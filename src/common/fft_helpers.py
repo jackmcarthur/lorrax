@@ -403,6 +403,7 @@ from ffi.mklfft import (  # noqa: E402  (re-export: see the block above)
 #     make_kconv_kminor       BSE rung:   fn(X, K_R), out_layout 0 | 1
 #     make_kfft_kminor        sharded transform over the three trailing k axes
 #     make_local_kconv_kminor / make_local_kfft_kminor  the same inside a shard_map
+#     make_local_kconv_klead  the k-leading conv inside a shard_map, V already R space (BSE W term)
 #
 # The contracts live in ``ffi/fft.py``.
 # ============================================================================
@@ -416,6 +417,7 @@ from ffi.fft import (  # noqa: E402,F401  (re-exported front doors)
     make_kconv_kminor,
     make_kfft_klead,
     make_kfft_kminor,
+    make_local_kconv_klead,
     make_local_kconv_kminor,
     make_local_kfft_klead,
     make_local_kfft_kminor,

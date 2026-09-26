@@ -134,7 +134,7 @@ from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 from common.shard_map import shard_map as _shard_map_fn
 
 from common.contract_bands import reduce_scatter_to_band_block
-from common.fft_helpers import make_kconv_kminor, make_local_kconv_kminor
+from common.fft_helpers import make_kconv_kminor, make_local_kconv_klead
 from .bse_preconditioner import exchange_spin_weight
 from .bse_ring_comm import make_bse_shardings
 
@@ -255,22 +255,25 @@ def matvec_opts() -> frozenset[str]:
 # ===========================================================================
 
 def _encode_T_A(X_b, psi_c_X, psi_v_Y):
-    """A-block ISDF encode.  ``X_b`` (c_full, v_full, nk) -> T (μ_loc,ν_loc,ns,ns,nk).
+    """A-block ISDF encode.  ``X_b`` (c_full, v_full, nk) -> T (nk,ns,μ_loc,ns,ν_loc).
 
-    ``T[μ,ν,t,s,k] = Σ_c ψ^X_c[k,c,t,μ] Σ_v conj(ψ^Y_v[k,v,s,ν]) X[c,v,k]``.
+    ``T[k,t,μ,s,ν] = Σ_c ψ^X_c[k,c,t,μ] Σ_v conj(ψ^Y_v[k,v,s,ν]) X[c,v,k]``.
+    T is K-LEADING: the batched ZGEMM over k writes it in this order, so no
+    T-sized transpose follows (the k-minor T of 2026-09-24 cost two per trial,
+    one after this GEMM and one before the decode's).
     μ rides 'x' (from ``psi_c_X``), ν rides 'y' (from ``psi_v_Y``).  The trial
     block arrives WHOLE (gathered once per block by the caller), so both ζ
     legs are produced in stationary accumulators and nothing crosses the
     mesh here (survey_C §C1, reports/gwjax_algorithmic_upgrades_2026-09-24).
     """
-    R = jnp.einsum("kvsN,cvk->cksN", jnp.conj(psi_v_Y), X_b)   # (c_full,nk,ns,ν_loc)
-    return jnp.einsum("kctM,cksN->MNtsk", psi_c_X, R)
+    R = jnp.einsum("kvsN,cvk->kcsN", jnp.conj(psi_v_Y), X_b)   # (nk,c_full,ns,ν_loc)
+    return jnp.einsum("kctM,kcsN->ktMsN", psi_c_X, R)
 
 
 def _encode_T_B(Xb_b, psi_c_Y, psi_v_X):
     """Coupling-block ISDF encode -- the c<->v leg swap (Henneke Eq. 4-3).
 
-    ``T[μ,ν,t,s,k] = Σ_v ψ^X_v[k,v,t,μ] Σ_c conj(ψ^Y_c[k,c,s,ν]) X[c,v,k]``,
+    ``T[k,t,μ,s,ν] = Σ_v ψ^X_v[k,v,t,μ] Σ_c conj(ψ^Y_c[k,c,s,ν]) X[c,v,k]``,
     ``Xb_b`` arrives WHOLE, (c_full, v_full, nk) — gathered once per block by
     the caller — so BOTH ζ legs stay stationary and nothing crosses the mesh
     here.  The legs
@@ -296,19 +299,30 @@ def _encode_T_B(Xb_b, psi_c_Y, psi_v_X):
     # the port carried that file's defect here, so it takes that file's fix.
     # X is the smallest tensor in the chain -- T carries TWO ζ axes, R carries
     # one -- so this takes the T- and R-sized tensors off the wire entirely.
-    R = jnp.einsum("kcsN,cvk->vksN", jnp.conj(psi_c_Y), Xb_b)  # (v_full,nk,ns,ν_loc)
-    return jnp.einsum("kvtM,vksN->MNtsk", psi_v_X, R)
+    R = jnp.einsum("kcsN,cvk->kvsN", jnp.conj(psi_c_Y), Xb_b)  # (nk,v_full,ns,ν_loc)
+    return jnp.einsum("kvtM,kvsN->ktMsN", psi_v_X, R)
 
 
-def _conv_decode(T_b, psi_c_X, psi_v_Y, W_R, kconv, sqrt_nk):
+def _w_r_klead(W_R):
+    """The rank's ``W_R`` tile (μ_loc, ν_loc, kx, ky, kz) -> k-leading (nk, μ_loc, ν_loc).
+
+    Once per matvec call, outside the trial scan: callers keep building W_R
+    k-minor (``make_kfft_kminor``), the conv's kernel is read k-leading.
+    """
+    mu_loc, nu_loc = W_R.shape[0], W_R.shape[1]
+    return jnp.moveaxis(W_R.reshape(mu_loc, nu_loc, -1), -1, 0)
+
+
+def _conv_decode(T_b, psi_c_X, psi_v_Y, W_Rk, kconv, sqrt_nk):
     """conv(T) then decode -- the stages both blocks share.
 
     conv: ``U_b = (1/Nk) fft_k(W_R · ifft_k-unnormalised(T_b))``, i.e.
-    ``fftn_ortho(ifftn_ortho(T_b) · W_R)``, as ONE call of the k-convolution
-    router's local k-minor door ``kconv`` (``make_local_kconv_kminor``:
-    nvidia-mathdx on CUDA, the plan route on cpu).  Both norm factors are one
-    folded constant inside it; ``W_R`` is already in R space
-    (``bse_feast.ensure_W_R``).
+    ``fftn_ortho(ifftn_ortho(T_b) · W_R)``, as ONE in-place call of the
+    k-convolution router's local k-LEADING door ``kconv``
+    (``make_local_kconv_klead``: nvidia-mathdx mode 2 on CUDA, the pass Σ's τ
+    kernel runs; the plan route on cpu).  Both norm factors are one folded
+    constant inside it; ``W_Rk`` is ``W_R`` already in R space
+    (``bse_feast.ensure_W_R``), read k-leading (``_w_r_klead``).
 
     THIS IS AN FFT AND IT STAYS AN FFT.  A dense (nk x nk) DFT contraction gives
     the same numbers and measured 2.3x faster on this deck, and it was REMOVED
@@ -322,13 +336,12 @@ def _conv_decode(T_b, psi_c_X, psi_v_Y, W_R, kconv, sqrt_nk):
     through THIS rank's μ_loc and ν_loc only: the result is the rank's
     ``(c_full, v_full, nk)`` PARTIAL, and the caller completes both sums
     with one reduce-scatter per block after the scan — no collective per
-    trial.
+    trial.  The (t, μ) contraction reads the k-leading U as a batched ZGEMM.
     """
-    mu_loc, nu_loc = T_b.shape[0], T_b.shape[1]
-    U_b = kconv(T_b[None], W_R.reshape(mu_loc, nu_loc, -1))[0]
+    U_b = kconv(T_b, W_Rk)                                        # in place on T_b
 
-    A = jnp.einsum("kctM,MNtsk->cNsk", jnp.conj(psi_c_X), U_b)  # (c_full, ν_loc, ns, nk)
-    WXcv = jnp.einsum("kvsN,cNsk->cvk", psi_v_Y, A)             # (c_full, v_full, nk)
+    A = jnp.einsum("kctM,ktMsN->kcsN", jnp.conj(psi_c_X), U_b)  # (nk, c_full, ns, ν_loc)
+    WXcv = jnp.einsum("kvsN,kcsN->cvk", psi_v_Y, A)             # (c_full, v_full, nk)
     return WXcv / sqrt_nk
 
 
@@ -386,9 +399,9 @@ def build_bse_stack_matvec(
     nk = nkx * nky * nkz
     opts = matvec_opts()
     use_gspmd = "gspmd" in opts
-    # The W-term k-convolution: the router's local k-minor door (inside the
-    # shard_map below), one fused call per trial.
-    kconv = make_local_kconv_kminor(mesh_xy, (nkx, nky, nkz), norm="ortho")
+    # The W-term k-convolution: the router's local k-leading door (inside the
+    # shard_map below), one fused in-place call per trial.
+    kconv = make_local_kconv_klead(mesh_xy, (nkx, nky, nkz), norm="ortho")
 
     # ── W term: one shard_map over ('x','y'); body = scan over the trial axis ──
     def _w_stack(X, psi_c_X, psi_v_Y, W_R):
@@ -396,14 +409,15 @@ def build_bse_stack_matvec(
         # μ_loc); psi_v_Y (nk, v_full, ns, ν_loc); W_R (μ_loc, ν_loc, kx,ky,kz).
         # sqrt_nk follows the input dtype (fp32/fp64) — drop-in for fp32 GMRES.
         # DTYPE SEAM: this whole W-term inherits X's dtype, so a complex64 matvec
-        # would halve the 655 MB T-tensor and every one of its ~7 HBM round-trips
+        # would halve the 655 MB T-tensor and every one of its ~4 HBM round-trips
         # (the audit's measured ~2× bandwidth lever, JOINT_FINDINGS §4). It is
         # DELIBERATELY left at complex128 (no c64 here) per owner decision
         # (2026-07-16); the fp32-GMRES path casts upstream in bse_feast, not here.
         sqrt_nk = jnp.sqrt(jnp.asarray(nk, dtype=X.real.dtype))
+        W_Rk = _w_r_klead(W_R)                       # once per call, not per trial
 
         def _body(carry, X_b):                       # X_b: (c_full, v_full, nk)
-            # encode: T_b[μ,ν,t,s,k] = Σ_c ψ_c[k,c,t,μ] Σ_v conj(ψ_v[k,v,s,ν]) X_b
+            # encode: T_b[k,t,μ,s,ν] = Σ_c ψ_c[k,c,t,μ] Σ_v conj(ψ_v[k,v,s,ν]) X_b
             # NO COLLECTIVE IN THIS BODY (survey_C §C1): X_b arrives whole,
             # and the decode returns this rank's (μ_loc, ν_loc) partial.
             # Encode / conv+decode are the shared module-level stages
@@ -411,7 +425,7 @@ def build_bse_stack_matvec(
             # the SAME ``_conv_decode``, which is what makes the non-TDA
             # fusion exact.
             T_b = _encode_T_A(X_b, psi_c_X, psi_v_Y)
-            return carry, _conv_decode(T_b, psi_c_X, psi_v_Y, W_R, kconv, sqrt_nk)
+            return carry, _conv_decode(T_b, psi_c_X, psi_v_Y, W_Rk, kconv, sqrt_nk)
 
         # Once per block: gather the trial block, scan, reduce once.  The
         # per-trial 'x' all-gather of R and psum_scatter of A are gone; the
@@ -590,7 +604,7 @@ def build_bse_stack_pair_matvec(
     sh = make_bse_shardings(mesh_xy)
     rep = NamedSharding(mesh_xy, P())
     nk = nkx * nky * nkz
-    kconv = make_local_kconv_kminor(mesh_xy, (nkx, nky, nkz), norm="ortho")
+    kconv = make_local_kconv_klead(mesh_xy, (nkx, nky, nkz), norm="ortho")
 
     # ── W term: one shard_map over ('x','y') — the SAME single region the TDA
     #    stack matvec opens.  No new shard_map is created by the coupling port:
@@ -599,6 +613,7 @@ def build_bse_stack_pair_matvec(
         # Local shards: X (n_trials, c_loc, v_loc, nk); psi_*_X (…, μ_loc);
         # psi_*_Y (…, ν_loc); W_R (μ_loc, ν_loc, kx, ky, kz).
         sqrt_nk = jnp.sqrt(jnp.asarray(nk, dtype=X.real.dtype))
+        W_Rk = _w_r_klead(W_R)                              # once per call
 
         # ONE block-level gather, hoisted OUT of the scan: both encodes take
         # the whole trial block, and Xb = conj(X) is formed locally from it
@@ -614,15 +629,15 @@ def build_bse_stack_pair_matvec(
             # and decode are linear, so one chain serves both blocks.
             T_b = (_encode_T_A(X_b, psi_c_X, psi_v_Y)
                    + sc * _encode_T_B(Xb_b, psi_c_Y, psi_v_X))
-            return carry, _conv_decode(T_b, psi_c_X, psi_v_Y, W_R, kconv, sqrt_nk)
+            return carry, _conv_decode(T_b, psi_c_X, psi_v_Y, W_Rk, kconv, sqrt_nk)
 
         def _body_unfused(carry, xs):
             # THE TWIN.  Two full chains.  Kept only to price the fusion.
             X_b, Xb_b = xs
             WA = _conv_decode(_encode_T_A(X_b, psi_c_X, psi_v_Y),
-                              psi_c_X, psi_v_Y, W_R, kconv, sqrt_nk)
+                              psi_c_X, psi_v_Y, W_Rk, kconv, sqrt_nk)
             WB = _conv_decode(_encode_T_B(Xb_b, psi_c_Y, psi_v_X),
-                              psi_c_X, psi_v_Y, W_R, kconv, sqrt_nk)
+                              psi_c_X, psi_v_Y, W_Rk, kconv, sqrt_nk)
             return carry, WA + sc * WB
 
         _, WX = lax.scan(_body_fused if fuse else _body_unfused,
