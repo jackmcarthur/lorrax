@@ -671,6 +671,13 @@ def gather_peaks() -> None:
 	_GLOBAL_COLLECTOR.gather_peaks()
 
 
+def total(records, *names: str) -> float:
+	"""Inclusive seconds of the sections named ``names`` in ``records``."""
+	wanted = set(names)
+	return sum(float(row["inclusive"]) for row in records
+	           if str(row["name"]) in wanted)
+
+
 def process_elapsed_s() -> float | None:
 	"""Seconds since THIS PROCESS started, or ``None`` if unavailable.
 

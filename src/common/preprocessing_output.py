@@ -190,15 +190,7 @@ class ScientificProductionReport:
 PreprocessingProductionReport = ScientificProductionReport
 
 
-def timing_total(records, *names: str) -> float:
-    """Sum canonical timing records without exposing collector internals."""
-    wanted = set(names)
-    return sum(float(row["inclusive"]) for row in records
-               if str(row["name"]) in wanted)
-
-
 __all__ = [
     "PreprocessingProductionReport",
     "ScientificProductionReport",
-    "timing_total",
 ]
