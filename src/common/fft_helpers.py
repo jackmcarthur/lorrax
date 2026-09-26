@@ -213,6 +213,9 @@ from ffi.fft import (  # noqa: E402  (re-export: see the block above)
 #     make_local_kconv_klead  the k-leading conv inside a shard_map, V already R space (BSE W term)
 #     make_local_kconv_klead_outer  the same with T = sum_K L R formed on the load (BSE encode
 #                                   fused); klead_outer_refusal says when it cannot serve
+#     make_local_kconv_klead_outer_decode  (prep, apply): the same with the decode's (t, mu)
+#                                   contraction fused into the store (U never stored);
+#                                   klead_outer_decode_refusal says when it cannot serve
 #
 # The contracts live in ``ffi/fft.py``.
 # ============================================================================
@@ -229,6 +232,8 @@ from ffi.fft import (  # noqa: E402,F401  (re-exported front doors)
     make_local_kconv_klead,
     make_local_kconv_klead_outer,
     klead_outer_refusal,
+    make_local_kconv_klead_outer_decode,
+    klead_outer_decode_refusal,
     make_local_kconv_kminor,
     make_local_kfft_klead,
     make_local_kfft_kminor,

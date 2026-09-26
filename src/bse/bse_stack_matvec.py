@@ -136,8 +136,9 @@ from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 from common.shard_map import shard_map as _shard_map_fn
 
 from common.contract_bands import reduce_scatter_to_band_block
-from common.fft_helpers import (klead_outer_refusal, make_local_kconv_klead,
-                                make_local_kconv_klead_outer)
+from common.fft_helpers import (klead_outer_decode_refusal, klead_outer_refusal,
+                                make_local_kconv_klead, make_local_kconv_klead_outer,
+                                make_local_kconv_klead_outer_decode)
 from .bse_preconditioner import exchange_spin_weight
 from .bse_ring_comm import make_bse_shardings
 
@@ -306,6 +307,15 @@ def _decode(U_b, psi_c_X, psi_v_Y, sqrt_nk):
     reduce-scatter completes it.
     """
     A = jnp.einsum("kctM,ktMsN->kcsN", jnp.conj(psi_c_X), U_b)  # (nk, c_full, ns, ν_loc)
+    return _decode_v(A, psi_v_Y, sqrt_nk)
+
+
+def _decode_v(A, psi_v_Y, sqrt_nk):
+    """``_decode``'s (s, ν) contraction of its (t, μ)-contracted ``A`` (nk, c_full, ns, ν_loc).
+
+    The fused outer route (``make_local_kconv_klead_outer_decode``) forms ``A`` in the
+    convolution's store and hands it here, so both routes run this einsum.
+    """
     WXcv = jnp.einsum("kvsN,kcsN->cvk", psi_v_Y, A)             # (c_full, v_full, nk)
     return WXcv / sqrt_nk
 
@@ -374,6 +384,30 @@ def _make_outer_router(mesh_xy, kgrid):
             doors["conv"] = make_local_kconv_klead_outer(mesh_xy, kgrid, norm="ortho")
         return doors["conv"]
     return route
+
+
+def _outer_w_term(route, rank, psi_c_X, psi_v_Y, W_R, sqrt_nk, mesh_xy, kgrid):
+    """``wterm(L, R, conj_r=False) -> (WX)_b`` on the outer load, or None when the router keeps T.
+
+    With the decode door (``make_local_kconv_klead_outer_decode``; announced once) the load's store
+    contracts U with conj(ψ^X_c) over (t, μ) and U never reaches HBM; ψ^X_c is tiled once here,
+    outside the trial scan.  Else the outer conv writes U and ``_decode`` reads it.  Either way
+    ``_decode_v`` runs the (s, ν) einsum, so the (t, μ)-first order of ``_decode`` holds.
+    """
+    from ffi.gate import announce_once
+    conv = route(rank)
+    if conv is None:
+        return None
+    W_Rm = _w_r_kminor(W_R)                          # the tile as built: a reshape, no copy
+    why = klead_outer_decode_refusal(mesh_xy, kgrid, psi_c_X.shape[1])
+    announce_once(("bse", "w_term_decode", why is None),
+                  "[bse] W term decode: " + ("fused into the outer load's store (U never stored)"
+                                             if why is None else "XLA on the stored U: " + why))
+    if why is not None:
+        return lambda L, R, conj_r=False: _decode(conv(L, R, W_Rm, conj_r=conj_r), psi_c_X, psi_v_Y, sqrt_nk)
+    prep, apply = make_local_kconv_klead_outer_decode(mesh_xy, kgrid, norm="ortho")
+    pc_t = prep(psi_c_X)
+    return lambda L, R, conj_r=False: _decode_v(apply(L, R, W_Rm, pc_t, conj_r=conj_r), psi_v_Y, sqrt_nk)
 
 
 def _exchange_U(S_part, V_q0):
@@ -493,14 +527,12 @@ def build_bse_stack_matvec(
         # (2026-07-16); the fp32-GMRES path casts upstream in bse_feast, not here.
         sqrt_nk = jnp.sqrt(jnp.asarray(nk, dtype=X.real.dtype))
 
-        kconv_outer = outer_route(min(psi_c_X.shape[1], psi_v_Y.shape[1]))
-        if kconv_outer is not None:
-            W_Rm = _w_r_kminor(W_R)                  # the tile as built: a reshape, no copy
-
+        wterm = _outer_w_term(outer_route, min(psi_c_X.shape[1], psi_v_Y.shape[1]), psi_c_X, psi_v_Y,
+                              W_R, sqrt_nk, mesh_xy, (nkx, nky, nkz))
+        if wterm is not None:
             def _body_outer(carry, X_b):             # X_b: (c_full, v_full, nk)
                 L, R, cj = _outer_legs(X_b, psi_c_X, psi_v_Y)
-                U_b = kconv_outer(L, R, W_Rm, conj_r=cj)   # T formed on the load, never stored
-                return carry, _decode(U_b, psi_c_X, psi_v_Y, sqrt_nk)
+                return carry, wterm(L, R, conj_r=cj)   # T formed on the load, never stored
 
             _, WX = lax.scan(_body_outer, None, _gather_trial_block(X), unroll=1)
             return _scatter_trial_block(WX, mesh_xy)
@@ -658,26 +690,21 @@ def build_bse_stack_pair_matvec(
         # blocks' legs along K, so ONE convolution call forms T_A + s T_B in
         # shared memory; the twin runs one call per block.
         rank = min(psi_c_X.shape[1], psi_v_Y.shape[1])
-        kconv_outer = outer_route(2 * rank if fuse else rank)
-        if kconv_outer is not None:
-            W_Rm = _w_r_kminor(W_R)                         # a reshape, no copy
-
+        wterm = _outer_w_term(outer_route, 2 * rank if fuse else rank, psi_c_X, psi_v_Y, W_R, sqrt_nk,
+                              mesh_xy, (nkx, nky, nkz))
+        if wterm is not None:
             def _body_outer_fused(carry, xs):
                 X_b, Xb_b = xs
                 L_A, R_A, cA = _outer_legs(X_b, psi_c_X, psi_v_Y)
                 L_B, R_B = _outer_legs_B(Xb_b, psi_c_Y, psi_v_X)
                 R_A = jnp.conj(R_A) if cA else R_A      # one convention for the concatenation
-                U_b = kconv_outer(jnp.concatenate([L_A, sc * L_B], axis=-1),
-                                  jnp.concatenate([R_A, R_B], axis=1), W_Rm)
-                return carry, _decode(U_b, psi_c_X, psi_v_Y, sqrt_nk)
+                return carry, wterm(jnp.concatenate([L_A, sc * L_B], axis=-1),
+                                    jnp.concatenate([R_A, R_B], axis=1))
 
             def _body_outer_unfused(carry, xs):
                 X_b, Xb_b = xs
                 L_A, R_A, cA = _outer_legs(X_b, psi_c_X, psi_v_Y)
-                WA = _decode(kconv_outer(L_A, R_A, W_Rm, conj_r=cA), psi_c_X, psi_v_Y, sqrt_nk)
-                WB = _decode(kconv_outer(*_outer_legs_B(Xb_b, psi_c_Y, psi_v_X), W_Rm),
-                                 psi_c_X, psi_v_Y, sqrt_nk)
-                return carry, WA + sc * WB
+                return carry, wterm(L_A, R_A, conj_r=cA) + sc * wterm(*_outer_legs_B(Xb_b, psi_c_Y, psi_v_X))
 
             _, WX = lax.scan(_body_outer_fused if fuse else _body_outer_unfused,
                              None, (X_full, Xb_full), unroll=1)

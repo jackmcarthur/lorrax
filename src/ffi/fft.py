@@ -1338,20 +1338,6 @@ def make_local_kconv_klead_outer(mesh: Mesh, kgrid, *, norm: str | None = "ortho
     return _plan
 
 
-def _cuda_attr(attr: int, ordinal: int = 0) -> int | None:
-    """A libcuda device attribute of device ``ordinal``; None without a driver."""
-    try:
-        import ctypes
-        cu = ctypes.CDLL("libcuda.so.1")
-        dev, v = ctypes.c_int(), ctypes.c_int()
-        if cu.cuInit(0) or cu.cuDeviceGet(ctypes.byref(dev), int(ordinal)) or cu.cuDeviceGetAttribute(
-                ctypes.byref(v), int(attr), dev):
-            return None
-        return int(v.value)
-    except Exception:                                         # noqa: BLE001
-        return None
-
-
 def klead_outer_decode_refusal(mesh: Mesh, kgrid, n_c: int, optin: int | None = None) -> str | None:
     """``None`` when :func:`make_local_kconv_klead_outer_decode` serves this mesh, grid and band count.
 
@@ -1387,9 +1373,10 @@ def make_local_kconv_klead_outer_decode(mesh: Mesh, kgrid, *, norm: str | None =
     conj_r=False)`` returns ``A[k,c,b,y] = Σ_{a,x} conj(Pc[k,c,a,x]) U[k,a,x,b,y]`` (nk, n_c, b, my), with
     ``U`` the outer conv of ``(L, R, V_R, conj_r)`` -- ``bse_stack_matvec._decode``'s (t, μ) contraction,
     whose (s, ν) contraction stays the caller's einsum.  CUDA (``kconv_outer_cuda_ffi.cc``): one resident
-    block per SM takes an even share of the (item, pair) tiles and writes each item's A to its own slot;
-    the items' slots are summed here in slot order (deterministic).  ``L`` and ``R`` are tiled per call
-    (K zero-padded to a multiple of 4, μ and ν to 8).  cpu: the outer conv's plan route and the einsum.
+    block per SM; the (phase, item) tiles go round robin so a wave shares one x window in L2, and the
+    tile completing an item sums its partials in phase order (deterministic).  ``L`` and ``R`` are
+    tiled into fragment order per call (K zero-padded to a multiple of 4, μ and ν to 8).  cpu: the
+    outer conv's plan route and the einsum.
     Check :func:`klead_outer_decode_refusal` first.
     """
     kg = _check_kgrid(kgrid, kconv_backend(mesh))
@@ -1406,9 +1393,7 @@ def make_local_kconv_klead_outer_decode(mesh: Mesh, kgrid, *, norm: str | None =
     _require_target(KCONV_KLEAD_OUTER_TARGET, "CUDA")
     _require_target(KCONV_KLEAD_OUTER_DECODE_TARGET, "CUDA")
     scale = ffi_fft_scale("ifftn", norm, nk) * ffi_fft_scale("fftn", norm, nk)
-    grid = _cuda_attr(16) or 1                                 # one resident block per SM
-    attrs = dict(nkx=np.int64(kg[0]), nky=np.int64(kg[1]), nkz=np.int64(kg[2]), scale=np.float64(scale),
-                 grid=np.int64(grid))
+    attrs = dict(nkx=np.int64(kg[0]), nky=np.int64(kg[1]), nkz=np.int64(kg[2]), scale=np.float64(scale))
 
     def _prep(pc):                              # (nk, c, a, mx) -> (a, nxb, nk, MB, 2, 8, 4)
         n_k, n_c, na, mx = pc.shape
@@ -1420,31 +1405,14 @@ def make_local_kconv_klead_outer_decode(mesh: Mesh, kgrid, *, norm: str | None =
         pcr, n_c = pc_t
         n_k, na, mx, kr = l.shape
         nb, my = r.shape[2], r.shape[3]
-        h, nxb, nyb, mb = -(-kr // 4), -(-mx // 8), -(-my // 8), pcr.shape[3]
+        h, nxb, nyb = -(-kr // 4), -(-mx // 8), -(-my // 8)
         # Lr (a, nxb, nk, H, 8, 4) = L[k, a, 8 xb + g, 4h + t]; Rr (b, nyb, nk, H, 8, 4) = R[k, 4h + t, b, 8 yb + g]
         lr = jnp.pad(l, ((0, 0), (0, 0), (0, 8 * nxb - mx), (0, 4 * h - kr)))
         lr = lr.reshape(n_k, na, nxb, 8, h, 4).transpose(1, 2, 0, 4, 3, 5)
         rr = jnp.pad(r, ((0, 0), (0, 4 * h - kr), (0, 0), (0, 8 * nyb - my)))
         rr = rr.reshape(n_k, h, 4, nb, nyb, 8).transpose(3, 4, 0, 1, 5, 2)
-        items, pairs = nb * nyb, na * nxb
-        slots = grid + items
-        a_part = jax.ffi.ffi_call(KCONV_KLEAD_OUTER_DECODE_TARGET,
-                                  jax.ShapeDtypeStruct((slots + 1, n_k, 8 * mb, 8), l.dtype))(
+        return jax.ffi.ffi_call(KCONV_KLEAD_OUTER_DECODE_TARGET, jax.ShapeDtypeStruct((n_k, n_c, nb, my), l.dtype))(
             lr, rr, v_r, pcr, conj_r=np.int64(bool(conj_r)), **attrs, **_mathdx_common())
-        # item -> its slots (block i covers units [i T / G, (i+1) T / G) and writes slot i + item)
-        total = items * pairs
-        segs = [[] for _ in range(items)]
-        for i in range(grid):
-            u0, u1 = i * total // grid, (i + 1) * total // grid
-            for it in range(u0 // pairs, (u1 - 1) // pairs + 1) if u1 > u0 else ():
-                segs[it].append(i + it)
-        width = max(len(q) for q in segs)
-        idx = np.array([q + [slots] * (width - len(q)) for q in segs], dtype=np.int32)
-        a_it = jnp.take(a_part, idx[:, 0], axis=0)
-        for j in range(1, width):                                      # slot order: fixed
-            a_it = a_it + jnp.take(a_part, idx[:, j], axis=0)
-        a_it = a_it.reshape(nyb, nb, n_k, 8 * mb, 8).transpose(2, 3, 1, 0, 4).reshape(n_k, 8 * mb, nb, 8 * nyb)
-        return a_it[:, :n_c, :, :my]
     return _prep, _apply
 
 
