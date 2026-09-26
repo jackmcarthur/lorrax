@@ -140,7 +140,7 @@ testpaths = ["tests", "services"]
 # they are argv-driven scripts with jax preambles, not pytest suites.
 # `services/*/bench` is the same thing for a service: claims-style baseline
 # drivers, never part of the default run.
-norecursedirs = ["archive", "bench"]
+norecursedirs = ["bench"]
 # `extra` (tooling / experimental / out-of-repo-fixture suites) is
 # deselected by default; run them with `-m extra` (an explicit -m on the
 # command line overrides this addopts default).
