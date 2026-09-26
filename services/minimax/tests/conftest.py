@@ -37,9 +37,8 @@ Plus one thing this service needs that the others do not: the door
 ANNOUNCES, once per distinct request, through :mod:`warnings`.  Those
 announcements are process-global state, so a cell that asserts "this
 announced" would pass or fail depending on which cell ran first.  The
-autouse fixture below resets both announcement registries and the catalog
-caches around every cell, which is what makes the announcement assertions
-order-independent — and ``test_the_announcement_reset_is_not_a_no_op``
+autouse fixture below resets both announcement registries around every
+cell, which is what makes the announcement assertions order-independent — and ``test_the_announcement_reset_is_not_a_no_op``
 next door is the red twin proving the fixture is doing something.
 """
 
@@ -97,11 +96,9 @@ def _fresh_announcements():
 
     minimax.reset_announcements()
     _cache.reset_announcements()
-    minimax.clear_caches()
     yield
     minimax.reset_announcements()
     _cache.reset_announcements()
-    minimax.clear_caches()
 
 
 @pytest.fixture()

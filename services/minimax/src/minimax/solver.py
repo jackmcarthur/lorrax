@@ -246,12 +246,6 @@ def solve_noncrossing_imag(N, R, omega_hat, lawson_iter=4):
     return t[order], best_w[order], best_err
 
 
-def evaluate_noncrossing_imag(x, t, w):
-    """Evaluate sum_l w_l exp(-t_l x)."""
-    x = np.asarray(x)
-    return np.exp(-np.outer(x, t)) @ w
-
-
 def noncrossing_imag_grids(R, omega_hat, eps, N_start=2, N_max=60):
     """Find minimum N achieving error < eps.
 
