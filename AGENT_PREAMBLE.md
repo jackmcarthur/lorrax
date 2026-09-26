@@ -56,12 +56,12 @@ class number.
 
 | thing | what to know |
 |---|---|
-| runtime | `export LX_BASE_MODULE=lorrax_A` on the login node, before `lx run`. The module selects a `git archive` source snapshot and one **sealed FFI bundle** (CUDA and host legs, handler ABI `LORRAX_FFI_ABI_VERSION` in `src/ffi/common/ffi_loader.py`); a checkout needs no `.so` of its own. The loader refuses a pinned `LORRAX_FFI_SO` whose ABI is not the source's ([Perlmutter](docs/environment/machines/perlmutter.md)) |
+| runtime | `lx` selects the `lorrax_A` base module (`LX_BASE_MODULE` is an expert override). The module selects a `git archive` source snapshot and one **sealed FFI bundle** (CUDA and host legs, handler ABI `LORRAX_FFI_ABI_VERSION` in `src/ffi/common/ffi_loader.py`); a checkout needs no `.so` of its own. The loader refuses a pinned `LORRAX_FFI_SO` whose ABI is not the source's ([Perlmutter](docs/environment/machines/perlmutter.md)) |
 | allocations | agents never allocate: the coordinator runs shared pools and a leg joins one with `lx run --pool NAME` (or `--jid`). `lx` claims a free node per leg; a full pool makes the leg wait (`--wait`). `lx release` cancels only what the calling agent created |
 | exit codes | 0–89 are the command's; 90–98 mean the step never ran (`LX-WRONGSITE` 90, `NOSLURM` 91, `NESTED` 92, `ALLOCFAIL` 93, `LOCKHELD` 94, `TOOSMALL` 95, `POOLFULL` 96, `SITEENV` 97, `EXPIRED` 98). An `LX-*` code is an absence, never a measurement |
 | hung or working | `lx status` cannot tell; `lx status --verify` samples `sstat` twice, 6 s apart. `lx status` draws CPU allocations GPU-shaped: check `AllocTRES` in `scontrol show job <id>` for `gres/gpu` |
 | certificate | 24 h; compute the minutes left from `ssh-keygen -L -f ~/.ssh/nersc-cert.pub`. A working `ssh` is no evidence (ControlPersist answers past expiry): probe with `ssh -o ControlPath=none perlmutter true`. Never `ssh -O exit`: it kills every backgrounded launcher |
-| GPU memory pool | owned by the runtime: `cuda_async`, reserved, fraction 0.89; a leg script exports none of the pool variables ([overview §2.1](docs/environment/overview.md#gpu-pool)). Timings are comparable only under the same pool |
+| GPU memory pool | owned by the runtime ([overview §2.1](docs/environment/overview.md#gpu-pool)); a leg script exports none of the pool variables. Timings are comparable only under the same pool |
 | artifacts, not rc | Judge a leg by its artifacts, not its rc. `$HOME` is 40 GiB; a full `$HOME` yields a 38-byte junitxml that parses as zero tests |
 | band degeneracy | the default is `strict`. Never set `LORRAX_BAND_DEGENERACY=snap` to make a gate pass |
 
