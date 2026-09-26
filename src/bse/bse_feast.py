@@ -5,7 +5,7 @@ window definition in eV, and FEAST ellipse-trapezoid quadrature nodes/weights),
 this module implements the full FEAST solve: shifted GMRES linear solves at each
 quadrature node plus Rayleigh-Ritz eigenpair extraction (``run_feast_ritz``).
 FEAST is the DEFAULT solve route for the ``bse_jax`` CLI entry point (bse_jax.py
-runs ``bse_feast.main`` unless ``--lanczos`` is passed). Output is printed to
+runs ``bse_feast.run(bse_feast.settings(...))`` unless ``--lanczos`` is passed). Output is printed to
 stdout in a physics-style report.
 """
 from __future__ import annotations
@@ -1371,7 +1371,7 @@ def _parse_window_arg(values: list[str], default: Tuple[float, float]) -> Tuple[
     return a, float(b_str)
 
 
-def main(argv: list[str] | None = None) -> None:
+def build_parser():
     import argparse
 
     parser = argparse.ArgumentParser(allow_abbrev=False, description="FEAST setup for sharded BSE")
@@ -1455,8 +1455,27 @@ def main(argv: list[str] | None = None) -> None:
         metavar=("A", "B"),
         help="Override window 2 bounds in eV (use 'auto' for B)",
     )
-    args = parser.parse_args(argv)
+    return parser
 
+
+def settings(input_file, **overrides):
+    """The CLI's settings with ``overrides`` applied, for an in-process caller.
+
+    Defaults are the parser's own, so a caller never restates them; a name
+    that is not a CLI destination refuses (``TypeError``) instead of being
+    carried and ignored.
+    """
+    ns = build_parser().parse_args(["-i", str(input_file)])
+    unknown = sorted(set(overrides) - set(vars(ns)))
+    if unknown:
+        raise TypeError(f"{__name__}.settings: unknown settings {unknown}")
+    for key, value in overrides.items():
+        setattr(ns, key, value)
+    return ns
+
+
+def run(args) -> None:
+    """FEAST windows, filter quadrature and (``feast_ritz``) Ritz values."""
     timing.reset()
 
     # Enable JAX persistent compile cache before any jit compiles.
@@ -1625,6 +1644,11 @@ def main(argv: list[str] | None = None) -> None:
                 print(f"  {i:2d}: {ev:12.6f}{tag}")
 
     timing.report(print_fn=print, title="--- Timing ---")
+
+
+
+def main(argv: list[str] | None = None) -> None:
+    run(build_parser().parse_args(argv))
 
 
 if __name__ == "__main__":

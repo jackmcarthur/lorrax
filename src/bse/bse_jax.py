@@ -244,7 +244,9 @@ def _preview_lanczos(
 
 
 
-def main(argv=None) -> int:
+def build_parser():
+    """The BSE CLI.  Below the startup call: ``--band-degeneracy`` takes its
+    choices from ``common.band_degeneracy`` (tests/test_cli_help_seam.py)."""
     import argparse
 
     parser = argparse.ArgumentParser(allow_abbrev=False, description="BSE JAX entry point")
@@ -431,137 +433,108 @@ def main(argv=None) -> int:
     parser.add_argument("--kpm-plot-file", type=str, default="bse_dos_kpm.png", help="KPM DOS plot output file.")
     parser.add_argument("--eqp", type=str, default=None, help="Path to BGW eqp1.dat for QP corrections.")
     parser.add_argument("--n-occ", type=int, default=None, help="Number of occupied bands.")
-    # INERT, and deliberately still accepted.  Its only consumer was the
-    # ``timed=True`` arm of ``bse_ring_comm.build_bse_ring_matvec*``, which was
-    # dead code (no caller ever passed it) and was deleted 2026-08-08; the dest
-    # was already never read even before that.  It is kept parseable so that an
-    # archived launch script still starts instead of dying in argparse on a
-    # batch node, which reads as a crashed run rather than a renamed flag.
-    # If per-term ring timings are wanted again, use common.timing sections on
-    # the jitted matvec -- not an unjitted arm that re-traces on every call.
-    parser.add_argument("--ring-timing", action="store_true")
-    args, _ = parser.parse_known_args(argv)
+    return parser
 
-    # Omitted --px/--py = the run's canonical square mesh, not 1x1.  Resolved
-    # here, above every branch below, for two reasons.  A shape that is not
-    # the job's then refuses at the top of main() rather than after a delegate
-    # has printed its banner; and the default route is a delegation --
-    # `if not args.lanczos:` hands the solve to bse_feast.main(["--px",
-    # str(args.px), ...]), with --kpm-dos taking px/py the same way -- so the forwarded argv must carry the
-    # resolved shape.  Until 2026-08-27 it carried the argparse placeholder
-    # 1/1: the default run put a four-GPU node's whole BSE on one device while
-    # the startup report above announced 2x2.
-    mesh_xy = create_mesh_xy_from_flags(args.px, args.py)
-    args.px, args.py = tuple(int(n) for n in mesh_xy.devices.shape)
 
+#: Retired flags refuse by name rather than as an unrecognised argument.
+_RETIRED_FLAGS = {
+    "--ring-timing": ("its timed ring-matvec arm was deleted 2026-08-08; "
+                      "time the jitted matvec with common.timing instead"),
+}
+
+#: The flags each route reads, beyond the ones every route reads.  A flag
+#: set away from its default on a route that does not read it refuses by
+#: name: the default FEAST route used to drop --eqp, --n-eig, --n-occ and
+#: the solver flags silently, so a QP run came back on DFT energies.
+_COMMON_DESTS = {"input", "n_val", "n_cond", "px", "py", "rpa", "bse", "tda",
+                 "lanczos", "kpm_dos"}
+_ROUTE_DESTS = {
+    "feast": {
+        "feast_n_lanczos", "feast_buffer", "feast_n_quad1", "feast_n_quad2",
+        "feast_quadrature", "feast_units_ev_per_ry", "feast_ritz_count",
+        "gmres_max_iter", "gmres_tol", "gmres_seed", "gmres_fp32",
+        "kpm_window_count", "kpm_n_moments", "kpm_n_random", "kpm_n_lanczos",
+        "feast_window1", "feast_window2"},
+    "kpm": {
+        "kpm_n_moments", "kpm_n_random", "kpm_n_lanczos", "kpm_window_count",
+        "kpm_plot_file", "kpm_emin_ev", "kpm_emax_ev"},
+    "lanczos": {
+        "n_eig", "write_eigs", "report_file", "max_lanczos_iter", "block_size",
+        "lanczos_rtol", "lanczos_check_every", "n_reorth", "solver",
+        "davidson_precond", "davidson_olsen", "davidson_eps_shift",
+        "davidson_m_max", "trlan_m_max", "trlan_n_keep", "eqp", "n_occ",
+        "band_degeneracy", "degeneracy_tol_ry"},
+}
+
+
+def parse_args(argv=None):
+    """``(route, args)``: strict parsing, retired and route-ignored flags refused."""
+    import sys
+    parser = build_parser()
+    raw = list(sys.argv[1:] if argv is None else argv)
+    for flag, why in _RETIRED_FLAGS.items():
+        if flag in raw:
+            parser.error(f"{flag} is retired: {why}")
+    args = parser.parse_args(raw)
     if args.input is None:
         parser.error("Default run requires -i/--input.")
+    route = ("kpm" if args.kpm_dos else "lanczos" if args.lanczos
+             else "feast")
+    ignored = sorted(
+        "--" + dest.replace("_", "-") for dest, value in vars(args).items()
+        if dest not in _COMMON_DESTS | _ROUTE_DESTS[route]
+        and value != parser.get_default(dest))
+    if ignored:
+        parser.error(
+            f"{', '.join(ignored)} {'is' if len(ignored) == 1 else 'are'} not "
+            f"read by the {route} route and would be ignored; drop "
+            f"{'it' if len(ignored) == 1 else 'them'} or choose the route "
+            f"that reads {'it' if len(ignored) == 1 else 'them'} (--lanczos "
+            f"for the eigensolve with QP energies and eigenvectors, "
+            f"--kpm-dos for the density of states, neither for FEAST)")
+    return route, args
 
+
+def main(argv=None) -> int:
+    route, args = parse_args(argv)
+
+    # Omitted --px/--py = the run's canonical square mesh, not 1x1.  A shape
+    # that is not the job's refuses here, above every route, and the FEAST
+    # and KPM routes are handed the resolved shape.
+    mesh_xy = create_mesh_xy_from_flags(args.px, args.py)
+    args.px, args.py = tuple(int(n) for n in mesh_xy.devices.shape)
     use_tda = args.tda
+    use_rpa = args.rpa or not args.bse
 
-    if args.kpm_dos:
+    if route == "kpm":
         from . import bse_kpm
+        bse_kpm.run(bse_kpm.settings(
+            args.input, n_val=args.n_val, n_cond=args.n_cond, px=args.px,
+            py=args.py, n_moments=args.kpm_n_moments,
+            n_random=args.kpm_n_random, n_lanczos=args.kpm_n_lanczos,
+            n_windows=args.kpm_window_count, plot_file=args.kpm_plot_file,
+            rpa=use_rpa, tda=use_tda, emin_ev=args.kpm_emin_ev,
+            emax_ev=args.kpm_emax_ev))
+        return 0
 
-        use_rpa = args.rpa or not args.bse
-        kpm_argv = [
-            "-i", args.input,
-            "--n-val", str(args.n_val),
-            "--n-cond", str(args.n_cond),
-            "--px", str(args.px),
-            "--py", str(args.py),
-            "--n-moments", str(args.kpm_n_moments),
-            "--n-random", str(args.kpm_n_random),
-            "--n-lanczos", str(args.kpm_n_lanczos),
-            "--n-windows", str(args.kpm_window_count),
-            "--plot-file", args.kpm_plot_file,
-        ]
-        if use_rpa:
-            kpm_argv.append("--rpa")
-        if use_tda:
-            kpm_argv.append("--tda")
-        if args.kpm_emin_ev is not None:
-            kpm_argv += ["--emin-ev", str(args.kpm_emin_ev)]
-        if args.kpm_emax_ev is not None:
-            kpm_argv += ["--emax-ev", str(args.kpm_emax_ev)]
-        # rc propagation is STRUCTURAL here: ``bse_kpm.main`` is ``-> None``
-        # and never returns a status code — argparse errors raise
-        # SystemExit(2) and any runtime failure raises out of ``main()``
-        # (nothing in it catches-and-returns), so a non-zero exit rides the
-        # exception past this line.  Reaching the line below means success.
-        # (A previous comment claimed ``main() or 0`` propagated a returned
-        # rc; with a None-returning delegate that expression was always 0 —
-        # release audit 2026-07-28.)
-        bse_kpm.main(kpm_argv)
-        raise SystemExit(0)
-
-    if not args.lanczos:
+    if route == "feast":
         from . import bse_feast
-
-        use_rpa = args.rpa or not args.bse
-        # rc propagation is structural, exactly as in the kpm branch above:
-        # ``bse_feast.main`` is ``-> None`` and signals failure by raising.
-        bse_feast.main(
-            [
-                "-i",
-                args.input,
-                "--n-val",
-                str(args.n_val),
-                "--n-cond",
-                str(args.n_cond),
-                "--px",
-                str(args.px),
-                "--py",
-                str(args.py),
-                "--n-lanczos",
-                str(args.feast_n_lanczos),
-                "--buffer",
-                str(args.feast_buffer),
-                "--n-quad1",
-                str(args.feast_n_quad1),
-                "--n-quad2",
-                str(args.feast_n_quad2),
-                "--quadrature",
-                args.feast_quadrature,
-                "--units-ev-per-ry",
-                str(args.feast_units_ev_per_ry),
-                "--feast-ritz",
-                "--feast-ritz-count",
-                str(args.feast_ritz_count),
-                "--gmres-max-iter",
-                str(args.gmres_max_iter),
-                "--gmres-tol",
-                str(args.gmres_tol),
-                "--gmres-seed",
-                str(args.gmres_seed),
-                *(["--gmres-fp32"] if args.gmres_fp32 else []),
-                *(["--rpa"] if use_rpa else []),
-                *(["--tda"] if use_tda else []),
-                "--windows-kpm",
-                "--windows-kpm-count",
-                str(args.kpm_window_count),
-                "--kpm-n-moments",
-                str(args.kpm_n_moments),
-                "--kpm-n-random",
-                str(args.kpm_n_random),
-                "--kpm-seed",
-                str(args.gmres_seed),
-                "--kpm-n-energy-pts",
-                "2000",
-                "--kpm-n-lanczos",
-                str(args.kpm_n_lanczos),
-                *(
-                    ["--window1", *args.feast_window1]
-                    if args.feast_window1 is not None
-                    else []
-                ),
-                *(
-                    ["--window2", *args.feast_window2]
-                    if args.feast_window2 is not None
-                    else []
-                ),
-            ]
-        )
-        raise SystemExit(0)
+        bse_feast.run(bse_feast.settings(
+            args.input, n_val=args.n_val, n_cond=args.n_cond, px=args.px,
+            py=args.py, n_lanczos=args.feast_n_lanczos,
+            buffer=args.feast_buffer, n_quad1=args.feast_n_quad1,
+            n_quad2=args.feast_n_quad2, quadrature=args.feast_quadrature,
+            units_ev_per_ry=args.feast_units_ev_per_ry, feast_ritz=True,
+            feast_ritz_count=args.feast_ritz_count,
+            gmres_max_iter=args.gmres_max_iter, gmres_tol=args.gmres_tol,
+            gmres_seed=args.gmres_seed, gmres_fp32=args.gmres_fp32,
+            rpa=use_rpa, tda=use_tda, windows_kpm=True,
+            windows_kpm_count=args.kpm_window_count,
+            kpm_n_moments=args.kpm_n_moments,
+            kpm_n_random=args.kpm_n_random, kpm_seed=args.gmres_seed,
+            kpm_n_energy_pts=2000, kpm_n_lanczos=args.kpm_n_lanczos,
+            window1=args.feast_window1, window2=args.feast_window2))
+        return 0
 
     # Non-TDA (full BSE) now flows through the same preview via the
     # ``solve_bse_sharded(tda=False)`` dispatch -> ``bse_nontda`` (structure-
