@@ -435,7 +435,9 @@ def antiunitary_check(mesh, fx_spin, fx_scalar, c, geo, *, taus=(0.35,), zs=(0.6
     sidx = build_sphere_box_index(gpar, tuple(c["fft_grid"]), w, ngk_valid=out.ngk[prow])
     tr = SphereTransport.typed(plan, fft_grid=c["fft_grid"], parent_sphere_index=sidx, children=out)
     assert np.allclose(tr.spin, 1.0)
-    res = dict(asym=asym, tau=0.0, tau_red=np.inf, z=0.0, z_red=np.inf, n_anti=int(np.sum(tr.anti)))
+    # a rule's miss is its worst row; a red twin's miss is its worst row too (it must be seen
+    # somewhere: an antiunitary row whose W is nearly real cannot tell the twin apart)
+    res = dict(asym=asym, tau=0.0, tau_red=0.0, z=0.0, z_red=0.0, n_anti=int(np.sum(tr.anti)))
     # W at τ: W(τ) = Σ_z [e^{-zτ'} W(z) + e^{-z̄τ'} W(z̄)] (any real-analytic weights)
     tp = 0.4
     Wt = sum(np.exp(-z * tp) * a + np.exp(-np.conj(z) * tp) * b for z, (a, b) in Wz.items())
@@ -448,14 +450,14 @@ def antiunitary_check(mesh, fx_spin, fx_scalar, c, geo, *, taus=(0.35,), zs=(0.6
         res["tau"] = max(res["tau"], cases.rel(np.where(m, img, 0), np.where(m, Wt[k], 0)))
         if anti:
             twin = pw.transport_operator(Wt[pr], np.where(live, src, 0), np.where(live, ph, 0), False)
-            res["tau_red"] = min(res["tau_red"], cases.rel(np.where(m, twin, 0), np.where(m, Wt[k], 0)))
+            res["tau_red"] = max(res["tau_red"], cases.rel(np.where(m, twin, 0), np.where(m, Wt[k], 0)))
         for z, (Wa, Wb) in Wz.items():
             srcW = Wb[pr] if anti else Wa[pr]                  # z̄ on an antiunitary row
             img = pw.transport_operator(srcW, np.where(live, src, 0), np.where(live, ph, 0), anti)
             res["z"] = max(res["z"], cases.rel(np.where(m, img, 0), np.where(m, Wa[k], 0)))
             if anti:
                 red = pw.transport_operator(Wa[pr], np.where(live, src, 0), np.where(live, ph, 0), anti)
-                res["z_red"] = min(res["z_red"], cases.rel(np.where(m, red, 0), np.where(m, Wa[k], 0)))
+                res["z_red"] = max(res["z_red"], cases.rel(np.where(m, red, 0), np.where(m, Wa[k], 0)))
     return res
 
 
