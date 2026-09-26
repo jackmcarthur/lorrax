@@ -269,9 +269,9 @@ def _pre_fix_stack_encode(Xb_b, psi_c_Y, psi_v_X):
     v_loc = Xb_b.shape[1] // py
     mine = lax.dynamic_slice_in_dim(Xb_b, lax.axis_index("y") * v_loc,
                                     v_loc, axis=1)
-    R = jnp.einsum("kcsN,cvk->vksN", jnp.conj(psi_c_Y), mine)
-    Rv = lax.all_gather(R, "y", axis=0, tiled=True)      # <- moves nu too
-    return jnp.einsum("kvtM,vksN->MNtsk", psi_v_X, Rv)
+    R = jnp.einsum("kcsN,cvk->kvsN", jnp.conj(psi_c_Y), mine)
+    Rv = lax.all_gather(R, "y", axis=1, tiled=True)      # <- moves nu too
+    return jnp.einsum("kvtM,kvsN->ktMsN", psi_v_X, Rv)   # the shipped k-leading T
 
 
 def _pre_fix_ring_encode(X, psi_c_Y, psi_v_X, v_chunk, px, py, mu_local,
