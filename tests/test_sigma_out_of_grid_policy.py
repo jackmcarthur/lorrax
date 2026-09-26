@@ -54,22 +54,23 @@ def test_the_sigma_build_reads_the_edge_under_clamp():
         assert diag["n_clipped"] == 1.0
 
 
-def _inputs(policy, n_frozen):
-    cfg = NS(compute_mode=NS(is_dynamic=True), omega_grid_ev=GRID,
+def _inputs(policy, n_frozen, session=None, grid=GRID):
+    cfg = NS(compute_mode=NS(is_dynamic=True), omega_grid_ev=grid,
              sigma=NS(out_of_grid=policy, omega_min_ev=-12.0, omega_max_ev=8.0,
-                      omega_step_ev=0.25),
+                      omega_step_ev=0.25,
+                      classification_window_ev=lambda: (-12.0, 8.0)),
              sc=NS(frozen_core_bands=n_frozen))
-    return NS(config=cfg, fixed_quadrature_session=None)
+    return NS(config=cfg, fixed_quadrature_session=session)
 
 
 def test_cover_grows_over_every_non_frozen_identity_and_nothing_else():
     part = BandPartition(protected_mask=np.ones(4, bool), in_range_mask=np.ones(4, bool))
     e = np.array([[-100.0, -5.0, 9.8, 11.7]])            # rel mu; band 1 is semicore
-    _, grown, _, _ = _sc_sampled_support(_inputs("cover", 1), part, e, 0.0)
+    _, grown, *_ = _sc_sampled_support(_inputs("cover", 1), part, e, 0.0)
     assert grown[0] == GRID[0]                           # frozen core does not grow it
     assert 11.7 + 0.5 + 1.17 <= grown[-1] < 11.7 + 0.5 + 1.17 + 0.25
     # Bounded by the spectrum it covers: unfrozen semicore reaches E - pad(E).
-    _, grown, _, _ = _sc_sampled_support(_inputs("cover", 0), part, e, 0.0)
+    _, grown, *_ = _sc_sampled_support(_inputs("cover", 0), part, e, 0.0)
     assert -100.0 - 10.5 - 0.25 < grown[0] <= -100.0 - 10.5
     # ... unless the W model calls it inactive (shared_pole_recipe.active_band_mask):
     # then no fc key is needed and the semicore keeps Sigma(0) as under static.
@@ -77,10 +78,10 @@ def test_cover_grows_over_every_non_frozen_identity_and_nothing_else():
     from common.units import RYD_TO_EV
     active = active_band_mask(e / RYD_TO_EV, 0.0)
     np.testing.assert_array_equal(active, [False, True, True, True])
-    _, grown, _, _ = _sc_sampled_support(_inputs("cover", 0), part, e, 0.0, active)
+    _, grown, *_ = _sc_sampled_support(_inputs("cover", 0), part, e, 0.0, active)
     assert grown[0] == GRID[0] and grown[-1] > 11.7
     for policy in ("static", "clamp"):                   # window rule: +9.8 and +11.7 lie
-        _, grown, _, _ = _sc_sampled_support(_inputs(policy, 1), part, e, 0.0)
+        _, grown, *_ = _sc_sampled_support(_inputs(policy, 1), part, e, 0.0)
         np.testing.assert_array_equal(grown, GRID)       # beyond the +9.44 padded top
 
 
@@ -91,11 +92,11 @@ def test_frozen_core_cannot_extend_the_sampled_grid(policy):
     # The core is just outside the sampled grid, inside the SC pad.  Only
     # the valence identity can request a new Sigma sample.
     e = np.array([[-12.25, -1.0]])
-    _, frozen_grid, _, required = _sc_sampled_support(
+    _, frozen_grid, _, required, _ = _sc_sampled_support(
         _inputs(policy, 1), part, e, 0.0)
     np.testing.assert_array_equal(frozen_grid, GRID)
     np.testing.assert_array_equal(required, [[False, True]])
-    _, live_grid, _, _ = _sc_sampled_support(
+    _, live_grid, *_ = _sc_sampled_support(
         _inputs(policy, 0), part, e, 0.0)
     assert live_grid[0] < GRID[0]
 
@@ -126,3 +127,73 @@ def test_coverage_is_judged_in_the_frame_the_sigma_build_uses():
     np.testing.assert_allclose(frame(ComputeMode.GN_PPM, "midgap"), 0.5 * (-5.1 - 0.9), atol=1e-12)
     np.testing.assert_allclose(frame(ComputeMode.GN_PPM, "vbm"), -5.1, atol=1e-12)
     np.testing.assert_allclose(frame(ComputeMode.MPA, "midgap"), -4.332, atol=1e-12)
+
+
+def _commit(session, support):
+    """What the SC map writes back after logging (sc_iteration)."""
+    sampled, grown, _, _, event = support
+    session["omega_grid_ev"] = tuple(grown)
+    session["window_plan"] = {"index": 0 if event == "plan" else 1, "event": event}
+    return grown, event
+
+
+def test_sc_window_plan_one_shot_then_plan_then_hold_then_extend():
+    """Owner 2026-09-25: map 0 is the one-shot grid, map 1 plans once at 1 eV,
+    later maps hold while every read support [E - 0.5, E + 0.5] is inside,
+    and a crossing extends only its edge, to E + 1 eV."""
+    from gw.scissor import SC_WINDOW_PAD_EV, sc_read_halfwidth_ev
+    assert SC_WINDOW_PAD_EV == (2.0, 1.0) and sc_read_halfwidth_ev() == 0.5
+    part = BandPartition(protected_mask=np.ones(3, bool), in_range_mask=np.ones(3, bool))
+    session = {}
+    inputs = _inputs("cover", 0, session, grid=np.arange(-12.0, 8.0 + 1e-9, 0.25))
+    grid0, event = _commit(session, _sc_sampled_support(
+        inputs, part, np.array([[-5.0, 0.3, 9.9]]), 0.0))
+    assert event == "plan"                                  # one-shot growth: E + pad(E)
+    assert 9.9 + 0.5 + 0.99 <= grid0[-1] < 9.9 + 0.5 + 0.99 + 0.25
+    grid1, event = _commit(session, _sc_sampled_support(
+        inputs, part, np.array([[-5.0, 0.3, 12.0]]), 0.0))
+    assert event == "re-plan"
+    assert grid1[0] == -12.0 and 13.0 <= grid1[-1] < 13.25   # from the requested grid, 1 eV
+    held, event = _commit(session, _sc_sampled_support(
+        inputs, part, np.array([[-5.0, 0.3, 12.5]]), 0.0))
+    assert event == "hold"                                  # 12.5 + 0.5 <= 13.0
+    np.testing.assert_array_equal(held, grid1)
+    grown, event = _commit(session, _sc_sampled_support(
+        inputs, part, np.array([[-5.0, 0.3, 12.6]]), 0.0))
+    assert event == "extend"                                # 12.6 + 0.5 > 13.0
+    assert grown[0] == grid1[0] and 13.6 <= grown[-1] < 13.85
+    np.testing.assert_array_equal(grown[:grid1.size], grid1)   # old samples kept
+    shrunk, event = _commit(session, _sc_sampled_support(
+        inputs, part, np.array([[-5.0, 0.3, 10.0]]), 0.0))
+    assert event == "hold" and shrunk.size == grown.size    # a hold never shrinks
+
+
+def test_a_single_map_run_keeps_the_one_shot_rule():
+    part = BandPartition(protected_mask=np.ones(2, bool), in_range_mask=np.ones(2, bool))
+    *_, event = _sc_sampled_support(_inputs("cover", 0), part, np.array([[0.3, 9.9]]), 0.0)
+    assert event == "one-shot"
+
+
+def test_unset_grid_edges_derive_the_grid_from_the_bands():
+    """Owner 2026-09-25: omega_min/max are optional. Unset, the requested grid
+    is the sample next to E_F on each side and the bands set the rest; set,
+    they are a minimum extent kept on every map."""
+    from gw.gw_config import DynamicSigmaConfig
+    base = dict(omega_step_ev=0.25, regularization_ev=0.25, window_edge_factor=1.0,
+                fermi_reference="vbm", sigma_at_dft_extrapolate=False,
+                sigma_at_dft_energies=False)
+    unset = DynamicSigmaConfig(omega_min_ev=None, omega_max_ev=None, **base)
+    assert unset.requested_edges_ev() == (-0.25, 0.25)
+    assert unset.classification_window_ev() == (-np.inf, np.inf)
+    half = DynamicSigmaConfig(omega_min_ev=-3.0, omega_max_ev=None, **base)
+    assert half.requested_edges_ev() == (-3.0, 0.25)
+    for policy in ("clamp", "static"):
+        with pytest.raises(ValueError, match="needs sigma_out_of_grid = cover"):
+            DynamicSigmaConfig(omega_min_ev=None, omega_max_ev=5.0,
+                               out_of_grid=policy, **base)
+    from gw.scissor import grow_sigma_support_ev
+    requested = np.arange(-0.25, 0.25 + 1e-9, 0.25)
+    grown, _ = grow_sigma_support_ev(unset, 0, requested, np.array([[-6.0, 2.0]]),
+                                     np.ones((1, 2), bool))
+    assert grown[0] <= -6.0 - 1.1 and grown[-1] >= 2.0 + 0.7
+    assert np.isclose(grown, 0.0).any()

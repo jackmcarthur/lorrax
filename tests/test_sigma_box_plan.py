@@ -79,8 +79,15 @@ def _fake_rule(box, eps, **_kwargs):
 
 
 def _freezing_session():
-    """A fresh SC session: its first call serves map 0 one-shot and freezes."""
+    """A fresh SC session: its first call serves map 0 one-shot and certifies
+    the first plan; the second re-plans (map 1)."""
     return {}
+
+
+def _held(plan_call):
+    """Run map 0 (one-shot + first plan) and map 1 (the re-plan); return map 1's result."""
+    plan_call()
+    return plan_call()
 
 
 def _frozen_digests(session, geometry):
@@ -391,12 +398,12 @@ def test_sc_fixed_tail_covers_a_state_crossing_the_product_edge(
 
     # The selector boundary is .65 Ry. A .02 Ry motion introduces a new
     # nearest tail state; its old member at 3 Ry must not set the certificate.
-    _, initial = plan(0.64)
+    _, initial = _held(lambda: plan(0.64))
     frozen = _frozen_digests(session, initial)
     calls.clear()
     _, current = plan(0.66)
     assert not calls
-    assert current["sc_fixed_total_rebuild_count"] == 0
+    assert current["sc_fixed_rebuilds_this_iteration"] == 0
     assert frozen == [w["node_digest"] for w in current["branches"][0]["windows"]]
 
 
@@ -413,11 +420,19 @@ def test_sc_fixed_session_reuses_identical_nodes_without_refitting(monkeypatch):
         eps=1.0e-4, cache_dir=None,
         fixed_rule_session=session,
         print_fn=lambda *_args, **_kwargs: None)
+    plan_sigma_windows(
+        _summaries(), [_branch_at((0.1, 3.0))],
+        np.asarray([0.2, 0.5]), 0.1, **args)
+    # Map 0: its own one-shot rules, then the first plan's held set.
+    assert len(calls) == 6
+    calls.clear()
     _, first_geometry = plan_sigma_windows(
         _summaries(), [_branch_at((0.1, 3.0))],
         np.asarray([0.2, 0.5]), 0.1, **args)
-    # Map 0: its own one-shot rules, then the padded set it freezes.
-    assert len(calls) == 6
+    # Map 1 holds: every box sits inside its first-plan rule; none refit.
+    assert calls == []
+    assert first_geometry["sc_plan_event"] == "hold"
+    assert first_geometry["sc_fixed_rebuilds_this_iteration"] == 0
     frozen = _frozen_digests(session, first_geometry)
     calls.clear()
     first, _ = plan_sigma_windows(
@@ -430,6 +445,7 @@ def test_sc_fixed_session_reuses_identical_nodes_without_refitting(monkeypatch):
     assert second_geometry["sc_fixed_quadrature"]
     assert not second_geometry["sc_fixed_initialized"]
     assert second_geometry["sc_fixed_rebuilds_this_iteration"] == 0
+    assert second_geometry["sc_plan_event"] == "hold"
     assert second_geometry["sc_fixed_total_rebuild_count"] == 0
     assert all(row["cache_status"] == "hit:sc-fixed"
                for row in second_geometry["branches"][0]["windows"])
@@ -455,9 +471,9 @@ def test_sc_fixed_rule_covers_the_declared_pole_support(monkeypatch):
         eps=1.0e-4, cache_dir=None, fixed_rule_session=session,
         fixed_pole_support_ry=5.0,
         print_fn=lambda *_args, **_kwargs: None)
-    _, first_geometry = plan_sigma_windows(
+    _, first_geometry = _held(lambda: plan_sigma_windows(
         _summaries(), [_branch_at((0.1, 3.0))],
-        np.asarray([0.2, 0.5]), 0.1, **args)
+        np.asarray([0.2, 0.5]), 0.1, **args))
     first, _ = plan_sigma_windows(
         _summaries(), [_branch_at((0.1, 3.0))],
         np.asarray([0.2, 0.5]), 0.1, **args)
@@ -491,11 +507,12 @@ def test_sc_fixed_session_rebuilds_an_escaped_window_and_says_so(monkeypatch):
         eps=1.0e-4, cache_dir=None,
         fixed_rule_session=session,
         print_fn=lambda *_args, **_kwargs: None)
-    _, first = plan_sigma_windows(
+    _, first = _held(lambda: plan_sigma_windows(
         _summaries(), [_branch_at((0.1, 3.0))],
-        np.asarray([0.2, 0.5]), 0.1, **args)
+        np.asarray([0.2, 0.5]), 0.1, **args))
     frozen = dict(zip((row["name"] for row in first["branches"][0]["windows"]),
                       _frozen_digests(session, first)))
+    planned = first["sc_fixed_total_rebuild_count"]
     calls.clear()
     # A box that escapes the frozen certificate refits THAT window (owner
     # 2026-09-22; per window since 2026-09-24), and the receipt must say so:
@@ -514,7 +531,10 @@ def test_sc_fixed_session_rebuilds_an_escaped_window_and_says_so(monkeypatch):
         name for name in rows if name in reasons]
     assert escaped["sc_fixed_escaped_windows"] == len(reasons)
     assert escaped["sc_fixed_rebuilds_this_iteration"] == len(reasons)
-    assert escaped["sc_fixed_total_rebuild_count"] == len(reasons)
+    assert escaped["sc_fixed_total_rebuild_count"] == planned + len(reasons)
+    assert escaped["sc_plan_event"] == "extend"
+    # The reason names the state that crossed: k, band and E - mu.
+    assert any("state k=0 band=2" in reason for reason in reasons.values())
     assert len(calls) == len(reasons)
     for name, row in rows.items():
         refit = name in reasons
@@ -539,9 +559,9 @@ def test_sc_fixed_session_keeps_receipt_for_temporarily_empty_window(
         eps=1.0e-4, cache_dir=None,
         fixed_rule_session=session,
         print_fn=lambda *_args, **_kwargs: None)
-    _, first_geometry = plan_sigma_windows(
+    _, first_geometry = _held(lambda: plan_sigma_windows(
         _summaries(), [_branch_at((0.1, 3.0))],
-        np.asarray([0.2, 0.5]), 0.1, **args)
+        np.asarray([0.2, 0.5]), 0.1, **args))
     frozen = _frozen_digests(session, first_geometry)
     calls.clear()
     _, subset_geometry = plan_sigma_windows(
@@ -584,9 +604,9 @@ def test_sc_fixed_session_rebuilds_for_a_window_absent_from_iteration_one(
         eps=1.0e-4, cache_dir=None,
         fixed_rule_session=session,
         print_fn=lambda *_args, **_kwargs: None)
-    plan_sigma_windows(
+    _held(lambda: plan_sigma_windows(
         _summaries(), [_branch_at((0.1, 0.2))],
-        np.asarray([0.2, 0.5]), 0.1, **args)
+        np.asarray([0.2, 0.5]), 0.1, **args))
     calls.clear()
     _, grown = plan_sigma_windows(
         _summaries(), [_branch_at((0.1, 3.0))],
@@ -594,7 +614,7 @@ def test_sc_fixed_session_rebuilds_for_a_window_absent_from_iteration_one(
     assert calls
     assert not grown["sc_fixed_initialized"]
     new = {name for name, reason in grown["sc_fixed_recompute_reasons"].items()
-           if reason == "absent when the rules froze"}
+           if reason == "escape: absent when the rules froze"}
     assert new and new <= set(grown["sc_fixed_rebuilt_windows"])
 
 
@@ -611,9 +631,9 @@ def test_sc_fixed_session_refits_only_on_material_class_flip(monkeypatch):
         eps=1.0e-4, cache_dir=None,
         fixed_rule_session=session,
         print_fn=lambda *_args, **_kwargs: None)
-    _, first = plan_sigma_windows(
+    _, first = _held(lambda: plan_sigma_windows(
         _summaries(), [_branch_at((0.1, 3.0))],
-        np.asarray([0.2, 0.5]), 0.1, material_class="metal", **args)
+        np.asarray([0.2, 0.5]), 0.1, material_class="metal", **args))
     assert first["sc_fixed_material_class"] == "metal"
     calls.clear()
     _, second = plan_sigma_windows(
@@ -624,14 +644,15 @@ def test_sc_fixed_session_refits_only_on_material_class_flip(monkeypatch):
     _, flipped = plan_sigma_windows(
         _summaries(), [_branch_at((0.11, 3.01))],
         np.asarray([0.2, 0.5]), 0.1, material_class="insulator", **args)
+    # A flip re-initializes: one-shot rules and a new first plan.
     assert len(calls) == 6
     assert flipped["sc_fixed_initialized"]
     assert flipped["sc_fixed_material_class"] == "insulator"
     assert flipped["sc_fixed_class_flip"] == "metal->insulator"
 
 
-def test_sc_map0_is_the_one_shot_plan_and_freezes_padded_rules(monkeypatch, tmp_path):
-    """Map 0 serves the one-shot plan and freezes padded rules that map 1 reuses."""
+def test_sc_map0_is_the_one_shot_plan_and_certifies_the_held_rules(monkeypatch, tmp_path):
+    """Map 0 serves the one-shot plan and certifies the held rules; later maps hold."""
     calls = []
 
     def counted(box, eps, **kwargs):
@@ -652,9 +673,11 @@ def test_sc_map0_is_the_one_shot_plan_and_freezes_padded_rules(monkeypatch, tmp_
             0.1, cache_dir=str(tmp_path / "sc"), fixed_rule_session=session,
             **quiet)
         receipts.append((plan, geometry, len(calls)))
-    (map0, first, built), (_, second, reused), (_, third, _) = receipts
+    (map0, first, built), (_, second, planned), (_, third, held) = receipts
     assert [g["sc_rule_mode"] for g in (first, second, third)] == [
         "one-shot", "frozen", "frozen"]
+    assert [g["sc_plan_event"] for g in (first, second, third)] == [
+        "plan", "hold", "hold"]
     # Map 0 is the one-shot planner's plan (SC map 0 = one-shot G0W0).
     for left, right in zip(one_shot, map0):
         np.testing.assert_array_equal(left.window.nodes.t, right.window.nodes.t)
@@ -662,34 +685,38 @@ def test_sc_map0_is_the_one_shot_plan_and_freezes_padded_rules(monkeypatch, tmp_
     assert [w["rule_box_ry"] for w in windows] == [
         w["rule_box_ry"] for w in one_shot_geometry["branches"][0]["windows"]]
     assert not any(w["sc_fixed_rule"] or w["sc_fixed_padded_box_ry"] for w in windows)
-    # The same call fitted the padded set beside the one-shot set; the one-shot
-    # fits are the one-shot plan's own builds, served by the rule table.
+    # The same call fitted the padded set beside the one-shot set: the three
+    # one-shot fits are the one-shot plan's own builds, served by the rule
+    # table (3 hits), and the builder ran only for the three padded held rules
+    # (3 builds) that map 1 then serves.
     assert first["sc_fixed_initialized"] and built == 3
     assert first["rule_table_lookups"] == {"hit": 3, "built": 3}
     assert first["sc_fixed_initial_window_tau_pairs"] == 6
-    for w in windows:
-        padded = session["rules"][w["name"]]["padded_box"]
-        assert padded[0] <= w["box_ry"][0] and padded[1] >= w["box_ry"][1]
-    assert reused == 0 and not second["sc_fixed_initialized"]
-    assert all(w["sc_fixed_rule"] and w["sc_fixed_padded_box_ry"]
-               and w["cache_status"] == "hit:sc-fixed"
-               for w in second["branches"][0]["windows"])
-    assert third["sc_fixed_rebuilds_this_iteration"] == 0
+    # Map 1 holds: each current box is inside its first-plan rule.
+    assert planned == 0 and second["sc_fixed_rebuilds_this_iteration"] == 0
+    resonant = session["rules"]["positive conduction:resonant"]
+    assert resonant["pad_ev"][0] == pytest.approx(2.0)          # max(2 eV, 10% of 1.4 eV)
+    assert resonant["certified"]["states_ry"][0] == pytest.approx(0.1 - 2.0 / RYD_TO_EV)
+    assert held == 0 and third["sc_fixed_rebuilds_this_iteration"] == 0
+    assert all(w["cache_status"] == "hit:sc-fixed"
+               for w in third["branches"][0]["windows"])
     assert [w["node_digest"] for w in third["branches"][0]["windows"]] == [
         w["node_digest"] for w in second["branches"][0]["windows"]]
+    # One node capacity for the held executables, never lowered.
+    assert third["sc_tau_capacity"] == second["sc_tau_capacity"] == 2
 
 
-def test_sc_rule_padding_scales_with_state_energy_and_ten_percent_on_poles():
+def test_sc_rule_padding_is_the_flat_plan_pad_and_ten_percent_on_poles():
     eta = 0.1
     spec = make_sigma_box_spec(
         name="crossing", frequencies=(-2.0, 2.0), states=(-0.2, 0.2),
         pole_stats=((1.0, 2.0, 0.5, 1.0),), pole_sign=1.0,
         eta_ry=eta)
+    spec["pole_bounds"] = (0.0, 2.5)                     # a bounded (shallow) selector
     assert spec["kind"] == "crossing"
-    padded = _sc_padded_box_spec(spec, eta)
+    padded = _sc_padded_box_spec(spec, eta, plan_index=1)
     expanded_poles = ((0.9, 2.2, 0.45, 1.1),)
-    pad_ev = 0.5 + 0.10 * (0.2 * RYD_TO_EV)
-    pad_ry = pad_ev / RYD_TO_EV
+    pad_ry = 1.0 / RYD_TO_EV
     pole_box, _, _ = _box_for_window(
         spec["frequencies"], (-0.2 - pad_ry, 0.2 + pad_ry), expanded_poles,
         spec["pole_sign"], eta)
@@ -699,29 +726,46 @@ def test_sc_rule_padding_scales_with_state_energy_and_ten_percent_on_poles():
         min(spec["box"][2], pole_box[2]),
         max(spec["box"][3], pole_box[3]),
     )
-    # No flat pad remains (owner 2026-09-24): the certificate is the
-    # classification and pole pads alone.
     np.testing.assert_allclose(padded["box"], expected, rtol=0.0, atol=0.0)
-    assert padded["sc_state_pad_ev"] == (pad_ev, pad_ev)
-    assert "sc_flat_pad_ev" not in padded
+    assert padded["sc_state_pad_ev"] == (1.0, 1.0)
     assert padded["sc_pole_pad_fraction"] == 0.10
+    assert padded["sc_certified_poles_ry"][:2] == pytest.approx((0.9, 2.2))
 
 
-def test_sc_edge_pad_is_the_pad_of_the_state_that_sets_the_edge():
-    """A crossing box's short side takes the frontier state's pad."""
+def test_sc_rule_state_pad_follows_the_qp_stretch_far_from_mu():
+    """max(flat, 10%|E - mu|) per edge: Na 8^3's top state moved +96 -> +101 eV
+    at map 1, which a flat pad cannot hold (553 s of refits)."""
     eta = 0.02
-    states = np.asarray([0.03, 0.4, 1.2])
+    far = 96.0 / RYD_TO_EV
     spec = make_sigma_box_spec(
-        name="cond resonant", frequencies=(0.0, 1.0), states=states,
-        pole_stats=((0.6, 1.1, 0.0, 0.0),), pole_sign=1.0, eta_ry=eta)
-    assert spec["kind"] == "crossing"
-    padded = _sc_padded_box_spec(spec, eta)
-    near, far = (0.5 + 0.1 * states[[0, -1]] * RYD_TO_EV)
-    assert padded["sc_state_pad_ev"] == pytest.approx((near, far))
-    # The short (positive) side moved by the frontier pad plus the pole pad,
-    # not by the farthest state's pad.
-    grown = padded["box"][1] - spec["box"][1]
-    assert grown < (near + 1.0) / RYD_TO_EV < far / RYD_TO_EV
+        name="val bulk", frequencies=(0.0, 1.0), states=(0.1, far),
+        pole_stats=((0.5, 1.0, 0.0, 0.0),), pole_sign=-1.0, eta_ry=eta)
+    first = _sc_padded_box_spec(spec, eta, plan_index=0)
+    later = _sc_padded_box_spec(spec, eta, plan_index=1)
+    assert first["sc_state_pad_ev"] == pytest.approx((2.0, 9.6))
+    assert later["sc_state_pad_ev"] == pytest.approx((1.0, 9.6))
+    moved = make_sigma_box_spec(
+        name="moved", frequencies=(0.0, 1.0), states=(0.1, 101.0 / RYD_TO_EV),
+        pole_stats=((0.5, 1.0, 0.0, 0.0),), pole_sign=-1.0, eta_ry=eta)
+    assert first["box"][1] >= moved["box"][1]
+
+
+def test_sc_rule_far_pole_edge_of_an_open_selector_is_doubled():
+    """Deep and bulk windows certify their far pole at 2x (Fe 4^3 map 2 refit
+    6/12 windows when the top shared-pole mode moved 20-30 % past a 10 % pad)."""
+    from gw.sigma_box_plan import _SC_FAR_POLE_FACTOR
+    eta = 0.02
+    spec = make_sigma_box_spec(
+        name="cond pole_tail", frequencies=(0.0, 1.0), states=(0.1, 0.5),
+        pole_stats=((2.0, 10.0, 0.0, 0.0),), pole_sign=1.0, eta_ry=eta)
+    spec["pole_bounds"] = (1.5, np.inf)
+    padded = _sc_padded_box_spec(spec, eta, plan_index=1)
+    assert _SC_FAR_POLE_FACTOR == 2.0
+    assert padded["sc_certified_poles_ry"][:2] == pytest.approx((1.8, 20.0))
+    moved = make_sigma_box_spec(
+        name="moved", frequencies=(0.0, 1.0), states=(0.1, 0.5),
+        pole_stats=((2.0, 13.0, 0.0, 0.0),), pole_sign=1.0, eta_ry=eta)
+    assert padded["box"][0] <= moved["box"][0] and padded["kind"] == moved["kind"]
 
 
 def test_sc_pad_does_not_cross_the_windows_own_state_selector():
@@ -738,10 +782,10 @@ def test_sc_pad_does_not_cross_the_windows_own_state_selector():
         name="val bulk", frequencies=(0.0, 1.0), states=(0.03, 0.5),
         pole_stats=((0.01, 1.0, 0.0, 0.5),), pole_sign=-1.0, eta_ry=eta)
     assert spec["kind"] == "sign_definite_positive"
-    unbounded = _sc_padded_box_spec(spec, eta)
+    unbounded = _sc_padded_box_spec(spec, eta, plan_index=1)
     assert unbounded["box"][0] == _SC_ZERO_SIDE_CAP * spec["box"][0]
     spec["state_interval"] = (state_lo, np.inf)
-    bounded = _sc_padded_box_spec(spec, eta)
+    bounded = _sc_padded_box_spec(spec, eta, plan_index=1)
     nearest_member = 0.0 + state_lo + 0.9 * 0.01
     assert bounded["box"][0] >= 0.7 * nearest_member * (1 - 1e-12)
     assert bounded["box"][0] > 10 * unbounded["box"][0]
@@ -749,7 +793,7 @@ def test_sc_pad_does_not_cross_the_windows_own_state_selector():
 
 
 def test_states_drifting_within_their_pads_stay_inside_the_frozen_box():
-    """The classification guarantee: no state inside its pad escapes."""
+    """The plan's guarantee: no state inside its pad escapes."""
     rng = np.random.default_rng(7)
     eta = 0.02
     for trial in range(40):
@@ -761,8 +805,8 @@ def test_states_drifting_within_their_pads_stay_inside_the_frozen_box():
             pole_stats=(pole,), pole_sign=1.0, eta_ry=eta)
         if spec["kind"] != "crossing":
             continue
-        padded = _sc_padded_box_spec(spec, eta)
-        pads = (0.5 + 0.1 * np.abs(states) * RYD_TO_EV) / RYD_TO_EV
+        padded = _sc_padded_box_spec(spec, eta, plan_index=1)
+        pads = np.maximum(1.0 / RYD_TO_EV, 0.10 * np.abs(states))
         for shift in (-1.0, 1.0, rng.uniform(-1.0, 1.0, states.size)):
             moved = make_sigma_box_spec(
                 name="moved", frequencies=frequencies,
@@ -799,7 +843,7 @@ def test_fixed_sc_refuses_a_rule_above_eps_without_retrying(monkeypatch):
     assert not any("time_budget" in kw or "reduction_steps" in kw
                    for kw in calls)
     # Three windows, fitted once for map 0's one-shot plan and once for the
-    # padded set it freezes: six builder calls, nothing tried twice.
+    # first plan's held set: six builder calls, nothing tried twice.
     assert len(calls) == 6
 
 
@@ -809,7 +853,7 @@ def test_sc_pad_keeps_a_sign_definite_support_sign_definite():
             "box": (-2.0, -0.3, 0.05, 0.4),
             "pole_extent": (-3.0, -0.05, 0.05, 0.4), "frequencies": np.asarray([0.0]),
             "states": np.asarray([0.0]), "pole_sign": 1}
-    padded = _sc_padded_box_spec(spec, 0.02)
+    padded = _sc_padded_box_spec(spec, 0.02, plan_index=1)
     # The pads alone would cross zero here; the zero side stops at the cap.
     assert padded["kind"] == "sign_definite_negative"
     assert padded["box"][1] == _SC_ZERO_SIDE_CAP * spec["box"][1]
