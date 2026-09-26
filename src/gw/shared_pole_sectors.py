@@ -172,9 +172,10 @@ def construct_sector_poles(bank, meta, config, *, mesh_xy, output):
     from common import timing
     from common.collectives import (device_put_process_local, gather_to_host,
                                     rank0_transaction)
+    from functools import partial
     from file_io.shared_pole_store import (validate_shared_pole_bank, _metadata, open_shared_pole_bank,
-        read_line_panels,write_shared_pole_model,write_shared_pole_sector_manifest)
-    from gw.shared_pole_local import batch_to_face,canonical_factors,face_rows
+        preview_model_write,read_line_panels,write_shared_pole_model,write_shared_pole_sector_manifest)
+    from gw.shared_pole_local import batch_to_face,canonical_factors,carrier_history,face_rows
     from gw.shared_pole_screening import _json
     from gw.shared_pole_directions import _sample_point
     from jax.sharding import NamedSharding,PartitionSpec as P
@@ -349,6 +350,21 @@ def construct_sector_poles(bank, meta, config, *, mesh_xy, output):
         # no all-parent factor stack or full photon operator is materialized.
         with timing.section('spole.sector.write', announce=True):
             ct_host_census=None
+            # One writer carrier per model (CC, TT, CT) held across rounds and
+            # maps (held_writer_width); CT_C and CT_T share the CT census.
+            writer_history=carrier_history(meta)
+            writer_capacity=getattr(meta,'shared_pole_rank_capacity',None)
+            writer_events=None if writer_capacity is None else writer_capacity.setdefault('_events',[])
+            spans=_contiguous_q_spans(ids,real)
+            rows=max(q1-q0 for q0,q1,_ in spans)
+
+            def writer_fits(model_name,width):
+                families=(0,1) if model_name=='CT' else ((0,) if model_name=='CC' else (1,))
+                try:
+                    return all(preview_model_write(meta,(rows,bank['mu_bases'][f].n_packed,3 if f else 1,width),
+                                                   basis=bank['mu_bases'][f]) for f in families)
+                except (ValueError,MemoryError,RuntimeError):
+                    return False
             for name,family,model,active_mask in zip(
                     ('CC','TT','CT_C','CT_T'),(0,1,0,1),models,treatment_masks):
                 ambient=ledger.live_stages
@@ -374,7 +390,8 @@ def construct_sector_poles(bank, meta, config, *, mesh_xy, output):
                     # exact host pole bytes and mask at the writer boundary;
                     # their endpoint factors still travel independently.
                     census=_host_sector_census(treated_poles,active_mask,mesh_xy,real,
-                        common=ct_host_census if name=='CT_T' else None)
+                        common=ct_host_census if name=='CT_T' else None,
+                        hold=(writer_history,('writer',name[:2]),partial(writer_fits,name[:2]),writer_events))
                     if name=='CT_C':
                         ct_host_census=census
                     poles,active,counts,width=census
@@ -451,8 +468,12 @@ def _sector_model_residence(meta,config,header,mu_bases,execution_rows,*,mesh_xy
     return {name:ResidentSectorModel(mesh_xy,label=str(root/(name+'.h5'))) for name in rows},receipt
 
 
-def _host_sector_census(poles,mask,mesh_xy,real,*,common=None):
-    """Materialize one writer census, or reuse the CT_C bytes for CT_T."""
+def _host_sector_census(poles,mask,mesh_xy,real,*,common=None,hold=None):
+    """Materialize one writer census, or reuse the CT_C bytes for CT_T.
+
+    ``hold`` is ``(history, key, fits, events)`` for the held writer carrier
+    (:func:`held_writer_width`); without it the carrier is this round's own.
+    """
     if common is not None:
         return common
     import jax
@@ -471,10 +492,38 @@ def _host_sector_census(poles,mask,mesh_xy,real,*,common=None):
     width=padded_axis(ladder_extent(int(counts[:real].max()),poles.shape[-1]),
         mesh_xy,name='shared_pole_port',
         specs=((P('x','y'),0),(P('x','y'),1))).carrier
+    if hold is not None:
+        width=held_writer_width(width,int(counts[:real].max()),*hold)
     # The factor carrier is Py aligned; only inactive pole columns are added.
     if poles.shape[-1] < width:
         poles=np.pad(poles,((0,0),(0,width-poles.shape[-1])),constant_values=1.0)
     return poles,active,counts,width
+
+
+def held_writer_width(live, kmax, history, key, fits, events):
+    """The writer carrier of one sector model: the largest one so far, or this round's.
+
+    The live carrier (this round's Kmax on the extent ladder) moves between
+    rounds and SC maps, and each new width lowered the face handoff, the
+    canonical stack and the store's staging, check and finalize programs
+    (Fe 4^3 bispinor: 2 at map 2, 1 at map 3, about 20 per map at maps 0-1).
+    ``history[key]`` keeps the largest live carrier of any earlier round or
+    map of this model (``carrier_history``); it grows only when a live carrier
+    exceeds it, noted in ``events`` (the SC log's list, None outside an SC
+    map past 0), and never shrinks. The extra columns are what the ladder pad
+    already writes past each parent's K: zero factor columns and unit poles,
+    which the store checks and never reads as poles. ``fits(width)`` prices
+    the store's write at the held carrier; if it does not fit, the round
+    writes at its live carrier and the hold is kept.
+    """
+    before=int(history.get(key,0))
+    if live>before:
+        if before and events is not None:
+            events.append(f"shared-pole writer carrier ({key[1]}): Kmax {kmax} exceeds the held "
+                          f"width {before}; grown to {live}")
+        history[key]=live
+        return live
+    return before if before==live or fits(before) else live
 
 
 def sector_held_errors(signed, samples, z, *, mesh_xy):
@@ -654,6 +703,17 @@ def construct_diagonal_sector_round(samples, moments, meta, config, geometry, *,
         return table,side
     states,infinity,(tables,side)=grow_round(
         round_key,states,infinity,history=history,preview=_preview,admit=_admit)
+    # The held per-state carriers grow only when a state's selection exceeds
+    # them; each growth widens this sector's pencil and every program keyed by
+    # it. An SC map past 0 says so in its log, as the CT span and K holds do.
+    before=history.get((round_key,'side'),(0,))[0]
+    if side>before:
+        capacity=getattr(meta,'shared_pole_rank_capacity',None)
+        if before and capacity is not None:
+            capacity.setdefault('_events',[]).append(
+                f"shared-pole {geometry['sector']} round: a state's selection exceeds its held carrier; "
+                f"pencil side {before} -> {side}")
+        history[(round_key,'side')]=(int(side),)
     from gw.shared_pole_recipe import shared_real_pole_gates_ordered_v1
     gram_keep = shared_real_pole_gates_ordered_v1['normalized_gram_keep']['sector_threshold']
     if execution == 'face':

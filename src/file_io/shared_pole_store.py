@@ -390,6 +390,25 @@ def _check_factor(b, poles2, K):
         _refuse("nonfinite, unsorted/nonpositive active poles or invalid inactive sentinel")
 
 
+def preview_model_write(meta, shape, *, basis=None):
+    """Whether :func:`write_shared_pole_model` would admit a factor batch of ``shape``.
+
+    ``shape`` is the (parent, mu_p, component, Kp) handoff. The price is the
+    writer's own admission (its conversion kernel's argument, output and
+    temporary bytes plus the pole scratch) against the map ledger's live
+    stages, without a ledger row. A caller choosing an optional wider carrier
+    asks here before allocating it and keeps its live width on False.
+    """
+    basis = meta.mu_basis if basis is None else basis
+    ledger = _capacity(meta)
+    shape = tuple(int(v) for v in shape)
+    arg, output, temporary = _conversion_bytes(basis, shape, P(None, "x", None, "y"), unpack=True)
+    row = ledger.preview(resident_bytes_per_rank=output,
+                         workspace_bytes_per_rank=temporary + arg + 3 * shape[0] * shape[-1] * 8,
+                         concurrent_with=ledger.live_stages)
+    return row["device_budget_status"] == "PASS"
+
+
 @timing.timed("shared_pole_store.write_model")
 def write_shared_pole_model(path, b, poles2, K, *, q_span, meta, tables,
                             recipe, receipts, ordered=False, basis=None, sector=None):
