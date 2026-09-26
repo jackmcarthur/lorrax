@@ -270,6 +270,17 @@ nearby maps hit without widening a crossing rank.
 resolves against the deck. The cache accelerates; it is never a second
 correctness path, and a failed write only warns.
 
+**Rule table.** Below the cache, every builder call is memoized in one
+run-independent table, `$SCRATCH/.cache/lorrax/sigma_box_rules`. It is keyed
+exactly by the snapped build box, ε, the currency, the κ cap, the rule schema
+and the solver identity (the minimax sources, numerics backend, CPU model and
+pinned BLAS threads). The builder reads no clock and pins its threads, so a
+hit is the rule a cold build returns, bit for bit (claim 2737). A warm run is
+therefore the cold run that wrote the table, and no run depends on which
+other decks wrote it; the table never serves by containment. The first writer
+of a key wins; an entry whose schema, key or digest does not authenticate is a
+named miss and is replaced. `off` disables the table too.
+
 **Request scope.** The shared-pole route scopes the cache to a subdirectory
 keyed by the map's physical identity (energies, occupations and recipe, with
 the SC map label stripped), η, ε and the pole census. Equal physical inputs
