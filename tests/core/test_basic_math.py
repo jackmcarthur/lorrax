@@ -1,26 +1,13 @@
-"""Cheap core checks for the minimax and Coulomb service doors."""
+"""Cheap core checks for the Coulomb service door and the deck grammar."""
 from __future__ import annotations
 
 import numpy as np
 import pytest
 
-import minimax
 import vcoul
 from gw.gw_config import LorraxConfig
 from lxkit.deck_doctor import required_input_paths
 from wfn_loader import WfnLoader
-
-
-def test_one_certified_minimax_rule_keeps_its_payload_contract():
-    rule = minimax.lookup(
-        family="noncrossing", target="inverse",
-        range_value=212.23793639387773,
-        error_bound=3.4533298639725701e-8, n_max=64,
-    )
-    assert rule.provenance.certified is True
-    assert rule.node_count <= 64
-    assert rule.max_error < 3.4533298639725701e-8
-    assert rule.provenance.one_line().endswith("CERTIFIED")
 
 
 def test_fixture_a_bulk_vq_matches_the_analytic_gamma_limit(core_fixtures):

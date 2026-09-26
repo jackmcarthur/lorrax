@@ -1,21 +1,16 @@
-"""The door: its surface, its announcements, and R1's staging.
-
-Three subjects, and they are the three things the extraction actually
-changed about behaviour rather than about location.
+"""The door: its surface, its announcements, and the runtime solve.
 
 1. **Door reachability.**  Everything a consumer needs is a top-level
    name, and the solver half is on the door LAZILY.  A cell that only
    checked ``hasattr`` would be satisfied by an eager import, so the lazy
    half is checked for deferral as well as for presence.
-2. **Provenance, announced once.**  Every table served says where it came
-   from, once per distinct request — not once per call, because a
-   quadrature request repeats per q-block per SCF iteration per rank and
-   an announcement nobody can read is the same as no announcement.
-3. **R1 stage 1.**  The escape hatch defaults OPEN, so no deck changes
-   behaviour in a refactor commit; closing it makes the same request a
-   refusal.  Both directions are cells, because "the default is on" and
-   "the flag does something" are different claims and only the pair
-   distinguishes a staged rollout from a decoration.
+2. **Announced once.**  Every rule served says where it came from, once
+   per distinct request — not once per call, because a quadrature request
+   repeats per q-block per SCF iteration per rank and an announcement
+   nobody can read is the same as no announcement.
+3. **Every rule is computed at run time.**  ``serve`` solves in process,
+   refuses a retired selector by name, and refuses a family with no
+   in-process solver.
 """
 
 from __future__ import annotations
@@ -66,89 +61,46 @@ def test_the_lazy_door_refuses_a_name_it_does_not_have():
         M.not_a_solver_name           # noqa: B018
 
 
-def test_the_declared_families_match_the_shipped_bundle():
-    """:data:`minimax.FAMILIES` claims which families ship tables.  That is
-    a MEASURED fact about the bundle restated as data, and a restatement
-    is exactly the kind of thing that rots — so it is checked against the
-    bundle rather than trusted.
-
-    This cell is also where R1's central finding is pinned: the
-    imaginary-axis family really does ship nothing.
-    """
-    shipped_families = set(M.catalog().families())
-    shipped_families |= set(
-        M.catalog_view("catalog_complex_laplace.json").families())
-    for name, spec in M.FAMILIES.items():
-        assert spec.shipped == (name in shipped_families), (
-            f"FAMILIES says {name} shipped={spec.shipped}, bundle says "
-            f"{name in shipped_families}")
-    assert M.FAMILIES["noncrossing_imag"].shipped is False
-    assert M.FAMILIES["damped_line"].shipped is False
-
-
-def test_the_catalog_view_is_enumerable_without_solving_anything():
-    """31 entries, two families, no optimiser.
-
-    The "no optimiser" half is NOT asserted here with
-    ``'minimax.solver' not in sys.modules`` — in a shared session another
-    cell may legitimately have imported it already, and a cell whose
-    verdict depends on collection order is worse than no cell.  The
-    deferral is measured in a fresh process by
-    :func:`test_the_solver_half_is_deferred_until_it_is_named` and in a
-    scrubbed one by the isolation suite.
-    """
-    view = M.catalog()
-    crossing = len(view.for_family("crossing"))
-    noncrossing = len(view.for_family("noncrossing"))
-    # The partition is the invariant: every entry belongs to exactly one of
-    # the two families, so these must add up whatever ships.
-    assert len(view) == len(view.entries) == crossing + noncrossing
-    # The totals are a canary, not a law -- update them WHEN TABLES SHIP and
-    # say so in the commit.  They read 31/5/26 until 2026-09-11, three tables
-    # behind what the package actually carried, so the cell had been failing
-    # rather than guarding.
-    assert (len(view), crossing, noncrossing) == (34, 6, 28)
-
-
 # ---------------------------------------------------------------------------
-#  2.  Provenance, and the announcement
+#  2.  The announcement
 # ---------------------------------------------------------------------------
 
-def test_a_served_table_announces_its_origin_once():
-    """R2's headline.  The first serve of a request announces; the second
-    of the SAME request does not."""
+def _solved_lines(caught):
+    return [str(w.message) for w in caught if "SOLVED" in str(w.message)]
+
+
+def test_a_solve_announces_its_origin_once(isolated_cache):
+    """The first serve of a request announces; the second of the SAME
+    request does not."""
     with warnings.catch_warnings(record=True) as caught:
         warnings.simplefilter("always")
-        M.lookup(family="noncrossing", target="inverse", range_value=10.0,
-                 error_bound=1.0e-6, n_max=64)
-        M.lookup(family="noncrossing", target="inverse", range_value=10.0,
-                 error_bound=1.0e-6, n_max=64)
-    lines = [str(w.message) for w in caught
-             if str(w.message).startswith("minimax: served")]
+        M.serve(family="noncrossing", target="inverse", range_value=10.0,
+                error_bound=1.0e-6, n_max=64)
+        M.serve(family="noncrossing", target="inverse", range_value=10.0,
+                error_bound=1.0e-6, n_max=64)
+    lines = _solved_lines(caught)
     assert len(lines) == 1, lines
-    assert "shipped noncrossing/noncrossing_R_10p000000" in lines[0]
-    assert "sha256:" in lines[0]
-    assert "UNCERTIFIED" in lines[0]
+    assert "noncrossing/inverse R=10" in lines[0]
+    assert "sha256:" in lines[0] or "runtime solve" in lines[0]
 
 
-def test_a_different_request_announces_separately():
+def test_a_different_request_announces_separately(isolated_cache):
     """RED TWIN for the once-only rule.  Announce-once must be keyed on the
     REQUEST; a global "announced already" flag would silence the second
-    table entirely, which is the failure mode that makes a log look clean
-    while two different artifacts are in play."""
+    rule entirely, which makes a log look clean while two different rules
+    are in play."""
     with warnings.catch_warnings(record=True) as caught:
         warnings.simplefilter("always")
-        M.lookup(family="noncrossing", target="inverse", range_value=10.0,
-                 error_bound=1.0e-6, n_max=64)
-        M.lookup(family="noncrossing", target="inverse", range_value=1000.0,
-                 error_bound=1.0e-6, n_max=64)
-    lines = [str(w.message) for w in caught
-             if str(w.message).startswith("minimax: served")]
+        M.serve(family="noncrossing", target="inverse", range_value=10.0,
+                error_bound=1.0e-6, n_max=64)
+        M.serve(family="noncrossing", target="inverse", range_value=1000.0,
+                error_bound=1.0e-6, n_max=64)
+    lines = _solved_lines(caught)
     assert len(lines) == 2, lines
     assert lines[0] != lines[1]
 
 
-def test_the_announcement_reset_is_not_a_no_op():
+def test_the_announcement_reset_is_not_a_no_op(isolated_cache):
     """RED TWIN for the conftest fixture.
 
     Every announcement cell in this suite depends on the autouse reset
@@ -158,226 +110,32 @@ def test_the_announcement_reset_is_not_a_no_op():
     """
     with warnings.catch_warnings(record=True) as caught:
         warnings.simplefilter("always")
-        M.lookup(family="noncrossing", target="inverse", range_value=10.0,
-                 error_bound=1.0e-6, n_max=64)
+        M.serve(family="noncrossing", target="inverse", range_value=10.0,
+                error_bound=1.0e-6, n_max=64)
         M.reset_announcements()
-        M.lookup(family="noncrossing", target="inverse", range_value=10.0,
-                 error_bound=1.0e-6, n_max=64)
-    lines = [str(w.message) for w in caught
-             if str(w.message).startswith("minimax: served")]
-    assert len(lines) == 2, lines
-
-
-def test_the_provenance_one_liner_carries_every_field_a_reader_needs():
-    q = M.lookup(family="noncrossing", target="inverse", range_value=10.0,
-                 error_bound=1.0e-6, n_max=64)
-    line = q.provenance.one_line()
-    assert line.startswith("shipped noncrossing/")
-    assert "sha256:" in line
-    assert "gen unrecorded (catalog schema v1)" in line
-    assert "backend unrecorded (catalog schema v1)" in line
-    assert line.endswith("UNCERTIFIED")
-
-
-def test_a_v2_entry_carries_a_real_generator_stamp():
-    """The contrast that makes the v1 'unrecorded' meaningful.
-
-    The complex_laplace bundle records its tool, its numpy and its scipy,
-    so the same one-liner says something specific — which is what the v1
-    rows will say once WP6's certification tier has been through them.
-    """
-    from minimax import _catalog as C                # noqa: PLC0415
-    view = C.catalog_view("catalog_complex_laplace.json")
-    entry = view.entries[0]
-    _t, _a, _e, _k, h = C.load_table(entry)
-    prov = C.provenance_for(
-        entry, h, C.load_catalog_dict("catalog_complex_laplace.json"))
-    assert prov.certified is True
-    assert "generate_imag_minimax_assets.py@" in prov.generator_commit
-    assert "numpy-" in prov.generation_backend
-    assert "scipy-" in prov.generation_backend
-    assert prov.one_line().endswith("CERTIFIED")
-
-
-def test_certified_and_shipped_are_different_claims():
-    """The distinction the whole provenance record exists to keep.
-
-    ``source`` says which ARTIFACT answered; ``certified`` says whether
-    that artifact carries a measured certification record.  Every v1 table
-    is a real shipped artifact whose claim about itself has never been
-    checked, and printing that on every serve is what makes WP6's absence
-    visible in a log instead of only in a design document.
-    """
-    q = M.lookup(family="noncrossing", target="inverse", range_value=10.0,
-                 error_bound=1.0e-6, n_max=64)
-    assert q.provenance.source == "shipped"
-    assert q.provenance.certified is False
-    assert "shipped" in q.provenance.one_line()
-    assert "UNCERTIFIED" in q.provenance.one_line()
-
-
-def test_mixed_v1_certified_entry_is_complete_and_error_bound_to_payload(
-        tmp_path, monkeypatch):
-    """A certified append cannot borrow legacy absence or a catalog claim."""
-    from minimax import _catalog as C                # noqa: PLC0415
-
-    tau = np.array([0.5], dtype=np.float64)
-    alpha = np.array([1.0], dtype=np.float64)
-    provenance = {
-        "tool": "tools/generate_minimax_assets.py",
-        "tool_sha256": "1" * 64,
-        "generator_commit": "2" * 40,
-        "backend_sha256": "3" * 64,
-    }
-    entry = {
-        "family": "noncrossing", "range_max": 2.0,
-        "error_bound": 1.0e-6, "node_count": 1,
-        "file": "noncrossing/certified.npz", "max_error": 1.0e-8,
-        "kappa0": 1.0, "payload_sha256": M.payload_sha256(tau, alpha),
-        "certification": {"checks": ["refined_error"]},
-        "provenance": provenance, "certified": True,
-    }
-    for missing in ("payload_sha256", "kappa0", "certification",
-                    "provenance"):
-        incomplete = dict(entry)
-        incomplete.pop(missing)
-        with pytest.raises(M.CatalogCorrupt, match="incomplete"):
-            M.parse_catalog(
-                {"schema_version": 1, "tables": [incomplete]},
-                catalog_name="incomplete.json")
-
-    for invalid_error in (-1.0, np.inf, 2.0e-6):
-        invalid = dict(entry, max_error=invalid_error)
-        with pytest.raises(M.CatalogCorrupt, match="within"):
-            M.parse_catalog(
-                {"schema_version": 1, "tables": [invalid]},
-                catalog_name="invalid-error.json")
-
-    root = tmp_path / "minimax_assets"
-    path = root / entry["file"]
-    path.parent.mkdir(parents=True)
-    np.savez_compressed(
-        path, tau=tau, alpha=alpha,
-        max_error=np.asarray(2.0e-8, dtype=np.float64))
-    monkeypatch.setattr(C, "_asset_root", lambda: root)
-    C.clear_caches()
-    parsed = M.parse_catalog(
-        {"schema_version": 1, "tables": [entry]},
-        catalog_name="mismatched.json")[0]
-    with pytest.raises(M.TableUnreadable, match="differs bit-exactly"):
-        C.load_table(parsed)
-    np.savez_compressed(
-        path, tau=tau, alpha=alpha,
-        max_error=np.asarray(np.inf, dtype=np.float64))
-    C.clear_caches()
-    with pytest.raises(M.TableUnreadable, match="payload max_error=.*within"):
-        C.load_table(parsed)
-
-
-@pytest.mark.parametrize("tau,alpha,node_count,match", [
-    (np.array([[0.5]]), np.array([1.0]), 1, "equal-length 1-D"),
-    (np.array([0.5]), np.array([1.0]), 2, "matching node_count"),
-    (np.array([np.nan]), np.array([1.0]), 1, "non-finite"),
-    (np.array([0.5]), np.array([-1.0]), 1, "positive real"),
-])
-def test_certified_noncrossing_payload_shape_and_values_refuse(
-        tmp_path, monkeypatch, tau, alpha, node_count, match):
-    """Selector metadata cannot outrun the certified numerical payload."""
-    from minimax import _catalog as C                # noqa: PLC0415
-
-    root = tmp_path / "minimax_assets"
-    rel = "noncrossing/certified.npz"
-    path = root / rel
-    path.parent.mkdir(parents=True)
-    np.savez_compressed(
-        path, tau=tau, alpha=alpha,
-        max_error=np.asarray(1.0e-8, dtype=np.float64))
-    raw = {
-        "family": "noncrossing", "range_max": 2.0,
-        "error_bound": 1.0e-6, "node_count": node_count, "file": rel,
-        "max_error": 1.0e-8, "kappa0": 1.0,
-        "payload_sha256": M.payload_sha256(tau, alpha),
-        "certification": {"checks": ["refined_error"]},
-        "provenance": {
-            "tool": "tools/generate_minimax_assets.py",
-            "tool_sha256": "1" * 64, "generator_commit": "2" * 40,
-            "backend_sha256": "3" * 64,
-        },
-        "certified": True,
-    }
-    entry = M.parse_catalog(
-        {"schema_version": 1, "tables": [raw]},
-        catalog_name="bad-payload.json")[0]
-    monkeypatch.setattr(C, "_asset_root", lambda: root)
-    C.clear_caches()
-    with pytest.raises(M.TableUnreadable, match=match):
-        C.load_table(entry)
-
-
-def test_final_run33_two_pane_requests_are_publicly_certified():
-    """The final equal-range plan is closed; obsolete percentile panes are not."""
-    low = M.lookup(
-        family="noncrossing", target="inverse",
-        range_value=212.23793639387773,
-        error_bound=3.4533298639725701e-8, n_max=64)
-    assert low.provenance.catalog_entry.endswith(
-        "noncrossing_R_256p000000_eps_3p0em08.npz")
-    assert low.provenance.certified is True
-    assert low.max_error == 1.8089704512114224e-8
-    assert low.kappa0 == 1.0000026652201994
-    assert "tools/generate_minimax_assets.py@c55621b2" in (
-        low.provenance.generator_commit)
-    assert "id-" in low.provenance.generation_backend
-    assert low.provenance.one_line().endswith("CERTIFIED")
-
-    high = M.lookup(
-        family="noncrossing", target="inverse",
-        range_value=212.32817285287737,
-        error_bound=4.9322777100153476e-7, n_max=64)
-    assert high.provenance.catalog_entry.endswith(
-        "noncrossing_R_215p443469_eps_2p0em07.npz")
-    assert high.provenance.certified is True
-    assert high.max_error == 5.882476630022365e-8
-    assert high.kappa0 == 1.0000064579102943
-    assert high.provenance.one_line().endswith("CERTIFIED")
+        M.serve(family="noncrossing", target="inverse", range_value=10.0,
+                error_bound=1.0e-6, n_max=64)
+    assert len(_solved_lines(caught)) == 2
 
 
 # ---------------------------------------------------------------------------
-#  3.  There is no table path — every rule is computed at run time
+#  3.  Every rule is computed at run time
 # ---------------------------------------------------------------------------
-#  The shipped-table branch, the ``use_shipped`` selector and the
-#  LORRAX_MINIMAX_ALLOW_RUNTIME_SOLVE hatch were removed on 2026-09-16: a
-#  shipped table is a node placement decided on another machine at another
-#  time, and the owner's rule is that every placement is computed at run
-#  time.  The measurement that justified it — on the `noncrossing` family
-#  production actually served — is in ``serve``'s own docstring.  These
-#  cells pin what replaced them.
 
-def test_serve_never_consults_a_shipped_table(isolated_cache):
-    """A request the catalog DOES cover is still solved here.
-
-    R = 10 at 1e-6 is a shipped entry — the lookup cells above serve it from
-    ``noncrossing_R_10p000000_eps_1p0em06.npz`` — so this is the true
-    negative for "the table path is gone": if any table branch survived,
-    this provenance would read ``shipped``.
-    """
-    pytest.importorskip("scipy")
+def test_serve_solves_in_process(isolated_cache):
+    """The rule comes from a runtime solve (or its disk cache), never from
+    a precomputed artifact."""
     q = M.serve(family="noncrossing", target="inverse", range_value=10.0,
                 error_bound=1.0e-6, n_max=64)
-    assert q.provenance.source != "shipped"
     assert q.provenance.source in ("runtime-uncertified", "cache")
+    assert q.provenance.certified is False
     assert q.max_error <= 1.0e-6
 
 
 def test_a_retired_use_shipped_selector_refuses_rather_than_being_ignored(
         isolated_cache):
-    """An un-updated caller must hear that the dial is gone.
-
-    Silently dropping ``use_shipped=False`` would answer a request to AVOID
-    the tables by computing — the right answer for the wrong reason — and
-    dropping ``use_shipped=True`` would answer a request FOR them the same
-    way.  Both are the parsed-but-ignored-key defect.
-    """
+    """An un-updated caller must hear that the selector is gone; silently
+    dropping it is the parsed-but-ignored-key defect (TASTE 13)."""
     with pytest.raises(M.UnknownTarget) as excinfo:
         M.serve(family="noncrossing", target="inverse", range_value=10.0,
                 error_bound=1.0e-6, n_max=64, use_shipped=False)
@@ -385,14 +143,11 @@ def test_a_retired_use_shipped_selector_refuses_rather_than_being_ignored(
 
 
 def test_the_solve_announces_itself_once_with_its_numbers(isolated_cache):
-    """The loudest line in the service, and what it says now.
+    """The loudest line in the service: the request, the achieved error,
+    the measured Σ|w| and κ₀.
 
-    It still names the request, the achieved error, the measured Σ|w| and
-    κ₀.  What it no longer says is that a shipped table failed to match:
-    nothing was looked up.
-
-    A_dim = 20 rather than 83 because the point of this cell is the
-    ANNOUNCEMENT, and a small bandwidth solves in about a second.
+    A_dim = 20 because the point of this cell is the ANNOUNCEMENT, and a
+    small bandwidth solves in about a second.
     """
     pytest.importorskip("scipy")
     with warnings.catch_warnings(record=True) as caught:
@@ -428,13 +183,10 @@ def test_the_solved_announcement_says_when_the_target_was_missed():
 
 
 def test_a_family_with_no_in_process_solver_refuses_rather_than_hanging():
-    """``complex_laplace`` has no in-process solver.
-
-    With the table path gone there is nothing left to serve this family
-    with, so the request refuses and names the generator — which was always
-    the real fix for it, rather than a flag.
-    """
+    """``complex_laplace`` has no in-process solver, so it refuses by name."""
     with pytest.raises(M.UncertifiedSolveRefused) as excinfo:
         M.serve(family="complex_laplace", target="complex_laplace",
                 range_value=21.544346900318832, error_bound=1.0e-6, n_max=64)
-    assert "generate_imag_minimax_assets.py" in str(excinfo.value)
+    assert "complex_laplace" in str(excinfo.value)
+    assert "no in-process solver" in str(excinfo.value)
+    assert M.FAMILIES["complex_laplace"].wired is False
