@@ -36,6 +36,7 @@ import numpy as np
 import jax
 import jax.numpy as jnp
 from jax.experimental import io_callback
+from common.collectives import to_transpose_partner
 from common.shard_map import shard_map
 from common.wfn_layout import (band_sphere_spec, PSI_NMU_SPEC, PSI_MUNT_SPEC,
                                PSI_NMU_ACC_SPEC, PSI_MUNT_ACC_SPEC)
@@ -962,9 +963,10 @@ def _gslot_face_kernel(mesh: Mesh, fft_grid: tuple, nk: int, bc_w: int, ns: int,
         X[b,s,μ] = Σ_{G ∈ my slots} ψ[k,b,s,G] · e^{2πi (k+G)·r_μ} / √N_r
 
     is a GEMM over the local G slots, reduce-scattered over the mesh straight
-    onto each face's 1/P accumulator slice (``PSI_NMU_ACC_SPEC`` y-major for
-    ψ_y, ``PSI_MUNT_ACC_SPEC`` x-major for ψ_x; :func:`_gslot_faces_kernel`
-    lands them on the faces).  The phase is formed from integer residues
+    onto ψ_x's x-major 1/P accumulator slice (``PSI_MUNT_ACC_SPEC``); ψ_y's
+    y-major slice (``PSI_NMU_ACC_SPEC``) is the transpose partner's, one
+    collective permute of 1/P (:func:`_gslot_faces_kernel` lands both on
+    the faces).  The phase is formed from integer residues
     ``(G_a r_a mod n_a)/n_a``, the twiddles the FFT itself uses.
     """
     nx, ny, nz = fft_grid
@@ -973,6 +975,8 @@ def _gslot_face_kernel(mesh: Mesh, fft_grid: tuple, nk: int, bc_w: int, ns: int,
     P_ = int(mesh.size)
     py = int(mesh.shape['y'])
     px = int(mesh.shape['x'])
+    if px != py:
+        raise ValueError(f"_gslot_face_kernel: mesh {px}x{py} is not square")
     ngk_l = ngk_c // P_
     n_t = mu_pad // mu_t
     inv_sqrt_n = 1.0 / np.sqrt(float(n_rtot))
@@ -1012,10 +1016,11 @@ def _gslot_face_kernel(mesh: Mesh, fft_grid: tuple, nk: int, bc_w: int, ns: int,
 
             X = jax.lax.map(one_tile, (r_t, w_t))              # (n_t, bc_w·ns, mu_t)
             X = jnp.moveaxis(X, 0, 1).reshape(bc_w, ns, mu_pad)
-            # Two reduce-scatters (the bytes of one all-reduce), each onto
-            # its face's 1/P μ slice: y-major for ψ_y, x-major for ψ_x.
-            Xy = jax.lax.psum_scatter(X, ('y', 'x'), scatter_dimension=2, tiled=True)
-            Xx = jnp.conj(jax.lax.psum_scatter(X, XY, scatter_dimension=2, tiled=True))
+            # One reduce-scatter onto the x-major 1/P μ slice (ψ_x); on the
+            # square mesh the y-major slice (ψ_y) is the transpose partner's.
+            Xs = jax.lax.psum_scatter(X, XY, scatter_dimension=2, tiled=True)
+            Xy = to_transpose_partner(Xs, px)
+            Xx = jnp.conj(Xs)
             z = jnp.int32(0)
             ay = jax.lax.dynamic_update_slice(ay, Xy[None], (kk, b0, z, z))
             ax_ = jax.lax.dynamic_update_slice(ax_, Xx[None], (kk, b0, z, z))
