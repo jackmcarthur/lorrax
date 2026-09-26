@@ -40,6 +40,7 @@ import numpy as np
 from common.band_degeneracy import (DEFAULT_MODE, DEGENERACY_TOL_RY,
                                     check_band_window)
 from common.collectives import gather_to_host
+from common.units import RYD_TO_EV
 from runtime.padding import pad_axis
 
 
@@ -563,3 +564,72 @@ def apply_eqp_and_reslice_bands(
     eps_v = pad_axis(eps_v, grid_y, axis=1, fill=-PAD_EPS_GUARD_RY).array
     eps_c = pad_axis(eps_c, grid_x, axis=1, fill=PAD_EPS_GUARD_RY).array
     return eps_v, eps_c, n_occ_eff
+
+
+def apply_eqp_to_bse_window(data, restart_file: str, eqp_file: str,
+                            input_file: str, *, mesh_shape,
+                            degeneracy_mode: str = DEFAULT_MODE,
+                            degeneracy_tol_ry: float = DEGENERACY_TOL_RY,
+                            log=_log0):
+    """Put a loaded BSE window on quasiparticle energies; return ``E^QP``.
+
+    Both legs of the pair basis move together, or ``D_Q = ε_c(k+Q) − ε_v(k)``
+    mixes QP conduction with DFT valence.  This re-slices the stored leg,
+    ``data["eps_v"]``/``data["eps_c"]``, on the corrected spectrum
+    (:func:`apply_eqp_and_reslice_bands`, which re-resolves ``n_occ`` so a
+    QP gap change cannot mis-slice), and returns the full-band
+    ``(nk, nb)`` QP table for the caller's interpolated leg.  ``eqp_file``
+    is the irreducible wedge; ``apply_eqp_corrections`` unfolds it through
+    the symmetry service.
+
+    Refuses (before touching ``data``) an eqp ladder on a QP WFN, whose ψ
+    and E are already a matched pair (:func:`refuse_eqp_on_a_qp_wfn`), and
+    energies rebuilt on the native restart grid after ``bse_k_grid`` has
+    densified ψ to another k axis.
+    """
+    from file_io.restart_bundle import read_metadata
+    refuse_eqp_on_a_qp_wfn(input_file, eqp_file)
+    enk_dft = read_metadata(restart_file)["energies"]
+    n_occ_in = resolve_n_occ(enk_dft, input_file=input_file)
+    data["eps_v"], data["eps_c"], n_occ_qp = apply_eqp_and_reslice_bands(
+        restart_file, eqp_file, input_file, int(data["n_val"]),
+        int(data["n_cond"]), n_occ_in, int(mesh_shape[0]), int(mesh_shape[1]),
+        degeneracy_mode=degeneracy_mode, degeneracy_tol_ry=degeneracy_tol_ry)
+    if int(data["eps_c"].shape[0]) != int(data["psi_c_X"].shape[0]):
+        raise ValueError(
+            "--eqp rebuilt energies on the native restart "
+            f"grid ({int(data['eps_c'].shape[0])} k) after bse_k_grid "
+            "had already densified the BSE wavefunctions to "
+            f"{int(data['psi_c_X'].shape[0])} k.  This would mix coarse "
+            "energies with fine-grid psi.  If wfn_file is WFN_qp.h5, "
+            "remove --eqp: that file already carries the canonical QP "
+            "eigenvalues paired with its rotated wavefunctions.  A "
+            "mean-field WFN plus diagonal eqp corrections needs the eqp "
+            "ladder applied inside the htransform densification, not "
+            "patched onto its output here.")
+    enk_qp = apply_eqp_corrections(enk_dft, eqp_file, input_file)
+    shift_ev = (enk_qp - enk_dft) * RYD_TO_EV
+    log(f"  [eqp] {os.path.basename(eqp_file)}: n_occ={n_occ_qp}, "
+        f"QP shifts min/max = {shift_ev.min():+.4f} / {shift_ev.max():+.4f} eV; "
+        f"BSE runs on QUASIPARTICLE energies")
+    return enk_qp
+
+
+def require_valence_pad_guard(data) -> None:
+    """Refuse a loaded window whose valence pad is not at the signed guard.
+
+    The loader and :func:`apply_eqp_and_reslice_bands` write
+    ``-PAD_EPS_GUARD_RY`` on the valence pad bands; a zero pad makes
+    ``ΔE = ε_c − 0`` a spurious transition below every physical one.
+    """
+    n_val, nv_pad = int(data["n_val"]), int(data["n_val_pad"])
+    if nv_pad <= n_val:
+        return
+    worst = float(jnp.max(jnp.asarray(data["eps_v"])[:, n_val:].real))
+    if worst > -0.5 * PAD_EPS_GUARD_RY:
+        raise ValueError(
+            f"loader returned an unguarded valence pad — "
+            f"max eps_v over the {nv_pad - n_val} pad bands is {worst:.3e} "
+            f"Ry, expected <= {-0.5 * PAD_EPS_GUARD_RY:.3e}. A zero pad "
+            f"here makes DeltaE = eps_c - 0 a spurious transition BELOW "
+            f"every physical one. See bse_window.PAD_EPS_GUARD_RY.")

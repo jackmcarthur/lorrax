@@ -301,6 +301,60 @@ def _f_shoulder_gate(f_eps, b_min: int, b_max: int, shift: float, log_fn,
     return worst
 
 
+def resolve_conduction_window(enk_sigma, *, nb_window: int, nval_in: int,
+                              n_cond: int, tol_ry: float, mode: str,
+                              input_file: str, log_fn=print):
+    """``(b_min, b_max, n_guard)``: the BSE conduction bands inside the fH.
+
+    fH is built from every band of ``ctilde`` and only the sub-window
+    ``[b_min, b_max)`` is returned, so a full-band ``ctilde`` gives a full-band
+    fH however few conduction bands the BSE keeps, and the kept bands sit
+    strictly inside it, guarded above.  A sliver window whose top edge cuts a
+    near-degenerate (Kramers) pair rings 100–1000 meV off-grid.  The window is
+    two-sided: a wider one asks the shared whole-state QRCP basis to represent
+    more states, which the all-coarse transformed-energy receipt and the
+    consumer's on-grid energy gate measure.
+
+    ``nb_window`` is the band count of the htransform fH (``ctilde``);
+    ``enk_sigma`` is its ``(nb, nk)`` energies, window-relative like
+    ``b_min = nval_in`` and ``b_max = nval_in + n_cond``.  The window must fit (it refuses otherwise), and its edges are
+    checked for a cut multiplet (``common.band_degeneracy``, report-only:
+    ``b_max`` is pinned to the loader's ``n_cond``, and widening it here would
+    desynchronise the conduction caches from the BSE window).  ``n_guard`` is
+    the conduction bands above the selection: fewer than 4 lets the top edge
+    ring off-grid; more than 16 asks the shared QRCP basis to represent states
+    the kernel never uses.  Both warn.
+    """
+    from common.band_degeneracy import check_band_window
+    nb_window = int(nb_window)
+    b_min, b_max = int(nval_in), int(nval_in) + int(n_cond)
+    n_guard = nb_window - b_max
+    if b_max > nb_window:
+        raise ValueError(
+            f"BSE conduction window [{b_min},{b_max}) exceeds the htransform "
+            f"fH window ({nb_window} bands): raise nband in {input_file} to "
+            f">= {b_max}, or drop --n-cond to <= {nb_window - int(nval_in)}")
+    check_band_window(
+        np.asarray(enk_sigma).T, b_min, b_max, tol_ry=tol_ry, mode=mode,
+        where="exciton_bands htransform conduction window", log=log_fn)
+    if n_guard < 4:
+        log_fn(f"  [warn] only {n_guard} conduction guard band(s) above the "
+               f"BSE selection — a selection boundary near a Kramers pair can "
+               f"ring off-grid; widen the input's ncond/nband (>= {b_max + 4} "
+               f"bands).")
+    if n_guard > 16:
+        log_fn(f"  [warn] htransform fH spans {nb_window} bands with {n_guard} "
+               f"conduction guards above the BSE window — a LARGE interp "
+               f"window is not automatically more accurate.  Check the "
+               f"mandatory all-coarse transformed-energy receipt and this "
+               f"driver's on-grid energy gate; keep nband just above the BSE "
+               f"window unless both remain controlled.")
+    log_fn(f"  full-band htransform: fH over {nb_window} bands "
+           f"({int(nval_in)}v + {nb_window - int(nval_in)}c); BSE conduction "
+           f"[{b_min},{b_max}) = {int(n_cond)} band(s) + {n_guard} guard(s)")
+    return b_min, b_max, n_guard
+
+
 def compute_wfns_fi(
     *,
     ctilde: jax.Array,
