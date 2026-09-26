@@ -2659,8 +2659,8 @@ def read_star_map(h5_path: str, dataset: str = "kin_ion", *, k_axis: int = 0):
 			f"{SYM_IDX_DATASET} {sidx.shape} must both be (nk_full,)")
 	# THE NUMBER OF DISTINCT STARS, not ``max + 1``.  The two agree only
 	# while the labels are dense, which is exactly what the writers are
-	# supposed to guarantee (``file_io.sigma_output.compact_star_tables``,
-	# and ``gw.kin_ion_io.star_tables`` through it) — so testing ``max+1``
+	# supposed to guarantee (``symmetry_maps.KStarMap.take``, which both
+	# wedge writers renumber through) — so testing ``max+1``
 	# tested the writers' arithmetic instead of their output, and passed
 	# on the one shape this refusal exists to catch.  MEASURED 2026-08-17:
 	# ``gnppm_debug``'s ``irr_idx_k = [0,2,2,6,8,7,6,7,8]`` gives

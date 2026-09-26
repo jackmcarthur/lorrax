@@ -3254,6 +3254,18 @@ def star_tables_of(sym):
 _star_tables_of = star_tables_of
 
 
+def star_wedge_rows(sym):
+    """``(wfn_rows, irr_idx_wedge)`` for a slab computed on the star wedge; see docs/architecture/symmetry_register.md."""
+    star = KStarMap(*star_tables_of(sym))
+    return star.labels.astype(np.int32), star.take
+
+
+def star_wedge_tables(sym):
+    """``(irr_idx_wedge, sym_idx_k, n_sym_spatial)``: the unfold tables of a star-wedge slab; see docs/architecture/symmetry_register.md."""
+    irr, sidx, nss = star_tables_of(sym)
+    return KStarMap(irr, sidx, nss).take, sidx, nss
+
+
 def unfold_file_wedge_to_full_bz(sym, data):
     """FILE wedge → full BZ; see docs/architecture/symmetry_register.md."""
     irr, sidx, nss = _star_tables_of(sym)
@@ -3363,6 +3375,19 @@ class KStarMap:
         """Every k its own star: ``select`` and ``broadcast`` are no-ops."""
         idx = np.arange(int(n_k), dtype=np.int32)
         return cls(idx, np.zeros(int(n_k), dtype=np.int32), 1, idx)
+
+    @property
+    def rows(self) -> np.ndarray:
+        """``(n_k_irr,)`` int32: the first full-grid row of each star, in
+        full-grid order (:func:`_star_row_order`) — what :meth:`select` keeps."""
+        return self._rows
+
+    @property
+    def take(self) -> np.ndarray:
+        """``(n_k_full,)`` int32: each full-grid k's position in :attr:`rows`,
+        i.e. ``irr_idx`` renumbered onto the kept rows — what
+        :meth:`broadcast` gathers with."""
+        return self._take
 
     @property
     def nk_full(self) -> int:

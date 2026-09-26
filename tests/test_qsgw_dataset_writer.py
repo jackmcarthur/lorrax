@@ -60,7 +60,6 @@ from file_io.sigma_output import (                              # noqa: E402
     SIGMA_K_AXIS,
     SPREAD_ATTR_PREFIX,
     append_qsgw_datasets_h5,
-    compact_star_tables,
     extract_and_stamp_k_irr,
     k_irr_rows_for,
 )
@@ -71,6 +70,19 @@ from file_io.kin_ion import (
     K_STORAGE_VERSION_ATTR,
     N_SYM_SPATIAL_ATTR,
 )
+
+
+def compact_star_tables(irr):
+    """``(rows, take)`` from the service's one star-row rule.
+
+    ``KStarMap.rows`` are the first full-grid row of each star and
+    ``KStarMap.take`` renumbers ``irr`` onto them; the rule needs no
+    symmetry rows, so the identity table stands in.
+    """
+    from symmetry_maps import KStarMap
+    irr = np.asarray(irr)
+    star = KStarMap(irr, np.zeros_like(irr), 1)
+    return star.rows, star.take
 from file_io.restart_bundle import (read_star_map)
 
 _REPO = pathlib.Path(__file__).resolve().parents[1]
