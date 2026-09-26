@@ -362,27 +362,48 @@ def build_G_tau(psi_xn, psi_yr, enk, t, *, e_ref=0.0, mask=None,
 
 
 # ---------------------------------------------------------------------------
-# Output spin blocks.  Σ = Σ_ab ψ*_a [G ⋆ W]_ab ψ_b is linear in the output
-# spin block, so a Σ consumer whose output tile would not fit stores and
-# projects it in d x d blocks (mathdx mode 7's output spin block); the Green
-# itself stays whole at the parents.
+# Output x blocks.  Σ = Σ_μ ψ*(μ) [G ⋆ W](μ, ν) ψ(ν) is linear in the output's
+# μ rows, so a Σ consumer whose output tile would not fit stores and projects
+# it in x blocks (mathdx mode 7's stored x block, every spin), each pass
+# reading only its own pairs' Green and W; the Green itself stays whole at the
+# parents.  ``d`` sizes the blocks: (ns/d)² of them, each ~(d/ns)² of the
+# tile, laid on the face projector's slab pieces
+# (``common.contract_bands.face_row_blocks``), so their projections move and
+# multiply what the whole tile's does.  (Output spin blocks of the same size
+# re-read the whole Green per block: the spin action mixes every source of a
+# pair.)
 # ---------------------------------------------------------------------------
 
+def sigma_row_blocks(*, n_rmu, ns, d, mesh):
+    """The x blocks ``(x0, bx, xs, xn)`` of a parent-row Σ tile stored at block size ``d`` (``None``: one whole tile at ``d = ns``)."""
+    if int(d) == int(ns):
+        return (None,)
+    from common.contract_bands import face_row_blocks
+    mx = int(n_rmu) // int(mesh.shape['x'])
+    return face_row_blocks(mx, int(mesh.shape['y']), (int(ns) // int(d)) ** 2)
+
+
 def sigma_spin_block(*, n_parent, n_rmu, ns, mesh, partner_tiles):
-    """The output spin block ``d`` (a divisor of ``ns``) a parent-row Σ convolution stores per pass.
+    """The block size ``d`` (a divisor of ``ns``): a parent-row Σ convolution stores its output in (ns/d)² x blocks.
 
     Live per rank: the parent Green ``T_p = 16·n_parent·ns²·μ²/P``, ``partner_tiles`` more
     of it (1 when the antiunitary partner is its own GEMM, 0 when it is read as conj(G)),
-    and the stored block ``T_p·(d/ns)²``; the largest ``d`` whose set fits the agreed
-    device target (the minimum process budget times the spinor's fragmentation
-    utilization) wins, else 1.  Every process computes the same ``d``.
+    and the widest stored x block, ``T_p·xn·bx/μ_x`` (``(d/ns)²`` of it up to a row per slab
+    piece, :func:`sigma_row_blocks`); the largest ``d`` whose set fits the agreed device
+    target (the minimum process budget times the spinor's fragmentation utilization) wins,
+    else 1.  Every process computes the same ``d``.
     """
     if int(ns) <= 1:
         return 1
     P_ = int(mesh.shape['x']) * int(mesh.shape['y'])
     tile = 16.0 * int(n_parent) * int(ns) ** 2 * int(n_rmu) ** 2 / P_
     target = _device_target_bytes(ns)
-    price = lambda d: (1.0 + float(partner_tiles) + (d / int(ns)) ** 2) * tile
+    mx = int(n_rmu) // int(mesh.shape['x'])
+
+    def frac(d):
+        b = sigma_row_blocks(n_rmu=n_rmu, ns=ns, d=d, mesh=mesh)[0]
+        return 1.0 if b is None else b[1] * b[3] / mx
+    price = lambda d: (1.0 + float(partner_tiles) + frac(d)) * tile
     divisors = sorted((d for d in range(1, int(ns) + 1) if int(ns) % d == 0), reverse=True)
     d = next((d for d in divisors if price(d) <= target), 1)
     from common.gpu_utils import record_stage_price
