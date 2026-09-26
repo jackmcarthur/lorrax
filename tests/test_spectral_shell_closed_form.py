@@ -118,8 +118,11 @@ def test_fit_matches_the_80_bisection_explicit_sum_estimator(monkeypatch):
     rng = np.random.default_rng(3)
     lad = _ladder(nk=4, n_dft=120, n_target=20000, seed=1)
     counts = (80, 100, 120)
+    # 1.5 + 1e-6, not 1.5: an exponent AT the summability boundary
+    # (SHELL_SUMMABLE_BETA) would be classified by the last ulp of each
+    # solver.  s = 2beta/3 = 1 itself is pinned by the log-moment test above.
     beta_true = np.concatenate([rng.uniform(0.3, 12.0, 40),
-                                [1.5, 39.0, 0.05 + 1e-6]]).reshape(1, -1)
+                                [1.5 + 1e-6, 39.0, 0.05 + 1e-6]]).reshape(1, -1)
     S = _planted_sums(lad, counts, beta_true, rng)
     S[1, 0, 0] = S[0, 0, 0] - (S[2, 0, 0] - S[1, 0, 0])   # D2, D3 opposite
     S[1, 0, 1] = S[0, 0, 1]                               # D2 = 0
@@ -134,7 +137,10 @@ def test_fit_matches_the_80_bisection_explicit_sum_estimator(monkeypatch):
                                         bx.SHELL_FAIL_NO_ROOT]
     assert new.failure[0, -1] == bx.SHELL_FAIL_EDGE
     good = new.failure == bx.SHELL_OK
-    assert good.sum() == beta_true.size - 4
+    ordinary = beta_true[0, 3:-1]          # states 0-2 and the last are planted
+    assert good.sum() == int((ordinary > bx.SHELL_SUMMABLE_BETA).sum())
+    assert np.all(new.failure[0, 3:-1][ordinary <= bx.SHELL_SUMMABLE_BETA]
+                  == bx.SHELL_FAIL_NOT_SUMMABLE)
     for name in ("beta", "tail_ratio", "s_inf"):
         a, b = getattr(new, name), getattr(old, name)
         np.testing.assert_array_equal(np.isnan(a), np.isnan(b))
