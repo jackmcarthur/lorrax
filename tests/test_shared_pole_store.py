@@ -490,3 +490,22 @@ if __name__=='__main__':
         rank0_transaction(root,stage='test.receipt',write=lambda:(root/'receipt.json').write_text(json.dumps({'collected':len(cells)+1,'passed':len(receipts),'tests':receipts},indent=2)))
         return 0
     run_main_and_finalize(main)
+
+
+def test_an_sc_run_holds_one_k_extent_per_model(capsys):
+    """Map 1 records the model's Kmax, later maps keep max(live, held) and say
+    so when it grows; CT_C and CT_T share one extent; no binding is exact."""
+    from types import SimpleNamespace
+    from file_io.shared_pole_store import _k_extent
+    assert _k_extent(SimpleNamespace(), {"sector": None}, 746, record=True) == 746
+    held = {}
+    meta = SimpleNamespace(shared_pole_k_capacity=held)
+    assert _k_extent(meta, {"sector": None}, 736, record=True) == 736     # map 1
+    assert _k_extent(meta, {"sector": None}, 734, record=False) == 736    # staging peek
+    assert _k_extent(meta, {"sector": None}, 734, record=True) == 736     # map 2
+    assert capsys.readouterr().out == ""
+    assert _k_extent(meta, {"sector": None}, 740, record=True) == 740     # a real growth
+    assert "grown to 740" in capsys.readouterr().out
+    assert _k_extent(meta, {"sector": "CT_C"}, 50, record=True) == 50
+    assert _k_extent(meta, {"sector": "CT_T"}, 48, record=True) == 50
+    assert held == {"None": 740, "CT": 50}
