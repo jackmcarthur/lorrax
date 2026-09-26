@@ -4053,12 +4053,16 @@ def read_bgw_eqp(eqp_file: str):
 
 			e_dft_k, e_qp_k = [], []
 			for _ in range(n_bands):
-				cols = f.readline().split()
-				# (ispin, iband, E_DFT, E_QP); iband is 1-based ABSOLUTE.
+				row = f.readline()
+				# (2i8, 2f15.9): ispin, iband (1-based ABSOLUTE), E_DFT, E_QP,
+				# read by COLUMN as BerkeleyGW does.  A value such as
+				# -1031.650469281 fills its 15 columns and fuses with the
+				# field before it; text past column 46 (the root file's Z*,
+				# Gamma*, status) is not a BGW field.
 				if first_band is None:
-					first_band = int(cols[1])
-				e_dft_k.append(float(cols[2]))
-				e_qp_k.append(float(cols[3]))
+					first_band = int(row[8:16])
+				e_dft_k.append(float(row[16:31]))
+				e_qp_k.append(float(row[31:46]))
 			e_dft_blocks.append(e_dft_k)
 			e_qp_blocks.append(e_qp_k)
 

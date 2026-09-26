@@ -159,7 +159,8 @@ G(τ) is never materialized; it exists only as $\psi\psi^*$ phases inside the
 | file | content |
 |---|---|
 | `eqp0.dat` | BerkeleyGW format. $E_\mathrm{DFT} + \Delta(E_\mathrm{DFT})$, $\Delta = \langle T + V_\mathrm{ion} + V_H + \Sigma_{xc}\rangle - E_\mathrm{DFT}$ |
-| `eqp1.dat` | BerkeleyGW format. Linearized $E + Z\,\Delta(E)$, $Z = (1 - \partial_\omega \mathrm{Re}\,\Sigma_c)^{-1}$ |
+| `eqp1.dat` | BerkeleyGW format. Linearized $E + Z\,\Delta(E)$, $Z = (1 - \partial_\omega \mathrm{Re}\,\Sigma_c)^{-1}$, raw for every $Z$ (a BerkeleyGW comparison column) |
+| `eqp_root.dat` | dynamic one-shot only. BerkeleyGW rows with $E_\mathrm{QP} = E^*$, the root of $E = h + \mathrm{Re}\,\Sigma_c(E)$ on $[E_\mathrm{DFT}, \mathrm{eqp0}]$, then $Z^*$, $\Gamma^* = Z^*\lvert\mathrm{Im}\,\Sigma_c(E^*)\rvert$ and a status: `QP`, the resonances `RES_Z` ($Z^* \notin (0,1]$) and `RES_BRACKET` (no root in the bracket), or `OFF_GRID` (bracket not sampled; $E^*$ = eqp0) |
 | `sigma_diag.dat` | Σ diagonals in eV. Bispinor runs add `sigCC`, `sigTT`, `sigCT` (= CT + TC); ordered broken-TR GN runs add `sigC_odd` |
 | `eqp_g0w0.dat` | PPM one-shot only: Re/Im of $H_0 + \Sigma_{xc}(E_\mathrm{DFT})$ |
 | `qp_wfn_rotations.h5` | the QP eigensystem $U_{mnk}$, $E_\mathrm{QP}$ with the source-WFN fingerprint, read by htransform, BSE and SC seeding |

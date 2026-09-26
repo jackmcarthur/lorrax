@@ -4866,10 +4866,9 @@ def _write_sc_eqp_snapshot(
     recording both ranges makes the closure across ``b3`` auditable.
     (Under the retired two-evaluation rCROP, trial outputs were diagnostics,
     not accepted iterates.)
-    The sibling ``eqp1_iterNNNN.dat`` is the BGW-shaped, output-only
-    linearization ``E_eval + Z * (eqp0_map - E_eval)`` using the central
-    difference on this map's retained Sigma grid.  The SC map never reads Z,
-    never gates on it, and never replaces a value because of it.
+    There is no per-map eqp1: at the fixed point the map output IS the root
+    of the QP equation, so a linearization about it adds nothing
+    (reports/unify_2026-09-26 section 2.6).
 
     WHICH NUMBER IS THE RESIDUAL, AND WHICH IS NOT.  ``verdict`` is
     :func:`protected_band_convergence` on THIS call's output against THIS
@@ -4940,8 +4939,6 @@ def _write_sc_eqp_snapshot(
         detail="this is the column the eqp snapshot reports as the map "
                "output, and its RMS stamp is the convergence criterion.")
 
-    z_factor_full = _sc_z_factors(inputs, state_out, e_output)
-
     rotation_path = _dump_sc_rotation(
         inputs, state_out, call_index=call_index)
     _dump_sc_sigma_lorentz(
@@ -4971,18 +4968,6 @@ def _write_sc_eqp_snapshot(
     e_dft = _to_file_wedge(
         np.asarray(inputs.e_dft_active_kn_ry, dtype=np.float64) * RYD_TO_EV)
     e_output = _loop_to_file_wedge(e_output)
-    sigma_e_eval = state_out.outputs.sigma_result.e_eval_ev
-    e_eval = (e_output.copy() if sigma_e_eval is None else _loop_to_file_wedge(
-        np.asarray(sigma_e_eval, dtype=np.float64)))
-    z_factor = _loop_to_file_wedge(z_factor_full)
-    if e_eval.shape != e_output.shape or z_factor.shape != e_output.shape:
-        raise ValueError(
-            "SC eqp1 snapshot shape mismatch after file-wedge reduction: "
-            f"E_eval={e_eval.shape}, eqp0_map={e_output.shape}, "
-            f"Z={z_factor.shape}")
-    # Output only.  In particular there is deliberately no pathological-Z
-    # mask, fallback, membership test, convergence test, or map update here.
-    eqp1_output = e_eval + z_factor * (e_output - e_eval)
 
     snapshot_partition = _partition_on_loop(
         _state_partition(state_out, inputs), inputs)
@@ -5070,17 +5055,6 @@ def _write_sc_eqp_snapshot(
         path, kpoints, e_dft, e_output,
         band_offset=band_offset, nspin=1, comments=comments,
     )
-    eqp1_path = os.path.join(
-        inputs.input_dir, f"eqp1_iter{int(call_index):04d}.dat")
-    write_bgw_eqp(
-        eqp1_path, kpoints, e_dft, eqp1_output,
-        band_offset=band_offset, nspin=1,
-        comments=comments + (
-            "BGW-style eqp1 diagnostic: E_eval + Z_central_difference * "
-            "(eqp0_map - E_eval); Z is output-only and is never read by "
-            "the SC iteration",
-        ),
-    )
 
     n_occ = int(inputs.meta.nelec) - band_offset
     gap_ev = float(np.min(e_output[:, n_occ])
@@ -5090,10 +5064,7 @@ def _write_sc_eqp_snapshot(
     in_range = np.asarray(partition.in_range_mask, dtype=bool)
     # Keep the established map-artifact line schema intact: the canonical
     # convergence parser keys the following verdict to this exact line.
-    # eqp1 is a sibling artifact, not a suffix that makes the map line
-    # unparsable.
     _record_sc(inputs, f"  SC map energies: {path}")
-    _record_sc(inputs, f"  SC map eqp1: {eqp1_path}")
     if rotation_path is not None:
         _record_sc(inputs, f"  SC map rotation: {rotation_path}")
     if map_gain is not None:
@@ -6577,8 +6548,8 @@ def run_sc_driver(
         raise RuntimeError(
             "GATE sc_fixed_point_not_converged: the SC iteration budget was "
             "exhausted without satisfying the protected-band fixed-point "
-            f"criterion. {verdict.summary()} Per-map eqp0_iterNNNN.dat and "
-            "eqp1_iterNNNN.dat diagnostics were retained; no terminal "
+            f"criterion. {verdict.summary()} Per-map eqp0_iterNNNN.dat "
+            "diagnostics were retained; no terminal "
             "QP result is reported as converged.")
     else:
         _record_sc(

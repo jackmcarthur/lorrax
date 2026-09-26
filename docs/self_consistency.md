@@ -198,8 +198,8 @@ evaluated input:
 | **fixed point NOT UNIQUE** | appended to CONVERGED when states lie within the Σ(E)/Σ(0) jump of a grid edge (§5). It is not a refusal. |
 
 A stalled or budget-exhausted run refuses with
-`GATE sc_fixed_point_not_converged`. The per-map `eqp0_iterNNNN.dat` and
-`eqp1_iterNNNN.dat` files remain, and no terminal QP result is reported.
+`GATE sc_fixed_point_not_converged`. The per-map `eqp0_iterNNNN.dat` files
+remain, and no terminal QP result is reported.
 
 **Cost.** The history is $2(m+1)$ copies of the carry, stacked on a leading,
 never-sharded axis. Bra bands sit on `x` and ket bands on `y`
@@ -466,7 +466,8 @@ Insulators keep `parallel_transport` and `dft_velocity`.
   names. `postprocess.rotate_wfn_to_qp` reapplies the stored ladder and table;
   it neither rebuilds the tail nor re-solves occupations.
 - **Per-map files are diagnostics, not restart state.** `eqp0_iterNNNN.dat`
-  and `eqp1_iterNNNN.dat` hold the map output. `rotation_iterNNNN.npy`
+  holds the map output; at the fixed point it is the root of the QP equation,
+  so no per-map eqp1 is written. `rotation_iterNNNN.npy`
   (`sc_dump_dir`) is the map's input $U$. With
   `sigma_lorentz_debug_output = true`, four-current maps write
   `sigma_lorentz_iterNNNN.h5`: the CC, CT+TC and TT sectors in the map's input
