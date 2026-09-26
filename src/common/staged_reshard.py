@@ -65,47 +65,21 @@ already had, with the *replicated* member of that pair removed.  Peak
 per-rank residency for this array therefore FALLS by ``px·py``; it
 cannot rise.  No staging buffer is introduced.
 
-TWO ROUTES THROUGH THE SAME MOVE  (``route=``)
----------------------------------------------
-There is more than one pair of exchanges that lands on the output
-layout, and which one is faster is a MEASUREMENT, not a derivation.  Both
-are implemented; ``route`` selects::
+THE SCHEDULE
+------------
+::
 
-  "split_b_first"  (default, the shipped one)
-      (B, M_x, N_y)  →  (B_x, M, N_y)  →  (B_xy, M, N)
-      all_to_all ax_x  (split B, concat M)      1 exchange, p_x peers
-      all_to_all ax_y  (split B, concat N)      1 exchange, p_y peers
+  (B, M_x, N_y)  →  (B_x, M, N_y)  →  (B_xy, M, N)
+  all_to_all ax_x  (split B, concat M)      1 exchange, p_x peers
+  all_to_all ax_y  (split B, concat N)      1 exchange, p_y peers
 
-  "flatten_m_first"  (proposed by the owner, 2026-07-31:
-      "q,mu_X,nu_Y -> q,mu_XY,nu -> q_XY,mu,nu ... i think that's most
-      efficient")
-      (B, M_x, N_y)  →  (B, M_xy, N)  →  (B_xy, M, N)
-      all_to_all ax_y            (split M, concat N)   p_y peers
-      all_to_all (ax_x, ax_y)    (split B, concat M)   p_x·p_y peers
-
-Both are volume-preserving at every step and both are pure movement, so
-they are the same bit-exact parity class.  They differ in
-
-* **divisibility.**  ``split_b_first`` needs ``M % p_x`` and ``N % p_y``
-  (the input layout's own requirement) plus ``B % (p_x·p_y)``.
-  ``flatten_m_first`` additionally needs ``M % (p_x·p_y)``, because its
-  intermediate cuts M over the FLATTENED axis.  On the MoS2 4x4 exciton
-  deck M = rank = nk·nb = 672 and 672 % 64 = 32, so at P=64 that route
-  needs M padded to 704 (+4.76 %).  ``pad_m`` does exactly that, locally,
-  and drops the pad rows again with a static gather at the end — see
-  :func:`face_to_batch_reshard` — so the padding cost is paid by the
-  route that needs it and by nothing else.
-* **peer count.**  Two exchanges over p_x and p_y peers versus one over
-  p_y and one over p_x·p_y.  Payload is ``(1 − 1/p)`` of a shard each
-  way, so ``split_b_first`` moves 1.75 shards at 8x8 against 1.86, and
-  its largest replica group is 8 rather than 64.  On this machine these
-  collectives measured COUNT-bound rather than bandwidth-bound, which
-  predicts ``split_b_first`` wins — a hypothesis the harness tests, not a
-  reason to skip testing it.
+It needs ``M % p_x`` and ``N % p_y`` (the input layout's own requirement)
+plus ``B % (p_x·p_y)``, moves ``(1 − 1/p)`` of a shard per exchange, and
+its largest replica group is ``max(p_x, p_y)``.
 
 ORDER OF THE TWO STAGES (§3.2 of the staged-reshard doctrine)
 --------------------------------------------------------------
-The two payloads within ``split_b_first`` are equal — ``(1 − 1/p)`` of
+The two payloads are equal — ``(1 − 1/p)`` of
 one shard each — so the axis order is not a payload decision as it is in
 ``contract_bands_block_reshard``.  It is fixed by the OUTPUT layout
 instead: ``P((ax, ay), None, None)`` numbers its B-blocks ``ax``-major,
@@ -116,10 +90,7 @@ minor axis, whose replica groups are consecutive ranks (node-local pairs
 at 2 ranks/node on the production layout).  The module still REFUSES a
 mesh whose minor axis is not ``ay``, because on such a mesh the block
 numbering the caller asked for and the groups the collectives use stop
-agreeing.  ``flatten_m_first`` reaches the same numbering by a different
-schedule: its first exchange gives rank ``(x, y)`` M-block ``x·py + y``,
-and its second hands out B over the flattened axis in the same
-``ax_x``-major order, so the two routes' outputs are element-identical.
+agreeing.
 
 Evidence pointer for the pattern itself: ``symmetry_maps``'s
 ``unfold_isdf_operator`` has shipped the same ``shard_map`` +
@@ -182,12 +153,6 @@ from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 from common.collectives import warm_mesh_cliques
 from runtime.padding import spec_divisor
 
-#: The two exchange schedules that land on ``P((ax_x, ax_y), None, None)``.
-#: ``split_b_first`` is the default and the measured one; ``flatten_m_first``
-#: is the owner's proposal (see the module docstring).
-ROUTES = ("split_b_first", "flatten_m_first")
-DEFAULT_ROUTE = "split_b_first"
-
 __all__ = [
     "permute_sharded_axis",
     "band_to_product_r_reshard",
@@ -195,8 +160,6 @@ __all__ = [
     "face_to_batch_reshard_supported",
     "shard_local_slice_pad",
     "shard_local_update",
-    "ROUTES",
-    "DEFAULT_ROUTE",
 ]
 
 
@@ -453,8 +416,7 @@ def shard_local_update(mesh: Mesh, *, spec: P) -> Callable:
 
 
 def face_to_batch_reshard_supported(mesh: Mesh, shape, *,
-                                    axes: tuple[str, str] = ("x", "y"),
-                                    route: str = DEFAULT_ROUTE) -> bool:
+                                    axes: tuple[str, str] = ("x", "y")) -> bool:
     """True when :func:`face_to_batch_reshard` can serve ``shape`` on ``mesh``.
 
     Pure arithmetic — no JAX call, no collective — so a caller can branch
@@ -462,16 +424,9 @@ def face_to_batch_reshard_supported(mesh: Mesh, shape, *,
     it to keep their historical (degraded) path alive for a shape this
     primitive must refuse, instead of turning a working-but-slow run into
     a crash.
-
-    Both routes are answered: ``flatten_m_first`` accepts an M that is not
-    a multiple of ``p_x·p_y`` only because the factory pads it locally
-    (``m_loc`` up to a multiple of ``p_y``), which needs ``M % p_x == 0``
-    and nothing more — the same requirement the INPUT layout already has.
     """
     ax_x, ax_y = axes
     names = tuple(mesh.axis_names)
-    if route not in ROUTES:
-        return False
     if ax_x not in names or ax_y not in names or names[-1] != ax_y:
         return False
     if len(shape) != 3:
@@ -492,12 +447,10 @@ def face_to_batch_reshard_supported(mesh: Mesh, shape, *,
 
 @lru_cache(maxsize=None)
 def face_to_batch_reshard(mesh: Mesh, *,
-                          axes: tuple[str, str] = ("x", "y"),
-                          route: str = DEFAULT_ROUTE,
-                          log_fn=None) -> Callable:
+                          axes: tuple[str, str] = ("x", "y")) -> Callable:
     """Factory: a ``shard_map``'d ``(B, M, N)`` face→batch reshard.
 
-    Memoized per (mesh, axes, route, log_fn): the returned kernel keeps its
+    Memoized per (mesh, axes): the returned kernel keeps its
     per-shape programs, so a caller that asks again every SC map (the
     shared-pole constructor) reuses them instead of recompiling.
 
@@ -509,13 +462,6 @@ def face_to_batch_reshard(mesh: Mesh, *,
         ``(major, minor)`` mesh axis names.  ``axes[0]`` carries the M
         (row) face and cuts B first; ``axes[1]`` carries the N (column)
         face and cuts B second.
-    route
-        One of :data:`ROUTES` — which pair of exchanges to issue.  See the
-        module docstring; the two are element-identical and differ only in
-        schedule, peer counts and (for ``flatten_m_first``) a local M pad.
-    log_fn
-        Optional rank-0 logger; used to announce the ``flatten_m_first``
-        pad, which is a real cost and must never be silent.
 
     Returns
     -------
@@ -535,10 +481,6 @@ def face_to_batch_reshard(mesh: Mesh, *,
     """
     from common.shard_map import shard_map
 
-    if route not in ROUTES:
-        raise ValueError(
-            f"face_to_batch_reshard: route={route!r} unknown; expected one "
-            f"of {' | '.join(ROUTES)}.")
     ax_x, ax_y = axes
     names = tuple(mesh.axis_names)
     if ax_x not in names or ax_y not in names:
@@ -559,7 +501,6 @@ def face_to_batch_reshard(mesh: Mesh, *,
     p_x, p_y = int(mesh.shape[ax_x]), int(mesh.shape[ax_y])
     from runtime.padding import mesh_divisor
     ndev = mesh_divisor(mesh)
-    _log = log_fn if log_fn is not None else (lambda *a, **k: None)
 
     def _body_split_b_first(a):
         # a: (B, M/p_x, N/p_y) — this rank's face tile of the WHOLE batch.
@@ -580,48 +521,13 @@ def face_to_batch_reshard(mesh: Mesh, *,
                                    tiled=True)             # (B/(px·py), M, N)
         return a
 
-    def _make_body_flatten_m_first(m_loc, m_pad, keep_idx):
-        """Owner's route: gather N first, then ONE flattened B exchange.
-
-        ``m_loc`` is the incoming per-rank M extent (M/p_x).  Stage 1 cuts
-        it p_y ways, so when ``m_loc % p_y`` it is zero-padded to ``m_pad``
-        FIRST — locally, no collective — and the pad rows are removed at
-        the end with a static gather (``keep_idx``).  Padding locally
-        interleaves the pad into the global M axis (rows m_loc..m_pad-1 of
-        every p_x-block), which is why the removal is a gather and not a
-        slice.
-        """
-        def _body(a):
-            if m_pad != m_loc:
-                a = jnp.pad(a, ((0, 0), (0, m_pad - m_loc), (0, 0)))
-            # Stage 1, over ax_y: split THIS rank's M tile p_y ways and
-            # collect N.  Rank (x, y) ends with M-block x·p_y + y (of the
-            # padded axis) and the whole N axis: P(None, (ax_x, ax_y), None).
-            if p_y > 1:
-                a = jax.lax.all_to_all(a, ax_y, split_axis=1, concat_axis=2,
-                                       tiled=True)      # (B, M_pad/ndev, N)
-            # Stage 2, over the FLATTENED (ax_x, ax_y): hand out B in ndev
-            # pieces and collect M.  Peer order over a tuple axis is
-            # ax_x-major, the same numbering P((ax_x, ax_y), ...) uses, so
-            # rank (x, y) ends with B-block x·p_y + y and the whole padded M.
-            if ndev > 1:
-                a = jax.lax.all_to_all(a, (ax_x, ax_y), split_axis=0,
-                                       concat_axis=1, tiled=True)
-            if keep_idx is not None:
-                a = jnp.take(a, keep_idx, axis=1)
-            return a
-        return _body
-
-    def _make_sm(body):
-        # jit: an eager call (the shared-pole constructor's) then compiles
-        # once per shape instead of dispatching the body op by op each call;
-        # under a caller's jit it inlines as before.
-        return jax.jit(shard_map(body, mesh=mesh,
-                                 in_specs=(P(None, ax_x, ax_y),),
-                                 out_specs=P((ax_x, ax_y), None, None),
-                                 check_vma=False))
-
-    _sm_cache: dict = {}
+    # jit: an eager call (the shared-pole constructor's) compiles once per
+    # shape instead of dispatching the body op by op on every call; under a
+    # caller's jit it inlines as before.
+    sm = jax.jit(shard_map(_body_split_b_first, mesh=mesh,
+                           in_specs=(P(None, ax_x, ax_y),),
+                           out_specs=P((ax_x, ax_y), None, None),
+                           check_vma=False))
 
     def _reshard(a):
         shape = tuple(int(s) for s in a.shape)
@@ -637,34 +543,6 @@ def face_to_batch_reshard(mesh: Mesh, *,
             m, m, p_x, name="face-to-batch row carrier")
         authenticate_padded_axis(
             n, n, p_y, name="face-to-batch column carrier")
-        sm = _sm_cache.get(shape)
-        if sm is None:
-            if route == "split_b_first":
-                sm = _make_sm(_body_split_b_first)
-            else:
-                m_loc = m // p_x
-                from runtime.padding import padded_axis
-                m_pad = padded_axis(
-                    m_loc, p_y, name="face-to-batch local row carrier").carrier
-                if m_pad == m_loc:
-                    keep = None
-                else:
-                    # NUMPY on purpose: a closed-over jax.Array inside a
-                    # shard_map body is a replicated operand, a host array is
-                    # folded in as a constant.
-                    keep = np.concatenate(
-                        [np.arange(x * m_pad, x * m_pad + m_loc,
-                                   dtype=np.int32) for x in range(p_x)])
-                    _log(f"  face_to_batch_reshard[flatten_m_first]: M={m} "
-                         f"gives m_loc={m_loc} which is not a multiple of "
-                         f"p_y={p_y}; zero-padding the local M tile to "
-                         f"{m_pad} (global {m_pad * p_x}, +"
-                         f"{100.0 * (m_pad * p_x - m) / m:.2f}%) and dropping "
-                         f"the {m_pad * p_x - m} pad rows with a static "
-                         f"gather.  This cost belongs to this route only; "
-                         f"'split_b_first' needs no M pad.")
-                sm = _make_sm(_make_body_flatten_m_first(m_loc, m_pad, keep))
-            _sm_cache[shape] = sm
         return sm(a)
 
     # Same policy, same reason, as contract_bands_block_reshard's factory:

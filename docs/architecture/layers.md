@@ -72,7 +72,7 @@ module-level `resolve*` function, and only the variables pinned to it
 | `gw.sigma_plan` | `LORRAX_SIGMA_PLAN` |
 | `gw.sigma_box_plan` | `LORRAX_UNIFORM_RULE_TRACE` |
 | `bandstructure.htransform` | `LORRAX_EXTRA_RANK_PAD` |
-| `bandstructure.bse_setup` | `LORRAX_FACE_TO_BATCH_ROUTE`, `LORRAX_FI_FSHOULDER_TOL` |
+| `bandstructure.bse_setup` | `LORRAX_FI_FSHOULDER_TOL` |
 
 ---
 
