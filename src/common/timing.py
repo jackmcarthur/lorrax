@@ -143,8 +143,40 @@ def _exc_text(error: BaseException | None) -> str:
 	first = (str(error).strip().splitlines() or [""])[0]
 	return f"{type(error).__name__}: {first[:200]}" if first else type(error).__name__
 
+# ---------------------------------------------------------------------------
+# DEVICE PEAK PER SECTION.  At every section boundary on the main thread the
+# pool high-water mark since the previous boundary is read and reset
+# (``runtime.xla_memory.pool_high_water``: two driver calls).  That interval
+# belongs to the section on top of the stack; a section's own peak is the max
+# over its intervals and its children's, so every section, not only the one
+# that raised the run's high-water mark, has its own peak on every rank.
+# Work dispatched but not yet allocated at a boundary counts in the next one.
+# ---------------------------------------------------------------------------
+_MEM_COST = [0, 0.0]          # boundary reads, seconds spent in them
+
+
+def _device_high_water(section: "TimingSection") -> int | None:
+	if threading.current_thread() is not threading.main_thread():
+		return None
+	t0 = time.perf_counter()
+	try:
+		from runtime.xla_memory import pool_high_water
+		return pool_high_water(reset=True)
+	except Exception:          # noqa: BLE001 — never take down the run
+		return None
+	finally:
+		_MEM_COST[0] += 1
+		_MEM_COST[1] += time.perf_counter() - t0
+
+
+def instrument_cost() -> tuple[int, float]:
+	"""(boundary reads, seconds) the per-section device peak has cost this process."""
+	return int(_MEM_COST[0]), float(_MEM_COST[1])
+
+
 class TimingNode:
-	__slots__ = ("name", "count", "inclusive", "exclusive", "children")
+	__slots__ = ("name", "count", "inclusive", "exclusive", "children",
+	             "peak", "peak_self", "peak_ranks", "peak_self_ranks")
 
 	def __init__(self, name: str):
 		self.name = name
@@ -152,6 +184,13 @@ class TimingNode:
 		self.inclusive = 0.0
 		self.exclusive = 0.0
 		self.children: OrderedDict[str, TimingNode] = OrderedDict()
+		# Device peaks in bytes, max over calls (-1: never measured): ``peak`` over
+		# the whole section, ``peak_self`` outside its timed children.  The
+		# ``*_ranks`` lists are every process's values after gather_peaks().
+		self.peak = -1
+		self.peak_self = -1
+		self.peak_ranks = None
+		self.peak_self_ranks = None
 
 	def child(self, name: str) -> "TimingNode":
 		node = self.children.get(name)
@@ -168,7 +207,7 @@ class TimingNode:
 
 class TimingSection:
 	__slots__ = ("collector", "node", "stack", "start", "child_elapsed",
-	             "_watchers", "announce", "label")
+	             "_watchers", "announce", "label", "mem_own", "mem_self")
 
 	def __init__(self, collector: "TimingCollector", node: TimingNode,
 	             stack: list["TimingSection"], *, announce: bool = False,
@@ -185,6 +224,8 @@ class TimingSection:
 		# (the tree/report always keeps the node name).
 		self.announce = announce
 		self.label = label
+		self.mem_own = -1
+		self.mem_self = -1
 
 	def _display_name(self) -> str:
 		return self.label if self.label else self.node.name
@@ -313,6 +354,12 @@ class TimingCollector:
 				if section._cadence_on():
 					_safe_trace("  " * (len(section.stack) - 1)
 					            + f"-> {section._display_name()}")
+				high = _device_high_water(section)
+				if high is not None and len(section.stack) > 1:
+					parent = section.stack[-2]
+					parent.mem_own = max(parent.mem_own, high)
+					parent.mem_self = max(parent.mem_self, high)
+				section.mem_own = section.mem_self = -1
 				section.start = time.perf_counter()
 				section.child_elapsed = 0.0
 				section._watchers = []
@@ -342,9 +389,18 @@ class TimingCollector:
 			self._heartbeat_sections.pop(section, None)
 			self._active_sections.discard(section)
 			section.node.record(inclusive, max(0.0, exclusive))
+			high = _device_high_water(section)
+			if high is not None:
+				section.mem_own = max(section.mem_own, high)
+				section.mem_self = max(section.mem_self, high)
+				node = section.node
+				node.peak = max(node.peak, section.mem_own)
+				node.peak_self = max(node.peak_self, section.mem_self)
 			section.stack.pop()
 			if section.stack:
 				section.stack[-1].child_elapsed += inclusive
+				section.stack[-1].mem_own = max(section.stack[-1].mem_own,
+				                                section.mem_own)
 			self._heartbeat_condition.notify_all()
 			# State is already clean if the ordinary foreground print sink fails.
 			# Holding the same lock as the scheduler preserves exit ordering.
@@ -496,6 +552,49 @@ class TimingCollector:
 			print_fn(f"{'TOTAL (wall)':<48} {'':>7} {wall:>11.3f} "
 			         f"{'':>11} {100.0:>6.1f}")
 
+	def current_path(self) -> tuple[str, ...]:
+		"""Names of this thread's open sections, outermost first."""
+		return tuple(section.node.name for section in self._stack())
+
+	def gather_peaks(self) -> None:
+		"""Share every section's device peaks across processes (every process enters).
+
+		One all-gather of the section count and one of the (path hash, peak,
+		self peak) rows, at the end of a run.  Each node then holds every
+		rank's values (NaN where a rank never entered it).
+		"""
+		import hashlib
+		import numpy as np
+		from common.collectives import all_gather_processes
+		with self._lock:
+			nodes = []
+
+			def visit(node, parents):
+				path = parents + (node.name,)
+				nodes.append((path, node))
+				for child in node.children.values():
+					visit(child, path)
+
+			for child in self._root.children.values():
+				visit(child, ())
+			key = lambda path: int.from_bytes(hashlib.blake2b(
+				"\x1f".join(path).encode(), digest_size=7).digest(), "little")
+			local = np.array([(key(p), n.peak, n.peak_self) for p, n in nodes],
+			                 dtype=np.int64).reshape(-1, 3)
+		counts = np.asarray(all_gather_processes(
+			np.asarray(len(local), dtype=np.int64))).reshape(-1)
+		padded = np.full((max(1, int(counts.max(initial=0))), 3), -1, dtype=np.int64)
+		padded[:len(local)] = local
+		table = np.asarray(all_gather_processes(padded))
+		per_rank = [{int(k): (a, b) for k, a, b in table[r, :int(counts[r])]}
+		            for r in range(len(counts))]
+		nan = lambda v: float(v) if v >= 0 else float("nan")
+		with self._lock:
+			for path, node in nodes:
+				hit = [rank.get(key(path), (-1, -1)) for rank in per_rank]
+				node.peak_ranks = [nan(a) for a, _ in hit]
+				node.peak_self_ranks = [nan(b) for _, b in hit]
+
 	def format(self, **kwargs) -> list[str]:
 		_, rows = self._rows(kwargs.get("min_percent"), kwargs.get("max_depth"))
 		return rows
@@ -519,6 +618,10 @@ class TimingCollector:
 				"count": int(node.count),
 				"inclusive": float(node.inclusive),
 				"exclusive": float(node.exclusive),
+				"peak": node.peak if node.peak >= 0 else None,
+				"peak_self": node.peak_self if node.peak_self >= 0 else None,
+				"peak_ranks": node.peak_ranks,
+				"peak_self_ranks": node.peak_self_ranks,
 			})
 			for child in node.children.values():
 				visit(child, path)
@@ -556,6 +659,16 @@ def record(name: str, seconds: float, *, count: int = 1) -> None:
 def records() -> list[dict[str, Any]]:
 	"""Structured snapshot of the global timing collector."""
 	return _GLOBAL_COLLECTOR.records()
+
+
+def current_path() -> tuple[str, ...]:
+	"""Names of this thread's open sections in the global collector, outermost first."""
+	return _GLOBAL_COLLECTOR.current_path()
+
+
+def gather_peaks() -> None:
+	"""Every process's section peaks onto every process (every process enters)."""
+	_GLOBAL_COLLECTOR.gather_peaks()
 
 
 def process_elapsed_s() -> float | None:
