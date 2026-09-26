@@ -50,11 +50,11 @@ shared_real_pole_v1_r3b = {
     # sites by the support rule; at most N_mu/16 right singular directions per line
     # support; at most 1.8 N_mu retained Gram directions, the pole count K per parent.
     "production": {"direction_cutoff": 1.0e-3, "imaginary_width_fraction": 0.25,
-                   "infinity_width_fraction": 0.125, "sigma_tolerance": 1.0e-4,
+                   "infinity_width_fraction": 0.125,
                    "bank_rule_tolerance": 1.0e-8, "fitted_support_count": 18,
                    "line_direction_cap_fraction": 0.0625, "pole_budget_fraction": 1.8},
     "relaxed": {"direction_cutoff": 1.0e-2, "imaginary_width_fraction": 0.125,
-                "infinity_width_fraction": 0.0625, "sigma_tolerance": 1.0e-3,
+                "infinity_width_fraction": 0.0625,
                 "line_count": 8, "imaginary_count": 2,
                 "bank_rule_tolerance": 1.0e-7},
 }
@@ -114,6 +114,11 @@ def table_hash(table):
 
 
 RECIPE_HASH = table_hash(shared_real_pole_v1_r3b)
+#: The Sigma quadrature is not W.  A tier's default for an omitted
+#: sigma_quadrature_eps lives outside the hashed table above, whose every field
+#: sets W's sampling or poles, so RECIPE_HASH (restart and bank identity) binds
+#: only W and a Sigma-only edit never refuses a stored model.
+SIGMA_EPS_DEFAULT = {"relaxed": 1.0e-3}
 GATE_HASH = table_hash(shared_real_pole_gates_v1_r3b)
 
 # Time-reversal-broken ordered route (particle-hole pencil in z). A separate
@@ -1261,7 +1266,6 @@ def resolve_shared_pole_recipe(config, wfns, meta, *, mesh_xy, print_fn,
                         if 'pole_budget_fraction' in policy else None),
         'multiplet_relative_tolerance': recipe['multiplet_relative_tolerance'],
         'bank_rule_tolerance': policy['bank_rule_tolerance'],
-        'sigma_tolerance': policy['sigma_tolerance'],
         'moment_convention': recipe['moment_convention'], 'census': dict(census),
         'operator_realization': recipe['operator_realization'],
         'U_bytes_per_rank': meta.shared_pole_capacity.U_bytes_per_rank,

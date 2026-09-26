@@ -42,11 +42,11 @@ are `P(None,'x','y')` on the square X/Y mesh with `P = Px·Py`.
    (theory §5.1). It fixes `direction_cutoff`, `imaginary_width`
    $=\lceil n/4\rceil$, `infinity_width` $=\lceil n/8\rceil$,
    `line_direction_cap` $=\lceil n/16\rceil$, `pole_budget`
-   $=\lceil1.8n\rceil$, `bank_rule_tolerance` $10^{-8}$ and
-   `sigma_tolerance` $10^{-4}$ for `production`; `relaxed` uses 8 uniform line
-   sites, 2 imaginary sites, cutoff $10^{-2}$, no cap, no budget, and
-   tolerances $10^{-7}$/$10^{-3}$. `sigma_quadrature_eps` is taken from the tier
-   and refuses a conflicting explicit value.
+   $=\lceil1.8n\rceil$ and `bank_rule_tolerance` $10^{-8}$ for `production`;
+   `relaxed` uses 8 uniform line sites, 2 imaginary sites, cutoff $10^{-2}$,
+   no cap, no budget, and bank tolerance $10^{-7}$. The Σ quadrature reads
+   `sigma_quadrature_eps` from the deck as every Σ route does; `relaxed` only
+   defaults an omitted key to $10^{-3}$.
 2. **Bank** (§2): Coulomb roots, samples $W_c,\partial_sW_c$ at the supports
    on the imaginary axis and the held supports, the direction panels of every
    fitted line support (§3), moments $M_1,M_3$ (and $M_0,M_2$ when ordered)

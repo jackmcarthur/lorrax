@@ -164,8 +164,8 @@ mass-weighted fit is what loses such a state.
 | crossing (Re d spans 0) | peak-relative | sup_box η_min \|Q(d) − 1/d\| ≤ ε, η_min = min Im d |
 | sign-definite | relative | sup_box \|d\| \|Q(d) − 1/d\| ≤ ε |
 
-ε is `sigma_quadrature_eps`, the only accuracy dial; the shared-pole W takes
-it from its `sigma_w_accuracy` tier. Defaults are in the
+ε is `sigma_quadrature_eps`, the only accuracy dial, read the same way on
+every Σ route (GN/HL-PPM, MPA, shared pole). Defaults are in the
 [input reference](../input_reference.md).
 
 Because the windows partition the tuples, a state's delivered error is one
@@ -233,8 +233,10 @@ The planner accepts a rule for a window only if all three hold:
 1. **Certificate.** Every node and weight is finite and the certified sup
    error is ≤ ε in the box's currency.
 2. **Runtime noise.** With a per-term relative perturbation ε_rt = 6·10⁻⁸,
-   ε_rt · max_{d∈∂box} ρ(d) Σ_l |w_l e^{i t_l d}| ≤ 0.05 ε, where ρ = |d| on a
-   sign-definite box and ρ = η_min on a crossing one. The noise mass is
+   ε_rt · max_{d∈∂box} ρ(d) Σ_l |w_l e^{i t_l d}| ≤ 5·10⁻⁶, where ρ = |d| on a
+   sign-definite box and ρ = η_min on a crossing one. The budget is absolute
+   (production's 0.05 × 10⁻⁴): roundoff is set by the executor's arithmetic,
+   not by ε, so a tighter ε does not tighten it. The noise mass is
    subharmonic, so its maximum is on the boundary, sampled at the rule's own
    horizon. Sign-definite rules are built under the cancellation cap that
    implies this bound.
@@ -326,10 +328,9 @@ A per-stage split of a node is a `jax.profiler` trace of the window executable.
 | refusal | fix |
 |---|---|
 | rule not certified at ε, or not finite (names window, box, kind) | a sign-preserving or split product window; never a looser `sigma_quadrature_eps` |
-| runtime-noise bound above 0.05 ε | the same; the box is too ill-conditioned for its currency |
+| runtime-noise bound above 5·10⁻⁶ | the same; the box is too ill-conditioned for its currency |
 | factored log growth above 30 | the same |
 | live pole with Re Ω ≤ 0 or Im Ω > 0, or a nonfinite residue | refit the pole model |
 | a branch with no live states | the Σ band window has no band on that side; widen `number_bands_sigma` or `occupation_window_threshold` |
 | η ≤ 0, ε ∉ (0, 1), edge factor < 0 | fix the deck |
 | η or ε changed inside one SC session | one currency per run |
-| shared-pole W with `sigma_quadrature_eps` unequal to its `sigma_w_accuracy` tier's tolerance | drop the key; the recipe owns ε |
