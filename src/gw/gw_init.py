@@ -35,19 +35,14 @@ from common.four_current_model import (
 from runtime import debug_print_enabled
 from file_io.wfn_basis import centroid_table_md5 as _centroid_table_md5
 
-# Canonical env grammar for this layer.  ``gw_config`` is deliberately
-# jax-free, so importing it here adds nothing to the import graph that
-# the declarations below do not already add.  See the module comment in
-# gw_config for why this vocabulary is duplicated rather than imported from
-# ``isdf.core`` (which imports jax) — and for the drift gate that keeps the
-# copies identical.
+# The env grammar and the XLA memory reading come from their owners in
+# ``runtime`` (L3, jax-free); the deck vocabulary from ``gw_config``.
+from runtime.env_flags import env_bool
+from runtime.xla_memory import classify_xla_pool, resolve_xla_gpu_memory_env
 from .gw_config import (
-	env_bool,
 	active_zeta_truncating_knobs,
-	classify_xla_pool,
 	refuse_unsupported_bispinor_tt_head_correction,
 	refuse_unsupported_bispinor_gw,
-	resolve_xla_gpu_memory_env,
 	uses_bare_tt_gamma_head,
 	uses_coupled_photon_head,
 	uses_direct_bispinor_shared_pole_head,
