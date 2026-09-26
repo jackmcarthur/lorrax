@@ -28,7 +28,7 @@ from file_io.commit_state import agree_io_refusal, assert_committed, set_commit_
 from symmetry_maps import QirrTables, validate_qirr_tables
 
 SCHEMA = "lorrax.shared-real-pole.v1"
-BANK_SCHEMA = "lorrax.shared-real-pole-bank.v2"
+BANK_SCHEMA = "lorrax.shared-real-pole-bank.v3"
 SECTOR_SCHEMA = "lorrax.shared-real-pole-sectors.v1"
 _TABLE_KEYS = ("irr_idx_q", "sym_idx_q", "q_irr_frac", "sym_perm", "L_table")
 _IDENTITY_KEYS = ("iteration_id", "hamiltonian", "energies", "occupations",
