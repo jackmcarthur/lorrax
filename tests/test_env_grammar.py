@@ -585,13 +585,14 @@ def test_isdf_core_grammar_copy_stays_dead():
             assert not (isinstance(t, ast.Name) and t.id == "_ENV_TRUE"), (
                 "isdf/core.py re-defines _ENV_TRUE; the vocabulary lives "
                 "in gw_config (P1.3)")
-    # and the import is really there, spelled from gw.gw_config
+    # and the import is really there: the one grammar, from runtime.env_flags
+    # (its home since VEST row 14) or its gw.gw_config re-export
     has_import = any(
-        isinstance(n, ast.ImportFrom) and n.module == "gw.gw_config"
+        isinstance(n, ast.ImportFrom) and n.module in ("runtime.env_flags", "gw.gw_config")
         and any(a.name == "env_bool" for a in n.names)
         for n in ast.walk(tree))
     assert has_import, (
-        "isdf/core.py no longer imports env_bool from gw.gw_config — its "
+        "isdf/core.py no longer imports env_bool from runtime.env_flags — its "
         "boolean knobs have no grammar")
 
 
