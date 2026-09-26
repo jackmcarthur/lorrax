@@ -232,11 +232,13 @@ def _get_sigma_kij_kernel(
                        nq=k_unfold_plan.n_parent, dtype=jnp.complex128, layout=layout,
                        enable_active_range=True)
 
-    def _g_from_selector(xn, yr, E, sel, E_min, E_max, ref, t, band_range=None):
+    def _g_from_selector(xn, yr, E, sel, E_min, E_max, ref, t, band_range=None,
+                         real_phases=None):
         """Apply boolean identity masks or signed occupation weights without clipping."""
+        # The exponent is -i·t·(E - ref): real when Re t == 0 (``real_phases``).
         options = dict(e_ref=ref, layout=layout, gemm=g_plan,
                        k_unfold_plan=k_unfold_plan, band_range=band_range,
-                       trim_zero_bands=True, unfold=False)
+                       trim_zero_bands=True, unfold=False, real_phases=real_phases)
         options["mask" if sel.dtype == jnp.bool_ else "band_weight"] = sel
         if energy_windows:
             options.update(E_min=E_min, E_max=E_max)
@@ -274,32 +276,40 @@ def _get_sigma_kij_kernel(
     def _kernel_impl(
         psi_coh_xn, psi_coh_yr, psi_proj_xr, psi_proj_yn,
         E_A, mask_A, E_min, E_max, E_ref_A, t_node, W_q, W_pt=None, load=None,
+        real_phases=None,
     ):
         # ONE W preparation per τ, ABOVE the bracket loop.  Explicit, not
         # left to CSE: on the decomposed chain this is ``ifftn(W)``, the
         # only transform in the chain that does not depend on G.
         W_prep = prep_w(W_q, W_pt, load)
+        build_g = partial(_g_from_selector, real_phases=real_phases)
         if brackets is None:
-            G_k = _g_from_selector(psi_coh_xn, psi_coh_yr, E_A, mask_A,
-                                   E_min, E_max, E_ref_A, t_node)
+            G_k = build_g(psi_coh_xn, psi_coh_yr, E_A, mask_A,
+                          E_min, E_max, E_ref_A, t_node)
             return spatial.conv_project(
                 psi_proj_xr, psi_proj_yn, G_k, W_prep)
         return _bracketed_face(
             psi_coh_xn, psi_coh_yr, psi_proj_xr, psi_proj_yn,
             E_A, mask_A, E_min, E_max, E_ref_A, t_node, W_prep,
-            _g_from_selector, spatial.conv_project)
+            build_g, spatial.conv_project)
 
+    # ``real_phases`` (static): the window's host-side statement that its
+    # node times are imaginary-axis (see ``build_G_tau``); omitted, the G
+    # partner is chosen by a runtime predicate.
     if energy_windows:
-        kernel = partial(jax.jit, donate_argnums=(10,))(_kernel_impl)
+        kernel = partial(jax.jit, donate_argnums=(10,),
+                         static_argnames=("real_phases",))(_kernel_impl)
     else:
-        @partial(jax.jit, donate_argnums=(8,))
+        @partial(jax.jit, donate_argnums=(8,), static_argnames=("real_phases",))
         def kernel(
             psi_coh_xn, psi_coh_yr, psi_proj_xr, psi_proj_yn,
             E_A, mask_A, E_ref_A, t_node, W_q, W_pt=None, load=None,
+            real_phases=None,
         ):
             return _kernel_impl(
                 psi_coh_xn, psi_coh_yr, psi_proj_xr, psi_proj_yn,
-                E_A, mask_A, None, None, E_ref_A, t_node, W_q, W_pt, load)
+                E_A, mask_A, None, None, E_ref_A, t_node, W_q, W_pt, load,
+                real_phases=real_phases)
 
     _sigma_kij_kernel_cache[key] = kernel
     return kernel

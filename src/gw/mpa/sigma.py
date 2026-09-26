@@ -936,7 +936,7 @@ class SynthesisTau:
     """One τ body for the window executable: W(τ) synthesis and Σ(τ) in one program.
 
     Serves the scalar shared-pole route and every photon sector.
-    ``window_kernel(space)`` is the traceable ``fn(*arguments, t, active_count)``
+    ``window_kernel(space, real_phases)`` is the traceable ``fn(*arguments, t, active_count)``
     of :meth:`DeviceOmegaAccumulator.integrate_window`, one per branch hole on
     an ordered model; ``window_arguments`` swaps in the right endpoint's
     operands and the synthesis's per-window operands.  Neither closes over a
@@ -950,22 +950,28 @@ class SynthesisTau:
         self._key, self._plans = key, plans
         self._admitted = False
 
-    def window_kernel(self, space):
+    def window_kernel(self, space, real_phases):
         """The τ body for ``space``, one function object per static configuration.
 
         The window runner is cached on this object, so returning the first
         map's body for an equal configuration (same shapes, mesh, layout,
         parent plans and W synthesis) lets every later SC map dispatch the
         compiled window executable instead of recompiling it.
+        ``real_phases``: every node time of the window has ``Re t == 0``
+        (a Laplace window), so the G phases are real and the antiunitary
+        partner is ``conj(G)``; decided on the host once per window, it is
+        static in the body, never a runtime predicate.
         """
         hole = space == 'val' and self._synthesis.ordered
-        key = (self._key, self._synthesis.key, hole)
+        real_phases = bool(real_phases)
+        key = (self._key, self._synthesis.key, hole, real_phases)
         if key not in _SYNTHESIS_TAU:
             spatial, w_kernel = self._spatial, self._synthesis.w_kernel
 
             def tau(xn, yr, xr, yn, energies, weight, w_operands, e_ref_a, e_ref_b, t, _active):
                 interactions = w_kernel(*w_operands, e_ref_b, t, hole)
-                return spatial(xn, yr, xr, yn, energies, weight, e_ref_a, t, interactions)
+                return spatial(xn, yr, xr, yn, energies, weight, e_ref_a, t, interactions,
+                               real_phases=real_phases)
             # The plans ride along so the ids in the key cannot be reused.
             _SYNTHESIS_TAU[key] = (self._plans, tau)
         return _SYNTHESIS_TAU[key][1]
@@ -1155,7 +1161,11 @@ def _integrate_sigma_batches(
                 if synthesis:
                     # The synthesis reads the right endpoint's faces and its
                     # window operands (host intervals, once per window).
-                    row_kernel = tau_kernel.window_kernel(row.space)
+                    # G's phases are exp(-i t (E - E_ref)): real exactly
+                    # when every node time is imaginary-axis (Re t == 0).
+                    real_phases = bool(np.all(np.real(np.asarray(
+                        jax.device_get(win.nodes.t), np.complex128)) == 0))
+                    row_kernel = tau_kernel.window_kernel(row.space, real_phases)
                     tau_arguments = tau_kernel.window_arguments(
                         psi_coh_xn, psi_proj_xr, E_A_call, selector,
                         jnp.asarray(win.E_ref_A), jnp.asarray(win.E_ref_B),

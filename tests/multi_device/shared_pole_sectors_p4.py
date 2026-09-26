@@ -671,7 +671,7 @@ def run_sigma_checks(mesh):
         e=energy if space=='cond' else -energy
         weight=1-occ if space=='cond' else occ
         arguments=body.window_arguments(xn,xr,put(e),put(weight),put(0.),put(0.),space,None,None)
-        actual=jax.jit(body.window_kernel(space))(*arguments,put(time),None)
+        actual=jax.jit(body.window_kernel(space, np.real(time) == 0))(*arguments,put(time),None)
         w=sum(np.einsum('qmp,p,qnp->qmn',c,np.exp(-1j*om*time)/(2*om),t.conj())
               for c,t,om in sectors)
         if space=='val': w=w[minus].swapaxes(-1,-2)

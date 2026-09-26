@@ -142,16 +142,23 @@ def build_G_parents(psi_xn, psi_yr, *, Gij=None, phases=None, layout='face', gem
         if (real_weights is True or phases is None
                 or not jnp.issubdtype(phases.dtype, jnp.complexfloating)):
             return ParentGreen(G, None, conj_partner=True)
+
+        def conjugate_build(_=None):
+            return _build_G_face(jnp.conj(psi_xn), jnp.conj(psi_yr),
+                                 gemm=gemm, Gij=Gij, phases=phases, mesh=k_unfold_plan.mesh_xy,
+                                 band_range=band_range,
+                                 prepared_active_gemm=prepared_active_gemm,
+                                 n_full=k_unfold_plan.n_full)
+        if real_weights is False:
+            # Stated complex on the host: no runtime predicate.
+            transposed = conjugate_build()
         else:
+            # A traced predicate is a conditional the GPU runtime reads back
+            # to the host (one synchronization per call).
             transposed = jax.lax.cond(
                 (jnp.any(jnp.imag(phases) != 0) if real_weights is None
                  else ~jnp.asarray(real_weights)),
-                lambda _: _build_G_face(jnp.conj(psi_xn), jnp.conj(psi_yr),
-                                        gemm=gemm, Gij=Gij, phases=phases, mesh=k_unfold_plan.mesh_xy,
-                                        band_range=band_range,
-                                        prepared_active_gemm=prepared_active_gemm,
-                                        n_full=k_unfold_plan.n_full),
-                lambda _: jnp.conj(G), operand=None)
+                conjugate_build, lambda _: jnp.conj(G), operand=None)
     return ParentGreen(G, transposed)
 
 
@@ -292,17 +299,25 @@ def build_G_tau(psi_xn, psi_yr, enk, t, *, e_ref=0.0, mask=None,
                 band_weight=None, E_min=None, E_max=None,
                 layout='face', gemm=None, k_unfold_plan=None, band_range=None,
                 trim_zero_bands=False, prepared_active_gemm=None,
-                conjugate=False, unfold=True, right_k_unfold_plan=None):
+                conjugate=False, unfold=True, right_k_unfold_plan=None,
+                real_phases=None):
     """Contract phases exp(-t*(energy-reference)) with energy windows, identity masks and signed weights.
 
     ``unfold=False`` returns the :class:`ParentGreen` pair instead of the
     full-k Green (the consumer does the typed unfold on its own load).
     ``right_k_unfold_plan`` transports the right endpoint of a two-family
     (charge x current) Green, as in :func:`build_G`.
+    ``real_phases`` is the caller's host-side statement that ``Im t == 0``
+    (a Σ Laplace window: ``t = τ``) or not (a crossing window); stated, the
+    antiunitary partner is chosen at trace time (``conj(G)`` read on load,
+    or the conjugate build).  ``None`` derives it from ``t`` on device, a
+    conditional the GPU runtime reads back to the host at every call.
+    Complex band weights make the phases complex whatever is stated.
     """
     real_weights = not jnp.issubdtype(jnp.result_type(t), jnp.complexfloating)
     if not real_weights:
-        real_weights = jnp.imag(t) == 0
+        real_weights = (jnp.imag(t) == 0 if real_phases is None
+                        else bool(real_phases))
     if band_weight is not None and jnp.issubdtype(
             jnp.result_type(band_weight), jnp.complexfloating):
         real_weights = False

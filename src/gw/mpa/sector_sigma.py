@@ -119,7 +119,7 @@ def sector_tau_factory(left, right, keys, meta, mesh_xy):
     """
     from distrib_la import gemm_plan, panel_matmul
     from common.contract_bands import contract_bands_block_reshard
-    from gw.greens_function_kernel import build_G_parents, _weighted_tau_phases
+    from gw.greens_function_kernel import build_G_tau
     from gw.cohsex_sigma import make_lorentz_convolution
 
     a, b = left.green_parent, right.green_parent
@@ -154,11 +154,12 @@ def sector_tau_factory(left, right, keys, meta, mesh_xy):
         _, right_yr, _, right_proj, _, _ = parent_sigma_operands(right)
         right_proj = pad_to_axis(right_proj, band_axis, axis=3)
 
-        def spatial(xn, yr, xr, yn, energies, weight, reference, time, interactions):
-            phases = _weighted_tau_phases(energies, 1j*time, e_ref=reference,
-                                         band_weight=weight)
-            green = build_G_parents(xn, yr, phases=phases, layout=a.layout,
-                                    gemm=gemm, k_unfold_plan=plans[0])
+        def spatial(xn, yr, xr, yn, energies, weight, reference, time, interactions, *,
+                    real_phases):
+            green = build_G_tau(xn, yr, energies, 1j*time, e_ref=reference,
+                                band_weight=weight, layout=a.layout, gemm=gemm,
+                                k_unfold_plan=plans[0], unfold=False,
+                                real_phases=real_phases)
             return project(xr, convolve(green, interactions), yn)
 
         b=band_axis.padded

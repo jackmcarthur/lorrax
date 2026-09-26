@@ -112,7 +112,7 @@ def test_ordered_sigma_matches_real_space_igw_and_the_swapped_routing_does_not(m
         arguments = tk.window_arguments(xn, xr, put(energy, P(None, None)), put(mask, P(None, None)),
                                         put(np.float64(ref_a)), put(np.float64(ref_b)),
                                         space, None, None)
-        out = jax.jit(tk.window_kernel(space))(*arguments, put(np.complex128(t)), None)
+        out = jax.jit(tk.window_kernel(space, np.real(t) == 0))(*arguments, put(np.complex128(t)), None)
         return np.diagonal(np.asarray(out)[..., :nb, :nb], axis1=-2, axis2=-1)
 
     def reference(space, t, ref_a, ref_b):

@@ -176,7 +176,7 @@ def test_full_negative_frequency_branch_matches_numpy():
 
 
 def test_padded_capacity_nodes_add_nothing():
-    """Every window of a plan shares the capacity; padded nodes are never run."""
+    """Every window of a plan shares the capacity; masked tail nodes add nothing."""
     got, want = _run_affine_window(_mesh(), capacity=11)
     np.testing.assert_allclose(got, want, rtol=3e-14, atol=3e-14)
 
