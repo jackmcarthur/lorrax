@@ -390,7 +390,7 @@ def direct_gamma_chunk_plan(mesh, operands, *, nsamples):
     sample, fits ``_GAMMA_ROOM_FRACTION`` of the stage room
     (``common.gpu_utils.device_room_bytes``).  Every process enters.
     """
-    from common.gpu_utils import device_room_bytes, record_stage_price
+    from common.gpu_utils import device_budget_bytes, device_room_bytes, record_stage_price
     n_dev = int(mesh.devices.size)
     split = NamedSharding(mesh, P(tuple(mesh.axis_names)))
     probe = n_dev * _GAMMA_MIN_LOCAL
@@ -404,14 +404,15 @@ def direct_gamma_chunk_plan(mesh, operands, *, nsamples):
     # q, D and weight rows (the fixed operands and the 4x4 outputs do not scale).
     per_sample = max(float(getattr(memory, "temp_size_in_bytes", 0)) / probe, 0.0) \
         + 8.0 * (3 + 16 + 1) / n_dev
-    room = _GAMMA_ROOM_FRACTION * float(device_room_bytes())
+    live_room = float(device_room_bytes())
+    room = _GAMMA_ROOM_FRACTION * live_room
     floor = max(probe, _GAMMA_SPHERE_POINTS)
     chunk = floor
     while chunk * 2 <= int(nsamples) and chunk * 2 * per_sample <= room:
         chunk *= 2
     chunk = min(max(chunk, floor), max(int(nsamples), floor))
     record_stage_price(f"direct Gamma head, chunk {chunk} over {n_dev} ranks",
-                       chunk * per_sample)
+                       device_budget_bytes() - live_room + chunk * per_sample)
     return int(chunk), split
 
 
