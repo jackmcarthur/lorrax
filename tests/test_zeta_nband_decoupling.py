@@ -90,13 +90,13 @@ def _soc_spectrum(nb=62, nk=8, pair_gap_mev=100.0, tight=None):
     (0, 4, 8, 40, 64),          # b1 != b0, b3 != b4, b4 PADDED past nband
 ])
 def test_unset_reproduces_the_historical_ranges_exactly(edges):
-    """The bit-identity claim, stated as the identity it is: with the key
-    unset the resolver returns ``(b0, b3)`` and ``(b1, b4)`` and nothing has
+    """With the key unset the resolver returns ``(b0, b3)`` and ``(b0, b4)``
+    (the right leg started at b1 before 2026-09-26) and nothing has
     happened."""
     bs = _slices(*edges)
     left, right = _init().zeta_fit_band_ranges(bs, None, log=lambda *_: None)
     assert left == (bs.b0, bs.b3)
-    assert right == (bs.b1, bs.b4)
+    assert right == (bs.b0, bs.b4)
 
 
 def test_the_padded_b4_is_passed_through_untouched():
@@ -214,8 +214,7 @@ def test_wider_than_nband_is_refused_by_name(tmp_path):
 
 
 def test_an_edge_at_or_below_b1_is_refused():
-    """``right = (b1, zeta_nband)`` has to be a window, not an empty or
-    inverted range."""
+    """``zeta_nband`` must stay above the Σ window's bottom b1."""
     bs = _slices(b0=0, b1=4, b2=8, b3=40, b4=64)
     with pytest.raises(ValueError, match="zeta_nband"):
         _init().zeta_fit_band_ranges(bs, 4, log=lambda *_: None)

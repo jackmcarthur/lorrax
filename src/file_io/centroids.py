@@ -11,6 +11,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import os
+import re
 from typing import TYPE_CHECKING
 
 import numpy as np
@@ -64,6 +65,82 @@ def _read_centroid_coordinates(centroids_file: str) -> np.ndarray:
             "coordinate.")
     return centroids_frac
 
+
+
+class CentroidWindowDropsOccupiedError(ValueError):
+    """A centroid pair-density window misses occupied bands."""
+
+
+# Written by ``centroid.production_output.format_centroid_header``.
+_PAIR_WINDOWS = re.compile(
+    r"pair-density windows\s+left=\((\d+),\s*(\d+)\),\s*"
+    r"right=\((\d+),\s*(\d+)\)")
+
+
+def assert_windows_keep_occupied(left, right, n_occ, *, where):
+    """Refuse pair-density windows that drop an occupied band.
+
+    Owner rule (PAIRS audit, 2026-09-26): the left leg is every occupied
+    state plus the Σ conduction window and the right leg every band in the
+    sums, so both start at band 0 and reach ``n_occ``.
+    """
+    (l0, l1), (r0, r1) = (tuple(int(v) for v in left),
+                          tuple(int(v) for v in right))
+    n_occ = int(n_occ)
+    if l0 > 0 or r0 > 0 or l1 < n_occ or r1 < n_occ:
+        raise CentroidWindowDropsOccupiedError(
+            f"CentroidWindowDropsOccupiedError: {where}: pair-density "
+            f"windows left=({l0}, {l1}), right=({r0}, {r1}) drop occupied "
+            f"bands of [0, {n_occ}).  Both windows must start at band 0 and "
+            f"reach nocc={n_occ}; pairs of the dropped bands are otherwise "
+            "never selected for.")
+
+
+def read_centroid_pair_windows(centroids_file: str):
+    """``(left, right)`` from the table's provenance header, or ``None``."""
+    with open(centroids_file, "r", encoding="utf-8") as stream:
+        for line in stream:
+            if not line.lstrip().startswith("#"):
+                break
+            match = _PAIR_WINDOWS.search(line)
+            if match:
+                v = tuple(int(g) for g in match.groups())
+                return (v[0], v[1]), (v[2], v[3])
+    return None
+
+
+def check_centroid_pair_windows(centroids_file, n_occ, zeta_left,
+                                zeta_right):
+    """Check a table's selection windows against the ζ-fit legs.
+
+    Refuses (:class:`CentroidWindowDropsOccupiedError`) when the windows drop
+    an occupied band.  Returns a one-line warning when the table has no
+    header, or when its windows stop short of the ζ legs without dropping an
+    occupied band (the pre-2026-09-26 ``v_x_vc`` left leg ends at nocc,
+    below the Σ conduction window).  Returns ``None`` when they cover them.
+    Selection is a placement heuristic; the ζ fit itself trains on its own
+    legs, which is why a short conduction window only warns.
+    """
+    windows = read_centroid_pair_windows(centroids_file)
+    if windows is None:
+        return (f"centroid file {centroids_file} has no 'pair-density "
+                "windows' header, so its selection windows cannot be "
+                "checked against the ζ fit.  Regenerate it with "
+                "centroid.kmeans_cli -i <deck>.")
+    left, right = windows
+    assert_windows_keep_occupied(
+        left, right, n_occ, where=f"centroid file {centroids_file}")
+    gaps = [f"{name}=({lo}, {hi}) ends below the ζ {name} leg's top {top}"
+            for name, (lo, hi), top in (("left", left, int(zeta_left[1])),
+                                        ("right", right, int(zeta_right[1])))
+            if hi < top]
+    if not gaps:
+        return None
+    return (f"centroid file {centroids_file}: selection window "
+            + "; ".join(gaps) + ".  The ζ fit still trains on "
+            f"left={tuple(zeta_left)} x right={tuple(zeta_right)}; for best "
+            "placement regenerate the centroids with "
+            "centroid.kmeans_cli -i <deck>.")
 
 def _centroid_grid_indices(
     centroids_frac: np.ndarray,

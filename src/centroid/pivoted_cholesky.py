@@ -1414,9 +1414,9 @@ def build_gram_q0_via_loadwfns(
       valence × conduction pair-product Gram used in the original assay.
 
     * Explicit ``(band_range_left, band_range_right)`` (gw_jax / ISDF
-      convention): left = ``(b0, b3)`` = "all val + sigma cond", right =
-      ``(b1, b4)`` = "sigma val + all cond". Matches the windowing used
-      by ``gw_init.fit_zeta`` → ``isdf_fitting.fit_zeta_chunked_to_h5``.
+      convention): left = ``(b0, b3)`` = "all occupied + sigma cond",
+      right = ``(b0, b4)`` = "all bands". Matches the windowing used by
+      ``gw_init.zeta_fit_band_ranges`` → ``isdf_fitting.fit_zeta_to_h5``.
       Passing ``band_norms`` additionally applies the pseudoband
       normalization ``ψ /= max(norm, 1.0)`` on both left and right
       (same clamp recipe as ``isdf_fitting.py:838-847``).

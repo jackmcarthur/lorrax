@@ -437,6 +437,11 @@ def _zeta_fit_provenance(*, wfn, meta, cfg, band_range_left, band_range_right,
 	if (int(vertex_mu_L) == 0
 			and tuple(band_range_left) != tuple(band_range_right)):
 		prov['charge_pair_training_domain'] = 'ordered_lr_plus_rl'
+	# The current channels took the same completion on 2026-09-26; an older
+	# LR-only transverse stamp lacks this key and refits.
+	if (int(vertex_mu_L) != 0
+			and tuple(band_range_left) != tuple(band_range_right)):
+		prov['current_pair_training_domain'] = 'ordered_lr_plus_rl'
 	return json.dumps(prov, sort_keys=True)
 
 
@@ -880,12 +885,16 @@ def resolve_zeta_fit_edge(band_slices, zeta_nband):
 def zeta_fit_band_ranges(band_slices, zeta_nband, *, log=print):
 	"""The two band ranges the ISDF ζ fit runs on: ``(left, right)``.
 
-	``left = (b0, b3)`` ("all val + sigma cond") and ``right = (b1, b4)``
-	("sigma val + all cond") — the pair density needs asymmetric ranges — for
-	every deck written before 2026-08-11, and for every deck since that does
-	not name ``zeta_nband``.  ``zeta_nband is None`` returns exactly those two
-	tuples and nothing else happens here, which is what makes the default
-	bit-identical: ``b4`` is the PADDED edge and is passed through untouched.
+	``left = (b0, b3)`` (all occupied + the Σ conduction window) and
+	``right = (b0, b4)`` (every band the χ0/Σ sums reach).  Both start at
+	band 0: every occupied state sits on both legs, so the deep×deep pairs,
+	each deep band's own |ψ_n|² among them, are fitted.  Until 2026-09-26
+	the right leg started at ``b1 = nocc − nval``, and a deck with
+	``nval < nocc`` left the block [0, b1)² unfitted while Σ still reported
+	those rows (reports/audits_2026-09-25/PAIRS.md).  With ``nval == nocc``
+	``b1 == b0`` and the ranges are unchanged.  ``zeta_nband is None``
+	returns exactly those two tuples; ``b4`` is the PADDED edge and is passed
+	through untouched.
 
 	THE DECOUPLING.  ``b4`` is the top of the χ0/Σ band sum AND, until today,
 	the top of the window ζ was fitted on.  The two want opposite things.  The
@@ -935,19 +944,19 @@ clears-fh-and-the-tile-null-still-refuses.md`` §3).
 	states the invariant where it can fail; this is why.
 	"""
 	left = (band_slices.b0, band_slices.b3)
-	right = (band_slices.b1, band_slices.b4)
+	right = (band_slices.b0, band_slices.b4)
 	if zeta_nband is None:
 		return left, right
 	b4_zeta = int(zeta_nband)
 	if not (band_slices.b1 < b4_zeta <= band_slices.b4):
 		raise ValueError(
 			f"zeta_nband={b4_zeta} is outside the band window this run holds: "
-			f"the ζ fit's right range starts at b1={band_slices.b1} and the "
+			f"the Σ window starts at b1={band_slices.b1} and the "
 			f"centroid ψ spans [b0, b4) = [{band_slices.b0}, "
 			f"{band_slices.b4}).  zeta_nband can only NARROW the ζ-fit "
 			f"window; it cannot move it outside the loaded bands.")
 	left = (band_slices.b0, min(band_slices.b3, b4_zeta))
-	right = (band_slices.b1, b4_zeta)
+	right = (band_slices.b0, b4_zeta)
 	log(f"    ζ-fit window DECOUPLED from the band sum: logical physical "
 	    f"edge zeta_nband={b4_zeta}; the loaded band carrier ends at "
 	    f"b4={band_slices.b4} (any tail above the logical loaded extent is "
@@ -962,6 +971,32 @@ clears-fh-and-the-tile-null-still-refuses.md`` §3).
 		    f"bands are wanted. ***")
 	return left, right
 
+
+
+class ZetaFitWindowDropsOccupiedError(ValueError):
+	"""A ζ-fit leg misses occupied bands, so their pair densities go unfitted."""
+
+
+def assert_zeta_fit_keeps_occupied(band_slices, band_range_left,
+                                   band_range_right):
+	"""Refuse a ζ-fit window whose left or right leg drops an occupied band.
+
+	The owner's rule (PAIRS audit, 2026-09-26): the left leg is every
+	occupied state plus the Σ conduction window, the right leg every band in
+	the sums.  Both legs must therefore start at ``b0`` and reach ``b2``
+	(nocc); otherwise pairs of the dropped occupied bands, including their
+	own densities |ψ_n|², are never fitted while Σ still reports their rows.
+	"""
+	b0, b2 = int(band_slices.b0), int(band_slices.b2)
+	for name, (lo, hi) in (("left", band_range_left),
+	                       ("right", band_range_right)):
+		if int(lo) > b0 or int(hi) < b2:
+			raise ZetaFitWindowDropsOccupiedError(
+				f"ZetaFitWindowDropsOccupiedError: the ζ-fit {name} leg "
+				f"[{int(lo)}, {int(hi)}) does not hold every occupied band "
+				f"[{b0}, {b2}).  The pair densities of the dropped bands would "
+				f"never be fitted.  Both legs must start at band {b0} and "
+				f"reach nocc={b2}.")
 
 def check_zeta_fit_windows(energies, band_range_left, band_range_right,
                            zeta_nband, logical_band_stop, *, log=print):
@@ -1380,6 +1415,30 @@ class _ZetaFitContract:
 		return bool(self.reuse_charge and all(self.reuse_transverse))
 
 
+_CENTROID_WINDOW_WARNED = set()
+
+
+def _check_centroid_selection_windows(cfg, band_slices, band_range_left,
+                                      band_range_right, print_fn):
+	"""Compare each centroid table's selection windows with the ζ-fit legs.
+
+	The table's provenance header names the pair-density windows kmeans
+	selected on.  :func:`file_io.centroids.check_centroid_pair_windows`
+	refuses a table whose windows drop occupied bands and returns a warning
+	for a softer gap (the pre-2026-09-26 ``v_x_vc`` left leg stops at nocc,
+	below the Σ conduction window).  Each warning prints once per table.
+	"""
+	from file_io.centroids import check_centroid_pair_windows
+	paths = [cfg.paths.centroids_file]
+	if cfg.bispinor and getattr(cfg.paths, "centroids_file_current", None):
+		paths.append(cfg.paths.centroids_file_current)
+	for path in paths:
+		warning = check_centroid_pair_windows(
+			path, int(band_slices.b2), band_range_left, band_range_right)
+		if warning is not None and path not in _CENTROID_WINDOW_WARNED:
+			_CENTROID_WINDOW_WARNED.add(path)
+			print_fn(f"WARNING: {warning}")
+
 def _resolve_zeta_fit_contract(
 		wfn, sym, meta, centroid_indices, mesh_xy, cfg, band_slices, tmp_dir,
 		*, print_fn=print):
@@ -1396,6 +1455,10 @@ def _resolve_zeta_fit_contract(
 		band_slices, getattr(cfg, "zeta_nband", None))
 	band_range_left, band_range_right = zeta_fit_band_ranges(
 		band_slices, zeta_edge, log=print_fn)
+	assert_zeta_fit_keeps_occupied(
+		band_slices, band_range_left, band_range_right)
+	_check_centroid_selection_windows(
+		cfg, band_slices, band_range_left, band_range_right, print_fn)
 	logical_band_stop = (
 		int(zeta_edge) if zeta_edge is not None
 		else int(getattr(meta, "b_id_4_user", 0) or band_slices.b4))
@@ -2733,6 +2796,10 @@ def _write_fresh_restart(
     				basis_wfn_fingerprint_binding))),
     		charge_zeta_identity=charge_zeta_identity_receipt,
     		band_slices=band_slices,
+    		zeta_fit_windows=zeta_fit_band_ranges(
+    			band_slices,
+    			resolve_zeta_fit_edge(band_slices, getattr(cfg, "zeta_nband", None)),
+    			log=lambda _message: None),
     		qirr=_qirr.with_capture(
     			take_pre_unfold("V_qmunu")),
     	)

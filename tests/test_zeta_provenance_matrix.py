@@ -218,7 +218,20 @@ def test_pair_domain_stamp_changes_only_asymmetric_charge():
     assert asymmetric["charge_pair_training_domain"] == "ordered_lr_plus_rl"
     assert "charge_pair_training_domain" not in equal
     assert "charge_pair_training_domain" not in transverse
+    assert transverse["current_pair_training_domain"] == "ordered_lr_plus_rl"
+    assert "current_pair_training_domain" not in asymmetric
     assert asymmetric["schema"] == equal["schema"] == transverse["schema"] == 2
+
+
+def test_pre_pair_domain_current_stamp_refits(stub_reader):
+    """An LR-only asymmetric current zeta (before 2026-09-26) refits."""
+    new = _prov(_cfg(bispinor=True), vertex_mu_L=1)
+    old = json.loads(new)
+    old.pop("current_pair_training_domain")
+    path = stub_reader(json.dumps(old, sort_keys=True))
+    msgs = []
+    assert not gw_init._zeta_reuse_ok(path, new, CENTS, print_fn=msgs.append)
+    assert "current_pair_training_domain" in " ".join(msgs)
 
 
 def test_logical_band_ranges_are_mesh_invariant_and_physics_sensitive(
@@ -457,7 +470,8 @@ def test_per_vertex_stamps_differ_only_in_vertex_and_mu():
         assert s["n_rmu"] == CENTS_T.shape[0]
         assert sorted(k for k in set(charge) | set(s)
                       if charge.get(k) != s.get(k)) == [
-                          "charge_pair_training_domain", "n_rmu",
+                          "charge_pair_training_domain",
+                          "current_pair_training_domain", "n_rmu",
                           "vertex_mu_L"]
     # ζ_T for μ_L=1 is not interchangeable with μ_L=2.
     assert stamps[1] != stamps[2]

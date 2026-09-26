@@ -1989,7 +1989,8 @@ def _zeta_fit_window_of(prov: dict) -> tuple[int, int] | None:
     halves of the pair density do not share one.
 
     The producer fits ``ρ_mn`` with m from its left range and n from its
-    right range — ``(b0, b3)`` and ``(b1, b4)`` on a stock deck.  Schema 2
+    right range — ``(b0, b3)`` and ``(b0, b4)`` on a stock deck (``(b1, b4)``
+    on the right before 2026-09-26).  Schema 2
     names the logical ranges explicitly; schema 1 carries the historical
     storage ranges.  This reader may reproduce either completed artifact,
     but the GW reuse validator never treats a schema-1 storage endpoint as

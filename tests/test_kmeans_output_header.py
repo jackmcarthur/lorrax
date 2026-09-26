@@ -51,9 +51,9 @@ def test_centroid_header_names_density_band_space_and_selection(tmp_path):
 
 
 def test_prune_header_and_executor_share_one_window_resolver():
-    args = SimpleNamespace(prune_window="v_x_vc")
+    args = SimpleNamespace(prune_window="v_x_vc", sigma_ncond=4)
     assert prune_band_ranges(args, 8, 32) == (
-        (0, 8), (0, 40), "valence x (valence + conduction)")
+        (0, 12), (0, 40), "(occupied + Sigma conduction) x all bands")
 
 
 def test_explicit_fit_window_is_independent_of_physical_occupancy():

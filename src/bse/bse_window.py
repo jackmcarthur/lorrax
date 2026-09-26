@@ -441,6 +441,43 @@ def refuse_eqp_on_a_qp_wfn(input_file: str, eqp_file: str) -> None:
         wfn_path=wfn_path, eqp_file=eqp_file)
 
 
+
+class BseWindowOutsideZetaTrainingError(ValueError):
+    """The BSE band window reaches bands whose pair densities ζ never fit."""
+
+
+def assert_bse_window_in_zeta_training(header, band_lo, band_hi):
+    """Refuse a BSE window ``[band_lo, band_hi)`` outside the ζ training set.
+
+    The BSE reads every pair of its window: v×c for the exchange, v×v' and
+    c×c' for the direct term.  The stored V and W represent a pair only if
+    both bands lie in the intersection of the ζ-fit legs, L ∩ R.  The
+    restart stamps the legs as ``zeta_fit_windows = (L0, L1, R0, R1)``;
+    a bundle written before 2026-09-26 has no stamp and used
+    L = (b0, b3), R = (b1, b4), so L ∩ R = [b1, b3) from ``band_window``.
+    """
+    stamp = header.get("zeta_fit_windows")
+    if stamp is not None:
+        l0, l1, r0, r1 = (int(v) for v in np.asarray(stamp).reshape(-1))
+        source = f"the ζ-fit legs left=({l0}, {l1}), right=({r0}, {r1})"
+    else:
+        if header.get("band_window") is None:
+            return
+        b0, b1, b2, b3, b4 = (
+            int(v) for v in np.asarray(header["band_window"]).reshape(-1))
+        l0, l1, r0, r1 = b0, b3, b1, b4
+        source = (f"the legacy ζ-fit legs left=({b0}, {b3}), "
+                  f"right=({b1}, {b4}) (bundle predates the zeta_fit_windows "
+                  f"stamp)")
+    lo, hi = max(l0, r0), min(l1, r1)
+    if int(band_lo) < lo or int(band_hi) > hi:
+        raise BseWindowOutsideZetaTrainingError(
+            f"BseWindowOutsideZetaTrainingError: the BSE band window "
+            f"[{int(band_lo)}, {int(band_hi)}) leaves [{lo}, {hi}), the "
+            f"bands on both legs of {source}.  Its v×v' or c×c' pair "
+            f"densities were never fitted.  Narrow the BSE window, or rerun "
+            f"the GW with nval/ncond covering it.")
+
 def resolve_n_occ(
     enk_full: np.ndarray,
     *,

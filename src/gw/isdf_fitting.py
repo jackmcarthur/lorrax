@@ -552,23 +552,24 @@ def fit_zeta_to_h5(
     if band_range_right is None:
         band_range_right = (meta.b_id_0, meta.b_id_4)
 
-    # The production charge fit uses asymmetric serving windows: L contains
-    # all occupied states plus the Sigma conduction window, while R contains
-    # the Sigma occupied window plus all empty states.  Complex conjugation
-    # swaps those ordered endpoints, so LR alone is not a conjugation-closed
-    # training space.  Complete the *normal equations* before factor/solve;
-    # no fitted zeta, V, or W is projected downstream.  The q involution is
-    # owned by the symmetry service and passed into neutral ``isdf.core``.
-    # The current channels train on LR alone, as they always have.
-    _complete_charge_pairs = (
-        not transverse and tuple(band_range_left) != tuple(band_range_right))
-    if _complete_charge_pairs:
+    # The production fit uses asymmetric serving windows: L (the bra leg)
+    # holds all occupied states plus the Sigma conduction window, R (the ket
+    # leg) every band in the sums.  Complex conjugation swaps those ordered
+    # endpoints, so LR alone is not a conjugation-closed training space.
+    # Complete the *normal equations* before factor/solve; no fitted zeta,
+    # V, or W is projected downstream.  The q involution is owned by the
+    # symmetry service and passed into neutral ``isdf.core``.  The current
+    # channels apply one vertex to both legs, so RL at q is the conjugate of
+    # LR at -q for them as for the charge; their chi reverse order and the
+    # COH empty branch read bands [b3, b4) on the bra leg (2026-09-26).
+    _complete_pairs = tuple(band_range_left) != tuple(band_range_right)
+    if _complete_pairs:
         from ffi import _services
         _services.ensure_on_path()
         from symmetry_maps import q_negation_index
         _q_neg_idx = q_negation_index(kgrid)
-        print("  Charge pair training domain: ordered LR + RL "
-              "(conjugation-closed normal equations)")
+        print(f"  Pair training domain (μ_L={list(vertices)}): ordered "
+              "LR + RL (conjugation-closed normal equations)")
     else:
         _q_neg_idx = None
 

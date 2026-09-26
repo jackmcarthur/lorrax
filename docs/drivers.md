@@ -60,15 +60,19 @@ refused before loading if they do not fit.
 |---|---|---|
 | `N_c` (positional) | 400 | centroids after pruning |
 | `--oversample` | 1.5 | k-means candidate factor; 1.0 disables pruning |
-| `--prune-n-val` / `--prune-n-cond` | `nelec` / `nbands − n_val` | pruning window extents |
-| `--prune-window` | `v_x_vc` | Gram band pair: `v_x_c`, `v_x_vc` (adds v×v, needed by V_H), `vc_x_vc` (full Σ square, for ncond ≫ nval) |
+| `-i` / `--input` | unset | GW deck; its `ncond` sets the Σ conduction window on the `v_x_vc` left leg |
+| `--prune-n-val` / `--prune-n-cond` | `nelec` / `nbands − n_val` | pruning window extents; `--prune-n-val` below `nelec` refuses |
+| `--prune-window` | `v_x_vc` | Gram band pair: `v_x_c`, `v_x_vc` (left = occupied + Σ conduction from `-i`, right = all bands; without `-i` it falls back to `vc_x_vc` and says so), `vc_x_vc` (all bands on both legs) |
 | `--fit-window L0:L1,R0:R1` | unset | explicit left/right windows for candidates and pruning |
 | `--density-mode` | `scalar` | `scalar` charge Gram; `current` transverse three-current Gram (needs orbit closure, `--rho-power 1`; suffix `_current`) |
 | `--orbit` / `--no-orbit` | on if the atom group has more than one operation | orbit-closed selection |
 | `--rho-power` | 1.0 | sampling weight $w^\alpha$; point density $\propto w^{3\alpha/5}$ |
 | `LORRAX_CENTROID_SELECT` (env) | `deliver` | `strict` refuses a numerically flat pool |
 
-The fit windows must cover the Σ window the GW run consumes.
+Both windows must start at band 0 and hold every occupied band; a window that
+drops one refuses (`CentroidWindowDropsOccupiedError`), here and when `gw_jax`
+reads the table's header. A header whose left window stops below the Σ
+conduction window (the old `v_x_vc` default) only warns.
 
 ## dipole — `psp.get_dipole_mtxels`
 

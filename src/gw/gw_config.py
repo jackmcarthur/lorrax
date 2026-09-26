@@ -1004,7 +1004,7 @@ _DEFAULTS = {
     # (2026-08-11).  ``None`` (the default) means "follow ``nband``", which
     # is what this axis did for its whole history and what keeps every
     # existing deck bit-identical — the ζ fit's right band range is then
-    # ``(b1, b4)`` exactly as before, PADDED extent and all.
+    # ``(b0, b4)``, PADDED extent and all (``(b1, b4)`` before 2026-09-26).
     #
     # WHY IT EXISTS.  ``nband`` served two unrelated jobs: the top of the
     # χ0/Σ band sum (``b4``) and the top of the window ζ is fitted on.  The
