@@ -37,7 +37,6 @@ from .bse_ring_comm import (
 from .bse_preconditioner import compute_pair_amplitude
 from file_io.restart_bundle import (_find_restart_file)
 from .bse_lanczos import (
-    block_lanczos_eig,
     lanczos_eig_jit,
     simple_lanczos_eig,
     iters_reported,
@@ -45,7 +44,6 @@ from .bse_lanczos import (
 from .bse_io import write_eigenvectors_stream
 
 __all__ = [
-    "block_lanczos_eig",
     "build_bse_ring_matvec_full",
     "compute_pair_amplitude",
     "create_mesh_2d",
