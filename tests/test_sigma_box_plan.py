@@ -11,6 +11,7 @@ import pytest
 
 from common.units import RYD_TO_EV
 from gw.mpa.sigma import _batch_rows
+from gw.mpa.sigma_windows import sigma_pole_edges
 from gw.ppm_windows import _SigmaBranch
 from gw.sigma_box_plan import (
     _box_for_window,
@@ -44,14 +45,27 @@ def _branch_at(energies, tag="positive conduction"):
     )
 
 
-def _summaries():
-    # eta=.1, omega_max=.5, edge=1.5 -> pole edge=.65.
-    shallow = (0.3, 0.3, 0.05, 0.05)
-    deep = (1.0, 1.0, 0.08, 0.08)
-    return (
-        (0, {"all": shallow, "shallow": shallow, "deep": None}),
-        (1, {"all": deep, "shallow": None, "deep": deep}),
-    )
+_POLES = ((0.3, 0.05), (1.0, 0.08))
+
+
+def _summaries(branches=None, poles=_POLES):
+    """Selector evidence of ``poles`` ``(a, gamma)`` at the branches' edges.
+
+    eta=.1, edge=1.5: on the default positive branch (omega_max=.5, no
+    excursion) the pos edge is .65 and the near edge .15.
+    """
+    branches = [_branch()] if branches is None else list(branches)
+    excursion = max(0.0, -min(float(np.min(np.asarray(b.E_A))) for b in branches))
+    edges = sigma_pole_edges(branches, 0.15, excursion)
+    rows = []
+    for index, (a, gamma) in enumerate(poles):
+        stat = (a, a, gamma, gamma)
+        evidence = {"all": stat}
+        for name, edge in edges.items():
+            evidence[f"shallow:{name}"] = stat if a <= edge else None
+            evidence[f"deep:{name}"] = stat if a > edge else None
+        rows.append((index, evidence))
+    return tuple(rows)
 
 
 def _fake_rule(box, eps, **_kwargs):
@@ -81,7 +95,7 @@ def _plan(monkeypatch, branch=None, summaries=None, **kwargs):
     omega = (-branch.omega_abs if branch.neg_omega_half
              else branch.omega_abs)
     return plan_sigma_windows(
-        _summaries() if summaries is None else summaries,
+        _summaries([branch]) if summaries is None else summaries,
         [branch], omega, 0.1,
         eps=1.0e-4,
         cache_dir=None, print_fn=lambda *_args, **_kwargs: None,
@@ -116,12 +130,7 @@ def test_three_product_partition_uses_raw_tuple_boxes(monkeypatch):
 
 
 def test_ppm_flat_crossing_line_nodes_reach_sigma_executor(monkeypatch):
-    ppm_summaries = (
-        (0, {"all": (0.3, 0.3, 0.0, 0.0),
-             "shallow": (0.3, 0.3, 0.0, 0.0), "deep": None}),
-        (1, {"all": (1.0, 1.0, 0.0, 0.0),
-             "shallow": None, "deep": (1.0, 1.0, 0.0, 0.0)}),
-    )
+    ppm_summaries = _summaries(poles=((0.3, 0.0), (1.0, 0.0)))
     plan, geometry = _plan(monkeypatch, summaries=ppm_summaries,
                            analytic_line=True)
     report = geometry["branches"][0]["windows"]
@@ -149,24 +158,97 @@ def test_analytic_line_request_keeps_damped_poles_on_box_rule(monkeypatch):
                for row in geometry["branches"][0]["windows"])
 
 
+def _metal_branch(space, negative):
+    """E = -.02 (excursion), .1 (resonant side), 3 (bulk); |w| .0-.5 across
+    the cut edge + exc = .17."""
+    omega_abs = np.asarray([0.0, 0.1, 0.2, 0.5], np.float64)
+    return _SigmaBranch(
+        tag=f"{'negative' if negative else 'positive'} {space}",
+        E_A=jnp.asarray([[-0.02, 0.1, 3.0]], dtype=jnp.float64),
+        base_mask_A=jnp.asarray([[True, True, True]]),
+        space=space, neg_omega_half=negative, omega_abs=omega_abs,
+        omega_idx=np.arange(omega_abs.size, dtype=np.int64))
+
+
+_METAL_POLES = ((0.05, 0.0), (0.3, 0.0), (1.0, 0.0))
+
+
 @pytest.mark.parametrize(
     ("space", "negative"),
     (("cond", False), ("val", False), ("cond", True), ("val", True)),
 )
 def test_product_windows_partition_every_causal_tuple(
         monkeypatch, space, negative):
-    tag = f"{'negative' if negative else 'positive'} {space}"
-    branch = _branch(tag, space=space, negative=negative)
-    plan, _geometry = _plan(monkeypatch, branch)
-    for state in range(2):
-        for pole in range(2):
-            owners = [
-                row.window.name
-                for row in plan
-                if bool(np.asarray(row.window.mask_A).reshape(-1)[state])
-                and pole in set(np.asarray(row.pole_indices).tolist())
-            ]
-            assert len(owners) == 1, (tag, state, pole, owners)
+    branch = _metal_branch(space, negative)
+    plan, geometry = _plan(
+        monkeypatch, branch, _summaries([branch], _METAL_POLES))
+    for state in range(3):
+        for pole in range(len(_METAL_POLES)):
+            for omega in range(branch.omega_abs.size):
+                owners = [
+                    row.window.name
+                    for row in plan
+                    if bool(np.asarray(row.window.mask_A).reshape(-1)[state])
+                    and pole in set(np.asarray(row.pole_indices).tolist())
+                    and omega in set(np.asarray(row.omega_idx).tolist())
+                ]
+                assert len(owners) == 1, (branch.tag, state, pole, omega, owners)
+    # Only a resonant window may cross zero; every other box keeps the state
+    # edge's sign gap.
+    for row in geometry["branches"][0]["windows"]:
+        if not row["name"].endswith(":resonant"):
+            assert row["kind"] != "crossing", row["name"]
+            assert min(abs(row["box_ry"][0]), abs(row["box_ry"][1])) >= (
+                0.7 * geometry["state_edge_ry"] - 1e-15), row["name"]
+
+
+@pytest.mark.parametrize(("space", "negative"), (("val", False), ("cond", True)))
+def test_non_crossing_branch_splits_resonant_states_at_the_omega_cut(
+        monkeypatch, space, negative):
+    branch = _metal_branch(space, negative)
+    plan, geometry = _plan(
+        monkeypatch, branch, _summaries([branch], _METAL_POLES))
+    cut = geometry["omega_cut_ry"]
+    assert cut == pytest.approx(0.15 + 0.02)
+    windows = {row.window.name.split(":")[1]: row for row in plan}
+    assert set(windows) == {"bulk", "resonant", "pole_tail", "omega_tail"}
+    np.testing.assert_array_equal(windows["bulk"].omega_idx, [0, 1, 2, 3])
+    np.testing.assert_array_equal(windows["resonant"].omega_idx, [0, 1])
+    np.testing.assert_array_equal(windows["omega_tail"].omega_idx, [2, 3])
+    np.testing.assert_array_equal(windows["resonant"].pole_indices, [0])
+    np.testing.assert_array_equal(windows["pole_tail"].pole_indices, [1, 2])
+    np.testing.assert_array_equal(windows["omega_tail"].pole_indices, [0, 1, 2])
+
+
+def test_crossing_branch_uses_its_own_halfs_pole_edge(monkeypatch):
+    """The w<E_F crossing branch's edge ignores the w>=E_F half's reach."""
+    negative = _metal_branch("val", True)
+    far = _SigmaBranch(
+        tag="positive cond", E_A=negative.E_A, base_mask_A=negative.base_mask_A,
+        space="cond", neg_omega_half=False,
+        omega_abs=np.asarray([0.0, 2.0]), omega_idx=np.asarray([4, 5]))
+    monkeypatch.setattr("gw.sigma_box_plan.build_uniform_rule", _fake_rule)
+    omega = np.asarray([-0.0, -0.1, -0.2, -0.5, 0.0, 2.0])
+    _, geometry = plan_sigma_windows(
+        _summaries([negative, far], _METAL_POLES), [negative, far], omega, 0.1,
+        eps=1.0e-4, cache_dir=None, print_fn=lambda *_a, **_k: None)
+    edges = geometry["pole_edges_ry"]
+    assert edges["neg"] == pytest.approx(0.5 + 0.17)
+    assert edges["pos"] == pytest.approx(2.0 + 0.17)
+    negative_rows = {row["name"]: row for row in geometry["branches"][0]["windows"]}
+    assert negative_rows["negative val:pole_tail"]["pole_interval_ry"][0] == edges["neg"]
+
+
+def test_insulating_non_crossing_branch_keeps_one_bulk_window(monkeypatch):
+    """No state within the edge: no split, every |w| in one bulk window."""
+    branch = _branch("positive val", space="val")
+    branch = _SigmaBranch(
+        tag=branch.tag, E_A=jnp.asarray([[0.4, 3.0]], dtype=jnp.float64),
+        base_mask_A=branch.base_mask_A, space="val", neg_omega_half=False,
+        omega_abs=np.asarray([0.0, 0.1, 0.5]), omega_idx=np.arange(3))
+    plan, _ = _plan(monkeypatch, branch)
+    assert [row.window.name for row in plan] == ["positive val:bulk"]
+    np.testing.assert_array_equal(plan[0].omega_idx, [0, 1, 2])
 
 
 def test_executor_conventions_and_lower_half_conjugation(monkeypatch):
@@ -380,12 +462,7 @@ def test_sc_fixed_rule_covers_the_declared_pole_support(monkeypatch):
         _summaries(), [_branch_at((0.1, 3.0))],
         np.asarray([0.2, 0.5]), 0.1, **args)
     calls.clear()
-    moved = (
-        (0, {"all": (0.3, 0.3, 0.05, 0.05),
-             "shallow": (0.3, 0.3, 0.05, 0.05), "deep": None}),
-        (1, {"all": (4.5, 4.5, 0.08, 0.08),
-             "shallow": None, "deep": (4.5, 4.5, 0.08, 0.08)}),
-    )
+    moved = _summaries(poles=((0.3, 0.05), (4.5, 0.08)))
     second, second_geometry = plan_sigma_windows(
         moved, [_branch_at((0.1, 3.0))],
         np.asarray([0.2, 0.5]), 0.1, **args)
