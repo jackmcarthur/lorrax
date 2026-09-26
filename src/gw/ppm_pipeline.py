@@ -450,8 +450,8 @@ def _report_band_extrapolation(
     print_fn((format_spectral_report if spectral
               else format_extrapolation_report)(plan, fit, states=states))
 
-    # States without an interior exponent keep S(N3) (``band_extrapolation``,
-    # "NO INTERIOR EXPONENT").  The block above names them; this one line is
+    # States without a usable exponent keep S(N3) (``band_extrapolation``,
+    # "NO USABLE EXPONENT").  The block above names them; this one line is
     # the count the production log keeps.
     if spectral and fit.n_failed:
         print_fn("WARNING: " + fit.failure_report().splitlines()[0])
@@ -690,9 +690,10 @@ def compute_ppm_sigma_pipeline(
                 f"band counts {plan.counts} (requested {plan.requested}).")
             # Emitted HERE and not only in the report block at the end: a
             # planner fallback is a fact about the run that the operator
-            # should see before Σ is spent, not after.
+            # should see before Σ is spent, not after.  ``WARNING:`` is what
+            # keeps it in the production log's warning block.
             for note in plan.notes:
-                print_fn(f"  Σc band extrapolation: {note}")
+                print_fn(f"WARNING: Σc band extrapolation: {note}")
         from .sigma_box_plan import resolve_sigma_box_cache_dir
         quadrature_cache_dir = resolve_sigma_box_cache_dir(
             config.sigma.quadrature_cache_dir, config.input_dir)

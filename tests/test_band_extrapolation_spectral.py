@@ -31,6 +31,7 @@ from gw.band_extrapolation import (
     SHELL_EXPONENT_BRACKET,
     SHELL_FAIL_EDGE,
     SHELL_FAIL_NO_ROOT,
+    SHELL_FAIL_NOT_SUMMABLE,
     SHELL_FAIL_SIGN,
     SHELL_FAIL_ZERO,
     SHELL_OK,
@@ -329,7 +330,7 @@ def test_bracket_scheme_deck_key_is_normalized_and_recorded_explicit(tmp_path):
 #  the estimator recovers the law it assumes
 # ---------------------------------------------------------------------------
 
-@pytest.mark.parametrize("beta", [1.5, 3.0, 4.7, 8.0])
+@pytest.mark.parametrize("beta", [2.0, 3.0, 4.7, 8.0])
 def test_recovers_an_exact_power_law_and_its_tail(beta):
     """Generated from ``A·x^(-β)``, the estimator returns β and S(N_T) exactly.
 
@@ -344,6 +345,26 @@ def test_recovers_an_exact_power_law_and_its_tail(beta):
     assert int(np.asarray(fit.failure)[0]) == SHELL_OK
     assert abs(float(fit.beta[0]) - beta) < 1e-9, "beta must be recovered"
     assert abs(float(fit.s_inf[0]) - truth) < 1e-12 * max(abs(truth), 1.0)
+
+
+@pytest.mark.parametrize("beta", [0.3, 1.0, 1.45])
+def test_a_tail_that_does_not_converge_has_no_tail(beta):
+    """An exact root at beta <= 3/2 is recovered by the solve and then REFUSED.
+
+    The Weyl ladder makes the per-band term n^(-2beta/3); at beta <= 3/2 its
+    sum grows without bound with the basis, so I_tail/I3 is set by N_T and
+    not by the two shells.  On Si 6x6x6 SOC (64 bands) such roots moved the
+    Gamma valence states by -4.6 to -8.3 eV (lane BX2).  No tail, no clip.
+    """
+    lad = _synthetic_ladder()
+    counts = (80, 100, 120)
+    S, _ = _points_from_power_law(lad, counts, beta, amp=1e-3)
+    fit = fit_band_extrapolation_spectral(counts, S[:, None], lad)
+    assert int(np.asarray(fit.failure)[0]) == SHELL_FAIL_NOT_SUMMABLE
+    assert not np.isfinite(float(fit.beta[0]))
+    assert float(np.real(fit.s_inf[0])) == float(np.real(S[2]))
+    msg = fit.failure_report()
+    assert "1 give beta <= 1.5" in msg and "NO TAIL" in msg
 
 
 def test_the_amplitude_and_the_intercept_are_eliminated_analytically():

@@ -345,15 +345,24 @@ that deck), the ladder is continued with the SAME Weyl form.  That
 continuation is used ONLY to extend the eigenvalue SEQUENCE; no self-energy,
 no matrix element and no exponent is ever taken from it.
 
-**NO INTERIOR EXPONENT, NO TAIL (2026-09-25).**  The model needs two shell
-increments that decay like a power law on this spectrum.  Three per-state
-signatures say they do not: (a) ``D₂`` and ``D₃`` of opposite sign or either
-exactly zero; (b) no bracketed root of the β equation in
-:data:`SHELL_EXPONENT_BRACKET`; (c) a root pressed against a bracket edge.
-Such a state has no tail: ``r = 0`` and ``Ŝ = S(N₃)``, its computed band
-sum.  Its β stays ``NaN`` (never a clipped edge) and ``failure`` keeps the
-reason; the report prints the count and names the states, and the h5 marks
-them by ``β = NaN``.  No other estimator is substituted.
+**NO USABLE EXPONENT, NO TAIL (2026-09-25).**  The model needs two shell
+increments that decay like a SUMMABLE power law on this spectrum.  Four
+per-state signatures say they do not: (a) ``D₂`` and ``D₃`` of opposite sign
+or either exactly zero; (b) no bracketed root of the β equation in
+:data:`SHELL_EXPONENT_BRACKET`; (c) a root pressed against a bracket edge;
+(d) a root at ``β ≤ 3/2`` (:data:`SHELL_SUMMABLE_BETA`), where the tail does
+not converge as the basis grows and ``I_tail/I₃`` is set by ``N_T``, not by
+the data.  Such a state has no tail: ``r = 0`` and ``Ŝ = S(N₃)``, its
+computed band sum.  Its β stays ``NaN`` (never a clipped edge) and
+``failure`` keeps the reason; the report prints the count and names the
+states, and the h5 marks them by ``β = NaN``.  No other estimator is
+substituted.
+
+(d) is the Si 6×6×6 SOC defect (lane BX2): shells one and three bands wide at
+the top of a 64-band window gave ``|D₃/D₂|`` within 1 % of its ``β → 0``
+limit, so β came out 0.1–0.6 and ``r`` 150–270, and the Γ valence states
+moved by −4.6 to −8.3 eV.  A ratio that close to the band-count ratio carries
+no decay information; it is shell texture.
 
 This replaced a run-level refusal.  Core fixture A (7 bands, n_occ = 2) put
 each shell on ONE band (counts 5, 6, 7), so ``D₂``/``D₃`` were single-band
@@ -928,6 +937,7 @@ def plan_band_brackets(
     lo_bound = n_occ + 1
     n_interior = 2 if bracket_scheme == "conduction_energy_midpoint" \
         else len(requested)
+    gaps = boundary_min_gaps(e, is_full_spectrum=False)
     for i_cut, req in enumerate(requested):
         req = int(req)
         # RESERVE ROOM FOR THE CUTS THAT COME AFTER THIS ONE.  Without this,
@@ -938,6 +948,13 @@ def plan_band_brackets(
         # and 16 is nb_logical - 1).  One band per remaining interior cut is
         # the minimum that keeps the counts strictly ascending.
         hi_bound = nb_logical - 1 - (n_interior - 1 - i_cut)
+        # AND NEVER PAST THE NEXT CUT'S REQUEST.  On Si 6x6x6 SOC at 64 bands
+        # the only 1-meV-clean boundaries in 39..63 over 216 k were 40 and 60,
+        # so cut 1 snapped 51 -> 60, past cut 2's request of 58; cut 2 was
+        # left at 61 and both shells sat in the top four bands (1 + 3), where
+        # the spectral estimator's exponent is shell texture (lane BX2).
+        if i_cut + 1 < len(requested):
+            hi_bound = min(hi_bound, int(requested[i_cut + 1]) - 1)
         if lo_bound > hi_bound:
             # No room left below N₃ for another cut.  Record the raw request
             # so the distinctness check below refuses with the actionable
@@ -962,13 +979,21 @@ def plan_band_brackets(
             cut = int(snap_cut_to_clean_boundary(
                 e, req, tol_ry=tol_ry, lo=lo_bound, hi=hi_bound))
         except BandWindowDegeneracyError:
-            cut = req
+            # The LEAST-degenerate boundary in range (largest min gap, then
+            # nearest the request, then downward), never blindly the request:
+            # under SOC with inversion every odd count is a Kramers split at
+            # EVERY k, which makes S(N) gauge-dependent (Γ quartet partners
+            # differed by 1e-4 eV in S(61) and by 3.6 eV after extrapolation).
+            cand = range(lo_bound, hi_bound + 1)
+            cut = max(cand, key=lambda n: (float(gaps[n]), -abs(n - req), -n))
             notes.append(
-                f"interior cut {req} kept UNSNAPPED: no multiplet-clean "
-                f"boundary exists in [{lo_bound}, {hi_bound}] at tol "
-                f"{tol_ry * RYD_TO_EV * 1e3:.3f} meV.  The cut is a sampling "
-                f"point on a partial-sum curve, not a Σ window, so this "
-                f"costs accuracy (<= ~6 meV measured) and not correctness.")
+                f"interior cut {req} -> {cut} kept UNSNAPPED: no "
+                f"multiplet-clean boundary exists in [{lo_bound}, {hi_bound}] "
+                f"at tol {tol_ry * RYD_TO_EV * 1e3:.3f} meV; {cut} is the "
+                f"least-degenerate boundary there (min gap "
+                f"{float(gaps[cut]) * RYD_TO_EV * 1e3:.3f} meV).  The cut is a "
+                f"sampling point on a partial-sum curve, not a Σ window, so "
+                f"this costs accuracy and not correctness.")
         snapped.append(cut)
         lo_bound = cut + 1
 
@@ -1535,6 +1560,16 @@ SHELL_FAIL_SIGN = 1
 SHELL_FAIL_ZERO = 2
 SHELL_FAIL_NO_ROOT = 3
 SHELL_FAIL_EDGE = 4
+SHELL_FAIL_NOT_SUMMABLE = 5
+
+#: The model's convergence boundary, not a tuned threshold.  The Weyl ladder
+#: puts ``ε_n − E₀ ∝ n^{2/3}``, so the per-band term ``n^{−2β/3}`` sums to a
+#: finite tail as ``N_T → ∞`` only for ``β > 3/2``.  At or below it the tail
+#: grows without bound with the basis, so ``I_tail/I₃`` is set by ``N_T`` and
+#: the Weyl continuation, not by the two measured shells.  On Si 6×6×6 SOC at
+#: 64 bands such roots (β 0.1–0.6, ``I_tail/I₃`` 150–270) moved the Γ valence
+#: states by −4.6 to −8.3 eV (lane BX2, 2026-09-25).
+SHELL_SUMMABLE_BETA: float = 1.5
 
 SHELL_FAILURE_REASONS = {
     SHELL_OK: "ok",
@@ -1553,6 +1588,10 @@ SHELL_FAILURE_REASONS = {
         "the root is pressed against a bracket edge: the bisection walked "
         "to the wall rather than converging inside, and returning the edge "
         "would be a CLIP reported as a fit"),
+    SHELL_FAIL_NOT_SUMMABLE: (
+        "beta <= 3/2: the fitted tail does not converge as the basis grows, "
+        "so the correction would be set by the basis endpoint N_T and the "
+        "Weyl continuation rather than by the two measured shells"),
 }
 
 
@@ -2076,13 +2115,23 @@ class SpectralShellFit:
         g = [float(self.ladder.log_moment(*self.shells[1], b)
                    - self.ladder.log_moment(*self.shells[0], b))
              for b in SHELL_EXPONENT_BRACKET]
+        n_sum = int(np.count_nonzero(fail == SHELL_FAIL_NOT_SUMMABLE))
+        (a1, a2), (_, a3), (_, n_t) = self.shells
         lines = [
             f"spectral_shell: {len(idx)} of {self.n_states} external states "
-            f"have NO TAIL.  Their two shell increments give no interior "
-            f"exponent in {SHELL_EXPONENT_BRACKET}, so each keeps its "
-            f"computed sum, S_hat = S(N3) (r = 0); no exponent is clipped.  "
-            f"On this spectrum |D3/D2| needs to lie in "
-            f"[{np.exp(g[1]):.4g}, {np.exp(g[0]):.4g}] to have an exponent.",
+            f"have NO TAIL and keep their computed sum, S_hat = S(N3) "
+            f"(r = 0); no exponent is clipped.  {len(idx) - n_sum} give no "
+            f"interior exponent in {SHELL_EXPONENT_BRACKET} (on this "
+            f"spectrum |D3/D2| needs to lie in "
+            f"[{np.exp(g[1]):.4g}, {np.exp(g[0]):.4g}]); {n_sum} give "
+            f"beta <= {SHELL_SUMMABLE_BETA:g}, a tail that does not converge "
+            f"with the basis.  Cause: the two measured shells hold "
+            f"{a2 - a1} and {a3 - a2} bands just below N3 = {a3}, with the "
+            f"tail running on to N_T = {n_t}; shells that thin, that few "
+            f"bands above "
+            f"the QP window, carry band texture rather than a resolvable "
+            f"decay.  Remedy: more bands (`number_bands_sigma`) or a "
+            f"production-quality plane-wave cutoff.",
             f"  band counts {tuple(int(c) for c in self.counts)}; shells "
             f"(absolute band index) 2 = {self.shells[0]}, 3 = "
             f"{self.shells[1]}, tail = {self.shells[2]}; "
@@ -2096,10 +2145,6 @@ class SpectralShellFit:
                 f"-- {reason}")
         if len(idx) > limit:
             lines.append(f"    ... and {len(idx) - limit} more.")
-        lines.append(
-            "  To extrapolate these states, raise `number_bands_sigma` so the "
-            "two shells sit further into the tail where the local power law "
-            "holds.")
         return "\n".join(lines)
 
 
@@ -2173,9 +2218,13 @@ def fit_band_extrapolation_spectral(
     sign = ~zero & (np.sign(r2) != np.sign(r3))
     code = np.where(zero, SHELL_FAIL_ZERO, np.where(sign, SHELL_FAIL_SIGN,
                                                     code))
+    # An interior root outside the summable range is no tail either: the
+    # correction it implies is carried by N_T, not by the data.
+    code = np.where((code == SHELL_OK) & (beta <= SHELL_SUMMABLE_BETA),
+                    SHELL_FAIL_NOT_SUMMABLE, code)
     beta = np.where(code == SHELL_OK, beta, np.nan)
 
-    # NO INTERIOR EXPONENT, NO TAIL: r = 0 keeps S(N3) (module docstring).
+    # NO USABLE EXPONENT, NO TAIL: r = 0 keeps S(N3) (module docstring).
     good = code == SHELL_OK
     safe_beta = np.where(good, beta, 1.0)
     log_i3 = ladder.log_moment(*shells[1], safe_beta)
@@ -2220,15 +2269,10 @@ def spectral_trust_verdict(fit: SpectralShellFit) -> str:
                f"keep S(N3)." if fit.n_failed else "")
     lo, med, hi = (float(np.percentile(b, 10)), float(np.median(b)),
                    float(np.percentile(b, 90)))
-    note = ""
-    if lo < 1.0:
-        note = ("  b < 1 on the lowest decile: a tail that shallow is not "
-                "summable in the way the estimator assumes -- read the "
-                "correction as a lower bound.")
     return (f"solved on {b.size} of {fit.n_states} states - beta median "
             f"{med:.2f}, p10/p90 {lo:.2f}/{hi:.2f}.  The per-state spread IS "
             f"the resolution this estimator exists to provide; it is not a "
-            f"quality metric.{no_tail}{note}")
+            f"quality metric.{no_tail}")
 
 
 def trust_verdict(fit: ExtrapolationFit, *, ratio_warn: float = 0.35) -> str:

@@ -463,6 +463,57 @@ def test_snapping_never_starves_a_later_cut():
     assert all(plan.n_occ < c < nb for c in plan.counts[:-1])
 
 
+def _kramers_ladder(nk, nb):
+    """Every band doubled at every k, as under SOC with inversion: each odd
+    count splits a Kramers pair everywhere."""
+    base = np.linspace(1.0, 10.0, nb // 2)
+    return np.repeat(base, 2)[None, :].repeat(nk, axis=0).copy()
+
+
+def test_snapping_never_crosses_the_next_request():
+    """A snapped cut must not pass the next cut's request (lane BX2).
+
+    The Si 6x6x6 SOC deck at 64 bands: the only 1-meV-clean boundaries in
+    39..63 were 40 and 60.  Cut 1 snapped 51 -> 60, past cut 2's request of
+    58, and cut 2 was left at 61 -- shells of one and three bands at the top
+    of the window, a Kramers split at every k, and Gamma valence states moved
+    by -4.6 to -8.3 eV.  This fixture has the same clean set.
+    """
+    nk, nb = 4, 64
+    e = _kramers_ladder(nk, nb)
+    e[0, 40:60] = e[0, 40]            # one k: pairs 20..29 degenerate
+    e[0, 60:64] = e[0, 60]            # and pairs 30, 31
+    gaps = boundary_min_gaps(e, is_full_spectrum=True)
+    clean = [n for n in range(39, 64) if gaps[n] > DEGENERACY_TOL_RY]
+    assert clean == [40, 60], clean
+    plan = plan_band_brackets(
+        enabled=True, enk_ry=e, n_occ=8, nb_logical=nb, nb_padded=nb)
+    assert plan.requested == (51, 58, 64)
+    assert plan.counts == (40, 60, 64), plan.counts
+    assert not plan.notes
+
+
+def test_the_fallback_takes_the_least_degenerate_boundary():
+    """With no clean boundary in range, a near miss beats a Kramers split.
+
+    The old fallback kept the raw request.  At an odd request under SOC that
+    is a split pair at every k, which makes S(N) gauge-dependent: Gamma
+    quartet partners differed by 1e-4 eV in S(61) and by 3.6 eV after the
+    extrapolation (lane BX2).
+    """
+    nk, nb = 4, 40
+    e = _kramers_ladder(nk, nb)
+    half_mev = 0.5e-3 / 13.605693122994
+    e[0, 32:40] = e[0, 32] + half_mev * np.repeat(np.arange(4), 2)
+    plan = plan_band_brackets(
+        enabled=True, enk_ry=e, n_occ=4, nb_logical=nb, nb_padded=nb,
+        fractions=(0.80, 0.875))
+    assert plan.requested == (32, 35, 40)
+    assert plan.counts == (32, 34, 40), plan.counts
+    joined = " ".join(plan.notes)
+    assert "UNSNAPPED" in joined and "35 -> 34" in joined
+
+
 def test_refuses_only_when_the_fractions_themselves_collapse():
     """The surviving refusal names the SIGMA count, because that is what
     fixes it.  Since the chi/Sigma split (2026-08-16) "raise nband" is not
