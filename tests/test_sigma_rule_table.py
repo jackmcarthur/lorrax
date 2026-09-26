@@ -27,7 +27,7 @@ from gw.sigma_box_plan import (
     _rule_table_store,
     plan_sigma_windows,
 )
-from minimax import UniformRule, build_uniform_rule
+from minimax import build_uniform_rule
 
 from test_sigma_box_plan import _branch, _fake_rule, _frozen_digests, _summaries
 
