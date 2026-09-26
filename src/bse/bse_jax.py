@@ -414,11 +414,10 @@ def main(argv=None) -> int:
              "orthogonal across the full Krylov basis. Smaller windows "
              "(e.g. 10) give ghost eigenvalues that destroy per-state "
              "oscillator strengths, and since 2026-08-08 they are no "
-             "longer even faster: the default batched reorth route "
-             "(solvers.lanczos, LORRAX_LANCZOS_REORTH) costs "
-             "2*max_iter collectives whatever the window, where the "
-             "legacy per-vector sweep cost O(window*max_iter). There "
-             "is no longer a speed reason to narrow this.",
+             "longer even faster: the batched reorth route "
+             "(solvers.lanczos, cgs2) costs 2*max_iter collectives "
+             "whatever the window. There is no speed reason to narrow "
+             "this.",
     )
     parser.add_argument(
         "--solver",
