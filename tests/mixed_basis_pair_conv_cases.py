@@ -10,6 +10,10 @@ definition in the module docstring.
   Fourier matrices and an explicit R sum.
 * ``ksum_reference``: the direct k-sum convolution
   X̂_q(r, r') = N_k⁻¹ Σ_k a_k conj(c_{k-q}), then the same output matrices.
+* ``dense_scalar_reference``: the Σ product A^{αβ}(r+R, r') B(r+R, r') on the same
+  materialized supercell, each operand on its own spheres.
+* ``band_sum_sigma`` / ``band_sum_chi``: the physical normalization, Σ_nn'(k) and
+  χ_q(G, G') as BGW band sums over explicit plane-wave matrix elements (no box).
 
 Symmetry cases realize the full-grid operands from parent ψ by the r-space typed
 action on the grid (``zeta_mubatch_fixtures._children``: the transport C_q and the
@@ -136,6 +140,95 @@ def ksum_reference(A, C, sphere_gvecs, sphere_ngk, kfrac, kgrid, fft_grid,
         kp = np.ravel_multi_index(((kint - qi) % kg).T, tuple(kg))
         Xq.append(np.einsum("kabrs,kabrs->rs", a, np.conj(c[kp])) / nk)
     return _output(np.asarray(Xq), out_gvecs, out_ngk, out_frac, fft_grid)
+
+
+def dense_scalar_reference(A, a_gvecs, a_ngk, a_frac, B, b_gvecs, b_ngk, b_frac, kgrid, fft_grid,
+                           out_gvecs, out_ngk, out_frac):
+    """X_k(p α, p' β) = Σ_R Σ_{r,r'} e^{-i(k+p)·(r+R)} A^{αβ}(r+R, r') B(r+R, r') e^{i(k+p')·r'}
+    (B one spin channel) on the materialized supercell: ``(n_k, width, ns, width, ns)``."""
+    nk = int(np.prod(kgrid))
+    a = _bloch_kernel(A, a_gvecs, a_ngk, a_frac, fft_grid)
+    b = _bloch_kernel(B, b_gvecs, b_ngk, b_frac, fft_grid)[:, 0, 0]
+    R = kgrid_frac(kgrid) * np.asarray(kgrid)
+    AR = np.einsum("kR,kabrs->Rabrs", np.exp(2j * np.pi * a_frac @ R.T), a) / nk
+    BR = np.einsum("kR,krs->Rrs", np.exp(2j * np.pi * b_frac @ R.T), b) / nk
+    Xq = np.einsum("qR,Rabrs->qabrs", np.exp(-2j * np.pi * out_frac @ R.T), AR * BR[:, None, None])
+    ns, w = A.shape[2], out_gvecs.shape[1]
+    X = np.zeros((len(out_frac), w, ns, w, ns), np.complex128)
+    for i in range(ns):
+        for j in range(ns):
+            X[:, :, i, :, j] = _output(Xq[:, i, j], out_gvecs, out_ngk, out_frac, fft_grid)
+    return X
+
+
+def _density(c1, g1, n1, k1, c2, g2, n2, k2, G, q):
+    """ρ(G) = Σ_{p'',α} c1(p''+G+g₀, α) conj c2(p'', α), g₀ = q + k2 − k1 (integer): the plane-wave
+    coefficient of ψ1 ψ2* at q + G (``c (nb, ns, width)``); returns ``(nb1, nb2, len(G))``."""
+    g0 = np.rint(np.asarray(q) + np.asarray(k2) - np.asarray(k1)).astype(np.int64)
+    look = {tuple(v): i for i, v in enumerate(g1[:n1])}
+    out = np.zeros((c1.shape[0], c2.shape[0], len(G)), np.complex128)
+    for gi, Gv in enumerate(G):
+        pairs = [(look[t], i2) for i2, v in enumerate(g2[:n2])
+                 if (t := tuple(v + Gv + g0)) in look]
+        if pairs:
+            i1, i2 = (np.asarray(v) for v in zip(*pairs))
+            out[:, :, gi] = np.einsum("nap,map->nm", c1[:, :, i1], np.conj(c2[:, :, i2]))
+    return out
+
+
+def band_sum_sigma(c, weights, gvecs, ngk, kfrac, W, w_gvecs, w_ngk, w_frac, kgrid, k_rows):
+    """Σ_nn'(k) = −N_k⁻¹ Σ_{q,m} g_m Σ_{GG'} ρ_nm(G) W_q(G, G') conj ρ_n'm(G'),
+    ρ_nm(G) = ⟨nk| e^{i(q+G)·r} |m, k−q⟩, with ψ = Σ_p c(p) e^{i(k+p)·r} (Ω = 1):
+    ``(len(k_rows), nb, nb)``."""
+    kg = np.asarray(kgrid)
+    nk = int(np.prod(kg))
+    kint = np.rint(kfrac * kg).astype(int) % kg
+    qint = np.rint(w_frac * kg).astype(int) % kg
+    out = []
+    for k in k_rows:
+        S = np.zeros((c.shape[1], c.shape[1]), np.complex128)
+        for q in range(nk):
+            kp = int(np.ravel_multi_index((kint[k] - qint[q]) % kg, tuple(kg)))
+            G = w_gvecs[q, :w_ngk[q]]
+            rho = np.conj(_density(c[k], gvecs[k], ngk[k], kfrac[k], c[kp], gvecs[kp], ngk[kp],
+                                   kfrac[kp], G, w_frac[q]))                # ρ_nm(G), (n, m, G)
+            Wq = W[q, :w_ngk[q], 0, :w_ngk[q], 0]
+            S += np.einsum("nmg,gh,Nmh,m->nN", rho, Wq, np.conj(rho), weights)
+        out.append(-S / nk)
+    return np.asarray(out)
+
+
+def band_sum_chi(c, wc, wv, gvecs, ngk, kfrac, kgrid, out_gvecs, out_ngk, out_frac):
+    """BGW's χ_q(G, G') = N_k⁻¹ Σ_{k,n,m} wc_n wv_m ρ_nm(G) conj ρ_nm(G'), ρ_nm = ψ_nk ψ*_{m,k−q} at
+    q + G (Ω = 1), the χ₀ of A = Σ_n c wc c†, C = Σ_m c wv c†: ``(n_q, width, width)``."""
+    kg = np.asarray(kgrid)
+    nk = int(np.prod(kg))
+    kint = np.rint(kfrac * kg).astype(int) % kg
+    X = np.zeros((len(out_frac), out_gvecs.shape[1], out_gvecs.shape[1]), np.complex128)
+    for i, q in enumerate(out_frac):
+        qi = np.rint(q * kg).astype(int)
+        G = out_gvecs[i, :out_ngk[i]]
+        for k in range(nk):
+            kp = int(np.ravel_multi_index((kint[k] - qi) % kg, tuple(kg)))
+            rho = _density(c[k], gvecs[k], ngk[k], kfrac[k], c[kp], gvecs[kp], ngk[kp], kfrac[kp], G, q)
+            X[i, :out_ngk[i], :out_ngk[i]] += np.einsum("nmg,n,m,nmh->gh", rho, wc, wv, np.conj(rho))
+    return X / nk
+
+
+def unfold_tile(transport, S_par, anti_conj=True):
+    """The transport's definition on one-channel tiles (numpy, the docstring's formula):
+    ``O_k[p, p'] = mph_k(p) · 𝒯 S_{row(k)}[src_k(p), src_k(p')] · nph_k(p')`` with 𝒯 = conj on
+    an antiunitary row; ``S_par (n_par, w, w)``; returns ``(N_k, w, w)`` (pad slots zero)."""
+    nk, w = transport.src.shape
+    out = np.zeros((nk, w, w), np.complex128)
+    for k in range(nk):
+        live = np.flatnonzero(transport.phase[k] != 0)
+        src, ph = transport.src[k, live], transport.phase[k, live]
+        blk = S_par[transport.row[k]][np.ix_(src, src)]
+        if transport.anti[k] and anti_conj:
+            blk, ph = np.conj(blk), np.conj(ph)
+        out[k][np.ix_(live, live)] = ph[:, None] * blk * np.conj(ph)[None, :]
+    return out
 
 
 def rel(a, b):

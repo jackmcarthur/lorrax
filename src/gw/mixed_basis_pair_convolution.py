@@ -1,22 +1,35 @@
-"""Mixed-basis pair convolution: two compact operators on plane-wave spheres → one on a response sphere.
+"""Mixed-basis pair convolution: two compact operators on plane-wave spheres → one on a third sphere set.
 
-The operation, with no prefactor::
+The operation, with no prefactor, in its two products (``product=``)::
 
-    X_q(G, G') = Σ_R Σ_{r,r'} e^{-i(q+G)·(r+R)} Σ_{αβ} A^{αβ}(r+R, r') conj C^{αβ}(r+R, r') e^{+i(q+G')·r'}
+    'trace'   X_q(G, G')        = Σ_R Σ_{r,r'} e^{-i(q+G)·(r+R)} Σ_{αβ} A^{αβ}(r+R, r') conj C^{αβ}(r+R, r') e^{+i(q+G')·r'}
+    'scalar'  X_q(G α, G' β)    = Σ_R Σ_{r,r'} e^{-i(q+G)·(r+R)} A^{αβ}(r+R, r') B(r+R, r') e^{+i(q+G')·r'}
 
     A(r+R, r') = N_k⁻¹ Σ_k e^{ik·R} a_k(r, r'),   a_k(r, r') = Σ_{p,p'} e^{i(k+p)·r} A_k(p α, p' β) e^{-i(k+p')·r'}
 
-and the same for C.  r, r' run over the N_r points of the cell's FFT box, R over the
-N_k cells of the Born–von Kármán supercell, k over the C-order k-grid, p, p' over
-the operand's plane-wave sphere at k, and G, G' over the output sphere at q.  The
-caller applies Ω/N_r², spin and occupation factors.
+and the same for C and B (B one spin channel).  r, r' run over the N_r points of the
+cell's FFT box, R over the N_k cells of the Born–von Kármán supercell, k over the
+C-order k-grid, p, p' over the operand's plane-wave sphere at k, and G, G' over the
+output sphere at q.  The caller applies the physical prefactor.
 
-χ₀ in the adjoint form is the first caller: A = Gc(τ), C = Gv(τ) (the adjoint of the
-second propagator, so both factors share ownership and indexing), and
-X_R = Σ_αβ Gc_R ⊙ conj(Gv_R) is the product the ISDF χ₀ accumulates.  Σ = G ⊙ W is the
-same pair convolution with the second operand on the response sphere and the
-output on the ψ sphere (sandbox TASTE 97); the operand and output bases are
-therefore separate arguments.
+χ₀ in the adjoint form is the first caller (``'trace'``): A = Gc(τ), C = Gv(τ) (the
+adjoint of the second propagator, so both factors share ownership and indexing), and
+X_R = Σ_αβ Gc_R ⊙ conj(Gv_R) is the product the ISDF χ₀ accumulates.
+
+Σ = −G ⊙ W is the second caller (``'scalar'``, sandbox TASTE 97): A = G(τ) at the
+k-parents on the ψ sphere, B = W(τ) at the q-IBZ on the χ sphere, the output on the ψ
+sphere at the k-IBZ, in the ``build_G_parents`` layout.  With G from
+``build_G_parents`` (unit-norm sphere coefficients) and BGW's
+``W(r, r') = (N_k Ω)⁻¹ Σ_q Σ_{GG'} e^{i(q+G)·r} W_q(G, G') e^{-i(q+G')·r'}``,
+Σ_k(p α, p' β; τ) = −X/(Ω·N_r²); χ₀'s X/(Ω·N_r²) is BGW's χ_q(G, G') in the same
+convention (the normalization tests hold both against band sums).
+
+The plain product is the conjugated one on B's time-reversed image
+C_k[p, p'] = conj B_{−k}[p̄, p̄'] (k + G_p = −(k̄ + G_p̄)): conj C(r+R, r') = B(r+R, r'),
+so ``'scalar'`` composes B's transport with time reversal
+(``SphereTransport.time_reversed``, tables only) and runs the same stages and the same
+k-convolution.  Its spin blocks ride as columns of a one-channel k-convolution, B's
+box transform broadcast over the n_s² blocks of A.
 
 Schedule (one τ node; P ranks; every stage one ``shard_map`` over ``('x','y')``)::
 
@@ -37,10 +50,11 @@ column half acts on the compact tile before step 3 (every p' is local there) and
 its row half inside the step-5 gather (every p is local there), so neither half
 moves data between ranks; the product of the two halves is the whole action.
 
-Memory law, per rank, complex128 (``describe()`` prints it)::
+Memory law, per rank, complex128 (``describe()`` prints it; n_A, n_C, n_X the operand
+and output spin widths: n_s, n_s, 1 for ``'trace'`` and n_s, 1, n_s for ``'scalar'``)::
 
-    resident  16·[N_k·n_s²·(M_A + M_C)·N_r/(P·n_c) + n_q·M_X·N_r/P]
-    batch     16·c·N_k·J·N_r,  c ≈ 4·n_s² + 2
+    resident  16·[N_k·(n_A²·M_A + n_C²·M_C)·N_r/(P·n_c) + n_q·n_X²·M_X·N_r/P]
+    batch     16·c·N_k·J·N_r,  c ≈ 4·n_A² + 2·n_X² + 2
 
 No N_k·N_r² object exists.  n_c (r' chunks), J (the batch), the k chunk of steps
 2–4 and the q chunk of step 6 all come from the device budget; each is one when
@@ -60,7 +74,7 @@ Backends, chosen when the plan is built:
 
 ``backend='xla'`` on a CUDA mesh is the parity and benchmark arm; production
 passes nothing.  n_s is 1, 2 or 4 (the bispinor width; mode 6 takes n_s ≤ 4): the
-spin blocks ride as axes of every stage and meet only in the step-5 trace.
+spin blocks ride as axes of every stage and meet only in the step-5 product.
 
 The r'-column wedge (``wedge=ColumnWedge``; ``None`` computes every column).  For
 operands covariant under a space group (every parent invariant under its little
@@ -71,7 +85,9 @@ and conj X(x, x') on an antiunitary one (real weights).  With ``x_μ = g(x_α + 
 
     T_q(G, x_μ) = e^{-2πi q·(S⁻¹L)} · 𝒯[ e^{-2πi (q'+G'')·Sτ} T_{q'}(G'', x_α) ]     𝒯 = conj on antiunitary rows
 
-so steps 2–5 run on one representative column per grid-point orbit (N_w ≈ N_r/|G|),
+and on a spin-carrying output (``'scalar'``, n_s > 1) the row's spin action U acts on
+both spin indices, T^{αβ} = Σ_γδ U_αγ (…)^{γδ} conj U_βδ, since G(gx, gx') =
+U G(x, x') U† (U T for an antiunitary row) and W(gx, gx') = W(x, x') (conj); so steps 2–5 run on one representative column per grid-point orbit (N_w ≈ N_r/|G|),
 with every full-grid q as the middle's output rows (N_k·N_w q-columns, no more than
 n_q·N_r), and a rank-local rebuild fills T_q(G, r') on whole orbits (the orbit-packed
 ``common.grouped_layout`` view of r') before step 6.  H exists only on the
@@ -97,6 +113,7 @@ __all__ = ["SphereSet", "SphereTransport", "PairOperand", "ColumnWedge", "MixedB
 _XY = ("x", "y")
 _C16 = 16                         # bytes per complex128 element
 _BACKENDS = (None, "router", "xla")
+_PRODUCTS = ("trace", "scalar")   # χ₀ = Σ_αβ A ⊙ conj C;  Σ = A^{αβ} ⊙ B (module docstring)
 
 
 # ---------------------------------------------------------------------------
@@ -148,10 +165,11 @@ class SphereSet:
 
     def recentred(self) -> "SphereSet":
         """The same spheres with each row's k taken in [-½, ½) per axis (``k → k − n``,
-        ``G → G + n``, n = round(k)): ``k + G`` and every Bloch factor are unchanged, and the
+        ``G → G + n``, n = ⌊k + ½⌋): ``k + G`` and every Bloch factor are unchanged, and the
         union of the rows' spheres is as tight as one sphere allows (a k in [0, 1) widens it
-        by one plane per axis: Fe 8³ at 70 Ry, 14 against 13)."""
-        n = np.rint(self.frac).astype(np.int64)
+        by one plane per axis: Fe 8³ at 70 Ry, 14 against 13).  The representative is
+        canonical, so two sphere sets on one grid agree row by row (±½ both map to −½)."""
+        n = np.floor(self.frac + 0.5 + 1e-9).astype(np.int64)
         return SphereSet(self.gvecs + n[:, None, :], self.ngk, self.frac - n)
 
     def box_cells(self, support) -> np.ndarray:
@@ -217,7 +235,8 @@ class SphereTransport:
                    phase=np.ones((nk, w), np.complex128), n_parent=nk)
 
     @classmethod
-    def typed(cls, plan, *, fft_grid, parent_sphere_index, children: SphereSet) -> "SphereTransport":
+    def typed(cls, plan, *, fft_grid, parent_sphere_index, children: SphereSet,
+              ns: int | None = None) -> "SphereTransport":
         """The parents' typed transport onto ``children``.
 
         ``plan`` carries the symmetry tables (``irr_idx``, ``sym_idx``,
@@ -225,15 +244,59 @@ class SphereTransport:
         ``spatial_ops``, ``translations``; a ``gw.centroid_k_unfold`` plan does);
         ``parent_sphere_index (n_parent, width)`` is the parents' slot → flat box
         cell table (``common.gvec_fft_box.build_sphere_box_index``, ``≥ N_r`` on a
-        pad slot).  The slot map and phase are ``typed_child_G_tables``'.
+        pad slot).  The slot map and phase are ``typed_child_G_tables``'.  ``ns=1`` on
+        a spinor plan is a spin-scalar operand (W): the trivial representation, with
+        the conj rule on antiunitary rows (``unfold_load_tables(trs_rule='conj')``).
         """
         from isdf.zeta_mubatch import typed_child_G_tables
         pslot, phase, anti = typed_child_G_tables(
             plan, fft_grid=fft_grid, sphere_par=parent_sphere_index,
             gvec_child=children.gvecs, ngk_child=children.ngk, k_child=children.frac)
-        return cls(row=np.asarray(plan.irr_idx), anti=anti, spin=np.asarray(plan.spin_action_full),
-                   src=pslot, phase=phase,
+        spin = np.asarray(plan.spin_action_full)
+        if ns is not None and int(ns) != spin.shape[-1]:
+            if int(ns) != 1:
+                raise ValueError(f"SphereTransport.typed: ns={ns} differs from the plan's spin "
+                                 f"width {spin.shape[-1]}; only a spin-scalar operand (ns=1) may")
+            spin = np.ones((spin.shape[0], 1, 1), np.complex128)
+        return cls(row=np.asarray(plan.irr_idx), anti=anti, spin=spin, src=pslot, phase=phase,
                    n_parent=int(np.asarray(parent_sphere_index).shape[0]))
+
+    def time_reversed(self, sphere: SphereSet) -> "SphereTransport":
+        """The transport of the time-reversed operator ``C_k[p, p'] = conj B_{k̄}[p̄, p̄']``,
+        ``k̄ = −k`` on the grid and ``k + G_p = −(k̄ + G_p̄)``, on the same ``sphere`` rows.
+
+        Then ``conj C(r+R, r') = B(r+R, r')``, and the conjugated pair product ``A ⊙ conj C``
+        is the plain one ``A ⊙ B``.  Tables only: row ``k̄``'s parent, its antiunitary
+        flag flipped, ``conj U_k̄``, and its slot map and phase read at ``p̄``.  B's
+        antiunitary rows must read ``conj`` of the tile (no transposed partner).  Refuses
+        a row set not closed under ``k → −k`` or a sphere not closed under ``G → −G``.
+        """
+        frac, g, live = sphere.frac, sphere.gvecs, sphere.live()
+        s = frac[:, None, :] + frac[None, :, :]
+        match = np.all(np.abs(s - np.rint(s)) < 1e-8, axis=2)
+        if not np.all(match.sum(axis=1) == 1):
+            raise ValueError("SphereTransport.time_reversed: the rows are not closed under k → −k")
+        kb = np.argmax(match, axis=1)
+        shift = np.rint(-frac - frac[kb]).astype(np.int64)                 # −k − k̄, integer
+        span = int(np.abs(g[live]).max()) + int(np.abs(shift).max()) + 1
+        base = 2 * span + 1
+        code = lambda m: ((m[..., 0] + span) * base + (m[..., 1] + span)) * base + (m[..., 2] + span)
+        pbar = np.zeros(g.shape[:2], np.int64)
+        for k in range(sphere.n):
+            b = int(kb[k])
+            lb, lk = np.flatnonzero(live[b]), np.flatnonzero(live[k])
+            cb = code(g[b, lb])
+            order = np.argsort(cb)
+            want = code(shift[k][None, :] - g[k, lk])
+            pos = np.minimum(np.searchsorted(cb[order], want), order.size - 1)
+            if not np.array_equal(cb[order][pos], want):
+                raise ValueError(f"SphereTransport.time_reversed: row {k}'s sphere is not the "
+                                 f"inverse of row {b}'s (−k)")
+            pbar[k, lk] = lb[order[pos]]
+        src = np.where(live, np.take_along_axis(self.src[kb], pbar, axis=1), self.src)
+        phase = np.where(live, np.take_along_axis(self.phase[kb], pbar, axis=1), 0.0)
+        return SphereTransport(row=self.row[kb], anti=~self.anti[kb], spin=np.conj(self.spin[kb]),
+                               src=src, phase=phase, n_parent=self.n_parent)
 
 
 @dataclasses.dataclass(frozen=True, eq=False)
@@ -257,13 +320,17 @@ class ColumnWedge:
     antiunitary with spatial part ``row − n_sym``, ``SymMaps.operation_rows``);
     one row per spatial part is kept, the unitary one when both are present.
     ``out_full``: the output sphere at every full-grid q in C order, the middle's
-    rows on the wedge.  Antiunitary rows need operands of real weights (no
-    partners); ``from_symmaps(..., unitary_only=True)`` is the partner path.
+    rows on the wedge.  ``spin (len(rows), n_s, n_s)``, aligned with ``rows``: each
+    row's spinor action (``SymMaps.spinor_action``), needed by a spin-carrying output
+    (``'scalar'`` at n_s > 1); ``None`` for a spin-traced one.  Antiunitary rows need
+    operands of real weights (no partners); ``from_symmaps(..., unitary_only=True)``
+    is the partner path.
     """
     sym_matrices: np.ndarray
     translations: np.ndarray
     rows: np.ndarray
     out_full: SphereSet
+    spin: np.ndarray | None = None
 
     def __post_init__(self):
         S = np.asarray(self.sym_matrices, dtype=np.int64)
@@ -275,12 +342,19 @@ class ColumnWedge:
                              f"at least one row; got {S.shape}, {t.shape}, {rows.shape}")
         if rows.min() < 0 or rows.max() >= 2 * n:
             raise ValueError(f"ColumnWedge: rows must lie in [0, {2 * n})")
+        spin = None if self.spin is None else np.asarray(self.spin, dtype=np.complex128)
+        if spin is not None and (spin.ndim != 3 or spin.shape[0] != rows.size
+                                 or spin.shape[1] != spin.shape[2]):
+            raise ValueError(f"ColumnWedge: spin must be ({rows.size}, n_s, n_s) aligned with rows; "
+                             f"got {spin.shape}")
         keep = {}
-        for r in sorted(rows.tolist(), key=lambda r: (r % n, r >= n)):
-            keep.setdefault(r % n, r)
+        for i in sorted(range(rows.size), key=lambda i: (rows[i] % n, rows[i] >= n)):
+            keep.setdefault(int(rows[i] % n), i)
+        idx = sorted(keep.values(), key=lambda i: rows[i])
         object.__setattr__(self, "sym_matrices", S)
         object.__setattr__(self, "translations", t)
-        object.__setattr__(self, "rows", np.asarray(sorted(keep.values()), dtype=np.int32))
+        object.__setattr__(self, "rows", rows[idx].astype(np.int32))
+        object.__setattr__(self, "spin", None if spin is None else spin[idx])
 
     @property
     def n_sym(self) -> int:
@@ -295,14 +369,17 @@ class ColumnWedge:
         return self.rows >= self.n_sym
 
     @classmethod
-    def from_symmaps(cls, sym, out_full: SphereSet, *, unitary_only: bool = False) -> "ColumnWedge":
+    def from_symmaps(cls, sym, out_full: SphereSet, *, unitary_only: bool = False,
+                     ns: int = 1) -> "ColumnWedge":
         """The authorized rows of a ``SymMaps`` (``active_symmetry_rows``); ``unitary_only``
-        keeps the unitary ones (operands with transposed partners)."""
+        keeps the unitary ones (operands with transposed partners); ``ns > 1`` carries the
+        rows' spinor actions (a spin-carrying output)."""
         S = np.asarray(sym.sym_matrices)
         rows = np.asarray(sym.active_symmetry_rows)
         if unitary_only:
             rows = rows[rows < S.shape[0]]
-        return cls(S, np.asarray(sym.translations)[:S.shape[0]], rows, out_full)
+        spin = None if int(ns) == 1 else np.asarray(sym.spinor_action(rows, nspinor=int(ns)))
+        return cls(S, np.asarray(sym.translations)[:S.shape[0]], rows, out_full, spin)
 
 
 # ---------------------------------------------------------------------------
@@ -418,12 +495,14 @@ def _divisors(n: int) -> list[int]:
     return [d for d in range(1, n + 1) if n % d == 0]
 
 
-def plan_pair_convolution_chunks(*, n_ranks, n_k, n_s, widths, width_out, n_q, n_r,
+def plan_pair_convolution_chunks(*, n_ranks, n_k, spins, widths, width_out, n_q, n_r,
                                  kboxes, kbox_out, n_parent_tiles, target_bytes,
                                  j_cap=64, n_c=None, J=None, kc=None, qc=None,
                                  wedge=None) -> PairConvChunks:
     """The schedule for one τ node (every count one when everything fits).
 
+    ``spins = (n_A, n_C, n_X)``: the two operands' and the output's spin widths
+    (``'trace'``: n_s, n_s, 1; ``'scalar'``: n_s, 1, n_s).
     ``widths``/``kboxes``: the two operands' slot carriers and union-box cells;
     ``n_parent_tiles``: the slab copies' element count per rank (inputs held).
     ``n_c``/``J``/``kc``/``qc`` pin those counts (tests and the benchmark); the rest follow
@@ -436,7 +515,12 @@ def plan_pair_convolution_chunks(*, n_ranks, n_k, n_s, widths, width_out, n_q, n
     Refuses ``GATE pairconv-capacity`` when even n_c at one batch column per rank
     per chunk and unit k and q chunks exceeds ``target_bytes``.
     """
-    Pn, nk, ns = int(n_ranks), int(n_k), int(n_s)
+    Pn, nk = int(n_ranks), int(n_k)
+    na, nc_, nx = (int(v) for v in spins)
+    ch = (na * na, nc_ * nc_)                   # the operands' spin blocks
+    cx = nx * nx                                # the output's
+    cd = na * na                                # D's columns per operand per batch column (both products)
+    split = nx > 1                              # 'scalar': A and B transformed apart, then stacked
     Mw, Mo, nq, nr = [int(w) for w in widths], int(width_out), int(n_q), int(n_r)
     wd = (dict(n_cols=nr, n_q_mid=nq, width_mid=Mo, kbox_mid=kbox_out, t_cols=0, n_rows=0)
           if wedge is None else dict(wedge))
@@ -451,27 +535,28 @@ def plan_pair_convolution_chunks(*, n_ranks, n_k, n_s, widths, width_out, n_q, n
 
     def resident(nc, j):
         cols = carrier(nc, j) // Pn
-        H = nk * ns * ns * sum(Mw) * (cols // nc)
-        Tm = nqm * Mm * cols
-        T = 0 if wedge is None else nq * Mo * tcol
-        return _C16 * (H + Tm + T + int(n_parent_tiles) + nq * Mo * Mo // Pn)
+        H = nk * sum(c * m for c, m in zip(ch, Mw)) * (cols // nc)
+        Tm = nqm * Mm * cx * cols
+        T = 0 if wedge is None else nq * Mo * cx * tcol
+        return _C16 * (H + Tm + T + int(n_parent_tiles) + nq * Mo * Mo * cx // Pn)
 
-    def rebuild(nc, j):             # one q row: the gathered operation rows and the rebuilt columns
+    def rebuild(nc, j):             # one q row: the gathered operation rows (+ the spin sandwich) and the rebuilt columns
         cols = carrier(nc, j) // Pn
-        return 0 if wedge is None else _C16 * (3 * nrow * Mm * cols + 2 * Mo * tcol)
+        return 0 if wedge is None else _C16 * cx * ((3 + split) * nrow * Mm * cols + 2 * Mo * tcol)
 
     def expand(kc, nc, j):          # the full r' transform of one k chunk, its phased gather, the all-to-all
         cols = carrier(nc, j) // Pn // nc
-        return _C16 * max(kc * ns * ns * (m // Pn) * (kb + 3 * nr) + kc * ns * ns * m * cols
-                          for m, kb in zip(Mw, kboxes))
+        return _C16 * max(kc * c * (m // Pn) * (kb + 3 * nr) + kc * c * m * cols
+                          for c, m, kb in zip(ch, Mw, kboxes))
 
-    def middle(j):                  # compact gathers, the p→r output and its workspace, F, U, Y, the r→G box
-        return _C16 * (nk * j * ns * ns * sum(kboxes) + 2 * nk * j * ns * ns * 2 * nr + nk * nr
-                       + nk * j * nr + 2 * nqm * j * nr + 2 * nqm * j * kbm + 2 * nqm * Mm * j)
+    def middle(j):                  # compact gathers, the p→r outputs, D and its workspace, F, U, Y, the r→G box
+        return _C16 * (nk * j * sum(c * kb for c, kb in zip(ch, kboxes))
+                       + nk * j * nr * (4 * cd + (sum(ch) if split else 0)) + nk * nr
+                       + nk * j * cx * nr + 2 * nqm * j * cx * (nr + kbm + Mm))
 
     def final(qc, nc, j):           # the all-to-all output, the phased box, its transform and gather
-        return _C16 * (3 * qc * (Mo // Pn) * max(t_total(nc, j), nr)
-                       + 2 * qc * (Mo // Pn) * (kbox_out + Mo))
+        return _C16 * cx * (3 * qc * (Mo // Pn) * max(t_total(nc, j), nr)
+                            + 2 * qc * (Mo // Pn) * (kbox_out + Mo))
 
     target = int(target_bytes)
     nc_range = [int(n_c)] if n_c is not None else range(1, ncol + 1)
@@ -594,12 +679,18 @@ class MixedBasisPairConvolution:
 
     ``A``, ``C``: ``(n_parent, M, n_s, M, n_s)`` complex128 at
     ``P(None, 'x', None, 'y', None)``, the ``gw.greens_function_kernel.build_G_parents``
-    layout on sphere slots (``M`` = the operand's slot carrier, ``width_carrier``).
+    layout on sphere slots (``M`` = the operand's slot carrier, ``width_carrier``); a
+    one-channel operand may come as ``(n_parent, M, M)`` at ``P(None, 'x', 'y')``, this
+    plan's own ``'trace'`` output layout (W from χ).
     ``A_partner``/``C_partner``: the transposed partners an antiunitary row reads;
-    ``None`` reads ``conj`` of the tile (a Green of real weights).  Returns
-    ``X (n_q, M_X, M_X)`` at ``P(None, 'x', 'y')`` on the output carrier (pad rows
-    and columns are zero).
+    ``None`` reads ``conj`` of the tile (a Green of real weights; W's conj rule).
+    Returns, on the output carrier with zero pad rows and columns,
+    ``'trace'``: ``X (n_q, M_X, M_X)`` at ``P(None, 'x', 'y')``;
+    ``'scalar'``: ``X (n_q, M_X, n_s, M_X, n_s)`` at ``P(None, 'x', None, 'y', None)``
+    (the ``build_G_parents`` layout: Σ at the k-IBZ from G at the k-parents and W at the
+    q-IBZ, where ``C`` is W and needs no partner).
 
+    ``product``: ``'trace'`` (χ₀) or ``'scalar'`` (Σ), the module docstring's two products.
     ``out`` holds the output rows (q-points, any subset of the grid, e.g. the IBZ).
     ``wedge``: the r'-column wedge (``ColumnWedge``); ``None`` computes every column
     (the validation arm, and the only schedule for operands that are not covariant).
@@ -608,16 +699,33 @@ class MixedBasisPairConvolution:
     """
 
     def __init__(self, mesh: Mesh, *, kgrid, fft_grid, left: PairOperand, right: PairOperand,
-                 out: SphereSet, backend: str | None = None, budget_bytes: int | None = None,
-                 chunks: tuple[int, int] | None = None, wedge: ColumnWedge | None = None):
+                 out: SphereSet, product: str = "trace", backend: str | None = None,
+                 budget_bytes: int | None = None, chunks: tuple[int, int] | None = None,
+                 wedge: ColumnWedge | None = None):
         if backend not in _BACKENDS:
             raise ValueError(f"MixedBasisPairConvolution: backend must be one of {_BACKENDS}, "
                              f"got {backend!r}")
+        if product not in _PRODUCTS:
+            raise ValueError(f"MixedBasisPairConvolution: product must be one of {_PRODUCTS}, "
+                             f"got {product!r}")
         # Internally every sphere is recentred (k in [-½, ½)): the union boxes, and with
-        # them the box transforms' supports, are as small as the spheres allow.
+        # them the box transforms' supports, are as small as the spheres allow, and every
+        # operand row takes the same (canonical) representative, so one Bloch phase serves both.
         left = PairOperand(left.sphere.recentred(), left.transport)
         right = PairOperand(right.sphere.recentred(), right.transport)
+        ns, ns_r = left.transport.ns, right.transport.ns
+        if product == "trace" and ns_r != ns:
+            raise ValueError(f"MixedBasisPairConvolution: product 'trace' pairs equal spin widths; "
+                             f"got {ns} and {ns_r}")
+        if product == "scalar":
+            if ns_r != 1:
+                raise ValueError(f"MixedBasisPairConvolution: product 'scalar' wants a one-channel "
+                                 f"right operand; got spin width {ns_r}")
+            # A ⊙ B = A ⊙ conj C on B's time-reversed image (module docstring)
+            right = PairOperand(right.sphere, right.transport.time_reversed(right.sphere))
         out = out.recentred()
+        self.product = product
+        self.spins = (ns, ns_r, 1 if product == "trace" else ns)       # (n_A, n_C, n_X)
         self.wedge = wedge
         mid = out if wedge is None else wedge.out_full.recentred()   # the middle's output rows
         self.mesh = mesh
@@ -629,11 +737,14 @@ class MixedBasisPairConvolution:
         self.nr = int(np.prod(self.fft_grid))
         self.ops = (left, right)
         self.out = out
-        ns = left.transport.ns
-        if right.transport.ns != ns:
-            raise ValueError(f"MixedBasisPairConvolution: operand spin widths {ns} and "
-                             f"{right.transport.ns} differ; the spin trace pairs them")
         self.ns = ns
+        nx = self.spins[2]
+        if wedge is not None and nx > 1 and (wedge.spin is None or wedge.spin.shape[-1] != nx):
+            raise ValueError(
+                f"GATE pairconv-wedge-spin: got a wedge with spin "
+                f"{None if wedge.spin is None else wedge.spin.shape}; want each row's ({nx}, {nx}) "
+                "spinor action; why: a spin-carrying output transforms as U X U† under each row; "
+                f"fix: ColumnWedge.from_symmaps(..., ns={nx})")
         for name, op in (("left", left), ("right", right)):
             if op.sphere.n != self.nk:
                 raise ValueError(f"MixedBasisPairConvolution: the {name} sphere has {op.sphere.n} "
@@ -644,10 +755,6 @@ class MixedBasisPairConvolution:
                         (kin % np.asarray(self.kgrid)).T, self.kgrid), np.arange(self.nk))):
                 raise ValueError(f"MixedBasisPairConvolution: the {name} rows are not the "
                                  "C-order k-grid the k-convolution assumes")
-        if not np.allclose(left.sphere.frac, right.sphere.frac, atol=1e-12):
-            raise NotImplementedError(
-                "MixedBasisPairConvolution: the two operands use different k representatives; "
-                "one row phase serves both on the fused load (the Σ caller, lane K2)")
         kg = np.asarray(self.kgrid)
         for name, s in (("output", out), ("wedge output", mid)):
             qin = np.rint(s.frac * kg).astype(np.int64)
@@ -703,12 +810,12 @@ class MixedBasisPairConvolution:
 
         # ---- schedule --------------------------------------------------------
         n_par = sum(op.transport.n_parent * (2 if np.any(op.transport.anti) else 1)
-                    * ax.carrier * ax.carrier * ns * ns // self.P
+                    * ax.carrier * ax.carrier * op.transport.ns ** 2 // self.P
                     for op, ax in zip(self.ops, self.m_axis))
         target = (int(budget_bytes) if budget_bytes is not None else _budget_target(ns))
         wt = self._wt
         self.chunks = plan_pair_convolution_chunks(
-            n_ranks=self.P, n_k=self.nk, n_s=ns, widths=self.width_carrier,
+            n_ranks=self.P, n_k=self.nk, spins=self.spins, widths=self.width_carrier,
             width_out=self.mo_axis.carrier, n_q=self.nq, n_r=self.nr,
             kboxes=[int(np.prod(k)) for k in self.kbox], kbox_out=int(np.prod(self.kbox_out)),
             n_parent_tiles=n_par, target_bytes=target,
@@ -876,19 +983,26 @@ class MixedBasisPairConvolution:
             self._expand.append(self._build_expand(t, sup, ax.carrier))
 
         # ---- 5: the streamed middle ------------------------------------------
-        same_support = all(np.array_equal(a, b) for a, b in zip(*self.sup))
+        # The k-convolution pairs D's [A | C] columns and traces nsk spin blocks: 'trace' has
+        # nsk = n_s and the J batch columns; 'scalar' has nsk = 1 and cw = n_s²·J columns
+        # (α, j, β), C's one channel broadcast over A's blocks.
+        _, ns_c, nx = self.spins
+        scalar = self.product == "scalar"
+        nsk = 1 if scalar else ns
+        same_support = not scalar and all(np.array_equal(a, b) for a, b in zip(*self.sup))
         plan_row = [self._plan(sign=+1, norm="forward", in_support=s) for s in self.sup]
         plan_out = self._plan(sign=-1, norm="backward", out_support=self.sup_mid)
         J, nq, nb = c.J, self.nq_mid, self.n_batch
+        cw = nx * nx * J
         kbox, kbo = self.kbox, self.kbox_mid
         nbo = int(np.prod(kbo))
         cols_chunk = self.cols_chunk
         backend = self.backend
         if backend == "router":
             from ffi.fft import make_fused_conv_kplane
-            ident = list(range(ns))
-            kconv = make_fused_conv_kplane(mesh, self.kgrid, ns, perm_l=ident, phase_l=[1] * ns,
-                                           perm_r=ident, phase_r=[1] * ns)
+            ident = list(range(nsk))
+            kconv = make_fused_conv_kplane(mesh, self.kgrid, nsk, perm_l=ident, phase_l=[1] * nsk,
+                                           perm_r=ident, phase_r=[1] * nsk)
         else:
             kinv = lambda x: local_ifftn3(x, axes=(0, 1, 2), norm="backward")
             kfwd = lambda x: local_fftn3(x, axes=(0, 1, 2), norm="backward")
@@ -901,29 +1015,35 @@ class MixedBasisPairConvolution:
             def step(T, b):
                 off = b * J
                 xa = _row_half(jax.lax.dynamic_slice_in_dim(HA, off, J, axis=4), ra, ma, sa, n_s=ns)
-                xc = _row_half(jax.lax.dynamic_slice_in_dim(HC, off, J, axis=4), rc, mc, sc_, n_s=ns)
-                if same_support:
+                xc = _row_half(jax.lax.dynamic_slice_in_dim(HC, off, J, axis=4), rc, mc, sc_, n_s=ns_c)
+                if scalar:
+                    DA = plan_row[0](xa.reshape((nk, ns, J, ns) + kbox[0])).reshape(nk, cw, nr)
+                    DC = plan_row[1](xc.reshape((nk, 1, J, 1) + kbox[1])).reshape(nk, 1, J, 1, nr)
+                    DC = jnp.broadcast_to(DC, (nk, ns, J, ns, nr)).reshape(nk, cw, nr)
+                    D = jnp.concatenate([DA, DC], axis=1)
+                elif same_support:
                     x = jnp.concatenate([xa, xc], axis=2).reshape((nk, ns, 2 * J, ns) + kbox[0])
                     D = plan_row[0](x)
                 else:
                     D = jnp.concatenate([plan_row[0](xa.reshape((nk, ns, J, ns) + kbox[0])),
                                          plan_row[1](xc.reshape((nk, ns, J, ns) + kbox[1]))], axis=2)
-                D = D.reshape(nk, ns, 2 * J, ns, nr)                      # (k, α, [A|C] J, β, r)
+                D = D.reshape(nk, nsk, 2 * cw, nsk, nr)                   # (k, α, [A|C] cw, β, r)
                 if backend == "router":
-                    U = kconv(D.reshape(nk, 1, ns, 2 * J, ns, nr), F.reshape(nk, 1, nr))
+                    U = kconv(D.reshape(nk, 1, nsk, 2 * cw, nsk, nr), F.reshape(nk, 1, nr))
                     Y = jnp.take(U, qrows, axis=0) * (1.0 / nk)           # row −q holds q
                 else:
-                    a = (D * F[:, None, None, None, :]).reshape(self.kgrid + (ns, 2 * J, ns, nr))
-                    aR = kinv(a).reshape(nk, ns, 2 * J, ns, nr)
-                    X = sum(aR[:, s1, :J, s2] * jnp.conj(aR[:, s1, J:, s2])
-                            for s1 in range(ns) for s2 in range(ns))
-                    Xq = kfwd(X.reshape(self.kgrid + (J, nr))).reshape(nk, J, nr)
+                    a = (D * F[:, None, None, None, :]).reshape(self.kgrid + (nsk, 2 * cw, nsk, nr))
+                    aR = kinv(a).reshape(nk, nsk, 2 * cw, nsk, nr)
+                    X = sum(aR[:, s1, :cw, s2] * jnp.conj(aR[:, s1, cw:, s2])
+                            for s1 in range(nsk) for s2 in range(nsk))
+                    Xq = kfwd(X.reshape(self.kgrid + (cw, nr))).reshape(nk, cw, nr)
                     Y = jnp.take(Xq, qrows, axis=0)
-                Y = (Y * Q[:, None, :]).reshape((nq, J) + fg)
-                Z = plan_out(Y).reshape(nq, J, nbo)
-                idx = jnp.broadcast_to(ocell[:, None, :], (nq, J, ocell.shape[1]))
+                Y = (Y * Q[:, None, :]).reshape((nq, cw) + fg)
+                Z = plan_out(Y).reshape(nq, cw, nbo)
+                idx = jnp.broadcast_to(ocell[:, None, :], (nq, cw, ocell.shape[1]))
                 Tb = jnp.take_along_axis(Z, idx, axis=2, mode="fill", fill_value=0)
-                T = jax.lax.dynamic_update_slice(T, jnp.swapaxes(Tb, 1, 2), (0, 0, j * cols_chunk + off))
+                Tb = jnp.transpose(Tb.reshape(nq, nx, J, nx, -1), (0, 4, 1, 3, 2))   # (q, M, α, β, j)
+                T = jax.lax.dynamic_update_slice(T, Tb, (0, 0, 0, 0, j * cols_chunk + off))
                 return T, None
 
             T, _ = jax.lax.scan(step, T, jnp.arange(nb), unroll=1)
@@ -933,8 +1053,8 @@ class MixedBasisPairConvolution:
         rep = P()
         self._middle = jax.jit(shard_map(
             middle, mesh=mesh,
-            in_specs=(hspec, hspec, P(None, None, _XY)) + (rep,) * 11,
-            out_specs=P(None, None, _XY), check_vma=False), donate_argnums=(2,))
+            in_specs=(hspec, hspec, hspec) + (rep,) * 11,
+            out_specs=hspec, check_vma=False), donate_argnums=(2,))
 
         # ---- 6: T → G over P, e^{iq·r'}, r' → G', 2-D layout ----------------
         plan_col_out = self._plan(sign=+1, norm="forward", out_support=self.sup_out)
@@ -947,28 +1067,37 @@ class MixedBasisPairConvolution:
         def final(T, qf, ocell, c2p):
             def step(_, i):
                 Tq = jax.lax.dynamic_slice_in_dim(T, i * qc, qc, axis=0)
-                Tq = jax.lax.all_to_all(Tq, _XY, split_axis=1, concat_axis=2, tiled=True)
+                Tq = jax.lax.all_to_all(Tq, _XY, split_axis=1, concat_axis=4, tiled=True)
                 q_i = jax.lax.dynamic_slice_in_dim(qf, i * qc, qc, axis=0)
                 # the columns in box order: a slice, or the orbit-packed view's gather
-                Tq = jnp.take(Tq, c2p, axis=2) if wedge else Tq[..., :nr]
-                Tq = Tq * _grid_phase(q_i, +1, fg, box)[:, None, :]
-                Z = plan_col_out(Tq.reshape((qc, mo_loc) + fg)).reshape(qc, mo_loc, nbo_o)
+                Tq = jnp.take(Tq, c2p, axis=4) if wedge else Tq[..., :nr]
+                Tq = Tq * _grid_phase(q_i, +1, fg, box)[:, None, None, None, :]
+                Z = plan_col_out(Tq.reshape((qc, mo_loc, nx, nx) + fg)).reshape(qc, mo_loc, nx, nx, nbo_o)
                 oc = jax.lax.dynamic_slice_in_dim(ocell, i * qc, qc, axis=0)
-                idx = jnp.broadcast_to(oc[:, None, :], (qc, mo_loc, oc.shape[1]))
-                return None, jnp.take_along_axis(Z, idx, axis=2, mode="fill", fill_value=0)
+                idx = jnp.broadcast_to(oc[:, None, None, None, :], (qc, mo_loc, nx, nx, oc.shape[1]))
+                return None, jnp.take_along_axis(Z, idx, axis=4, mode="fill", fill_value=0)
 
             _, X = jax.lax.scan(step, None, jnp.arange(n_qc), unroll=1)
-            X = X.reshape(nq_o, mo_loc, -1)
-            return jax.lax.all_to_all(X, "y", split_axis=2, concat_axis=1, tiled=True)
+            X = X.reshape(nq_o, mo_loc, nx, nx, -1)
+            if not scalar:                  # χ: (q, M, M)
+                return jax.lax.all_to_all(X.reshape(nq_o, mo_loc, -1), "y", split_axis=2,
+                                          concat_axis=1, tiled=True)
+            X = jnp.transpose(X, (0, 1, 2, 4, 3))                        # Σ: (q, m, α, M, β)
+            return jax.lax.all_to_all(X, "y", split_axis=3, concat_axis=1, tiled=True)
 
-        self._final = jax.jit(shard_map(final, mesh=mesh, in_specs=(P(None, None, _XY), rep, rep, rep),
-                                        out_specs=P(None, "x", "y"), check_vma=False))
+        self._out_spec = P(None, "x", "y") if not scalar else P(None, "x", None, "y", None)
+        self._final = jax.jit(shard_map(final, mesh=mesh, in_specs=(hspec, rep, rep, rep),
+                                        out_specs=self._out_spec, check_vma=False))
         self._dev_c2p = self._put(np.arange(nr, dtype=np.int32) if not wedge else
                                   self._wt["layout"].canonical_to_packed.astype(np.int32))
 
         def zeros_T():
-            return jnp.zeros((self.nq_mid, self.mm_axis.carrier, self.nr_carrier), jnp.complex128)
-        self._zeros_T = jax.jit(zeros_T, out_shardings=NamedSharding(mesh, P(None, None, _XY)))
+            return jnp.zeros((self.nq_mid, self.mm_axis.carrier, nx, nx, self.nr_carrier), jnp.complex128)
+        self._zeros_T = jax.jit(zeros_T, out_shardings=NamedSharding(mesh, hspec))
+
+        # a one-channel operand in the 3-D (n, M, M) layout → the 5-D slab input
+        self._as5 = jax.jit(lambda x: x[:, :, None, :, None],
+                            out_shardings=NamedSharding(mesh, P(None, "x", None, "y", None)))
         if wedge:
             self._build_rebuild()
 
@@ -977,35 +1106,46 @@ class MixedBasisPairConvolution:
         T_q(G, r') on whole orbits at the output q (module docstring)."""
         wt, mesh = self._wt, self.mesh
         nq, nrow, mo = self.nq, len(self.wedge.rows), self.mo_axis.carrier
+        nx = self.spins[2]
         R = self.cols_rank
         lay = wt["layout"]
         live = lay.packed_to_canonical >= 0
         mu = np.where(live, lay.packed_to_canonical, 0)
         sel = np.where(live, wt["jrow"][mu] * R + wt["rep_loc"][wt["labels"][mu]], 0).astype(np.int32)
+        spin = (np.ones((nrow, 1, 1), np.complex128) if nx == 1
+                else np.asarray(self.wedge.spin, np.complex128))
         self._dev_rebuild = (self._put(wt["par"]), self._put(wt["pslot"]), self._put(wt["gph"]),
-                             self._put(wt["anti"]),
+                             self._put(wt["anti"]), self._put(spin),
                              self._put(sel, P(_XY)),
                              self._put(wt["phl"], P(None, _XY)))
 
-        def rebuild(Tm, par, pslot, gph, anti, sel, phl):
+        def rebuild(Tm, par, pslot, gph, anti, U, sel, phl):
             def step(_, i):
-                g = jnp.take(Tm, par[i], axis=0)                          # (rows, M_mid, R)
-                idx = jnp.broadcast_to(pslot[i][:, :, None], (nrow, mo, R))
-                g = jnp.take_along_axis(g, idx, axis=1, mode="fill", fill_value=0) * gph[i][:, :, None]
-                g = jnp.where(anti[:, None, None], jnp.conj(g), g)
-                flat = jnp.transpose(g, (1, 0, 2)).reshape(mo, nrow * R)
-                return None, jnp.take(flat, sel, axis=1) * phl[i][None, :]
+                g = jnp.take(Tm, par[i], axis=0)                          # (rows, M_mid, α, β, R)
+                idx = jnp.broadcast_to(pslot[i][:, :, None, None, None], (nrow, mo, nx, nx, R))
+                g = (jnp.take_along_axis(g, idx, axis=1, mode="fill", fill_value=0)
+                     * gph[i][:, :, None, None, None])
+                g = jnp.where(anti[:, None, None, None, None], jnp.conj(g), g)
+                if nx > 1:                  # U (…) U† per row, elementwise (QUALITY_PATTERNS §11)
+                    u = lambda a, c: U[:, a, c][:, None, None, None]
+                    g = jnp.stack([sum(u(a, c) * g[:, :, c] for c in range(nx)) for a in range(nx)], 2)
+                    g = jnp.stack([sum(g[:, :, :, d] * jnp.conj(u(b, d)) for d in range(nx))
+                                   for b in range(nx)], 3)
+                flat = jnp.transpose(g, (1, 2, 3, 0, 4)).reshape(mo, nx, nx, nrow * R)
+                return None, jnp.take(flat, sel, axis=3) * phl[i][None, None, None, :]
             _, T = jax.lax.scan(step, None, jnp.arange(nq), unroll=1)
             return T
 
         rep = P()
+        hspec = P(None, None, None, None, _XY)
         self._rebuild = jax.jit(shard_map(
-            rebuild, mesh=mesh, in_specs=(P(None, None, _XY), rep, rep, rep, rep, P(_XY), P(None, _XY)),
-            out_specs=P(None, None, _XY), check_vma=False))
+            rebuild, mesh=mesh, in_specs=(hspec, rep, rep, rep, rep, rep, P(_XY), P(None, _XY)),
+            out_specs=hspec, check_vma=False))
 
     def _build_expand(self, t, sup, m_carrier):
         """Steps 2–4 for one operand: ``fn(S, St, j) -> H`` for r' chunk ``j``."""
-        mesh, ns, nk, nr, P_ = self.mesh, self.ns, self.nk, self.nr, self.P
+        mesh, nk, nr, P_ = self.mesh, self.nk, self.nr, self.P
+        ns = int(np.asarray(t["spin"]).shape[-1])            # this operand's spin width
         c = self.chunks
         fg = self.fft_grid
         kc, n_kc = c.kc, self.nk // c.kc
@@ -1065,12 +1205,25 @@ class MixedBasisPairConvolution:
                 timings.setdefault(name + "_chunks", []).append(dt)
             return time.perf_counter()
 
-        for name, x, ax in (("A", A, self.m_axis[0]), ("C", C, self.m_axis[1])):
-            want = (None, ax.carrier, self.ns, ax.carrier, self.ns)
-            if x.ndim != 5 or tuple(x.shape[1:]) != want[1:] or x.dtype != jnp.complex128:
+        ops_in = []
+        for name, x, ax, t in (("A", A, self.m_axis[0], self._tables[0]),
+                               ("C", C, self.m_axis[1], self._tables[1])):
+            n_s = int(np.asarray(t["spin"]).shape[-1])
+            if n_s == 1 and x.ndim == 3:
+                x = self._as5(x)                    # (n, M, M) at P(None, 'x', 'y'), e.g. W
+            if x.ndim != 5 or tuple(x.shape[1:]) != (ax.carrier, n_s, ax.carrier, n_s) \
+                    or x.dtype != jnp.complex128:
                 raise ValueError(f"MixedBasisPairConvolution: {name} must be complex128 "
-                                 f"(n_parent, {ax.carrier}, {self.ns}, {ax.carrier}, {self.ns}); "
+                                 f"(n_parent, {ax.carrier}, {n_s}, {ax.carrier}, {n_s}); "
                                  f"got {x.shape} {x.dtype}")
+            ops_in.append(x)
+        A, C = ops_in
+        if self.product == "scalar" and C_partner is not None:
+            raise ValueError(
+                "GATE pairconv-scalar-partner: got a transposed partner for the one-channel operand; "
+                "want W on the conj rule (no partner); why: the plain product reads W's time-reversed "
+                "image through its transport, which conjugates rather than transposes; fix: pass "
+                "C_partner=None")
         if self.wedge is not None and bool(np.any(self.wedge.anti)) \
                 and (A_partner is not None or C_partner is not None):
             raise ValueError(
@@ -1113,12 +1266,14 @@ class MixedBasisPairConvolution:
         """Collectives in each stage's compiled HLO, lowered on abstract operands:
         ``{stage: {op: count}}`` (the structural claim: the streamed middle moves nothing)."""
         import re
-        ns, nk, nq = self.ns, self.nk, self.nq
+        nk, nq, nx = self.nk, self.nq, self.spins[2]
         sd = lambda shape, dt, spec: jax.ShapeDtypeStruct(shape, dt, sharding=NamedSharding(self.mesh, spec))
         rep = lambda shape, dt: sd(shape, dt, P())
         i32, c128, f64 = jnp.int32, jnp.complex128, jnp.float64
-        ops = {}
+        h5 = P(None, None, None, None, _XY)
+        ops, H, tb = {}, [], []
         for name, (t, M) in zip(("left", "right"), zip(self._tables, self.width_carrier)):
+            ns = int(np.asarray(t["spin"]).shape[-1])
             tile = sd((t["n_parent"], M, ns, M, ns), c128, P(None, "x", None, "y", None))
             slab = sd((t["n_parent"], M, ns, M, ns), c128, P(None, _XY, None, None, None))
             nbox = t["csrc"].shape[1]
@@ -1127,21 +1282,19 @@ class MixedBasisPairConvolution:
                 slab, slab, rep((), i32), rep((nk,), i32), rep((nk,), i32), rep((nk, ns, ns), c128),
                 rep((nk, nbox), i32), rep((nk, nbox), c128), rep((nk, 3), f64),
                 rep(self._coltab.shape, i32))
-        H = [sd((nk, M, ns, ns, self.P * self.cols_chunk), c128, P(None, None, None, None, _XY))
-             for M in self.width_carrier]
+            H.append(sd((nk, M, ns, ns, self.P * self.cols_chunk), c128, h5))
+            tb.append((rep((nk, nbox), i32), rep((nk, nbox), c128), rep((nk, ns, ns), c128)))
         nqm, mm = self.nq_mid, self.mm_axis.carrier
-        Tm = sd((nqm, mm, self.nr_carrier), c128, P(None, None, _XY))
-        tb = [(rep((nk, t["csrc"].shape[1]), i32), rep((nk, t["csrc"].shape[1]), c128),
-               rep((nk, ns, ns), c128)) for t in self._tables]
+        Tm = sd((nqm, mm, nx, nx, self.nr_carrier), c128, h5)
         ops["middle"] = self._middle.lower(H[0], H[1], Tm, rep((), i32), rep((nk, 3), f64),
                                            rep((nqm, 3), f64), rep((nqm,), i32),
                                            rep((nqm, mm), i32), *tb[0], *tb[1])
         T = Tm
         if self._wt is not None:
             n_pad = self._wt["layout"].n_padded
-            T = sd((nq, self.mo_axis.carrier, n_pad), c128, P(None, None, _XY))
+            T = sd((nq, self.mo_axis.carrier, nx, nx, n_pad), c128, h5)
             ops["rebuild"] = self._rebuild.lower(
-                Tm, *(rep(np.shape(a), a.dtype) for a in self._dev_rebuild[:4]),
+                Tm, *(rep(np.shape(a), a.dtype) for a in self._dev_rebuild[:5]),
                 sd((n_pad,), i32, P(_XY)), sd((nq, n_pad), c128, P(None, _XY)))
         ops["final"] = self._final.lower(T, rep((nq, 3), f64), rep((nq, self.mo_axis.carrier), i32),
                                          rep((self.nr,), i32))
@@ -1161,15 +1314,16 @@ class MixedBasisPairConvolution:
         c = self.chunks
         gb = lambda b: f"{b / 1e9:.3f} GB"
         return (f"[pair-conv] backend {self.backend}; P={self.P}; k-grid {self.kgrid} (N_k={self.nk}); "
-                f"box {self.fft_grid} (N_r={self.nr}, carrier {self.nr_carrier}); n_s={self.ns}; "
+                f"box {self.fft_grid} (N_r={self.nr}, carrier {self.nr_carrier}); product "
+                f"{self.product!r}, spins A/C/X {'/'.join(map(str, self.spins))}; "
                 f"slots A/C/X {self.ops[0].sphere.width}/{self.ops[1].sphere.width}/{self.out.width} "
                 f"(carriers {self.width_carrier[0]}/{self.width_carrier[1]}/{self.mo_axis.carrier}); "
                 f"union boxes {self.kbox[0]}/{self.kbox[1]}/{self.kbox_out}; n_q={self.nq}\n"
                 f"[pair-conv] schedule: r' chunks n_c={c.n_c}, batch J={c.J} ({self.n_batch} per chunk "
                 f"per rank), k chunk {c.kc}, q chunk {c.qc}\n"
                 f"[pair-conv] memory law per rank: resident {gb(c.bytes_resident)} "
-                f"(H {gb(_C16 * self.nk * self.ns ** 2 * sum(self.width_carrier) * self.cols_chunk)}, "
-                f"T {gb(_C16 * self.nq * self.mo_axis.carrier * self.cols_rank)}); transients expand "
+                f"(H {gb(_C16 * self.nk * self.cols_chunk * sum(n * n * m for n, m in zip(self.spins, self.width_carrier)))}, "
+                f"T {gb(_C16 * self.nq_mid * self.mm_axis.carrier * self.spins[2] ** 2 * self.cols_rank)}); transients expand "
                 f"{gb(c.bytes_expand)}, middle {gb(c.bytes_middle)}, final {gb(c.bytes_final)}"
                 f"{'' if self._wt is None else ', rebuild ' + gb(c.bytes_rebuild)}; "
                 f"HWM {gb(c.hwm)} against target {gb(c.target)}" + self._describe_wedge())
@@ -1186,9 +1340,10 @@ class MixedBasisPairConvolution:
                 f"{self.nq_mid} (every q), union box {self.kbox_mid}")
 
     def strip(self, X):
-        """The logical output ``(n_q, width, width)`` on the host (gathers; small outputs only)."""
+        """The logical output on the host, ``(n_q, width, width)`` or ``(n_q, width, n_s, width,
+        n_s)`` (gathers; small outputs only)."""
         from jax.experimental import multihost_utils
         x = np.asarray(multihost_utils.process_allgather(X, tiled=True)) \
             if not X.is_fully_addressable else np.asarray(X)
         w = self.out.width
-        return x[:, :w, :w]
+        return x[:, :w, :w] if x.ndim == 3 else x[:, :w, :, :w, :]

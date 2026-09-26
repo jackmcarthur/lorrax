@@ -312,12 +312,12 @@ def _wedge_check(mesh, c, backend, rows, *, twins=()):
     red = {}
     for name in twins:
         tw = _conv(mesh, *args, wedge=_wedge(c, rows), **kw)
-        par, pslot, gph, anti, sel, phl = tw._dev_rebuild
+        par, pslot, gph, anti, U, sel, phl = tw._dev_rebuild
         if name == "no_conj":             # antiunitary rows read without the conjugation
             anti = tw._put(np.zeros_like(tw._wt["anti"]))
         elif name == "no_wrap":           # the lattice-wrap phase e^{-2πi q·S⁻¹L} dropped
             phl = tw._put(np.where(np.abs(tw._wt["phl"]) > 0, 1.0 + 0j, 0j), P(None, ("x", "y")))
-        tw._dev_rebuild = (par, pslot, gph, anti, sel, phl)
+        tw._dev_rebuild = (par, pslot, gph, anti, U, sel, phl)
         red[name] = cases.rel(_run(tw, *pa), ref)
     return dict(ref=cases.rel(got, ref), dense=cases.rel(got, dense), dense_ref=cases.rel(dense, ref),
                 orbits=conv._wt["n_orbits"], nr=conv.nr, red=red, conv=conv)
@@ -412,3 +412,333 @@ def test_screened_sphere_set_and_alias_cap():
     with pytest.raises(ValueError, match="GATE screened-coulomb-cutoff"):
         screened_sphere_set(fft_grid=(8, 8, 8), psi=psi, bvec=np.eye(3), q_frac=c["kfrac"],
                             ecutwfc=ecut, screened_coulomb_cutoff=1.0001 * cap)
+
+
+# ---------------------------------------------------------------------------
+# Σ, the second caller (product='scalar'): A = G on the ψ sphere, B = W on the χ sphere,
+# the output on the ψ sphere; B's rows at the other representative of every ±½ plane
+# ---------------------------------------------------------------------------
+
+def _sigma_conv(mesh, kgrid, fft_grid, g_op, w_op, out, **kw):
+    from gw.mixed_basis_pair_convolution import MixedBasisPairConvolution, SphereSet
+    return MixedBasisPairConvolution(mesh, kgrid=kgrid, fft_grid=fft_grid, left=g_op, right=w_op,
+                                     out=SphereSet(*out), product="scalar", **kw)
+
+
+def _run_sigma(conv, G, W, Gt=None):
+    """G ``(n, w, ns, w, ns)`` and W ``(n, w, 1, w, 1)`` padded to the carriers; W goes in as the
+    3-D ``(n, M, M)`` at ``P(None, 'x', 'y')`` (the χ plan's output layout)."""
+    mesh = conv.mesh
+    s5 = NamedSharding(mesh, P(None, "x", None, "y", None))
+    s3 = NamedSharding(mesh, P(None, "x", "y"))
+    g = fixtures._put(cases.pad_tiles(G, conv.width_carrier[0]), s5)
+    gt = None if Gt is None else fixtures._put(cases.pad_tiles(Gt, conv.width_carrier[0]), s5)
+    w = fixtures._put(cases.pad_tiles(W, conv.width_carrier[1])[:, :, 0, :, 0], s3)
+    return conv.strip(conv(g, w, A_partner=gt))
+
+
+def sigma_random_case(ns, *, seed=0, kgrid=(2, 2, 1), fft_grid=(8, 7, 7)):
+    kfrac = cases.kgrid_frac(kgrid)
+    wfrac = kfrac - (kfrac >= 0.5)                     # W rows at the other representative of ±½
+    sph, ngk = cases.spheres(kfrac, np.eye(3), 1.3)
+    wsp, wngk = cases.spheres(wfrac, np.eye(3), 1.0)
+    rng = np.random.default_rng(seed + 10 * ns)
+    G = cases.random_green(rng, len(kfrac), sph.shape[1], ngk, ns, garbage=1e3)
+    W = cases.random_green(rng, len(kfrac), wsp.shape[1], wngk, 1, garbage=1e3)
+    ksel = np.asarray([0, 3, 1])
+    osph, ongk = cases.spheres(kfrac[ksel], np.eye(3), 1.3)
+    return dict(kgrid=kgrid, fft_grid=fft_grid, kfrac=kfrac, wfrac=wfrac, sph=sph, ngk=ngk,
+                wsp=wsp, wngk=wngk, G=G, W=W, out=(osph, ongk, kfrac[ksel]), ns=ns)
+
+
+def _sigma_ref(c, G=None, W=None):
+    return cases.dense_scalar_reference(
+        c["G"] if G is None else G, c["sph"], c["ngk"], c["kfrac"],
+        c["W"] if W is None else W, c["wsp"], c["wngk"], c["wfrac"],
+        c["kgrid"], c["fft_grid"], *c["out"])
+
+
+def _identity_ops(c):
+    from gw.mixed_basis_pair_convolution import PairOperand, SphereSet, SphereTransport
+    gs, ws = SphereSet(c["sph"], c["ngk"], c["kfrac"]), SphereSet(c["wsp"], c["wngk"], c["wfrac"])
+    return (PairOperand(gs, SphereTransport.identity(gs, c["ns"])),
+            PairOperand(ws, SphereTransport.identity(ws, 1)))
+
+
+@pytest.mark.parametrize("n_mesh", [1, 4])
+@pytest.mark.parametrize("ns", [1, 2])
+@pytest.mark.parametrize("backend", ["xla", "router"])
+def test_sigma_random_operands_match_the_dense_reference(n_mesh, ns, backend):
+    c = sigma_random_case(ns)
+    mesh = _mesh(n_mesh)
+    ref = _sigma_ref(c)
+    g_op, w_op = _identity_ops(c)
+    conv = _sigma_conv(mesh, c["kgrid"], c["fft_grid"], g_op, w_op, c["out"], backend=backend,
+                       budget_bytes=int(1e10))
+    assert conv.chunks.n_c == 1 and conv.spins == (ns, 1, ns)
+    got = _run_sigma(conv, c["G"], c["W"])
+    assert got.shape == ref.shape and cases.rel(got, ref) <= TOL, cases.rel(got, ref)
+    tight = _sigma_conv(mesh, c["kgrid"], c["fft_grid"], g_op, w_op, c["out"], backend=backend,
+                        budget_bytes=int(1e10), chunks=(3, 4, 2, 1))
+    assert (tight.chunks.n_c, tight.chunks.kc, tight.chunks.qc) == (3, 2, 1) \
+        and tight.n_batch >= 2, tight.describe()
+    got = _run_sigma(tight, c["G"], c["W"])
+    assert cases.rel(got, ref) <= TOL, (cases.rel(got, ref), tight.describe())
+
+
+def test_sigma_time_reversal_is_the_plain_product(monkeypatch):
+    """Red twin: without the time-reversed transport the plan forms A ⊙ conj B, not A ⊙ B."""
+    from gw.mixed_basis_pair_convolution import SphereTransport
+    c = sigma_random_case(2)
+    ref = _sigma_ref(c)
+    g_op, w_op = _identity_ops(c)
+    monkeypatch.setattr(SphereTransport, "time_reversed", lambda self, sphere: self)
+    conv = _sigma_conv(_mesh(1), c["kgrid"], c["fft_grid"], g_op, w_op, c["out"], backend="xla",
+                       budget_bytes=int(1e10))
+    assert cases.rel(_run_sigma(conv, c["G"], c["W"]), ref) > 1e-3
+
+
+def test_sigma_census_and_refusals():
+    from gw.mixed_basis_pair_convolution import SphereTransport
+    c = sigma_random_case(2)
+    g_op, w_op = _identity_ops(c)
+    conv = _sigma_conv(_mesh(4), c["kgrid"], c["fft_grid"], g_op, w_op, c["out"], backend="xla",
+                       budget_bytes=int(1e10), chunks=(2, 3, 2, 1))
+    census = conv.collective_census()
+    assert census["middle"] == {}, census
+    assert census["final"] == {"all-to-all": 2}, census
+    for k in ("slab left", "slab right", "expand left", "expand right"):
+        assert census[k] == {"all-to-all": 1}, census
+    with pytest.raises(ValueError, match="one-channel right operand"):
+        _sigma_conv(_mesh(1), c["kgrid"], c["fft_grid"], g_op, g_op, c["out"], backend="xla")
+    with pytest.raises(ValueError, match="pairs equal spin widths"):
+        from gw.mixed_basis_pair_convolution import MixedBasisPairConvolution, SphereSet
+        MixedBasisPairConvolution(_mesh(1), kgrid=c["kgrid"], fft_grid=c["fft_grid"], left=g_op,
+                                  right=w_op, out=SphereSet(*c["out"]), backend="xla")
+    from gw.mixed_basis_pair_convolution import SphereSet
+    ws = w_op.sphere                   # row 1 loses its last shell slot: no longer inversion-closed
+    skew = SphereSet(ws.gvecs, ws.ngk - (np.arange(ws.n) == 1), ws.frac)
+    with pytest.raises(ValueError, match="time_reversed"):
+        SphereTransport.identity(skew, 1).time_reversed(skew)
+
+
+@pytest.mark.parametrize("ns", [1, 2])
+def test_sigma_and_chi_normalization_against_band_sums(ns):
+    """The physical factors: Σ_k = −X/(Ω·N_r²) and χ_q = X/(Ω·N_r²) (Ω = 1 here) against BGW's
+    band sums over explicit ⟨nk|e^{i(q+G)·r}|m, k−q⟩ (no box, no FFT)."""
+    from gw.mixed_basis_pair_convolution import (MixedBasisPairConvolution, PairOperand, SphereSet,
+                                                SphereTransport)
+    kgrid, fft_grid = (2, 2, 1), (8, 7, 7)
+    kfrac = cases.kgrid_frac(kgrid)
+    wfrac = kfrac - (kfrac >= 0.5)
+    nr = int(np.prod(fft_grid))
+    sph, ngk = cases.spheres(kfrac, np.eye(3), 1.3)
+    wsp, wngk = cases.spheres(wfrac, np.eye(3), 1.0)
+    rng = np.random.default_rng(40 + ns)
+    nb = 3
+    cpsi = (rng.standard_normal((len(kfrac), nb, ns, sph.shape[1]))
+            + 1j * rng.standard_normal((len(kfrac), nb, ns, sph.shape[1])))
+    cpsi *= (np.arange(sph.shape[1])[None, :] < ngk[:, None])[:, None, None, :]
+    g = rng.standard_normal(nb)
+    W = cases.random_green(rng, len(kfrac), wsp.shape[1], wngk, 1)
+    mesh = _mesh(1)
+    gs, ws = SphereSet(sph, ngk, kfrac), SphereSet(wsp, wngk, wfrac)
+    g_op = PairOperand(gs, SphereTransport.identity(gs, ns))
+    w_op = PairOperand(ws, SphereTransport.identity(ws, 1))
+    rows = [0, 3]
+    conv = _sigma_conv(mesh, kgrid, fft_grid, g_op, w_op, (sph[rows], ngk[rows], kfrac[rows]),
+                       backend="xla", budget_bytes=int(1e10))
+    X = _run_sigma(conv, cases.green_from_psi(cpsi, g), W)
+    sig = -X / nr ** 2
+    got = np.einsum("knap,kpaqb,kmbq->knm", np.conj(cpsi[rows]), sig, cpsi[rows])
+    want = cases.band_sum_sigma(cpsi, g, sph, ngk, kfrac, W, wsp, wngk, wfrac, kgrid, rows)
+    assert cases.rel(got, want) <= TOL, cases.rel(got, want)
+    # χ₀ = X/(Ω·N_r²) on the χ sphere
+    wc, wv = rng.standard_normal(nb), rng.standard_normal(nb)
+    chi = MixedBasisPairConvolution(mesh, kgrid=kgrid, fft_grid=fft_grid, left=g_op, right=g_op,
+                                    out=SphereSet(wsp, wngk, wfrac), backend="xla",
+                                    budget_bytes=int(1e10))
+    s5 = NamedSharding(mesh, P(None, "x", None, "y", None))
+    put = lambda a: fixtures._put(cases.pad_tiles(a, chi.width_carrier[0]), s5)
+    Xc = chi.strip(chi(put(cases.green_from_psi(cpsi, wc)), put(cases.green_from_psi(cpsi, wv))))
+    want = cases.band_sum_chi(cpsi, wc, wv, sph, ngk, kfrac, kgrid, wsp, wngk, wfrac)
+    assert cases.rel(Xc / nr ** 2, want) <= TOL, cases.rel(Xc / nr ** 2, want)
+
+
+# ---- symmetry: G at the k-parents, W at the q-IBZ, both unfolded on load --------------------
+
+def _scalar_plan(plan):
+    """The plan's tables with the trivial spin representation (a spin-scalar operand's)."""
+    from types import SimpleNamespace
+    n = len(np.asarray(plan.irr_idx))
+    return SimpleNamespace(irr_idx=np.asarray(plan.irr_idx), sym_idx=np.asarray(plan.sym_idx),
+                           k_parent_frac=np.asarray(plan.k_parent_frac),
+                           n_sym_spatial=int(plan.n_sym_spatial), n_full=n,
+                           spatial_ops=np.asarray(plan.spatial_ops),
+                           translations=np.asarray(plan.translations),
+                           spin_action_full=np.ones((n, 1, 1), np.complex128))
+
+
+def w_parents_and_children(c, *, ecut_w, metric, nphi=3, seed=17, covariant=False):
+    """W = Σ_m φ_m λ_m φ_m† on the χ sphere (λ real: the conj rule), parents random (or closed
+    under their little groups, ``covariant``), children by the r-space action (trivial spin)."""
+    from common.gvec_fft_box import build_sphere_box_index
+    fx = c["fx"]
+    sfx = dict(fx, plan=_scalar_plan(fx["plan"]))
+    kpar, kful = np.asarray(fx["plan"].k_parent_frac), np.asarray(fx["kfull"])
+    wps, wpn = cases.spheres(kpar, metric, ecut_w)
+    wcs, wcn = cases.spheres(kful, metric, ecut_w, width=wps.shape[1])
+    rng = np.random.default_rng(seed)
+    phi = (rng.standard_normal((len(kpar), nphi, 1, wps.shape[1]))
+           + 1j * rng.standard_normal((len(kpar), nphi, 1, wps.shape[1])))
+    phi *= (np.arange(wps.shape[1])[None, :] < wpn[:, None])[:, None, None, :]
+    leak0 = 0.0
+    if covariant:
+        phi, leak0 = cases.close_under_little_groups(sfx, phi, wps, wpn, rows=fx["rows"],
+                                                     spinor_action=None, ns=1)
+    lam = np.tile(rng.standard_normal(nphi), phi.shape[1] // nphi)
+    phic, leak = cases.children_psi(sfx, phi, wps, wpn, wcs, wcn)
+    widx = build_sphere_box_index(wps, tuple(fx["fft_grid"]), wps.shape[1], ngk_valid=wpn)
+    return dict(W_par=cases.green_from_psi(phi, lam), W=cases.green_from_psi(phic, lam),
+                wps=wps, wpn=wpn, wsp=wcs, wngk=wcn, wfrac=kful, widx=widx,
+                wleak=max(leak0, leak), splan=sfx["plan"])
+
+
+def _sigma_typed_ops(c, w):
+    from gw.mixed_basis_pair_convolution import PairOperand, SphereSet, SphereTransport
+    fx = c["fx"]
+    gs = SphereSet(c["sph"], c["ngk"], c["kfrac"])
+    ws = SphereSet(w["wsp"], w["wngk"], w["wfrac"])
+    g_tr = SphereTransport.typed(fx["plan"], fft_grid=fx["fft_grid"], parent_sphere_index=c["sidx"],
+                                 children=gs)
+    w_tr = SphereTransport.typed(fx["plan"], fft_grid=fx["fft_grid"], parent_sphere_index=w["widx"],
+                                 children=ws, ns=1)
+    return PairOperand(gs, g_tr), PairOperand(ws, w_tr)
+
+
+def _sigma_symmetry_check(mesh, c, w, backend, *, wedge_rows=None, twins=()):
+    """Σ from typed parents (G at the k-parents, W at the q-IBZ) against the dense reference on
+    full-grid children; with ``wedge_rows`` also the r'-wedge against the dense-column plan."""
+    from gw.mixed_basis_pair_convolution import (ColumnWedge, PairOperand, SphereSet,
+                                                SphereTransport)
+    assert c["leak"] <= 1e-13 and w["wleak"] <= 1e-13, (c["leak"], w["wleak"])
+    cw = dict(c, G=c["A"], W=w["W"], wsp=w["wsp"], wngk=w["wngk"], wfrac=w["wfrac"])
+    ref = _sigma_ref(cw)
+    g_op, w_op = _sigma_typed_ops(c, w)
+    kw = dict(backend=backend, budget_bytes=int(1e10))
+    args = (mesh, c["kgrid"], c["fft_grid"])
+    dense = _run_sigma(_sigma_conv(*args, g_op, w_op, c["out"], **kw), c["A_par"], w["W_par"])
+    r = dict(parent=cases.rel(dense, ref), anti=bool(np.any(w_op.transport.anti)), red={})
+    # W's own unfold (the conj rule) against the r-space children, on the tiles
+    r["w_tile"] = cases.rel(cases.unfold_tile(w_op.transport, w["W_par"][:, :, 0, :, 0]),
+                            w["W"][:, :, 0, :, 0])
+    for name in twins:
+        if name == "no_anti_W":
+            t = w_op.transport
+            bad = PairOperand(w_op.sphere, SphereTransport(row=t.row, anti=np.zeros_like(t.anti),
+                                                           spin=t.spin, src=t.src, phase=t.phase,
+                                                           n_parent=t.n_parent))
+            r["red"][name] = cases.rel(_run_sigma(_sigma_conv(*args, g_op, bad, c["out"], **kw),
+                                                  c["A_par"], w["W_par"]), ref)
+    if wedge_rows is not None:
+        fx = c["fx"]
+        ns = c["ns"]
+        rows = np.asarray(wedge_rows)
+        spin = None if ns == 1 else np.asarray(fx["spinor_action"](rows, nspinor=ns))
+        wedge = ColumnWedge(np.asarray(fx["ops"]), np.asarray(fx["tnp"]), rows,
+                            SphereSet(*c["out_full"]), spin)
+        conv = _sigma_conv(*args, g_op, w_op, c["out"], wedge=wedge, **kw)
+        got = _run_sigma(conv, c["A_par"], w["W_par"])
+        r.update(wedge_ref=cases.rel(got, ref), wedge_dense=cases.rel(got, dense),
+                 orbits=conv._wt["n_orbits"], nr=conv.nr)
+        if "no_spin" in twins and ns > 1:
+            tw = _sigma_conv(*args, g_op, w_op, c["out"], wedge=wedge, **kw)
+            d = list(tw._dev_rebuild)
+            d[4] = tw._put(np.broadcast_to(np.eye(ns, dtype=np.complex128), (len(tw.wedge.rows), ns, ns)))
+            tw._dev_rebuild = tuple(d)
+            r["red"]["no_spin"] = cases.rel(_run_sigma(tw, c["A_par"], w["W_par"]), ref)
+    return r
+
+
+def sigma_glide_case(mesh, *, covariant):
+    fx = fixtures._glide_fixture(mesh, np.random.default_rng(2), 2, translated_anti=True,
+                                   theta=np.pi / 2)
+    if covariant:
+        c = covariant_case(fx, ecut=1.3, metric=np.eye(3), box=(8, 8, 7))
+        c["out"] = (*cases.spheres(c["kfrac"][[0, 1, 3]], np.eye(3), 1.3), c["kfrac"][[0, 1, 3]])
+        c["out_full"] = (*cases.spheres(c["kfrac"], np.eye(3), 1.3), c["kfrac"])
+    else:
+        c = symmetry_case(fx, ecut=1.3, metric=np.eye(3), box=(8, 8, 7))
+        c["out"] = (*cases.spheres(c["kfrac"][[0, 1, 3]], np.eye(3), 1.3), c["kfrac"][[0, 1, 3]])
+    w = w_parents_and_children(c, ecut_w=1.0, metric=np.eye(3), covariant=covariant)
+    return c, w
+
+
+@pytest.mark.parametrize("backend", ["xla", "router"])
+def test_sigma_glide_parents_equal_full_grid(backend):
+    """Glide group, n_s = 2, spin mixing, an antiunitary row: G from its parents and W from its
+    q-IBZ (the conj rule, trivial spin) against the dense supercell reference on full-grid input."""
+    mesh = _mesh(4)
+    c, w = sigma_glide_case(mesh, covariant=False)
+    r = _sigma_symmetry_check(mesh, c, w, backend, twins=("no_anti_W",))
+    assert r["anti"] and r["parent"] <= TOL and r["w_tile"] <= 1e-13, r
+    assert r["red"]["no_anti_W"] > 1e-3, r
+
+
+@pytest.mark.parametrize("backend", ["xla", "router"])
+@pytest.mark.parametrize("rows", [(0, 1, 2, 3), (0, 3)])
+def test_sigma_wedge_glide_equals_dense(backend, rows):
+    """The r'-wedge on Σ: covariant G and W, the output's spin sandwich live (θ = π/2 mixes spin);
+    dropping it (U = 1) misses."""
+    mesh = _mesh(4)
+    c, w = sigma_glide_case(mesh, covariant=True)
+    r = _sigma_symmetry_check(mesh, c, w, backend, wedge_rows=rows, twins=("no_spin",))
+    assert r["parent"] <= TOL and r["wedge_ref"] <= TOL and r["wedge_dense"] <= TOL, r
+    assert r["orbits"] < r["nr"] and r["red"]["no_spin"] > 1e-3, r
+
+
+def test_sigma_wedge_needs_spin():
+    from gw.mixed_basis_pair_convolution import ColumnWedge, SphereSet
+    mesh = _mesh(1)
+    c, w = sigma_glide_case(mesh, covariant=True)
+    g_op, w_op = _sigma_typed_ops(c, w)
+    fx = c["fx"]
+    wedge = ColumnWedge(np.asarray(fx["ops"]), np.asarray(fx["tnp"]), (0, 1), SphereSet(*c["out_full"]))
+    with pytest.raises(ValueError, match="GATE pairconv-wedge-spin"):
+        _sigma_conv(mesh, c["kgrid"], c["fft_grid"], g_op, w_op, c["out"], wedge=wedge,
+                    backend="xla", budget_bytes=int(1e10))
+
+
+def conj_rule_check(mesh, c, *, ecut_w, metric, backend="xla"):
+    """W's antiunitary rule at fixed τ, measured: χ₀(τ) of covariant Greens at every full-grid q
+    against the typed one-channel unfold (conj rule, ``cases.unfold_tile``) of χ₀ at the parents;
+    the red twin reads the antiunitary rows without the conjugation."""
+    from common.gvec_fft_box import build_sphere_box_index
+    from gw.mixed_basis_pair_convolution import SphereSet, SphereTransport
+    fx = c["fx"]
+    kpar, kful = np.asarray(fx["plan"].k_parent_frac), np.asarray(fx["kfull"])
+    wps, wpn = cases.spheres(kpar, metric, ecut_w)
+    wcs, wcn = cases.spheres(kful, metric, ecut_w, width=wps.shape[1])
+    tr = SphereTransport.identity(SphereSet(c["sph"], c["ngk"], c["kfrac"]), c["ns"])
+    kw = dict(transport=tr, backend=backend, budget_bytes=int(1e10))
+    x_full = _run(_conv(mesh, c["kgrid"], c["fft_grid"], c["sph"], c["ngk"], c["kfrac"],
+                        (wcs, wcn, kful), **kw), c["A"], c["C"])
+    x_par = _run(_conv(mesh, c["kgrid"], c["fft_grid"], c["sph"], c["ngk"], c["kfrac"],
+                       (wps, wpn, kpar), **kw), c["A"], c["C"])
+    widx = build_sphere_box_index(wps, tuple(fx["fft_grid"]), wps.shape[1], ngk_valid=wpn)
+    w_tr = SphereTransport.typed(fx["plan"], fft_grid=fx["fft_grid"], parent_sphere_index=widx,
+                                 children=SphereSet(wcs, wcn, kful), ns=1)
+    return dict(rule=cases.rel(cases.unfold_tile(w_tr, x_par), x_full),
+                red=cases.rel(cases.unfold_tile(w_tr, x_par, anti_conj=False), x_full),
+                n_anti=int(np.sum(w_tr.anti)))
+
+
+def test_conj_rule_on_chi_glide():
+    """χ₀(τ) of covariant Greens (glide, n_s = 2, spin mixing, antiunitary rows) unfolds from the
+    parents by the conj rule with the trivial spin action; without the conjugation it misses."""
+    mesh = _mesh(1)
+    fx = fixtures._glide_fixture(mesh, np.random.default_rng(2), 2, translated_anti=True,
+                                   theta=np.pi / 2)
+    c = covariant_case(fx, ecut=1.3, metric=np.eye(3), box=(6, 6, 5))
+    r = conj_rule_check(mesh, c, ecut_w=1.0, metric=np.eye(3))
+    assert r["n_anti"] > 0 and r["rule"] <= TOL and r["red"] > 1e-3, r
