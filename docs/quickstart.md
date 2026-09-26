@@ -76,4 +76,4 @@ artifacts a material needs.
 - [Installation](installation/index.md) and
   [Building the FFI libraries](building_ffi.md)
 - [Theory overview](theory/overview.md) and [physics](theory/physics.md)
-- [Codebase](architecture/codebase.md) and [memory model](architecture/memory-model.md)
+- [Codebase](codebase.md) and [memory model](architecture/memory-model.md)

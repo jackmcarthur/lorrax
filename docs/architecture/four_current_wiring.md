@@ -6,7 +6,7 @@ route it serves, what it costs and what refuses. The physics (the Γ-cell
 heads, the frequency each channel carries, what is zero by construction) is
 [Four-current heads and frequency](../theory/four-current-head-corrections.md).
 Deck-key semantics are the [input reference](../input_reference.md)'s, and
-module one-liners are [Codebase](codebase.md)'s.
+module one-liners are [Codebase](../codebase.md)'s.
 
 Notation: $n_C$, $n_T$ are the charge and current centroid counts, and
 $p_C$, $p_T$ their mesh-padded extents. $N_{\rm packed}=p_C+3p_T$. $n_q$
