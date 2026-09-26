@@ -4,13 +4,15 @@ from math import gcd
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 from jax import lax
 from jax.sharding import NamedSharding, PartitionSpec as P
 
 from ._shard_map import shard_map
+from .resolve import mesh_platform
 
 
-def panel_matmul(a, b, *, mesh, panel_bytes):
+def panel_matmul(a, b, *, mesh, panel_bytes, bounds=None):
     """Multiply face matrices, broadcasting one contraction panel at a time.
 
     Parameters
@@ -28,6 +30,13 @@ def panel_matmul(a, b, *, mesh, panel_bytes):
         A complete contraction panel is exchanged once when it fits this
         budget; otherwise smaller band panels are streamed. Output and
         input faces are accounted for separately by the caller.
+    bounds : jax.Array, optional
+        Integer (q,2), replicated: per batch row, the half-open contraction
+        interval [lo, hi) outside which the caller has already zeroed a (or
+        b).  When the complete panel is gathered, the local product runs
+        only over that interval (the local active-range GEMM), so the
+        dropped columns cost no flops; the result is the same product.  The
+        streamed paths contract every column (the zeros make that exact).
 
     Returns
     -------
@@ -53,6 +62,11 @@ def panel_matmul(a, b, *, mesh, panel_bytes):
     if not sample_axis and limit >= k:
         # One bounded all-gather per operand gives the local GEMM its full K.
         # This avoids p tiny-K GEMMs when the complete panel is already small.
+        # The gathered panels hold K in global order, so the caller's band
+        # interval selects the same columns of both.
+        if bounds is not None:
+            bounds = jnp.asarray(bounds, jnp.int32).reshape(q, 2)
+            return _kernel(mesh, q, m, k, n, k, False, True)(a, b, bounds)
         width = k
     elif not sample_axis and px == py:
         # Interleaved chunks: every rank contributes `width` of its own K
@@ -71,11 +85,41 @@ def panel_matmul(a, b, *, mesh, panel_bytes):
     return _kernel(mesh, q, m, k, n, width, sample_axis)(a, b)
 
 
+def _local_interval_product(mesh):
+    """The local active-range GEMM of this mesh's platform: ``(left, right, bounds) -> left @ right`` over each row's interval."""
+    one, zero = np.complex128(1.0), np.complex128(0.0)
+    if mesh_platform(mesh) == "CUDA":
+        from ._active_local_cuda import active_local_cuda, require_active_local_cuda
+        require_active_local_cuda()
+        contract = active_local_cuda
+    else:
+        from ._active_local import active_local_matmul as contract
+
+    def product(left, right, bounds):
+        weights = jnp.ones(left.shape[::2], left.dtype)
+        return contract(left, right, bounds, weights, alpha=one, beta=zero)
+    return product
+
+
 @lru_cache(maxsize=64)
-def _kernel(mesh, q, m, k, n, width, sample_axis):
+def _kernel(mesh, q, m, k, n, width, sample_axis, active=False):
     px, py = int(mesh.shape['x']), int(mesh.shape['y'])
     mx, ny, kx, ky = m // px, n // py, k // px, k // py
     spec = P(None, None, 'x', 'y') if sample_axis else P(None, 'x', 'y')
+    face_a = NamedSharding(mesh, P(None, 'x', 'y'))
+    if active:
+        interval_product = _local_interval_product(mesh)
+
+        @partial(shard_map, mesh=mesh,
+                 in_specs=(P(None, 'x', 'y'), spec, P()), out_specs=spec,
+                 check_vma=False)
+        def gathered(a, b, bounds):
+            left = lax.all_gather(a, 'y', axis=2, tiled=True)
+            right = lax.all_gather(b, 'x', axis=1, tiled=True)
+            return interval_product(left, right, bounds)
+
+        return jax.jit(gathered, in_shardings=(face_a, face_a, NamedSharding(mesh, P())),
+                       out_shardings=face_a)
 
     @partial(shard_map, mesh=mesh,
              in_specs=(P(None, 'x', 'y'), spec), out_specs=spec,
@@ -110,7 +154,6 @@ def _kernel(mesh, q, m, k, n, width, sample_axis):
         c, _ = lax.scan(panel, c, jnp.arange(k // width), unroll=1)
         return c if sample_axis else c[:, 0]
 
-    face_a = NamedSharding(mesh, P(None, 'x', 'y'))
     face_b = NamedSharding(mesh, spec)
     return jax.jit(product, in_shardings=(face_a, face_b), out_shardings=face_b)
 
