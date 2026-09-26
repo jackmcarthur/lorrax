@@ -318,39 +318,6 @@ class FfiAbiMismatch(FfiLibraryUnusable):
     """
 
 
-def _check_abi(lib: ctypes.CDLL, platform: str, path: str) -> None:
-    """Refuse a library whose handler signatures are not this tree's.
-
-    CALLED IMMEDIATELY AFTER ``CDLL`` AND BEFORE ANYTHING ELSE TOUCHES THE
-    LIBRARY.  Order is the requirement, not an optimisation: registering
-    targets or setting argtypes on a mispaired library is exactly the state
-    whose only symptom is a runtime ``INVALID_ARGUMENT`` several minutes into
-    an allocated run.
-
-    THE TWO OUTCOMES ARE DELIBERATELY DIFFERENT.
-
-    *Stamped and different* is a REFUSAL.  The two sides disagree about what
-    crosses the boundary; nothing good happens next.  What used to happen
-    instead was::
-
-        INVALID_ARGUMENT: Wrong number of arguments: expected 3 but got 4
-
-    which names neither library, neither version, nor what to do.
-
-    *Not stamped at all* is an ANNOUNCEMENT, once, and the load proceeds.  A
-    library built before 2026-08-08 carries no stamp, and "unstamped" is not
-    evidence of "wrong" — roughly nine worktrees pin such libraries today and
-    refusing them wholesale would break every one of them to fix none.  A site
-    that wants the ratchet closed sets ``LORRAX_FFI_ABI_STRICT=1``.
-    """
-    _native.check_abi(
-        lib, platform, path, expected_abi=LORRAX_FFI_ABI_VERSION,
-        abi_symbols=_ABI_SYMBOLS,
-        build_hint=str(_PLATFORMS[platform]["build_hint"]),
-        strict_unstamped=os.environ.get("LORRAX_FFI_ABI_STRICT", "") == "1",
-        mismatch_cls=FfiAbiMismatch)
-
-
 def _locate_so(platform: str) -> Path:
     return _native.locate_library(
         platform, specs=_PLATFORMS,

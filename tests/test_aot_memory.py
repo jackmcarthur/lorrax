@@ -153,8 +153,7 @@ def test_xla_gpu_still_emits_a_parseable_fft_op():
     way XLA:CPU does for Ducc, ``parse_fft_specs_from_hlo`` returns an empty
     list, ``cufft_scratch`` becomes 0, and ``cufft_measured`` stays True
     because nothing failed.  Then the planner is back to under-predicting
-    silently.  ``query_fft_peak_bytes`` announces that case at runtime; this
-    test turns it into a failure in CI.
+    silently.  This test turns that case into a failure in CI.
     """
     from src.runtime.aot_memory import parse_fft_specs_from_hlo
 
