@@ -526,16 +526,27 @@ def finalize_shared_pole_model(path, *, meta, expected_identity, basis=None):
     return _finalize_model(path, meta=meta, header=header, basis=basis)
 
 
+#: Headroom of the SC run's held pole-column extent over the live Kmax it is
+#: set from. After map 1 the sector models' Kmax grows by about 1% per map (Fe
+#: 4^3 bispinor CC/TT 1328 -> 1335 -> 1338, CT 723 -> 729), and an exact extent
+#: recompiled every store, read and Sigma-window program each map; 3% holds
+#: that drift for several maps and pads less than the eighth-octave ladder it
+#: replaces (up to 12.5%).
+_K_HEADROOM = 0.03
+
+
 def _k_extent(meta, header, live, *, record):
-    """The model's pole-column extent: the live Kmax, or the SC run's capacity.
+    """The model's pole-column extent: the live Kmax, or the SC run's held one.
 
     An SC map past map 0 binds ``meta.shared_pole_k_capacity`` (a dict the
-    quadrature session keeps): map 1 records its live Kmax, later maps keep
-    ``max(live, held)``, so a model whose Kmax drifts down keeps one dataset
-    shape and every store/read program is reused (Fe 4^3: 746 -> 736 -> 734
-    recompiled finalize, SlabIO and census programs at map 2). A live Kmax
-    above the held one grows it, printed. Columns past each parent's K are
-    zero factors and unit poles, as before. No binding: the live Kmax.
+    quadrature session keeps). Map 1 sets the extent to its live Kmax plus
+    :data:`_K_HEADROOM`; later maps keep it while the live Kmax fits and grow
+    it (again with headroom) only when it does not, noting the growth in
+    ``held["_events"]`` for the SC log. So a drifting Kmax keeps one dataset
+    shape and every store, read and Sigma program is reused (Fe 4^3 charge:
+    746 -> 736 -> 734 recompiled finalize, SlabIO and census programs at map
+    2). Columns past each parent's K are zero factors and unit poles, as
+    before. No binding (a one-shot, map 0): the live Kmax.
     """
     held = getattr(meta, "shared_pole_k_capacity", None)
     if held is None:
@@ -543,12 +554,16 @@ def _k_extent(meta, header, live, *, record):
     sector = header.get("sector")
     key = "CT" if sector in ("CT_C", "CT_T") else str(sector)
     before = int(held.get(key, 0))
-    extent = max(int(live), before)
-    if record:
-        if before and extent > before and process_rank() == 0:
-            print(f"  shared-pole K capacity ({key}): live Kmax {int(live)} exceeds "
-                  f"the held {before}; grown to {extent}")
-        held[key] = extent
+    if int(live) <= before:
+        return before
+    if not record:
+        return int(live)
+    extent = int(np.ceil(int(live) * (1.0 + _K_HEADROOM)))
+    if before:
+        held.setdefault("_events", []).append(
+            f"shared-pole K extent ({key}): live Kmax {int(live)} exceeds the held "
+            f"{before}; grown to {extent}")
+    held[key] = extent
     return extent
 
 

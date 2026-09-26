@@ -4103,6 +4103,12 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
         fixed_quadrature_session=inputs.fixed_quadrature_session,
         print_fn=inputs.print_fn,
     )
+    # The W model's held pole-column extent grew this map (a live Kmax past
+    # it): say so, as the window plan says its extensions.
+    held_k = getattr(inputs.meta, "shared_pole_k_capacity", None)
+    if held_k is not None:
+        for note in held_k.pop("_events", []):
+            _record_sc(inputs, f"    SC map {int(state.iteration)}: {note}")
     if bool(sigma_result.hartree_omitted) != (exact_hartree_dft is not None):
         raise RuntimeError(
             "SigmaResult Hartree-omission receipt disagrees with the "
