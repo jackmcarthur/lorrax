@@ -5112,8 +5112,9 @@ def _write_sc_eqp_snapshot(
     not accepted iterates.)
     The sibling ``eqp1_iterNNNN.dat`` is the BGW-shaped, output-only
     linearization ``E_eval + Z * (eqp0_map - E_eval)`` using the central
-    difference on this map's retained Sigma grid.  The SC map never reads Z,
-    never gates on it, and never replaces a value because of it.
+    difference on this map's retained Sigma grid, with the one-shot's
+    pathological-Z fallback (eqp1 = eqp0 where Z is outside (0, 1]).  The SC
+    map never reads Z or eqp1 and never gates on either.
 
     WHICH NUMBER IS THE RESIDUAL, AND WHICH IS NOT.  ``verdict`` is
     :func:`protected_band_convergence` on THIS call's output against THIS
@@ -5157,7 +5158,7 @@ def _write_sc_eqp_snapshot(
     from symmetry_maps import (
         reduce_full_bz_to_file_wedge, unfold_star_wedge_to_full_bz)
 
-    from .eqp_bgw import write_bgw_eqp
+    from .eqp_bgw import pathological_z_factor_mask, write_bgw_eqp
 
     # BEFORE the rank gate, on purpose.  ``e_output_kn_ev`` is a replicated
     # host array, so the check is bit-identical on every rank and costs a
@@ -5224,9 +5225,12 @@ def _write_sc_eqp_snapshot(
             "SC eqp1 snapshot shape mismatch after file-wedge reduction: "
             f"E_eval={e_eval.shape}, eqp0_map={e_output.shape}, "
             f"Z={z_factor.shape}")
-    # Output only.  In particular there is deliberately no pathological-Z
-    # mask, fallback, membership test, convergence test, or map update here.
-    eqp1_output = e_eval + z_factor * (e_output - e_eval)
+    # Output only.  The one-shot's pathological-Z rule (eqp_bgw.py
+    # pathological_z_factor_mask, applied in compute_eqp_diag): a state whose
+    # raw Z is non-finite or outside 0 < Z <= 1 reports eqp1 = eqp0.  Nothing
+    # here reaches a membership test, a convergence test or a map update.
+    eqp1_output = np.where(pathological_z_factor_mask(z_factor), e_output,
+                           e_eval + z_factor * (e_output - e_eval))
 
     snapshot_partition = _partition_on_loop(
         _state_partition(state_out, inputs), inputs)
@@ -5342,8 +5346,9 @@ def _write_sc_eqp_snapshot(
         band_offset=band_offset, nspin=1,
         comments=comments + (
             "BGW-style eqp1 diagnostic: E_eval + Z_central_difference * "
-            "(eqp0_map - E_eval); Z is output-only and is never read by "
-            "the SC iteration",
+            "(eqp0_map - E_eval), eqp0_map where Z is non-finite or outside "
+            "0 < Z <= 1; Z is output-only and is never read by the SC "
+            "iteration",
         ),
     )
 

@@ -139,19 +139,22 @@ def test_the_snapshot_stamps_the_convergence_criterion():
 
 
 def test_snapshot_writes_eqp1_but_never_uses_z_to_drive_the_map():
+    """eqp1 takes the one-shot's pathological-Z fallback; the map never
+    reads Z or eqp1."""
     body = _block("_write_sc_eqp_snapshot")
     assert "eqp1_iter" in body
     assert "e_eval + z_factor * (e_output - e_eval)" in body
+    assert "np.where(pathological_z_factor_mask(z_factor), e_output," in body
     assert "Z is output-only" in body
-    assert "pathological_z_factor_mask" not in body
     assert "z_factor_iter" not in body
+    assert body.count("eqp1_output") == 2  # its assignment and the writer
 
     clear = _block("_clear_sc_eqp_snapshots")
     assert "eqp1" in clear and "z_factor" in clear
 
     gw_output = open(os.path.join(_SRC, "gw", "gw_output.py"),
                      encoding="utf-8").read()
-    assert "guard_pathological_z=not results.self_consistent" in gw_output
+    assert "guard_pathological_z" not in gw_output
     assert "None if results.self_consistent else assembly.z_factor" in gw_output
 
     driver = _block("run_sc_driver")

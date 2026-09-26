@@ -433,7 +433,9 @@ Insulators keep `parallel_transport` and `dft_velocity`.
   names. `postprocess.rotate_wfn_to_qp` reapplies the stored ladder and table;
   it neither rebuilds the tail nor re-solves occupations.
 - **Per-map files are diagnostics, not restart state.** `eqp0_iterNNNN.dat`
-  and `eqp1_iterNNNN.dat` hold the map output. `rotation_iterNNNN.npy`
+  and `eqp1_iterNNNN.dat` hold the map output; eqp1 takes the one-shot's
+  fallback (eqp1 = eqp0 where Z is non-finite or outside $0 < Z \le 1$) and
+  is never read by the map. `rotation_iterNNNN.npy`
   (`sc_dump_dir`) is the map's input $U$. With
   `sigma_lorentz_debug_output = true`, four-current maps write
   `sigma_lorentz_iterNNNN.h5`: the CC, CT+TC and TT sectors in the map's input

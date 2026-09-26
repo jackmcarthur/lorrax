@@ -1727,14 +1727,9 @@ def write_results(
         e_eval_rel_ev=e_eval_rel_ev_irr,
         dE_ev=eqp_dE_ev,
         nspin=1,
-        # SC is an eqp0-type fixed-point map.  Its central-difference Z is
-        # output-only in the BGW-style eqp1 column; it must never select a
-        # fallback value or feed an iteration.
-        # SC map 0 is evaluated at E_DFT: it IS the one-shot and takes its guard.
-        guard_pathological_z=(
-            not results.self_consistent
-            or (e_eval_ev_irr is not None
-                and np.array_equal(e_eval_ev_irr, e_dft_ev_irr))),
+        # One pathological-Z rule on every route (eqp_bgw.compute_eqp_diag).
+        # SC's central-difference Z stays output-only: it moves only the
+        # BGW-style eqp1 column and never feeds an iteration.
         print_fn=print_fn,
     )
 

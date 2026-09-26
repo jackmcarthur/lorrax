@@ -437,7 +437,6 @@ def compute_eqp_diag(
 	# Both or neither; None ⇒ the historical at-DFT linearization.
 	sigma_c_at_eval_diag_ev: np.ndarray | None = None,  # (nk, nb)
 	e_eval_ev: np.ndarray | None = None,                # (nk, nb)
-	guard_pathological_z: bool = True,
 ) -> tuple[np.ndarray, np.ndarray]:
 	"""Return zeroth-order and Z-linearized BGW QP energies.
 
@@ -471,9 +470,9 @@ def compute_eqp_diag(
 	For dynamic modes (GN-PPM, HL-PPM, MPA) the caller obtains
 	``sigma_c_at_dft_diag_ev``, ``sigma_c_at_eval_diag_ev`` and
 	``z_factor`` from :func:`compute_z_factor_from_omega_grid`.
-	One-shot callers retain the historical state-local pathological-Z fallback.
-	Self-consistent output passes ``guard_pathological_z=False``: its raw
-	central-difference Z affects only the reported ``eqp1`` column and never
+	Every caller, one-shot and self-consistent, takes the state-local
+	pathological-Z fallback (eqp1 = eqp0 where Z is non-finite or outside
+	0 < Z <= 1).  Z affects only the reported ``eqp1`` column and never
 	changes, gates, or replaces an SC-map value.
 	"""
 	if (sigma_c_at_eval_diag_ev is None) != (e_eval_ev is None):
@@ -508,7 +507,7 @@ def compute_eqp_diag(
 			+ sigma_x_diag_ev + sigma_c_at_eval_diag_ev - e_eval_ev
 		).real
 		eqp1 = e_eval_ev + z_factor * delta_at_eval
-	if z_factor is not None and guard_pathological_z:
+	if z_factor is not None:
 		eqp1 = np.where(pathological_z_factor_mask(z_factor), eqp0, eqp1)
 	return eqp0, eqp1
 
@@ -588,7 +587,6 @@ def assemble_eqp(
 	hartree_scalar_diag_ev: np.ndarray | None = None,
 	hartree_transverse_diag_ev: np.ndarray | None = None,
 	mean_field_gate: bool = True,
-	guard_pathological_z: bool = True,
 	print_fn=print,
 ) -> EqpAssembly:
 	"""Assemble BGW QP energies from H₀ and Σ.  **One implementation.**
@@ -726,8 +724,7 @@ def assemble_eqp(
 			e_eval_ev = None
 
 	z_pathological = (
-		None if z_factor is None or not guard_pathological_z
-		else pathological_z_factor_mask(z_factor))
+		None if z_factor is None else pathological_z_factor_mask(z_factor))
 	if z_pathological is not None:
 		n_bad = int(np.count_nonzero(z_pathological))
 		finite = np.asarray(z_factor)[np.isfinite(z_factor)]
@@ -759,7 +756,6 @@ def assemble_eqp(
 		z_factor=z_factor,
 		sigma_c_at_eval_diag_ev=sigma_c_at_eval,
 		e_eval_ev=e_eval_ev,
-		guard_pathological_z=guard_pathological_z,
 	)
 	return EqpAssembly(
 		kpoints_irr_frac=np.asarray(kpoints_irr_frac, dtype=np.float64),
