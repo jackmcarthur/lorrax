@@ -1,6 +1,6 @@
 // kconv_outer_cuda_ffi.cc -- the k-convolution family's outer-product load (the BSE W term).
 //
-//   U[k,a,x,b,y] = s * FFT_k( IFFT_k T[.,a,x,b,y] * V[k,x,y] ),
+//   U[k,a,x,b,y] = s * FFT_k( IFFT_k T[.,a,x,b,y] * V[x,y,k] ),   V k-MINOR (the W_R tile as built)
 //   T[k,a,x,b,y] = sum_K L[k,a,x,K] * R[k,K,b,y]          (formed on the load, never stored)
 //                  (conj(R) with the attribute conj_r = 1: the BSE right leg is conj(psi_v),
 //                   read from psi_v itself, so no conjugated copy is made)
@@ -124,7 +124,7 @@ extern "C" __global__ void __launch_bounds__(LRX_THREADS, LRX_MINB) lrx_kconv_ou
     const long long pairs = g.na * g.nxb;
     // 32-bit offsets from per-tile 64-bit bases: every operand holds < 2^31 elements (the handler
     // checks), so only the bases need 64 bits -- fewer live registers at the 64-register cap.
-    const int kl = (int)(g.na * g.mx * KK), kv = (int)(g.mx * g.my), ku = (int)ucols;
+    const int kl = (int)(g.na * g.mx * KK), ku = (int)ucols;
     const int nbmy = (int)(g.nb * g.my), rkk = (int)rk;
     for (long long it = blockIdx.x; it < g.items; it += gridDim.x) {
         const long long grp = it % g.ngrp, yb_ = it / g.ngrp;
@@ -166,13 +166,15 @@ extern "C" __global__ void __launch_bounds__(LRX_THREADS, LRX_MINB) lrx_kconv_ou
             }
             __syncthreads();
             lrx_kbox::transform3<NX, NY, NZ, TR, LRX_SM, fft_direction::inverse>(bank);
-            // Mid: the stored kernel V[k, x, y] (R space), mode 2's KernMid.
-            const lrx_c2* vb = V + (long long)x0 * g.my + y0;
+            // Mid: the stored kernel V[x, y, k] (R space, k-MINOR: the caller's W_R tile as it is
+            // built, no transpose), mode 2's KernMid product.  k runs fastest across threads, so a
+            // warp reads 32 consecutive k of one (x, y) and walks one bank column.
+            const lrx_c2* vb = V + ((long long)x0 * g.my + y0) * NK;
             for (int i = threadIdx.x; i < TR * NK; i += blockDim.x) {
-                const int j = i % TR, k = i / TR, xi = j / YB, yi = j % YB;
+                const int k = i % NK, j = i / NK, xi = j / YB, yi = j % YB;
                 if (xi < xlim && yi < ylim) {
                     lrx_c2* e = bank + j * GK::RS + GK::at(k);
-                    *e = lrx_mul(*e, vb[k * kv + xi * (int)g.my + yi]);
+                    *e = lrx_mul(*e, vb[(xi * (int)g.my + yi) * NK + k]);
                 }
             }
             __syncthreads();
@@ -298,7 +300,7 @@ static ffi::Error build(int nkx, int nky, int nkz, int K, std::string_view mathd
     return ffi::Error::Success();
 }
 
-// L (nk, na, mx, K), R (nk, K, nb, my), V (nk, mx, my) -> U (nk, na, mx, nb, my), complex128.
+// L (nk, na, mx, K), R (nk, K, nb, my), V (mx, my, nk) -> U (nk, na, mx, nb, my), complex128.
 static ffi::Error KleadOuterConv(cudaStream_t stream, ffi::AnyBuffer L, ffi::AnyBuffer R, ffi::AnyBuffer V,
                                  ffi::Result<ffi::AnyBuffer> U, int64_t nkx, int64_t nky, int64_t nkz,
                                  double scale, int64_t conj_r, std::string_view mathdx_root,
@@ -316,11 +318,11 @@ static ffi::Error KleadOuterConv(cudaStream_t stream, ffi::AnyBuffer L, ffi::Any
     const int64_t nk = nkx * nky * nkz;
     auto ld = L.dimensions(), rd = R.dimensions(), vd = V.dimensions(), ud = U->dimensions();
     if (ld.size() != 4 || rd.size() != 4 || vd.size() != 3 || ud.size() != 5)
-        return bad("want L (nk,na,mx,K), R (nk,K,nb,my), V (nk,mx,my), U (nk,na,mx,nb,my)");
+        return bad("want L (nk,na,mx,K), R (nk,K,nb,my), V (mx,my,nk), U (nk,na,mx,nb,my)");
     const int64_t na = ld[1], mx = ld[2], K = ld[3], nb = rd[2], my = rd[3];
-    if (ld[0] != nk || rd[0] != nk || rd[1] != K || vd[0] != nk || vd[1] != mx || vd[2] != my ||
+    if (ld[0] != nk || rd[0] != nk || rd[1] != K || vd[0] != mx || vd[1] != my || vd[2] != nk ||
         ud[0] != nk || ud[1] != na || ud[2] != mx || ud[3] != nb || ud[4] != my)
-        return bad("want L (nk,na,mx,K), R (nk,K,nb,my), V (nk,mx,my), U (nk,na,mx,nb,my) with nk = nkx*nky*nkz");
+        return bad("want L (nk,na,mx,K), R (nk,K,nb,my), V (mx,my,nk), U (nk,na,mx,nb,my) with nk = nkx*nky*nkz");
     if (K < 4 || K % 4) {
         std::ostringstream os;
         os << "GATE mathdx-kconv-outer-rank: got K=" << K << "; want a positive multiple of 4 (the m8n8k4 "
@@ -370,7 +372,7 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(
         .Ctx<xla::ffi::PlatformStream<cudaStream_t>>()
         .Arg<xla::ffi::AnyBuffer>()   // L (nk, na, mx, K)
         .Arg<xla::ffi::AnyBuffer>()   // R (nk, K, nb, my)
-        .Arg<xla::ffi::AnyBuffer>()   // V (nk, mx, my), R space
+        .Arg<xla::ffi::AnyBuffer>()   // V (mx, my, nk), R space, k-minor
         .Ret<xla::ffi::AnyBuffer>()   // U (nk, na, mx, nb, my)
         .Attr<int64_t>("nkx")
         .Attr<int64_t>("nky")
