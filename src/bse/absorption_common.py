@@ -94,20 +94,142 @@ def exciton_dipole_projections(A, d_alpha):
     Returns
     -------
     (N, 3) complex128 — ⟨0|r̂_α|S⟩ per state, per polarisation.
+
+    DISTRIBUTED OPERANDS.  When ``A`` or ``d_alpha`` is a ``jax.Array`` (the
+    solver's eigenvectors, sharded over the transition axes) the same
+    contraction runs as one ``tensordot`` over the trailing axes: each rank
+    contracts its own (c, v, k) tile and one all-reduce of the (N, 3) result
+    follows.  Nothing is gathered, and the result stays a ``jax.Array``.
     """
-    A = np.asarray(A)
-    d_alpha = np.asarray(d_alpha)
+    if not (_is_jax_array(A) or _is_jax_array(d_alpha)):
+        A = np.asarray(A)
+        d_alpha = np.asarray(d_alpha)
     if A.shape[1:] != d_alpha.shape[1:]:
         raise ValueError(
             f"eigenvector transition axes {A.shape[1:]} do not match the "
             f"dipole's {d_alpha.shape[1:]}.  Both must be indexed over the "
             f"same (c, v, k) block in the same order; a transpose here is a "
             f"silently wrong oscillator strength, not a broadcast.")
+    if _is_jax_array(A) or _is_jax_array(d_alpha):
+        import jax.numpy as jnp
+        axes = tuple(range(1, A.ndim))
+        return jnp.tensordot(A, jnp.conj(d_alpha), axes=(axes, axes)
+                             ).astype(jnp.complex128)
     n_state = A.shape[0]
     n_trans = int(np.prod(A.shape[1:])) if A.ndim > 1 else 1
     return (A.reshape(n_state, n_trans)
             @ np.conj(d_alpha.reshape(d_alpha.shape[0], n_trans)).T
             ).astype(np.complex128)
+
+
+def _is_jax_array(x) -> bool:
+    """A ``jax.Array`` (or tracer), without importing jax for NumPy callers."""
+    return type(x).__module__.split(".")[0] in ("jax", "jaxlib")
+
+
+#: Share of TOTAL per-device memory one block of eigenvector rows may occupy
+#: while :func:`exciton_dipoles_distributed` contracts it.  Total, not free
+#: memory, for the reproducibility reason ``bse_nontda.dense_col_chunk`` gives:
+#: a block width read off ambient free memory changes run to run.
+_DIPOLE_BLOCK_BUDGET_FRAC = 0.05
+
+
+def exciton_dipoles_distributed(eigenvectors, d_block, n_states: int):
+    """⟨0|r̂_α|S⟩ for the first ``n_states`` rows of the solver's eigenvectors.
+
+    ``eigenvectors`` : ``(N, 1, nc_pad, nv_pad, nk)`` (TDA, as the BSE solves
+    return them) or ``(N, nc_pad, nv_pad, nk)``, a ``jax.Array`` sharded over
+    the transition axes.  ``d_block`` : ``(3, nc_pad, nv_pad, nk)``, the
+    ``build_dipole_vector_bse`` layout on the same transition axes (pad rows
+    are zero in both, so they add nothing).
+
+    The contraction is :func:`exciton_dipole_projections` applied to blocks of
+    states, a batched GEMM on each rank's (c, v, k) tile plus one (block, 3)
+    all-reduce per block, so no rank ever holds another rank's eigenvector
+    tile.  The block width comes from the per-device memory budget
+    (``_DIPOLE_BLOCK_BUDGET_FRAC`` of total device memory over the local bytes
+    of one state), the existing BSE path's sizing rule.  Every process must
+    call this (the slices and the reduction are global computations); every
+    process returns the same host ``(n_states, 3)`` complex128 array.
+    """
+    import jax
+    import jax.numpy as jnp
+    from jax.sharding import NamedSharding, PartitionSpec as P
+
+    from common.collectives import gather_to_host
+    from common.gpu_utils import get_device_memory_info
+
+    tda_axis = eigenvectors.ndim == 5
+    if tda_axis and int(eigenvectors.shape[1]) != 1:
+        raise NotImplementedError(
+            "exciton dipoles are TDA-only: the full-BSE oscillator strength "
+            "needs both halves of the paired vector (see load_eigenvectors_h5)")
+    n_states = int(n_states)
+    sharding = eigenvectors.sharding
+    local = sharding.shard_shape(eigenvectors.shape)
+    per_state = 16 * int(np.prod(local[1:]))
+    budget = (float(get_device_memory_info().get("total_gb") or 8.0) * 1e9
+              * _DIPOLE_BLOCK_BUDGET_FRAC)
+    block = int(min(max(n_states, 1), max(1, budget // per_state)))
+    if isinstance(sharding, NamedSharding):
+        # The dipole takes the eigenvectors' transition layout, so each rank
+        # contracts the (c, v, k) tile it already holds.
+        spec = tuple(sharding.spec) + (None,) * (
+            eigenvectors.ndim - len(sharding.spec))
+        d_sharding = NamedSharding(sharding.mesh, P(None, *spec[-3:]))
+        out_sharding = NamedSharding(sharding.mesh, P())
+    else:
+        d_sharding = out_sharding = sharding
+
+    def _block(i0, size):
+        # The block is sliced INSIDE the program, so no copy of the whole
+        # stack is ever made; one compile per distinct (i0, size).
+        def contract(A, d):
+            A = jax.lax.slice_in_dim(A, i0, i0 + size, axis=0)
+            return exciton_dipole_projections(A[:, 0] if tda_axis else A, d)
+        return jax.jit(contract, in_shardings=(sharding, d_sharding),
+                       out_shardings=out_sharding)
+
+    d_block = jnp.asarray(d_block)
+    out = np.zeros((n_states, int(d_block.shape[0])), np.complex128)
+    for i0 in range(0, n_states, block):
+        size = min(block, n_states - i0)
+        out[i0:i0 + size] = gather_to_host(
+            _block(i0, size)(eigenvectors, d_block))
+    return out
+
+
+def eps2_from_exciton_dipoles(omegas_Ry, energies_Ry, dipoles, eta_Ry,
+                              V_cell, n_k, n_spin, n_spinor):
+    """Sum-over-states ε₂(ω), ``(n_omega, 3)``, from saved per-state dipoles.
+
+    ``ε₂^α(ω) = 16π²/(V·N_k·n_spin·n_spinor) · Σ_S |⟨0|r̂_α|S⟩|² L_η(ω − E_S)``
+    with the Lorentzian of :func:`lorentzian_broaden`: the prefactor and the
+    broadening ``absorption_haydock`` uses, so over the states it includes this
+    is the Haydock resolvent's spectrum state by state.  States above the last
+    one saved are absent: below ``E_N`` their tails add at most
+    ``pref · W_missing · L_η(E_N − ω)``.
+    """
+    pref = 16.0 * np.pi ** 2 / (V_cell * n_k * n_spin * n_spinor)
+    weights = np.abs(np.asarray(dipoles)) ** 2
+    return pref * lorentzian_broaden(omegas_Ry, np.asarray(energies_Ry),
+                                     weights, eta_Ry)
+
+
+def load_exciton_dipoles_h5(path: str | Path):
+    """Eigenvalues (Ry) and per-state dipoles ``(N, 3)`` from eigenvectors.h5.
+
+    Reads ``exciton_data/dipoles`` (a LORRAX extension of the BGW file,
+    ``bse/eigenvectors.h5.spec``) without touching the eigenvectors.
+    """
+    with h5py.File(str(path), "r") as f:
+        if "dipoles" not in f["exciton_data"]:
+            raise KeyError(
+                f"{path!s} has no exciton_data/dipoles: it was written without "
+                f"--dipole (bse.bse_jax), or by BerkeleyGW")
+        eig_eV = np.asarray(f["exciton_data/eigenvalues"][()], dtype=np.float64)
+        raw = np.asarray(f["exciton_data/dipoles"][0])        # (N, 3, 2)
+    return eig_eV / RYD2EV, raw[..., 0] + 1j * raw[..., 1]
 
 
 def load_eigenvectors_h5(path: str | Path):
@@ -357,7 +479,10 @@ def write_absorption_h5(
 __all__ = [
     "RYD2EV",
     "exciton_dipole_projections",
+    "exciton_dipoles_distributed",
+    "eps2_from_exciton_dipoles",
     "load_eigenvectors_h5",
+    "load_exciton_dipoles_h5",
     "slice_dipole_to_bse_window",
     "build_dipole_vector_bse",
     "lorentzian_broaden",

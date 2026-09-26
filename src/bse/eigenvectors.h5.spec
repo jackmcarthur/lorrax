@@ -171,3 +171,24 @@ Content: All the arrays
 	Value: The electron-hole coefficients, that is, the left BSE
 	eigenvectors Bvc with negative eigenvalues. This array is used when TDA
 	is false.
+
+	Dataset: dipoles
+	Type: double
+	Rank: 3 or 4
+	Dims(1): 2 (if flavor==2). Otherwise, this dimension is suppressed.
+	Dims(2): 3
+	Dims(3): nevecs
+	Dims(4): nQ
+	Value: LORRAX extension, written by bse.bse_jax --write-eigs --dipole
+	(TDA only); BerkeleyGW readers ignore it. The per-state exciton dipole
+	<0|r_alpha|S> = sum_t A^S_t conj(d^alpha_t), alpha = x, y, z Cartesian,
+	with d^alpha_t = <ck|v_alpha|vk> / (E_ck - E_vk) from dipole.h5
+	(psp.get_dipole_mtxels, the same table absorption_haydock seeds from).
+	Units: bohr. The velocity is in Rydberg atomic units, so d = i<ck|r|vk>
+	and the stored number is -i<0|r|S>; the modulus, which is all eps2
+	reads, is exact. Contracted over the solver's window (pad rows are zero)
+	by absorption_common.exciton_dipoles_distributed, the one contraction
+	absorption_common.exciton_dipole_projections defines. Read with
+	absorption_common.load_exciton_dipoles_h5; the sum-over-states eps2 is
+	absorption_common.eps2_from_exciton_dipoles (Haydock's prefactor and
+	Lorentzian).

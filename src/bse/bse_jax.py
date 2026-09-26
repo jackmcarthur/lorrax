@@ -51,6 +51,7 @@ __all__ = [
 _STAGES = (
     ("restart input", "bse.load"),
     ("BSE eigensolve", "bse.eigensolve"),
+    ("exciton dipoles", "bse.exciton_dipoles"),
     ("eigenvector write", "bse.write_eigenvectors"),
 )
 
@@ -61,6 +62,7 @@ def _preview_lanczos(
     n_cond: int,
     n_eig: int = 5,
     write_eigs: int | None = None,
+    dipole_file: str | None = None,
     max_lanczos_iter: int | None = None,
     include_W: bool = True,
     eqp_file: str | None = None,
@@ -116,7 +118,7 @@ def _preview_lanczos(
             # loader-CLAMPED band counts (data['n_val']/data['n_cond']), not the
             # raw CLI n_val/n_cond, so an over-request can't slice out of bounds.
             from .bse_io import apply_eqp_and_reslice_bands
-            data["eps_v"], data["eps_c"], _ = apply_eqp_and_reslice_bands(
+            data["eps_v"], data["eps_c"], n_occ_eqp = apply_eqp_and_reslice_bands(
                 restart_file, eqp_file, input_file,
                 int(data["n_val"]), int(data["n_cond"]), n_occ, grid_x,
                 grid_y, degeneracy_mode=degeneracy_mode,
@@ -211,6 +213,29 @@ def _preview_lanczos(
 
     if write_eigs is not None:
         n_write = n_eig if write_eigs < 0 else min(write_eigs, n_eig)
+        dipoles = None
+        if dipole_file is not None:
+            # ⟨0|r̂_α|S⟩ per written state: the dipole.h5 Haydock seeds from
+            # (``psp.get_dipole_mtxels``), sliced to the RESOLVED window with the
+            # n_occ the loader and ``--eqp`` settled on, contracted against the
+            # solve's distributed eigenvectors in state blocks (no gather).
+            from file_io.restart_bundle import load_dipole_h5, read_metadata
+            from .absorption_common import (build_dipole_vector_bse,
+                                            exciton_dipoles_distributed,
+                                            slice_dipole_to_bse_window)
+            from .bse_io import resolve_n_occ
+            n_occ_dip = (n_occ_eqp if eqp_file is not None else resolve_n_occ(
+                read_metadata(restart_file)["energies"], n_occ=n_occ,
+                input_file=input_file))
+            with timing.section("bse.exciton_dipoles", announce=True):
+                dipole_cart, deltaE, _ = load_dipole_h5(dipole_file)
+                d_alpha, _ = slice_dipole_to_bse_window(
+                    dipole_cart, deltaE, n_occ_dip, n_val_eff, n_cond_eff)
+                del dipole_cart, deltaE
+                dipoles = exciton_dipoles_distributed(
+                    eigenvectors, build_dipole_vector_bse(
+                        d_alpha, n_cond_pad=nc_pad, n_val_pad=nv_pad),
+                    n_write)
         with timing.section("bse.write_eigenvectors", announce=True):
             write_eigenvectors_stream(
                 "eigenvectors.h5",
@@ -223,6 +248,7 @@ def _preview_lanczos(
                 nkz,
                 n_write,
                 use_tda=tda,
+                dipoles=dipoles,
             )
 
     if stage_progress is not None:
@@ -317,6 +343,12 @@ def build_parser():
         type=int,
         help="Write eigenvectors.h5 (optional N, default: n-eig).",
     )
+    parser.add_argument(
+        "--dipole", default=None, metavar="DIPOLE_H5",
+        help="with --write-eigs (TDA): contract each written state against "
+             "this dipole.h5 (psp.get_dipole_mtxels, the file "
+             "absorption_haydock reads) and store <0|r|S> as "
+             "exciton_data/dipoles in eigenvectors.h5")
     parser.add_argument(
         "--report-file", default=None,
         help="human-readable Lanczos report (default: bse.out)")
@@ -458,7 +490,7 @@ _ROUTE_DESTS = {
         "lanczos_rtol", "lanczos_check_every", "n_reorth", "solver",
         "davidson_precond", "davidson_olsen", "davidson_eps_shift",
         "davidson_m_max", "trlan_m_max", "trlan_n_keep", "eqp", "n_occ",
-        "band_degeneracy", "degeneracy_tol_ry"},
+        "band_degeneracy", "degeneracy_tol_ry", "dipole"},
 }
 
 
@@ -487,6 +519,11 @@ def parse_args(argv=None):
             f"that reads {'it' if len(ignored) == 1 else 'them'} (--lanczos "
             f"for the eigensolve with QP energies and eigenvectors, "
             f"--kpm-dos for the density of states, neither for FEAST)")
+    if args.dipole is not None and (args.write_eigs is None or not args.tda):
+        parser.error("--dipole stores per-state dipoles beside the written "
+                     "eigenvectors: it needs --write-eigs and --tda (the "
+                     "full-BSE oscillator strength needs both halves of the "
+                     "paired vector)")
     return route, args
 
 
@@ -571,6 +608,7 @@ def main(argv=None) -> int:
                 args.solver, ("lanczos", "davidson", "trlan")),
             "Eigenvectors   : " + (
                 "written to a separate numerical artifact"
+                + (" with per-state dipoles <0|r|S>" if args.dipole else "")
                 if args.write_eigs is not None else "not requested"),
         ))
         report.sampling(wfn=wfn, sym=sym)
@@ -585,6 +623,7 @@ def main(argv=None) -> int:
             args.n_cond,
             n_eig=args.n_eig,
             write_eigs=args.write_eigs,
+            dipole_file=args.dipole,
             max_lanczos_iter=args.max_lanczos_iter,
             include_W=not (args.rpa or not args.bse),
             eqp_file=args.eqp,

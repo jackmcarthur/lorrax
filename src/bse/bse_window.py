@@ -169,6 +169,7 @@ def write_eigenvectors_stream(
     nkz: int,
     n_write: int,
     use_tda: bool = True,
+    dipoles: Optional[np.ndarray] = None,
 ) -> None:
     # ── WHICH WINDOW DOES THIS FILE DESCRIBE? ─────────────────────────────
     # The LOGICAL one the loader RESOLVED (``data['n_val']``/``data['n_cond']``).
@@ -214,7 +215,19 @@ def write_eigenvectors_stream(
     # dataset, so both components are persisted.  BGW eigenvectors.h5 stores
     # eigenvalues in eV (BSE/diag.f90's write path; ``eigenvalues.dat``'s
     # header says "eig (eV)") and our solvers return Ry — convert here.
+    #
+    # ``dipoles`` (optional, TDA only): the host ``(n_write, 3)`` per-state
+    # ⟨0|r̂_α|S⟩ from ``absorption_common.exciton_dipoles_distributed``, written
+    # beside the eigenvectors as ``exciton_data/dipoles`` (1, n_write, 3, 2) —
+    # a LORRAX extension BGW readers ignore (``eigenvectors.h5.spec``).
     RYD2EV = 13.6056980659
+    if dipoles is not None:
+        dipoles = np.asarray(dipoles)
+        if not use_tda or dipoles.shape != (int(n_write), 3):
+            raise ValueError(
+                f"write_eigenvectors_stream: dipoles must be the TDA per-state "
+                f"(n_write, 3) = ({int(n_write)}, 3) array; got shape "
+                f"{dipoles.shape} with use_tda={use_tda}")
     # ``gather_to_host``, not ``device_get``: see the ONE-writer note below for
     # why this writer must not assume any particular solver's sharding.  On the
     # replicated Lanczos arrays and on Davidson's already-host eigenvalues the
@@ -386,8 +399,14 @@ def write_eigenvectors_stream(
                 coupling_dset[0, i, :, :, :, :, 0] = re
                 coupling_dset[0, i, :, :, :, :, 1] = im
 
+        if dipoles is not None:
+            exciton_data.create_dataset(
+                "dipoles",
+                data=np.stack([dipoles.real, dipoles.imag], axis=-1)[None])
+
     print(f"Wrote {n_write} eigenvectors to {output_file}"
-          + ("" if use_tda else " (+ coupling Y)"))
+          + ("" if use_tda else " (+ coupling Y)")
+          + ("" if dipoles is None else " (+ per-state dipoles)"))
 
 
 
