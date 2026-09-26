@@ -534,6 +534,7 @@ if(LORRAX_CUFFT_ON)
     # is no embedded cubin to extract.
     add_library(build_kconv_mathdx_cuda OBJECT
         cufft/kconv_mathdx_cuda_ffi.cc
+        cufft/kconv_outer_cuda_ffi.cc
         common/nvrtc_build.cc)
     set_target_properties(build_kconv_mathdx_cuda PROPERTIES
         POSITION_INDEPENDENT_CODE ON)
