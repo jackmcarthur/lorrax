@@ -52,7 +52,8 @@ class PlaneWaveSystem:
     psi_full: object          # SphereSet: ψ sphere at every full-grid k (C order)
     psi_par: object           # SphereSet: ψ sphere at the k-parents
     plan: object              # the typed-transport tables (SphereTransport.typed, build_G_parents)
-    psi: np.ndarray           # (n_par, nb, ns, width) ψ(G) at the parents, unit norm
+    psi_nmu: object           # (n_par, nb_pad, ns, ngkmax) ψ(G) at the parents, P(None,'x',None,'y')
+    width: int                # one slot width for every sphere (the ngkmax the carrier pads)
     enk: np.ndarray           # (n_par, nb) Ry
     ecut: float               # max |k+G|² of the ψ spheres (Ry)
     ns: int
@@ -65,10 +66,11 @@ def _pad_width(g, width):
 
 def open_plane_wave_system(wfn_path: str, mesh, *, nb: int) -> PlaneWaveSystem:
     """Read ψ(G), E and the symmetry tables once (the loader's own doors)."""
+    from jax.sharding import PartitionSpec as P
     from file_io import WfnLoader
     from vcoul import CoulombGeometry
     from .mixed_basis_pair_convolution import SphereSet
-    with WfnLoader(wfn_path, backend="eager") as w:
+    with WfnLoader(wfn_path, mesh=mesh) as w:
         sym = w.symmetry()
         kgrid = tuple(int(v) for v in w.kgrid)
         box = tuple(int(v) for v in w.fft_grid)
@@ -77,7 +79,13 @@ def open_plane_wave_system(wfn_path: str, mesh, *, nb: int) -> PlaneWaveSystem:
         gf, nf = np.asarray(w.gvecs(k="full_bz")), np.asarray(w.ngk_valid(k="full_bz"))
         kp = np.asarray(w.kvecs(k=sym.parent_k_domain))
         gp, npar = np.asarray(w.gvecs(k=sym.parent_k_domain)), np.asarray(w.ngk_valid(k=sym.parent_k_domain))
-        psi = np.asarray(w.load(bands=(0, int(nb)), k=sym.parent_k_domain))[:, :int(nb)]
+        # the sharded loader lands ψ(G) directly in the ψ_nmu face layout (zero pad slots); the
+        # band window is read to a multiple of the ranks (the phdf5 build refuses an explicit
+        # spec otherwise); bands past ``nb`` carry zero weight in every Green
+        n_load = -(-int(nb) // int(mesh.size)) * int(mesh.size)
+        if n_load > int(w.nbands):
+            raise ValueError(f"plane_wave_pipeline: nb={nb} rounds to {n_load} > the WFN's {w.nbands} bands")
+        psi_nmu = w.load(bands=(0, n_load), k=sym.parent_k_domain, sharding=P(None, "x", None, "y"))
         ns = int(w.nspinor)
         if sym.parent_k_domain != "ibz":
             raise ValueError(f"plane_wave_pipeline: parent_k_domain {sym.parent_k_domain!r}; want 'ibz'")
@@ -85,9 +93,8 @@ def open_plane_wave_system(wfn_path: str, mesh, *, nb: int) -> PlaneWaveSystem:
         enk = e_all[:, :int(nb)]
         cut_gap = (float(np.min(e_all[:, int(nb)] - e_all[:, int(nb) - 1]))
                    if e_all.shape[1] > int(nb) else float("inf"))
-    width = max(gf.shape[1], gp.shape[1], psi.shape[-1])
+    width = max(gf.shape[1], gp.shape[1], int(psi_nmu.shape[-1]))
     gf, gp = _pad_width(gf, width), _pad_width(gp, width)
-    psi = np.pad(psi, ((0, 0), (0, 0), (0, 0), (0, width - psi.shape[-1])))
     bvec = np.asarray(geom.bvec, np.float64)
     ecut = max(float(np.max(np.sum(((kf[i][None] + gf[i, :nf[i]]) @ bvec) ** 2, axis=1)))
                for i in range(len(nf)))
@@ -102,7 +109,7 @@ def open_plane_wave_system(wfn_path: str, mesh, *, nb: int) -> PlaneWaveSystem:
                            mesh_xy=mesh, n_full=len(sidx))
     return PlaneWaveSystem(sym=sym, kgrid=kgrid, fft_grid=box, geometry=geom,
                            psi_full=SphereSet(gf, nf, kf), psi_par=SphereSet(gp, npar, kp),
-                           plan=plan, psi=psi, enk=enk, ecut=ecut, ns=ns, cut_gap=cut_gap)
+                           plan=plan, psi_nmu=psi_nmu, width=width, enk=enk, ecut=ecut, ns=ns, cut_gap=cut_gap)
 
 
 class PlaneWaveGW:
@@ -124,19 +131,19 @@ class PlaneWaveGW:
         s = system
         self.mesh, self.s, self.nval = mesh, s, int(nval)
         self.P = int(mesh.shape["x"]) * int(mesh.shape["y"])
-        n_par, nb, ns, width = s.psi.shape
+        n_par, nb_c, ns, ngk = (int(v) for v in s.psi_nmu.shape)
+        nb, width = int(s.enk.shape[1]), s.width
         box, bvec = s.fft_grid, np.asarray(s.geometry.bvec, np.float64)
         self.n_r = int(np.prod(box))
         self.omega_cell = float(s.geometry.cell_volume)
         # ---- ψ(G) in the r_μ face arrays: μ is the sphere slot, one carrier for every k
         self.M = int(padded_axis(width, self.P, name="psi sphere slots").carrier)
-        self.nb_c = int(padded_axis(nb, self.P, name="bands").carrier)
-        x = np.zeros((n_par, self.nb_c, ns, self.M), np.complex128)
-        x[:, :nb, :, :width] = s.psi
+        self.nb_c, self.n_par = nb_c, n_par
         nmu = NamedSharding(mesh, P(None, "x", None, "y"))
         mun = NamedSharding(mesh, P(None, None, "x", "y"))
-        psi_nmu = jax.device_put(x, nmu)
-        psi_mun = jax.device_put(np.ascontiguousarray(np.transpose(x, (0, 2, 3, 1))), mun)
+        psi_nmu = jax.jit(lambda a: jnp.pad(a, ((0, 0), (0, 0), (0, 0), (0, self.M - ngk))),
+                          out_shardings=nmu)(s.psi_nmu)
+        psi_mun = jax.jit(lambda a: jnp.transpose(a, (0, 2, 3, 1)), out_shardings=mun)(psi_nmu)
         # the parent carrier's roles (gw.wavefunction_bundle.parent_sigma_operands): ψ_mun is the
         # direct operand of the G builder, ψ_nmu the conjugated one and the projection face
         self.enk = np.zeros((n_par, self.nb_c))
@@ -192,7 +199,7 @@ class PlaneWaveGW:
         """G_k(p, p') at the parents with band weights ``(n_par, nb)``: the G builder, unchanged."""
         import jax.numpy as jnp
         from .greens_function_kernel import build_G_parents
-        w = np.zeros((self.s.psi.shape[0], self.nb_c))
+        w = np.zeros((self.n_par, self.nb_c))
         w[:, :self.nb] = weights
         return build_G_parents(self.carrier.psi_mun, self.carrier.psi_nmu, phases=jnp.asarray(w),
                                layout="face", gemm=self._gemm, k_unfold_plan=self.s.plan,
@@ -211,6 +218,7 @@ class PlaneWaveGW:
         """χ_q(G, G'; iω_j) at the k-parent q rows, ``(n_z, n_par, M_χ, M_χ)``; the rule per
         sample is ``minimax_screening``'s (ω = 0: 1/x; else x/(x² + ω²))."""
         import jax
+        import jax.numpy as jnp
         from jax.sharding import NamedSharding, PartitionSpec as P
         from .minimax_screening import (solve_laplace_minimax_imag_interval,
                                         solve_laplace_minimax_interval)
@@ -219,8 +227,8 @@ class PlaneWaveGW:
         cond = np.arange(self.nb) >= self.nval
         n_z = len(omegas_ry)
         Mc = int(self.screen.M)
-        acc = jax.device_put(np.zeros((n_z, self.w_par.n, Mc, Mc), np.complex128),
-                             NamedSharding(self.mesh, P(None, None, "x", "y")))
+        acc = jax.jit(lambda: jnp.zeros((n_z, self.w_par.n, Mc, Mc), jnp.complex128),
+                      out_shardings=NamedSharding(self.mesh, P(None, None, "x", "y")))()
         self.rules = []
         for j, om in enumerate(omegas_ry):
             rule = (solve_laplace_minimax_interval(self.x_min, self.x_max, target_error=target_error)
@@ -254,8 +262,8 @@ class PlaneWaveGW:
         import jax.numpy as jnp
         from jax.sharding import NamedSharding, PartitionSpec as P
         v = self.screen.v.astype(np.complex128)                           # (n_par, M_χ), Γ head 0
-        V = jax.device_put(v[:, :, None] * np.eye(v.shape[1])[None],
-                           NamedSharding(self.mesh, P(None, "x", "y")))
+        V = jax.jit(lambda a: a[:, :, None] * jnp.eye(a.shape[1], dtype=a.dtype)[None],
+                    out_shardings=NamedSharding(self.mesh, P(None, "x", "y")))(jnp.asarray(v))
         Gocc = self._timed("green", self.green,
                            np.broadcast_to((np.arange(self.nb) < self.nval).astype(float),
                                            self.s.enk.shape))
@@ -292,18 +300,16 @@ def main(argv=None):
     ap.add_argument("--out", required=True)
     args = ap.parse_args(argv)
     import jax
-    from jax.sharding import Mesh
-    n = len(jax.devices())
-    px = int(np.sqrt(n))
-    mesh = Mesh(np.asarray(jax.devices()).reshape(px, n // px), ("x", "y"))
+    from common.collectives import prepare_mesh
+    mesh = prepare_mesh(print_fn=lambda *a, **k: None)
     say = (lambda *a: print("[pw-pipeline]", *a, flush=True)) if jax.process_index() == 0 else (lambda *a: None)
     t0 = time.perf_counter()
     system = open_plane_wave_system(args.wfn, mesh, nb=args.nb)
     t_read = time.perf_counter() - t0
     gw = PlaneWaveGW(mesh, system, nval=args.nval,
                      screened_coulomb_cutoff=args.screened_coulomb_cutoff, wedge=args.wedge)
-    say(f"system: kgrid {system.kgrid}, box {system.fft_grid} (N_r {gw.n_r}), n_par {system.psi.shape[0]}, "
-        f"nb {gw.nb}, ns {gw.ns}, ψ width {system.psi.shape[-1]} (carrier {gw.M}), χ sphere "
+    say(f"system: kgrid {system.kgrid}, box {system.fft_grid} (N_r {gw.n_r}), n_par {gw.n_par}, "
+        f"nb {gw.nb}, ns {gw.ns}, ψ width {system.width} (carrier {gw.M}), χ sphere "
         f"{gw.w_par.width} (carrier {gw.screen.M}), gap {gw.x_min * _RY_EV:.4f} eV, band-cut gap "
         f"{system.cut_gap * _RY_EV:.4f} eV; "
         f"read {t_read:.1f} s, plans {gw.t_plans:.1f} s")
@@ -325,7 +331,7 @@ def main(argv=None):
     walls = {k: dict(n=len(v), total_s=float(np.sum(v)), warm_s=float(np.min(v[1:] if len(v) > 1 else v)))
              for k, v in gw.walls.items()}
     res = dict(kgrid=system.kgrid, fft_grid=system.fft_grid, n_r=gw.n_r, P=gw.P, nb=gw.nb, nval=gw.nval,
-               psi_width=int(system.psi.shape[-1]), psi_carrier=gw.M, chi_width=int(gw.w_par.width),
+               psi_width=int(system.width), psi_carrier=gw.M, chi_width=int(gw.w_par.width),
                chi_carrier=int(gw.screen.M), kpar_frac=system.psi_par.frac.tolist(),
                q_cart_norm=np.linalg.norm(qc, axis=1).tolist(),
                enk_ev=(system.enk * _RY_EV).tolist(), cut_gap_ev=system.cut_gap * _RY_EV, sigx_ev=(sigx * _RY_EV).tolist(),
