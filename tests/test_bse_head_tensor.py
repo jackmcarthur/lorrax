@@ -2,8 +2,8 @@
 
 ``K^head_{t,t'} = (1/N_k) conj(d_a(t)) M_ab d_b(t')`` is rank three over the
 transition index and never enters the μ basis (``LT_HEAD_PROBLEM.md`` §6).  The
-matvec adds it as the SAME contraction as the exchange term with ``(M_Y, V_q0,
-M_X)`` replaced by ``(D_head, M_head, D_head)``, which means the conjugation
+matvec adds it as the SAME contraction as the exchange term with ``(M, V_q0,
+M)`` replaced by ``(D_head, M_head, D_head)``, which means the conjugation
 convention has to match the exchange term's exactly — and the exchange term's
 conjugation is the one the tree has already had to fix once (``K^x = M V M†``:
 conjugated vertex on the encode leg).

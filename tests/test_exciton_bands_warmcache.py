@@ -146,14 +146,13 @@ def _unsunk_twin(mesh):
                    psi_v_X, psi_v_Y, eps_v, W_R):
         def body(carry, xs):
             psi_c_X, psi_c_Y, eps_c, V = xs
-            M_X = compute_pair_amplitude(psi_c_X, psi_v_X)
-            M_Y = compute_pair_amplitude(psi_c_Y, psi_v_Y)
+            M = compute_pair_amplitude(psi_c_X, psi_v_X)
 
             def matvec_block(Vb):
                 X = Vb.reshape(2, NC, NV, nk)
                 X = lax.with_sharding_constraint(X, sh.X)
                 HX = matvec(X, psi_c_X, psi_c_Y, psi_v_X, psi_v_Y,
-                            eps_c, eps_v, W_R, V, M_X, M_Y)
+                            eps_c, eps_v, W_R, V, M)
                 return HX.reshape(2, -1)
 
             evs, _ = block_lanczos_eig_jit(

@@ -63,7 +63,7 @@ Square mesh `('x','y')`; shardings from `bse_ring_comm.make_bse_shardings`.
 |---|---|---|
 | trial block `X` | `(n_trials, n_c, n_v, N_k)` | `P(None, 'x', 'y', None)` |
 | `psi_c_X` / `psi_v_Y` | `(N_k, n_c, n_s, N_μ)` / `(N_k, n_v, n_s, N_μ)` | μ on `'x'` / ν on `'y'` |
-| `M_X` / `M_Y` | `(N_k, n_c, n_v, N_μ)` | μ on `'x'` / ν on `'y'` |
+| `M` (exchange pair amplitude) | `(N_k, n_c, n_v, N_μ)` | `P(None, 'x', 'y', None)`: transitions tiled like `X`, μ whole (1/P) |
 | `V_q0` | `(N_μ, N_μ)` | `P('x', 'y')` |
 | `W_R` | `(N_μ, N_μ, n_kx, n_ky, n_kz)` | `P('x', 'y', None, None, None)` |
 | `eps_c`, `eps_v` | `(N_k, n_c)`, `(N_k, n_v)` | replicated |

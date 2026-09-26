@@ -81,7 +81,7 @@ def test_fold_matches_main(bse_dense_state, kernel):
         Xs = jax.lax.with_sharding_constraint(X, sh.X)
         args = (arr["psi_c_X"], arr["psi_c_Y"], arr["psi_v_X"], arr["psi_v_Y"],
                 data["eps_c"], data["eps_v"], arr["W_R"], arr["V_q0"],
-                arr["M_X"], arr["M_Y"])
+                arr["M"])
         got = np.asarray(build_fold(mesh, nkx, nky, nkz, kernel=kernel)(Xs, *args))
         ref = np.asarray(base.build_bse_stack_matvec(
             mesh, nkx, nky, nkz, kernel=kernel)(Xs, *args))

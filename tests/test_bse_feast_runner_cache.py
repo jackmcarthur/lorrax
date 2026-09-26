@@ -58,7 +58,7 @@ from bse import bse_feast as BF  # noqa: E402
 
 # The exact ten keys matvec_operands() reads, in its positional order.
 _OPERAND_KEYS = ("psi_c_X", "psi_c_Y", "psi_v_X", "psi_v_Y",
-                 "eps_c", "eps_v", "W_R", "V_q0", "M_X", "M_Y")
+                 "eps_c", "eps_v", "W_R", "V_q0", "M")
 
 # Runner knobs, held FIXED across every operator below: that is the point.
 # Under the old key these scalars WERE the key, so every call below collided
@@ -71,7 +71,7 @@ def _make_matvec(scale: float):
     """A distinct callable object per call -- a distinct ``id()``, exactly as
     the two drivers' ``build_bse_*_matvec`` factories produce."""
     def matvec(x, psi_c_X, psi_c_Y, psi_v_X, psi_v_Y,
-               eps_c, eps_v, W_R, V_q0, M_X, M_Y):
+               eps_c, eps_v, W_R, V_q0, M):
         # Diagonal, and it READS an operand, so both halves of the key matter.
         return jnp.asarray(scale, dtype=x.dtype) * psi_c_X * x
     return matvec

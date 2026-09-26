@@ -162,11 +162,10 @@ def _matvec(data, X):
         Vq = jax.lax.with_sharding_constraint(jnp.asarray(data["V_q0"]), sh.V)
         Xs = jax.lax.with_sharding_constraint(jnp.asarray(X), sh.X)
         W_R = jnp.fft.ifftn(Wq, axes=(2, 3, 4), norm="ortho")
-        M_X = jax.lax.with_sharding_constraint(compute_pair_amplitude(pcx, pvx), sh.psi_x)
-        M_Y = jax.lax.with_sharding_constraint(compute_pair_amplitude(pcy, pvy), sh.psi_y)
+        M = jax.lax.with_sharding_constraint(compute_pair_amplitude(pcx, pvx), sh.M)
         mv = build_bse_stack_matvec(mesh, NK, 1, 1)
         out = mv(Xs, pcx, pcy, pvx, pvy, jnp.asarray(data["eps_c"]),
-                 jnp.asarray(data["eps_v"]), W_R, Vq, M_X, M_Y)
+                 jnp.asarray(data["eps_v"]), W_R, Vq, M)
         out.block_until_ready()
     return out
 

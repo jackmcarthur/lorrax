@@ -364,10 +364,8 @@ def _worker() -> int:
         d["ev"] = jax.device_put(eps_v, sh.eps)
         d["Wd"] = jax.device_put(W_R, sh.W)
         d["Vd"] = jax.device_put(V_q0, sh.V)
-        d["M_X"] = jax.jit(compute_pair_amplitude,
-                           out_shardings=sh.psi_x)(d["pcx"], d["pvx"])
-        d["M_Y"] = jax.jit(compute_pair_amplitude,
-                           out_shardings=sh.psi_y)(d["pcy"], d["pvy"])
+        d["M"] = jax.jit(compute_pair_amplitude,
+                         out_shardings=sh.M)(d["pcx"], d["pvx"])
         return d
 
     def ring_blocks(px, py, *, low_mem):
@@ -385,11 +383,11 @@ def _worker() -> int:
                 if incW:
                     A[:, j0:j0 + NCOL] = np.asarray(jax.device_get(apA(
                         col, d["pcx"], d["pcy"], d["pvx"], d["pvy"],
-                        d["ec"], d["ev"], d["Wd"], d["Vd"], d["M_X"]))
+                        d["ec"], d["ev"], d["Wd"], d["Vd"], d["M"]))
                     ).reshape(NCOL, -1).T
                 B[:, j0:j0 + NCOL] = np.asarray(jax.device_get(apB(
                     col, d["pcx"], d["pcy"], d["pvx"], d["pvy"],
-                    d["Wd"], d["Vd"], d["M_X"]))).reshape(NCOL, -1).T
+                    d["Wd"], d["Vd"], d["M"]))).reshape(NCOL, -1).T
             if incW:
                 out["A"] = A
             out[f"B_{tag}"] = B
@@ -409,7 +407,7 @@ def _worker() -> int:
                     col = jax.device_put(
                         eye[j0:j0 + NCOL].reshape(-1, NC, NV, NK), sh.X)
                     args = (d["pcx"], d["pcy"], d["pvx"], d["pvy"], d["ec"],
-                            d["ev"], d["Wd"], d["Vd"], d["M_X"], d["M_Y"])
+                            d["ev"], d["Wd"], d["Vd"], d["M"])
                     r0 = pair(col, jnp.asarray(0.0), *args)
                     r1 = pair(col, jnp.asarray(1.0), *args)
                     A[:, j0:j0 + NCOL] = np.asarray(

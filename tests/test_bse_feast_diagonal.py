@@ -4,8 +4,8 @@
 independent implementation of the resonant object
 ``bse_davidson_helpers.build_bse_exact_diagonal`` assembles — eight un-jitted
 einsums that arrived independently at the same ``+1/nk`` exchange / ``−1/nk``
-direct normalisation, rebuilt ``M_X``/``M_Y`` from ``psi`` instead of reading the
-payload's hoisted pair amplitudes, and paid eight program constructions per call
+direct normalisation, rebuilt the pair amplitudes from ``psi`` instead of reading the
+payload's hoisted ``M``, and paid eight program constructions per call
 (PRECOND_BUILD_FREE.md §7.1).  The reference below retains that independent
 resonant arithmetic, then applies the separately gated non-TDA row convention
 ``[diag_h, -conj(diag_h)]``.
@@ -18,7 +18,7 @@ This file is what keeps them from drifting apart again: the old resonant
 implementation is transcribed here as the reference, so any future edit to
 either side has to explain itself against the arithmetic that was shipped.
 
-Two of the cells are RED TWINS.  ``test_adapter_reads_the_payloads_M_X`` fails
+Two of the cells are RED TWINS.  ``test_adapter_reads_the_payloads_M`` fails
 if the adapter goes back to rebuilding the pair amplitudes locally; it passes
 trivially — with a zero difference — for an implementation that ignores the
 payload, which is exactly the failure it exists to catch.
@@ -80,8 +80,7 @@ def _payload(seed=20260808, w_scale=1.0):
         "psi_c_X": psi_c_X, "psi_c_Y": psi_c_Y,
         "psi_v_X": psi_v_X, "psi_v_Y": psi_v_Y,
         # exactly what the loader hoists (audit P3)
-        "M_X": jnp.einsum("kcsm,kvsm->kcvm", jnp.conj(psi_c_X), psi_v_X),
-        "M_Y": jnp.einsum("kcsm,kvsm->kcvm", jnp.conj(psi_c_Y), psi_v_Y),
+        "M": jnp.einsum("kcsm,kvsm->kcvm", jnp.conj(psi_c_X), psi_v_X),
         "V_q0": cx(NMU, NMU),
         "W_q": jnp.asarray(w_scale) * cx(NMU, NMU, NKX, NKY, NKZ),
     }
@@ -96,8 +95,8 @@ def _feast_diag_reference(data, mesh_xy, include_W=True, use_tda=True):
     psi_v_X = data["psi_v_X"]
     psi_c_Y = data["psi_c_Y"]
     psi_v_Y = data["psi_v_Y"]
-    M_X = jnp.einsum("kcsm,kvsm->kcvm", jnp.conj(psi_c_X), psi_v_X)
-    M_Y = jnp.einsum("kcsm,kvsm->kcvm", jnp.conj(psi_c_Y), psi_v_Y)
+    # ONE pair amplitude (the loader's transition-layout M) on both legs.
+    M_X = M_Y = jnp.einsum("kcsm,kvsm->kcvm", jnp.conj(psi_c_X), psi_v_X)
     V_q0 = data["V_q0"]
     S_v = jnp.einsum("MN,kcvN->kcvM", V_q0, jnp.conj(M_Y))
     V_diag_kcv = jnp.einsum("kcvM,kcvM->kcv", M_X, S_v) / nk
@@ -178,11 +177,11 @@ def test_complex_and_real_routes_share_the_real_part_exactly(mesh):
     nk = NK
     cplx = np.asarray(H.build_bse_exact_diagonal(
         data["eps_c"], data["eps_v"], data["psi_c_X"], data["psi_v_Y"],
-        data["W_q"][:, :, 0, 0, 0], data["M_X"], data["M_Y"], data["V_q0"],
+        data["W_q"][:, :, 0, 0, 0], data["M"], data["V_q0"],
         nk, memo=False, complex_out=True))
     real = np.asarray(H.build_bse_exact_diagonal(
         data["eps_c"], data["eps_v"], data["psi_c_X"], data["psi_v_Y"],
-        data["W_q"][:, :, 0, 0, 0], data["M_X"], data["M_Y"], data["V_q0"],
+        data["W_q"][:, :, 0, 0, 0], data["M"], data["V_q0"],
         nk, memo=False, complex_out=False))
     assert np.array_equal(cplx.real, real)
 
@@ -194,11 +193,11 @@ def test_include_W_false_drops_the_term_rather_than_zeroing_it(mesh):
     nk = NK
     out = np.asarray(H.build_bse_exact_diagonal(
         data["eps_c"], data["eps_v"], data["psi_c_X"], data["psi_v_Y"],
-        None, data["M_X"], data["M_Y"], data["V_q0"], nk, memo=False))
-    S = np.einsum('kcvM,MN->kcvN', np.asarray(data["M_X"]),
+        None, data["M"], data["V_q0"], nk, memo=False))
+    S = np.einsum('kcvM,MN->kcvN', np.asarray(data["M"]),
                   np.asarray(data["V_q0"]))
     V_x = np.real(np.einsum('kcvN,kcvN->cvk', S,
-                            np.conj(np.asarray(data["M_Y"]))))
+                            np.conj(np.asarray(data["M"]))))
     dE = (np.asarray(data["eps_c"]).T[:, None, :]
           - np.asarray(data["eps_v"]).T[None, :, :])
     assert np.allclose(out, dE + V_x / nk, rtol=0, atol=ATOL_RY)
@@ -210,7 +209,7 @@ def test_memo_is_skipped_when_an_operand_is_none():
     data = _payload()
     nk = NK
     args = (data["eps_c"], data["eps_v"], data["psi_c_X"], data["psi_v_Y"],
-            None, data["M_X"], data["M_Y"], data["V_q0"])
+            None, data["M"], data["V_q0"])
     H.clear_exact_diagonal_memo()
     H.build_bse_exact_diagonal(*args, nk, memo=True).block_until_ready()
     before = H.exact_diagonal_memo_stats()["hits"]
@@ -220,22 +219,22 @@ def test_memo_is_skipped_when_an_operand_is_none():
 
 # ── red twins ────────────────────────────────────────────────────────────
 
-def test_adapter_reads_the_payloads_M_X(mesh):
+def test_adapter_reads_the_payloads_M(mesh):
     """RED TWIN — audit P3's hoisted pair amplitudes must be the ones used.
 
-    An implementation that rebuilds ``M_X`` from ``psi`` locally returns the
+    An implementation that rebuilds ``M`` from ``psi`` locally returns the
     SAME answer here (difference exactly 0.0), which is the whole point: this
     cell is the only thing that can tell the two apart.  ``build_finite_q_data``
-    maintains ``M_X``/``M_Y`` per q, so reading ``psi`` instead is a live
+    maintains ``M`` per q, so reading ``psi`` instead is a live
     correctness hazard on the finite-q route, not a style preference.
     """
     data = _payload()
     base = np.asarray(BF.build_preconditioner_diagonal_sharded(data, mesh))
     tampered = dict(data)
-    tampered["M_X"] = data["M_X"] * 1.5
+    tampered["M"] = data["M"] * 1.5
     out = np.asarray(BF.build_preconditioner_diagonal_sharded(tampered, mesh))
     assert np.max(np.abs(out - base)) > 1e-6, (
-        "perturbing data['M_X'] did not move the diagonal — the adapter is "
+        "perturbing data['M'] did not move the diagonal — the adapter is "
         "rebuilding the pair amplitudes from psi instead of reading them")
 
 

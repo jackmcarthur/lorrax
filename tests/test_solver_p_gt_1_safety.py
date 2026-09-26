@@ -350,7 +350,7 @@ def test_feast_runner_core_closes_over_no_arrays():
     from bse import bse_feast as BF
 
     operand_keys = ("psi_c_X", "psi_c_Y", "psi_v_X", "psi_v_Y",
-                    "eps_c", "eps_v", "W_R", "V_q0", "M_X", "M_Y")
+                    "eps_c", "eps_v", "W_R", "V_q0", "M")
     data = {k: jnp.full((1,), 1.0, dtype=jnp.complex128) for k in operand_keys}
 
     def matvec(x, *operands):
@@ -395,7 +395,7 @@ def test_feast_runner_core_takes_operands_as_an_argument():
         "sibling needs rewriting")
 
     operand_keys = ("psi_c_X", "psi_c_Y", "psi_v_X", "psi_v_Y",
-                    "eps_c", "eps_v", "W_R", "V_q0", "M_X", "M_Y")
+                    "eps_c", "eps_v", "W_R", "V_q0", "M")
     data = {k: jnp.full((1,), 1.0, dtype=jnp.complex128) for k in operand_keys}
 
     def matvec(x, *operands):

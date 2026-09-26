@@ -137,11 +137,10 @@ def _load_data_and_matvec(
     eps_c = data["eps_c"]
     eps_v = data["eps_v"]
     V_q0 = data["V_q0"]
-    M_X = data["M_X"]  # hoisted V-term pair-amps (audit P3)
-    M_Y = data["M_Y"]
+    M = data["M"]  # hoisted V-term pair amplitude (audit P3)
 
     operator_data = (psi_c_X, psi_c_Y, psi_v_X, psi_v_Y,
-                     eps_c, eps_v, W_R, V_q0, M_X, M_Y)
+                     eps_c, eps_v, W_R, V_q0, M)
 
     def apply_H(solver_data, X):
         return matvec_stack(X, *solver_data[0])

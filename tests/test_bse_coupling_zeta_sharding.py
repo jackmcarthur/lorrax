@@ -135,7 +135,7 @@ def _worker() -> int:
         pvx = jax.device_put(psi_v, sh.psi_x); pvy = jax.device_put(psi_v, sh.psi_y)
         ec = jax.device_put(eps_c, sh.eps); ev = jax.device_put(eps_v, sh.eps)
         Wd = jax.device_put(W_R, sh.W); Vd = jax.device_put(V_q0, sh.V)
-        M_X = jax.jit(compute_pair_amplitude, out_shardings=sh.psi_x)(pcx, pvx)
+        M = jax.jit(compute_pair_amplitude, out_shardings=sh.M)(pcx, pvx)
         eye = np.eye(N, dtype=np.complex128)
         out = {}
         for tag, incW in (("W", True), ("x", False)):
@@ -149,10 +149,10 @@ def _worker() -> int:
                     eye[j0:j0 + NCOL].reshape(-1, NC, NV, NK), sh.X)
                 if incW:
                     A[:, j0:j0 + NCOL] = np.asarray(jax.device_get(apA(
-                        col, pcx, pcy, pvx, pvy, ec, ev, Wd, Vd, M_X))
+                        col, pcx, pcy, pvx, pvy, ec, ev, Wd, Vd, M))
                     ).reshape(NCOL, -1).T
                 B[:, j0:j0 + NCOL] = np.asarray(jax.device_get(apB(
-                    col, pcx, pcy, pvx, pvy, Wd, Vd, M_X))).reshape(NCOL, -1).T
+                    col, pcx, pcy, pvx, pvy, Wd, Vd, M))).reshape(NCOL, -1).T
             if incW:
                 out["A"] = A
             out[f"B_{tag}"] = B

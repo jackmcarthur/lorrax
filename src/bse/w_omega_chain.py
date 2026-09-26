@@ -397,7 +397,7 @@ def build_w_omega_chain(data, matvec, gen, sh, cols, chain_len,
     args = (
         data["psi_c_X"], data["psi_c_Y"], data["psi_v_X"], data["psi_v_Y"],
         data["eps_c"], data["eps_v"], data["W_R"], data["V_q0"],
-        data["M_X"], data["M_Y"],
+        data["M"],
     )
 
     B0 = _seed_block(cols, data, gen, sh)                       # (p,c,v,k)
