@@ -70,6 +70,7 @@ struct OuterGeo {                          // the embedded source declares the s
     long long items;                       // nyb * nb * ngrp
     double scale;
     int conj_r;                            // 1: the load reads conj(R) (the BSE right leg is conj(psi))
+    long long nc, nv;                      // decode arm: Pc (nk, nc, na, mx), Pv (nk, nv, nb, my)
 };
 
 static ffi::Error fail(const char* where, const std::string& detail,
@@ -92,6 +93,7 @@ struct OuterGeo {
     long long items;
     double scale;
     int conj_r;
+    long long nc, nv;
 };
 
 constexpr int NX = LRX_NX, NY = LRX_NY, NZ = LRX_NZ, NK = NX * NY * NZ;
@@ -112,9 +114,21 @@ __device__ __forceinline__ void lrx_dmma(double& d0, double& d1, double a, doubl
                  : "+d"(d0), "+d"(d1) : "d"(a), "d"(b));
 }
 
+#if LRX_DEC
+// Decode arm (piece C prototype): no U store.  After the forward transform each warp folds its
+// k columns into A[k, c, nu] += sum_mu conj(Pc[k, c, a, mu]) U[k, mu, nu] (DMMA, registers, the
+// (t, mu)-first order of bse_stack_matvec._decode); at the item's end A meets Pv over nu and the
+// (c, v, k) partial is added atomically into Y.
+constexpr int MB = LRX_MB;                // 8-row c blocks
+extern "C" __global__ void __launch_bounds__(LRX_THREADS, LRX_MINB) lrx_kconv_outer(
+    const lrx_c2* __restrict__ L, const lrx_c2* __restrict__ R, const lrx_c2* __restrict__ V,
+    const lrx_c2* __restrict__ Pc, const lrx_c2* __restrict__ Pv, double* __restrict__ Y, OuterGeo g) {
+    lrx_c2* U = nullptr;
+#else
 extern "C" __global__ void __launch_bounds__(LRX_THREADS, LRX_MINB) lrx_kconv_outer(
     const lrx_c2* __restrict__ L, const lrx_c2* __restrict__ R, const lrx_c2* __restrict__ V,
     lrx_c2* __restrict__ U, OuterGeo g) {
+#endif
     extern __shared__ lrx_c2 bank[];
     using namespace cufftdx;
     const int warp = threadIdx.x / 32, lane = threadIdx.x % 32;
@@ -128,6 +142,13 @@ extern "C" __global__ void __launch_bounds__(LRX_THREADS, LRX_MINB) lrx_kconv_ou
         const long long yr = y0 + gr;                             // this lane's B column
         const bool yok = yr < g.my;
         const long long p0 = grp * g.per, p1 = min(pairs, p0 + g.per);
+#if LRX_DEC
+        double acc[(NK + NWARP - 1) / NWARP][MB][4];
+#pragma unroll
+        for (int kk = 0; kk < (NK + NWARP - 1) / NWARP; ++kk)
+#pragma unroll
+            for (int mb = 0; mb < MB; ++mb) { acc[kk][mb][0] = acc[kk][mb][1] = acc[kk][mb][2] = acc[kk][mb][3] = 0.0; }
+#endif
         for (long long p = p0; p < p1; ++p) {
             const long long a = p % g.na, x0 = (p / g.na) * XB;
             const long long xr = x0 + gr;                         // this lane's A row
@@ -166,6 +187,32 @@ extern "C" __global__ void __launch_bounds__(LRX_THREADS, LRX_MINB) lrx_kconv_ou
             }
             __syncthreads();
             lrx_kbox::transform3<NX, NY, NZ, TR, LRX_SM, fft_direction::forward>(bank);
+#if LRX_DEC
+            // Decode: A[k, c, nu] += conj(Pc[k, c, a, x0 + mu]) U[k, mu, nu] (the scale is applied to Y).
+#pragma unroll
+            for (int kk = 0; kk < (NK + NWARP - 1) / NWARP; ++kk) {
+                const int k = warp + kk * NWARP;
+                if (k < NK) {
+#pragma unroll
+                    for (int h = 0; h < 2; ++h) {
+                        const lrx_c2 ub = bank[((4 * h + tg) * YB + gr) * GK::RS + GK::at(k)];
+                        const long long mu = x0 + 4 * h + tg;
+#pragma unroll
+                        for (int mb = 0; mb < MB; ++mb) {
+                            const long long c = mb * 8 + gr;
+                            const double2 pc = (c < g.nc && mu < g.mx)
+                                ? __ldg(reinterpret_cast<const double2*>(Pc + (((long long)k * g.nc + c) * g.na + a) * g.mx + mu))
+                                : make_double2(0.0, 0.0);
+                            lrx_dmma(acc[kk][mb][0], acc[kk][mb][1], pc.x, ub.x);
+                            lrx_dmma(acc[kk][mb][0], acc[kk][mb][1], pc.y, ub.y);
+                            lrx_dmma(acc[kk][mb][2], acc[kk][mb][3], pc.x, ub.y);
+                            lrx_dmma(acc[kk][mb][2], acc[kk][mb][3], -pc.y, ub.x);
+                        }
+                    }
+                }
+            }
+            (void)U;
+#else
             // Store: mode 2's RowStore (v * scale), U k-leading (nk, na, mx, nb, my).
             for (int i = threadIdx.x; i < TR * NK; i += blockDim.x) {
                 const int j = i % TR, k = i / TR;
@@ -178,8 +225,45 @@ extern "C" __global__ void __launch_bounds__(LRX_THREADS, LRX_MINB) lrx_kconv_ou
                     U[(long long)k * ucols + ((a * g.mx + x) * g.nb + b) * g.my + yy] = w;
                 }
             }
+#endif
             __syncthreads();
         }
+#if LRX_DEC
+        // Item end: Y[c, v, k] += scale * sum_nu Pv[k, v, b, y0 + nu] A[k, c, nu], one 8-row c block at a
+        // time through the (now free) bank: A_s[k][c][nu] at k*64 + c*8 + nu.
+#pragma unroll
+        for (int mb = 0; mb < MB; ++mb) {
+#pragma unroll
+            for (int kk = 0; kk < (NK + NWARP - 1) / NWARP; ++kk) {
+                const int k = warp + kk * NWARP;
+                if (k < NK) {
+                    lrx_c2 a0, a1;
+                    a0.x = acc[kk][mb][0]; a0.y = acc[kk][mb][2];
+                    a1.x = acc[kk][mb][1]; a1.y = acc[kk][mb][3];
+                    bank[k * 64 + gr * 8 + 2 * tg] = a0;
+                    bank[k * 64 + gr * 8 + 2 * tg + 1] = a1;
+                }
+            }
+            __syncthreads();
+            for (long long o = threadIdx.x; o < (long long)NK * 8 * g.nv; o += blockDim.x) {
+                const int k = (int)(o / (8 * g.nv)), cl = (int)((o / g.nv) % 8);
+                const long long v = o % g.nv, c = mb * 8 + cl;
+                if (c >= g.nc) continue;
+                double sx = 0.0, sy = 0.0;
+                for (int nu = 0; nu < YB; ++nu) {
+                    if (y0 + nu >= g.my) break;
+                    const lrx_c2 pv = Pv[(((long long)k * g.nv + v) * g.nb + b) * g.my + y0 + nu];
+                    const lrx_c2 av = bank[k * 64 + cl * 8 + nu];
+                    sx = fma(pv.x, av.x, sx); sx = fma(-pv.y, av.y, sx);
+                    sy = fma(pv.x, av.y, sy); sy = fma(pv.y, av.x, sy);
+                }
+                double* yp = Y + 2 * ((c * g.nv + v) * NK + k);
+                atomicAdd(yp, sx * g.scale);
+                atomicAdd(yp + 1, sy * g.scale);
+            }
+            __syncthreads();
+        }
+#endif
     }
 }
 )__lrx__";
@@ -189,13 +273,13 @@ using nvrtc::driver_api;
 using nvrtc::cu_err;
 
 struct Built { CUfunction fn = nullptr; int smem = 0, minb = 1, sms = 0; };
-using Key = std::tuple<CUcontext, int, int, int, int>;   // ctx, nkx, nky, nkz, K
+using Key = std::tuple<CUcontext, int, int, int, int, int>;   // ctx, nkx, nky, nkz, K, decode c blocks (0: U arm)
 static std::mutex g_mu;
 static std::map<Key, Built> g_cache;
 static std::map<Key, std::string> g_fail;
 
 static ffi::Error build(int nkx, int nky, int nkz, int K, std::string_view mathdx_root,
-                        std::string_view cubin_dir, const Built** out) {
+                        std::string_view cubin_dir, const Built** out, int mb = 0) {
     const DriverApi& api = driver_api();
     if (!api.ok) return fail("driver-api resolve", api.err);
     CUcontext ctx = nullptr;
@@ -205,7 +289,7 @@ static ffi::Error build(int nkx, int nky, int nkz, int K, std::string_view mathd
         cr = api.CtxGetCurrent(&ctx);
         if (cr != CUDA_SUCCESS || ctx == nullptr) return fail("cuCtxGetCurrent", cu_err(cr));
     }
-    const Key key{ctx, nkx, nky, nkz, K};
+    const Key key{ctx, nkx, nky, nkz, K, mb};
     std::lock_guard<std::mutex> lock(g_mu);
     if (auto it = g_cache.find(key); it != g_cache.end()) { *out = &it->second; return ffi::Error::Success(); }
     if (auto it = g_fail.find(key); it != g_fail.end()) return fail("kernel build (cached failure)", it->second);
@@ -236,7 +320,7 @@ static ffi::Error build(int nkx, int nky, int nkz, int K, std::string_view mathd
               "here -- ffi.fft.klead_outer_refusal routes such a grid to the unfused encode + mode 2 chain";
         return sticky("tile", os.str(), ffi::ErrorCode::kInvalidArgument);
     }
-    const int minb = std::max(1, std::min<int>(2, static_cast<int>(smem_sm / (smem + 1024))));
+    const int minb = mb ? 1 : std::max(1, std::min<int>(2, static_cast<int>(smem_sm / (smem + 1024))));
     std::string why;
     const std::string cuda_inc = nvrtc::toolkit_include(&why);
     if (cuda_inc.empty()) return sticky("CUDA toolkit headers for NVRTC", why);
@@ -253,7 +337,8 @@ static ffi::Error build(int nkx, int nky, int nkz, int K, std::string_view mathd
         "--gpu-architecture=sm_" + std::to_string(cc_major) + std::to_string(cc_minor),
         "-DLRX_NX=" + std::to_string(nkx), "-DLRX_NY=" + std::to_string(nky), "-DLRX_NZ=" + std::to_string(nkz),
         "-DLRX_K=" + std::to_string(K), "-DLRX_THREADS=" + std::to_string(kThreads),
-        "-DLRX_MINB=" + std::to_string(minb), "-DLRX_SM=" + std::to_string(cc_major * 100 + cc_minor * 10)};
+        "-DLRX_MINB=" + std::to_string(minb), "-DLRX_SM=" + std::to_string(cc_major * 100 + cc_minor * 10),
+        "-DLRX_DEC=" + std::string(mb ? "1" : "0"), "-DLRX_MB=" + std::to_string(mb ? mb : 1)};
     nvrtc::mathdx_toolchain(root, cuda_inc, "cufftdx", &prog);
     prog.kernel = "lrx_kconv_outer";
     std::string missing;
@@ -262,7 +347,7 @@ static ffi::Error build(int nkx, int nky, int nkz, int K, std::string_view mathd
     std::string path;
     if (!dir.empty()) {
         std::ostringstream name;
-        name << dir << "/kconv_outer_" << nkx << "x" << nky << "x" << nkz << "_K" << K << "_sm" << cc_major
+        name << dir << "/kconv_outer_" << nkx << "x" << nky << "x" << nkz << "_K" << K << (mb ? "_dec" + std::to_string(mb) : std::string()) << "_sm" << cc_major
              << cc_minor << "_" << key_hex << ".cubin";
         path = name.str();
     }
@@ -348,7 +433,75 @@ static ffi::Error KleadOuterConv(cudaStream_t stream, ffi::AnyBuffer L, ffi::Any
     return ffi::Error::Success();
 }
 
+// Piece C prototype: the decode fused into the store.  L, R, V as KleadOuterConv; Pc (nk, nc, na, mx)
+// = psi_c_X, Pv (nk, nv, nb, my) = psi_v_Y; Y (nc, nv, nk) = scale * sum conj(Pc) Pv U, this rank's
+// (mu_loc, nu_loc) partial in bse_stack_matvec._decode's order.  U is never stored.
+static ffi::Error KleadOuterDecode(cudaStream_t stream, ffi::AnyBuffer L, ffi::AnyBuffer R, ffi::AnyBuffer V,
+                                   ffi::AnyBuffer Pc, ffi::AnyBuffer Pv, ffi::Result<ffi::AnyBuffer> Y,
+                                   int64_t nkx, int64_t nky, int64_t nkz, double scale, int64_t conj_r,
+                                   std::string_view mathdx_root, std::string_view cubin_dir) {
+    auto bad = [](const std::string& why) { return fail("klead outer decode", why, ffi::ErrorCode::kInvalidArgument); };
+    const int64_t nk = nkx * nky * nkz;
+    auto ld = L.dimensions(), rd = R.dimensions(), cd = Pc.dimensions(), pd = Pv.dimensions(), yd = Y->dimensions();
+    if (ld.size() != 4 || rd.size() != 4 || cd.size() != 4 || pd.size() != 4 || yd.size() != 3)
+        return bad("want L (nk,na,mx,K), R (nk,K,nb,my), Pc (nk,nc,na,mx), Pv (nk,nv,nb,my), Y (nc,nv,nk)");
+    const int64_t na = ld[1], mx = ld[2], K = ld[3], nb = rd[2], my = rd[3], nc = cd[1], nv = pd[1];
+    if (ld[0] != nk || rd[0] != nk || rd[1] != K || cd[0] != nk || cd[2] != na || cd[3] != mx || pd[0] != nk ||
+        pd[2] != nb || pd[3] != my || yd[0] != nc || yd[1] != nv || yd[2] != nk || K % 4 || nc < 1 || nv < 1)
+        return bad("operand shapes disagree");
+    if (cudaMemsetAsync(Y->untyped_data(), 0, static_cast<size_t>(nc * nv * nk) * 16, stream) != cudaSuccess)
+        return fail("klead outer decode", "cudaMemsetAsync(Y)");
+    const Built* k = nullptr;
+    const int mb = static_cast<int>((nc + 7) / 8);
+    if (ffi::Error e = build(static_cast<int>(nkx), static_cast<int>(nky), static_cast<int>(nkz),
+                             static_cast<int>(K), mathdx_root, cubin_dir, &k, mb);
+        !e.success())
+        return e;
+    OuterGeo g{};
+    g.na = na; g.mx = mx; g.nb = nb; g.my = my;
+    g.nxb = (mx + kTile - 1) / kTile;
+    g.nyb = (my + kTile - 1) / kTile;
+    const long long slots = static_cast<long long>(k->sms) * k->minb;
+    const long long base = nb * g.nyb, pairs = na * g.nxb;
+    g.ngrp = std::max(1LL, std::min(pairs, (4 * slots + base - 1) / base));
+    g.per = (pairs + g.ngrp - 1) / g.ngrp;
+    g.items = base * g.ngrp;
+    g.scale = scale;
+    g.conj_r = conj_r ? 1 : 0;
+    g.nc = nc; g.nv = nv;
+    const void* lp = L.untyped_data();
+    const void* rp = R.untyped_data();
+    const void* vp = V.untyped_data();
+    const void* cp = Pc.untyped_data();
+    const void* pp = Pv.untyped_data();
+    void* yp = Y->untyped_data();
+    void* args[] = {(void*)&lp, (void*)&rp, (void*)&vp, (void*)&cp, (void*)&pp, (void*)&yp, (void*)&g};
+    CUresult cr = driver_api().LaunchKernel(k->fn, static_cast<unsigned>(std::min(g.items, 2147483647LL)), 1, 1,
+                                            kThreads, 1, 1, static_cast<unsigned>(k->smem),
+                                            reinterpret_cast<CUstream>(stream), args, nullptr);
+    if (cr != CUDA_SUCCESS) return fail("cuLaunchKernel", cu_err(cr));
+    return ffi::Error::Success();
+}
+
 }  // namespace lorrax_ffi::kconv_outer
+
+XLA_FFI_DEFINE_HANDLER_SYMBOL(
+    KConvMathdxKleadOuterDecodeCudaFfi, lorrax_ffi::kconv_outer::KleadOuterDecode,
+    xla::ffi::Ffi::Bind()
+        .Ctx<xla::ffi::PlatformStream<cudaStream_t>>()
+        .Arg<xla::ffi::AnyBuffer>()   // L
+        .Arg<xla::ffi::AnyBuffer>()   // R
+        .Arg<xla::ffi::AnyBuffer>()   // V
+        .Arg<xla::ffi::AnyBuffer>()   // Pc
+        .Arg<xla::ffi::AnyBuffer>()   // Pv
+        .Ret<xla::ffi::AnyBuffer>()   // Y (nc, nv, nk)
+        .Attr<int64_t>("nkx")
+        .Attr<int64_t>("nky")
+        .Attr<int64_t>("nkz")
+        .Attr<double>("scale")
+        .Attr<int64_t>("conj_r")
+        .Attr<std::string_view>("mathdx_root")
+        .Attr<std::string_view>("cubin_dir"));
 
 XLA_FFI_DEFINE_HANDLER_SYMBOL(
     KConvMathdxKleadOuterCudaFfi, lorrax_ffi::kconv_outer::KleadOuterConv,
