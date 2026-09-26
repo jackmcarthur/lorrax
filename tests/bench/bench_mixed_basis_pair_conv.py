@@ -346,6 +346,8 @@ def main():
     ap.add_argument("--wedge", choices=("off", "full", "unitary"), default="off")
     ap.add_argument("--screened-coulomb-cutoff", type=float, default=None)
     ap.add_argument("--product", choices=("trace", "scalar"), default="trace")
+    ap.add_argument("--compiled-memory", action="store_true",
+                    help="print each stage's compiled buffers (XLA memory_analysis) against the model")
     ap.add_argument("--out", required=True)
     args = ap.parse_args()
     from gw.mixed_basis_pair_convolution import MixedBasisPairConvolution
@@ -381,6 +383,14 @@ def main():
                           stages=conv.chunks.stage_bytes, hwm=conv.chunks.hwm,
                           target=conv.chunks.target),
                receipt=conv.describe(), t_tables=t_tables, t_plan=t_plan)
+    if args.compiled_memory:
+        rec["compiled_memory"] = cm = conv.compiled_memory()
+        say("compiled per-rank buffers (GB): " + "; ".join(
+            f"{k} arg {v['argument'] / 1e9:.2f} out {v['output'] / 1e9:.2f} alias {v['alias'] / 1e9:.2f} "
+            f"temp {v['temp'] / 1e9:.2f}" for k, v in cm.items()))
+        say("model transients (GB): " + ", ".join(
+            f"{k} {getattr(conv.chunks, 'bytes_' + k) / 1e9:.2f}"
+            for k in ("expand", "middle", "rebuild", "final")))
     A, C, rec["compact"] = compact_build(s, mesh, conv.width_carrier[0], args.nb, args.nv)
     if args.product == "scalar":        # C is W at the q-IBZ (the χ plan's output layout)
         del C
