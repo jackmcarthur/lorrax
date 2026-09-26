@@ -186,6 +186,17 @@ def _diag_embed(mesh):
 
 
 @lru_cache(maxsize=None)
+def _zeros_like_stack(mesh):
+    return jax.jit(jnp.zeros_like, out_shardings=NamedSharding(mesh, P(None, None, "x", "y")))
+
+
+@lru_cache(maxsize=None)
+def _set_row(mesh):
+    return jax.jit(lambda acc, x, j: jax.lax.dynamic_update_index_in_dim(acc, x, j, 0),
+                   donate_argnums=(0,), out_shardings=NamedSharding(mesh, P(None, None, "x", "y")))
+
+
+@lru_cache(maxsize=None)
 def _minus_diag(mesh):
     """W − diag(v), and the Γ head slot set to ``head`` (per leading z)."""
     spec = NamedSharding(mesh, P(None, None, "x", "y"))
@@ -241,10 +252,13 @@ class SphereScreening:
                        pref=1.0, axis=self.axis)
 
     def solve_samples(self, chi_z):
-        """``solve`` at each leading z of ``chi_z (n_z, n_q, M, M)``; W stacked the same way."""
-        spec = NamedSharding(self.mesh, P(None, None, "x", "y"))
-        return jax.lax.with_sharding_constraint(
-            jnp.stack([self.solve(chi_z[j]) for j in range(int(chi_z.shape[0]))]), spec)
+        """``solve`` at each leading z of ``chi_z (n_z, n_q, M, M)``; W stacked the same way
+        (written in place: χ and W stacks plus one sample's Dyson workspace are live)."""
+        n_z = int(chi_z.shape[0])
+        W = _zeros_like_stack(self.mesh)(chi_z)
+        for j in range(n_z):
+            W = _set_row(self.mesh)(W, self.solve(chi_z[j]), j)
+        return W
 
     # ------------------------------------------------------------------ Γ head
     def gamma_head(self, W_z, S, Y, Z):
@@ -334,8 +348,9 @@ class SphereScreening:
         if n_z is not None and n_p is not None:
             dy = (_C16 * 5 * -(-n_q // Pn) * M * M if self.linalg == "local"
                   else _C16 * 4 * n_q * M * M / Pn)
-            s += (f"; law: samples {gb(n_z * per)} + poles {gb(3 * n_p * per)} + Dyson "
-                  f"{gb(dy)} per rank")
+            s += (f"; law per rank: Dyson stage χ + W samples {gb(2 * n_z * per)} + workspace "
+                  f"{gb(dy)}; fit stage W^c samples {gb(n_z * per)} + poles {gb(3 * n_p * per)} "
+                  f"+ the fit transient (budget-derived q batch)")
         return s
 
 
