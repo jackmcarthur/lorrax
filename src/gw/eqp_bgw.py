@@ -121,6 +121,7 @@ def write_bgw_eqp(
 	band_offset: int,
 	nspin: int = 1,
 	comments: tuple[str, ...] = (),
+	row_suffix: np.ndarray | None = None,
 ) -> str:
 	"""Write a BerkeleyGW ``eqp{0,1}.dat`` file.
 
@@ -143,6 +144,9 @@ def write_bgw_eqp(
 	    formatter supplies the leading ``# `` so the file remains readable by
 	    BerkeleyGW-compatible parsers.  The ordinary ``eqp0.dat`` / ``eqp1.dat``
 	    path passes none and remains byte-identical to the historical format.
+	row_suffix : (nk, nb) str, optional
+	    Text appended to each band row after its 46-character BGW record
+	    (:func:`write_eqp_root`); each piece must begin with a blank.
 	"""
 	kpts = np.asarray(kpoints_irr_frac, dtype=np.float64)
 	e_dft = np.asarray(e_dft_ev, dtype=np.float64)
@@ -152,6 +156,12 @@ def write_bgw_eqp(
 		raise ValueError(f"kpoints shape {kpts.shape} does not match e_dft {(nk, 3)}")
 	if e_qp.shape != (nk, nb):
 		raise ValueError(f"e_qp shape {e_qp.shape} does not match e_dft {(nk, nb)}")
+	if row_suffix is not None:
+		row_suffix = np.asarray(row_suffix, dtype=str)
+		if row_suffix.shape != (nk, nb) or not all(
+				t.startswith(" ") and "\n" not in t for t in row_suffix.ravel()):
+			raise ValueError(
+				"row_suffix must be (nk, nb) strings, each starting with a blank")
 
 	# ── Writer gate (pre-write) ──────────────────────────────────────
 	# The NaN-producing distributed back-solve of 2026-07 reached disk
@@ -203,12 +213,23 @@ def write_bgw_eqp(
 					# (ispin, iband, E_DFT, E_QP).
 					fh.write(
 						f"{ispin:8d}{iband:8d}"
-						f"{float(e_dft[ik, ib]):15.9f}{float(e_qp[ik, ib]):15.9f}\n"
-					)
+						f"{float(e_dft[ik, ib]):15.9f}{float(e_qp[ik, ib]):15.9f}"
+						+ ("" if row_suffix is None else str(row_suffix[ik, ib]))
+						+ "\n")
 	verify_eqp_file(abs_path, nk=nk, nb=nb, nspin=nspin)
 	return abs_path
 
 
+
+
+def _eqp_body_fields(line: str):
+	"""``(E_DFT, E_QP)`` text of a ``(2i8, 2f15.9)`` row, or None."""
+	head = line[:16]
+	if len(line.rstrip("\n")) < 46 or not (
+			head[:8].strip().lstrip("-").isdigit()
+			and head[8:16].strip().isdigit()):
+		return None
+	return [line[16:31], line[31:46]]
 
 
 def verify_eqp_file(
@@ -248,16 +269,19 @@ def verify_eqp_file(
 				continue
 			tok = line.split()
 			# Header rows are (3f13.9, i8) — the first token is a float and
-			# carries a '.'.  Body rows are (2i8, 2f15.9) — the first two
-			# tokens are bare integers.  Discriminating on content rather
-			# than column width keeps this correct if either format ever
-			# widens a field.
+			# carries a '.'.  Body rows are (2i8, 2f15.9) and are read by
+			# COLUMN, as BerkeleyGW reads them: a value such as
+			# -1031.650469281 fills its 15 columns and fuses with the field
+			# before it, so whitespace splitting would miscount it.  Text
+			# after column 46 (the root file's Z*, Gamma*, status) is not a
+			# BGW field.
+			body = _eqp_body_fields(line)
 			if len(tok) == 4 and "." in tok[0]:
 				n_header += 1
 				vals = tok[:3]
-			elif len(tok) == 4:
+			elif body is not None:
 				n_body += 1
-				vals = tok[2:]
+				vals = body
 			else:
 				n_nonfinite += len(tok)   # malformed → count as suspect
 				continue
@@ -359,15 +383,116 @@ def compute_z_factor_from_omega_grid(
 	return sigma_c_at_dft, z_factor
 
 
-def pathological_z_factor_mask(z_factor: np.ndarray) -> np.ndarray:
-	"""Return states whose linearized QP update is not physically admissible.
+#: Per-state outcome of :func:`solve_qp_root`, in the order of the codes.
+#: QP: a root in the bracket with 0 < Z* <= 1.  RES_Z: a root whose Z* is
+#: outside (0, 1].  RES_BRACKET: f(E) = E - h - Re Sigma(E) keeps its sign
+#: over the fully sampled bracket [E_in, eqp0].  OFF_GRID: the bracket leaves
+#: the sampled grid before f changes sign, so the sampled Sigma cannot place
+#: the root.  The two RES codes are resonances (a state with no quasiparticle
+#: near E_in); with a positive pole model neither occurs more than about eta
+#: from a pole cluster of Sigma_n (reports/unify_2026-09-26 section 2.4).
+QP_STATUS_NAMES = ("QP", "RES_Z", "RES_BRACKET", "OFF_GRID")
+QP_OK, QP_RES_Z, QP_RES_BRACKET, QP_OFF_GRID = range(4)
 
-	A quasiparticle residue must be finite and lie in ``0 < Z <= 1``.  Keep
-	the raw value for diagnostics, but never let a pole/grid crossing turn the
-	Newton correction into an unbounded ``eqp1`` energy.
+
+@dataclass(frozen=True)
+class QPRoot:
+	"""The QP equation solved on the sampled Sigma, one value per state.
+
+	``e_ev`` is E*, the root of E = h + Re Sigma_c(E) bracketed from the
+	input energy (a resonance row carries the spectral-function peak on the
+	bracket, an OFF_GRID row eqp0); ``z`` is Z* = 1/(1 - Re Sigma_c'(E*)) on
+	the eqp1 stencil; ``gamma_ev`` is Z*|Im Sigma_c(E*)| on a QP row and
+	|Im Sigma_c(E*)| otherwise; ``status`` indexes :data:`QP_STATUS_NAMES`.
 	"""
-	z = np.asarray(z_factor, dtype=np.float64)
-	return ~(np.isfinite(z) & (z > 0.0) & (z <= 1.0))
+
+	e_ev: np.ndarray
+	z: np.ndarray
+	gamma_ev: np.ndarray
+	status: np.ndarray
+
+	def counts(self) -> dict[str, int]:
+		return {name: int(np.count_nonzero(self.status == code))
+		        for code, name in enumerate(QP_STATUS_NAMES)}
+
+
+def solve_qp_root(
+	*,
+	sigma_c_omega_diag_ev: np.ndarray,  # (n_omega, nk, nb)
+	omega_rel_ev: np.ndarray,           # (n_omega,)
+	e_in_rel_ev: np.ndarray,            # (nk, nb)  E_in - E_F
+	eqp0_rel_ev: np.ndarray,            # (nk, nb)  g(E_in) - E_F
+	reference_ev: float,
+	dE_ev: float = Z_FINITE_DIFFERENCE_EV,
+) -> QPRoot:
+	"""Solve f(E) = E - h - Re Sigma_c(E) = 0 on [E_in, eqp0], per state.
+
+	h = eqp0 - Re Sigma_c(E_in) is the static part, so f(E_in) = E_in - eqp0
+	exactly.  If Re Sigma_c' <= 0 between E_in and eqp0, the root lies in
+	that interval and is unique there (UNIFY appendix A2).  Sigma_c is the
+	linear interpolant of the samples, so f is piecewise linear and the root
+	of the sampled f is found exactly: the grid cells from E_in toward eqp0
+	are scanned and the first sign change is solved in its cell.  The first
+	change from E_in is the root continuous in the input.  No threshold
+	enters; Z* uses the eqp1 central-difference stencil at E*.
+	``reference_ev`` (E_F) converts E* back to absolute eV.
+	"""
+	omega = np.asarray(omega_rel_ev, dtype=np.float64)
+	sig = np.asarray(sigma_c_omega_diag_ev)
+	re_sig = np.real(sig)
+	e_in = np.asarray(e_in_rel_ev, dtype=np.float64)
+	eqp0 = np.asarray(eqp0_rel_ev, dtype=np.float64)
+	nk, nb = e_in.shape
+	if sig.shape != (omega.size, nk, nb) or eqp0.shape != (nk, nb):
+		raise ValueError(
+			f"solve_qp_root: Sigma {sig.shape}, omega {omega.shape}, E_in "
+			f"{e_in.shape}, eqp0 {eqp0.shape} are not one (omega, k, n) set")
+	lo, hi = float(omega[0]), float(omega[-1])
+
+	def _re_at(k, n, x):
+		return np.interp(x, omega, re_sig[:, k, n])
+
+	e_star = eqp0.copy()
+	status = np.full((nk, nb), QP_OFF_GRID, dtype=np.int8)
+	for k in range(nk):
+		for n in range(nb):
+			a, b = float(e_in[k, n]), float(eqp0[k, n])
+			if not lo <= a <= hi:
+				continue
+			if a == b:
+				e_star[k, n], status[k, n] = a, QP_OK
+				continue
+			b_in = min(max(b, lo), hi)
+			inner = omega[(omega > min(a, b_in)) & (omega < max(a, b_in))]
+			xs = np.concatenate(([a], inner if b_in > a else inner[::-1], [b_in]))
+			h = b - _re_at(k, n, a)
+			f = xs - h - _re_at(k, n, xs)
+			f[0] = a - b
+			change = np.flatnonzero((f[1:] == 0.0) | (np.sign(f[1:]) != np.sign(f[:-1])))
+			if change.size:
+				i = int(change[0])
+				x0, x1, f0, f1 = xs[i], xs[i + 1], f[i], f[i + 1]
+				e_star[k, n] = x1 if f1 == 0.0 else x0 - f0 * (x1 - x0) / (f1 - f0)
+				status[k, n] = QP_OK
+			elif b_in == b:
+				# The whole bracket is sampled and f keeps its sign: no root.
+				# Report the spectral-function peak on the bracket.
+				im = np.abs(np.interp(xs, omega, np.imag(sig[:, k, n])))
+				e_star[k, n] = xs[int(np.argmax(im / (f * f + im * im + 1e-300)))]
+				status[k, n] = QP_RES_BRACKET
+	solved = status != QP_OFF_GRID
+	sigma_at, z = compute_z_factor_from_omega_grid(
+		sigma_c_omega_diag_ev=sig, omega_rel_ev=omega,
+		e_dft_rel_ev=np.where(solved, e_star, 0.0), dE_ev=dE_ev)
+	im_abs = np.abs(np.imag(sigma_at))
+	status = np.where(
+		(status == QP_OK) & ~(np.isfinite(z) & (z > 0.0) & (z <= 1.0)),
+		QP_RES_Z, status).astype(np.int8)
+	z = np.where(solved, z, 1.0)
+	gamma = np.where(status == QP_OK, z * im_abs,
+	                 np.where(solved, im_abs, 0.0))
+	return QPRoot(e_ev=e_star + float(reference_ev), z=z, gamma_ev=gamma,
+	              status=status)
 
 
 def _implied_vxc_window_ev() -> tuple[float, float]:
@@ -443,7 +568,6 @@ def compute_eqp_diag(
 	# Both or neither; None ⇒ the historical at-DFT linearization.
 	sigma_c_at_eval_diag_ev: np.ndarray | None = None,  # (nk, nb)
 	e_eval_ev: np.ndarray | None = None,                # (nk, nb)
-	guard_pathological_z: bool = True,
 ) -> tuple[np.ndarray, np.ndarray]:
 	"""Return zeroth-order and Z-linearized BGW QP energies.
 
@@ -477,10 +601,9 @@ def compute_eqp_diag(
 	For dynamic modes (GN-PPM, HL-PPM, MPA) the caller obtains
 	``sigma_c_at_dft_diag_ev``, ``sigma_c_at_eval_diag_ev`` and
 	``z_factor`` from :func:`compute_z_factor_from_omega_grid`.
-	One-shot callers retain the historical state-local pathological-Z fallback.
-	Self-consistent output passes ``guard_pathological_z=False``: its raw
-	central-difference Z affects only the reported ``eqp1`` column and never
-	changes, gates, or replaces an SC-map value.
+	eqp1 is the raw BerkeleyGW column: a Z outside (0, 1] is not replaced.
+	The QP energy itself is the root of the QP equation
+	(:func:`solve_qp_root`), which classifies such states as resonances.
 	"""
 	if (sigma_c_at_eval_diag_ev is None) != (e_eval_ev is None):
 		raise ValueError(
@@ -514,8 +637,6 @@ def compute_eqp_diag(
 			+ sigma_x_diag_ev + sigma_c_at_eval_diag_ev - e_eval_ev
 		).real
 		eqp1 = e_eval_ev + z_factor * delta_at_eval
-	if z_factor is not None and guard_pathological_z:
-		eqp1 = np.where(pathological_z_factor_mask(z_factor), eqp0, eqp1)
 	return eqp0, eqp1
 
 
@@ -552,7 +673,9 @@ class EqpAssembly:
 	#: operator cube remains raw; this smaller curve is an assembly operand.
 	sigma_c_omega_diag_ev: np.ndarray | None
 	z_factor: np.ndarray | None
-	z_pathological: np.ndarray | None
+	#: The QP-equation root per state (one-shot dynamic runs); None in
+	#: static modes and under self-consistency, whose map output is the root.
+	qp_root: QPRoot | None
 	implied_vxc_ev: np.ndarray | None
 	hartree_transverse_diag_ev: np.ndarray | None = None
 	nspin: int = 1
@@ -561,14 +684,18 @@ class EqpAssembly:
 	e_eval_ev: np.ndarray | None = None
 
 	def write(self, *, eqp0_path: str, eqp1_path: str) -> tuple[str, str]:
-		"""Emit the exact-BGW-format eqp0.dat / eqp1.dat pair."""
-		return write_eqp_bgw_pair(
+		"""Emit the exact-BGW-format eqp0.dat / eqp1.dat pair, and beside
+		them the root file (:func:`eqp_root_path`) when there is a root."""
+		paths = write_eqp_bgw_pair(
 			eqp0_path=eqp0_path, eqp1_path=eqp1_path,
 			kpoints_irr_frac=self.kpoints_irr_frac,
 			e_dft_ev=self.e_dft_ev,
 			eqp0_ev=self.eqp0_ev, eqp1_ev=self.eqp1_ev,
 			band_offset=self.band_offset, nspin=self.nspin,
 		)
+		if self.qp_root is not None:
+			write_eqp_root(eqp_root_path(eqp1_path), self)
+		return paths
 
 
 def assemble_eqp(
@@ -594,7 +721,6 @@ def assemble_eqp(
 	hartree_scalar_diag_ev: np.ndarray | None = None,
 	hartree_transverse_diag_ev: np.ndarray | None = None,
 	mean_field_gate: bool = True,
-	guard_pathological_z: bool = True,
 	print_fn=print,
 ) -> EqpAssembly:
 	"""Assemble BGW QP energies from H₀ and Σ.  **One implementation.**
@@ -613,11 +739,11 @@ def assemble_eqp(
 	   Z there, which is where eqp1 is linearized
 	   (:func:`compute_z_factor_from_omega_grid`, and
 	   :func:`compute_eqp_diag` for why);
-	4. the Newton update (:func:`compute_eqp_diag`);
-	5. on the historical one-shot path, state-local fallback ``eqp1 = eqp0``
-	   wherever raw Z is non-finite or outside ``0 < Z <= 1``.  The SC writer
-	   disables that fallback: Z is output-only and the fixed-point map is
-	   always the unlinearized eqp0-type evaluation.
+	4. the Newton update (:func:`compute_eqp_diag`), eqp1 raw as BGW's;
+	5. for a dynamic run evaluated at E_DFT, the QP-equation root on
+	   [E_DFT, eqp0] with Z*, Gamma* and a resonance status
+	   (:func:`solve_qp_root`).  Self-consistent output has none: its map
+	   output is already the root.
 
 	**The evaluation point, and the one-omega-reference rule.**
 	``e_eval_ev`` / ``e_eval_rel_ev`` are the same energies in absolute
@@ -731,31 +857,6 @@ def assemble_eqp(
 		else:
 			e_eval_ev = None
 
-	z_pathological = (
-		None if z_factor is None or not guard_pathological_z
-		else pathological_z_factor_mask(z_factor))
-	if z_pathological is not None:
-		n_bad = int(np.count_nonzero(z_pathological))
-		finite = np.asarray(z_factor)[np.isfinite(z_factor)]
-		range_text = (
-			"no finite values" if finite.size == 0 else
-			f"finite range [{float(np.min(finite)):.8g}, "
-			f"{float(np.max(finite)):.8g}]")
-		severity = "WARNING: " if n_bad else "  "
-		print_fn(
-			f"{severity}Z-factor guard: "
-			f"pathological={n_bad}/{z_pathological.size} "
-			"(valid iff finite and 0 < Z <= 1); "
-			f"{range_text}; flagged eqp1 states fall back to eqp0.")
-		if n_bad:
-			bad_rows = np.argwhere(z_pathological)
-			preview = ", ".join(
-				f"(k={int(k)}, band={int(band_offset) + int(n) + 1}, "
-				f"Z={float(np.asarray(z_factor)[k, n]):.8g})"
-				for k, n in bad_rows[:8])
-			more = "" if n_bad <= 8 else f", ... +{n_bad - 8} more"
-			print_fn(f"WARNING: pathological Z states: {preview}{more}")
-
 	eqp0_ev, eqp1_ev = compute_eqp_diag(
 		kin_ion_diag_ev=kin_ion_diag_ev,
 		hartree_diag_ev=hartree_used,
@@ -765,8 +866,22 @@ def assemble_eqp(
 		z_factor=z_factor,
 		sigma_c_at_eval_diag_ev=sigma_c_at_eval,
 		e_eval_ev=e_eval_ev,
-		guard_pathological_z=guard_pathological_z,
 	)
+	qp_root = None
+	if z_factor is not None and e_eval_ev is None:
+		# Evaluated at E_DFT, so E_in = E_DFT: the one-shot, and SC map 0.
+		reference_ev = float(np.mean(
+			np.asarray(e_dft_ev, dtype=np.float64)
+			- np.asarray(e_dft_rel_ev, dtype=np.float64)))
+		qp_root = solve_qp_root(
+			sigma_c_omega_diag_ev=sigma_c_omega_diag_ev,
+			omega_rel_ev=omega_rel_ev,
+			e_in_rel_ev=e_dft_rel_ev,
+			eqp0_rel_ev=eqp0_ev - reference_ev,
+			reference_ev=reference_ev, dE_ev=dE_ev)
+		_report_qp_root(qp_root, z_factor=z_factor, eqp1_ev=eqp1_ev,
+		                band_offset=band_offset, e_dft_ev=e_dft_ev,
+		                reference_ev=reference_ev, print_fn=print_fn)
 	return EqpAssembly(
 		kpoints_irr_frac=np.asarray(kpoints_irr_frac, dtype=np.float64),
 		band_offset=int(band_offset),
@@ -781,7 +896,7 @@ def assemble_eqp(
 			None if sigma_c_omega_diag_ev is None
 			else np.asarray(sigma_c_omega_diag_ev, dtype=np.complex128)),
 		z_factor=z_factor,
-		z_pathological=z_pathological,
+		qp_root=qp_root,
 		implied_vxc_ev=implied_vxc,
 		hartree_transverse_diag_ev=hartree_transverse_used,
 		nspin=int(nspin),
@@ -810,6 +925,65 @@ def _warn_on_unphysical_h0(**kwargs):
 		)
 		return None
 	return _gwo._warn_on_unphysical_h0(**kwargs)
+
+
+def _report_qp_root(root: QPRoot, *, z_factor, eqp1_ev, band_offset,
+                    e_dft_ev, reference_ev, print_fn) -> None:
+	"""One summary line per status, and the non-QP rows by name."""
+	counts = root.counts()
+	ok = root.status == QP_OK
+	gap = np.abs(root.e_ev - np.asarray(eqp1_ev, dtype=np.float64))[ok]
+	gap_text = ("" if not gap.size else
+	            f"; QP rows |E* - eqp1| max {1e3 * float(np.max(gap)):.3f} "
+	            f"median {1e3 * float(np.median(gap)):.3f} meV")
+	print_fn("  QP root on [E_DFT, eqp0]: "
+	         + ", ".join(f"{k}={v}" for k, v in counts.items())
+	         + f" of {root.status.size}{gap_text}.")
+	bad = np.argwhere(~ok)
+	for k, n in bad[:12]:
+		print_fn(
+			f"    {QP_STATUS_NAMES[int(root.status[k, n])]}: k={int(k)} "
+			f"band={int(band_offset) + int(n) + 1} "
+			f"E_DFT-E_F={float(e_dft_ev[k, n]) - reference_ev:+.3f} eV "
+			f"E*-E_F={float(root.e_ev[k, n]) - reference_ev:+.3f} eV "
+			f"Z*={float(root.z[k, n]):.4g} Gamma*={float(root.gamma_ev[k, n]):.4g} eV "
+			f"(eqp1 Z={float(np.asarray(z_factor)[k, n]):.4g})")
+	if bad.shape[0] > 12:
+		print_fn(f"    ... +{bad.shape[0] - 12} more non-QP rows")
+
+
+def eqp_root_path(eqp1_path: str) -> str:
+	"""The root file beside ``eqp1_path``: its ``eqp1`` token becomes
+	``eqp_root`` (``gnppm_eqp1.dat`` -> ``gnppm_eqp_root.dat``)."""
+	head, base = os.path.split(eqp1_path)
+	stem, ext = os.path.splitext(base)
+	i = stem.rfind("eqp1")
+	stem = (stem[:i] + "eqp_root" + stem[i + 4:]) if i >= 0 else stem + "_root"
+	return os.path.join(head, stem + (ext or ".dat"))
+
+
+def write_eqp_root(path: str, assembly: "EqpAssembly") -> str:
+	"""BGW-format rows with E_QP = E*, then Z*, Gamma* and the status.
+
+	The first 46 characters of every row are the BerkeleyGW ``(2i8,
+	2f15.9)`` record, so an eqp reader that consumes four fields reads E*
+	as the QP energy.  Z* and Gamma* follow as ``1x,es14.6``, the status as
+	one word; each extra field starts with a blank and cannot fuse.
+	"""
+	root = assembly.qp_root
+	names = np.asarray(QP_STATUS_NAMES)[root.status.astype(int)]
+	extras = np.char.add(np.char.add(
+		np.char.add(" ", np.char.mod("%14.6e", root.z)),
+		np.char.add(" ", np.char.mod("%14.6e", root.gamma_ev))),
+		np.char.add(" ", names))
+	return write_bgw_eqp(
+		path, assembly.kpoints_irr_frac, assembly.e_dft_ev, root.e_ev,
+		band_offset=assembly.band_offset, nspin=assembly.nspin,
+		comments=(
+			"E_QP = E*, the root of E = h + Re Sigma_c(E) on [E_DFT, eqp0]; "
+			"trailing columns Z* Gamma*(eV) status; status "
+			+ "|".join(QP_STATUS_NAMES) + " (gw.eqp_bgw.solve_qp_root)",),
+		row_suffix=extras)
 
 
 def write_eqp_bgw_pair(

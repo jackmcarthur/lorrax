@@ -1498,7 +1498,7 @@ def write_results(
         write_eqp_g0w0,
         write_qp_rotations_h5,
     )
-    from .eqp_bgw import assemble_eqp
+    from .eqp_bgw import QP_STATUS_NAMES, assemble_eqp
 
     r2e = RYD_TO_EV
 
@@ -1727,14 +1727,6 @@ def write_results(
         e_eval_rel_ev=e_eval_rel_ev_irr,
         dE_ev=eqp_dE_ev,
         nspin=1,
-        # SC is an eqp0-type fixed-point map.  Its central-difference Z is
-        # output-only in the BGW-style eqp1 column; it must never select a
-        # fallback value or feed an iteration.
-        # SC map 0 is evaluated at E_DFT: it IS the one-shot and takes its guard.
-        guard_pathological_z=(
-            not results.self_consistent
-            or (e_eval_ev_irr is not None
-                and np.array_equal(e_eval_ev_irr, e_dft_ev_irr))),
         print_fn=print_fn,
     )
 
@@ -1761,12 +1753,11 @@ def write_results(
         sigma_c_odd_kn_eV=(
             None if results.sigma_c_odd_diag_at_dft_ry is None
             else r2e * _wedge(results.sigma_c_odd_diag_at_dft_ry)),
-        # The legacy sigma text diagnostic defines Z together with a guarded
-        # fallback-status twin.  SC has no such status: its raw central-
-        # difference Z is represented only by the resulting eqp1 file.
-        z_factor_kn=(None if results.self_consistent else assembly.z_factor),
-        z_pathological_kn=(
-            None if results.self_consistent else assembly.z_pathological),
+        # Z (the eqp1 stencil at E_DFT) beside the QP-root status.  SC output
+        # has neither: its map output is the root.
+        z_factor_kn=(None if assembly.qp_root is None else assembly.z_factor),
+        qp_status_kn=(None if assembly.qp_root is None else np.asarray(
+            QP_STATUS_NAMES)[assembly.qp_root.status.astype(int)]),
     )
 
     # ``sigma_mnk.h5``'s full operators intentionally remain raw: changing

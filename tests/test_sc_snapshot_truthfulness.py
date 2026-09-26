@@ -138,21 +138,21 @@ def test_the_snapshot_stamps_the_convergence_criterion():
     assert "THIS is the convergence criterion" in body
 
 
-def test_snapshot_writes_eqp1_but_never_uses_z_to_drive_the_map():
+def test_snapshot_writes_no_eqp1_and_no_z():
+    """At the fixed point the map output is the QP root: no per-map eqp1,
+    no Z (reports/unify_2026-09-26 section 2.6)."""
     body = _block("_write_sc_eqp_snapshot")
-    assert "eqp1_iter" in body
-    assert "e_eval + z_factor * (e_output - e_eval)" in body
-    assert "Z is output-only" in body
-    assert "pathological_z_factor_mask" not in body
-    assert "z_factor_iter" not in body
+    assert "eqp1_iter" not in body
+    assert "_sc_z_factors" not in body
+    assert "pathological" not in body
 
     clear = _block("_clear_sc_eqp_snapshots")
-    assert "eqp1" in clear and "z_factor" in clear
+    assert "eqp1" in clear and "z_factor" in clear   # stale files still go
 
     gw_output = open(os.path.join(_SRC, "gw", "gw_output.py"),
                      encoding="utf-8").read()
-    assert "guard_pathological_z=not results.self_consistent" in gw_output
-    assert "None if results.self_consistent else assembly.z_factor" in gw_output
+    assert "guard_pathological_z" not in gw_output
+    assert "None if assembly.qp_root is None else assembly.z_factor" in gw_output
 
     driver = _block("run_sc_driver")
     assert "{} if int(config.sc.max_iter) > 1 else None" in driver

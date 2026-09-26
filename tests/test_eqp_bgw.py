@@ -13,7 +13,8 @@ import pytest
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
 from gw.eqp_bgw import (
-	assemble_eqp, compute_z_factor_from_omega_grid, write_bgw_eqp)
+	QP_STATUS_NAMES, assemble_eqp, compute_z_factor_from_omega_grid,
+	write_bgw_eqp)
 
 
 # Single-k-point block from
@@ -327,55 +328,86 @@ def test_static_modes_ignore_an_evaluation_point_and_keep_eqp1_eq_eqp0():
 		mean_field_gate=False,
 		print_fn=lambda *_a, **_k: None)
 	np.testing.assert_array_equal(got.eqp0_ev, got.eqp1_ev)
-	assert got.z_factor is None and got.z_pathological is None
+	assert got.z_factor is None and got.qp_root is None
 	assert got.e_eval_ev is None
 
 
-def test_pole_crossing_pathological_z_falls_back_to_eqp0():
-	"""A sampled pole may diagnose bad Z; it may not launch eqp1 to infinity."""
-	omega = np.arange(-2.0, 2.0 + 1.0e-9, 0.25)
-	pole, eta, strength = 0.20, 0.05, 0.30
-	x = omega - pole
-	curve = (strength * x / (x * x + eta * eta))[:, None, None]
-	messages = []
-	got = assemble_eqp(
+def _one_state(curve, *, h=1.0, omega=None, messages=None):
+	omega = np.arange(-2.0, 2.0 + 1.0e-9, 0.25) if omega is None else omega
+	return assemble_eqp(
 		kpoints_irr_frac=np.zeros((1, 3)), band_offset=12,
-		e_dft_ev=np.zeros((1, 1)), kin_ion_diag_ev=np.ones((1, 1)),
+		e_dft_ev=np.zeros((1, 1)), kin_ion_diag_ev=np.full((1, 1), h),
 		hartree_diag_ev=np.zeros((1, 1)),
 		sigma_x_diag_ev=np.zeros((1, 1)),
-		sigma_c_omega_diag_ev=curve.astype(np.complex128),
-		omega_rel_ev=omega, e_dft_rel_ev=np.zeros((1, 1)),
-		dE_ev=0.5, mean_field_gate=False, print_fn=messages.append,
-	)
-	assert float(got.z_factor[0, 0]) < 0.0
-	assert bool(got.z_pathological[0, 0])
-	np.testing.assert_array_equal(got.eqp1_ev, got.eqp0_ev)
-	assert any("pathological=1/1" in line for line in messages)
-	assert any("band=13" in line for line in messages)
-	assert all(line.startswith("WARNING: ") for line in messages)
-
-
-def test_sc_eqp1_reports_raw_z_without_a_guard_or_fallback():
-	"""A derivative may format SC output, never select a map value."""
-	omega = np.arange(-2.0, 2.0 + 1.0e-9, 0.25)
-	pole, eta, strength = 0.20, 0.05, 0.30
-	x = omega - pole
-	curve = (strength * x / (x * x + eta * eta))[:, None, None]
-	messages = []
-	got = assemble_eqp(
-		kpoints_irr_frac=np.zeros((1, 3)), band_offset=12,
-		e_dft_ev=np.zeros((1, 1)), kin_ion_diag_ev=np.ones((1, 1)),
-		hartree_diag_ev=np.zeros((1, 1)),
-		sigma_x_diag_ev=np.zeros((1, 1)),
-		sigma_c_omega_diag_ev=curve.astype(np.complex128),
+		sigma_c_omega_diag_ev=np.asarray(curve)[:, None, None].astype(
+			np.complex128),
 		omega_rel_ev=omega, e_dft_rel_ev=np.zeros((1, 1)),
 		dE_ev=0.5, mean_field_gate=False,
-		guard_pathological_z=False, print_fn=messages.append,
-	)
+		print_fn=(messages.append if messages is not None
+		          else (lambda *_a, **_k: None)))
+
+
+def test_pole_crossing_is_a_resonance_and_eqp1_stays_raw():
+	"""A sampled pole within eta of the root gives Z* < 0: the state is
+	classified RES_Z, not guarded; eqp1 is BerkeleyGW's raw number."""
+	omega = np.arange(-2.0, 2.0 + 1.0e-9, 0.25)
+	pole, eta, strength = 0.20, 0.05, 0.30
+	x = omega - pole
+	messages = []
+	got = _one_state(strength * x / (x * x + eta * eta), messages=messages)
 	assert float(got.z_factor[0, 0]) < 0.0
-	assert got.z_pathological is None
 	assert not np.array_equal(got.eqp1_ev, got.eqp0_ev)
-	assert messages == []
+	root = got.qp_root
+	assert QP_STATUS_NAMES[int(root.status[0, 0])] == "RES_Z"
+	e_star = float(root.e_ev[0, 0])
+	assert float(got.eqp0_ev[0, 0]) < e_star < 0.0     # inside [eqp0, E_in]
+	# f(E*) = 0 on the sampled (linearly interpolated) Sigma.
+	f = e_star - 1.0 - np.interp(e_star, omega, strength * x / (x * x + eta * eta))
+	assert abs(f) < 1e-12
+	assert float(root.z[0, 0]) < 0.0
+	assert any("RES_Z=1" in line for line in messages)
+	assert any("RES_Z: k=0 band=13" in line for line in messages)
+
+
+def test_no_root_in_the_bracket_is_a_resonance():
+	"""Sigma' = 2 > 1: f keeps its sign over [E_in, eqp0] = [0, 0.5]."""
+	omega = np.arange(-2.0, 2.0 + 1.0e-9, 0.25)
+	got = _one_state(2.0 * omega, h=0.5)
+	assert QP_STATUS_NAMES[int(got.qp_root.status[0, 0])] == "RES_BRACKET"
+	assert 0.0 <= float(got.qp_root.e_ev[0, 0]) <= 0.5
+
+
+def test_an_unsampled_bracket_is_off_grid_and_carries_eqp0():
+	"""eqp0 = 6 eV lies past the +2 eV grid top and f has no sign change on
+	the sampled part: OFF_GRID, E* = eqp0, flagged."""
+	omega = np.arange(-2.0, 2.0 + 1.0e-9, 0.25)
+	got = _one_state(np.full(omega.shape, 5.0))
+	assert QP_STATUS_NAMES[int(got.qp_root.status[0, 0])] == "OFF_GRID"
+	np.testing.assert_array_equal(got.qp_root.e_ev, got.eqp0_ev)
+
+
+def test_root_file_keeps_the_bgw_record_and_reads_back(tmp_path):
+	"""The first 46 columns are BGW's; Z*, Gamma*, status follow; a fused
+	-1031 eV eqp1 value reads back by column."""
+	from file_io.restart_bundle import read_bgw_eqp
+	omega = np.arange(-2.0, 2.0 + 1.0e-9, 0.25)
+	got = _one_state(0.3 - 0.2 * omega)
+	p0, p1 = tmp_path / "eqp0.dat", tmp_path / "eqp1.dat"
+	got.write(eqp0_path=str(p0), eqp1_path=str(p1))
+	root_path = tmp_path / "eqp_root.dat"
+	rows = [ln for ln in root_path.read_text().splitlines()
+	        if not ln.startswith("#")]
+	assert rows[1][:46] == f"{1:8d}{13:8d}{0.0:15.9f}{1.3 / 1.2:15.9f}"
+	assert rows[1][46:].split()[2] == "QP"
+	_, e_dft, e_qp, first = read_bgw_eqp(str(root_path))
+	np.testing.assert_allclose(e_qp, [[1.3 / 1.2]], atol=1e-9)
+	fused = tmp_path / "fused.dat"
+	write_bgw_eqp(str(fused), np.zeros((1, 3)), np.array([[77.591750926]]),
+	              np.array([[-1031.650469281]]), band_offset=62)
+	assert "77.591750926-1031.650469281" in fused.read_text()
+	_, e_dft, e_qp, first = read_bgw_eqp(str(fused))
+	assert (first, float(e_dft[0, 0]), float(e_qp[0, 0])) == (
+		62, 77.591750926, -1031.650469281)
 
 
 def test_smooth_negative_slope_keeps_the_linearized_eqp1():
@@ -393,8 +425,12 @@ def test_smooth_negative_slope_keeps_the_linearized_eqp1():
 		mean_field_gate=False, print_fn=messages.append,
 	)
 	np.testing.assert_allclose(got.z_factor, [[1.0 / 1.2]], atol=1.0e-12)
-	assert not bool(got.z_pathological[0, 0])
 	np.testing.assert_allclose(got.eqp0_ev, [[1.3]], atol=1.0e-12)
 	np.testing.assert_allclose(got.eqp1_ev, [[(1.0 / 1.2) * 1.3]], atol=1.0e-12)
-	assert any("pathological=0/1" in line for line in messages)
+	# Linear Sigma: one Newton step is exact, so the root equals eqp1.
+	assert QP_STATUS_NAMES[int(got.qp_root.status[0, 0])] == "QP"
+	np.testing.assert_allclose(got.qp_root.e_ev, got.eqp1_ev, atol=1.0e-12)
+	np.testing.assert_allclose(got.qp_root.z, [[1.0 / 1.2]], atol=1.0e-12)
+	assert any("QP=1, RES_Z=0, RES_BRACKET=0, OFF_GRID=0" in line
+	           for line in messages)
 	assert all(not line.startswith("WARNING: ") for line in messages)
