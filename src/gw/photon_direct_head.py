@@ -374,6 +374,8 @@ _GAMMA_SAMPLES = 2**17
 _GAMMA_MIN_LOCAL = 2**10
 #: Share of the stage room the chunk's compiled footprint may take.
 _GAMMA_ROOM_FRACTION = 0.5
+#: Points of the screened sphere rule (``_bulk_sphere_rule``: 8 radial x 12 polar x 24 azimuthal).
+_GAMMA_SPHERE_POINTS = 8 * 12 * 24
 
 
 def direct_gamma_chunk_plan(mesh, operands, *, nsamples):
@@ -381,13 +383,12 @@ def direct_gamma_chunk_plan(mesh, operands, *, nsamples):
 
     The samples of one call are split over every rank (``P(('x', 'y'))``: the
     q sums in :func:`_direct_gamma_chunk` become one small all-reduce), so no
-    rank repeats another's samples.  The chunk is the largest power of two,
-    at most ``nsamples`` (one call per replicate), whose compiled footprint,
-    priced at a probe chunk and scaled per sample, fits
-    ``_GAMMA_ROOM_FRACTION`` of the stage room
-    (``common.gpu_utils.device_room_bytes``); never below
-    ``_GAMMA_MIN_LOCAL`` samples per rank, nor below the 2304-point sphere
-    rule.  Every process enters.
+    rank repeats another's samples.  The chunk starts at the floor
+    (``_GAMMA_MIN_LOCAL`` samples per rank, and at least the sphere rule's
+    points) and doubles while it stays within ``nsamples`` (one call per
+    replicate) and its compiled footprint, priced at the floor and scaled per
+    sample, fits ``_GAMMA_ROOM_FRACTION`` of the stage room
+    (``common.gpu_utils.device_room_bytes``).  Every process enters.
     """
     from common.gpu_utils import device_room_bytes, record_stage_price
     n_dev = int(mesh.devices.size)
@@ -404,7 +405,7 @@ def direct_gamma_chunk_plan(mesh, operands, *, nsamples):
     per_sample = max(float(getattr(memory, "temp_size_in_bytes", 0)) / probe, 0.0) \
         + 8.0 * (3 + 16 + 1) / n_dev
     room = _GAMMA_ROOM_FRACTION * float(device_room_bytes())
-    floor = max(probe, 2304)
+    floor = max(probe, _GAMMA_SPHERE_POINTS)
     chunk = floor
     while chunk * 2 <= int(nsamples) and chunk * 2 * per_sample <= room:
         chunk *= 2
