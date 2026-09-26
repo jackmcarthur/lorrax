@@ -1429,7 +1429,11 @@ def compute_sigma_xc(
     fixed_quadrature_session=None,
     print_fn: Callable = print,
 ) -> SigmaResult:
-    """Produce Sigma and Hartree fields; see docs/architecture/four_current_wiring.md."""
+    """Produce Sigma and Hartree fields; see docs/architecture/four_current_wiring.md.
+
+    ``photon_response`` is consumed: its packed V and W are deleted once the
+    static channels have read them.
+    """
     from .cohsex_sigma import compute_cohsex_sigma, compute_sigma_x
     from .ppm_pipeline import compute_ppm_sigma_pipeline
     _validate_sigma_stage(
@@ -1438,6 +1442,13 @@ def compute_sigma_xc(
         Gij, V_q, W_by_role, bispinor_v_q_path, config, hartree_basis_rotation, mesh_xy, meta,
         mode, mu_bases, occupation_state, photon_response, print_fn, static_head_terms, wfns,
         wfns_transverse)
+    if photon_response is not None:
+        # The packed static photon response is consumed: its static channels were its
+        # last reader, so its V and W end here, before Hartree and the tau sweep (3.1 GB
+        # per rank on the CrI3 6x6 bispinor at P4).  The one caller drops it on return.
+        for packed in {id(a): a for a in (photon_response.V_packed,
+                                          photon_response.W_packed)}.values():
+            packed.delete()
     (sig_h, v_h_scalar, h_transverse) = _sigma_hartree_fields(
         band_slices, config, hartree_basis_rotation, mesh_xy, meta, omit_v_h, print_fn, sig_x,
         sym, wfn)

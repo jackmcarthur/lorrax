@@ -1485,9 +1485,14 @@ class SweepPlan(NamedTuple):
     g_carrier
         ``ngkmax`` padded to a multiple of P: the extent the all-to-all
         splits into P slabs.  Pad columns are zero in ψ and in the mask.
+    band_chunk
+        bands per application of a band-layout operator: this rank's
+        ``nb/P`` when its FFT boxes fit the budget, else the fewest chunks
+        that do (:func:`plan_sweep`).
     """
     k_tile: int
     g_carrier: int
+    band_chunk: int
 
 
 def plan_sweep(geom: SweepGeometry, operator) -> SweepPlan:
@@ -1537,7 +1542,37 @@ def plan_sweep(geom: SweepGeometry, operator) -> SweepPlan:
     peer_block = nb_rank * geom.ns * g_carrier * c128 / n_ranks
     k_tile = next((k for k in range(1, k_mem + 1) if geom.nk % k == 0
                    and k * peer_block >= A2A_BANDWIDTH_BLOCK_BYTES), k_mem)
-    return SweepPlan(k_tile, g_carrier)
+    return SweepPlan(k_tile, g_carrier, _band_chunk(geom, ops, nb_rank, k_tile * step))
+
+
+#: The share of the stage room the band-layout FFT boxes may fill.
+_BOX_ROOM_FRACTION = 0.9
+
+
+def _band_chunk(geom, ops, nb_rank: int, step_bytes: float) -> int:
+    """Bands per application of the band-layout operators, from the run's budget.
+
+    A band operator holds FFT boxes of ``ns·N_r·16`` bytes per band: ψ(r), one
+    product and one forward transform per component, ``2 + 2·max(ncomp, 1)``
+    boxes (the four-current potential: six).  Its bands are independent, so
+    the fewest equal chunks whose boxes fit beside the step's live set in the
+    stage room (``common.gpu_utils.device_room_bytes``) are applied one after
+    another; one chunk, this rank's ``nb/P``, when they fit.  Every process
+    computes the same chunk.
+    """
+    copies = max((2 + 2 * max(int(o.ncomp), 1) for o in ops if o.apply is not None),
+                 default=0)
+    if not copies:
+        return nb_rank
+    from common.gpu_utils import device_budget_bytes, device_room_bytes, record_stage_price
+    box = copies * float(geom.ns) * float(np.prod(geom.fft_grid)) * 16.0
+    room = float(device_room_bytes())
+    fit = max(1, int((_BOX_ROOM_FRACTION * room - step_bytes) // box))
+    n_chunks = -(-nb_rank // min(fit, nb_rank))
+    chunk = -(-nb_rank // n_chunks)
+    record_stage_price(f"matrix-element sweep, plan_sweep {chunk}/{nb_rank} bands",
+                       device_budget_bytes() - room + step_bytes + chunk * box)
+    return chunk
 
 
 #: Per-peer all-to-all block (bytes) at which the collective is taken to be
@@ -1597,7 +1632,17 @@ def _sweep_body(geom: SweepGeometry, operators: tuple, spans: tuple,
         with K.  (K, nb/P, ns, ngkmax[, c])."""
         def one(xs):
             p, g, m, b, kv = xs
-            return operator.apply(p[None], g, m, b[None], kv, *consts)[0]
+            nbr, c = int(p.shape[0]), int(plan.band_chunk)
+            if c >= nbr:
+                return operator.apply(p[None], g, m, b[None], kv, *consts)[0]
+            # Band chunks, one after another: the boxes are (c, ns, grid).
+            n = -(-nbr // c)
+            chunks = jnp.pad(p, ((0, n * c - nbr),) + ((0, 0),) * (p.ndim - 1))
+            _, out = jax.lax.scan(
+                lambda carry, pc: (carry, operator.apply(pc[None], g, m, b[None], kv,
+                                                         *consts)[0]),
+                None, chunks.reshape(n, c, *p.shape[1:]), unroll=1)
+            return out.reshape(n * c, *out.shape[2:])[:nbr]
         xs = (t["psi"], t["gvec"], t["gmask"], t["bidx"], t["kvec"])
         if K == 1:
             return one(jax.tree_util.tree_map(lambda a: a[0], xs))[None]

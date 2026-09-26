@@ -65,8 +65,12 @@ def _get_chi_minimax_kernel(mesh_xy: Mesh, kgrid: tuple[int, int, int],
                             vertex_pairs=None,
                             k_unfold_plan=None,
                             occupations: str = "step",
-                            ordered: bool = False):
+                            ordered: bool = False,
+                            real_times: bool = False):
     """Build the face or parent imaginary-time response with vertices applied after unfold.
+
+    ``real_times``: every node time is real (the parent kernel then reads a
+    complex contour's antiunitary partner as conj(G) on the load).
 
     ``occupations="step"`` is the zero-temperature gapped response (masked
     valence/conduction Green pair, references vmax/cmin); ``"fermi_dirac"``
@@ -130,7 +134,7 @@ def _get_chi_minimax_kernel(mesh_xy: Mesh, kgrid: tuple[int, int, int],
                  complex_contour, layout, face_shape, right_face_shape,
                  vertex_classes, (tuple(id(p) for p in k_unfold_plan)
                                if isinstance(k_unfold_plan, tuple) else id(k_unfold_plan)),
-                 fused)
+                 fused, bool(real_times) and fused)
     if fermi_dirac:
         cache_key = cache_key + ("fermi_dirac", bool(ordered))
     if cache_key in _chi_minimax_kernel_cache:
@@ -143,7 +147,7 @@ def _get_chi_minimax_kernel(mesh_xy: Mesh, kgrid: tuple[int, int, int],
     if fused:
         kernel = _get_chi_minimax_kernel_fused(
             mesh_xy, kgrid, nk, n_out, complex_contour, face_shape,
-            k_unfold_plan=k_unfold_plan, layout=layout)
+            k_unfold_plan=k_unfold_plan, layout=layout, real_times=bool(real_times))
     else:
         kernel = _get_chi_minimax_kernel_face(
             mesh_xy, kgrid, nk, n_out, complex_contour, face_shape,
@@ -464,7 +468,8 @@ def _get_chi_minimax_kernel_face(mesh_xy, kgrid, nk, n_out, complex_contour,
 
 
 def _get_chi_minimax_kernel_fused(mesh_xy, kgrid, nk, n_out, complex_contour,
-                                  face_shape, *, k_unfold_plan, layout="face"):
+                                  face_shape, *, k_unfold_plan, layout="face",
+                                  real_times=False):
     """The step-occupation, identity-vertex response read from the raw-parent Green pair.
 
         chi_R(mu, nu) = sum_tau alpha_tau sum_ab conj(Gc'_ab) Gv'_ab   (+ c.c., real contour)
@@ -472,25 +477,27 @@ def _get_chi_minimax_kernel_fused(mesh_xy, kgrid, nk, n_out, complex_contour,
     with ``G' = ifftn_k`` of the typed unfold of each parent Green: one GEMM per Green at
     the parents, then ``ffi.fft.make_kconv_chi_unfold`` (mathdx mode 11) unfolds both on
     its load, transforms, traces the spins and accumulates chi_R in place.  The live set
-    is the two parent Greens and the accumulator; a real contour reads the antiunitary
-    partner as ``conj(G)`` on the load, a complex one reads the conjugate-face parent
-    Green.  When that set exceeds the device target the valence Green is built and
-    accumulated in band chunks (chi_tau is linear in it;
-    ``greens_function_kernel.chi_valence_chunks``).  One forward transform after the tau
-    sum.  Same signature and output as :func:`_get_chi_minimax_kernel_face` for
-    ``vertex_pairs=None``.
+    is the two parent Greens and the accumulator (priced by
+    ``greens_function_kernel.price_chi0_node``); real node times read the antiunitary
+    partner as ``conj(G)`` on the load, complex ones read the conjugate-face parent
+    Green.  One forward transform after the tau sum.  Same signature and output as
+    :func:`_get_chi_minimax_kernel_face` for ``vertex_pairs=None``.
     """
     from common.fft_helpers import make_flat_k_fftn, make_kconv_chi_unfold
     from common.wfn_layout import psi_specs
     from distrib_la import gemm_plan
-    from .greens_function_kernel import build_G_tau, chi_valence_chunks
+    from .greens_function_kernel import build_G_tau, price_chi0_node
     from .wavefunction_bundle import CHI_Q_SPEC as _chi_spec, CHI_R_SPEC as _chi_R_spec
 
     psi_nmu_spec, psi_mun_spec = psi_specs(layout)
     nk_in, nb_full, n_rmu, ns = (int(v) for v in face_shape)
     anti = bool(np.any(np.asarray(k_unfold_plan.sym_idx) >= k_unfold_plan.n_sym_spatial))
-    n_vc = chi_valence_chunks(n_parent=nk_in, n_rmu=n_rmu, ns=ns, n_full=nk, n_out=n_out,
-                              n_val=nb_full, mesh=mesh_xy, partner=complex_contour and anti)
+    # Real node times (every step response but the real-axis contours) give Greens of real
+    # weights even when alpha is complex (the ordered imaginary probe): their antiunitary
+    # partner is conj(G), read on the load, so no partner tile is built.
+    real_t = real_times or not complex_contour
+    price_chi0_node(n_parent=nk_in, n_rmu=n_rmu, ns=ns, n_full=nk, n_out=n_out,
+                    n_band=nb_full, mesh=mesh_xy, partner=anti and not real_t)
     if nk_in != k_unfold_plan.n_parent or k_unfold_plan.n_full != nk:
         raise ValueError("chi parent plan: face k extent or full-k extent disagrees with its plan.")
     door = make_kconv_chi_unfold(mesh_xy, kgrid, k_unfold_plan.unfold_load_tables(),
@@ -499,9 +506,11 @@ def _get_chi_minimax_kernel_fused(mesh_xy, kgrid, nk, n_out, complex_contour,
     chi_R_shard = NamedSharding(mesh_xy, _chi_R_spec)
     acc_shard = NamedSharding(mesh_xy, P(None, None, "x", "y"))
     rep0, rep1, rep2 = (NamedSharding(mesh_xy, s) for s in (P(), P(None), P(None, None)))
-    # One planned GEMM at the parents, shared by every Gv and Gc build.
+    # One planned GEMM at the parents, shared by every Gv and Gc build.  Not warmed: it
+    # runs inside this one jit, and a warm-up would hold full-size dummy C and D tiles.
     g_plan = gemm_plan(mesh_xy, m=n_rmu * ns, k=nb_full, n=n_rmu * ns, nq=nk_in,
-                       dtype=jnp.complex128, layout=layout, enable_active_range=True)
+                       dtype=jnp.complex128, layout=layout, enable_active_range=True,
+                       warmup=False)
     nodes_shard = MinimaxNodes(t=rep1, alpha=rep1 if n_out == 1 else rep0)
 
     def integrate(nodes, psi_mun, psi_nmu, mask_v, mask_c, enk_full, vmax, cmin):
@@ -511,29 +520,16 @@ def _get_chi_minimax_kernel_fused(mesh_xy, kgrid, nk, n_out, complex_contour,
 
         def node(acc, xs):
             t_scalar, alpha_col = xs
-            tau = t_scalar if complex_contour else jnp.real(t_scalar).astype(jnp.float64)
-            t_c = jnp.conj(tau) if complex_contour else tau
-            green = lambda t, ref, mask, band_range=None: build_G_tau(
+            tau = jnp.real(t_scalar).astype(jnp.float64) if real_t else t_scalar
+            t_c = tau if real_t else jnp.conj(tau)
+            green = lambda t, ref, mask: build_G_tau(
                 psi_mun, psi_nmu, enk_full, t, e_ref=ref, mask=mask, layout=layout,
-                gemm=g_plan, k_unfold_plan=k_unfold_plan, trim_zero_bands=True, unfold=False,
-                band_range=band_range)
-            alpha = alpha_col.astype(jnp.complex128)
+                gemm=g_plan, k_unfold_plan=k_unfold_plan, trim_zero_bands=True, unfold=False)
+            Gv = green(-tau, vmax, mask_v)
             Gc = green(t_c, cmin, mask_c)
-            if n_vc == 1:
-                chunks = (None,)
-            else:
-                # The valence support's band interval, split into n_vc ranges.
-                occupied = jnp.any(mask_v, axis=0)
-                lo = jnp.argmax(occupied)
-                hi = nb_full - jnp.argmax(occupied[::-1])
-                edges = [lo + ((hi - lo) * c) // n_vc for c in range(n_vc + 1)]
-                chunks = tuple(zip(edges[:-1], edges[1:]))
-            for band_range in chunks:
-                Gv = green(-tau, vmax, mask_v, band_range)
-                # A Green of real weights reads its partner as conj(G) on the load.
-                partners = () if Gv.conj_partner else (Gv.transpose, Gc.transpose)
-                acc = door(acc, Gv.G, Gc.G, alpha, *partners)
-            return acc, None
+            # A Green of real weights reads its partner as conj(G) on the load.
+            partners = () if Gv.conj_partner else (Gv.transpose, Gc.transpose)
+            return door(acc, Gv.G, Gc.G, alpha_col.astype(jnp.complex128), *partners), None
 
         acc, _ = jax.lax.scan(node, acc0, (nodes.t, alpha_rows), unroll=1)
         return tuple(chi_fftn(acc[o]) for o in range(n_out))
@@ -1536,9 +1532,10 @@ def _run_minimax_chi(wfns, meta, mesh_xy, args, *, n_out=1,
     """
     ensure_jax_compile_cache()
     kgrid = (int(meta.nkx), int(meta.nky), int(meta.nkz))
+    real_times = not np.any(np.imag(np.asarray(jax.device_get(args[0].t))))
     kernel = _get_chi_minimax_kernel(
         mesh_xy, kgrid, n_out=n_out, complex_contour=complex_contour,
-        **_chi_parent_face_kwargs(wfns))
+        real_times=real_times, **_chi_parent_face_kwargs(wfns))
     if compile_only:
         kernel.lower(*args).compile()
         return None
