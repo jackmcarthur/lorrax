@@ -1094,7 +1094,7 @@ extern "C" __global__ void __launch_bounds__(256) lrx_kconv(
     constexpr int PB = RB / SS;
     const long long mx = t.ml / NS, my = t.nl / NS, pairs = mx * my;
     const long long p0 = (long long)blockIdx.x * PB;
-    lrx_group_load<PB>(gp, gt, t, p0, pairs, my, sm);
+    lrx_group_load<PB>(gp, gt, t, p0, pairs, my, 0, sm);
     __syncthreads();
     transform3<fft_direction::inverse>(sm);
     const long long wy = (long long)my * v.nb, wx = (long long)v.na * wy;
