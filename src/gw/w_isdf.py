@@ -957,19 +957,37 @@ def _get_chi_fractional_contour_kernel_face(
 
             return jax.lax.cond(window == 0, crossing, remote, None), None
 
-        def direct_body(accumulators, node):
-            time, forward, reverse = node
-            def add(acc):
-                # ONE Green pair A(t)=Gu(t) conj(Gf(conj(t))) per node serves
-                # both orientations: the reverse product at time conj(t) is
-                # conj(A(t)), read from the -q rows of the same transform.
-                # green_k owns its own physical/incumbent conjugation.
-                value = chi_fftn(spin_correlation(occ_f, -time, energy_reference[0],
-                    occ_u, jnp.conj(time), energy_reference[1]))
-                acc = accumulate_selected(acc, rows(value, gather_q), forward)
-                return accumulate_selected(acc, jnp.conj(rows(value, reverse_q)), reverse)
-            return jax.lax.cond(jnp.any(forward != 0) | jnp.any(reverse != 0), add,
-                                lambda acc: acc, accumulators), None
+        def direct_node(index, accumulators):
+            # ONE Green pair A(t)=Gu(t) conj(Gf(conj(t))) per node serves
+            # both orientations: the reverse product at time conj(t) is
+            # conj(A(t)), read from the -q rows of the same transform.
+            # green_k owns its own physical/incumbent conjugation.
+            time = time_nodes[index]
+            forward = jax.lax.dynamic_index_in_dim(
+                projection_rows[0], index, axis=1, keepdims=False)
+            reverse = jax.lax.dynamic_index_in_dim(
+                projection_rows[1], index, axis=1, keepdims=False)
+            value = chi_fftn(spin_correlation(occ_f, -time, energy_reference[0],
+                occ_u, jnp.conj(time), energy_reference[1]))
+            accumulators = accumulate_selected(accumulators, rows(value, gather_q), forward)
+            return accumulate_selected(accumulators, jnp.conj(rows(value, reverse_q)), reverse)
+
+        def direct_stream(accumulators):
+            # The rule is padded to RESPONSE_NODE_CAPACITY slots with zero
+            # weights at the end. Loop over the live prefix only, with the
+            # accumulator as a plain loop carry: a lax.cond skip that carried
+            # the donated bank accumulator made XLA copy it twice per slot,
+            # padded slots included (Fe 4^3 bispinor: 768 copies of 2.89
+            # GB/rank, 3.2 s per bank; lane MAUD, 2026-09-25). A zero-weight
+            # node inside the prefix adds exact zeros.
+            live = (jnp.any(projection_rows[0] != 0, axis=0)
+                    | jnp.any(projection_rows[1] != 0, axis=0))
+            count = jnp.max(jnp.where(live, jnp.arange(live.shape[0]) + 1, 0))
+            _, accumulators = jax.lax.while_loop(
+                lambda state: state[0] < count,
+                lambda state: (state[0] + 1, direct_node(state[0], state[1])),
+                (jnp.zeros((), count.dtype), accumulators))
+            return accumulators
 
         def body(accumulators, node):
             time, projection = node
@@ -993,13 +1011,14 @@ def _get_chi_fractional_contour_kernel_face(
             )
             return updated, None
 
-        nodes = ((time_nodes, projection_rows[0].T, projection_rows[1].T)
-                 if pair_mode == "direct" else
-                 (time_nodes[0], projection_rows.T, time_nodes[1])
-                 if pair_mode == "windowed" else (time_nodes, projection_rows.T))
-        final_R, _ = jax.lax.scan(
-            (direct_body if pair_mode == "direct" else window_body)
-            if pair_mode in ("windowed", "direct") else body, initial, nodes, unroll=1)
+        if pair_mode == "direct":
+            final_R = direct_stream(initial)
+        else:
+            nodes = ((time_nodes[0], projection_rows.T, time_nodes[1])
+                     if pair_mode == "windowed" else (time_nodes, projection_rows.T))
+            final_R, _ = jax.lax.scan(
+                window_body if pair_mode == "windowed" else body,
+                initial, nodes, unroll=1)
         if selected_q is None:
             finished = tuple(_finish(value) for value in final_R)
             if photon is not None:
