@@ -454,8 +454,10 @@ def test_contracted_cert_runs_under_the_zeta_window_too():
     assert "window_mode=args.refit_window" in src, (
         "the cert must know which gate it is on this run")
     # and the twin rows are built off cert_idx regardless of window, which is
-    # the line that actually makes it run.
-    assert "for iQ in cert_idx:" in src
+    # the line that actually makes it run (bse.exchange_path owns the rows).
+    assert "cert_idx=cert_idx" in src
+    tiles = (REPO_ROOT / "src" / "bse" / "exchange_path.py").read_text("utf8")
+    assert "for iQ in cert_idx:" in tiles
 
 
 def test_exciton_bands_exposes_and_threads_the_guard_count():
