@@ -51,9 +51,9 @@ _sigma_shared_tau_kernel_cache: dict[
 def _make_project_ri_reduce_scatter(
     mesh_xy: Mesh, *, merged_x: bool = True,
     layout: str = "face", face_shape=None, face_band_extent=None,
-    k_unfold_plan=None,
+    k_unfold_plan=None, spin_block=None,
 ) -> Callable[..., jax.Array]:
-    """Project Σ on the raw-parent rows (``(n_parent, ns, μ, ns, ν)`` in); the completed frequency sum owns the band unfold."""
+    """Project Σ on the raw-parent rows (``(n_parent, d, μ, d, ν)`` blocks in); the completed frequency sum owns the band unfold."""
     from common.contract_bands import contract_bands_block_reshard
 
     if k_unfold_plan is None or face_shape is None:
@@ -65,7 +65,7 @@ def _make_project_ri_reduce_scatter(
     inner = contract_bands_block_reshard(
         mesh_xy, channels="none", layout=layout,
         face_shape=(k_unfold_plan.n_parent, *face_shape[1:]),
-        face_band_extent=face_band_extent)
+        face_band_extent=face_band_extent, spin_block=spin_block)
     return inner
 
 
@@ -142,24 +142,23 @@ def get_sigma_spatial_kernel(
                                           norm='ortho', mult=-1.0 / np.sqrt(float(nk_tot)),
                                           spin_block=d)
     project = _make_project_ri_reduce_scatter(
-        mesh_xy, merged_x=merged_x, layout=layout,
-        face_shape=face_shape if d == ns else (*face_shape[:3], d),
-        face_band_extent=face_band_extent, k_unfold_plan=k_unfold_plan)
+        mesh_xy, merged_x=merged_x, layout=layout, face_shape=face_shape,
+        face_band_extent=face_band_extent, k_unfold_plan=k_unfold_plan,
+        spin_block=d)
     blocks = [(a0, b0) for a0 in range(0, ns, d) for b0 in range(0, ns, d)]
 
     def convolve_project(psi_proj_xr, psi_proj_yn, G_parents, W_prep):
-        """Σ on the parent rows, one stored output spin block at a time (one pass at d = ns)."""
-        total = None
+        """Σ on the parent rows, one stored output spin block at a time (one pass at d = ns).
+
+        ψ is oriented once and every block adds into one rank-local band
+        partial, so the band-block reduce-scatter runs once per call."""
+        faces = project.prepare(psi_proj_xr, psi_proj_yn)
+        acc = None
         for a0, b0 in blocks:
             sigma_parent = unfold_conv(G_parents.G, G_parents.transpose, W_prep,
                                        conj_partner=G_parents.conj_partner, a0=a0, b0=b0)
-            left = (psi_proj_xr if d == ns
-                    else jax.lax.slice_in_dim(psi_proj_xr, a0, a0 + d, axis=2))
-            right = (psi_proj_yn if d == ns
-                     else jax.lax.slice_in_dim(psi_proj_yn, b0, b0 + d, axis=1))
-            part = project(left, sigma_parent, right)
-            total = part if total is None else total + part
-        return total
+            acc = project.accumulate(faces, sigma_parent, a0=a0, b0=b0, acc=acc)
+        return project.finish(acc)
 
     @jax.jit
     def prep_w(W_q):
