@@ -185,28 +185,60 @@ are different objects, and the head kernel keeps them apart by construction:
 
 - **Dynamic.** The interband Kubo tensor $S(z)$ (`qsgw_head.head_s_tensor_sharded`,
   convention of [S-tensor convention](s-tensor-convention.md)) plus the Drude
-  tensor from tetrahedron Fermi-surface weights
-  (`fermi_surface.tetrahedron_delta_weights`), entering as $D/z^2$ at
-  $z=\omega+i\eta$.
+  tensor, entering as $D/z^2$ at $z=\omega+i\eta$:
+
+  $$
+  D_{ab}=\frac{C}{\Omega N_k}\sum_k\sum_{nm\in\mathcal M}
+  \bar w_{k,nm}\,v^{a*}_{k,nm}v^{b}_{k,nm},\qquad
+  \omega_p^2(\hat q)=8\pi\,\hat q\cdot D\cdot\hat q,
+  $$
+
+  with $C=2/(n_{\rm spin}n_{\rm spinor})$, $w$ the star-covariant tetrahedron
+  weight of $\delta(E-\mu)$ times $N_k$ (`fermi_surface.metal_head_surface_weights`),
+  and the sum over each degenerate multiplet $\mathcal M$ (BGW's
+  TOL_Degeneracy, $10^{-6}$ Ry) with one weight per multiplet. The multiplet
+  trace is invariant under rotations inside the multiplet; its pairs are
+  excluded from $S$. Free electrons give $D=2n$, i.e. $\omega_p^2=16\pi n$ Ry$^2$.
+  Measured: Na bcc $8^3$ 5.95 eV (free electron at this density 6.05 eV);
+  Fe bcc $4^3$ 2.09/2.31 eV, where $4^3$ does not converge the Fermi surface.
 - **Static.** The exact $z=0$ slot is not the $\omega\to0$ value of the dynamic
-  expression; `head_samples_from_s` substitutes
+  expression; it takes
 
   $$
   \kappa_{\rm TF}^2=\frac{8\pi N(E_F)}{V_{\rm cell}},
   $$
 
-  with $N(E_F)$ the same tetrahedron weight sum, in the mini-BZ average.
+  with $N(E_F)$ the same tetrahedron weight sum, in the mini-BZ average, and
+  through the static wing/body fold when the head is folded
+  (`qsgw_head._metal_static_head`). The metal MPA and shared-pole plans have
+  no exact-zero sample: their origin is $i\varpi_0$, where the $q$-first
+  Drude head screens the whole cell ($W\to0$).
 
-**Routes on a metal.** The default `sc_head_update = off`, and every one-shot
-metal run, keep the fixed DFT direct response **with no intraband term**. The
-Drude and Thomas–Fermi head above is admitted on one route:
-`sigma_w_model = shared_pole`, `head_correction = no_local_fields`,
-`qp_solver = self_consistent`, `sc_head_update = dft_velocity`
-(`gw_config.uses_metal_direct_drude_head`), which rotates the DFT dipole into
-each map's QP basis and uses that map's occupations and surface weights; it
-builds no wings and folds nothing through the body. Full local-field folding of
-a metallic head and `parallel_transport` refuse. The route table is owned by
+**Every metallic head carries the metal's state.** The one-shot head, the
+frozen head of `sc_head_update = off` and the per-map head of `dft_velocity`
+take the fixed-N Fermi–Dirac state that the body and $\Sigma$ take, and the
+intraband term above; `dft_velocity` rebuilds it each map from the DFT
+velocity rotated into the map's basis. A 0/1 table by band index is never a
+metallic head occupation: it cuts degenerate multiplets and, before the
+multiplet rule, put $1/(\Delta E\,z^2)$ with $\Delta E\sim10^{-14}$ Ry into $S$
+(Na $8^3$: $W=0$ at every sample up to 11 Ry). The route table is owned by
 [self-consistency](../self_consistency.md#metals-direct-drude-head).
+
+**What the head contributes on shell.** For any pole model the band-diagonal
+head at the state's own energy is
+
+$$
+\Sigma^{\rm head}_{nk}(\epsilon_{nk})=\frac{1/2-f_{nk}}{\Omega N_k}\,W^c_{\rm head}(\omega\to0),
+$$
+
+so QSGW maps and on-shell energies see the static head only; the Drude
+term moves them through $W^c(0)$ alone and moves $Z$ and off-shell values
+through the rest. The scalar head fit therefore reproduces its static sample
+exactly (§5.3). With $W^c(0)=-\langle v\rangle_{\rm cell}$ (perfect screening
+of the cell) the head adds the uniform $-\langle v\rangle/(2\Omega N_k)$ to
+exchange-plus-correlation and nothing band dependent; the Thomas–Fermi value
+adds $(1/2-f)\langle 8\pi/(q^2\epsilon_\infty+\kappa^2)\rangle/(\Omega N_k)$,
+$\pm1.9$ meV on Na $8^3$, falling as $1/N_k$.
 
 **Accuracy of the static anchor.** $\kappa_{\rm TF}^2$ inherits the DOS
 estimator. On an $8\times8\times8$ sodium mesh five estimators of $N(E_F)$ from
@@ -258,7 +290,12 @@ $$
 
 with per-$(k,n)$ occupations, so a window straddling $E_F$ stays valid.
 `sigma_dispatch` asserts that the head fit's stamped occupations equal the
-body's live state (`gw.mpa.sigma.assert_head_body_occupation_match`).
+body's live state (`gw.mpa.sigma.assert_head_body_occupation_match`). At
+$\delta_{nk}=0$ the sum is $(1/2-f_{nk})W^c(0)/(\Omega N_k)$ with
+$W^c(0)=-2\sum_pR_p/\Omega_p$, so the scalar head fit keeps its poles and
+re-solves the residues with the sample nearest the origin as an equality
+constraint (`gw.mpa.model._pin_static_head_sample`); the unconstrained refit
+had missed that sample by 5.8 Ry bohr$^3$ on Fe $4^3$, $\pm7.7$ meV on shell.
 
 ### 5.4 Exchange, SX and Hartree
 
