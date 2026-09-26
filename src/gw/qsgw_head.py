@@ -2476,6 +2476,14 @@ class IterationHeadSamples:
         )
 
 
+def _metal_intraband(response):
+    """``(N0, D)`` of a metallic head response, ``None`` on an insulator."""
+    if response.drude_tensor is None:
+        return None
+    return (float(response.static_kappa2_bohr2) / (8.0 * np.pi),
+            np.asarray(response.drude_tensor))
+
+
 def _fold_static_kappa2(response, W_body_gamma, cell_volume, mesh):
     """Return kappa_eff^2 after the scalar static wing/body/wing fold."""
     if response.static_kappa2_bohr2 is None:
@@ -2567,7 +2575,8 @@ def finalize_iteration_head_sample(
             float(meta.cell_volume),
             mesh_xy=mesh,
         )
-    static_kappa2 = response.static_kappa2_bohr2
+    intraband = _metal_intraband(response)
+    static_kappa2 = None if intraband is not None else response.static_kappa2_bohr2
     if use_fold and abs(response.omegas[index]) <= 1.0e-14:
         static_kappa2 = _fold_static_kappa2(
             response, W_body_gamma, float(meta.cell_volume), mesh)
@@ -2578,6 +2587,7 @@ def finalize_iteration_head_sample(
         meta=meta,
         config=config,
         static_kappa2_bohr2=static_kappa2,
+        intraband=intraband,
         response_kind=("full_local_fields" if use_fold
                        else "direct_irreducible"),
         source_prefix=("head_schur" if use_fold else "head_direct"),
@@ -2686,8 +2696,10 @@ def finalize_iteration_head_samples(
         )
         jax.block_until_ready(S_effective)
         mem_probe("qsgw_head.finalize_head_samples.post_fold")
+    intraband = _metal_intraband(response)
     static_kappa2 = response.static_kappa2_bohr2
-    if use_fold and static_kappa2 is not None:
+    if use_fold and static_kappa2 is not None and any(
+            abs(z) <= 1.0e-14 for z in response.omegas):
         static_indices = [
             i for i, z in enumerate(response.omegas) if abs(z) <= 1.0e-14]
         if len(static_indices) != 1:
@@ -2695,6 +2707,8 @@ def finalize_iteration_head_samples(
                 "static metallic head requires exactly one z=0 response")
         static_kappa2 = _fold_static_kappa2(
             response, W_gamma[static_indices[0]], float(meta.cell_volume), mesh)
+    elif intraband is not None:
+        static_kappa2 = None
     samples = head_samples_from_s(
         S_effective,
         response.omegas,
@@ -2702,6 +2716,7 @@ def finalize_iteration_head_samples(
         meta=meta,
         config=config,
         static_kappa2_bohr2=static_kappa2,
+        intraband=intraband,
         response_kind=("full_local_fields" if use_fold
                        else "direct_irreducible"),
         source_prefix=("head_schur" if use_fold else "head_direct"),
@@ -2715,6 +2730,47 @@ def finalize_iteration_head_samples(
     )
 
 
+def lindhard_intraband_chi(q_cart, z, drude_tensor, dos):
+    r"""Finite-q intraband density response of the q = 0 cell, in Ry.
+
+    .. math::
+        \chi_{\rm intra}(\mathbf q, z) = -N_0\, L(s), \qquad
+        L(s) = 1 - \frac{s}{2}\ln\frac{s+1}{s-1}, \qquad
+        s = \frac{z}{\bar v(\hat q)\,|q|}, \quad
+        \bar v(\hat q)^2 = \frac{3\,\hat q\cdot D\cdot\hat q}{N_0},
+
+    the Lindhard function of a Fermi surface with the head's own density of
+    states ``N0`` (per Ry per bohr^3) and Drude tensor ``D``.  It carries
+    both limits exactly for any Fermi surface: ``chi -> q.D.q / z^2`` for
+    ``|z| >> vbar q`` (the q-first Drude head) and ``chi -> -N0`` at
+    ``z = 0`` (Thomas-Fermi, ``kappa^2 = 8 pi N0``), and it is the exact
+    Lindhard crossover between them for a spherical one.  Inside the q = 0
+    cell ``|z| < vbar q`` is the particle-hole continuum; there the q-first
+    Drude form screens perfectly where the response is static.  Retarded in
+    the upper half plane, conjugate below.
+    """
+    q = jnp.asarray(q_cart, dtype=jnp.float64)
+    D = jnp.real(jnp.asarray(drude_tensor)).astype(jnp.float64)
+    qDq = jnp.einsum("qa,ab,qb->q", q, D, q)
+    z = complex(z)
+    lower = z.imag < 0.0
+    zz = z.conjugate() if lower else z
+    s = zz / jnp.sqrt(3.0 * jnp.maximum(qDq, 1.0e-300) / float(dos))
+    big = jnp.abs(s) > 20.0
+    s_big = jnp.where(big, s, 20.0 + 0.0j)
+    inv2 = 1.0 / (s_big * s_big)
+    series = jnp.zeros_like(s_big)
+    term = inv2
+    for n in range(1, 13):
+        series = series - term / (2 * n + 1)
+        term = term * inv2
+    s_small = jnp.where(big, 0.0 + 0.0j, s)
+    direct = 1.0 - 0.5 * s_small * (
+        jnp.log(s_small + 1.0) - jnp.log(s_small - 1.0))
+    chi = -float(dos) * jnp.where(big, series, direct)
+    return jnp.conj(chi) if lower else chi
+
+
 def head_samples_from_s(
     S_cart_omega,
     omegas_ry,
@@ -2725,8 +2781,18 @@ def head_samples_from_s(
     static_kappa2_bohr2: float | None = None,
     response_kind="direct_irreducible",
     source_prefix: str = "qsgw_parallel_transport",
+    intraband=None,
 ) -> tuple[object, ...]:
-    """Convert replicated 3x3 S tensors to mini-BZ averaged head samples."""
+    """Convert replicated 3x3 S tensors to mini-BZ averaged head samples.
+
+    ``intraband = (dos, D)`` marks a metal whose ``S`` carries the q-first
+    Drude term ``D / z^2``: at every sample that term is exchanged for the
+    finite-q intraband response of the cell
+    (:func:`lindhard_intraband_chi`), which is Thomas-Fermi at ``z = 0``
+    and Drude for ``|z| >> v_F q``.  ``static_kappa2_bohr2`` names the one
+    exact-zero row that is NOT taken from ``S``: the full head's folded
+    Thomas-Fermi slot.
+    """
     from gw.head_correction import (
         HeadResponseKind, HeadSample, resolve_head_override)
     from gw.isdf_fitting import mem_probe
@@ -2760,6 +2826,14 @@ def head_samples_from_s(
             continue
         is_static_metal = (
             static_kappa2_bohr2 is not None and abs(z) <= 1.0e-14)
+        extra_chi = None
+        if intraband is not None and not is_static_metal:
+            dos, drude = intraband
+            drude = np.asarray(drude, dtype=np.complex128)
+            if abs(z) > 1.0e-15:
+                S = S - drude / (z * z)
+            extra_chi = (lambda q, _z=z, _D=drude, _n=float(dos):
+                         lindhard_intraband_chi(q, _z, _D, _n))
         vc0, wc0 = compute_q0_averages(
             wfn,
             jnp.asarray(0.0, dtype=jnp.float64),
@@ -2771,6 +2845,7 @@ def head_samples_from_s(
             analytic_sphere=bool(getattr(
                 config.head, "analytic_q0_sphere",
                 config.head.head_minibz_average)),
+            extra_chi=extra_chi,
         )
         out.append(
             HeadSample(
