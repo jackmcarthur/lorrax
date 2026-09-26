@@ -1735,7 +1735,7 @@ static TilePlan tile_table_plan(int dev, int tp_max, long long bank_pair, int nk
 // threads covers them, the block takes that many threads (whole warps), if the plan's resident
 // blocks keep at least 56 registers per thread (the fused load's 56 on an A100's 64 K).
 static int tt_threads(long long items, int minb) {
-    if (items <= kThreads || items > 2 * kThreads) return kThreads;
+    if (items <= kThreads || items > 4 * kThreads) return kThreads;
     const int t = static_cast<int>((items + 31) / 32 * 32);
     return 56LL * t * minb <= 65536 ? t : kThreads;
 }
@@ -1802,7 +1802,7 @@ static ffi::Error build(int mode, int nkx, int nky, int nkz, int ns, bool f32,
             // two or more blocks per SM; none fits: the register load at the plan's tile.
             if (cc_major >= 8 && kplan.threads == kThreads && tile_tables_pay(ns)) {
                 const TilePlan tt = tile_table_plan(dev, kplan.tr, static_cast<long long>(chi_grp) * g.rs() * 16,
-                                                    nk, ns, 0, true);
+                                                    nk, ns, 0, false);
                 if (!tt.err.empty()) return fail("device attributes", tt.err);
                 if (tt.tp > 0) {
                     chi_tt = tt.tp;
