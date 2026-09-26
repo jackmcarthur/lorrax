@@ -245,7 +245,7 @@ and the second one is disqualifying:
   measurable condition number, not a convergence failure.
 
 Add to that a P=1 restriction — the two vertex contractions are plain einsums
-over the hoisted ``M_X`` / ``M_Y``, see the refusal in
+over the hoisted ``M``, see the refusal in
 :func:`build_rpa_dyson_preconditioner` — and route B is a measurement, not a
 recommendation.  Route A is the one to wire into the facade.  Route B is kept
 because it is the honest form of "precondition with the RPA resolvent", because
@@ -687,7 +687,7 @@ def build_rpa_dyson_preconditioner(dq: dict, stack: PrecondStack, diag_rpa0,
                                    B_dense) -> tuple:
     """The (B) preconditioner's RUNTIME-argument pytree for :func:`rpa_dyson_precond`.
 
-    ``(diag_rpa0, M_X, M_Y, inv_sqrt_nk, B_dense)`` — everything the apply reads,
+    ``(diag_rpa0, M, inv_sqrt_nk, B_dense)`` — everything the apply reads,
     passed as an argument rather than closed over, for the same reason
     ``matvec_operands`` is: the compiled engine is then keyed on the operator and
     the PRECONDITIONER FUNCTION only, so a whole q x z sweep reuses one
@@ -698,8 +698,8 @@ def build_rpa_dyson_preconditioner(dq: dict, stack: PrecondStack, diag_rpa0,
     because ``gen`` and ``snapshot`` are ``jax.jit``s carrying explicit in/out
     shardings and a nested jit of that shape is not supported (the same wall
     ``w_ladder._accumulate_columns`` documents).  The einsums contract ``c`` (on
-    x in the trial block, full in ``M_X``) and ``v`` (on y, full in ``M_Y``),
-    which GSPMD is free to satisfy by resharding the pair-amplitude tensors
+    x in the trial block and in ``M``) and ``v`` (on y in both), which GSPMD
+    is free to satisfy by resharding the pair-amplitude tensor
     rather than the one-column trial vector.  Route A carries no such
     restriction and is the production recommendation; the P>1 form of route B is
     a shard_map of these two contractions and is a named deferral.
@@ -708,7 +708,7 @@ def build_rpa_dyson_preconditioner(dq: dict, stack: PrecondStack, diag_rpa0,
     if px * py > 1:
         raise NotImplementedError(
             "build_rpa_dyson_preconditioner is P=1 only: its two vertex "
-            f"contractions are plain einsums over M_X/M_Y and this is a "
+            f"contractions are plain einsums over M and this is a "
             f"{px}x{py} mesh.  They cannot call gen/snapshot instead — those "
             "are jax.jit's carrying explicit in/out shardings and nesting one "
             "inside the FGMRES program is not a supported shape — so the P>1 "
@@ -717,7 +717,7 @@ def build_rpa_dyson_preconditioner(dq: dict, stack: PrecondStack, diag_rpa0,
             "it inverts the same dyad exactly and reuses the production "
             "reshard boundaries unchanged.")
     nk = int(dq["nkx"] * dq["nky"] * dq["nkz"])
-    return (diag_rpa0, dq["M_X"], dq["M_Y"], float(1.0 / np.sqrt(nk)), B_dense)
+    return (diag_rpa0, dq["M"], float(1.0 / np.sqrt(nk)), B_dense)
 
 
 # ---------------------------------------------------------------------------
@@ -824,12 +824,12 @@ def rpa_dyson_precond(x, z, args):
     as ``snapshot``/``gen`` (bare vertex on the decode, conjugate on the encode);
     that correspondence is what :func:`check_ring_dyad_identity` measures.
     """
-    diag_rpa0, M_X, M_Y, inv_sqrt_nk, B_dense = args
+    diag_rpa0, M, inv_sqrt_nk, B_dense = args
     rd = x / (z - diag_rpa0)
     s = rd[0] + rd[1]                                        # (b, c, v, k)
-    rho = jnp.einsum("kcvN,bcvk->bN", jnp.conj(M_Y), s) * inv_sqrt_nk
+    rho = jnp.einsum("kcvN,bcvk->bN", jnp.conj(M), s) * inv_sqrt_nk
     u = jnp.einsum("MN,bN->bM", B_dense, rho)
-    g = jnp.einsum("kcvM,bM->bcvk", M_X, u) * inv_sqrt_nk
+    g = jnp.einsum("kcvM,bM->bcvk", M, u) * inv_sqrt_nk
     return rd + jnp.stack([g, -g], axis=0) / (z - diag_rpa0)
 
 

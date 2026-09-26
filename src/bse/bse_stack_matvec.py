@@ -3,19 +3,23 @@
 ``build_bse_stack_matvec`` returns a jitted
 
     matvec(X[n_trials, c, v, k], psi_c_X, psi_c_Y, psi_v_X, psi_v_Y,
-           eps_c, eps_v, W_R, V_q0, M_X, M_Y)  ->  out[n_trials, c, v, k]
+           eps_c, eps_v, W_R, V_q0, M)  ->  out[n_trials, c, v, k]
 
 for the TDA BSE (or RPA) Hamiltonian ``H = D + V - W`` (``D + V`` for RPA).
 
-The exchange pair amplitudes ``M_X`` (μ on x) and ``M_Y`` (ν on y) are pure
-functions of ψ (``compute_pair_amplitude``), so they are HOISTED to matvec inputs
+The exchange pair amplitude ``M[k,c,v,μ] = Σ_s conj(ψ_c) ψ_v`` is a pure function
+of ψ (``compute_pair_amplitude``), so it is HOISTED to a matvec input
 (precomputed ONCE per solve at load time, ``bse_io``) rather than rebuilt inside
 every iteration — the matvec is a per-iteration black-box jit whose ψ args XLA
 cannot hoist across calls (audit P3, ``reports/bse_refactor_map_2026-07-15/archive/
-matvec_efficiency_audit``). Peak-neutral (both M's already lived inside every call);
-only the between-matvec floor rises by ~2·M/p. ``psi_c_Y``/``psi_v_X`` are retained
-in the signature for a uniform calling convention with the ring matvecs (they now
-feed only the W-term's ``psi_c_X``/``psi_v_Y``; the V-term reads the hoisted M's).
+matvec_efficiency_audit``).  ONE copy, in the TRANSITION layout ``sh.M``: (c, v)
+tiled exactly like X (c on x, v on y) and μ whole, so it is 1/P per rank and the
+exchange encode and decode are both local contractions against the rank's own X
+tile; the only collectives are two psums of a (n_trials, μ) vector
+(``_exchange_U``).  It replaced two copies sharded on μ alone (``M_X`` μ on x,
+``M_Y`` ν on y), 2·M/√P per rank.  ``psi_c_Y``/``psi_v_X`` are retained in the
+signature for a uniform calling convention with the ring matvecs (they feed
+only the coupling block's encode here).
 
 Why a stack matvec.  The four legacy TDA matvecs (ring/gather/simple/serial)
 carry the trial axis ``b`` on the direct-term tensor ``T[b, μ, ν, t, s, k]`` —
@@ -117,7 +121,7 @@ standard for this class, cf. the ``contract_bands_block_reshard`` note in
 ``bse_ring_comm.py``).
 
 The exchange term fuses the same way and for the same reason (one ``V_q0``
-solve, one ``M_X`` decode, two encodes), which is worth 0.15% of the traffic and
+solve, one ``M`` decode, two encodes), which is worth 0.15% of the traffic and
 is done because it falls out, not because it pays.  The diagonal ``D`` is
 applied ONCE, not twice: ``B`` has no ``D`` term.
 """
@@ -345,6 +349,53 @@ def _conv_decode(T_b, psi_c_X, psi_v_Y, W_Rk, kconv, sqrt_nk):
     return WXcv / sqrt_nk
 
 
+def _exchange_U(S_part, V_q0):
+    """Inside the (x, y) shard_map: the exchange term's two small reductions.
+
+    ``S_part`` (b, μ) is this rank's partial of the k-summed encode, contracted
+    over its own (c, v) transition tile; ``V_q0`` its (μ_x, ν_y) tile.  One psum
+    completes S, the tile product gives U's μ_x rows summed over this ν_y block,
+    and a second psum completes and replicates U = V_q0 · S, (b, μ).  Both
+    psums move a (b, μ) vector -- the V term's only collectives.
+    """
+    S = lax.psum(S_part, ("x", "y"))
+    mx, ny = V_q0.shape
+    S_y = lax.dynamic_slice_in_dim(S, lax.axis_index("y") * ny, ny, axis=1)
+    U_x = jnp.einsum("MN,bN->bM", V_q0, S_y)                    # (b, μ_x) partial in ν
+    U = lax.dynamic_update_slice_in_dim(
+        jnp.zeros_like(S), U_x, lax.axis_index("x") * mx, axis=1)
+    return lax.psum(U, ("x", "y"))
+
+
+def _make_v_term(mesh_xy, pair: bool):
+    """The exchange (V) term on the transition layout, one shard_map.
+
+    ``pair=False``: ``f(X, M, V_q0, enc, dec) = dec · M (V_q0 (enc · M† X))``.
+    ``pair=True``:  ``f(X, Xb, sc, M, V_q0, enc, dec)`` adds the coupling
+    block's bare-vertex encode ``sc · M^T Xb`` before the ONE V_q0 solve.
+    X, Xb and M are all (c on x, v on y), so both encodes and the decode are
+    rank-local; ``enc``/``dec`` are the scalar normalisations.
+    """
+    xspec = P(None, "x", "y", None)
+
+    def _tda(X, M, V_q0, enc, dec):
+        S = jnp.einsum("kcvN,bcvk->bN", jnp.conj(M), X) * enc      # (b, μ) partial
+        return jnp.einsum("kcvM,bM->bcvk", M, _exchange_U(S, V_q0)) * dec
+
+    def _pair(X, Xb, sc, M, V_q0, enc, dec):
+        S = (jnp.einsum("kcvN,bcvk->bN", jnp.conj(M), X)
+             + sc * jnp.einsum("kcvN,bcvk->bN", M, Xb)) * enc
+        return jnp.einsum("kcvM,bM->bcvk", M, _exchange_U(S, V_q0)) * dec
+
+    if pair:
+        return _shard_map_fn(_pair, mesh=mesh_xy,
+                             in_specs=(xspec, xspec, P(), xspec, P("x", "y"), P(), P()),
+                             out_specs=xspec, check_vma=False)
+    return _shard_map_fn(_tda, mesh=mesh_xy,
+                         in_specs=(xspec, xspec, P("x", "y"), P(), P()),
+                         out_specs=xspec, check_vma=False)
+
+
 def build_bse_stack_matvec(
     mesh_xy: Mesh,
     nkx: int,
@@ -379,14 +430,14 @@ def build_bse_stack_matvec(
 
             K^head_{t,t'} = (1/N_k) · conj(d_a(t)) · M_ab · d_b(t')
 
-        is rank three over transitions and belongs beside ``M_X``/``M_Y``,
+        is rank three over transitions and belongs beside ``M``,
         where this matvec already carries rank-three objects
         (``LT_HEAD_PROBLEM.md`` §6).
 
-        Structurally it IS the exchange term with ``(M_X, M_Y, V_q0)``
+        Structurally it IS the exchange term with ``(M, M, V_q0)``
         replaced by ``(D_head, D_head, M_head)``, which is why it reuses the
         same encode/decode shape and the same ``1/N_k``.  ``D_head`` is
-        ``conj(d)`` with the same ``(k, c, v, a)`` layout as ``M_X`` and a
+        ``conj(d)`` with the same ``(k, c, v, a)`` layout as ``M`` and a
         Cartesian axis of length 3 where μ was; ``M_head`` is the real
         symmetric ``(3, 3)`` cell moment.  Hermiticity of the added term is
         then automatic: ``M`` real symmetric ⇒ ``K^head`` Hermitian.
@@ -501,12 +552,14 @@ def build_bse_stack_matvec(
     if use_gspmd:
         w_stack = _w_gspmd
 
+    v_term = _make_v_term(mesh_xy, pair=False)
+
     def _matvec(X, psi_c_X, psi_c_Y, psi_v_X, psi_v_Y, eps_c, eps_v, W_R, V_q0,
-                M_X, M_Y, D_head=None, M_head=None):
-        # M_X (μ on x) / M_Y (ν on y): hoisted exchange pair amplitudes, precomputed
-        # once per solve (audit P3). psi_c_Y / psi_v_X are now unused here — kept for
-        # a uniform matvec signature with the ring paths; psi_c_X / psi_v_Y still
-        # feed the W-term.
+                M, D_head=None, M_head=None):
+        # M (transition layout, sh.M): the hoisted exchange pair amplitude,
+        # precomputed once per solve (audit P3). psi_c_Y / psi_v_X are unused
+        # here — kept for a uniform matvec signature with the ring paths;
+        # psi_c_X / psi_v_Y feed the W-term.
         sqrt_nk = jnp.sqrt(jnp.asarray(nk, dtype=X.real.dtype))
         # ── D term: (ε_c − ε_v) · X  (batched, local) ──────────────────────────
         delta_E = eps_c.T[None, :, None, :] - eps_v.T[None, None, :, :]
@@ -518,23 +571,21 @@ def build_bse_stack_matvec(
         # the reverse assignment builds conj(K^x), which cannot be covariant
         # alongside the (correct, untouched) W term.
         # The encode carries the scalar-singlet weight (2 scalar, 1 spinor).
+        # Encode k-SUMMED S = M† X, U = V_q0 S, decode M U broadcast over k —
+        # all against the rank's own (c, v) tile; ``_exchange_U`` holds the two
+        # (b, μ) psums.
         w_x = exchange_spin_weight(psi_c_X.shape[2])
-        S = jnp.einsum("kcvN,bcvk->bN", jnp.conj(M_Y), X)         # k SUMMED → (b, ν_loc)
-        S = lax.with_sharding_constraint(S, sh.S_k0) / sqrt_nk * w_x   # ×1.0 is exact
-        U = jnp.einsum("MN,bN->bM", V_q0, S)                      # (b, μ_loc)
-        U = lax.with_sharding_constraint(U, sh.d_mu)
-        VX = jnp.einsum("kcvM,bM->bcvk", M_X, U)                 # broadcast over k
-        VX = lax.with_sharding_constraint(VX, sh.X) / sqrt_nk
+        VX = v_term(X, M, V_q0, w_x / sqrt_nk, 1.0 / sqrt_nk)
 
         if head_tensor:
             # ── Head term: the SAME contraction with (D_head, M_head) in
-            #    place of (M_Y, V_q0, M_X).  Three Cartesian components stand
+            #    place of (M, V_q0, M).  Three Cartesian components stand
             #    where μ stood, so this is three inner products per trial
             #    vector and a 3x3 — free next to everything above.  The
             #    conjugation follows the V term's exactly, and must: the
             #    encode leg carries the conjugated vertex.
             # D_head = conj(d), so conj(D_head) is the bare dipole and the
-            # two legs read exactly as M_Y / M_X do above.
+            # two legs read exactly as the encode / decode M do above.
             Sh = jnp.einsum("kcva,bcvk->ba", jnp.conj(D_head), X) / sqrt_nk * w_x
             Uh = Sh @ M_head.astype(Sh.dtype).T                   # U_a = M_ab S_b
             HX = jnp.einsum("kcva,ba->bcvk", D_head, Uh)
@@ -547,7 +598,7 @@ def build_bse_stack_matvec(
         return D_term + VX - WX
 
     in_sh = [sh.X, sh.psi_x, sh.psi_y, sh.psi_x, sh.psi_y,
-             sh.eps, sh.eps, sh.W, sh.V, sh.psi_x, sh.psi_y]
+             sh.eps, sh.eps, sh.W, sh.V, sh.M]
     if head_tensor:
         # D_head / M_head are small and replicated: three Cartesian channels
         # over (k, c, v) and a 3x3.  No mesh axis to tile them on.
@@ -654,8 +705,10 @@ def build_bse_stack_pair_matvec(
         out_specs=P(None, "x", "y", None),
     )
 
+    v_pair = _make_v_term(mesh_xy, pair=True)
+
     def _pair(X, s, psi_c_X, psi_c_Y, psi_v_X, psi_v_Y, eps_c, eps_v, W_R,
-              V_q0, M_X, M_Y):
+              V_q0, M):
         sqrt_nk = jnp.sqrt(jnp.asarray(nk, dtype=X.real.dtype))
         sc = s.astype(X.dtype)
         Xb = jnp.conj(X)
@@ -673,14 +726,10 @@ def build_bse_stack_pair_matvec(
         #    spells the same thing as ``apply_V_ring_B``, which conjugates ψ^Y
         #    on the way in).  DO NOT "improve" this conjugation: the exchange
         #    conjugation is settled and re-litigating it is a known failure.
-        S_A = jnp.einsum("kcvN,bcvk->bN", jnp.conj(M_Y), X)       # (b, ν_loc)
-        S_B = jnp.einsum("kcvN,bcvk->bN", M_Y, Xb)                # (b, ν_loc)
-        S = (lax.with_sharding_constraint(S_A + sc * S_B, sh.S_k0) / sqrt_nk
-             * exchange_spin_weight(psi_c_X.shape[2]))
-        U = jnp.einsum("MN,bN->bM", V_q0, S)                      # (b, μ_loc)
-        U = lax.with_sharding_constraint(U, sh.d_mu)
-        VX = jnp.einsum("kcvM,bM->bcvk", M_X, U)                  # broadcast over k
-        VX = lax.with_sharding_constraint(VX, sh.X) / sqrt_nk
+        #    Both encodes and the decode are local on the transition layout
+        #    (``_make_v_term``); one V_q0 solve serves both blocks.
+        VX = v_pair(X, Xb, sc, M, V_q0,
+                    exchange_spin_weight(psi_c_X.shape[2]) / sqrt_nk, 1.0 / sqrt_nk)
 
         if not include_W:
             return D_term + VX
@@ -691,6 +740,6 @@ def build_bse_stack_pair_matvec(
     return jax.jit(
         _pair,
         in_shardings=(sh.X, rep, sh.psi_x, sh.psi_y, sh.psi_x, sh.psi_y,
-                      sh.eps, sh.eps, sh.W, sh.V, sh.psi_x, sh.psi_y),
+                      sh.eps, sh.eps, sh.W, sh.V, sh.M),
         out_shardings=sh.X,
     )

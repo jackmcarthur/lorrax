@@ -255,24 +255,21 @@ def load_bse_data_from_restart_sharded(
             warnings.warn(msg, RuntimeWarning, stacklevel=2)
             print(f"BSE-sharded: [WARN] {msg}")
 
-    # Exchange pair amplitudes M(k,c,v,μ) = Σ_s conj(ψ_c) ψ_v, hoisted so the
-    # per-iteration matvec receives them instead of rebuilding them from ψ:
-    # the V-term decode (M_X, μ on x) and encode (M_Y, ν on y) vertices.
-    # Peak-neutral; the between-matvec floor rises by ~2·M/p.
-    M_X = jax.lax.with_sharding_constraint(
+    # Exchange pair amplitude M(k,c,v,μ) = Σ_s conj(ψ_c) ψ_v, hoisted so the
+    # per-iteration matvec receives it instead of rebuilding it from ψ.  ONE
+    # copy in the transition layout (c on x, v on y, μ whole): 1/P per rank,
+    # and both V-term legs (encode, decode) read it locally.  Was two copies
+    # sharded on μ only (M_X μ on x, M_Y ν on y), 2·M/√P per rank.
+    M = jax.lax.with_sharding_constraint(
         compute_pair_amplitude(psi_c_X, psi_v_X),
-        NamedSharding(mesh_xy, P(None, None, None, "x")))
-    M_Y = jax.lax.with_sharding_constraint(
-        compute_pair_amplitude(psi_c_Y, psi_v_Y),
-        NamedSharding(mesh_xy, P(None, None, None, "y")))
+        NamedSharding(mesh_xy, P(None, "x", "y", None)))
 
     data = {
         "psi_c_X": psi_c_X,
         "psi_c_Y": psi_c_Y,
         "psi_v_X": psi_v_X,
         "psi_v_Y": psi_v_Y,
-        "M_X": M_X,
-        "M_Y": M_Y,
+        "M": M,
         "eps_c": eps_c,
         "eps_v": eps_v,
         "W_q": W_q,

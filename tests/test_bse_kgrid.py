@@ -129,7 +129,7 @@ def test_on_grid_identity_byte_equal(tmp_path):
     d0 = _load(restart, inp, mesh_xy, None)
     cg = (int(d0["nkx"]), int(d0["nky"]), int(d0["nkz"]))
     d1 = _load(restart, inp, mesh_xy, cg)          # == coarse → fast path
-    for k in ("psi_c_X", "psi_v_X", "M_X", "eps_c", "eps_v", "W_q", "V_q0"):
+    for k in ("psi_c_X", "psi_v_X", "M", "eps_c", "eps_v", "W_q", "V_q0"):
         a, b = np.asarray(jax.device_get(d0[k])), np.asarray(jax.device_get(d1[k]))
         assert np.array_equal(a, b), f"{k} not byte-identical on the fast path"
 
@@ -176,7 +176,7 @@ def test_densify_3to6_shapes_and_solvable(tmp_path):
         X = Vb.reshape(bs, nc_pad, nv_pad, nk_f)
         X = jax.lax.with_sharding_constraint(X, sh.X)
         HX = matvec(X, df["psi_c_X"], df["psi_c_Y"], df["psi_v_X"], df["psi_v_Y"],
-                    df["eps_c"], df["eps_v"], W_R, df["V_q0"], df["M_X"], df["M_Y"])
+                    df["eps_c"], df["eps_v"], W_R, df["V_q0"], df["M"])
         return HX.reshape(bs, -1)
 
     evs, _ = block_lanczos_eig_jit(mvb, n_flat, n_eig=4, block_size=bs,

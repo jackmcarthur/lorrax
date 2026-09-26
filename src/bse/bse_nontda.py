@@ -286,7 +286,7 @@ def _full_matvec_and_args(data, mesh_xy, sh, *, include_W, with_halves=False):
         W_R = data["W_q"]
     args = (data["psi_c_X"], data["psi_c_Y"], data["psi_v_X"], data["psi_v_Y"],
             data["eps_c"], data["eps_v"], W_R, data["V_q0"],
-            data["M_X"], data["M_Y"])
+            data["M"])
     return (matvec, args, halves) if with_halves else (matvec, args)
 
 
@@ -362,7 +362,7 @@ def _materialize_A_B(matvec_full, args, sh, nc, nv, nk, *, col_chunk=None,
     # digit because conjugation only flips a sign bit.
     A_out = np.empty((N, N), dtype=np.complex128)       # [flat, col]
     B_out = np.empty((N, N), dtype=np.complex128)
-    a_args = args[:9]                                   # ... eps_c, eps_v, W_R, V_q0, M_X
+    a_args = args[:9]                                   # ... eps_c, eps_v, W_R, V_q0, M
     b_args = (args[0], args[1], args[2], args[3], args[6], args[7], args[8])
     for c0 in range(0, N, col_chunk):
         blk = eye[c0:c0 + col_chunk]                     # (b, nc, nv, nk)
@@ -495,7 +495,7 @@ def _solve_nontda_matrix_free(data, mesh_xy, sh, args, nc, nv, nk, n_eig, *,
     rep = NamedSharding(mesh_xy, P())
     UV_sh = NamedSharding(mesh_xy, P(None, None, "x", "y", None))
     in_sh = (sh.psi_x, sh.psi_y, sh.psi_x, sh.psi_y, sh.eps, sh.eps,
-             sh.W, sh.V, sh.psi_x, sh.psi_y)
+             sh.W, sh.V, sh.M)
     _l = log if log is not None else (lambda *_a, **_k: None)
 
     @partial(jax.jit, in_shardings=in_sh)

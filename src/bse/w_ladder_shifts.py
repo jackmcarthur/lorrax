@@ -308,10 +308,10 @@ would need an inner chunk loop it does not have today.
 
 HOISTING, VERIFIED (2026-08-16, by reading the call graph)
 ----------------------------------------------------------
-* **Pair densities are hoisted per operator, not per matvec.** ``M_X``/``M_Y``
-  are payload slots threaded through ``bse_feast.matvec_operands`` as runtime
-  arguments (audit P3), and ``apply_V_ring`` takes ``M_X`` as a parameter —
-  the matvec never rebuilds them.  The direct rung uses no pair density at all
+* **Pair densities are hoisted per operator, not per matvec.** ``M`` is a
+  payload slot threaded through ``bse_feast.matvec_operands`` as a runtime
+  argument (audit P3), and ``apply_V_ring`` takes its μ-on-x view ``M_X`` as a
+  parameter — the matvec never rebuilds it.  The direct rung uses no pair density at all
   (it contracts ``psi`` through ``T``), and its per-matvec work is a genuine
   function of the trial vector, so there is nothing hoistable left in it.
 * **One exception, and the seed hoist covers it — and it matters most exactly

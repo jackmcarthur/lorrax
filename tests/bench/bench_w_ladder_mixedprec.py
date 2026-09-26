@@ -580,7 +580,7 @@ def main() -> int:
         q = q_list[qidx[0]]
         dq, diag = _dq(q)
         z = zs[0]
-        M = np.asarray(gather_to_host(dq["M_X"]))       # (k, c, v, mu)
+        M = np.asarray(gather_to_host(dq["M"]))       # (k, c, v, mu)
 
         def sex(tile):
             W = np.asarray(tile)[:nlog, :nlog]

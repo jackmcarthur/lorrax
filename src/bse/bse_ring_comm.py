@@ -316,6 +316,9 @@ def make_bse_shardings(mesh_xy: Mesh) -> SimpleNamespace:
         X_full=NamedSharding(mesh_xy, P(None, None, "x", "y", None)),
         psi_x=NamedSharding(mesh_xy, P(None, None, None, "x")),
         psi_y=NamedSharding(mesh_xy, P(None, None, None, "y")),
+        # The exchange pair amplitude M (k, c, v, μ): transitions tiled like X
+        # (c on x, v on y), μ whole -- 1/P per rank, one copy for both legs.
+        M=NamedSharding(mesh_xy, P(None, "x", "y", None)),
         V=NamedSharding(mesh_xy, P("x", "y")),
         W=NamedSharding(mesh_xy, P("x", "y", None, None, None)),
         eps=NamedSharding(mesh_xy, P(None, None)),
@@ -1067,10 +1070,11 @@ def build_bse_ring_matvec_full(
         # EXTRA runtime operands (rolled, UN-flipped) — see
         # bse_feast.ladder_matvec_operands and _w_term_A's operand contract.
         def _matvec_impl(X_full, psi_c_X, psi_c_Y, psi_v_X, psi_v_Y, eps_c,
-                         eps_v, W_R, V_q0, M_X, M_Y,
+                         eps_v, W_R, V_q0, M,
                          psi_cW_X, psi_cW_Y, psi_vW_X, psi_vW_Y):
-            # M_X: hoisted decode-side exchange pair amplitude (audit P3).
-            # M_Y is unused here — kept for a uniform matvec signature.
+            # M: the hoisted exchange pair amplitude (audit P3) in the shared
+            # transition layout (sh.M); the ring decode reads it μ-on-x.
+            M_X = lax.with_sharding_constraint(M, sh.psi_x)
             return _impl_core(X_full, psi_c_X, psi_c_Y, psi_v_X, psi_v_Y,
                               eps_c, eps_v, W_R, V_q0, M_X,
                               psi_cW_X, psi_cW_Y, psi_vW_X, psi_vW_Y)
@@ -1081,18 +1085,20 @@ def build_bse_ring_matvec_full(
                 sh.X_full,
                 sh.psi_x, sh.psi_y, sh.psi_x, sh.psi_y,
                 sh.eps, sh.eps, sh.W, sh.V,
-                sh.psi_x, sh.psi_y,
+                sh.M,
                 sh.psi_x, sh.psi_y, sh.psi_x, sh.psi_y,
             ),
             out_shardings=sh.X_full,
         )
     else:
         def _matvec_impl(X_full, psi_c_X, psi_c_Y, psi_v_X, psi_v_Y, eps_c,
-                         eps_v, W_R, V_q0, M_X, M_Y):
-            # M_X: hoisted decode-side exchange pair amplitude (audit P3), shared by
-            # the A and B blocks. M_Y is unused here — kept for a uniform matvec
-            # signature.  The rung (if any) consumes the density psi arrays —
-            # correct for every raw payload (the only kind these operators see).
+                         eps_v, W_R, V_q0, M):
+            # M: the hoisted exchange pair amplitude (audit P3) in the shared
+            # transition layout (sh.M), read μ-on-x by the ring decode and shared
+            # by the A and B blocks.  The rung (if any) consumes the density psi
+            # arrays — correct for every raw payload (the only kind these
+            # operators see).
+            M_X = lax.with_sharding_constraint(M, sh.psi_x)
             return _impl_core(X_full, psi_c_X, psi_c_Y, psi_v_X, psi_v_Y,
                               eps_c, eps_v, W_R, V_q0, M_X,
                               psi_c_X, psi_c_Y, psi_v_X, psi_v_Y)
@@ -1109,8 +1115,7 @@ def build_bse_ring_matvec_full(
                 sh.eps,
                 sh.W,
                 sh.V,
-                sh.psi_x,
-                sh.psi_y,
+                sh.M,
             ),
             out_shardings=sh.X_full,
         )
@@ -1128,24 +1133,26 @@ def build_bse_ring_matvec_full(
     # Half-appliers serve raw payloads only (the ladder_rung_slots combination
     # refuses above), so the rung's psi operands ARE the density ones here.
     def _apply_A_raw(X, psi_c_X, psi_c_Y, psi_v_X, psi_v_Y, eps_c, eps_v,
-                     W_R, V_q0, M_X):
+                     W_R, V_q0, M):
+        M_X = lax.with_sharding_constraint(M, sh.psi_x)
         return _apply_A(X, psi_c_X, psi_c_Y, psi_v_X, psi_v_Y, eps_c, eps_v,
                         W_R, V_q0, M_X, psi_c_X, psi_v_Y)
 
-    def _apply_B_raw(X, psi_c_X, psi_c_Y, psi_v_X, psi_v_Y, W_R, V_q0, M_X):
+    def _apply_B_raw(X, psi_c_X, psi_c_Y, psi_v_X, psi_v_Y, W_R, V_q0, M):
+        M_X = lax.with_sharding_constraint(M, sh.psi_x)
         return _apply_B(X, psi_c_X, psi_c_Y, psi_v_X, psi_v_Y, W_R, V_q0, M_X,
                         psi_c_X, psi_c_Y, psi_v_X, psi_v_Y)
 
     apply_A = jax.jit(
         _apply_A_raw,
         in_shardings=(sh.X, sh.psi_x, sh.psi_y, sh.psi_x, sh.psi_y,
-                      sh.eps, sh.eps, sh.W, sh.V, sh.psi_x),
+                      sh.eps, sh.eps, sh.W, sh.V, sh.M),
         out_shardings=sh.X,
     )
     apply_B = jax.jit(
         _apply_B_raw,
         in_shardings=(sh.X, sh.psi_x, sh.psi_y, sh.psi_x, sh.psi_y,
-                      sh.W, sh.V, sh.psi_x),
+                      sh.W, sh.V, sh.M),
         out_shardings=sh.X,
     )
     return matvec, apply_A, apply_B

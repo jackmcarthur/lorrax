@@ -127,7 +127,7 @@ def main(argv=None):
     psi_v_X, psi_v_Y = data["psi_v_X"], data["psi_v_Y"]
     eps_c, eps_v = data["eps_c"], data["eps_v"]
     V_q0 = data["V_q0"]
-    M_X, M_Y = data["M_X"], data["M_Y"]  # hoisted V-term pair-amps (audit P3)
+    M = data["M"]  # hoisted V-term pair amplitude (audit P3)
 
     # The stack matvec scans its trial axis internally (one T-tensor alive
     # regardless of the Davidson block width), so the whole block goes in.
@@ -137,7 +137,7 @@ def main(argv=None):
     # Pass psi_*, eps_*, W_R, V_q0 as arguments to the jit'd function;
     # the whole Davidson solve receives those arrays through explicit data.
     operator_data = (psi_c_X, psi_c_Y, psi_v_X, psi_v_Y,
-                     eps_c, eps_v, W_R, V_q0, M_X, M_Y)
+                     eps_c, eps_v, W_R, V_q0, M)
 
     def apply_H(solver_data, X):
         return matvec_stack(X, *solver_data[0])

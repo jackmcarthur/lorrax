@@ -286,10 +286,8 @@ def _synthetic_payload(mesh, *, nkx=2, nky=2, nkz=1, nc=2, nv=2, nmu=8, seed=7):
             "nkx": nkx, "nky": nky, "nkz": nkz,
             "n_cond_pad": nc, "n_val_pad": nv, "n_rmu": nmu,
         }
-        d["M_X"] = jax.lax.with_sharding_constraint(
-            compute_pair_amplitude(d["psi_c_X"], d["psi_v_X"]), sh.psi_x)
-        d["M_Y"] = jax.lax.with_sharding_constraint(
-            compute_pair_amplitude(d["psi_c_Y"], d["psi_v_Y"]), sh.psi_y)
+        d["M"] = jax.lax.with_sharding_constraint(
+            compute_pair_amplitude(d["psi_c_X"], d["psi_v_X"]), sh.M)
     return d
 
 
@@ -370,10 +368,8 @@ def _trs_synthetic_payload(mesh, *, nkx=3, nky=3, nkz=1, nc=2, nv=2, nmu=8,
             "nkx": nkx, "nky": nky, "nkz": nkz,
             "n_cond_pad": nc, "n_val_pad": nv, "n_rmu": nmu,
         }
-        d["M_X"] = jax.lax.with_sharding_constraint(
-            compute_pair_amplitude(d["psi_c_X"], d["psi_v_X"]), sh.psi_x)
-        d["M_Y"] = jax.lax.with_sharding_constraint(
-            compute_pair_amplitude(d["psi_c_Y"], d["psi_v_Y"]), sh.psi_y)
+        d["M"] = jax.lax.with_sharding_constraint(
+            compute_pair_amplitude(d["psi_c_X"], d["psi_v_X"]), sh.M)
     return d, neg
 
 
@@ -460,10 +456,8 @@ def test_w_ladder_trs_gauge_mechanism_on_a_synthetic_payload(ns):
         scr[f"{name}_X"] = jax.device_put(psi, sh.psi_x)
         scr[f"{name}_Y"] = jax.device_put(psi, sh.psi_y)
     with mesh:
-        scr["M_X"] = jax.lax.with_sharding_constraint(
-            compute_pair_amplitude(scr["psi_c_X"], scr["psi_v_X"]), sh.psi_x)
-        scr["M_Y"] = jax.lax.with_sharding_constraint(
-            compute_pair_amplitude(scr["psi_c_Y"], scr["psi_v_Y"]), sh.psi_y)
+        scr["M"] = jax.lax.with_sharding_constraint(
+            compute_pair_amplitude(scr["psi_c_X"], scr["psi_v_X"]), sh.M)
 
     rel_bad = _reciprocity_of_production(scr, mesh, q, cols)
     print(f"[trs-mechanism] TRS gauge {rel_good:.3e}   scrambled {rel_bad:.3e}")
@@ -618,10 +612,8 @@ def test_w_ladder_gauge_sensitivity_is_real_bounded_and_reciprocity_blind():
         gaugeB[f"{nm}_X"] = jax.device_put(psi, sh.psi_x)
         gaugeB[f"{nm}_Y"] = jax.device_put(psi, sh.psi_y)
     with mesh:
-        gaugeB["M_X"] = jax.lax.with_sharding_constraint(
-            compute_pair_amplitude(gaugeB["psi_c_X"], gaugeB["psi_v_X"]), sh.psi_x)
-        gaugeB["M_Y"] = jax.lax.with_sharding_constraint(
-            compute_pair_amplitude(gaugeB["psi_c_Y"], gaugeB["psi_v_Y"]), sh.psi_y)
+        gaugeB["M"] = jax.lax.with_sharding_constraint(
+            compute_pair_amplitude(gaugeB["psi_c_X"], gaugeB["psi_v_X"]), sh.M)
 
     tiles = {}
     for tag, payload in (("A", data), ("B", gaugeB)):

@@ -126,7 +126,7 @@ def test_dial_preserves_the_operator(bse_dense_state, monkeypatch, opt, tol,
         HXs = np.asarray(mv(
             Xs, arr["psi_c_X"], arr["psi_c_Y"], arr["psi_v_X"], arr["psi_v_Y"],
             data["eps_c"], data["eps_v"], arr["W_R"], arr["V_q0"],
-            arr["M_X"], arr["M_Y"]))
+            arr["M"]))
     for t in range(nt):
         ref = H @ np.asarray(X)[t].reshape(-1)
         err = _relerr(HXs[t].reshape(-1), ref)

@@ -60,26 +60,25 @@ def make_bse_h_tilde(matvec, data, e_center, half_width):
     eps_v = data["eps_v"]
     W_R = data["W_R"]
     V_q0 = data["V_q0"]
-    M_X = data["M_X"]  # hoisted V-term pair-amps (audit P3)
-    M_Y = data["M_Y"]
+    M = data["M"]  # hoisted V-term pair amplitude (audit P3)
 
     dtype_real = eps_c.dtype
     e_center_jnp = jnp.asarray(e_center, dtype=dtype_real)
     inv_hw = jnp.asarray(1.0 / half_width, dtype=dtype_real)
 
-    # The ten operands are RETURNED for the caller to pass as runtime arguments
+    # The nine operands are RETURNED for the caller to pass as runtime arguments
     # rather than captured here (registered R1).  They are mesh-sharded, so a
     # jit that closes over them is refused at trace time at P>1 with "Closing
     # over jax.Array that spans non-addressable devices" -- which is how KPM
     # died at P>1 before any downstream device_get could be reached.
     @jax.jit
     def apply_h_tilde(x, psi_c_X, psi_c_Y, psi_v_X, psi_v_Y,
-                      eps_c, eps_v, W_R, V_q0, M_X, M_Y):
-        hx = matvec(x, psi_c_X, psi_c_Y, psi_v_X, psi_v_Y, eps_c, eps_v, W_R, V_q0, M_X, M_Y)
+                      eps_c, eps_v, W_R, V_q0, M):
+        hx = matvec(x, psi_c_X, psi_c_Y, psi_v_X, psi_v_Y, eps_c, eps_v, W_R, V_q0, M)
         return (hx - e_center_jnp * x) * inv_hw
 
     operands = (psi_c_X, psi_c_Y, psi_v_X, psi_v_Y, eps_c, eps_v, W_R, V_q0,
-                M_X, M_Y)
+                M)
     return apply_h_tilde, operands
 
 

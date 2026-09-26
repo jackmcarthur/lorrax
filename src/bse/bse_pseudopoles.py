@@ -116,8 +116,7 @@ def _build_reduced_h(matvec, basis: list[jax.Array], data: dict, use_tda: bool) 
                 data["eps_v"],
                 data["W_R"],
                 data["V_q0"],
-                data["M_X"],  # hoisted V-term pair-amps (audit P3)
-                data["M_Y"],
+                data["M"],  # hoisted V-term pair amplitude (audit P3)
             )
         )
     V = jnp.stack(basis, axis=0)

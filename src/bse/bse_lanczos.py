@@ -264,11 +264,11 @@ def solve_bse_sharded(
         psi_v_X = data["psi_v_X"]; psi_v_Y = data["psi_v_Y"]
         eps_c   = data["eps_c"];   eps_v   = data["eps_v"]
         V_q0    = data["V_q0"]
-        M_X     = data["M_X"];     M_Y     = data["M_Y"]  # hoisted V-term pair-amps (P3)
+        M       = data["M"]  # hoisted V-term pair amplitude (P3)
         # W_R already built above (donated top-level ifft).
 
         operator_data = (psi_c_X, psi_c_Y, psi_v_X, psi_v_Y,
-                         eps_c, eps_v, W_R, V_q0, M_X, M_Y)
+                         eps_c, eps_v, W_R, V_q0, M)
 
         def apply_H(solver_data, V):
             V = jax.lax.with_sharding_constraint(V, sh.X)
@@ -294,7 +294,7 @@ def solve_bse_sharded(
             _memo_before = exact_diagonal_memo_stats()["hits"]
             with timing.section("bse.solve.exact_diag"):
                 _diag_H = build_bse_exact_diagonal(
-                    eps_c, eps_v, psi_c_X, psi_v_Y, _W_q0, M_X, M_Y, V_q0,
+                    eps_c, eps_v, psi_c_X, psi_v_Y, _W_q0, M, V_q0,
                     nk, sharding=NamedSharding(mesh_xy, P("x", "y", None)))
                 _diag_H.block_until_ready()
             _memoised = exact_diagonal_memo_stats()["hits"] > _memo_before
@@ -431,7 +431,7 @@ def solve_bse_sharded(
         psi_v_X = data["psi_v_X"]; psi_v_Y = data["psi_v_Y"]
         eps_c   = data["eps_c"];   eps_v   = data["eps_v"]
         V_q0    = data["V_q0"]
-        M_X     = data["M_X"];     M_Y     = data["M_Y"]
+        M       = data["M"]
 
         m_max = int(trlan_m_max) if trlan_m_max else max(3 * n_eig, 60)
         n_keep = int(trlan_n_keep) if trlan_n_keep else n_eig + 10
@@ -462,12 +462,12 @@ def solve_bse_sharded(
             jax.jit,
             in_shardings=(
                 sh.psi_x, sh.psi_y, sh.psi_x, sh.psi_y,
-                sh.eps, sh.eps, sh.W, sh.V, sh.psi_x, sh.psi_y,
+                sh.eps, sh.eps, sh.W, sh.V, sh.M,
             ),
             # Keep Ritz vectors distributed; the streaming writer owns host I/O.
             out_shardings=(rep_tr, bse_sharding, rep_tr),
         )
-        def _trlan_run(pcx, pcy, pvx, pvy, ec, ev, WR, Vq0, MX, MY):
+        def _trlan_run(pcx, pcy, pvx, pvy, ec, ev, WR, Vq0, M):
             def apply_H(V):
                 V = jax.lax.with_sharding_constraint(V, sh.X)
                 return matvec_ring(V, pcx, pcy, pvx, pvy, ec, ev, WR, Vq0,
@@ -481,7 +481,7 @@ def solve_bse_sharded(
 
         eigenvalues, eigenvectors, alpha_im = _trlan_run(
             psi_c_X, psi_c_Y, psi_v_X, psi_v_Y, eps_c, eps_v, W_R, V_q0,
-            M_X, M_Y)
+            M)
         print(f"Thick-restart Lanczos: max |Im <q,Hq>| = "
               f"{float(alpha_im):.3e} Ry", flush=True)
         eigenvectors = eigenvectors.reshape(n_eig, 1, nc_pad, nv_pad, nk)
@@ -513,7 +513,7 @@ def solve_bse_sharded(
         jax.jit,
         in_shardings=(
             sh.psi_x, sh.psi_y, sh.psi_x, sh.psi_y,
-            sh.eps, sh.eps, sh.W, sh.V, sh.psi_x, sh.psi_y,
+            sh.eps, sh.eps, sh.W, sh.V, sh.M,
         ),
         # Fourth entry covers the α-Hermiticity payload: a pytree prefix, so
         # ``rep_eig`` applies to each of its (replicated, scalar) leaves.
@@ -524,17 +524,17 @@ def solve_bse_sharded(
         # is the original audit-P5 observation; the fix was to move the
         # transform out, not to donate the eigensolve's inputs.
     )
-    def _full_run(psi_c_X, psi_c_Y, psi_v_X, psi_v_Y, eps_c, eps_v, W_R, V_q0, M_X, M_Y):
+    def _full_run(psi_c_X, psi_c_Y, psi_v_X, psi_v_Y, eps_c, eps_v, W_R, V_q0, M):
         with alpha_herm_sink() as _sink:
             evs, evecs, n_it = _krylov(
                 psi_c_X, psi_c_Y, psi_v_X, psi_v_Y, eps_c, eps_v,
-                W_R, V_q0, M_X, M_Y,
+                W_R, V_q0, M,
             )
         labels, payload = split_alpha_sink(_sink)
         _alpha_labels[:] = labels
         return evs, evecs, n_it, payload
 
-    def _krylov(psi_c_X, psi_c_Y, psi_v_X, psi_v_Y, eps_c, eps_v, W_R, V_q0, M_X, M_Y):
+    def _krylov(psi_c_X, psi_c_Y, psi_v_X, psi_v_Y, eps_c, eps_v, W_R, V_q0, M):
         if bs == 1:
             # Single-vector matvec — accept (n_flat,) and reshape to (1, c, v, k).
             def matvec(v_flat):
@@ -542,7 +542,7 @@ def solve_bse_sharded(
                 X = jax.lax.with_sharding_constraint(X, sh.X)
                 HX = matvec_ring(
                     X, psi_c_X, psi_c_Y, psi_v_X, psi_v_Y,
-                    eps_c, eps_v, W_R, V_q0, M_X, M_Y,
+                    eps_c, eps_v, W_R, V_q0, M,
                 )
                 return HX[0]
             if rtol > 0.0:
@@ -576,7 +576,7 @@ def solve_bse_sharded(
                 X = jax.lax.with_sharding_constraint(X, sh.X)
                 HX = matvec_ring(
                     X, psi_c_X, psi_c_Y, psi_v_X, psi_v_Y,
-                    eps_c, eps_v, W_R, V_q0, M_X, M_Y,
+                    eps_c, eps_v, W_R, V_q0, M,
                 )
                 return HX
             if rtol > 0.0:
@@ -609,7 +609,7 @@ def solve_bse_sharded(
         data["psi_v_X"], data["psi_v_Y"],
         data["eps_c"], data["eps_v"],
         W_R, data["V_q0"],
-        data["M_X"], data["M_Y"],
+        data["M"],
     )
     with timing.section("bse.solve.krylov_compile"):
         _full_run_c = _full_run.lower(*_args).compile()

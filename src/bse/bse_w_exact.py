@@ -282,14 +282,12 @@ def build_finite_q_data(data, q, mesh_xy):
         jnp.conj(data["psi_v_X"]), sh.psi_x)
     dq["psi_v_Y"] = jax.lax.with_sharding_constraint(
         jnp.conj(data["psi_v_Y"]), sh.psi_y)
-    # M_X/M_Y are hoisted V-term pair amplitudes (audit P3) and are pure functions
+    # M is the hoisted V-term pair amplitude (audit P3) and is a pure function
     # of ψ — the finite-q roll shifted psi_c and the vertex flip conjugated both,
     # so recompute them from the ROLLED, CONJUGATED states.  The q=0 M's
     # shallow-copied from `data` would be stale twice over.
-    dq["M_X"] = jax.lax.with_sharding_constraint(
-        compute_pair_amplitude(dq["psi_c_X"], dq["psi_v_X"]), sh.psi_x)
-    dq["M_Y"] = jax.lax.with_sharding_constraint(
-        compute_pair_amplitude(dq["psi_c_Y"], dq["psi_v_Y"]), sh.psi_y)
+    dq["M"] = jax.lax.with_sharding_constraint(
+        compute_pair_amplitude(dq["psi_c_X"], dq["psi_v_X"]), sh.M)
     # The flip is EXACT for the four density vertices (above) and WRONG for
     # the direct rung: the rung is bilinear in (c,c')/(v,v') band pairs and
     # must consume the PHYSICAL (rolled, UN-flipped) arrays — running it on
@@ -742,10 +740,8 @@ def enforce_trs_pair_gauge(data, mesh_xy):
     out["psi_v_Y"] = device_put_process_local(psi_v, sh.psi_y)
     out["eps_c"] = device_put_process_local(eps_c, sh.eps)
     out["eps_v"] = device_put_process_local(eps_v, sh.eps)
-    out["M_X"] = jax.lax.with_sharding_constraint(
-        compute_pair_amplitude(out["psi_c_X"], out["psi_v_X"]), sh.psi_x)
-    out["M_Y"] = jax.lax.with_sharding_constraint(
-        compute_pair_amplitude(out["psi_c_Y"], out["psi_v_Y"]), sh.psi_y)
+    out["M"] = jax.lax.with_sharding_constraint(
+        compute_pair_amplitude(out["psi_c_X"], out["psi_v_X"]), sh.M)
     return out
 
 
