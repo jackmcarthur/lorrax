@@ -134,6 +134,7 @@ from jax import lax
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
 from common.shard_map import shard_map as _shard_map_fn
+from common.vma import mark_varying
 
 from common.contract_bands import reduce_scatter_to_band_block
 from common.fft_helpers import (klead_outer_decode_refusal, klead_outer_refusal,
@@ -407,7 +408,10 @@ def _outer_w_term(route, rank, psi_c_X, psi_v_Y, W_R, sqrt_nk, mesh_xy, kgrid):
         return lambda L, R, conj_r=False: _decode(conv(L, R, W_Rm, conj_r=conj_r), psi_c_X, psi_v_Y, sqrt_nk)
     prep, apply = make_local_kconv_klead_outer_decode(mesh_xy, kgrid, norm="ortho")
     pc_t = prep(psi_c_X)
-    return lambda L, R, conj_r=False: _decode_v(apply(L, R, W_Rm, pc_t, conj_r=conj_r), psi_v_Y, sqrt_nk)
+    # A is this rank's (μ_loc, ν_loc) partial: varying over both mesh axes, which the custom
+    # call's result does not carry (the XLA route gets it from the einsum with ψ^X_c).
+    return lambda L, R, conj_r=False: _decode_v(
+        mark_varying(apply(L, R, W_Rm, pc_t, conj_r=conj_r), ("x", "y")), psi_v_Y, sqrt_nk)
 
 
 def _exchange_U(S_part, V_q0):
