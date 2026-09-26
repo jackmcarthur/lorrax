@@ -12,8 +12,8 @@ outline, editorial threads (T1–T5), and pre-writing task list live in
 | Chapter | State |
 |---|---|
 | 00 Outline | current |
-| 01 Introduction | 1.1 user-revised (register reference); 1.2/1.3 archived to `_archive/` pending rework |
-| 02 Installation | 2.1 rewritten as JAX narrative 2026-07-11; 2.2-2.4 swept |
+| 01 Introduction | 1.1 user-revised (register reference); 1.2/1.3 not written |
+| 02 Installation | none: installation is owned by `docs/installation/` |
 | 03 Tutorial | drafted; PRL-density sweep 2026-07-11 (numbers TODO: reference run) |
 | 04 GW in real space and real time | drafted; reviewed; PRL-density sweep 2026-07-11 |
 | 05 ISDF | drafted; reviewed; PRL-density sweep 2026-07-11 |
