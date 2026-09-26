@@ -931,10 +931,13 @@ __device__ __forceinline__ void tt_gather(const lrx_c2* g0, const lrx_c2* g0t, c
 }
 
 // The typed unfold of the staged cells in place, from shared tables only; ends with a barrier.
-// NS consecutive lanes of one warp own one (k, operand group): lane d forms column d's phases and
-// left = U g (pass 1), then, after a warp barrier, lane a forms row a of left U^dagger (pass 2),
-// so the column-to-row exchange never leaves the warp.  Every lane of a warp runs the same number
-// of rounds (the warp barrier needs the whole warp); k is fastest across the groups of a warp.
+// The NS members of one (k, operand group) are NS lanes of one warp: member d forms column d's
+// phases and left = U g (pass 1), then, after a warp barrier, member a forms row a of left U^dagger
+// (pass 2), so the column-to-row exchange never leaves the warp.  A warp holds GW = 32 / NS groups,
+// member-major (lane = e * GW + group): the 8 lanes of a 16-byte shared phase are one member of 8
+// consecutive k, one cell apart, so both passes are free of bank conflicts (member-minor lanes put
+// a phase's cells d*SP or 4a*SP apart: 2-way at 6x6x1 ns 4).  Every lane of a warp runs the same
+// number of rounds (the warp barrier needs the whole warp); k is fastest across the groups.
 static_assert(32 % NS == 0, "a warp holds whole spin groups");
 __device__ __forceinline__ void tt_finish(const TileTabs& s, int b, int npr, lrx_c2* bank) {
     const lrx_c2* u = s.u();
@@ -943,11 +946,12 @@ __device__ __forceinline__ void tt_finish(const TileTabs& s, int b, int npr, lrx
     const int* ls = s.ls(b);
     const int* rs = s.rs(b);
     constexpr int CS = NR * TT_RSTRIDE;            // cell (c, d) of a group at col[c * CS]
-    constexpr int ITEMS = NK * TT_GT * NS;
-    for (int i0 = 0; i0 < ITEMS; i0 += blockDim.x) {
-        const int i = i0 + threadIdx.x, g = i / NS, e = i % NS;
+    constexpr int NG = NK * TT_GT, GW = 32 / NS;   // (k, operand group) items; groups per warp
+    for (int i0 = 0; i0 < NG * NS; i0 += blockDim.x) {
+        const int i = i0 + threadIdx.x, lane = i % 32;
+        const int e = lane / GW, g = (i / 32) * GW + lane % GW;
         const int k = g % NK, gi = g / NK, jp = gi / TT_OPS;
-        const bool live = i < ITEMS && jp < npr;
+        const bool live = g < NG && jp < npr;
         if (live) {                                    // pass 1: column d = e
             const int d = e;
             lrx_c2* col = bank + tt_cell(gi * SS + d, k);
