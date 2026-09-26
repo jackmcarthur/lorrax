@@ -7,6 +7,7 @@ the SC owner may retain time nodes after current-domain certification.
 """
 from pathlib import Path
 import dataclasses
+from functools import lru_cache
 import hashlib
 import json
 import shutil
@@ -108,6 +109,12 @@ def shared_pole_identity(wfns, meta, *, label, wfn, binding, centroid_indices):
         recipe_hash=recipe["recipe_hash"], gate_hash=recipe["gate_hash"])
 
 
+@lru_cache(maxsize=8)
+def _coulomb_unpack(basis):
+    """One packed-to-canonical V conversion per basis, so an SC map reuses its executable."""
+    return jax.jit(lambda v: basis.unpack_operator(v, spec=P(None, "x", "y")))
+
+
 def _coulomb_resource(value, meta, sym, mesh_xy, path):
     """Stage bounded canonical V parents via centroid and SlabIO owners.
 
@@ -118,17 +125,17 @@ def _coulomb_resource(value, meta, sym, mesh_xy, path):
     """
     from file_io.slab_io import SlabIO
     from symmetry_maps import QirrOperator
-    from .response_bank import _reserve, resource_digest
+    from .response_bank import _compiled, _reserve, resource_digest
     basis = meta.mu_basis
     qids = np.asarray(sym.q_irr_full_idx, np.int64)
     op = QirrOperator.of(value)
     if op.n_full != meta.nk_tot or tuple(op.values.shape[1:]) != (basis.n_packed, basis.n_packed):
         raise ValueError("GATE shared_pole_coulomb: expected the packed bare V")
     value = op.at_rows(qids)
-    kernel = jax.jit(lambda v: basis.unpack_operator(v, spec=P(None, "x", "y")))
+    kernel = _coulomb_unpack(basis)
     shape = (1, basis.n_packed, basis.n_packed)
     operand = jax.ShapeDtypeStruct(shape, value.dtype, sharding=value.sharding)
-    executable = kernel.lower(operand).compile()
+    executable = _compiled(kernel, (operand,))
     stats = executable.memory_analysis()
     if stats is None:
         raise ValueError("GATE shared_pole_coulomb: conversion memory unavailable")

@@ -576,12 +576,32 @@ def response_dense_workspace(mesh_xy, n, batch, layout, *, with_eigh):
     return dict(gemm=gemm,eigh=eig,total=gemm+eig,scope="actual-shape ISERV query; GEMM persistent plus concurrent eigh scratch")
 
 
+_COMPILED = {}
+
+
+def _compiled(kernel, args):
+    """``kernel.lower(*args).compile()`` once per kernel and argument signature, per process.
+
+    AOT lowering bypasses jit's executable cache, so an admission repeated at
+    every sample of every SC map would recompile an unchanged program.  The
+    kernels are module-cached builders, so their identity is stable; the
+    caller still admits the executable's memory on every call.
+    """
+    key = (kernel, jax.tree.structure(args), tuple(
+        (tuple(x.shape), str(x.dtype), getattr(x, "sharding", None))
+        if hasattr(x, "shape") else x for x in jax.tree.leaves(args)))
+    executable = _COMPILED.get(key)
+    if executable is None:
+        executable = _COMPILED[key] = kernel.lower(*args).compile()
+    return executable
+
+
 def _bank_execution(meta, mesh_xy, receipt, config, *, photon=False):
     """Compile and admit new dense work; stream outputs are reserved by batch."""
     def execute(kernel, args, stage):
         with timing.section('bank.compile.' + stage, announce=True):
             started = time.monotonic()
-            executable = kernel.lower(*args).compile()
+            executable = _compiled(kernel, args)
             receipt["seconds"]["compilation"] = (receipt["seconds"].get("compilation", 0.)
                 + time.monotonic() - started)
         with timing.section('bank.admission.' + stage, announce=True):
@@ -662,8 +682,7 @@ def _coulomb_batch(meta, config, bank_io, mesh_xy, q_span, execute):
     spec = P(None, "x", "y")
     abstract = jax.ShapeDtypeStruct(shape, jnp.complex128,
                                    sharding=NamedSharding(mesh_xy, spec))
-    packed = _coulomb_pack(basis,mesh_xy)
-    compiled = packed.lower(abstract).compile()
+    compiled = _compiled(_coulomb_pack(basis,mesh_xy), (abstract,))
     memory = compiled.memory_analysis()
     _reserve(meta, "coulomb_read_pack", memory.argument_size_in_bytes,
              memory.output_size_in_bytes + memory.temp_size_in_bytes)
@@ -931,6 +950,13 @@ def _reciprocity_census(receipt, value, z_batch, q_full, parent, meta):
         for i in rows)
 
 
+@lru_cache(maxsize=8)
+def _symmetric_part(mesh, sharding):
+    """(c + c^T)/2 of an all-mesh tile, once per mesh and output placement."""
+    from common.collectives import transpose_xy
+    return jax.jit(lambda c: 0.5*(c + transpose_xy(c, mesh)), out_shardings=sharding)
+
+
 def _tr_odd_census(receipt, solve_value, h, chi, value, z, q_full):
     """Measure the time-reversal-odd channel of an ordered bank at q = -q.
 
@@ -948,10 +974,8 @@ def _tr_odd_census(receipt, solve_value, h, chi, value, z, q_full):
     names = ("chi_odd_max_rel", "chi_odd_fro_rel", "chi_hermiticity_rel",
              "w_hermiticity_rel", "w_even_route_hermiticity_rel", "w_transpose_rel")
     # The Dyson owner requires face-sharded [1,n,n] operands.
-    from common.collectives import transpose_xy, xy_tile_mesh
-    mesh = xy_tile_mesh(chi)
-    symmetric = jax.jit(lambda c: 0.5*(c + transpose_xy(c, mesh)),
-                        out_shardings=h.sharding)
+    from common.collectives import xy_tile_mesh
+    symmetric = _symmetric_part(xy_tile_mesh(chi), h.sharding)
     for s in imaginary.tolist():
         sym = symmetric(chi[s:s+1])
         w_even = v + solve_value(h, sym)[0]
