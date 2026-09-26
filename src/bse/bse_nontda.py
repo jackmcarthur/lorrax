@@ -85,7 +85,7 @@ import jax
 import jax.numpy as jnp
 
 from common.fft_helpers import make_kfft_kminor
-from common.gpu_utils import get_device_memory_info
+from common.gpu_utils import device_budget_bytes
 from .bse_ring_comm import build_bse_ring_matvec_full, make_bse_shardings
 
 jax.config.update("jax_enable_x64", True)
@@ -115,9 +115,9 @@ _DENSE_N_MAX = 4096
 #
 # so the width is derived from the footprint and the device budget instead.
 _DENSE_T_PEAK_FACTOR = 5.3    # compiled peak / T footprint (measured, above)
-_DENSE_T_BUDGET_FRAC = 0.4    # of TOTAL per-device memory
+_DENSE_T_BUDGET_FRAC = 0.4    # of the run budget (common.gpu_utils.device_budget_bytes)
 
-# The budget is taken from TOTAL device memory, never from free memory.  Free
+# The budget is the run's budget (deck, else the collective default), never free memory.  Free
 # memory is ambient -- it depends on what else is resident when this runs -- and
 # a width derived from it is not reproducible: the same leg on the same deck
 # picked col_chunk=2 and col_chunk=5 twenty minutes apart on this pool, purely
@@ -149,8 +149,7 @@ def dense_col_chunk(args, mesh_xy, N, *, log=None):
     nk = int(np.prod(np.asarray(W_R.shape[2:5])))
     per_col = mu_local * nu_local * nspinor * nspinor * nk * 16
     peak_per_col = per_col * _DENSE_T_PEAK_FACTOR
-    budget = (float(get_device_memory_info().get("total_gb") or 8.0)
-              * 1e9 * _DENSE_T_BUDGET_FRAC)
+    budget = device_budget_bytes() * _DENSE_T_BUDGET_FRAC
     chunk = int(min(int(N), max(1, int(budget // peak_per_col))))
     shape = (f"mu_l={mu_local} x nu_l={nu_local} x ns^2={nspinor ** 2} x "
              f"nk={nk}")

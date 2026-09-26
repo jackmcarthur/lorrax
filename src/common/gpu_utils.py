@@ -110,13 +110,14 @@ def set_device_budget_gb(gb: float) -> None:
 def device_budget_bytes() -> float:
     """THE per-device budget in bytes (1 GB = 1e9 B) every planner prices against.
 
-    ``memory_per_device_gb`` as the config resolved it; a caller without a
-    resolved config (a tool, a unit test) gets the collective auto-detection,
-    so every process must then enter.
+    ``memory_per_device_gb`` as the config resolved it.  A driver without that
+    key (kmeans, htransform, bse, exciton_bands, a tool) gets the same default
+    gwjax resolves at 0, the collective auto-detection, recorded here on the
+    first call; every process must enter that first call.
     """
-    if _RUN_DEVICE_BUDGET_GB is not None:
-        return _RUN_DEVICE_BUDGET_GB * 1e9
-    return minimum_process_budget_gb(get_device_memory_gb()) * 1e9
+    if _RUN_DEVICE_BUDGET_GB is None:
+        set_device_budget_gb(minimum_process_budget_gb(get_device_memory_gb()))
+    return _RUN_DEVICE_BUDGET_GB * 1e9
 
 
 def device_room_bytes(*, pool_fraction: float = 1.0) -> int:

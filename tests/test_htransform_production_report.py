@@ -236,8 +236,8 @@ def test_deck_basis_mismatch_refits_and_absent_basis_is_published(
         lambda path, *args, **kwargs: writes.append(path))
     import common.gpu_utils as gpu_utils
     import common.collectives as collectives
-    monkeypatch.setattr(gpu_utils, "get_device_memory_info", lambda: {
-        "budget_gb": 1.0, "available_gb": 1.0, "source": "test"})
+    monkeypatch.setattr(gpu_utils, "device_room_bytes", lambda **kwargs: 10**9)
+    monkeypatch.setattr(gpu_utils, "device_budget_bytes", lambda: 1.0e9)
     monkeypatch.setattr(collectives, "all_gather_processes",
                         lambda value: np.asarray([value]))
 

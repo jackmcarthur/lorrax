@@ -982,7 +982,7 @@ def _write_w_av_stage(
         np.asarray(sym.kvecs_asints, dtype=np.int32), kgrid, source_steps)
     wraps = np.empty((nq, nk, 3), dtype=np.int32)
     center_on_x, overlap = make_cross_k_overlap(mesh)
-    from common.gpu_utils import get_device_memory_info
+    from common.gpu_utils import device_budget_bytes
     from runtime.xla_memory import resolve_xla_gpu_memory_env
     xla_memory = resolve_xla_gpu_memory_env()
     if (jax.default_backend() == "gpu"
@@ -995,8 +995,7 @@ def _write_w_av_stage(
             "collective write. Fix: export "
             "XLA_PYTHON_CLIENT_ALLOCATOR=platform before lx run; see "
             "docs/dev/env_vars.md.")
-    memory = get_device_memory_info()
-    tile_budget_bytes = 0.20 * float(memory["total_gb"]) * 1.0e9
+    tile_budget_bytes = 0.20 * device_budget_bytes()
     px = int(mesh.shape["x"])
     py = int(mesh.shape["y"])
     nb_storage = band_storage_extent(mesh, nb)
@@ -1029,8 +1028,8 @@ def _write_w_av_stage(
             f"  W-av streaming: k={k_batch}/{nk}, q=1/{nq} "
             f"resident (conservative overlap working set "
             f"{working_gib:.2f} GiB/device; "
-            f"20% of {float(memory['total_gb']):.1f} GB device memory, "
-            f"source {memory['source']}); WFN source=center+neighbor union; "
+            f"20% of the {device_budget_bytes() / 1e9:.1f} GB run budget); "
+            f"WFN source=center+neighbor union; "
             f"raw artifact={artifact_gib:.2f} GiB")
     g_full = wfn.gvecs(k="full_bz")
     ngk_full = wfn.ngk_valid(k="full_bz")
