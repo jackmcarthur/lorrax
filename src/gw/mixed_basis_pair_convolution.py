@@ -648,9 +648,12 @@ def plan_pair_convolution_chunks(*, n_ranks, n_k, spins, widths, width_out, n_q,
         return _C16 * (nk * j * gath + nk * j * nr * 4 * cd + nk * nr
                        + nk * j * cx * nr + 2 * nqm * j * cx * (nr + kbm + Mm))
 
-    def final(qc, nc, j):           # the all-to-all output, the phased box, its transform and gather
-        return _C16 * cx * (3 * qc * (Mo // Pn) * max(t_total(nc, j), nr)
-                            + 2 * qc * (Mo // Pn) * (kbox_out + Mo))
+    def final(qc, nc, j):           # the all-to-all output, the phased box, its transform and gather;
+        # past one q chunk XLA also holds one copy of the T it reads (compiled_memory(): temp
+        # 12.26 GB against T 11.86 GB at Fe 8³ n_s=2 Σ, qc = 1)
+        copy = 0 if nq // qc == 1 else (t_out or t_mid(nc, j))
+        return copy + _C16 * cx * (3 * qc * (Mo // Pn) * max(t_total(nc, j), nr)
+                                   + 2 * qc * (Mo // Pn) * (kbox_out + Mo))
 
     def hwm(nc, j, kc_, qc_):       # the largest stage (PairConvChunks.stage_bytes)
         held = tiles + h_bytes(nc, j) + t_mid(nc, j)
@@ -1218,10 +1221,7 @@ class MixedBasisPairConvolution:
 
         def final(T, qf, ocell, c2p):
             def step(_, i):
-                # the barrier keeps the all-to-all's relayout on this q chunk: without it XLA
-                # hoists the transpose out of the loop as one copy of the whole T (compiled temp
-                # 12.3 GB at Fe 8³ n_s=2 Σ, T 11.9 GB; compiled_memory() measures it)
-                Tq = jax.lax.optimization_barrier(jax.lax.dynamic_slice_in_dim(T, i * qc, qc, axis=0))
+                Tq = jax.lax.dynamic_slice_in_dim(T, i * qc, qc, axis=0)
                 Tq = jax.lax.all_to_all(Tq, _XY, split_axis=1, concat_axis=4, tiled=True)
                 q_i = jax.lax.dynamic_slice_in_dim(qf, i * qc, qc, axis=0)
                 # the columns in box order: a slice, or the orbit-packed view's gather
