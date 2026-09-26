@@ -175,7 +175,7 @@ $$
 
 one LU per q and requested frequency: \(N_qN_zN_\mu^3\) for \(N_z\)
 frequencies, local (per-q pivoted) or distributed over the 2-D mesh
-(`w_dyson_solver`). The self-energy model decides which \(z\) are requested
+(the `linalg` dial). The self-energy model decides which \(z\) are requested
 (§6).
 
 ## 6. Self-energy
@@ -275,6 +275,9 @@ every q is computed and stored, never partially unfolded. No rank
 materializes an \(N_\mu^2\) matrix to write or fit it.
 
 ## 10. What the formulation refuses
+
+The key-level contract is the [input reference](../input_reference.md); this
+table gives the physical reason for each refusal.
 
 | case | refusal | why |
 |---|---|---|
