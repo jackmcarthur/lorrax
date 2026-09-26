@@ -261,9 +261,9 @@ def create_mesh_xy_from_flags(px: Optional[int],
     """Resolve ``--px/--py`` for every BSE driver's ``main()``.
 
     Omitted means the run's mesh.  ``px is None and py is None`` — the
-    argparse default in all six bse-family drivers since 2026-08-27
-    (``bse_jax``, ``bse_feast``, ``bse_kpm``, ``bse_pseudopoles``,
-    ``bse_w_exact``, ``exciton_bands``: 12 declarations, gated by
+    argparse default in all five bse-family drivers since 2026-08-27
+    (``bse_jax``, ``bse_feast``, ``bse_kpm``, ``bse_w_exact``,
+    ``exciton_bands``: 10 declarations, gated by
     ``tests/test_layering.py::test_no_bse_driver_defaults_its_mesh_shape``) —
     is a request for the job's canonical square mesh, i.e. exactly what
     ``runtime.initialize_communicator_stack`` already built and announced in
@@ -288,7 +288,7 @@ def create_mesh_xy_from_flags(px: Optional[int],
 
     The ``None`` arm goes through :func:`create_mesh_2d`, not through a bare
     ``resolve_mesh()``, because ``bse_feast`` / ``bse_w_exact`` / ``bse_kpm``
-    / ``bse_pseudopoles`` call only ``runtime.bootstrap()`` and hold no
+    call only ``runtime.bootstrap()`` and hold no
     ``RuntimeStack``: for them a bare resolve would hand back an unwarmed
     mesh and drop both :func:`common.collectives.prepare_mesh`'s cliques and
     the :func:`_warm_process_allgather` warm-up this module documents (32
@@ -1247,9 +1247,7 @@ def build_density_snapshot_operator(
 
     * ``scatter_nu_on_y=False`` (default): the V_q0 contraction over N is
       completed with a plain ``psum('y')`` and ``d`` returns replicated on the
-      batch axis with ``mu`` on ``x`` — ``P(None, 'x')`` = ``(b, mu_X)``.  Used
-      by the per-vector density-snapshot callers (``bse_pseudopoles``) that
-      device_get one column at a time.
+      batch axis with ``mu`` on ``x`` — ``P(None, 'x')`` = ``(b, mu_X)``.
 
     * ``scatter_nu_on_y=True``: the W-column / screened-W(omega) path, where the
       batch axis IS the probe index ``nu`` and we want the assembled tile

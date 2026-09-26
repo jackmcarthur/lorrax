@@ -271,7 +271,7 @@ def test_bse_eqp_frontends_reach_the_shared_stamp_owner():
     source_root = Path(__file__).resolve().parents[1]
     for path in (
             "src/bse/bse_jax.py", "src/bse/absorption_haydock.py",
-            "src/bse/davidson_absorption.py", "src/bse/bse_loading.py"):
+            "src/bse/bse_loading.py"):
         text = (source_root / path).read_text(encoding="utf8")
         assert ("apply_eqp_and_reslice_bands" in text
                 or "apply_eqp_corrections" in text), path

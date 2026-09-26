@@ -1,4 +1,4 @@
-"""davidson_absorption: the dipole file is a PRODUCED input (2026-08-08).
+"""load_dipole_h5: the dipole file is a PRODUCED input (2026-08-08).
 
 RED TWIN recorded in FIX_driver_blockers.md.
 """
@@ -11,7 +11,7 @@ import numpy as np
 import pytest
 
 # ===========================================================================
-# 1. davidson_absorption's dipole is a PRODUCED input, and says so
+# 1. The dipole is a PRODUCED input, and the reader says so
 # ===========================================================================
 def test_missing_dipole_names_its_producer(tmp_path):
     """A missing dipole file must refuse with the command that builds it.
