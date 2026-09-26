@@ -853,7 +853,7 @@ def compute_screening_model(
         iteration_head_response=iteration_head_response)
 
 
-def driver_persists_w0(mode, config, *, self_consistent=False) -> bool:
+def driver_persists_w0(mode, config) -> bool:
     """Does the DRIVER own the W0 restart flush for this run?
 
     Three runs answer no:
@@ -876,13 +876,14 @@ def driver_persists_w0(mode, config, *, self_consistent=False) -> bool:
       persisted and a BSE on the restart refuses by name
       (``file_io.restart_bundle.read_bse_payload``).
     * ``compute_mode = mpa`` on a bispinor deck (four-component charge or
-      photon sector stores), and any self-consistent MPA map: the static W
-      of those models is not built (future work), with the same BSE
-      refusal.
+      photon sector stores): the static W of those models is not built
+      (future work), with the same BSE refusal.
 
     ``compute_mode = mpa`` with ``sigma_w_model = shared_pole`` (the
-    production W) answers yes on a one-shot: :func:`restart_static_w`
-    evaluates the model at ω = 0 through the Σ synthesis owner.
+    production W) answers yes, one-shot and self-consistent alike:
+    :func:`restart_static_w` evaluates the model at ω = 0 through the Σ
+    synthesis owner.  A self-consistent run evaluates the accepted final
+    map's model, once, after the loop (``sc_iteration.run_sc_driver``).
 
     Lives here rather than in ``gw_jax`` so the driver keeps one call and
     no mode/diagram arithmetic, and so the reasons sit next to the fork
@@ -894,8 +895,7 @@ def driver_persists_w0(mode, config, *, self_consistent=False) -> bool:
         return False
     if mode is ComputeMode.MPA:
         sigma = getattr(config, "sigma", None)
-        return (not self_consistent
-                and getattr(sigma, "w_model", "mpa") == "shared_pole"
+        return (getattr(sigma, "w_model", "mpa") == "shared_pole"
                 and not bool(getattr(config, "bispinor", False)))
     return True
 

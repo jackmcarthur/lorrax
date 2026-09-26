@@ -277,12 +277,15 @@ path past that point.
 
 A bank of a retired schema (v1, v2: dense line samples) is refused by name, and
 constructor resume then rebuilds it. `write_poles = true` exports $(b,\Lambda)$.
-A one-shot with `write_restart_tensors = true` persists `W0_qmunu` $=V+W_c(0)$
+A run with `write_restart_tensors = true` persists `W0_qmunu` $=V+W_c(0)$
 for BSE: `gw.mpa.sigma.shared_pole_static_wc` runs the §8 synthesis with the
 $\omega=0$ coefficient $-1/(2\Lambda)$ and adds the hole branch
 $W_+(-q,0)^{\mathsf T}$ (ordered) or $W_+$ (TRS), i.e. $-b\Lambda^{-1}b^\dagger$
-on a TRS store; the head is the resolver's $\omega=0$ sample. Plain-MPA, bispinor,
-metal and self-consistent restarts carry no `W0_qmunu`, and a BSE on them refuses.
+on a TRS store. A one-shot stores the resolver's $\omega=0$ head; a
+self-consistent run evaluates the accepted final map's model once, after the
+loop, from that map's retained scratch generation, and stores the map's
+iteration head at $\omega=0$. Plain-MPA, bispinor and metal restarts carry no
+`W0_qmunu`, and a BSE on them refuses.
 `write_w = true` dumps the bank as stored (line supports as panels) and is a
 debug output.
 
