@@ -348,7 +348,8 @@ def compute_wfns_fi(
                    which regime is which, and ``distrib_la.Plan`` for
                    the backends.
         use_low_mem_eigh: the SECOND eigenvalue path, named by intent rather
-                   than by library (input key ``use_low_mem_eigh``).  False
+                   than by library; callers set it from the deck's
+                   ``linalg = distributed`` dial.  False
                    (default) = reshard each chunk onto the q axis and run the
                    batched native ``eigh``, every device owning WHOLE
                    (rank, rank) matrices.  True = keep the matrix spread over
