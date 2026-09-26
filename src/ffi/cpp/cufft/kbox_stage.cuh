@@ -141,6 +141,18 @@ __device__ __forceinline__ void line_fft(C* p, int stride) {
     for (int e = 0; e < N; ++e) { p[e * stride].x = v[e].x; p[e * stride].y = v[e].y; }
 }
 
+// Pass line l of TR resident rows with n lines per row -> (row j, line li).  From 8 rows up
+// the row runs fastest: the 8 threads of a 16-byte shared-memory phase then take one line
+// offset in 8 rows, RS apart, and RS is odd, so they hit 8 distinct bank groups on every grid.
+// Line-fastest puts the phase on lines li*d apart, one bank group whenever 8 | d: 8x8x1's y
+// pass (d = ny) was 8-way, 70% of the shared wavefronts of mode 2 at the CrI3 BSE shape.
+// Which thread runs a line does not change the line's arithmetic.  Fewer rows: line fastest.
+template <int TR>
+__device__ __forceinline__ void line_of(int l, int n, int& j, int& li) {
+    if constexpr (TR >= 8) { j = l % TR; li = l / TR; }
+    else { j = l / n; li = l % n; }
+}
+
 // The 3-D transform of TR resident padded rows (bank row j at bank + j*RS), axes z, y, x, all
 // threads of the block, one thread FFT per line; each pass that runs ends with __syncthreads()
 // (a length-1 axis writes nothing), so the transform ends synchronised whenever it wrote.  TR is
@@ -149,23 +161,24 @@ template <int NX, int NY, int NZ, int TR, int Arch, cufftdx::fft_direction Dir, 
 __device__ void transform3(C* bank) {
     constexpr int tr = TR;
     using G = Geo<NX, NY, NZ>;
+    int j, li;
     if constexpr (NZ > 1) {
         for (int l = threadIdx.x; l < tr * NX * NY; l += blockDim.x) {
-            const int j = l / (NX * NY), li = l % (NX * NY);
+            line_of<TR>(l, NX * NY, j, li);
             line_fft<NZ, Arch, Dir>(bank + j * G::RS + li * G::ZP, 1);
         }
         __syncthreads();
     }
     if constexpr (NY > 1) {
         for (int l = threadIdx.x; l < tr * NX * NZ; l += blockDim.x) {
-            const int j = l / (NX * NZ), li = l % (NX * NZ);
+            line_of<TR>(l, NX * NZ, j, li);
             line_fft<NY, Arch, Dir>(bank + j * G::RS + (li / NZ) * NY * G::ZP + li % NZ, G::ZP);
         }
         __syncthreads();
     }
     if constexpr (NX > 1) {
         for (int l = threadIdx.x; l < tr * NY * NZ; l += blockDim.x) {
-            const int j = l / (NY * NZ), li = l % (NY * NZ);
+            line_of<TR>(l, NY * NZ, j, li);
             line_fft<NX, Arch, Dir>(bank + j * G::RS + G::plane_at(li), NY * G::ZP);
         }
         __syncthreads();
