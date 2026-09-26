@@ -339,15 +339,20 @@ def test_the_import_counter_charges_only_the_first_import():
 def test_bse_jax_decomposes_its_bring_up_row():
     """``bse.imports_and_runtime`` was 80.1 % of a warm P=4 wall in ONE row.
 
-    Static, because the alternative is running the driver: the epilogue must
-    record the per-phase rows and an ``imports`` remainder, the same shape
-    ``htransform`` has had since 2026-08-08.
+    Static, because the alternative is running the driver.  Since
+    2026-09-25 the split is owned once, by ``runtime.run_session``: it records
+    the per-phase rows and an ``imports`` remainder under the driver's prefix,
+    and bse_jax opens its session with the prefix ``bse``.
     """
     src = open(os.path.join(_SRC, "bse", "bse_jax.py"), encoding="utf-8").read()
     assert 'timing.record("bse.imports_and_runtime"' not in src, (
         "the opaque single row is back")
-    assert 'f"bse.runtime_stack.{_phase}"' in src, "the phase rows are missing"
-    assert 'timing.record("bse.imports"' in src, "the imports remainder is missing"
+    assert 'RunSession(RUNTIME, "bse",' in src, "bse_jax left the session"
+    owner = open(os.path.join(_SRC, "runtime", "run_session.py"),
+                 encoding="utf-8").read()
+    assert 'f"{prefix}.runtime_stack.{phase}"' in owner, (
+        "the phase rows are missing")
+    assert 'f"{prefix}.imports"' in owner, "the imports remainder is missing"
 
 
 def test_the_bring_up_rows_sum_to_the_pre_main_wall():

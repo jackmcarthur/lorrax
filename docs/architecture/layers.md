@@ -103,8 +103,11 @@ Two rules follow, and both are enforced:
 ## 3. L3 — substrate
 
 **Process bootstrap**: `runtime` and `runtime.{aot_memory, padding,
-production_stream, xla_memory, jax_support, pjrt_log_filter, source_closure,
-network_env, env_flags}`, plus `common/grouped_layout.py`.
+production_stream, run_session, xla_memory, jax_support, pjrt_log_filter,
+source_closure, network_env, env_flags}`, plus `common/grouped_layout.py`.
+`runtime.run_session.RunSession` is the one driver session: it opens the
+driver's report, owns stdout, resets timing, splits the pre-`main` span,
+closes the report as REFUSED on a raised refusal, and prints the file table.
 `runtime.initialize_communicator_stack()` is the single startup entry point.
 In order it installs the fail-fast excepthook, seals the source closure, sets
 the environment before jax reads it, selects the CPU-collectives transport,

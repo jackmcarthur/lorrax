@@ -106,6 +106,9 @@ _L3_MODULES = frozenset({
     "runtime", "runtime.aot_memory", "runtime.padding",
     "common.grouped_layout",
     "runtime.production_stream", "runtime.xla_memory",
+    # the one driver session (report, stdout, timing, refusal, file table);
+    # it imports no report class, only ``common.timing`` and the stream.
+    "runtime.run_session",
     "runtime.jax_support", "runtime.pjrt_log_filter",
     # stdlib-only package-origin sealing at the first runtime boundary
     "runtime.source_closure",
@@ -697,6 +700,63 @@ def test_the_plumbing_scan_does_not_cry_wolf():
     assert scan_plumbing_imports(ok) == [], (
         "the plumbing scan flags the sanctioned spelling; it would make the "
         "gate unusable and it would be turned off")
+
+
+# ===========================================================================
+# 2b.  The driver-length ratchet — a core driver's main reads as its physics
+# ===========================================================================
+#
+# Rule 1 counts jax imports, so a 1,110-line ``main`` of report, timing and
+# writer plumbing passed it as "clean" (ARCH audit H6).  This table counts
+# the statements of each core driver's entry function, nested blocks
+# included.  Same ratchet rules as the plumbing budget: over fails, and so
+# does under until the number here is lowered.  gw_jax's ``main`` hands off
+# to ``_run_gw_stages``, so both are counted.
+
+_DRIVER_MAIN_STATEMENTS = {
+    "gw.gw_jax": (("main", "_run_gw_stages"), 57),
+    "bse.bse_jax": (("main",), 103),
+    "bse.exciton_bands": (("main",), 475),
+    "bandstructure.htransform": (("main",), 129),
+    "gw.kin_ion_io": (("main",), 165),
+    "psp.get_dipole_mtxels": (("main",), 374),
+}
+
+
+def main_statement_count(source: str, names=("main",)) -> int:
+    """Statements inside the named module-level functions, nested included."""
+    found = {node.name: node for node in ast.parse(source).body
+             if isinstance(node, ast.FunctionDef) and node.name in names}
+    missing = sorted(set(names) - set(found))
+    assert not missing, f"no module-level function(s) {missing}"
+    return sum(sum(isinstance(n, ast.stmt) for n in ast.walk(fn)) - 1
+               for fn in found.values())
+
+
+@pytest.mark.parametrize("mod", sorted(_DRIVER_MAIN_STATEMENTS))
+def test_driver_main_statement_ratchet(sources, mod):
+    names, budget = _DRIVER_MAIN_STATEMENTS[mod]
+    count = main_statement_count(sources[mod], names)
+    assert count <= budget, (
+        f"{mod}.{'+'.join(names)} has {count} statements, budget {budget}.  "
+        f"Move report, timing or writer plumbing to its owner "
+        f"(runtime.run_session, file_io) instead of growing the driver.")
+    assert count == budget, (
+        f"{mod}.{'+'.join(names)} now has {count} statements but is budgeted "
+        f"{budget}.  Lower the budget in this file to {count} and keep the win.")
+
+
+def test_the_main_statement_scan_can_fail():
+    """RED TWIN: the same counter on a source whose count is known."""
+    src = ("def main(argv=None):\n"
+           "    x = 1\n"
+           "    if x:\n"
+           "        y = 2\n"
+           "        return y\n"
+           "def other():\n"
+           "    pass\n")
+    assert main_statement_count(src) == 4
+    assert main_statement_count(src, ("main", "other")) == 5
 
 
 # ===========================================================================
