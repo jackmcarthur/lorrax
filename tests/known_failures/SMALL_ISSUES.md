@@ -448,7 +448,7 @@ silent overwrite.
     today. NOTE: this reading supersedes the earlier "1.2–11.8 meV
     trigonal warping" interpretation in EXCITON_BANDS_FEATURES §6.1 —
     those two directions are symmetry-equivalent, so the spread is
-    residual, not physics. [LT_LADDER_ACROSS_THE_CELL_2026-08-10.md]
+    residual, not physics.
 
 35. **NOT A DEFECT — `-G=4` is not a parsing quirk.** Recorded because
     the opposite was believed for a day and cost eleven OOM-killed
