@@ -68,7 +68,7 @@ def check(mesh, root, layout, resident=False):
         bases.append(basis);bare.append(psi)
     meta=SimpleNamespace(mu_basis=bases[0],nspin=1,nspinor=4,nkx=nk,nky=1,nkz=1,kgrid=grid,
         fft_grid=fft,nk_tot=nk,n_rmu=4,nb_sigma=nb,nelec=2,b_id_0=0,b_id_3=nb,b_id_4_user=nb,
-        cell_volume=1.,shared_pole_recipe=dict(eta_ev=eta*RYD_TO_EV,sigma_tolerance=1e-4))
+        cell_volume=1.,shared_pole_recipe=dict(eta_ev=eta*RYD_TO_EV))
     meta.shared_pole_capacity=CapacityLedger(meta,mesh_xy=mesh,device_budget_bytes=1<<30)
     meta.shared_pole_capacity.reserve('fixture.wavefunctions',resident_bytes_per_rank=
         sum(2*x.nbytes//mesh.size for x in bare),workspace_bytes_per_rank=0)
