@@ -581,7 +581,7 @@ def _divisors(n: int) -> list[int]:
 def plan_pair_convolution_chunks(*, n_ranks, n_k, spins, widths, width_out, n_q, n_r,
                                  kboxes, kbox_out, n_parent_tiles, target_bytes,
                                  j_cap=64, n_c=None, J=None, kc=None, qc=None,
-                                 wedge=None, kboxes_parent=None, parents_per_step=None) -> PairConvChunks:
+                                 wedge=None, kboxes_parent=None, expand_step=None) -> PairConvChunks:
     """The schedule for one τ node (every count one when everything fits).
 
     ``spins = (n_A, n_C, n_X)``: the two operands' and the output's spin widths
@@ -589,8 +589,8 @@ def plan_pair_convolution_chunks(*, n_ranks, n_k, spins, widths, width_out, n_q,
     ``widths``/``kboxes``: the two operands' slot carriers and union-box cells;
     ``n_parent_tiles``: the slab copies' element count per rank (inputs held).
     ``kboxes_parent``: the operands' parent union-box cells (the expand's p'→r' input);
-    ``parents_per_step(kc)``: the parents one expand step transforms for ``kc`` children
-    (default ``kc``, one transform per child).
+    ``expand_step(kc)``: ``(npc, kc')``, the parents one expand step transforms and the
+    children it unfolds when the k chunk is ``kc`` (default ``(kc, kc)``, one transform per child).
     ``n_c``/``J``/``kc``/``qc`` pin those counts (tests and the benchmark); the rest follow
     (``kc`` must divide ``n_k`` and ``qc`` must divide ``n_q``).
     ``wedge`` (the r'-column wedge; ``None``: every column) is
@@ -635,12 +635,12 @@ def plan_pair_convolution_chunks(*, n_ranks, n_k, spins, widths, width_out, n_q,
         return 0 if wedge is None else _C16 * cx * ((3 + bcast) * nrow * Mm * cols + 2 * Mo * tcol)
 
     kbp = kboxes if kboxes_parent is None else kboxes_parent
-    npc_of = (lambda k: k) if parents_per_step is None else parents_per_step
+    step_of = (lambda k: (k, k)) if expand_step is None else expand_step
 
     def expand(kc, nc, j):          # one step: its parents' full r' transform, the children's column unfold, the all-to-all
         cols = carrier(nc, j) // Pn // nc
-        npc = int(npc_of(kc))
-        return _C16 * max(npc * c * (m // Pn) * (kb + 3 * nr) + 2 * kc * c * m * cols
+        npc, kce = (int(v) for v in step_of(kc))
+        return _C16 * max(npc * c * (m // Pn) * (kb + 3 * nr) + 2 * kce * c * m * cols
                           for c, m, kb in zip(ch, Mw, kbp))
 
     def middle(j):                  # compact gathers, the p→r outputs, D and its workspace, F, U, Y, the r→G box
@@ -918,8 +918,9 @@ class MixedBasisPairConvolution:
             kboxes=[int(np.prod(k)) for k in self.kbox], kbox_out=int(np.prod(self.kbox_out)),
             n_parent_tiles=n_par, target_bytes=target,
             kboxes_parent=[int(np.prod(pt["kbox"])) for pt in self._ptables],
-            parents_per_step=lambda kc_: max(self._steps(pt["pi"][v], kc_)["npc"]
-                                            for pt in self._ptables for v in pt["pi"]),
+            expand_step=lambda kc_: tuple(max(self._steps(pt["pi"][v], kc_)[key]
+                                              for pt in self._ptables for v in pt["pi"])
+                                          for key in ("npc", "kc")),
             wedge=None if wt is None else dict(
                 n_cols=self.P * wt["n_rep_rank"], n_q_mid=self.nq_mid,
                 width_mid=self.mm_axis.carrier, kbox_mid=int(np.prod(self.kbox_mid)),
@@ -1072,19 +1073,29 @@ class MixedBasisPairConvolution:
                     L=np.asarray(L, np.float64), pi=pi, n_parent=par.n)
 
     def _steps(self, pi, kc):
-        """The expand's steps for ``kc`` children each: the children in transform-set order
-        (``pi``, then k), cut into steps of ``kc``; a step transforms the ``npc`` consecutive
-        entries from ``start`` (``npc`` the widest step's span, so every step has one shape)."""
+        """The expand's steps for about ``kc`` children each: the transform-set entries ``pi``
+        takes, dealt by star size (children per entry, largest first) in snake order into
+        ``n = N_k // kc`` steps (at most one per entry), so every step holds about as many
+        entries and as many children; ``npc``/``kc`` are the largest step's, the rest padded
+        (a padded entry repeats the step's first; a padded child scatters past N_k, dropped)."""
         nk = self.nk
-        order = np.lexsort((np.arange(nk), pi)).reshape(nk // kc, kc)
-        lo, hi = pi[order[:, 0]], pi[order[:, -1]]
-        npc = int(np.max(hi - lo + 1))
-        n_src = int(pi.max()) + 1
-        start = np.minimum(lo, max(n_src - npc, 0)).astype(np.int32)
-        npc = min(npc, n_src)
-        return dict(npc=npc, start=start, order=order.astype(np.int32),
-                    lpar=(pi[order] - start[:, None]).astype(np.int32),
-                    n_transforms=npc * (nk // kc), n_src=n_src)
+        ent, star = np.unique(pi, return_counts=True)
+        n = max(1, min(nk // int(kc), ent.size))
+        bins = [[] for _ in range(n)]
+        for i, e in enumerate(ent[np.argsort(-star, kind="stable")]):
+            r, c = divmod(i, n)
+            bins[c if r % 2 == 0 else n - 1 - c].append(int(e))
+        kids = [np.flatnonzero(np.isin(pi, b_)) for b_ in bins]
+        npc, kcs = max(len(b_) for b_ in bins), max(len(k_) for k_ in kids)
+        plist = np.array([b_ + [b_[0]] * (npc - len(b_)) for b_ in bins], np.int32)
+        kidx = np.zeros((n, kcs), np.int32)
+        lpar = np.zeros((n, kcs), np.int32)
+        for i, (b_, k_) in enumerate(zip(bins, kids)):
+            loc = {e: j for j, e in enumerate(b_)}
+            kidx[i] = np.concatenate([k_, nk + np.arange(kcs - k_.size)])
+            lpar[i, :k_.size] = [loc[int(pi[k])] for k in k_]
+        return dict(npc=npc, kc=kcs, plist=plist, kidx=kidx, lpar=lpar,
+                    n_transforms=npc * n, n_src=int(ent.size))
 
     def _put(self, a, spec=P()):
         from lxkit import device_put_process_local
@@ -1131,10 +1142,11 @@ class MixedBasisPairConvolution:
             shared = (self._put(pt["pcsrc"]), self._put(pt["alpha"]), self._put(pt["L"]),
                       self._put(self._coltab))
             row, anti, spin = t["row"].astype(np.int64), t["anti"], np.asarray(t["spin"])
+            kk = {v: np.minimum(st["kidx"], self.nk - 1) for v, st in ps.items()}   # pads: any child's tables
             self._dev_exp.append({v: tuple(self._put(a) for a in (
-                st["start"], st["lpar"], st["order"], pt["op"][st["order"]],
-                pt["kbar"][row[st["order"]]], anti[st["order"]].astype(np.int32),
-                spin[st["order"]])) + shared for v, st in ps.items()})
+                st["plist"], st["lpar"], st["kidx"], pt["op"][kk[v]],
+                pt["kbar"][row[kk[v]]], anti[kk[v]].astype(np.int32),
+                spin[kk[v]])) + shared for v, st in ps.items()})
         self._expand = [self._build_expand(t, pt, ps, ax.carrier)
                         for t, pt, ps, ax in zip(self._tables, self._ptables, self._pstep, self.m_axis)]
 
@@ -1303,7 +1315,6 @@ class MixedBasisPairConvolution:
         device tables (``self._dev_exp``)."""
         mesh, nk, nr, P_ = self.mesh, self.nk, self.nr, self.P
         ns = int(np.asarray(t["spin"]).shape[-1])            # this operand's spin width
-        kc = self.chunks.kc
         fg = self.fft_grid
         m_loc = m_carrier // P_
         kbp = pt["kbox"]
@@ -1312,8 +1323,8 @@ class MixedBasisPairConvolution:
         n_par = pt["n_parent"]
         nfg = jnp.asarray(fg, jnp.float64)
 
-        def expand(S, St, j, start, lpar, kidx, cop, ckbar, canti, cspin, pcsrc, alpha, L, coltab,
-                   *, partner, npc):
+        def expand(S, St, j, plist, lpar, kidx, cop, ckbar, canti, cspin, pcsrc, alpha, L, coltab,
+                   *, partner, npc, kc):
             # the transform set: the parent tiles, and with partners conj of the transposed
             # partners, which an antiunitary child reads before its own conjugation
             src = jnp.concatenate([S, jnp.conj(St)], axis=0) if partner else S
@@ -1324,9 +1335,8 @@ class MixedBasisPairConvolution:
             nc_all = cols.shape[0]                            # P × the chunk's columns
 
             def step(H, i):
-                st = start[i]
-                g = jax.lax.dynamic_slice_in_dim(src, st, npc, axis=0)          # (npc, m, γ, M, δ)
-                cs = jax.lax.dynamic_slice_in_dim(pcs, st, npc, axis=0)         # (npc, cells)
+                g = jnp.take(src, plist[i], axis=0)                             # (npc, m, γ, M, δ)
+                cs = jnp.take(pcs, plist[i], axis=0)                            # (npc, cells)
                 idx = jnp.broadcast_to(cs[:, None, None, :, None], g.shape[:3] + (cs.shape[1], ns))
                 x = jnp.take_along_axis(g, idx, axis=3, mode="fill", fill_value=0)
                 x = jnp.transpose(x, (1, 2, 4, 0, 3)).reshape((m_loc, ns, ns, npc) + kbp)
@@ -1348,19 +1358,19 @@ class MixedBasisPairConvolution:
                 v = jnp.transpose(v, (3, 0, 1, 2, 4)).reshape(kc, m_loc, ns, ns, P_, cols_chunk)
                 v = jax.lax.all_to_all(v, _XY, split_axis=4, concat_axis=1, tiled=True)
                 H = H.at[kidx[i]].set(v.reshape(kc, m_carrier, ns, ns, cols_chunk),
-                                      unique_indices=True)
+                                      mode="drop", unique_indices=True)       # a padded child: dropped
                 return H, None
 
             H0 = jnp.zeros((nk, m_carrier, ns, ns, cols_chunk), jnp.complex128)
-            H, _ = jax.lax.scan(step, H0, jnp.arange(start.shape[0]), unroll=1)
+            H, _ = jax.lax.scan(step, H0, jnp.arange(plist.shape[0]), unroll=1)
             return H
 
         sspec, rep = P(None, _XY, None, None, None), P()
         out = P(None, None, None, None, _XY)
         fns = {}
         for partner, steps in psteps.items():
-            f = (lambda S, St, j, *tb, _p=partner, _n=steps["npc"]:
-                 expand(S, St, j, *tb, partner=_p, npc=_n))
+            f = (lambda S, St, j, *tb, _p=partner, _n=steps["npc"], _k=steps["kc"]:
+                 expand(S, St, j, *tb, partner=_p, npc=_n, kc=_k))
             fns[partner] = jax.jit(shard_map(f, mesh=mesh, in_specs=(sspec, sspec) + (rep,) * 12,
                                              out_specs=out, check_vma=False))
         return fns
@@ -1512,7 +1522,8 @@ class MixedBasisPairConvolution:
                 f"[pair-conv] schedule: r' chunks n_c={c.n_c}, batch J={c.J} ({self.n_batch} per chunk "
                 f"per rank), k chunk {c.kc}, q chunk {c.qc}; expand at the parents: "
                 + "; ".join(f"{nm} {st['n_transforms']} p'→r' transforms per chunk for {self.nk} k "
-                            f"({len(st['start'])} steps × {st['npc']} of {st['n_src']})"
+                            f"({len(st['plist'])} steps × {st['npc']} of {st['n_src']}, "
+                            f"{st['kc']} children per step)"
                             for nm, ps in zip(("left", "right"), self._pstep)
                             for v, st in ps.items() if not v) + "\n"
                 f"[pair-conv] memory law per rank: tiles {gb(c.bytes_tiles)}, H {gb(c.bytes_h)}, "

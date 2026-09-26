@@ -380,7 +380,7 @@ def main():
                           middle=conv.chunks.bytes_middle, final=conv.chunks.bytes_final,
                           stages=conv.chunks.stage_bytes, hwm=conv.chunks.hwm,
                           target=conv.chunks.target),
-               expand_steps=[{str(v): dict(npc=st["npc"], n_steps=len(st["start"]),
+               expand_steps=[{str(v): dict(npc=st["npc"], kc=st["kc"], n_steps=len(st["plist"]),
                                            n_transforms=st["n_transforms"], n_src=st["n_src"])
                               for v, st in ps.items()} for ps in conv._pstep],
                receipt=conv.describe(), t_tables=t_tables, t_plan=t_plan)
