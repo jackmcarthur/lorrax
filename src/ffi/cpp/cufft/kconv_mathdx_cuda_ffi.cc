@@ -204,6 +204,8 @@ struct UnfoldTab {
                                                  // 1 conjugate the phased product, 2 read conj(G)
     const double* spin_r;                        // (nk,nr_s,nr_s) right action; null = spin
     int a0, b0;                                  // mode 7: first rows of the output spin block
+    long long y0, by;                            // mode 7: the stored nu block [y0, y0 + by) of the
+                                                 // local right centroids (by = 0: every nu)
 };
 
 // Mode 8 vertex tables and scales (the embedded source declares the same struct).
@@ -260,6 +262,7 @@ struct UnfoldTab {
     int conj_trs;
     const double* spin_r;
     int a0, b0;
+    long long y0, by;
 };
 // The output row of full k: kout[k] (-1 = not stored), or k itself.
 __device__ __forceinline__ long long lrx_out_row(const UnfoldTab& t, int k) {
@@ -724,15 +727,16 @@ __device__ __forceinline__ void lrx_spin_row(const lrx_c2 (&u)[NS][NS], const lr
 // The grouped load (RB holds whole spin groups): PB pairs per block, the NS*NS
 // sources of a pair read once and U G U^dagger formed in registers; bank
 // (jp, a, b) = row jp*SS + a*NS + b holds all NK values of that element.
+// Pair pr is (x, y) = (pr / by, y0 + pr % by): the stored nu block (lrx_nu_block).
 template <int PB>
 __device__ __forceinline__ void lrx_group_load(
     const lrx_c2* __restrict__ gp, const lrx_c2* __restrict__ gt, const UnfoldTab& t,
-    long long p0, long long pairs, long long my, lrx_c2* sm) {
+    long long p0, long long pairs, long long by, long long y0, lrx_c2* sm) {
     for (int i = threadIdx.x; i < PB * NK; i += blockDim.x) {
         const int k = i / PB, jp = i % PB;
         const long long pr = p0 + jp;
         if (pr < pairs) {
-            const long long xx = pr / my, yy = pr - xx * my;
+            const long long xx = pr / by, yy = y0 + (pr - xx * by);
             lrx_c2 g[NS][NR], u[NS][NS], ur[NR][NR];
             lrx_unfold_pair(gp, gt, t, k, xx, yy, g, u, ur);
 #pragma unroll
@@ -757,21 +761,30 @@ __device__ __forceinline__ void lrx_group_load(
     }
 }
 
+// Mode 7's stored nu block: the right centroids [y0, y0 + by) of every left one, so a pass
+// reads only its own pairs' sources (by = 0, every other mode: all of them).  (by, y0).
+__device__ __forceinline__ void lrx_nu_block(const UnfoldTab& t, long long& by, long long& y0) {
+    by = t.by > 0 ? t.by : t.nl / NR;
+    y0 = t.by > 0 ? t.y0 : 0;
+}
+
 // The load of modes 7 and 9: the block's RB rows r = (pair, a, b) of the
 // unfolded operand into the banks, grouped when RB holds whole spin groups.
 __device__ __forceinline__ void lrx_unfold_load(
     const lrx_c2* __restrict__ gp, const lrx_c2* __restrict__ gt, const UnfoldTab& t,
     long long r0, lrx_c2* sm) {
-    const long long my = t.nl / NR, pairs = (t.ml / NS) * my;
+    long long by, y0;
+    lrx_nu_block(t, by, y0);
+    const long long pairs = (t.ml / NS) * by;
     if constexpr (GROUPED) {
-        lrx_group_load<RB / SSO>(gp, gt, t, r0 / SSO, pairs, my, sm);
+        lrx_group_load<RB / SSO>(gp, gt, t, r0 / SSO, pairs, by, y0, sm);
     } else {
         for (int i = threadIdx.x; i < RB * NK; i += blockDim.x) {
             const int k = i / RB, j = i % RB;
             const long long r = r0 + j, pr = r / SSO;
             lrx_c2 v = {0.0, 0.0};
             if (pr < pairs) {
-                const long long xx = pr / my, yy = pr - xx * my;
+                const long long xx = pr / by, yy = y0 + (pr - xx * by);
                 const int a = (NA == NS) ? (int)((r % SS) / NR) : t.a0 + (int)((r % SSO) / NA);
                 const int b = (NA == NS) ? (int)(r % NR) : t.b0 + (int)((r % SSO) % NA);
                 lrx_c2 g[NS][NR], u[NS][NS], ur[NR][NR], out[NR];
@@ -845,11 +858,13 @@ __device__ __forceinline__ void tt_fixed(const UnfoldTab& t, const TileTabs& s) 
     }
 }
 
-// The tables of pairs [pr0, pr0 + npr) (npr <= TP; pair = x*my + y) into buffer b by cp.async
-// (the caller commits): lsrc/rsrc slices [jp][k][c] (one copy of NS or NR indices), mph/nph
-// [jp][c][k], and with TT_NW the kernel kern[(k*mx + x)*my + y] as w [jp][k].
+// The tables of pairs [pr0, pr0 + npr) (npr <= TP; pair = x*my + y, y counted from oy: mode 7's
+// stored nu block, whose kernel rows are kmy wide) into buffer b by cp.async (the caller
+// commits): lsrc/rsrc slices [jp][k][c] (one copy of NS or NR indices), mph/nph [jp][c][k], and
+// with TT_NW the kernel kern[(k*mx + x)*kmy + oy + y] as w [jp][k].
 __device__ __forceinline__ void tt_tile(const UnfoldTab& t, const TileTabs& s, int b, long long pr0, int npr,
-                                        long long my, const lrx_c2* kern, long long mx) {
+                                        long long my, const lrx_c2* kern, long long mx, long long oy = 0,
+                                        long long kmy = 0) {
     const lrx_c2* mph = reinterpret_cast<const lrx_c2*>(t.mph);
     const lrx_c2* nph = reinterpret_cast<const lrx_c2*>(t.nph);
     const long long x0 = pr0 / my, y0 = pr0 - x0 * my;
@@ -858,15 +873,17 @@ __device__ __forceinline__ void tt_tile(const UnfoldTab& t, const TileTabs& s, i
         if (jp >= npr) continue;
         long long xx = x0, yy = y0 + jp;
         while (yy >= my) { yy -= my; ++xx; }
+        yy += oy;
         lrx_async::copy<4 * NS>(s.ls(b) + i * NS, t.lsrc + (long long)k * t.ml + xx * NS);
         lrx_async::copy<4 * NR>(s.rs(b) + i * NR, t.rsrc + (long long)k * t.nl + yy * NR);
-        if constexpr (TT_NW > 0) lrx_async::copy<16>(s.w(b) + i, kern + ((long long)k * mx + xx) * my + yy);
+        if constexpr (TT_NW > 0) lrx_async::copy<16>(s.w(b) + i, kern + ((long long)k * mx + xx) * kmy + yy);
     }
     for (int i = threadIdx.x; i < TP * (NS + NR) * NK; i += blockDim.x) {
         const int k = i % NK, q = i / NK, jp = q / (NS + NR), e = q % (NS + NR);
         if (jp >= npr) continue;
         long long xx = x0, yy = y0 + jp;
         while (yy >= my) { yy -= my; ++xx; }
+        yy += oy;
         if (e < NS)
             lrx_async::copy<16>(s.mp(b) + (jp * NS + e) * NK + k, mph + (long long)k * t.ml + xx * NS + e);
         else
@@ -977,13 +994,15 @@ extern "C" __global__ void __launch_bounds__(256, LRX_MINB) lrx_kconv(
     static_assert(RB == TT_ROWS, "the host passes the tile's pairs and rows together");
     extern __shared__ lrx_c2 sm[];
     using namespace cufftdx;
-    const long long mx = t.ml / NS, my = t.nl / NS, pairs = mx * my;
+    long long by, oy;                                  // the stored nu block (lrx_nu_block)
+    lrx_nu_block(t, by, oy);
+    const long long mx = t.ml / NS, my = t.nl / NS, pairs = mx * by;
     const TileTabs s{reinterpret_cast<char*>(sm + RB * SP)};
     const long long stride = (long long)gridDim.x * TP;
     auto npr_of = [&](long long q) { return (int)min((long long)TP, pairs - q); };
     long long p0 = (long long)blockIdx.x * TP;
     tt_fixed(t, s);
-    if (p0 < pairs) tt_tile(t, s, 0, p0, npr_of(p0), my, kern, mx);
+    if (p0 < pairs) tt_tile(t, s, 0, p0, npr_of(p0), by, kern, mx, oy, my);
     lrx_async::commit();
     for (int b = 0; p0 < pairs; p0 += stride, b ^= 1) {
         lrx_async::wait_all();
@@ -991,7 +1010,7 @@ extern "C" __global__ void __launch_bounds__(256, LRX_MINB) lrx_kconv(
         const int npr = npr_of(p0);
         tt_gather(gp, gt, gp, gt, t, s, b, npr, sm);
         lrx_async::commit();
-        if (p0 + stride < pairs) tt_tile(t, s, b ^ 1, p0 + stride, npr_of(p0 + stride), my, kern, mx);
+        if (p0 + stride < pairs) tt_tile(t, s, b ^ 1, p0 + stride, npr_of(p0 + stride), by, kern, mx, oy, my);
         lrx_async::commit();
         lrx_async::wait_prior<1>();                     // this tile's cells (not the next tables)
         __syncthreads();
@@ -1004,16 +1023,16 @@ extern "C" __global__ void __launch_bounds__(256, LRX_MINB) lrx_kconv(
         }
         __syncthreads();
         transform3<fft_direction::forward>(sm);
-        const long long x0 = p0 / my, y0 = p0 - x0 * my;
+        const long long x0 = p0 / by, y0 = p0 - x0 * by;
         for (int i = threadIdx.x; i < RB * NK; i += blockDim.x) {
             const int k = i / RB, j = i % RB, jp = j / SS;
             const long long ko = lrx_out_row(t, k);
             if (jp < npr && ko >= 0) {
-                long long xx = x0, yy = y0 + jp;
-                while (yy >= my) { yy -= my; ++xx; }
+                long long xx = x0, yy = y0 + jp;           // yy within the block
+                while (yy >= by) { yy -= by; ++xx; }
                 const int a = (j % SS) / NS, bb = j % NS;
                 const lrx_c2 v = sm[j * SP + k];
-                y[((ko * NS + a) * mx + xx) * (my * NS) + bb * my + yy] = {v.x * scale, v.y * scale};
+                y[((ko * NS + a) * mx + xx) * (by * NS) + bb * by + yy] = {v.x * scale, v.y * scale};
             }
         }                                              // the loop top syncs before the next gather
     }
@@ -1024,7 +1043,9 @@ extern "C" __global__ void __launch_bounds__(256) lrx_kconv(
     const lrx_c2* __restrict__ kern, lrx_c2* __restrict__ y, UnfoldTab t, double scale) {
     extern __shared__ lrx_c2 sm[];
     using namespace cufftdx;
-    const long long mx = t.ml / NS, my = t.nl / NS, pairs = mx * my;
+    long long by, oy;                                  // the stored nu block (lrx_nu_block)
+    lrx_nu_block(t, by, oy);
+    const long long mx = t.ml / NS, my = t.nl / NS, pairs = mx * by;
     const long long r0 = (long long)blockIdx.x * RB;
     lrx_unfold_load(gp, gt, t, r0, sm);
     __syncthreads();
@@ -1033,7 +1054,7 @@ extern "C" __global__ void __launch_bounds__(256) lrx_kconv(
         const int k = i / RB, j = i % RB;
         const long long pr = (r0 + j) / SSO;
         if (pr < pairs) {
-            const long long xx = pr / my, yy = pr - xx * my;
+            const long long xx = pr / by, yy = oy + (pr - xx * by);
             sm[j * SP + k] = lrx_mul(sm[j * SP + k], kern[((long long)k * mx + xx) * my + yy]);
         }
     }
@@ -1044,11 +1065,11 @@ extern "C" __global__ void __launch_bounds__(256) lrx_kconv(
         const long long r = r0 + j, pr = r / SSO;
         const long long ko = lrx_out_row(t, k);
         if (pr < pairs && ko >= 0) {
-            const long long xx = pr / my, yy = pr - xx * my;
-            // (a, b) within the stored block: U is (n_out, NA, mx, NA, my).
+            const long long xx = pr / by, yy = pr - xx * by;   // yy within the nu block
+            // (a, b) within the stored block: U is (n_out, NA, mx, NA, by).
             const int a = (int)((r % SSO) / NA), b = (int)(r % NA);
             const lrx_c2 v = sm[j * SP + k];
-            y[((ko * NA + a) * mx + xx) * (my * NA) + b * my + yy] = {v.x * scale, v.y * scale};
+            y[((ko * NA + a) * mx + xx) * (by * NA) + b * by + yy] = {v.x * scale, v.y * scale};
         }
     }
 }
@@ -2337,13 +2358,17 @@ static ffi::Error LaunchRows(cudaStream_t stream, int mode, ffi::AnyBuffer X, co
 // through the typed-unfold tables; U (n_out, ns, mx, ns, my) spin-major, full-k
 // row k stored at kout[k] (-1 = not stored).  kout == nullptr is the previous
 // target's contract (every k at its own row, n_out = nk), kept so an older
-// source tree still runs on this library.
+// source tree still runs on this library.  by > 0 stores the nu block
+// [y0, y0 + by) of the local right centroids, U (n_out, ns, mx, ns, by): the pass
+// reads only those pairs' sources, so a caller that bounds the output tile by nu
+// blocks reads the Green and W once in all (spin blocks re-read them per block).
 static ffi::Error KleadUnfoldImpl(
     cudaStream_t stream, ffi::AnyBuffer Gp, ffi::AnyBuffer Gt, ffi::AnyBuffer row, ffi::AnyBuffer trs,
     ffi::AnyBuffer lsrc, ffi::AnyBuffer rsrc, ffi::AnyBuffer mph, ffi::AnyBuffer nph, ffi::AnyBuffer spin,
     const ffi::AnyBuffer* kout, ffi::AnyBuffer V, ffi::Result<ffi::AnyBuffer> U, int64_t nkx,
     int64_t nky, int64_t nkz, double scale, std::string_view mathdx_root, std::string_view cubin_dir,
-    int64_t conj_src = 0, int64_t spin_block = 0, int64_t a0 = 0, int64_t b0 = 0) {
+    int64_t conj_src = 0, int64_t spin_block = 0, int64_t a0 = 0, int64_t b0 = 0, int64_t y0 = 0,
+    int64_t by = 0) {
     auto bad = [](const std::string& why) {
         return fail("klead unfold conv", why, ffi::ErrorCode::kInvalidArgument);
     };
@@ -2361,6 +2386,7 @@ static ffi::Error KleadUnfoldImpl(
     const auto gd = Gp.dimensions(), sd = spin.dimensions();
     if (gd.size() != 3 || sd.size() != 3) return bad("want Gp (n_parent, ml, nl) and spin (nk, ns, ns)");
     const int64_t np = gd[0], ml = gd[1], nl = gd[2], ns = sd[1];
+    const int64_t ny = (ns > 0 && by > 0) ? by : (ns > 0 ? nl / ns : 0);   // stored nu extent
     const auto C = ffi::DataType::C128, I = ffi::DataType::S32;
     if ((ns != 1 && ns != 2 && ns != 4) || ml % ns || nl % ns || np < 1 ||
         !is(Gp, C, {np, ml, nl}) || !is(Gt, C, {np, ml, nl}) || !is(row, I, {nk}) || !is(trs, I, {nk}) ||
@@ -2370,15 +2396,18 @@ static ffi::Error KleadUnfoldImpl(
         !(U->element_type() == C && U->dimensions().size() == 5 && U->dimensions()[0] >= 1 &&
           (kout != nullptr || U->dimensions()[0] == nk) &&
           U->dimensions()[1] == (spin_block ? spin_block : ns) && U->dimensions()[2] == ml / ns &&
-          U->dimensions()[3] == (spin_block ? spin_block : ns) && U->dimensions()[4] == nl / ns))
+          U->dimensions()[3] == (spin_block ? spin_block : ns) && U->dimensions()[4] == ny))
         return bad("want c128 Gp=Gt (np,ml,nl); s32 row,trs,kout (nk), lsrc (nk,ml), rsrc (nk,nl); c128 "
                    "mph (nk,ml), nph (nk,nl), spin (nk,ns,ns), V (nk,ml/ns,nl/ns); U "
-                   "(n_out,ns,ml/ns,ns,nl/ns), n_out = nk without kout");
+                   "(n_out,ns,ml/ns,ns,nl/ns or by), n_out = nk without kout");
     // The output spin block: rows [a0, a0 + d) x [b0, b0 + d) of the spin group (d = ns: all).
     const int64_t d = spin_block ? spin_block : ns;
     if (d < 1 || ns % d || a0 < 0 || b0 < 0 || a0 % d || b0 % d || a0 >= ns || b0 >= ns)
         return bad("want spin_block d dividing ns and block origins a0, b0 in [0, ns), multiples of d");
-    const int64_t pairs = (ml / ns) * (nl / ns);
+    // The nu block stores the whole spin group (a spin block and a nu block do not combine).
+    if (by < 0 || y0 < 0 || (by > 0 && (d != ns || y0 + by > nl / ns)))
+        return bad("want the nu block [y0, y0 + by) inside [0, nl/ns) with the whole spin group");
+    const int64_t pairs = (ml / ns) * ny;
     if (pairs == 0) return ffi::Error::Success();
     const Built* k = nullptr;
     ffi::Error e = build(7, static_cast<int>(nkx), static_cast<int>(nky), static_cast<int>(nkz),
@@ -2390,7 +2419,8 @@ static ffi::Error KleadUnfoldImpl(
                 static_cast<const double*>(mph.untyped_data()), static_cast<const double*>(nph.untyped_data()),
                 static_cast<const double*>(spin.untyped_data()), ml, nl,
                 kout ? static_cast<const int*>(kout->untyped_data()) : nullptr, conj_src ? 2 : 0, nullptr,
-                static_cast<int>(a0), static_cast<int>(b0)};
+                static_cast<int>(a0), static_cast<int>(b0), static_cast<long long>(y0),
+                static_cast<long long>(by)};
     const void* gpp = Gp.untyped_data();
     const void* gtp = Gt.untyped_data();
     const void* vp = V.untyped_data();
@@ -2426,6 +2456,16 @@ static ffi::Error KleadUnfoldBlockConv(
     std::string_view mathdx_root, std::string_view cubin_dir) {
     return KleadUnfoldImpl(stream, Gp, Gt, row, trs, lsrc, rsrc, mph, nph, spin, &kout, V, U, nkx, nky,
                            nkz, scale, mathdx_root, cubin_dir, conj_src, spin_block, a0, b0);
+}
+// `_nublock`: the conj-on-load partner and the stored nu block [y0, y0 + by) (whole spin group).
+static ffi::Error KleadUnfoldNuBlockConv(
+    cudaStream_t stream, ffi::AnyBuffer Gp, ffi::AnyBuffer Gt, ffi::AnyBuffer row, ffi::AnyBuffer trs,
+    ffi::AnyBuffer lsrc, ffi::AnyBuffer rsrc, ffi::AnyBuffer mph, ffi::AnyBuffer nph, ffi::AnyBuffer spin,
+    ffi::AnyBuffer kout, ffi::AnyBuffer V, ffi::Result<ffi::AnyBuffer> U, int64_t nkx, int64_t nky,
+    int64_t nkz, double scale, int64_t conj_src, int64_t y0, int64_t by,
+    std::string_view mathdx_root, std::string_view cubin_dir) {
+    return KleadUnfoldImpl(stream, Gp, Gt, row, trs, lsrc, rsrc, mph, nph, spin, &kout, V, U, nkx, nky,
+                           nkz, scale, mathdx_root, cubin_dir, conj_src, 0, 0, 0, y0, by);
 }
 static ffi::Error KleadUnfoldConv(
     cudaStream_t stream, ffi::AnyBuffer Gp, ffi::AnyBuffer Gt, ffi::AnyBuffer row, ffi::AnyBuffer trs,
@@ -3044,6 +3084,29 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(
         .Attr<int64_t>("spin_block")  // d: store the (d x d) output spin block at (a0, b0); 0 = all
         .Attr<int64_t>("a0")
         .Attr<int64_t>("b0")
+        .Attr<std::string_view>("mathdx_root")
+        .Attr<std::string_view>("cubin_dir"));
+
+XLA_FFI_DEFINE_HANDLER_SYMBOL(
+    KConvMathdxKleadUnfoldNuBlockCudaFfi, lorrax_ffi::kconv_mathdx::KleadUnfoldNuBlockConv,
+    xla::ffi::Ffi::Bind()
+        .Ctx<xla::ffi::PlatformStream<cudaStream_t>>()
+        .Arg<xla::ffi::AnyBuffer>()   // Gp
+        .Arg<xla::ffi::AnyBuffer>()   // Gt (unread when conj_src)
+        .Arg<xla::ffi::AnyBuffer>()   // row
+        .Arg<xla::ffi::AnyBuffer>()   // trs
+        .Arg<xla::ffi::AnyBuffer>()   // lsrc
+        .Arg<xla::ffi::AnyBuffer>()   // rsrc
+        .Arg<xla::ffi::AnyBuffer>()   // mph
+        .Arg<xla::ffi::AnyBuffer>()   // nph
+        .Arg<xla::ffi::AnyBuffer>()   // spin
+        .Arg<xla::ffi::AnyBuffer>()   // kout
+        .Arg<xla::ffi::AnyBuffer>()   // V (R space)
+        .Ret<xla::ffi::AnyBuffer>()
+        LRX_KCONV_GRID_ATTRS
+        .Attr<int64_t>("conj_src")    // 1: the antiunitary partner is conj(Gp); Gt unread
+        .Attr<int64_t>("y0")          // the stored nu block [y0, y0 + by) of the local right centroids
+        .Attr<int64_t>("by")          // 0: every nu
         .Attr<std::string_view>("mathdx_root")
         .Attr<std::string_view>("cubin_dir"));
 

@@ -370,7 +370,8 @@ def face_projection_chunk(*, nk, nb, ns, mu_left, mu_right, p, channels=1,
                           itemsize=16):
     """Local band columns ``w`` per chunk of the face projector's stream.
 
-    ``ns`` is the operator block's spin extent.  The stream's transients
+    ``mu_right/p`` is the operator block's local ν extent (a ν block's
+    width).  The stream's transients
     per rank, for ``w`` local columns (``p·w`` global): the gathered ψ_r
     chunk ``nk·ns·(μ_r/p)·p·w`` (twice while a prefetch is in flight), and
     per channel the partial ``T`` ``nk·ns·(μ_l/p)·p·w``, its scattered slab
@@ -400,42 +401,36 @@ class BandProjector:
     """``Σ[m,n] = Σ conj(ψ_l)[m,s,μ] O[s,μ,s',ν] ψ_r[s',ν,n]`` in three phases.
 
     ``prepare(psi_left, psi_right) -> faces`` orients the ψ operands once;
-    ``accumulate(faces, O, a0=0, b0=0, acc=None) -> acc`` adds one operator
-    spin block's contribution (``O`` holds spins ``[a0, a0+d)`` ×
-    ``[b0, b0+d)``) to a rank-local ``(nb, nb)`` partial; ``finish(acc)``
-    reduces it ONCE into ``(nk, m_X, n_Y)``.  A caller that projects an
-    operator in ``d×d`` spin blocks (``gw.ppm_tau_kernel``) prepares once and
-    reduces once, however many blocks.  The partial is ``16·nk·nb²`` bytes
-    per rank (per channel), P-independent, carried as a
+    ``accumulate(faces, O, nu=None, acc=None) -> acc`` adds one operator ν
+    block's contribution to a rank-local ``(nb, nb)`` partial: ``O`` holds
+    the local right centroids ``[y0, y0+by)`` of every rank's ν tile
+    (``nu = (y0, by)``; ``None``: the whole operator), every spin and every
+    μ; ``finish(acc)`` reduces it ONCE into ``(nk, m_X, n_Y)``.  A caller
+    that projects an operator in ν blocks (``gw.ppm_tau_kernel``) prepares
+    once and reduces once, however many blocks.  The partial is
+    ``16·nk·nb²`` bytes per rank (per channel), P-independent, carried as a
     ``(nch, P·nk, nb, nb)`` array at ``P(None, (ax_x, ax_y))``.
 
     Calling the projector, ``project(psi_left, O, psi_right)``, is all three
-    for a whole-spin operator (``d = ns``).  ``channels="split_reim"``
-    returns ``(S_R, S_I)``.
+    for a whole operator.  ``channels="split_reim"`` returns ``(S_R, S_I)``.
     """
 
     def __init__(self, *, mesh, axes, expected, in_specs, channels, prepare,
-                 accumulate, finish, spin_block, ns):
+                 accumulate, finish):
         self.mesh, self.axes, self.channels = mesh, axes, channels
-        self.spin_block, self.ns = spin_block, ns
         self._expected, self._in_specs = expected, in_specs
         self.prepare, self._accumulate, self._finish = (
             prepare, accumulate, finish)
 
-    def accumulate(self, faces, O, a0=0, b0=0, acc=None):
-        return self._accumulate(faces, O, acc, a0=int(a0), b0=int(b0))
+    def accumulate(self, faces, O, nu=None, acc=None):
+        nu = None if nu is None else (int(nu[0]), int(nu[1]))
+        return self._accumulate(faces, O, acc, nu=nu)
 
     def finish(self, acc):
         out = self._finish(acc)
         return out[0] if self.channels == "none" else (out[0], out[1])
 
     def __call__(self, psi_left, O, psi_right):
-        if self.spin_block != self.ns:
-            raise ValueError(
-                "contract_bands_block_reshard: a projector planned for "
-                f"{self.spin_block}x{self.spin_block} operator spin blocks "
-                f"of an ns = {self.ns} carrier is driven through prepare/"
-                "accumulate/finish, not called on one block")
         got = (tuple(psi_left.shape), tuple(O.shape), tuple(psi_right.shape))
         if got != self._expected:
             raise ValueError(
@@ -459,7 +454,7 @@ class BandProjector:
 
 
 def _projector_shapes(mesh_xy, face_shape, axes, channels, right_face_shape,
-                      band_extent, spin_block, *, square):
+                      band_extent, nu_block, *, square):
     """Validated static extents shared by the face and axis projectors."""
     ax_x, ax_y = axes
     px, py = int(mesh_xy.shape[ax_x]), int(mesh_xy.shape[ax_y])
@@ -482,17 +477,17 @@ def _projector_shapes(mesh_xy, face_shape, axes, channels, right_face_shape,
             f"{tuple(right_face_shape)}")
     mu_r = int(right_face_shape[2])
     nb = nb_full if band_extent is None else int(band_extent)
-    d = ns if spin_block is None else int(spin_block)
-    if d < 1 or ns % d:
-        raise ValueError(
-            f"contract_bands_block_reshard: spin_block {d} must divide "
-            f"nspinor {ns}")
     if nb % px or nb % py or mu_l % px or mu_r % py:
         raise ValueError(
             "contract_bands_block_reshard: the projected band extent "
             f"{nb} and the centroid extents ({mu_l}, {mu_r}) must tile the "
             f"({px}, {py}) mesh")
-    return nk, nb, ns, d, mu_l, mu_r, px, py
+    by = mu_r // py if nu_block is None else int(nu_block)
+    if not 1 <= by <= mu_r // py:
+        raise ValueError(
+            f"contract_bands_block_reshard: nu_block {by} must lie in "
+            f"[1, {mu_r // py}] (the local right centroid extent)")
+    return nk, nb, ns, by, mu_l, mu_r, px, py
 
 
 def _band_block_finish(mesh_xy, axes, px, py, nch):
@@ -509,7 +504,7 @@ def _band_block_finish(mesh_xy, axes, px, py, nch):
 
 def _face_project_kernel(mesh_xy: Mesh, face_shape, axes, *,
                          channels: str = "none", right_face_shape=None,
-                         band_extent=None, spin_block=None):
+                         band_extent=None, nu_block=None):
     """The face-layout Σ projector: the operator stays, ψ streams in 1/P tiles.
 
         Σ[m,n] = Σ_{s,μ} conj(ψ_l)[m,s,μ] T[s,μ,n],
@@ -547,14 +542,16 @@ def _face_project_kernel(mesh_xy: Mesh, face_shape, axes, *,
     from common.shard_map import shard_map
 
     ax_x, ax_y = axes
-    nk, nb, ns, d, mu_l, mu_r, p, _ = _projector_shapes(
+    nk, nb, ns, by, mu_l, mu_r, p, _ = _projector_shapes(
         mesh_xy, face_shape, axes, channels, right_face_shape, band_extent,
-        spin_block, square=True)
+        nu_block, square=True)
     nch = 1 if channels == "none" else 2
     b_loc, mul = nb // p, mu_l // p
     q = -(-mul // p)
-    w = face_projection_chunk(nk=nk, nb=nb, ns=d, mu_left=mu_l,
-                              mu_right=mu_r, p=p, channels=nch)
+    # Admitted against the widest ν block's operator tile (the whole tile
+    # when the operator comes in one piece).
+    w = face_projection_chunk(nk=nk, nb=nb, ns=ns, mu_left=mu_l,
+                              mu_right=p * by, p=p, channels=nch)
     n_chunks = b_loc // w
     both = (ax_x, ax_y)
     transpose = [(i * p + j, j * p + i) for i in range(p) for j in range(p)]
@@ -576,9 +573,9 @@ def _face_project_kernel(mesh_xy: Mesh, face_shape, axes, *,
         prepare_body, mesh=mesh_xy, in_specs=(left_spec, right_spec),
         out_specs=(slab_spec, rt_spec), check_vma=False))
 
-    def accumulate_body(slab, rt, O, acc, *, a0, b0):
-        slab = slab[:, :, a0:a0 + d]
-        rt = rt[:, b0:b0 + d]
+    def accumulate_body(slab, rt, O, acc, *, nu):
+        if nu is not None:                   # ψ_r(ν_y, n_x): the block's ν
+            rt = rt[:, :, nu[0]:nu[0] + nu[1]]
         ops = ((O,) if channels == "none" else
                (jnp.real(O).astype(O.dtype), jnp.imag(O).astype(O.dtype)))
         if acc is None:
@@ -619,10 +616,10 @@ def _face_project_kernel(mesh_xy: Mesh, face_shape, axes, *,
 
     compiled = {}
 
-    def accumulate(faces, O, acc, *, a0, b0):
-        key = (a0, b0, acc is None)
+    def accumulate(faces, O, acc, *, nu):
+        key = (nu, acc is None)
         if key not in compiled:
-            body = functools.partial(accumulate_body, a0=a0, b0=b0)
+            body = functools.partial(accumulate_body, nu=nu)
             if acc is None:
                 fn = shard_map(lambda s, r, o: body(s, r, o, None),
                                mesh=mesh_xy,
@@ -644,13 +641,12 @@ def _face_project_kernel(mesh_xy: Mesh, face_shape, axes, *,
                   (nk, ns, mu_r, nb)),
         in_specs=(left_spec, o_spec, right_spec), prepare=prepare,
         accumulate=accumulate,
-        finish=_band_block_finish(mesh_xy, axes, p, p, nch),
-        spin_block=d, ns=ns)
+        finish=_band_block_finish(mesh_xy, axes, p, p, nch))
 
 
 def _axis_project_kernel(mesh_xy: Mesh, face_shape, axes, *,
                          channels: str = "none", right_face_shape=None,
-                         band_extent=None, spin_block=None):
+                         band_extent=None, nu_block=None):
     """The ``layout='axis'`` Σ projector: slab partial, ONE reduction.
 
     ``axis`` operands carry EVERY band with the centroid axis split over one
@@ -670,15 +666,15 @@ def _axis_project_kernel(mesh_xy: Mesh, face_shape, axes, *,
     and ``finish`` (:func:`reduce_scatter_to_band_block`) sums the
     ``(nb, nb)`` partial over the mesh into ``P(None, 'x', 'y')`` — one
     collective of ``nb²`` per rank per projection, however many operator
-    spin blocks.  ``channels='split_reim'`` projects ``Re O`` and ``Im O``
+    ν blocks.  ``channels='split_reim'`` projects ``Re O`` and ``Im O``
     into the same partial stack.
     """
     from common.shard_map import shard_map
 
     ax_x, ax_y = axes
-    nk, nb, ns, d, mu_l, mu_r, px, py = _projector_shapes(
+    nk, nb, ns, _, mu_l, mu_r, px, py = _projector_shapes(
         mesh_xy, face_shape, axes, channels, right_face_shape, band_extent,
-        spin_block, square=False)
+        nu_block, square=False)
     nch = 1 if channels == "none" else 2
     left_spec, o_spec, right_spec = (
         P(None, None, None, ax_x), P(None, None, ax_x, None, ax_y),
@@ -687,9 +683,9 @@ def _axis_project_kernel(mesh_xy: Mesh, face_shape, axes, *,
 
     prepare = jax.jit(lambda psi_l, psi_r: (jnp.conj(psi_l), psi_r))
 
-    def accumulate_body(psi_l, psi_r, O, acc, *, a0, b0):
-        psi_l = psi_l[:, :, a0:a0 + d]
-        psi_r = psi_r[:, b0:b0 + d]
+    def accumulate_body(psi_l, psi_r, O, acc, *, nu):
+        if nu is not None:                   # ψ_r(ν_y, n): the block's ν
+            psi_r = psi_r[:, :, nu[0]:nu[0] + nu[1]]
         ops = ((O,) if channels == "none" else
                (jnp.real(O).astype(O.dtype), jnp.imag(O).astype(O.dtype)))
         part = jnp.stack([
@@ -700,10 +696,10 @@ def _axis_project_kernel(mesh_xy: Mesh, face_shape, axes, *,
 
     compiled = {}
 
-    def accumulate(faces, O, acc, *, a0, b0):
-        key = (a0, b0, acc is None)
+    def accumulate(faces, O, acc, *, nu):
+        key = (nu, acc is None)
         if key not in compiled:
-            body = functools.partial(accumulate_body, a0=a0, b0=b0)
+            body = functools.partial(accumulate_body, nu=nu)
             if acc is None:
                 fn = shard_map(lambda l, r, o: body(l, r, o, None),
                                mesh=mesh_xy,
@@ -724,8 +720,7 @@ def _axis_project_kernel(mesh_xy: Mesh, face_shape, axes, *,
                   (nk, ns, mu_r, nb)),
         in_specs=(left_spec, o_spec, right_spec), prepare=prepare,
         accumulate=accumulate,
-        finish=_band_block_finish(mesh_xy, axes, px, py, nch),
-        spin_block=d, ns=ns)
+        finish=_band_block_finish(mesh_xy, axes, px, py, nch))
 
 
 def contract_bands_block_reshard(
@@ -738,7 +733,7 @@ def contract_bands_block_reshard(
     face_shape=None,
     right_face_shape=None,
     face_band_extent=None,
-    spin_block=None,
+    nu_block=None,
 ) -> Callable:
     """Build the band projection + reshard primitive (module docstring).
 
@@ -799,11 +794,12 @@ def contract_bands_block_reshard(
     face_band_extent
         The projected band extent (the Σ window's padded carrier), when the
         ψ operands are sliced below ``nb_full``.
-    spin_block
-        Face/axis: the operator spin block ``d`` (a divisor of ``nspinor``)
-        a caller projects through :class:`BandProjector`'s
-        ``prepare``/``accumulate``/``finish`` — ψ at full ``nspinor``, each
-        ``O`` block ``(nk, d, μ, d, ν)``.  Default ``nspinor``.
+    nu_block
+        Face/axis: the widest ν block (local right centroids per rank) a
+        caller projects through :class:`BandProjector`'s
+        ``prepare``/``accumulate``/``finish`` — each ``O`` block
+        ``(nk, ns, μ, ns, P_y·by)``, every spin; it sizes the face stream's
+        band chunk.  Default: the whole local ν extent.
 
     Returns
     -------
@@ -838,7 +834,7 @@ def contract_bands_block_reshard(
                  else _axis_project_kernel)
         return build(mesh_xy, face_shape, axes, channels=channels,
                      right_face_shape=right_face_shape,
-                     band_extent=face_band_extent, spin_block=spin_block)
+                     band_extent=face_band_extent, nu_block=nu_block)
 
     from common.shard_map import shard_map
 

@@ -345,27 +345,43 @@ def build_G_tau(psi_xn, psi_yr, enk, t, *, e_ref=0.0, mask=None,
 
 
 # ---------------------------------------------------------------------------
-# Output spin blocks.  Σ = Σ_ab ψ*_a [G ⋆ W]_ab ψ_b is linear in the output
-# spin block, so a Σ consumer whose output tile would not fit stores and
-# projects it in d x d blocks (mathdx mode 7's output spin block); the Green
-# itself stays whole at the parents.
+# Output ν blocks.  Σ = Σ_ν [G ⋆ W](μ, ν) ψ(ν) is linear in the output's ν
+# range, so a Σ consumer whose output tile would not fit stores and projects
+# it in ν blocks (mathdx mode 7's stored ν block, every spin), each pass
+# reading only its own pairs' Green and W; the Green itself stays whole at
+# the parents.  ``d`` sizes the blocks: (ns/d)² of them, each ~(d/ns)² of the
+# tile.  (Output spin blocks of the same size re-read the whole Green per
+# block, since the spin action mixes every source of a pair.)
 # ---------------------------------------------------------------------------
 
+def sigma_nu_blocks(ny, n_blocks):
+    """The local ν blocks ``(y0, by)`` of a ``ny``-wide right tile in ``n_blocks`` near-equal pieces (wider first)."""
+    ny, n_blocks = int(ny), int(n_blocks)
+    n_blocks = max(1, min(n_blocks, ny))
+    base, extra = divmod(ny, n_blocks)
+    widths = [base + 1] * extra + [base] * (n_blocks - extra)
+    starts = np.cumsum([0] + widths[:-1])
+    return tuple((int(y0), int(by)) for y0, by in zip(starts, widths))
+
+
 def sigma_spin_block(*, n_parent, n_rmu, ns, mesh, partner_tiles):
-    """The output spin block ``d`` (a divisor of ``ns``) a parent-row Σ convolution stores per pass.
+    """The block size ``d`` (a divisor of ``ns``): a parent-row Σ convolution stores its output in (ns/d)² ν blocks.
 
     Live per rank: the parent Green ``T_p = 16·n_parent·ns²·μ²/P``, ``partner_tiles`` more
     of it (1 when the antiunitary partner is its own GEMM, 0 when it is read as conj(G)),
-    and the stored block ``T_p·(d/ns)²``; the largest ``d`` whose set fits the agreed
-    device target (the minimum process budget times the spinor's fragmentation
-    utilization) wins, else 1.  Every process computes the same ``d``.
+    and the widest stored ν block, ``T_p·by/ν_loc`` (``(d/ns)²`` of it up to one column,
+    :func:`sigma_nu_blocks`); the largest ``d`` whose set fits the agreed device target
+    (the minimum process budget times the spinor's fragmentation utilization) wins, else
+    1.  Every process computes the same ``d``.
     """
     if int(ns) <= 1:
         return 1
     P_ = int(mesh.shape['x']) * int(mesh.shape['y'])
     tile = 16.0 * int(n_parent) * int(ns) ** 2 * int(n_rmu) ** 2 / P_
     target = _device_target_bytes(ns)
-    price = lambda d: (1.0 + float(partner_tiles) + (d / int(ns)) ** 2) * tile
+    ny = int(n_rmu) // int(mesh.shape['y'])
+    frac = lambda d: sigma_nu_blocks(ny, (int(ns) // d) ** 2)[0][1] / ny
+    price = lambda d: (1.0 + float(partner_tiles) + frac(d)) * tile
     divisors = sorted((d for d in range(1, int(ns) + 1) if int(ns) % d == 0), reverse=True)
     d = next((d for d in divisors if price(d) <= target), 1)
     from common.gpu_utils import record_stage_price
