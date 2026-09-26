@@ -209,6 +209,8 @@ from symmetry_maps.maps import (
     star_broadcast,
     reduce_full_bz_to_file_wedge,
     star_tables_of,
+    star_wedge_rows,
+    star_wedge_tables,
     unfold_file_wedge_polar_matrix,
     unfold_file_wedge_to_full_bz,
     unfold_file_wedge_band_operator,
@@ -341,6 +343,7 @@ __all__ = [
     "unfold_file_wedge_polar_matrix", "unfold_file_wedge_band_operator",
     "unfold_wavefunction_local",
     "reduce_full_bz_to_file_wedge", "star_tables_of",
+    "star_wedge_rows", "star_wedge_tables",
     # sharded q-axis unfolds
     "slice_q_full_to_ibz", "unfold_isdf_operator",
     "unfold_operator_local", "open_spin_block_coefficient",

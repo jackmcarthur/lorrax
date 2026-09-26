@@ -620,3 +620,30 @@ def test_the_helpers_keep_a_device_operand_on_the_device():
     assert float(np.abs(np.asarray(back_d) - back_h).max()) == 0.0
     assert star_spread(dev, GNPPM_IRR, GNPPM_SYM, GNPPM_NSS) == star_spread(
         A, GNPPM_IRR, GNPPM_SYM, GNPPM_NSS)
+
+
+def test_kstarmap_rows_and_take_are_the_one_star_row_rule():
+    """``rows`` are the first full-grid row of each star in full-grid order
+    (NOT sorted by label: gnppm's labels come back [0, 2, 6, 8, 7]) and
+    ``take`` renumbers ``irr`` onto them, which is the table both wedge
+    writers file.  The star-wedge helpers are built from the same two."""
+    from types import SimpleNamespace
+    from symmetry_maps import star_wedge_rows, star_wedge_tables
+
+    star = KStarMap(GNPPM_IRR, GNPPM_SYM, GNPPM_NSS)
+    np.testing.assert_array_equal(star.rows, [0, 1, 3, 4, 5])
+    np.testing.assert_array_equal(GNPPM_IRR[star.rows], [0, 2, 6, 8, 7])
+    np.testing.assert_array_equal(star.take, [0, 1, 1, 2, 3, 4, 2, 4, 3])
+    np.testing.assert_array_equal(star.rows, _star_row_order(GNPPM_IRR)[0])
+    # Red twin: np.unique's sorted order is the one the rule rejects.
+    assert not np.array_equal(np.unique(GNPPM_IRR), GNPPM_IRR[star.rows])
+
+    sym = SimpleNamespace(irr_idx_k=GNPPM_IRR, sym_idx_k=GNPPM_SYM,
+                          sym_mats_k=np.zeros((2 * GNPPM_NSS, 3, 3)))
+    labels, take = star_wedge_rows(sym)
+    np.testing.assert_array_equal(labels, [0, 2, 6, 8, 7])
+    np.testing.assert_array_equal(take, star.take)
+    irr_w, sidx, nss = star_wedge_tables(sym)
+    np.testing.assert_array_equal(irr_w, star.take)
+    np.testing.assert_array_equal(sidx, GNPPM_SYM)
+    assert nss == GNPPM_NSS
