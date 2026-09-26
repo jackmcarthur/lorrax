@@ -9,9 +9,8 @@ and mpmath come from the `solve` extra.
 The namespace holds several distinct rule families, one per kernel, domain
 and error currency. A rule valid for one target is not valid for another with
 the same bandwidth, so callers select the constructor that matches their
-kernel. The disk cache and uniform-rule backend are controlled by
-`LORRAX_MINIMAX_CACHE_DIR`, `LORRAX_DISABLE_MINIMAX_DISK_CACHE` and
-`LORRAX_UNIFORM_RULE_BACKEND`, whose rules
+kernel. The disk cache is controlled by `LORRAX_MINIMAX_CACHE_DIR` and
+`LORRAX_DISABLE_MINIMAX_DISK_CACHE`, whose rules
 [`docs/dev/env_vars.md`](../dev/env_vars.md) owns. A cached rule always carries
 `source='cache'` and `certified=False`.
 
