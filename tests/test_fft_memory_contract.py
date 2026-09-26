@@ -1,31 +1,20 @@
-"""The FFT-memory contract: the planner's FFT term must MEASURE, not assume.
+"""The FFT-memory microservice: ``runtime.aot_memory`` must MEASURE, not assume.
 
-These tests pin the wiring that was broken until 2026-07-30, when
-``common.fft_helpers.query_fft_peak_bytes`` promised in its docstring that its
-result "includes cuFFT scratch" while its body computed only
-``compiled.memory_analysis()`` — a number that structurally cannot contain the
-cuFFT plan workspace (jaxlib's ``FftThunk`` takes that from a runtime scratch
-allocator, outside XLA's buffer assignment).  ``runtime.aot_memory``, the one
-module that actually queries ``cufftMakePlanMany``, had zero callers in
-``src/`` while ``docs/architecture/memory-model.md`` said it was wired in.
+``compiled.memory_analysis()`` structurally cannot contain the cuFFT plan
+workspace (jaxlib's ``FftThunk`` takes that from a runtime scratch allocator,
+outside XLA's buffer assignment), so :func:`runtime.aot_memory.aot_kernel_peak_bytes`
+adds a ``cufftMakePlanMany`` query on top.  These cells pin its arithmetic
+and its failure policy.
 
-Every test here runs on CPU: none of them needs a GPU, because each one
-asserts about the *path taken*, not about a cuFFT number.  The GPU-only
-assertions (that a real libcufft query returns non-zero, and that XLA:GPU
-still emits a parseable ``fft`` op) live in ``tests/test_aot_memory.py``.
+Every test here runs on CPU: each asserts about the *path taken*, not about a
+cuFFT number.  The GPU-only assertions (that a real libcufft query returns
+non-zero, and that XLA:GPU still emits a parseable ``fft`` op) live in
+``tests/test_aot_memory.py``.
 
-If any of these goes green while the wiring is broken, it is a void
-instrument.  Each is written so that reverting the fix turns it RED:
-
-* ``test_planner_fft_term_flows_through_aot_kernel_peak_bytes`` fails the
-  moment ``query_fft_peak_bytes`` computes its own peak again.
-* ``test_probe_compiles_the_exact_helper_production_uses`` fails the moment
-  the probe substitutes a transform kind or normalization production did not
-  request.
 * ``test_cufft_query_failure_is_announced_and_flagged`` fails if the
   unavailable-cuFFT case silently returns 0 again.
-* ``test_no_mesh_fallback_announces`` fails if the analytic fallback goes
-  quiet again.
+* ``test_announce_once_speaks_then_dedupes`` fails if the announcement path
+  prints unconditionally or never.
 """
 
 from __future__ import annotations
@@ -42,18 +31,8 @@ _SRC = Path(__file__).resolve().parent.parent / "src"
 if str(_SRC) not in sys.path:
     sys.path.insert(0, str(_SRC))
 
-import numpy as np                                              # noqa: E402
-import jax                                                      # noqa: E402
-import jax.numpy as jnp                                         # noqa: E402
-from jax.sharding import Mesh, NamedSharding, PartitionSpec as P  # noqa: E402
-
-import common.fft_helpers as fft_helpers                        # noqa: E402
 import runtime.aot_memory as aot                                # noqa: E402
 
-
-# A tiny FFT box: the probe compile has to be real (that is the point), but
-# it does not have to be big.  128 complex elements.
-_NK, _BC, _NS, _GRID = 2, 1, 1, (4, 4, 4)
 
 # A representative optimized-HLO line carrying an XLA fft op.
 _HLO_WITH_FFT = (
@@ -67,22 +46,12 @@ _HLO_WITH_FFT = (
 
 @pytest.fixture(autouse=True)
 def _clean_module_state():
-    """Per-test isolation for the two process-global caches.
-
-    ``_fft_workspace_cache`` would otherwise serve a previous test's number
-    (making a monkeypatch look ineffective), and ``_announced`` would swallow
-    the second test's announcement (making a loud path look silent).
+    """Per-test isolation: ``_announced`` would otherwise swallow the second
+    test's announcement (making a loud path look silent).
     """
-    fft_helpers._fft_workspace_cache.clear()
     aot._announced.clear()
     yield
-    fft_helpers._fft_workspace_cache.clear()
     aot._announced.clear()
-
-
-def _unit_mesh() -> Mesh:
-    """A real 1x1 ('x','y') Mesh over the first available device."""
-    return Mesh(np.asarray(jax.devices()[:1]).reshape(1, 1), ('x', 'y'))
 
 
 def _fake_compiled(*, temp=0, arg=0, out=0, alias=0, hlo=_HLO_WITH_FFT):
@@ -93,125 +62,6 @@ def _fake_compiled(*, temp=0, arg=0, out=0, alias=0, hlo=_HLO_WITH_FFT):
             output_size_in_bytes=out, alias_size_in_bytes=alias),
         as_text=lambda: hlo,
     )
-
-
-# ---------------------------------------------------------------------------
-# The wiring: planner -> fft_helpers -> aot_memory (the cuFFT query path)
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.parametrize(
-    ("kind", "norm", "factory_name"),
-    (("fftn", None, "make_sharded_fftn_3d"),
-     ("ifftn", "ortho", "make_sharded_ifftn_3d")),
-)
-def test_probe_compiles_the_exact_helper_production_uses(
-        monkeypatch, kind, norm, factory_name):
-    """The probe must compile the requested production factory and norm.
-
-    Every production FFT box goes through ``make_sharded_*fftn_3d``
-    (``wfn_transforms._local_box_fft``, the ζ writer's r→G FFT in
-    ``gw.isdf_fitting``, the flat-k helpers; the zeta-loader reader-side twin
-    was deleted on 2026-08-07).
-
-    Modelling a different FFT form sizes cuFFT plans nothing ever builds;
-    that is precisely what the per-axis ``custom_partitioning`` probe did.
-    """
-    seen = []
-    real = getattr(fft_helpers, factory_name)
-
-    def spy(*a, **kw):
-        seen.append((a, kw))
-        return real(*a, **kw)
-
-    monkeypatch.setattr(fft_helpers, factory_name, spy)
-
-    fft_helpers.query_fft_peak_bytes(
-        input_shape=(_NK, _BC, _NS, *_GRID), fft_axes=(-3, -2, -1),
-        sharding=NamedSharding(
-            _unit_mesh(), P(None, ('x', 'y'), None, None, None, None)),
-        kind=kind, norm=norm,
-        dtype=jnp.complex128)
-
-    assert seen, (
-        f"query_fft_peak_bytes did not compile {factory_name} — the memory "
-        "model is probing an FFT form production does not run.")
-    assert seen[0][1]["norm"] == norm
-
-
-def test_query_result_is_the_breakdown_total(monkeypatch):
-    """``query_fft_peak_bytes`` returns ``AotPeakBreakdown.total`` verbatim
-    — compiled peak PLUS cuFFT scratch, not just one of them."""
-    monkeypatch.setattr(aot, "aot_kernel_peak_bytes", lambda compiled, **kw:
-                        aot.AotPeakBreakdown(compiled_peak=1_000,
-                                             cufft_scratch=2_000,
-                                             total=3_000,
-                                             cufft_measured=True,
-                                             fft_specs=()))
-    got = fft_helpers.query_fft_peak_bytes(
-        input_shape=(_NK, _BC, _NS, *_GRID), fft_axes=(-3, -2, -1),
-        sharding=NamedSharding(
-            _unit_mesh(), P(None, ('x', 'y'), None, None, None, None)),
-        kind="ifftn", norm="ortho",
-        dtype=jnp.complex128)
-    assert got == 3_000
-
-
-def test_query_cache_keys_on_transform_kind_and_norm(monkeypatch):
-    """Distinct production programs must not reuse one cached measurement."""
-    calls = []
-
-    class _Lowered:
-        def compile(self, **_kwargs):
-            return object()
-
-    class _Jitted:
-        def lower(self, _spec):
-            return _Lowered()
-
-    monkeypatch.setattr(fft_helpers, "make_sharded_fftn_3d",
-                        lambda *a, **kw: object())
-    monkeypatch.setattr(fft_helpers, "make_sharded_ifftn_3d",
-                        lambda *a, **kw: object())
-    monkeypatch.setattr(fft_helpers.jax, "jit",
-                        lambda *a, **kw: _Jitted())
-
-    def fake_peak(_compiled, **_kwargs):
-        calls.append(None)
-        n = len(calls)
-        return aot.AotPeakBreakdown(
-            compiled_peak=n, cufft_scratch=0, total=n,
-            cufft_measured=True, fft_specs=(object(),))
-
-    monkeypatch.setattr(aot, "aot_kernel_peak_bytes", fake_peak)
-    sharding = NamedSharding(
-        _unit_mesh(), P(None, ('x', 'y'), None, None, None, None))
-
-    def query(kind, norm):
-        return fft_helpers.query_fft_peak_bytes(
-            input_shape=(_NK, _BC, _NS, *_GRID),
-            fft_axes=(-3, -2, -1), sharding=sharding,
-            kind=kind, norm=norm, dtype=jnp.complex128)
-
-    assert [query("fftn", None), query("fftn", "ortho"),
-            query("ifftn", "ortho"), query("ifftn", "ortho")] == [1, 2, 3, 3]
-    assert len(calls) == 3
-
-
-@pytest.mark.parametrize(
-    ("kind", "norm", "match"),
-    (("inverse", "ortho", "kind must be"),
-     ("ifftn", "unitary", "norm must be")),
-)
-def test_query_refuses_unknown_transform_semantics(kind, norm, match):
-    """A misspelled program is an API error, not an analytic demotion."""
-    with pytest.raises(ValueError, match=match):
-        fft_helpers.query_fft_peak_bytes(
-            input_shape=(_NK, _BC, _NS, *_GRID),
-            fft_axes=(-3, -2, -1),
-            sharding=NamedSharding(
-                _unit_mesh(), P(None, ('x', 'y'), None, None, None, None)),
-            kind=kind, norm=norm, dtype=jnp.complex128)
 
 
 # ---------------------------------------------------------------------------

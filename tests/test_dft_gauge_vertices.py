@@ -34,8 +34,6 @@ from psp.vnl_ops import (
     apply_icl_vnl_transfer_jet_to_ket,
     apply_uniform_vnl_derivatives_to_ket,
     build_vnl_kdata_from_kvec,
-    compute_icl_vnl_finite_contact_to_ket,
-    compute_icl_vnl_finite_transfer_to_ket,
 )
 
 
@@ -137,27 +135,6 @@ def _finite_setup(*, third_derivatives=False):
     return replace(
         _setup(curved=False, third_derivatives=third_derivatives),
         uniform_gauge_fingerprint="sha256:" + "5" * 64)
-
-
-def _rectangular_vnl_action(
-    psi, G_source, source_mask, G_target_unwrapped, target_mask, k, setup,
-):
-    """Independent rectangular ``Z_out E Z_in^dag`` value oracle."""
-    Z_source = np.asarray(build_vnl_kdata_from_kvec(
-        np.asarray(k), np.asarray(G_source), setup).Z)
-    Z_target = np.asarray(build_vnl_kdata_from_kvec(
-        np.asarray(k), np.asarray(G_target_unwrapped), setup).Z)
-    source_mask = np.asarray(source_mask)
-    target_mask = np.asarray(target_mask)
-    physical = np.asarray(psi) * source_mask[None, None, :]
-    coefficients = np.einsum(
-        "RG,nsG->Rsn", np.conj(Z_source), physical, optimize=True)
-    coupled = np.einsum(
-        "stRQ,Qtn->Rsn", np.asarray(setup.E_super), coefficients,
-        optimize=True)
-    value = np.einsum(
-        "RG,Rsn->nsG", Z_target, coupled, optimize=True)
-    return value * target_mask[None, None, :]
 
 
 def test_exact_origin_radial_moment_and_contact_action():
@@ -678,96 +655,6 @@ def test_isometric_photon_vertex_jet_matches_the_direct_kminusq_endpoint():
     assert err_small < 0.14 * err_big  # cubic remainder: ideal ratio 1/8
 
 
-def test_exact_icl_finite_transfer_matches_q0_and_landed_q2_jet():
-    setup = _finite_setup(third_derivatives=True)
-    psi = _states()
-    G = np.asarray([[0, 0, 0], [1, 0, 0], [0, -1, 1], [0, 0, 0]])
-    mask = np.asarray([1.0, 1.0, 1.0, 0.0])
-    k = np.asarray([0.19, -0.17, 0.12])
-
-    q0 = compute_icl_vnl_finite_transfer_to_ket(
-        psi, G, G, k, k, np.zeros(3), np.zeros(3, dtype=np.int32),
-        setup, mask, mask, path_order=8,
-        projector_row_chunk=1, g_chunk=2)
-    uniform = apply_uniform_vnl_derivatives_to_ket(
-        psi, G, k, setup, mask, projector_row_chunk=1, g_chunk=2)
-    assert bool(np.asarray(q0.certified))
-    np.testing.assert_allclose(
-        q0.gamma_cart_ket, uniform.gamma_cart_ket,
-        rtol=3.0e-13, atol=3.0e-13)
-
-    # The finite-transfer owner and the long-wave owner meet at the existing
-    # q2 jet.  q is supplied in crystal coordinates; jet derivatives contract
-    # the corresponding Cartesian q exactly once.
-    q_cart = 1.5e-3 * np.asarray([0.31, -0.47, 0.29])
-    q_crys = q_cart @ np.linalg.inv(setup.B)
-    finite = compute_icl_vnl_finite_transfer_to_ket(
-        psi, G, G, k, k - q_crys, q_crys,
-        np.zeros(3, dtype=np.int32), setup, mask, mask,
-        path_order=12, path_rtol=1.0e-11, path_atol=1.0e-13,
-        projector_row_chunk=1, g_chunk=2)
-    jet = apply_icl_vnl_transfer_jet_to_ket(
-        psi, G, k, setup, mask, projector_row_chunk=1, g_chunk=2,
-        include_q2=True)
-    expected = (
-        np.asarray(jet.gamma0_cart_ket)
-        + np.einsum(
-            "b,abnsg->ansg", q_cart,
-            np.asarray(jet.dgamma_dq_cart_ket))
-        + 0.5 * np.einsum(
-            "b,c,abcnsg->ansg", q_cart, q_cart,
-            np.asarray(jet.d2gamma_dq2_cart_ket)))
-    assert bool(np.asarray(finite.certified))
-    np.testing.assert_allclose(
-        finite.gamma_cart_ket, expected, rtol=2.0e-9, atol=2.0e-10)
-
-
-def test_exact_icl_finite_contact_q0_and_two_photon_ward():
-    setup = _finite_setup()
-    psi = _states()
-    G = np.asarray([[0, 0, 0], [1, 0, 0], [0, -1, 1], [0, 0, 0]])
-    mask = np.asarray([1.0, 1.0, 1.0, 0.0])
-    k = np.asarray([0.19, -0.17, 0.12])
-
-    q0 = compute_icl_vnl_finite_contact_to_ket(
-        psi, G, k, np.zeros(3), setup, mask, path_order=8,
-        projector_row_chunk=1, g_chunk=2)
-    uniform = apply_uniform_vnl_derivatives_to_ket(
-        psi, G, k, setup, mask, projector_row_chunk=1, g_chunk=2)
-    assert bool(np.asarray(q0.certified))
-    np.testing.assert_allclose(
-        q0.lambda_cart_ket, uniform.lambda_cart_ket,
-        rtol=3.0e-13, atol=3.0e-13)
-
-    # Contracting the first photon leg removes it from the Wilson path.
-    # The remaining two one-photon vertices fix the sign and unit prefactor:
-    # q_a Lambda_ab(k;q,-q) = Gamma_b(k,-q)-Gamma_b(k-q,-q).
-    q = np.asarray([0.017, -0.011, 0.009])
-    contact = compute_icl_vnl_finite_contact_to_ket(
-        psi, G, k, q, setup, mask, path_order=12,
-        path_rtol=2.0e-10, path_atol=1.0e-12,
-        projector_row_chunk=1, g_chunk=2)
-    gamma_plus = compute_icl_vnl_finite_transfer_to_ket(
-        psi, G, G, k, k + q, -q, np.zeros(3, dtype=np.int32),
-        setup, mask, mask, path_order=12,
-        path_rtol=2.0e-10, path_atol=1.0e-12,
-        projector_row_chunk=1, g_chunk=2)
-    gamma_minus = compute_icl_vnl_finite_transfer_to_ket(
-        psi, G, G, k - q, k, -q, np.zeros(3, dtype=np.int32),
-        setup, mask, mask, path_order=12,
-        path_rtol=2.0e-10, path_atol=1.0e-12,
-        projector_row_chunk=1, g_chunk=2)
-    assert bool(np.asarray(contact.certified))
-    assert bool(np.asarray(gamma_plus.certified))
-    assert bool(np.asarray(gamma_minus.certified))
-    q_cart = q @ setup.B
-    lhs = np.einsum("a,abnsg->bnsg", q_cart, contact.lambda_cart_ket)
-    rhs = gamma_plus.gamma_cart_ket - gamma_minus.gamma_cart_ket
-    np.testing.assert_allclose(lhs, rhs, rtol=4.0e-10, atol=4.0e-11)
-    assert (contact.vnl_path_operator_fingerprint
-            != gamma_plus.vnl_path_operator_fingerprint)
-
-
 def test_uniform_contact_and_paramagnetic_sum_have_fsum_prefactor():
     """Hellmann--Feynman curvature fixes contact/bubble sign and factor 2."""
     setup = _finite_setup()
@@ -796,9 +683,6 @@ def test_uniform_contact_and_paramagnetic_sum_have_fsum_prefactor():
     K = (G + k[None, :]) @ B
     uniform = apply_uniform_vnl_derivatives_to_ket(
         basis, G, k, setup, mask, projector_row_chunk=1, g_chunk=2)
-    q0_contact = compute_icl_vnl_finite_contact_to_ket(
-        basis, G, k, np.zeros(3), setup, mask, path_order=8,
-        projector_row_chunk=1, g_chunk=2)
     kinetic_gamma = np.stack([
         basis * (2.0 * K[:, a])[None, None, :] for a in range(3)
     ])
@@ -807,7 +691,7 @@ def test_uniform_contact_and_paramagnetic_sum_have_fsum_prefactor():
     for a in range(3):
         kinetic_contact[a, a] = 2.0 * basis
     gamma = kinetic_gamma + np.asarray(uniform.gamma_cart_ket)
-    contact = kinetic_contact + np.asarray(q0_contact.lambda_cart_ket)
+    contact = kinetic_contact + np.asarray(uniform.lambda_cart_ket)
 
     direction = np.asarray([0.37, -0.51, 0.28])
     direction /= np.linalg.norm(direction)
@@ -833,120 +717,3 @@ def test_uniform_contact_and_paramagnetic_sum_have_fsum_prefactor():
         + np.linalg.eigvalsh(hamiltonian(k - dk))[0]) / step**2
     np.testing.assert_allclose(
         response_curvature, curvature_fd, rtol=2.0e-5, atol=2.0e-6)
-
-
-def test_exact_icl_finite_contact_centered_q2_coefficient():
-    setup = _finite_setup()
-    psi = _states()
-    G = np.asarray([[0, 0, 0], [1, 0, 0], [0, -1, 1], [0, 0, 0]])
-    mask = np.asarray([1.0, 1.0, 1.0, 0.0])
-    k = np.asarray([0.19, -0.17, 0.12])
-    Binv = np.linalg.inv(setup.B)
-    direction = np.asarray([0.37, -0.51, 0.28])
-    direction /= np.linalg.norm(direction)
-    step = 3.0e-3
-    q_cart = step * direction
-    q = q_cart @ Binv
-
-    common = dict(
-        setup=setup, g_mask=mask, path_order=10,
-        projector_row_chunk=1, g_chunk=2)
-    plus = compute_icl_vnl_finite_contact_to_ket(
-        psi, G, k, q, **common)
-    zero = compute_icl_vnl_finite_contact_to_ket(
-        psi, G, k, np.zeros(3), **common)
-    minus = compute_icl_vnl_finite_contact_to_ket(
-        psi, G, k, -q, **common)
-    np.testing.assert_allclose(
-        plus.lambda_cart_ket, minus.lambda_cart_ket,
-        rtol=3.0e-13, atol=3.0e-13)
-    contact_curvature = (
-        np.asarray(plus.lambda_cart_ket)
-        - 2.0 * np.asarray(zero.lambda_cart_ket)
-        + np.asarray(minus.lambda_cart_ket)) / step**2
-
-    lambda_plus = apply_uniform_vnl_derivatives_to_ket(
-        psi, G, k + q, setup, mask,
-        projector_row_chunk=1, g_chunk=2).lambda_cart_ket
-    lambda_minus = apply_uniform_vnl_derivatives_to_ket(
-        psi, G, k - q, setup, mask,
-        projector_row_chunk=1, g_chunk=2).lambda_cart_ket
-    lambda_curvature = (
-        np.asarray(lambda_plus)
-        - 2.0 * np.asarray(zero.lambda_cart_ket)
-        + np.asarray(lambda_minus)) / step**2
-    # E[(s-t)^2] = 1/6 for two independent unit-interval path points.
-    np.testing.assert_allclose(
-        contact_curvature, lambda_curvature / 6.0,
-        rtol=4.0e-4, atol=2.0e-5)
-
-
-def test_exact_icl_finite_transfer_ward_wrap_and_hermiticity():
-    setup = _finite_setup()
-    G = np.asarray([[0, 0, 0], [1, 0, 0], [0, -1, 1]])
-    mask = np.ones(G.shape[0], dtype=np.float64)
-    k = np.asarray([0.45, -0.11, 0.08])
-    q = np.asarray([-0.22, 0.03, -0.04])
-    wrap = np.asarray([1, 0, 0], dtype=np.int32)
-    k_target = k - q - wrap
-
-    # Use a complete spin/G basis so the returned actions are the rectangular
-    # operator matrices themselves, not a state-dependent Hermiticity probe.
-    dim = 2 * G.shape[0]
-    basis = np.eye(dim, dtype=np.complex128).reshape(dim, 2, G.shape[0])
-    forward = compute_icl_vnl_finite_transfer_to_ket(
-        basis, G, G, k, k_target, q, wrap, setup, mask, mask,
-        path_order=12, path_rtol=2.0e-10, path_atol=1.0e-12,
-        projector_row_chunk=1, g_chunk=2)
-    assert bool(np.asarray(forward.certified))
-
-    q_cart = q @ setup.B
-    lhs = np.einsum("a,ansg->nsg", q_cart, forward.gamma_cart_ket)
-    G_target_unwrapped = G - wrap[None, :]
-    rhs = (
-        _rectangular_vnl_action(
-            basis, G, mask, G_target_unwrapped, mask, k, setup)
-        - _rectangular_vnl_action(
-            basis, G, mask, G_target_unwrapped, mask, k - q, setup))
-    np.testing.assert_allclose(lhs, rhs, rtol=3.0e-10, atol=3.0e-11)
-
-    reverse = compute_icl_vnl_finite_transfer_to_ket(
-        basis, G, G, k_target, k, -q, -wrap, setup, mask, mask,
-        path_order=12, path_rtol=2.0e-10, path_atol=1.0e-12,
-        projector_row_chunk=1, g_chunk=2)
-    assert bool(np.asarray(reverse.certified))
-
-    def operator_matrices(result):
-        values = np.asarray(result.gamma_cart_ket)
-        return np.transpose(values, (0, 2, 3, 1)).reshape(3, dim, dim)
-
-    forward_mtx = operator_matrices(forward)
-    reverse_mtx = operator_matrices(reverse)
-    np.testing.assert_allclose(
-        forward_mtx, np.swapaxes(np.conj(reverse_mtx), -1, -2),
-        rtol=4.0e-10, atol=4.0e-11)
-
-
-def test_exact_icl_finite_transfer_rejects_noncanonical_wrap_and_stamps_rule():
-    setup = _finite_setup()
-    psi = _states()
-    G = np.asarray([[0, 0, 0], [1, 0, 0], [0, -1, 1], [0, 0, 0]])
-    mask = np.asarray([1.0, 1.0, 1.0, 0.0])
-    k = np.asarray([0.19, -0.17, 0.12])
-    q = np.asarray([0.07, 0.02, -0.03])
-    invalid = compute_icl_vnl_finite_transfer_to_ket(
-        psi, G, G, k, k - q, q, np.asarray([1, 0, 0]),
-        setup, mask, mask, path_order=8,
-        projector_row_chunk=1, g_chunk=2)
-    assert not bool(np.asarray(invalid.certified))
-
-    first = vnl_ops.icl_vnl_finite_transfer_operator_fingerprint(
-        setup, path_order=8, path_rtol=1.0e-9, path_atol=1.0e-12)
-    second = vnl_ops.icl_vnl_finite_transfer_operator_fingerprint(
-        setup, path_order=12, path_rtol=1.0e-9, path_atol=1.0e-12)
-    third = vnl_ops.icl_vnl_finite_transfer_operator_fingerprint(
-        setup, path_order=8, path_rtol=2.0e-9, path_atol=1.0e-12)
-    assert first.startswith("sha256:") and len(first) == 71
-    assert len({first, second, third}) == 3
-
-

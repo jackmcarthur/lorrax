@@ -1,39 +1,26 @@
 """Lightweight progress reporting for long-running loops.
 
-Two variants:
-
-  scan_progress  — decorator for jax.lax.scan bodies (io_callback-based)
   LoopProgress   — context manager for Python for-loops (no JAX overhead)
 
-Both emit BGW-style output:
+It emits BGW-style output:
 
     Started frequency integration at 17:50:20.
     [ 17:50:21 | ██████░░░░ |  60% ] tau node  6 / 10 · ETA 2 s
     Finished frequency integration at 17:50:23.  Elapsed: 3 s.
 
-Design choices for low overhead:
-  - Only one scalar int32 crosses the io_callback boundary (scan variant)
-  - Milestone steps precomputed as a static boolean mask
-  - All timestamp/ETA/formatting logic stays on the host
-  - enabled=False skips callback setup entirely (non-rank-0 processes)
+Milestone steps are precomputed as a static boolean mask, and
+``enabled=False`` (non-rank-0 processes) prints nothing.
 """
 
 from __future__ import annotations
 
-import functools
 import time
-from dataclasses import dataclass, field
-from typing import Any, Callable, TypeVar
+from typing import Callable
 
 import jax
-import jax.numpy as jnp
 import numpy as np
-from jax import lax
-from jax.experimental import io_callback
 
 
-CarryT = TypeVar("CarryT")
-ScanBody = Callable  # (carry, x) -> (carry, y)
 PrintFn = Callable[[str], None]
 
 
@@ -170,96 +157,3 @@ class LoopProgress:
             elapsed = int(round(now - self._start))
             self.print_fn(f"Finished {self.title} at {_fmt_time(now)}.  Elapsed: {elapsed} s.")
         self._start = None
-
-
-# ---------------------------------------------------------------------------
-#  jax.lax.scan decorator (io_callback-based)
-# ---------------------------------------------------------------------------
-
-@dataclass
-class _ScanLogState:
-    start_wall_time: float | None = None
-
-
-def scan_progress(
-    num_steps: int,
-    print_fn: PrintFn,
-    *,
-    title: str = "scan",
-    item_name: str = "step",
-    max_updates: int = 10,
-    bar_width: int = 10,
-    enabled: bool | None = None,
-) -> Callable:
-    """Decorator for a jax.lax.scan body that emits progress output.
-
-    The decorated scan must be called with an integer index as the first
-    scanned element::
-
-        @scan_progress(n, print_fn, title="frequency integration")
-        def body(carry, x):
-            ...
-            return carry, y
-
-        idx = jnp.arange(n, dtype=jnp.int32)
-        carry_out, ys = lax.scan(body, init, (idx, xs))
-
-    Only milestone steps trigger an io_callback; the sole device->host
-    payload is the scalar step index (int32).
-    """
-    if num_steps <= 0:
-        raise ValueError("num_steps must be positive.")
-    if enabled is None:
-        enabled = (jax.process_index() == 0)
-
-    emit_mask = jnp.asarray(_milestone_mask(num_steps, max_updates))
-    result_shape = jax.ShapeDtypeStruct((), jnp.int32)
-    state = _ScanLogState()
-
-    def _start_cb(_):
-        now = time.time()
-        state.start_wall_time = now
-        print_fn(f"Started {title} at {_fmt_time(now)}.")
-        return np.int32(0)
-
-    def _progress_cb(step_1based):
-        now = time.time()
-        step = int(step_1based)
-        start = state.start_wall_time or now
-        elapsed = max(0.0, now - start)
-        print_fn(_format_progress(step, num_steps, elapsed, title, item_name, bar_width))
-        if step >= num_steps:
-            print_fn(f"Finished {title} at {_fmt_time(now)}.  Elapsed: {int(round(elapsed))} s.")
-            state.start_wall_time = None
-        return np.int32(0)
-
-    def decorator(body_fn):
-        @functools.wraps(body_fn)
-        def wrapped(carry, xs):
-            if not isinstance(xs, tuple) or len(xs) < 2:
-                raise TypeError(
-                    "Decorated scan body expects xs = (idx, x) or (idx, x1, x2, ...) "
-                    "where idx = jnp.arange(num_steps, dtype=jnp.int32).")
-            idx0 = xs[0]
-            body_xs = xs[1] if len(xs) == 2 else xs[1:]
-            step = jnp.asarray(idx0, dtype=jnp.int32) + jnp.int32(1)
-
-            if enabled:
-                _ = lax.cond(
-                    step == 1,
-                    lambda _: io_callback(_start_cb, result_shape, np.int32(0), ordered=True),
-                    lambda _: jnp.int32(0),
-                    operand=None)
-
-            carry, y = body_fn(carry, body_xs)
-
-            if enabled:
-                _ = lax.cond(
-                    emit_mask[step],
-                    lambda _: io_callback(_progress_cb, result_shape, step, ordered=True),
-                    lambda _: jnp.int32(0),
-                    operand=None)
-
-            return carry, y
-        return wrapped
-    return decorator
