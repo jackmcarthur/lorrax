@@ -461,6 +461,13 @@ class SCMapScreeningArtifacts:
     static_w: object | None
     iteration_head: object | None
     static_head_terms: object | None
+    #: This map's shared-pole model handle (``W_by_role["shared_pole"]``);
+    #: the accepted final map's is evaluated at omega = 0 for ``W0_qmunu``.
+    shared_pole: object | None = None
+    #: ``(v + [DeltaH, W], U, E_QP, nb_logical)`` of this map's
+    #: interband-commutator head, the operands of ``dipole_qsgw.h5``
+    #: (``qsgw_head.write_qsgw_dipole``); ``None`` on every other head.
+    qsgw_velocity: tuple | None = None
 
 
 @dataclass(frozen=True)
@@ -3544,6 +3551,7 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
     iteration_head_response = None
     iteration_static_head_terms = inputs.static_head_terms
     head_occ_kn = None
+    qsgw_velocity = None
     pt = getattr(inputs, "parallel_transport", None)
     # The shared-pole route also carries the direct-only head
     # (no_local_fields) through this frozen DFT response, with the wings
@@ -3589,6 +3597,8 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
         if isinstance(pt, InterbandCommutatorHeadData):
             head_velocity_dft = _interband_commutator_head_velocity(
                 inputs, state, ks, wfns_qp, U_full, pt, nb_storage)
+            qsgw_velocity = (head_velocity_dft, U_full,
+                             wfns_qp.enk[:, :nb_storage], int(pt.nb_logical))
 
         head_occ_kn = wfns_qp.occ[:, :nb_storage]
         head_efermi_ry = float(efermi_ry)
@@ -4076,6 +4086,8 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
                 static_w=W_by_role.get("static"),
                 iteration_head=iteration_head,
                 static_head_terms=iteration_static_head_terms,
+                shared_pole=W_by_role.get("shared_pole"),
+                qsgw_velocity=qsgw_velocity,
             ),
             exact_hartree_dft=exact_hartree_dft,
         ),
@@ -6593,37 +6605,61 @@ def run_sc_driver(
     # one writes the static W body together with the head samples produced by
     # the exact same accepted map.  ``persist_w0_and_head`` consumes the
     # matching fixed-name pre-unfold capture when IBZ storage is selected.
+    # The shared-pole route has no static W body: its W0 is the accepted
+    # final map's model evaluated at omega = 0 (``restart_static_w``), read
+    # from that map's retained scratch generation.
     from .restart_q_storage import take_pre_unfold
-    from .screening import driver_persists_w0
+    from .screening import driver_persists_w0, restart_static_w
+    mpa = config.compute_mode is ComputeMode.MPA
     try:
         if config.compute_mode.needs_screening and driver_persists_w0(
-                config.compute_mode, config, self_consistent=True):
-            if screening.static_w is None:
+                config.compute_mode, config):
+            final_w = screening.shared_pole if mpa else screening.static_w
+            if final_w is None:
                 raise RuntimeError(
                     "GATE persist_sc_requires_final_static_w: "
-                    "screening.static_w got: None; want: the accepted "
-                    "final-map static W body; why: restart persistence must "
-                    "not write head samples without their matching W.")
+                    f"screening.{'shared_pole' if mpa else 'static_w'} got: "
+                    "None; want: the accepted final-map static W body (its "
+                    "shared-pole model on compute_mode = mpa); why: restart "
+                    "persistence must not write head samples without their "
+                    "matching W.")
+            W_static = restart_static_w(
+                config.compute_mode,
+                dict(static=screening.static_w, shared_pole=screening.shared_pole,
+                     iteration_head=screening.iteration_head),
+                V_q, config=config, meta=meta, mesh_xy=mesh_xy,
+                material_class=material_class, print_fn=print_fn)
             from .gw_output import persist_w0_and_head
             with timing.section("gw_jax.persist_w0"):
-                persist_w0_and_head(
-                    screening.static_w,
-                    tensors_filename=tensors_filename,
-                    head_resolver=head_resolver,
-                    iteration_head=screening.iteration_head,
-                    config=config, meta=meta, mesh_xy=mesh_xy,
-                    sym=sym, centroid_indices=centroid_indices,
-                    print_fn=print_fn,
-                )
+                if W_static is not None:
+                    persist_w0_and_head(
+                        W_static,
+                        tensors_filename=tensors_filename,
+                        head_resolver=head_resolver,
+                        iteration_head=screening.iteration_head,
+                        config=config, meta=meta, mesh_xy=mesh_xy,
+                        sym=sym, centroid_indices=centroid_indices,
+                        static_head_only=mpa,
+                        print_fn=print_fn,
+                    )
     finally:
         # The writer consumes this on an IBZ restart write.  On disabled,
         # absent-file, or non-persisting paths the producer capture still
         # owns the large pre-unfold W wedge, so the final-map owner must tear
         # it down explicitly before post-SC artifacts are built.
         take_pre_unfold("W0_qmunu")
+    if screening.qsgw_velocity is not None:
+        from .qsgw_head import QSGW_DIPOLE_FILE, write_qsgw_dipole
+        v_qsgw, U_qsgw, e_qsgw, nb_qsgw = screening.qsgw_velocity
+        with timing.section("sc.write_qsgw_dipole"):
+            write_qsgw_dipole(
+                os.path.join(input_dir, QSGW_DIPOLE_FILE), v_qsgw, U_qsgw,
+                e_qsgw, nb_logical=nb_qsgw, mesh=mesh_xy, print_fn=print_fn)
+        del v_qsgw, U_qsgw, e_qsgw
     # W0 is the only large object in the final-map payload.  Drop it before
     # WFN/sigma artifact construction; the tiny head/term provenance remains.
-    screening = dataclasses.replace(screening, static_w=None)
+    screening = dataclasses.replace(
+        screening, static_w=None, shared_pole=None, qsgw_velocity=None)
     state_final = dataclasses.replace(
         state_final,
         outputs=dataclasses.replace(

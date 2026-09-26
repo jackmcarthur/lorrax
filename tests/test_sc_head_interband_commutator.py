@@ -342,3 +342,51 @@ def test_the_loader_refuses_a_velocity_without_the_nonlocal_commutator(
             match="GATE sc_head_interband_commutator_velocity_operator"):
         qsgw_head.load_interband_commutator_head(
             "pt.h5", mesh=None, wfn=None, meta=None, config=None)
+
+
+def test_the_qsgw_dipole_file_is_the_rotated_head_velocity(tmp_path):
+    # dipole_qsgw.h5 = U^H (v + [DeltaH, W]) U with band_energies = E_QP,
+    # read back by the one dipole.h5 loader.  With U = 1 and a band-diagonal
+    # DeltaH its r-form d = v_cv/(E_c - E_v) is the DFT position operator:
+    # the QSGW velocity renormalization and the QP gap cancel exactly.
+    pytest.importorskip("h5py")
+    from file_io.restart_bundle import load_dipole_h5
+    from jax.sharding import NamedSharding, PartitionSpec as P
+
+    rng = np.random.default_rng(11)
+    nk, nb, n_occ = 2, 6, 2
+    mesh = _mesh()
+    e = np.sort(rng.uniform(-1.0, 1.0, size=(nk, nb)), axis=1)
+    shift = rng.normal(size=(nk, nb)) * 0.1
+    v = _hermitian(rng, 3, nk, nb, nb)
+    delta = np.zeros((nk, nb, nb), dtype=np.complex128)
+    delta[:, np.arange(nb), np.arange(nb)] = shift
+    face = NamedSharding(mesh, P(None, None, "x", "y"))
+    v_qsgw, _ = interband_commutator_velocity(
+        jax.device_put(jnp.asarray(v), face), jnp.asarray(delta),
+        jnp.asarray(shift), jnp.asarray(e), nb_logical=nb, n_occ=n_occ,
+        mesh=mesh)
+    eye = np.broadcast_to(np.eye(nb, dtype=np.complex128), (nk, nb, nb))
+    path = tmp_path / qsgw_head.QSGW_DIPOLE_FILE
+    qsgw_head.write_qsgw_dipole(path, v_qsgw, jnp.asarray(eye), e + shift,
+                                nb_logical=nb, mesh=mesh, print_fn=lambda *_: None)
+    got, dE, attrs = load_dipole_h5(path)
+    assert attrs["nbands"] == nb and attrs["nk"] == nk
+    np.testing.assert_allclose(dE, (e + shift)[:, :, None] - (e + shift)[:, None, :])
+    cv = np.ix_(range(3), range(nk), range(n_occ, nb), range(n_occ))
+    de_dft = (e[:, :, None] - e[:, None, :])[None]
+    np.testing.assert_allclose((got / np.where(dE == 0, 1, dE)[None])[cv],
+                               (v / np.where(de_dft == 0, 1, de_dft))[cv],
+                               rtol=1e-12, atol=1e-12)
+
+    # A general active rotation: the file holds U^H v U on the active block.
+    q, _ = np.linalg.qr(rng.normal(size=(nk, 4, 4))
+                        + 1j * rng.normal(size=(nk, 4, 4)))
+    qsgw_head.write_qsgw_dipole(path, jax.device_put(jnp.asarray(v), face),
+                                jnp.asarray(q), e, nb_logical=nb, mesh=mesh,
+                                print_fn=lambda *_: None)
+    got, _, _ = load_dipole_h5(path)
+    U = np.array(eye)
+    U[:, :4, :4] = q
+    want = np.einsum("kmp,akmn,knq->akpq", U.conj(), v, U)
+    np.testing.assert_allclose(got, want, rtol=1e-12, atol=1e-12)

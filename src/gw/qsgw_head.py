@@ -1182,6 +1182,55 @@ def interband_commutator_velocity(
       jnp.asarray(mix_z, dtype=jnp.complex128), z_pos)
 
 
+#: The QSGW velocity file the SC driver writes beside ``dipole.h5``.
+QSGW_DIPOLE_FILE = "dipole_qsgw.h5"
+
+
+def write_qsgw_dipole(path, velocity_dft_cart, U_active, energies_qp_kn_ry, *,
+                      nb_logical: int, mesh: Mesh, print_fn=print) -> None:
+    r"""Write one SC map's QSGW velocity as a ``dipole.h5`` in its QP basis.
+
+    ``velocity_dft_cart`` is :func:`interband_commutator_velocity`'s
+    ``v + [DeltaH, W]`` (DFT basis), ``U_active`` the map's rotation to its
+    input QP states and ``energies_qp_kn_ry`` their energies: the same three
+    operands the map's head consumed (:func:`build_iteration_head_response`).
+    The file holds ``U^dagger (v + [DeltaH, W]) U`` with ``band_energies =
+    E_QP`` in ``file_io.dipole``'s layout, so ``load_dipole_h5`` and every
+    absorption consumer read it unchanged; their ``d = v_cv/(E_c - E_v)`` is
+    then the position operator between QP states (``U^dagger r U``).
+
+    Term content (docs/self_consistency.md, 'Interband-commutator head'):
+    the full DFT velocity ``i[H_DFT, r]`` (``p + i[V_NL, r]``) plus the
+    QSGW correction ``i[DeltaH, r]`` with ``r`` replaced by its cross-gap
+    (valence-conduction) interband part, ``W = i r^VC``.  The intraband
+    connection term (the covariant k-derivative of ``DeltaH`` within an
+    occupation class) is omitted; on the valence-conduction block it holds
+    only ``DeltaH_VC``, so the error is first order in the cross-gap mixing.
+    Collapsed axes use the stored position operator exactly. COLLECTIVE.
+    """
+    from common.collectives import gather_to_host
+    from file_io.dipole import write_dipole
+
+    v_qp = rotate_velocity_active_to_qp(velocity_dft_cart, U_active, mesh=mesh)
+    nb = int(nb_logical)
+    energies = energies_qp_kn_ry
+    energies = np.asarray(gather_to_host(energies) if isinstance(
+        energies, jax.Array) else energies, dtype=np.float64)[:, :nb]
+    kmajor = jax.jit(lambda v: jnp.moveaxis(v, 0, 1), out_shardings=NamedSharding(
+        mesh, P(None, None, "x", "y")))(v_qp)
+    del v_qp
+    write_dipole(path, kmajor, energies, mesh=mesh, attrs={
+        "nbands": nb, "nk": int(energies.shape[0]), "skip_vnl": 0,
+        "basis": "qp",
+        "note": ("QSGW velocity U^H (v + [DeltaH, W]) U between the SC "
+                 "final map's input QP states (gw.qsgw_head."
+                 "interband_commutator_velocity); band_energies are their "
+                 "QP energies; the intraband connection term is omitted")})
+    print_fn(f"  QSGW dipoles: {os.path.basename(str(path))} "
+             f"({int(energies.shape[0])} k x {nb} bands, QP basis, "
+             "v + [DeltaH, W])")
+
+
 def _assemble_kernel(mesh: Mesh, nb_storage: int) -> Callable:
     key = ("assemble_head_manifold", id(mesh), int(nb_storage))
     hit = _KERNEL_CACHE.get(key)

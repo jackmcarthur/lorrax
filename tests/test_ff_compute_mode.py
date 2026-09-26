@@ -219,8 +219,8 @@ def test_the_driver_imports_whatever_it_dispatches_the_w0_persist_on():
     for mode in (ComputeMode.COHSEX, ComputeMode.GN_PPM, ComputeMode.HL_PPM):
         assert driver_persists_w0(mode, _RPA_CONFIG) is True
 
-    # The shared-pole one-shot persists V + Wc(0) (W0PERSIST); a
-    # self-consistent map, a bispinor store and a ladder W do not.
+    # The shared-pole route persists V + Wc(0), one-shot (W0PERSIST) and at
+    # the SC final map alike; a bispinor store and a ladder W do not.
     class _SharedPole(_RpaConfig):
         bispinor = False
 
@@ -235,8 +235,6 @@ def test_the_driver_imports_whatever_it_dispatches_the_w0_persist_on():
             diagrams = ScreeningDiagrams.W_BSE
 
     assert driver_persists_w0(ComputeMode.MPA, _SharedPole()) is True
-    assert driver_persists_w0(
-        ComputeMode.MPA, _SharedPole(), self_consistent=True) is False
     assert driver_persists_w0(ComputeMode.MPA, _Bispinor()) is False
     assert driver_persists_w0(ComputeMode.MPA, _Ladder()) is False
 
