@@ -58,9 +58,6 @@ def row_shard_spec(mesh_axis="x"):
     axis and the argument exists so a caller on a differently-named
     mesh does not have to hand-build the tuple and get the position
     wrong.
-
-    ``mpa_store.read_w_columns(out_spec=...)`` checks any spec it is
-    given against this shape and refuses a 2-D one by name.
     """
     return (None, mesh_axis, None)
 

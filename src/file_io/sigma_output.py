@@ -123,7 +123,7 @@ SIGMA_K_AXIS = {
 #: relative to what, so every post-hoc consumer guessed, and the one that
 #: guessed insulating midgap mis-sampled Σ_c(ω) by a measured 2.79 eV on
 #: the sodium metal deck (audit A2).  One name, defined once, used by the
-#: writer and by :func:`read_omega_reference`.
+#: writer and by every post-hoc reader.
 OMEGA_DATASET = "omega_ev"
 OMEGA_REFERENCE_ATTR = "omega_reference_ev"
 OMEGA_REFERENCE_PROVENANCE_ATTR = "omega_reference_provenance"

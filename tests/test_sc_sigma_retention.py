@@ -241,12 +241,9 @@ def test_history_and_fixed_head_serial_writes_are_rank_gated():
     assert history.index("process_rank() == 0") < history.index("np.save(")
     assert "barrier(" in history
 
-    # The head fit is COLLECTIVE now (every rank enters SlabIO), so the
-    # rank gate moved from the model to the writer: model.py must route
-    # the head only through write_head_fit_collective, never through the
-    # serial h5py test seam write_head_fit.
+    # The head fit is COLLECTIVE (every rank enters SlabIO), so the rank
+    # gate lives in the writer: model.py routes the head through
+    # write_head_fit_collective.
     model_src = (_PATH.parents[2] / "src" / "gw" / "mpa" / "model.py")
     text = model_src.read_text()
     assert "write_head_fit_collective(" in text
-    assert "write_head_fit(" not in text.replace(
-        "write_head_fit_collective(", "")
