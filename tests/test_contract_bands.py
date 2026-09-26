@@ -555,16 +555,9 @@ def test_ffi_gemm_plan():
 
 
 # ---------------------------------------------------------------------------
-# Face layout — the low_mem_bands two-face GEMM-seam merge helpers and the
-# contract_bands_block_reshard(layout='face') refusal ladder.  The two-GEMM
-# numeric plan itself needs distrib_la.gemm_plan, which is cuBLASMp-only
-# (CUDA-only today) — its algebra parity is certified on the real 4-rank
-# CUDA gate, tests/multi_device/low_mem_bands_g_projection_hartree_gate.py.
-# What CAN be certified on an emulated CPU mesh, and is here: the (s,mu)
-# merge/split reshape itself is correct AND free of any collective (the
-# measured correction to the audit report's own "flatten (s,mu)" claim —
-# see contract_bands.merge_spin_centroid's docstring), and every new
-# layout='face' keyword refuses cleanly before ever reaching gemm_plan.
+# Face layout — the (s,mu) GEMM-seam merge helpers, the face projector
+# (pure JAX collectives, so its numerics and collective contract are
+# certified here on the emulated mesh) and its refusal ladder.
 # ---------------------------------------------------------------------------
 
 def test_merge_split_spin_centroid_roundtrip_and_no_collective():
@@ -689,6 +682,143 @@ def test_face_projector_rejects_bad_channels():
     with pytest.raises(ValueError, match="channels"):
         contract_bands_block_reshard(
             mesh, layout="face", face_shape=face_shape, channels="bogus")
+
+
+def _face_operands(mesh, *, ns, mu_l=MU + 2, mu_r=MU + 4, nb=MN, seed=23):
+    """Rectangular face operands; ``mu_l/p`` odd so the slab pads."""
+    rng = np.random.default_rng(seed)
+    psi_l = _crand(rng, NK, nb, ns, mu_l)
+    o = _crand(rng, NK, ns, mu_l, ns, mu_r)
+    psi_r = _crand(rng, NK, ns, mu_r, nb)
+    put = lambda a, spec: jax.device_put(jnp.asarray(a),     # noqa: E731
+                                         NamedSharding(mesh, spec))
+    dev = (put(psi_l, P(None, "x", None, "y")),
+           put(o, P(None, None, "x", None, "y")),
+           put(psi_r, P(None, None, "x", "y")))
+    return dev, (psi_l, o, psi_r)
+
+
+def _face_ref(psi_l, o, psi_r):
+    return np.einsum("kasm,ksmtn,ktnb->kab", np.conj(psi_l), o, psi_r)
+
+
+@pytest.mark.parametrize("chunked", [False, True])
+@pytest.mark.parametrize("ns", [1, 2, 4])     # scalar, Pauli, bispinor
+def test_face_projector_matches_reference(ns, chunked, monkeypatch):
+    """``layout='face'``: the stationary-operator stream against numpy, 1e-14.
+
+    Rectangular endpoints, a padded slab (``μ_l/p`` odd), both channel plans,
+    and the band stream at one chunk and at one column per chunk (the
+    prefetching scan).  The output lands at ``P(None,'x','y')``.  Red twin:
+    the transposed block misses the reference by O(1).
+    """
+    import common.contract_bands as cb
+    width = 1 if chunked else MN // PX
+    monkeypatch.setattr(cb, "face_projection_chunk", lambda **_: width)
+    mesh = _mesh()
+    dev, host = _face_operands(mesh, ns=ns)
+    face, right = (NK, MN, MU + 2, ns), (NK, MN, MU + 4, ns)
+    proj = contract_bands_block_reshard(
+        mesh, layout="face", face_shape=face, right_face_shape=right)
+    out = proj(*dev)
+    assert out.sharding.is_equivalent_to(
+        NamedSharding(mesh, P(None, "x", "y")), 3)
+    ref = _face_ref(*host)
+    got = np.asarray(out)
+    scale = np.abs(ref).max()
+    assert np.abs(got - ref).max() <= TOL * 10 * scale
+    assert np.abs(np.swapaxes(got, -1, -2) - ref).max() > 1e-3 * scale
+
+    split = contract_bands_block_reshard(
+        mesh, layout="face", face_shape=face, right_face_shape=right,
+        channels="split_reim")
+    S_R, S_I = (np.asarray(x) for x in split(*dev))
+    psi_l, o, psi_r = host
+    for got_c, o_c in ((S_R, o.real), (S_I, o.imag)):
+        ref_c = _face_ref(psi_l, o_c, psi_r)
+        assert np.abs(got_c - ref_c).max() <= TOL * 10 * np.abs(ref_c).max()
+
+
+@pytest.mark.parametrize("layout", ["face", "axis"])
+@pytest.mark.parametrize("ns,d", [(2, 1), (4, 1), (4, 2)])
+def test_spin_blocks_accumulate_into_one_reduction(layout, ns, d):
+    """An operator projected in ``d×d`` spin blocks (the Σ τ spin-block
+    passes): ``prepare`` once, ``accumulate`` every block into the local
+    partial, ``finish`` once — the whole-spin reference to 1e-14, and ONE
+    band-block reduce-scatter (over the whole mesh) however many blocks."""
+    mesh = _mesh()
+    face = (NK, MN, MU, ns)
+    if layout == "face":
+        dev, host = _face_operands(mesh, ns=ns, mu_l=MU, mu_r=MU)
+    else:
+        dev, host, _ = _axis_operands(mesh, mu_l=MU, mu_r=MU, ns=ns)
+    proj = contract_bands_block_reshard(
+        mesh, layout=layout, face_shape=face, spin_block=d)
+    o_spec = NamedSharding(mesh, P(None, None, "x", None, "y"))
+    blocks = [(a0, b0) for a0 in range(0, ns, d) for b0 in range(0, ns, d)]
+
+    @jax.jit
+    def blocked(left, o, right):
+        faces = proj.prepare(left, right)
+        acc = None
+        for a0, b0 in blocks:
+            blk = jax.lax.with_sharding_constraint(
+                o[:, a0:a0 + d, :, b0:b0 + d], o_spec)
+            acc = proj.accumulate(faces, blk, a0=a0, b0=b0, acc=acc)
+        return proj.finish(acc)
+
+    ref = _face_ref(*host)
+    got = np.asarray(blocked(*dev))
+    assert np.abs(got - ref).max() <= TOL * 10 * np.abs(ref).max()
+    hlo = blocked.lower(*dev).compile().as_text()
+    whole = re.findall(r"reduce-scatter(?:-start)?\([^\n]*replica_groups="
+                       r"(?:\{\{0,1,2,3\}\}|\[1,4\])", hlo)
+    assert len(whole) == 1, hlo
+    with pytest.raises(ValueError, match="spin blocks"):
+        proj(*dev)
+
+
+def test_face_projector_never_moves_the_operator(monkeypatch):
+    """The collective contract: two transpose permutes and the slab
+    all-to-all of 1/P ψ tiles, one ψ_r chunk all-gather, the T scatter and
+    the band-block scatter — and no collective whose payload is the
+    operator's local tile (a SUMMA/cuBLASMp-style panel broadcast would
+    move it every call).  One chunk, so each collective appears once."""
+    import common.contract_bands as cb
+    monkeypatch.setattr(cb, "face_projection_chunk", lambda **_: MN // PX)
+    mesh = _mesh()
+    dev, _ = _face_operands(mesh, ns=2, mu_l=MU, mu_r=MU)
+    proj = contract_bands_block_reshard(
+        mesh, layout="face", face_shape=(NK, MN, MU, 2))
+    hlo = jax.jit(proj).lower(*dev).compile().as_text()
+    count = lambda op: len(re.findall(                      # noqa: E731
+        rf"\b{op}(-start)?\(", hlo))
+    assert count("collective-permute") == 2, hlo
+    assert count("all-to-all") == 1, hlo
+    assert count("all-gather") == 1, hlo
+    assert count("reduce-scatter") == 2, hlo
+    o_tile = NK * 2 * (MU // PX) * 2 * (MU // PY)
+    payloads = [int(np.prod([int(d) for d in dims.split(",") if d]))
+                for dims, _ in re.findall(
+                    r"=\s+\w+\[([\d,]*)\]\S*\s+(all-gather|all-to-all|"
+                    r"collective-permute|reduce-scatter)(?:-start)?\(", hlo)]
+    assert payloads and max(payloads) < o_tile, (payloads, o_tile)
+
+
+def test_face_projection_chunk_is_one_chunk_until_the_operator_tile():
+    """The stream's chunk rule: one chunk while its transients fit one local
+    operator tile, then chunks that keep them under it as P grows."""
+    from common.contract_bands import face_projection_chunk
+    # μ3088 bispinor at d = 4, (s, μ) folded: the Σ τ projection shape.
+    kw = dict(nk=7, nb=496, ns=1, mu_left=12352, mu_right=12352)
+    for p in (2, 4, 8):
+        assert face_projection_chunk(p=p, **kw) == 496 // p
+    p = 32
+    w = face_projection_chunk(p=p, **kw)
+    assert w < 496 // p
+    need = 16 * 7 * p * w * (2 * 12352 // p + 12352 // p
+                             + -(-(12352 // p) // p) + 496)
+    assert need <= 16 * 7 * (12352 // p) ** 2
 
 
 def _axis_operands(mesh, mu_l=MU, mu_r=MU + 4, nb=MN, seed=11, ns=NS):
