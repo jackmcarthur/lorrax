@@ -27,7 +27,7 @@ from common.scientific_output import (
 )
 from common.units import RYD_TO_EV
 from . import quadrature_log
-from .gw_config import qp_solver_semantics
+from .gw_config import qp_solver_semantics, sigma_requested_edges_ev
 
 
 _WARNING_WORDS = (
@@ -502,8 +502,11 @@ class GWProductionReport:
         if not config.compute_mode.is_dynamic:
             return
         b = band_slices
-        grid_lo = float(config.sigma.omega_min_ev)
-        grid_hi = float(config.sigma.omega_max_ev)
+        # The sampled grid the result was built on (grown past the requested
+        # edges, or derived from the bands when they are unset).
+        _grid = getattr(sigma_result, "omega_grid_ev", None)
+        grid_lo, grid_hi = ((float(_grid[0]), float(_grid[-1])) if _grid is not None
+                            else sigma_requested_edges_ev(config.sigma))
         ef_ev = float(sigma_result.efermi_dft_ev)
         provenance = (getattr(sigma_result, "omega_reference_provenance", None)
                       or config.sigma.fermi_reference)

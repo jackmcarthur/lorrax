@@ -490,3 +490,26 @@ if __name__=='__main__':
         rank0_transaction(root,stage='test.receipt',write=lambda:(root/'receipt.json').write_text(json.dumps({'collected':len(cells)+1,'passed':len(receipts),'tests':receipts},indent=2)))
         return 0
     run_main_and_finalize(main)
+
+
+def test_an_sc_run_holds_one_k_extent_per_model():
+    """Map 1 sets the model's extent to its Kmax plus 3% headroom, later maps
+    keep it while the live Kmax fits and grow it (with headroom, noted) when
+    it does not; CT_C and CT_T share one extent; no binding is exact."""
+    from types import SimpleNamespace
+    from file_io.shared_pole_store import _K_HEADROOM, _k_extent
+    assert _K_HEADROOM == 0.03
+    assert _k_extent(SimpleNamespace(), {"sector": None}, 746, record=True) == 746
+    held = {}
+    meta = SimpleNamespace(shared_pole_k_capacity=held)
+    assert _k_extent(meta, {"sector": None}, 736, record=False) == 736    # map-1 staging
+    assert _k_extent(meta, {"sector": None}, 736, record=True) == 759     # map 1: 736 * 1.03
+    assert _k_extent(meta, {"sector": None}, 734, record=False) == 759    # later staging
+    assert _k_extent(meta, {"sector": None}, 758, record=True) == 759     # drift inside
+    assert "_events" not in held
+    assert _k_extent(meta, {"sector": None}, 760, record=True) == 783     # a real growth
+    assert held.pop("_events") == [
+        "shared-pole K extent (None): live Kmax 760 exceeds the held 759; grown to 783"]
+    assert _k_extent(meta, {"sector": "CT_C"}, 50, record=True) == 52
+    assert _k_extent(meta, {"sector": "CT_T"}, 48, record=True) == 52
+    assert held == {"None": 783, "CT": 52}

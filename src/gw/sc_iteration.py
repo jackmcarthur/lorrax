@@ -69,7 +69,7 @@ from .band_partition import (
     BandPartition, apply_band_partition, build_omega_band_partition)
 from .efermi import (OCCUPATION_CLAMP_TOL_DEFAULT
                      as _OCCUPATION_CLAMP_TOL_DEFAULT, OccupationState)
-from .gw_config import ComputeMode, HeadCorrection
+from .gw_config import ComputeMode, HeadCorrection, sigma_classification_window_ev
 from .scissor import (ScissorFit, apply_conduction_scissor_to_tail,
                       classify_scissor_bands, fit_scissor)
 from .sigma_dispatch import (
@@ -2442,8 +2442,18 @@ def rebuild_hartree_dft_basis(inputs, U_qp, occupations_full,
     include_current = bool(representation.current_bispinor)
     charge_ns = (int(psi_G.shape[2]) if representation.charge_bispinor
                  else int(inputs.wfn.nspinor))
+    # One density-scan shape per SC run: the rotated band count only grows
+    # (a metal's occupied count drifts map to map; Fe 4^3 map 2 recompiled).
+    from .qsgw_density import density_active_band_count
+    session = getattr(inputs, "fixed_quadrature_session", None)
+    rotated_floor = 0
+    if session is not None:
+        rotated_floor = session["density_active_bands"] = max(
+            int(session.get("density_active_bands", 0)),
+            density_active_band_count(np.asarray(occ), np.asarray(kweights), f_spin))
     fields = rho_from_wfns(
         psi_G, occ, kweights, U=U_density, mesh=inputs.mesh_xy,
+        min_active_bands=rotated_floor,
         box_index=bidx, fft_grid=grid,
         cell_volume=float(inputs.wfn.cell_volume),
         spin_degeneracy=f_spin,
@@ -2813,18 +2823,33 @@ from .efermi import sigma_frame_mu_ev  # noqa: E402  (shared with the one-shot)
 
 
 def _sc_sampled_support(inputs, partition, energies_loop, mu_ev, active_n=None):
-    """This map's sampled Sigma(omega) support: ``(sampled, grown, E - mu,
-    required)``, or None for a static Sigma (no grid, no fallback).  Pure;
-    the caller logs the growth and writes the session once."""
+    """This map's sampled Sigma(omega) support under the SC window plan:
+    ``(sampled, grown, E - mu, required, event)``, or None for a static Sigma
+    (no grid, no fallback).  Pure; the caller logs it and writes the session.
+
+    The plan (owner 2026-09-25, ``scissor.SC_WINDOW_PAD_EV``):
+
+    * ``plan`` (map 0): the one-shot grid, grown by the one-shot rule, so SC
+      map 0 is the one-shot calculation;
+    * ``re-plan`` (map 1, once): the requested grid grown to cover every
+      required state +/- the later pad (1 eV); it may shrink;
+    * ``hold`` (later maps): unchanged while every required state's read
+      support [E - dE, E + dE] (``scissor.sc_read_halfwidth_ev``) lies inside;
+    * ``extend``: otherwise only the crossed edge grows, to E +/- 1 eV.
+
+    ``one-shot``: a single-map run (no quadrature session) grows by the
+    one-shot rule.
+    """
     if not inputs.config.compute_mode.is_dynamic:
         return None
-    from .scissor import grow_sigma_support_ev
+    from .scissor import SC_WINDOW_PAD_EV, grow_sigma_support_ev, sc_read_halfwidth_ev
+    grid_pad = SC_WINDOW_PAD_EV[-1]
 
     session = inputs.fixed_quadrature_session
-    sampled_grid = np.asarray(
-        session.get("omega_grid_ev", inputs.config.omega_grid_ev)
-        if session is not None else inputs.config.omega_grid_ev,
-        dtype=np.float64)
+    requested = np.asarray(inputs.config.omega_grid_ev, dtype=np.float64)
+    plan = None if session is None else session.get("window_plan")
+    sampled_grid = (requested if plan is None else
+                    np.asarray(session["omega_grid_ev"], dtype=np.float64))
     support_partition = _partition_on_loop(partition, inputs)
     required_kn = np.broadcast_to(np.asarray(
         support_partition.protected_mask | support_partition.in_range_mask,
@@ -2835,10 +2860,82 @@ def _sc_sampled_support(inputs, partition, energies_loop, mu_ev, active_n=None):
     # on the fixed DFT ladder), never over frozen core; the mask is by
     # identity and fixed, so no state switches between Sigma(E) and Sigma(0).
     # The one-shot applies the same rule, so SC map 0 is the one-shot.
-    expanded_grid, required_kn = grow_sigma_support_ev(
-        inputs.config.sigma, inputs.config.sc.frozen_core_bands, sampled_grid,
-        energy_relative_ev, required_kn, active_n)
-    return sampled_grid, expanded_grid, energy_relative_ev, required_kn
+    grow = _functools.partial(grow_sigma_support_ev, inputs.config.sigma,
+                   inputs.config.sc.frozen_core_bands)
+    if plan is None:
+        event = "one-shot" if session is None else "plan"
+        expanded_grid, required_kn = grow(
+            requested, energy_relative_ev, required_kn, active_n)
+    elif int(plan["index"]) == 0:
+        event = "re-plan"
+        pad = grid_pad
+        expanded_grid, required_kn = grow(
+            requested, energy_relative_ev, required_kn, active_n,
+            pad_ev=pad, trigger_ev=pad)
+    else:
+        expanded_grid, required_kn = grow(
+            sampled_grid, energy_relative_ev, required_kn, active_n,
+            pad_ev=grid_pad, trigger_ev=sc_read_halfwidth_ev())
+        event = "hold" if expanded_grid.size == sampled_grid.size else "extend"
+    return sampled_grid, expanded_grid, energy_relative_ev, required_kn, event
+
+
+def _record_sc_window_plan(inputs, iteration, event, sampled_grid, grown_grid,
+                           energy_relative_ev, required_kn):
+    """One log record per map for the SC window plan (``_sc_sampled_support``).
+
+    ``plan``/``one-shot``: one line per required state outside the requested
+    grid (the one-shot growth).  ``re-plan``: the grid change and the states
+    that set its edges.  ``hold``: the tightest read support.  ``extend``: one
+    line per state whose read support crossed an edge, with the new edge.
+    """
+    from .scissor import (SC_WINDOW_PAD_EV, sc_read_halfwidth_ev,
+                          sc_state_pad_ev)
+
+    e = np.asarray(energy_relative_ev, dtype=np.float64)
+    req = np.asarray(required_kn, dtype=bool)
+    b0 = int(inputs.band_slices.b0)
+
+    def state(k, n):
+        return f"band={b0 + int(n) + 1}, k={int(k)}, E-mu={float(e[k, n]):+.6f} eV"
+
+    grids = (f"[{sampled_grid[0]:+.6f}, {sampled_grid[-1]:+.6f}] -> "
+             f"[{grown_grid[0]:+.6f}, {grown_grid[-1]:+.6f}] eV")
+    if event in ("plan", "one-shot"):
+        outside = req & ((e < sampled_grid[0]) | (e > sampled_grid[-1]))
+        for k, n in zip(*np.nonzero(outside)):
+            _record_sc(inputs, f"SC sampled-support growth: {state(k, n)}, "
+                       f"pad={float(sc_state_pad_ev(e[k, n])):.6f} eV; "
+                       f"sampled {grids}")
+        return
+    if not req.any():
+        _record_sc(inputs, f"SC window {event} (map {iteration}): no required state; grid {grids}")
+        return
+    masked_lo = np.where(req, e, np.inf)
+    masked_hi = np.where(req, e, -np.inf)
+    lo_kn = np.unravel_index(int(np.argmin(masked_lo)), e.shape)
+    hi_kn = np.unravel_index(int(np.argmax(masked_hi)), e.shape)
+    half = sc_read_halfwidth_ev()
+    if event == "re-plan":
+        _record_sc(inputs, f"SC window re-plan (map {iteration}, pad "
+                   f"{SC_WINDOW_PAD_EV[-1]:.2f} eV): grid {grids}; lowest "
+                   f"{state(*lo_kn)}, highest {state(*hi_kn)}")
+        return
+    if event == "hold":
+        slack_lo = float(e[lo_kn]) - half - float(grown_grid[0])
+        slack_hi = float(grown_grid[-1]) - float(e[hi_kn]) - half
+        edge, where = ((slack_lo, state(*lo_kn)) if slack_lo <= slack_hi
+                       else (slack_hi, state(*hi_kn)))
+        _record_sc(inputs, f"SC window hold (map {iteration}): grid "
+                   f"[{grown_grid[0]:+.6f}, {grown_grid[-1]:+.6f}] eV held; "
+                   f"tightest read support {where}, {edge:.4f} eV inside its edge")
+        return
+    crossed = req & ((e - half < sampled_grid[0]) | (e + half > sampled_grid[-1]))
+    for k, n in zip(*np.nonzero(crossed)):
+        side = "upper" if e[k, n] + half > sampled_grid[-1] else "lower"
+        _record_sc(inputs, f"SC window extension (map {iteration}): {state(k, n)}; "
+                   f"read support [{e[k, n] - half:+.6f}, {e[k, n] + half:+.6f}] eV "
+                   f"crosses the {side} edge; pad {SC_WINDOW_PAD_EV[-1]:.2f} eV; grid {grids}")
 
 
 def _sc_active_identities(inputs):
@@ -2988,8 +3085,8 @@ def _classify_sc_partition(
             f"sigma_out_of_grid={inputs.config.sigma.out_of_grid}"
             + (" (the grid grows over every non-frozen identity)."
                if inputs.config.sigma.out_of_grid == "cover" else
-               f"; energies outside [{float(inputs.config.sigma.omega_min_ev):+.2f}, "
-               f"{float(inputs.config.sigma.omega_max_ev):+.2f}] eV plus the SC pad read "
+               f"; energies outside [{sigma_classification_window_ev(inputs.config.sigma)[0]:+.2f}, "
+               f"{sigma_classification_window_ev(inputs.config.sigma)[1]:+.2f}] eV plus the SC pad read "
                + ("the nearest grid edge." if inputs.config.sigma.out_of_grid == "clamp"
                   else "Sigma(omega=0).")))
     if not ks.is_identity:
@@ -3579,6 +3676,17 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
         inputs.meta.shared_pole_response_rules = (
             None if inputs.fixed_quadrature_session is None else
             inputs.fixed_quadrature_session.setdefault("chi", {}))
+        # Map 1 records the model's Kmax and later maps keep at least it, so
+        # the store and its readers keep one column extent
+        # (shared_pole_store._k_extent); map 0 is the one-shot's exact Kmax.
+        inputs.meta.shared_pole_k_capacity = (
+            None if inputs.fixed_quadrature_session is None or int(state.iteration) == 0
+            else inputs.fixed_quadrature_session.setdefault("shared_pole_k_capacity", {}))
+        # The same for the CT round's retained CC/TT span widths
+        # (shared_pole_sectors.cross_span_widths).
+        inputs.meta.shared_pole_rank_capacity = (
+            None if inputs.fixed_quadrature_session is None or int(state.iteration) == 0
+            else inputs.fixed_quadrature_session.setdefault("shared_pole_rank_capacity", {}))
 
     from .gw_config import (uses_bare_transverse_shared_pole,
                             uses_direct_bispinor_shared_pole_head)
@@ -3949,25 +4057,17 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
     # diag(f), Σ_c branch weights, and the metal E_F reference.
     sigma_config = inputs.config
     if sc_support is not None:
-        from .scissor import sc_state_pad_ev
-
         session = inputs.fixed_quadrature_session
-        sampled_grid, expanded_grid, energy_relative_ev, required_kn = sc_support
-        escaped_kn = required_kn & (
-            (energy_relative_ev < sampled_grid[0])
-            | (energy_relative_ev > sampled_grid[-1]))
-        for k, n in zip(*np.nonzero(escaped_kn)):
-            energy = float(energy_relative_ev[k, n])
-            _record_sc(
-                inputs, f"SC sampled-support growth: "
-                f"band={int(inputs.band_slices.b0) + int(n) + 1}, k={int(k)}, "
-                f"E-mu={energy:+.6f} eV, pad={float(sc_state_pad_ev(energy)):.6f} eV; "
-                f"sampled [{sampled_grid[0]:+.6f}, {sampled_grid[-1]:+.6f}] -> "
-                f"[{expanded_grid[0]:+.6f}, {expanded_grid[-1]:+.6f}] eV")
+        sampled_grid, expanded_grid, energy_relative_ev, required_kn, event = sc_support
+        _record_sc_window_plan(inputs, int(state.iteration), event, sampled_grid,
+                               expanded_grid, energy_relative_ev, required_kn)
         if session is not None:
-            # A grown grid that leaves a frozen Sigma certificate is a box
-            # escape and refits the rule set (sigma_box_plan).
+            # A grid that leaves a held Sigma certificate is a box escape and
+            # refits only the windows it crossed (sigma_box_plan).
             session["omega_grid_ev"] = tuple(float(x) for x in expanded_grid)
+            session["window_plan"] = {
+                "index": 0 if event == "plan" else 1, "event": event,
+                "iteration": int(state.iteration)}
         sigma_config = replace(
             inputs.config, sc_omega_grid_ev=tuple(float(x) for x in expanded_grid))
     sigma_result = compute_sigma_xc(
@@ -4001,6 +4101,13 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
         fixed_quadrature_session=inputs.fixed_quadrature_session,
         print_fn=inputs.print_fn,
     )
+    # The W model's held pole-column extent or CT span width grew this map (a
+    # live Kmax or retained rank past it): say so, as the window plan says
+    # its extensions.
+    for held in (getattr(inputs.meta, "shared_pole_k_capacity", None),
+                 getattr(inputs.meta, "shared_pole_rank_capacity", None)):
+        for note in ({} if held is None else held).pop("_events", []):
+            _record_sc(inputs, f"    SC map {int(state.iteration)}: {note}")
     if bool(sigma_result.hartree_omitted) != (exact_hartree_dft is not None):
         raise RuntimeError(
             "SigmaResult Hartree-omission receipt disagrees with the "
@@ -4700,8 +4807,7 @@ def _sc_edge_ambiguity(inputs: SCInputs, state_out: SCState) -> tuple[int, str]:
         diag = np.asarray(strip_axis(diag, sigma.sigma_band_axis, axis=-1))
     e_rel = np.asarray(sigma.e_eval_ev, dtype=np.float64) - float(sigma.efermi_dft_ev)
     from .scissor import sc_padded_window_ev
-    window = sc_padded_window_ev(float(inputs.config.sigma.omega_min_ev),
-                                 float(inputs.config.sigma.omega_max_ev))
+    window = sc_padded_window_ev(*sigma_classification_window_ev(inputs.config.sigma))
     ambiguous, jump = sigma_grid_edge_ambiguity(
         diag, np.asarray(omega, dtype=np.float64), e_rel, growth_window_ev=window)
     # Frozen-core bands are held at their DFT block (no Sigma enters them).
@@ -6760,8 +6866,8 @@ def run_sc_driver(
         # do not silently subtract a loader VBM from a candidate midgap.
         efermi_dft_scissor_ry = float(
             _midgap_efermi(e_dft_active_kn_ry, int(meta.nelec)))
-    omega_min_ev = float(config.sigma.omega_min_ev) + efermi_ev
-    omega_max_ev = float(config.sigma.omega_max_ev) + efermi_ev
+    omega_min_ev, omega_max_ev = (
+        edge + efermi_ev for edge in sigma_classification_window_ev(config.sigma))
     # One constructor owns the all-k window predicate and whole-multiplet
     # promotion.  EQP2 uses the same constructor below; neither ladder can
     # silently invent a different protected subspace.
