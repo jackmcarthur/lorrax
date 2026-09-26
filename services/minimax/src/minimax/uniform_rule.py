@@ -1090,7 +1090,8 @@ def uniform_rule_solver_identity():
 
 
 def _build_uniform_rule(box, eps, *, im_cap=3.0, kappa_cap=1.0e4, trunc=10.0,
-                        reduce=True, relative=None, attempts=None):
+                        reduce=True, relative=None, attempts=None,
+                        fit_points=_FIT_POINTS_PER_HALF_WAVE):
     """Rule for ``1/d`` on ``box = (re_lo, re_hi, im_lo, im_hi)`` with
     ``Im d > 0``.
 
@@ -1160,7 +1161,7 @@ def _build_uniform_rule(box, eps, *, im_cap=3.0, kappa_cap=1.0e4, trunc=10.0,
     # than the fit: 17 of 80 random rotated-ray boxes were exact on the fit
     # samples and off between them before the check was finer.
     bx = (re_lo, re_hi, im_lo, im_hi)
-    fit_cloud = _BoundaryCloud(bx, theta, S, eps, p=_FIT_POINTS_PER_HALF_WAVE,
+    fit_cloud = _BoundaryCloud(bx, theta, S, eps, p=fit_points,
                                p_target=5.0, top=False)
     check = _BoundaryCloud(bx, theta, S, eps, p=6.0, p_target=8.0)
     d = fit_cloud.d
@@ -1288,6 +1289,16 @@ def _build_uniform_rule(box, eps, *, im_cap=3.0, kappa_cap=1.0e4, trunc=10.0,
     else:
         times, weights = fam.to_rule(s, w)
     sup, kappa = check.sup(times, weights, relative)
+    # A narrow sign-definite box can alias on the fit cloud: RC2's GN
+    # state_tail (2.837, 3.612) Ry has 12 fit points, its 4th singular value
+    # reads 9e-8 there (5e-5 on 16 points), and the rank-3 start misses eps
+    # 1.9x on the check cloud.  Only a start no reduction accepted gets here
+    # with sup > eps, so a certified box never takes this path.
+    if relative and not sup <= eps and fit_points < 4 * _FIT_POINTS_PER_HALF_WAVE:
+        return _build_uniform_rule(
+            box, eps, im_cap=im_cap, kappa_cap=kappa_cap, trunc=trunc,
+            reduce=reduce, relative=relative, attempts=attempts,
+            fit_points=2 * fit_points)
     return UniformRule(
         times=times, weights=weights, box=bx,
         eps=float(eps), relative=bool(relative), theta_deg=float(np.rad2deg(theta)),
