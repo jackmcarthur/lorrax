@@ -11,7 +11,8 @@ from gw.shared_pole_recipe import _sector_treatment_ceiling
 
 def inputs(gap=.7, *, eta=.25, tier="production", top=20.):
     config = NS(sigma=NS(w_model="shared_pole", w_accuracy=tier,
-                         regularization_ev=eta), memory=NS(per_device_gb=30.))
+                         regularization_ev=eta), memory=NS(per_device_gb=30.),
+                bispinor=False)
     wfns = NS(enk=np.array([[-20., -gap/2, gap/2, 999.]]*2)/RYD_TO_EV,
               occ=np.array([[1., 1., 0., 0.]]*2),
               slices=NS(b0=0, b4_logical=3, val=slice(0, 2),
@@ -33,12 +34,22 @@ def resolve(args, session=None):
         support_session=session)
 
 
-def assert_same_geometry(a, b):
+# An interacting map's envelope sits on the 1e-4 snap grid (99253307a); an
+# independent resolution uses the raw interval, so their frequencies agree to
+# one grid step and their structure exactly.
+SNAP_RTOL = 1.0e-4
+
+
+def assert_same_geometry(a, b, rtol=0.0):
     for key in ("line_ev", "imaginary_ev", "held_line_ev", "held_imaginary_ev",
                 "z_ry", "role", "distinct_id", "held", "support_pair",
                 "fit_ids", "held_ids"):
         assert a[key].dtype == b[key].dtype
-        assert a[key].tobytes() == b[key].tobytes(), key
+        if rtol and a[key].dtype.kind in "fc":
+            np.testing.assert_allclose(a[key], b[key], rtol=rtol, atol=0.0,
+                                       err_msg=key)
+        else:
+            assert a[key].tobytes() == b[key].tobytes(), key
 
 
 def interacting_session(args):
@@ -138,10 +149,10 @@ def test_policy_or_basis_change_starts_a_new_envelope(changed):
     current = resolve(args, session)
     assert current["support_envelope"]["status"] == "policy_changed"
     assert current["support_envelope"]["epoch"] == 1
-    assert_same_geometry(current, resolve(args))
+    assert_same_geometry(current, resolve(args), rtol=SNAP_RTOL)
     if changed == "eta":
         assert current["height_ev"] == first["height_ev"] == 2.6
-        assert current["u_min_ev"] == 2*first["u_min_ev"]
+        assert current["u_min_ev"] == pytest.approx(2*first["u_min_ev"], rel=SNAP_RTOL)
 
 
 def test_current_census_is_required_even_with_an_existing_envelope():
@@ -183,7 +194,7 @@ def test_reference_interval_is_not_retained_by_first_interacting_map():
     assert reference["support_envelope"]["epoch"] == -1
     assert session == {"reference_complete": True}
     current = resolve(inputs(1.5, top=20.), session)
-    assert_same_geometry(current, resolve(inputs(1.5, top=20.)))
+    assert_same_geometry(current, resolve(inputs(1.5, top=20.)), rtol=SNAP_RTOL)
     assert current["top_ev"] < reference["top_ev"]
     assert current["u_min_ev"] > reference["u_min_ev"]
     assert current["support_envelope"]["status"] == "initial"
