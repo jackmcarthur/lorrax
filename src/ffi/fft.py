@@ -654,7 +654,7 @@ def cubin_cache_dir() -> str:
     directory for every world size: an image depends on the device and the
     wheel, not on P.  No knob.
     """
-    from lxkit.cache import user_cache_dir
+    from lxkit import user_cache_dir
     return str(user_cache_dir("kconv_mathdx"))
 
 
