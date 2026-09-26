@@ -41,8 +41,8 @@ instead of calling `eigh` on $\mathrm{diag}(E_{\rm DFT})$, so SC map 0 equals th
 one-shot G0W0 bit for bit
 (`tests/test_invariance_gates.py::test_sc_iteration1_equals_one_shot`). Each
 map costs one full $\chi_0 \to W \to \Sigma$ evaluation. Σ rule planning is
-paid on map 0 (its one-shot plan and the frozen set), and after that only for
-windows that escape (§4).
+paid on map 0 (the one-shot plan) and map 1 (the held plan), and after that
+only for a window a state crosses (§4).
 
 The loop is driven by eqp0, which is Σ at the current energies. No Z-factor
 enters the iteration. Each map also writes the BerkeleyGW-shaped linearization
@@ -125,9 +125,9 @@ is zero. Two safeguards cost no evaluation and have no tunable constant:
   the history.
 
 A discrete map event does not restart the history. Such an event is a Σ rule
-rebuild or sampled-grid growth, logged as `SC map event`. Early maps grow the
-grid on every call, and restarting there reduces the method to Picard steps,
-which diverge on an expansive map.
+rebuild or a grid change (the map-1 plan, an extension), logged as `SC map
+event`. Restarting there would reduce the method to Picard steps, which
+diverge on an expansive map.
 
 Plain iteration is refused. On dense band manifolds the QSGW Jacobian has
 cycle-direction eigenvalues of about −3 or below, so a plain fixed point
@@ -182,7 +182,7 @@ $\Sigma(E)$, not $\Sigma(0)$, for an active state outside the requested grid.
 - **Out-of-grid policy** (`sigma_out_of_grid`, owner 2026-09-24). One
   classification, `qsgw_utils.omega_coverage`, decides which energies are
   on the sampled grid. The Σ build (`qsgw_utils.sigma_eval_omega`), the
-  growth below and the tail mask all read it.
+  window plan below and the tail mask all read it.
 
   | policy | an off-grid $\Sigma(E)$ reads | error past the edge, median / p90 (eV) | risk | cost |
   |---|---|---|---|---|
@@ -203,23 +203,36 @@ $\Sigma(E)$, not $\Sigma(0)$, for an active state outside the requested grid.
   rule $C_n > 0$, is not offered: Σ at a grid edge is far from its $1/\omega$
   asymptote (Fe: −5 to −7 eV at +28 eV), so the matched pole falls inside
   the extrapolated range for 10–92 % of the states (CLAIMS 2710).
-- **Growth.** A state that must be covered and moves past the sampled grid
-  grows only the outer samples, out to $E \pm \mathrm{pad}(E)$ with
+- **Window plan** (owner 2026-09-25). The sampled grid and the Σ rule
+  boxes are planned once and then held, so a steady map compiles no program
+  and refits no rule. Map 0 is the one-shot: its grid grows the requested
+  one over every required state outside it, to $E \pm \mathrm{pad}(E)$ with
   $\mathrm{pad}(E) = 0.5\ \mathrm{eV} + 0.10\,\lvert E - \mu\rvert$
-  (`scissor.sc_state_pad_ev`). Under `cover` that is every protected, active
-  identity outside `sc_frozen_core_bands`. Under `clamp` and `static` it is only a
-  state inside the padded window, the solution of
+  (`scissor.sc_state_pad_ev`). Map 1 plans: the requested grid grows to
+  cover every required state $\pm 1$ eV (`scissor.SC_WINDOW_PAD_EV`), and it
+  may shrink against map 0. Later maps hold that grid while every required
+  state's read support $[E - 0.5, E + 0.5]$ eV (the $Z$ stencil,
+  `eqp_bgw.Z_FINITE_DIFFERENCE_EV`) lies inside it. When a state is about to
+  cross, only the crossed edge grows, to $E \pm 1$ eV, and one
+  `SC window extension` line names the band, k, $E - \mu$ and the edge; a
+  held map prints `SC window hold` with the tightest support. Under `cover`
+  the required states are the protected, active identities outside
+  `sc_frozen_core_bands`; under `clamp` and `static` only those inside the
+  padded window, the solution of
   $E \ge \omega_{\min} - \mathrm{pad}(E)$ and $E \le \omega_{\max} + \mathrm{pad}(E)$
-  (`scissor.sc_padded_window_ev`). Old samples do not change, the grown
-  support persists, and an interior hole refuses. Coverage is judged in the
-  frame the Σ build measures from: the current spectrum's VBM or midgap for
-  GN/HL-PPM (`ppm_sigma.ppm_fermi_frame`), `efermi.resolve_sigma_efermi_ry`
-  for MPA. On MoS2 3×3 the PPM frame sat 1.4 eV above the DFT midgap, and
-  judging coverage in the wrong one left a "covered" state on $\Sigma(0)$
-  until a later growth switched it, a 2.8 eV jump of its map output
-  (CLAIMS 2736). Growth is monotone and
-  bounded by the covered spectrum; in practice it stops after map 1, so
-  growth late in a run marks a state that is still running away.
+  (`scissor.sc_padded_window_ev`). Set `sigma_omega_min_ev` /
+  `sigma_omega_max_ev` are a minimum extent kept on every map; unset, the
+  grid comes from the protected band range alone (`cover` only). Old
+  samples do not move on an extension and an interior hole refuses.
+  Coverage is judged in the frame the Σ build measures from: the current
+  spectrum's VBM or midgap for GN/HL-PPM (`ppm_sigma.ppm_fermi_frame`),
+  `efermi.resolve_sigma_efermi_ry` for MPA. On MoS2 3×3 the PPM frame sat
+  1.4 eV above the DFT midgap, and judging coverage in the wrong one left a
+  "covered" state on $\Sigma(0)$ until a later growth switched it, a 2.8 eV
+  jump of its map output (CLAIMS 2736). No map-0 plan is kept: states move
+  3–6.5 eV between maps 0 and 1 (Fe 4³ top conduction +18.8 → +25 eV;
+  every CrI3 8×8 window left its padded box), so a map-0 margin holds
+  nothing.
 - **Width.** The crossing-rule node count grows linearly in bandwidth$/\eta$,
   and Σ far from $E_F$ is not smoother: on Fe the curvature at
   $\lvert\omega\rvert \ge 15$ eV is 13× that near $E_F$. Put deep semicore in
@@ -227,18 +240,24 @@ $\Sigma(E)$, not $\Sigma(0)$, for an active state outside the requested grid.
   `sigma_regularization_ev` is the literal broadening η of every ansatz and
   is not a speed knob. The quadrature page owns η and
   `sigma_quadrature_eps`.
-- **Frozen rules** (`sigma_box_plan`). Map 0 is served by the one-shot
-  planner's rules. The same call freezes one rule per product window,
-  certified on the window's box padded in two ways: each
-  edge by the pad of the state that sets it, and by 10 % for the poles. The
-  zero-side edge of a sign-definite box stops at 5 % of its distance to zero,
-  so the box stays sign-definite. Later maps reuse a rule by containment
-  (`cache=hit:sc-fixed`). A state that leaves its box, a new window, pole
-  drift or grid growth outside a certificate refits only the windows involved
-  (`rebuild:sc-fixed`; the `SC fixed quadrature:` line prints `escaped=k/n`).
-  A change of material class re-initializes the set. Every path accepts a rule
-  only if its certified sup error is at most `sigma_quadrature_eps`; otherwise
-  it refuses, naming the window, box, sup and node count. There is no retry;
+- **Held rules** (`sigma_box_plan._fit_fixed_sc_rules`). Map 0 is served
+  by the one-shot planner's rules, and nothing is frozen there. Map 1 fits
+  one rule per product window, certified on the window's box over the
+  map-1 grid with its states padded by 1 eV (clipped to the window's own
+  selector interval), its near pole edges and widths by 10 %, and the far
+  pole edge of an unbounded selector (deep and bulk windows) by 2×: the
+  highest shared-pole mode moves 10–30 % per map, and a sign-definite
+  relative rule pays about one node for it. The zero-side edge of a
+  sign-definite box stops at 5 % of its distance to zero, so the box stays
+  sign-definite. Later maps reuse a rule by containment
+  (`cache=hit:sc-fixed`). A window whose box leaves its rule, a new window,
+  or a sign change is refit alone at the same pad (`rebuild:sc-fixed`), and
+  its reason names the state (k, band, $E - \mu$), the pole extent or the
+  grid edge that crossed. The window executables keep the session's largest
+  node count, so a refit recompiles them only when it raises it. A change of
+  material class re-initializes the plan. Every path accepts a rule only if
+  its certified sup error is at most `sigma_quadrature_eps`; otherwise it
+  refuses, naming the window, box, sup and node count. There is no retry;
   η and ε are fixed for the session.
 
 ## 5 Where the map is not smooth
