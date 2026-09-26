@@ -358,10 +358,12 @@ def sigma_spin_block(*, n_parent, n_rmu, ns, mesh, partner_tiles):
     P_ = int(mesh.shape['x']) * int(mesh.shape['y'])
     tile = 16.0 * int(n_parent) * int(ns) ** 2 * int(n_rmu) ** 2 / P_
     target = _device_target_bytes(ns)
-    for d in sorted((d for d in range(1, int(ns) + 1) if int(ns) % d == 0), reverse=True):
-        if (1.0 + float(partner_tiles) + (d / int(ns)) ** 2) * tile <= target:
-            return d
-    return 1
+    price = lambda d: (1.0 + float(partner_tiles) + (d / int(ns)) ** 2) * tile
+    divisors = sorted((d for d in range(1, int(ns) + 1) if int(ns) % d == 0), reverse=True)
+    d = next((d for d in divisors if price(d) <= target), 1)
+    from common.gpu_utils import record_stage_price
+    record_stage_price("Sigma tau, sigma_spin_block", price(d), section="sigma.tau_sweep")
+    return d
 
 
 def _device_target_bytes(ns: int) -> float:
@@ -388,8 +390,10 @@ def chi_valence_chunks(*, n_parent, n_rmu, ns, n_full, n_out, n_val, mesh, partn
     acc = 16.0 * int(n_out) * int(n_full) * int(n_rmu) ** 2 / P_
     target = _device_target_bytes(ns)
     side = (1.0 + float(bool(partner))) * tile
-    for n in range(1, max(1, int(n_val)) + 1):
-        if side * (1.0 + 1.0 / n) + acc <= target:
-            return n
-    return max(1, int(n_val))
+    price = lambda n: side * (1.0 + 1.0 / n) + acc
+    n = next((n for n in range(1, max(1, int(n_val)) + 1) if price(n) <= target),
+             max(1, int(n_val)))
+    from common.gpu_utils import record_stage_price
+    record_stage_price("chi0, chi_valence_chunks", price(n), section="chi.exec")
+    return n
 

@@ -88,6 +88,32 @@ def minimum_process_budget_gb(local_gb: float) -> float:
     return float(np.min(budgets))
 
 
+# ============================================================================
+# Planner prices: what each planner said its stage would hold, per rank
+# ============================================================================
+
+_STAGE_PRICES: list[dict] = []
+
+
+def record_stage_price(stage: str, price_bytes: float, *, section: str | None = None) -> None:
+    """Record a planner's per-rank price for the stage it plans.
+
+    ``price_bytes`` is the live set the planner compared against its budget;
+    ``section`` names the timing section whose device peak the price is judged
+    against (default: the innermost open section at the call).  The run's
+    stage-memory table prints peak / price as γ, or "no planner".
+    """
+    from common import timing
+    path = timing.current_path()
+    _STAGE_PRICES.append({"stage": str(stage), "bytes": float(price_bytes),
+                          "path": path, "section": section or (path[-1] if path else None)})
+
+
+def stage_prices() -> list[dict]:
+    """Every price recorded this run, in call order."""
+    return [dict(row) for row in _STAGE_PRICES]
+
+
 def _query_nvidia_smi_memory(field: str) -> int | None:
     """Query this rank's visible GPU memory field, returned in bytes."""
     try:

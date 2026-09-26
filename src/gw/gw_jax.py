@@ -1359,6 +1359,8 @@ def _record_process_wall(_pre_main, _t_main):
 def _close_timing(_pre_main, _t_main, meta, print0):
     """Produce the complete process wall time and timing decomposition."""
     _wall = _record_process_wall(_pre_main, _t_main)
+    # Every process: the stage-memory table's max and min over ranks.
+    timing.gather_peaks()
     if meta.rank == 0 and debug_print_enabled():
         timing.report(print_fn=print0, title="--- Timing ---", wall=_wall)
     return (_wall)

@@ -1643,6 +1643,10 @@ def _plan_route_g_for_channel(
 		n_s=(int(psi_cylinder[1]) if psi_cylinder else int(min(
 			_n_a, math.ceil(2.4 * _r) + 1))),
 		n_vertex=int(n_vertex), n_parent=int(n_parent))
+	from common.gpu_utils import record_stage_price
+	record_stage_price("zeta fit, plan_zeta_route_g HWM", mubatch_plan.hwm_bytes,
+	                   section=("gw_jax.zeta_fit_chunked" if int(n_vertex) == 1
+	                            else "gw_jax.zeta_fit_transverse"))
 	if jax.process_index() == 0:
 		print_fn(mubatch_plan.format())
 	return {
