@@ -486,16 +486,9 @@ def main(argv=None) -> int:
     parser.add_argument("--kpm-plot-file", type=str, default="bse_dos_kpm.png", help="KPM DOS plot output file.")
     parser.add_argument("--eqp", type=str, default=None, help="Path to BGW eqp1.dat for QP corrections.")
     parser.add_argument("--n-occ", type=int, default=None, help="Number of occupied bands.")
-    # INERT, and deliberately still accepted.  Its only consumer was the
-    # ``timed=True`` arm of ``bse_ring_comm.build_bse_ring_matvec*``, which was
-    # dead code (no caller ever passed it) and was deleted 2026-08-08; the dest
-    # was already never read even before that.  It is kept parseable so that an
-    # archived launch script still starts instead of dying in argparse on a
-    # batch node, which reads as a crashed run rather than a renamed flag.
-    # If per-term ring timings are wanted again, use common.timing sections on
-    # the jitted matvec -- not an unjitted arm that re-traces on every call.
-    parser.add_argument("--ring-timing", action="store_true")
-    args, _ = parser.parse_known_args(argv)
+    args, unknown = parser.parse_known_args(argv)
+    if "--ring-timing" in unknown:
+        parser.error("--ring-timing is retired: its timed ring-matvec arm was deleted 2026-08-08")
 
     # Omitted --px/--py = the run's canonical square mesh, not 1x1.  Resolved
     # here, above every branch below, for two reasons.  A shape that is not
