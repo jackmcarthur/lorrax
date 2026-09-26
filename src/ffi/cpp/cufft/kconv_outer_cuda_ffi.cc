@@ -188,7 +188,9 @@ extern "C" __global__ void __launch_bounds__(LRX_THREADS, LRX_MINB) lrx_kconv_ou
                     lrx_c2 w;
                     w.x = v.x * g.scale;
                     w.y = v.y * g.scale;
-                    ub[k * ku + xi * nbmy + yi] = w;
+                    // Streaming store (evict-first): U is never re-read here, so it must not push
+                    // the L2-resident legs out.
+                    __stcs(reinterpret_cast<double2*>(ub + k * ku + xi * nbmy + yi), make_double2(w.x, w.y));
                 }
             }
             __syncthreads();
