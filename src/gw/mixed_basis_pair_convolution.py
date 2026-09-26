@@ -54,10 +54,14 @@ moves data between ranks; the product of the two halves is the whole action.
 Memory law, per rank, complex128 (``describe()`` prints it; n_A, n_C, n_X the operand
 and output spin widths: n_s, n_s, 1 for ``'trace'`` and n_s, 1, n_s for ``'scalar'``)::
 
-    resident  16·[N_k·(n_A²·M_A + n_C²·M_C)·N_r/(P·n_c) + n_q·n_X²·M_X·N_r/P]
-    batch     16·c·N_k·J·N_r,  c ≈ 4·n_A² + 2·n_X² + 2
+    H         16·N_k·(n_A²·M_A + n_C²·M_C)·N_r/(P·n_c)          expand, middle
+    T         16·n_q·n_X²·M_X·N_r/P                              expand … final
+    batch     16·c·N_k·J·N_r,  c ≈ 4·n_A² + 2·n_X² + 2           middle
 
-No N_k·N_r² object exists.  n_c (r' chunks), J (the batch), the k chunk of steps
+charged per stage over the objects live in it (``PairConvChunks.stage_bytes``: the slab
+tiles throughout, H with the middle's T through the expand and the middle, the middle's
+T with the rebuilt T through the wedge's rebuild, the final T with X through the final
+stage); the HWM is the largest stage.  No N_k·N_r² object exists.  n_c (r' chunks), J (the batch), the k chunk of steps
 2–4 and the q chunk of step 6 all come from the device budget; each is one when
 everything fits (sandbox TASTE 96).  The r' chunking recomputes steps 2–3 per chunk
 (O(N_k M N_r log N_r) each, ~M/N_r of the step-5 work) and bounds H by 1/n_c.
@@ -473,13 +477,22 @@ def screened_sphere_set(*, fft_grid, psi: SphereSet, bvec, q_frac, ecutwfc: floa
 
 @dataclasses.dataclass(frozen=True)
 class PairConvChunks:
-    """The budget-derived schedule: r' chunks, batch width, k and q chunks, and the byte model."""
+    """The budget-derived schedule: r' chunks, batch width, k and q chunks, and the byte model.
+
+    The model is per stage, over the objects live in that stage (``__call__``'s order):
+    the slab tiles live throughout; H (one r' chunk) and the middle's T through the expand
+    and the middle; the middle's T and the rebuilt T (wedge) through the rebuild; the T the
+    final stage reads and X through the final stage.  The HWM is the largest stage."""
     n_c: int
     J: int
     kc: int
     qc: int
     n_r_carrier: int
-    bytes_resident: int
+    bytes_tiles: int
+    bytes_h: int
+    bytes_t_mid: int
+    bytes_t_out: int
+    bytes_out: int
     bytes_expand: int
     bytes_middle: int
     bytes_final: int
@@ -487,9 +500,24 @@ class PairConvChunks:
     bytes_rebuild: int = 0
 
     @property
+    def bytes_resident(self) -> int:
+        """What the expand and the middle hold: the tiles, H and the middle's T."""
+        return self.bytes_tiles + self.bytes_h + self.bytes_t_mid
+
+    @property
+    def stage_bytes(self) -> dict:
+        t_fin = self.bytes_t_out if self.bytes_t_out else self.bytes_t_mid
+        out = dict(expand=self.bytes_resident + self.bytes_expand,
+                   middle=self.bytes_resident + self.bytes_middle,
+                   final=self.bytes_tiles + t_fin + self.bytes_final + self.bytes_out)
+        if self.bytes_t_out:
+            out["rebuild"] = (self.bytes_tiles + self.bytes_t_mid + self.bytes_t_out
+                              + self.bytes_rebuild)
+        return out
+
+    @property
     def hwm(self) -> int:
-        return self.bytes_resident + max(self.bytes_expand, self.bytes_middle, self.bytes_final,
-                                         self.bytes_rebuild)
+        return max(self.stage_bytes.values())
 
 
 def _divisors(n: int) -> list[int]:
@@ -534,12 +562,16 @@ def plan_pair_convolution_chunks(*, n_ranks, n_k, spins, widths, width_out, n_q,
     def t_total(nc, j):             # columns of the T the final stage reads, all ranks
         return carrier(nc, j) if wedge is None else Pn * tcol
 
-    def resident(nc, j):
+    tiles = _C16 * int(n_parent_tiles)                  # the slab copies: every stage
+    x_out = _C16 * (nq * Mo * Mo * cx // Pn)            # X: the final stage
+    t_out = 0 if wedge is None else _C16 * nq * Mo * cx * tcol   # the rebuilt T: rebuild, final
+
+    def h_bytes(nc, j):             # H of one r' chunk: the expand and the middle
         cols = carrier(nc, j) // Pn
-        H = nk * sum(c * m for c, m in zip(ch, Mw)) * (cols // nc)
-        Tm = nqm * Mm * cx * cols
-        T = 0 if wedge is None else nq * Mo * cx * tcol
-        return _C16 * (H + Tm + T + int(n_parent_tiles) + nq * Mo * Mo * cx // Pn)
+        return _C16 * nk * sum(c * m for c, m in zip(ch, Mw)) * (cols // nc)
+
+    def t_mid(nc, j):               # the middle's T: the expand, the middle and the rebuild
+        return _C16 * nqm * Mm * cx * (carrier(nc, j) // Pn)
 
     def rebuild(nc, j):             # one q row: the gathered operation rows (+ the spin sandwich) and the rebuilt columns
         cols = carrier(nc, j) // Pn
@@ -559,15 +591,22 @@ def plan_pair_convolution_chunks(*, n_ranks, n_k, spins, widths, width_out, n_q,
         return _C16 * cx * (3 * qc * (Mo // Pn) * max(t_total(nc, j), nr)
                             + 2 * qc * (Mo // Pn) * (kbox_out + Mo))
 
+    def hwm(nc, j, kc_, qc_):       # the largest stage (PairConvChunks.stage_bytes)
+        held = tiles + h_bytes(nc, j) + t_mid(nc, j)
+        stages = [held + expand(kc_, nc, j), held + middle(j),
+                  tiles + (t_out or t_mid(nc, j)) + final(qc_, nc, j) + x_out]
+        if wedge is not None:
+            stages.append(tiles + t_mid(nc, j) + t_out + rebuild(nc, j))
+        return max(stages)
+
     target = int(target_bytes)
     nc_range = [int(n_c)] if n_c is not None else range(1, ncol + 1)
     for nc in nc_range:
-        if resident(nc, 1) + max(expand(1, nc, 1), middle(1), final(1, nc, 1),
-                                 rebuild(nc, 1)) <= target or n_c is not None:
+        if hwm(nc, 1, 1, 1) <= target or n_c is not None:
             break
     else:
         raise RuntimeError(
-            f"GATE pairconv-capacity: got {resident(ncol, 1) + middle(1)} B per rank at the smallest "
+            f"GATE pairconv-capacity: got {hwm(ncol, 1, 1, 1)} B per rank at the smallest "
             f"schedule; want at most {target} B; why: the mixed-basis pair convolution keeps "
             "H_k(p, r') for one r' chunk and T_q(G, r') resident on all P ranks; fix: more ranks "
             "or more memory per device")
@@ -575,21 +614,19 @@ def plan_pair_convolution_chunks(*, n_ranks, n_k, spins, widths, width_out, n_q,
     if J is None:
         J = 1
         for j in range(min(int(j_cap), cols_chunk), 0, -1):
-            if resident(nc, j) + max(middle(j), expand(1, nc, j), final(1, nc, j),
-                                     rebuild(nc, j)) <= target:
+            if hwm(nc, j, 1, 1) <= target:
                 J = j
                 break
     J = int(J)
     if kc is None:
-        kc = max([d for d in _divisors(nk)
-                  if resident(nc, J) + expand(d, nc, J) <= target] or [1])
+        kc = max([d for d in _divisors(nk) if hwm(nc, J, d, 1) <= target] or [1])
     if qc is None:
-        qc = max([d for d in _divisors(nq)
-                  if resident(nc, J) + final(d, nc, J) <= target] or [1])
+        qc = max([d for d in _divisors(nq) if hwm(nc, J, int(kc), d) <= target] or [1])
     if nk % int(kc) or nq % int(qc):
         raise ValueError(f"pair-conv chunks: kc={kc} must divide n_k={nk} and qc={qc} n_q={nq}")
     return PairConvChunks(n_c=int(nc), J=J, kc=int(kc), qc=int(qc),
-                          n_r_carrier=carrier(nc, J), bytes_resident=resident(nc, J),
+                          n_r_carrier=carrier(nc, J), bytes_tiles=tiles, bytes_h=h_bytes(nc, J),
+                          bytes_t_mid=t_mid(nc, J), bytes_t_out=t_out, bytes_out=x_out,
                           bytes_expand=expand(kc, nc, J), bytes_middle=middle(J),
                           bytes_final=final(qc, nc, J), target=target,
                           bytes_rebuild=rebuild(nc, J))
@@ -1329,12 +1366,13 @@ class MixedBasisPairConvolution:
                 f"union boxes {self.kbox[0]}/{self.kbox[1]}/{self.kbox_out}; n_q={self.nq}\n"
                 f"[pair-conv] schedule: r' chunks n_c={c.n_c}, batch J={c.J} ({self.n_batch} per chunk "
                 f"per rank), k chunk {c.kc}, q chunk {c.qc}\n"
-                f"[pair-conv] memory law per rank: resident {gb(c.bytes_resident)} "
-                f"(H {gb(_C16 * self.nk * self.cols_chunk * sum(n * n * m for n, m in zip(self.spins, self.width_carrier)))}, "
-                f"T {gb(_C16 * self.nq_mid * self.mm_axis.carrier * self.spins[2] ** 2 * self.cols_rank)}); transients expand "
-                f"{gb(c.bytes_expand)}, middle {gb(c.bytes_middle)}, final {gb(c.bytes_final)}"
-                f"{'' if self._wt is None else ', rebuild ' + gb(c.bytes_rebuild)}; "
-                f"HWM {gb(c.hwm)} against target {gb(c.target)}" + self._describe_wedge())
+                f"[pair-conv] memory law per rank: tiles {gb(c.bytes_tiles)}, H {gb(c.bytes_h)}, "
+                f"middle T {gb(c.bytes_t_mid)}"
+                f"{'' if self._wt is None else ', rebuilt T ' + gb(c.bytes_t_out)}, X {gb(c.bytes_out)}; "
+                f"transients expand {gb(c.bytes_expand)}, middle {gb(c.bytes_middle)}, final "
+                f"{gb(c.bytes_final)}{'' if self._wt is None else ', rebuild ' + gb(c.bytes_rebuild)}; "
+                f"stages " + ", ".join(f"{k} {gb(v)}" for k, v in c.stage_bytes.items())
+                + f"; HWM {gb(c.hwm)} against target {gb(c.target)}" + self._describe_wedge())
 
     def _describe_wedge(self) -> str:
         wt = self._wt
