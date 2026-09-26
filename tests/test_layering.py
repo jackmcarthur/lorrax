@@ -618,12 +618,11 @@ _DRIVER_PLUMBING_BUDGET = {
     # the mesh ``initialize_communicator_stack`` built).
     "bandstructure.htransform": 1,
     # One ``from jax.sharding import ...`` each (a ``mesh_xy: Mesh``
-    # annotation in every one).  The separate DEFAULTS bug these four
+    # annotation in every one).  The separate DEFAULTS bug these
     # carried — ``--px/--py`` defaulting to 1, so on 16 devices with no flags
     # they ran a 1x1 mesh with no warning — is fixed (2026-08-27) and is now
     # gated in section 5b, not described here.
     "bse.bse_feast": 1,
-    "bse.bse_pseudopoles": 1,
     "bse.bse_w_exact": 1,
     "bse.bse_kpm": 1,
 }
@@ -1337,9 +1336,9 @@ def test_the_mesh_scan_can_fail():
 #
 # The second rule below is the one this bundle exists for, and rule 4 cannot
 # see it: a driver does not need to say ``Mesh(`` to end up on the wrong mesh.
-# Until 2026-08-27 all six bse-family drivers declared ``--px``/``--py`` with
-# ``default=1`` — ``bse_jax``, ``bse_feast``, ``bse_kpm``, ``bse_pseudopoles``,
-# ``bse_w_exact``, ``exciton_bands``, two declarations each, twelve in all —
+# Until 2026-08-27 the bse-family drivers declared ``--px``/``--py`` with
+# ``default=1`` — ``bse_jax``, ``bse_feast``, ``bse_kpm``, ``bse_w_exact``,
+# ``exciton_bands`` and a since-deleted pseudopole driver, two each —
 # so a run with no flags asked the (correct, shared) factory for
 # a 1x1 — the whole BSE on one device of a four-GPU node, while the startup
 # report announced 2x2; at P>1 the same default builds over
@@ -1428,15 +1427,15 @@ def test_no_bse_driver_defaults_its_mesh_shape(sources):
             seen.append((mod, flag))
             if default not in ("None", "<absent>"):
                 bad.append((mod, line, flag, default))
-    # Exact, not a floor.  At ``>= 10`` two declarations could vanish with the
+    # Exact, not a floor.  At ``>= 8`` two declarations could vanish with the
     # gate still green — a driver losing its --px/--py silently reverts to
     # whatever its main() does with the missing attribute, which is the class
-    # of defect this section exists for.  Six drivers x two flags = 12; if a
-    # seventh driver is added, edit this literal deliberately (rule: prefer
+    # of defect this section exists for.  Five drivers x two flags = 10; if a
+    # sixth driver is added, edit this literal deliberately (rule: prefer
     # the sufficient check over the merely necessary one).
-    assert len(seen) == 12, (
-        f"{len(seen)} --px/--py declarations found in src/bse/, expected 12 "
-        f"(six drivers x two flags): {seen}.  Either a driver stopped "
+    assert len(seen) == 10, (
+        f"{len(seen)} --px/--py declarations found in src/bse/, expected 10 "
+        f"(five drivers x two flags): {seen}.  Either a driver stopped "
         f"declaring its mesh flags, or one was added and this literal is "
         f"stale — both need a human, neither is a pass")
     assert not bad, (

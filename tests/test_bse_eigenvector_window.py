@@ -23,8 +23,8 @@ THREE NUMBERS, AND ONLY ONE OF THEM IS THE ANSWER.  For a window that snapped
     the loader's resolved count  4   — the bands actually solved  ← the answer
     the mesh-rounded pad extent  4   — what the ARRAY is shaped by, not bands
 
-``nc``/``nv`` in the file are what ``absorption_eigvecs`` slices ``dipole.h5``
-with, against ``n_occ``, so they have to name real bands: the resolved count.
+``nc``/``nv`` in the file are what an absorption post-processor slices
+``dipole.h5`` with, against ``n_occ``, so they have to name real bands: the resolved count.
 The pad is dropped BY COUNT, the same spelling as ``pad_zone_mask_np`` — and
 because a stale request and a mesh pad both make the incoming array *wider*
 than the declared window and cannot be told apart by shape, the trim is checked

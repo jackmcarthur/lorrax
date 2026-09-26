@@ -3,11 +3,11 @@
 `bse_lanczos` hoisted its W_R build to a real top-level boundary and DONATED
 `W_q` there, because a jit parameter's buffer is owned by the caller for the
 whole call: run the transform inside the solve and both `W_q` and `W_R` stay
-resident for its entire duration.  Three other drivers build the same W_R with
+resident for its entire duration.  Two other drivers build the same W_R with
 the same helper at the same kind of boundary and never got the same treatment
 (FFT_DONATION_AUDIT.md 2.3):
 
-    davidson_absorption.py   bse_nontda.py   exciton_bands.py (x2 paths)
+    bse_nontda.py   exciton_bands.py (x2 paths)
 
 The audit measured that the *in-jit* peak is identical donated or not
 (112.50 MiB/rank either way at this deck's W shape) — the whole win is
@@ -108,11 +108,10 @@ def test_donation_frees_the_input_buffer():
 
 
 @pytest.mark.parametrize("module,func,label", [
-    ("bse.davidson_absorption", None, "davidson_absorption W_R build"),
     ("bse.bse_nontda", "_full_matvec_and_args", "bse_nontda W_R build"),
     ("bse.exciton_bands", None, "exciton_bands W_R build"),
 ])
-def test_the_four_sites_donate_and_drop_the_reference(module, func, label):
+def test_the_sites_donate_and_drop_the_reference(module, func, label):
     """RED TWIN for the WIRING at each site, including the dropped reference.
 
     Source-level, deliberately: each of these lives inside a driver `main()`
