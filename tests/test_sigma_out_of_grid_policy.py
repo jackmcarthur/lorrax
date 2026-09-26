@@ -197,3 +197,21 @@ def test_unset_grid_edges_derive_the_grid_from_the_bands():
                                      np.ones((1, 2), bool))
     assert grown[0] <= -6.0 - 1.1 and grown[-1] >= 2.0 + 0.7
     assert np.isclose(grown, 0.0).any()
+
+
+def test_a_patch_deck_sets_both_edges_before_the_cover_only_refusal(tmp_path):
+    """A ``sigma_omega_patches_ev`` deck under static constructs: the patches
+    set both edges before DynamicSigmaConfig is built (core fixture B's
+    ``[static]`` deck).  Unset edges without patches still refuse."""
+    from gw.gw_config import LorraxConfig
+    base = ("[cohsex]\nsys_dim = 3\nnval = 2\nncond = 2\nnband = 10\n"
+            "memory_per_device_gb = 4.0\nsigma_out_of_grid = static\n")
+    deck = tmp_path / "patches.in"
+    deck.write_text(base + "sigma_omega_patches_ev = -12:0, 0.1:9.4\n"
+                    "sigma_omega_step_ev = 0.1\n")
+    sigma = LorraxConfig.from_input_file(str(deck), print_fn=lambda *a, **k: None).sigma
+    assert (sigma.omega_min_ev, sigma.omega_max_ev) == (-12.0, 9.4)
+    assert sigma.out_of_grid == "static"
+    deck.write_text(base)
+    with pytest.raises(ValueError, match="needs sigma_out_of_grid = cover"):
+        LorraxConfig.from_input_file(str(deck), print_fn=lambda *a, **k: None)

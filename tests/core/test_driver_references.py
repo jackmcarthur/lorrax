@@ -179,7 +179,9 @@ def test_b_retained_escape_grows_grid_in_the_same_map(core_fixtures, policy):
     protected identity at map 0, so band 3 (+13.7 eV) is covered before the
     first map and band 2's escape needs no later growth.  ``static`` keeps
     the padded-window rule: band 3 lies past it and reads Sigma(0), and
-    band 2 grows the grid in the map where it escapes.
+    band 2 grows the grid in the map where it escapes -- since SCPAD, map
+    1's window re-plan (1 eV around every required state) before that
+    map's Sigma sweep.
     """
     if not harness.gpu_available():
         pytest.skip("retained-state escape uses the GPU driver")
@@ -220,7 +222,8 @@ def test_b_retained_escape_grows_grid_in_the_same_map(core_fixtures, policy):
         assert np.max(receipt['eval_energies_rel_ev'][:, :3]) < grid[-1]
         return
     assert "SC sampled-support growth" not in first
-    growth = second.index("SC sampled-support growth: band=2, k=0")
+    growth = second.index("SC window re-plan (map 1")
+    assert "highest band=2, k=0" in second[growth:second.index("\n", growth)]
     assert growth < second.index("Started Sigma tau sweep")
     assert grid[-1] > 9.7
     # The final writer must retain the same grown support used by map 1.
