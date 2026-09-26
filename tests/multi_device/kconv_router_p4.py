@@ -46,6 +46,12 @@ must resolve to ``mathdx`` on this mesh (asserted, TASTE 30).
    Red twins: the stored kernel rolled by one k, the transform input rolled
    by one k.
 
+5. The BSE W-term doors (rank-local, k-grids 8x8x1 and 3x2x4, K and n_c off the pads):
+   ``make_local_kconv_klead_outer`` (both ``conj_r``) against the dense sum and the
+   chain it replaces (XLA einsum, then ``make_local_kconv_klead``), and
+   ``make_local_kconv_klead_outer_decode`` against the dense sum and decode.  Red
+   twins: V_R rolled by one k, the decode's Pc rolled by one k.
+
 Parity 1e-13 (mathdx vs plan route), 1e-12 vs dense sums; each red twin
 must miss by more than 1e-3.
 Run: ``lx run -N 1 -G 4 -n 4 python3 -u tests/multi_device/kconv_router_p4.py``.
@@ -442,6 +448,51 @@ def stored_cases(mesh, rng):
     return recs
 
 
+def outer_cases(mesh, rng):
+    """The BSE W-term doors (rank-local): the outer-product load and its fused decode vs NumPy."""
+    _local = np.asarray                          # rank-local results: _host would gather every rank's copy
+    from ffi import fft as F
+    recs = []
+    a = b = 2
+    mx = my = 8
+    K, n_c, mult = 5, 6, -0.5                    # K and n_c exercise the zero pads (4, 8)
+    for kg in ((8, 8, 1), (3, 2, 4)):
+        nk = int(np.prod(kg))
+        for why in (F.klead_outer_refusal(mesh, kg), F.klead_outer_decode_refusal(mesh, kg, n_c)):
+            assert why is None, f"outer doors refuse on kgrid {kg}: {why}"
+        L = _crand(rng, nk, a, mx, K)
+        R = _crand(rng, nk, K, b, my)
+        V = _crand(rng, mx, my, nk)                                   # W_R tile, k-minor
+        Pc = _crand(rng, nk, n_c, a, mx)
+        V3 = np.moveaxis(V, -1, 0).reshape(kg + (mx, my))[:, :, :, None, :, None, :]
+
+        def dense(r_leg, v3):
+            T = np.einsum("kaxK,kKby->kaxby", L, r_leg).reshape(kg + (a, mx, b, my))
+            return (mult * _np3(_np3(T, kg, 0, "ifftn", "ortho") * v3, kg, 0, "fftn", "ortho")
+                    ).reshape(nk, a, mx, b, my)
+        outer = F.make_local_kconv_klead_outer(mesh, kg, norm="ortho", mult=mult)
+        chain = F.make_local_kconv_klead(mesh, kg, norm="ortho", mult=mult)
+        d = jax.devices()[0] if jax.process_count() == 1 else jax.local_devices()[0]
+        on = lambda x: jax.device_put(x, d)                            # noqa: E731
+        for conj_r in (False, True):
+            r_leg = np.conj(R) if conj_r else R
+            ref = dense(r_leg, V3)
+            U = _local(outer(on(L), on(R), on(V), conj_r=conj_r))
+            Uc = _local(chain(jnp.einsum("kaxK,kKby->kaxby", on(L), on(r_leg)), on(np.moveaxis(V, -1, 0))))
+            Ured = _local(outer(on(L), on(R), on(np.roll(V, 1, -1)), conj_r=conj_r))
+            recs.append(dict(case=f"kconv_klead_outer_conj{int(conj_r)}", kgrid=list(kg),
+                             ref_outer_vs_numpy=_rel(U, ref), ref_outer_vs_chain=_rel(U, Uc),
+                             red_rolled_V=_rel(Ured, ref)))
+        prep, apply = F.make_local_kconv_klead_outer_decode(mesh, kg, norm="ortho")
+        ref_u = dense(np.conj(R), V3) / mult
+        ref_a = np.einsum("kctM,ktMsN->kcsN", np.conj(Pc), ref_u)
+        A = _local(apply(on(L), on(R), on(V), prep(on(Pc)), conj_r=True))
+        Ared = _local(apply(on(L), on(R), on(V), prep(on(np.roll(Pc, 1, 0))), conj_r=True))
+        recs.append(dict(case="kconv_klead_outer_decode", kgrid=list(kg), n_c=n_c,
+                         ref_decode_vs_numpy=_rel(A, ref_a), red_rolled_Pc=_rel(Ared, ref_a)))
+    return recs
+
+
 def main() -> int:
     import json
     mesh = Mesh(np.asarray(jax.devices()).reshape(2, 2), XY)
@@ -449,7 +500,7 @@ def main() -> int:
     recs = ([downfold_case(mesh, rng), face_parent_case(mesh, rng), plane_case(mesh, rng)]
             + unfold_cases(mesh, rng) + lorentz_cases(mesh, rng) + wedge_cases(mesh, rng)
             + chi_cases(mesh, rng) + block_cases(mesh, rng)
-            + stored_cases(mesh, rng))
+            + stored_cases(mesh, rng) + outer_cases(mesh, rng))
     bad = []
     for r in recs:
         for k, v in r.items():
