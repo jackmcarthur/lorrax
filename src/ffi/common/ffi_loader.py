@@ -133,7 +133,7 @@ _CUDA_TARGET_SYMBOLS = {
     # fourier_plan_cuda_ffi.cc): cuBLAS Fourier GEMMs + one cuFFT group.
     "lorrax_fourier_plan":          "LorraxFourierPlanCudaFfi",
     "lorrax_fourier_plan_mathdx":   "LorraxFourierPlanMathdxCudaFfi",
-    # gw.contour_accumulator: A[o] += p[o]·c on the response-bank streams
+    # ffi.contour: A[o] += p[o]·c on the response-bank streams
     # (cpp/response/contour_accumulate*).
     "lorrax_contour_accumulate":    "ContourAccumulateFfi",
     "lorrax_phdf5_write":           "PhdfWriteFfi",
@@ -585,7 +585,7 @@ def _register_ffi_targets(lib: ctypes.CDLL, platform: str) -> None:
 #: contour row is registered from ``_CUDA_TARGET_SYMBOLS``; the spin rotation
 #: is registered by its own service, so only its symbol is checked here.
 _CUDA_STARTUP_HANDLERS = {
-    "lorrax_contour_accumulate": ("ContourAccumulateFfi", "gw.contour_accumulator"),
+    "lorrax_contour_accumulate": ("ContourAccumulateFfi", "ffi.contour"),
     "lorrax_symmetry_spin_rotate_centroid": ("SpinRotateCentroidCudaFfi",
                                              "symmetry_maps._spin_rotation"),
 }
