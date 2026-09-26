@@ -28,6 +28,11 @@ is the minimum over processes of `common.gpu_utils.get_device_memory_gb()`:
 client reports no limit), and 0.90 of host RAM per device on CPU. The minimum
 is taken because static tile shapes must agree on every process.
 
+Every planner reads this one number, `common.gpu_utils.device_budget_bytes()`,
+which the config sets when the deck resolves. A stage planned while earlier
+objects are live prices against its room, `device_room_bytes()`: the budget
+less the bytes in use, the minimum over processes.
+
 A planner fills `target = budget × utilization`. Utilization defaults to
 0.90, 0.85 and 0.78 for `n_s` = 1, 2 and ≥4
 (`bfc_fragmentation_target_utilization`): a wider spinor axis makes one larger
@@ -91,30 +96,25 @@ projected-band ψ faces to the band-complete orientation for the call and
 contracts each `(μ_x, ν_y)` slab locally, so the μ-sized operator never
 moves; its transient is `M_axis` at the projected band count.
 
-## Spin-pair streaming
+## The Green-side stages
 
-For `n_s > 1` the charge response and the Σ convolutions are elementwise in
-the spinor pair, `χ₀ = Σ_ab Gc_ab·conj(Gv_ab)` and
-`Σ = Σ_ab ψ*_a (G_ab ⋆ W) ψ_b` with `W` spin-independent, so no stage needs
-the `n_s²` Green at once. The typed unfold mixes spinor components, so the
-parents move to full k first (the ψ action, `M·N_k/n_par` per rank), and
-each `(a, b)` block is one GEMM of the `a` and `b` spinor rows there:
+χ₀ and Σ(τ) read the parent Greens `T_p = 16·n_par·n_s²·μ²/P` through the
+fused k-convolution, which unfolds them on its load, so no full-k Green
+exists. A Green of real weights (real node times) reads its antiunitary
+partner as `conj(G)` on the load; complex times build a conjugate-face
+partner tile (`partner = 1`). Each Green build adds its band-complete panels
+`M_axis` ([§ ψ carriers](#ψ-carriers-faces-and-band-panels)). New bytes per
+rank beside what is live:
 
 ```text
-live per block  ≈ 4 · 16·N_k·μ²/P          (Green, transform, product, accumulator)
-extra GEMM work = N_k/n_par                full-k blocks instead of parent Greens
+χ₀ node   = 2·(1 + partner)·(T_p + M_axis) + 16·n_out·N_k·μ²/P            nothing chunks
+Σ(τ) pass = (1 + partner + (d/n_s)²)·T_p + 16·N_k·μ²/P + (1 + partner)·M_axis
 ```
 
-The stream applies the same one-tile panel rule once per call: when the two
-full-k band-complete copies fit one Green tile it gathers them once and the
-`2·n_s²` block GEMMs are local; otherwise every block GEMM gathers its own
-band panels (`gw.greens_function_kernel.pair_stream_layout`).
-
-`gw.greens_function_kernel.spin_pairs_needed` streams a stage only when its
-whole-spin live set exceeds the target: `3·G_tile` for χ₀ (Gv, Gc and the
-unfold transient), `2·G_tile` for Σ_x, the Coulomb hole and Σ_c(τ) (Σ_k and
-its convolution transient). Otherwise the stage keeps the parent Green and
-the fused unfold convolution.
+`sigma_spin_block` picks the largest output spin block `d` (a divisor of
+`n_s`) whose pass fits the room times the spinor's utilization, else 1.
+`price_chi0_node` only prices the χ₀ node: a band chunk of Gv would still
+be a whole `(μ, ν)` tile.
 
 ## Stage inventory
 
@@ -126,19 +126,19 @@ the fused unfold convolution.
 | V_q | `V_acc` `16·Q·μ_L·μ_R/P`, one q-tile of ζ rows, G panels | `vq_tile_bytes` ([§ V_q](#vq-g-panels-and-q-tiles)) | `GATE vq_tile_budget` |
 | V_q unfold | `16·N_k·μ²/P`, sharded `P(None,'x','y')` | — | — |
 | shared-pole screening and Σ | response-bank faces, pencils, eigh workspace, then G and W tiles | the capacity ledger ([shared-pole model](shared_pole_model.md), byte model) | before allocating, when a stage and its named concurrent stages exceed the budget |
-| static / GN-PPM screening | χ₀ τ-scan: whole-spin `≈3·G_tile`; when that exceeds the target the spin pairs stream ([§ spin pairs](#spin-pair-streaming)), four `(a,b)` blocks `16·N_k·μ²/P` (Gv, Gc and their transforms) plus the parents unfolded to full k (`M_face·N_k/n_par` or `M_axis·N_k/n_par`) and the `16·N_k·μ²/P` accumulator; unchunked over q | nothing | — |
+| static / GN-PPM screening | the χ₀ node ([§ Green-side](#the-green-side-stages)); the GN fit's q block (XLA's compiled footprint of one q) | `price_chi0_node` (a price, no choice); `_gn_ppm_fit_q_block` against the room | `GATE gn_ppm_fit_capacity` |
+| Σ(τ) sweep | the resident pole fields and W prep, then one pass ([§ Green-side](#the-green-side-stages)) | `sigma_spin_block` against the room | — |
+| matrix-element sweep (V_H, four-current) | the step's slabs, and FFT boxes `(2 + 2·n_comp)·n_s·N_r·16` per band of a band-layout operator | `mtxel_sweep.plan_sweep`: bands in the fewest chunks that fit the room | — |
 | restart write | one sharded tile, `max(16·Q·μ²/P, 16·Q·μ·N_G/P)` (SlabIO writes per-rank hyperslabs) | — | — |
 
 Replicated per-process metadata (the TRS-augmented centroid permutation and
 lattice-wrap tables, `O(n_sym·μ)`; the q-folding tables, `O(N_k)`) is
 negligible at every size.
 
-The static and GN-PPM screening path (`gw.screening.compute_screening` → χ₀
-→ Dyson) has no planner. Its χ₀ scratch cannot be chunked over q, because the
-flat-k transform needs the whole k axis on every rank. The one schedulable
-term is bounded: a completed W of an earlier screening role is spilled to host
-(`common.collectives.spill_to_host`) while a later role runs, and restored
-afterwards.
+The χ₀ node cannot be chunked over q, because the k-convolution needs the
+whole k axis on every rank. A completed W of an earlier screening role is
+spilled to host (`common.collectives.spill_to_host`) while a later role runs,
+and restored afterwards.
 
 ## Route G: every ζ fit
 
@@ -269,6 +269,20 @@ per batch against rule 1. All planners stay single-stage and generic.
    zeta-mubatch-capacity` names ψ(G) and the smallest batch. For V_q, more
    ranks, fewer centroids, or a smaller ζ sphere; `vq_g_chunk_size` shrinks
    only the panel workspace.
-5. **Compare with the run.** Define `γ = runtime peak / planner HWM`; `γ > 1`
-   is an under-estimate to investigate. `tools/profile_gw_xprof.py` captures
-   an XProf trace whose modules map onto the stages above.
+5. **Compare with the run.** `gwjax.out` prints MAJOR-STAGE DEVICE MEMORY:
+   each stage's device peak (max and min over ranks), the planner's price and
+   `γ = peak / price`, or "no planner", and the section that set the peak.
+   `γ > 1` is an under-estimate to investigate.
+
+## The per-stage receipt
+
+`peak_bytes_in_use` never resets, so a stage below an earlier high-water mark
+is invisible in it. The CUDA pool behind XLA's `cuda_async` allocator keeps
+`CU_MEMPOOL_ATTR_USED_MEM_HIGH`, which a reset sets back to the bytes in use.
+`runtime.xla_memory.pool_high_water` reads and resets it at every
+`common.timing` section boundary on the main thread (two driver calls), so
+every section has its own peak on every rank. A planner records its price
+with `common.gpu_utils.record_stage_price(stage, bytes, section=...)`: the
+live bytes plus what it plans. What the pool cannot see: NCCL and library
+workspaces outside it (2–3 GB per rank on A100), and work dispatched but not
+yet allocated at a boundary, which counts in the next section.
