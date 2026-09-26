@@ -232,7 +232,7 @@ def _operator(case, geom, extra):
     raise ValueError(case)
 
 
-def _run(case, ns, k_tile=None, use_scan=True, monkeypatch=None):
+def _run(case, ns, k_tile=None, use_scan=True, monkeypatch=None, band_chunk=None):
     mesh = _mesh()
     psi, gv, gmask, bidx, kvecs = _fixture(ns)
     rng = np.random.default_rng(3)
@@ -256,11 +256,12 @@ def _run(case, ns, k_tile=None, use_scan=True, monkeypatch=None):
             extra["op"] = four_current_potential_operator(
                 geom, extra["V_r"], rng.standard_normal((3, *GRID)),
                 charge_nspinor=2)
-        if k_tile is not None:
+        if k_tile is not None or band_chunk is not None:
             real = mtxel_sweep.plan_sweep
+            fix = {k: v for k, v in (("k_tile", k_tile), ("band_chunk", band_chunk))
+                   if v is not None}
             monkeypatch.setattr(
-                mtxel_sweep, "plan_sweep",
-                lambda g, o: real(g, o)._replace(k_tile=k_tile))
+                mtxel_sweep, "plan_sweep", lambda g, o: real(g, o)._replace(**fix))
         psi_pad = np.pad(psi, ((0, 0), (0, geom.nb - NB), (0, 0), (0, 0)))
         psi_j = jax.make_array_from_callback(
             psi_pad.shape, NamedSharding(mesh, band_sphere_spec()),
@@ -312,6 +313,16 @@ def test_sweep_matches_independent_reference(case, ns):
 def test_k_tiles_agree(case, k_tile, monkeypatch):
     """Every k tile computes the same matrix: tiling only batches."""
     got, ref, _, _ = _run(case, 2, k_tile=k_tile, monkeypatch=monkeypatch)
+    assert _rel(got[..., :NB, :NB], ref) <= RTOL
+
+
+@pytest.mark.mesh(4)
+@pytest.mark.parametrize("case,ns", [("vh", 2), ("four_current", 4)])
+def test_band_chunks_agree(case, ns, monkeypatch):
+    """Band chunks of a band-layout operator (2 of this rank's 3 bands, so one
+    chunk is padded) compute the same matrix as one pass: the bands are independent."""
+    got, ref, _, geom = _run(case, ns, band_chunk=2, monkeypatch=monkeypatch)
+    assert geom.nb // 4 == 3
     assert _rel(got[..., :NB, :NB], ref) <= RTOL
 
 

@@ -457,28 +457,27 @@ def _plan_vq_group(tiles, *, rows, n_q: int, ngkmax: int, mesh_xy: Mesh,
     n_tiles = -(-int(n_q) // q_max)
     q_tile = -(-int(n_q) // n_tiles)
     priced = resident + work + q_tile * per_q
-    from common.gpu_utils import record_stage_price
-    record_stage_price("V_q, vq_tile_bytes", priced)
     return q_tile, g, dict(resident=resident, per_q=per_q, work=work,
                            priced=priced, n_tiles=n_tiles,
                            host_staged=q_tile * host_per_q)
 
 
+#: The share of the stage room a V_q plan fills (the margin for what the price omits).
+_VQ_ROOM_FRACTION = 0.9
+
+
 def _vq_budget_bytes(budget_bytes: float | None) -> float:
     """The per-rank V_q device budget, agreed across processes (the minimum).
 
-    ``None`` measures it live: ``common.gpu_utils.get_device_memory_info``
-    ``budget_gb`` (0.9 of this device's currently available memory), the
-    same rule the gw_init ``V_q budget`` line prints.  The q-tile count sets
-    how many collective reads every rank issues, so the value must be the
-    same on every rank; the minimum is the only safe agreement.
+    ``None`` is the stage room: 0.9 of the run's budget (``memory_per_device_gb``)
+    less the live bytes (``common.gpu_utils.device_room_bytes``, already the
+    minimum over processes).  The q-tile count sets how many collective reads
+    every rank issues, so the value must be the same on every rank.
     """
-    from common.gpu_utils import get_device_memory_info, minimum_process_budget_gb
+    from common.gpu_utils import device_room_bytes, minimum_process_budget_gb
     if budget_bytes is None:
-        local_gb = float(get_device_memory_info()['budget_gb'])
-    else:
-        local_gb = float(budget_bytes) / 1e9
-    return minimum_process_budget_gb(local_gb) * 1e9
+        return _VQ_ROOM_FRACTION * float(device_room_bytes())
+    return minimum_process_budget_gb(float(budget_bytes) / 1e9) * 1e9
 
 
 def _make_read_q_tile(zeta_loader, n_rmu_padded: int, mesh_xy: Mesh):
@@ -747,6 +746,8 @@ def _compute_V_q_g_flat_tiles(
         s['v'] = v
 
     # ---- G panel and q-tile from the V_q budget ------------------------
+    from common.gpu_utils import device_budget_bytes, device_room_bytes, record_stage_price
+    live = device_budget_bytes() - float(device_room_bytes())
     budget = _vq_budget_bytes(budget_bytes)
     # A ζ q-tile read stages each rank's slab in its phdf5 file context's host
     # buffer (``ctx->read_buf``); the context retires a buffer above 32 MiB
@@ -758,6 +759,7 @@ def _compute_V_q_g_flat_tiles(
               n_sub=n_sub if s['one_leg'] else 0) for s in specs],
         rows=mu_pad, n_q=n_q_ibz, ngkmax=ngkmax, mesh_xy=mesh_xy,
         g_chunk=g_chunk, budget_bytes=budget, host_budget_bytes=host_budget)
+    record_stage_price(f"V_q, vq_tile_bytes q_tile={q_tile}", live + priced['priced'])
     n_chunks = -(-ngkmax // g_chunk)
     n_tiles = int(priced['n_tiles'])
     if verbose and jax.process_index() == 0:
