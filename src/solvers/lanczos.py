@@ -5,13 +5,13 @@ Finds the lowest n_eig eigenvalues of a Hermitian operator H given only
 a callable matvec.  No physics knowledge — works for any Hermitian
 eigenproblem.
 
-Four variants:
+Three variants:
   - simple_lanczos_eig:              Python-loop, full reorthogonalization
-  - lanczos_eig_jit:                 lax.fori_loop, partial reorth (JIT-able)
-  - block_lanczos_eig_jit:           Block Lanczos in lax.fori_loop
+  - block_lanczos_eig_jit:           Block Lanczos in lax.fori_loop (any
+                                     block size; block_size=1 is single-vector)
   - block_lanczos_eig_jit_converged: as above, Ritz-stability exit
 
-The three JIT-able variants reorthogonalise by **batched classical
+The two JIT-able variants reorthogonalise by **batched classical
 Gram-Schmidt, applied twice** (``cgs2``) — every overlap of a sweep in one
 matrix product, so two collectives per iteration instead of ``j+1``.  It is
 the only route; the basis window ``--n-reorth`` selects is independent of it —
@@ -26,8 +26,9 @@ OUTPUT rather than on a construction tile.
 
 Usage
 -----
-    from solvers.lanczos import lanczos_eig_jit
-    eigenvalues, eigenvectors = lanczos_eig_jit(matvec, n=1000, n_eig=10)
+    from solvers.lanczos import block_lanczos_eig_jit
+    eigenvalues, eigenvectors = block_lanczos_eig_jit(
+        matvec_block, n=1000, n_eig=10, block_size=1)
 """
 from __future__ import annotations
 
@@ -306,7 +307,7 @@ def alpha_herm_sink():
     Wrap the TRACE of a jit whose module must stay persistable::
 
         with alpha_herm_sink() as sink:
-            evs, evecs = lanczos_eig_jit(matvec, n, ...)
+            evs, evecs = block_lanczos_eig_jit(matvec, n, ...)
         labels, payload = split_alpha_sink(sink)
         return evs, evecs, payload          # payload joins the jit's outputs
 
@@ -530,46 +531,24 @@ def _announce_reorth(name: str, max_iter: int, n_reorth: int) -> None:
 
 
 # ---------------------------------------------------------------------------
-# THE WINDOW INCLUDES THE CURRENT VECTOR q_j — and why that is not optional
+# THE WINDOW INCLUDES THE CURRENT BLOCK Q_j
 # ---------------------------------------------------------------------------
-# The recurrence subtracts only the REAL part of the current projection:
+# The reorth window is ``{i : max(0, j - n_reorth) <= i <= j}``: the current
+# block is projected out again after the three-term step.  The block
+# recurrence subtracts the full complex ``alpha_j = Q_j^H Z``, so in exact
+# arithmetic that projection is a no-op; it removes the round-off component
+# left along ``Q_j``.  It costs nothing: ``cgs2`` computes all overlaps in one
+# all-reduce and masks, so one more selected slot is free.
 #
-#     alpha_c = <q_j, z>            # complex
-#     alpha_j = alpha_c.real        # only this drives the recurrence
-#     z      -= alpha_j * q_j       # ... so i*Im(alpha_c) is LEFT IN z
+# History: the retired single-vector kernel subtracted only ``Re alpha`` and
+# left ``i*Im alpha`` in ``z``; with an ``i < j`` window that put a
+# ``4.2009e-06`` floor under the Ritz-vector orthogonality of the Si record
+# deck, and widening the window to ``i <= j`` removed it (2026-08-08,
+# ``RITZ_ORTHO_PROBE.md``).
 #
-# ``alpha`` has to stay real — it is the diagonal of a real symmetric
-# tridiagonal ``T`` — and ``Im alpha_c`` is exactly what the alpha-Hermiticity
-# invariant above reports.  But leaving that component in ``z`` means
-# ``<q_j, z> = i*Im(alpha_c)`` exactly, and ``q_{j+1} = z / beta_j``, so the
-# Krylov basis acquires
-#
-#     |<q_j, q_{j+1}>|  ~=  |Im alpha_j| / beta_j
-#
-# on its first superdiagonal.  Until 2026-08-08 the reorth window stopped at
-# ``i < j``, so ``q_j`` was THE ONE DIRECTION NO SWEEP REMOVED
-# (``max|V^H V - I| = 4.2009e-06`` on the Si record deck).
-#
-# Widening the window to ``i <= j`` closes it.  Measured on that deck (P=4,
-# 200 iterations, full reorth; ``RITZ_ORTHO_PROBE.md``):
-#
-#     max|V^H V - I|   4.2009e-06  ->  ~1e-15    (machine precision)
-#
-# THE COST IS ZERO: ``cgs2`` computes ``h = Q^H z`` over ALL slots in one
-# all-reduce and then masks, so selecting one more entry of an
-# already-computed ``h`` costs nothing at all.
-#
-# IN EXACT ARITHMETIC THIS CHANGES NOTHING.  For a Hermitian ``H``,
-# ``Im alpha_c == 0`` and the ``i == j`` projection is a no-op — it is
-# reorthogonalisation in the ordinary sense, removing a component that is zero
-# on paper and nonzero in floating point.  What it costs on a NON-Hermitian
-# operator is proportional to that operator's defect: on the Si record deck it
-# moved the twenty excitons by 4.2e-10 eV while the mini-BZ Coulomb head bug
-# was live, and by 2.1e-14 eV once that bug was fixed.
-#
-# ``_REORTH_INCLUDE_CURRENT`` exists ONLY so the gate that pins this can drive
-# the pre-2026-08-08 window in-process and prove it goes red
-# (``tests/test_lanczos_reorth_routes.py``).  Production never changes it.
+# ``_REORTH_INCLUDE_CURRENT`` exists so
+# ``tests/test_lanczos_reorth_routes.py`` can drive the narrow window
+# in-process.  Production never changes it.
 _REORTH_INCLUDE_CURRENT = True
 
 
@@ -588,23 +567,6 @@ def _reorth_window(j, n_slots: int, n_reorth: int):
     idx = jnp.arange(int(n_slots))
     upper = idx <= j if _REORTH_INCLUDE_CURRENT else idx < j
     return jnp.logical_and(upper, idx >= j - int(n_reorth))
-
-
-def _cgs2_vec(Q, z, sel):
-    """Two classical Gram-Schmidt passes against a single-vector basis.
-
-    ``Q`` ``(n, m)`` — stored basis; columns past the current iteration are
-    exactly zero.  ``z`` ``(n,)``.  ``sel`` ``(m,)`` bool — the window mask.
-
-    TWO collectives total, one per pass, each an ``(m,)`` all-reduce.  The
-    second contraction is over the replicated column axis and emits none.
-    """
-    def _pass(zz):
-        # Contracts the SHARDED row axis -> exactly one psum, of shape (m,).
-        h = jnp.tensordot(jnp.conj(Q), zz, axes=([0], [0]))
-        h = jnp.where(sel, h, jnp.zeros((), dtype=h.dtype))
-        return zz - jnp.tensordot(Q, h, axes=([1], [0]))
-    return _pass(_pass(z))
 
 
 def _cgs2_block(Q_all, Z, sel):
@@ -813,140 +775,6 @@ def simple_lanczos_eig(
     return eigenvalues, eigenvectors
 
 
-def lanczos_eig_jit(
-    matvec: Callable[[jax.Array], jax.Array],
-    n: int,
-    n_eig: int = 20,
-    max_iter: int = 100,
-    seed: int = 42,
-    n_reorth: int = FULL_REORTH,
-    subspace_plan=None,
-    vector_shape=None,
-    structured_vectors=False,
-) -> tuple[jax.Array, jax.Array]:
-    """JIT-compiled Lanczos using lax.fori_loop.
-
-    ``subspace_plan`` declares active algebra and vector placement; distributed
-    callers resolve it before their outer JIT. Its capacity is ``max_iter+1``
-    after the dimension clamp. See ``docs/services/lanczos.md``.
-
-    Parameters
-    ----------
-    matvec : (n,) -> (n,)
-        Hermitian matvec on flat vectors.
-    n : int
-        Vector dimension.
-    n_eig : int
-        Number of lowest eigenvalues to compute.
-    max_iter : int
-        Maximum Lanczos iterations (fixed for JIT).
-    seed : int
-        Random seed for initial vector.
-    n_reorth : int
-        Window size for partial reorthogonalization: the ``n_reorth``
-        PREVIOUS basis vectors.  The current vector ``q_j`` is always
-        projected out as well, at no collective cost — see the route
-        section, "THE WINDOW INCLUDES THE CURRENT VECTOR q_j".
-        Default ``FULL_REORTH`` (-1) = the whole basis; a finite window is a
-        deliberate memory/time trade, not something you should get by not
-        choosing.  See "Reorthogonalisation WINDOW" above for the measurement.
-
-    Returns
-    -------
-    eigenvalues : (n_eig,)
-    eigenvectors : (n_eig, n)
-    """
-    # Krylov-exhaustion clamp, then the sentinel — in that order, because the
-    # window resolves against the depth the loop can actually reach.
-    max_iter = max(1, min(int(max_iter), int(n)))
-    subspace_plan = _resolve_subspace_plan(subspace_plan, max_iter + 1, n_eig)
-    vector_shape = (int(n),) if vector_shape is None else tuple(vector_shape)
-    if int(np.prod(vector_shape)) != int(n):
-        raise ValueError('Lanczos vector_shape must contain n elements')
-    n_reorth = resolve_n_reorth(n_reorth, max_iter)
-    _announce_reorth("lanczos_eig_jit", max_iter, n_reorth)
-    key = jax.random.PRNGKey(seed)
-    k1, k2 = jax.random.split(key)
-
-    q0 = jax.random.normal(k1, (n,), dtype=jnp.float64)
-    q0 = q0 + 1j * jax.random.normal(k2, (n,), dtype=jnp.float64)
-    if structured_vectors:
-        q0 = q0.reshape(vector_shape)
-    q0 = q0 / jnp.sqrt(jnp.sum(jnp.abs(q0)**2))
-
-    # +1 column so the last iteration does not overwrite Q[:, max_iter-1] (P1).
-    row_basis = subspace_plan is not None
-    Q = jnp.zeros(((max_iter + 1, *vector_shape) if row_basis else (n, max_iter + 1)),
-                  dtype=jnp.complex128)
-    Q = Q.at[0].set(q0.reshape(vector_shape)) if row_basis else Q.at[:, 0].set(q0)
-    alpha = jnp.zeros((max_iter,), dtype=jnp.float64)
-    beta = jnp.zeros((max_iter,), dtype=jnp.float64)
-    # |Im α_j| — carried alongside α, checked once after the loop.  Two extra
-    # float64 slots of carry; see the module header for the cost argument.
-    alpha_im = jnp.zeros((max_iter,), dtype=jnp.float64)
-
-    def lanczos_step(j, carry):
-        Q, alpha, beta, alpha_im, q_prev = carry
-        z = matvec(q_prev)
-
-        # ONE complex dot product.  ``.real`` drives the recurrence; ``.imag``
-        # is the Hermitian-form residual that used to be discarded here.
-        alpha_c = jnp.sum(jnp.conj(q_prev) * z)
-        alpha_j = alpha_c.real
-        alpha = alpha.at[j].set(alpha_j)
-        alpha_im = alpha_im.at[j].set(jnp.abs(alpha_c.imag))
-
-        z = z - alpha_j * q_prev
-        q_prev_prev = (Q[jnp.maximum(j - 1, 0)].reshape(q_prev.shape) if row_basis
-                       else Q[:, jnp.maximum(j - 1, 0)])
-        beta_prev = jnp.where(j > 0, beta[j - 1], 0.0)
-        z = z - beta_prev * q_prev_prev
-
-        # Two batched passes, two collectives — see the route section at the
-        # top of this module.
-        if row_basis:
-            first = jnp.maximum(0, j - n_reorth)
-            stop = j + int(_REORTH_INCLUDE_CURRENT)
-            z = subspace_plan.orthogonalize(
-                Q, z.reshape(1, *vector_shape), stop - first,
-                start=first).reshape(q_prev.shape)
-        else:
-            z = _cgs2_vec(Q, z, _reorth_window(j, max_iter + 1, n_reorth))
-
-        beta_j = jnp.sqrt(jnp.sum(jnp.abs(z)**2))
-        beta = beta.at[j].set(beta_j)
-
-        q_next = z / jnp.maximum(beta_j, 1e-15)
-        Q = (Q.at[j + 1].set(q_next.reshape(vector_shape)) if row_basis
-             else Q.at[:, j + 1].set(q_next))
-
-        return (Q, alpha, beta, alpha_im, q_next)
-
-    init_carry = (Q, alpha, beta, alpha_im, q0)
-    Q, alpha, beta, alpha_im, _ = lax.fori_loop(
-        0, max_iter, lanczos_step, init_carry)
-
-    _emit_alpha_herm("lanczos_eig_jit", alpha_im, jnp.abs(alpha))
-
-    T = jnp.diag(alpha)
-    off_diag = beta[:-1]
-    T = T + jnp.diag(off_diag, 1) + jnp.diag(off_diag, -1)
-
-    if row_basis:
-        T = jnp.pad(T.astype(jnp.complex128), ((0, 1), (0, 1)))
-        return _planned_ritz(subspace_plan, Q, T, max_iter, n_eig, structured_vectors)
-
-    evals_T, vecs_T = jnp.linalg.eigh(T)
-    idx = jnp.argsort(evals_T)[:n_eig]
-    eigenvalues = evals_T[idx]
-
-    eigenvectors = (Q[:, :max_iter] @ vecs_T[:, idx]).T
-    norms = jnp.linalg.norm(eigenvectors, axis=1, keepdims=True)
-    eigenvectors = eigenvectors / jnp.maximum(norms, 1e-15)
-
-    return eigenvalues, eigenvectors
-
-
 def _build_block_tridiag(alpha_all, beta_all, max_iter: int, bs: int,
                         *, capacity=None, active_blocks=None):
     """Build the block-tridiagonal T from per-iter (bs,bs) blocks.
@@ -1031,7 +859,7 @@ def block_lanczos_eig_jit(
         Window size (in *blocks*) for partial reorthogonalisation: the
         ``n_reorth`` PREVIOUS basis blocks.  The current block ``Q_j`` is
         always projected out as well, at no collective cost -- see the route
-        section, "THE WINDOW INCLUDES THE CURRENT VECTOR q_j".
+        section, "THE WINDOW INCLUDES THE CURRENT BLOCK Q_j".
         Default ``FULL_REORTH`` (-1) = the whole basis.
 
     Krylov-exhaustion clamp: the Krylov space cannot exceed the vector

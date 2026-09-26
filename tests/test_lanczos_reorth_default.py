@@ -67,8 +67,7 @@ def test_the_shipped_defaults_are_full_reorth():
     worse answer has no way to notice from the outside.
     """
     import inspect
-    for fn in (LZ.lanczos_eig_jit, LZ.block_lanczos_eig_jit,
-               LZ.block_lanczos_eig_jit_converged):
+    for fn in (LZ.block_lanczos_eig_jit, LZ.block_lanczos_eig_jit_converged):
         default = inspect.signature(fn).parameters["n_reorth"].default
         assert default == LZ.FULL_REORTH, (
             f"{fn.__name__} defaults to n_reorth={default!r}, not FULL_REORTH")
@@ -92,6 +91,12 @@ def test_resolve_n_reorth_maps_the_sentinel_and_none():
         assert LZ.resolve_n_reorth(LZ.resolve_n_reorth(-1, depth), depth) == depth
 
 
+def _lanczos(mv, n, **kw):
+    """The single-vector Lanczos: the block kernel at block_size=1."""
+    return LZ.block_lanczos_eig_jit(lambda V: mv(V[0])[None], n, block_size=1,
+                                    **kw)
+
+
 # --------------------------------------------------------------------------
 # THE RED TWIN for the semantic trap
 # --------------------------------------------------------------------------
@@ -109,7 +114,7 @@ def test_sentinel_is_resolved_before_both_consumers(capsys):
     mv = lambda v: H @ v
 
     capsys.readouterr()
-    jax.block_until_ready(LZ.lanczos_eig_jit(
+    jax.block_until_ready(_lanczos(
         mv, n, n_eig=4, max_iter=max_iter, n_reorth=LZ.FULL_REORTH,
         seed=3))
     line = capsys.readouterr().out
@@ -142,8 +147,8 @@ def test_the_default_and_an_explicit_full_window_agree(capsys):
     n, max_iter = 64, 24
     H, _ = _hermitian(n)
     mv = lambda v: H @ v
-    ev_default, _ = LZ.lanczos_eig_jit(mv, n, n_eig=5, max_iter=max_iter, seed=3)
-    ev_explicit, _ = LZ.lanczos_eig_jit(
+    ev_default, _ = _lanczos(mv, n, n_eig=5, max_iter=max_iter, seed=3)
+    ev_explicit, _ = _lanczos(
         mv, n, n_eig=5, max_iter=max_iter, n_reorth=max_iter, seed=3)
     assert np.array_equal(np.asarray(ev_default), np.asarray(ev_explicit))
 
@@ -174,8 +179,8 @@ def test_the_default_beats_a_short_window():
 
     def _orth(n_reorth):
         kw = {} if n_reorth is None else {"n_reorth": n_reorth}
-        _, V = LZ.lanczos_eig_jit(mv, n, n_eig=max_iter, max_iter=max_iter,
-                                  seed=3, **kw)
+        _, V = _lanczos(mv, n, n_eig=max_iter, max_iter=max_iter,
+                        seed=3, **kw)
         V = np.asarray(V)
         G = V.conj() @ V.T
         return float(np.max(np.abs(G - np.eye(G.shape[0]))))
@@ -206,7 +211,7 @@ def test_krylov_clamp_caps_at_the_vector_space(capsys):
     mv = lambda v: H @ v
     capsys.readouterr()
     ev, _ = jax.block_until_ready(
-        LZ.lanczos_eig_jit(mv, n, n_eig=3, max_iter=64, seed=3))
+        _lanczos(mv, n, n_eig=3, max_iter=64, seed=3))
     line = capsys.readouterr().out
     if jax.process_index() == 0:
         assert f"max_iter={n}" in line, (

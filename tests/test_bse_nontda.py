@@ -105,15 +105,17 @@ def test_block_lanczos_eigenvector_residual_p1():
 
 
 def test_lanczos_jit_final_slot_shapes_p1():
-    """P1: the single-vector and converged block variants also carry the +1 slot
-    and return correctly-shaped, correct eigenpairs on a synthetic Hermitian op."""
-    from solvers.lanczos import lanczos_eig_jit, block_lanczos_eig_jit_converged
+    """P1: the block kernel at block_size=1 and the converged block variant carry
+    the +1 slot and return correctly-shaped, correct eigenpairs on a synthetic
+    Hermitian op."""
+    from solvers.lanczos import block_lanczos_eig_jit, block_lanczos_eig_jit_converged
     rng = np.random.default_rng(1); n = 30
     G = rng.standard_normal((n, n)) + 1j * rng.standard_normal((n, n))
     H = 0.5 * (G + G.conj().T); Hj = jnp.asarray(H)
     ref = np.sort(np.linalg.eigvalsh(H))[:3]
 
-    ev, evec = lanczos_eig_jit(lambda v: Hj @ v, n, n_eig=3, max_iter=n, n_reorth=n)
+    ev, evec = block_lanczos_eig_jit(lambda V: (Hj @ V.T).T, n, n_eig=3,
+                                     block_size=1, max_iter=n, n_reorth=n)
     ev = np.asarray(jax.device_get(ev))
     assert evec.shape == (3, n)
     assert np.allclose(np.sort(ev.real), ref, atol=1e-8)
@@ -181,21 +183,21 @@ def _herm_op(n=24, seed=7):
 
 def _krylov_pair(n=24):
     """(sunk, unsunk) — the same Krylov solve with and without the sink."""
-    from solvers.lanczos import (alpha_herm_sink, lanczos_eig_jit,
+    from solvers.lanczos import (alpha_herm_sink, block_lanczos_eig_jit,
                                  split_alpha_sink)
     labels_box: list = []
 
     def sunk(Hm):
         with alpha_herm_sink() as sink:
-            evs, _ = lanczos_eig_jit(lambda v: Hm @ v, n, n_eig=3,
-                                     max_iter=n, n_reorth=n)
+            evs, _ = block_lanczos_eig_jit(lambda V: (Hm @ V.T).T, n, n_eig=3,
+                                           block_size=1, max_iter=n, n_reorth=n)
         labels, payload = split_alpha_sink(sink)
         labels_box[:] = labels
         return evs, payload
 
     def unsunk(Hm):          # the RED TWIN: the pre-fix shape
-        evs, _ = lanczos_eig_jit(lambda v: Hm @ v, n, n_eig=3,
-                                 max_iter=n, n_reorth=n)
+        evs, _ = block_lanczos_eig_jit(lambda V: (Hm @ V.T).T, n, n_eig=3,
+                                       block_size=1, max_iter=n, n_reorth=n)
         return evs
 
     return sunk, unsunk, labels_box
