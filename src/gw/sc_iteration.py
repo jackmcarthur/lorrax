@@ -6241,8 +6241,8 @@ def _interband_commutator_head_velocity(
     ``v + [DeltaH, W]`` (``qsgw_head.interband_commutator_velocity``), plus
     one record line: the valence-conduction share of the correction per
     axis, the largest cross-gap mixing ``max_k ||U_VC||_F`` (the head's
-    error is first order in it), the excluded degenerate pairs and the
-    smallest kept energy difference.
+    error is first order in it) and the direct DFT gap.  A closed gap
+    refuses (``GATE sc_head_interband_commutator_gap``).
     """
     from .qsgw_head import interband_commutator_velocity
 
@@ -6252,19 +6252,36 @@ def _interband_commutator_head_velocity(
     velocity, (num, den, excluded, min_kept) = interband_commutator_velocity(
         pt.velocity_dft_cart, delta_active, tail_diagonal,
         inputs.wfns_dft.enk[:, :nb_storage],
-        nb_logical=int(pt.nb_logical), n_occ=n_occ, mesh=inputs.mesh_xy)
+        nb_logical=int(pt.nb_logical), n_occ=n_occ, mesh=inputs.mesh_xy,
+        collapsed_position=pt.collapsed_position,
+        collapsed_axes=pt.collapsed_axes,
+        reciprocal_lattice_cart=pt.reciprocal_lattice_cart)
     na = int(U_full.shape[-1])
     mixing = (float(jnp.max(jnp.sqrt(jnp.sum(
         jnp.abs(U_full[:, :n_occ, n_occ:]) ** 2, axis=(1, 2)))))
         if n_occ < na else 0.0)
+    if int(excluded) != 0:
+        raise ValueError(
+            "GATE sc_head_interband_commutator_gap: "
+            f"{int(excluded)} valence-conduction DFT pairs are degenerate "
+            "within gw.degen_average.TOL_DEGENERACY_RY.\n"
+            f"  got:  n_occ = {n_occ}; the direct DFT gap closes at some k\n"
+            "  want: E_c - E_v > 1e-6 Ry at every k of the head manifold\n"
+            "  why:  W_vc = v_vc/(E_v - E_c) is the cross-gap position "
+            "operator; a closed gap is a metal, which this head does not "
+            "describe\n"
+            "  doc:  docs/self_consistency.md, 'Interband-commutator head'")
     ratio = np.sqrt(np.asarray(num) / np.maximum(np.asarray(den), 1e-300))
+    exact_axes = ",".join(f"b{a + 1}" for a in pt.collapsed_axes)
     _record_sc(
         inputs,
         "    SC head: interband commutator |[dH,W]_vc|/|v_vc| x/y/z = "
         + "/".join(f"{r:.4e}" for r in ratio)
-        + f"; cross-gap mixing max_k|U_VC|_F = {mixing:.3e}; "
-        f"degenerate pairs excluded = {int(excluded)}, "
-        f"smallest kept |dE| = {float(min_kept) * 13.6056980659e3:.3f} meV")
+        + f"; cross-gap mixing theta = max_k|U_VC|_F = {mixing:.3e} "
+        "(periodic-axis head error O(theta), ~theta/4 in S_aa on MoS2)"
+        + (f"; collapsed axis {exact_axes} exact (position operator)"
+           if exact_axes else "")
+        + f"; direct DFT gap {float(min_kept) * 13.6056980659:.4f} eV")
     return velocity
 
 
@@ -6506,8 +6523,8 @@ def load_head_velocity_source(
         print_fn(
             "  SC head: interband commutator on the exact DFT velocity from "
             f"{pt_path} (nb={source.nb_logical}); each map adds "
-            "[DeltaH, W], W_ml = v_ml/(E_m - E_l), with no links and no k "
-            "stencil (insulators; pairs within 1e-6 Ry excluded)")
+            "[DeltaH, W], W_vc = v_vc/(E_v - E_c) across the gap only, "
+            "with no links and no k stencil (insulators)")
         return source
 
     _refuse_unsupported_link_stencil(

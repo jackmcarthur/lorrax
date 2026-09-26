@@ -927,6 +927,12 @@ class InterbandCommutatorHeadData:
     velocity_dft_cart: jax.Array
     nb_logical: int
     reciprocal_lattice_cart: np.ndarray
+    #: ``(3, nk, nb_s, nb_s)`` reduced position operator ``Z_a = <m|b_a.r|n>``
+    #: of the collapsed (one-point) k axes, zero elsewhere; ``None`` on a
+    #: grid with no collapsed axis.  Along such an axis the head uses it
+    #: exactly (``-i[Z_a, DeltaH]``) instead of the cross-gap commutator.
+    collapsed_position: object = None
+    collapsed_axes: tuple = ()
     forward_links: None = None
     forward_neighbors: None = None
     validation: None = None
@@ -944,14 +950,33 @@ def load_interband_commutator_head(
     the stamp refuses here.  Every other provenance check is
     :func:`load_dft_velocity_head`'s.
     """
+    from common.parallel_transport import band_storage_extent, collapsed_axes
+    from file_io.parallel_transport import COLLAPSED_POSITION_DATASET
     from file_io.slab_io import SlabIO
 
+    axes = tuple(int(a) for a in collapsed_axes(wfn.kgrid)) if wfn is not None else ()
+    position = None
     with SlabIO(path, mode="r", mesh=mesh) as io:
         try:
             vnl_included = int(io.read_small("vnl_included", dtype=np.int32))
         except (KeyError, RuntimeError, OSError, ValueError) as exc:
             vnl_included = None
             detail = f"{type(exc).__name__}: {exc}"
+        if vnl_included == 1 and axes:
+            nb_storage = band_storage_extent(mesh, int(meta.b_id_4_user))
+            try:
+                position = io.read_slab(
+                    COLLAPSED_POSITION_DATASET,
+                    shape=(3, int(meta.nk_tot), nb_storage, nb_storage),
+                    partition_spec=P(None, None, "x", "y"))
+            except (KeyError, RuntimeError, OSError, ValueError) as exc:
+                raise ValueError(
+                    f"GATE pt_collapsed_axis_artifact: {path}: the k grid "
+                    f"{tuple(int(n) for n in wfn.kgrid)} has a collapsed axis "
+                    f"but {COLLAPSED_POSITION_DATASET} could not be read "
+                    f"({type(exc).__name__}: {exc}); regenerate with "
+                    "get_dipole_mtxels --parallel-transport-out "
+                    "--parallel-transport-velocity-only") from exc
     if vnl_included != 1:
         got = ("no vnl_included stamp (" + detail + ")"
                if vnl_included is None else f"vnl_included = {vnl_included}")
@@ -973,6 +998,8 @@ def load_interband_commutator_head(
         velocity_dft_cart=base.velocity_dft_cart,
         nb_logical=int(base.nb_logical),
         reciprocal_lattice_cart=base.reciprocal_lattice_cart,
+        collapsed_position=position,
+        collapsed_axes=axes,
     )
 
 
@@ -995,16 +1022,23 @@ def _interband_commutator_kernel(
     tol = float(TOL_DEGENERACY_RY)
 
     @jax.jit
-    def _kernel(v, delta_active, tail_diagonal, e_dft):
+    def _kernel(v, delta_active, tail_diagonal, e_dft, mix_w, mix_z, z_pos):
         nbs = int(v.shape[-1])
         band = jnp.arange(nbs)
         live = band < nbl
         de = jax.lax.with_sharding_constraint(
             e_dft[:, :, None] - e_dft[:, None, :], tile_sharding)
-        pair = live[:, None] & live[None, :] & (band[:, None] != band[None, :])
+        # Cross-gap pairs only: valence-conduction and conduction-valence.
+        occupied = band < nv
+        pair = (live[:, None] & live[None, :]
+                & (occupied[:, None] != occupied[None, :]))
         keep = pair[None] & (jnp.abs(de) > tol)
         W = jnp.where(keep[None], v / jnp.where(keep, de, 1.0)[None],
                       jnp.zeros((), dtype=v.dtype))
+        # Collapsed reduced axes take the exact position operator:
+        # W_red = B W_cart, W_red[a] = i Z_a there, W_cart = B^-1 W_red.
+        W = (jnp.einsum("ij,j...->i...", mix_w, W)
+             + jnp.einsum("ij,j...->i...", mix_z, 1j * z_pos))
         W = jax.lax.with_sharding_constraint(W, out_sharding)
         # [DeltaH, W] with DeltaH = active block (+) diagonal tail.
         t = jnp.where(band[None, :] >= na, tail_diagonal, 0.0)
@@ -1035,27 +1069,42 @@ def interband_commutator_velocity(
     nb_logical: int,
     n_occ: int,
     mesh: Mesh,
+    collapsed_position=None,
+    collapsed_axes=(),
+    reciprocal_lattice_cart=None,
 ):
     r"""QSGW head velocity ``v + [DeltaH, W]`` in the DFT basis, no links.
 
-    ``W_ml = v_ml/(E_m - E_l)`` is ``i r_ml``, the interband position
-    operator of the DFT Hamiltonian, so ``[H_DFT, W] = v`` off the diagonal
-    and ``-i[r, DeltaH] = [DeltaH, W]``.  Blount's decomposition of the
-    covariant derivative, ``D DeltaH = -i[A^inter, DeltaH] + D^intra DeltaH``,
-    shows what this drops: the valence-conduction block of the dropped
-    ``D^intra DeltaH`` holds only the cross-gap block ``DeltaH_VC``.  The
-    head is therefore exact for any ``DeltaH`` that does not mix valence and
-    conduction (a band-diagonal ``DeltaH`` gives the renormalized velocity
-    ``v_mn (E^QP_m - E^QP_n)/(E_m - E_n)``), and its error is first order in
+    ``W_vc = v_vc/(E_v - E_c)`` is ``i r_vc``, the cross-gap position
+    operator of the DFT Hamiltonian (valence ``v < n_occ <= c``), so
+    ``[H_DFT, W] = v`` on the valence-conduction blocks and
+    ``-i[r^VC, DeltaH] = [DeltaH, W]``.  Split the covariant derivative by
+    occupation class, ``D DeltaH = -i[A^VC, DeltaH] + D^class DeltaH``.  The
+    valence-conduction block of ``D^class DeltaH`` holds only the cross-gap
+    block ``DeltaH_VC``, so the head is exact for any ``DeltaH`` that does
+    not mix valence and conduction (a band-diagonal ``DeltaH`` gives
+    ``v_vc (E^QP_v - E^QP_c)/(E_v - E_c)``), and its error is first order in
     the cross-gap mixing.  No sum over states is truncated: ``DeltaH`` is
     the active block plus a diagonal tail, so every ``W`` element it meets
     is inside the head manifold.
 
-    Degenerate manifolds: pairs with ``|E_m - E_l| <= TOL_DEGENERACY_RY``
-    (``gw.degen_average``, 1e-6 Ry) and the diagonal are EXCLUDED.  Their
-    connection is gauge-dependent and pairs with the k derivative of
-    ``DeltaH`` that no stencil-free route forms; it is zero when ``DeltaH``
-    is constant on the multiplet.
+    Degenerate and near-degenerate manifolds: every same-class pair is
+    EXCLUDED, not only exact multiplets.  Inside a class the interband
+    ``W`` has no gap below it: near-degenerate pairs make it arbitrarily
+    large, and the k derivative of ``DeltaH`` that would cancel it has no
+    stencil-free form.  Excluding pairs within ``TOL_DEGENERACY_RY`` alone
+    left Si 6x6x6 SOC with a head 8.8x the link head (pairs at 0.19 meV);
+    the class rule has no tolerance and every denominator is at least the
+    direct gap.  A cross-gap pair within ``TOL_DEGENERACY_RY``
+    (``gw.degen_average``) is a closed gap; it is excluded and counted, and
+    the SC caller refuses it.
+
+    Collapsed axes (a slab normal, a wire's transverse axes): there the
+    cell is not periodic and the connection is the stored position operator
+    ``Z_a`` (``common.parallel_transport.link_stencil_orders``), so the
+    reduced component ``a`` of ``W`` is ``i Z_a``, full and exact, and the
+    cross-gap rule is used only along the periodic axes:
+    ``W_cart = B^-1 [B W^VC with rows a replaced by i Z_a]``.
 
     Shapes: ``velocity_dft_cart`` (3, nk, nb_s, nb_s) ``P(None, None, x, y)``;
     ``delta_h_active`` (nk, na, na); ``tail_diagonal`` and
@@ -1065,7 +1114,8 @@ def interband_commutator_velocity(
 
     Returns ``(velocity, stats)``; ``stats`` holds, per Cartesian axis, the
     valence-conduction sums ``|[DeltaH, W]_vc|^2`` and ``|v_vc|^2``, the count
-    of excluded degenerate pairs, and the smallest kept ``|E_m - E_l|``.
+    of cross-gap pairs within ``TOL_DEGENERACY_RY``, and the smallest kept
+    ``|E_c - E_v|`` (the direct DFT gap of the manifold).
     """
     v = jnp.asarray(velocity_dft_cart, dtype=jnp.complex128)
     delta = jnp.asarray(delta_h_active, dtype=jnp.complex128)
@@ -1085,9 +1135,29 @@ def interband_commutator_velocity(
             "interband commutator head needs 0 < n_occ < nb_logical <= "
             f"nb_storage and na <= nb_storage; got n_occ={n_occ}, "
             f"nb_logical={nb_logical}, nb_storage={nbs}, na={na}")
+    axes = tuple(int(a) for a in collapsed_axes)
+    if axes:
+        if collapsed_position is None or reciprocal_lattice_cart is None:
+            raise ValueError(
+                "collapsed axes need the stored position operator and the "
+                "reciprocal lattice")
+        B = np.asarray(reciprocal_lattice_cart, dtype=np.float64)
+        Binv = np.linalg.inv(B)
+        sel = np.zeros((3, 3))
+        sel[axes, axes] = 1.0
+        mix_w = Binv @ (np.eye(3) - sel) @ B
+        mix_z = Binv @ sel
+        z_pos = jnp.asarray(collapsed_position, dtype=jnp.complex128)
+        if z_pos.shape != v.shape:
+            raise ValueError(
+                f"collapsed position {z_pos.shape} != velocity {v.shape}")
+    else:
+        mix_w, mix_z = np.eye(3), np.zeros((3, 3))
+        z_pos = jnp.zeros((3, 1, 1, 1), dtype=jnp.complex128)
     return _interband_commutator_kernel(
         mesh, nb_logical=int(nb_logical), nb_active=na, n_occ=int(n_occ),
-    )(v, delta, tail, e)
+    )(v, delta, tail, e, jnp.asarray(mix_w, dtype=jnp.complex128),
+      jnp.asarray(mix_z, dtype=jnp.complex128), z_pos)
 
 
 def _assemble_kernel(mesh: Mesh, nb_storage: int) -> Callable:
