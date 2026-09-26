@@ -283,8 +283,19 @@ def _conv_decode(T_b, psi_c_X, psi_v_Y, W_Rk, kconv, sqrt_nk):
     with one reduce-scatter per block after the scan — no collective per
     trial.  The (t, μ) contraction reads the k-leading U as a batched ZGEMM.
     """
-    U_b = kconv(T_b, W_Rk)                                        # in place on T_b
+    return _decode(kconv(T_b, W_Rk), psi_c_X, psi_v_Y, sqrt_nk)  # kconv in place on T_b
 
+
+def _decode(U_b, psi_c_X, psi_v_Y, sqrt_nk):
+    """``(WX)_b = (1/√Nk) Σ conj(ψ_c) ψ_v U_b``: (t, μ) first, then (s, ν).
+
+    Kept in this order on every route, including the outer load: contracting the
+    smaller band set first saves flops only once the decode is compute-bound (it
+    reads U at ~69% of HBM today, 1.96 against 1.98 ms either order on CrI3 8x8),
+    and the (s, ν)-first order moved Haydock ε₂ by 1.0e-6 against 4e-7 for this one
+    (BSEMAX, claims ledger).  This rank's (μ_loc, ν_loc) partial; the caller's one
+    reduce-scatter completes it.
+    """
     A = jnp.einsum("kctM,ktMsN->kcsN", jnp.conj(psi_c_X), U_b)  # (nk, c_full, ns, ν_loc)
     WXcv = jnp.einsum("kvsN,kcsN->cvk", psi_v_Y, A)             # (c_full, v_full, nk)
     return WXcv / sqrt_nk
@@ -299,9 +310,10 @@ def _conv_decode(T_b, psi_c_X, psi_v_Y, W_Rk, kconv, sqrt_nk):
 # its encode does ~7 flop per byte of T written.  The router's outer door
 # (``make_local_kconv_klead_outer``) forms T in shared memory on the convolution's load from
 # its two legs, ``T = Σ_K L[k,t,μ,K] R[k,K,s,ν]``, so T is never written or read: the encode
-# ZGEMM and one of the convolution's two T-sized HBM passes are gone.  Both the legs and the
-# decode contract over K = min(n_c, n_v) first (8.6 against 15.0 GFLOP per trial on CrI3, a
-# pure reordering).  U is unchanged (k-leading, the decode's batched ZGEMM reads it).
+# ZGEMM and one of the convolution's two T-sized HBM passes are gone.  The legs contract over
+# K = min(n_c, n_v) (8.6 against 15.0 GFLOP per trial on CrI3; the load's fp64 tensor-core
+# K-sum reproduces the batched ZGEMM of the same order bit for bit).  U is unchanged
+# (k-leading), and ``_decode`` reads it exactly as the XLA route does.
 
 
 def _outer_legs(X_b, psi_c_X, psi_v_Y):
@@ -350,20 +362,6 @@ def _make_outer_router(mesh_xy, kgrid):
             doors["conv"] = make_local_kconv_klead_outer(mesh_xy, kgrid, norm="ortho")
         return doors["conv"]
     return route
-
-
-def _decode_min(U_b, psi_c_X, psi_v_Y, sqrt_nk):
-    """``(WX)_b = (1/√Nk) Σ conj(ψ_c) ψ_v U_b`` contracted through the smaller band set first.
-
-    n_v <= n_c: ``B = U·ψ_v`` over (s, ν) (out n_v), then ``conj(ψ_c)`` over (t, μ);
-    else the (t, μ)-first order of ``_conv_decode``.  This rank's (μ_loc, ν_loc) partial,
-    completed by the caller's one reduce-scatter.
-    """
-    if psi_v_Y.shape[1] <= psi_c_X.shape[1]:
-        B = jnp.einsum("ktMsN,kvsN->ktMv", U_b, psi_v_Y)          # (nk, ns, μ_loc, n_v)
-        return jnp.einsum("kctM,ktMv->cvk", jnp.conj(psi_c_X), B) / sqrt_nk
-    A = jnp.einsum("kctM,ktMsN->kcsN", jnp.conj(psi_c_X), U_b)    # (nk, n_c, ns, ν_loc)
-    return jnp.einsum("kvsN,kcsN->cvk", psi_v_Y, A) / sqrt_nk
 
 
 def _exchange_U(S_part, V_q0):
@@ -489,7 +487,7 @@ def build_bse_stack_matvec(
             def _body_outer(carry, X_b):             # X_b: (c_full, v_full, nk)
                 L, R = _outer_legs(X_b, psi_c_X, psi_v_Y)
                 U_b = kconv_outer(L, R, W_Rk)        # T formed on the load, never stored
-                return carry, _decode_min(U_b, psi_c_X, psi_v_Y, sqrt_nk)
+                return carry, _decode(U_b, psi_c_X, psi_v_Y, sqrt_nk)
 
             _, WX = lax.scan(_body_outer, None, _gather_trial_block(X), unroll=1)
             return _scatter_trial_block(WX, mesh_xy)
@@ -654,13 +652,13 @@ def build_bse_stack_pair_matvec(
                 L_B, R_B = _outer_legs_B(Xb_b, psi_c_Y, psi_v_X)
                 U_b = kconv_outer(jnp.concatenate([L_A, sc * L_B], axis=-1),
                                   jnp.concatenate([R_A, R_B], axis=1), W_Rk)
-                return carry, _decode_min(U_b, psi_c_X, psi_v_Y, sqrt_nk)
+                return carry, _decode(U_b, psi_c_X, psi_v_Y, sqrt_nk)
 
             def _body_outer_unfused(carry, xs):
                 X_b, Xb_b = xs
-                WA = _decode_min(kconv_outer(*_outer_legs(X_b, psi_c_X, psi_v_Y), W_Rk),
+                WA = _decode(kconv_outer(*_outer_legs(X_b, psi_c_X, psi_v_Y), W_Rk),
                                  psi_c_X, psi_v_Y, sqrt_nk)
-                WB = _decode_min(kconv_outer(*_outer_legs_B(Xb_b, psi_c_Y, psi_v_X), W_Rk),
+                WB = _decode(kconv_outer(*_outer_legs_B(Xb_b, psi_c_Y, psi_v_X), W_Rk),
                                  psi_c_X, psi_v_Y, sqrt_nk)
                 return carry, WA + sc * WB
 
