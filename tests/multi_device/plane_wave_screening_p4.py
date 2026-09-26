@@ -89,7 +89,8 @@ def fe_antiunitary(mesh, wfn):
         f"closure leak {c['leak']:.1e}")
     assert c["leak"] <= 1e-12, c["leak"]
     geo = vcoul.CoulombGeometry(bvec=b, cell_volume=1.0)
-    r = s.antiunitary_check(mesh, fx2, fx1, c, geo)
+    # τ·|z| near one: the z and z̄ weights differ at O(1), so the twin sees the (r,r') asymmetry
+    r = s.antiunitary_check(mesh, fx2, fx1, c, geo, taus=(1.5,), zs=(1.0j, 0.5 + 0.8j))
     say(f"Fe antiunitary ({r['n_anti']} anti rows of {len(c['kfrac'])}): χ(Γ) (r,r') asymmetry "
         f"{r['asym']:.2e}; τ rule {r['tau']:.1e} (no-conj twin {r['tau_red']:.1e}); z rule "
         f"{r['z']:.1e} (parent-at-z twin {r['z_red']:.1e})")
