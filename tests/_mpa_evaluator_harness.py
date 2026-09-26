@@ -2,8 +2,7 @@
 
 The ``evaluate_samples`` cluster, moved verbatim out of
 ``gw.mpa.evaluator``: it has zero production callers and serves only as
-the oracle for the shipped-table tests (``tests/test_mpa_evaluator.py``
-and ``tests/test_minimax_imag_tables.py``).  Production keeps
+the oracle for ``tests/test_mpa_evaluator.py``.  Production keeps
 ``damped_line_rule`` and the ``damped_rectangle_*`` family in
 ``gw.mpa.evaluator``; this module imports them rather than copying them.
 Plain module, no pytest imports.

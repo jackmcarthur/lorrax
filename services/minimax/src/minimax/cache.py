@@ -69,8 +69,8 @@ def backend_tag() -> str:
 
     numpy and scipy versions plus the machine, because those are what
     survey 2.4 measured moving the answer.  scipy is imported lazily
-    and tolerated absent: a lookup-only process never has to have it,
-    and a process about to solve will import it a moment later anyway.
+    and tolerated absent: the numpy-only solvers (``levelled``) never need
+    it.
     """
     try:
         import scipy                                   # noqa: PLC0415
@@ -79,7 +79,7 @@ def backend_tag() -> str:
         # Genuinely broad, and it is not a demotion: this value is a CACHE
         # KEY COMPONENT, so "scipy could not be interrogated" must produce
         # a distinct, stable tag rather than an exception that would take
-        # down a lookup that does not need scipy at all.
+        # down a solve that does not need scipy at all.
         scipy_v = "absent"
     return (f"cpu:numpy-{np.__version__}/scipy-{scipy_v}/"
             f"{os.uname().machine if hasattr(os, 'uname') else 'unknown'}")
@@ -197,9 +197,9 @@ def load(namespace: str, payload: dict[str, Any]
 def _read(path: Path) -> tuple[np.ndarray, np.ndarray, float] | None:
     """One cache file.  A corrupt file announces and is treated as absent.
 
-    Deliberately NOT a refusal: unlike the shipped bundle, a cache file is
-    not an artifact anybody promised, so a truncated one means "re-solve",
-    not "the install is broken".  What changed is that it says so.
+    Deliberately NOT a refusal: a cache file is not an artifact anybody
+    promised, so a truncated one means "re-solve", not "the install is
+    broken".  It says so.
     """
     try:
         with np.load(path, allow_pickle=False) as data:
