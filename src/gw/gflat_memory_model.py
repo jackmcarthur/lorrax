@@ -78,7 +78,6 @@ def loader_band_chunk(*, nb: int, nk: int, ns: int, ngkmax: int, n_rmu: int,
     process enters.
     """
     from common.gpu_utils import device_room_bytes
-    from runtime.padding import round_up
     nb, p_band = int(nb), int(p_band)
     k_tile, _ = centroid_fft_tile_geometry(nk=int(nk), band_chunk=max(int(floor), 1),
                                            p_band=p_band)
@@ -88,8 +87,8 @@ def loader_band_chunk(*, nb: int, nk: int, ns: int, ngkmax: int, n_rmu: int,
                 + k_tile * int(ns) * 16.0 * (mu_x + mu_y))
     fit = int(_LOADER_TILE_ROOM_FRACTION * float(device_room_bytes()) // per_band)
     n_tiles = -(-nb // max(fit, 1))
-    tile = round_up(-(-nb // n_tiles), p_band)
-    return int(min(max(tile, int(floor)), round_up(nb, p_band)))
+    tile = padded_axis(-(-nb // n_tiles), p_band, name="psi loader band tile").carrier
+    return int(min(max(tile, int(floor)), padded_axis(nb, p_band, name="psi loader band extent").carrier))
 
 
 # ---------------------------------------------------------------------------

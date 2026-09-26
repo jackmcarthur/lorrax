@@ -70,14 +70,20 @@ def test_col_chunk_floors_at_one_and_never_refuses():
     assert dense_col_chunk(args, _FakeMesh(1, 1), 4096) == 1
 
 
-def test_col_chunk_accounts_for_the_mesh():
+def test_col_chunk_accounts_for_the_mesh(monkeypatch):
     """Sharding mu over x and nu over y shrinks the LOCAL tensor, so a wider
     mesh must admit a wider trial block.
+
+    The width reads the run budget (``common.gpu_utils.device_budget_bytes``),
+    so the budget is pinned here: the cell checks the mesh dependence, not the
+    host's default budget.
 
     RED TWIN: read the global W_R shape instead of dividing by (px, py) and
     the two widths come back equal.
     """
+    import bse.bse_nontda as nontda
     from bse.bse_nontda import dense_col_chunk
+    monkeypatch.setattr(nontda, "device_budget_bytes", lambda: 32.0e9)
 
     args = _args_for(480, 480, (4, 4, 4))
     one = dense_col_chunk(args, _FakeMesh(1, 1), 4096)
