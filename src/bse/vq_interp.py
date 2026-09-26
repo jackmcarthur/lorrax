@@ -2215,8 +2215,7 @@ def refit_prepare(input_file: str, mesh_xy: Mesh, zx, log_fn=print,
           and NOT from the deck.  ``refit_vq`` refuses without it.
     """
     # ARGUMENT VALIDATION FIRST — it costs nothing, it needs no file to be
-    # readable, and it runs BEFORE the htransform import below, whose module
-    # body brings up the communicator stack and the REQUIRED-FFI gate.
+    # readable, and it runs BEFORE the fh_interp import below.
     n_guard = REFIT_N_GUARD_DEFAULT if n_guard is None else int(n_guard)
     if n_guard < 0:
         raise SystemExit(
@@ -2228,7 +2227,7 @@ def refit_prepare(input_file: str, mesh_xy: Mesh, zx, log_fn=print,
         read_lorrax_input,
         resolve_distrib_la_batched_route,
     )
-    from bandstructure.htransform import initialize_wfns
+    from bandstructure.fh_interp import initialize_wfns
     from common.psi_G_store import build_psi_G_store
     from common.wfn_layout import band_sphere_spec
     # THE ζ SOLVE, BEFORE ANYTHING EXPENSIVE.  A refit whose solve does not

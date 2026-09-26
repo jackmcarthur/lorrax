@@ -79,9 +79,11 @@ def test_every_direct_plan_batched_site_selects_at_plan_construction():
 def test_htransform_galerkin_receives_the_one_resolved_run_route():
     """Every production door to the Galerkin batch uses the same setting."""
     checks = {
-        "src/bandstructure/htransform.py": {
+        "src/bandstructure/fh_interp.py": {
             "fit_galerkin_basis": "distrib_la_batched_route",
             "streaming_galerkin_solve": "distrib_la_batched_route",
+        },
+        "src/bandstructure/htransform.py": {
             "initialize_wfns": "distrib_la_batched_route",
         },
         "src/bse/exciton_bands.py": {

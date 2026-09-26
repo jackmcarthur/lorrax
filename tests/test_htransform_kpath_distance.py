@@ -5,7 +5,7 @@ from types import SimpleNamespace
 import numpy as np
 
 def test_bcc_gamma_h_distance_uses_one_reciprocal_scale():
-    from bandstructure.htransform import initialize_kpath
+    from bandstructure.fh_interp import initialize_kpath
 
     alat_bohr = 5.42
     wfn = SimpleNamespace(

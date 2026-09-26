@@ -59,7 +59,7 @@ def interpolate_band_operator(operator_cart, source_coefficients,
 
 def _interpolate_component(operator_cart, source_coefficients,
                            path_coefficients, kpath, kgrid, mesh, n_return):
-    from bandstructure.htransform import build_R_grid_np
+    from bandstructure.fh_interp import build_R_grid_np
     nk, nb, rank = source_coefficients.shape
     nq = len(kpath)
     coefficients = pad_axis(
