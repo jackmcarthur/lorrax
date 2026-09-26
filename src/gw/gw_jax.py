@@ -554,8 +554,11 @@ def _prepare_isdf_carriers(
 
 def _prepare_oneshot_response(
         config, do_screened, input_dir, material_class, mesh_xy, meta, mode, print0,
-        qp_solver, wfn, wfns, wfns_sigma):
-    """Produce quadrature and direct head-response inputs for one-shot screening."""
+        qp_solver, wfn, wfns, wfns_sigma, *, occupation_state=None):
+    """Produce quadrature and direct head-response inputs for one-shot screening.
+
+    On a metal ``occupation_state`` is the one fixed-N state the body and
+    Sigma consume; the head takes it too, with its intraband term."""
     quad, e_ref = None, None
     if do_screened:
         with timing.section("gw_jax.minimax_quadrature", announce=True,
@@ -613,7 +616,13 @@ def _prepare_oneshot_response(
                 wfns_sigma, oneshot_omegas,
                 input_dir=input_dir, mesh=mesh_xy,
                 wfn=wfn, meta=meta, config=config,
-                wings=not direct_only_shared_pole)
+                wings=not direct_only_shared_pole,
+                occupation_state=(occupation_state
+                                  if material_class == "metal" else None))
+            if material_class == "metal":
+                from .qsgw_head import metal_head_summary
+                print0("  " + metal_head_summary(
+                    oneshot_head_response, occupation_state))
             print0(
                 "  head_correction=no_local_fields: built the direct DFT "
                 "response on the chi0 transition manifold; no wings, no "
@@ -1587,7 +1596,7 @@ def _run_gw_stages(args, _t_main, _pre_main, opened):
 	(
 	    quad, e_ref, oneshot_head_response, oneshot_head_requests, oneshot_mpa_plan) = _prepare_oneshot_response(
 	    config, do_screened, input_dir, material_class, mesh_xy, meta, mode, print0, qp_solver,
-	    wfn, wfns, wfns_sigma)
+	    wfn, wfns, wfns_sigma, occupation_state=oneshot_occupation_state)
 	(
 	    W_by_role, photon_response, green_parent_carrier, wfns_screening) = _run_oneshot_screening(
 	    V_q, bispinor_v_q_path, centroid_indices, config, e_ref, green_parent_carrier,
