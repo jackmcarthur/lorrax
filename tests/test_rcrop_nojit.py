@@ -6,9 +6,7 @@ loop reaches ``mixing.acceleration.rcrop_nojit`` from
 named it: the one automated SC gate
 (``test_invariance_gates.py::test_sc_iteration1_equals_one_shot``) sets
 ``sc_max_iter = 1``, which returns on ``run_self_consistency``'s
-one-shot fast path before an accelerator is constructed, and
-``tests/bench/benchmark_synthetic.py`` imports ``rcrop``/``crop``, not
-``rcrop_nojit`` (and ``bench`` is in ``norecursedirs``).
+one-shot fast path before an accelerator is constructed.
 
 Everything here runs against a synthetic residual — no mesh, no
 container fixture, no deck — so it belongs in the normal suite.
