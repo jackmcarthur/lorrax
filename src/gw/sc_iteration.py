@@ -3773,6 +3773,11 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
                 f"    SC head: {velocity_kind} + live Fermi-surface Drude "
                 f"and static Thomas-Fermi direct head "
                 f"(nb={pt.nb_logical}, samples={len(head_omegas)}; no wings)")
+        if (entry_occ_state is not None
+                and iteration_head_response.drude_tensor is not None):
+            from .qsgw_head import metal_head_summary
+            _record_sc(inputs, "    SC " + metal_head_summary(
+                iteration_head_response, entry_occ_state))
         else:
             _record_sc(
                 inputs,
@@ -3801,7 +3806,7 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
                 wings=not direct_only_shared_pole,
                 occupation_state=dft_head_state)
             if dft_head_state is not None:
-                inputs.print_fn("    SC " + metal_head_summary(
+                _record_sc(inputs, "    SC " + metal_head_summary(
                     iteration_head_response, dft_head_state))
         # The frozen response is the DFT direct response; its Sigma-side
         # ladder (energies, occupations, reference) is the DFT one, a step by
