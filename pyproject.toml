@@ -110,12 +110,7 @@ zeta_loader = "zeta_loader"
 [tool.uv]
 package = true
 
-# NOTHING HERE.  ``common/minimax_assets/`` used to be declared as package
-# data on this line; the bundle rides with the ``minimax`` service now
-# (``services/minimax/pyproject.toml``), which is what let the door read it
-# through ``importlib.resources.files("minimax")`` and cut the single
-# production import edge into ``common``.  The table is kept, empty, because
-# it is the place a NEW package-data claim would have to go.
+# Empty: the place a new package-data claim would go.
 [tool.setuptools.package-data]
 
 [tool.uv.sources]

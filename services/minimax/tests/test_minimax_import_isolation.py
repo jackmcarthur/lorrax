@@ -16,11 +16,11 @@ Four properties here, and they are four different claims:
   host numpy end to end.  ``MinimaxNodes`` — the complex128 pytree — stayed
   in ``gw.minimax_screening`` precisely so that this stays true.
 * ``import minimax`` needs NO scipy.  scipy is the ``solve`` extra: it is
-  reached from :mod:`minimax.solver` and nowhere else, behind a PEP-562
-  lazy ``__getattr__``.  A machine with no scipy must still import the
-  package, serve every certified table in the bundle, and refuse exactly
-  the solver names.  ``pyproject.toml`` says so; this is where the claim
-  is measured rather than asserted.
+  reached from the lazy builders behind a PEP-562 ``__getattr__``.  A
+  machine with no scipy must still import the package, serve the
+  numpy-only ``noncrossing`` rule, and refuse by name.
+  ``pyproject.toml`` says so; this is where the claim is measured rather
+  than asserted.
 * ``import minimax`` does NOT drag in lxkit either.  lxkit is a TEST-time
   dependency here (unlike distrib_la, which depends on it at runtime for
   the capability gates), so it is deliberately NOT handed to the child.
@@ -54,9 +54,9 @@ _LORRAX_SRC = os.path.join(_REPO, "src")
 #:
 #: ONE ENTRY, and that is the headline.  ``jax`` is not here (vcoul's is),
 #: ``scipy`` is not here (it is the ``solve`` extra), ``lxkit`` is not here
-#: (distrib_la's is).  Serving a certified quadrature is reading a JSON file
-#: and an ``.npz``; nothing else should be required to do it, and this tuple
-#: is where that is enforced rather than hoped.
+#: (distrib_la's is).  Serving the ``noncrossing`` rule is numpy arithmetic;
+#: nothing else should be required to do it, and this tuple is where that is
+#: enforced rather than hoped.
 _DEPS = ("numpy",)
 
 #: The same, plus the optional solver dependency, for the arms that
@@ -114,69 +114,58 @@ def test_minimax_imports_with_the_monorepo_absent():
     assert run.loaded == () and run.reachable == ()
 
 
-def test_the_lookup_surface_answers_with_no_lorrax_no_jax_and_no_scipy():
+def test_the_serving_surface_answers_with_no_lorrax_no_jax_and_no_scipy():
     """Not just ``import minimax`` — the whole SERVING path, cold.
 
     An ``__init__`` that imported cleanly and then failed on first use
     would pass a bare import check and be useless, so the child TOUCHES
-    the surface: it counts ``__all__``, enumerates the catalog, resolves a
-    real request against the shipped bundle, reads the payload off disk,
-    and prints the provenance line.  Then it asserts that neither jax nor
-    scipy arrived while it did any of that — which is the quarantine, and
-    it is the reason a production lookup costs microseconds instead of
-    importing an optimiser.
+    the surface: it counts ``__all__`` and resolves every non-lazy name
+    with no scipy arriving, then solves a real ``noncrossing`` request and
+    reads its provenance with no jax arriving.  The solve itself may import
+    scipy when it is installed: the cache key records scipy's version.
     """
     run = import_isolation(
         "minimax", _lorrax_roots(), src_dir=_SVC_SRC, deps=_DEPS,
         check_path=True,
         preamble=(
             _CPU_PIN +
-            "import sys\n"
+            "import os, sys\n"
+            "os.environ['LORRAX_DISABLE_MINIMAX_DISK_CACHE'] = '1'\n"
             "import minimax as M\n"
             # A PIN, and it is meant to drift only on purpose: the count
             # is what catches an __all__ that quietly emptied, and a
             # deliberate door change is exactly the kind of edit that
             # should have to touch a test.
-            "assert len(M.__all__) == 75, (len(M.__all__), M.__all__)\n"
+            "assert len(M.__all__) == 54, (len(M.__all__), M.__all__)\n"
             # Only the NON-lazy half is touched by name here: hasattr on a
             # solver name would fire the PEP-562 __getattr__ and import
             # scipy, which is the very thing the next assertion denies.
             "for _n in M.__all__:\n"
-                    "    if (_n in M._SOLVER_NAMES or _n in M._FREQUENCY_FIT_NAMES\n"
-                    "            or _n in M._UNIFORM_RULE_NAMES\n"
-                "            or _n in M._LEVELLED_NAMES\n"
-                "            or _n in M._ANALYTIC_NAMES\n"
+            "    if (_n in M._SOLVER_NAMES or _n in M._FREQUENCY_FIT_NAMES\n"
+            "            or _n in M._UNIFORM_RULE_NAMES\n"
+            "            or _n in M._LEVELLED_NAMES\n"
+            "            or _n in M._ANALYTIC_NAMES\n"
             "            or _n in M._ODD_LAPLACE_NAMES\n"
             "            or _n in M._DAMPED_RULE_NAMES\n"
-                "            or _n in M._MATSUBARA_RULE_NAMES\n"
-                "            or _n in M._RESPONSE_RULE_NAMES):\n"
+            "            or _n in M._MATSUBARA_RULE_NAMES\n"
+            "            or _n in M._RESPONSE_RULE_NAMES):\n"
             "        continue\n"
             "    assert hasattr(M, _n), _n\n"
-            "v = M.catalog()\n"
-                "assert len(v) == 34, len(v)\n"
-            "assert v.families() == ('crossing', 'noncrossing'), v\n"
-            "q = M.lookup(family='noncrossing', target='inverse',\n"
-            "             range_value=10.0, error_bound=1e-6, n_max=64)\n"
-            "assert q.node_count == 7 and q.nodes.dtype.name == 'float64'\n"
-            "assert q.provenance.source == 'shipped'\n"
-            "assert q.provenance.table_hash.startswith('sha256:')\n"
-            "assert 'shipped' in q.one_line()\n"
-            # THE QUARANTINE, measured at the end so it covers everything
-            # above rather than only the import.
-            "assert 'jax' not in sys.modules, 'minimax pulled jax'\n"
-            "assert 'scipy' not in sys.modules, 'a lookup pulled scipy'\n"))
+            # THE QUARANTINE: the door surface costs no optimiser.
+            "assert 'scipy' not in sys.modules, 'the door surface pulled "
+            "scipy'\n"
+            "q = M.serve(family='noncrossing', target='inverse',\n"
+            "            range_value=10.0, error_bound=1e-6, n_max=64)\n"
+            "assert q.node_count > 0 and q.nodes.dtype.name == 'float64'\n"
+            "assert q.max_error <= 1e-6\n"
+            "assert q.provenance.source == 'runtime-uncertified'\n"
+            # Measured at the end so it covers everything above.
+            "assert 'jax' not in sys.modules, 'minimax pulled jax'\n"))
     assert run.loaded == ()
 
 
 def test_a_refusal_is_reachable_and_readable_with_no_scipy():
-    """A gap must be nameable on a machine that cannot solve anything.
-
-    This is R1's shape as a property of the install: the refusal path is
-    the one that must work when the solver is absent, because "no table
-    and no solver" is exactly the situation where a silent fallback used
-    to be most expensive.  The message must carry the nearest certified
-    artifact and BOTH levers.
-    """
+    """A gap must be nameable on a machine that cannot solve anything."""
     run = import_isolation(
         "minimax", _lorrax_roots(), src_dir=_SVC_SRC, deps=_DEPS,
         check_path=True,
@@ -184,16 +173,14 @@ def test_a_refusal_is_reachable_and_readable_with_no_scipy():
             _CPU_PIN +
             "import sys, minimax as M\n"
             "try:\n"
-            "    M.lookup(family='crossing', target='hgl', range_value=83.0,\n"
-            "             error_bound=1e-6, n_max=500, eps_q=1e-3)\n"
-            "except M.NoCertifiedTable as e:\n"
+            "    M.serve(family='complex_laplace', target='complex_laplace',\n"
+            "            range_value=21.5, error_bound=1e-6, n_max=64)\n"
+            "except M.UncertifiedSolveRefused as e:\n"
             "    t = str(e)\n"
-            "    assert 'A_dim=83' in t, t\n"
-            "    assert 'nearest certified below' in t, t\n"
-            "    assert 'reachable by' in t, t\n"
-            "    assert 'or generate' in t, t\n"
+            "    assert 'complex_laplace' in t, t\n"
+            "    assert 'no in-process solver' in t, t\n"
             "else:\n"
-            "    raise AssertionError('A_dim=83 is outside the catalog and "
+            "    raise AssertionError('complex_laplace has no solver and "
             "did not refuse')\n"
             "assert 'scipy' not in sys.modules\n"))
     assert run.loaded == ()
@@ -202,8 +189,7 @@ def test_a_refusal_is_reachable_and_readable_with_no_scipy():
 def test_the_solver_half_is_reachable_when_scipy_is_there():
     """The lazy door is a DEFERRAL, not a removal.
 
-    ``from minimax import G_hgl`` must work — the generator campaign and
-    the certification tier need those names — and it must be the moment
+    ``from minimax import G_hgl`` must work, and it must be the moment
     scipy arrives, not before.  Both halves of that are asserted here, in
     one child, because asserting only the first would be satisfied by an
     eager import.
@@ -273,7 +259,7 @@ def test_the_door_surface_assertion_can_fail():
     """RED TWIN for the surface cell above.
 
     Asserting a name the door does NOT export must fail inside the child,
-    or ``test_the_lookup_surface_answers_with_no_lorrax_no_jax_and_no_scipy``
+    or ``test_the_serving_surface_answers_with_no_lorrax_no_jax_and_no_scipy``
     would pass on any package at all — including one whose ``__all__`` had
     quietly emptied.
     """
