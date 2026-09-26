@@ -41,6 +41,7 @@ import numpy as np
 # Path bootstrap; dies with the owner's workspace fix -- see _services.py.
 from ffi import _services      # noqa: F401
 from runtime.env_flags import env_bool
+from common import timing
 from common.collectives import transpose_xy, xy_tile_mesh
 
 _services.ensure_on_path()
@@ -311,6 +312,7 @@ class GNPPMFitResult:
     B_odd_qmunu: jax.Array | None = None
 
 
+@timing.timed("gn_ppm.fit")
 def fit_gn_ppm_from_wc_pair(
     Wc0_qmunu: jax.Array,
     Wc_probe_qmunu: jax.Array,
