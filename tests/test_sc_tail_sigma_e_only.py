@@ -63,3 +63,18 @@ def test_unit_z_is_the_plain_mean_bitwise_and_a_satellite_barely_moves_beta():
     drop = mask.copy(); drop[0, 4] = False
     assert fit.n_fit_c == 7 and np.isclose(
         fit.beta_c_ev, _fit_sum_band_tail(kw_sat, drop, none, np.full(mask.shape, 0.8))[0].beta_c_ev)
+
+
+def test_z_upper_bound_reads_the_snap_grid_so_round_off_at_one_keeps_the_law():
+    # CrI3 8x8 SC: one state's Z read 0.999865 vs 1.000021 across a round-off
+    # change; an exact z <= 1 dropped it on one arm only.  On the 1e-4 grid
+    # (snap_outward, the A11 grid) both arms keep it; Z = 1.00011 is outside.
+    kw, mask = _case()
+    none = np.zeros_like(mask)
+    fits = []
+    for zval in (0.999865, 1.0, 1.0 + 2.0 ** -52, 1.000021, 1.00009):
+        z = np.full(mask.shape, 0.8); z[0, 4] = zval
+        fits.append(_fit_sum_band_tail(kw, mask, none, z)[0])
+    assert all(f.n_fit_c == 8 for f in fits)
+    z = np.full(mask.shape, 0.8); z[0, 4] = 1.00011
+    assert _fit_sum_band_tail(kw, mask, none, z)[0].n_fit_c == 7
