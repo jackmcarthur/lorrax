@@ -1295,7 +1295,7 @@ def klead_outer_refusal(mesh: Mesh, kgrid, optin: int | None = None) -> str | No
 
 def make_local_kconv_klead_outer(mesh: Mesh, kgrid, *, norm: str | None = "ortho",
                                  mult: float = 1.0) -> Callable:
-    """Rank-local ``fn(L, R, V_R) -> U``: :func:`make_local_kconv_klead` of ``T = Σ_K L R``.
+    """Rank-local ``fn(L, R, V_R, conj_r=False) -> U``: :func:`make_local_kconv_klead` of ``T = Σ_K L R``.
 
     ``U = mult · fftn(ifftn(T) · V_R[:, None, :, None, :])`` with
     ``T[k,a,x,b,y] = Σ_K L[k,a,x,K] R[k,K,b,y]`` for ``L`` ``(nk, a, mx, K)``, ``R``
@@ -1303,7 +1303,9 @@ def make_local_kconv_klead_outer(mesh: Mesh, kgrid, *, norm: str | None = "ortho
     outer-product load (``kconv_outer_cuda_ffi.cc``) forms T in shared memory on the fp64
     tensor cores and never stores it; the transforms, the kernel multiply and the scaled store
     are mathdx mode 2's.  Its K sum reproduces XLA's batched ZGEMM of the same contraction bit
-    for bit (A100), so U equals ``make_local_kconv_klead(einsum(L, R), V_R)``.  K is zero-padded
+    for bit (A100), so U equals ``make_local_kconv_klead(einsum(L, R), V_R)``.  ``conj_r`` (static)
+    reads ``conj(R)`` instead (the BSE right leg is a conjugated wavefunction; reading it from
+    the wavefunction avoids a conjugated copy, bit for bit the explicit ``conj``).  K is zero-padded
     to a multiple of 4 (the m8n8k4 chunk; exact).  cpu: that composition on the plan route.
     Check :func:`klead_outer_refusal` first.
     """
@@ -1315,19 +1317,19 @@ def make_local_kconv_klead_outer(mesh: Mesh, kgrid, *, norm: str | None = "ortho
         attrs = dict(nkx=np.int64(kg[0]), nky=np.int64(kg[1]), nkz=np.int64(kg[2]),
                      scale=np.float64(scale))
 
-        def _mathdx(l, r, v_r):
+        def _mathdx(l, r, v_r, conj_r=False):
             shape = (l.shape[0], l.shape[1], l.shape[2], r.shape[2], r.shape[3])
             pad = -l.shape[3] % 4
             if pad:
                 l = jnp.pad(l, ((0, 0), (0, 0), (0, 0), (0, pad)))
                 r = jnp.pad(r, ((0, 0), (0, pad), (0, 0), (0, 0)))
             return jax.ffi.ffi_call(KCONV_KLEAD_OUTER_TARGET, jax.ShapeDtypeStruct(shape, l.dtype))(
-                l, r, v_r, **attrs, **_mathdx_common())
+                l, r, v_r, conj_r=np.int64(bool(conj_r)), **attrs, **_mathdx_common())
         return _mathdx
     apply = make_local_kconv_klead(mesh, kg, norm=norm, mult=mult)
 
-    def _plan(l, r, v_r):
-        return apply(jnp.einsum("kaxK,kKby->kaxby", l, r), v_r)
+    def _plan(l, r, v_r, conj_r=False):
+        return apply(jnp.einsum("kaxK,kKby->kaxby", l, jnp.conj(r) if conj_r else r), v_r)
     return _plan
 
 

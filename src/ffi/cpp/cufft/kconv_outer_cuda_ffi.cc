@@ -2,6 +2,8 @@
 //
 //   U[k,a,x,b,y] = s * FFT_k( IFFT_k T[.,a,x,b,y] * V[k,x,y] ),
 //   T[k,a,x,b,y] = sum_K L[k,a,x,K] * R[k,K,b,y]          (formed on the load, never stored)
+//                  (conj(R) with the attribute conj_r = 1: the BSE right leg is conj(psi_v),
+//                   read from psi_v itself, so no conjugated copy is made)
 //
 // Mode 2 of kconv_mathdx_cuda_ffi.cc (the k-leading stored-kernel convolution on the k-box
 // stage) with its T operand replaced by the rank-K sum the BSE encode builds.  The BSE T is
@@ -67,6 +69,7 @@ struct OuterGeo {                          // the embedded source declares the s
     long long ngrp, per;                   // (x block, a) groups per (y block, b), pairs per group
     long long items;                       // nyb * nb * ngrp
     double scale;
+    int conj_r;                            // 1: the load reads conj(R) (the BSE right leg is conj(psi))
 };
 
 static ffi::Error fail(const char* where, const std::string& detail,
@@ -88,6 +91,7 @@ struct OuterGeo {
     long long ngrp, per;
     long long items;
     double scale;
+    int conj_r;
 };
 
 constexpr int NX = LRX_NX, NY = LRX_NY, NZ = LRX_NZ, NK = NX * NY * NZ;
@@ -138,9 +142,10 @@ extern "C" __global__ void __launch_bounds__(LRX_THREADS, LRX_MINB) lrx_kconv_ou
                     const int q = 4 * h + tg;
                     const double2 lv = xok ? __ldg(lp + q) : make_double2(0.0, 0.0);
                     const double2 rv = yok ? __ldg(rp + (long long)q * rk) : make_double2(0.0, 0.0);
-                    lrx_dmma(re0, re1, lv.x, rv.x);
-                    lrx_dmma(re0, re1, -lv.y, rv.y);
-                    lrx_dmma(im0, im1, lv.x, rv.y);
+                    const double ri = g.conj_r ? -rv.y : rv.y;       // conj(R): the same value an
+                    lrx_dmma(re0, re1, lv.x, rv.x);                  // explicit conj would pass
+                    lrx_dmma(re0, re1, -lv.y, ri);
+                    lrx_dmma(im0, im1, lv.x, ri);
                     lrx_dmma(im0, im1, lv.y, rv.x);
                 }
                 lrx_c2 v0, v1;
@@ -285,7 +290,8 @@ static ffi::Error build(int nkx, int nky, int nkz, int K, std::string_view mathd
 // L (nk, na, mx, K), R (nk, K, nb, my), V (nk, mx, my) -> U (nk, na, mx, nb, my), complex128.
 static ffi::Error KleadOuterConv(cudaStream_t stream, ffi::AnyBuffer L, ffi::AnyBuffer R, ffi::AnyBuffer V,
                                  ffi::Result<ffi::AnyBuffer> U, int64_t nkx, int64_t nky, int64_t nkz,
-                                 double scale, std::string_view mathdx_root, std::string_view cubin_dir) {
+                                 double scale, int64_t conj_r, std::string_view mathdx_root,
+                                 std::string_view cubin_dir) {
     auto bad = [](const std::string& why) { return fail("klead outer conv", why, ffi::ErrorCode::kInvalidArgument); };
     if (nkx < 1 || nky < 1 || nkz < 1 || nkx > kAxisMax || nky > kAxisMax || nkz > kAxisMax) {
         std::ostringstream os;
@@ -328,6 +334,7 @@ static ffi::Error KleadOuterConv(cudaStream_t stream, ffi::AnyBuffer L, ffi::Any
     g.per = (pairs + g.ngrp - 1) / g.ngrp;
     g.items = base * g.ngrp;
     g.scale = scale;
+    g.conj_r = conj_r ? 1 : 0;
     const void* lp = L.untyped_data();
     const void* rp = R.untyped_data();
     const void* vp = V.untyped_data();
@@ -355,5 +362,6 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(
         .Attr<int64_t>("nky")
         .Attr<int64_t>("nkz")
         .Attr<double>("scale")
+        .Attr<int64_t>("conj_r")
         .Attr<std::string_view>("mathdx_root")
         .Attr<std::string_view>("cubin_dir"));

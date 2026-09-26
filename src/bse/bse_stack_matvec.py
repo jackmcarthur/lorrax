@@ -317,15 +317,17 @@ def _decode(U_b, psi_c_X, psi_v_Y, sqrt_nk):
 
 
 def _outer_legs(X_b, psi_c_X, psi_v_Y):
-    """``(L, R)`` with ``T = Σ_K L[k,t,μ,K] R[k,K,s,ν]`` and K = min(n_c, n_v).
+    """``(L, R, conj_r)`` with ``T = Σ_K L[k,t,μ,K] R'[k,K,s,ν]``, K = min(n_c, n_v),
+    ``R' = conj(R)`` when ``conj_r`` else ``R``.
 
-    n_v <= n_c: ``L = Σ_c ψ^X_c X`` (nk, ns, μ_loc, n_v), ``R = conj(ψ^Y_v)``.
-    n_c <  n_v: ``L = ψ^X_c`` moved K-minor (nk, ns, μ_loc, n_c), ``R = Σ_v conj(ψ^Y_v) X``.
+    n_v <= n_c: ``L = Σ_c ψ^X_c X`` (nk, ns, μ_loc, n_v), ``R' = conj(ψ^Y_v)`` read from
+    ``ψ^Y_v`` itself (``conj_r``: no conjugated copy).
+    n_c <  n_v: ``L = ψ^X_c`` moved K-minor (nk, ns, μ_loc, n_c), ``R' = Σ_v conj(ψ^Y_v) X``.
     """
     if psi_v_Y.shape[1] <= psi_c_X.shape[1]:
-        return (jnp.einsum("kctM,cvk->ktMv", psi_c_X, X_b), jnp.conj(psi_v_Y))
+        return jnp.einsum("kctM,cvk->ktMv", psi_c_X, X_b), psi_v_Y, True
     return (jnp.moveaxis(psi_c_X, 1, -1),
-            jnp.einsum("kvsN,cvk->kcsN", jnp.conj(psi_v_Y), X_b))
+            jnp.einsum("kvsN,cvk->kcsN", jnp.conj(psi_v_Y), X_b), False)
 
 
 def _outer_legs_B(Xb_b, psi_c_Y, psi_v_X):
@@ -486,8 +488,8 @@ def build_bse_stack_matvec(
         kconv_outer = outer_route(min(psi_c_X.shape[1], psi_v_Y.shape[1]))
         if kconv_outer is not None:
             def _body_outer(carry, X_b):             # X_b: (c_full, v_full, nk)
-                L, R = _outer_legs(X_b, psi_c_X, psi_v_Y)
-                U_b = kconv_outer(L, R, W_Rk)        # T formed on the load, never stored
+                L, R, cj = _outer_legs(X_b, psi_c_X, psi_v_Y)
+                U_b = kconv_outer(L, R, W_Rk, conj_r=cj)   # T formed on the load, never stored
                 return carry, _decode(U_b, psi_c_X, psi_v_Y, sqrt_nk)
 
             _, WX = lax.scan(_body_outer, None, _gather_trial_block(X), unroll=1)
@@ -649,16 +651,17 @@ def build_bse_stack_pair_matvec(
         if kconv_outer is not None:
             def _body_outer_fused(carry, xs):
                 X_b, Xb_b = xs
-                L_A, R_A = _outer_legs(X_b, psi_c_X, psi_v_Y)
+                L_A, R_A, cA = _outer_legs(X_b, psi_c_X, psi_v_Y)
                 L_B, R_B = _outer_legs_B(Xb_b, psi_c_Y, psi_v_X)
+                R_A = jnp.conj(R_A) if cA else R_A      # one convention for the concatenation
                 U_b = kconv_outer(jnp.concatenate([L_A, sc * L_B], axis=-1),
                                   jnp.concatenate([R_A, R_B], axis=1), W_Rk)
                 return carry, _decode(U_b, psi_c_X, psi_v_Y, sqrt_nk)
 
             def _body_outer_unfused(carry, xs):
                 X_b, Xb_b = xs
-                WA = _decode(kconv_outer(*_outer_legs(X_b, psi_c_X, psi_v_Y), W_Rk),
-                                 psi_c_X, psi_v_Y, sqrt_nk)
+                L_A, R_A, cA = _outer_legs(X_b, psi_c_X, psi_v_Y)
+                WA = _decode(kconv_outer(L_A, R_A, W_Rk, conj_r=cA), psi_c_X, psi_v_Y, sqrt_nk)
                 WB = _decode(kconv_outer(*_outer_legs_B(Xb_b, psi_c_Y, psi_v_X), W_Rk),
                                  psi_c_X, psi_v_Y, sqrt_nk)
                 return carry, WA + sc * WB
