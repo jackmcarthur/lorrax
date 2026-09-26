@@ -33,7 +33,10 @@ namespace lrx_kbox {
 struct Geometry {
     int nx, ny, nz;
     int zp() const { return nz | 1; }                        // odd z-line
-    long long row() const { return (long long)nx * ny * zp(); }
+    // The x stride: ny odd z-lines on a 3-D box; on a 2-D box (nz = 1) an odd y-line, so the y
+    // pass's lines (one per x, consecutive threads) do not start on one bank (8x8x1: 8-way).
+    long long xs() const { return nz > 1 ? (long long)ny * zp() : (long long)(ny | 1); }
+    long long row() const { return (long long)nx * xs(); }
     long long rs() const { return row() | 1; }                // odd row stride
     long long pr() const { return ((long long)ny * zp()) | 1; }  // padded (ky, kz) plane (split arm)
 };
@@ -109,9 +112,12 @@ template <int NX, int NY, int NZ>
 struct Geo {
     static constexpr int NK = NX * NY * NZ;
     static constexpr int ZP = NZ | 1;
-    static constexpr int RS = (NX * NY * ZP) | 1;
+    static constexpr int XS = NZ > 1 ? NY * ZP : (NY | 1);   // x stride (Geometry::xs)
+    static constexpr int RS = (NX * XS) | 1;
     static constexpr int PR = (NY * ZP) | 1;
-    __device__ static constexpr int at(int k) { return (k / NZ) * ZP + k % NZ; }   // bank offset of flat k
+    __device__ static constexpr int at(int k) {                // bank offset of flat k
+        return NZ > 1 ? (k / NZ) * ZP + k % NZ : (k / NY) * XS + k % NY;
+    }
     __device__ static constexpr int plane_at(int p) { return (p / NZ) * ZP + p % NZ; }  // p = ky*NZ + kz
 };
 
@@ -159,14 +165,14 @@ __device__ void transform3(C* bank) {
     if constexpr (NY > 1) {
         for (int l = threadIdx.x; l < tr * NX * NZ; l += blockDim.x) {
             const int j = l / (NX * NZ), li = l % (NX * NZ);
-            line_fft<NY, Arch, Dir>(bank + j * G::RS + (li / NZ) * NY * G::ZP + li % NZ, G::ZP);
+            line_fft<NY, Arch, Dir>(bank + j * G::RS + (li / NZ) * G::XS + li % NZ, G::ZP);
         }
         __syncthreads();
     }
     if constexpr (NX > 1) {
         for (int l = threadIdx.x; l < tr * NY * NZ; l += blockDim.x) {
             const int j = l / (NY * NZ), li = l % (NY * NZ);
-            line_fft<NX, Arch, Dir>(bank + j * G::RS + G::plane_at(li), NY * G::ZP);
+            line_fft<NX, Arch, Dir>(bank + j * G::RS + G::plane_at(li), G::XS);
         }
         __syncthreads();
     }

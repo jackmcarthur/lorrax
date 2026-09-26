@@ -1631,7 +1631,8 @@ def chi_unfold_refusal(kgrid, ns: int, optin: int | None = None) -> str:
     """Why mathdx mode 11 cannot serve this grid ("" when it can): the k-box residency rule.
 
     The handler's build() refuses the same cases (GATE mathdx-kconv-chi-residency): the
-    single pass needs one pair's ``2 ns^2`` columns of ``16·((nx·ny·(nz|1))|1)`` B within
+    single pass needs one pair's ``2 ns^2`` columns of ``16·((nx·xs)|1)`` B (``xs = ny·(nz|1)``,
+    ``ny|1`` on a 2-D box: ``kbox_stage.cuh`` Geometry) within
     the opt-in shared memory per block; the split arm needs a 16-column plane tile of
     ``16·((ny·(nz|1))|1)`` B each and a group pencil of ``16·nx·(2 ns^2 + 1)·TY`` B,
     ``TY = 256 / (2 ns^2)``.  ``optin`` defaults to the device's attribute.
@@ -1642,7 +1643,8 @@ def chi_unfold_refusal(kgrid, ns: int, optin: int | None = None) -> str:
     if have is None:
         return "no CUDA driver to read the opt-in shared memory"
     zp = nz | 1
-    rs, pr = (nx * ny * zp) | 1, (ny * zp) | 1
+    xs = ny * zp if nz > 1 else ny | 1
+    rs, pr = (nx * xs) | 1, (ny * zp) | 1
     grp = 2 * ns * ns
     if grp * rs * 16 <= have:
         return ""
