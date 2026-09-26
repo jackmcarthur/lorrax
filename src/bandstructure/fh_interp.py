@@ -179,38 +179,21 @@ def streaming_galerkin_solve(wfn, sym, meta, centroid_indices, mesh_xy: Mesh,
                     basis, meta=meta, rank_multiplier=rank_multiplier))
             return basis
 
-    # The whole-state ledger describes allocations made *after this point*.
-    # Compare it with the allocator budget still available to the fit, not
-    # with the arena limit: the driver, WFN metadata and symmetry service are
-    # already live.  ``get_device_memory_info`` is the public owner of that
-    # policy and retains its standard 10% reserve for allocator fragmentation
-    # and state materialised between planning and the first streamed slab.
-    from common.gpu_utils import get_device_memory_info
-    memory = get_device_memory_info()
-    local_fit_budget = int(float(memory["budget_gb"]) * 1.0e9)
-    # The carrier and r-chunk extents are shared static control flow.  BFC
-    # residency is rank-local and asynchronous, so one rank choosing from its
-    # own larger budget can send its peers into a different compile/loop
-    # schedule.  Resolve one worst-rank budget through the process-collective
-    # service before planning any static extent.
-    from common.collectives import all_gather_processes
-    process_budgets = np.asarray(
-        all_gather_processes(np.asarray(local_fit_budget, dtype=np.int64)),
-        dtype=np.int64,
-    )
-    if process_budgets.size == 0 or np.any(process_budgets <= 0):
+    # The whole-state ledger describes allocations made *after this point*:
+    # the fit may claim the run's budget less the bytes already live (the
+    # driver, WFN metadata and symmetry service), the minimum over processes,
+    # so every rank plans the same static carrier and r-chunk extents.
+    from common.gpu_utils import device_budget_bytes, device_room_bytes
+    device_fit_budget = float(device_room_bytes())
+    if device_fit_budget <= 0:
         raise RuntimeError(
-            "htransform live-capacity gather returned no positive budget")
-    device_fit_budget = float(np.min(process_budgets))
+            "htransform: no room left in the run budget "
+            f"({device_budget_bytes() / 1e9:.2f} GB/device) beside the live bytes")
     if log_fn is not None:
         log_fn(
             "  Whole-state live fit budget: "
-            f"{device_fit_budget/2**30:.2f} GiB/device from "
-            f"worst-rank reserve (this rank "
-            f"{local_fit_budget/2**30:.2f} GiB; "
-            f"{float(memory['available_gb'])*1.0e9/2**30:.2f} GiB available "
-            f"({memory['source']}); the allocator limit is not reusable "
-            "capacity while earlier driver state remains live)")
+            f"{device_fit_budget/2**30:.2f} GiB/device (the run budget "
+            f"{device_budget_bytes()/2**30:.2f} GiB less the live bytes, worst rank)")
     basis = fit_galerkin_basis(
         wfn, sym, meta, centroid_indices, mesh_xy, band_range,
         log_fn=log_fn,

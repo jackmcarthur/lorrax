@@ -334,8 +334,8 @@ class SphereScreening:
                           sd((1,), jnp.int32)).compile().memory_analysis()
             self._fit_temp[key] = max(1, int(getattr(mem, "temp_size_in_bytes", 0)))
         if budget_bytes is None:
-            from common.gpu_utils import get_device_memory_gb, minimum_process_budget_gb
-            budget_bytes = int(minimum_process_budget_gb(get_device_memory_gb()) * 1e9)
+            from common.gpu_utils import device_budget_bytes
+            budget_bytes = int(device_budget_bytes())
         n_loc = self.sphere.n
         return int(max(1, min(n_loc, (int(budget_bytes) // 2) // self._fit_temp[key])))
 
@@ -349,8 +349,8 @@ class SphereScreening:
         (``fit_q_batch``'s compiled figure).  Past one chunk the caller reruns the χ τ
         loop per chunk (the pair convolution's cost), so the remedy there is more ranks."""
         if budget_bytes is None:
-            from common.gpu_utils import get_device_memory_gb, minimum_process_budget_gb
-            budget_bytes = int(minimum_process_budget_gb(get_device_memory_gb()) * 1e9)
+            from common.gpu_utils import device_budget_bytes
+            budget_bytes = int(device_budget_bytes())
         self.fit_q_batch(n_p, ordered=ordered, budget_bytes=budget_bytes)
         temp_q = self._fit_temp[(int(n_p), bool(ordered), 1.0e-13, "loewner")]
         n_q, M, Pn = self.sphere.n, self.M, self.P

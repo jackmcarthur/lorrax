@@ -699,10 +699,8 @@ def plan_pair_convolution_chunks(*, n_ranks, n_k, spins, widths, width_out, n_q,
 
 def _budget_target(ns: int) -> int:
     """The run's per-device budget (the minimum over processes) times the BFC utilization for n_s."""
-    from common.gpu_utils import (bfc_fragmentation_target_utilization, get_device_memory_gb,
-                                  minimum_process_budget_gb)
-    budget = minimum_process_budget_gb(get_device_memory_gb()) * 1e9
-    return int(budget * bfc_fragmentation_target_utilization(int(ns)))
+    from common.gpu_utils import bfc_fragmentation_target_utilization, device_budget_bytes
+    return int(device_budget_bytes() * bfc_fragmentation_target_utilization(int(ns)))
 
 
 # ---------------------------------------------------------------------------

@@ -922,14 +922,11 @@ def _coefficient_window(mesh, *, nbands, nspinor, ngkmax) -> int:
     slab, the active block as complex, its rotation, the output slab and the
     one queued write — and the largest ``w`` that fits otherwise.
     """
-    from common.gpu_utils import (
-        bfc_fragmentation_target_utilization, get_device_memory_info,
-        minimum_process_budget_gb)
+    from common.gpu_utils import bfc_fragmentation_target_utilization, device_room_bytes
 
     p = int(mesh.devices.size)
     whole_k = -(-int(ngkmax) // p)
-    budget = minimum_process_budget_gb(
-        float(get_device_memory_info()["budget_gb"])) * 1e9
+    budget = float(device_room_bytes())
     per_column = 5 * int(nbands) * int(nspinor) * 16
     w = int(budget * bfc_fragmentation_target_utilization(4) // per_column)
     return p * max(1, min(whole_k, w))
