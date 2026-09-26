@@ -360,40 +360,25 @@ __device__ __forceinline__ lrx_c2 lrx_parent_load(
 #endif
 
 constexpr int NX = LRX_NX, NY = LRX_NY, NZ = LRX_NZ, NS = LRX_NS, RB = LRX_RB;
-constexpr int NK = NX * NY * NZ, SP = NK | 1;
+// The resident banks hold the k-box stage's padded row (kbox_stage.cuh Geo): odd z-lines on a
+// 3-D box, odd y-lines on a 2-D box, an odd row stride, so no axis pass walks one bank (a flat
+// nk|1 row put the lines of 8x8x1's y pass and 8^3's z pass on one bank group: 8-way).  Element
+// k of bank row j is j * SP + cell(k); the transforms are the stage's.
+#include "kbox_stage.cuh"
+using KGeo = lrx_kbox::Geo<NX, NY, NZ>;
+constexpr int NK = NX * NY * NZ, SP = KGeo::RS;
+__device__ __forceinline__ int cell(int k) { return KGeo::at(k); }
 
 template <int N, cufftdx::fft_direction Dir>
 using TFFT = decltype(cufftdx::Size<N>() + cufftdx::Precision<lrx_real>() +
                       cufftdx::Type<cufftdx::fft_type::c2c>() + cufftdx::Direction<Dir>() +
                       cufftdx::Thread() + cufftdx::SM<LRX_SM>());
 
-// One axis of the 3-D transform on RB resident rows: every block thread runs
-// whole library line-FFTs (flat k is C-order, kz fastest).
-template <int N, int STRIDE, cufftdx::fft_direction Dir>
-__device__ __forceinline__ void axis_pass(lrx_c2* bank) {
-    if constexpr (N > 1) {
-        using F = TFFT<N, Dir>;
-        using V = typename F::value_type;
-        constexpr int lines = NK / N;
-        for (int l = threadIdx.x; l < RB * lines; l += blockDim.x) {
-            const int j = l / lines, li = l % lines;
-            lrx_c2* p = bank + j * SP + (li / STRIDE) * N * STRIDE + (li % STRIDE);
-            V v[F::storage_size];
-#pragma unroll
-            for (int e = 0; e < N; ++e) { v[e].x = p[e * STRIDE].x; v[e].y = p[e * STRIDE].y; }
-            F().execute(v);
-#pragma unroll
-            for (int e = 0; e < N; ++e) { p[e * STRIDE].x = v[e].x; p[e * STRIDE].y = v[e].y; }
-        }
-        __syncthreads();                               // a pass that did not run writes nothing to publish
-    }
-}
-
+// The 3-D transform of the RB resident rows: the k-box stage's (z, y, x thread FFTs, every
+// block thread, a barrier after each pass that ran), on the padded row.
 template <cufftdx::fft_direction Dir>
 __device__ __forceinline__ void transform3(lrx_c2* bank) {
-    axis_pass<NZ, 1, Dir>(bank);
-    axis_pass<NY, NZ, Dir>(bank);
-    axis_pass<NX, NY * NZ, Dir>(bank);
+    lrx_kbox::transform3<NX, NY, NZ, RB, LRX_SM, Dir>(bank);
 }
 
 #if LRX_MODE < 2 || LRX_MODE == 6
@@ -454,14 +439,14 @@ extern "C" __global__ void __launch_bounds__(256) lrx_kconv(
                     bv = bin[base + (long long)ap * rows * NS + row * NS + bp];
 #endif
                 }
-                abank[j * SP + k] = av;
-                bbank[j * SP + k] = bv;
+                abank[j * SP + cell(k)] = av;
+                bbank[j * SP + cell(k)] = bv;
             }
             __syncthreads();
             transform3<fft_direction::inverse>(abank);
             transform3<fft_direction::inverse>(bbank);
             for (int i = threadIdx.x; i < RB * NK; i += blockDim.x) {
-                const int q = (i / NK) * SP + (i % NK);
+                const int q = (i / NK) * SP + cell(i % NK);
                 const lrx_c2 ac = {abank[q].x, -abank[q].y};
                 const lrx_c2 term = lrx_phase(lrx_mul(ac, bbank[q]), pc);
                 if (a == 0 && b == 0) accum[q] = term;
@@ -475,7 +460,7 @@ extern "C" __global__ void __launch_bounds__(256) lrx_kconv(
         const int k = i / RB, j = i % RB;
         const long long row = r0 + j;
         if (row < rows) {
-            const lrx_c2 v = accum[j * SP + k];
+            const lrx_c2 v = accum[j * SP + cell(k)];
             uout[(long long)k * rows + row] = {v.x * scale, v.y * scale};
         }
     }
@@ -592,7 +577,7 @@ extern "C" __global__ void __launch_bounds__(256) lrx_kconv(
         const long long row = r0 + j;
         lrx_c2 v = {0.0, 0.0};
         if (row < g.rows) v = x[lrx_elem(row, k, g.rows)];
-        sm[j * SP + k] = v;
+        sm[j * SP + cell(k)] = v;
     }
     __syncthreads();
     if (CONV || !g.forward) transform3<fft_direction::inverse>(sm);
@@ -603,7 +588,7 @@ extern "C" __global__ void __launch_bounds__(256) lrx_kconv(
             const long long row = r0 + j;
             if (row < g.rows) {
                 const long long kidx = ((row / g.m1) % g.m0) * NK + k;
-                sm[j * SP + k] = lrx_mul(sm[j * SP + k], kern[kidx]);
+                sm[j * SP + cell(k)] = lrx_mul(sm[j * SP + cell(k)], kern[kidx]);
             }
         }
         __syncthreads();
@@ -613,7 +598,7 @@ extern "C" __global__ void __launch_bounds__(256) lrx_kconv(
         const int k = i % NK, j = i / NK;
         const long long row = r0 + j;
         if (row < g.rows) {
-            const lrx_c2 v = sm[j * SP + k];
+            const lrx_c2 v = sm[j * SP + cell(k)];
             lrx_c2 w;
             w.x = (lrx_real)(v.x * g.scale);
             w.y = (lrx_real)(v.y * g.scale);
@@ -761,15 +746,15 @@ __device__ __forceinline__ void lrx_group_load(
                 for (int b = 0; b < NR; ++b) {
                     if constexpr (NA != NS) {
                         if (b < t.b0 || b >= t.b0 + NA) continue;
-                        sm[(jp * SSO + (a - t.a0) * NA + (b - t.b0)) * SP + k] = out[b];
+                        sm[(jp * SSO + (a - t.a0) * NA + (b - t.b0)) * SP + cell(k)] = out[b];
                     } else {
-                        sm[(jp * SS + a * NR + b) * SP + k] = out[b];
+                        sm[(jp * SS + a * NR + b) * SP + cell(k)] = out[b];
                     }
                 }
             }
         } else {
 #pragma unroll
-            for (int ab = 0; ab < SSO; ++ab) sm[(jp * SSO + ab) * SP + k] = {0.0, 0.0};
+            for (int ab = 0; ab < SSO; ++ab) sm[(jp * SSO + ab) * SP + cell(k)] = {0.0, 0.0};
         }
     }
 }
@@ -797,7 +782,7 @@ __device__ __forceinline__ void lrx_unfold_load(
                 lrx_spin_row(u, ur, g, a, out);
                 v = out[b];
             }
-            sm[j * SP + k] = v;
+            sm[j * SP + cell(k)] = v;
         }
     }
 }
@@ -827,14 +812,9 @@ constexpr int TT_GT = TP * TT_OPS;             // operand groups per tile
 constexpr lrx_kbox::UnfoldTiles kTT{NK, NS, NR, TP, TT_NW};
 constexpr long long TT_U = kTT.u(), TT_MP = kTT.mp(0), TT_NP = kTT.np(0), TT_W = kTT.w(0),
                     TT_OFF = kTT.off(), TT_LS = kTT.ls(0), TT_RS = kTT.rs(0), TT_FLAG = kTT.flag();
-// Bank cell of row j at flat k: mode 11 the k-box stage's padded row, mode 7 the family's.
-#if LRX_MODE == 11
-constexpr int TT_RSTRIDE = lrx_kbox::Geo<NX, NY, NZ>::RS;
-__device__ __forceinline__ int tt_cell(int j, int k) { return j * TT_RSTRIDE + lrx_kbox::Geo<NX, NY, NZ>::at(k); }
-#else
+// Bank cell of row j at flat k: the k-box stage's padded row (modes 7 and 11 alike).
 constexpr int TT_RSTRIDE = SP;
-__device__ __forceinline__ int tt_cell(int j, int k) { return j * TT_RSTRIDE + k; }
-#endif
+__device__ __forceinline__ int tt_cell(int j, int k) { return j * TT_RSTRIDE + cell(k); }
 struct TileTabs {
     char* s;
     __device__ lrx_c2* u() const { return reinterpret_cast<lrx_c2*>(s + TT_U); }
@@ -1028,7 +1008,7 @@ extern "C" __global__ void __launch_bounds__(256, LRX_MINB) lrx_kconv(
         const lrx_c2* w = s.w(b);
         for (int i = threadIdx.x; i < RB * NK; i += blockDim.x) {
             const int k = i / RB, j = i % RB;
-            if (j / SS < npr) sm[j * SP + k] = lrx_mul(sm[j * SP + k], w[(j / SS) * NK + k]);
+            if (j / SS < npr) sm[j * SP + cell(k)] = lrx_mul(sm[j * SP + cell(k)], w[(j / SS) * NK + k]);
         }
         __syncthreads();
         transform3<fft_direction::forward>(sm);
@@ -1040,7 +1020,7 @@ extern "C" __global__ void __launch_bounds__(256, LRX_MINB) lrx_kconv(
                 long long xx = x0, yy = y0 + jp;
                 while (yy >= my) { yy -= my; ++xx; }
                 const int a = (j % SS) / NS, bb = j % NS;
-                const lrx_c2 v = sm[j * SP + k];
+                const lrx_c2 v = sm[j * SP + cell(k)];
                 y[((ko * NS + a) * rows + xx) * (my * NS) + bb * my + yy] = {v.x * scale, v.y * scale};
             }
         }                                              // the loop top syncs before the next gather
@@ -1063,7 +1043,7 @@ extern "C" __global__ void __launch_bounds__(256) lrx_kconv(
         const long long pr = (r0 + j) / SSO;
         if (pr < pairs) {
             const long long rx = pr / my, yy = pr - rx * my, xx = min(lrx_x_of(xb, rx), mx - 1);
-            sm[j * SP + k] = lrx_mul(sm[j * SP + k], kern[((long long)k * mx + xx) * my + yy]);
+            sm[j * SP + cell(k)] = lrx_mul(sm[j * SP + cell(k)], kern[((long long)k * mx + xx) * my + yy]);
         }
     }
     __syncthreads();
@@ -1076,7 +1056,7 @@ extern "C" __global__ void __launch_bounds__(256) lrx_kconv(
             const long long rx = pr / my, yy = pr - rx * my;
             // (a, b) within the stored block: U is (n_out, NA, rows, NA, my).
             const int a = (int)((r % SSO) / NA), b = (int)(r % NA);
-            const lrx_c2 v = sm[j * SP + k];
+            const lrx_c2 v = sm[j * SP + cell(k)];
             y[((ko * NA + a) * rows + rx) * (my * NA) + b * my + yy] = {v.x * scale, v.y * scale};
         }
     }
@@ -1114,7 +1094,7 @@ extern "C" __global__ void __launch_bounds__(256) lrx_kconv(
         lrx_c2 g[SS], acc[SS];
 #pragma unroll
         for (int ab = 0; ab < SS; ++ab) {
-            const lrx_c2 z = sm[(jp * SS + ab) * SP + k];
+            const lrx_c2 z = sm[(jp * SS + ab) * SP + cell(k)];
             g[ab].x = __dmul_rn(z.x, v.s_g);
             g[ab].y = __dmul_rn(z.y, v.s_g);
             acc[ab].x = 0.0;
@@ -1141,7 +1121,7 @@ extern "C" __global__ void __launch_bounds__(256) lrx_kconv(
             }
         }
 #pragma unroll
-        for (int ab = 0; ab < SS; ++ab) sm[(jp * SS + ab) * SP + k] = acc[ab];
+        for (int ab = 0; ab < SS; ++ab) sm[(jp * SS + ab) * SP + cell(k)] = acc[ab];
     }
     __syncthreads();
     transform3<fft_direction::forward>(sm);
@@ -1152,7 +1132,7 @@ extern "C" __global__ void __launch_bounds__(256) lrx_kconv(
         if (pr < pairs && ko >= 0) {
             const long long xx = pr / my, yy = pr - xx * my;
             const int a = (int)((r % SS) / NS), b = (int)(r % NS);
-            const lrx_c2 z = sm[j * SP + k];
+            const lrx_c2 z = sm[j * SP + cell(k)];
             y[((ko * NS + a) * mx + xx) * t.nl + b * my + yy] =
                 {__dmul_rn(__dmul_rn(z.x, v.s_f), v.mult), __dmul_rn(__dmul_rn(z.y, v.s_f), v.mult)};
         }
@@ -1340,7 +1320,7 @@ extern "C" __global__ void __launch_bounds__(256) lrx_kconv(
         if (pr < pairs) {
             const long long xx = pr / my, yy = pr - xx * my;
             const int a = (int)((r % SS) / NR), b = (int)(r % NR);
-            const lrx_c2 v = sm[j * SP + k];
+            const lrx_c2 v = sm[j * SP + cell(k)];
             y[((long long)k * t.ml + xx * NS + a) * t.nl + yy * NR + b] = {v.x * scale, v.y * scale};
         }
     }
@@ -1788,7 +1768,8 @@ static ffi::Error build(int mode, int nkx, int nky, int nkz, int ns, bool f32,
     LRX_CUDA_CHECK(cudaDeviceGetAttribute(&cc_minor, cudaDevAttrComputeCapabilityMinor, dev), "cc minor");
     LRX_CUDA_CHECK(cudaDeviceGetAttribute(&smem_optin, cudaDevAttrMaxSharedMemoryPerBlockOptin, dev),
                    "max opt-in shared memory");
-    const int nk = nkx * nky * nkz, sp = nk | 1;
+    // A resident row is the k-box stage's padded row (the embedded source's SP).
+    const int nk = nkx * nky * nkz, sp = static_cast<int>(lrx_kbox::Geometry{nkx, nky, nkz}.rs());
     const bool pair = mode < 2 || mode == 6;           // three banks per row
     const int banks = pair ? 3 : 1;
     const long long rows_max = pair ? kRowsMax : kRowsMax1;
@@ -2023,7 +2004,7 @@ static ffi::Error build(int mode, int nkx, int nky, int nkz, int ns, bool f32,
     prog.name = "lrx_kconv_mathdx.cu";
     if (std::string_view(prog.src).find(ag::kHeaderName) != std::string_view::npos)
         prog.headers = {{ag::kHeaderName, ag::kHeaderSrc}};
-    if (mode == 11 || kbox_rows || lor_split || m7_tp)
+    if (mode != 10)                                    // every kSrc mode's banks are the stage's rows
         prog.headers.push_back({kbox::kHeaderName, kbox::kHeaderSrc});
     prog.defs = defs;
     nvrtc::mathdx_toolchain(root, cuda_inc, "cufftdx", &prog);
