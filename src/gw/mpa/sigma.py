@@ -6,9 +6,6 @@ import dataclasses
 
 import gc
 import math
-import os
-import sys
-import time
 from dataclasses import replace
 from functools import lru_cache, partial
 
@@ -33,34 +30,15 @@ from gw.ppm_tau_kernel import (_get_sigma_kij_kernel,
 from gw.ppm_windows import branches_for_omega_grid
 from gw import quadrature_log
 from gw.sigma_box_plan import plan_sigma_windows, sigma_rule_request_cache
-from gw.sigma_plan import resolve_sigma_plan
 from gw.wavefunction_bundle import (
     parent_sigma_operands, sigma_face_kernel_kwargs)
-from runtime.env_flags import env_bool
 from runtime.padding import combined_divisor, pad_to_axis, padded_axis
 
 from .sigma_windows import (OCCUPATION_WINDOW_THRESHOLD_DEFAULT,
-                            CROSSING_NODE_FLOOR,
-                            build_shared_sigma_windows,
                             summarize_sigma_poles,
                             shared_pole_frequencies,
                             shared_pole_intervals,
                             summarize_shared_poles)
-
-
-# The pane route is an immutable comparison instrument, not a production
-# accuracy policy.  Freezing its historical target here lets old/new box-rule
-# comparisons keep the same control while retiring the measured-sector deck
-# dial from the production path.
-_PANE_CONTROL_TARGET_ERROR = 6.5e-4
-# The pane CONTROL's own rank cap.  There is no deck pair ceiling any more
-# (owner ruling 2026-09-02); the control keeps a generous fixed cap only
-# because its legacy planner needs one to size its tables.
-_PANE_CONTROL_MAX_RANK = 4096
-
-
-_DEBUG_GN_ODD_RESIDUE_OFF_ENV = "LORRAX_DEBUG_GN_ODD_RESIDUE_OFF"
-_DEBUG_MAX_TAU_DISPATCHES_ENV = "LORRAX_DEBUG_SIGMA_MAX_TAU_DISPATCHES"
 
 
 def _unfenced(name, *, sync_ranks=True):
@@ -185,49 +163,6 @@ def shared_pole_hole_kernel(mesh_xy):
     from common.collectives import transpose_xy
     return jax.jit(lambda w_full, minus_q: transpose_xy(w_full[minus_q], mesh_xy),
                    out_shardings=NamedSharding(mesh_xy, P(None, "x", "y")))
-
-
-_EVEN_PART_ENV = "LORRAX_DEBUG_SHARED_POLE_EVEN_PART"
-
-
-def debug_shared_pole_even_part(ordered):
-    """DEBUG-ONLY: the LORRAX_DEBUG_SHARED_POLE_EVEN_PART choice ("all", "exclude_q0") or None.
-
-    Sigma then consumes the even part W^even_q = [W_q + W_-q^T]/2 of an ordered store, the odd-channel
-    diagnostic Sigma[W] - Sigma[W^even]. Refuses unknown values and TRS stores (W is already even).
-    """
-    import os
-    value = os.environ.get(_EVEN_PART_ENV, "").strip().lower()
-    if value in ("", "0", "off", "false", "no"):
-        return None
-    if value not in ("all", "exclude_q0"):
-        raise ValueError(f"{_EVEN_PART_ENV}={value!r}: want all or exclude_q0 (debug-only)")
-    if not ordered:
-        raise ValueError(f"{_EVEN_PART_ENV}={value!r}: refuses on a time-reversal-symmetric store, whose W is already even")
-    if jax.process_index() == 0:
-        print(f"WARNING -- DEBUG: {_EVEN_PART_ENV}={value}: Sigma consumes W^even = [W_q + W_-q^T]/2 "
-              f"of the ordered store{' except at q = 0' if value == 'exclude_q0' else ''}; not a physical result", flush=True)
-    return value
-
-
-@lru_cache(maxsize=None)
-def shared_pole_even_part_kernel(mesh_xy, *, exclude_q0):
-    """DEBUG-ONLY W(tau) of the even part of an ordered store, for both causal branches.
-
-    The even part is itself an ordered store: parent q holds {b_j(q)/sqrt2 at Omega_j(q)} and
-    {conj(b_j(-q))/sqrt2 at Omega_j(-q)}. Its particle W at q is [W_+(q) + W_+(-q)^T]/2, and its hole
-    side, W^even_+(-q)^T, is the same matrix, so one full-q tile serves both branches. ``exclude_q0``
-    keeps the ordered W at q = 0 (canonical row 0): W_+(0) for conduction windows, W_+(0)^T for valence.
-    """
-    from common.collectives import transpose_xy
-
-    def even(w_full, minus_q, valence):
-        mirrored = transpose_xy(w_full[minus_q], mesh_xy)
-        half = 0.5 * (w_full + mirrored)
-        if not exclude_q0:
-            return half
-        return half.at[0].set(jnp.where(valence, mirrored[0], w_full[0]))
-    return jax.jit(even, out_shardings=NamedSharding(mesh_xy, P(None, "x", "y")))
 
 
 def _shared_pole_fixed_q_policy(header):
@@ -452,7 +387,6 @@ def _shared_pole_w_synthesis(io, meta, header, frequencies, schedule, *, mesh_xy
             raise ValueError("shared-pole panel capacities must be positive")
         # Ordered stores: conduction windows use W_+(q), valence windows W_+(-q)^T.
         ordered = header.get("representation") == "scalar-ordered-ph"
-        even_part = debug_shared_pole_even_part(ordered)
         if kmax == 0:
             zero = _zeros(mesh_xy, (Q, m, m))
             return WSynthesis(lambda _ref, _time, _hole: zero(),
@@ -537,8 +471,6 @@ def _shared_pole_w_synthesis(io, meta, header, frequencies, schedule, *, mesh_xy
         from symmetry_maps import q_negation_index
         minus_q = np.asarray(q_negation_index(tuple(int(v) for v in header["grid"])))
         hole_kernel = shared_pole_hole_kernel(mesh_xy)
-        even_kernel = (shared_pole_even_part_kernel(mesh_xy, exclude_q0=even_part == "exclude_q0")
-                       if even_part else None)
     _band_fence('tau.factor_read', sync_ranks=True)
     with timing.section('tau.factor_read'):
         capacity = getattr(meta, "shared_pole_capacity", None)
@@ -619,8 +551,6 @@ def _shared_pole_w_synthesis(io, meta, header, frequencies, schedule, *, mesh_xy
                                     add, lambda acc: acc, acc)
             total = jax.lax.fori_loop(
                 0, n_chunks, chunk, _zeros(mesh_xy, (Q, m, m))() if total is None else total)
-        if even_part:
-            return even_kernel(total, jnp.asarray(minus_q), hole)
         if hole:
             return hole_kernel(total, jnp.asarray(minus_q))
         return total
@@ -646,7 +576,7 @@ def _shared_pole_w_synthesis(io, meta, header, frequencies, schedule, *, mesh_xy
                 capacity.live_stages = ambient
             closed = True
 
-    key = ("scalar", mesh_xy, Q, m, width, n_chunks, ordered, even_part,
+    key = ("scalar", mesh_xy, Q, m, width, n_chunks, ordered,
            tuple((p["span"], p["count"], p["static"]) for p in panels))
     return WSynthesis(w_kernel, window_operands, lambda: (panel_factors, panel_poles),
                       close, native_workspace, key, ordered=ordered)
@@ -870,65 +800,6 @@ def _shared_pole_memory_schedule(meta, header, *, mesh_xy, layout="face"):
                 routed_bytes_per_panel_per_rank=footprint["routed_bytes_per_panel_per_rank"],
                 inherited_sigma_peak_status="NOT_MEASURED",
                 projection_matrix_bytes_per_rank=int(projection_bytes))
-
-
-def _resolve_debug_max_tau_dispatches(*, print_fn=print):
-    """Return the debug-only bounded-sweep length, or ``None``.
-
-    A bounded sweep is a performance instrument, not a quadrature rule: the
-    executor exits cleanly after the requested number of real-shape tau
-    dispatches and never returns a partial Sigma cube to an output consumer.
-    """
-    raw = os.environ.get(_DEBUG_MAX_TAU_DISPATCHES_ENV)
-    if raw is None or not raw.strip():
-        return None
-    try:
-        count = int(raw)
-    except ValueError as exc:
-        raise ValueError(
-            f"{_DEBUG_MAX_TAU_DISPATCHES_ENV} must be a positive integer; "
-            f"got {raw!r}") from exc
-    if count <= 0:
-        raise ValueError(
-            f"{_DEBUG_MAX_TAU_DISPATCHES_ENV} must be a positive integer; "
-            f"got {raw!r}")
-    print_fn(
-        "WARNING -- DEBUG: "
-        f"{_DEBUG_MAX_TAU_DISPATCHES_ENV}={count}; the MPA Sigma executor "
-        "will stop after that many tau dispatches and WILL NOT produce "
-        "scientific Sigma/QP output.")
-    return count
-
-
-def _debug_probe_print(line):
-    """Emit one live rank-zero line outside the production report sink."""
-    if jax.process_index() == 0:
-        # gw_jax deliberately sends incidental stdout to /dev/null.  This
-        # opt-in diagnostic must survive that production stream boundary.
-        print(line, file=sys.stderr, flush=True)
-
-
-def _resolve_mpa_odd_residue_debug(ordered_residues, *, print_fn=print):
-    """Resolve the shared GN/MPA odd-residue A/B switch for an MPA fit."""
-    enabled = env_bool(
-        _DEBUG_GN_ODD_RESIDUE_OFF_ENV, False, print_fn=print_fn)
-    if enabled and not bool(ordered_residues):
-        raise ValueError(
-            "GATE debug_gn_odd_residue_off_scope:\n"
-            f"  got:  {_DEBUG_GN_ODD_RESIDUE_OFF_ENV}=1 with an "
-            "MPA single-residue/TRS fit\n"
-            "  want: this debug switch only on a measured-broken-TR "
-            "ordered-residue MPA fit\n"
-            "  why:  a TRS MPA fit has no time-reversal-odd residue to "
-            "discard\n"
-            "  fix:   unset LORRAX_DEBUG_GN_ODD_RESIDUE_OFF")
-    if enabled:
-        print_fn(
-            "WARNING -- DEBUG: LORRAX_DEBUG_GN_ODD_RESIDUE_OFF=1; "
-            "measured-broken-TR MPA fit is discarding the "
-            "anti-Hermitian frequency-odd residue: D=0 and R+=R-=B. "
-            "This arm is for A/B diagnosis only, never production.")
-    return enabled
 
 
 def _geometry_residue(B, B_odd):
@@ -1155,7 +1026,6 @@ def _integrate_sigma_batches(
         omega = np.asarray(omega_grid_ry, np.float64)
         if omega.ndim != 1 or not omega.size:
             raise ValueError("omega_grid_ry must be a nonempty vector")
-        debug_max_tau = _resolve_debug_max_tau_dispatches(print_fn=print_fn)
         s = wfns.slices
         sigma_axis = sigma_band_axis(
             int(s.nb_sigma), mesh_xy, ansatz="dynamic")
@@ -1231,15 +1101,10 @@ def _integrate_sigma_batches(
                 for _row in plan:
                     if _batch_rows(_row, _batch) is not None:
                         total_tau += len(np.asarray(_row.window.nodes.t))
-        progress_total = (
-            total_tau if debug_max_tau is None
-            else min(total_tau, debug_max_tau))
         progress = LoopProgress(
-            max(1, progress_total), print_fn, title="Sigma tau sweep",
+            max(1, total_tau), print_fn, title="Sigma tau sweep",
             item_name="tau node", max_updates=20)
         progress.start()
-        sweep_wall_start = None
-        stop_probe = False
     for lo, Omega, B, B_odd in batches:
         if not synthesis and getattr(meta, 'mu_basis', None) is not None:
             # The pole store keeps the canonical centroid order; the run
@@ -1327,7 +1192,6 @@ def _integrate_sigma_batches(
                     print_fn(
                         "  MPA Sigma sweep begin: one executable per window "
                         "prewarmed")
-                    sweep_wall_start = time.perf_counter()
                     sweep_started = True
             fence('tau.window_setup', sync_ranks=True)
             with timing.section('tau.window_setup'):
@@ -1335,13 +1199,6 @@ def _integrate_sigma_batches(
                     jax.device_get(win.nodes.t), np.complex128)
                 alpha_nodes = np.asarray(
                     jax.device_get(win.nodes.alpha), np.complex128)
-                if debug_max_tau is not None:
-                    remaining = debug_max_tau - n_tau
-                    if remaining <= 0:
-                        stop_probe = True
-                        break
-                    t_nodes = t_nodes[:remaining]
-                    alpha_nodes = alpha_nodes[:remaining]
             # One executable per window: the node loop runs on device.
             total = accumulator.integrate_window(
                 row_kernel, tau_arguments, t_nodes, alpha_nodes,
@@ -1350,28 +1207,9 @@ def _integrate_sigma_batches(
                 progress.step(wait=total)
             n_tau += len(t_nodes)
             n_sweeps += 1
-            if debug_max_tau is not None and n_tau >= debug_max_tau:
-                stop_probe = True
-                break
         del B, B_odd, Omega
         gc.collect()
-        if stop_probe:
-            break
     progress.finish()
-
-    if debug_max_tau is not None:
-        # Close every outstanding window update before stopping the
-        # measurement clock.  The partial cube dies here; it is never wrapped
-        # in SigmaOmegaResult or handed to an output path.
-        jax.block_until_ready(accumulator.finalize())
-        elapsed = time.perf_counter() - sweep_wall_start
-        _debug_probe_print(
-            f"  DEBUG bounded Sigma tau sweep: {n_tau} dispatches in "
-            f"{elapsed:.6f} s ({elapsed / max(1, n_tau):.6f} s/dispatch)")
-        _debug_probe_print(
-            "  DEBUG bounded Sigma tau sweep complete; exiting before "
-            "Sigma/QP output (intentional rc=0).")
-        raise SystemExit(0)
 
     fence('tau.finalize', sync_ranks=True)
     with timing.section('tau.finalize'):
@@ -1400,7 +1238,7 @@ def _integrate_sigma_batches(
         ratio = None
         if max_b or max_d:
             ratio = max_d / max_b if max_b else np.inf
-            state = "DEBUG ODD OFF (D discarded)" if odd_residue_off else "enabled"
+            state = "D=0 twin" if odd_residue_off else "enabled"
             print_fn(
                 f"  MPA odd Sigma: measured-broken-TR ordered residues; {state}; "
                 f"max|D|/max|B|={ratio:.12e}")
@@ -1758,8 +1596,6 @@ def compute_sigma_c_mpa_omega_grid(
             expected_screening_diagrams=expected_screening_diagrams)
         n_poles = int(ledger["n_p"])
         ordered_residues = bool(ledger["ordered_residues"])
-    odd_residue_off = _resolve_mpa_odd_residue_debug(
-        ordered_residues, print_fn=print_fn)
     pole_batch_size = _bounded_pole_batch_size(pole_batch_size)
     with timing.section("sigma.branches"):
         branches = (_branches(
@@ -1767,9 +1603,6 @@ def compute_sigma_c_mpa_omega_grid(
             occupation_state=occupation_state,
             occupation_window_threshold=occupation_window_threshold)
             if sigma_branches is None else tuple(sigma_branches))
-    plan_mode = resolve_sigma_plan()
-    if shared_pole and plan_mode != "box":
-        raise ValueError("shared-pole Sigma requires the production box planner")
     # ONE collective handle for the census walk, the planner, and the
     # executor walk — the whole Σ stage of this iteration.  The reader
     # does its h5py reads (ledger, unfold tables) before that handle
@@ -1825,8 +1658,6 @@ def compute_sigma_c_mpa_omega_grid(
                 slice(lo, hi), unfold=getattr(reader, "q_wedge", None) is None,
                 return_sharded=True, to_unit="Ry", include_odd=True)
             _refuse_nonfinite_pole_slab(lo, Omega, B, B_odd)
-            if B_odd is not None and odd_residue_off:
-                B_odd = jnp.zeros_like(B_odd)
             summaries.extend(summarize_sigma_poles(
                 Omega, _geometry_residue(B, B_odd), branches,
                 regularization_width_ry=regularization_width_ry,
@@ -1834,100 +1665,83 @@ def compute_sigma_c_mpa_omega_grid(
                 occupation_window_threshold=occupation_window_threshold))
             del Omega, B, B_odd
             gc.collect()
-        if plan_mode == "panes":
-            plan, geometry = build_shared_sigma_windows(
-                summaries, branches,
-                regularization_width_ry=regularization_width_ry,
-                edge_factor=edge_factor,
-                target_error=_PANE_CONTROL_TARGET_ERROR,
-                max_rank=_PANE_CONTROL_MAX_RANK,
-                crossing_max_nodes=max(
-                    CROSSING_NODE_FLOOR, _PANE_CONTROL_MAX_RANK),
-                omega_grid_step_ry=omega_grid_step_ry,
-                occupation_window_threshold=occupation_window_threshold)
-        else:
-            # Rule fitting is its own timing row: on the Si b80/c504 deck the
-            # cold fits took ~180 s of a 194 s "Sigma" stage while the tau
-            # sweep took 6 s (2026-09-03, runs/DEV/122), and the table
-            # could not tell them apart.
-            with timing.section("sigma.rule_plan"):
-                plan, geometry = plan_sigma_windows(
-                    summaries, branches, omega_grid_ry,
-                    regularization_width_ry,
-                    eps=quadrature_eps,
-                    cache_dir=quadrature_cache_dir,
-                    print_fn=print_fn, edge_factor=edge_factor,
-                    fixed_rule_session=fixed_quadrature_session,
-                    analytic_line=bool(analytic_line),
-                    material_class=material_class,
-                    fixed_pole_support_ry=fixed_pole_support_ry,
-                    certificate_pole_summaries=certificate)
+        # Rule fitting is its own timing row: on the Si b80/c504 deck the
+        # cold fits took ~180 s of a 194 s "Sigma" stage while the tau
+        # sweep took 6 s (2026-09-03, runs/DEV/122), and the table
+        # could not tell them apart.
+        with timing.section("sigma.rule_plan"):
+            plan, geometry = plan_sigma_windows(
+                summaries, branches, omega_grid_ry,
+                regularization_width_ry,
+                eps=quadrature_eps,
+                cache_dir=quadrature_cache_dir,
+                print_fn=print_fn, edge_factor=edge_factor,
+                fixed_rule_session=fixed_quadrature_session,
+                analytic_line=bool(analytic_line),
+                material_class=material_class,
+                fixed_pole_support_ry=fixed_pole_support_ry,
+                certificate_pole_summaries=certificate)
         quadrature_log.record_sigma_plan(geometry)
-        if plan_mode == "panes":
+        print_fn(
+            f"  MPA windows [box]: "
+            f"eta={geometry['eta_ry'] * RYD_TO_EV:.4f} eV, "
+            f"eps={geometry['eps']:.3g}, "
+            f"certificate={geometry['rule_eps']:.3g}, "
+            f"{geometry['n_windows']} logical windows, "
+            f"{geometry['window_tau_pairs']} (window,tau) pairs, "
+            f"{geometry['distinct_tau_count']} branch-distinct tau, "
+            f"cache={geometry['cache_dir'] or 'off'}")
+        if geometry["sc_fixed_quadrature"]:
+            reasons = geometry.get("sc_fixed_recompute_reasons") or {}
             print_fn(
-                f"  MPA windows: eta={geometry['eta_ry'] * RYD_TO_EV:.4f} eV, "
-                f"{geometry['n_windows']} logical windows")
-        else:
-            print_fn(
-                f"  MPA windows [box]: "
-                f"eta={geometry['eta_ry'] * RYD_TO_EV:.4f} eV, "
-                f"eps={geometry['eps']:.3g}, "
-                f"certificate={geometry['rule_eps']:.3g}, "
-                f"{geometry['n_windows']} logical windows, "
-                f"{geometry['window_tau_pairs']} (window,tau) pairs, "
-                f"{geometry['distinct_tau_count']} branch-distinct tau, "
-                f"cache={geometry['cache_dir'] or 'off'}")
-            if geometry["sc_fixed_quadrature"]:
-                reasons = geometry.get("sc_fixed_recompute_reasons") or {}
+                "  SC fixed quadrature: "
+                f"iteration={geometry['sc_fixed_iteration']}, "
+                f"rules={geometry['sc_rule_mode']}, "
+                f"initialized={geometry['sc_fixed_initialized']}, "
+                f"frozen={geometry['sc_rule_mode'] == 'frozen' and not reasons and geometry['sc_fixed_rebuilds_this_iteration'] == 0}, "
+                f"escaped={geometry['sc_fixed_escaped_windows']}/"
+                f"{geometry['n_windows']}, "
+                f"rebuilds_this_iteration="
+                f"{geometry['sc_fixed_rebuilds_this_iteration']}, "
+                f"rebuilds_total="
+                f"{geometry['sc_fixed_total_rebuild_count']}, "
+                f"material_class={geometry.get('sc_fixed_material_class')}, "
+                f"pair_cost={geometry['window_tau_pairs']}, "
+                f"initial_pair_cost="
+                f"{geometry['sc_fixed_initial_window_tau_pairs']}, "
+                f"max_state_pad={geometry['sc_state_edge_padding_ev']:.3f} eV (energy-proportional), "
+                f"pole_pad="
+                f"{100.0 * geometry['sc_pole_extent_padding_fraction']:.1f}%")
+            for name, reason in sorted(reasons.items()):
                 print_fn(
-                    "  SC fixed quadrature: "
-                    f"iteration={geometry['sc_fixed_iteration']}, "
-                    f"rules={geometry['sc_rule_mode']}, "
-                    f"initialized={geometry['sc_fixed_initialized']}, "
-                    f"frozen={geometry['sc_rule_mode'] == 'frozen' and not reasons and geometry['sc_fixed_rebuilds_this_iteration'] == 0}, "
-                    f"escaped={geometry['sc_fixed_escaped_windows']}/"
-                    f"{geometry['n_windows']}, "
-                    f"rebuilds_this_iteration="
-                    f"{geometry['sc_fixed_rebuilds_this_iteration']}, "
-                    f"rebuilds_total="
-                    f"{geometry['sc_fixed_total_rebuild_count']}, "
-                    f"material_class={geometry.get('sc_fixed_material_class')}, "
-                    f"pair_cost={geometry['window_tau_pairs']}, "
-                    f"initial_pair_cost="
-                    f"{geometry['sc_fixed_initial_window_tau_pairs']}, "
-                    f"max_state_pad={geometry['sc_state_edge_padding_ev']:.3f} eV (energy-proportional), "
-                    f"pole_pad="
-                    f"{100.0 * geometry['sc_pole_extent_padding_fraction']:.1f}%")
-                for name, reason in sorted(reasons.items()):
-                    print_fn(
-                        f"    SC fixed quadrature recompute: {name!r} "
-                        f"({reason})")
-            for branch in geometry["branches"]:
-                for window in branch["windows"]:
-                    prefix = (
-                        "    SC fixed window: "
-                        if window["sc_fixed_rule"] else "    ")
-                    box = tuple(window["box_ry"])
-                    padded = (
-                        "" if not window["sc_fixed_rule"] else
-                        f"padded_box="
-                        f"{tuple(value * RYD_TO_EV for value in window['sc_fixed_padded_box_ry'])} "
-                        "eV, ")
-                    if window["sc_fixed_rule"]:
-                        box = tuple(value * RYD_TO_EV for value in box)
-                    print_fn(
-                        f"{prefix}{window['name']}: "
-                        f"n_tau={window['node_count']}, "
-                        f"nodes={window['node_digest']}, "
-                        f"cache={window['cache_status']}, "
-                        f"box={box} "
-                        f"{'eV' if window['sc_fixed_rule'] else 'Ry'}, "
-                        f"{padded}"
-                        f"sup={window['sup_error']:.6g}/"
-                        f"{window['eps']:.6g} ({window['criterion']}), "
-                        f"kappa_max={window['kappa_max']:.6g}, "
-                        f"noise={window['runtime_noise_bound']:.6g}/"
-                        f"{window['runtime_noise_budget']:.6g}")
+                    f"    SC fixed quadrature recompute: {name!r} "
+                    f"({reason})")
+        for branch in geometry["branches"]:
+            for window in branch["windows"]:
+                prefix = (
+                    "    SC fixed window: "
+                    if window["sc_fixed_rule"] else "    ")
+                box = tuple(window["box_ry"])
+                padded = (
+                    "" if not window["sc_fixed_rule"] else
+                    f"padded_box="
+                    f"{tuple(value * RYD_TO_EV for value in window['sc_fixed_padded_box_ry'])} "
+                    "eV, ")
+                if window["sc_fixed_rule"]:
+                    box = tuple(value * RYD_TO_EV for value in box)
+                print_fn(
+                    f"{prefix}{window['name']}: "
+                    f"n_tau={window['node_count']}, "
+                    f"nodes={window['node_digest']}, "
+                    f"cache={window['cache_status']}, "
+                    f"box={box} "
+                    f"{'eV' if window['sc_fixed_rule'] else 'Ry'}, "
+                    f"{padded}"
+                    f"sup={window['sup_error']:.6g}/"
+                    f"{window['eps']:.6g} ({window['criterion']}), "
+                    f"kappa_max={window['kappa_max']:.6g}, "
+                    f"noise={window['runtime_noise_bound']:.6g}/"
+                    f"{window['runtime_noise_budget']:.6g}")
         with timing.section("sigma.tau_sweep"):
             if shared_pole:
                 _band_fence('tau.synthesis_setup', sync_ranks=True)
@@ -1959,7 +1773,7 @@ def compute_sigma_c_mpa_omega_grid(
                 total = integrate_sigma_store(
                     wfns, reader, n_poles, plan, omega_grid_ry, meta, mesh_xy,
                     pole_batch_size=pole_batch_size, brackets=band_brackets,
-                    band_counts=band_counts, odd_residue_off=odd_residue_off,
+                    band_counts=band_counts,
                     print_fn=print_fn)
         # odd_reference=False: the caller builds its own D=0 reference (the GN
         # arm does, in ppm_pipeline), so a second twin here would be a whole

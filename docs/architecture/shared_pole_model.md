@@ -327,10 +327,6 @@ finalized with no Γ body ([four-current heads](../theory/four-current-head-corr
 `tests/test_head_direct_ordered.py`). Metal head routes are
 [self-consistency](../self_consistency.md#metals-direct-drude-head).
 
-**Debug.** `LORRAX_DEBUG_SHARED_POLE_EVEN_PART` (`all` or `exclude_q0`) feeds
-$[W_+(q)+W_+(-q)^{\mathsf T}]/2$ to both branches of an ordered store, so
-$\Sigma^{\rm odd}=\Sigma[W]-\Sigma[W^{\rm even}]$ can be measured.
-
 ## 9 Gates and tests
 
 Every construction receipt row carries version, value, threshold and

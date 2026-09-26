@@ -668,8 +668,6 @@ def finalize_dynamic_sigma(
             # EQP receipt.  Only the SC path passes False today, and it
             # replaces the field afterwards with the converged write.
             sigma_omega_h5_path = None
-        from .ppm_sigma import host_rss_diag
-        host_rss_diag("finalize: Sigma_c(E_DFT) evaluated")
         sig_x_rep = device_put_process_local(
             sig_x, NamedSharding(mesh_xy, P(None, None, None)))
         one_sided_core_mask = _qsgw_one_sided_core_mask(
@@ -732,7 +730,6 @@ def finalize_dynamic_sigma(
                 config=config, print_fn=print_fn)
 
         finalize_section.watch(sigma_c_omega, sigma_xc_qsgw, sigma_xc_qsgw_unextrap)
-        host_rss_diag("finalize: QSGW Sigma_xc built")
 
     _band_attrs = ((band_extrapolation or {}).get("attrs") or {})
     _band_counts_raw = _band_attrs.get("band_counts")

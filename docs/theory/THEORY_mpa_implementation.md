@@ -289,21 +289,6 @@ batch, so $N_{\rm eval}=\sum_wN_wm_w$. The batch is a memory choice, not a
 spectral classification. Symmetry reduces storage and all non-FFT work on the
 wedge; inputs are unfolded before the $k$-grid convolution.
 
-### Pane planner (comparison control) {#pane-planner}
-
-`LORRAX_SIGMA_PLAN=panes` replaces the box planner with a frozen pane planner
-(`gw.mpa.sigma_windows.build_shared_sigma_windows`) for comparisons; it is not
-the production path and is refused with the shared-pole $W$. With
-$T=\max|\omega|+m_{\rm edge}\eta$ it splits each crossing branch's state × pole
-product into a **crossing core** ($E_A\le T$, $a_p\le T$; positive causal
-Gauss rule, $N_\times=\mathcal O(F/\gamma_{\min}\log1/\epsilon)$), an
-**electronic stripe** ($E_A>T$, $a_p\le T$) and a **plasmon slab**
-($a_p>T$), the latter two with rotated-contour sector rules whose rank grows as
-$\log(|d|_{\max}/|d|_{\min})\log(1/\epsilon)$. Rectangular selectors keep the
-band and pole sums separable; the core is deliberately overinclusive for that
-reason. Its tolerances are frozen constants, and its one-sided windows are the
-ones that use $Z$.
-
 ## 8. Head, output and QSGW boundary
 
 The $q\to0$ head is a scalar $W_{c,\rm head}(z)=W_{\rm head}(z)-v_{\rm head}$
@@ -359,7 +344,7 @@ the direct QP-basis head. The loop itself is [self-consistency](../self_consiste
 | multipole fit algebra and guards | `gw.mpa.pade_fit`, `gw.mpa.small_eig` |
 | column-block walk and checkpoint epochs | `gw.mpa.tiling`, `gw.mpa.fit_driver` |
 | sample and pole bytes | `file_io.mpa_store` through SlabIO |
-| Σ box planner / pane planner | `gw.sigma_box_plan` / `gw.mpa.sigma_windows` |
+| Σ box planner and its pole census | `gw.sigma_box_plan` / `gw.mpa.sigma_windows` |
 | Σ executor | `gw.mpa.sigma` |
 | shared $G\times W$ spatial kernel | `gw.ppm_tau_kernel` |
 | accumulation into real-frequency Σ | `gw.ppm_accumulators` |
