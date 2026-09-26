@@ -26,14 +26,14 @@ project = contract_bands_block_reshard(
     face_shape=None,          # (nk, nb_full, n_μ, nspinor), required for face/axis
     right_face_shape=None,    # rectangular operator: right endpoint's shape
     face_band_extent=None,
-    nu_block=None,            # face/axis: widest ν block (local right centroids); default all
+    row_block=None,           # face/axis: widest x block's local μ rows (xn·bx); default all
 )
 out = project(psi_left, O, psi_right)
-# face/axis, an operator in ν blocks (every spin): one reduction per call
+# face/axis, an operator in x blocks on the slab pieces (every spin): one reduction per call
 faces = project.prepare(psi_left, psi_right)
 acc = None
-for y0, by in blocks:                     # gw.greens_function_kernel.sigma_nu_blocks
-    acc = project.accumulate(faces, O_block, nu=(y0, by), acc=acc)
+for rows in project.row_blocks(n):        # common.contract_bands.face_row_blocks
+    acc = project.accumulate(faces, O_block, rows=rows, acc=acc)
 out = project.finish(acc)
 ```
 

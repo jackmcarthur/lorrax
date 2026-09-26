@@ -334,7 +334,7 @@ def wedge_cases(mesh, rng):
 
 
 def block_cases(mesh, rng):
-    """Mode 7's stored nu blocks and conj-on-load partner vs the whole door (bitwise)."""
+    """Mode 7's stored x blocks and conj-on-load partner vs the whole door (bitwise)."""
     import zeta_mubatch_fixtures as fixtures
     from test_kconv_klead_unfold import block_case, c3_fixture
     recs = []

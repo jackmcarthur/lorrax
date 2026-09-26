@@ -51,9 +51,9 @@ _sigma_shared_tau_kernel_cache: dict[
 def _make_project_ri_reduce_scatter(
     mesh_xy: Mesh, *, merged_x: bool = True,
     layout: str = "face", face_shape=None, face_band_extent=None,
-    k_unfold_plan=None, nu_block=None,
+    k_unfold_plan=None, row_block=None,
 ) -> Callable[..., jax.Array]:
-    """Project Σ on the raw-parent rows (``(n_parent, ns, μ, ns, ν-block)`` blocks in); the completed frequency sum owns the band unfold."""
+    """Project Σ on the raw-parent rows (``(n_parent, ns, x-block, ns, ν)`` blocks in); the completed frequency sum owns the band unfold."""
     from common.contract_bands import contract_bands_block_reshard
 
     if k_unfold_plan is None or face_shape is None:
@@ -65,7 +65,7 @@ def _make_project_ri_reduce_scatter(
     inner = contract_bands_block_reshard(
         mesh_xy, channels="none", layout=layout,
         face_shape=(k_unfold_plan.n_parent, *face_shape[1:]),
-        face_band_extent=face_band_extent, nu_block=nu_block)
+        face_band_extent=face_band_extent, row_block=row_block)
     return inner
 
 
@@ -111,13 +111,14 @@ def get_sigma_spatial_kernel(
     with the typed unfold on its load (nvidia-mathdx on CUDA; the service's
     table composition and the FFTW gw_conv handler on cpu).
 
-    The output Σ_k is stored and projected in (ns/d)² ν blocks (local right
-    centroids, every spin) when the whole output would not fit beside the
-    parent Green (``greens_function_kernel.sigma_spin_block`` sizes ``d``;
-    ``partner_tiles`` counts the partner Green a caller holds: 1 for complex
-    weights, 0 when it is read as conj(G)).  Σ is linear in the block, so the
-    passes sum to the same Σ (round-off: the ν sum is split), and each pass
-    reads only its own pairs' Green and W.
+    The output Σ_k is stored and projected in (ns/d)² x blocks (local left
+    centroids on the face projector's slab pieces, every spin) when the whole
+    output would not fit beside the parent Green
+    (``greens_function_kernel.sigma_spin_block`` sizes ``d``; ``partner_tiles``
+    counts the partner Green a caller holds: 1 for complex weights, 0 when it
+    is read as conj(G)).  Σ is linear in the block, so the passes sum to the
+    same Σ (round-off: the μ sum is split), and each pass reads only its own
+    pairs' Green and W.
     """
     kgrid = tuple(int(x) for x in kgrid)
     nk_tot = kgrid[0] * kgrid[1] * kgrid[2]
@@ -135,22 +136,21 @@ def get_sigma_spatial_kernel(
                              norm='ortho', mult=-1.0 / np.sqrt(float(nk_tot)))
     if k_unfold_plan is None:
         raise ValueError("Sigma spatial kernel requires the typed parent unfold plan.")
-    from .greens_function_kernel import sigma_nu_blocks, sigma_spin_block
+    from .greens_function_kernel import sigma_row_blocks, sigma_spin_block
     ns = int(face_shape[3])
     d = sigma_spin_block(n_parent=k_unfold_plan.n_parent, n_rmu=int(face_shape[2]), ns=ns,
                          mesh=mesh_xy, partner_tiles=partner_tiles)
     unfold_conv = make_kconv_klead_unfold(mesh_xy, kgrid, k_unfold_plan.unfold_load_tables(),
                                           store_rows=k_unfold_plan.parent_full_rows,
                                           norm='ortho', mult=-1.0 / np.sqrt(float(nk_tot)))
-    ny = int(face_shape[2]) // int(mesh_xy.shape['y'])
-    blocks = ((None,) if d == ns else sigma_nu_blocks(ny, (ns // d) ** 2))
+    blocks = sigma_row_blocks(n_rmu=int(face_shape[2]), ns=ns, d=d, mesh=mesh_xy)
     project = _make_project_ri_reduce_scatter(
         mesh_xy, merged_x=merged_x, layout=layout, face_shape=face_shape,
         face_band_extent=face_band_extent, k_unfold_plan=k_unfold_plan,
-        nu_block=None if d == ns else blocks[0][1])
+        row_block=None if d == ns else blocks[0][1] * blocks[0][3])
 
     def convolve_project(psi_proj_xr, psi_proj_yn, G_parents, W_prep):
-        """Σ on the parent rows, one stored output ν block at a time (one pass at d = ns).
+        """Σ on the parent rows, one stored output x block at a time (one pass at d = ns).
 
         ψ is oriented once and every block adds into one rank-local band
         partial, so the band-block reduce-scatter runs once per call.  The
@@ -161,15 +161,15 @@ def get_sigma_spatial_kernel(
         price ``sigma_spin_block`` admits)."""
         faces = acc = None
         G, Gt, W = G_parents.G, G_parents.transpose, W_prep
-        for nu in blocks:
+        for rows in blocks:
             if acc is not None:
                 acc, G, Gt, W = jax.lax.optimization_barrier((acc, G, Gt, W))
-            sigma_parent = unfold_conv(G, Gt, W, conj_partner=G_parents.conj_partner, nu=nu)
+            sigma_parent = unfold_conv(G, Gt, W, conj_partner=G_parents.conj_partner, rows=rows)
             if faces is None:
                 sigma_parent, left, right = jax.lax.optimization_barrier(
                     (sigma_parent, psi_proj_xr, psi_proj_yn))
                 faces = project.prepare(left, right)
-            acc = project.accumulate(faces, sigma_parent, nu=nu, acc=acc)
+            acc = project.accumulate(faces, sigma_parent, rows=rows, acc=acc)
         return project.finish(acc)
 
     @jax.jit

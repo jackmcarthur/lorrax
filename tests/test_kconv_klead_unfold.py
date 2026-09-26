@@ -75,8 +75,8 @@ def unfold_case(mesh, fx, seed=0):
 
 
 def block_case(mesh, fx, seed=0):
-    """(max |door block - whole door block|, per block) for every stored nu block of the
-    Sigma consumer's splits (greens_function_kernel.sigma_nu_blocks), and conj_partner
+    """(max |door block - whole door block|, per block) for every stored x block of the
+    Sigma consumer's splits (common.contract_bands.face_row_blocks), and conj_partner
     against the materialized conj(G) partner: both bitwise."""
     from ffi import fft as F
     from gw.wavefunction_bundle import SIGMA_CONV_G7D_SPEC, V_FFT5D_SPEC
@@ -95,16 +95,18 @@ def block_case(mesh, fx, seed=0):
     whole = F.make_kconv_klead_unfold(mesh, kg, tables, store_rows=rows, norm="ortho", mult=mult)
     ref = fixtures._host(whole(Gd, Gcd if anti else None, Wp))
     conj = fixtures._host(whole(Gd, None, Wp, conj_partner=True))
-    from gw.greens_function_kernel import sigma_nu_blocks
+    from common.contract_bands import face_row_blocks
     worst = 0.0
-    py = int(mesh.shape["y"])
-    my = mu // py
+    px, py = int(mesh.shape["x"]), int(mesh.shape["y"])
+    mx = mu // px
     for d in [v for v in range(1, ns) if ns % v == 0]:
-        for y0, by in sigma_nu_blocks(my, (ns // d) ** 2):
-            got = fixtures._host(whole(Gd, None, Wp, conj_partner=True, nu=(y0, by)))
-            # The block holds local nu [y0, y0 + by) of every rank's nu tile.
-            want = np.concatenate([ref[..., j * my + y0:j * my + y0 + by] for j in range(py)],
-                                  axis=-1)
+        for rows in face_row_blocks(mx, py, (ns // d) ** 2):
+            got = fixtures._host(whole(Gd, None, Wp, conj_partner=True, rows=rows))
+            # The block holds rows x_block_rows(rows) of every rank's mu tile (x >= mx: zero).
+            idx = F.x_block_rows(rows)
+            want = np.concatenate([
+                np.where((idx < mx)[None, None, :, None, None],
+                         ref[:, :, i * mx + np.minimum(idx, mx - 1)], 0) for i in range(px)], axis=2)
             worst = max(worst, float(np.max(np.abs(got - want))))
     return dict(ns=ns, antiunitary=anti, conj_bitwise=bool(np.array_equal(conj, ref)),
                 blocks_max_abs=worst)
@@ -227,8 +229,8 @@ def test_store_rows_must_be_distinct_rows_of_the_grid():
             raise AssertionError(f"store_rows={bad} was accepted")
 
 
-def test_output_nu_blocks_and_conj_partner_are_the_whole_door():
-    """Every stored nu block of mode 7's output and the conj-on-load partner equal the whole door."""
+def test_output_x_blocks_and_conj_partner_are_the_whole_door():
+    """Every stored x block of mode 7's output and the conj-on-load partner equal the whole door."""
     mesh = _mesh()
     rng = np.random.default_rng(9)
     cases = [fixtures._glide_fixture(mesh, rng, ns) for ns in (2, 4)] + [c3_fixture(mesh, 4)]
