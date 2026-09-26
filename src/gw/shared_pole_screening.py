@@ -236,8 +236,8 @@ def retain_iteration_scratch(run_dir, label, *, print_fn=print):
     """Collectively keep only map ``label``'s shared-pole scratch generation.
 
     Each SC map screens into its own ``sc_NNNN_shared_pole/``, and a file-tier
-    bank there is ``16 N_q (f_s N_s + f_m) N_mu^2`` bytes (0.87 TB on Fe 8^3),
-    so without this the scratch grows linearly in maps.  The caller invokes it
+    bank there is the payload of ``shared_pole_bank_payload_bytes`` (about
+    0.27 TB on Fe 8^3), so without this the scratch grows linearly in maps.  The caller invokes it
     only after the current map's model has been built, consumed by Sigma and
     passed the Sigma gates, so a failure keeps the last usable generation, and
     the current one survives convergence for constructor resume.  Only exact

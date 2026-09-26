@@ -716,7 +716,8 @@ def construct_cross_sector_round(sectors, samples, moments, meta, config, *,
         mesh_xy=mesh_xy,ledger=meta.shared_pole_capacity,
         upstream=meta.shared_pole_capacity.live_stages,execution=execution)
     budget.batch_width = charge['model'][0].shape[0]
-    budget.retained_panels = (*retained,*ct.values(),*tc.values(),*moments.values())
+    budget.retained_panels = (*retained,*ct.values(),*tc.values(),*moments.values(),
+        *(panels for stored in line_cross for panels,_ in stored.values()))
     # Cross assembly has rectangular original pencils; only the projected
     # retained pair is square. Keep those two extents distinct in the ledger.
     original_sides = tuple(s['coefficients'].shape[-2] for s in sectors)

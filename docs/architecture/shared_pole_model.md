@@ -27,7 +27,7 @@ are `P(None,'x','y')` on the square X/Y mesh with `P = Px·Py`.
 | §4 reduction, paired basis and cut | `gw.shared_pole_reduction` |
 | §4 dedupe and measured model checks | `gw.shared_pole_gates` |
 | constructor chain, route admission | `gw.shared_pole_constructor` |
-| §6 parent rounds and partner exchange | `gw.shared_pole_local` |
+| §6 parent rounds | `gw.shared_pole_local` |
 | §6 whole-mesh (face) execution adapters | `gw.shared_pole_execution` |
 | §5 photon CC/TT/CT sectors | `gw.shared_pole_sectors` |
 | §10 byte model | `gw.shared_pole_capacity` |
@@ -47,8 +47,10 @@ are `P(None,'x','y')` on the square X/Y mesh with `P = Px·Py`.
    sites, 2 imaginary sites, cutoff $10^{-2}$, no cap, no budget, and
    tolerances $10^{-7}$/$10^{-3}$. `sigma_quadrature_eps` is taken from the tier
    and refuses a conflicting explicit value.
-2. **Bank** (§2): Coulomb roots, samples $W_c,\partial_sW_c$ at every support,
-   moments $M_1,M_3$ (and $M_0,M_2$ when ordered) → `bank.h5`.
+2. **Bank** (§2): Coulomb roots, samples $W_c,\partial_sW_c$ at the supports
+   on the imaginary axis and the held supports, the direction panels of every
+   fitted line support (§3), moments $M_1,M_3$ (and $M_0,M_2$ when ordered)
+   → `bank.h5`.
 3. **Residence.** The bank is written frequency-major and read parent-major. It
    stays on the devices when the payload and one read copy fit half the device
    budget *and* the constructor route is unchanged with it live; otherwise it
@@ -118,18 +120,15 @@ $\Sigma[W^{\rm even}]-\Sigma^{\rm odd}$
 
 **Minus-q partner.** The ordered pencil's state $X(-z)$ acts with
 $W_q(-\bar z)=\overline{W_{-q}(z)}$ on the directions of $X(z)$, and it must be
-the same operator as $W_q(z)$. On an imaginary node $-\bar z=z$, so the stored
-sample is its own partner. At each fitted line sample (`minus_q_partner_span`,
-the contiguous ids $[p_0,p_1)$ in the header's `minus_q_partner`) the bank
-stores `Wc_minus_q`/`dWc_minus_q_ds`. The stream's output rows are the union of
+the same operator as $W_q(z)$. On an imaginary node $-\bar z=z$, so the sample
+is its own partner. At each fitted line support off the imaginary axis the
+producer solves it beside $W_q(z)$: the stream's output rows are the union of
 the parent rows and their $-q$ rows in one panel, and the partner is formed
 from the conjugated $-q$ rows with the **original parent's $V$** (and contact).
-Held samples store none, because the checks read `Wc`/`dWc_ds` only.
-Rebuilding the line-node partner from the $-q$ parent through the symmetry
-tables is not exact: the ISDF $V_q$ is covariant only to about $2\times10^{-6}$,
-and the ordered Gram amplifies that into a refusal
-(sandbox claim 2452, bcc Fe).
-A bank with the retired all-sample layout (`mirror_mode`) is refused by name.
+It is consumed by the line selection (§3) and never stored. Rebuilding it from
+the $-q$ parent through the symmetry tables is not exact: the ISDF $V_q$ is
+covariant only to about $2\times10^{-6}$, and the ordered Gram amplifies that
+into a refusal (sandbox claim 2452, bcc Fe).
 
 **Dyson and derivative.** Per sample and bounded $q$ span, $W_c$ is solved from
 the roots and $\partial_sW=W(\partial_s\chi)W$ is formed from the committed $W$,
@@ -150,15 +149,41 @@ sample and parent span.
 ## 3 Directions
 
 `gw.shared_pole_directions` selects $Q_a$ per fitted support through
-`distrib_la` on the face stacks (theory §5.1): right singular vectors of the line
-sample above `direction_cutoff` (at most `line_direction_cap`, whole multiplets
-within $10^{-6}$), leading eigenvectors of $-\operatorname{Herm}W_c(iu)$ to
+`distrib_la` (theory §5.1): right singular vectors of the line sample above
+`direction_cutoff` (at most `line_direction_cap`, whole multiplets within
+$10^{-6}$), leading eigenvectors of $-\operatorname{Herm}W_c(iu)$ to
 `imaginary_width`, and of $M_1$ to `infinity_width`, with the rank floor at
 $n\epsilon_{64}$. Each state is `(node, Q, O = W Q, D = W' Q)`. Direction ranks
 sit on the padded-extent ladder (`runtime.padding.ladder_extent`) so selection
-and round programs repeat across rounds and maps. The constructor releases the
-sample matrices before reduction and prices the selected pencil before
-allocating it.
+and round programs repeat across rounds and maps.
+
+**Line supports are selected by the producer.** A fitted line support with
+$\operatorname{Re}z\ne0$ reads nothing but its own sample: $Q$ is cut from the
+singular spectrum of $W_q(z_a)$ alone (the multiplet closure included), and
+every state the pencil takes from it acts on $Q$ or on $O=WQ$ of the same
+sample,
+
+$$
+\begin{aligned}
+&X(z):\ (Q,\ WQ,\ W'Q), &&X(\bar z):\ (O,\ W^\dagger O,\ W'^\dagger O),\\
+&X(-z):\ (Q,\ W_m^\dagger Q,\ W_m'^\dagger Q), &&X(-\bar z):\ (O,\ W_mO,\ W_m'O),
+\end{aligned}
+\qquad W_m=W_q(-\bar z),
+\tag{SP 7}
+$$
+
+(the mirrors on an ordered bank; derivatives in $z$ ordered, in $s$ TRS), and on
+a photon bank the other family's rows of the same products, which are the
+CT/TC actions. The Gram cut, the pole budget, the round extent and the CT
+joint span act only on these panels. So the producer selects while
+$W_q(z_a)$, $\partial_sW_q$ and $W_m$ are in hand (`LineSelection`, whole
+parents per rank when their blocks and the $2n$ eigensystem fit, else the
+face) and the bank stores the panels (§7). The constructor reads them
+(`line_panel_states`) and selects the supports on the imaginary axis from their
+dense samples per round. On the local route both sides run the same one-parent
+dilation eigensolve on the same bits, so $Q$ and every count are the ones the
+constructor would select; the action GEMMs run at a different panel width
+and agree to round-off.
 
 ## 4 Pencils and reduction
 
@@ -236,7 +261,7 @@ path past that point.
 ## 7 Store schema
 
 `model.h5` (`lorrax.shared-real-pole.v1`) and `bank.h5`
-(`lorrax.shared-real-pole-bank.v1`) share one authenticated header
+(`lorrax.shared-real-pole-bank.v3`) share one authenticated header
 (`file_io.shared_pole_store`); bulk payloads cross SlabIO only.
 
 | field | meaning |
@@ -247,11 +272,14 @@ path past that point.
 | `n_q_irr`, `q_irr_full_idx`, `qirr`, `operations` | raw parents and the authorized symmetry rows |
 | `n_mu_logical`, `nspinor`, `centroid_digest` | basis identity; the operator is the spin-traced $\mu\times\mu$ charge response for `nspinor` 1, 2 and the four-component kinetic-balance carrier |
 | model: `factor [q, μ, components, Kmax]` complex128, `poles2_ry2 [q, Kmax]` float64, `K [q]` int64 | (W 14) per parent, units Ry$^{3/2}$ and Ry²; inactive columns have $b=0$, $\Lambda=1$ Ry² |
-| bank: `Wc`, `dWc_ds [q, a, μ, μ]`; `Wc_minus_q`, `dWc_minus_q_ds [q, p₁−p₀, μ, μ]` when ordered; `M1`, `M3` (+ `M0`, `M2` when ordered); `constant` for photon | samples and moments of §2 |
+| bank: `Wc`, `dWc_ds [q, a, μ, μ]` at the dense samples (every id outside the line span $[p_0,p_1)$, rows $a$ skipping it); `M1`, `M3` (+ `M0`, `M2` when ordered); `constant` for photon | dense samples and moments of §2 |
+| bank: `line_<family>_<sid> [q, 1+2S, rows, r]`, photon `…_cross [q, 2S, other rows, r]`; header `line_panels` (span, rows, widths, counts), mask `line_written [q, p₁−p₀]` | one line support's $Q$, then output and action per state of (SP 7), $S=2$ TRS, 4 ordered; `charge` rows in the canonical carrier, photon `C`/`T` rows in the packed sector order; $r$ is the carrier of the sample's widest count |
 
-`write_poles = true` exports $(b,\Lambda)$, from which a BSE takes
-$W_c(0)=-b\Lambda^{-1}b^\dagger$ exactly. `write_w = true` dumps the whole bank
-and is a debug output.
+A bank of a retired schema (v1, v2: dense line samples) is refused by name, and
+constructor resume then rebuilds it. `write_poles = true` exports $(b,\Lambda)$,
+from which a BSE takes $W_c(0)=-b\Lambda^{-1}b^\dagger$ exactly.
+`write_w = true` dumps the bank as stored (line supports as panels) and is a
+debug output.
 
 ## 8 The Σ consumer
 
@@ -351,7 +379,10 @@ $$
 $$
 
 with $c_b=\lceil b/P\rceil$ on local rounds ($b/P$ on the face route) and, by
-phase: selection $D=24n^2$, $s_f=2a$; reduction $D=14R^2+12nR$, $s_f=0$; model
+phase: selection $D=24n^2$, $s_f=2a$ over the $a$ dense fitted samples plus the
+moment faces and the line panels in face units,
+$N_{\rm line}(1+2S)\,n\,r_{\rm cap}/n^2$ (`selection_face_count`);
+reduction $D=14R^2+12nR$, $s_f=0$; model
 checks $D=8n^2+4nR$, $s_f=2a$; CT cross reduction
 $D=10\,CT+14R^2+12n(C+T)$. A local round has $b=P$. The native cuSOLVERMp `eigh`
 adds a private $n^2/P$ operand tile beside its workspace, which
@@ -359,3 +390,19 @@ adds a private $n^2/P$ operand tile beside its workspace, which
 (`CapacityLedger`) owns admission: a stage refuses before it allocates when its
 aggregate with the named concurrent stages exceeds the device budget
 (`memory.per_device_gb`) less the inherited stream/Σ peaks.
+
+**Bank payload** (`shared_pole_bank_payload_bytes`, the residence admission):
+
+$$
+B=\frac{16\,N_q}{P}\Big[(2N_{\rm dense}+N_m)\,d^2
++N_{\rm line}\sum_f\big((1+2S)\,n_f+2S\,n_{f'}\big)\,r_f\Big],
+\tag{SP 8}
+$$
+
+$n_{f'}$ the cross rows of a photon family (absent on a charge bank) and $r_f$
+the carrier of the family's line cap. On Fe $8^3$ bispinor ($N_q=59$,
+$d=3164$, 14 line and 8 dense samples) this is 28.5 face tiles per parent
+against 77 with dense line samples. The producer's selection adds, beside one
+group's carry, the endpoint blocks of $W$ and $\partial_sW$ ($2\lceil N_q/P\rceil d^2$
+on the local route) and one $2n$ dilation eigensystem
+(`line_selection_price`).

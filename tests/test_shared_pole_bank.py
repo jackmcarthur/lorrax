@@ -178,6 +178,12 @@ def test_ordered_scalar_bank_stores_line_panels(tmp_path):
         fit_ids=np.asarray([0, 1], dtype=np.int64),
         held_ids=np.asarray([2], dtype=np.int64))
     tables["sym"].trs_allowed = False
+    # The panel writes admit their canonical-row conversion; give the tiny
+    # fixture a fixed budget so the test does not depend on the mesh default.
+    from gw.shared_pole_recipe import CapacityLedger
+    meta.shared_pole_capacity = CapacityLedger(meta, mesh_xy=mesh, device_budget_bytes=1 << 22)
+    meta.shared_pole_capacity.reserve("fixture_live_bound", resident_bytes_per_rank=4096, workspace_bytes_per_rank=0)
+    meta.shared_pole_capacity.live_stages = ("fixture_live_bound",)
     basis = meta.mu_basis
     banks = {"file": tmp_path / "ordered_scalar_bank.h5",
              "device": store.ResidentBankPayload(mesh, carrier=basis.n_canonical, label="device"),
