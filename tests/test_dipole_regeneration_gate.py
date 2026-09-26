@@ -294,7 +294,7 @@ def test_the_default_analytic_sweep_writes_a_valid_dipole_h5(tmp_path):
     out = run / "dipole_regen.h5"
     assert out.is_file() and out.stat().st_size > 0
     with h5py.File(out) as h:
-        assert set(h.keys()) >= {"dipole_cart", "deltaE"}
+        assert set(h.keys()) >= {"dipole_cart", "band_energies"}
         d = np.asarray(h["dipole_cart"])
         assert h.attrs["prov_vnl_mode"] == "analytic"
         assert not bool(h.attrs["prov_skip_vnl"])

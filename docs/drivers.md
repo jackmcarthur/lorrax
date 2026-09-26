@@ -84,13 +84,15 @@ head $S(\omega)$ of Σ and by the BSE head term ([theory](theory/physics.md)).
 
 Reads the deck (`wfn_file`, `nval`, `ncond`, `nband`, `bispinor`) and the
 `*.upf` files (deck directory, then `../qe/scf`, `../qe/nscf`). Writes
-`dipole.h5`: `dipole_cart` `(3, nk, nb, nb)`, `deltaE` `(nk, nb, nb)` =
-$E_b - E_{b'}$, and root provenance attributes (`prov_wfn_sha256` and its
+`dipole.h5` (`file_io.dipole`): `dipole_cart` `(3, nk, nb, nb)`,
+`band_energies` `(nk, nb)` (readers derive $E_b - E_{b'}$; a file written
+before 2026-09-25 stores it as `deltaE`), and root provenance attributes (`prov_wfn_sha256` and its
 fingerprint scheme, `prov_{nval,ncond,nband,nb_written,wfn_file}`, the
 representation, V_NL and $q\to0$-operator schemes). `check_dipole_provenance`
 refuses a file whose WFN, band extent, representation or V_NL convention does
 not match the run, or whose operator scheme is unstamped; the fix is to rerun
-this driver. The k sweep is partitioned across ranks; rank 0 writes.
+this driver. The sweep shards bands over the mesh and SlabIO writes the
+velocity from those shards; no rank gathers the table.
 
 Invoke: `python3 -m psp.get_dipole_mtxels -i deck.in [--out dipole.h5]`.
 
@@ -114,8 +116,9 @@ Invoke: `python3 -m gw.kin_ion_io -i deck.in [-o kin_ion.h5] [-n NB]`. The deck
 owns the system, band window and spinor settings; `WFN.h5` and the
 pseudopotentials are stamped as provenance, and a GW run refuses a file whose
 k storage, spinor representation, system dimension, band extent, WFN, input or
-pseudopotential stamp differs from its own. Multi-rank sweeps are distributed;
-rank 0 writes after the gather.
+pseudopotential stamp differs from its own. The sweep shards bands over the
+mesh and `file_io.kin_ion.write_kin_ion` writes the star-wedge slab from those
+shards through SlabIO; no rank gathers it.
 
 | key / flag | default | meaning |
 |---|---|---|
