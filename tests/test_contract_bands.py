@@ -821,6 +821,77 @@ def test_face_projection_chunk_is_one_chunk_until_the_operator_tile():
     assert need <= 16 * 7 * (12352 // p) ** 2
 
 
+def _projector_shapes_modulo(mesh_xy, face_shape, axes, channels,
+                             right_face_shape, band_extent, spin_block, *,
+                             square):
+    """FACEPROJ 5674a11ec ``_projector_shapes``, before runtime.padding."""
+    ax_x, ax_y = axes
+    px, py = int(mesh_xy.shape[ax_x]), int(mesh_xy.shape[ax_y])
+    if square and px != py:
+        raise ValueError("square")
+    if channels not in ("none", "split_reim"):
+        raise ValueError("channels")
+    nk, nb_full, mu_l, ns = (int(v) for v in face_shape)
+    right_face_shape = face_shape if right_face_shape is None \
+        else right_face_shape
+    if (int(right_face_shape[0]), int(right_face_shape[1]),
+            int(right_face_shape[3])) != (nk, nb_full, ns):
+        raise ValueError("left/right")
+    mu_r = int(right_face_shape[2])
+    nb = nb_full if band_extent is None else int(band_extent)
+    d = ns if spin_block is None else int(spin_block)
+    if d < 1 or ns % d:
+        raise ValueError("spin_block")
+    if nb % px or nb % py or mu_l % px or mu_r % py:
+        raise ValueError("tile")
+    return nk, nb, ns, d, mu_l, mu_r, px, py
+
+
+def test_projector_shapes_match_the_modulo_spelling():
+    """runtime.padding refuses and admits exactly the extents the inline
+    modulo did, and returns the same shapes; the face slab pad is the same
+    ``p·⌈μ/p⌉ − μ``.  Pure Python, no devices."""
+    from types import SimpleNamespace
+
+    from common.contract_bands import _projector_shapes
+    from runtime.padding import padded_axis
+
+    seen = {"ok": 0, "refused": 0}
+    for px in (1, 2, 3, 4):
+        for py in (1, 2, 3, 4):
+            mesh = SimpleNamespace(shape={"x": px, "y": py})
+            for nb_full in range(0, 13):
+                for mu_l in range(0, 10):
+                    for mu_r in (0, 1, 4, 6, 7, 12):
+                        for band_extent in (None, max(nb_full - 1, 0)):
+                            for square in (False, True):
+                                args = (mesh, (2, nb_full, mu_l, 2),
+                                        ("x", "y"), "none",
+                                        (2, nb_full, mu_r, 2), band_extent,
+                                        1)
+                                try:
+                                    want = _projector_shapes_modulo(
+                                        *args, square=square)
+                                except ValueError:
+                                    want = ValueError
+                                try:
+                                    got = _projector_shapes(
+                                        *args, square=square)
+                                except ValueError:
+                                    got = ValueError
+                                assert got == want, (px, py, nb_full, mu_l,
+                                                     mu_r, band_extent,
+                                                     square, got, want)
+                                seen["refused" if want is ValueError
+                                     else "ok"] += 1
+    assert seen["ok"] and seen["refused"], seen
+    for p in range(1, 9):
+        for mul in range(0, 40):
+            q = -(-mul // p)
+            axis = padded_axis(mul, p, name="face slab centroid piece")
+            assert (axis.carrier // p, axis.pad) == (q, p * q - mul)
+
+
 def _axis_operands(mesh, mu_l=MU, mu_r=MU + 4, nb=MN, seed=11, ns=NS):
     """Rectangular (μ_left != ν_right) axis-layout operands."""
     rng = np.random.default_rng(seed)
@@ -876,7 +947,7 @@ def test_axis_projector_matches_reference_with_one_reduction(ns):
 
 def test_axis_projector_refuses_untiled_bands_and_hidden_reshards():
     mesh = _mesh()
-    with pytest.raises(ValueError, match="tile"):
+    with pytest.raises(ValueError, match="projected band extent"):
         contract_bands_block_reshard(
             mesh, layout="axis", face_shape=(NK, MN + 1, MU, NS))
     dev, _, _ = _axis_operands(mesh)

@@ -124,12 +124,6 @@ MODULO_EXCEPTIONS.update(_registered({
      "project_little_group_operator", "m % (px * py)"),
     ("src/gw/isdf_fitting.py", "add_pad_diagonal_sharded", "n % px"),
     ("src/gw/isdf_fitting.py", "add_pad_diagonal_sharded", "n % py"),
-    # mtxel followons 48f3c2f7: the axis Sigma projector refuses a projected
-    # band extent that is not already on its (px, py) carrier.
-    ("src/common/contract_bands.py", "_axis_project_kernel",
-     "nb_project % px"),
-    ("src/common/contract_bands.py", "_axis_project_kernel",
-     "nb_project % py"),
 }, reason="consumer authenticates an already-padded mesh carrier",
    follow_up="accept a runtime.padding receipt when the owner next edits it"))
 

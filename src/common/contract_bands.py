@@ -170,6 +170,7 @@ import jax.numpy as jnp
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
 from common.collectives import warm_mesh_cliques
+from runtime.padding import authenticate_padded_axis, padded_axis
 
 __all__ = [
     "contract_bands_block_reshard",
@@ -383,7 +384,7 @@ def face_projection_chunk(*, nk, nb, ns, mu_left, mu_right, p, channels=1,
     """
     b_loc = nb // p
     mul, mur = mu_left // p, mu_right // p
-    q = -(-mul // p)
+    q = padded_axis(mul, int(p), name="face slab centroid piece").carrier // p
     tile = itemsize * nk * ns * mul * ns * mur
     for w in sorted((d for d in range(1, b_loc + 1) if b_loc % d == 0),
                     reverse=True):
@@ -487,11 +488,17 @@ def _projector_shapes(mesh_xy, face_shape, axes, channels, right_face_shape,
         raise ValueError(
             f"contract_bands_block_reshard: spin_block {d} must divide "
             f"nspinor {ns}")
-    if nb % px or nb % py or mu_l % px or mu_r % py:
-        raise ValueError(
-            "contract_bands_block_reshard: the projected band extent "
-            f"{nb} and the centroid extents ({mu_l}, {mu_r}) must tile the "
-            f"({px}, {py}) mesh")
+    band_spec = P(None, ax_x, ax_y)                  # Σ (nk, m_X, n_Y)
+    o_spec = P(None, None, ax_x, None, ax_y)         # O (nk, s, μ_X, s', ν_Y)
+    authenticate_padded_axis(
+        nb, nb, mesh_xy, specs=((band_spec, 1), (band_spec, 2)),
+        name="contract_bands_block_reshard: projected band extent")
+    authenticate_padded_axis(
+        mu_l, mu_l, mesh_xy, spec=o_spec, axis=2,
+        name="contract_bands_block_reshard: left centroid extent")
+    authenticate_padded_axis(
+        mu_r, mu_r, mesh_xy, spec=o_spec, axis=4,
+        name="contract_bands_block_reshard: right centroid extent")
     return nk, nb, ns, d, mu_l, mu_r, px, py
 
 
@@ -552,7 +559,7 @@ def _face_project_kernel(mesh_xy: Mesh, face_shape, axes, *,
         spin_block, square=True)
     nch = 1 if channels == "none" else 2
     b_loc, mul = nb // p, mu_l // p
-    q = -(-mul // p)
+    slab_pad = padded_axis(mul, p, name="face slab centroid piece").pad
     w = face_projection_chunk(nk=nk, nb=nb, ns=d, mu_left=mu_l,
                               mu_right=mu_r, p=p, channels=nch)
     n_chunks = b_loc // w
@@ -567,7 +574,7 @@ def _face_project_kernel(mesh_xy: Mesh, face_shape, axes, *,
     def prepare_body(psi_l, psi_r):
         lt = jax.lax.ppermute(psi_l, both, transpose)     # (m_y, s, μ_x)
         rt = jax.lax.ppermute(psi_r, both, transpose)     # (s', ν_y, n_x)
-        lt = jnp.pad(lt, ((0, 0), (0, 0), (0, 0), (0, p * q - mul)))
+        lt = jnp.pad(lt, ((0, 0), (0, 0), (0, 0), (0, slab_pad)))
         slab = jnp.conj(jax.lax.all_to_all(
             lt, ax_y, split_axis=3, concat_axis=1, tiled=True))
         return slab, rt
@@ -591,7 +598,7 @@ def _face_project_kernel(mesh_xy: Mesh, face_shape, axes, *,
         def chunk_part(r_chunk):
             t = jnp.stack([jnp.einsum("ksmtn,ktnc->ksmc", o, r_chunk)
                            for o in ops])
-            t = jnp.pad(t, ((0, 0),) * 3 + ((0, p * q - mul), (0, 0)))
+            t = jnp.pad(t, ((0, 0),) * 3 + ((0, slab_pad), (0, 0)))
             t = jax.lax.psum_scatter(t, ax_y, scatter_dimension=3,
                                      tiled=True)
             return jnp.einsum("kasm,eksmc->ekac", slab, t)
