@@ -16,6 +16,8 @@ convolution; tolerance 1e-11 relative to max|X|.
 * red twins: a rolled source table, conjugated transport phases (A-cubic), a dropped
   antiunitary flag (glide) each miss by > 1e-3; an aliasing box refuses.
 """
+import dataclasses
+
 import numpy as np
 import pytest
 import jax
@@ -137,8 +139,7 @@ def test_rolled_transport_misses():
     mesh = _mesh(1)
     ref, _ = _references(c)
     tr = SphereTransport.identity(SphereSet(c["sph"], c["ngk"], c["kfrac"]), 1)
-    red = SphereTransport(row=tr.row, anti=tr.anti, spin=tr.spin, src=np.roll(tr.src, 1, axis=1),
-                          phase=tr.phase, n_parent=tr.n_parent)
+    red = dataclasses.replace(tr, src=np.roll(tr.src, 1, axis=1))
     conv = _conv(mesh, c["kgrid"], c["fft_grid"], c["sph"], c["ngk"], c["kfrac"], c["out"],
                  transport=red, backend="xla", budget_bytes=int(1e10))
     assert cases.rel(_run(conv, c["A"], c["C"]), ref) > 1e-3
@@ -156,6 +157,28 @@ def test_aliasing_box_refuses():
 # ---------------------------------------------------------------------------
 # symmetry: typed parents against full-grid input
 # ---------------------------------------------------------------------------
+
+EXPAND_TWINS = ("par_no_wrap", "par_identity_map")
+
+
+def expand_twin(conv, name):
+    """A red twin of the expand at the k-parents, in place on ``conv``'s device tables: the column
+    map's lattice wrap dropped (``par_no_wrap``: y = x_α, not x_α + L), or the map itself
+    (``par_identity_map``: each child reads its parent's column at r', not at mtrx·(r' − τ))."""
+    for i, de in enumerate(conv._dev_exp):
+        pt = conv._ptables[i]
+        for v, tabs in de.items():
+            t = list(tabs)
+            if name == "par_no_wrap":
+                t[9] = conv._put(np.zeros_like(pt["L"]))
+            elif name == "par_identity_map":
+                t[8] = conv._put(np.broadcast_to(np.arange(conv.nr, dtype=np.int32),
+                                                 pt["alpha"].shape).copy())
+            else:
+                raise ValueError(name)
+            de[v] = tuple(t)
+    return conv
+
 
 def symmetry_case(fx, *, ecut, metric, box, nb=5, seed=3):
     """Parent ψ on metric spheres; the full grid through the r-space action."""
@@ -201,11 +224,13 @@ def _symmetry_check(mesh, c, backend):
     red = {}
     for name, bad in (("conj_phase", dict(phase=np.conj(typed.phase))),
                       ("no_anti", dict(anti=np.zeros_like(typed.anti)))):
-        fields = dict(dict(row=typed.row, anti=typed.anti, spin=typed.spin, src=typed.src,
-                           phase=typed.phase, n_parent=typed.n_parent), **bad)
         conv = _conv(mesh, c["kgrid"], c["fft_grid"], c["sph"], c["ngk"], c["kfrac"], c["out"],
-                     transport=SphereTransport(**fields), **kw)
+                     transport=dataclasses.replace(typed, **bad), **kw)
         red[name] = cases.rel(_run(conv, c["A_par"], c["C_par"]), ref)
+    for name in EXPAND_TWINS:
+        conv = _conv(mesh, c["kgrid"], c["fft_grid"], c["sph"], c["ngk"], c["kfrac"], c["out"],
+                     transport=typed, **kw)
+        red[name] = cases.rel(_run(expand_twin(conv, name), c["A_par"], c["C_par"]), ref)
     return dict(full=cases.rel(got_full, ref), parent=cases.rel(got_par, ref),
                 anti=bool(np.any(typed.anti)), red=red)
 
@@ -312,6 +337,9 @@ def _wedge_check(mesh, c, backend, rows, *, twins=()):
     red = {}
     for name in twins:
         tw = _conv(mesh, *args, wedge=_wedge(c, rows), **kw)
+        if name in EXPAND_TWINS:
+            red[name] = cases.rel(_run(expand_twin(tw, name), *pa), ref)
+            continue
         par, pslot, gph, anti, U, sel, phl = tw._dev_rebuild
         if name == "no_conj":             # antiunitary rows read without the conjugation
             anti = tw._put(np.zeros_like(tw._wt["anti"]))
@@ -636,9 +664,7 @@ def _sigma_symmetry_check(mesh, c, w, backend, *, wedge_rows=None, twins=(), ref
     for name in twins:
         if name == "no_anti_W":
             t = w_op.transport
-            bad = PairOperand(w_op.sphere, SphereTransport(row=t.row, anti=np.zeros_like(t.anti),
-                                                           spin=t.spin, src=t.src, phase=t.phase,
-                                                           n_parent=t.n_parent))
+            bad = PairOperand(w_op.sphere, dataclasses.replace(t, anti=np.zeros_like(t.anti)))
             r["red"][name] = cases.rel(_run_sigma(_sigma_conv(*args, g_op, bad, c["out"], **kw),
                                                   c["A_par"], w["W_par"]), ref)
     if wedge_rows is not None:
@@ -652,6 +678,9 @@ def _sigma_symmetry_check(mesh, c, w, backend, *, wedge_rows=None, twins=(), ref
         got = _run_sigma(conv, c["A_par"], w["W_par"])
         r.update(wedge_ref=cases.rel(got, ref), wedge_dense=cases.rel(got, dense),
                  orbits=conv._wt["n_orbits"], nr=conv.nr)
+        for name in set(twins) & set(EXPAND_TWINS):
+            tw = expand_twin(_sigma_conv(*args, g_op, w_op, c["out"], wedge=wedge, **kw), name)
+            r["red"][name] = cases.rel(_run_sigma(tw, c["A_par"], w["W_par"]), ref)
         if "no_spin" in twins and ns > 1:
             tw = _sigma_conv(*args, g_op, w_op, c["out"], wedge=wedge, **kw)
             d = list(tw._dev_rebuild)
