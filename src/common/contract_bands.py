@@ -16,27 +16,17 @@ as a rank-local shard between the two collectives.
 
 That is the ``layout="legacy"`` (default) body, byte-identical to the
 code this module shipped before the face carrier existed.
-``layout="face"`` (the two-face carrier, ``gw.wavefunction_bundle``)
-solves the SAME projection with a completely different mechanism — two
-planned ``distrib_la.gemm_plan`` N,N GEMMs, no shard_map, no
-psum_scatter — because face's ψ operands are 2-D sharded on BOTH mesh
-axes from the start, unlike legacy's ``psi_xr``/``psi_yn`` (band axis
-replicated going in, sharded only at the output).  See
-:func:`contract_bands_block_reshard`'s own docstring and
-``reports/gwjax_low_mem_bands_audit_2026-08-22/report.md``.  Face's
-``channels="split_reim"`` arm (2026-08-22) is the dynamic PPM/MPA
-Σ_c(τ) two-channel plan, consumed by ``gw.ppm_tau_kernel``'s own face
-dispatch — see this module's :func:`_face_project_kernel` for the
-mechanism.
-
-Face uses the planned two-GEMM projection below (the distributed native
-provider).  Axis operands already carry every band, so each rank holds a
+``layout="face"`` (the band-distributed ψ carrier every GW stage holds,
+``gw.wavefunction_bundle``) solves the SAME projection with every operand
+at 1/P: the operator stays on its tiles, ψ_l becomes a resident 1/P slab,
+ψ_r streams through in band chunks sized against one operator tile, and
+two psum_scatters (T's ν sum, then the band block) finish it
+(:func:`_face_project_kernel`, which prices its collectives and peak).
+``layout="axis"`` operands already carry every band, so each rank holds a
 whole ``(μ_x, ν_y)`` slab of the contraction: :func:`_axis_project_kernel`
 contracts it locally and reduces the ``(nb, nb)`` partial ONCE with the
-slab-contraction primitive (:func:`reduce_scatter_to_band_block`), where
-the two local-GEMM plans it replaced issued two psum_scatters, the first
-of the ``(μ/p_x, nb)`` intermediate.  The legacy body is not the current
-GW axis route.
+slab-contraction primitive (:func:`reduce_scatter_to_band_block`).  The
+legacy body is not a GW route.
 
 Structure (per rank, inside one shard_map)::
 
@@ -172,6 +162,7 @@ backend-neutral; the FFI dial is CPU-only and refused elsewhere).
 
 from __future__ import annotations
 
+import functools
 from typing import Callable
 
 import jax
@@ -182,6 +173,8 @@ from common.collectives import warm_mesh_cliques
 
 __all__ = [
     "contract_bands_block_reshard",
+    "BandProjector",
+    "face_projection_chunk",
     "bands_gemm_ffi_enabled",
     "bands_gemm_ffi_mode",
     "merge_spin_centroid",
@@ -259,9 +252,9 @@ def reduce_scatter_to_band_block(part, *, px: int, py: int,
 
 
 # ---------------------------------------------------------------------------
-# GEMM-seam (s, mu) merge — shared by this module's face-layout projector
-# and gw.greens_function_kernel's face-layout G builder (the low_mem_bands
-# two-face carrier, reports/gwjax_low_mem_bands_audit_2026-08-22/report.md).
+# GEMM-seam (s, mu) merge — the face GEMM operands' one (s, mu) order
+# (gw.greens_function_kernel's face G builder, wavefunction_bundle's
+# rotations).
 # ---------------------------------------------------------------------------
 
 def merge_spin_centroid(x, spin_axis: int, centroid_axis: int):
@@ -364,65 +357,300 @@ def bands_gemm_ffi_enabled() -> bool:
 # ---------------------------------------------------------------------------
 
 #: ``(nk, nb_full, n_rmu, nspinor)`` — the four static ints
-#: :func:`contract_bands_block_reshard`'s face path needs to build its two
-#: ``distrib_la.gemm_plan``s EAGERLY (their shapes are fixed at
-#: construction; unlike the legacy shard_map body, which is
-#: shape-polymorphic).  A plain 4-tuple rather than a new dataclass: this
-#: is the only site that reads it, and every field already has a home
-#: name elsewhere (``Wavefunctions.slices.nb_full``, ``psi_mun.shape``).
+#: :func:`contract_bands_block_reshard`'s face and axis paths need to fix
+#: their local tile shapes and the face path's band-chunk count at
+#: construction (the legacy shard_map body is shape-polymorphic).  A plain
+#: 4-tuple rather than a new dataclass: this is the only site that reads it,
+#: and every field already has a home name elsewhere
+#: (``Wavefunctions.slices.nb_full``, ``psi_mun.shape``).
 FaceProjectShape = tuple
 
 
-def _face_project_kernel(
-    mesh_xy: Mesh,
-    face_shape,
-    axes: tuple[str, str],
-    channels: str = "none",
-    right_face_shape=None,
-    band_extent=None,
-    layout="face",
-):
-    """The face-layout Σ projector: reshard ψ, then the axis projector.
+def face_projection_chunk(*, nk, nb, ns, mu_left, mu_right, p, channels=1,
+                          itemsize=16):
+    """Local band columns ``w`` per chunk of the face projector's stream.
 
-        Σ[m,n] = Σ_{s,μ} conj(ψ_l)[m,s,μ] Σ_{s',ν} O[s,μ,s',ν] ψ_r[s',ν,n]
-
-    Face ψ holds bands on one mesh axis and centroids on the other; the axis
-    projector (:func:`_axis_project_kernel`) wants every band with the
-    centroids on the operator's own axis, ``ψ_l`` at
-    ``P(None,None,None,'x')`` and ``ψ_r`` at ``P(None,None,'y',None)``.
-    Resharding the two band-extent ψ operands moves
-    ``16·nk·nb·ns·μ·(1/p_x + 1/p_y)`` bytes per rank; the μ-sized operator
-    ``O`` never moves, and the product ends in one ``nb²`` reduce-scatter.
-    Same arguments and results as the axis projector, including
-    ``channels="split_reim"`` and rectangular endpoints.
+    ``ns`` is the operator block's spin extent.  The stream's transients
+    per rank, for ``w`` local columns (``p·w`` global): the gathered ψ_r
+    chunk ``nk·ns·(μ_r/p)·p·w`` (twice while a prefetch is in flight), and
+    per channel the partial ``T`` ``nk·ns·(μ_l/p)·p·w``, its scattered slab
+    ``nk·ns·⌈μ_l/p⌉_p/p·p·w`` and the band partial ``nk·nb·p·w``.  They are
+    admitted against ONE local operator tile ``nk·ns²·(μ_l/p)·(μ_r/p)`` —
+    the block being projected, so the stream never more than doubles its
+    operand's footprint and falls as 1/P.  The largest divisor of ``nb/p``
+    that fits wins (one chunk, ``w = nb/p``, whenever everything fits);
+    ``w = 1`` is the floor.
     """
-    if layout == "axis":
-        return _axis_project_kernel(
-            mesh_xy, face_shape, axes, channels=channels,
-            right_face_shape=right_face_shape, band_extent=band_extent)
+    b_loc = nb // p
+    mul, mur = mu_left // p, mu_right // p
+    q = -(-mul // p)
+    tile = itemsize * nk * ns * mul * ns * mur
+    for w in sorted((d for d in range(1, b_loc + 1) if b_loc % d == 0),
+                    reverse=True):
+        prefetch = 2 if w < b_loc else 1
+        cols = p * w
+        need = itemsize * nk * cols * (
+            prefetch * ns * mur + channels * (ns * mul + ns * q + nb))
+        if need <= tile:
+            return w
+    return 1
 
-    # Faces: bring the two band-extent ψ operands to the axis orientation
-    # (bands complete, centroids on one mesh axis) and run the axis
-    # projector.  Only ψ moves; the μ-sized operator O stays on its tiles and
-    # one nb² reduce-scatter finishes the product.
-    axis_project = _axis_project_kernel(
-        mesh_xy, face_shape, axes, channels=channels,
-        right_face_shape=right_face_shape, band_extent=band_extent)
+
+class BandProjector:
+    """``Σ[m,n] = Σ conj(ψ_l)[m,s,μ] O[s,μ,s',ν] ψ_r[s',ν,n]`` in three phases.
+
+    ``prepare(psi_left, psi_right) -> faces`` orients the ψ operands once;
+    ``accumulate(faces, O, a0=0, b0=0, acc=None) -> acc`` adds one operator
+    spin block's contribution (``O`` holds spins ``[a0, a0+d)`` ×
+    ``[b0, b0+d)``) to a rank-local ``(nb, nb)`` partial; ``finish(acc)``
+    reduces it ONCE into ``(nk, m_X, n_Y)``.  A caller that projects an
+    operator in ``d×d`` spin blocks (``gw.ppm_tau_kernel``) prepares once and
+    reduces once, however many blocks.  The partial is ``16·nk·nb²`` bytes
+    per rank (per channel), P-independent, carried as a
+    ``(nch, P·nk, nb, nb)`` array at ``P(None, (ax_x, ax_y))``.
+
+    Calling the projector, ``project(psi_left, O, psi_right)``, is all three
+    for a whole-spin operator (``d = ns``).  ``channels="split_reim"``
+    returns ``(S_R, S_I)``.
+    """
+
+    def __init__(self, *, mesh, axes, expected, in_specs, channels, prepare,
+                 accumulate, finish, spin_block, ns):
+        self.mesh, self.axes, self.channels = mesh, axes, channels
+        self.spin_block, self.ns = spin_block, ns
+        self._expected, self._in_specs = expected, in_specs
+        self.prepare, self._accumulate, self._finish = (
+            prepare, accumulate, finish)
+
+    def accumulate(self, faces, O, a0=0, b0=0, acc=None):
+        return self._accumulate(faces, O, acc, a0=int(a0), b0=int(b0))
+
+    def finish(self, acc):
+        out = self._finish(acc)
+        return out[0] if self.channels == "none" else (out[0], out[1])
+
+    def __call__(self, psi_left, O, psi_right):
+        if self.spin_block != self.ns:
+            raise ValueError(
+                "contract_bands_block_reshard: a projector planned for "
+                f"{self.spin_block}x{self.spin_block} operator spin blocks "
+                f"of an ns = {self.ns} carrier is driven through prepare/"
+                "accumulate/finish, not called on one block")
+        got = (tuple(psi_left.shape), tuple(O.shape), tuple(psi_right.shape))
+        if got != self._expected:
+            raise ValueError(
+                "contract_bands_block_reshard: endpoint shapes "
+                f"{got} do not match planned {self._expected}")
+        # Same contract as a planned GEMM: a concrete operand must already
+        # sit in its spec (a tracer's layout belongs to the enclosing jit),
+        # never an implicit (μ, n)-class reshard.
+        for name, x, spec in zip(("psi_left", "O", "psi_right"),
+                                 (psi_left, O, psi_right), self._in_specs):
+            have = getattr(x, "sharding", None)
+            if (not isinstance(x, jax.core.Tracer) and have is not None
+                    and not have.is_equivalent_to(
+                        NamedSharding(self.mesh, spec), x.ndim)):
+                raise ValueError(
+                    f"contract_bands_block_reshard: {name} must already be "
+                    f"sharded {spec}; refusing an implicit reshard of a "
+                    f"{tuple(x.shape)} array.  Got {have!r}.")
+        return self.finish(self.accumulate(self.prepare(psi_left, psi_right),
+                                           O))
+
+
+def _projector_shapes(mesh_xy, face_shape, axes, channels, right_face_shape,
+                      band_extent, spin_block, *, square):
+    """Validated static extents shared by the face and axis projectors."""
     ax_x, ax_y = axes
-    to_axis = jax.jit(lambda left, right: (left, right), out_shardings=(
-        NamedSharding(mesh_xy, P(None, None, None, ax_x)),
-        NamedSharding(mesh_xy, P(None, None, ax_y, None))))
+    px, py = int(mesh_xy.shape[ax_x]), int(mesh_xy.shape[ax_y])
+    if square and px != py:
+        raise ValueError(
+            "contract_bands_block_reshard(layout='face'): the face projector "
+            f"needs a square mesh, got {dict(mesh_xy.shape)}")
+    if channels not in ("none", "split_reim"):
+        raise ValueError(
+            f"contract_bands_block_reshard: channels must be 'none' or "
+            f"'split_reim', got {channels!r}")
+    nk, nb_full, mu_l, ns = (int(v) for v in face_shape)
+    right_face_shape = face_shape if right_face_shape is None \
+        else right_face_shape
+    if (int(right_face_shape[0]), int(right_face_shape[1]),
+            int(right_face_shape[3])) != (nk, nb_full, ns):
+        raise ValueError(
+            "contract_bands_block_reshard: left/right face shapes must share "
+            f"(nk, nb_full, nspinor); got {tuple(face_shape)} and "
+            f"{tuple(right_face_shape)}")
+    mu_r = int(right_face_shape[2])
+    nb = nb_full if band_extent is None else int(band_extent)
+    d = ns if spin_block is None else int(spin_block)
+    if d < 1 or ns % d:
+        raise ValueError(
+            f"contract_bands_block_reshard: spin_block {d} must divide "
+            f"nspinor {ns}")
+    if nb % px or nb % py or mu_l % px or mu_r % py:
+        raise ValueError(
+            "contract_bands_block_reshard: the projected band extent "
+            f"{nb} and the centroid extents ({mu_l}, {mu_r}) must tile the "
+            f"({px}, {py}) mesh")
+    return nk, nb, ns, d, mu_l, mu_r, px, py
 
-    def project(psi_nmu, O, psi_mun):
-        left, right = to_axis(psi_nmu, psi_mun)
-        return axis_project(left, O, right)
 
-    return project
+def _band_block_finish(mesh_xy, axes, px, py, nch):
+    """``acc`` ``(nch, P·nk, nb, nb)`` partials → ``(nch, nk, m_X, n_Y)``."""
+    from common.shard_map import shard_map
+
+    ax_x, ax_y = axes
+    return jax.jit(shard_map(
+        lambda acc: reduce_scatter_to_band_block(
+            acc, px=px, py=py, axes=axes, row_axis=2, col_axis=3),
+        mesh=mesh_xy, in_specs=P(None, axes), out_specs=P(None, None, ax_x, ax_y),
+        check_vma=False))
+
+
+def _face_project_kernel(mesh_xy: Mesh, face_shape, axes, *,
+                         channels: str = "none", right_face_shape=None,
+                         band_extent=None, spin_block=None):
+    """The face-layout Σ projector: the operator stays, ψ streams in 1/P tiles.
+
+        Σ[m,n] = Σ_{s,μ} conj(ψ_l)[m,s,μ] T[s,μ,n],
+        T[s,μ,n] = Σ_{s',ν} O[s,μ,s',ν] ψ_r[s',ν,n]
+
+    Operands, all 1/P on the square ``p×p`` mesh: ``ψ_l`` = psi_nmu
+    ``(nk, m_X, s, μ_Y)``, ``O`` ``(nk, s, μ_X, s', ν_Y)``, ``ψ_r`` = psi_mun
+    ``(nk, s', ν_X, n_Y)``; output ``(nk, m_X, n_Y)``.
+
+    ``prepare``: each ψ tile goes to its transpose partner (rank (x,y) ↔
+    (y,x), one ``ppermute`` of a 1/P tile), so rank (x,y) holds ψ_l(m_y,
+    μ_x) and ψ_r(ν_y, n_x) — the centroid blocks of its own operator tile;
+    ψ_l's μ_x block then splits over 'y' while its bands gather (one
+    ``all_to_all``): the slab conj ψ_l(all m, μ_x piece y), 1/P.
+
+    ``accumulate``, per band chunk (``p·w`` global columns, the next one
+    gathered while this one multiplies): ψ_r's chunk gathers over 'x' to
+    ``(ν_y, p·w)``; ``T = O_local·ψ_r`` is the local ZGEMM (the flops of
+    the whole projection); one ``psum_scatter`` over 'y' completes the ν
+    sum onto the slab's μ piece; ``slab·T`` adds the rank's share of the
+    chunk's ``(nb, p·w)`` columns to the partial.  ``finish``: one
+    band-block reduce-scatter.
+
+    ``O`` never moves.  Per rank, a whole-spin projection moves
+    ``16·nk·[nb·ns·(μ_l+μ_r)/p + nb² + 3·nb·ns·μ/P]`` bytes of collectives
+    (``prepare`` is the last term); a stationary-output GEMM (SUMMA,
+    cuBLASMp) would add ``16·nk·ns²·μ_l·μ_r/p``, √P operator tiles.  The
+    stream's transients are admitted against one local operator tile
+    (:func:`face_projection_chunk`) and fall as 1/P; the slab is
+    ``16·nk·nb·ns·μ_l/P``; the partial ``16·nk·nb²``.  T's ν sum is reduced
+    before the ψ_l contraction, so the result agrees with the axis
+    projector to round-off, not bitwise.  ``μ_x`` pieces are zero-padded to
+    ``p·⌈μ/P⌉``.
+    """
+    from common.shard_map import shard_map
+
+    ax_x, ax_y = axes
+    nk, nb, ns, d, mu_l, mu_r, p, _ = _projector_shapes(
+        mesh_xy, face_shape, axes, channels, right_face_shape, band_extent,
+        spin_block, square=True)
+    nch = 1 if channels == "none" else 2
+    b_loc, mul = nb // p, mu_l // p
+    q = -(-mul // p)
+    w = face_projection_chunk(nk=nk, nb=nb, ns=d, mu_left=mu_l,
+                              mu_right=mu_r, p=p, channels=nch)
+    n_chunks = b_loc // w
+    both = (ax_x, ax_y)
+    transpose = [(i * p + j, j * p + i) for i in range(p) for j in range(p)]
+    left_spec, o_spec, right_spec = (
+        P(None, ax_x, None, ax_y), P(None, None, ax_x, None, ax_y),
+        P(None, None, ax_x, ax_y))
+    slab_spec, rt_spec, acc_spec = (
+        P(None, None, None, both), P(None, None, ax_y, ax_x), P(None, both))
+
+    def prepare_body(psi_l, psi_r):
+        lt = jax.lax.ppermute(psi_l, both, transpose)     # (m_y, s, μ_x)
+        rt = jax.lax.ppermute(psi_r, both, transpose)     # (s', ν_y, n_x)
+        lt = jnp.pad(lt, ((0, 0), (0, 0), (0, 0), (0, p * q - mul)))
+        slab = jnp.conj(jax.lax.all_to_all(
+            lt, ax_y, split_axis=3, concat_axis=1, tiled=True))
+        return slab, rt
+
+    prepare = jax.jit(shard_map(
+        prepare_body, mesh=mesh_xy, in_specs=(left_spec, right_spec),
+        out_specs=(slab_spec, rt_spec), check_vma=False))
+
+    def accumulate_body(slab, rt, O, acc, *, a0, b0):
+        slab = slab[:, :, a0:a0 + d]
+        rt = rt[:, b0:b0 + d]
+        ops = ((O,) if channels == "none" else
+               (jnp.real(O).astype(O.dtype), jnp.imag(O).astype(O.dtype)))
+        if acc is None:
+            acc = jnp.zeros((nch, nk, nb, nb), O.dtype)
+
+        def gather(j):
+            cols = jax.lax.dynamic_slice_in_dim(rt, j * w, w, axis=3)
+            return jax.lax.all_gather(cols, ax_x, axis=3, tiled=True)
+
+        def chunk_part(r_chunk):
+            t = jnp.stack([jnp.einsum("ksmtn,ktnc->ksmc", o, r_chunk)
+                           for o in ops])
+            t = jnp.pad(t, ((0, 0),) * 3 + ((0, p * q - mul), (0, 0)))
+            t = jax.lax.psum_scatter(t, ax_y, scatter_dimension=3,
+                                     tiled=True)
+            return jnp.einsum("kasm,eksmc->ekac", slab, t)
+
+        if n_chunks == 1:
+            return acc + chunk_part(gather(0))
+        # Chunk j holds local columns [j·w, (j+1)·w) of every n_x block.
+        acc = acc.reshape(nch, nk, nb, p, b_loc)
+
+        def add(acc, part, j):
+            part = part.reshape(nch, nk, nb, p, w)
+            here = jax.lax.dynamic_slice_in_dim(acc, j * w, w, axis=4)
+            return jax.lax.dynamic_update_slice_in_dim(acc, here + part,
+                                                       j * w, axis=4)
+
+        def step(carry, j):
+            acc, current = carry
+            ahead = gather(j + 1)
+            return (add(acc, chunk_part(current), j), ahead), None
+
+        (acc, last), _ = jax.lax.scan(step, (acc, gather(0)),
+                                      jnp.arange(n_chunks - 1), unroll=1)
+        acc = add(acc, chunk_part(last), n_chunks - 1)
+        return acc.reshape(nch, nk, nb, nb)
+
+    compiled = {}
+
+    def accumulate(faces, O, acc, *, a0, b0):
+        key = (a0, b0, acc is None)
+        if key not in compiled:
+            body = functools.partial(accumulate_body, a0=a0, b0=b0)
+            if acc is None:
+                fn = shard_map(lambda s, r, o: body(s, r, o, None),
+                               mesh=mesh_xy,
+                               in_specs=(slab_spec, rt_spec, o_spec),
+                               out_specs=acc_spec, check_vma=False)
+            else:
+                fn = shard_map(body, mesh=mesh_xy,
+                               in_specs=(slab_spec, rt_spec, o_spec,
+                                         acc_spec),
+                               out_specs=acc_spec, check_vma=False)
+            compiled[key] = jax.jit(fn)
+        args = (*faces, O) if acc is None else (*faces, O, acc)
+        return compiled[key](*args)
+
+    warm_mesh_cliques(mesh_xy)
+    return BandProjector(
+        mesh=mesh_xy, axes=axes, channels=channels,
+        expected=((nk, nb, ns, mu_l), (nk, ns, mu_l, ns, mu_r),
+                  (nk, ns, mu_r, nb)),
+        in_specs=(left_spec, o_spec, right_spec), prepare=prepare,
+        accumulate=accumulate,
+        finish=_band_block_finish(mesh_xy, axes, p, p, nch),
+        spin_block=d, ns=ns)
 
 
 def _axis_project_kernel(mesh_xy: Mesh, face_shape, axes, *,
                          channels: str = "none", right_face_shape=None,
-                         band_extent=None):
+                         band_extent=None, spin_block=None):
     """The ``layout='axis'`` Σ projector: slab partial, ONE reduction.
 
     ``axis`` operands carry EVERY band with the centroid axis split over one
@@ -434,86 +662,70 @@ def _axis_project_kernel(mesh_xy: Mesh, face_shape, axes, *,
         psi_right  (nk, s', ν, n)    P(None, None, 'y', None)
 
     so each rank holds a complete ``(μ_x, ν_y)`` slab of the contraction.
-    It contracts that slab locally,
+    ``accumulate`` contracts that slab locally,
 
         T[s,μ,n]  = Σ_{s',ν∈y} O[s,μ,s',ν] ψ_r[s',ν,n]
         part[m,n] = Σ_{s,μ∈x}  conj(ψ_l[m,s,μ]) T[s,μ,n],
 
-    and :func:`reduce_scatter_to_band_block` sums the ``(nb, nb)`` partial
-    over the mesh into ``P(None, 'x', 'y')`` — one collective per call of
-    ``nb²`` per rank.  The two-plan chain this replaces (``distrib_la``
-    local GEMM plans with ``reduction_axis='y'`` then ``'x'``) issued two
-    psum_scatters, the first of the ``(μ/p_x, nb)`` intermediate; the price
-    here is the second contraction running over all ``nb`` columns instead
-    of ``nb/p_y`` (``nb·p_y/(ns·N_ν)`` of the first's flops).
-    ``channels='split_reim'`` projects ``Re O`` and ``Im O`` and stacks the
-    two partials into the same single reduction.
+    and ``finish`` (:func:`reduce_scatter_to_band_block`) sums the
+    ``(nb, nb)`` partial over the mesh into ``P(None, 'x', 'y')`` — one
+    collective of ``nb²`` per rank per projection, however many operator
+    spin blocks.  ``channels='split_reim'`` projects ``Re O`` and ``Im O``
+    into the same partial stack.
     """
     from common.shard_map import shard_map
 
     ax_x, ax_y = axes
-    px, py = int(mesh_xy.shape[ax_x]), int(mesh_xy.shape[ax_y])
-    nk, nb_full, n_rmu_left, ns = (int(v) for v in face_shape)
-    nb_project = nb_full if band_extent is None else int(band_extent)
-    right_face_shape = face_shape if right_face_shape is None \
-        else right_face_shape
-    n_rmu_right = int(right_face_shape[2])
-    expected = ((nk, nb_project, ns, n_rmu_left),
-                (nk, ns, n_rmu_left, ns, n_rmu_right),
-                (nk, ns, n_rmu_right, nb_project))
-    if channels not in ("none", "split_reim"):
-        raise ValueError(
-            f"_axis_project_kernel: channels must be 'none' or "
-            f"'split_reim', got {channels!r}")
-    if nb_project % px or nb_project % py:
-        raise ValueError(
-            "contract_bands_block_reshard(layout='axis'): the projected band "
-            f"extent {nb_project} must tile the ({px}, {py}) mesh")
+    nk, nb, ns, d, mu_l, mu_r, px, py = _projector_shapes(
+        mesh_xy, face_shape, axes, channels, right_face_shape, band_extent,
+        spin_block, square=False)
+    nch = 1 if channels == "none" else 2
+    left_spec, o_spec, right_spec = (
+        P(None, None, None, ax_x), P(None, None, ax_x, None, ax_y),
+        P(None, None, ax_y, None))
+    acc_spec = P(None, (ax_x, ax_y))
 
-    def body(psi_l, O, psi_r):
-        if channels == "none":
-            ops = (O,)
-        else:
-            ops = (jnp.real(O).astype(O.dtype), jnp.imag(O).astype(O.dtype))
-        parts = []
-        for o in ops:
-            T = jnp.einsum("ksmtn,ktnb->ksmb", o, psi_r, optimize=True)
-            parts.append(jnp.einsum("kasm,ksmb->kab", jnp.conj(psi_l), T,
-                                    optimize=True))
-        blk = reduce_scatter_to_band_block(
-            jnp.stack(parts), px=px, py=py, axes=axes)
-        return blk[0] if channels == "none" else (blk[0], blk[1])
+    prepare = jax.jit(lambda psi_l, psi_r: (jnp.conj(psi_l), psi_r))
 
-    out = P(None, ax_x, ax_y)
-    in_specs = (P(None, None, None, ax_x), P(None, None, ax_x, None, ax_y),
-                P(None, None, ax_y, None))
-    kernel = jax.jit(shard_map(
-        body, mesh=mesh_xy, in_specs=in_specs,
-        out_specs=out if channels == "none" else (out, out),
-        check_vma=False))
+    def accumulate_body(psi_l, psi_r, O, acc, *, a0, b0):
+        psi_l = psi_l[:, :, a0:a0 + d]
+        psi_r = psi_r[:, b0:b0 + d]
+        ops = ((O,) if channels == "none" else
+               (jnp.real(O).astype(O.dtype), jnp.imag(O).astype(O.dtype)))
+        part = jnp.stack([
+            jnp.einsum("kasm,ksmb->kab", psi_l,
+                       jnp.einsum("ksmtn,ktnb->ksmb", o, psi_r))
+            for o in ops])
+        return part if acc is None else acc + part
 
-    def project(psi_nmu, O, psi_mun):
-        got = (tuple(psi_nmu.shape), tuple(O.shape), tuple(psi_mun.shape))
-        if got != expected:
-            raise ValueError(
-                "contract_bands_block_reshard(layout='axis'): endpoint "
-                f"shapes {got} do not match planned {expected}")
-        # Same contract as the distrib_la plans this replaces: a concrete
-        # operand must already sit in its spec (a tracer's layout belongs
-        # to the enclosing jit), never an implicit (μ, n)-class reshard.
-        for name, x, spec in zip(("psi_left", "O", "psi_right"),
-                                 (psi_nmu, O, psi_mun), in_specs):
-            have = getattr(x, "sharding", None)
-            if (not isinstance(x, jax.core.Tracer) and have is not None
-                    and not have.is_equivalent_to(
-                        jax.sharding.NamedSharding(mesh_xy, spec), x.ndim)):
-                raise ValueError(
-                    f"contract_bands_block_reshard(layout='axis'): {name} "
-                    f"must already be sharded {spec}; refusing an implicit "
-                    f"reshard of a {tuple(x.shape)} array.  Got {have!r}.")
-        return kernel(psi_nmu, O, psi_mun)
+    compiled = {}
 
-    return project
+    def accumulate(faces, O, acc, *, a0, b0):
+        key = (a0, b0, acc is None)
+        if key not in compiled:
+            body = functools.partial(accumulate_body, a0=a0, b0=b0)
+            if acc is None:
+                fn = shard_map(lambda l, r, o: body(l, r, o, None),
+                               mesh=mesh_xy,
+                               in_specs=(left_spec, right_spec, o_spec),
+                               out_specs=acc_spec, check_vma=False)
+            else:
+                fn = shard_map(body, mesh=mesh_xy,
+                               in_specs=(left_spec, right_spec, o_spec,
+                                         acc_spec),
+                               out_specs=acc_spec, check_vma=False)
+            compiled[key] = jax.jit(fn)
+        args = (*faces, O) if acc is None else (*faces, O, acc)
+        return compiled[key](*args)
+
+    return BandProjector(
+        mesh=mesh_xy, axes=axes, channels=channels,
+        expected=((nk, nb, ns, mu_l), (nk, ns, mu_l, ns, mu_r),
+                  (nk, ns, mu_r, nb)),
+        in_specs=(left_spec, o_spec, right_spec), prepare=prepare,
+        accumulate=accumulate,
+        finish=_band_block_finish(mesh_xy, axes, px, py, nch),
+        spin_block=d, ns=ns)
 
 
 def contract_bands_block_reshard(
@@ -526,6 +738,7 @@ def contract_bands_block_reshard(
     face_shape=None,
     right_face_shape=None,
     face_band_extent=None,
+    spin_block=None,
 ) -> Callable:
     """Build the band projection + reshard primitive (module docstring).
 
@@ -547,8 +760,8 @@ def contract_bands_block_reshard(
         windows; channel algebra: gw.ppm_tau_kernel + manual §7.5).
         Returns the tuple ``(S_R, S_I)``, both complex.  Incompatible
         with ``extra`` (refused): stack the channel pair yourself as a
-        real leading-extra operand if you need both.  **Legacy layout
-        only** — refused under ``layout='face'``, see below.
+        real leading-extra operand if you need both.  Under
+        ``layout='face'``/``'axis'`` both channels ride one stream.
     extra
         ``"none"`` | ``"leading"`` | ``"minor"`` — position of the
         caller's stack axis E (see canonical layout).  Both orders are
@@ -557,55 +770,53 @@ def contract_bands_block_reshard(
         ``"minor"`` always takes the XLA plan (structural: the
         contracted axis is not GEMM-reachable without a full-tile
         transpose copy) — use ``"leading"`` where the GEMM plan matters.
-        **Legacy layout only** — refused under ``layout='face'``.
+        **Legacy layout only** — refused under ``layout='face'``/``'axis'``.
     axes
         Mesh axis names ``(ax_x, ax_y)``; ax_x shards μ/m, ax_y shards
         ν/n.  Default matches every production mesh.
     layout
+        ``"face"``: the band-distributed ``psi_nmu`` ``(nk, m_X, s, μ_Y)``
+        and ``psi_mun`` ``(nk, s', ν_X, n_Y)`` (``gw.wavefunction_bundle``),
+        every operand and transient at 1/P — the stationary-operator
+        stream of :func:`_face_project_kernel`.  Needs a square mesh.
         ``"axis"``: band-complete operands (every band on every rank, the
-        centroid axis on one mesh axis). Uses the same
-        planned projection as face; the service selects local GEMMs and
-        centroid reduce-scatter. Requires ``face_shape`` and ``extra="none"``.
+        centroid axis on one mesh axis) — :func:`_axis_project_kernel`'s
+        local slab contraction and one band-block reduce-scatter.
+        Both require ``face_shape`` and ``extra="none"`` (a caller with
+        several projections calls the kernel once per slice).
         ``"legacy"`` (default): the shard_map + psum_scatter body below,
         BYTE-IDENTICAL to the code this module shipped before the
         face carrier existed.
-        ``"face"``: the two-face carrier's ``psi_nmu``/``psi_mun``
-        operands (``gw.wavefunction_bundle``) — a completely different
-        mechanism (two planned ``distrib_la.gemm_plan`` N,N GEMMs, no
-        shard_map, no psum_scatter; see :func:`_face_project_kernel`),
-        because those operands are 2-D sharded on BOTH mesh axes from the
-        start (unlike legacy's ``psi_xr``/``psi_yn``, whose band axis is
-        REPLICATED going in and only becomes sharded at the output) — the
-        collective-based algorithm below is not expressible on them.
-        Requires ``face_shape``; ``channels`` may be ``"none"`` or
-        ``"split_reim"`` (2026-08-22 — the dynamic PPM/MPA Σ_c(τ)
-        two-channel plan, ported: see :func:`_face_project_kernel`).
-        ``extra`` must stay ``"none"`` (refused otherwise — the face
-        projector has no batched-stack axis; a caller with several
-        projections calls this kernel once per slice instead).
     face_shape
         ``(nk, nb_full, n_rmu, nspinor)`` — required when ``layout=
-        'face'``.  Fixes both GEMM plans' shapes EAGERLY at this call
-        (the reason this is a factory ARGUMENT and not read off an
-        operand at call time: a ``GemmPlan`` cannot be built from inside
-        a trace — see ``distrib_la.gemm_plan``'s own docstring).
+        'face'``/``'axis'``.  Fixes the local tile shapes and the face
+        stream's band-chunk count at this call.
     right_face_shape
         Optional ``(nk, nb_full, n_rmu_right, nspinor)`` for a rectangular
         operator.  Omit for the historical square projection.  The two
         endpoints must share ``nk``, ``nb_full`` and ``nspinor``; only their
         centroid extents may differ.
+    face_band_extent
+        The projected band extent (the Σ window's padded carrier), when the
+        ψ operands are sliced below ``nb_full``.
+    spin_block
+        Face/axis: the operator spin block ``d`` (a divisor of ``nspinor``)
+        a caller projects through :class:`BandProjector`'s
+        ``prepare``/``accumulate``/``finish`` — ψ at full ``nspinor``, each
+        ``O`` block ``(nk, d, μ, d, ν)``.  Default ``nspinor``.
 
     Returns
     -------
     ``project(psi_left, O, psi_right)`` — safe to jit / trace into larger
     kernels.  Legacy: a shard_map'd callable, output per the canonical
-    layout table.  Face: two chained planned GEMMs, output ``(nk, m, n)``
-    at ``P(None, ax_x, ax_y)`` — the SAME output spec as legacy's.
+    layout table.  Face/axis: a :class:`BandProjector`, output
+    ``(nk, m, n)`` at ``P(None, ax_x, ax_y)`` — the SAME output spec as
+    legacy's.
     """
     if layout not in ("legacy", "face", "axis"):
         raise ValueError(
-            f"contract_bands_block_reshard: layout must be 'legacy' or "
-            f"'face', got {layout!r}")
+            f"contract_bands_block_reshard: layout must be 'legacy', "
+            f"'face' or 'axis', got {layout!r}")
     if layout in ("face", "axis"):
         if channels not in ("none", "split_reim"):
             raise ValueError(
@@ -613,23 +824,21 @@ def contract_bands_block_reshard(
                 f"{channels!r} not in ('none', 'split_reim')")
         if extra != "none":
             raise NotImplementedError(
-                "contract_bands_block_reshard(layout='face'): extra="
-                f"{extra!r} is not ported — the two-GEMM face projector "
-                "has no batched-stack axis; a caller with several "
-                "projections to make (Σ channels, band brackets) calls "
-                "this kernel once per slice instead (see "
-                "gw.ppm_tau_kernel._bracketed_face / _stack_channels).  "
-                "channels='split_reim' IS ported (2026-08-22, the dynamic "
-                "PPM/MPA Σ_c(τ) two-channel plan) — see "
-                "_face_project_kernel's docstring.")
+                f"contract_bands_block_reshard(layout={layout!r}): extra="
+                f"{extra!r} is not ported — the face/axis projectors have "
+                "no batched-stack axis; a caller with several projections "
+                "to make (band brackets) calls this kernel once per slice "
+                "(gw.ppm_tau_kernel._bracketed_face).  channels="
+                "'split_reim' is served.")
         if face_shape is None:
             raise ValueError(
                 "contract_bands_block_reshard(layout='face') requires "
                 "face_shape=(nk, nb_full, n_rmu, nspinor)")
-        return _face_project_kernel(
-            mesh_xy, face_shape, axes, channels=channels,
-            right_face_shape=right_face_shape,
-            band_extent=face_band_extent, layout=layout)
+        build = (_face_project_kernel if layout == "face"
+                 else _axis_project_kernel)
+        return build(mesh_xy, face_shape, axes, channels=channels,
+                     right_face_shape=right_face_shape,
+                     band_extent=face_band_extent, spin_block=spin_block)
 
     from common.shard_map import shard_map
 
