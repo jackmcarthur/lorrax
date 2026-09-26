@@ -31,7 +31,7 @@ read or modify. Read this file upon first inspection of the LORRAX source before
 | `src/gw/minimax_screening.py` | PPM extraction, minimax window helpers | PPM parameter issues |
 | `src/gw/minimax_config.py` | Shared minimax / sigma quadrature config | Quadrature setup |
 | `src/gw/head_correction.py` | q=0 head / wing correction | Head corrections |
-| `src/gw/vcoul.py`, `compute_vcoul.py`, `compute_vcoul_0d.py` | Coulomb potential (3D / 2D slab / 0D box) | Truncation, V_q build |
+| `src/gw/vcoul.py`, `compute_vcoul.py` | Coulomb potential (3D / 2D slab / 0D box) | Truncation, V_q build |
 | `src/gw/greens_function_kernel.py` | `build_G` occupied/all Green's function | G-matrix construction |
 | `src/gw/wavefunction_bundle.py` | `Wavefunctions` bundle + `project` / `project_ri` (Σ_μν → Σ_ij band projection) | Band-basis projection |
 | `src/gw/qsgw_utils.py` | QSGW fixed-point solver, Σ^xc I/O | Self-consistent GW |

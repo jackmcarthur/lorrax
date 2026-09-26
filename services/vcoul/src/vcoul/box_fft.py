@@ -26,11 +26,7 @@ Reference: BerkeleyGW source files:
 Units: output is in Rydberg, matching BerkeleyGW convention: v(G) = 8π/|G|²
 for the untruncated case.
 
-NUMPY ONLY — no jax, no lorrax.  The ``main()`` CLI that used to live
-alongside this (it read a WFN.h5 through ``file_io.WfnLoader`` and diffed
-against a BGW ``vcoul`` text file) stayed behind in
-``gw/compute_vcoul_0d.py``: a comparison driver that opens files is not
-part of a pure-math service surface.
+NUMPY ONLY — no jax, no lorrax.
 """
 
 import numpy as np

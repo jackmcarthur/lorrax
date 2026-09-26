@@ -599,7 +599,6 @@ _DRIVER_PLUMBING_BUDGET = {
     "psp.orbital_magnetization": 0,
     "psp.finite_q_head_interp": 0,
     "gw.eqp_bgw": 0,
-    "gw.compute_vcoul_0d": 0,
     "postprocess.rotate_wfn_to_qp": 0,
     "gw.downfold_cli": 0,
 
@@ -1598,13 +1597,12 @@ def test_every_package_in_the_map_exists(sources):
 #: an entry claiming otherwise.
 #:
 #: ``vcoul`` joined 2026-08-07.  Its shims — ``gw.compute_vcoul``,
-#: ``gw.coulomb.*``, ``gw.vcoul``, ``gw.compute_vcoul_0d``,
+#: ``gw.coulomb.*``, ``gw.vcoul``,
 #: ``file_io.read_bgw_vcoul``, ``common.coulomb_sphere`` — all say ``import
 #: vcoul`` / ``from vcoul import <public name>`` and none reaches a
 #: submodule, so vcoul needs NO row in ``_SERVICE_DOOR_EXCEPTIONS`` below.
-#: That is the point of putting ``_minibz_kernel_bare`` and
-#: ``_round_up_fft_size`` on the door despite the underscore: they have real
-#: cross-package consumers, and a shim reaching ``vcoul.minibz`` for one of
+#: That is the point of putting ``_minibz_kernel_bare`` on the door despite
+#: the underscore: it has real cross-package consumers, and a shim reaching ``vcoul.minibz`` for one of
 #: them would have been this rule's first new violation since the replumb.
 #: ``minimax`` joined 2026-08-08 with the sixth extraction, and it joined
 #: with NO shim and NO row below.  ``gw.minimax_screening`` — the module's
