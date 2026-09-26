@@ -61,10 +61,6 @@ __all__ = ["cholesky", "block_size_for", "dense_to_tiles", "tiles_to_dense"]
 def block_size_for(n: int, Pr: int, Pc: int) -> tuple[int, int]:
     """``(block_size, J)`` for an ``n x n`` matrix on a ``Pr x Pc`` mesh.
 
-    Ported from ``common.fft_helpers.compute_block_size_for_2d_cholesky``,
-    which is where it sat purely because that module already had ``math``
-    imported; nothing about it is an FFT fact.
-
     The constraints are fundamental to any 2-D blocked algorithm::
 
         n % block_size == 0     the matrix divides into whole tiles
