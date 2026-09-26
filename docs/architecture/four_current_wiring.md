@@ -519,7 +519,6 @@ format (`file_io.static_gauge_head`).)
 | `_complete_static_vertex_orientations(forward_R, reverse_R)` | both ordered orientations in R space before the R→q FFT: `forward + reverse^†`; charge reduces to `forward + conj(forward)`. `2*forward` is valid only in a real gauge |
 | `solve_w(V_q, chi0_q, meta, mesh_xy, *, dyson_solver, n_rmu_logical)` | $W=(1-V\chi_0)^{-1}V$, flat q `(n_q, μ, μ)`; q axis full-BZ or wedge (the caller owns it); output `P(None,'x','y')` on both plans; `chi0_q` is donated |
 | `_resolve_w_solve_fn` | the one plan dispatch for `solve_w` and `precompile_solve_w`. `local`: q scattered over `P(('x','y'),None,None)`, per-q pivoted LU, sliced to the logical extent. `distributed`: 2-D block GEMM for $A$ plus `distrib_la` `solve_lu`; refuses at resolve time, never downgrades. The plan comes from `linalg` |
-| `_w_residual_report` | $\|(1-V\chi)W-V\|/\|V\|$ on the first q, under `LORRAX_W_RESIDUAL_CHECK=1`; the distributed plan's numerical contract |
 | `_w_solve_pref_scalar(meta)` | the state-capacity prefactor from `meta.nspinor_wfnfile`, never the bispinor representation width (that would halve every block) |
 | `_require_w_operand_geometry` | $V$ and $\chi$ share one square centroid carrier: the packed basis, or the canonical padding receipt |
 | `compute_no_pair_dirac_current_block` / `_blocks` | one or several paramagnetic no-pair blocks, `(n_q, p_I, p_J)`, no Ward contact |

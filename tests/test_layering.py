@@ -806,11 +806,6 @@ def test_the_env_scan_separates_reads_from_writes():
 # is banned outright.
 
 _L1_LIBRARY_ENV_READS = {
-    # resolve_sigma_plan -- explicit, fail-closed selection of the box
-    # production route or the frozen pane comparison control.
-    "gw.sigma_plan": {
-        "LORRAX_SIGMA_PLAN",
-    },
     # Debug-only support-box trace.  Accuracy, reduction wall and cache
     # location are deck keys; no numerical policy is read here.
     "gw.sigma_box_plan": {
@@ -958,7 +953,7 @@ def test_the_resolver_scan_can_fail():
 
 def test_the_l1_env_read_ratchet_rejects_a_new_unregistered_policy(sources):
     """RED TWIN: a resolver alone does not register a new policy read."""
-    mod = "gw.sigma_plan"
+    mod = "gw.sigma_box_plan"
     injected = (
         sources[mod]
         + "\ndef resolve_audit_negative_control():\n"

@@ -963,18 +963,6 @@ def test_mpa_executor_has_one_tau_kernel_factory():
     assert len(calls) == 1
 
 
-def test_box_route_is_default_and_campaign_route_refuses(monkeypatch):
-    from gw.sigma_plan import resolve_sigma_plan
-
-    monkeypatch.delenv("LORRAX_SIGMA_PLAN", raising=False)
-    assert resolve_sigma_plan() == "box"
-    monkeypatch.setenv("LORRAX_SIGMA_PLAN", "panes")
-    assert resolve_sigma_plan() == "panes"
-    monkeypatch.setenv("LORRAX_SIGMA_PLAN", "delivered")
-    with pytest.raises(ValueError, match="box.*panes"):
-        resolve_sigma_plan()
-
-
 _DECK = """\
 [cohsex]
 sys_dim = 3

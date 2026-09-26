@@ -13,7 +13,6 @@ from __future__ import annotations
 from dataclasses import dataclass
 from functools import lru_cache
 from typing import TYPE_CHECKING, NamedTuple
-import os
 
 import jax
 import jax.numpy as jnp
@@ -407,33 +406,8 @@ def fit_ppm(
     z = complex(probe_omega)
     t0 = _t.perf_counter()
 
-    _mem_diag = os.environ.get("LORRAX_PPM_MEM_DIAG", "0").strip() in ("1", "true", "on")
-
-    def _mem(label, *arrays):
-        # Env-gated: block on the named arrays, then print this device's allocator state,
-        # so an OOM is attributed to the stage that dispatched it (async dispatch otherwise
-        # surfaces it at the next host read).
-        if not _mem_diag:
-            return
-        for a in arrays:
-            if a is not None:
-                jax.block_until_ready(a)
-        st = jax.local_devices()[0].memory_stats() or {}
-        specs = ", ".join(
-            f"{getattr(getattr(a, 'sharding', None), 'spec', None)} {tuple(a.shape)}"
-            for a in arrays if a is not None)
-        if jax.process_index() == 0:
-            import sys as _sys
-            _sys.stderr.write(
-                f"  [ppm mem] {label}: in_use {st.get('bytes_in_use', 0) / 2**30:.2f} GiB, "
-                f"peak {st.get('peak_bytes_in_use', 0) / 2**30:.2f} GiB, "
-                f"limit {st.get('bytes_limit', 0) / 2**30:.2f} GiB; {specs}\n")
-            _sys.stderr.flush()
-
-    _mem("fit_ppm entry (W0, Wprobe, V live)", W0_q, Wprobe_q, V_q)
     Wc0_q = W0_q - V_q
     Wci_q = Wprobe_q - V_q
-    _mem("Wc0/Wci formed", Wc0_q, Wci_q)
     fit = fit_gn_ppm_from_wc_pair(
          Wc0_q, Wci_q, z, fallback_omega=float(fallback_omega),
          n_mu_logical=int(n_mu_logical),
@@ -444,8 +418,6 @@ def fit_ppm(
          ordered_orientations=bool(ordered_orientations),
          print_fn=print_fn if print_fn is not None else print)
 
-    _mem("GN fit returned (before reshard)", fit.omega_qmunu, fit.B_qmunu,
-         fit.B_odd_qmunu, fit.valid_qmunu)
     q_shard = NamedSharding(mesh_xy, P(None, 'x', 'y'))
     Omega = jax.lax.with_sharding_constraint(
         jnp.asarray(fit.omega_qmunu), q_shard)
@@ -456,7 +428,6 @@ def fit_ppm(
     valid_mask = jax.lax.with_sharding_constraint(
         jnp.asarray(fit.valid_qmunu), q_shard)
     Wc0_q = jax.lax.with_sharding_constraint(Wc0_q, q_shard)
-    _mem("GN fit done + outputs resharded", Omega, B, B_odd, valid_mask, Wc0_q)
     t1 = _t.perf_counter()
 
     probe_hermiticity_residual = None
@@ -477,25 +448,6 @@ def fit_ppm(
     # Deck-level ε_H measurement (env-gated observability; channel-
     # hermiticity memo §1.3/§3.5): the Laplace-family symmetry diagnostics
     # (σ_R symmetric / σ_I antisymmetric, check L1) hold only to the PPM
-    # amplitude's INHERITED hermiticity residual
-    # ε_H = max_q |B_q − B_q†| / max|B| — inherited from the un-Hermitized
-    # LU Dyson solve, gated in production only at q=0 / rtol 1e-6.  Measure
-    # it, don't assume it.  The channel MERGE itself needs no hermiticity
-    # (bilinearity), so this is diagnostic, not a gate; rtol=1.0 keeps the
-    # HL probe (legitimately non-Hermitian B) from warning.
-    if os.environ.get("LORRAX_PPM_HERM_DIAG", "0").strip().lower() in (
-            "1", "true", "yes", "on"):
-        from common import sanity
-        _pf = print_fn if print_fn is not None else (lambda *a, **k: None)
-        sanity.check_hermitian(f"{model_label} B_q (eps_H, all q)", B,
-                               rtol=1.0, verbose=True, print_fn=_pf)
-        sanity.check_hermitian(f"{model_label} Omega_q (symmetry, all q)",
-                               Omega, rtol=1.0, verbose=True, print_fn=_pf)
-        if B_odd is not None:
-            sanity.check_hermitian(f"{model_label} D_q (odd residue, all q)",
-                                   B_odd, rtol=1.0, verbose=True,
-                                   print_fn=_pf)
-
     # ω_p in PPMBuildResult historically meant the imaginary-axis magnitude;
     # carry the probe magnitude there for diagnostics.  Downstream Σ kernels
     # consume only B_q, Omega_q (the *fitted* pole frequency), so the probe
@@ -893,22 +845,6 @@ def _add_static_term_fn(sharding):
     """``sigma + term`` broadcast over (bracket, omega); built once per layout."""
     return jax.jit(lambda sigma, term: sigma + term[None, None, ...],
                    out_shardings=sharding)
-
-
-def host_rss_diag(label):
-    """LORRAX_PPM_MEM_DIAG=1: rank 0 prints its host VmRSS / VmHWM (stderr) at ``label``."""
-    if os.environ.get("LORRAX_PPM_MEM_DIAG", "0").strip() not in ("1", "true", "on"):
-        return
-    if jax.process_index() != 0:
-        return
-    import sys as _sys
-    with open("/proc/self/status") as fh:
-        vm = {k: v.split()[0] for k, v in
-              (line.split(":", 1) for line in fh if line.startswith(("VmRSS", "VmHWM")))}
-    _sys.stderr.write(
-        f"  [host rss] {label}: VmRSS {int(vm.get('VmRSS', 0)) / 2**20:.2f} GiB, "
-        f"VmHWM {int(vm.get('VmHWM', 0)) / 2**20:.2f} GiB\n")
-    _sys.stderr.flush()
 
 
 def compute_sigma_c_ppm_omega_grid(
