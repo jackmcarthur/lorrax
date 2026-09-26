@@ -26,25 +26,35 @@ project = contract_bands_block_reshard(
     face_shape=None,          # (nk, nb_full, n_μ, nspinor), required for face/axis
     right_face_shape=None,    # rectangular operator: right endpoint's shape
     face_band_extent=None,
+    spin_block=None,          # face/axis: operator spin block d (default nspinor)
 )
 out = project(psi_left, O, psi_right)
+# face/axis, an operator in d x d spin blocks: one reduction per call
+faces = project.prepare(psi_left, psi_right)
+acc = None
+for a0, b0 in blocks:
+    acc = project.accumulate(faces, O_block, a0=a0, b0=b0, acc=acc)
+out = project.finish(acc)
 ```
 
 `project` is safe to jit or trace into a larger kernel. The factory is a
-collective: the legacy factory calls `common.collectives.warm_mesh_cliques`
-([MPI collectives](mpi_collectives.md)), and face/axis build `distrib_la`
-GEMM plans eagerly. Call it synchronously on every rank, outside any trace.
+collective: the legacy and face factories call
+`common.collectives.warm_mesh_cliques` ([MPI collectives](mpi_collectives.md)).
+Call it synchronously on every rank, outside any trace.
 
 ### Layouts: one projection, three mechanisms
 
 | `layout` | operands | mechanism | collectives | consumers |
 |---|---|---|---|---|
 | `legacy` | ψ band axis replicated going in (`psi_xr`, `psi_yn`) | one `shard_map`: right GEMM → `psum_scatter('y')` → left GEMM → `psum_scatter('x')` | two, the large one on `'y'` | `bse.bse_ring_comm` (`extra="leading"`), `common.zeta_projection` |
-| `face` | two-face carrier (`psi_nmu`, `psi_mun`, 2-D sharded from the start) | two planned `distrib_la.gemm_plan` N,N GEMMs, `T = O·ψ_mun`, `Σ = conj(ψ_nmu)·T` | inside the provider | GW Σ (`gw.ppm_tau_kernel`, `cohsex_sigma`, `photon_sigma`, `mpa.sector_sigma`) on the band-distributed ψ carrier |
-| `axis` | every band local, centroid split over one mesh axis | local slab contraction, then `reduce_scatter_to_band_block` | one, `nb²` per rank | the face projector after it reshards ψ to band-complete copies, and the spin-pair streams |
+| `face` | band-distributed ψ (`psi_nmu`, `psi_mun`, 1/P); square mesh | the operator never moves. `prepare`: transpose `ppermute` of each ψ tile, then an `all_to_all` over `'y'` into the ψ_l slab (all bands, `μ/P`). `accumulate`, per band chunk sized against one local operator tile: ψ_r chunk `all_gather('x')`, local `T = O·ψ_r`, `psum_scatter('y')` of T onto the slab's μ piece, slab contraction into a rank-local `(nb, nb)` partial. `finish`: `reduce_scatter_to_band_block` | per rank `16·nk·[nb·ns·(μ_l+μ_r)/p + nb² + 3·nb·ns·μ/P]` bytes; transients ≤ one operator tile | GW Σ (`gw.ppm_tau_kernel`, `cohsex_sigma`, `photon_sigma`, `mpa.sector_sigma`) on the band-distributed ψ carrier |
+| `axis` | every band local, centroid split over one mesh axis | local slab contraction into the partial, then `reduce_scatter_to_band_block` | one, `nb²` per rank | axis-layout ψ carriers (none in production) |
 
 Face and axis require `face_shape`, refuse any `extra` other than `"none"`
 (call once per slice instead), and accept `channels ∈ {"none", "split_reim"}`.
+Their `(nb, nb)` partial is `16·nk·nb²` bytes per rank per channel,
+P-independent; a projection whose operator comes in spin blocks accumulates
+every block into it and reduces once.
 All three return `(nk, m, n)` at `P(None, ax_x, ax_y)`.
 
 ### Legacy operand layout
