@@ -521,7 +521,8 @@ def test_sweep_consumers_take_kvecs_from_the_same_gtab():
     """Every migrated sweep pairs ``gtab.gvecs`` with ``gtab.kvecs``."""
     root = Path(__file__).resolve().parents[1]
     for relpath, expected in (
-            ("src/gw/kin_ion_io.py", 2),
+            ("src/gw/kin_ion_io.py", 1),     # T + V_loc + V_NL
+            ("src/gw/hartree.py", 1),        # the direct field (ARCH H2)
             ("src/gw/sc_iteration.py", 2),
     ):
         tree = ast.parse((root / relpath).read_text(encoding="utf-8"))
