@@ -21,6 +21,11 @@ Every arm runs in its own process (per-GPU peak memory is the process's):
   its unitary ones), with the χ spheres at every full-grid q as the middle's rows.
   The synthetic operands are not covariant, so the wedge's values differ from the
   dense-column plan's here by design; correctness is the P4 gate's (covariant operands);
+* ``--product scalar`` is Σ = G ⊙ W, the second caller: A = G (the ``Gc`` build) on the ψ
+  sphere at the k-parents, B = W synthetic random at the q-IBZ (= the k-parents) on the χ
+  sphere, resolved once over the full grid and the parents (K3's export rule), typed
+  one-channel transport; the output on the ψ sphere at the k-parents; the wedge carries
+  the rows' spinor actions;
 * reports: plan receipt, compact-build wall (cold, warm), kernel wall by stage
   (cold one-shot including compiles, then warm one-shot), per-GPU peak bytes, a
   checksum for cross-arm parity; ``--stages`` adds warm per-sub-stage timings of one
@@ -134,8 +139,23 @@ def setup(args, mesh):
     sidx_par = build_sphere_box_index(gp, box, gp.shape[1], ngk_valid=npar)
     tr = SphereTransport.typed(plan, fft_grid=box, parent_sphere_index=sidx_par, children=children)
     op = PairOperand(children, tr)
-    return dict(op=op, out=out, kgrid=kgrid, box=box, plan=plan, npar=npar, gp=gp, ns=ns,
-                ecut=ecut, cut=cut, wedge=wedge)
+    w_op, w_ngk_par = None, None
+    if args.product == "scalar":
+        # W on the χ sphere at the q-IBZ = the k-parents, resolved once with the full grid
+        s_all = screened_sphere_set(fft_grid=box, psi=psi, bvec=bvec, q_frac=np.concatenate([kf, kp]),
+                                    ecutwfc=ecut, screened_coulomb_cutoff=chi_cut)
+        w_full = SphereSet(s_all.gvecs[:len(kf)], s_all.ngk[:len(kf)], kf)
+        w_par = SphereSet(s_all.gvecs[len(kf):], s_all.ngk[len(kf):], kp)
+        widx = build_sphere_box_index(w_par.gvecs, box, w_par.width, ngk_valid=w_par.ngk)
+        w_ngk_par = w_par.ngk
+        w_op = PairOperand(w_full, SphereTransport.typed(plan, fft_grid=box, parent_sphere_index=widx,
+                                                         children=w_full, ns=1))
+        out = SphereSet(gp, npar, kp)                                   # Σ at the k-parents
+        if args.wedge != "off":
+            wedge = ColumnWedge.from_symmaps(sym, children, unitary_only=args.wedge == "unitary",
+                                             ns=ns)
+    return dict(op=op, w_op=w_op, w_ngk_par=w_ngk_par, out=out, kgrid=kgrid, box=box, plan=plan,
+                npar=npar, gp=gp, ns=ns, ecut=ecut, cut=cut, wedge=wedge)
 
 
 def compact_build(s, mesh, M, nb, nv, seed=5):
@@ -184,9 +204,28 @@ def compact_build(s, mesh, M, nb, nv, seed=5):
     return A, C, dict(cold_s=cold, warm_s=min(warm), flops=flops, M=M, nb=nb)
 
 
+def w_build(s, mesh, M, seed=9):
+    """Synthetic W at the q-IBZ on its carrier: random (n_par, M, M) at P(None, 'x', 'y'), zero pads."""
+    live = np.arange(M)[None, :] < np.asarray(s["w_ngk_par"])[:, None]
+    n = live.shape[0]
+
+    def cb(idx):
+        starts = [sl.start or 0 for sl in idx]
+        shape = [len(range(*sl.indices(v))) for sl, v in zip(idx, (n, M, M))]
+        r = np.random.default_rng([seed] + starts)
+        return r.standard_normal(shape) + 1j * r.standard_normal(shape)
+    sh = NamedSharding(mesh, P(None, "x", "y"))
+    W = jax.make_array_from_callback((n, M, M), sh, cb)
+    mask = jnp.asarray(live[:, :, None] & live[:, None, :])
+    return jax.jit(lambda a: jnp.where(mask, a, 0), out_shardings=sh)(W)
+
+
 def checksum(conv, X):
     """Per-q Frobenius norms and one 4x4 corner, gathered (small)."""
     x = conv.strip(X)
+    if x.ndim == 5:                    # Σ: (q, M, α, M, β) → the (α, β) = (0, 0) block's corner
+        return dict(norm=np.linalg.norm(x.reshape(x.shape[0], -1), axis=1).tolist(),
+                    corner=[[complex(v).real, complex(v).imag] for v in x[0, :4, 0, :4, 0].ravel()])
     return dict(norm=np.linalg.norm(x, axis=(1, 2)).tolist(),
                 corner=[[complex(v).real, complex(v).imag] for v in x[0, :4, :4].ravel()])
 
@@ -195,6 +234,10 @@ def stages(conv, reps=3):
     """Warm timings of one middle batch's and one expand chunk's sub-stages on this rank's GPU."""
     import gw.mixed_basis_pair_convolution as mb
     ns, nk, nr, J = conv.ns, conv.nk, conv.nr, conv.chunks.J
+    scalar = conv.product == "scalar"
+    nx = conv.spins[2]
+    nsk = 1 if scalar else ns             # the k-convolution's spin trace width
+    cw = nx * nx * J                      # its columns per operand
     dev = jax.local_devices()[0]
     kb = conv.kbox[0]
     nbox = int(np.prod(kb))
@@ -219,33 +262,42 @@ def stages(conv, reps=3):
     lsrc, lph, spin = put(t["csrc"]), put(t["mph"]), put(t["spin"])
     row = jax.jit(lambda h, a, b, c: mb._row_half(h, a, b, c, n_s=ns))
     res["row_half_gather"] = timeit(row, H, lsrc, lph, spin)
-    x = zc((nk, ns, 2 * J, ns) + kb)
     plan_row = conv._plan(sign=+1, norm="forward", in_support=conv.sup[0])
-    res["plan_p2r"] = timeit(jax.jit(plan_row), x)
-    D = zc((nk, ns, 2 * J, ns, nr))
+    if scalar:                            # G's n_s² blocks and W's one channel, transformed apart
+        res["plan_p2r"] = timeit(jax.jit(plan_row), zc((nk, ns, J, ns) + kb))
+        plan_w = conv._plan(sign=+1, norm="forward", in_support=conv.sup[1])
+        res["plan_p2r_W"] = timeit(jax.jit(plan_w), zc((nk, 1, J, 1) + conv.kbox[1]))
+        bc = jax.jit(lambda a, c: jnp.concatenate(
+            [a.reshape(nk, cw, nr), jnp.broadcast_to(c.reshape(nk, 1, J, 1, nr),
+                                                     (nk, ns, J, ns, nr)).reshape(nk, cw, nr)], 1))
+        res["broadcast_concat_W"] = timeit(bc, zc((nk, ns, J, ns, nr)), zc((nk, 1, J, 1, nr)))
+    else:
+        res["plan_p2r"] = timeit(jax.jit(plan_row), zc((nk, ns, 2 * J, ns) + kb))
+    D = zc((nk, nsk, 2 * cw, nsk, nr))
     F = zc((nk, nr))
     if conv.backend == "router":
         from ffi.fft import make_fused_conv_kplane
-        kconv = make_fused_conv_kplane(conv.mesh, conv.kgrid, ns, perm_l=list(range(ns)),
-                                       phase_l=[1] * ns, perm_r=list(range(ns)), phase_r=[1] * ns)
-        f = jax.jit(lambda d, f_: kconv(d.reshape(nk, 1, ns, 2 * J, ns, nr), f_.reshape(nk, 1, nr)))
+        kconv = make_fused_conv_kplane(conv.mesh, conv.kgrid, nsk, perm_l=list(range(nsk)),
+                                       phase_l=[1] * nsk, perm_r=list(range(nsk)), phase_r=[1] * nsk)
+        f = jax.jit(lambda d, f_: kconv(d.reshape(nk, 1, nsk, 2 * cw, nsk, nr), f_.reshape(nk, 1, nr)))
     else:
         from common.fft_helpers import local_fftn3, local_ifftn3
 
         def f(d, f_):
-            a = (d * f_[:, None, None, None, :]).reshape(conv.kgrid + (ns, 2 * J, ns, nr))
-            aR = local_ifftn3(a, axes=(0, 1, 2), norm="backward").reshape(nk, ns, 2 * J, ns, nr)
-            X = sum(aR[:, s1, :J, s2] * jnp.conj(aR[:, s1, J:, s2]) for s1 in range(ns) for s2 in range(ns))
-            return local_fftn3(X.reshape(conv.kgrid + (J, nr)), axes=(0, 1, 2), norm="backward")
+            a = (d * f_[:, None, None, None, :]).reshape(conv.kgrid + (nsk, 2 * cw, nsk, nr))
+            aR = local_ifftn3(a, axes=(0, 1, 2), norm="backward").reshape(nk, nsk, 2 * cw, nsk, nr)
+            X = sum(aR[:, s1, :cw, s2] * jnp.conj(aR[:, s1, cw:, s2])
+                    for s1 in range(nsk) for s2 in range(nsk))
+            return local_fftn3(X.reshape(conv.kgrid + (cw, nr)), axes=(0, 1, 2), norm="backward")
         f = jax.jit(f)
     res["kconv"] = timeit(f, D, F)
-    U = zc((nk, J, nr))
+    U = zc((nk, cw, nr))
     Q = zc((nq, nr))
     rows = put(conv.q_rows)
-    sel = jax.jit(lambda u, q, r: (jnp.take(u, r, axis=0) * q[:, None, :]).reshape((nq, J) + conv.fft_grid))
+    sel = jax.jit(lambda u, q, r: (jnp.take(u, r, axis=0) * q[:, None, :]).reshape((nq, cw) + conv.fft_grid))
     res["q_select_phase"] = timeit(sel, U, Q, rows)
     plan_out = conv._plan(sign=-1, norm="backward", out_support=conv.sup_mid)
-    Y = zc((nq, J) + conv.fft_grid)
+    Y = zc((nq, cw) + conv.fft_grid)
     res["plan_r2G"] = timeit(jax.jit(plan_out), Y)
     # expand: one k chunk of the column half and p'->r' for this rank's rows
     kc, ml = conv.chunks.kc, M // conv.P
@@ -255,7 +307,8 @@ def stages(conv, reps=3):
     plan_col = conv._plan(sign=-1, norm="backward", in_support=conv.sup[0])
     xc = zc((kc, ml, ns, ns) + kb)
     res["plan_p2r_prime"] = timeit(jax.jit(plan_col), xc)
-    res["shapes"] = dict(J=J, kc=kc, nbox=nbox, M=M, nq=nq, nk=nk, nr=nr, ns=ns)
+    res["shapes"] = dict(J=J, kc=kc, nbox=nbox, M=M, nq=nq, nk=nk, nr=nr, ns=ns, cw=cw, nsk=nsk,
+                         product=conv.product)
     return res
 
 
@@ -295,6 +348,7 @@ def main():
     ap.add_argument("--stages", action="store_true")
     ap.add_argument("--wedge", choices=("off", "full", "unitary"), default="off")
     ap.add_argument("--screened-coulomb-cutoff", type=float, default=None)
+    ap.add_argument("--product", choices=("trace", "scalar"), default="trace")
     ap.add_argument("--out", required=True)
     args = ap.parse_args()
     from gw.mixed_basis_pair_convolution import MixedBasisPairConvolution
@@ -304,8 +358,9 @@ def main():
     t_tables = time.perf_counter() - t0
     backend = "router" if args.arm == "router" else "xla"
     t0 = time.perf_counter()
-    kw = dict(kgrid=s["kgrid"], fft_grid=s["box"], left=s["op"], right=s["op"], out=s["out"],
-              backend=backend, wedge=s["wedge"])
+    kw = dict(kgrid=s["kgrid"], fft_grid=s["box"], left=s["op"], out=s["out"], backend=backend,
+              wedge=s["wedge"], product=args.product,
+              right=s["op"] if args.product == "trace" else s["w_op"])
     if args.arm == "naive":
         probe = MixedBasisPairConvolution(mesh, **kw, budget_bytes=int(1e15), chunks=(1, 1))
         conv = MixedBasisPairConvolution(mesh, **kw, budget_bytes=int(1e15),
@@ -316,7 +371,7 @@ def main():
         conv = MixedBasisPairConvolution(mesh, **kw)
     t_plan = time.perf_counter() - t0
     say(conv.describe())
-    rec = dict(arm=args.arm, wedge=args.wedge,
+    rec = dict(arm=args.arm, wedge=args.wedge, product=args.product, spins=list(conv.spins),
                orbits=None if conv._wt is None else conv._wt["n_orbits"],
                wedge_rows=None if conv.wedge is None else conv.wedge.rows.tolist(), ns=args.ns, wfn=args.wfn, ecut_scale=args.ecut_scale, box=list(s["box"]),
                kgrid=list(s["kgrid"]), n_parent=len(s["npar"]), nq=conv.nq, P=conv.P,
@@ -329,6 +384,9 @@ def main():
                           hwm=conv.chunks.hwm, target=conv.chunks.target),
                receipt=conv.describe(), t_tables=t_tables, t_plan=t_plan)
     A, C, rec["compact"] = compact_build(s, mesh, conv.width_carrier[0], args.nb, args.nv)
+    if args.product == "scalar":        # C is W at the q-IBZ (the χ plan's output layout)
+        del C
+        C = w_build(s, mesh, conv.width_carrier[1])
     say(f"compact build: cold {rec['compact']['cold_s']:.3f} s, warm {rec['compact']['warm_s']:.4f} s, "
         f"{rec['compact']['flops'] / rec['compact']['warm_s'] / 1e12 / conv.P:.2f} TF/s per GPU")
     stats = jax.local_devices()[0].memory_stats() or {}
