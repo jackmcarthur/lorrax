@@ -132,13 +132,6 @@ that site; `—` means uncertified, and the site warns instead of refusing.
 | `common/zeta_projection.least_squares_transfer` | small-basis Gram `G_S` | caller `rcond` | `μ_S` | 1e8 | refuse (κ arm only: the route reduces over q before host, so it has no per-q trace for the weight arm) |
 | `centroid/pivoted_cholesky` select | candidate Gram, PSD | `√ε` relative | candidate count | — | reports; see below |
 | `bse/bse_w_exact` TRIM probes | probe independence | relative | block size | — | refuse on deficiency, naming k, block and norm |
-| `bse/bse_pseudopoles._orthonormalize` | filtered-vector overlap Gram | `s_cutoff`, floored at absolute `1e-30` | — | — | not wired |
-
-Wiring `_orthonormalize` changes numbers in a shipped eigensolver (a straddled
-block is dropped, so the retained rank falls), so it needs an A/B on the Si BSE
-deck first (`tests/known_failures/2026-08-11-bse-rank-cuts-outside-spectral-closure.md`).
-Its `1e-30` floor violates the no-absolute-floor rule and binds only below
-`s_max ~ 1e-24`.
 
 ### Where rank deficiency must not refuse
 

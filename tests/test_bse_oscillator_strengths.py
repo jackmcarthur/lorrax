@@ -80,8 +80,13 @@ import pytest
 
 from bse.absorption_common import (slice_dipole_to_bse_window)
 from file_io.restart_bundle import (load_dipole_h5)
-from bse.absorption_eigvecs import (compute_dipole_projections,
-                                    compute_jdos_oscillators)
+from bse.absorption_common import (
+    exciton_dipole_projections as compute_dipole_projections)
+
+
+def compute_jdos_oscillators(d_alpha):
+    """Independent-particle oscillator weights ``|d^α_{cvk}|²``."""
+    return (np.abs(d_alpha) ** 2).astype(np.float64)
 
 REG = Path(__file__).resolve().parent / "regression"
 
