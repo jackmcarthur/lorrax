@@ -1318,7 +1318,7 @@ def make_local_kconv_klead_outer(mesh: Mesh, kgrid, *, norm: str | None = "ortho
 
         def _mathdx(l, r, v_r):
             shape = (l.shape[0], l.shape[1], l.shape[2], r.shape[2], r.shape[3])
-            pad = -l.shape[3] % 4 if yb == 0 else 0      # the DMMA arm's 4-wide K chunks
+            pad = -l.shape[3] % 4 if yb in (0, -2) else 0   # the DMMA arm's 4-wide K chunks
             if pad:
                 l = jnp.pad(l, ((0, 0), (0, 0), (0, 0), (0, pad)))
                 r = jnp.pad(r, ((0, 0), (0, pad), (0, 0), (0, 0)))

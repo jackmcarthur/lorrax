@@ -108,7 +108,8 @@ __device__ __forceinline__ void lrx_dmma(double& d0, double& d1, double a, doubl
 extern "C" __global__ void __launch_bounds__(LRX_THREADS, LRX_MINB) lrx_kconv_outer(
     const lrx_c2* __restrict__ L, const lrx_c2* __restrict__ R, const lrx_c2* __restrict__ V,
     lrx_c2* __restrict__ U, OuterGeo g) {
-    static_assert(XB == 8 && YB == 8 && KK % 4 == 0, "DMMA arm: 8x8 tile, K a multiple of 4");
+    static_assert((XB == 8 || XB == 4) && YB == 8 && KK % 4 == 0,
+                  "DMMA arm: an 8- or 4-row by 8-column tile, K a multiple of 4");
     extern __shared__ lrx_c2 bank[];
     using namespace cufftdx;
     constexpr int NWARP = LRX_THREADS / 32;
@@ -126,7 +127,7 @@ extern "C" __global__ void __launch_bounds__(LRX_THREADS, LRX_MINB) lrx_kconv_ou
         for (long long p = p0; p < p1; ++p) {
             const long long a = p % g.na, x0 = (p / g.na) * XB;
             const long long xr = x0 + gr;                         // this lane's A row
-            const bool xok = xr < g.mx;
+            const bool xok = gr < XB && xr < g.mx;                // XB = 4: rows 4..7 are zero
             for (int k = warp; k < NK; k += NWARP) {
                 const double2* lp = reinterpret_cast<const double2*>(L + (((long long)k * g.na + a) * g.mx + xr) * KK);
                 const double2* rp = reinterpret_cast<const double2*>(R + (long long)k * KK * rk + b * g.my + yr);
@@ -143,8 +144,10 @@ extern "C" __global__ void __launch_bounds__(LRX_THREADS, LRX_MINB) lrx_kconv_ou
                 }
                 lrx_c2 v0, v1;
                 v0.x = re0; v0.y = im0; v1.x = re1; v1.y = im1;
-                bank[(gr * YB + 2 * tg) * GK::RS + GK::at(k)] = v0;
-                bank[(gr * YB + 2 * tg + 1) * GK::RS + GK::at(k)] = v1;
+                if (gr < XB) {
+                    bank[(gr * YB + 2 * tg) * GK::RS + GK::at(k)] = v0;
+                    bank[(gr * YB + 2 * tg + 1) * GK::RS + GK::at(k)] = v1;
+                }
             }
             __syncthreads();
             lrx_kbox::transform3<NX, NY, NZ, TR, LRX_SM, fft_direction::inverse>(bank);
@@ -295,7 +298,7 @@ static std::map<Key, std::string> g_fail;
 // Rule: the widest y run (<= 8, 128-byte runs of the U store and the V read) whose NK * YB
 // threads stay <= 256, so two blocks share an SM; XB = 32 / YB (a 32-column tile, mode 2's).
 static int pick_yb(int nk, int yb_req) {
-    if (yb_req == 0) return 8;                         // the DMMA arm's 8x8 tile
+    if (yb_req == 0 || yb_req == -2) return 8;         // the DMMA arm's 8-column tile
     if (yb_req > 0) return yb_req;
     int yb = 1;
     while (yb < 8 && nk * yb * 2 <= kThreadsMax) yb *= 2;
@@ -315,7 +318,7 @@ static ffi::Error build(int nkx, int nky, int nkz, int K, int yb_req, std::strin
     }
     const int nk = nkx * nky * nkz;
     const int yb = pick_yb(nk, yb_req);
-    const Key key{ctx, nkx, nky, nkz, K, yb_req == 0 ? 0 : yb};
+    const Key key{ctx, nkx, nky, nkz, K, (yb_req == 0 || yb_req == -2) ? yb_req : yb};
     std::lock_guard<std::mutex> lock(g_mu);
     if (auto it = g_cache.find(key); it != g_cache.end()) { *out = &it->second; return ffi::Error::Success(); }
     if (auto it = g_fail.find(key); it != g_fail.end()) return fail("kernel build (cached failure)", it->second);
@@ -335,9 +338,9 @@ static ffi::Error build(int nkx, int nky, int nkz, int K, int yb_req, std::strin
     // yb_req 0: the DMMA arm (8x8 tile, 512 threads, the bank alone in shared memory, two
     // blocks per SM at <= 64 registers); yb_req -1: the FMA arm at the rule's y width; > 0: the
     // FMA arm at that width (a measurement dial).
-    const bool dmma = yb_req == 0;
-    const int threads = dmma ? 512 : nk * yb;
-    const int xb = dmma ? 8 : std::max(1, 32 / yb);
+    const bool dmma = yb_req == 0 || yb_req == -2;
+    const int threads = dmma ? (yb_req == 0 ? 512 : 256) : nk * yb;
+    const int xb = dmma ? (yb_req == 0 ? 8 : 4) : std::max(1, 32 / yb);
     const lrx_kbox::Geometry geo{nkx, nky, nkz};
     // The bank, then NBUF (L tile, V tile) buffers: two when they fit (the next pair's tiles
     // land while this pair transforms), else one.
@@ -363,7 +366,7 @@ static ffi::Error build(int nkx, int nky, int nkz, int K, int yb_req, std::strin
     // Two blocks per SM only where the shared memory allows it and a block of <= 256 threads
     // keeps 128 registers per thread (the right leg alone is 4K of them).
     const int minb = (threads > 256 && !dmma) ? 1
-                     : std::max(1, std::min<int>(2, static_cast<int>(smem_sm / (smem + 1024))));
+                     : std::max(1, std::min<int>(dmma ? 4 : 2, static_cast<int>(smem_sm / (smem + 1024))));
     std::string why;
     const std::string cuda_inc = nvrtc::toolkit_include(&why);
     if (cuda_inc.empty()) return sticky("CUDA toolkit headers for NVRTC", why);
@@ -391,7 +394,7 @@ static ffi::Error build(int nkx, int nky, int nkz, int K, int yb_req, std::strin
     std::string path;
     if (!dir.empty()) {
         std::ostringstream name;
-        name << dir << "/kconv_outer_" << nkx << "x" << nky << "x" << nkz << "_K" << K << (dmma ? "_dmma" : "_yb" + std::to_string(yb)) << "_sm"
+        name << dir << "/kconv_outer_" << nkx << "x" << nky << "x" << nkz << "_K" << K << (dmma ? "_dmma" + std::to_string(xb) : "_yb" + std::to_string(yb)) << "_sm"
              << cc_major << cc_minor << "_" << key_hex << ".cubin";
         path = name.str();
     }
