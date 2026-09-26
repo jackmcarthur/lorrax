@@ -4210,14 +4210,22 @@ METAL_HEAD_UPDATES = ("parallel_transport", "dft_velocity")
 
 
 def uses_metal_direct_drude_head(config) -> bool:
-    """Admit the live direct charge head on an ordered shared-pole metal."""
-    return (
-        config.qp_solver is QPSolver.SELF_CONSISTENT
-        and config.sc.head_update == "dft_velocity"
-        and config.head.correction is HeadCorrection.NO_LOCAL_FIELDS
-        and config.sigma.w_model == "shared_pole"
-        and (not config.bispinor or uses_bare_transverse_shared_pole(config))
-    )
+    """Admit the per-map velocity head (Drude + Thomas-Fermi) on a shared-pole metal.
+
+    The direct head (``no_local_fields``) is admitted on scalar and
+    bare-transverse bispinor decks.  The folded head (``full``, intraband
+    wings and the static fold) is admitted on scalar decks (owner ruling
+    2026-09-25: full on time-reversal-even metals on the frozen and the
+    per-map routes); an ordered (time-reversal-broken) store still refuses
+    it at the head (``GATE shared_pole_head_ordered``).
+    """
+    if not (config.qp_solver is QPSolver.SELF_CONSISTENT
+            and config.sc.head_update == "dft_velocity"
+            and config.sigma.w_model == "shared_pole"):
+        return False
+    if config.head.correction is HeadCorrection.NO_LOCAL_FIELDS:
+        return not config.bispinor or uses_bare_transverse_shared_pole(config)
+    return config.head.correction is HeadCorrection.FULL and not config.bispinor
 
 
 @dataclass(frozen=True)
@@ -4460,9 +4468,11 @@ def validate_material_inputs(config, material_class):
                 "tetrahedron Fermi-surface weights, Drude term, Thomas-Fermi "
                 "static head)\n"
                 "  want: sc_head_update = off, or dft_velocity with "
-                "shared_pole + no_local_fields for a direct Drude head\n"
-                "  why:  wings and full local-field folding lack a certified "
-                "ordered metallic Drude completion\n"
+                "shared_pole and no_local_fields (direct Drude head) or full "
+                "(scalar decks)\n"
+                "  why:  parallel_transport links do not follow a Fermi "
+                "surface whose occupations change every map, and a folded "
+                "bispinor metal head has no derived completion\n"
                 "  doc:  docs/self_consistency.md, 'Metals: direct Drude head'")
         if width_ry is None:
             raise ValueError(
