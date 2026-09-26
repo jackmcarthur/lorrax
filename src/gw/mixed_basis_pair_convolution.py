@@ -28,8 +28,9 @@ The plain product is the conjugated one on B's time-reversed image
 C_k[p, p'] = conj B_{−k}[p̄, p̄'] (k + G_p = −(k̄ + G_p̄)): conj C(r+R, r') = B(r+R, r'),
 so ``'scalar'`` composes B's transport with time reversal
 (``SphereTransport.time_reversed``, tables only) and runs the same stages and the same
-k-convolution.  Its spin blocks ride as columns of a one-channel k-convolution, B's
-box transform broadcast over the n_s² blocks of A.
+k-convolution.  Its spin blocks ride as columns of a one-channel k-convolution: B is
+broadcast over the n_s² blocks of A on the compact box (both operands' tables on the union of
+their supports), and one p→r call writes D = [A | B].
 
 Schedule (one τ node; P ranks; every stage one ``shard_map`` over ``('x','y')``)::
 
@@ -520,7 +521,7 @@ def plan_pair_convolution_chunks(*, n_ranks, n_k, spins, widths, width_out, n_q,
     ch = (na * na, nc_ * nc_)                   # the operands' spin blocks
     cx = nx * nx                                # the output's
     cd = na * na                                # D's columns per operand per batch column (both products)
-    split = nx > 1                              # 'scalar': A and B transformed apart, then stacked
+    bcast = nx > 1                              # 'scalar': B broadcast over A's blocks on the compact box
     Mw, Mo, nq, nr = [int(w) for w in widths], int(width_out), int(n_q), int(n_r)
     wd = (dict(n_cols=nr, n_q_mid=nq, width_mid=Mo, kbox_mid=kbox_out, t_cols=0, n_rows=0)
           if wedge is None else dict(wedge))
@@ -542,7 +543,7 @@ def plan_pair_convolution_chunks(*, n_ranks, n_k, spins, widths, width_out, n_q,
 
     def rebuild(nc, j):             # one q row: the gathered operation rows (+ the spin sandwich) and the rebuilt columns
         cols = carrier(nc, j) // Pn
-        return 0 if wedge is None else _C16 * cx * ((3 + split) * nrow * Mm * cols + 2 * Mo * tcol)
+        return 0 if wedge is None else _C16 * cx * ((3 + bcast) * nrow * Mm * cols + 2 * Mo * tcol)
 
     def expand(kc, nc, j):          # the full r' transform of one k chunk, its phased gather, the all-to-all
         cols = carrier(nc, j) // Pn // nc
@@ -550,8 +551,8 @@ def plan_pair_convolution_chunks(*, n_ranks, n_k, spins, widths, width_out, n_q,
                           for c, m, kb in zip(ch, Mw, kboxes))
 
     def middle(j):                  # compact gathers, the p→r outputs, D and its workspace, F, U, Y, the r→G box
-        return _C16 * (nk * j * sum(c * kb for c, kb in zip(ch, kboxes))
-                       + nk * j * nr * (4 * cd + (sum(ch) if split else 0)) + nk * nr
+        gath = sum(c * kb for c, kb in zip(ch, kboxes)) + (2 * cd * kboxes[0] if bcast else 0)
+        return _C16 * (nk * j * gath + nk * j * nr * 4 * cd + nk * nr
                        + nk * j * cx * nr + 2 * nqm * j * cx * (nr + kbm + Mm))
 
     def final(qc, nc, j):           # the all-to-all output, the phased box, its transform and gather
@@ -782,7 +783,15 @@ class MixedBasisPairConvolution:
                 f"GATE pairconv-alias: got box {self.fft_grid} with margins {margin.tolist()}; want "
                 "every margin ≥ 1; why: product frequencies outside the output sphere would fold "
                 "onto it; fix: a larger FFT box (alias_free_margin names the deficit per axis)")
-        self.kbox = tuple(tuple(len(s) for s in sup) for sup in self.sup)
+        # The boxes the operands' tables and p→r transforms use: each operand's own union support,
+        # or for 'scalar' the union of both, so W's one channel is broadcast over G's n_s² blocks
+        # on the compact box and one p→r call writes D = [G | W] directly (no full-box concat).
+        if product == "scalar":
+            u = tuple(np.union1d(a, b) for a, b in zip(*self.sup))
+            self.sup_tab = (u, u)
+        else:
+            self.sup_tab = self.sup
+        self.kbox = tuple(tuple(len(s) for s in sup) for sup in self.sup_tab)
         self.kbox_out = tuple(len(s) for s in self.sup_out)
         self.kbox_mid = tuple(len(s) for s in self.sup_mid)
         self.m_axis = tuple(padded_axis(op.sphere.width, self.P, name=f"pair-conv {nm} slots")
@@ -793,7 +802,7 @@ class MixedBasisPairConvolution:
 
         # ---- host tables -----------------------------------------------------
         self._tables = [self._operand_tables(op, sup, ax.carrier)
-                        for op, sup, ax in zip(self.ops, self.sup, self.m_axis)]
+                        for op, sup, ax in zip(self.ops, self.sup_tab, self.m_axis)]
         self._ocell = self._out_cells(out, self.sup_out, self.mo_axis.carrier)
         self._ocell_mid = self._out_cells(mid, self.sup_mid, self.mm_axis.carrier)
         self._wt = None if wedge is None else self._wedge_tables(wedge, out, mid)
@@ -979,7 +988,7 @@ class MixedBasisPairConvolution:
 
         # ---- 2-4: column half, p' → r', Bloch column phase, r' chunk, all-to-all
         self._expand = []
-        for t, sup, ax in zip(self._tables, self.sup, self.m_axis):
+        for t, sup, ax in zip(self._tables, self.sup_tab, self.m_axis):
             self._expand.append(self._build_expand(t, sup, ax.carrier))
 
         # ---- 5: the streamed middle ------------------------------------------
@@ -989,8 +998,8 @@ class MixedBasisPairConvolution:
         _, ns_c, nx = self.spins
         scalar = self.product == "scalar"
         nsk = 1 if scalar else ns
-        same_support = not scalar and all(np.array_equal(a, b) for a, b in zip(*self.sup))
-        plan_row = [self._plan(sign=+1, norm="forward", in_support=s) for s in self.sup]
+        same_support = all(np.array_equal(a, b) for a, b in zip(*self.sup_tab))    # always for 'scalar'
+        plan_row = [self._plan(sign=+1, norm="forward", in_support=s) for s in self.sup_tab]
         plan_out = self._plan(sign=-1, norm="backward", out_support=self.sup_mid)
         J, nq, nb = c.J, self.nq_mid, self.n_batch
         cw = nx * nx * J
@@ -1016,11 +1025,10 @@ class MixedBasisPairConvolution:
                 off = b * J
                 xa = _row_half(jax.lax.dynamic_slice_in_dim(HA, off, J, axis=4), ra, ma, sa, n_s=ns)
                 xc = _row_half(jax.lax.dynamic_slice_in_dim(HC, off, J, axis=4), rc, mc, sc_, n_s=ns_c)
-                if scalar:
-                    DA = plan_row[0](xa.reshape((nk, ns, J, ns) + kbox[0])).reshape(nk, cw, nr)
-                    DC = plan_row[1](xc.reshape((nk, 1, J, 1) + kbox[1])).reshape(nk, 1, J, 1, nr)
-                    DC = jnp.broadcast_to(DC, (nk, ns, J, ns, nr)).reshape(nk, cw, nr)
-                    D = jnp.concatenate([DA, DC], axis=1)
+                if scalar:                  # W broadcast on the compact box, one p→r call
+                    xc = jnp.broadcast_to(xc, xa.shape)
+                    x = jnp.concatenate([xa.reshape((nk, cw, -1)), xc.reshape((nk, cw, -1))], axis=1)
+                    D = plan_row[0](x.reshape((nk, 2 * cw) + kbox[0]))
                 elif same_support:
                     x = jnp.concatenate([xa, xc], axis=2).reshape((nk, ns, 2 * J, ns) + kbox[0])
                     D = plan_row[0](x)
