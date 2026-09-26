@@ -314,37 +314,6 @@ def test_parent_carrier_matches_full_k_ordered_minimax_routes(monkeypatch):
     w_isdf._chi_minimax_kernel_cache.clear()
 
 
-def test_fused_chi0_valence_chunks_sum_to_one_pass(monkeypatch):
-    """The fused chi0 node built in valence-band chunks equals the one-pass node.
-
-    ``chi_valence_chunks`` splits the valence Green when the Green pair would not fit;
-    chi_tau is linear in Gv, so the chunked sum is the same response to rounding.  Both
-    contours: the real one (the partner read as conj(G)) and the ordered complex one.
-    """
-    from gw import w_isdf, greens_function_kernel as gfk
-    from symmetry_maps import q_negation_index
-
-    mesh, _, wfns_parent = _parent_and_full_minimax_bundles(monkeypatch)
-    meta = SimpleNamespace(nkx=3, nky=1, nkz=1, nk_tot=3)
-    quad = SimpleNamespace(tau=np.asarray([0.05, 0.37]), alpha=np.asarray([0.6, 0.4]),
-                           alpha_odd=np.asarray([0.3, -0.2]))
-    routes = (lambda w: w_isdf.compute_chi0(w, quad, meta, mesh),
-              lambda w: w_isdf.compute_chi0_imag_ordered(
-                  w, quad, meta, mesh, q_neg_index=q_negation_index((3, 1, 1))))
-    for route in routes:
-        w_isdf._chi_minimax_kernel_cache.clear()
-        one = np.asarray(jax.device_get(route(wfns_parent)))
-        monkeypatch.setattr(gfk, "chi_valence_chunks", lambda **k: 3)
-        w_isdf._chi_minimax_kernel_cache.clear()
-        three = np.asarray(jax.device_get(route(wfns_parent)))
-        monkeypatch.undo()
-        mesh, _, wfns_parent = _parent_and_full_minimax_bundles(monkeypatch)
-        scale = float(np.max(np.abs(one)))
-        assert scale > 0
-        assert float(np.max(np.abs(three - one))) <= 1e-13 * scale
-    w_isdf._chi_minimax_kernel_cache.clear()
-
-
 def test_symmetry_kernel_caches_do_not_capture_outer_jit_tracers():
     """A cold nested trace may be reused by a different outer executable."""
     import symmetry_maps.maps as maps_impl

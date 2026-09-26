@@ -396,6 +396,8 @@ class CapacityLedger:
             raise MemoryError(f"GATE shared_pole_capacity: stage={stage}; got: {reason}; "
                               "why: aggregate live allocation must not exceed the remaining device budget")
         self._accepted[stage] = row
+        from common.gpu_utils import record_stage_price
+        record_stage_price("shared-pole ledger", row['aggregate_bytes_per_rank'])
         return copy.deepcopy(row)
 
     def preview(self, *, resident_bytes_per_rank,
@@ -1111,9 +1113,10 @@ def resolve_shared_pole_recipe(config, wfns, meta, *, mesh_xy, print_fn,
     energies = np.asarray(wfns.enk, dtype=np.float64)[:, :stop]
     if hashlib.sha256(energies.tobytes()).hexdigest() != census['energy_sha256']:
         raise ValueError("GATE shared_pole_census: got: stale energies; want: census rebound at current bands; why: SC must rebuild geometry")
+    # The run's budget in decimal GB (was per_device_gb * 2**30: GiB, 7.4% over the deck).
+    from common.gpu_utils import device_budget_bytes
     meta.shared_pole_capacity = CapacityLedger(
-        meta, mesh_xy=mesh_xy,
-        device_budget_bytes=int(config.memory.per_device_gb * 2**30))
+        meta, mesh_xy=mesh_xy, device_budget_bytes=int(device_budget_bytes()))
     recipe = shared_real_pole_v1_r3b
     tier = config.sigma.w_accuracy
     policy = recipe[tier]

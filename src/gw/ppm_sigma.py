@@ -55,7 +55,7 @@ def _face_g_plan(mesh_xy: Mesh, face_shape, layout="face"):
     nk, nb_full, n_rmu, ns = (int(v) for v in face_shape)
     mu_s = n_rmu * ns
     return gemm_plan(mesh_xy, m=mu_s, k=nb_full, n=mu_s, nq=nk,
-                     dtype=jnp.complex128, layout=layout)
+                     dtype=jnp.complex128, layout=layout, warmup=False)
 
 
 @dataclass(frozen=True)
