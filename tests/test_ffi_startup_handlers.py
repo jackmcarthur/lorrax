@@ -2,7 +2,7 @@
 
 ``ffi_loader.require_cuda_handlers`` (called by
 ``runtime.initialize_communicator_stack``) checks the contour accumulator and
-the spin rotation symbols on a CUDA mesh; ``gw.contour_accumulator`` refuses
+the spin rotation symbols on a CUDA mesh; ``ffi.contour`` refuses
 through ``probe_target``.  Each check is run against a library that lacks the
 symbol (it must refuse, naming the symbol and the door) and against one that
 has it (it must pass), so a check that can never fire cannot pass here.
@@ -52,7 +52,7 @@ def test_startup_check_is_a_no_op_off_cuda(monkeypatch):
 
 
 def test_contour_door_refuses_an_unusable_target_and_names_the_probe(monkeypatch):
-    import gw.contour_accumulator as C
+    import ffi.contour as C
 
     C._require.cache_clear()
     monkeypatch.setattr(C, "probe_target",
@@ -67,7 +67,7 @@ def test_contour_door_refuses_an_unusable_target_and_names_the_probe(monkeypatch
 
 def test_contour_target_is_a_row_of_the_cuda_table():
     from ffi.common import ffi_loader as L
-    import gw.contour_accumulator as C
+    import ffi.contour as C
 
     assert L._CUDA_TARGET_SYMBOLS[C.TARGET] == "ContourAccumulateFfi"
     assert L._CUDA_STARTUP_HANDLERS[C.TARGET][0] == "ContourAccumulateFfi"

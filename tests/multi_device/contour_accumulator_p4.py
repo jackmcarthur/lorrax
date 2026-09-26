@@ -14,7 +14,7 @@ def main():
     import jax
     import jax.numpy as jnp
     from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
-    from gw.contour_accumulator import contour_accumulator
+    from ffi.contour import contour_accumulator
     root = Path(sys.argv[1])
     assert jax.device_count() == jax.process_count() == 4
     mesh = Mesh(np.array(jax.devices()).reshape(2, 2), ('x', 'y'))
