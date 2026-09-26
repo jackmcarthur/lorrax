@@ -352,14 +352,12 @@ def mode_solve(args):
     """ONE probe chunk of the real ladder solve, arm by arm.
 
     Arms are the product of ``--fuse`` (rung fusion off/on), ``--resid-norms``
-    (stopping-norm semantics), ``--max-iters`` (the cap) and ``--lift``
-    (route A, the Woodbury ring removal).  Every arm runs on the SAME payload
+    (stopping-norm semantics) and ``--max-iters`` (the cap).  Every arm runs on the SAME payload
     in the SAME process, so the ratios are protected from machine drift.
     """
     import jax
     import jax.numpy as jnp
     from bse import bse_w_exact as bwe
-    from bse import w_ladder_precond as wlp
     apply_screening_resolvent_block = bwe.apply_screening_resolvent_block
     build_probe_rhs = getattr(bwe, "build_probe_rhs", None)
 
@@ -373,10 +371,6 @@ def mode_solve(args):
     ncol = max(int(np.ceil(ncol / py)) * py, py)
     G = np.eye(n_pad, dtype=np.float64)[:ncol, :]
 
-    if args.lift and ncol != n_pad:
-        _log(f"[solve] --lift skipped: route A's Dyson close needs EVERY column "
-             f"of T (it inverts I - T on the padded extent), and this leg probes "
-             f"{ncol} of {n_pad}.  Re-run with --cols {n_pad} for the lift arm.")
     fuses = [int(v) for v in str(args.fuse).split(",")]
     engines = {}
     for fv in fuses:
@@ -456,37 +450,6 @@ def mode_solve(args):
                              f"{it.max():7d} "
                              f"{1e3*dt/max(float(it.sum()),1.0):10.3f} "
                              f"{rs.max():15.3e}")
-                if args.lift and fv == fuses[-1] and ncol == n_pad:
-                    stack = wlp.build_precond_stack(mesh, data, include_w=True)
-                    diag_h0 = wlp.lifted_precond_diagonal(
-                        dq, mesh, stack, include_w=True)
-                    for rep in range(2):
-                        t0 = time.perf_counter()
-                        out = wlp.apply_lifted_resolvent_block(
-                            G, z, dq, stack, diag_h0,
-                            max_iter=int(args.max_iters.split(",")[0]),
-                            tol=float(args.tol))
-                        jax.block_until_ready(out)
-                        dt = time.perf_counter() - t0
-                    T_tile, rr, it2 = out
-                    # CLOSE IT: the lift's tile is T = Pi v, and the object
-                    # the oracle certifies is W - v.  Comparing T against a
-                    # W oracle would be a category error, so the Dyson close
-                    # runs here, exactly as the facade runs it.
-                    W_lift = wlp.dyson_close_tile(
-                        T_tile, dq["V_q0"],
-                        allow_replicated_solve=bool(args.allow_replicated_dyson))
-                    tiles[(q, zs, "lift", int(args.max_iters.split(",")[0]),
-                           args.resid_norms.split(",")[0])] = np.asarray(
-                        jax.device_get(W_lift))
-                    it2 = np.asarray(jax.device_get(it2))[:ncol]
-                    rr = np.asarray(jax.device_get(rr))[:ncol]
-                    _log(f"{str(q):>9} {zs:>13} {'lift(routeA)':>16} "
-                         f"{int(args.max_iters.split(',')[0]):5d} "
-                         f"{args.resid_norms.split(',')[0]:>5} {dt:9.3f} "
-                         f"{it2.mean():8.2f} {it2.max():7d} "
-                         f"{1e3*dt/max(float(it2.sum()),1.0):10.3f} "
-                         f"{rr.max():15.3e}")
     _log("-" * len(hdr))
     rc = 0
     if oracles:
@@ -540,12 +503,10 @@ def main(argv=None):
     ap.add_argument("--zs", default="0")
     ap.add_argument("--max-iters", default="200")
     ap.add_argument("--resid-norms", default="-")
-    ap.add_argument("--lift", type=int, default=0)
     ap.add_argument("--oracle-tol", type=float, default=0.0,
                     help="tight-tol oracle on the same operator; 0 disables")
     ap.add_argument("--oracle-max-iter", type=int, default=300)
     ap.add_argument("--gate-rel", type=float, default=1e-8)
-    ap.add_argument("--allow-replicated-dyson", type=int, default=0)
     ap.add_argument("--include-w", type=int, default=1)
     ap.add_argument("--batch-widths", default="1,2,4,8,16")
     ap.add_argument("--matvec-reps", type=int, default=20)

@@ -1,8 +1,7 @@
 """Kernel-level profiling driver for the ladder-W direct rung (track O9).
 
-WHAT THIS IS FOR, and why it is not one of the existing benches.  The three
-in-tree ladder benches (``bench_w_ladder_precond``, ``_shifts``,
-``_integration``) all measure WALL TIME of an algorithmic arm.  This one exists
+WHAT THIS IS FOR, and why it is not the existing bench.  The in-tree ladder
+bench (``bench_w_ladder_integration``) measures WALL TIME of an algorithmic arm.  This one exists
 one layer down: it produces a process whose GPU work is *only* the ladder
 matvec, in a shape and a repeat structure that Nsight Systems (timeline, kernel
 mix, launch gaps) and Nsight Compute (per-kernel DRAM traffic and occupancy) can
