@@ -2237,11 +2237,7 @@ class SymMaps:
         # (``G_full = mtrx.T @ G_irr = sym_mats_k @ G_irr``).
         #
         # It is corrected rather than deleted because a reader of
-        # ``SymMaps.__init__`` hits this before either of those, and the
-        # transposed convention it stated is the one the known-broken
-        # ``tests/bench/charge_density.py:159-174`` adopted — it rotates
-        # G with ``R_grid`` (= ``mtrx``) and is wrong on every
-        # non-symmorphic deck.
+        # ``SymMaps.__init__`` hits this before either of those.
         #
         # So: k and G both transform with ``sym_mats_k = mtrx.T``
         # (column form).  Real space uses `Rinv = inv(mtrx)`:

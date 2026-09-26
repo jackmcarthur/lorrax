@@ -115,14 +115,14 @@ def test_coverage_is_judged_in_the_frame_the_sigma_build_uses():
     # MoS2 3x3 QSGW (CLAIMS 2725): the PPM Sigma frame is the CURRENT
     # spectrum's midgap, 1.4 eV above the DFT midgap the partition uses.
     from gw.gw_config import ComputeMode
-    from gw.sc_iteration import _sigma_frame_mu_ev
+    from gw.efermi import sigma_frame_mu_ev
     from common.units import RYD_TO_EV
     e_ev = np.array([[-14.3, -5.1, -0.8, 3.0], [-14.2, -5.3, -0.9, 3.2]])
     e_ry, step_ry = e_ev / RYD_TO_EV, -3.0 / RYD_TO_EV       # 2 occupied per k
     wfn = NS(efermi=-4.332 / RYD_TO_EV, vbm=-5.4 / RYD_TO_EV)
     def frame(mode, ref):
-        inputs = NS(config=NS(compute_mode=mode, sigma=NS(fermi_reference=ref)), wfn=wfn)
-        return _sigma_frame_mu_ev(inputs, e_ry, step_ry, None)
+        config = NS(compute_mode=mode, sigma=NS(fermi_reference=ref))
+        return sigma_frame_mu_ev(config, wfn, e_ry, step_ry, None)
     np.testing.assert_allclose(frame(ComputeMode.GN_PPM, "midgap"), 0.5 * (-5.1 - 0.9), atol=1e-12)
     np.testing.assert_allclose(frame(ComputeMode.GN_PPM, "vbm"), -5.1, atol=1e-12)
     np.testing.assert_allclose(frame(ComputeMode.MPA, "midgap"), -4.332, atol=1e-12)
