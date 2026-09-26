@@ -166,7 +166,9 @@ def check_degeneracy_consistency(
 
     Parameters
     ----------
-    H : (nk, nb, nb) — operator matrix in the band basis, Ry.
+    H : (nk, nb, nb) — operator matrix in the band basis, Ry.  Anything that
+        slices, including an open h5py dataset: only the manifold blocks
+        are read.
     energies : (nk, nb) — the eigenvalues those bands carry, Ry.
     el_tol_ry : bands closer than this are treated as one manifold.
     split_tol_ry : a block spectrum spread above this is reported.
@@ -178,7 +180,6 @@ def check_degeneracy_consistency(
     """
     import numpy as np
 
-    H = np.asarray(H)
     en = np.asarray(energies, dtype=np.float64)
     nk = min(H.shape[0], en.shape[0])
     nb = min(H.shape[1], en.shape[1])

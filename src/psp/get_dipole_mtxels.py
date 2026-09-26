@@ -36,13 +36,13 @@ import jax.numpy as jnp
 from wfn_loader import WfnLoader                                    # noqa: E402
 from symmetry_maps import unfold_file_wedge_polar_matrix            # noqa: E402
 from common import timing
-from common.collectives import barrier, gather_k_blocks
+from common.collectives import gather_k_blocks
 from common.preprocessing_output import PreprocessingProductionReport
 from common.progress import LoopProgress
 from common.scientific_output import band_range, pseudopotential_file_rows
 from common.mtxel_sweep import (VNL_VELOCITY_SIGN_FLIPPED,
                                 VNL_VELOCITY_SIGN_SHIPPED, SweepGeometry,
-                                blocks_to_host, dipole_operator,
+                                dipole_operator,
                                 require_vnl_velocity_sign,
                                 sweep_matrix_elements,
                                 sweep_uniform_current_matrix_elements)
@@ -52,10 +52,7 @@ from common.parallel_transport import (
 )
 from common.wfn_layout import band_sphere_spec
 from common.wfn_transforms import load_kpoint_fftbox_local
-from common.bispinor_init import (
-	ALPHA_FS, DIRAC_ALPHA_VERTEX_PROVENANCE,
-	KINETIC_BALANCE_LIFT_PROVENANCE, NO_PAIR_DIRAC_CURRENT_MODEL,
-)
+from common.bispinor_init import ALPHA_FS
 from common.gamma_matrices import gamma_apply, gamma_perm_phase
 from common import Meta
 from gw.gw_config import (
@@ -67,7 +64,8 @@ from psp.pseudos import load_pseudopotentials, print_atomic_structure
 from psp.dft_operators import (padded_gvectors, gather_psi_G_from_crys,
                                momentum_matrix_k)
 import psp.vnl_ops as vnl_ops
-import h5py
+from file_io.dipole import (band_energies_on_full_bz, finite_q_payload,
+                            write_dipole)
 from runtime.run_session import RunSession
 
 # --------------------------
@@ -510,11 +508,11 @@ def resolve_vnl_velocity_sign(cli_value, deck_value):
     return require_vnl_velocity_sign(raw)
 
 
-def stamp_dipole_provenance(h5, *, wfn, wfn_path, nval, ncond, nband,
-                             nb_written, bispinor, skip_vnl, vnl_mode,
-                             vnl_velocity_sign=None, nspinor=None,
-                             soc=None, hubbard=None) -> None:
-    """Record what this ``dipole.h5`` was built from.
+def dipole_provenance(*, wfn, wfn_path, nval, ncond, nband,
+                      nb_written, bispinor, skip_vnl, vnl_mode,
+                      vnl_velocity_sign=None, nspinor=None,
+                      soc=None, hubbard=None) -> dict:
+    """The root attributes recording what this ``dipole.h5`` was built from.
 
     ``hubbard`` is the DFT+U stamp from ``psp.hubbard_ops``: ``'none'`` (no
     DFT+U in the mean field), ``'skip_vnl'``, or the canonical JSON of the
@@ -541,31 +539,40 @@ def stamp_dipole_provenance(h5, *, wfn, wfn_path, nval, ncond, nband,
     record-only — the consumer could re-measure, but the stamp is the
     cheap, honest record of what THIS file was built with.
     """
-    h5.attrs["prov_wfn_sha256"] = wfn_fingerprint(wfn)
-    h5.attrs["prov_wfn_fingerprint_scheme"] = WFN_FINGERPRINT_SCHEME
-    h5.attrs["prov_wfn_file"] = str(wfn_path)
-    h5.attrs["prov_nval"] = int(nval)
-    h5.attrs["prov_ncond"] = int(ncond)
-    h5.attrs["prov_nband"] = int(nband)
-    h5.attrs["prov_nb_written"] = int(nb_written)
-    h5.attrs["prov_bispinor"] = bool(bispinor)
-    h5.attrs["prov_skip_vnl"] = bool(skip_vnl)
-    h5.attrs["prov_vnl_mode"] = str(vnl_mode)
+    attrs = {
+        "prov_wfn_sha256": wfn_fingerprint(wfn),
+        "prov_wfn_fingerprint_scheme": WFN_FINGERPRINT_SCHEME,
+        "prov_wfn_file": str(wfn_path),
+        "prov_nval": int(nval),
+        "prov_ncond": int(ncond),
+        "prov_nband": int(nband),
+        "prov_nb_written": int(nb_written),
+        "prov_bispinor": bool(bispinor),
+        "prov_skip_vnl": bool(skip_vnl),
+        "prov_vnl_mode": str(vnl_mode),
+    }
     if hubbard is not None:
-        h5.attrs["prov_hubbard"] = str(hubbard)
+        attrs["prov_hubbard"] = str(hubbard)
     # ``analytic`` and the VNL sign do not identify the implementation.  In
     # particular, 5036f21b replaced the old sqrt(q^2+1e-8) projector
     # regularizer and approximate l>0 origin row by exact reduced-radial
     # moments.  That reaches ordinary Gamma-point dZ and therefore the stored
     # velocity.  Fail closed across that boundary rather than calling two
     # different operator discretisations the same artifact.
-    h5.attrs["prov_q0_operator_scheme"] = _DIPOLE_Q0_OPERATOR_SCHEME
+    attrs["prov_q0_operator_scheme"] = _DIPOLE_Q0_OPERATOR_SCHEME
     if vnl_velocity_sign is not None:
-        h5.attrs["prov_vnl_velocity_sign"] = float(vnl_velocity_sign)
+        attrs["prov_vnl_velocity_sign"] = float(vnl_velocity_sign)
     if nspinor is not None:
-        h5.attrs["prov_nspinor"] = int(nspinor)
+        attrs["prov_nspinor"] = int(nspinor)
     if soc is not None:
-        h5.attrs["prov_soc"] = bool(soc)
+        attrs["prov_soc"] = bool(soc)
+    return attrs
+
+
+def stamp_dipole_provenance(h5, **kwargs) -> None:
+    """Stamp :func:`dipole_provenance` onto an open writable h5py file."""
+    for key, value in dipole_provenance(**kwargs).items():
+        h5.attrs[key] = value
 
 
 def _resolve_dipole_nb_written(wfn, *, ncond, nband) -> int:
@@ -1186,7 +1193,7 @@ def main(argv=None):
 						"a DFT+U deck runs the analytic q=0 / finite-q velocity only")
 		report.environment(wfn=wfn, lines=(
 			"Matrix storage : distributed band blocks on the X x Y mesh",
-			"Output writer  : rank-zero artifact writer after a bounded owner gather",
+			"Output writer  : SlabIO collective write from the band shards",
 		))
 		_operator = ("p (nonlocal commutator intentionally omitted)"
 					 if args.skip_vnl else _arm)
@@ -1283,68 +1290,9 @@ def main(argv=None):
 			))
 			return 0
 
-		# ── ΔE: pure host arithmetic on the band energy table ───────────────
-		# No ψ, no device, nk·nb²·8 B (2 MB at MoS₂ 4×4 / 128 bands), so it is
-		# built for every k on every rank instead of riding the k partition and
-		# paying a second gather.  Arithmetic is verbatim what the fused loop
-		# did, which is why the pinned ``deltaE`` parity is EXACTLY 0.
-		#
-		# ΔE IS PROVABLY REDUNDANT AND IS STILL NOT WORTH COMPRESSING — measured
-		# 2026-08-08 on all four committed dipole.h5 fixtures, and written down
-		# because the redundancy is obvious enough that it will keep being
-		# proposed and the numbers settle it in either direction.
-		#
-		# THE REDUNDANCY IS TOTAL.  ``deltaE[k]`` is bit-identical — max|Δ|
-		# exactly 0.000e+00, not "agrees to round-off" — to the outer difference
-		# of a single WFN eigenvalue row, at every k of every fixture.  The whole
-		# (nk, nb, nb) f64 array therefore carries at most (nrk, nb) numbers, and
-		# those numbers are already in WFN.h5:
-		#
-		#     deck               deltaE      as (nrk, nb)   on the dataset
-		#     cohsex_debug       0.87 MB        2 640 B         330x
-		#     gnppm_debug        0.46 MB        3 200 B         144x
-		#     hbn_cohsex_debug   0.92 MB       11 520 B          80x
-		#     si_cohsex_debug    1.84 MB        3 840 B         480x
-		#
-		# THE FILE BARELY MOVES.  ``deltaE`` is 14.3 % of dipole.h5 on all four,
-		# and that fraction is structural rather than incidental: ``dipole_cart``
-		# is three complex128 planes against one f64 plane, exactly 6:1.  So
-		# deleting ΔE outright takes dipole.h5 to 85.8 % of its size — 1.17x —
-		# and the remaining 85.7 % is the half carrying a Cartesian index, which
-		# needs the proper-rotation treatment and is exactly why the dipole was
-		# REGISTERED rather than claimed.  The redundancy is total in the half
-		# that was never the problem.
-		#
-		# NOT IMPLEMENTED, deliberately.  It would touch three sites — this
-		# writer, ``bse.absorption_common.load_dipole_h5`` and
-		# ``common.chi_from_dipole.read_dipole_h5``, none of which has a consumer
-		# cell in the tree today — to buy 1.17x.  FOR THE OWNER: if
-		# ``dipole_cart``'s rotation work is ever done, take the ΔE half in the
-		# SAME change.  Its correctness is free — store the ``e_b`` vector this
-		# loop already holds and rebuild with this same expression, bit-identical
-		# by construction rather than by measurement — and it is 14.2 % of the
-		# file on top of whatever ``dipole_cart`` buys.
-		#
-		# ONE FIXTURE ANOMALY, recorded rather than chased.  On cohsex_debug, 3
-		# of 9 k reproduce ``el[0, 1]`` where today's ``SymMaps`` gives
-		# ``irr_idx_k[k] = 2``.  Both rows reproduce the committed ΔE
-		# bit-identically through the row that matches, and the two rows differ
-		# from each other by 1.066e-14 Ry — so that fixture's k→IBZ map and this
-		# tree's are physically equivalent and not the same map.  It says nothing
-		# about the redundancy, which holds on that deck too, and everything
-		# about the age of the fixture.
-		energies = np.asarray(wfn.energies)
-		deltaE = np.zeros((nk, nb, nb), dtype=np.float64)
-		for i in range(nk):
-			try:
-				k_red = int(sym.irr_idx_k[i])
-			except Exception:
-				k_red = int(i)
-			if energies.ndim >= 3:
-				e_b = np.asarray(energies[0, k_red, :nb], dtype=float)
-			else:
-				e_b = np.asarray(energies[:nb], dtype=float)
-			deltaE[i] = e_b[:, None] - e_b[None, :]
+		# The eigenvalue each full-BZ k carries (its star parent's row).
+		# ΔE is derived from it on read (file_io.dipole).
+		band_energies = band_energies_on_full_bz(wfn, sym, nb)
 
 		def _print_debug_blocks(i, p_cart, vNL_cart):
 			"""Forensic 4x6 tables under the driver's one debug switch."""
@@ -1534,9 +1482,11 @@ def main(argv=None):
 		dipole_progress.start()
 		if args.vnl_mode == "numeric":
 			with timing.section("dipole_sweep"):
-				dip_k_major = gather_k_blocks(nk, _dipole_block,
-				                              item_shape=(3, nb, nb),
-				                              label="dipole", owner_only=True)
+				# The validation arm: replicated on the host of every rank,
+				# which SlabIO writes from one canonical copy.
+				velocity = gather_k_blocks(nk, _dipole_block,
+				                           item_shape=(3, nb, nb),
+				                           label="dipole", owner_only=False)
 		else:
 			if debug and jax.process_index() == 0:
 				_dipole_block(debug_kindex)     # the table, nothing else
@@ -1558,7 +1508,7 @@ def main(argv=None):
 				vnl_setup=None if args.skip_vnl else vnl_setup,
 				vnl_velocity_sign=vnl_velocity_sign,
 				hubbard=hubbard_setup)
-			with timing.section("dipole_sweep"):
+			with timing.section("dipole_sweep") as sweep:
 				H_v_file = sweep_matrix_elements(
 					psi_G, operator=op, geom=geom,
 					gvecs=gtab_file.gvecs, gmask=gtab_file.mask,
@@ -1608,12 +1558,10 @@ def main(argv=None):
 					del collapsed_position_kmajor
 					write_pt_remainder = write_parallel_transport_artifact
 					validate_pt_artifact = validate_parallel_transport_artifact
-				# THE BOUNDARY, named rather than implied: the only consumer
-				# of the (nk, 3, nb, nb) table is the serial h5py write on
-				# rank 0 below, which cannot take a sharded operand.
-				# ``owner_only`` keeps it off the peers (BD.4) and the gather
-				# runs in chunks so a peer's transient is one chunk.
-				dip_k_major = blocks_to_host(H_v, nb=nb, owner_only=True)
+				# The velocity stays sharded, 1/P of (nk, 3, nb, nb) per rank,
+				# until SlabIO writes it from those shards below.
+				velocity = H_v
+				sweep.watch(velocity)
 			del H_v, psi_G
 			if pt_path is not None and args.parallel_transport_velocity_only:
 				# D2 (reports/metal_head_pt_pipelines_2026-08-23/PLAN.md): the
@@ -1635,10 +1583,10 @@ def main(argv=None):
 				      f"{pt_path}")
 			elif pt_path is not None:
 				# The SlabIO velocity transaction above is closed and durable,
-				# and the all-k psi/H_v device arrays are now dead.  The link
-				# stream therefore holds only one central and one neighbour WFN
-				# plus one distributed band matrix, never both preprocessing
-				# representations at once.
+				# and the all-k psi is now dead (the velocity keeps its 1/P
+				# shard for dipole.h5).  The link stream therefore holds only
+				# one central and one neighbour WFN plus one distributed band
+				# matrix, never both preprocessing representations at once.
 				with timing.section("parallel_transport_links"):
 					write_pt_remainder(
 						pt_path, wfn=wfn, sym=sym, mesh=RUNTIME.mesh,
@@ -1678,16 +1626,9 @@ def main(argv=None):
 					f"{float(metrics['transition_overlap_real']):.6f}")
 		dipole_progress.step()
 		dipole_progress.finish()
-		if dip_k_major is not None:
-			dipole = np.ascontiguousarray(np.moveaxis(dip_k_major, 0, 1))
-		else:
-			dipole = None                        # non-root: never consumed
-		del dip_k_major
 
 		# Optional: finite-q matrix elements for the SOS chi head/wing/S/w pipeline.
-		rho_cvkq = v_cvkq = alpha_cvkq = ward_residual_cvkq = None
-		kminq_idx_kq = None
-		cv_meta = None
+		finite_q = None
 		if args.with_finite_q:
 			print("\nComputing finite-q matrix elements (SOS pipeline)...")
 			iq_list = args.iq_list if args.iq_list is not None else list(range(int(sym.nk_tot)))
@@ -1705,84 +1646,42 @@ def main(argv=None):
 					progress_fn=report.progress,
 					diagnostic_fn=debug_print if debug else None,
 				)
-			cv_meta = {
-				'iq_list': np.asarray(iq_list, dtype=np.int32),
-				'n_occ': int(n_occ_eff),
-				'v_lo': int(v_lo),
-				'c_hi': int(c_hi),
-			}
+			finite_q = finite_q_payload(
+				rho_cvkq=rho_cvkq, v_cvkq=v_cvkq, kminq_idx=kminq_idx_kq,
+				iq_list=iq_list, n_occ=n_occ_eff, v_lo=v_lo, c_hi=c_hi,
+				alpha_cvkq=alpha_cvkq, ward_residual_cvkq=ward_residual_cvkq)
+			del rho_cvkq, v_cvkq, alpha_cvkq, ward_residual_cvkq, kminq_idx_kq
 			report.heading("Finite-q coverage")
 			report.emit(f"Reduced q points: {len(iq_list)} of {int(sym.nk_red)} stored points")
 			report.emit(f"Valence slice  : {band_range(v_lo, n_occ_eff)}")
 			report.emit(f"Conduction slice: {band_range(n_occ_eff, c_hi)}")
 
-		# Save to dipole.h5 with deltaE
 		out_path = Path(args.out).resolve()
 		note = ('dipole_cart[3,x,y] = p_i (V_NL skipped, --skip-vnl); '
 		        if args.skip_vnl
 		        else f'dipole_cart[3,x,y] = {_arm}'
 		             + ('' if hubbard_setup is None else ' + i[r, V_U] (prov_hubbard)')
 		             + f' [vnl_velocity_sign = {vnl_velocity_sign:+.1f}]; ')
-		note += 'deltaE[k,:,:] = E_b - E_b\''
-		# Rank-0 writes.  Every rank holds the same gathered host arrays, so a
-		# multi-process launch previously had all of them open the SAME path with
-		# mode 'w' concurrently -- serial h5py has no cross-process locking, so
-		# that is a genuine corruption hazard (it merely happened not to bite at
-		# 4 ranks).  Barrier afterwards so no rank races ahead of the file
-		# existing on disk.
+		note += 'band_energies[k,b] = E_b(k); deltaE = E_b - E_b\' derived on read'
 		write_progress = LoopProgress(
 			1, report.progress, title="dipole artifact write",
 			item_name="output artifact")
 		write_progress.start()
-		if jax.process_index() == 0:
-			with timing.section("write_h5"), h5py.File(str(out_path), 'w') as h5:
-				h5.create_dataset('dipole_cart', data=dipole)
-				h5.create_dataset('deltaE', data=deltaE)
-				h5.attrs['nbands'] = int(wfn.nbands)
-				h5.attrs['nk'] = int(sym.nk_tot)
-				h5.attrs['skip_vnl'] = bool(args.skip_vnl)
-				h5.attrs['note'] = note
-				stamp_dipole_provenance(
-					h5, wfn=wfn, wfn_path=str(wfn_path), nval=nval, ncond=ncond,
-					nband=nband, nb_written=nb, bispinor=bispinor,
-					skip_vnl=bool(args.skip_vnl), vnl_mode=str(args.vnl_mode),
-					vnl_velocity_sign=vnl_velocity_sign,
-					nspinor=int(wfn.nspinor), soc=bool(vnl_setup.soc),
-					hubbard=hubbard_stamp)
-				if rho_cvkq is not None:
-					fq = h5.create_group('finite_q')
-					fq.create_dataset('rho_cvkq', data=rho_cvkq)
-					fq.create_dataset('v_cvkq',   data=v_cvkq)
-					fq.create_dataset('kminq_idx', data=kminq_idx_kq)
-					fq.create_dataset('iq_list',   data=cv_meta['iq_list'])
-					fq.attrs['n_occ'] = cv_meta['n_occ']
-					fq.attrs['v_lo'] = cv_meta['v_lo']
-					fq.attrs['c_hi'] = cv_meta['c_hi']
-					fq.attrs['note'] = (
-						"rho_cvkq[c, v, k, q] = <u_{c, k-q}|u_{v, k}>_cell; "
-						"v_cvkq[a, c, v, k, q] = symmetric (v_R + v_L)/2 of "
-						"<u_{c, k-q}|v^a|u_{v, k}>_cell  (kinetic + VNL); "
-						"kminq_idx[k, q] = canonical k-q index in unfolded_kpts.")
-					if alpha_cvkq is not None:
-						ds_alpha = fq.create_dataset('alpha_cvkq', data=alpha_cvkq)
-						ds_alpha.attrs['operator'] = (
-							"<u_{c,k-q}|alpha_i=gamma^0 gamma^i|u_{v,k}>_cell")
-						ds_alpha.attrs['units'] = "dimensionless"
-						ds_alpha.attrs['normalization'] = (
-							"same unrenormalized kinetic-balance four-spinors as rho_cvkq")
-						ds_ward = fq.create_dataset(
-							'ward_residual_cvkq', data=ward_residual_cvkq)
-						ds_ward.attrs['units'] = "rydberg"
-						ds_ward.attrs['formula'] = (
-							"(E_c(k-q)-E_v(k))_Ry*rho_cvkq + "
-							"q_cart_bohr^-1 dot (2*alpha_cvkq/alpha_fs)")
-						ds_ward.attrs['energy_source'] = "WFN mean-field eigenvalues"
-						fq.attrs['selected_current_model'] = NO_PAIR_DIRAC_CURRENT_MODEL
-						fq.attrs['selected_current_lift'] = KINETIC_BALANCE_LIFT_PROVENANCE
-						fq.attrs['selected_current_operator'] = DIRAC_ALPHA_VERTEX_PROVENANCE
-						fq.attrs['selected_current_gauge_completion'] = "none_diagnostic_only"
-						fq.attrs['alpha_fs'] = float(ALPHA_FS)
-		barrier("dipole_write")
+		with timing.section("write_h5"):
+			write_dipole(
+				out_path, velocity, band_energies, mesh=RUNTIME.mesh,
+				attrs={"nbands": int(wfn.nbands), "nk": int(sym.nk_tot),
+				       "skip_vnl": bool(args.skip_vnl), "note": note,
+				       **dipole_provenance(
+				           wfn=wfn, wfn_path=str(wfn_path), nval=nval,
+				           ncond=ncond, nband=nband, nb_written=nb,
+				           bispinor=bispinor, skip_vnl=bool(args.skip_vnl),
+				           vnl_mode=str(args.vnl_mode),
+				           vnl_velocity_sign=vnl_velocity_sign,
+				           nspinor=int(wfn.nspinor), soc=bool(vnl_setup.soc),
+				           hubbard=hubbard_stamp)},
+				finite_q=finite_q)
+		del velocity, finite_q
 		write_progress.step()
 		write_progress.finish()
 		file_rows = [("dipole matrices", "written", str(out_path))]

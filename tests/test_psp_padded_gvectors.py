@@ -298,7 +298,7 @@ def _write_stamped(path, wfn, *, nb_written=4, dataset_nb=None,
         h5.create_dataset(
             "dipole_cart", data=np.zeros((3, 1, dataset_nb, dataset_nb)))
         h5.create_dataset(
-            "deltaE", data=np.zeros((1, dataset_nb, dataset_nb)))
+            "band_energies", data=np.zeros((1, dataset_nb)))
         if finite_q:
             h5.create_group("finite_q")
         stamp_dipole_provenance(h5, wfn=wfn, wfn_path="WFN.h5",
@@ -480,7 +480,8 @@ def test_provenance_guard_refuses_ncond_relaxation_when_dataset_is_short(
         p, wfn=wfn, nval=2, ncond=1, nband=8,
         print_fn=lines.append) is False
     assert any("dipole_cart shape=(3, 1, 7, 7)" in ln
-               and "deltaE shape=(1, 7, 7)" in ln for ln in lines)
+               and "band energy extent (nk, nb)=(1, 7)" in ln
+               for ln in lines)
 
 
 def test_provenance_guard_still_refuses_nval_or_nband_mismatch(

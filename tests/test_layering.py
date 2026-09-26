@@ -718,8 +718,8 @@ _DRIVER_MAIN_STATEMENTS = {
     "bse.bse_jax": (("main",), 103),
     "bse.exciton_bands": (("main",), 475),
     "bandstructure.htransform": (("main",), 129),
-    "gw.kin_ion_io": (("main",), 165),
-    "psp.get_dipole_mtxels": (("main",), 374),
+    "gw.kin_ion_io": (("main",), 128),
+    "psp.get_dipole_mtxels": (("main",), 330),
 }
 
 
