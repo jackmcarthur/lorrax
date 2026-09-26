@@ -11,9 +11,9 @@ one matrix product, ``2 * max_iter`` all-reduces of an ``(m,)`` vector.
 * ``test_record_deck_collective_counts_are_pinned`` -- the 400 all-reduces of
   the Si record deck (200 iterations).
 * ``test_window_includes_the_current_vector`` +
-  ``test_current_vector_projection_holds_orthogonality`` -- the 2026-08-08
-  widening of the window from ``i < j`` to ``i <= j``; the second is the RED
-  TWIN that reverts it in-process and must go red.
+  ``test_widening_is_a_no_op_on_a_hermitian_operator`` -- the 2026-08-08
+  widening of the window from ``i < j`` to ``i <= j``: the set it selects,
+  and that it moves no eigenvalue of a Hermitian operator.
 * ``test_cgs2_full_reorth_solves_the_distinct_spectrum`` and
   ``test_cgs2_orthogonality`` -- accuracy and the property reorth delivers.
 """
@@ -128,8 +128,9 @@ def test_the_default_really_is_batched(monkeypatch):
     n, it = 32, 8
     mv = _diag_matvec(np.arange(1, n + 1, dtype=float))
     jx = jax.make_jaxpr(
-        lambda: LZ.lanczos_eig_jit(mv, n, n_eig=4, max_iter=it,
-                                   n_reorth=it))().jaxpr
+        lambda: LZ.block_lanczos_eig_jit(lambda V: mv(V[0])[None], n, n_eig=4,
+                                         block_size=1, max_iter=it,
+                                         n_reorth=it))().jaxpr
     assert _count_prim(jx, "while") == 0, (
         "the DEFAULT route still carries a per-vector reorth loop")
     assert _count_prim(jx, "scan") >= 1, "outer Lanczos loop vanished"
@@ -143,9 +144,9 @@ def test_window_includes_the_current_vector():
     recurrence leaves behind survived into ``q_{j+1} = z/beta_j`` and put a
     ``4.2009e-06`` floor under the Ritz-vector orthogonality of the Si record
     deck.  ``RITZ_ORTHO_PROBE.md`` measured the widening collapsing that floor
-    to ~1e-15, and the owner ruled it in.  Narrowing it back to ``i < j``
-    reopens the floor; ``test_current_vector_projection_holds_orthogonality``
-    is the red twin.
+    to ~1e-15, and the owner ruled it in.  That floor belonged to the retired
+    single-vector kernel; the block kernel subtracts the full complex alpha,
+    and the ``i == j`` slot stays in the window as a free re-projection.
 
     This cell pins the set from both sides, and pins that the collective count
     did NOT move -- which is the whole argument for the change being free.
@@ -187,9 +188,9 @@ def _degenerate_hermitian(n, seed=11):
 
 def _run(H, n, n_eig, max_iter, n_reorth):
     mv = lambda v: H @ v
-    return jax.block_until_ready(LZ.lanczos_eig_jit(
-        mv, n, n_eig=n_eig, max_iter=max_iter,
-        n_reorth=n_reorth, seed=3))
+    return jax.block_until_ready(LZ.block_lanczos_eig_jit(
+        lambda V: mv(V[0])[None], n, n_eig=n_eig, block_size=1,
+        max_iter=max_iter, n_reorth=n_reorth, seed=3))
 
 
 @pytest.mark.parametrize("n,max_iter", [(96, 48)])
@@ -218,54 +219,8 @@ def test_cgs2_orthogonality():
 
 
 # --------------------------------------------------------------------------
-# the property the widening exists to deliver, and its red twin
+# the widening is safe on a Hermitian operator
 # --------------------------------------------------------------------------
-
-def _almost_hermitian(n, eps, seed=11):
-    """A Hermitian H perturbed by an ANTI-Hermitian ``i*eps*D``, D real diag.
-
-    ``<q, (H + i eps D) q> = <q,Hq> + i eps <q,Dq>`` with ``<q,Dq>`` real, so
-    ``Im alpha_j ~ eps`` -- a controlled stand-in for the operator defect the
-    Si record deck had (``Im alpha / max|alpha| = 1.088e-06`` from the mini-BZ
-    Coulomb head).  This is the only regime in which the widening does anything
-    at all: for an exactly Hermitian operator the ``i == j`` projection is a
-    no-op, which is precisely why the change is safe.
-    """
-    H, lam = _degenerate_hermitian(n, seed)
-    D = np.linspace(0.5, 1.5, n)
-    return H + 1j * float(eps) * jnp.asarray(np.diag(D), dtype=jnp.complex128), lam
-
-
-def _ritz_ortho(H, n, max_iter):
-    _, V = _run(H, n, max_iter, max_iter, max_iter)
-    V = np.asarray(V)
-    G = V.conj() @ V.T
-    return float(np.max(np.abs(G - np.eye(G.shape[0]))))
-
-
-def test_current_vector_projection_holds_orthogonality(monkeypatch):
-    """RED TWIN: revert the window to ``i < j`` and this gate must go red.
-
-    On an operator with ``Im alpha != 0``, the un-subtracted ``i*Im<q_j,z>``
-    lands on the Krylov basis' first superdiagonal at ``|Im alpha_j| / beta_j``
-    and the Ritz vectors inherit it.  With ``q_j`` in the window it is removed
-    and orthogonality is at round-off; with the pre-2026-08-08 window it is not.
-
-    """
-    n, max_iter, eps = 96, 48, 1e-6
-    H, _ = _almost_hermitian(n, eps)
-
-    good = _ritz_ortho(H, n, max_iter)
-    assert good < 1e-11, (
-        f"q_j is in the window but orthogonality is {good:.3e}")
-
-    monkeypatch.setattr(LZ, "_REORTH_INCLUDE_CURRENT", False)
-    bad = _ritz_ortho(H, n, max_iter)
-    assert bad > 1e-9, (
-        f"RED TWIN DID NOT GO RED: the i<j window still holds "
-        f"orthogonality at {bad:.3e} -- the gate is no longer testing anything")
-    assert bad > 1e3 * good, (
-        f"RED TWIN TOO WEAK: i<j {bad:.3e} vs i<=j {good:.3e}")
 
 
 def test_widening_is_a_no_op_on_a_hermitian_operator(monkeypatch):

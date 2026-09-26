@@ -27,14 +27,13 @@ from solvers.lanczos import (
     report_alpha_herm,
     simple_lanczos_eig,
     split_alpha_sink,
-    lanczos_eig_jit,
 )
 
 #: Third element of ``solve_bse_sharded``'s return tuple when the route ran a
 #: FIXED number of iterations and therefore never measured a convergence point.
 #:
-#: Three of the four routes here (``lanczos_eig_jit``, ``block_lanczos_eig_jit``
-#: and ``davidson``) run their full iteration budget unconditionally.  They used
+#: The fixed-iteration routes here (``block_lanczos_eig_jit`` at any block
+#: size, ``davidson``) run their full iteration budget unconditionally.  They used
 #: to return ``jnp.int32(max_iter)``, which is the BUDGET wearing a
 #: MEASUREMENT's name: a caller reading ``n_iter_done`` cannot tell "converged
 #: after 200" from "was told to do 200".  Only
@@ -516,12 +515,11 @@ def solve_bse_sharded(
                     eps_c, eps_v, W_R, V_q0, M_X, M_Y,
                 )
                 return HX[0]
+            # The block kernel at block_size=1 is the single-vector Lanczos.
+            def matvec_block(V_block):
+                return matvec(V_block[0])[None]
             if rtol > 0.0:
-                # Convergence-driven path: route through the block-Lanczos
-                # while_loop with bs=1 (mathematically the same as a
-                # single-vector Lanczos with early exit).
-                def matvec_block(V_block):
-                    return matvec(V_block[0])[None]
+                # Convergence-driven path: the block while_loop, early exit.
                 return block_lanczos_eig_jit_converged(
                     matvec_block, n_flat, n_eig=n_eig,
                     block_size=1, max_iter=max_iter,
@@ -530,11 +528,11 @@ def solve_bse_sharded(
                     subspace_plan=lanczos_plan, vector_shape=lanczos_vector_shape,
                     structured_vectors=True,
                 )
-            evs, evecs = lanczos_eig_jit(
-                matvec, n_flat, n_eig=n_eig, max_iter=max_iter,
-                n_reorth=n_reorth,
+            evs, evecs = block_lanczos_eig_jit(
+                matvec_block, n_flat, n_eig=n_eig,
+                block_size=1, max_iter=max_iter, n_reorth=n_reorth,
                 subspace_plan=lanczos_plan, vector_shape=lanczos_vector_shape,
-                    structured_vectors=True,
+                structured_vectors=True,
             )
             return evs, evecs, jnp.int32(N_ITER_NOT_MEASURED)
         else:
