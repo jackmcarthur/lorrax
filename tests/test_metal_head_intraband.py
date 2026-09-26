@@ -11,12 +11,18 @@ Two questions.
    sphere inside a cubic zone; the linear-tetrahedron error is O(h^2)
    (0.971, 0.988, 0.9986 of the exact value at 12^3, 16^3, 20^3).
 
-2. **Occupations.**  A metal's head must take the fixed-N Fermi-Dirac state,
+2. **Multiplets.**  A pair inside one degenerate multiplet (split by less
+   than BGW's TOL_Degeneracy) carries no interband transition; its
+   ``dE -> 0`` content is the multiplet part of the Drude tensor.  With
+   the multiplet trace and one weight per multiplet, ``D`` is invariant
+   under a unitary rotation inside the multiplet; the diagonal alone is not.
+
+3. **Occupations.**  A metal's head must take the fixed-N Fermi-Dirac state,
    not the bundle's 0/1 step by band index.  The step splits a degenerate
    multiplet at the cut; on Na 8^3 (a pair split by 8e-15 Ry, 2.2 eV above
    mu) that made the head W = 0 at every frequency.  The fixture plants the
-   same split: the step table reproduces the divergence (negative control)
-   and :func:`gw.qsgw_head.build_dft_head_response` with the state does not.
+   same split; :func:`gw.qsgw_head.build_dft_head_response` must carry the
+   fixed-N state, its Drude tensor and its Fermi level.
 """
 
 from __future__ import annotations
@@ -101,7 +107,7 @@ def test_free_electron_drude_tensor_and_thomas_fermi(nspinor):
     volume = a ** 3
     drude = np.asarray(head_drude_tensor_sharded(
         jnp.asarray(velocity, dtype=jnp.complex128), jnp.asarray(surface),
-        mesh=_mesh(), nb_logical=energy.shape[1], cell_volume=volume,
+        jnp.asarray(energy), mesh=_mesh(), nb_logical=energy.shape[1], cell_volume=volume,
         nk_tot=n ** 3, nspin=1, nspinor=nspinor))
     density = kf ** 3 / (3.0 * np.pi ** 2)
     np.testing.assert_allclose(np.diag(drude.real) / (2.0 * density), 1.0,
@@ -136,8 +142,12 @@ def _split_pair_fixture():
                            velocity=velocity, state=state, step=step)
 
 
-def test_step_by_band_index_splits_a_degenerate_pair_and_diverges():
-    """Negative control: the table the one-shot/off heads used to take."""
+def test_step_by_band_index_no_longer_diverges_and_differs_from_fd():
+    """The table the one-shot/off heads used to take cuts a multiplet.
+
+    Before the multiplet mask this gave ``1/(dE z^2) ~ 1e14``; now the cut
+    pair carries no interband weight, but the step table is still not the
+    metal's state, so its S differs from the fixed-N one."""
     fx = _split_pair_fixture()
     common = dict(mesh=_mesh(), nb_logical=3, cell_volume=fx.a ** 3,
                   nk_tot=fx.n ** 3, nspin=1, nspinor=1)
@@ -148,8 +158,9 @@ def test_step_by_band_index_splits_a_degenerate_pair_and_diverges():
     s_fd = np.asarray(head_s_tensor_sharded(
         jnp.asarray(fx.velocity), jnp.asarray(fx.energies),
         jnp.asarray(np.asarray(fx.state.f_kn)), z, **common))
-    assert np.max(np.abs(s_step)) > 1.0e6
+    assert np.max(np.abs(s_step)) < 1.0e3
     assert np.max(np.abs(s_fd)) < 1.0e3
+    assert np.max(np.abs(s_step - s_fd)) > 1.0e-3 * np.max(np.abs(s_fd))
 
 
 def test_dft_head_takes_the_fixed_n_state_and_its_drude_term(monkeypatch, tmp_path):
@@ -189,4 +200,40 @@ def test_dft_head_takes_the_fixed_n_state_and_its_drude_term(monkeypatch, tmp_pa
         wfns, z[1:], input_dir=str(tmp_path), mesh=_mesh(), wfn=wfn,
         meta=meta, config=config, wings=False)
     assert plain.drude_tensor is None and plain.static_kappa2_bohr2 is None
-    assert np.max(np.abs(np.asarray(plain.S_direct))) > 1.0e6
+
+
+def test_multiplet_drude_trace_is_basis_invariant_and_s_skips_the_pair():
+    rng = np.random.default_rng(11)
+    nk = 4
+    energies = np.tile(np.asarray([-0.2, 0.01, 0.01 + 4.0e-15, 0.5]), (nk, 1))
+    raw = rng.normal(size=(3, nk, 4, 4)) + 1j * rng.normal(size=(3, nk, 4, 4))
+    velocity = 0.5 * (raw + np.swapaxes(raw.conj(), -1, -2))
+    surface = np.tile(np.asarray([0.0, 0.7, 0.7, 0.0]), (nk, 1))
+    u = np.linalg.qr(rng.normal(size=(2, 2)) + 1j * rng.normal(size=(2, 2)))[0]
+    rot = np.eye(4, dtype=complex)
+    rot[1:3, 1:3] = u
+    rotated = np.einsum("ij,akjl,lm->akim", rot.conj().T, velocity, rot)
+    common = dict(mesh=_mesh(), nb_logical=4, cell_volume=50.0, nk_tot=nk,
+                  nspin=1, nspinor=2)
+
+    def drude(v):
+        return np.asarray(head_drude_tensor_sharded(
+            jnp.asarray(v), jnp.asarray(surface), jnp.asarray(energies),
+            **common))
+
+    np.testing.assert_allclose(drude(rotated), drude(velocity), rtol=1e-12,
+                               atol=1e-14)
+    # Negative control: the diagonal-only contraction moves under the same
+    # rotation, so the invariance above is the multiplet trace's.
+    diag = lambda v: np.einsum("kn,akn,bkn->ab", surface,
+                               np.einsum("aknn->akn", v).conj(),
+                               np.einsum("aknn->akn", v))
+    assert np.max(np.abs(diag(rotated) - diag(velocity))) > 1e-3
+    # The split pair is not an interband transition: a 0/1 table that cuts
+    # the multiplet leaves S finite (the pre-fix kernel gave 1/(dE z^2)).
+    cut = np.tile(np.asarray([1.0, 1.0, 0.0, 0.0]), (nk, 1))
+    s = np.asarray(head_s_tensor_sharded(
+        jnp.asarray(velocity), jnp.asarray(energies), jnp.asarray(cut),
+        np.asarray([0.3j]), **{k: v for k, v in common.items()}))
+    assert np.max(np.abs(s)) < 1.0e2
+
