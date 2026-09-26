@@ -371,6 +371,7 @@ def _run(args: argparse.Namespace) -> int:
         drude_tensor = head_drude_tensor_sharded(
             pt.velocity_dft_cart,
             surface_weight_kn,
+            energies_kn,
             mesh=mesh,
             nb_logical=nb_logical,
             cell_volume=float(meta.cell_volume),
