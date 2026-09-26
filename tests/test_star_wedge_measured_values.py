@@ -239,18 +239,19 @@ def test_renumber_composed_with_rows_returns_the_parent_map_exactly(
     number — which is why it is asserted here rather than left to a physics
     gate to notice.
 
-    ``compact_star_tables`` is the production renumbering (one rule in the
-    tree; ``sigma_mnk.h5`` has used it since its own wedge storage landed)
-    and ``gw.kin_ion_io.star_wedge_rows`` is a four-line wrapper over it.
+    ``KStarMap.rows``/``.take`` is the production renumbering (one rule in
+    the tree, used by ``sigma_mnk.h5`` and ``kin_ion.h5``), and
+    ``symmetry_maps.star_wedge_rows`` is a two-line wrapper over it.
     Checked here against the SERVICE's own ``_star_row_order`` so the cell
     runs without the FFI gate that importing ``gw.kin_ion_io`` fires; the
     wrapper's agreement is the ``star_tables_agrees`` arm of the same log.
     """
-    from file_io.sigma_output import compact_star_tables
+    from symmetry_maps import KStarMap
 
     sym = _sym_or_skip(deck, wfn)
     irr, _sidx, _nss, _par, _trs = _tables(sym)
-    rows_to_keep, irr_idx_wedge = compact_star_tables(irr)
+    star = KStarMap(irr, _sidx, _nss)
+    rows_to_keep, irr_idx_wedge = star.rows, star.take
     rows = irr[rows_to_keep]
 
     assert rows.size == n_orbits, (
@@ -302,7 +303,7 @@ def test_the_true_ibz_decks_keep_the_literal_old_path(
     assertion instead of a claim.
 
     MIND THE TWO INDEX SPACES, which is the trap this cell was written wrong
-    in first.  ``compact_star_tables`` returns rows of the FULL BZ — on
+    in first.  ``KStarMap.rows`` are rows of the FULL BZ — on
     ``si_cohsex_debug`` they are ``[0, 1, 2, 5, 6, 7, 10, 27]``, the same
     eight ``test_symmetry_maps_kirr_fullids.py`` pins as ``_SI_WEDGE``.
     ``star_wedge_rows`` then maps them into the WFN's OWN k axis by indexing
@@ -310,11 +311,12 @@ def test_the_true_ibz_decks_keep_the_literal_old_path(
     ``arange(nk_red)`` on a true-IBZ deck.  Asserting on the raw full-BZ rows
     instead reads as "this deck moved" on a deck that did not move.
     """
-    from file_io.sigma_output import compact_star_tables
+    from symmetry_maps import KStarMap
 
     sym = _sym_or_skip(deck, wfn)
     irr, _sidx, _nss, _par, _trs = _tables(sym)
-    rows_to_keep, irr_idx_wedge = compact_star_tables(irr)
+    star = KStarMap(irr, _sidx, _nss)
+    rows_to_keep, irr_idx_wedge = star.rows, star.take
     wfn_rows = irr[rows_to_keep]
 
     assert np.array_equal(wfn_rows, np.arange(int(sym.nk_red))), (
@@ -367,11 +369,11 @@ def test_a_wedge_stored_slab_reads_back_exactly_star_covariant(
     off ``read_full_bz_dataset`` exactly star-covariant, on synthetic data
     that cannot be accidentally symmetric.
     """
-    from file_io.sigma_output import compact_star_tables
+    from symmetry_maps import KStarMap
 
     sym = _sym_or_skip(deck, wfn)
     irr, sidx, nss, par, trs = _tables(sym)
-    _rows, irr_idx_wedge = compact_star_tables(irr)
+    irr_idx_wedge = KStarMap(irr, sidx, nss).take
 
     assert int(trs.sum()) == n_trs > 0, (
         f"PRECONDITION: {deck} must exercise the antiunitary branch, or the "

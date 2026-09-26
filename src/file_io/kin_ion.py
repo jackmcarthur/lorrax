@@ -20,8 +20,7 @@ THE STAR WEDGE IS NOT ALWAYS THE WFN'S OWN k-SET, and the stored
 ``irr_idx_k`` indexes the STORED ROWS, not ``SymMaps.irr_idx_k``'s
 upstream wedge labels: ``gnppm_debug`` stores 9 k over 5 orbits, and a
 table filed verbatim there would claim 9 stored rows for a 5-row slab.
-Both writers renumber through
-:func:`file_io.sigma_output.compact_star_tables`, and
+Both writers renumber through ``symmetry_maps.KStarMap.take``, and
 :func:`read_star_map` refuses a file where the two disagree.
 
 A file says so in the ``k_storage`` attr of each dataset, and carries the
@@ -73,44 +72,12 @@ SYM_IDX_DATASET = "sym_idx_k"
 N_SYM_SPATIAL_ATTR = "n_sym_spatial"
 
 
-# ===========================================================================
-# THE UNFOLD, AND WHY THE PREDICATE IS PASSED EXPLICITLY
-# ===========================================================================
-# ``kin_ion`` (T + V_loc + V_NL) is a SCALAR operator built from the
-# crystal's own potentials, so it commutes with every
-# operation of the space group AND with time reversal, and the full-BZ table
-# holds only ``nrk`` distinct matrices.  ``gw.kin_ion_io`` derives that
-# statement in full; what matters at the READ side is the shape of the map:
-#
-#   UNITARY ROW (sym_idx < n_sym_spatial) — a pure copy of the parent's
-#     matrix.  The same R acts on bra and ket and O commutes with it, so no
-#     rotation, no phase and no degenerate-subspace unitary is left over.
-#   ANTIUNITARY ROW (sym_idx >= n_sym_spatial) — the ELEMENT-WISE conjugate
-#     of the parent's matrix, because ⟨Θm|O|Θn⟩ = conj⟨m|O|n⟩.
-#
-# THE PREDICATE, AND WHY IT IS PASSED EXPLICITLY.  The rule is
-# ``sym_idx_k >= n_sym_spatial``, i.e. "is this row time-reversed", because
-# the reference is the file's own IBZ slab — written verbatim by the
-# generator with no symmetry operation applied, so the representative is
-# untransformed by construction.  ``star_broadcast``'s DEFAULT predicate is
-# a different one (the XOR against the first FULL-BZ row of the star),
-# correct for the ``star_select`` output it is normally handed and wrong
-# here.  The two stopped coinciding: on ``tests/regression/cohsex_debug``
-# the shipping op-selection policy gives star label 2 a first full-BZ row
-# with sym_idx 12 = ntran (a pure time reversal), so the XOR inverts the
-# conjugation on 6 of the 9 k-points — MEASURED 183.61 eV of error in
-# ⟨m|V_H|n⟩, entirely in the OFF-DIAGONALS, with the diagonal and therefore
-# every diagonal observable exactly unchanged, which is why nothing caught
-# it.  Hence ``trs_reference="ibz_slab"`` is passed explicitly, and
-# ``tests/test_kin_ion_star_broadcast.py::
-# test_the_call_site_passes_ibz_slab_as_a_literal`` parses THIS FILE to
-# check that it still is.
-#
-# The pin moved here with the function.  It used to parse
-# ``src/gw/kin_ion_io.py``, which is where the broadcast lived while it
-# happened at WRITE time; the same cell now also asserts that no
-# ``star_broadcast`` call is left over there, so the predicate cannot be
-# re-introduced at the writer under a different literal.
+# THE UNFOLD and its antiunitary predicate: docs/architecture/
+# symmetry_register.md §8, "Operator slabs on the star wedge".  The stored
+# slab is the untransformed WFN state of each star, so the predicate is the
+# member's own flag (``trs_reference="ibz_slab"``); the star-row XOR rule is
+# for ``star_select`` output and was measured 183.61 eV wrong here
+# (``cohsex_debug``, off-diagonal ⟨m|V_H|n⟩ only).
 
 
 def broadcast_ibz_to_full_bz(A_irr, irr_idx_k, sym_idx_k, n_sym_spatial):
@@ -118,15 +85,14 @@ def broadcast_ibz_to_full_bz(A_irr, irr_idx_k, sym_idx_k, n_sym_spatial):
 
 	THE adapter over :func:`symmetry_maps.star_broadcast`, so the
 	time-reversal rule has ONE implementation in the tree — one call site,
-	reached by both the reader here and ``gw.kin_ion_io``'s writer-side
-	wrapper.  ``star_broadcast`` orders ``A_irr`` by ``star_select``'s
+	reached by the reader here and by :func:`broadcast_star_wedge`.
+	``star_broadcast`` orders ``A_irr`` by ``star_select``'s
 	first-occurrence rows; the rows here are the file's own stored rows in
 	that order, and ``irr_idx_k`` was renumbered against them by the
 	writer, so the labels passed are the identity — which makes its gather
 	``A[irr_idx_k]``, with ``conj`` applied on the time-reversed rows.
 
-	``None`` in, ``None`` out: the writer's callers gather with
-	``owner_only=True``, so the peers hold no table to broadcast.
+	``None`` in, ``None`` out.
 
 	A device operand stays on its device; nothing here pulls the array to
 	the host, which is what lets the read path unfold a replicated slab in
@@ -159,6 +125,22 @@ def broadcast_ibz_to_full_bz(A_irr, irr_idx_k, sym_idx_k, n_sym_spatial):
 
 
 
+def broadcast_star_wedge(A_irr, sym):
+	"""A star-wedge slab ``(n_orbits, …)`` of a live run → ``(nk_tot, …)``.
+
+	The writer-side spelling of :func:`broadcast_ibz_to_full_bz`: the tables
+	come from the run's ``SymMaps`` (``symmetry_maps.star_wedge_tables``)
+	instead of a file.  ``None`` in, ``None`` out.  A device operand keeps
+	its trailing-axis sharding.
+	"""
+	if A_irr is None:
+		return None
+	from ffi import _services
+	_services.ensure_on_path()
+	import symmetry_maps
+	return broadcast_ibz_to_full_bz(A_irr, *symmetry_maps.star_wedge_tables(sym))
+
+
 def write_kin_ion(path, H_irr, *, mesh, nb, star, attrs) -> None:
 	"""Write ``kin_ion.h5`` through SlabIO from the sweep's shards.
 
@@ -166,7 +148,7 @@ def write_kin_ion(path, H_irr, *, mesh, nb, star, attrs) -> None:
 	``(n_orbits, nb_pad, nb_pad)`` with its band axes on the mesh (or a
 	replicated host array); SlabIO drops the pad rows past the logical
 	``nb``.  ``star`` is ``(irr_idx_k, sym_idx_k, n_sym_spatial)`` already
-	renumbered onto the stored rows (``symmetry_maps.star_tables``); the
+	renumbered onto the stored rows (``symmetry_maps.star_wedge_tables``); the
 	two index tables are filed beside the slab they unfold, and the slab is
 	stamped ``k_storage = "ibz"``.  ``attrs`` are the dataset's provenance
 	attributes; every rank passes them and rank 0's copy lands.
