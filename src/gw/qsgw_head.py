@@ -1419,15 +1419,18 @@ def _head_wing_kernel_face(
 
     Residency: the vertex stays ``v[a, k, i_X, j_Y]`` and the pair weight,
     ``dE``, ``f`` and the masks are built on the same ``(i_X, j_Y)`` tile, so
-    every pair-indexed value is ``1/P``.  Per centroid block ``b`` (one
-    ``_HEAD_WING_MU_BLOCK`` slice of each rank's own mu tile), the endpoints
-    are gathered on the block only: ``psi[k, i_X, s, M_b]`` over Y from the
-    nmu face and ``psi[k, s, M_b, j_Y]`` over X from the mun face, ``M_b``
-    being block ``b`` of every mu tile (square mesh: the X and Y mu tiles
-    are one partition).  Each rank contracts its pair tile; ``Y`` is
-    reduce-scattered over X onto ``mu_X`` and summed over Y, ``Z`` the
-    mirror.  The antiunitary term reads the transposed tile, so it takes
-    the bra with bands on Y and the ket with bands on X (two more gathers).
+    every pair-indexed value is ``1/P``.  ``Y`` reads the mun faces and ``Z``
+    the nmu faces (separate endpoint bundles may differ between the two).
+    Per centroid block ``b`` (one ``_HEAD_WING_MU_BLOCK`` slice of each
+    rank's own mu tile) a pass gathers its two endpoints on the block only,
+    ``[k, s, M_b, i_X]`` for the bra and ``[k, s, M_b, j_Y]`` for the ket,
+    ``M_b`` being block ``b`` of every mu tile (square mesh: the X and Y mu
+    tiles are one partition).  The face's own band axis is one gather; the
+    other is the transpose partner's block (``to_transpose_partner``) and
+    one gather.  Each rank contracts its pair tile; ``Y`` is reduce-scattered
+    over X onto ``mu_X`` and summed over Y, ``Z`` the mirror.  The
+    antiunitary term reads the transposed tile, so it also takes the bra
+    with bands on Y and the ket with bands on X.
     """
     key = ("head_wings_face", id(mesh), int(nb_logical), bool(include_surface),
            layout, int(classes), bool(anti))
@@ -1441,6 +1444,7 @@ def _head_wing_kernel_face(
             f"partition on X and Y, i.e. a square mesh; got "
             f"{int(mesh.shape[ax_x])}x{int(mesh.shape[ax_y])} (repo "
             "docs/architecture/decisions.md 2026-08-01: square meshes only).")
+    from common.collectives import to_transpose_partner
     from common.wfn_layout import psi_specs
     nmu_spec, mun_spec = psi_specs(layout)
     use_anti = bool(anti) and bool(classes)
@@ -1551,76 +1555,97 @@ def _head_wing_kernel_face(
         mu_pad = mu_padded - mu_local
         pad_nmu = lambda a: jnp.pad(a, ((0, 0), (0, 0), (0, 0), (0, mu_pad)))
         pad_mun = lambda a: jnp.pad(a, ((0, 0), (0, 0), (0, mu_pad), (0, 0)))
-        bra_nmu_padded, ket_nmu_padded = pad_nmu(bra_nmu_local), pad_nmu(ket_nmu_local)
-        bra_mun_padded, ket_mun_padded = pad_mun(bra_mun_local), pad_mun(ket_mun_local)
+        p_side = int(mesh.shape[ax_x])
 
-        def _block_step(_carry, blk):
-            start = blk * mu_block
+        # Endpoint blocks ``[k, s, M_b, n]`` with the band tile on X (``_x``)
+        # or on Y (``_y``).  A face's own band axis needs one gather; the
+        # other band axis is its transpose partner's block, then a gather.
+        def _mun_y(a, start):
+            t = jax.lax.dynamic_slice_in_dim(a, start, mu_block, axis=2)
+            return jax.lax.all_gather(t, ax_x, axis=2, tiled=True)
 
-            def _rows_x(a):
-                """nmu block over Y: ``[k, s, M_b, i_X]``."""
-                t = jax.lax.dynamic_slice_in_dim(a, start, mu_block, axis=3)
-                t = jax.lax.all_gather(t, ax_y, axis=3, tiled=True)
-                return jnp.transpose(t, (0, 2, 3, 1))
+        def _mun_x(a, start):
+            t = jax.lax.dynamic_slice_in_dim(a, start, mu_block, axis=2)
+            t = to_transpose_partner(t, p_side)
+            return jax.lax.all_gather(t, ax_y, axis=2, tiled=True)
 
-            def _cols_y(a):
-                """mun block over X: ``[k, s, M_b, j_Y]``."""
-                t = jax.lax.dynamic_slice_in_dim(a, start, mu_block, axis=2)
-                return jax.lax.all_gather(t, ax_x, axis=2, tiled=True)
+        def _nmu_x(a, start):
+            t = jax.lax.dynamic_slice_in_dim(a, start, mu_block, axis=3)
+            t = jax.lax.all_gather(t, ax_y, axis=3, tiled=True)
+            return jnp.transpose(t, (0, 2, 3, 1))
 
-            bra_x, ket_y = _rows_x(bra_nmu_padded), _cols_y(ket_mun_padded)
-            bra_y = ket_x = None
-            if use_anti:
-                bra_y, ket_x = _cols_y(bra_mun_padded), _rows_x(ket_nmu_padded)
+        def _nmu_y(a, start):
+            t = jax.lax.dynamic_slice_in_dim(a, start, mu_block, axis=3)
+            t = to_transpose_partner(t, p_side)
+            t = jax.lax.all_gather(t, ax_x, axis=3, tiled=True)
+            return jnp.transpose(t, (0, 2, 3, 1))
 
-            def _contract(weight):
-                # Y[w,a,m] = sum_{k,s,i,j} conj(v)[a,k,i,j] W[w,k,i,j]
-                #                          conj(bra)[k,s,m,i] ket[k,s,m,j]
-                # Z[w,m,b] = sum_{k,s,i,j} bra[k,s,m,i] conj(ket)[k,s,m,j]
-                #                          W[w,k,i,j] v[b,k,i,j]
-                # over this rank's (i_X, j_Y) pair tile, per frequency and
-                # vertex: T = conj(v[a]) W (nk, nbx, nby), then i against
-                # the bra, then k, s, j against the ket; the largest value
-                # is T.  An antiunitary child reads rho_ji: its pair weight
-                # is (v W)^T, contracted with the Y-banded bra and the
-                # X-banded ket (see _head_wings_sharded_face).
-                def _one_frequency(_carry, weight_w):
-                    rows, cols = [], []
-                    for a in range(n_vertex):
-                        t = jnp.conj(v_local[a]) * weight_w
-                        u = jnp.einsum("ksmi,kij->ksmj", jnp.conj(bra_x), t)
-                        u_anti = None
-                        if use_anti:
-                            u_anti = jnp.einsum(
-                                "ksmi,kji->ksmj", jnp.conj(bra_y),
-                                v_local[a] * weight_w)
-                        rows.append(_k_sum(u, ket_y, u_anti, ket_x))
-                        t = weight_w * v_local[a]
-                        u = jnp.einsum("ksmi,kij->ksmj", bra_x, t)
-                        u_anti = None
-                        if use_anti:
-                            u_anti = jnp.einsum(
-                                "ksmi,kji->ksmj", bra_y,
-                                weight_w * jnp.conj(v_local[a]))
-                        cols.append(_k_sum(
-                            u, jnp.conj(ket_y), u_anti,
-                            None if ket_x is None else jnp.conj(ket_x)))
-                    return _carry, (jnp.stack(rows, axis=0),
-                                    jnp.stack(cols, axis=-1))
-                _, yz = jax.lax.scan(_one_frequency, None, weight, unroll=1)
-                return yz
-            y_part, z_part = _weighted_stack(_contract)
-            y_part = y_part.reshape(n_omega_padded, n_vertex, n_class, -1)
-            z_part = z_part.reshape(n_omega_padded, n_class, -1, n_vertex)
-            # M_b is tile-major: the scatter's chunk x is mu tile x's block.
-            y_blk = jax.lax.psum(jax.lax.psum_scatter(
-                y_part, ax_x, scatter_dimension=3, tiled=True), ax_y)
-            z_blk = jax.lax.psum(jax.lax.psum_scatter(
-                z_part, ax_y, scatter_dimension=2, tiled=True), ax_x)
-            return _carry, (y_blk, z_blk)
+        def _pass(bra, ket, band_x, band_y, contract, scatter_axis, sum_axis, dim):
+            """One wing: per centroid block, gather the endpoints, contract the
+            local pair tile, reduce-scatter the block onto its own mu tile."""
+            def _block_step(_carry, blk):
+                start = blk * mu_block
+                ends = (band_x(bra, start), band_y(ket, start))
+                if use_anti:
+                    ends = ends + (band_y(bra, start), band_x(ket, start))
+                part = _weighted_stack(lambda w: contract(w, *ends))
+                # M_b is tile-major: the scatter's chunk t is mu tile t's block.
+                blk_out = jax.lax.psum(jax.lax.psum_scatter(
+                    part, scatter_axis, scatter_dimension=dim, tiled=True), sum_axis)
+                return _carry, blk_out
+            _, chunks = jax.lax.scan(
+                _block_step, None, jnp.arange(n_blocks, dtype=jnp.int32), unroll=1)
+            return chunks
 
-        _, (y_chunks, z_chunks) = jax.lax.scan(
-            _block_step, None, jnp.arange(n_blocks, dtype=jnp.int32), unroll=1)
+        # Y[w,a,m] = sum_{k,s,i,j} conj(v)[a,k,i,j] W[w,k,i,j]
+        #                          conj(bra)[k,s,m,i] ket[k,s,m,j]  (mun faces)
+        # Z[w,m,b] = sum_{k,s,i,j} bra[k,s,m,i] conj(ket)[k,s,m,j]
+        #                          W[w,k,i,j] v[b,k,i,j]            (nmu faces)
+        # over this rank's (i_X, j_Y) pair tile, per frequency and vertex:
+        # T = conj(v[a]) W (nk, nbx, nby), then i against the bra, then k, s,
+        # j against the ket; the largest value is T.  An antiunitary child
+        # reads rho_ji: its pair weight is (v W)^T, contracted with the
+        # Y-banded bra and the X-banded ket (see _head_wings_sharded_face).
+        def _contract_left(weight, bra_x, ket_y, bra_y=None, ket_x=None):
+            def _one_frequency(_carry, weight_w):
+                rows = []
+                for a in range(n_vertex):
+                    t = jnp.conj(v_local[a]) * weight_w
+                    u = jnp.einsum("ksmi,kij->ksmj", jnp.conj(bra_x), t)
+                    u_anti = None
+                    if use_anti:
+                        u_anti = jnp.einsum(
+                            "ksmi,kji->ksmj", jnp.conj(bra_y),
+                            v_local[a] * weight_w)
+                    rows.append(_k_sum(u, ket_y, u_anti, ket_x))
+                return _carry, jnp.stack(rows, axis=0)
+            _, y = jax.lax.scan(_one_frequency, None, weight, unroll=1)
+            return y
+
+        def _contract_right(weight, bra_x, ket_y, bra_y=None, ket_x=None):
+            def _one_frequency(_carry, weight_w):
+                cols = []
+                for b in range(n_vertex):
+                    t = weight_w * v_local[b]
+                    u = jnp.einsum("ksmi,kij->ksmj", bra_x, t)
+                    u_anti = None
+                    if use_anti:
+                        u_anti = jnp.einsum(
+                            "ksmi,kji->ksmj", bra_y,
+                            weight_w * jnp.conj(v_local[b]))
+                    cols.append(_k_sum(
+                        u, jnp.conj(ket_y), u_anti,
+                        None if ket_x is None else jnp.conj(ket_x)))
+                return _carry, jnp.stack(cols, axis=-1)
+            _, z = jax.lax.scan(_one_frequency, None, weight, unroll=1)
+            return z
+
+        y_chunks = _pass(pad_mun(bra_mun_local), pad_mun(ket_mun_local), _mun_x, _mun_y,
+                         _contract_left, ax_x, ax_y, 4)
+        y_chunks = y_chunks.reshape(n_blocks, n_omega_padded, n_vertex, n_class, mu_block)
+        z_chunks = _pass(pad_nmu(bra_nmu_local), pad_nmu(ket_nmu_local), _nmu_x, _nmu_y,
+                         _contract_right, ax_y, ax_x, 3)
+        z_chunks = z_chunks.reshape(n_blocks, n_omega_padded, n_class, mu_block, n_vertex)
         Y_x = jnp.moveaxis(y_chunks, 0, 3).reshape(
             n_omega_padded, n_vertex, n_class,
             mu_padded)[:n_omega, :, :, :mu_local]
