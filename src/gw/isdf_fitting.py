@@ -32,10 +32,6 @@ from isdf.core import (
     _resolve_solver_kind,
     zeta_factor_resident,
 )
-# The opaque distributed factor.  Re-exported through isdf.core rather than
-# imported from the door here: this module never CALLS distrib_la, it only
-# has to tell a token from an array (route G refuses one).
-from isdf.core import FactorToken
 
 
 # Running max of nvidia-smi used MB across all probe points within a run
@@ -488,10 +484,6 @@ def fit_zeta_to_h5(
     bispinor: bool = False,
     bispinor_lift: str = "raw",
     solver_kind: str = 'auto',
-    distributed_cholesky: str = "auto",
-    distributed_lu: str = "auto",
-    zeta_ridge: float = 0.0,
-    charge_zeta_solve: str = "cholesky",
     zeta_rcond: float = ZETA_RCOND_DEFAULT,
     distrib_la_batched_route: str = "batch_reshard",
     write_ibz_only: bool = True,
@@ -730,34 +722,25 @@ def fit_zeta_to_h5(
             C_q_flat.block_until_ready()
 
         with timing.section("zeta_fit.cholesky"):
-            # Route G applies a WHOLE-TILE factor on each G tile, so a current
-            # channel always takes the local pivoted LU (a block-cyclic provider
-            # token cannot be applied per tile).
+            # Route G applies a WHOLE-TILE factor on each G tile: the charge
+            # channel's rank-truncated pseudo-inverse, or a current channel's
+            # local pivoted LU.
             _kind = 'lu' if v != 0 else _resolve_solver_kind(
-                mesh_xy, v, solver_kind,
-                distributed_cholesky=distributed_cholesky,
-                distributed_lu=distributed_lu,
-                n_rmu=n_rmu_solve, nq=int(C_q_flat.shape[0]),
-                charge_zeta_solve=charge_zeta_solve)
-            _route = 'batch_reshard' if v != 0 else distrib_la_batched_route
+                0, solver_kind,
+                n_rmu=n_rmu_solve, nq=int(C_q_flat.shape[0]))
             _factor = factor_c_q(
                 C_q_flat, mesh_xy, vertex_mu_L=v,
                 n_rmu_logical=n_rmu_solve, solver_kind=_kind,
-                zeta_ridge=zeta_ridge, zeta_rcond=zeta_rcond,
-                distrib_la_batched_route=_route)
+                zeta_rcond=zeta_rcond)
             # The charge factor is one array; a current factor is (factor, piv).
             L_q, lu_piv = _factor if v != 0 else (_factor, None)
-            if isinstance(L_q, FactorToken):
-                raise ValueError(
-                    f"fit_zeta_to_h5: μ_L={v} factor resolved to {L_q!r}; route G "
-                    "applies a whole-tile factor on each G tile.")
             jax.block_until_ready(L_q)
             print_fn(f"  μ_L={v} factor: {_kind} -> "
                      f"{'hoisted pivoted LU' if lu_piv is not None else 'whole-tile'} "
                      f"{tuple(L_q.shape)}, back-solve on the q owners")
         with timing.section("zeta_fit.factor_residency"):
             L_q, lu_piv = zeta_factor_resident(
-                L_q, lu_piv, mesh_xy, solver_kind=_kind, distrib_la_batched_route=_route)
+                L_q, lu_piv, mesh_xy, solver_kind=_kind)
         del C_q_flat
         gc.collect()
 

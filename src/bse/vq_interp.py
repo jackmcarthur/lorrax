@@ -1952,18 +1952,20 @@ def read_zeta_fit_provenance(zeta_file: str) -> dict | None:
     return out if isinstance(out, dict) else None
 
 
-def _zeta_solve_of(prov: dict, zeta_file: str) -> tuple[str, float, float]:
-    """``(charge_zeta_solve, zeta_rcond, zeta_ridge)`` of the fit on disk.
+def _zeta_solve_of(prov: dict, zeta_file: str) -> tuple[str, float]:
+    """``(charge_zeta_solve, zeta_rcond)`` of the fit on disk.
 
-    The three values ``isdf.core.solve_zeta_charge_dense`` needs to redo the
-    producer's ζ solve.  ``zeta_rcond``/``zeta_ridge`` are stored as the
-    provenance's own strings (``repr(value)``, or the raw env string when the
-    deprecated env twin won — ``isdf.core.deprecated_env_record``), so they
-    parse as floats either way and they are the EFFECTIVE values, which is
-    the whole point of reading them here instead of off the deck.
+    The two values ``isdf.core.solve_zeta_charge_dense`` needs to redo the
+    producer's ζ solve.  ``zeta_rcond`` is stored as the provenance's own
+    string (``repr(value)``, or the raw env string when the deprecated env
+    twin won — ``isdf.core.deprecated_env_record``), so it parses as a float
+    either way and it is the EFFECTIVE value, which is the whole point of
+    reading it here instead of off the deck.
     """
     kind = str(prov.get("charge_zeta_solve", "")).strip().lower()
-    if kind not in ("rank_truncate", "cholesky"):
+    if kind == "cholesky":
+        raise SystemExit(f"exciton_bands --vq-mode=refit: {zeta_file} records charge_zeta_solve='cholesky', a charge solve retired on 2026-09-25; refit ζ with the rank-truncated solve.")
+    if kind != "rank_truncate":
         raise SystemExit(
             f"exciton_bands --vq-mode=refit: {zeta_file} records "
             f"charge_zeta_solve={prov.get('charge_zeta_solve')!r}, which is "
@@ -1972,16 +1974,15 @@ def _zeta_solve_of(prov: dict, zeta_file: str) -> tuple[str, float, float]:
             f"guess one.")
     try:
         rcond = float(prov["zeta_rcond"])
-        ridge = float(prov.get("zeta_ridge", 0.0))
     except (KeyError, TypeError, ValueError) as exc:
         raise SystemExit(
             f"exciton_bands --vq-mode=refit: {zeta_file}'s fit_provenance "
-            f"does not carry a parseable zeta_rcond/zeta_ridge "
-            f"({prov.get('zeta_rcond')!r} / {prov.get('zeta_ridge')!r}).  "
-            f"Those are the conditioning knobs ζ was fitted under and the "
-            f"refit reproduces them exactly; it has no default for them."
+            f"does not carry a parseable zeta_rcond "
+            f"({prov.get('zeta_rcond')!r}).  That is the conditioning knob "
+            f"ζ was fitted under and the refit reproduces it exactly; it has "
+            f"no default for it."
         ) from exc
-    return kind, rcond, ridge
+    return kind, rcond
 
 
 def _zeta_fit_window_of(prov: dict) -> tuple[int, int] | None:
@@ -2209,7 +2210,7 @@ def refit_prepare(input_file: str, mesh_xy: Mesh, zx, log_fn=print,
           recorded so a reader of ``rst`` never has to infer which is which
       r_chunk_ranges, galerkin_rel — bounded schedule + compact projection
           receipt; no full-grid Psi/B/Z/zeta is retained.
-      zeta_solve  ``(charge_zeta_solve, zeta_rcond, zeta_ridge)`` of the fit
+      zeta_solve  ``(charge_zeta_solve, zeta_rcond)`` of the fit
           on disk — read from the ζ file's own ``isdf_header/fit_provenance``
           and NOT from the deck.  ``refit_vq`` refuses without it.
     """
@@ -2241,7 +2242,7 @@ def refit_prepare(input_file: str, mesh_xy: Mesh, zx, log_fn=print,
         raise SystemExit(
             f"exciton_bands --vq-mode=refit: {zx['zeta_file']} carries no "
             f"``isdf_header/fit_provenance``, so the ζ solve it was fitted "
-            f"with — charge_zeta_solve, zeta_rcond, zeta_ridge — is unknown. "
+            f"with — charge_zeta_solve, zeta_rcond — is unknown. "
             f"The refit re-solves the SAME system at the target Q and must "
             f"use the SAME solve: a plain ridged Cholesky keeps the near-null "
             f"directions the producer's rank truncation discarded and V_Q is "
@@ -2250,7 +2251,7 @@ def refit_prepare(input_file: str, mesh_xy: Mesh, zx, log_fn=print,
             f"use --vq-mode=ongrid, which needs no refit.")
     _zeta_solve = _zeta_solve_of(_prov, zx["zeta_file"])
     log_fn(f"  [refit] ζ solve = THE PRODUCER'S: {_zeta_solve[0]} at "
-           f"zeta_rcond={_zeta_solve[1]:.3e}, zeta_ridge={_zeta_solve[2]:.3e} "
+           f"zeta_rcond={_zeta_solve[1]:.3e} "
            f"(read from {os.path.basename(zx['zeta_file'])} "
            f"isdf_header/fit_provenance, not from the deck)")
     params = read_lorrax_input(input_file)
@@ -2574,8 +2575,8 @@ def _refit_kernels(nk, nb, ns, n_mu, zeta_solve):
     """Jitted refit chunk kernels, cached on the (shape) signature so every
     refit Q after the first is dispatch-only (per-q-recompile lesson).
 
-    ``zeta_solve`` is the producer's ``(charge_zeta_solve, zeta_rcond,
-    zeta_ridge)`` triple for the bundle being refitted (:func:`_zeta_solve_of`).
+    ``zeta_solve`` is the producer's ``(charge_zeta_solve, zeta_rcond)``
+    pair for the bundle being refitted (:func:`_zeta_solve_of`).
     It is part of the CACHE KEY, not just of the closure: the ζ solve is a
     different program per (kind, rcond), and a key that omitted it would hand
     the second bundle of a process the first bundle's compiled solve.
@@ -2584,7 +2585,7 @@ def _refit_kernels(nk, nb, ns, n_mu, zeta_solve):
     hit = _REFIT_KERNELS.get(key)
     if hit is not None:
         return hit
-    _solve_kind, _rcond, _ridge = zeta_solve
+    _solve_kind, _rcond = zeta_solve
     # LAZY, and for the same reason every other import in this module is:
     # ``isdf.core``'s module body reaches ``distrib_la`` and the FFI plan
     # resolver, and this module is imported by host-only diagnostics that
@@ -2619,8 +2620,7 @@ def _refit_kernels(nk, nb, ns, n_mu, zeta_solve):
         # (tests/known_failures/2026-08-11-narrowed-zeta-window-clears-fh-\
         # and-the-tile-null-still-refuses.md §4).
         return solve_zeta_charge_dense(
-            C, Z, charge_zeta_solve=_solve_kind, zeta_rcond=_rcond,
-            zeta_ridge=_ridge)
+            C, Z, charge_zeta_solve=_solve_kind, zeta_rcond=_rcond)
 
     kernels = (_cq_and_x, _solve_zeta)
     _REFIT_KERNELS[key] = kernels
@@ -2730,11 +2730,11 @@ def refit_vq(zx, rst, q_tile_frac, mesh_xy: Mesh, log_fn=print,
     if "zeta_solve" not in rst:
         raise SystemExit(
             "refit_vq: this refit state carries no ``zeta_solve`` — the "
-            "(charge_zeta_solve, zeta_rcond, zeta_ridge) the bundle's ζ was "
+            "(charge_zeta_solve, zeta_rcond) the bundle's ζ was "
             "actually fitted with.  ζ' must be solved the way ζ was or it "
             "differs from ζ in the near-null subspace the producer truncated, "
             "and V_Q is quadratic in that difference.  Build the state with "
-            "vq_interp.refit_prepare, which reads the triple from the ζ "
+            "vq_interp.refit_prepare, which reads the pair from the ζ "
             "file's isdf_header/fit_provenance.")
     cq_and_x, solve_zeta = _refit_kernels(
         nk, nb, ns, n_mu, rst["zeta_solve"])

@@ -253,12 +253,13 @@ def _zeta_fit_provenance(*, wfn, meta, cfg, band_range_left, band_range_right,
 	outcome than the (contrived) same-path-same-size-different-content
 	case.
 
-	``zeta_rcond`` / ``zeta_ridge`` record the EFFECTIVE values, i.e. after
-	``LORRAX_ZETA_RCOND`` / ``LORRAX_ZETA_RIDGE`` are applied exactly as
-	``isdf/core._replicated_chol`` applies them.  Recording the cfg values
+	``zeta_rcond`` records the EFFECTIVE value, i.e. after
+	``LORRAX_ZETA_RCOND`` is applied exactly as
+	``isdf/core._factor_c_q_replicated`` applies it.  Recording the cfg value
 	instead would be a correctness hole: a rerun that drops the env
 	override would match the provenance and silently reuse a ζ fit at a
-	different conditioning cutoff.
+	different conditioning cutoff.  ``zeta_ridge`` is retired and refused
+	unless 0; it is still stamped (``repr(0.0)``) so stored stamps compare.
 
 	``write_ibz_only`` is the REQUESTED value.  ``fit_zeta_to_h5`` may
 	flip it off when the orbit-closure check fails — but that check is a
@@ -307,6 +308,8 @@ def _zeta_fit_provenance(*, wfn, meta, cfg, band_range_left, band_range_right,
 		and not (int(vertex_mu_L) == 0 and not _carrier_bispinor))
 	_ti = dict(transverse_identity or {}) if _couple_transverse else {}
 	from isdf.core import deprecated_env_record as _dep_env_record
+	if float(cfg.backend.zeta_ridge) != 0.0:
+		raise ValueError("zeta_ridge is retired (2026-09-25): the charge ζ solve is the rank-truncated pseudo-inverse and zeta_rcond sets its cut; remove the key.")
 	# ``wfn._filename`` is the same source path fit_zeta_to_h5 copies
 	# mf_header from — the authoritative identity of the ζ's input WFN.
 	wfn_path = getattr(wfn, '_filename', None) or ''
@@ -357,8 +360,7 @@ def _zeta_fit_provenance(*, wfn, meta, cfg, band_range_left, band_range_right,
 		# what the fit actually used.  The recorded string is
 		# byte-identical to the historical format in every case that
 		# ever produced a reusable ζ.
-		'zeta_ridge':           _dep_env_record(
-			"LORRAX_ZETA_RIDGE", cfg.backend.zeta_ridge),
+		'zeta_ridge':           repr(cfg.backend.zeta_ridge),
 		'zeta_rcond':           _dep_env_record(
 			"LORRAX_ZETA_RCOND", cfg.backend.zeta_rcond),
 		'charge_zeta_solve':    str(cfg.backend.charge_zeta_solve),
@@ -1814,11 +1816,7 @@ def _fit_charge_zeta_channel(
                 band_range_left=band_range_left,
                 band_range_right=band_range_right,
                 band_norms=_band_norms,
-                distributed_cholesky=cfg.backend.distributed_cholesky,
-                distributed_lu=cfg.backend.distributed_lu,
                 distrib_la_batched_route=cfg.backend.distrib_la_batched_route,
-                zeta_ridge=cfg.backend.zeta_ridge,
-                charge_zeta_solve=cfg.backend.charge_zeta_solve,
                 zeta_rcond=cfg.backend.zeta_rcond,
                 write_ibz_only=_write_ibz_only_charge,
                 zeta_cutoff_ry=_zeta_cutoff,
@@ -1965,10 +1963,7 @@ def _fit_transverse_zeta_channels(
             bispinor=True,
             band_range_left=band_range_left, band_range_right=band_range_right,
             band_norms=_band_norms,
-            distributed_cholesky=cfg.backend.distributed_cholesky,
-            distributed_lu=cfg.backend.distributed_lu,
             distrib_la_batched_route=cfg.backend.distrib_la_batched_route,
-            zeta_ridge=cfg.backend.zeta_ridge,
             bispinor_lift=(representation.current_lift or "raw"),
             write_ibz_only=_write_ibz_only_transverse,
             zeta_cutoff_ry=_zeta_cutoff,

@@ -824,15 +824,8 @@ def test_scalapack_getrf_getrs_split_is_bit_identical_cpu(mesh_cpu11, dtype):
 
 
 @needs_host_ffi
-def test_scalapack_resolver_and_host_only_guard(mesh_cpu11):
-    """distributed_lu=scalapack resolves to scalapack_lu (explicit only —
-    auto never picks it); a GPU-device mesh is rejected loudly."""
-    _needs_monorepo("isdf.core transverse-solver resolution")
-    from isdf.core import _resolve_solver_kind_transverse
-    assert _resolve_solver_kind_transverse(
-        mesh_cpu11, "scalapack") == "scalapack_lu"
-    assert _resolve_solver_kind_transverse(
-        mesh_cpu11, "auto") != "scalapack_lu"
+def test_scalapack_host_only_guard(mesh_cpu11):
+    """The host-only ScaLAPACK solve rejects a GPU-device mesh loudly."""
     import jax
     batched_distributed_solve_lu = backend_module(
         "scalapack").batched_distributed_solve_lu
@@ -956,60 +949,6 @@ def _cli_main():
 
 if __name__ == "__main__":
     sys.exit(_cli_main())
-
-
-# ---------------------------------------------------------------------------
-# distributed_cholesky = slate — the input-file-selectable backend
-# (factor_c_q wiring; see isdf.core._resolve_solver_kind_charge)
-# ---------------------------------------------------------------------------
-
-def check_factor_c_q_slate(mesh):
-    """factor_c_q(solver_kind='slate_cholesky') returns a conventional L
-    equal to the numpy Cholesky (1×1 mesh), so the downstream per-q
-    triangular back-solve consumes it unchanged."""
-    import jax
-    import jax.numpy as jnp
-    from jax.sharding import NamedSharding, PartitionSpec as P
-    _needs_monorepo("isdf.core.factor_c_q")
-    from isdf.core import factor_c_q, _resolve_solver_kind_charge
-
-    assert _resolve_solver_kind_charge(mesh, "slate") == "slate_cholesky"
-
-    rng = np.random.default_rng(7)
-    n, nq = 32, 3
-    A = rng.standard_normal((nq, n, n)) + 1j * rng.standard_normal((nq, n, n))
-    C = A @ np.conj(np.swapaxes(A, -1, -2)) + n * np.eye(n)[None]
-    C_dev = jax.device_put(jnp.asarray(C), NamedSharding(mesh, P(None, "x", "y")))
-
-    L = np.asarray(factor_c_q(C_dev, mesh, solver_kind="slate_cholesky"))
-    L_ref = np.linalg.cholesky(C)
-    resid = np.max(np.abs(L - L_ref)) / np.max(np.abs(L_ref))
-    assert resid < 1e-12, f"slate factor_c_q vs numpy Cholesky: rel {resid:.2e}"
-
-    # Determinism: second call bit-identical.
-    L2 = np.asarray(factor_c_q(C_dev, mesh, solver_kind="slate_cholesky"))
-    assert np.array_equal(L, L2)
-
-
-@needs_ffi
-def test_factor_c_q_slate_matches_reference():
-    check_factor_c_q_slate(_mesh_1x1())
-
-
-@needs_host_ffi
-def test_factor_c_q_slate_matches_reference_cpu():
-    # Same production wiring on a CPU-device mesh — the input-file
-    # ``distributed_cholesky = slate`` path a CPU-backend run takes.
-    check_factor_c_q_slate(_mesh_cpu_1x1())
-
-
-@needs_ffi
-def test_resolver_never_auto_picks_slate():
-    _needs_monorepo("isdf.core charge-solver resolution")
-    from isdf.core import _resolve_solver_kind_charge
-    mesh = _mesh_1x1()
-    assert _resolve_solver_kind_charge(mesh, "auto") != "slate_cholesky"
-    assert _resolve_solver_kind_charge(mesh, "off") == "sharded_cholesky"
 
 
 # ---------------------------------------------------------------------------
