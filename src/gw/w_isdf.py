@@ -1368,12 +1368,16 @@ def _w_solve_pref_scalar(meta) -> float:
 
 def _resolve_w_solve_fn(meta, mesh_xy, *, n_rmu, n_rmu_logical=None,
                         dyson_solver=None,
-                        distrib_la_batched_route: str = "batch_reshard"):
-    """Return ``(solve_fn, pref)`` for the requested W plan; see docs/architecture/four_current_wiring.md."""
+                        distrib_la_batched_route: str = "batch_reshard",
+                        pref=None, nq=None):
+    """Return ``(solve_fn, pref)`` for the requested W plan; see docs/architecture/four_current_wiring.md.
+
+    ``pref``/``nq`` given (a caller with no ISDF ``meta``, e.g. the plane-wave
+    response sphere): χ₀'s prefactor and the q count come from the caller."""
     from .gw_config import normalize_w_dyson_solver
     dyson = normalize_w_dyson_solver(dyson_solver)
-    nq = int(meta.nk_tot)
-    pref_scalar = _w_solve_pref_scalar(meta)
+    nq = int(meta.nk_tot) if nq is None else int(nq)
+    pref_scalar = _w_solve_pref_scalar(meta) if pref is None else complex(pref)
 
     # Scalar charge solves take their logical prefix from ``meta``.  The
     # packed photon solve is a direct sum of independently padded channel
@@ -1394,8 +1398,11 @@ def _resolve_w_solve_fn(meta, mesh_xy, *, n_rmu, n_rmu_logical=None,
 
 
 def _require_w_operand_geometry(V_q, chi0_q, meta, mesh_xy, *,
-                                n_rmu_logical=None):
-    """Authenticate the public Dyson carrier without owning its q set; see docs/architecture/four_current_wiring.md."""
+                                n_rmu_logical=None, axis=None):
+    """Authenticate the public Dyson carrier without owning its q set; see docs/architecture/four_current_wiring.md.
+
+    ``axis`` (a ``runtime.padding.PaddedAxis``) is the carrier of a caller with
+    no ISDF ``meta``; its logical prefix is the solve extent."""
     v_shape = tuple(int(n) for n in V_q.shape)
     chi_shape = tuple(int(n) for n in chi0_q.shape)
     if v_shape != chi_shape:
@@ -1407,11 +1414,19 @@ def _require_w_operand_geometry(V_q, chi0_q, meta, mesh_xy, *,
         raise ValueError(
             "solve_w requires equal rank-3 square (q,mu,nu) operands; "
             f"got V_q.shape=chi0_q.shape={v_shape}.")
-    n_logical = (int(getattr(meta, 'mu_solve_extent', meta.n_rmu))
-                 if n_rmu_logical is None else int(n_rmu_logical))
-    basis = getattr(meta, "mu_basis", None)
-    mu_axis = (basis.solve_axis if basis is not None and n_rmu_logical is None
-               else padded_mu_axis(n_logical, mesh_xy))
+    if axis is None and meta is None:
+        raise ValueError("solve_w: meta=None needs axis= (the carrier PaddedAxis)")
+    if axis is not None:
+        if meta is not None or n_rmu_logical is not None:
+            raise ValueError("solve_w: axis= replaces meta's carrier and n_rmu_logical; "
+                             "pass meta=None and no n_rmu_logical with it")
+        n_logical, mu_axis = int(axis.logical), axis
+    else:
+        n_logical = (int(getattr(meta, 'mu_solve_extent', meta.n_rmu))
+                     if n_rmu_logical is None else int(n_rmu_logical))
+        basis = getattr(meta, "mu_basis", None)
+        mu_axis = (basis.solve_axis if basis is not None and n_rmu_logical is None
+                   else padded_mu_axis(n_logical, mesh_xy))
     authenticate_padded_axis(
         mu_axis.logical, v_shape[1], mu_axis,
         name="Dyson row-centroid carrier")
@@ -1423,14 +1438,23 @@ def _require_w_operand_geometry(V_q, chi0_q, meta, mesh_xy, *,
 
 def solve_w(V_q, chi0_q, meta, mesh_xy, *, dyson_solver=None,
             n_rmu_logical=None,
-            distrib_la_batched_route: str = "batch_reshard"):
-    """W(q) = (I − V χ₀)⁻¹ V via a Dyson solve; see docs/architecture/four_current_wiring.md."""
+            distrib_la_batched_route: str = "batch_reshard",
+            pref=None, axis=None):
+    """W(q) = (I − pref·V χ₀)⁻¹ V via a Dyson solve; see docs/architecture/four_current_wiring.md.
+
+    ISDF callers pass ``meta`` (the prefactor 2/(√N_k·n_spin·n_spinor) and the
+    centroid carrier).  A caller with no ISDF ``meta`` (the plane-wave response
+    sphere, ``gw.plane_wave_screening``) passes ``meta=None``, ``pref`` and
+    ``axis`` (the carrier ``PaddedAxis``) instead."""
     n_logical = _require_w_operand_geometry(
-        V_q, chi0_q, meta, mesh_xy, n_rmu_logical=n_rmu_logical)
+        V_q, chi0_q, meta, mesh_xy, n_rmu_logical=n_rmu_logical, axis=axis)
+    if meta is None and pref is None:
+        raise ValueError("solve_w: meta=None needs pref= (χ₀'s prefactor)")
     solve_fn, pref = _resolve_w_solve_fn(
         meta, mesh_xy, n_rmu=chi0_q.shape[1],
         n_rmu_logical=n_logical, dyson_solver=dyson_solver,
-        distrib_la_batched_route=distrib_la_batched_route)
+        distrib_la_batched_route=distrib_la_batched_route,
+        pref=pref, nq=None if meta is not None else int(V_q.shape[0]))
     with jax_profile.annotation("W_solve"):
         return solve_fn(V_q, chi0_q, pref)
 
@@ -3039,15 +3063,19 @@ def compute_chi0_direct_fractional(
 
 def precompile_solve_w(V_q, chi0_q, meta, mesh_xy, *, dyson_solver=None,
                        n_rmu_logical=None,
-                       distrib_la_batched_route: str = "batch_reshard"):
-    """AOT lower+compile of the W-solve jit; see docs/architecture/four_current_wiring.md."""
+                       distrib_la_batched_route: str = "batch_reshard",
+                       pref=None, axis=None):
+    """AOT lower+compile of the W-solve jit (``solve_w``'s arguments); see docs/architecture/four_current_wiring.md."""
     ensure_jax_compile_cache()
     n_logical = _require_w_operand_geometry(
-        V_q, chi0_q, meta, mesh_xy, n_rmu_logical=n_rmu_logical)
+        V_q, chi0_q, meta, mesh_xy, n_rmu_logical=n_rmu_logical, axis=axis)
+    if meta is None and pref is None:
+        raise ValueError("precompile_solve_w: meta=None needs pref= (χ₀'s prefactor)")
     solve_fn, pref = _resolve_w_solve_fn(
         meta, mesh_xy, n_rmu=chi0_q.shape[1],
         n_rmu_logical=n_logical, dyson_solver=dyson_solver,
-        distrib_la_batched_route=distrib_la_batched_route)
+        distrib_la_batched_route=distrib_la_batched_route,
+        pref=pref, nq=None if meta is not None else int(V_q.shape[0]))
     # The DISTRIBUTED plan is a plain function around chunked jits + one
     # FFI call, not a single jit, so there is nothing to lower here —
     # the first real call builds the BLACS descriptor and compiles its
