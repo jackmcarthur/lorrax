@@ -2436,3 +2436,41 @@ def vnl_velocity_matrix(psi_G, Z, dZ, E_super):
     """
     c, dc = projector_coefficients(psi_G, Z, dZ)
     return vnl_velocity_block_from_coefficients(c, dc, c, dc, E_super)
+
+
+def vnl_velocity_finite_difference(matrix_at, kpoint_crys, G_phys_crys, B,
+                                   *, h: float, h_rel: float, scheme: str):
+    """``+∂V_NL/∂K_cart`` ``(3, nb, nb)`` by central differences.
+
+    The numeric validation arm of the analytic ``dZ`` velocity (gated
+    against it by ``tests/test_vnl_velocity_fd_agreement.py``).
+    ``matrix_at(k_crys)`` returns ⟨m|V_NL(k)|n⟩; ``B`` is the Cartesian
+    reciprocal lattice, rows b_i.  The step is ``max(h, h_rel · max(median
+    |K|, 1))`` over the PHYSICAL G rows only: a pad row at G = 0 would drag
+    the median toward |k|.  ``scheme = "richardson"`` extrapolates the h and
+    h/2 differences, ``(4 D_{h/2} − D_h) / 3``.  The sign is the analytic
+    arm's: a literal derivative of ⟨m|V_NL(k)|n⟩, with no minus.
+    """
+    B = np.asarray(B, dtype=float)
+    Binv = np.linalg.inv(B)
+    k0 = np.asarray(kpoint_crys, dtype=float)
+    K_cart = (np.asarray(G_phys_crys, dtype=float) + k0[None, :]) @ B
+    K_med = (float(np.median(np.linalg.norm(K_cart, axis=1)))
+             if K_cart.size else 1.0)
+    h1 = max(float(h), float(h_rel) * max(K_med, 1.0))
+
+    def central(ic, step):
+        d = np.zeros((3,), dtype=float)
+        d[ic] = step
+        dk = d @ Binv
+        return (matrix_at(k0 + dk) - matrix_at(k0 - dk)) / (2.0 * step)
+
+    out = None
+    for ic in range(3):
+        D1 = central(ic, h1)
+        value = ((4.0 * central(ic, 0.5 * h1) - D1) / 3.0
+                 if scheme == "richardson" else D1)
+        if out is None:
+            out = np.zeros((3,) + tuple(np.shape(value)), dtype=np.complex128)
+        out[ic] = value
+    return out

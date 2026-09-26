@@ -717,7 +717,7 @@ _DRIVER_MAIN_STATEMENTS = {
     "bandstructure.htransform": (("main",), 126),
     "centroid.kmeans_cli": (("main",), 91),
     "gw.kin_ion_io": (("main",), 128),
-    "psp.get_dipole_mtxels": (("main",), 330),
+    "psp.get_dipole_mtxels": (("main",), 238),
 }
 
 
