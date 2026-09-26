@@ -228,7 +228,7 @@ def resolve_precond_route(route: str, bse_dim: int) -> str:
 # Passing ``None`` drops the term at TRACE time, so those routes compile a program
 # with no W contraction in it at all instead of multiplying by a zero tile.
 @partial(jax.jit, static_argnames=("nk", "sharding", "complex_out"))
-def _exact_diagonal_kernel(eps_c, eps_v, psi_c_X, psi_v_Y, W_q0, M_X, M_Y,
+def _exact_diagonal_kernel(eps_c, eps_v, psi_c_X, psi_v_Y, W_q0, M,
                            V_q0, *, nk, sharding, complex_out: bool = False):
     dE = eps_c.T[:, None, :] - eps_v.T[None, :, :]          # (c, v, k)
 
@@ -242,9 +242,9 @@ def _exact_diagonal_kernel(eps_c, eps_v, psi_c_X, psi_v_Y, W_q0, M_X, M_Y,
         Y = jnp.einsum('kcM,MN->kcN', a.astype(W_q0.dtype), W_q0)
         W_d_c = jnp.einsum('kcN,kvN->cvk', Y, b.astype(W_q0.dtype))
 
-    S = jnp.einsum('kcvM,MN->kcvN', M_X, V_q0)
+    S = jnp.einsum('kcvM,MN->kcvN', M, V_q0)
     # The matvec's scalar-singlet exchange weight (bse_preconditioner owns it).
-    V_x_c = jnp.einsum('kcvN,kcvN->cvk', S, jnp.conj(M_Y)) * exchange_spin_weight(
+    V_x_c = jnp.einsum('kcvN,kcvN->cvk', S, jnp.conj(M)) * exchange_spin_weight(
         psi_c_X.shape[2])
 
     if complex_out:
@@ -337,7 +337,7 @@ def exact_diagonal_memo_stats():
 
 
 def build_bse_exact_diagonal(
-    eps_c, eps_v, psi_c_X, psi_v_Y, W_q0, M_X, M_Y, V_q0, nk: int,
+    eps_c, eps_v, psi_c_X, psi_v_Y, W_q0, M, V_q0, nk: int,
     *, sharding=None, memo: bool = True, complex_out: bool = False,
 ):
     """``diag(H_BSE)[c, v, k]`` — assembled exactly, once per solve.
@@ -357,7 +357,7 @@ def build_bse_exact_diagonal(
     trial vector, so each term below is its own contraction read off the
     matvec (``bse_stack_matvec``):
 
-        V_x[c,v,k] = Σ_MN  M_X[k,c,v,M] · V_q0[M,N] · conj(M_Y[k,c,v,N])
+        V_x[c,v,k] = Σ_MN  M[k,c,v,M] · V_q0[M,N] · conj(M[k,c,v,N])
         W_d[c,v,k] = Σ_MN  a[k,c,M] · W_q0[M,N] · b[k,v,N]
             with a[k,c,M] = Σ_spinor |psi_c_X[k,c,·,M]|²
                  b[k,v,N] = Σ_spinor |psi_v_Y[k,v,·,N]|²
@@ -419,7 +419,7 @@ def build_bse_exact_diagonal(
     diag : (nc_pad, nv_pad, nk) — real by default, complex under
         ``complex_out``; same layout as ``ΔE`` either way.
     """
-    operands = (eps_c, eps_v, psi_c_X, psi_v_Y, W_q0, M_X, M_Y, V_q0)
+    operands = (eps_c, eps_v, psi_c_X, psi_v_Y, W_q0, M, V_q0)
     # An operand that is ``None`` (``W_q0`` under include_W=False) has no weak
     # reference, so the identity memo cannot express "the same arrays as last
     # time" for it.  Skip the memo outright rather than lean on _DiagMemo.put's

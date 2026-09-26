@@ -42,7 +42,7 @@ def _random_stack(nt, nc, nv, nk):
 
 
 def _place(data, mesh):
-    """Shard the fixture arrays + build W_R and the hoisted pair-amps M_X/M_Y."""
+    """Shard the fixture arrays + build W_R and the hoisted pair amplitude M."""
     from bse.bse_ring_comm import make_bse_shardings
     from bse.bse_preconditioner import compute_pair_amplitude
     sh = make_bse_shardings(mesh)
@@ -57,10 +57,8 @@ def _place(data, mesh):
         )
         out["W_R"] = jnp.fft.ifftn(out["W_q"], axes=(2, 3, 4), norm="ortho")
         # Hoisted V-term pair amplitudes (audit P3) — matvec args, not recomputed.
-        out["M_X"] = jax.lax.with_sharding_constraint(
-            compute_pair_amplitude(out["psi_c_X"], out["psi_v_X"]), sh.psi_x)
-        out["M_Y"] = jax.lax.with_sharding_constraint(
-            compute_pair_amplitude(out["psi_c_Y"], out["psi_v_Y"]), sh.psi_y)
+        out["M"] = jax.lax.with_sharding_constraint(
+            compute_pair_amplitude(out["psi_c_X"], out["psi_v_X"]), sh.M)
     return sh, out
 
 
@@ -89,7 +87,7 @@ def test_stack_matches_dense(bse_dense_state, kernel):
         HXs = np.asarray(stack_mv(
             Xs, arr["psi_c_X"], arr["psi_c_Y"], arr["psi_v_X"], arr["psi_v_Y"],
             data["eps_c"], data["eps_v"], arr["W_R"], arr["V_q0"],
-            arr["M_X"], arr["M_Y"]))
+            arr["M"]))
     for t in range(nt):
         got = HXs[t].reshape(-1)
         ref = Href @ np.asarray(X)[t].reshape(-1)
@@ -124,7 +122,7 @@ def test_stack_memory_flat_in_n_trials(bse_dense_state):
                 jnp.zeros((nt, nc, nv, nk), dtype=jnp.complex128), sh.X)
             rest = (arr["psi_c_X"], arr["psi_c_Y"], arr["psi_v_X"], arr["psi_v_Y"],
                     data["eps_c"], data["eps_v"], arr["W_R"], arr["V_q0"],
-                    arr["M_X"], arr["M_Y"])
+                    arr["M"])
             compiled = mv.lower(X, *rest).compile()
         return int(compiled.memory_analysis().temp_size_in_bytes)
 

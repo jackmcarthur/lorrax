@@ -665,10 +665,9 @@ def _interpolate_bse_data_to_grid(
 
     psi_v_X, psi_v_Y, psi_c_X, psi_c_Y, eps_v, eps_c = _split_pad(
         bundle.psi_rmu_Y, bundle.enk_full)
-    M_X = jax.lax.with_sharding_constraint(
-        compute_pair_amplitude(psi_c_X, psi_v_X), x4)
-    M_Y = jax.lax.with_sharding_constraint(
-        compute_pair_amplitude(psi_c_Y, psi_v_Y), y4)
+    M = jax.lax.with_sharding_constraint(
+        compute_pair_amplitude(psi_c_X, psi_v_X),
+        NamedSharding(mesh_xy, P(None, "x", "y", None)))
 
     # ── V_Q exchange q=0 tile on the fine grid ────────────────────────────
     # A Q=0 exciton's exchange kernel is DENSE in (k,k') through the ONE q=0
@@ -781,7 +780,7 @@ def _interpolate_bse_data_to_grid(
     out.update({
         "psi_c_X": psi_c_X, "psi_c_Y": psi_c_Y,
         "psi_v_X": psi_v_X, "psi_v_Y": psi_v_Y,
-        "M_X": M_X, "M_Y": M_Y,
+        "M": M,
         "eps_c": eps_c, "eps_v": eps_v,
         "W_q": W_q_fine, "V_q0": V_q0,
         "V_q_full": None,                       # finite-q resolvent not a fine use

@@ -107,9 +107,9 @@ def ensure_W_R(data: dict, include_W: bool, mesh_xy: Mesh) -> dict:
 
 
 def matvec_operands(data: dict) -> tuple:
-    """The 10 operand arrays the ring/stack matvec consumes after ``x``, in the
+    """The 9 operand arrays the ring/stack matvec consumes after ``x``, in the
     matvec's positional order ``(psi_c_X, psi_c_Y, psi_v_X, psi_v_Y, eps_c, eps_v,
-    W_R, V_q0, M_X, M_Y)``.
+    W_R, V_q0, M)``.
 
     Pulling these out of ``data`` and threading them as RUNTIME ARGUMENTS through
     the jitted solve (instead of closing over the ``data`` dict) is what lets ONE
@@ -120,12 +120,12 @@ def matvec_operands(data: dict) -> tuple:
     return (
         data["psi_c_X"], data["psi_c_Y"], data["psi_v_X"], data["psi_v_Y"],
         data["eps_c"], data["eps_v"], data["W_R"], data["V_q0"],
-        data["M_X"], data["M_Y"],  # M_X/M_Y: hoisted V-term pair-amps (audit P3)
+        data["M"],  # hoisted V-term pair amplitude (audit P3), transition layout
     )
 
 
 def ladder_matvec_operands(data: dict) -> tuple:
-    """The 14 operands of a ``ladder_rung_slots`` matvec: the ordinary 10 plus
+    """The 13 operands of a ``ladder_rung_slots`` matvec: the ordinary 9 plus
     the rung's four PHYSICAL (rolled, un-flipped) psi arrays.  Falls back to
     the density arrays when the payload carries no rung slots — that is a raw
     payload, where the density arrays ARE physical (the q=0 identity cells)."""
@@ -179,7 +179,7 @@ def build_preconditioner_diagonal_sharded(
     * **``include_W=False``**, the RPA density-response route, which now drops
       the direct contraction at trace time instead of adding a zero tile.
 
-    What it stops doing: rebuilding ``M_X`` / ``M_Y`` from ``psi`` locally.
+    What it stops doing: rebuilding ``M`` from ``psi`` locally.
     Audit P3 hoisted those onto the payload precisely so nothing would, and
     ``build_finite_q_data`` maintains them per q; the two forms are the same
     ``compute_pair_amplitude`` call, which is why the agreement above is at
@@ -189,11 +189,9 @@ def build_preconditioner_diagonal_sharded(
 
     # Hoisted pair amplitudes (audit P3).  The fallback is for payloads
     # assembled outside the loader; it is the same contraction the loader runs.
-    M_X = data.get("M_X")
-    M_Y = data.get("M_Y")
-    if M_X is None or M_Y is None:
-        M_X = compute_pair_amplitude(data["psi_c_X"], data["psi_v_X"])
-        M_Y = compute_pair_amplitude(data["psi_c_Y"], data["psi_v_Y"])
+    M = data.get("M")
+    if M is None:
+        M = compute_pair_amplitude(data["psi_c_X"], data["psi_v_X"])
 
     W_q0 = None
     if include_W:
@@ -214,7 +212,7 @@ def build_preconditioner_diagonal_sharded(
     tda_sharding = NamedSharding(mesh_xy, P("x", "y", None))
     diag_h = build_bse_exact_diagonal(
         data["eps_c"], data["eps_v"], data["psi_c_X"], data["psi_v_Y"],
-        W_q0, M_X, M_Y, data["V_q0"], nk,
+        W_q0, M, data["V_q0"], nk,
         sharding=tda_sharding, complex_out=True, memo=False,
     )
     if use_tda:
@@ -491,13 +489,13 @@ def _get_feast_runner(
       close over an array whose shards live on other processes ("Closing over
       jax.Array that spans non-addressable (non process local) devices is not
       allowed.  Please pass such arrays as arguments to the function"), and the
-      ten operands are mesh-sharded.  ``bse_feast --feast-ritz`` and
+      nine operands are mesh-sharded.  ``bse_feast --feast-ritz`` and
       ``bse_pseudopoles`` were therefore SINGLE-PROCESS ONLY: the census had to
       take its whole GMRES iteration-count measurement at P=1 for this reason.
       Passing the operands as arguments is the fix jax's own error message
       prescribes, and it makes the closure capture no ``jax.Array`` at all.
 
-    The cache key is UNCHANGED — ``id(matvec)`` plus the ids of the ten operand
+    The cache key is UNCHANGED — ``id(matvec)`` plus the ids of the nine operand
     arrays plus the scalar knobs — and so is the ``(matvec, operands, runner)``
     value that pins those ids so a later object cannot recycle them while the
     entry is live.  Keeping it means the wrapper handed back for one operand set
@@ -587,8 +585,7 @@ def _build_gmres_data_fp32(data: dict) -> dict:
         "psi_c_Y": _cast_with_sharding(data["psi_c_Y"], jnp.complex64),
         "psi_v_X": _cast_with_sharding(data["psi_v_X"], jnp.complex64),
         "psi_v_Y": _cast_with_sharding(data["psi_v_Y"], jnp.complex64),
-        "M_X": _cast_with_sharding(data["M_X"], jnp.complex64),  # hoisted V-term pair-amps (P3)
-        "M_Y": _cast_with_sharding(data["M_Y"], jnp.complex64),
+        "M": _cast_with_sharding(data["M"], jnp.complex64),  # hoisted V-term pair amplitude (P3)
         "eps_c": _cast_with_sharding(data["eps_c"], jnp.float32),
         "eps_v": _cast_with_sharding(data["eps_v"], jnp.float32),
         "V_q0": _cast_with_sharding(data["V_q0"], jnp.complex64),
@@ -637,7 +634,7 @@ def _rayleigh_ritz(
 
     args = (data["psi_c_X"], data["psi_c_Y"], data["psi_v_X"], data["psi_v_Y"],
             data["eps_c"], data["eps_v"], data["W_R"], data["V_q0"],
-            data["M_X"], data["M_Y"])  # hoisted V-term pair-amps (audit P3)
+            data["M"])  # hoisted V-term pair amplitude (audit P3)
     if use_tda:
         # TDA subspace application through the trial-stack matvec: the filtered
         # vectors are (1, nc, nv, nk), so concatenate on the leading axis into a
@@ -1084,8 +1081,7 @@ def estimate_spectral_bounds_sharded(
             eps_v,
             data_fp32["W_R"],
             data_fp32["V_q0"],
-            data_fp32["M_X"],  # hoisted V-term pair-amps (audit P3)
-            data_fp32["M_Y"],
+            data_fp32["M"],  # hoisted V-term pair amplitude (audit P3)
         )
 
         alpha = jnp.vdot(q, z).real

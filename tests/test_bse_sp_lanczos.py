@@ -278,13 +278,11 @@ def _pair_ctx(data):
         W_R = jnp.fft.ifftn(jnp.array(data["W_q"]), axes=(2, 3, 4), norm="ortho")
         W_R = jax.lax.with_sharding_constraint(W_R, sh.W)
         V_q0 = jax.lax.with_sharding_constraint(data["V_q0"], sh.V)
-        M_X = jax.lax.with_sharding_constraint(
-            compute_pair_amplitude(psi_c_X, psi_v_X), sh.psi_x)
-        M_Y = jax.lax.with_sharding_constraint(
-            compute_pair_amplitude(psi_c_Y, psi_v_Y), sh.psi_y)
+        M = jax.lax.with_sharding_constraint(
+            compute_pair_amplitude(psi_c_X, psi_v_X), sh.M)
     args = (psi_c_X, psi_c_Y, psi_v_X, psi_v_Y,
             jnp.asarray(data["eps_c"]), jnp.asarray(data["eps_v"]),
-            W_R, V_q0, M_X, M_Y)
+            W_R, V_q0, M)
     return mesh, sh, args
 
 

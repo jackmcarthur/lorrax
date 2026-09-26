@@ -298,7 +298,7 @@ def build_path_solver(mesh_xy: Mesh, nkx: int, nky: int, nkz: int,
     with ``solve_path.alpha_labels`` (filled at trace time) to run the gate on
     the host.  Nothing about the invariant changes — only where it is emitted.
 
-    The scan body per Q: hoist the exchange pair amplitudes M_X/M_Y from
+    The scan body per Q: hoist the exchange pair amplitude M from
     the Q-shifted conduction ψ (audit-P3 contract — matvec args, computed
     once per solve, reused across all Lanczos iterations), then run the
     fixed-iteration block Lanczos with the ONE production stack matvec.
@@ -340,17 +340,15 @@ def build_path_solver(mesh_xy: Mesh, nkx: int, nky: int, nkz: int,
             psi_c_X = lax.with_sharding_constraint(psi_c_X, sh.psi_x)
             psi_c_Y = lax.with_sharding_constraint(psi_c_Y, sh.psi_y)
             V = lax.with_sharding_constraint(V, sh.V)
-            M_X = lax.with_sharding_constraint(
-                compute_pair_amplitude(psi_c_X, psi_v_X), sh.psi_x)
-            M_Y = lax.with_sharding_constraint(
-                compute_pair_amplitude(psi_c_Y, psi_v_Y), sh.psi_y)
+            M = lax.with_sharding_constraint(
+                compute_pair_amplitude(psi_c_X, psi_v_X), sh.M)
 
             def matvec_block(Vb):
                 X = Vb.reshape(block_size, nc_pad, nv_pad, nk)
                 X = lax.with_sharding_constraint(X, sh.X)
                 extra = (D_head, M_head) if head_tensor else ()
                 HX = matvec(X, psi_c_X, psi_c_Y, psi_v_X, psi_v_Y,
-                            eps_c, eps_v, W_R, V, M_X, M_Y, *extra)
+                            eps_c, eps_v, W_R, V, M, *extra)
                 return HX
 
             # The α-Hermiticity report leaves the trace as DATA, not as a host
@@ -425,7 +423,7 @@ def build_head_dipole_operand(args, nk, nc_pad, nv_pad, n_val, n_cond,
     ``∂_q ζ̃`` the μ-basis route would have needed never appears
     (``LT_HEAD_PROBLEM.md`` §6).
 
-    Returned pre-conjugated and in ``M_X``'s ``(k, c, v, ·)`` layout, with a
+    Returned pre-conjugated and in ``M``'s ``(k, c, v, ·)`` layout, with a
     Cartesian axis of length 3 where μ was, so the matvec's head term reads
     exactly as its exchange term (``bse_stack_matvec``, ``head_tensor``).
     The ``(c, v)`` window and its padding match the loader's:

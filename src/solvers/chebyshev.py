@@ -83,7 +83,7 @@ def make_chebyshev_recurrence(
     # ``apply_h_tilde``.  Closing over a *callable* is legal.  The problem is
     # what the callable closes over: on the BSE path
     # (``bse.bse_kpm.make_bse_h_tilde``) it is itself jitted and captures the
-    # ten MESH-SHARDED operands ``psi_c_X … M_Y``.  Tracing inlines those, and
+    # nine MESH-SHARDED operands ``psi_c_X … M``.  Tracing inlines those, and
     # at P>1 jax refuses -- "Closing over jax.Array that spans non-addressable
     # devices" -- at TRACE time, before any of the P>1 ``device_get`` fixes
     # downstream can matter.  Same family as ``bse_feast._get_feast_runner``.

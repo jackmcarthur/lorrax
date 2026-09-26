@@ -147,10 +147,8 @@ def synthetic_payload(mesh, *, nkx, nky, nkz, nc, nv, nmu, ns, seed=7):
             "nkx": nkx, "nky": nky, "nkz": nkz,
             "n_cond_pad": nc, "n_val_pad": nv, "n_rmu": nmu,
         }
-        d["M_X"] = jax.lax.with_sharding_constraint(
-            compute_pair_amplitude(d["psi_c_X"], d["psi_v_X"]), sh.psi_x)
-        d["M_Y"] = jax.lax.with_sharding_constraint(
-            compute_pair_amplitude(d["psi_c_Y"], d["psi_v_Y"]), sh.psi_y)
+        d["M"] = jax.lax.with_sharding_constraint(
+            compute_pair_amplitude(d["psi_c_X"], d["psi_v_X"]), sh.M)
     return d
 
 

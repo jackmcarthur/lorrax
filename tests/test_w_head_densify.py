@@ -156,7 +156,7 @@ def test_the_loader_does_not_defer_when_the_grids_are_equal(tmp_path, monkeypatc
     d0 = load_bse_data_from_restart_sharded(restart, bse_k_grid=None, **kw)
     cg = (int(d0["nkx"]), int(d0["nky"]), int(d0["nkz"]))
     d1 = load_bse_data_from_restart_sharded(restart, bse_k_grid=cg, **kw)
-    for key in ("W_q", "V_q0", "psi_c_X", "psi_v_X", "eps_c", "eps_v", "M_X"):
+    for key in ("W_q", "V_q0", "psi_c_X", "psi_v_X", "eps_c", "eps_v", "M"):
         a = np.asarray(jax.device_get(d0[key]))
         b = np.asarray(jax.device_get(d1[key]))
         assert np.array_equal(a, b), f"{key} moved on the equal-grid path"

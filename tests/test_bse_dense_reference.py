@@ -160,14 +160,12 @@ def _sharded_matvec(data, X, include_W):
         Xs = jax.lax.with_sharding_constraint(X, sh.X)
         W_R = jnp.fft.ifftn(W_q, axes=(2, 3, 4), norm="ortho")
         # Hoisted V-term pair amplitudes (audit P3) — matvec args, not recomputed.
-        M_X = jax.lax.with_sharding_constraint(
-            compute_pair_amplitude(psi_c_X, psi_v_X), sh.psi_x)
-        M_Y = jax.lax.with_sharding_constraint(
-            compute_pair_amplitude(psi_c_Y, psi_v_Y), sh.psi_y)
+        M = jax.lax.with_sharding_constraint(
+            compute_pair_amplitude(psi_c_X, psi_v_X), sh.M)
         mv = build_bse_stack_matvec(mesh, nkx, nky, nkz,
                                     kernel="bse" if include_W else "rpa")
         HX = mv(Xs, psi_c_X, psi_c_Y, psi_v_X, psi_v_Y,
-                data["eps_c"], data["eps_v"], W_R, V_q0, M_X, M_Y)
+                data["eps_c"], data["eps_v"], W_R, V_q0, M)
         HX.block_until_ready()
     return HX
 
@@ -318,9 +316,8 @@ def _materialize_nontda_operator(data):
         Wqs = jax.lax.with_sharding_constraint(data["W_q"], sh.W)
         Vqs = jax.lax.with_sharding_constraint(data["V_q0"], sh.V)
         W_R = jnp.fft.ifftn(Wqs, axes=(2, 3, 4), norm="ortho")
-        M_X = jax.lax.with_sharding_constraint(compute_pair_amplitude(pcx, pvx), sh.psi_x)
-        M_Y = jax.lax.with_sharding_constraint(compute_pair_amplitude(pcy, pvy), sh.psi_y)
-        args = (pcx, pcy, pvx, pvy, data["eps_c"], data["eps_v"], W_R, Vqs, M_X, M_Y)
+        M = jax.lax.with_sharding_constraint(compute_pair_amplitude(pcx, pvx), sh.M)
+        args = (pcx, pcy, pvx, pvy, data["eps_c"], data["eps_v"], W_R, Vqs, M)
         mv = build_bse_ring_matvec_full(mesh, nkx, nky, nkz, include_W=True, screening=False)
         chunk = 8
         for part in (0, 1):
@@ -469,7 +466,7 @@ def test_nontda_dense_build_half_appliers_agree_with_the_full_matvec(bse_dense_s
 
 def _nontda_data_from_subset(data):
     """Build the ``solve_bse_nontda_sharded`` data contract (sharded ψ/ε/W/V +
-    hoisted M_X/M_Y + pad counts) from the ``bse_dense_state`` subset — no second
+    hoisted M + pad counts) from the ``bse_dense_state`` subset — no second
     restart load (1×1 mesh, so no band padding)."""
     from jax.sharding import Mesh
     from bse.bse_ring_comm import make_bse_shardings
@@ -500,10 +497,8 @@ def _nontda_data_from_subset(data):
             "nkx": int(data["nkx"]), "nky": int(data["nky"]), "nkz": int(data["nkz"]),
             "n_cond_pad": nc, "n_val_pad": nv,
         }
-        d["M_X"] = jax.lax.with_sharding_constraint(
-            compute_pair_amplitude(d["psi_c_X"], d["psi_v_X"]), sh.psi_x)
-        d["M_Y"] = jax.lax.with_sharding_constraint(
-            compute_pair_amplitude(d["psi_c_Y"], d["psi_v_Y"]), sh.psi_y)
+        d["M"] = jax.lax.with_sharding_constraint(
+            compute_pair_amplitude(d["psi_c_X"], d["psi_v_X"]), sh.M)
     return d, mesh
 
 

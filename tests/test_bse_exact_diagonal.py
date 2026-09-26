@@ -45,23 +45,22 @@ def _payload(seed=20260808, w_scale=1.0):
     psi_c_X = cx(NK, NC, 2, NMU)          # (k, c, spinor, mu)
     psi_v_Y = cx(NK, NV, 2, NMU)
     W_q0 = jnp.asarray(w_scale) * cx(NMU, NMU)
-    M_X = cx(NK, NC, NV, NMU)
-    M_Y = cx(NK, NC, NV, NMU)
+    M = cx(NK, NC, NV, NMU)
     V_q0 = cx(NMU, NMU)
-    return (eps_c, eps_v, psi_c_X, psi_v_Y, W_q0, M_X, M_Y, V_q0)
+    return (eps_c, eps_v, psi_c_X, psi_v_Y, W_q0, M, V_q0)
 
 
 def _reference_diagonal(ops, nk):
     """The same contraction written in numpy, independent of the jax code."""
-    eps_c, eps_v, psi_c_X, psi_v_Y, W_q0, M_X, M_Y, V_q0 = (
+    eps_c, eps_v, psi_c_X, psi_v_Y, W_q0, M, V_q0 = (
         np.asarray(o) for o in ops)
     dE = eps_c.T[:, None, :] - eps_v.T[None, :, :]
     a = np.sum(np.abs(psi_c_X) ** 2, axis=2)
     b = np.sum(np.abs(psi_v_Y) ** 2, axis=2)
     Y = np.einsum('kcM,MN->kcN', a.astype(W_q0.dtype), W_q0)
     W_d = np.real(np.einsum('kcN,kvN->cvk', Y, b.astype(W_q0.dtype)))
-    S = np.einsum('kcvM,MN->kcvN', M_X, V_q0)
-    V_x = np.real(np.einsum('kcvN,kcvN->cvk', S, np.conj(M_Y)))
+    S = np.einsum('kcvM,MN->kcvN', M, V_q0)
+    V_x = np.real(np.einsum('kcvN,kcvN->cvk', S, np.conj(M)))
     return dE + (V_x - W_d) / nk
 
 

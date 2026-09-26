@@ -100,7 +100,7 @@ def _fixture(mesh):
         "nkx": NK, "nky": 1, "nkz": 1,
         "psi_c_X": jnp.zeros(1), "psi_c_Y": jnp.zeros(1),
         "psi_v_X": jnp.zeros(1), "psi_v_Y": jnp.zeros(1),
-        "W_R": jnp.zeros(1), "M_X": jnp.zeros(1), "M_Y": jnp.zeros(1),
+        "W_R": jnp.zeros(1), "M": jnp.zeros(1),
         "n_rmu": NMU,
     }
 
@@ -159,7 +159,7 @@ def _eager_reference_chain(data, matvec, gen, sh, cols, chain_len,
         jnp.sqrt(jnp.clip(delta_E.real, 0.0, None)).astype(jnp.complex128), sh.X)
     args = (data["psi_c_X"], data["psi_c_Y"], data["psi_v_X"], data["psi_v_Y"],
             data["eps_c"], data["eps_v"], data["W_R"], data["V_q0"],
-            data["M_X"], data["M_Y"])
+            data["M"])
 
     def apply_S(U):
         _tick()
