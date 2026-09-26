@@ -100,27 +100,38 @@ pays each node once.
 ## 4. Product windows
 
 With a = f_e η (f_e = `sigma_window_edge_factor`, default 1.5),
-x = max(0, −min_A E_A) and Λ = max|ω| + a + x, each branch is partitioned into
-at most three Cartesian products:
+x = max(0, −min_A E_A), Λ_h = max_h|ω| + a + x over the branches of ω half h,
+and ν = a + x, each branch is partitioned into at most four Cartesian products
+(states × poles × |ω|); `gw.mpa.sigma_windows.sigma_pole_edges` owns Λ_h and ν:
 
-| branch | window | states | poles (Re Ω) |
-|---|---|---|---|
-| crossing | resonant | E ≤ Λ | (0, Λ] |
-| crossing | state tail | E > Λ | (0, Λ] |
-| crossing | pole tail | all | > Λ |
-| sign-definite | bulk | E > a | all |
-| sign-definite | resonant | E ≤ a | (0, Λ] |
-| sign-definite | pole tail | E ≤ a | > Λ |
+| branch | window | states | poles (Re Ω) | \|ω\| |
+|---|---|---|---|---|
+| crossing | resonant | E ≤ Λ_h | (0, Λ_h] | all |
+| crossing | state tail | E > Λ_h | (0, Λ_h] | all |
+| crossing | pole tail | all | > Λ_h | all |
+| sign-definite | bulk | E > a | all | all |
+| sign-definite | resonant | E ≤ a | (0, ν] | < ν |
+| sign-definite | pole tail | E ≤ a | > ν | < ν |
+| sign-definite | ω tail | E ≤ a | all | ≥ ν |
 
 - **Products**, because only a product set factors into G^w(τ) ⊙ W^w(τ). A
   selector coupling one state to one pole reinstates the state–pole sum.
-- **A partition**: each causal (state, pole, ω-sign) tuple has one owner, so
+  A window owns a subset of its branch's frequencies; the executor scatters
+  it by index.
+- **A partition**: each causal (state, pole, ω) tuple has one owner, so
   the error bound of §6 carries no window-count factor.
 - **These cuts** keep far states and far poles out of the crossing box, whose
   rule is linear in its width, and put them in sign-definite boxes, whose
   rules are logarithmic. On the sign-definite branch the states within a of
   zero (a small gap, an inverted band, a metal's Fermi surface) are split off
   so the bulk box stays sign-definite.
+- **The ω cut ν** of the sign-definite branch: there |d| = |ω| + E + Re Ω
+  with E ≥ −x, so above ν every denominator clears a and the ω tail is one
+  relative box. Below ν only the excursion sliver crosses zero, over a box of
+  size ~ν rather than ω_max + Ω_max (Na 8³ map 0: 1682 → 39 pairs; claim 2821).
+  A branch with no state within a of zero (an insulator) keeps one bulk window.
+- **One Λ per half**, because the SC cover grows the upper half only; a global
+  Λ put 7.9 Ry of poles into the lower half's crossing box on Na.
 
 Empty windows are dropped. Windows are never merged: a whole-branch rule
 widens cheap sign-definite tails into one expensive crossing box. On a metal
@@ -132,7 +143,7 @@ bands sit in both. A state on the wrong side of μ widens Λ through x.
 ## 5. Denominator boxes
 
 The real support of window w is the extent of the eight corners
-ω − σ_b(E + Re Ω), over the branch's extreme frequencies, the window's
+ω − σ_b(E + Re Ω), over the window's extreme frequencies, the window's
 extreme live states and its extreme live poles. The imaginary support is
 [γ_min + η, γ_max + η] with γ = −Im Ω. Pole extrema come from a distributed
 census that keeps, per pole and selector, the extrema over live entries only;
