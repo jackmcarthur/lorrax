@@ -319,6 +319,52 @@ def _write_sample(path, index, value, q_idx, meta, mesh_xy, n_z, *, name=_CHI):
     del value
 
 
+def _pin_static_head_sample(wc, z, fitted, *, rcond=1.0e-13):
+    r"""Refit the scalar head's residues with its static sample exact.
+
+    On shell the band-diagonal head is exactly
+    ``Sigma_nk(E_nk) = (1/2 - f_nk) W^c(0) / (Omega N_k)`` for any pole
+    model (``compute_complex_pole_head_sigma_diag`` at ``delta = 0``), so
+    ``W^c(0)`` alone carries the head's on-shell self-energy.  The guarded
+    fit's residue refit is an unweighted least squares over every sample and
+    can miss the static one: on Fe 4^3 with the metallic Drude head it missed
+    by 5.8 Ry bohr^3, a +/-7.7 meV on-shell error.  This keeps the fitted
+    poles and re-solves the residues as least squares subject to
+    ``W^c_fit(z_s) = W^c(z_s)`` at the sample nearest the origin (``z = 0``
+    on an insulator plan, the metal origin ``i varpi_0`` on a metal plan):
+    ``B = B_0 + N y`` with ``B_0`` the minimum-norm solution of the
+    constraint and ``N`` its null space.
+    """
+    wc = np.asarray(wc, dtype=np.complex128)
+    z = np.asarray(z, dtype=np.complex128)
+    omega = np.asarray(fitted["Omega_p"], dtype=np.complex128)
+    residues = np.asarray(fitted["B_p"], dtype=np.complex128)
+    matrix = 2.0 * omega[None, :] / (z[:, None] ** 2 - omega[None, :] ** 2)
+    s = int(np.argmin(np.abs(z)))
+    before = float(np.abs(matrix[s] @ residues - wc[s]))
+    row = matrix[s]
+    norm2 = float(np.real(np.vdot(row, row)))
+    if omega.size == 0 or norm2 == 0.0:
+        raise ValueError("scalar-head static pin: no fitted pole reaches the "
+                         "static sample")
+    base = np.conj(row) * wc[s] / norm2
+    _, _, vh = np.linalg.svd(row[None, :])
+    null = np.conj(vh[1:].T)
+    rest = np.delete(np.arange(z.size), s)
+    if null.shape[1]:
+        y, *_ = np.linalg.lstsq(matrix[rest] @ null,
+                                wc[rest] - matrix[rest] @ base, rcond=rcond)
+        residues = base + null @ y
+    else:
+        residues = base
+    out = dict(fitted)
+    out["B_p"] = residues
+    out["max_abs_residual"] = float(np.max(np.abs(matrix @ residues - wc)))
+    out["static_pin_z"] = complex(z[s])
+    out["static_pin_residual_before"] = before
+    return out
+
+
 def fit_head_samples(head_samples, z, n_p, *, model, solve,
                      occupation_state=None):
     """Fit scalar Wc_head in Ry through the canonical MPA scalar fitter.
@@ -348,6 +394,7 @@ def fit_head_samples(head_samples, z, n_p, *, model, solve,
         provenance = {"solve_mode": "exact_zero", "n_valid": int(n_p)}
     else:
         fitted = fit_driver.fit_scalar_samples(wc, z, n_p, solve=solve)
+        fitted = _pin_static_head_sample(wc, z, fitted)
         provenance = {
             "solve_mode": fitted["solve"],
             "solve_affine": fitted["affine"],
@@ -357,6 +404,9 @@ def fit_head_samples(head_samples, z, n_p, *, model, solve,
             "condition_max_allowed": 1.0 / fitted["rcond"],
             "backward_error_max_allowed": float(
                 np.sqrt(np.finfo(np.float64).eps)),
+            "static_pin_z": complex(fitted["static_pin_z"]),
+            "static_pin_residual_before": float(
+                fitted["static_pin_residual_before"]),
         }
     if (not all(np.all(np.isfinite(value)) for value in
                 (wc, z, fitted["Omega_p"], fitted["B_p"], fitted["condition"],
