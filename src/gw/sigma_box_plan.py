@@ -1153,19 +1153,18 @@ def _certified_entry(fit, padded_spec, spec, **extra):
 def _fit_fixed_sc_rules(
     specs, eta, *, eps, cache_dir, session, material_class=None,
 ):
-    """The SC window plan's rules: one-shot, re-plan once, hold, extend.
+    """The SC window plan's rules: plan at map 0, hold, extend on a crossing.
 
-    Owner 2026-09-25 (``scissor.SC_WINDOW_PAD_EV``): plan the windows once
-    with a pad, then hold them until a state is about to cross an edge.
+    Owner 2026-09-25 (``scissor.SC_WINDOW_PAD_EV``): plan the windows with a
+    generous pad, then hold them until a state is about to cross an edge.
 
     * Map 0 is served by the ordinary one-shot rules, so SC map 0 equals the
-      one-shot G0W0 bit for bit; nothing is frozen.
-    * Map 1 plans once: every window's box padded by the pad over the map-1
-      grid (:func:`_sc_padded_box_spec`), fit or served from the cache.
+      one-shot G0W0 bit for bit, and in the same balanced pass certifies the
+      first plan: every window padded per state edge by max(2 eV, 10%
+      |E - mu|) over the map-0 grid (:func:`_sc_padded_box_spec`).
     * Every later map holds. A window is refit only when its current box
-      leaves its rule's box, at the same pad, and the reason names the
-      state, pole extent or grid edge that crossed
-      (:func:`_escape_attribution`).
+      leaves its rule's box (a state, the pole extent or the grid edge
+      crossed; :func:`_escape_attribution` names it), at max(1 eV, 10%).
     * A metal<->insulator flip re-initializes the plan; a rule-validity
       failure during reuse (factored-log growth above the cap) refits that
       window.
@@ -1237,26 +1236,16 @@ def _fit_fixed_sc_rules(
             initialized=True)
 
     rules = session["rules"]
-    replan = int(session.get("plan_index", 0)) == 0
+    # From map 1 the rules are held: the first plan's margin absorbs the
+    # map-1 motion where it can (Na 8^3: the top state's +5 eV sits inside its
+    # 9.6 eV pad), and a window refits only when its current box leaves its
+    # rule. Re-padding every window at map 1 refit 8 of Na's 10 windows (the
+    # 10% far-state pad moves with the state), which is the fit the first plan
+    # exists to avoid. The sampled grid still re-plans at map 1.
     session["plan_index"] = 1
-    reasons_by_name, padded_by_name = {}, {}
+    reasons_by_name = {}
     for spec in rows:
         entry = rules.get(spec["name"])
-        if replan:
-            # THE MAP-1 RE-PLAN: every window at the later pad over this
-            # map's re-planned grid; a first-plan rule containing it serves.
-            padded_spec = _sc_padded_box_spec(spec, eta, plan_index=1)
-            padded_by_name[spec["name"]] = padded_spec
-            if entry is None:
-                reasons_by_name[spec["name"]] = "re-plan: absent from the first plan"
-                continue
-            reasons = _box_escape_reasons(entry["fit"]["rule_box"], padded_spec["box"])
-            if bool(entry["fit"]["relative"]) != (padded_spec["kind"] != "crossing"):
-                reasons.append("absolute/relative error currency changed")
-            if reasons:
-                reasons_by_name[spec["name"]] = "re-plan: " + "; ".join(reasons)
-            continue
-        # HOLD: a window is refit only when its current box leaves its rule.
         if entry is None:
             reasons_by_name[spec["name"]] = "escape: absent when the rules froze"
             continue
@@ -1269,11 +1258,10 @@ def _fit_fixed_sc_rules(
     fit_rows = []
     refit = [spec for spec in rows if spec["name"] in reasons_by_name]
     if refit:
-        padded = [padded_by_name.get(spec["name"])
-                  or _sc_padded_box_spec(spec, eta, plan_index=1) for spec in refit]
+        padded = [_sc_padded_box_spec(spec, eta, plan_index=1) for spec in refit]
         # Its own stage: a refit is host work between the W response and the
         # Sigma tau sweep, 2-27 s per CrI3 8x8 SC map (P2-S, 2026-09-25).
-        label = ("re-plan" if replan else "escaped")
+        label = "escaped"
         with timing.section("sigma.rule_refit", announce=True,
                             label=f"Sigma rule refit ({len(padded)} {label} windows)"):
             new_fits, fit_rows = fit_sigma_box_specs(
@@ -1320,11 +1308,9 @@ def _fit_fixed_sc_rules(
                 print(f"  [sc-fixed] iteration {iteration}: recomputed the "
                       f"rule for {name!r} ({reason})")
     return fits, fit_rows, receipt(
-        "frozen", fits, event=("re-plan" if replan else
-                               "extend" if reasons_by_name else "hold"),
+        "frozen", fits, event=("extend" if reasons_by_name else "hold"),
         rebuilt=(name for name in (spec["name"] for spec in rows) if name in recomputed),
-        reasons=recomputed.items(),
-        escaped=0 if replan else len(reasons_by_name))
+        reasons=recomputed.items(), escaped=len(reasons_by_name))
 
 
 def sigma_box_executor_nodes(

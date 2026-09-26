@@ -251,12 +251,11 @@ $\Sigma(E)$, not $\Sigma(0)$, for an active state outside the requested grid.
   crossing windows in 553 s. Poles are padded by 10 % at the near edges and
   widths, and 2× at the far edge of an unbounded selector (deep and bulk
   windows), because the highest shared-pole mode moves 10–30 % per map and a
-  sign-definite relative rule pays about one node for it. Map 1 re-plans
-  once: a rule whose box contains its window's box padded by
-  max(1 eV, 10 %) over the map-1 grid keeps serving, and the others are
-  refit at that pad. Later maps reuse a rule by containment
-  (`cache=hit:sc-fixed`). A window whose box leaves its rule, a new window,
-  or a sign change is refit alone at the later pad (`rebuild:sc-fixed`),
+  sign-definite relative rule pays about one node for it. From map 1 the
+  rules are held: a map reuses a rule by containment
+  (`cache=hit:sc-fixed`), and only the grid re-plans at map 1. A window
+  whose box leaves its rule, a new window, or a sign change is refit alone
+  at max(1 eV, 10 %) (`rebuild:sc-fixed`),
   and its reason names the state (k, band, $E - \mu$), the pole extent or
   the grid edge that crossed. The zero-side edge of a sign-definite box
   stops at 5 % of its distance to zero, so the box stays sign-definite. The

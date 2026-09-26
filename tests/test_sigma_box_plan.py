@@ -347,9 +347,9 @@ def test_sc_fixed_session_reuses_identical_nodes_without_refitting(monkeypatch):
     _, first_geometry = plan_sigma_windows(
         _summaries(), [_branch_at((0.1, 3.0))],
         np.asarray([0.2, 0.5]), 0.1, **args)
-    # Map 1: every later-pad box sits inside its first-plan rule; none refit.
+    # Map 1 holds: every box sits inside its first-plan rule; none refit.
     assert calls == []
-    assert first_geometry["sc_plan_event"] == "re-plan"
+    assert first_geometry["sc_plan_event"] == "hold"
     assert first_geometry["sc_fixed_rebuilds_this_iteration"] == 0
     frozen = _frozen_digests(session, first_geometry)
     calls.clear()
@@ -574,8 +574,8 @@ def test_sc_fixed_session_refits_only_on_material_class_flip(monkeypatch):
     assert flipped["sc_fixed_class_flip"] == "metal->insulator"
 
 
-def test_sc_map0_is_the_one_shot_plan_and_map1_plans_the_held_rules(monkeypatch, tmp_path):
-    """Map 0 serves the one-shot plan and holds nothing; map 1 plans; map 2 holds."""
+def test_sc_map0_is_the_one_shot_plan_and_certifies_the_held_rules(monkeypatch, tmp_path):
+    """Map 0 serves the one-shot plan and certifies the held rules; later maps hold."""
     calls = []
 
     def counted(box, eps, **kwargs):
@@ -600,7 +600,7 @@ def test_sc_map0_is_the_one_shot_plan_and_map1_plans_the_held_rules(monkeypatch,
     assert [g["sc_rule_mode"] for g in (first, second, third)] == [
         "one-shot", "frozen", "frozen"]
     assert [g["sc_plan_event"] for g in (first, second, third)] == [
-        "plan", "re-plan", "hold"]
+        "plan", "hold", "hold"]
     # Map 0 is the one-shot planner's plan (SC map 0 = one-shot G0W0).
     for left, right in zip(one_shot, map0):
         np.testing.assert_array_equal(left.window.nodes.t, right.window.nodes.t)
@@ -610,7 +610,7 @@ def test_sc_map0_is_the_one_shot_plan_and_map1_plans_the_held_rules(monkeypatch,
     assert not any(w["sc_fixed_rule"] or w["sc_fixed_padded_box_ry"] for w in windows)
     assert first["sc_fixed_initialized"] and built == 6
     assert first["sc_fixed_initial_window_tau_pairs"] == 6
-    # Map 1 re-plans at the later pad; each box is inside its first-plan rule.
+    # Map 1 holds: each current box is inside its first-plan rule.
     assert planned == 0 and second["sc_fixed_rebuilds_this_iteration"] == 0
     resonant = session["rules"]["positive conduction:resonant"]
     assert resonant["pad_ev"][0] == pytest.approx(2.0)          # max(2 eV, 10% of 1.4 eV)
