@@ -79,6 +79,9 @@ sigma_omega_min_ev = -10.0
 sigma_omega_max_ev = 10.0
 sigma_omega_step_ev = 0.5
 sigma_regularization_ev = 0.25
+# sigma_quadrature_eps = 3e-5: the same explicit value as gnppm_test.in, so the
+# one-shot == SC-iteration-1 gate compares one rule set.
+sigma_quadrature_eps = 3e-5
 memory_per_device_gb = 28
 sigma_freq_debug_output = false
 fermi_reference = midgap

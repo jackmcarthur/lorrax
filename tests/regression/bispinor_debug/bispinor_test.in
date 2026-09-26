@@ -96,6 +96,9 @@ sigma_omega_min_ev = -4.0
 sigma_omega_max_ev = 4.0
 sigma_omega_step_ev = 1.0
 sigma_regularization_ev = 0.25
+# sigma_quadrature_eps = 3e-5 (owner 2026-09-26): the production default, stated
+# explicitly so this frozen reference does not move with a later default change.
+sigma_quadrature_eps = 3e-5
 fermi_reference = midgap
 
 # sc_frozen_core_bands = 12 (owner 2026-09-25): Mo 4s/4p and S 3s, the SC fixture's
