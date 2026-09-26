@@ -18,7 +18,6 @@ def _mesh():
 
 
 def test_ppm_fit_is_handed_in_memory_to_the_mpa_route(monkeypatch):
-    from file_io import mpa_store
     from gw import ppm_sigma
     from gw.mpa import sigma as mpa_sigma
 
@@ -54,9 +53,6 @@ def test_ppm_fit_is_handed_in_memory_to_the_mpa_route(monkeypatch):
     omega_grid = np.asarray([-0.1, 0.2])
     captured = {}
 
-    def no_store(*_args, **_kwargs):
-        raise AssertionError("GN/HL Sigma must not write a pole store")
-
     def fake_mpa(wfns_arg, path, meta_arg, mesh_arg, **kwargs):
         captured["mpa"] = (wfns_arg, path, meta_arg, mesh_arg, kwargs)
         shape = (1, omega_grid.size, 1, 2, 2)
@@ -69,8 +65,6 @@ def test_ppm_fit_is_handed_in_memory_to_the_mpa_route(monkeypatch):
             sigma_c_kij=values,
             band_counts=plan.counts)
 
-    monkeypatch.setattr(
-        mpa_store, "write_complete_pole_store_collective", no_store)
     monkeypatch.setattr(
         mpa_sigma, "compute_sigma_c_mpa_omega_grid", fake_mpa)
 

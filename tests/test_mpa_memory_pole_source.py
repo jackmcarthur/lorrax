@@ -22,17 +22,7 @@ import file_io.slab_io as slab_io  # noqa: E402
 from file_io import mpa_store  # noqa: E402
 from file_io.restart_bundle import PoleReader  # noqa: E402
 from gw.mpa.sigma import MemoryPoleSource  # noqa: E402
-from tests._mpa_test_geometry import HostSlabIO  # noqa: E402
-
-
-class _PaddedReadSlabIO(HostSlabIO):
-    """HostSlabIO whose reads zero-fill past the dataset extent, as SlabIO's do."""
-
-    def read_slab(self, name, *, shape, offset, valid_shape=None, **kw):
-        return super().read_slab(
-            name, shape=shape, offset=offset,
-            valid_shape=self.file[name].shape if valid_shape is None else valid_shape,
-            **kw)
+from tests._mpa_test_geometry import HostSlabIO, put_fit_block  # noqa: E402
 
 
 @pytest.mark.mesh(4)
@@ -40,7 +30,7 @@ class _PaddedReadSlabIO(HostSlabIO):
 def test_memory_source_batches_equal_the_store_round_trip(monkeypatch, ordered):
     if len(jax.devices()) < 4:
         pytest.skip("needs 4 devices")
-    monkeypatch.setattr(slab_io, "SlabIO", _PaddedReadSlabIO)
+    monkeypatch.setattr(slab_io, "SlabIO", HostSlabIO)
     monkeypatch.setattr(collectives, "process_rank", lambda: 0)
     monkeypatch.setattr(collectives, "barrier", lambda _name: False)
     mesh = Mesh(np.array(jax.devices()[:4]).reshape(2, 2), ("x", "y"))
@@ -60,11 +50,20 @@ def test_memory_source_batches_equal_the_store_round_trip(monkeypatch, ordered):
     put = lambda x: None if x is None else jax.device_put(x, sharding)  # noqa: E731
 
     path = os.path.join(tempfile.mkdtemp(prefix="memory_poles_"), "fit.h5")
-    mpa_store.write_complete_pole_store_collective(
-        path, put(Omega), put(B), B_odd_p=put(D), mesh_xy=mesh,
-        n_mu_logical=n_mu, energy_unit="Ry",
-        provenance={"fit_protocol": "two_point_ppm", "screening_diagrams": "w_rpa"},
-        certification={"condition_max_allowed": 1.0, "backward_error_max_allowed": 1.0})
+    mpa_store.allocate_fit_store_collective(
+        path, mesh_xy=mesh, n_q=n_q, n_mu=n_mu, n_p=1, energy_unit="Ry",
+        ordered_residues=ordered,
+        provenance={"fit_protocol": "two_point_ppm", "screening_diagrams": "w_rpa"})
+    diag = {"condition": np.ones((n_mu, n_mu)),
+            "backward_error": np.zeros((n_mu, n_mu))}
+    for q in range(n_q):
+        logical = (slice(None), q, slice(0, n_mu), slice(0, n_mu))
+        put_fit_block(path, q, np.arange(n_mu), Omega[logical], B[logical],
+                      diag, mesh=mesh,
+                      B_odd=None if D is None else D[logical])
+    mpa_store.finalize_fit_store(
+        path, certification={"condition_max_allowed": 1.0,
+                             "backward_error_max_allowed": 1.0})
     with PoleReader(path, mesh_xy=mesh) as reader:
         want = reader.read(slice(0, 1), unfold=True, return_sharded=True,
                            to_unit="Ry", include_odd=True)

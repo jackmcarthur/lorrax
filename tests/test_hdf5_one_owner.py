@@ -11,7 +11,8 @@ guard that refuses the benign case would refuse the whole pipeline and a
 guard that allows the undefined case buys nothing.
 
 HOST-SIDE, REAL STORES.  Every gate below runs on an actual fit store
-built by ``allocate_fit_store``/``write_fit_block``/``finalize_fit_store``
+built by ``allocate_fit_store_collective``/``FitWriter``/
+``finalize_fit_store`` on a CPU mesh through the host ``SlabIO`` stand-in
 — the real input shape, reached through the real ``mpa_store`` entry
 points — with the FFI side of each scenario declared through the same
 ``note_open`` call ``SlabIO`` itself makes.  The phdf5 FFI is not
@@ -30,6 +31,7 @@ import pytest
 from file_io import hdf5_owner as HO
 from file_io import restart_bundle as _bundle_reader
 from file_io import mpa_store as MS
+from tests._mpa_test_geometry import cpu_mesh, host_slab_io, put_fit_block
 
 
 @pytest.fixture(autouse=True)
@@ -45,15 +47,19 @@ def fit_store():
     d = tempfile.mkdtemp(prefix="hdf5_owner_")
     path = os.path.join(d, "mpa_fit_sc_0000.h5")
     n_q, n_mu, n_p = 1, 4, 2
-    MS.allocate_fit_store(path, n_q=n_q, n_mu=n_mu, n_p=n_p,
-                          energy_unit="Ry")
     rng = np.random.default_rng(7)
     Om = (rng.normal(size=(n_p, n_mu, n_mu))
           - 1j * rng.uniform(0.01, 0.1, size=(n_p, n_mu, n_mu)))
     Bp = rng.normal(size=(n_p, n_mu, n_mu)) + 0j
     diag = {"condition": np.full((n_mu, n_mu), 2.0),
             "backward_error": np.full((n_mu, n_mu), 1e-14)}
-    MS.write_fit_block(path, 0, np.arange(n_mu), Om, Bp, diag)
+    with host_slab_io():
+        MS.allocate_fit_store_collective(
+            path, mesh_xy=cpu_mesh(), n_q=n_q, n_mu=n_mu, n_p=n_p,
+            energy_unit="Ry")
+        put_fit_block(path, 0, np.arange(n_mu), Om, Bp, diag,
+                      mesh=cpu_mesh())
+    HO.reset_for_test()
     MS.finalize_fit_store(
         path, certification={"condition_max_allowed": 1e6,
                              "backward_error_max_allowed": 1e-8})
@@ -402,14 +408,16 @@ def test_the_probe_names_the_unsafe_condition_when_it_holds(fit_store,
 # ---------------------------------------------------------------------------
 
 def test_the_pole_reader_needs_a_mesh_and_says_why():
-    """The host path stays :func:`read_poles`; the reader is the mesh one."""
+    """Pole reads are collective only; a mesh-less reader refuses."""
     with pytest.raises(ValueError, match="PoleReader requires mesh_xy"):
         _bundle_reader.open_pole_reader("ignored.h5", mesh_xy=None)
 
 
-def test_read_poles_still_reads_the_host_path_whole(fit_store):
-    """The one-shot door is unchanged for mesh-less callers."""
-    Om, Bp = _bundle_reader.read_poles(fit_store, pole_slice=slice(0, 1), to_unit="Ry")
-    assert Om.shape[0] == 1 and Bp.shape == Om.shape
-    with pytest.raises(IndexError, match="outside"):
-        _bundle_reader.read_poles(fit_store, pole_slice=slice(5, 9))
+def test_the_pole_reader_reads_one_range_and_refuses_outside(fit_store):
+    """One contiguous pole range per read; a range past n_p refuses."""
+    with host_slab_io(), _bundle_reader.open_pole_reader(
+            fit_store, mesh_xy=cpu_mesh()) as reader:
+        Om, Bp = reader.read(slice(0, 1), to_unit="Ry")
+        assert Om.shape[0] == 1 and Bp.shape == Om.shape
+        with pytest.raises(IndexError, match="outside"):
+            reader.read(slice(5, 9))
