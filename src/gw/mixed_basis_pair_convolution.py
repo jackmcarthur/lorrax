@@ -648,10 +648,11 @@ def plan_pair_convolution_chunks(*, n_ranks, n_k, spins, widths, width_out, n_q,
         return _C16 * (nk * j * gath + nk * j * nr * 4 * cd + nk * nr
                        + nk * j * cx * nr + 2 * nqm * j * cx * (nr + kbm + Mm))
 
-    def final(qc, nc, j):           # X's stacked q rows, then the larger of one q chunk (the
-        # all-to-all output, the phased box, its transform and gather) and X's relayout for the
-        # last all-to-all
-        chunk = _C16 * cx * (3 * qc * (Mo // Pn) * max(t_total(nc, j), nr)
+    def final(qc, nc, j):           # X's stacked q rows, then the larger of one q chunk and X's
+        # relayout for the last all-to-all.  One q chunk: the slice, the all-to-all output, the
+        # phased box, one more box-sized buffer outside XLA's compiled temp (the stage's measured
+        # peak exceeds its compiled buffers by one chunk), the transform and its gather.
+        chunk = _C16 * cx * (4 * qc * (Mo // Pn) * max(t_total(nc, j), nr)
                              + 2 * qc * (Mo // Pn) * (kbox_out + Mo))
         return x_out + max(chunk, x_out)
 
