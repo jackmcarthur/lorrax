@@ -1218,7 +1218,10 @@ class MixedBasisPairConvolution:
 
         def final(T, qf, ocell, c2p):
             def step(_, i):
-                Tq = jax.lax.dynamic_slice_in_dim(T, i * qc, qc, axis=0)
+                # the barrier keeps the all-to-all's relayout on this q chunk: without it XLA
+                # hoists the transpose out of the loop as one copy of the whole T (compiled temp
+                # 12.3 GB at Fe 8³ n_s=2 Σ, T 11.9 GB; compiled_memory() measures it)
+                Tq = jax.lax.optimization_barrier(jax.lax.dynamic_slice_in_dim(T, i * qc, qc, axis=0))
                 Tq = jax.lax.all_to_all(Tq, _XY, split_axis=1, concat_axis=4, tiled=True)
                 q_i = jax.lax.dynamic_slice_in_dim(qf, i * qc, qc, axis=0)
                 # the columns in box order: a slice, or the orbit-packed view's gather
