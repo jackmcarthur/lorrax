@@ -1059,8 +1059,8 @@ def uniform_rule_solver_identity():
     equal arguments return the same rule bit for bit when these fields are
     equal: the minimax sources (sha256 over every ``.py`` of the package),
     the numerics backend (:func:`minimax.cache.backend_tag`), the CPU model
-    (OpenBLAS dispatches its kernels by it), the pinned thread count and the
-    reduction backend selector. A persistent rule table keys on this dict,
+    (OpenBLAS dispatches its kernels by it) and the pinned thread count.
+    A persistent rule table keys on this dict,
     so an edited builder or another machine class opens a new namespace
     instead of being served another solver's rule.
     """
@@ -1086,8 +1086,7 @@ def uniform_rule_solver_identity():
             "minimax_sources": digest.hexdigest(), "backend": backend_tag(),
             "cpu": cpu, "blas_threads": _BLAS_THREADS,
         }
-    return dict(_STATIC_IDENTITY, reduction_backend=os.environ.get(
-        "LORRAX_UNIFORM_RULE_BACKEND", "numpy").strip().lower())
+    return dict(_STATIC_IDENTITY)
 
 
 def _build_uniform_rule(box, eps, *, im_cap=3.0, kappa_cap=1.0e4, trunc=10.0,
