@@ -25,7 +25,16 @@ processes, one GPU each:
   reference and against the dense-column plan at 1e-11, with red twins (the antiunitary
   conjugation or the lattice-wrap phase dropped) missing by > 1e-3.
 
-Run: ``lx run -N 1 -G 4 -n 4 python3 -u tests/multi_device/mixed_basis_pair_conv_p4.py [--wfn PATH]``.
+* Σ, the second caller (``product='scalar'``: A = G on the ψ sphere, B = W on the χ
+  sphere, the output on the ψ sphere), both backends: random operands (n_s = 1, 2, W rows
+  at the other representative of the ±½ planes, forced chunks); the glide group with G at
+  its parents and W at its q-IBZ (W's conj rule; red twin: W's antiunitary flag dropped);
+  the r'-wedge on covariant G and W (red twin: the output's spin sandwich dropped); with
+  ``--wfn`` Fe at n_s = 1 and 2 on the same checks, all 16 rows and the 8 unitary ones;
+* W's antiunitary rule at fixed τ on the TR-broken Fe group: χ₀(τ) of covariant Greens at
+  every full-grid q equals the conj-rule unfold of χ₀ at the parents (red twin: no conj).
+
+Run: ``lx run -N 1 -G 4 -n 4 python3 -u tests/multi_device/mixed_basis_pair_conv_p4.py [--wfn PATH] [--only sigma]``.
 Prints one ``[pairconv-p4] PASS``/``FAIL`` line per check and ``ALL PASS`` at the end.
 """
 from __future__ import annotations
@@ -104,14 +113,118 @@ def fe_case(mesh, wfn_path, ns_box=(6, 6, 6)):
                            metric=b @ b.T, box=ns_box)
 
 
+def _fe_box(c, w):
+    """The smallest box from 6³ up that keeps Σ (ψ ⊕ χ → ψ) and χ₀ alias-free on these spheres."""
+    from gw.mixed_basis_pair_convolution import SphereSet, alias_free_margin
+    sp = SphereSet(c["sph"], c["ngk"], c["kfrac"]).recentred().union_support()
+    ws = SphereSet(w["wsp"], w["wngk"], w["wfrac"]).recentred().union_support()
+    for n in range(6, 13):
+        if np.all(alias_free_margin((n,) * 3, sp, ws, sp) >= 1) and np.all(
+                alias_free_margin((n,) * 3, sp, sp, ws) >= 1):
+            return (n, n, n)
+    raise RuntimeError("no alias-free box up to 12^3")
+
+
+def sigma_checks(mesh, args):
+    """Σ = G ⊙ W, the second caller of the same plan (product='scalar')."""
+    import zeta_mubatch_fixtures as fixtures
+    from ffi.fft import kconv_backend  # noqa: F401  (route already checked)
+    from gw.mixed_basis_pair_convolution import SphereTransport
+    # ---- random operands, dense reference ---------------------------------
+    for ns in (1, 2):
+        c = t.sigma_random_case(ns)
+        ref = t._sigma_ref(c)
+        g_op, w_op = t._identity_ops(c)
+        for backend in ("router", "xla"):
+            for chunks in (None, (3, 4, 2, 1)):
+                conv = t._sigma_conv(mesh, c["kgrid"], c["fft_grid"], g_op, w_op, c["out"],
+                                     backend=backend, chunks=chunks, budget_bytes=int(1e10))
+                e = cases.rel(t._run_sigma(conv, c["G"], c["W"]), ref)
+                check(f"sigma random ns={ns} {backend} chunks={chunks}",
+                      e <= t.TOL and conv.backend == backend,
+                      f"rel {e:.2e} (n_c {conv.chunks.n_c}, J {conv.chunks.J}, kc {conv.chunks.kc}, "
+                      f"qc {conv.chunks.qc})")
+    # the red twin: without the time-reversed transport the plan forms A ⊙ conj B
+    c = t.sigma_random_case(2)
+    ref = t._sigma_ref(c)
+    g_op, w_op = t._identity_ops(c)
+    keep = SphereTransport.time_reversed
+    SphereTransport.time_reversed = lambda self, sphere: self
+    try:
+        conv = t._sigma_conv(mesh, c["kgrid"], c["fft_grid"], g_op, w_op, c["out"], backend="router",
+                             budget_bytes=int(1e10))
+        e = cases.rel(t._run_sigma(conv, c["G"], c["W"]), ref)
+    finally:
+        SphereTransport.time_reversed = keep
+    check("sigma red twin: no time reversal (router)", e > 1e-3, f"rel {e:.1e}")
+    census = conv.collective_census()
+    want = {"middle": {}, "final": {"all-to-all": 2}, "slab left": {"all-to-all": 1},
+            "slab right": {"all-to-all": 1}, "expand left": {"all-to-all": 1},
+            "expand right": {"all-to-all": 1}}
+    check("sigma collective census (router, compiled HLO)", census == want, str(census))
+
+    # ---- symmetry: G at the parents, W at the q-IBZ; the wedge on covariant operands ----
+    for backend in ("router", "xla"):
+        c, w = t.sigma_glide_case(mesh, covariant=False)
+        r = t._sigma_symmetry_check(mesh, c, w, backend, twins=("no_anti_W",))
+        check(f"sigma glide ns=2 parents {backend}",
+              r["anti"] and r["parent"] <= t.TOL and r["w_tile"] <= 1e-13 and r["red"]["no_anti_W"] > 1e-3,
+              f"parents vs dense ref {r['parent']:.2e}; W tile unfold {r['w_tile']:.1e}; red no_anti_W "
+              f"{r['red']['no_anti_W']:.1e}")
+        c, w = t.sigma_glide_case(mesh, covariant=True)
+        for rows in ((0, 1, 2, 3), (0, 3)):
+            r = t._sigma_symmetry_check(mesh, c, w, backend, wedge_rows=rows, twins=("no_spin",))
+            check(f"sigma wedge glide ns=2 rows {rows} {backend}",
+                  r["parent"] <= t.TOL and r["wedge_ref"] <= t.TOL and r["wedge_dense"] <= t.TOL
+                  and r["red"]["no_spin"] > 1e-3,
+                  f"wedge vs dense ref {r['wedge_ref']:.2e}, vs dense-column plan {r['wedge_dense']:.2e}; "
+                  f"{r['orbits']} orbits of {r['nr']}; red no_spin {r['red']['no_spin']:.1e}")
+    if not args.wfn:
+        return
+    for ns_fe in (1, 2):
+        fxf, bf = fe_fixture(mesh, args.wfn, ns=ns_fe)
+        metric = bf @ bf.T
+        e1 = float(np.min(np.einsum("ij,ij->i", bf, bf)))
+        c = t.covariant_case(fxf, ecut=1.05 * e1, metric=metric, box=(6, 6, 6), nb=2)
+        kf = c["kfrac"]
+        qsel = [0, 1, len(kf) - 1]
+        c["out"] = (*cases.spheres(kf[qsel], metric, 1.05 * e1), kf[qsel])
+        c["out_full"] = (*cases.spheres(kf, metric, 1.05 * e1), kf)
+        w = t.w_parents_and_children(c, ecut_w=0.8 * e1, metric=metric, covariant=True)
+        c["fft_grid"] = _fe_box(c, w)
+        rows = np.asarray(fxf["rows"])
+        n_sp = len(fxf["ops"])
+        cr = t.conj_rule_check(mesh, c, ecut_w=0.8 * e1, metric=metric, backend="router")
+        check(f"W conj rule at fixed tau, Fe ns={ns_fe} (TR-broken)",
+              cr["n_anti"] > 0 and cr["rule"] <= t.TOL and cr["red"] > 1e-3,
+              f"chi0 full grid vs conj-rule unfold {cr['rule']:.2e} over {cr['n_anti']} antiunitary "
+              f"children; red (no conj) {cr['red']:.1e}")
+        for backend in ("router", "xla"):
+            for name, rw in ((f"all {len(rows)} rows", rows), ("unitary rows", rows[rows < n_sp])):
+                twins = ("no_anti_W",) + (("no_spin",) if ns_fe > 1 else ())
+                r = t._sigma_symmetry_check(mesh, c, w, backend, wedge_rows=rw, twins=twins)
+                ok = (r["parent"] <= t.TOL and r["wedge_ref"] <= t.TOL and r["wedge_dense"] <= t.TOL
+                      and r["w_tile"] <= 1e-13 and all(v > 1e-3 for v in r["red"].values()))
+                check(f"sigma Fe ns={ns_fe} {name} {backend} box {c['fft_grid']}", ok,
+                      f"parents vs dense ref {r['parent']:.2e}; wedge vs ref {r['wedge_ref']:.2e}, vs "
+                      f"dense-column {r['wedge_dense']:.2e}; {r['orbits']} orbits of {r['nr']}; W tile "
+                      f"{r['w_tile']:.1e}; red {', '.join(f'{k} {v:.1e}' for k, v in r['red'].items())}; "
+                      f"leak {c['leak']:.1e}/{w['wleak']:.1e}")
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--wfn", default=None)
+    ap.add_argument("--only", choices=("all", "sigma"), default="all")
     args = ap.parse_args()
     from ffi.fft import kconv_backend
     from gw.mixed_basis_pair_convolution import SphereSet, SphereTransport
     mesh = Mesh(np.asarray(jax.devices()).reshape(2, 2), ("x", "y"))
     check("route", kconv_backend(mesh) == "mathdx", f"kconv_backend={kconv_backend(mesh)}")
+    if args.only == "sigma":
+        sigma_checks(mesh, args)
+        say("ALL PASS" if not FAILS else f"FAILED: {FAILS}")
+        return 0 if not FAILS else 1
 
     # ---- random operands, dense reference ---------------------------------
     for ns in (1, 2):
@@ -217,6 +330,7 @@ def main():
             "expand right": {"all-to-all": 1}}
     check("collective census (router, compiled HLO)", census == want, str(census))
 
+    sigma_checks(mesh, args)
     say("ALL PASS" if not FAILS else f"FAILED: {FAILS}")
     return 0 if not FAILS else 1
 
