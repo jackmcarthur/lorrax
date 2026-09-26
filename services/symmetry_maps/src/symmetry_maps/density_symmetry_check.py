@@ -692,7 +692,7 @@ _CACHE: dict[tuple, DensitySymmetryReport] = {}
 # ---------------------------------------------------------------------------
 
 def _stamp_dir():
-    from lxkit.cache import user_cache_dir
+    from lxkit import user_cache_dir
     return user_cache_dir("wfn_trs")
 
 
