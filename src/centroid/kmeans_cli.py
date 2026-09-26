@@ -57,11 +57,9 @@ def build_parser() -> argparse.ArgumentParser:
                         "the selector reports the resulting numerical rank. "
                         "Before 2026-07-29 the default was min(n_val, nbands - "
                         "n_val), which silently clamped the window to n_val.")
-    p.add_argument("--prune-window", choices=("v_x_c", "v_x_vc", "vc_x_vc"),
+    p.add_argument("--prune-window", choices=("v_x_vc", "vc_x_vc"),
                    default="v_x_vc",
                    help="Pivoted-Cholesky Gram band-window pair. "
-                        "'v_x_c' (legacy) = left (0, n_val), right (n_val, "
-                        "n_val+n_cond) — only val×cond pair densities. "
                         "'v_x_vc' (default) = left (0, n_val), right (0, "
                         "n_val+n_cond) — adds val×val (and val×cond), so "
                         "the centroids also span the |ψ_v|² and ψ_v*ψ_v' "
@@ -420,15 +418,8 @@ def _prune(args, wfn, sym, mesh, cand_idx, orbit_id, n_unique, N_c):
         verbose=(debug_print_enabled() and process_rank() == 0),
         progress_print_fn=rank0_print,
     )
-    if args.prune_window == "v_x_vc":
-        kwargs["band_range_left"] = left_range
-        kwargs["band_range_right"] = right_range
-    elif args.prune_window == "vc_x_vc":
-        kwargs["band_range_left"] = left_range
-        kwargs["band_range_right"] = right_range
-    else:
-        kwargs["n_val"] = n_val
-        kwargs["n_cond"] = n_cond
+    kwargs["band_range_left"] = left_range
+    kwargs["band_range_right"] = right_range
     print0(f"  prune window: left={left_range} right={right_range} "
            f"[{range_label}]; Gram="
            f"{'Σ_i Z_i Z_i† (i=1,2,3)' if args.density_mode == 'current' else 'charge'}")
