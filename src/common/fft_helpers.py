@@ -352,7 +352,7 @@ def make_sharded_fftn_3d(
 # FFI backend for the flat-k helpers — REQUIRED (decisions.md 2026-08-01)
 # ============================================================================
 # The service itself lives in ``src/ffi/fft.py`` (Python) + ``src/ffi/cpp/
-# mklfft`` and ``src/ffi/cpp/cufft`` (handlers).  THIS file used to carry a
+# fftw`` and ``src/ffi/cpp/cufft`` (handlers).  THIS file used to carry a
 # second, drifting copy of the gate and both bodies (delegated 2026-07-30),
 # and then a gated XLA twin of the flat-k transform (DELETED 2026-08-01
 # under the FFI-required ruling: where a certified FFI path exists, the
@@ -381,7 +381,7 @@ def make_sharded_fftn_3d(
 # no FFI route, which the ruling explicitly keeps.
 # ============================================================================
 
-from ffi.mklfft import (  # noqa: E402  (re-export: see the block above)
+from ffi.fft import (  # noqa: E402  (re-export: see the block above)
     GATE,
     fft_ffi_enabled,
 )
