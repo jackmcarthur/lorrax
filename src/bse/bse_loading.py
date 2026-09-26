@@ -208,9 +208,9 @@ def load_bse_data_from_restart_sharded(
     fine_grid = _resolve_bse_k_grid(bse_k_grid, input_file)
     densify_pending = (fine_grid is not None
                        and fine_grid != (nkx, nky, nkz))
-    w_head_mode = resolve_w_head_densify(
+    resolve_w_head_densify(                  # refuses a retired mode by name
         w_head_densify, _read_lorrax_input_quietly(input_file))
-    defer_whead = densify_pending and w_head_mode == "c1"
+    defer_whead = densify_pending
     head_channel = None
 
     if g0_X is not None and inject_head:
@@ -301,15 +301,6 @@ def load_bse_data_from_restart_sharded(
             raise ValueError(
                 "bse_k_grid densification needs input_file (cohsex.in) to run "
                 "the htransform ψ/ε and vq_interp V_Q interpolation.")
-        if w_head_mode == "legacy":
-            print("BSE-sharded: [WARN] w_head_densify = legacy — W's Γ head "
-                  "rides through the trigonometric interpolant as a Kronecker "
-                  "delta.  That is the documented defect (gw.head_densify): "
-                  "the interpolant of a delta is a Dirichlet kernel, so a "
-                  "fraction of the head's ~10^3 meV prefactor is deposited at "
-                  "fine q that should carry none of it, and the 1/q² rise "
-                  "inside the coarse Γ cell is missing entirely.  This arm "
-                  "exists to price the repair, not to be run for physics.")
         data = _interpolate_bse_data_to_grid(
             data, fine_grid, restart_file, input_file, mesh_xy,
             head_channel=head_channel,
