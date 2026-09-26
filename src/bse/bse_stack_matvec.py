@@ -76,8 +76,8 @@ now stands:
     and a fused identity that gates itself against nothing is not gated.
   * DONE — the ``krep`` matvec option and the bare-``shard_map`` sites are
     deleted, and the ``yhoist`` collective hoist is unconditional (``3a7704bb``,
-    ``8349b65c``, ``ac67fd3c``).  ``LORRAX_BSE_MATVEC_OPT`` survives because
-    ``gspmd`` remains — see the dial's own note below.
+    ``8349b65c``, ``ac67fd3c``).  ``LORRAX_BSE_MATVEC_OPT`` and its last
+    token, the ``gspmd`` audit route, went on 2026-09-25.
   * DONE 2026-09-24 — ``bse_simple``, ``bse_serial``, ``--matvec-kind`` and the
     TDA ``build_bse_ring_matvec`` are deleted.  Its three consumers (FEAST
     spectral bounds, KPM, pseudopoles) now use this builder, and the dense
@@ -123,8 +123,6 @@ applied ONCE, not twice: ``B`` has no ``D`` term.
 """
 from __future__ import annotations
 
-import os
-
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -134,7 +132,7 @@ from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 from common.shard_map import shard_map as _shard_map_fn
 
 from common.contract_bands import reduce_scatter_to_band_block
-from common.fft_helpers import make_kconv_kminor, make_local_kconv_kminor
+from common.fft_helpers import make_local_kconv_kminor
 from .bse_preconditioner import exchange_spin_weight
 from .bse_ring_comm import make_bse_shardings
 
@@ -165,19 +163,8 @@ def _scatter_trial_block(WX, mesh_xy):
 
 
 # ===========================================================================
-# LORRAX_BSE_MATVEC_OPT — the ONE dial for this kernel's two measured levers
+# The W term's collective schedule
 # ===========================================================================
-#
-# Grammar: a comma list of tokens from ``_MATVEC_OPTS``; empty/unset = none.
-# An UNKNOWN token REFUSES.  That refusal is the point: this project has
-# already shipped a flag (``LORRAX_FFT_FFI_FUSED``) whose consumer accepted
-# ``=yes`` and silently ignored ``=Y``, so a run could be labelled "optimised"
-# and be running the baseline.  A perf dial that can be misspelled into a
-# no-op makes every A/B built on it void.
-#
-#   [densek REMOVED 2026-07-31 — owner directive, no exceptions.  The ruling
-#           and the numbers behind it are stated once, at the site it governs:
-#           ``_conv_decode``'s "THIS IS AN FFT AND IT STAYS AN FFT".]
 #
 # The W term runs NO collective per trial (survey_C §C1, 2026-09-24).  The
 # trial block X (b, c, v, nk) -- the smallest tensor in the chain, with no ζ
@@ -194,56 +181,9 @@ def _scatter_trial_block(WX, mesh_xy):
 # the encode's flops.  (Was: the 'y' pair hoisted per block since
 # 2026-08-08, the 'x' pair per trial.)
 #
-#   gspmd   AUDIT ROUTE, default OFF.  Build the W term with NO ``shard_map``:
-#           the same einsum chain and the same ``lax.scan`` over trials, but
-#           expressed on GLOBAL arrays with ``with_sharding_constraint`` hints
-#           at each of the four points where the manual body issues a
-#           collective, letting XLA's SPMD partitioner choose the collective.
-#           Built for the 2026-08-08 shard_map audit to answer whether the
-#           manual all_gather/psum_scatter schedule is EARNED or HABIT.
-#           It is an A/B instrument, not a proposed default: it changes which
-#           collectives the program issues, so every claim about it must be
-#           backed by an HLO diff and a timing pair.  See SHARDMAP_AUDIT.md.
-#           NOTE the structural consequence: with no enclosing shard_map the
-#           W-term convolution goes through the router's sharded door
-#           ``make_kconv_kminor`` (which wraps its OWN shard_map) instead of
-#           the local door the manual body calls.
-#
 # The permanent hoist does not change the number of live
 # (nk, mu_loc, nu_loc, ns^2)-class intermediates, which stays at the one
 # ``T_b`` family documented below.
-# ``krep`` REMOVED 2026-08-08 (owner ruling, measured): it uniquely removed 3
-# in-loop collectives per block iteration that CGS2 does not, but they are a
-# 128 B and two 13 KB all-reduces -- ~1.35 ms against a ~2700 ms eigensolve,
-# 0.05%, and a 6-rep wall A/B could not see them in either direction inside a
-# 30% intra-arm spread (FEAST_KPM_PASS.md §1).  It was never honoured on the
-# shipped bs == 1 route, which is why it also carried an honesty banner and
-# eight gate cells -- maintenance surface for a lever worth 0.05%.
-# ``yhoist`` REMOVED 2026-08-08 -- not withdrawn, made PERMANENT.  It met the
-# owner's standing knob policy exactly (improves performance, no drawback,
-# arch-safe, so remove the knob and keep the winning behaviour): measured
-# 1.007x alone -- inside the 3.42% run-to-run spread the same job measured by
-# running its baseline cell twice -- at a cost of 16 KB/rank, with no scale
-# cliff and no numerics (the gate asserted BIT-identity, not a tolerance).
-# A lever that is free, harmless and too small to see is not a dial, it is a
-# default.  ENV_KNOB_CENSUS.md §6.3, FIX_smallwins.md §3.5.
-_MATVEC_OPTS = ("gspmd",)   # densek REMOVED 2026-07-31, owner directive
-
-
-def matvec_opts() -> frozenset[str]:
-    raw = os.environ.get("LORRAX_BSE_MATVEC_OPT", "").strip()
-    if not raw:
-        return frozenset()
-    toks = [t.strip().lower() for t in raw.split(",") if t.strip()]
-    bad = [t for t in toks if t not in _MATVEC_OPTS]
-    if bad:
-        raise ValueError(
-            f"LORRAX_BSE_MATVEC_OPT={raw!r}: unknown option(s) {bad}.  "
-            f"Valid tokens are {list(_MATVEC_OPTS)}, comma-separated; "
-            f"unset/empty selects none.  Refusing rather than silently "
-            f"running the baseline under an optimised label.")
-    return frozenset(toks)
-
 
 
 # ===========================================================================
@@ -384,8 +324,6 @@ def build_bse_stack_matvec(
 
     sh = make_bse_shardings(mesh_xy)
     nk = nkx * nky * nkz
-    opts = matvec_opts()
-    use_gspmd = "gspmd" in opts
     # The W-term k-convolution: the router's local k-minor door (inside the
     # shard_map below), one fused call per trial.
     kconv = make_local_kconv_kminor(mesh_xy, (nkx, nky, nkz), norm="ortho")
@@ -420,63 +358,6 @@ def build_bse_stack_matvec(
         _, WX = lax.scan(_body, None, _gather_trial_block(X), unroll=1)
         return _scatter_trial_block(WX, mesh_xy)
 
-    # ── W term, GSPMD twin: same math, same scan, NO shard_map ────────────────
-    # Audit route (``LORRAX_BSE_MATVEC_OPT=gspmd``).  Line-for-line the same
-    # chain as ``_w_stack`` above, but on GLOBAL arrays.  Each of the four
-    # ``with_sharding_constraint`` calls below sits at exactly the point where
-    # the manual body issues a collective, and requests the SAME data layout the
-    # manual collective produces -- so if the partitioner is any good it should
-    # emit the same four collectives.  Whether it does is the experiment.
-    #
-    #   pre-C1 manual schedule (per trial)        | gspmd hint
-    #   all_gather(X_b, 'y', axis=1)              | wsc(X_b,  P('x', None, None))
-    #   all_gather(R,   'x', axis=0)              | wsc(R,    P(None, None, None, 'y'))
-    #   psum_scatter(..., 'x', scatter_dim=0)     | wsc(A,    P('x', 'y', None, None))
-    #   psum_scatter(..., 'y', scatter_dim=1)     | wsc(WXcv, P('x', 'y', None))
-    #
-    # The manual body no longer issues these per trial (survey_C §C1); this
-    # twin still mirrors the 2026-08-08 schedule and stays an audit A/B of
-    # THAT plan.
-    #
-    # The convolution necessarily changes door: with no enclosing shard_map
-    # this route uses the router's sharded k-minor door (``make_kconv_kminor``),
-    # which wraps the identical local call in its own shard_map.  That
-    # shard_map is NOT nested here -- which is the structural point this route
-    # exists to demonstrate.
-    _ns = lambda spec: NamedSharding(mesh_xy, spec)
-    _g_conv = make_kconv_kminor(mesh_xy, (nkx, nky, nkz),
-                                P(None, "x", "y", None, None, None), P("x", "y", None),
-                                norm="ortho")
-
-    def _w_gspmd(X, psi_c_X, psi_v_Y, W_R):
-        # Global shapes: X (n_trials, c, v, nk); psi_c_X (nk, c, ns, μ);
-        # psi_v_Y (nk, v, ns, ν); W_R (μ, ν, kx, ky, kz).
-        sqrt_nk = jnp.sqrt(jnp.asarray(nk, dtype=X.real.dtype))
-
-        def _body(carry, X_b):                       # X_b: (c, v, nk) global
-            # 'y' gather: make v replicated so the ν-contraction below is local.
-            Xv = lax.with_sharding_constraint(X_b, _ns(P("x", None, None)))
-            R = jnp.einsum("kvsN,cvk->cksN", jnp.conj(psi_v_Y), Xv)
-            # 'x' gather: make c replicated so the μ-encode below is local.
-            R = lax.with_sharding_constraint(R, _ns(P(None, None, None, "y")))
-            T_b = jnp.einsum("kctM,cksN->MNtsk", psi_c_X, R)
-            T_b = lax.with_sharding_constraint(
-                T_b, _ns(P("x", "y", None, None, None)))
-            mu, nu, ns = T_b.shape[0], T_b.shape[1], T_b.shape[2]
-
-            U_b = _g_conv(T_b[None], W_R.reshape(mu, nu, nk))[0]
-
-            # μ-sum with c landing on 'x' -- the psum_scatter('x') ask.
-            A = jnp.einsum("kctM,MNtsk->cNsk", jnp.conj(psi_c_X), U_b)
-            A = lax.with_sharding_constraint(A, _ns(P("x", "y", None, None)))
-            # ν-sum with v landing on 'y' -- the psum_scatter('y') ask.
-            WXcv = jnp.einsum("kvsN,cNsk->cvk", psi_v_Y, A)
-            WXcv = lax.with_sharding_constraint(WXcv, _ns(P("x", "y", None)))
-            return carry, WXcv / sqrt_nk
-
-        _, WX = lax.scan(_body, None, X)
-        return lax.with_sharding_constraint(WX, sh.X)
-
     w_stack = _shard_map_fn(
         _w_stack,
         mesh=mesh_xy,
@@ -484,8 +365,6 @@ def build_bse_stack_matvec(
                   P(None, None, None, "y"), P("x", "y", None, None, None)),
         out_specs=P(None, "x", "y", None),
     )
-    if use_gspmd:
-        w_stack = _w_gspmd
 
     def _matvec(X, psi_c_X, psi_c_Y, psi_v_X, psi_v_Y, eps_c, eps_v, W_R, V_q0,
                 M_X, M_Y, D_head=None, M_head=None):
