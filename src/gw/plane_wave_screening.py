@@ -43,9 +43,12 @@ and the ``vcoul`` kernel's ``q0_average``, ``gw.mixed_basis_pair_convolution``
 local or distributed through ``distrib_la``), ``gw.head_correction``'s
 ``fold_small_head_wings_sharded``, and ``gw.mpa.pade_fit.fit_mpa_poles_batched``.
 
-Memory per rank, complex128: the χ/W samples 16·n_z·n_q·M²/P, the poles
-16·(2 or 3)·n_p·n_q·M²/P, and the Dyson workspace (local 16·5·⌈n_q/P⌉·M²,
-distributed 16·c·n_q·M²/P); M is the sphere carrier (``describe()`` prints it).
+Memory per rank, complex128, one stack = 16·n_q·M²/P (M the sphere carrier): the Dyson
+stage holds the χ and W samples (2·n_z stacks) and one sample's workspace (local
+16·5·M², distributed 16·4·n_q·M²/P); the fit stage holds the W^c samples and the poles
+(n_z + 3·n_p stacks) and the fit transient of ``fit_q_batch`` q rows (about 8.5 kB per
+element at n_p = 8, read from the compiled executable).  ``plan_q_chunks`` derives the
+wedge-q chunk count from the device budget; ``describe()`` prints the law.
 """
 from __future__ import annotations
 
@@ -335,6 +338,34 @@ class SphereScreening:
             budget_bytes = int(minimum_process_budget_gb(get_device_memory_gb()) * 1e9)
         n_loc = self.sphere.n
         return int(max(1, min(n_loc, (int(budget_bytes) // 2) // self._fit_temp[key])))
+
+    def plan_q_chunks(self, n_z: int, n_p: int, *, budget_bytes: int | None = None,
+                      ordered: bool = False) -> int:
+        """Wedge-q chunks for the caller's χ → W → poles pass: one when everything fits.
+
+        Per rank, for n_c wedge rows: the Dyson stage holds the χ and W samples
+        (2·n_z stacks) plus one sample's workspace, and the fit stage the W^c samples
+        and the poles (n_z + 3·n_p stacks) plus one q row's fit transient
+        (``fit_q_batch``'s compiled figure).  Past one chunk the caller reruns the χ τ
+        loop per chunk (the pair convolution's cost), so the remedy there is more ranks."""
+        if budget_bytes is None:
+            from common.gpu_utils import get_device_memory_gb, minimum_process_budget_gb
+            budget_bytes = int(minimum_process_budget_gb(get_device_memory_gb()) * 1e9)
+        self.fit_q_batch(n_p, ordered=ordered, budget_bytes=budget_bytes)
+        temp_q = self._fit_temp[(int(n_p), bool(ordered), 1.0e-13, "loewner")]
+        n_q, M, Pn = self.sphere.n, self.M, self.P
+        row = _C16 * M * M / Pn
+        work = (_C16 * 5 * M * M if self.linalg == "local" else _C16 * 4 * n_q * M * M / Pn)
+        for n_c in range(1, n_q + 1):
+            nq_c = -(-n_q // n_c)
+            need = max(2 * int(n_z) * row * nq_c + work,
+                       (int(n_z) + 3 * int(n_p)) * row * nq_c + temp_q)
+            if need <= budget_bytes:
+                return n_c
+        raise ValueError(
+            f"GATE pw-screening-budget: got a per-rank budget of {budget_bytes / 1e9:.2f} GB; "
+            f"want one wedge row's samples, poles and workspace to fit; why: the response "
+            f"sphere carrier M={M} at P={Pn}; fix: more ranks or a smaller screened_coulomb_cutoff")
 
     # ------------------------------------------------------------------ receipt
     def describe(self, n_z: int | None = None, n_p: int | None = None) -> str:
