@@ -2234,15 +2234,17 @@ def main(argv=None):
                              "band windows).  ``distributed`` is the portable "
                              "spelling and the ONLY one that exists on a host "
                              "mesh, where it means ScaLAPACK pzheevd.  "
-                             "OVERRIDES the input-file ``eigh_backend`` key "
-                             "(default: use the key, which defaults to auto).")
+                             "A debugging override of the backend the deck's "
+                             "``linalg`` dial resolves (default: the resolved "
+                             "backend).")
     parser.add_argument(
         "--distrib-la-batched-route", default=None,
         choices=distrib_la_batched_route_choices(),
-        help="OVERRIDES the input-file distrib_la_batched_route key for "
-             "every Plan.batched call in this driver. auto preserves the "
-             "backend's robust distributed route; batch_reshard moves q "
-             "onto the mesh and runs whole-matrix local JAX linalg.")
+        help="A debugging override of the batch schedule the deck's "
+             "``linalg`` dial resolves, for every Plan.batched call in this "
+             "driver. auto preserves the backend's robust distributed route; "
+             "batch_reshard moves q onto the mesh and runs whole-matrix local "
+             "JAX linalg.")
     args = parser.parse_args(argv)
     input_dir = os.path.dirname(os.path.abspath(args.input))
 

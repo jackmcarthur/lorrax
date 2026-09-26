@@ -649,9 +649,9 @@ def compute_ppm_sigma_pipeline(
         # The band-bracket plan is resolved HERE, once, before anything is
         # compiled: it fixes the kernel's G-build count, the AOT signature
         # and the Σ cube's leading extent, so it must be the same object all
-        # three see.  ``sigma_band_extrapolation = false`` (the default)
-        # gives the trivial one-bracket plan and the whole path below is
-        # bit-identical to the un-bracketed code.
+        # three see.  ``use_band_extrapolation = false`` gives the trivial
+        # one-bracket plan and the whole path below is bit-identical to the
+        # un-bracketed code.
         s = wfns.slices
         # THE CUTS ARE WITHIN THE Σ COUNT, NOT THE χ COUNT.  ``b_id_4_sigma``
         # / ``sigma_sum``, never ``b_id_4_user`` / ``full``: the latter pair
