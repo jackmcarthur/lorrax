@@ -645,7 +645,8 @@ def rho_from_wfns(psi_G, occ, kweights, *, mesh: Mesh, box_index,
                   charge_nspinor: int | None = None,
                   return_spin_density_matrix: bool = False,
                   per_k: bool = False,
-                  memory_budget_bytes: float | None = None, print_fn=None):
+                  memory_budget_bytes: float | None = None, print_fn=None,
+                  projection_receipt_fn=None):
     """ρ(r) = Σ_k w_k f_spin Σ_{n,s} f_nk |ψ̃_nks(r)|², scanned over k.
 
     Parameters
@@ -676,6 +677,11 @@ def rho_from_wfns(psi_G, occ, kweights, *, mesh: Mesh, box_index,
     print_fn : callable, optional
         Receives the plan receipt (route, rotated bands, k tile) once per
         compiled executable.
+    projection_receipt_fn : callable, optional
+        Receives the ``PolarFFTFieldProjection`` of the Dirac current (the
+        movement of the raw field and the covariance residual of the
+        projected one) when ``sym`` projects it.  The current is projected
+        here and nowhere else, so this is the receipt a caller reports.
 
     ``include_dirac_current=True`` requires four-component orbitals and
     returns ``(rho,Jx,Jy,Jz)`` from the SAME inverse FFT and the SAME signed
@@ -877,6 +883,8 @@ def rho_from_wfns(psi_G, occ, kweights, *, mesh: Mesh, box_index,
         from symmetry_maps import project_polar_fft_field
         projected = project_polar_fft_field(result[1:], sym)
         result = result.at[1:].set(projected.field)
+        if projection_receipt_fn is not None:
+            projection_receipt_fn(projected)
     return result
 
 

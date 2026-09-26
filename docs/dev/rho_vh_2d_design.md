@@ -11,7 +11,7 @@ conventions; this page owns the APIs and schedules.
 | spin fields | `psp.get_DFT_mtxels.spin_density_matrix_to_pauli_fields` | raw `rho_ab` → real `(rho,mx,my,mz)`; spatial/antiunitary action remains with `symmetry_maps` |
 | scalar/vector fields | `psp.get_DFT_mtxels.build_hartree_potential`, `psp.dft_operators.transverse_potential_from_current` | WFN FFT grid, run `sys_dim`; zero-mode and transverse-sign conventions come from the shared Coulomb service |
 | band matrix | `common.mtxel_sweep.sweep_matrix_elements` | `(nk,nb,nb)` complex Ry, `P(None,'x','y')`; scalar and vector actions share one sweep |
-| one-shot entry | `gw.kin_ion_io.compute_hartree_matrix` | streams fixed `(k,band)` chunks and returns charge plus optional transverse matrices |
+| one-shot entry | `gw.hartree.direct_field_matrices` | streams fixed `(k,band)` chunks and returns charge plus optional transverse matrices; the Dirac current is projected once, in `rho_from_wfns` |
 | self-consistent entry | `gw.sc_iteration.rebuild_hartree_dft_basis` | rebuilds from current orbitals and returns full-BZ matrices in the DFT basis |
 
 `kin_ion.h5` remains kinetic plus ionic. No driver may substitute another
