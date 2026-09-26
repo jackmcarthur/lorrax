@@ -1402,18 +1402,6 @@ belong to the consolidation pass, not to the audit that found them.
    FALSE FAILURE on any deck whose star begins on a time-reversed row.
    It is a gate, not production, so nothing physical is wrong today.
 
-2. **`tests/bench/charge_density.py:135` `_symmetrise_density` is a broken
-   duplicate** of `src/gw/qsgw_density.py:270` `symmetrise_density`.
-   Three defects against the canonical: (a) NO τ phase at all, so it is
-   silently wrong on every non-symmorphic deck; (b) it rotates G with
-   `sym.R_grid` (= `mtrx`) where the live convention is `sym_mats_k`
-   (= `mtrx.T`) — the transposed convention, which is the one the stale
-   `maps.py` comment corrected in this commit used to state; (c) it works
-   in G-space with an FFT round trip instead of the r-grid permutation.
-   Called unconditionally at `tests/bench/charge_density.py:130`.
-   `src/psp/scf_potential.py:19-20` already records it as known broken.
-   Fix is deletion in favour of the canonical, not repair.
-
 ### ~~`sc_on_ibz = true` HAS ROTTED~~ — FIXED 2026-08-15, and the default is now True
 
 **CLOSED.**  Kept because the shape of the failure is the reusable part.

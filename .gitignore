@@ -78,7 +78,6 @@ src/ffi/**/CMakeFiles/
 src/ffi/**/cmake_install.cmake
 site/
 .tier2_cross_p/
-.restart_q_storage_ab/
 .padprobe/
 # The HDF5 operation journal and its crash rings (file_io/h5_journal.py).
 # Per-rank run artifacts, written into the working directory — which is a
