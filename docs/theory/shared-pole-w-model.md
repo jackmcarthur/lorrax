@@ -275,6 +275,14 @@ variables. Under TRS the partner's factors are $\bar b$ and (W 16) reduces to
 | moments $M_0\ldots M_3$ | infinity rows of the pencil, (W 19), (W 26) |
 | passivity | (W 9), checked on the whitened model |
 
+The static value is measured, not guaranteed: the bank carries no $\omega=0$
+sample. On the CrI₃ SOC ferromagnet (8×8×1, $N_\mu=1446$, 10 IBZ $q$) the
+restart's $W_0=v+W_c(0)$ matches the GN-PPM Dyson $W(0)$ to $1.47\times10^{-5}$
+max-relative and $1.99\times10^{-5}$ Frobenius, and $W_c$ to $2.3\times10^{-5}$
+Frobenius ($4\times10^{-6}$ at Γ), with identical $v$ and heads; the BSE
+$E_1\ldots E_5$ on the two restarts agree within 0.07 meV (claim 2856,
+`runs/CrI3/504_w0persist_20260926`).
+
 ## 5 Construction: tangential interpolation as rational Gauss quadrature
 
 ### 5.1 Supports and directions
