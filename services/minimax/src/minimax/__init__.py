@@ -5,8 +5,7 @@ submodules. Importing the package loads no JAX or SciPy. Rule constructors
 load optional numerical libraries only when called.
 
 The target is part of every rule contract. ``serve`` computes the static,
-imaginary-probe, and regularized crossing screening rules in process;
-``lookup`` inspects historical certified assets without solving. Sigma's
+imaginary-probe, and regularized crossing screening rules in process. Sigma's
 complex denominator rectangles use ``build_uniform_rule``. The shared-pole W
 bank uses ``response_group_rules`` because it needs current-frequency value
 and derivative projections; the GN-PPM imaginary probe uses
@@ -25,45 +24,8 @@ See ``docs/services/minimax.md`` for units, error currencies and certificates.
 
 from __future__ import annotations
 
-from minimax._catalog import (
-    CatalogEntry,
-    catalog_view,
-    clear_caches,
-    load_catalog_dict,
-    load_table,
-    nearest_below,
-    payload_sha256,
-    parse_catalog,
-    parse_entry,
-    provenance_for,
-    select_entry,
-)
-#: The ``complex_laplace`` family's selection rule, as a NAMED MODULE and
-#: not as a handful of names on the door.  It is on the public surface —
-#: ``from minimax import beta_selector`` — because it is one family's rule
-#: and it carries its own small vocabulary: two clause constants, a
-#: selection record and a refusal record, each of which would collide with
-#: or blur a generic name here (``select`` beside ``select_entry``,
-#: ``load_catalog`` beside ``load_catalog_dict``, a second
-#: ``reset_announcements``).  A module is the honest shape for that, and
-#: it is not the door rule's "consumer reaches a submodule" violation:
-#: this IS the door for that family, and ``lookup(family=
-#: 'complex_laplace', ...)`` routes through it.  Importing it costs numpy
-#: and json, which the door already spends.
-#:
-#: ``damped_line_selector`` is here for the same reason and ``family_axes``
-#: because it is the DECLARATION both of them read -- which axis of which
-#: family rounds which way, in one place, so two doors cannot drift apart
-#: on it.  ``damped_line_selector`` has no production consumer yet (the fit
-#: stage still runs two sweeps where the catalog exists so it can run one);
-#: it is on the surface anyway, because a door nobody can reach is how a
-#: shipped catalog quietly becomes unreachable bytes.
-from minimax import beta_selector, damped_line_selector, family_axes
 from minimax.door import (
-    catalog,
     family_for_character,
-    lookup,
-    nearest_certified,
     noncrossing_kappa0,
     reset_announcements,
     serve,
@@ -71,19 +33,13 @@ from minimax.door import (
 )
 from minimax.records import (
     SOURCES,
-    CatalogView,
     Provenance,
     Quadrature,
     runtime_provenance,
 )
 from minimax.refusals import (
-    AmplificationCap,
-    CatalogCorrupt,
-    CatalogUnavailable,
     MinimaxRefusal,
-    NoCertifiedTable,
     SamplingUnsupported,
-    TableUnreadable,
     UncertifiedSolveRefused,
     UnknownTarget,
 )
@@ -96,29 +52,9 @@ from minimax.targets import (
     families_for_character,
 )
 
-#: The offline solver half, reached lazily.  These are the names
-#: ``common.minimax`` published before the extraction, and they are on the
-#: door — not behind ``minimax.solver`` — because they have real external
-#: consumers (the generator tool, the certification tier, the imag-table
-#: cells), and a consumer reaching a submodule is the door rule's first
-#: violation.  There is no compat shim at the old path: ``common.minimax``
-#: had exactly one production importer, it was repointed here in the same
-#: commit, and the phase's shim ratchet
-#: (``tests/test_service_path_bootstrap.py``) pins the old path gone.
-#:
-#: Lazy because :mod:`minimax.solver` is the service's ONLY scipy consumer.
-#: Serving a certified table must not import an optimiser, and this is how
-#: that stays true while keeping the names on the door.
-#:
-#: THE UNCALLED HALF IS GONE (owner sign-off, 2026-09-12).  This table used
-#: to carry the Remez solver, the binary-search crossing builder, the error
-#: models and the three rescalers because the extraction that moved them was
-#: not allowed to shrink the surface it moved.  Reachability was then
-#: recomputed by SYMBOL from the real consumers — door.py, the two generator
-#: tools, ``gw.minimax_screening`` and this service's tests — and 24
-#: functions, 530 of ``solver.py``'s 1061 lines, were reachable from none of
-#: them.  They are deleted, and these rows with them.  What remains is what
-#: the door actually calls.
+#: The solver half, reached lazily: the names the door itself calls.
+#: Lazy because :mod:`minimax.solver` is the service's ONLY scipy consumer,
+#: so ``import minimax`` never imports an optimiser.
 _SOLVER_NAMES = (
     # target functions
     "G_hgl", "G_fermi", "tau_max_hgl", "tau_max_fermi",
@@ -126,18 +62,6 @@ _SOLVER_NAMES = (
     "noncrossing_imag_grids", "crossing_grids",
     # the solvers under them
     "solve_noncrossing_imag", "solve_crossing",
-    # the imag evaluator: tests/test_minimax_imag_tables.py checks the
-    # shipped complex_laplace alpha.real against _imag_target through it
-    "evaluate_noncrossing_imag",
-    # Underscore-private BY HISTORY and on the door anyway, for the same
-    # reason `vcoul._minibz_kernel_bare` is: it has a real cross-package
-    # consumer.  `tests/test_minimax_imag_tables.py` asserts that the
-    # shipped complex_laplace payload's `alpha.real` fits THIS function --
-    # R4's "the imaginary-axis family and the complex-Laplace family are one
-    # campaign" claim, discharged against the production target rather than
-    # against a restatement of it.  A consumer reaching `minimax.solver` for
-    # it would be the door rule's first violation.
-    "_imag_target",
 )
 
 # Positive minimax fitting for complex-frequency resolvents, over the
@@ -150,17 +74,17 @@ _FREQUENCY_FIT_NAMES = (
 
 # Uniform denominator-box rules are a production service surface.  Keep the
 # numerical module lazy, like every other SciPy-backed builder below, so a
-# catalog-only import still pays no solver dependency.
+# bare import still pays no solver dependency.
 _UNIFORM_RULE_NAMES = (
     "UniformRule", "box_samples", "boundary_samples", "build_uniform_rule",
     "rule_roundoff_amplification", "rule_sup_error",
 )
 
 # Levelled (minimax-optimal) noncrossing rules: NumPy only, but lazy like
-# every builder so a catalog-only import pays nothing.
+# every builder so a bare import pays nothing.
 _LEVELLED_NAMES = ("noncrossing_levelled", "certify_noncrossing")
 
-# Experimental constructors remain lazy: catalog lookup stays NumPy-only.
+# Experimental constructors remain lazy: a bare import stays NumPy-only.
 _ANALYTIC_NAMES = ("positive_reciprocal", "odd_reciprocal",
                    "damped_line_reciprocal", "analytic_line_box_rule")
 _ODD_LAPLACE_NAMES = ("augment_odd_laplace",)
@@ -230,21 +154,13 @@ __all__ = [
     "TARGETS", "FAMILIES", "CHARACTERS", "TargetSpec", "FamilySpec",
     "families_for_character", "family_for_character",
     # --- what you get back -------------------------------------------------
-    "Quadrature", "Provenance", "CatalogView", "SOURCES",
-    "runtime_provenance",
-    # --- lookup, and only lookup -------------------------------------------
-    "beta_selector", "damped_line_selector", "family_axes",
-    "lookup", "nearest_certified", "catalog", "serve", "solve_uncertified",
-    "reset_announcements",
-    # --- the catalog algebra, for the certification tier and the census ----
-    "CatalogEntry", "catalog_view", "load_catalog_dict", "parse_catalog",
-    "parse_entry", "select_entry", "nearest_below", "clear_caches",
-    "load_table", "payload_sha256", "provenance_for",
+    "Quadrature", "Provenance", "SOURCES", "runtime_provenance",
+    # --- the door ----------------------------------------------------------
+    "serve", "solve_uncertified", "reset_announcements",
     "noncrossing_kappa0",
     # --- the refusals ------------------------------------------------------
-    "MinimaxRefusal", "NoCertifiedTable", "AmplificationCap", "UnknownTarget",
-    "CatalogUnavailable", "TableUnreadable", "CatalogCorrupt",
-    "UncertifiedSolveRefused", "SamplingUnsupported",
+    "MinimaxRefusal", "UnknownTarget", "UncertifiedSolveRefused",
+    "SamplingUnsupported",
     # --- complex-frequency resolvent fitting (lazy; scipy) -----------------
     *_FREQUENCY_FIT_NAMES,
     # --- uniform denominator-box rules (lazy; scipy) -----------------------
