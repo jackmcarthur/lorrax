@@ -142,7 +142,7 @@ def test_sc_window_plan_one_shot_then_plan_then_hold_then_extend():
     later maps hold while every read support [E - 0.5, E + 0.5] is inside,
     and a crossing extends only its edge, to E + 1 eV."""
     from gw.scissor import SC_WINDOW_PAD_EV, sc_read_halfwidth_ev
-    assert SC_WINDOW_PAD_EV == 1.0 and sc_read_halfwidth_ev() == 0.5
+    assert SC_WINDOW_PAD_EV == (2.0, 1.0) and sc_read_halfwidth_ev() == 0.5
     part = BandPartition(protected_mask=np.ones(3, bool), in_range_mask=np.ones(3, bool))
     session = {}
     inputs = _inputs("cover", 0, session, grid=np.arange(-12.0, 8.0 + 1e-9, 0.25))

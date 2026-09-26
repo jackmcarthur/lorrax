@@ -966,29 +966,27 @@ def _box_escape_reasons(outer, inner):
 _SC_FAR_POLE_FACTOR = 2.0
 
 
-def _sc_padded_box_spec(spec, eta, *, pad_ev):
+def _sc_padded_box_spec(spec, eta, *, plan_index):
     """Return the held SC certificate box for one product window.
 
     The SC window plan (``scissor.SC_WINDOW_PAD_EV``, owner 2026-09-25)
-    certifies each window over the current (planned) grid on:
+    certifies each window over the grid it is planned on:
 
-    * its live states padded by ``pad_ev`` on both sides, clipped to the
-      window's own selector interval;
+    * its live states, each edge padded by the pad of the state that sets
+      it, ``scissor.sc_window_pad_ev``: max(2 eV on the first plan and 1 eV
+      after, 10% of |E - mu|), clipped to the window's own selector interval;
     * its poles: near edges and widths by ten percent, the far edge of an
       unbounded selector by :data:`_SC_FAR_POLE_FACTOR`.
 
-    The grid is held between plans, so a map whose current box stays inside
-    keeps the rule; a map that leaves it is an escape, and only that window
-    is refit.
+    A map whose current box stays inside keeps the rule; a map that leaves it
+    is an escape, and only that window is refit (at the later pad).
 
-    Tempting, and why not: the per-state pad 0.5 eV + 10%|E - mu| of the SC
-    classification. It is a hysteresis, not a plan: the grid grew under every
-    drifting state and the certificate did not cover the grown frequencies,
-    so every growth refit the windows on its side (Fe 4^3 map 1: 5/12,
-    32 s). A flat pad costs short-side nodes on crossing windows (Si 101
-    map-0 boxes, flat +-2 eV: 167 + 161 nodes against 108 + 94 per state;
-    runs/runtime/sigma_quad_20260924/m3_planner), which is why it is 1 eV
-    and planned once, at map 1, around the map-1 energies.
+    Tempting, and why not: a flat pad on every state. QP corrections stretch
+    the spectrum by about 10%, so a flat 1 eV pad refit Na 8^3's two crossing
+    windows at map 1 (553 s; top state +96 -> +101 eV). And a flat pad on the
+    far edge alone costs short-side nodes (Si 101 map-0 boxes, flat +-2 eV:
+    167 + 161 nodes against 108 + 94 per state;
+    runs/runtime/sigma_quad_20260924/m3_planner).
     """
     a_lo, a_hi, gamma_lo, gamma_hi = spec["pole_extent"]
     frac = _SC_POLE_PAD_FRACTION
@@ -1005,11 +1003,11 @@ def _sc_padded_box_spec(spec, eta, *, pad_ev):
     # factor references, and use it only to size the frozen certificate.
     if "sc_support_pole_extent" in spec:
         padded_poles.append(tuple(spec["sc_support_pole_extent"]))
+    from gw.scissor import sc_window_pad_ev
     states = np.asarray(spec["states"], dtype=np.float64)
-    pad = float(pad_ev)
-    if not (np.isfinite(pad) and pad > 0.0):
-        raise ValueError(f"SC window pad must be positive; got {pad_ev!r} eV")
-    pad_ry = pad / RYD_TO_EV
+    low, high = float(np.min(states)), float(np.max(states))
+    pad_lo, pad_hi = (float(sc_window_pad_ev(value * RYD_TO_EV, plan_index)) / RYD_TO_EV
+                      for value in (low, high))
     # Membership is re-selected on every map: a state past the window's own
     # selector bound belongs to the neighbouring window, whose certificate
     # covers it. Padding across the bound only drags a sign-definite edge
@@ -1019,8 +1017,7 @@ def _sc_padded_box_spec(spec, eta, *, pad_ev):
     # refused on refit).
     state_lo, state_hi = spec.get("state_interval", (-np.inf, np.inf))
     padded_states = np.asarray(
-        [max(float(np.min(states)) - pad_ry, state_lo),
-         min(float(np.max(states)) + pad_ry, state_hi)])
+        [max(low - pad_lo, state_lo), min(high + pad_hi, state_hi)])
     frequencies = np.asarray(spec["frequencies"], dtype=np.float64)
     pole_box, _, _ = _box_for_window(
         frequencies, padded_states, padded_poles, spec["pole_sign"], eta)
@@ -1058,7 +1055,7 @@ def _sc_padded_box_spec(spec, eta, *, pad_ev):
         "sign_definite_positive" if box[0] > 0.0 else
         "sign_definite_negative" if box[1] < 0.0 else "crossing")
     padded["sc_unpadded_box"] = tuple(spec["box"])
-    padded["sc_state_pad_ev"] = (pad, pad)
+    padded["sc_state_pad_ev"] = (pad_lo * RYD_TO_EV, pad_hi * RYD_TO_EV)
     padded["sc_state_extent_ry"] = (float(np.min(states)), float(np.max(states)))
     padded["sc_certified_states_ry"] = tuple(float(v) for v in padded_states)
     padded["sc_certified_poles_ry"] = tuple(float(v) for v in padded_poles[0])
@@ -1144,7 +1141,7 @@ def _certified_entry(fit, padded_spec, spec, **extra):
         "fit": fit,
         "padded_box": tuple(padded_spec["box"]),
         "initial_box": tuple(spec["box"]),
-        "pad_ev": float(padded_spec["sc_state_pad_ev"][0]),
+        "pad_ev": tuple(float(v) for v in padded_spec["sc_state_pad_ev"]),
         "certified": {
             "states_ry": padded_spec["sc_certified_states_ry"],
             "poles_ry": padded_spec["sc_certified_poles_ry"],
@@ -1177,7 +1174,7 @@ def _fit_fixed_sc_rules(
     (``session["tau_capacity"]``, never lowered), so a refit recompiles them
     only if it raises it.
     """
-    from gw.scissor import SC_WINDOW_PAD_EV
+    from gw.scissor import SC_WINDOW_PAD_EV, SC_WINDOW_PAD_FRACTION
 
     rows = list(specs)
     iteration = int(session.get("call_count", 0)) + 1
@@ -1212,39 +1209,46 @@ def _fit_fixed_sc_rules(
             "material_class": session.get("material_class"),
             "class_flip": session.pop("class_flip", None),
             "plan_index": int(session.get("plan_index", 0)),
-            "pad_ev": float(SC_WINDOW_PAD_EV),
+            "pad_ev": tuple(float(v) for v in SC_WINDOW_PAD_EV),
+            "pad_fraction": float(SC_WINDOW_PAD_FRACTION),
             "tau_capacity": int(session["tau_capacity"]),
         }
 
     if "rules" not in session:
-        # MAP 0 (or the map of a class flip): the one-shot rules only, so SC
-        # map 0 is the one-shot G0W0 bit for bit.  Nothing is frozen here:
-        # states move 3-6.5 eV between maps 0 and 1 (Fe 4^3 top conduction
-        # +18.8 -> +25 eV; CrI3 8x8 escaped 9/9 padded windows), so a map-0
-        # certificate would be refit at map 1 anyway.
+        # MAP 0 (or the map of a class flip): served by the one-shot rules, so
+        # SC map 0 is the one-shot G0W0 bit for bit; in the same balanced
+        # pass the first plan's held set is certified at the first pad.
         session["eta_ry"] = float(eta)
         session["eps"] = float(eps)
         session["plan_index"] = 0
-        session["rules"] = {}
-        served, fit_rows = fit_sigma_box_specs(
-            rows, eta, eps=eps, cache_dir=cache_dir)
-        return served, fit_rows, receipt(
-            "one-shot", served, event="plan", initialized=True)
+        padded = [_sc_padded_box_spec(spec, eta, plan_index=0) for spec in rows]
+        (served, fit_rows), (fits, padded_rows) = fit_sigma_box_spec_groups(
+            [(rows, True), (padded, False)], eta, eps=eps, cache_dir=cache_dir)
+        session["rules"] = {
+            spec["name"]: _certified_entry(
+                dict(fit, cache_status=f"init:{fit['cache_status']}"), padded_spec, spec)
+            for spec, padded_spec, fit in zip(rows, padded, fits)}
+        session["initial_window_tau_pairs"] = int(sum(
+            fit["node_count"] for fit in fits))
+        # The executables serve the one-shot rules on this map and the
+        # held ones afterwards: size the node capacity for both.
+        return served, list(fit_rows) + list(padded_rows), receipt(
+            "one-shot", list(served) + list(fits), event="plan",
+            initialized=True)
 
     rules = session["rules"]
     replan = int(session.get("plan_index", 0)) == 0
     session["plan_index"] = 1
-    pad = SC_WINDOW_PAD_EV
     reasons_by_name, padded_by_name = {}, {}
     for spec in rows:
         entry = rules.get(spec["name"])
         if replan:
-            # THE MAP-1 PLAN: every window at the pad over this map's
-            # re-planned grid (a rule already held that contains it serves).
-            padded_spec = _sc_padded_box_spec(spec, eta, pad_ev=pad)
+            # THE MAP-1 RE-PLAN: every window at the later pad over this
+            # map's re-planned grid; a first-plan rule containing it serves.
+            padded_spec = _sc_padded_box_spec(spec, eta, plan_index=1)
             padded_by_name[spec["name"]] = padded_spec
             if entry is None:
-                reasons_by_name[spec["name"]] = "re-plan: planned at map 1"
+                reasons_by_name[spec["name"]] = "re-plan: absent from the first plan"
                 continue
             reasons = _box_escape_reasons(entry["fit"]["rule_box"], padded_spec["box"])
             if bool(entry["fit"]["relative"]) != (padded_spec["kind"] != "crossing"):
@@ -1266,7 +1270,7 @@ def _fit_fixed_sc_rules(
     refit = [spec for spec in rows if spec["name"] in reasons_by_name]
     if refit:
         padded = [padded_by_name.get(spec["name"])
-                  or _sc_padded_box_spec(spec, eta, pad_ev=pad) for spec in refit]
+                  or _sc_padded_box_spec(spec, eta, plan_index=1) for spec in refit]
         # Its own stage: a refit is host work between the W response and the
         # Sigma tau sweep, 2-27 s per CrI3 8x8 SC map (P2-S, 2026-09-25).
         label = ("re-plan" if replan else "escaped")
@@ -1280,9 +1284,6 @@ def _fit_fixed_sc_rules(
                 dict(fit, cache_status=f"rebuild:sc-fixed:{fit['cache_status']}"),
                 padded_spec, spec, rebuilt_at_iteration=iteration,
                 rebuild_reason=reasons_by_name[spec["name"]])
-    if replan:
-        session["initial_window_tau_pairs"] = int(sum(
-            rules[spec["name"]]["fit"]["node_count"] for spec in rows))
     # A product window may temporarily have no live state/pole tuples.  Keep
     # its frozen receipt in ``rules`` and simply omit its zero
     # contribution from this map; if it reappears, the containment check
@@ -1297,7 +1298,7 @@ def _fit_fixed_sc_rules(
         try:
             fits.append(_fixed_fit_for_spec(entry, spec))
         except _RuleValidityFailure as exc:
-            padded_spec = _sc_padded_box_spec(spec, eta, pad_ev=pad)
+            padded_spec = _sc_padded_box_spec(spec, eta, plan_index=1)
             with timing.section("sigma.rule_refit", announce=True,
                                 label="Sigma rule refit (validity)"):
                 new_fits, new_rows = fit_sigma_box_specs(
@@ -1680,7 +1681,9 @@ def plan_sigma_windows(
             "sc_fixed_recompute_reasons": dict(
                 fixed_receipt.get("recompute_reasons", ())),
             "sc_fixed_class_flip": fixed_receipt.get("class_flip"),
-            "sc_state_edge_padding_ev": float(fixed_receipt["pad_ev"]),
+            "sc_state_edge_padding_ev": fixed_receipt["pad_ev"][min(
+                int(fixed_receipt["plan_index"]), len(fixed_receipt["pad_ev"]) - 1)],
+            "sc_state_edge_padding_fraction": fixed_receipt["pad_fraction"],
             "sc_plan_event": fixed_receipt["plan_event"],
             "sc_tau_capacity": int(fixed_receipt["tau_capacity"]),
             "sc_pole_extent_padding_fraction": _SC_POLE_PAD_FRACTION,

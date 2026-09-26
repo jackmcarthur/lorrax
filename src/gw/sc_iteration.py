@@ -2848,7 +2848,7 @@ def _sc_sampled_support(inputs, partition, energies_loop, mu_ev, active_n=None):
     * ``plan`` (map 0): the one-shot grid, grown by the one-shot rule, so SC
       map 0 is the one-shot calculation;
     * ``re-plan`` (map 1, once): the requested grid grown to cover every
-      required state +/- the pad (1 eV); it may shrink;
+      required state +/- the later pad (1 eV); it may shrink;
     * ``hold`` (later maps): unchanged while every required state's read
       support [E - dE, E + dE] (``scissor.sc_read_halfwidth_ev``) lies inside;
     * ``extend``: otherwise only the crossed edge grows, to E +/- 1 eV.
@@ -2859,6 +2859,7 @@ def _sc_sampled_support(inputs, partition, energies_loop, mu_ev, active_n=None):
     if not inputs.config.compute_mode.is_dynamic:
         return None
     from .scissor import SC_WINDOW_PAD_EV, grow_sigma_support_ev, sc_read_halfwidth_ev
+    grid_pad = SC_WINDOW_PAD_EV[-1]
 
     session = inputs.fixed_quadrature_session
     requested = np.asarray(inputs.config.omega_grid_ev, dtype=np.float64)
@@ -2883,14 +2884,14 @@ def _sc_sampled_support(inputs, partition, energies_loop, mu_ev, active_n=None):
             requested, energy_relative_ev, required_kn, active_n)
     elif int(plan["index"]) == 0:
         event = "re-plan"
-        pad = SC_WINDOW_PAD_EV
+        pad = grid_pad
         expanded_grid, required_kn = grow(
             requested, energy_relative_ev, required_kn, active_n,
             pad_ev=pad, trigger_ev=pad)
     else:
         expanded_grid, required_kn = grow(
             sampled_grid, energy_relative_ev, required_kn, active_n,
-            pad_ev=SC_WINDOW_PAD_EV, trigger_ev=sc_read_halfwidth_ev())
+            pad_ev=grid_pad, trigger_ev=sc_read_halfwidth_ev())
         event = "hold" if expanded_grid.size == sampled_grid.size else "extend"
     return sampled_grid, expanded_grid, energy_relative_ev, required_kn, event
 
@@ -2933,7 +2934,7 @@ def _record_sc_window_plan(inputs, iteration, event, sampled_grid, grown_grid,
     half = sc_read_halfwidth_ev()
     if event == "re-plan":
         _record_sc(inputs, f"SC window re-plan (map {iteration}, pad "
-                   f"{SC_WINDOW_PAD_EV:.2f} eV): grid {grids}; lowest "
+                   f"{SC_WINDOW_PAD_EV[-1]:.2f} eV): grid {grids}; lowest "
                    f"{state(*lo_kn)}, highest {state(*hi_kn)}")
         return
     if event == "hold":
@@ -2950,7 +2951,7 @@ def _record_sc_window_plan(inputs, iteration, event, sampled_grid, grown_grid,
         side = "upper" if e[k, n] + half > sampled_grid[-1] else "lower"
         _record_sc(inputs, f"SC window extension (map {iteration}): {state(k, n)}; "
                    f"read support [{e[k, n] - half:+.6f}, {e[k, n] + half:+.6f}] eV "
-                   f"crosses the {side} edge; pad {SC_WINDOW_PAD_EV:.2f} eV; grid {grids}")
+                   f"crosses the {side} edge; pad {SC_WINDOW_PAD_EV[-1]:.2f} eV; grid {grids}")
 
 
 def _sc_active_identities(inputs):
