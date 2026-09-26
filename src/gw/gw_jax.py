@@ -110,7 +110,7 @@ from .compute_vcoul import build_bgw_v_grid_fn
 from .minimax_screening import build_static_quadrature
 from . import quadrature_log
 from .screening import (
-	compute_screening_model, driver_persists_w0, screening_requests_for)
+	compute_screening_model, driver_persists_w0, restart_static_w, screening_requests_for)
 from .sigma_dispatch import (
 	SIGMA_KSET_FULL_BZ, SIGMA_KSET_STAR_WEDGE, compute_sigma_xc,
 	sigma_result_on_kset, validate_band_extrapolation)
@@ -809,17 +809,24 @@ def _install_oneshot_head(
 
 def _persist_screening(
         V_q, W_by_role, centroid_indices, config, head_resolver, mesh_xy, meta, mode,
-        print0, qp_solver, sym, tensors_filename, photon_response=None):
+        print0, qp_solver, sym, tensors_filename, photon_response=None,
+        material_class=None):
     """Persist the screened static body and head on the canonical q set."""
     if (driver_persists_w0(mode, config)
             and qp_solver is not QPSolver.SELF_CONSISTENT):
+        W_static = restart_static_w(
+            mode, W_by_role, V_q, config=config, meta=meta, mesh_xy=mesh_xy,
+            material_class=material_class, print_fn=print0)
+        if W_static is None:
+            return
         with timing.section("gw_jax.persist_w0"):
             from .gw_output import persist_w0_and_head
             persist_w0_and_head(
-                W_by_role.get("static", V_q), photon_response=photon_response,
+                W_static, photon_response=photon_response,
                 tensors_filename=tensors_filename, head_resolver=head_resolver,
                 config=config, meta=meta, mesh_xy=mesh_xy,
                 sym=sym, centroid_indices=centroid_indices,
+                static_head_only=mode is ComputeMode.MPA,
                 print_fn=print0)
 
 
@@ -1602,7 +1609,8 @@ def _run_gw_stages(args, _t_main, _pre_main, opened):
 	    oneshot_head_response, print0, wfn)
 	_persist_screening(
 	    V_q, W_by_role, centroid_indices, config, head_resolver, mesh_xy, meta, mode, print0,
-	    qp_solver, sym, tensors_filename, photon_response=photon_response)
+	    qp_solver, sym, tensors_filename, photon_response=photon_response,
+	    material_class=material_class)
 	(
 	    static_head_terms) = _prepare_static_head(
 	    config, do_screened, head_resolver, meta, mode, print0, qp_solver,

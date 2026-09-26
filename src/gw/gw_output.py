@@ -400,15 +400,22 @@ def persist_w0_and_head(
 
     ``static_head_only`` DECLARES that ``W_q`` is the ω = 0 W and nothing
     else, so the stored ω grid is ``{0}`` whatever the run's compute mode
-    is.  It exists for exactly one caller: the ``screening_diagrams =
-    w_bse`` stage helper, whose first leg computes the RPA W(0) that the
-    ladder kernel consumes and persists THAT — under every mode, MPA
-    included.  It is a NAMED OPT-IN rather than a relaxation of the
-    dynamic-mode refusal below, because the two say different things.  The
+    is.  It has two callers: the ``screening_diagrams = w_bse`` stage
+    helper, whose first leg computes the RPA W(0) that the ladder kernel
+    consumes and persists THAT — under every mode, MPA included — and the
+    one-shot shared-pole MPA route, whose W is the model evaluated at
+    ω = 0 (``gw.screening.restart_static_w``).  It is a NAMED OPT-IN rather
+    than a relaxation of the dynamic-mode refusal below, because the two say
+    different things.  The
     refusal says "this mode's W was not sampled at {0, probe}, so do not
     stamp that grid onto the file"; this flag says "the array in my hand
     was sampled at {0} and I am telling you so".  A caller that cannot
     make that statement still gets the refusal.
+
+    ``W_q`` may be a zero-argument callable; it is called only after the
+    write-policy and output-file preflight, so a producer whose static W is
+    an evaluation rather than a held array (the shared-pole model) runs it
+    only when the file is written.
 
     ``photon_response`` selects the produced screened charge block and its
     q-parent capture when the packed operator owns the whole static Sigma.
@@ -435,6 +442,8 @@ def persist_w0_and_head(
         return
     if not os.path.exists(tensors_filename):
         return
+    if callable(W_q):
+        W_q = W_q()
     from .gw_config import packed_photon_replaces_charge_sigma
     if (photon_response is not None
             and packed_photon_replaces_charge_sigma(config)):

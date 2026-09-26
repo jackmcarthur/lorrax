@@ -213,11 +213,32 @@ def test_the_driver_imports_whatever_it_dispatches_the_w0_persist_on():
         n for n in ast.walk(ast.parse((_GW / "screening.py").read_text()))
         if isinstance(n, ast.FunctionDef) and n.name == "driver_persists_w0"))
     assert "ComputeMode.MPA" in body, (
-        "the MPA half of the persist decision is gone; if MPA's head "
-        "persistence landed, rewrite this cell to pin THAT")
+        "the MPA half of the persist decision is gone")
+    # Pade-fit MPA has no omega = 0 evaluator: nothing persisted, BSE refuses.
     assert driver_persists_w0(ComputeMode.MPA, _RPA_CONFIG) is False
     for mode in (ComputeMode.COHSEX, ComputeMode.GN_PPM, ComputeMode.HL_PPM):
         assert driver_persists_w0(mode, _RPA_CONFIG) is True
+
+    # The shared-pole one-shot persists V + Wc(0) (W0PERSIST); a
+    # self-consistent map, a bispinor store and a ladder W do not.
+    class _SharedPole(_RpaConfig):
+        bispinor = False
+
+        class sigma:
+            w_model = "shared_pole"
+
+    class _Bispinor(_SharedPole):
+        bispinor = True
+
+    class _Ladder(_SharedPole):
+        class screening:
+            diagrams = ScreeningDiagrams.W_BSE
+
+    assert driver_persists_w0(ComputeMode.MPA, _SharedPole()) is True
+    assert driver_persists_w0(
+        ComputeMode.MPA, _SharedPole(), self_consistent=True) is False
+    assert driver_persists_w0(ComputeMode.MPA, _Bispinor()) is False
+    assert driver_persists_w0(ComputeMode.MPA, _Ladder()) is False
 
 
 # ---------------------------------------------------------------------------
@@ -511,3 +532,34 @@ def test_the_reference_docs_carry_the_mode_and_say_it_refuses(doc):
     row = next(ln for ln in text.splitlines() if "`compute_mode`" in ln)
     assert "mpa" in row
     assert "REFUSES" in row.upper()
+
+
+def test_restart_static_w_names_why_an_mpa_run_persists_no_w0():
+    """Non-MPA modes hand over the static role unchanged; the shared-pole MPA
+    route returns a lazy evaluation, or None with the reason printed (metal;
+    head_correction = full without an omega = 0 sample).  W0PERSIST."""
+    from types import SimpleNamespace as NS
+    from gw.gw_config import HeadCorrection
+    from gw.screening import restart_static_w
+
+    static, V = object(), object()
+    kw = dict(meta=None, mesh_xy=None)
+    assert restart_static_w(ComputeMode.GN_PPM, {"static": static}, V,
+                            config=_RPA_CONFIG, **kw) is static
+    assert restart_static_w(ComputeMode.COHSEX, {}, V, config=_RPA_CONFIG, **kw) is V
+    lines = []
+    roles = {"shared_pole": {"path": "model.h5", "digest": "d"}}
+    nlf = NS(head=NS(correction=HeadCorrection.NO_LOCAL_FIELDS))
+    assert restart_static_w(ComputeMode.MPA, roles, V, config=nlf,
+                            material_class="metal", print_fn=lines.append, **kw) is None
+    assert "metal" in lines[-1] and "refuses" in lines[-1]
+    full = NS(head=NS(correction=HeadCorrection.FULL))
+    no_zero = dict(roles, iteration_head=NS(omegas=(0.1j, 0.5j)))
+    assert restart_static_w(ComputeMode.MPA, no_zero, V, config=full,
+                            material_class="insulator", print_fn=lines.append, **kw) is None
+    assert "omega = 0" in lines[-1]
+    with_zero = dict(roles, iteration_head=NS(omegas=(0j, 0.5j)))
+    assert callable(restart_static_w(ComputeMode.MPA, with_zero, V, config=full,
+                                     material_class="insulator", **kw))
+    assert callable(restart_static_w(ComputeMode.MPA, roles, V, config=nlf,
+                                     material_class="insulator", **kw))

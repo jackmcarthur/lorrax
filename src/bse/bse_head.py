@@ -4,12 +4,11 @@ AUTHORITY RULE — ``vhead`` goes on the exchange tile unconditionally, and
 ``whead`` goes on ``W`` only when a real screened ``W0`` was loaded.
 ``compute_vcoul`` zeroes ``v(G=G'=0)`` at q=0 before the Dyson solve, so the
 q=0 exchange tile is bare Coulomb either way and reinstating the mini-BZ
-average is always right.  ``whead`` is the head of the SCREENED interaction,
-and both restart loaders fall back to bare ``V`` for ``W`` when the restart
-carries no ready ``W0_qmunu``; putting a screened head on that tile is a
-second, silent error riding on a loud one.  ``_inject_q0_head`` owns that gate
-in ONE spelling and both loaders call it, which is what stops the two paths
-drifting apart again (they did, and the sharded one was the silent half).
+average is always right.  ``whead`` is the head of the SCREENED interaction.
+The restart loaders no longer fall back to bare ``V`` for ``W``: a restart
+without a ready ``W0_qmunu`` refuses in ``read_bse_payload`` (claim 2848).
+``_inject_q0_head`` still owns the ``w0_ready`` gate in ONE spelling, so a
+screened head can never reach an unscreened tile by any other door.
 
 DEFERRAL IS THE SECOND, SEPARATE QUESTION, and it is deliberately not spelled
 as the first.  When a coarse→fine densification is pending, W's head belongs on

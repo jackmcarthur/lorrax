@@ -1,43 +1,25 @@
-"""A screened head must not land on an unscreened tile — at any mesh.
+"""A screened head goes on a screened tile only — and a W0-less restart refuses.
 
-THE DEFECT (found by the Schur design pass, ``SCHUR_BSE_DESIGN.md`` §5(a),
-fixed on ``fix/sharded-whead-gate-2026-08-10``).  Both BSE restart loaders
-fall back to bare Coulomb ``V`` for ``W`` when the restart carries no ready
-``W0_qmunu`` — the April all-zero-screening gate, ``W0_ready``, which
-``tests/test_bse_w0_ready_gate.py`` pins on the READING side.  Both then
-re-attach the q=0 Coulomb head that ``compute_vcoul`` removed before the
-Dyson solve, as a rank-1 update ``(head/V_cell)·conj(g0)⊗g0``.
+HISTORY.  Both BSE restart loaders used to fall back to bare Coulomb ``V`` for
+``W`` when the restart carried no ready ``W0_qmunu``, and the sharded loader
+then put the SCREENED q = 0 head on that bare tile (``SCHUR_BSE_DESIGN.md``
+§5(a), ``fix/sharded-whead-gate-2026-08-10``).  The fallback itself is now
+deleted (W0PERSIST 2026-09-26, claim 2848): an MPA restart carried no W0, and
+the BSE silently ran ``D + V - V`` with a head-less q = 0 tile, E_1 = -7.09 eV
+on CrI3 8x8 SOC.  ``file_io.restart_bundle.read_bse_payload`` refuses by name.
 
-``vhead`` belongs on the exchange tile either way; ``whead`` is the head of
-the SCREENED interaction, so it belongs on the W tile only when a screened W
-was actually loaded.  ``_load_ring_subset`` (single device) asked that
-question.  ``load_bse_data_from_restart_sharded`` — the P>1 path, and the one
-production runs at scale — did not: it passed ``W_q`` into the injector
-unconditionally, so a fallback run added a 2600-meV-class screened head to a
-tile that is bare ``V``.  The fallback warns loudly; the head on top of it
-was silent, and it is not a smaller error than the fallback it rides on but a
-different one, on the q=0 tile the exciton binding is most sensitive to.
-
-WHAT IS MEASURED HERE, and why it takes subprocesses.  The claim is about
-composition of the returned tensor, so every cell below runs the REAL loader
-on a REAL (synthetic) restart file and compares tiles — no source matching
-decides whether the code is correct.  A mesh is fixed at process start
-(``--xla_force_host_platform_device_count``), so each device count is one
-CPU worker subprocess, JSON on stdout; this module is both the pytest file
-and that worker, the convention ``tests/test_zeta_mesh_invariance.py``
+WHAT IS MEASURED HERE, and why it takes subprocesses.  Every cell runs the
+REAL loaders on a REAL (synthetic) restart file.  A mesh is fixed at process
+start (``--xla_force_host_platform_device_count``), so each device count is
+one CPU worker subprocess, JSON on stdout; this module is both the pytest
+file and that worker, the convention ``tests/test_zeta_mesh_invariance.py``
 established.  CPU-only and fixture-free: it runs on any box.
 
-The four arms, per mesh:
+The arms, per mesh:
 
-``sharded/fallback``  W0 present but ``W0_ready=False`` → the bug's state.
-``sharded/ready``     a real W0 → the normal path, which must not move.
-``ring/*``            the same two through the single-device loader, whose
-                      gate was already right, as the parity target.
-``prefix/fallback``   THE RED TWIN: the same loader with the gate forced
-                      open (the pre-fix spelling monkeypatched back in),
-                      which must show the injected head at P>1.  A gate
-                      whose red twin is not executed is a gate that can rot
-                      into a tautology.
+``sharded/fallback``  W0 present but ``W0_ready=False`` → must REFUSE.
+``sharded/ready``     a real W0 → W0 plus the rank-1 screened head.
+``ring/*``            the same two through the single-device loader.
 """
 
 from __future__ import annotations
@@ -174,9 +156,21 @@ def _worker(px: int, py: int) -> dict:
                 "padded_extent": int(W_q.shape[0]),
             }
 
-        _record(f"sharded/{arm}", bse_loading.load_bse_data_from_restart_sharded(
+        def _refused(tag, call):
+            try:
+                call()
+            except ValueError as exc:
+                out[tag] = {"refused": "bse_requires_screened_w0" in str(exc)}
+            else:
+                out[tag] = {"refused": False}
+
+        load = lambda: bse_loading.load_bse_data_from_restart_sharded(
             path, n_val=N_VAL, n_cond=N_COND, mesh_xy=mesh, n_occ=N_OCC,
-            cell_volume=CELL_VOLUME))
+            cell_volume=CELL_VOLUME)
+        if arm == "fallback":
+            _refused("sharded/fallback", load)
+        else:
+            _record("sharded/ready", load())
 
         if px * py == 1:
             # The single-device full-file loader, which refuses at P>1 by
@@ -193,33 +187,14 @@ def _worker(px: int, py: int) -> dict:
 
             bse_loading._resolve_head_params = _with_cell_volume
             try:
-                _record(f"ring/{arm}", bse_loading._load_ring_subset(
-                    path, n_val=N_VAL, n_cond=N_COND, px=1, py=1, n_occ=N_OCC))
+                ring = lambda: bse_loading._load_ring_subset(
+                    path, n_val=N_VAL, n_cond=N_COND, px=1, py=1, n_occ=N_OCC)
+                if arm == "fallback":
+                    _refused("ring/fallback", ring)
+                else:
+                    _record("ring/ready", ring())
             finally:
                 bse_loading._resolve_head_params = _real
-
-        if arm == "fallback":
-            # THE RED TWIN, EXECUTED.  ``_inject_q0_head`` with its gate
-            # forced open is the pre-fix line verbatim (``W_q`` passed
-            # straight in, no ``w0_ready``), so this arm is the shipped
-            # loader running the shipped defect on the shipped fallback
-            # state.  If it stops showing the injected head, the fixture
-            # has stopped constructing the hazard and every green cell
-            # below is vacuous.
-            _real_inject = bse_loading._inject_q0_head
-
-            def _ungated(*args, **kwargs):
-                kwargs["w0_ready"] = True
-                return _real_inject(*args, **kwargs)
-
-            bse_loading._inject_q0_head = _ungated
-            try:
-                _record("prefix/fallback",
-                        bse_loading.load_bse_data_from_restart_sharded(
-                            path, n_val=N_VAL, n_cond=N_COND, mesh_xy=mesh,
-                            n_occ=N_OCC, cell_volume=CELL_VOLUME))
-            finally:
-                bse_loading._inject_q0_head = _real_inject
 
     return out
 
@@ -254,60 +229,16 @@ def p4():
 
 
 # ---------------------------------------------------------------------------
-# (a) The fallback state
+# (a) A restart without W0 refuses
 # ---------------------------------------------------------------------------
 
-def test_the_pre_fix_loader_puts_a_screened_head_on_the_bare_v_tile(p4):
-    """THE DEFECT, REPRODUCED, at P>1 and through the real loader.
-
-    Gate forced open, fallback file: the returned q=0 tile is NOT the bare
-    ``V`` that was read from disk, and it is EXACTLY that ``V`` plus the
-    rank-1 ``(whead/V_cell)·conj(g0)⊗g0``.  Both halves matter — the first
-    says something was added, the second says it was the screened head and
-    not a read error.
-    """
-    got = p4["prefix/fallback"]["q0_tile"]
-    disk = p4["disk/fallback"]
-    assert got != disk["src_q0"], (
-        "the pre-fix spelling left the fallback tile alone; the fixture no "
-        "longer constructs the hazard this file exists to gate")
-    assert got == disk["src_q0_plus_head"], (
-        "the pre-fix tile is neither bare V nor V+head — the arithmetic in "
-        "this cell's reference has drifted from head_correction's")
-
-
-@pytest.mark.parametrize("mesh", ["p1", "p4"])
-def test_the_fallback_tile_is_returned_exactly_as_it_was_read(mesh, request):
-    """THE FIX.  No screened head on an unscreened tile, at either mesh.
-
-    BIT equality against the dataset on disk, not a tolerance: the gated
-    path performs no arithmetic on ``W_q`` at all, so anything short of the
-    identical bytes is a different bug.
-    """
-    res = request.getfixturevalue(mesh)
-    assert res["sharded/fallback"]["q0_tile"] == res["disk/fallback"]["src_q0"], (
-        "the sharded loader's bare-V fallback tile carries an injected "
-        "screened head (SCHUR_BSE_DESIGN.md §5(a)); whead must be gated on "
-        "w0_ready exactly as _load_ring_subset gates it")
-
-
-def test_the_two_loaders_compose_the_fallback_identically(p1, p4):
-    """GATE PARITY, stated as bit equality between the two readers.
-
-    The single-device loader's gate was already right, so it is the target:
-    sharded at 1x1 and at 2x2 must both produce the tile ``_load_ring_subset``
-    produces, on the same file, for the same head.  The exchange tile is
-    compared too — ``vhead`` is NOT gated (the q=0 exchange tile is bare
-    Coulomb whether or not screening loaded), and a fix that over-reached
-    into V would show up here rather than in a review.
-    """
-    ring = p1["ring/fallback"]
+def test_a_w0_less_restart_is_refused_at_every_mesh(p1, p4):
+    """No bare-V stand-in for W, through both loaders, at P = 1 and P = 4."""
+    assert p1["ring/fallback"]["refused"]
     for tag, res in (("1x1", p1), ("2x2", p4)):
-        assert res["sharded/fallback"]["q0_tile"] == ring["q0_tile"], (
-            f"sharded {tag} and single-device disagree on the fallback W tile")
-        assert res["sharded/fallback"]["V_q0"] == ring["V_q0"], (
-            f"sharded {tag} and single-device disagree on the fallback "
-            f"exchange tile; vhead must still be injected")
+        assert res["sharded/fallback"]["refused"], (
+            f"sharded {tag}: a restart with W0_ready = False loaded instead of "
+            f"refusing with GATE bse_requires_screened_w0")
 
 
 # ---------------------------------------------------------------------------
@@ -342,17 +273,8 @@ def test_only_the_q0_slice_is_ever_touched(mesh, request):
     stop being the whole claim.
     """
     res = request.getfixturevalue(mesh)
-    for arm in ("fallback", "ready"):
-        assert res[f"sharded/{arm}"]["finite_q_tile"] == \
-            res[f"disk/{arm}"]["src_q1"], (
-            f"the {arm} arm's q=(1,0,0) tile is not the bytes on disk")
-
-
-@pytest.mark.parametrize("mesh", ["p1", "p4"])
-def test_the_fallback_and_ready_arms_are_actually_different_files(mesh, request):
-    """CONTROL.  Two arms that returned the same tile would gate nothing."""
-    res = request.getfixturevalue(mesh)
-    assert res["sharded/fallback"]["q0_tile"] != res["sharded/ready"]["q0_tile"]
+    assert res["sharded/ready"]["finite_q_tile"] == res["disk/ready"]["src_q1"], (
+        "the ready arm's q=(1,0,0) tile is not the bytes on disk")
 
 
 def test_the_padding_really_differs_between_the_two_meshes(p1, p4):

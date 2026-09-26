@@ -31,12 +31,12 @@ literal — and like that one, it comes with a red twin showing the matcher
 detects the pre-fix shape.
 
 THE OTHER HALF OF THIS FLAG lives in ``tests/test_sharded_whead_gate.py``.
-Everything here is about READING: which tensor the loaders bind when the flag
-says the screening was never persisted.  What they then DO with the bare-V
-fallback they bound is a second question, and the sharded loader used to
-answer it differently from the single-device one — it injected the SCREENED
-q=0 head on top of the unscreened tile.  That file gates the composition
-behaviourally, at P=1 and P=4; this one gates the reading.
+Everything here is about READING.  The BSE payload reader used to bind bare
+``V`` for ``W`` when the flag said the screening was never persisted; that
+fallback is deleted (W0PERSIST, claim 2848: an MPA restart gave CrI3 an
+unscreened, head-less BSE with E_1 = -7.09 eV) and the reader refuses by
+name.  That file gates the refusal and the ready-path composition at P=1 and
+P=4; this one gates the reading.
 """
 
 from __future__ import annotations
@@ -257,7 +257,8 @@ def _guards_on_w0_ready(source, binder):
 
 
 def test_the_interpolation_path_gates_on_w0_ready_like_bse_io_does(tmp_path, monkeypatch):
-    """Explicit W refuses; BSE chooses bare V; interpolation leaves W absent."""
+    """Explicit W refuses; the BSE payload refuses (no bare-V fallback, claim
+    2848); interpolation leaves W absent."""
     import h5py
     import inspect
     import jax
@@ -286,8 +287,12 @@ def test_the_interpolation_path_gates_on_w0_ready_like_bse_io_does(tmp_path, mon
                 reader.read_interaction(path, "screened", mesh)
         else:
             np.testing.assert_array_equal(reader.read_interaction(path, "screened", mesh), 3.0)
-        payload = reader.read_bse_payload(path, None, mesh, [0], [1])
-        np.testing.assert_array_equal(payload[3], 3.0 if ready else 2.0)
+        if ready:
+            payload = reader.read_bse_payload(path, None, mesh, [0], [1])
+            np.testing.assert_array_equal(payload[3], 3.0)
+        else:
+            with pytest.raises(ValueError, match="bse_requires_screened_w0"):
+                reader.read_bse_payload(path, None, mesh, [0], [1])
         coarse = reader.read_coarse_interactions(path, None, mesh)
         if ready:
             np.testing.assert_array_equal(coarse["W0"], 3.0)

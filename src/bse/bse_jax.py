@@ -584,7 +584,8 @@ def main(argv=None) -> int:
                 "Tamm-Dancoff Hermitian BSE" if use_tda else
                 "full resonant-antiresonant BSE"),
             "Interaction    : " + (
-                "D + V - W (screened direct term enabled)" if include_w else
+                "D + V - W (screened direct term; W = the restart's "
+                "persisted static W0, refused if absent)" if include_w else
                 "D + V (RPA kernel; screened direct term omitted)"),
             f"Eigensolver    : {args.solver}; block size={int(args.block_size)}; "
             f"requested roots={int(args.n_eig)}",
