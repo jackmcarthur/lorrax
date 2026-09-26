@@ -265,4 +265,34 @@ def star_symmetrize_weights(weights_kn, star_index):
     return sums[compact] / counts[compact][:, None]
 
 
-__all__ = ["tetrahedron_delta_weights", "star_symmetrize_weights"]
+def metal_head_surface_weights(energies_kn, chemical_potential, *, sym, kgrid,
+                               nb_storage=None):
+    r"""Return the metallic head's Fermi-surface table ``Nk * w_kn``.
+
+    ``w_kn`` is the star-covariant tetrahedron weight of
+    ``integral delta(E_n(k) - mu) dk`` over the normalized zone, at the
+    fixed-N chemical potential: the point group's decomposition orbit
+    (:func:`tetrahedron_delta_weights`) followed by the star average
+    (:func:`star_symmetrize_weights`).  The factor ``Nk`` matches the head
+    contractions' uniform ``1/Nk``; ``N(E_F) = capacity * sum_kn w_kn``.
+    Columns past ``energies_kn.shape[1]`` up to ``nb_storage`` are exact
+    zeros.  Every metallic head route (the QSGW map, the frozen DFT head,
+    the one-shot head) takes its table here.
+    """
+    energies = np.asarray(energies_kn, dtype=np.float64)
+    weights = tetrahedron_delta_weights(
+        energies, np.asarray(sym.unfolded_kpts, dtype=np.float64),
+        tuple(int(x) for x in kgrid), float(chemical_potential),
+        symmetry_matrices=np.asarray(sym.sym_mats_k))
+    weights = star_symmetrize_weights(weights, np.asarray(sym.irr_idx_k))
+    weights = weights * float(energies.shape[0])
+    width = int(energies.shape[1] if nb_storage is None else nb_storage)
+    if width < energies.shape[1]:
+        raise ValueError(
+            f"nb_storage={width} is narrower than the {energies.shape[1]} "
+            "logical head bands")
+    return np.pad(weights, ((0, 0), (0, width - energies.shape[1])))
+
+
+__all__ = ["tetrahedron_delta_weights", "star_symmetrize_weights",
+           "metal_head_surface_weights"]

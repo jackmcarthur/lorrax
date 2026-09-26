@@ -33,6 +33,7 @@ __all__ = [
     "static_gauge_hall_transaction",
     "static_head_wings_sharded",
     "head_samples_from_s",
+    "metal_head_summary",
     "finalize_iteration_head_sample",
     "finalize_iteration_head_samples",
     "load_dft_velocity_head",
@@ -2496,6 +2497,10 @@ class IterationHeadResponse:
     sigma_energies_ry: np.ndarray
     sigma_occupations: np.ndarray
     efermi_ry: float
+    #: Metals only: the Fermi-surface (Drude) tensor ``D_ab`` in the S
+    #: convention, ``omega_p(qhat)^2 = 8 pi qhat.D.qhat`` (Ry^2).  Reported
+    #: by the drivers so every metallic log carries its plasma frequency.
+    drude_tensor: np.ndarray | None = None
 
 
 @dataclass(frozen=True)
@@ -2954,7 +2959,12 @@ def build_iteration_head_response(
             rel_tol=float(config.minimax_config.target_error),
         )[0:1]
     static_kappa2 = None
+    drude_tensor = None
     if surface_weight_qp_kn is not None:
+        drude_tensor = np.asarray(head_drude_tensor_sharded(
+            v_qp, surface_weight_qp_kn, mesh=mesh, nb_logical=nb_logical,
+            cell_volume=float(meta.cell_volume), nk_tot=int(meta.nk_tot),
+            nspin=int(wfn.nspin), nspinor=normalization_nspinor))
         capacity = 2.0 / (
             float(max(int(wfn.nspin), 1))
             * float(max(normalization_nspinor, 1)))
@@ -2980,6 +2990,7 @@ def build_iteration_head_response(
             :, : np.shape(sigma_energies_ry)[1]
         ],
         efermi_ry=float(efermi_ry),
+        drude_tensor=drude_tensor,
     )
 
 
@@ -3065,6 +3076,7 @@ def build_dft_head_response(
     config,
     wfn_fingerprint_binding=None,
     wings: bool = True,
+    occupation_state=None,
 ) -> IterationHeadResponse:
     """Build the one-shot DFT head on exactly the chi0 band manifold.
 
@@ -3079,6 +3091,16 @@ def build_dft_head_response(
     (:func:`finalize_iteration_head_sample`) never folds.  ``S_direct``
     needs no time-reversal assumption (``gw.shared_pole_head`` docstring), so
     this is the head an ordered store carries.
+
+    ``occupation_state`` is the metal's fixed-N Fermi-Dirac state on this
+    spectrum (the one-shot state, or the DFT state of a map whose head stays
+    frozen).  It replaces the bundle's 0/1 table, which is a step by band
+    index and splits degenerate multiplets at the cut, and it adds the
+    metal's intraband Fermi-surface response: the tetrahedron table of
+    :func:`gw.fermi_surface.metal_head_surface_weights` enters ``S(z)`` as
+    the Drude term and, for the direct head, the static Thomas-Fermi slot.
+    The wings stay interband-only: the intraband head is direct on every
+    metallic route.  ``None`` is the insulating head.
     """
     import os
 
@@ -3106,12 +3128,50 @@ def build_dft_head_response(
     # ``meta.nspinor`` is four for the bispinor representation, whereas
     # response normalization counts the source-WFN states.
     normalization_nspinor = int(meta.nspinor_wfnfile)
+    surface = None
+    static_kappa2 = None
+    drude_tensor = None
+    if occupation_state is not None:
+        if b0 != 0:
+            raise ValueError(
+                "metal head requires a band manifold starting at 0, got "
+                f"b_id_0={b0}")
+        f_state = np.asarray(occupation_state.f_kn, dtype=np.float64)
+        if f_state.shape[0] != int(meta.nk_tot) or f_state.shape[1] < nb_logical:
+            raise ValueError(
+                "metal head occupation state does not cover the chi head "
+                f"manifold: f_kn {f_state.shape}, want "
+                f"({int(meta.nk_tot)}, >={nb_logical})")
+        occupations = jnp.asarray(f_state[:, :nb_logical])
+        from .fermi_surface import metal_head_surface_weights
+        surface_host = metal_head_surface_weights(
+            np.asarray(energies, dtype=np.float64),
+            float(occupation_state.mu_ry), sym=wfn.symmetry(),
+            kgrid=wfn.kgrid)
+        surface = jnp.asarray(surface_host)
+        drude_tensor = np.asarray(head_drude_tensor_sharded(
+            jnp.asarray(velocity_cart), surface, mesh=mesh,
+            nb_logical=nb_logical, cell_volume=float(meta.cell_volume),
+            nk_tot=int(meta.nk_tot), nspin=int(wfn.nspin),
+            nspinor=normalization_nspinor))
+        if wings and np.any(np.abs(z) <= 1.0e-14):
+            raise ValueError(
+                "GATE metal_full_head_static_row: a metallic full head has "
+                "no static wing completion for an exact z=0 row; the metal "
+                "MPA plan has none (its origin is mpa_metal_origin_shift_ry)")
+        if not wings:
+            capacity = 2.0 / (
+                float(max(int(wfn.nspin), 1))
+                * float(max(normalization_nspinor, 1)))
+            static_kappa2 = 8.0 * np.pi * capacity * float(
+                np.sum(surface_host)) / float(meta.nk_tot) / float(
+                    meta.cell_volume)
     S = head_s_tensor_sharded(
         jnp.asarray(velocity_cart), energies, occupations, z,
         mesh=mesh, nb_logical=nb_logical,
         cell_volume=float(meta.cell_volume), nk_tot=int(meta.nk_tot),
         nspin=int(wfn.nspin), nspinor=normalization_nspinor,
-        eta_ry=float(config.head.wcoul0_eta))
+        eta_ry=float(config.head.wcoul0_eta), surface_weight_kn=surface)
     Y_x = Z_y = None
     if wings:
         Y_x, Z_y = head_wings_sharded(
@@ -3130,7 +3190,9 @@ def build_dft_head_response(
     mem_probe("qsgw_head.build_dft_head_response.post_response")
     e_host = np.asarray(energies)
     n_occ_local = max(0, min(int(meta.nelec) - b0, nb_logical))
-    if 0 < n_occ_local < nb_logical:
+    if occupation_state is not None:
+        efermi = float(occupation_state.mu_ry)
+    elif 0 < n_occ_local < nb_logical:
         efermi = 0.5 * (
             float(np.max(e_host[:, n_occ_local - 1]))
             + float(np.min(e_host[:, n_occ_local])))
@@ -3139,11 +3201,27 @@ def build_dft_head_response(
     return IterationHeadResponse(
         omegas=tuple(complex(value) for value in z),
         S_direct=S, Y_x=Y_x, Z_y=Z_y,
-        static_kappa2_bohr2=None,
+        static_kappa2_bohr2=static_kappa2,
         static_Y_x=None, static_Z_y=None, static_chi_body_gamma=None,
         sigma_energies_ry=e_host[:, :int(meta.nb_sigma)],
         sigma_occupations=np.asarray(occupations)[:, :int(meta.nb_sigma)],
-        efermi_ry=efermi)
+        efermi_ry=efermi, drude_tensor=drude_tensor)
+
+
+def metal_head_summary(response: IterationHeadResponse, occupation_state) -> str:
+    """One log line naming a metallic head's occupations and plasma frequency."""
+    from common import RYD_TO_EV
+    D = np.real(np.asarray(response.drude_tensor))
+    wp = np.sqrt(np.maximum(8.0 * np.pi * np.linalg.eigvalsh(0.5 * (D + D.T)), 0.0))
+    kappa = response.static_kappa2_bohr2
+    return (
+        "metal head: fixed-N "
+        f"{occupation_state.smearing_family} occupations (mu="
+        f"{float(occupation_state.mu_ry) * RYD_TO_EV:.6f} eV, occ_hash="
+        f"{occupation_state.occ_hash}) plus the tetrahedron Fermi-surface "
+        "intraband term; omega_p principal = "
+        + "/".join(f"{x * RYD_TO_EV:.4f}" for x in wp) + " eV"
+        + ("" if kappa is None else f"; kappa_TF^2 = {kappa:.6f} bohr^-2"))
 
 
 def build_iteration_head_samples(

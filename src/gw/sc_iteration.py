@@ -1175,6 +1175,18 @@ def _certified_seed_occupation_state(
     return replayed
 
 
+def _fixed_dft_head_occupation_state(inputs: SCInputs) -> OccupationState | None:
+    """The DFT fixed-N state of a metal's frozen head (``sc_head_update=off``).
+
+    The frozen head is the DFT response, so it takes the fixed-N state of the
+    DFT spectrum from the one occupation solver, never the bundle's step by
+    band index.  ``None`` on an insulator.
+    """
+    if inputs.material_class != "metal":
+        return None
+    return _solve_occupation_state(inputs, inputs.wfns_dft.enk)
+
+
 def _solve_head_occupations(
     inputs: SCInputs,
     energies_kn_ry,
@@ -1195,45 +1207,17 @@ def _solve_head_occupations(
     if inputs.material_class == "metal":
         nb_logical = min(nb_logical, int(inputs.band_slices.sigma.stop))
     nb_storage = int(pt.velocity_dft_cart.shape[-1])
-    nk = int(energies.shape[0])
     mu_ry = float(occ_state.mu_ry)
     # The Drude weight is a Fermi-surface integral, not a coarse-grid
-    # sampling of the MP1 derivative.  On sodium 8^3 the latter moves the
-    # plasma frequency from 6.09 to 7.68 eV.  Tetrahedra use MP1 only to
-    # determine the fixed-N chemical potential; no fitted plasma frequency
-    # enters the response.
-    from .fermi_surface import (
-        star_symmetrize_weights,
-        tetrahedron_delta_weights,
-    )
+    # sampling of the occupation derivative (on sodium 8^3 the latter moves
+    # the plasma frequency from 6.09 to 7.68 eV).  One owner builds the
+    # star-covariant tetrahedron table for every metallic head route.
+    from .fermi_surface import metal_head_surface_weights
 
-    surface_logical = tetrahedron_delta_weights(
-        np.asarray(energies[:, :nb_logical], dtype=np.float64),
-        np.asarray(inputs.sym.unfolded_kpts, dtype=np.float64),
-        tuple(int(x) for x in inputs.wfn.kgrid),
-        float(mu_ry),
-        symmetry_matrices=np.asarray(inputs.sym.sym_mats_k),
-    )
-    # POST-INTEGRATION STAR SYMMETRIZATION.  The six tetrahedra all share one
-    # hardcoded (1,1,1) body diagonal, so the weight table is NOT star
-    # covariant: measured on this deck's converged state, 4 of 48 crystal ops
-    # leave it invariant, N(E_F) varies by 0.0425 states/Ry/cell inside a
-    # single star, and the Drude tensor comes out 2.68 percent anisotropic on
-    # cubic sodium.  Averaging over each star restores the crystal point
-    # group exactly and moves neither sum_kn w_kn nor the Drude trace.  It
-    # belongs HERE rather than inside the quadrature because this is where
-    # the star labels live -- `sym.irr_idx_k` is already in hand, and the
-    # quadrature is deliberately symmetry-free.  O(nk*nb).
-    surface_logical = star_symmetrize_weights(
-        surface_logical, np.asarray(inputs.sym.irr_idx_k))
-    # The distributed contraction owns an explicit uniform 1/Nk.  Convert
-    # normalized-BZ tetrahedron weights to its per-grid-point interface.
-    surface_kn = jnp.pad(
-        jnp.asarray(surface_logical * float(nk), dtype=jnp.float64),
-        ((0, 0), (0, nb_storage - nb_logical)),
-        mode="constant",
-        constant_values=0.0,
-    )
+    surface_kn = jnp.asarray(metal_head_surface_weights(
+        np.asarray(energies[:, :nb_logical], dtype=np.float64), mu_ry,
+        sym=inputs.sym, kgrid=inputs.wfn.kgrid, nb_storage=nb_storage),
+        dtype=jnp.float64)
     return occ_state, surface_kn
 
 
@@ -3808,12 +3792,17 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
         if (iteration_head_response is None or
                 (inputs.config.sigma.w_model == "shared_pole"
                  and tuple(iteration_head_response.omegas) != tuple(head_omegas))):
-            from .qsgw_head import build_dft_head_response
+            from .qsgw_head import build_dft_head_response, metal_head_summary
+            dft_head_state = _fixed_dft_head_occupation_state(inputs)
             iteration_head_response = build_dft_head_response(
                 inputs.wfns_dft, np.asarray(head_omegas, dtype=np.complex128),
                 input_dir=inputs.input_dir, mesh=inputs.mesh_xy, wfn=inputs.wfn,
                 meta=inputs.meta, config=inputs.config,
-                wings=not direct_only_shared_pole)
+                wings=not direct_only_shared_pole,
+                occupation_state=dft_head_state)
+            if dft_head_state is not None:
+                inputs.print_fn("    SC " + metal_head_summary(
+                    iteration_head_response, dft_head_state))
         # The frozen response is the DFT direct response; its Sigma-side
         # ladder (energies, occupations, reference) is the DFT one, a step by
         # band index.  On a metal every head consumer (the static terms here,
@@ -6733,9 +6722,12 @@ def run_sc_driver(
         config, input_dir, mesh=mesh_xy, sym=sym, wfn=wfn, meta=meta,
         material_class=material_class, print_fn=print_fn)
     fixed_dft_head_response = None
+    # A metal's frozen head needs its DFT fixed-N state, which the map
+    # solves (``_fixed_dft_head_occupation_state``); it is built there.
     if (parallel_transport is None
             and config.head.correction is HeadCorrection.FULL
-            and config.sigma.w_model != "shared_pole"):
+            and config.sigma.w_model != "shared_pole"
+            and material_class != "metal"):
         # ``sc_head_update=off`` freezes this direct DFT response.  Build it
         # once, on the same single-sourced frequency plan every map consumes,
         # then fold it through each iteration's resident W exactly once.
