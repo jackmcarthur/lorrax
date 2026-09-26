@@ -30,6 +30,7 @@ from common import timing
 from common.band_degeneracy import DEGENERACY_TOL_RY
 from common.units import RYD_TO_EV
 from file_io.restart_bundle import read_eqp_energies
+from gw.gw_config import resolve_distrib_la_batched_route
 from runtime.padding import spec_divisor
 from common.wfn_transforms import get_enk_bandrange
 from isdf.galerkin import (

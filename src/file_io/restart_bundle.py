@@ -34,6 +34,8 @@ from .tagged_arrays import (BAND_WINDOW_SCHEMA_DATASET, BAND_WINDOW_SCHEMA_VERSI
     format_coulomb_policy)
 
 if TYPE_CHECKING:
+    from zeta_loader import ZetaLoader
+
     from .isdf_header import IsdfHeader
 
 _REGENERATE = (
