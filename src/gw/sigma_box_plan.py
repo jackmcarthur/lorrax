@@ -53,7 +53,12 @@ from minimax import (
 
 _FACTOR_GROWTH_CAP = 30.0
 _RUNTIME_NOISE_EPSILON = 6.0e-8
-_RUNTIME_NOISE_SAFETY = 0.05
+#: Absolute budget on a rule's runtime-noise bound (roundoff amplification x
+#: _RUNTIME_NOISE_EPSILON, :func:`_accept_rule`), in the certificate's own
+#: currency.  Roundoff is set by the executor's arithmetic, not by the
+#: quadrature, so its budget does not shrink with eps: production's
+#: 0.05 x 1e-4 (the same double), which lets eps below 2e-5 certify.
+_RUNTIME_NOISE_BUDGET = 5.0e-6
 _SC_POLE_PAD_FRACTION = 0.10
 _BOX_SIGN_FRACTION = 0.7
 #: Pad toward zero for a sign-definite SC window: 0.5 of its distance escaped by 1.6% on TaAs 8^3
@@ -762,9 +767,9 @@ def _factor_growth(times, pole_sign, states, pole_stats, e_ref_a, e_ref_b):
     return green, screened
 
 
-def _noise_amplification_cap(eps):
+def _noise_amplification_cap():
     """Largest roundoff amplification the executor's noise budget admits."""
-    return _RUNTIME_NOISE_SAFETY * eps / _RUNTIME_NOISE_EPSILON
+    return _RUNTIME_NOISE_BUDGET / _RUNTIME_NOISE_EPSILON
 
 
 def _fit_rule(spec, eps, cache_dir, eta, *, cache_build_widen=True,
@@ -783,7 +788,7 @@ def _fit_rule(spec, eps, cache_dir, eta, *, cache_build_widen=True,
     # here only to search cache metadata; cache misses still leave the choice
     # to build_uniform_rule(relative=None).
     relative = requested_box[0] > 0.0 or requested_box[1] < 0.0
-    noise_amplification_cap = _noise_amplification_cap(eps)
+    noise_amplification_cap = _noise_amplification_cap()
     analytic_line = (bool(spec.get("analytic_line")) and not relative
                      and requested_box[2] == requested_box[3]
                      and spec["pole_extent"][2:] == (0.0, 0.0))
@@ -811,7 +816,7 @@ def _fit_rule(spec, eps, cache_dir, eta, *, cache_build_widen=True,
                 # sum|term|/|Q|, while Sigma's noise amplification is
                 # |d|*sum|term|.  The certified relative sup error gives
                 # |d Q(d)| <= 1 + eps, so this cap is sufficient for the
-                # executor's stricter, eps-scaled noise condition.  Crossing
+                # executor's absolute noise condition.  Crossing
                 # rules use peak-relative term mass instead and retain the
                 # service's ordinary cancellation cap.
                 build_kwargs["kappa_cap"] = (
@@ -855,7 +860,7 @@ def _fit_rule(spec, eps, cache_dir, eta, *, cache_build_widen=True,
 
 def _accept_rule(spec, rule, eps, *, cache_status, cache_dir):
     """Accept one rule for one window, or refuse; return its executor receipt."""
-    noise_budget = _RUNTIME_NOISE_SAFETY * eps
+    noise_budget = _RUNTIME_NOISE_BUDGET
     # ONE ACCEPTANCE ON EVERY PATH.  One-shot, fixed-SC initialization and
     # its rebuilds all require the certified sup error at or below eps; the
     # fixed-SC bypass (enforce_sup_error=False, 2026-09-03) let Na retain a
@@ -943,7 +948,7 @@ def _serve_from_plan(specs, fits, eps, cache_dir):
     """
     fresh = sorted((fit for fit in fits if fit["built"]),
                    key=lambda fit: (fit["node_count"], fit["rule_digest"]))
-    cap = _noise_amplification_cap(eps)
+    cap = _noise_amplification_cap()
     served = []
     for spec, own in zip(specs, fits):
         chosen = own

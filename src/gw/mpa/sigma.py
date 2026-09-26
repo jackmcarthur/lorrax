@@ -1567,7 +1567,6 @@ def compute_sigma_c_mpa_omega_grid(
         if not np.isclose(regularization_width_ry * RYD_TO_EV,
                           recipe["eta_ev"], rtol=0, atol=1e-12):
             raise ValueError("GATE shared_pole_eta: Sigma and current recipe eta differ")
-        quadrature_eps = float(recipe["sigma_tolerance"])
         if fixed_quadrature_session is not None:
             fixed_pole_support_ry = (
                 recipe.get("sector_pole_treatment") or {}).get("ceiling_ry")

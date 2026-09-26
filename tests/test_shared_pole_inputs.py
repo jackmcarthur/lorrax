@@ -176,9 +176,15 @@ def test_unused_elementwise_inputs(tmp_path, entry):
         parse(tmp_path, 'compute_mode=mpa\nsigma_w_model=shared_pole\n' + entry + '\n')
 
 
-def test_epsilon_conflict(tmp_path):
-    with pytest.raises(ValueError, match='GATE shared_pole_epsilon_conflict'):
-        parse(tmp_path, 'compute_mode=mpa\nsigma_w_model=shared_pole\nsigma_w_accuracy=relaxed\nsigma_quadrature_eps=1e-4\n')
+@pytest.mark.parametrize('tier,deck,want', [
+    ('production', '', 1e-4), ('relaxed', '', 1e-3),
+    ('production', 'sigma_quadrature_eps=1e-5\n', 1e-5),
+    ('relaxed', 'sigma_quadrature_eps=1e-4\n', 1e-4)])
+def test_deck_epsilon_is_the_one_key(tmp_path, tier, deck, want):
+    """The shared pole reads sigma_quadrature_eps like every other Sigma route;
+    a tier supplies only the default of an omitted key."""
+    c = parse(tmp_path, f'compute_mode=mpa\nsigma_w_model=shared_pole\nsigma_w_accuracy={tier}\n{deck}')
+    assert c.sigma.quadrature_eps == want
 
 
 def fixture(*, metal=False, eta=.25, tier='production', top=20.):
