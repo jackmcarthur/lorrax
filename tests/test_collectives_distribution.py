@@ -679,20 +679,26 @@ def test_the_driver_still_runs_its_sweeps_through_a_shared_kernel():
     and the distribution lives in one shared kernel — so what it counts
     moved, and ``gather_k_blocks`` must now be ABSENT rather than
     present twice.
+
+    The Hartree sweep moved to ``gw/hartree.py`` (ARCH H2) and the
+    ``kin_ion.h5`` writer takes the sharded block (ARCH H4), so the count
+    runs over both files.
     """
-    src = _DRIVER.read_text()
-    tree = ast.parse(src)
-    names = [n.func.id for n in ast.walk(tree)
-             if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)]
+    names = []
+    for path in (_DRIVER, _SRC / "gw" / "hartree.py"):
+        tree = ast.parse(path.read_text())
+        names += [n.func.id for n in ast.walk(tree)
+                  if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)]
     assert names.count("gather_k_blocks") == 0, (
         "kin_ion_io is back on the k-partitioned gather, which cannot use "
         "more than nk ranks")
     assert names.count("sweep_matrix_elements") == 2, (
         "expected packed scalar/current Hartree and kin_ion sweeps through "
         "common.mtxel_sweep")
-    assert names.count("blocks_to_host") == 3, (
-        "each artifact/legacy output arm must undo its sharded block at a "
-        "NAMED boundary; the live return_sharded arms bypass these calls")
+    assert names.count("blocks_to_host") == 2, (
+        "the host-return Hartree arms undo the sharded block at a NAMED "
+        "boundary; the live return_sharded arms and the SlabIO writer "
+        "bypass it")
 
 
 def test_the_driver_gets_its_mesh_and_its_warm_up_from_one_call():
