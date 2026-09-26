@@ -1,7 +1,7 @@
 """``sc_head_update = interband_commutator``: kernel, exactness, grammar.
 
-1. The kernel equals a dense numpy ``v + [DeltaH, W]`` on a padded,
-   mesh-non-divisible manifold with an exactly degenerate pair.
+1. The kernel equals a dense numpy ``v + [DeltaH, W]`` (cross-gap ``W``) on
+   a padded, mesh-non-divisible manifold, and counts a closed-gap pair.
 2. The exactness statement, against finite differences of a tight-binding
    ``H(k)`` that share no code with the kernel: a ``DeltaH`` with no
    valence-conduction block gives the exact valence-conduction velocity,
@@ -51,12 +51,13 @@ def _hermitian(rng, *shape):
     return 0.5 * (a + np.conj(np.swapaxes(a, -1, -2)))
 
 
-def _reference(v, delta_active, tail, e, nb_logical):
+def _reference(v, delta_active, tail, e, nb_logical, n_occ):
     nk, nbs = e.shape
     na = delta_active.shape[-1]
     de = e[:, :, None] - e[:, None, :]
     live = np.arange(nbs) < nb_logical
-    pair = live[:, None] & live[None, :] & ~np.eye(nbs, dtype=bool)
+    occ = np.arange(nbs) < n_occ
+    pair = live[:, None] & live[None, :] & (occ[:, None] != occ[None, :])
     keep = pair[None] & (np.abs(de) > TOL_DEGENERACY_RY)
     W = np.where(keep[None], v / np.where(keep, de, 1.0)[None], 0.0)
     dH = np.zeros((nk, nbs, nbs), dtype=np.complex128)
@@ -71,11 +72,12 @@ def _reference(v, delta_active, tail, e, nb_logical):
 # 1. Kernel against the dense formula
 # ---------------------------------------------------------------------------
 
-def test_kernel_matches_dense_commutator_with_padding_and_a_degenerate_pair():
+def test_kernel_matches_dense_commutator_with_padding_and_a_closed_gap_pair():
     rng = np.random.default_rng(2509)
     nk, nbl, nbs, na, n_occ = 3, 7, 8, 5, 3
     e = np.sort(rng.uniform(-1.0, 1.0, size=(nk, nbs)), axis=1)
-    e[:, 1] = e[:, 2] + 0.25 * TOL_DEGENERACY_RY  # one exact multiplet
+    e[:, 1] = e[:, 0] + 0.25 * TOL_DEGENERACY_RY  # a same-class multiplet
+    e[0, 3] = e[0, 2] + 0.25 * TOL_DEGENERACY_RY  # the gap closes at k = 0
     e[:, nbl:] = e[:, :1]                         # padding energy collides
     v = _hermitian(rng, 3, nk, nbs, nbs)
     v[..., nbl:, :] = 0.0
@@ -85,10 +87,11 @@ def test_kernel_matches_dense_commutator_with_padding_and_a_degenerate_pair():
     got, (num, den, excluded, min_kept) = interband_commutator_velocity(
         jnp.asarray(v), jnp.asarray(delta), jnp.asarray(tail), jnp.asarray(e),
         nb_logical=nbl, n_occ=n_occ, mesh=_mesh())
-    ref, keep, pair = _reference(v, delta, tail, e, nbl)
+    ref, keep, pair = _reference(v, delta, tail, e, nbl, n_occ)
     np.testing.assert_allclose(np.asarray(got), ref, rtol=1e-12, atol=1e-12)
-    # The multiplet pair is excluded in both orders at every k.
-    assert int(excluded) == int(np.sum(pair[None] & ~keep)) == 2 * nk
+    # Only the closed cross-gap pair is counted, in both orders; the
+    # same-class multiplet is excluded with its whole class.
+    assert int(excluded) == int(np.sum(pair[None] & ~keep)) == 2
     de = np.abs(e[:, :, None] - e[:, None, :])
     assert float(min_kept) == pytest.approx(float(np.min(de[keep])))
     vc = np.zeros((nbs, nbs), dtype=bool)
@@ -102,7 +105,7 @@ def test_kernel_matches_dense_commutator_with_padding_and_a_degenerate_pair():
         rtol=1e-12)
 
 
-def test_band_diagonal_delta_h_renormalizes_every_nondegenerate_pair():
+def test_band_diagonal_delta_h_renormalizes_the_cross_gap_blocks():
     rng = np.random.default_rng(7)
     nk, nb, n_occ = 2, 6, 2
     e = np.sort(rng.uniform(-1.0, 1.0, size=(nk, nb)), axis=1)
@@ -114,10 +117,46 @@ def test_band_diagonal_delta_h_renormalizes_every_nondegenerate_pair():
         jnp.asarray(v), jnp.asarray(delta), jnp.asarray(shift), jnp.asarray(e),
         nb_logical=nb, n_occ=n_occ, mesh=_mesh())
     eq = e + shift
+    occ = np.arange(nb) < n_occ
+    cross = occ[:, None] != occ[None, :]
     ratio = (eq[:, :, None] - eq[:, None, :]) / np.where(
-        np.eye(nb, dtype=bool)[None], 1.0, e[:, :, None] - e[:, None, :])
-    want = np.where(np.eye(nb, dtype=bool)[None, None], v, v * ratio[None])
+        cross[None], e[:, :, None] - e[:, None, :], 1.0)
+    want = np.where(cross[None, None], v * ratio[None], v)
     np.testing.assert_allclose(np.asarray(got), want, rtol=1e-12, atol=1e-12)
+
+
+def test_a_collapsed_axis_takes_the_position_operator_exactly():
+    # Reduced component a of W is i Z_a on a collapsed axis and B W^VC
+    # elsewhere; checked against the dense formula with a non-orthogonal B.
+    rng = np.random.default_rng(99)
+    nk, nb, n_occ = 2, 6, 2
+    e = np.sort(rng.uniform(-1.0, 1.0, size=(nk, nb)), axis=1)
+    e[:, n_occ:] += 0.5
+    v = _hermitian(rng, 3, nk, nb, nb)
+    Z = _hermitian(rng, 3, nk, nb, nb)
+    Z[:2] = 0.0
+    delta = _hermitian(rng, nk, nb, nb)
+    B = np.array([[1.0, 0.2, 0.0], [0.1, 1.1, 0.0], [0.3, -0.2, 0.7]])
+    got, _ = interband_commutator_velocity(
+        jnp.asarray(v), jnp.asarray(delta), jnp.zeros((nk, nb)), jnp.asarray(e),
+        nb_logical=nb, n_occ=n_occ, mesh=_mesh(), collapsed_position=jnp.asarray(Z),
+        collapsed_axes=(2,), reciprocal_lattice_cart=B)
+    ref, _, _ = _reference(v, delta, np.zeros((nk, nb)), e, nb, n_occ)
+    W_cart = np.zeros_like(v)
+    occ = np.arange(nb) < n_occ
+    cross = (occ[:, None] != occ[None, :])[None]
+    de = e[:, :, None] - e[:, None, :]
+    W_cart = np.where(cross[None], v / np.where(cross, de, 1.0)[None], 0.0)
+    W_red = np.einsum("ij,j...->i...", B, W_cart)
+    W_red[2] = 1j * Z[2]
+    W_eff = np.einsum("ij,j...->i...", np.linalg.inv(B), W_red)
+    want = v + (np.einsum("kml,akln->akmn", delta, W_eff)
+                - np.einsum("akml,kln->akmn", W_eff, delta))
+    np.testing.assert_allclose(np.asarray(got), want, rtol=1e-12, atol=1e-12)
+    # The periodic reduced components are the plain cross-gap commutator.
+    red_got = np.einsum("ij,j...->i...", B, np.asarray(got) - v)
+    red_ref = np.einsum("ij,j...->i...", B, ref - v)
+    np.testing.assert_allclose(red_got[:2], red_ref[:2], rtol=1e-12, atol=1e-12)
 
 
 # ---------------------------------------------------------------------------
