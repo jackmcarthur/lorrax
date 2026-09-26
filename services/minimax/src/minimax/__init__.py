@@ -78,6 +78,7 @@ _FREQUENCY_FIT_NAMES = (
 _UNIFORM_RULE_NAMES = (
     "UniformRule", "box_samples", "boundary_samples", "build_uniform_rule",
     "rule_roundoff_amplification", "rule_sup_error",
+    "uniform_rule_solver_identity",
 )
 
 # Levelled (minimax-optimal) noncrossing rules: NumPy only, but lazy like

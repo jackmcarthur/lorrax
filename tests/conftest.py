@@ -273,6 +273,24 @@ from types import SimpleNamespace as _NS
 import pytest
 
 
+@pytest.fixture(autouse=True)
+def _private_sigma_rule_table(request, tmp_path_factory, monkeypatch):
+    """Give every cell its own run-independent Σ rule table.
+
+    Cells patch ``build_uniform_rule`` with fakes: a fake stored in the
+    user's table would be served to a real run with the same build box, and
+    a rule another cell stored would replace a cell's own fake. Keyed by the
+    node id, so the ranks of one P>1 cell share one table; the directory is
+    created only when a cell stores a rule, and ``mesh`` children inherit
+    the variable.
+    """
+    import hashlib
+    cell = hashlib.sha256(request.node.nodeid.encode()).hexdigest()[:16]
+    monkeypatch.setenv(
+        "LORRAX_SIGMA_RULE_TABLE_TEST_DIR",
+        str(tmp_path_factory.getbasetemp() / "sigma_rule_tables" / cell))
+
+
 # ---------------------------------------------------------------------------
 # `@pytest.mark.mesh(n)` — THE CELLS THE PIN ABOVE USED TO SILENCE  (2026-08-10)
 # ---------------------------------------------------------------------------

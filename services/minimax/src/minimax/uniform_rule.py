@@ -89,6 +89,7 @@ from .fixed_n_start import predict_nodes, start_param
 __all__ = [
     "UniformRule", "build_uniform_rule", "box_samples",
     "rule_roundoff_amplification", "rule_sup_error",
+    "uniform_rule_solver_identity",
 ]
 
 
@@ -1045,6 +1046,48 @@ def build_uniform_rule(box, eps, **options):
     """
     with _pinned_blas_threads():
         return _build_uniform_rule(box, eps, **options)
+
+
+_STATIC_IDENTITY = None
+
+
+def uniform_rule_solver_identity():
+    """What a :func:`build_uniform_rule` result depends on besides its
+    arguments, as a JSON-ready dict.
+
+    The builder reads no clock and pins its BLAS threads, so two calls with
+    equal arguments return the same rule bit for bit when these fields are
+    equal: the minimax sources (sha256 over every ``.py`` of the package),
+    the numerics backend (:func:`minimax.cache.backend_tag`), the CPU model
+    (OpenBLAS dispatches its kernels by it), the pinned thread count and the
+    reduction backend selector. A persistent rule table keys on this dict,
+    so an edited builder or another machine class opens a new namespace
+    instead of being served another solver's rule.
+    """
+    global _STATIC_IDENTITY
+    if _STATIC_IDENTITY is None:
+        import hashlib
+        from pathlib import Path
+
+        from .cache import backend_tag
+        package = Path(__file__).resolve().parent
+        digest = hashlib.sha256()
+        for path in sorted(package.rglob("*.py")):
+            digest.update(str(path.relative_to(package)).encode() + b"\0")
+            digest.update(path.read_bytes() + b"\0")
+        cpu = "unknown"
+        try:
+            with open("/proc/cpuinfo", encoding="ascii", errors="replace") as info:
+                cpu = next((line.split(":", 1)[1].strip() for line in info
+                            if line.startswith("model name")), cpu)
+        except OSError:
+            pass
+        _STATIC_IDENTITY = {
+            "minimax_sources": digest.hexdigest(), "backend": backend_tag(),
+            "cpu": cpu, "blas_threads": _BLAS_THREADS,
+        }
+    return dict(_STATIC_IDENTITY, reduction_backend=os.environ.get(
+        "LORRAX_UNIFORM_RULE_BACKEND", "numpy").strip().lower())
 
 
 def _build_uniform_rule(box, eps, *, im_cap=3.0, kappa_cap=1.0e4, trunc=10.0,

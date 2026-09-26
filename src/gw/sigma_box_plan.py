@@ -15,6 +15,7 @@ routes.
 
 from __future__ import annotations
 
+import errno
 import hashlib
 import json
 import os
@@ -22,6 +23,7 @@ import re
 import pickle
 import socket
 import time
+import uuid
 import zipfile
 
 from ffi import _services
@@ -45,6 +47,7 @@ from minimax import (
     boundary_samples,
     build_uniform_rule,
     rule_roundoff_amplification,
+    uniform_rule_solver_identity,
 )
 
 
@@ -59,6 +62,9 @@ _SC_ZERO_SIDE_CAP = 0.05
 #: v5: rules are built on outward-snapped boxes (_build_box); v4 entries were
 #: built on the raw request and are not served, so a warm cache equals a cold one.
 _RULE_CACHE_SCHEMA = "sigma-box-ry-v5"
+#: The run-independent rule table's entry format and key definition
+#: (:func:`_rule_table_key`); a new value opens a new namespace.
+_RULE_TABLE_FORMAT = "sigma-box-table-v1"
 
 
 def _rule_digest(rule, noise_amplification):
@@ -140,7 +146,8 @@ def resolve_sigma_box_cache_dir(setting, input_dir):
     """Resolve the deck's uniform-rule cache spelling beside its input.
 
     ``"auto"`` selects ``<input_dir>/tmp/sigma_quadrature_rules``;
-    ``"off"`` disables the acceleration; any other relative path is resolved
+    ``"off"`` disables the acceleration, including the run-independent rule
+    table (:func:`_rule_table_root`); any other relative path is resolved
     against ``input_dir``.  A cache is not an accuracy path: every loaded rule
     is still checked for box containment and the requested error currency.
     """
@@ -350,6 +357,10 @@ def _rule_cache_lookup(
                 f"ignored {len(stale)} rule file(s) of another schema, first={stale[0]}; "
                 "affected windows will be rebuilt. The files are retained "
                 "as prior-run evidence.")
+    except FileNotFoundError:
+        # A fresh request scope: nothing stored yet is an empty cache. The
+        # plan's builds create the directory when they are stored.
+        return None, ()
     except OSError as exc:
         path = os.path.abspath(directory)
         warnings.append(
@@ -454,23 +465,8 @@ def _rule_cache_store(directory, rule, noise_amplification):
     temporary = None
     try:
         os.makedirs(directory, exist_ok=True)
-        temporary = (f"{path}.{socket.gethostname()}.{process_rank()}."
-                     f"{os.getpid()}.tmp")
-        with open(temporary, "wb") as handle:
-            np.savez(
-                handle, schema=_RULE_CACHE_SCHEMA, digest=digest,
-                box=np.asarray(rule.box, np.float64),
-                eps=float(rule.eps), relative=bool(rule.relative),
-                times=rule.times, weights=rule.weights,
-                sup_error=float(rule.sup_error),
-                kappa_max=float(rule.kappa_max),
-                roundoff_amplification=float(noise_amplification),
-                theta_deg=float(rule.theta_deg), rank=int(rule.rank),
-                seconds=float(rule.seconds))
-            # Durable before it becomes visible: without this a node loss
-            # after the rename can leave a torn archive under the final name.
-            handle.flush()
-            os.fsync(handle.fileno())
+        temporary = _temporary_name(path)
+        _write_rule_archive(temporary, rule, noise_amplification, digest)
         os.replace(temporary, path)
     except OSError as exc:
         if temporary is not None:
@@ -486,6 +482,183 @@ def _rule_cache_store(directory, rule, noise_amplification):
             "will be rebuilt on a later run: "
             f"path={path} error={type(exc).__name__}: {exc}")
     return None
+
+
+def _temporary_name(path):
+    """A sibling name no other node, rank or process can pick for ``path``."""
+    return (f"{path}.{socket.gethostname()}.{process_rank()}.{os.getpid()}."
+            f"{uuid.uuid4().hex[:12]}.tmp")
+
+
+def _write_rule_archive(path, rule, noise_amplification, digest, **extra):
+    """Write one rule archive at ``path`` and make it durable."""
+    with open(path, "wb") as handle:
+        np.savez(
+            handle, schema=_RULE_CACHE_SCHEMA, digest=digest,
+            box=np.asarray(rule.box, np.float64),
+            eps=float(rule.eps), relative=bool(rule.relative),
+            times=rule.times, weights=rule.weights,
+            sup_error=float(rule.sup_error),
+            kappa_max=float(rule.kappa_max),
+            roundoff_amplification=float(noise_amplification),
+            theta_deg=float(rule.theta_deg), rank=int(rule.rank),
+            seconds=float(rule.seconds), **extra)
+        # Durable before it becomes visible: without this a node loss
+        # after the rename can leave a torn archive under the final name.
+        handle.flush()
+        os.fsync(handle.fileno())
+
+
+# ---------------------------------------------------------------- rule table
+# The run-local request scope above is a SERVING policy: containment inside
+# one physical scope, so sector calls and restarts share rules. The table
+# below is a MEMO of the builder: ``build_uniform_rule(build_box, eps,
+# kappa_cap)`` reads no clock and pins its BLAS threads, so its result is a
+# function of the snapped build box, the currency and the solver identity
+# (claim 2737). A hit returns the bytes a cold build returns, so a warm run
+# equals the cold run that wrote the table, and no run's answer depends on
+# which other decks wrote it. Serving across runs by containment would.
+
+def _rule_table_root(cache_dir):
+    """The run-independent rule table, or ``None`` when caching is off.
+
+    ``$SCRATCH/.cache/lorrax/sigma_box_rules``, beside the compile caches
+    (:func:`common.jax_compile_cache.default_cache_root`); no knob.
+    ``sigma_quadrature_cache_dir = off`` (``cache_dir is None``) turns it
+    off with the run-local scope. ``LORRAX_SIGMA_RULE_TABLE_TEST_DIR`` is
+    the suite's private table (``tests/conftest.py``): tests patch the
+    builder, and a fake rule must never reach the user's table.
+    """
+    if cache_dir is None:
+        return None
+    private = os.environ.get("LORRAX_SIGMA_RULE_TABLE_TEST_DIR", "").strip()
+    if private:
+        return private
+    from common.jax_compile_cache import default_cache_root
+    return os.path.join(str(default_cache_root().parent), "sigma_box_rules")
+
+
+def _rule_table_key(build_box, eps, relative, kappa_cap):
+    """Everything a builder call's result depends on, JSON-ready."""
+    return {
+        "format": _RULE_TABLE_FORMAT, "schema": _RULE_CACHE_SCHEMA,
+        "box": [float(value) for value in build_box], "eps": float(eps),
+        "relative": bool(relative),
+        "kappa_cap": None if kappa_cap is None else float(kappa_cap),
+        "solver": uniform_rule_solver_identity(),
+    }
+
+
+def _rule_table_path(root, key):
+    """``(path, key_json)``: one namespace per format and solver identity.
+
+    JSON spells a float by its shortest round-trip repr, so equal keys are
+    equal bit for bit."""
+    blob = json.dumps(key, sort_keys=True, separators=(",", ":"))
+    digest = hashlib.sha256(blob.encode()).hexdigest()
+    solver = hashlib.sha256(json.dumps(
+        key["solver"], sort_keys=True).encode()).hexdigest()[:16]
+    return (os.path.join(root, f"{key['format']}_{solver}", digest[:2],
+                         f"rule_{digest}.npz"), blob)
+
+
+def _rule_table_lookup(root, key):
+    """``((rule, amplification, digest), None)`` on a hit, else ``(None, why)``.
+
+    ``why`` is ``None`` for an absent entry and a named warning for one that
+    exists but is not served: another format or schema, another key, or a
+    certificate whose digest does not authenticate.
+    """
+    path, blob = _rule_table_path(root, key)
+    try:
+        with np.load(path, allow_pickle=False) as data:
+            stored = (str(data["table_format"]), str(data["schema"]))
+            if stored != (_RULE_TABLE_FORMAT, _RULE_CACHE_SCHEMA):
+                raise ValueError(
+                    f"schema mismatch: entry {stored[0]}/{stored[1]}, "
+                    f"this build reads {_RULE_TABLE_FORMAT}/{_RULE_CACHE_SCHEMA}")
+            box = tuple(float(value) for value in data["box"])
+            if str(data["key"]) != blob or list(box) != key["box"]:
+                raise ValueError("key mismatch: the entry answers another request")
+            rule = UniformRule(
+                times=np.asarray(data["times"]),
+                weights=np.asarray(data["weights"]),
+                box=box, eps=float(data["eps"]),
+                relative=bool(data["relative"]),
+                theta_deg=float(data["theta_deg"]), rank=int(data["rank"]),
+                sup_error=float(data["sup_error"]),
+                kappa_max=float(data["kappa_max"]), seconds=0.0)
+            amplification = float(data["roundoff_amplification"])
+            digest = _rule_digest(rule, amplification)
+            if (str(data["digest"]) != digest
+                    or not _rule_is_certified(rule, rule.eps)
+                    or rule.times.ndim != 1 or rule.weights.ndim != 1
+                    or not np.isfinite(amplification)):
+                raise ValueError("certificate digest mismatch")
+    except FileNotFoundError:
+        return None, None
+    except (OSError, KeyError, ValueError, EOFError, zipfile.BadZipFile) as exc:
+        return None, (
+            "WARNING sigma rule table entry not served (a miss; this run "
+            f"builds the rule and replaces the entry): path={path} "
+            f"error={type(exc).__name__}: {exc}")
+    return (rule, amplification, digest), None
+
+
+def _rule_table_store(root, key, rule, noise_amplification):
+    """Publish one built rule; the first writer wins. Returns a warning or ``None``.
+
+    The archive is written and synced under a private name, then hard-linked
+    to its key: ``link`` fails when the key exists, so a published entry
+    never changes and readers never see a partial file. A published entry
+    whose rule differs from this build is a DETERMINISM warning (the builder
+    is meant to be a function of the key); the table keeps the first. An
+    unservable entry is replaced by rename. Where the filesystem has no hard
+    links, rename publishes (the last writer wins, still whole).
+    """
+    path, blob = _rule_table_path(root, key)
+    digest = _rule_digest(rule, noise_amplification)
+    temporary = None
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        temporary = _temporary_name(path)
+        _write_rule_archive(temporary, rule, noise_amplification, digest,
+                            table_format=_RULE_TABLE_FORMAT, key=blob)
+        try:
+            os.link(temporary, path)
+            return None
+        except FileExistsError:
+            pass
+        except OSError as exc:
+            if exc.errno not in (errno.EPERM, errno.EOPNOTSUPP, errno.EXDEV,
+                                 errno.EMLINK, errno.ENOSYS):
+                raise
+            os.replace(temporary, path)
+            temporary = None
+            return None
+        existing, problem = _rule_table_lookup(root, key)
+        if existing is None:
+            os.replace(temporary, path)
+            temporary = None
+            return None if problem is None else (
+                problem + "; replaced by this run's build")
+        if existing[2] != digest:
+            return (
+                "WARNING sigma rule table DETERMINISM: this run built a "
+                "different rule for a key already in the table (the table "
+                f"keeps the first; this run used its own build): path={path} "
+                f"table digest={existing[2][:16]} build digest={digest[:16]}")
+        return None
+    except OSError as exc:
+        return ("WARNING sigma rule table write failed; this rule will be "
+                f"rebuilt by a later run: path={path} "
+                f"error={type(exc).__name__}: {exc}")
+    finally:
+        if temporary is not None:
+            try:
+                os.unlink(temporary)
+            except OSError:
+                pass
 
 
 #: Relative cell of the logarithmic grid every build box is snapped outward to.
@@ -590,6 +763,7 @@ def _fit_rule(spec, eps, cache_dir, eta, *, cache_build_widen=True,
                      and requested_box[2] == requested_box[3]
                      and spec["pole_extent"][2:] == (0.0, 0.0))
     built = False
+    rule_table, table_key = "none", None
     if analytic_line:
         # PPM's real poles make Im(d)=eta exactly.  Ask the analytic service
         # for that line; a cached rectangle rule cannot silently preempt it.
@@ -617,11 +791,28 @@ def _fit_rule(spec, eps, cache_dir, eta, *, cache_build_widen=True,
                 # service's ordinary cancellation cap.
                 build_kwargs["kappa_cap"] = (
                     noise_amplification_cap / (1.0 + eps))
-            if attempts is not None and not relative:
-                build_kwargs["attempts"] = attempts
-            rule = build_uniform_rule(build_box, eps, **build_kwargs)
-            if rule is None:
-                return None
+            # The table memoizes this builder call: the attempts range is not
+            # in the key because the stored rule is the window's decided one.
+            table = _rule_table_root(cache_dir)
+            entry = None
+            if table is not None:
+                table_key = _rule_table_key(
+                    build_box, eps, build_box[0] > 0.0 or build_box[1] < 0.0,
+                    build_kwargs.get("kappa_cap"))
+                entry, table_warning = _rule_table_lookup(table, table_key)
+                if table_warning is not None:
+                    cache_lookup_warnings += (table_warning,)
+            if entry is not None:
+                rule, rule_table = entry[0], "hit"
+            else:
+                if attempts is not None and not relative:
+                    build_kwargs["attempts"] = attempts
+                rule = build_uniform_rule(build_box, eps, **build_kwargs)
+                if rule is None:
+                    return None
+                rule_table = "off" if table is None else "built"
+            # A table hit is this plan's build in every later step (the
+            # request-scope store and _serve_from_plan), so warm equals cold.
             built = True
             cache_status = "miss" if cache_dir is not None else "off"
         # There is no retry.  The builder takes no clock and no pass count,
@@ -632,7 +823,8 @@ def _fit_rule(spec, eps, cache_dir, eta, *, cache_build_widen=True,
     fit = _accept_rule(spec, rule, eps, cache_status=cache_status,
                        cache_dir=cache_dir)
     fit.update(built=built, analytic_line=analytic_line,
-               cache_lookup_warnings=cache_lookup_warnings)
+               cache_lookup_warnings=tuple(cache_lookup_warnings),
+               rule_table=rule_table, rule_table_key=table_key)
     return fit
 
 
@@ -703,6 +895,8 @@ def _accept_rule(spec, rule, eps, *, cache_status, cache_dir):
         "node_digest": node_digest,
         "rule": rule, "rule_digest": _rule_digest(rule, noise_amplification),
         "cache_write_warning": None, "cache_lookup_warnings": (),
+        "rule_table": "none", "rule_table_key": None,
+        "rule_table_warning": None,
         "one_line": (f"analytic line: {rule.node_count} nodes, "
                      f"sup {rule.sup_error:.2e} (eps {eps:g})"
                      if cache_status == "analytic-line" else rule.one_line()),
@@ -919,14 +1113,23 @@ def fit_sigma_box_spec_groups(groups, eta_ry, *, eps, cache_dir):
     # Every rank has looked up by now (the gather above), so writing the
     # plan's builds cannot change any choice made in it. One writer: the
     # replicated receipts already hold every build.
+    table = _rule_table_root(cache_dir)
     if process_rank() == 0:
-        stored = {}
+        stored, published = {}, {}
         for fit in fits:
             if fit["built"] and fit["rule_digest"] not in stored:
                 stored[fit["rule_digest"]] = _rule_cache_store(
                     cache_dir, fit["rule"], fit["roundoff_amplification"])
             if fit["built"]:
                 fit["cache_write_warning"] = stored[fit["rule_digest"]]
+            if fit["rule_table"] == "built" and table is not None:
+                # Every builder call of the plan, served or not, is memoized.
+                key = json.dumps(fit["rule_table_key"], sort_keys=True)
+                if key not in published:
+                    published[key] = _rule_table_store(
+                        table, fit["rule_table_key"], fit["rule"],
+                        fit["roundoff_amplification"])
+                fit["rule_table_warning"] = published[key]
     if process_count() > 1 and any(fit["built"] for fit in fits):
         # ORDER the store before any rank's NEXT lookup.  Sector Sigma calls
         # share one scope (eb19474d): without this a peer can look up the TT
@@ -1068,10 +1271,12 @@ def _fixed_fit_for_spec(entry, spec):
             f"{max(growth):.6g} exceeds {_FACTOR_GROWTH_CAP:g}")
     fit["factor_growth"] = growth
     fit["cache_status"] = "hit:sc-fixed"
+    fit["rule_table"] = "none"
     fit["seconds"] = 0.0
     # A failed write was announced on the iteration that attempted it. Reusing
     # the in-memory fixed rule must not repeat the old warning every SC map.
     fit["cache_write_warning"] = None
+    fit["rule_table_warning"] = None
     fit["cache_lookup_warnings"] = ()
     return fit
 
@@ -1476,9 +1681,10 @@ def plan_sigma_windows(
         announced = set()
         for fit in fits:
             warnings = tuple(fit.get("cache_lookup_warnings", ()))
-            write_warning = fit.get("cache_write_warning")
-            if write_warning:
-                warnings += (write_warning,)
+            for write_warning in (fit.get("cache_write_warning"),
+                                  fit.get("rule_table_warning")):
+                if write_warning:
+                    warnings += (write_warning,)
             for warning in warnings:
                 if warning not in announced:
                     print_fn(warning)
@@ -1536,6 +1742,7 @@ def plan_sigma_windows(
             "runtime_noise_budget": fit["noise_budget"],
             "factor_growth": list(fit["factor_growth"]),
             "cache_status": fit["cache_status"],
+            "rule_table": fit["rule_table"],
             "fit_seconds": fit["seconds"],
             "sc_fixed_rule": frozen,
             "sc_fixed_padded_box_ry": (
@@ -1557,6 +1764,12 @@ def plan_sigma_windows(
         "eta_ry": eta, "eps": tolerance,
         "rule_eps": tolerance,
         "cache_dir": cache_dir, "rule_cache_schema": _RULE_CACHE_SCHEMA,
+        "rule_table_dir": _rule_table_root(cache_dir),
+        "rule_table_format": _RULE_TABLE_FORMAT,
+        "rule_table_lookups": {
+            status: sum(1 for row in fit_rows
+                        if (row.get("value") or {}).get("rule_table") == status)
+            for status in ("hit", "built")},
         "n_windows": len(output),
         "window_tau_pairs": pairs, "distinct_tau_count": distinct,
         "plan_seconds": time.perf_counter() - started,
