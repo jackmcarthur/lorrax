@@ -268,7 +268,7 @@ class ConstructorCapacity:
         return price
 
     def preview(self, side, *, phase, sample_batch=1, selection_faces=None,
-                padding_output_bytes_per_rank=0):
+                cross_original_sides=None, padding_output_bytes_per_rank=0):
         """Preview device admission without appending a ledger row."""
         # A candidate carrier may be rejected in favour of the current
         # round's smaller one.  Its workspace must not become a high-water
@@ -277,6 +277,7 @@ class ConstructorCapacity:
         try:
             price, native = self.quote(side, phase=phase, sample_batch=sample_batch,
                                        selection_faces=selection_faces,
+                                       cross_original_sides=cross_original_sides,
                                        padding_output_bytes_per_rank=padding_output_bytes_per_rank)
         finally:
             self._native_maxima, self._workspace = maxima, workspace
