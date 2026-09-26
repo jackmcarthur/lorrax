@@ -440,8 +440,7 @@ def solve_bse_sharded(
         def _trlan_run(pcx, pcy, pvx, pvy, ec, ev, WR, Vq0, M):
             def apply_H(V):
                 V = jax.lax.with_sharding_constraint(V, sh.X)
-                return matvec_ring(V, pcx, pcy, pvx, pvy, ec, ev, WR, Vq0,
-                                   MX, MY)
+                return matvec_ring(V, pcx, pcy, pvx, pvy, ec, ev, WR, Vq0, M)
             return thick_restart_lanczos_eig(
                 apply_H, (nc_pad, nv_pad, nk),
                 n_eig=n_eig, m_max=m_max, n_keep=n_keep,
