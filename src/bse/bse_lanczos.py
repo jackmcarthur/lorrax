@@ -23,7 +23,6 @@ from solvers.lanczos import (
     FULL_REORTH,
     reorth_kind,
     alpha_herm_sink,
-    block_lanczos_eig,
     block_lanczos_eig_jit,
     block_lanczos_eig_jit_converged,
     report_alpha_herm,
