@@ -208,12 +208,13 @@ def test_gw_warns_once_per_centroid_table(tmp_path):
     path = _table(tmp_path, (0, 18), (0, 35))
     cfg = SimpleNamespace(bispinor=False, paths=SimpleNamespace(
         centroids_file=path, centroids_file_current=None))
-    said = []
     bs = _slices(b1=14, b2=18, b3=26, b4=36)
-    for _ in range(2):
-        gi._check_centroid_selection_windows(
-            cfg, bs, (0, 26), (0, 36), said.append)
-    assert len(said) == 1 and said[0].startswith("WARNING:")
+    gi._CENTROID_WINDOW_WARNED.discard(path)
+    with pytest.warns(RuntimeWarning) as record:
+        for _ in range(2):
+            gi._check_centroid_selection_windows(cfg, bs, (0, 26), (0, 36))
+    said = [str(w.message) for w in record if "centroid file" in str(w.message)]
+    assert len(said) == 1 and "left=(0, 18)" in said[0]
 
 
 # ---------------------------------------------------------------------------
