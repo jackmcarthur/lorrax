@@ -2,7 +2,7 @@
 
 This is the physics gate of the ordered route. An ordered store in the physical orientation
 W_q = FT_q[W] (each parent keeps its positive modes; -q is its own parent) feeds the production
-shared-pole tau kernel. Conduction windows take W_+(q); valence windows take
+shared-pole tau body (SynthesisTau). Conduction windows take W_+(q); valence windows take
 shared_pole_hole_kernel's W_+(-q)^T. Both equal -psi^H [G(t) o W_branch(t)] psi on the
 Born-von Karman supercell to 1e-10 relative. Feeding the valence window W_+(q)^T instead (the
 swapped routing) misses by at least 1e-3.
@@ -22,7 +22,8 @@ def test_ordered_sigma_matches_real_space_igw_and_the_swapped_routing_does_not(m
     import jax.numpy as jnp
     from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
     import gw.ppm_tau_kernel as tau_kernel
-    from gw.mpa.sigma import shared_pole_hole_kernel, synthesize_shared_pole_parents
+    from gw.mpa.sigma import (SynthesisTau, WSynthesis, shared_pole_hole_kernel,
+                              synthesize_shared_pole_parents)
     from symmetry_maps import q_negation_index
     from gw.wavefunction_bundle import BandSlices, parent_sigma_operands, sigma_face_kernel_kwargs
     from multi_device.full_photon_head_sigma_gate import _bundle
@@ -64,7 +65,9 @@ def test_ordered_sigma_matches_real_space_igw_and_the_swapped_routing_does_not(m
             om, omm = np.sqrt(p2), np.sqrt(p2m)
             stored = (b / (2 * om * (z - om))) @ b.conj().T - (np.conj(bm) / (2 * omm * (z + omm))) @ bm.T
             want = ft_q(supercell, lat, qf)
-            assert np.linalg.norm(stored - want) <= 1e-12 * np.linalg.norm(want)
+            # The plant's own roundoff: the dense W_c(z) and its Fourier
+            # transform agree to ~1.03e-12 relative before any LORRAX code runs.
+            assert np.linalg.norm(stored - want) <= 1e-11 * np.linalg.norm(want)
     odd_even = np.linalg.norm(w_c(0.7j, pencil) - w_c(0.7j, pencil).T) / np.linalg.norm(w_c(0.7j, pencil))
     assert odd_even > 1e-2, "the lattice must break time reversal"
 
@@ -83,24 +86,33 @@ def test_ordered_sigma_matches_real_space_igw_and_the_swapped_routing_does_not(m
     faces = (put(factors, P(None, "x", None, "y")), put(factors, P(None, "y", None, "x")),
              put(poles2), put(intervals))
     hole, minus_q = shared_pole_hole_kernel(mesh), put(np.asarray(minus, np.int32))
-    swapped = {"on": False}
-
-    def build(space, _omega, _indices, _bounds, _phase_real, E_ref_B, t_node, _active_count=None):
-        plus = synthesize(*faces, E_ref_B, t_node)
-        if space != "val":
-            return plus
-        return jnp.swapaxes(plus, -1, -2) if swapped["on"] else hole(plus, minus_q)
-
-    kernel = tau_kernel.get_shared_sigma_tau_kernel(
-        mesh_xy=mesh, kgrid=(lat.n1, lat.n2, 1), brackets=None, w_synthesis=build,
-        **sigma_face_kernel_kwargs(wfns))
     xn, yr, xr, yn, _, _ = parent_sigma_operands(wfns)
+    sigma_kij = tau_kernel._get_sigma_kij_kernel(
+        mesh_xy=mesh, kgrid=(lat.n1, lat.n2, 1), merged_x=True, brackets=None,
+        **sigma_face_kernel_kwargs(wfns))
 
-    def production(space, t, ref_a, ref_b):
+    def body(swapped):
+        """The production τ body over a planted W synthesis; ``swapped`` is the control."""
+        def w_kernel(x, y, p, r, E_ref_B, t_node, valence):
+            plus = synthesize(x, y, p, r, E_ref_B, t_node)
+            if not valence:
+                return plus
+            return jnp.swapaxes(plus, -1, -2) if swapped else hole(plus, minus_q)
+        synthesis = WSynthesis(w_kernel, lambda _space, _indices, _bounds: faces,
+                               lambda: faces, lambda _result=None: None, 0,
+                               ("lattice", swapped), ordered=True)
+        return SynthesisTau(sigma_kij, synthesis, yr, yn, 0, "lattice", None,
+                            ("lattice", id(mesh)), (wfns.green_parent.plan,))
+
+    bodies = {False: body(False), True: body(True)}
+
+    def production(space, t, ref_a, ref_b, swapped=False):
         energy, mask = (e - mu_f, occ == 0) if space == "cond" else (mu_f - e, occ > 0)
-        out = kernel(xn, yr, xr, yn, put(energy, P(None, None)), put(mask, P(None, None)), space, None,
-                     put(np.zeros(1, np.int32)), put(np.zeros((1, 6))), put(np.zeros(1, bool)),
-                     put(np.float64(ref_a)), put(np.float64(ref_b)), put(np.complex128(t)))
+        tk = bodies[swapped]
+        arguments = tk.window_arguments(xn, xr, put(energy, P(None, None)), put(mask, P(None, None)),
+                                        put(np.float64(ref_a)), put(np.float64(ref_b)),
+                                        space, None, None)
+        out = jax.jit(tk.window_kernel(space))(*arguments, put(np.complex128(t)), None)
         return np.diagonal(np.asarray(out)[..., :nb, :nb], axis1=-2, axis2=-1)
 
     def reference(space, t, ref_a, ref_b):
@@ -119,9 +131,8 @@ def test_ordered_sigma_matches_real_space_igw_and_the_swapped_routing_does_not(m
                 scale = np.max(np.abs(want))
                 worst = max(worst, np.max(np.abs(production(space, t, ref_a, ref_b) - want)) / scale)
                 if space == "val":
-                    swapped["on"] = True
-                    control = min(control, np.max(np.abs(production(space, t, ref_a, ref_b) - want)) / scale)
-                    swapped["on"] = False
+                    control = min(control, np.max(np.abs(
+                        production(space, t, ref_a, ref_b, swapped=True) - want)) / scale)
     print(f"GATE lattice Sigma = iGW (3 t x 2 refs x cond/val): max diagonal rel {worst:.2e} <= 1e-10; "
           f"swapped valence routing min rel {control:.2e} >= 1e-3; plant |W - W^T|/|W| {odd_even:.3f}")
     assert worst <= 1e-10, worst

@@ -1,6 +1,5 @@
 import jax
 import numpy as np
-import pytest
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
 from gw.ppm_accumulators import DeviceOmegaAccumulator
@@ -58,6 +57,16 @@ def test_selector_boundary_is_strict_below_and_inclusive_above():
     np.testing.assert_allclose(got, want, rtol=2e-15, atol=2e-15)
 
 
+def _constant(sigma, _t, _active_count):
+    return sigma
+
+
+def _fold(acc, sigma, t, alpha, **options):
+    """One window executable whose τ kernel returns the same Σ at every node."""
+    acc.integrate_window(_constant, (sigma,), t, alpha, n_active=len(t),
+                         active_count=None, capacity=len(t), **options)
+
+
 def test_device_frequency_fold_and_one_sided_completion():
     mesh = _mesh()
     sigma_sharding = NamedSharding(mesh, P(None, "x", "y"))
@@ -73,11 +82,8 @@ def test_device_frequency_fold_and_one_sided_completion():
 
     acc = DeviceOmegaAccumulator(omega, shape=shape,
                                  sharding=output_sharding, omega_axis=0)
-    acc.begin_window(t, alpha, omega_sign=sign, prefactor=pref,
-                     e_ref_sum=e_ref, antihermitian=True)
-    for _ in t:
-        acc.add_tau(sigma)
-    acc.end_window()
+    _fold(acc, sigma, t, alpha, omega_sign=sign, prefactor=pref,
+          e_ref_sum=e_ref, antihermitian=True)
     got = np.asarray(acc.finalize())
 
     coeff = ((pref * alpha[:, None])
@@ -85,13 +91,6 @@ def test_device_frequency_fold_and_one_sided_completion():
     Z = coeff.sum(axis=0).reshape((-1, 1, 1, 1)) * np.asarray(sigma)[None]
     want = (Z - np.conj(np.swapaxes(Z, -1, -2))) / 2j
     np.testing.assert_allclose(got, want, rtol=2e-14, atol=2e-14)
-
-    broken = DeviceOmegaAccumulator(omega, shape=shape,
-                                    sharding=output_sharding, omega_axis=0)
-    broken.begin_window(t, alpha, omega_sign=sign, prefactor=pref)
-    broken.add_tau(sigma)
-    with pytest.raises(RuntimeError, match="before all tau nodes"):
-        broken.end_window()
 
 
 def test_device_frequency_fold_can_target_one_causal_half():
@@ -103,12 +102,9 @@ def test_device_frequency_fold_can_target_one_causal_half():
         np.asarray([[[2.0 + 0.5j]]]), sigma_sharding)
     acc = DeviceOmegaAccumulator(
         omega, shape=(4, 1, 1, 1), sharding=output_sharding, omega_axis=0)
-    acc.begin_window(
-        np.asarray([0.3]), np.asarray([0.7]), omega_sign=1.0,
-        prefactor=-1.0, omega_indices=np.asarray([2, 3]),
-        omega_values=np.asarray([0.0, 0.4]))
-    acc.add_tau(sigma)
-    acc.end_window()
+    _fold(acc, sigma, np.asarray([0.3]), np.asarray([0.7]), omega_sign=1.0,
+          prefactor=-1.0, omega_indices=np.asarray([2, 3]),
+          omega_values=np.asarray([0.0, 0.4]))
     got = np.asarray(acc.finalize())[:, 0, 0, 0]
     assert np.array_equal(got[:2], np.zeros(2, np.complex128))
     want = -0.7 * np.exp(1j * np.asarray([0.0, 0.4]) * 0.3) * (2 + 0.5j)
@@ -126,11 +122,8 @@ def test_device_frequency_fold_preserves_a_leading_bracket_axis():
     acc = DeviceOmegaAccumulator(
         omega, shape=(2, 3, 2, 2, 2), sharding=output_sharding,
         omega_axis=1)
-    acc.begin_window(
-        np.asarray([0.4]), np.asarray([0.7]), omega_sign=-1.0,
-        prefactor=0.5)
-    acc.add_tau(sigma)
-    acc.end_window()
+    _fold(acc, sigma, np.asarray([0.4]), np.asarray([0.7]), omega_sign=-1.0,
+          prefactor=0.5)
 
     got = np.asarray(acc.finalize())
     coeff = 0.35 * np.exp(-1j * omega * 0.4)
@@ -153,10 +146,7 @@ def test_device_frequency_fold_carries_a_leading_band_bracket_axis():
     acc = DeviceOmegaAccumulator(
         omega, shape=(2, omega.size, 2, 2, 2),
         sharding=output_sharding, omega_axis=1)
-    acc.begin_window(t, alpha, omega_sign=1.0, prefactor=-1.0)
-    for _ in t:
-        acc.add_tau(sigma)
-    acc.end_window()
+    _fold(acc, sigma, t, alpha, omega_sign=1.0, prefactor=-1.0)
 
     got = np.asarray(acc.finalize())
     coeff = (-alpha[:, None]

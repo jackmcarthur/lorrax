@@ -161,19 +161,25 @@ def _synthesis_fixture(monkeypatch):
 
 
 @pytest.mark.parametrize('parent_capacity,column_capacity', [(2,5),(1,3)])
-def test_synthesis_uses_same_carrier_for_resident_and_panels(
+def test_synthesis_reads_once_and_runs_inside_one_program(
         monkeypatch, parent_capacity, column_capacity):
+    """Resident, parent-panel and column-chunk schedules give the same W.
+
+    The factors are read once, at the synthesis; ``w_kernel`` runs under one
+    jit (as it does inside the window executable) and never reads again.
+    """
     from gw.mpa.sigma import _shared_pole_w_synthesis
     fx = _synthesis_fixture(monkeypatch)
     mesh, meta, header = fx.mesh, fx.meta, fx.header
-    parents, factor, omega, reads, put = (
-        fx.parents, fx.factor, fx.omega, fx.reads, fx.put)
+    parents, factor, omega, reads = fx.parents, fx.factor, fx.omega, fx.reads
     schedule=dict(status='PASS',parent_capacity=parent_capacity,
                   column_capacity=column_capacity,endpoint_budgets={})
-    build=_shared_pole_w_synthesis(None,meta,header,omega,schedule,mesh_xy=mesh)
+    synthesis=_shared_pole_w_synthesis(None,meta,header,omega,schedule,mesh_xy=mesh)
+    assert len(reads)==1
     bounds=np.tile([0,np.inf,-np.inf,-np.inf,np.inf,np.inf],(2,1))
-    args=(None,None,put(np.arange(2),P()),put(bounds,P()),None,.3,.7+.2j)
-    got=build(*args)
+    operands=synthesis.window_operands('cond',np.arange(2),bounds)
+    w=jax.jit(lambda ops,e,t: synthesis.w_kernel(*ops,e,t,False))
+    got=w(operands,.3,.7+.2j)
     f=factor[:,:,0,:]
     d=np.exp(-1j*(omega-.3)*(.7+.2j))/(2*omega)
     plus=(f*d[:,None,:])@f.conj().swapaxes(-1,-2)
@@ -181,9 +187,9 @@ def test_synthesis_uses_same_carrier_for_resident_and_panels(
     # Every q of the 2x2x2 fixture is self-negative, with identity star maps.
     expected=(.5*(plus+trans))[parents]
     np.testing.assert_allclose(got,expected,atol=3e-12)
-    before=len(reads)
-    jax.block_until_ready(build(*args))
-    assert len(reads)==before*(1 if parent_capacity==2 else 2)
+    jax.block_until_ready(w(operands,.3,.7+.2j))
+    assert len(reads)==1
+    synthesis.close()
 
 def test_equal_size_panels_each_reserve_their_own_warm_stage(monkeypatch):
     """Two panels of equal (count, width) are two ledger reservations.
