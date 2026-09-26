@@ -415,7 +415,7 @@ def test_sigma_spatial_cache_owns_plan_and_selects_each_plans_parent_rows(monkey
     monkeypatch.setattr("common.contract_bands.contract_bands_block_reshard",
                         lambda *a, **k: SimpleNamespace(
                             prepare=lambda left, right: None,
-                            accumulate=lambda faces, o, a0, b0, acc: o,
+                            accumulate=lambda faces, o, rows, acc: o,
                             finish=lambda acc: acc))
     monkeypatch.setattr("symmetry_maps.unfold_file_wedge_band_operator",
                         lambda sym, value, **k: value)

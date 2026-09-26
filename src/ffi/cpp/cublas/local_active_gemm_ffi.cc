@@ -6,6 +6,10 @@
 // C^T = B^T A^T, so an interval [lo,hi) is a pair of pointer views with the
 // original leading dimensions.  No selected operand or distributed context is
 // created, and no collective is issued.
+//
+// Two bindings.  The aliased one takes C and applies beta.  The `_out` one takes
+// no C: beta is 0, so every batch row is written here (the GEMM over a live
+// interval, a memset of an empty one) and the output needs no zero fill first.
 
 #include "xla/ffi/api/ffi.h"
 #include "common/ffi_helpers.h"
@@ -191,9 +195,10 @@ static bool ProductFitsInt64(int64_t x, int64_t y) {
   return x == 0 || y <= std::numeric_limits<int64_t>::max() / x;
 }
 
+// c_in == nullptr: the `_out` binding (no C operand, beta = 0).
 static ffi::Error DispatchWithBounds(
     cudaStream_t stream, ffi::AnyBuffer a, ffi::AnyBuffer b,
-    ffi::AnyBuffer c_in,
+    const ffi::AnyBuffer* c_in,
     ffi::Result<ffi::AnyBuffer> c_out,
     ffi::Result<ffi::BufferR1<ffi::U8>> workspace,
     const std::vector<int32_t>& host_bounds, int64_t n_bounds, int64_t nq,
@@ -205,25 +210,30 @@ static ffi::Error DispatchWithBounds(
       !ProductFitsInt64(nq, m * k) || !ProductFitsInt64(nq, k * n) ||
       !ProductFitsInt64(nq, m * n))
     return ffi::Error::InvalidArgument("local active GEMM dimension overflow");
+  const auto c_dims = c_in != nullptr ? c_in->dimensions() : c_out->dimensions();
+  const ffi::DataType c_type = c_in != nullptr ? c_in->element_type() : c_out->element_type();
   if (a.dimensions().size() != 3 || b.dimensions().size() != 3 ||
-      c_in.dimensions().size() != 3 || c_out->dimensions().size() != 3 ||
+      c_dims.size() != 3 || c_out->dimensions().size() != 3 ||
       a.dimensions()[0] != nq || a.dimensions()[1] != m ||
       a.dimensions()[2] != k || b.dimensions()[0] != nq ||
       b.dimensions()[1] != k || b.dimensions()[2] != n ||
-      c_in.dimensions()[0] != nq || c_in.dimensions()[1] != m ||
-      c_in.dimensions()[2] != n || c_out->dimensions()[0] != nq ||
+      c_dims[0] != nq || c_dims[1] != m ||
+      c_dims[2] != n || c_out->dimensions()[0] != nq ||
       c_out->dimensions()[1] != m || c_out->dimensions()[2] != n)
     return ffi::Error::InvalidArgument("local active GEMM buffer geometry");
   if (n_bounds != 1 && n_bounds != nq)
     return ffi::Error::InvalidArgument(
         "local active GEMM needs one or nq bound pairs");
   if (a.element_type() != b.element_type() ||
-      a.element_type() != c_in.element_type() ||
+      a.element_type() != c_type ||
       a.element_type() != c_out->element_type())
     return ffi::Error::InvalidArgument("local active GEMM operand dtype mismatch");
-  if (c_in.untyped_data() != c_out->untyped_data())
+  if (c_in != nullptr && c_in->untyped_data() != c_out->untyped_data())
     return ffi::Error::InvalidArgument(
         "local active GEMM requires declared C input/output alias");
+  if (c_in == nullptr && (beta_re != 0.0 || beta_im != 0.0))
+    return ffi::Error::InvalidArgument(
+        "local active GEMM without C requires beta = 0");
   if (workspace->dimensions()[0] < kWorkspaceBytes)
     return ffi::Error::InvalidArgument("local active GEMM workspace too small");
 
@@ -276,8 +286,29 @@ static ffi::Error Dispatch(
       cudaMemcpyDeviceToHost, stream));
   LORRAX_LOCAL_CUDA(cudaStreamSynchronize(stream));
   return DispatchWithBounds(
-      stream, a, b, c_in, c_out, workspace, host_bounds, n_bounds, nq, m, k, n,
+      stream, a, b, &c_in, c_out, workspace, host_bounds, n_bounds, nq, m, k, n,
       alpha_re, alpha_im, beta_re, beta_im);
+}
+
+// The `_out` binding: no C operand, beta = 0 (the handler writes every row).
+static ffi::Error OutDispatch(
+    cudaStream_t stream, ffi::AnyBuffer a, ffi::AnyBuffer b,
+    ffi::BufferR2<ffi::S32> bounds, ffi::Result<ffi::AnyBuffer> c_out,
+    ffi::Result<ffi::BufferR1<ffi::U8>> workspace, int64_t nq, int64_t m,
+    int64_t k, int64_t n, double alpha_re, double alpha_im) {
+  if (bounds.dimensions()[1] != 2 ||
+      (bounds.dimensions()[0] != 1 && bounds.dimensions()[0] != nq))
+    return ffi::Error::InvalidArgument(
+        "local active GEMM bounds must have shape (1|nq,2)");
+  const int64_t n_bounds = bounds.dimensions()[0];
+  std::vector<int32_t> host_bounds(2 * n_bounds);
+  LORRAX_LOCAL_CUDA(cudaMemcpyAsync(
+      host_bounds.data(), bounds.typed_data(), host_bounds.size() * sizeof(int32_t),
+      cudaMemcpyDeviceToHost, stream));
+  LORRAX_LOCAL_CUDA(cudaStreamSynchronize(stream));
+  return DispatchWithBounds(
+      stream, a, b, nullptr, c_out, workspace, host_bounds, n_bounds, nq, m, k, n,
+      alpha_re, alpha_im, 0.0, 0.0);
 }
 
 static ffi::Error PreparedDispatch(
@@ -300,7 +331,7 @@ static ffi::Error PreparedDispatch(
     host_bounds[i] = static_cast<int32_t>(active_bounds[i]);
   }
   return DispatchWithBounds(
-      stream, a, b, c_in, c_out, workspace, host_bounds, n_bounds, nq, m, k, n,
+      stream, a, b, &c_in, c_out, workspace, host_bounds, n_bounds, nq, m, k, n,
       alpha_re, alpha_im, beta_re, beta_im);
 }
 
@@ -325,6 +356,23 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(
         .Attr<double>("alpha_im")
         .Attr<double>("beta_re")
         .Attr<double>("beta_im"));
+
+XLA_FFI_DEFINE_HANDLER_SYMBOL(
+    CublasLocalActiveRangeGemmOutFfi,
+    lorrax_ffi::cublas_local_active_gemm::OutDispatch,
+    ffi::Ffi::Bind()
+        .Ctx<ffi::PlatformStream<cudaStream_t>>()
+        .Arg<ffi::AnyBuffer>()
+        .Arg<ffi::AnyBuffer>()
+        .Arg<ffi::BufferR2<ffi::S32>>()
+        .Ret<ffi::AnyBuffer>()
+        .Ret<ffi::BufferR1<ffi::U8>>()
+        .Attr<int64_t>("nq")
+        .Attr<int64_t>("m")
+        .Attr<int64_t>("k")
+        .Attr<int64_t>("n")
+        .Attr<double>("alpha_re")
+        .Attr<double>("alpha_im"));
 
 XLA_FFI_DEFINE_HANDLER_SYMBOL(
     CublasLocalPreparedActiveRangeGemmFfi,

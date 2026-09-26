@@ -741,30 +741,38 @@ def test_face_projector_matches_reference(ns, chunked, monkeypatch):
 
 @pytest.mark.parametrize("layout", ["face", "axis"])
 @pytest.mark.parametrize("ns,d", [(2, 1), (4, 1), (4, 2)])
-def test_spin_blocks_accumulate_into_one_reduction(layout, ns, d):
-    """An operator projected in ``d×d`` spin blocks (the Σ τ spin-block
-    passes): ``prepare`` once, ``accumulate`` every block into the local
-    partial, ``finish`` once — the whole-spin reference to 1e-14, and ONE
-    band-block reduce-scatter (over the whole mesh) however many blocks."""
+def test_x_blocks_accumulate_into_one_reduction(layout, ns, d):
+    """An operator projected in x blocks (the Σ τ passes: block rows on the
+    face slab pieces, every spin, every ν): ``prepare`` once, ``accumulate``
+    every block into the local partial, ``finish`` once — the whole reference
+    to 1e-14, and ONE band-block reduce-scatter (over the whole mesh) however
+    many blocks."""
+    from common.contract_bands import face_row_blocks
+    from ffi.fft import x_block_rows
     mesh = _mesh()
     face = (NK, MN, MU, ns)
     if layout == "face":
         dev, host = _face_operands(mesh, ns=ns, mu_l=MU, mu_r=MU)
     else:
         dev, host, _ = _axis_operands(mesh, mu_l=MU, mu_r=MU, ns=ns)
+    mx = MU // PX
+    blocks = face_row_blocks(mx, PY, (ns // d) ** 2)
     proj = contract_bands_block_reshard(
-        mesh, layout=layout, face_shape=face, spin_block=d)
+        mesh, layout=layout, face_shape=face,
+        row_block=blocks[0][1] * blocks[0][3])
+    assert proj.row_blocks((ns // d) ** 2) == blocks
     o_spec = NamedSharding(mesh, P(None, None, "x", None, "y"))
-    blocks = [(a0, b0) for a0 in range(0, ns, d) for b0 in range(0, ns, d)]
+    rows_of = {rows: np.concatenate([i * mx + x_block_rows(rows)
+                                     for i in range(PX)]) for rows in blocks}
 
     @jax.jit
     def blocked(left, o, right):
         faces = proj.prepare(left, right)
         acc = None
-        for a0, b0 in blocks:
+        for rows in blocks:
             blk = jax.lax.with_sharding_constraint(
-                o[:, a0:a0 + d, :, b0:b0 + d], o_spec)
-            acc = proj.accumulate(faces, blk, a0=a0, b0=b0, acc=acc)
+                jnp.take(o, jnp.asarray(rows_of[rows]), axis=2), o_spec)
+            acc = proj.accumulate(faces, blk, rows=rows, acc=acc)
         return proj.finish(acc)
 
     ref = _face_ref(*host)
@@ -774,8 +782,6 @@ def test_spin_blocks_accumulate_into_one_reduction(layout, ns, d):
     whole = re.findall(r"reduce-scatter(?:-start)?\([^\n]*replica_groups="
                        r"(?:\{\{0,1,2,3\}\}|\[1,4\])", hlo)
     assert len(whole) == 1, hlo
-    with pytest.raises(ValueError, match="spin blocks"):
-        proj(*dev)
 
 
 def test_face_projector_never_moves_the_operator(monkeypatch):
