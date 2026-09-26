@@ -1510,14 +1510,12 @@ def deprecated_env_record(env_name: str, key_value) -> str:
 #
 # This module used to carry its own ``_env_bool`` for conditioning telemetry.
 # The rank receipt is now mandatory production output, so it has no env gate.
-# ``gw.gw_config.env_bool`` has the
-# identical vocabulary plus the once-per-(name,value) ``*** LORRAX
-# SANITY`` announcement on unrecognised tokens.  The import direction is
-# L1→L1 and safe: ``gw/__init__`` pulls only ``gw_config``, which is
-# deliberately jax-free and imports nothing from ``isdf``.
-# (P1.3 grammar unification, 2026-07-31; the drift gate is
+# ``runtime.env_flags.env_bool`` has the identical vocabulary plus the
+# once-per-(name,value) ``*** LORRAX SANITY`` announcement on unrecognised
+# tokens.  (P1.3 grammar unification, 2026-07-31; the drift gate is
 # ``tests/test_env_grammar.py``, which scans this file as an OWNED file.)
-from gw.gw_config import ZETA_RCOND_DEFAULT, env_bool
+from runtime.env_flags import env_bool
+from gw.gw_config import ZETA_RCOND_DEFAULT
 
 
 def _deprecated_env_float(env_name: str, key_name: str, key_value) -> float:
