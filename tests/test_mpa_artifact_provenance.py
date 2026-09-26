@@ -14,6 +14,7 @@ import pytest
 from file_io import restart_bundle as _bundle_reader
 from file_io import mpa_store
 from gw.mpa import fit_driver, model, sigma
+from tests._mpa_test_geometry import cpu_mesh, host_slab_io, put_fit_block
 
 
 _CERT = {
@@ -41,18 +42,19 @@ def test_every_driver_screening_call_carries_charge_zeta_identity():
 
 
 def _finalized_fit(path, *, provenance=None):
-    mpa_store.allocate_fit_store(
-        path, n_q=1, n_mu=2, n_p=1, energy_unit="Ry",
-        grid_hash="grid", table_hash="table", centroid_hash="centroids",
-        provenance=provenance)
     omega = np.full((1, 2, 2), 0.8 - 0.1j, dtype=np.complex128)
     residue = np.ones_like(omega)
     diagnostics = {
         "condition": np.ones((2, 2)),
         "backward_error": np.zeros((2, 2)),
     }
-    mpa_store.write_fit_block(
-        path, 0, [0, 1], omega, residue, diagnostics)
+    with host_slab_io():
+        mpa_store.allocate_fit_store_collective(
+            str(path), mesh_xy=cpu_mesh(), n_q=1, n_mu=2, n_p=1,
+            energy_unit="Ry", grid_hash="grid", table_hash="table",
+            centroid_hash="centroids", provenance=provenance)
+        put_fit_block(path, 0, [0, 1], omega, residue, diagnostics,
+                      mesh=cpu_mesh())
     mpa_store.finalize_fit_store(path, certification=_CERT)
 
 
@@ -74,9 +76,6 @@ def test_sample_writer_stamps_the_canonical_wfn_owner(
         model, "_q_wedge",
         lambda *args, **kwargs: (
             np.asarray([0]), object(), SimpleNamespace()))
-    monkeypatch.setattr(
-        model.mpa_store, "refuse_completed_artifact_replacement",
-        lambda *args, **kwargs: ())
     captured = {}
 
     class ReachedSampleAllocation(RuntimeError):

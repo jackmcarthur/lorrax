@@ -48,7 +48,8 @@ from file_io import restart_bundle as _bundle_reader
 from file_io import mpa_store as MS                               # noqa: E402
 from gw.mpa import fit_driver, pade_fit, sampling, tiling         # noqa: E402
 from tests._mpa_test_geometry import (                            # noqa: E402
-    N_Q_IBZ as _N_Q_IBZ, HostSlabIO, geometry)
+    N_Q_IBZ as _N_Q_IBZ, HostSlabIO, geometry, read_fit_store,
+    write_w_collective)
 
 #: Twelve seeds, every one with first index < 6.  The glide maps
 #: (r0, r1, r2) -> (r0 + 6, r1, -r2), so no seed is its own image and no
@@ -262,7 +263,8 @@ def test_run_driver_holds_one_fit_payload_handle(
     fit_writes = [name for path, name in writes if path == str(fit_path)]
     assert len(fit_writes) == 3 * report["blocks_walked"]
     assert set(fit_writes) == {"Omega_p", "B_p", "fit_condition"}
-    receipt = _bundle_reader.read_fit_io_receipt(str(fit_path))
+    with h5py.File(fit_path, "r") as grp:
+        receipt = MS._read_fit_io_receipt_group(grp)
     assert receipt["scope"] == "successful_body_attempt"
     for key in MS._FIT_IO_RECEIPT_COUNTS:
         assert receipt["counts"][key] == report[key]
@@ -517,7 +519,7 @@ def _protocol_grid(n_p=_N_P):
         energy_unit="Ha")
 
 
-def _write_w_file(path, n_p=_N_P):
+def _write_w_file(path, mesh_xy, n_p=_N_P):
     """A complete, fully-ready W(omega) file plus the planted field."""
     tables, verdict, n_mu = _geometry()
     assert n_mu == _N_MU, f"geometry drifted: {n_mu} centroids"
@@ -526,11 +528,9 @@ def _write_w_file(path, n_p=_N_P):
     W = _synthesize_w(Omega, B, z)
     line = np.array([0] * n_p + [1] * n_p, dtype=np.int32)
 
-    MS.allocate_w_omega(
-        str(path), _W_NAME, n_omega=2 * n_p, n_q_on_disk=_N_Q_IBZ,
-        n_mu=n_mu, tables=tables, omega=z,
-        sampling=dict(_SAMPLING, n_p=n_p), omega_line=line,
-        closure_verdict=verdict,
+    write_w_collective(
+        path, _W_NAME, W, mesh=mesh_xy, tables=tables, verdict=verdict,
+        omega=z, sampling=dict(_SAMPLING, n_p=n_p), omega_line=line,
         provenance={
             "deck": "synthetic-glide-mpa-driver",
             "wfn_fingerprint_scheme": "wfn-test-v1",
@@ -538,18 +538,16 @@ def _write_w_file(path, n_p=_N_P):
             "charge_zeta_identity_scheme": "zeta-test-v1",
             "charge_zeta_identity": "zeta-test-a",
         })
-    for i in range(2 * n_p):
-        MS.write_w_slab(str(path), _W_NAME, i, W[i], ready=True)
     return {"z": z, "Omega": Omega, "B": B, "W": W, "n_mu": n_mu,
             "n_q": _N_Q_IBZ, "n_p": n_p}
 
 
 @pytest.fixture(scope="module")
-def planted(tmp_path_factory):
+def planted(tmp_path_factory, mesh_xy):
     """The W(omega) file and the field it was synthesized from."""
     root = tmp_path_factory.mktemp("mpa_driver")
     w_path = root / "W_omega.h5"
-    field = _write_w_file(w_path)
+    field = _write_w_file(w_path, mesh_xy)
     field["root"] = root
     field["w_path"] = w_path
     return field
@@ -592,17 +590,17 @@ def test_sample_identities_propagate_through_fit_and_reuse(fitted):
 # ---------------------------------------------------------------------------
 
 def test_end_to_end_recovers_the_planted_pole_field(planted, fitted,
-                                                    capsys):
+                                                    capsys, mesh_xy):
     """Poles in through the W file, same poles out of the fit store.
 
     THE GATE.  Every step is the production one: the samples were
     written per frequency and stamped ready, read back in budgeted
-    column blocks through ``read_w_columns``, fitted by the vmapped
-    kernel, staged block by block through ``write_fit_block``, and read
-    again through ``read_fit_tensors`` after ``finalize_fit_store``.
-    Nothing in this assertion touches an in-memory shortcut.
+    column blocks through ``WColumnReader``, fitted by the vmapped
+    kernel, staged block by block through ``FitWriter``, and read again
+    through ``PoleReader`` after ``finalize_fit_store``.  Nothing in this
+    assertion touches an in-memory shortcut.
     """
-    Om, Bp, diag, ledger = _bundle_reader.read_fit_tensors(str(fitted["path"]))
+    Om, Bp, diag, ledger = read_fit_store(fitted["path"], mesh=mesh_xy)
     assert ledger["complete"]
     assert Om.shape == planted["Omega"].shape
     assert Bp.shape == planted["B"].shape
@@ -704,27 +702,19 @@ def test_ordered_end_to_end_stores_and_recovers_the_odd_residue(
     line = np.array([0] * _N_P + [1] * _N_P, dtype=np.int32)
     sample_path = tmp_path / "W_ordered.h5"
     common = dict(
-        n_omega=2 * _N_P, n_q_on_disk=_N_Q_IBZ, n_mu=n_mu,
-        tables=tables, sampling=_SAMPLING, omega_line=line,
-        closure_verdict=verdict,
+        mesh=mesh_xy, tables=tables, verdict=verdict, sampling=_SAMPLING,
+        omega_line=line,
         provenance={"deck": "synthetic-ordered-mpa-driver"})
-    MS.allocate_w_omega(
-        str(sample_path), _W_NAME, omega=z, **common)
-    MS.allocate_w_omega(
-        str(sample_path), _W_NEGATIVE_NAME, omega=-z, **common)
-    for index in range(2 * _N_P):
-        MS.write_w_slab(
-            str(sample_path), _W_NAME, index, positive[index], ready=True)
-        MS.write_w_slab(
-            str(sample_path), _W_NEGATIVE_NAME, index, negative[index],
-            ready=True)
+    write_w_collective(sample_path, _W_NAME, positive, omega=z, **common)
+    write_w_collective(
+        sample_path, _W_NEGATIVE_NAME, negative, omega=-z, **common)
 
     fit_path = tmp_path / "fit_ordered.h5"
     ledger, report = fit_driver.run_fit_driver(
         str(sample_path), _W_NAME, str(fit_path), z, _N_P,
         w_negative_name=_W_NEGATIVE_NAME, mesh_xy=mesh_xy)
-    Omega_f, B_f, D_f = _bundle_reader.read_poles(
-        str(fit_path), include_odd=True)
+    Omega_f, B_f, D_f, _, _ = read_fit_store(
+        fit_path, mesh=mesh_xy, include_odd=True)
     assert ledger["ordered_residues"]
     assert report["ordered_residues"]
     assert D_f is not None
@@ -737,7 +727,7 @@ def test_thiele_end_to_end_keeps_only_condition_payload(tmp_path, mesh_xy):
     """PT keeps its refusal metrics in memory without bloating the store."""
 
     w_path = tmp_path / "W_thiele.h5"
-    field = _write_w_file(w_path)
+    field = _write_w_file(w_path, mesh_xy)
     fit_path = tmp_path / "mpa_fit_thiele.h5"
     ledger, report = fit_driver.run_fit_driver(
         str(w_path), _W_NAME, str(fit_path), field["z"], field["n_p"],
@@ -746,7 +736,7 @@ def test_thiele_end_to_end_keeps_only_condition_payload(tmp_path, mesh_xy):
     assert ledger["complete"]
     assert report["solve"] == "thiele"
     assert report["eig"] == "lapack"
-    _, _, diagnostics, _ = _bundle_reader.read_fit_tensors(str(fit_path))
+    _, _, diagnostics, _ = read_fit_store(fit_path, mesh=mesh_xy)
     assert set(diagnostics) == {"condition"}
     assert np.all(np.isfinite(diagnostics["condition"]))
     with h5py.File(fit_path, "r") as f:
@@ -873,7 +863,7 @@ def test_end_to_end_at_the_si_pole_schedule(tmp_path, capsys, mesh_xy):
     """
     n_p = sampling.POLE_SCHEDULE["Si"]
     assert n_p == 8
-    field = _write_w_file(tmp_path / "W_si.h5", n_p=n_p)
+    field = _write_w_file(tmp_path / "W_si.h5", mesh_xy, n_p=n_p)
     fit_path = tmp_path / "mpa_fit_si.h5"
 
     stream = io.StringIO()
@@ -884,7 +874,7 @@ def test_end_to_end_at_the_si_pole_schedule(tmp_path, capsys, mesh_xy):
     assert report["n_cols_budget"] == 1
     assert report["blocks_walked"] == field["n_q"] * field["n_mu"]
 
-    Om, Bp, diag, _ = _bundle_reader.read_fit_tensors(str(fit_path))
+    Om, Bp, diag, _ = read_fit_store(fit_path, mesh=mesh_xy)
     d_omega = float(np.max(np.abs(Om - field["Omega"])))
     d_b = float(np.max(np.abs(Bp - field["B"])))
     with capsys.disabled():
@@ -910,9 +900,10 @@ def test_end_to_end_at_the_si_pole_schedule(tmp_path, capsys, mesh_xy):
         f"{floor:.3e}; the bar is {_COND_EPS_MARGIN_B:.0f}x")
 
 
-def test_production_fit_persists_only_condition_map(planted, fitted):
+def test_production_fit_persists_only_condition_map(planted, fitted,
+                                                     mesh_xy):
     """Full fit-health arrays do not silently return to production I/O."""
-    _, _, diag, _ = _bundle_reader.read_fit_tensors(str(fitted["path"]))
+    _, _, diag, _ = read_fit_store(fitted["path"], mesh=mesh_xy)
     assert set(diag) == {"condition"}
     with h5py.File(fitted["path"], "r") as f:
         assert set(k for k in f if str(k).startswith("fit_")) == {
@@ -920,7 +911,7 @@ def test_production_fit_persists_only_condition_map(planted, fitted):
 
 
 def test_every_block_has_its_diagnostics_and_the_ledger_is_complete(
-        planted, fitted):
+        planted, fitted, mesh_xy):
     """The ledger is whole, and no diagnostic is a silent zero."""
     ledger = fitted["ledger"]
     n_mu, n_q = planted["n_mu"], planted["n_q"]
@@ -939,7 +930,7 @@ def test_every_block_has_its_diagnostics_and_the_ledger_is_complete(
             np.sqrt(np.finfo(np.float64).eps)),
     }
 
-    _, _, diag, _ = _bundle_reader.read_fit_tensors(str(fitted["path"]))
+    _, _, diag, _ = read_fit_store(fitted["path"], mesh=mesh_xy)
     assert set(diag) == {"condition"}
     arr = diag["condition"]
     assert arr.shape == (n_q, n_mu, n_mu)
@@ -1059,7 +1050,7 @@ def test_red_twin_budget_bust_refuses_mid_walk_then_resumes(
     ledger = MS.finalize_fit_store(str(fit_path), certification=_CERT)
     assert ledger["complete"]
 
-    Om, Bp, _, _ = _bundle_reader.read_fit_tensors(str(fit_path))
+    Om, Bp, _, _ = read_fit_store(fit_path, mesh=mesh_xy)
     assert np.max(np.abs(Om - planted["Omega"])) < 1.0e-7
     assert np.max(np.abs(Bp - planted["B"])) < 1.0e-6
 

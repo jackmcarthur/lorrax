@@ -371,13 +371,14 @@ def _occ_state(**over):
 
 
 def _tiny_fit_store(tmp_path, occupation_state):
-    from file_io import restart_bundle as _bundle_reader
     from file_io import mpa_store as MS
+    from tests._mpa_test_geometry import cpu_mesh, host_slab_io
 
     dest = tmp_path / "fit.h5"
-    MS.allocate_fit_store(
-        dest, n_q=1, n_mu=2, n_p=1, energy_unit="Ry",
-        occupation_state=occupation_state)
+    with host_slab_io():
+        MS.allocate_fit_store_collective(
+            str(dest), mesh_xy=cpu_mesh(), n_q=1, n_mu=2, n_p=1,
+            energy_unit="Ry", occupation_state=occupation_state)
     return dest
 
 
@@ -739,17 +740,18 @@ def _sampling_record(config, omega_max):
 
 
 def _stamped_store(path, record):
-    from file_io import restart_bundle as _bundle_reader
     from file_io import mpa_store as MS
 
-    from tests._mpa_test_geometry import geometry
+    from tests._mpa_test_geometry import cpu_mesh, geometry, host_slab_io
 
     tables, verdict, n_mu = geometry([[1, 2, 3], [4, 5, 6]])
-    MS.allocate_w_omega(
-        path, "chi_qmunu_z", n_omega=2, n_q_on_disk=3, n_mu=n_mu,
-        tables=tables, omega=np.array([2.0e-5j, 0.5 + 0.2j]),
-        omega_line=np.array([0, 1], dtype=np.int32), sampling=record,
-        closure_verdict=verdict, energy_unit="Ry")
+    with host_slab_io():
+        MS.allocate_w_omega_collective(
+            path, "chi_qmunu_z", mesh_xy=cpu_mesh(), n_omega=2,
+            n_q_on_disk=3, n_mu=n_mu, tables=tables,
+            omega=np.array([2.0e-5j, 0.5 + 0.2j]),
+            omega_line=np.array([0, 1], dtype=np.int32), sampling=record,
+            closure_verdict=verdict, energy_unit="Ry")
     return path
 
 
@@ -769,7 +771,7 @@ def test_an_undeclared_shift_leaves_the_store_byte_identical(tmp_path):
     """ADDITIVE means additive.  Holding the ω grid fixed isolates the ONE
     thing the key changes in the store: an attr that appears when the deck
     declares it and is absent otherwise.  So a deck that leaves the key
-    unset hands ``allocate_w_omega`` the same record it handed it before the
+    unset hands ``allocate_w_omega_collective`` the same record it handed it before the
     key existed -- same attr set, same digest, same bytes."""
     import h5py
 
