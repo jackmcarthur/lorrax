@@ -1001,6 +1001,7 @@ def _integrate_sigma_batches(
     w_synthesis=None,
     tau_kernel_factory=None,
     q_wedge=None,
+    tau_capacity=None,
     print_fn,
 ):
     """One spatial executor for streamed fit slabs: one executable per window.
@@ -1081,7 +1082,11 @@ def _integrate_sigma_batches(
         q_pair = (None if q_wedge is None else dataclasses.replace(
             q_wedge, values=None, load=None, trs_rule="pair_transpose").with_load(mesh_xy))
         small = NamedSharding(mesh_xy, P())
-        tau_capacity = max((len(row.window.nodes.t) for row in plan), default=0)
+        # A held SC plan's executables keep one node capacity (the session's
+        # largest, never lowered), so a refit recompiles them only if it
+        # raises it; a one-shot sizes it from its own windows.
+        tau_capacity = max(max((len(row.window.nodes.t) for row in plan), default=0),
+                           int(tau_capacity or 0))
 
         n_sweeps = n_tau = 0
         batch_size = int(pole_batch_size)
@@ -1397,6 +1402,7 @@ def integrate_sigma_store(
     brackets=None,
     band_counts=None,
     odd_residue_off=False,
+    tau_capacity=None,
     print_fn=print,
 ):
     """Read, unfold, consume, and release one pole range at a time.
@@ -1433,7 +1439,7 @@ def integrate_sigma_store(
             wfns, batches(reader), int(n_poles), plan, omega_grid_ry, meta,
             mesh_xy, pole_batch_size=batch_size, brackets=brackets,
             band_counts=band_counts, odd_residue_off=odd_residue_off,
-            q_wedge=q_wedge, print_fn=print_fn)
+            q_wedge=q_wedge, tau_capacity=tau_capacity, print_fn=print_fn)
 
     if isinstance(fit_src, (PoleReader, MemoryPoleSource)):
         return run(fit_src)
@@ -1709,9 +1715,13 @@ def compute_sigma_c_mpa_omega_grid(
                 f"pair_cost={geometry['window_tau_pairs']}, "
                 f"initial_pair_cost="
                 f"{geometry['sc_fixed_initial_window_tau_pairs']}, "
-                f"max_state_pad={geometry['sc_state_edge_padding_ev']:.3f} eV (energy-proportional), "
+                f"plan={geometry['sc_plan_event']}, "
+                f"state_pad=max({geometry['sc_state_edge_padding_ev']:.2f} eV, "
+                f"{100.0 * geometry['sc_state_edge_padding_fraction']:.0f}%|E-mu|), "
                 f"pole_pad="
-                f"{100.0 * geometry['sc_pole_extent_padding_fraction']:.1f}%")
+                f"{100.0 * geometry['sc_pole_extent_padding_fraction']:.1f}% "
+                f"(far x{geometry['sc_far_pole_factor']:g}), "
+                f"tau_capacity={geometry['sc_tau_capacity']}")
             for name, reason in sorted(reasons.items()):
                 print_fn(
                     f"    SC fixed quadrature recompute: {name!r} "
@@ -1761,7 +1771,8 @@ def compute_sigma_c_mpa_omega_grid(
                         brackets=band_brackets, band_counts=band_counts,
                         w_synthesis=synthesis,
                         tau_kernel_factory=(None if owned else
-                                            sector_context["tau_kernel"]), print_fn=print_fn)
+                                            sector_context["tau_kernel"]),
+                        tau_capacity=geometry.get("sc_tau_capacity"), print_fn=print_fn)
                 except BaseException:
                     if owned:
                         synthesis.close()
@@ -1774,6 +1785,7 @@ def compute_sigma_c_mpa_omega_grid(
                     wfns, reader, n_poles, plan, omega_grid_ry, meta, mesh_xy,
                     pole_batch_size=pole_batch_size, brackets=band_brackets,
                     band_counts=band_counts,
+                    tau_capacity=geometry.get("sc_tau_capacity"),
                     print_fn=print_fn)
         # odd_reference=False: the caller builds its own D=0 reference (the GN
         # arm does, in ppm_pipeline), so a second twin here would be a whole
