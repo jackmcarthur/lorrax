@@ -159,20 +159,21 @@ def main():
     total = None
     widths = []
     t = np.float64(0.37)
-    for lo, hi in ((0, 4), (4, 5)):
-        Omega, B = _bundle_reader.read_poles(
-            fit_path, pole_slice=slice(lo, hi), mesh_xy=mesh,
-            unfold=True, return_sharded=True)
-        widths.append(int(Omega.shape[0]))
-        if Omega.is_fully_addressable or B.is_fully_addressable:
-            _fail(f"pole range [{lo},{hi}) became fully addressable")
-        width = hi - lo
-        bounds = jnp.asarray(np.tile(
-            [0.0, np.inf, 0.0, -np.inf, np.inf, np.inf], (width, 1)))
-        Wt = jax.jit(build_shared_w_tau)(
-            B, Omega, jnp.arange(width, dtype=jnp.int32), bounds,
-            jnp.zeros(width, dtype=bool), jnp.asarray(0.0), jnp.asarray(t))
-        total = Wt if total is None else total + Wt
+    with _bundle_reader.open_pole_reader(fit_path, mesh_xy=mesh) as reader:
+        for lo, hi in ((0, 4), (4, 5)):
+            Omega, B = reader.read(
+                slice(lo, hi), unfold=True, return_sharded=True)
+            widths.append(int(Omega.shape[0]))
+            if Omega.is_fully_addressable or B.is_fully_addressable:
+                _fail(f"pole range [{lo},{hi}) became fully addressable")
+            width = hi - lo
+            bounds = jnp.asarray(np.tile(
+                [0.0, np.inf, 0.0, -np.inf, np.inf, np.inf], (width, 1)))
+            Wt = jax.jit(build_shared_w_tau)(
+                B, Omega, jnp.arange(width, dtype=jnp.int32), bounds,
+                jnp.zeros(width, dtype=bool), jnp.asarray(0.0),
+                jnp.asarray(t))
+            total = Wt if total is None else total + Wt
     if widths != [4, 1]:
         _fail(f"pole stream widths are {widths}, expected [4, 1]")
 

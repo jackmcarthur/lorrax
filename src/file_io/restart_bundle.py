@@ -655,8 +655,6 @@ def unfold_parent_faces(faces, restart_file, input_file, mesh_xy, *, family="cha
                                    3, spec=spec) for a in faces)
 
 
-
-
 def read_metadata(filename):
     """Return small, replicated bundle facts in canonical file order.
 
@@ -843,7 +841,6 @@ def read_downfold_geometry(filename: str) -> dict:
     return geom
 
 
-
 def read_interaction_orbits(src: str, mu_L: int, print_fn):
     """The parent's ``QirrTables``, or ``None`` when it stores the full BZ.
 
@@ -903,7 +900,6 @@ def read_interaction_orbits(src: str, mu_L: int, print_fn):
     return tables
 
 
-
 def read_downfold_inputs(filename, input_file, mesh_xy):
     """Return authenticated geometry, full-k faces and linear interactions."""
     if not input_file:
@@ -952,7 +948,6 @@ def load_dipole_h5(path: str | Path):
         attrs = dict(f.attrs)
         attrs["nbands"], attrs["nk"] = int(attrs["nbands"]), int(attrs["nk"])
     return dipole_cart, deltaE, attrs
-
 
 
 def require_screened_bundle(filename, *, include_w=True, print_fn=print):
@@ -1019,7 +1014,6 @@ def read_qp_wfn_stamp(path) -> dict | None:
         return None
 
 
-
 def read_qp_state_source_provenance(path) -> dict | None:
     """Read a restart source-state record; ``None`` means legacy/unproven."""
     from .qp_wfn import (QP_STATE_SOURCE_DATASET, _validate_qp_state_source)
@@ -1037,7 +1031,6 @@ def read_qp_state_source_provenance(path) -> dict | None:
             f"{path}: {QP_STATE_SOURCE_DATASET} is not valid UTF-8 JSON") \
             from exc
     return _validate_qp_state_source(record, path=str(path))
-
 
 
 def read_qp_rotations_artifact(h5_path: str) -> dict:
@@ -1399,7 +1392,6 @@ def validate_qp_rotations_artifact(
                 "differs from the state handed to the writer.")
 
 
-
 def read_qp_rotations_full_bz(h5_path: str, datasets=None) -> dict:
     """``qp_wfn_rotations.h5``'s k-indexed arrays, ON THE FULL BZ.
 
@@ -1426,7 +1418,6 @@ def read_qp_rotations_full_bz(h5_path: str, datasets=None) -> dict:
             out[name] = (arr if star is None
                          else np.asarray(broadcast_ibz_to_full_bz(arr, *star)))
     return out
-
 
 
 def read_kirr_to_kfull(rot_file, wfn_kpoints, rot_kpoints, *, artifact=None):
@@ -1487,7 +1478,6 @@ def read_kirr_to_kfull(rot_file, wfn_kpoints, rot_kpoints, *, artifact=None):
     return kirr_to_kfull
 
 
-
 def _read_eval_energies_ev(
 	path: str, *, kirr_to_kfull: np.ndarray, band_start: int, band_stop: int,
 ) -> np.ndarray:
@@ -1523,7 +1513,6 @@ def _read_eval_energies_ev(
 		f"{os.path.basename(path)} carries neither 'E_qp_nk_rydberg' "
 		f"(qp_wfn_rotations.h5) nor 'mf_header/kpoints/el' (WFN_qp.h5); it "
 		f"cannot say what energies Sigma was evaluated at.")
-
 
 
 class BispinorVqReader:
@@ -1747,7 +1736,6 @@ class BispinorVqReader:
     @property
     def filename(self) -> Path:
         return self._filename
-
 
 
 def read_photon_charge(filename, mesh_xy):
@@ -2052,7 +2040,6 @@ def read_eqp_assembly_receipt(filepath):
 		}
 
 
-
 def read_eval_energies(filepath):
 	"""``(eval_rel_ev, provenance, coverage)`` off a ``sigma_mnk.h5``.
 
@@ -2078,29 +2065,6 @@ def read_eval_energies(filepath):
 			abs_path, STACK_H5PY, "r", where="read_eval_energies"), \
 			h5py.File(abs_path, "r") as h5:
 		return _eval_metadata_from_open_h5(h5)
-
-
-
-def read_omega_reference(filepath):
-	"""``(reference_ev, provenance)`` off a ``sigma_mnk.h5``, or ``(None, None)``.
-
-	THE ONE READER OF THE STAMP, so its location is stated once.  ``None``
-	means the file predates the stamp (audit A2) — not that its ω axis is
-	absolute.  A consumer that cannot tolerate a guess must REFUSE on
-	``None`` rather than substitute its own convention; that substitution,
-	made silently, is the defect the stamp exists to close.
-	"""
-	from file_io.sigma_output import (
-		STACK_H5PY,
-		open_scope,
-	)
-	abs_path = os.path.abspath(filepath)
-	with open_scope(
-			abs_path, STACK_H5PY, "r", where="read_omega_reference"), \
-			h5py.File(abs_path, "r") as h5:
-		_omega, ref, prov = _omega_metadata_from_open_h5(h5)
-	return ref, prov
-
 
 
 def _find_restart_file(input_file: str) -> str:
@@ -2129,7 +2093,6 @@ def _find_restart_file(input_file: str) -> str:
             f"this run's Σ/eqp inputs; move the other isdf_tensors_*.h5 "
             f"bundles out of the run directory and its tmp/ subdirectory.")
     return candidates[0]
-
 
 
 class _ZetaGTiles:
@@ -2248,7 +2211,6 @@ class _ZetaGTiles:
         self._loader.close()
 
 
-
 def _zeta_mesh_for_loader(mesh, log_fn=print):
     """``(mesh_or_None, distributed)`` — the ζ transport decision, once.
 
@@ -2279,7 +2241,6 @@ def _zeta_mesh_for_loader(mesh, log_fn=print):
                f"un-sharded, so every rank reads the whole chunk.")
         return None, False
     return mesh, True
-
 
 
 def open_zeta(path, **kwargs):
@@ -2392,7 +2353,6 @@ def load_kin_ion_submatrix(
 		h5_path, "kin_ion", band_start, band_stop, mesh=mesh)
 
 
-
 def validate_kin_ion_against_run(
 	h5_path: str,
 	*,
@@ -2465,7 +2425,6 @@ def validate_kin_ion_against_run(
 	return attrs
 
 
-
 def _load_matrix_submatrix(
 	h5_path: str,
 	dataset: str,
@@ -2510,7 +2469,6 @@ def _load_matrix_submatrix(
 	return _unfold_if_ibz(arr, star)
 
 
-
 def read_kin_ion_provenance(h5_path: str) -> dict:
 	"""Return the ``kin_ion`` dataset attributes as a plain dict.
 
@@ -2541,7 +2499,6 @@ def read_kin_ion_provenance(h5_path: str) -> dict:
 	return out
 
 
-
 def read_full_bz_dataset(h5_path: str, dataset: str = "kin_ion"):
 	"""One dataset of ``kin_ion.h5``, on the FULL BZ, as a host array.
 
@@ -2565,7 +2522,6 @@ def read_full_bz_dataset(h5_path: str, dataset: str = "kin_ion"):
 			raise KeyError(f"Dataset {dataset!r} missing from {h5_path}")
 		arr = np.asarray(h5[dataset][()])
 	return np.asarray(_unfold_if_ibz(arr, star))
-
 
 
 def read_star_map(h5_path: str, dataset: str = "kin_ion", *, k_axis: int = 0):
@@ -2676,7 +2632,6 @@ def read_star_map(h5_path: str, dataset: str = "kin_ion", *, k_axis: int = 0):
 	return irr, sidx, n_sym_spatial
 
 
-
 def _eval_metadata_from_open_h5(h5):
 	"""Return the small evaluation-energy stamp from an already-open file."""
 	from file_io.sigma_output import (
@@ -2706,7 +2661,6 @@ def _eval_metadata_from_open_h5(h5):
 	return arr, str(prov), cov
 
 
-
 def _omega_metadata_from_open_h5(h5):
 	"""Return the small omega axis plus its optional reference stamps."""
 	from file_io.sigma_output import (
@@ -2727,85 +2681,6 @@ def _omega_metadata_from_open_h5(h5):
 	return omega, ref, str(prov)
 
 
-def read_poles(
-    src,
-    *,
-    pole_slice=None,
-    mesh_xy=None,
-    unfold=False,
-    return_sharded=False,
-    to_unit=None,
-    allow_partial=False,
-    include_odd=False,
-    mode="r",
-):
-    """Read one contiguous pole range with two collective SlabIO reads.
-
-    The leading pole axis is always retained.  ``pole_slice=None`` reads it
-    completely; an integer reads a length-one range.  A mesh read is always
-    sharded — pass ``return_sharded=True`` with ``mesh_xy``; there is no
-    gather path.
-
-    THE SUMMARY LINE DESCRIBES ONE OF TWO BRANCHES, and the contract
-    changes with ``mesh_xy``:
-
-    * ``mesh_xy`` given — COLLECTIVE, two ``SlabIO`` reads through
-      :func:`open_pole_reader`; ``src`` must be a PATH; returns two sharded
-      ``jax.Array``s of ``(n_poles, n_q, n_mu_padded, n_mu_padded)`` on
-      ``P(None, None, 'x', 'y')``, where the pad is
-      ``runtime.padding.padded_mu_extent``, not ``mesh_divisible_shape``.
-    * ``mesh_xy=None`` — SERIAL, rank-local, no SlabIO and nothing
-      collective; ``src`` may be a path or an open h5py group; returns two
-      HOST numpy arrays at the LOGICAL ``(n_poles, n_q, n_mu, n_mu)``.
-
-    Returns the 2-tuple ``(Omega_p, B_p)`` either way.  This is NOT the
-    sole pole reader — :func:`read_fit_block`, :func:`read_fit_tensors` and
-    :meth:`PoleReader.read` also read these datasets, and the production Σ
-    reader is the last of those; this function has no ``src`` caller.
-
-    ONE range per call, so a caller reading SEVERAL ranges of one file —
-    every Σ stage does — opens and closes the store once per range.  Use
-    :func:`open_pole_reader` there instead: it holds one collective handle
-    across the whole walk and does its h5py reads before that handle
-    exists (audit A1).  This function is the single-range door, and is
-    that reader with a lifetime of one call.
-    """
-    from file_io.mpa_store import (
-        _finish_pole_read,
-        _h5,
-        _pole_range,
-        _refuse_unfinalized,
-        fit_completion_ledger,
-    )
-    if mesh_xy is not None and not return_sharded:
-        raise ValueError(
-            "read_poles: got mesh_xy with return_sharded=False; want "
-            "return_sharded=True on every mesh read — the collective "
-            "read lands sharded and every mesh caller consumes that "
-            "layout, so no gather path exists.  Fix: pass "
-            "return_sharded=True, or drop mesh_xy for a host-side read.")
-    if mesh_xy is not None:
-        with open_pole_reader(src, mesh_xy=mesh_xy,
-                              allow_partial=allow_partial, mode=mode) as rd:
-            return rd.read(pole_slice, unfold=unfold,
-                           return_sharded=return_sharded, to_unit=to_unit,
-                           include_odd=include_odd)
-
-    with _h5(src, mode) as grp:
-        ledger = fit_completion_ledger(grp)
-        _refuse_unfinalized(grp, ledger, allow_partial, "read_poles")
-        lo, hi = _pole_range(ledger, pole_slice, "read_poles")
-        Omega = np.asarray(grp["Omega_p"][lo:hi])
-        Bp = np.asarray(grp["B_p"][lo:hi])
-        B_odd = (np.asarray(grp["B_odd_p"][lo:hi])
-                 if include_odd and ledger["ordered_residues"] else None)
-    return _finish_pole_read(
-        src, Omega, Bp, ledger, mesh_xy=None, unfold=unfold,
-        return_sharded=return_sharded, to_unit=to_unit,
-        B_odd=B_odd, include_odd=include_odd)
-
-
-
 def open_pole_reader(src, *, mesh_xy, allow_partial=False, mode="r"):
     """A :class:`PoleReader` for one iteration's pole walk.
 
@@ -2819,19 +2694,16 @@ def open_pole_reader(src, *, mesh_xy, allow_partial=False, mode="r"):
                       mode=mode)
 
 
-
 class PoleReader:
     """ONE collective handle serving every pole batch of one iteration.
 
     WHY THIS EXISTS (audit A1 fix 2).  The Σ stage walks the pole axis in
     batches so no complete pole tensor ever exists on host or device, and
     it walks it TWICE per iteration — once for the census that plans the
-    windows, once for the spatial executor.  Called through
-    :func:`read_poles`, each batch opened and closed its own h5py handle
-    (ledger), its own collective ``SlabIO``, and a THIRD h5py handle for
-    the unfold tables — and the third one landed *between* the two, so the
-    per-batch sequence alternated h5py → FFI → h5py on one file, through
-    two independent HDF5 library instances, once per batch.
+    windows, once for the spatial executor.  Opening per batch would cost
+    an h5py handle (ledger), a collective ``SlabIO`` and a third h5py
+    handle (unfold tables) each time, alternating h5py → FFI → h5py on one
+    file through two independent HDF5 library instances.
 
     This reader collapses that to: read the ledger and the unfold tables
     with h5py FIRST (two opens, or one when the store is not wedge-packed),
@@ -2870,8 +2742,7 @@ class PoleReader:
             raise ValueError(
                 "PoleReader requires mesh_xy: it exists to hold ONE "
                 "collective handle open across an iteration's pole "
-                "batches, and a mesh-less read has no such handle.  Use "
-                "read_poles(src, pole_slice=...) for the host path.")
+                "batches; pole reads are collective only.")
         self.src = src
         self.mesh_xy = mesh_xy
         # h5py FIRST, and completely, and closed — before any collective
@@ -2926,10 +2797,9 @@ class PoleReader:
                 "B_odd_p", shape=shape, offset=(lo, 0, 0, 0),
                 partition_spec=P(None, None, "x", "y"))
         return _finish_pole_read(
-            self.src, Omega, Bp, self.ledger, mesh_xy=self.mesh_xy,
+            Omega, Bp, self.ledger, mesh_xy=self.mesh_xy,
             unfold=unfold, return_sharded=return_sharded, to_unit=to_unit,
             tables=self.tables, B_odd=B_odd, include_odd=include_odd)
-
 
 
 def read_fit_unfold_tables(src, *, mode="r"):
@@ -2944,107 +2814,6 @@ def read_fit_unfold_tables(src, *, mode="r"):
         if FIT_TABLE_OWNER + qs.QIRR_TABLE_SUFFIX not in grp:
             return None
         return qs.read_tables(grp, FIT_TABLE_OWNER, mode=mode)
-
-
-
-def read_fit_tensors(src, *, allow_partial=False, mode="r"):
-    """The whole ``(Omega_p, B_p, diagnostics, ledger)``.
-
-    For tests and offline inspection.  The Σ stage does NOT read this — it
-    streams contiguous pole ranges through :class:`PoleReader` (opened by
-    :func:`open_pole_reader`) and never holds the whole tensor.  This used
-    to name :func:`read_poles`, which the Σ stage stopped using when
-    ``PoleReader`` landed.
-
-    ``Omega_p`` and ``B_p`` come back ``(n_p, n_q, n_mu, n_mu)``
-    complex128 and ``diagnostics`` as ``{key: (n_q, n_mu, n_mu) float64}``
-    — the whole tensor, on this rank, which is the cost the first
-    paragraph is warning about.  Serial; ``src`` is a path or an open
-    group.  Same finalize refusal as :func:`read_fit_block`.
-    """
-    from file_io.mpa_store import (
-        _h5,
-        _qs,
-        _refuse_unfinalized,
-        fit_completion_ledger,
-    )
-    qs = _qs()
-    with _h5(src, mode) as grp:
-        ledger = fit_completion_ledger(grp)
-        _refuse_unfinalized(grp, ledger, allow_partial,
-                            "read_fit_tensors")
-        Om = np.asarray(grp["Omega_p"][()])
-        Bp = np.asarray(grp["B_p"][()])
-        diag = {str(k)[len("fit_"):]: np.asarray(grp[k][()])
-                for k in grp if str(k).startswith("fit_")}
-        return Om, Bp, diag, ledger
-
-
-
-def read_fit_block(src, q, mu_cols, *, allow_partial=False, mode="r"):
-    """One column block's ``(Omega_p, B_p, diagnostics, ledger)``.
-
-    Refuses an unfinalized store unless ``allow_partial=True``, and
-    when partial, refuses the specific columns that are not fitted —
-    "the file is incomplete" and "the columns you asked for are
-    incomplete" are different facts and a driver resuming a crashed fit
-    needs the second one.
-    """
-    from file_io.mpa_store import (
-        _column_span,
-        _h5,
-        _qs,
-        _ranges,
-        _refuse_unfinalized,
-        fit_completion_ledger,
-        normalise_columns,
-    )
-    qs = _qs()
-    with _h5(src, mode) as grp:
-        ledger = fit_completion_ledger(grp)
-        _refuse_unfinalized(grp, ledger, allow_partial,
-                            f"read_fit_block(q={q})")
-        iq = int(q)
-        if not 0 <= iq < ledger["n_q"]:
-            raise IndexError(
-                f"read_fit_block: q={iq} is outside [0, "
-                f"{ledger['n_q']})")
-        cols = normalise_columns(mu_cols, ledger["n_mu"])
-        undone = cols[~ledger["blocks_done"][iq, cols]]
-        if undone.size:
-            raise ValueError(
-                f"read_fit_block: q={iq} columns "
-                f"{_ranges(undone)} are not fitted.  They read back as "
-                f"zeros, which is a converged-looking dark channel and "
-                f"not an absent one, so the refusal is on the LEDGER "
-                f"and never on the data.")
-        lo, hi, sel = _column_span(cols)
-        sel = slice(lo, hi) if sel is None else sel
-        Om = np.asarray(grp["Omega_p"][:, iq, :, sel])
-        Bp = np.asarray(grp["B_p"][:, iq, :, sel])
-        stamp = ledger["diagnostic_keys"] or ""
-        keys = tuple(key for key in stamp.split(",") if key)
-        diag = {}
-        for key in keys:
-            name = "fit_" + key
-            if name not in grp:
-                raise ValueError(
-                    f"read_fit_block: diagnostic_keys names {name!r}, "
-                    "but the dataset is absent")
-            diag[key] = np.asarray(grp[name][iq, :, sel])
-        return Om, Bp, diag, ledger
-
-
-
-def read_fit_io_receipt(src, *, mode="r"):
-    """Return the ready body-attempt I/O receipt, or ``None`` if absent."""
-    from file_io.mpa_store import (
-        _h5,
-        _read_fit_io_receipt_group,
-    )
-    with _h5(src, mode) as grp:
-        return _read_fit_io_receipt_group(grp)
-
 
 
 def validate_fit_store(src, *, expected_identity=None,
@@ -3142,7 +2911,6 @@ def validate_fit_store(src, *, expected_identity=None,
                 f"MPA fit failed its stored certification: {metric}="
                 f"{got!r} exceeds {allowed!r}")
     return ledger
-
 
 
 def validate_fit_store_for_resume(
@@ -3261,7 +3029,6 @@ def validate_fit_store_for_resume(
             "MPA partial fit blocks_done does not exactly equal the union of "
             "its validated journal ranges")
     return ledger
-
 
 
 def read_head_fit_collective(src, *, mesh_xy, to_unit=None):
@@ -3394,74 +3161,9 @@ def read_head_fit_collective(src, *, mesh_xy, to_unit=None):
     }
 
 
-
-def read_head_fit(src, *, to_unit=None, mode="r"):
-    """Read the complete scalar q->0 MPA fit; refuse absent/partial data."""
-    from file_io.mpa_store import (
-        MPA_HEAD_SUFFIX,
-        _HEAD_FIT_MODELS,
-        _h5,
-        _open_fit,
-        _qs,
-        _unit_scale,
-    )
-    qs = _qs()
-    with _h5(src, mode) as grp:
-        _open_fit(grp)
-        if MPA_HEAD_SUFFIX not in grp:
-            raise ValueError("read_head_fit: fit store carries no scalar head")
-        head = grp[MPA_HEAD_SUFFIX]
-        if int(head.attrs.get("format_version", -1)) != 1:
-            raise ValueError("read_head_fit: unsupported scalar-head format")
-        if not bool(head.attrs.get("ready", False)):
-            raise ValueError("read_head_fit: scalar head is NOT READY")
-        source_unit = qs.qirr_attr_str(head, "frequency_unit")
-        z = np.asarray(head["sample_z"][()])
-        wc = np.asarray(head["sample_Wc"][()])
-        poles = np.asarray(head["Omega_p"][()])
-        residues = np.asarray(head["B_p"][()])
-        diagnostics = {
-            key: float(head.attrs[key])
-            for key in ("fit_condition", "fit_backward_error",
-                        "fit_max_abs_residual")
-        }
-        units = {
-            "frequency": source_unit,
-            "Wc": qs.qirr_attr_str(head, "Wc_unit"),
-            "residue": qs.qirr_attr_str(head, "residue_unit"),
-        }
-        model = qs.qirr_attr_str(head, "model")
-        if model not in _HEAD_FIT_MODELS:
-            raise ValueError(
-                f"read_head_fit: got scalar-head model {model!r}; want "
-                f"one of {_HEAD_FIT_MODELS} — the only fitting protocols "
-                f"this reader knows how to interpret, and a pole set "
-                f"whose protocol nobody can name cannot be consumed "
-                f"correctly.  Fix: refit the head with a known model, or "
-                f"teach _HEAD_FIT_MODELS the new one alongside its "
-                f"consumer.")
-    if to_unit is not None:
-        scale = _unit_scale(source_unit, to_unit, "head read")
-        z, poles, residues = z * scale, poles * scale, residues * scale
-        units["frequency"] = str(to_unit)
-        units["residue"] = f"{to_unit}*a.u."
-    return {
-        "sample_z": z,
-        "sample_Wc": wc,
-        "Omega_p": poles,
-        "B_p": residues,
-        "units": units,
-        "diagnostics": diagnostics,
-        "model": model,
-        "ready": True,
-    }
-
-
-
 def open_w_column_reader(src, *, mesh_xy, headers):
     """Open the persistent source reader for one fit checkpoint epoch."""
     return WColumnReader(src, mesh_xy=mesh_xy, headers=headers)
-
 
 
 class WColumnReader:
@@ -3570,7 +3272,6 @@ class WColumnReader:
         return block
 
 
-
 def read_w_columns_collective(
     src,
     name,
@@ -3601,89 +3302,6 @@ def read_w_columns_collective(
             tile_bytes=tile_bytes)
 
 
-
-def read_w_columns(
-    src,
-    name,
-    q,
-    mu_cols,
-    *,
-    tile_bytes=None,
-    n_mu_padded=None,
-    out_spec=None,
-    require_ready=True,
-    mode="r",
-):
-    """A few ν columns of W_q, ACROSS ALL FREQUENCIES.
-
-    Returns ``(n_omega, N_μ_rows, len(mu_cols))`` complex — the shape
-    the per-element plasmon-pole fit consumes.  This is the read the
-    leading frequency axis exists for: the fit needs all of ω for one
-    (μ, ν) element and never needs all of (μ, ν) for one ω, so the
-    frequency axis is the OUTER one on disk and the innermost one in the
-    solve.
-
-    THE BUDGET REFUSES BY NAME.  ``len(mu_cols)`` is checked against
-    :func:`choose_column_budget` and a request that busts it raises with
-    the full arithmetic — the per-column cost, the total, the tile it is
-    measured against, the ratio, and the count that would have fit.
-    Silently truncating or silently allowing would each defeat the
-    constraint the number encodes: a small number of W_q(μ,ν) copies fit
-    at once, and this block is priced to be one of them.
-
-    THE SHARDING IS 1-D ON THE ROW AXIS.  ``out_spec`` is checked, not
-    applied — the read itself is host-side h5py and the placement is the
-    caller's — but a 2-D spec is refused here rather than downstream,
-    because by the time it is downstream the column count is no longer
-    the number the budget was computed for.  See
-    :func:`_refuse_two_dim_sharding`.
-
-    REQUIRES EVERY SLAB.  The block spans the whole frequency axis, so
-    every ω must be ready; a partially filled file refuses and names how
-    many slabs are missing.  That is stricter than :func:`read_w_slab`
-    on purpose — a fit run on the ready half of a grid produces poles
-    that are wrong rather than absent.
-    """
-    from file_io.mpa_store import (
-        _column_span,
-        _h5,
-        _qs,
-        _refuse_two_dim_sharding,
-        _validate_column_request,
-    )
-    qs = _qs()
-    header = read_w_header(src, name, mode=mode)
-    _refuse_two_dim_sharding(out_spec, f"read_w_columns({name!r})")
-    n_mu = header["n_mu"]
-    iq, cols, _ = _validate_column_request(
-        header, q, mu_cols, tile_bytes, f"read_w_columns({name!r})",
-        require_ready=require_ready)
-
-    # ONE HYPERSLAB, NOT ONE PER FREQUENCY.  A contiguous run becomes a
-    # slice (HDF5 reads it as a single hyperslab); anything else is a
-    # point selection on the LAST axis only, which h5py supports and
-    # which keeps the row axis whole — the axis the caller shards.
-    lo, hi, sel = _column_span(cols)
-    with _h5(src, mode) as grp:
-        block = grp[name][:, iq, :, slice(lo, hi) if sel is None else sel]
-    block = np.asarray(block)
-
-    if n_mu_padded is not None and int(n_mu_padded) != n_mu:
-        pad = int(n_mu_padded) - n_mu
-        if pad < 0:
-            raise ValueError(
-                f"read_w_columns({name!r}): the file stores {n_mu} "
-                f"logical centroids and the caller asked to pad the row "
-                f"axis DOWN to {n_mu_padded}.  The pad only ever grows "
-                f"the extent.")
-        # ROWS ONLY.  The columns are a selection the caller chose, not
-        # an axis with a pad; padding them would invent centroids the
-        # caller did not ask for and shift every index in ``mu_cols``.
-        block = np.pad(block, ((0, 0), (0, pad), (0, 0)))
-    return block
-
-
-
 def read_w_tables(src, name, *, mode="r"):
     """The stored unfold tables — ``qirr_store.read_tables``, unchanged.
 
@@ -3707,141 +3325,6 @@ def read_w_tables(src, name, *, mode="r"):
     )
     with _h5(src, mode) as grp:
         return _qs().read_tables(grp, name)
-
-
-
-def read_w_slab(
-    src,
-    name,
-    i_omega,
-    *,
-    q=None,
-    unfold=False,
-    mesh_xy=None,
-    n_mu_padded=None,
-    require_ready=True,
-    mode="r",
-):
-    """One frequency slab: ``(n_q, N_μ, N_μ)``, or one q of it.
-
-    THE REMOVABILITY CLAIM, AS A FUNCTION.  What comes back for
-    ``unfold=False`` and ``n_mu_padded=None`` is bit-identical to what
-    ``qirr_store.read_tensor`` returns from a version-1 file written
-    from this slab — same bytes, same wedge, same tables.  That is the
-    whole content of "the leading dimension is removable later": the
-    axis is a container, not a change of meaning, and dropping it is a
-    slice rather than a migration.  ``test_the_leading_axis_is_
-    removable`` asserts it attr-for-attr.
-
-    Parameters
-    ----------
-    q
-        Optional q index into the stored wedge.  ``None`` returns every
-        stored q at this ω.
-    unfold
-        Unfold the wedge to the full BZ AT THIS FREQUENCY.  The tables
-        are ω-independent, so this is ``unfold_isdf_operator`` on the
-        slab — the same call, the same arguments, one frequency at a
-        time.  Needs ``mesh_xy``.
-    n_mu_padded
-        Re-apply a μ pad of the READER's own width.  The file stores the
-        LOGICAL extent, so a consumer that wants the padded in-memory
-        layout asks for it here rather than finding the writer's pad and
-        hoping it matches.
-    require_ready
-        Refuse when this slab's ledger bit is False.  Default True.
-    """
-    from file_io.mpa_store import (
-        _h5,
-        _qs,
-    )
-    qs = _qs()
-    header = read_w_header(src, name, mode=mode)
-    i = int(i_omega)
-    n_omega = header["n_omega"]
-    if not 0 <= i < n_omega:
-        raise IndexError(
-            f"mpa_store: frequency index {i} is outside [0, {n_omega}) "
-            f"for {name!r}.")
-    if require_ready and not bool(header["data_ready"][i]):
-        raise ValueError(
-            f"mpa_store: {name!r} frequency slab {i} (ω = "
-            f"{header['omega'][i]}) is PRESENT AND CORRECTLY SHAPED but "
-            f"its data_ready bit is False — it is allocated space, not "
-            f"data.  {header['n_ready']} of {n_omega} slabs are ready.  "
-            f"Reading it would hand the fit a slab of zeros that passes "
-            f"every shape check, which is the mechanism behind the "
-            f"all-zero-screening incident: a plausible excitonic "
-            f"spectrum out of a W that was never written.  A "
-            f"frequency-resolved file reaches this state routinely — "
-            f"the producer fills ω one line-batched sweep at a time — "
-            f"so the ledger is per slab and not per file.  Pass "
-            f"require_ready=False to inspect the placeholder "
-            f"deliberately.")
-
-    with _h5(src, mode) as grp:
-        ds = grp[name]
-        raw = ds[i] if q is None else ds[i, int(q)]
-    raw = np.asarray(raw)
-
-    # THE TABLES ARE READ ONLY WHEN THEY ARE NEEDED, which is the
-    # unfold and the re-pad.  The production per-slab read is neither —
-    # a consumer walking ω takes the wedge as stored — and opening the
-    # table group on every one of those would be a second file open per
-    # frequency for arrays nobody looks at.  Their DIGEST was already
-    # checked by ``read_w_header`` above, so this is a saved read and
-    # not a skipped check.
-    if not unfold and n_mu_padded is None:
-        return raw, header
-
-    tables = read_w_tables(src, name, mode=mode)
-    can = tables.canonical()
-    if n_mu_padded is not None and int(n_mu_padded) != int(can.n_mu):
-        pad = int(n_mu_padded) - int(can.n_mu)
-        if pad < 0:
-            raise ValueError(
-                f"mpa_store: {name!r} stores {can.n_mu} logical "
-                f"centroids and the caller asked to pad DOWN to "
-                f"{n_mu_padded}.  The pad only ever grows the extent; a "
-                f"smaller request means the caller and the file "
-                f"disagree about the centroid set.")
-        widths = [(0, 0)] * (raw.ndim - 2) + [(0, pad), (0, pad)]
-        raw = np.pad(raw, widths)
-        can = can.padded(int(n_mu_padded))
-
-    if not unfold or header["q_storage"] == "full":
-        return raw, header
-    if q is not None:
-        raise ValueError(
-            f"mpa_store: {name!r} cannot unfold a single stored q "
-            f"(q={q}).  The unfold gathers every full-BZ row from its "
-            f"IBZ parent, so it needs the whole wedge at this ω; ask "
-            f"for q=None and index the result.")
-    if mesh_xy is None:
-        raise ValueError(
-            f"mpa_store: {name!r} is stored on the q wedge "
-            f"({header['n_q_on_disk']} of {header['n_q_full']} q) and "
-            f"unfolding slab {i} needs a mesh; pass mesh_xy= or "
-            f"unfold=False to take the wedge.")
-    import jax.numpy as jnp
-    # THROUGH THE SERVICE'S DOOR, not past it: the top-level package,
-    # never ``symmetry_maps.maps``.  Reaching a submodule is what stops
-    # a service being replaceable, and ``test_layering`` enforces it.
-    from symmetry_maps import unfold_isdf_operator
-    # Test seam only — the bulk to-device transfer below has zero
-    # production callers; production unfolds sharded in _finish_pole_read.
-    full = unfold_isdf_operator(
-        jnp.asarray(raw),
-        irr_idx=can.irr_idx_q,
-        sym_idx=can.sym_idx_q,
-        sym_perm=can.sym_perm,
-        L_table=can.L_table,
-        q_irr_frac=can.q_irr_frac,
-        mesh_xy=mesh_xy,
-        n_sym_spatial=int(can.n_sym_spatial),
-    )
-    return full, header
-
 
 
 def read_w_header(src, name, *, mode="r"):
@@ -4019,7 +3502,6 @@ def read_w_header(src, name, *, mode="r"):
         }
 
 
-
 def read_w_slab_collective(
     src,
     name,
@@ -4082,7 +3564,6 @@ def read_w_slab_collective(
     return slab[0], header
 
 
-
 def read_occupation_stamps(src, *, mode="r"):
     """Return the fit store's occupation stamps, or None if unstamped."""
     from file_io.mpa_store import (
@@ -4131,7 +3612,6 @@ def _fix_sphere_wrap(zx):
     if changed:
         print(f"  [wrapfix] {changed} of {zx['nq']} q relabeled to the "
               f"sphere-derived center")
-
 
 
 def read_vq_payload(restart_file: str, zeta_file: str, *,
@@ -4316,7 +3796,6 @@ def read_vq_payload(restart_file: str, zeta_file: str, *,
     return zx
 
 
-
 def check_dipole_provenance(
     path, *, wfn, nval, ncond, nband,
     bispinor=None, skip_vnl=None, vnl_mode=None, vnl_velocity_sign=None,
@@ -4463,7 +3942,6 @@ def check_dipole_provenance(
     return True
 
 
-
 def _q0_ncond_coverage(h5, *, wfn, ncond, nband) -> tuple[bool, str]:
     """Can an ``ncond``-mismatched file represent the identical q→0 matrix?"""
     from psp.get_dipole_mtxels import (
@@ -4587,7 +4065,6 @@ def read_bgw_eqp(eqp_file: str):
 	return np.array(kpts), e_dft, e_qp, int(first_band) - 1
 
 
-
 def read_eqp_energies(eqp_file: str, sym, band_window: tuple[int, int]) -> jax.Array:
     """Full-BZ QP energies from the IRREDUCIBLE-WEDGE ``eqp{0,1}.dat``.
 
@@ -4686,7 +4163,6 @@ def read_eqp_energies(eqp_file: str, sym, band_window: tuple[int, int]) -> jax.A
     return jnp.asarray(full_ev.T / RYD_TO_EV, dtype=jnp.float64)
 
 
-
 def apply_eqp_corrections(
     enk_full: np.ndarray,
     eqp_file: str,
@@ -4780,7 +4256,6 @@ def apply_eqp_corrections(
     # present replaces it.  Ry in, Ry out.
     enk_qp[:, :n_take] = np.where(have, block / ry_to_ev, enk_qp[:, :n_take])
     return enk_qp
-
 
 
 def read_kin_ion_full_bz(filename):

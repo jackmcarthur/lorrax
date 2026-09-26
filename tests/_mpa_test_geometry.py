@@ -19,10 +19,16 @@ must run without pytest or this package.
 :class:`HostSlabIO` is the one serial-h5py stand-in for the collective
 ``SlabIO``: it exercises the collective ``mpa_store`` API in a single
 host process at logical extents (PHDF5 itself has cluster tests).
-Call-census tests subclass it with thin recording wrappers.
+Call-census tests subclass it with thin recording wrappers.  The
+``*_collective`` helpers below drive the production writers and readers
+through it on a CPU mesh; they expect ``file_io.slab_io.SlabIO`` to be
+patched (a fixture, or :func:`host_slab_io`).
 """
 
 from __future__ import annotations
+
+import contextlib
+import os
 
 import numpy as np
 
@@ -117,11 +123,16 @@ class HostSlabIO:
         if name not in self.file:
             self.file.create_dataset(name, shape=shape, dtype=dtype)
 
-    def read_slab(self, name, *, shape, offset, valid_shape,
-                  partition_spec, **_):
+    def read_slab(self, name, *, partition_spec, shape=None, offset=None,
+                  valid_shape=None, as_numpy=False, **_):
+        """Zero-fill past the dataset extent, as ``SlabIO`` does."""
         import jax
         from jax.sharding import NamedSharding
 
+        stored = self.file[name].shape
+        shape = stored if shape is None else shape
+        offset = (0,) * len(shape) if offset is None else offset
+        valid_shape = stored if valid_shape is None else valid_shape
         out = np.zeros(shape, dtype=self.file[name].dtype)
         extent = tuple(min(valid_shape[d], shape[d],
                            self.file[name].shape[d] - offset[d])
@@ -130,6 +141,8 @@ class HostSlabIO:
         src = tuple(slice(offset[d], offset[d] + extent[d])
                     for d in range(len(shape)))
         out[dst] = self.file[name][src]
+        if as_numpy:
+            return out
         return jax.device_put(
             out, NamedSharding(self.mesh, partition_spec))
 
@@ -146,3 +159,134 @@ class HostSlabIO:
                     for d in range(host.ndim))
         src = tuple(slice(0, n) for n in extent)
         self.file[name][dst] = host[src]
+
+    def write_attr(self, name, value):
+        """The small replicated vectors of the scalar head."""
+        self.file.create_dataset(name, data=np.asarray(value))
+
+
+@contextlib.contextmanager
+def host_slab_io(cls=HostSlabIO):
+    """Route ``file_io.slab_io.SlabIO`` through the host stand-in."""
+    import file_io.slab_io as slab_io
+
+    original = slab_io.SlabIO
+    slab_io.SlabIO = cls
+    try:
+        yield cls
+    finally:
+        slab_io.SlabIO = original
+
+
+def cpu_mesh():
+    """A 1x1 ``('x', 'y')`` mesh on the first CPU device."""
+    import jax
+    from jax.sharding import Mesh
+
+    return Mesh(np.asarray(jax.devices("cpu")[:1]).reshape(1, 1),
+                ("x", "y"))
+
+
+def write_w_collective(path, name, W, *, mesh, tables, verdict, omega,
+                       sampling, omega_line=None, provenance=None,
+                       ready=True, mode="a", energy_unit="Ha"):
+    """Allocate and fill a W(z) tensor through the production collectives.
+
+    ``W`` is ``(n_omega, n_q, n_mu, n_mu)`` at the LOGICAL extent.
+    ``ready`` is one bool or one per slab: a slab written with
+    ``ready=False`` holds bytes whose ledger bit is unset, the state a
+    preempted producer leaves.
+    """
+    import jax
+    from jax.sharding import NamedSharding, PartitionSpec as P
+    from file_io import mpa_store as MS
+    from runtime.padding import padded_mu_extent
+
+    W = np.asarray(W)
+    n_omega, n_q, n_mu = int(W.shape[0]), int(W.shape[1]), int(W.shape[-1])
+    flags = np.broadcast_to(np.asarray(ready, dtype=bool), (n_omega,))
+    MS.allocate_w_omega_collective(
+        os.fspath(path), name, mesh_xy=mesh, n_omega=n_omega,
+        n_q_on_disk=n_q, n_mu=n_mu, tables=tables, omega=omega,
+        sampling=sampling, omega_line=omega_line, closure_verdict=verdict,
+        provenance=provenance, energy_unit=energy_unit, mode=mode)
+    n_pad = int(padded_mu_extent(n_mu, mesh))
+    sharding = NamedSharding(mesh, P(None, "x", "y"))
+    for i in range(n_omega):
+        host = np.zeros((n_q, n_pad, n_pad), dtype=W.dtype)
+        host[:, :n_mu, :n_mu] = W[i]
+        MS.write_w_slab_collective(
+            os.fspath(path), name, i, jax.device_put(host, sharding),
+            mesh_xy=mesh, global_shape=W.shape, ready=bool(flags[i]))
+
+
+def read_w_slab_logical(path, name, i_omega, *, mesh, require_ready=True):
+    """``read_w_slab_collective`` cut back to the logical extent, on host."""
+    from file_io import restart_bundle as RB
+
+    slab, header = RB.read_w_slab_collective(
+        os.fspath(path), name, i_omega, mesh_xy=mesh,
+        require_ready=require_ready)
+    n_mu = int(header["n_mu"])
+    return np.asarray(slab)[:, :n_mu, :n_mu], header
+
+
+def put_fit_block(path, q, cols, Omega, B, diag, *, mesh,
+                  B_odd=None):
+    """One contiguous column block through the production ``FitWriter``.
+
+    ``Omega``/``B``/``B_odd`` are ``(n_p, n_mu, len(cols))`` and ``diag``
+    holds ``condition`` and ``backward_error`` maps ``(n_mu, len(cols))``
+    at the logical extent; the block maxima enter the ledger.
+    """
+    import jax
+    from jax.sharding import NamedSharding, PartitionSpec as P
+    from file_io import mpa_store as MS
+    from runtime.padding import padded_mu_extent
+
+    cols = np.asarray(cols, dtype=np.int64)
+    Omega = np.asarray(Omega)
+    n_p, n_mu, width = Omega.shape
+    n_rows = int(padded_mu_extent(n_mu, mesh))
+    pole = NamedSharding(mesh, P(None, None, ("x", "y"), None))
+    rows = NamedSharding(mesh, P(None, ("x", "y")))
+
+    def put(block, sharding, lead):
+        host = np.zeros(lead + (n_rows, width), dtype=np.asarray(block).dtype)
+        host[..., :n_mu, :] = np.asarray(block).reshape(lead + (n_mu, width))
+        return jax.device_put(host, sharding)
+
+    condition = np.asarray(diag["condition"], dtype=np.float64)
+    backward = np.asarray(diag["backward_error"], dtype=np.float64)
+    return MS.write_fit_block_collective(
+        os.fspath(path), q, cols,
+        put(Omega, pole, (n_p, 1)), put(B, pole, (n_p, 1)),
+        {"condition": put(condition, rows, (1,))},
+        B_odd_p_block=None if B_odd is None else put(B_odd, pole, (n_p, 1)),
+        mesh_xy=mesh,
+        block_condition_max=float(np.max(condition)),
+        block_backward_error_max=float(np.max(backward)),
+        diagnostics_finite=bool(np.isfinite(condition).all()
+                                and np.isfinite(backward).all()))
+
+
+def read_fit_store(path, *, mesh, allow_partial=False, pole_slice=None,
+                   to_unit=None, include_odd=False):
+    """The pole field through ``PoleReader``, cut to the logical extent.
+
+    Returns ``(Omega, B[, B_odd], {"condition": map}, ledger)`` on host.
+    """
+    import h5py
+    from file_io.restart_bundle import PoleReader
+
+    with PoleReader(os.fspath(path), mesh_xy=mesh,
+                    allow_partial=allow_partial) as reader:
+        arrays = reader.read(pole_slice, to_unit=to_unit,
+                             include_odd=include_odd)
+        ledger = reader.ledger
+    n_mu = int(ledger["n_mu"])
+    arrays = tuple(None if a is None else np.asarray(a)[..., :n_mu, :n_mu]
+                   for a in arrays)
+    with h5py.File(os.fspath(path), "r") as f:
+        condition = np.asarray(f["fit_condition"][()])
+    return (*arrays, {"condition": condition}, ledger)
