@@ -13,6 +13,7 @@ from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
 from common.collectives import device_put_process_local
 from common.shard_map import shard_map
+from gw.degen_average import TOL_DEGENERACY_RY
 
 
 __all__ = [
@@ -1001,60 +1002,22 @@ def assemble_delta_head_manifold(
     return _assemble_delta_kernel(mesh, int(nb_storage))(delta, tail)
 
 
-def _interband_degenerate_weight(
-    dE, f_diff, z, s_avg, prefactor, near_degenerate, *, include_surface: bool,
-):
-    r"""Adler-Wiser interband weight, continuous through ``dE -> 0``.
+def _interband_weight(dE, f_diff, z, prefactor):
+    r"""Adler-Wiser interband weight ``prefactor f_diff / (dE (z^2 - dE^2))``.
 
-    ``prefactor * f_diff / (dE * (z**2 - dE**2))`` has a removable
-    singularity at ``dE = 0`` for FIXED, nonzero ``z``: by l'Hopital on the
-    numerator (``f_diff -> -f'(E_mid) * dE`` as the two energies coalesce),
-    ``f_diff / dE -> 0.5*(s_bra + s_ket)``, where ``s = -f'`` is the
-    caller's own MP1 Fermi-surface weight (:func:`gw.efermi.
-    mp1_negative_derivative`) -- the divided-difference-to-derivative limit
-    that the static chi0 body reaches through its Fermi-Dirac tau factors
-    (:func:`gw.w_isdf.compute_chi0_matsubara` at ``n = 0``).  The
-    ``z``-dependence keeps its
-    finite-``z`` form throughout: only ``dE`` is taken to a limit, never
-    ``z`` -- a resonance (``z`` near ``dE`` at a NON-degenerate pair) is a
-    different singularity and is untouched by this branch.
-
-    ``s_avg`` (``0.5*(s_bra+s_ket)``) and ``near_degenerate`` (the
-    resolution-scaled ``|dE|`` test) are precomputed by the caller,
-    already broadcast to ``dE``'s shape: neither depends on ``omega``, so
-    hoisting them out of the inner per-frequency closure avoids
-    recomputing a comparison already fixed by the band-pair tile alone.
-
-    ``include_surface`` is a plain Python ``bool``, closed over at trace
-    time by the caller (its kernel factory already keys its compilation
-    cache on it): when ``False`` -- no ``-f'`` data, i.e. every insulating
-    or fixed-occupation deck -- this compiles to EXACTLY the pre-fix
-    ``jnp.where(|denom|>1e-16, regular, 0)`` body; the degenerate branch
-    is never lowered into that HLO graph and ``s_avg``/``near_degenerate``
-    are unused (may be ``None``).
-
-    SCOPE.  This formula (``prefactor * f_diff / (dE * (z**2 - dE**2))``)
-    is ``_s_tensor_kernel``'s ONLY; the wing kernel
-    ``_head_wing_kernel_face`` builds a structurally
-    DIFFERENT ``F_ij = -pref_inter * f_diff / (z**2 - dE**2)`` -- one fewer
-    power of ``dE`` (the mixed density/velocity response), because a wing pairs one velocity leg with one
-    dimension-1-in-energy density vertex where the head pairs two
-    velocity legs.  At fixed nonzero ``z``, THAT formula is already
-    continuous as ``dE -> 0`` (``f_diff -> 0`` at the same order as the
-    numerator, no compensating ``dE`` in the denominator to cancel), so
-    its own ``|denom|>1e-16`` clip is not this same defect -- it guards a
-    ``z ~= dE`` resonance, a different singularity this helper does not
-    address.  Do not reuse this helper there without rederiving the limit.
+    Every pair reaching this weight is split by more than
+    :data:`gw.degen_average.TOL_DEGENERACY_RY`: an exactly degenerate pair
+    carries no interband transition.  Its ``dE -> 0`` limit is Fermi-surface
+    (intraband) content, ``(-f') |v_nm|^2 / z^2``, which the metallic head
+    takes in the multiplet Drude tensor of :func:`head_drude_tensor_sharded`
+    with the same weights as the diagonal, so the tensor is invariant under
+    rotations inside the multiplet.  Here a 0/1 table that cuts a multiplet
+    would give ``1 / (dE z^2)`` at roundoff ``dE``; the mask removes that.
+    The clip guards the ``z ~ dE`` resonance of a split pair at real ``z``.
     """
     denom = dE * (z * z - dE * dE)
-    zero = jnp.asarray(0.0 + 0.0j, dtype=jnp.complex128)
-    regular = prefactor * f_diff / denom
-    clipped = jnp.where(jnp.abs(denom) > 1.0e-16, regular, zero)
-    if not include_surface:
-        return clipped
-    z_ok = jnp.abs(z) > 1.0e-15
-    degenerate = prefactor * s_avg / (z * z)
-    return jnp.where(near_degenerate & z_ok, degenerate, clipped)
+    return jnp.where(jnp.abs(denom) > 1.0e-16, prefactor * f_diff / denom,
+                     jnp.asarray(0.0 + 0.0j, dtype=jnp.complex128))
 
 
 def _head_wing_interband_weight(
@@ -1077,50 +1040,31 @@ def _head_wing_interband_weight(
     )
 
 
-def _s_tensor_kernel(
-    mesh: Mesh, *, nb_logical: int, include_surface: bool = False,
-) -> Callable:
-    key = ("head_s", id(mesh), int(nb_logical), bool(include_surface))
+def _s_tensor_kernel(mesh: Mesh, *, nb_logical: int) -> Callable:
+    key = ("head_s", id(mesh), int(nb_logical))
     hit = _KERNEL_CACHE.get(key)
     if hit is not None:
         return hit
     ax_x, ax_y = _mesh_xy(mesh)
 
-    def _local(
-        v_local, e_bra, e_ket, f_bra, f_ket, s_bra, s_ket, omegas, prefactor, eta,
-    ):
+    def _local(v_local, e_bra, e_ket, f_bra, f_ket, omegas, prefactor, eta):
         nx, ny = v_local.shape[-2:]
         ix = jax.lax.axis_index(ax_x) * nx + jnp.arange(nx)
         iy = jax.lax.axis_index(ax_y) * ny + jnp.arange(ny)
         dE = e_bra[:, :, None] - e_ket[:, None, :]
         f_diff = f_ket[:, None, :] - f_bra[:, :, None]
         logical = ((ix[:, None] < nb_logical) & (iy[None, :] < nb_logical))[None, :, :]
-        # Sum every energy-ordered band pair.  f_diff is SIGNED: MP1 is
-        # not globally monotone and may overshoot slightly outside [0, 1],
-        # so filtering on f_v-f_c>0 would not implement the Adler-Wiser
-        # occupation difference.  The historical 0/1 path is unchanged
-        # because its energy-ordered nonzero differences are positive.
-        transition = logical & (dE > 0.0)
-        if include_surface:
-            scale = jnp.maximum(
-                1.0,
-                jnp.maximum(jnp.abs(e_bra)[:, :, None], jnp.abs(e_ket)[:, None, :]),
-            )
-            near_degenerate = (
-                jnp.abs(dE) <= 64.0 * jnp.finfo(jnp.float64).eps * scale)
-            s_avg = 0.5 * (s_bra[:, :, None] + s_ket[:, None, :])
-        else:
-            near_degenerate = None
-            s_avg = None
+        # Sum every energy-ordered band pair split by more than the BGW
+        # degeneracy tolerance.  f_diff is SIGNED (MP1 may overshoot [0, 1]),
+        # so filtering on f_v-f_c>0 would not implement Adler-Wiser.  A pair
+        # inside one multiplet is intraband content (``_interband_weight``).
+        transition = logical & (dE >= TOL_DEGENERACY_RY)
 
         def _one(omega):
             z = omega + 1j * eta
             weight = jnp.where(
                 transition,
-                _interband_degenerate_weight(
-                    dE, f_diff, z, s_avg, prefactor, near_degenerate,
-                    include_surface=include_surface,
-                ),
+                _interband_weight(dE, f_diff, z, prefactor),
                 jnp.asarray(0.0 + 0.0j, dtype=jnp.complex128),
             )
             local = jnp.einsum(
@@ -1167,8 +1111,6 @@ def _s_tensor_kernel(
         mesh=mesh,
         in_specs=(
             P(None, None, "x", "y"),
-            P(None, "x"),
-            P(None, "y"),
             P(None, "x"),
             P(None, "y"),
             P(None, "x"),
@@ -1932,16 +1874,16 @@ def _drude_tensor_kernel(mesh: Mesh, *, nb_logical: int) -> Callable:
         return hit
     ax_x, ax_y = _mesh_xy(mesh)
 
-    def _local(v_local, surface_weight_x, prefactor):
+    def _local(v_local, e_x, e_y, s_x, s_y, prefactor):
         nx, ny = v_local.shape[-2:]
         ix = jax.lax.axis_index(ax_x) * nx + jnp.arange(nx)
         iy = jax.lax.axis_index(ax_y) * ny + jnp.arange(ny)
-        diagonal = (
-            (ix[:, None] == iy[None, :])
-            & (ix[:, None] < nb_logical)
-            & (iy[None, :] < nb_logical)
-        )[None, :, :]
-        weight = jnp.where(diagonal, surface_weight_x[:, :, None], 0.0)
+        logical = ((ix[:, None] < nb_logical)
+                   & (iy[None, :] < nb_logical))[None, :, :]
+        multiplet = logical & (
+            jnp.abs(e_x[:, :, None] - e_y[:, None, :]) < TOL_DEGENERACY_RY)
+        weight = jnp.where(
+            multiplet, 0.5 * (s_x[:, :, None] + s_y[:, None, :]), 0.0)
         local = prefactor * jnp.einsum(
             "akij,kij,bkij->ab",
             jnp.conj(v_local), weight, v_local, optimize=True,
@@ -1951,7 +1893,8 @@ def _drude_tensor_kernel(mesh: Mesh, *, nb_logical: int) -> Callable:
     sm = shard_map(
         _local,
         mesh=mesh,
-        in_specs=(P(None, None, "x", "y"), P(None, "x"), P()),
+        in_specs=(P(None, None, "x", "y"), P(None, "x"), P(None, "y"),
+                  P(None, "x"), P(None, "y"), P()),
         out_specs=P(None, None),
         check_vma=False,
     )
@@ -1963,6 +1906,7 @@ def _drude_tensor_kernel(mesh: Mesh, *, nb_logical: int) -> Callable:
 def head_drude_tensor_sharded(
     velocity_cart,
     surface_weight_kn,
+    energies_kn_ry,
     *,
     mesh: Mesh,
     nb_logical: int,
@@ -1971,32 +1915,42 @@ def head_drude_tensor_sharded(
     nspin: int,
     nspinor: int,
 ):
-    """Return the ab-initio Drude tensor ``D_ab`` in Rydberg units.
+    r"""Return the ab-initio Drude tensor ``D_ab`` in Rydberg units.
 
-    ``D_ab = C/(Omega Nk) sum_kn (-df/dE) v_a,nn* v_b,nn`` with state
-    capacity ``C=2/(nspin*nspinor)``.  Consequently the directional plasma
-    frequency in this tree's Rydberg convention is
-    ``omega_p(qhat)^2 = 8*pi*qhat.D.qhat``.  The diagonal QSGW velocities
-    include the nonlocal-pseudopotential and covariant-rotation terms.  At
-    the initial iteration they are exactly the saved DFT ``dH/dk``; only a
-    subsequent self-consistent Hamiltonian update makes them QSGW.  No fitted
-    or experimental plasma frequency enters.
+    .. math::
+        D_{ab} = \frac{C}{\Omega N_k} \sum_k \sum_{nm:\,|E_n-E_m|<\delta}
+        \bar w_{k,nm}\, v^{a*}_{k,nm} v^b_{k,nm},
+        \qquad C = \frac{2}{n_{\rm spin} n_{\rm spinor}},
+
+    the q -> 0, |z| >> v q limit of the intraband density response,
+    ``chi = q.D.q / z^2``, so ``omega_p(qhat)^2 = 8 pi qhat.D.qhat`` (Ry^2)
+    and free electrons give ``D = 2n``.  ``w`` is the Fermi-surface table
+    (``Nk`` times the normalized-zone ``integral delta(E-mu)``) and
+    ``wbar = (w_n + w_m)/2``.  The sum runs over each degenerate multiplet
+    (``delta = TOL_DEGENERACY_RY``, BGW's TOL_Degeneracy), not only the
+    diagonal: the trace ``sum_nm v_nm v_mn`` over a multiplet is invariant
+    under rotations inside it, the diagonal alone is not, and those pairs are
+    excluded from the interband ``S``.  The velocities include the nonlocal
+    pseudopotential; in QSGW they are rotated into the current basis.  No
+    fitted or experimental plasma frequency enters.
     """
     v = jnp.asarray(velocity_cart, dtype=jnp.complex128)
     surface = jnp.asarray(surface_weight_kn, dtype=jnp.float64)
+    energies = jnp.asarray(energies_kn_ry, dtype=jnp.float64)
     if v.ndim != 4 or v.shape[0] != 3 or v.shape[2] != v.shape[3]:
         raise ValueError(
             f"velocity_cart must be (3,nk,nb,nb), got {v.shape}.")
-    if tuple(surface.shape) != tuple(v.shape[1:3]):
+    if tuple(surface.shape) != tuple(v.shape[1:3]) or (
+            energies.shape != surface.shape):
         raise ValueError(
-            f"surface_weight_kn shape {surface.shape} does not match "
-            f"velocity (nk,nb)={v.shape[1:3]}.")
+            f"surface_weight_kn {surface.shape} and energies "
+            f"{energies.shape} must match velocity (nk,nb)={v.shape[1:3]}.")
     if not (0 < int(nb_logical) <= int(v.shape[2])):
         raise ValueError(
             f"need 0 < nb_logical <= stored nb, got "
             f"{nb_logical}, {v.shape[2]}.")
-    v, _e, _f, surface = _pad_head_band_manifold(
-        v, surface, surface, surface, mesh=mesh)
+    v, energies, _f, surface = _pad_head_band_manifold(
+        v, energies, surface, surface, mesh=mesh)
     pref = 2.0 / (
         float(cell_volume)
         * float(nk_tot)
@@ -2004,7 +1958,8 @@ def head_drude_tensor_sharded(
         * float(max(int(nspinor), 1))
     )
     tensor = _drude_tensor_kernel(mesh, nb_logical=int(nb_logical))(
-        v, surface, jnp.asarray(pref, dtype=jnp.complex128))
+        v, energies, energies, surface, surface,
+        jnp.asarray(pref, dtype=jnp.complex128))
     return 0.5 * (tensor + jnp.conj(tensor.T))
 
 
@@ -2084,16 +2039,12 @@ def head_s_tensor_sharded(
         * float(max(int(nspin), 1))
         * float(max(int(nspinor), 1))
     )
-    interband = _s_tensor_kernel(
-        mesh, nb_logical=int(nb_logical), include_surface=bool(include_surface),
-    )(
+    interband = _s_tensor_kernel(mesh, nb_logical=int(nb_logical))(
         v,
         e,
         e,
         f,
         f,
-        surface,
-        surface,
         omega,
         jnp.asarray(pref, dtype=jnp.complex128),
         jnp.asarray(float(eta_ry), dtype=jnp.float64),
@@ -2108,6 +2059,7 @@ def head_s_tensor_sharded(
     drude = head_drude_tensor_sharded(
         v,
         surface,
+        e,
         mesh=mesh,
         nb_logical=int(nb_logical),
         cell_volume=float(cell_volume),
@@ -2838,6 +2790,34 @@ def head_samples_from_s(
     return tuple(out)
 
 
+def _metal_static_head(wfns, surface, occupation_state, omegas, *, mesh,
+                       meta, config, nb_logical, nspin, nspinor):
+    """The exact z = 0 slot of a metallic head: Thomas-Fermi and its fold.
+
+    ``kappa_TF^2 = 8 pi N(E_F) / Omega`` with ``N(E_F)`` from the same
+    Fermi-surface table as the Drude term.  When the head carries wings
+    (``wfns`` given) and the plan has an exact static row, the static
+    density wings and the static Gamma body (``compute_chi0_matsubara`` at
+    ``n = 0``, whose tau factors carry ``-df/dE``) complete the fold.  Both
+    metallic head builders take this one owner.
+    """
+    capacity = 2.0 / (float(max(int(nspin), 1)) * float(max(int(nspinor), 1)))
+    kappa2 = (8.0 * np.pi * capacity
+              * float(np.sum(np.asarray(surface, dtype=np.float64)))
+              / float(meta.nk_tot) / float(meta.cell_volume))
+    static_Y_x = static_Z_y = static_chi_body_gamma = None
+    if wfns is not None and any(abs(complex(z)) <= 1.0e-14 for z in omegas):
+        static_Y_x, static_Z_y = static_head_wings_sharded(
+            wfns, surface, mesh=mesh, nb_logical=int(nb_logical),
+            nk_tot=int(meta.nk_tot), nspin=int(nspin), nspinor=int(nspinor))
+        from gw.w_isdf import compute_chi0_matsubara
+        static_chi_body_gamma = compute_chi0_matsubara(
+            wfns, meta, mesh, occupation_state=occupation_state,
+            nu_indices=(0,),
+            rel_tol=float(config.minimax_config.target_error))[0:1]
+    return kappa2, static_Y_x, static_Z_y, static_chi_body_gamma
+
+
 def build_iteration_head_response(
     delta_h_dft,
     forward_links,
@@ -2931,51 +2911,20 @@ def build_iteration_head_response(
             surface_weight_kn=surface_weight_qp_kn,
         )
     omegas = tuple(complex(z) for z in np.asarray(omegas_ry).reshape(-1))
-    if (
-        wfns_qp is not None
-        and surface_weight_qp_kn is not None
-        and any(abs(z) <= 1.0e-14 for z in omegas)
-    ):
-        static_Y_x, static_Z_y = static_head_wings_sharded(
-            wfns_qp,
-            surface_weight_qp_kn,
-            mesh=mesh,
-            nb_logical=int(nb_logical),
-            nk_tot=int(meta.nk_tot),
-            nspin=int(wfn.nspin),
-            nspinor=normalization_nspinor,
-        )
-        # chi0(q=0; i nu_0) from the one static producer: the finite-
-        # temperature Matsubara sweep, whose tau factors carry the Fermi-
-        # surface -df/dE.  Row 0 of the flat q grid is Gamma; the (1, mu, mu)
-        # slice is the override shape its consumers set.
-        from gw.w_isdf import compute_chi0_matsubara
-        static_chi_body_gamma = compute_chi0_matsubara(
-            wfns_qp,
-            meta,
-            mesh,
-            occupation_state=occupation_state,
-            nu_indices=(0,),
-            rel_tol=float(config.minimax_config.target_error),
-        )[0:1]
+    static_Y_x = static_Z_y = static_chi_body_gamma = None
     static_kappa2 = None
     drude_tensor = None
     if surface_weight_qp_kn is not None:
         drude_tensor = np.asarray(head_drude_tensor_sharded(
-            v_qp, surface_weight_qp_kn, mesh=mesh, nb_logical=nb_logical,
+            v_qp, surface_weight_qp_kn, energies_qp_kn_ry, mesh=mesh,
+            nb_logical=nb_logical,
             cell_volume=float(meta.cell_volume), nk_tot=int(meta.nk_tot),
             nspin=int(wfn.nspin), nspinor=normalization_nspinor))
-        capacity = 2.0 / (
-            float(max(int(wfn.nspin), 1))
-            * float(max(normalization_nspinor, 1)))
-        # Tetrahedron weights arrive multiplied by Nk to share the distributed
-        # Drude contraction's interface.  Undo that factor for the normalized
-        # BZ density of states, then use kappa_TF^2=8*pi*DOS_Ry/Omega.
-        dos_ry_per_cell = capacity * float(
-            np.sum(np.asarray(surface_weight_qp_kn, dtype=np.float64))) / float(
-                meta.nk_tot)
-        static_kappa2 = (
-            8.0 * np.pi * dos_ry_per_cell / float(meta.cell_volume))
+        (static_kappa2, static_Y_x, static_Z_y,
+         static_chi_body_gamma) = _metal_static_head(
+            wfns_qp, surface_weight_qp_kn, occupation_state, omegas,
+            mesh=mesh, meta=meta, config=config, nb_logical=nb_logical,
+            nspin=int(wfn.nspin), nspinor=normalization_nspinor)
     return IterationHeadResponse(
         omegas=omegas,
         S_direct=S,
@@ -3094,13 +3043,14 @@ def build_dft_head_response(
 
     ``occupation_state`` is the metal's fixed-N Fermi-Dirac state on this
     spectrum (the one-shot state, or the DFT state of a map whose head stays
-    frozen).  It replaces the bundle's 0/1 table, which is a step by band
-    index and splits degenerate multiplets at the cut, and it adds the
-    metal's intraband Fermi-surface response: the tetrahedron table of
+    frozen).  It replaces the bundle's 0/1 table, a step by band index that
+    splits degenerate multiplets at the cut, and it adds the intraband
+    Fermi-surface response exactly as the QSGW builder does
+    (:func:`build_iteration_head_response`): the table of
     :func:`gw.fermi_surface.metal_head_surface_weights` enters ``S(z)`` as
-    the Drude term and, for the direct head, the static Thomas-Fermi slot.
-    The wings stay interband-only: the intraband head is direct on every
-    metallic route.  ``None`` is the insulating head.
+    the Drude term and the wings as their intraband term, and the exact
+    ``z = 0`` row takes Thomas-Fermi with its static fold
+    (:func:`_metal_static_head`).  ``None`` is the insulating head.
     """
     import os
 
@@ -3130,6 +3080,7 @@ def build_dft_head_response(
     normalization_nspinor = int(meta.nspinor_wfnfile)
     surface = None
     static_kappa2 = None
+    static_Y_x = static_Z_y = static_chi_body_gamma = None
     drude_tensor = None
     if occupation_state is not None:
         if b0 != 0:
@@ -3150,22 +3101,15 @@ def build_dft_head_response(
             kgrid=wfn.kgrid)
         surface = jnp.asarray(surface_host)
         drude_tensor = np.asarray(head_drude_tensor_sharded(
-            jnp.asarray(velocity_cart), surface, mesh=mesh,
+            jnp.asarray(velocity_cart), surface, energies, mesh=mesh,
             nb_logical=nb_logical, cell_volume=float(meta.cell_volume),
             nk_tot=int(meta.nk_tot), nspin=int(wfn.nspin),
             nspinor=normalization_nspinor))
-        if wings and np.any(np.abs(z) <= 1.0e-14):
-            raise ValueError(
-                "GATE metal_full_head_static_row: a metallic full head has "
-                "no static wing completion for an exact z=0 row; the metal "
-                "MPA plan has none (its origin is mpa_metal_origin_shift_ry)")
-        if not wings:
-            capacity = 2.0 / (
-                float(max(int(wfn.nspin), 1))
-                * float(max(normalization_nspinor, 1)))
-            static_kappa2 = 8.0 * np.pi * capacity * float(
-                np.sum(surface_host)) / float(meta.nk_tot) / float(
-                    meta.cell_volume)
+        (static_kappa2, static_Y_x, static_Z_y,
+         static_chi_body_gamma) = _metal_static_head(
+            wfns if wings else None, surface, occupation_state, z,
+            mesh=mesh, meta=meta, config=config, nb_logical=nb_logical,
+            nspin=int(wfn.nspin), nspinor=normalization_nspinor)
     S = head_s_tensor_sharded(
         jnp.asarray(velocity_cart), energies, occupations, z,
         mesh=mesh, nb_logical=nb_logical,
@@ -3178,7 +3122,7 @@ def build_dft_head_response(
             jnp.asarray(velocity_cart), wfns, energies, occupations, z,
             mesh=mesh, nb_logical=nb_logical, nk_tot=int(meta.nk_tot),
             nspin=int(wfn.nspin), nspinor=normalization_nspinor,
-            eta_ry=float(config.head.wcoul0_eta))
+            eta_ry=float(config.head.wcoul0_eta), surface_weight_kn=surface)
     # Hard lifetime boundary: this module previously had zero
     # ``block_until_ready`` calls (unlike ``screening.py``'s per-stage
     # discipline), so the direct head/wings built here stayed queued,
@@ -3202,7 +3146,8 @@ def build_dft_head_response(
         omegas=tuple(complex(value) for value in z),
         S_direct=S, Y_x=Y_x, Z_y=Z_y,
         static_kappa2_bohr2=static_kappa2,
-        static_Y_x=None, static_Z_y=None, static_chi_body_gamma=None,
+        static_Y_x=static_Y_x, static_Z_y=static_Z_y,
+        static_chi_body_gamma=static_chi_body_gamma,
         sigma_energies_ry=e_host[:, :int(meta.nb_sigma)],
         sigma_occupations=np.asarray(occupations)[:, :int(meta.nb_sigma)],
         efermi_ry=efermi, drude_tensor=drude_tensor)

@@ -273,7 +273,8 @@ def metal_head_surface_weights(energies_kn, chemical_potential, *, sym, kgrid,
     ``integral delta(E_n(k) - mu) dk`` over the normalized zone, at the
     fixed-N chemical potential: the point group's decomposition orbit
     (:func:`tetrahedron_delta_weights`) followed by the star average
-    (:func:`star_symmetrize_weights`).  The factor ``Nk`` matches the head
+    (:func:`star_symmetrize_weights`), then averaged over each degenerate
+    multiplet at BGW's TOL_Degeneracy.  The factor ``Nk`` matches the head
     contractions' uniform ``1/Nk``; ``N(E_F) = capacity * sum_kn w_kn``.
     Columns past ``energies_kn.shape[1]`` up to ``nb_storage`` are exact
     zeros.  Every metallic head route (the QSGW map, the frozen DFT head,
@@ -285,6 +286,12 @@ def metal_head_surface_weights(energies_kn, chemical_potential, *, sym, kgrid,
         tuple(int(x) for x in kgrid), float(chemical_potential),
         symmetry_matrices=np.asarray(sym.sym_mats_k))
     weights = star_symmetrize_weights(weights, np.asarray(sym.irr_idx_k))
+    # One weight per degenerate multiplet: the Drude tensor contracts the
+    # multiplet trace, which is basis invariant only for a common weight.
+    # Band-sorted linear tetrahedra give members of one multiplet different
+    # weights; the mean keeps N(E_F) unchanged.
+    from .degen_average import average_within_degenerate_sets
+    weights = average_within_degenerate_sets(weights, energies)
     weights = weights * float(energies.shape[0])
     width = int(energies.shape[1] if nb_storage is None else nb_storage)
     if width < energies.shape[1]:
