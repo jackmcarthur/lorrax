@@ -136,7 +136,8 @@ from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 from common.shard_map import shard_map as _shard_map_fn
 
 from common.contract_bands import reduce_scatter_to_band_block
-from common.fft_helpers import make_local_kconv_klead
+from common.fft_helpers import (klead_outer_refusal, make_local_kconv_klead,
+                                make_local_kconv_klead_outer)
 from .bse_preconditioner import exchange_spin_weight
 from .bse_ring_comm import make_bse_shardings
 
@@ -289,6 +290,46 @@ def _conv_decode(T_b, psi_c_X, psi_v_Y, W_Rk, kconv, sqrt_nk):
     return WXcv / sqrt_nk
 
 
+# ===========================================================================
+# The TDA W term on the outer-product load (BSEMAX, 2026-09-26)
+# ===========================================================================
+#
+# T[k,t,μ,s,ν] = Σ_c ψ^X_c Σ_v conj(ψ^Y_v) X is a rank-K sum per k with K = min(n_c, n_v), and
+# it is the largest object of the matvec (2.15 GB per rank per trial on CrI3 8x8 at P4) while
+# its encode does ~7 flop per byte of T written.  The router's outer door
+# (``make_local_kconv_klead_outer``) forms T in shared memory on the convolution's load from
+# its two legs, ``T = Σ_K L[k,t,μ,K] R[k,K,s,ν]``, so T is never written or read: the encode
+# ZGEMM and one of the convolution's two T-sized HBM passes are gone.  Both the legs and the
+# decode contract over K = min(n_c, n_v) first (8.6 against 15.0 GFLOP per trial on CrI3, a
+# pure reordering).  U is unchanged (k-leading, the decode's batched ZGEMM reads it).
+
+
+def _outer_legs(X_b, psi_c_X, psi_v_Y):
+    """``(L, R)`` with ``T = Σ_K L[k,t,μ,K] R[k,K,s,ν]`` and K = min(n_c, n_v).
+
+    n_v <= n_c: ``L = Σ_c ψ^X_c X`` (nk, ns, μ_loc, n_v), ``R = conj(ψ^Y_v)``.
+    n_c <  n_v: ``L = ψ^X_c`` moved K-minor (nk, ns, μ_loc, n_c), ``R = Σ_v conj(ψ^Y_v) X``.
+    """
+    if psi_v_Y.shape[1] <= psi_c_X.shape[1]:
+        return (jnp.einsum("kctM,cvk->ktMv", psi_c_X, X_b), jnp.conj(psi_v_Y))
+    return (jnp.moveaxis(psi_c_X, 1, -1),
+            jnp.einsum("kvsN,cvk->kcsN", jnp.conj(psi_v_Y), X_b))
+
+
+def _decode_min(U_b, psi_c_X, psi_v_Y, sqrt_nk):
+    """``(WX)_b = (1/√Nk) Σ conj(ψ_c) ψ_v U_b`` contracted through the smaller band set first.
+
+    n_v <= n_c: ``B = U·ψ_v`` over (s, ν) (out n_v), then ``conj(ψ_c)`` over (t, μ);
+    else the (t, μ)-first order of ``_conv_decode``.  This rank's (μ_loc, ν_loc) partial,
+    completed by the caller's one reduce-scatter.
+    """
+    if psi_v_Y.shape[1] <= psi_c_X.shape[1]:
+        B = jnp.einsum("ktMsN,kvsN->ktMv", U_b, psi_v_Y)          # (nk, ns, μ_loc, n_v)
+        return jnp.einsum("kctM,ktMv->cvk", jnp.conj(psi_c_X), B) / sqrt_nk
+    A = jnp.einsum("kctM,ktMsN->kcsN", jnp.conj(psi_c_X), U_b)    # (nk, n_c, ns, ν_loc)
+    return jnp.einsum("kvsN,kcsN->cvk", psi_v_Y, A) / sqrt_nk
+
+
 def _exchange_U(S_part, V_q0):
     """Inside the (x, y) shard_map: the exchange term's two small reductions.
 
@@ -388,9 +429,23 @@ def build_bse_stack_matvec(
 
     sh = make_bse_shardings(mesh_xy)
     nk = nkx * nky * nkz
-    # The W-term k-convolution: the router's local k-leading door (inside the
-    # shard_map below), one fused in-place call per trial.
+    # The W-term k-convolution: the router's outer-product door when it serves
+    # the band rank K = min(n_c, n_v) (decided at trace time, announced once),
+    # else the local k-leading door on an XLA-built T; one call per trial.
     kconv = make_local_kconv_klead(mesh_xy, (nkx, nky, nkz), norm="ortho")
+    kconv_outer = None
+
+    def _outer_route(psi_c_X, psi_v_Y):
+        nonlocal kconv_outer
+        from ffi.gate import announce_once
+        rank = min(int(psi_c_X.shape[1]), int(psi_v_Y.shape[1]))
+        why = klead_outer_refusal(mesh_xy, (nkx, nky, nkz), rank)
+        announce_once(("bse", "w_term_route", rank, why is None),
+                      f"[bse] W term: {'outer-product load (T never stored)' if why is None else 'XLA encode + k-conv: ' + why}"
+                      f", K = min(n_c, n_v) = {rank}")
+        if why is None and kconv_outer is None:
+            kconv_outer = make_local_kconv_klead_outer(mesh_xy, (nkx, nky, nkz), norm="ortho")
+        return why is None
 
     # ── W term: one shard_map over ('x','y'); body = scan over the trial axis ──
     def _w_stack(X, psi_c_X, psi_v_Y, W_R):
@@ -404,6 +459,15 @@ def build_bse_stack_matvec(
         # (2026-07-16); the fp32-GMRES path casts upstream in bse_feast, not here.
         sqrt_nk = jnp.sqrt(jnp.asarray(nk, dtype=X.real.dtype))
         W_Rk = _w_r_klead(W_R)                       # once per call, not per trial
+
+        if _outer_route(psi_c_X, psi_v_Y):
+            def _body_outer(carry, X_b):             # X_b: (c_full, v_full, nk)
+                L, R = _outer_legs(X_b, psi_c_X, psi_v_Y)
+                U_b = kconv_outer(L, R, W_Rk)        # T formed on the load, never stored
+                return carry, _decode_min(U_b, psi_c_X, psi_v_Y, sqrt_nk)
+
+            _, WX = lax.scan(_body_outer, None, _gather_trial_block(X), unroll=1)
+            return _scatter_trial_block(WX, mesh_xy)
 
         def _body(carry, X_b):                       # X_b: (c_full, v_full, nk)
             # encode: T_b[k,t,μ,s,ν] = Σ_c ψ_c[k,c,t,μ] Σ_v conj(ψ_v[k,v,s,ν]) X_b

@@ -85,7 +85,7 @@ struct OuterGeo {
 };
 
 constexpr int NX = LRX_NX, NY = LRX_NY, NZ = LRX_NZ, NK = NX * NY * NZ;
-constexpr int KK = LRX_K, YB = LRX_YB, XB = LRX_XB, TR = XB * YB;
+constexpr int KK = LRX_K, YB = LRX_YB, XB = LRX_XB, TR = XB * YB, NBUF = LRX_NBUF;
 using GK = lrx_kbox::Geo<NX, NY, NZ>;
 
 // The family's kernel multiply (kconv_mathdx_cuda_ffi.cc lrx_mul), spelled identically.
@@ -94,11 +94,38 @@ __device__ __forceinline__ lrx_c2 lrx_mul(lrx_c2 a, lrx_c2 b) {
     return z;
 }
 
+__device__ __forceinline__ void lrx_cp_wait1() { asm volatile("cp.async.wait_group 1;\n" ::); }
+
+// Stage the (a, x block) tile's two streamed operands into buffer `buf`, one cp.async group:
+// Ls[k][xi][K] = L[k, a, x0 + xi, K] (one contiguous XB*KK run per k) and
+// Vs[k][j]     = V[k, x0 + j / YB, y0 + j % YB] (YB-long runs); zero past the edges.
+__device__ __forceinline__ void lrx_stage(lrx_c2* Ls, lrx_c2* Vs, const lrx_c2* __restrict__ L,
+                                          const lrx_c2* __restrict__ V, const OuterGeo& g,
+                                          long long a, long long x0, long long y0) {
+    for (int i = threadIdx.x; i < NK * XB * KK; i += blockDim.x) {
+        const int k = i / (XB * KK), rem = i % (XB * KK);
+        const long long x = x0 + rem / KK;
+        if (x < g.mx) lrx_kbox::cp_async<16>(Ls + i, L + (((long long)k * g.na + a) * g.mx + x) * KK + rem % KK);
+        else { Ls[i].x = 0.0; Ls[i].y = 0.0; }
+    }
+    for (int i = threadIdx.x; i < NK * TR; i += blockDim.x) {
+        const int k = i / TR, j = i % TR;
+        const long long x = x0 + j / YB, y = y0 + j % YB;
+        if (x < g.mx && y < g.my) lrx_kbox::cp_async<16>(Vs + i, V + ((long long)k * g.mx + x) * g.my + y);
+        else { Vs[i].x = 0.0; Vs[i].y = 0.0; }
+    }
+    lrx_kbox::cp_async_commit();
+}
+
+// Shared memory: the k-box bank (TR padded columns), then NBUF (L tile, V tile) buffers; the
+// next pair's tiles land by cp.async while this pair transforms (NBUF = 2).
 extern "C" __global__ void __launch_bounds__(LRX_THREADS, LRX_MINB) lrx_kconv_outer(
     const lrx_c2* __restrict__ L, const lrx_c2* __restrict__ R, const lrx_c2* __restrict__ V,
     lrx_c2* __restrict__ U, OuterGeo g) {
     extern __shared__ lrx_c2 bank[];
     using namespace cufftdx;
+    constexpr int LT = NK * XB * KK, VT = NK * TR;
+    lrx_c2* const Lb = bank + TR * GK::RS;                        // Ls[buf] = Lb + buf * (LT + VT)
     const int ek = threadIdx.x / YB, ey = threadIdx.x % YB;       // the encode's (k, y)
     const long long ucols = g.na * g.mx * g.nb * g.my;            // U columns per k
     const long long pairs = g.na * g.nxb;
@@ -113,37 +140,44 @@ extern "C" __global__ void __launch_bounds__(LRX_THREADS, LRX_MINB) lrx_kconv_ou
             if (yok) r[q] = R[(((long long)ek * KK + q) * g.nb + b) * g.my + y];
             else { r[q].x = 0.0; r[q].y = 0.0; }
         }
-        const long long p1 = min(pairs, (grp + 1) * g.per);
-        for (long long p = grp * g.per; p < p1; ++p) {
+        const long long p0 = grp * g.per, p1 = min(pairs, p0 + g.per);
+        if (p0 < p1) lrx_stage(Lb, Lb + LT, L, V, g, p0 % g.na, (p0 / g.na) * XB, y0);
+        int buf = 0;
+        for (long long p = p0; p < p1; ++p) {
             const long long a = p % g.na, x0 = (p / g.na) * XB;
+            lrx_c2* const Ls = Lb + buf * (LT + VT);
+            lrx_c2* const Vs = Ls + LT;
+            if (NBUF == 2 && p + 1 < p1) {
+                lrx_c2* const Ln = Lb + (buf ^ 1) * (LT + VT);
+                lrx_stage(Ln, Ln + LT, L, V, g, (p + 1) % g.na, ((p + 1) / g.na) * XB, y0);
+                lrx_cp_wait1();
+            } else {
+                if (NBUF == 1 && p > p0) lrx_stage(Ls, Vs, L, V, g, a, x0, y0);
+                lrx_kbox::cp_async_wait_all();
+            }
+            __syncthreads();
             // Load: T[k, a, x, b, y] = sum_K L[k, a, x, K] R[k, K, b, y], one K-ordered fma chain.
 #pragma unroll
             for (int xi = 0; xi < XB; ++xi) {
-                const long long x = x0 + xi;
                 lrx_c2 acc = {0.0, 0.0};
-                if (yok && x < g.mx) {
-                    const lrx_c2* l = L + (((long long)ek * g.na + a) * g.mx + x) * KK;
+                const lrx_c2* l = Ls + (ek * XB + xi) * KK;
 #pragma unroll
-                    for (int q = 0; q < KK; ++q) {
-                        const double2 lv = __ldg(reinterpret_cast<const double2*>(l) + q);
-                        acc.x = fma(lv.x, r[q].x, acc.x);
-                        acc.x = fma(-lv.y, r[q].y, acc.x);
-                        acc.y = fma(lv.x, r[q].y, acc.y);
-                        acc.y = fma(lv.y, r[q].x, acc.y);
-                    }
+                for (int q = 0; q < KK; ++q) {
+                    const lrx_c2 lv = l[q];
+                    acc.x = fma(lv.x, r[q].x, acc.x);
+                    acc.x = fma(-lv.y, r[q].y, acc.x);
+                    acc.y = fma(lv.x, r[q].y, acc.y);
+                    acc.y = fma(lv.y, r[q].x, acc.y);
                 }
                 bank[(xi * YB + ey) * GK::RS + GK::at(ek)] = acc;
             }
             __syncthreads();
             lrx_kbox::transform3<NX, NY, NZ, TR, LRX_SM, fft_direction::inverse>(bank);
-            // Mid: the stored kernel V[k, x, y] (R space), mode 2's KernMid.
+            // Mid: the stored kernel V[k, x, y] (R space), mode 2's KernMid, from the staged tile.
             for (int i = threadIdx.x; i < TR * NK; i += blockDim.x) {
                 const int j = i % TR, k = i / TR;
-                const long long x = x0 + j / YB, yy = y0 + j % YB;
-                if (x < g.mx && yy < g.my) {
-                    lrx_c2* e = bank + j * GK::RS + GK::at(k);
-                    *e = lrx_mul(*e, V[((long long)k * g.mx + x) * g.my + yy]);
-                }
+                lrx_c2* e = bank + j * GK::RS + GK::at(k);
+                *e = lrx_mul(*e, Vs[k * TR + j]);
             }
             __syncthreads();
             lrx_kbox::transform3<NX, NY, NZ, TR, LRX_SM, fft_direction::forward>(bank);
@@ -160,6 +194,7 @@ extern "C" __global__ void __launch_bounds__(LRX_THREADS, LRX_MINB) lrx_kconv_ou
                 }
             }
             __syncthreads();
+            buf ^= (NBUF == 2);
         }
     }
 }
@@ -181,7 +216,7 @@ static std::map<Key, std::string> g_fail;
 static int pick_yb(int nk, int yb_req) {
     if (yb_req > 0) return yb_req;
     int yb = 1;
-    while (yb < 8 && nk * yb * 2 <= 256) yb *= 2;
+    while (yb < 8 && nk * yb * 2 <= kThreadsMax) yb *= 2;
     return yb;
 }
 
@@ -218,7 +253,12 @@ static ffi::Error build(int nkx, int nky, int nkz, int K, int yb_req, std::strin
     const int threads = nk * yb;
     const int xb = std::max(1, 32 / yb);
     const lrx_kbox::Geometry geo{nkx, nky, nkz};
-    const long long smem = static_cast<long long>(xb) * yb * geo.rs() * 16;
+    // The bank, then NBUF (L tile, V tile) buffers: two when they fit (the next pair's tiles
+    // land while this pair transforms), else one.
+    const long long bank_b = static_cast<long long>(xb) * yb * geo.rs() * 16;
+    const long long tiles_b = (static_cast<long long>(nk) * xb * K + static_cast<long long>(nk) * xb * yb) * 16;
+    const int nbuf = bank_b + 2 * tiles_b <= smem_optin ? 2 : 1;
+    const long long smem = bank_b + nbuf * tiles_b;
     if (yb < 1 || (yb & (yb - 1)) || threads > kThreadsMax || smem > smem_optin) {
         std::ostringstream os;
         os << "GATE mathdx-kconv-outer-tile: got k-grid (" << nkx << "," << nky << "," << nkz << ") at y width "
@@ -228,7 +268,9 @@ static ffi::Error build(int nkx, int nky, int nkz, int K, int yb_req, std::strin
               "ffi.fft.klead_outer_refusal routes such a grid to the unfused encode + mode 2 chain";
         return sticky("tile", os.str(), ffi::ErrorCode::kInvalidArgument);
     }
-    const int minb = std::max(1, std::min<int>(2, static_cast<int>(smem_sm / (smem + 1024))));
+    // Two blocks per SM only where the shared memory allows it and a block of <= 256 threads
+    // keeps 128 registers per thread (the right leg alone is 4K of them).
+    const int minb = threads > 256 ? 1 : std::max(1, std::min<int>(2, static_cast<int>(smem_sm / (smem + 1024))));
     std::string why;
     const std::string cuda_inc = nvrtc::toolkit_include(&why);
     if (cuda_inc.empty()) return sticky("CUDA toolkit headers for NVRTC", why);
@@ -246,6 +288,7 @@ static ffi::Error build(int nkx, int nky, int nkz, int K, int yb_req, std::strin
         "-DLRX_NX=" + std::to_string(nkx), "-DLRX_NY=" + std::to_string(nky), "-DLRX_NZ=" + std::to_string(nkz),
         "-DLRX_K=" + std::to_string(K), "-DLRX_YB=" + std::to_string(yb), "-DLRX_XB=" + std::to_string(xb),
         "-DLRX_THREADS=" + std::to_string(threads), "-DLRX_MINB=" + std::to_string(minb),
+        "-DLRX_NBUF=" + std::to_string(nbuf),
         "-DLRX_SM=" + std::to_string(cc_major * 100 + cc_minor * 10)};
     nvrtc::mathdx_toolchain(root, cuda_inc, "cufftdx", &prog);
     prog.kernel = "lrx_kconv_outer";
@@ -274,9 +317,9 @@ static ffi::Error build(int nkx, int nky, int nkz, int K, int yb_req, std::strin
     if (cr != CUDA_SUCCESS) return sticky("cuFuncSetAttribute", cu_err(cr));
     if (mklpin::announce_here() || mklpin::debug_print_here()) {
         std::fprintf(stderr, "[kconv_outer] %s kgrid=(%d,%d,%d) K=%d sm_%d%d in %.1f ms (tile %dx%d, %d threads, "
-                     "%d blocks/SM, smem=%d B, cubin %s)\n",
+                     "%d blocks/SM, %d tile buffers, smem=%d B, cubin %s)\n",
                      img.from_disk ? "disk-cache hit" : "NVRTC built", nkx, nky, nkz, K, cc_major, cc_minor, img.ms,
-                     xb, yb, threads, minb, b.smem,
+                     xb, yb, threads, minb, nbuf, b.smem,
                      path.empty() ? "not cached (no cubin_dir)" : (img.from_disk ? path.c_str() : "stored"));
     }
     *out = &(g_cache[key] = b);
