@@ -1,7 +1,7 @@
 # Planned Lanczos active algebra
 
-`solvers.lanczos.lanczos_eig_jit`, `block_lanczos_eig_jit` and
-`block_lanczos_eig_jit_converged` take a `subspace_plan` from
+`solvers.lanczos.block_lanczos_eig_jit` (any block size; `block_size=1` is
+the single-vector solver) and `block_lanczos_eig_jit_converged` take a `subspace_plan` from
 [`distrib_la.plan_subspace`](davidson.md#shared-subspace-service), resolved
 before the recurrence is staged. Distributed callers build it with their
 vector sharding before their outer `jit` and pass it in. An omitted plan

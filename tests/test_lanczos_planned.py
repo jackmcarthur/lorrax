@@ -37,10 +37,6 @@ def _solve(matrix, *, block_size, steps, planned, n_reorth=-1, early=False):
                     lambda x: x @ h.T, n, roots, block_size, steps,
                     n_reorth=n_reorth, rtol=1e-11, check_every=2,
                     subspace_plan=plan)
-            if block_size == 1:
-                return lz.lanczos_eig_jit(
-                    lambda x: h @ x, n, roots, steps, n_reorth=n_reorth,
-                    subspace_plan=plan)
             return lz.block_lanczos_eig_jit(
                 lambda x: x @ h.T, n, roots, block_size, steps,
                 n_reorth=n_reorth, subspace_plan=plan)
