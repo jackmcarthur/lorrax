@@ -1334,6 +1334,26 @@ def make_local_kconv_klead_outer(mesh: Mesh, kgrid, *, norm: str | None = "ortho
     return _plan
 
 
+def make_local_kconv_klead_outer_decode(mesh: Mesh, kgrid, *, norm: str | None = "ortho") -> Callable:
+    """EXPERIMENT (piece C): ``fn(L, R, V_R, Pc, Pv, conj_r) -> Y (nc, nv, nk)``, the outer load with
+    the decode fused into the store: ``Y[c,v,k] = Σ_{t,μ,s,ν} conj(Pc[k,c,t,μ]) Pv[k,v,s,ν] U[k,t,μ,s,ν]``
+    with U the outer conv's (never stored).  CUDA only."""
+    kg = _check_kgrid(kgrid, kconv_backend(mesh))
+    nk = kg[0] * kg[1] * kg[2]
+    scale = ffi_fft_scale("ifftn", norm, nk) * ffi_fft_scale("fftn", norm, nk)
+    attrs = dict(nkx=np.int64(kg[0]), nky=np.int64(kg[1]), nkz=np.int64(kg[2]), scale=np.float64(scale))
+
+    def _fn(l, r, v_r, pc, pv, conj_r=False):
+        pad = -l.shape[3] % 4
+        if pad:
+            l = jnp.pad(l, ((0, 0), (0, 0), (0, 0), (0, pad)))
+            r = jnp.pad(r, ((0, 0), (0, pad), (0, 0), (0, 0)))
+        shape = (pc.shape[1], pv.shape[1], l.shape[0])
+        return jax.ffi.ffi_call("lorrax_mathdx_kconv_klead_outer_decode", jax.ShapeDtypeStruct(shape, l.dtype))(
+            l, r, v_r, pc, pv, conj_r=np.int64(bool(conj_r)), **attrs, **_mathdx_common())
+    return _fn
+
+
 def _klead_locals(mesh, kg, norm, mult):
     """Rank-local ``(prep, apply)`` of :func:`make_kconv_klead` for this mesh's backend."""
     if kconv_backend(mesh) == "mathdx" or _cpu_test_arm():
