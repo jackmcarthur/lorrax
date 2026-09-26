@@ -31,7 +31,10 @@ is taken because static tile shapes must agree on every process.
 Every planner reads this one number, `common.gpu_utils.device_budget_bytes()`,
 which the config sets when the deck resolves. A stage planned while earlier
 objects are live prices against its room, `device_room_bytes()`: the budget
-less the bytes in use, the minimum over processes.
+less the bytes in use, the minimum over processes. kmeans, htransform, bse and
+exciton_bands have no deck key; their planners read the same owner, whose
+default is the collective auto-detection above, recorded on the first call.
+No planner reads `bytes_limit`, free memory or the card total directly.
 
 A planner fills `target = budget × utilization`. Utilization defaults to
 0.90, 0.85 and 0.78 for `n_s` = 1, 2 and ≥4
@@ -131,6 +134,12 @@ the static Σ channels read it, before Hartree and the τ sweep.
 | static / GN-PPM screening | the χ₀ node ([§ Green-side](#the-green-side-stages)); the GN fit's q block (XLA's compiled footprint of one q) | `price_chi0_node` (a price, no choice); `_gn_ppm_fit_q_block` against the room | `GATE gn_ppm_fit_capacity` |
 | Σ(τ) sweep | the resident pole fields and W prep, then one pass ([§ Green-side](#the-green-side-stages)) | `sigma_spin_block` against the room | — |
 | matrix-element sweep (V_H, four-current) | the step's slabs, and FFT boxes `(2 + 2·n_comp)·n_s·N_r·16` per band of a band-layout operator | `mtxel_sweep.plan_sweep`: bands in the fewest chunks that fit the room | — |
+| ψ loader off the fit plan (ζ reuse, current faces) | one band tile of G-flat rows, samples and faces | `gflat_memory_model.loader_band_chunk`: ¼ of the room, at least the automatic 16 | the loader, when one scan row cannot fit |
+| moment bank | `(per_q·w + 16)` faces for a batch of `w` q parents | `response_bank.moment_q_width`: half the smaller of the ledger's and the device's room | the ledger |
+| sector Σ face Green panel | one parent Green tile of band panels, at most the ledger's room | `greens_function_kernel.green_panel_bytes` | the ledger |
+| direct Γ head (bulk metals) | the compiled per-sample footprint × samples per call, split over every rank | `photon_direct_head.direct_gamma_chunk_plan`: half the room, at least 2¹⁰ samples per rank, at most one 2¹⁷ replicate per call | — |
+| head wings | `n_ends` gathered endpoint blocks `16·N_k·n_s·block·N_b` | `qsgw_head.head_wing_mu_block`: half the room, at least 16 centroids | — |
+| exciton_bands C_q | P_R and its update, one ψ chunk and its Pk | `vq_interp.build_cq_q_chunk` | — |
 | restart write | one sharded tile, `max(16·Q·μ²/P, 16·Q·μ·N_G/P)` (SlabIO writes per-rank hyperslabs) | — | — |
 
 Replicated per-process metadata (the TRS-augmented centroid permutation and
