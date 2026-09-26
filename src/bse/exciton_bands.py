@@ -136,9 +136,7 @@ from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
 from solvers.lanczos import (alpha_herm_sink, block_lanczos_eig_jit,
                              report_alpha_herm, split_alpha_sink)
-from common.band_degeneracy import (DEFAULT_MODE, DEGENERACY_TOL_RY, MODES,
-                                    check_band_window)
-from common.collectives import device_put_process_local
+from common.band_degeneracy import DEFAULT_MODE, DEGENERACY_TOL_RY, MODES
 from common.fft_helpers import make_kfft_kminor
 from common.preprocessing_output import ScientificProductionReport
 from common.progress import LoopProgress
@@ -150,7 +148,8 @@ from file_io.restart_bundle import (_find_restart_file)
 from .bse_ring_comm import create_mesh_xy_from_flags, make_bse_shardings
 from .bse_preconditioner import compute_pair_amplitude
 from .bse_stack_matvec import build_bse_stack_matvec
-from .bse_window import refuse_eqp_on_a_qp_wfn
+from .exchange_path import exchange_tiles
+from .bse_window import apply_eqp_to_bse_window, require_valence_pad_guard
 from . import vq_interp
 
 RY2EV = 13.6056980659
@@ -1513,7 +1512,8 @@ def main(argv=None):
         # ── Q path from the ONE K_POINTS crystal_b machinery ─────────────────
         from gw.gw_config import linalg_resolution, read_lorrax_input
         from bandstructure import htransform as ht
-        from bandstructure.bse_setup import compute_wfns_fi
+        from bandstructure.bse_setup import (compute_wfns_fi,
+                                             resolve_conduction_window)
 
         params = read_lorrax_input(args.input)
         # CLI backend flags remain debug overrides of the implementation selected
@@ -1603,84 +1603,17 @@ def main(argv=None):
         n_val, n_cond = int(data["n_val"]), int(data["n_cond"])
         nv_pad, nc_pad = int(data["n_val_pad"]), int(data["n_cond_pad"])
         n_rmu, n_rmu_pad = int(data["n_rmu"]), int(data["n_rmu_pad"])
-        # ── QP energies (--eqp) ───────────────────────────────────────────────
-        # BOTH legs of the pair basis have to move together or the diagonal
-        # D_Q = eps_c(k+Q) - eps_v(k) mixes QP conduction with DFT valence.  The
-        # stored leg is re-sliced here (n_occ is RE-resolved on the corrected
-        # energies, so a QP-driven gap change cannot mis-slice); the interpolated
-        # leg is corrected below, right after ``initialize_wfns``.
-        #
-        # ``args.input`` is passed, and the eqp file is the IRREDUCIBLE WEDGE.
-        # This used to pass ``input_file=None`` to reach a second code path that
-        # matched full-BZ k to wedge blocks by mean-field energy to 0.01 eV, on
-        # the stated grounds that "LORRAX's own GW writes eqp1.dat on the FULL
-        # BZ".  It does not — ``gw_output.py`` subsets through ``kirr_to_kfull``
-        # and ``gw_jax.py`` passes ``wfn.kpoints`` — so the assertion that
-        # branch was avoiding is the one that PASSES, and the heuristic was
-        # bespoke unfolding standing in for the symmetry service.  Both are
-        # gone; ``apply_eqp_corrections`` now unfolds through the service's
-        # single ``star_broadcast`` adapter and ``input_file`` is required.
+        # ── QP energies (--eqp): both legs of the pair basis move together.
+        # The stored leg is re-sliced here; the interpolated leg takes the
+        # same ``enk_qp_full`` right after ``initialize_wfns`` below.
         enk_qp_full = None
         if args.eqp:
-            # A QP WFN's psi and E are a MATCHED PAIR, and --eqp is a second,
-            # DFT-band-labelled ladder.  Applying it on top overwrites the
-            # canonical QP eigenvalues that produced the rotation and relabels the
-            # rotated orbitals with the mean-field band ordering -- silently, and
-            # with the right shapes throughout.  The shape guard further down sees
-            # this only when a bse_k_grid densification has already moved psi to a
-            # different k axis; without densification the two tables are the same
-            # size and the overwrite is invisible.  Measured on the MoS2 run-82
-            # parent smoke (JID 57269074 step .128): the deck selects WFN_qp.h5 and
-            # the wrapper passes --eqp eqp1.dat.
-            #
-            # The refusal lives in ``bse_window`` beside the other eqp helpers and
-            # ``_parse_wfn_path`` — one owner for "which WFN does this deck name",
-            # and it asks the FILE's stamp rather than its name.
-            refuse_eqp_on_a_qp_wfn(args.input, args.eqp)
-            from .bse_io import (apply_eqp_and_reslice_bands, resolve_n_occ)
-            from file_io.restart_bundle import (apply_eqp_corrections)
-            from file_io.restart_bundle import read_metadata
-            _enk_dft_full = read_metadata(restart_file)["energies"]
-            n_occ_in = resolve_n_occ(_enk_dft_full, input_file=args.input)
-            data["eps_v"], data["eps_c"], n_occ_qp = apply_eqp_and_reslice_bands(
-                restart_file, args.eqp, args.input, n_val, n_cond, n_occ_in,
-                mesh_xy.devices.shape[0], mesh_xy.devices.shape[1],
+            enk_qp_full = apply_eqp_to_bse_window(
+                data, restart_file, args.eqp, args.input,
+                mesh_shape=mesh_xy.devices.shape,
                 degeneracy_mode=args.band_degeneracy,
-                degeneracy_tol_ry=args.degeneracy_tol_ry)
-            if int(data["eps_c"].shape[0]) != int(data["psi_c_X"].shape[0]):
-                raise ValueError(
-                    "exciton_bands: --eqp rebuilt energies on the native restart "
-                    f"grid ({int(data['eps_c'].shape[0])} k) after bse_k_grid "
-                    "had already densified the BSE wavefunctions to "
-                    f"{int(data['psi_c_X'].shape[0])} k.  This would mix coarse "
-                    "energies with fine-grid psi.  If wfn_file is WFN_qp.h5, "
-                    "remove --eqp: that file already carries the canonical QP "
-                    "eigenvalues paired with its rotated wavefunctions.  A "
-                    "mean-field WFN plus diagonal eqp corrections needs the eqp "
-                    "ladder applied inside the htransform densification, not "
-                    "patched onto its output here.")
-            enk_qp_full = apply_eqp_corrections(
-                _enk_dft_full, args.eqp, args.input)
-            _shift_ev = (enk_qp_full - _enk_dft_full) * RY2EV
-            log(f"  [eqp] {os.path.basename(args.eqp)}: n_occ={n_occ_qp}, "
-                f"QP shifts min/max = {_shift_ev.min():+.4f} / {_shift_ev.max():+.4f} eV; "
-                f"BSE runs on QUASIPARTICLE energies")
-        if nv_pad > n_val:
-            # The loader (and apply_eqp_and_reslice_bands, above) now write the
-            # signed guard themselves, so this is no longer a repair — it is the
-            # CHECK that they did.  Kept because this driver is where the wrong
-            # number was first noticed; a silent regression to a zero ε pad puts
-            # spurious transitions BELOW the exciton onset on every BSE driver,
-            # not just this one, and this is the cheapest place that would see it.
-            _pad_eps_v = jnp.asarray(data["eps_v"])[:, n_val:]
-            _worst = float(jnp.max(_pad_eps_v.real))
-            if _worst > -0.5 * PAD_EPS_GUARD_RY:
-                raise ValueError(
-                    f"exciton_bands: loader returned an unguarded valence pad — "
-                    f"max eps_v over the {nv_pad - n_val} pad bands is {_worst:.3e} "
-                    f"Ry, expected <= {-0.5 * PAD_EPS_GUARD_RY:.3e}. A zero pad "
-                    f"here makes DeltaE = eps_c - 0 a spurious transition BELOW "
-                    f"every physical one. See bse_io.PAD_EPS_GUARD_RY.")
+                degeneracy_tol_ry=args.degeneracy_tol_ry, log=log)
+        require_valence_pad_guard(data)
         tick("load_bse", t0)
         stage_progress.step()
         for receipt in _bse_grid_rank_records:
@@ -1774,62 +1707,16 @@ def main(argv=None):
                 f"path index {int(idx) + 1}")
 
         # ── conduction caches ψ_c(k+Q), ε_c(k+Q) for the whole path ──────────
-        # FULL-BAND htransform basis — the single lever that removes the off-grid
-        # window-cache ringing.  compute_wfns_fi builds fH from ALL bands in
-        # ``ctilde`` (the entire loaded window = input nval+ncond) and only
-        # RETURNS the sub-window [b_min, b_max); so a full-band ctilde gives a
-        # full-band fH regardless of how few conduction bands the BSE keeps.  With
-        # the standard driver's window (nband=40 = 26v+14c) the BSE conduction
-        # bands [b_min, b_max) sit strictly INTERIOR, guarded above by the extra
-        # conduction bands — every selection boundary stays off any near-
-        # degenerate (Kramers) pair.  A SLIVER conduction window whose top
-        # boundary cuts a near-degenerate pair instead rings 100-1000 meV off-grid
-        # (05_htransform_spbands/gap_scan; Si degeneracy root-cause 73e58f79).
-        #
-        # But the interpolation window is TWO-SIDED: too small rings off-grid,
-        # while a larger window asks the shared whole-state QRCP basis to represent
-        # more states.  The all-coarse transformed-energy receipt and this
-        # consumer's on-grid energy gate measure that representation directly;
-        # centroid count is not a state-space rank proxy in the published route.
-        # Keep only physically required bands plus guards unless those receipts
-        # justify a larger window.
+        # fH is built from every band of ``ctilde``; the BSE conduction bands
+        # are returned from its interior, above by the guard bands, so no
+        # selection edge cuts a near-degenerate pair (resolve_conduction_window).
         t0 = time.time()
         nb_window = int(ctilde.shape[1])    # bands in the htransform fH (= input nval+ncond)
         nval_in = int(params["nval"])       # window-relative CBM index (VBM = nval_in-1)
-        b_min, b_max = nval_in, nval_in + n_cond
-        n_guard = nb_window - b_max         # conduction bands ABOVE the BSE selection
-        if b_max > nb_window:
-            raise ValueError(
-                f"BSE conduction window [{b_min},{b_max}) exceeds the htransform "
-                f"fH window ({nb_window} bands): raise nband in {args.input} to "
-                f">= {b_max}, or drop --n-cond to <= {nb_window - nval_in}")
-        # The htransform window is the SECOND place a band boundary is cut in this
-        # driver, and it is cut in a different index space (window-relative, not
-        # absolute), so the loader's snap does not automatically make it safe.
-        # ``enk_sigma`` is (nb, nk) in the SAME window-relative indexing as
-        # b_min/b_max, so the check is exact here.  Report-only: b_max is pinned to
-        # the already-resolved n_cond, and widening it here would desynchronise the
-        # conduction caches from the BSE window the loader sized.  The prose above
-        # has warned about exactly this failure since the Si root-cause; this makes
-        # it a measurement instead of a warning about a possibility.
-        check_band_window(
-            np.asarray(enk_sigma).T, b_min, b_max,
+        b_min, b_max, n_guard = resolve_conduction_window(
+            enk_sigma, nb_window=nb_window, nval_in=nval_in, n_cond=n_cond,
             tol_ry=args.degeneracy_tol_ry, mode=args.band_degeneracy,
-            where="exciton_bands htransform conduction window", log=log)
-        if n_guard < 4:
-            log(f"  [warn] only {n_guard} conduction guard band(s) above the BSE "
-                f"selection — a selection boundary near a Kramers pair can ring "
-                f"off-grid; widen the input's ncond/nband (>= {b_max + 4} bands).")
-        if n_guard > 16:
-            log(f"  [warn] htransform fH spans {nb_window} bands with {n_guard} "
-                  f"conduction guards above the BSE window — a LARGE interp window "
-                  f"is not automatically more accurate.  Check the mandatory "
-                  f"all-coarse transformed-energy receipt and this driver's "
-                  f"on-grid energy gate; keep nband just above the BSE window "
-                  f"unless both remain controlled.")
-        log(f"  full-band htransform: fH over {nb_window} bands "
-            f"({nval_in}v + {nb_window - nval_in}c); BSE conduction "
-            f"[{b_min},{b_max}) = {n_cond} band(s) + {n_guard} guard(s)")
+            input_file=args.input, log_fn=log)
         _nelec = int(wfn.nelec)
         report.bands((
             f"Electrons      : {float(getattr(wfn, 'num_electrons', _nelec)):.5f}; "
@@ -2198,89 +2085,13 @@ def main(argv=None):
                        f"not reference numbers") + ").")
             tick("refit_prepare_and_null", t0)
 
-        grid_xy = NamedSharding(mesh_xy, P("x", "y"))
-
-        def _hermitize(V):
-            return 0.5 * (V + jnp.conj(V).T)
-
         t0 = time.time()
-        V_rows = []
-        # Per-Q cell moment for the tensor head.  Zero for Γ and for every Q on
-        # the OFF arm, which makes the head term an exact no-op there — the Γ
-        # endpoint keeps the production q=0 tile and its rank-one head, as its
-        # own docstring promises.
-        M_rows = np.zeros((nQ, 3, 3), dtype=np.float64)
-        head_scalars: list = []
-        v_gamma = jax.device_put(data["V_q0"], grid_xy)
-        n_eval_calls = 0
-        for iQ in range(nQ):
-            Qw = Qpath[iQ] - np.round(Qpath[iQ])
-            if np.linalg.norm(Qw) < 1e-9:
-                V_rows.append(_hermitize(v_gamma))       # production q=0 tile
-                continue
-            q_tile = -Qpath[iQ]                          # tile momentum = wrap(−Q)
-            q_tile_np = q_tile - np.round(q_tile)
-            if ongrid:
-                ix, iy, iz = (np.round(q_tile_np * kgrid_vq).astype(int)
-                              % kgrid_vq)
-                V_rows.append(_hermitize(
-                    jax.device_put(V_ongrid[:, :, ix, iy, iz], grid_xy)))
-                n_eval_calls += 1
-                continue
-            if pure_refit:
-                V_np = vq_interp.refit_vq(zx_fit, rst, q_tile_np, mesh_xy,
-                                          log_fn=log)
-                V_pad = np.zeros((n_rmu_pad, n_rmu_pad), dtype=np.complex128)
-                V_pad[:n_rmu, :n_rmu] = 0.5 * (V_np[:n_rmu, :n_rmu]
-                                               + V_np[:n_rmu, :n_rmu].conj().T)
-                V_rows.append(device_put_process_local(V_pad, grid_xy))
-                n_eval_calls += 1
-                continue
-            q_tile = jnp.asarray(q_tile_np)
-            if head_mbz:
-                gstar, head_val, M_ab = vq_interp.minibz_head_vlr(
-                    zx, prep, q_tile_np, alpha=args.alpha, moment=True)
-                # The head channel leaves the mu basis entirely: v[gstar] -> 0
-                # removes the LR G* column from the tile, and the cell-averaged
-                # head comes back as the rank-three tensor term in the matvec.
-                # Injecting BOTH would double-count the head.
-                M_rows[iQ] = M_ab
-                V_rows.append(_hermitize(eval_vq(
-                    q_tile, prep["V_SRc"], pinvF, coeffs_packed,
-                    jnp.asarray(0.0, dtype=jnp.float64),
-                    jnp.asarray(gstar, dtype=jnp.int32))))
-                head_scalars.append((iQ, float(head_val), float(np.trace(M_ab))))
-            else:
-                V_rows.append(_hermitize(eval_vq(q_tile, prep["V_SRc"], pinvF,
-                                                 coeffs_packed)))
-            n_eval_calls += 1
-        if pure_refit:
-            log(f"  exchange: per-Q ζ REFIT at all {n_eval_calls} finite Q "
-                f"(compute-don't-interpolate; Γ keeps the production q=0 tile), "
-                + ("certified against the stored V_qmunu by the on-grid tile null "
-                   "above" if args.refit_window == "zeta" else
-                   f"ζ' on bands {rst['window_abs']}; certification is the "
-                   f"contracted eigenvalue gate after the scan"))
-        # CERTIFICATION TWINS.  One extra solve row per certification Q carrying
-        # the PRODUCER's stored tile at that same wrap(−Q).  Appended after every
-        # path row so ``evs_all[nQ + j]`` is the stored-route answer for
-        # ``cert_idx[j]``, whose refit-route answer is already at ``evs_all[i]``.
-        # Nothing else about the row differs — same conduction caches, same W_R,
-        # same solver, same scan — so the eigenvalue difference is attributable to
-        # the exchange tile and to nothing else.
-        for iQ in cert_idx:
-            q_tile_np = -Qpath[iQ] - np.round(-Qpath[iQ])
-            ix, iy, iz = np.round(q_tile_np * kgrid_vq).astype(int) % kgrid_vq
-            V_rows.append(_hermitize(
-                jax.device_put(V_ongrid[:, :, ix, iy, iz], grid_xy)))
         refit_idx = []
         if args.vq_mode == "both":
-            if args.refit_points:
-                refit_idx = sorted({int(s) for s in args.refit_points.split(",")
-                                    if s.strip() != ""})
-            else:
-                refit_idx = sorted({int(i) for i in
-                                    np.linspace(1, nQ - 2, 5).round()})
+            refit_idx = (sorted({int(s) for s in args.refit_points.split(",")
+                                 if s.strip() != ""}) if args.refit_points
+                         else sorted({int(i) for i in
+                                      np.linspace(1, nQ - 2, 5).round()}))
             rst = vq_interp.refit_prepare(args.input, mesh_xy, zx,
                                           r_chunk=args.refit_r_chunk,
                                           policy=zx.get("policy"),
@@ -2288,40 +2099,36 @@ def main(argv=None):
                                           n_guard=args.refit_guard_bands,
                                           distrib_la_batched_route=(
                                               args.distrib_la_batched_route))
-            for iQ in refit_idx:
-                q_tile = -Qpath[iQ]
-                V_np = vq_interp.refit_vq(zx, rst, q_tile, mesh_xy)
-                V_pad = np.zeros((n_rmu_pad, n_rmu_pad), dtype=np.complex128)
-                V_pad[:n_rmu, :n_rmu] = 0.5 * (V_np + V_np.conj().T)
-                # Process-local (AA.1): V_pad is host numpy, identical on every
-                # rank; plain device_put would fire the hidden assert_equal
-                # all-gather.  LORRAX_CHECK_REPLICA=1 re-arms it.
-                V_rows.append(device_put_process_local(V_pad, grid_xy))
-        # Row order in the stack, and the ONE place it is written down:
+        # V_Q at every solve row.  Row order, fixed by exchange_tiles:
         #   [0, nQ)                                   the path (+ --extra-q)
         #   [nQ, nQ + n_cert)                         certification twins, stored
         #                                             tile at cert_idx[j]
         #   [nQ + n_cert, nQ + n_cert + n_refit)      --vq-mode=both refit spots
-        # ``cert_idx`` and ``refit_idx`` are never both non-empty (one belongs to
-        # --vq-mode=refit, the other to =both), but the readers below index off
-        # this layout rather than off that fact.
+        V_stack, M_stack, head_scalars, n_eval_calls = exchange_tiles(
+            Qpath, route=("ongrid" if ongrid else
+                          "refit" if pure_refit else "interp"),
+            mesh_xy=mesh_xy, V_q0=data["V_q0"], V_ongrid=V_ongrid,
+            kgrid_vq=kgrid_vq, n_rmu=n_rmu, n_rmu_pad=n_rmu_pad,
+            refit=(zx_fit, rst) if pure_refit else None,
+            interp=(None if ongrid or pure_refit else
+                    (zx, prep, eval_vq, pinvF, coeffs_packed)),
+            head_mbz=head_mbz, alpha=args.alpha, cert_idx=cert_idx,
+            both_refit=(zx, rst) if refit_idx else None, both_idx=refit_idx,
+            log_fn=log)
+        if pure_refit:
+            log(f"  exchange: per-Q ζ REFIT at all {n_eval_calls} finite Q "
+                f"(compute-don't-interpolate; Γ keeps the production q=0 tile), "
+                + ("certified against the stored V_qmunu by the on-grid tile null "
+                   "above" if args.refit_window == "zeta" else
+                   f"ζ' on bands {rst['window_abs']}; certification is the "
+                   f"contracted eigenvalue gate after the scan"))
         n_cert = len(cert_idx)
         n_solve = nQ + n_cert + len(refit_idx)
-        assert len(V_rows) == n_solve, (
-            f"V_rows {len(V_rows)} != n_solve {n_solve} "
-            f"(nQ={nQ}, cert={n_cert}, refit={len(refit_idx)})")
-        V_stack = jax.device_put(jnp.stack(V_rows),
-                                 NamedSharding(mesh_xy, P(None, "x", "y")))
-        if head_mbz:
-            # refit/cert rows carry no head tensor (they are the ground-truth
-            # point-value comparison); zero is an exact no-op in the term.
-            M_stack = np.concatenate(
-                [M_rows, np.zeros((n_cert + len(refit_idx), 3, 3))], axis=0)
-            for iQ, hv, trM in head_scalars[:4]:
-                log(f"  [head-tensor] Q#{iQ}: <v_LR>_mBZ = {hv:.6f}, "
-                    f"tr M_ab = {trM * RY2EV:.6e} eV/bohr^2")
-            if len(head_scalars) > 4:
-                log(f"  [head-tensor] ... {len(head_scalars)} Q in total")
+        for iQ, hv, trM in head_scalars[:4]:
+            log(f"  [head-tensor] Q#{iQ}: <v_LR>_mBZ = {hv:.6f}, "
+                f"tr M_ab = {trM * RY2EV:.6e} eV/bohr^2")
+        if len(head_scalars) > 4:
+            log(f"  [head-tensor] ... {len(head_scalars)} Q in total")
         tick("vq_eval", t0)
         stage_progress.step()
 
