@@ -204,7 +204,6 @@ refusals stay on by default; per-file and per-operation instruments are opt-in.
 
 | var | default | class | grammar and effect |
 |---|---|---|---|
-| `LORRAX_UNIFORM_RULE_BACKEND` | unset (`numpy`) | debug | Stripped, case-insensitive `numpy`, `jax` or `auto`; anything else refuses. Backend of the minimax reduction in `build_uniform_rule` (`services/minimax`); `auto` picks JAX only with an accelerator, start rank ≥ 40 and a fit cloud ≥ 2000 points; a non-empty `backend=` argument wins, and `jax` falls back to NumPy when JAX is unusable. Changes speed and floating-point detail, not acceptance. |
 | `LORRAX_VQ_LR_GZ_TRIM` | `0` | debug, **A/B** | Exactly `1`. Trims the structurally dead G_z columns from the long-range v(q) design basis (`bse/vq_interp.py::lr_gset`; 337 → 161 columns on the MoS2 slab). Off by default because with it on the coverage null reads 5.8e-3 against a 1e-6 tolerance. |
 | `LORRAX_SKIP_VQ_GATES` | `0` | debug | Exactly `1`. Skips the V_Q interpolation self-checks (`bse/vq_interp.py`), which exist because interpolation errors are silent. |
 | `LORRAX_TRS_CHECK` | `1` | guard | Stripped, case-insensitive: `strict` also refuses a broken or inconclusive reference; `0 false off no` refuse (`GATE retired_LORRAX_TRS_CHECK_off`), since skipping the measurement would assert time reversal. Automatic two-component DFT-reference measurement before any TRS-dependent consumer (`symmetry_maps/density_symmetry_check.py`); consumers read only `WfnLoader.trs_holds` → `SymMaps.trs_allowed`. |
