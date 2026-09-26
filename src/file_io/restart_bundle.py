@@ -677,6 +677,7 @@ def read_metadata(filename):
             logical_band_count=nb_logical,
             energies=value("enk_full"), grid=value("kgrid"),
             band_window=value("band_window"), band_split=value("band_window_split"),
+            zeta_fit_windows=value("zeta_fit_windows"),
             centroid_count=int(f["n_rmu_logical"][()]),
             head_vector=value("G0_mu_nu"), bare_head=value("vhead"),
             screened_head=value("whead"), head_cartesian=value("S_cart_head"),

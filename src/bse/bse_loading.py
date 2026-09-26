@@ -18,7 +18,8 @@ from .bse_densify import (_interpolate_bse_data_to_grid,
                           resolve_w_head_densify)
 from .bse_head import _inject_q0_head, _resolve_head_params
 from .bse_preconditioner import compute_pair_amplitude
-from .bse_window import (PAD_EPS_GUARD_RY, _log0, _parse_wfn_path, resolve_n_occ)
+from .bse_window import (PAD_EPS_GUARD_RY, _log0, _parse_wfn_path, resolve_n_occ,
+                         assert_bse_window_in_zeta_training)
 from file_io.restart_bundle import (apply_eqp_corrections)
 
 
@@ -165,6 +166,7 @@ def load_bse_data_from_restart_sharded(
     n_val, n_cond = resolve_band_window(enk_full, n_occ, n_val, n_cond,
         tol_ry=degeneracy_tol_ry, mode=degeneracy_mode,
         where="load_bse_data_from_restart_sharded", log=_log0)
+    assert_bse_window_in_zeta_training(header, n_occ-n_val, n_occ+n_cond)
     val_indices = np.arange(n_occ-n_val, n_occ)
     cond_indices = np.arange(n_occ, n_occ+n_cond)
     eps_v = jnp.asarray(enk_full[:, val_indices])

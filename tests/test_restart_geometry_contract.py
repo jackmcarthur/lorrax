@@ -176,6 +176,27 @@ def test_charge_zeta_receipt_fresh_stamp_and_read(tmp_path, host_transport):
     assert state.charge_zeta_identity == receipt
 
 
+
+def test_zeta_fit_windows_stamp_reaches_the_bse_check(tmp_path, host_transport):
+    """The ζ training legs are stamped fresh and read back by the BSE guard."""
+    from bse.bse_window import (BseWindowOutsideZetaTrainingError,
+                                assert_bse_window_in_zeta_training)
+    path = str(tmp_path / "zeta_windows.h5")
+    tagged_arrays.write_restart_state_to_h5(
+        path, n_rmu_logical=2,
+        V_qmunu=np.eye(2, dtype=np.complex128)[None],
+        psi_parent_y=np.ones((1, 1, 1, 2), dtype=np.complex128),
+        psi_parent_y_mun=np.ones((1, 1, 2, 1), dtype=np.complex128),
+        parent_k_rows=np.array([0]),
+        zeta_fit_windows=((0, 72), (0, 184)), mesh=_mesh_product(1),
+        mode="w")
+    canonicalize_fixture(path)
+    header = restart_bundle.read_metadata(path)
+    assert tuple(header["zeta_fit_windows"]) == (0, 72, 0, 184)
+    assert_bse_window_in_zeta_training(header, 0, 72)
+    with pytest.raises(BseWindowOutsideZetaTrainingError):
+        assert_bse_window_in_zeta_training(header, 40, 80)
+
 @pytest.mark.parametrize(
     "stored",
     [np.asarray([b"scheme"], dtype="S"),
