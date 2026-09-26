@@ -335,7 +335,10 @@ BerkeleyGW-layout `eigenvectors.h5` (rank 0).
 
 Invoke: `python -u -m bse.bse_jax -i cohsex.in --lanczos --bse ...` in the GW
 run directory. The mesh is the run's square startup mesh; `--px`/`--py` must
-be square and use every device.
+be square and use every device. The CLI is strict: an unknown flag refuses,
+and so does a flag the chosen route (Lanczos, `--kpm-dos`, or the default
+FEAST) does not read — `--eqp`, `--n-eig`, `--n-occ` and the solver flags are
+Lanczos-only.
 
 Without `--lanczos` the driver hands the solve to FEAST and forwards only
 `-i`, `--n-val`, `--n-cond`, `--px`/`--py`, `--bse`/`--rpa`/`--tda` and the
