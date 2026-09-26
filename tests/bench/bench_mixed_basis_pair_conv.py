@@ -378,7 +378,8 @@ def main():
                            n_batch=conv.n_batch, nr_carrier=conv.nr_carrier),
                model=dict(resident=conv.chunks.bytes_resident, expand=conv.chunks.bytes_expand,
                           middle=conv.chunks.bytes_middle, final=conv.chunks.bytes_final,
-                          hwm=conv.chunks.hwm, target=conv.chunks.target),
+                          stages=conv.chunks.stage_bytes, hwm=conv.chunks.hwm,
+                          target=conv.chunks.target),
                receipt=conv.describe(), t_tables=t_tables, t_plan=t_plan)
     A, C, rec["compact"] = compact_build(s, mesh, conv.width_carrier[0], args.nb, args.nv)
     if args.product == "scalar":        # C is W at the q-IBZ (the χ plan's output layout)
@@ -408,9 +409,16 @@ def main():
     rec["memory_stats"] = {k: int(v) for k, v in stats.items() if isinstance(v, (int, np.integer))}
     rec["peak_bytes_in_use"] = int(stats.get("peak_bytes_in_use", 0))
     rec["bytes_limit"] = int(stats.get("bytes_limit", 0))
+    from jax.experimental import multihost_utils
+    peaks = np.asarray(multihost_utils.process_allgather(
+        np.asarray([rec["peak_bytes_in_use"], rec["bytes_in_use_before"]], np.int64))).reshape(-1, 2)
+    rec["peak_bytes_per_rank"] = peaks[:, 0].tolist()
+    rec["in_use_before_per_rank"] = peaks[:, 1].tolist()
     rec["checksum"] = checksum(conv, X)
     say(f"peak {rec['peak_bytes_in_use'] / 1e9:.2f} GB per GPU (in use before the kernel "
         f"{rec['bytes_in_use_before'] / 1e9:.2f} GB; model HWM {conv.chunks.hwm / 1e9:.2f} GB)")
+    say(f"peak per rank {[round(v / 1e9, 2) for v in peaks[:, 0]]} GB (max {peaks[:, 0].max() / 1e9:.2f}); "
+        f"target {conv.chunks.target / 1e9:.2f} GB, device limit {rec['bytes_limit'] / 1e9:.2f} GB")
     del X
     if args.stages:
         rec["stages"] = stages(conv)
