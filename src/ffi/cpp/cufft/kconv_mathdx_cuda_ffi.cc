@@ -540,15 +540,22 @@ extern "C" __global__ void __launch_bounds__(LRX_THREADS) lrx_kconv(
 #if LRX_ARM == 0
     (void)phase;
     const RowLoad ld{x, g.rows};
-    for (long long c0 = (long long)blockIdx.x * TRC; c0 < g.rows; c0 += (long long)gridDim.x * TRC) {
-        lrx_kbox::stage_tile<NX, NY, NZ, TRC>(sm, c0, g.rows, ld);
+    // Mode 2: the a slabs (rows (a, x, b, y), mx*b*my rows each) read one kernel V[k, x, y], so
+    // their tiles are interleaved, a fastest: the a tiles of one (x, y) run together and all but
+    // the first find V in L2 (a slab walked alone re-reads V from DRAM a times).  A tile never
+    // crosses a slab (its end bounds the tile); mode 3 is one slab.
+    const long long seg = CONV ? g.m2 * g.m1 : g.rows;
+    const long long na = g.rows / seg, tps = (seg + TRC - 1) / TRC;
+    for (long long t = blockIdx.x; t < na * tps; t += gridDim.x) {
+        const long long a = t % na, c0 = a * seg + (t / na) * TRC, end = (a + 1) * seg;
+        lrx_kbox::stage_tile<NX, NY, NZ, TRC>(sm, c0, end, ld);
         if (inv) lrx_tile3<fft_direction::inverse>(sm);
         else lrx_tile3<fft_direction::forward>(sm);
         if constexpr (CONV) {
-            lrx_kbox::mid_tile<NX, NY, NZ, TRC>(sm, c0, g.rows, KernMid{kern, g});
+            lrx_kbox::mid_tile<NX, NY, NZ, TRC>(sm, c0, end, KernMid{kern, g});
             lrx_tile3<fft_direction::forward>(sm);
         }
-        lrx_kbox::store_tile<NX, NY, NZ, TRC>(sm, c0, g.rows, RowStore{y, g.rows, g.scale});
+        lrx_kbox::store_tile<NX, NY, NZ, TRC>(sm, c0, end, RowStore{y, g.rows, g.scale});
     }
 #else
     const Plain<lrx_c2> yy{y, g.rows};
@@ -2310,7 +2317,10 @@ static ffi::Error LaunchRows(cudaStream_t stream, int mode, ffi::AnyBuffer X, co
             if (cr != CUDA_SUCCESS) return fail("cuLaunchKernel", cu_err(cr));
             return ffi::Error::Success();
         };
-        if (k->arm == 0) return launch(0, (g.rows + k->tr - 1) / k->tr, k->threads, k->smem);
+        if (k->arm == 0) {                             // one block per tile; mode 2 tiles each a slab
+            const long long seg = mode == 2 ? g.m2 * g.m1 : g.rows;
+            return launch(0, (g.rows / seg) * ((seg + k->tr - 1) / k->tr), k->threads, k->smem);
+        }
         const long long cap = static_cast<long long>(k->sms) * 8;
         const long long plane = nkx * ((g.rows + k->tr - 1) / k->tr);
         const long long pencil = (nky * nkz * g.rows + kThreads - 1) / kThreads;
