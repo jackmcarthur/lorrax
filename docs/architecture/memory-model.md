@@ -114,7 +114,9 @@ rank beside what is live:
 `sigma_spin_block` picks the largest output spin block `d` (a divisor of
 `n_s`) whose pass fits the room times the spinor's utilization, else 1.
 `price_chi0_node` only prices the χ₀ node: a band chunk of Gv would still
-be a whole `(μ, ν)` tile.
+be a whole `(μ, ν)` tile. On the packed bispinor route the static photon
+response (`V_packed`, `W_packed`, `2·16·Q·(μ + 3μ_T)²/P`) is deleted after
+the static Σ channels read it, before Hartree and the τ sweep.
 
 ## Stage inventory
 
@@ -199,9 +201,10 @@ host     = 16·(μ_L [+ μ_R])·N_G/P per q                       phdf5 read sta
 otherwise the largest width ≤ 4096 whose panel all-gather fits
 `LORRAX_COLLECTIVE_CHUNK_MB` and whose panels take at most half of what one q
 leaves), then `q_tile` as every q that fits both the device budget and the
-host staging budget, balanced across tiles. The budget is 0.9 of live
-available device memory, agreed as the minimum across processes because the
-tile count fixes the collective reads every rank issues. `GATE vq_tile_budget`
+host staging budget, balanced across tiles. The budget is 0.9 of the stage
+room (`memory_per_device_gb` less the live bytes), agreed as the minimum
+across processes because the tile count fixes the collective reads every rank
+issues. `GATE vq_tile_budget`
 refuses when `resident + work + per_q` alone exceeds it.
 
 For the charge channel, `ZetaG.contract_v` accumulates `V_q` tile by tile as
