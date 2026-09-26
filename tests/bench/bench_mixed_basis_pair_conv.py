@@ -296,15 +296,13 @@ def stages(conv, reps=3):
     plan_out = conv._plan(sign=-1, norm="backward", out_support=conv.sup_mid)
     Y = zc((nq, cw) + conv.fft_grid)
     res["plan_r2G"] = timeit(jax.jit(plan_out), Y)
-    # expand: one k chunk of the column half and p'->r' for this rank's rows
+    # expand: one step's p'->r' at its parents for this rank's rows
     kc, ml = conv.chunks.kc, M // conv.P
-    g = zc((kc, ml, ns, M, ns))
-    col = jax.jit(lambda g_, a, b, c: mb._column_half(g_, a, b, c, n_s=ns))
-    res["column_half_gather"] = timeit(col, g, put(t["csrc"][:kc]), put(t["nph"][:kc]), put(t["spin"][:kc]))
-    plan_col = conv._plan(sign=-1, norm="backward", in_support=conv.sup_tab[0])
-    xc = zc((kc, ml, ns, ns) + kb)
-    res["plan_p2r_prime"] = timeit(jax.jit(plan_col), xc)
-    res["shapes"] = dict(J=J, kc=kc, nbox=nbox, M=M, nq=nq, nk=nk, nr=nr, ns=ns, cw=cw, nsk=nsk,
+    pt = conv._ptables[0]
+    npc = conv._pstep[0][False]["npc"]
+    plan_par = conv._plan(sign=-1, norm="backward", in_support=pt["sup"])
+    res["plan_p2r_prime_parents"] = timeit(jax.jit(plan_par), zc((ml, ns, ns, npc) + pt["kbox"]))
+    res["shapes"] = dict(J=J, kc=kc, npc=npc, nbox=nbox, M=M, nq=nq, nk=nk, nr=nr, ns=ns, cw=cw, nsk=nsk,
                          product=conv.product)
     return res
 
@@ -382,6 +380,9 @@ def main():
                           middle=conv.chunks.bytes_middle, final=conv.chunks.bytes_final,
                           stages=conv.chunks.stage_bytes, hwm=conv.chunks.hwm,
                           target=conv.chunks.target),
+               expand_steps=[{str(v): dict(npc=st["npc"], n_steps=len(st["start"]),
+                                           n_transforms=st["n_transforms"], n_src=st["n_src"])
+                              for v, st in ps.items()} for ps in conv._pstep],
                receipt=conv.describe(), t_tables=t_tables, t_plan=t_plan)
     if args.compiled_memory:
         rec["compiled_memory"] = cm = conv.compiled_memory()

@@ -198,6 +198,12 @@ class SphereTransport:
     antiunitary one: ``symmetry_maps.unfold_load_tables``' pair-transpose rule on
     sphere slots.  ``row (N_k,)``, ``anti (N_k,)``, ``spin (N_k, n_s, n_s)``,
     ``src``/``phase (N_k, width)`` (pad slots never read), ``n_parent`` rows.
+
+    The same action in r space, which the expand uses on the column coordinate
+    (module docstring, "The expand at the k-parents"): ``parent`` the parents' own
+    spheres (slot order of the tiles), and each child's spatial operation, ``rot (N_k, 3, 3)``
+    BGW ``mtrx`` and ``tnp (N_k, 3)`` BGW ``tnp`` (2π·τ): the child reads its parent at
+    ``y = mtrx·(r − τ)`` (``symmetry_maps.centroid_source_map_and_wrap``).
     """
     row: np.ndarray
     anti: np.ndarray
@@ -205,6 +211,9 @@ class SphereTransport:
     src: np.ndarray
     phase: np.ndarray
     n_parent: int
+    parent: SphereSet
+    rot: np.ndarray
+    tnp: np.ndarray
 
     def __post_init__(self):
         row = np.asarray(self.row, dtype=np.int32).reshape(-1)
@@ -221,8 +230,15 @@ class SphereTransport:
                              f"{spin.shape}, {src.shape}, {phase.shape}")
         if nk and (row.min() < 0 or row.max() >= int(self.n_parent)):
             raise ValueError(f"SphereTransport: parent rows must lie in [0, {self.n_parent})")
+        rot = np.asarray(self.rot, dtype=np.int64)
+        tnp = np.asarray(self.tnp, dtype=np.float64)
+        if (not isinstance(self.parent, SphereSet) or self.parent.n != int(self.n_parent)
+                or rot.shape != (nk, 3, 3) or tnp.shape != (nk, 3)):
+            raise ValueError(f"SphereTransport: want parent a SphereSet of {self.n_parent} rows, "
+                             f"rot (N_k, 3, 3), tnp (N_k, 3); got {getattr(self.parent, 'n', None)}, "
+                             f"{rot.shape}, {tnp.shape}")
         for name, val in (("row", row), ("anti", anti), ("spin", spin), ("src", src),
-                          ("phase", phase)):
+                          ("phase", phase), ("rot", rot), ("tnp", tnp)):
             object.__setattr__(self, name, val)
         object.__setattr__(self, "n_parent", int(self.n_parent))
 
@@ -237,7 +253,9 @@ class SphereTransport:
         return cls(row=np.arange(nk), anti=np.zeros(nk, bool),
                    spin=np.broadcast_to(np.eye(ns, dtype=np.complex128), (nk, ns, ns)),
                    src=np.broadcast_to(np.arange(w), (nk, w)),
-                   phase=np.ones((nk, w), np.complex128), n_parent=nk)
+                   phase=np.ones((nk, w), np.complex128), n_parent=nk, parent=sphere,
+                   rot=np.broadcast_to(np.eye(3, dtype=np.int64), (nk, 3, 3)),
+                   tnp=np.zeros((nk, 3)))
 
     @classmethod
     def typed(cls, plan, *, fft_grid, parent_sphere_index, children: SphereSet,
@@ -263,8 +281,27 @@ class SphereTransport:
                 raise ValueError(f"SphereTransport.typed: ns={ns} differs from the plan's spin "
                                  f"width {spin.shape[-1]}; only a spin-scalar operand (ns=1) may")
             spin = np.ones((spin.shape[0], 1, 1), np.complex128)
-        return cls(row=np.asarray(plan.irr_idx), anti=anti, spin=spin, src=pslot, phase=phase,
-                   n_parent=int(np.asarray(parent_sphere_index).shape[0]))
+        # the parents' spheres, exactly: each parent's Miller indices from one of its children,
+        # k̄ + G = ±mtrx⁻ᵀ(k + G') (typed_child_G_tables' relation), in the tiles' slot order
+        cell = np.asarray(parent_sphere_index, dtype=np.int64)
+        n_par, w_par = (int(v) for v in cell.shape)
+        live_par = cell < int(np.prod(fft_grid))
+        kp = np.asarray(plan.k_parent_frac, np.float64)
+        irr = np.asarray(plan.irr_idx, dtype=np.int64)
+        op = np.asarray(plan.sym_idx, dtype=np.int64) % int(plan.n_sym_spatial)
+        rot = np.asarray(plan.spatial_ops, np.int64)[op]
+        mill = np.zeros((n_par, w_par, 3), np.int64)
+        for p in range(n_par):
+            k0 = int(np.flatnonzero(irr == p)[0])
+            lk = np.arange(children.width) < children.ngk[k0]
+            K = (children.frac[k0][None, :] + children.gvecs[k0][lk]) * (-1.0 if anti[k0] else 1.0)
+            G = np.rint(np.linalg.solve(rot[k0].T.astype(np.float64), K.T).T - kp[p]).astype(np.int64)
+            mill[p, pslot[k0][lk]] = G
+            if int(lk.sum()) != int(live_par[p].sum()):
+                raise ValueError(f"SphereTransport.typed: child {k0} does not cover parent {p}'s sphere")
+        return cls(row=irr, anti=anti, spin=spin, src=pslot, phase=phase, n_parent=n_par,
+                   parent=SphereSet(mill, live_par.sum(axis=1), kp), rot=rot,
+                   tnp=np.asarray(plan.translations, np.float64)[op])
 
     def time_reversed(self, sphere: SphereSet) -> "SphereTransport":
         """The transport of the time-reversed operator ``C_k[p, p'] = conj B_{k̄}[p̄, p̄']``,
@@ -301,7 +338,8 @@ class SphereTransport:
         src = np.where(live, np.take_along_axis(self.src[kb], pbar, axis=1), self.src)
         phase = np.where(live, np.take_along_axis(self.phase[kb], pbar, axis=1), 0.0)
         return SphereTransport(row=self.row[kb], anti=~self.anti[kb], spin=np.conj(self.spin[kb]),
-                               src=src, phase=phase, n_parent=self.n_parent)
+                               src=src, phase=phase, n_parent=self.n_parent, parent=self.parent,
+                               rot=self.rot[kb], tnp=self.tnp[kb])
 
 
 @dataclasses.dataclass(frozen=True, eq=False)
@@ -527,13 +565,16 @@ def _divisors(n: int) -> list[int]:
 def plan_pair_convolution_chunks(*, n_ranks, n_k, spins, widths, width_out, n_q, n_r,
                                  kboxes, kbox_out, n_parent_tiles, target_bytes,
                                  j_cap=64, n_c=None, J=None, kc=None, qc=None,
-                                 wedge=None) -> PairConvChunks:
+                                 wedge=None, kboxes_parent=None, parents_per_step=None) -> PairConvChunks:
     """The schedule for one τ node (every count one when everything fits).
 
     ``spins = (n_A, n_C, n_X)``: the two operands' and the output's spin widths
     (``'trace'``: n_s, n_s, 1; ``'scalar'``: n_s, 1, n_s).
     ``widths``/``kboxes``: the two operands' slot carriers and union-box cells;
     ``n_parent_tiles``: the slab copies' element count per rank (inputs held).
+    ``kboxes_parent``: the operands' parent union-box cells (the expand's p'→r' input);
+    ``parents_per_step(kc)``: the parents one expand step transforms for ``kc`` children
+    (default ``kc``, one transform per child).
     ``n_c``/``J``/``kc``/``qc`` pin those counts (tests and the benchmark); the rest follow
     (``kc`` must divide ``n_k`` and ``qc`` must divide ``n_q``).
     ``wedge`` (the r'-column wedge; ``None``: every column) is
@@ -577,10 +618,14 @@ def plan_pair_convolution_chunks(*, n_ranks, n_k, spins, widths, width_out, n_q,
         cols = carrier(nc, j) // Pn
         return 0 if wedge is None else _C16 * cx * ((3 + bcast) * nrow * Mm * cols + 2 * Mo * tcol)
 
-    def expand(kc, nc, j):          # the full r' transform of one k chunk, its phased gather, the all-to-all
+    kbp = kboxes if kboxes_parent is None else kboxes_parent
+    npc_of = (lambda k: k) if parents_per_step is None else parents_per_step
+
+    def expand(kc, nc, j):          # one step: its parents' full r' transform, the children's column unfold, the all-to-all
         cols = carrier(nc, j) // Pn // nc
-        return _C16 * max(kc * c * (m // Pn) * (kb + 3 * nr) + kc * c * m * cols
-                          for c, m, kb in zip(ch, Mw, kboxes))
+        npc = int(npc_of(kc))
+        return _C16 * max(npc * c * (m // Pn) * (kb + 3 * nr) + 2 * kc * c * m * cols
+                          for c, m, kb in zip(ch, Mw, kbp))
 
     def middle(j):                  # compact gathers, the p→r outputs, D and its workspace, F, U, Y, the r→G box
         gath = sum(c * kb for c, kb in zip(ch, kboxes)) + (2 * cd * kboxes[0] if bcast else 0)
@@ -655,19 +700,6 @@ def _grid_phase(frac, sign, fft_grid, flat_idx):
     r = lambda i, n: (i.reshape(-1).astype(jnp.float64) / n)[None, :]
     arg = f[:, 0, None] * r(i1, n1) + f[:, 1, None] * r(i2, n2) + f[:, 2, None] * r(i3, n3)
     return jnp.exp((sign * 2j * np.pi) * arg).reshape((f.shape[0],) + tuple(flat_idx.shape))
-
-
-def _column_half(src_tile, csrc, cph, spin, *, n_s):
-    """The transport's column half on ``(k, rows, γ, M, δ)``: gather the parent slots of each box
-    cell (``csrc``, out of range on an empty cell reads 0), the phase ``cph``, then
-    ``Σ_δ · conj U_k[β, δ]``; returns ``(k, rows, γ, β, cells)``."""
-    idx = jnp.broadcast_to(csrc[:, None, None, :, None],
-                           src_tile.shape[:3] + (csrc.shape[1], n_s))
-    v = jnp.take_along_axis(src_tile, idx, axis=3, mode="fill", fill_value=0)
-    v = v * cph[:, None, None, :, None]
-    uc = jnp.conj(spin)
-    out = [sum(v[..., d] * uc[:, b, d][:, None, None, None] for d in range(n_s)) for b in range(n_s)]
-    return jnp.stack(out, axis=3)
 
 
 def _row_half(h, lsrc, lph, spin, *, n_s):
@@ -840,6 +872,7 @@ class MixedBasisPairConvolution:
         # ---- host tables -----------------------------------------------------
         self._tables = [self._operand_tables(op, sup, ax.carrier)
                         for op, sup, ax in zip(self.ops, self.sup_tab, self.m_axis)]
+        self._ptables = [self._parent_tables(op, ax.carrier) for op, ax in zip(self.ops, self.m_axis)]
         self._ocell = self._out_cells(out, self.sup_out, self.mo_axis.carrier)
         self._ocell_mid = self._out_cells(mid, self.sup_mid, self.mm_axis.carrier)
         self._wt = None if wedge is None else self._wedge_tables(wedge, out, mid)
@@ -865,6 +898,9 @@ class MixedBasisPairConvolution:
             width_out=self.mo_axis.carrier, n_q=self.nq, n_r=self.nr,
             kboxes=[int(np.prod(k)) for k in self.kbox], kbox_out=int(np.prod(self.kbox_out)),
             n_parent_tiles=n_par, target_bytes=target,
+            kboxes_parent=[int(np.prod(pt["kbox"])) for pt in self._ptables],
+            parents_per_step=lambda kc_: max(self._steps(pt["pi"][v], kc_)["npc"]
+                                            for pt in self._ptables for v in pt["pi"]),
             wedge=None if wt is None else dict(
                 n_cols=self.P * wt["n_rep_rank"], n_q_mid=self.nq_mid,
                 width_mid=self.mm_axis.carrier, kbox_mid=int(np.prod(self.kbox_mid)),
@@ -973,17 +1009,63 @@ class MixedBasisPairConvolution:
         nbox = int(np.prod([len(s) for s in sup]))
         csrc = np.full((self.nk, nbox), m_carrier, dtype=np.int32)
         mph = np.zeros((self.nk, nbox), np.complex128)
-        nph = np.zeros((self.nk, nbox), np.complex128)
         for k in range(self.nk):
             live = cells[k] >= 0
             c = cells[k][live]
             ph = tr.phase[k][live]
             csrc[k, c] = tr.src[k][live]
             mph[k, c] = np.conj(ph) if tr.anti[k] else ph
-            nph[k, c] = ph if tr.anti[k] else np.conj(ph)
         return dict(row=tr.row.astype(np.int32), anti=tr.anti.astype(np.int32), spin=tr.spin,
-                    csrc=csrc, mph=mph, nph=nph, n_parent=tr.n_parent,
+                    csrc=csrc, mph=mph, n_parent=tr.n_parent,
                     has_anti=bool(np.any(tr.anti)))
+
+    def _parent_tables(self, op: PairOperand, m_carrier):
+        """The expand's host tables for one operand (module docstring, "The expand at the
+        k-parents"): each parent's slot at each cell of the parents' union box, the parents'
+        k̄, each child's transform-set entry ``pi`` (``row``; ``row + n_parent`` on an
+        antiunitary row when partners are passed) and its operation's column map
+        ``y = mtrx·(r' − τ) = x_α + L`` over every box cell
+        (``symmetry_maps.centroid_source_map_and_wrap``, one row per distinct operation)."""
+        from symmetry_maps import centroid_source_map_and_wrap
+        tr = op.transport
+        par = tr.parent.recentred()
+        if par.width > m_carrier:
+            raise ValueError(f"MixedBasisPairConvolution: parent spheres of width {par.width} exceed "
+                             f"the operand's slot carrier {m_carrier}")
+        sup = par.union_support()
+        nbox = int(np.prod([len(v) for v in sup]))
+        cells = par.box_cells(sup)
+        pcsrc = np.full((par.n, nbox), m_carrier, np.int32)
+        for p in range(par.n):
+            lv = cells[p] >= 0
+            pcsrc[p, cells[p][lv]] = np.flatnonzero(lv)
+        key = np.concatenate([tr.rot.reshape(self.nk, 9).astype(np.float64), tr.tnp], axis=1)
+        uniq, op_id = np.unique(key, axis=0, return_inverse=True)
+        grid = np.stack(np.unravel_index(np.arange(self.nr), self.fft_grid), axis=-1).astype(np.int32)
+        alpha, L = centroid_source_map_and_wrap(grid, uniq[:, :9].reshape(-1, 3, 3).astype(np.int64),
+                                                uniq[:, 9:], np.asarray(self.fft_grid))
+        row = tr.row.astype(np.int64)
+        pi = {False: row}
+        if np.any(tr.anti):
+            pi[True] = row + par.n * tr.anti.astype(np.int64)
+        return dict(sup=sup, kbox=tuple(len(v) for v in sup), pcsrc=pcsrc, kbar=par.frac,
+                    op=op_id.reshape(-1).astype(np.int32), alpha=np.asarray(alpha, np.int32),
+                    L=np.asarray(L, np.float64), pi=pi, n_parent=par.n)
+
+    def _steps(self, pi, kc):
+        """The expand's steps for ``kc`` children each: the children in transform-set order
+        (``pi``, then k), cut into steps of ``kc``; a step transforms the ``npc`` consecutive
+        entries from ``start`` (``npc`` the widest step's span, so every step has one shape)."""
+        nk = self.nk
+        order = np.lexsort((np.arange(nk), pi)).reshape(nk // kc, kc)
+        lo, hi = pi[order[:, 0]], pi[order[:, -1]]
+        npc = int(np.max(hi - lo + 1))
+        n_src = int(pi.max()) + 1
+        start = np.minimum(lo, max(n_src - npc, 0)).astype(np.int32)
+        npc = min(npc, n_src)
+        return dict(npc=npc, start=start, order=order.astype(np.int32),
+                    lpar=(pi[order] - start[:, None]).astype(np.int32),
+                    n_transforms=npc * (nk // kc), n_src=n_src)
 
     def _put(self, a, spec=P()):
         from lxkit import device_put_process_local
@@ -1007,7 +1089,7 @@ class MixedBasisPairConvolution:
         c = self.chunks
         fg = self.fft_grid
         kfrac = self.ops[0].sphere.frac
-        self._dev = [dict((key, self._put(t[key])) for key in ("row", "anti", "spin", "csrc", "mph", "nph"))
+        self._dev = [dict((key, self._put(t[key])) for key in ("row", "anti", "spin", "csrc", "mph"))
                      for t in self._tables]
         self._dev_k = self._put(kfrac)
         self._dev_q = self._put(self.out.frac)
@@ -1023,10 +1105,19 @@ class MixedBasisPairConvolution:
         self._slab = jax.jit(shard_map(slab, mesh=mesh, in_specs=P(None, "x", None, "y", None),
                                        out_specs=P(None, _XY, None, None, None), check_vma=False))
 
-        # ---- 2-4: column half, p' → r', Bloch column phase, r' chunk, all-to-all
-        self._expand = []
-        for t, sup, ax in zip(self._tables, self.sup_tab, self.m_axis):
-            self._expand.append(self._build_expand(t, sup, ax.carrier))
+        # ---- 2-4: p' → r' at the parents, the children's column unfold, all-to-all
+        self._pstep = [{v: self._steps(pt["pi"][v], c.kc) for v in pt["pi"]} for pt in self._ptables]
+        self._dev_exp = []
+        for t, pt, ps in zip(self._tables, self._ptables, self._pstep):
+            shared = (self._put(pt["pcsrc"]), self._put(pt["alpha"]), self._put(pt["L"]),
+                      self._put(self._coltab))
+            row, anti, spin = t["row"].astype(np.int64), t["anti"], np.asarray(t["spin"])
+            self._dev_exp.append({v: tuple(self._put(a) for a in (
+                st["start"], st["lpar"], st["order"], pt["op"][st["order"]],
+                pt["kbar"][row[st["order"]]], anti[st["order"]].astype(np.int32),
+                spin[st["order"]])) + shared for v, st in ps.items()})
+        self._expand = [self._build_expand(t, pt, ps, ax.carrier)
+                        for t, pt, ps, ax in zip(self._tables, self._ptables, self._pstep, self.m_axis)]
 
         # ---- 5: the streamed middle ------------------------------------------
         # The k-convolution pairs D's [A | C] columns and traces nsk spin blocks: 'trace' has
@@ -1187,52 +1278,71 @@ class MixedBasisPairConvolution:
             rebuild, mesh=mesh, in_specs=(hspec, rep, rep, rep, rep, rep, P(_XY), P(None, _XY)),
             out_specs=hspec, check_vma=False))
 
-    def _build_expand(self, t, sup, m_carrier):
-        """Steps 2–4 for one operand: ``fn(S, St, j) -> H`` for r' chunk ``j``."""
+    def _build_expand(self, t, pt, psteps, m_carrier):
+        """Steps 2–4 for one operand at the k-parents: ``fns[partner](S, St, j, *tabs) -> H`` for
+        r' chunk ``j`` (module docstring, "The expand at the k-parents"), with ``tabs`` its
+        device tables (``self._dev_exp``)."""
         mesh, nk, nr, P_ = self.mesh, self.nk, self.nr, self.P
         ns = int(np.asarray(t["spin"]).shape[-1])            # this operand's spin width
-        c = self.chunks
+        kc = self.chunks.kc
         fg = self.fft_grid
-        kc, n_kc = c.kc, self.nk // c.kc
         m_loc = m_carrier // P_
-        kb = tuple(len(s) for s in sup)
-        plan_col = self._plan(sign=-1, norm="backward", in_support=sup)
-        cols_rank, cols_chunk = self.cols_rank, self.cols_chunk
-        n_par, conj_partner = t["n_parent"], True
+        kbp = pt["kbox"]
+        plan_par = self._plan(sign=-1, norm="backward", in_support=pt["sup"])
+        cols_chunk = self.cols_chunk
+        n_par = pt["n_parent"]
+        nfg = jnp.asarray(fg, jnp.float64)
 
-        def expand(S, St, j, row, anti, spin, csrc, nph, kf, coltab, *, partner):
-            src = jnp.concatenate([S, St], axis=0) if partner else S
-            # the r' columns of chunk j that each destination rank owns (≥ N_r: pad, reads 0)
-            cols = jax.lax.dynamic_slice_in_dim(coltab, j * cols_chunk, cols_chunk, axis=1)
+        def expand(S, St, j, start, lpar, kidx, cop, ckbar, canti, cspin, pcsrc, alpha, L, coltab,
+                   *, partner, npc):
+            # the transform set: the parent tiles, and with partners conj of the transposed
+            # partners, which an antiunitary child reads before its own conjugation
+            src = jnp.concatenate([S, jnp.conj(St)], axis=0) if partner else S
+            pcs = jnp.concatenate([pcsrc, pcsrc], axis=0) if partner else pcsrc
+            cols = jax.lax.dynamic_slice_in_dim(coltab, j * cols_chunk, cols_chunk, axis=1).reshape(-1)
+            live = cols < nr                                  # a pad column (≥ N_r) reads 0
+            colc = jnp.where(live, cols, 0)
+            nc_all = cols.shape[0]                            # P × the chunk's columns
 
-            def step(_, i):
-                k0 = i * kc
-                rows = jax.lax.dynamic_slice_in_dim(row, k0, kc)
-                an = jax.lax.dynamic_slice_in_dim(anti, k0, kc)
-                if partner:
-                    g = jnp.take(src, rows + n_par * an, axis=0)
-                else:
-                    g = jnp.take(src, rows, axis=0)
-                    g = jnp.where((an != 0)[:, None, None, None, None], jnp.conj(g), g)
-                x = _column_half(g, jax.lax.dynamic_slice_in_dim(csrc, k0, kc),
-                                 jax.lax.dynamic_slice_in_dim(nph, k0, kc),
-                                 jax.lax.dynamic_slice_in_dim(spin, k0, kc), n_s=ns)
-                y = plan_col(x.reshape((kc, m_loc, ns, ns) + kb)).reshape(kc, m_loc, ns, ns, nr)
-                y = jnp.take(y, cols, axis=4, mode="fill", fill_value=0)       # (kc, m, γ, β, P, cols)
-                y = y * _grid_phase(jax.lax.dynamic_slice_in_dim(kf, k0, kc), -1, fg,
-                                    cols)[:, None, None, None]
-                y = jax.lax.all_to_all(y, _XY, split_axis=4, concat_axis=1, tiled=True)
-                return None, y.reshape(kc, m_carrier, ns, ns, cols_chunk)
+            def step(H, i):
+                st = start[i]
+                g = jax.lax.dynamic_slice_in_dim(src, st, npc, axis=0)          # (npc, m, γ, M, δ)
+                cs = jax.lax.dynamic_slice_in_dim(pcs, st, npc, axis=0)         # (npc, cells)
+                idx = jnp.broadcast_to(cs[:, None, None, :, None], g.shape[:3] + (cs.shape[1], ns))
+                x = jnp.take_along_axis(g, idx, axis=3, mode="fill", fill_value=0)
+                x = jnp.transpose(x, (1, 2, 4, 0, 3)).reshape((m_loc, ns, ns, npc) + kbp)
+                h = plan_par(x).reshape(m_loc, ns, ns, npc * nr)                 # H̃_π̄(p γ, δ, x)
+                # the step's children: y = x_α + L on each destination column, phase e^{-2πi k̄·y}
+                op2 = cop[i][:, None] * nr + colc[None, :]                      # (kc, cols)
+                a = jnp.take(alpha.reshape(-1), op2)
+                Lg = jnp.take(L.reshape(-1, 3), op2, axis=0)
+                ia = jnp.stack([a // (fg[1] * fg[2]), (a // fg[2]) % fg[1], a % fg[2]], axis=-1)
+                y = ia.astype(jnp.float64) / nfg + Lg
+                ph = jnp.exp(-2j * np.pi * jnp.sum(ckbar[i][:, None, :] * y, axis=-1))
+                flat = jnp.where(live[None, :], lpar[i][:, None] * nr + a, npc * nr)
+                v = jnp.take(h, flat.reshape(-1), axis=3, mode="fill", fill_value=0)
+                v = v.reshape(m_loc, ns, ns, kc, nc_all) * ph[None, None, None]
+                v = jnp.where((canti[i] != 0)[None, None, None, :, None], jnp.conj(v), v)
+                uc = jnp.conj(cspin[i])                                         # Σ_δ · conj U[β, δ]
+                v = jnp.stack([sum(v[:, :, d] * uc[:, b, d][None, None, :, None] for d in range(ns))
+                               for b in range(ns)], axis=2)                     # (m, γ, β, kc, cols)
+                v = jnp.transpose(v, (3, 0, 1, 2, 4)).reshape(kc, m_loc, ns, ns, P_, cols_chunk)
+                v = jax.lax.all_to_all(v, _XY, split_axis=4, concat_axis=1, tiled=True)
+                H = H.at[kidx[i]].set(v.reshape(kc, m_carrier, ns, ns, cols_chunk),
+                                      unique_indices=True)
+                return H, None
 
-            _, H = jax.lax.scan(step, None, jnp.arange(n_kc), unroll=1)
-            return H.reshape(nk, m_carrier, ns, ns, cols_chunk)
+            H0 = jnp.zeros((nk, m_carrier, ns, ns, cols_chunk), jnp.complex128)
+            H, _ = jax.lax.scan(step, H0, jnp.arange(start.shape[0]), unroll=1)
+            return H
 
         sspec, rep = P(None, _XY, None, None, None), P()
         out = P(None, None, None, None, _XY)
         fns = {}
-        for partner in (False, True):
-            f = (lambda S, St, j, *tb, _p=partner: expand(S, St, j, *tb, partner=_p))
-            fns[partner] = jax.jit(shard_map(f, mesh=mesh, in_specs=(sspec, sspec) + (rep,) * 8,
+        for partner, steps in psteps.items():
+            f = (lambda S, St, j, *tb, _p=partner, _n=steps["npc"]:
+                 expand(S, St, j, *tb, partner=_p, npc=_n))
+            fns[partner] = jax.jit(shard_map(f, mesh=mesh, in_specs=(sspec, sspec) + (rep,) * 12,
                                              out_specs=out, check_vma=False))
         return fns
 
@@ -1293,10 +1403,9 @@ class MixedBasisPairConvolution:
         for j in range(self.chunks.n_c):
             jj = jnp.asarray(j, jnp.int32)
             H = []
-            for (s, st), fns, dv in zip(slabs, self._expand, d):
-                H.append(fns[st is not None](s, s if st is None else st, jj, dv["row"], dv["anti"],
-                                             dv["spin"], dv["csrc"], dv["nph"], self._dev_k,
-                                             self._dev_cols))
+            for (s, st), fns, de in zip(slabs, self._expand, self._dev_exp):
+                v = st is not None
+                H.append(fns[v](s, s if st is None else st, jj, *de[v]))
             t0 = mark("expand", H, t0)
             T = self._middle(H[0], H[1], T, jj, self._dev_k, self._dev_qmid, self._dev_qrows,
                              self._dev_ocell_mid, d[0]["csrc"], d[0]["mph"], d[0]["spin"],
@@ -1350,10 +1459,9 @@ class MixedBasisPairConvolution:
             slab = sd((t["n_parent"], M, ns, M, ns), c128, P(None, _XY, None, None, None))
             nbox = t["csrc"].shape[1]
             ops[f"slab {name}"] = self._slab.lower(tile)
-            ops[f"expand {name}"] = self._expand[0 if name == "left" else 1][False].lower(
-                slab, slab, rep((), i32), rep((nk,), i32), rep((nk,), i32), rep((nk, ns, ns), c128),
-                rep((nk, nbox), i32), rep((nk, nbox), c128), rep((nk, 3), f64),
-                rep(self._coltab.shape, i32))
+            i = 0 if name == "left" else 1
+            ops[f"expand {name}"] = self._expand[i][False].lower(
+                slab, slab, rep((), i32), *self._dev_exp[i][False])
             H.append(sd((nk, M, ns, ns, self.P * self.cols_chunk), c128, h5))
             tb.append((rep((nk, nbox), i32), rep((nk, nbox), c128), rep((nk, ns, ns), c128)))
         nqm, mm = self.nq_mid, self.mm_axis.carrier

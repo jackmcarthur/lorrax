@@ -31,6 +31,10 @@ processes, one GPU each:
   its parents and W at its q-IBZ (W's conj rule; red twin: W's antiunitary flag dropped);
   the r'-wedge on covariant G and W (red twin: the output's spin sandwich dropped); with
   ``--wfn`` Fe at n_s = 1 and 2 on the same checks, all 16 rows and the 8 unitary ones;
+* the expand at the k-parents (p'→r' on the parents, each child a column gather of its
+  parent's transform at mtrx·(r' − τ) with the Bloch/wrap phase e^{-2πi k̄·y}): its red twins,
+  the lattice wrap dropped and the identity column map, must miss by > 1e-3 on the typed
+  parents (A-cubic, glide, Fe) and on Fe's wedge checks for both products;
 * W's antiunitary rule at fixed τ on the TR-broken Fe group: χ₀(τ) of covariant Greens at
   every full-grid q equals the conj-rule unfold of χ₀ at the parents (red twin: no conj).
 
@@ -206,7 +210,7 @@ def sigma_checks(mesh, args):
         ref = None
         for backend in ("router", "xla"):
             for name, rw in ((f"all {len(rows)} rows", rows), ("unitary rows", rows[rows < n_sp])):
-                twins = ("no_anti_W",) + (("no_spin",) if ns_fe > 1 else ())
+                twins = ("no_anti_W",) + (("no_spin",) if ns_fe > 1 else ()) + t.EXPAND_TWINS
                 r = t._sigma_symmetry_check(mesh, c, w, backend, wedge_rows=rw, twins=twins, ref=ref)
                 ref = r["ref_arr"]
                 ok = (r["parent"] <= t.TOL and r["wedge_ref"] <= t.TOL and r["wedge_dense"] <= t.TOL
@@ -259,7 +263,7 @@ def main():
         for backend in ("router", "xla"):
             r = t._symmetry_check(mesh, c, backend)
             check(f"{name} {backend}", r["full"] <= t.TOL and r["parent"] <= t.TOL
-                  and r["red"][red] > 1e-3,
+                  and r["red"][red] > 1e-3 and all(r["red"][k] > 1e-3 for k in t.EXPAND_TWINS),
                   f"full {r['full']:.2e}, parent {r['parent']:.2e}, anti rows {r['anti']}, "
                   f"red twins {', '.join(f'{k} {v:.1e}' for k, v in r['red'].items())}, "
                   f"leak {c['leak']:.1e}")
@@ -310,8 +314,9 @@ def main():
                                   metric=bf @ bf.T, box=(6, 6, 6), nb=2)
             n_sp = len(fxf["ops"])
             rows = np.asarray(fxf["rows"])
-            wcases += [(f"Fe ns={ns_fe} all {len(rows)} rows", cf, rows, ("no_conj", "no_wrap")),
-                       (f"Fe ns={ns_fe} unitary rows", cf, rows[rows < n_sp], ())]
+            wcases += [(f"Fe ns={ns_fe} all {len(rows)} rows", cf, rows,
+                        ("no_conj", "no_wrap") + t.EXPAND_TWINS),
+                       (f"Fe ns={ns_fe} unitary rows", cf, rows[rows < n_sp], t.EXPAND_TWINS)]
     for name, c, rows, twins in wcases:
         for backend in ("router", "xla"):
             r = t._wedge_check(mesh, c, backend, rows, twins=twins)
