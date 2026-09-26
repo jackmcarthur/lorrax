@@ -33,9 +33,7 @@ default may redistribute each block.
 * **Reorthogonalization.** CGS2 over the active interval
   `[max(0, j − n_reorth)·b, (j+1)·b)`, including the current block, with two
   batched overlap reductions per iteration, so excluded old vectors and the
-  unused capacity tail cost nothing. The route (`cgs2` default, or `mgs`) is
-  `LORRAX_LANCZOS_REORTH`, owned by [`env_vars.md`](../dev/env_vars.md); `mgs`
-  keeps its sequential arithmetic.
+  unused capacity tail cost nothing. It is the only route.
 * **Convergence-driven solves** build only completed projected blocks, pass
   the actual `j·b` dimension to the service eigensolver, and reconstruct from
   the completed rows only. No changing vector shape enters the iteration.
