@@ -1015,11 +1015,10 @@ def _gslot_face_kernel(mesh: Mesh, fft_grid: tuple, nk: int, bc_w: int, ns: int,
             # Two reduce-scatters (the bytes of one all-reduce), each onto
             # its face's 1/P μ slice: y-major for ψ_y, x-major for ψ_x.
             Xy = jax.lax.psum_scatter(X, ('y', 'x'), scatter_dimension=2, tiled=True)
-            Xx = jnp.conj(jax.lax.psum_scatter(
-                X, XY, scatter_dimension=2, tiled=True)).transpose(2, 0, 1)
+            Xx = jnp.conj(jax.lax.psum_scatter(X, XY, scatter_dimension=2, tiled=True))
             z = jnp.int32(0)
             ay = jax.lax.dynamic_update_slice(ay, Xy[None], (kk, b0, z, z))
-            ax_ = jax.lax.dynamic_update_slice(ax_, Xx[None], (kk, z, b0, z))
+            ax_ = jax.lax.dynamic_update_slice(ax_, Xx[None], (kk, b0, z, z))
             return (ay, ax_), None
 
         (acc_y, acc_x), _ = jax.lax.scan(
@@ -1041,13 +1040,15 @@ def _gslot_faces_kernel(mesh: Mesh):
     """The 1/P accumulators on the two faces: ONE all-to-all per face.
 
     ψ_y ``(nk, n, s, μ_YX)`` → ``PSI_NMU_SPEC`` (bands split over x, the x
-    slices of each y tile joined); ψ_x ``(nk, μ_XY, n, s)`` →
-    ``PSI_MUNT_SPEC`` (bands split over y, the y slices of each x tile
-    joined).  Values are moved, never recomputed; every operand is 1/P.
+    slices of each y tile joined); ψ_x ``(nk, n, s, μ_XY)`` → bands split
+    over y, the y slices of each x tile joined, then the local transpose to
+    ``PSI_MUNT_SPEC``.  Values are moved, never recomputed; every operand
+    is 1/P.
     """
     def local(ay, ax_):
+        fx = jax.lax.all_to_all(ax_, 'y', split_axis=1, concat_axis=3, tiled=True)
         return (jax.lax.all_to_all(ay, 'x', split_axis=1, concat_axis=3, tiled=True),
-                jax.lax.all_to_all(ax_, 'y', split_axis=2, concat_axis=1, tiled=True))
+                jnp.transpose(fx, (0, 3, 1, 2)))
     fn = shard_map(local, mesh=mesh, in_specs=(PSI_NMU_ACC_SPEC, PSI_MUNT_ACC_SPEC),
                    out_specs=(PSI_NMU_SPEC, PSI_MUNT_SPEC), check_vma=False)
     return jax.jit(fn, donate_argnums=(0, 1))
@@ -1158,7 +1159,7 @@ def load_parent_psi_G(
         @partial(jax.jit, out_shardings=(acc_Y, acc_X))
         def _zero_faces():
             return (jnp.zeros((nk, nb_c, int(meta.nspinor), int(mu_pad)), jnp.complex128),
-                    jnp.zeros((nk, int(mu_pad), nb_c, int(meta.nspinor)), jnp.complex128))
+                    jnp.zeros((nk, nb_c, int(meta.nspinor), int(mu_pad)), jnp.complex128))
         acc_y, acc_x = _zero_faces()
         _, finish = _centroid_face_kernels(
             b0, meta, mu_active_mask, n_rmu, int(mu_pad), b1 - b0, out_X, out_Y,
@@ -1169,7 +1170,7 @@ def load_parent_psi_G(
         w_mu_dev = device_put_process_local(np.zeros((P_,), np.float64), rep)
         acc_y, acc_x = jax.jit(
             lambda: (jnp.zeros((1, 1, 1, P_), jnp.complex128),
-                     jnp.zeros((1, P_, 1, 1), jnp.complex128)),
+                     jnp.zeros((1, 1, 1, P_), jnp.complex128)),
             out_shardings=(NamedSharding(mesh_xy, PSI_NMU_ACC_SPEC),
                            NamedSharding(mesh_xy, PSI_MUNT_ACC_SPEC)))()
 
