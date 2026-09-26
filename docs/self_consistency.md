@@ -346,7 +346,7 @@ receipts certify the unprojected model only.
 
 | status on a metal | what | where |
 |---|---|---|
-| default | `sc_head_update = off`: the fixed DFT direct response, with no intraband term | `qsgw_head.build_dft_head_response` |
+| default | `sc_head_update = off`: the fixed DFT response on the DFT fixed-N Fermi-Dirac state, with the tetrahedron Drude term and the Thomas–Fermi static slot | `qsgw_head.build_dft_head_response`, `sc_iteration._fixed_dft_head_occupation_state` |
 | admitted: shared-pole, `head_correction = no_local_fields` | `dft_velocity`: the `dipole.h5` velocity rotated into each map's QP basis, the current fixed-N μ and tetrahedron weights; the dynamic Drude tensor at $\omega \ne 0$, Thomas–Fermi at $\omega = 0$ | `qsgw_head.build_iteration_head_response`, `sc_iteration._solve_head_occupations`, `gw_config.uses_metal_direct_drude_head` |
 | refused (`GATE metal_sc_head_update_disabled`) | `parallel_transport`, and `dft_velocity` with full local-field folding | `gw_config.validate_material_inputs` |
 | refused (`GATE metal_sc_head_update_disabled`) | `occ_broadening > 0` next to a metal width | `gw_config._validate_occupation_smearing` |
