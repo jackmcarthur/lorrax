@@ -15,9 +15,8 @@ Two public entry points, one helper:
     Build ρ_val(r) on the FFT grid by streaming over the **full BZ** and
     accumulating Σ_k Σ_{v<n_occ} |ψ_{v,k}(r)|².  No symmetrisation is
     required because the full-BZ sum is already invariant under the
-    crystal point group.  Cheaper and more robust than the IBZ +
-    symmetrise approach (which ``tests/bench/charge_density.py`` does;
-    ``_symmetrise_density`` there is known broken — see psp/dev_status.md).
+    crystal point group.  Cheaper and more robust than an IBZ sum
+    followed by a symmetrisation pass.
 
 Lifted from ``psp/run_nscf._build_potentials`` so both the NSCF driver and
 the Sternheimer driver can share the pipeline without CrystalData
@@ -118,10 +117,8 @@ def build_rho_val_from_wfn(wfn, sym, meta, n_occ: int, *, verbose: bool = True) 
     factor comes from the uniform full-BZ weight (k-weights all 1/N_k once
     symmetry-related k are unfolded).
 
-    Unlike the IBZ path in ``tests/bench/charge_density.py::build_density_from_ibz``,
-    the full-BZ sum is exactly invariant under the crystal point group without
-    an explicit ρ(G) star-averaging pass, so the broken ``_symmetrise_density``
-    helper is sidestepped.
+    The full-BZ sum is exactly invariant under the crystal point group
+    without an explicit ρ(G) star-averaging pass.
 
     Parameters
     ----------

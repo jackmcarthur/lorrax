@@ -274,8 +274,7 @@ def create_mesh_xy_from_flags(px: Optional[int],
     0's device on every rank — which every rank >= 1 then refuses in
     ``collectives._require_addressable``.  Every launch recipe in-tree
     hard-codes ``--px 2 --py 2`` (``tests/fast_gate.py``,
-    ``tests/test_bse_bgw_regression.py``,
-    ``tests/multi_device/restart_q_storage_ab.sh``) — that is the shape of a
+    ``tests/test_bse_bgw_regression.py``) — that is the shape of a
     default nobody can rely on.
 
     A given shape is an assertion, not a request.  Both must be given
