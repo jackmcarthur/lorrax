@@ -4,7 +4,7 @@ The body of one contraction: the large right GEMM of
 `common.contract_bands.contract_bands_block_reshard`
 ([band-projection primitive](staged_reshard_primitive.md)) on a CPU mesh.
 Nothing else routes through it, and nothing else should without its own
-measurement. Python: `src/ffi/gemm.py` (`ffi.mklblas` is a re-export shim);
+measurement. Python: `src/ffi/gemm.py`;
 handler: `src/ffi/cpp/cblas/gemm_batch_ffi.cc`; gate: `ffi.gate.Gate`
 ([gate contract](ffi_gate_contract.md)).
 

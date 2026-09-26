@@ -120,7 +120,7 @@ The dial routes ONLY that right contraction through the vendor-BLAS GEMM
 host FFI handler; everything else — channel algebra, collectives, the
 small left dots (1.6e-3 of the right's flops, measured) — is untouched.
 
-The dial ITSELF is a microservice: ``ffi.mklblas`` owns its grammar,
+The dial ITSELF is a microservice: ``ffi.gemm`` owns its grammar,
 platform resolution, capability probe, announcements, refusals and the
 ``ffi_call`` (handler ``lorrax_mklblas_gemm_batch``,
 src/ffi/cpp/cblas).  ``docs/dev/vendor_gemm_service.md`` is its
@@ -320,7 +320,7 @@ def split_spin_centroid(x, axis: int, spin_size: int, centroid_size: int):
 
 
 # ---------------------------------------------------------------------------
-# Gated vendor-BLAS GEMM FFI body — the SERVICE lives in ``ffi.mklblas``
+# Gated vendor-BLAS GEMM FFI body — the SERVICE lives in ``ffi.gemm``
 # ---------------------------------------------------------------------------
 # The dial's grammar, platform resolution, capability probe, announcements
 # and refusals are the microservice's (``src/ffi/gemm.py``, on the
@@ -332,16 +332,16 @@ def split_spin_centroid(x, axis: int, spin_size: int, centroid_size: int):
 # primitive's operand layout rather than about BLAS.  Contract:
 # ``docs/dev/vendor_gemm_service.md``; gate doctrine:
 # ``docs/dev/ffi_gate_contract.md``.
-from ffi.mklblas import (                                    # noqa: E402
+from ffi.gemm import (                                       # noqa: E402
     GATE as _BANDS_GEMM_GATE,
     gemm_batch as _gemm_batch_ffi,
-    require_bands_gemm_ffi as _require_bands_gemm_ffi,
+    require_gemm_ffi as _require_bands_gemm_ffi,
 )
 
 
 def bands_gemm_ffi_mode() -> str:
     """The LORRAX_BANDS_GEMM_FFI grammar: ``"on"`` | ``"off"``
-    (delegates to :data:`ffi.mklblas.GATE`)."""
+    (delegates to :data:`ffi.gemm.GATE`)."""
     return _BANDS_GEMM_GATE.mode()
 
 

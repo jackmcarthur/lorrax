@@ -711,7 +711,7 @@ def test_the_plumbing_scan_does_not_cry_wolf():
 # and passes it.
 #
 # The model already exists one layer down: ``common.contract_bands`` makes no
-# ``os.environ`` call at all — it consumes ``ffi.mklblas.gemm.GATE``, a typed
+# ``os.environ`` call at all — it consumes ``ffi.gemm.GATE``, a typed
 # capability object.  A kernel taking a ``Gate`` rather than a string is the
 # target state.
 
@@ -741,7 +741,7 @@ def test_no_l2_module_reads_the_environment(sources):
         f"L2 is physics-agnostic mathematics and must be a function of its "
         f"arguments; these read the environment: {offenders}.  Pass the dial "
         f"in, or take a typed capability object the way "
-        f"common.contract_bands takes ffi.mklblas.gemm.GATE.")
+        f"common.contract_bands takes ffi.gemm.GATE.")
 
 
 def test_the_l2_env_exceptions_are_all_still_needed(sources):
