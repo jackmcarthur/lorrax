@@ -111,6 +111,7 @@ __all__ = [
     # reductions and gathers
     "psum_replicate",
     "transpose_xy",
+    "to_transpose_partner",
     "xy_tile_mesh",
     "all_gather_processes",
     "gather_to_host",
@@ -663,10 +664,21 @@ def transpose_xy(x, mesh):
     if int(mesh.shape["y"]) != p:
         raise ValueError(f"transpose_xy: mesh {dict(mesh.shape)} is not square")
     spec = P(*((None,) * (x.ndim - 2)), "x", "y")
-    perm = [(i * p + j, j * p + i) for i in range(p) for j in range(p)]
     return shard_map(
-        lambda t: jax.lax.ppermute(jnp.swapaxes(t, -1, -2), ("x", "y"), perm),
+        lambda t: to_transpose_partner(jnp.swapaxes(t, -1, -2), p),
         mesh=mesh, in_specs=spec, out_specs=spec)(x)
+
+
+def to_transpose_partner(t, p: int):
+    """Inside a ``shard_map`` over the square ``('x', 'y')`` mesh: rank (i, j)'s block to rank (j, i).
+
+    One collective permute of this rank's block, no arithmetic; the body of
+    :func:`transpose_xy` and of any kernel that needs an operand's other
+    face (a block held ``[.., a_X, b_Y]`` arrives as the partner's
+    ``[.., a_Y, b_X]``)."""
+    import jax
+    perm = [(i * p + j, j * p + i) for i in range(p) for j in range(p)]
+    return jax.lax.ppermute(t, ("x", "y"), perm)
 
 
 def xy_tile_mesh(x):

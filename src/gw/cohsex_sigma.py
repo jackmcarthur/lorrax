@@ -195,9 +195,9 @@ def _occ_diag_full(Gij, nb_sigma, nb_full):
 
 
 def _face_kwargs(wfns) -> dict:
-    """Select the canonical Sigma face shapes and typed parent transport."""
+    """Select the canonical Sigma face shapes, typed parent transport and output window."""
     from .wavefunction_bundle import sigma_face_kernel_kwargs
-    return sigma_face_kernel_kwargs(wfns)
+    return {**sigma_face_kernel_kwargs(wfns), "nb_window": int(wfns.slices.nb_sigma)}
 
 
 _cohsex_kernel_cache: dict[tuple[object, ...], tuple] = {}
@@ -402,8 +402,12 @@ def make_lorentz_q0_product(nk_tot: int):
 
 def _make_cohsex_kernels(mesh_xy: Mesh, kgrid: tuple[int, int, int],
                          nk_tot: int, *, layout: str = "face",
-                         face_shape=None, k_unfold_plan=None):
-    """Build static SX/COH kernels on canonical faces with optional typed parent transport."""
+                         face_shape=None, k_unfold_plan=None, nb_window=None):
+    """Build static SX/COH kernels on canonical faces with optional typed parent transport.
+
+    ``nb_window`` projects only the leading output bands (the QP window), so
+    Σ is born ``(nk, nb_window, nb_window)`` on its carrier; ``None`` projects
+    every band."""
     if layout not in ("face", "axis"):
         raise ValueError(
             f"_make_cohsex_kernels: layout must be 'face', "
@@ -418,35 +422,55 @@ def _make_cohsex_kernels(mesh_xy: Mesh, kgrid: tuple[int, int, int],
     # thrown away anyway.
     from ffi import ffi_dial_key
     cache_key = (_mesh_key(mesh_xy), tuple(int(x) for x in kgrid), ffi_dial_key(),
-                layout, face_shape, k_unfold_plan)
+                layout, face_shape, k_unfold_plan, nb_window)
     if cache_key in _cohsex_kernel_cache:
         return _cohsex_kernel_cache[cache_key]
 
     _convolve = _make_static_convolution(mesh_xy, kgrid, nk_tot)
     kernels = _make_cohsex_kernels_face(
         mesh_xy, face_shape, _convolve, k_unfold_plan=k_unfold_plan, layout=layout,
-        kgrid=kgrid)
+        kgrid=kgrid, nb_window=nb_window)
 
     _cohsex_kernel_cache[cache_key] = kernels
     return kernels
 
 
 def _make_cohsex_kernels_face(mesh_xy: Mesh, face_shape, _convolve,
-                              k_unfold_plan=None, layout="face", *, kgrid=None):
-    """Contract static SX/COH and project before selecting the requested output band window."""
+                              k_unfold_plan=None, layout="face", *, kgrid=None,
+                              nb_window=None):
+    """Contract static SX/COH and project only the requested output band window.
+
+    The projection endpoints are cut to the window's mesh carrier
+    (``ppm_sigma.sigma_band_axis``, the MPA Σ's own), so the Σ this returns
+    is ``(nk, carrier, carrier)`` at ``P(None,'x','y')``: the consumer's
+    replication holds the window, never the ``nb_full²`` band square."""
     from distrib_la import gemm_plan
     from common.contract_bands import contract_bands_block_reshard
+    from runtime.padding import pad_to_axis
 
     nk, nb_full, n_rmu, ns = (int(v) for v in face_shape)
     g_shape = (face_shape if k_unfold_plan is None
                else (k_unfold_plan.n_parent, *face_shape[1:]))
     nk_g, nb_g, n_rmu_g, ns_g = (int(v) for v in g_shape)
     mu_s = n_rmu_g * ns_g
+    window = None
+    if nb_window is not None:
+        from .ppm_sigma import sigma_band_axis
+        window = sigma_band_axis(int(nb_window), mesh_xy, ansatz="static")
+    band_extent = None if window is None else window.carrier
+
+    def _windowed(psi_left, psi_right):
+        """The projection endpoints cut to the output window (bands on axes 1 and 3)."""
+        if window is None:
+            return psi_left, psi_right
+        return (pad_to_axis(psi_left, window, axis=1),
+                pad_to_axis(psi_right, window, axis=3))
 
     g_plan = gemm_plan(mesh_xy, m=mu_s, k=nb_g, n=mu_s, nq=nk_g,
                        dtype=jnp.complex128, layout=layout)
     proj_fn = contract_bands_block_reshard(
-        mesh_xy, layout=layout, face_shape=tuple(g_shape))
+        mesh_xy, layout=layout, face_shape=tuple(g_shape),
+        face_band_extent=band_extent)
     if k_unfold_plan is not None:
         from ffi import _services
         _services.ensure_on_path()
@@ -472,7 +496,7 @@ def _make_cohsex_kernels_face(mesh_xy: Mesh, face_shape, _convolve,
         spatial = get_sigma_spatial_kernel(
             mesh_xy=mesh_xy, kgrid=kgrid, merged_x=True, layout=layout,
             face_shape=tuple(int(v) for v in face_shape), k_unfold_plan=k_unfold_plan,
-            partner_tiles=0)
+            partner_tiles=0, face_band_extent=band_extent)
 
     def _parent_sigma(wfns, phases_parent, interaction, prefactor, *, real_weights):
         """Σ on the parent rows from the parent Green, unfolded to the wedge's band operator."""
@@ -481,6 +505,7 @@ def _make_cohsex_kernels_face(mesh_xy: Mesh, face_shape, _convolve,
         pg = build_G_parents(g_mun, g_nmu, phases=phases_parent, layout=layout, gemm=g_plan,
                              k_unfold_plan=k_unfold_plan, real_weights=real_weights)
         _, _, proj_nmu, proj_mun, _, _ = parent_sigma_operands(wfns)
+        proj_nmu, proj_mun = _windowed(proj_nmu, proj_mun)
         parent_rows = prefactor * spatial.conv_project(
             proj_nmu, proj_mun, pg, _convolve.prep(interaction))
         # Static Σ is Hermitian, so conj and transpose coincide; the dynamic
@@ -488,7 +513,8 @@ def _make_cohsex_kernels_face(mesh_xy: Mesh, face_shape, _convolve,
         return unfold_file_wedge_band_operator(_sym, parent_rows, trs_rule="transpose")
 
     def _project_bands(wfns, sigma_k):
-        return _project(wfns.psi_nmu, wfns.psi_mun, sigma_k,
+        psi_left, psi_right = _windowed(wfns.psi_nmu, wfns.psi_mun)
+        return _project(psi_left, psi_right, sigma_k,
                         layout=layout, face_project_fn=proj_fn)
 
     @jax.jit
