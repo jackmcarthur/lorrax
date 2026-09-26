@@ -92,7 +92,7 @@ alone put $S_{zz}$ 1.3 % from the exact position-operator head, so the
 periodic-axis error is about $\theta/4$ in $S_{aa}$. A $5\times10^{-3}$ head
 tolerance is out of reach at $\theta \approx 0.05$ without within-class $k$
 information (links). The per-map line prints $\theta$; there is no refusal
-threshold.
+threshold. Measurements: sandbox claim 2815.
 
 Every same-class pair is excluded, degenerate or not. Inside a class, $W$ has
 no gap in its denominator. Near-degenerate pairs make it arbitrarily large, and
