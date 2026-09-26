@@ -17,7 +17,8 @@ def face_band_gather_product(A, B, mesh, phases, band_range, n_full=None):
     ``P(None,'x','y')``.  ``w`` is the phase row, zero outside the per-row
     ``band_range``.  ``distrib_la.panel_matmul`` all-gathers the band panels
     (A over y, B over x) and multiplies them locally into the rank's own
-    output tile, so no reduction follows.  Every Green-building stage
+    output tile, so no reduction follows; the local product runs only over
+    each row's ``band_range`` (the local active-range GEMM).  Every Green-building stage
     reserves one full-k Green tile, ``16·N_k·(M/p_x)·(N/p_y)`` bytes
     (``N_k = n_full``, the parents' full zone; ``nq`` when the faces are
     already at full k), for these transient panels, so the panel count is
@@ -31,17 +32,23 @@ def face_band_gather_product(A, B, mesh, phases, band_range, n_full=None):
     nq, m, nb = (int(v) for v in A.shape)
     n = int(B.shape[-1])
     weight = None if phases is None else phases.astype(A.dtype)
+    bounds = None
     if band_range is not None:
-        lo, hi = (jnp.reshape(jnp.asarray(v), (-1, 1)) for v in band_range)
+        lo, hi = (jnp.broadcast_to(jnp.reshape(jnp.asarray(v, jnp.int32), (-1,)), (nq,))
+                  for v in band_range)
         idx = jnp.arange(nb)[None, :]
-        live = (idx >= lo) & (idx < hi)
+        live = (idx >= lo[:, None]) & (idx < hi[:, None])
         weight = (live.astype(A.dtype) if weight is None
                   else jnp.where(live, weight, jnp.zeros((), A.dtype)))
+        # The interval also bounds the gathered local product: the columns
+        # outside it are zero, so skipping them is the same product.
+        hi = jnp.clip(hi, 0, nb)
+        bounds = jnp.stack([jnp.clip(lo, 0, hi), hi], axis=1)
     if weight is not None:
         A = A * weight[:, None, :]
     px, py = int(mesh.shape['x']), int(mesh.shape['y'])
     tile_bytes = A.dtype.itemsize * int(n_full or nq) * (m // px) * (n // py)
-    return panel_matmul(A, B, mesh=mesh, panel_bytes=tile_bytes)
+    return panel_matmul(A, B, mesh=mesh, panel_bytes=tile_bytes, bounds=bounds)
 
 
 def _build_G_face(psi_mun, psi_nmu, *, gemm, Gij=None, phases=None, mesh=None,
