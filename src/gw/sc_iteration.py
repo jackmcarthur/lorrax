@@ -6423,7 +6423,10 @@ def load_head_velocity_source(
         print_fn(
             "  SC head: authenticated DFT dipole velocity, rotated into "
             "this map's QP basis; live Fermi-surface Drude and static "
-            "Thomas-Fermi direct head, without wings")
+            "Thomas-Fermi head"
+            + (", folded through intraband wings"
+               if config.head.correction is HeadCorrection.FULL
+               else ", direct (no wings)"))
         return source
 
     pt_path = resolve_input_path(
