@@ -115,8 +115,9 @@ def _uniform_grid_indices(kpoints_crystal, kgrid):
     points = np.mod(np.asarray(kpoints_crystal, dtype=np.float64), 1.0)
     grid = np.asarray(kgrid, dtype=np.int64)
     # A one-point axis (a slab's z) is admitted: every tetrahedron step along
-    # it wraps to the same k, so the Kuhn cells reduce exactly to the
-    # triangle rule of the remaining axes (their fibres sum to one).
+    # it wraps to the same k (the caller accumulates repeated vertices), so
+    # the Kuhn cells reduce exactly to the triangle rule of the remaining
+    # axes (their fibres sum to one).
     if points.ndim != 2 or points.shape[1] != 3 or grid.shape != (3,) or np.any(grid < 1):
         raise ValueError("need kpoints (nk,3) and a three-dimensional kgrid >= 1")
     scaled = points * grid[None, :]
@@ -214,7 +215,8 @@ def tetrahedron_delta_weights(
             vertex = flat[start + tet]
             local = _tetra_delta_vertex_weights(
                 energies[vertex, band], chemical_potential)
-            weights[vertex, band] += cell_jacobian * local
+            # add.at: on a one-point axis two vertices are the same k.
+            np.add.at(weights, (vertex, band), cell_jacobian * local)
     return weights
 
 

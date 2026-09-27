@@ -530,13 +530,19 @@ def _slab_gamma_cell_average(geometry, kgrid, operands, mesh, cell_volume):
         ladder.append(compiled(*(device_put_process_local(x, split) for x in (q, D, w)),
                                *operands))
     fields = [np.asarray(x) / cell_volume for x in ladder[-1][:-1]]
-    spread = max(float(np.max(np.abs(np.asarray(a) - np.asarray(b)))) / cell_volume
-                 for a, b in zip(ladder[-1][:-1], ladder[-2][:-1]))
+    change = [np.max(np.abs(np.asarray(a) - np.asarray(b))) / cell_volume
+              for a, b in zip(ladder[-1][:-1], ladder[-2][:-1])]
+    spread = float(max(change))
+    relative = ", ".join(
+        f"{name} {float(d) / max(float(np.max(np.abs(x))), 1e-300):.1e}"
+        for name, d, x in zip(("Wc", "dWc", "Wc_mq", "dWc_mq", "const", "M", "bare"),
+                              change, fields))
     max_error = max(float(result[-1]) for result in ladder)
     edges = len(receipt.polygon_vertices)
     return (fields, spread, max_error,
             f"exact {edges}-edge Wigner-Seitz polygon, Duffy-Gauss orders "
-            f"{receipt.orders} ({receipt.physical_counts[-1]} nodes)")
+            f"{receipt.orders} ({receipt.physical_counts[-1]} nodes); "
+            f"24->32 relative change: {relative}")
 
 
 def _fields(operands):
