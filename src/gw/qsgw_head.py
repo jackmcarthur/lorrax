@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 from dataclasses import dataclass
 from typing import Callable
 
@@ -2953,7 +2954,33 @@ def metal_intraband_model(velocity_cart, surface_weight_kn, energies_kn_ry, *,
         np.asarray(surface_weight_kn, dtype=np.float64)[:, :int(nb_logical)],
         split.diag_host, spread, drude, capacity=capacity,
         cell_volume=float(cell_volume), nk_tot=int(nk_tot))
+    # The physical Drude tensor is the phi -> 0 (vanishing cell) limit: only
+    # exact multiplets are intraband.  The cell-effective D above approaches
+    # it as the cell shrinks (docs/theory/metal-q0-head.md section 2).
+    physical = dataclasses.replace(split, moment=np.zeros_like(split.moment))
+    atoms.physical_drude = np.asarray(head_drude_tensor_sharded(
+        velocity_cart, surface, energies_kn_ry, mesh=mesh,
+        nb_logical=int(nb_logical), cell_volume=float(cell_volume),
+        nk_tot=int(nk_tot), nspin=int(nspin), nspinor=int(nspinor),
+        pair_split=physical))
     return drude, atoms, split
+
+
+def plasma_frequencies_ev(drude_tensor):
+    """Principal ``omega_p = sqrt(8 pi eig(Re D))`` in eV of a Drude tensor."""
+    from common import RYD_TO_EV
+    D = np.real(np.asarray(drude_tensor))
+    return np.sqrt(np.maximum(8.0 * np.pi * np.linalg.eigvalsh(0.5 * (D + D.T)),
+                              0.0)) * RYD_TO_EV
+
+
+def drude_report(atoms) -> str:
+    """Physical and cell-effective plasma frequencies of one metal head."""
+    return ("omega_p physical (exact multiplets, phi -> 0) = "
+            + "/".join(f"{x:.4f}" for x in plasma_frequencies_ev(atoms.physical_drude))
+            + " eV; q=0-cell effective (Fermi-surface share phi of near pairs) = "
+            + "/".join(f"{x:.4f}" for x in plasma_frequencies_ev(atoms.drude_tensor))
+            + " eV")
 
 
 def _fold_static_kappa2(response, W_body_gamma, cell_volume, mesh):
@@ -3682,18 +3709,18 @@ def _head_bvec(wfn):
 
 
 def metal_head_summary(response: IterationHeadResponse, occupation_state) -> str:
-    """One log line naming a metallic head's occupations and plasma frequency."""
+    """One log line naming a metallic head's occupations and plasma frequencies."""
     from common import RYD_TO_EV
-    D = np.real(np.asarray(response.drude_tensor))
-    wp = np.sqrt(np.maximum(8.0 * np.pi * np.linalg.eigvalsh(0.5 * (D + D.T)), 0.0))
     kappa = response.static_kappa2_bohr2
+    wp = ("omega_p principal = " + "/".join(
+        f"{x:.4f}" for x in plasma_frequencies_ev(response.drude_tensor)) + " eV"
+        if response.fermi_surface is None else drude_report(response.fermi_surface))
     return (
         "metal head: fixed-N "
         f"{occupation_state.smearing_family} occupations (mu="
         f"{float(occupation_state.mu_ry) * RYD_TO_EV:.6f} eV, occ_hash="
         f"{occupation_state.occ_hash}) plus the tetrahedron Fermi-surface "
-        "intraband term; omega_p principal = "
-        + "/".join(f"{x * RYD_TO_EV:.4f}" for x in wp) + " eV"
+        "intraband term; " + wp
         + ("" if kappa is None else f"; kappa_TF^2 = {kappa:.6f} bohr^-2")
         + ("" if response.fermi_surface is None
            else "; intraband cell: " + response.fermi_surface.describe()))

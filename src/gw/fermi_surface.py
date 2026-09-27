@@ -484,6 +484,8 @@ class FermiSurfaceIntraband:
                 "GATE metal_intraband_moments: velocity atoms miss the Drude tensor by "
                 f"{error:.3e} (scale {scale_d:.3e}); the pair split of the atoms and of D differ")
         self.moment_error = error
+        #: The phi -> 0 Drude tensor (exact multiplets only), set by the builder.
+        self.physical_drude = None
         self._blocks = _intraband_blocks(self.weights, self.velocities)
 
     def describe(self) -> str:

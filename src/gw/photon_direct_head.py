@@ -464,13 +464,11 @@ def build_direct_photon_head(velocity_cart, wfns, occupation_state, *,
                 jnp.asarray(drude), jnp.asarray(dos, jnp.float64), contact,
                 atom_w, atom_u)
     if jax.process_index() == 0:
-        from common import RYD_TO_EV
-        wp = np.sqrt(np.maximum(8.0 * np.pi * np.linalg.eigvalsh(
-            np.real(0.5 * (drude + drude.T))), 0.0))
-        print("  direct photon Γ metal head: tetrahedron Fermi surface, omega_p principal = "
-                 + "/".join(f"{x * RYD_TO_EV:.4f}" for x in wp)
-                 + f" eV; kappa_TF^2 = {8.0 * np.pi * dos:.6f} bohr^-2; "
-                 + atoms.describe(), file=sys.stderr, flush=True)
+        from gw.qsgw_head import drude_report
+        print("  direct photon Γ metal head: tetrahedron Fermi surface, "
+              + drude_report(atoms)
+              + f"; kappa_TF^2 = {8.0 * np.pi * dos:.6f} bohr^-2; "
+              + atoms.describe(), file=sys.stderr, flush=True)
     chunk_size, split = direct_gamma_chunk_plan(mesh, operands, nsamples=_GAMMA_SAMPLES)
     samples = iter_minibz_photon_samples(get_kernel(3), geometry,
         kgrid, nsamples=_GAMMA_SAMPLES,

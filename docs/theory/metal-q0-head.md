@@ -151,6 +151,23 @@ hides the Thomas–Fermi term (§3). The same weight bounds the four-current
 charge jets. On a coarse grid $\epsilon$ is large enough that eV-scale pairs
 share their weight too, and the share falls as the cell shrinks.
 
+**Physical and cell-effective Drude weight.** Two tensors carry the name.
+The physical Drude tensor $D_{\rm phys}$ is the $\phi\to0$ limit: only exact
+multiplets are intraband, and $\omega_p^2(\hat q)=8\pi\,\hat q\cdot D_{\rm phys}\cdot\hat q$
+is the metal's plasma frequency on this k grid. The cell-effective tensor
+$D_{\mathcal C}=D_{\rm phys}+\sum\phi_{nm}\bar w_{nm}v^*_{nm}v^{\sf T}_{nm}$ is
+what the q = 0 cell uses. It adds the Fermi-surface share of near-degenerate
+interband pairs, whose weight $S$ loses, so the f-sum over $S+D$ is unchanged.
+Since $\epsilon^2\propto\operatorname{tr}Q\propto N_k^{-2/3}$,
+$D_{\mathcal C}\to D_{\rm phys}$ as the cell shrinks. The logs print both.
+On Fe $4^3$ (frozen DFT head) they are 2.09/2.31 eV (physical) and
+7.57/7.62 eV (cell-effective). With the same bands and $Q$ scaled to the
+$8^3$, $16^3$ and $32^3$ cells the cell-effective value falls to 5.17/5.69,
+3.89/4.69 and 3.20/3.89 eV (claim 2862). The excess $\omega_p^2$ roughly halves
+per doubling of the grid, i.e. it scales as $\epsilon\propto N_k^{-1/3}$, not
+as $\epsilon^2$: near-crossing pairs have a continuum of small $\Delta$. A cell-effective $\omega_p$ is
+not a plasma frequency to compare with experiment or with DFT.
+
 **The Hall part of a pair's Fermi-surface share.** The share $\phi$ moves
 only symmetric content; its antisymmetric part is Berry curvature, which no
 Fermi-surface velocity carries. The four-current head keeps it: the
