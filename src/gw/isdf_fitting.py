@@ -12,6 +12,7 @@ from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
 from common import Meta
 from common import timing
+from common.gamma_matrices import current_fit_terms
 from common.collectives import (
     device_put_process_local as _device_put_process_local,
 )
@@ -209,7 +210,7 @@ class ZetaChannel(NamedTuple):
 def _fit_mubatch(
     *, wfn, meta, centroid_indices, mesh_xy, plan, parent_psi,
     band_range_full, bispinor, bispinor_lift, k_unfold_plan,
-    weight_l_face, weight_r_face, channels,
+    weight_l_face, weight_r_face, channels, vertex_terms,
     distrib_la_batched_route, n_rmu_solve,
     q_irr_full_idx, q_neg_idx, q_frac, sphere_idx, ngk_per_q,
     mu_basis, gvec_components, scratch_dir, print_fn,
@@ -328,7 +329,8 @@ def _fit_mubatch(
         q_sel=q_irr_full_idx, q_axis=q_axis, q_neg=q_neg_idx, qvec_frac=q_frac,
         n_col=int(cyl[0].shape[1]), n_s=int(cyl[0].shape[2]),
         plane_from_col=np.asarray(jax.device_get(cyl[2])), n_pg=int(plan.r_sub),
-        axis=axis, n_src=n_par, vertices=vertices, c_out=c_out, n_blk=n_blk)
+        axis=axis, n_src=n_par, vertices=vertices, c_out=c_out, n_blk=n_blk,
+        vertex_terms=vertex_terms)
     kernel = zmb.make_route_g_kernel(**kern_args)
     split_kernels = {}
     if debug_print_enabled():
@@ -495,9 +497,14 @@ def fit_zeta_to_h5(
     mubatch_plan=None,
     parent_psi=None,
     write_zeta_file: bool = True,
+    current_basis_rows=None,
     print_fn=print,
 ):
     """Fit canonical q-IBZ ζ for each channel of ``output_files`` on route G.
+
+    ``current_basis_rows`` (``symmetry_maps.select_current_basis``; None is
+    Cartesian) is the basis the current channels are fitted in: channel c
+    trains on Σ_i B_ci ψ†α^iψ (``common.gamma_matrices.current_fit_terms``).
 
     ``output_files`` maps μ_L to its ζ file: ``{0: path}`` for the charge
     channel, ``{1: …, 2: …, 3: …}`` (or the missing subset) for the bispinor
@@ -691,14 +698,23 @@ def fit_zeta_to_h5(
         with timing.section("zeta_fit.CCT"):
             # γ̃^{μ_L} on both endpoints after the typed unfold: C_q is the
             # channel's interpolation metric (Hermitian indefinite for μ_L ≠ 0).
-            print_fn(f"  C_q on raw parents ({'charge γ̃^0=I' if v == 0 else f'current γ̃^{v}'}): "
+            terms = current_fit_terms(v, current_basis_rows)
+            _bname = 'Cartesian' if current_basis_rows is None else 'circular'
+            print_fn(f"  C_q on raw parents ({'charge γ̃^0=I' if v == 0 else f'current channel {v}'}"
+                     f"{'' if v == 0 else f', {_bname} basis: ' + ' + '.join(f'({w:.3g})U{i}{j}' for w, i, j in terms)}): "
                      f"{k_unfold_plan.n_parent} -> {nk_tot} k rows")
-            C_q = c_q_from_psi_sm(
-                kgrid=kgrid, mesh_xy=mesh_xy,
-                psi_mun_parent=psi_mun_parent, psi_nmu_parent=psi_nmu_parent,
-                weight_l=weight_l_face, weight_r=weight_r_face,
-                gemm=_face_gemm, k_unfold_plan=k_unfold_plan,
-                gamma_L=v, gamma_R=v)
+            C_q = None
+            for w, i, j in terms:
+                part = c_q_from_psi_sm(
+                    kgrid=kgrid, mesh_xy=mesh_xy,
+                    psi_mun_parent=psi_mun_parent, psi_nmu_parent=psi_nmu_parent,
+                    weight_l=weight_l_face, weight_r=weight_r_face,
+                    gemm=_face_gemm, k_unfold_plan=k_unfold_plan,
+                    gamma_L=i, gamma_R=j)
+                if len(terms) > 1 or w != 1.0:
+                    part = w * part
+                C_q = part if C_q is None else C_q + part
+                del part
             C_q_flat = jax.lax.with_sharding_constraint(
                 C_q.reshape(nq, n_rmu_padded, n_rmu_padded), flat_shard)
             del C_q
@@ -780,6 +796,7 @@ def fit_zeta_to_h5(
         bispinor_lift=bispinor_lift, k_unfold_plan=k_unfold_plan,
         weight_l_face=weight_l_face, weight_r_face=weight_r_face,
         channels=channels,
+        vertex_terms=tuple(current_fit_terms(v, current_basis_rows) for v in vertices),
         distrib_la_batched_route=distrib_la_batched_route,
         n_rmu_solve=n_rmu_solve, q_irr_full_idx=q_irr_full_idx,
         q_neg_idx=_q_neg_idx, q_frac=q_irr_frac,

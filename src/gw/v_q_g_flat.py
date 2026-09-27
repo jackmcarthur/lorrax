@@ -929,6 +929,8 @@ def _finish_vq_tile(s, *, V_sh, mesh_xy, stack_cols, unfold_isdf_one_leg,
             mesh_xy=mesh_xy,
             component_action=s['one_leg_action'],
             source_component=s['source_component'],
+            **({} if s['one_leg_action'] == 'scalar'
+               else dict(component_basis=s['component_basis'])),
         )
         del zeta_cols
 

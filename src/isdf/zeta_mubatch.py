@@ -206,6 +206,7 @@ def make_route_g_kernel(*, mesh: Mesh, kgrid, fft_grid, ns: int, b: int,
                         q_sel, q_axis, q_neg, qvec_frac, n_col: int, n_s: int,
                         plane_from_col, n_pg: int, axis: int, n_src: int, vertices=(0,),
                         c_out: int | None = None, n_blk: int = 1,
+                        vertex_terms=None,
                         stop_at: str | None = None):
     """Compile-once executable for one μ batch on route G.
 
@@ -293,11 +294,22 @@ def make_route_g_kernel(*, mesh: Mesh, kgrid, fft_grid, ns: int, b: int,
     # One k-convolution per channel: C_q and Z_q put γ̃^{μ_L} on both
     # endpoints' output spins after the typed unfold (isdf.core.c_q_from_psi_sm),
     # which the router takes as the static (perm, phase) of its load.
-    pair_kernels = []
-    for v in vertices:
-        p_v, ph_v = _conv_kpair_static_gamma(None if v == 0 else gamma_perm_phase(v), ns)
-        pair_kernels.append(make_fused_conv_kplane(mesh, kgrid, ns, perm_l=p_v, phase_l=ph_v,
-                                                   perm_r=p_v, phase_r=ph_v))
+    # ``vertex_terms[c]`` = ((w, i, j), ...): channel c's Z is Σ w·Z(γ̃^i at μ,
+    # γ̃^j at r) (common.gamma_matrices.current_fit_terms); each distinct
+    # (i, j) convolution runs once per group and is shared by the channels.
+    if vertex_terms is None:
+        vertex_terms = tuple(((1.0, v, v),) for v in vertices)
+    vertex_terms = tuple(tuple((complex(w), int(i), int(j)) for w, i, j in t)
+                         for t in vertex_terms)
+    if len(vertex_terms) != len(vertices):
+        raise ValueError("make_route_g_kernel: one vertex_terms entry per channel")
+    pairs = sorted({(i, j) for t in vertex_terms for _, i, j in t})
+    pair_kernels = {}
+    for i, j in pairs:
+        p_i, ph_i = _conv_kpair_static_gamma(None if i == 0 else gamma_perm_phase(i), ns)
+        p_j, ph_j = _conv_kpair_static_gamma(None if j == 0 else gamma_perm_phase(j), ns)
+        pair_kernels[(i, j)] = make_fused_conv_kplane(mesh, kgrid, ns, perm_l=p_i, phase_l=ph_i,
+                                                      perm_r=p_j, phase_r=ph_j)
     n_v = len(vertices)
     ib = (np.arange(ps) // n_c).astype(np.float64)
     ic = (np.arange(ps) % n_c).astype(np.float64)
@@ -310,7 +322,7 @@ def make_route_g_kernel(*, mesh: Mesh, kgrid, fft_grid, ns: int, b: int,
            hash(q_sel.tobytes()), q_axis,
            None if q_neg is None else hash(q_neg.tobytes()), hash(qv.tobytes()),
            int(n_col), int(n_s), hash(pfc.tobytes()), int(n_pg), int(axis), int(n_src),
-           vertices, c_out, n_blk, stop_at)
+           vertices, vertex_terms, c_out, n_blk, stop_at)
     hit = _kernel_cache.get(key)
     if hit is not None:
         return hit
@@ -400,16 +412,23 @@ def make_route_g_kernel(*, mesh: Mesh, kgrid, fft_grid, ns: int, b: int,
                                 * a0[None, :, None] / n_a) * on[None, :, None]   # (Q, n_pg, n_za)
                     d = d.reshape(nk, n_pg, ns, 2 * c_out, ns, ps)
                     out = []
-                    for pair_kernel, acc_v in zip(pair_kernels, acc):
+                    zp = {}
+                    for ij in pairs:
                         # The k-convolution reads d where the FFT left it: the Bloch
                         # phase, the L | R split of the 2c slots and the vertex happen
                         # on its load.
-                        Z = pair_kernel(d, bl)                                  # (nk, c, n_pg·ps)
+                        Zij = pair_kernels[ij](d, bl)                           # (nk, c, n_pg·ps)
+                        if stop_at != 'kconv' and q_neg is not None:
+                            Zij = Zij + jnp.conj(jnp.take(Zij, jnp.asarray(q_neg), axis=0))
+                        zp[ij] = Zij
+                    for terms, acc_v in zip(vertex_terms, acc):
+                        if len(terms) == 1 and terms[0][0] == 1.0:
+                            Z = zp[terms[0][1:]]
+                        else:
+                            Z = sum(w * zp[(i, j)] for w, i, j in terms)
                         if stop_at == 'kconv':
                             out.append(acc_v + jnp.sum(jnp.abs(Z)))
                             continue
-                        if q_neg is not None:
-                            Z = Z + jnp.conj(jnp.take(Z, jnp.asarray(q_neg), axis=0))
                         Z = jnp.take(Z, jnp.asarray(q_sel), axis=0).reshape(Q, c_out, n_pg, ps)
                         Z = (Z * qin[:, None, None, :]).reshape(Q, c_out, n_pg, n_b, n_c)
                         Fz = local_fftn3(Z, axes=(-2, -1), norm='backward').reshape(Q, c_out, n_pg, ps)
