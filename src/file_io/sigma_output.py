@@ -101,13 +101,8 @@ SIGMA_K_AXIS = {
 	# covariance, and it is only checkable on a persisted, stamped array.
 	"sigma_c_extrap_inf_kn_ev": 0,
 	"sigma_c_extrap_last_kn_ev": 0,
-	"sigma_c_extrap_ampl_kn_ev": 0,
 	"sigma_c_extrap_sigma_kn_ev": 0,
-	# The estimator-specific fourth array.  ``ampl`` is A (the 1/N
-	# coefficient) and is written by ``band_index_only``; ``beta`` is the
-	# per-state decay exponent and is written by ``spectral_shell``.  Two
-	# names rather than one reused name, so a file says which estimator made
-	# it even to a reader who never looks at the attributes.
+	# The per-state decay exponent written by ``spectral_shell``.
 	"sigma_c_extrap_beta_kn": 0,
 	# The energies THIS Sigma was evaluated at, omega-relative, band
 	# diagonal (nk, nb) -> k is axis 0.  Registered here rather than merely
@@ -1343,7 +1338,7 @@ def write_sigma_omega_h5(
 
 	``band_extrapolation``
 	    ``{"arrays": {name: (nk, nb)}, "attrs": {...}}`` from
-	    ``gw.band_extrapolation.extrapolation_h5_payload``.  Until
+	    ``gw.band_extrapolation.spectral_h5_payload``.  Until
 	    2026-08-15 the fitted ``S_inf`` reached NO artifact: a run with the
 	    feature on and one with it off were identical to 8e-15 in every
 	    dataset here while the log reported an 848 meV correction, so the

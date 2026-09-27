@@ -276,7 +276,7 @@ def write_sigma_omega(
 
     ``band_extrapolation`` is the optional
     ``{"arrays": {...}, "attrs": {...}}`` the Σ_c band-convergence fit
-    produces (``gw.band_extrapolation.extrapolation_h5_payload``).  None —
+    produces (``gw.band_extrapolation.spectral_h5_payload``).  None —
     the default and every non-extrapolating run — writes exactly the file
     that was written before the feature existed.
     """

@@ -37,10 +37,6 @@ from .band_extrapolation import (
     plane_wave_band_count,
     spectral_h5_payload,
     assert_brackets_match_ols_abscissae,
-    extrapolation_h5_payload,
-    extrapolation_weights,
-    fit_band_extrapolation,
-    format_extrapolation_report,
     static_limit_tail_ruling,
     plan_band_brackets,
     sc_tolerance_ruling,
@@ -234,10 +230,8 @@ def _band_count_kernel(sharding):
 
 
 def _combine_extrapolation(a, w):
-    """Apply scalar or symmetric per-state weights in bracket order."""
+    """Apply symmetric per-state weights in bracket order."""
     w = jnp.asarray(w, dtype=a.dtype)
-    if w.ndim == 1:
-        return jnp.tensordot(w, a, axes=(0, 0))
     # Form only one (nk, nb, nb) weight matrix at a time. The small static
     # bracket loop preserves the established elementwise summation order.
     acc = None
@@ -278,18 +272,8 @@ def _extrapolated_point(cube, weights):
     """``S_extrap`` over the leading bracket axis: ``sum_b w_b * cube[b]``.
 
     THE OPERATION THAT MAKES THE EXTRAPOLATED Σ A LEGITIMATE HAMILTONIAN.
-    ``weights`` are REAL and sum to 1 under BOTH estimators, and both
-    properties are load-bearing rather than incidental.
-
-    TWO SHAPES, ONE INVARIANT.
-
-    ``(3,)`` — ``band_index_only``.  The ordinary-least-squares coefficients
-    from ``band_extrapolation.extrapolation_weights`` depend only on the three
-    band COUNTS, so this is one fixed affine combination applied identically
-    to every (ω, k, i, j) element.  **This branch is unchanged and is the
-    bit-for-bit path**: it must stay a single ``tensordot`` in exactly this
-    order, because that is what the byte-identity gate against the previous
-    default compares.
+    ``weights`` are REAL and sum to 1, and both properties are load-bearing
+    rather than incidental.
 
     ``(3, nk, nb)`` — ``spectral_shell``.  The estimator solves one exponent
     per EXTERNAL state, so its coefficients carry the state shape.  The Σ
@@ -299,7 +283,7 @@ def _extrapolated_point(cube, weights):
     diagonal (where the estimator is defined and where it was measured) and
     that preserves ``sum_b w_b = 1``.
 
-    Hermiticity survives EITHER shape EXACTLY, not approximately.  Each
+    Hermiticity survives EXACTLY, not approximately.  Each
     cumulative bracket point is Hermitian in (i, j); a real scalar times a
     complex number commutes with conjugation bit-for-bit in IEEE arithmetic;
     ``½(w_i + w_j)`` equals ``½(w_j + w_i)`` to the last bit because IEEE
@@ -307,8 +291,9 @@ def _extrapolated_point(cube, weights):
     same order for element (i, j) and element (j, i).  So
     ``S[j, i] == conj(S[i, j])`` to the last bit, and the next SC iteration's
     eigenvectors stay consistent with its own eigenvalues.
-    ``tests/test_band_extrapolation.py::
-    test_extrapolated_sigma_is_hermitian_to_machine_precision`` is the gate.
+    ``tests/test_band_extrapolation_spectral.py::
+    test_extrapolated_sigma_is_hermitian_to_machine_precision_per_state`` is
+    the gate.
 
     Sharding is restated on the way out for the same reason
     :func:`_band_count_point` restates it: the leading axis is dropped, and
@@ -317,11 +302,11 @@ def _extrapolated_point(cube, weights):
     reduction.
     """
     w = np.asarray(weights, dtype=np.float64)
-    if w.ndim not in (1, 3):
+    if w.ndim != 3:
         raise ValueError(
-            f"_extrapolated_point: weights must be (3,) [band_index_only] or "
-            f"(3, nk, nb) [spectral_shell], got shape {w.shape}")
-    if w.ndim == 3 and w.shape[-1] != int(cube.shape[-1]):
+            f"_extrapolated_point: weights must be the per-state (3, nk, nb) "
+            f"of spectral_shell, got shape {w.shape}")
+    if w.shape[-1] != int(cube.shape[-1]):
         # Per-state weights are fitted on the LOGICAL bands; the cube keeps
         # its padded band carrier, whose extra rows/columns are zero.  Zero
         # weights there keep them zero without stripping the cube.
@@ -360,12 +345,10 @@ def _report_band_extrapolation(
     tail; extrapolating Σ_total would fit a constant as if it converged.
 
     Returns ``(h5_payload, weights)``.  The WEIGHTS come back from here rather
-    than being derived at the call site because under ``spectral_shell`` they
-    are per-state and are a function of the FIT — deriving them twice would be
-    deriving the estimator twice, and the two copies could disagree.  The
-    caller applies them to the Σ cube; ``band_extrapolation.extrapolation_
-    weights`` is still used for ``band_index_only`` so that path stays the
-    identical arithmetic it always was.
+    than being derived at the call site because they are per-state and are a
+    function of the FIT — deriving them twice would be deriving the estimator
+    twice, and the two copies could disagree.  The caller applies them to the
+    Σ cube.
     """
     from .qsgw_utils import extract_sigma_diag_replicated, interp_along_omega
 
@@ -403,30 +386,24 @@ def _report_band_extrapolation(
             diag_w_kn * RYD_TO_EV, omega_grid_ev, omega_eval_ev))
     s_at_counts = np.stack(points)
 
-    # ── WHICH ESTIMATOR ─────────────────────────────────────────────────
-    # Read here and nowhere else.  Both estimators consume the SAME
-    # ``s_at_counts`` produced above, so the fork is post-processing: nothing
-    # about the compute, the brackets or the three points depends on it.
+    # ── THE ESTIMATOR ───────────────────────────────────────────────────
+    # ``spectral_shell`` is the only value the config accepts; it is read
+    # here for the log line below.
     estimator = str(getattr(config.sigma, "band_extrapolation_estimator",
                             BAND_EXTRAPOLATION_ESTIMATOR_DEFAULT))
-    spectral = estimator == "spectral_shell"
-    ladder = None
-    if spectral:
-        # THE LADDER IS DFT-ONLY, AND IT IS BUILT FROM THE WFN'S OWN
-        # EIGENVALUES AND k WEIGHTS — the mean field, never the three Σ
-        # values.  Absolute band indexing (band 1 = the WFN's first band),
-        # because the Weyl counting law counts from the bottom of the band
-        # manifold; ``b0`` carries the Σ sum's offset into it.
-        ladder = build_band_ladder(
-            enk_ry=np.asarray(wfn.energies[0], dtype=np.float64),
-            kweights=np.asarray(wfn.kweights, dtype=np.float64),
-            n_target=plane_wave_band_count(wfn.ngk, int(wfn.nspinor)),
-            b0=int(band_slices.b0),
-        )
-        fit = fit_band_extrapolation_spectral(
-            sigma_omega.band_counts, s_at_counts, ladder)
-    else:
-        fit = fit_band_extrapolation(sigma_omega.band_counts, s_at_counts)
+    # THE LADDER IS DFT-ONLY, AND IT IS BUILT FROM THE WFN'S OWN EIGENVALUES
+    # AND k WEIGHTS — the mean field, never the three Σ values.  Absolute
+    # band indexing (band 1 = the WFN's first band), because the Weyl
+    # counting law counts from the bottom of the band manifold; ``b0``
+    # carries the Σ sum's offset into it.
+    ladder = build_band_ladder(
+        enk_ry=np.asarray(wfn.energies[0], dtype=np.float64),
+        kweights=np.asarray(wfn.kweights, dtype=np.float64),
+        n_target=plane_wave_band_count(wfn.ngk, int(wfn.nspinor)),
+        b0=int(band_slices.b0),
+    )
+    fit = fit_band_extrapolation_spectral(
+        sigma_omega.band_counts, s_at_counts, ladder)
 
     # THE STATES A GW RUN IS FOR.  The band edges, located from the actual
     # eigenvalues over the QP window rather than assumed to sit at index
@@ -447,13 +424,12 @@ def _report_band_extrapolation(
         states.append((f"CBM  k={kc} n={nc + n_occ}  "
                        f"E={unocc[kc, nc]:.4f} eV",
                        (int(kc), int(nc + n_occ))))
-    print_fn((format_spectral_report if spectral
-              else format_extrapolation_report)(plan, fit, states=states))
+    print_fn(format_spectral_report(plan, fit, states=states))
 
     # States without a usable exponent keep S(N3) (``band_extrapolation``,
     # "NO USABLE EXPONENT").  The block above names them; this one line is
     # the count the production log keeps.
-    if spectral and fit.n_failed:
+    if fit.n_failed:
         print_fn("WARNING: " + fit.failure_report().splitlines()[0])
 
     # ── WHAT THIS RUN DOES WITH THE NUMBER ──────────────────────────────
@@ -505,10 +481,7 @@ def _report_band_extrapolation(
 
     # The arrays are already in eV on the band diagonal, which is the unit
     # and the layout ``sigma_mnk.h5`` wants, so no scale is applied here.
-    if spectral:
-        return spectral_h5_payload(plan, fit), fit.weights()
-    return (extrapolation_h5_payload(plan, fit),
-            extrapolation_weights(sigma_omega.band_counts))
+    return spectral_h5_payload(plan, fit), fit.weights()
 
 
 def compute_ppm_sigma_pipeline(
@@ -728,11 +701,10 @@ def compute_ppm_sigma_pipeline(
         # ON: both are replaced at the report seam below.
         #
         # The combination itself happens AFTER the report block below, for
-        # one reason: under ``spectral_shell`` the coefficients ARE the fit,
-        # and the fit is built there.  Deriving them here as well would be
-        # deriving the estimator twice.  Nothing between here and there reads
-        # ``sigma_c_body_omega``, and for ``band_index_only`` the arithmetic
-        # is byte-for-byte what it was when it happened at this line.
+        # one reason: the coefficients ARE the fit, and the fit is built
+        # there.  Deriving them here as well would be deriving the estimator
+        # twice.  Nothing between here and there reads
+        # ``sigma_c_body_omega``.
         sigma_c_body_omega = sigma_c_body_omega_n3
         sigma_c_body_omega_unextrap = None
 

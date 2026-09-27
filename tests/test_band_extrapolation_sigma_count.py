@@ -33,8 +33,8 @@ used, so the ratios are the same too.  Measured:
 0.94 % apart, ``sum(c) == 1`` in both.  A run that brackets the wrong count
 applies a nearly-correct operator to the wrong three partial sums, produces an
 exactly Hermitian Σ (``c`` is real), converges, and prints entirely ordinary
-numbers.  ``trust_verdict`` cannot see it either: it inspects the fit's own
-residual structure, which is self-consistent on the wrong curve.
+numbers.  A residual-based verdict cannot see it either: the fit's own
+residual structure is self-consistent on the wrong curve.
 
 WHAT THIS FILE PINS.  The planner arithmetic against a Σ count that DIFFERS
 from the χ count (§1); the two production call sites reading the Σ-side

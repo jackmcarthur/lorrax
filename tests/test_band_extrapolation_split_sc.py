@@ -285,10 +285,9 @@ def test_the_driving_sigma_is_the_extrapolated_point_of_the_planned_counts():
     fit -- one exponent per external state -- so deriving them at this call
     site as well would derive the estimator twice, and the two copies could
     disagree with nothing to notice.  So the call site must take the weights
-    it was HANDED, and the ``band_index_only`` branch inside the report must
-    still be the same ``extrapolation_weights(sigma_omega.band_counts)`` it
-    always was.  Both halves are asserted; dropping either would let a
-    wrong-count run through exactly as before.
+    it was HANDED, and the fit inside the report must read the PLAN's counts
+    (``sigma_omega.band_counts``).  Both halves are asserted; dropping either
+    would let a wrong-count run through exactly as before.
     """
     path = os.path.join(_SRC, "gw", "ppm_pipeline.py")
     calls = _calls(path, "_extrapolated_point")
@@ -304,9 +303,9 @@ def test_the_driving_sigma_is_the_extrapolated_point_of_the_planned_counts():
             in src_pipe), (
         "the driving weights must come back from the one seam that builds "
         "the fit; anything else is a second derivation of the estimator")
-    assert ("extrapolation_weights(sigma_omega.band_counts)" in src_pipe), (
-        "band_index_only must still apply the OLS coefficients of the PLAN's "
-        "counts -- that is what makes it the same code path under a new name")
+    assert ("sigma_omega.band_counts, s_at_counts, ladder)" in src_pipe), (
+        "the spectral fit must read the PLAN's counts, the same counts the "
+        "cube was bracketed at")
     # ...and band_counts is the PLAN's counts, not a band count re-read from
     # the config or the meta.
     src = open(os.path.join(_SRC, "gw", "ppm_sigma.py"), encoding="utf-8").read()

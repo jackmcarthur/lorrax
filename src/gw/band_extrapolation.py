@@ -1,25 +1,19 @@
 """Band-convergence extrapolation of the correlation self-energy Σ_c.
 
-TWO ESTIMATORS, ONE SET OF THREE POINTS.  Both read the SAME three cumulative
-bracket sums S(N₁), S(N₂), S(N₃) that the τ kernel already produces in one
-pass; they differ only in what they do with them.  The deck selects with
-``band_extrapolation_estimator``:
+ONE ESTIMATOR, THREE POINTS.  It reads the three cumulative bracket sums
+S(N₁), S(N₂), S(N₃) that the τ kernel already produces in one pass.  The deck
+key ``band_extrapolation_estimator`` has one value, ``spectral_shell`` (the
+default since 2026-08-17): solve ONE exponent per external state from the
+ratio of the two observed shell increments against spectral moments of the
+real DFT eigenvalues, then integrate the remaining tail out to the finite
+plane-wave basis.  ``SPECTRAL SHELL ESTIMATOR`` below.
 
-  ``spectral_shell``   **the default since 2026-08-17.**  A spectrum-resolved
-      SHELL estimator: solve ONE exponent per external state from the ratio of
-      the two observed shell increments against spectral moments of the real
-      DFT eigenvalues, then integrate the remaining tail out to the finite
-      plane-wave basis.  ``SPECTRAL SHELL ESTIMATOR`` below.
-  ``band_index_only``  the incumbent two-parameter ``S_∞ + A/N`` least
-      squares.  Kept and selectable, unchanged bit-for-bit; renamed because
-      "1/N" names the only thing it looks at — the band INDEX — and the
-      measurement below is that the band index alone is not enough.
-
-Everything from ``WHAT CONVERGES SLOWLY`` to ``BAND COUNTS, NOT AN ENERGY
-CUTOFF`` describes machinery both estimators share (the brackets, what is held
-fixed across the three points, the counting law, the mode gate) or the
-``band_index_only`` fit and its own history.  Read the two estimator sections
-as the fork.
+The two-parameter ``S_∞ + A/N`` least squares (deck value
+``band_index_only``) was deleted on 2026-09-27 (owner ruling).  Against the
+accurate BANDTRUTH truth it was the worst estimator, 43 / 79 meV median / max
+at N₃ = 152 (sandbox claims 2860, 2866).  A deck that names it refuses by name
+(``gw.gw_config``).  :func:`extrapolation_weights` keeps its three OLS
+coefficients because :func:`static_limit_tail_ruling` still reads them.
 
 WHAT CONVERGES SLOWLY.  Σ_c's intermediate-state sum runs over every band in
 the Green's function,
@@ -30,25 +24,6 @@ and its unoccupied tail decays slowly: the states above the QP window
 contribute a small, same-signed, slowly-vanishing amount that a brute-force
 band count only removes by being enormous.  This module evaluates the SAME
 sum at three band counts in ONE pass and extrapolates instead.
-
-⚠ **THE 1/N LAW THIS MODULE FITS IS NOT THE MEASURED DECAY, AND THE ERROR
-THAT CAUSES IS ONE-SIGNED.  Measured 2026-08-16 — see
-``sandbox:reports/ch_converge_functional_forms_2026-08-16/``.**  On a 508-band
-Si arm the local convergence power climbs monotonically 1.28 → 2.29 across
-N = 100 → 300 and never approaches 1.  The kinematics are fine (the band
-ladder is free-electron to 1 %, and the counting law below reproduces the
-low-N behaviour); the drift is entirely in the matrix elements, whose
-effective falloff ``|M|² ~ E^-a`` runs a = 1.83 at N = 60 to 3.94 at N = 380.
-Because the data decays FASTER than 1/N over the window sampled here, a 1/N
-fit projects more remaining tail than exists and lands BELOW the truth on
-every state at every band count.  Scored against a MEASURED S(508):
-45.8 meV median at N_max = 152, 17.5 at 260, 3.5 at 396, always undershooting.
-
-The form is kept for now because it is what has been validated end to end and
-the replacement is not yet implemented; it is documented here so that no
-reader takes "decays like 1/N" as established.  The screened-Coulomb cutoff
-was tested as the cause and REFUTED (tripling W's G-space moves the exponent
-by ≤ 0.001).
 
 THE THREE POINTS COME FROM DISJOINT BRACKETS, NOT THREE RUNS.  Under the
 default ``band_extrapolation_bracket_scheme = total_fractions``, the band axis
@@ -102,8 +77,8 @@ A fit can therefore have R² = 0.9994 and an intercept 47 meV wrong: the
 residual is set by how well the model tracks a several-hundred-meV rise,
 while the intercept error is set by a small smooth curvature that every point
 in a low window shares.  **No residual, R² or scatter statistic can see it**
-— which is also why ``Δ_model`` alone is not a sufficient diagnostic and why
-:class:`ExtrapolationFit` carries the two SIGNED numbers below beside it.
+— which is also why no residual-based diagnostic can stand in for a
+held-out measurement.
 
 THE DEFAULT FRACTIONS ARE OF THE TOTAL BAND COUNT, NOT OF THE CONDUCTION
 COUNT — and since 2026-08-22 that is a NAMED default
@@ -141,8 +116,8 @@ it has to be said out loud.
 included in the Sigma sum, snaps it to a multiplet-clean boundary, then places
 N2 at the clean rectangular boundary nearest halfway between N1 and N3 in
 ``mean_k E[k,N-1]``.  It does NOT apply a global E_ck mask: every k keeps the
-same static band count.  This changes only cut placement; both estimators
-still use absolute band indices and the full DFT energy ladder.
+same static band count.  This changes only cut placement; the estimator
+still uses absolute band indices and the full DFT energy ladder.
 
 Neither is the default, and that is measured rather than cautious.  On the
 dense Si GN-PPM control, merely reinterpreting 80/90 as conduction fractions
@@ -162,129 +137,9 @@ does not establish a universal band threshold.  Existing decks therefore
 retain their numerical meaning, while production studies can name the new
 scheme and get its resolved cuts in the startup log and HDF5 provenance.
 
-THE FIT HAS EXACTLY TWO FREE PARAMETERS.
-
-    S(N) = S_∞ + A / N_eff,        N_eff = N_occ + N_c = N
-
-fitted by ordinary least squares in 1/N over the three points.  Two
-parameters, and the limit point is 1/N → 0.
-
-**THE THREE-PARAMETER FORMS WERE TESTED AGAINST THE DENSE CURVE AND
-REJECTED.  Do not re-litigate this without new data.**  Against BerkeleyGW's
-``ch_converge.dat`` on the Si 4×4×4 SOC deck at 124 bands, 192 (k, band)
-states, MAE / max error in meV against BGW's own band-converged CH:
-
-    3 points, 2 par, (0.80, 0.90)          14.2 /  26.5     noise ×6.6
-    3 points, 3 par S_∞+A/N+B/N², wide     18.0 /  69.2     noise ×4.7
-    3 points, 3 par, top-weighted          57.5 / 216.9     noise ×112.3
-    4 points, 3 par, wide                  15.5 /  86.5     noise ×4.0
-
-**THE SHIFTED LAW ``S_∞ + A/(N + N₀)`` WAS ALSO TESTED, WITH N₀ FITTED ON
-THE DENSE CURVE AND THEN HELD FIXED** — the move that makes it two
-parameters in production and answers "is there a functional form for the
-crossover from non-1/N to 1/N".  **There is not, on this deck.**  N₀ comes
-out SMALL and NEGATIVE with a large spread and a strong window dependence
-(median −1.5 fitted over [16, 124], drifting to −6.0 over [40, 124], p25/p75
-spanning −7.5…+2), and it does **not** correspond to ``n_val = 8``, to the
-measured bumpy→smooth transition at ``n_cond ≈ 7–10``, or to anything else
-physical.  It is a fitted nuisance, not a crossover scale.
-
-Held fixed at the calibrated value it buys ~15–25 % at LOW fractions and
-essentially nothing where the sampling actually sits: at nband 124,
-(0.50, 0.75) improves 35.3 → 27.6 meV MAE, but (0.80, 0.90) only 14.2 →
-13.7 and its MAX gets WORSE, 26.5 → 31.4.  **And it does not buy the ability
-to sample lower, which was the whole reason to want it**: (0.50, 0.75) with
-N₀ fitted in-sample on this very deck is 27.6 meV, still 2× worse than
-(0.80, 0.90) with N₀ = 0 at 14.2.  Moving the window beats modelling the
-crossover.
-
-**THE NEW DATA THE INJUNCTION ABOVE ASKS FOR NOW EXISTS (2026-08-16), AND IT
-CHANGES TWO OF THESE CONCLUSIONS.**  A 508-band Si arm gives a MEASURED
-S(508), so estimators can be scored held-out instead of against a reference
-that is itself a fit or a model.  Under that protocol:
-
-  * The shifted law was re-searched over ``N₀`` AND the exponent JOINTLY,
-    rather than with the exponent pinned to 1.  ``S_∞ + A/(N + 50)²`` cuts
-    the sliding-window intercept travel 42.7 → 3.9 meV and transfers
-    out-of-sample to a different SCF, cutoff and band count (travel 4.8
-    against 36.4 for 1/N).  It is still NOT shippable — ``N₀ ≈ +50`` has no
-    counterpart in the mean field (the DFT bands give n₀ = 0), and (N₀, q)
-    drifts to ~(110, 3.0) over the extended range — so it is a shape
-    diagnostic, not a form.  But "there is no crossover form on this deck" is
-    too strong as written above; what is true is that no FIXED one describes
-    N = 100…500.
-  * A FOURTH point does not help this estimator.  Held-out against S(508),
-    4 points at (0.70, 0.80, 0.90) are WORSE than 3 at (0.80, 0.90) at every
-    band count (47.8 vs 45.8 at N_max = 152, 20.4 vs 17.5 at 260): the extra
-    sample extends the lever into the region where the form is more wrong,
-    and that costs more than the conditioning gain (noise ×3.5 vs ×5.9) wins.
-    The defensible reason to want a fourth point is a held-out prediction of
-    the fourth shell as an uncertainty estimate — not accuracy.
-
-The replacement is a spectrum-resolved SHELL estimator: fit the per-state
-decay from the ratio of the two observed shell increments against spectral
-moments of the real DFT eigenvalues, then integrate the remaining tail to the
-finite basis endpoint.  Held-out against S(508) it beats this module's
-estimator at every band count, and it needs exactly the three points this
-module already computes.  **It is implemented here now (2026-08-17) and is the
-DEFAULT**; see ``SPECTRAL SHELL ESTIMATOR`` below.
-
-A CALIBRATED BIAS CORRECTION was tested too, and the result is the argument
-for leaving the centre alone.  Scaling the applied correction by an optimal
-``g`` gives g = 0.788 at (nband 76, 0.50/0.75) rising to **g = 0.9885 at the
-shipped (nband 124, 0.80/0.90)**, where the in-sample gain is 14.2 → 13.7
-meV — nothing.  At the recommended fractions the estimator is already
-unbiased; there is no centre left to tune, only an honest bar to report.
-
-The three-parameter form absorbs the curvature and does help at low
-``nband``, but (a) its MAX error is no better, and the worst states are what
-a QP window is judged on; (b) it is catastrophically ill-conditioned at
-exactly the top-weighted spacings the two-parameter form wants — 112× noise
-amplification, against 6.6× — so the two changes fight each other; (c)
-through three points it is an INTERPOLANT: zero residual by construction, no
-third-point check, ``Δ_model`` undefined.  The one respectable variant is a
-FOURTH bracket with a 3-parameter least squares, and it is beaten by three
-points at (0.80, 0.90) while costing another G(τ) build.  ("noise ×" is the
-2-norm of the row of the design-matrix pseudo-inverse that produces S_∞: the
-factor by which an INDEPENDENT per-point error reaches the intercept.  A
-common-mode error passes through 1:1 for every estimator.)
-
-THE DIAGNOSTICS ARE THE POINT — BUT THEY SEE DIFFERENT THINGS.  A
-two-parameter fit through three points always returns a number; whether that
-number means anything is decided by whether the three points are already in
-the asymptotic 1/N regime.  The exact two-point intercepts
-
-    S_∞^(ij) = (N_j·S_j − N_i·S_i) / (N_j − N_i)
-
-are free (they are the closed-form solution of the same model on a pair) and
-if the model held, all three would coincide.  Three numbers are reported and
-they are NOT interchangeable:
-
-``Δ_model`` — the pairwise intercepts' spread about the fit.  A measure of
-    SCATTER.  It sees preasymptotic curvature that makes the three points
-    disagree; **it cannot see a bias the three points share.**  Measured on
-    a clean BerkeleyGW curve at counts (52, 76, 100): ``Δ_model`` median
-    18.8 meV, ratio to ``Δ_tail`` 0.057, verdict ``consistent`` on 100 % of
-    768 state-fits with ZERO sign reversals — while the true intercept error
-    was 55 meV MAE and 167 meV max.  So a passing ratio is necessary and not
-    sufficient, and a ``NOT TRUSTWORTHY`` verdict on a real deck is evidence
-    about the Σ_c being fitted, not about the sampling.
-
-``pair_split`` = S_∞^(1,2) − S_∞^(2,3) — the same information UNSIGNED in
-    ``Δ_model``, kept SIGNED.  Its magnitude bounds the residual curvature
-    and its sign says which way the bias runs, which the absolute value
-    throws away.  8.2–52.1 meV at the old fractions, 2–20 meV at these.
-
-``a_over_n_last`` = A / N₃ — how much correction the model is still applying
-    AT the largest computed point.  A one-sided number: it is large exactly
-    when the sum has not finished, and unlike ``Δ_model`` it does not go
-    quiet when all three points share the same error.
-
-``Δ_tail`` — how far the extrapolation moved the largest computed point.
-    The size of the correction, not its error.
-
 SPECTRAL SHELL ESTIMATOR — THE DEFAULT SINCE 2026-08-17.  The band index is
-the wrong variable and the section above says so with a measurement: the local
+the wrong variable, and that was measured (2026-08-16,
+``sandbox:reports/ch_converge_functional_forms_2026-08-16/``): the local
 convergence power climbs 1.28 → 2.29 over N = 100 → 300 because the MATRIX
 ELEMENTS fall off, and their falloff is a property of the ENERGY the
 intermediate state sits at, not of its position in a list.  So use the
@@ -374,16 +229,16 @@ than β = 40 reaches on a ladder whose 8-band Weyl fit (R² = 0.70) puts E₀
 
 MEASURED, HELD OUT, AGAINST A NUMBER BERKELEYGW COMPUTED.  The 508-band Si arm
 (50 Ry, ``sandbox:reports/band_tail_exponent_50ry_2026-08-16/``) gives a
-MEASURED ``S(508)``, so both estimators can be scored on data neither fitted.
+MEASURED ``S(508)``, so the estimator can be scored on data it never fitted.
 Median |error| over the 28 Fermi-window states, in meV:
 
-    N_max      band_index_only      spectral_shell
-    -------------------------------------------------
-    152             45.8                  4.7
-    204             29.7                 14.7
-    260             17.5                 12.5
-    296             12.6                  0.7
-    396              3.5                  0.0
+    N_max      spectral_shell
+    --------------------------
+    152             4.7
+    204            14.7
+    260            12.5
+    296             0.7
+    396             0.0
 
 β came out 3.4–5.3 across those rungs, independently consistent with ``a + 1``
 from the dense increment fit (a = 1.83 → 3.94), which is the check that it is
@@ -1129,9 +984,9 @@ def assert_brackets_match_ols_abscissae(plan: BandBracketPlan, slices, *,
     — 0.94 % apart at the largest coefficient, and ``sum(c) == 1`` in both.
     So a run that brackets the WRONG count applies a nearly-correct operator
     to the wrong three partial sums.  ``c`` is still real, so Σ_∞ is still
-    exactly Hermitian; the SC loop still converges; ``trust_verdict`` still
-    reads ordinary, because it inspects the fit's own residual structure and
-    that structure is self-consistent on the wrong curve.  There is no
+    exactly Hermitian; the SC loop still converges; a residual-based verdict
+    still reads ordinary, because the fit's own residual structure is
+    self-consistent on the wrong curve.  There is no
     downstream check that can see it.  Only the site where the plan meets the
     band axis it will slice can, which is why this is called there.
 
@@ -1268,189 +1123,16 @@ def assert_brackets_match_ols_abscissae(plan: BandBracketPlan, slices, *,
 #  The fit
 # ---------------------------------------------------------------------------
 
-@dataclass(frozen=True)
-class ExtrapolationFit:
-    """Result of the two-parameter 1/N fit, plus its quality diagnostics.
-
-    Every array field carries the CALLER's trailing shape (e.g. ``(nk, nb)``
-    for a band-diagonal Σ_c); only the leading three-point axis is consumed.
-    """
-
-    counts: np.ndarray            # (3,) int   — N₁, N₂, N₃
-    s_at_counts: np.ndarray       # (3, ...)   — S(N₁), S(N₂), S(N₃)
-    s_inf: np.ndarray             # (...)      — least-squares intercept
-    amplitude: np.ndarray         # (...)      — A, the 1/N coefficient
-    pair_s_inf: dict              # {(i, j): (...)} exact two-point intercepts
-    delta_tail: np.ndarray        # (...)      |S_∞^fit − S₃|
-    delta_model: np.ndarray       # (...)      max_ij |S_∞^(ij) − S_∞^fit|
-    residual: np.ndarray          # (...)      max_i |S_i − model(N_i)|
-
-    # ── THE TWO SIGNED, ONE-SIDED DIAGNOSTICS ───────────────────────────
-    # Derived rather than stored: both are exact functions of fields the fit
-    # already carries, so ``at()`` restricts them for free and there is no
-    # second place that can go stale.  See the module docstring for what
-    # each one can and cannot see; the short version is that ``delta_model``
-    # is a SCATTER metric and is blind to an error the three points share,
-    # which is the error that actually dominates.
-
-    @property
-    def pair_split(self) -> np.ndarray:
-        """S_∞^(1,2) − S_∞^(2,3), SIGNED.
-
-        The same information ``delta_model`` reduces to an absolute value.
-        Its magnitude bounds the residual curvature; its sign says which way
-        the preasymptotic bias runs, and the sign is the half that says
-        whether the extrapolation is over- or under-correcting.
-        """
-        return self.pair_s_inf[(0, 1)] - self.pair_s_inf[(1, 2)]
-
-    def uncertainty(self, quantile: str = "p90") -> np.ndarray:
-        """Extrapolation uncertainty as a fraction of the applied correction.
-
-        ``|S_inf - S_true| <~ f * Delta_tail`` with ``f`` from
-        :data:`TAIL_UNCERTAINTY_FRACTION` — an ENVELOPE calibrated against
-        BerkeleyGW on one deck, not a per-state error bar (there is no
-        working per-state predictor; see the constant's comment for the
-        R² <= 0 measurement that rules the obvious candidates out).
-
-        Extrapolation only.  Not the difference from BerkeleyGW, not the
-        ISDF basis, not the W-side band count.
-        """
-        p90, p99 = TAIL_UNCERTAINTY_FRACTION
-        f = {"p90": p90, "p99": p99}[quantile]
-        return f * np.abs(self.delta_tail)
-
-    @property
-    def a_over_n_last(self) -> np.ndarray:
-        """A / N₃ — the correction the model is still applying AT the last point.
-
-        One-sided: large exactly when the band sum has not finished.  Unlike
-        ``delta_model`` it does not go quiet when all three points carry the
-        same error, which is why it is reported beside it rather than
-        instead of it.
-        """
-        return self.amplitude / float(self.counts[-1])
-
-    def at(self, index) -> "ExtrapolationFit":
-        """Restrict every field to a subset of the trailing state axes.
-
-        The fit is elementwise in (k, band) — every state has its own two
-        parameters — so a subset of it IS the fit of that subset, and this is
-        an indexing operation rather than a refit.  It exists because an
-        aggregate over ALL states is the wrong summary: Σ_c at the top of the
-        QP window is both large and the worst-converged thing in the run, so
-        a max over (k, band) reports that state's tail as if it were the
-        calculation's, and its verdict as if it were the calculation's.  The
-        states a GW run is FOR are the band edges.
-        """
-        # ``index`` addresses the TRAILING state axes; ``s_at_counts`` has the
-        # three-point axis in front of them, so the tuple has to be SPLICED
-        # after a full slice, not passed as one more index.  Wrapping it
-        # instead — ``[(slice(None), index)]`` — makes numpy read a (k, n)
-        # pair as fancy indexing along axis 1 and returns a (3, 2) array where
-        # a scalar was meant; that reached a driver run.
-        idx = index if isinstance(index, tuple) else (index,)
-        return ExtrapolationFit(
-            counts=self.counts,
-            s_at_counts=self.s_at_counts[(slice(None),) + idx],
-            s_inf=self.s_inf[index],
-            amplitude=self.amplitude[index],
-            pair_s_inf={k: v[index] for k, v in self.pair_s_inf.items()},
-            delta_tail=self.delta_tail[index],
-            delta_model=self.delta_model[index],
-            residual=self.residual[index],
-        )
-
-
-def fit_band_extrapolation(
-    counts, s_at_counts: np.ndarray) -> ExtrapolationFit:
-    """Ordinary least squares of ``S(N) = S_∞ + A/N`` over three points.
-
-    Parameters
-    ----------
-    counts : sequence of int, length 3
-        ``N_eff`` at each point.  ``N_eff = N_occ + N_c`` is just the total
-        band count of the sum, which is what the brackets cumulate to.
-    s_at_counts : (3, ...) complex array
-        The CUMULATIVE bracket sums — S(N₁), S(N₂), S(N₃) — with any
-        trailing shape.  Complex is carried through: the model is linear, so
-        fitting the complex value is exactly fitting Re and Im separately.
-
-    Returns
-    -------
-    ExtrapolationFit
-    """
-    N = np.asarray(counts, dtype=np.float64)
-    S = np.asarray(s_at_counts)
-    # EXACTLY three, not ">= 2".  The fit itself is well posed on two points,
-    # but every consumer indexes the (1, 2) pair by name — ``pair_split``,
-    # ``trust_verdict``, the log block, the h5 payload — so a two-point fit
-    # CONSTRUCTS and then dies with ``KeyError((1, 2))`` at whichever consumer
-    # runs first.  Verified 2026-08-16.  Refusing here turns a confusing
-    # downstream crash into a statement about the input.
-    if N.ndim != 1 or N.size != 3:
-        raise ValueError(
-            f"fit_band_extrapolation: need exactly 3 counts, got {N}.  "
-            f"The two-parameter fit needs three points to have a residual at "
-            f"all, and the diagnostics are built on the three pairwise "
-            f"intercepts.")
-    if S.shape[0] != N.size:
-        raise ValueError(
-            f"fit_band_extrapolation: S leading axis {S.shape[0]} != "
-            f"{N.size} counts")
-
-    x = 1.0 / N                                   # the regressor
-    n = float(N.size)
-    xbar = float(np.mean(x))
-    # Ordinary least squares, written out rather than via lstsq so the
-    # broadcast over the trailing (k, band) axes is explicit and allocation
-    # free.  Sxx is a scalar; the covariance carries the trailing shape.
-    Sxx = float(np.sum((x - xbar) ** 2))
-    if Sxx <= 0.0:
-        raise ValueError(
-            "fit_band_extrapolation: the three band counts are degenerate "
-            f"in 1/N ({N}) — no slope is determined.")
-    xb = x.reshape((-1,) + (1,) * (S.ndim - 1))
-    Sbar = np.mean(S, axis=0)
-    Sxy = np.sum((xb - xbar) * (S - Sbar), axis=0)
-    A = Sxy / Sxx
-    s_inf = Sbar - A * xbar
-
-    pair = {}
-    for i in range(N.size):
-        for j in range(i + 1, N.size):
-            # Exact two-point solution of the same model:
-            #   N_j·S_j − N_i·S_i = (N_j − N_i)·S_∞
-            pair[(i, j)] = (N[j] * S[j] - N[i] * S[i]) / (N[j] - N[i])
-
-    model = s_inf[None, ...] + A[None, ...] * xb
-    residual = np.max(np.abs(S - model), axis=0)
-    delta_tail = np.abs(s_inf - S[-1])
-    delta_model = np.max(
-        np.abs(np.stack([p - s_inf for p in pair.values()], axis=0)), axis=0)
-
-    return ExtrapolationFit(
-        counts=np.asarray(N, dtype=np.int64),
-        s_at_counts=S,
-        s_inf=s_inf,
-        amplitude=A,
-        pair_s_inf=pair,
-        delta_tail=delta_tail,
-        delta_model=delta_model,
-        residual=residual,
-    )
-
-
 def extrapolation_weights(counts) -> np.ndarray:
     """The REAL coefficients ``c`` with ``S_inf = sum_i c_i * S(N_i)``.
 
-    WHY THIS EXISTS SEPARATELY FROM :func:`fit_band_extrapolation`.  That
-    function fits the band DIAGONAL and returns diagnostics; this one returns
-    the three numbers that let a caller apply the same fit to an object it
-    would be absurd to run a regression on — the full ``(nomega, nk, nb, nb)``
-    Σ_c cube that becomes the QP Hamiltonian.  Both are the SAME estimator,
-    and ``tests/test_band_extrapolation.py::
-    test_weights_reproduce_the_fit_intercept`` pins them together so the
+    The OLS coefficients of ``S_∞ + A/N`` in ``x = 1/N``.  The estimator
+    that applied them to Σ (``band_index_only``) was deleted on 2026-09-27;
+    :func:`static_limit_tail_ruling` still reads them to size the static tail
+    a 1/N limit would omit, and ``tests/test_band_extrapolation_split_sc.py``
+    uses them to show a wrong bracket count is invisible in the weights.
+    Historical note on the original pairing, kept for the argument below: the
+    weights and the diagonal fit were pinned together so the
     number the log reports and the number that drives the iteration cannot
     drift apart.
 
@@ -1484,7 +1166,7 @@ def extrapolation_weights(counts) -> np.ndarray:
     Parameters
     ----------
     counts : sequence of int, length 3
-        ``N_eff`` at each point, as in :func:`fit_band_extrapolation`.
+        ``N_eff`` at each point.
 
     Returns
     -------
@@ -1493,9 +1175,7 @@ def extrapolation_weights(counts) -> np.ndarray:
     N = np.asarray(counts, dtype=np.float64)
     if N.ndim != 1 or N.size != 3:
         raise ValueError(
-            f"extrapolation_weights: need exactly 3 counts, got {N}.  Same "
-            f"requirement as fit_band_extrapolation -- the two must describe "
-            f"the same estimator.")
+            f"extrapolation_weights: need exactly 3 counts, got {N}.")
     x = 1.0 / N
     xbar = float(np.mean(x))
     Sxx = float(np.sum((x - xbar) ** 2))
@@ -1516,12 +1196,10 @@ def extrapolation_weights(counts) -> np.ndarray:
 #: The band-convergence estimators a deck may select, and the default.
 #:
 #: ``spectral_shell`` is the default since 2026-08-17 (owner ruling): held out
-#: against a MEASURED S(508) it beats ``band_index_only`` at every band count
-#: on the Si 50 Ry arm — see the module docstring for the table.
-#: ``band_index_only`` is the incumbent ``S_∞ + A/N`` least squares under its
-#: honest name; it is kept, selectable, and bit-for-bit what it always was.
-BAND_EXTRAPOLATION_ESTIMATORS: tuple[str, ...] = (
-    "spectral_shell", "band_index_only")
+#: against a MEASURED S(508) it beat the 1/N fit at every band count on the
+#: Si 50 Ry arm.  ``band_index_only`` (that fit) was deleted 2026-09-27 and
+#: refuses by name in ``gw.gw_config``.
+BAND_EXTRAPOLATION_ESTIMATORS: tuple[str, ...] = ("spectral_shell",)
 BAND_EXTRAPOLATION_ESTIMATOR_DEFAULT: str = "spectral_shell"
 
 #: Bracket for the per-state exponent β, and how the root is located in it.
@@ -2025,8 +1703,8 @@ def solve_shell_exponents(ladder: BandLadder, shell2, shell3, ratio):
 class SpectralShellFit:
     """Result of the spectrum-resolved shell estimator.
 
-    Elementwise in the trailing (k, band) state axes, exactly as
-    :class:`ExtrapolationFit` is — every external state carries its own β and
+    Elementwise in the trailing (k, band) state axes — every external state
+    carries its own β and
     its own tail ratio, which is the whole point (see the module docstring's
     ruling on pooling).
     """
@@ -2069,9 +1747,9 @@ class SpectralShellFit:
     def uncertainty(self, quantile: str = "p90") -> np.ndarray:
         """Extrapolation uncertainty as a fraction of the applied correction.
 
-        THE FRACTION IS THE ONE CALIBRATED FOR ``band_index_only`` and it has
-        NOT been re-calibrated here.  It is carried so the h5 payload and the
-        SC-tolerance block keep the same shape under both estimators, and it
+        THE FRACTION IS THE ONE CALIBRATED FOR THE DELETED 1/N FIT and it
+        has NOT been re-calibrated here.  It is carried so the h5 payload and the
+        SC-tolerance block keep their four-array shape, and it
         is an ENVELOPE, not a per-state bar — see
         :data:`TAIL_UNCERTAINTY_FRACTION`.  Because ``spectral_shell`` applies
         a SMALLER correction where it is more accurate, this bar is
@@ -2086,8 +1764,7 @@ class SpectralShellFit:
         """Restrict every field to a subset of the trailing state axes.
 
         An indexing operation, not a refit: the estimator is elementwise in
-        (k, band).  Same splice discipline as :meth:`ExtrapolationFit.at` —
-        ``s_at_counts`` carries the three-point axis in front.
+        (k, band).  ``s_at_counts`` carries the three-point axis in front.
         """
         idx = index if isinstance(index, tuple) else (index,)
         return SpectralShellFit(
@@ -2252,7 +1929,7 @@ def fit_band_extrapolation_spectral(
 def spectral_trust_verdict(fit: SpectralShellFit) -> str:
     """One line saying whether the shell ratios support a local power law.
 
-    Unlike :func:`trust_verdict` there is no residual to inspect: the
+    There is no residual to inspect: the
     estimator has one unknown and two shells, so it is an interpolant of the
     ratio by construction and a "fit quality" number would be identically
     zero.  What CAN be reported is (a) whether every state solved at all, and
@@ -2275,68 +1952,17 @@ def spectral_trust_verdict(fit: SpectralShellFit) -> str:
             f"quality metric.{no_tail}")
 
 
-def trust_verdict(fit: ExtrapolationFit, *, ratio_warn: float = 0.35) -> str:
-    """One line saying whether the three points support the 1/N model.
-
-    Two failure signatures, both read off the REAL part (the part that moves
-    a QP energy):
-
-    * **sign reversal** — the (1,2) and (2,3) intervals imply corrections of
-      opposite sign, i.e. the sum is not monotonically approaching anything
-      on this range;
-    * **Δ_model comparable to Δ_tail** — the pairwise intercepts disagree by
-      an appreciable fraction of the correction being applied, so the fitted
-      correction is smaller than its own model error.
-
-    Reported as prose, not as a refusal: the numbers are the product, and a
-    run that stops on a soft quality metric would be worse than one that
-    prints the metric.
-
-    ``ratio_warn = 0.35`` IS NOT A MEASURED THRESHOLD.  Every other constant
-    in this module carries a provenance paragraph; this one does not, and it
-    should be read as a round number chosen to sit well above the 0.057 ratio
-    measured on a clean curve (module docstring) and well below 1.  Nothing
-    has calibrated where between those it belongs, and the docstring's own
-    warning applies with full force: a passing ratio was measured to coexist
-    with a 55 meV MAE / 167 meV max intercept error, so tightening this number
-    would not have caught that and loosening it would not have missed it.
-    Treat a verdict as a statement about SCATTER only.
-    """
-    d_tail = float(np.max(np.abs(np.real(fit.delta_tail))))
-    d_model = float(np.max(np.abs(np.real(fit.delta_model))))
-    a12 = np.real(fit.pair_s_inf[(0, 1)] - fit.s_at_counts[1])
-    a23 = np.real(fit.pair_s_inf[(1, 2)] - fit.s_at_counts[2])
-    reversed_sign = bool(np.any(np.sign(a12) * np.sign(a23) < 0))
-    ratio = d_model / d_tail if d_tail > 0.0 else float("inf")
-
-    if reversed_sign:
-        return (f"NOT TRUSTWORTHY — the (1,2) and (2,3) intervals imply "
-                f"corrections of OPPOSITE SIGN on at least one state: the "
-                f"band sum is not monotone in 1/N over these counts, so the "
-                f"extrapolation is not measuring a tail.")
-    if ratio > ratio_warn:
-        return (f"NOT TRUSTWORTHY — Δ_model/Δ_tail = {ratio:.2f} > "
-                f"{ratio_warn:.2f}: the pairwise intercepts disagree by an "
-                f"appreciable fraction of the correction, so these three "
-                f"counts do not resolve the 1/N tail.  Use more bands.")
-    return (f"consistent — Δ_model/Δ_tail = {ratio:.2f}; the three pairwise "
-            f"intercepts agree to well within the applied correction.")
-
-
 def tolerance_bar_ev(fit, quantile: str = "p90") -> tuple:
     """``(median, max)`` of the extrapolation uncertainty over all states, eV.
 
-    Takes EITHER fit type.  Both :class:`ExtrapolationFit` and
-    :class:`SpectralShellFit` expose ``uncertainty(quantile)`` as a fraction
-    of their own ``Delta_tail``, and that is the only thing this reads — so
-    the SC-tolerance block below is one code path under both estimators
-    rather than two that could drift.
+    :class:`SpectralShellFit` exposes ``uncertainty(quantile)`` as a fraction
+    of its own ``Delta_tail``, and that is the only thing this reads.
 
     Two numbers because they answer different questions and the module has a
     standing rule against reporting the max alone: a max over (k, band) is set
     by the top of the QP window, whose Σ_c is the largest and least converged
     quantity in the run, so it describes that state rather than the
-    calculation (see :meth:`ExtrapolationFit.at`).  The MEDIAN is the bar on a
+    calculation.  The MEDIAN is the bar on a
     typical state and is what the ruling below triggers on; the MAX is quoted
     beside it as the envelope.
     """
@@ -2348,7 +1974,7 @@ def sc_tolerance_ruling(fit, tol_ev: float,
                         *, quantile: str = "p90") -> tuple:
     """Is the SC convergence tolerance inside the extrapolation's own bar?
 
-    Takes either fit type; see :func:`tolerance_bar_ev`.
+    See :func:`tolerance_bar_ev`.
 
     Returns ``(inside: bool, text: str)``.  ``text`` is always a block worth
     printing; ``inside`` says whether it is a warning or a statement.
@@ -2457,7 +2083,7 @@ STATIC_LIMIT_TAIL_FLOOR_EV: float = 1.0e-4
 
 
 def static_limit_tail_ruling(
-    fit: ExtrapolationFit,
+    fit: SpectralShellFit,
     static_coh_at_counts,
     *,
     quantile: str = "p90",
@@ -2485,7 +2111,7 @@ def static_limit_tail_ruling(
     static term into bracket 0 ONLY, so it is a CONSTANT on the band-sum
     series.  This estimator is affine with ``sum(c) == 1``, so a constant
     passes into ``S_inf`` exactly 1:1 and contributes NOTHING to ``A``,
-    ``Δ_tail``, ``Δ_model``, the residual or :func:`trust_verdict`.  That is
+    ``Δ_tail`` or β.  That is
     equivalent to extrapolating the dynamical part alone and adding the static
     part back afterwards, which is the correct treatment and is what the
     anti-convergence measurement demands.  Band-resolving the term — making
@@ -2618,24 +2244,9 @@ def static_limit_tail_ruling(
 
 
 #: Dataset names the fit contributes to ``sigma_mnk.h5``, all ``(nk, nb)``
-#: band-diagonal and all in eV — the same unit and the same band diagonal as
-#: ``sigma_c_kij_ev``'s, evaluated at the same E_nk on the same ω grid.
-EXTRAP_DATASETS = (
-    "sigma_c_extrap_inf_kn_ev",     # S_∞, the extrapolated Σ_c
-    "sigma_c_extrap_last_kn_ev",    # S(N₃), the ordinary full-band Σ_c
-    "sigma_c_extrap_ampl_kn_ev",    # A, the 1/N coefficient
-    "sigma_c_extrap_sigma_kn_ev",   # the p90 uncertainty envelope
-)
-
-#: The same, for ``spectral_shell``.  THREE OF THE FOUR NAMES ARE SHARED, and
-#: the fourth is DIFFERENT ON PURPOSE.  ``inf``, ``last`` and ``sigma`` mean
-#: the same thing under both estimators, so a consumer that reads the
-#: extrapolated Σ_c, the un-extrapolated one and the bar needs no fork.  But
-#: ``ampl`` is ``A``, the coefficient of ``1/N`` — a quantity the spectral
-#: estimator does not have and must not appear to have.  Writing β into a
-#: dataset named ``ampl`` would silently redefine a shipped array; the
-#: estimator-specific fourth name is how a reader can tell which estimator
-#: produced the file even without reading the ``estimator`` attribute.
+#: band-diagonal and in eV except β.  The deleted 1/N fit wrote
+#: ``sigma_c_extrap_ampl_kn_ev`` (its ``A``) in β's place; β has its own name
+#: so an old file cannot be read as a new one.
 SPECTRAL_EXTRAP_DATASETS = (
     "sigma_c_extrap_inf_kn_ev",     # Ŝ, the extrapolated Σ_c
     "sigma_c_extrap_last_kn_ev",    # S(N₃), the ordinary full-band Σ_c
@@ -2645,7 +2256,7 @@ SPECTRAL_EXTRAP_DATASETS = (
 
 
 def _bracket_h5_attrs(plan: BandBracketPlan) -> dict:
-    """Artifact provenance shared by both estimators.
+    """Artifact provenance for the estimator's h5 payload.
 
     ``bracket_fractions`` stays for compatibility, but is empty when fractions
     did not select the cuts.  Writing 0.80/0.90 for the conduction-coordinate
@@ -2667,7 +2278,7 @@ def _bracket_h5_attrs(plan: BandBracketPlan) -> dict:
 
 
 def _bracket_geometry_text(plan: BandBracketPlan) -> str:
-    """One log spelling of the planner semantics for both estimators."""
+    """One log spelling of the planner semantics."""
     if plan.bracket_scheme == "total_fractions":
         return (f"fractions = {BRACKET_FRACTIONS} of the TOTAL band count "
                 f"{plan.counts[-1]}")
@@ -2702,8 +2313,7 @@ def spectral_h5_payload(plan: BandBracketPlan, fit: SpectralShellFit,
                         *, scale: float = 1.0) -> dict:
     """``sigma_mnk.h5``'s payload for a ``spectral_shell`` run.
 
-    The same four-array contract :func:`extrapolation_h5_payload` documents,
-    with β in place of the 1/N amplitude — see
+    Four arrays, with β in place of the deleted 1/N fit's amplitude — see
     :data:`SPECTRAL_EXTRAP_DATASETS` for why the name changes rather than the
     meaning of an existing one.  ``β`` is dimensionless, so ``scale`` (a unit
     conversion) is deliberately NOT applied to it.
@@ -2862,7 +2472,7 @@ def format_spectral_report(
         f"right.",
         f"       The +/- is {100*TAIL_UNCERTAINTY_FRACTION[0]:.0f} % / "
         f"{100*TAIL_UNCERTAINTY_FRACTION[1]:.0f} % of Delta_tail -- the "
-        f"envelope CALIBRATED FOR band_index_only AND NOT RE-DERIVED HERE.  "
+        f"envelope CALIBRATED FOR THE DELETED 1/N FIT AND NOT RE-DERIVED HERE.  "
         f"Held out against a measured S(508) this estimator's median error "
         f"is 3-10x smaller than that one's, so the bar is conservative on "
         f"the states that test covered and unmeasured on the rest.  It "
@@ -2874,165 +2484,11 @@ def format_spectral_report(
     return "\n".join(lines)
 
 
-def extrapolation_h5_payload(plan: BandBracketPlan, fit: ExtrapolationFit,
-                             *, scale: float = 1.0) -> dict:
-    """The arrays and attributes ``sigma_mnk.h5`` should carry for this fit.
-
-    WHY THIS EXISTS.  Until 2026-08-15 the fitted ``S_∞`` was PRINTED and
-    written nowhere, so a run with the feature ON and one with it OFF
-    produced byte-identical artifacts — ``sigma_diag.dat`` identical, every
-    dataset of ``sigma_mnk.h5`` identical to 8e-15 — while the log reported
-    an 848 meV correction at the VBM.  The feature's entire output lived in
-    a log line: it could not be gated, diffed, regression-tested, or
-    consumed downstream, and a star-spread test on the written Σ passed
-    VACUOUSLY because it was measuring the un-extrapolated cube.
-
-    Four ``(nk, nb)`` arrays go in, not one.  ``S_∞`` alone tells a reader
-    the answer but not how far it moved or whether to believe it, and the
-    other three are already computed: ``S(N₃)`` is the un-extrapolated value
-    at the same states (so the correction is a subtraction, not a
-    reconstruction), ``A`` is how much correction is still being applied at
-    the largest count, and the uncertainty is the envelope from
-    :data:`TAIL_UNCERTAINTY_FRACTION`.
-
-    The verdict and the band counts ride as ATTRIBUTES rather than arrays:
-    they are per-run, not per-state.
-    """
-    def _arr(a):
-        return np.asarray(a, dtype=np.complex128) * scale
-
-    return {
-        "arrays": {
-            "sigma_c_extrap_inf_kn_ev": _arr(fit.s_inf),
-            "sigma_c_extrap_last_kn_ev": _arr(fit.s_at_counts[-1]),
-            "sigma_c_extrap_ampl_kn_ev": _arr(fit.amplitude),
-            "sigma_c_extrap_sigma_kn_ev": _arr(fit.uncertainty("p90")),
-        },
-        "attrs": {
-            "band_counts": np.asarray(plan.counts, dtype=np.int64),
-            "band_counts_requested": np.asarray(plan.requested,
-                                                dtype=np.int64),
-            **_bracket_h5_attrs(plan),
-            "n_occ": int(plan.n_occ),
-            "n_cond": int(plan.n_cond),
-            "uncertainty_fraction_p90_p99": np.asarray(
-                TAIL_UNCERTAINTY_FRACTION, dtype=np.float64),
-            "verdict": str(trust_verdict(fit)),
-            "planner_notes": " | ".join(plan.notes) if plan.notes else "",
-        },
-    }
-
-
-def format_extrapolation_report(
-    plan: BandBracketPlan,
-    fit: ExtrapolationFit,
-    *,
-    states: "list[tuple[str, object]] | None" = None,
-    label: str = "Sigma_c",
-    unit: str = "eV",
-    scale: float = 1.0,
-) -> str:
-    """The log block.  Numbers first; the layout is deliberately not final.
-
-    The requirement this satisfies is that ONE log carries the full-band
-    value and the extrapolated value side by side, with the three band
-    counts, the fit parameters and every diagnostic — unambiguously, and
-    without the reader having to reconstruct anything.
-
-    ``states`` is ``[(label, index), ...]``: the individual (k, band) states
-    to report in full, each on its own row with SIGNED values, plus its own
-    verdict.  The aggregate row that follows is a max over every state and is
-    deliberately labelled as an envelope, not as a result — on a real deck it
-    is dominated by the top of the QP window, whose Σ_c is both the largest
-    and the least converged quantity in the run.
-    """
-    def _sg(a):
-        return float(np.real(np.asarray(a))) * scale
-
-    def _mx(a):
-        return float(np.max(np.abs(np.real(np.asarray(a))))) * scale
-
-    geometry = _bracket_geometry_text(plan)
-    lines = [
-        f"  -- {label} band-convergence extrapolation "
-        f"(S(N) = S_inf + A/N, 2 parameters, 3 points) --",
-        f"     N_occ = {plan.n_occ}   N_cond = {plan.n_cond}   {geometry}",
-    ]
-    lines.extend(_bracket_report_lines(plan, unit))
-
-    for slabel, index in (states or []):
-        f1 = fit.at(index)
-        lines += [
-            f"     [{slabel}]",
-            f"       S(N1={plan.counts[0]}) = {_sg(f1.s_at_counts[0]):+12.6f}   "
-            f"S(N2={plan.counts[1]}) = {_sg(f1.s_at_counts[1]):+12.6f}   "
-            f"S(N3={plan.counts[2]}) = {_sg(f1.s_at_counts[2]):+12.6f} {unit}",
-            f"       S(N3) [full {plan.counts[-1]}-band Sigma_c] = "
-            f"{_sg(f1.s_at_counts[-1]):+12.6f} {unit}   ->   "
-            f"S_inf = {_sg(f1.s_inf):+12.6f} {unit}   "
-            f"(A = {_sg(f1.amplitude):+.4f} {unit}*band)",
-            f"       S_inf^(12) = {_sg(f1.pair_s_inf[(0, 1)]):+12.6f}   "
-            f"S_inf^(23) = {_sg(f1.pair_s_inf[(1, 2)]):+12.6f}   "
-            f"S_inf^(13) = {_sg(f1.pair_s_inf[(0, 2)]):+12.6f} {unit}",
-            f"       Delta_tail = {_mx(f1.delta_tail):.6f} {unit}   "
-            f"Delta_model = {_mx(f1.delta_model):.6f} {unit}   "
-            f"residual = {_mx(f1.residual):.3e} {unit}",
-            f"       pair_split = {_sg(f1.pair_split):+12.6f} {unit}   "
-            f"A/N3 = {_sg(f1.a_over_n_last):+12.6f} {unit}   "
-            f"(both SIGNED -- see below)",
-            f"       S_inf = {_sg(f1.s_inf):+.6f} +/- "
-            f"{_mx(f1.uncertainty('p90')):.6f} (p90) / "
-            f"{_mx(f1.uncertainty('p99')):.6f} (p99) {unit}"
-            f"   <- EXTRAPOLATION uncertainty only",
-            f"       verdict: {trust_verdict(f1)}",
-        ]
-
-    lines += [
-        f"     [envelope over ALL (k, band) of the QP window -- an upper "
-        f"bound, NOT the result: it is set by the top of the window, whose "
-        f"Sigma_c is the least converged quantity in the run]",
-        f"       max|S(N3)| = {_mx(fit.s_at_counts[-1]):.6f}   "
-        f"max|S_inf| = {_mx(fit.s_inf):.6f} {unit}",
-        f"       max Delta_tail = {_mx(fit.delta_tail):.6f} {unit}   "
-        f"max Delta_model = {_mx(fit.delta_model):.6f} {unit}   "
-        f"max residual = {_mx(fit.residual):.3e} {unit}",
-        f"       max |pair_split| = {_mx(fit.pair_split):.6f} {unit}   "
-        f"max |A/N3| = {_mx(fit.a_over_n_last):.6f} {unit}",
-        f"       verdict: {trust_verdict(fit)}",
-        # WHAT EACH DIAGNOSTIC CAN AND CANNOT SEE.  Printed rather than left
-        # to the docstring because the verdict line above is what an operator
-        # reads, and a "consistent" that is necessary-but-not-sufficient has
-        # to say so where it is read.  Measured on a clean BerkeleyGW curve:
-        # verdict "consistent" on 100 % of 768 state-fits, zero sign
-        # reversals, while the true intercept error was 55 meV MAE / 167 max.
-        f"     [reading these] Delta_model is a SCATTER metric: it sees the "
-        f"three points DISAGREEING, and is blind to an error they SHARE -- "
-        f"which is the error that dominates.  A 'consistent' verdict is "
-        f"necessary, not sufficient.",
-        f"       pair_split is Delta_model kept SIGNED: its sign says which "
-        f"way the preasymptotic bias runs (negative => the fit is "
-        f"over-correcting).  A/N3 is one-sided: it is the correction still "
-        f"being applied at the largest band count, and stays loud when "
-        f"Delta_model goes quiet.",
-        f"       Both shrink when the sampling moves up the band range; "
-        f"neither is a substitute for raising nband when A/N3 is comparable "
-        f"to the accuracy you need.",
-        f"       The +/- is {100*TAIL_UNCERTAINTY_FRACTION[0]:.0f} % / "
-        f"{100*TAIL_UNCERTAINTY_FRACTION[1]:.0f} % of Delta_tail -- an "
-        f"ENVELOPE calibrated against BerkeleyGW on one deck, NOT a per-state "
-        f"bar (no per-state predictor works: R^2 <= 0 for all four numbers "
-        f"above).  It covers the EXTRAPOLATION only -- not the difference "
-        f"from BerkeleyGW, the ISDF basis, or the W-side band count.",
-    ]
-    return "\n".join(lines)
-
-
 __all__ = [
     "BRACKET_FRACTIONS",
     "BRACKET_SCHEMES",
     "BRACKET_SCHEME_DEFAULT",
     "CONDUCTION_HALF_FRACTION",
-    "EXTRAP_DATASETS",
     "SPECTRAL_EXTRAP_DATASETS",
     "TAIL_UNCERTAINTY_FRACTION",
     "BAND_EXTRAPOLATION_ESTIMATORS",
@@ -3046,7 +2502,6 @@ __all__ = [
     "SHELL_FAIL_ZERO",
     "SHELL_FAIL_NO_ROOT",
     "SHELL_FAIL_EDGE",
-    "extrapolation_h5_payload",
     "extrapolation_weights",
     "spectral_h5_payload",
     "BandBracketCountMismatch",
@@ -3056,10 +2511,7 @@ __all__ = [
     "SpectralShellFit",
     "assert_brackets_match_ols_abscissae",
     "build_band_ladder",
-    "ExtrapolationFit",
-    "fit_band_extrapolation",
     "fit_band_extrapolation_spectral",
-    "format_extrapolation_report",
     "format_spectral_report",
     "plan_band_brackets",
     "plane_wave_band_count",
@@ -3068,6 +2520,5 @@ __all__ = [
     "spectral_trust_verdict",
     "tolerance_bar_ev",
     "trivial_plan",
-    "trust_verdict",
     "weyl_ladder_fit",
 ]
