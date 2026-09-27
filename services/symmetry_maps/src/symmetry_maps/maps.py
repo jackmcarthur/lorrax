@@ -1487,6 +1487,58 @@ def isdf_one_leg_source_slots(gvec_components, *, sym, sym_idx, q_irr_frac,
     return source_slot
 
 
+_UNSET_BASIS = object()
+
+#: Rows of the circular current basis: j_± = (j_x ± i j_y)/√2 and j_z.
+CIRCULAR_CURRENT_ROWS = np.array([[1.0, 1.0j, 0.0], [1.0, -1.0j, 0.0],
+                                  [0.0, 0.0, np.sqrt(2.0)]], dtype=np.complex128) / np.sqrt(2.0)
+
+
+def current_component_action(sym, rows, basis_rows):
+    """Action of typed rows on the Dirac-current index in the basis ``basis_rows``.
+
+    ``basis_rows`` is None (Cartesian, the polar time-odd ``R``) or a unitary
+    ``B`` whose row c is component c's Cartesian coefficients.  A unitary row
+    acts as ``B R Bᴴ``; an antiunitary row, applied after the conjugation of
+    its operand, as ``B R Bᵀ`` (``R`` is real).
+    """
+    action = np.asarray(sym.cartesian_action(rows, axial=False, time_odd=True), dtype=np.float64)
+    if basis_rows is None:
+        return action
+    B = np.asarray(basis_rows, dtype=np.complex128)
+    _, _, anti = sym.operation_rows(np.asarray(rows))
+    anti = np.asarray(anti, dtype=bool).reshape(-1)[:, None, None]
+    return np.where(anti, B @ action @ B.T, B @ action @ B.conj().T)
+
+
+def _monomial(action, tol=1e-10):
+    nz = np.abs(action) > tol
+    return bool(np.all(nz.sum(-1) == 1) and np.all(nz.sum(-2) == 1))
+
+
+def select_current_basis(sym):
+    """``(name, rows)``: the current-component basis in which every typed row is monomial.
+
+    Separate per-component ISDF fits are covariant exactly when each
+    operation maps components to phased (and, antiunitary, conjugated)
+    components.  The circular basis about z is monomial for every group with
+    a unique z axis (C3, C4, C6, magnetic groups with M ∥ z); Cartesian is
+    for the cubic groups.  Circular is preferred when both qualify, so one
+    rule serves hexagonal and tetragonal decks.  Refuses a group with
+    neither.  Decide it from the PHYSICAL group (the WFN's), never from a
+    reduced computational group.
+    """
+    rows = np.unique(np.concatenate([np.asarray(sym.sym_idx_k).ravel(),
+                                     np.asarray(sym.sym_idx_q).ravel()]))
+    for name, basis in (("circular", CIRCULAR_CURRENT_ROWS), ("cartesian", None)):
+        if _monomial(current_component_action(sym, rows, basis)):
+            return name, basis
+    raise ValueError(
+        "GATE current_fit_basis: got a group whose current action is monomial in neither the "
+        f"circular nor the Cartesian basis ({len(rows)} rows); want one of the two; "
+        "why: separate current fits are covariant only in a monomial basis; fix: none in-tree")
+
+
 def unfold_isdf_one_leg(
     zeta_ibz,
     *,
@@ -1501,8 +1553,14 @@ def unfold_isdf_one_leg(
     mesh_xy,
     component_action,
     source_component=None,
+    component_basis=_UNSET_BASIS,
 ):
-    """Transport one ISDF Fourier leg from the q-IBZ to the full q grid; see docs/architecture/symmetry_register.md."""
+    """Transport one ISDF Fourier leg from the q-IBZ to the full q grid; see docs/architecture/symmetry_register.md.
+
+    A polar leg names its current ``component_basis`` (None: Cartesian; else
+    the rows of :func:`select_current_basis`): the source column of
+    :func:`current_component_action` in that basis carries it to the targets.
+    """
     action = str(component_action).strip().lower()
     if action not in ("scalar", "polar"):
         raise ValueError(
@@ -1616,8 +1674,9 @@ def unfold_isdf_one_leg(
     trs = rows >= n_spatial
     R_column = None
     if action == "polar":
-        R_column = sym.cartesian_action(
-            rows, axial=False, time_odd=True)[:, :, source]
+        if component_basis is _UNSET_BASIS:
+            raise ValueError("unfold_isdf_one_leg: a polar leg must name its component_basis")
+        R_column = current_component_action(sym, rows, component_basis)[:, :, source]
 
     fn = _get_unfold_isdf_one_leg_jit(
         zeta_shape=zshape, idx=idx, rows=rows, perm=perm,

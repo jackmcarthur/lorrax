@@ -2443,13 +2443,12 @@ def _complete_static_photon_head(
             raise ValueError(
                 "the packed static photon completion requires four "
                 "literal-Gamma vectors")
-        g0_X = pack_photon_channel_vectors(
-            tuple(photon_g0_vectors), layout, mesh_xy, axis_name="x")[0]
-        y_sharding = NamedSharding(mesh_xy, P(None, "y"))
-        g0_Y = pack_photon_channel_vectors(
-            tuple(device_put_process_local(vector, y_sharding)
-                  for vector in photon_g0_vectors),
-            layout, mesh_xy, axis_name="y")[0]
+        # The Γ rows in the photon operator's Cartesian blocks, from the
+        # fit-basis G=0 vectors (the one rotation owner).
+        from .photon_direct_head import packed_gamma_vectors
+        g0_X, g0_Y = packed_gamma_vectors(
+            photon_g0_vectors, layout, mesh_xy,
+            current_basis_rows=meta.current_basis_rows)
         geometry = CoulombGeometry.from_wfn(wfn)
         cubature = slab_minibz_photon_cubature(
             get_kernel(2), geometry, tuple(int(v) for v in meta.kgrid))

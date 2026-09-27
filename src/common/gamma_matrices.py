@@ -163,58 +163,22 @@ def gamma_perm_phase_host(mu_lorentz: int) -> tuple[_np.ndarray, _np.ndarray]:
     return perm.copy(), phase.copy()
 
 
-#: The basis the three current ζ channels are fitted in (lane CURSYM,
-#: 2026-09-27; an experiment switch set by the run's control script, not a
-#: deck key).  ``cartesian``: channel i fits ψ†α^iψ (main).  ``trace``: all
-#: three channels fit one interpolant on the positive Cartesian trace
-#: (BSPSYM).  ``circular``: the channels fit j_± = (j_x ± i j_y)/√2 and j_z,
-#: the basis in which every operation of a group with a unique z axis acts
-#: as a phased permutation, so separate fits stay covariant.
-CURRENT_FIT_BASIS = "cartesian"
-_R2 = 1.0 / _np.sqrt(2.0)
-_CURRENT_FIT_ROWS = {
-    "circular": _np.array([[_R2, 1j * _R2, 0.0],
-                           [_R2, -1j * _R2, 0.0],
-                           [0.0, 0.0, 1.0]], dtype=_np.complex128),
-}
-
-
-def current_fit_basis() -> str:
-    basis = str(CURRENT_FIT_BASIS)
-    if basis not in ("cartesian", "trace", "circular", "circular_vswap"):
-        raise ValueError(f"CURRENT_FIT_BASIS={basis!r} not in (cartesian, trace, circular)")
-    return basis
-
-
-def current_fit_unitary():
-    """``U[c-1, i-1]``: channel c's feature is Σ_i U_ci ψ†α^iψ; None when U = I.
-
-    ``circular_vswap`` is the labelling control: circular fits read with the
-    ± rows of V exchanged (a wrong-label arm the V comparison must reject).
-    """
-    basis = current_fit_basis()
-    if basis == "circular_vswap":
-        return _CURRENT_FIT_ROWS["circular"][[1, 0, 2]]
-    return _CURRENT_FIT_ROWS.get(basis)
-
-
-def current_fit_terms(channel: int) -> tuple:
+def current_fit_terms(channel: int, basis_rows) -> tuple:
     """Channel ``c``'s Gram and Z as Σ w·U(γ̃^i at μ, γ̃^j at r): ``((w, i, j), ...)``.
 
-    The fit kernels are bilinear in the two vertex phase vectors; a feature
-    Σ_i u_i ψ†α^iψ whose phase vector is real (every row here) has the
-    positive Gram Σ_ij u_i u_j U(α^i, α^j).  α^2 is imaginary, so the
-    positive Cartesian trace carries U(α^2, α^2) with weight −1.
+    ``basis_rows`` is None (Cartesian: channel c fits ψ†α^cψ) or the unitary
+    ``B`` of ``symmetry_maps.select_current_basis`` (channel c fits
+    Σ_i B_ci ψ†α^iψ).  The fit kernels are bilinear in the two vertex phase
+    vectors, and every row of ``B`` combines α^i whose phase vectors make the
+    channel's own phase vector real (α^± = (α^1 ± iα^2)/√2 has phases
+    (√2, 0, √2, 0)), so the channel's positive Gram is Σ_ij B_ci B_cj U(α^i, α^j).
     """
     c = int(channel)
     if c == 0:
         return ((1.0, 0, 0),)
-    basis = current_fit_basis()
-    if basis == "cartesian":
+    if basis_rows is None:
         return ((1.0, c, c),)
-    if basis == "trace":
-        return ((1.0, 1, 1), (-1.0, 2, 2), (1.0, 3, 3))
-    u = _CURRENT_FIT_ROWS["circular"][c - 1]
+    u = _np.asarray(basis_rows, dtype=_np.complex128)[c - 1]
     return tuple((complex(u[i] * u[j]), i + 1, j + 1)
                  for i in range(3) for j in range(3) if abs(u[i] * u[j]) > 0)
 
@@ -467,6 +431,5 @@ __all__ = [
     "gamma0", "gamma1", "gamma2", "gamma3", "gamma5",
     "gammas_perm", "gammas_phase",
     "gamma_perm_phase", "gamma_apply", "gamma_double_contract",
-    "gamma_vertex_trace", "current_fit_basis", "current_fit_terms",
-    "current_fit_unitary",
+    "gamma_vertex_trace", "current_fit_terms",
 ]

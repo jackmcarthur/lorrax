@@ -1702,7 +1702,8 @@ def compute_photon_bank(wfns, wfns_transverse, meta, config, *, mesh_xy, sym,
                 mesh=mesh_xy, meta=meta, wfn=wfn,
                 frequencies_ry=bank_points(sample_plan), print_fn=print_fn)
             direct_head["gamma_vectors"] = packed_gamma_vectors(
-                direct_gamma, layout, mesh_xy)
+                direct_gamma, layout, mesh_xy,
+                current_basis_rows=meta.current_basis_rows)
             receipt["direct_gamma"] = dict(
                 approximation="first_order_dipole_current_fd",
                 sectors="CC_CT_TC_TT", local_fields=False,

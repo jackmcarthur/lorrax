@@ -234,6 +234,9 @@ from symmetry_maps.maps import (
     unfold_isdf_one_leg,
     isdf_one_leg_source_slots,
     mix_lorentz_blocks,
+    CIRCULAR_CURRENT_ROWS,
+    current_component_action,
+    select_current_basis,
 )
 from symmetry_maps.unfold_load import (
     QirrOperator,
@@ -361,6 +364,7 @@ __all__ = [
     "monomial_endpoint_action", "fold_monomial_endpoint_action",
     "isdf_one_leg_source_slots",
     "mix_lorentz_blocks",
+    "CIRCULAR_CURRENT_ROWS", "current_component_action", "select_current_basis",
     # psi unfold / antiunitary rule
     "unfold_psi", "spinor_rotation_for_sym_row", "apply_spinor_rotation",
     "tau_phase_row", "tau_phase_row_jax", "unfold_reciprocal_carriers",
