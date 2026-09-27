@@ -750,8 +750,9 @@ def _psi_at_rest_2d(d: dict, mesh_xy: Mesh) -> dict:
     ``*_X`` -> ``P(None, 'y', None, 'x')``, ``*_Y`` -> ``P(None, 'x', None,
     'y')``.  The band extent must divide that axis; the loader pads it to the
     mesh (``pad_bands``), and an extent that does not divide is refused by
-    name rather than replicated.
+    ``runtime.padding.authenticate_padded_axis`` rather than replicated.
     """
+    from runtime.padding import authenticate_padded_axis
     out = dict(d)
     for key in _PSI_KEYS:
         a = d.get(key)
@@ -759,13 +760,11 @@ def _psi_at_rest_2d(d: dict, mesh_xy: Mesh) -> dict:
             continue
         mu_axis = "x" if key.endswith("_X") else "y"
         band_axis = "y" if mu_axis == "x" else "x"
-        n_band, n_mesh = int(a.shape[1]), int(mesh_xy.shape[band_axis])
-        if n_band % n_mesh:
-            raise ValueError(
-                f"GATE ladder_psi_2d_indivisible: {key} has "
-                f"{n_band} bands, which does not divide mesh axis "
-                f"{band_axis!r} ({n_mesh}); want a band window padded to "
-                f"the mesh (the loader's pad_bands) on a square mesh.")
+        # The loader pads the band window to the mesh (pad_bands); the
+        # padding owner refuses a band carrier that is not already padded.
+        n_band = int(a.shape[1])
+        authenticate_padded_axis(n_band, n_band, int(mesh_xy.shape[band_axis]),
+                                 name=f"ladder psi {key} band carrier")
         out[key] = _reshard(
             a, NamedSharding(mesh_xy, P(None, band_axis, None, mu_axis)))
     return out
