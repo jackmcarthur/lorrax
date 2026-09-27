@@ -3331,6 +3331,25 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
     sigma0_kn = (np.zeros(energies_loop.shape, dtype=bool) if sc_support is None
                  else ~omega_coverage(sc_support[1], sc_support[2])[0])
 
+    # WINDESIGN INSTRUMENT (scratch branch, not production): two band classes.
+    # P = the requested window (qp_support.sigma_window_states, by identity),
+    # R = the other QP-window identities. Unset env = unchanged code.
+    _wd_mode = os.environ.get("LORRAX_WINDESIGN_CLASSES") or None
+    _wd_window = None
+    if _wd_mode is not None:
+        if _wd_mode not in ("couple", "nocouple"):
+            raise ValueError(f"LORRAX_WINDESIGN_CLASSES={_wd_mode!r}: couple | nocouple")
+        _wd_window = np.asarray(
+            inputs.fixed_quadrature_session["sigma_window_states"], dtype=bool)
+        _wd_col = np.zeros(_wd_window.shape, dtype=np.float64)
+        np.put_along_axis(_wd_col, np.asarray(indices_loop),
+                          _wd_window.astype(np.float64), axis=1)
+        from . import qsgw_utils as _wd_qu
+        _wd_qu._WINDESIGN_COL_WEIGHT = (
+            _wd_col if ks.is_identity else _wd_col[np.asarray(ks.take)])
+        _record_sc(inputs, f"    WINDESIGN classes ({_wd_mode}): P {int(_wd_window.sum())}"
+                           f" / R {int((~_wd_window).sum())} of {_wd_window.size} loop identities")
+
     # ENERGY-ONLY SCISSOR FOR THE SUM-BAND TAIL.  No new iteration state:
     # the fit is derived from the current carry's eigenspectrum and the
     # immutable active DFT ladder.  The logical stop is b4_user, not padded
@@ -3363,6 +3382,8 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
         if scissor_classes is not None:
             valence_kn, crossing_kn = scissor_classes.masks(e_dft_fit_ev.shape)
             fit_mask_kn = fit_mask_kn & ~crossing_kn
+        if _wd_window is not None:  # WINDESIGN: R no longer consumes Sigma(E)
+            fit_mask_kn = fit_mask_kn & _wd_window
         # The SUM-BAND tail (bands beyond the Sigma window) keeps its
         # per-map refit: freezing it moved the Si b80/c504 QSGW gap by 22 meV
         # at map 6 (si_p4_replay4 vs attempt 3), a closure change on
@@ -3917,6 +3938,9 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
         fixed_quadrature_session=inputs.fixed_quadrature_session,
         print_fn=inputs.print_fn,
     )
+    if _wd_mode is not None:
+        from . import qsgw_utils as _wd_qu
+        _wd_qu._WINDESIGN_COL_WEIGHT = None
     # The W model's held pole-column extent or CT span width grew this map (a
     # live Kmax or retained rank past it): say so, as the window plan says
     # its extensions.
@@ -4049,6 +4073,16 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
     # Every QP-window identity keeps its full Sigma (owner rule 2026-09-22),
     # so the map output is the full QSGW Hamiltonian: no band is scissored
     # and no off-diagonal is masked.
+    if _wd_mode is not None:
+        _e_wd = inputs.e_dft_active_kn_ry
+        if not ks.is_identity:
+            _e_wd = ks.select(_e_wd)
+        from .scissor import k_star_weights as _wd_kw
+        H_qp_dft_full = _windesign_classes(
+            H_qp_dft_full, _wd_window, np.asarray(_e_wd, dtype=np.float64),
+            float(inputs.wfn.efermi), state.tail_z_kn, _wd_kw(ks),
+            couple=(_wd_mode == "couple"), mesh=inputs.mesh_xy,
+            record=lambda msg: _record_sc(inputs, msg))
     H_qp_dft_new = H_qp_dft_full
 
     # The occupation state CARRIED below is the ENTRY solve consumed by this
@@ -4406,6 +4440,49 @@ def _apply_scissor_partition_policy(
                 "eV. A scissored tail entered the frontier; widen the Sigma "
                 "window rather than anchoring through it.")
     return H_partitioned, scissor_fit, partition
+
+
+def _windesign_classes(H, window_kn, e_dft_ry, efermi_ry, z_kn, k_weights, *,
+                       couple, mesh, record):
+    """WINDESIGN INSTRUMENT (scratch branch, not production).
+
+    DFT-basis map output with two classes: P-P kept; P-R kept (couple) or
+    zeroed (nocouple); R-R off-diagonals zeroed; the R diagonal replaced by
+    E_DFT + beta above E_F (E_DFT below), beta the k-star- and Z-weighted
+    mean of the DFT-basis diagonal QSGW correction H_nn - E_DFT,n over P
+    states more than 1 eV above E_F(DFT) with Z in (0, 1] (unit Z at map 0).
+    Host numpy on the gathered (nk, nb, nb) carry: instrument-sized decks only.
+    """
+    from common.collectives import gather_to_host
+    from .qp_support import quasiparticle_mask
+    Hh = np.asarray(gather_to_host(H), dtype=np.complex128)
+    p = np.asarray(window_kn, dtype=bool)
+    r = ~p
+    diag = np.real(np.diagonal(Hh, axis1=1, axis2=2))
+    above = (e_dft_ry - efermi_ry) * RYD_TO_EV > 1.0
+    fit = p & above
+    w = np.broadcast_to(np.asarray(k_weights, np.float64)[:, None], p.shape).copy()
+    if z_kn is not None:
+        z = np.broadcast_to(np.asarray(z_kn, np.float64), p.shape)
+        qp = quasiparticle_mask(z)
+        fit &= qp
+        w = w * np.where(qp, z, 0.0)
+    wf = w * fit
+    beta = float(np.sum(wf * (diag - e_dft_ry)) / max(np.sum(wf), 1e-300))
+    target = np.where(e_dft_ry > efermi_ry, e_dft_ry + beta, e_dft_ry)
+    pf, rf = p.astype(np.float64), r.astype(np.float64)
+    keep = pf[:, :, None] * pf[:, None, :]
+    if couple:
+        keep = keep + pf[:, :, None] * rf[:, None, :] + rf[:, :, None] * pf[:, None, :]
+    eye = np.eye(p.shape[1])[None]
+    new_diag = np.where(p, diag, np.where(r, target, diag))
+    Hn = Hh * (1.0 - eye) * keep + new_diag[:, :, None] * eye
+    moved = np.where(r, target - diag, 0.0) * RYD_TO_EV
+    record(f"    WINDESIGN classes ({'couple' if couple else 'nocouple'}): "
+           f"beta={beta * RYD_TO_EV:+.4f} eV (n={int(fit.sum())}); R diagonal "
+           f"reset by [{moved.min():+.3f}, {moved.max():+.3f}] eV against the full-Sigma diagonal; "
+           f"max |P-R| kept {float(np.max(np.abs(Hh * pf[:, :, None] * rf[:, None, :]))) * RYD_TO_EV if couple else 0.0:.4f} eV")
+    return _place(Hn, mesh, _band_rotation_spec())
 
 
 def _refuse_empty_map_output(e_output_kn_ev: np.ndarray, *,

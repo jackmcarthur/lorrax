@@ -603,6 +603,55 @@ def static_sigma_diag_to_host(sigma_knn, mesh_xy: Mesh) -> np.ndarray:
 # iteration.
 _QSGW_BUILD_KERNEL_CACHE: dict[tuple[int, bool], object] = {}
 
+#: WINDESIGN INSTRUMENT (scratch branch, not production). Per (k, sorted QP
+#: column) class weight of the E array build_qsgw_sigma_xc is called with:
+#: 1 = protected (P), 0 = rotating (R). Set by sc_iteration around one Sigma
+#: build when LORRAX_WINDESIGN_CLASSES is set; None = the unchanged kernel.
+_WINDESIGN_COL_WEIGHT = None
+
+
+def _qsgw_build_kernel_classes(mesh_xy: Mesh, *, replicated_output: bool):
+    """WINDESIGN instrument: the QSGW build with class weights w (1 P, 0 R).
+
+    Sigma_c,mn = (w_m A + w_n B) / max(w_m + w_n, 1): P-P is the usual half
+    sum, P-R keeps only the half at the P state's energy (A at E_m for m in
+    P; B at E_n for n in P), R-R is zero. Sigma_x is kept where at least one
+    index is P. The Hermitian part follows, so H_ij = (S_ij(E_i) +
+    conj(S_ji(E_i)))/2 for i in P, j in R.
+    """
+    key = (id(mesh_xy), bool(replicated_output), "windesign")
+    fn = _QSGW_BUILD_KERNEL_CACHE.get(key)
+    if fn is None:
+        out_3d = NamedSharding(
+            mesh_xy,
+            P(None, None, None) if replicated_output
+            else P(None, "x", "y"))
+
+        @jax.jit
+        def _kernel(sig_w, sig_x, ilo, ihi, wlo, whi, wts):
+            full = sig_w.shape
+            one = (1,) + tuple(full[1:])
+            ilo_m = jnp.broadcast_to(ilo[None, :, :, None], one)
+            ihi_m = jnp.broadcast_to(ihi[None, :, :, None], one)
+            A = (wlo[:, :, None] * jnp.take_along_axis(sig_w, ilo_m, axis=0)[0]
+                 + whi[:, :, None] * jnp.take_along_axis(sig_w, ihi_m, axis=0)[0])
+            ilo_n = jnp.broadcast_to(ilo[None, :, None, :], one)
+            ihi_n = jnp.broadcast_to(ihi[None, :, None, :], one)
+            B = (wlo[:, None, :] * jnp.take_along_axis(sig_w, ilo_n, axis=0)[0]
+                 + whi[:, None, :] * jnp.take_along_axis(sig_w, ihi_n, axis=0)[0])
+            wm = wts[:, :, None]
+            wn = wts[:, None, :]
+            sigma_c = (wm * A + wn * B) / jnp.maximum(wm + wn, 1.0)
+            keep_x = 1.0 - (1.0 - wm) * (1.0 - wn)
+            M = sigma_c + keep_x * sig_x
+            M = jax.lax.with_sharding_constraint(M, out_3d)
+            Mh = 0.5 * (M + jnp.conj(jnp.swapaxes(M, -1, -2)))
+            return jax.lax.with_sharding_constraint(Mh, out_3d)
+
+        fn = _kernel
+        _QSGW_BUILD_KERNEL_CACHE[key] = fn
+    return fn
+
 
 def _qsgw_build_kernel(mesh_xy: Mesh, *, replicated_output: bool):
     key = (id(mesh_xy), bool(replicated_output))
@@ -779,11 +828,25 @@ def build_qsgw_sigma_xc(
     w_lo_j   = device_put_process_local(w_lo.astype(np.complex128), rep_2d)
     w_hi_j   = device_put_process_local(w_hi.astype(np.complex128), rep_2d)
 
-    sigma_xc_qsgw = _qsgw_build_kernel(
-        mesh_xy, replicated_output=bool(replicated_output))(
-        sigma_c_omega_ry, sigma_x_kij_ry,
-        idx_lo_j, idx_hi_j, w_lo_j, w_hi_j,
-    )
+    if _WINDESIGN_COL_WEIGHT is not None:
+        wts = np.zeros((nk, nb), dtype=np.float64)
+        wsrc = np.asarray(_WINDESIGN_COL_WEIGHT, dtype=np.float64)
+        if wsrc.shape != (nk, logical_nb):
+            raise ValueError(
+                f"WINDESIGN class weights {wsrc.shape} != ({nk}, {logical_nb})")
+        wts[:, :logical_nb] = wsrc
+        wts_j = device_put_process_local(wts.astype(np.complex128), rep_2d)
+        sigma_xc_qsgw = _qsgw_build_kernel_classes(
+            mesh_xy, replicated_output=bool(replicated_output))(
+            sigma_c_omega_ry, sigma_x_kij_ry,
+            idx_lo_j, idx_hi_j, w_lo_j, w_hi_j, wts_j,
+        )
+    else:
+        sigma_xc_qsgw = _qsgw_build_kernel(
+            mesh_xy, replicated_output=bool(replicated_output))(
+            sigma_c_omega_ry, sigma_x_kij_ry,
+            idx_lo_j, idx_hi_j, w_lo_j, w_hi_j,
+        )
     sigma_xc_qsgw.block_until_ready()
     if band_axis is not None and replicated_output:
         from runtime.padding import strip_axis
