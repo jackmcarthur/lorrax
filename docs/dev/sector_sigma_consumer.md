@@ -14,9 +14,11 @@ and band projection use their existing owners. Fractional occupation weights
 are passed unchanged by the common planner.
 
 The hole branch conjugates both residue endpoints at minus q while retaining
-the same complex time phase. Endpoint star transformations use
-`symmetry_maps.unfold_endpoint_panel`, including polar time-odd Cartesian
-current actions. No W, chi or G average is introduced.
+the same complex time phase. The residue contraction runs on q parents,
+then `symmetry_maps.unfold_operator_from_load_tables` transports its result
+with the polar time-odd Cartesian current actions. Antiunitary rows consume
+a conjugated-endpoint contraction with unchanged complex time weights.
+No W, chi or G average is introduced.
 
 The independently stored instantaneous `W_infinity-V` is contracted once with
 the equal-time occupied projector through `photon_sigma.contract_lorentz_blocks`
@@ -37,17 +39,17 @@ map still requires the constructor to publish an accepted sector handle.
 ## Memory and scope
 
 One rectangular endpoint class is evaluated at a time. The store reads each
-sector's full parent/pole factor set once at setup; the symmetry service
-unfolds it once to full q. The current map retains only those transformed
-factors and replicated squared poles until that sector's frequency integration
+sector's parent/pole factor set once at setup. The current map retains those
+parent factors and replicated squared poles until that sector's frequency integration
 finishes. CC/TT each read two orientations from one store; CT/TC each read
 left-X and right-Y from their separate stores and compare pole arrays. The
 W factors sit on faces (centroid and pole axes distributed) or, when the
 capacity ledger admits the replicated pole columns, in the axis orientation
 (pole axis replicated, each centroid endpoint over its own mesh axis). The face
-Green's narrow band contraction uses bounded panels; W(t) still uses its
-planned factor GEMM. Both form one all-P W(t) rectangle at a time. No W(t)
-history or state/pole-pair sum is retained. Setup routing, resident factors, and compiled
+Green's narrow band contraction uses bounded panels; W(t) uses its
+planned parent factor GEMM and a second parent contraction when antiunitary
+rows are selected. The product unfold retains both processor axes. No W(t)
+history or state/pole-pair sum is retained. Setup placement, resident factors, and compiled
 contractions have capacity reservations with explicit sector lifetime.
 
 The constant path retains a whole all-P photon bank, then its all-P packed
