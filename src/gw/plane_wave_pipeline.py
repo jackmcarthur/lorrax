@@ -658,6 +658,7 @@ class PlaneWaveGW:
                                              line_panel_states, line_sample_states, port_extent,
                                              select_round_states)
         from .shared_pole_local import reduce_round, round_tables
+        from .shared_pole_recipe import shared_real_pole_gates_v1_r3b as spole_gates
         mesh, n = self.mesh, int(self.screen.M)
         t0 = time.perf_counter()
         recipe = self.shared_pole_recipe(config, wfns, meta, print_fn=print_fn)
@@ -742,6 +743,19 @@ class PlaneWaveGW:
                     retained_metric_positive=bool(reduction["retained_metric_positive"][slot]),
                     zero_policy=bool(zero["zero_policy"][slot]),
                     retained_moments_max=float(max(np.max(v[slot]) for v in retained.values()))))
+            # The constructor's refusals (construct_shared_poles, spole.gates): no model whose Gram
+            # is indefinite, whose zero policy failed or whose retained moments drifted reaches Σ.
+            for row in gates[-real:]:
+                failed = [k for k in ("gram_valid", "gram_diagonal_positive",
+                                      "retained_metric_positive", "zero_policy") if not row[k]]
+                if row["retained_moments_max"] > spole_gates["retained_subspace_moments"]["threshold"]:
+                    failed.append("retained_moments")
+                if failed:
+                    raise ValueError(
+                        f"GATE shared_pole_{failed[0]}: got: failed at q={row['q']} ({', '.join(failed)}), "
+                        f"Gram min/max={row['gram_min_relative']:.3e}; want: Gram min/max >= "
+                        f"{spole_gates['normalized_gram_validity']['threshold']} and valid metric, zero "
+                        "policy and moments; why: no PSD repair (the constructor's own refusal)")
             blocks.append((jax.jit(lambda b: b, out_shardings=NamedSharding(mesh, P(None, "x", None)))(
                 model[0]), real))
             pole_rows.append(poles[:real])
