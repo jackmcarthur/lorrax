@@ -1264,9 +1264,17 @@ def _compute_mpa_sigma(
     head_diag = None
     if head is not None:
         if iteration_head is None:
+            # One occupation state per call: on a metal the head splits its
+            # residues by the same fixed-N state as the body, Sigma_x and the
+            # SC map-0 head (sc_iteration: the map-entry state), never by the
+            # WFN table.  The WFN table put occupancy 1 on bands below nelec
+            # above E_F and moved Fe 4^3 one-shot Sigma_c by up to 3.89 eV
+            # against SC map 0.
             sigma_bands = wfns.slices.sigma
             head_enk = np.asarray(wfns.enk[:, sigma_bands])
-            head_occ = np.asarray(wfns.occ[:, sigma_bands])
+            head_occ = np.asarray(
+                wfns.occ if occupation_state is None
+                else occupation_state.f_kn)[:, sigma_bands]
         else:
             head_enk = np.asarray(iteration_head.sigma_energies_ry)
             head_occ = np.asarray(iteration_head.sigma_occupations)
