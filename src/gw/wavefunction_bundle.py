@@ -76,6 +76,7 @@ class BandSlices:
     #: Logical union top used by spectral consumers.  On a split deck this is
     #: max(chi, sigma); on every deck it excludes the process-mesh pad in b4.
     b4_logical: int = 0
+    b3_requested: int = 0  # protected request before the rotating carrier is extended
 
     @classmethod
     def from_band_edges(cls, b0: int, b1: int, b2: int, b3: int, b4: int,

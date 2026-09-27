@@ -420,9 +420,10 @@ def _prepare_band_metadata(centroid_indices, config, mesh_xy, n_rmu, print0, sym
     mu_basis = PackedCentroidBasis.build(
         centroid_indices, sym, wfn.fft_grid, mesh_xy)
     print0(f"  {mu_basis.describe()}")
+    rotating_bands = config.compute_mode.is_dynamic and config.qp_solver == "self_consistent"
     meta = Meta.from_system(wfn, sym,
                             int(config.nval),
-                            int(config.ncond), config.nband,
+                            (config.nband - int(wfn.nelec) if rotating_bands else int(config.ncond)), config.nband,
                             n_rmu, charge_bispinor,
                             nband_chi=config.bands.chi,
                             nband_sigma=config.bands.sigma,
@@ -434,6 +435,9 @@ def _prepare_band_metadata(centroid_indices, config, mesh_xy, n_rmu, print0, sym
     band_slices = BandSlices.from_band_edges(
         *meta.band_edges, b4_chi=meta.b_id_4_chi,
         b4_sigma=meta.b_id_4_sigma, b4_logical=meta.b_id_4_user)
+    if rotating_bands:
+        from dataclasses import replace
+        band_slices = replace(band_slices, b3_requested=int(wfn.nelec) + int(config.ncond))
     zeta_fit_edge = resolve_zeta_fit_edge(
         band_slices, getattr(config, "zeta_nband", None))
     print0(f"  {config.bands.describe(zeta_fit_edge)}")
@@ -864,7 +868,7 @@ def _oneshot_sampled_support(config, enk_dft, wfn, occupation_state,
 
     from .efermi import sigma_frame_mu_ev
     from .qp_support import plan_support_ev, requested_states
-    from .shared_pole_recipe import active_band_mask
+    from .band_partition import requested_band_mask
     e_ry = np.asarray(enk_dft, dtype=np.float64)
     metal = material_class == "metal" and occupation_state is not None
     mu_ev = sigma_frame_mu_ev(
@@ -875,7 +879,9 @@ def _oneshot_sampled_support(config, enk_dft, wfn, occupation_state,
     energy = e_ry * RYD_TO_EV - mu_ev
     states = requested_states(
         config.sigma, config.sc.frozen_core_bands, energy,
-        np.ones(e_ry.shape, dtype=bool), active_band_mask(e_ry, float(wfn.efermi)))
+        requested_band_mask(e_ry * RYD_TO_EV, n_occ=int(wfn.nelec),
+                            nval=config.nval, ncond=config.ncond,
+                            gap_ev=config.sigma.regularization_ev))
     grown, _ = plan_support_ev(config.sigma, requested, energy, states, 0)
     if grown.size == requested.size:
         return config

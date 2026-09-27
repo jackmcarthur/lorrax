@@ -661,6 +661,7 @@ def finalize_dynamic_sigma(
             omega_grid_ev, e_qp_rel_ev, mesh_xy,
             band_axis=sigma_band_axis,
             out_of_grid=config.sigma.out_of_grid,
+            protected_kn=config.sc_sigma_protected_kn,
         )
         print_fn(f"  QSGW: {int(qsgw_diag['n_clipped'])} clipped "
                  f"({100*qsgw_diag['frac_clipped']:.1f}%)")
@@ -695,6 +696,7 @@ def finalize_dynamic_sigma(
                 omega_grid_ev, e_qp_rel_ev, mesh_xy,
                 band_axis=sigma_band_axis,
                 out_of_grid=config.sigma.out_of_grid,
+            protected_kn=config.sc_sigma_protected_kn,
             )
 
         # Only append when this call created the base file.  SC iterations
@@ -1244,7 +1246,8 @@ def _compute_mpa_sigma(
                 shell, _ = build_qsgw_sigma_xc(
                     value.sigma_c_kij, zero_x, config.omega_grid_ev,
                     e_qp_rel_ev, mesh_xy, band_axis=value.band_axis,
-                    out_of_grid=config.sigma.out_of_grid)
+                    out_of_grid=config.sigma.out_of_grid,
+                    protected_kn=config.sc_sigma_protected_kn)
                 return shell
 
         sector_result = compute_sector_sigma(

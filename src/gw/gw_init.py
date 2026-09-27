@@ -931,7 +931,7 @@ clears-fh-and-the-tile-null-still-refuses.md`` §3).
 	nothing downstream would notice.  :func:`assert_isdf_window_is_the_max`
 	states the invariant where it can fail; this is why.
 	"""
-	left = (band_slices.b0, band_slices.b3)
+	left = (band_slices.b0, band_slices.b3_requested or band_slices.b3)
 	right = (band_slices.b1, band_slices.b4)
 	if zeta_nband is None:
 		return left, right
@@ -943,7 +943,7 @@ clears-fh-and-the-tile-null-still-refuses.md`` §3).
 			f"centroid ψ spans [b0, b4) = [{band_slices.b0}, "
 			f"{band_slices.b4}).  zeta_nband can only NARROW the ζ-fit "
 			f"window; it cannot move it outside the loaded bands.")
-	left = (band_slices.b0, min(band_slices.b3, b4_zeta))
+	left = (band_slices.b0, min(band_slices.b3_requested or band_slices.b3, b4_zeta))
 	right = (band_slices.b1, b4_zeta)
 	log(f"    ζ-fit window DECOUPLED from the band sum: logical physical "
 	    f"edge zeta_nband={b4_zeta}; the loaded band carrier ends at "
