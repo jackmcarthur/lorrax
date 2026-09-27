@@ -69,13 +69,7 @@ def sigma_eval_omega(omega_grid: np.ndarray, eval_kn: np.ndarray,
     """
     covered = omega_coverage(omega_grid, eval_kn)[0]
     omega = np.asarray(omega_grid, dtype=np.float64)
-    e = np.asarray(eval_kn, dtype=np.float64)
-    if policy == "clamp":
-        return np.clip(e, float(omega[0]), float(omega[-1])), covered
-    if policy in ("cover", "static"):
-        return np.where(covered, e, 0.0), covered
-    raise ValueError(f"sigma_out_of_grid must be cover, clamp or static; got {policy!r}")
-
+    return np.clip(np.asarray(eval_kn, dtype=float), omega[0], omega[-1]), covered
 
 
 
@@ -109,7 +103,7 @@ def interp_along_omega(
         print_fn(f"  omega coverage{where}: {n_out} of {eval_arr.size} ({100.0 * frac:.1f}%) "
                  f"evaluation energies outside [{float(omega[0]):.3f}, {float(omega[-1]):.3f}] "
                  f"use Sigma(omega=0).")
-    e = np.where(covered, eval_arr, 0.0)
+    e = np.clip(eval_arr, omega[0], omega[-1])
     idx_hi = np.clip(np.searchsorted(omega, e, side="left"), 1, omega.size - 1)
     idx_lo = idx_hi - 1
     denom = np.where(omega[idx_hi] > omega[idx_lo], omega[idx_hi] - omega[idx_lo], 1.0)
