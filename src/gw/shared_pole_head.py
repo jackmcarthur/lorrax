@@ -173,7 +173,8 @@ def build_shared_pole_head(handle, header, V_q, wfns, meta, config, *,
     from .gw_config import HeadCorrection
     from .mpa.model import fit_head_samples
     from .mpa.sample_plan import plan_z
-    from .qsgw_head import IterationHeadSamples, finalize_iteration_head_sample
+    from .qsgw_head import (IterationHeadSamples, finalize_iteration_head_rows,
+                            iteration_head_sample_terms)
     from .response_bank import _reserve
     from .qgrid_symmetry import shared_pole_operator_realizer
     import distrib_la
@@ -244,19 +245,30 @@ def build_shared_pole_head(handle, header, V_q, wfns, meta, config, *,
         name, _ = _reserve(meta, "head", resident,
             3*stats.output_size_in_bytes+stats.temp_size_in_bytes+native)
         ledger.live_stages = ambient+(name,)
+    # Each point's Gamma body is resident only while its 3x3 fold is formed;
+    # the mini-BZ cell averages of all points then share one draw
+    # (finalize_iteration_head_rows), bit-identical to one call per point.
+    terms = []
     for index, point in enumerate(points):
         total = None
         if full:
             value = evaluate(jnp.asarray(point*point, jnp.complex128), *args)
             total = value[0]
-        samples.append(head_resolver.at(point) if response is None else
-            finalize_iteration_head_sample(response, index, total,
-                wfn=wfn, meta=meta, config=config, mesh=mesh_xy))
+        if response is None:
+            samples.append(head_resolver.at(point))
+        else:
+            terms.append(iteration_head_sample_terms(response, index, total,
+                meta=meta, config=config, mesh=mesh_xy))
         del total
         if full:
             del value
     if full:
         del args, b, poles, counts
+    if terms:
+        rows = [t for t in terms if isinstance(t, dict)]
+        averaged = iter(finalize_iteration_head_rows(
+            response, rows, wfn=wfn, meta=meta, config=config))
+        samples = [next(averaged) if isinstance(t, dict) else t for t in terms]
     ledger.live_stages = ambient
     if jax.process_index() == 0 and samples:
         origin = min(range(len(points)), key=lambda i: abs(points[i]))

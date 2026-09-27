@@ -54,3 +54,20 @@ class Bulk3D(vcoul.Bulk3D):
             analytic_sphere=analytic_sphere,
             extra_chi=extra_chi,
         )
+
+    def q0_average_screened(
+        self, wfn, meta: Meta, *,
+        S_carts,
+        extra_chis=None,
+        nsamples: int = 2**18,
+        method: str = "sobol",
+        qmc_reps: int = 10,
+        analytic_sphere: bool = False,
+    ):
+        return super().q0_average_screened(
+            CoulombGeometry.from_wfn(wfn),
+            (meta.nkx, meta.nky, meta.nkz),
+            S_carts=S_carts, extra_chis=extra_chis,
+            nsamples=nsamples, method=method, qmc_reps=qmc_reps,
+            analytic_sphere=analytic_sphere,
+        )

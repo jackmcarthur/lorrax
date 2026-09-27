@@ -39,7 +39,9 @@ __all__ = [
     "metal_head_summary",
     "interband_commutator_velocity",
     "finalize_iteration_head_sample",
+    "finalize_iteration_head_rows",
     "finalize_iteration_head_samples",
+    "iteration_head_sample_terms",
     "load_dft_velocity_head",
     "load_dft_dipole_head",
     "load_interband_commutator_head",
@@ -3085,6 +3087,55 @@ def finalize_iteration_head_sample(
     survives the call. Left and right wings remain independent at complex
     frequency.
     """
+    terms = iteration_head_sample_terms(
+        response, omega_index, W_body_gamma, meta=meta, config=config, mesh=mesh)
+    if not isinstance(terms, dict):
+        return terms
+    return finalize_iteration_head_rows(
+        response, [terms], wfn=wfn, meta=meta, config=config)[0]
+
+
+def finalize_iteration_head_rows(response, terms, *, wfn, meta, config):
+    """Mini-BZ-average several :func:`iteration_head_sample_terms` rows in one call.
+
+    Row ``i`` equals ``finalize_iteration_head_sample`` of its frequency bit
+    for bit; the rows share one mini-BZ draw (``head_samples_from_s``).  The
+    rows of one call share their fold policy; only a zero-frequency row reads
+    its static kappa^2.
+    """
+    if not terms:
+        return ()
+    if len({(t["response_kind"], t["source_prefix"]) for t in terms}) != 1:
+        raise ValueError("head rows of one call must share their fold policy")
+    static = [t["static_kappa2"] for t in terms if abs(t["omega"]) <= 1.0e-14]
+    return head_samples_from_s(
+        np.stack([np.asarray(t["S_effective"], dtype=np.complex128) for t in terms]),
+        tuple(t["omega"] for t in terms),
+        wfn=wfn,
+        meta=meta,
+        config=config,
+        static_kappa2_bohr2=static[0] if static else None,
+        intraband=_metal_intraband(response),
+        response_kind=terms[0]["response_kind"],
+        source_prefix=terms[0]["source_prefix"],
+    )
+
+
+def iteration_head_sample_terms(
+    response: IterationHeadResponse,
+    omega_index: int,
+    W_body_gamma=None,
+    *,
+    meta,
+    config,
+    mesh: Mesh,
+):
+    """One frequency's replicated 3x3 head tensor, folded while ``W_body_gamma`` is resident.
+
+    Returns the ``head_correction = off`` sample itself, or a dict of the
+    operands :func:`finalize_iteration_head_rows` averages.  Only the 3x3
+    result outlives the call.
+    """
     from gw.gw_config import HeadCorrection, coerce_head_correction
 
     policy = coerce_head_correction(
@@ -3128,18 +3179,14 @@ def finalize_iteration_head_sample(
     if use_fold and abs(response.omegas[index]) <= 1.0e-14:
         static_kappa2 = _fold_static_kappa2(
             response, W_body_gamma, float(meta.cell_volume), mesh)
-    return head_samples_from_s(
-        S_effective[None, :, :],
-        (response.omegas[index],),
-        wfn=wfn,
-        meta=meta,
-        config=config,
-        static_kappa2_bohr2=static_kappa2,
-        intraband=intraband,
+    return dict(
+        omega=complex(response.omegas[index]),
+        S_effective=np.asarray(S_effective, dtype=np.complex128),
+        static_kappa2=static_kappa2,
         response_kind=("full_local_fields" if use_fold
                        else "direct_irreducible"),
         source_prefix=("head_schur" if use_fold else "head_direct"),
-    )[0]
+    )
 
 
 def finalize_iteration_head_samples(
@@ -3304,7 +3351,7 @@ def head_samples_from_s(
     from gw.head_correction import (
         HeadResponseKind, HeadSample, resolve_head_override)
     from gw.isdf_fitting import mem_probe
-    from gw.vcoul import compute_q0_averages
+    from gw.vcoul import compute_q0_averages, compute_q0_averages_screened
 
     # This is the first host readback of ``S_cart_omega`` for callers that
     # do not already sync it (``finalize_iteration_head_samples`` now does,
@@ -3326,12 +3373,18 @@ def head_samples_from_s(
         "whead_0freq": config.head.whead_0freq,
         "whead_imfreq": config.head.whead_imfreq,
     }
-    out = []
     kind = HeadResponseKind(response_kind)
+    analytic_sphere = bool(getattr(
+        config.head, "analytic_q0_sphere", config.head.head_minibz_average))
+    # Pass 1: each row's cell-average operands.  Every row but a Thomas-Fermi
+    # kappa^2 row averages v/(1 - v(q.S.q + chi_extra)) on the one mini-BZ
+    # draw, so those rows share it in ONE call below (one device copy of the
+    # draw, one <v>) instead of one call per frequency.
+    rows = []
     for z, S in zip(omegas, S_host):
         override = resolve_head_override(params, z)
         if override is not None:
-            out.append(override)
+            rows.append(("override", z, override, None, False))
             continue
         is_static_metal = (
             static_kappa2_bohr2 is not None and abs(z) <= 1.0e-14)
@@ -3349,19 +3402,30 @@ def head_samples_from_s(
             extra_chi = (lambda q, _n=float(static_kappa2_bohr2) / (8.0 * np.pi):
                          jnp.full((q.shape[0],), -_n, dtype=jnp.complex128))
         static_from_s = is_static_metal and intraband is not None
-        vc0, wc0 = compute_q0_averages(
-            wfn,
-            jnp.asarray(0.0, dtype=jnp.float64),
-            meta,
-            S_cart=(S if (static_from_s or not is_static_metal) else None),
-            static_kappa2=(
-                jnp.asarray(static_kappa2_bohr2, dtype=jnp.float64)
-                if is_static_metal and not static_from_s else None),
-            analytic_sphere=bool(getattr(
-                config.head, "analytic_q0_sphere",
-                config.head.head_minibz_average)),
-            extra_chi=extra_chi,
-        )
+        rows.append(("screened" if (static_from_s or not is_static_metal)
+                     else "kappa2", z, S, extra_chi, is_static_metal))
+    screened = [i for i, r in enumerate(rows) if r[0] == "screened"]
+    averages = {}
+    if screened:
+        vc0, wcoul0 = compute_q0_averages_screened(
+            wfn, meta, [rows[i][2] for i in screened],
+            extra_chis=[rows[i][3] for i in screened],
+            analytic_sphere=analytic_sphere)
+        averages.update(zip(screened, ((vc0, w) for w in wcoul0)))
+    for i, row in enumerate(rows):
+        if row[0] == "kappa2":
+            averages[i] = compute_q0_averages(
+                wfn, jnp.asarray(0.0, dtype=jnp.float64), meta,
+                S_cart=None,
+                static_kappa2=jnp.asarray(static_kappa2_bohr2, dtype=jnp.float64),
+                analytic_sphere=analytic_sphere, extra_chi=None)
+    # Pass 2: read back once per row, in the caller's order.
+    out = []
+    for i, (label, z, S, _, is_static_metal) in enumerate(rows):
+        if label == "override":
+            out.append(S)
+            continue
+        vc0, wc0 = averages[i]
         out.append(
             HeadSample(
                 vc0=complex(vc0),
@@ -3373,7 +3437,7 @@ def head_samples_from_s(
                     else f"{source_prefix}(omega={z} Ry)"
                 ),
                 omega=z,
-                S_cart=(S if (static_from_s or not is_static_metal) else None),
+                S_cart=(S if label == "screened" else None),
                 response_kind=kind,
             )
         )

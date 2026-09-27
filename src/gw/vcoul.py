@@ -23,7 +23,8 @@ import jax.numpy as jnp                                     # noqa: E402
 from common import Meta                                     # noqa: E402
 from vcoul import wrap_points_to_voronoi                    # noqa: E402,F401
 
-__all__ = ["wrap_points_to_voronoi", "compute_q0_averages"]
+__all__ = ["wrap_points_to_voronoi", "compute_q0_averages",
+           "compute_q0_averages_screened"]
 
 
 def compute_q0_averages(
@@ -90,3 +91,37 @@ def compute_q0_averages(
 		analytic_sphere=analytic_sphere,
 		**kwargs,
 	)
+
+
+def compute_q0_averages_screened(
+	wfn,
+	meta: Meta,
+	S_carts,
+	*,
+	extra_chis=None,
+	nsamples: int = 2**18,
+	method: str = "auto",
+	qmc_reps: int = 10,
+	analytic_sphere: bool = False,
+):
+	"""``compute_q0_averages(S_cart=S_i, extra_chi=chi_i)`` for every row on one draw.
+
+	Returns ``(vc0_mean, [wcoul0_i])``; each row is bit-identical to its own
+	:func:`compute_q0_averages` call.  The 3D bulk shares the draw's device
+	copy, ``<v>`` and ``v(q)`` across rows (``vcoul.Bulk3D.q0_average_screened``);
+	other dimensions keep one call per row.
+	"""
+	S_carts = list(S_carts)
+	extra_chis = [None] * len(S_carts) if extra_chis is None else list(extra_chis)
+	if int(getattr(meta, 'sys_dim', 3)) == 3:
+		from .coulomb import get_kernel
+		return get_kernel(3).q0_average_screened(
+			wfn, meta, S_carts=S_carts, extra_chis=extra_chis,
+			nsamples=nsamples, method=method, qmc_reps=qmc_reps,
+			analytic_sphere=analytic_sphere)
+	rows = [compute_q0_averages(
+		wfn, jnp.asarray(0.0, dtype=jnp.float64), meta, S_cart=S,
+		nsamples=nsamples, method=method, qmc_reps=qmc_reps,
+		analytic_sphere=analytic_sphere, extra_chi=chi)
+		for S, chi in zip(S_carts, extra_chis)]
+	return (rows[0][0] if rows else None), [w for _, w in rows]
