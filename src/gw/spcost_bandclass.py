@@ -29,8 +29,9 @@ def begin(inputs, state, ks, indices, energies, U, classes):
     val = np.asarray(inputs.valence_mask_active_kn)
     if not ks.is_identity:
         e, val = ks.select(e), ks.select(val)
-    p = sigma_window_states((e-float(inputs.wfn.efermi))*RYD_TO_EV,
+    p = (sigma_window_states((e-float(inputs.wfn.efermi))*RYD_TO_EV,
                             CANDIDATE['window_ev'], tol_ev=1e-4)
+         if CONTEXT is None else CONTEXT['p'])
     p[:, :int(inputs.config.sc.frozen_core_bands)] = False
     if classes is not None:
         val, cross = classes.masks(e.shape)
@@ -79,7 +80,7 @@ def _edit_kernel(mesh, coupling, lowdin):
         safe = jnp.where(pr > 0, denom, 1.)
         # A genuine resonance is returned for the host refusal below.
         min_denom = jnp.min(jnp.where(pr > 0, jnp.abs(denom), jnp.inf))
-        ct = jnp.sum(jnp.where(pr > 0, jnp.abs(H)**2 / safe, 0.), axis=1) if lowdin else jnp.zeros_like(diag)
+        ct = jnp.sum(jnp.where(pr > 0, jnp.abs(H)**2 / safe, 0.), axis=1) if lowdin and coupling != 'none' else jnp.zeros_like(diag)
         desired = jnp.where(p > 0, diag, target-ct)
         eye = jnp.eye(H.shape[-1])[None]
         result = H * keep * (1-eye) + desired[:, :, None]*eye
