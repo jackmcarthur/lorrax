@@ -1688,6 +1688,10 @@ _DEFAULTS = {
     # fractions, widths and gates are unchanged, and the sites enter
     # recipe_version/recipe_hash so no store crosses ladders on restart.
     "sigma_w_support_sites_ev": "",
+    # 0 = the recipe's production pole budget (ceil(1.8 n) retained Gram
+    # directions per parent).  A positive value replaces the 1.8; it enters
+    # recipe_version/recipe_hash like the support sites.  A study dial.
+    "sigma_w_pole_budget_fraction": 0.0,
     "sigma_window_edge_factor": 1.5,
     # PPM sigma options
     # PPM invalid-pole treatment (BGW invalid_gpp_mode). 'zero' drops Omega^2<0
@@ -2268,6 +2272,14 @@ def _resolve_shared_pole_inputs(params):
             f"{params['sigma_w_support_sites_ev']!r} with sigma_w_model={model!r}; "
             "want: sigma_w_model=shared_pole; why: only the shared-pole "
             "resolver has support ladders to replace")
+    if "sigma_w_pole_budget_fraction" in named and (
+            model != "shared_pole" or params["sigma_w_accuracy"] != "production"
+            or not float(params["sigma_w_pole_budget_fraction"]) > 0.0):
+        raise ValueError(
+            "GATE shared_pole_applicability: sigma_w_pole_budget_fraction got: "
+            f"{params['sigma_w_pole_budget_fraction']!r} with sigma_w_model={model!r}, "
+            f"sigma_w_accuracy={params['sigma_w_accuracy']!r}; want: > 0 with "
+            "shared_pole production; why: only that tier has a pole budget")
     eta = float(params["sigma_regularization_ev"])
     if not (np.isfinite(eta) and eta > 0.0):
         raise ValueError(
@@ -2300,6 +2312,7 @@ def _resolve_shared_pole_inputs(params):
             "  shared-pole support ladders with explicit sites:\n"
             f"    line      {override['line_ev']} eV\n"
             f"    imaginary {override['imaginary_ev']} eV\n"
+            f"    off-axis  {override['off_axis_ev']} (re, im) eV\n"
             "  The resolver's band-structure line rule (production),\n"
             "  endpoint line rule (relaxed), and Zolotarev imaginary\n"
             "  count are NOT used.  Height (4*eta), held\n"
@@ -2553,6 +2566,7 @@ def _input_response(
         w_model=str(params["sigma_w_model"]),
         w_accuracy=str(params["sigma_w_accuracy"]),
         w_support_sites_ev=str(params["sigma_w_support_sites_ev"]),
+        w_pole_budget_fraction=float(params["sigma_w_pole_budget_fraction"]),
         window_edge_factor=float(params["sigma_window_edge_factor"]),
         fermi_reference=str(params["fermi_reference"]).strip().lower(),
         quadrature_eps=float(params["sigma_quadrature_eps"]),
@@ -4005,6 +4019,9 @@ class DynamicSigmaConfig:
     #: an explicit support geometry for support-rule studies.  Parsed and
     #: gated by ``gw.shared_pole_recipe.parse_support_sites``.
     w_support_sites_ev: str = _DEFAULTS["sigma_w_support_sites_ev"]
+    #: ``sigma_w_pole_budget_fraction``: 0 (default, the recipe's 1.8) or
+    #: the retained-direction budget per parent as a multiple of n.
+    w_pole_budget_fraction: float = _DEFAULTS["sigma_w_pole_budget_fraction"]
     quadrature_eps: float = _DEFAULTS["sigma_quadrature_eps"]
     quadrature_cache_dir: str = "auto"
     #: ``sigma_omega_patches_ev``: "" (default, the contiguous
