@@ -159,4 +159,4 @@ def far_patch_grid_ev(patch):
     lo, hi = float(patch[0]), float(patch[1])
     step = 0.5 * far_patch_eta_ev(patch)
     n = int(np.ceil((hi - lo) / step - 1e-9)) + 1
-    return lo + step * np.arange(n)
+    return np.linspace(lo, hi, max(n, 2))      # ends at hi: never enters the near grid
