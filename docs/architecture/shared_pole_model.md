@@ -94,7 +94,7 @@ check.
 
 **Domain and occupations.** The transition interval spans every nonzero
 occupied/empty weight pair on the one branch support
-(`gw.efermi.band_in_occupation_window`, $|w|\ge 2^{-53}$; samples only),
+(`gw.efermi.band_in_occupation_window`, $|w|\ge 10^{-5}$; samples only),
 including negative transition energies and signed metallic weights; the exact
 moments keep every weight. The occupation envelope
 $|f_nu_m|\le A_fA_u\min(1,e^{\beta(E_m-E_n)})$, with $A=\max(1,\max|\cdot|)$ and

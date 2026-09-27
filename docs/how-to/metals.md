@@ -4,9 +4,9 @@ This page turns a request of the form "QSGW on *metal* within $E_{\rm win}$ of
 $E_F$ on an $N^3$ grid" into a deck. Key meanings are in the
 [input reference](../input_reference.md); the map, its stop rules and the SC
 head routes are in [self-consistency](../self_consistency.md); the screening
-theory, including the $q\to0$ head, is in
-[metallic MPA screening](../theory/metallic-mpa-screening.md). This page does
-not restate them.
+theory is in [metallic MPA screening](../theory/metallic-mpa-screening.md) and
+the $q\to0$ head in [the metallic q→0 head](../theory/metal-q0-head.md). This
+page does not restate them.
 
 ## Fixed rules for every metal
 
@@ -21,9 +21,10 @@ not restate them.
   comparison only, and it refuses time-reversal-broken metals
   (`GATE mpa_ordered_metal`).
 - **One band support.** A band is in a χ or Σ branch iff its weight ($f$ or
-  $1-f$) is resolved in float64, $|w|\ge 2^{-53}$, i.e.
-  $|E-\mu|\le 53\ln2\,k_BT$. It is the same in the one-shot and every SC map,
-  so SC map 0 is the one-shot. There is no key.
+  $1-f$) is at least $10^{-5}$, i.e. $|E-\mu|\le 11.5\,k_BT$. A state that
+  crosses the cut between SC maps moves Σ by about $10^{-5}$ of its term,
+  0.01 meV. It is the same in the one-shot and every SC map, so SC map 0 is
+  the one-shot. There is no key.
 
 ## Inputs
 
@@ -46,7 +47,7 @@ the band energies from the NSCF output; a one-shot's `eqp0.dat` and the
 | pair window | `nval` = the occupied bands whose maximum over k lies above $E_F-E_{\rm win}$ | it sets the lower edge of the ISDF pair-density window, not the bottom of the QP window. Do not freeze deep bands with `sc_frozen_core_bands`: on Fe 3s/3p the frozen law is off by hundreds of meV (CLAIMS 2859) |
 | band sums | `number_bands`: the bands the NSCF has | the χ0 and Σ sums; band-count convergence is a separate study |
 | centroids | select on the Σ pair set, `--fit-window 0:B,0:number_bands` with `B = nelec + ncond`. First run `python3 -m centroid.kmeans_cli` with a large request and read `achieved numerical rank=r` in `kmeans.out`; then select $N_\mu$ between $0.5r$ and $1.3r$. The rank line appears only when the snapped candidates outnumber the request (`pruning: not applied` otherwise), so keep the probe request below the FFT-grid point count | the ISDF exchange error falls with $N_\mu/r$: RMS ≤ 1 meV near $0.5r$, max ≤ 1 meV near $1.3r$ (CLAIMS 2860). See [drivers](../drivers.md) |
-| head | `head_correction = no_local_fields` (direct charge head $S(\omega)$ with the Drude, Thomas–Fermi and Lindhard-cell terms), or `full` on a scalar deck | [metallic MPA screening](../theory/metallic-mpa-screening.md) owns the head model |
+| head | `head_correction = no_local_fields` (direct charge head: the interband $S(\omega)$ and the Fermi-surface Lindhard term, averaged over the q = 0 cell), or `full` on a scalar deck | [the metallic q→0 head](../theory/metal-q0-head.md) owns the head model |
 | SC head | `sc_head_update = off` (default: fixed DFT head on the DFT Fermi–Dirac state), or `dft_velocity` with `dipole.h5` | [self-consistency §7](../self_consistency.md#metals-direct-drude-head) |
 | stop rule | `sc_tol_ev = 1e-3` | 1 meV is the reproducibility the default `sigma_quadrature_eps` is chosen for; judge convergence by states near $E_F$ ([self-consistency §7](../self_consistency.md#7-metals)) |
 
