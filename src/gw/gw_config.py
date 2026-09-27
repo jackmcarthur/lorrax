@@ -1678,6 +1678,10 @@ _DEFAULTS = {
     # (owner 2026-09-24): cover (grow the grid over every protected
     # identity), clamp (the nearest grid edge), static (omega = 0).
     "sigma_out_of_grid": "cover",
+    # The requested Sigma states (owner 2026-09-27): DFT energies within
+    # E_F +/- this many eV, multiplet-closed (gw.qp_support).  Fe-class decks
+    # set 15.  nval/ncond keep setting the QP and ISDF pair windows.
+    "sigma_window_ev": 10.0,
     "sigma_w_model": "mpa",
     "sigma_w_accuracy": "production",
     # "" = the shared-pole resolver's own line and imaginary ladders.
@@ -2547,6 +2551,7 @@ def _input_response(
         omega_step_ev=float(params["sigma_omega_step_ev"]),
         regularization_ev=float(params["sigma_regularization_ev"]),
         out_of_grid=str(params["sigma_out_of_grid"]).strip().lower(),
+        window_ev=float(params["sigma_window_ev"]),
         w_model=str(params["sigma_w_model"]),
         w_accuracy=str(params["sigma_w_accuracy"]),
         w_support_sites_ev=str(params["sigma_w_support_sites_ev"]),
@@ -4007,6 +4012,10 @@ class DynamicSigmaConfig:
     #: ``sigma_out_of_grid``: cover | clamp | static, the QSGW Sigma(E)
     #: rule outside the sampled grid (``qsgw_utils.sigma_eval_omega``).
     out_of_grid: str = "cover"
+    #: ``sigma_window_ev``: the requested Sigma states are those with E_DFT
+    #: within E_F +/- this (eV), multiplet-closed; the sampled support stays
+    #: within it plus the plan pad (``gw.qp_support``).
+    window_ev: float = _DEFAULTS["sigma_window_ev"]
     w_model: str = "mpa"
     w_accuracy: str = "production"
     #: ``sigma_w_support_sites_ev``: "" (default, the shared-pole
@@ -4064,6 +4073,9 @@ class DynamicSigmaConfig:
                 "Sigma grid from the protected band range, which needs "
                 f"sigma_out_of_grid = cover (got {self.out_of_grid!r}); set both "
                 "edges for clamp or static.")
+        if not (np.isfinite(float(self.window_ev)) and float(self.window_ev) > 0.0):
+            raise ValueError(
+                f"sigma_window_ev must be a positive number of eV; got {self.window_ev!r}.")
         if self.out_of_grid not in ("cover", "clamp", "static"):
             raise ValueError(
                 "sigma_out_of_grid must be 'cover', 'clamp' or 'static'; got "

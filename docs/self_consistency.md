@@ -277,7 +277,9 @@ $\Sigma(E)$, not $\Sigma(0)$, for an active state outside the requested grid.
   $D \cup [\min_{n\in R} E^{\rm in}_n - P,\ \max_{n\in R} E^{\rm in}_n + P]$,
   a refusal (`GATE sigma_support_envelope`) if it would. $D$ is the deck's
   `sigma_omega_min_ev`/`sigma_omega_max_ev` (or patch list), fixed. $R$ is the
-  QP window's identities (`nval`, `ncond`) that the W model treats as active,
+  QP window's states with $|E^{\rm DFT} - E_F| \le W$ (`sigma_window_ev`,
+  default 10 eV, Fe-class decks 15; multiplet-closed at each k, decided at
+  the first plan) that the W model treats as active,
   outside `sc_frozen_core_bands`, and quasiparticles at the previous map,
   $Z \in (0, 1]$; under `clamp` and `static` only those inside the padded
   window (`scissor.sc_padded_window_ev`). $E^{\rm in}$ is DFT at map 0 and
@@ -291,9 +293,10 @@ $\Sigma(E)$, not $\Sigma(0)$, for an active state outside the requested grid.
   $E - \mu$ and the edge. A requested state with $Z \notin (0, 1]$ has no
   quasiparticle: its energy never moves the grid, and off the grid it reads
   the out-of-grid rule and is named in an `SC window no-quasiparticle`
-  line. A grid that reaches far above $E_F$ therefore means the deck
-  requested states there: the Na 8³ deck with `ncond` = 81 requests every
-  band, up to +96 eV. Old samples do not move on an extension and an interior
+  line. `nval`/`ncond` set the QP window and the ISDF pair window; a
+  window state outside $\pm W$ gets no Σ sample of its own and reads the
+  out-of-grid rule. Before `sigma_window_ev` the Na 8³ deck with `ncond` = 81
+  requested every band and grew the grid to +106 eV. Old samples do not move on an extension and an interior
   hole refuses. The Σ rule certificates below pad the band-sum states by
   $\max(2/1\ \mathrm{eV}, 10\%\,\lvert E - \mu\rvert)$.
   Coverage is judged in the frame the Σ build measures from: the current
