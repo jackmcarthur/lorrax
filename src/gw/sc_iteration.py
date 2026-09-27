@@ -2672,7 +2672,7 @@ def _sc_sampled_support(inputs, partition, energies_loop, mu_ev, active_n=None,
     if not inputs.config.compute_mode.is_dynamic:
         return None
     from .qp_support import (hold_support_ev, plan_support_ev, quasiparticle_mask,
-                             requested_states)
+                             requested_states, sigma_window_states)
 
     sigma = inputs.config.sigma
     session = inputs.fixed_quadrature_session
@@ -2689,8 +2689,17 @@ def _sc_sampled_support(inputs, partition, energies_loop, mu_ev, active_n=None,
     # W model treats as active (``active_n``: shared_pole_recipe.active_band_mask
     # on the fixed DFT ladder), never frozen core; owner 2026-09-27: only
     # quasiparticles move the support.
+    # The requested window E_F +/- W (sigma_window_ev) is decided once, on the
+    # first plan's input energies (DFT for a DFT seed), and held by identity.
+    window_ev = getattr(sigma, "window_ev", None)
+    window_kn = None if session is None else session.get("sigma_window_states")
+    if window_kn is None:
+        window_kn = sigma_window_states(energy_relative_ev, window_ev)
+        if session is not None:
+            session["sigma_window_states"] = window_kn
     everyone = requested_states(sigma, inputs.config.sc.frozen_core_bands,
-                                energy_relative_ev, required_kn, active_n)
+                                energy_relative_ev, required_kn, active_n,
+                                window_kn=window_kn)
     quasiparticle = (None if z_in_kn is None else
                      quasiparticle_mask(np.broadcast_to(z_in_kn, energies_loop.shape)))
     states = everyone if quasiparticle is None else everyone & quasiparticle
@@ -2737,6 +2746,10 @@ def _record_sc_window_plan(inputs, iteration, support):
                    "Z outside (0, 1] at the previous map, off the grid; it does not "
                    "move the support and reads the out-of-grid rule")
     if event in ("plan", "one-shot"):
+        window_ev = getattr(inputs.config.sigma, "window_ev", None)
+        _record_sc(inputs, f"SC requested states (map {iteration}): E_DFT within E_F +/- "
+                   f"{window_ev} eV (sigma_window_ev), multiplet-closed, active, "
+                   f"non-frozen: {int(req.sum())} of {req.size}; grid {grids}")
         outside = req & ((e < sampled_grid[0]) | (e > sampled_grid[-1]))
         for k, n in zip(*np.nonzero(outside)):
             _record_sc(inputs, f"SC sampled-support growth: {state(k, n)}, "
