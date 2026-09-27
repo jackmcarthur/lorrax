@@ -290,7 +290,7 @@ _SC_PAD_BASE_EV = 0.5
 _SC_PAD_FRACTION = 0.10
 
 
-def sc_state_pad_ev(energy_relative_to_mu_ev):
+def eqp2_state_margin_ev(energy_relative_to_mu_ev):
     """Energy drift allowance of the clamp/static SC classification window.
 
     The sampled Sigma(omega) support uses flat pads (``gw.qp_support``).

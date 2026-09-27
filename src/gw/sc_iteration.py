@@ -106,12 +106,6 @@ class ConvergenceVerdict:
     #: The stall rule fired (label-free residual flat over 12 maps).
     #: Always paired with converged=False.
     stalled: bool = False
-    #: States within the Sigma(E)/Sigma(0) jump of a sampled-grid edge
-    #: (``qsgw_utils.sigma_grid_edge_ambiguity``): there the map is
-    #: discontinuous and the fixed point reached depends on the path.
-    edge_ambiguous: int = 0
-    edge_ambiguous_detail: str = ""
-
     def summary(self) -> str:
         """The log line.  Says which number is the test and which is not."""
         return (
@@ -122,9 +116,7 @@ class ConvergenceVerdict:
             f"RMS_all({self.n_total}) = {self.rms_all_ev:.6f} eV "
             f"(diagnostics, NOT the criterion) | "
             f"{'CONVERGED' if self.converged else ('STALLED at floor, not converged' if self.stalled else 'not converged')}"
-            + (f" | fixed point NOT UNIQUE: {self.edge_ambiguous} state(s) within "
-               f"the Sigma(E)/Sigma(0) jump of a Sigma-grid edge "
-               f"({self.edge_ambiguous_detail})" if self.edge_ambiguous else ""))
+)
 
 
 @dataclass(frozen=True)
@@ -422,22 +414,6 @@ class SCInputs:
     record_fn: Callable | None = None
 
 
-def _freeze_core_block_to_dft(H, e_dft_kn_ry, n_frozen):
-    """Hold bands ``[0, n_frozen)`` at the DFT Hamiltonian block.
-
-    In the DFT basis that block is ``diag(E_DFT)`` with no coupling to the
-    other bands, so the frozen states keep their DFT energies and orbitals
-    exactly.  Only the logical ``[:n_frozen]`` energies are read; padded
-    carrier columns are untouched.
-    """
-    nb = H.shape[-1]
-    idx = jnp.arange(nb)
-    frozen = idx < int(n_frozen)
-    either = frozen[:, None] | frozen[None, :]
-    H = jnp.where(either[None], jnp.zeros((), H.dtype), H)
-    e = jnp.asarray(e_dft_kn_ry)[:, :int(n_frozen)].astype(H.dtype)
-    diag = jnp.diagonal(H, axis1=-2, axis2=-1).at[:, :int(n_frozen)].set(e)
-    return H.at[:, idx, idx].set(diag)
 
 
 @dataclass(frozen=True)
@@ -819,17 +795,8 @@ def make_initial_state_from_qp_rotations(
     seed_mu_ry = (
         float(occ_state.mu_ry) if occ_state is not None else
         float(_midgap_efermi(jnp.asarray(E_full), int(inputs.meta.nelec))))
-    seed_policy = artifact.get("sc_seed_policy")
-    if seed_policy is not None and (
-            seed_policy["active_scissor"] is not None
-            or not np.all(seed_policy["protected_mask"])
-            or not np.all(seed_policy["in_range_mask"])):
-        raise ValueError(
-            f"SC QP seed {artifact_path} carries an active-window scissor or "
-            "a partial band partition. Both were retired: every QP-window "
-            "identity keeps its full Sigma (owner rule 2026-09-22) and "
-            "nothing reads a seeded law. Seed from a run written after that "
-            "rule.")
+    # Only the authenticated Hamiltonian seeds this solve. The new deck's
+    # requested bands define its partition; no old scissor law is imported.
     partition, _, _, _ = _classify_sc_partition(
         E_loop, U_loop, occ_state, previous_partition=None, iteration=0,
         inputs=inputs, current_mu_ry=seed_mu_ry)
@@ -2669,8 +2636,7 @@ def _sc_sampled_support(inputs, partition, energies_loop, mu_ev, active_n=None,
     deck = np.asarray(inputs.config.omega_grid_ev, dtype=float)
     part = _partition_on_loop(partition, inputs)
     energy = energies_loop - mu_ev
-    states = requested_states(sigma, inputs.config.sc.frozen_core_bands,
-                              energy, part.protected_mask, active_n)
+    states = requested_states(energy, part.protected_mask)
     if session is None or "omega_grid_ev" not in session:
         grid, envelope = plan_support_ev(sigma, deck, energy, states)
         event = "one-shot" if session is None else "plan"
@@ -2833,7 +2799,6 @@ def _classify_sc_partition(
             e_reference_loop, n_occ=int(inputs.meta.nelec),
             nval=inputs.config.nval, ncond=inputs.config.ncond,
             gap_ev=inputs.config.sigma.regularization_ev)
-        protected[:, :int(inputs.config.sc.frozen_core_bands)] = False
         partition = BandPartition(jnp.asarray(protected), jnp.asarray(protected))
         _record_sc(inputs, f"SC band classes: {int(protected.sum())} protected / "
                    f"{int((~protected).sum())} rotating; nval/ncond request "
@@ -3901,20 +3866,6 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
     # block and can create symmetry breaking in the next SC state. BGW
     # diagonal averaging belongs to the one-shot/output convention.
     H_qp_dft_full = inputs.kin_ion_dft + delta_h_dft
-    n_frozen_core = int(inputs.config.sc.frozen_core_bands)
-    if n_frozen_core > 0:
-        # Owner 2026-09-23 (CrI3): semicore off the Sigma grid is not updated
-        # at all -- neither Sigma(omega=0) nor a scissor -- but stays in every
-        # band sum.  H is on the loop's k-set; take the same rows of E_DFT.
-        _e_frz = inputs.e_dft_active_kn_ry
-        if not ks.is_identity:
-            _e_frz = ks.select(_e_frz)
-        H_qp_dft_full = _freeze_core_block_to_dft(
-            H_qp_dft_full, _e_frz, n_frozen_core)
-        if int(state.iteration) == 0:
-            _record_sc(inputs, f"    SC frozen core: bands 1-{n_frozen_core} "
-                               "held at their DFT block (not updated)")
-
     # ── THE UN-EXTRAPOLATED TWIN ────────────────────────────────────────
     # Present only when ``use_band_extrapolation`` drove this stage's Σ.
     # Assembled through the SAME three steps as the carry above — k-select,
@@ -4240,7 +4191,7 @@ def _apply_scissor_partition_policy(
             # gap (the same deck's 22 eV HOMO-LUMO gap at k=0) promotes
             # nothing and a scissored state cannot re-enter as protected on
             # one map and leave on the next.
-            from .scissor import sc_state_pad_ev
+            from .scissor import eqp2_state_margin_ev
 
             e_ref = np.asarray(e_dft_kn_ry, dtype=np.float64)
             e_fermi_ry = float(efermi_dft_ry)
@@ -4255,7 +4206,7 @@ def _apply_scissor_partition_policy(
             frontier_kn[here, top[have]] = True
             nxt = np.minimum(top + 1, ncols - 1)
             inside = np.zeros(e_ref.shape[0], dtype=bool)
-            near_ry = float(sc_state_pad_ev(0.0)) / RYD_TO_EV
+            near_ry = float(eqp2_state_margin_ev(0.0)) / RYD_TO_EV
             inside[have] = (
                 e_ref[here, nxt[have]] - e_fermi_ry) <= near_ry
             frontier_kn[rows[have & inside], nxt[have & inside]] = True

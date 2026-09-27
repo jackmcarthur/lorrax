@@ -1380,7 +1380,6 @@ _DEFAULTS = {
     # Owner 2026-09-23: the lowest N bands (1-based 1..N; semicore) are held
     # at their DFT Hamiltonian block in every QSGW map -- still in the Sigma_x
     # and chi0 sums, never updated.  0 updates every QP-window band.
-    "sc_frozen_core_bands": 0,
     # Optional fourth text output beside the ordinary one-shot eqp0/eqp1
     # pair.  This iterates ONLY the eigenvalues/eigenvectors against the
     # already-computed full Sigma_c(omega) table: W, screening, and Sigma
@@ -1676,7 +1675,6 @@ _DEFAULTS = {
     # fractions, widths and gates are unchanged, and the sites enter
     # recipe_version/recipe_hash so no store crosses ladders on restart.
     "sigma_w_support_sites_ev": "",
-    "sigma_window_edge_factor": 1.5,
     # PPM sigma options
     # PPM invalid-pole treatment (BGW invalid_gpp_mode). 'zero' drops Omega^2<0
     # poles (BGW mode 0); '2ry' keeps the fit's fallback pole (BGW mode 2);
@@ -2535,7 +2533,7 @@ def _input_response(
         w_model=str(params["sigma_w_model"]),
         w_accuracy=str(params["sigma_w_accuracy"]),
         w_support_sites_ev=str(params["sigma_w_support_sites_ev"]),
-        window_edge_factor=float(params["sigma_window_edge_factor"]),
+        window_edge_factor=1.0,
         fermi_reference=str(params["fermi_reference"]).strip().lower(),
         quadrature_eps=float(params["sigma_quadrature_eps"]),
         quadrature_cache_dir=str(
@@ -2595,7 +2593,6 @@ def _input_iteration(
             "sc_dump_dir") or None,
         exact_degeneracy_tol_ev=float(
             params["sc_exact_degeneracy_tol_ev"]),
-        frozen_core_bands=int(params["sc_frozen_core_bands"]),
         eigh=_linalg.sc_eigh,
         head_update=str(params["sc_head_update"]).strip().lower(),
         initial_qp_rotations_file=(
@@ -2910,7 +2907,8 @@ def _report_early_retired_keys(
                 "IGNORED — the LORRAX-native eqp0 filename is now "
                 "'sigma_diag_file'; eqp0.dat / eqp1.dat are written "
                 "automatically"))
-    for legacy_key in ("sigma_window_ev", "sigma_out_of_grid", "sigma_omega_patches_ev"):
+    for legacy_key in ("sigma_window_ev", "sigma_out_of_grid", "sigma_omega_patches_ev",
+                       "sigma_window_edge_factor", "sc_frozen_core_bands"):
         if section.get(legacy_key, fallback=None) is not None:
             raise ValueError(f"Input key '{legacy_key}' is retired: nval/ncond select "
                              "protected bands; sigma_omega_min_ev/max_ev only enlarge "
@@ -3959,12 +3957,6 @@ def sigma_requested_edges_ev(sigma):
             step if hi is None else float(hi))
 
 
-def sigma_classification_window_ev(sigma):
-    """The requested window (eV) band classification reads; unset is unbounded."""
-    lo, hi = getattr(sigma, "omega_min_ev", None), getattr(sigma, "omega_max_ev", None)
-    return (-np.inf if lo is None else float(lo), np.inf if hi is None else float(hi))
-
-
 @dataclass(frozen=True)
 class DynamicSigmaConfig:
     """Ansatz-neutral real-frequency Sigma grid and output policy."""
@@ -4070,10 +4062,6 @@ class DynamicSigmaConfig:
     def requested_edges_ev(self):
         """The requested grid edges; an unset edge is the sample next to E_F."""
         return sigma_requested_edges_ev(self)
-
-    def classification_window_ev(self):
-        """The requested window for band classification; unset is unbounded."""
-        return sigma_classification_window_ev(self)
 
 
 
@@ -4219,7 +4207,6 @@ class SCConfig:
     mixing: float
     dump_dir: str | None
     exact_degeneracy_tol_ev: float = 1.0e-4
-    frozen_core_bands: int = 0
     eigh: str = "auto"    # "auto" | "native" | "distributed"
     #: "off" | "parallel_transport" | "dft_velocity" | "interband_commutator".
     #: Every non-off mode rebuilds the head. Only ``dft_velocity`` with an
@@ -4271,8 +4258,6 @@ class SCConfig:
                 "sc_exact_degeneracy_tol_ev must be in (0, 1e-4] eV. "
                 "The 0.1 meV ceiling separates accidental degeneracy from "
                 "resolved physical splittings; it is not an SC damping knob.")
-        if self.frozen_core_bands < 0:
-            raise ValueError("sc_frozen_core_bands must be >= 0.")
         if self.eigh not in ("auto", "native", "distributed"):
             raise ValueError(
                 f"sc_eigh must be 'auto', 'native' or 'distributed'; "

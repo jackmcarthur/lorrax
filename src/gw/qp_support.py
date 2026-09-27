@@ -29,16 +29,13 @@ def quasiparticle_mask(z_kn):
     return np.isfinite(z) & (z > 0.0) & (z_down <= 1.0)
 
 
-def requested_states(sigma, frozen_core_bands, energy_relative_ev, required_kn,
-                     active_n=None, quasiparticle_kn=None):
+def requested_states(energy_relative_ev, required_kn):
     """Protected identities; omega endpoints and previous Z never select bands."""
-    required = np.array(np.broadcast_to(np.asarray(required_kn, bool),
-                                       np.shape(energy_relative_ev)))
-    required[:, :int(frozen_core_bands)] = False
-    return required
+    return np.array(np.broadcast_to(np.asarray(required_kn, bool),
+                                    np.shape(energy_relative_ev)))
 
 
-def plan_support_ev(sigma, deck_grid_ev, energy_relative_ev, requested_kn, plan_index=0):
+def plan_support_ev(sigma, deck_grid_ev, energy_relative_ev, requested_kn):
     """Return the single contiguous support and its unrounded envelope."""
     e = np.asarray(energy_relative_ev, float)
     p = np.broadcast_to(np.asarray(requested_kn, bool), e.shape)

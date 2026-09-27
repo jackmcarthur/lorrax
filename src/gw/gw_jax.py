@@ -855,21 +855,17 @@ def _prepare_static_head(config, do_screened, head_resolver, meta, mode, print0,
 
 def _oneshot_sampled_support(config, enk_dft, wfn, occupation_state,
                              material_class, print_fn):
-    """The one-shot's sampled Sigma(omega) support: the first plan of
-    ``gw.qp_support`` (the deck request joined with every requested state's
-    E_DFT +/- 2 eV), the plan SC map 0 makes, so SC map 0 is this calculation.
+    """Plan from requested bands on the full DFT ladder, as SC map 0 does.
 
-    The requested states are the Sigma window's identities the W model treats
-    as active, judged in the frame the Sigma build measures from
-    (``efermi.sigma_frame_mu_ev``).  Under ``cover`` an active state outside
-    the requested grid reads its own Sigma(E).
+    The loaded WFN energies are small metadata. Using the complete ladder
+    lets an edge close across a manifold beyond the output band's prefix.
     """
     from dataclasses import replace
 
     from .efermi import sigma_frame_mu_ev
     from .qp_support import plan_support_ev, requested_states
     from .band_partition import requested_band_mask
-    e_ry = np.asarray(enk_dft, dtype=np.float64)
+    e_ry = np.asarray(wfn.energies[0, :, :config.nband], dtype=np.float64)
     metal = material_class == "metal" and occupation_state is not None
     mu_ev = sigma_frame_mu_ev(
         config, wfn, e_ry,
@@ -878,12 +874,12 @@ def _oneshot_sampled_support(config, enk_dft, wfn, occupation_state,
     requested = np.asarray(config.omega_grid_ev, dtype=np.float64)
     energy = e_ry * RYD_TO_EV - mu_ev
     states = requested_states(
-        config.sigma, config.sc.frozen_core_bands, energy,
+        energy,
         requested_band_mask(e_ry * RYD_TO_EV, n_occ=int(wfn.nelec),
                             nval=config.nval, ncond=config.ncond,
                             gap_ev=config.sigma.regularization_ev))
-    grown, _ = plan_support_ev(config.sigma, requested, energy, states, 0)
-    if grown.size == requested.size:
+    grown, _ = plan_support_ev(config.sigma, requested, energy, states)
+    if np.array_equal(grown, requested):
         return config
     print_fn(f"  Sigma sampled support (plan 0, clamp reads): "
              f"[{requested[0]:+.6f}, {requested[-1]:+.6f}] -> "
