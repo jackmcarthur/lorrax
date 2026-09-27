@@ -140,7 +140,10 @@ class CrystalData:
         # ── lattice ──
         a1, a2, a3 = _vec(_text(root, "a1")), _vec(_text(root, "a2")), _vec(_text(root, "a3"))
         avec_bohr = np.array([a1, a2, a3])
-        alat = float(np.linalg.norm(a1))
+        # QE's lattice parameter (celldm(1)); |a1| only when the XML omits it
+        # (they differ for e.g. bcc, where |a1| = alat·√3/2).
+        structure = _all(root, "atomic_structure")[0].attrib
+        alat = float(structure.get("alat", np.linalg.norm(a1)))
         blat = 2.0 * np.pi / alat
         avec = avec_bohr / alat
         bvec = np.array([_vec(_text(root, f"b{i}")) for i in (1, 2, 3)])
