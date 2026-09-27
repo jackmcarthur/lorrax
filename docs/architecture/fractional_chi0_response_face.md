@@ -61,8 +61,8 @@ with positive times t_l and weights h_l from a damped-line rule, followed by
 one FFT R → q.
 
 **Band weights.** `_occupation_support_slices` returns the smallest
-contiguous band ranges on which |f|, respectively |1 − f|, is resolved in
-float64, |w| ≥ 2⁻⁵³ (`gw.efermi.band_in_occupation_window`). MP overshoot is kept by magnitude, and a
+contiguous band ranges on which |f|, respectively |1 − f|, is at least
+10⁻⁵ (`gw.efermi.band_in_occupation_window`). MP overshoot is kept by magnitude, and a
 partially occupied band belongs to both. The weights are f̃ = f·1_f and
 ũ = (1 − f)·1_u, inverted before masking so that a band outside the empty
 support carries exactly zero. On the face layout a support is applied as a

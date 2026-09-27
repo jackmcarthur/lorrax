@@ -328,21 +328,21 @@ def test_a_gapped_step_state_is_untouched_by_any_admissible_clamp():
 # --------------------------------------------------------------------------
 
 def test_the_two_rules_are_not_the_same_rule():
-    """The branch floor is float64 resolution; the clamp is MP1's own support.
+    """The clamp changes the table's values; the floor decides branch membership.
 
-    The floor (``2**-53``) sits far below the clamp tolerance, so on an MP1
-    table the clamp is the binding cut: it drags the support edge in from
-    the underflow radius x=27.30 to x=4.31, and the branch predicate then
-    keeps what the table holds.
+    The floor (1e-5) sits above the default clamp tolerance (1e-8), so on an
+    MP1 table the clamp moves values but only ones the branch predicate
+    already excludes: the tables differ and both branch supports agree.
     """
-    assert OCCUPATION_WEIGHT_FLOOR < OCCUPATION_CLAMP_TOL_DEFAULT
+    assert OCCUPATION_WEIGHT_FLOOR > OCCUPATION_CLAMP_TOL_DEFAULT
     energies, f_raw = _metallic_table(nb=20001, span=0.6)
     f_clamped = np.asarray(mp1_occupations(
         jnp.asarray(energies[None, :]), 0.0, 0.01,
         OCCUPATION_CLAMP_TOL_DEFAULT))[0]
-    kept_raw = int(np.count_nonzero(band_in_occupation_window(f_raw)))
-    kept_clamped = int(np.count_nonzero(band_in_occupation_window(f_clamped)))
-    assert kept_clamped < kept_raw, (kept_raw, kept_clamped)
+    assert np.count_nonzero(f_clamped != f_raw) > 0
+    for w_raw, w_clamped in ((f_raw, f_clamped), (1.0 - f_raw, 1.0 - f_clamped)):
+        np.testing.assert_array_equal(band_in_occupation_window(w_raw),
+                                      band_in_occupation_window(w_clamped))
 
 
 def test_the_fermi_surface_weight_is_deliberately_not_clamped():

@@ -430,10 +430,12 @@ receipts certify the unprojected model only.
 - Occupations are Fermi-Dirac only, and `occ_smearing_width_ry` is $k_BT$.
   Each map solves μ at a fixed electron count from its input spectrum
   (`_solve_occupation_state`); μ is never mixed.
-- A band is in a Σ or χ branch iff its weight ($f$, or $1-f$) is resolved in
-  float64, $|w|\ge 2^{-53}$ (`gw.efermi.band_in_occupation_window`), for the
-  one-shot and every map alike. No state switches a branch on or off as it
-  moves; the retired 0.005 floor did, by 5.4 meV on Fe (CLAIMS 2793).
+- A band is in a Σ or χ branch iff its weight ($f$, or $1-f$) is at least
+  $10^{-5}$ (`gw.efermi.band_in_occupation_window`; $|E-\mu|\le11.5\,k_BT$ for
+  Fermi–Dirac), for the one-shot and every map alike. A state that crosses
+  the cut between maps switches one term by about $10^{-5}$ of its size,
+  0.01 meV; the retired 0.005 floor switched it by 5.4 meV on Fe
+  (CLAIMS 2793).
 - The energy-only tail above the QP window has exact-zero occupations. It
   still enters G and the response at its current shifted energies, and the
   window alone sets μ. A tail state that enters the fractional manifold

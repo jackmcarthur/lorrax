@@ -1,11 +1,10 @@
-"""A band is in a Green's-function branch iff its weight is resolved in float64.
+"""A band is in a Green's-function branch iff its weight is at least 1e-5.
 
 The branch weight is ``f`` on the occupied side and ``1 - f`` on the empty
-side.  ``gw.efermi.band_in_occupation_window`` keeps it iff
-``|w| >= 2**-53``, the smallest nonzero value of ``1.0 - f``: the float64
-resolution of the partition ``f + (1 - f) = 1``.  The conduction weight has
-that support by rounding; the floor gives the valence weight the same one
-instead of letting it run on to the underflow of ``f``.  The one-shot and every SC map
+side.  ``gw.efermi.band_in_occupation_window`` keeps it iff ``|w| >= 1e-5``:
+for Fermi-Dirac, ``|E - mu| <= 11.5 kBT``.  A state that crosses the cut
+between SC maps moves Sigma by about 1e-5 x its term (0.01 meV where the old
+0.005 floor moved it 5.38 meV, CLAIMS 2793).  The one-shot and every SC map
 use the same predicate, so SC map 0 is the one-shot.  The retired deck key
 ``occupation_window_threshold`` (a 0.005 weight floor by default) refuses.
 """
@@ -49,37 +48,39 @@ def _branch_masks(f):
     return got["cond"], got["val"]
 
 
-def test_the_floor_is_the_smallest_nonzero_conduction_weight():
+def test_the_floor_is_1e_minus_5():
     floor = OCCUPATION_WEIGHT_FLOOR
-    assert floor == 2.0 ** -53
-    assert 1.0 - np.nextafter(1.0, 0.0) == floor
-    w = np.asarray([0.0, np.nextafter(floor, 0.0), floor, 1e-300,
+    assert floor == 1e-5
+    w = np.asarray([0.0, np.nextafter(floor, 0.0), floor, 2.0 ** -53,
                     -floor, 0.5, 1.0])
     np.testing.assert_array_equal(band_in_occupation_window(w),
                                   [False, False, True, False, True, True, True])
 
 
-def test_the_conduction_weight_support_is_unchanged():
-    """``1.0 - f`` is 0 or at least 2**-53 for f in [0.5, 1]: floor-invariant."""
-    f = np.asarray([0.5, 0.75, 1.0 - 2.0 ** -53, 1.0 - 3 * 2.0 ** -53, 1.0])
+def test_the_conduction_weight_has_the_same_floor():
+    """``1.0 - f`` below 1e-5 leaves the empty branch, as ``f`` does the occupied."""
+    f = np.asarray([0.5, 1.0 - 2e-5, 1.0 - 5e-6, 1.0 - 2.0 ** -53, 1.0])
     u = 1.0 - f
-    np.testing.assert_array_equal(band_in_occupation_window(u), u != 0.0)
+    np.testing.assert_array_equal(band_in_occupation_window(u),
+                                  [True, True, False, False, False])
 
 
-def test_fermi_dirac_valence_support_ends_at_53_ln2_kbt():
-    """f >= 2**-53 iff E - mu <= kBT * 53 ln 2 = 36.74 kBT."""
+def test_fermi_dirac_support_ends_at_11_5_kbt_on_both_sides():
+    """|w| >= 1e-5 iff |E - mu| <= kBT ln(1e5 - 1) = 11.51 kBT."""
     kbt = 0.02
-    E = np.asarray([0.0, 36.5, 37.0]) * kbt
+    E = np.asarray([-11.6, -11.4, 0.0, 11.4, 11.6]) * kbt
     f = np.asarray(efermi.fd_occupations(E[None, :], 0.0, kbt))[0]
-    _cond, val = _branch_masks(f)
-    np.testing.assert_array_equal(val, [True, True, False])
+    cond, val = _branch_masks(f)
+    np.testing.assert_array_equal(val, [True, True, True, True, False])
+    np.testing.assert_array_equal(cond, [False, True, True, True, True])
 
 
-def test_states_the_old_floor_dropped_are_kept():
-    """The CLAIMS 2793 pair straddled 0.005; both belong to the branch now."""
-    f = [0.00499944814812, 0.00500410083235, 1e-15, 1e-18, 0.0]
+def test_the_claims_2793_pair_is_kept_and_the_float64_tail_dropped():
+    """The CLAIMS 2793 pair straddled 0.005; both belong to the branch now.
+    Weights below 1e-5, which the float64 floor 2**-53 kept, do not."""
+    f = [0.00499944814812, 0.00500410083235, 2e-5, 5e-6, 1e-15, 0.0]
     _cond, val = _branch_masks(f)
-    np.testing.assert_array_equal(val, [True, True, True, False, False])
+    np.testing.assert_array_equal(val, [True, True, True, False, False, False])
 
 
 def test_negative_mp1_weights_are_kept_and_zeros_excluded():
@@ -96,9 +97,9 @@ def test_an_insulating_branch_has_no_weight_and_is_untouched():
 
 def test_chi_supports_use_the_same_predicate():
     from gw.w_isdf import _occupation_support_slices
-    occ = np.asarray([[1.0, 1.0 - 1e-17, 0.4, 1e-17, 1e-15, 0.0]])
+    occ = np.asarray([[1.0, 1.0 - 1e-6, 0.4, 1e-4, 1e-6, 0.0]])
     f_slice, u_slice = _occupation_support_slices(occ)
-    assert f_slice == slice(0, 5)
+    assert f_slice == slice(0, 4)
     assert u_slice == slice(2, 6)
     gapped = np.asarray([[1.0, 1.0, 0.0, 0.0]])
     assert _occupation_support_slices(gapped) == (slice(0, 2), slice(2, 4))
@@ -112,8 +113,10 @@ def test_there_is_one_predicate():
 
 def test_the_response_bank_samples_the_same_support():
     from gw.response_bank import response_sample_weights
-    f = np.asarray([1.0, 0.5, 1e-15, 1e-17, 0.0])
+    f = np.asarray([1.0, 1.0 - 1e-6, 0.5, 1e-4, 1e-6, 0.0])
     ft, ut, receipt = response_sample_weights(f, 1.0 - f)
+    np.testing.assert_array_equal(ft != 0, [True, True, True, True, False, False])
+    np.testing.assert_array_equal(ut != 0, [False, False, True, True, True, True])
     np.testing.assert_array_equal(ft != 0, band_in_occupation_window(f))
     np.testing.assert_array_equal(ut != 0, band_in_occupation_window(1.0 - f))
     assert receipt["occupation_activity_floor"] == OCCUPATION_WEIGHT_FLOOR
