@@ -1369,7 +1369,9 @@ def plan_sigma_windows(
     omega_grid = np.asarray(omega_ry, dtype=np.float64)
     state_rows, geometry = _product_geometry(branch_rows, eta, edge)
 
-    all_stats = [row["all"] for _, row in summaries if row["all"] is not None]
+    certificate_rows = (summaries if certificate_pole_summaries is None
+                        else tuple(certificate_pole_summaries))
+    all_stats = [row["all"] for _, row in certificate_rows if row["all"] is not None]
     far_pole = 4. * max(row[1] for row in all_stats)
     far_gamma = 4. * max(row[3] for row in all_stats)
     specs, plan_specs, branch_reports = [], [], []
