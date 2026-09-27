@@ -8,11 +8,16 @@ stays inside
 * ``D`` is the deck's explicit request (``sigma_omega_min_ev`` /
   ``sigma_omega_max_ev``, or the patch list): a fixed interval that never grows.
   Unset edges give the sample next to E_F.
-* ``R`` is the requested states: the QP-window identities (nval/ncond) the W
+* ``R`` is the requested states (owner 2026-09-27): the QP-window states
+  whose DFT energy lies within E_F ± W (``sigma_window_ev``, default 10 eV;
+  Fe-class decks 15), closed over degenerate multiplets at each k
+  (:func:`sigma_window_states`, decided once at the first plan), that the W
   model treats as active (``shared_pole_recipe.active_band_mask``), outside
   ``sc_frozen_core_bands``, and quasiparticles at the previous map
   (:func:`quasiparticle_mask`).  Under ``clamp``/``static`` only those inside
-  the padded requested window (``scissor.sc_padded_window_ev``).
+  the padded requested window (``scissor.sc_padded_window_ev``).  ``nval`` /
+  ``ncond`` still set the QP window and the ISDF pair window; a window state
+  outside ±W gets no Sigma sample of its own and reads the out-of-grid rule.
 * ``E_in`` is each state's input energy for the map: DFT at the one-shot and SC
   map 0, the carried QP eigenvalue after.  It is never a root: eqp0, eqp1, Z
   and a fixed-point solve do not enter this module.
@@ -77,8 +82,41 @@ def quasiparticle_mask(z_kn):
     return np.isfinite(z) & (z > 0.0) & (z_down <= 1.0)
 
 
+#: Two states at one k closer than this (eV) are one multiplet for the
+#: requested-window closure (the metals recipe's 1 meV band-edge tolerance).
+WINDOW_MULTIPLET_TOL_EV = 1.0e-3
+
+
+def sigma_window_states(energy_dft_relative_ev, window_ev,
+                        tol_ev=WINDOW_MULTIPLET_TOL_EV):
+    """``|E_DFT - E_F| <= W`` per state, closed over multiplets at each k.
+
+    ``energy_dft_relative_ev`` is ``(nk, nb)`` DFT energies about E_F, sorted
+    per k (DFT identity order).  A state within ``tol_ev`` of a member at the
+    same k joins it, so the window edge never splits a degenerate multiplet
+    (INVARIANTS 14).  ``window_ev=None`` requests every state.
+    """
+    energy = np.asarray(energy_dft_relative_ev, dtype=np.float64)
+    if window_ev is None:
+        return np.ones(energy.shape, dtype=bool)
+    w = float(window_ev)
+    if not (np.isfinite(w) and w > 0.0):
+        raise ValueError(f"sigma_window_ev must be a positive number of eV; got {window_ev!r}")
+    inside = np.abs(energy) <= w
+    out = inside.copy()
+    for k in range(energy.shape[0]):
+        order = np.argsort(energy[k], kind="stable")
+        e = energy[k, order]
+        # multiplet ids along the sorted ladder: a new id at every gap > tol
+        ids = np.concatenate(([0], np.cumsum(np.diff(e) > tol_ev)))
+        member = np.zeros(int(ids[-1]) + 1, dtype=bool) if ids.size else np.zeros(0, bool)
+        np.logical_or.at(member, ids, inside[k, order])
+        out[k, order] = member[ids]
+    return out
+
+
 def requested_states(sigma, frozen_core_bands, energy_relative_ev, required_kn,
-                     active_n=None, quasiparticle_kn=None):
+                     active_n=None, quasiparticle_kn=None, window_kn=None):
     """The requested set ``R`` of this map (module docstring), ``(nk, nb)`` bool."""
     energy = np.asarray(energy_relative_ev, dtype=np.float64)
     required = np.array(np.broadcast_to(
@@ -94,6 +132,8 @@ def requested_states(sigma, frozen_core_bands, energy_relative_ev, required_kn,
         from .scissor import sc_padded_window_ev
         win_lo, win_hi = sc_padded_window_ev(*sigma_classification_window_ev(sigma))
         required &= (energy >= win_lo) & (energy <= win_hi)
+    if window_kn is not None:
+        required &= np.asarray(window_kn, dtype=bool)
     if quasiparticle_kn is not None:
         required &= np.asarray(quasiparticle_kn, dtype=bool)
     return required
