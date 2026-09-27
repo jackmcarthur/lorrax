@@ -437,7 +437,7 @@ def _prepare_isdf_carriers(
             wfns, meta, occupation_state=oneshot_occupation_state,
             trs_allowed=sym.trs_allowed,
             state_capacity=wfn.occupation_state_capacity,
-            kweights=full_k_quadrature_weights(wfn, sym))
+            kweights=full_k_quadrature_weights(wfn, wfn.symmetry()))
         meta.shared_pole_recipe = resolve_shared_pole_recipe(
             config, wfns, meta, mesh_xy=mesh_xy, print_fn=print0)
     wfns_transverse = getattr(isdf, 'wf_bundle_transverse', None)
