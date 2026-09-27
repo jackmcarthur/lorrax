@@ -469,7 +469,6 @@ class PlaneWaveGW:
             quadrature_cache_dir=resolve_sigma_box_cache_dir(config.sigma.quadrature_cache_dir,
                                                              config.input_dir),
             omega_grid_step_ry=float(config.sigma.omega_step_ev) / RYD_TO_EV,
-            occupation_window_threshold=float(config.mpa.occupation_window_threshold),
             # one pole batch: every τ node pays one pair convolution, whatever the pole count
             pole_batch_size=min(int(config.mpa.n_poles), 8), material_class="insulator",
             tau_kernel_factory=factory, print_fn=print_fn)
