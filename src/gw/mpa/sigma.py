@@ -1098,6 +1098,7 @@ def _integrate_sigma_batches(
     brackets=None,
     band_counts=None,
     odd_residue_off=False,
+    capacity_stage="sigma",
     w_synthesis=None,
     tau_kernel_factory=None,
     q_wedge=None,
@@ -1172,7 +1173,7 @@ def _integrate_sigma_batches(
                            tuple(sorted(face_kwargs.items(), key=lambda kv: kv[0])))
             tau_kernel = SynthesisTau(
                 sigma_kij, w_synthesis, psi_coh_yr, psi_proj_yn, w_synthesis.native,
-                "sigma.synthesis.window", meta, spatial_key, (k_unfold_plan,))
+                f"{capacity_stage}.synthesis.window", meta, spatial_key, (k_unfold_plan,))
         else:
             tau_kernel = get_shared_sigma_tau_kernel(
                 mesh_xy=mesh_xy, kgrid=kgrid, brackets=brackets,
@@ -1645,6 +1646,7 @@ def compute_sigma_c_mpa_omega_grid(
     odd_reference=True,
     tau_kernel_factory=None,
     recipe_eta_role="sigma",
+    capacity_stage="sigma",
     print_fn=print,
 ):
     """Read a fitted MPA store, derive its windows, and compute Sigma_c.
@@ -1705,7 +1707,8 @@ def compute_sigma_c_mpa_omega_grid(
         n_poles = int(ledger["n_q_irr"])
         ordered_residues = False
         with timing.section("sigma.capacity"):
-            schedule = (_shared_pole_memory_schedule(meta, ledger, mesh_xy=mesh_xy, layout=wfns.layout)
+            schedule = (_shared_pole_memory_schedule(meta, ledger, mesh_xy=mesh_xy, layout=wfns.layout,
+                                                     stage=capacity_stage)
                         if sector_context is None else sector_context["schedule"](ledger))
         print_fn(f"  shared-pole Sigma capacity: {schedule}")
     elif isinstance(fit_src, MemoryPoleSource):
@@ -1877,7 +1880,7 @@ def compute_sigma_c_mpa_omega_grid(
                 with timing.section('tau.synthesis_setup'):
                     synthesis = (_shared_pole_w_synthesis(
                         reader, meta, ledger, frequencies, schedule, mesh_xy=mesh_xy,
-                        layout=schedule.get("factor_layout", wfns.layout))
+                        layout=schedule.get("factor_layout", wfns.layout), stage=capacity_stage)
                         if sector_context is None else sector_context["synthesis"](
                             reader, ledger, frequencies, schedule))
                 # A sector's caller owns its synthesis lifetime
@@ -1891,7 +1894,8 @@ def compute_sigma_c_mpa_omega_grid(
                         w_synthesis=synthesis,
                         tau_kernel_factory=(None if owned else
                                             sector_context["tau_kernel"]),
-                        tau_capacity=geometry.get("sc_tau_capacity"), print_fn=print_fn)
+                        tau_capacity=geometry.get("sc_tau_capacity"),
+                        capacity_stage=capacity_stage, print_fn=print_fn)
                 except BaseException:
                     if owned:
                         synthesis.close()

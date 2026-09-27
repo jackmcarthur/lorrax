@@ -133,7 +133,11 @@ def far_patches_ev(energy_rel_ev, rotating_kn, near_support_ev):
             lo = hi_near + step
         if lo < lo_near and hi > lo_near:
             hi = lo_near - step
-        out.append((float(np.floor(lo / step) * step), float(np.ceil(hi / step) * step)))
+        lo, hi = float(np.floor(lo / step) * step), float(np.ceil(hi / step) * step)
+        if out and lo - out[-1][1] <= 2.0 * pad:      # a short hole costs more than it saves
+            out[-1] = (out[-1][0], hi)
+        else:
+            out.append((lo, hi))
     return tuple(out)
 
 

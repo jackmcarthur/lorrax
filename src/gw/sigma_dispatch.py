@@ -1282,6 +1282,7 @@ def _compute_mpa_sigma(
                                regularization_width_ry=FAR_PATCH_ETA_EV / RYD_TO_EV,
                                omega_grid_step_ry=FAR_PATCH_STEP_EV / RYD_TO_EV,
                                recipe_eta_role="far_patch",
+                               capacity_stage=f"sigma.far{j}",
                                fixed_quadrature_session=(
                                    None if fixed_quadrature_session is None else
                                    fixed_quadrature_session.setdefault(
