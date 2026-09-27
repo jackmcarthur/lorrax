@@ -179,8 +179,11 @@ x_{n+1} = \sum_i \alpha_i\,(x_i + f_i), \qquad
 $$
 
 with $\alpha$ real, because Hermitian matrices form a real vector space. The
-metric $P$ is the per-k outer product of the window's identity mask; padding
-is zero. Two safeguards cost no evaluation and have no tunable constant:
+metric multiplies each residual by the per-k outer product of the window's
+identity mask and the square root of its star multiplicity; padding is zero.
+Its squared norm is therefore the full uniform k-grid sum, independent of
+the computational wedge. Full-grid rows retain unit weight. Two safeguards
+cost no evaluation and have no tunable constant:
 
 - **Conditioning filter.** The oldest differences are dropped until the
   unit-column Gram has condition number at most $10^{12}$.
