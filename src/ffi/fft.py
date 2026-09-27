@@ -1342,8 +1342,9 @@ def make_local_kconv_klead_outer(mesh: Mesh, kgrid, *, norm: str | None = "ortho
 def klead_outer_decode_refusal(mesh: Mesh, kgrid, n_c: int, optin: int | None = None) -> str | None:
     """``None`` when :func:`make_local_kconv_klead_outer_decode` serves this mesh, grid and band count.
 
-    CUDA needs :func:`klead_outer_refusal`'s conditions, the decode handler, the bank plus the staged
-    V tile, ``64·16·(RS + nk)`` B, within the opt-in shared memory, and the per-lane accumulator
+    CUDA needs :func:`klead_outer_refusal`'s conditions, the decode handler, the ping-pong's two
+    banks, ``2·64·16·RS`` B, within the opt-in shared memory (the handler stages the V tile beside
+    them when that fits too, else its Mid reads V from L2), and the per-lane accumulator
     ``ceil(nk/16)·ceil(n_c/8) <= 8`` m8n8 blocks (the handler's GATE mathdx-kconv-outer-decode-tile).
     A cpu mesh is always served.  Callers that get a reason keep the outer conv + XLA decode.
     """
@@ -1357,9 +1358,9 @@ def klead_outer_decode_refusal(mesh: Mesh, kgrid, n_c: int, optin: int | None = 
     kg = _check_kgrid(kgrid, "mathdx")
     nk = kg[0] * kg[1] * kg[2]
     have = _optin_smem_bytes() if optin is None else int(optin)
-    need = 64 * 16 * (((kg[0] * kg[1] * (kg[2] | 1)) | 1) + nk)
-    if have is None or need > have:
-        return f"the bank and the staged V tile need {need} B; the device has {have} B of opt-in shared memory"
+    need = 2 * 64 * 16 * ((kg[0] * kg[1] * (kg[2] | 1)) | 1)
+    if have is None or need + 16 > have:
+        return f"the two banks need {need} B; the device has {have} B of opt-in shared memory"
     blocks = -(-nk // 16) * -(-int(n_c) // 8)
     if blocks > 8:
         return f"the decode accumulator needs {blocks} m8n8 blocks per lane (nk {nk}, n_c {n_c}); the limit is 8"
@@ -1389,8 +1390,9 @@ def make_local_kconv_klead_outer_decode(mesh: Mesh, kgrid, *, norm: str | None =
     conj_r=False)`` returns ``A[k,c,b,y] = Σ_{a,x} conj(Pc[k,c,a,x]) U[k,a,x,b,y]`` (nk, n_c, b, my), with
     ``U`` the outer conv of ``(L, R, V_R, conj_r)`` -- ``bse_stack_matvec._decode``'s (t, μ) contraction,
     whose (s, ν) contraction stays the caller's einsum.  CUDA (``kconv_outer_cuda_ffi.cc``): one resident
-    block per SM; the (phase, item) tiles go round robin so a wave shares one x window in L2, and the
-    tile completing an item sums its partials in phase order (deterministic).  ``L`` and ``R`` are
+    block per SM, two 8-warp groups ping-ponging on two banks; the (phase, item) tiles go round robin
+    so a wave shares one x window in L2, and the tile completing an item sums its partials in phase
+    order (deterministic).  ``L`` and ``R`` are
     tiled into fragment order per call (K zero-padded to a multiple of 4, μ and ν to 8).  cpu: the
     outer conv's plan route and the einsum.
     Check :func:`klead_outer_decode_refusal` first.

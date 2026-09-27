@@ -153,36 +153,46 @@ __device__ __forceinline__ void line_of(int l, int n, int& j, int& li) {
     else { j = l / n; li = l % n; }
 }
 
-// The 3-D transform of TR resident padded rows (bank row j at bank + j*RS), axes z, y, x, all
-// threads of the block, one thread FFT per line; each pass that runs ends with __syncthreads()
-// (a length-1 axis writes nothing), so the transform ends synchronised whenever it wrote.  TR is
-// the plan's tr, a compile-time constant of the embedded program (as the family's rows per block).
-template <int NX, int NY, int NZ, int TR, int Arch, cufftdx::fft_direction Dir, class C>
-__device__ void transform3(C* bank) {
+// The 3-D transform of TR resident padded rows (bank row j at bank + j*RS), axes z, y, x, one
+// thread FFT per line, lines dealt to threads tid = 0..nthr-1; each pass that runs ends with
+// sync() (a length-1 axis writes nothing), so the transform ends synchronised whenever it wrote.
+// TR is the plan's tr, a compile-time constant of the embedded program (as the family's rows per
+// block).  The block form (every thread, __syncthreads) is the family's; a warp group of a block
+// (the BSE outer decode's ping-pong) passes its own thread index, size and named barrier.  Which
+// thread runs a line does not change the line's arithmetic.
+struct BlockSync {
+    __device__ void operator()() const { __syncthreads(); }
+};
+template <int NX, int NY, int NZ, int TR, int Arch, cufftdx::fft_direction Dir, class C, class Sync>
+__device__ void transform3(C* bank, int tid, int nthr, const Sync& sync) {
     constexpr int tr = TR;
     using G = Geo<NX, NY, NZ>;
     int j, li;
     if constexpr (NZ > 1) {
-        for (int l = threadIdx.x; l < tr * NX * NY; l += blockDim.x) {
+        for (int l = tid; l < tr * NX * NY; l += nthr) {
             line_of<TR>(l, NX * NY, j, li);
             line_fft<NZ, Arch, Dir>(bank + j * G::RS + li * G::ZP, 1);
         }
-        __syncthreads();
+        sync();
     }
     if constexpr (NY > 1) {
-        for (int l = threadIdx.x; l < tr * NX * NZ; l += blockDim.x) {
+        for (int l = tid; l < tr * NX * NZ; l += nthr) {
             line_of<TR>(l, NX * NZ, j, li);
             line_fft<NY, Arch, Dir>(bank + j * G::RS + (li / NZ) * NY * G::ZP + li % NZ, G::ZP);
         }
-        __syncthreads();
+        sync();
     }
     if constexpr (NX > 1) {
-        for (int l = threadIdx.x; l < tr * NY * NZ; l += blockDim.x) {
+        for (int l = tid; l < tr * NY * NZ; l += nthr) {
             line_of<TR>(l, NY * NZ, j, li);
             line_fft<NX, Arch, Dir>(bank + j * G::RS + G::plane_at(li), NY * G::ZP);
         }
-        __syncthreads();
+        sync();
     }
+}
+template <int NX, int NY, int NZ, int TR, int Arch, cufftdx::fft_direction Dir, class C>
+__device__ void transform3(C* bank) {
+    transform3<NX, NY, NZ, TR, Arch, Dir>(bank, (int)threadIdx.x, (int)blockDim.x, BlockSync{});
 }
 
 // The staged tile as a direct Load writes it: v(k, j) is element k of tile column j.

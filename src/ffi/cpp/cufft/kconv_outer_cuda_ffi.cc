@@ -387,14 +387,34 @@ static ffi::Error KleadOuterConv(cudaStream_t stream, ffi::AnyBuffer L, ffi::Any
 //   Rr  (nb, nyb, NK, H, 8, 4)      lane (g, t) of chunk h at k:  R[k, 4h + t, b, 8 yb + g]
 //   Pcr (na, nxb, NK, MB, 2, 8, 4)  lane (g, t) of (mb, h) at k:  Pc[k, 8 mb + g, a, 8 xb + 4h + t]
 // zero-padded past mx, my, n_c and K, so a padded cell of the tile holds T = 0 and adds 0.
-// Per pair: load (T on DMMA, K chunks in order, as the U arm) -> bank, inverse transform3, Mid
-// (V[x, y, k] staged in shared memory by cp.async one pair ahead; a tile shared by consecutive
-// pairs is staged once), forward transform3, decode.  The bank column of tile cell (x, y) is
-// x*8 + (y ^ f(x)), f(x) = 3(x&1) + 4((x>>1)&1): the load's D-fragment stores and the decode's
-// B-fragment reads then each hit 8 distinct 16-byte bank groups per phase (RS is 1 mod 8).
-// The transforms, Mid and the K sum are the U arm's, so A is main's contraction of the same U
-// in a different summation order (round-off class).  One block per SM: the accumulator is
-// NK * MB * 8 * 8 complex per block (128 KB at 8x8, n_c 14), half the register file.
+//
+// Ping-pong (BSEPP, 2026-09-27).  Two groups of 8 warps, two banks.  Group g convolves the
+// combo's pairs p0 + 2s + g into bank g -- load (T on DMMA, K chunks in order, as the U arm),
+// inverse transform3, Mid, forward transform3 -- on its own named barrier, so one group's
+// barrier waits and L2 latency are covered by the other group's issue.  The decode keeps one
+// owner per accumulator: warp w holds A at k = w + 16 kk (all c blocks), as with one group, and
+// each group decodes both banks for its own k in pair order (bank 0, then bank 1).  Every
+// accumulator therefore sums the same products in the same order as the one-group kernel
+// (bitwise), and the accumulator stays NK * MB * 8 * 8 complex per block (128 KB at 8x8, n_c 14),
+// half the register file: one block per SM.  Hand-off per step s on named barriers (arrive by
+// the producer, sync by the consumer, 512 threads):
+//   FULL g   group g's forward transform of bank g is done       (the other group then decodes it)
+//   EMPTY g  the other group has decoded bank g                  (group g then loads into it)
+//   VREADY   the staged V tile is complete (staged arm only)
+// An odd last pair runs on group 0 alone.  Group 1 starts its first load after group 0's first
+// load, so the groups run offset by one phase; the hand-off keeps an offset of up to one bank
+// decode without waits.
+// V (the Mid's kernel) has two arms, chosen from the device's opt-in shared memory at build:
+//   staged (LRX_VSTAGE = 1, the two banks plus one V tile fit: H100 and later at 8x8, A100 on
+//          small grids): group 0 stages its pair's V tile by cp.async at the start of its step;
+//          group 1 reads it when its pair has the same tile (consecutive pairs share one when
+//          na is even, the BSE spinor case), else from L2;
+//   L2     (LRX_VSTAGE = 0, A100 at 8x8): the Mid reads V[x, y, k] from L2, k fastest (512
+//          contiguous bytes per warp), eight loads in flight per thread.
+// The bank column of tile cell (x, y) is x*8 + (y ^ f(x)), f(x) = 3(x&1) + 4((x>>1)&1): the load's
+// D-fragment stores and the decode's B-fragment reads then each hit 8 distinct 16-byte bank
+// groups per phase (RS is 1 mod 8).  The transforms, Mid and the K sum are the U arm's, so A is
+// main's contraction of the same U in a different summation order (round-off class).
 static const char* kDecodeSrc = R"__lrx__(
 #include <cufftdx.hpp>
 typedef double lrx_real;
@@ -409,10 +429,25 @@ struct DecodeGeo {
 
 constexpr int NX = LRX_NX, NY = LRX_NY, NZ = LRX_NZ, NK = NX * NY * NZ;
 constexpr int KK = LRX_K, H = KK / 4, MB = LRX_MB, TR = 64, NWARP = LRX_THREADS / 32;
+constexpr int GT = LRX_THREADS / 2, GW = NWARP / 2;   // threads and warps of one group
 constexpr int KW = (NK + NWARP - 1) / NWARP;
 constexpr unsigned SLOT = NK * MB * 64;            // one combo's partial, complex elements
 static_assert(KK % 4 == 0, "K is a multiple of the m8n8k4 chunk (the door zero-pads)");
+static_assert(LRX_THREADS == 512, "two groups of 8 warps");
 using GK = lrx_kbox::Geo<NX, NY, NZ>;
+
+// Named barriers: 0 is __syncthreads; 1, 2 the groups; the rest the hand-off (512 threads).
+constexpr int BAR_G = 1, BAR_FULL = 3, BAR_EMPTY = 5, BAR_VREADY = 7, BAR_GO = 8;
+__device__ __forceinline__ void bar_sync(int id, int n) {
+    asm volatile("bar.sync %0, %1;\n" ::"r"(id), "r"(n) : "memory");
+}
+__device__ __forceinline__ void bar_arrive(int id, int n) {
+    asm volatile("bar.arrive %0, %1;\n" ::"r"(id), "r"(n) : "memory");
+}
+struct GroupSync {
+    int id;
+    __device__ void operator()() const { bar_sync(id, GT); }
+};
 
 __device__ __forceinline__ lrx_c2 lrx_mul(lrx_c2 a, lrx_c2 b) {
     lrx_c2 z = {a.x*b.x - a.y*b.y, a.x*b.y + a.y*b.x};
@@ -441,17 +476,111 @@ __device__ __forceinline__ void lrx_dmma(double& d0, double& d1, double a, doubl
 __device__ __forceinline__ int fperm(int x) { return 3 * (x & 1) + 4 * ((x >> 1) & 1); }
 __device__ __forceinline__ int pcol(int x, int y) { return x * 8 + (y ^ fperm(x)); }
 
+// Load: bank[pcol(x, y), k] = T[k, a, 8 xb + x, b, 8 yb + y] = sum_K L R on the tensor cores, K
+// chunks in order (re and im interleaved, each accumulator's order that of the U arm).  The
+// group's warps take k = wl, wl + GW, ...
+__device__ __forceinline__ void load_t(lrx_c2* bank, const double2* lb, const double2* rb, int wl, int gr,
+                                       int tg) {
+    for (int k = wl; k < NK; k += GW) {
+        double re0 = 0.0, re1 = 0.0, im0 = 0.0, im1 = 0.0;
+#pragma unroll
+        for (int h = 0; h < H; ++h) {
+            const double2 lv = __ldg(lb + (unsigned)((k * H + h) * 32));
+            const double2 rv = __ldg(rb + (unsigned)((k * H + h) * 32));
+            lrx_dmma(re0, re1, lv.x, rv.x);
+#if LRX_CONJ
+            lrx_dmma(im0, im1, lv.x, -rv.y);
+            lrx_dmma(re0, re1, lv.y, rv.y);
+#else
+            lrx_dmma(im0, im1, lv.x, rv.y);
+            lrx_dmma(re0, re1, -lv.y, rv.y);
+#endif
+            lrx_dmma(im0, im1, lv.y, rv.x);
+        }
+        lrx_c2 v0, v1;
+        v0.x = re0; v0.y = im0; v1.x = re1; v1.y = im1;
+        bank[pcol(gr, 2 * tg) * GK::RS + GK::at(k)] = v0;
+        bank[pcol(gr, 2 * tg + 1) * GK::RS + GK::at(k)] = v1;
+    }
+}
+
+#if LRX_VSTAGE
 // cp.async of the (xb, yb) V tile into vs[j * NK + k], bank column order; padded cells skipped.
 __device__ __forceinline__ void stage_v(lrx_c2* vs, const lrx_c2* __restrict__ V, int xb, int yb,
-                                        const DecodeGeo& g) {
+                                        const DecodeGeo& g, int tid) {
     const int x0 = xb * 8, y0 = yb * 8;
     const int xlim = min(8, (int)g.mx - x0), ylim = min(8, (int)g.my - y0);
     const lrx_c2* vb = V + ((long long)x0 * g.my + y0) * NK;
-    for (int o = threadIdx.x; o < TR * NK; o += blockDim.x) {
+    for (int o = tid; o < TR * NK; o += GT) {
         const int k = o % NK, j = o / NK, x = j >> 3, y = (j & 7) ^ fperm(x);
         if (x < xlim && y < ylim) lrx_kbox::cp_async<16>(vs + o, vb + (unsigned)((x * (int)g.my + y) * NK + k));
     }
     lrx_kbox::cp_async_commit();
+}
+// Mid: mode 2's KernMid product with the staged tile.
+__device__ __forceinline__ void mid_staged(lrx_c2* bank, const lrx_c2* vs, int xlim, int ylim, int tid) {
+    for (int i = tid; i < TR * NK; i += GT) {
+        const int k = i % NK, j = i / NK, x = j >> 3, y = (j & 7) ^ fperm(x);
+        if (x < xlim && y < ylim) {
+            lrx_c2* e = bank + j * GK::RS + GK::at(k);
+            *e = lrx_mul(*e, vs[i]);
+        }
+    }
+}
+#endif
+// Mid: mode 2's KernMid product with V[x, y, k] read from L2 (k fastest: a warp reads 512
+// contiguous bytes), MLP loads in flight per thread before the products.
+constexpr int MLP = 8;
+__device__ __forceinline__ void mid_l2(lrx_c2* bank, const lrx_c2* __restrict__ V, int xb, int yb, int xlim,
+                                       int ylim, const DecodeGeo& g, int tid) {
+    const double2* vb = reinterpret_cast<const double2*>(V + ((long long)xb * 8 * g.my + yb * 8) * NK);
+    const int my = (int)g.my;
+    for (int i0 = tid; i0 < TR * NK; i0 += GT * MLP) {
+        double2 vv[MLP];
+#pragma unroll
+        for (int u = 0; u < MLP; ++u) {
+            const int i = i0 + u * GT, k = i % NK, j = i / NK, x = j >> 3, y = (j & 7) ^ fperm(x);
+            vv[u] = (i < TR * NK && x < xlim && y < ylim) ? __ldg(vb + (unsigned)((x * my + y) * NK + k))
+                                                          : make_double2(0.0, 0.0);
+        }
+#pragma unroll
+        for (int u = 0; u < MLP; ++u) {
+            const int i = i0 + u * GT, k = i % NK, j = i / NK, x = j >> 3, y = (j & 7) ^ fperm(x);
+            if (i < TR * NK && x < xlim && y < ylim) {
+                lrx_c2* e = bank + j * GK::RS + GK::at(k);
+                lrx_c2 v; v.x = vv[u].x; v.y = vv[u].y;
+                *e = lrx_mul(*e, v);
+            }
+        }
+    }
+}
+
+// Decode: A[k, c, nu] += conj(Pc[k, c, a, 8 xb + mu]) U[k, mu, nu] for this warp's k (the one-group
+// kernel's owner map, k = warp + kk NWARP); per accumulator the sums run mu-chunk (h) in order,
+// re: Pr Ur then Pi Ui, im: Pr Ui then -Pi Ur.
+__device__ __forceinline__ void decode_bank(double (&acc)[KW][MB][4], const lrx_c2* bank, const double2* pb,
+                                            int warp, int gr, int tg) {
+#pragma unroll
+    for (int kk = 0; kk < KW; ++kk) {
+        const int k = warp + kk * NWARP;
+        if (k < NK) {
+#pragma unroll
+            for (int h = 0; h < 2; ++h) {
+                const lrx_c2 ub = bank[pcol(4 * h + tg, gr) * GK::RS + GK::at(k)];
+                double2 pc[MB];
+#pragma unroll
+                for (int mb = 0; mb < MB; ++mb) pc[mb] = __ldg(pb + (unsigned)(((k * MB + mb) * 2 + h) * 32));
+#pragma unroll
+                for (int mb = 0; mb < MB; ++mb) lrx_dmma(acc[kk][mb][0], acc[kk][mb][1], pc[mb].x, ub.x);
+#pragma unroll
+                for (int mb = 0; mb < MB; ++mb) lrx_dmma(acc[kk][mb][2], acc[kk][mb][3], pc[mb].x, ub.y);
+#pragma unroll
+                for (int mb = 0; mb < MB; ++mb) lrx_dmma(acc[kk][mb][0], acc[kk][mb][1], pc[mb].y, ub.y);
+#pragma unroll
+                for (int mb = 0; mb < MB; ++mb) lrx_dmma(acc[kk][mb][2], acc[kk][mb][3], -pc[mb].y, ub.x);
+            }
+        }
+    }
 }
 
 extern "C" __global__ void __launch_bounds__(LRX_THREADS, 1) lrx_kconv_outer_decode(
@@ -460,11 +589,16 @@ extern "C" __global__ void __launch_bounds__(LRX_THREADS, 1) lrx_kconv_outer_dec
     int* __restrict__ count, DecodeGeo g) {
     extern __shared__ lrx_c2 smem[];
     __shared__ int last;
-    lrx_c2* bank = smem;
-    lrx_c2* vs = smem + TR * GK::RS;
     using namespace cufftdx;
     const int warp = threadIdx.x / 32, lane = threadIdx.x % 32;
     const int gr = lane >> 2, tg = lane & 3;
+    const int grp = warp / GW, wl = warp % GW, gtid = threadIdx.x % GT;
+    lrx_c2* const bank0 = smem;
+    lrx_c2* const bank1 = smem + TR * GK::RS;
+#if LRX_VSTAGE
+    lrx_c2* const vs = smem + 2 * TR * GK::RS;
+#endif
+    const GroupSync gsync{BAR_G + grp};
     const double2* L2 = reinterpret_cast<const double2*>(Lr) + lane;
     const double2* R2 = reinterpret_cast<const double2*>(Rr) + lane;
     const double2* P2 = reinterpret_cast<const double2*>(Pcr) + lane;
@@ -474,94 +608,79 @@ extern "C" __global__ void __launch_bounds__(LRX_THREADS, 1) lrx_kconv_outer_dec
     for (int kk = 0; kk < KW; ++kk)
 #pragma unroll
         for (int mb = 0; mb < MB; ++mb) acc[kk][mb][0] = acc[kk][mb][1] = acc[kk][mb][2] = acc[kk][mb][3] = 0.0;
-    int vx = -1, vy = -1;
-    if (blockIdx.x < g.combos) {
-        const int c = blockIdx.x, it = c % items, p = (c / items) * (int)g.per;
-        vx = p / na; vy = it / nb;
-        stage_v(vs, V, vx, vy, g);
-    }
     for (int c = blockIdx.x; c < g.combos; c += gridDim.x) {
         const int ph = c / items, it = c % items;
         const int b = it % nb, yb = it / nb;
         const int p0 = ph * (int)g.per, p1 = min((int)g.pairs, p0 + (int)g.per);
+        const int nstep = (p1 - p0 + 1) / 2;
         const double2* rb = R2 + (unsigned)(b * (int)g.nyb + yb) * (unsigned)(NK * H * 32);
         const int ylim = min(8, (int)g.my - yb * 8);
-        for (int p = p0; p < p1; ++p) {
-            const int a = p % na, xb = p / na;
-            const int xlim = min(8, (int)g.mx - xb * 8);
-            // Load: T[k, a, x, b, y] = sum_K L R on the tensor cores, K chunks in order (the U arm's
-            // sums; re and im interleaved, each accumulator's order unchanged).
-            const double2* lb = L2 + (unsigned)(a * (int)g.nxb + xb) * (unsigned)(NK * H * 32);
-            for (int k = warp; k < NK; k += NWARP) {
-                double re0 = 0.0, re1 = 0.0, im0 = 0.0, im1 = 0.0;
-#pragma unroll
-                for (int h = 0; h < H; ++h) {
-                    const double2 lv = __ldg(lb + (unsigned)((k * H + h) * 32));
-                    const double2 rv = __ldg(rb + (unsigned)((k * H + h) * 32));
-                    lrx_dmma(re0, re1, lv.x, rv.x);
-#if LRX_CONJ
-                    lrx_dmma(im0, im1, lv.x, -rv.y);
-                    lrx_dmma(re0, re1, lv.y, rv.y);
-#else
-                    lrx_dmma(im0, im1, lv.x, rv.y);
-                    lrx_dmma(re0, re1, -lv.y, rv.y);
+        for (int s = 0; s < nstep; ++s) {
+            const int pa = p0 + 2 * s, pb_ = pa + 1;
+            const bool two = pb_ < p1;                       // this step has group 1's pair
+            const bool two_next = pa + 3 < p1;               // the next step has group 1's pair
+            const int aA = pa % na, xA = pa / na;
+            const double2* pcA = P2 + (unsigned)(aA * (int)g.nxb + xA) * (unsigned)(NK * MB * 64);
+            if (grp == 0) {
+                if (s > 0) bar_sync(BAR_EMPTY + 0, LRX_THREADS);
+#if LRX_VSTAGE
+                stage_v(vs, V, xA, yb, g, gtid);
 #endif
-                    lrx_dmma(im0, im1, lv.y, rv.x);
+                load_t(bank0, L2 + (unsigned)(aA * (int)g.nxb + xA) * (unsigned)(NK * H * 32), rb, wl, gr, tg);
+                gsync();
+                if (s == 0 && two) bar_arrive(BAR_GO, LRX_THREADS);
+                lrx_kbox::transform3<NX, NY, NZ, TR, LRX_SM, fft_direction::inverse>(bank0, gtid, GT, gsync);
+                const int xlim = min(8, (int)g.mx - xA * 8);
+#if LRX_VSTAGE
+                lrx_kbox::cp_async_wait_all();
+                gsync();
+                if (two) bar_arrive(BAR_VREADY, LRX_THREADS);
+                mid_staged(bank0, vs, xlim, ylim, gtid);
+#else
+                mid_l2(bank0, V, xA, yb, xlim, ylim, g, gtid);
+#endif
+                gsync();
+                lrx_kbox::transform3<NX, NY, NZ, TR, LRX_SM, fft_direction::forward>(bank0, gtid, GT, gsync);
+                bar_arrive(BAR_FULL + 0, LRX_THREADS);
+                decode_bank(acc, bank0, pcA, warp, gr, tg);
+                if (two) {
+                    const int aB = pb_ % na, xB = pb_ / na;
+                    bar_sync(BAR_FULL + 1, LRX_THREADS);
+                    decode_bank(acc, bank1, P2 + (unsigned)(aB * (int)g.nxb + xB) * (unsigned)(NK * MB * 64),
+                                warp, gr, tg);
+                    if (two_next) bar_arrive(BAR_EMPTY + 1, LRX_THREADS);
                 }
-                lrx_c2 v0, v1;
-                v0.x = re0; v0.y = im0; v1.x = re1; v1.y = im1;
-                bank[pcol(gr, 2 * tg) * GK::RS + GK::at(k)] = v0;
-                bank[pcol(gr, 2 * tg + 1) * GK::RS + GK::at(k)] = v1;
-            }
-            __syncthreads();
-            lrx_kbox::transform3<NX, NY, NZ, TR, LRX_SM, fft_direction::inverse>(bank);
-            lrx_kbox::cp_async_wait_all();
-            __syncthreads();
-            // Mid: mode 2's KernMid product with the staged tile.
-            for (int i = threadIdx.x; i < TR * NK; i += blockDim.x) {
-                const int k = i % NK, j = i / NK, x = j >> 3, y = (j & 7) ^ fperm(x);
-                if (x < xlim && y < ylim) {
-                    lrx_c2* e = bank + j * GK::RS + GK::at(k);
-                    *e = lrx_mul(*e, vs[i]);
+            } else {
+                if (two) {
+                    const int aB = pb_ % na, xB = pb_ / na;
+                    if (s > 0) bar_sync(BAR_EMPTY + 1, LRX_THREADS);
+                    if (s == 0) bar_sync(BAR_GO, LRX_THREADS);
+                    load_t(bank1, L2 + (unsigned)(aB * (int)g.nxb + xB) * (unsigned)(NK * H * 32), rb, wl, gr, tg);
+                    gsync();
+                    lrx_kbox::transform3<NX, NY, NZ, TR, LRX_SM, fft_direction::inverse>(bank1, gtid, GT, gsync);
+                    const int xlim = min(8, (int)g.mx - xB * 8);
+#if LRX_VSTAGE
+                    bar_sync(BAR_VREADY, LRX_THREADS);
+                    if (xB == xA) mid_staged(bank1, vs, xlim, ylim, gtid);
+                    else mid_l2(bank1, V, xB, yb, xlim, ylim, g, gtid);
+#else
+                    mid_l2(bank1, V, xB, yb, xlim, ylim, g, gtid);
+#endif
+                    gsync();
+                    lrx_kbox::transform3<NX, NY, NZ, TR, LRX_SM, fft_direction::forward>(bank1, gtid, GT, gsync);
+                    bar_arrive(BAR_FULL + 1, LRX_THREADS);
+                    bar_sync(BAR_FULL + 0, LRX_THREADS);
+                    decode_bank(acc, bank0, pcA, warp, gr, tg);
+                    if (s + 1 < nstep) bar_arrive(BAR_EMPTY + 0, LRX_THREADS);
+                    decode_bank(acc, bank1, P2 + (unsigned)(aB * (int)g.nxb + xB) * (unsigned)(NK * MB * 64),
+                                warp, gr, tg);
+                } else {                                     // the odd last pair: bank 0 only
+                    bar_sync(BAR_FULL + 0, LRX_THREADS);
+                    decode_bank(acc, bank0, pcA, warp, gr, tg);
                 }
             }
-            __syncthreads();
-            {   // the next pair's V tile (this combo's, or the next combo's first), unless vs holds it
-                int xn = -1, yn = -1;
-                if (p + 1 < p1) { xn = (p + 1) / na; yn = yb; }
-                else if (c + (int)gridDim.x < g.combos) {
-                    const int c2 = c + gridDim.x;
-                    xn = ((c2 / items) * (int)g.per) / na; yn = (c2 % items) / nb;
-                }
-                if (xn >= 0 && (xn != vx || yn != vy)) { stage_v(vs, V, xn, yn, g); vx = xn; vy = yn; }
-            }
-            lrx_kbox::transform3<NX, NY, NZ, TR, LRX_SM, fft_direction::forward>(bank);
-            // Decode: A[k, c, nu] += conj(Pc[k, c, a, 8 xb + mu]) U[k, mu, nu]; per accumulator the
-            // sums run mu-chunk (h) in order, re: Pr Ur then Pi Ui, im: Pr Ui then -Pi Ur.
-            const double2* pb = P2 + (unsigned)(a * (int)g.nxb + xb) * (unsigned)(NK * MB * 64);
-#pragma unroll
-            for (int kk = 0; kk < KW; ++kk) {
-                const int k = warp + kk * NWARP;
-                if (k < NK) {
-#pragma unroll
-                    for (int h = 0; h < 2; ++h) {
-                        const lrx_c2 ub = bank[pcol(4 * h + tg, gr) * GK::RS + GK::at(k)];
-                        double2 pc[MB];
-#pragma unroll
-                        for (int mb = 0; mb < MB; ++mb) pc[mb] = __ldg(pb + (unsigned)(((k * MB + mb) * 2 + h) * 32));
-#pragma unroll
-                        for (int mb = 0; mb < MB; ++mb) lrx_dmma(acc[kk][mb][0], acc[kk][mb][1], pc[mb].x, ub.x);
-#pragma unroll
-                        for (int mb = 0; mb < MB; ++mb) lrx_dmma(acc[kk][mb][2], acc[kk][mb][3], pc[mb].x, ub.y);
-#pragma unroll
-                        for (int mb = 0; mb < MB; ++mb) lrx_dmma(acc[kk][mb][0], acc[kk][mb][1], pc[mb].y, ub.y);
-#pragma unroll
-                        for (int mb = 0; mb < MB; ++mb) lrx_dmma(acc[kk][mb][2], acc[kk][mb][3], -pc[mb].y, ub.x);
-                    }
-                }
-            }
-            __syncthreads();
         }
+        __syncthreads();
         // The combo's scaled partial to its slot c; the combo completing the item sums the item's
         // slots in phase order into A[k, c, b, y].
         lrx_c2* sb = slots + (unsigned long long)c * SLOT;
@@ -613,7 +732,8 @@ struct DecodeGeo {                          // the embedded source declares the 
     double scale;
 };
 
-using DKey = std::tuple<CUcontext, int, int, int, int, int, int, int>;   // ctx, nkx, nky, nkz, K, MB, conj_r, fma
+// ctx, nkx, nky, nkz, K, MB, conj_r, fma, vstage
+using DKey = std::tuple<CUcontext, int, int, int, int, int, int, int, int>;
 static std::map<DKey, Built> g_dcache;
 static std::map<DKey, std::string> g_dfail;
 
@@ -628,7 +748,21 @@ static ffi::Error build_decode(int nkx, int nky, int nkz, int K, int mb, int con
         cr = api.CtxGetCurrent(&ctx);
         if (cr != CUDA_SUCCESS || ctx == nullptr) return fail("cuCtxGetCurrent", cu_err(cr));
     }
-    const DKey key{ctx, nkx, nky, nkz, K, mb, conj_r, fma};
+    int dev = 0, cc_major = 0, cc_minor = 0, smem_optin = 0, sms = 0;
+    if (cudaGetDevice(&dev) != cudaSuccess ||
+        cudaDeviceGetAttribute(&cc_major, cudaDevAttrComputeCapabilityMajor, dev) != cudaSuccess ||
+        cudaDeviceGetAttribute(&cc_minor, cudaDevAttrComputeCapabilityMinor, dev) != cudaSuccess ||
+        cudaDeviceGetAttribute(&smem_optin, cudaDevAttrMaxSharedMemoryPerBlockOptin, dev) != cudaSuccess ||
+        cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev) != cudaSuccess)
+        return fail("device attributes", "cudaDeviceGetAttribute");
+    // Two banks always; the staged V tile when it fits beside them (the static `last` and the
+    // alignment slack are the 16 B).
+    const lrx_kbox::Geometry geo{nkx, nky, nkz};
+    const long long nk = static_cast<long long>(nkx) * nky * nkz;
+    const long long smem2 = 2LL * kTile * kTile * geo.rs() * 16;
+    const long long smemv = smem2 + static_cast<long long>(kTile) * kTile * nk * 16;
+    const int vstage = smemv + 16 <= smem_optin ? 1 : 0;
+    const DKey key{ctx, nkx, nky, nkz, K, mb, conj_r, fma, vstage};
     std::lock_guard<std::mutex> lock(g_mu);
     if (auto it = g_dcache.find(key); it != g_dcache.end()) { *out = &it->second; return ffi::Error::Success(); }
     if (auto it = g_dfail.find(key); it != g_dfail.end()) return fail("kernel build (cached failure)", it->second);
@@ -637,29 +771,20 @@ static ffi::Error build_decode(int nkx, int nky, int nkz, int K, int mb, int con
         g_dfail.emplace(key, std::string(where) + " -- " + why);
         return fail(where, why, code);
     };
-    int dev = 0, cc_major = 0, cc_minor = 0, smem_optin = 0, sms = 0;
-    if (cudaGetDevice(&dev) != cudaSuccess ||
-        cudaDeviceGetAttribute(&cc_major, cudaDevAttrComputeCapabilityMajor, dev) != cudaSuccess ||
-        cudaDeviceGetAttribute(&cc_minor, cudaDevAttrComputeCapabilityMinor, dev) != cudaSuccess ||
-        cudaDeviceGetAttribute(&smem_optin, cudaDevAttrMaxSharedMemoryPerBlockOptin, dev) != cudaSuccess ||
-        cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev) != cudaSuccess)
-        return sticky("device attributes", "cudaDeviceGetAttribute");
     if (cc_major < 8)
         return sticky("GATE mathdx-kconv-outer-arch", "got sm_" + std::to_string(cc_major * 10 + cc_minor) +
                       "; want sm_80+ (fp64 mma.m8n8k4); fix: none here -- the router keeps the unfused chain",
                       ffi::ErrorCode::kFailedPrecondition);
-    const lrx_kbox::Geometry geo{nkx, nky, nkz};
-    const long long nk = static_cast<long long>(nkx) * nky * nkz;
-    const long long smem = static_cast<long long>(kTile) * kTile * (geo.rs() + nk) * 16;
     const long long kw = (nk + kThreads / 32 - 1) / (kThreads / 32);
-    if (smem + 16 > smem_optin || kw * mb > 8) {
+    if (smem2 + 16 > smem_optin || kw * mb > 8) {
         std::ostringstream os;
         os << "GATE mathdx-kconv-outer-decode-tile: got k-grid (" << nkx << "," << nky << "," << nkz << "), "
-           << mb << " c blocks: bank + staged V " << smem << " B (want <= " << smem_optin << " B of opt-in shared "
+           << mb << " c blocks: two banks " << smem2 << " B (want <= " << smem_optin << " B of opt-in shared "
               "memory) and " << kw * mb << " accumulator blocks per lane (want <= 8, the register file); fix: none "
               "here -- ffi.fft.klead_outer_decode_refusal routes such a shape to the outer conv + XLA decode";
         return sticky("tile", os.str(), ffi::ErrorCode::kInvalidArgument);
     }
+    const long long smem = vstage ? smemv : smem2;
     std::string why;
     const std::string cuda_inc = nvrtc::toolkit_include(&why);
     if (cuda_inc.empty()) return sticky("CUDA toolkit headers for NVRTC", why);
@@ -677,7 +802,7 @@ static ffi::Error build_decode(int nkx, int nky, int nkz, int K, int mb, int con
         "-DLRX_NX=" + std::to_string(nkx), "-DLRX_NY=" + std::to_string(nky), "-DLRX_NZ=" + std::to_string(nkz),
         "-DLRX_K=" + std::to_string(K), "-DLRX_THREADS=" + std::to_string(kThreads),
         "-DLRX_MB=" + std::to_string(mb), "-DLRX_CONJ=" + std::to_string(conj_r), "-DLRX_FMA=" + std::to_string(fma),
-        "-DLRX_SM=" + std::to_string(cc_major * 100 + cc_minor * 10)};
+        "-DLRX_VSTAGE=" + std::to_string(vstage), "-DLRX_SM=" + std::to_string(cc_major * 100 + cc_minor * 10)};
     nvrtc::mathdx_toolchain(root, cuda_inc, "cufftdx", &prog);
     prog.kernel = "lrx_kconv_outer_decode";
     std::string missing;
@@ -687,7 +812,8 @@ static ffi::Error build_decode(int nkx, int nky, int nkz, int K, int mb, int con
     if (!dir.empty()) {
         std::ostringstream name;
         name << dir << "/kconv_outer_dec_" << nkx << "x" << nky << "x" << nkz << "_K" << K << "_mb" << mb << "_c"
-             << conj_r << (fma ? "_fma" : "") << "_sm" << cc_major << cc_minor << "_" << key_hex << ".cubin";
+             << conj_r << (fma ? "_fma" : "") << (vstage ? "_vs" : "_vl2") << "_sm" << cc_major << cc_minor << "_"
+             << key_hex << ".cubin";
         path = name.str();
     }
     nvrtc::Image img;
@@ -701,10 +827,10 @@ static ffi::Error build_decode(int nkx, int nky, int nkz, int K, int mb, int con
     cr = api.FuncSetAttribute(b.fn, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, b.smem);
     if (cr != CUDA_SUCCESS) return sticky("cuFuncSetAttribute", cu_err(cr));
     if (mklpin::announce_here() || mklpin::debug_print_here()) {
-        std::fprintf(stderr, "[kconv_outer] decode %s kgrid=(%d,%d,%d) K=%d c-blocks=%d conj_r=%d K-sum=%s sm_%d%d in %.1f ms "
-                     "(8x8 tile, %d threads, 1 block/SM, smem=%d B, cubin %s)\n",
-                     img.from_disk ? "disk-cache hit" : "NVRTC built", nkx, nky, nkz, K, mb, conj_r, fma ? "fma" : "dmma", cc_major,
-                     cc_minor, img.ms, kThreads, b.smem,
+        std::fprintf(stderr, "[kconv_outer] decode %s kgrid=(%d,%d,%d) K=%d c-blocks=%d conj_r=%d K-sum=%s V=%s sm_%d%d "
+                     "in %.1f ms (8x8 tile, ping-pong 2 x 8 warps, 1 block/SM, smem=%d B of %d, cubin %s)\n",
+                     img.from_disk ? "disk-cache hit" : "NVRTC built", nkx, nky, nkz, K, mb, conj_r, fma ? "fma" : "dmma",
+                     vstage ? "staged" : "L2", cc_major, cc_minor, img.ms, b.smem, smem_optin,
                      path.empty() ? "not cached (no cubin_dir)" : (img.from_disk ? path.c_str() : "stored"));
     }
     *out = &(g_dcache[key] = b);
