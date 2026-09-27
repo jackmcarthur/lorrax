@@ -1692,6 +1692,8 @@ _DEFAULTS = {
     # directions per parent).  A positive value replaces the 1.8; it enters
     # recipe_version/recipe_hash like the support sites.  A study dial.
     "sigma_w_pole_budget_fraction": 0.0,
+    "sigma_w_study_height_ev": 0.0,
+    "sigma_w_study_width_scale": 1.0,
     "sigma_window_edge_factor": 1.5,
     # PPM sigma options
     # PPM invalid-pole treatment (BGW invalid_gpp_mode). 'zero' drops Omega^2<0
@@ -2272,6 +2274,11 @@ def _resolve_shared_pole_inputs(params):
             f"{params['sigma_w_support_sites_ev']!r} with sigma_w_model={model!r}; "
             "want: sigma_w_model=shared_pole; why: only the shared-pole "
             "resolver has support ladders to replace")
+    for key in ("sigma_w_study_height_ev", "sigma_w_study_width_scale"):
+        if key in named and (model != "shared_pole" or not np.isfinite(float(params[key]))
+                             or float(params[key]) <= 0.0):
+            raise ValueError(f"GATE shared_pole_study: got: {key}={params[key]!r}; "
+                             "want: shared_pole with finite positive study value")
     if "sigma_w_pole_budget_fraction" in named and (
             model != "shared_pole" or params["sigma_w_accuracy"] != "production"
             or not float(params["sigma_w_pole_budget_fraction"]) > 0.0):
@@ -2567,6 +2574,8 @@ def _input_response(
         w_accuracy=str(params["sigma_w_accuracy"]),
         w_support_sites_ev=str(params["sigma_w_support_sites_ev"]),
         w_pole_budget_fraction=float(params["sigma_w_pole_budget_fraction"]),
+        w_study_height_ev=float(params["sigma_w_study_height_ev"]),
+        w_study_width_scale=float(params["sigma_w_study_width_scale"]),
         window_edge_factor=float(params["sigma_window_edge_factor"]),
         fermi_reference=str(params["fermi_reference"]).strip().lower(),
         quadrature_eps=float(params["sigma_quadrature_eps"]),
@@ -4022,6 +4031,8 @@ class DynamicSigmaConfig:
     #: ``sigma_w_pole_budget_fraction``: 0 (default, the recipe's 1.8) or
     #: the retained-direction budget per parent as a multiple of n.
     w_pole_budget_fraction: float = _DEFAULTS["sigma_w_pole_budget_fraction"]
+    w_study_height_ev: float = _DEFAULTS["sigma_w_study_height_ev"]
+    w_study_width_scale: float = _DEFAULTS["sigma_w_study_width_scale"]
     quadrature_eps: float = _DEFAULTS["sigma_quadrature_eps"]
     quadrature_cache_dir: str = "auto"
     #: ``sigma_omega_patches_ev``: "" (default, the contiguous
