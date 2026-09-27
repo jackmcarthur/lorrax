@@ -1274,13 +1274,14 @@ def _compute_mpa_sigma(
         # Independent (patch, eta) deliveries: each patch plans its own rules
         # once at eta_far and holds them; the pole model and occupations are
         # the near body's.
-        from .qp_support import FAR_PATCH_ETA_EV, FAR_PATCH_STEP_EV, far_patch_grid_ev
+        from .qp_support import far_patch_eta_ev, far_patch_grid_ev
         for j, patch in enumerate(far_patches):
             grid_ev = far_patch_grid_ev(patch)
+            eta_far = far_patch_eta_ev(patch)
             far_options = dict(body_options,
                                omega_grid_ry=grid_ev / RYD_TO_EV,
-                               regularization_width_ry=FAR_PATCH_ETA_EV / RYD_TO_EV,
-                               omega_grid_step_ry=FAR_PATCH_STEP_EV / RYD_TO_EV,
+                               regularization_width_ry=eta_far / RYD_TO_EV,
+                               omega_grid_step_ry=0.5 * eta_far / RYD_TO_EV,
                                recipe_eta_role="far_patch",
                                capacity_stage=f"sigma.far{j}",
                                fixed_quadrature_session=(
@@ -1288,7 +1289,7 @@ def _compute_mpa_sigma(
                                    fixed_quadrature_session.setdefault(
                                        f"{sigma_w_model}:far{j}", {})))
             print_fn(f"  Sigma far patch {j}: [{patch[0]:+.2f}, {patch[1]:+.2f}] eV, "
-                     f"eta {FAR_PATCH_ETA_EV:.3f} eV, {grid_ev.size} samples")
+                     f"eta {eta_far:.3f} eV, {grid_ev.size} samples")
             far_bodies.append((grid_ev, compute_sigma_c_mpa_omega_grid(
                 wfns, fit_path, meta, mesh_xy, sigma_w_model=sigma_w_model,
                 fit_identity=fit_identity, fit_digest=fit_digest, **far_options)))

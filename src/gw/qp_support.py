@@ -100,10 +100,13 @@ def check_fixed_point(session):
     return True
 
 
-#: Broadening of the rotating-band far patches (eV). The P-R coupling needs
-#: Sigma_io(E_o) at each rotating energy only to modest accuracy; its node
-#: count scales as E_bw/eta (CLASSMIX round 2).
+#: Broadening of the rotating-band far patches (eV), above and below E_F.
+#: The P-R coupling needs Sigma_io(E_o) only to modest accuracy and a patch's
+#: node count scales as E_bw/eta. Replays (CLASSMIX round 2): Si conduction
+#: endpoints at 1 eV keep 0.7-0.8 meV; Fe semicore endpoints at 2 eV match
+#: the exact read (1.98 vs 1.95 meV) at half the 1 eV price.
 FAR_PATCH_ETA_EV = 1.0
+FAR_PATCH_ETA_BELOW_EV = 2.0
 #: Far-patch sampling step (eV): eta/2 resolves the broadened Sigma.
 FAR_PATCH_STEP_EV = 0.5
 #: Outer pad of each far patch about its rotating DFT energies (eV).
@@ -141,7 +144,13 @@ def far_patches_ev(energy_rel_ev, rotating_kn, near_support_ev):
     return tuple(out)
 
 
+def far_patch_eta_ev(patch):
+    """A patch wholly below E_F takes the broad semicore eta."""
+    return FAR_PATCH_ETA_BELOW_EV if float(patch[1]) <= 0.0 else FAR_PATCH_ETA_EV
+
+
 def far_patch_grid_ev(patch):
     lo, hi = float(patch[0]), float(patch[1])
-    n = int(round((hi - lo) / FAR_PATCH_STEP_EV)) + 1
-    return lo + FAR_PATCH_STEP_EV * np.arange(n)
+    step = 0.5 * far_patch_eta_ev(patch)
+    n = int(np.ceil((hi - lo) / step - 1e-9)) + 1
+    return lo + step * np.arange(n)
