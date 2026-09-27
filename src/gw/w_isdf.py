@@ -865,7 +865,7 @@ def _get_chi_fractional_contour_kernel_face(
                     for A in family_channels(pair[0]):
                         for B in family_channels(pair[1]):
                             block = gamma_vertex_trace(
-                                gf, gu, A, B, spin_axes=(2, 4),
+                                gf, gu, photon.vertex(A), photon.vertex(B), spin_axes=(2, 4),
                                 lower_offset=(2 * hg[0], 2 * hg[1]),
                                 upper_offset=(2 * up[0], 2 * up[1]))
                             total = _insert(
@@ -2448,7 +2448,8 @@ def _complete_static_photon_head(
         from .photon_direct_head import packed_gamma_vectors
         g0_X, g0_Y = packed_gamma_vectors(
             photon_g0_vectors, layout, mesh_xy,
-            current_basis_rows=meta.current_basis_rows)
+            current_basis_rows=meta.current_basis_rows,
+            current_rep_rows=meta.current_rep_rows)
         geometry = CoulombGeometry.from_wfn(wfn)
         cubature = slab_minibz_photon_cubature(
             get_kernel(2), geometry, tuple(int(v) for v in meta.kgrid))

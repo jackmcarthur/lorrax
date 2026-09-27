@@ -143,7 +143,9 @@ def _make_photon_static_class_kernel(
             n=shapes[1][2]*shapes[1][3], nq=shapes[0][0], dtype=jnp.complex128, layout=layout)
         _photon_sigma_kernel_cache[plan_key] = project, g_plan
     project, g_plan = _photon_sigma_kernel_cache[plan_key]
-    convolve = make_lorentz_convolution(mesh_xy, kgrid, nk_tot, keys, plans[0], plans[1])
+    # The static photon route keeps Cartesian operators (Meta.current_rep_rows).
+    convolve = make_lorentz_convolution(mesh_xy, kgrid, nk_tot, keys, plans[0], plans[1],
+                                        current_rows=None)
     head_product = make_lorentz_q0_product(nk_tot) if with_head else None
     rows = np.asarray(plans[0].parent_full_rows)
     @jax.jit

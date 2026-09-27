@@ -123,7 +123,7 @@ def photon_diagonal_current_faces(vertex, *, mesh_xy, layout, wfn_layout="face")
     from common.shard_map import shard_map
     from common.wfn_layout import psi_specs
     from gw.photon_layout import TRANSVERSE, pack_photon_faces
-    from symmetry_maps import unfold_wavefunction_local
+    from symmetry_maps import unfold_wavefunction_local, current_component_action
 
     families = vertex.families
     plan = families.plans[1]
@@ -131,7 +131,7 @@ def photon_diagonal_current_faces(vertex, *, mesh_xy, layout, wfn_layout="face")
 
     def density(face, spin_axis):
         return jnp.stack([jnp.sum(jnp.conj(face) * gamma_apply(
-            face, *gamma_perm_phase(A), axis=spin_axis), axis=spin_axis)
+            face, *(jnp.asarray(t) for t in families.vertex(A)), axis=spin_axis), axis=spin_axis)
             for A in TRANSVERSE], axis=spin_axis)
 
     tables = ()
@@ -140,8 +140,9 @@ def photon_diagonal_current_faces(vertex, *, mesh_xy, layout, wfn_layout="face")
         tables = (np.asarray(plan.irr_idx), rows, np.asarray(plan.k_parent_frac),
                   np.asarray(plan.centroid_local_perm),
                   np.zeros(np.shape(plan.L_table), np.float64),
-                  np.asarray(plan.sym.cartesian_action(rows, axial=False, time_odd=True),
-                             dtype=np.complex128))
+                  np.asarray(current_component_action(
+                      plan.sym, rows, None if families.current_rows is None
+                      else np.asarray(families.current_rows)), dtype=np.complex128))
 
     def to_full_k(value, spin_axis, mu_axis, mesh_axis, *tables):
         if not tables:

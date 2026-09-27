@@ -183,6 +183,33 @@ def current_fit_terms(channel: int, basis_rows) -> tuple:
                  for i in range(3) for j in range(3) if abs(u[i] * u[j]) > 0)
 
 
+def current_vertex_perm_phase_host(channel: int, rep_rows) -> tuple[_np.ndarray, _np.ndarray]:
+    """HOST ``(perm, phase)`` of Lorentz channel ``channel`` in the representation ``rep_rows``.
+
+    Channel 0 is γ̃^0; a current channel c is Σ_i B_ci α^i (``rep_rows`` None:
+    α^c).  The circular rows give α^± = (α^1 ± iα^2)/√2, a monomial with
+    entries √2 on half its rows and 0 on the others: a zero row keeps α^1's
+    column so ``perm`` stays a permutation, with phase 0.
+    """
+    c = int(channel)
+    if c == 0 or rep_rows is None:
+        perm, phase = _perm_phase[c]
+        return perm.copy(), phase.copy()
+    u = _np.asarray(rep_rows, dtype=_np.complex128)[c - 1]
+    m = sum(u[i] * _gamma_tables[i + 1] for i in range(3) if abs(u[i]) > 0)
+    base = next(i + 1 for i in range(3) if abs(u[i]) > 0)
+    perm, phase = _perm_phase[base][0].copy(), _np.zeros(4, dtype=_np.complex128)
+    for a in range(4):
+        cols = _np.flatnonzero(_np.abs(m[a]) > 1e-14)
+        if cols.size > 1:
+            raise ValueError(f"current channel {c} vertex is not monomial in row {a}")
+        if cols.size == 1:
+            perm[a], phase[a] = int(cols[0]), m[a, cols[0]]
+    if sorted(perm.tolist()) != list(range(4)):
+        raise ValueError(f"current channel {c} vertex has no permutation completion")
+    return perm, phase
+
+
 def gamma_apply(X: jax.Array, perm: jax.Array, phase: jax.Array,
                 axis: int, is_identity: bool = False) -> jax.Array:
     """Apply a monomial γ̃ matrix on ``axis`` of X via gather + phase mul.
@@ -390,19 +417,31 @@ def gamma_vertex_trace(G_lower, G_upper, left: int, right: int,
     two spin axes (ints or traced scalars); the sum runs over the lower
     Green's block, whose vertex images must lie in the upper Green's.
     """
-    perm_l, phase_l = (jnp.asarray(t) for t in _perm_phase[int(left)])
-    perm_r, phase_r = (jnp.asarray(t) for t in _perm_phase[int(right)])
+    # ``left``/``right``: a channel of the Cartesian basis, or explicit HOST
+    # (perm, phase) tables (current_vertex_perm_phase_host); a zero entry's
+    # terms are skipped.
+    host_l = _perm_phase[int(left)] if _np.ndim(left) == 0 else left
+    host_r = _perm_phase[int(right)] if _np.ndim(right) == 0 else right
+    live_l = _np.abs(_np.asarray(host_l[1])) > 0
+    live_r = _np.abs(_np.asarray(host_r[1])) > 0
+    perm_l, phase_l = (jnp.asarray(t) for t in host_l)
+    perm_r, phase_r = (jnp.asarray(t) for t in host_r)
     a_axis, b_axis = spin_axes
     take = jax.lax.dynamic_index_in_dim
     total = None
     for i in range(int(G_lower.shape[a_axis])):
         for j in range(int(G_lower.shape[b_axis])):
             a, b = lower_offset[0] + i, lower_offset[1] + j
+            static = isinstance(a, (int, _np.integer)) and isinstance(b, (int, _np.integer))
+            if static and not (live_l[a] and live_r[b]):
+                continue
             upper = take(take(G_upper, perm_r[b] - upper_offset[1], b_axis, keepdims=False),
                          perm_l[a] - upper_offset[0], a_axis, keepdims=False)
             lower = take(take(G_lower, j, b_axis, keepdims=False), i, a_axis, keepdims=False)
             term = (phase_l[a] * jnp.conj(phase_r[b])) * upper * jnp.conj(lower)
             total = term if total is None else total + term
+    if total is None:   # every static term had a zero vertex entry
+        total = jnp.zeros_like(jnp.take(jnp.take(G_lower, 0, b_axis), 0, a_axis))
     return total
 
 
@@ -431,5 +470,5 @@ __all__ = [
     "gamma0", "gamma1", "gamma2", "gamma3", "gamma5",
     "gammas_perm", "gammas_phase",
     "gamma_perm_phase", "gamma_apply", "gamma_double_contract",
-    "gamma_vertex_trace", "current_fit_terms",
+    "gamma_vertex_trace", "current_fit_terms", "current_vertex_perm_phase_host",
 ]

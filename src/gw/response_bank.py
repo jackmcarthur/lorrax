@@ -249,7 +249,7 @@ class PhotonEndpoints:
 
 
 def prepare_photon_carriers(wfns, wfns_transverse, mu_bases, *,
-                            mesh_xy, layout):
+                            mesh_xy, layout, current_rows):
     """Bind the charge and current families' raw-parent faces for the one response stream.
 
     Returns :class:`PhotonEndpoints`.  ``layout`` is the bank's canonical
@@ -281,7 +281,9 @@ def prepare_photon_carriers(wfns, wfns_transverse, mu_bases, *,
     families = PhotonFamilies(
         plans=(left.plan, right.plan),
         packed_layout=layout if same_order else packed, layout=layout,
-        bases=None if same_order else tuple(mu_bases))
+        bases=None if same_order else tuple(mu_bases),
+        current_rows=(None if current_rows is None else
+                      tuple(tuple(complex(v) for v in row) for row in np.asarray(current_rows))))
     return PhotonEndpoints(families, (left.psi_mun, right.psi_mun),
                            (left.psi_nmu, right.psi_nmu), left.enk)
 
@@ -1617,7 +1619,8 @@ def compute_photon_bank(wfns, wfns_transverse, meta, config, *, mesh_xy, sym,
         print("photon bank: preparing shared vertex endpoints and bare V", flush=True)
     with timing.section("bank.photon_endpoints"):
         vertex = prepare_photon_carriers(wfns, wfns_transverse, mu_bases,
-                                         mesh_xy=mesh_xy, layout=layout)
+                                         mesh_xy=mesh_xy, layout=layout,
+                                         current_rows=meta.current_rep_rows)
         bank["photon_v"] = photon_bare_operator(wfns, wfns_transverse, meta,
             path=bank["bispinor_v_q_path"], mu_bases=mu_bases, layout=layout, mesh_xy=mesh_xy)
         from .gw_config import uses_direct_bispinor_shared_pole_head
@@ -1703,7 +1706,8 @@ def compute_photon_bank(wfns, wfns_transverse, meta, config, *, mesh_xy, sym,
                 frequencies_ry=bank_points(sample_plan), print_fn=print_fn)
             direct_head["gamma_vectors"] = packed_gamma_vectors(
                 direct_gamma, layout, mesh_xy,
-                current_basis_rows=meta.current_basis_rows)
+                current_basis_rows=meta.current_basis_rows,
+                current_rep_rows=meta.current_rep_rows)
             receipt["direct_gamma"] = dict(
                 approximation="first_order_dipole_current_fd",
                 sectors="CC_CT_TC_TT", local_fields=False,

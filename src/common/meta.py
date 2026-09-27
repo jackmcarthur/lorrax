@@ -61,6 +61,10 @@ class Meta:
     # select_current_basis rows; None = Cartesian), resolved once from the
     # physical group by gw_init and read by every current-index consumer.
     current_basis_rows: object = None
+    # Basis of the current index of every operator downstream of the fit
+    # (V, χ0, W, Σ, heads); None = Cartesian.  gw_init sets it to the fit
+    # basis on the sector shared-pole route, Cartesian elsewhere.
+    current_rep_rows: object = None
 
     @property
     def mu_solve_extent(self) -> int:

@@ -222,6 +222,26 @@ def charge_zeta_identity(provenance_json, *, wfn,
 	}
 
 
+def _current_bases(cfg, wfn, print_fn):
+	"""``(fit_rows, rep_rows)`` of the bispinor current index; see ``Meta.current_rep_rows``.
+
+	The fit basis is the one in which every PHYSICAL operation acts
+	monomially (``symmetry_maps.select_current_basis``), so separate
+	component fits commute with the unfold.  The sector shared-pole route
+	keeps its operators in that basis, where every symmetry action on the
+	current index is a phased permutation folded into the unfold tables; the
+	other bispinor routes return to Cartesian at V.
+	"""
+	from symmetry_maps import select_current_basis
+	from .gw_config import uses_full_bispinor_shared_pole
+	name, fit_rows = select_current_basis(wfn.symmetry())
+	rep_rows = fit_rows if uses_full_bispinor_shared_pole(cfg) else None
+	print_fn(f"  current fit basis: {name}; operator basis: "
+	         f"{'the fit basis' if rep_rows is not None else 'Cartesian'} "
+	         f"(symmetry_maps.select_current_basis on the physical group)")
+	return fit_rows, rep_rows
+
+
 def _zeta_fit_provenance(*, wfn, meta, cfg, band_range_left, band_range_right,
                          logical_band_stop, zeta_cutoff, zeta_vcoul_cutoff,
                          write_ibz_only, band_norms, vertex_mu_L=0,
@@ -1461,10 +1481,7 @@ def _resolve_zeta_fit_contract(
 		# operation acts monomially, so separate component fits commute with
 		# the unfold (symmetry_maps.select_current_basis).  Resolved once
 		# here and carried on meta.
-		from symmetry_maps import select_current_basis
-		_basis_name, meta.current_basis_rows = select_current_basis(wfn.symmetry())
-		print_fn(f"  current fit basis: {_basis_name} (the physical group's current "
-		         f"action is monomial in it; symmetry_maps.select_current_basis)")
+		meta.current_basis_rows, meta.current_rep_rows = _current_bases(cfg, wfn, print_fn)
 		from common.centroid_basis import PackedCentroidBasis
 		basis_T = PackedCentroidBasis.build(
 			centroids_transverse, sym, meta.fft_grid, mesh_xy)
@@ -2227,6 +2244,7 @@ def _bispinor_current_tiles(zetas_T, *, cfg, meta_T, wfn, sym, centroid_T_idx,
                                 or bool(cfg.head.bispinor_tt_head_correction)
                                 or uses_direct_bispinor_shared_pole_head(cfg)),
             current_basis_rows=meta_T.current_basis_rows,
+            current_rep_rows=meta_T.current_rep_rows,
             print_fn=print_fn)
 
 
@@ -2341,6 +2359,7 @@ def _compute_photon_vq(
                     spatial_current_representation=None,
                     cc_tile=cc_tile, tt_tiles=tt_tiles,
                     current_basis_rows=meta.current_basis_rows,
+                    current_rep_rows=meta.current_rep_rows,
                 )
     from file_io.restart_bundle import read_photon_charge
     V_q_raw = read_photon_charge(bispinor_h5_path, mesh_xy)

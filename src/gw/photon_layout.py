@@ -832,6 +832,15 @@ class PhotonFamilies:
     packed_layout: PhotonBasisLayout
     layout: PhotonBasisLayout
     bases: tuple | None = None
+    # The current index's basis (``Meta.current_rep_rows`` as a tuple of row
+    # tuples; None = Cartesian): the stream's vertices and actions use it.
+    current_rows: tuple | None = None
+
+    def vertex(self, channel: int):
+        """HOST ``(perm, phase)`` of Lorentz channel ``channel`` in this basis."""
+        from common.gamma_matrices import current_vertex_perm_phase_host
+        rows = None if self.current_rows is None else np.asarray(self.current_rows)
+        return current_vertex_perm_phase_host(channel, rows)
 
     def __post_init__(self) -> None:
         if len(self.plans) != 2 or (self.plans[0] is None) != (self.plans[1] is None):

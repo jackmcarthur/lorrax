@@ -336,7 +336,7 @@ def lorentz_class_vertices(keys):
 
 
 def make_lorentz_convolution(mesh_xy: Mesh, kgrid, nk_tot: int, keys, left_plan,
-                             right_plan=None):
+                             right_plan=None, *, current_rows):
     """The four-current Σ door: ``fn(parent_green, V) -> Σ_k``, read from the raw parents.
 
         Σ_k = -1/√N_k · fftn( Σ_AB γ̃_A ifftn(Ĝ) γ̃_B† · ifftn(V)[:, x, A, y, B] )
@@ -352,18 +352,20 @@ def make_lorentz_convolution(mesh_xy: Mesh, kgrid, nk_tot: int, keys, left_plan,
     """
     from ffi import ffi_dial_key
     from common.fft_helpers import make_kconv_lorentz_unfold
-    from common.gamma_matrices import gamma_perm_phase_host
+    from common.gamma_matrices import current_vertex_perm_phase_host
     lefts, rights = lorentz_class_vertices(keys)
     right = left_plan if right_plan is None else right_plan
+    rows = None if current_rows is None else np.asarray(current_rows)
     key = (_mesh_key(mesh_xy), tuple(int(v) for v in kgrid), ffi_dial_key(), int(nk_tot),
-           lefts, rights, id(left_plan), id(right))
+           lefts, rights, id(left_plan), id(right),
+           None if rows is None else rows.tobytes())
     if key not in _lorentz_convolution_cache:
         tables = left_plan.unfold_load_tables(
             right_plan=None if right is left_plan else right)
         door = make_kconv_lorentz_unfold(
             mesh_xy, kgrid, tables,
-            left_vertices=[gamma_perm_phase_host(A) for A in lefts],
-            right_vertices=[gamma_perm_phase_host(B) for B in rights],
+            left_vertices=[current_vertex_perm_phase_host(A, rows) for A in lefts],
+            right_vertices=[current_vertex_perm_phase_host(B, rows) for B in rights],
             store_rows=left_plan.parent_full_rows,
             norm='ortho', mult=-1.0 / np.sqrt(float(nk_tot)))
 

@@ -508,7 +508,7 @@ def _bispinor_tile_spec(mu_L, nu_L, *, zeta_C, zeta_T, use_ibz_C, use_ibz_T,
         use_ibz=use_ibz)
 
 
-def _cartesian_tt_results(results, current_basis_rows):
+def _cartesian_tt_results(results, current_basis_rows, current_rep_rows=None):
     """The six TT tiles in the fit basis → Cartesian: V = Uᴴ V_fit U.
 
     ``results`` follows ``UNIQUE_TILES[1:]``.  Channel c's ζ fits
@@ -518,9 +518,16 @@ def _cartesian_tt_results(results, current_basis_rows):
     ``photon_direct_head.packed_gamma_vectors`` rotates into Cartesian rows).
     Cartesian fits (``current_basis_rows`` None) are returned untouched.
     """
-    U = current_basis_rows
-    if U is None:
+    # V_rep = W V_fit Wᴴ with W = B_rep B_fitᴴ (None = I); the formula below
+    # reads V_ij = Σ_ab conj(U_ai) V_fit^{ab} U_bj with U = Wᴴ.
+    B_fit = None if current_basis_rows is None else np.asarray(current_basis_rows)
+    B_rep = None if current_rep_rows is None else np.asarray(current_rep_rows)
+    if (B_fit is None and B_rep is None) or (
+            B_fit is not None and B_rep is not None and np.array_equal(B_fit, B_rep)):
         return results
+    W = ((np.eye(3) if B_rep is None else B_rep)
+         @ (np.eye(3) if B_fit is None else B_fit).conj().T)
+    U = W.conj().T
     names = UNIQUE_TILES[1:]
     shardings = tuple(r[0].sharding for r in results)
 
@@ -686,6 +693,7 @@ def compute_bispinor_tt_tiles(
     sym=None, centroid_T_idx: np.ndarray | None = None,
     tt_head_correction: bool = False,
     current_basis_rows=None,
+    current_rep_rows=None,
     print_fn=print, verbose: bool = True,
 ) -> ParkedVTiles:
     """The six TT tiles of :func:`compute_V_q_bispinor_g_flat_to_h5`, from the
@@ -711,7 +719,7 @@ def compute_bispinor_tt_tiles(
         g_chunk=g_chunk, sym=sym, centroid_indices=centroid_T_idx,
         qgrid_policy=_bispinor_qgrid_policy(sym=sym, kgrid=kgrid),
         verbose=verbose)
-    results = _cartesian_tt_results(results, current_basis_rows)
+    results = _cartesian_tt_results(results, current_basis_rows, current_rep_rows)
     return ParkedVTiles(results, what="the six TT tiles", print_fn=print_fn)
 
 
@@ -751,6 +759,7 @@ def compute_V_q_bispinor_g_flat_to_h5(
     cc_tile: "ParkedVTiles | None" = None,
     tt_tiles: "ParkedVTiles | None" = None,
     current_basis_rows=None,
+    current_rep_rows=None,
 ) -> tuple[Path, tuple[jax.Array, jax.Array, jax.Array, jax.Array]]:
     """Stream the 7 unique bispinor V_q^{μ_L, ν_L} tiles to HDF5 via the
     G-flat per-q + G-chunked path.
@@ -851,7 +860,7 @@ def compute_V_q_bispinor_g_flat_to_h5(
                 verbose=verbose,
             )
             if not is_CC_group:
-                results = _cartesian_tt_results(results, current_basis_rows)
+                results = _cartesian_tt_results(results, current_basis_rows, current_rep_rows)
         for (mu_L, nu_L), s_tile, (V_acc, g0_acc) in zip(group, specs, results):
             same_zeta = (mu_L == nu_L)
             if (same_zeta and mu_L != 0 and _use_ibz_T

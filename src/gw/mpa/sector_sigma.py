@@ -150,7 +150,8 @@ def sector_tau_factory(left, right, keys, meta, mesh_xy):
         gemm = gemm_plan(mesh_xy, m=m, k=k, n=n, nq=q,
                          dtype=jnp.complex128, layout=a.layout)
     convolve = make_lorentz_convolution(mesh_xy, meta.kgrid, meta.nk_tot, keys,
-                                        plans[0], plans[1])
+                                        plans[0], plans[1],
+                                        current_rows=meta.current_rep_rows)
 
     def factory(synthesis, band_axis):
         project = contract_bands_block_reshard(mesh_xy, layout=a.layout,
@@ -179,7 +180,7 @@ def sector_tau_factory(left, right, keys, meta, mesh_xy):
     return factory
 
 
-def _endpoint_route(header, basis, sym, span, rows, mesh_xy, axis, width):
+def _endpoint_route(header, basis, sym, span, rows, mesh_xy, axis, width, current_rows):
     """Bind the symmetry service's current/charge endpoint action, once per panel."""
     from symmetry_maps import endpoint_panel_cost
     from gw.qgrid_symmetry import shared_pole_packed_action
@@ -190,7 +191,8 @@ def _endpoint_route(header, basis, sym, span, rows, mesh_xy, axis, width):
     parent = np.asarray(qt['irr_idx_q'])[rows]-lo
     operations = np.asarray(qt['sym_idx_q'])[rows]
     nc = int(header.get('factor_components', 1))
-    action = (sym.cartesian_action(operations, axial=False, time_odd=True)
+    from symmetry_maps import current_component_action
+    action = (current_component_action(sym, operations, current_rows)
               if nc == 3 else np.ones((len(rows),1,1)))
     cost = endpoint_panel_cost((hi-lo,basis.n_packed,nc,width),len(rows),
                               mesh=mesh_xy,mesh_axis=axis,dtype=np.complex128)
@@ -243,7 +245,7 @@ def sector_synthesis(readers, headers, bases, families, frequencies, meta, mesh_
     routes=[];costs=[]
     for h,b,f,axis in zip(headers,bases,families,('x','y')):
         route,cost=_endpoint_route(h,b,f.green_parent.plan.sym,(0,nq),rows,
-                                   mesh_xy,axis,kcarrier)
+                                   mesh_xy,axis,kcarrier,meta.current_rep_rows)
         routes.append(route);costs.append(cost)
     def place(value,spec):
         return _placer(mesh_xy,spec)(value)
