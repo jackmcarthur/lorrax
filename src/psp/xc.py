@@ -63,6 +63,28 @@ def pbe_functional():
     return eps_xc, XCLevel.GGA
 
 
+def pbe_functional_polarized():
+    """Spin-polarized PBE.  Returns ``eps_xc(rho_up, rho_dn, s_uu, s_ud, s_dd)``
+    in Ry per electron, ``s_ab = ∇ρ_a·∇ρ_b`` (libxc's σ ordering)."""
+    from jax_xc.impl import gga_x_pbe, gga_c_pbe
+    from jax_xc.utils import get_p
+
+    exchange = get_p("gga_x_pbe", True)
+    correlation = get_p("gga_c_pbe", True)
+
+    def scalar_eps(ru, rd, suu, sud, sdd):
+        r, sig = (ru, rd), (suu, sud, sdd)
+        return 2.0 * (gga_x_pbe.pol(exchange, r, sig)
+                      + gga_c_pbe.pol(correlation, r, sig))
+
+    def eps_xc(ru, rd, suu, sud, sdd):
+        args = jnp.broadcast_arrays(ru, rd, suu, sud, sdd)
+        flat = [a.reshape(-1) for a in args]
+        return jax.vmap(scalar_eps)(*flat).reshape(args[0].shape)
+
+    return eps_xc
+
+
 # ═══════════════════════════════════════════════════════════════════════
 #  Compute input quantities from density
 # ═══════════════════════════════════════════════════════════════════════
@@ -185,3 +207,72 @@ def _vxc_mgga(rho, rho_raw, sigma, tau, rho_G, G_cart, xc_fn):
     # For now this is the potential part; the τ-dependent Hamiltonian
     # contribution (non-multiplicative) would need to be wired separately.
     return df_drho - 2.0 * div + df_dtau
+
+
+# ═══════════════════════════════════════════════════════════════════════
+#  Noncollinear magnetic V_xc: v δ_αβ + B·σ_αβ (QE's general branch)
+# ═══════════════════════════════════════════════════════════════════════
+
+def compute_V_xc_noncollinear(rho_total, rho_G_total, mag, G_cart, xc_fn):
+    """V_xc^{αβ}(r) = v(r) δ_αβ + B(r)·σ_αβ from ρ and m for a spin-polarized GGA.
+
+    The local-frame construction QE uses with ``lsign = .false.`` (the general
+    branch; ``skills/build_inputs`` magnetic recipe): at each r the
+    functional is evaluated on
+
+        ρ_↑,↓ = (ρ ± |m|)/2,        ∇ρ_↑,↓ = (∇ρ ± ∇|m|)/2,
+
+    with ρ = ρ_val + ρ_core (the core enters ρ only) and ∇ taken on the FFT
+    grid, ∇ρ from ``rho_G_total`` (analytic core) and ∇|m| from the FFT of
+    the |m| field.  With f = ρ ε_xc and the GGA divergence as in
+    :func:`_vxc_gga`,
+
+        v_σ = ∂f/∂ρ_σ − ∇·(2 ∂f/∂σ_σσ ∇ρ_σ + ∂f/∂σ_↑↓ ∇ρ_σ̄),
+        v = (v_↑ + v_↓)/2,     B = (v_↑ − v_↓)/2 · m/|m|,
+
+    i.e. B_i = δE_xc/δm_i, exact because E depends on m only through the
+    field |m|.  Gradient terms are dropped where ρ ≤ 1e-6 or |∇ρ|² ≤ 1e-10
+    (the scalar route's QE thresholds); B = 0 where |m| ≤ 1e-20.
+
+    Parameters: ``rho_total`` (nx,ny,nz), ``rho_G_total`` its complex FFT,
+    ``mag`` (3,nx,ny,nz) m in the same density units, ``G_cart``
+    (nx,ny,nz,3), ``xc_fn`` from :func:`pbe_functional_polarized`.
+    Returns ``(v, B)`` in Ry, shapes (nx,ny,nz) and (3,nx,ny,nz).
+    """
+    rho = jnp.maximum(rho_total, 1e-10)
+    amag = jnp.sqrt(jnp.sum(mag ** 2, axis=0))
+    amag_G = local_fftn3(amag)
+    grad_rho = _compute_grad_components(rho_G_total, G_cart)
+    grad_amag = _compute_grad_components(amag_G, G_cart)
+    ru = 0.5 * (rho + amag)
+    rd = jnp.maximum(0.5 * (rho - amag), 1e-12)
+    gu = [0.5 * (a + b) for a, b in zip(grad_rho, grad_amag)]
+    gd = [0.5 * (a - b) for a, b in zip(grad_rho, grad_amag)]
+    suu = sum(a * a for a in gu)
+    sud = sum(a * b for a, b in zip(gu, gd))
+    sdd = sum(b * b for b in gd)
+
+    def energy(ru_, rd_, suu_, sud_, sdd_):
+        return jnp.sum((ru_ + rd_) * xc_fn(ru_, rd_, suu_, sud_, sdd_))
+
+    zero = jnp.zeros_like(rho)
+    lda_u, lda_d = jax.grad(energy, argnums=(0, 1))(ru, rd, zero, zero, zero)
+    f_u, f_d, f_uu, f_ud, f_dd = jax.grad(energy, argnums=(0, 1, 2, 3, 4))(
+        ru, rd, suu, sud, sdd)
+    sigma = sum(a * a for a in grad_rho)
+    active = (rho_total > 1e-6) & (sigma > 1e-10)
+    f_u = jnp.where(active, f_u, lda_u)
+    f_d = jnp.where(active, f_d, lda_d)
+    f_uu, f_ud, f_dd = (jnp.where(active, x, 0.0) for x in (f_uu, f_ud, f_dd))
+
+    def divergence(field):
+        out = jnp.zeros_like(rho)
+        for i in range(3):
+            h_G = local_fftn3(field[i])
+            out = out + jnp.real(local_ifftn3(1j * G_cart[..., i] * h_G))
+        return out
+
+    v_u = f_u - divergence([2.0 * f_uu * a + f_ud * b for a, b in zip(gu, gd)])
+    v_d = f_d - divergence([2.0 * f_dd * b + f_ud * a for a, b in zip(gu, gd)])
+    unit = jnp.where(amag > 1e-20, mag / jnp.maximum(amag, 1e-300), 0.0)
+    return 0.5 * (v_u + v_d), 0.5 * (v_u - v_d) * unit

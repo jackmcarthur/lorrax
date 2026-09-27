@@ -344,6 +344,27 @@ class CrystalData:
         return rho_r, rho_G
 
     # ------------------------------------------------------------------
+    def load_magnetization(self) -> np.ndarray:
+        """m(r) = (m_x, m_y, m_z) on the FFT grid from ``charge-density.hdf5``.
+
+        Same units and normalization as :meth:`load_charge_density`'s ρ
+        (a noncollinear magnetic QE run writes ``m_x``, ``m_y``, ``m_z``
+        beside ``rhotot_g``).  Returns (3, nx, ny, nz) float64.
+        """
+        cd_path = os.path.join(self._save_dir, "charge-density.hdf5")
+        nx, ny, nz = self.fft_grid
+        out = np.zeros((3, nx, ny, nz), dtype=np.float64)
+        with h5py.File(cd_path, "r") as f:
+            miller = f["MillerIndices"][:]
+            ix, iy, iz = miller[:, 0] % nx, miller[:, 1] % ny, miller[:, 2] % nz
+            for i, name in enumerate(("m_x", "m_y", "m_z")):
+                ri = f[name][:]
+                m_G = np.zeros((nx, ny, nz), dtype=np.complex128)
+                m_G[ix, iy, iz] = ri[0::2] + 1j * ri[1::2]
+                out[i] = np.real(np.fft.ifftn(m_G)) * (nx * ny * nz)
+        return out
+
+    # ------------------------------------------------------------------
     def validate_against_wfn(self, wfn, atol: float = 1e-6) -> None:
         """Assert all structural fields match a WFNReader."""
         def _chk(name, a, b, tol=atol):

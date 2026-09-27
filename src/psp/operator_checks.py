@@ -310,6 +310,7 @@ def validate_dense_h_inputs(
     charge_density_fields: tuple,
     n_basis_max: int,
     budget_bytes: float,
+    nc_gga_branch: str | None = None,
 ) -> OperatorContext:
     """Refuse, before any heavy work, a QE run whose H the psp operators cannot rebuild.
 
@@ -317,8 +318,18 @@ def validate_dense_h_inputs(
     only its parsed XML facts, so each refusal class is testable without
     files.  Every refusal is a :class:`DenseHRefusal` whose ``rule`` names
     the class: ``upf_missing``, ``functional``, ``xc_extension``,
-    ``pseudo_type``, ``magnetism``, ``charge_density``, ``truncation_2d``,
-    ``memory``.  On success the validated operator context comes back.
+    ``pseudo_type``, ``magnetism``, ``nc_gga_branch``, ``charge_density``,
+    ``truncation_2d``, ``memory``.  On success the validated operator
+    context comes back.
+
+    Magnetism: a noncollinear magnetic run (``do_magnetization``) is
+    rebuilt with V_xc = v δ + B·σ from ρ and m (``psp.xc``), in QE's general
+    noncollinear GGA branch (``lsign = .false.``).  The ``.save`` does not
+    record which branch the QE run took (stock QE fixes a quantization axis
+    when every starting moment is parallel; the sandbox's patched QE and
+    tilted seeds do not), so the caller states it: ``nc_gga_branch``
+    ``"general"`` is rebuilt, anything else refuses.  Collinear ``nspin = 2``
+    refuses: H_k and the WFN writer carry one spin channel.
     """
     import os
 
@@ -364,12 +375,20 @@ def validate_dense_h_inputs(
                 f"QE run used {crystal.functional!r}.")
 
     # ---- magnetism ----
-    if int(crystal.nspin) == 2 or bool(crystal.domag):
+    if int(crystal.nspin) == 2:
         raise DenseHRefusal(
             "magnetism",
-            f"magnetic run (nspin={int(crystal.nspin)}, "
-            f"do_magnetization={bool(crystal.domag)}); the psp V_xc is "
-            f"spin-unpolarized.")
+            "collinear spin-polarized run (nspin=2): H_k and the WFN writer "
+            "carry one spin channel.  Run QE noncollinear (noncolin=.true.).")
+    if bool(crystal.domag) and nc_gga_branch != "general":
+        raise DenseHRefusal(
+            "nc_gga_branch",
+            f"noncollinear magnetic GGA run, nc_gga_branch={nc_gga_branch!r}. "
+            f"The QE .save does not record QE's noncollinear GGA branch; "
+            f"state it (--nc-gga-branch general: the patched SOC pw.x or "
+            f"nonparallel seeds, no 'Fixed quantization axis for GGA' line "
+            f"in the SCF output).  The fixed-axis branch (lsign=.true.) is "
+            f"not rebuilt: it needs QE's ux, which the .save does not keep.")
 
     # ---- the density the potential is built from ----
     if "rhotot_g" not in charge_density_fields:
@@ -377,6 +396,13 @@ def validate_dense_h_inputs(
             "charge_density",
             f"no charge-density.hdf5 with rhotot_g in {crystal._save_dir}; "
             f"V_H and V_xc are built from the SCF density.")
+    missing_m = [f for f in ("m_x", "m_y", "m_z")
+                 if f not in charge_density_fields]
+    if bool(crystal.domag) and missing_m:
+        raise DenseHRefusal(
+            "charge_density",
+            f"magnetic run but charge-density.hdf5 lacks {missing_m}; "
+            f"B_xc is built from the SCF magnetization.")
 
     # ---- Coulomb truncation agrees with the QE run ----
     qe_2d = crystal.assume_isolated == "2D"
