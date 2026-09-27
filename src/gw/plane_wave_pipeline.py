@@ -464,7 +464,6 @@ class PlaneWaveGW:
                                          nkz=self.s.kgrid[2], mu_basis=None), mesh,
             omega_grid_ry=config.omega_grid_ry, efermi_ry=self.mu,
             regularization_width_ry=xi.resolved_ry,
-            edge_factor=float(config.sigma.window_edge_factor),
             quadrature_eps=float(config.sigma.quadrature_eps),
             quadrature_cache_dir=resolve_sigma_box_cache_dir(config.sigma.quadrature_cache_dir,
                                                              config.input_dir),

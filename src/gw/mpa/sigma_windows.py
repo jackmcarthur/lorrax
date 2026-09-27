@@ -84,7 +84,7 @@ def _stats_by_pole(Omega, B, bounds):
     return tuple(out)
 
 
-def sigma_pole_edges(branches, state_edge, excursion):
+def sigma_pole_edges(branches, state_edge):
     """The Σ planner's pole edges, in Ry: the one owner of their formula.
 
     ``pos``/``neg`` belong to the crossing branch of each ω half
@@ -112,30 +112,14 @@ def sigma_pole_edges(branches, state_edge, excursion):
     return {"pos": pos + near, "neg": neg + near, "near": near}
 
 
-def _geometry(branches, regularization_width_ry, edge_factor):
+def _geometry(branches, regularization_width_ry):
     omega_max = max((float(np.max(b.omega_abs)) for b in branches
                      if b.omega_abs.size), default=0.0)
     eta = float(regularization_width_ry)
     if not np.isfinite(eta) or eta <= 0.0:
         raise ValueError("MPA sigma eta must be finite and positive")
-    # Fractional occupations give EVERY branch a possible negative-E_A shell
-    # (width ~ few×degauss): the crossing branches through their own support,
-    # and the statically-sign-definite branches through wrong-side states (an
-    # MP1-fractional state above μ still carries weight f in a "val" branch).
-    # Deepening the shallow/deep pole edge by the worst excursion across ALL
-    # branches keeps every deep-pole rectangle sign-definite — the crossing
-    # slab at x_lo = e_lo + a_lo − ω_max > edge·η, and the sd_slab (the
-    # wrong-side sliver × deep poles, whose x has the +ω orientation) at
-    # x_lo = e_lo + a_lo ≥ edge·η + ω_max — and routes every straddle
-    # through a core rule whose f_max bound covers it.  A non-negative
-    # support (every normal insulator) contributes zero, so the insulating
-    # geometry is unchanged bit-for-bit.
-    excursion = 0.0
-    for b in branches:
-        _mask, eb = _a_space(b, lambda E: np.ones(E.shape, bool))
-        if eb is not None:
-            excursion = max(excursion, -min(eb[0], 0.0))
-    edges = sigma_pole_edges(branches, float(edge_factor) * eta, excursion)
+    # One eta margin; the common edge owner adds the fixed FD excursion.
+    edges = sigma_pole_edges(branches, eta)
     selectors = {"all": _selector()}
     for name, edge in edges.items():
         selectors[f"shallow:{name}"] = _selector(a_hi=edge)
@@ -150,7 +134,6 @@ def summarize_sigma_poles(
     branches,
     *,
     regularization_width_ry,
-    edge_factor,
     pole_offset=0,
 ):
     """Reduce one resident pole batch to the scalar planning evidence.
@@ -160,7 +143,7 @@ def summarize_sigma_poles(
     windows are selected against the same support.
     """
     _omega_max, _eta, _edges, selectors = _geometry(
-        branches, regularization_width_ry, edge_factor)
+        branches, regularization_width_ry)
     if B_poles.shape != Omega_poles.shape:
         raise ValueError("Omega_poles and B_poles must have identical shapes")
     nonfinite, bad = map(int, jax.device_get(
@@ -250,7 +233,7 @@ def shared_pole_intervals(frequencies, pole_indices, bounds):
 
 
 def summarize_shared_poles(
-    poles2_ry2, counts, branches, *, regularization_width_ry, edge_factor,
+    poles2_ry2, counts, branches, *, regularization_width_ry,
 ):
     """Feed real, ragged parent extrema to the existing Σ window planner.
 
@@ -261,7 +244,7 @@ def summarize_shared_poles(
     """
     frequencies = shared_pole_frequencies(poles2_ry2, counts)
     _, _, _, selectors = _geometry(
-        branches, regularization_width_ry, edge_factor)
+        branches, regularization_width_ry)
     evidence = [dict() for _ in frequencies]
     indices = np.arange(len(frequencies), dtype=np.int64)
     for name, bounds in selectors.items():

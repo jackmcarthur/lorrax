@@ -1626,7 +1626,6 @@ def compute_sigma_c_mpa_omega_grid(
     omega_grid_ry,
     efermi_ry,
     regularization_width_ry,
-    edge_factor=1.5,
     quadrature_eps,
     quadrature_cache_dir,
     omega_grid_step_ry,
@@ -1763,8 +1762,7 @@ def compute_sigma_c_mpa_omega_grid(
                 frequencies = shared_pole_frequencies(poles2, counts)
                 summaries = summarize_shared_poles(
                     poles2, counts, branches,
-                    regularization_width_ry=regularization_width_ry,
-                    edge_factor=edge_factor)
+                    regularization_width_ry=regularization_width_ry)
                 if scope is not None:
                     # The certificate boxes come from the same union, so the
                     # map's sector calls request one box set: the first fits
@@ -1775,8 +1773,7 @@ def compute_sigma_c_mpa_omega_grid(
                         union2[q, :len(row)] = np.sort(row)
                     certificate = summarize_shared_poles(
                         union2, np.asarray(union_counts, np.int64), branches,
-                        regularization_width_ry=regularization_width_ry,
-                        edge_factor=edge_factor)
+                        regularization_width_ry=regularization_width_ry)
         for lo in (() if shared_pole else range(0, n_poles, int(pole_batch_size))):
             hi = min(lo + int(pole_batch_size), n_poles)
             Omega, B, B_odd = reader.read(
@@ -1786,7 +1783,7 @@ def compute_sigma_c_mpa_omega_grid(
             summaries.extend(summarize_sigma_poles(
                 Omega, _geometry_residue(B, B_odd), branches,
                 regularization_width_ry=regularization_width_ry,
-                edge_factor=edge_factor, pole_offset=lo))
+                pole_offset=lo))
             del Omega, B, B_odd
             gc.collect()
         # Rule fitting is its own timing row: on the Si b80/c504 deck the
@@ -1799,7 +1796,7 @@ def compute_sigma_c_mpa_omega_grid(
                 regularization_width_ry,
                 eps=quadrature_eps,
                 cache_dir=quadrature_cache_dir,
-                print_fn=print_fn, edge_factor=edge_factor,
+                print_fn=print_fn,
                 fixed_rule_session=fixed_quadrature_session,
                 analytic_line=bool(analytic_line),
                 material_class=material_class,

@@ -196,7 +196,7 @@ def _live_states(branch):
     return energy, energy.reshape(-1)[indices], indices
 
 
-def _product_geometry(branches, eta, edge_factor):
+def _product_geometry(branches, eta):
     omega_max = max(
         (float(np.max(branch.omega_abs)) for branch in branches
          if branch.omega_abs.size), default=0.0)
@@ -206,15 +206,15 @@ def _product_geometry(branches, eta, edge_factor):
         shape, energy, indices = _live_states(branch)
         excursion = max(excursion, float(branch.excursion_bound_ry))
         state_rows.append((shape, energy, indices))
-    state_edge = float(edge_factor) * eta
-    edges = sigma_pole_edges(branches, state_edge, excursion)
+    state_edge = eta
+    edges = sigma_pole_edges(branches, state_edge)
     return state_rows, {
         "omega_max_ry": omega_max,
         "state_edge_ry": state_edge,
         "pole_edges_ry": edges,
         "omega_cut_ry": edges["near"],
         "negative_state_excursion_ry": excursion,
-        "edge_factor": float(edge_factor),
+        "edge_factor": 1.0,
     }
 
 
@@ -1255,7 +1255,6 @@ def plan_sigma_windows(
     eps,
     cache_dir,
     print_fn=print,
-    edge_factor=1.5,
     fixed_rule_session=None,
     analytic_line=False,
     material_class=None,
@@ -1341,13 +1340,10 @@ def plan_sigma_windows(
     """
     started = time.perf_counter()
     eta, tolerance = float(eta_ry), float(eps)
-    edge = float(edge_factor)
     if not np.isfinite(eta) or eta <= 0.0:
         raise ValueError("sigma_quadrature requires eta_ry > 0")
     if not 0.0 < tolerance < 1.0:
         raise ValueError("sigma_quadrature_eps must lie in (0, 1)")
-    if not np.isfinite(edge) or edge < 0.0:
-        raise ValueError("Sigma selector margin must be nonnegative")
     fixed_pole_support = None
     if fixed_pole_support_ry is not None:
         fixed_pole_support = float(fixed_pole_support_ry)
@@ -1367,7 +1363,7 @@ def plan_sigma_windows(
     if not summaries:
         raise ValueError("Sigma box planning needs at least one pole summary")
     omega_grid = np.asarray(omega_ry, dtype=np.float64)
-    state_rows, geometry = _product_geometry(branch_rows, eta, edge)
+    state_rows, geometry = _product_geometry(branch_rows, eta)
 
     certificate_rows = (summaries if certificate_pole_summaries is None
                         else tuple(certificate_pole_summaries))
