@@ -58,17 +58,7 @@ def _admit_compiled(kernel,args,meta,stage,*,native=0,resident=0):
 # objects and XLA compiles each program once per run.  Data (factors, poles,
 # intervals) always enters as an argument, never as a closure constant.
 
-_ENDPOINT_UNFOLD = {}
-
-
-def _endpoint_unfold(kwargs):
-    """``jit(face -> unfold_endpoint_panel(face, **kwargs)[0])``, one per table set."""
-    from symmetry_maps import unfold_endpoint_panel
-    key = _static_key(kwargs)
-    if key not in _ENDPOINT_UNFOLD:
-        _ENDPOINT_UNFOLD[key] = jax.jit(
-            lambda face: unfold_endpoint_panel(face, **kwargs)[0])
-    return _ENDPOINT_UNFOLD[key]
+_W_CONTRACTIONS = {}
 
 
 @lru_cache(maxsize=None)
@@ -83,29 +73,36 @@ def _zeros(mesh_xy, shape):
                    out_shardings=NamedSharding(mesh_xy, P(None, 'x', 'y')))
 
 
-@lru_cache(maxsize=None)
-def _w_contraction(mesh_xy, grid, nk, mc, nt_n, kcarrier, layout):
-    """W(t) = B_A d(t) B_B^T on the full-q grid; the valence branch reads -q.
+def _w_contraction(mesh_xy, grid, nq, mc, nt_n, kcarrier, layout, tables):
+    """Contract B_A d(t) B_B† on q parents, then apply the typed endpoint action.
 
-    ``(nk, m*nc, n*nt)`` from ``(x, y, omega, interval, ref, time, hole)``
-    with ``hole`` static.  One GEMM plan per configuration.
+    The antiunitary partner is B_A* d(t) B_Bᵀ: its causal weights remain
+    unchanged. The occupied branch is conj(W_+[conj(d)](-q)); this preserves
+    the same ordered-residue convention as the full-q endpoint contraction.
+    Every quadratic operand retains P(None,'x','y').
     """
     from distrib_la import gemm_plan
-    from symmetry_maps import q_negation_index
+    from symmetry_maps import q_negation_index, unfold_operator_from_load_tables
     from .sigma import _shared_pole_weights, _shared_pole_contract
-    gemm = gemm_plan(mesh_xy, m=mc, n=nt_n, k=kcarrier, nq=nk,
+    key = _static_key((mesh_xy, grid, nq, mc, nt_n, kcarrier, layout, tables))
+    if key in _W_CONTRACTIONS:
+        return _W_CONTRACTIONS[key]
+    gemm = gemm_plan(mesh_xy, m=mc, n=nt_n, k=kcarrier, nq=nq,
                      dtype=np.complex128, layout=layout)
     minus = jnp.asarray(q_negation_index(grid))
+    anti = bool(np.any(tables.trs))
 
     @partial(jax.jit, static_argnums=(6,))
     def kernel(x, y, omega, interval, ref, time, hole):
-        if hole:
-            x = jnp.conj(jnp.take(x, minus, axis=0))
-            y = jnp.conj(jnp.take(y, minus, axis=0))
-            omega = jnp.take(omega, minus, axis=0)
-            interval = jnp.take(interval, minus, axis=0)
         weights = _shared_pole_weights(omega, interval, ref, time)
-        return _shared_pole_contract(x, y, weights, gemm=gemm, layout=layout)
+        if hole:
+            weights = jnp.conj(weights)
+        value = _shared_pole_contract(x, y, weights, gemm=gemm, layout=layout)
+        partner = (_shared_pole_contract(jnp.conj(x), jnp.conj(y), weights,
+                                        gemm=gemm, layout=layout) if anti else None)
+        full = unfold_operator_from_load_tables(value, partner, tables=tables, mesh_xy=mesh_xy)
+        return jnp.conj(jnp.take(full, minus, axis=0)) if hole else full
+    _W_CONTRACTIONS[key] = kernel
     return kernel
 
 
@@ -179,36 +176,41 @@ def sector_tau_factory(left, right, keys, meta, mesh_xy):
     return factory
 
 
-def _endpoint_route(header, basis, sym, span, rows, mesh_xy, axis, width):
-    """Bind the symmetry service's current/charge endpoint action, once per panel."""
-    from symmetry_maps import endpoint_panel_cost
+def _sector_unfold_tables(headers, bases, families, mesh_xy):
+    """Bind both packed endpoint families to the service's Lorentz action."""
+    from symmetry_maps import unfold_load_tables
     from gw.qgrid_symmetry import shared_pole_packed_action
-    proxy = SimpleNamespace(mu_basis=basis)
-    perm, wraps, _ = shared_pole_packed_action(proxy, header, mesh_xy=mesh_xy)
-    qt = header['qirr']
-    lo, hi = span
-    parent = np.asarray(qt['irr_idx_q'])[rows]-lo
-    operations = np.asarray(qt['sym_idx_q'])[rows]
-    nc = int(header.get('factor_components', 1))
-    action = (sym.cartesian_action(operations, axial=False, time_odd=True)
-              if nc == 3 else np.ones((len(rows),1,1)))
-    cost = endpoint_panel_cost((hi-lo,basis.n_packed,nc,width),len(rows),
-                              mesh=mesh_xy,mesh_axis=axis,dtype=np.complex128)
-    kwargs = dict(irr_idx=parent,sym_idx=operations,
-        q_irr_frac=np.asarray(qt['q_irr_frac'])[lo:hi],source_perm=perm,L_table=wraps,
-        spin_action_full=action,n_sym_spatial=int(qt['n_sym_spatial']),
-        active_mask=basis.active_mask,mesh=mesh_xy,mesh_axis=axis,
-        max_live_bytes=cost['estimated_live_bytes_per_rank'])
-    return _endpoint_unfold(kwargs), cost
+    actions = []
+    for header, basis, family in zip(headers, bases, families):
+        perm, wraps, _ = shared_pole_packed_action(
+            SimpleNamespace(mu_basis=basis), header, mesh_xy=mesh_xy)
+        qt = header['qirr']
+        components = int(header.get('factor_components', 1))
+        if components not in (1, 3):
+            raise ValueError('GATE shared_pole_sectors: expected charge or three current components')
+        lorentz = family.green_parent.plan.sym.lorentz_action(qt['sym_idx_q'])
+        action = lorentz[:, :1, :1] if components == 1 else lorentz[:, 1:, 1:]
+        actions.append((perm, wraps, action))
+    left, right = actions
+    qt = headers[0]['qirr']
+    other = headers[1]['qirr']
+    if any(not np.array_equal(qt[name], other[name])
+           for name in ('irr_idx_q', 'sym_idx_q', 'q_irr_frac', 'n_sym_spatial')):
+        raise ValueError('GATE shared_pole_sector_census: endpoint q actions differ')
+    return unfold_load_tables(
+        irr_idx=qt['irr_idx_q'], sym_idx=qt['sym_idx_q'],
+        sym_perm=left[0], L_table=left[1], right_sym_perm=right[0], right_L_table=right[1],
+        k_irr_frac=qt['q_irr_frac'], spin_action_full=left[2], right_spin_action_full=right[2],
+        n_sym_spatial=int(qt['n_sym_spatial']), mesh_xy=mesh_xy, trs_rule='pair_transpose')
 
 
 def sector_synthesis(readers, headers, bases, families, frequencies, meta, mesh_xy):
-    """Retain full-q endpoint factors and form one W(t) tile per tau.
+    """Retain parent-q endpoint factors and unfold their contraction per tau.
 
-    The store and symmetry services are called once at setup.  The factors
-    are placed once, with pole columns replicated (axis orientation) whenever
-    the capacity ledger admits it, so each tau is a local GEMM; otherwise the
-    configured face placement is kept.
+    Pole columns are replicated only when admitted, so the parent contraction
+    is a local GEMM; otherwise it uses the configured face placement. Typed
+    endpoint tables transport the product, with a second parent contraction
+    only when the authenticated magnetic group selects antiunitary rows.
     Occupied windows use conj(B_A(-q)) d(t) B_B(-q)^T; d is never conjugated.
     """
     from file_io.shared_pole_store import read_shared_pole_faces
@@ -235,16 +237,12 @@ def sector_synthesis(readers, headers, bases, families, frequencies, meta, mesh_
                           lambda _space,_indices,_bounds:(),lambda:(),lambda _result=None:None,0,
                           ('zero',mesh_xy,shape,nc,nt),ordered=True)
     # The store reader pads physical Kmax for both endpoint face shardings.
-    # Keep that carrier through unfolding and GEMM; K and the interval bounds
+    # Keep that carrier through GEMM; K and the interval bounds
     # remain physical, so the padded pole columns have identically zero weight.
     kcarrier=padded_axis(kmax,mesh_xy,name='sector_sigma_K',specs=(
         (P(None,'x',None,'y'),3),(P(None,'y',None,'x'),3))).carrier
-    rows=np.arange(nk,dtype=np.int32)
-    routes=[];costs=[]
-    for h,b,f,axis in zip(headers,bases,families,('x','y')):
-        route,cost=_endpoint_route(h,b,f.green_parent.plan.sym,(0,nq),rows,
-                                   mesh_xy,axis,kcarrier)
-        routes.append(route);costs.append(cost)
+    tables = _sector_unfold_tables(headers, bases, families, mesh_xy)
+    partners = 2 if np.any(tables.trs) else 1
     def place(value,spec):
         return _placer(mesh_xy,spec)(value)
     px,py=int(mesh_xy.shape['x']),int(mesh_xy.shape['y'])
@@ -254,18 +252,14 @@ def sector_synthesis(readers, headers, bases, families, frequencies, meta, mesh_
         # Each factor has one centroid axis. Pole columns divide over the
         # other mesh axis only in the face orientation.
         split=factor_layout=='face'
-        return (16*nk*((m//px)*nc*(kcarrier//py if split else kcarrier)
+        return (16*nq*((m//px)*nc*(kcarrier//py if split else kcarrier)
                        +(n//py)*nt*(kcarrier//px if split else kcarrier))
-                +8*nk*kcarrier+16*nk*m*nc*n*nt//mesh_xy.size)
-    native=_native_workspace(mesh_xy,(((nk,m*nc,kcarrier),(nk,kcarrier,n*nt)),))
-    workspace=sum(c['estimated_live_bytes_per_rank'] for c in costs)+native
-    # A face input is required by the established symmetry route. After it
-    # completes the factors are placed once for every tau: they do not depend
-    # on tau, only d(tau) does. With K replicated (axis orientation) each tau
-    # is a local batched GEMM with no collective; the face GEMM's per-q SUMMA
-    # re-broadcast the same panels every call (Fe 4^3 bispinor: 158k NCCL
-    # broadcasts, 9.9 s of the first sector sweep). Face stays the fallback
-    # when the ledger cannot admit the replicated pole columns.
+                +8*nq*kcarrier+16*(nk+partners*nq)*m*nc*n*nt//mesh_xy.size)
+    native=_native_workspace(mesh_xy,(((nq,m*nc,kcarrier),(nq,kcarrier,n*nt)),))
+    workspace=2*face_bytes+native
+    # Factors remain on the q wedge. Place their pole columns once; every
+    # tau reuses that placement and pays the product unfold, never an
+    # endpoint unfold or a full-zone factor contraction.
     factor_layout=layout
     if layout=='face' and capacity.preview(
             resident_bytes_per_rank=resident_for('axis')+2*face_bytes,
@@ -291,10 +285,9 @@ def sector_synthesis(readers, headers, bases, families, frequencies, meta, mesh_
                                        basis=bases[1],orientations=('y',))
             if not bool(jnp.all(lhs[2]==rhs[2])):
                 raise ValueError('GATE shared_pole_sector_census: unequal pole values')
-        b_x=place(routes[0](lhs[0]),factor_spec[0])
-        b_y=place(routes[1](rhs[1]),factor_spec[1])
-        parent=np.asarray(left['qirr']['irr_idx_q'],dtype=np.int32)
-        poles=jnp.take(lhs[2],parent,axis=0)
+        b_x=place(lhs[0],factor_spec[0])
+        b_y=place(rhs[1],factor_spec[1])
+        poles=lhs[2]
         jax.block_until_ready((b_x,b_y,poles))
         del lhs,rhs
     except BaseException:
@@ -312,7 +305,7 @@ def sector_synthesis(readers, headers, bases, families, frequencies, meta, mesh_
         # The window runner inlines this contraction and SynthesisTau.admit
         # reserves the runner's peak plus this GEMM's native workspace; a
         # standalone AOT compile per hole would only repeat that work.
-        kernel=_w_contraction(mesh_xy,tuple(left['grid']),nk,m*nc,n*nt,kcarrier,factor_layout)
+        kernel=_w_contraction(mesh_xy,tuple(left['grid']),nq,m*nc,n*nt,kcarrier,factor_layout,tables)
     except BaseException:
         capacity.live_stages=ambient
         b_x=b_y=poles=None
@@ -326,7 +319,7 @@ def sector_synthesis(readers, headers, bases, families, frequencies, meta, mesh_
         # Host intervals once per window; every tau node of the window reuses them.
         intervals=shared_pole_intervals(frequencies,np.asarray(indices),np.asarray(bounds))
         return (b_x,b_y,poles,device_put_process_local(
-            np.ascontiguousarray(intervals[parent]),replicated))
+            np.ascontiguousarray(intervals),replicated))
     closed=False
     def close(result=None):
         nonlocal b_x,b_y,poles,closed
@@ -339,7 +332,8 @@ def sector_synthesis(readers, headers, bases, families, frequencies, meta, mesh_
             capacity.live_stages=ambient
             closed=True
     return WSynthesis(w_kernel,window_operands,lambda:(b_x,b_y,poles),close,native,
-                      ('w',mesh_xy,tuple(left['grid']),nk,m,nc,n,nt,kcarrier,layout),ordered=True)
+                      ('w',mesh_xy,tuple(left['grid']),nq,nk,m,nc,n,nt,kcarrier,factor_layout,
+                       _static_key(tables)),ordered=True)
 
 
 def instantaneous_sector_sigma(handle, families, bases, meta, mesh_xy, *,

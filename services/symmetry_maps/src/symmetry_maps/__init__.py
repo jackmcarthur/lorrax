@@ -245,6 +245,7 @@ from symmetry_maps.unfold_load import (
     unfold_load_tables,
     local_unfold_load_tables,
     apply_unfold_load_tables_local,
+    unfold_operator_from_load_tables,
 )
 # Pre-sweep spellings.  Imported from the modules that define them, so
 # the door and the module bind the SAME object and cannot drift apart.
@@ -353,6 +354,7 @@ __all__ = [
     "umklapp_phase",
     "UnfoldLoadTables", "unfold_load_tables", "local_unfold_load_tables",
     "apply_unfold_load_tables_local",
+    "unfold_operator_from_load_tables",
     "isdf_one_leg_source_slots",
     "mix_lorentz_blocks",
     # psi unfold / antiunitary rule
