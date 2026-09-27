@@ -492,7 +492,8 @@ def _prepare_oneshot_response(
     # store carries.
     direct_only_shared_pole = (
         config.head.correction is HeadCorrection.NO_LOCAL_FIELDS
-        and config.sigma.w_model == "shared_pole")
+        and config.sigma.w_model == "shared_pole"
+        and not uses_direct_bispinor_shared_pole_head(config))
     if (do_screened
             and (config.head.correction is HeadCorrection.FULL or direct_only_shared_pole)
             and config.screening.diagrams is ScreeningDiagrams.W_RPA
