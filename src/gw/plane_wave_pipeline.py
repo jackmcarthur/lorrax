@@ -750,8 +750,10 @@ class PlaneWaveGW:
         counts = np.concatenate([a.sum(axis=-1) for a in active_rows]).astype(np.int64)
         K = int(face_width(mesh, int(counts.max())))
         poles2 = np.ones((self.n_par, K))
-        for q, (p, a) in enumerate(zip(np.concatenate(pole_rows), np.concatenate(active_rows))):
-            poles2[q, :int(a.sum())] = p[:int(a.sum())]
+        # rounds may solve at different pencil sides; each parent's model is an active prefix
+        rows = [(p, int(a.sum())) for P_, A_ in zip(pole_rows, active_rows) for p, a in zip(P_, A_)]
+        for q, (p, c) in enumerate(rows):
+            poles2[q, :c] = p[:c]
         pad = lambda b: jnp.pad(b[:, :, :K], ((0, 0), (0, 0), (0, max(0, K - b.shape[-1]))))
         b = jax.jit(lambda *bs: jnp.concatenate([pad(x)[:r] for x, r in zip(bs, [r for _, r in blocks])]),
                     out_shardings=NamedSharding(mesh, P(None, "x", None)))(*[x for x, _ in blocks])
