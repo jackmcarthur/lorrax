@@ -1,108 +1,47 @@
-"""Measure-independent generalized-Gauss time rules for ``1/d`` on a box.
+"""The Sigma box rule's record, its boundary certificate and its noise measure.
 
-One rule per product window.  The only inputs are the window's support box
-``[re_lo, re_hi] x [im_lo, im_hi]`` in the denominator ``d = omega - z``
-(``im_lo = eta``) and ``eps``, a sup bound on the box in the currency that
-matches Sigma's error: the RELATIVE error ``|d| |Q - 1/d|`` on a
-sign-definite box (its terms are far from resonance and large, semicore
-states at ``|d| ~ 200 eta`` included), the error relative to the ``1/eta``
-peak, ``eta |Q - 1/d|``, on a crossing box (where ``1/d`` is bounded only by
-the peak and a relative bound at the edges would cost +50 % nodes for no
-delivered gain).  See ``build_uniform_rule``.
-Nothing about the spectral measure enters: the same box gives the same rule
-on every deck, which is what makes the result reproducible and cacheable
-(rules are keyed by ``(box, eps)``) and what removed the campaign's failure
-mode of histogram-weighted fits that missed a low-mass state at E_F.
+A rule for ``1/d`` on a denominator box ``[re_lo, re_hi] x [im_lo, im_hi]``
+(``im_lo = eta > 0``) is a :class:`UniformRule`: times and weights in the
+executor convention ``1/d ~= sum_k w_k exp(i t_k d)``, the box and ``eps``
+it answers, and the certificate it passed.  The builder is
+:func:`minimax.analytic_box.analytic_box_rule`; this module holds what the
+builder, the planner and the rule table share:
 
-The identity being discretised is ``1/d = -i int_0^inf exp(i t d) dt``
-(``Im d > 0``), so ``sum_k w_k exp(i t_k d)`` with the time nodes ``t_k`` is
-one FFT convolution per node in the executor; nodes are the runtime
-currency.  Boxes with ``Im d < 0`` are NOT handled here: the caller
-conjugates (``times -> -conj(times)``, ``weights -> conj(weights)``), which
-flips ``Im d`` and leaves the real corners alone.
+- :class:`_BoundaryCloud`, the acceptance certificate: the error and the
+  executor's noise mass are analytic/subharmonic on the closed box, so their
+  maxima lie on its boundary, sampled at the rule's own horizon and refined
+  by a bracketed golden-section search;
+- :func:`rule_sup_error` and :func:`rule_roundoff_amplification`, the same
+  two numbers on a caller's cloud (the planner's noise gate);
+- the 16-thread BLAS pin every build runs under, and
+  :func:`uniform_rule_solver_identity`, which keys the persistent rule table.
 
-1. **Ray angle.** ``t = s exp(-i theta)``; ``theta`` is scanned over the
-   interval where every ``exp(i t d)`` on the box decays and the angle with
-   the smallest numerical rank wins.  Symmetric crossing boxes get real time,
-   sign-definite boxes rotate toward imaginary time (the Laplace family).
-2. **Start.** Interpolatory rule from a pivoted QR of the ray family's SVD
-   basis (``r`` nodes at ``eps/10``), ready after about a second.  In the
-   relative currency the basis and the least squares carry the cloud's
-   log-density (every decade of ``|d|`` counts once) and the start is
-   polished by a few Lawson reweighting rounds toward the sup, because the
-   L2 optimum leaves the near corner 3-7x above ``eps``.
-3. **Placement (crossing boxes).** ``fixed_n_start`` predicts the count the
-   box needs and places exactly that many nodes where certified rules put
-   theirs; one polish either certifies it or the count grows 10 % and the
-   placement is tried again.  This is what a crossing box normally returns,
-   and it terminates on the CERTIFICATE, never on a clock.  It exists
-   because the reduction below asks for ~``rank/2`` removals times ``K``
-   candidates times 60-180 LM steps -- of order 1e5 solves and 100+ TFLOP --
-   on a problem whose whole content is a few hundred GFLOP.  On a wide box it
-   does not finish (still running after nine minutes on the widest corpus
-   box), so it is not this path's fallback: when the bracket is exhausted the
-   rule is the interpolatory one at the ray rank, polished once.
-4. **Reduction** (sign-definite boxes only). Bremer-Gimbutas-Rokhlin style: nodes are removed one at a
-   time (batches while far above the target), the survivors re-solved by a
-   variable-projection Levenberg-Marquardt on the CLOUD residual
-   ``sum_k w_k exp(i t_k d) - 1/d``.  Candidates are ranked by the
-   leave-one-out residual gain ``|w_k|^2 / [(A^H A + mu^2)^-1]_kk``; the best
-   ``K`` get a short solve, the best ``keep`` of those are solved to
-   acceptance, and the accepted one with the smallest residual is kept.
-   Weights are eliminated by penalised least squares (Tikhonov ``mu`` pinning
-   the cancellation ratio), ``Im s`` is parametrised as ``c + h tanh(y)`` so
-   the off-ray cap is built into the model.  A candidate is kept while the
-   sup error on a FINER check cloud stays below ``eps`` and the
-   term-cancellation ratio below ``kappa_cap``.  It runs to its natural end,
-   the point where no accepted removal remains, which on a sign-definite box
-   is 0.4-3.0 s.
-
-Why the reduction works on the cloud and not on the SVD moments: the
-truncated SVD model is exact only on the ray, and its dropped tail grows like
-``exp(B |Im t|)`` at nodes off the ray, so a moment residual read 1e-14 while
-the box error was 1e-3.  Every acceptance decision below is a sup norm on
-sampled denominators for that reason.
-
-Counts: a crossing box returns what ``fixed_n_start.predict_nodes`` asks for
-(or the first 10 % rung above it that certifies), roughly ``W T / 2 pi`` for
-an effective width ``W`` and support ``T = ln(c/eps)/eta`` -- measured 34.6 %
-below what the clock-bounded reduction used to ship over the 41-box corpus,
-and not a function of how fast the machine is;
-``O(log(re_hi/re_lo))`` for a sign-definite box.  The count is set by the box
-width in units of ``eta``, so nothing in this module can go below the
-geometry of the window it is given.
+Currencies: the RELATIVE error ``|d| |Q - 1/d|`` on a sign-definite box, the
+peak-relative ``eta |Q - 1/d|`` on a crossing box
+(``docs/theory/sigma-quadrature-problem.md`` section 6).  Boxes with
+``Im d < 0`` are the caller's: it conjugates (``times -> -conj(times)``,
+``weights -> conj(weights)``).
 """
 from __future__ import annotations
 
-import os
-import time
 from contextlib import contextmanager
 from dataclasses import dataclass
 
 import numpy as np
-from numpy.linalg import lstsq, svd
-from scipy.linalg import cho_factor, cho_solve, solve_triangular
-from scipy.linalg import qr as _pivoted_qr
-
-from .fixed_n_start import predict_nodes, start_param
 
 __all__ = [
-    "UniformRule", "build_uniform_rule", "box_samples",
-    "rule_roundoff_amplification", "rule_sup_error",
-    "uniform_rule_solver_identity",
+    "UniformRule", "boundary_samples", "rule_roundoff_amplification",
+    "rule_sup_error", "uniform_rule_solver_identity",
 ]
 
 
 # ----------------------------------------------------------------- BLAS threads
 #: The thread count every rule build runs its BLAS at, whatever the launch
-#: environment. The crossing fit is a nonlinear least squares with many
-#: certified local solutions, and OpenBLAS sums in a thread-count dependent
-#: order, so the environment chose the rule: CrI3 8x8 val:resonant certified
-#: at 188 nodes with 4 threads and 207 with 16 on one host, and at 8 against
-#: 16 threads a Perlmutter node returned the same count with a different rule
-#: (P2-S, 2026-09-25). 16 is what every Perlmutter GPU rank used before the
-#: pin (``runtime.default_blas_threads``: the 16 physical cores of a rank's
-#: 32-hyperthread mask), so the rules that ran there are unchanged.
+#: environment. OpenBLAS sums in a thread-count dependent order, so the weight
+#: solve's round-off, and with it a marginal certificate, would otherwise
+#: follow the environment; the pin makes a rule a function of (box, eps) on
+#: one machine class, which the rule table's memo needs. 16 is the physical
+#: core count of a Perlmutter GPU rank (``runtime.default_blas_threads``).
 _BLAS_THREADS = 16
 _BLAS_CONTROLS = None
 
@@ -155,108 +94,7 @@ def _pinned_blas_threads():
             put(count)
 
 
-# ----------------------------------------------------------------- support cloud
-def _re_line(lo, hi, h, near):
-    """Real-axis sample line: spacing ``h`` within ``near`` of zero, geometric
-    beyond, both end points always present.
-
-    The rule's error oscillates on the scale ``2 pi Im d / ln(1/eps)`` only
-    near ``Re d = 0``; far out the family is smooth on the scale of ``|Re d|``
-    itself, so geometric spacing (about 1.5 points per e-fold, plus 8) resolves
-    it.  Tempting, and why not: a uniform line over the whole box.  The
-    sign-definite tails on a metal reach ``Re d ~ -8.5 Ry`` at ``eta`` 0.018
-    Ry; a uniform line at the near-zero density would be ~1e5 points per Im
-    level and the solver's matrices would not fit in cache, for no gain."""
-    parts = []
-    a, b = max(lo, -near), min(hi, near)
-    if a < b:
-        parts.append(np.arange(a, b + 0.5 * h, h))
-    for sign, edge, inner in ((1.0, hi, lo), (-1.0, lo, hi)):
-        # the geometric part starts at the box's own near edge when that lies
-        # beyond `near`: starting at `near` sampled (and certified) points
-        # outside a far sign-definite box, e.g. Na [77, 243] eta at 5 nodes
-        # where the box itself needs 3 (runs/DEV/326, 2026-09-11)
-        start = max(near, sign * inner)
-        if sign * edge > start:
-            n = int(1.5 * np.log(sign * edge / start) * near / h) + 8
-            parts.append(sign * np.geomspace(start, sign * edge, n))
-    re = np.concatenate(parts) if parts else np.array([lo, hi])
-    return np.sort(np.unique(np.concatenate([re, [lo, hi]])))
-
-
-def box_samples(re_lo, re_hi, im_lo, im_hi, per_unit=5.0, n_im=6, near=30.0):
-    """Sample cloud on the box: ``n_im`` log-spaced ``Im d`` levels from
-    ``im_lo`` to ``im_hi``, each carrying its own real line.
-
-    Along ``Re d`` the spacing is ``min(Im d, 4 im_lo) / per_unit`` within
-    ``near * im_lo`` of zero and geometric beyond (``_re_line``).  Higher Im
-    levels are smoother and get coarser lines, but never coarser than
-    ``4 im_lo / per_unit``: on a rotated ray the fast oscillation is set by
-    the ray's own frequency, not by the level's ``Im d``.  Only the ray-angle
-    scan uses it now (thinned to ~500 points); the fit, the acceptance and
-    the executor noise gate sample the boundary (``_BoundaryCloud``)."""
-    im = np.geomspace(im_lo, max(im_hi, im_lo * 1.0001), n_im)
-    out = []
-    for v in im:
-        h = min(v, 4.0 * im_lo) / per_unit
-        out.append(_re_line(re_lo, re_hi, h, near * im_lo) + 1j * v)
-    return np.concatenate(out)
-
-
-def _log_density_weights(d):
-    """Per-sample weights ``sqrt(q_i)`` with ``q_i`` the spacing of ``log|Re d|``
-    within each ``Im`` level (mean 1).  In the relative currency the basis
-    truncation and the least-squares steps should count every decade of
-    ``|d|`` equally (the natural measure for ``1/x`` on ``[a, b]``); the cloud
-    itself is denser far out, and without this the truncated basis is all
-    about the far region and the start misses the relative criterion at the
-    near corner by 30x (measured: sup_rel 2.8e-3 at eps 1e-4 on the Na
-    val:bulk box, worst point ``d = re_lo + i im_lo``)."""
-    q = np.empty(d.size)
-    for level in np.unique(d.imag):
-        idx = np.nonzero(d.imag == level)[0]
-        x = np.log(np.abs(d.real[idx]))
-        order = np.argsort(x)
-        g = np.gradient(x[order]) if idx.size > 1 else np.ones(1)
-        q[idx[order]] = np.abs(g)
-    q /= max(q.mean(), 1e-300)
-    return np.sqrt(q)
-
-
 # ----------------------------------------------------------------- boundary cloud
-#: Fit-cloud density in points per half wave of the live horizon; the
-#: acceptance cloud uses 6.  On 41 production boxes 1.5, 2 and 3 gave node
-#: counts within path noise of one another and none exceeded eps on an
-#: independent audit; 3 cost ~1.5x the reduction wall of 1.5-2
-#: (runs/DEV/326_minimax_fit_review_2026-09-11, A/B rounds 1-2).
-_FIT_POINTS_PER_HALF_WAVE = 2.0
-# ------------------------------------------------------ fixed-N placement
-# How hard the placement tries at one node count, and how the count grows.
-# All four measured over the 41-box corpus (run DEV/327; claims 2192/2193).
-#
-# The LM is the entire cost of this path: on the widest box one 60-step solve
-# is 12.2 s, against 1 s for the angle scan, the family SVD and the
-# interpolatory weights together, and 32 ms for a certificate.  From a
-# structural start 30 steps reach the same sup as 60 on every box that ever
-# certifies (lm30 against lm60: 1.9/1.9, 1.0/1.0, 1.1/1.1, 1.4/1.4), so the
-# second thirty are bought and thrown away.
-_FIXED_N_STEPS = 30
-# Every placement that ever certified did so by the SECOND Lawson round;
-# rounds 3-6 are about four sevenths of a polish and rescued nothing.
-_FIXED_N_ROUNDS = 2
-# After the initial solve a placement that never certifies sits above 4.6 eps
-# while every eventual winner sits at or below 1.9, so a sup above this is in
-# the wrong basin and is abandoned rather than polished.
-_FIXED_N_GATE = 3.0
-# ``predict_nodes`` is fitted on converged reductions, which censors the
-# widest boxes and makes it read low there by up to 1.56x (x120_thin0
-# certifies at 207 against 133 predicted).  Growing until the certificate
-# passes removes that bias without refitting the law on four points, and
-# 1.10^7 = 1.95 covers the measured shortfall with room to spare.
-_FIXED_N_GROWTH = 1.10
-_FIXED_N_BRACKET = 8
-
-
 def _live_spacing(d, theta, S, eps, p, p_target):
     """Spacing that resolves every live family member at ``d``.
 
@@ -305,15 +143,12 @@ class _BoundaryCloud:
     there too (checked on 300 cached rules).  ``sup`` refines the sampled
     local maxima by a bracketed golden-section search.
 
-    Tempting, and why not: the level cloud (``box_samples``) for the fit and
-    the acceptance.  On a thin box (``Im d`` in ``[eta, 1.01 eta]``, every
-    real-pole window) its 6 or 24 levels are copies of one line -- 22,093
-    rows for an 11-node Na tail rule that 65 boundary rows fit -- and on real
-    time its geometric far-field spacing misses the rule's error, which
-    oscillates at the node horizon at every ``Re d``: a dense boundary audit
-    found 100 of 2,603 cached rules above eps, up to 247x on unreduced wide
-    boxes (runs/DEV/326_minimax_fit_review_2026-09-11).  Merging the levels
-    instead keeps the far-field gap and returned uncertified wide rules."""
+    Tempting, and why not: a cloud of interior levels, or a geometric far
+    field.  On a thin box (``Im d`` in ``[eta, 1.01 eta]``, every real-pole
+    window) the levels are copies of one line, and on real time the rule's
+    error oscillates at the node horizon at every ``Re d``: a dense boundary
+    audit found 100 of 2,603 level-certified rules above eps, up to 247x on
+    wide boxes (runs/DEV/326_minimax_fit_review_2026-09-11)."""
 
     def __init__(self, box, theta, S, eps, *, p, p_target, top=True):
         re_lo, re_hi, im_lo, im_hi = box
@@ -347,9 +182,11 @@ class _BoundaryCloud:
         return np.abs(d * Q - 1.0) if relative else self.im_lo * np.abs(Q - 1.0 / d)
 
     def sup(self, times, weights, relative, iters=20):
-        """``(sup rho |Q - 1/d|, max kappa)``: every sampled local maximum
-        within 10% of the largest (edge ends included) is refined by a
-        golden-section search on its bracket.
+        """``(sup rho |Q - 1/d|, max kappa, max rho sum_k |w_k exp(i t_k d)|)``:
+        every sampled local maximum of the error within 10% of the largest
+        (edge ends included) is refined by a golden-section search on its
+        bracket.  The third number is the executor's noise amplification in
+        the certificate's currency.
 
         Tempting, and why not: the vertex of the parabola through the three
         samples (no extra evaluations).  Near the corner of a relative box the
@@ -359,7 +196,9 @@ class _BoundaryCloud:
         T = _cexp(1j * self.d[:, None] * np.asarray(times)[None, :]) * np.asarray(weights)[None, :]
         Q = T.sum(1)
         g = np.abs(self.d * Q - 1.0) if relative else self.im_lo * np.abs(Q - 1.0 / self.d)
-        kappa = float((np.abs(T).sum(1) / np.maximum(np.abs(Q), 1e-300)).max())
+        term_mass = np.abs(T).sum(1)
+        kappa = float((term_mass / np.maximum(np.abs(Q), 1e-300)).max())
+        mass = float(((np.abs(self.d) if relative else self.im_lo) * term_mass).max())
         best, start = float(g.max()), 0
         base, step, lo, hi = [], [], [], []
         for u, pts in self.edges:
@@ -389,7 +228,7 @@ class _BoundaryCloud:
                 c, e, fc, fe = (np.where(left, x, e), np.where(left, c, x),
                                 np.where(left, fx, fe), np.where(left, fc, fx))
             best = max(best, float(fc.max()), float(fe.max()))
-        return best, kappa
+        return best, kappa, mass
 
 
 def boundary_samples(box, theta_deg, horizon, eps, p=6.0):
@@ -400,571 +239,11 @@ def boundary_samples(box, theta_deg, horizon, eps, p=6.0):
                           float(horizon), float(eps), p=p, p_target=8.0).d
 
 
-def _legal_angles(d, margin=0.25):
-    """Ray angles (1 degree steps) whose slowest family member still decays at
-    a rate of at least ``margin * min(Im d)``:
-    ``|exp(i s e^{-i th} d)| = exp(-s (cos th Im d - sin th Re d))``.
-
-    The margin keeps the horizon ``S = ln(10/eps)/rate`` within four times the
-    real-time horizon.  Tempting, and why not: allow every angle with a
-    positive rate.  Near the limit ``rate -> 0`` the horizon and the Chebyshev
-    grid grow without bound, and a rule on that ray amplifies executor noise
-    by the same factor it gained in rank."""
-    th = np.deg2rad(np.arange(-89.0, 89.5, 1.0))
-    rate = np.min(np.cos(th)[:, None] * d.imag[None, :]
-                  - np.sin(th)[:, None] * d.real[None, :], axis=1)
-    ok = rate >= margin * d.imag.min()
-    return th[ok], rate[ok]
-
-
-# ----------------------------------------------------------------- Chebyshev grid
-def _cheb_grid(S, n):
-    """Chebyshev-Lobatto points on ``[0, S]`` with Clenshaw-Curtis weights.
-
-    The family is compressed by an SVD in the L2 inner product on the ray,
-    which these weights integrate exactly up to degree ``n - 1``; the Lobatto
-    clustering near ``s = 0`` is what resolves the short-lived fast members
-    for free.  Tempting, and why not: a uniform grid with trapezoid weights.
-    Its near-zero spacing is ``S/n``, so the fastest members alias unless
-    ``n`` is many thousands; the first reducer stalled on exactly that."""
-    N = n - 1
-    x = np.cos(np.pi * np.arange(n) / N)
-    m = np.arange(1, N // 2 + 1)
-    b = np.where(2 * m < N, 1.0, 0.5) / (4.0 * m * m - 1.0)
-    acc = np.cos(2.0 * np.pi * np.outer(np.arange(N + 1), m) / N) @ b
-    c = (2.0 / N) * (1.0 - 2.0 * acc)
-    c[0] *= 0.5
-    c[N] *= 0.5
-    return 0.5 * S * (1.0 - x), 0.5 * S * c
-
-
-def _grid_size(d, theta, S, eps=1e-5, points_per_half_wave=3.0, cap=6000):
-    """Chebyshev points needed on ``[0, S]`` for the family on this ray.
-
-    Each member oscillates at ``nu = |cos th Re d + sin th Im d|`` and decays
-    at ``lam``; it needs ``points_per_half_wave`` points per half wave over its
-    LIFETIME ``min(S, ln(10/eps)/lam)``, and the near-zero Lobatto spacing
-    ``S (pi/N)^2 / 2`` must stay below a half wave of the fastest member.
-    Three points per half wave is the measured floor: at two the SVD basis
-    aliased and the reduction stalled.
-
-    Tempting, and why not: size the grid by ``nu_max * S`` (the fastest member
-    over the whole horizon).  On a rotated ray the fast members are the
-    fast-decaying ones and are dead long before ``S``; sizing by ``nu_max * S``
-    gave 6000-point grids and a 353 s start where the lifetime rule takes
-    seconds for the same basis."""
-    nu = np.abs(np.cos(theta) * d.real + np.sin(theta) * d.imag)
-    lam = np.maximum(np.cos(theta) * d.imag - np.sin(theta) * d.real, 1e-300)
-    life = np.minimum(S, np.log(10.0 / eps) / lam)
-    interior = points_per_half_wave * np.max(nu * life) / np.pi
-    near_zero = np.sqrt(points_per_half_wave * np.pi * S * np.max(nu) / 2.0)
-    # The near-zero spacing must also resolve the shortest LIFETIME, not only
-    # the fastest oscillation: on a rotated ray the far members of a wide
-    # sign-definite box die within ``1/(|Re d| sin th)``, which in the
-    # relative currency they must be integrated to ``eps`` over (in the
-    # peak-relative currency they hardly count).  Measured on a box with
-    # ``R ~ 9000`` at 85 deg: the oscillation rule gave 138 points, the first
-    # interval was ten lifetimes wide, and the start rule was wrong
-    # everywhere (relative error 0.6, kappa 2e4).
-    near_decay = np.pi * np.sqrt(
-        points_per_half_wave * S * np.max(lam) / (2.0 * np.log(10.0 / eps)))
-    return int(min(max(interior, near_zero, near_decay) + 100, cap))
-
-
-#: Element-wise work on a tall ``m x n`` block below this size stays inline.
-_ROW_BLOCK_MIN = 1 << 16
-_ROW_POOL = None
-
-
-def _by_rows(block, shape, dtype=complex):
-    """``block(slice)`` for row slices of an array of ``shape``, in row order.
-
-    numpy runs element-wise ufuncs on one core while the planner owns ~16
-    (only the GEMMs used them): the complex exponentials of the design matrix
-    and the conjugate copies were half of a crossing fit's wall
-    (P2-E 2026-09-24).  Rows are independent and every element is computed
-    by the same ufunc as before, so the result is bit-identical to the
-    single-block call.
-    """
-    global _ROW_POOL
-    m = int(shape[0])
-    threads = min(16, len(os.sched_getaffinity(0)), m)
-    if threads < 2 or int(np.prod(shape)) < _ROW_BLOCK_MIN:
-        return block(slice(0, m))
-    if _ROW_POOL is None:
-        from concurrent.futures import ThreadPoolExecutor
-        _ROW_POOL = ThreadPoolExecutor(max_workers=threads)
-    out = np.empty(shape, dtype)
-    edges = np.linspace(0, m, threads + 1).astype(int)
-
-    def fill(lo_hi):
-        lo, hi = lo_hi
-        out[lo:hi] = block(slice(lo, hi))
-
-    list(_ROW_POOL.map(fill, zip(edges[:-1], edges[1:])))
-    return out
-
-
-def _conj(M):
-    """``M.conj()`` of a tall matrix, computed on the planner's cores."""
-    if not M.flags.c_contiguous:
-        return M.conj()
-    return _by_rows(lambda rows: M[rows].conj(), M.shape, M.dtype)
-
-
-def _cholesky_qr2(M):
-    """Economy QR of a tall matrix by two Cholesky-QR passes (all GEMM);
-    Householder QR when a Gram is not positive definite."""
-    try:
-        R1 = np.linalg.cholesky(_conj(M).T @ M).conj().T          # upper
-        Q1 = M @ np.linalg.inv(R1)                                # n x n inverse: cheap
-        R2 = np.linalg.cholesky(_conj(Q1).T @ Q1).conj().T
-        Q = Q1 @ np.linalg.inv(R2)
-        return Q, R2 @ R1
-    except np.linalg.LinAlgError:
-        return np.linalg.qr(M)
-
-
 def _cexp(z):
     """``exp(z)`` for complex ``z`` as ``exp(Re z) (cos Im z + i sin Im z)``.
     numpy's complex ``exp`` is scalar code (44 ns per element measured); the
     three real ufuncs are SIMD and about 3x faster.  Same values."""
     return np.exp(z.real) * (np.cos(z.imag) + 1j * np.sin(z.imag))
-
-
-def _family(d, theta, s):
-    """``exp(i t d)`` for ``t = s exp(-i theta)``: rows are cloud points,
-    columns are ray positions."""
-    return _cexp(1j * d[:, None] * (s * np.exp(-1j * theta))[None, :])
-
-
-def _choose_angle(d, eps, rho, scan=(-85, -70, -55, -40, -20, 0, 20, 40, 55, 70, 85)):
-    """Minimum ``eps``-rank ray angle over the legal interval (rank in the
-    ``rho``-weighted norm, see ``build_uniform_rule``).
-
-    Eleven candidate angles, each snapped to the nearest legal degree and
-    skipped if none is within 0.6 degrees; the rank is measured on a thinned
-    cloud (~500 points), which is within a node or two of the full cloud's.
-    Crossing boxes land on real time, sign-definite ones at 55-70 degrees.
-    If no scanned angle is legal (a very asymmetric box) the middle legal
-    angle is used.
-
-    Tempting, and why not: optimise the angle continuously or on a fine scan.
-    The rank is a step function of the angle and flat around its minimum, so
-    a finer search changes the count by a node while costing an SVD per
-    angle; the coarse scan is about a second."""
-    th_ok, rate_ok = _legal_angles(d)
-    step = max(1, d.size // 500)
-    thin, thin_rho = d[::step], rho[::step]
-    best = None
-    for deg in scan:
-        i = int(np.argmin(np.abs(th_ok - np.deg2rad(deg))))
-        if abs(th_ok[i] - np.deg2rad(deg)) > np.deg2rad(0.6):
-            continue
-        S = np.log(10.0 / eps) / rate_ok[i]
-        s, w = _cheb_grid(S, _grid_size(thin, th_ok[i], S, eps))
-        sv = svd(thin_rho[:, None] * _family(thin, th_ok[i], s) * np.sqrt(w)[None, :],
-                 compute_uv=False)
-        r = int(np.sum(sv > eps * sv[0]))
-        if best is None or r < best[0]:
-            best = (r, th_ok[i], S, rate_ok[i])
-    if best is None:
-        i = len(th_ok) // 2
-        best = (0, th_ok[i], np.log(10.0 / eps) / rate_ok[i], rate_ok[i])
-    return best
-
-
-# ----------------------------------------------------------------- ray family (start rule)
-class _RayFamily:
-    """SVD basis of ``{exp(i t(s) d)}`` on one ray; provides the interpolatory
-    start rule.
-
-    ``M`` is the family on the Lobatto grid with the Clenshaw-Curtis weights
-    folded in, so its right singular vectors are L2-orthonormal on the ray;
-    ``r`` columns survive at the truncation ``eps`` the caller passes (which is
-    ``eps/10``: the start must be an order more accurate than the acceptance
-    or the reduction finds nothing to remove).  ``m`` holds the integrals of
-    the basis functions over ``[0, S]``, which an interpolatory rule must
-    reproduce.  ``A`` converts the basis on the grid to Chebyshev coefficients
-    so ``U(s)`` can evaluate it at ANY ``s`` as a cosine series (exact for the
-    degree-``N`` interpolant).
-
-    Tempting, and why not: evaluate the basis off-grid by re-sampling the
-    family and projecting.  That is a fresh SVD per evaluation and, worse, the
-    projection is not the interpolant, so the pivoted QR below picked nodes
-    the rule then could not reproduce."""
-
-    def __init__(self, d, theta, S, eps, rho):
-        self.d, self.theta, self.S = d, theta, S
-        self.phase = np.exp(-1j * theta)
-        n_s = _grid_size(d, theta, S, eps)
-        s, ws = _cheb_grid(S, n_s)
-        # rows weighted by rho: the basis is truncated in the same norm the
-        # rule is accepted in (relative on a sign-definite box), otherwise
-        # the start misses the criterion and the reducer has nothing to keep
-        M = rho[:, None] * _family(d, theta, s) * np.sqrt(ws)[None, :]
-        _P, sig, Qh = svd(M, full_matrices=False)
-        r = int(np.sum(sig > eps * sig[0]))
-        self.r = r
-        Ug = Qh[:r] / np.sqrt(ws)[None, :]
-        self.m = Ug @ ws
-        N = n_s - 1
-        V = np.cos(np.pi * np.outer(np.arange(N + 1), np.arange(N + 1)) / N)
-        scale = np.full(N + 1, 2.0 / N)
-        scale[0] = scale[N] = 1.0 / N
-        wj = np.ones(N + 1)
-        wj[0] = wj[N] = 0.5
-        self.A = (Ug * wj[None, :]) @ V * scale[None, :]
-        self.N = N
-        self.s_grid = s
-
-    def _T(self, s):
-        x = 1.0 - 2.0 * s / self.S
-        k = np.arange(self.N + 1)
-        th = np.arccos(x)
-        return np.cos(np.outer(k, th))
-
-    def U(self, s):
-        """The ``r`` basis functions at ray positions ``s`` (cosine series)."""
-        return self.A @ self._T(s)
-
-    def interpolatory(self, k=None):
-        """``k`` nodes (default the full rank ``r``) by pivoted QR on the
-        interior Lobatto points, weights by least squares against the basis
-        integrals.  At ``r`` this is the start rule, about 1.3-1.5x the Gauss
-        count and ready in about a second.  Below ``r`` it is a poor rule --
-        the QR keeps its nodes in the head, where certified rules run out to
-        the amplitude floor -- but its weights are the right SIZE for ``k``
-        nodes, which is what the cloud fit needs to set its Tikhonov scale."""
-        # The Lobatto grid contains s = 0; a node there is a zero time node,
-        # which the executor refuses ("served quadrature has invalid or zero
-        # time nodes"), so the end points are never offered.  Tempting, and
-        # why not: s = 0 is often the best-conditioned pivot, and it was the
-        # first thing the QR picked before this line existed.
-        cand = self.s_grid[1:-1]
-        k = self.r if k is None else min(int(k), self.r)
-        _, _, piv = _pivoted_qr(self.U(cand.astype(complex))[:k], mode="economic",
-                                pivoting=True)
-        s = np.sort(cand[piv[:k]]).astype(complex)
-        w = lstsq(self.U(s)[:k], self.m[:k], rcond=None)[0]
-        return s, w
-
-    def to_rule(self, s, w):
-        """Time nodes and weights of ``1/d ~= sum w_k exp(i t_k d)``: with
-        ``t = phase s`` the identity ``1/d = -i int_0^inf exp(i t d) dt``
-        becomes ``-i phase int exp(i phase s d) ds``, hence the weight map."""
-        return self.phase * s, -1j * self.phase * w
-
-
-# ----------------------------------------------------------------- cloud solver (reduction)
-class _CloudFit:
-    """Nonlinear least squares of the rule against ``1/d`` on the cloud.
-
-    Residual ``E_i = sum_k w_k exp(i d_i t_k) - 1/d_i`` scaled by ``rho_i``:
-    ``im_lo`` (relative to the ``1/eta`` peak) on a crossing box, ``|d_i|``
-    (relative to the term's own size) on a sign-definite box -- the same
-    currency ``eps`` is stated in, see ``build_uniform_rule``.
-    Nodes ``t = phase * s`` with ``Re s`` in ``[0, S]`` and ``Im s`` in
-    ``[im_lo, im_hi]`` (the caller's off-ray cap); weights are eliminated by
-    penalised least squares (variable projection with the Kaufman Jacobian).
-    The state ``(s, w)`` is in the executor's convention already, so
-    ``fam.phase * s`` and ``w`` ARE the rule (no ``-i phase`` factor here).
-
-    Tempting, and why not: optimise nodes and weights jointly.  Weights are
-    linear and ill-conditioned (exponentially clustered columns); solving them
-    exactly at every node step is what keeps the LM steps meaningful.
-    """
-
-    def __init__(self, d, phase, S, im_lo, im_hi, eps, w_ref, rho, alpha=0.3):
-        self.d, self.phase, self.S, self.im_lo, self.im_hi = d, phase, S, im_lo, im_hi
-        self.eps = eps
-        self.scale = rho
-        self.b = self.scale / d
-        self.nb = np.linalg.norm(self.b)
-        self.idp = 1j * d * phase
-        # Tikhonov weight penalty: |mu w| ~ alpha*eps*|b| for weights of the
-        # reference size, so runaway cancelling weights cost more than the
-        # acceptance residual while normal weights cost less.  This is what
-        # pins the cancellation ratio kappa: without it the solver happily
-        # trades two nodes for one pair of 1e6-sized opposite weights that
-        # the executor's noise floor then amplifies.  Tempting, and why not:
-        # mu = 0 with a kappa check afterwards -- the solve converges to the
-        # cancelling solution first and the check just refuses it.
-        self.mu = alpha * eps * self.nb / max(np.linalg.norm(w_ref), 1e-300)
-        self.c = 0.5 * (im_lo + im_hi)
-        self.h = 0.5 * (im_hi - im_lo)
-
-    def A(self, s):
-        """Design matrix ``exp(i d t)`` with the rows in the rule's currency."""
-        return _by_rows(lambda r: _cexp(self.idp[r, None] * s[None, :])
-                        * self.scale[r, None], (self.idp.size, s.size))
-
-    def ls(self, s):
-        """Penalised least-squares weights for nodes ``s``: QR of ``[A; mu I]``
-        by CholeskyQR2.  Returns ``w``, the full residual (cloud rows then
-        penalty rows), ``Q`` and ``A``; the Jacobian projection reuses ``Q``.
-
-        CholeskyQR2: ``R1 = chol(Aa^H Aa)``, ``Q1 = Aa R1^-1``, then once more
-        on ``Q1`` -- two Gram matrices and two triangular solves, all GEMM
-        (200-290 Gflop/s here), and ``Q`` orthonormal to machine precision
-        after the second pass whenever the first Cholesky succeeds (it fails
-        only for ``kappa(Aa) > ~1e8``, and then the Householder QR is used).
-        The solution is the QR solution; the reduction's endpoints are the
-        old ones.
-
-        Tempting, and why not: (1) LAPACK's Householder QR (what this
-        replaced): textbook-stable but 15 Gflop/s on this tall-skinny complex
-        shape and called twice per LM step -- 300 ms of a 440 ms iteration on
-        the Na +-15 eV crossing box (m = 2055, n = 346).  (2) The normal
-        equations with iterative refinement: 4.3x faster per step, residuals
-        equal to four digits, and yet the reduction on that box stalled at 234
-        nodes where the QR path reached 223 -- near the acceptance edge the
-        refined weights are not the least-squares weights for these
-        exponentially clustered columns, and candidates fail the sup test.
-        """
-        A = self.A(s)
-        n = s.size
-        Aa = np.concatenate([A, self.mu * np.eye(n, dtype=complex)], 0)
-        ba = np.concatenate([self.b, np.zeros(n, complex)])
-        Q, R = _cholesky_qr2(Aa)
-        c = _conj(Q).T @ ba
-        w = solve_triangular(R, c, check_finite=False)
-        return w, ba - Q @ c, Q, A
-
-    def _y_of(self, s):
-        # Im s = c + h tanh(y): the off-ray cap is part of the model, so no
-        # step can leave the strip and no clipping is needed on Im.
-        u = np.clip((s.imag - self.c) / max(self.h, 1e-300), -1.0 + 1e-3, 1.0 - 1e-3)
-        return np.arctanh(u)
-
-    def _s_of(self, re, y):
-        return re.clip(0.0, self.S) + 1j * (self.c + self.h * np.tanh(y))
-
-    def newton(self, s, steps=30, tol=1e-14, check=None, chunk=10, stall=1e-3):
-        """Variable-projection Levenberg-Marquardt on the node positions.
-
-        Kaufman Jacobian ``J = P_perp (dA/ds) w`` (the weight response is
-        projected out through ``Q``), split into real and imaginary parts with
-        the tanh chain rule on ``Im s``, columns scaled to unit norm.  One
-        eigendecomposition of the Gram matrix per step gives the step for
-        every damping ``lam`` at once; up to 12 dampings are tried, the first
-        that lowers the residual is taken and ``lam`` relaxed by 3, else it is
-        raised by 4.  Every ``chunk`` steps the optional ``check(s, w, res)``
-        may stop the solve (rule accepted) and the solve stops when the
-        residual fell by less than ``stall`` over the chunk.  Returns nodes,
-        weights, relative residual.
-
-        Tempting, and why not: a plain Gauss-Newton or lstsq step per
-        damping.  Undamped steps move clustered nodes past each other and
-        the residual explodes; a separate lstsq per damping costs 12 solves
-        of a tall system per step where one Gram of size ``2n`` serves every
-        damping.  The damped system ``(G + lam I) p = -J^T F`` is solved by a
-        Cholesky per damping (0.1 Gflop at ``2n = 692``) rather than by one
-        eigendecomposition of ``G`` (3.3 Gflop, 45 ms): the same step, and
-        one or two dampings are usually enough.  The real ``2n x 2n`` Gram is
-        assembled from the complex ``n x n`` one (``Re``/``Im`` blocks of
-        ``Jc^H Jc``, exact identities) instead of forming the real Jacobian and
-        multiplying: 4x fewer flops for the same matrix."""
-        s = s.real.clip(0.0, self.S) + 1j * s.imag.clip(self.im_lo, self.im_hi)
-        y = self._y_of(s)
-        s = self._s_of(s.real, y)
-        w, F, Q, A = self.ls(s)
-        n = s.size
-        m = self.d.size
-        lam = 1e-3
-        n_last = np.linalg.norm(F)
-        for it in range(steps):
-            nF = np.linalg.norm(F)
-            if nF < tol * self.nb:
-                break
-            if it > 0 and it % chunk == 0:
-                if check is not None and check(s, w, np.linalg.norm(F[:m]) / self.nb):
-                    break
-                if nF > (1.0 - stall) * n_last:
-                    break
-                n_last = nF
-            Jc = np.concatenate([
-                _by_rows(lambda r: -(self.idp[r, None] * A[r]) * w[None, :], A.shape),
-                np.zeros((n, n), complex)], 0)
-            Jc -= Q @ (_conj(Q).T @ Jc)
-            dIm = self.h / np.cosh(y) ** 2
-            # column norms of the real Jacobian [[Re, -Im dIm], [Im, Re dIm]]
-            cn = np.sqrt(np.sum(np.abs(Jc) ** 2, axis=0))
-            D = np.concatenate([cn, cn * dIm])
-            D = np.where(D > 0, D, 1.0)
-            JcH = _conj(Jc).T
-            Gc = JcH @ Jc
-            ReG, ImG = Gc.real, Gc.imag
-            Gr = np.block([[ReG, -ImG * dIm[None, :]],
-                           [dIm[:, None] * ImG.T, dIm[:, None] * ReG * dIm[None, :]]])
-            Gr /= D[:, None] * D[None, :]
-            v = JcH @ (-F)
-            g = np.concatenate([v.real, dIm * v.imag]) / D
-            improved = False
-            for _lm in range(12):
-                Gl = Gr.copy()
-                Gl[np.diag_indices(2 * n)] += lam
-                try:
-                    p = cho_solve(cho_factor(Gl, lower=False, check_finite=False), g,
-                                  check_finite=False) / D
-                except np.linalg.LinAlgError:
-                    p = np.linalg.solve(Gl, g) / D
-                y_new = np.clip(y + np.clip(p[n:], -3.0, 3.0), -8.0, 8.0)
-                s_new = self._s_of(s.real + p[:n], y_new)
-                w_new, F_new, Q_new, A_new = self.ls(s_new)
-                if np.linalg.norm(F_new) < nF:
-                    s, w, F, Q, A, y = s_new, w_new, F_new, Q_new, A_new, y_new
-                    lam = max(lam / 3.0, 1e-9)
-                    improved = True
-                    break
-                lam *= 4.0
-            if not improved:
-                break
-        return s, w, np.linalg.norm(F[:m]) / self.nb
-
-    def loo_scores(self, s, w):
-        """Residual increase when node ``k`` is dropped and the weights
-        re-solved: ``|w_k|^2 / [(A^H A + mu^2)^-1]_kk``, exact for the linear
-        (weights-only) re-solve.  Small score = cheap to remove.
-
-        Tempting, and why not: rank by ``|w_k|``.  A small weight on a node the
-        neighbours cannot cover is expensive to remove and a large weight in a
-        dense cluster is cheap; the ``|w|``-ranked reducer stalled at ~0.9 r
-        while this one reaches ~0.5 r on the same windows."""
-        A = self.A(s)
-        G = np.linalg.pinv(A.conj().T @ A + self.mu ** 2 * np.eye(s.size))
-        return np.abs(w) ** 2 / np.maximum(np.real(np.diag(G)), 1e-300)
-
-    def _solve_pick(self, starts, ok, nstep, keep, rank_steps=8):
-        """Successive halving: every start gets a short solve (``rank_steps``),
-        the ``keep`` best continue to ``nstep`` steps with early exit on
-        acceptance; the accepted solve with the smallest residual wins (or
-        None).  A full solve for every candidate would cost ``K`` times as
-        much per removal; the short solve ranks them well enough."""
-        stop = lambda a, b, r: ok(a, b) and r <= self.eps
-        short = []
-        for s0 in starts:
-            s_t, w_t, res = self.newton(s0, steps=rank_steps, chunk=100)
-            short.append((res, s_t, w_t))
-        short.sort(key=lambda z: z[0])
-        found = None
-        for res, s_t, w_t in short[:keep]:
-            if not (ok(s_t, w_t) and res <= self.eps):
-                s_t, w_t, res = self.newton(s_t, steps=nstep, check=stop)
-            if ok(s_t, w_t) and (found is None or res < found[2]):
-                found = (s_t, w_t, res)
-        return found
-
-    def polish(self, s, ok, nstep=60, rounds=6, gate=None):
-        """Solve at this node count; ``(s, w, accepted)``.
-
-        A least-squares polish is L2-optimal, and on a sign-definite box in
-        the relative currency its sup sits at the near corner, 3-7x above
-        the L2 level (the corner is a small region in the log measure that
-        carries the slowest ray members).  Lawson's reweighting -- rows
-        re-weighted by their own residual and re-solved -- moves the L2
-        optimum toward the minimax one; a handful of tempered rounds is
-        enough to bring the corner under eps.  Tempting, and why not: a
-        larger trunc (eps/100) instead -- it costs 4-5 nodes and kappa and
-        still misses (measured 2.6e-4 at eps 1e-4 on the Na val:bulk box).
-
-        The rounds are bounded by construction (~30 s on an R ~ 1e4 box).
-        The reduction and the fixed-N placement share this routine so they
-        judge a node count the same way: polishing the placement without the
-        rounds measured +11 % nodes over the corpus, because placements that
-        need them missed and fell through to the reduction
-        (run DEV/327, results/ab_fixed_n).
-
-        The first accepted state is returned immediately: a further round can
-        take a certified rule back above ``eps`` (measured 1.1 -> 6.1 eps on
-        x120_tall0, and 0.86 -> 11.0 on na_B06), so the rounds must never run
-        past acceptance.
-
-        ``gate`` is ``(sup_ratio, threshold)`` for a caller that would rather
-        give up than pay for the rounds: after the initial solve, a sup above
-        ``threshold`` abandons.  The rounds rescue a placement that is already
-        close and nothing else -- across the corpus every placement that ever
-        certified did so by the second round, while the ones that never
-        certified sat at 4.6 to 39 eps after the initial solve (results/e9)."""
-        s, w, _res = self.newton(np.asarray(s, complex), steps=nstep)
-        accepted = ok(s, w)
-        if not accepted and gate is not None:
-            sup_ratio, threshold = gate
-            if sup_ratio(s, w) > threshold:
-                return s, w, False
-        for _round in range(rounds):
-            if accepted:
-                break
-            E = np.abs(self.A(s) @ w - self.b)
-            factor = np.clip(np.sqrt(E / max(E.mean(), 1e-300)), 0.5, 2.0)
-            self.scale = self.scale * factor
-            self.scale *= self.nb / max(np.linalg.norm(self.scale / self.d), 1e-300)
-            self.b = self.scale / self.d
-            s, w, _res = self.newton(s, steps=nstep)
-            accepted = ok(s, w)
-        return s, w, accepted
-
-    def reduce(self, s, ok, batch_frac=0.10, K=6, nstep=60, keep=2):
-        """Gauss-type reduction with lookahead, run to its natural end.
-
-        It stops when no accepted removal remains, which is a property of the
-        inputs, so two machines produce the same rule.  There is no clock and
-        no pass cap: this is reached only on a sign-definite box, where the
-        reduction finishes on its own in 0.4-3.0 s across the corpus -- the
-        widest (R = 3522) in 1.6 s -- and a 120 s budget never once bound.
-        A crossing box does not come here at all; see ``build_uniform_rule``.
-
-        The start is first polished to the optimum for its node count; if
-        even that is not accepted the caller keeps the interpolatory rule.
-        Far above the target the batch move drops ``batch`` low-score nodes at
-        once, never two neighbours (a gap two nodes wide cannot be closed by
-        the survivors), and solves to the optimum: an early exit at
-        acceptance would leave a marginal state the single removals inherit.
-        Each failed batch halves it.  At batch 1 the ``K`` best leave-one-out
-        candidates are tried by successive halving, then the next ``2K``;
-        when neither yields an accepted rule the reduction stops, and
-        ``best`` -- always the last accepted state -- is what it returns.
-
-        Tempting, and why not: single removals from the start (``r`` is ~300
-        on a wide crossing box, and ~150 removals times ``K`` solves do not
-        finish -- measured still running after nine minutes on x160_thin1,
-        which is what made this loop unusable there), or a fixed batch (one
-        failure at batch 30 would end the batch phase 30 nodes early)."""
-        s, w, accepted = self.polish(s, ok, nstep=nstep)
-        if not accepted:
-            return None                                             # caller keeps the start
-        best = (s.copy(), w.copy())
-        batch = max(1, int(batch_frac * s.size))
-        while s.size > 2:
-            order = np.argsort(self.loo_scores(s, w))
-            if batch > 1:
-                drop, protected = [], set()
-                for k in order:
-                    if k in protected:
-                        continue
-                    drop.append(int(k))
-                    protected.update((k - 1, k, k + 1))
-                    if len(drop) >= batch:
-                        break
-                s_t, w_t, _ = self.newton(np.delete(s, drop), steps=3 * nstep)
-                if ok(s_t, w_t):
-                    s, w = s_t, w_t
-                    best = (s.copy(), w.copy())
-                else:
-                    batch //= 2
-                continue
-            found = None
-            for lo, hi, ns in ((0, K, nstep), (K, 3 * K, 2 * nstep)):
-                starts = [np.delete(s, k) for k in order[lo:hi]]
-                if starts:
-                    found = self._solve_pick(starts, ok, ns, keep)
-                if found is not None:
-                    break
-            if found is None:
-                break
-            s, w = found[0], found[1]
-            best = (s.copy(), w.copy())
-        return best
 
 
 def rule_sup_error(times, weights, d, rho=None):
@@ -1012,9 +291,9 @@ def rule_roundoff_amplification(times, weights, d, rho):
 class UniformRule:
     """A finished rule: ``times``/``weights`` in the executor's convention
     (``1/d ~= sum weights * exp(i times * d)``), the box and ``eps`` it was
-    built for (its cache key), the ray angle, the interpolatory rank ``r`` it
-    started from, and the sup error and cancellation ratio measured on the
-    check cloud."""
+    built for (its cache key), the family's ray angle, its degree (the count
+    law's answer), and the sup error and cancellation ratio measured on the
+    certificate cloud."""
     times: np.ndarray
     weights: np.ndarray
     box: tuple
@@ -1031,29 +310,18 @@ class UniformRule:
         return int(self.times.size)
 
     def one_line(self) -> str:
-        return (f"uniform box rule: {self.node_count} nodes, ray {self.theta_deg:.0f} deg, "
-                f"rank {self.rank}, sup {self.sup_error:.2e} (eps {self.eps:g}, "
+        return (f"box rule: {self.node_count} nodes, ray {self.theta_deg:.0f} deg, "
+                f"degree {self.rank}, sup {self.sup_error:.2e} (eps {self.eps:g}, "
                 f"{'relative' if self.relative else 'peak-relative'}), "
                 f"kappa {self.kappa_max:.3g}, {self.seconds:.1f} s")
-
-
-def build_uniform_rule(box, eps, **options):
-    """Rule for ``1/d`` on ``box``; see :func:`_build_uniform_rule`.
-
-    Every build runs its BLAS at ``_BLAS_THREADS`` threads, so the rule is a
-    function of the box and ``eps`` on a given machine, not of the launch's
-    thread environment.
-    """
-    with _pinned_blas_threads():
-        return _build_uniform_rule(box, eps, **options)
 
 
 _STATIC_IDENTITY = None
 
 
 def uniform_rule_solver_identity():
-    """What a :func:`build_uniform_rule` result depends on besides its
-    arguments, as a JSON-ready dict.
+    """What an :func:`minimax.analytic_box_rule` result depends on besides
+    its arguments, as a JSON-ready dict.
 
     The builder reads no clock and pins its BLAS threads, so two calls with
     equal arguments return the same rule bit for bit when these fields are
@@ -1087,220 +355,3 @@ def uniform_rule_solver_identity():
             "cpu": cpu, "blas_threads": _BLAS_THREADS,
         }
     return dict(_STATIC_IDENTITY)
-
-
-def _build_uniform_rule(box, eps, *, im_cap=3.0, kappa_cap=1.0e4, trunc=10.0,
-                        reduce=True, relative=None, attempts=None,
-                        fit_points=_FIT_POINTS_PER_HALF_WAVE):
-    """Rule for ``1/d`` on ``box = (re_lo, re_hi, im_lo, im_hi)`` with
-    ``Im d > 0``.
-
-    ``eps`` is a sup bound on the box in the rule's currency: on a
-    sign-definite box (``re_lo > 0`` or ``re_hi < 0``) the RELATIVE error
-    ``|d| |Q(d) - 1/d| <= eps``; on a crossing box the error relative to the
-    ``1/im_lo`` peak, ``im_lo |Q(d) - 1/d| <= eps`` (``relative`` overrides
-    the choice).  The distinction is physics, not taste: a term's error in
-    Sigma scales with the term's own size ``1/|d|``.  A sign-definite tail
-    carries states far from resonance whose terms are large (semicore
-    states at ``|d| ~ 200 eta``), and a peak-relative sup of ``eps`` there is
-    a ``200 eps`` relative error: measured 4 meV at the Na 2s state where the
-    relative rule gives 0.1 meV.  Exponential sums for ``1/x`` on ``[a, b]``
-    are uniform in relative error at ``O(log(b/a))`` terms anyway, so the
-    relative criterion is free on those boxes.  On a crossing box ``1/d`` is
-    bounded only by the peak, and the relative criterion would tighten the
-    far edges by ``|d|/eta`` (up to 40x) for terms whose size the peak
-    already dominates: measured +50 % nodes on the Na conduction crossing
-    box (76 -> 115) for no delivered-error gain.
-
-    ``im_cap`` bounds ``|Im t| * (box half-width)`` so no family member grows
-    by more than ``exp(im_cap)`` off the ray (and never more than ``0.3 S``
-    off it): the SVD basis is a basis of the ray only, and nodes that wander
-    far off it buy accuracy on the fit cloud with growth the check cloud then
-    catches.  ``trunc`` is the start rule's extra accuracy (``eps/trunc``).
-    ``kappa_cap`` is the largest cancellation ratio accepted.  Nothing here
-    reads a clock: a crossing box stops when its placement certifies and a
-    sign-definite box when its reduction runs out of accepted removals, so
-    the same inputs give the same rule on any machine and at any load.
-    Never refuses a finite box.
-
-    ``attempts = (first, stop)`` runs only fixed-N attempts ``first <= j <
-    stop`` of a crossing box (``stop=None``: to the bracket's end, then the
-    rank-``r`` fallback) and returns ``None`` when none of them certifies and
-    ``stop`` is finite. Each attempt is a fresh solve at its own node count,
-    and the count sequence does not depend on the solves, so ranges that
-    partition the bracket can run in different processes: the first range, in
-    attempt order, that returns a rule returns the rule of the whole bracket,
-    bit for bit when the processes share one BLAS configuration. The skipped
-    attempts are taken as not certified, which the caller guarantees.
-
-    Tempting, and why not: judge acceptance on the fit cloud ``d`` itself
-    (17 of 80 random boxes passed there and failed on a finer cloud), or skip
-    the ``ok`` polish of the start (an unpolished start inherits the
-    interpolatory weights, which are far from the least-squares optimum and
-    cost the first batch removals)."""
-    re_lo, re_hi, im_lo, im_hi = map(float, box)
-    if not (np.isfinite([re_lo, re_hi, im_lo, im_hi]).all() and re_lo <= re_hi
-            and 0.0 < im_lo <= im_hi):
-        raise ValueError(f"invalid support box {box!r}")
-    t0 = time.perf_counter()
-    if relative is None:
-        relative = re_lo > 0.0 or re_hi < 0.0
-    if attempts is not None and (relative or not reduce):
-        raise ValueError("attempts splits only the fixed-N bracket of a crossing box")
-    first, stop = (0, None) if attempts is None else attempts
-    # rho_of: the acceptance currency (sup); fit_of: the same currency with
-    # the cloud's log-density folded in, for the basis and the least squares
-    rho_of = (lambda x: np.abs(x)) if relative else (lambda x: np.full(x.size, im_lo))
-    fit_of = ((lambda x: np.abs(x) * _log_density_weights(x)) if relative
-              else rho_of)
-    d0 = box_samples(re_lo, re_hi, im_lo, im_hi)
-    _r0, theta, S, _rate = _choose_angle(d0, eps, fit_of(d0))
-    # Fit on the box boundary at the family's live bandwidth; accept on a
-    # boundary cloud twice as fine with every local maximum refined
-    # (_BoundaryCloud says why the boundary suffices).  Acceptance stays finer
-    # than the fit: 17 of 80 random rotated-ray boxes were exact on the fit
-    # samples and off between them before the check was finer.
-    bx = (re_lo, re_hi, im_lo, im_hi)
-    fit_cloud = _BoundaryCloud(bx, theta, S, eps, p=fit_points,
-                               p_target=5.0, top=False)
-    check = _BoundaryCloud(bx, theta, S, eps, p=6.0, p_target=8.0)
-    d = fit_cloud.d
-    rho = rho_of(d) * fit_cloud.arc_weights(relative)
-    fam = _RayFamily(d, theta, S, eps / trunc, rho)
-    s, w = fam.interpolatory()
-    if reduce:
-        Bp = max(re_hi, 1e-3 * im_lo)
-        Bm = max(-re_lo, 1e-3 * im_lo)
-        im_lo_s, im_hi_s = max(-im_cap / Bp, -0.3 * S), min(im_cap / Bm, 0.3 * S)
-
-        # Both read fam.phase, not fit.phase: every _CloudFit below is built
-        # with fam.phase, and closing over `fit` would make acceptance depend
-        # on which solver happened to be bound last.
-        def ok(s_, w_):
-            e_, k_ = check.sup(fam.phase * s_, w_, relative)
-            return e_ <= eps and k_ <= kappa_cap
-
-        def sup_ratio(s_, w_):
-            return check.sup(fam.phase * s_, w_, relative)[0] / eps
-
-        # The start must be accepted before anything can be removed.  In the
-        # relative currency a loose eps (1e-3) with the default eps/10 basis
-        # can leave the near corner of a wide box (R ~ 500) above eps even
-        # after the Lawson rounds; a basis one order tighter costs ~2 nodes
-        # at the start and a few seconds, so escalate rather than refuse.
-        # Crossing boxes: place the count, then bracket it upward.
-        #
-        # The reduction below removes nodes one at a time with a K-candidate
-        # lookahead, so it asks for roughly ``rank/2`` removals times K solves
-        # times 60-180 LM steps -- of order 10^5 solves, 100+ TFLOP, on a
-        # problem whose whole content is a few hundred GFLOP (the cloud is
-        # 141-3256 points and the ray grid 185-1754, so one least-squares is
-        # 0.1-3 GFLOP and the family SVD at most 0.06 TFLOP).  It does not
-        # finish on a wide box, and cutting it short with a clock was the
-        # whole reason this function used to take a wall-clock budget -- a
-        # parameter that made the delivered node count a function of machine
-        # load, which is how a quadrature rule stopped being reproducible.
-        #
-        # Placing the count asks for ONE solve instead, so the clock is not
-        # needed and is gone: this path stops on its certificate and the same
-        # inputs give the same rule on any machine at any load.
-        # Measured against this same builder with the path removed, 41 boxes
-        # paired on one node at 16 threads:
-        #     crossing nodes 2186 against 3341, -34.6 %
-        #     planning wall   497 s against 2426 s, -79.5 %
-        #     worst box 109 s against 209 s, median 4.0 s, sign-definite equal
-        # Audit: all 41 re-certified on an independent dense boundary cloud,
-        # 0 optimistic certificates.  Thread count matters as much as any of
-        # this -- the same solve is 47 ms per LM step at 16 threads, 216 ms at
-        # 4 and 148 ms at 64 -- so a planner should give a fit ~16 cores.
-        # ``predict_nodes`` was fitted only on boxes whose reduction converged,
-        # which censored exactly the wide ones, so it reads low there (x120_thin0
-        # certifies at 207 against 133 predicted, x120_thin1 at 221 against 164).
-        # Growing the count until it certifies costs a few cheap solves and
-        # removes the bias without refitting the law on four points.
-        #
-        # Tempting, and why not: (1) hand a certified placement to the
-        # reduction as its START rather than returning it.  It looks free --
-        # x080_thin1 certifies at 141 where the reduction reaches 132 -- but
-        # over the corpus it moved nothing for 1.4x the wall: the reduction
-        # stalls in the placement's basin and does not find the rank start's.
-        # (2) The same path on sign-definite boxes: theirs already reduces in
-        # 1-4 s and it measured +37 % nodes.  (3) w_ref from the rank-r start
-        # instead of an n_k-node rule: mu = alpha eps |b| / |w_ref| is then
-        # wrong by the size ratio and the polish misses (4.8 eps against 0.9
-        # on x080_tall0, +19 % nodes over the corpus).
-        red = None
-        if not relative:
-            n_k = predict_nodes(bx, eps, relative)
-            for attempt in range(_FIXED_N_BRACKET):
-                n_k = int(min(n_k, fam.r))
-                if n_k < 2:
-                    break
-                if attempt >= first and (stop is None or attempt < stop):
-                    # w_ref sets the Tikhonov scale, so it must be the weights
-                    # of an n_k-node rule (see the note above).
-                    _s_ref, w_ref_n = fam.interpolatory(n_k)
-                    fit = _CloudFit(d, fam.phase, S, im_lo_s, im_hi_s, eps,
-                                    w_ref=w_ref_n, rho=rho)
-                    s_k, w_k, accepted = fit.polish(
-                        start_param(bx, eps, theta, S, im_lo_s, im_hi_s, n_k), ok,
-                        nstep=_FIXED_N_STEPS, rounds=_FIXED_N_ROUNDS,
-                        gate=(sup_ratio, _FIXED_N_GATE))
-                    if accepted:
-                        red = (s_k, w_k)
-                        break
-                if n_k >= fam.r:
-                    break
-                n_k = int(np.ceil(n_k * _FIXED_N_GROWTH))
-            if red is None and stop is not None:
-                return None
-            if red is None:
-                # The bracket is the whole crossing path: the reduction is NOT
-                # its fallback.  Removing one node at a time with a
-                # K-candidate lookahead does not finish on a box this wide
-                # (measured still running after nine minutes on x160_thin1),
-                # and needing a clock to cut that short is what put a
-                # wall-clock budget in this function in the first place.  The
-                # interpolatory rule at the ray rank, polished once, is
-                # bounded by construction and is what the budgeted reduction
-                # actually shipped on these boxes anyway.
-                fit = _CloudFit(d, fam.phase, S, im_lo_s, im_hi_s, eps,
-                                w_ref=w, rho=rho)
-                s_r, w_r, accepted = fit.polish(s, ok)
-                if accepted:
-                    red = (s_r, w_r)
-        else:
-            for extra in (1.0, 10.0, 100.0):
-                if extra > 1.0:
-                    fam = _RayFamily(d, theta, S, eps / (trunc * extra), rho)
-                    s, w = fam.interpolatory()
-                # the cloud solver works in the executor's convention
-                # t = phase*s with weights -i*phase*w: the sup test uses
-                # exactly that map
-                fit = _CloudFit(d, fam.phase, S, im_lo_s, im_hi_s, eps, w_ref=w, rho=rho)
-                red = fit.reduce(s, ok)
-                if red is not None:
-                    break
-        if red is not None:
-            s, w_fit = red
-            times, weights = fam.phase * s, w_fit          # A w - b = scale (Q - 1/d): w is the rule weight
-        else:
-            times, weights = fam.to_rule(s, w)
-    else:
-        times, weights = fam.to_rule(s, w)
-    sup, kappa = check.sup(times, weights, relative)
-    # A narrow sign-definite box can alias on the fit cloud: RC2's GN
-    # state_tail (2.837, 3.612) Ry has 12 fit points, its 4th singular value
-    # reads 9e-8 there (5e-5 on 16 points), and the rank-3 start misses eps
-    # 1.9x on the check cloud.  Only a start no reduction accepted gets here
-    # with sup > eps, so a certified box never takes this path.
-    if relative and not sup <= eps and fit_points < 4 * _FIT_POINTS_PER_HALF_WAVE:
-        return _build_uniform_rule(
-            box, eps, im_cap=im_cap, kappa_cap=kappa_cap, trunc=trunc,
-            reduce=reduce, relative=relative, attempts=attempts,
-            fit_points=2 * fit_points)
-    return UniformRule(
-        times=times, weights=weights, box=bx,
-        eps=float(eps), relative=bool(relative), theta_deg=float(np.rad2deg(theta)),
-        rank=int(fam.r), sup_error=sup, kappa_max=kappa,
-        seconds=time.perf_counter() - t0)

@@ -97,7 +97,7 @@ def _frozen_digests(session, geometry):
 
 
 def _plan(monkeypatch, branch=None, summaries=None, **kwargs):
-    monkeypatch.setattr("gw.sigma_box_plan.build_uniform_rule", _fake_rule)
+    monkeypatch.setattr("gw.sigma_box_plan._BOX_RULE_BUILDER", _fake_rule)
     branch = _branch() if branch is None else branch
     omega = (-branch.omega_abs if branch.neg_omega_half
              else branch.omega_abs)
@@ -234,7 +234,7 @@ def test_crossing_branch_uses_its_own_halfs_pole_edge(monkeypatch):
         tag="positive cond", E_A=negative.E_A, base_mask_A=negative.base_mask_A,
         space="cond", neg_omega_half=False,
         omega_abs=np.asarray([0.0, 2.0]), omega_idx=np.asarray([4, 5]))
-    monkeypatch.setattr("gw.sigma_box_plan.build_uniform_rule", _fake_rule)
+    monkeypatch.setattr("gw.sigma_box_plan._BOX_RULE_BUILDER", _fake_rule)
     omega = np.asarray([-0.0, -0.1, -0.2, -0.5, 0.0, 2.0])
     _, geometry = plan_sigma_windows(
         _summaries([negative, far], _METAL_POLES), [negative, far], omega, 0.1,
@@ -288,7 +288,7 @@ def test_containment_cache_reuses_rules_without_a_builder_call(
         calls.append(tuple(box))
         return _fake_rule(box, eps, **kwargs)
 
-    monkeypatch.setattr("gw.sigma_box_plan.build_uniform_rule", counted)
+    monkeypatch.setattr("gw.sigma_box_plan._BOX_RULE_BUILDER", counted)
     args = dict(
         eps=1.0e-4,
         cache_dir=str(tmp_path), print_fn=lambda *_args, **_kwargs: None)
@@ -328,7 +328,7 @@ def test_cold_plan_serves_the_rules_a_warm_rerun_would(monkeypatch, tmp_path):
             relative=rule.relative, theta_deg=5.0, rank=3,
             sup_error=0.5 * eps, kappa_max=1.2, seconds=0.0)
 
-    monkeypatch.setattr("gw.sigma_box_plan.build_uniform_rule", sized)
+    monkeypatch.setattr("gw.sigma_box_plan._BOX_RULE_BUILDER", sized)
     real_poles = tuple((index, {
         key: None if row is None else (*row[:2], 0.05, 0.05)
         for key, row in groups.items()}) for index, groups in _summaries())
@@ -377,7 +377,7 @@ def test_sc_fixed_tail_covers_a_state_crossing_the_product_edge(
         calls.append(tuple(box))
         return _fake_rule(box, eps, **kwargs)
 
-    monkeypatch.setattr("gw.sigma_box_plan.build_uniform_rule", counted)
+    monkeypatch.setattr("gw.sigma_box_plan._BOX_RULE_BUILDER", counted)
     session = _freezing_session()
     omega_abs = np.asarray([0.2, 0.5])
     omega = -omega_abs if negative else omega_abs
@@ -414,7 +414,7 @@ def test_sc_fixed_session_reuses_identical_nodes_without_refitting(monkeypatch):
         calls.append(tuple(box))
         return _fake_rule(box, eps, **kwargs)
 
-    monkeypatch.setattr("gw.sigma_box_plan.build_uniform_rule", counted)
+    monkeypatch.setattr("gw.sigma_box_plan._BOX_RULE_BUILDER", counted)
     session = _freezing_session()
     args = dict(
         eps=1.0e-4, cache_dir=None,
@@ -465,7 +465,7 @@ def test_sc_fixed_rule_covers_the_declared_pole_support(monkeypatch):
         calls.append(tuple(box))
         return _fake_rule(box, eps, **kwargs)
 
-    monkeypatch.setattr("gw.sigma_box_plan.build_uniform_rule", counted)
+    monkeypatch.setattr("gw.sigma_box_plan._BOX_RULE_BUILDER", counted)
     session = _freezing_session()
     args = dict(
         eps=1.0e-4, cache_dir=None, fixed_rule_session=session,
@@ -501,7 +501,7 @@ def test_sc_fixed_session_rebuilds_an_escaped_window_and_says_so(monkeypatch):
         calls.append(tuple(box))
         return _fake_rule(box, eps, **kwargs)
 
-    monkeypatch.setattr("gw.sigma_box_plan.build_uniform_rule", counted)
+    monkeypatch.setattr("gw.sigma_box_plan._BOX_RULE_BUILDER", counted)
     session = _freezing_session()
     args = dict(
         eps=1.0e-4, cache_dir=None,
@@ -553,7 +553,7 @@ def test_sc_fixed_session_keeps_receipt_for_temporarily_empty_window(
         calls.append(tuple(box))
         return _fake_rule(box, eps, **kwargs)
 
-    monkeypatch.setattr("gw.sigma_box_plan.build_uniform_rule", counted)
+    monkeypatch.setattr("gw.sigma_box_plan._BOX_RULE_BUILDER", counted)
     session = _freezing_session()
     args = dict(
         eps=1.0e-4, cache_dir=None,
@@ -598,7 +598,7 @@ def test_sc_fixed_session_rebuilds_for_a_window_absent_from_iteration_one(
         calls.append(tuple(box))
         return _fake_rule(box, eps, **kwargs)
 
-    monkeypatch.setattr("gw.sigma_box_plan.build_uniform_rule", counted)
+    monkeypatch.setattr("gw.sigma_box_plan._BOX_RULE_BUILDER", counted)
     session = _freezing_session()
     args = dict(
         eps=1.0e-4, cache_dir=None,
@@ -625,7 +625,7 @@ def test_sc_fixed_session_refits_only_on_material_class_flip(monkeypatch):
         calls.append(tuple(box))
         return _fake_rule(box, eps, **kwargs)
 
-    monkeypatch.setattr("gw.sigma_box_plan.build_uniform_rule", counted)
+    monkeypatch.setattr("gw.sigma_box_plan._BOX_RULE_BUILDER", counted)
     session = _freezing_session()
     args = dict(
         eps=1.0e-4, cache_dir=None,
@@ -659,7 +659,7 @@ def test_sc_map0_is_the_one_shot_plan_and_certifies_the_held_rules(monkeypatch, 
         calls.append(tuple(box))
         return _fake_rule(box, eps, **kwargs)
 
-    monkeypatch.setattr("gw.sigma_box_plan.build_uniform_rule", counted)
+    monkeypatch.setattr("gw.sigma_box_plan._BOX_RULE_BUILDER", counted)
     quiet = dict(eps=1.0e-4, print_fn=lambda *_args, **_kwargs: None)
     one_shot, one_shot_geometry = plan_sigma_windows(
         _summaries(), [_branch_at((0.1, 3.0))], np.asarray([0.2, 0.5]), 0.1,
@@ -832,7 +832,7 @@ def test_fixed_sc_refuses_a_rule_above_eps_without_retrying(monkeypatch):
             _fake_rule(box, eps, **kwargs), sup_error=5.5 * eps)
 
     monkeypatch.setattr(
-        "gw.sigma_box_plan.build_uniform_rule", diagnostic_above_eps)
+        "gw.sigma_box_plan._BOX_RULE_BUILDER", diagnostic_above_eps)
     with pytest.raises(RuntimeError, match="exceeds eps") as err:
         plan_sigma_windows(
             _summaries(), [_branch()], np.asarray([0.2, 0.5]), 0.1,
@@ -867,7 +867,7 @@ def test_one_shot_preserves_the_historical_sup_error_refusal(monkeypatch):
             _fake_rule(box, eps, **kwargs), sup_error=5.5 * eps)
 
     monkeypatch.setattr(
-        "gw.sigma_box_plan.build_uniform_rule", diagnostic_above_eps)
+        "gw.sigma_box_plan._BOX_RULE_BUILDER", diagnostic_above_eps)
     with pytest.raises(RuntimeError, match="rule sup error"):
         plan_sigma_windows(
             _summaries(), [_branch()], np.asarray([0.2, 0.5]), 0.1,
@@ -885,7 +885,7 @@ def test_crossing_noise_gate_uses_peak_relative_term_mass(monkeypatch):
             _fake_rule(box, eps, **kwargs), kappa_max=1.0e6)
 
     monkeypatch.setattr(
-        "gw.sigma_box_plan.build_uniform_rule", large_relative_kappa)
+        "gw.sigma_box_plan._BOX_RULE_BUILDER", large_relative_kappa)
     plan, geometry = plan_sigma_windows(
         _summaries(), [_branch()], np.asarray([0.2, 0.5]), 0.1,
         eps=1.0e-4,
@@ -910,7 +910,7 @@ def test_executor_noise_gate_refuses_large_term_mass(monkeypatch):
             _fake_rule(box, eps, **kwargs),
             weights=np.asarray([1.0e5 + 0.0j, -1.0e5 + 0.0j]))
 
-    monkeypatch.setattr("gw.sigma_box_plan.build_uniform_rule", unstable)
+    monkeypatch.setattr("gw.sigma_box_plan._BOX_RULE_BUILDER", unstable)
     with pytest.raises(RuntimeError, match="runtime-noise"):
         plan_sigma_windows(
             _summaries(), [_branch()], np.asarray([0.2, 0.5]), 0.1,
@@ -918,32 +918,33 @@ def test_executor_noise_gate_refuses_large_term_mass(monkeypatch):
             cache_dir=None, print_fn=lambda *_args, **_kwargs: None)
 
 
-def test_sign_definite_builder_receives_executor_noise_cap(monkeypatch):
+def test_builder_receives_executor_noise_cap(monkeypatch):
     calls = []
 
     def conditioned(box, eps, **kwargs):
         calls.append((tuple(box), dict(kwargs)))
         return _fake_rule(box, eps, **kwargs)
 
-    monkeypatch.setattr("gw.sigma_box_plan.build_uniform_rule", conditioned)
+    monkeypatch.setattr("gw.sigma_box_plan._BOX_RULE_BUILDER", conditioned)
     plan_sigma_windows(
         _summaries(), [_branch()], np.asarray([0.2, 0.5]), 0.1,
         eps=1.0e-4,
         cache_dir=None, print_fn=lambda *_args, **_kwargs: None)
-    expected = (0.05 * 1.0e-4) / (6.0e-8 * (1.0 + 1.0e-4))
+    # One cap in both currencies: the executor's noise budget over its
+    # per-term roundoff, the term mass the planner's noise gate bounds.
+    expected = 5.0e-6 / 6.0e-8
     crossing = [kwargs for box, kwargs in calls if box[0] <= 0.0 <= box[1]]
     sign_definite = [
         kwargs for box, kwargs in calls if box[0] > 0.0 or box[1] < 0.0
     ]
-    assert crossing and all("kappa_cap" not in kwargs for kwargs in crossing)
-    assert sign_definite and all(
-        kwargs["kappa_cap"] == pytest.approx(expected)
-        for kwargs in sign_definite)
+    assert crossing and sign_definite
+    assert all(kwargs == {"mass_cap": pytest.approx(expected)}
+               for kwargs in crossing + sign_definite)
 
 
 def test_cache_rule_missing_active_noise_cap_does_not_shadow_builder(
         monkeypatch, tmp_path):
-    monkeypatch.setattr("gw.sigma_box_plan.build_uniform_rule", _fake_rule)
+    monkeypatch.setattr("gw.sigma_box_plan._BOX_RULE_BUILDER", _fake_rule)
     args = dict(
         eps=1.0e-4,
         cache_dir=str(tmp_path), print_fn=lambda *_args, **_kwargs: None)
@@ -963,7 +964,7 @@ def test_cache_rule_missing_active_noise_cap_does_not_shadow_builder(
         calls.append(tuple(box))
         return _fake_rule(box, eps, **kwargs)
 
-    monkeypatch.setattr("gw.sigma_box_plan.build_uniform_rule", counted)
+    monkeypatch.setattr("gw.sigma_box_plan._BOX_RULE_BUILDER", counted)
     _plan, geometry = plan_sigma_windows(
         _summaries(), [_branch()], np.asarray([0.2, 0.5]), 0.1, **args)
     assert len(calls) == 3
@@ -982,7 +983,7 @@ def test_cache_rule_missing_active_noise_cap_does_not_shadow_builder(
 
 def test_corrupt_cache_entry_is_announced_and_repaired(
         monkeypatch, tmp_path):
-    monkeypatch.setattr("gw.sigma_box_plan.build_uniform_rule", _fake_rule)
+    monkeypatch.setattr("gw.sigma_box_plan._BOX_RULE_BUILDER", _fake_rule)
     args = dict(
         eps=1.0e-4,
         cache_dir=str(tmp_path))
@@ -1016,7 +1017,7 @@ def test_corrupt_cache_entry_is_announced_and_repaired(
 
 def test_each_cache_write_failure_is_announced_without_rejecting_rule(
         monkeypatch, tmp_path):
-    monkeypatch.setattr("gw.sigma_box_plan.build_uniform_rule", _fake_rule)
+    monkeypatch.setattr("gw.sigma_box_plan._BOX_RULE_BUILDER", _fake_rule)
     monkeypatch.setattr(
         "gw.sigma_box_plan.os.replace",
         lambda *_args: (_ for _ in ()).throw(OSError("read-only cache")))
@@ -1039,7 +1040,7 @@ def test_each_cache_write_failure_is_announced_without_rejecting_rule(
 
 def test_no_pair_ceiling(monkeypatch):
     # Owner ruling 2026-09-02: the plan reports its pair count, never refuses on it.
-    monkeypatch.setattr("gw.sigma_box_plan.build_uniform_rule", _fake_rule)
+    monkeypatch.setattr("gw.sigma_box_plan._BOX_RULE_BUILDER", _fake_rule)
     plan, geometry = plan_sigma_windows(
         _summaries(), [_branch()], np.asarray([0.2, 0.5]), 0.1,
         eps=1.0e-4,
@@ -1152,7 +1153,7 @@ def test_nan_weights_with_finite_sup_are_not_a_certificate(monkeypatch):
         weights[0] = np.nan
         return dataclasses.replace(rule, weights=weights)
 
-    monkeypatch.setattr("gw.sigma_box_plan.build_uniform_rule", poisoned)
+    monkeypatch.setattr("gw.sigma_box_plan._BOX_RULE_BUILDER", poisoned)
     with pytest.raises(RuntimeError, match="is not finite"):
         plan_sigma_windows(
             _summaries(), [_branch()], np.asarray([0.2, 0.5]), 0.1,
@@ -1168,7 +1169,7 @@ def test_infinite_sup_refuses_and_names_the_value(monkeypatch):
         return dataclasses.replace(
             _fake_rule(box, eps, **kwargs), sup_error=float("inf"))
 
-    monkeypatch.setattr("gw.sigma_box_plan.build_uniform_rule", broken)
+    monkeypatch.setattr("gw.sigma_box_plan._BOX_RULE_BUILDER", broken)
     with pytest.raises(RuntimeError, match="exceeds eps") as err:
         plan_sigma_windows(
             _summaries(), [_branch()], np.asarray([0.2, 0.5]), 0.1,
@@ -1234,7 +1235,7 @@ def test_durable_receipt_is_strict_json_with_null_open_edges(monkeypatch, tmp_pa
     ``production_report.py`` was changed to retain durably.
     """
     from gw.production_report import GWProductionReport
-    monkeypatch.setattr("gw.sigma_box_plan.build_uniform_rule", _fake_rule)
+    monkeypatch.setattr("gw.sigma_box_plan._BOX_RULE_BUILDER", _fake_rule)
     monkeypatch.setattr("gw.sigma_box_plan.process_rank", lambda: 0)
     path = tmp_path / "gwjax.out"
     report = GWProductionReport(
@@ -1268,7 +1269,7 @@ def _refuse_json_constant(token):
 def test_current_input_request_cannot_reuse_changed_map_rules(
         monkeypatch, tmp_path, changed):
     from gw.sigma_box_plan import sigma_rule_request_cache
-    monkeypatch.setattr("gw.sigma_box_plan.build_uniform_rule", _fake_rule)
+    monkeypatch.setattr("gw.sigma_box_plan._BOX_RULE_BUILDER", _fake_rule)
     identity = _sc_identity(1)
     poles, counts = np.array([[.09, 1.]]), np.array([2])
     kw = dict(eta=.1, eps=1e-4)

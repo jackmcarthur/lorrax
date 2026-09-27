@@ -21,7 +21,7 @@ kernel. The disk cache is controlled by `LORRAX_MINIMAX_CACHE_DIR` and
 | `serve(*, family, target, range_value, error_bound, n_max, eps_q=None, omega_hat=None) -> Quadrature` | Solves a screening rule in process for families `noncrossing`, `noncrossing_imag` (needs `omega_hat`) and `crossing` (`eps_q`, target `hgl` or `fermi`). Every rule is computed at run time; any other selector keyword refuses. | `gw.minimax_screening` |
 | `TARGETS`, `FAMILIES`, `CHARACTERS`, `family_for_character(...)` | Target and family vocabulary as data. | |
 | `Quadrature`, `Provenance` | Nodes, weights, `max_error`, κ₀, and the source (`runtime-uncertified`, `cache` or `cache-legacy`) with its hash and backend. | |
-| `build_uniform_rule(box, eps, ..., attempts=None)` | Builds and certifies one rule for `1/d` on the denominator box `[re_lo, re_hi] × [im_lo, im_hi]`. It returns when its own boundary certificate is met, with no clock or pass-count input. Every build runs each loaded OpenBLAS at 16 threads and restores the count after. On one machine a box and tolerance therefore give one rule whatever the launch's thread variables, because the crossing fit's local solution follows the BLAS summation order. A different CPU's kernels can still give a different certified rule. `attempts=(first, stop)` runs only fixed-N attempts `first ≤ j < stop` of a crossing box (`stop=None`: to the end, then the fallback) and returns `None` if none of them certifies. The first range to certify returns the whole bracket's rule, because the node-count sequence does not depend on the solves. | `gw.sigma_box_plan`, which splits a dominant crossing build across ranks |
+| `analytic_box_rule(box, eps, *, mass_cap=83, relative=None)` | Derived rule for `1/d` on a denominator box `[re_lo, re_hi] × [im_lo, im_hi]` in the executor convention `Σ w e^{itd}`, returned as a `UniformRule`. Crossing boxes: the bent contour (trapezoid line plus two imaginary-time Gauss image sets) or the elliptic time-Ritz sector rule, whichever count law is smaller first and the other as the fallback; sign-definite boxes: the sector rule with the local extremal-length count. No node is optimized; the weights are one linear least-squares solve. A rung is accepted when the boundary certificate reads sup ≤ eps and term mass ≤ `mass_cap` in the box's currency; each family climbs a fixed ladder, and a rule neither family certifies is returned uncertified for the planner to refuse. Runs under the 16-thread BLAS pin. Theory: [minimax quadrature §7](../theory/minimax-quadrature.md#7-σ-denominator-box-rules). | `gw.sigma_box_plan` (the Σ box-rule builder) |
 | `analytic_line_box_rule(box, eps)` | Fixed-height line rule in Σ's `Σ w e^{itd}` convention, checked to peak-relative error. Crossing boxes with one positive imaginary height only. | `gw.sigma_box_plan`, PPM real-pole crossing windows |
 | `fit_damped_reciprocal(rectangles, *, target_error, ...)` | One positive rule `1/d ≈ Σ w e^{−d t}` for `1/(x − iγ)` over rectangles `(x_min, x_max, γ_min, γ_max)`, `x_min > 0`. | `gw.mpa.sigma_windows` |
 | `damped_line_rule`, `damped_rectangle_rule`, `damped_rectangle_gauss_rule`, `damped_rectangle_positive_rule` | MPA positive-time line and rectangle rules, § [Damped MPA rules](#damped-mpa-rules). | `gw.mpa.model` |
@@ -96,7 +96,7 @@ or response arrays, and none certifies W or Σ accuracy.
   not proven. A positive `decay_rate` bounds occupation products by
   min(1, e^{decay_rate·d}) and restricts 0 ≤ Re t ≤ decay_rate. `previous`
   rules with matching members are tried first. The build runs every loaded
-  OpenBLAS at 16 threads (the pin of `build_uniform_rule`): the pencil's QR,
+  OpenBLAS at 16 threads (the pin of `analytic_box_rule`): the pencil's QR,
   SVD and least squares pick different times at different thread counts, and
   the shared-pole W poles inherit them.
 * **`response_laplace_rule(delta_lo_ry, delta_hi_ry, z_ry, *, rel_tol=1e-8,
@@ -164,7 +164,7 @@ the line rule with `(span/height, height·ε)` and call
 `rule.rescaled(height)`. `analytic_line_box_rule` removes e^{−height·t} from
 the weights, because Σ's e^{itd} already carries that damping; it accepts only
 a real interval crossing zero at one positive height. Sign-definite tails and
-finite-height rectangles use `build_uniform_rule`.
+finite-height rectangles use `analytic_box_rule`.
 
 ## Verification
 

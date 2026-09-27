@@ -292,7 +292,7 @@ def _sigma_rule_table_root():
 def _private_sigma_rule_table(request, _sigma_rule_table_root, monkeypatch):
     """Give every cell its own run-independent Σ rule table.
 
-    Cells patch ``build_uniform_rule`` with fakes: a fake stored in the
+    Cells patch the Sigma box-rule builder (``gw.sigma_box_plan._BOX_RULE_BUILDER``) with fakes: a fake stored in the
     user's table would be served to a real run with the same build box, and
     a rule another cell stored would replace a cell's own fake. One
     subdirectory per cell, created only when the cell stores a rule; a
