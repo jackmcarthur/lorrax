@@ -27,7 +27,7 @@ The SC equations and artifact contract remain in [self consistency](../self_cons
 | Use one crossing rectangle per causal branch, with separate non-crossing tails. | The state and pole selectors give a direct denominator bound. | No crossing subwindows or per-state rule families. |
 | Use the provable insulator short side, including poles down to zero. | A trend in the gap is not a certificate. | Prior MoS2 estimate +61 pairs; remeasure at epsilon 1e-4. |
 | Use four times the initial far state, pole and damping extents. | Far-side growth costs logarithmically and cannot enlarge the crossing edge. | Prior estimate +8–9 pairs; remeasure with derived rules. |
-| Set epsilon = 1e-4; use QUADWIRE's derived rules. | One explicit accuracy target and one rule owner. | Measured per-deck totals decide the 500/1000 limits. |
+| Default epsilon = 1e-4 on every W tier; use QUADWIRE's derived rules. | One explicit accuracy target and one rule owner. | Measured per-deck totals decide the 500/1000 limits. |
 | Retain the existing scissor fit behind its existing API. | SPCOST B has map-0 comparisons but no converged fit verdict; window geometry does not choose the fit form. | No quadrature pairs. |
 
 ## Hamiltonian

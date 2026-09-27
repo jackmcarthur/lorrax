@@ -114,11 +114,6 @@ def table_hash(table):
 
 
 RECIPE_HASH = table_hash(shared_real_pole_v1_r3b)
-#: The Sigma quadrature is not W.  A tier's default for an omitted
-#: sigma_quadrature_eps lives outside the hashed table above, whose every field
-#: sets W's sampling or poles, so RECIPE_HASH (restart and bank identity) binds
-#: only W and a Sigma-only edit never refuses a stored model.
-SIGMA_EPS_DEFAULT = {"relaxed": 5.0e-4}
 GATE_HASH = table_hash(shared_real_pole_gates_v1_r3b)
 
 # Time-reversal-broken ordered route (particle-hole pencil in z). A separate
