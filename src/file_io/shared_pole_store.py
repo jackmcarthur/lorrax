@@ -273,13 +273,14 @@ def _metadata(meta, tables, recipe, identity, ordered=None, *, basis=None, secto
     elif sector not in ("CC", "TT", "CT_C", "CT_T") or int(meta.nspinor) != 4:
         _refuse("sector factors require Nspinor=4 and CC/TT/CT_C/CT_T")
     sym = tables["sym"]
-    # A bank (ordered=None) follows the measured TRS state; a model store
-    # states its representation and must agree with it.
+    # Scalar banks/models follow the measured TRS state. Every four-current
+    # sector uses the ordered photon pencil, including CC/TT from a TRS
+    # source: physical TRS does not make all current blocks even in z.
     bank = ordered is None
     if bank:
         ordered = photon or not bool(sym.trs_allowed)
     elif (bool(sym.trs_allowed) == bool(ordered)
-          and not (ordered and sector in ("CT_C", "CT_T"))):
+          and not (ordered and sector is not None)):
         _refuse("ordered representation requires authenticated broken TRS" if ordered
                 else "TRS-broken representation is unsupported")
     qt = tables["qirr"].logical(basis.n_logical).canonical()

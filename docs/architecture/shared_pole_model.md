@@ -214,6 +214,9 @@ gate is positive retained $\mathcal H$; the scalar passivity bound does not
 apply to the signed photon $V$ (theory §9). Stores stamp
 `raw-sector-endpoint-v1`; a manifest (`lorrax.shared-real-pole-sectors.v1`,
 `sector-ordered-ph`) binds the four stores and the constant.
+All four sector stores use the ordered representation for both TRS and
+magnetic sources. The authenticated operation rows still follow the measured
+TRS verdict; choosing the ordered pencil does not assert broken TRS.
 
 **Treatment ceiling.** Bispinor sector models deactivate poles above
 
