@@ -10,7 +10,7 @@ The SC equations and artifact contract remain in [self consistency](../self_cons
 2. `number_bands` sets the complete rotating and sum-band carrier.
 3. `sigma_omega_min_ev` only enlarges the negative sampled extent, in eV relative to the Sigma reference.
 4. `sigma_omega_max_ev` only enlarges the positive extent; either endpoint may be omitted.
-5. `sigma_omega_step_ev` sets sampling; `sigma_window_ev`, `sigma_out_of_grid`, and `sigma_omega_patches_ev` refuse by name.
+5. `sigma_omega_step_ev` sets sampling; `sigma_window_ev`, `sigma_out_of_grid`, `sigma_omega_patches_ev`, `sigma_window_edge_factor`, and `sc_frozen_core_bands` refuse by name.
 
 ## Decisions and cost
 
@@ -22,6 +22,7 @@ The SC equations and artifact contract remain in [self consistency](../self_cons
 | Plan once; never grow the grid or refit inside the SC loop. | Anderson must see one map with fixed interpolation and quadrature. | Zero in-loop rule-build cost; dormant boxes consume pairs only when populated. |
 | Clamp protected reads to the nearest sampled endpoint. | This is continuous and bounded when a state leaves support. | Zero extra pairs during iteration. |
 | Check at convergence and rebuild once if needed; restart the history then. | An early excursion does not justify permanent support growth. | At most one additional complete plan and SC solve. |
+| Fix the selector margin at eta. | It bounds the non-crossing denominator away from zero without a tunable geometry key. | Saves the former extra 0.5 eta of crossing width. |
 | Use one crossing rectangle per causal branch, with separate non-crossing tails. | The state and pole selectors give a direct denominator bound. | No crossing subwindows or per-state rule families. |
 | Use the provable insulator short side, including poles down to zero. | A trend in the gap is not a certificate. | Prior MoS2 estimate +61 pairs; remeasure at epsilon 1e-4. |
 | Use four times the initial far state, pole and damping extents. | Far-side growth costs logarithmically and cannot enlarge the crossing edge. | Prior estimate +8–9 pairs; remeasure with derived rules. |
@@ -48,7 +49,7 @@ no hidden active-band cutoff overrides the user's requested states.
 
 Let X = kBT log(1/1e-5) for FD occupations, and X = 0 for an insulator.
 The retained occupation support gives E >= -X on either causal branch.
-For a crossing half with omega <= W, selectors use E, Omega <= W + 1.5 eta + X.
+For a crossing half with omega <= W, selectors use E, Omega <= W + eta + X.
 The complement is a state tail and a pole tail, both non-crossing.
 The opposite-frequency branch needs only its small E/Omega/omega corner;
 its remaining bulk, pole tail and frequency tail are non-crossing.
