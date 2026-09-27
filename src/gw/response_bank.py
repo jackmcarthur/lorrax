@@ -288,16 +288,21 @@ def prepare_photon_carriers(wfns, wfns_transverse, mu_bases, *,
 
 def photon_static_contact(wfns, meta, *, mesh_xy, layout, vertex,
                           occupation_state, sample_plan, execute, receipt):
-    r"""Build Pi_grid(0,0), centroid D and their TT sum once per bank.
+    r"""Build the TT Ward contact ``Pi_FD(0,0)``, with ``Pi_grid`` and centroid D, once per bank.
 
-    The FD zero-Matsubara stream contains ``-D`` on diagonal transitions.
-    Therefore ``Pi_grid=Pi_FD+D`` removes that contribution; the prescribed
-    contact is then ``Pi_grid+D``. Both quantities here are physical density
-    responses (one factor ``1/Omega``). ``response_algebra`` converts the
-    contact to the convention of the stored ``V/ Omega`` at insertion.
-    For a step-occupation insulator the same stream uses its ordinary
-    Laplace weights and D is exactly zero. It never assigns a gap to a metal.
-    All returned packed operators are ``[1,N,N]`` at ``P(None,'x','y')``.
+    The FD zero-Matsubara stream at q = 0 is the static limit
+    ``lim_{q->0} Pi(q, 0)``: its diagonal transitions carry the Fermi-surface
+    term ``-D`` (the same sign as the head's static ``-(alpha/2)^2 D``).
+    The Ward contact is that limit, so a normal metal's static transverse
+    response ``Pi(q, 0) - contact`` vanishes as q -> 0 and its dynamic limit
+    ``Pi(0, z) - contact`` is ``+D``, the Drude weight.  ``Pi_grid = Pi_FD+D``
+    (the interband part) and D are returned as diagnostics only.  Both are
+    physical density responses (one factor ``1/Omega``). ``response_algebra``
+    converts the contact to the convention of the stored ``V/ Omega`` at
+    insertion.  For a step-occupation insulator the same stream uses its
+    ordinary Laplace weights and D is exactly zero. It never assigns a gap to
+    a metal.  All returned packed operators are ``[1,N,N]`` at
+    ``P(None,'x','y')``.
     """
     from common.shard_map import shard_map
     from .static_gauge_response import (fermi_dirac_current_drude,
@@ -357,9 +362,9 @@ def photon_static_contact(wfns, meta, *, mesh_xy, layout, vertex,
         mesh=mesh_xy, in_specs=P(None, "x", "y"), out_specs=P(None, "x", "y"), check_vma=False)
     pi_fd = jax.jit(tt_only)(raw[:, 0] * (_w_solve_pref_scalar(meta)/float(meta.cell_volume)))
     pi_grid = pi_fd + drude
-    contact = pi_grid + drude
+    contact = pi_fd
     receipt["correlation_count"] += count
-    receipt["contact"] = dict(equation="Pi_grid(0,0)+D", diagonal_reference="Pi_FD=Pi_grid-D",
+    receipt["contact"] = dict(equation="Pi_FD(0,0)=Pi_grid(0,0)-D", diagonal_reference="Pi_grid=Pi_FD+D",
         units="physical response density, 1/Omega", scope="built once for this bank state")
     return pi_grid, drude, contact
 
@@ -1697,7 +1702,7 @@ def compute_photon_bank(wfns, wfns_transverse, meta, config, *, mesh_xy, sym,
                 velocity = rotate_velocity_active_to_qp(
                     velocity, photon_head_rotation, mesh=mesh_xy)
             direct_head = build_direct_photon_head(
-                velocity, wfns, occupation_state, contact_packed=contact,
+                velocity, wfns, occupation_state,
                 photon_g0_vectors=direct_gamma, layout=layout,
                 mesh=mesh_xy, meta=meta, wfn=wfn,
                 frequencies_ry=bank_points(sample_plan), print_fn=print_fn)
