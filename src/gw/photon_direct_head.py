@@ -367,6 +367,29 @@ _GAMMA_MIN_LOCAL = 2**10
 _GAMMA_ROOM_FRACTION = 0.5
 #: Points of the screened sphere rule (``_bulk_sphere_rule``: 8 radial x 12 polar x 24 azimuthal).
 _GAMMA_SPHERE_POINTS = 8 * 12 * 24
+#: The exterior Sobol stream by (cell, k grid, chunk).  It is seeded geometry,
+#: so a hit is the stream a redraw makes, bit for bit; a metallic bispinor
+#: bank asks for the same stream at every SC map (0.4-0.6 s of host draw and
+#: bare-kernel work per map on Fe 4^3).  One entry, host float64:
+#: 4 x 2^17 x (3 + 16 + 1) x 8 B = 84 MB per process.
+_GAMMA_STREAM: dict = {}
+
+
+def _gamma_sample_stream(geometry, kgrid, chunk_size):
+    """The four-replicate exterior stream of ``iter_minibz_photon_samples``, held."""
+    from vcoul import get_kernel, iter_minibz_photon_samples
+
+    key = (np.asarray(geometry.bvec, dtype=np.float64).tobytes(),
+           float(geometry.cell_volume), tuple(int(n) for n in kgrid),
+           int(chunk_size))
+    held = _GAMMA_STREAM.get(key)
+    if held is None:
+        held = tuple(iter_minibz_photon_samples(get_kernel(3), geometry,
+            kgrid, nsamples=_GAMMA_SAMPLES,
+            qmc_reps=4, chunk_size=chunk_size, analytic_sphere=True))
+        _GAMMA_STREAM.clear()
+        _GAMMA_STREAM[key] = held
+    return held
 
 
 def direct_gamma_chunk_plan(mesh, operands, *, nsamples):
@@ -419,7 +442,7 @@ def build_direct_photon_head(velocity_cart, wfns, occupation_state, *,
     """
     from ffi import _services
     _services.ensure_on_path()
-    from vcoul import CoulombGeometry, get_kernel, iter_minibz_photon_samples
+    from vcoul import CoulombGeometry
     from common.collectives import device_put_process_local
 
     if int(meta.sys_dim) != 3:
@@ -470,9 +493,7 @@ def build_direct_photon_head(velocity_cart, wfns, occupation_state, *,
               + f"; kappa_TF^2 = {8.0 * np.pi * dos:.6f} bohr^-2; "
               + atoms.describe(), file=sys.stderr, flush=True)
     chunk_size, split = direct_gamma_chunk_plan(mesh, operands, nsamples=_GAMMA_SAMPLES)
-    samples = iter_minibz_photon_samples(get_kernel(3), geometry,
-        kgrid, nsamples=_GAMMA_SAMPLES,
-        qmc_reps=4, chunk_size=chunk_size, analytic_sphere=True)
+    samples = _gamma_sample_stream(geometry, kgrid, chunk_size)
     fields = ((len(z),4,4), (len(z),4,4), (len(z),4,4),
               (len(z),4,4), (4,4), (4,4,4), (4,4))
     total = [jnp.zeros(shape, dtype=jnp.complex128) for shape in fields]
