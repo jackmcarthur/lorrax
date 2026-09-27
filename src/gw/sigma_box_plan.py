@@ -1182,7 +1182,8 @@ def _fit_fixed_sc_rules(specs, eta, *, eps, cache_dir, session, material_class=N
         fits, fit_rows = [None] * len(fixed), []
         for eta_g in sorted({float(f.get("eta_ry", eta)) for f in fixed}):
             ids = [i for i, f in enumerate(fixed) if float(f.get("eta_ry", eta)) == eta_g]
-            got, got_rows = fit_sigma_box_specs([fixed[i] for i in ids], eta_g, eps=eps,
+            eps_g = float(fixed[ids[0]].get("eps", eps))
+            got, got_rows = fit_sigma_box_specs([fixed[i] for i in ids], eta_g, eps=eps_g,
                                                 cache_dir=cache_dir, cache_build_widen=False)
             for i, fit in zip(ids, got):
                 fits[i] = fit
@@ -1269,6 +1270,7 @@ def plan_sigma_windows(
     fixed_pole_support_ry=None,
     certificate_pole_summaries=None,
     omega_eta_ry=None,
+    far_eps=None,
 ):
     """Build the complete MPA Sigma quadrature from raw support boxes.
 
@@ -1490,6 +1492,10 @@ def plan_sigma_windows(
         branch_reports.append(report)
 
     fixed_receipt = None
+    if far_eps is not None:
+        for spec in plan_specs:
+            if float(spec.get("eta_ry", eta)) != float(eta):
+                spec["eps"] = float(far_eps)
     fits, fit_rows, fixed_receipt = _fit_fixed_sc_rules(
         specs, eta, eps=tolerance, cache_dir=cache_dir,
         session={} if fixed_rule_session is None else fixed_rule_session,

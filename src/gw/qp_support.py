@@ -107,6 +107,11 @@ def check_fixed_point(session):
 #: the exact read (1.98 vs 1.95 meV) at half the 1 eV price.
 FAR_PATCH_ETA_EV = 1.0
 FAR_PATCH_ETA_BELOW_EV = 2.0
+#: Rule tolerance of the far-patch crossing windows. A far window's node
+#: count is set by its short side over eta (the patch top above the lowest
+#: state), not by its pole range, so splitting cannot shorten it; the coupling
+#: needs only percent accuracy (CLASSMIX round 4: 158 -> 90 nodes at 1e-2).
+FAR_PATCH_EPS = 1.0e-2
 #: Far-patch sampling step (eV): eta/2 resolves the broadened Sigma.
 FAR_PATCH_STEP_EV = 0.5
 #: Outer pad of each far patch about its rotating DFT energies (eV).

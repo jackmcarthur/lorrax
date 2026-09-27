@@ -1273,7 +1273,7 @@ def _compute_mpa_sigma(
             # extra frequencies whose crossing windows carry the patch eta
             # (gw.sigma_box_plan.plan_sigma_windows omega_eta_ry); the cube is
             # split back into the near grid and the far patches below.
-            from .qp_support import far_patch_eta_ev, far_patch_grid_ev
+            from .qp_support import FAR_PATCH_EPS, far_patch_eta_ev, far_patch_grid_ev
             near_ev = np.asarray(config.omega_grid_ev, dtype=np.float64)
             pieces = [(near_ev, np.full(near_ev.size, _xi.resolved_ry * RYD_TO_EV), True)]
             for patch in far_patches:
@@ -1292,7 +1292,7 @@ def _compute_mpa_sigma(
                 wfns, fit_path, meta, mesh_xy, sigma_w_model=sigma_w_model,
                 fit_identity=fit_identity, fit_digest=fit_digest,
                 **dict(body_options, omega_grid_ry=union_ev / RYD_TO_EV,
-                       omega_eta_ry=union_eta_ev / RYD_TO_EV))
+                       omega_eta_ry=union_eta_ev / RYD_TO_EV, far_eps=FAR_PATCH_EPS))
             from dataclasses import replace as _replace_body
             near_idx = np.nonzero(near_mask)[0]
             far_idx = np.nonzero(~near_mask)[0]
