@@ -1166,6 +1166,11 @@ def _sc_padded_box_spec(spec, eta, *, plan_index):
     """
     a_lo, a_hi, gamma_lo, gamma_hi = spec["pole_extent"]
     frac = _SC_POLE_PAD_FRACTION
+    # Tempting, and why not: clamping the padded poles to the window's
+    # selector bounds. Those bounds are this map's grid edges and move with
+    # the grid (MoS2 3x3 SC-3 W10: the top grows 12.5 -> 13.0 eV at map 1, and
+    # a clamped cond:resonant escaped at maps 1 and 2, 154 -> 115 -> 142 nodes;
+    # QAUDIT 2026-09-27). The sign gap below keeps the zero side off the pads.
     open_above = not np.isfinite(spec.get("pole_bounds", (0.0, 0.0))[1])
     padded_poles = [(
         a_lo - frac * abs(a_lo),
@@ -1217,14 +1222,17 @@ def _sc_padded_box_spec(spec, eta, *, plan_index):
     elif spec["kind"] == "sign_definite_positive":
         box[0] = max(box[0], _SC_ZERO_SIDE_CAP * spec["box"][0])
     # Membership can change without appreciable state motion: a state just
-    # outside a tail at map 0 can enter it at map 1. Cover the selector's
-    # guaranteed sign gap, not the accidental nearest initial sample.
+    # outside a tail at map 0 can enter it at map 1. Where the selectors
+    # guarantee a sign gap, every member on every map has |d| >= gap, so the
+    # zero-side edge is the gap itself: covered, and never dragged closer by
+    # the pads (the Fe 4^3 SC cond:pole_tail pads reached -0.11 eta against a
+    # 1.5 eta selector gap, an ill-conditioned box the rule refused, 2026-09-27).
     if "sc_selector_gap_ry" in spec:
         gap = float(spec["sc_selector_gap_ry"])
         if spec["kind"] == "sign_definite_negative":
-            box[1] = max(box[1], -gap)
+            box[1] = max(-gap, spec["box"][1])
         elif spec["kind"] == "sign_definite_positive":
-            box[0] = min(box[0], gap)
+            box[0] = min(gap, spec["box"][0])
     padded = dict(spec)
     padded["box"] = tuple(float(value) for value in box)
     padded["kind"] = (
