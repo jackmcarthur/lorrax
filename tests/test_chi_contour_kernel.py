@@ -367,6 +367,64 @@ def test_fractional_contour_matches_kubo_on_oriented_three_point_grid(
     assert u_slice == slice(1, 4)
 
 
+def test_fractional_contour_ends_both_supports_at_the_chi_band_top(monkeypatch):
+    """Bands above ``b_id_4_chi_user`` are outside the chi0 sum on the fractional contour.
+
+    The split deck's result equals the same contour on the bands below the
+    chi top alone; without the window the top bands do contribute.
+    """
+    import common.fft_helpers as fft_helpers
+    import distrib_la
+    monkeypatch.setattr(distrib_la, "gemm_plan", _local_gemm_plan)
+    monkeypatch.setattr(
+        fft_helpers, "make_flat_k_fftn", _emulated_flat_k_fftn)
+    mesh = _mesh_xy()
+    rng = np.random.default_rng(20260927)
+    nk, nb, ns, nmu, top = 3, 4, 2, 4, 2
+    psi = (rng.normal(size=(nk, nb, ns, nmu))
+           + 1j * rng.normal(size=(nk, nb, ns, nmu)))
+    enk = np.array([
+        [-1.3, -0.4, 0.2, 1.1],
+        [-1.1, -0.2, 0.5, 1.4],
+        [-1.4, -0.1, 0.7, 1.2],
+    ])
+    occ = np.array([
+        [1.0, 0.82, 0.10, 0.0],
+        [1.0, 0.61, 0.25, 0.0],
+        [1.0, 0.74, 0.05, 0.0],
+    ])
+
+    def bundle(n, slices):
+        return Wavefunctions(
+            psi_mun=_put(psi[:, :n].transpose(0, 2, 3, 1), mesh, PSI_MUN_SPEC),
+            psi_nmu=_put(psi[:, :n], mesh, PSI_NMU_SPEC),
+            enk=_put(enk[:, :n], mesh, P(None, None)),
+            occ=_put(occ[:, :n], mesh, P(None, None)),
+            slices=slices,
+            layout="face",
+        )
+
+    time = np.array([0.13, 0.41, 0.79])
+    z = np.array([0.32 + 0.18j, 0.77 + 0.24j])
+    weights = np.array([[0.19, 0.31, 0.17], [0.23, 0.27, 0.11]])
+
+    def run(wfns, meta):
+        out = w_isdf.compute_chi0_contour_fractional(
+            wfns, time, weights, z, meta, mesh)
+        return np.stack([np.asarray(jax.device_get(v)) for v in out])
+
+    split = bundle(nb, BandSlices.from_band_edges(
+        0, 0, 2, nb, nb, b4_chi=top, b4_sigma=nb))
+    got = run(split, SimpleNamespace(nkx=3, nky=1, nkz=1, b_id_4_chi_user=top))
+    want = run(bundle(top, BandSlices.from_band_edges(0, 0, 2, top, top)),
+               SimpleNamespace(nkx=3, nky=1, nkz=1))
+    np.testing.assert_allclose(got, want, rtol=1e-12, atol=1e-12)
+    whole = run(split, SimpleNamespace(nkx=3, nky=1, nkz=1))
+    assert np.max(np.abs(whole - want)) > 1e-3
+    assert w_isdf.occupation_support_bandwidth(enk, occ, top) == (
+        np.max(enk[:, 1:top]) - np.min(enk[:, :top]))
+
+
 def _mp1_occupations(enk, mu, width):
     """Fractional occupations from the production MP1 helper."""
     from gw import efermi

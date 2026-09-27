@@ -786,6 +786,7 @@ def _evaluate_samples(
         compute_chi0_contour_ordered,
         compute_chi0_contour_fractional,
         compute_chi0_direct_fractional,
+        chi_band_stop,
         occupation_support_bandwidth,
     )
 
@@ -841,7 +842,7 @@ def _evaluate_samples(
     # slices no longer contain.
     if metal:
         delta_max = occupation_support_bandwidth(
-            wfns.enk, occupation_state.f_kn)
+            wfns.enk, occupation_state.f_kn, chi_band_stop(meta, wfns))
 
     for point in routes["existing"]:
         if not metal:
@@ -897,8 +898,7 @@ def _evaluate_samples(
                 wfns, np.asarray([point["z"]], dtype=np.complex128),
                 meta, mesh_xy, occupation_state=occupation_state,
                 kminq_rows=kminq_rows,
-                nb_logical=(
-                    int(meta.b_id_4_chi_user) - int(wfns.slices.b0)),
+                nb_logical=chi_band_stop(meta, wfns),
                 progress_fn=lambda q_done, q_total, elapsed: print_fn(
                     "  MPA direct chi0 shifted-origin q row "
                     f"{q_done}/{q_total} complete in {elapsed:.3f} s"),

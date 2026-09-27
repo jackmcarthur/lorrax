@@ -2534,13 +2534,30 @@ def compute_static_photon_response(
     )
 
 
-def _occupation_support_slices(occupations):
-    """Smallest contiguous f and (1-f) band supports without truncation; see docs/architecture/four_current_wiring.md."""
+def chi_band_stop(meta, wfns):
+    """Local end of the chi0/W band sum: ``Meta.b_id_4_chi_user - b0``.
+
+    The one owner of the chi band window for the finite-occupation routes
+    (the logical top, no mesh pad; the shared-pole bank's census reads the
+    same edge).  None when ``meta`` carries no band edges: the whole carrier.
+    """
+    top = getattr(meta, "b_id_4_chi_user", None)
+    return None if top is None else int(top) - int(wfns.slices.b0)
+
+
+def _occupation_support_slices(occupations, band_stop=None):
+    """Smallest contiguous f and (1-f) band supports inside the chi band window; see docs/architecture/four_current_wiring.md.
+
+    ``band_stop`` (:func:`chi_band_stop`) ends both supports at the chi band
+    sum's top; None reads every band of the table.
+    """
     occ = np.asarray(jax.device_get(occupations), dtype=np.float64)
     if occ.ndim != 2:
         raise ValueError(
             "fractional contour occupations must have shape (nk, nb), got "
             + str(occ.shape))
+    if band_stop is not None:
+        occ = occ[:, :int(band_stop)]
     f_support = np.any(band_in_occupation_window(occ), axis=0)
     u_support = np.any(band_in_occupation_window(1.0 - occ), axis=0)
     if not np.any(f_support) or not np.any(u_support):
@@ -2563,6 +2580,7 @@ def _chi0_fractional_contour_args(
     z_values,
     occupations,
     energy_reference,
+    band_stop=None,
 ):
     """Prepare final band weights on the occupied and unoccupied support windows."""
     time_nodes = np.asarray(time_nodes, dtype=np.float64)
@@ -2599,7 +2617,7 @@ def _chi0_fractional_contour_args(
         raise ValueError(
             "fractional contour occupation shape {} does not match energies "
             "{}".format(occ_full.shape, wfns.enk.shape))
-    f_slice, u_slice = _occupation_support_slices(occ_full)
+    f_slice, u_slice = _occupation_support_slices(occ_full, band_stop)
     eref = 0.0 if energy_reference is None else float(energy_reference)
     # Invert occupations before masking so excluded bands retain zero weight.
     nb_full = int(wfns.slices.nb_full)
@@ -2667,6 +2685,7 @@ def compute_chi0_contour_fractional(
         z_values,
         occupations,
         energy_reference,
+        chi_band_stop(meta, wfns),
     )
     kernel = _get_chi_fractional_contour_kernel(
         mesh_xy, kgrid, n_out, ordered=ordered, **_chi_parent_face_kwargs(wfns))
@@ -2940,10 +2959,10 @@ def _get_chi_fractional_q_kernel_face(
     return kernel
 
 
-def occupation_support_bandwidth(energies_kn_ry, occupations_kn):
-    """Largest transition energy over the occupation supports, Ry; see docs/architecture/four_current_wiring.md."""
+def occupation_support_bandwidth(energies_kn_ry, occupations_kn, band_stop=None):
+    """Largest transition energy over the occupation supports inside the chi band window, Ry; see docs/architecture/four_current_wiring.md."""
     e = np.asarray(jax.device_get(energies_kn_ry), dtype=np.float64)
-    f_slice, u_slice = _occupation_support_slices(occupations_kn)
+    f_slice, u_slice = _occupation_support_slices(occupations_kn, band_stop)
     return float(np.max(e[:, u_slice]) - np.min(e[:, f_slice]))
 
 
