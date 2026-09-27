@@ -1439,35 +1439,10 @@ def plan_sigma_windows(
                 # it serves every frequency it owns at the near eta, so a far
                 # patch adds no window here.
                 owned_eta = np.full(owned_all.size, float(eta))
-            local_all, class_lo, class_hi = local, state_lo, state_hi
             for eta_w in np.unique(owned_eta):
-             owned = owned_all[owned_eta == eta_w]
-             eta_w = float(eta_w)
-             intervals = [("", class_lo, class_hi)]
-             if eta_w != float(eta):
-                 # A far patch resonates only with states whose E + Omega can
-                 # reach its frequencies; split the others off as sign-definite
-                 # windows so the crossing box spans the patch, not the band.
-                 f_lo = float(np.min(frequencies[owned])); f_hi = float(np.max(frequencies[owned]))
-                 a_lo, a_hi = pole_min, pole_max
-                 cuts = ((f_lo - a_hi, f_hi - a_lo) if pole_sign > 0 else
-                         (-f_hi - a_hi, -f_lo - a_lo))
-                 c1, c2 = cuts[0] - eta_w, cuts[1] + eta_w
-                 intervals = [(tag, max(lo_, class_lo), min(hi_, class_hi))
-                              for tag, lo_, hi_ in ((":lo", -np.inf, c1), (":x", c1, c2),
-                                                    (":hi", c2, np.inf))
-                              if min(hi_, class_hi) > max(lo_, class_lo)]
-             for part, state_lo, state_hi in intervals:
-              local = local_all[(raw_energy[local_all] > state_lo)
-                                & (raw_energy[local_all] <= state_hi)]
-              live = bool(local.size and pole_indices.size)
-              sub_min = max(-float(branch.excursion_bound_ry), float(state_lo))
-              sub_max = (4. * max(float(np.max(raw_energy)), eta)
-                         if not np.isfinite(state_hi) else float(state_hi))
-              if sub_max <= sub_min:
-                  continue
-              states = raw_energy[local] if local.size else np.array([sub_min, sub_max])
-              suffix = ("" if eta_w == float(eta) else f"@eta{eta_w * RYD_TO_EV:.3g}") + part
+              owned = owned_all[owned_eta == eta_w]
+              eta_w = float(eta_w)
+              suffix = "" if eta_w == float(eta) else f"@eta{eta_w * RYD_TO_EV:.3g}"
               spec = make_sigma_box_spec(
                 name=f"{branch.tag}:{name}{suffix}", frequencies=frequencies[owned],
                 states=states, pole_stats=fit_poles,
