@@ -445,6 +445,43 @@ def _little_group_operations(q_full_idx, *, kgrid, sym_mats_k,
 
 _LITTLE_GROUP_PROJECTORS = {}
 
+#: Streaming bytes one extra segment's dispatches cost (its sub-batch gather,
+#: scatter and loop launch); the segment planner weighs it against the tile
+#: transforms a segment saves.  An order-of-magnitude constant, not a tuning dial.
+_SEGMENT_OVERHEAD_BYTES = 64 * 2**20
+
+
+def _little_group_segments(counts, *, tile_bytes):
+    """Cheapest split of the projection steps into [lo, hi) segments.
+
+    ``counts[p]`` is parent p's little-group order.  A segment transforms the
+    parents with ``counts > lo`` for ``hi - lo`` steps (4 tile passes each); a
+    segment on a strict subset also gathers and scatters it (2 passes per
+    member) and pays one dispatch overhead.  Boundaries are the distinct
+    orders; exact dynamic programming over them.  Uniform groups keep one
+    all-parent segment (the unsegmented loop).
+    """
+    counts = np.asarray(counts, dtype=np.int64)
+    b = int(counts.size)
+    overhead = _SEGMENT_OVERHEAD_BYTES / max(int(tile_bytes), 1)
+    points = [0] + sorted({int(c) for c in counts})
+
+    def cost(lo, hi):
+        members = int(np.count_nonzero(counts > lo))
+        return 4.0*(hi - lo)*members + (0.0 if members == b else 2.0*members + overhead)
+
+    best = {0: (0.0, None)}
+    for j in range(1, len(points)):
+        best[points[j]] = min((best[points[i]][0] + cost(points[i], points[j]), points[i])
+                              for i in range(j))
+    cuts, point = [], points[-1]
+    while point:
+        cuts.append(point)
+        point = best[point][1]
+    bounds = [0] + cuts[::-1]
+    return tuple((lo, hi, tuple(int(p) for p in np.flatnonzero(counts > lo)))
+                 for lo, hi in zip(bounds[:-1], bounds[1:]))
+
 
 def project_little_group_operator(
     operator, *, transposed_partner, q_full_idx, q_irr_frac, sym_mats_k,
@@ -537,16 +574,15 @@ def project_little_group_operator(
         for parent, rows in enumerate(stabilizers):
             ops[:rows.size, parent] = rows
             valid[:rows.size, parent] = 1./rows.size
-        # Steps run in segments between the distinct little-group orders; a
-        # segment transforms only the parents whose group still has operations
-        # left.  Padding every parent to the largest group made the loop cost
-        # n_parents x max|G_q| tiles instead of sum|G_q| (bcc 8^3: 2784 vs 430,
-        # ~37 ms of a Na shared-pole Sigma tau node).  Each parent still adds
-        # its operations in the same order, and the dropped steps added exact
-        # zeros; the phase is formed over all parents as before.
-        bounds = [0] + sorted({int(c) for c in counts})
-        segments = tuple((lo, hi, tuple(int(p) for p in np.flatnonzero(counts >= hi)))
-                         for lo, hi in zip(bounds[:-1], bounds[1:]))
+        # Steps run in segments; a segment [lo, hi) transforms only the parents
+        # whose group has operations past lo.  Padding every parent to the
+        # largest group made the loop cost n_parents x max|G_q| tile transforms
+        # instead of sum|G_q| (bcc 8^3: 2784 vs 430, ~37 ms of a Na shared-pole
+        # Sigma tau node).  Each parent still adds its operations in the same
+        # order, and a parent's padded steps add exact zeros, as before; the
+        # phase is formed over all parents.
+        segments = _little_group_segments(
+            counts, tile_bytes=16*m*m//(int(mesh.shape["x"])*int(mesh.shape["y"])))
         sh = NamedSharding(mesh, P(None, "x", "y"))
 
         def local(plus, partner):
@@ -558,15 +594,19 @@ def project_little_group_operator(
                 sel = None if whole else jnp.asarray(members, dtype=jnp.int32)
                 sub_plus = plus if whole else plus[sel]
                 sub_partner = partner if whole else partner[sel]
+                # The segment's own operation and weight rows, host constants.
+                sub_ops = ops if whole else ops[:, list(members)]
+                sub_valid = valid if whole else valid[:, list(members)]
 
-                def step(index, acc, sel=sel, sub_plus=sub_plus, sub_partner=sub_partner):
+                def step(index, acc, sel=sel, sub_plus=sub_plus, sub_partner=sub_partner,
+                         sub_ops=sub_ops, sub_valid=sub_valid):
                     rows_all = jnp.asarray(ops)[index]
                     phase = jnp.exp(2j*jnp.pi*jnp.einsum(
                         "qi,qmi->qm", jnp.asarray(qfrac), jnp.asarray(wraps)[rows_all]))
-                    rows = rows_all if sel is None else rows_all[sel]
-                    weight = jnp.asarray(valid)[index]
+                    rows = jnp.asarray(sub_ops)[index]
+                    weight = jnp.asarray(sub_valid)[index]
                     if sel is not None:
-                        phase, weight = phase[sel], weight[sel]
+                        phase = phase[sel]
                     anti = rows >= nsp
                     source = jnp.where(anti[:, None, None], sub_partner, sub_plus)
                     selected_perm = jnp.asarray(perm)[rows]
