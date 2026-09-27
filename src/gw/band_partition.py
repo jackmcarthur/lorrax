@@ -1,32 +1,15 @@
-"""Three-way band partition for QSGW: protected / non-protected-in-range / out-of-range.
+"""Band classes and Hamiltonian masks.
 
-The QSGW iteration map carries ``H_qp_dft`` over the **active subspace**
-(``band_slices.sigma`` of the wfn bundle).  Within that subspace, each
-band falls into one of three categories per the user-configured
-:class:`BandPartition`:
-
-================================  ===========================  =======================================
-Category                          ``protected_mask`` element   Diagonal of ``H_qp_dft`` per iteration
-================================  ===========================  =======================================
-Protected                         ``True``                     Full Σ at QP energy (off-diag mixed in)
-Non-protected, in ω-range         ``False``, ``in_range=True`` Diagonal Σ at actual band energy
-Non-protected, out of ω-range     ``False``, ``in_range=False`` Scissor extrapolation α·E_DFT + β
-================================  ===========================  =======================================
-
-Off-diagonals of ``H_qp_dft`` are kept **only** for protected×protected
-pairs.  All other off-diagonals are zeroed each iteration so the
-non-protected / out-of-range bands never mix into the protected
-subspace's eigenproblem.
-
-Masks follow DFT reference identities at each k.  Only fixed-Sigma EQP2
-builds a non-trivial partition (:func:`build_omega_band_partition`); the SC
-loop keeps every QP-window identity protected (owner rule 2026-09-22), so its
-partition is :meth:`BandPartition.all_protected`.
+Dynamic SC protects the requested DFT bands, closed outward to spectral gaps
+resolved at eta. Other bands rotate through their couplings to protected
+bands, with a scissor (or deep DFT) diagonal and no rotating–rotating mixing.
+The legacy three-mask helper below serves fixed-Sigma EQP2 only.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
+from functools import partial
 
 import numpy as np
 
@@ -37,6 +20,21 @@ import jax.numpy as jnp
 # ---------------------------------------------------------------------------
 # Partition descriptor
 # ---------------------------------------------------------------------------
+
+def requested_band_mask(energies_ev, *, n_occ, nval, ncond, gap_ev):
+    """Requested bands closed to the next resolved spectral gap at each k.
+
+    A gap larger than eta separates manifolds resolved by Sigma. Only the
+    initial DFT ladder is classified. The work is O(nk nb), with no axis loop.
+    """
+    e = np.asarray(energies_ev, float)
+    lo, hi = int(n_occ)-int(nval), int(n_occ)+int(ncond)
+    if not 0 <= lo < hi <= e.shape[1]:
+        raise ValueError(f"protected band range [{lo}, {hi}) outside {e.shape}")
+    groups = np.cumsum(np.concatenate((np.zeros((e.shape[0], 1), bool),
+                                      np.diff(e, axis=1) > float(gap_ev)), axis=1), axis=1)
+    return (groups >= groups[:, lo:lo+1]) & (groups <= groups[:, hi-1:hi])
+
 
 @dataclass(frozen=True)
 class BandPartition:
@@ -245,3 +243,24 @@ def apply_band_partition(
 __all__ = [
     "BandPartition", "apply_band_partition", "build_omega_band_partition",
 ]
+
+
+@partial(jax.jit, static_argnames=("mesh",))
+def rotating_band_hamiltonian(H, protected_kn, rotating_diagonal_ry, mesh):
+    """Keep P-P and P-R, replace R diagonals and discard R-R mixing.
+
+    H is (nk, nb_X, nb_Y), energies are Ry. Masks/diagonals are bounded
+    (nk, nb) metadata; the matrix result stays on both processor axes.
+    """
+    from jax.sharding import NamedSharding, PartitionSpec as P
+    p = protected_kn
+    eye = jnp.eye(H.shape[-1], dtype=bool)[None]
+    keep = p[:, :, None] | p[:, None, :]
+    result = jnp.where(keep, H, jnp.where(eye, rotating_diagonal_ry[:, :, None], 0.))
+    from runtime.padding import pad_square, padded_axis
+    spec = P(None, "x", "y")
+    axis = padded_axis(H.shape[-1], mesh, name="rotating band Hamiltonian",
+                       specs=((spec, 1), (spec, 2)))
+    result = jax.lax.with_sharding_constraint(
+        pad_square(result, axis), NamedSharding(mesh, spec))
+    return result[:, :axis.logical, :axis.logical]

@@ -4706,6 +4706,7 @@ class LorraxConfig:
     #: Internal sampled SC support, retained by the quadrature session.
     #: This is not a deck knob; requested Sigma bounds stay unchanged.
     sc_omega_grid_ev: tuple[float, ...] | None = None
+    sc_sigma_protected_kn: object | None = None
 
     def __post_init__(self):
         """Refuse head settings outside their landed scope."""

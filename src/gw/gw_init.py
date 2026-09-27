@@ -931,7 +931,7 @@ clears-fh-and-the-tile-null-still-refuses.md`` §3).
 	nothing downstream would notice.  :func:`assert_isdf_window_is_the_max`
 	states the invariant where it can fail; this is why.
 	"""
-	left = (band_slices.b0, band_slices.b3)
+	left = (band_slices.b0, band_slices.b3_requested or band_slices.b3)
 	right = (band_slices.b1, band_slices.b4)
 	if zeta_nband is None:
 		return left, right
@@ -943,7 +943,7 @@ clears-fh-and-the-tile-null-still-refuses.md`` §3).
 			f"centroid ψ spans [b0, b4) = [{band_slices.b0}, "
 			f"{band_slices.b4}).  zeta_nband can only NARROW the ζ-fit "
 			f"window; it cannot move it outside the loaded bands.")
-	left = (band_slices.b0, min(band_slices.b3, b4_zeta))
+	left = (band_slices.b0, min(band_slices.b3_requested or band_slices.b3, b4_zeta))
 	right = (band_slices.b1, b4_zeta)
 	log(f"    ζ-fit window DECOUPLED from the band sum: logical physical "
 	    f"edge zeta_nband={b4_zeta}; the loaded band carrier ends at "
@@ -3239,9 +3239,10 @@ def prepare_band_metadata(centroid_indices, config, mesh_xy, n_rmu, print0, sym,
     mu_basis = PackedCentroidBasis.build(
         centroid_indices, sym, wfn.fft_grid, mesh_xy)
     print0(f"  {mu_basis.describe()}")
+    rotating_bands = config.compute_mode.is_dynamic and config.qp_solver == "self_consistent"
     meta = Meta.from_system(wfn, sym,
                             int(config.nval),
-                            int(config.ncond), config.nband,
+                            (config.nband - int(wfn.nelec) if rotating_bands else int(config.ncond)), config.nband,
                             n_rmu, charge_bispinor,
                             nband_chi=config.bands.chi,
                             nband_sigma=config.bands.sigma,
@@ -3253,6 +3254,9 @@ def prepare_band_metadata(centroid_indices, config, mesh_xy, n_rmu, print0, sym,
     band_slices = BandSlices.from_band_edges(
         *meta.band_edges, b4_chi=meta.b_id_4_chi,
         b4_sigma=meta.b_id_4_sigma, b4_logical=meta.b_id_4_user)
+    if rotating_bands:
+        from dataclasses import replace
+        band_slices = replace(band_slices, b3_requested=int(wfn.nelec) + int(config.ncond))
     zeta_fit_edge = resolve_zeta_fit_edge(
         band_slices, getattr(config, "zeta_nband", None))
     print0(f"  {config.bands.describe(zeta_fit_edge)}")

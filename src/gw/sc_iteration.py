@@ -785,9 +785,15 @@ def make_initial_state_from_qp_rotations(
     )
     expected_range = tuple(int(x) for x in inputs.band_slices.sigma_range)
     if artifact_range != expected_range:
-        raise ValueError(
-            "SC QP seed band range differs from this run: "
-            f"artifact={artifact_range}, run={expected_range}.")
+        if artifact_range[0] != expected_range[0] or artifact_range[1] > expected_range[1]:
+            raise ValueError(f"SC QP seed band range {artifact_range} is not a prefix of {expected_range}")
+        old_nb, new_nb = U_full.shape[-1], expected_range[1]-expected_range[0]
+        expanded = np.broadcast_to(np.eye(new_nb, dtype=complex),
+                                   (U_full.shape[0], new_nb, new_nb)).copy()
+        expanded[:, :old_nb, :old_nb] = U_full
+        energies = np.asarray(inputs.e_dft_active_kn_ry).copy()
+        energies[:, :old_nb] = E_full
+        U_full, E_full = expanded, energies
     H_full = np.einsum(
         "kmn,kn,kln->kml", U_full, E_full, np.conj(U_full), optimize=True)
 
@@ -2822,23 +2828,16 @@ def _classify_sc_partition(
             f"in_range={_band_ranges(partition.in_range_mask, band_offset=int(inputs.band_slices.b0))}; "
             "no band enters or leaves the set for the rest of the loop.")
     else:
-        # Owner rule 2026-09-22: every band of the QP window keeps its full
-        # QSGW Sigma; an energy outside the omega grid evaluates Sigma_mn at
-        # omega = 0 (qsgw_utils.build_qsgw_sigma_xc). No band is scissored
-        # for leaving the grid, so there is nothing to classify.
-        ones = np.ones(energies_loop.shape, dtype=bool)
-        partition = BandPartition(protected_mask=jnp.asarray(ones), in_range_mask=jnp.asarray(ones))
-        _record_sc(
-            inputs,
-            f"  SC map {int(iteration)} (identity, mu-anchored) partition: all "
-            f"{energies_loop.shape[1]} QP-window identities protected; "
-            f"sigma_out_of_grid={inputs.config.sigma.out_of_grid}"
-            + (" (the grid grows over every non-frozen identity)."
-               if inputs.config.sigma.out_of_grid == "cover" else
-               f"; energies outside [{sigma_classification_window_ev(inputs.config.sigma)[0]:+.2f}, "
-               f"{sigma_classification_window_ev(inputs.config.sigma)[1]:+.2f}] eV plus the SC pad read "
-               + ("the nearest grid edge." if inputs.config.sigma.out_of_grid == "clamp"
-                  else "Sigma(omega=0).")))
+        from .band_partition import requested_band_mask
+        protected = requested_band_mask(
+            e_reference_loop, n_occ=int(inputs.meta.nelec),
+            nval=inputs.config.nval, ncond=inputs.config.ncond,
+            gap_ev=inputs.config.sigma.regularization_ev)
+        protected[:, :int(inputs.config.sc.frozen_core_bands)] = False
+        partition = BandPartition(jnp.asarray(protected), jnp.asarray(protected))
+        _record_sc(inputs, f"SC band classes: {int(protected.sum())} protected / "
+                   f"{int((~protected).sum())} rotating; nval/ncond request "
+                   "closed to the next eta-resolved spectral gap")
     if not ks.is_identity:
         partition = BandPartition(
             protected_mask=ks.broadcast(partition.protected_mask),
@@ -3246,44 +3245,43 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
     tail_start = int(inputs.band_slices.sigma.stop)
     logical_stop = (
         int(inputs.meta.b_id_4_user) - int(inputs.band_slices.b0))
-    if logical_stop > tail_start:
-        from .scissor import k_star_weights
+    from .scissor import k_star_weights
 
-        e_dft_fit = inputs.e_dft_active_kn_ry
-        valence_fit = inputs.valence_mask_active_kn
-        if not ks.is_identity:
-            e_dft_fit = ks.select(e_dft_fit)
-            valence_fit = ks.select(valence_fit)
-        e_dft_fit_ev = np.asarray(e_dft_fit, dtype=np.float64) * RYD_TO_EV
-        fit_partition = _partition_on_loop(partition, inputs)
-        fit_mask_kn = np.broadcast_to(np.asarray(
-            fit_partition.protected_mask | fit_partition.in_range_mask,
-            dtype=bool), e_dft_fit_ev.shape)
-        # THE THREE-WAY CLASSIFICATION matters here: the tail law that gets
-        # applied is the CONDUCTION one, and under the old index mask a
-        # Fermi-crossing band above the occupied cut (sodium's band 10 of
-        # nval = 10) was a conduction sample.
-        valence_kn = np.asarray(valence_fit, dtype=bool)
-        if scissor_classes is not None:
-            valence_kn, crossing_kn = scissor_classes.masks(e_dft_fit_ev.shape)
-            fit_mask_kn = fit_mask_kn & ~crossing_kn
-        # The SUM-BAND tail (bands beyond the Sigma window) keeps its
-        # per-map refit: freezing it moved the Si b80/c504 QSGW gap by 22 meV
-        # at map 6 (si_p4_replay4 vs attempt 3), a closure change on
-        # semiconductors that nothing here justifies.  It is not part of the
-        # rotated QP subspace; its update is one rigid scissor, the mean
-        # correction of every trusted conduction state in the window (owner
-        # 2026-09-23; the lowest-multiplet law put CrI3's tail on one
-        # localized Cr-d band, +7.0 eV against the window mean +3.5 eV).
-        tail_fit, n_sigma0_excluded, tail_note = _fit_sum_band_tail(dict(
-            E_dft_kn_ev=e_dft_fit_ev,
-            E_qp_kn_ev=energies_loop,
-            valence_mask_kn=valence_kn,
-            k_weights=k_star_weights(ks),
-        ), fit_mask_kn, sigma0_kn, state.tail_z_kn)
-        if tail_note:
-            _record_sc(inputs, f"    SC sum-band tail: {tail_note}")
-    if tail_fit is not None:
+    e_dft_fit = inputs.e_dft_active_kn_ry
+    valence_fit = inputs.valence_mask_active_kn
+    if not ks.is_identity:
+        e_dft_fit = ks.select(e_dft_fit)
+        valence_fit = ks.select(valence_fit)
+    e_dft_fit_ev = np.asarray(e_dft_fit, dtype=np.float64) * RYD_TO_EV
+    fit_partition = _partition_on_loop(partition, inputs)
+    fit_mask_kn = np.broadcast_to(np.asarray(
+        fit_partition.protected_mask | fit_partition.in_range_mask,
+        dtype=bool), e_dft_fit_ev.shape)
+    # THE THREE-WAY CLASSIFICATION matters here: the tail law that gets
+    # applied is the CONDUCTION one, and under the old index mask a
+    # Fermi-crossing band above the occupied cut (sodium's band 10 of
+    # nval = 10) was a conduction sample.
+    valence_kn = np.asarray(valence_fit, dtype=bool)
+    if scissor_classes is not None:
+        valence_kn, crossing_kn = scissor_classes.masks(e_dft_fit_ev.shape)
+        fit_mask_kn = fit_mask_kn & ~crossing_kn
+    # The SUM-BAND tail (bands beyond the Sigma window) keeps its
+    # per-map refit: freezing it moved the Si b80/c504 QSGW gap by 22 meV
+    # at map 6 (si_p4_replay4 vs attempt 3), a closure change on
+    # semiconductors that nothing here justifies.  It is not part of the
+    # rotated QP subspace; its update is one rigid scissor, the mean
+    # correction of every trusted conduction state in the window (owner
+    # 2026-09-23; the lowest-multiplet law put CrI3's tail on one
+    # localized Cr-d band, +7.0 eV against the window mean +3.5 eV).
+    tail_fit, n_sigma0_excluded, tail_note = _fit_sum_band_tail(dict(
+        E_dft_kn_ev=e_dft_fit_ev,
+        E_qp_kn_ev=energies_loop,
+        valence_mask_kn=valence_kn,
+        k_weights=k_star_weights(ks),
+    ), fit_mask_kn, sigma0_kn, state.tail_z_kn)
+    if tail_note:
+        _record_sc(inputs, f"    SC sum-band tail: {tail_note}")
+    if tail_fit is not None and logical_stop > tail_start:
         enk_base_ev = apply_conduction_scissor_to_tail(
             np.asarray(inputs.wfns_dft.enk, dtype=np.float64) * RYD_TO_EV,
             tail_fit,
@@ -3797,6 +3795,12 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
                 "iteration": int(state.iteration)}
         sigma_config = replace(
             inputs.config, sc_omega_grid_ev=tuple(float(x) for x in expanded_grid))
+    protected_loop = np.broadcast_to(np.asarray(
+        _partition_on_loop(partition, inputs).protected_mask, bool), indices_loop.shape)
+    protected_sorted = np.zeros_like(protected_loop)
+    np.put_along_axis(protected_sorted, indices_loop, protected_loop, axis=1)
+    sigma_config = replace(sigma_config, sc_sigma_protected_kn=(
+        protected_sorted if ks.is_identity else protected_sorted[np.asarray(ks.take)]))
     sigma_result = compute_sigma_xc(
         inputs.config.compute_mode,
         occupation_state=metal_occ_state,
@@ -3957,10 +3961,21 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
              ("delta_h_dft", delta_h_dft),
              ("H_qp_dft_full", H_qp_dft_full)),
             inputs.print_fn)
-    # Every QP-window identity keeps its full Sigma (owner rule 2026-09-22),
-    # so the map output is the full QSGW Hamiltonian: no band is scissored
-    # and no off-diagonal is masked.
-    H_qp_dft_new = H_qp_dft_full
+    # The fixed DFT partition owns which endpoint carries dynamic Sigma.
+    # Keep protected–rotating couplings; replace only the rotating block.
+    from .band_partition import rotating_band_hamiltonian
+    target = np.asarray(e_dft_fit, float).copy()
+    if tail_fit is not None:
+        from .scissor import qsgw_out_of_range_energies
+        from .shared_pole_recipe import active_band_mask
+        target = qsgw_out_of_range_energies(
+            e_dft_fit_ev, valence_kn, tail_fit,
+            fermi_displacement_ev=_mu_ev-float(inputs.wfn.efermi)*RYD_TO_EV,
+            crossing_mask_kn=(None if scissor_classes is None else crossing_kn)) / RYD_TO_EV
+        active = active_band_mask(np.asarray(inputs.e_dft_active_kn_ry), float(inputs.wfn.efermi))
+        target = np.where(active[None, :], target, np.asarray(e_dft_fit))
+    H_qp_dft_new = rotating_band_hamiltonian(
+        H_qp_dft_full, jnp.asarray(protected_loop), jnp.asarray(target), inputs.mesh_xy)
 
     # The occupation state CARRIED below is the ENTRY solve consumed by this
     # call's chi/head/Sigma.  The carry remains DIAGNOSTIC continuity only (mu drift between
@@ -5740,7 +5755,7 @@ def _run_anderson(
     # Refresh it after classification; the same current identity block then
     # weights every history entry in that solve. Padded entries stay zero.
     _metric_np = np.zeros((int(x0.shape[0]), _nbp, _nbp), dtype=np.float64)
-    _metric_np[:, :nb, :nb] = _fit_mask[:, :, None] * _fit_mask[:, None, :]
+    _metric_np[:, :nb, :nb] = (_fit_mask[:, :, None] | _fit_mask[:, None, :])
     print_fn(
         "  SC Anderson metric: Gram over the per-k non-scissored DFT identity "
         "block; masks refreshed after each map, scissored rows follow the map")
@@ -6374,7 +6389,11 @@ def run_sc_driver(
 
     # Every QP-window identity keeps its full Sigma (owner rule 2026-09-22):
     # the cold seed starts all-protected and map 0 confirms it.
-    partition = BandPartition.all_protected(nb_active)
+    from .band_partition import requested_band_mask
+    protected = requested_band_mask(np.asarray(e_dft_active_kn_ry) * RYD_TO_EV,
+        n_occ=int(meta.nelec), nval=config.nval, ncond=config.ncond,
+        gap_ev=config.sigma.regularization_ev)
+    partition = BandPartition(jnp.asarray(protected), jnp.asarray(protected))
 
     # THE k-STAR MAP.  Built UNCONDITIONALLY, because it has two
     # independent jobs and only the first is optional:
