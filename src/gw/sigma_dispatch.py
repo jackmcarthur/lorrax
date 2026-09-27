@@ -1340,8 +1340,13 @@ def _compute_mpa_sigma(
                     cell_volume=float(meta.cell_volume), nk_tot=int(meta.nk_tot))
             cubes.append(add_head_sigma_diag(far_body.sigma_c_kij, far_head,
                                              band_axis=far_body.band_axis))
+        # The joined far axis must ascend: plans are grouped by eta, not energy.
+        order = np.argsort([float(g[0]) for g, _ in far_bodies], kind="stable")
+        cubes = [cubes[i] for i in order]
         sigma_c_far = (cubes[0] if len(cubes) == 1 else jnp.concatenate(cubes, axis=0),
-                       np.concatenate([g for g, _ in far_bodies]))
+                       np.concatenate([far_bodies[i][0] for i in order]))
+        if np.any(np.diff(sigma_c_far[1]) <= 0):
+            raise ValueError("GATE sigma_far_patch_order: far patches overlap or do not ascend")
     return finalize_dynamic_sigma(
         body.sigma_c_kij, head_diag,
         sigma_band_axis=body.band_axis,
