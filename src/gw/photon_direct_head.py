@@ -38,10 +38,12 @@ def cartesian_gamma_rows(photon_g0_vectors, current_basis_rows):
     B = np.asarray(current_basis_rows, dtype=np.complex128)
     rows = [(g[0], None, None, None)]
     for a in range(3):
-        rows.append((None,) + tuple(
-            sum(complex(np.conj(B[c, a]) * B[c, i]) * g[1 + c]
-                for c in range(3) if abs(B[c, a] * B[c, i]) > 0)
-            for i in range(3)))
+        blocks = []
+        for i in range(3):
+            terms = [complex(np.conj(B[c, a]) * B[c, i]) * g[1 + c]
+                     for c in range(3) if abs(B[c, a] * B[c, i]) > 0]
+            blocks.append(sum(terms[1:], terms[0]) if terms else None)
+        rows.append((None,) + tuple(blocks))
     return tuple(rows)
 
 
