@@ -1,4 +1,4 @@
-"""First-order direct bulk photon head from the authenticated dipole vertex.
+"""First-order direct photon Γ head (bulk or slab) from the authenticated dipole vertex.
 
 The six rows are three derivatives of the charge vertex followed by three
 uniform current vertices.  Only the final 6 by 6 tensors are replicated;
