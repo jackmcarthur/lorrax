@@ -33,6 +33,7 @@ Classification, interpolation and Hamiltonian masks add no quadrature pairs them
 | Use four times the initial far state, pole and damping extents. | Far-side reserve cannot enlarge the crossing edge. | Non-crossing costs: Fe 144, MoS2 54/65, Si 61, bispinor 139 per sector, Na 114/123/132. |
 | Use epsilon=1e-4 and QUADWIRE's derived rules on every W tier. | Keep one accuracy target and one rule owner. | T is measured at 1e-4; no tolerance relaxation is selected. |
 | Give every rotating band its DFT energy plus one scissor per side of mu, the mean H_ii - E_i of the protected occupied (empty) states; deep bands take the occupied-side scissor. | A diagonal error reaches a protected state at second order, |V|^2 dbeta/Delta^2; with exact couplings this law leaves 0.9-1.3 meV at the Si fixed point against 2.4-3.0 for a static-QSGW-plus-correlation diagonal (CLASSMIX). | Zero pairs. |
+| Read every rotating endpoint beyond the near support from far patches planned once at map 0 (rotating DFT energies +/- 2 eV, merged across holes <= 4 eV), one plan per eta: 1 eV above E_F, 2 eV below; the rotating diagonal is its own-energy patch read. With patches the side scissor is the fallback only. | The P-R coupling at the protected energy alone costs 33 meV (Fe) and 2-4 meV (Si) at the fixed point; far reads recover 67-85% of it (CLASSMIX round 2). Semicore endpoints are eta-insensitive to 2 eV. | Fe 748 -> ~1110, MoS2 338 -> 462 pairs/map; each far plan pays a 117-192 pair box floor. |
 | Reject the tested global-envelope automatic boundary replacement. | Its Fe spread is 1988.003 meV, against 1 meV. | 1613 pairs on its common broad diagnostic grid; no production saving established. |
 
 | Gate deck | Maps | T per map | Fixed sampled support, eV |
@@ -50,10 +51,11 @@ The implementation honors that request rather than silently applying an energy c
 ## Hamiltonian and geometry
 
 Protected bands P receive full QSGW Sigma and full mixing. Every other loaded
-band is R. Its diagonal is its DFT energy plus the QP-correction scissor of
-its side of mu (mean H_ii - E_i over protected occupied or empty states);
-deep bands obey the same law.
-R–R off-diagonal entries vanish. A P–R entry uses herm Sigma_ij(E_i), i in P;
+band is R. A rotating endpoint beyond the near support reads the held far
+patch (P-R: the usual half-sum; diagonal: own energy). Without patches (sector
+routes) its diagonal is its DFT energy plus the QP-correction scissor of its
+side of mu.
+R–R off-diagonal entries vanish. A P–R entry uses the half-sum with the rotating endpoint read from its far patch (herm Sigma_ij(E_i), i in P, on sector routes);
 P–P uses the usual Hermitian endpoint half-sum. The fixed DFT partition follows
 state identities through the eigenvectors; energy sorting never reclassifies P.
 
