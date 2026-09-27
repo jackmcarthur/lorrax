@@ -53,7 +53,7 @@ import numpy as np
 
 from .uniform_rule import UniformRule, _BoundaryCloud, _cexp, _pinned_blas_threads
 
-__all__ = ["analytic_box_rule", "corner_exponent", "crossing_nodes", "sector_degree"]
+__all__ = ["analytic_box_rule", "corner_exponent", "crossing_nodes", "node_ladder", "sector_degree"]
 
 #: Corner amplification of the bent line at the narrow edge, ``e^c``: the
 #: largest the executor noise gate admits with room (term mass <= 83 > e^4).
@@ -79,14 +79,15 @@ _FIT_POINTS = 2.0
 
 
 # ------------------------------------------------------------ crossing: nodes
-def corner_exponent(box):
-    """The bend ``c`` of a crossing box: ``_BEND`` = 4 on a thin box, lowered on
-    a tall one so the leg's phase ``tau_c (H - 1) = c (H - 1)/m`` at the top
-    edge stays within ``_LEG_PHASE`` radians, floored at ``_BEND_MIN``."""
+def corner_exponent(box, bend=_BEND):
+    """The bend ``c`` of a crossing box: ``bend`` (default ``_BEND`` = 4) on a
+    thin box, lowered on a tall one so the leg's phase ``tau_c (H - 1) =
+    c (H - 1)/m`` at the top edge stays within ``_LEG_PHASE`` radians,
+    floored at ``_BEND_MIN``."""
     re_lo, re_hi, im_lo, im_hi = (float(v) for v in box)
     m = max(min(-re_lo, re_hi) / im_lo, _NARROW_MIN)
     rise = im_hi / im_lo - 1.0
-    return min(_BEND, max(_BEND_MIN, _LEG_PHASE * m / max(rise, 1e-12)))
+    return min(bend, max(_BEND_MIN, _LEG_PHASE * m / max(rise, 1e-12)))
 
 
 def crossing_nodes(box, eps, rung=0, bend=None):
@@ -258,18 +259,43 @@ def _weights(box, times, eps, relative):
 
 
 # ------------------------------------------------------------ the builder
-def _crossing_rule(box, eps, rung, bend):
-    s, _ = crossing_nodes(box, eps, rung, bend)
-    times = s / float(box[2])
-    return times, _weights(box, times, eps, False), 0.0, int(s.size)
-
-
-def _sector_rule(box, eps, rung, relative):
+def _sector_times(box, eps, rung):
     from .laplace_ritz import place_times
     n, lo, hi, phi, _law = sector_degree(box, eps, rung)
     rot = np.exp(-1j * phi)
-    times = 1j * rot * place_times(lo, hi, 0.0, n)
-    return times, _weights(box, times, eps, relative), -float(np.angle(1j * rot)), n
+    return 1j * rot * place_times(lo, hi, 0.0, n), -float(np.angle(1j * rot)), n
+
+
+def node_ladder(box, eps, relative=None, bend=_BEND):
+    """The derived node sets of ``box``, rung by rung, as ``(times, theta, degree)``.
+
+    ``times`` are in the inverse units of ``box`` (executor convention
+    ``exp(i t d)``) and ``theta`` is the ray the certificate samples along.
+    A sign-definite (or ``relative``) box yields the sector rule's six rungs;
+    a crossing box yields the bent contour's bends ``c, c/2, c/4``, six margin
+    rungs each.  Every set is a formula of ``(box, eps, rung)``; the caller's
+    certificate picks the first rung that passes.  The Sigma box rule and the
+    response group rules (:mod:`minimax.complex_response`) both read it;
+    ``bend`` is the thin-box corner exponent, set by the consumer's admitted
+    term mass (``e^bend`` below it).
+    """
+    re_lo, re_hi, im_lo, _im_hi = (float(v) for v in box)
+    if relative is None:
+        relative = re_lo > 0.0 or re_hi < 0.0
+    if relative:
+        for rung in range(_SECTOR_RUNGS):
+            yield _sector_times(box, eps, rung)
+        return
+    # A crossing box takes the bent contour only. The sector rule certifies
+    # narrow crossing boxes, but its rotated times cancel at |w| ~ 1e10 there
+    # and the executor's Sigma came out non-finite (core fixture A,
+    # [-2.71, 47.63] eta, 2026-09-27). The bend's own fixed ladder: c, c/2,
+    # c/4, each with the margin ladder.
+    c = corner_exponent(box, bend)
+    for step in (c, c / 2.0, c / 4.0):
+        for rung in range(_CROSSING_RUNGS):
+            s, _ = crossing_nodes(box, eps, rung, step)
+            yield s / im_lo, 0.0, int(s.size)
 
 
 def analytic_box_rule(box, eps, *, mass_cap=83.0, relative=None):
@@ -286,32 +312,17 @@ def analytic_box_rule(box, eps, *, mass_cap=83.0, relative=None):
     box = (re_lo, re_hi, im_lo, im_hi)
     if relative is None:
         relative = re_lo > 0.0 or re_hi < 0.0
-    if relative:
-        families = [(lambda r: _sector_rule(box, eps, r, True), _SECTOR_RUNGS)]
-    else:
-        # A crossing box takes the bent contour only. The sector rule
-        # certifies narrow crossing boxes, but its rotated times cancel at
-        # |w| ~ 1e10 there and the executor's Sigma came out non-finite
-        # (core fixture A, [-2.71, 47.63] eta, 2026-09-27).
-        # the bend's own fixed ladder: c, c/2, c/4, each with the margin ladder
-        c = corner_exponent(box)
-        families = [(lambda r, b=b: _crossing_rule(box, eps, r, b), _CROSSING_RUNGS)
-                    for b in (c, c / 2.0, c / 4.0)]
     started = time.perf_counter()
     with _pinned_blas_threads():
-        for build, rungs in families:
-            for rung in range(rungs):
-                times, weights, theta, degree = build(rung)
-                horizon = max(math.log(10.0 / eps) / im_lo, float(np.abs(times).max()))
-                # sampled along the rule's own ray: a sector rule's far times
-                # oscillate at |Re t| well above ln(10/eps)/eta
-                check = _BoundaryCloud(box, theta, horizon, eps, p=6.0, p_target=8.0)
-                sup, kappa, mass = check.sup(times, weights, relative)
-                if sup <= eps and mass <= mass_cap:
-                    break
-            else:
-                continue
-            break
+        for times, theta, degree in node_ladder(box, eps, relative):
+            weights = _weights(box, times, eps, relative)
+            horizon = max(math.log(10.0 / eps) / im_lo, float(np.abs(times).max()))
+            # sampled along the rule's own ray: a sector rule's far times
+            # oscillate at |Re t| well above ln(10/eps)/eta
+            check = _BoundaryCloud(box, theta, horizon, eps, p=6.0, p_target=8.0)
+            sup, kappa, mass = check.sup(times, weights, relative)
+            if sup <= eps and mass <= mass_cap:
+                break
     return UniformRule(
         times=times, weights=weights, box=box, eps=float(eps), relative=bool(relative),
         theta_deg=float(np.rad2deg(theta)), rank=int(degree), sup_error=float(sup),

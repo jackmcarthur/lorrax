@@ -99,7 +99,8 @@ if stack.process_index == 0:
         exact=weight*(1 if side==0 else -1)/(2*z*(delta-pole)**2)
         slope=np.max(abs(basis@rule['derivative'][0,side,:m]-exact))*z.imag**3
         assert max(error,slope)<1e-8,(error,slope)
-        assert np.all((t.real>=0)&(t.real<=beta))
+        # growth-side times stay within e^3 on every Green factor (|Re t|(hi-lo) <= 3)
+        assert np.all((t.real>=-3/2)&(t.real<=beta))
         print(f'PASS weighted scalar side={side} nodes={m} value={error:.3e} ds={slope:.3e}',flush=True)
     import runpy
     from pathlib import Path
