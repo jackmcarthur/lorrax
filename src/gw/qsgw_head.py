@@ -2424,8 +2424,12 @@ def _velocity_diagonal_kernel(mesh: Mesh) -> Callable:
     return kernel
 
 
-def metal_pair_split(velocity_cart, *, mesh: Mesh, bvec_cart, kgrid):
-    """Build the :class:`MetalPairSplit` of one velocity operator."""
+def metal_pair_split(velocity_cart, *, mesh: Mesh, bvec_cart, kgrid,
+                     is_2d: bool = False):
+    """Build the :class:`MetalPairSplit` of one velocity operator.
+
+    ``is_2d`` reads the pair scale on the slab's in-plane polygon cell
+    (``vcoul.minibz_coulomb_moment``)."""
     from ffi import _services
     _services.ensure_on_path()
     from vcoul import minibz_coulomb_moment
@@ -2436,7 +2440,7 @@ def metal_pair_split(velocity_cart, *, mesh: Mesh, bvec_cart, kgrid):
     v, _e, _f, _s = _pad_head_band_manifold(v, e, e, e, mesh=mesh)
     diag = np.asarray(gather_to_host(_velocity_diagonal_kernel(mesh)(v)))
     moment = minibz_coulomb_moment(np.asarray(bvec_cart, dtype=np.float64),
-                                   tuple(int(n) for n in kgrid))
+                                   tuple(int(n) for n in kgrid), is_2d=is_2d)
     replicated = device_put_process_local(diag, NamedSharding(mesh, P()))
     return MetalPairSplit(diag=replicated, moment=moment, diag_host=diag)
 
@@ -2981,7 +2985,7 @@ def _metal_intraband(response):
 def metal_intraband_model(velocity_cart, surface_weight_kn, energies_kn_ry, *,
                           mesh: Mesh, nb_logical: int, cell_volume: float,
                           nk_tot: int, nspin: int, nspinor: int, bvec_cart,
-                          kgrid):
+                          kgrid, is_2d: bool = False):
     """``(D, atoms, split)`` of a metal: one pair split, one surface table.
 
     The split (:func:`metal_pair_split`) is built once from this velocity and
@@ -2992,7 +2996,7 @@ def metal_intraband_model(velocity_cart, surface_weight_kn, energies_kn_ry, *,
     from gw.fermi_surface import FermiSurfaceIntraband
 
     split = metal_pair_split(velocity_cart, mesh=mesh, bvec_cart=bvec_cart,
-                             kgrid=kgrid)
+                             kgrid=kgrid, is_2d=is_2d)
     surface = jnp.asarray(surface_weight_kn, dtype=jnp.float64)
     drude, spread = head_drude_tensor_sharded(
         velocity_cart, surface, energies_kn_ry, mesh=mesh,

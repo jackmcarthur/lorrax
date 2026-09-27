@@ -29,8 +29,7 @@ import numpy as np
 from vcoul.base import SysDim, v_qG_single
 from vcoul.geometry import CoulombGeometry
 from vcoul.minibz import (_sample_q0_minibz_qpoints, minibz_average,
-                          minibz_inscribed_sphere_r2,
-                          minibz_transverse_head_avg, minibz_voronoi_batches,
+                          minibz_inscribed_sphere_r2, minibz_voronoi_batches,
                           slab_minibz_photon_cubature)
 
 __all__ = ["Slab2D", "SlabQ0Certificate", "Q0_RULE_EXACT",
@@ -478,43 +477,45 @@ class Slab2D:
 
     def q0_average_transverse_tensor(
         self, geometry: CoulombGeometry, kgrid, *,
-        nsamples: int = 2**18,
-        method: str = "sobol",
-        qmc_reps: int = 10,
         analytic_sphere: bool = False,
     ) -> np.ndarray:
         """``T_ab = ⟨v_slab(q) t_ab(q̂)⟩_mBZ`` at q=Γ — the bare Coulomb-
         gauge transverse-projector head (bispinor TT), bare units (no
-        ``1/celvol``).  Scrambled-Sobol Voronoi draw (``nmax`` 1↔3 on the
-        ``analytic_sphere`` flag, ``is_2d=True``) — see
-        :func:`~vcoul.minibz.minibz_transverse_head_avg` for the estimator
-        and the physics it replaces (the missing q=Γ, G=0 slot of the bare
-        TT tiles, ``docs/BISPINOR_DHFB_DESIGN.md`` §11).
+        ``1/celvol``), on the exact rule :meth:`q0_average` uses.
 
-        NOT THE SAME RULE AS :meth:`q0_average` SINCE 2026-09-01.  The
-        scalar charge head moved to the exact Wigner--Seitz polygon
-        cubature (``Q0_RULE_EXACT``); this TT head is still the Sobol
-        draw, so it still carries the ~0.1–0.2 % cusp sampling error the
-        scalar head shed.  It has one production caller, the incumbent
-        ``bare_transverse`` route's ``gw.v_q_bispinor._tt_head_tensor``;
-        the packed route takes its TT head from the same receipt
-        ``q0_average`` now uses and is unaffected.  Registered in
-        ``KNOWN_LORRAX_ISSUES.md``; the fix is the same three lines
-        (``receipt.chunks[-1].D_raw[:, 1:, 1:] / COULOMB_GAUGE_TT_SIGN``)
-        and it moves the incumbent route's numbers, so it wants its own
-        gate.
+        The nodes, weights and ``D_TT = COULOMB_GAUGE_TT_SIGN · v · P_T``
+        are read off the receipt of
+        :func:`~vcoul.minibz.slab_minibz_photon_cubature`, the same one the
+        charge head and the direct four-current Γ head
+        (``gw.photon_direct_head``) average on, so the bare TT tile in V
+        and the head that subtracts it are one reduction of one set of
+        numbers.  The 16/24/32 ladder's last pair must converge under the
+        charge head's budget or the call refuses.  ``analytic_sphere`` is
+        refused as in :meth:`q0_average`: a slab has no Baldereschi sphere.
         """
-        nkx, nky, nkz = (int(s) for s in kgrid)
-        bvec = np.asarray(geometry.bvec, dtype=np.float64)
-        zc = self.truncation_half_height(geometry)
-        batches = _sample_q0_minibz_qpoints(
-            geometry, (nkx, nky, nkz), nsamples=nsamples, method=method,
-            qmc_reps=qmc_reps, analytic_sphere=analytic_sphere, is_2d=True)
-        q0sph2 = minibz_inscribed_sphere_r2(bvec, (nkx, nky, nkz), is_2d=True)
-        return minibz_transverse_head_avg(
-            np.zeros(3), [np.asarray(b) for b in batches], kind="slab",
-            celvol=float(geometry.cell_volume), n_kpts=int(nkx * nky * nkz),
-            q0sph2=q0sph2, zc=zc,
-            # The slab flag widens the draw's Voronoi fold only; the
-            # Baldereschi analytic sphere is the 3D 1/q^2 treatment.
-            analytic_sphere=False, adaptive=True)
+        from vcoul.minibz import COULOMB_GAUGE_TT_SIGN
+        if analytic_sphere:
+            raise ValueError(
+                "GATE slab_q0_analytic_sphere_unavailable: the slab TT "
+                "q->0 head integrates the exact Wigner-Seitz polygon; there "
+                "is no Baldereschi-Tosatti sphere in 2D.  Fix: pass "
+                "analytic_sphere=False.  doc: docs/services/vcoul.md.")
+        receipt = slab_minibz_photon_cubature(
+            Slab2D(), geometry, tuple(int(s) for s in kgrid))
+        ladder = []
+        for chunk in receipt.chunks:
+            n_valid = int(chunk.physical_count)
+            weight = np.asarray(chunk.sample_weight[:n_valid], np.float64)
+            tt = np.asarray(chunk.D_raw[:n_valid, 1:, 1:], np.float64)
+            ladder.append(np.einsum("q,qab->ab", weight, tt)
+                          / (float(np.sum(weight)) * COULOMB_GAUGE_TT_SIGN))
+        delta = float(np.max(np.abs(ladder[-1] - ladder[-2])))
+        scale = float(np.max(np.abs(ladder[-1])))
+        ratio = delta / (_Q0_LADDER_ATOL + _Q0_LADDER_RTOL * scale)
+        if not np.all(np.isfinite(ladder[-1])) or not ratio <= 1.0:
+            raise ValueError(
+                "GATE slab_q0_polygon_not_converged: the TT q->0 head's "
+                f"Duffy--Gauss orders {receipt.orders[-2]}->"
+                f"{receipt.orders[-1]} differ by {delta:.3e} (error_ratio "
+                f"{ratio:.3e} > 1); the provider ladder is fixed.")
+        return ladder[-1]

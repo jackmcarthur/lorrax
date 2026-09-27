@@ -29,7 +29,7 @@ contracts them. All three values ride the same four-spinor carrier.
 | packed, bare | `bare_transverse` inside the packed envelope | $\chi_{TT}=\chi_{CT}=0$, so $W=\mathrm{diag}(W_{00},D_{TT})$; CC dynamic under GN/HL as above | §4 completion with a charge-only response: $\mathrm{diag}(W^{00}_h,\langle D_{TT}\rangle)$ | as the two rows above |
 | incumbent, bare | `bare_transverse` outside the envelope | CC: scalar $W$ in any compute mode; TT: bare | charge: §3; TT: the bare overlay (§2.1) for GN/HL and `x_only` under `head_correction = full`, none otherwise | scalar Σ plus $\Sigma^B=X(D_{TT})$ |
 | shared-pole hybrid | `bare_transverse`, `compute_mode = mpa`, `sigma_w_model = shared_pole` | CC: full-frequency shared-pole $W$ on the four-spinor charge; TT: bare | charge: `full`, or `no_local_fields` (direct $S(\omega)$, required on an ordered store); TT: bare overlay unless `off` | shared-pole $\Sigma_c$ plus $\Sigma^B$ |
-| full shared-pole | `full_shared_pole`, `compute_mode = mpa`, `sigma_w_model = shared_pole` | ordered CC/CT/TC/TT sectors, each with its own poles ([shared-pole model](../architecture/shared_pole_model.md)) | first-order direct bulk head under `no_local_fields` (§5); `full` refuses | [sector Σ consumer](../dev/sector_sigma_consumer.md) |
+| full shared-pole | `full_shared_pole`, `compute_mode = mpa`, `sigma_w_model = shared_pole` | ordered CC/CT/TC/TT sectors, each with its own poles ([shared-pole model](../architecture/shared_pole_model.md)) | first-order direct head (bulk or slab) under `no_local_fields` (§5); `full` refuses | [sector Σ consumer](../dev/sector_sigma_consumer.md) |
 
 **The packed envelope** is `compute_mode ∈ {cohsex, gn_ppm, hl_ppm}`,
 `qp_solver = one_shot_dft`, `screening_diagrams = w_rpa` and
@@ -122,10 +122,9 @@ T=\tfrac23\langle v\rangle\,\mathbb 1\ \ \text{(isotropic 3D)} .
 $$
 
 Bulk adds the Baldereschi–Tosatti analytic sphere for the $1/q^2$ part. The
-slab average is a scrambled-Sobol Voronoi draw, not the exact polygon rule
-of §3.1, so it keeps the 0.1–0.2 % cusp sampling error that rule removes
-(`vcoul.Slab2D.q0_average_transverse_tensor`). Box truncation (`sys_dim = 0`)
-never zeros the slot and is refused.
+slab average uses the exact polygon rule of §3.1, the same receipt as the
+charge head (`vcoul.Slab2D.q0_average_transverse_tensor`). Box truncation
+(`sys_dim = 0`) never zeros the slot and is refused.
 
 The head is frequency independent, because $\Sigma^B$ is. Its weight in Σ
 is $\langle v\rangle/(\Omega N_k)$. In 2D, $\langle v\rangle\propto
@@ -420,13 +419,14 @@ centroids it reaches 11.5 meV in the bare-X head of individual occupied
 states (CLAIMS 586). The wings and the current blocks have no band-diagonal
 form, so they stay in the $(\mu,\nu)$ representation on every route.
 
-## 5. The direct first-order bulk head (`full_shared_pole`) {#direct-bulk-head}
+## 5. The direct first-order head (`full_shared_pole`) {#direct-bulk-head}
 
 `full_shared_pole` with `head_correction = no_local_fields` completes the
 ordered sector bank with a direct Γ head
-(`gw.photon_direct_head.build_direct_photon_head`). It requires
-`sys_dim = 3` and the current map's Fermi–Dirac occupations. `full`
-refuses, because no wing/body fold exists for this route.
+(`gw.photon_direct_head.build_direct_photon_head`) for `sys_dim = 3` or
+`2` (§5.1). A metal needs the current map's Fermi–Dirac occupations; an
+insulator (step occupations, no occupation state) has no intraband block.
+`full` refuses, because no wing/body fold exists for this route.
 
 At each Γ-cell sample $\mathbf q$ and bank frequency $z$ the response is
 first order in the long-wavelength vertex:
@@ -463,7 +463,7 @@ These enter the bank through the four literal-Γ vectors as rank-4 updates.
 The bare TT overlay (§2.1) stays in $V$ for exchange and is subtracted
 from the screening root.
 
-The cubature uses $4\times2^{17}$ scrambled-Sobol samples of the mini-BZ
+In bulk the cubature uses $4\times2^{17}$ scrambled-Sobol samples of the mini-BZ
 exterior. Inside the excised sphere an $8\times12\times24$
 radial/angular rule runs through the same coupled 4×4 solve, with weights
 calibrated to the analytic $8\pi/q^2$ sphere integral. The run prints the
@@ -476,6 +476,38 @@ enters with $1-\phi$ of its tensor; its Fermi-surface share $\phi$ keeps
 only its Hall (antisymmetric) part here ([metal head §2](metal-q0-head.md)),
 so the charge jets stay bounded as $\Delta\to0$. The model folds no wings
 and no microscopic local fields.
+
+### 5.1 The slab head {#direct-slab-head}
+
+A slab of height $L$ (the cell's $c$) and area $A$, $\Omega=AL$, uses the
+Ismail–Beigi kernel with $z_c=L/2$. At $G=0$ and in-plane $\mathbf q$
+($q_z=0$),
+$v(q)=8\pi(1-e^{-z_cq})/q^2\to 8\pi z_c/q$, so $v/\Omega\to(4\pi/q)/A$, the
+2D Coulomb interaction (Ry). The bare block is
+$D=\mathrm{diag}(v,\,-v\,P^T(\hat q))$ with $\hat q$ in plane: the $z$
+current is always transverse ($P^T_{zz}=1$), the in-plane current only
+across $\hat q$. Nothing else changes: the same $6\times6$ interband
+tensors (per $\Omega$), atoms and contact, projected with $q_z=0$, and the
+same $4\times4$ solve at every node. The limits are the 2D ones:
+
+| | small $q$ |
+|---|---|
+| insulator, static CC | $\epsilon=1-v\,\mathbf q\cdot S(0)\cdot\mathbf q\to1+8\pi z_c\,|\hat q\cdot S\cdot\hat q|\,q$ (the 2D polarizability; $\epsilon\to1$) |
+| insulator, CT / TT | CT $=O(q)$; at $z\ne0$, $W_{TT}\to-P^T[P^T(\Pi_{TT}-C)P^T]^{+}P^T$, finite, since $vP^T\sim1/q$ |
+| metal, static CC | $\epsilon=1+8\pi z_cN_0/q$ (2D Thomas–Fermi), $W_{CC}(0)\to1/N_0$ |
+| metal, plasmon | $\omega^2=8\pi(1-e^{-z_cq})\,\hat q\cdot D\cdot\hat q+\tfrac34(qu)^2\propto q$ |
+
+$D$, $S$ and the atoms carry the in-plane/out-of-plane anisotropy; a slab's
+intraband velocities have $u_z=0$, so the $z$ current has no Drude weight.
+The cell is the exact in-plane Wigner–Seitz polygon of the mini lattice
+(`vcoul.slab_minibz_photon_cubature`, the charge head's rule): Γ-to-edge
+triangles, Duffy map $\mathbf q=r[(1-s)\mathbf v_i+s\mathbf v_{i+1}]$
+whose Jacobian $r$ cancels the $1/q$ cusp, Gauss–Legendre orders
+16/24/32, normalized weights. The integrand is a cusp, not a pole, so there
+is no sphere. Every node takes the $4\times4$ solve before the sum; the
+order-32 sums are the head and the 24→32 change prints as its spread. The
+metal pair split reads the same polygon's Coulomb moment
+(`vcoul.minibz_coulomb_moment(..., is_2d=True)`, $Q_{zz}=0$).
 
 ## 6. Code owners
 
@@ -490,6 +522,6 @@ and no microscopic local fields.
 | packed body response and Dyson solve | `gw.w_isdf.compute_static_photon_response` |
 | sixteen-block Σ and its current-only selection | `gw.photon_sigma` |
 | incumbent $\Sigma^B$ | `gw.sigma_x_bispinor` |
-| direct first-order bulk head | `gw.photon_direct_head` |
+| direct first-order head, bulk and slab | `gw.photon_direct_head` |
 | route predicates and refusals | `gw.gw_config` |
 | carrier resolution | `common.four_current_model` |

@@ -3560,9 +3560,10 @@ def incumbent_bispinor_head_record(config) -> tuple[str, str]:
             "incumbent route); NOT a production calculation")
     if config.head.correction is HeadCorrection.NO_LOCAL_FIELDS:
         if uses_direct_bispinor_shared_pole_head(config):
-            return "", ("first-order direct bulk CC/CT/TC/TT Gamma-cell head "
-                        "in ordered shared-pole sectors; FD metal Drude and "
-                        "screened sphere; no wing/body fold; spatial current "
+            return "", ("first-order direct CC/CT/TC/TT Gamma-cell head "
+                        "in ordered shared-pole sectors (bulk: screened "
+                        "sphere; slab: exact Wigner-Seitz polygon); FD metal "
+                        "Drude; no wing/body fold; spatial current "
                         "uses the dipole-velocity approximation")
         if uses_bare_transverse_shared_pole(config):
             return "", ("direct frequency-dependent scalar CC Gamma head "
