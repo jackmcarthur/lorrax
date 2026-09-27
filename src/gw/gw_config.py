@@ -1677,7 +1677,7 @@ _DEFAULTS = {
     # Where a QSGW Sigma(E) evaluation outside the sampled grid reads
     # (owner 2026-09-24): cover (grow the grid over every protected
     # identity), clamp (the nearest grid edge), static (omega = 0).
-    "sigma_out_of_grid": "cover",
+    "sigma_out_of_grid": "clamp",
     "sigma_w_model": "mpa",
     "sigma_w_accuracy": "production",
     # "" = the shared-pole resolver's own line and imaginary ladders.
@@ -2926,6 +2926,11 @@ def _report_early_retired_keys(
                 "IGNORED — the LORRAX-native eqp0 filename is now "
                 "'sigma_diag_file'; eqp0.dat / eqp1.dat are written "
                 "automatically"))
+    for legacy_key in ("sigma_window_ev", "sigma_out_of_grid", "sigma_omega_patches_ev"):
+        if section.get(legacy_key, fallback=None) is not None:
+            raise ValueError(f"Input key '{legacy_key}' is retired: nval/ncond select "
+                             "protected bands; sigma_omega_min_ev/max_ev only enlarge "
+                             "their fixed support. Remove the key.")
     for legacy_key in ("slab_io", "use_ffi_io"):
         if section.get(legacy_key, fallback=None) is not None:
             raise ValueError(
@@ -3990,7 +3995,7 @@ class DynamicSigmaConfig:
     #: cache spelling is "auto" (run tmp), "off", or a deck-relative path.
     #: ``sigma_out_of_grid``: cover | clamp | static, the QSGW Sigma(E)
     #: rule outside the sampled grid (``qsgw_utils.sigma_eval_omega``).
-    out_of_grid: str = "cover"
+    out_of_grid: str = "clamp"
     w_model: str = "mpa"
     w_accuracy: str = "production"
     #: ``sigma_w_support_sites_ev``: "" (default, the shared-pole
@@ -4041,13 +4046,6 @@ class DynamicSigmaConfig:
         lo, hi = self.requested_edges_ev()
         if hi < lo:
             raise ValueError("sigma_omega_max_ev must be >= sigma_omega_min_ev.")
-        if ((self.omega_min_ev is None or self.omega_max_ev is None)
-                and self.out_of_grid != "cover"):
-            raise ValueError(
-                "An unset sigma_omega_min_ev / sigma_omega_max_ev derives the "
-                "Sigma grid from the protected band range, which needs "
-                f"sigma_out_of_grid = cover (got {self.out_of_grid!r}); set both "
-                "edges for clamp or static.")
         if self.out_of_grid not in ("cover", "clamp", "static"):
             raise ValueError(
                 "sigma_out_of_grid must be 'cover', 'clamp' or 'static'; got "

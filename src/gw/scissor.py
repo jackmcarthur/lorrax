@@ -324,26 +324,6 @@ def sc_padded_window_ev(lower_ev, upper_ev):
             upper / (1.0 - _SC_PAD_FRACTION * np.sign(upper)))
 
 
-#: Band-sum state pad of the held SC Sigma rule boxes, in eV (owner
-#: 2026-09-25): the first plan (map 0's held rules), then every refit. It pads
-#: the G-side states of a product window, not the sampled omega support,
-#: which ``gw.qp_support`` owns.
-SC_WINDOW_PAD_EV = (2.0, 1.0)
-
-#: A Sigma rule's state pad is at least this fraction of |E - mu|: QP
-#: corrections stretch the spectrum by about 10% (Na 8^3 top state +96 ->
-#: +101 eV at map 1), so a flat pad refit Na's 1265- and 1669-node crossing
-#: windows at map 1 (553 s) where the stretch-proportional pad held them.
-SC_WINDOW_PAD_FRACTION = 0.10
-
-
-def sc_window_pad_ev(energy_relative_to_mu_ev, plan_index):
-    """The Sigma rule state pad of plan ``plan_index``: max(flat, 10% |E - mu|)."""
-    flat = SC_WINDOW_PAD_EV[min(int(plan_index), len(SC_WINDOW_PAD_EV) - 1)]
-    return np.maximum(flat, SC_WINDOW_PAD_FRACTION * np.abs(
-        np.asarray(energy_relative_to_mu_ev, dtype=np.float64)))
-
-
 def classify_bands_in_grid(
     E_kn_ev: np.ndarray,
     omega_min_ev: float,
