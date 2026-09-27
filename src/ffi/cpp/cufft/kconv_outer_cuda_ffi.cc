@@ -410,7 +410,7 @@ static ffi::Error KleadOuterConv(cudaStream_t stream, ffi::AnyBuffer L, ffi::Any
 //          group 1 reads it when its pair has the same tile (consecutive pairs share one when
 //          na is even, the BSE spinor case), else from L2;
 //   L2     (LRX_VSTAGE = 0, A100 at 8x8): the Mid reads V[x, y, k] from L2, k fastest (512
-//          contiguous bytes per warp), eight loads in flight per thread.
+//          contiguous bytes per warp), eight loads in flight per thread (four: 1% slower).
 // The bank column of tile cell (x, y) is x*8 + (y ^ f(x)), f(x) = 3(x&1) + 4((x>>1)&1): the load's
 // D-fragment stores and the decode's B-fragment reads then each hit 8 distinct 16-byte bank
 // groups per phase (RS is 1 mod 8).  The transforms, Mid and the K sum are the U arm's, so A is
@@ -478,9 +478,10 @@ __device__ __forceinline__ int pcol(int x, int y) { return x * 8 + (y ^ fperm(x)
 
 // Load: bank[pcol(x, y), k] = T[k, a, 8 xb + x, b, 8 yb + y] = sum_K L R on the tensor cores, K
 // chunks in order (re and im interleaved, each accumulator's order that of the U arm).  The
-// group's warps take k = wl, wl + GW, ...
+// group's warps take k = wl, wl + GW, ..., two k in flight (measured: 1 and 4 in flight 3% slower).
 __device__ __forceinline__ void load_t(lrx_c2* bank, const double2* lb, const double2* rb, int wl, int gr,
                                        int tg) {
+#pragma unroll 2
     for (int k = wl; k < NK; k += GW) {
         double re0 = 0.0, re1 = 0.0, im0 = 0.0, im1 = 0.0;
 #pragma unroll
