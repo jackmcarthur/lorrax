@@ -521,3 +521,9 @@ guarantees; the signatures are in the code.
   (`sigma_mnk.h5`, `kin_ion.h5`) stores `take` as its `irr_idx_k`.
 * `star_wedge_rows(sym)` → `(labels, take)`; `star_wedge_tables(sym)` →
   `(take, sym_idx_k, n_sym_spatial)`: an operator slab on the star wedge (§8).
+
+The route-G Fourier tables and local pair action are owned by
+`symmetry_maps.typed_child_G_tables` and
+`symmetry_maps.unfold_reciprocal_pair_local`. They apply the typed
+centroid/G permutations, translation phases, magnetic conjugation and spin
+sandwich in that order; ISDF supplies the parent slab and geometry only.

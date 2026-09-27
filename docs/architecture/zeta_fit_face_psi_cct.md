@@ -52,8 +52,10 @@ action and antiunitary conjugation, all read from `symmetry_maps` through the
 plan. It then evaluates the k correlation and writes C_q for all N_k q at
 `P(None,'x','y')`.
 
-A current channel applies its vertex γ̃^i on the output spin indices after
-transport. The stored faces are never vertex-folded. The four-spinor action is
+The current family sums the three positive feature metrics after transport,
+with a conjugated left vertex (`conjugate_left_vertex=True`). The scalar
+interpolant and its covariance follow the [ISDF equations](../theory/isdf-zeta-vq.md).
+The stored faces are never vertex-folded. The four-spinor action is
 on the [symmetry register](symmetry_register.md), and the Lorentz convention
 is in [four-current wiring](four_current_wiring.md).
 
@@ -118,12 +120,14 @@ the W Dyson solve, the transverse LU and the eigensolvers, never the ζ
 back-solve. Route G applies the factor tile
 by tile ([finalize](zeta_fit_mubatch.md#finalize-v_q-and-the-head-columns)).
 
-**Current channels.** C_q^i is a Hermitian indefinite, signed Gram. The fit
-factors C + δI once per channel with pivoted LU, where
-δ = 1e-12·sign(Re tr C)·|tr C|/μ (`_transverse_lu_ridge`). The sign keeps the
-pairing (sC + sδI)⁻¹(sZ) = (C + δI)⁻¹Z. The indefinite solve always runs at
-the logical extent (`runtime.padding.solve_at_logical`), because pad-extent LU
-round-off is amplified O(1) in the near-null current modes.
+**Current family.** The positive Cartesian-trace metric has one shared
+factor and one right-hand-side store for all three output vertices. The fit
+retains the existing ridged pivoted LU, with δ = 1e-12·Re tr C/μ, at the
+logical centroid extent (`runtime.padding.solve_at_logical`). No spectral
+cut or conditioning threshold changes. Each missing output file trains on
+all three vertices, including when another file is reused. Current cache
+provenance includes `current_pair_training_domain=positive_cartesian_trace_lr_v1`;
+older diagonal fits refit. Charge provenance is unchanged.
 
 Route G applies the factor per G tile, so it is always the local whole-tile
 JAX LU (`factor_c_q` with `batch_reshard`), laid out on the q owners like

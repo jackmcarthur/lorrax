@@ -33,6 +33,9 @@ from common.fft_helpers import local_fftn3
 from common.wfn_transforms import _plane_geometry
 from runtime.padding import axis_mask, pad_to_axis, padded_axis
 
+from symmetry_maps import typed_child_G_tables, unfold_reciprocal_pair_local
+
+
 _XY = ('x', 'y')
 _kernel_cache: dict = {}
 
@@ -115,61 +118,6 @@ def best_owner_orbit_batches(plan, mu_pad: int, n_ranks: int, *, c_max: int):
     return best[1]
 
 
-def typed_child_G_tables(plan, *, fft_grid, sphere_par, gvec_child,
-                         ngk_child, k_child):
-    """The r-space typed ψ action (:func:`symmetry_maps.unfold_wavefunction_local`)
-    as G-space tables, its exact Fourier image.
-
-    The typed child is ``ψ_k(x) = U_k T[ψ_p(S x − t)]`` with the snapped
-    offset ``t = round(N·S·τ)/N`` (the grid permutation's), so on the child's
-    sphere ``c_k(G') = U_k T[c_p(G) e^{-2πi (k̄+G)·t}]`` with
-    ``S^T(k̄+G) = ±(k + G')`` (+ unitary, − antiunitary rows, where T
-    conjugates).  ``sphere_par (n_parent, ngk_par)`` is the parents' sphere
-    index (slot → flat box cell, ``≥ N_r`` on a pad slot;
-    :func:`common.gvec_fft_box.build_sphere_box_index`).  Returns ``(pslot
-    (nk, ngk_c) int32`` parent slot of each child slot (``ngk_par`` for pad
-    slots), ``phase (nk, ngk_c)`` ``e^{-2πi (k̄+G)·t}``, ``anti (nk,) bool)``.
-    """
-    fg = np.asarray(fft_grid, dtype=np.int64)
-    S_all = np.asarray(plan.spatial_ops, dtype=np.int64)
-    tau = np.asarray(plan.translations, dtype=np.float64) / (2.0 * np.pi)
-    n_sym = int(plan.n_sym_spatial)
-    kp = np.asarray(plan.k_parent_frac, dtype=np.float64)
-    kc = np.asarray(k_child, dtype=np.float64)
-    gvc = np.asarray(gvec_child, dtype=np.int64)
-    nk, ngk_c = int(gvc.shape[0]), int(gvc.shape[1])
-    sph = np.asarray(sphere_par, dtype=np.int64)
-    n_par, ngk_par = (int(v) for v in sph.shape)
-    N = int(np.prod(fg))
-    box = np.full((n_par, N), ngk_par, dtype=np.int64)      # flat cell → slot
-    for p_ in range(n_par):
-        live_p = sph[p_] < N
-        box[p_, sph[p_][live_p]] = np.flatnonzero(live_p)
-    pslot = np.full((nk, ngk_c), ngk_par, dtype=np.int32)
-    phase = np.zeros((nk, ngk_c), dtype=np.complex128)
-    anti = np.zeros(nk, dtype=bool)
-    for k in range(nk):
-        p, s = int(plan.irr_idx[k]), int(plan.sym_idx[k])
-        S = S_all[s % n_sym]
-        anti[k] = s >= n_sym
-        t = np.rint(fg * (S @ tau[s % n_sym])) / fg
-        live = np.arange(ngk_c) < int(ngk_child[k])
-        K = (kc[k][None, :] + gvc[k]) * (-1.0 if anti[k] else 1.0)   # = S^T (k̄+G)
-        kg = np.linalg.solve(S.T.astype(np.float64), K.T).T            # k̄ + G
-        G = np.rint(kg - kp[p][None, :]).astype(np.int64)
-        if np.max(np.abs((kg - kp[p]) - G)[live], initial=0.0) > 1e-6:
-            raise ValueError(f"typed_child_G_tables: child k={k} is not an image "
-                             f"of parent {p} under row {s}")
-        flat = (((G % fg) * np.array([fg[1] * fg[2], fg[2], 1])).sum(-1))
-        sl = box[p][flat]
-        if np.any(sl[live] >= int(ngk_par)):
-            raise ValueError(f"typed_child_G_tables: child k={k} has a G outside "
-                             f"parent {p}'s sphere")
-        pslot[k] = np.where(live, sl, int(ngk_par))
-        phase[k] = np.where(live, np.exp(-2j * np.pi * ((kp[p] + G) @ t)), 0.0)
-    return pslot, phase, anti
-
-
 def zeta_plane_tables(gvec_components, ngk_per_q, fft_grid, axis, g_axis):
     """The ζ sphere as a cylinder: its in-plane columns ``zc`` (union over the
     stored q), its axis values ``za`` (mod ``n_a``), and per ``(q, slot)`` the
@@ -187,34 +135,23 @@ def zeta_plane_tables(gvec_components, ngk_per_q, fft_grid, axis, g_axis):
             np.asarray(pad_to_axis(flat.astype(np.int32), g_axis, axis=1)))
 
 
-def _spin_sandwich(U, d):
-    """``(U ⊗ Ū) d`` on the two spin axes (0 and 3) of ``d (s, x, m, s', j)``.
-
-    Written as ``ns²`` elementwise terms rather than an einsum: with a
-    contraction length of ``ns`` (2 or 4) XLA lowers the einsum to eight tiny
-    cuBLAS GEMMs per child k, whereas the elementwise form fuses into the
-    surrounding gathers (docs/dev/QUALITY_PATTERNS.md §11).
-    """
-    ns = int(d.shape[0])
-    Uc = jnp.conj(U)
-    left = jnp.stack([sum(U[a, c] * d[c] for c in range(ns)) for a in range(ns)])
-    return jnp.stack([sum(left[:, :, :, e] * Uc[b, e] for e in range(ns))
-                      for b in range(ns)], axis=3)
-
-
 def make_route_g_kernel(*, mesh: Mesh, kgrid, fft_grid, ns: int, b: int,
                         q_sel, q_axis, q_neg, qvec_frac, n_col: int, n_s: int,
                         plane_from_col, n_pg: int, axis: int, n_src: int, vertices=(0,),
                         c_out: int | None = None, n_blk: int = 1,
+                        sum_vertices: bool = False, conjugate_left_vertex: bool = False,
                         stop_at: str | None = None):
     """Compile-once executable for one μ batch on route G.
 
     Returns ``fn(psi_bar, w_l, w_r, kvecs, g3, xmu, live, cyl, zt, unf, lt) -> rows``,
-    one ``(Q, b, N_G)`` array per vertex of ``vertices`` at ``P(None, ('x','y'),
+    one ``(Q, b, N_G)`` array per vertex of ``vertices`` (one sum when
+    ``sum_vertices=True``) at ``P(None, ('x','y'),
     None)`` (μ-owned; rank p owns the batch slots ``p·c + [0, c)``, ``c = b/P``).
     ``vertices`` are the Lorentz channels μ_L of γ̃^{μ_L}: ``(0,)`` for the
-    charge fit, ``(1, 2, 3)`` for the three current channels, which share
-    every stage but the k-convolution and the accumulate:
+    charge fit, ``(1, 2, 3)`` for the current family. Its positive trace uses
+    ``conjugate_left_vertex=True`` and ``sum_vertices=True``: one summed
+    k-convolution output reaches the spatial transform and accumulator.
+    Without the sum, the neutral kernel returns one output per vertex.
 
     1. ``X_B = ψ(r_μ)`` by a direct DFT of each rank's ψ G slice, one psum;
     2. the pair GEMM in G space on the rank's slice
@@ -296,9 +233,12 @@ def make_route_g_kernel(*, mesh: Mesh, kgrid, fft_grid, ns: int, b: int,
     pair_kernels = []
     for v in vertices:
         p_v, ph_v = _conv_kpair_static_gamma(None if v == 0 else gamma_perm_phase(v), ns)
-        pair_kernels.append(make_fused_conv_kplane(mesh, kgrid, ns, perm_l=p_v, phase_l=ph_v,
-                                                   perm_r=p_v, phase_r=ph_v))
-    n_v = len(vertices)
+        phase_l = np.conj(ph_v) if conjugate_left_vertex else ph_v
+        pair_kernels.append(make_fused_conv_kplane(
+            mesh, kgrid, ns, perm_l=p_v, phase_l=phase_l,
+            perm_r=p_v, phase_r=ph_v))
+    kernel_groups = (tuple(pair_kernels),) if sum_vertices else tuple((k,) for k in pair_kernels)
+    n_v = len(kernel_groups)
     ib = (np.arange(ps) // n_c).astype(np.float64)
     ic = (np.arange(ps) % n_c).astype(np.float64)
     pfc = np.asarray(plane_from_col, dtype=np.int32).reshape(ps)
@@ -310,7 +250,7 @@ def make_route_g_kernel(*, mesh: Mesh, kgrid, fft_grid, ns: int, b: int,
            hash(q_sel.tobytes()), q_axis,
            None if q_neg is None else hash(q_neg.tobytes()), hash(qv.tobytes()),
            int(n_col), int(n_s), hash(pfc.tobytes()), int(n_pg), int(axis), int(n_src),
-           vertices, c_out, n_blk, stop_at)
+           vertices, bool(sum_vertices), bool(conjugate_left_vertex), c_out, n_blk, stop_at)
     hit = _kernel_cache.get(key)
     if hit is not None:
         return hit
@@ -366,11 +306,10 @@ def make_route_g_kernel(*, mesh: Mesh, kgrid, fft_grid, ns: int, b: int,
                     # the typed unfold of the parent's pair projectors to child k
                     p, s_ = irr[k], sym[k]
                     d = D[p].reshape(ns, 2, c, ns, ngk1)
-                    wl = jnp.exp(2j * jnp.pi * (lL[s_].astype(jnp.float64) @ kvecs[p]))
-                    d = jnp.take(d, lperm[s_], axis=2) * wl[None, None, :, None, None]
-                    d = jnp.take(d, pslot[k], axis=-1) * jnp.conj(phase[k])
-                    d = jnp.where(anti[k], jnp.conj(d), d)
-                    d = _spin_sandwich(U[k], d)
+                    d = unfold_reciprocal_pair_local(
+                        d, centroid_perm=lperm[s_], centroid_wraps=lL[s_],
+                        k_parent=kvecs[p], g_slots=pslot[k], g_phase=phase[k],
+                        anti=anti[k], spin=U[k])
                     d = jnp.concatenate([d.reshape(ns, 2 * c_out, ns, -1),
                                          jnp.zeros((ns, 2 * c_out, ns, 1), d.dtype)], -1)
                     cy = jnp.take(d, jnp.clip(ci[k], 0, int(d.shape[-1]) - 1).reshape(-1), axis=-1)
@@ -400,11 +339,13 @@ def make_route_g_kernel(*, mesh: Mesh, kgrid, fft_grid, ns: int, b: int,
                                 * a0[None, :, None] / n_a) * on[None, :, None]   # (Q, n_pg, n_za)
                     d = d.reshape(nk, n_pg, ns, 2 * c_out, ns, ps)
                     out = []
-                    for pair_kernel, acc_v in zip(pair_kernels, acc):
+                    for kernel_group, acc_v in zip(kernel_groups, acc):
                         # The k-convolution reads d where the FFT left it: the Bloch
                         # phase, the L | R split of the 2c slots and the vertex happen
                         # on its load.
-                        Z = pair_kernel(d, bl)                                  # (nk, c, n_pg·ps)
+                        Z = kernel_group[0](d, bl)                              # (nk, c, n_pg·ps)
+                        for pair_kernel in kernel_group[1:]:
+                            Z = Z + pair_kernel(d, bl)
                         if stop_at == 'kconv':
                             out.append(acc_v + jnp.sum(jnp.abs(Z)))
                             continue
@@ -490,6 +431,7 @@ class ZStore:
         """``q_axis``: stored q rows (carrier a multiple of P); ``g_axis``: the
         ζ sphere cut into whole G tiles (divisor = ``G_tile``).  Both are
         ``runtime.padding.PaddedAxis`` records the kernel and the finalize share."""
+        self._closed = False
         self.mesh = mesh
         self.P = _mesh_size(mesh)
         self.q_axis, self.g_axis = q_axis, g_axis
@@ -597,6 +539,9 @@ class ZStore:
         return out
 
     def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
         if self.placement == 'host':
             self._host.clear()
         else:
@@ -857,13 +802,11 @@ def _debug_enabled() -> bool:
 def _logical_solve(solver_kind: str, n_log: int):
     """ζ_q = C_q⁻¹ Z_q at the logical μ extent, through the channel's conditioning seam.
 
-    The charge Gram is PSD: C⁺ = B Bᴴ, the λ > rcond·λ_max eigh cut
-    (:mod:`isdf.cplus`).  A current channel's Gram C^μ is Hermitian
-    INDEFINITE -- that cut would drop its whole negative half -- so the
-    currents keep their own seam from :mod:`isdf.core`, the same arithmetic
-    as every transverse fit: the sign-aware ridged pivoted LU factored once
-    per channel (``'lu'``, operand ``(LU, pivots)``, κ_lb certified at
-    factor time).
+    Charge uses the PSD pseudo-inverse B Bᴴ from :mod:`isdf.cplus`.
+    The common positive current metric retains its ridged LU conditioning
+    from :mod:`isdf.core`; explicit signed-metric callers use the same LU
+    seam. The caller supplies the factor kind, rather than inferring it
+    from a Lorentz component here.
     """
     from isdf import cplus
     from isdf.core import _zeta_logical_solvers

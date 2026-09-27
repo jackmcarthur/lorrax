@@ -3,8 +3,8 @@
 `gw.isdf_fitting._fit_mubatch` runs every fresh ζ fit: the charge channel at
 ns = 1, 2 and 4 (the bispinor charge lift), and the three bispinor current
 channels μ_L = 1, 2, 3, which share one loop. It forms the right-hand side
-Z^{μ_L}_q(μ, G) on the ζ sphere in batches of centroids, then applies each
-channel's C_q⁻¹ one G tile at a time (and, for the charge channel, contracts
+Z_q(μ, G) on the ζ sphere in batches of centroids, then applies the
+family's C_q⁻¹ one G tile at a time (and, for the charge channel, contracts
 V_q in the same pass). The theory is on the
 [ISDF page](../theory/isdf-zeta-vq.md). Code: `isdf.zeta_mubatch` (the kernel,
 `ZStore`, `ZetaG`), `isdf.pair_kernels`, `isdf.cplus`, the transverse factor
@@ -31,7 +31,10 @@ solve afterwards. When the charge channel's L and R windows differ, the LR+RL
 completion Z_q ← Z_q + conj Z_{−q} is applied in r space before the q
 selection, as it is for C_q
 ([normal equations](zeta_fit_face_psi_cct.md#normal-equations)); the current
-channels train on LR alone.
+channels train on LR alone, using the positive Cartesian trace defined on
+the [ISDF page](../theory/isdf-zeta-vq.md). The diagram above shows one
+vertex contraction; the current trace conjugates its left phase and sums
+all three contributions before the spatial FFT.
 
 ## One μ batch
 
@@ -62,8 +65,9 @@ centroid orbits.
 
 Everything through the plane FFT depends only on ψ and the centroids, so the
 three current channels share it: one X_B, one pair GEMM, one all-to-all and
-one set of plane FFTs per batch, then one k-convolution, one accumulator and
-one Z store per channel. The charge fit is the same kernel with one channel.
+one set of plane FFTs per batch. Three k-convolutions feed one sum before
+the spatial FFT, one accumulator and one Z store. The charge fit is the
+same kernel with one channel.
 
 Each batch runs two collectives, the X_B psum and the pair-projector
 all-to-all; `LORRAX_DEBUG_PRINT=1` counts them from the compiled HLO. Every
@@ -143,16 +147,11 @@ G tile (`zeta_mubatch._logical_solve`):
 - **Charge.** C_q is a PSD Gram. The factor is B = V_keep Λ_keep^{-1/2} with
   B Bᴴ = C⁺, keeping λ > `zeta_rcond`·λ_max (`isdf.cplus`,
   [factor and back-solve](zeta_fit_face_psi_cct.md#factor-and-back-solve)).
-- **Currents.** C^μ_q is Hermitian INDEFINITE: the PSD cut would drop its whole
-  negative half, an O(1) error, not a regularization (the P4 gate's red twin
-  measures 0.23 on a ±-spectrum). Route G therefore keeps the transverse fits'
-  own solve: the sign-aware ridged pivoted LU of C + δI with
-  δ = 1e-12·sign(Re tr C)·|tr C|/μ, factored once per channel at the logical
-  extent and certified by κ_lb (`isdf.core.factor_c_q`), and applied per tile
-  as `(LU, pivots)`. Route G always takes the local whole-tile LU; a
-  block-cyclic provider token (`linalg = distributed`) cannot be applied per
-  tile, so under `distributed` the current ζ changes pivot gauge at
-  round-off·κ, as the charge factor did.
+- **Currents.** The positive Cartesian-trace metric retains the ridged LU
+  at the logical extent, shared by all three current files
+  ([factor contract](zeta_fit_face_psi_cct.md#factor-and-back-solve)).
+  The neutral solve seam still accepts signed metrics from explicit
+  callers; the production fit supplies the positive family metric.
 
 No deck key selects the seam: the channel does.
 
@@ -217,9 +216,11 @@ for the loop (charge in `gw_init._prepare_fresh_parent_faces`, currents in
 
 `plan_zeta_route_g` sizes everything from the one device budget,
 `memory_per_device_gb` times the fragmentation target. No deck key or
-environment variable sizes the fit. With `n_vertex` channels (3 for the
-currents) the Z rows, the ζ-cylinder accumulator, the Z/k-conv output rows,
-the factors and the store are priced n_vertex times; everything else once.
+environment variable sizes the fit. `n_vertex` prices the Z rows, the
+ζ-cylinder accumulator, the Z/k-conv output rows, factors and store. The
+current-family planner conservatively retains its missing-channel count;
+the production fit shares one factor, accumulator and store across those
+channels. Repricing that conservative bound is separate from the fit change.
 
 | object | bytes per rank | live |
 |---|---|---|

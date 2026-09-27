@@ -1105,8 +1105,14 @@ def c_q_from_psi_sm(
 	gemm,
 	gamma_L: int = 0,
 	gamma_R: int = 0,
+	conjugate_left_vertex: bool = False,
 ) -> jax.Array:
-	"""Contract raw-parent band projectors and apply fixed vertices after typed unfolding."""
+	"""Contract raw-parent projectors with vertices after typed unfolding.
+
+	Conjugating the left vertex forms a positive transition-feature metric;
+	this is essential for imaginary current vertices. The default retains
+	the ordered response convention.
+	"""
 	n_parent, s_, mu_pk, nb = (int(v) for v in psi_mun_parent.shape)
 	nkx, nky, nkz = kgrid
 	nk = nkx * nky * nkz
@@ -1126,6 +1132,8 @@ def c_q_from_psi_sm(
 			"_c_q_face_parent: psi_nmu_parent shape "
 			f"{tuple(psi_nmu_parent.shape)} != {(n_parent, nb, s_, mu_pk)}.")
 	left_gamma = (None, None) if gamma_L == 0 else _gamma_perm_phase_mu(gamma_L)
+	if conjugate_left_vertex and left_gamma[1] is not None:
+		left_gamma = (left_gamma[0], jnp.conj(left_gamma[1]))
 	right_gamma = (None, None) if gamma_R == 0 else _gamma_perm_phase_mu(gamma_R)
 	px = int(mesh_xy.shape['x'])
 	py = int(mesh_xy.shape['y'])

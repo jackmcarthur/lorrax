@@ -427,13 +427,15 @@ def _zeta_fit_provenance(*, wfn, meta, cfg, band_range_left, band_range_right,
 	# Pauli-reference stamps remain byte-for-byte reusable.
 	if carrier_lift is not None:
 		prov['bispinor_lift'] = str(carrier_lift)
-	# Stamp only the path whose physics changed.  Equal-window charge fits and
-	# every transverse fit retain their byte-identical schema-1 provenance;
+	# Stamp only the training domain whose physics changed;
+	# equal-window charge fits retain their existing provenance.
 	# an old asymmetric LR-only stamp lacks this non-legacy key and therefore
 	# refits instead of entering the ordered LR+RL serving basis.
 	if (int(vertex_mu_L) == 0
 			and tuple(band_range_left) != tuple(band_range_right)):
 		prov['charge_pair_training_domain'] = 'ordered_lr_plus_rl'
+	if int(vertex_mu_L) != 0:
+		prov['current_pair_training_domain'] = 'positive_cartesian_trace_lr_v1'
 	return json.dumps(prov, sort_keys=True)
 
 
@@ -1915,8 +1917,8 @@ def _fit_transverse_zeta_channels(
 
     The missing channels share one μ-batch loop (docs/architecture/
     zeta_fit_mubatch.md): one ψ(G) read samples the current faces and stays
-    resident for the loop, then each channel gets its own C_q^μ, factor and
-    ``zeta_q_mu{μ}.h5``.
+    resident for the loop. All three vertices train one scalar interpolant;
+    missing files share its factor and store, keeping per-vertex headers.
     """
     from gw.isdf_fitting import fit_zeta_to_h5
     print_fn(f"\n  [bispinor] resolving ζ^{{μ_L=1,2,3}} on current-density "

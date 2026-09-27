@@ -190,15 +190,12 @@ unique $\mathbf q=\Gamma$, $\mathbf G=0$ slot. The spatial-metric sign
 (`vcoul.COULOMB_GAUGE_TT_SIGN = -1`) is applied once on the way out; no
 vertex or Σ contraction compensates it.
 
-**ζ fits, by channel.** Every channel takes the μ-batch fit
-([ζ μ-batch](zeta_fit_mubatch.md)). The three current channels are one fit
-on their own centroids: one ψ(G) read, then per batch one X_B, pair GEMM,
-all-to-all and set of plane FFTs shared by all three, and one k-convolution
-(γ̃^{μ_L} on its load), accumulator and Z store per channel. Each channel
-keeps its own C_q^μ, its sign-aware ridged LU
-([the solve seam](zeta_fit_mubatch.md#the-solve-seam)) and its canonical
-q-IBZ output file `zeta_q_mu{μ_L}.h5`. `gw_jax.zeta_fit_transverse` times
-the fit.
+**ζ fits, by family.** The current centroids train one positive Cartesian
+trace and share its scalar interpolant, factor and right-hand-side store.
+The [fit owner](zeta_fit_face_psi_cct.md) defines conditioning and cache
+provenance; [route G](zeta_fit_mubatch.md) defines the distributed loop.
+The three output views keep their canonical per-vertex q-IBZ file headers.
+`gw_jax.zeta_fit_transverse` times the complete current-family fit.
 
 ## Stage 3: screening
 

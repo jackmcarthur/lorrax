@@ -193,6 +193,7 @@ from symmetry_maps.directed_edges import (
     directed_edge_orbit_table,
     q_stencil_orbit_table,
 )
+from symmetry_maps.reciprocal import typed_child_G_tables, unfold_reciprocal_pair_local
 from symmetry_maps.maps import (
     KStarMap,
     SpatialOperatorTables,
@@ -322,6 +323,8 @@ from symmetry_maps.qe_schema import (
 from symmetry_maps._compat import RENAMES, RETIREMENT_GATE  # noqa: F401
 
 __all__ = [
+    "typed_child_G_tables",
+    "unfold_reciprocal_pair_local",
     # tables
     "SymMaps", "SpatialOperatorTables", "build_spatial_operator_tables",
     "kgrid_shift_map", "bgw_integer_q_to_fractional",

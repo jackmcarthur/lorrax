@@ -53,10 +53,23 @@ action ([symmetry §3–4](symmetry.md)). \(C_q\) is the Gram matrix of the
 training pair products sampled at the centroids, so it is Hermitian positive
 semidefinite.
 
-A current (bispinor) channel inserts its vertex \(\tilde\gamma^i\) on the
-output spinor indices after transport. Its \(C_q\) is then a Hermitian
-indefinite, signed Gram
-([four-current wiring](../architecture/four_current_wiring.md)).
+**Current-family fit.** Stack the three Cartesian transition features
+\(J_i\) and solve one scalar interpolant for the entire family:
+
+$$
+C^T_q=\sum_{i=1}^3 J_{i,q}(\mu)J_{i,q}(\nu)^*,\qquad
+Z^T_q=\sum_{i=1}^3 J_{i,q}(\mu)J_{i,q}(r)^*,\qquad
+\zeta^T_q=(C^T_q)^{-1}Z^T_q.
+$$
+
+The left vertex in the pair-projector contraction is conjugated. In the
+present gamma convention this gives \(C_x-C_y+C_z\) and the same combination
+of right-hand sides; a sum of the signed response metrics is not this Gram.
+Orthogonal Cartesian rotations cancel in the trace, and antiunitary group
+operations conjugate the scalar metric. One scalar interpolant therefore
+commutes with every current rotation, whereas three independently fitted
+diagonal interpolants are not closed under a general Cartesian rotation.
+All group actions remain owned by the [symmetry service](symmetry.md).
 
 **Conjugation closure.** The charge windows are asymmetric: \(L\) holds every
 occupied state plus the \(\Sigma\) conduction window, and \(R\) holds the

@@ -209,7 +209,7 @@ class ZetaChannel(NamedTuple):
 def _fit_mubatch(
     *, wfn, meta, centroid_indices, mesh_xy, plan, parent_psi,
     band_range_full, bispinor, bispinor_lift, k_unfold_plan,
-    weight_l_face, weight_r_face, channels,
+    weight_l_face, weight_r_face, channels, training_vertices,
     distrib_la_batched_route, n_rmu_solve,
     q_irr_full_idx, q_neg_idx, q_frac, sphere_idx, ngk_per_q,
     mu_basis, gvec_components, scratch_dir, print_fn,
@@ -219,7 +219,8 @@ def _fit_mubatch(
     See docs/architecture/zeta_fit_mubatch.md.  ``plan`` is the planner's
     :class:`gw.gflat_memory_model.MuBatchPlan`; ``channels`` the
     :class:`ZetaChannel` list.  The channels share every stage of a batch but
-    the k-convolution and the accumulate; each has its own Z store.  Writes
+    the k-convolution; current vertices sum before the spatial transform
+    and share one Z store.  Writes
     ``zeta_q_G`` into each channel's file G tile by G tile, one file at a
     time, and returns ``({μ_L: ZetaG}, n_batches_run, n_batches)``.
     """
@@ -236,6 +237,7 @@ def _fit_mubatch(
     ngkmax = int(sphere_idx.shape[1])
     kgrid = tuple(int(v) for v in meta.kgrid)
     vertices = tuple(int(ch.vertex) for ch in channels)
+    common_current = vertices != (0,)
     # The fit window's LOGICAL bands: band_range_full is the P-padded transport
     # range, whose tail past the user's last band is an exact-zero pad on the
     # faces (PsiGStore zeroes it the same way); route G reads the file, so it
@@ -328,7 +330,8 @@ def _fit_mubatch(
         q_sel=q_irr_full_idx, q_axis=q_axis, q_neg=q_neg_idx, qvec_frac=q_frac,
         n_col=int(cyl[0].shape[1]), n_s=int(cyl[0].shape[2]),
         plane_from_col=np.asarray(jax.device_get(cyl[2])), n_pg=int(plan.r_sub),
-        axis=axis, n_src=n_par, vertices=vertices, c_out=c_out, n_blk=n_blk)
+        axis=axis, n_src=n_par, vertices=training_vertices,
+        sum_vertices=common_current, conjugate_left_vertex=common_current, c_out=c_out, n_blk=n_blk)
     kernel = zmb.make_route_g_kernel(**kern_args)
     split_kernels = {}
     if debug_print_enabled():
@@ -341,7 +344,8 @@ def _fit_mubatch(
         packed_from_slot=mb.slot_of_packed, n_batch=int(mb.n_batch),
         scratch_path=os.path.join(
             scratch_dir, "zeta_Z_store.scratch.h5" if v == 0
-            else f"zeta_Z_store_mu{v}.scratch.h5")) for v in vertices]
+            else f"zeta_Z_store_mu{v}.scratch.h5"))
+        for v in (vertices[:1] if common_current else vertices)]
     canon = np.asarray(k_unfold_plan.layout.axis.packed_to_canonical)
     x_cent = np.asarray(centroid_indices, dtype=np.float64) / np.asarray(fft_grid)
     ops = (_device_put_process_local(w_l, rep), _device_put_process_local(w_r, rep),
@@ -439,7 +443,8 @@ def _fit_mubatch(
 
     # ---- ζ = C⁻¹ Z, held lazily; written only for a file consumer --------
     zetas = {}
-    for ch, store in zip(channels, stores):
+    for index, ch in enumerate(channels):
+        store = stores[0 if common_current else index]
         zeta_g = zmb.ZetaG(
             store, mesh=mesh_xy, L_q=ch.L_q, lu_piv=ch.lu_piv,
             solver_kind=ch.solver_kind,
@@ -465,8 +470,9 @@ def _fit_mubatch(
                     "zeta_writes_complete")
             print_fn(f"  μ-batch ζ file (μ_L={ch.vertex}) written in "
                      f"{time.perf_counter() - t_w:.2f}s")
-        print_fn(store.receipt())
         zetas[int(ch.vertex)] = zeta_g
+    for store in stores:
+        print_fn(store.receipt())
     return zetas, n_run, n_batch
 
 
@@ -502,8 +508,8 @@ def fit_zeta_to_h5(
     ``output_files`` maps μ_L to its ζ file: ``{0: path}`` for the charge
     channel, ``{1: …, 2: …, 3: …}`` (or the missing subset) for the bispinor
     current channels, which share one μ-batch loop
-    (docs/architecture/zeta_fit_mubatch.md).  Each channel owns its C_q, its
-    factor and its file.  Returns ``(peak_bytes, {μ_L: ZetaG})``.
+    (docs/architecture/zeta_fit_mubatch.md).  The current files share the
+    positive Cartesian-trace fit, one factor and one Z store.  Returns ``(peak_bytes, {μ_L: ZetaG})``.
     """
     if k_unfold_plan is None or psi_nmu_parent is None or psi_mun_parent is None:
         raise ValueError("fit_zeta_to_h5 requires a typed plan and both raw-parent faces.")
@@ -522,6 +528,9 @@ def fit_zeta_to_h5(
             f"fit_zeta_to_h5: channels {vertices} must be (0,) (charge) or a "
             "subset of the current channels (1, 2, 3).")
     transverse = vertices != (0,)
+    # A scalar interpolant shared by all current components commutes with
+    # every Cartesian rotation, including nonmonomial magnetic operations.
+    training_vertices = (1, 2, 3) if transverse else (0,)
     mem_probe("zeta_fit_start")
 
     # Two μ extents (common/meta.py): ``n_rmu`` is the LOGICAL centroid count
@@ -675,7 +684,7 @@ def fit_zeta_to_h5(
     # from files (a family accepted for reuse).  The caller decides.
     _write_file = bool(write_zeta_file)
 
-    # ========== per channel: C_q, its factor, its file ==========
+    # ========== one metric and factor per centroid family ==========
     from distrib_la import gemm_plan as _gemm_plan
     _mu_gemm = int(k_unfold_plan.n_centroid_packed)
     # C's enclosing JIT compiles this GEMM; standalone dummy warmup would
@@ -685,65 +694,71 @@ def fit_zeta_to_h5(
         nq=int(k_unfold_plan.n_parent), dtype=jnp.complex128, layout=layout,
         warmup=False)
     print_fn(f"  {_face_gemm.describe()}")
-    channels = []
-    for v in vertices:
-        with timing.section("zeta_fit.CCT"):
-            # γ̃^{μ_L} on both endpoints after the typed unfold: C_q is the
-            # channel's interpolation metric (Hermitian indefinite for μ_L ≠ 0).
-            print_fn(f"  C_q on raw parents ({'charge γ̃^0=I' if v == 0 else f'current γ̃^{v}'}): "
-                     f"{k_unfold_plan.n_parent} -> {nk_tot} k rows")
-            C_q = c_q_from_psi_sm(
+    # One positive C=sum_i C_i and one factor for the current family.
+    v = training_vertices[0]
+    with timing.section("zeta_fit.CCT"):
+        # The current training features are stacked in Cartesian space.
+        # Conjugating the left vertex makes their trace a positive metric.
+        print_fn(f"  C_q on raw parents ({'charge γ̃^0=I' if v == 0 else 'positive Cartesian current trace'}): "
+                 f"{k_unfold_plan.n_parent} -> {nk_tot} k rows")
+        C_q = None
+        for vertex in training_vertices:
+            part = c_q_from_psi_sm(
                 kgrid=kgrid, mesh_xy=mesh_xy,
                 psi_mun_parent=psi_mun_parent, psi_nmu_parent=psi_nmu_parent,
                 weight_l=weight_l_face, weight_r=weight_r_face,
                 gemm=_face_gemm, k_unfold_plan=k_unfold_plan,
-                gamma_L=v, gamma_R=v)
-            C_q_flat = jax.lax.with_sharding_constraint(
-                C_q.reshape(nq, n_rmu_padded, n_rmu_padded), flat_shard)
-            del C_q
-            if n_rmu_solve == n_rmu_padded and n_rmu_padded > n_rmu:
-                # Interleaved pad slots (orbit-packed order): C_q's pad rows and
-                # columns are exact zeros.  Put C's own MEAN DIAGONAL (tr C/n per
-                # q) on the pad diagonal: the factor is nonsingular, Z's zero pad
-                # rows give zeta_pad = 0, and the pad eigenvalues sit inside the
-                # active spectrum (a unit pad would BE lambda_max when C's scale
-                # is small, and the cut would drop real modes: Si leg 20, 39 meV).
-                # Rank-local by construction (Fe3GeTe2 P36/P16 OOM, 2026-09-21).
-                C_q_flat = add_pad_diagonal_sharded(
-                    C_q_flat, mu_basis.active_mask, float(n_rmu), mesh_xy=mesh_xy)
-            if _q_neg_idx is not None:
-                C_q_flat = complete_ordered_pair_normal_equations(
-                    C_q_flat, _q_neg_idx)
-            # IBZ cascade: slice C_q to the stored rows before the per-q factor.
-            if write_ibz_only and getattr(sym, 'q_irr_full_idx', None) is not None:
-                from symmetry_maps import slice_q_full_to_ibz
-                C_q_flat = slice_q_full_to_ibz(
-                    C_q_flat, sym.q_irr_full_idx, out_sharding=flat_shard)
-            C_q_flat.block_until_ready()
+                gamma_L=vertex, gamma_R=vertex, conjugate_left_vertex=transverse)
+            C_q = part if C_q is None else C_q + part
+        del part
+        C_q_flat = jax.lax.with_sharding_constraint(
+            C_q.reshape(nq, n_rmu_padded, n_rmu_padded), flat_shard)
+        del C_q
+        if n_rmu_solve == n_rmu_padded and n_rmu_padded > n_rmu:
+            # Interleaved pad slots (orbit-packed order): C_q's pad rows and
+            # columns are exact zeros.  Put C's own MEAN DIAGONAL (tr C/n per
+            # q) on the pad diagonal: the factor is nonsingular, Z's zero pad
+            # rows give zeta_pad = 0, and the pad eigenvalues sit inside the
+            # active spectrum (a unit pad would BE lambda_max when C's scale
+            # is small, and the cut would drop real modes: Si leg 20, 39 meV).
+            # Rank-local by construction (Fe3GeTe2 P36/P16 OOM, 2026-09-21).
+            C_q_flat = add_pad_diagonal_sharded(
+                C_q_flat, mu_basis.active_mask, float(n_rmu), mesh_xy=mesh_xy)
+        if _q_neg_idx is not None:
+            C_q_flat = complete_ordered_pair_normal_equations(
+                C_q_flat, _q_neg_idx)
+        # IBZ cascade: slice C_q to the stored rows before the per-q factor.
+        if write_ibz_only and getattr(sym, 'q_irr_full_idx', None) is not None:
+            from symmetry_maps import slice_q_full_to_ibz
+            C_q_flat = slice_q_full_to_ibz(
+                C_q_flat, sym.q_irr_full_idx, out_sharding=flat_shard)
+        C_q_flat.block_until_ready()
 
-        with timing.section("zeta_fit.cholesky"):
-            # Route G applies a WHOLE-TILE factor on each G tile: the charge
-            # channel's rank-truncated pseudo-inverse, or a current channel's
-            # local pivoted LU.
-            _kind = 'lu' if v != 0 else _resolve_solver_kind(
-                0, solver_kind,
-                n_rmu=n_rmu_solve, nq=int(C_q_flat.shape[0]))
-            _factor = factor_c_q(
-                C_q_flat, mesh_xy, vertex_mu_L=v,
-                n_rmu_logical=n_rmu_solve, solver_kind=_kind,
-                zeta_rcond=zeta_rcond)
-            # The charge factor is one array; a current factor is (factor, piv).
-            L_q, lu_piv = _factor if v != 0 else (_factor, None)
-            jax.block_until_ready(L_q)
-            print_fn(f"  μ_L={v} factor: {_kind} -> "
-                     f"{'hoisted pivoted LU' if lu_piv is not None else 'whole-tile'} "
-                     f"{tuple(L_q.shape)}, back-solve on the q owners")
-        with timing.section("zeta_fit.factor_residency"):
-            L_q, lu_piv = zeta_factor_resident(
-                L_q, lu_piv, mesh_xy, solver_kind=_kind)
-        del C_q_flat
-        gc.collect()
+    with timing.section("zeta_fit.cholesky"):
+        # Route G applies a WHOLE-TILE factor on each G tile: the charge
+        # channel's rank-truncated pseudo-inverse, or the shared current
+        # metric's ridged pivoted LU.
+        _kind = 'lu' if v != 0 else _resolve_solver_kind(
+            0, solver_kind,
+            n_rmu=n_rmu_solve, nq=int(C_q_flat.shape[0]))
+        _factor = factor_c_q(
+            C_q_flat, mesh_xy, vertex_mu_L=v,
+            n_rmu_logical=n_rmu_solve, solver_kind=_kind,
+            zeta_rcond=zeta_rcond)
+        # The charge factor is one array; a current factor is (factor, piv).
+        L_q, lu_piv = _factor if v != 0 else (_factor, None)
+        jax.block_until_ready(L_q)
+        print_fn(f"  μ_L={v} factor: {_kind} -> "
+                 f"{'hoisted pivoted LU' if lu_piv is not None else 'whole-tile'} "
+                 f"{tuple(L_q.shape)}, back-solve on the q owners")
+    with timing.section("zeta_fit.factor_residency"):
+        L_q, lu_piv = zeta_factor_resident(
+            L_q, lu_piv, mesh_xy, solver_kind=_kind)
+    del C_q_flat
+    gc.collect()
 
+    channels = []
+    for v in vertices:
         # zeta_q.h5 carries the source WFN's mf_header verbatim and an
         # isdf_header with the ζ-specific metadata.  SlabIO(mode='w') creates
         # the inode collectively so H5Fcreate applies the Lustre striping
@@ -778,7 +793,7 @@ def fit_zeta_to_h5(
         band_range_full=band_range_full, bispinor=bispinor,
         bispinor_lift=bispinor_lift, k_unfold_plan=k_unfold_plan,
         weight_l_face=weight_l_face, weight_r_face=weight_r_face,
-        channels=channels,
+        channels=channels, training_vertices=training_vertices,
         distrib_la_batched_route=distrib_la_batched_route,
         n_rmu_solve=n_rmu_solve, q_irr_full_idx=q_irr_full_idx,
         q_neg_idx=_q_neg_idx, q_frac=q_irr_frac,
