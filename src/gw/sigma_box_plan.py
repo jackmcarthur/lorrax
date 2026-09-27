@@ -41,13 +41,18 @@ from gw.minimax_screening import MinimaxNodes
 from gw.mpa.sigma_windows import SharedSigmaWindow, sigma_pole_edges
 from gw.ppm_windows import _SigmaWindow
 from minimax import (
+    analytic_box_rule,
     analytic_line_box_rule,
     UniformRule,
     boundary_samples,
-    build_uniform_rule,
     rule_roundoff_amplification,
     uniform_rule_solver_identity,
 )
+
+#: The box-rule builder: derived nodes and counts, weights from one linear
+#: solve (``minimax.analytic_box``), certified on the box boundary; no node is
+#: optimized, so a cold plan costs about a second per large window.
+_BOX_RULE_BUILDER = analytic_box_rule
 
 
 _FACTOR_GROWTH_CAP = 30.0
@@ -63,9 +68,11 @@ _BOX_SIGN_FRACTION = 0.7
 #: Pad toward zero for a sign-definite SC window: 0.5 of its distance escaped by 1.6% on TaAs 8^3
 #: map 1 and 0.25 again at map 2 (semimetal valence state 30 -> 15 -> 6 meV from E_F); 0.05 floors it below 1 meV.
 _SC_ZERO_SIDE_CAP = 0.05
-#: v5: rules are built on outward-snapped boxes (_build_box); v4 entries were
-#: built on the raw request and are not served, so a warm cache equals a cold one.
-_RULE_CACHE_SCHEMA = "sigma-box-ry-v5"
+#: v7: derived rules (bent contour + sector rule, ``minimax.analytic_box``)
+#: accepted on the term mass in the box's currency; v6 (csc + sine, strip
+#: count) and fitted v5 entries are not served, so a run never mixes
+#: families.  v5: rules are built on outward-snapped boxes (_build_box).
+_RULE_CACHE_SCHEMA = "sigma-box-ry-v7"
 #: The run-independent rule table's entry format and key definition
 #: (:func:`_rule_table_key`); a new value opens a new namespace.
 _RULE_TABLE_FORMAT = "sigma-box-table-v1"
@@ -535,8 +542,8 @@ def _write_rule_archive(path, rule, noise_amplification, digest, **extra):
 # ---------------------------------------------------------------- rule table
 # The run-local request scope above is a SERVING policy: containment inside
 # one physical scope, so sector calls and restarts share rules. The table
-# below is a MEMO of the builder: ``build_uniform_rule(build_box, eps,
-# kappa_cap)`` reads no clock and pins its BLAS threads, so its result is a
+# below is a MEMO of the builder: ``_BOX_RULE_BUILDER(build_box, eps,
+# mass_cap)`` reads no clock and pins its BLAS threads, so its result is a
 # function of the snapped build box, the currency and the solver identity
 # (claim 2737). A hit returns the bytes a cold build returns, so a warm run
 # equals the cold run that wrote the table, and no run's answer depends on
@@ -561,7 +568,7 @@ def resolve_sigma_rule_table_dir(cache_dir):
     return os.path.join(str(default_cache_root().parent), "sigma_box_rules")
 
 
-def _rule_table_key(build_box, eps, relative, kappa_cap):
+def _rule_table_key(build_box, eps, relative, mass_cap):
     """Everything a builder call's result depends on, JSON-ready.
 
     ``builder`` names the function that answers: a patched builder (a test
@@ -569,11 +576,11 @@ def _rule_table_key(build_box, eps, relative, kappa_cap):
     """
     return {
         "format": _RULE_TABLE_FORMAT, "schema": _RULE_CACHE_SCHEMA,
-        "builder": (f"{build_uniform_rule.__module__}."
-                    f"{build_uniform_rule.__qualname__}"),
+        "builder": (f"{_BOX_RULE_BUILDER.__module__}."
+                    f"{_BOX_RULE_BUILDER.__qualname__}"),
         "box": [float(value) for value in build_box], "eps": float(eps),
         "relative": bool(relative),
-        "kappa_cap": None if kappa_cap is None else float(kappa_cap),
+        "mass_cap": None if mass_cap is None else float(mass_cap),
         "solver": uniform_rule_solver_identity(),
     }
 
@@ -715,19 +722,15 @@ def _build_box(box, eta, *, widen):
 
     ``widen`` adds 1% of the width to the far edges (|x| > 3 eta) so nearby
     SC maps and sector calls hit by containment. The snap makes the rule a
-    function of a grid cell rather than of the exact request: the builder is
-    a nonlinear fit with many certified local solutions, so a request moved
-    by round-off (extreme shared-pole edges differ 1e-9-4e-8 relative between
-    two exact GEMM orders) otherwise lands on a different rule. Every Fe 4^3
-    bispinor window rule differed between the face and band-complete ψ
-    contraction orders, and
-    eqp1 by 0.32 meV (P2-E, 2026-09-24). On the 1e-4 grid a perturbed
-    request maps to the same build box, hence the same rule bit for bit,
-    unless it straddles a cell edge (probability ~ perturbation / 1e-4).
-    The cell is kept that fine because the fixed-N bracket accepts node
-    counts in 10% steps: a marginal certification flips when its box grows,
-    and 0.1% cells added 5% tau pairs on CrI3 8x8 SC (1e-4 cells: see the
-    commit).
+    function of a grid cell rather than of the exact request: a request
+    moved by round-off (extreme shared-pole edges differ 1e-9-4e-8 relative
+    between two exact GEMM orders) otherwise lands on a different rule (the
+    fitted builder of P2-E moved Fe 4^3 bispinor eqp1 by 0.32 meV this way,
+    2026-09-24). On the 1e-4 grid a perturbed request maps to the same build
+    box, hence the same rule bit for bit, unless it straddles a cell edge
+    (probability ~ perturbation / 1e-4). The cell is kept that fine because
+    the count ladder moves in 10% steps: a marginal certification flips when
+    its box grows.
     """
     if widen:
         extra = 0.01 * max(box[1] - box[0], eta)
@@ -771,21 +774,18 @@ def _noise_amplification_cap():
     return _RUNTIME_NOISE_BUDGET / _RUNTIME_NOISE_EPSILON
 
 
-def _fit_rule(spec, eps, cache_dir, eta, *, cache_build_widen=True,
-              attempts=None):
+def _fit_rule(spec, eps, cache_dir, eta, *, cache_build_widen=True):
     """Look up or build one window's rule and accept it; never write the cache.
 
     The lookup reads only certificates written before this plan: the plan's
     own builds are stored after every rank has looked up (see
     :func:`fit_sigma_box_specs`), so no window's choice depends on how far
-    another rank has got. ``attempts`` restricts a crossing build to one
-    range of its fixed-N bracket (``build_uniform_rule``); ``None`` is
-    returned when that range does not certify.
+    another rank has got.
     """
     requested_box = spec["box"]
     # This is exactly the builder's default currency predicate.  It is used
     # here only to search cache metadata; cache misses still leave the choice
-    # to build_uniform_rule(relative=None).
+    # to _BOX_RULE_BUILDER(relative=None).
     relative = requested_box[0] > 0.0 or requested_box[1] < 0.0
     noise_amplification_cap = _noise_amplification_cap()
     analytic_line = (bool(spec.get("analytic_line")) and not relative
@@ -809,36 +809,23 @@ def _fit_rule(spec, eps, cache_dir, eta, *, cache_build_widen=True,
         else:
             build_box = _build_box(requested_box, eta, widen=(
                 cache_dir is not None and cache_build_widen))
-            build_kwargs = {}
-            if relative:
-                # For a sign-definite rule the service's kappa is
-                # sum|term|/|Q|, while Sigma's noise amplification is
-                # |d|*sum|term|.  The certified relative sup error gives
-                # |d Q(d)| <= 1 + eps, so this cap is sufficient for the
-                # executor's absolute noise condition.  Crossing
-                # rules use peak-relative term mass instead and retain the
-                # service's ordinary cancellation cap.
-                build_kwargs["kappa_cap"] = (
-                    noise_amplification_cap / (1.0 + eps))
-            # The table memoizes this builder call: the attempts range is not
-            # in the key because the stored rule is the window's decided one.
+            # The builder's ladder steps on the executor's own noise gate:
+            # the term mass rho*sum|w e^{itd}| in the box's currency (rho =
+            # |d| or eta), the quantity _accept_rule bounds below.
+            build_kwargs = {"mass_cap": noise_amplification_cap}
             table = resolve_sigma_rule_table_dir(cache_dir)
             entry = None
             if table is not None:
                 table_key = _rule_table_key(
                     build_box, eps, build_box[0] > 0.0 or build_box[1] < 0.0,
-                    build_kwargs.get("kappa_cap"))
+                    noise_amplification_cap)
                 entry, table_warning = _rule_table_lookup(table, table_key)
                 if table_warning is not None:
                     cache_lookup_warnings += (table_warning,)
             if entry is not None:
                 rule, rule_table = entry[0], "hit"
             else:
-                if attempts is not None and not relative:
-                    build_kwargs["attempts"] = attempts
-                rule = build_uniform_rule(build_box, eps, **build_kwargs)
-                if rule is None:
-                    return None
+                rule = _BOX_RULE_BUILDER(build_box, eps, **build_kwargs)
                 rule_table = "off" if table is None else "built"
             # A table hit is this plan's build in every later step (the
             # request-scope store and _serve_from_plan), so warm equals cold.
@@ -978,12 +965,12 @@ def _serve_from_plan(specs, fits, eps, cache_dir):
 
 
 def _fit_cost(spec, eta):
-    """Predicted builder cost, only to balance ranks: a crossing rule's node
-    count follows its short side in units of eta (CrI3 8x8: 113-129 nodes,
-    4-9 s); a sign-definite rule is a few nodes (0.5-1.5 s)."""
+    """Predicted builder cost, only to balance ranks: a crossing rule's weight
+    solve grows with its node count, which follows the box width in units of
+    eta; a sign-definite rule is a few tens of nodes."""
     if spec["kind"] != "crossing":
         return 1.0
-    return 1.0 + min(-float(spec["box"][0]), float(spec["box"][1])) / eta
+    return 1.0 + (float(spec["box"][1]) - float(spec["box"][0])) / eta
 
 
 def _rank_assignment(costs, world):
@@ -1000,61 +987,25 @@ def _rank_assignment(costs, world):
     return owned
 
 
-def _bracket_tasks(specs, costs, world):
-    """``(window, attempts, cost)`` tasks: crossing builds split across ranks.
-
-    A crossing rule is a fixed-N bracket of 2-3 solves of 3-10 s each after a
-    3-6 s setup (CrI3 8x8 SC, val:resonant at 248 and 269 nodes), serial on
-    one rank while the other ranks finish their sign-definite windows in a
-    few seconds. A window whose predicted cost is a share ``f`` of the plan
-    gets ``floor(f * world)`` tasks, and at least two once ``f * world >= 1``:
-    single attempts ``0, 1, ...`` and the tail (the remaining attempts and
-    the fallback). One dominant window takes three of four ranks and leaves
-    one for the sign-definite windows; two (the SC map-0 one-shot and padded
-    rules) take two each. Rounding half up gave the lone window a fourth,
-    wasted attempt and stacked the small windows on its ranks (CrI3 8x8 SC
-    map 1: 15.7 s against 12.2 s).
-    Every task repeats the setup; the window's wall becomes one setup plus
-    its longest attempt instead of the sum. Analytic lines and sign-definite
-    windows stay whole.
-    """
-    total = float(sum(costs)) or 1.0
-    tasks = []
-    for index, (spec, cost) in enumerate(zip(specs, costs)):
-        share = world * cost / total
-        split = (1 if world < 2 or share < 1.0 or spec.get("analytic_line")
-                 or spec["kind"] != "crossing" else max(2, int(share)))
-        if split < 2:
-            tasks.append((index, None, cost))
-            continue
-        ranges = [(j, j + 1) for j in range(split - 1)] + [(split - 1, None)]
-        tasks.extend((index, attempts, cost / split) for attempts in ranges)
-    return tasks
-
-
 def _parallel_fits(specs, worker, costs):
     """Fit independent windows once across ranks and replicate small rules.
 
-    A crossing build may run as several attempt ranges
-    (:func:`_bracket_tasks`); its window takes the first range, in attempt
-    order, that returns a rule or refuses, which is the serial build's
-    result: the node-count sequence does not depend on the solves and every
-    rank runs the same BLAS configuration. ``worker(index, attempts)``.
+    Each window is built whole on one rank (:func:`_rank_assignment`); the
+    rule does not depend on the rank, since every rank runs the same BLAS
+    configuration. ``worker(index)``.
     """
     rank, world = int(process_rank()), int(process_count())
-    tasks = _bracket_tasks(specs, costs, world)
     local = []
-    for task in _rank_assignment([cost for _, _, cost in tasks], world)[rank]:
-        index, attempts, _cost = tasks[task]
+    for index in _rank_assignment(list(costs), world)[rank]:
         started = time.perf_counter()
         try:
-            value = worker(index, attempts)
+            value = worker(index)
             error = None
         except Exception as exc:  # refusals cross ranks as data, then raise
             value = None
             error = f"{type(exc).__name__}: {exc}"
         local.append({
-            "index": index, "task": task, "source_rank": rank, "value": value,
+            "index": index, "source_rank": rank, "value": value,
             "error": error, "wall_seconds": time.perf_counter() - started,
         })
     if world == 1:
@@ -1075,18 +1026,10 @@ def _parallel_fits(specs, worker, costs):
         shards = [pickle.loads(np.ascontiguousarray(
             gathered[source, :int(length)]).tobytes())
                   for source, length in enumerate(lengths)]
-    done = sorted((row for shard in shards for row in shard),
-                  key=lambda row: row["task"])
-    if [row["task"] for row in done] != list(range(len(tasks))):
+    rows = sorted((row for shard in shards for row in shard),
+                  key=lambda row: row["index"])
+    if [row["index"] for row in rows] != list(range(len(specs))):
         raise RuntimeError("Sigma box planner did not gather every window")
-    rows = []
-    for index in range(len(specs)):
-        ranges = [row for row in done if row["index"] == index]
-        # Tasks are in attempt order; the tail always decides.
-        decided = next(row for row in ranges
-                       if row["error"] is not None or row["value"] is not None)
-        rows.append(dict(decided, wall_seconds=max(
-            row["wall_seconds"] for row in ranges)))
     refusal = next((row for row in rows if row["error"] is not None), None)
     if refusal is not None:
         raise RuntimeError(refusal["error"])
@@ -1133,9 +1076,9 @@ def fit_sigma_box_spec_groups(groups, eta_ry, *, eps, cache_dir):
     if not 0.0 < tolerance < 1.0:
         raise ValueError("sigma_quadrature_eps must lie in (0, 1)")
     fits, fit_rows = _parallel_fits(
-        rows, lambda index, attempts: _fit_rule(
+        rows, lambda index: _fit_rule(
             rows[index], tolerance, cache_dir, eta,
-            cache_build_widen=widen[index], attempts=attempts),
+            cache_build_widen=widen[index]),
         [_fit_cost(spec, eta) for spec in rows])
     if cache_dir is None:
         return [(fits[lo:hi], fit_rows[lo:hi]) for lo, hi in bounds]
