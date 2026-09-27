@@ -168,6 +168,13 @@ class CrystalData:
             children = {c.tag.split("}")[-1]: c for c in sym_elem}
             if "rotation" not in children:
                 continue
+            # <symmetries> lists all nrot lattice operations; only the nsym
+            # tagged crystal_symmetry belong to the crystal (magnetic runs
+            # keep a subgroup).
+            info_el = children.get("info")
+            if (info_el is not None and info_el.text
+                    and info_el.text.strip() != "crystal_symmetry"):
+                continue
             R = _vec(children["rotation"].text).reshape(3, 3)
             rotations.append(np.round(R).astype(int))
             tau = (_vec(children["fractional_translation"].text)
