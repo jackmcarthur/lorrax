@@ -145,7 +145,9 @@ carries the direct head (`no_local_fields`) instead.
   The symmetry service transports the product into 1 CC, 3 CT/TC or 9 TT
   full-q blocks, with both centroid axes distributed over all P ranks.
   A full TT result costs `9·nk_tot·M_T_packed²·16/P` bytes per rank;
-  parent products and factors are admitted beside it. Endpoint classes are
+  parent products and factors are admitted beside it. Factors retain centroid
+  and pole axes on opposite processor axes; no pole-column replication.
+  Endpoint classes are
   submitted without host fences, so a single-class lifetime is not implied.
 
 ## 2026-09-06 — Covariant Γ photon completion

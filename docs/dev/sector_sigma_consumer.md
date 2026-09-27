@@ -24,17 +24,17 @@ The independently stored instantaneous `W_infinity-V` is contracted once with
 the equal-time occupied projector through `photon_sigma.contract_lorentz_blocks`
 in its exchange mode. The dispatch keeps bare V exchange and does not apply a
 static screened-current approximation. The constant carries no extra volume
-factor, transverse sign or Coulomb-hole half. Photon heads are not part of the
-sector handle and are unsupported there.
+factor, transverse sign or Coulomb-hole half. The direct photon head, when
+requested on a supported bulk deck, is already included in the bank before
+sector construction. The sector consumer adds no scalar head correction.
 
 At the driver dispatch, the manifest path is selected as a handle but is not
 opened as a scalar model: `compute_sector_sigma` validates it before the scalar
 HDF5 consumer branch. The bare exchange owner adds charge V and, when both
 the transverse carrier and bispinor V are present, transverse V once. The
-sector constant is then added to the dynamic body once. Sector handles require
-`head_correction = off`; the existing bispinor plus finite-temperature
-occupation exception permits that setting in self-consistent maps. A material
-map still requires the constructor to publish an accepted sector handle.
+sector constant is then added to the dynamic body once. A headless deck uses
+`head_correction = off`; the direct photon route uses `no_local_fields`.
+A material map requires the constructor to publish an accepted sector handle.
 
 ## Memory and scope
 
@@ -43,9 +43,9 @@ sector's parent/pole factor set once at setup. The current map retains those
 parent factors and replicated squared poles until that sector's frequency integration
 finishes. CC/TT each read two orientations from one store; CT/TC each read
 left-X and right-Y from their separate stores and compare pole arrays. The
-W factors sit on faces (centroid and pole axes distributed) or, when the
-capacity ledger admits the replicated pole columns, in the axis orientation
-(pole axis replicated, each centroid endpoint over its own mesh axis). The face
+W factors sit on faces with centroid and pole axes distributed over opposite
+processor axes. K grows with the centroid count, so pole columns are never
+replicated to consume spare capacity. The face
 Green's narrow band contraction uses bounded panels; W(t) uses its
 planned parent factor GEMM and a second parent contraction when antiunitary
 rows are selected. The product unfold retains both processor axes. No W(t)

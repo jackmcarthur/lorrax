@@ -207,8 +207,7 @@ def _sector_unfold_tables(headers, bases, families, mesh_xy):
 def sector_synthesis(readers, headers, bases, families, frequencies, meta, mesh_xy):
     """Retain parent-q endpoint factors and unfold their contraction per tau.
 
-    Pole columns are replicated only when admitted, so the parent contraction
-    is a local GEMM; otherwise it uses the configured face placement. Typed
+    Pole columns and centroids divide over opposite processor axes. Typed
     endpoint tables transport the product, with a second parent contraction
     only when the authenticated magnetic group selects antiunitary rows.
     Occupied windows use conj(B_A(-q)) d(t) B_B(-q)^T; d is never conjugated.
@@ -245,29 +244,16 @@ def sector_synthesis(readers, headers, bases, families, frequencies, meta, mesh_
     partners = 2 if np.any(tables.trs) else 1
     def place(value,spec):
         return _placer(mesh_xy,spec)(value)
-    px,py=int(mesh_xy.shape['x']),int(mesh_xy.shape['y'])
     face_bytes=16*nq*kcarrier*(m*nc+n*nt)//mesh_xy.size
-
-    def resident_for(factor_layout):
-        # Each factor has one centroid axis. Pole columns divide over the
-        # other mesh axis only in the face orientation.
-        split=factor_layout=='face'
-        return (16*nq*((m//px)*nc*(kcarrier//py if split else kcarrier)
-                       +(n//py)*nt*(kcarrier//px if split else kcarrier))
-                +8*nq*kcarrier+16*(nk+partners*nq)*m*nc*n*nt//mesh_xy.size)
     native=_native_workspace(mesh_xy,(((nq,m*nc,kcarrier),(nq,kcarrier,n*nt)),))
     workspace=2*face_bytes+native
-    # Factors remain on the q wedge. Place their pole columns once; every
-    # tau reuses that placement and pays the product unfold, never an
-    # endpoint unfold or a full-zone factor contraction.
-    factor_layout=layout
-    if layout=='face' and capacity.preview(
-            resident_bytes_per_rank=resident_for('axis')+2*face_bytes,
-            workspace_bytes_per_rank=workspace,
-            concurrent_with=ambient)['device_budget_status']=='PASS':
-        factor_layout='axis'
+    # K scales with the centroid count: replicating its columns would retain
+    # quadratic factors on only sqrt(P) ranks. Keep both face layouts on all
+    # P ranks, independently of the current deck's spare device capacity.
+    factor_layout='face'
     factor_spec=_shared_pole_factor_specs(factor_layout)
-    resident_bytes=resident_for(factor_layout)
+    resident_bytes=(face_bytes+8*nq*kcarrier
+                    +16*(nk+partners*nq)*m*nc*n*nt//mesh_xy.size)
     setup=f'sigma.sector.setup.{tag}'
     resident=f'sigma.sector.resident.{tag}'
     capacity.reserve(setup,resident_bytes_per_rank=resident_bytes+2*face_bytes,
