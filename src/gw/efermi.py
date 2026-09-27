@@ -58,8 +58,8 @@ argument is ``(E-mu)/(2*broadening_ry)``.  Matching QE therefore uses
 
 TWO OCCUPANCY RULES LIVE HERE AND THEY ARE NOT THE SAME RULE.
 :func:`band_in_occupation_window` decides which bands are in a
-Green's-function branch -- the float64 support of the branch weight.  ``occupation_clamp_tol``
-(:func:`clamp_occupation_tail`) decides whether a meaningless value exists
+Green's-function branch -- the float64 support of the branch weight.
+``occupation_clamp_tol`` (:func:`clamp_occupation_tail`) decides whether a meaningless value exists
 in the table at all, and it is applied once, at evaluation, so every
 consumer sees the same support.  Neither subsumes the other and neither
 should be collapsed into the other.
@@ -164,8 +164,9 @@ def resolve_sigma_efermi_ry(fermi_reference, *, occupation_state, wfn):
 #  Green's-function branch at all.  ONE predicate, ONE floor -- every
 #  consumer imports from here rather than re-spelling the rule.  The
 #  consumers are the Sigma branch supports (``gw.ppm_windows``), the MPA
-#  pole-window geometry (``gw.mpa.sigma_windows``) and the chi0
-#  fractional-occupation supports (``gw.w_isdf``).
+#  pole-window geometry (``gw.mpa.sigma_windows``), the chi0
+#  fractional-occupation supports (``gw.w_isdf``) and the shared-pole
+#  response-bank samples (``gw.response_bank``).
 # ---------------------------------------------------------------------------
 
 #: The float64 resolution of the partition ``f + (1 - f) = 1``.  The
@@ -222,7 +223,7 @@ def band_in_occupation_window(weight):
     size: the conditioning is gated per window by ``factor_growth`` in
     ``gw.sigma_box_plan``, whatever the support.  What the support decides
     is the box.  Exact nonzero support keeps a valence weight ``f`` down to
-    its underflow, 708 kBT above mu -- every band of a metal deck -- and
+    its underflow, about 700 kBT above mu -- every band of a metal deck -- and
     widens the occupied branch's box by that excursion; the conduction
     weight ``1.0 - f`` stops at ``2**-53`` by rounding.  The floor applies
     that same float64 resolution to both branches
@@ -233,7 +234,7 @@ def band_in_occupation_window(weight):
     occupied-branch weight (down to about -0.0355 at the lobe minimum), and
     ``abs`` keeps it.  Exact zeros stay excluded.
 
-    Works on numpy and jax arrays alike; returns whatever ``abs``/``>`` give
+    Works on numpy and jax arrays alike; returns whatever ``abs``/``>=`` give
     for the operand type, so a caller keeps its own array library.
     """
     return abs(weight) >= OCCUPATION_WEIGHT_FLOOR

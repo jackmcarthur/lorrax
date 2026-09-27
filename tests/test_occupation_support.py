@@ -127,3 +127,14 @@ def test_the_retired_key_refuses_by_name(tmp_path):
                     "number_bands = 40\noccupation_window_threshold = 0.995\n")
     with pytest.raises(ValueError, match="occupation_window_threshold"):
         LorraxConfig.from_input_file(str(deck), print_fn=lambda _: None)
+
+
+def test_the_static_occupation_projector_is_not_thresholded():
+    """``cohsex_sigma.build_Gij`` weights every Sigma band by f and drops none:
+    a cut would delete electrons from the Hartree density."""
+    import inspect
+    from gw.cohsex_sigma import build_Gij
+
+    src = inspect.getsource(build_Gij)
+    assert "band_in_occupation_window" not in src
+    assert "Gij[:, idx, idx] = f_win" in src
