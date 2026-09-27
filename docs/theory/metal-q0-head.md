@@ -248,6 +248,12 @@ bank's consumer ([four-current heads §5](four-current-head-corrections.md#direc
   Coulomb-weighted $Q$, one number per pair. The q-resolved version, the
   saturated vertex $(x/4)/(1+x/2)$ at every cell sample, is the next
   refinement; it needs the pair list beside the atoms.
+- **The head plasmon follows $D_{\mathcal C}$.** The cell's dynamic head puts
+  the shared weight at $\omega=0$, so its plasmon sits at the cell-effective,
+  not the physical, $\omega_p$ until the grid converges. On Fe $4^3$ the
+  bispinor map-0 eqp0/eqp1 tails (64 and 119 meV) come entirely from the CC
+  head block, on states whose $|E-E_F|$ lies 3.6–4.8 eV from the Fermi
+  level (claim 2862).
 - **Wings.** The `full` scalar route folds head/body wings
   (`qsgw_head.head_wings_sharded`); the wing kernels keep every pair with
   $\Delta>0$ and a diagonal-only surface term, so they apply neither the
