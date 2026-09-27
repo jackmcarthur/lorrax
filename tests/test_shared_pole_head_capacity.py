@@ -73,7 +73,7 @@ def test_ordered_store_carries_the_direct_head_without_a_fold(monkeypatch):
 
     def finalize(response, index, W_body_gamma=None, **kwargs):
         seen.append((index, W_body_gamma))
-        return NS(omega=response.omegas[index], source="head_direct")
+        return NS(omega=response.omegas[index], source="head_direct", vc0=0j, wcoul0=0j)
 
     def fit(samples, points, n_poles, *, model, solve, occupation_state):
         assert model == "dft_direct_loewner" and len(samples) == len(points) == 2
