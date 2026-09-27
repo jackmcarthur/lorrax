@@ -554,7 +554,7 @@ def compute_V_H_and_V_xc(
     return V_H_r, V_xc_r
 
 
-@functools.partial(jax.jit, static_argnames=("truncation_2d", "blat"))
+@functools.partial(jax.jit, static_argnames=("truncation_2d", "blat", "ecutrho"))
 def compute_V_H_and_V_xc_noncollinear(
     rho_val: jax.Array,
     rho_core: jax.Array,
@@ -565,6 +565,7 @@ def compute_V_H_and_V_xc_noncollinear(
     bvec: jax.Array,
     blat: float,
     *,
+    ecutrho: float,
     truncation_2d: bool = False,
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
     """V_H, v_xc and B_xc for a noncollinear magnetic run (PBE, QE's general branch).
@@ -581,7 +582,8 @@ def compute_V_H_and_V_xc_noncollinear(
     rho_core_gridded = jnp.real(local_ifftn3(rhog_core))
     rho_G_total = local_fftn3(rho_total - rho_core_gridded) + rhog_core
     v_xc, B_xc = compute_V_xc_noncollinear(
-        rho_total, rho_G_total, mag, G_cart, pbe_functional_polarized())
+        rho_total, rho_G_total, mag, G_cart, pbe_functional_polarized(),
+        ecutrho)
     return V_H_r, v_xc, B_xc
 
 
