@@ -1580,8 +1580,8 @@ def compute_photon_bank(wfns, wfns_transverse, meta, config, *, mesh_xy, sym,
     ``constant`` field is W_infinity-V. M0..M3 use the same convention as the
     ordered charge bank. Both CT and TC are retained. The scalar producer,
     memory planner, quadrature, transaction masks and reader are shared.
-    Later SC maps supply ``bank_io['static_reference']`` with the initial
-    bank's ``path`` and ``identity`` to keep its contact fixed.
+    Every call, every SC map included, builds its own static contact: the
+    Ward proxy subtracts the static limit of this map's response.
     """
     from file_io.shared_pole_store import validate_shared_pole_bank
 
@@ -1646,31 +1646,12 @@ def compute_photon_bank(wfns, wfns_transverse, meta, config, *, mesh_xy, sym,
     if jax.process_index() == 0:
         print("photon bank: centroid D and static grid reference", flush=True)
     with timing.section("bank.static_contact"):
-        from file_io.shared_pole_store import (ResidentBankPayload, read_static_reference,
-                                               write_bank_contact, write_static_reference)
-        reference = bank.get("static_reference")
-        initial = None
-        if reference is None:
-            grid, drude, contact = photon_static_contact(wfns, meta, mesh_xy=mesh_xy,
-                layout=layout, vertex=vertex, occupation_state=occupation_state,
-                sample_plan=sample_plan, execute=execute, receipt=receipt)
-            # Later maps freeze this contact from its own small file, written on
-            # both tiers beside (not inside) this map's scratch generation.
-            generation = Path(bank["path"].label if isinstance(bank["path"], ResidentBankPayload)
-                              else bank["path"]).parent
-            reference = write_static_reference(
-                generation.with_name(generation.name + "_photon_static_reference.h5"),
-                dict(Pi_grid=grid, Drude=drude, TT_contact=contact),
-                header=header, mesh_xy=mesh_xy)
-        else:
-            initial, (grid, drude, contact) = read_static_reference(reference, n=n, mesh_xy=mesh_xy)
-            for key in ("photon_layout", "photon_centroid_digests"):
-                if initial.get(key) != header[key]:
-                    raise ValueError(f"GATE photon_static_reference: initial/current {key} differs")
-        receipt["static_reference"] = reference
+        from file_io.shared_pole_store import write_bank_contact
+        grid, drude, contact = photon_static_contact(wfns, meta, mesh_xy=mesh_xy,
+            layout=layout, vertex=vertex, occupation_state=occupation_state,
+            sample_plan=sample_plan, execute=execute, receipt=receipt)
         bank["minus_q_operator_provenance"] = dict(coulomb=bank["coulomb"],
-            static_reference=reference,
-            static_reference_commit=(initial["commit"] if initial is not None else None),
+            static_contact="this map's Pi_FD(0,0)",
             state_identity=bank["identity"],
             moments="M0,M1,M2,M3 and constant computed with the identical photon_v and contact arrays")
         # Persist the contact's two physically defined pieces as bank diagnostics;

@@ -60,13 +60,8 @@ def _authenticated_constructor_resume(root, identity, recipe, *, photon=False):
     if bank_receipt.get('identity') != identity or bank_receipt.get('completion') is not True:
         return False
     if photon:
-        from file_io.shared_pole_store import static_reference_record
         if (bank_receipt.get('stage') != 'photon'
                 or bank_receipt.get('bank_complete') is not True):
-            return False
-        try:
-            static_reference_record(bank_receipt.get('static_reference', {}))
-        except (KeyError, OSError, TypeError, ValueError):
             return False
     elif (moments_receipt.get('identity') != identity
           or moments_receipt.get('completion') is not True
@@ -287,7 +282,6 @@ def screen_shared_poles(wfns, V_q, meta, config, *, mesh_xy, sym,
                         head_resolver=None, mpa_plan=None, iteration_head_response=None,
                         material_class=None, wfns_transverse=None,
                         bispinor_v_q_path=None, mu_bases=None,
-                        photon_static_reference=None,
                         photon_g0_vectors=None, photon_head_cache=None,
                         photon_head_rotation=None):
     """Build current W; only one-shot models may use ISDF restart membership.
@@ -429,7 +423,6 @@ def screen_shared_poles(wfns, V_q, meta, config, *, mesh_xy, sym,
                     identity=identity, tables=tables, coulomb=coulomb)
         if photon:
             bank.update(photon_layout=photon_layout, mu_bases=mu_bases,
-                        static_reference=photon_static_reference,
                         bispinor_v_q_path=bispinor_v_q_path,
                         sector_tables=(tables, _shared_pole_tables(
                             meta, sym, mu_bases[1].canonical_indices)))
@@ -505,8 +498,6 @@ def screen_shared_poles(wfns, V_q, meta, config, *, mesh_xy, sym,
         # Device-resident sector models stay live until Sigma releases them.
         ledger.live_stages = (handle['model_stage'],) if handle.get('model_stage') else ()
         result = dict(shared_pole=handle)
-        if photon:
-            result['photon_static_reference'] = receipts['bank']['static_reference']
         from .gw_config import HeadCorrection
         if config.head.correction is not HeadCorrection.OFF:
             if photon:

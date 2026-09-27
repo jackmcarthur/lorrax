@@ -3534,18 +3534,10 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
                         mu_bases=inputs.mu_bases,
                         photon_g0_vectors=inputs.photon_g0_vectors,
                         photon_head_cache=inputs.screening_seed_cache,
-                        photon_head_rotation=U_full,
-                        photon_static_reference=(None if inputs.screening_seed_cache is None else
-                            inputs.screening_seed_cache.get('photon_static_reference')))
+                        photon_head_rotation=U_full)
                    if inputs.config.sigma.w_model == "shared_pole"
                    and wfns_transverse_qp is not None else {}),
                 print_fn=inputs.print_fn)
-        if (inputs.screening_seed_cache is not None and isinstance(produced, dict)
-                and produced.get('photon_static_reference') is not None):
-            # Only the immutable initial contact survives. Current samples,
-            # moments and all three pole models belong to this map.
-            inputs.screening_seed_cache.setdefault(
-                'photon_static_reference', produced['photon_static_reference'])
         return produced
 
     # Per-mode screening plan.  The q->0 head uses this exact frequency/role
