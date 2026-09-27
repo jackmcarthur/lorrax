@@ -20,7 +20,10 @@ i tau(sigma)``, ``tau = min(c/m, (Lam - sigma)/m)``, at density
 ``0 -> -i c/m`` carries the wide side's Laplace part; and two Gauss sets on
 the imaginary time axes carry the trapezoid's two images at ``+-B0`` (the
 endpoint error of the trapezoid rule, exactly two Laplace integrals).  The
-growth-side image is capped at ``|Im s| (b - a) <= 3``.
+growth-side image is capped at ``|Im s| (b - a) <= 3``.  On a tall box
+(damped poles, height ``H``) the bend is lowered to
+``c = min(4, max(2, 8 m/(H - 1)))`` (:func:`corner_exponent`), the leg gets
+uniform nodes for its top-edge phase, and a miss steps ``c, c/2, c/4``.
 
 **Sector rule** (:func:`sector_degree`).  Every box with ``im_lo > 0`` lies
 in an open sector of the upper half plane.  Times are the elliptic
@@ -50,7 +53,7 @@ import numpy as np
 
 from .uniform_rule import UniformRule, _BoundaryCloud, _cexp, _pinned_blas_threads
 
-__all__ = ["analytic_box_rule", "crossing_nodes", "sector_degree"]
+__all__ = ["analytic_box_rule", "corner_exponent", "crossing_nodes", "sector_degree"]
 
 #: Corner amplification of the bent line at the narrow edge, ``e^c``: the
 #: largest the executor noise gate admits with room (term mass <= 83 > e^4).
@@ -68,18 +71,33 @@ _MARGIN_SLOPE = 0.01
 _CROSSING_RUNGS, _SECTOR_RUNGS, _LADDER_GROWTH = 6, 6, 1.10
 #: The narrowest side the bent contour is built for, in units of eta.
 _NARROW_MIN = 4.0
+#: The leg's largest phase at the top edge, tau_c (H - 1), in radians, and the
+#: floor of the bend it sets (tall crossing boxes).
+_LEG_PHASE, _BEND_MIN = 8.0, 2.0
 #: Fit cloud density along Re d, in points per half wave of the largest |t|.
 _FIT_POINTS = 2.0
 
 
 # ------------------------------------------------------------ crossing: nodes
-def crossing_nodes(box, eps, rung=0):
+def corner_exponent(box):
+    """The bend ``c`` of a crossing box: ``_BEND`` = 4 on a thin box, lowered on
+    a tall one so the leg's phase ``tau_c (H - 1) = c (H - 1)/m`` at the top
+    edge stays within ``_LEG_PHASE`` radians, floored at ``_BEND_MIN``."""
+    re_lo, re_hi, im_lo, im_hi = (float(v) for v in box)
+    m = max(min(-re_lo, re_hi) / im_lo, _NARROW_MIN)
+    rise = im_hi / im_lo - 1.0
+    return min(_BEND, max(_BEND_MIN, _LEG_PHASE * m / max(rise, 1e-12)))
+
+
+def crossing_nodes(box, eps, rung=0, bend=None):
     """Derived bent-contour nodes ``s`` in units of ``1/im_lo``, and a receipt.
 
     See the module docstring; ``rung`` raises the line margin by ``1.1**rung``
-    and adds ``rung`` nodes to the leg and to each image set.
+    and adds ``rung`` nodes to the leg and to each image set; ``bend`` is the
+    corner exponent c (default :func:`corner_exponent`).
     """
-    re_lo, re_hi, im_lo, _im_hi = (float(v) for v in box)
+    c = corner_exponent(box) if bend is None else float(bend)
+    re_lo, re_hi, im_lo, im_hi = (float(v) for v in box)
     a, b = re_lo / im_lo, re_hi / im_lo
     flip = b > -a
     M, m = (b, -a) if flip else (-a, b)
@@ -92,9 +110,9 @@ def crossing_nodes(box, eps, rung=0):
     # Always bent, a symmetric box too: the straight line (tau = 0) leaves the
     # far image to the growth-capped set, and on [-20, 20] x [1, 10] eta it
     # ended at 1.49 eps where the bent contour certifies with 73 nodes.
-    tau_c = _BEND / m
-    floor = 1.0 + _MARGIN_SLOPE * max(2.0, L - _BEND * M / m)
-    gamma = min(max(math.sqrt(1.0 + 8.0 * (L + _BEND) / (math.pi * M * Lam)), floor), 1.2)
+    tau_c = c / m
+    floor = 1.0 + _MARGIN_SLOPE * max(2.0, L - c * M / m)
+    gamma = min(max(math.sqrt(1.0 + 8.0 * (L + c) / (math.pi * M * Lam)), floor), 1.2)
     gamma *= _LADDER_GROWTH ** rung
     sigma = np.linspace(0.0, Lam, 20001)
     tau = np.minimum(tau_c, np.maximum(0.0, (Lam - sigma) / m))
@@ -107,6 +125,11 @@ def crossing_nodes(box, eps, rung=0):
     # the leg, graded toward 0; its top node -i tau_c is the line's first node
     kv = int(math.ceil(math.log(max(M * tau_c, 2.0)) * L / math.pi ** 2)) + rung
     parts.append(-1j * tau_c * np.geomspace(0.05 / (M * tau_c), 1.0, kv + 1)[:-1])
+    # on a tall box the leg's members e^{v d} turn their phase v*y through
+    # tau_c (H - 1) radians: one uniform node per 2 pi / gamma of it
+    k_osc = int(gamma * tau_c * (im_hi / im_lo - 1.0) / (2.0 * math.pi))
+    if k_osc:
+        parts.append(-1j * tau_c * (np.arange(1, k_osc + 1) - 0.5) / k_osc)
     # the trapezoid's images at +-B0: two Gauss sets on the imaginary axes
     B0 = gamma * max(width[0], min(M, Lam / tau_c))
     live = min(M, Lam / tau_c)
@@ -123,7 +146,7 @@ def crossing_nodes(box, eps, rung=0):
     s = np.concatenate(parts)
     if flip:
         s = np.conj(s)
-    return s, dict(M=M, m=m, gamma=gamma, tau_c=tau_c, B0=B0, n_line=n_line, flip=flip)
+    return s, dict(M=M, m=m, c=c, gamma=gamma, tau_c=tau_c, B0=B0, n_line=n_line, flip=flip)
 
 
 # ------------------------------------------------------------ sector: degree
@@ -235,8 +258,8 @@ def _weights(box, times, eps, relative):
 
 
 # ------------------------------------------------------------ the builder
-def _crossing_rule(box, eps, rung):
-    s, _ = crossing_nodes(box, eps, rung)
+def _crossing_rule(box, eps, rung, bend):
+    s, _ = crossing_nodes(box, eps, rung, bend)
     times = s / float(box[2])
     return times, _weights(box, times, eps, False), 0.0, int(s.size)
 
@@ -270,7 +293,10 @@ def analytic_box_rule(box, eps, *, mass_cap=83.0, relative=None):
         # certifies narrow crossing boxes, but its rotated times cancel at
         # |w| ~ 1e10 there and the executor's Sigma came out non-finite
         # (core fixture A, [-2.71, 47.63] eta, 2026-09-27).
-        families = [(lambda r: _crossing_rule(box, eps, r), _CROSSING_RUNGS)]
+        # the bend's own fixed ladder: c, c/2, c/4, each with the margin ladder
+        c = corner_exponent(box)
+        families = [(lambda r, b=b: _crossing_rule(box, eps, r, b), _CROSSING_RUNGS)
+                    for b in (c, c / 2.0, c / 4.0)]
     started = time.perf_counter()
     with _pinned_blas_threads():
         for build, rungs in families:

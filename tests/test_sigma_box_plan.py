@@ -1319,16 +1319,19 @@ def test_rank_assignment_spreads_the_longest_fits_and_reduces_to_round_robin():
     assert sorted(big) == [0, 1, 2, 3]
 
 
-def test_tall_narrow_crossing_window_is_refused_by_name():
-    """KNOWN LIMIT (KNOWN_LORRAX_ISSUES, QAUDIT claim 2882): the derived rule
-    does not certify (-60, 6) x (1, 20) eta; the window must be refused by
-    name, never served uncertified."""
+def test_tall_narrow_crossing_window_is_accepted():
+    """A tall narrow crossing window (damped poles over a small requested
+    window, QAUDIT claim 2882) plans: the derived rule certifies it and the
+    planner's noise gate accepts it."""
     from gw.sigma_box_plan import _accept_rule
     from minimax import analytic_box_rule
     eta = 0.02
     box = (-60.0 * eta, 6.0 * eta, eta, 20.0 * eta)
     rule = analytic_box_rule(box, 1.0e-4, mass_cap=5.0e-6 / 6.0e-8)
-    assert rule.sup_error > 1.0e-4
-    with pytest.raises(RuntimeError, match=r"'tall' refused: rule sup error"):
-        _accept_rule({"name": "tall", "kind": "crossing"}, rule, 1.0e-4,
-                     cache_status="miss", cache_dir=None)
+    assert rule.sup_error <= 1.0e-4
+    fit = _accept_rule({"name": "tall", "kind": "crossing", "conjugate": False,
+                        "pole_sign": 1.0, "states": np.asarray([0.0]),
+                        "pole_stats": [(0.1, 0.2, 0.0, 0.3)],
+                        "E_ref_A": 0.0, "E_ref_B": 0.0},
+                       rule, 1.0e-4, cache_status="miss", cache_dir=None)
+    assert fit["node_count"] == rule.node_count

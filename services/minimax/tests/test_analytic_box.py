@@ -2,7 +2,7 @@
 import numpy as np
 import pytest
 
-from minimax.analytic_box import analytic_box_rule, crossing_nodes
+from minimax.analytic_box import analytic_box_rule, corner_exponent, crossing_nodes
 from minimax.uniform_rule import rule_roundoff_amplification, rule_sup_error
 
 ETA = 0.02
@@ -112,17 +112,28 @@ def test_narrow_crossing_box_is_the_floored_bent_contour(box_eta, eps):
     assert np.abs(rule.weights).max() * ETA < 100.0
 
 
-def test_tall_narrow_crossing_box_is_returned_uncertified():
-    """KNOWN LIMIT (KNOWN_LORRAX_ISSUES, QAUDIT claim 2882): a crossing box with
-    a narrow side of 4-8 eta and a height of 10 eta or more certifies in
-    neither family; main's fitted builder certified such boxes with 21-52
-    nodes.  The builder returns its last rung uncertified, and the planner
-    refuses the window by name (tests/test_sigma_box_plan.py).  No deck box
-    is of this shape today; damped poles in a small excursion window would be."""
-    box = (-60.0 * ETA, 6.0 * ETA, ETA, 20.0 * ETA)
-    rule = analytic_box_rule(box, 1.0e-4)
-    assert rule.sup_error > 1.0e-4
-    assert np.all(np.isfinite(rule.times)) and np.all(np.isfinite(rule.weights))
+@pytest.mark.parametrize("box_eta", [
+    (-50.0, 4.0, 10.0), (-50.0, 4.0, 20.0), (-50.0, 4.0, 50.0),
+    (-50.0, 8.0, 50.0), (-200.0, 4.0, 50.0), (-200.0, 8.0, 50.0),
+])
+@pytest.mark.parametrize("eps", [3.0e-5, 1.0e-4])
+def test_tall_narrow_crossing_boxes_certify(box_eta, eps):
+    """QAUDIT's six boxes (claim 2882): a narrow side of 4-8 eta under damped
+    poles 10-50 eta tall.  The bend is lowered on a tall box so the leg's phase
+    tau_c (H - 1) at the top edge stays within 8 rad (corner_exponent), and a
+    miss steps the bend down c, c/2, c/4; main's fitted rules took 21-52 nodes."""
+    M, m, H = box_eta
+    box = (-M * ETA, m * ETA, ETA, H * ETA)
+    rule = analytic_box_rule(box, eps)
+    _check(rule, box, eps)
+    assert rule.node_count <= 80
+
+
+def test_thin_crossing_box_keeps_the_full_bend():
+    """The height rule leaves every thin (real-pole) crossing box at c = 4."""
+    for box_eta in ((-306.3, 153.5), (-41.0, 83.3), (-400.0, 4.0)):
+        box = (box_eta[0] * ETA, box_eta[1] * ETA, ETA, 1.01 * ETA)
+        assert corner_exponent(box) == pytest.approx(4.0)
 
 
 def test_thin_boxes_certify_on_the_dense_boundary():
