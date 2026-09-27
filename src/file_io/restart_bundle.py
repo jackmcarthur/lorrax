@@ -1590,7 +1590,8 @@ class BispinorVqReader:
                 raise ValueError(
                     f"{self._filename}: v_qmunu_format='{fmt}', "
                     f"expected '{V_QMUNU_FORMAT}'.  Wrong file or stale "
-                    f"format from a different LORRAX revision."
+                    f"format from a different LORRAX revision. "
+                    "Set restart = false to rebuild the current-fit tensors."
                 )
             self.kgrid = tuple(int(x) for x in _read_scalar("kgrid"))
             self.n_rmu_C = int(_read_scalar("n_rmu_C"))

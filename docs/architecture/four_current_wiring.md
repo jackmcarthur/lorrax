@@ -170,7 +170,7 @@ name.
 | parent faces | `wavefunction_bundle.ParentGreenCarrier`, separate C and T families | `psi_nmu (n_parent, n_b, 4, μ)`, `psi_mun (n_parent, 4, μ, n_b)` | `P(None,'x',None,'y')`, `P(None,None,'x','y')` | all |
 | charge ζ | `isdf_fitting.fit_zeta_to_h5` | `tmp/zeta_q.h5`, G-flat `(n_q, n_C, n_G)` c128 | written through SlabIO | all |
 | three current ζ | the same fit, `vertex_mu_L ∈ {1,2,3}` | `tmp/zeta_q_mu{1,2,3}.h5`, `(n_q, n_T, n_G)` c128 | same | all |
-| bare $D^{IJ}$ tiles | `v_q_bispinor.compute_V_q_bispinor_g_flat_to_h5` | `v_q_bispinor.h5`: 7 datasets `(n_q, n_L, n_R)` c128, format `bispinor_lorentz_v2` | device tile `P(None,'x','y')` | all |
+| bare $D^{IJ}$ tiles | `v_q_bispinor.compute_V_q_bispinor_g_flat_to_h5` | `v_q_bispinor.h5`: 7 datasets `(n_q, n_L, n_R)` c128, format `bispinor_lorentz_v3` | device tile `P(None,'x','y')` | all |
 | tile reader | `file_io.restart_bundle.BispinorVqReader.get_tile` | `(n_q, p_L, p_R)` in packed centroid order | `P(None,'x','y')` | all |
 | literal-Γ vectors | written beside the tiles | `photon_g0_vectors_{0..3}`, each `(1, n)` canonical order | read at `P(None,'x')` | P under `full`, SP-full direct head |
 
@@ -451,6 +451,12 @@ on one rank ([decisions](decisions.md); plan table in
   [Parent ζ fitting](zeta_fit_face_psi_cct.md).
 
 ## Self-consistency and restart
+
+The bispinor V artifact format is `bispinor_lorentz_v3`: its current
+tiles use the [common positive-trace fit](zeta_fit_face_psi_cct.md).
+The reader refuses older formats before collective I/O. Rebuild with
+`restart = false`; ordinary ζ reuse separately checks its training-domain
+provenance, so a compatible common-fit ζ cache can still be reused.
 
 Packed routes are one-shot (`qp_solver = one_shot_dft`). On B,
 self-consistency requires `density_self_consistent = true`. Each map

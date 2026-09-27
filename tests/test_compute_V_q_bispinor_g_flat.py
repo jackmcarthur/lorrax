@@ -234,7 +234,7 @@ def test_bispinor_7_tiles_match_einsum_reference(tmp_path, single_device_mesh):
         import json
         unique = [tuple(t) for t in json.loads(f.attrs['unique_tiles'])]
         assert set(unique) == set(UNIQUE_TILES)
-        assert f['v_qmunu_format'][()].decode() == "bispinor_lorentz_v2"
+        assert f['v_qmunu_format'][()].decode() == "bispinor_lorentz_v3"
 
     for channel in range(4):
         np.testing.assert_allclose(

@@ -78,7 +78,9 @@ HERMITIAN_PAIRS: dict[tuple[int, int], tuple[int, int]] = {
     (3, 2): (2, 3),
 }
 
-V_QMUNU_FORMAT = "bispinor_lorentz_v2"
+# v3 requires the common positive-Cartesian-trace current fit.
+# A full restart bypasses zeta reuse, so v2 tiles must refuse.
+V_QMUNU_FORMAT = "bispinor_lorentz_v3"
 V_QMUNU_INVENTORY_SCHEMA = 1
 V_QMUNU_INVENTORY_DATASET = "v_qmunu_unique_tile_inventory"
 V_QMUNU_DATA_READY_DATASET = "v_qmunu_data_ready"
