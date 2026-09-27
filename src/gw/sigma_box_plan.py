@@ -1188,6 +1188,9 @@ def _selector_box_spec(spec, eta):
              0., spec["far_gamma_ceiling"])
     box, raw, extent = _box_for_window(spec["frequencies"], states, [poles],
                                       spec["pole_sign"], eta)
+    # Selector inequalities already include the sole crossing pad through
+    # omega. Numerical enclosure uses the rule table's outward snap only.
+    box = (*raw, eta, poles[3] + eta)
     fixed = dict(spec, box=box, raw_real_support=raw)
     fixed["kind"] = ("sign_definite_positive" if box[0] > 0 else
                      "sign_definite_negative" if box[1] < 0 else "crossing")
@@ -1223,18 +1226,20 @@ def _fixed_fit_for_spec(entry, spec):
     return fit
 
 
-def _fit_fixed_sc_rules(specs, eta, *, eps, cache_dir, session, material_class=None):
+def _fit_fixed_sc_rules(specs, eta, *, eps, cache_dir, session, material_class=None, plan_specs=None):
     """Build one selector plan; reuse it unchanged until convergence is checked."""
     rows = list(specs)
     iteration = int(session.get("call_count", 0)) + 1
     session["call_count"] = iteration
     initialized = "rules" not in session
     if initialized:
-        fixed = [_selector_box_spec(spec, eta) for spec in rows]
+        fixed = [_selector_box_spec(spec, eta) for spec in (rows if plan_specs is None else plan_specs)]
         fits, fit_rows = fit_sigma_box_specs(fixed, eta, eps=eps,
                                             cache_dir=cache_dir, cache_build_widen=False)
+        session["tau_capacity"] = max((int(f["node_count"]) for f in fits), default=0)
         session["rules"] = {spec["name"]: {"fit": fit}
-                            for spec, fit in zip(rows, fits)}
+                            for spec, fit in zip(fixed, fits)}
+        fits = [_fixed_fit_for_spec(session["rules"][spec["name"]], spec) for spec in rows]
         session["eta_ry"], session["eps"] = float(eta), float(eps)
         session["initial_window_tau_pairs"] = sum(f["node_count"] for f in fits)
     else:
@@ -1424,7 +1429,7 @@ def plan_sigma_windows(
     all_stats = [row["all"] for _, row in summaries if row["all"] is not None]
     far_pole = 4. * max(row[1] for row in all_stats)
     far_gamma = 4. * max(row[3] for row in all_stats)
-    specs, branch_reports = [], []
+    specs, plan_specs, branch_reports = [], [], []
     for branch, (state_shape, raw_energy, flat_indices) in zip(
             branch_rows, state_rows):
         positions = np.asarray(branch.omega_idx, dtype=np.int64)
@@ -1449,12 +1454,23 @@ def plan_sigma_windows(
             owned = np.nonzero(
                 (omega_abs >= omega_lo) & (omega_abs < omega_hi))[0]
             pole_indices, pole_stats = _pole_rows(summaries, selector)
-            if not local.size or not owned.size or not pole_indices.size:
+            if not owned.size:
                 continue
-            states = raw_energy[local]
+            live = bool(local.size and pole_indices.size)
+            # Reserve dormant product classes on map 0 too: movement may
+            # populate them, but never causes an in-loop rule build.
+            state_min = max(-float(branch.excursion_bound_ry), float(state_lo))
+            state_max = (4. * max(float(np.max(raw_energy)), eta)
+                         if not np.isfinite(state_hi) else float(state_hi))
+            pole_min = max(0., float(pole_lo))
+            pole_max = far_pole if not np.isfinite(pole_hi) else float(pole_hi)
+            if state_max <= state_min or pole_max <= pole_min:
+                continue
+            states = raw_energy[local] if local.size else np.array([state_min, state_max])
+            fit_poles = pole_stats if pole_stats else [(pole_min, pole_max, 0., far_gamma)]
             spec = make_sigma_box_spec(
                 name=f"{branch.tag}:{name}", frequencies=frequencies[owned],
-                states=states, pole_stats=pole_stats,
+                states=states, pole_stats=fit_poles,
                 pole_sign=pole_sign, eta_ry=eta)
             if certificate_pole_summaries is not None:
                 _, union_stats = _pole_rows(certificate_pole_summaries, selector)
@@ -1490,7 +1506,9 @@ def plan_sigma_windows(
                 "omega_idx": positions[owned],
                 "branch_report": report,
             })
-            specs.append(spec)
+            plan_specs.append(spec)
+            if live:
+                specs.append(spec)
         report["plan_stop"] = len(specs)
         report["window_count"] = report["plan_stop"] - report["plan_start"]
         branch_reports.append(report)
@@ -1499,7 +1517,7 @@ def plan_sigma_windows(
     fits, fit_rows, fixed_receipt = _fit_fixed_sc_rules(
         specs, eta, eps=tolerance, cache_dir=cache_dir,
         session={} if fixed_rule_session is None else fixed_rule_session,
-        material_class=material_class)
+        material_class=material_class, plan_specs=plan_specs)
     if process_rank() == 0:
         announced = set()
         for fit in fits:

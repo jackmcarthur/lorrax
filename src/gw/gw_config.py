@@ -1667,15 +1667,7 @@ _DEFAULTS = {
     "sigma_omega_min_ev": None,
     "sigma_omega_max_ev": None,
     "sigma_omega_step_ev": 0.25,
-    # "" = the contiguous [min, max] grid.  "lo:hi, lo:hi" (eV) = a union
-    # of uniform patches at sigma_omega_step_ev — the semicore dynamic-
-    # range spelling (docs/input_reference.md, sigma_omega_patches_ev).
-    "sigma_omega_patches_ev": "",
     "sigma_regularization_ev": 0.25,
-    # Where a QSGW Sigma(E) evaluation outside the sampled grid reads
-    # (owner 2026-09-24): cover (grow the grid over every protected
-    # identity), clamp (the nearest grid edge), static (omega = 0).
-    "sigma_out_of_grid": "clamp",
     "sigma_w_model": "mpa",
     "sigma_w_accuracy": "production",
     # "" = the shared-pole resolver's own line and imaginary ladders.
@@ -2535,16 +2527,11 @@ def _input_response(
     # A patch list sets both edges before the config (and its cover-only
     # refusal for unset edges) is built.
     _edges = [params["sigma_omega_min_ev"], params["sigma_omega_max_ev"]]
-    _patches = DynamicSigmaConfig.parse_omega_patches_ev(
-        params["sigma_omega_patches_ev"], float(params["sigma_omega_step_ev"]))
-    if _patches:
-        _edges = [_patches[0][0], _patches[-1][1]]
     sigma = DynamicSigmaConfig(
         omega_min_ev=None if _edges[0] is None else float(_edges[0]),
         omega_max_ev=None if _edges[1] is None else float(_edges[1]),
         omega_step_ev=float(params["sigma_omega_step_ev"]),
         regularization_ev=float(params["sigma_regularization_ev"]),
-        out_of_grid=str(params["sigma_out_of_grid"]).strip().lower(),
         w_model=str(params["sigma_w_model"]),
         w_accuracy=str(params["sigma_w_accuracy"]),
         w_support_sites_ev=str(params["sigma_w_support_sites_ev"]),
@@ -2554,7 +2541,6 @@ def _input_response(
         quadrature_cache_dir=str(
             params["sigma_quadrature_cache_dir"]).strip(),
         sigma_at_dft_energies=bool(params["sigma_at_dft_energies"]),
-        omega_patches_ev=str(params["sigma_omega_patches_ev"]).strip(),
         band_extrapolation_estimator=str(
             params["band_extrapolation_estimator"]
             or BAND_EXTRAPOLATION_ESTIMATOR_DEFAULT).strip().lower(),
@@ -3967,7 +3953,10 @@ def sigma_requested_edges_ev(sigma):
     """Requested Sigma grid edges (eV); an unset edge is the sample next to E_F."""
     step = float(sigma.omega_step_ev)
     lo, hi = getattr(sigma, "omega_min_ev", None), getattr(sigma, "omega_max_ev", None)
-    return (-step if lo is None else float(lo), step if hi is None else float(hi))
+    return (min(-step, float(hi)) if lo is None and hi is not None else
+            -step if lo is None else float(lo),
+            max(step, float(lo)) if hi is None and lo is not None else
+            step if hi is None else float(hi))
 
 
 def sigma_classification_window_ev(sigma):
@@ -3991,9 +3980,6 @@ class DynamicSigmaConfig:
     sigma_at_dft_energies: bool
     #: Uniform denominator-box policy for dynamic Sigma quadrature.  The
     #: cache spelling is "auto" (run tmp), "off", or a deck-relative path.
-    #: ``sigma_out_of_grid``: cover | clamp | static, the QSGW Sigma(E)
-    #: rule outside the sampled grid (``qsgw_utils.sigma_eval_omega``).
-    out_of_grid: str = "clamp"
     w_model: str = "mpa"
     w_accuracy: str = "production"
     #: ``sigma_w_support_sites_ev``: "" (default, the shared-pole
@@ -4003,15 +3989,6 @@ class DynamicSigmaConfig:
     w_support_sites_ev: str = _DEFAULTS["sigma_w_support_sites_ev"]
     quadrature_eps: float = _DEFAULTS["sigma_quadrature_eps"]
     quadrature_cache_dir: str = "auto"
-    #: ``sigma_omega_patches_ev``: "" (default, the contiguous
-    #: [min, max] grid) or "lo:hi, lo:hi, ..." — a union of uniform
-    #: patches at ``omega_step_ev``, replacing the contiguous grid.  The
-    #: Σ(ω)→E interpolation is searchsorted piecewise-linear and needs no
-    #: uniformity; solved QP energies landing inside a hole are refused at
-    #: the QSGW seam (gw.qsgw_utils.assert_omega_grid_covers).  MPA's box
-    #: planner certifies each branch's min/max frequency corners, so a hole
-    #: saves evaluation/output points but does not add a second partition.
-    omega_patches_ev: str = ""
     #: Band-convergence extrapolation of Sigma_c, resolved from
     #: ``use_band_extrapolation`` (default TRUE) and its deprecated alias
     #: ``sigma_band_extrapolation`` by
@@ -4042,13 +4019,8 @@ class DynamicSigmaConfig:
         if self.omega_step_ev <= 0.0:
             raise ValueError("sigma_omega_step_ev must be > 0.")
         lo, hi = self.requested_edges_ev()
-        if hi < lo:
+        if not np.isfinite([lo, hi]).all() or hi < lo:
             raise ValueError("sigma_omega_max_ev must be >= sigma_omega_min_ev.")
-        if self.out_of_grid not in ("cover", "clamp", "static"):
-            raise ValueError(
-                "sigma_out_of_grid must be 'cover', 'clamp' or 'static'; got "
-                f"{self.out_of_grid!r}.")
-        self.parsed_omega_patches_ev()
         if self.fermi_reference not in ("vbm", "midgap", "mp1_fixed_n"):
             raise ValueError(
                 "fermi_reference must be 'vbm', 'midgap' or 'mp1_fixed_n'.")
@@ -4103,40 +4075,6 @@ class DynamicSigmaConfig:
         """The requested window for band classification; unset is unbounded."""
         return sigma_classification_window_ev(self)
 
-    def parsed_omega_patches_ev(self):
-        """The validated ``[(lo, hi), ...]`` patch list, or ``[]``; see docs/architecture/decisions.md."""
-        return self.parse_omega_patches_ev(self.omega_patches_ev, self.omega_step_ev)
-
-    @staticmethod
-    def parse_omega_patches_ev(text, step_ev):
-        """Parse a ``sigma_omega_patches_ev`` spelling at ``step_ev``; see :meth:`parsed_omega_patches_ev`."""
-        text = str(text or "").strip()
-        if not text:
-            return []
-        patches = []
-        for piece in text.split(","):
-            piece = piece.strip()
-            if not piece:
-                continue
-            parts = piece.split(":")
-            try:
-                lo, hi = (float(parts[0]), float(parts[1])) \
-                    if len(parts) == 2 else (np.nan, np.nan)
-            except ValueError:
-                lo = hi = np.nan
-            if not (np.isfinite(lo) and np.isfinite(hi) and hi > lo):
-                raise ValueError(
-                    "sigma_omega_patches_ev must be 'lo:hi, lo:hi, ...' "
-                    f"with hi > lo in eV; could not parse {piece!r}")
-            patches.append((lo, hi))
-        for (l0, h0), (l1, h1) in zip(patches, patches[1:]):
-            if l1 < h0 + step_ev:
-                raise ValueError(
-                    "sigma_omega_patches_ev patches must be ascending and "
-                    f"separated by at least one step; [{l0}:{h0}] then "
-                    f"[{l1}:{h1}] at step {step_ev}. Merge "
-                    "them into one patch instead.")
-        return patches
 
 
 @dataclass(frozen=True)
@@ -4860,25 +4798,9 @@ class LorraxConfig:
             # by every SC map, under one rule.
             return np.asarray(self.sc_omega_grid_ev, dtype=np.float64)
         p = self.sigma
-        patches = p.parsed_omega_patches_ev()
-        if not patches:
-            lo, hi = sigma_requested_edges_ev(p)
-            n = int(np.floor((hi - lo) / p.omega_step_ev + 0.5)) + 1
-            grid = lo + p.omega_step_ev * np.arange(n, dtype=np.float64)
-        else:
-            pieces = []
-            for lo, hi in patches:
-                n = int(np.floor((hi - lo) / p.omega_step_ev + 0.5)) + 1
-                pieces.append(lo + p.omega_step_ev * np.arange(
-                    n, dtype=np.float64))
-            grid = np.concatenate(pieces)
-        if np.any(np.diff(grid) <= 0.0):
-            raise ValueError(
-                "sigma_omega_patches_ev produced a non-increasing grid; "
-                "patches must be ascending and disjoint")
-        # The requested grid.  The one-shot and every SC map grow it by one
-        # rule (gw.qp_support) into ``sc_omega_grid_ev``, so SC map 0 is the
-        # one-shot calculation.
+        lo, hi = sigma_requested_edges_ev(p)
+        n = int(np.ceil((hi - lo) / p.omega_step_ev)) + 1
+        grid = lo + p.omega_step_ev * np.arange(n, dtype=np.float64)
         return grid
 
     @property

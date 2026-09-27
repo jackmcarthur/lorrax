@@ -69,7 +69,7 @@ from .band_partition import (
     BandPartition, apply_band_partition, build_omega_band_partition)
 from .efermi import (OCCUPATION_CLAMP_TOL_DEFAULT
                      as _OCCUPATION_CLAMP_TOL_DEFAULT, OccupationState)
-from .gw_config import ComputeMode, HeadCorrection, sigma_classification_window_ev
+from .gw_config import ComputeMode, HeadCorrection
 from .scissor import (ScissorFit, apply_conduction_scissor_to_tail,
                       classify_scissor_bands, fit_scissor)
 from .sigma_dispatch import (
@@ -3969,7 +3969,7 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
         from .scissor import qsgw_out_of_range_energies
         from .shared_pole_recipe import active_band_mask
         target = qsgw_out_of_range_energies(
-            e_dft_fit_ev, valence_kn, tail_fit,
+            e_dft_fit_ev, tail_fit, valence_kn,
             fermi_displacement_ev=_mu_ev-float(inputs.wfn.efermi)*RYD_TO_EV,
             crossing_mask_kn=(None if scissor_classes is None else crossing_kn)) / RYD_TO_EV
         active = active_band_mask(np.asarray(inputs.e_dft_active_kn_ry), float(inputs.wfn.efermi))
@@ -4396,46 +4396,6 @@ def _record_sc(inputs: SCInputs, line: str) -> None:
         record_fn(line)
     elif fallback is not None:
         fallback(line)
-
-
-def _sc_edge_ambiguity(inputs: SCInputs, state_out: SCState) -> tuple[int, str]:
-    """Count this map's states that sit within a Sigma-grid edge jump.
-
-    Reads the map's own diagonal Sigma_c(omega) cube, grid and evaluation
-    ladder (the same operands and reference ``_sc_z_factors`` uses) and
-    applies ``qsgw_utils.sigma_grid_edge_ambiguity``.  Collective for a
-    band-sharded cube, so every rank calls it.  Returns (count, detail).
-    """
-    # Only Sigma(0) jumps at an edge: clamp is continuous there, and cover
-    # leaves no protected identity off the grid.
-    if inputs.config.sigma.out_of_grid != "static":
-        return 0, ""
-    sigma = state_out.outputs.sigma_result
-    cube, omega = sigma.sigma_c_omega_kij_ry, sigma.omega_grid_ev
-    if cube is None or omega is None:
-        return 0, ""
-    from .qsgw_utils import extract_sigma_diag_replicated, sigma_grid_edge_ambiguity
-    diag = np.asarray(extract_sigma_diag_replicated(cube, inputs.mesh_xy),
-                      dtype=np.complex128) * RYD_TO_EV
-    if sigma.sigma_band_axis is not None:
-        from runtime.padding import strip_axis
-        diag = np.asarray(strip_axis(diag, sigma.sigma_band_axis, axis=-1))
-    e_rel = np.asarray(sigma.e_eval_ev, dtype=np.float64) - float(sigma.efermi_dft_ev)
-    from .scissor import sc_padded_window_ev
-    window = sc_padded_window_ev(*sigma_classification_window_ev(inputs.config.sigma))
-    ambiguous, jump = sigma_grid_edge_ambiguity(
-        diag, np.asarray(omega, dtype=np.float64), e_rel, growth_window_ev=window)
-    # Frozen-core bands are held at their DFT block (no Sigma enters them).
-    ambiguous[:, :int(inputs.config.sc.frozen_core_bands)] = False
-    n = int(np.count_nonzero(ambiguous))
-    if not n:
-        return 0, ""
-    k, b = np.unravel_index(int(np.argmax(np.where(ambiguous, np.abs(jump), -1.0))),
-                            jump.shape)
-    return n, (f"largest jump {float(jump[k, b]):+.3f} eV at k={int(k)} sorted band "
-               f"{int(b) + 1}, E-mu={float(e_rel[k, b]):+.3f} eV; grid "
-               f"[{float(omega[0]):+.2f}, {float(omega[-1]):+.2f}] eV, growth window "
-               f"[{window[0]:+.2f}, {window[1]:+.2f}] eV")
 
 
 def _sc_z_factors(
@@ -5621,12 +5581,6 @@ def _run_anderson(
         _verdict, state_out = _sc_identity_for_call(
             inputs, state_out, E_in, E_new, _identity_history, cutoff_ev=tol_ev,
             u_out=_out_eig[1])
-        _n_edge, _edge_detail = _sc_edge_ambiguity(inputs, state_out)
-        if _n_edge:
-            _verdict = replace(_verdict, edge_ambiguous=_n_edge,
-                               edge_ambiguous_detail=_edge_detail)
-            _record_sc(inputs, f"    SC grid-edge ambiguity: {_n_edge} state(s) "
-                               f"within the Sigma(E)/Sigma(0) jump; {_edge_detail}")
         _last_outputs[0] = state_out.outputs
         _last_verdict[0] = _verdict
         rms = float(np.sqrt(np.mean((E_new - _e_history[-1]) ** 2)))

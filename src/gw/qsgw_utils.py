@@ -55,22 +55,11 @@ def omega_coverage(omega_grid: np.ndarray,
     return covered, n_out, frac
 
 
-def sigma_eval_omega(omega_grid: np.ndarray, eval_kn: np.ndarray,
-                     policy: str) -> tuple[np.ndarray, np.ndarray]:
-    """``(omega_read_kn, covered_kn)``: where each QSGW Sigma(E) evaluation
-    reads, under ``sigma_out_of_grid`` (docs/self_consistency.md §4).
-
-    The coverage is :func:`omega_coverage`'s, the one classification the Sigma
-    build, the SC grid growth and the sum-band tail mask all read.  A covered
-    energy reads itself.  An uncovered one reads the nearest grid edge under
-    ``clamp`` and omega = 0 under ``static``; under ``cover`` the SC growth has
-    already covered every protected identity, so what remains uncovered is a
-    frozen-core band (decoupled from H) and reads omega = 0.
-    """
+def sigma_eval_omega(omega_grid: np.ndarray, eval_kn: np.ndarray):
+    """Clamp reads to fixed support; return the physical coverage separately."""
     covered = omega_coverage(omega_grid, eval_kn)[0]
     omega = np.asarray(omega_grid, dtype=np.float64)
     return np.clip(np.asarray(eval_kn, dtype=float), omega[0], omega[-1]), covered
-
 
 
 def interp_along_omega(
@@ -83,26 +72,20 @@ def interp_along_omega(
 ) -> np.ndarray:
     """Linearly interpolate ``values_w_kn[ω, k, n]`` along ω at per-(k, n) points ``eval_kn``.
 
-    An evaluation energy outside the sampled grid takes the static value at
-    ω = 0 (owner rule 2026-09-22: the grid covers the manifold of interest and
-    everything else falls back to Σ(ω=0)); ω = 0 must lie inside the grid.
-    With ``print_fn``, one counted line names how many cells fell back.
+    An evaluation energy outside the sampled grid reads the nearest edge.
+    With ``print_fn``, one counted line names the clamped cells.
 
     values_w_kn : (nω, nk, nb); omega_grid : (nω,) increasing, the same
     reference as ``eval_kn`` (E_F-relative); returns (nk, nb).
     """
     omega = np.asarray(omega_grid, dtype=np.float64)
     eval_arr = np.asarray(eval_kn, dtype=np.float64)
-    if not float(omega[0]) <= 0.0 <= float(omega[-1]):
-        raise ValueError(
-            f"interp_along_omega: the Sigma(omega=0) fallback needs omega = 0 inside the grid "
-            f"[{float(omega[0]):.3f}, {float(omega[-1]):.3f}]")
     covered, n_out, frac = omega_coverage(omega, eval_arr)
     if n_out and print_fn is not None:
         where = f" [{context}]" if context else ""
         print_fn(f"  omega coverage{where}: {n_out} of {eval_arr.size} ({100.0 * frac:.1f}%) "
                  f"evaluation energies outside [{float(omega[0]):.3f}, {float(omega[-1]):.3f}] "
-                 f"use Sigma(omega=0).")
+                 f"read the nearest sampled edge.")
     e = np.clip(eval_arr, omega[0], omega[-1])
     idx_hi = np.clip(np.searchsorted(omega, e, side="left"), 1, omega.size - 1)
     idx_lo = idx_hi - 1
@@ -113,68 +96,6 @@ def interp_along_omega(
     return ((1.0 - w_hi) * values_w_kn[idx_lo, k_idx, n_idx]
             + w_hi * values_w_kn[idx_hi, k_idx, n_idx])
 
-
-def sigma_grid_edge_ambiguity(
-    sigma_c_diag_w_kn_ev: np.ndarray,
-    omega_grid_ev: np.ndarray,
-    e_kn_ev: np.ndarray,
-    growth_window_ev: tuple[float, float] | None = None,
-) -> tuple[np.ndarray, np.ndarray]:
-    """States whose QSGW diagonal fixed point is not unique at a grid edge.
-
-    The out-of-grid rule above (and :func:`build_qsgw_sigma_xc`) makes the
-    QSGW map DISCONTINUOUS at each sampled-grid edge ω_e: a state inside the
-    grid takes Σ_c,nn(E_n), a state outside takes Σ_c,nn(0), so its diagonal
-    jumps by
-
-        Δ_n = Re Σ_c,nn(0) − Re Σ_c,nn(ω_e)      (ω_e = the nearer edge).
-
-    In the diagonal model E = A + Σ(E), when the jump carries a state OUTWARD
-    (Δ_n > 0 at the top edge, Δ_n < 0 at the bottom) a state within |Δ_n| of
-    the edge, on either side, has a self-consistent partner on the other
-    side: two fixed points, and the one the loop reaches depends on its path.
-    That is what is flagged.  An inward jump leaves no fixed point within
-    |Δ_n| outside the edge (such a state maps back inside), so a converged
-    state there cannot occur and an inside state is unique.  Measured: Fe 4^3 bispinor H-point states at
-    E-μ = +9.8 (inside, Σ(E)) and +11.7 eV (outside, Σ(0)) around a +10 eV
-    edge, Δ = 1.87 eV, one branch per accelerator (sandbox claim 2688).
-
-    No threshold: the band is the jump itself.  Parameters are the diagonal
-    Σ_c(ω) samples ``(nω, nk, nb)`` (eV, complex or real), the increasing
-    grid ``(nω,)`` and the evaluation energies ``(nk, nb)``, all on the same
-    E_F-relative reference.  Returns ``(ambiguous_kn, jump_kn_ev)``.
-
-    ``growth_window_ev`` is the SC loop's padded window (``scissor.
-    sc_padded_window_ev``): a state inside it GROWS the grid instead of
-    leaving it, so the Σ(E)/Σ(0) switch sits at the outer of the grid edge
-    and the window edge.  Where the window reaches past the grid, Σ there is
-    unsampled and the sampled edge value stands in for it (an estimate).
-    Fe 4^3 at +28 eV: without this, 12 states near the +28 grid edge were
-    flagged at map 0 although the grid would have grown under them.
-    """
-    omega = np.asarray(omega_grid_ev, dtype=np.float64)
-    e = np.asarray(e_kn_ev, dtype=np.float64)
-    sig = np.real(np.asarray(sigma_c_diag_w_kn_ev))
-    if sig.shape != (omega.size,) + e.shape:
-        raise ValueError(
-            f"sigma_grid_edge_ambiguity: Sigma diag {sig.shape} does not match "
-            f"grid {omega.shape} x energies {e.shape}")
-    at_zero = interp_along_omega(sig, omega, np.zeros_like(e))
-    lo, hi = float(omega[0]), float(omega[-1])
-    if growth_window_ev is not None:
-        lo, hi = min(lo, float(growth_window_ev[0])), max(hi, float(growth_window_ev[1]))
-    use_top = np.abs(e - hi) <= np.abs(e - lo)
-    edge = np.where(use_top, hi, lo)
-    at_edge = np.where(use_top, sig[-1], sig[0])
-    jump = at_zero - at_edge
-    outward = np.where(use_top, jump > 0.0, jump < 0.0)
-    ambiguous = outward & (np.abs(e - edge) < np.abs(jump))
-    return ambiguous, jump
-
-
-# ---------------------------------------------------------------------------
-# Diagonal-Σ(E) fixed point  (host NumPy, vectorised)
-# ---------------------------------------------------------------------------
 
 def assert_omega_grid_covers(E_kn_ry, in_grid_mask, omega_grid_ry, *,
                              context):
@@ -661,7 +582,6 @@ def build_qsgw_sigma_xc(
     *,
     replicated_output: bool = True,
     band_axis=None,
-    out_of_grid: str = "clamp",
     protected_kn=None,
 ) -> tuple[jax.Array, dict[str, float]]:
     """Build the static Hermitian QSGW Σ_xc[k, m, n].
@@ -741,13 +661,7 @@ def build_qsgw_sigma_xc(
     # Linear-interp index/weight arrays, host-side then pushed replicated.
     omega_lo = float(omega[0])
     omega_hi = float(omega[-1])
-    # sigma_out_of_grid decides where an uncovered energy reads; the grid is
-    # E_F-relative, so omega = 0 is E_F and must be sampled for cover/static.
-    if out_of_grid != "clamp" and not omega_lo <= 0.0 <= omega_hi:
-        raise ValueError(
-            f"build_qsgw_sigma_xc: the Sigma(omega=0) fallback needs omega = 0 inside "
-            f"[{omega_lo:.3f}, {omega_hi:.3f}] eV")
-    E_clamped, inside = sigma_eval_omega(omega, E, out_of_grid)
+    E_clamped, inside = sigma_eval_omega(omega, E)
     n_clipped = int(np.count_nonzero(~inside[:, :logical_nb]))
     idx_hi = np.clip(np.searchsorted(omega, E_clamped, side="left"),
                      1, n_omega - 1)
@@ -989,7 +903,7 @@ def solve_qp(
         band_axis=band_axis,
     )
     print_fn(f"  QSGW: {int(qsgw_diag['n_clipped'])} evaluations off the grid "
-        f"({100*qsgw_diag['frac_clipped']:.1f}%) read Sigma(omega=0)")
+        f"({100*qsgw_diag['frac_clipped']:.1f}%) clamp to the sampled edge")
     # THE REBUILD SUPERSEDES THE AT-DFT CUBE IN THE FILE TOO.  The Σ
     # dispatch already appended its own QSGW build — evaluated at E_DFT,
     # which is what ``one_shot_dft`` keeps — and on this branch that build
@@ -1095,7 +1009,6 @@ __all__ = [
     "omega_coverage",
     "plot_qp_energy_comparison",
     "remove_managed",
-    "sigma_grid_edge_ambiguity",
     "sigma_eval_omega",
     "solve_diagonal_sigma_fixed_point",
     "write_qsgw_sigma_cube",
