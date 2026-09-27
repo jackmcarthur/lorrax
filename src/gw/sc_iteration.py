@@ -3494,16 +3494,20 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
                             uses_direct_bispinor_shared_pole_head)
     if uses_direct_bispinor_shared_pole_head(inputs.config):
         sigma = inputs.band_slices.sigma
-        if (sigma.start != 0 or entry_occ_state is None
+        # A metal's head reads the entry-solved FD state; an insulator's reads
+        # the bundle's step occupations (``metal_occ_state`` is None).
+        metal = inputs.material_class == "metal"
+        if (sigma.start != 0 or (metal and entry_occ_state is None)
                 or U_full.shape != (wfns_qp.enk.shape[0], sigma.stop, sigma.stop)
                 or not bool(jnp.array_equal(wfns_qp.enk[:, sigma], E_full))
-                or not bool(jnp.array_equal(wfns_qp.occ, entry_occ_state.f_kn))):
+                or (metal and not bool(jnp.array_equal(wfns_qp.occ, entry_occ_state.f_kn)))):
             raise ValueError("GATE photon_direct_map_state: Γ E, f, and U "
                              "must be the same map-entry QP state")
         inputs.print_fn(f"    direct photon Γ map state: iteration={state.iteration}, "
                         f"active=[{inputs.band_slices.b0},{inputs.band_slices.b3}), "
-                        f"occupations={entry_occ_state.occ_hash}; "
-                        "inactive velocity rotation=identity")
+                        "occupations="
+                        + (entry_occ_state.occ_hash if metal else "insulating step")
+                        + "; inactive velocity rotation=identity")
 
     def _screening(mpa_plan, iteration_head_response, *, producer=None,
                    quad_override=None):
