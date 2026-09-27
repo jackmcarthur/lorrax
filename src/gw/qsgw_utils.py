@@ -157,8 +157,8 @@ def solve_diagonal_sigma_fixed_point(
     -------
     E : (nk, nb)
         Converged QP eigenvalues in eV.  An iterate outside
-        ``[ω_min, ω_max]`` reads Σ(ω = 0) (:func:`interp_along_omega`), not
-        the nearest grid edge; the caller
+        ``[ω_min, ω_max]`` reads the nearest sampled edge
+        (:func:`interp_along_omega`); the caller
         (:func:`solve_qp`) puts every band that is not on the grid at all k
         back at E_DFT.
     converged : (nk, nb), bool
@@ -180,7 +180,7 @@ def solve_diagonal_sigma_fixed_point(
     mix = float(np.clip(mixing, 0.0, 1.0))
 
     for it in range(max_iter):
-        # An off-grid iterate reads Sigma(omega = 0) (interp_along_omega):
+        # An off-grid iterate reads the nearest edge (interp_along_omega):
         # a refusal here would kill the solve on a band the caller replaces
         # by E_DFT anyway (see the Returns section).  Unreported on purpose —
         # it runs up to ``max_iter`` times and one line per iteration is
@@ -864,7 +864,7 @@ def solve_qp(
 
     # A band is "in-grid" iff E_DFT[k, n] lies in [ω_min, ω_max] for every
     # k; if any single k is outside, the band keeps E_DFT at every k (the
-    # diagonal solver read Σ(ω = 0) for the offending k, which would
+    # diagonal solver clamped the offending k to a sampled edge, which would
     # otherwise contaminate the band's k-dispersion).  E_DFT is the
     # zeroth-order QP correction = 0 estimate.
     from .scissor import classify_bands_in_grid
