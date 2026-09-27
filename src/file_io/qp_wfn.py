@@ -917,8 +917,9 @@ def write_complete_wfn_h5(output_path: str, wfn, energies_ry: np.ndarray,
     Per k, one all-reduce puts the owner's block on every rank (``nbands ·
     nspinor · ngk · 16`` B), each rank slices its G window and every window
     is written collectively through ``file_io.slab_io`` as
-    :func:`write_qp_wfn_h5` writes its rotated slabs.  ``stamps`` land at the
-    root beside :data:`COMPLETE_WFN_ATTR` = the band count.
+    :func:`write_qp_wfn_h5` writes its rotated slabs.  Occupations are the
+    source's, zero past its last band.  ``stamps`` land at the root beside
+    :data:`COMPLETE_WFN_ATTR` = the band count.
     """
     from jax.sharding import NamedSharding, PartitionSpec as P
     from common import timing
@@ -933,11 +934,22 @@ def write_complete_wfn_h5(output_path: str, wfn, energies_ry: np.ndarray,
             f"write_complete_wfn_h5: energies shape {energies_ry.shape} is "
             f"not (nk={nk}, nbands).")
     nbands = int(energies_ry.shape[1])
+    # The source's occupation table, zero past its last band: the occupied
+    # density operator (and so the WFN TRS verdict, measured from it) is the
+    # source's, metals included.
+    source_occ = np.asarray(wfn.occs, dtype=np.float64)
+    keep = min(nbands, int(source_occ.shape[-1]))
+    if np.any(source_occ[..., keep:] != 0.0):
+        raise ValueError(
+            f"write_complete_wfn_h5: {nbands} bands would drop occupied "
+            f"source bands (occupation beyond band {keep}).")
+    occupations = np.zeros(source_occ.shape[:-1] + (nbands,), np.float64)
+    occupations[..., :keep] = source_occ[..., :keep]
     stamps = {**stamps, COMPLETE_WFN_ATTR: nbands}
     with timing.section("complete_wfn.write"):
         ngk = _write_source_header(
             output_path, wfn, nbands=nbands, energies_ry=energies_ry,
-            occupations=None, stamps=stamps, mesh=mesh)
+            occupations=occupations, stamps=stamps, mesh=mesh)
         kpt_starts = np.asarray(wfn.kpt_starts, dtype=np.int64)
         width = _coefficient_window(mesh, nbands=nbands, nspinor=nspinor,
                                     ngkmax=int(np.max(ngk)))

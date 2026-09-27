@@ -31,7 +31,8 @@ import jax.numpy as jnp
 import numpy as np
 
 from psp.ionic_gspace import build_ionic_and_core
-from psp.dft_operators import build_G_cart, compute_V_H_and_V_xc, build_V_scf
+from psp.dft_operators import (build_G_cart, build_V_scf, compute_V_H_and_V_xc,
+                               compute_V_H_and_V_xc_noncollinear)
 import psp.vnl_ops as vnl_ops
 from common.fft_helpers import local_ifftn3
 
@@ -46,6 +47,7 @@ def build_dft_potentials(
     rho_val: jax.Array,
     *,
     truncation_2d: bool,
+    magnetization: jax.Array | None = None,
     verbose: bool = True,
 ) -> tuple[jax.Array, jax.Array, vnl_ops.VNLSetup]:
     """Build (V_scf, V_loc, vnl_setup) on the FFT grid.
@@ -62,13 +64,16 @@ def build_dft_potentials(
         Real-space valence charge density in e/bohr³.
     truncation_2d : bool
         Apply 2D Coulomb truncation in V_H (slab geometries).
+    magnetization : (3, nx, ny, nz) float64, optional
+        m(r) of a noncollinear magnetic run; V_scf is then the spin matrix
+        (2, 2, nx, ny, nz) v δ + B_xc·σ (QE's general noncollinear GGA branch).
     verbose : bool
         Print timing.
 
     Returns
     -------
-    V_scf : (nx, ny, nz) float64
-        Combined local potential V_loc + V_H + V_xc.
+    V_scf : (nx, ny, nz) float64, or (2, 2, nx, ny, nz) complex128 when magnetic
+        Combined local potential V_loc + V_H + V_xc (+ B_xc·σ).
     V_loc : (nx, ny, nz) float64
         Ionic local potential alone (kept separately for h_diag).
     vnl_setup : vnl_ops.VNLSetup
@@ -84,12 +89,21 @@ def build_dft_potentials(
     nx, ny, nz = int(fft_grid[0]), int(fft_grid[1]), int(fft_grid[2])
     G_cart = build_G_cart(nx, ny, nz,
                           float(mf.blat) * np.asarray(mf.bvec, dtype=float))
-    V_H, V_xc = compute_V_H_and_V_xc(
-        rho_val, rho_core, rho_core_G, G_cart,
-        jnp.asarray(mf.bdot, dtype=jnp.float64),
-        jnp.asarray(mf.bvec, dtype=jnp.float64), mf.blat,
-        truncation_2d=truncation_2d)
-    V_scf = build_V_scf(V_loc, V_H, V_xc)
+    if magnetization is None:
+        V_H, V_xc = compute_V_H_and_V_xc(
+            rho_val, rho_core, rho_core_G, G_cart,
+            jnp.asarray(mf.bdot, dtype=jnp.float64),
+            jnp.asarray(mf.bvec, dtype=jnp.float64), mf.blat,
+            truncation_2d=truncation_2d)
+        V_scf = build_V_scf(V_loc, V_H, V_xc)
+    else:
+        V_H, V_xc, B_xc = compute_V_H_and_V_xc_noncollinear(
+            rho_val, rho_core, rho_core_G,
+            jnp.asarray(magnetization, dtype=jnp.float64), G_cart,
+            jnp.asarray(mf.bdot, dtype=jnp.float64),
+            jnp.asarray(mf.bvec, dtype=jnp.float64), mf.blat,
+            truncation_2d=truncation_2d)
+        V_scf = build_V_scf(V_loc, V_H, V_xc, B_xc)
     # j-resolved vs j-averaged V_NL resolves automatically inside
     # build_vnl_setup: ``mf.spinorbit`` (QE <spinorbit>) when ``mf`` came
     # from a .save; measured against the wavefunctions when ``mf`` is a
