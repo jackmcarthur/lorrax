@@ -1571,7 +1571,7 @@ def compute_photon_bank(wfns, wfns_transverse, meta, config, *, mesh_xy, sym,
                         mu_bases, layout, occupation_state, sample_plan, bank_io,
                         wfn=None, photon_g0_vectors=None,
                         wfn_fingerprint_binding=None, photon_head_cache=None,
-                        photon_head_rotation=None,
+                        photon_head_state=None,
                         print_fn=print):
     """Build a full photon bank through the existing sample/moment stages.
 
@@ -1582,6 +1582,10 @@ def compute_photon_bank(wfns, wfns_transverse, meta, config, *, mesh_xy, sym,
     memory planner, quadrature, transaction masks and reader are shared.
     Every call, every SC map included, builds its own static contact: the
     Ward proxy subtracts the static limit of this map's response.
+    ``photon_head_state = (rotation, wfns, occupation_state)`` sets the
+    direct head's state (``sc_head_update``): None entries are the bank's own
+    state and no rotation (one-shot); SC ``dft_velocity`` passes the map's
+    QP rotation, ``off`` the DFT bundle and its fixed-N state.
     """
     from file_io.shared_pole_store import validate_shared_pole_bank
 
@@ -1678,12 +1682,15 @@ def compute_photon_bank(wfns, wfns_transverse, meta, config, *, mesh_xy, sym,
                     host, empty, empty, empty, mesh=mesh_xy)
                 cache["direct_photon_velocity"] = velocity
                 del host
-            if photon_head_rotation is not None:
+            rotation, head_wfns, head_occupation = (
+                photon_head_state or (None, None, None))
+            if rotation is not None:
                 from .qsgw_head import rotate_velocity_active_to_qp
                 velocity = rotate_velocity_active_to_qp(
-                    velocity, photon_head_rotation, mesh=mesh_xy)
+                    velocity, rotation, mesh=mesh_xy)
             direct_head = build_direct_photon_head(
-                velocity, wfns, occupation_state,
+                velocity, wfns if head_wfns is None else head_wfns,
+                occupation_state if head_occupation is None else head_occupation,
                 photon_g0_vectors=direct_gamma, layout=layout,
                 mesh=mesh_xy, meta=meta, wfn=wfn,
                 frequencies_ry=bank_points(sample_plan), print_fn=print_fn)

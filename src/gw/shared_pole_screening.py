@@ -283,7 +283,7 @@ def screen_shared_poles(wfns, V_q, meta, config, *, mesh_xy, sym,
                         material_class=None, wfns_transverse=None,
                         bispinor_v_q_path=None, mu_bases=None,
                         photon_g0_vectors=None, photon_head_cache=None,
-                        photon_head_rotation=None):
+                        photon_head_state=None):
     """Build current W; only one-shot models may use ISDF restart membership.
 
     SC labels own separate map scratch. ``restart`` may restore the invariant
@@ -462,7 +462,7 @@ def screen_shared_poles(wfns, V_q, meta, config, *, mesh_xy, sym,
                 wfn=wfn, photon_g0_vectors=photon_g0_vectors,
                 wfn_fingerprint_binding=wfn_fingerprint_binding,
                 photon_head_cache=photon_head_cache,
-                photon_head_rotation=photon_head_rotation, print_fn=print_fn))
+                photon_head_state=photon_head_state, print_fn=print_fn))
         else:
             record("bank", produce_w_bank(wfns, meta, config, mesh_xy=mesh_xy,
                 sym=sym, sample_plan=recipe, bank_io=bank, print_fn=print_fn))

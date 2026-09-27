@@ -455,7 +455,13 @@ on one rank ([decisions](decisions.md); plan table in
 
 ## Self-consistency and restart
 
-Packed routes are one-shot (`qp_solver = one_shot_dft`). On B,
+Packed routes are one-shot (`qp_solver = one_shot_dft`). On SP-full every
+map rebuilds the sector bank and its Ward contact from the map's state.
+The direct Γ head follows `sc_head_update`: `dft_velocity` builds it on the
+map's state with the QP-rotated dipole velocity, and `off` on the DFT state
+at the map's frequencies (`compute_photon_bank(photon_head_state=…)`).
+The two differ by the head's Fermi surface (Fe 4³: ω_p 2.13 → 2.47 eV over
+maps 0–2 under `dft_velocity`). On B,
 self-consistency requires `density_self_consistent = true`. Each map
 rotates both the charge and the transverse parent bundles from their DFT
 references with the same $U$, $E$, passes the transverse bundle and its
