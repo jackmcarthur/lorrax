@@ -131,6 +131,10 @@ def _coulomb_resource(value, meta, sym, mesh_xy, path):
     op = QirrOperator.of(value)
     if op.n_full != meta.nk_tot or tuple(op.values.shape[1:]) != (basis.n_packed, basis.n_packed):
         raise ValueError("GATE shared_pole_coulomb: expected the packed bare V")
+    token = _operator_token(op.values)
+    linked = _link_staged_coulomb(token, qids, basis, path)
+    if linked is not None:
+        return linked
     value = op.at_rows(qids)
     kernel = _coulomb_unpack(basis)
     shape = (1, basis.n_packed, basis.n_packed)
@@ -149,9 +153,53 @@ def _coulomb_resource(value, meta, sym, mesh_xy, path):
                           valid_shape=(1, basis.n_logical, basis.n_logical))
             io.sync_writes()
             del canonical
-    return dict(path=str(path), dataset="V_canonical_qwedge", basis="canonical",
-                q_irr_full_idx=qids.tolist(), sha256=resource_digest(path),
-                operator=_operator_token(op.values))
+    resource = dict(path=str(path), dataset="V_canonical_qwedge", basis="canonical",
+                    q_irr_full_idx=qids.tolist(), sha256=resource_digest(path),
+                    operator=token)
+    _STAGED_COULOMB.clear()
+    _STAGED_COULOMB[token] = (resource, int(basis.n_canonical))
+    return resource
+
+
+#: The last staged canonical V resource of this process, by operator token.
+_STAGED_COULOMB: dict = {}
+
+
+def _link_staged_coulomb(token, qids, basis, path):
+    """Hard-link this operator's previously staged V into ``path``; None if unavailable.
+
+    Every SC map stages the same V_q into its own scratch generation; the
+    previous map's file (still retained while this map screens) has the same
+    bytes, so a hard link replaces the canonical conversion, the write and the
+    content hash (``response_bank.resource_digest`` keys its hash on the inode
+    generation).  Rank 0 links and broadcasts the verdict, so every rank
+    either returns the linked resource or stages as before.
+    """
+    import os
+    from common.collectives import rank0_transaction
+    held = _STAGED_COULOMB.get(token)
+    if (held is None or held[1] != int(basis.n_canonical)
+            or held[0]["q_irr_full_idx"] != qids.tolist()):
+        return None
+    source = held[0]["path"]
+    if os.path.abspath(source) == os.path.abspath(os.fspath(path)):
+        return None
+
+    def link():
+        try:
+            os.link(source, path)
+            return True
+        except OSError:
+            return False
+    if not rank0_transaction(path, stage="shared_pole.coulomb_link", write=link,
+                             return_value=True):
+        return None
+    # Consumers re-authenticate the link (authenticate_coulomb): same inode
+    # generation, same recorded hash, no read.  The next map links from this
+    # generation's name, which outlives the previous map's scratch.
+    resource = dict(held[0], path=str(path))
+    _STAGED_COULOMB[token] = (resource, held[1])
+    return resource
 
 
 #: The one bare-V operator of this process, by token.  The strong reference

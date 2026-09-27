@@ -539,9 +539,18 @@ def resource_digest(path):
     stat = path.stat()
     digest = np.zeros(32, dtype=np.uint8)
     if jax.process_index() == 0:
-        digest[:] = np.frombuffer(bytes.fromhex(_resource_hash(
-            str(path), stat.st_size, stat.st_mtime_ns)), dtype=np.uint8)
+        # One hash per file generation: a hard link of an already hashed
+        # generation (an SC map's re-staged V) is not read again.
+        generation = (stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns)
+        hexdigest = _HASH_BY_GENERATION.get(generation)
+        if hexdigest is None:
+            hexdigest = _HASH_BY_GENERATION[generation] = _resource_hash(
+                str(path), stat.st_size, stat.st_mtime_ns)
+        digest[:] = np.frombuffer(bytes.fromhex(hexdigest), dtype=np.uint8)
     return bytes(np.asarray(multihost_utils.broadcast_one_to_all(digest))).hex()
+
+
+_HASH_BY_GENERATION: dict = {}
 
 
 def authenticate_coulomb(bank_io, qids):
