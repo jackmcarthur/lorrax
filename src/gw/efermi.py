@@ -176,13 +176,13 @@ def resolve_sigma_efermi_ry(fermi_reference, *, occupation_state, wfn):
 #: 4^3 from 798 to 1159 tau pairs and its cold rule plan from 58 s to 98 s
 #: (CLAIMS 2863), for states that carry no weight.
 #:
-#: THE BOUND.  A state that crosses the cut between SC maps switches one
-#: branch term on or off, and it changes Sigma by at most about the floor
-#: times the term the weight multiplies.  At 0.005 that was 5.38 meV on Fe
-#: (CLAIMS 2793); at 1e-5 it is about 0.01 meV.  Each weight the floor
-#: drops bounds the one-shot truncation the same way.
-#: No deck key: the one-shot and every SC map read this constant, so SC map
-#: 0 is the one-shot.
+#: A state crossing the cut switches one weighted branch term on or off.
+#: Holding that term fixed, scaling the 5.38 meV Fe switch at 0.005
+#: (CLAIMS 2793) to 1e-5 estimates 0.01 meV.  This is not an end-to-end
+#: error bound: screening and quadrature also change with support, and
+#: the raw eqp1 derivative can amplify a small Sigma change.
+#: No deck key: the one-shot and every SC map read this constant, so their
+#: branch support agrees for the same occupation table.
 OCCUPATION_WEIGHT_FLOOR = 1e-5
 
 
@@ -220,7 +220,8 @@ def band_in_occupation_window(weight):
     (5.3 kBT, until 2026-09-26) dropped states that carry weight: 2.6 meV
     RMS / 8.4 meV max of Fe 4^3 Sigma against the same model (CLAIMS 2451),
     and a 5.4 meV switch of one occupied-branch term when an SC state
-    crossed it (CLAIMS 2793).  At 1e-5 that switch is about 0.01 meV
+    crossed it (CLAIMS 2793).  The fixed-term estimate at 1e-5 is about
+    0.01 meV, not a bound on the complete GW result
     (:data:`OCCUPATION_WEIGHT_FLOOR`).
 
     WHAT THE FLOOR DECIDES.  The Sigma executor multiplies each band's factor
