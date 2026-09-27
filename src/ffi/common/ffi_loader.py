@@ -130,6 +130,9 @@ _CUDA_TARGET_SYMBOLS = {
     "lorrax_mathdx_kconv_klead_unfold_xblock": "KConvMathdxKleadUnfoldXBlockCudaFfi",
     "lorrax_mathdx_kconv_klead_lorentz_conj": "KConvMathdxKleadLorentzConjCudaFfi",
     "lorrax_mathdx_kfft_klead_unfold": "KFftMathdxKleadUnfoldCudaFfi",
+    # Mode 9's identity-spin arm (additive; an older library lacks it and the
+    # router keeps the dense arm).
+    "lorrax_mathdx_kfft_klead_unfold_idspin": "KFftMathdxKleadUnfoldIdSpinCudaFfi",
     "lorrax_mathdx_kconv_chi_unfold": "KConvMathdxChiUnfoldCudaFfi",
     "lorrax_mathdx_kfft_klead":     "KFftMathdxKleadCudaFfi",
     "lorrax_mathdx_kconv_kminor":   "KConvMathdxKminorCudaFfi",

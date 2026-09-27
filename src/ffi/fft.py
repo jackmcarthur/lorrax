@@ -193,6 +193,10 @@ KCONV_KLEAD_OUTER_DECODE_TARGET = "lorrax_mathdx_kconv_klead_outer_decode"
 KCONV_KLEAD_UNFOLD_TARGET = "lorrax_mathdx_kconv_klead_unfold_xblock"
 KCONV_KLEAD_LORENTZ_TARGET = "lorrax_mathdx_kconv_klead_lorentz_conj"
 KFFT_KLEAD_UNFOLD_TARGET = "lorrax_mathdx_kfft_klead_unfold"
+#: Mode 9's identity-spin arm: same operands, the endpoint actions already folded into the
+#: tables (``symmetry_maps.fold_monomial_endpoint_action``).  Additive: not in
+#: ``KCONV_TARGETS``; a library without it serves the same tables on the dense arm.
+KFFT_KLEAD_UNFOLD_ID_TARGET = "lorrax_mathdx_kfft_klead_unfold_idspin"
 #: Mode 11, the chi0 pass read from the raw-parent Green pair (:func:`make_kconv_chi_unfold`).
 KCONV_CHI_UNFOLD_TARGET = "lorrax_mathdx_kconv_chi_unfold"
 KFFT_KLEAD_TARGET = "lorrax_mathdx_kfft_klead"
@@ -1593,12 +1597,36 @@ def make_kconv_klead_unfold(mesh: Mesh, kgrid, tables, *, store_rows, norm: str 
     return apply
 
 
+_VERTEX_CODE_VALUES = np.concatenate([np.asarray([1, 1j, -1, -1j], dtype=np.complex128),
+                                      np.sqrt(2.0) * np.asarray([1, 1j, -1, -1j]), [0.0]])
+
+
+def _vertex_phase_codes(phase, ns: int, label: str) -> np.ndarray:
+    """A Lorentz vertex's entries as the four-current door's codes (mode 8 only).
+
+    0-3: i^c; 4-7: sqrt(2) i^(c-4); 8: zero.  The circular current vertices
+    alpha^+- = (alpha^1 +- i alpha^2)/sqrt(2) have entries sqrt(2) and 0.  A
+    unit-modulus vertex gets the modes 0/1/6 codes 0-3, so every Cartesian
+    door's attributes are unchanged and an older handler refuses only 4-8.
+    """
+    values = np.asarray(phase, dtype=np.complex128).reshape(-1)
+    if values.size != ns:
+        raise ValueError(f"k-conv {label} phase has {values.size} entries; ns={ns}")
+    codes = np.empty(ns, dtype=np.int64)
+    for i, value in enumerate(values):
+        hits = np.flatnonzero(np.abs(_VERTEX_CODE_VALUES - value) <= 1e-14)
+        if hits.size != 1:
+            raise ValueError(f"k-conv {label} phase[{i}]={value!r} is not a door vertex entry")
+        codes[i] = int(hits[0])
+    return codes
+
+
 def _vertex_tables(vertices, ns: int, label: str) -> tuple[np.ndarray, np.ndarray]:
     """``(perm, phase)`` monomial vertices → concatenated perm and phase-code attributes."""
     if not 1 <= len(vertices) <= 4:
         raise ValueError(f"k-conv {label}: 1..4 Lorentz vertices per side, got {len(vertices)}")
     perms = [_check_perm(perm, ns, f"{label} vertex {i}") for i, (perm, _) in enumerate(vertices)]
-    codes = [_conv_kpair_phase_codes(phase, ns, f"{label} vertex {i}")
+    codes = [_vertex_phase_codes(phase, ns, f"{label} vertex {i}")
              for i, (_, phase) in enumerate(vertices)]
     return np.concatenate(perms).astype(np.int64), np.concatenate(codes).astype(np.int64)
 
@@ -1663,7 +1691,7 @@ def make_kconv_lorentz_unfold(mesh: Mesh, kgrid, tables, *, left_vertices, right
                 jnp.asarray(kout), prep_local(v), conj_src=np.int64(bool(conj_src)), **attrs)
     else:
         forward_local = make_local_kfft_klead(mesh, kg, kind="fftn", norm=norm)
-        quarter = np.asarray([1, 1j, -1, -1j], dtype=np.complex128)
+        quarter = _VERTEX_CODE_VALUES
         left = [(perm_l[i * ns:(i + 1) * ns], quarter[phase_l[i * ns:(i + 1) * ns]]) for i in range(na)]
         right = [(perm_r[j * ns:(j + 1) * ns], quarter[phase_r[j * ns:(j + 1) * ns]]) for j in range(nb)]
 
@@ -1753,10 +1781,18 @@ def make_kfft_klead_unfold(mesh: Mesh, kgrid, tables, *, norm: str | None = "ort
         attrs = dict(nkx=np.int64(kg[0]), nky=np.int64(kg[1]), nkz=np.int64(kg[2]),
                      scale=np.float64(ffi_fft_scale("ifftn", norm, nk)), conj_trs=np.int64(conj),
                      **_mathdx_common())
+        # Identity endpoint actions (host tables): the load reads no spin table.
+        identity = all(np.array_equal(a, np.broadcast_to(np.eye(a.shape[-1]), a.shape))
+                       for a in (spin_l, spin_r))
+        target = KFFT_KLEAD_UNFOLD_TARGET
+        if identity:
+            from ffi.common import ffi_loader
+            if ffi_loader.probe_target(KFFT_KLEAD_UNFOLD_ID_TARGET, "CUDA")[0]:
+                target = KFFT_KLEAD_UNFOLD_ID_TARGET
 
         def apply_tables(w, wt, t):
             out = jax.ShapeDtypeStruct((nk, int(w.shape[1]), int(w.shape[2])), w.dtype)
-            return jax.ffi.ffi_call(KFFT_KLEAD_UNFOLD_TARGET, out)(
+            return jax.ffi.ffi_call(target, out)(
                 w, wt, t.row, t.trs, t.lsrc, t.rsrc, t.mph, t.nph, t.spin, t.spin_r, **attrs)
     else:
         _require_plan_route()
