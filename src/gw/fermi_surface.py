@@ -188,21 +188,30 @@ def tetrahedron_delta_weights(
                       _tetrahedron_decomposition_orbit(symmetry_matrices))
     weights = np.zeros_like(energies)
     cell_jacobian = 1.0 / (float(len(decompositions)) * float(nk_expected))
-    nbands = int(energies.shape[1])
-    for base in np.ndindex(*(int(x) for x in grid)):
-        base_vec = np.asarray(base, dtype=np.int64)
-        for decomposition in decompositions:
-            for offsets in decomposition:
-                vertices = np.mod(base_vec[None, :] + offsets, grid[None, :])
-                flat = np.asarray(
-                    [grid_to_flat[tuple(int(x) for x in vertex)]
-                     for vertex in vertices],
-                    dtype=np.int64,
-                )
-                for band in range(nbands):
-                    local = _tetra_delta_vertex_weights(
-                        energies[flat, band], chemical_potential)
-                    weights[flat, band] += cell_jacobian * local
+    # Every tetrahedron's four grid vertices, in the order of the historical
+    # loop (cell, decomposition, tetrahedron): ``flat[t]`` is tetrahedron t.
+    bases = np.asarray(list(np.ndindex(*(int(x) for x in grid))),
+                       dtype=np.int64).reshape(-1, 3)
+    offsets = np.stack([offsets for decomposition in decompositions
+                        for offsets in decomposition])
+    vertices = np.mod(bases[:, None, None, :] + offsets[None], grid)
+    flat = grid_to_flat[vertices[..., 0], vertices[..., 1],
+                        vertices[..., 2]].reshape(-1, 4)
+    # ``_tetra_delta_vertex_weights`` returns exact zeros unless
+    # min E < mu' < max E (mu' = nextafter(mu)), and adding +0.0 changes no
+    # weight, so only the (tetrahedron, band) pairs that straddle mu' are
+    # visited, in the historical order: the table is bit-identical.
+    mu_edge = float(np.nextafter(float(chemical_potential), np.inf))
+    block = 4096
+    for start in range(0, flat.shape[0], block):
+        corner = energies[flat[start:start + block]]
+        straddles = ((np.min(corner, axis=1) < mu_edge)
+                     & (np.max(corner, axis=1) > mu_edge))
+        for tet, band in zip(*np.nonzero(straddles)):
+            vertex = flat[start + tet]
+            local = _tetra_delta_vertex_weights(
+                energies[vertex, band], chemical_potential)
+            weights[vertex, band] += cell_jacobian * local
     return weights
 
 
