@@ -434,6 +434,9 @@ def _zeta_fit_provenance(*, wfn, meta, cfg, band_range_left, band_range_right,
 	if (int(vertex_mu_L) == 0
 			and tuple(band_range_left) != tuple(band_range_right)):
 		prov['charge_pair_training_domain'] = 'ordered_lr_plus_rl'
+	from common.gamma_matrices import current_fit_basis
+	if int(vertex_mu_L) != 0 and current_fit_basis() != 'cartesian':
+		prov['current_fit_basis'] = current_fit_basis()
 	return json.dumps(prov, sort_keys=True)
 
 
@@ -2337,6 +2340,12 @@ def _compute_photon_vq(
     if not (uses_coupled_photon_head(cfg)
             or uses_direct_bispinor_shared_pole_head(cfg)):
         photon_g0_vectors = None
+    else:
+        from common.gamma_matrices import current_fit_unitary
+        if current_fit_unitary() is not None:
+            raise NotImplementedError(
+                "circular current fit: the photon G=0 vectors are Cartesian "
+                "one-leg ζ coefficients and are not rotated; run head-off decks.")
     head_channel = None
     if str(getattr(cfg.head, 'mc_average_placement', 'off')) != 'off':
         raise NotImplementedError(
