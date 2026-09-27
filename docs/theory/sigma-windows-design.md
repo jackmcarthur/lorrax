@@ -32,7 +32,7 @@ Classification, interpolation and Hamiltonian masks add no quadrature pairs them
 | Use the provable insulator short side, including poles down to zero. | A gap trend is not a certificate. | MoS2 T=913/924; crossing cost alone exceeds 500. |
 | Use four times the initial far state, pole and damping extents. | Far-side reserve cannot enlarge the crossing edge. | Non-crossing costs: Fe 144, MoS2 54/65, Si 61, bispinor 139 per sector, Na 114/123/132. |
 | Use epsilon=1e-4 and QUADWIRE's derived rules on every W tier. | Keep one accuracy target and one rule owner. | T is measured at 1e-4; no tolerance relaxation is selected. |
-| Give every rotating band the static QSGW diagonal (T+V_ion+V_H+Sigma_x) plus one correlation scissor per side of mu, the mean Re Sigma_c,nn(E_n) of the protected occupied (empty) states. | It carries no V_xc, so the fixed point does not depend on the DFT start, and it reads Sigma only at protected energies; no band is held at DFT. | Zero pairs. |
+| Give every rotating band its DFT energy plus one scissor per side of mu, the mean H_ii - E_i of the protected occupied (empty) states; deep bands take the occupied-side scissor. | A diagonal error reaches a protected state at second order, |V|^2 dbeta/Delta^2; with exact couplings this law leaves 0.9-1.3 meV at the Si fixed point against 2.4-3.0 for a static-QSGW-plus-correlation diagonal (CLASSMIX). | Zero pairs. |
 | Reject the tested global-envelope automatic boundary replacement. | Its Fe spread is 1988.003 meV, against 1 meV. | 1613 pairs on its common broad diagnostic grid; no production saving established. |
 
 | Gate deck | Maps | T per map | Fixed sampled support, eV |
@@ -50,9 +50,9 @@ The implementation honors that request rather than silently applying an energy c
 ## Hamiltonian and geometry
 
 Protected bands P receive full QSGW Sigma and full mixing. Every other loaded
-band is R. Its diagonal is the static QSGW diagonal (T+V_ion+V_H+Sigma_x) in
-the DFT basis plus the correlation scissor of its side of mu; deep bands obey
-the same law.
+band is R. Its diagonal is its DFT energy plus the QP-correction scissor of
+its side of mu (mean H_ii - E_i over protected occupied or empty states);
+deep bands obey the same law.
 R–R off-diagonal entries vanish. A P–R entry uses herm Sigma_ij(E_i), i in P;
 P–P uses the usual Hermitian endpoint half-sum. The fixed DFT partition follows
 state identities through the eigenvectors; energy sorting never reclassifies P.

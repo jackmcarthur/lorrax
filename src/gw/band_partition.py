@@ -2,8 +2,8 @@
 
 Dynamic SC protects the requested DFT bands, counted from E_F at each k and
 closed outward to spectral gaps resolved at eta. Other bands rotate through
-their couplings to protected bands, with a static-QSGW-plus-correlation-scissor
-diagonal and no rotating–rotating mixing.
+their couplings to protected bands, with a DFT-plus-side-scissor diagonal and
+no rotating–rotating mixing.
 The legacy three-mask helper below serves fixed-Sigma EQP2 only.
 """
 
@@ -285,32 +285,35 @@ __all__ = [
 ]
 
 
-def rotating_diagonal(static_kn, sigma_c_kn, protected_kn, *, below_kn,
+def rotating_diagonal(h_diag_kn, e_dft_kn, protected_kn, *, below_kn,
                       fit_below_kn, fit_above_kn, k_weights):
-    """Rotating diagonal: static QSGW diagonal plus a correlation scissor per side.
+    """Rotating diagonal: DFT energy plus one QP-correction scissor per side of mu.
 
-    ``static_kn`` is (T + V_ion + V_H + Sigma_x)_nn in the DFT basis and
-    ``sigma_c_kn`` is Re Sigma_c,nn(E_n) of each identity in its own QP basis
-    (Ry, identity order). The scissor below (above) mu is the k-star-weighted
-    mean of ``sigma_c_kn`` over the protected occupied (empty) states; with
-    no protected state on one side, that side takes the other side's mean.
-    Neither term reads Sigma at a rotating energy or the DFT V_xc.
+    ``h_diag_kn`` is the full QSGW diagonal in the DFT basis and ``e_dft_kn``
+    the DFT energies (Ry, identity order). The scissor below (above) mu is the
+    k-star-weighted mean of H_ii - E_i over the protected occupied (empty)
+    states; with no protected state on one side, that side takes the other
+    side's mean. Nothing is read at a rotating energy and no band is held at
+    DFT. A diagonal error reaches a protected state only at second order,
+    |V_io|^2 d(beta)/(E_i - E_o)^2, so the side mean is weighted by nothing
+    else (claim: CLASSMIX).
     """
     w = np.asarray(k_weights, float)[:, None]
     p = np.asarray(protected_kn, bool)
-    sig = np.asarray(sigma_c_kn, float)
+    e = np.asarray(e_dft_kn, float)
+    delta = np.asarray(h_diag_kn, float) - e
     def side(mask):
         wt = w * (p & mask)
         total = float(wt.sum())
-        return (float((wt * sig).sum()) / total if total > 0 else None), int((p & mask).sum())
+        return (float((wt * delta).sum()) / total if total > 0 else None), int((p & mask).sum())
     (b_lo, n_lo), (b_hi, n_hi) = side(fit_below_kn), side(fit_above_kn)
     if b_lo is None and b_hi is None:
-        raise ValueError("rotating bands: no protected state fits the correlation scissor")
+        raise ValueError("rotating bands: no protected state fits the scissor")
     b_lo = b_hi if b_lo is None else b_lo
     b_hi = b_lo if b_hi is None else b_hi
-    target = np.asarray(static_kn, float) + np.where(below_kn, b_lo, b_hi)
+    target = e + np.where(below_kn, b_lo, b_hi)
     from common.units import RYD_TO_EV
-    return target, (f"beta_c below={b_lo * RYD_TO_EV:+.6f} eV (n={n_lo}), "
+    return target, (f"beta below={b_lo * RYD_TO_EV:+.6f} eV (n={n_lo}), "
                     f"above={b_hi * RYD_TO_EV:+.6f} eV (n={n_hi})")
 
 

@@ -3886,36 +3886,28 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
             inputs.print_fn)
     # The fixed DFT partition owns which endpoint carries dynamic Sigma.
     # Keep protected–rotating couplings; replace only the rotating block.
-    # A rotating diagonal is the static QSGW Hamiltonian (T + V_ion + V_H +
-    # Sigma_x, no V_xc) plus one correlation scissor per side of mu, the
-    # mean Re Sigma_c,nn(E_n) of the protected states on that side. No
-    # rotating state is read at its own energy and none is held at DFT.
+    # A rotating diagonal is its DFT energy plus one scissor per side of mu,
+    # the mean QP correction H_ii - E_i of the protected occupied (empty)
+    # states. No rotating state is read at its own energy and none is held
+    # at DFT (deep states take the occupied-side scissor).
     from .band_partition import rotating_band_hamiltonian, rotating_diagonal
     target = np.asarray(e_dft_fit, float).copy()
     rotating_loop = ~np.asarray(protected_loop, dtype=bool)
     if rotating_loop.any():
         from .qsgw_utils import static_sigma_diag_to_host
         from .scissor import k_star_weights
-        if sigma_result.sigma_x_kij_ry is None:
-            raise ValueError("rotating bands need Sigma_x for their static diagonal")
-        sigma_c_qp = sigma_result.sigma_xc_kij_ry - sigma_result.sigma_x_kij_ry
-        gamma_kn = np.take_along_axis(
-            static_sigma_diag_to_host(sigma_c_qp, inputs.mesh_xy).real,
-            np.asarray(indices_loop), axis=1)
-        static_kn = (static_sigma_diag_to_host(H_qp_dft_full, inputs.mesh_xy).real
-                     - static_sigma_diag_to_host(_rotate_to_dft_basis(
-                         sigma_c_qp, U_qp, mesh=inputs.mesh_xy), inputs.mesh_xy).real)
         empty_kn = ~np.asarray(valence_kn, dtype=bool)
         occupied_kn = np.asarray(valence_kn, dtype=bool)
         if scissor_classes is not None:
             empty_kn = empty_kn & ~crossing_kn
             occupied_kn = occupied_kn & ~crossing_kn
         target, law = rotating_diagonal(
-            static_kn, gamma_kn, np.asarray(protected_loop, dtype=bool),
+            static_sigma_diag_to_host(H_qp_dft_full, inputs.mesh_xy).real,
+            np.asarray(e_dft_fit, float), np.asarray(protected_loop, dtype=bool),
             below_kn=e_dft_fit_ev < float(_mu_ev),
             fit_below_kn=occupied_kn, fit_above_kn=empty_kn,
             k_weights=k_star_weights(ks))
-        _record_sc(inputs, f"    SC rotating diagonal: static QSGW + correlation scissor; {law}")
+        _record_sc(inputs, f"    SC rotating diagonal: DFT + side scissor; {law}")
     H_qp_dft_new = rotating_band_hamiltonian(
         H_qp_dft_full, jnp.asarray(protected_loop), jnp.asarray(target), inputs.mesh_xy)
 
