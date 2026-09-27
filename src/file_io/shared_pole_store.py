@@ -657,7 +657,46 @@ def _finalize_model(path, *, meta, header, basis=None):
             set_commit_state(f, True)
     with timing.section("finalisation"):
         rank0_transaction(path, stage="shared_pole.finalize", write=finish)
+        _record_finalized_digest(path, header["digest"])
         return _read_header(path)
+
+
+#: Payload digests this process computed while finalizing a model file, keyed
+#: by the finalized file's generation (resolved path, inode, size, mtime_ns).
+#: An SC map's Sigma validates the model its own constructor finalized seconds
+#: earlier; an unchanged generation reuses that digest instead of a second full
+#: payload read and hash (Na 8^3: ~0.8 s of idle devices per map).  Any rewrite
+#: changes the key, and a file from another process is always re-hashed.
+_FINALIZED_DIGESTS: dict = {}
+
+
+def _file_generation(path):
+    stat = Path(path).stat()
+    return (str(Path(path).resolve()), stat.st_ino, stat.st_size, stat.st_mtime_ns)
+
+
+def _record_finalized_digest(path, digest):
+    """Remember the payload digest of the file generation this process just finalized."""
+    try:
+        _FINALIZED_DIGESTS[_file_generation(path)] = digest
+    except OSError:
+        pass
+
+
+def _finalized_digest_current(path, digest):
+    """Whether ``path`` is still the generation finalized here with ``digest``.
+
+    Rank 0 decides and every rank takes its verdict, so the payload re-hash
+    that follows a False is entered by all ranks or none (INVARIANTS 21).
+    """
+    from jax.experimental import multihost_utils
+    verdict = np.zeros(1, dtype=np.int32)
+    if process_rank() == 0:
+        try:
+            verdict[0] = int(_FINALIZED_DIGESTS.get(_file_generation(path)) == digest)
+        except OSError:
+            verdict[0] = 0
+    return bool(np.asarray(multihost_utils.broadcast_one_to_all(verdict))[0])
 
 
 def _covering_windows(total, span):
@@ -821,6 +860,8 @@ def validate_shared_pole_model(path, *, expected_identity, mesh_xy, capacity=Non
                     "scope":"metadata only; payload digest not authenticated"})
     if isinstance(path, ResidentSectorModel):
         return header  # bound by object identity and final_commit above
+    if _finalized_digest_current(path, header["digest"]):
+        return header  # this process hashed exactly this generation when it finalized it
     if _model_digest(path, header, mesh_xy, capacity=capacity) != header["digest"]:
         _refuse("model payload/identity digest mismatch")
     return header
