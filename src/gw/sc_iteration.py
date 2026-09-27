@@ -6612,8 +6612,7 @@ def run_sc_driver(
     from .screening import driver_persists_w0, restart_static_w
     mpa = config.compute_mode is ComputeMode.MPA
     try:
-        if config.compute_mode.needs_screening and driver_persists_w0(
-                config.compute_mode, config):
+        if driver_persists_w0(config.compute_mode, config):
             final_w = screening.shared_pole if mpa else screening.static_w
             if final_w is None:
                 raise RuntimeError(

@@ -186,4 +186,4 @@ Entries are max / median / RMS of \(|\Delta\Sigma_x|\) in meV over 8 IBZ k. N_μ
   - to 1–3 meV median and at most 28 meV max in \(\Sigma_c(N)\);
   - to 1.6 meV in the tail \(S(412)-S(296)\).
   The old 960 set, off by 360 meV in Σ_x, moves \(\Sigma_c(412)\) by up to 1.2 eV.
-- **How it was run.** The measurement uses `head_correction = off` and `write_restart_tensors = false`. On this main, a scalar `x_only` deck otherwise dies in the W0 persist before Σ_x, because it has no W to persist.
+- **How it was run.** The measurement uses `head_correction = off` and `write_restart_tensors = false`.

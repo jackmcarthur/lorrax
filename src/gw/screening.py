@@ -856,8 +856,10 @@ def compute_screening_model(
 def driver_persists_w0(mode, config) -> bool:
     """Does the DRIVER own the W0 restart flush for this run?
 
-    Three runs answer no:
+    Four runs answer no:
 
+    * ``compute_mode = x_only`` — it builds no W, so there is nothing to
+      persist; a BSE on the restart refuses by name.
     * ``screening_diagrams = w_bse`` or ``w_rpa_resolvent`` — the stage
       helper has ALREADY persisted, because the RPA W(0) it wrote is the
       restart-handoff input the ladder facade reads back (both arms run
@@ -889,6 +891,8 @@ def driver_persists_w0(mode, config) -> bool:
     no mode/diagram arithmetic, and so the reasons sit next to the fork
     that creates them.
     """
+    if not mode.needs_screening:
+        return False
     diagrams = coerce_screening_diagrams(
         getattr(config.screening, "diagrams", ScreeningDiagrams.W_RPA))
     if diagrams is not ScreeningDiagrams.W_RPA:

@@ -239,6 +239,12 @@ def test_the_driver_imports_whatever_it_dispatches_the_w0_persist_on():
     assert driver_persists_w0(ComputeMode.MPA, _Ladder()) is False
 
 
+def test_x_only_builds_no_w_and_persists_no_w0():
+    """x_only has no W: the driver skips the W0 persist and a BSE refuses."""
+    from gw.screening import driver_persists_w0
+    assert driver_persists_w0(ComputeMode.X_ONLY, _RPA_CONFIG) is False
+
+
 # ---------------------------------------------------------------------------
 # 3. Exhaustive dispatch — no site inherits an else-branch
 # ---------------------------------------------------------------------------
