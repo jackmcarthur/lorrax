@@ -55,6 +55,7 @@ import numpy as np
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
 from common.collectives import barrier
+from common.gamma_matrices import current_fit_unitary
 
 
 
@@ -298,6 +299,7 @@ def _make_per_q_v_builder_for_tile(
     kgrid=None,
     tt_head_correction: bool = False,
     tt_head_tensor: np.ndarray | None = None,
+    current_U: np.ndarray | None = None,
 ):
     """Return ``builder(q_irr_frac, gvec_components) → (n_q, ngkmax) c128``.
 
@@ -370,6 +372,8 @@ def _make_per_q_v_builder_for_tile(
                  bvec=bvec_f, cell_volume=cell_volume, sys_dim=sys_dim, kgrid=kgrid))
         if T.shape != (3, 3):
             raise ValueError(f"TT head tensor must be 3x3, got {T.shape}")
+        if current_U is not None:
+            T = current_U @ T @ current_U.conj().T
         # Bare (T) -> the same "v(q+G)/Ω_cell already applied" convention
         # compute_v_q_per_G's output carries (vcoul.base.CoulombKernel's
         # own Protocol docstring) — divide by cell_volume ONCE, here, not
@@ -392,8 +396,11 @@ def _make_per_q_v_builder_for_tile(
         K_cart = np.einsum('ba,qbg->qag', bvec_f, qG_frac)
         K2 = np.sum(K_cart * K_cart, axis=1)             # (n_q, ngkmax)
         is_gamma_slot = K2 <= eps_K2                     # unique (q=Γ,G=0)
-        t = transverse_projector(
-            np.moveaxis(K_cart, 1, -1), K2, eps_K2=eps_K2)[:, :, i, j]
+        t = transverse_projector(np.moveaxis(K_cart, 1, -1), K2, eps_K2=eps_K2)
+        if current_U is not None:
+            # The fit basis's kernel U d Uᴴ (channels c = Σ_i U_ci j_i).
+            t = np.einsum('ai,qgik,bk->qgab', current_U, t, current_U.conj())
+        t = t[:, :, i, j]
         # Assemble the positive transverse-projector weight first so the
         # finite-q body and optional mini-BZ replacement share one, and only
         # one, Coulomb-gauge spatial-metric sign below.  Stored currents use
@@ -452,6 +459,7 @@ def _bispinor_tile_spec(mu_L, nu_L, *, zeta_C, zeta_T, use_ibz_C, use_ibz_T,
         vcoul_cutoff_ry=vcoul_cutoff_ry, bdot=bdot,
         kgrid=kgrid, tt_head_correction=tt_head_correction,
         tt_head_tensor=tt_head_tensor,
+        current_U=None if is_CC else current_fit_unitary(),
     )
     # BGW vcoul overlay only meaningful on the CC tile; transverse
     # tiles are pure projector applications.  Wrap the builder.
@@ -497,6 +505,46 @@ def _bispinor_tile_spec(mu_L, nu_L, *, zeta_C, zeta_T, use_ibz_C, use_ibz_T,
         source_component=mu_L - 1 if polar else None,
         timing_label=tile_dataset_name(mu_L, nu_L),
         use_ibz=use_ibz)
+
+
+def _cartesian_tt_results(results):
+    """The six TT tiles in the fit basis → Cartesian: V = Uᴴ V_fit U.
+
+    ``results`` follows ``UNIQUE_TILES[1:]``.  Channel c's ζ fits
+    Σ_i U_ci j_i, so V_ij = Σ_ab conj(U_ai) V_fit^{ab} U_bj with
+    V_fit^{ba} = V_fit^{ab}ᴴ on the centroid axes; the g0 carriers are
+    returned unchanged (head-on decks refuse this basis in gw_init).
+    Identity (Cartesian / trace fits): returned untouched.
+    """
+    U = current_fit_unitary()
+    if U is None:
+        return results
+    names = UNIQUE_TILES[1:]
+    shardings = tuple(r[0].sharding for r in results)
+
+    def rotate(*V):
+        tiles = dict(zip(names, V))
+
+        def fit_tile(a, b):
+            if a <= b:
+                return tiles[(a, b)]
+            return jnp.conj(jnp.swapaxes(tiles[(b, a)], -1, -2))
+
+        out = []
+        for i, j in names:
+            acc = None
+            for a in (1, 2, 3):
+                for b in (1, 2, 3):
+                    w = complex(np.conj(U[a - 1, i - 1]) * U[b - 1, j - 1])
+                    if w == 0:
+                        continue
+                    term = w * fit_tile(a, b)
+                    acc = term if acc is None else acc + term
+            out.append(acc)
+        return tuple(out)
+
+    V = jax.jit(rotate, out_shardings=shardings)(*(r[0] for r in results))
+    return [(v, r[1]) for v, r in zip(V, results)]
 
 
 class ParkedVTiles:
@@ -659,6 +707,7 @@ def compute_bispinor_tt_tiles(
         g_chunk=g_chunk, sym=sym, centroid_indices=centroid_T_idx,
         qgrid_policy=_bispinor_qgrid_policy(sym=sym, kgrid=kgrid),
         verbose=verbose)
+    results = _cartesian_tt_results(results)
     return ParkedVTiles(results, what="the six TT tiles", print_fn=print_fn)
 
 
@@ -796,6 +845,8 @@ def compute_V_q_bispinor_g_flat_to_h5(
                 qgrid_policy=qgrid_policy,
                 verbose=verbose,
             )
+            if not is_CC_group:
+                results = _cartesian_tt_results(results)
         for (mu_L, nu_L), s_tile, (V_acc, g0_acc) in zip(group, specs, results):
             same_zeta = (mu_L == nu_L)
             if (same_zeta and mu_L != 0 and _use_ibz_T
