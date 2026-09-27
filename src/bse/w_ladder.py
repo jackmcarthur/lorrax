@@ -531,7 +531,6 @@ def sweep_q_wedge(
     deflation_rank: Optional[int] = None,
     z_outer: bool = False,
     on_z_done: Optional[Callable] = None,
-    band_layout: str = "ring",
 ):
     """Walk the q-wedge x probe-chunk x z-list with ONE compiled engine.
 
@@ -579,20 +578,18 @@ def sweep_q_wedge(
     the solve.  Every (q, z) solve sees the same operands either way, so the
     tiles do not depend on the order.  ``False`` is the historical order.
 
-    ``band_layout='2d'`` keeps every psi array AT REST with the band axis on
-    one mesh axis and mu on the other (1/P per rank, :func:`_psi_at_rest_2d`)
-    instead of band-whole and replicated over a sqrt(P) axis.  The jitted GMRES
-    engine takes the 2-D operands and its matvec reshards to the ring layout
-    inside the program, so the band-whole panels exist only transiently per
-    matvec; the eager seed, preconditioner and snapshot get a transient ring
-    view (:func:`_psi_ring_view`).  Chunked band-panel gathers inside the ring
-    steps (transient 2/sqrt(P) of the band axis) are the matvec owner's
-    follow-on.  ``'ring'`` is the historical layout.
+    PSI RESTS 2-D: every psi array is held with the band axis on one mesh
+    axis and mu on the other (1/P per rank, :func:`_psi_at_rest_2d`), never
+    band-whole and replicated over a sqrt(P) axis.  The jitted GMRES engine
+    takes the 2-D operands and its matvec reshards to the ring layout inside
+    the program, so the band-whole panels exist only transiently per matvec;
+    the eager seed, preconditioner and snapshot get a transient ring view
+    (:func:`_psi_ring_view`).  MEASURED against the replicated layout on Si 4^3
+    SOC (480 mu, 8v x 20c, 8 q, 64 columns, P4, z = 0): wall +5.0 % warm /
+    +1.0 % cold, W bitwise identical (claim 2861).  Chunked band-panel gathers
+    inside the ring steps (transient 2/sqrt(P) of the band axis) are the
+    matvec owner's follow-on.
     """
-    if band_layout not in ("ring", "2d"):
-        raise ValueError(
-            f"band_layout must be 'ring' or '2d', got {band_layout!r}")
-    two_d = band_layout == "2d"
     # ``build_ladder_resolvent`` -> ``ensure_W_R(data, ...)`` populates
     # ``data['W_R']`` ONCE, here, OUTSIDE the q loop.  That is a correctness-
     # neutral, cost-material distinction:
@@ -623,10 +620,9 @@ def sweep_q_wedge(
     # untouched, which is why the RPA arm below skips it and stays
     # bit-identical).  Measured: without it the FIRST-PRINCIPLES dense ladder
     # operator itself breaks W(-q) = conj(W(q)) at 1.043e-03 (2026-08-16).
-    if two_d:
-        # The gauge and the engine build are eager ring-layout stages; the
-        # payload goes back to 2-D below, after them.
-        data = _psi_ring_view(data)
+    # The gauge and the engine build are eager ring-layout stages; the
+    # payload goes back to 2-D below, after them.
+    data = _psi_ring_view(data)
     if include_w:
         data = enforce_trs_pair_gauge(data, mesh_xy)
     matvec, _, gen, snapshot, sh = build_ladder_resolvent(
@@ -658,16 +654,12 @@ def sweep_q_wedge(
     if deflation_rank is None:
         deflation_rank = LADDER_DEFLATION_RANK if include_w else 0
     op_fn = ladder_matvec_operands if include_w else matvec_operands
-    view = _psi_ring_view if two_d else None
-    if two_d:
-        data = _psi_at_rest_2d(data, mesh_xy)
+    data = _psi_at_rest_2d(data, mesh_xy)
 
     def _q_payload(iq, qv):
         q = (int(qv[0]), int(qv[1]), int(qv[2]))
-        dq = build_finite_q_data(_psi_ring_view(data) if two_d else data,
-                                 q, mesh_xy)
-        if two_d:
-            dq = _psi_at_rest_2d(dq, mesh_xy)
+        dq = _psi_at_rest_2d(
+            build_finite_q_data(_psi_ring_view(data), q, mesh_xy), mesh_xy)
         if include_w and "psi_c_W_X" not in dq:    # pragma: no cover
             raise RuntimeError(
                 "sweep_q_wedge built a ladder_rung_slots engine but "
@@ -685,7 +677,7 @@ def sweep_q_wedge(
         if lift:
             solve_dq["V_q0"] = zero_v
         diag_hq = build_preconditioner_diagonal_sharded(
-            _psi_ring_view(solve_dq) if two_d else solve_dq, mesh_xy,
+            _psi_ring_view(solve_dq), mesh_xy,
             include_W=include_w, use_tda=False)
         if build_hook is not None:
             build_hook(iq, q, dq)
@@ -711,8 +703,7 @@ def sweep_q_wedge(
             # locally and costs ~27 RPA-matvec-equivalents there (opt_shifts,
             # 2026-08-16) — and free on the ladder arm, where the matvec
             # dwarfs it.
-            rhs = build_probe_rhs(G, _psi_ring_view(dq) if two_d else dq,
-                                  gen, sh)
+            rhs = build_probe_rhs(G, _psi_ring_view(dq), gen, sh)
             for iz, z in z_items:
                 if deflation_rank > 0 and iz not in defl_by_z:
                     defl_by_z[iz] = _deflation_for(
@@ -727,7 +718,7 @@ def sweep_q_wedge(
                     snapshot_v=(eye_v if lift else None),
                     operands_fn=op_fn,
                     deflation=defl_by_z.get(iz),
-                    view=view)
+                    view=_psi_ring_view)
                 on_result(iq, q, iz, complex(z), c0, n_real,
                           W_tile, resids, iters)
 
@@ -771,10 +762,10 @@ def _psi_at_rest_2d(d: dict, mesh_xy: Mesh) -> dict:
         n_band, n_mesh = int(a.shape[1]), int(mesh_xy.shape[band_axis])
         if n_band % n_mesh:
             raise ValueError(
-                f"GATE ladder_band_layout_2d_indivisible: {key} has "
+                f"GATE ladder_psi_2d_indivisible: {key} has "
                 f"{n_band} bands, which does not divide mesh axis "
-                f"{band_axis!r} ({n_mesh}); want band_layout='ring' or a "
-                f"band window padded to the mesh.")
+                f"{band_axis!r} ({n_mesh}); want a band window padded to "
+                f"the mesh (the loader's pad_bands) on a square mesh.")
         out[key] = _reshard(
             a, NamedSharding(mesh_xy, P(None, band_axis, None, mu_axis)))
     return out
@@ -810,32 +801,6 @@ def _reshard(a: jax.Array, sharding: NamedSharding) -> jax.Array:
         fn = jax.jit(lambda t: t, out_shardings=sharding)
         _RESHARD_CACHE[sharding] = fn
     return fn(a)
-
-
-def ladder_fingerprint(tile: jax.Array) -> tuple[float, complex]:
-    """``(||tile||_F, sum_{mu,nu} tile * w)`` of one ``(mu, nu)`` wedge tile.
-
-    ``w[mu, nu] = exp(i (0.37 mu + 0.61 nu))``: a fixed, dense, deterministic
-    weight, so two producers of the same tile agree on both numbers to their
-    own solver tolerance and a permuted or partial tile does not.  Sharded
-    elementwise reductions only; nothing mu^2 is gathered.
-    """
-    n0, n1 = (int(n) for n in tile.shape[-2:])
-    key = (tuple(tile.shape), str(tile.dtype), tile.sharding)
-    fn = _FINGERPRINT_CACHE.get(key)
-    if fn is None:
-        def _fp(a):
-            mu = jnp.arange(n0, dtype=jnp.float64)[:, None]
-            nu = jnp.arange(n1, dtype=jnp.float64)[None, :]
-            w = jnp.exp(1j * (0.37 * mu + 0.61 * nu))
-            return jnp.sqrt(jnp.sum(jnp.abs(a) ** 2)), jnp.sum(a * w)
-        fn = jax.jit(_fp)
-        _FINGERPRINT_CACHE[key] = fn
-    fro, chk = jax.device_get(fn(tile))
-    return float(fro), complex(chk)
-
-
-_FINGERPRINT_CACHE: dict = {}
 
 
 #: Recycled eigenvectors per (q, z) on the LADDER operator, and the Arnoldi
@@ -889,7 +854,6 @@ def compute_wc_qwedge(
     head_pref: Optional[float] = None,
     deflation_rank: Optional[int] = None,
     on_z: Optional[Callable] = None,
-    band_layout: str = "ring",
 ) -> WLadderWedge:
     """Ladder ``W(z) - v`` bodies for every irreducible q and every requested z.
 
@@ -900,8 +864,7 @@ def compute_wc_qwedge(
     ``(nq_irr, n_pad)`` host residuals and iteration counts, then drops the
     tile.  The resident set is one z's wedge instead of the
     ``(nz, nq, mu, mu)`` stack, and the returned wedge carries ``wc=None``.
-    ``band_layout`` is :func:`sweep_q_wedge`'s psi layout (``'ring'`` or
-    ``'2d'``).
+    psi rests 2-D (:func:`sweep_q_wedge`).
 
     The facade the GW stage helper calls.  ``z_list_ry`` are complex Rydberg
     frequencies (cohsex: ``{0}``; gn_ppm: ``{0, i w_p}``; mpa: its sample plan);
@@ -973,8 +936,7 @@ def compute_wc_qwedge(
     data = load_bse_data_from_restart_sharded(
         restart_path, n_val=10**9, n_cond=10**9, mesh_xy=mesh_xy,
         input_file=input_file, inject_head=False, load_v_full=True)
-    if band_layout == "2d":
-        data = _psi_at_rest_2d(data, mesh_xy)
+    data = _psi_at_rest_2d(data, mesh_xy)
 
     head_args = (head_dipole_path, head_n_occ, head_pref)
     if any(value is not None for value in head_args) and not all(
@@ -1075,8 +1037,7 @@ def compute_wc_qwedge(
         build_hook=((lambda iq, q, dq: v_by_q.__setitem__(iq, dq["V_q0"]))
                     if route == "lift" else None),
         z_outer=on_z is not None,
-        on_z_done=(_on_z_done if on_z is not None else None),
-        band_layout=band_layout)
+        on_z_done=(_on_z_done if on_z is not None else None))
 
     if on_z is not None:
         wc = None
@@ -1115,7 +1076,7 @@ def compute_wc_qwedge(
             velocity_cv, delta_cv,
             n_cond_pad=int(data["n_cond_pad"]),
             n_val_pad=int(data["n_val_pad"]))
-        head_data = (_psi_ring_view(data) if band_layout == "2d" else data)
+        head_data = _psi_ring_view(data)
         head_op = build_head_operator(mesh_xy, head_data, include_w=include_w)
         head_result = solve_head_tensor(
             head_op, head_data, d_pair, z_list_ry, pref=float(head_pref),

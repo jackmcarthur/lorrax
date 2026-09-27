@@ -922,7 +922,7 @@ def apply_screening_resolvent_block(G_zeta, z, data, matvec, diag_h, gen,
 
     ``view`` (optional) maps ``data`` to the ring layout for the two eager
     stages, the seed and the snapshot, when the payload's psi carriers rest in
-    another layout (``w_ladder`` ``band_layout='2d'``); the jitted solve takes
+    another layout (``w_ladder`` rests psi 2-D); the jitted solve takes
     ``data`` as is.  ``None`` is the historical call.
 
     Computes ``W(omega) - v`` tiles from the non-TDA RPA density-response

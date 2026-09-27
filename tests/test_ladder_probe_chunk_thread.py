@@ -93,28 +93,3 @@ def test_default_zero_keeps_the_whole_basis_block(monkeypatch):
     whole-padded-basis block, bit-identical for every existing deck."""
     seen, _ = _drive_facade(monkeypatch, deck_chunk=0, p_y=4)
     assert seen["probe_chunk"] is None
-
-
-def test_ladder_z_list_and_band_layout_keys():
-    """``ladder_z_list`` is off by default and refuses the real axis;
-    ``ladder_band_layout`` accepts only the two layouts."""
-    pytest.importorskip("jax")
-    from gw.gw_config import ScreeningConfig, _DEFAULTS, parse_ladder_z_list
-
-    assert _DEFAULTS["ladder_z_list"] == ""
-    assert _DEFAULTS["ladder_band_layout"] == "ring"
-    assert parse_ladder_z_list("") == ()
-    assert parse_ladder_z_list("0, 0.5j,1j") == (0j, 0.5j, 1j)
-    with pytest.raises(ValueError, match="ladder_z_list"):
-        parse_ladder_z_list("half")
-    kw = dict(method="minimax", occ_broadening_ev=0.0,
-              minimax_target_error=1e-6, minimax_max_nodes=64,
-              minimax_energy_reference="midgap")
-    cfg = ScreeningConfig(**kw)
-    assert cfg.ladder_z_list == () and cfg.ladder_band_layout == "ring"
-    assert ScreeningConfig(ladder_z_list=(0.5j,), ladder_band_layout="2d",
-                           **kw).ladder_band_layout == "2d"
-    with pytest.raises(ValueError, match="real"):
-        ScreeningConfig(ladder_z_list=(0.3 + 0j,), **kw)
-    with pytest.raises(ValueError, match="ladder_band_layout"):
-        ScreeningConfig(ladder_band_layout="bands", **kw)

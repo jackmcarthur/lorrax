@@ -615,8 +615,7 @@ def prepare_ladder_restart(
 
 def _ladder_wedge(tensors_filename, z_list_ry, mesh_xy, *, input_file,
                   include_w=True, print_fn=print, gmres_tol=None,
-                  config=None, meta=None, wfn=None, on_z=None,
-                  with_head=True):
+                  config=None, meta=None, wfn=None, on_z=None):
     """One call into ``bse.w_ladder``, with the residual gate on its output.
 
     ``gmres_tol`` defaults to the PRODUCTION constant :data:`_GMRES_TOL`.
@@ -687,7 +686,7 @@ def _ladder_wedge(tensors_filename, z_list_ry, mesh_xy, *, input_file,
                         label=f"W ladder resolvent ({z.size} z, "
                               f"include_w={include_w})"):
         head_kwargs = {}
-        if config is not None and with_head:
+        if config is not None:
             from .gw_config import HeadCorrection
             if config.head.correction is HeadCorrection.FULL:
                 if meta is None or wfn is None:
@@ -704,8 +703,6 @@ def _ladder_wedge(tensors_filename, z_list_ry, mesh_xy, *, input_file,
                         float(meta.cell_volume), int(meta.nk_tot),
                         int(wfn.nspin), int(meta.nspinor_wfnfile)),
                 }
-        layout = str(getattr(getattr(config, "screening", None),
-                             "ladder_band_layout", "ring") or "ring")
         stream = None
         if on_z is not None:
             import time
@@ -727,7 +724,7 @@ def _ladder_wedge(tensors_filename, z_list_ry, mesh_xy, *, input_file,
                     f"{worst_z:.2e}, rank-0 device high-water "
                     + (f"{peak / 2**30:.2f} GiB" if peak is not None
                        else "n/a")
-                    + f" (psi layout {layout})")
+                    + " (psi 2-D at rest)")
                 if not (worst_z <= ceiling) or hot_z >= _GMRES_MAX_ITER:
                     raise RuntimeError(
                         f"w_bse: the ladder resolvent did not converge at "
@@ -742,7 +739,7 @@ def _ladder_wedge(tensors_filename, z_list_ry, mesh_xy, *, input_file,
             tensors_filename, z, mesh_xy, include_w=include_w,
             gmres_tol=tol, gmres_max_iter=_GMRES_MAX_ITER,
             probe_chunk=probe_chunk,
-            input_file=input_file, on_z=stream, band_layout=layout,
+            input_file=input_file, on_z=stream,
             **head_kwargs)
     resid = _wedge_field(wedge, _RESIDUAL_FIELDS, np.float64)
     iters = _wedge_field(wedge, _ITERATION_FIELDS, np.int64)
@@ -1124,59 +1121,8 @@ def make_ladder_wc_source(
     return _wc_from_ladder
 
 
-def deliver_ladder_z_list(config, meta, mesh_xy, sym, tensors_filename, *,
-                          print_fn=print):
-    """Optional W_BSE(q, z) at the deck's ``ladder_z_list``, one z at a time.
-
-    Runs after the driver has persisted the RPA W(0) (the ladder kernel
-    ``W_R``) into the restart bundle, under either ``screening_diagrams``
-    value, and hands nothing to Sigma: ``screening_diagrams = w_bse`` is the
-    route that replaces Sigma's W.  Each z is solved on the q wedge through
-    the same facade and the same per-z residual gate as that route, then
-    logged with one ``ladder_fingerprint`` per wedge q (the standalone facade
-    reproduces them from the same bundle).  Off when the key is empty.
-    """
-    z_list = tuple(complex(z) for z in config.screening.ladder_z_list)
-    if not z_list:
-        return None
-    from bse.w_ladder import ladder_fingerprint   # noqa: PLC0415 (cycle)
-
-    if not tensors_filename or not os.path.exists(tensors_filename):
-        raise ValueError(
-            "GATE ladder_z_list_needs_restart_writes: ladder_z_list reads "
-            "psi, energies, V and the RPA W(0) back from the restart bundle; "
-            f"got {tensors_filename!r}.  Set write_restart_tensors = true.")
-    _assert_restart_is_loadable(tensors_filename, include_w=True,
-                                print_fn=print_fn)
-    _refuse_metallic_mean_field(config, meta, include_w=True,
-                                print_fn=print_fn)
-    delivered = {}
-
-    def _log(iz, z, wc_z):
-        rows = []
-        for iq in range(int(wc_z.shape[0])):
-            fro, chk = ladder_fingerprint(wc_z[iq])
-            rows.append((fro, chk))
-            print_fn(f"  Ladder W(z) z[{iz}] q_irr[{iq}]: ||W-v||_F "
-                     f"{fro:.12e}  checksum {chk.real:+.12e}"
-                     f"{chk.imag:+.12e}j")
-        delivered[complex(z)] = rows
-
-    with timing.section("gw_jax.w_ladder_z_list", announce=True,
-                        label=f"W_BSE(z) delivery ({len(z_list)} z, one at "
-                              f"a time)"):
-        wedge = _ladder_wedge(
-            tensors_filename, z_list, mesh_xy,
-            input_file=getattr(config, "input_file", ""),
-            include_w=True, print_fn=print_fn, config=config, meta=meta,
-            on_z=_log, with_head=False)
-    _assert_wedge_matches_run(wedge, sym)
-    return delivered
-
-
 __all__ = [
     "compute_screening_ladder",
-    "deliver_ladder_z_list",
     "make_ladder_wc_source",
     "prepare_ladder_restart",
     "refuse_fractional_occupations",
