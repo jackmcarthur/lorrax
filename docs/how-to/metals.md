@@ -25,18 +25,27 @@ not restate them.
   $|E-\mu|\le 53\ln2\,k_BT$. It is the same in the one-shot and every SC map,
   so SC map 0 is the one-shot. There is no key.
 
+## Inputs
+
+`WFN.h5` from a QE NSCF on the full $N^3$ grid with `smearing = 'fd'`
+([inputs from DFT](../preprocessing.md)), `kin_ion.h5`, `dipole.h5` in the run
+directory (the [dipole driver](../drivers.md); the metal head reads its
+velocities, and a missing file refuses) and a centroid table. Read $E_F$ and
+the band energies from the NSCF output; a one-shot's `eqp0.dat` and the
+`E_F = ... (fixed-N mu)` line of `gwjax.out` give the same numbers at $k_BT$.
+
 ## What you choose
 
 | choice | how to set it | why |
 |---|---|---|
 | $k_BT$ | `occ_smearing_width_ry` = the DFT `degauss`. Use 0.01 Ry at $N\ge 8$ and 0.02 Ry at $N=4$–6 (the Na 8³ and Fe 4³/8³ production decks) | the grid must resolve the Fermi surface: $k_BT$ of order the band dispersion across one k spacing (Marzari–Vanderbilt). Halve it when you double $N$ |
-| QP window top | `ncond` = (highest band whose minimum over k lies below $E_F+E_{\rm win}$) − `nelec`, where `nelec` is the highest band occupied at any k | Σ diagonals are computed for bands $[0,$ `nelec + ncond`$)$. States above the window are a rigid tail ([self-consistency §2](../self_consistency.md#2-band-treatment)) |
+| QP window top | `ncond` = (highest band whose minimum over k lies below $E_F+E_{\rm win}$) − `nelec`, where `nelec` is the WFN's occupied-band boundary (`max(ifmax)`; `kmeans.out` prints it as `occupied-band boundary`) | Σ diagonals are computed for bands $[0,$ `nelec + ncond`$)$. States above the window are a rigid tail ([self-consistency §2](../self_consistency.md#2-band-treatment)) |
 | pair window | `nval` = the occupied bands whose maximum over k lies above $E_F-E_{\rm win}$ | it sets the lower edge of the ISDF pair-density window, not the bottom of the QP window. Do not freeze deep bands with `sc_frozen_core_bands`: on Fe 3s/3p the frozen law is off by hundreds of meV (CLAIMS 2859) |
-| band sums | `number_bands`: all bands the NSCF has; at least 2–3× `nelec + ncond` | the χ0 and Σ sums; band-count convergence is a separate study |
-| centroids | `python3 -m centroid.kmeans_cli N_mu --fit-window 0:B_sigma,0:number_bands`, with $N_\mu$ at 0.5–1.3× the numerical rank of that pair set | ISDF exchange error collapses in $N_\mu/r$ (CLAIMS 2860); `kmeans.out` prints the pool rank. See [drivers](../drivers.md) |
+| band sums | `number_bands`: the bands the NSCF has | the χ0 and Σ sums; band-count convergence is a separate study |
+| centroids | select on the Σ pair set, `--fit-window 0:B,0:number_bands` with `B = nelec + ncond`. First run `python3 -m centroid.kmeans_cli` with a request well above the rank and read `achieved numerical rank=r` in `kmeans.out`; then select $N_\mu$ between $0.5r$ and $1.3r$ | the ISDF exchange error falls with $N_\mu/r$: RMS ≤ 1 meV near $0.5r$, max ≤ 1 meV near $1.3r$ (CLAIMS 2860). See [drivers](../drivers.md) |
 | head | `head_correction = no_local_fields` (direct charge head $S(\omega)$ with the Drude, Thomas–Fermi and Lindhard-cell terms), or `full` on a scalar deck | [metallic MPA screening](../theory/metallic-mpa-screening.md) owns the head model |
 | SC head | `sc_head_update = off` (default: fixed DFT head on the DFT Fermi–Dirac state), or `dft_velocity` with `dipole.h5` | [self-consistency §7](../self_consistency.md#metals-direct-drude-head) |
-| stop rule | `sc_tol_ev = 1e-3` for a 1 meV Fermi-window target | the default `1e-4` is below the Σ rule-set noise on metals; judge convergence by states near $E_F$ ([self-consistency §7](../self_consistency.md#7-metals)) |
+| stop rule | `sc_tol_ev = 1e-3` | 1 meV is the reproducibility the default `sigma_quadrature_eps` is chosen for; judge convergence by states near $E_F$ ([self-consistency §7](../self_consistency.md#7-metals)) |
 
 State `sys_dim = 3`. `fermi_reference = mp1_fixed_n` is required on a metal
 (the name is historical; with Fermi–Dirac it is the fixed-N μ).
@@ -65,10 +74,13 @@ State `sys_dim = 3`. `fermi_reference = mp1_fixed_n` is required on a metal
 | `sigma_w_model = mpa` on a time-reversal-broken metal | `mpa_ordered_metal` |
 | `occupation_window_threshold` | retired |
 
-## Worked deck: bcc Fe, 4³, QSGW within 5 eV of $E_F$
+## Worked deck: bcc Fe, 4³, QSGW within 10 eV of $E_F$
 
-Scalar (charge-only) Fe, 35 bands, FD $k_BT$ = 0.02 Ry. The window (bands
-up to `nelec + ncond`) covers $E_F$ + 5 eV.
+Charge-only Fe on a spinor WFN, 35 bands, $k_BT$ = 0.02 Ry. The one-shot
+gives $E_F$ = 18.01 eV and `nelec` = 18. Bands 19–24 have their minimum
+below $E_F$ + 10 eV and band 25 does not, so `ncond` = 6. Occupied bands
+9–18 reach above $E_F$ − 10 eV, so `nval` = 10. Centroids are selected on
+`--fit-window 0:24,0:35`.
 
 ```ini
 [cohsex]
@@ -77,8 +89,8 @@ centroids_file = centroids_frac.txt
 kin_ion_file = kin_ion.h5
 sys_dim = 3
 bispinor = false
-nval = 4
-ncond = 8
+nval = 10
+ncond = 6
 number_bands = 35
 compute_mode = mpa
 sigma_w_model = shared_pole
