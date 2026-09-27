@@ -343,7 +343,7 @@ class PlaneWaveGW:
         return acc
 
     # ------------------------------------------------------------------ MPA samples
-    def wavefunctions(self):
+    def wavefunctions(self, *, qp_bands=None):
         """The Σ executor's bundle: RSK4's parent carrier with full-k energy tables.
 
         Band edges: occupied ``nval``, QP window and Σ sum ``nb``, carrier ``nb_c`` (the
@@ -352,7 +352,11 @@ class PlaneWaveGW:
         from .wavefunction_bundle import BandSlices, Wavefunctions
         irr = np.asarray(self.s.plan.irr_idx)
         occ = (np.arange(self.nb_c) < self.nval).astype(np.float64)
-        sl = BandSlices.from_band_edges(0, 0, self.nval, self.nb, self.nb_c, b4_logical=self.nb)
+        stop = self.nb if qp_bands is None else int(qp_bands)
+        if not self.nval < stop <= self.nb:
+            raise ValueError("plane-wave QP projection must include occupied and empty states")
+        self.qp_bands = stop
+        sl = BandSlices.from_band_edges(0, 0, self.nval, stop, self.nb_c, b4_logical=self.nb)
         return Wavefunctions(enk=jnp.asarray(self.enk[irr]),
                              occ=jnp.asarray(np.broadcast_to(occ, (irr.size, self.nb_c))),
                              slices=sl, green_parent=self.carrier, layout="face")
@@ -926,7 +930,7 @@ def _one_shot(args, mesh, system, gw, say, t_read):
 
     sigx = gw.exchange()
     stage("sigma_x")
-    wfns = gw.wavefunctions()
+    wfns = gw.wavefunctions(qp_bands=min(gw.nb, config.nval + config.ncond))
     if str(config.sigma.w_model) == "shared_pole":
         return _one_shot_shared_pole(args, mesh, system, gw, say, t_read, config, wfns, sigx,
                                      stage, stages)
@@ -952,14 +956,14 @@ def _one_shot(args, mesh, system, gw, say, t_read):
                chi_carrier=int(gw.screen.M), kpar_frac=system.psi_par.frac.tolist(),
                enk_ev=(system.enk * _RY_EV).tolist(), mu_ev=gw.mu * _RY_EV,
                sigx_ev=(sigx * _RY_EV).tolist(),
-               sigc_at_e_ev_re=(at.real * _RY_EV).tolist(), sigc_at_e_ev_im=(at.imag * _RY_EV).tolist(),
-               omega_ev=(om * _RY_EV).tolist(),
-               sigc_omega_ev_re=(sc.real * _RY_EV).tolist(), sigc_omega_ev_im=(sc.imag * _RY_EV).tolist(),
+               sigc_at_e_ev_re=None if at is None else (at.real * _RY_EV).tolist(), sigc_at_e_ev_im=None if at is None else (at.imag * _RY_EV).tolist(),
+               omega_ev=None if om is None else (om * _RY_EV).tolist(),
+               sigc_omega_ev_re=None if sc is None else (sc.real * _RY_EV).tolist(), sigc_omega_ev_im=None if sc is None else (sc.imag * _RY_EV).tolist(),
                mpa_z_ry_re=np.real(z).tolist(), mpa_z_ry_im=np.imag(z).tolist(), mpa_fit_cond=cond,
                stages=stages, walls=walls, t_read_s=t_read, t_plans_s=gw.t_plans,
                chi_law=gw.chi_conv.describe(), sigma_law=gw.sig_conv.describe(),
                screen_law=gw.screen.describe(len(z), int(config.mpa.n_poles)))
-    for k in range(gw.n_par):
+    for k in range(gw.n_par if at is not None else 0):
         say(f"k{k} Σ_c(E) re (eV): " + " ".join(f"{v:.4f}" for v in at[k].real * _RY_EV))
     say("walls:", json.dumps(walls))
     if jax.process_index() == 0:
@@ -973,11 +977,15 @@ def _diag_at_energies(body, system, gw, mesh):
     import jax
     rows = np.asarray(system.plan.parent_full_rows)
     diag = jax.jit(lambda a: jax.numpy.diagonal(a[:, rows], axis1=-2, axis2=-1))(body.sigma_c_kij)
-    sc = _host(diag, mesh)[:, :, :gw.nb]                                  # (n_ω, n_par, nb) Ry
+    sc = _host(diag, mesh)[:, :, :gw.qp_bands]                         # (n_ω, n_par, n_QP) Ry
     om = np.asarray(body.omega_ry)
-    x = system.enk - gw.mu
-    at = np.array([[np.interp(x[k, n], om, sc[:, k, n].real) + 1j * np.interp(x[k, n], om, sc[:, k, n].imag)
-                    for n in range(gw.nb)] for k in range(gw.n_par)])
+    x = system.enk[:, :sc.shape[-1]] - gw.mu
+    # Batch scalar interpolation over the small output-state table; no host k/band loop.
+    import jax.numpy as jnp
+    interp = jax.jit(jax.vmap(jax.vmap(
+        lambda en, row: jnp.interp(en, jnp.asarray(om), row.real)
+                         + 1j * jnp.interp(en, jnp.asarray(om), row.imag))))
+    at = np.asarray(interp(jnp.asarray(x), jnp.asarray(sc.transpose(1, 2, 0))))
     return sc, om, at
 
 
@@ -1095,7 +1103,8 @@ def _one_shot_shared_pole(args, mesh, system, gw, say, t_read, config, wfns, sig
             json.dump(complex_z, f, indent=1)
     stage("complex_z")
     # ---- Σ_c through the shared-pole route
-    body = gw.sigma_c_shared_pole(config, wfns, model, meta, print_fn=say)
+    body = (None if args.skip_sigma else
+            gw.sigma_c_shared_pole(config, wfns, model, meta, print_fn=say))
     stage("sigma_c_tau_sweep")
     return _write_shared_pole_result(args, mesh, system, gw, say, t_read, config, model, sigx, body,
                                      stages, dict(response_vs_minimax_chi_2i_ev=check_imag,
@@ -1160,7 +1169,8 @@ def _write_shared_pole_result(args, mesh, system, gw, say, t_read, config, model
                               stages, checks, complex_z):
     import jax
     recipe = model["recipe"]
-    sc, om, at = _diag_at_energies(body, system, gw, mesh)
+    sc, om, at = ((None, None, None) if body is None else
+                  _diag_at_energies(body, system, gw, mesh))
     walls = {k: dict(n=len(v), total_s=float(np.sum(v)), warm_s=float(np.min(v[1:] if len(v) > 1 else v)))
              for k, v in gw.walls.items()}
     res = dict(kgrid=system.kgrid, fft_grid=system.fft_grid, n_r=gw.n_r, P=gw.P, nb=gw.nb, nval=gw.nval,
@@ -1168,13 +1178,14 @@ def _write_shared_pole_result(args, mesh, system, gw, say, t_read, config, model
                chi_carrier=int(gw.screen.M), kpar_frac=system.psi_par.frac.tolist(),
                enk_ev=(system.enk * _RY_EV).tolist(), mu_ev=gw.mu * _RY_EV,
                sigx_ev=(sigx * _RY_EV).tolist(),
-               sigc_at_e_ev_re=(at.real * _RY_EV).tolist(), sigc_at_e_ev_im=(at.imag * _RY_EV).tolist(),
-               omega_ev=(om * _RY_EV).tolist(),
-               sigc_omega_ev_re=(sc.real * _RY_EV).tolist(), sigc_omega_ev_im=(sc.imag * _RY_EV).tolist(),
+               sigc_at_e_ev_re=None if at is None else (at.real * _RY_EV).tolist(), sigc_at_e_ev_im=None if at is None else (at.imag * _RY_EV).tolist(),
+               omega_ev=None if om is None else (om * _RY_EV).tolist(),
+               sigc_omega_ev_re=None if sc is None else (sc.real * _RY_EV).tolist(), sigc_omega_ev_im=None if sc is None else (sc.imag * _RY_EV).tolist(),
                w_model="shared_pole",
                shared_pole=dict(K=model["counts"].tolist(), K_carrier=model["K"],
                                 pole_budget=recipe.get("pole_budget"), n=int(gw.screen.axis.logical),
                                 port_count=args.port_count,
+                                recipe_hash=recipe["recipe_hash"],
                                 widths=dict(imaginary=recipe["imaginary_width"],
                                             infinity=recipe["infinity_width"],
                                             line_cap=recipe["line_direction_cap"]),
@@ -1188,7 +1199,7 @@ def _write_shared_pole_result(args, mesh, system, gw, say, t_read, config, model
                checks=checks, complex_z=complex_z,
                stages=stages, walls=walls, t_read_s=t_read, t_plans_s=gw.t_plans,
                chi_law=gw.chi_conv.describe(), sigma_law=gw.sig_conv.describe())
-    for k in range(gw.n_par):
+    for k in range(gw.n_par if at is not None else 0):
         say(f"k{k} Σ_c(E) re (eV): " + " ".join(f"{v:.4f}" for v in at[k].real * _RY_EV))
     say("walls:", json.dumps(walls))
     if jax.process_index() == 0:
@@ -1217,6 +1228,7 @@ def main(argv=None):
     ap.add_argument("--port-count", type=int, default=None,
                     help="shared-pole deck, diagnostic: size the recipe's direction widths and pole "
                          "budget from this port count instead of the sphere width")
+    ap.add_argument("--skip-sigma", action="store_true", help="study: proxy only, no Sigma sweep")
     ap.add_argument("--skip-complex-z", action="store_true",
                     help="shared-pole deck: skip the model-vs-exact W^c(z) comparison")
     ap.add_argument("--out", required=True)
