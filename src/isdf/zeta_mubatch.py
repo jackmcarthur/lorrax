@@ -927,7 +927,8 @@ def contract_v_group(zetas, pairs, v_tables, *, keep, print_fn=None):
     :meth:`ZetaG.contract_v` does.  Returns ``[V^{ab}]`` in ``pairs`` order,
     ``(Q, μ_pad, μ_pad)`` at ``P(None,'x','y')`` in canonical centroid order.
     This is what spares the four-current V_q the three ζ_T files: the file
-    route wrote each ζ^a and read it back to form the same sums.
+    route wrote each ζ^a and read it back to form the same sums. Views of
+    one shared scalar current fit reuse its formed tile.
     """
     t0 = time.perf_counter()
     z0 = zetas[0]
@@ -971,16 +972,22 @@ def contract_v_group(zetas, pairs, v_tables, *, keep, print_fn=None):
     # dropped after, so a G tile holds one Z tile and the ζ tiles — the six
     # tile-sized buffers the fit's plan sized g_tile for (MuBatchPlan).
     for t in range(st0.n_Gt):
-        zt = []
+        zt, formed = [], {}
         for i, z in enumerate(zetas):
-            Zt = z.store.read_tile(t)
-            a, m, sh, zi = form[i](factors[i], Zt, v_form, ngk_dev, sl_dev,
-                                   jnp.int32(t), *stub[i])
-            stub[i] = (a, m, sh)
-            zt.append(zi)
-            del Zt
+            # Current views share the same scalar fit. Form its tile once;
+            # independent fits keep separate factors and separate entries.
+            key = (id(z.store), id(z.L_q), id(z.lu_piv),
+                   z.solver_kind, z.n_rmu_solve)
+            if key not in formed:
+                Zt = z.store.read_tile(t)
+                a, m, sh, zi = form[i](factors[i], Zt, v_form, ngk_dev, sl_dev,
+                                       jnp.int32(t), *stub[i])
+                stub[i] = (a, m, sh)
+                formed[key] = zi
+                del Zt
+            zt.append(formed[key])
         V, S = step(tuple(zt), v_dev, ngk_dev, sl_dev, jnp.int32(t), V, S)
-        del zt
+        del zt, formed
     out = []
     for Vp in V:
         Vp = _finish_v(mesh, st0.Q)(Vp)
@@ -989,10 +996,11 @@ def contract_v_group(zetas, pairs, v_tables, *, keep, print_fn=None):
         Sa = _finish_shell(mesh, st0.Q)(Sa)
         z.shell = z0.mu_basis.unpack_axis(Sa, 1) if z0.mu_basis is not None else Sa
         z.shell_slots = keep
+    unique_stores = {id(z.store): z.store for z in zetas}.values()
     receipt = (f"  μ-batch V_q group: {len(zetas)} ζ, {len(pairs)} tiles, "
                f"{st0.n_Gt} G tiles, q-local, "
                f"{time.perf_counter() - t0:.2f}s (store read "
-               f"{sum(z.store.t_read for z in zetas):.2f}s); no ζ file")
+               f"{sum(st.t_read for st in unique_stores):.2f}s); no ζ file")
     if jax.process_index() == 0:
         print_fn(receipt)
     return out
