@@ -84,13 +84,14 @@ $$
 
 The forward product is $A(t)=G_u(t)\,\overline{G_f(\bar t)}$; the reverse is
 $\overline{A(\bar t)}$ — the same damping with the orbital product reversed, not
-$\overline{A(t)}$. The nodes come from a stacked Hankel shift pencil; a group
-whose shared fit fails is split in halves down to single samples, so no sample
-uses more nodes than its own rule needs. The group size is the largest whose
+$\overline{A(t)}$. The nodes are derived, never fitted: each pole height is a
+thin Σ denominator box in $D=p-d$, and the group takes one elliptic sector rule
+for its sign-definite heights and one bent contour for its crossing heights
+([grouped response rules](../theory/response-laplace.md#grouped-response-rules));
+the weights are one least-squares solve per height and an evaluation
+certificate per height accepts them, at a tenth of the tier's bank tolerance. The group size is the largest whose
 donated carry `[2·members, q, μ_X, ν_Y]` and compiled stream temporaries fit the
-map ledger: every sample in one group on symmetric decks. The accuracies are
-sampled, not continuum certificates; a matched QP comparison is the acceptance
-check.
+map ledger: every sample in one group on symmetric decks.
 
 **Domain and occupations.** The transition interval spans every nonzero
 occupied/empty weight pair on the one branch support

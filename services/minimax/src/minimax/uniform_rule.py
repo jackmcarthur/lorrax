@@ -177,16 +177,19 @@ class _BoundaryCloud:
             lengths = lengths / np.abs(self.d)
         return np.sqrt(lengths / lengths.mean())
 
-    def _g(self, d, times, weights, relative):
+    def _g(self, d, times, weights, relative, power=1):
         Q = _cexp(1j * d[:, None] * np.asarray(times)[None, :]) @ np.asarray(weights)
-        return np.abs(d * Q - 1.0) if relative else self.im_lo * np.abs(Q - 1.0 / d)
+        if relative:
+            return np.abs(d ** power * Q - 1.0)
+        return self.im_lo ** power * np.abs(Q - 1.0 / d ** power)
 
-    def sup(self, times, weights, relative, iters=20):
+    def sup(self, times, weights, relative, iters=20, power=1):
         """``(sup rho |Q - 1/d|, max kappa, max rho sum_k |w_k exp(i t_k d)|)``:
         every sampled local maximum of the error within 10% of the largest
         (edge ends included) is refined by a golden-section search on its
         bracket.  The third number is the executor's noise amplification in
-        the certificate's currency.
+        the certificate's currency.  ``power = 2`` certifies ``1/d**2`` in the
+        same currency raised to the second power (the response rules' ds rows).
 
         Tempting, and why not: the vertex of the parabola through the three
         samples (no extra evaluations).  Near the corner of a relative box the
@@ -195,10 +198,11 @@ class _BoundaryCloud:
         (runs/DEV/326_minimax_fit_review_2026-09-11/tools/diag_refinement.py)."""
         T = _cexp(1j * self.d[:, None] * np.asarray(times)[None, :]) * np.asarray(weights)[None, :]
         Q = T.sum(1)
-        g = np.abs(self.d * Q - 1.0) if relative else self.im_lo * np.abs(Q - 1.0 / self.d)
+        g = (np.abs(self.d ** power * Q - 1.0) if relative
+             else self.im_lo ** power * np.abs(Q - 1.0 / self.d ** power))
         term_mass = np.abs(T).sum(1)
         kappa = float((term_mass / np.maximum(np.abs(Q), 1e-300)).max())
-        mass = float(((np.abs(self.d) if relative else self.im_lo) * term_mass).max())
+        mass = float(((np.abs(self.d) if relative else self.im_lo) ** power * term_mass).max())
         best, start = float(g.max()), 0
         base, step, lo, hi = [], [], [], []
         for u, pts in self.edges:
@@ -218,13 +222,13 @@ class _BoundaryCloud:
             base, step, a, b = map(np.concatenate, (base, step, lo, hi))
             r = 0.5 * (np.sqrt(5.0) - 1.0)
             c, e = b - r * (b - a), a + r * (b - a)
-            fc = self._g(base + step * c, times, weights, relative)
-            fe = self._g(base + step * e, times, weights, relative)
+            fc = self._g(base + step * c, times, weights, relative, power)
+            fe = self._g(base + step * e, times, weights, relative, power)
             for _ in range(iters):
                 left = fc > fe                   # the maximum lies in [a, e]
                 a, b = np.where(left, a, c), np.where(left, e, b)
                 x = np.where(left, b - r * (b - a), a + r * (b - a))
-                fx = self._g(base + step * x, times, weights, relative)
+                fx = self._g(base + step * x, times, weights, relative, power)
                 c, e, fc, fe = (np.where(left, x, e), np.where(left, c, x),
                                 np.where(left, fx, fe), np.where(left, fc, fx))
             best = max(best, float(fc.max()), float(fe.max()))
