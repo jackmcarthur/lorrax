@@ -103,10 +103,11 @@ def check_fixed_point(session):
 #: Broadening of the rotating-band far patches (eV), above and below E_F.
 #: The P-R coupling needs Sigma_io(E_o) only to modest accuracy and a patch's
 #: node count scales as E_bw/eta. Replays (CLASSMIX round 2): Si conduction
-#: endpoints at 1 eV keep 0.7-0.8 meV; Fe semicore endpoints at 2 eV match
-#: the exact read (1.98 vs 1.95 meV) at half the 1 eV price.
+#: endpoints at 1 eV keep 0.7-0.8 meV; Fe semicore endpoints match the exact
+#: read at 2 eV (1.98 vs 1.95 meV) and move 0.1 meV more at 4 eV (round 4),
+#: which halves their far window (82 -> 45 nodes).
 FAR_PATCH_ETA_EV = 1.0
-FAR_PATCH_ETA_BELOW_EV = 2.0
+FAR_PATCH_ETA_BELOW_EV = 4.0
 #: Rule tolerance of the far-patch crossing windows. A far window's node
 #: count is set by its short side over eta (the patch top above the lowest
 #: state), not by its pole range, so splitting cannot shorten it; the coupling
