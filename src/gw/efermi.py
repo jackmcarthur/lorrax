@@ -58,7 +58,7 @@ argument is ``(E-mu)/(2*broadening_ry)``.  Matching QE therefore uses
 
 TWO OCCUPANCY RULES LIVE HERE AND THEY ARE NOT THE SAME RULE.
 :func:`band_in_occupation_window` decides which bands are in a
-Green's-function branch -- the float64 support of the branch weight.
+Green's-function branch -- the support ``|w| >= 1e-5`` of the branch weight.
 ``occupation_clamp_tol`` (:func:`clamp_occupation_tail`) decides whether a meaningless value exists
 in the table at all, and it is applied once, at evaluation, so every
 consumer sees the same support.  Neither subsumes the other and neither
@@ -169,16 +169,21 @@ def resolve_sigma_efermi_ry(fermi_reference, *, occupation_state, wfn):
 #  response-bank samples (``gw.response_bank``).
 # ---------------------------------------------------------------------------
 
-#: The float64 resolution of the partition ``f + (1 - f) = 1``.  The
-#: conduction weight ``1.0 - f`` is a multiple of ``2**-53`` (the spacing of
-#: doubles just below 1), so its smallest nonzero value is ``2**-53`` and
-#: its support is set by rounding.  A valence weight ``f`` below ``2**-53`` is
-#: finer than its own complement resolves; keeping it lets the valence
-#: support run on to the underflow of ``f``.  Both branches therefore keep
-#: ``|w| >= 2**-53``.  For a Fermi-Dirac state that is the energy cut
-#: ``|E - mu| <= kBT * 53 ln 2 = 36.74 kBT`` on either side of mu.  It is a
-#: property of float64, not a tuned constant.
-OCCUPATION_WEIGHT_FLOOR = float(np.finfo(np.float64).epsneg)  # 2**-53
+#: The branch-weight floor: a band is in a branch iff ``|w| >= 1e-5``.  For
+#: a Fermi-Dirac state that is ``|E - mu| <= kBT * ln(1e5 - 1) = 11.5 kBT``
+#: on either side of mu.  The support sets the Sigma box widths, and the tau
+#: cost grows linearly with them: the float64 floor 2**-53 (36.7 kBT) took Fe
+#: 4^3 from 798 to 1159 tau pairs and its cold rule plan from 58 s to 98 s
+#: (CLAIMS 2863), for states that carry no weight.
+#:
+#: THE BOUND.  A state that crosses the cut between SC maps switches one
+#: branch term on or off, and it changes Sigma by at most about the floor
+#: times the term the weight multiplies.  At 0.005 that was 5.38 meV on Fe
+#: (CLAIMS 2793); at 1e-5 it is about 0.01 meV.  Each weight the floor
+#: drops bounds the one-shot truncation the same way.
+#: No deck key: the one-shot and every SC map read this constant, so SC map
+#: 0 is the one-shot.
+OCCUPATION_WEIGHT_FLOOR = 1e-5
 
 
 def sigma_frame_mu_ev(config, wfn, E_full_ry, efermi_ry, occupation_state):
@@ -211,23 +216,22 @@ def sigma_frame_mu_ev(config, wfn, E_full_ry, efermi_ry, occupation_state):
 def band_in_occupation_window(weight):
     """``abs(weight) >= OCCUPATION_WEIGHT_FLOOR`` -- the one band-inclusion predicate.
 
-    ONE SUPPORT FOR ONE-SHOT AND EVERY SC MAP.  A tuned occupancy floor
-    (0.995 until 2026-09-26, a weight floor of 0.005 = 5.3 kBT) dropped
-    states that carry weight: 2.6 meV RMS / 8.4 meV max of Fe 4^3 Sigma
-    against the same model (CLAIMS 2451), and a 5.4 meV switch of one
-    occupied-branch term when an SC state crossed it (CLAIMS 2793).
+    ONE SUPPORT FOR ONE-SHOT AND EVERY SC MAP.  The weight floor 0.005
+    (5.3 kBT, until 2026-09-26) dropped states that carry weight: 2.6 meV
+    RMS / 8.4 meV max of Fe 4^3 Sigma against the same model (CLAIMS 2451),
+    and a 5.4 meV switch of one occupied-branch term when an SC state
+    crossed it (CLAIMS 2793).  At 1e-5 that switch is about 0.01 meV
+    (:data:`OCCUPATION_WEIGHT_FLOOR`).
 
-    WHY NOT ``w != 0``.  The Sigma executor multiplies each band's factor
+    WHAT THE FLOOR DECIDES.  The Sigma executor multiplies each band's factor
     ``exp(-i (E - E_ref) t)`` by its weight, and the planner puts ``E_ref`` at
     the edge of the states it admits, so no factor grows with the weight's
     size: the conditioning is gated per window by ``factor_growth`` in
     ``gw.sigma_box_plan``, whatever the support.  What the support decides
-    is the box.  Exact nonzero support keeps a valence weight ``f`` down to
-    its underflow, about 700 kBT above mu -- every band of a metal deck -- and
-    widens the occupied branch's box by that excursion; the conduction
-    weight ``1.0 - f`` stops at ``2**-53`` by rounding.  The floor applies
-    that same float64 resolution to both branches
-    (:data:`OCCUPATION_WEIGHT_FLOOR`).
+    is the box, and the tau cost is linear in its width.  Exact nonzero
+    support keeps a valence weight ``f`` down to its underflow, about 700
+    kBT above mu -- every band of a metal deck; the float64 floor ``2**-53``
+    reaches 36.7 kBT; 1e-5 reaches 11.5 kBT.
 
     MAGNITUDE, NEVER A ONE-SIDED CUT.  :attr:`OccupationState.f_kn` is never
     clipped; under an MP1 state a band just above mu carries a NEGATIVE
