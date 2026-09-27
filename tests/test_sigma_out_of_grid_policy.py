@@ -172,8 +172,8 @@ def test_sc_window_plan_one_shot_then_plan_then_hold_then_extend():
 
 def test_a_single_map_run_keeps_the_one_shot_rule():
     part = BandPartition(protected_mask=np.ones(2, bool), in_range_mask=np.ones(2, bool))
-    *_, event = _sc_sampled_support(_inputs("cover", 0), part, np.array([[0.3, 9.9]]), 0.0)
-    assert event == "one-shot"
+    support = _sc_sampled_support(_inputs("cover", 0), part, np.array([[0.3, 9.9]]), 0.0)
+    assert support.event == "one-shot"
 
 
 def test_unset_grid_edges_derive_the_grid_from_the_bands():
