@@ -1410,10 +1410,13 @@ def produce_sample_bank(wfns, meta, config, *, mesh_xy, sym, sample_plan, bank_i
             if vertex is not None:
                 _photon_sample_norms(receipt,value,q0,sample,bank_io["photon_layout"],mesh_xy)
             for iq in range(q0,q1):
-                part = slice(iq-q0,iq-q0+1)
-                if vertex is None:
+                # Both censuses read only self-negative (TRIM) parents; test
+                # that on the host first, so no other parent dispatches a
+                # device slice per sample (0.2 s per map on Fe 4^3 charge).
+                if vertex is None and _self_negative(int(qids[iq]),meta):
+                    part = slice(iq-q0,iq-q0+1)
                     _reciprocity_census(receipt,value[part],z[sample:sample+1],int(qids[iq]),iq,meta)
-                    if ordered and _self_negative(int(qids[iq]),meta):
+                    if ordered:
                         _tr_odd_census(receipt,solve_value,h[part],chi_value[part],value[part],z[sample:sample+1],int(qids[iq]))
         return value, slope
 
