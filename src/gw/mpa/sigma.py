@@ -1499,6 +1499,45 @@ class MemoryPoleSource:
         return take(self.Omega), take(self.B), B_odd
 
 
+class MemorySharedPoleModel:
+    """A shared-pole model handed to the Sigma executor in memory: the store's census, no file.
+
+    The in-memory twin of the store for ``compute_sigma_c_mpa_omega_grid(sigma_w_model=
+    "shared_pole")``, as :class:`MemoryPoleSource` is for the pole route.  ``poles2`` host
+    float64 ``[n_q_irr, K]`` squared frequencies (Ry²) with an active prefix of ``counts``
+    ``[n_q_irr]`` columns per parent; ``factors`` whatever the caller's synthesis reads (the
+    plane-wave path: ``b`` on the response sphere's faces).  ``identity`` is the provenance
+    dict the Σ rule cache scopes by.  The caller supplies ``sector_context`` (schedule,
+    synthesis, τ kernel) and owns the factors' lifetime.
+    """
+
+    def __init__(self, poles2, counts, *, identity, factors=None, ordered=False):
+        poles2 = np.asarray(poles2, np.float64)
+        counts = np.asarray(counts, np.int64)
+        if poles2.ndim != 2 or counts.shape != (poles2.shape[0],) or np.any(counts < 0) \
+                or np.any(counts > poles2.shape[1]):
+            raise ValueError(f"MemorySharedPoleModel: poles2 {poles2.shape} and counts "
+                             f"{counts.shape} disagree")
+        active = np.arange(poles2.shape[1])[None, :] < counts[:, None]
+        if not np.all(np.isfinite(poles2[active])) or np.any(poles2[active] <= 0):
+            raise ValueError("GATE shared_pole_census: in-memory poles must be finite and positive")
+        self.poles2 = np.where(active, poles2, 1.0)
+        self.counts = counts
+        self.factors = factors
+        self.ledger = {"n_q_irr": int(poles2.shape[0]), "Kmax": int(poles2.shape[1]),
+                       "K": counts.tolist(), "identity": dict(identity), "digest": None,
+                       "representation": "scalar-ordered-ph" if ordered else "scalar-even"}
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_exc):
+        return False
+
+    def census(self):
+        return self.poles2, self.counts
+
+
 def integrate_sigma_store(
     wfns,
     fit_src,
@@ -1682,12 +1721,16 @@ def compute_sigma_c_mpa_omega_grid(
             "compute_sigma_c_mpa_omega_grid: tau_kernel_factory serves the pole "
             "route; a shared-pole model passes its sector kernel through sector_context")
     fixed_pole_support_ry = None
+    memory_model = isinstance(fit_src, MemorySharedPoleModel)
+    if memory_model and (not shared_pole or sector_context is None):
+        raise ValueError("MemorySharedPoleModel: sigma_w_model='shared_pole' with the caller's "
+                         "sector_context (schedule, synthesis, tau_kernel) is required")
     if shared_pole:
         from file_io.shared_pole_store import open_shared_pole_model, validate_shared_pole_model
         with timing.section("sigma.model_validate"):
-            ledger = validate_shared_pole_model(
+            ledger = (fit_src.ledger if memory_model else validate_shared_pole_model(
                 fit_src, expected_identity=fit_identity, mesh_xy=mesh_xy,
-                capacity=meta.shared_pole_capacity)
+                capacity=meta.shared_pole_capacity))
         if fit_digest is not None and ledger["digest"] != fit_digest:
             raise ValueError("GATE shared_pole_identity: screening handle digest differs from model")
         recipe = meta.shared_pole_recipe
@@ -1736,7 +1779,8 @@ def compute_sigma_c_mpa_omega_grid(
     # (audit A1; hdf5_owner enforces it).  The context manager is the
     # release path: a refusal from the planner or the executor must still
     # close the handle on every rank.
-    with (open_shared_pole_model(fit_src, mesh_xy=mesh_xy) if shared_pole else
+    with (fit_src if memory_model else
+          open_shared_pole_model(fit_src, mesh_xy=mesh_xy) if shared_pole else
           fit_src if isinstance(fit_src, MemoryPoleSource) else
           open_pole_reader(fit_src, mesh_xy=mesh_xy)) as reader:
         # One bounded extrema census serves both routes.  In particular, the
@@ -1747,10 +1791,13 @@ def compute_sigma_c_mpa_omega_grid(
         if shared_pole:
             from file_io.shared_pole_store import read_shared_pole_census
             with timing.section("sigma.census"):
-                poles_device, counts_device = read_shared_pole_census(
-                    reader, header=ledger, capacity=meta.shared_pole_capacity)
-                poles2, counts = map(np.asarray, jax.device_get((poles_device, counts_device)))
-                del poles_device, counts_device
+                if memory_model:
+                    poles2, counts = reader.census()
+                else:
+                    poles_device, counts_device = read_shared_pole_census(
+                        reader, header=ledger, capacity=meta.shared_pole_capacity)
+                    poles2, counts = map(np.asarray, jax.device_get((poles_device, counts_device)))
+                    del poles_device, counts_device
                 # A sector call scopes its rules by the map's union census
                 # (compute_sector_sigma), so sectors reuse each other's fits.
                 scope = (sector_context or {}).get("rule_census")
@@ -1964,5 +2011,6 @@ __all__ = [
     "assert_head_body_occupation_match",
     "compute_sigma_c_mpa_omega_grid",
     "integrate_sigma_store",
+    "MemorySharedPoleModel",
     "_attach_ordered_odd_sigma",
 ]
