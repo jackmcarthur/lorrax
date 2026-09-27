@@ -1224,10 +1224,12 @@ def resolve_shared_pole_recipe(config, wfns, meta, *, mesh_xy, print_fn,
         support_pairs.append([-1, -1] if pair is None else pair)
     for i, e in enumerate(line):
         add(e, height, 'line', False)
-    for i, u in enumerate(imaginary):
-        add(0.0, u, 'imaginary', False)
+    # Off-axis sites directly after the line ladder: the store reads the line
+    # panel as one contiguous sample span.
     for re_ev, im_ev in (override or {}).get('off_axis_ev', ()):
         add(re_ev, im_ev, 'line', False)
+    for i, u in enumerate(imaginary):
+        add(0.0, u, 'imaginary', False)
     for i, e in enumerate(held_line):
         j = held_pairs[i]
         add(e, height, 'held_line', True, [j, j+1])
