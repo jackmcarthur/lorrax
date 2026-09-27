@@ -3536,7 +3536,11 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
                         mu_bases=inputs.mu_bases,
                         photon_g0_vectors=inputs.photon_g0_vectors,
                         photon_head_cache=inputs.screening_seed_cache,
-                        photon_head_rotation=U_full)
+                        photon_head_state=(
+                            (U_full, None, None)
+                            if inputs.config.sc.head_update == "dft_velocity"
+                            else (None, inputs.wfns_dft,
+                                  _fixed_dft_head_occupation_state(inputs))))
                    if inputs.config.sigma.w_model == "shared_pole"
                    and wfns_transverse_qp is not None else {}),
                 print_fn=inputs.print_fn)
@@ -6186,10 +6190,18 @@ def load_head_velocity_source(
     (a) link singular-value hybridization at the active window's top edge —
         ``parallel_transport`` only, needs the links this mode alone reads.
     """
-    from gw.gw_config import HEAD_UPDATES
+    from gw.gw_config import HEAD_UPDATES, uses_direct_bispinor_shared_pole_head
 
     mode = str(config.sc.head_update)
     if mode not in HEAD_UPDATES:
+        return None
+    if uses_direct_bispinor_shared_pole_head(config):
+        # The four-current bank reads and rotates the dipole velocity itself
+        # (``response_bank.compute_photon_bank``); no scalar head consumes one.
+        print_fn(
+            "  SC head: four-current direct Gamma head follows every map "
+            "(sc_head_update = dft_velocity): QP-rotated dipole velocity, "
+            "this map's Fermi-Dirac state, its own Ward contact")
         return None
     if not bool(config.do_G0):
         raise ValueError(

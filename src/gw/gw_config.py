@@ -3731,6 +3731,22 @@ def refuse_unsupported_bispinor_gw(config) -> None:
                 "bank has a direct Gamma head under "
                 "head_correction=no_local_fields; full wing/body folding is "
                 "unavailable")
+        if (config.qp_solver is QPSolver.SELF_CONSISTENT
+                and config.sc.head_update not in PHOTON_DIRECT_HEAD_UPDATES):
+            raise ValueError(
+                "GATE full_shared_pole_head_update: the four-current direct "
+                "Gamma head has two SC modes.\n"
+                f"  got:  sc_head_update = {config.sc.head_update}\n"
+                "  want: dft_velocity (the head follows every map: QP-rotated "
+                "dipole velocity, this map's Fermi-Dirac state and its own "
+                "Ward contact) or off (the DFT head, rebuilt at each map's "
+                "frequencies)\n"
+                "  why:  gw.photon_direct_head consumes the dipole velocity "
+                "only; parallel-transport links and the interband-commutator "
+                "velocity have no four-current consumer, so either would be "
+                "ignored\n"
+                "  doc:  docs/architecture/four_current_wiring.md, "
+                "'Self-consistency and restart'.")
         return
     if not bool(config.bispinor):
         raise ValueError(
@@ -4255,12 +4271,19 @@ INSULATOR_HEAD_UPDATES = ("interband_commutator",)
 #: Every ``sc_head_update`` value that rebuilds the head each map.
 HEAD_UPDATES = METAL_HEAD_UPDATES + INSULATOR_HEAD_UPDATES
 
+#: The SC head modes of the four-current direct Γ head
+#: (``bispinor_gw = full_shared_pole``): ``off`` builds it on the DFT state,
+#: ``dft_velocity`` on each map's state with the QP-rotated velocity.
+PHOTON_DIRECT_HEAD_UPDATES = ("off", "dft_velocity")
+
 
 def uses_metal_direct_drude_head(config) -> bool:
     """Admit the per-map velocity head (Drude + Thomas-Fermi) on a shared-pole metal.
 
-    The direct head (``no_local_fields``) is admitted on scalar and
-    bare-transverse bispinor decks.  The folded head (``full``, intraband
+    The direct head (``no_local_fields``) is admitted on scalar,
+    bare-transverse and four-current (``full_shared_pole``) decks; the
+    four-current bank builds its own head from the same QP-rotated dipole
+    velocity (``response_bank.compute_photon_bank``).  The folded head (``full``, intraband
     wings and the static fold) is admitted on scalar decks (owner ruling
     2026-09-25: full on time-reversal-even metals on the frozen and the
     per-map routes); an ordered (time-reversal-broken) store still refuses
@@ -4271,7 +4294,8 @@ def uses_metal_direct_drude_head(config) -> bool:
             and config.sigma.w_model == "shared_pole"):
         return False
     if config.head.correction is HeadCorrection.NO_LOCAL_FIELDS:
-        return not config.bispinor or uses_bare_transverse_shared_pole(config)
+        return (not config.bispinor or uses_bare_transverse_shared_pole(config)
+                or uses_full_bispinor_shared_pole(config))
     return config.head.correction is HeadCorrection.FULL and not config.bispinor
 
 
