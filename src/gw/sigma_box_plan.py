@@ -1347,7 +1347,7 @@ def plan_sigma_windows(
     if not 0.0 < tolerance < 1.0:
         raise ValueError("sigma_quadrature_eps must lie in (0, 1)")
     if not np.isfinite(edge) or edge < 0.0:
-        raise ValueError("sigma_window_edge_factor must be nonnegative")
+        raise ValueError("Sigma selector margin must be nonnegative")
     fixed_pole_support = None
     if fixed_pole_support_ry is not None:
         fixed_pole_support = float(fixed_pole_support_ry)

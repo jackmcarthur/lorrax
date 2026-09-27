@@ -13,8 +13,9 @@ the Hartree rebuild ([direct Hartree field](theory/hartree.md)).
 ## 1 The map
 
 The carry is the QP Hamiltonian in the fixed DFT basis, $H_k$ of shape
-`(nk, nb, nb)`. It spans the Σ band window `[b0, b3)`, the `nval + ncond`
-bands, on the loop's k-set. One map $F: H \to H'$ does five things:
+`(nk, nb, nb)`. Dynamic SC spans the complete `number_bands` carrier on
+the loop's k-set; the [window decision](theory/sigma-windows-design.md)
+separates requested protected bands from rotating bands. One map $F: H \to H'$ does five things:
 
 1. diagonalize $H_k = U_k\,\mathrm{diag}(E_k)\,U_k^\dagger$;
 2. rotate the original DFT orbitals by $U$. There is no cumulative product,
@@ -37,9 +38,9 @@ $$
 $F$ is a pure function of $H$: re-evaluating the same input returns a
 bitwise-identical output (CLAIMS 2678). Every evaluated pair
 $(H, F(H) - H)$ is therefore valid secant data. Map 0 takes $U = I$ exactly
-instead of calling `eigh` on $\mathrm{diag}(E_{\rm DFT})$, so SC map 0 equals the
-one-shot G0W0 bit for bit
-(`tests/test_invariance_gates.py::test_sc_iteration1_equals_one_shot`). Each
+instead of calling `eigh` on $\mathrm{diag}(E_{\rm DFT})$. Its input orbitals
+and occupations are the DFT ones; the band-class operator differs from a
+one-shot operator wherever a rotating endpoint is present. Each
 map costs one full $\chi_0 \to W \to \Sigma$ evaluation. The
 [window decision](theory/sigma-windows-design.md) owns the single initial
 quadrature plan and the one permitted convergence rebuild.
@@ -350,10 +351,9 @@ Insulators keep `parallel_transport` and `dft_velocity`.
   history.
 - **Seeding a new run.** `sc_initial_qp_rotations_file` imports an
   authenticated eigensystem as $H = U\,\mathrm{diag}(E)\,U^\dagger$ in the
-  original DFT basis. A seed whose band policy is not all-protected, or that
-  carries an active-window scissor (both written only before the 2026-09-22
-  all-protected rule), refuses. Keep the original WFN and
-  reference operators. Occupations and the tail fit are recomputed, and the
+  original DFT basis. A smaller prefix seed is extended by the DFT identity
+  and DFT energies. The new deck classifies its bands; the seed's old scissor
+  law is not imported. Keep the original WFN and reference operators. Occupations and the tail fit are recomputed, and the
   quadrature and the accelerator history start empty, so this is a new run,
   not a continuation.
 - **`restart = true`** reuses the ISDF/W tensors of a finished run. It
