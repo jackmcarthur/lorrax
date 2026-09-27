@@ -1,11 +1,11 @@
 """The MP1 occupation table's far tail is snapped to exact 0 / 1.
 
-``occupation_clamp_tol`` answers a DIFFERENT question from
-``occupation_window_threshold``, and this file exists partly to keep them
-from being collapsed into one another.  The threshold decides which bands
-are worth putting in a Green's-function branch; the clamp decides whether a
-meaningless value exists in the table at all.  Both are live; neither
-subsumes the other (``test_the_two_rules_are_not_the_same_rule``).
+``occupation_clamp_tol`` answers a DIFFERENT question from the branch
+support (``gw.efermi.band_in_occupation_window``), and this file exists
+partly to keep them from being collapsed into one another.  The support
+decides which bands are in a Green's-function branch; the clamp decides
+whether a meaningless value exists in the table at all
+(``test_the_two_rules_are_not_the_same_rule``).
 
 The argument for the clamp is a number.  Unclamped, the MP1 table's support
 edge sits at ``x = (E-mu)/(2W) = 27.2971``, which is
@@ -45,13 +45,12 @@ import jax.numpy as jnp
 from gw.efermi import (MP1_LOBE_EXTREMUM,
                        OCCUPATION_CLAMP_TOL_DEFAULT,
                        OCCUPATION_CLAMP_TOL_MAX,
-                       OCCUPATION_WINDOW_THRESHOLD_DEFAULT,
+                       OCCUPATION_WEIGHT_FLOOR,
                        OccupationState,
                        band_in_occupation_window,
                        clamp_occupation_tail,
                        mp1_occupations,
                        occupation_clamp_tol,
-                       occupation_weight_floor,
                        occupied_band_count,
                        solve_mp1_occupations)
 
@@ -329,61 +328,20 @@ def test_a_gapped_step_state_is_untouched_by_any_admissible_clamp():
 # --------------------------------------------------------------------------
 
 def test_the_two_rules_are_not_the_same_rule():
-    """They cut at different radii and they answer different questions.
+    """The branch floor is float64 resolution; the clamp is MP1's own support.
 
-    The threshold's floor bites at ``x = 2.14``; the clamp's support edge is
-    at ``x = 4.31``.  The threshold is the binding cut everywhere it applies,
-    which is why the clamp changes no band-set decision at the default
-    threshold (next test) -- and why neither can be deleted in favour of the
-    other.
+    The floor (``2**-53``) sits far below the clamp tolerance, so on an MP1
+    table the clamp is the binding cut: it drags the support edge in from
+    the underflow radius x=27.30 to x=4.31, and the branch predicate then
+    keeps what the table holds.
     """
-    floor = occupation_weight_floor(OCCUPATION_WINDOW_THRESHOLD_DEFAULT)
-    assert floor == pytest.approx(0.005)
-    assert OCCUPATION_CLAMP_TOL_DEFAULT < floor
-    edge_thresh = float(
-        max(x for x in np.linspace(0.0, 10.0, 200001)
-            if abs(_mp1_closed_form(x)) > floor))
-    edge_clamp = _support_edge_in_x(0.01, OCCUPATION_CLAMP_TOL_DEFAULT)
-    assert edge_thresh == pytest.approx(2.1375, rel=1e-3), edge_thresh
-    assert edge_clamp > edge_thresh
-
-
-def test_the_threshold_sites_decide_identically_with_and_without_the_clamp():
-    """Every band the clamp zeroes was already outside the window.
-
-    The four consumers of ``band_in_occupation_window`` cut on
-    ``abs(weight) > 0.005``; the clamp only moves values whose magnitude is
-    below 1e-8.  So on both branch weights, at every default-threshold
-    consumer, the band set is unchanged -- the clamp makes some of the
-    threshold's work redundant on paper without changing a single result.
-    Executed over a real MP1 table on both branches.
-    """
-    energies, f_raw = _metallic_table(nb=20001)
-    f_clamped = np.asarray(mp1_occupations(
-        jnp.asarray(energies[None, :]), 0.0, 0.01,
-        OCCUPATION_CLAMP_TOL_DEFAULT))[0]
-    assert np.count_nonzero(f_clamped != f_raw) > 0, "no tail in the fixture"
-
-    floor = occupation_weight_floor(OCCUPATION_WINDOW_THRESHOLD_DEFAULT)
-    for raw, clamped in ((f_raw, f_clamped), (1.0 - f_raw, 1.0 - f_clamped)):
-        assert np.array_equal(band_in_occupation_window(raw, floor),
-                              band_in_occupation_window(clamped, floor))
-
-
-def test_the_exact_rule_escape_hatch_is_where_the_clamp_does_show_up():
-    """``threshold = 1.0`` (floor 0) is the one consumer setting the clamp
-    moves -- it drags the exact rule's edge in from x=27.30 to x=4.31, which
-    is the entire point of the key."""
+    assert OCCUPATION_WEIGHT_FLOOR < OCCUPATION_CLAMP_TOL_DEFAULT
     energies, f_raw = _metallic_table(nb=20001, span=0.6)
     f_clamped = np.asarray(mp1_occupations(
         jnp.asarray(energies[None, :]), 0.0, 0.01,
         OCCUPATION_CLAMP_TOL_DEFAULT))[0]
-    exact_floor = occupation_weight_floor(1.0)
-    assert exact_floor == 0.0
-    kept_raw = int(np.count_nonzero(
-        band_in_occupation_window(f_raw, exact_floor)))
-    kept_clamped = int(np.count_nonzero(
-        band_in_occupation_window(f_clamped, exact_floor)))
+    kept_raw = int(np.count_nonzero(band_in_occupation_window(f_raw)))
+    kept_clamped = int(np.count_nonzero(band_in_occupation_window(f_clamped)))
     assert kept_clamped < kept_raw, (kept_raw, kept_clamped)
 
 
@@ -434,4 +392,3 @@ def test_the_key_has_a_row_in_the_input_reference():
     # The three facts a future reader must not have to rediscover.
     assert "27.2971" in rows[0]
     assert "fixed-N" in rows[0]
-    assert "occupation_window_threshold" in rows[0]

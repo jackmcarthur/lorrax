@@ -25,8 +25,7 @@ from runtime.padding import (
     padded_mu_axis,
     solve_at_logical,
 )
-from .efermi import (OCCUPATION_WINDOW_THRESHOLD_DEFAULT,
-                     band_in_occupation_window, occupation_weight_floor)
+from .efermi import band_in_occupation_window
 from .minimax_screening import MinimaxNodes
 
 
@@ -2535,25 +2534,20 @@ def compute_static_photon_response(
     )
 
 
-def _occupation_support_slices(
-        occupations,
-        occupation_window_threshold=OCCUPATION_WINDOW_THRESHOLD_DEFAULT):
+def _occupation_support_slices(occupations):
     """Smallest contiguous f and (1-f) band supports without truncation; see docs/architecture/four_current_wiring.md."""
     occ = np.asarray(jax.device_get(occupations), dtype=np.float64)
     if occ.ndim != 2:
         raise ValueError(
             "fractional contour occupations must have shape (nk, nb), got "
             + str(occ.shape))
-    floor = occupation_weight_floor(occupation_window_threshold)
-    f_support = np.any(band_in_occupation_window(occ, floor), axis=0)
-    u_support = np.any(band_in_occupation_window(1.0 - occ, floor), axis=0)
+    f_support = np.any(band_in_occupation_window(occ), axis=0)
+    u_support = np.any(band_in_occupation_window(1.0 - occ), axis=0)
     if not np.any(f_support) or not np.any(u_support):
         raise ValueError(
-            "fractional contour chi0 needs at least one band clearing the "
-            f"occupation window on each side (threshold "
-            f"{float(occupation_window_threshold)!r} ⇒ |weight| > {floor!r}); "
-            "raise occupation_window_threshold toward 1.0 to widen the "
-            "supports, or check the occupation table")
+            "fractional contour chi0 needs at least one band with a nonzero "
+            "float64 weight on each side (gw.efermi.band_in_occupation_window); "
+            "check the occupation table")
     f_idx = np.flatnonzero(f_support)
     u_idx = np.flatnonzero(u_support)
     return (
@@ -2569,7 +2563,6 @@ def _chi0_fractional_contour_args(
     z_values,
     occupations,
     energy_reference,
-    occupation_window_threshold=OCCUPATION_WINDOW_THRESHOLD_DEFAULT,
 ):
     """Prepare final band weights on the occupied and unoccupied support windows."""
     time_nodes = np.asarray(time_nodes, dtype=np.float64)
@@ -2606,8 +2599,7 @@ def _chi0_fractional_contour_args(
         raise ValueError(
             "fractional contour occupation shape {} does not match energies "
             "{}".format(occ_full.shape, wfns.enk.shape))
-    f_slice, u_slice = _occupation_support_slices(
-        occ_full, occupation_window_threshold)
+    f_slice, u_slice = _occupation_support_slices(occ_full)
     eref = 0.0 if energy_reference is None else float(energy_reference)
     # Invert occupations before masking so excluded bands retain zero weight.
     nb_full = int(wfns.slices.nb_full)
@@ -2658,7 +2650,6 @@ def compute_chi0_contour_fractional(
     *,
     occupations=None,
     energy_reference=0.0,
-    occupation_window_threshold=OCCUPATION_WINDOW_THRESHOLD_DEFAULT,
     ordered=False,
 ):
     """Evaluate retarded finite-occupation chi0 at complex frequencies; see docs/architecture/four_current_wiring.md.
@@ -2676,7 +2667,6 @@ def compute_chi0_contour_fractional(
         z_values,
         occupations,
         energy_reference,
-        occupation_window_threshold,
     )
     kernel = _get_chi_fractional_contour_kernel(
         mesh_xy, kgrid, n_out, ordered=ordered, **_chi_parent_face_kwargs(wfns))
@@ -2950,13 +2940,10 @@ def _get_chi_fractional_q_kernel_face(
     return kernel
 
 
-def occupation_support_bandwidth(
-        energies_kn_ry, occupations_kn,
-        occupation_window_threshold=OCCUPATION_WINDOW_THRESHOLD_DEFAULT):
+def occupation_support_bandwidth(energies_kn_ry, occupations_kn):
     """Largest transition energy over the occupation supports, Ry; see docs/architecture/four_current_wiring.md."""
     e = np.asarray(jax.device_get(energies_kn_ry), dtype=np.float64)
-    f_slice, u_slice = _occupation_support_slices(
-        occupations_kn, occupation_window_threshold)
+    f_slice, u_slice = _occupation_support_slices(occupations_kn)
     return float(np.max(e[:, u_slice]) - np.min(e[:, f_slice]))
 
 

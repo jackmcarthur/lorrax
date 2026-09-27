@@ -1651,14 +1651,6 @@ _DEFAULTS = {
     # (relative paths are resolved beside the input deck).
     "sigma_quadrature_eps": 3.0e-5,
     "sigma_quadrature_cache_dir": "auto",
-    # OCCUPANCY at which a band leaves a metallic Green's-function branch.
-    # The Σ planner cuts on the branch WEIGHT (f on val, 1−f on cond), so
-    # the applied floor is 1 − threshold: 0.995 ⇒ |weight| > 0.005.  It is
-    # a magnitude, because MP1 f_kn is never clipped and a wrong-side band
-    # carries a NEGATIVE weight that must be kept.  1.0 reproduces the
-    # historical exact `weight != 0` rule bit-for-bit.  Metal-only: an
-    # insulating branch has no weight and is untouched.
-    "occupation_window_threshold": 0.995,
     # Sigma frequency grid
     # None (unset): the grid comes from the protected Sigma band range under
     # the SC window plan; a value is a minimum extent honoured every map.
@@ -2534,8 +2526,6 @@ def _input_response(
         pole_batch_size=int(params["mpa_pole_batch_size"]),
         overwrite_completed_artifacts=bool(
             params["mpa_overwrite_completed_artifacts"]),
-        occupation_window_threshold=float(
-            params["occupation_window_threshold"]),
         fit_reuse_file=(str(params["mpa_fit_reuse_file"]) or None),
     )
     # A patch list sets both edges before the config (and its cover-only
@@ -3072,6 +3062,13 @@ def _report_remaining_retired_keys(
             "Input key 'sigma_at_dft_extrapolate' is retired: under "
             "qp_solver = fixed_point a band off the Sigma(omega) grid keeps "
             "E_DFT; there is no scissor extrapolation.  Remove the key.")
+    if section.get("occupation_window_threshold", fallback=None) is not None:
+        raise ValueError(
+            "Input key 'occupation_window_threshold' is retired: a band "
+            "belongs to a Green's-function branch iff its weight (f, or "
+            "1 - f) is resolved in float64, |w| >= 2**-53 "
+            "(gw.efermi.band_in_occupation_window), the same support for the "
+            "one-shot and every SC map.  Remove the key.")
     if section.get("low_mem_bands", fallback=None) is not None:
         raise ValueError(
             "Input key 'low_mem_bands' is retired: ψ is always stored "
@@ -4178,15 +4175,6 @@ class MPAConfig:
     #: Deliberately destructive opt-in for replacing an already complete MPA
     #: sample store or finalized/certified pole fit.  False is write-once.
     overwrite_completed_artifacts: bool = False
-    #: ``occupation_window_threshold``: the OCCUPANCY at which a band stops
-    #: counting toward a metallic Green's-function branch.  The Σ planner's
-    #: cut is on the branch WEIGHT (``f`` on val, ``1 − f`` on cond), so the
-    #: floor it applies is ``1 − threshold`` — 0.995 ⇒ ``|weight| > 0.005``
-    #: — and it is a MAGNITUDE because MP1 occupations are never clipped.
-    #: 1.0 recovers the historical exact ``weight != 0`` rule.  Validated at
-    #: its consumer (``gw.mpa.sigma_windows._weight_floor``) per the ruling
-    #: below.
-    occupation_window_threshold: float = 0.995
     #: Explicit finalized pole store for a read-only one-shot reuse.  This is
     #: not the ISDF ``restart`` flag: that flag does not own screening state.
     fit_reuse_file: str | None = None
@@ -4620,11 +4608,10 @@ class LorraxConfig:
     #: ``occupation_clamp_tol``: the distance from 0 or 1 within which an
     #: MP1 occupation is snapped to EXACTLY 0 or 1, applied at the point
     #: the occupations are evaluated and therefore inside the fixed-N root
-    #: (``gw.efermi.clamp_occupation_tail``).  Distinct from
-    #: ``occupation_window_threshold``, which decides band membership of a
-    #: Green's-function branch and is not replaced by this.  Validated at
-    #: its consumer (``gw.efermi.occupation_clamp_tol``), the same shape
-    #: ``occupation_window_threshold`` uses.
+    #: (``gw.efermi.clamp_occupation_tail``).  Distinct from the branch
+    #: support (``gw.efermi.band_in_occupation_window``), which decides band
+    #: membership of a Green's-function branch.  Validated at its consumer
+    #: (``gw.efermi.occupation_clamp_tol``).
     occupation_clamp_tol: float
 
     # --- Core mode flags (top-level; hot path) ---

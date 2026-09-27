@@ -63,9 +63,10 @@ One time node therefore costs **two weighted single-band Green sums**, one with
 band axes are summed; no band-pair-by-node object exists
 (`gw.w_isdf.compute_chi0_contour_fractional`; the weight enters
 `build_G_tau(band_weight=)` linearly and is never clipped or square-rooted).
-The band supports are the smallest contiguous ranges whose weight clears
-$|w|>1-$`occupation_window_threshold` (default 0.995, floor 0.005); a partially
-occupied band belongs to both.
+The band supports are the smallest contiguous ranges whose weight is resolved
+in float64, $|w|\ge 2^{-53}$ (`gw.efermi.band_in_occupation_window`; for
+Fermi–Dirac $|E-\mu|\le 53\ln 2\,k_BT$); a partially occupied band belongs to
+both. The same predicate cuts the Σ branches, for the one-shot and every SC map.
 
 ### 1.2 Where the cancellation lives
 

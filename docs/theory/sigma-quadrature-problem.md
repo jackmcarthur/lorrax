@@ -332,6 +332,6 @@ A per-stage split of a node is a `jax.profiler` trace of the window executable.
 | runtime-noise bound above 5·10⁻⁶ | the same; the box is too ill-conditioned for its currency |
 | factored log growth above 30 | the same |
 | live pole with Re Ω ≤ 0 or Im Ω > 0, or a nonfinite residue | refit the pole model |
-| a branch with no live states | the Σ band window has no band on that side; widen `number_bands_sigma` or `occupation_window_threshold` |
+| a branch with no live states | the Σ band window has no band on that side; widen `number_bands_sigma` |
 | η ≤ 0, ε ∉ (0, 1), edge factor < 0 | fix the deck |
 | η or ε changed inside one SC session | one currency per run |

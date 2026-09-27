@@ -34,8 +34,7 @@ from gw.wavefunction_bundle import (
     parent_sigma_operands, sigma_face_kernel_kwargs)
 from runtime.padding import combined_divisor, pad_to_axis, padded_axis
 
-from .sigma_windows import (OCCUPATION_WINDOW_THRESHOLD_DEFAULT,
-                            summarize_sigma_poles,
+from .sigma_windows import (summarize_sigma_poles,
                             shared_pole_frequencies,
                             shared_pole_intervals,
                             summarize_shared_poles)
@@ -1548,8 +1547,7 @@ def integrate_sigma_store(
         return run(reader)
 
 
-def _branches(wfns, omega, efermi_ry, occupation_state=None,
-              occupation_window_threshold=OCCUPATION_WINDOW_THRESHOLD_DEFAULT):
+def _branches(wfns, omega, efermi_ry, occupation_state=None):
     """The four causal branches, with occupation and energy kept separate.
 
     Band axis is ``slices.sigma_sum`` -- the Sigma band count, not the
@@ -1562,17 +1560,16 @@ def _branches(wfns, omega, efermi_ry, occupation_state=None,
     bit-exact: bool occ>0.5 masks, distances signed against ``efermi_ry``.
     With a state (duck-typed: ``.f_kn``, ``.mu_ry``), the branches carry the
     fractional supports and weights: the val branch sums every band whose
-    weight f clears the occupancy window at weight f, the cond branch every
-    band whose weight 1−f clears it at weight 1−f.  Nothing is clipped; the
+    weight f is in its float64 support at weight f, the cond branch every
+    band whose weight 1−f is at weight 1−f.  Nothing is clipped; the
     Fermi-Dirac weights metals use lie in [0, 1], and an MP overshoot
     (f<0 or f>1) would ride through unchanged
     (docs/theory/finite-occupation-screening.md).
 
-    ``occupation_window_threshold`` sets that window;
-    ``branches_for_omega_grid`` applies it.  1.0 restores the historical
-    ``f != 1`` / ``f != 0`` supports bit-for-bit.  Applying it here rather
+    ``branches_for_omega_grid`` applies the one support predicate
+    (``gw.efermi.band_in_occupation_window``).  Applying it here rather
     than only in the planner keeps ONE support: ``sigma_windows._a_space``
-    re-applies the same floor to the same weights, so the two agree by
+    re-applies the same predicate to the same weights, so the two agree by
     construction instead of by review.
     """
     if occupation_state is None:
@@ -1599,8 +1596,7 @@ def _branches(wfns, omega, efermi_ry, occupation_state=None,
     return branches_for_omega_grid(
         omega, E_cond=energy, H_val=-energy,
         cond_mask=(f != 1.0), val_mask=(f != 0.0),
-        cond_weight=1.0 - f, val_weight=f,
-        occupation_window_threshold=occupation_window_threshold)
+        cond_weight=1.0 - f, val_weight=f)
 
 
 def compute_sigma_c_mpa_omega_grid(
@@ -1616,7 +1612,6 @@ def compute_sigma_c_mpa_omega_grid(
     quadrature_eps,
     quadrature_cache_dir,
     omega_grid_step_ry,
-    occupation_window_threshold=OCCUPATION_WINDOW_THRESHOLD_DEFAULT,
     pole_batch_size=4,
     fit_identity=None,
     fit_digest=None,
@@ -1640,11 +1635,9 @@ def compute_sigma_c_mpa_omega_grid(
     branches carry exact fractional supports and (f, 1−f) weights, and
     ``efermi_ry`` must equal ``occupation_state.mu_ry``.
 
-    ``occupation_window_threshold`` is the OCCUPANCY below which a band is
-    still counted in a branch; the cut is ``|weight| > 1 - it``.  It is
-    forwarded from this one value to the BRANCH BUILD and to BOTH planner
-    entry points, which is what keeps the branch supports, the pole census
-    and the window build on one support.
+    The branch build and both planner entry points read the one support
+    predicate (``gw.efermi.band_in_occupation_window``), which keeps the
+    branch supports, the pole census and the window build on one support.
 
     Pole tensors are read collectively in their native sharding.  The box
     planner retains only exact live extrema from each configured pole batch;
@@ -1706,8 +1699,7 @@ def compute_sigma_c_mpa_omega_grid(
     with timing.section("sigma.branches"):
         branches = (_branches(
             wfns, omega_grid_ry, efermi_ry,
-            occupation_state=occupation_state,
-            occupation_window_threshold=occupation_window_threshold)
+            occupation_state=occupation_state)
             if sigma_branches is None else tuple(sigma_branches))
     # ONE collective handle for the census walk, the planner, and the
     # executor walk — the whole Σ stage of this iteration.  The reader
@@ -1743,8 +1735,7 @@ def compute_sigma_c_mpa_omega_grid(
                 summaries = summarize_shared_poles(
                     poles2, counts, branches,
                     regularization_width_ry=regularization_width_ry,
-                    edge_factor=edge_factor,
-                    occupation_window_threshold=occupation_window_threshold)
+                    edge_factor=edge_factor)
                 if scope is not None:
                     # The certificate boxes come from the same union, so the
                     # map's sector calls request one box set: the first fits
@@ -1756,8 +1747,7 @@ def compute_sigma_c_mpa_omega_grid(
                     certificate = summarize_shared_poles(
                         union2, np.asarray(union_counts, np.int64), branches,
                         regularization_width_ry=regularization_width_ry,
-                        edge_factor=edge_factor,
-                        occupation_window_threshold=occupation_window_threshold)
+                        edge_factor=edge_factor)
         for lo in (() if shared_pole else range(0, n_poles, int(pole_batch_size))):
             hi = min(lo + int(pole_batch_size), n_poles)
             Omega, B, B_odd = reader.read(
@@ -1767,8 +1757,7 @@ def compute_sigma_c_mpa_omega_grid(
             summaries.extend(summarize_sigma_poles(
                 Omega, _geometry_residue(B, B_odd), branches,
                 regularization_width_ry=regularization_width_ry,
-                edge_factor=edge_factor, pole_offset=lo,
-                occupation_window_threshold=occupation_window_threshold))
+                edge_factor=edge_factor, pole_offset=lo))
             del Omega, B, B_odd
             gc.collect()
         # Rule fitting is its own timing row: on the Si b80/c504 deck the

@@ -811,16 +811,14 @@ def _evaluate_samples(
         + ".")
 
     omega_m = float(quad.x_max)
-    # ONE occupancy window for the whole fit: the rule bandwidth below and
-    # every fractional-chi call in this function read the same deck value, so
-    # the damped-line rule can never be sized for transitions the band slices
-    # no longer contain.  Same key, same default and same predicate as the
-    # Sigma planner's band window (gw.efermi.occupation_weight_floor).
-    occ_window = float(config.mpa.occupation_window_threshold)
+    # ONE occupation support for the whole fit: the rule bandwidth below and
+    # every fractional-chi call in this function read the same predicate as
+    # the Sigma planner's band window (gw.efermi.band_in_occupation_window),
+    # so the damped-line rule can never be sized for transitions the band
+    # slices no longer contain.
     if metal:
         delta_max = occupation_support_bandwidth(
-            wfns.enk, occupation_state.f_kn,
-            occupation_window_threshold=occ_window)
+            wfns.enk, occupation_state.f_kn)
 
     for point in routes["existing"]:
         if not metal:
@@ -903,7 +901,6 @@ def _evaluate_samples(
                 meta, mesh_xy,
                 occupations=occupation_state.f_kn,
                 energy_reference=float(occupation_state.mu_ry),
-                occupation_window_threshold=occ_window,
                 ordered=metal_physical)
             write_full(point, chi)
 
@@ -926,7 +923,6 @@ def _evaluate_samples(
                 wfns, t, h, z, meta, mesh_xy,
                 occupations=occupation_state.f_kn,
                 energy_reference=float(occupation_state.mu_ry),
-                occupation_window_threshold=occ_window,
                 ordered=metal_physical)
         elif ordered:
             values, reflected_values = compute_chi0_contour_ordered(

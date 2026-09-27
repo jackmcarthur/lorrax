@@ -14,8 +14,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-from gw.efermi import (OCCUPATION_WINDOW_THRESHOLD_DEFAULT,
-                       band_in_occupation_window, occupation_weight_floor)
+from gw.efermi import band_in_occupation_window
 from gw.ppm_windows import _SigmaWindow
 
 
@@ -37,14 +36,6 @@ class SharedSigmaWindow(NamedTuple):
 
 
 _INF = np.inf
-
-#: ``occupation_window_threshold`` lives in ``gw.efermi`` — ONE default, ONE
-#: occupancy→weight map, ONE predicate, shared with ``gw.ppm_windows`` (the
-#: Σ branch supports) and ``gw.w_isdf`` (the χ₀ occupation supports).  Re-bound
-#: here because this module's callers and tests have imported these names since
-#: the rule was introduced.
-_weight_floor = occupation_weight_floor
-
 
 def _selector(a_hi=_INF, gamma_lo=-_INF, gamma_hi=_INF):
     # (a_gt, a_le, gamma_ge, gamma_gt, gamma_lt, gamma_le)
@@ -119,7 +110,7 @@ def sigma_pole_edges(branches, state_edge, excursion):
     return {"pos": pos + near, "neg": neg + near, "near": near}
 
 
-def _geometry(branches, regularization_width_ry, edge_factor, weight_floor):
+def _geometry(branches, regularization_width_ry, edge_factor):
     omega_max = max((float(np.max(b.omega_abs)) for b in branches
                      if b.omega_abs.size), default=0.0)
     eta = float(regularization_width_ry)
@@ -139,8 +130,7 @@ def _geometry(branches, regularization_width_ry, edge_factor, weight_floor):
     # geometry is unchanged bit-for-bit.
     excursion = 0.0
     for b in branches:
-        _mask, eb = _a_space(b, lambda E: np.ones(E.shape, bool),
-                             weight_floor)
+        _mask, eb = _a_space(b, lambda E: np.ones(E.shape, bool))
         if eb is not None:
             excursion = max(excursion, -min(eb[0], 0.0))
     edges = sigma_pole_edges(branches, float(edge_factor) * eta, excursion)
@@ -160,18 +150,15 @@ def summarize_sigma_poles(
     regularization_width_ry,
     edge_factor,
     pole_offset=0,
-    occupation_window_threshold=OCCUPATION_WINDOW_THRESHOLD_DEFAULT,
 ):
     """Reduce one resident pole batch to the scalar planning evidence.
 
-    ``occupation_window_threshold`` MUST match the value the branch build and
-    the box planner use — they share ``_geometry``, and a mismatch would
-    select poles against one support and windows against another.  All come
-    from the single deck key in production.
+    The branch build and the box planner share ``_geometry`` and the one
+    support predicate (``gw.efermi.band_in_occupation_window``), so poles and
+    windows are selected against the same support.
     """
     _omega_max, _eta, _edges, selectors = _geometry(
-        branches, regularization_width_ry, edge_factor,
-        _weight_floor(occupation_window_threshold))
+        branches, regularization_width_ry, edge_factor)
     if B_poles.shape != Omega_poles.shape:
         raise ValueError("Omega_poles and B_poles must have identical shapes")
     nonfinite, bad = map(int, jax.device_get(
@@ -262,7 +249,6 @@ def shared_pole_intervals(frequencies, pole_indices, bounds):
 
 def summarize_shared_poles(
     poles2_ry2, counts, branches, *, regularization_width_ry, edge_factor,
-    occupation_window_threshold=OCCUPATION_WINDOW_THRESHOLD_DEFAULT,
 ):
     """Feed real, ragged parent extrema to the existing Σ window planner.
 
@@ -273,8 +259,7 @@ def summarize_shared_poles(
     """
     frequencies = shared_pole_frequencies(poles2_ry2, counts)
     _, _, _, selectors = _geometry(
-        branches, regularization_width_ry, edge_factor,
-        _weight_floor(occupation_window_threshold))
+        branches, regularization_width_ry, edge_factor)
     evidence = [dict() for _ in frequencies]
     indices = np.arange(len(frequencies), dtype=np.int64)
     for name, bounds in selectors.items():
@@ -289,38 +274,24 @@ def summarize_shared_poles(
     return tuple(enumerate(evidence))
 
 
-def _a_space(branch, predicate, weight_floor=0.0):
+def _a_space(branch, predicate):
     E = np.asarray(jax.device_get(branch.E_A), dtype=np.float64)
     base = np.asarray(jax.device_get(branch.base_mask_A), dtype=bool)
     if branch.band_weight is not None:
         # Metallic branches select multiplicatively (mask x weight in the
-        # executor), so base_mask_A spans the whole window and negligible
-        # weights would widen the geometry with bands that contribute
-        # nothing — the -0.53 Ry phantom excursion of the first metallic
-        # arm, whose val branch reached out to a smallest live weight of
-        # 2.67e-322 (a subnormal) because the cut was the EXACT `w != 0.0`.
-        # An exact cut only excludes what underflowed to zero, which is
-        # ~54 smearing widths out; the occupancy threshold cuts at the
-        # physical few-widths shell instead (0.995 ⇒ |w| > 0.005 ⇒ about
-        # 4.3 widths).  Exact zeros are still excluded, since 0 is not
-        # > 0.005, so that history is preserved, not traded away.
-        # The magnitude/never-clipped argument is at
-        # ``gw.efermi.band_in_occupation_window``, which owns the predicate.
+        # executor), so base_mask_A spans the whole window.  The support is
+        # the one predicate ``gw.efermi.band_in_occupation_window`` (which
+        # owns the float64-floor argument); it is applied again here so a
+        # branch built by any other route cannot plan a support the executor
+        # does not honour.  Idempotent.
         #
-        # WIDENING THIS COSTS GEOMETRY, NOT JUST BANDS: the support's
-        # min(E_A) sets `excursion` in _geometry, which deepens
-        # crossing_edge for EVERY branch and moves work between the
-        # sign-definite and crossing quadrature families.  That is the
-        # mechanism by which an over-wide support refused outright at
-        # -0.53 Ry.  Lower the threshold only with a plan-level A/B.
-        #
-        # REDUNDANT-BY-DESIGN since the same floor is applied to the base
-        # masks at ``ppm_windows.branches_for_omega_grid``: this is the cut
-        # that OWNS the geometry, and it stays here so a branch built by any
-        # other route cannot plan a support the executor does not honour.
-        # Idempotent — same floor, same magnitude rule.
+        # WIDENING THE SUPPORT COSTS GEOMETRY, NOT JUST BANDS: its min(E_A)
+        # sets ``excursion`` in _geometry, which deepens the pole edges of
+        # EVERY branch and moves work between the sign-definite and crossing
+        # families.  Exact ``w != 0`` support once refused outright at a
+        # -0.53 Ry excursion (a subnormal MP1 weight, claim 0196).
         w = np.asarray(jax.device_get(branch.band_weight), dtype=np.float64)
-        base = base & band_in_occupation_window(w, float(weight_floor))
+        base = base & band_in_occupation_window(w)
     mask = base & predicate(E)
     values = E[mask]
     if not values.size:
