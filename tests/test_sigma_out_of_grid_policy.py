@@ -267,3 +267,25 @@ def test_the_support_envelope_refuses_a_grid_grown_past_it():
     with pytest.raises(ValueError, match="GATE sigma_support_envelope"):
         assert_support_in_envelope(np.arange(-12.0, 12.5, 0.25), deck, envelope, 0.25,
                                    context="test")
+
+
+def test_the_requested_window_is_e_f_plus_minus_w_and_multiplet_closed():
+    """Owner 2026-09-27: the requested Sigma states lie within E_F +/- W
+    (sigma_window_ev); a state outside it cannot grow the grid, and the edge
+    never splits a multiplet at one k."""
+    from gw.qp_support import sigma_window_states
+    e = np.array([[-12.0, -3.0, 9.9995, 10.0004, 23.8],
+                  [-9.0, 0.0, 10.5, 10.5, 12.0]])
+    np.testing.assert_array_equal(sigma_window_states(e, 10.0),
+                                  [[False, True, True, True, False],
+                                   [True, True, False, False, False]])
+    np.testing.assert_array_equal(sigma_window_states(e, None), np.ones(e.shape, bool))
+    with pytest.raises(ValueError, match="sigma_window_ev"):
+        sigma_window_states(e, 0.0)
+    part = BandPartition(protected_mask=np.ones(5, bool), in_range_mask=np.ones(5, bool))
+    inputs = _inputs("cover", 0)
+    inputs.config.sigma.window_ev = 10.0
+    support = _sc_sampled_support(inputs, part, e, 0.0)
+    assert support.grown[0] == -12.0                    # -12 is outside W: the deck edge holds
+    assert 10.0004 + 2.0 <= support.grown[-1] < 10.0004 + 2.0 + 0.25   # +23.8 does not grow it
+    np.testing.assert_array_equal(support.requested[0], [False, True, True, True, False])
