@@ -117,6 +117,12 @@ class CrystalData:
     kgrid: np.ndarray               # (3,) int — Monkhorst-Pack dimensions
     assume_isolated: str            # "none" | "2D" (from QE assume_isolated)
 
+    # ── Hamiltonian facts the dense-H preflight reads (psp.operator_checks) ──
+    functional: str = ""            # QE <dft><functional>, upper case
+    xc_extensions: tuple = ()       # which of <hybrid>, <vdW>, <dftU> the run carries
+    domag: bool = False             # QE <do_magnetization>: a magnetic noncollinear run
+    pseudo_files: tuple = ()        # ((species, pseudo_file), ...) from <atomic_species>
+
     # ── Private ──
     _save_dir: str = ""
 
@@ -218,6 +224,20 @@ class CrystalData:
                 f"Unsupported assume_isolated='{assume_isolated}' in QE .save. "
                 f"LORRAX supports: 'none', '2D'")
 
+        # ── Hamiltonian facts: the functional and whatever extends it ──
+        functional = (_text(root, "functional") or "").upper()
+        xc_extensions = tuple(tag for tag in ("hybrid", "vdW", "dftU")
+                              if _all(root, tag))
+        domag = _text(root, "do_magnetization") == "true"
+        pseudo_files = []
+        for sp in _all(root, "species"):
+            children = {c.tag.split("}")[-1]: c for c in sp}
+            if "pseudo_file" in children and children["pseudo_file"].text:
+                entry = (sp.attrib.get("name", ""),
+                         children["pseudo_file"].text.strip())
+                if entry not in pseudo_files:
+                    pseudo_files.append(entry)
+
         return cls(
             alat=alat, blat=blat, avec=avec, bvec=bvec, bdot=bdot,
             cell_volume=cell_volume, nat=nat,
@@ -227,7 +247,9 @@ class CrystalData:
             nelec=nelec, nspin=nspin, nspinor=nspinor, spinorbit=spinorbit,
             ecutwfc=ecutwfc, ecutrho=ecutrho, fft_grid=fft_grid,
             nbands=nbands, nkpts=0, kgrid=kgrid,
-            assume_isolated=assume_isolated, _save_dir=save_dir,
+            assume_isolated=assume_isolated,
+            functional=functional, xc_extensions=xc_extensions, domag=domag,
+            pseudo_files=tuple(pseudo_files), _save_dir=save_dir,
         )
 
     # ------------------------------------------------------------------
@@ -292,6 +314,15 @@ class CrystalData:
         return _reduce_mp_to_ibz(nk, sym, time_reversal=time_reversal)
 
     # ------------------------------------------------------------------
+    def charge_density_fields(self) -> tuple[str, ...]:
+        """Dataset names in ``charge-density.hdf5``; ``()`` when the file is absent."""
+        cd_path = os.path.join(self._save_dir, "charge-density.hdf5")
+        if not os.path.isfile(cd_path):
+            return ()
+        with h5py.File(cd_path, "r") as f:
+            return tuple(sorted(f.keys()))
+
+    # ------------------------------------------------------------------
     def load_charge_density(self) -> tuple[np.ndarray, np.ndarray]:
         """Read ρ_val from ``charge-density.hdf5``."""
         cd_path = os.path.join(self._save_dir, "charge-density.hdf5")
@@ -328,7 +359,10 @@ class CrystalData:
         _chk("bdot", self.bdot, wfn.bdot)
         _chk("atom_crys", self.atom_crys, wfn.atom_crys)
         _chk("atom_types", self.atom_types, wfn.atom_types, tol=0.5)
-        _chk("nelec", self.nelec, wfn.nelec, tol=0.5)
+        # A WfnLoader's ``nelec`` is an occupied-BAND count (max ifmax);
+        # the physical count it carries is ``num_electrons``.
+        _chk("nelec", self.nelec, getattr(wfn, "num_electrons", wfn.nelec),
+             tol=0.5)
         _chk("nspinor", self.nspinor, wfn.nspinor, tol=0.5)
         _chk("fft_grid", self.fft_grid, wfn.fft_grid, tol=0.5)
         _chk("ntran", self.ntran, wfn.ntran, tol=0.5)

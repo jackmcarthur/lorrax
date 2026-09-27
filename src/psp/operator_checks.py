@@ -266,3 +266,136 @@ def check_degeneracy_consistency(
     return dict(n_manifolds=n_manifolds, n_split=len(findings),
                 max_split_ry=max_split, worst=findings[:max_report],
                 clean=clean)
+
+
+# ---------------------------------------------------------------------------
+# Dense-H preflight: can this QE run's Hamiltonian be rebuilt exactly?
+# ---------------------------------------------------------------------------
+
+#: QE <dft><functional> names whose V_xc ``psp.xc`` reproduces
+#: (``dft_operators.compute_V_H_and_V_xc`` evaluates PBE only).
+DENSE_H_FUNCTIONALS = ("PBE",)
+
+#: Peak dense bytes per k, in units of ``N²·16`` (complex128), N = nspinor·ngk:
+#: the unit-vector block, H, the eigenvectors and the solver workspace (two).
+DENSE_H_MATRICES_PER_K = 5
+
+
+class DenseHRefusal(RuntimeError):
+    """The QE run's Hamiltonian cannot be rebuilt exactly; ``rule`` names why."""
+
+    def __init__(self, rule: str, message: str):
+        self.rule = rule
+        super().__init__(f"[dense_h:{rule}] {message}")
+
+
+def _upf_flag(value) -> bool:
+    value = getattr(value, "value", value)
+    if isinstance(value, str):
+        return value.strip().strip(".").lower() in ("t", "true")
+    return bool(value)
+
+
+def dense_h_bytes(n_basis: int) -> int:
+    """Peak per-rank device bytes of one k's dense solve (N = nspinor·ngk)."""
+    return DENSE_H_MATRICES_PER_K * int(n_basis) ** 2 * 16
+
+
+def validate_dense_h_inputs(
+    crystal,
+    pseudos: dict,
+    *,
+    sys_dim: int,
+    pseudo_dir: str,
+    charge_density_fields: tuple,
+    n_basis_max: int,
+    budget_bytes: float,
+) -> OperatorContext:
+    """Refuse, before any heavy work, a QE run whose H the psp operators cannot rebuild.
+
+    ``crystal`` is the ``CrystalData`` of the QE ``.save``; the checks read
+    only its parsed XML facts, so each refusal class is testable without
+    files.  Every refusal is a :class:`DenseHRefusal` whose ``rule`` names
+    the class: ``upf_missing``, ``functional``, ``xc_extension``,
+    ``pseudo_type``, ``magnetism``, ``charge_density``, ``truncation_2d``,
+    ``memory``.  On success the validated operator context comes back.
+    """
+    import os
+
+    # ---- every species' UPF is on disk and loaded ----
+    for species, fname in crystal.pseudo_files:
+        if not os.path.isfile(os.path.join(pseudo_dir, fname)):
+            raise DenseHRefusal(
+                "upf_missing",
+                f"species {species!r} needs {fname!r}, not found in "
+                f"{pseudo_dir}.  Copy the UPF the QE run used next to the "
+                f".save or pass --pseudo-dir.")
+
+    # ---- the functional ----
+    if crystal.xc_extensions:
+        raise DenseHRefusal(
+            "xc_extension",
+            f"the QE run carries {', '.join(crystal.xc_extensions)}; the "
+            f"psp operators rebuild semilocal V_xc only (no hybrid, vdW or "
+            f"+U term).")
+    if crystal.functional not in DENSE_H_FUNCTIONALS:
+        raise DenseHRefusal(
+            "functional",
+            f"QE functional {crystal.functional or '<absent>'!r}; the psp "
+            f"V_xc evaluates {', '.join(DENSE_H_FUNCTIONALS)} only "
+            f"(psp.dft_operators.compute_V_H_and_V_xc).")
+
+    # ---- norm-conserving pseudopotentials of the same functional ----
+    for elem, pp in pseudos.items():
+        h = pp.pp_header
+        kind = str(getattr(h.pseudo_type, "value", h.pseudo_type) or "").upper()
+        if (kind not in ("NC", "SL") or _upf_flag(h.is_ultrasoft)
+                or _upf_flag(h.is_paw)):
+            raise DenseHRefusal(
+                "pseudo_type",
+                f"{elem} UPF is pseudo_type={kind!r}; the dense H is "
+                f"H(G,G') with overlap S = 1, which holds for "
+                f"norm-conserving pseudopotentials only (no USPP/PAW).")
+        pp_functional = str(h.functional or "").strip().upper()
+        if pp_functional and pp_functional != crystal.functional:
+            raise DenseHRefusal(
+                "functional",
+                f"{elem} UPF was generated with {pp_functional!r} but the "
+                f"QE run used {crystal.functional!r}.")
+
+    # ---- magnetism ----
+    if int(crystal.nspin) == 2 or bool(crystal.domag):
+        raise DenseHRefusal(
+            "magnetism",
+            f"magnetic run (nspin={int(crystal.nspin)}, "
+            f"do_magnetization={bool(crystal.domag)}); the psp V_xc is "
+            f"spin-unpolarized.")
+
+    # ---- the density the potential is built from ----
+    if "rhotot_g" not in charge_density_fields:
+        raise DenseHRefusal(
+            "charge_density",
+            f"no charge-density.hdf5 with rhotot_g in {crystal._save_dir}; "
+            f"V_H and V_xc are built from the SCF density.")
+
+    # ---- Coulomb truncation agrees with the QE run ----
+    qe_2d = crystal.assume_isolated == "2D"
+    if (int(sys_dim) == 2) != qe_2d:
+        raise DenseHRefusal(
+            "truncation_2d",
+            f"sys_dim={int(sys_dim)} but the QE run has "
+            f"assume_isolated={crystal.assume_isolated!r}; V_H must use the "
+            f"truncation the SCF used (sys_dim 2 <-> '2D').")
+
+    # ---- the dense matrices fit the one device budget ----
+    need = dense_h_bytes(n_basis_max)
+    if need > float(budget_bytes):
+        raise DenseHRefusal(
+            "memory",
+            f"one k needs {need / 1e9:.2f} GB (N = nspinor·ngk = "
+            f"{int(n_basis_max)}, {DENSE_H_MATRICES_PER_K}·N²·16 B) but the "
+            f"device budget is {float(budget_bytes) / 1e9:.2f} GB "
+            f"(memory_per_device_gb).  The dense route is for small cells.")
+
+    return validate_operator_inputs(pseudos, crystal, sys_dim=int(sys_dim),
+                                    caller="dense_h")
