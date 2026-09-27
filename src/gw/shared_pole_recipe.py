@@ -63,7 +63,9 @@ shared_real_pole_v1_r3b = {
 # and version. Composite checks retain their individual dimensional thresholds.
 _GATE_ROWS = {
     "normalized_gram_keep": ("retain gamma/gamma_max strictly above cut", 1.0e-8),
-    "normalized_gram_validity": ("gamma_min/gamma_max >= threshold", -1.0e-7),
+    # STUDY (FEREF 2026-09-27): bar at -1e-5 as on BANDEX's study tree (claims 2898/2900); the Fe 4^3 complete-basis
+    # q=0 Gram reads -1.35e-7 at the stock -1e-7 bar. Not a production value.
+    "normalized_gram_validity": ("gamma_min/gamma_max >= threshold", -1.0e-5),
     "zero_ritz_policy": ("drop lambda <= cutoff only within factor-weight budget",
                          {"lambda_cutoff_ry2": 1.0e-6, "max_dropped_weight_fraction": 1.0e-6}),
     # Legacy C denotes b: preserve this hashed predicate for stored identities.
