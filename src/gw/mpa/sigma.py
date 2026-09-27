@@ -1644,6 +1644,7 @@ def compute_sigma_c_mpa_omega_grid(
     sector_context=None,
     odd_reference=True,
     tau_kernel_factory=None,
+    recipe_eta_role="sigma",
     print_fn=print,
 ):
     """Read a fitted MPA store, derive its windows, and compute Sigma_c.
@@ -1692,8 +1693,11 @@ def compute_sigma_c_mpa_omega_grid(
         if fit_digest is not None and ledger["digest"] != fit_digest:
             raise ValueError("GATE shared_pole_identity: screening handle digest differs from model")
         recipe = meta.shared_pole_recipe
-        if not np.isclose(regularization_width_ry * RYD_TO_EV,
-                          recipe["eta_ev"], rtol=0, atol=1e-12):
+        # A rotating-band far patch is an intentional broader delivery of the
+        # same pole model (gw.qp_support.FAR_PATCH_ETA_EV); only the near
+        # Sigma must match the recipe eta.
+        if recipe_eta_role != "far_patch" and not np.isclose(
+                regularization_width_ry * RYD_TO_EV, recipe["eta_ev"], rtol=0, atol=1e-12):
             raise ValueError("GATE shared_pole_eta: Sigma and current recipe eta differ")
         if fixed_quadrature_session is not None:
             fixed_pole_support_ry = (

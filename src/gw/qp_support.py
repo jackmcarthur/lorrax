@@ -98,3 +98,46 @@ def check_fixed_point(session):
     session["convergence_rebuilds"] = 1
     session["rebuild_floor_ev"] = floor
     return True
+
+
+#: Broadening of the rotating-band far patches (eV). The P-R coupling needs
+#: Sigma_io(E_o) at each rotating energy only to modest accuracy; its node
+#: count scales as E_bw/eta (CLASSMIX round 2).
+FAR_PATCH_ETA_EV = 1.0
+#: Far-patch sampling step (eV): eta/2 resolves the broadened Sigma.
+FAR_PATCH_STEP_EV = 0.5
+#: Outer pad of each far patch about its rotating DFT energies (eV).
+FAR_PATCH_PAD_EV = 2.0
+
+
+def far_patches_ev(energy_rel_ev, rotating_kn, near_support_ev):
+    """Contiguous far patches covering every rotating DFT energy outside the near support.
+
+    ``energy_rel_ev`` (nk, nb) is about the Sigma frame's E_F. Energies are
+    padded by FAR_PATCH_PAD_EV, merged where padded intervals overlap, clipped
+    against the near support and snapped outward to FAR_PATCH_STEP_EV.
+    Returns ((lo, hi), ...) ascending; empty when no rotating state lies outside.
+    """
+    e = np.asarray(energy_rel_ev, float)[np.asarray(rotating_kn, bool)]
+    lo_near, hi_near = float(near_support_ev[0]), float(near_support_ev[1])
+    e = np.sort(e[(e < lo_near) | (e > hi_near)])
+    if e.size == 0:
+        return ()
+    step, pad = FAR_PATCH_STEP_EV, FAR_PATCH_PAD_EV
+    breaks = np.nonzero(np.diff(e) > 2.0 * pad)[0]
+    starts = np.concatenate(([0], breaks + 1)); stops = np.concatenate((breaks, [e.size - 1]))
+    out = []
+    for a, b in zip(starts, stops):
+        lo, hi = e[a] - pad, e[b] + pad
+        if hi > hi_near and lo < hi_near:
+            lo = hi_near + step
+        if lo < lo_near and hi > lo_near:
+            hi = lo_near - step
+        out.append((float(np.floor(lo / step) * step), float(np.ceil(hi / step) * step)))
+    return tuple(out)
+
+
+def far_patch_grid_ev(patch):
+    lo, hi = float(patch[0]), float(patch[1])
+    n = int(round((hi - lo) / FAR_PATCH_STEP_EV)) + 1
+    return lo + FAR_PATCH_STEP_EV * np.arange(n)

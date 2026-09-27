@@ -3739,6 +3739,32 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
     np.put_along_axis(protected_sorted, indices_loop, protected_loop, axis=1)
     sigma_config = replace(sigma_config, sc_sigma_protected_kn=(
         protected_sorted if ks.is_identity else protected_sorted[np.asarray(ks.take)]))
+    # ROTATING-BAND FAR PATCHES: planned once at map 0 over the rotating DFT
+    # energies outside the near support, then held. Each is an independent
+    # Sigma delivery at FAR_PATCH_ETA_EV; rotating endpoints (couplings and
+    # the rotating diagonal) read it instead of the protected-endpoint rule.
+    far_patches = ()
+    if (sc_support is not None and inputs.wfns_transverse is None
+            and inputs.config.compute_mode is ComputeMode.MPA
+            and (~np.asarray(protected_loop, bool)).any()):
+        session = inputs.fixed_quadrature_session
+        if session is not None and "far_patches_ev" in session:
+            far_patches = session["far_patches_ev"]
+        else:
+            from .qp_support import far_patches_ev
+            mu_frame_ev = sigma_frame_mu_ev(
+                inputs.config, inputs.wfn, E_full, efermi_ry,
+                entry_occ_state if inputs.material_class == "metal" else None)
+            grid = np.asarray(sc_support.grown, float)
+            far_patches = far_patches_ev(
+                e_dft_fit_ev - float(mu_frame_ev), ~np.asarray(protected_loop, bool),
+                (float(grid[0]), float(grid[-1])))
+            if session is not None:
+                session["far_patches_ev"] = far_patches
+            _record_sc(inputs, "    SC rotating far patches (planned once, held): "
+                       + (", ".join(f"[{a:+.2f}, {b:+.2f}]" for a, b in far_patches) or "none"))
+        if far_patches:
+            sigma_config = replace(sigma_config, sc_far_patches_ev=tuple(far_patches))
     sigma_result = compute_sigma_xc(
         inputs.config.compute_mode,
         occupation_state=metal_occ_state,
@@ -3893,7 +3919,12 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
     from .band_partition import rotating_band_hamiltonian, rotating_diagonal
     target = np.asarray(e_dft_fit, float).copy()
     rotating_loop = ~np.asarray(protected_loop, dtype=bool)
-    if rotating_loop.any():
+    if rotating_loop.any() and far_patches:
+        # The rotating diagonal is its own-energy far-patch read; keep it.
+        from .qsgw_utils import static_sigma_diag_to_host
+        target = static_sigma_diag_to_host(H_qp_dft_full, inputs.mesh_xy).real
+        _record_sc(inputs, "    SC rotating diagonal: own-energy far-patch read")
+    elif rotating_loop.any():
         from .qsgw_utils import static_sigma_diag_to_host
         from .scissor import k_star_weights
         empty_kn = ~np.asarray(valence_kn, dtype=bool)

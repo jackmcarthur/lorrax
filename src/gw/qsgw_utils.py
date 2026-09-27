@@ -563,6 +563,58 @@ def _qsgw_build_kernel(mesh_xy: Mesh, *, replicated_output: bool):
     return fn
 
 
+_QSGW_FAR_KERNEL_CACHE: dict[tuple[int, bool], object] = {}
+
+
+def _qsgw_far_kernel(mesh_xy: Mesh, *, replicated_output: bool):
+    """As ``_qsgw_build_kernel``, with every rotating endpoint read from the far cube.
+
+    Sigma_c,ij = 1/2 [Sigma_ij(E_i) + Sigma_ij(E_j)], each endpoint read from
+    the near cube when that state is protected and from the far-patch cube
+    otherwise; the rotating block itself is replaced downstream except its
+    diagonal, which is the rotating state's own-energy read.
+    """
+    key = (id(mesh_xy), bool(replicated_output))
+    fn = _QSGW_FAR_KERNEL_CACHE.get(key)
+    if fn is None:
+        out_3d = NamedSharding(
+            mesh_xy,
+            P(None, None, None) if replicated_output
+            else P(None, "x", "y"))
+
+        def _rows_cols(sig, lo, hi, wl, wh):
+            one = (1,) + tuple(sig.shape[1:])
+            a_lo = jnp.take_along_axis(sig, jnp.broadcast_to(lo[None, :, :, None], one), axis=0)[0]
+            a_hi = jnp.take_along_axis(sig, jnp.broadcast_to(hi[None, :, :, None], one), axis=0)[0]
+            b_lo = jnp.take_along_axis(sig, jnp.broadcast_to(lo[None, :, None, :], one), axis=0)[0]
+            b_hi = jnp.take_along_axis(sig, jnp.broadcast_to(hi[None, :, None, :], one), axis=0)[0]
+            return (wl[:, :, None] * a_lo + wh[:, :, None] * a_hi,
+                    wl[:, None, :] * b_lo + wh[:, None, :] * b_hi)
+
+        @jax.jit
+        def _kernel(sig_w, sig_f, sig_x, ilo, ihi, wlo, whi, flo, fhi, fwlo, fwhi, protected):
+            A, B = _rows_cols(sig_w, ilo, ihi, wlo, whi)
+            Af, Bf = _rows_cols(sig_f, flo, fhi, fwlo, fwhi)
+            pm, pn = protected[:, :, None], protected[:, None, :]
+            sigma_c = 0.5 * (pm * A + (1. - pm) * Af + pn * B + (1. - pn) * Bf)
+            M = jax.lax.with_sharding_constraint(sigma_c + sig_x, out_3d)
+            Mh = 0.5 * (M + jnp.conj(jnp.swapaxes(M, -1, -2)))
+            return jax.lax.with_sharding_constraint(Mh, out_3d)
+
+        fn = _kernel
+        _QSGW_FAR_KERNEL_CACHE[key] = fn
+    return fn
+
+
+def _interp_tables(omega, E):
+    E_clamped, inside = sigma_eval_omega(omega, E)
+    idx_hi = np.clip(np.searchsorted(omega, E_clamped, side="left"), 1, omega.size - 1)
+    idx_lo = idx_hi - 1
+    denom = np.where(omega[idx_hi] > omega[idx_lo], omega[idx_hi] - omega[idx_lo], 1.0)
+    w_hi = (E_clamped - omega[idx_lo]) / denom
+    return idx_lo, idx_hi, 1.0 - w_hi, w_hi, inside
+
+
 def build_qsgw_sigma_xc(
     sigma_c_omega_ry: jax.Array,
     sigma_x_kij_ry: jax.Array,
@@ -573,8 +625,13 @@ def build_qsgw_sigma_xc(
     replicated_output: bool = True,
     band_axis=None,
     protected_kn=None,
+    far=None,
 ) -> tuple[jax.Array, dict[str, float]]:
     """Build the static Hermitian QSGW Σ_xc[k, m, n].
+
+    ``far = (sigma_c_far_omega_ry, far_omega_ev)`` (with ``protected_kn``):
+    rotating endpoints read the far-patch cube instead of the protected
+    endpoint rule; see :func:`_qsgw_far_kernel`.
 
     Implements the standard QSGW ansatz
 
@@ -685,11 +742,26 @@ def build_qsgw_sigma_xc(
         protected.fill(0.)
         protected[:, :logical_nb] = np.asarray(protected_kn, float)
     protected_j = device_put_process_local(protected, rep_2d)
-    sigma_xc_qsgw = _qsgw_build_kernel(
-        mesh_xy, replicated_output=bool(replicated_output))(
-        sigma_c_omega_ry, sigma_x_kij_ry,
-        idx_lo_j, idx_hi_j, w_lo_j, w_hi_j, protected_j,
-    )
+    n_far_clipped = 0
+    if far is not None and protected_kn is not None:
+        sig_f, far_omega = far
+        far_omega = np.asarray(far_omega, dtype=np.float64)
+        flo, fhi, fwl, fwh, finside = _interp_tables(far_omega, E)
+        n_far_clipped = int(np.count_nonzero(
+            (~finside[:, :logical_nb]) & (protected[:, :logical_nb] < 0.5)))
+        put = lambda a, t: device_put_process_local(a.astype(t), rep_2d)
+        sigma_xc_qsgw = _qsgw_far_kernel(
+            mesh_xy, replicated_output=bool(replicated_output))(
+            sigma_c_omega_ry, sig_f, sigma_x_kij_ry,
+            idx_lo_j, idx_hi_j, w_lo_j, w_hi_j,
+            put(flo, np.int32), put(fhi, np.int32),
+            put(fwl, np.complex128), put(fwh, np.complex128), protected_j)
+    else:
+        sigma_xc_qsgw = _qsgw_build_kernel(
+            mesh_xy, replicated_output=bool(replicated_output))(
+            sigma_c_omega_ry, sigma_x_kij_ry,
+            idx_lo_j, idx_hi_j, w_lo_j, w_hi_j, protected_j,
+        )
     sigma_xc_qsgw.block_until_ready()
     if band_axis is not None and replicated_output:
         from runtime.padding import strip_axis
@@ -704,6 +776,7 @@ def build_qsgw_sigma_xc(
             if nk * logical_nb else 0.0),
         "omega_min_ev": omega_lo,
         "omega_max_ev": omega_hi,
+        "n_far_clipped": float(n_far_clipped),
     }
     return sigma_xc_qsgw, diagnostics
 

@@ -518,6 +518,7 @@ def finalize_dynamic_sigma(
     write_sigma_omega_h5: bool = True,
     band_extrapolation: dict | None = None,
     sigma_c_body_omega_unextrap: jax.Array | None = None,
+    sigma_c_far=None,
     print_fn: Callable = print,
     efermi_ry=None,
     efermi_provenance=None,
@@ -661,9 +662,13 @@ def finalize_dynamic_sigma(
             omega_grid_ev, e_qp_rel_ev, mesh_xy,
             band_axis=sigma_band_axis,
             protected_kn=config.sc_sigma_protected_kn,
+            far=sigma_c_far,
         )
         print_fn(f"  QSGW: {int(qsgw_diag['n_clipped'])} clipped "
-                 f"({100*qsgw_diag['frac_clipped']:.1f}%)")
+                 f"({100*qsgw_diag['frac_clipped']:.1f}%)"
+                 + ("" if sigma_c_far is None else
+                    f"; rotating endpoints read far patches, "
+                    f"{int(qsgw_diag['n_far_clipped'])} clamped"))
 
         sigma_lorentz = None
         if sigma_lorentz_static_skij_ry is not None:
@@ -1260,6 +1265,32 @@ def _compute_mpa_sigma(
         body = compute_sigma_c_mpa_omega_grid(
             wfns, fit_path, meta, mesh_xy, sigma_w_model=sigma_w_model,
             fit_identity=fit_identity, fit_digest=fit_digest, **body_options)
+    far_patches = getattr(config, "sc_far_patches_ev", None) or ()
+    far_bodies = []
+    if far_patches:
+        if sector_handle.get("representation") == "sector-ordered-ph":
+            raise ValueError("GATE sigma_far_patch_sector: far patches serve the scalar "
+                             "Sigma route only")
+        # Independent (patch, eta) deliveries: each patch plans its own rules
+        # once at eta_far and holds them; the pole model and occupations are
+        # the near body's.
+        from .qp_support import FAR_PATCH_ETA_EV, FAR_PATCH_STEP_EV, far_patch_grid_ev
+        for j, patch in enumerate(far_patches):
+            grid_ev = far_patch_grid_ev(patch)
+            far_options = dict(body_options,
+                               omega_grid_ry=grid_ev / RYD_TO_EV,
+                               regularization_width_ry=FAR_PATCH_ETA_EV / RYD_TO_EV,
+                               omega_grid_step_ry=FAR_PATCH_STEP_EV / RYD_TO_EV,
+                               recipe_eta_role="far_patch",
+                               fixed_quadrature_session=(
+                                   None if fixed_quadrature_session is None else
+                                   fixed_quadrature_session.setdefault(
+                                       f"{sigma_w_model}:far{j}", {})))
+            print_fn(f"  Sigma far patch {j}: [{patch[0]:+.2f}, {patch[1]:+.2f}] eV, "
+                     f"eta {FAR_PATCH_ETA_EV:.3f} eV, {grid_ev.size} samples")
+            far_bodies.append((grid_ev, compute_sigma_c_mpa_omega_grid(
+                wfns, fit_path, meta, mesh_xy, sigma_w_model=sigma_w_model,
+                fit_identity=fit_identity, fit_digest=fit_digest, **far_options)))
     head_diag = None
     if head is not None:
         if iteration_head is None:
@@ -1288,6 +1319,22 @@ def _compute_mpa_sigma(
             occupations=head_occ,
             poles_ry=head["Omega_p"], residues_ry=head["B_p"],
             cell_volume=float(meta.cell_volume), nk_tot=int(meta.nk_tot))
+    sigma_c_far = None
+    if far_bodies:
+        from .dynamic_sigma import add_head_sigma_diag
+        cubes = []
+        for grid_ev, far_body in far_bodies:
+            far_head = None
+            if head is not None:
+                far_head = compute_complex_pole_head_sigma_diag(
+                    omega_grid_ry=grid_ev / RYD_TO_EV, enk_ry=head_enk,
+                    efermi_ry=sigma_efermi_ry, occupations=head_occ,
+                    poles_ry=head["Omega_p"], residues_ry=head["B_p"],
+                    cell_volume=float(meta.cell_volume), nk_tot=int(meta.nk_tot))
+            cubes.append(add_head_sigma_diag(far_body.sigma_c_kij, far_head,
+                                             band_axis=far_body.band_axis))
+        sigma_c_far = (cubes[0] if len(cubes) == 1 else jnp.concatenate(cubes, axis=0),
+                       np.concatenate([g for g, _ in far_bodies]))
     return finalize_dynamic_sigma(
         body.sigma_c_kij, head_diag,
         sigma_band_axis=body.band_axis,
@@ -1302,6 +1349,7 @@ def _compute_mpa_sigma(
         sigma_lorentz_static_skij_ry=sigma_lorentz,
         sigma_c_odd_body_omega=body.sigma_c_odd_kij,
         ppm_odd_even_residue_ratio=body.odd_even_residue_ratio,
+        sigma_c_far=sigma_c_far,
         print_fn=print_fn,
         efermi_ry=sigma_efermi_ry,
         efermi_provenance=sigma_efermi_provenance)
