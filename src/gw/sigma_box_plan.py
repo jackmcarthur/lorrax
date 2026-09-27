@@ -41,13 +41,18 @@ from gw.minimax_screening import MinimaxNodes
 from gw.mpa.sigma_windows import SharedSigmaWindow, sigma_pole_edges
 from gw.ppm_windows import _SigmaWindow
 from minimax import (
+    analytic_box_rule,
     analytic_line_box_rule,
     UniformRule,
     boundary_samples,
-    build_uniform_rule,
     rule_roundoff_amplification,
     uniform_rule_solver_identity,
 )
+
+#: The box-rule builder: closed-form nodes, weights and counts
+#: (``minimax.analytic_box``), certified on the box boundary; no node is
+#: optimized, so a cold plan costs milliseconds per window.
+_BOX_RULE_BUILDER = analytic_box_rule
 
 
 _FACTOR_GROWTH_CAP = 30.0
@@ -63,9 +68,10 @@ _BOX_SIGN_FRACTION = 0.7
 #: Pad toward zero for a sign-definite SC window: 0.5 of its distance escaped by 1.6% on TaAs 8^3
 #: map 1 and 0.25 again at map 2 (semimetal valence state 30 -> 15 -> 6 meV from E_F); 0.05 floors it below 1 meV.
 _SC_ZERO_SIDE_CAP = 0.05
-#: v5: rules are built on outward-snapped boxes (_build_box); v4 entries were
-#: built on the raw request and are not served, so a warm cache equals a cold one.
-_RULE_CACHE_SCHEMA = "sigma-box-ry-v5"
+#: v6: closed-form rules (``minimax.analytic_box``); fitted v5 entries are not
+#: served, so a run never mixes the two families.  v5: rules are built on
+#: outward-snapped boxes (_build_box).
+_RULE_CACHE_SCHEMA = "sigma-box-ry-v6"
 #: The run-independent rule table's entry format and key definition
 #: (:func:`_rule_table_key`); a new value opens a new namespace.
 _RULE_TABLE_FORMAT = "sigma-box-table-v1"
@@ -535,7 +541,7 @@ def _write_rule_archive(path, rule, noise_amplification, digest, **extra):
 # ---------------------------------------------------------------- rule table
 # The run-local request scope above is a SERVING policy: containment inside
 # one physical scope, so sector calls and restarts share rules. The table
-# below is a MEMO of the builder: ``build_uniform_rule(build_box, eps,
+# below is a MEMO of the builder: ``_BOX_RULE_BUILDER(build_box, eps,
 # kappa_cap)`` reads no clock and pins its BLAS threads, so its result is a
 # function of the snapped build box, the currency and the solver identity
 # (claim 2737). A hit returns the bytes a cold build returns, so a warm run
@@ -569,8 +575,8 @@ def _rule_table_key(build_box, eps, relative, kappa_cap):
     """
     return {
         "format": _RULE_TABLE_FORMAT, "schema": _RULE_CACHE_SCHEMA,
-        "builder": (f"{build_uniform_rule.__module__}."
-                    f"{build_uniform_rule.__qualname__}"),
+        "builder": (f"{_BOX_RULE_BUILDER.__module__}."
+                    f"{_BOX_RULE_BUILDER.__qualname__}"),
         "box": [float(value) for value in build_box], "eps": float(eps),
         "relative": bool(relative),
         "kappa_cap": None if kappa_cap is None else float(kappa_cap),
@@ -779,13 +785,13 @@ def _fit_rule(spec, eps, cache_dir, eta, *, cache_build_widen=True,
     own builds are stored after every rank has looked up (see
     :func:`fit_sigma_box_specs`), so no window's choice depends on how far
     another rank has got. ``attempts`` restricts a crossing build to one
-    range of its fixed-N bracket (``build_uniform_rule``); ``None`` is
+    range of the fitted builder's bracket (ignored by the closed-form one); ``None`` is
     returned when that range does not certify.
     """
     requested_box = spec["box"]
     # This is exactly the builder's default currency predicate.  It is used
     # here only to search cache metadata; cache misses still leave the choice
-    # to build_uniform_rule(relative=None).
+    # to _BOX_RULE_BUILDER(relative=None).
     relative = requested_box[0] > 0.0 or requested_box[1] < 0.0
     noise_amplification_cap = _noise_amplification_cap()
     analytic_line = (bool(spec.get("analytic_line")) and not relative
@@ -836,7 +842,7 @@ def _fit_rule(spec, eps, cache_dir, eta, *, cache_build_widen=True,
             else:
                 if attempts is not None and not relative:
                     build_kwargs["attempts"] = attempts
-                rule = build_uniform_rule(build_box, eps, **build_kwargs)
+                rule = _BOX_RULE_BUILDER(build_box, eps, **build_kwargs)
                 if rule is None:
                     return None
                 rule_table = "off" if table is None else "built"

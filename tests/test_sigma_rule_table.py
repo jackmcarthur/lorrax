@@ -28,7 +28,7 @@ from gw.sigma_box_plan import (
     _rule_table_store,
     plan_sigma_windows,
 )
-from minimax import build_uniform_rule
+from minimax import analytic_box_rule
 
 from test_sigma_box_plan import _branch, _fake_rule, _frozen_digests, _summaries
 
@@ -64,7 +64,7 @@ def _nodes(plan):
 def test_warm_plan_is_the_cold_plan_bit_for_bit_without_a_builder_call(
         monkeypatch, tmp_path):
     calls = []
-    monkeypatch.setattr("gw.sigma_box_plan.build_uniform_rule", _drifting(calls))
+    monkeypatch.setattr("gw.sigma_box_plan._BOX_RULE_BUILDER", _drifting(calls))
     cold_plan, cold = _plan(str(tmp_path / "run_a"), **_QUIET)
     assert len(calls) == 3
     assert cold["rule_table_lookups"] == {"hit": 0, "built": 3}
@@ -95,7 +95,7 @@ def test_warm_plan_is_the_cold_plan_bit_for_bit_without_a_builder_call(
 
 def test_warm_sc_freeze_is_the_cold_freeze(monkeypatch, tmp_path):
     calls = []
-    monkeypatch.setattr("gw.sigma_box_plan.build_uniform_rule", _drifting(calls))
+    monkeypatch.setattr("gw.sigma_box_plan._BOX_RULE_BUILDER", _drifting(calls))
     digests = []
     for run in ("run_a", "run_b"):
         session = {}
@@ -109,7 +109,7 @@ def test_warm_sc_freeze_is_the_cold_freeze(monkeypatch, tmp_path):
 
 
 def test_caching_off_writes_no_table(monkeypatch):
-    monkeypatch.setattr("gw.sigma_box_plan.build_uniform_rule", _fake_rule)
+    monkeypatch.setattr("gw.sigma_box_plan._BOX_RULE_BUILDER", _fake_rule)
     assert resolve_sigma_rule_table_dir(None) is None
     _plan(None, **_QUIET)
     assert not Path(os.environ["LORRAX_SIGMA_RULE_TABLE_TEST_DIR"]).exists()
@@ -165,7 +165,7 @@ def test_an_unauthenticated_entry_is_a_named_miss_and_is_replaced(
         monkeypatch, tmp_path, changes, named):
     root = os.environ["LORRAX_SIGMA_RULE_TABLE_TEST_DIR"]
     calls = []
-    monkeypatch.setattr("gw.sigma_box_plan.build_uniform_rule", _drifting(calls))
+    monkeypatch.setattr("gw.sigma_box_plan._BOX_RULE_BUILDER", _drifting(calls))
     _plan(str(tmp_path / "run_a"), **_QUIET)
     paths = sorted(Path(root).rglob("rule_*.npz"))
     assert len(paths) == 3
@@ -309,8 +309,8 @@ def test_concurrent_writers_of_different_rules_keep_the_first(tmp_path):
 def test_the_builder_is_a_function_of_its_key(box, kwargs):
     """What makes a memo exact (claim 2737): two builds of one key on one
     machine return the same bytes."""
-    first = build_uniform_rule(box, 1.0e-4, **kwargs)
-    second = build_uniform_rule(box, 1.0e-4, **kwargs)
+    first = analytic_box_rule(box, 1.0e-4, **kwargs)
+    second = analytic_box_rule(box, 1.0e-4, **kwargs)
     assert first.times.tobytes() == second.times.tobytes()
     assert first.weights.tobytes() == second.weights.tobytes()
     assert _rule_digest(first, 1.0) == _rule_digest(second, 1.0)

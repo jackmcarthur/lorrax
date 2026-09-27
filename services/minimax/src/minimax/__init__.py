@@ -81,6 +81,11 @@ _UNIFORM_RULE_NAMES = (
     "uniform_rule_solver_identity",
 )
 
+# Closed-form denominator-box rules (csc core + sine correction on crossing
+# boxes, elliptic time-Ritz on sign-definite ones): the Sigma planner's
+# builder.  SciPy, so lazy.
+_ANALYTIC_BOX_NAMES = ("analytic_box_rule",)
+
 # Levelled (minimax-optimal) noncrossing rules: NumPy only, but lazy like
 # every builder so a bare import pays nothing.
 _LEVELLED_NAMES = ("noncrossing_levelled", "certify_noncrossing")
@@ -124,6 +129,9 @@ def __getattr__(name: str):
     if name in _UNIFORM_RULE_NAMES:
         from minimax import uniform_rule as _uniform   # noqa: PLC0415
         return getattr(_uniform, name)
+    if name in _ANALYTIC_BOX_NAMES:
+        from minimax import analytic_box as _analytic_box  # noqa: PLC0415
+        return getattr(_analytic_box, name)
     if name in _LEVELLED_NAMES:
         from minimax import levelled as _levelled  # noqa: PLC0415
         return getattr(_levelled, name)
@@ -144,7 +152,7 @@ def __getattr__(name: str):
 def __dir__():
     return sorted(set(globals()) | set(_SOLVER_NAMES)
                   | set(_FREQUENCY_FIT_NAMES)
-                  | set(_UNIFORM_RULE_NAMES)
+                  | set(_UNIFORM_RULE_NAMES) | set(_ANALYTIC_BOX_NAMES)
                   | set(_LEVELLED_NAMES) | set(_RESPONSE_RULE_NAMES)
                   | set(_MATSUBARA_RULE_NAMES) | set(_ANALYTIC_NAMES)
                   | set(_ODD_LAPLACE_NAMES) | set(_DAMPED_RULE_NAMES))
@@ -166,6 +174,7 @@ __all__ = [
     *_FREQUENCY_FIT_NAMES,
     # --- uniform denominator-box rules (lazy; scipy) -----------------------
     *_UNIFORM_RULE_NAMES,
+    *_ANALYTIC_BOX_NAMES,
     # --- levelled noncrossing rules (lazy; numpy) --------------------------
     *_LEVELLED_NAMES,
     # --- exploratory reciprocal constructors (lazy; scipy/mpmath) ---------
