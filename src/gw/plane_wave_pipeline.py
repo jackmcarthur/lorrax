@@ -854,7 +854,6 @@ class PlaneWaveGW:
             quadrature_cache_dir=resolve_sigma_box_cache_dir(config.sigma.quadrature_cache_dir,
                                                              config.input_dir),
             omega_grid_step_ry=float(config.sigma.omega_step_ev) / RYD_TO_EV,
-            occupation_window_threshold=float(config.mpa.occupation_window_threshold),
             material_class="insulator", sigma_w_model="shared_pole", sector_context=context,
             print_fn=print_fn)
 
