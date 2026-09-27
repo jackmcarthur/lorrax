@@ -2991,7 +2991,7 @@ def _report_early_retired_keys(
             ("mpa_sigma_sector_target_error",
              "MPA Sigma uses one uniform denominator-box rule per product "
              "window and has no measured-sector error apportionment. Remove "
-             "the key and use sigma_quadrature_eps (default 3e-5)."),
+             "the key and use sigma_quadrature_eps (default 1e-4)."),
             ("mpa_sigma_max_nodes",
              "the pair ceiling is gone and the box plan never refuses on "
              "count. Remove the key; sigma_quadrature_eps is the only "
