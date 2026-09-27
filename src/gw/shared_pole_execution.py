@@ -194,8 +194,12 @@ def constructor_execution(meta, resolution, recipe, *, mesh, ledger, upstream,
     # check to the conservative side here; a failure routes the map to the face.
     if defer_reduction and cross_original_sides is None:
         import distrib_la
-        if not distrib_la.fits_local(local.eigenplan(side), "eigh", ((1, side, side),) * 8,
-                                     np.complex128, ledger.device_budget_bytes_per_rank):
+        try:
+            local_fits = distrib_la.fits_local(local.eigenplan(side), "eigh", ((1, side, side),) * 8,
+                                               np.complex128, ledger.device_budget_bytes_per_rank)
+        except RuntimeError:   # the native workspace query refuses a side this large on one device
+            local_fits = False
+        if not local_fits:
             return 'face', dict(
                 reason='local parent pencil (conservative side) cannot reduce on one device',
                 requested_layout=resolution.layout, conservative_pencil_side=side,
