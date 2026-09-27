@@ -434,6 +434,8 @@ def _zeta_fit_provenance(*, wfn, meta, cfg, band_range_left, band_range_right,
 	if (int(vertex_mu_L) == 0
 			and tuple(band_range_left) != tuple(band_range_right)):
 		prov['charge_pair_training_domain'] = 'ordered_lr_plus_rl'
+	if int(vertex_mu_L) != 0 and meta.current_basis_rows is not None:
+		prov['current_fit_basis'] = 'circular'
 	return json.dumps(prov, sort_keys=True)
 
 
@@ -1455,6 +1457,14 @@ def _resolve_zeta_fit_contract(
 		# device array only after the canonical all-channel reuse verdict says
 		# that a fit or downstream Sigma sampling is actually required.
 		centroids_transverse = np.asarray(cent_T_np, dtype=np.int32)
+		# The current-component basis: the one in which every PHYSICAL
+		# operation acts monomially, so separate component fits commute with
+		# the unfold (symmetry_maps.select_current_basis).  Resolved once
+		# here and carried on meta.
+		from symmetry_maps import select_current_basis
+		_basis_name, meta.current_basis_rows = select_current_basis(wfn.symmetry())
+		print_fn(f"  current fit basis: {_basis_name} (the physical group's current "
+		         f"action is monomial in it; symmetry_maps.select_current_basis)")
 		from common.centroid_basis import PackedCentroidBasis
 		basis_T = PackedCentroidBasis.build(
 			centroids_transverse, sym, meta.fft_grid, mesh_xy)
@@ -1979,7 +1989,8 @@ def _fit_transverse_zeta_channels(
             zeta_cutoff_ry=_zeta_cutoff,
             layout="face",
             mubatch_plan=_chunks_T['mubatch'], parent_psi=parent_psi,
-            write_zeta_file=write_T, print_fn=print_fn)
+            write_zeta_file=write_T, current_basis_rows=_meta_T.current_basis_rows,
+            print_fn=print_fn)
     del parent_psi
     tt_tiles = None
     try:
@@ -2215,6 +2226,7 @@ def _bispinor_current_tiles(zetas_T, *, cfg, meta_T, wfn, sym, centroid_T_idx,
             tt_head_correction=(uses_bare_tt_gamma_head(cfg)
                                 or bool(cfg.head.bispinor_tt_head_correction)
                                 or uses_direct_bispinor_shared_pole_head(cfg)),
+            current_basis_rows=meta_T.current_basis_rows,
             print_fn=print_fn)
 
 
@@ -2328,6 +2340,7 @@ def _compute_photon_vq(
                     charge_representation=None,
                     spatial_current_representation=None,
                     cc_tile=cc_tile, tt_tiles=tt_tiles,
+                    current_basis_rows=meta.current_basis_rows,
                 )
     from file_io.restart_bundle import read_photon_charge
     V_q_raw = read_photon_charge(bispinor_h5_path, mesh_xy)
@@ -2337,6 +2350,7 @@ def _compute_photon_vq(
     if not (uses_coupled_photon_head(cfg)
             or uses_direct_bispinor_shared_pole_head(cfg)):
         photon_g0_vectors = None
+
     head_channel = None
     if str(getattr(cfg.head, 'mc_average_placement', 'off')) != 'off':
         raise NotImplementedError(

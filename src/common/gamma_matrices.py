@@ -163,6 +163,26 @@ def gamma_perm_phase_host(mu_lorentz: int) -> tuple[_np.ndarray, _np.ndarray]:
     return perm.copy(), phase.copy()
 
 
+def current_fit_terms(channel: int, basis_rows) -> tuple:
+    """Channel ``c``'s Gram and Z as Σ w·U(γ̃^i at μ, γ̃^j at r): ``((w, i, j), ...)``.
+
+    ``basis_rows`` is None (Cartesian: channel c fits ψ†α^cψ) or the unitary
+    ``B`` of ``symmetry_maps.select_current_basis`` (channel c fits
+    Σ_i B_ci ψ†α^iψ).  The fit kernels are bilinear in the two vertex phase
+    vectors, and every row of ``B`` combines α^i whose phase vectors make the
+    channel's own phase vector real (α^± = (α^1 ± iα^2)/√2 has phases
+    (√2, 0, √2, 0)), so the channel's positive Gram is Σ_ij B_ci B_cj U(α^i, α^j).
+    """
+    c = int(channel)
+    if c == 0:
+        return ((1.0, 0, 0),)
+    if basis_rows is None:
+        return ((1.0, c, c),)
+    u = _np.asarray(basis_rows, dtype=_np.complex128)[c - 1]
+    return tuple((complex(u[i] * u[j]), i + 1, j + 1)
+                 for i in range(3) for j in range(3) if abs(u[i] * u[j]) > 0)
+
+
 def gamma_apply(X: jax.Array, perm: jax.Array, phase: jax.Array,
                 axis: int, is_identity: bool = False) -> jax.Array:
     """Apply a monomial γ̃ matrix on ``axis`` of X via gather + phase mul.
@@ -411,5 +431,5 @@ __all__ = [
     "gamma0", "gamma1", "gamma2", "gamma3", "gamma5",
     "gammas_perm", "gammas_phase",
     "gamma_perm_phase", "gamma_apply", "gamma_double_contract",
-    "gamma_vertex_trace",
+    "gamma_vertex_trace", "current_fit_terms",
 ]

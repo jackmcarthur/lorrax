@@ -57,6 +57,10 @@ class Meta:
     # seam.  ``None`` (drivers without a symmetry-packed basis) keeps the
     # canonical suffix-padded carrier.
     mu_basis: object = None
+    # Current-component basis of the bispinor fits (symmetry_maps.
+    # select_current_basis rows; None = Cartesian), resolved once from the
+    # physical group by gw_init and read by every current-index consumer.
+    current_basis_rows: object = None
 
     @property
     def mu_solve_extent(self) -> int:

@@ -19,19 +19,67 @@ from common.bispinor_init import HALFALPHA
 from gw.qsgw_head import _pad_head_band_manifold, _mesh_xy
 
 
-def packed_gamma_vectors(photon_g0_vectors, layout, mesh):
-    """Use the existing photon-layout owner for the four Γ plane-wave rows."""
+def cartesian_gamma_rows(photon_g0_vectors, current_basis_rows):
+    """The four Γ head rows as per-block vectors: ``rows[a][i]`` in Lorentz block i.
+
+    The G=0 one-leg vectors are diagonal in the fit basis (channel c is
+    component c's ζ at G=0).  The photon operator keeps Cartesian blocks
+    (``v_q_bispinor._cartesian_tt_results``), so Cartesian head row a places
+    ``Σ_c conj(B_ca) B_ci g^c`` in current block i: then
+    ``Σ_ab conj(row_a) M_ab row_b`` equals the fit-basis head with
+    ``B M Bᴴ``, for every Cartesian 4×4 head tensor M.  ``B`` None
+    (Cartesian fits): row a is ``g^a`` in block a alone.
+    """
+    g = tuple(photon_g0_vectors)
+    zero = [None] * 4
+    if current_basis_rows is None:
+        return tuple(tuple(v if i == a else zero[i] for i in range(4))
+                     for a, v in enumerate(g))
+    B = np.asarray(current_basis_rows, dtype=np.complex128)
+    rows = [(g[0], None, None, None)]
+    for a in range(3):
+        blocks = []
+        for i in range(3):
+            terms = [complex(np.conj(B[c, a]) * B[c, i]) * g[1 + c]
+                     for c in range(3) if abs(B[c, a] * B[c, i]) > 0]
+            blocks.append(sum(terms[1:], terms[0]) if terms else None)
+        rows.append((None,) + tuple(blocks))
+    return tuple(rows)
+
+
+def packed_gamma_vectors(photon_g0_vectors, layout, mesh, *, current_basis_rows):
+    """Use the existing photon-layout owner for the four Γ plane-wave rows.
+
+    ``current_basis_rows`` is ``meta.current_basis_rows``: the rows are
+    :func:`cartesian_gamma_rows`, each packed block by block.
+    """
     from common.collectives import device_put_process_local
     from gw.photon_layout import pack_photon_channel_vectors
 
     if photon_g0_vectors is None or len(photon_g0_vectors) != 4:
         raise ValueError("direct photon Γ needs four authenticated G=0 vectors")
-    x = pack_photon_channel_vectors(tuple(photon_g0_vectors), layout,
-                                    mesh, axis_name="x")[0]
+    blocks = cartesian_gamma_rows(photon_g0_vectors, current_basis_rows)
     sh_y = NamedSharding(mesh, P(None, "y"))
-    y = pack_photon_channel_vectors(tuple(
-        device_put_process_local(row, sh_y) for row in photon_g0_vectors),
-        layout, mesh, axis_name="y")[0]
+
+    def pack(axis_name, place):
+        out = []
+        for a, row in enumerate(blocks):
+            filled = tuple(place(v) if v is not None else
+                           jnp.zeros_like(place(photon_g0_vectors[i]))
+                           for i, v in enumerate(row))
+            out.append(pack_photon_channel_vectors(
+                filled, layout, mesh, axis_name=axis_name)[0].sum(axis=0))
+        return jnp.stack(out)
+
+    if current_basis_rows is None:
+        x = pack_photon_channel_vectors(tuple(photon_g0_vectors), layout,
+                                        mesh, axis_name="x")[0]
+        y = pack_photon_channel_vectors(tuple(
+            device_put_process_local(row, sh_y) for row in photon_g0_vectors),
+            layout, mesh, axis_name="y")[0]
+        return x, y
+    x = pack("x", lambda v: v)
+    y = pack("y", lambda v: device_put_process_local(v, sh_y))
     return x, y
 
 
@@ -42,7 +90,8 @@ def subtract_bare_tt_from_bank(packed_v, photon_g0_vectors, *, layout,
     from gw.photon_layout import add_photon_q0_low_rank
     from gw.v_q_bispinor import _tt_head_tensor
 
-    x, y = packed_gamma_vectors(photon_g0_vectors, layout, mesh)
+    x, y = packed_gamma_vectors(photon_g0_vectors, layout, mesh,
+                                current_basis_rows=meta.current_basis_rows)
     tensor = _tt_head_tensor(bvec=CoulombGeometry.from_wfn(wfn).bvec,
         cell_volume=float(meta.cell_volume), sys_dim=int(meta.sys_dim),
         kgrid=tuple(meta.kgrid))
@@ -72,9 +121,11 @@ def _contact_projection_program(mesh):
         out_specs=P(None,None), check_vma=False))
 
 
-def direct_photon_contact(contact_packed, photon_g0_vectors, *, layout, mesh):
+def direct_photon_contact(contact_packed, photon_g0_vectors, *, layout, mesh,
+                          current_basis_rows):
     """Project the bank's one FD contact onto the four uniform vertices."""
-    x, y = packed_gamma_vectors(photon_g0_vectors, layout, mesh)
+    x, y = packed_gamma_vectors(photon_g0_vectors, layout, mesh,
+                                current_basis_rows=current_basis_rows)
     return _contact_projection_program(mesh)(x, contact_packed, y)
 
 
@@ -479,7 +530,7 @@ def build_direct_photon_head(velocity_cart, wfns, occupation_state, *,
         nk_tot=int(meta.nk_tot), nspin=int(wfn.nspin),
         nspinor_wfn=int(meta.nspinor_wfnfile))
     contact = direct_photon_contact(contact_packed, photon_g0_vectors,
-        layout=layout, mesh=mesh)
+        layout=layout, mesh=mesh, current_basis_rows=meta.current_basis_rows)
     replicated = NamedSharding(mesh, P())
     points_device = device_put_process_local(z, replicated)
     atom_w, atom_u = (device_put_process_local(np.asarray(x), replicated)
