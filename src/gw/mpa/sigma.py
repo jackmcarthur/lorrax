@@ -1098,7 +1098,6 @@ def _integrate_sigma_batches(
     brackets=None,
     band_counts=None,
     odd_residue_off=False,
-    capacity_stage="sigma",
     w_synthesis=None,
     tau_kernel_factory=None,
     q_wedge=None,
@@ -1173,7 +1172,7 @@ def _integrate_sigma_batches(
                            tuple(sorted(face_kwargs.items(), key=lambda kv: kv[0])))
             tau_kernel = SynthesisTau(
                 sigma_kij, w_synthesis, psi_coh_yr, psi_proj_yn, w_synthesis.native,
-                f"{capacity_stage}.synthesis.window", meta, spatial_key, (k_unfold_plan,))
+                "sigma.synthesis.window", meta, spatial_key, (k_unfold_plan,))
         else:
             tau_kernel = get_shared_sigma_tau_kernel(
                 mesh_xy=mesh_xy, kgrid=kgrid, brackets=brackets,
@@ -1645,8 +1644,6 @@ def compute_sigma_c_mpa_omega_grid(
     sector_context=None,
     odd_reference=True,
     tau_kernel_factory=None,
-    recipe_eta_role="sigma",
-    capacity_stage="sigma",
     omega_eta_ry=None,
     print_fn=print,
 ):
@@ -1696,11 +1693,8 @@ def compute_sigma_c_mpa_omega_grid(
         if fit_digest is not None and ledger["digest"] != fit_digest:
             raise ValueError("GATE shared_pole_identity: screening handle digest differs from model")
         recipe = meta.shared_pole_recipe
-        # A rotating-band far patch is an intentional broader delivery of the
-        # same pole model (gw.qp_support.FAR_PATCH_ETA_EV); only the near
-        # Sigma must match the recipe eta.
-        if recipe_eta_role != "far_patch" and not np.isclose(
-                regularization_width_ry * RYD_TO_EV, recipe["eta_ev"], rtol=0, atol=1e-12):
+        if not np.isclose(regularization_width_ry * RYD_TO_EV,
+                          recipe["eta_ev"], rtol=0, atol=1e-12):
             raise ValueError("GATE shared_pole_eta: Sigma and current recipe eta differ")
         if fixed_quadrature_session is not None:
             fixed_pole_support_ry = (
@@ -1708,8 +1702,7 @@ def compute_sigma_c_mpa_omega_grid(
         n_poles = int(ledger["n_q_irr"])
         ordered_residues = False
         with timing.section("sigma.capacity"):
-            schedule = (_shared_pole_memory_schedule(meta, ledger, mesh_xy=mesh_xy, layout=wfns.layout,
-                                                     stage=capacity_stage)
+            schedule = (_shared_pole_memory_schedule(meta, ledger, mesh_xy=mesh_xy, layout=wfns.layout)
                         if sector_context is None else sector_context["schedule"](ledger))
         print_fn(f"  shared-pole Sigma capacity: {schedule}")
     elif isinstance(fit_src, MemoryPoleSource):
@@ -1882,7 +1875,7 @@ def compute_sigma_c_mpa_omega_grid(
                 with timing.section('tau.synthesis_setup'):
                     synthesis = (_shared_pole_w_synthesis(
                         reader, meta, ledger, frequencies, schedule, mesh_xy=mesh_xy,
-                        layout=schedule.get("factor_layout", wfns.layout), stage=capacity_stage)
+                        layout=schedule.get("factor_layout", wfns.layout))
                         if sector_context is None else sector_context["synthesis"](
                             reader, ledger, frequencies, schedule))
                 # A sector's caller owns its synthesis lifetime
@@ -1896,8 +1889,7 @@ def compute_sigma_c_mpa_omega_grid(
                         w_synthesis=synthesis,
                         tau_kernel_factory=(None if owned else
                                             sector_context["tau_kernel"]),
-                        tau_capacity=geometry.get("sc_tau_capacity"),
-                        capacity_stage=capacity_stage, print_fn=print_fn)
+                        tau_capacity=geometry.get("sc_tau_capacity"), print_fn=print_fn)
                 except BaseException:
                     if owned:
                         synthesis.close()
