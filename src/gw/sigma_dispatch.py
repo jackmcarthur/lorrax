@@ -1216,7 +1216,6 @@ def _compute_mpa_sigma(
         efermi_ry=sigma_efermi_ry,
         occupation_state=occupation_state,
         regularization_width_ry=_xi.resolved_ry,
-        edge_factor=float(config.sigma.window_edge_factor),
         quadrature_eps=float(config.sigma.quadrature_eps),
         quadrature_cache_dir=quadrature_cache_dir,
         omega_grid_step_ry=(

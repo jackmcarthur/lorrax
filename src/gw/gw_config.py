@@ -2528,7 +2528,6 @@ def _input_response(
         w_model=str(params["sigma_w_model"]),
         w_accuracy=str(params["sigma_w_accuracy"]),
         w_support_sites_ev=str(params["sigma_w_support_sites_ev"]),
-        window_edge_factor=1.0,
         fermi_reference=str(params["fermi_reference"]).strip().lower(),
         quadrature_eps=float(params["sigma_quadrature_eps"]),
         quadrature_cache_dir=str(
@@ -3962,7 +3961,6 @@ class DynamicSigmaConfig:
     omega_max_ev: float | None
     omega_step_ev: float
     regularization_ev: float
-    window_edge_factor: float
     fermi_reference: str
     sigma_at_dft_energies: bool
     #: Uniform denominator-box policy for dynamic Sigma quadrature.  The
