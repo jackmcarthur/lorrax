@@ -213,7 +213,8 @@ def _vxc_mgga(rho, rho_raw, sigma, tau, rho_G, G_cart, xc_fn):
 #  Noncollinear magnetic V_xc: v δ_αβ + B·σ_αβ (QE's general branch)
 # ═══════════════════════════════════════════════════════════════════════
 
-def compute_V_xc_noncollinear(rho_total, rho_G_total, mag, G_cart, xc_fn):
+def compute_V_xc_noncollinear(rho_total, rho_G_total, mag, G_cart, xc_fn,
+                              ecutrho):
     """V_xc^{αβ}(r) = v(r) δ_αβ + B(r)·σ_αβ from ρ and m for a spin-polarized GGA.
 
     The local-frame construction QE uses with ``lsign = .false.`` (the general
@@ -234,15 +235,23 @@ def compute_V_xc_noncollinear(rho_total, rho_G_total, mag, G_cart, xc_fn):
     field |m|.  Gradient terms are dropped where ρ ≤ 1e-6 or |∇ρ|² ≤ 1e-10
     (the scalar route's QE thresholds); B = 0 where |m| ≤ 1e-20.
 
+    Every gradient and divergence keeps only the density sphere
+    |G|² ≤ ``ecutrho`` (QE's ``fft_gradient_g2r``/``fft_graddot`` act on the
+    ngm G-vectors).  It matters here: |m| has a cusp where m changes sign
+    (37 % of the bcc Fe grid has m_z < 0), so its box FFT carries weight
+    outside the sphere that QE never sees.
+
     Parameters: ``rho_total`` (nx,ny,nz), ``rho_G_total`` its complex FFT,
     ``mag`` (3,nx,ny,nz) m in the same density units, ``G_cart``
     (nx,ny,nz,3), ``xc_fn`` from :func:`pbe_functional_polarized`.
     Returns ``(v, B)`` in Ry, shapes (nx,ny,nz) and (3,nx,ny,nz).
     """
     rho = jnp.maximum(rho_total, 1e-10)
+    sphere = jnp.sum(G_cart ** 2, axis=-1) <= ecutrho
     amag = jnp.sqrt(jnp.sum(mag ** 2, axis=0))
-    amag_G = local_fftn3(amag)
-    grad_rho = _compute_grad_components(rho_G_total, G_cart)
+    amag_G = jnp.where(sphere, local_fftn3(amag), 0.0)
+    grad_rho = _compute_grad_components(jnp.where(sphere, rho_G_total, 0.0),
+                                        G_cart)
     grad_amag = _compute_grad_components(amag_G, G_cart)
     ru = 0.5 * (rho + amag)
     rd = jnp.maximum(0.5 * (rho - amag), 1e-12)
@@ -268,7 +277,7 @@ def compute_V_xc_noncollinear(rho_total, rho_G_total, mag, G_cart, xc_fn):
     def divergence(field):
         out = jnp.zeros_like(rho)
         for i in range(3):
-            h_G = local_fftn3(field[i])
+            h_G = jnp.where(sphere, local_fftn3(field[i]), 0.0)
             out = out + jnp.real(local_ifftn3(1j * G_cart[..., i] * h_G))
         return out
 
