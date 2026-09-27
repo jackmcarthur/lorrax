@@ -1164,11 +1164,18 @@ def resolve_shared_pole_recipe(config, wfns, meta, *, mesh_xy, print_fn,
         meta, mesh_xy=mesh_xy, device_budget_bytes=int(device_budget_bytes()))
     recipe = shared_real_pole_v1_r3b
     tier = config.sigma.w_accuracy
-    policy = recipe[tier]
+    policy = dict(recipe[tier])
+    width_scale = float(getattr(config.sigma, "w_study_width_scale", 1.0))
+    for key in ("imaginary_width_fraction", "infinity_width_fraction", "line_direction_cap_fraction"):
+        if key in policy:
+            policy[key] *= width_scale
     eta = float(config.sigma.regularization_ev)
     if not math.isfinite(eta) or eta <= 0:
         raise ValueError("GATE shared_pole_eta: got: invalid eta; want: finite positive sigma_regularization_ev; why: causal sampling height")
     height = max(recipe['height_floor_ev'], recipe['height_eta_factor'] * eta)
+    height_override = float(getattr(config.sigma, 'w_study_height_ev', 0.0))
+    if height_override > 0.0:
+        height = height_override
     override = parse_support_sites(getattr(config.sigma, 'w_support_sites_ev', ''))
     plasma_ry = 2.0 * math.sqrt(4.0 * math.pi * census['active_electrons']
                                / census['cell_volume_bohr3'])
@@ -1273,6 +1280,10 @@ def resolve_shared_pole_recipe(config, wfns, meta, *, mesh_xy, print_fn,
         version = RECIPE_VERSION + '+support_sites'
         table = hashlib.sha256(
             (RECIPE_HASH + '|' + override['text']).encode()).hexdigest()
+    if height_override > 0.0 or width_scale != 1.0:
+        version += '+spcost_study'
+        table = hashlib.sha256((table + '|height=' + repr(height_override)
+                                + '|width_scale=' + repr(width_scale)).encode()).hexdigest()
     budget_fraction = policy.get('pole_budget_fraction')
     budget_override = float(getattr(config.sigma, 'w_pole_budget_fraction', 0.0) or 0.0)
     if budget_override > 0.0:
@@ -1326,6 +1337,8 @@ def resolve_shared_pole_recipe(config, wfns, meta, *, mesh_xy, print_fn,
         'pole_budget': (math.ceil(n * budget_fraction)
                         if budget_fraction is not None else None),
         'pole_budget_fraction': budget_fraction,
+        'study_height_ev': height_override,
+        'study_width_scale': width_scale,
         'multiplet_relative_tolerance': recipe['multiplet_relative_tolerance'],
         'bank_rule_tolerance': policy['bank_rule_tolerance'],
         'moment_convention': recipe['moment_convention'], 'census': dict(census),
