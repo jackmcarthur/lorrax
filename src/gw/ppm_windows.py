@@ -139,6 +139,7 @@ class _SigmaBranch(NamedTuple):
     omega_abs: np.ndarray
     omega_idx: np.ndarray
     band_weight: jax.Array | None = None
+    excursion_bound_ry: float = 0.0
 
 
 def _omega_clusters(
@@ -249,6 +250,7 @@ def branches_for_omega_grid(
     val_mask: jax.Array,
     cond_weight: jax.Array | None = None,
     val_weight: jax.Array | None = None,
+    excursion_bound_ry: float = 0.0,
 ) -> list[_SigmaBranch]:
     """Split a signed omega grid and enumerate its causal branches.
 
@@ -259,7 +261,7 @@ def branches_for_omega_grid(
     omega = np.asarray(omega_grid_ry, np.float64)
     idx_pos = np.where(omega >= 0.0)[0]
     idx_neg = np.where(omega < 0.0)[0]
-    return _iter_branches(
+    branches = _iter_branches(
         omega_pos=omega[idx_pos],
         idx_pos=idx_pos,
         omega_neg_abs=-omega[idx_neg],
@@ -271,6 +273,8 @@ def branches_for_omega_grid(
         cond_weight=cond_weight,
         val_weight=val_weight,
     )
+
+    return [b._replace(excursion_bound_ry=float(excursion_bound_ry)) for b in branches]
 
 
 def window_mask_B_bounds(window: _SigmaWindow) -> tuple[float, float]:

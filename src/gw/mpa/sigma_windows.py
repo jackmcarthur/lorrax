@@ -101,7 +101,9 @@ def sigma_pole_edges(branches, state_edge, excursion):
     reach 7.9 Ry of poles (Na 8^3 map 0: 409 -> 263 pairs with the half's
     own edge, claim 2821).
     """
-    near = float(state_edge) + float(excursion)
+    # The occupation-floor bound is fixed by the smearing, not by live extrema.
+    excursion = max((float(b.excursion_bound_ry) for b in branches), default=0.0)
+    near = float(state_edge) + excursion
     pos, neg = (
         max((float(np.max(b.omega_abs)) for b in branches
              if b.omega_abs.size and bool(b.neg_omega_half) == negative),

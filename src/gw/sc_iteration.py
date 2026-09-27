@@ -2654,122 +2654,39 @@ class SCSupport(NamedTuple):
 
 def _sc_sampled_support(inputs, partition, energies_loop, mu_ev, active_n=None,
                         z_in_kn=None):
-    """This map's sampled Sigma(omega) support (``gw.qp_support``), an
-    :class:`SCSupport`, or None for a static Sigma (no grid, no fallback).
-    Pure; the caller logs it and writes the session.
-
-    * ``plan`` (map 0) and ``one-shot``: the deck request joined with every
-      requested state's E_in +/- 2 eV, so SC map 0 is the one-shot;
-    * ``re-plan`` (map 1, once): the same from the deck request at 1 eV; it may
-      shrink;
-    * ``hold`` (later maps): unchanged while every requested read support
-      [E - dE, E + dE] (``qp_support.read_halfwidth_ev``) lies inside;
-    * ``extend``: otherwise only the crossed edge grows, to E +/- 1 eV.
-
-    ``z_in_kn`` is the previous map's Z per identity: a requested state with
-    Z outside (0, 1] has no quasiparticle and cannot move the support.
-    """
+    """Plan once on protected inputs; retain that grid on every later map."""
     if not inputs.config.compute_mode.is_dynamic:
         return None
-    from .qp_support import (hold_support_ev, plan_support_ev, quasiparticle_mask,
-                             requested_states)
-
+    from .qp_support import plan_support_ev, requested_states, clamped_reads
     sigma = inputs.config.sigma
     session = inputs.fixed_quadrature_session
-    requested = np.asarray(inputs.config.omega_grid_ev, dtype=np.float64)
-    plan = None if session is None else session.get("window_plan")
-    sampled_grid = (requested if plan is None else
-                    np.asarray(session["omega_grid_ev"], dtype=np.float64))
-    support_partition = _partition_on_loop(partition, inputs)
-    required_kn = np.broadcast_to(np.asarray(
-        support_partition.protected_mask | support_partition.in_range_mask,
-        dtype=bool), energies_loop.shape)
-    energy_relative_ev = energies_loop - mu_ev
-    # Owner 2026-09-24: the requested states are the protected identities the
-    # W model treats as active (``active_n``: shared_pole_recipe.active_band_mask
-    # on the fixed DFT ladder), never frozen core; owner 2026-09-27: only
-    # quasiparticles move the support.
-    everyone = requested_states(sigma, inputs.config.sc.frozen_core_bands,
-                                energy_relative_ev, required_kn, active_n)
-    quasiparticle = (None if z_in_kn is None else
-                     quasiparticle_mask(np.broadcast_to(z_in_kn, energies_loop.shape)))
-    states = everyone if quasiparticle is None else everyone & quasiparticle
-    no_qp = everyone & ~states
-    if plan is None:
+    deck = np.asarray(inputs.config.omega_grid_ev, dtype=float)
+    part = _partition_on_loop(partition, inputs)
+    energy = energies_loop - mu_ev
+    states = requested_states(sigma, inputs.config.sc.frozen_core_bands,
+                              energy, part.protected_mask, active_n)
+    if session is None or "omega_grid_ev" not in session:
+        grid, envelope = plan_support_ev(sigma, deck, energy, states)
         event = "one-shot" if session is None else "plan"
-        grid, envelope = plan_support_ev(sigma, requested, energy_relative_ev, states, 0)
-    elif int(plan["index"]) == 0:
-        event = "re-plan"
-        grid, envelope = plan_support_ev(sigma, requested, energy_relative_ev, states, 1)
     else:
-        grid, envelope, event = hold_support_ev(
-            sigma, requested, sampled_grid, session.get("support_envelope_ev"),
-            energy_relative_ev, states)
-    return SCSupport(sampled_grid, grid, energy_relative_ev, states, event,
-                     envelope, no_qp)
+        grid = np.asarray(session["omega_grid_ev"], float)
+        envelope = session["support_envelope_ev"]
+        event = "hold"
+    outside = clamped_reads(energy, states, grid)
+    if session is not None:
+        session["outside_plan"] = ([f"{int(outside.sum())} protected read stencils "
+                                    "outside the omega support"] if outside.any() else [])
+    return SCSupport(deck, grid, energy, states, event, envelope, outside)
 
 
 def _record_sc_window_plan(inputs, iteration, support):
-    """One log record per map for the SC window plan (``_sc_sampled_support``).
-
-    ``plan``/``one-shot``: one line per requested state outside the requested
-    grid.  ``re-plan``: the grid change and the states that set its edges.
-    ``hold``: the tightest read support.  ``extend``: one line per state whose
-    read support crossed an edge, with the new edge.  Every map: one line per
-    requested state without a quasiparticle that lies off the grid.
-    """
-    from .qp_support import SUPPORT_BUFFER_EV, SUPPORT_PAD_EV, read_halfwidth_ev
-
-    sampled_grid, grown_grid, e, req, event = support[:5]
-    e = np.asarray(e, dtype=np.float64)
-    req = np.asarray(req, dtype=bool)
-    b0 = int(inputs.band_slices.b0)
-
-    def state(k, n):
-        return f"band={b0 + int(n) + 1}, k={int(k)}, E-mu={float(e[k, n]):+.6f} eV"
-
-    grids = (f"[{sampled_grid[0]:+.6f}, {sampled_grid[-1]:+.6f}] -> "
-             f"[{grown_grid[0]:+.6f}, {grown_grid[-1]:+.6f}] eV")
-    off_grid = np.asarray(support.no_qp, dtype=bool) & (
-        (e < grown_grid[0]) | (e > grown_grid[-1]))
-    for k, n in zip(*np.nonzero(off_grid)):
-        _record_sc(inputs, f"SC window no-quasiparticle (map {iteration}): {state(k, n)}; "
-                   "Z outside (0, 1] at the previous map, off the grid; it does not "
-                   "move the support and reads the out-of-grid rule")
-    if event in ("plan", "one-shot"):
-        outside = req & ((e < sampled_grid[0]) | (e > sampled_grid[-1]))
-        for k, n in zip(*np.nonzero(outside)):
-            _record_sc(inputs, f"SC sampled-support growth: {state(k, n)}, "
-                       f"pad={SUPPORT_PAD_EV[0]:.6f} eV; sampled {grids}")
-        return
-    if not req.any():
-        _record_sc(inputs, f"SC window {event} (map {iteration}): no requested state; grid {grids}")
-        return
-    masked_lo = np.where(req, e, np.inf)
-    masked_hi = np.where(req, e, -np.inf)
-    lo_kn = np.unravel_index(int(np.argmin(masked_lo)), e.shape)
-    hi_kn = np.unravel_index(int(np.argmax(masked_hi)), e.shape)
-    half = read_halfwidth_ev()
-    if event == "re-plan":
-        _record_sc(inputs, f"SC window re-plan (map {iteration}, pad "
-                   f"{SUPPORT_PAD_EV[1]:.2f} eV): grid {grids}; lowest "
-                   f"{state(*lo_kn)}, highest {state(*hi_kn)}")
-        return
-    if event == "hold":
-        slack_lo = float(e[lo_kn]) - half - float(grown_grid[0])
-        slack_hi = float(grown_grid[-1]) - float(e[hi_kn]) - half
-        edge, where = ((slack_lo, state(*lo_kn)) if slack_lo <= slack_hi
-                       else (slack_hi, state(*hi_kn)))
-        _record_sc(inputs, f"SC window hold (map {iteration}): grid "
-                   f"[{grown_grid[0]:+.6f}, {grown_grid[-1]:+.6f}] eV held; "
-                   f"tightest read support {where}, {edge:.4f} eV inside its edge")
-        return
-    crossed = req & ((e - half < sampled_grid[0]) | (e + half > sampled_grid[-1]))
-    for k, n in zip(*np.nonzero(crossed)):
-        side = "upper" if e[k, n] + half > sampled_grid[-1] else "lower"
-        _record_sc(inputs, f"SC window extension (map {iteration}): {state(k, n)}; "
-                   f"read support [{e[k, n] - half:+.6f}, {e[k, n] + half:+.6f}] eV "
-                   f"crosses the {side} edge; pad {SUPPORT_BUFFER_EV:.2f} eV; grid {grids}")
+    """One bounded receipt per map, including clamped read stencils."""
+    grid = support.grown
+    _record_sc(inputs, f"SC window {support.event} (map {iteration}): grid "
+               f"[{grid[0]:+.6f}, {grid[-1]:+.6f}] eV; "
+               f"protected={int(support.requested.sum())}; "
+               f"clamped_stencils={int(support.no_qp.sum())}; "
+               "outer pad=2.00 eV once; fixed-point check pending")
 
 
 def _sc_active_identities(inputs):
@@ -5601,7 +5518,7 @@ def _run_anderson(
     _occ_state: list = [state_init.occupation_state]
     _head_surface_weight: list = [state_init.head_surface_weight_kn]
     _tail_z: list = [state_init.tail_z_kn]
-    _iter_idx = [0]
+    _iter_idx = [int(state_init.iteration)]
     rms_history: list[float] = []
     _partition: list[BandPartition | None] = [state_init.partition]
     _gain_previous: list[tuple[np.ndarray, np.ndarray] | None] = [None]
@@ -5852,6 +5769,15 @@ def _run_anderson(
         print_fn(
             "  SC pad inertness: NOT CHECKED (early stop -- the "
             "check reads the solver's final x, not reached on this path)")
+        from .qp_support import check_fixed_point
+        if stop.verdict.converged and check_fixed_point(inputs.fixed_quadrature_session):
+            _record_sc(inputs, "SC Sigma support: rebuilding once at convergence; "
+                       "discarding the old Anderson history")
+            rebuilt, history = _run_anderson(
+                replace(stop.state, outputs=None, convergence_verdict=None), inputs,
+                max_iter=max_iter, tol_ev=tol_ev, history_depth=history_depth,
+                eigvalsh_kshard=eigvalsh_kshard, print_fn=print_fn, dump_dir=dump_dir)
+            return rebuilt, rms_history + history
         _maybe_dump_e_history(dump_dir, _e_history, print_fn)
         return stop.state, rms_history
 

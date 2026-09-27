@@ -1606,13 +1606,15 @@ def _branches(wfns, omega, efermi_ry, occupation_state=None):
             f"state: efermi_ry={float(efermi_ry):.12g} Ry vs "
             f"occupation_state.mu_ry={mu:.12g} Ry.  One chemical potential "
             "per iteration — pass the state's own mu.")
+    from gw.efermi import OCCUPATION_WEIGHT_FLOOR
+    excursion = float(occupation_state.smearing_width_ry) * np.log(1.0 / OCCUPATION_WEIGHT_FLOOR)
     f = jnp.reshape(jnp.asarray(occupation_state.f_kn),
                     wfns.enk.shape)[:, wfns.slices.sigma_sum]
     energy = wfns.enk[:, wfns.slices.sigma_sum] - mu
     return branches_for_omega_grid(
         omega, E_cond=energy, H_val=-energy,
         cond_mask=(f != 1.0), val_mask=(f != 0.0),
-        cond_weight=1.0 - f, val_weight=f)
+        cond_weight=1.0 - f, val_weight=f, excursion_bound_ry=excursion)
 
 
 def compute_sigma_c_mpa_omega_grid(
