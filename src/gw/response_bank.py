@@ -21,6 +21,8 @@ import jax.numpy as jnp
 import numpy as np
 from jax.sharding import NamedSharding, PartitionSpec as P
 
+from .efermi import OCCUPATION_WEIGHT_FLOOR, band_in_occupation_window
+
 
 def response_algebra(meta, config, *, mesh_xy, n, ordered=False, photon=False):
     """Plan physical Dyson samples and exact high-frequency moments.
@@ -732,10 +734,14 @@ def bank_points(sample_plan):
 
 
 def response_sample_weights(f, u):
-    """Existing sample-only activity floor; exact moments retain every weight."""
-    ft = np.where(np.abs(f) >= 1e-14, f, 0.0)
-    ut = np.where(np.abs(u) >= 1e-14, u, 0.0)
-    return ft, ut, dict(occupation_activity_floor=1e-14,
+    """The sample weights on the one branch support; exact moments retain every weight.
+
+    ``gw.efermi.band_in_occupation_window`` is the support Sigma and the
+    fractional chi0 use, so the bank samples the same states.
+    """
+    ft = np.where(band_in_occupation_window(f), f, 0.0)
+    ut = np.where(band_in_occupation_window(u), u, 0.0)
+    return ft, ut, dict(occupation_activity_floor=OCCUPATION_WEIGHT_FLOOR,
         discarded_f_mass=float(np.sum(np.abs(f-ft))),
         discarded_u_mass=float(np.sum(np.abs(u-ut))))
 
