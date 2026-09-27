@@ -144,11 +144,12 @@ $$
 \;\xrightarrow{\Delta\to0}\;\frac{C}{\Omega N_k}\,\frac{|f'|\,|\hat q\cdot v_{nm}|^2}{\epsilon^2},
 $$
 
-finite, where the first-order form diverged as $\Delta^{-2}$. The Fe $4^3$
-pairs with splittings below $10^{-4}$ Ry that made
-$8\pi\,\hat q\cdot S\cdot\hat q\approx-2\times10^6$ against
-$\epsilon\sim10^{-1}$ Ry keep $\phi\approx1$, and the Thomas–Fermi term is no
-longer hidden. The same weight bounds the four-current charge jets.
+finite, where the first-order form diverged as $\Delta^{-2}$. Near-crossing
+pairs at the Fermi level (Fe $4^3$ has splittings below $10^{-4}$ Ry against
+$\epsilon\sim10^{-1}$ Ry) have $\phi\approx1$, so their static weight no longer
+hides the Thomas–Fermi term (§3). The same weight bounds the four-current
+charge jets. On a coarse grid $\epsilon$ is large enough that eV-scale pairs
+share their weight too, and the share falls as the cell shrinks.
 
 **The Hall part of a pair's Fermi-surface share.** The share $\phi$ moves
 only symmetric content; its antisymmetric part is Berry curvature, which no
@@ -177,8 +178,20 @@ on the scrambled-Sobol Voronoi draws of `vcoul` (with the analytic sphere
 where the deck asks for it; `gw.vcoul.compute_q0_averages`, argument
 `extra_chi`). $\chi_{\rm intra}$ is evaluated at every sample from the atoms,
 so both its direction and its magnitude dependence are resolved. The exact
-static slot $z=0$ takes $\langle8\pi/(q^2+\kappa^2)\rangle_{\mathcal C}$
-(`qsgw_head._metal_static_head`), the $z\to0^+$ limit of the same function.
+static slot $z=0$ is the $z\to0^+$ limit of the same function,
+$\chi_{\rm intra}\to-N_0$ at every sample, with the interband $S(0)$ kept:
+
+$$
+W_{\rm head}(0)=\Big\langle\frac{8\pi}{\mathbf q\cdot\epsilon_\infty\cdot\mathbf q+\kappa^2}\Big\rangle_{\mathcal C},
+\qquad \epsilon_\infty=1-8\pi S(0),\quad \kappa^2=8\pi N_0 .
+$$
+
+A folded (`full`) head uses the folded $S(0)$ and the static fold's $\kappa^2$
+(`qsgw_head._metal_static_head`). On Fe $4^3$ map 0 the origin
+$8\pi\,\hat q\cdot S(0)\cdot\hat q$ is $-151/-91$ with this split, against
+$-2242/-1551$ without it, so $q^2\epsilon_\infty$ at the cell's
+$\operatorname{tr}Q=0.017$ bohr$^{-2}$ is comparable with $\kappa^2=2.33$ rather than
+12–17 times larger (claim 2862).
 The four-current head solves the $4\times4$ Dyson equation
 $W_h=[1-\mathcal D(\mathbf q)(\Pi(\mathbf q,z)-C)]^{-1}\mathcal D(\mathbf q)$
 at every Sobol sample of the cell exterior and every point of the screened
@@ -219,8 +232,10 @@ bank's consumer ([four-current heads §5](four-current-head-corrections.md#direc
   saturated vertex $(x/4)/(1+x/2)$ at every cell sample, is the next
   refinement; it needs the pair list beside the atoms.
 - **Wings.** The `full` scalar route folds head/body wings
-  (`qsgw_head.head_wings_sharded`); the wing kernels still split pairs by
-  the degeneracy tolerance alone. Their transition weight is the next seam.
+  (`qsgw_head.head_wings_sharded`); the wing kernels keep every pair with
+  $\Delta>0$ and a diagonal-only surface term, so they apply neither the
+  degeneracy rule nor $\phi$. Weighting their pairs by $1-\phi$ is the next
+  seam.
 - **Estimators.** The intraband term uses tetrahedron weights and the
   interband term FD occupations; at coarse grids the two describe slightly
   different Fermi surfaces.
