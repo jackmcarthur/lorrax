@@ -604,8 +604,8 @@ def static_sigma_diag_to_host(sigma_knn, mesh_xy: Mesh) -> np.ndarray:
 _QSGW_BUILD_KERNEL_CACHE: dict[tuple[int, bool], object] = {}
 
 
-def _qsgw_build_kernel(mesh_xy: Mesh, *, replicated_output: bool):
-    key = (id(mesh_xy), bool(replicated_output))
+def _qsgw_build_kernel(mesh_xy: Mesh, *, replicated_output: bool, study_coupling=None):
+    key = (id(mesh_xy), bool(replicated_output), study_coupling)
     fn = _QSGW_BUILD_KERNEL_CACHE.get(key)
     if fn is None:
         out_3d = NamedSharding(
@@ -614,7 +614,7 @@ def _qsgw_build_kernel(mesh_xy: Mesh, *, replicated_output: bool):
             else P(None, "x", "y"))
 
         @jax.jit
-        def _kernel(sig_w, sig_x, ilo, ihi, wlo, whi):
+        def _kernel(sig_w, sig_x, ilo, ihi, wlo, whi, classes=None, izlo=0, izhi=0, wzhi=0.):
             # ilo/ihi/wlo/whi: (nk, nb) replicated; sig_w: (nω, nk, nb_m_X, nb_n_Y).
             # A[k, m, n] = Σ_c[idx[k, m], k, m, n] (interp at E_m(k))
             # B[k, m, n] = Σ_c[idx[k, n], k, m, n] (interp at E_n(k))
@@ -640,6 +640,17 @@ def _qsgw_build_kernel(mesh_xy: Mesh, *, replicated_output: bool):
             B = wlo[:, None, :] * B_lo + whi[:, None, :] * B_hi
 
             sigma_c = 0.5 * (A + B)
+            if study_coupling is not None:
+                pm, pn = classes[:, :, None], classes[:, None, :]
+                if study_coupling == "energy":
+                    # For P-R use BOTH matrix orientations at the same P
+                    # energy before hermitisation, never half a QSGW matrix.
+                    sigma_c = (pm*A+pn*B)/jnp.maximum(pm+pn, 1.)
+                elif study_coupling == "zero":
+                    zero = (1-wzhi)*sig_w[izlo]+wzhi*sig_w[izhi]
+                    sigma_c = pm*pn*sigma_c + (pm+pn-2*pm*pn)*zero
+                else:
+                    sigma_c = pm*pn*sigma_c
 
             # Half-sum, then add static Σ_x.  Historical callers request a
             # replicated matrix before Hermitisation.  The fixed-Sigma evSC
@@ -779,10 +790,21 @@ def build_qsgw_sigma_xc(
     w_lo_j   = device_put_process_local(w_lo.astype(np.complex128), rep_2d)
     w_hi_j   = device_put_process_local(w_hi.astype(np.complex128), rep_2d)
 
+    from . import spcost_bandclass as study
+    extra = ()
+    coupling = None
+    if study.CANDIDATE is not None and study.CONTEXT is not None:
+        coupling = study.CANDIDATE["coupling"]
+        classes = np.zeros((nk, nb), dtype=float)
+        classes[:, :logical_nb] = study.CONTEXT["pfull"]
+        izhi = int(np.clip(np.searchsorted(omega, 0.), 1, n_omega-1))
+        izlo = izhi-1
+        wzhi = float(-omega[izlo]/(omega[izhi]-omega[izlo]))
+        extra = (device_put_process_local(classes, rep_2d), izlo, izhi, wzhi)
     sigma_xc_qsgw = _qsgw_build_kernel(
-        mesh_xy, replicated_output=bool(replicated_output))(
+        mesh_xy, replicated_output=bool(replicated_output), study_coupling=coupling)(
         sigma_c_omega_ry, sigma_x_kij_ry,
-        idx_lo_j, idx_hi_j, w_lo_j, w_hi_j,
+        idx_lo_j, idx_hi_j, w_lo_j, w_hi_j, *extra,
     )
     sigma_xc_qsgw.block_until_ready()
     if band_axis is not None and replicated_output:

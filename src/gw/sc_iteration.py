@@ -3331,6 +3331,11 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
     sigma0_kn = (np.zeros(energies_loop.shape, dtype=bool) if sc_support is None
                  else ~omega_coverage(sc_support[1], sc_support[2])[0])
 
+    # Explicit scratch runner activates this study; ordinary decks are unchanged.
+    from . import spcost_bandclass
+    spcost_bandclass.begin(inputs, state, ks, indices_loop, energies_loop,
+                          U_qp, scissor_classes)
+
     # ENERGY-ONLY SCISSOR FOR THE SUM-BAND TAIL.  No new iteration state:
     # the fit is derived from the current carry's eigenspectrum and the
     # immutable active DFT ladder.  The logical stop is b4_user, not padded
@@ -4056,7 +4061,7 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
     # Every QP-window identity keeps its full Sigma (owner rule 2026-09-22),
     # so the map output is the full QSGW Hamiltonian: no band is scissored
     # and no off-diagonal is masked.
-    H_qp_dft_new = H_qp_dft_full
+    H_qp_dft_new = spcost_bandclass.finish(H_qp_dft_full, inputs)
 
     # The occupation state CARRIED below is the ENTRY solve consumed by this
     # call's chi/head/Sigma.  The carry remains DIAGNOSTIC continuity only (mu drift between
