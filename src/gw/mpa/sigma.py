@@ -1647,6 +1647,7 @@ def compute_sigma_c_mpa_omega_grid(
     tau_kernel_factory=None,
     recipe_eta_role="sigma",
     capacity_stage="sigma",
+    omega_eta_ry=None,
     print_fn=print,
 ):
     """Read a fitted MPA store, derive its windows, and compute Sigma_c.
@@ -1808,7 +1809,8 @@ def compute_sigma_c_mpa_omega_grid(
                 analytic_line=bool(analytic_line),
                 material_class=material_class,
                 fixed_pole_support_ry=fixed_pole_support_ry,
-                certificate_pole_summaries=certificate)
+                certificate_pole_summaries=certificate,
+                omega_eta_ry=omega_eta_ry)
         quadrature_log.record_sigma_plan(geometry)
         print_fn(
             f"  MPA windows [box]: "

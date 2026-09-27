@@ -1176,9 +1176,17 @@ def _fit_fixed_sc_rules(specs, eta, *, eps, cache_dir, session, material_class=N
     session["call_count"] = iteration
     initialized = "rules" not in session
     if initialized:
-        fixed = [_selector_box_spec(spec, eta) for spec in (rows if plan_specs is None else plan_specs)]
-        fits, fit_rows = fit_sigma_box_specs(fixed, eta, eps=eps,
-                                            cache_dir=cache_dir, cache_build_widen=False)
+        fixed = [_selector_box_spec(spec, spec.get("eta_ry", eta))
+                 for spec in (rows if plan_specs is None else plan_specs)]
+        # One fit call per broadening: a far-patch window keeps its own eta.
+        fits, fit_rows = [None] * len(fixed), []
+        for eta_g in sorted({float(f.get("eta_ry", eta)) for f in fixed}):
+            ids = [i for i, f in enumerate(fixed) if float(f.get("eta_ry", eta)) == eta_g]
+            got, got_rows = fit_sigma_box_specs([fixed[i] for i in ids], eta_g, eps=eps,
+                                                cache_dir=cache_dir, cache_build_widen=False)
+            for i, fit in zip(ids, got):
+                fits[i] = fit
+            fit_rows.extend(got_rows)
         session["tau_capacity"] = max((int(f["node_count"]) for f in fits), default=0)
         session["rules"] = {spec["name"]: {"fit": fit}
                             for spec, fit in zip(fixed, fits)}
@@ -1260,8 +1268,15 @@ def plan_sigma_windows(
     material_class=None,
     fixed_pole_support_ry=None,
     certificate_pole_summaries=None,
+    omega_eta_ry=None,
 ):
     """Build the complete MPA Sigma quadrature from raw support boxes.
+
+    ``omega_eta_ry`` (optional, one value per ``omega_ry`` sample): a per-range
+    broadening. Each product window is split by the eta of the frequencies it
+    owns; a split window's box, rule and executor weights use its own eta
+    (rotating-band far patches, gw.qp_support). Product partitions (state and
+    pole edges) stay at ``eta_ry``.
 
     ``analytic_line`` asks the service for its fixed-height rule only when
     the box crosses zero and all poles are real. PPM supplies that request;
@@ -1363,6 +1378,11 @@ def plan_sigma_windows(
     if not summaries:
         raise ValueError("Sigma box planning needs at least one pole summary")
     omega_grid = np.asarray(omega_ry, dtype=np.float64)
+    omega_eta = (None if omega_eta_ry is None
+                 else np.asarray(omega_eta_ry, dtype=np.float64).reshape(-1))
+    if omega_eta is not None and (omega_eta.shape != omega_grid.shape
+                                  or np.any(omega_eta < float(eta) - 1e-15)):
+        raise ValueError("omega_eta_ry must give one eta >= eta_ry per frequency")
     state_rows, geometry = _product_geometry(branch_rows, eta)
 
     certificate_rows = (summaries if certificate_pole_summaries is None
@@ -1409,47 +1429,62 @@ def plan_sigma_windows(
                 continue
             states = raw_energy[local] if local.size else np.array([state_min, state_max])
             fit_poles = pole_stats if pole_stats else [(pole_min, pole_max, 0., far_gamma)]
-            spec = make_sigma_box_spec(
-                name=f"{branch.tag}:{name}", frequencies=frequencies[owned],
+            owned_all = owned
+            owned_eta = (np.full(owned_all.size, float(eta)) if omega_eta is None
+                         else omega_eta[positions[owned_all]])
+            if np.unique(owned_eta).size > 1 and make_sigma_box_spec(
+                    name="probe", frequencies=frequencies[owned_all], states=states,
+                    pole_stats=fit_poles, pole_sign=pole_sign, eta_ry=eta)["kind"] != "crossing":
+                # A sign-definite window's node count barely depends on eta:
+                # it serves every frequency it owns at the near eta, so a far
+                # patch adds no window here.
+                owned_eta = np.full(owned_all.size, float(eta))
+            for eta_w in np.unique(owned_eta):
+              owned = owned_all[owned_eta == eta_w]
+              eta_w = float(eta_w)
+              suffix = "" if eta_w == float(eta) else f"@eta{eta_w * RYD_TO_EV:.3g}"
+              spec = make_sigma_box_spec(
+                name=f"{branch.tag}:{name}{suffix}", frequencies=frequencies[owned],
                 states=states, pole_stats=fit_poles,
-                pole_sign=pole_sign, eta_ry=eta)
-            if certificate_pole_summaries is not None:
-                _, union_stats = _pole_rows(certificate_pole_summaries, selector)
-                union = (make_sigma_box_spec(
-                    name=spec["name"], frequencies=frequencies[owned],
-                    states=states,
-                    pole_stats=union_stats, pole_sign=pole_sign, eta_ry=eta)
-                    if union_stats else None)
-                if (union is not None and union["kind"] == spec["kind"]
-                        and _box_contains(union["box"], spec["box"])):
-                    spec.update(box=union["box"],
-                                raw_real_support=union["raw_real_support"],
-                                pole_extent=union["pole_extent"])
-            spec["analytic_line"] = bool(analytic_line)
-            if fixed_pole_support is not None:
-                support_lo = max(0.0, float(pole_lo))
-                support_hi = min(fixed_pole_support, float(pole_hi))
-                if support_hi > support_lo:
-                    spec["sc_support_pole_extent"] = (
-                        support_lo, support_hi, 0.0, 0.0)
-            spec.update({
-                "branch": branch,
-                "far_state_ceiling": 4. * max(float(np.max(raw_energy)), eta),
-                "far_pole_ceiling": far_pole,
-                "far_gamma_ceiling": far_gamma,
-                "state_indices": flat_indices[local],
-                "state_shape": state_shape.shape,
-                "state_interval": (float(state_lo), float(state_hi)),
-                "pole_indices": pole_indices,
-                "pole_bounds": (float(pole_lo), float(pole_hi)),
-                "omega_interval": (float(omega_lo), float(omega_hi)),
-                "omega_abs": omega_abs[owned],
-                "omega_idx": positions[owned],
-                "branch_report": report,
-            })
-            plan_specs.append(spec)
-            if live:
-                specs.append(spec)
+                pole_sign=pole_sign, eta_ry=eta_w)
+              spec["eta_ry"] = eta_w
+              if certificate_pole_summaries is not None:
+                  _, union_stats = _pole_rows(certificate_pole_summaries, selector)
+                  union = (make_sigma_box_spec(
+                      name=spec["name"], frequencies=frequencies[owned],
+                      states=states,
+                      pole_stats=union_stats, pole_sign=pole_sign, eta_ry=eta_w)
+                      if union_stats else None)
+                  if (union is not None and union["kind"] == spec["kind"]
+                          and _box_contains(union["box"], spec["box"])):
+                      spec.update(box=union["box"],
+                                  raw_real_support=union["raw_real_support"],
+                                  pole_extent=union["pole_extent"])
+              spec["analytic_line"] = bool(analytic_line)
+              if fixed_pole_support is not None:
+                  support_lo = max(0.0, float(pole_lo))
+                  support_hi = min(fixed_pole_support, float(pole_hi))
+                  if support_hi > support_lo:
+                      spec["sc_support_pole_extent"] = (
+                          support_lo, support_hi, 0.0, 0.0)
+              spec.update({
+                  "branch": branch,
+                  "far_state_ceiling": 4. * max(float(np.max(raw_energy)), eta),
+                  "far_pole_ceiling": far_pole,
+                  "far_gamma_ceiling": far_gamma,
+                  "state_indices": flat_indices[local],
+                  "state_shape": state_shape.shape,
+                  "state_interval": (float(state_lo), float(state_hi)),
+                  "pole_indices": pole_indices,
+                  "pole_bounds": (float(pole_lo), float(pole_hi)),
+                  "omega_interval": (float(omega_lo), float(omega_hi)),
+                  "omega_abs": omega_abs[owned],
+                  "omega_idx": positions[owned],
+                  "branch_report": report,
+              })
+              plan_specs.append(spec)
+              if live:
+                  specs.append(spec)
         report["plan_stop"] = len(specs)
         report["window_count"] = report["plan_stop"] - report["plan_start"]
         branch_reports.append(report)
@@ -1486,7 +1521,7 @@ def plan_sigma_windows(
         window = _SigmaWindow(
             name=spec["name"],
             nodes=sigma_box_executor_nodes(
-                fit, spec["pole_sign"], eta),
+                fit, spec["pole_sign"], spec.get("eta_ry", eta)),
             mask_A=mask.reshape(spec["state_shape"]),
             E_ref_A=spec["E_ref_A"], E_ref_B=spec["E_ref_B"],
             omega_sign=int(spec["pole_sign"]) * external_sign,

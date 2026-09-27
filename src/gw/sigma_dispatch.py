@@ -1235,6 +1235,11 @@ def _compute_mpa_sigma(
     lorentz_output = bool(config.debug.sigma_lorentz_debug_output)
     if not lorentz_output:
         sigma_lorentz = None
+    far_bodies = []
+    if (getattr(config, "sc_far_patches_ev", None)
+            and sector_handle.get("representation") == "sector-ordered-ph"):
+        raise ValueError("GATE sigma_far_patch_sector: far patches serve the scalar "
+                         "Sigma route only")
     if sector_handle.get("representation") == "sector-ordered-ph":
         from .mpa.sector_sigma import compute_sector_sigma
         on_shell = None
@@ -1262,42 +1267,51 @@ def _compute_mpa_sigma(
         else:
             body = sector_result
     else:
-        body = compute_sigma_c_mpa_omega_grid(
-            wfns, fit_path, meta, mesh_xy, sigma_w_model=sigma_w_model,
-            fit_identity=fit_identity, fit_digest=fit_digest, **body_options)
-    far_patches = getattr(config, "sc_far_patches_ev", None) or ()
-    far_bodies = []
-    if far_patches:
-        if sector_handle.get("representation") == "sector-ordered-ph":
-            raise ValueError("GATE sigma_far_patch_sector: far patches serve the scalar "
-                             "Sigma route only")
-        # Independent (patch, eta) deliveries: each patch plans its own rules
-        # once at eta_far and holds them; the pole model and occupations are
-        # the near body's.
-        from .qp_support import far_patch_eta_ev, far_patch_grid_ev
-        # One plan per eta: patches sharing an eta are one grid with holes,
-        # so each plan pays its fixed box structure once.
-        groups = {}
-        for patch in far_patches:
-            groups.setdefault(far_patch_eta_ev(patch), []).append(patch)
-        for j, (eta_far, patches) in enumerate(sorted(groups.items())):
-            grid_ev = np.concatenate([far_patch_grid_ev(p_) for p_ in patches])
-            far_options = dict(body_options,
-                               omega_grid_ry=grid_ev / RYD_TO_EV,
-                               regularization_width_ry=eta_far / RYD_TO_EV,
-                               omega_grid_step_ry=0.5 * eta_far / RYD_TO_EV,
-                               recipe_eta_role="far_patch",
-                               capacity_stage=f"sigma.far{j}",
-                               fixed_quadrature_session=(
-                                   None if fixed_quadrature_session is None else
-                                   fixed_quadrature_session.setdefault(
-                                       f"{sigma_w_model}:far{j}", {})))
-            print_fn(f"  Sigma far plan {j}: eta {eta_far:.3f} eV, patches "
-                     + ", ".join(f"[{a:+.2f}, {b:+.2f}]" for a, b in patches)
-                     + f" eV, {grid_ev.size} samples")
-            far_bodies.append((grid_ev, compute_sigma_c_mpa_omega_grid(
+        far_patches = getattr(config, "sc_far_patches_ev", None) or ()
+        if far_patches:
+            # ONE PLAN, PER-RANGE ETA: the far patches join the near grid as
+            # extra frequencies whose crossing windows carry the patch eta
+            # (gw.sigma_box_plan.plan_sigma_windows omega_eta_ry); the cube is
+            # split back into the near grid and the far patches below.
+            from .qp_support import far_patch_eta_ev, far_patch_grid_ev
+            near_ev = np.asarray(config.omega_grid_ev, dtype=np.float64)
+            pieces = [(near_ev, np.full(near_ev.size, _xi.resolved_ry * RYD_TO_EV), True)]
+            for patch in far_patches:
+                grid_ev = far_patch_grid_ev(patch)
+                pieces.append((grid_ev, np.full(grid_ev.size, far_patch_eta_ev(patch)), False))
+            pieces.sort(key=lambda piece: float(piece[0][0]))
+            union_ev = np.concatenate([p_[0] for p_ in pieces])
+            if np.any(np.diff(union_ev) <= 0):
+                raise ValueError("GATE sigma_far_patch_order: far patches overlap the near grid")
+            union_eta_ev = np.concatenate([p_[1] for p_ in pieces])
+            near_mask = np.concatenate([np.full(p_[0].size, p_[2]) for p_ in pieces])
+            print_fn("  Sigma far patches in the near plan: "
+                     + ", ".join(f"[{g[0]:+.2f}, {g[-1]:+.2f}] eV at eta {e[0]:.3f}"
+                                 for g, e, near in pieces if not near))
+            body = compute_sigma_c_mpa_omega_grid(
                 wfns, fit_path, meta, mesh_xy, sigma_w_model=sigma_w_model,
-                fit_identity=fit_identity, fit_digest=fit_digest, **far_options)))
+                fit_identity=fit_identity, fit_digest=fit_digest,
+                **dict(body_options, omega_grid_ry=union_ev / RYD_TO_EV,
+                       omega_eta_ry=union_eta_ev / RYD_TO_EV))
+            from dataclasses import replace as _replace_body
+            near_idx = np.nonzero(near_mask)[0]
+            far_idx = np.nonzero(~near_mask)[0]
+
+            def _slice(b, idx, keep_odd):
+                fields = dict(sigma_c_kij=jnp.take(b.sigma_c_kij, jnp.asarray(idx), axis=0))
+                if hasattr(b, "sigma_c_odd_kij"):
+                    fields["sigma_c_odd_kij"] = (
+                        None if (b.sigma_c_odd_kij is None or not keep_odd) else
+                        jnp.take(b.sigma_c_odd_kij, jnp.asarray(idx), axis=0))
+                if hasattr(b, "omega_ry"):
+                    fields["omega_ry"] = np.asarray(b.omega_ry)[idx]
+                return _replace_body(b, **fields)
+            far_bodies.append((union_ev[far_idx], _slice(body, far_idx, False)))
+            body = _slice(body, near_idx, True)
+        else:
+            body = compute_sigma_c_mpa_omega_grid(
+                wfns, fit_path, meta, mesh_xy, sigma_w_model=sigma_w_model,
+                fit_identity=fit_identity, fit_digest=fit_digest, **body_options)
     head_diag = None
     if head is not None:
         if iteration_head is None:
