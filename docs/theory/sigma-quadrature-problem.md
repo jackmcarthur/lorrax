@@ -99,8 +99,7 @@ pays each node once.
 
 ## 4. Product windows
 
-With a = f_e η (f_e = `sigma_window_edge_factor`, default 1.5),
-x = max(0, −min_A E_A), Λ_h = max_h|ω| + a + x over the branches of ω half h,
+With a and x fixed by the [window decision](sigma-windows-design.md), Λ_h = max_h|ω| + a + x over the branches of ω half h,
 and ν = a + x, each branch is partitioned into at most four Cartesian products
 (states × poles × |ω|); `gw.mpa.sigma_windows.sigma_pole_edges` owns Λ_h and ν:
 
@@ -130,10 +129,10 @@ and ν = a + x, each branch is partitioned into at most four Cartesian products
   relative box. Below ν only the excursion sliver crosses zero, over a box of
   size ~ν rather than ω_max + Ω_max (Na 8³ map 0: 1682 → 39 pairs; claim 2821).
   A branch with no state within a of zero (an insulator) keeps one bulk window.
-- **One Λ per half**, because the SC cover grows the upper half only; a global
+- **One Λ per half**, because the two sampled extents can differ; a global
   Λ put 7.9 Ry of poles into the lower half's crossing box on Na.
 
-Empty windows are dropped. Windows are never merged: a whole-branch rule
+Empty windows do no sweep work; the initial plan reserves their rules. Windows are never merged: a whole-branch rule
 widens cheap sign-definite tails into one expensive crossing box. On a metal
 the branch supports carry the occupation weights: a band belongs to the
 occupied branch at weight f when |f| clears the occupation window and to the
@@ -249,27 +248,9 @@ family, and the (window, τ) pair count is reported, never refused on.
 
 ## 9. Self-consistent maps
 
-A multi-map QSGW run carries a fixed-quadrature session. The first two
-planner calls (maps 0 and 1) use one-shot rules. The third freezes a rule set
-on its own boxes, each padded:
-
-- each real edge by the classification pad of the state that sets it,
-  0.5 eV + 0.10 |E − μ|, never across the window's own selector bound;
-- every pole extent by 10%;
-- a sign-definite edge toward zero at most to 5% of its distance from zero;
-- the zero-side edge of a tail window out to the selector's guaranteed gap
-  0.7a, which covers a state that enters the tail on a later map.
-
-Later maps reuse the frozen nodes while the current box is contained. Four
-events change that:
-
-- A window that escapes its box, changes currency, or did not exist at the
-  freeze is refit alone.
-- A factored-growth failure refits that window alone.
-- A metal ↔ insulator flip reinitializes the set.
-- A change of η or ε refuses.
-
-The receipt names every refit window and its reason.
+The [Sigma window decision](sigma-windows-design.md) owns support and
+immutable box geometry across SC maps, including the one convergence rebuild.
+This page owns the quadrature problem and its certificate currencies.
 
 ## 10. Cache, request scope and parallel planning
 

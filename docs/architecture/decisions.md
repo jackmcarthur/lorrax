@@ -560,11 +560,11 @@ keys themselves are in the [input reference](../input_reference.md).
 - **`sigma_stage_modes`** returns every mode the run dispatches Σ under, in
   order: the staged ladder when `config.sc.stages` exists, else the one
   `compute_mode`. A run-level refusal asks this, never the current stage.
-- **`LorraxConfig.omega_grid_ev`**: `n = floor((max − min)/step + 0.5) + 1`;
-  the Ry grid is derived by division. With `sigma_omega_patches_ev` the grid is
-  the union of patches built by the same formula, and `sigma_omega_min/max_ev`
-  become the patch hull. `DynamicSigmaConfig.parsed_omega_patches_ev` refuses
-  malformed, unsorted, overlapping or touching patches.
+- **`LorraxConfig.omega_grid_ev`** is contiguous and rounds the requested
+  upper edge outward to the sampling step. The one support owner,
+  `gw.qp_support`, joins it to the requested-state envelope under the
+  [window decision](../theory/sigma-windows-design.md). Patch-list grids
+  refuse by name.
 
 ### Screening
 
