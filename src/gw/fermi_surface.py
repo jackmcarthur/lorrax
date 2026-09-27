@@ -275,25 +275,29 @@ def star_symmetrize_weights(weights_kn, star_index):
 
 
 def metal_head_surface_weights(energies_kn, chemical_potential, *, sym, kgrid,
-                               nb_storage=None):
+                               bvec_cart, nb_storage=None):
     r"""Return the metallic head's Fermi-surface table ``Nk * w_kn``.
 
     ``w_kn`` is the star-covariant tetrahedron weight of
     ``integral delta(E_n(k) - mu) dk`` over the normalized zone, at the
-    fixed-N chemical potential: the point group's decomposition orbit
+    fixed-N chemical potential: the reciprocal lattice's decomposition orbit
     (:func:`tetrahedron_delta_weights`) followed by the star average
     (:func:`star_symmetrize_weights`), then averaged over each degenerate
     multiplet at BGW's TOL_Degeneracy.  The factor ``Nk`` matches the head
     contractions' uniform ``1/Nk``; ``N(E_F) = capacity * sum_kn w_kn``.
     Columns past ``energies_kn.shape[1]`` up to ``nb_storage`` are exact
     zeros.  Every metallic head route (the QSGW map, the frozen DFT head,
-    the one-shot head) takes its table here.
+    the one-shot head) takes its table here. ``bvec_cart`` has reciprocal
+    basis vectors as rows. The partition depends on this geometry and grid,
+    never on the WFN's stored operations; no symmetry of the integrand is
+    assumed by averaging quadrature partitions.
     """
     energies = np.asarray(energies_kn, dtype=np.float64)
+    from symmetry_maps import lattice_grid_point_group
     weights = tetrahedron_delta_weights(
         energies, np.asarray(sym.unfolded_kpts, dtype=np.float64),
         tuple(int(x) for x in kgrid), float(chemical_potential),
-        symmetry_matrices=np.asarray(sym.sym_mats_k))
+        symmetry_matrices=lattice_grid_point_group(bvec_cart, kgrid))
     weights = star_symmetrize_weights(weights, np.asarray(sym.irr_idx_k))
     # One weight per degenerate multiplet: the Drude tensor contracts the
     # multiplet trace, which is basis invariant only for a common weight.

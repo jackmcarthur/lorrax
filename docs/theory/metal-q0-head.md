@@ -35,6 +35,11 @@ $$
 
 $w_s$ is the star-covariant tetrahedron weight of $\delta(E-\mu)$ times $N_k$
 (`fermi_surface.metal_head_surface_weights`), so $\sum_sW_s=N(E_F)/\Omega\equiv N_0$.
+The tetrahedron partition averages the grid-preserving reciprocal-lattice
+point group supplied by `symmetry_maps.lattice_grid_point_group`. It is the
+same quadrature for a reduced or identity-only WFN. This averages integration
+partitions, without asserting extra symmetries of the magnetic state or
+projecting its response tensor.
 The limits are exact for any Fermi surface:
 
 | limit | CC | CT | TT |
