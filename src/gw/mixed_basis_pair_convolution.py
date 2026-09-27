@@ -1379,7 +1379,20 @@ class MixedBasisPairConvolution:
         return fns
 
     # ------------------------------------------------------------------ call
-    def __call__(self, A, C, *, A_partner=None, C_partner=None, timings: dict | None = None):
+    def tables(self) -> dict:
+        """Every device table a call reads, as one pytree.
+
+        A caller that traces this plan inside its own program passes them back as
+        ``tables=`` (an argument of that program): multi-process JAX refuses to close over
+        a global array (the Σ executor's window runs the plane-wave τ body inside one
+        executable, ``gw.plane_wave_pipeline``)."""
+        return dict(dev=self._dev, exp=self._dev_exp, k=self._dev_k, q=self._dev_q,
+                    qmid=self._dev_qmid, ocell=self._dev_ocell, ocell_mid=self._dev_ocell_mid,
+                    qrows=self._dev_qrows, c2p=self._dev_c2p,
+                    rebuild=getattr(self, "_dev_rebuild", None))
+
+    def __call__(self, A, C, *, A_partner=None, C_partner=None, timings: dict | None = None,
+                 tables: dict | None = None):
         import time
 
         def mark(name, x, t0):
@@ -1431,23 +1444,24 @@ class MixedBasisPairConvolution:
         t0 = mark("slab", slabs, t0)
         T = self._zeros_T()
         t0 = mark("alloc", T, t0)
-        d = self._dev
+        tb = self.tables() if tables is None else tables
+        d = tb["dev"]
         for j in range(self.chunks.n_c):
             jj = jnp.asarray(j, jnp.int32)
             H = []
-            for (s, st), fns, de in zip(slabs, self._expand, self._dev_exp):
+            for (s, st), fns, de in zip(slabs, self._expand, tb["exp"]):
                 v = st is not None
                 H.append(fns[v](s, s if st is None else st, jj, *de[v]))
             t0 = mark("expand", H, t0)
-            T = self._middle(H[0], H[1], T, jj, self._dev_k, self._dev_qmid, self._dev_qrows,
-                             self._dev_ocell_mid, d[0]["csrc"], d[0]["mph"], d[0]["spin"],
+            T = self._middle(H[0], H[1], T, jj, tb["k"], tb["qmid"], tb["qrows"],
+                             tb["ocell_mid"], d[0]["csrc"], d[0]["mph"], d[0]["spin"],
                              d[1]["csrc"], d[1]["mph"], d[1]["spin"])
             del H
             t0 = mark("middle", T, t0)
         if self._wt is not None:
-            T = self._rebuild(T, *self._dev_rebuild)
+            T = self._rebuild(T, *tb["rebuild"])
             t0 = mark("rebuild", T, t0)
-        X = self._final(T, self._dev_q, self._dev_ocell, self._dev_c2p)
+        X = self._final(T, tb["q"], tb["ocell"], tb["c2p"])
         mark("final", X, t0)
         return X
 

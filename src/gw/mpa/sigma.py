@@ -1430,20 +1430,29 @@ class MemoryPoleSource:
     store keeps only the logical extent and its reads zero-fill the padding.
     Batches are device slices of the resident fields.  Nothing is gathered,
     copied to host, or written.
+
+    ``axis``: a ``runtime.padding.PaddedAxis`` naming the operator extent
+    when it is not the centroid axis -- the plane-wave response sphere
+    (``gw.plane_wave_screening.SphereScreening.axis``).
+    ``q_wedge``: the carrier the executor wraps each residue batch in
+    (``dataclasses.replace(q_wedge, values=None, load=None,
+    trs_rule="pair_transpose").with_load(mesh)``, then ``values=B``): the ISDF
+    ``QirrOperator``, or the plane-wave ``SphereResidues`` whose load is the
+    pair convolution's tables (its τ body reads W on the q-IBZ through them).
     """
 
-    def __init__(self, Omega_p, B_p, B_odd_p=None, *, n_mu_logical, mesh_xy,
-                 provenance, q_wedge=None):
+    def __init__(self, Omega_p, B_p, B_odd_p=None, *, n_mu_logical=None, mesh_xy,
+                 provenance, q_wedge=None, axis=None):
         from runtime.padding import padded_mu_extent
         shape = tuple(int(n) for n in Omega_p.shape)
-        n_mu = int(n_mu_logical)
+        n_mu = int(axis.logical if n_mu_logical is None else n_mu_logical)
         if len(shape) != 4 or tuple(B_p.shape) != shape or (
                 B_odd_p is not None and tuple(B_odd_p.shape) != shape):
             raise ValueError(
                 "MemoryPoleSource: Omega/B/B_odd must share one "
                 f"(n_p, n_q, mu, nu) shape; got {shape}, {tuple(B_p.shape)}, "
                 f"{None if B_odd_p is None else tuple(B_odd_p.shape)}")
-        n_pad = int(padded_mu_extent(n_mu, mesh_xy))
+        n_pad = int(padded_mu_extent(n_mu, mesh_xy) if axis is None else axis.carrier)
         if shape[2:] != (n_pad, n_pad):
             raise ValueError(
                 f"MemoryPoleSource: mu extent {shape[2:]} is not the store's "
@@ -1461,7 +1470,8 @@ class MemoryPoleSource:
         self.ledger = {
             "n_p": shape[0], "n_q": shape[1], "n_mu": n_mu,
             "ordered_residues": B_odd_p is not None,
-            "q_storage": "full" if q_wedge is None else "ibz", "energy_unit": "Ry",
+            "q_storage": "full" if q_wedge is None and axis is None else "ibz",
+            "energy_unit": "Ry",
             "provenance": dict(provenance),
         }
 
@@ -1504,6 +1514,7 @@ def integrate_sigma_store(
     band_counts=None,
     odd_residue_off=False,
     tau_capacity=None,
+    tau_kernel_factory=None,
     print_fn=print,
 ):
     """Read, unfold, consume, and release one pole range at a time.
@@ -1520,6 +1531,10 @@ def integrate_sigma_store(
     disjoint slices.  The spatial kernel then returns a leading bracket axis;
     this executor inserts omega behind it and cumulatively sums the brackets
     before returning.  ``None`` preserves the ordinary MPA rank-4 result.
+
+    ``tau_kernel_factory`` replaces the resident pole route's τ body (the
+    plane-wave path's ``get_shared_sigma_tau_kernel(_sigma_kij=...)``); see
+    :func:`_integrate_sigma_batches`.
     """
     batch_size = _bounded_pole_batch_size(pole_batch_size)
 
@@ -1540,7 +1555,8 @@ def integrate_sigma_store(
             wfns, batches(reader), int(n_poles), plan, omega_grid_ry, meta,
             mesh_xy, pole_batch_size=batch_size, brackets=brackets,
             band_counts=band_counts, odd_residue_off=odd_residue_off,
-            q_wedge=q_wedge, tau_capacity=tau_capacity, print_fn=print_fn)
+            q_wedge=q_wedge, tau_capacity=tau_capacity,
+            tau_kernel_factory=tau_kernel_factory, print_fn=print_fn)
 
     if isinstance(fit_src, (PoleReader, MemoryPoleSource)):
         return run(fit_src)
@@ -1631,6 +1647,7 @@ def compute_sigma_c_mpa_omega_grid(
     analytic_line=False,
     sector_context=None,
     odd_reference=True,
+    tau_kernel_factory=None,
     print_fn=print,
 ):
     """Read a fitted MPA store, derive its windows, and compute Sigma_c.
@@ -1657,10 +1674,20 @@ def compute_sigma_c_mpa_omega_grid(
     partition.  They change neither pole interpretation nor window planning.
     ``analytic_line`` is the PPM request for its real-pole crossing windows;
     the planner validates the pole and denominator geometry before using it.
+    ``tau_kernel_factory`` (the pole route only): the τ body another spatial
+    basis supplies, ``factory(w_synthesis, sigma_axis) -> tau_kernel`` with
+    the resident route's signature -- the plane-wave path
+    (``gw.plane_wave_pipeline``) passes ``get_shared_sigma_tau_kernel`` over
+    its own ``_sigma_kij``.  The planner, the windows and the accumulator
+    are unchanged.
     """
     if sigma_w_model not in ("mpa", "shared_pole"):
         raise ValueError(f"sigma_w_model must be mpa or shared_pole; got {sigma_w_model!r}")
     shared_pole = sigma_w_model == "shared_pole"
+    if shared_pole and tau_kernel_factory is not None:
+        raise ValueError(
+            "compute_sigma_c_mpa_omega_grid: tau_kernel_factory serves the pole "
+            "route; a shared-pole model passes its sector kernel through sector_context")
     fixed_pole_support_ry = None
     if shared_pole:
         from file_io.shared_pole_store import open_shared_pole_model, validate_shared_pole_model
@@ -1886,6 +1913,7 @@ def compute_sigma_c_mpa_omega_grid(
                     pole_batch_size=pole_batch_size, brackets=band_brackets,
                     band_counts=band_counts,
                     tau_capacity=geometry.get("sc_tau_capacity"),
+                    tau_kernel_factory=tau_kernel_factory,
                     print_fn=print_fn)
         # odd_reference=False: the caller builds its own D=0 reference (the GN
         # arm does, in ppm_pipeline), so a second twin here would be a whole
@@ -1901,6 +1929,7 @@ def compute_sigma_c_mpa_omega_grid(
             wfns, reader, n_poles, plan, omega_grid_ry, meta, mesh_xy,
             pole_batch_size=pole_batch_size, brackets=band_brackets,
             band_counts=band_counts, odd_residue_off=True,
+            tau_kernel_factory=tau_kernel_factory,
             print_fn=lambda *args, **kwargs: None)
         return _attach_ordered_odd_sigma(total, even)
 
