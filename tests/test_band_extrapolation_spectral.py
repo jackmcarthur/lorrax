@@ -1,18 +1,12 @@
 """Gates for the spectrum-resolved shell estimator (``spectral_shell``).
 
-THE LOAD-BEARING ONES ARE THE TWO AT THE TOP.  Everything else here is a
-property test on arithmetic; those two are the reason the estimator is
-allowed to be the default:
-
-  * :func:`test_reproduces_the_measured_s508_table` — the estimator's error
-    against a MEASURED ``S(508)``, a number BerkeleyGW computed, on the
-    508-band Si 50 Ry arm.  Held out: no part of it was fitted.  It is
-    skipped rather than failed when the arm is not on disk (``$SCRATCH`` is
-    purge-eligible), and the skip says so by name.
-  * :func:`test_band_index_only_is_the_incumbent_estimator_untouched` — the
-    rename changed nothing.  ``band_index_only`` must produce the same
-    numbers, from the same code, as the default did before this estimator
-    existed.
+THE LOAD-BEARING ONE IS AT THE TOP.  Everything else here is a property
+test on arithmetic; :func:`test_reproduces_the_measured_s508_table` is the
+reason the estimator is the default: its error against a MEASURED
+``S(508)``, a number BerkeleyGW computed, on the 508-band Si 50 Ry arm.
+Held out: no part of it was fitted.  It is skipped rather than failed when
+the arm is not on disk (``$SCRATCH`` is purge-eligible), and the skip says
+so by name.
 
 The rest gate the rulings: β is per-state, the ladder is DFT-only, failure is
 a named refusal and never a clip, ``N_T`` is the finite basis, and the
@@ -53,12 +47,11 @@ S508_RUN = "/pscratch/sd/j/jackm/si_bandtail50_20260816"
 S508_PROTO = ("/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/"
               "reports/band_tail_exponent_50ry_2026-08-16/scripts")
 
-#: The published table, ``N_max -> (band_index_only, spectral_shell)`` median
-#: |error| against the MEASURED S(508), meV, over the 28 Fermi-window states.
-#: Quoted in ``gw.band_extrapolation``'s module docstring and in
-#: ``docs/input_reference.md``; this is the only place it is CHECKED.
-S508_TABLE = {152: (45.8, 4.7), 204: (29.7, 14.7), 260: (17.5, 12.5),
-              296: (12.6, 0.7), 396: (3.5, 0.0)}
+#: The published table, ``N_max -> spectral_shell`` median |error| against
+#: the MEASURED S(508), meV, over the 28 Fermi-window states.  Quoted in
+#: ``gw.band_extrapolation``'s module docstring; this is the only place it is
+#: CHECKED.
+S508_TABLE = {152: 4.7, 204: 14.7, 260: 12.5, 296: 0.7, 396: 0.0}
 
 
 # ---------------------------------------------------------------------------
@@ -172,7 +165,7 @@ def _points_from_power_law(ladder, counts, beta, amp, base=1.0):
             f"reports/spectral_shell_band_extrapolation_2026-08-17/scripts/"
             f"reference_table.py, which reads the same arm."))
 def test_reproduces_the_measured_s508_table():
-    """Both estimators, scored against a number BerkeleyGW computed.
+    """The estimator, scored against a number BerkeleyGW computed.
 
     ``S(508)`` is a MEASURED partial sum, not a fit and not a model, so an
     estimator predicting it from ``N_max < 508`` is being graded on data it
@@ -191,7 +184,6 @@ def test_reproduces_the_measured_s508_table():
     sys.path.insert(0, S508_PROTO)
     try:
         from arms import Arm
-        from predict508 import fit_model
     finally:
         sys.path.remove(S508_PROTO)
     import h5py
@@ -207,8 +199,7 @@ def test_reproduces_the_measured_s508_table():
     assert ladder.r2 > 0.999, f"Weyl R^2 = {ladder.r2}"
 
     keys = arm.FERMI
-    for nmax, (want_1n, want_sp) in zip((150, 200, 250, 300, 400),
-                                        S508_TABLE.values()):
+    for nmax, want_sp in zip((150, 200, 250, 300, 400), S508_TABLE.values()):
         n = arm.rung(nmax)["n"]
         counts = arm.counts_of_total(n, (0.80, 0.90))
         S = np.empty((3, len(keys)))
@@ -222,15 +213,9 @@ def test_reproduces_the_measured_s508_table():
         fit = fit_band_extrapolation_spectral(counts, S, ladder)
         assert fit.n_failed == 0, fit.failure_report()
         got_sp = float(np.median(np.abs(np.real(fit.s_inf) - truth))) * 1e3
-        got_1n = float(np.median([
-            abs(fit_model(counts, S[:, j], 1.0) - truth[j]) * 1e3
-            for j in range(len(keys))]))
         assert round(got_sp, 1) == want_sp, (
             f"N_max {n}: spectral_shell median |err| {got_sp:.3f} meV, "
             f"published {want_sp}")
-        assert round(got_1n, 1) == want_1n, (
-            f"N_max {n}: band_index_only median |err| {got_1n:.3f} meV, "
-            f"published {want_1n}")
         b = np.asarray(fit.beta)
         assert 3.0 < float(np.median(b)) < 5.5, (
             f"beta median {np.median(b)} outside the measured 3.4-5.3 band; "
@@ -238,35 +223,28 @@ def test_reproduces_the_measured_s508_table():
 
 
 # ---------------------------------------------------------------------------
-#  (2)  THE RENAME CHANGED NOTHING
+#  (2)  THE RETIRED 1/N VALUE REFUSES BY NAME
 # ---------------------------------------------------------------------------
 
-def test_band_index_only_is_the_incumbent_estimator_untouched():
-    """``band_index_only`` IS ``fit_band_extrapolation``, not a copy of it.
+def test_band_index_only_refuses_by_name():
+    """Owner ruling 2026-09-27: the 1/N fit is deleted, and a deck naming it
+    must refuse by name, not fall through to the typo message or run the
+    default."""
+    from gw.gw_config import DynamicSigmaConfig
 
-    The rename must not have forked the code.  Selecting it must reach the
-    same function, produce the same intercept, and produce the SAME three
-    scalar weights the previous default applied to the Σ cube — which is what
-    makes the byte-identity claim on a real deck a claim about arithmetic
-    rather than about luck.
-    """
-    from gw.band_extrapolation import (
-        extrapolation_weights, fit_band_extrapolation)
-
-    assert BAND_EXTRAPOLATION_ESTIMATORS == (
-        "spectral_shell", "band_index_only")
+    assert BAND_EXTRAPOLATION_ESTIMATORS == ("spectral_shell",)
     assert BAND_EXTRAPOLATION_ESTIMATOR_DEFAULT == "spectral_shell"
+    kw = dict(omega_min_ev=-5.0, omega_max_ev=5.0, omega_step_ev=0.1,
+              regularization_ev=0.1, window_edge_factor=1.0,
+              fermi_reference="midgap",
+              sigma_at_dft_energies=False)
+    with pytest.raises(ValueError) as exc:
+        DynamicSigmaConfig(band_extrapolation_estimator="band_index_only",
+                           **kw)
+    msg = str(exc.value)
+    assert "band_index_only is retired" in msg
+    assert "2026-09-27" in msg and "spectral_shell" in msg
 
-    rng = np.random.default_rng(2026)
-    counts = (100, 112, 124)
-    S = rng.normal(size=(3, 5, 7)) + 1j * rng.normal(size=(3, 5, 7))
-    fit = fit_band_extrapolation(counts, S)
-    w = extrapolation_weights(counts)
-    assert w.shape == (3,), "the incumbent's weights are three SCALARS"
-    assert w.dtype == np.float64
-    # The weights ARE the fit: same operator, two entry points.
-    assert np.allclose(np.tensordot(w, S, axes=(0, 0)), fit.s_inf, atol=0,
-                       rtol=1e-13)
 
 
 def test_the_deck_key_defaults_to_spectral_shell_and_refuses_a_typo():

@@ -37,13 +37,25 @@ from common.band_degeneracy import (
 from common.units import RYD_TO_EV
 from gw.band_extrapolation import (
     BandExtrapolationRefused,
-    extrapolation_h5_payload,
-    fit_band_extrapolation,
-    format_extrapolation_report,
+    build_band_ladder,
+    fit_band_extrapolation_spectral,
+    format_spectral_report,
     plan_band_brackets,
     trivial_plan,
-    trust_verdict,
 )
+
+
+def _spectral_fit(counts, S):
+    """The shipped estimator on a free-electron ladder of 200 DFT bands.
+
+    For the tests of the rulings the fit feeds (SC tolerance, static tail,
+    report notes).  ``-1 + 30/N`` data gives β ≈ 3 and a tail of about
+    0.5 eV at N₃ ≈ 50.
+    """
+    n = np.arange(1, 201, dtype=np.float64)
+    enk_ry = ((-6.0 + 3.0 * n ** (2.0 / 3.0)) / RYD_TO_EV)[None, :]
+    ladder = build_band_ladder(enk_ry=enk_ry, kweights=None, n_target=400)
+    return fit_band_extrapolation_spectral(counts, S, ladder)
 
 
 # ---------------------------------------------------------------------------
@@ -438,8 +450,8 @@ def test_unsnappable_interior_cut_falls_back_instead_of_refusing():
     assert "36" in joined, "the note must name the cut it kept"
     # And the report block carries it, so it reaches the log either way.
     N = np.asarray(plan.counts, dtype=float)
-    fit = fit_band_extrapolation(N, (-1.0 + 30.0 / N)[:, None, None])
-    assert "NOTE:" in format_extrapolation_report(plan, fit)
+    fit = _spectral_fit(plan.counts, (-1.0 + 30.0 / N)[:, None, None])
+    assert "NOTE:" in format_spectral_report(plan, fit)
 
 
 def test_snapping_never_starves_a_later_cut():
@@ -707,326 +719,8 @@ def test_dispatch_AUTO_DISABLES_a_defaulted_key_on_a_non_ppm_mode():
 
 
 # ---------------------------------------------------------------------------
-#  the fit
-# ---------------------------------------------------------------------------
-
-def test_fit_recovers_an_exact_two_parameter_tail():
-    N = np.array([52, 76, 100])
-    s_inf, A = -1.25 + 0.3j, 40.0 - 2.0j
-    S = s_inf + A / N[:, None, None]
-    fit = fit_band_extrapolation(N, S)
-    assert np.allclose(fit.s_inf, s_inf, atol=1e-12)
-    assert np.allclose(fit.amplitude, A, atol=1e-10)
-    # On an EXACT 1/N series every pairwise intercept is the same number, so
-    # the curvature diagnostic must be zero and the tail must be the real
-    # remaining correction.
-    assert float(np.max(np.abs(fit.delta_model))) < 1e-11
-    assert np.allclose(fit.delta_tail, np.abs(A / N[-1]), atol=1e-11)
-    assert float(np.max(np.abs(fit.residual))) < 1e-11
-    assert "consistent" in trust_verdict(fit)
-    # The two SIGNED one-sided diagnostics.  On an exact series the pairwise
-    # intercepts coincide, so their signed difference is zero; A/N3 is the
-    # correction still being applied at the last point and is NOT zero — that
-    # asymmetry is the whole reason both are reported.
-    assert np.allclose(fit.pair_split, 0.0, atol=1e-11)
-    assert np.allclose(fit.a_over_n_last, A / N[-1], atol=1e-11)
-
-
-def test_the_signed_diagnostics_see_what_delta_model_cannot():
-    """``pair_split`` keeps the sign ``delta_model`` throws away.
-
-    Two curves whose preasymptotic bias runs in OPPOSITE directions have the
-    same |Δ_model| and must be distinguishable.  This is the property the
-    2026-08-15 measurement turned on: on a clean BerkeleyGW curve Δ_model was
-    18.8 meV with a ``consistent`` verdict while the true error was 55 meV
-    MAE — a bias all three points shared, which a scatter metric cannot see.
-    """
-    # S = S_inf + A/N +- B/N^2: the SAME 1/N series with the curvature term
-    # flipped.  Δ_model is identical between the two by construction, which
-    # is exactly the blindness being demonstrated.
-    N = np.array([80.0, 88.0, 100.0])
-    curved = [fit_band_extrapolation(N, (-1.0 + 30.0 / N + B / N ** 2)[:, None])
-              for B in (+400.0, -400.0)]
-    over, under = curved
-    assert np.allclose(over.delta_model, under.delta_model), \
-        "the fixture must give the two the SAME scatter, or it proves nothing"
-    assert np.sign(over.pair_split) != np.sign(under.pair_split), \
-        "pair_split must distinguish over- from under-correction"
-    # ...and the two intercepts really do land on opposite sides of the
-    # unperturbed answer, so the sign is reporting something true.
-    assert float(over.s_inf[0]) < -1.0 < float(under.s_inf[0])
-    # ``at()`` must carry the derived properties through, since they are the
-    # per-state numbers the log prints.
-    f1 = over.at((0,))
-    assert np.shape(f1.pair_split) == ()
-    assert np.allclose(f1.a_over_n_last, f1.amplitude / N[-1])
-
-
-def test_pairwise_intercepts_are_the_closed_form_two_point_solution():
-    N = np.array([52.0, 76.0, 100.0])
-    S = np.array([-1.0, -0.8, -0.7])[:, None]
-    fit = fit_band_extrapolation(N, S)
-    for i, j in ((0, 1), (1, 2), (0, 2)):
-        expect = (N[j] * S[j] - N[i] * S[i]) / (N[j] - N[i])
-        assert np.allclose(fit.pair_s_inf[(i, j)], expect)
-
-
-def test_sign_reversal_is_called_out():
-    N = np.array([52.0, 76.0, 100.0])
-    S = np.array([-1.0, -0.5, -0.9])[:, None]      # non-monotone in 1/N
-    fit = fit_band_extrapolation(N, S)
-    assert "NOT TRUSTWORTHY" in trust_verdict(fit)
-
-
-def test_uncertainty_is_a_fraction_of_the_applied_correction():
-    """The bar scales with Delta_tail, and p99 is wider than p90.
-
-    It is an ENVELOPE, not a per-state bar: no per-state predictor works
-    (R^2 <= 0 for A/N3, Delta_model, pair_split and Delta_tail alike at the
-    shipped fractions), so what is asserted here is the contract — the bar
-    is a fraction of the correction actually applied, and it vanishes when
-    the correction does.
-    """
-    from gw.band_extrapolation import TAIL_UNCERTAINTY_FRACTION
-    p90, p99 = TAIL_UNCERTAINTY_FRACTION
-    assert 0.0 < p90 < p99 < 1.0, "a bar wider than the correction is useless"
-
-    N = np.array([100.0, 108.0, 124.0])
-    for A in (30.0, 60.0):
-        fit = fit_band_extrapolation(N, (-1.0 + A / N)[:, None])
-        assert np.allclose(fit.uncertainty("p90"), p90 * np.abs(fit.delta_tail))
-        assert np.allclose(fit.uncertainty("p99"), p99 * np.abs(fit.delta_tail))
-    # Doubling the tail doubles the bar — the bar is a scale on the
-    # correction, not an additive constant.
-    f1 = fit_band_extrapolation(N, (-1.0 + 30.0 / N)[:, None])
-    f2 = fit_band_extrapolation(N, (-1.0 + 60.0 / N)[:, None])
-    assert np.allclose(f2.uncertainty(), 2.0 * f1.uncertainty())
-    # A converged sum gets a zero bar rather than a floor.
-    flat = fit_band_extrapolation(N, np.full((3, 1), -1.0))
-    assert np.allclose(flat.uncertainty(), 0.0)
-
-
-def test_fit_refuses_anything_but_three_points():
-    """Two points must be refused AT THE FIT, not at whoever indexes it.
-
-    The fit itself is well posed on two points, so the old ``>= 2`` guard let
-    a two-point call construct successfully; every consumer then died with
-    ``KeyError((1, 2))`` because ``pair_split``, ``trust_verdict``, the log
-    block and the h5 payload all name that pair.  Verified 2026-08-16 on the
-    pre-fix code: the construction succeeded and returned s_inf = -2.0333.
-    """
-    S2 = np.array([[-1.0], [-1.2]])
-    with pytest.raises(ValueError, match="exactly 3 counts"):
-        fit_band_extrapolation([100, 124], S2)
-    with pytest.raises(ValueError, match="exactly 3 counts"):
-        fit_band_extrapolation([100, 108, 116, 124], np.full((4, 1), -1.0))
-    # and the supported arity still builds every consumer without raising
-    N3 = np.array([100.0, 108.0, 124.0])
-    fit = fit_band_extrapolation(N3, (-1.0 + 30.0 / N3)[:, None])
-    assert np.isfinite(np.real(fit.pair_split)).all()
-    assert isinstance(trust_verdict(fit), str)
-
-
-def test_report_carries_full_band_and_extrapolated_side_by_side():
-    e = _si_like_spectrum()
-    nb = e.shape[1]
-    plan = plan_band_brackets(
-        enabled=True, enk_ry=e, n_occ=2, nb_logical=nb, nb_padded=nb)
-    N = np.asarray(plan.counts, dtype=float)
-    # (3, nk, nb) — the shape the driver actually fits, so a per-state index
-    # is a genuine 2-axis address.  A (3, 1, 1) stand-in hid a real defect:
-    # `ExtrapolationFit.at((k, n))` spliced the tuple wrong and returned a
-    # (3, 2) array, which only fails when nb > 1.
-    nk_t, nb_t = 4, 6
-    rng = np.random.default_rng(7)
-    S = ((-1.0 + 30.0 / N)[:, None, None]
-         + 0.01 * rng.standard_normal((1, nk_t, nb_t)))
-    fit = fit_band_extrapolation(N, S)
-    assert np.shape(fit.at((2, 3)).s_at_counts) == (3,), \
-        "at((k, n)) must reduce the state axes to a scalar per point"
-    text = format_extrapolation_report(
-        plan, fit, states=[("VBM k=2 n=3", (2, 3))])
-    for needle in ("N1 =", "N2 =", "N3 =", "S_inf", "S(N3)", "A =",
-                   "S_inf^(12)", "S_inf^(23)", "S_inf^(13)",
-                   "Delta_tail", "Delta_model", "verdict",
-                   "VBM k=2 n=3", "envelope",
-                   # the SIGNED one-sided diagnostics, and the legend that
-                   # says what each of the three can and cannot see — the
-                   # verdict line is what an operator reads, so a
-                   # necessary-but-not-sufficient "consistent" has to say so
-                   # where it is read
-                   "pair_split", "A/N3", "SCATTER", "blind",
-                   "necessary, not sufficient",
-                   # the extrapolation uncertainty, and the label that keeps it
-                   # separate from "difference from BerkeleyGW"
-                   "(p90)", "(p99)", "EXTRAPOLATION uncertainty only",
-                   "ENVELOPE"):
-        assert needle in text, f"report is missing {needle!r}"
-    assert "TOTAL band count" in text, \
-        "the report must say the fractions are of the total, not of n_cond"
-    for c in plan.counts:
-        assert str(c) in text
-    # The named-state row must carry BOTH the full-band value and the
-    # extrapolated one, side by side, on one line — that is the output
-    # requirement, not a formatting preference.
-    side_by_side = [ln for ln in text.splitlines()
-                    if "full" in ln and "S_inf =" in ln]
-    assert side_by_side, "no line carries S(N3) and S_inf side by side"
-
-
-# ---------------------------------------------------------------------------
-#  PERSISTENCE — the feature must reach an artifact, not only a log line
-# ---------------------------------------------------------------------------
-
-def _extrap_fit_and_plan(nk=6, nb=5):
-    """A plan + fit with a real (nk, nb) state shape, as the driver has."""
-    e = _si_like_spectrum()
-    plan = plan_band_brackets(
-        enabled=True, enk_ry=e, n_occ=2,
-        nb_logical=e.shape[1], nb_padded=e.shape[1])
-    N = np.asarray(plan.counts, dtype=float)
-    rng = np.random.default_rng(11)
-    S = ((-1.0 + 30.0 / N)[:, None, None]
-         + 0.01 * rng.standard_normal((1, nk, nb)))
-    return plan, fit_band_extrapolation(N, S)
-
-
-def test_payload_carries_the_fit_and_its_provenance():
-    from gw.band_extrapolation import (
-        EXTRAP_DATASETS, extrapolation_h5_payload)
-    plan, fit = _extrap_fit_and_plan()
-    pay = extrapolation_h5_payload(plan, fit)
-    assert set(pay["arrays"]) == set(EXTRAP_DATASETS)
-    for name, arr in pay["arrays"].items():
-        assert np.shape(arr) == (6, 5), f"{name} lost the (nk, nb) shape"
-    assert np.allclose(pay["arrays"]["sigma_c_extrap_inf_kn_ev"], fit.s_inf)
-    assert np.allclose(pay["arrays"]["sigma_c_extrap_last_kn_ev"],
-                       fit.s_at_counts[-1])
-    a = pay["attrs"]
-    # The provenance a reader needs to interpret the number without the log.
-    assert list(a["band_counts"]) == list(plan.counts)
-    assert "consistent" in a["verdict"] or "TRUSTWORTHY" in a["verdict"]
-    assert len(a["uncertainty_fraction_p90_p99"]) == 2
-    assert "planner_notes" in a, "a snap fallback must be readable from the file"
-    assert "band_extrapolation_bracket_scheme" not in a, \
-        "the default artifact stays byte-compatible"
-
-
-def test_conduction_scheme_payload_does_not_claim_total_band_fractions():
-    e = np.tile(np.arange(40, dtype=float) ** 2, (2, 1))
-    plan = plan_band_brackets(
-        enabled=True, enk_ry=e, n_occ=10, nb_logical=40, nb_padded=40,
-        bracket_scheme="conduction_energy_midpoint")
-    N = np.asarray(plan.counts, dtype=float)
-    fit = fit_band_extrapolation(N, (-1.0 + 30.0 / N)[:, None])
-    attrs = extrapolation_h5_payload(plan, fit)["attrs"]
-    assert attrs["band_extrapolation_bracket_scheme"] == \
-        "conduction_energy_midpoint"
-    assert np.allclose(attrs["bracket_boundary_mean_energy_ev"],
-                       plan.boundary_mean_energy_ev)
-    assert np.asarray(attrs["bracket_fractions"]).size == 0, \
-        "0.80/0.90 would be false provenance for the conduction scheme"
-
-
-def test_sinf_reaches_sigma_mnk_h5_and_off_vs_on_differ(tmp_path):
-    """THE ANTI-VACUITY GATE.
-
-    Before 2026-08-15 a run with the feature ON and one with it OFF wrote
-    byte-identical artifacts -- every dataset of ``sigma_mnk.h5`` identical
-    to 8e-15 -- while the log reported an 848 meV correction.  Any test of
-    the extrapolated Sigma therefore passed by measuring the
-    un-extrapolated cube.  This asserts the two files DIFFER, and that the
-    difference is the fit.
-    """
-    h5py = pytest.importorskip("h5py")
-    from file_io import write_sigma_omega_h5
-    from gw.band_extrapolation import (
-        EXTRAP_DATASETS, extrapolation_h5_payload)
-
-    n_omega, nk, nb = 3, 6, 5
-    rng = np.random.default_rng(5)
-
-    def c(*shape):
-        return (rng.standard_normal(shape)
-                + 1j * rng.standard_normal(shape)).astype(np.complex128)
-
-    omega = np.linspace(-2.0, 2.0, n_omega)
-    cube, sx, h = c(n_omega, nk, nb, nb), c(nk, nb, nb), c(nk, nb, nb)
-    plan, fit = _extrap_fit_and_plan(nk=nk, nb=nb)
-    pay = extrapolation_h5_payload(plan, fit)
-
-    paths = {}
-    for tag, extra in (("off", None), ("on", pay)):
-        p = str(tmp_path / f"sigma_mnk_{tag}.h5")
-        write_sigma_omega_h5(
-            p, omega, None, sigma_c_kij_ev=cube, sigma_sx_kij_ev=sx,
-            hartree_kij_ev=h, mesh=_mesh_1x1(), star=None,
-            band_extrapolation=extra)
-        paths[tag] = p
-
-    with h5py.File(paths["off"], "r") as f:
-        off = set(f.keys())
-    with h5py.File(paths["on"], "r") as f:
-        on = set(f.keys())
-        s_inf = np.asarray(f["sigma_c_extrap_inf_kn_ev"][()])
-        attrs = dict(f["sigma_c_extrap_inf_kn_ev"].attrs)
-
-    assert on - off == set(EXTRAP_DATASETS), (
-        f"feature ON must add exactly the fit datasets; added {sorted(on-off)}")
-    assert not (off - on), "feature ON must not drop anything"
-    assert np.allclose(s_inf, fit.s_inf), "S_inf did not survive the write"
-    # The un-extrapolated value is beside it, so the correction is a
-    # subtraction rather than a reconstruction.
-    with h5py.File(paths["on"], "r") as f:
-        last = np.asarray(f["sigma_c_extrap_last_kn_ev"][()])
-    assert not np.allclose(s_inf, last), \
-        "S_inf == S(N3) would mean no correction was applied at all"
-    assert "verdict" in attrs and "band_counts" in attrs, \
-        "a reader of the dataset alone must be able to tell if it was trusted"
-
-
-def test_extrap_datasets_are_registered_for_star_extraction():
-    """They must go through the SAME k extraction and stamp as the cubes.
-
-    The invariant that matters for S_inf is exact star covariance, and it is
-    only checkable on a persisted, stamped array.  A dataset absent from
-    SIGMA_K_AXIS is REFUSED by the extractor rather than written on a
-    guessed axis, so this also pins that they are never silently full-BZ in
-    a k_irr file.
-    """
-    # file_io pulls the wfn_loader import chain, which needs h5py; on a
-    # platform without it this cell is an ABSENCE, not a measurement.
-    pytest.importorskip("h5py")
-    from file_io.sigma_output import SIGMA_K_AXIS
-    from gw.band_extrapolation import EXTRAP_DATASETS
-    for name in EXTRAP_DATASETS:
-        assert SIGMA_K_AXIS.get(name) == 0, \
-            f"{name} must declare k on axis 0 (it is band-diagonal (nk, nb))"
-
-
-# ---------------------------------------------------------------------------
 #  the SC coupling: extrapolate Sigma, THEN diagonalize
 # ---------------------------------------------------------------------------
-
-def test_weights_reproduce_the_fit_intercept():
-    """``extrapolation_weights`` and ``fit_band_extrapolation`` are ONE estimator.
-
-    They have to be, because they are used in two different places for two
-    different purposes: the fit produces the number the LOG reports, and the
-    weights produce the Sigma that DRIVES the iteration.  If they ever drift
-    apart, the run reports one correction and applies another, and nothing
-    downstream can see the difference.
-    """
-    from gw.band_extrapolation import extrapolation_weights
-
-    N = np.array([100, 112, 124])
-    rng = np.random.default_rng(20260816)
-    S = (rng.normal(size=(3, 5, 7)) + 1j * rng.normal(size=(3, 5, 7)))
-    fit = fit_band_extrapolation(N, S)
-    w = extrapolation_weights(N)
-    got = np.tensordot(w, S, axes=(0, 0))
-    assert np.allclose(got, fit.s_inf, rtol=0, atol=1e-13), \
-        "the driving combination must BE the reported fit"
 
 
 def test_weights_are_real_and_affine():
@@ -1039,61 +733,6 @@ def test_weights_are_real_and_affine():
         assert w.dtype == np.float64, "complex weights would break Hermiticity"
         assert abs(float(w.sum()) - 1.0) < 1e-12, \
             "an affine combination: sum(c) == 1"
-
-
-def test_extrapolated_sigma_is_hermitian_to_machine_precision():
-    """The gate on "extrapolate Sigma, THEN diagonalize".
-
-    A real linear combination of Hermitian matrices is Hermitian EXACTLY --
-    not to a tolerance.  This is the property that makes the extrapolated
-    Sigma a legitimate static self-energy, and hence makes the next SC
-    iteration's eigenvectors consistent with its own eigenvalues.  The test
-    asserts BITWISE equality, not ``allclose``: anything less would pass on a
-    combination that had quietly acquired an imaginary part in its weights.
-    """
-    from gw.band_extrapolation import extrapolation_weights
-    from gw.ppm_pipeline import _extrapolated_point
-
-    rng = np.random.default_rng(816)
-    nk, nb = 3, 6
-    pts = []
-    for _ in range(3):
-        A = rng.normal(size=(nk, nb, nb)) + 1j * rng.normal(size=(nk, nb, nb))
-        H = 0.5 * (A + np.conj(np.swapaxes(A, -1, -2)))
-        # Make it EXACTLY Hermitian (the 0.5*(A+A^H) above already is, but
-        # pin it so the test measures the combination and not the input).
-        H = np.tril(H) + np.conj(np.swapaxes(np.tril(H, -1), -1, -2))
-        assert np.array_equal(H, np.conj(np.swapaxes(H, -1, -2)))
-        pts.append(H)
-    cube = np.stack(pts)
-
-    counts = [100, 112, 124]
-    out = np.asarray(_extrapolated_point(cube, extrapolation_weights(counts)))
-    assert np.array_equal(out, np.conj(np.swapaxes(out, -1, -2))), \
-        "the extrapolated Sigma must be Hermitian to the LAST BIT"
-
-
-def test_extrapolation_is_pad_band_inert():
-    """Mesh pad bands carry zero psi, hence zero Sigma, and must stay zero.
-
-    rCROP's pad-inertness check reads bit-for-bit zeros out of the carry.  A
-    weighted sum of exact zeros is an exact zero for any finite weights, but
-    this pins it rather than assuming it -- it is the one property of the
-    combination that rCROP actually depends on besides Hermiticity.
-    """
-    from gw.band_extrapolation import extrapolation_weights
-    from gw.ppm_pipeline import _extrapolated_point
-
-    nk, nb, n_real = 2, 6, 4
-    rng = np.random.default_rng(4)
-    cube = (rng.normal(size=(3, nk, nb, nb))
-            + 1j * rng.normal(size=(3, nk, nb, nb)))
-    cube[:, :, n_real:, :] = 0.0
-    cube[:, :, :, n_real:] = 0.0
-    out = np.asarray(
-        _extrapolated_point(cube, extrapolation_weights([100, 112, 124])))
-    assert np.all(out[:, n_real:, :] == 0.0)
-    assert np.all(out[:, :, n_real:] == 0.0)
 
 
 def test_eigenvalue_extrapolation_is_not_the_same_operation():
@@ -1172,8 +811,8 @@ def test_sc_tolerance_ruling_warns_when_the_tolerance_is_inside_the_bar():
     from gw.band_extrapolation import sc_tolerance_ruling, tolerance_bar_ev
 
     N = np.array([100, 112, 124])
-    # A correction of ~0.27 eV -> a p90 bar of ~40 meV at 15 %.
-    fit = fit_band_extrapolation(N, (-1.0 + 30.0 / N)[:, None])
+    # A correction of ~0.17 eV -> a p90 bar of ~25 meV at 15 %.
+    fit = _spectral_fit(N, (-1.0 + 30.0 / N)[:, None])
     med, mx = tolerance_bar_ev(fit)
     assert med > 0.0 and mx >= med
 
@@ -1200,7 +839,7 @@ def test_sc_tolerance_ruling_does_not_refuse():
     """
     from gw.band_extrapolation import sc_tolerance_ruling
     N = np.array([100, 112, 124])
-    fit = fit_band_extrapolation(N, (-1.0 + 30.0 / N)[:, None])
+    fit = _spectral_fit(N, (-1.0 + 30.0 / N)[:, None])
     inside, text = sc_tolerance_ruling(fit, 1.0e-9)
     assert inside is True
     assert isinstance(text, str) and text            # returned, not raised
@@ -1264,7 +903,7 @@ def test_mask_with_a_leading_nspin_axis_gives_the_same_bracketed_sum(brackets):
 
 def _fit_for_static_tests():
     N = np.array([42, 46, 52])
-    return N, fit_band_extrapolation(N, (-1.0 + 30.0 / N)[:, None])
+    return N, _spectral_fit(N, (-1.0 + 30.0 / N)[:, None])
 
 
 def test_a_constant_offset_moves_S_inf_and_nothing_else():
@@ -1281,15 +920,11 @@ def test_a_constant_offset_moves_S_inf_and_nothing_else():
     """
     N, fit = _fit_for_static_tests()
     C = 0.37
-    fit2 = fit_band_extrapolation(N, fit.s_at_counts + C)
-    assert np.max(np.abs((fit2.s_inf - fit.s_inf) - C)) < 1e-13
-    for nm, a, b in (("A", fit.amplitude, fit2.amplitude),
-                     ("delta_tail", fit.delta_tail, fit2.delta_tail),
-                     ("delta_model", fit.delta_model, fit2.delta_model),
-                     ("residual", fit.residual, fit2.residual)):
+    fit2 = _spectral_fit(N, fit.s_at_counts + C)
+    assert np.max(np.abs((fit2.s_inf - fit.s_inf) - C)) < 1e-12
+    for nm, a, b in (("beta", fit.beta, fit2.beta),
+                     ("delta_tail", fit.delta_tail, fit2.delta_tail)):
         assert np.max(np.abs(np.asarray(b) - np.asarray(a))) < 1e-12, nm
-    # ... and therefore the verdict cannot see it either.
-    assert trust_verdict(fit) == trust_verdict(fit2)
 
 
 def test_static_limit_ruling_is_silent_on_a_band_independent_term():
@@ -1330,7 +965,7 @@ def test_static_limit_ruling_measures_the_tail_it_omits():
         "the direct refutation of the 'band-count independent' claim that "
         "used to justify the bracket-0 fold in ppm_sigma.")
     # ESCALATION IS A COMPARISON, NOT A CONSTANT.  This fit's own correction is
-    # 30/N3 eV, so its p90 bar is 0.15*30/52 = 86.5 meV against a 17.3 meV
+    # ~0.5 eV, so its p90 bar is ~75 meV against a 17.3 meV
     # static tail -- the omission is real, measured, and SMALLER than the bar
     # the run already quotes, which is exactly the case that must NOT escalate.
     # The escalating case is covered separately below.
@@ -1385,7 +1020,7 @@ def test_static_limit_ruling_does_not_escalate_on_a_ratio_of_two_zeros():
         static_limit_tail_ruling, STATIC_LIMIT_TAIL_FLOOR_EV)
     N = np.array([62, 90, 100])
     # Three IDENTICAL points: the exact degenerate case observed.
-    fit = fit_band_extrapolation(N, np.full((3, 4), 1.088910))
+    fit = _spectral_fit(N, np.full((3, 4), 1.088910))
     assert float(np.max(np.abs(fit.delta_tail))) == 0.0
     C = np.stack([np.full((4,), -1e-9 * (1.0 + 1e-3 * i)) for i in range(3)])
     exceeds, text, stats = static_limit_tail_ruling(fit, C)

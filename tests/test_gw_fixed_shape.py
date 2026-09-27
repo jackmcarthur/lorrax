@@ -27,9 +27,14 @@ def test_postprocessing_executables_accept_changed_indices_and_weights():
     point = _band_count_kernel(None).lower(cube, jnp.int32(0)).compile()
     for index in (0, 2):
         np.testing.assert_array_equal(point(cube, jnp.int32(index)), np.asarray(cube)[index])
-    weights = jnp.asarray([0.5, -1.0, 1.5])
-    combine = _extrapolation_kernel(None).lower(cube, weights).compile()
+    # Per-state weights (3, nk, nb) on a (3, nw, nk, nb, nb) cube, applied as
+    # the symmetric mean 1/2(w_i + w_j).
+    cube5 = jnp.asarray(rng.normal(size=(3, 2, 3, 4, 4)) + 1j * rng.normal(size=(3, 2, 3, 4, 4)))
+    weights = jnp.asarray(rng.normal(size=(3, 3, 4)))
+    combine = _extrapolation_kernel(None).lower(cube5, weights).compile()
     for w in (weights, weights[::-1]):
-        np.testing.assert_allclose(combine(cube, w), np.tensordot(np.asarray(w), np.asarray(cube), axes=(0, 0)), rtol=3e-15, atol=3e-15)
+        wn = np.asarray(w)
+        wsym = 0.5 * (wn[:, :, :, None] + wn[:, :, None, :])
+        np.testing.assert_allclose(combine(cube5, w), np.sum(wsym[:, None] * np.asarray(cube5), axis=0), rtol=3e-15, atol=3e-15)
     assert _band_count_kernel(None) is _band_count_kernel(None)
     assert _extrapolation_kernel(None) is _extrapolation_kernel(None)

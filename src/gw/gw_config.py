@@ -197,6 +197,16 @@ class BispinorGWMode(str, enum.Enum):
     FULL_STATIC_COHSEX = "full_static_cohsex"
 
 
+#: Retired ``band_extrapolation_estimator`` values: {value: why}.
+_RETIRED_BAND_EXTRAPOLATION_ESTIMATORS: dict[str, str] = {
+    "band_index_only": (
+        "the two-parameter S_inf + A/N least squares was deleted by owner "
+        "ruling 2026-09-27 (\"get rid of band number only\").  Against the "
+        "accurate BANDTRUTH truth it was the worst estimator, 43 / 79 meV "
+        "median / max at N3 = 152 (sandbox claims 2860, 2866)."),
+}
+
+
 #: Retired ``bispinor_gw`` spellings: {value: (gate id, want, why)}.  ONE
 #: table so a retired value cannot be refused in one message shape here and
 #: another one three releases later.
@@ -1728,9 +1738,8 @@ _DEFAULTS = {
     # false" from "the deck said nothing", and only the former can turn the
     # feature off.
     "sigma_band_extrapolation": None,
-    # WHICH band-convergence estimator consumes the three bracket sums.
-    # Both read the SAME three points; they differ only in what they do with
-    # them, so this key costs nothing and changes no compute.
+    # WHICH band-convergence estimator consumes the three bracket sums.  One
+    # value is accepted; the key changes no compute.
     #
     #   spectral_shell   DEFAULT since 2026-08-17.  Solves one decay exponent
     #                    PER EXTERNAL STATE from the ratio of the two observed
@@ -1739,18 +1748,13 @@ _DEFAULTS = {
     #                    the finite plane-wave basis N_PW = min(ngk)*nspinor.
     #                    Held out against a MEASURED S(508) on the Si 50 Ry
     #                    508-band arm its median error is 4.7 / 14.7 / 12.5 /
-    #                    0.7 / 0.0 meV at N_max = 152 / 204 / 260 / 296 / 396,
-    #                    against 45.8 / 29.7 / 17.5 / 12.6 / 3.5 for the
-    #                    incumbent.  REFUSES BY NAME on a state whose two
-    #                    shells disagree in sign or whose exponent has no
-    #                    bracketed root -- it never clips and never
-    #                    substitutes.
-    #   band_index_only  The incumbent two-parameter S_inf + A/N least
-    #                    squares, under its honest name: the band INDEX is the
-    #                    only thing it looks at.  Kept, selectable, and
-    #                    bit-for-bit unchanged -- it is the same code path.
+    #                    0.7 / 0.0 meV at N_max = 152 / 204 / 260 / 296 / 396.
+    #                    A state with no usable exponent keeps S(N3); it never
+    #                    clips and never substitutes.
+    #   band_index_only  DELETED 2026-09-27 (owner ruling); refuses by name,
+    #                    see _RETIRED_BAND_EXTRAPOLATION_ESTIMATORS.
     #
-    # See gw.band_extrapolation's module docstring for both derivations, the
+    # See gw.band_extrapolation's module docstring for the derivation, the
     # held-out table and the owner rulings (beta is per-state and is never
     # pooled; the ladder comes from the DFT eigenvalues only).
     "band_extrapolation_estimator": BAND_EXTRAPOLATION_ESTIMATOR_DEFAULT,
@@ -4016,11 +4020,8 @@ class DynamicSigmaConfig:
     #: Did a deck NAME either spelling?  Selects between auto-disabling and
     #: refusing on a non-PPM mode; see :func:`resolve_band_extrapolation`.
     band_extrapolation_explicit: bool = False
-    #: WHICH estimator consumes the three bracket sums --
-    #: ``spectral_shell`` (default) or ``band_index_only``.  Read once, by
-    #: ``gw.ppm_pipeline``.  It selects nothing about the COMPUTE: both
-    #: estimators read the same three points the same brackets produce, so
-    #: this is a post-processing choice and switching it re-does no Sigma.
+    #: WHICH estimator consumes the three bracket sums -- ``spectral_shell``,
+    #: the only accepted value.  Read once, by ``gw.ppm_pipeline``.
     band_extrapolation_estimator: str = BAND_EXTRAPOLATION_ESTIMATOR_DEFAULT
     #: WHICH compile-time cuts produce the three sums.  The legacy
     #: ``total_fractions`` geometry remains the default; the explicit
@@ -4059,22 +4060,29 @@ class DynamicSigmaConfig:
         if not str(self.quadrature_cache_dir).strip():
             raise ValueError(
                 "sigma_quadrature_cache_dir must be 'auto', 'off', or a path.")
-        # REFUSE an unrecognised estimator, naming both, rather than falling
-        # back to the default.  A misspelling that silently ran the default
-        # would be an A/B measuring nothing -- the same rule
+        # REFUSE a retired or unrecognised estimator by name rather than
+        # falling back to the default.  A misspelling that silently ran the
+        # default would be an A/B measuring nothing -- the same rule
         # ``screening_method`` states above, for the same reason.
+        why = _RETIRED_BAND_EXTRAPOLATION_ESTIMATORS.get(
+            self.band_extrapolation_estimator)
+        if why is not None:
+            raise ValueError(
+                f"band_extrapolation_estimator = "
+                f"{self.band_extrapolation_estimator} is retired: {why}  "
+                f"Remove the key or set it to 'spectral_shell' (the "
+                f"default).")
         if self.band_extrapolation_estimator not in (
                 BAND_EXTRAPOLATION_ESTIMATORS):
             raise ValueError(
                 f"band_extrapolation_estimator = "
                 f"{self.band_extrapolation_estimator!r} is not a known "
-                f"band-convergence estimator.  The two are: 'spectral_shell' "
-                f"(the DEFAULT -- one decay exponent per external state from "
-                f"the two shell increments against spectral moments of the "
-                f"DFT eigenvalues, tail integrated to the finite plane-wave "
-                f"basis) and 'band_index_only' (the incumbent two-parameter "
-                f"S_inf + A/N least squares).  Both consume the SAME three "
-                f"bracket sums; neither changes what is computed.")
+                f"band-convergence estimator.  The one accepted value is "
+                f"{BAND_EXTRAPOLATION_ESTIMATORS}: 'spectral_shell' (the "
+                f"DEFAULT -- one decay exponent per external state from the "
+                f"two shell increments against spectral moments of the DFT "
+                f"eigenvalues, tail integrated to the finite plane-wave "
+                f"basis).")
         if self.band_extrapolation_bracket_scheme not in BRACKET_SCHEMES:
             raise ValueError(
                 f"band_extrapolation_bracket_scheme = "
