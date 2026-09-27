@@ -28,6 +28,7 @@ is still one definition of the typed action: ``maps.py``.
 from __future__ import annotations
 
 import dataclasses
+from functools import partial
 from typing import NamedTuple
 
 import jax
@@ -38,7 +39,8 @@ from symmetry_maps.maps import certify_endpoint_locality
 
 __all__ = ["QirrOperator", "DeviceLoadTables", "DEVICE_LOAD_SPECS", "device_load_tables",
            "UnfoldLoadTables", "unfold_load_tables", "local_unfold_load_tables", "umklapp_phase",
-           "apply_unfold_load_tables_local"]
+           "apply_unfold_load_tables_local", "unfold_operator_from_load_tables",
+           "monomial_endpoint_action", "fold_monomial_endpoint_action"]
 
 
 class UnfoldLoadTables(NamedTuple):
@@ -263,6 +265,88 @@ def _rotate_endpoints(spatial, spin_l, spin_r):
     return jnp.stack([sum(left[..., d] * jnp.conj(R[:, b, d])[:, None, None, None]
                          for d in range(nr_s) if np.any(spin_r[:, b, d] != 0))
                       for b in range(nr_s)], axis=4)
+
+
+def unfold_operator_from_load_tables(operator, partner, *, tables, mesh_xy):
+    """Apply authenticated endpoint tables to a distributed parent operator.
+
+    Inputs ``[n_parent, mu*n_l, nu*n_r]`` tile both matrix axes over X/Y.
+    Output ``[n_full, mu, n_l, nu, n_r]`` keeps the same two-axis placement.
+    For ``pair_transpose``, ``partner`` is the conjugated-factor contraction
+    on these same shards, with its scalar spectral weights unchanged. It is
+    not the complex conjugate of a frequency-dependent operator.
+
+    Bind this operation inside a retained jit. The action and local table
+    slicing are the same owners used by the fused convolution loaders.
+    """
+    from ._shard_map import shard_map
+    if tuple(tables.mesh_shape) != (int(mesh_xy.shape['x']), int(mesh_xy.shape['y'])):
+        raise ValueError("unfold_operator_from_load_tables: tables belong to another mesh shape")
+    expected = (tables.n_parent, tables.lsrc.shape[1], tables.rsrc.shape[1])
+    if tuple(operator.shape) != expected:
+        raise ValueError(f"unfold_operator_from_load_tables: want {expected}, got {operator.shape}")
+    if partner is None:
+        if not tables.conj_trs and np.any(tables.trs):
+            raise ValueError("unfold_operator_from_load_tables: antiunitary rows require a partner")
+        partner = operator
+    if partner.shape != operator.shape:
+        raise ValueError("unfold_operator_from_load_tables: partner must have the same endpoint layout")
+    @partial(shard_map, mesh=mesh_xy, in_specs=(_P(None, 'x', 'y'),) * 2,
+               out_specs=_P(None, 'x', None, 'y', None), check_vma=False)
+    def apply(value, transpose):
+        return apply_unfold_load_tables_local(
+            value, transpose, local_unfold_load_tables(tables), tables.spin, tables.spin_r)
+    return apply(operator, partner)
+
+
+def monomial_endpoint_action(action, tol=1e-12):
+    """``(src, phase)`` with ``action[k, a, src[k, a]] = phase[k, a]`` and zeros elsewhere.
+
+    Refuses a row with more than one nonzero per endpoint slot: that action
+    mixes components and cannot be folded into the load (a Cartesian current
+    under C3, where the circular basis is the monomial one).
+    """
+    a = np.asarray(action, dtype=np.complex128)
+    nz = np.abs(a) > tol
+    bad = np.flatnonzero(~(np.all(nz.sum(-1) == 1, axis=-1) & np.all(nz.sum(-2) == 1, axis=-1)))
+    if bad.size:
+        raise ValueError(f"monomial_endpoint_action: rows {bad.tolist()} are not monomial")
+    src = np.argmax(nz, axis=-1).astype(np.int32)
+    return src, np.take_along_axis(a, src[..., None], axis=-1)[..., 0]
+
+
+def fold_monomial_endpoint_action(t: UnfoldLoadTables) -> UnfoldLoadTables:
+    """The endpoint action folded into the source maps and phases; ``spin`` becomes the identity.
+
+    With ``U_k[a, c] = phase[k, a] delta(c, src[k, a])`` the rotated tile is
+    ``O[mu a, nu b] = phase_a V[mu src_a, nu src'_b] conj(phase'_b)``, so the
+    load reads one source slot per output slot: the component permutation
+    joins ``lsrc``/``rsrc`` and the phases join ``mph``/``nph`` (conjugated on
+    an antiunitary row of the conj arm, whose product is conjugated after the
+    phases).  No rotation pass remains; a kernel skips its identity multiply.
+    """
+    spin_r = t.spin if t.spin_r is None else t.spin_r
+    src_l, ph_l = monomial_endpoint_action(t.spin)
+    src_r, ph_r = monomial_endpoint_action(spin_r)
+    ns, nr = int(src_l.shape[-1]), int(src_r.shape[-1])
+
+    def fold(slots, phases, src, ph, width, right):
+        nk, n = slots.shape
+        base = (np.arange(n) // width) * width
+        comp = np.arange(n) % width
+        pick = base[None, :] + src[:, comp]                     # merged slot of (mu, src_a)
+        new_slots = np.take_along_axis(slots, pick, axis=1)
+        w = ph[:, comp]
+        w = np.conj(w) if right else w
+        if t.conj_trs:
+            w = np.where(np.asarray(t.trs)[:, None] != 0, np.conj(w), w)
+        return new_slots, np.take_along_axis(phases, pick, axis=1) * w
+
+    lsrc, mph = fold(t.lsrc, t.mph, src_l, ph_l, ns, False)
+    rsrc, nph = fold(t.rsrc, t.nph, src_r, ph_r, nr, True)
+    eye = lambda n: np.broadcast_to(np.eye(n, dtype=np.complex128), (t.spin.shape[0], n, n)).copy()
+    return t._replace(lsrc=lsrc, rsrc=rsrc, mph=mph, nph=nph, spin=eye(ns),
+                      spin_r=None if t.spin_r is None else eye(nr))
 
 
 @dataclasses.dataclass(frozen=True)
@@ -522,4 +606,3 @@ def _unflatten(aux, leaves):
 
 
 jax.tree_util.register_pytree_node(QirrOperator, _flatten, _unflatten)
-
