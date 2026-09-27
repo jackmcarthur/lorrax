@@ -28,6 +28,7 @@ is still one definition of the typed action: ``maps.py``.
 from __future__ import annotations
 
 import dataclasses
+from functools import partial
 from typing import NamedTuple
 
 import jax
@@ -38,7 +39,7 @@ from symmetry_maps.maps import certify_endpoint_locality
 
 __all__ = ["QirrOperator", "DeviceLoadTables", "DEVICE_LOAD_SPECS", "device_load_tables",
            "UnfoldLoadTables", "unfold_load_tables", "local_unfold_load_tables", "umklapp_phase",
-           "apply_unfold_load_tables_local"]
+           "apply_unfold_load_tables_local", "unfold_operator_from_load_tables"]
 
 
 class UnfoldLoadTables(NamedTuple):
@@ -263,6 +264,38 @@ def _rotate_endpoints(spatial, spin_l, spin_r):
     return jnp.stack([sum(left[..., d] * jnp.conj(R[:, b, d])[:, None, None, None]
                          for d in range(nr_s) if np.any(spin_r[:, b, d] != 0))
                       for b in range(nr_s)], axis=4)
+
+
+def unfold_operator_from_load_tables(operator, partner, *, tables, mesh_xy):
+    """Apply authenticated endpoint tables to a distributed parent operator.
+
+    Inputs ``[n_parent, mu*n_l, nu*n_r]`` tile both matrix axes over X/Y.
+    Output ``[n_full, mu, n_l, nu, n_r]`` keeps the same two-axis placement.
+    For ``pair_transpose``, ``partner`` is the conjugated-factor contraction
+    on these same shards, with its scalar spectral weights unchanged. It is
+    not the complex conjugate of a frequency-dependent operator.
+
+    Bind this operation inside a retained jit. The action and local table
+    slicing are the same owners used by the fused convolution loaders.
+    """
+    from ._shard_map import shard_map
+    if tuple(tables.mesh_shape) != (int(mesh_xy.shape['x']), int(mesh_xy.shape['y'])):
+        raise ValueError("unfold_operator_from_load_tables: tables belong to another mesh shape")
+    expected = (tables.n_parent, tables.lsrc.shape[1], tables.rsrc.shape[1])
+    if tuple(operator.shape) != expected:
+        raise ValueError(f"unfold_operator_from_load_tables: want {expected}, got {operator.shape}")
+    if partner is None:
+        if not tables.conj_trs and np.any(tables.trs):
+            raise ValueError("unfold_operator_from_load_tables: antiunitary rows require a partner")
+        partner = operator
+    if partner.shape != operator.shape:
+        raise ValueError("unfold_operator_from_load_tables: partner must have the same endpoint layout")
+    @partial(shard_map, mesh=mesh_xy, in_specs=(_P(None, 'x', 'y'),) * 2,
+               out_specs=_P(None, 'x', None, 'y', None), check_vma=False)
+    def apply(value, transpose):
+        return apply_unfold_load_tables_local(
+            value, transpose, local_unfold_load_tables(tables), tables.spin, tables.spin_r)
+    return apply(operator, partner)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -522,4 +555,3 @@ def _unflatten(aux, leaves):
 
 
 jax.tree_util.register_pytree_node(QirrOperator, _flatten, _unflatten)
-

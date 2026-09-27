@@ -139,12 +139,14 @@ carries the direct head (`no_local_fields`) instead.
 * **Head attribution is opt-in.** `sigma_freq_debug_output` alone enables
   head-attribution diagnostics and their output; the physical Γ completion
   does not depend on it.
-* **Ordered Σ residency.** The ordered four-current Σ runs one compiled scan
-  and one restore producer per endpoint-family class. The producer returns 1
-  CC, 3 CT/TC or 9 TT full-q blocks with centroid axes distributed over all P
-  ranks; a TT stack costs `9·nk_tot·M_T_packed²·16/P` bytes per rank. It is
-  transient per class, not a cache. Classes are submitted without host
-  fences, so a single-class lifetime is not implied.
+* **Ordered Σ residency.** Four-current shared-pole factors remain on q
+  parents. Each τ contracts the parent operator and, when antiunitary rows
+  are used, its conjugated-factor partner with unchanged causal weights.
+  The symmetry service transports the product into 1 CC, 3 CT/TC or 9 TT
+  full-q blocks, with both centroid axes distributed over all P ranks.
+  A full TT result costs `9·nk_tot·M_T_packed²·16/P` bytes per rank;
+  parent products and factors are admitted beside it. Endpoint classes are
+  submitted without host fences, so a single-class lifetime is not implied.
 
 ## 2026-09-06 — Covariant Γ photon completion
 
