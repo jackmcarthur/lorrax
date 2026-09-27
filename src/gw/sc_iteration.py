@@ -5478,9 +5478,15 @@ def _run_anderson(
     residual back.
     """
     from mixing.acceleration import anderson_nojit
+    from .scissor import k_star_weights
 
     H0 = state_init.H_qp_dft
     nk, nb, _ = H0.shape
+    # Anderson forms the Gram AFTER multiplying residuals by its metric.
+    # sqrt(star size) therefore gives the same sum as the full uniform
+    # k grid. A common normalization cancels from the least-squares solve;
+    # keeping the full-grid weight at one preserves that arm's arithmetic.
+    metric_k = np.sqrt(k_star_weights(_kstar(inputs)))[:, None, None]
     n_elem = nk * nb * nb
     mesh = inputs.mesh_xy
     print_fn(
@@ -5671,7 +5677,7 @@ def _run_anderson(
         metric_mask = np.broadcast_to(np.asarray(
             metric_partition.protected_mask | metric_partition.in_range_mask,
             dtype=bool), (int(x0.shape[0]), nb))
-        _metric_np[:, :nb, :nb] = metric_mask[:, :, None] * metric_mask[:, None, :]
+        _metric_np[:, :nb, :nb] = metric_k * (metric_mask[:, :, None] * metric_mask[:, None, :])
         _occ_state[0] = state_out.occupation_state
         _head_surface_weight[0] = state_out.head_surface_weight_kn
         _tail_z[0] = state_out.tail_z_kn
@@ -5811,9 +5817,8 @@ def _run_anderson(
     # global error, so the factor is gone rather than corrected.
 
     # THE ACCELERATOR FITS THE PARTITION'S RETAINED BLOCK, the same set the
-    # criterion tests.  Under the all-protected rule (owner 2026-09-22) that
-    # is every identity: weights of exactly 1.0, the unweighted solve bit for
-    # bit.
+    # criterion tests. Each retained k row carries its full-grid multiplicity,
+    # so changing the computational wedge does not change the Gram metric.
     _init_partition = _partition_on_loop(state_init.partition, inputs)
     _fit_mask = np.broadcast_to(
         np.asarray(_init_partition.protected_mask, bool)
@@ -5823,10 +5828,11 @@ def _run_anderson(
     # Refresh it after classification; the same current identity block then
     # weights every history entry in that solve. Padded entries stay zero.
     _metric_np = np.zeros((int(x0.shape[0]), _nbp, _nbp), dtype=np.float64)
-    _metric_np[:, :nb, :nb] = _fit_mask[:, :, None] * _fit_mask[:, None, :]
+    _metric_np[:, :nb, :nb] = metric_k * (_fit_mask[:, :, None] * _fit_mask[:, None, :])
     print_fn(
-        "  SC Anderson metric: Gram over the per-k non-scissored DFT identity "
-        "block; masks refreshed after each map, scissored rows follow the map")
+        "  SC Anderson metric: full-grid star-weighted Gram over the per-k "
+        "non-scissored DFT identity block; masks refreshed after each map, "
+        "scissored rows follow the map")
     try:
         result = anderson_nojit(
             residual_fn,
