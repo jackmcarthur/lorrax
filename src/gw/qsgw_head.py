@@ -3619,6 +3619,7 @@ def build_dft_head_response(
     wfn_fingerprint_binding=None,
     wings: bool = True,
     occupation_state=None,
+    frozen_parts: dict | None = None,
 ) -> IterationHeadResponse:
     """Build the one-shot DFT head on exactly the chi0 band manifold.
 
@@ -3644,17 +3645,34 @@ def build_dft_head_response(
     the Drude term and the wings as their intraband term, and the exact
     ``z = 0`` row takes Thomas-Fermi with its static fold
     (:func:`_metal_static_head`).  ``None`` is the insulating head.
+
+    ``frozen_parts`` is a caller-owned dict that holds the frequency-free
+    part of this response between calls on the same ``wfns``: the
+    authenticated velocity and, on a metal, the Fermi-surface table, the
+    Drude atoms, the pair split and the static head.  Its key is ``wings``,
+    whether the plan has an exact static row, and the state's ``(mu,
+    occ_hash)``.  A frozen SC head (``sc_head_update = off``) keeps that key
+    while its frequency plan follows the QP energy span, so each map then
+    builds only S(z) and the wings.
     """
     import os
 
+    z = np.asarray(omegas_ry, dtype=np.complex128).reshape(-1)
+    parts_key = (bool(wings), any(abs(complex(v)) <= 1.0e-14 for v in z),
+                 None if occupation_state is None else
+                 (float(occupation_state.mu_ry), occupation_state.occ_hash))
+    parts = None if frozen_parts is None else frozen_parts.get(parts_key)
     dipole_path = os.path.join(input_dir, "dipole.h5")
-    if not os.path.exists(dipole_path):
-        raise FileNotFoundError(
-            "head_correction=full requires dipole.h5 to build the direct "
-            f"head and wings; missing {dipole_path}.")
-    velocity_cart = read_authenticated_dipole_velocity(
-        dipole_path, wfn=wfn, meta=meta, config=config,
-        wfn_fingerprint_binding=wfn_fingerprint_binding)
+    if parts is None:
+        if not os.path.exists(dipole_path):
+            raise FileNotFoundError(
+                "head_correction=full requires dipole.h5 to build the direct "
+                f"head and wings; missing {dipole_path}.")
+        velocity_cart = read_authenticated_dipole_velocity(
+            dipole_path, wfn=wfn, meta=meta, config=config,
+            wfn_fingerprint_binding=wfn_fingerprint_binding)
+    else:
+        velocity_cart = parts["velocity_cart"]
     b0 = int(meta.b_id_0)
     b4 = int(meta.b_id_4_chi_user)
     nb_logical = b4 - b0
@@ -3667,7 +3685,6 @@ def build_dft_head_response(
             f"{velocity_cart.shape}, expected "
             f"(3,{int(meta.nk_tot)},{nb_logical},{nb_logical}) for global "
             f"bands [{b0},{b4}).")
-    z = np.asarray(omegas_ry, dtype=np.complex128).reshape(-1)
     # ``meta.nspinor`` is four for the bispinor representation, whereas
     # response normalization counts the source-WFN states.
     normalization_nspinor = int(meta.nspinor_wfnfile)
@@ -3687,23 +3704,34 @@ def build_dft_head_response(
                 f"manifold: f_kn {f_state.shape}, want "
                 f"({int(meta.nk_tot)}, >={nb_logical})")
         occupations = jnp.asarray(f_state[:, :nb_logical])
-        from .fermi_surface import metal_head_surface_weights
-        surface_host = metal_head_surface_weights(
-            np.asarray(energies, dtype=np.float64),
-            float(occupation_state.mu_ry), sym=wfn.symmetry(),
-            kgrid=wfn.kgrid)
-        surface = jnp.asarray(surface_host)
-        drude_tensor, fermi_surface, pair_split = metal_intraband_model(
-            jnp.asarray(velocity_cart), surface, energies, mesh=mesh,
-            nb_logical=nb_logical, cell_volume=float(meta.cell_volume),
-            nk_tot=int(meta.nk_tot), nspin=int(wfn.nspin),
-            nspinor=normalization_nspinor, bvec_cart=_head_bvec(wfn),
-            kgrid=wfn.kgrid)
-        (static_kappa2, static_Y_x, static_Z_y,
-         static_chi_body_gamma) = _metal_static_head(
-            wfns if wings else None, surface, occupation_state, z,
-            mesh=mesh, meta=meta, config=config, nb_logical=nb_logical,
-            nspin=int(wfn.nspin), nspinor=normalization_nspinor)
+        if parts is None:
+            from .fermi_surface import metal_head_surface_weights
+            surface_host = metal_head_surface_weights(
+                np.asarray(energies, dtype=np.float64),
+                float(occupation_state.mu_ry), sym=wfn.symmetry(),
+                kgrid=wfn.kgrid)
+            surface = jnp.asarray(surface_host)
+            drude_tensor, fermi_surface, pair_split = metal_intraband_model(
+                jnp.asarray(velocity_cart), surface, energies, mesh=mesh,
+                nb_logical=nb_logical, cell_volume=float(meta.cell_volume),
+                nk_tot=int(meta.nk_tot), nspin=int(wfn.nspin),
+                nspinor=normalization_nspinor, bvec_cart=_head_bvec(wfn),
+                kgrid=wfn.kgrid)
+            (static_kappa2, static_Y_x, static_Z_y,
+             static_chi_body_gamma) = _metal_static_head(
+                wfns if wings else None, surface, occupation_state, z,
+                mesh=mesh, meta=meta, config=config, nb_logical=nb_logical,
+                nspin=int(wfn.nspin), nspinor=normalization_nspinor)
+        else:
+            (surface, drude_tensor, fermi_surface, pair_split, static_kappa2,
+             static_Y_x, static_Z_y, static_chi_body_gamma) = parts["metal"]
+    if parts is None and frozen_parts is not None:
+        frozen_parts.clear()
+        frozen_parts[parts_key] = dict(
+            velocity_cart=velocity_cart,
+            metal=(surface, drude_tensor, fermi_surface, pair_split,
+                   static_kappa2, static_Y_x, static_Z_y,
+                   static_chi_body_gamma))
     S = head_s_tensor_sharded(
         jnp.asarray(velocity_cart), energies, occupations, z,
         mesh=mesh, nb_logical=nb_logical,

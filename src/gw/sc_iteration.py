@@ -3694,12 +3694,19 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
                  and tuple(iteration_head_response.omegas) != tuple(head_omegas))):
             from .qsgw_head import build_dft_head_response, metal_head_summary
             dft_head_state = _fixed_dft_head_occupation_state(inputs)
+            # The shared-pole head grid follows this map's energy span, so
+            # the response is rebuilt on it; its frequency-free part (dipole
+            # velocity, Fermi-surface table, Drude atoms, static head) is a
+            # function of the DFT state only and is held across maps.
+            seed_cache = inputs.screening_seed_cache
             iteration_head_response = build_dft_head_response(
                 inputs.wfns_dft, np.asarray(head_omegas, dtype=np.complex128),
                 input_dir=inputs.input_dir, mesh=inputs.mesh_xy, wfn=inputs.wfn,
                 meta=inputs.meta, config=inputs.config,
                 wings=not direct_only_shared_pole,
-                occupation_state=dft_head_state)
+                occupation_state=dft_head_state,
+                frozen_parts=(None if seed_cache is None else
+                              seed_cache.setdefault("dft_head_frozen_parts", {})))
             if dft_head_state is not None:
                 _record_sc(inputs, "    SC " + metal_head_summary(
                     iteration_head_response, dft_head_state))

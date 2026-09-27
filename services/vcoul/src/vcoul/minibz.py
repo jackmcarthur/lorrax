@@ -77,6 +77,7 @@ and the only thing it provides is the scrambled-Sobol generator.  See
 """
 from __future__ import annotations
 
+import collections
 from dataclasses import InitVar, dataclass, field
 import functools
 import hashlib
@@ -350,6 +351,16 @@ def _iter_minibz_voronoi_batches(
     yield _map_unit_draw(randvals)
 
 
+#: Mapped mini-BZ draws, keyed by everything the draw depends on (cell, q
+#: grid, count, sequence, replicates, fold, dimension, seed).  The draw is
+#: deterministic, so a hit returns the arrays a redraw would make, bit for
+#: bit.  The q=0 head asks for the same draw at every head sample of every
+#: map.  Bounded: one entry is qmc_reps x nsamples x 3 float64 on the
+#: default device (63 MB at the head's 10 x 2^18), the peak one call holds.
+_DRAW_CACHE: "collections.OrderedDict" = collections.OrderedDict()
+_DRAW_CACHE_ENTRIES = 2
+
+
 def minibz_voronoi_batches(
     bvec, kgrid, *,
     nsamples: int = 2**18,
@@ -393,10 +404,22 @@ def minibz_voronoi_batches(
         refusal, because a refusal here would be a behaviour change on a
         path nothing in the tree exercises.
     """
-    return list(_iter_minibz_voronoi_batches(
-        bvec, kgrid, nsamples=nsamples, method=method,
-        qmc_reps=qmc_reps, nmax=nmax, is_2d=is_2d,
-        seed_offset=seed_offset))
+    key = (np.asarray(bvec, dtype=np.float64).tobytes(),
+           tuple(int(s) for s in np.ravel(kgrid)), int(nsamples),
+           str(method).lower(), int(qmc_reps), int(nmax), bool(is_2d),
+           int(seed_offset))
+    draw = _DRAW_CACHE.get(key)
+    if draw is None:
+        draw = tuple(_iter_minibz_voronoi_batches(
+            bvec, kgrid, nsamples=nsamples, method=method,
+            qmc_reps=qmc_reps, nmax=nmax, is_2d=is_2d,
+            seed_offset=seed_offset))
+        _DRAW_CACHE[key] = draw
+        while len(_DRAW_CACHE) > _DRAW_CACHE_ENTRIES:
+            _DRAW_CACHE.popitem(last=False)
+    else:
+        _DRAW_CACHE.move_to_end(key)
+    return list(draw)
 
 
 def sample_minibz_qpoints(
