@@ -81,6 +81,7 @@ nav:
       - Physics: theory/physics.md
       - Direct Hartree field: theory/hartree.md
       - ISDF / zeta-V(q): theory/isdf-zeta-vq.md
+      - ISDF exchange accuracy: theory/isdf-exchange-accuracy.md
       - Minimax quadrature: theory/minimax-quadrature.md
       - Space-time response (Laplace): theory/response-laplace.md
       - The Sigma(omega) quadrature problem: theory/sigma-quadrature-problem.md
