@@ -187,8 +187,10 @@ $$
 so the contour is a vertical leg 0 → −ic/m (the wide side's Laplace part,
 ⌈ln(Mc/m)L/π²⌉ nodes graded geometrically toward 0), the capped line
 σ − ic/m, and a linear fall to the real axis at σ = Λ, where every live member
-is below ε/4. c = 4 is the noise gate's: the narrow edge is amplified by e^c
-and the executor admits a term mass of 83. The two image sets sit at ±B₀,
+is below ε/4. The corner amplifies the narrow edge by e^c, and the executor
+admits a term mass of 5·10⁻⁶/6·10⁻⁸ = 83.3, so c must stay below
+ln 83.3 = 4.42; c = 4 is a choice under that bound, not a derivation. The two
+image sets sit at ±B₀,
 B₀ = γ·max(B(0), min(M, Λm/c)); each has
 K = ⌈ln(16R)(L + c)/π²⌉ Gauss–Legendre nodes, R = (B₀ + x_live)/(B₀ − m), and
 the growth-side image is capped at |Im s|(b − a) ≤ 3. With κ = c/L the line
@@ -200,12 +202,20 @@ count is N_line = 1 + γI/2π,
 | m(1+κ) < M ≤ mΛ/c | MΛ − cM²/(2m) + (mc/2)(1+κ+κ²) |
 | M > mΛ/c (saturated) | mΛ²/(2c) + (mc/2)(1+κ+κ²) |
 
-and the margin γ minimizes line plus image nodes, γ² − 1 = 8(L + c)/(πMΛ),
-clipped to [1 + 0.01·max(2, L − cM/m), 1.2]. A symmetric box bends too: the
-straight line leaves the far image to the growth-capped set and misses on a
-tall box ([−20, 20] × [1, 10]η: 1.49ε), where the bent contour certifies. The
-floor's 0.01 is the one calibrated constant. On a miss the ladder raises γ by
-1.1 and adds one node to the leg and to each image set, four rungs.
+The margin is γ² − 1 = 8(L + c)/(πMΛ), clipped to
+[1 + 0.01·max(2, L − cM/m), 1.2]. That expression minimizes a simplified
+count, a straight line γMΛ/2π plus two image sets at R = (γ + 1)/(γ − 1); it
+is not the minimizer of the bent count above, and the floor, not the
+expression, sets γ on 290 of the 371 corpus crossing boxes (claim 2882). A
+symmetric box bends too: the straight line leaves the far image to the
+growth-capped set and misses on a tall box ([−20, 20] × [1, 10]η: 1.49ε),
+where the bent contour certifies. On a miss the ladder raises γ by 1.1 and
+adds one node to the leg and to each image set, four rungs.
+
+A crossing box whose narrow side is 4–8η and whose height is 10η or more
+certifies in neither family ((−60, 6) × (1, 20)η at 10⁻⁴ ends at 7ε), where
+the fitted builder certified with 21–52 nodes; the planner refuses such a
+window by name. No deck box has this shape today (`KNOWN_LORRAX_ISSUES`).
 
 **The sector rule and the local extremal-length law.** A box with Im d ≥ η
 lies in an open sector of the upper half plane. Rotate by the sector axis φ;
@@ -220,11 +230,14 @@ $$
 
 Zolotarev's ln 16 split into one ln 4 per end at that end's own gap; for a
 constant gap it is the strip count ln(16R)L/(π²(1 − 2γ/π)). φ minimizes the
-law on a fixed 200-point grid. The law has no calibrated constant: over 953
-fitted sign-definite rules its median fitted/law ratio is 1.000 (rms log
-0.132, no trend in the angle; claim 2873). The ladder is
-n → max(n + 1, ⌈1.1n⌉), six rungs. Sign-definite boxes weight the fit
-geometrically in |Re d|, the relative currency's measure.
+law on a fixed 200-point grid. The law has no calibrated constant, and it is
+an estimate, not a bound. Over the 953 fitted sign-definite rules the median
+fitted/⌈law⌉ ratio is 1.000 (claim 2873), and against the continuous law it
+is 1.075. Rung 0 certifies 315 of those 953 boxes (45 of 120 in QAUDIT's
+sample, claim 2882); the ladder n → max(n + 1, ⌈1.1n⌉), six rungs, carries
+the rest, and the certified counts sit at a median 1.15× the rung-0 law.
+Sign-definite boxes weight the fit geometrically in |Re d|, the relative
+currency's measure.
 
 **Which family.** A sign-definite box takes the sector rule. A crossing box
 builds first the family with the smaller count, N_line + leg + images or the
@@ -232,6 +245,16 @@ sector law, and the other when the first ladder ends uncertified. The sector
 rule wins when the narrow side lies inside the peak (m of a few η), where the
 bent contour's fixed 10–16-node overhead dominates. A rule neither family
 certifies is returned uncertified and the planner refuses the window by name.
+
+**Chosen constants.** None of these is derived; each was fixed once and not
+tuned per box. Corner exponent c = 4 (under ln 83.3); line end Λ = ln(4/ε);
+growth-side image cap |Im s|(b − a) ≤ 3 (the fitted rules' off-ray cap); margin
+floor slope 0.01 (the one constant calibrated against the corpus) and margin
+cap 1.2; leg start 0.05/(Mτ_c); the image-horizon guard
+1/max(1 − m/B₀, 0.05); ridge 0.05ε; fit density 2 points per half wave of the
+largest |t| on the real edges and 40 geometric points on the sides; the
+ladders (×1.1, four crossing and six sector rungs); the sector φ grid (200
+points) and its gap guard (0.02 rad).
 
 **Acceptance.** A rung is accepted when the boundary certificate
 ([§8 of the Σ page](sigma-quadrature-problem.md#8-acceptance)) reads sup ≤ ε and

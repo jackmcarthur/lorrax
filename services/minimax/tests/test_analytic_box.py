@@ -113,6 +113,19 @@ def test_the_other_family_is_the_fallback():
     assert abs(rule.theta_deg) > 1.0
 
 
+def test_tall_narrow_crossing_box_is_returned_uncertified():
+    """KNOWN LIMIT (KNOWN_LORRAX_ISSUES, QAUDIT claim 2882): a crossing box with
+    a narrow side of 4-8 eta and a height of 10 eta or more certifies in
+    neither family; main's fitted builder certified such boxes with 21-52
+    nodes.  The builder returns its last rung uncertified, and the planner
+    refuses the window by name (tests/test_sigma_box_plan.py).  No deck box
+    is of this shape today; damped poles in a small excursion window would be."""
+    box = (-60.0 * ETA, 6.0 * ETA, ETA, 20.0 * ETA)
+    rule = analytic_box_rule(box, 1.0e-4)
+    assert rule.sup_error > 1.0e-4
+    assert np.all(np.isfinite(rule.times)) and np.all(np.isfinite(rule.weights))
+
+
 def test_thin_boxes_certify_on_the_dense_boundary():
     for box in ((-14.0 * ETA, 22.0 * ETA, ETA, 1.01 * ETA),     # Na B06-like crossing
                 (1.05 * ETA, 240.0 * ETA, ETA, 1.01 * ETA)):    # Na tail-like
