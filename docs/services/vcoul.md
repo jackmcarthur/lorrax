@@ -106,8 +106,12 @@ takes a named rule with no silent alternative:
 * `Slab2D.q0_average_transverse_tensor` (the bare TT head of
   `gw.v_q_bispinor`) reads the same receipt: `−D_TT` of the order-32 rule,
   with the same 24→32 convergence refusal. The direct four-current head
-  (`gw.photon_direct_head`) averages on it too, so the TT tile it subtracts
-  from V is the one V holds.
+  subtracts this tile from V (`subtract_bare_tt_from_bank`), so the tile
+  removed is the one V holds.
+* `slab_minibz_graded_photon_cubature` issues the same receipt on seven
+  geometric radial panels toward Γ (8/12/16 Gauss points per panel, 32 per
+  edge), for screened integrands with a near-Γ scale; the direct
+  four-current head averages on it. Bare integrands agree on both rules.
 * `minibz_coulomb_moment(..., is_2d=True)` is the slab cell's
   Coulomb-weighted `Q_ab` on the order-32 polygon rule (`Q_zz = 0`); the
   metal pair split reads it.

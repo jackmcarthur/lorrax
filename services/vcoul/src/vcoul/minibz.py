@@ -105,6 +105,7 @@ __all__ = [
     "minibz_transverse_head_avg",
     "SlabMinibzPhotonReceipt",
     "slab_minibz_photon_cubature",
+    "slab_minibz_graded_photon_cubature",
     "validate_slab_minibz_photon_receipt",
     "iter_minibz_photon_samples",
     "bulk_photon_D_raw",
@@ -124,6 +125,19 @@ COULOMB_GAUGE_TT_SIGN = -1.0
 _SLAB_MINIBZ_PHOTON_METHOD = (
     "true_ws_polygon_duffy_gauss_legendre_v1")
 _SLAB_MINIBZ_PHOTON_ORDERS = (16, 24, 32)
+#: The graded variant for SCREENED integrands: the same Γ-to-edge Duffy
+#: triangles, with the radial axis cut into the geometric panels
+#: ``[0, 4^-6], [4^-6, 4^-5], ..., [1/4, 1]``.  A ladder order is the
+#: Gauss--Legendre count per radial panel; each edge carries 32 points.  A
+#: screened slab integrand has a near-Γ scale set by the response (the TT
+#: block's 2D magnetostatic screening, ``q* ~ 8 pi z_c |Pi_TT - C|``) that the
+#: single-panel rule resolves only algebraically (3 % at order 32 on CrI3
+#: 3x3); the panels resolve it geometrically (1e-10).
+_SLAB_MINIBZ_GRADED_METHOD = (
+    "true_ws_polygon_duffy_graded_gauss_legendre_v1")
+_SLAB_MINIBZ_GRADED_ORDERS = (8, 12, 16)
+_SLAB_MINIBZ_GRADED_PANELS = (0.0,) + tuple(4.0 ** -k for k in range(6, -1, -1))
+_SLAB_MINIBZ_GRADED_ANGULAR = 32
 _SLAB_MINIBZ_RECEIPT_TOKEN = object()
 
 
@@ -818,10 +832,28 @@ def _slab_minibz_polygon_rule(polygon, polygon_area, order):
     kernel's integrable ``1/|q|`` cusp before summation.  Gauss nodes are
     interior to ``(0,1)``, so the singular point itself is never evaluated.
     """
-    n = int(order)
-    unit_nodes, unit_weights = gauss_legendre_interval(n, 0.0, 1.0)
-    r, s = np.meshgrid(unit_nodes, unit_nodes, indexing="ij")
-    wr, ws = np.meshgrid(unit_weights, unit_weights, indexing="ij")
+    nodes, weights = gauss_legendre_interval(int(order), 0.0, 1.0)
+    return _slab_minibz_duffy_rule(
+        polygon, polygon_area, nodes, weights, nodes, weights)
+
+
+def _slab_minibz_graded_rule(polygon, polygon_area, order):
+    """The Duffy rule with ``order`` Gauss points per geometric radial panel."""
+    panels = [gauss_legendre_interval(int(order), lo, hi) for lo, hi in zip(
+        _SLAB_MINIBZ_GRADED_PANELS[:-1], _SLAB_MINIBZ_GRADED_PANELS[1:])]
+    s_nodes, s_weights = gauss_legendre_interval(
+        _SLAB_MINIBZ_GRADED_ANGULAR, 0.0, 1.0)
+    return _slab_minibz_duffy_rule(
+        polygon, polygon_area,
+        np.concatenate([p[0] for p in panels]),
+        np.concatenate([p[1] for p in panels]), s_nodes, s_weights)
+
+
+def _slab_minibz_duffy_rule(polygon, polygon_area, r_nodes, r_weights,
+                            s_nodes, s_weights):
+    """Normalized Γ-to-edge Duffy rule on given radial and edge nodes."""
+    r, s = np.meshgrid(r_nodes, s_nodes, indexing="ij")
+    wr, ws = np.meshgrid(r_weights, s_weights, indexing="ij")
     q_parts = []
     w_parts = []
     for left, right in zip(polygon, np.roll(polygon, -1, axis=0)):
@@ -848,6 +880,18 @@ def _slab_minibz_polygon_rule(polygon, polygon_area, order):
             "polygon cubature failed its weighted-centroid identity: "
             f"|sum(w*q)|={np.linalg.norm(weighted_centroid):.3e}")
     return q_cart, average_weights, weight_sum_defect, weighted_centroid
+
+
+#: method -> (ladder orders, rule builder, radial x edge nodes per triangle).
+_SLAB_MINIBZ_RULES = {
+    _SLAB_MINIBZ_PHOTON_METHOD: (
+        _SLAB_MINIBZ_PHOTON_ORDERS, _slab_minibz_polygon_rule,
+        lambda order: order * order),
+    _SLAB_MINIBZ_GRADED_METHOD: (
+        _SLAB_MINIBZ_GRADED_ORDERS, _slab_minibz_graded_rule,
+        lambda order: (len(_SLAB_MINIBZ_GRADED_PANELS) - 1) * order
+        * _SLAB_MINIBZ_GRADED_ANGULAR),
+}
 
 
 def _photon_D_raw(q_cart, *, kind, zc):
@@ -912,11 +956,32 @@ def slab_minibz_photon_cubature(
     ladder, and binds the normalized weights and padded/physical solve counts
     into one provider-issued result.  Raw ``D`` carries no cell-volume factor.
     """
+    return _issue_slab_minibz_receipt(
+        kernel, geometry, kgrid, _SLAB_MINIBZ_PHOTON_METHOD)
+
+
+def slab_minibz_graded_photon_cubature(
+    kernel, geometry, kgrid,
+) -> SlabMinibzPhotonReceipt:
+    """The same receipt on the radially graded rule, for screened integrands.
+
+    The cell, triangles, Duffy map and ``D`` are those of
+    :func:`slab_minibz_photon_cubature`; the radial axis is cut into seven
+    geometric panels toward Γ and the ladder is 8/12/16 Gauss points per
+    panel (``_SLAB_MINIBZ_GRADED_*``).  No dial.
+    """
+    return _issue_slab_minibz_receipt(
+        kernel, geometry, kgrid, _SLAB_MINIBZ_GRADED_METHOD)
+
+
+def _issue_slab_minibz_receipt(kernel, geometry, kgrid, method):
+    """Build, digest and validate one receipt of a registered rule family."""
     from vcoul.slab_2d import Slab2D
     if type(kernel) is not Slab2D:
         raise TypeError(
             "slab_minibz_photon_cubature needs the exact Slab2D kernel "
             "returned by get_kernel(2)")
+    orders, rule, nodes_per_triangle = _SLAB_MINIBZ_RULES[method]
 
     bvec = np.asarray(geometry.bvec, dtype=np.float64)
     kg = tuple(int(v) for v in kgrid)
@@ -928,16 +993,15 @@ def slab_minibz_photon_cubature(
             f"got {cell_volume}")
     polygon, mini_lattice, polygon_area = (
         _slab_minibz_wigner_seitz_polygon(bvec, kg))
-    padded_count = int(polygon.shape[0]) * max(
-        _SLAB_MINIBZ_PHOTON_ORDERS) ** 2
+    padded_count = int(polygon.shape[0]) * nodes_per_triangle(max(orders))
 
     chunks = []
     physical_counts = []
     weight_defects = []
     weighted_centroids = []
-    for order in _SLAB_MINIBZ_PHOTON_ORDERS:
+    for order in orders:
         q_valid, weight_valid, defect, centroid = (
-            _slab_minibz_polygon_rule(polygon, polygon_area, order))
+            rule(polygon, polygon_area, order))
         physical_count = int(q_valid.shape[0])
         D_valid, _ = _photon_D_raw(q_valid, kind="slab", zc=zc)
 
@@ -962,8 +1026,8 @@ def slab_minibz_photon_cubature(
         return tuple(tuple(float(x) for x in row) for row in values)
 
     receipt = SlabMinibzPhotonReceipt(
-        method=_SLAB_MINIBZ_PHOTON_METHOD,
-        orders=_SLAB_MINIBZ_PHOTON_ORDERS,
+        method=method,
+        orders=orders,
         reciprocal_lattice_rows=_rows(bvec),
         kgrid=kg,
         mini_lattice_rows=_rows(mini_lattice),
@@ -972,7 +1036,7 @@ def slab_minibz_photon_cubature(
         slab_zc=zc,
         cell_volume=cell_volume,
         physical_counts=tuple(physical_counts),
-        padded_counts=(padded_count,) * len(_SLAB_MINIBZ_PHOTON_ORDERS),
+        padded_counts=(padded_count,) * len(orders),
         weight_sum_defects=tuple(weight_defects),
         weighted_q_centroids=tuple(weighted_centroids),
         chunks=tuple(chunks),
@@ -1002,12 +1066,13 @@ def validate_slab_minibz_photon_receipt(
 
 def _require_slab_minibz_photon_receipt(receipt) -> None:
     """Validate every small fact bound into one provider-issued receipt."""
-    if receipt.method != _SLAB_MINIBZ_PHOTON_METHOD:
+    if receipt.method not in _SLAB_MINIBZ_RULES:
         raise ValueError(
             "exact slab photon receipt carries the wrong cubature method")
-    if receipt.orders != _SLAB_MINIBZ_PHOTON_ORDERS:
+    orders, rule, nodes_per_triangle = _SLAB_MINIBZ_RULES[receipt.method]
+    if receipt.orders != orders:
         raise ValueError(
-            "exact slab photon receipt must carry the fixed 16/24/32 ladder")
+            "exact slab photon receipt must carry its method's fixed ladder")
     bvec = np.asarray(receipt.reciprocal_lattice_rows, dtype=np.float64)
     mini = np.asarray(receipt.mini_lattice_rows, dtype=np.float64)
     polygon = np.asarray(receipt.polygon_vertices, dtype=np.float64)
@@ -1053,7 +1118,7 @@ def _require_slab_minibz_photon_receipt(receipt) -> None:
         raise ValueError(
             "exact slab photon receipt failed its CCW/area identity")
 
-    n_orders = len(_SLAB_MINIBZ_PHOTON_ORDERS)
+    n_orders = len(orders)
     fields = (
         receipt.physical_counts, receipt.padded_counts,
         receipt.weight_sum_defects, receipt.weighted_q_centroids,
@@ -1077,9 +1142,8 @@ def _require_slab_minibz_photon_receipt(receipt) -> None:
             "exact slab photon receipt payload or metadata changed after "
             "provider issuance")
     expected_physical = tuple(
-        int(polygon.shape[0]) * order * order
-        for order in _SLAB_MINIBZ_PHOTON_ORDERS)
-    expected_padded = (int(polygon.shape[0]) * 32 * 32,) * n_orders
+        int(polygon.shape[0]) * nodes_per_triangle(order) for order in orders)
+    expected_padded = (max(expected_physical),) * n_orders
     if (receipt.physical_counts != expected_physical
             or receipt.padded_counts != expected_padded):
         raise ValueError(
@@ -1090,10 +1154,8 @@ def _require_slab_minibz_photon_receipt(receipt) -> None:
         q = np.asarray(chunk.q_cart)
         D = np.asarray(chunk.D_raw)
         weight = np.asarray(chunk.sample_weight)
-        expected_q, expected_weight, defect, centroid = (
-            _slab_minibz_polygon_rule(
-                expected_polygon, receipt.polygon_area,
-                _SLAB_MINIBZ_PHOTON_ORDERS[index]))
+        expected_q, expected_weight, defect, centroid = rule(
+            expected_polygon, receipt.polygon_area, orders[index])
         expected_D, _ = _photon_D_raw(
             expected_q, kind="slab", zc=receipt.slab_zc)
         if (chunk.order != receipt.orders[index]

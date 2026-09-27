@@ -495,19 +495,22 @@ def _bulk_gamma_cell_average(geometry, kgrid, operands, mesh, cell_volume):
 def _slab_gamma_cell_average(geometry, kgrid, operands, mesh, cell_volume):
     """Slab Γ cell: the exact in-plane Wigner–Seitz polygon of vcoul.
 
-    Every node of the provider's Γ-to-edge Duffy–Gauss ladder (orders
-    16/24/32, normalized weights, ``D`` with the Ismail–Beigi kernel at
-    ``q_z = 0``) takes the full 4×4 Dyson solve before the weighted sum.
-    The radial Jacobian cancels the 2D ``1/q`` cusp, so there is no sphere.
-    The order-32 sums are the head; the 24→32 change is reported as the
-    rule's spread.  The same receipt gives the scalar charge head and the
-    bare TT Γ tile (``vcoul.Slab2D.q0_average_transverse_tensor``).
+    Every node of the provider's graded Γ-to-edge Duffy–Gauss ladder
+    (``vcoul.slab_minibz_graded_photon_cubature``: seven geometric radial
+    panels toward Γ, 8/12/16 points per panel, normalized weights, ``D`` with
+    the Ismail–Beigi kernel at ``q_z = 0``) takes the full 4×4 Dyson solve
+    before the weighted sum.  The radial Jacobian cancels the 2D ``1/q`` cusp,
+    so there is no sphere; the panels resolve the TT block's near-Γ
+    screening scale, which one radial panel converges to only 3 % at 32
+    points (CrI3 3×3).  The finest sums are the head; the change from the
+    previous order is reported per field.  The cell, triangles and ``D`` are
+    those of the scalar charge head and the bare TT Γ tile.
     """
     from common.collectives import device_put_process_local
     from common.gpu_utils import device_budget_bytes, device_room_bytes, record_stage_price
-    from vcoul import get_kernel, slab_minibz_photon_cubature
+    from vcoul import get_kernel, slab_minibz_graded_photon_cubature
 
-    receipt = slab_minibz_photon_cubature(get_kernel(2), geometry, kgrid)
+    receipt = slab_minibz_graded_photon_cubature(get_kernel(2), geometry, kgrid)
     n_dev = int(mesh.devices.size)
     split = NamedSharding(mesh, P(tuple(mesh.axis_names)))
     padded = int(receipt.padded_counts[-1])
@@ -540,9 +543,10 @@ def _slab_gamma_cell_average(geometry, kgrid, operands, mesh, cell_volume):
     max_error = max(float(result[-1]) for result in ladder)
     edges = len(receipt.polygon_vertices)
     return (fields, spread, max_error,
-            f"exact {edges}-edge Wigner-Seitz polygon, Duffy-Gauss orders "
-            f"{receipt.orders} ({receipt.physical_counts[-1]} nodes); "
-            f"24->32 relative change: {relative}")
+            f"exact {edges}-edge Wigner-Seitz polygon, graded Duffy-Gauss "
+            f"orders {receipt.orders} per panel ({receipt.physical_counts[-1]} "
+            f"nodes); {receipt.orders[-2]}->{receipt.orders[-1]} relative "
+            f"change: {relative}")
 
 
 def _fields(operands):

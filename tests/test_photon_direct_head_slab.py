@@ -165,3 +165,30 @@ def test_slab_fermi_surface_table_is_the_2d_dos():
     area = abs(np.linalg.det(_BVEC[:2, :2]))
     np.testing.assert_allclose(sums[0], sums[1], rtol=1e-13)
     np.testing.assert_allclose(sums[0], np.pi / area, rtol=1e-2)
+
+
+def test_graded_receipt_resolves_a_near_gamma_screening_scale():
+    """The TT block's screened integrand has a near-Γ scale q*; after the
+    Duffy Jacobian it is v(q) q*/(q + q*).  The single-panel ladder reaches
+    it algebraically, the graded panels geometrically; bare v agrees on both."""
+    from vcoul import (get_kernel, slab_minibz_graded_photon_cubature,
+                       slab_minibz_photon_cubature,
+                       validate_slab_minibz_photon_receipt)
+    geometry = _geometry()
+    graded = validate_slab_minibz_photon_receipt(
+        slab_minibz_graded_photon_cubature(get_kernel(2), geometry, _KGRID))
+    uniform = slab_minibz_photon_cubature(get_kernel(2), geometry, _KGRID)
+    assert graded.orders == (8, 12, 16) and graded.padded_counts[0] == 4 * 7 * 16 * 32
+    qstar = 1e-3 * float(np.sqrt(graded.polygon_area))
+
+    def average(chunk, screened):
+        n = chunk.physical_count
+        w, v = chunk.sample_weight[:n], chunk.D_raw[:n, 0, 0]
+        q = np.linalg.norm(chunk.q_cart[:n], axis=1)
+        return float(np.sum(w * v * (qstar / (q + qstar) if screened else 1.0)))
+
+    ref = average(graded.chunks[-1], True)
+    assert abs(average(graded.chunks[-2], True) - ref) < 1e-9 * ref
+    assert abs(average(uniform.chunks[-1], True) - ref) > 1e-3 * ref
+    np.testing.assert_allclose(average(graded.chunks[-1], False),
+                               average(uniform.chunks[-1], False), rtol=1e-13)

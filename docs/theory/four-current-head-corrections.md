@@ -499,15 +499,22 @@ same $4\times4$ solve at every node. The limits are the 2D ones:
 
 $D$, $S$ and the atoms carry the in-plane/out-of-plane anisotropy; a slab's
 intraband velocities have $u_z=0$, so the $z$ current has no Drude weight.
-The cell is the exact in-plane Wigner–Seitz polygon of the mini lattice
-(`vcoul.slab_minibz_photon_cubature`, the charge head's rule): Γ-to-edge
-triangles, Duffy map $\mathbf q=r[(1-s)\mathbf v_i+s\mathbf v_{i+1}]$
-whose Jacobian $r$ cancels the $1/q$ cusp, Gauss–Legendre orders
-16/24/32, normalized weights. The integrand is a cusp, not a pole, so there
-is no sphere. Every node takes the $4\times4$ solve before the sum; the
-order-32 sums are the head and the 24→32 change prints as its spread. The
-metal pair split reads the same polygon's Coulomb moment
-(`vcoul.minibz_coulomb_moment(..., is_2d=True)`, $Q_{zz}=0$).
+The cell is the exact in-plane Wigner–Seitz polygon of the mini lattice,
+cut into the charge head's Γ-to-edge triangles with the Duffy map
+$\mathbf q=r[(1-s)\mathbf v_i+s\mathbf v_{i+1}]$, whose Jacobian $r$
+cancels the $1/q$ cusp. The integrand is a cusp, not a pole, so there is no
+sphere. The screened TT block has one more scale: at $z\ne0$,
+$W_{TT}-D_{TT}\propto q^*/(q+q^*)$ after the Jacobian, with
+$q^*\sim8\pi z_c|\Pi_{TT}-C|$ far inside the cell. A single radial
+Gauss–Legendre panel reaches it only algebraically (TT 3 % at 32 points on
+CrI3 3×3, while CC is at 1e-11), so the head uses the graded rule
+(`vcoul.slab_minibz_graded_photon_cubature`): seven geometric radial panels
+$[0,4^{-6}],[4^{-6},4^{-5}],\dots,[\tfrac14,1]$ with 8/12/16 points each
+and 32 along each edge (1e-10 at 12 points). Every node takes the
+$4\times4$ solve before the sum; the 16-point sums are the head and the
+12→16 change per field goes to the bank receipt. The metal pair split reads
+the polygon's Coulomb moment (`vcoul.minibz_coulomb_moment(...,
+is_2d=True)`, $Q_{zz}=0$).
 
 ## 6. Code owners
 
