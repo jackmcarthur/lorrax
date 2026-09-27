@@ -83,7 +83,6 @@ def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output):
     with timing.section("spole.entry"):
         import numpy as np
         from jax.sharding import NamedSharding, PartitionSpec as P
-        import distrib_la
         from runtime.padding import mesh_divisor
         from file_io.shared_pole_store import (
             charge_representation, validate_shared_pole_bank, open_shared_pole_bank,
@@ -153,7 +152,7 @@ def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output):
         # ordered bank builds without it and records the moments NOT_MEASURED.
         odd_moments = ordered and bool(header.get("odd_moments", False))
         logical_n = int(meta.n_rmu)
-        from gw.shared_pole_execution import constructor_side_upper_bound
+        from gw.shared_pole_execution import constructor_side_upper_bound, local_reduction_fits
         execution, execution_receipt, column_extent, selection_faces, moment_fields = constructor_route(
             meta, config, recipe, mesh_xy=mesh_xy, ledger=ledger, upstream=upstream,
             ordered=ordered, odd_moments=odd_moments,
@@ -265,9 +264,8 @@ def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output):
                 side = int(table["active"].shape[-1])
                 padding_bytes = round_padding_output_bytes(
                     round_states, infinity, widths, infinity_width)
-                if execution == 'local' and not distrib_la.fits_local(
-                        budget.eigenplan(side), "eigh", ((1, side, side),) * 8,
-                        np.complex128, ledger.device_budget_bytes_per_rank):
+                if execution == 'local' and not local_reduction_fits(
+                        budget.eigenplan(side), side, ledger.device_budget_bytes_per_rank):
                     return False
                 return budget.preview(side, phase="reduction",
                     padding_output_bytes_per_rank=padding_bytes)["device_budget_status"] == "PASS"
@@ -280,10 +278,11 @@ def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output):
                 # Resolve before either reduction program is traced. Local
                 # mode's native route still has its own workspace guard.
                 local_eigh = budget.eigenplan(side)
-                if execution == 'local' and not distrib_la.fits_local(
-                        local_eigh, "eigh", ((1, side, side),) * 8,
-                        np.complex128, ledger.device_budget_bytes_per_rank):
-                    raise ValueError(f"GATE shared_pole_round_capacity: got: pencil side {side} at parents {ids[:real]}; want: eight [side, side] complex blocks and the eigh workspace within {ledger.device_budget_bytes_per_rank} bytes on one device; why: every parent reduces on its own rank")
+                if execution == 'local' and not local_reduction_fits(
+                        local_eigh, side, ledger.device_budget_bytes_per_rank):
+                    # Routing admitted 'local' at the conservative side, which bounds
+                    # this side; reaching here is a broken bound, not a deck limit.
+                    raise ValueError(f"GATE shared_pole_round_capacity: got: pencil side {side} at parents {ids[:real]} above the routed conservative side {conservative_side}; want: the routing bound to hold; why: constructor_execution sends a parent that cannot reduce on one device to the face")
                 budget.plan(side, phase="reduction",
                     padding_output_bytes_per_rank=padding_bytes)
                 if reuse:
@@ -320,13 +319,14 @@ def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output):
                         raise ValueError(
                             f"GATE shared_pole_{name}: got: failed at q={q}, "
                             f"Gram min/max={round_reduction['gram_min_relative'][slot]}, "
+                            f"rounding floor/max={round_reduction['gram_floor_relative'][slot]}, "
                             f"paired H_r min/max={round_reduction['paired_min_relative'][slot] if ordered else 'n/a'}, "
                             f"metric infinity norm={round_reduction['metric_initial_infinity_norm'][slot]}, "
                             f"inverse-root residual={round_reduction['metric_inverse_root_residual_relative'][slot]}; "
-                            f"want: Gram min/max >= {gates['normalized_gram_validity']['threshold']} "
+                            f"want: Gram min >= -(propagated float64 floor) (gram_rounding_validity) "
                             "and valid diagonal/retained metric; why: no PSD repair")
                 if not round_zero["zero_policy"][slot]:
-                    raise ValueError(f"GATE shared_pole_zero_ritz: got: failed at q={q}; want: finite positive response within dropped-weight budget; why: no pole clipping")
+                    raise ValueError(f"GATE shared_pole_zero_ritz: got: failed at q={q}, dropped {round_zero['dropped_count'][slot]} Ritz values carrying {round_zero['dropped_factor_weight_fraction'][slot]:.3e} of the factor weight; want: finite positive response within dropped-weight budget; why: no pole clipping")
                 # The ordered identity is on the ORIGINAL infinity directions: exact only for the
                 # full Galerkin span, projection accuracy after the keep/retention cuts. It is
                 # reported beside the full_m1/full_m3 diagnostic bands, as the TRS route reports

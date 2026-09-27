@@ -347,7 +347,8 @@ four-component charge store has its own `representation` row
 | gate | certifies | refuses? |
 |---|---|---|
 | `representation` | TRS: `nspinor` 1/2 and TRS allowed; ordered: TRS broken and an ordered bank | yes |
-| `normalized_gram_validity` | equilibrated Gram (or $\mathcal H'_{vv}$) spectrum $\gamma_{\min}/\gamma_{\max}\ge-10^{-7}$ | yes |
+| `gram_rounding_validity` | equilibrated Gram (or $\mathcal H'_{vv}$) $\gamma_{\min}\ge-(\gamma_n\lVert D^{-1/2}\Sigma D^{-1/2}\rVert_F+Ru\,\gamma_{\max})$: Weyl with $\Sigma_{ab}$ the uncancelled magnitude of each divided difference, $(\lVert O_a\rVert+\lVert O_b\rVert)/\lvert s_b-\bar s_a\rvert$ ($\lVert D\rVert$ when confluent), $\gamma_n=nu/(1-nu)$ (`shared_pole_reduction.gram_rounding_floor`) | yes |
+| `normalized_gram_validity` | $\gamma_{\min}/\gamma_{\max}\ge-10^{-7}$: the photon sector route, the ordered paired $H_r$, and direct unit calls only | yes |
 | `normalized_gram_keep` | retained rank at the cut ($10^{-8}$; ordered $10^{-7}$, sector spans $10^{-5}$) | diagnostic |
 | `retained_subspace_moments` | TRS: projected $M_1,M_3$ identity to $10^{-10}$; ordered: $m_0..m_3$ on the infinity directions | TRS yes; ordered diagnostic |
 | `zero_ritz_policy` | $\lambda\le10^{-6}$ Ry² dropped within $10^{-6}$ factor weight; ordered also `infinite_weight_ok` | yes |

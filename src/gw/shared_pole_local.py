@@ -310,12 +310,15 @@ def solve_parent_pencil(points, q, o, d, infinity, active, *, eigh, matmul,
     from gw.shared_pole_pencil import assemble_ordered_shared_pole_pencil, assemble_shared_pole_pencil
     from gw.shared_pole_reduction import reduce_ordered_shared_pole_pencil, reduce_shared_pole_pencil
     finite = [(points, q, o, d)]
+    # Support geometry of the Gram validity floor (shared_pole_reduction.gram_rounding_floor).
+    rounding = dict(points=points, derivative_norm=jnp.linalg.norm(d, axis=-2), rows=int(q.shape[-2]))
     if ordered:
         pencil = assemble_ordered_shared_pole_pencil(finite, infinity if odd_moments else None,
                                                      matmul=matmul, matrix_sharding=matrix_sharding)
         reduced = reduce_ordered_shared_pole_pencil(
             pencil, active, eigh=eigh, matmul=matmul, gates=gates, keep_budget=keep_budget,
-            retain_span=retain_span, matrix_sharding=matrix_sharding, gram_keep=gram_keep)
+            retain_span=retain_span, matrix_sharding=matrix_sharding, gram_keep=gram_keep,
+            rounding=rounding)
         model, signed, reduction = reduced[:3]
         if retain_span:
             coefficients = reduced[3]
@@ -325,7 +328,8 @@ def solve_parent_pencil(points, q, o, d, infinity, active, *, eigh, matmul,
     else:
         pencil = assemble_shared_pole_pencil(finite, infinity, matmul=matmul)
         model, reduction, coefficients = reduce_shared_pole_pencil(
-            pencil, active, eigh=eigh, matmul=matmul, gates=gates, keep_budget=keep_budget)
+            pencil, active, eigh=eigh, matmul=matmul, gates=gates, keep_budget=keep_budget,
+            rounding=rounding)
         model, zero = apply_shared_pole_zero_policy(model, gates=gates)
         # E selects the infinity block, the last columns of X.
         side, width = pencil[0].shape[-1], infinity[0].shape[-1]
