@@ -37,6 +37,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <cstdlib>
 #include <cstdio>
 #include <map>
 #include <mutex>
@@ -427,6 +428,16 @@ struct DecodeGeo {
     double scale;
 };
 
+#ifndef LRX_LU
+#define LRX_LU 1
+#endif
+#ifndef LRX_GO
+#define LRX_GO 1
+#endif
+#ifndef LRX_MLP
+#define LRX_MLP 8
+#endif
+constexpr int LU = LRX_LU;
 constexpr int NX = LRX_NX, NY = LRX_NY, NZ = LRX_NZ, NK = NX * NY * NZ;
 constexpr int KK = LRX_K, H = KK / 4, MB = LRX_MB, TR = 64, NWARP = LRX_THREADS / 32;
 constexpr int GT = LRX_THREADS / 2, GW = NWARP / 2;   // threads and warps of one group
@@ -481,6 +492,7 @@ __device__ __forceinline__ int pcol(int x, int y) { return x * 8 + (y ^ fperm(x)
 // group's warps take k = wl, wl + GW, ...
 __device__ __forceinline__ void load_t(lrx_c2* bank, const double2* lb, const double2* rb, int wl, int gr,
                                        int tg) {
+#pragma unroll LU
     for (int k = wl; k < NK; k += GW) {
         double re0 = 0.0, re1 = 0.0, im0 = 0.0, im1 = 0.0;
 #pragma unroll
@@ -530,7 +542,7 @@ __device__ __forceinline__ void mid_staged(lrx_c2* bank, const lrx_c2* vs, int x
 #endif
 // Mid: mode 2's KernMid product with V[x, y, k] read from L2 (k fastest: a warp reads 512
 // contiguous bytes), MLP loads in flight per thread before the products.
-constexpr int MLP = 8;
+constexpr int MLP = LRX_MLP;
 __device__ __forceinline__ void mid_l2(lrx_c2* bank, const lrx_c2* __restrict__ V, int xb, int yb, int xlim,
                                        int ylim, const DecodeGeo& g, int tid) {
     const double2* vb = reinterpret_cast<const double2*>(V + ((long long)xb * 8 * g.my + yb * 8) * NK);
@@ -628,7 +640,7 @@ extern "C" __global__ void __launch_bounds__(LRX_THREADS, 1) lrx_kconv_outer_dec
 #endif
                 load_t(bank0, L2 + (unsigned)(aA * (int)g.nxb + xA) * (unsigned)(NK * H * 32), rb, wl, gr, tg);
                 gsync();
-                if (s == 0 && two) bar_arrive(BAR_GO, LRX_THREADS);
+                if (LRX_GO && s == 0 && two) bar_arrive(BAR_GO, LRX_THREADS);
                 lrx_kbox::transform3<NX, NY, NZ, TR, LRX_SM, fft_direction::inverse>(bank0, gtid, GT, gsync);
                 const int xlim = min(8, (int)g.mx - xA * 8);
 #if LRX_VSTAGE
@@ -654,7 +666,7 @@ extern "C" __global__ void __launch_bounds__(LRX_THREADS, 1) lrx_kconv_outer_dec
                 if (two) {
                     const int aB = pb_ % na, xB = pb_ / na;
                     if (s > 0) bar_sync(BAR_EMPTY + 1, LRX_THREADS);
-                    if (s == 0) bar_sync(BAR_GO, LRX_THREADS);
+                    if (LRX_GO && s == 0) bar_sync(BAR_GO, LRX_THREADS);
                     load_t(bank1, L2 + (unsigned)(aB * (int)g.nxb + xB) * (unsigned)(NK * H * 32), rb, wl, gr, tg);
                     gsync();
                     lrx_kbox::transform3<NX, NY, NZ, TR, LRX_SM, fft_direction::inverse>(bank1, gtid, GT, gsync);
@@ -803,6 +815,9 @@ static ffi::Error build_decode(int nkx, int nky, int nkz, int K, int mb, int con
         "-DLRX_K=" + std::to_string(K), "-DLRX_THREADS=" + std::to_string(kThreads),
         "-DLRX_MB=" + std::to_string(mb), "-DLRX_CONJ=" + std::to_string(conj_r), "-DLRX_FMA=" + std::to_string(fma),
         "-DLRX_VSTAGE=" + std::to_string(vstage), "-DLRX_SM=" + std::to_string(cc_major * 100 + cc_minor * 10)};
+    if (const char* e = std::getenv("LRX_BSEPP_EXP")) {   // EXPERIMENT ONLY (removed before landing)
+        std::istringstream is(e); std::string d; while (is >> d) prog.defs.push_back(d);
+    }
     nvrtc::mathdx_toolchain(root, cuda_inc, "cufftdx", &prog);
     prog.kernel = "lrx_kconv_outer_decode";
     std::string missing;
