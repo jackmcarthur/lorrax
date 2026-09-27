@@ -3945,10 +3945,13 @@ def sigma_requested_edges_ev(sigma):
     """Requested Sigma grid edges (eV); an unset edge is the sample next to E_F."""
     step = float(sigma.omega_step_ev)
     lo, hi = getattr(sigma, "omega_min_ev", None), getattr(sigma, "omega_max_ev", None)
-    return (min(-step, float(hi)) if lo is None and hi is not None else
-            -step if lo is None else float(lo),
-            max(step, float(lo)) if hi is None and lo is not None else
-            step if hi is None else float(hi))
+    if any(value is not None and not np.isfinite(float(value)) for value in (lo, hi)):
+        raise ValueError("sigma_omega_min_ev/max_ev must be finite when set.")
+    if lo is None:
+        return -step, step if hi is None else max(step, float(hi))
+    if hi is None:
+        return min(-step, float(lo)), step
+    return float(lo), float(hi)
 
 
 @dataclass(frozen=True)
