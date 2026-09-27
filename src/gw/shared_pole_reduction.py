@@ -58,6 +58,136 @@ def _metric_inverse_root(metric, *, matmul, tolerance, matrix_sharding=None):
 
 
 
+_UNIT_ROUNDOFF = float(jnp.finfo(jnp.float64).eps) / 2
+
+
+def _frobenius_by_rows(entry, rows, block=512):
+    """sqrt(sum of entry**2) over all rows, one bounded [b, block, R] row block at a time."""
+    starts = jnp.arange(-(-int(rows) // block)) * block
+
+    def one(start):
+        idx = start + jnp.arange(block)
+        valid = idx < rows
+        value = entry(jnp.minimum(idx, rows - 1))
+        return jnp.sum(jnp.where(valid[None, :, None], value, 0.0) ** 2, axis=(-2, -1))
+    return jnp.sqrt(jnp.sum(jax.lax.map(one, starts), axis=0))
+
+
+def _divided_difference_scale(x, xr, o, orow, d, drow):
+    """Uncancelled magnitude of one resolvent-identity Gram entry (W 18).
+
+    G_ab = (Q_a^H O_b - O_a^H Q_b)/(x_b - conj x_a) with unit directions: the
+    numerator's two inner products have magnitudes <= |O_a|, |O_b|, so its
+    rounding is gamma_n (|O_a| + |O_b|) and the entry's is that over the
+    denominator. A confluent entry is the derivative action, <= |D|.
+    Rows [b, blk] (xr, orow, drow) against columns [b, R] (x, o, d).
+    """
+    den = jnp.abs(x[:, None, :] - jnp.conj(xr)[:, :, None])
+    mag = jnp.maximum(1.0, jnp.maximum(jnp.abs(xr)[:, :, None], jnp.abs(x)[:, None, :]))
+    conf = den <= 8 * jnp.finfo(jnp.float64).eps * mag
+    return jnp.where(conf, 0.5 * (drow[:, :, None] + d[:, None, :]),
+                     (orow[:, :, None] + o[:, None, :]) / jnp.where(conf, 1.0, den))
+
+
+def gram_rounding_floor(scale, rounding, output_norm, *, finite):
+    """Rounding floor of the equilibrated even Gram's spectrum (Weyl bound).
+
+    The exact Gram X^H X is PSD, so a computed eigenvalue below zero is
+    rounding. Each entry is a divided difference of sample actions (W 18,
+    W 19) whose float64 error is at most gamma_n times its uncancelled
+    magnitude Sigma_ab (``_divided_difference_scale``; infinity rows
+    Q_inf^H O_b carry |O_b|, the moment block |2 M1 Q_inf|), with
+    gamma_n = n u / (1 - n u) for inner products of length n. Equilibration
+    scales Sigma by D^-1/2 on both sides, and Weyl's inequality gives
+    gamma_min >= -||E||_2 >= -gamma_n ||D^-1/2 Sigma D^-1/2||_F. The
+    eigensolver adds R u gamma_max. The floor is therefore relative to the
+    cancelled scale of the entries, not to the Gram itself: close supports,
+    small diagonals and large outputs raise it; a well-separated pencil
+    gets a floor far below the old fixed 1e-7.
+
+    ``scale`` [b,R] is 1/sqrt(diag G) (0 on inert columns); ``rounding`` holds
+    ``points`` [b,F] (s, Ry^2), ``derivative_norm`` [b,F] and ``rows`` (n);
+    ``output_norm`` [b,R] the column norms of O (infinity columns 2 M1 Q_inf).
+    Returns the absolute floor [b] on the equilibrated spectrum, before R u gamma_max.
+    """
+    side = scale.shape[-1]
+    n = float(rounding["rows"])
+    gamma_n = n * _UNIT_ROUNDOFF / (1 - n * _UNIT_ROUNDOFF)
+    pad = ((0, 0), (0, side - finite))
+    x = jnp.pad(jnp.asarray(rounding["points"], jnp.complex128), pad)
+    d = jnp.pad(jnp.asarray(rounding["derivative_norm"], jnp.float64), pad)
+    o = output_norm
+    inf = jnp.arange(side) >= finite
+
+    def entry(idx):
+        ri, ci = inf[idx][None, :, None], inf[None, None, :]
+        orow = o[:, idx]
+        finite_block = _divided_difference_scale(x, x[:, idx], o, orow, d, d[:, idx])
+        mixed = jnp.where(ri, o[:, None, :], orow[:, :, None])
+        moments = 0.5 * (orow[:, :, None] + o[:, None, :])
+        value = jnp.where(ri & ci, moments, jnp.where(ri | ci, mixed, finite_block))
+        return scale[:, idx][:, :, None] * value * scale[:, None, :]
+    return gamma_n * _frobenius_by_rows(entry, side)
+
+
+def ordered_gram_rounding_floor(scale, rounding, output_norm, *, half, finite, n_inf, inverse):
+    """Rounding floor of the equilibrated paired Gram H'_vv (ordered route).
+
+    Same Weyl argument as ``gram_rounding_floor`` on the v-block of the paired
+    basis. Original H entries are H_ab = z_b G_ab - O_a^H Q_b (W 25), so after
+    the Hermitian part their rounding is gamma_n [(|z_a|+|z_b|) Sigma_ab +
+    |O_a| + |O_b|]/2 with Sigma_ab the divided-difference scale in z. The
+    v rows/columns are v_p = (x_p - x_{p+half})/(2 z_p) (and k0 at infinity),
+    so their bounds add the four (or two) parent entries times |1/(2 z)|;
+    k0 rows are z_b Q_inf^H O_b - 2 (M0 Q_inf)^H Q_b, bounded by
+    |z_b||O_b| + |2 M0 Q_inf|, and the k0-k0 block 2 Q^H M1 Q by |2 M1 Q_inf|.
+    ``output_norm`` [b, finite + 2 n_inf] are the column norms of O joined with
+    2 [M0 Q_inf, M1 Q_inf]; ``scale`` [b, half + n_inf] is the v-block equilibration.
+    """
+    n = float(rounding["rows"])
+    gamma_n = n * _UNIT_ROUNDOFF / (1 - n * _UNIT_ROUNDOFF)
+    z = jnp.asarray(rounding["points"], jnp.complex128)
+    d = jnp.asarray(rounding["derivative_norm"], jnp.float64)
+    o = output_norm[:, :finite]
+    m0 = output_norm[:, finite:finite + n_inf]
+    m1 = output_norm[:, finite + n_inf:finite + 2 * n_inf]
+    inv = jnp.abs(inverse)
+    side = half + n_inf
+
+    def h_bound(rows, cols):
+        # Hermitian-part rounding of original finite H entries, rows x cols [b, r, c].
+        zr, zc = z[:, rows], z[:, cols]
+        sig = _divided_difference_scale(zc, zr, o[:, cols], o[:, rows], d[:, cols], d[:, rows])
+        return 0.5 * ((jnp.abs(zr)[:, :, None] + jnp.abs(zc)[:, None, :]) * sig
+                      + o[:, rows][:, :, None] + o[:, cols][:, None, :])
+
+    def k0_bound(rows):
+        # k0 row i against original finite column b.
+        return (jnp.abs(z)[:, None, :] * o[:, None, :]) + m0[:, rows][:, :, None]
+
+    pair = jnp.arange(half)
+
+    def entry(idx):
+        is_inf = idx >= half
+        p = jnp.where(is_inf, 0, idx)
+        ff = inv[:, p][:, :, None] * inv[:, None, :] * (
+            h_bound(p, pair) + h_bound(p, pair + half)
+            + h_bound(p + half, pair) + h_bound(p + half, pair + half))
+        if not n_inf:
+            return scale[:, idx][:, :, None] * ff * scale[:, None, :]
+        i = jnp.where(is_inf, idx - half, 0)
+        k0_all = k0_bound(jnp.arange(n_inf))
+        fk = inv[:, p][:, :, None] * (k0_all[:, :, p] + k0_all[:, :, p + half]).swapaxes(-1, -2)
+        kf_all = k0_bound(i)
+        kf = inv[:, None, :] * (kf_all[:, :, pair] + kf_all[:, :, pair + half])
+        kk = 0.5 * (m1[:, i][:, :, None] + m1[:, None, :])
+        top = jnp.concatenate((ff, fk), axis=-1)
+        bottom = jnp.concatenate((kf, kk), axis=-1)
+        value = jnp.where(is_inf[None, :, None], bottom, top)
+        return scale[:, idx][:, :, None] * value * scale[:, None, :]
+    return gamma_n * _frobenius_by_rows(entry, side)
+
+
 def _within_budget(gamma, budget):
     """The largest ``budget`` entries of each ascending spectrum row (all when None)."""
     if budget is None:
@@ -65,7 +195,26 @@ def _within_budget(gamma, budget):
     return jnp.arange(gamma.shape[-1])[None, :] >= gamma.shape[-1] - int(budget)
 
 
-def reduce_shared_pole_pencil(pencil, active_columns, *, eigh, matmul, gates, keep_budget=None):
+def _validity_floor(scale, rounding, output_norm, largest, *, gates, ordered, **paired):
+    """Absolute floor [b] on the equilibrated Gram's smallest eigenvalue.
+
+    With the support geometry (``rounding``) the floor is the propagated
+    float64 bound of ``gram_rounding_floor`` / ``ordered_gram_rounding_floor``
+    plus the eigensolver's R u gamma_max (gate row ``gram_rounding_validity``);
+    without it, the legacy fixed relative row ``normalized_gram_validity``.
+    """
+    if rounding is None:
+        return -gates["normalized_gram_validity"]["threshold"] * jnp.maximum(largest, 0)
+    if ordered:
+        bound = ordered_gram_rounding_floor(scale, rounding, output_norm, **paired)
+    else:
+        bound = gram_rounding_floor(scale, rounding, output_norm, finite=int(rounding["points"].shape[-1]))
+    factor = float(gates["gram_rounding_validity"]["threshold"]["bound_factor"])
+    return factor * bound + scale.shape[-1] * _UNIT_ROUNDOFF * jnp.maximum(largest, 0)
+
+
+def reduce_shared_pole_pencil(pencil, active_columns, *, eigh, matmul, gates, keep_budget=None,
+                              rounding=None):
     """Equilibrate the Gram matrix and compute its corrected Ritz model.
 
     Parameters
@@ -86,6 +235,10 @@ def reduce_shared_pole_pencil(pencil, active_columns, *, eigh, matmul, gates, ke
         The recipe's pole budget: at most this many equilibrated-Gram
         directions survive the keep cut, the largest first. The Ritz step
         then acts on that subspace, so K <= keep_budget.
+    rounding : mapping, optional
+        ``points`` [b,F] (s), ``derivative_norm`` [b,F] and ``rows`` (n) of the
+        finite columns, for the Gram validity floor (``gram_rounding_floor``).
+        Without it (direct unit calls) the floor is the legacy fixed row.
 
     Returns
     -------
@@ -101,6 +254,8 @@ def reduce_shared_pole_pencil(pencil, active_columns, *, eigh, matmul, gates, ke
         Returned for retained-space diagnostics, never a frozen SC basis.
     """
     g, h, output = pencil
+    # Raw column norms, before equilibration: the rounding floor's |O_a|.
+    output_norm = None if rounding is None else jnp.linalg.norm(output, axis=-2)
     diagonal = jnp.real(jnp.diagonal(g, axis1=-2, axis2=-1))
     diagonal_ok = jnp.all(jnp.where(active_columns,
                                   jnp.isfinite(diagonal) & (diagonal > 0),
@@ -115,8 +270,9 @@ def reduce_shared_pole_pencil(pencil, active_columns, *, eigh, matmul, gates, ke
     gamma, u = eigh(hermitian_part(g))
     largest = gamma[:, -1]
     ratio = gamma[:, 0] / jnp.where(largest > 0, largest, 1)
+    floor = _validity_floor(scale, rounding, output_norm, largest, gates=gates, ordered=False)
     gram_ok = ((largest > 0) & jnp.all(jnp.isfinite(gamma), axis=-1)
-               & (ratio >= gates["normalized_gram_validity"]["threshold"]))
+               & (gamma[:, 0] >= -floor))
     keep = gamma > gates["normalized_gram_keep"]["threshold"] * largest[:, None]
     keep = keep & (largest[:, None] > 0) & _within_budget(gamma, keep_budget)
     count = jnp.sum(keep, axis=-1, dtype=jnp.int64)
@@ -144,6 +300,7 @@ def reduce_shared_pole_pencil(pencil, active_columns, *, eigh, matmul, gates, ke
         "gram_diagonal_positive": diagonal_ok,
         "gram_valid": gram_ok,
         "gram_min_relative": ratio,
+        "gram_floor_relative": floor / jnp.where(largest > 0, largest, 1),
         "gram_spectrum_relative": gamma / jnp.where(largest > 0, largest, 1)[:, None],
         "retained_rank": count,
         "gram_condition": largest / jnp.min(jnp.where(keep, gamma, jnp.inf), axis=-1),
@@ -194,7 +351,8 @@ def _restricted_block(ww, wv, vv):
 
 
 def reduce_ordered_shared_pole_pencil(pencil, active_columns, *, eigh, matmul, gates, keep_budget=None,
-                                     retain_span=False, matrix_sharding=None, gram_keep=None):
+                                     retain_span=False, matrix_sharding=None, gram_keep=None,
+                                     rounding=None):
     """Paired-basis Ritz reduction of the particle-hole pencil.
 
     ``pencil=(G,H,O,z)`` from ``assemble_ordered_shared_pole_pencil`` over paired
@@ -262,6 +420,12 @@ def reduce_ordered_shared_pole_pencil(pencil, active_columns, *, eigh, matmul, g
     gamma, u = eigh(hermitian_part(h_vv))
     largest = gamma[:, -1]
     ratio = gamma[:, 0] / jnp.where(largest > 0, largest, 1)
+    # The finite paired columns are exactly the first ``half`` of the v-block.
+    floor = _validity_floor(scale, None if rounding is None else dict(
+        rounding, points=rounding["points"][:, :finite],
+        derivative_norm=rounding["derivative_norm"][:, :finite]),
+        None if rounding is None else jnp.linalg.norm(output, axis=-2), largest,
+        gates=gates, ordered=True, half=half, finite=finite, n_inf=n_inf, inverse=inverse)
     keep = ((gamma > keep_cut * largest[:, None]) & (largest[:, None] > 0)
             & _within_budget(gamma, keep_budget))
     count = jnp.sum(keep, axis=-1, dtype=jnp.int64)
@@ -341,13 +505,14 @@ def reduce_ordered_shared_pole_pencil(pencil, active_columns, *, eigh, matmul, g
     b = c * (jnp.sqrt(2.0) / safe * positive)[:, None, :]
     poles2 = jnp.where(positive, 1 / safe**2, 1.0)
     budget = gates["zero_ritz_policy"]["threshold"]["max_dropped_weight_fraction"]
-    gram_ok = ((largest > 0) & jnp.all(jnp.isfinite(gamma), axis=-1) & (ratio >= validity)
+    gram_ok = ((largest > 0) & jnp.all(jnp.isfinite(gamma), axis=-1) & (gamma[:, 0] >= -floor)
                & jnp.all(jnp.isfinite(gamma_r), axis=-1) & (ratio_r >= validity))
     diagnostics = {
         **metric_diagnostics,
         "gram_diagonal_positive": diagonal_ok,
         "gram_valid": gram_ok,
         "gram_min_relative": ratio,
+        "gram_floor_relative": floor / jnp.where(largest > 0, largest, 1),
         "paired_min_relative": ratio_r,
         "paired_rank": count_r,
         "gram_spectrum_relative": gamma / jnp.where(largest > 0, largest, 1)[:, None],
