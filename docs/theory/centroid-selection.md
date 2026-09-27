@@ -5,7 +5,9 @@ grid snapping, symmetry-orbit closure and optional candidate-Gram pruning.
 This page distinguishes its objective from possible replacements. The fit
 and its conditioning are owned by [ISDF](isdf-zeta-vq.md) and the
 [rank policy](../dev/rank_truncation_policy.md); the selected band windows
-must satisfy [basis adequacy](../dev/isdf_basis_adequacy_at_large_nband.md).
+must satisfy [basis adequacy](../dev/isdf_basis_adequacy_at_large_nband.md);
+the counts that adequacy takes are measured in
+[ISDF exchange accuracy](isdf-exchange-accuracy.md).
 Full-grid pivoting and continuous point refinement below are designs, not
 implemented production routes or measured speedups.
 
