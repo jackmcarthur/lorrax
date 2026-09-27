@@ -43,9 +43,10 @@ kmeans. It reads kin_ion for the QP Hamiltonian and dipoles for the Γ head (sta
 
 ## One frequency integration
 
-The Σ(ω) quadrature is reused whole, not copied. `_integrate_sigma_batches` already
-takes a `tau_kernel_factory`, and `ppm_tau_kernel.get_shared_sigma_tau_kernel`
-(`ppm_tau_kernel.py:368`) already takes a caller's `_sigma_kij`. The planned windows,
+The Σ(ω) quadrature is reused whole, not copied. `compute_sigma_c_mpa_omega_grid`
+passes a `tau_kernel_factory` through `integrate_sigma_store` to
+`_integrate_sigma_batches`, and `ppm_tau_kernel.get_shared_sigma_tau_kernel` takes a
+caller's `_sigma_kij`. The planned windows,
 the box rules (`sigma_box_plan.plan_sigma_windows`, :1588), the pole windows,
 `build_shared_w_tau` (:329) and `DeviceOmegaAccumulator` (`ppm_accumulators.py:76`)
 are unchanged. The τ body enters the Σ owner, then leaves for the plane-wave product:
@@ -55,18 +56,24 @@ are unchanged. The τ body enters the Σ owner, then leaves for the plane-wave p
         Σ_k = −X/(Ω·N_r²),  X = pair_conv['scalar'](G, W_t)                     # K2
         return project(ψ_nmu, ψ_mun, Σ_k)                                        # the face projector
 
-The ISDF `sigma_kij` differs only in its middle line (`get_sigma_spatial_kernel`,
-`ppm_tau_kernel.py:94`: the ISDF k-convolution). χ is the same: each τ node of a
-`minimax_screening` rule is one `'trace'` pair convolution per orientation, summed into
-every sample row by `accumulate_chi`. The MPA fit and the shared-pole constructor act
-on (q, G, G') tiles as they act on (q, μ, ν).
+The ISDF `sigma_kij` differs only in its middle line (`get_sigma_spatial_kernel`:
+the ISDF k-convolution). The projector is the one face projector,
+`common.contract_bands.contract_bands_block_reshard`, on Σ_k reordered spin-major.
 
-Two things must change to wire stage 8, and both are small:
-- `compute_sigma_c_mpa_omega_grid` (`mpa/sigma.py:1505`) → `integrate_sigma_store`
-  (:1392) must pass a `tau_kernel_factory` through (today only the shared-pole sector
-  route passes one).
-- `MemoryPoleSource` (:1323) must accept the sphere carrier as its "μ" extent, and the
-  poles must live on the q wedge = the k-parents.
+χ at the MPA samples goes through the MPA owner's route dispatch,
+`mpa.model._evaluate_samples`, with this basis as its χ producer (`chi=`): the plan is
+`make_mpa_plan` on `build_static_quadrature`, so the z grid and every rule are the ISDF
+run's. Each τ node is one `'trace'` pair convolution, summed into every sample row by
+`accumulate_chi`. The conduction Green carries e^{-(E−μ)τ}, the valence Green
+e^{+(E−μ)τ̄} (the right operand is read conjugated), so each pair carries e^{-Δτ}:
+- static and imaginary points: the minimax rule on both particle–hole orientations;
+- line points: the damped-line rule, nodes ±i·t on one orientation, weights
+  `w_isdf._chi0_contour_alpha_rows` about E_gap = 0.
+
+W then goes `SphereScreening.solve_samples` → `correlation` → `fit_poles`. The poles
+enter `MemoryPoleSource(axis=SphereScreening.axis)` on the q-IBZ rows; the plane-wave
+τ body reads them through its own sphere transport. The k tables are a `SphereKPlan`;
+its `parent_rows` is `centroid_k_unfold.parent_rows`, the centroid plan's own.
 
 ## Symmetry and time
 
@@ -90,9 +97,9 @@ in the first cut.
 
 - The Γ head and wings. v(q+G=0) = 0, and the Γ W is the head-removed body. The
   wing producer (G4) and the head owner's S(z) are not wired.
-- The MPA sample route at complex z. The cut computes χ and W at imaginary
-  frequencies only, through the minimax rules.
-- Stage 8 (Σ_c) and stage 9. The seam is specified above.
+- Stage 9 as an owner call. `--deck` computes Σ_x and Σ_c(ω) and interpolates
+  Σ_c at E_DFT; eqp0 is assembled by the caller from the ISDF run's kin_ion and V_H.
+- Band-tail extrapolation. The plane-wave Σ_c sums the deck's bands only.
 - n_s = 2 and bispinors. The pair convolution supports them; the cut refuses
   antiunitary k rows.
 - The r'-column wedge is an option (`--wedge`). It needs operands covariant under the

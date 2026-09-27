@@ -64,6 +64,40 @@ class OperationClasses(NamedTuple):
     parent_rows: np.ndarray
 
 
+def parent_rows(irr_idx, n_parent: int, array, *, axis: int = 0):
+    """Select raw-parent rows from a full-k scalar table.
+
+    This helper is only for quantities such as energies and occupations
+    that are invariant within a star.  Wavefunctions must be loaded from
+    the raw WFN parent rows; selecting file-wedge rows from an unfolded
+    wavefunction is not equivalent when that row carries a nonidentity or
+    antiunitary action.  ``irr_idx`` maps each full-k row to its raw parent
+    (``SymMaps.irr_idx_k``); every k plan (the centroid plan here, the
+    plane-wave sphere plan) selects through this one function.
+    """
+    irr_idx = np.asarray(irr_idx)
+    src = jnp.asarray(array)
+    axis = int(axis) % src.ndim
+    if int(src.shape[axis]) != int(irr_idx.shape[0]):
+        raise ValueError(
+            "parent_rows: full-k axis has extent "
+            f"{src.shape[axis]}, expected {int(irr_idx.shape[0])}.")
+    # irr_idx maps full rows to raw WFN parent rows.  Several raw rows may
+    # be symmetry-redundant, but every parent used by a child carries the
+    # same scalar value.  Scatter picks one child per raw parent without
+    # imposing a star-wedge gauge on wavefunctions.
+    source = np.full((int(n_parent),), -1, dtype=np.int32)
+    for full, parent in enumerate(irr_idx):
+        source[int(parent)] = int(full)
+    unused = source < 0
+    if np.any(unused):
+        # Unused raw WFN rows have no full-zone consumer.  Their values
+        # are immaterial but keeping the parent carrier rectangular makes
+        # the direct irr_idx gather simple and stable.  Fill from row zero.
+        source[unused] = 0
+    return jnp.take(src, jnp.asarray(source), axis=axis)
+
+
 @dataclass(frozen=True, eq=False)
 class CentroidKUnfoldPlan:
     """Authenticated raw-parent/full-k transport for one centroid basis.
@@ -275,34 +309,8 @@ class CentroidKUnfoldPlan:
         return int(self.layout.axis.n_padded)
 
     def parent_rows(self, array, *, axis: int = 0):
-        """Select raw-parent rows from a full-k scalar table.
-
-        This helper is only for quantities such as energies and occupations
-        that are invariant within a star.  Wavefunctions must be loaded from
-        the raw WFN parent rows; selecting file-wedge rows from an unfolded
-        wavefunction is not equivalent when that row carries a nonidentity or
-        antiunitary action.
-        """
-        src = jnp.asarray(array)
-        axis = int(axis) % src.ndim
-        if int(src.shape[axis]) != self.n_full:
-            raise ValueError(
-                "CentroidKUnfoldPlan.parent_rows: full-k axis has extent "
-                f"{src.shape[axis]}, expected {self.n_full}.")
-        # irr_idx maps full rows to raw WFN parent rows.  Several raw rows may
-        # be symmetry-redundant, but every parent used by a child carries the
-        # same scalar value.  Scatter picks one child per raw parent without
-        # imposing a star-wedge gauge on wavefunctions.
-        source = np.full((self.n_parent,), -1, dtype=np.int32)
-        for full, parent in enumerate(self.irr_idx):
-            source[int(parent)] = int(full)
-        unused = source < 0
-        if np.any(unused):
-            # Unused raw WFN rows have no full-zone consumer.  Their values
-            # are immaterial but keeping the parent carrier rectangular makes
-            # the direct irr_idx gather simple and stable.  Fill from row zero.
-            source[unused] = 0
-        return jnp.take(src, jnp.asarray(source), axis=axis)
+        """Select raw-parent rows from a full-k scalar table (:func:`parent_rows`)."""
+        return parent_rows(self.irr_idx, self.n_parent, array, axis=axis)
 
     def unfold_operator(self, operator_parent, *, operator_transpose=None, right_plan=None,
                         conjugate=False):

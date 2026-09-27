@@ -320,11 +320,12 @@ def _get_sigma_kij_kernel(
 
 
 def _wedge_residues(B_poles):
-    """``(B, load)``: residues on the q wedge arrive as a ``QirrOperator``
-    carrying the device load tables of the mode-9 prep (jit arguments, never
-    program constants); full-zone residues are a plain array and ``None``."""
-    from symmetry_maps import QirrOperator
-    if isinstance(B_poles, QirrOperator):
+    """``(B, load)``: residues on the q wedge arrive in a carrier with ``values`` and
+    the device ``load`` tables their transport reads (jit arguments, never program
+    constants): the ISDF ``QirrOperator`` (the mode-9 prep's tables) or the plane-wave
+    ``gw.plane_wave_pipeline.SphereResidues`` (the pair convolution's tables).
+    Full-zone residues are a plain array and ``None``."""
+    if hasattr(B_poles, "values") and hasattr(B_poles, "load"):
         return B_poles.values, B_poles.load
     return B_poles, None
 

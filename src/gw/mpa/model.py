@@ -4,6 +4,7 @@ from __future__ import annotations
 
 
 import os
+from types import SimpleNamespace
 
 import jax.numpy as jnp
 import numpy as np
@@ -752,9 +753,17 @@ def _evaluate_samples(
     material_class, sym,
     energy_reference, occupation_state, write_full, write_wedge,
     static_gamma_override, gamma_row, kminq_rows, write_reflected=None,
-    print_fn=print,
+    chi=None, print_fn=print,
 ):
     """Evaluate every plan point through its route's kernel.
+
+    ``chi``: the response producer of another spatial basis, a namespace of
+    ``static(quad)``, ``imag(quad)`` and ``contour(tau, weight_rows,
+    frequency_sign, z)`` with the ISDF kernels' contracts (``w_isdf.compute_chi0``,
+    ``compute_chi0_contour``); ``None`` is the ISDF basis.  Only the
+    insulating time-reversal route takes one (the plane-wave path,
+    ``gw.plane_wave_pipeline``); the rules and the route dispatch are this
+    function's either way.
 
     Insulating plans whose measured verdict permits time reversal keep the
     historical kernels on a byte-identical code path.  Broken-TR insulating
@@ -781,6 +790,20 @@ def _evaluate_samples(
     )
 
     metal = material_class == "metal"
+    if chi is None:
+        chi = SimpleNamespace(
+            static=lambda used: compute_chi0(
+                wfns, used, meta, mesh_xy, energy_reference=energy_reference),
+            imag=lambda used: compute_chi0(
+                wfns, used, meta, mesh_xy, energy_reference=energy_reference),
+            contour=lambda tau, weights, signs, z: compute_chi0_contour(
+                wfns, tau, weights, signs, z, meta, mesh_xy,
+                energy_reference=energy_reference))
+    elif metal or not bool(getattr(sym, "trs_allowed", False)):
+        raise ValueError(
+            "GATE mpa_chi_producer_route: a caller's chi producer serves the "
+            "insulating time-reversal route only; got material_class="
+            f"{material_class!r}, trs_allowed={getattr(sym, 'trs_allowed', None)!r}")
     _require_metal_occupations(material_class, occupation_state)
     if not hasattr(sym, "trs_allowed"):
         raise ValueError(
@@ -823,16 +846,14 @@ def _evaluate_samples(
     for point in routes["existing"]:
         if not metal:
             if point["character"] == "static":
-                chi = compute_chi0(
-                    wfns, quad, meta, mesh_xy,
-                    energy_reference=energy_reference)
+                values = chi.static(quad)
             elif ordered and point["character"] == "imag":
                 rule = minimax.damped_line_rule(
                     point["varpi"], omega_m,
                     rel_tol=config.minimax_config.target_error,
                     max_order=config.minimax_config.max_nodes)
                 quadrature_log.record_line(rule, points=1, sweeps=1)
-                chi, chi_reflected = compute_chi0_contour_ordered(
+                values, chi_reflected = compute_chi0_contour_ordered(
                     wfns, rule["t"], rule["h"],
                     np.asarray([point["z"]], dtype=np.complex128),
                     meta, mesh_xy, q_neg_index=q_neg,
@@ -855,17 +876,15 @@ def _evaluate_samples(
                 quadrature_log.record_minimax(
                     "imag", used, omega_ry=point["varpi"],
                     target=config.minimax_config.target_error)
-                chi = compute_chi0(
-                    wfns, used, meta, mesh_xy,
-                    energy_reference=energy_reference)
+                values = chi.imag(used)
             if (
                 point["character"] == "static"
                 and static_gamma_override is not None
             ):
-                chi = chi.at[0].set(static_gamma_override[0])
+                values = values.at[0].set(static_gamma_override[0])
             if ordered and point["character"] == "static":
-                chi_reflected = chi
-            write_full(point, chi)
+                chi_reflected = values
+            write_full(point, values)
             if ordered:
                 write_reflected(point, chi_reflected)
         elif point["role"].startswith("near"):
@@ -895,14 +914,14 @@ def _evaluate_samples(
                 rel_tol=config.minimax_config.target_error,
                 max_order=config.minimax_config.max_nodes)
             quadrature_log.record_line(rule, points=1, sweeps=1)
-            chi = compute_chi0_contour_fractional(
+            sample = compute_chi0_contour_fractional(
                 wfns, rule["t"], rule["h"],
                 np.asarray([point["z"]], dtype=np.complex128),
                 meta, mesh_xy,
                 occupations=occupation_state.f_kn,
                 energy_reference=float(occupation_state.mu_ry),
                 ordered=metal_physical)
-            write_full(point, chi)
+            write_full(point, sample)
 
     for varpi_i, points in routes["lines"]:
         z = np.asarray([point["z"] for point in points])
@@ -935,18 +954,16 @@ def _evaluate_samples(
                                     -np.ones(t.size, np.int8)))
             weights = np.broadcast_to(
                 np.concatenate((1j * h, -1j * h)), (z.size, 2 * t.size))
-            values = compute_chi0_contour(
-                wfns, tau, weights, signs, z, meta, mesh_xy,
-                energy_reference=energy_reference)
+            values = chi.contour(tau, weights, signs, z)
         values = (values,) if z.size == 1 else values
         if ordered:
             reflected_values = (
                 (reflected_values,) if z.size == 1 else reflected_values)
         else:
             reflected_values = (None,) * len(points)
-        for point, chi, chi_reflected in zip(
+        for point, sample, chi_reflected in zip(
                 points, values, reflected_values):
-            write_full(point, chi)
+            write_full(point, sample)
             if ordered:
                 write_reflected(point, chi_reflected)
 
