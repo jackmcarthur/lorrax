@@ -1,4 +1,4 @@
-"""Scissor-shift laws and the SC Σ(ω) support rules.
+"""Scissor-shift laws and the SC classification window.
 
 Two consumers extrapolate a QP correction with these laws: the SC loop's
 sum-band tail beyond the Σ window (:func:`apply_conduction_scissor_to_tail`,
@@ -291,9 +291,9 @@ _SC_PAD_FRACTION = 0.10
 
 
 def sc_state_pad_ev(energy_relative_to_mu_ev):
-    """Energy drift allowance of the SC classification and the one-shot growth.
+    """Energy drift allowance of the clamp/static SC classification window.
 
-    The SC window plan after map 0 uses the flat :data:`SC_WINDOW_PAD_EV`.
+    The sampled Sigma(omega) support uses flat pads (``gw.qp_support``).
 
     Parameters
     ----------
@@ -324,10 +324,10 @@ def sc_padded_window_ev(lower_ev, upper_ev):
             upper / (1.0 - _SC_PAD_FRACTION * np.sign(upper)))
 
 
-#: Pad of the SC Sigma window plan around every state it covers, in eV
-#: (owner 2026-09-25): the first plan (map 0's held Sigma rules), then every
-#: later plan (the map-1 re-plan of the sampled grid and the rules, and each
-#: extension). Between plans a window is held.
+#: Band-sum state pad of the held SC Sigma rule boxes, in eV (owner
+#: 2026-09-25): the first plan (map 0's held rules), then every refit. It pads
+#: the G-side states of a product window, not the sampled omega support,
+#: which ``gw.qp_support`` owns.
 SC_WINDOW_PAD_EV = (2.0, 1.0)
 
 #: A Sigma rule's state pad is at least this fraction of |E - mu|: QP
@@ -342,124 +342,6 @@ def sc_window_pad_ev(energy_relative_to_mu_ev, plan_index):
     flat = SC_WINDOW_PAD_EV[min(int(plan_index), len(SC_WINDOW_PAD_EV) - 1)]
     return np.maximum(flat, SC_WINDOW_PAD_FRACTION * np.abs(
         np.asarray(energy_relative_to_mu_ev, dtype=np.float64)))
-
-
-def sc_read_halfwidth_ev():
-    """Half-width of the Sigma(omega) samples one state's evaluation reads.
-
-    Sigma(E) is read at E and the Z stencil at E +/- dE
-    (``eqp_bgw.compute_z_factor_from_omega_grid``, linear interpolation), so a
-    state is on its grid while [E - dE, E + dE] is; a held grid is extended
-    only when that support is about to leave it.
-    """
-    from .eqp_bgw import Z_FINITE_DIFFERENCE_EV
-    return float(Z_FINITE_DIFFERENCE_EV)
-
-
-def grow_sigma_support_ev(sigma, frozen_core_bands, sampled_grid_ev,
-                          energy_relative_ev, required_kn, active_n=None, *,
-                          pad_ev=None, trigger_ev=0.0):
-    """The sampled Sigma(omega) support grown over the states that read their
-    own Sigma(E): ``(grown_grid_ev, required_kn)``.
-
-    ONE rule for the one-shot and every SC map (owner 2026-09-24), so SC map 0
-    is the one-shot calculation and no state switches between Sigma(0) and
-    Sigma(E) between them. ``sigma_out_of_grid = cover`` grows over every
-    required identity the W model treats as active (``active_n``) and not in
-    ``sc_frozen_core_bands``; ``clamp``/``static`` only over a required state
-    inside the requested window plus the SC pad.
-
-    ``pad_ev``/``trigger_ev`` are the SC window plan's (:data:`SC_WINDOW_PAD_EV`,
-    :func:`extend_sc_omega_grid_ev`); the default is the one-shot's growth.
-    """
-    energy = np.asarray(energy_relative_ev, dtype=np.float64)
-    required = np.array(np.broadcast_to(
-        np.asarray(required_kn, dtype=bool), energy.shape))
-    # Frozen core blocks stay at DFT in the SC Hamiltonian.  They cannot
-    # require new Sigma samples under any out-of-grid policy.
-    required[:, :int(frozen_core_bands)] = False
-    if sigma.out_of_grid == "cover":
-        if active_n is not None:
-            required &= np.asarray(active_n, dtype=bool)[None, :]
-    else:
-        from .gw_config import sigma_classification_window_ev
-        win_lo, win_hi = sc_padded_window_ev(*sigma_classification_window_ev(sigma))
-        required &= (energy >= win_lo) & (energy <= win_hi)
-    return (extend_sc_omega_grid_ev(sampled_grid_ev, energy, required,
-                                    float(sigma.omega_step_ev),
-                                    pad_ev=pad_ev, trigger_ev=trigger_ev),
-            required)
-
-
-def extend_sc_omega_grid_ev(omega_grid_ev, energy_kn_ev, required_kn, step_ev,
-                            *, pad_ev=None, trigger_ev=0.0):
-    """Cover retained raw SC energies by extending only outer samples.
-
-    Parameters
-    ----------
-    omega_grid_ev : (n_omega,) real
-        Existing sampled frequencies relative to mu, in eV, ascending.
-    energy_kn_ev : (nk, nb_active) real
-        Raw current energies relative to mu in eV, in DFT identity order.
-    required_kn : (nk, nb_active) or (nb_active,) bool
-        Protected or in-range identities retained in the Hamiltonian.
-    step_ev : float
-        Sampling step in eV, also used for the added outer samples.
-    pad_ev : float, optional
-        Flat pad of an SC window plan. ``None`` is the one-shot growth pad
-        ``sc_state_pad_ev(E)``.
-    trigger_ev : float
-        A required state triggers growth when E -/+ ``trigger_ev`` leaves the
-        grid: 0 (the one-shot: the state itself), the plan pad (a re-plan) or
-        the read half-width (a held grid, :func:`sc_read_halfwidth_ev`).
-
-    Returns
-    -------
-    ndarray
-        Monotone sampled support containing every old sample unchanged.
-        Only triggering required states grow it, to E +/- pad.
-        Interior gaps retain the existing patched-grid coverage refusal.
-    """
-    from common.units import RYD_TO_EV
-    from .qsgw_utils import assert_omega_grid_covers
-
-    grid = np.asarray(omega_grid_ev, dtype=np.float64)
-    energy = np.asarray(energy_kn_ev, dtype=np.float64)
-    required = np.asarray(required_kn, dtype=bool)
-    step = float(step_ev)
-    if (grid.ndim != 1 or grid.size < 2 or not np.isfinite(grid).all()
-            or np.any(np.diff(grid) <= 0.0)
-            or not np.isfinite(step) or step <= 0.0):
-        raise ValueError("SC omega support requires an ascending finite grid and positive step")
-    if energy.ndim != 2 or required.shape not in ((energy.shape[1],), energy.shape):
-        raise ValueError("SC omega support: energies and required identity masks disagree")
-    required = np.broadcast_to(required, energy.shape)
-    if not np.isfinite(energy[required]).all():
-        raise ValueError("SC omega support: retained energies must be finite")
-    trigger = float(trigger_ev)
-    if not (np.isfinite(trigger) and trigger >= 0.0
-            and (pad_ev is None or float(pad_ev) >= trigger)):
-        raise ValueError("SC omega support: need 0 <= trigger_ev <= pad_ev")
-    assert_omega_grid_covers(
-        energy / RYD_TO_EV, required, grid / RYD_TO_EV,
-        context="SC retained identity support")
-    below = required & (energy - trigger < grid[0])
-    above = required & (energy + trigger > grid[-1])
-    if not (below.any() or above.any()):
-        return grid
-
-    def pad(values):
-        return (sc_state_pad_ev(values) if pad_ev is None
-                else np.full(values.shape, float(pad_ev)))
-    lower = (float(np.min(energy[below] - pad(energy[below])))
-             if below.any() else float(grid[0]))
-    upper = (float(np.max(energy[above] + pad(energy[above])))
-             if above.any() else float(grid[-1]))
-    n_lower = int(np.ceil((grid[0] - lower) / step))
-    n_upper = int(np.ceil((upper - grid[-1]) / step))
-    return np.concatenate((
-        grid[0] - step * np.arange(n_lower, 0, -1), grid,
-        grid[-1] + step * np.arange(1, n_upper + 1)))
 
 
 def classify_bands_in_grid(

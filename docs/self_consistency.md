@@ -239,7 +239,7 @@ not a failure of the accelerator.
 ## 4 Σ grid and quadrature across maps
 
 The ω grid is measured from $E_F$. The one-shot and every SC map grow the
-requested grid by one rule (`scissor.grow_sigma_support_ev`, below), so SC map 0
+requested grid by one rule (`qp_support`, below), so SC map 0
 is the one-shot calculation: the same grid, the same rules and the same
 out-of-grid set (owner, 2026-09-24). Under `cover` the one-shot therefore reads
 $\Sigma(E)$, not $\Sigma(0)$, for an active state outside the requested grid.
@@ -251,7 +251,7 @@ $\Sigma(E)$, not $\Sigma(0)$, for an active state outside the requested grid.
 
   | policy | an off-grid $\Sigma(E)$ reads | error past the edge, median / p90 (eV) | risk | cost |
   |---|---|---|---|---|
-  | `cover` (default) | nothing active is off-grid: the grid grows over every protected identity the W model treats as active; deeper identities read $\Sigma(\omega = 0)$ | 0 for active states | shallow semicore near the active-depth line is covered and stiff: MoS2 S 3s (depth 13.9–15.1 eV) takes 17–18 maps against static's 8 | Fe 4³ with no frozen core: grid to +31 eV (not −98), SC driver 1.33× static on one map |
+  | `cover` (default) | no requested quasiparticle is off-grid: the grid grows over each (window plan below); deeper identities and states without a quasiparticle read $\Sigma(\omega = 0)$ | 0 for active states | shallow semicore near the active-depth line is covered and stiff: MoS2 S 3s (depth 13.9–15.1 eV) takes 17–18 maps against static's 8 | Fe 4³ with no frozen core: grid to +31 eV (not −98), SC driver 1.33× static on one map |
   | `clamp` | $\Sigma(\omega_{\rm edge})$ | Fe 0.3–0.7 / 0.8–4.7; CrI3 0.05–0.12 / 0.5–2.2; MoS2 0.2–0.3 / 0.6–0.8 | continuous at the edge, but every clamped state inherits Σ there; an edge on a GN-PPM pole gives errors of order $10^3$ eV | none |
   | `static` | $\Sigma(\omega = 0)$ | Fe 1.6–4.4; CrI3 0.4–0.5; MoS2 0.6–0.8 (median) | two fixed points for states within the edge jump (§5) | none |
 
@@ -268,30 +268,31 @@ $\Sigma(E)$, not $\Sigma(0)$, for an active state outside the requested grid.
   rule $C_n > 0$, is not offered: Σ at a grid edge is far from its $1/\omega$
   asymptote (Fe: −5 to −7 eV at +28 eV), so the matched pole falls inside
   the extrapolated range for 10–92 % of the states (CLAIMS 2710).
-- **Window plan** (owner 2026-09-25). The sampled grid and the Σ rule
-  boxes are planned once and then held, so a steady map compiles no program
-  and refits no rule. Map 0 is the one-shot: its grid grows the requested
-  one over every required state outside it, to $E \pm \mathrm{pad}(E)$ with
-  $\mathrm{pad}(E) = 0.5\ \mathrm{eV} + 0.10\,\lvert E - \mu\rvert$
-  (`scissor.sc_state_pad_ev`). Map 1 plans: the requested grid grows to
-  cover every required state $\pm 1$ eV (the later pad of
-  `scissor.SC_WINDOW_PAD_EV`), and it
-  may shrink against map 0. Later maps hold that grid while every required
-  state's read support $[E - 0.5, E + 0.5]$ eV (the $Z$ stencil,
-  `eqp_bgw.Z_FINITE_DIFFERENCE_EV`) lies inside it. When a state is about to
-  cross, only the crossed edge grows, to $E \pm 1$ eV, and one
-  `SC window extension` line names the band, k, $E - \mu$ and the edge; a
-  held map prints `SC window hold` with the tightest support. Under `cover`
-  the required states are the protected, active identities outside
-  `sc_frozen_core_bands`; under `clamp` and `static` only those inside the
-  padded window, the solution of
-  $E \ge \omega_{\min} - \mathrm{pad}(E)$ and $E \le \omega_{\max} + \mathrm{pad}(E)$
-  (`scissor.sc_padded_window_ev`). Set `sigma_omega_min_ev` /
-  `sigma_omega_max_ev` are a minimum extent kept on every map; unset, the
-  grid comes from the protected band range alone (`cover` only). Old
-  samples do not move on an extension and an interior hole refuses. The
-  grid pad is flat; the Σ rule certificates below also scale with
-  $\lvert E - \mu\rvert$.
+- **Window plan** (owner 2026-09-25, 2026-09-27; `gw/qp_support.py`). The
+  sampled grid is chosen to converge only the requested states and never
+  leaves
+  $D \cup [\min_{n\in R} E^{\rm in}_n - P,\ \max_{n\in R} E^{\rm in}_n + P]$,
+  a refusal (`GATE sigma_support_envelope`) if it would. $D$ is the deck's
+  `sigma_omega_min_ev`/`sigma_omega_max_ev` (or patch list), fixed. $R$ is the
+  QP window's identities (`nval`, `ncond`) that the W model treats as active,
+  outside `sc_frozen_core_bands`, and quasiparticles at the previous map,
+  $Z \in (0, 1]$; under `clamp` and `static` only those inside the padded
+  window (`scissor.sc_padded_window_ev`). $E^{\rm in}$ is DFT at map 0 and
+  the carried QP eigenvalue after; eqp0, eqp1 and $Z$ are never an input.
+  The pad is flat: $P$ = 2 eV at the first plan (the one-shot and SC map 0)
+  and 1 eV at the map-1 plan, which starts again from $D$ and may shrink.
+  Later maps hold the grid while every requested state's read support
+  $[E - 0.5, E + 0.5]$ eV (the $Z$ stencil, `eqp_bgw.Z_FINITE_DIFFERENCE_EV`)
+  lies inside it; when one is about to cross, only that edge grows, to
+  $E \pm 1$ eV, and one `SC window extension` line names the band, k,
+  $E - \mu$ and the edge. A requested state with $Z \notin (0, 1]$ has no
+  quasiparticle: its energy never moves the grid, and off the grid it reads
+  the out-of-grid rule and is named in an `SC window no-quasiparticle`
+  line. A grid that reaches far above $E_F$ therefore means the deck
+  requested states there: the Na 8³ deck with `ncond` = 81 requests every
+  band, up to +96 eV. Old samples do not move on an extension and an interior
+  hole refuses. The Σ rule certificates below pad the band-sum states by
+  $\max(2/1\ \mathrm{eV}, 10\%\,\lvert E - \mu\rvert)$.
   Coverage is judged in the frame the Σ build measures from: the current
   spectrum's VBM or midgap for GN/HL-PPM (`ppm_sigma.ppm_fermi_frame`),
   `efermi.resolve_sigma_efermi_ry` for MPA. On MoS2 3×3 the PPM frame sat

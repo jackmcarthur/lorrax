@@ -3975,9 +3975,8 @@ def sigma_classification_window_ev(sigma):
 class DynamicSigmaConfig:
     """Ansatz-neutral real-frequency Sigma grid and output policy."""
     #: Requested Sigma grid edges in eV about the Sigma frame's E_F, or None
-    #: (unset): then the grid is the protected band range grown by the
-    #: one-shot rule and the SC window plan (``scissor.SC_WINDOW_PAD_EV``),
-    #: and a set edge is a minimum extent honoured on every map.
+    #: (unset): then the requested states alone set the grid
+    #: (``gw.qp_support``), and a set edge is a fixed extent kept on every map.
     omega_min_ev: float | None
     omega_max_ev: float | None
     omega_step_ev: float
@@ -4858,8 +4857,8 @@ class LorraxConfig:
     def omega_grid_ev(self):
         """Σ_c(ω) frequency grid in eV (length-stable single formula); see docs/architecture/decisions.md."""
         if getattr(self, "sc_omega_grid_ev", None) is not None:
-            # The sampled support grown by ``scissor.grow_sigma_support_ev``:
-            # by the one-shot, and by every SC map, under one rule.
+            # The sampled support of ``gw.qp_support``: by the one-shot, and
+            # by every SC map, under one rule.
             return np.asarray(self.sc_omega_grid_ev, dtype=np.float64)
         p = self.sigma
         patches = p.parsed_omega_patches_ev()
@@ -4879,8 +4878,8 @@ class LorraxConfig:
                 "sigma_omega_patches_ev produced a non-increasing grid; "
                 "patches must be ascending and disjoint")
         # The requested grid.  The one-shot and every SC map grow it by one
-        # rule (scissor.grow_sigma_support_ev) into ``sc_omega_grid_ev``,
-        # so SC map 0 is the one-shot calculation.
+        # rule (gw.qp_support) into ``sc_omega_grid_ev``, so SC map 0 is the
+        # one-shot calculation.
         return grid
 
     @property

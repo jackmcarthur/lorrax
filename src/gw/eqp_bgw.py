@@ -314,7 +314,7 @@ def verify_eqp_file(
 
 #: BerkeleyGW's ``finite_difference_spacing`` default, in eV: the Z stencil
 #: reads Sigma at E +/- this.  The SC window hold reads the same value
-#: (``scissor.sc_read_halfwidth_ev``).
+#: (``qp_support.read_halfwidth_ev``).
 Z_FINITE_DIFFERENCE_EV = 0.5
 
 
