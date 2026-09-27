@@ -2294,12 +2294,7 @@ def _resolve_shared_pole_inputs(params):
             "  on another ladder refuses on restart.  This is a support\n"
             "  study dial; leave it empty for production.\n"
             "  ==========================================================")
-    # sigma_quadrature_eps means one thing on every Sigma route; a tier only
-    # supplies a default when the deck omits the key (relaxed: 5e-4).
-    from .shared_pole_recipe import SIGMA_EPS_DEFAULT
-    default_eps = SIGMA_EPS_DEFAULT.get(params["sigma_w_accuracy"])
-    if default_eps is not None and "sigma_quadrature_eps" not in named:
-        params["sigma_quadrature_eps"] = default_eps
+    # The Sigma epsilon default is independent of the W-model accuracy tier.
     # minimax_target_error retains its incumbent static-stage meaning; the
     # bank always consumes the tier's bank_rule_tolerance from the resolver
     # (production 1e-8, relaxed 1e-7; gw.shared_pole_recipe).
