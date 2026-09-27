@@ -102,7 +102,7 @@ def build_dft_potentials(
             jnp.asarray(magnetization, dtype=jnp.float64), G_cart,
             jnp.asarray(mf.bdot, dtype=jnp.float64),
             jnp.asarray(mf.bvec, dtype=jnp.float64), mf.blat,
-            truncation_2d=truncation_2d)
+            ecutrho=float(mf.ecutrho), truncation_2d=truncation_2d)
         V_scf = build_V_scf(V_loc, V_H, V_xc, B_xc)
     # j-resolved vs j-averaged V_NL resolves automatically inside
     # build_vnl_setup: ``mf.spinorbit`` (QE <spinorbit>) when ``mf`` came
