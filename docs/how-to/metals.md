@@ -63,7 +63,7 @@ fixed-N μ).
   default); `sigma_omega_min_ev`/`sigma_omega_max_ev` are optional minimum
   extents.
 - The shared-pole support ladders, the Σ quadrature rules
-  (`sigma_quadrature_eps`, default 3e-5) and the SC pad-then-hold windows.
+  (`sigma_quadrature_eps`, default 1e-4) and the SC pad-then-hold windows.
 - The q→0 head from the tetrahedron Fermi-surface weights and the
   `dipole.h5` velocities.
 
