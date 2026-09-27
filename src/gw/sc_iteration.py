@@ -2788,7 +2788,8 @@ def _classify_sc_partition(
         protected = requested_band_mask(
             e_reference_loop, n_occ=int(inputs.meta.nelec),
             nval=inputs.config.nval, ncond=inputs.config.ncond,
-            gap_ev=inputs.config.sigma.regularization_ev)
+            gap_ev=inputs.config.sigma.regularization_ev,
+            mu_ev=mu_ev if inputs.material_class == "metal" else None)
         partition = BandPartition(jnp.asarray(protected), jnp.asarray(protected))
         _record_sc(inputs, f"SC band classes: {int(protected.sum())} protected / "
                    f"{int((~protected).sum())} rotating; nval/ncond request "
@@ -3881,21 +3882,36 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
             inputs.print_fn)
     # The fixed DFT partition owns which endpoint carries dynamic Sigma.
     # Keep protected–rotating couplings; replace only the rotating block.
-    from .band_partition import rotating_band_hamiltonian
+    # A rotating diagonal is the static QSGW Hamiltonian (T + V_ion + V_H +
+    # Sigma_x, no V_xc) plus one correlation scissor per side of mu, the
+    # mean Re Sigma_c,nn(E_n) of the protected states on that side. No
+    # rotating state is read at its own energy and none is held at DFT.
+    from .band_partition import rotating_band_hamiltonian, rotating_diagonal
     target = np.asarray(e_dft_fit, float).copy()
-    if tail_fit is not None:
-        from .scissor import qsgw_out_of_range_energies
-        from .shared_pole_recipe import active_band_mask
-        # The rotating metallic branch follows the same rigid Fermi shift
-        # as rotating valence. EQP2's identity law for crossing bands does
-        # not apply to dynamic SC; only deep rotating states keep DFT below.
-        rigid_kn = (valence_kn if scissor_classes is None else
-                    valence_kn | crossing_kn)
-        target = qsgw_out_of_range_energies(
-            e_dft_fit_ev, tail_fit, rigid_kn,
-            fermi_displacement_ev=_mu_ev-float(inputs.wfn.efermi)*RYD_TO_EV) / RYD_TO_EV
-        active = active_band_mask(np.asarray(inputs.e_dft_active_kn_ry), float(inputs.wfn.efermi))
-        target = np.where(active[None, :], target, np.asarray(e_dft_fit))
+    rotating_loop = ~np.asarray(protected_loop, dtype=bool)
+    if rotating_loop.any():
+        from .qsgw_utils import static_sigma_diag_to_host
+        from .scissor import k_star_weights
+        if sigma_result.sigma_x_kij_ry is None:
+            raise ValueError("rotating bands need Sigma_x for their static diagonal")
+        sigma_c_qp = sigma_result.sigma_xc_kij_ry - sigma_result.sigma_x_kij_ry
+        gamma_kn = np.take_along_axis(
+            static_sigma_diag_to_host(sigma_c_qp, inputs.mesh_xy).real,
+            np.asarray(indices_loop), axis=1)
+        static_kn = (static_sigma_diag_to_host(H_qp_dft_full, inputs.mesh_xy).real
+                     - static_sigma_diag_to_host(_rotate_to_dft_basis(
+                         sigma_c_qp, U_qp, mesh=inputs.mesh_xy), inputs.mesh_xy).real)
+        empty_kn = ~np.asarray(valence_kn, dtype=bool)
+        occupied_kn = np.asarray(valence_kn, dtype=bool)
+        if scissor_classes is not None:
+            empty_kn = empty_kn & ~crossing_kn
+            occupied_kn = occupied_kn & ~crossing_kn
+        target, law = rotating_diagonal(
+            static_kn, gamma_kn, np.asarray(protected_loop, dtype=bool),
+            below_kn=e_dft_fit_ev < float(_mu_ev),
+            fit_below_kn=occupied_kn, fit_above_kn=empty_kn,
+            k_weights=k_star_weights(ks))
+        _record_sc(inputs, f"    SC rotating diagonal: static QSGW + correlation scissor; {law}")
     H_qp_dft_new = rotating_band_hamiltonian(
         H_qp_dft_full, jnp.asarray(protected_loop), jnp.asarray(target), inputs.mesh_xy)
 

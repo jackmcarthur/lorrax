@@ -1,8 +1,9 @@
 """Band classes and Hamiltonian masks.
 
-Dynamic SC protects the requested DFT bands, closed outward to spectral gaps
-resolved at eta. Other bands rotate through their couplings to protected
-bands, with a scissor (or deep DFT) diagonal and no rotating–rotating mixing.
+Dynamic SC protects the requested DFT bands, counted from E_F at each k and
+closed outward to spectral gaps resolved at eta. Other bands rotate through
+their couplings to protected bands, with a static-QSGW-plus-correlation-scissor
+diagonal and no rotating–rotating mixing.
 The legacy three-mask helper below serves fixed-Sigma EQP2 only.
 """
 
@@ -21,25 +22,38 @@ import jax.numpy as jnp
 # Partition descriptor
 # ---------------------------------------------------------------------------
 
-def requested_band_mask(energies_ev, *, n_occ, nval, ncond, gap_ev):
+def requested_band_mask(energies_ev, *, n_occ, nval, ncond, gap_ev, mu_ev=None):
     """Requested bands closed to the next resolved spectral gap at each k.
 
-    A gap larger than eta separates manifolds resolved by Sigma. Only the
-    initial DFT ladder is classified. The work is O(nk nb), with no axis loop.
+    ``nval``/``ncond`` count states below/above the Fermi level at each k.
+    With ``mu_ev`` (absolute eV, the frame of ``energies_ev``) the count
+    starts at the number of states below mu at that k, so a metal protects
+    the same energy neighbourhood of E_F at every k; without it, or on an
+    insulator, the count starts at ``n_occ``. A gap larger than eta separates
+    manifolds resolved by Sigma. Only the initial DFT ladder is classified.
+    The work is O(nk nb), with no axis loop.
     """
     e = np.asarray(energies_ev, float)
-    lo, hi = int(n_occ)-int(nval), int(n_occ)+int(ncond)
-    if not 0 <= lo < hi <= e.shape[1]:
-        raise ValueError(f"protected band range [{lo}, {hi}) outside {e.shape}")
-    groups = np.cumsum(np.concatenate((np.zeros((e.shape[0], 1), bool),
+    nk, nb = e.shape
+    below = (np.full(nk, int(n_occ)) if mu_ev is None
+             else np.count_nonzero(e < float(mu_ev), axis=1))
+    lo, hi = below - int(nval), below + int(ncond)
+    if np.any(lo < 0) or np.any(hi > nb) or np.any(lo >= hi):
+        k = int(np.argmax((lo < 0) | (hi > nb)))
+        raise ValueError(f"protected band range [{lo[k]}, {hi[k]}) at k={k} outside {e.shape}; "
+                         "reduce nval/ncond or load more bands")
+    groups = np.cumsum(np.concatenate((np.zeros((nk, 1), bool),
                                       np.diff(e, axis=1) > float(gap_ev)), axis=1), axis=1)
-    protected = (groups >= groups[:, lo:lo+1]) & (groups <= groups[:, hi-1:hi])
+    g_lo = np.take_along_axis(groups, lo[:, None], axis=1)
+    g_hi = np.take_along_axis(groups, (hi - 1)[:, None], axis=1)
+    protected = (groups >= g_lo) & (groups <= g_hi)
     # A dense ladder must not turn a small request into an all-band window.
     # This bounds automatic edge closure, not the user's requested extent.
     from .qp_support import SUPPORT_PAD_EV
     lower = np.min(np.where(protected, e, np.inf), axis=1)
     upper = np.max(np.where(protected, e, -np.inf), axis=1)
-    promotion = np.maximum(e[:, lo] - lower, upper - e[:, hi-1])
+    rows = np.arange(nk)
+    promotion = np.maximum(e[rows, lo] - lower, upper - e[rows, hi - 1])
     if np.any(promotion > SUPPORT_PAD_EV):
         k = int(np.argmax(promotion))
         raise ValueError(
@@ -257,6 +271,35 @@ def apply_band_partition(
 __all__ = [
     "BandPartition", "apply_band_partition", "build_omega_band_partition",
 ]
+
+
+def rotating_diagonal(static_kn, sigma_c_kn, protected_kn, *, below_kn,
+                      fit_below_kn, fit_above_kn, k_weights):
+    """Rotating diagonal: static QSGW diagonal plus a correlation scissor per side.
+
+    ``static_kn`` is (T + V_ion + V_H + Sigma_x)_nn in the DFT basis and
+    ``sigma_c_kn`` is Re Sigma_c,nn(E_n) of each identity in its own QP basis
+    (Ry, identity order). The scissor below (above) mu is the k-star-weighted
+    mean of ``sigma_c_kn`` over the protected occupied (empty) states; with
+    no protected state on one side, that side takes the other side's mean.
+    Neither term reads Sigma at a rotating energy or the DFT V_xc.
+    """
+    w = np.asarray(k_weights, float)[:, None]
+    p = np.asarray(protected_kn, bool)
+    sig = np.asarray(sigma_c_kn, float)
+    def side(mask):
+        wt = w * (p & mask)
+        total = float(wt.sum())
+        return (float((wt * sig).sum()) / total if total > 0 else None), int((p & mask).sum())
+    (b_lo, n_lo), (b_hi, n_hi) = side(fit_below_kn), side(fit_above_kn)
+    if b_lo is None and b_hi is None:
+        raise ValueError("rotating bands: no protected state fits the correlation scissor")
+    b_lo = b_hi if b_lo is None else b_lo
+    b_hi = b_lo if b_hi is None else b_hi
+    target = np.asarray(static_kn, float) + np.where(below_kn, b_lo, b_hi)
+    from common.units import RYD_TO_EV
+    return target, (f"beta_c below={b_lo * RYD_TO_EV:+.6f} eV (n={n_lo}), "
+                    f"above={b_hi * RYD_TO_EV:+.6f} eV (n={n_hi})")
 
 
 @partial(jax.jit, static_argnames=("mesh",))
