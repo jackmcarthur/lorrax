@@ -125,7 +125,8 @@ the QE-schema receipt and the occupied two-component DFT states
 | `ppm_invalid_mode` | str | `static_limit` | Treatment of a mode with no valid Ω² fit: `static_limit` (BerkeleyGW mode 3; alias `infinity`), `zero` (mode 0; alias `skip`) or `2ry` (mode 2). `imaginary` refuses. |
 | `sigma_w_model` | str | `mpa` | Body model under `compute_mode = mpa`: `mpa` or `shared_pole` ([shared-pole model](architecture/shared_pole_model.md)). Under self-consistency, shared poles rebuild W from the current wavefunctions and retain the certified quadrature rules. |
 | `sigma_w_accuracy` | str | `production` | Shared-pole recipe tier: `production` or `relaxed`. It requires `sigma_w_model = shared_pole`. |
-| `sigma_w_support_sites_ev` | str | `""` | Shared-pole ladder override: `"<line eV list> \| <imaginary eV list>"`, each strictly increasing. Empty keeps the resolver's line rule and the Zolotarev imaginary ladder. The sites enter the recipe hash, so a model built on another ladder refuses. It requires `sigma_w_model = shared_pole`. |
+| `sigma_w_support_sites_ev` | str | `""` | Shared-pole ladder override: `"<line eV list> \| <imaginary eV list>"`, each strictly increasing. An optional third field `\| <re@im list>` adds fitted line-role supports at their own height (eV); they do not move the held midpoints. Empty keeps the resolver's line rule and the Zolotarev imaginary ladder. The sites enter the recipe hash, so a model built on another ladder refuses. It requires `sigma_w_model = shared_pole`. |
+| `sigma_w_pole_budget_fraction` | float | `0` | Shared-pole pole budget study dial: a positive f retains at most ⌈f·n⌉ Gram directions per parent in place of the production 1.8. It enters the recipe hash. It requires `sigma_w_model = shared_pole` and `sigma_w_accuracy = production`. |
 
 `bispinor_tt_head_correction` is not a deck key: the transverse Γ head comes
 with `head_correction`, and a deck that names the key refuses at parse. A
