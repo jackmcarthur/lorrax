@@ -188,6 +188,20 @@ def constructor_execution(meta, resolution, recipe, *, mesh, ledger, upstream,
             selection_face_count=selection_faces,
             retained_output_upper_bound_bytes_per_rank=retained_outputs,
             local_selection=resident_selection, local_reduction=resident_reduction)
+    # STUDY (FEREF 2026-09-27, KNOWN_LORRAX_ISSUES): a deferred reduction admission skipped the
+    # one-device eight-block + eigh check that the local constructor's _admit enforces, so a parent
+    # whose pencil cannot reduce on one device refused instead of running on the face. Apply that
+    # check to the conservative side here; a failure routes the map to the face.
+    if defer_reduction and cross_original_sides is None:
+        import distrib_la
+        if not distrib_la.fits_local(local.eigenplan(side), "eigh", ((1, side, side),) * 8,
+                                     np.complex128, ledger.device_budget_bytes_per_rank):
+            return 'face', dict(
+                reason='local parent pencil (conservative side) cannot reduce on one device',
+                requested_layout=resolution.layout, conservative_pencil_side=side,
+                selection_face_count=selection_faces,
+                retained_output_upper_bound_bytes_per_rank=retained_outputs,
+                local_selection=resident_selection, local_reduction=None)
     selection = preview('selection', **selection_args)
     reduction = None if defer_reduction else preview(reduction_phase, **reduction_args)
     admitted = all(row['device_budget_status'] == 'PASS'
