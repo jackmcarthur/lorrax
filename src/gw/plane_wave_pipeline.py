@@ -1111,14 +1111,47 @@ def _one_shot_shared_pole(args, mesh, system, gw, say, t_read, config, wfns, sig
                                                   ds_vs_central_difference=check_ds), complex_z)
 
 
-def _complex_z(args, mesh, system, gw, say, config, wfns, model, pts, tol, eta_ev, rel):
-    """Step 2: the model W^c(q, z) against the exact Dyson W^c(q, z) at complex z, with the
-    8-pole MPA of the same basis beside it."""
+def _exact_target(args, mesh, system, gw, say, config, zs, tol, kinds, eta_ev, rel):
+    """Study cache of the fixed Dyson target, sharded in both G axes through SlabIO.
+
+    The complete WFN hash, source hash, energies, Coulomb values, grid and z points
+    authenticate the target. Model supports, direction widths and pole caps do not
+    enter this exact target. No matrix is gathered to a host or a single device.
+    """
+    import hashlib
+    from pathlib import Path
     import jax
     import jax.numpy as jnp
     from jax.sharding import NamedSharding, PartitionSpec as P
-    zs = np.asarray([p[1] for p in pts]) / _RY_EV
-    kinds = np.asarray([p[0] for p in pts])
+    from common.collectives import barrier
+    from file_io.slab_io import SlabIO
+    t0 = time.perf_counter()
+    cache = None if args.exact_target_cache is None else Path(args.exact_target_cache)
+    identity = None
+    if cache is not None:
+        h = hashlib.sha256()
+        with open(args.wfn, "rb") as f:
+            for block in iter(lambda: f.read(8 * 1024**2), b""):
+                h.update(block)
+        identity = dict(wfn_sha256=h.hexdigest(),
+                        source_sha256=hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
+                        energies_sha256=hashlib.sha256(np.asarray(system.enk).tobytes()).hexdigest(),
+                        coulomb_sha256=hashlib.sha256(np.asarray(gw.screen.v).tobytes()).hexdigest(),
+                        gvecs_sha256=hashlib.sha256(np.asarray(gw.w_par.gvecs).tobytes()).hexdigest(),
+                        kgrid=list(map(int, system.kgrid)), nb=int(gw.nb), nval=int(gw.nval),
+                        ns=int(gw.ns), points_ry=np.stack((zs.real,zs.imag),axis=1).tolist(),
+                        kinds=kinds.tolist(), tolerance=float(tol))
+        if (cache / "receipt.json").exists():
+            receipt = json.loads((cache / "receipt.json").read_text())
+            if receipt["identity"] != identity:
+                raise ValueError("GATE pw_exact_target_identity: exact target inputs or source differ")
+            with SlabIO(str(cache / "target.h5"), mode="r", mesh=mesh) as io:
+                W_ex = io.read_slab("Wc", partition_spec=P(None, None, "x", "y"))
+            W_ex.block_until_ready()
+            status = dict(status="hit", read_seconds=time.perf_counter()-t0,
+                          cold_seconds=receipt["cold_seconds"], path=str(cache))
+            say("exact target cache: " + json.dumps(status))
+            return W_ex, receipt["nodes"], np.asarray(receipt["tolerances"]), receipt["check_line"], status
     chi_z, nodes_z, tol_z = _exact_chi_points(gw, zs, tol, kinds)
     say("exact chi(z): rule tolerance per point " + " ".join(f"{t:.0e}" for t in tol_z)
         + f"; {nodes_z} Green pairs")
@@ -1132,11 +1165,39 @@ def _complex_z(args, mesh, system, gw, say, config, wfns, model, pts, tol, eta_e
     W_ex = jax.jit(lambda *a: jnp.stack(a), out_shardings=NamedSharding(mesh, P(None, None, "x", "y")))(
         *[value(H, chi_z[2 * j]) for j in range(zs.size)])
     del chi_z
+    cold = time.perf_counter()-t0
+    status = dict(status="built", cold_seconds=cold, path=None if cache is None else str(cache))
+    if cache is not None:
+        cache.mkdir(parents=True, exist_ok=True)
+        with SlabIO(str(cache / "target.h5"), mode="w", mesh=mesh) as io:
+            io.create_dataset("Wc", shape=W_ex.shape, dtype=np.complex128)
+            io.write_slab("Wc", W_ex)
+        if jax.process_index() == 0:
+            receipt = dict(identity=identity, nodes=int(nodes_z), tolerances=tol_z.tolist(),
+                           check_line=check_line, cold_seconds=cold)
+            (cache / "receipt.json").write_text(json.dumps(receipt, indent=2)+"\n")
+        barrier("pw.exact_target.write", print_fn=say)
+    say("exact target cache: " + json.dumps(status))
+    return W_ex, nodes_z, tol_z, check_line, status
+
+
+def _complex_z(args, mesh, system, gw, say, config, wfns, model, pts, tol, eta_ev, rel):
+    """Step 2: the model W^c(q, z) against the exact Dyson W^c(q, z) at complex z, with the
+    8-pole MPA of the same basis beside it."""
+    import jax
+    import jax.numpy as jnp
+    from jax.sharding import NamedSharding, PartitionSpec as P
+    zs = np.asarray([p[1] for p in pts]) / _RY_EV
+    kinds = np.asarray([p[0] for p in pts])
+    W_ex, nodes_z, tol_z, check_line, target_cache = _exact_target(
+        args, mesh, system, gw, say, config, zs, tol, kinds, eta_ev, rel)
     gv = np.asarray(gw.w_par.gvecs)
     g0 = np.asarray([int(np.flatnonzero(np.all(gv[q] == 0, axis=1))[0]) for q in range(gw.n_par)])
     fro_sp, head_sp, h0 = _w_errors(mesh, gw.shared_pole_w(model, zs), W_ex, g0)
     mpa = None
     try:
+        if args.skip_mpa:
+            raise ValueError("NOT_MEASURED: MPA comparison explicitly skipped")
         zm, chi_m = gw.mpa_samples(config, wfns, print_fn=say)
         Omega, B, cond = gw.mpa_poles(config, zm, chi_m)
         del chi_m
@@ -1158,7 +1219,7 @@ def _complex_z(args, mesh, system, gw, say, config, wfns, model, pts, tol, eta_e
             + ("" if "fro_rel" not in mpa else
                f"; MPA Frob max {np.nanmax(mpa['fro_rel'][j]):.2e}, head max {np.nanmax(mpa['head_rel'][j]):.2e}"))
     return dict(points_ev=[[k, v.real, v.imag] for k, v in pts], eta_ev=eta_ev,
-                response_nodes=nodes_z, rule_tolerance=tol_z.tolist(),
+                response_nodes=nodes_z, rule_tolerance=tol_z.tolist(), target_cache=target_cache,
                 q_frac=system.psi_par.frac.tolist(),
                 head_exact_ry=[[abs(x) for x in r] for r in np.asarray(h0).tolist()],
                 line_rule_vs_response_rule_5_eta=check_line,
@@ -1228,6 +1289,8 @@ def main(argv=None):
     ap.add_argument("--port-count", type=int, default=None,
                     help="shared-pole deck, diagnostic: size the recipe's direction widths and pole "
                          "budget from this port count instead of the sphere width")
+    ap.add_argument("--exact-target-cache", default=None, help="study: authenticated sharded Dyson target cache")
+    ap.add_argument("--skip-mpa", action="store_true", help="study: omit unrelated MPA comparison")
     ap.add_argument("--skip-sigma", action="store_true", help="study: proxy only, no Sigma sweep")
     ap.add_argument("--skip-complex-z", action="store_true",
                     help="shared-pole deck: skip the model-vs-exact W^c(z) comparison")
