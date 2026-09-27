@@ -189,7 +189,8 @@ so the contour is a vertical leg 0 → −ic/m (the wide side's Laplace part,
 σ − ic/m, and a linear fall to the real axis at σ = Λ, where every live member
 is below ε/4. The corner amplifies the narrow edge by e^c, and the executor
 admits a term mass of 5·10⁻⁶/6·10⁻⁸ = 83.3, so c must stay below
-ln 83.3 = 4.42; c = 4 is a choice under that bound, not a derivation. The two
+ln 83.3 = 4.42; c = 4 is a choice under that bound, not a derivation (a
+tall box lowers it, below). The two
 image sets sit at ±B₀,
 B₀ = γ·max(B(0), min(M, Λm/c)); each has
 K = ⌈ln(16R)(L + c)/π²⌉ Gauss–Legendre nodes, R = (B₀ + x_live)/(B₀ − m), and
@@ -212,10 +213,19 @@ growth-capped set and misses on a tall box ([−20, 20] × [1, 10]η: 1.49ε),
 where the bent contour certifies. On a miss the ladder raises γ by 1.1 and
 adds one node to the leg and to each image set, six rungs.
 
-A crossing box whose narrow side is 4–8η and whose height is 10η or more
-certifies in neither family ((−60, 6) × (1, 20)η at 10⁻⁴ ends at 7ε), where
-the fitted builder certified with 21–52 nodes; the planner refuses such a
-window by name. No deck box has this shape today (`KNOWN_LORRAX_ISSUES`).
+**Tall crossing boxes.** Damped poles give a crossing box height H ≫ η. The
+leg's members e^{v d}, v ∈ [0, τ_c], keep the modulus e^{v x} at every height
+and turn their phase v·y through τ_c(H − 1) = c(H − 1)/m radians at the top
+edge, which the few graded leg nodes cannot integrate; at c = 4 a narrow side
+of 4–8η and H ≥ 10η did not certify (QAUDIT, claim 2882). So the bend is
+c = min(4, max(2, 8m/(H − 1))), which holds the top-edge phase to 8 rad and
+leaves every thin box at c = 4, and the leg gets ⌊γτ_c(H − 1)/2π⌋ uniform
+nodes for the phase that remains. A miss steps the bend down the fixed
+ladder c, c/2, c/4, each with the margin ladder; a box whose narrow side sits
+at 4η with M/m of 50–100 takes the second step even when thin. QAUDIT's grid
+extended to M = 50/200/400, m = 2–32η, H = 1.01–50η certifies in all 252
+boxes at ε = 3·10⁻⁵ and 10⁻⁴; QAUDIT's six tall boxes take 35–67 nodes at
+3·10⁻⁵, where the fitted rules took 21–52.
 
 **The sector rule and the local extremal-length law.** A box with Im d ≥ η
 lies in an open sector of the upper half plane. Rotate by the sector axis φ;
@@ -256,7 +266,8 @@ floor slope 0.01 (the one constant calibrated against the corpus) and margin
 cap 1.2; leg start 0.05/(Mτ_c); the image-horizon guard
 1/max(1 − m/B₀, 0.05); ridge 0.05ε; fit density 2 points per half wave of the
 largest |t| on the real edges and 40 geometric points on the sides; the
-narrowest built side 4η; the ladders (×1.1, six rungs each); the sector φ grid (200
+narrowest built side 4η; the tall-box leg phase 8 rad and the bend floor 2;
+the ladders (×1.1, six rungs each; the bend c, c/2, c/4); the sector φ grid (200
 points) and its gap guard (0.02 rad).
 
 **Acceptance.** A rung is accepted when the boundary certificate
