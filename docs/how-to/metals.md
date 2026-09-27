@@ -43,8 +43,7 @@ the band energies from the NSCF output; a one-shot's `eqp0.dat` and the
 | choice | how to set it | why |
 |---|---|---|
 | $k_BT$ | `occ_smearing_width_ry` = the DFT `degauss`. Use 0.01 Ry at $N\ge 8$ and 0.02 Ry at $N=4$–6 (the Na 8³ and Fe 4³/8³ production decks) | the grid must resolve the Fermi surface: $k_BT$ of order the band dispersion across one k spacing. Halve it when you double $N$ |
-| QP window top | `ncond` = (highest band whose minimum over k lies below $E_F+E_{\rm win}$) − `nelec`, where `nelec` is the WFN's occupied-band boundary (`max(ifmax)`; `kmeans.out` prints it as `occupied-band boundary`) | Σ diagonals are computed for bands $[0,$ `nelec + ncond`$)$. The edge may not split a degenerate multiplet at any k (1 meV tolerance; `BandWindowDegeneracyError` refuses), so raise `ncond` to the top of the multiplet. States above the window are a rigid tail ([self-consistency §2](../self_consistency.md#2-band-treatment)) |
-| pair window | `nval` = the occupied bands whose maximum over k lies above $E_F-E_{\rm win}$ | it sets the lower edge of the ISDF pair-density window, not the bottom of the QP window. Do not freeze deep bands with `sc_frozen_core_bands`: on Fe 3s/3p the frozen law is off by hundreds of meV (CLAIMS 2859) |
+| QP bands | `nval`, `ncond` | The [window decision](../theory/sigma-windows-design.md) owns the protected/rotating split and its edge closure. |
 | band sums | `number_bands`: the bands the NSCF has | the χ0 and Σ sums; band-count convergence is a separate study |
 | centroids | select on the Σ pair set, `--fit-window 0:B,0:number_bands` with `B = nelec + ncond`. First run `python3 -m centroid.kmeans_cli` with a large request and read `achieved numerical rank=r` in `kmeans.out`; then select $N_\mu$ between $0.5r$ and $1.3r$. The rank line appears only when the snapped candidates outnumber the request (`pruning: not applied` otherwise), so keep the probe request below the FFT-grid point count | the ISDF exchange error falls with $N_\mu/r$: RMS ≤ 1 meV near $0.5r$, max ≤ 1 meV near $1.3r$ (CLAIMS 2860). See [drivers](../drivers.md) |
 | head | `head_correction = no_local_fields` (direct charge head: the interband $S(\omega)$ and the Fermi-surface Lindhard term, averaged over the q = 0 cell), or `full` on a scalar deck | [the metallic q→0 head](../theory/metal-q0-head.md) owns the head model |
@@ -59,11 +58,8 @@ fixed-N μ).
 ## What the code derives
 
 - μ at fixed electron count from each map's spectrum; μ is never mixed.
-- The Σ(ω) grid from the protected bands (`sigma_out_of_grid = cover`, the
-  default); `sigma_omega_min_ev`/`sigma_omega_max_ev` are optional minimum
-  extents.
-- The shared-pole support ladders, the Σ quadrature rules
-  (`sigma_quadrature_eps`, default 3e-5) and the SC pad-then-hold windows.
+- The sampled Sigma support and quadrature geometry from the
+  [window decision](../theory/sigma-windows-design.md).
 - The q→0 head from the tetrahedron Fermi-surface weights and the
   `dipole.h5` velocities.
 

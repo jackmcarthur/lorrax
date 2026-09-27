@@ -40,14 +40,13 @@ $(H, F(H) - H)$ is therefore valid secant data. Map 0 takes $U = I$ exactly
 instead of calling `eigh` on $\mathrm{diag}(E_{\rm DFT})$, so SC map 0 equals the
 one-shot G0W0 bit for bit
 (`tests/test_invariance_gates.py::test_sc_iteration1_equals_one_shot`). Each
-map costs one full $\chi_0 \to W \to \Sigma$ evaluation. Σ rule planning is
-paid on map 0 (the one-shot plan) and map 1 (the held plan), and after that
-only for a window a state crosses (§4).
+map costs one full $\chi_0 \to W \to \Sigma$ evaluation. The
+[window decision](theory/sigma-windows-design.md) owns the single initial
+quadrature plan and the one permitted convergence rebuild.
 
-The loop is driven by eqp0, which is Σ at the current energies. No Z-factor
-enters the iteration. Each map also writes the BerkeleyGW-shaped linearization
-$\mathrm{eqp1} = E_{\rm in} + Z\,(\mathrm{eqp0} - E_{\rm in})$, which equals
-eqp0 at a fixed point.
+The loop is driven by eqp0, which is Σ at the current energies. Z weights enter only the tail fit. SC writes `eqp0_iterNNNN.dat`; it does
+not write per-map eqp1 files. The one-shot eqp1 artifact retains the raw
+BerkeleyGW linearization.
 
 With `sc_on_ibz = true` (the default), $H$, $E$, $U$, every retained k-indexed
 `SigmaResult` table and the density-SC Hartree components carry the star
@@ -123,17 +122,10 @@ energies, so it takes these dipoles at the same diagonal approximation.
 
 ## 2 Band treatment
 
-| bands | block of $H'$ |
-|---|---|
-| the `nval + ncond` QP window | full $\Sigma^{\rm QSGW}$, off-diagonals kept within the window |
-| the lowest `sc_frozen_core_bands` | held at the DFT block $\mathrm{diag}(E_{\rm DFT})$; they stay in the $\Sigma_x$ and $\chi_0$ sums |
-| the sum-band tail `[b3, number_bands)` | DFT orbitals with an energy-only rigid shift, refit every map: the $Z$-weighted mean QP correction of the window's conduction states that read their own $\Sigma(E)$ (below) |
-
-Every window band keeps its full Σ. Under the default `sigma_out_of_grid =
-cover` a band the W model treats as active reads Σ at its own energy, and
-the grid grows over it; a deeper band reads $\Sigma(\omega = 0)$ (§4). Map 0, or an
-authenticated seed, classifies the band set once, and the set stays frozen:
-no band enters or leaves it later.
+The [Sigma window decision](theory/sigma-windows-design.md) owns the
+protected/rotating classes, endpoint evaluation, requested band edges and
+their closure. The complete loaded carrier rotates. The following tail fit
+is an independent policy consumed by that partition.
 
 **Tail law.** The rigid shift is
 
@@ -238,99 +230,12 @@ not a failure of the accelerator.
 
 ## 4 Σ grid and quadrature across maps
 
-The ω grid is measured from $E_F$. The one-shot and every SC map grow the
-requested grid by one rule (`qp_support`, below), so SC map 0
-is the one-shot calculation: the same grid, the same rules and the same
-out-of-grid set (owner, 2026-09-24). Under `cover` the one-shot therefore reads
-$\Sigma(E)$, not $\Sigma(0)$, for an active state outside the requested grid.
+The [Sigma window decision](theory/sigma-windows-design.md) owns sampled
+support, immutable box geometry, clamped reads and the single convergence
+rebuild. `gw.qp_support` and `gw.sigma_box_plan` implement that policy.
+The support is measured in the frame used by Sigma: `ppm_sigma.ppm_fermi_frame`
+for GN/HL-PPM and `efermi.resolve_sigma_efermi_ry` for MPA.
 
-- **Out-of-grid policy** (`sigma_out_of_grid`, owner 2026-09-24). One
-  classification, `qsgw_utils.omega_coverage`, decides which energies are
-  on the sampled grid. The Σ build (`qsgw_utils.sigma_eval_omega`), the
-  window plan below and the tail mask all read it.
-
-  | policy | an off-grid $\Sigma(E)$ reads | error past the edge, median / p90 (eV) | risk | cost |
-  |---|---|---|---|---|
-  | `cover` (default) | no requested quasiparticle is off-grid: the grid grows over each (window plan below); deeper identities and states without a quasiparticle read $\Sigma(\omega = 0)$ | 0 for active states | shallow semicore near the active-depth line is covered and stiff: MoS2 S 3s (depth 13.9–15.1 eV) takes 17–18 maps against static's 8 | Fe 4³ with no frozen core: grid to +31 eV (not −98), SC driver 1.33× static on one map |
-  | `clamp` | $\Sigma(\omega_{\rm edge})$ | Fe 0.3–0.7 / 0.8–4.7; CrI3 0.05–0.12 / 0.5–2.2; MoS2 0.2–0.3 / 0.6–0.8 | continuous at the edge, but every clamped state inherits Σ there; an edge on a GN-PPM pole gives errors of order $10^3$ eV | none |
-  | `static` | $\Sigma(\omega = 0)$ | Fe 1.6–4.4; CrI3 0.4–0.5; MoS2 0.6–0.8 (median) | two fixed points for states within the edge jump (§5) | none |
-
-  The numbers are from CLAIMS 2710: truth is the sampled Σ over the 2–6 eV
-  beyond a truncated edge. `clamp` and `static` are there to second-guess a
-  hard system. **Active** is the shared-pole census rule,
-  $\max_k E^{\rm DFT}_{nk} \ge E_F - 15$ eV (`shared_pole_recipe.active_band_mask`),
-  evaluated once on the DFT ladder, so a state never switches between
-  $\Sigma(E)$ and $\Sigma(0)$. Deeper states are the ones the W model carries no
-  plasma charge for; covering Fe 4³'s 3s/3p stretched the grid to −98 eV,
-  ran 5× slower and moved them 16 eV (CLAIMS 2739). An energy-only law for
-  them would sit 11–16 eV from $\Sigma(0)$, which is why they keep it.
-  A tail matched to the edge, $C_n/(\omega - \bar\omega_n)$ with the sum
-  rule $C_n > 0$, is not offered: Σ at a grid edge is far from its $1/\omega$
-  asymptote (Fe: −5 to −7 eV at +28 eV), so the matched pole falls inside
-  the extrapolated range for 10–92 % of the states (CLAIMS 2710).
-- **Window plan** (owner 2026-09-25, 2026-09-27; `gw/qp_support.py`). The
-  sampled grid is chosen to converge only the requested states and never
-  leaves
-  $D \cup [\min_{n\in R} E^{\rm in}_n - P,\ \max_{n\in R} E^{\rm in}_n + P]$,
-  a refusal (`GATE sigma_support_envelope`) if it would. $D$ is the deck's
-  `sigma_omega_min_ev`/`sigma_omega_max_ev` (or patch list), fixed. $R$ is the
-  QP window's identities (`nval`, `ncond`) that the W model treats as active,
-  outside `sc_frozen_core_bands`, and quasiparticles at the previous map,
-  $Z \in (0, 1]$; under `clamp` and `static` only those inside the padded
-  window (`scissor.sc_padded_window_ev`). $E^{\rm in}$ is DFT at map 0 and
-  the carried QP eigenvalue after; eqp0, eqp1 and $Z$ are never an input.
-  The pad is flat: $P$ = 2 eV at the first plan (the one-shot and SC map 0)
-  and 1 eV at the map-1 plan, which starts again from $D$ and may shrink.
-  Later maps hold the grid while every requested state's read support
-  $[E - 0.5, E + 0.5]$ eV (the $Z$ stencil, `eqp_bgw.Z_FINITE_DIFFERENCE_EV`)
-  lies inside it; when one is about to cross, only that edge grows, to
-  $E \pm 1$ eV, and one `SC window extension` line names the band, k,
-  $E - \mu$ and the edge. A requested state with $Z \notin (0, 1]$ has no
-  quasiparticle: its energy never moves the grid, and off the grid it reads
-  the out-of-grid rule and is named in an `SC window no-quasiparticle`
-  line. A grid that reaches far above $E_F$ therefore means the deck
-  requested states there: the Na 8³ deck with `ncond` = 81 requests every
-  band, up to +96 eV. Old samples do not move on an extension and an interior
-  hole refuses. The Σ rule certificates below pad the band-sum states by
-  $\max(2/1\ \mathrm{eV}, 10\%\,\lvert E - \mu\rvert)$.
-  Coverage is judged in the frame the Σ build measures from: the current
-  spectrum's VBM or midgap for GN/HL-PPM (`ppm_sigma.ppm_fermi_frame`),
-  `efermi.resolve_sigma_efermi_ry` for MPA. On MoS2 3×3 the PPM frame sat
-  1.4 eV above the DFT midgap, and judging coverage in the wrong one left a
-  "covered" state on $\Sigma(0)$ until a later growth switched it, a 2.8 eV
-  jump of its map output (CLAIMS 2736).
-- **Width.** The crossing-rule node count grows linearly in bandwidth$/\eta$,
-  and Σ far from $E_F$ is not smoother: on Fe the curvature at
-  $\lvert\omega\rvert \ge 15$ eV is 13× that near $E_F$. Put deep semicore in
-  `sc_frozen_core_bands`, where it stays at its DFT block and costs nothing.
-  `sigma_regularization_ev` is the literal broadening η of every ansatz and
-  is not a speed knob. The quadrature page owns η and
-  `sigma_quadrature_eps`.
-- **Held rules** (`sigma_box_plan._fit_fixed_sc_rules`). Map 0 is served
-  by the one-shot planner's rules, and the same balanced pass certifies the
-  first plan: one rule per product window on its box over the map-0 grid,
-  each state edge padded by `scissor.sc_window_pad_ev` =
-  max(2 eV, 10 % of $\lvert E - \mu\rvert$), clipped to the window's own
-  selector interval. Near $E_F$ that is the owner's 2 eV; far away the 10 %
-  is the QP stretch (Na 8³: top state +96 → +101 eV at map 1), which a flat
-  pad cannot hold: a flat 1 eV map-1 plan refit Na's 1265- and 1669-node
-  crossing windows in 553 s. Poles are padded by 10 % at the near edges and
-  widths, and 2× at the far edge of an unbounded selector (deep and bulk
-  windows), because the highest shared-pole mode moves 10–30 % per map and a
-  sign-definite relative rule pays about one node for it. From map 1 the
-  rules are held: a map reuses a rule by containment
-  (`cache=hit:sc-fixed`), and only the grid re-plans at map 1. A window
-  whose box leaves its rule, a new window, or a sign change is refit alone
-  at max(1 eV, 10 %) (`rebuild:sc-fixed`),
-  and its reason names the state (k, band, $E - \mu$), the pole extent or
-  the grid edge that crossed. The zero-side edge of a sign-definite box
-  stops at 5 % of its distance to zero, so the box stays sign-definite. The
-  window executables keep the session's largest node count, so a refit
-  recompiles them only when it raises it. A change of material class
-  re-initializes the plan. Every path accepts a rule only if its certified
-  sup error is at most `sigma_quadrature_eps`; otherwise it refuses, naming
-  the window, box, sup and node count. There is no retry; η and ε are fixed
-  for the session.
 - **Held W carriers.** From map 1 the shared-pole model keeps one
   pole-column extent per sector (`shared_pole_store._k_extent`: map 1's
   Kmax + 3 %, grown with headroom only when a live Kmax exceeds it, logged),
@@ -343,28 +248,6 @@ $\Sigma(E)$, not $\Sigma(0)$, for an active state outside the requested grid.
 
 ## 5 Where the map is not smooth
 
-**The grid-edge switch** (`sigma_out_of_grid = static` only). $\Sigma(0)$
-makes $F$ discontinuous at each edge $\omega_e$ by
-
-$$
-\Delta_n = \mathrm{Re}\,\Sigma_{c,nn}(0) - \mathrm{Re}\,\Sigma_{c,nn}(\omega_e).
-$$
-
-In the diagonal model $E = A + \Sigma(E)$, a jump that points outward
-($\Delta_n > 0$ at the top edge, $\Delta_n < 0$ at the bottom) gives every
-state within $\lvert\Delta_n\rvert$ of the edge a self-consistent partner on
-the other side. There are then two fixed points, and the path decides which
-one the loop reaches. An inward jump cannot do this.
-`qsgw_utils.sigma_grid_edge_ambiguity` flags these states every map. It has no
-threshold, because the band is the jump itself. It takes the effective edge as
-the outer of the sampled-grid edge and the padded-window edge, since a state
-inside the padded window grows the grid rather than leaving it. Frozen-core
-bands are excluded. On Fe 4³ bispinor, the H-point states converge at
-$E - \mu = +9.8$ eV (inside) under one trajectory and at $+11.7$ eV (outside)
-under another, around a +10 eV edge with $\Delta = 1.87$ eV (CLAIMS 2688).
-Under `cover` both seeds reach one branch within 2 meV (CLAIMS 2703); `clamp`
-has no jump, so the verdict flags edge states only under `static`.
-
 **The elementwise MPA pole refit** (`compute_mode = mpa`,
 `sigma_w_model = mpa`). The imaginary-axis samples of $\chi_0$ and $W$ respond
 linearly to a kick. The per-element Loewner/Padé solve from 16 samples is not
@@ -375,8 +258,8 @@ Resolution makes it harmless. At 24 bands and 192 centroids on Si the map gain
 is 14–18 and the loop plateaus; at 80 bands and 504 centroids it is 0.3 and
 the loop contracts.
 
-**Discrete events.** A rule rebuild or grid growth is a small jump of $F$. It
-is logged, and the history keeps it (§3).
+The sole convergence rebuild changes the map and starts a fresh Anderson
+history. Clamped interpolation is continuous at the sampled endpoints.
 
 ## 6 Shared-pole W with retained quadrature {#shared-pole-w-with-retained-quadrature}
 

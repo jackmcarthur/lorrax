@@ -35,13 +35,14 @@ def requested_states(energy_relative_ev, required_kn):
                                     np.shape(energy_relative_ev)))
 
 
-def plan_support_ev(sigma, deck_grid_ev, energy_relative_ev, requested_kn):
+def plan_support_ev(sigma, deck_grid_ev, energy_relative_ev, requested_kn, *,
+                    outer_pad_ev=SUPPORT_PAD_EV):
     """Return the single contiguous support and its unrounded envelope."""
     e = np.asarray(energy_relative_ev, float)
     p = np.broadcast_to(np.asarray(requested_kn, bool), e.shape)
     if not np.any(p) or not np.isfinite(e[p]).all():
         raise ValueError("Sigma support needs finite protected-state energies")
-    pad = SUPPORT_PAD_EV + read_halfwidth_ev()
+    pad = float(outer_pad_ev) + read_halfwidth_ev()
     envelope = (float(e[p].min()) - pad, float(e[p].max()) + pad)
     step = float(sigma.omega_step_ev)
     deck = np.asarray(deck_grid_ev, float)
@@ -80,6 +81,9 @@ def check_fixed_point(session):
         raise ValueError("GATE sigma_plan_fixed_point: support failed after its one "
                          "rebuild; enlarge nval/ncond or sigma_omega_min_ev/max_ev. "
                          + "; ".join(reasons))
+    old_grid = session.get("omega_grid_ev", ())
+    floor = () if not len(old_grid) else (old_grid[0], old_grid[-1])
     session.clear()
     session["convergence_rebuilds"] = 1
+    session["rebuild_floor_ev"] = floor
     return True

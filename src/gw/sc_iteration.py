@@ -2620,9 +2620,9 @@ class SCSupport(NamedTuple):
     grown: np.ndarray          # the grid this map samples, eV
     energy: np.ndarray         # E_in - mu per identity, eV
     requested: np.ndarray      # the requested set R (gw.qp_support)
-    event: str                 # one-shot | plan | re-plan | hold | extend
+    event: str                 # one-shot | plan | hold | rebuild
     envelope: tuple | None     # R's envelope since the last plan, eV
-    no_qp: np.ndarray          # requested identities dropped for Z outside (0, 1]
+    clamped_kn: np.ndarray      # protected states whose read stencil is clipped
 
 
 def _sc_sampled_support(inputs, partition, energies_loop, mu_ev, active_n=None,
@@ -2638,8 +2638,12 @@ def _sc_sampled_support(inputs, partition, energies_loop, mu_ev, active_n=None,
     energy = energies_loop - mu_ev
     states = requested_states(energy, part.protected_mask)
     if session is None or "omega_grid_ev" not in session:
-        grid, envelope = plan_support_ev(sigma, deck, energy, states)
-        event = "one-shot" if session is None else "plan"
+        rebuilding = bool(session and session.get("convergence_rebuilds"))
+        if rebuilding:
+            deck = np.concatenate((deck, session["rebuild_floor_ev"]))
+        grid, envelope = plan_support_ev(
+            sigma, deck, energy, states, outer_pad_ev=0. if rebuilding else 2.)
+        event = "rebuild" if rebuilding else "one-shot" if session is None else "plan"
     else:
         grid = np.asarray(session["omega_grid_ev"], float)
         envelope = session["support_envelope_ev"]
@@ -2657,8 +2661,8 @@ def _record_sc_window_plan(inputs, iteration, support):
     _record_sc(inputs, f"SC window {support.event} (map {iteration}): grid "
                f"[{grid[0]:+.6f}, {grid[-1]:+.6f}] eV; "
                f"protected={int(support.requested.sum())}; "
-               f"clamped_stencils={int(support.no_qp.sum())}; "
-               "outer pad=2.00 eV once; fixed-point check pending")
+               f"clamped_stencils={int(support.clamped_kn.sum())}; "
+               "initial outer pad=2.00 eV; no repeated pad; fixed-point check pending")
 
 
 def _sc_active_identities(inputs):
@@ -3752,11 +3756,11 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
         _record_sc_window_plan(inputs, int(state.iteration), sc_support)
         if session is not None:
             session["support_envelope_ev"] = sc_support.envelope
-            # A grid that leaves a held Sigma certificate is a box escape and
-            # refits only the windows it crossed (sigma_box_plan).
+            # The same omega coordinates are reused until the sole
+            # convergence rebuild; no map escape refits a rule.
             session["omega_grid_ev"] = tuple(float(x) for x in expanded_grid)
             session["window_plan"] = {
-                "index": 0 if event == "plan" else 1, "event": event,
+                "index": int(session.get("convergence_rebuilds", 0)), "event": event,
                 "iteration": int(state.iteration)}
         sigma_config = replace(
             inputs.config, sc_omega_grid_ev=tuple(float(x) for x in expanded_grid))
@@ -4484,7 +4488,7 @@ def _map_output_eigensystem(inputs, state_out):
 def _masked_residual_mev(H_out, H_in, mask_kn):
     """``P (H_out - H_in) P`` in meV, ``P`` the per-k block of ``mask_kn``."""
     f = (H_out - H_in) * RYD_TO_EV * 1e3
-    keep = mask_kn[:, :, None] & mask_kn[:, None, :]
+    keep = mask_kn[:, :, None] | mask_kn[:, None, :]
     return jnp.where(keep, f, 0.0)
 
 
@@ -5514,7 +5518,7 @@ def _run_anderson(
         metric_mask = np.broadcast_to(np.asarray(
             metric_partition.protected_mask | metric_partition.in_range_mask,
             dtype=bool), (int(x0.shape[0]), nb))
-        _metric_np[:, :nb, :nb] = metric_mask[:, :, None] * metric_mask[:, None, :]
+        _metric_np[:, :nb, :nb] = metric_mask[:, :, None] | metric_mask[:, None, :]
         _occ_state[0] = state_out.occupation_state
         _head_surface_weight[0] = state_out.head_surface_weight_kn
         _tail_z[0] = state_out.tail_z_kn
@@ -5607,6 +5611,7 @@ def _run_anderson(
                         occupation_state=state_out.occupation_state,
                         head_surface_weight_kn=state_out.head_surface_weight_kn,
                         outputs=state_out.outputs,
+                        tail_z_kn=state_out.tail_z_kn,
                         convergence_verdict=_verdict),
                 _verdict)
         return _to_entry(state_out.H_qp_dft - H)
