@@ -1588,8 +1588,7 @@ def run_fixed_sigma_evsc(
     model's active line) are removed from the Sigma Hamiltonian and replaced
     by the active-window scissor (:func:`_apply_scissor_partition_policy`).
     EQP2 is that scissor's only consumer.  The Sigma build reads
-    Sigma(omega = 0) for an off-grid energy whatever ``sigma_out_of_grid``
-    says (``build_qsgw_sigma_xc`` is called with its default), and only in
+    the nearest sampled edge for an off-grid energy, and only in
     matrix entries that the partition then discards.  Convergence is the maximum absolute
     eigenvalue difference between ``F(H)`` and ``H`` over the protected or
     otherwise non-scissored states.  ``eqp2_accelerator=rcrop`` accelerates

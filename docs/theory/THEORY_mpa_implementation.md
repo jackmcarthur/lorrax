@@ -248,7 +248,7 @@ with $\eta$ = `sigma_regularization_ev`, a literal retarded broadening entered
 once: $\Gamma_p$ stays in $W(t)$, and the planner multiplies every time weight
 by $e^{-\eta t}$. The four branches are (ω ≥ 0, ω < 0) × (empty, occupied);
 their sign topology, product windows, denominator boxes, rules
-(`sigma_quadrature_eps`, `sigma_window_edge_factor`) and refusals are
+(`sigma_quadrature_eps`; geometry follows [the window decision](sigma-windows-design.md)) and refusals are
 [the Σ quadrature problem](sigma-quadrature-problem.md). The planner uses only
 live poles ($|B_p|>0$); a nonfinite residue or a live pole with $a_p\le0$ or
 $\Gamma_p<0$ refuses. Metallic weights and the Fermi-window split are

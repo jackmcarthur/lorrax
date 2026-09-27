@@ -99,18 +99,10 @@ def interp_along_omega(
 
 def assert_omega_grid_covers(E_kn_ry, in_grid_mask, omega_grid_ry, *,
                              context):
-    """Refuse solved QP energies inside a hole of a patched ω grid.
+    """Refuse reads inside holes in a legacy externally supplied Sigma cube.
 
-    A patched grid (``sigma_omega_patches_ev``) has interior gaps by
-    design — that is what makes the MPA crossing rule's cost independent
-    of the dynamic range.  The Σ(ω)→E piecewise-linear interpolation is
-    silent about a hole: an energy in the gap would be interpolated
-    across it and come back plausible-looking and wrong.  So a hole is
-    detected from the grid itself (a step above 3× the median step) and
-    an in-grid-classified energy strictly inside one — more than one
-    median step from both hole edges — is a refusal that names the
-    energy and the fix (widen or add a patch).  Contiguous grids have
-    no holes and return immediately.
+    New runs produce a contiguous grid. The guard also protects callers
+    reading an older sparse-frequency artifact from silent gap interpolation.
     """
     omega = np.asarray(omega_grid_ry, dtype=np.float64)
     if omega.size < 2:
@@ -133,10 +125,8 @@ def assert_omega_grid_covers(E_kn_ry, in_grid_mask, omega_grid_ry, *,
                 f"the ω-grid hole ({lo * RYD_TO_EV:.2f}, "
                 f"{hi * RYD_TO_EV:.2f}) eV — e.g. "
                 f"{worst * RYD_TO_EV:.3f} eV — where Σ(ω) would be "
-                "interpolated across the gap.  FALSE case: every solved "
-                "QP energy lies on a grid patch.  Widen the nearest "
-                "sigma_omega_patches_ev patch (QP energies drift between "
-                "QSGW iterations; leave headroom).")
+                "interpolated across the gap. Recompute Sigma on a contiguous "
+                "grid covering these energies.")
 
 
 def solve_diagonal_sigma_fixed_point(
@@ -168,7 +158,7 @@ def solve_diagonal_sigma_fixed_point(
     E : (nk, nb)
         Converged QP eigenvalues in eV.  An iterate outside
         ``[ω_min, ω_max]`` reads Σ(ω = 0) (:func:`interp_along_omega`), not
-        the grid edge, whatever ``sigma_out_of_grid`` says; the caller
+        the nearest grid edge; the caller
         (:func:`solve_qp`) puts every band that is not on the grid at all k
         back at E_DFT.
     converged : (nk, nb), bool
@@ -620,7 +610,7 @@ def build_qsgw_sigma_xc(
     sigma_xc_qsgw_kij_ry : jax.Array, (nk, nb, nb), complex128, replicated
         unless ``replicated_output=False``, then two-axis band sharded.
     diagnostics : dict with ``n_clipped`` (count of ``E_kn`` outside
-        ``[ω_min, ω_max]``, read per ``out_of_grid`` through
+        ``[ω_min, ω_max]``, clamped through
         :func:`sigma_eval_omega`) and ``omega_min/max_ev``.
     """
     omega = np.asarray(omega_ev, dtype=np.float64)
@@ -816,7 +806,7 @@ def solve_qp(
     - ``fixed_point`` — diagonal on-shell solve E = h₀ + ReΣ(E) followed
       by a QSGW rebuild at the solved energies.  A band off the ω grid at
       any k keeps E_DFT, and an off-grid evaluation in the rebuild reads
-      Σ(ω = 0) whatever ``sigma_out_of_grid`` says (``build_qsgw_sigma_xc``
+      the nearest sampled edge (``build_qsgw_sigma_xc``
       is called with its default).  Dynamic, non-streamed only
       (validated at config load).  The dispatch's internal at-DFT build
       is superseded here — one redundant (cheap) QSGW contraction, the
