@@ -6,7 +6,7 @@ load optional numerical libraries only when called.
 
 The target is part of every rule contract. ``serve`` computes the static,
 imaginary-probe, and regularized crossing screening rules in process. Sigma's
-complex denominator rectangles use ``build_uniform_rule``. The shared-pole W
+complex denominator rectangles use ``analytic_box_rule``. The shared-pole W
 bank uses ``response_group_rules`` because it needs current-frequency value
 and derivative projections; the GN-PPM imaginary probe uses
 ``response_laplace_rule``. ``response_bank_rule`` has no production caller. Finite-temperature
@@ -72,14 +72,19 @@ _FREQUENCY_FIT_NAMES = (
     "DampedReciprocalFit", "fit_damped_reciprocal",
 )
 
-# Uniform denominator-box rules are a production service surface.  Keep the
-# numerical module lazy, like every other SciPy-backed builder below, so a
-# bare import still pays no solver dependency.
+# The denominator-box rule record, its boundary certificate and noise
+# measure, and the solver identity the rule table keys on.  Lazy, like every
+# numerical module below.
 _UNIFORM_RULE_NAMES = (
-    "UniformRule", "box_samples", "boundary_samples", "build_uniform_rule",
+    "UniformRule", "boundary_samples",
     "rule_roundoff_amplification", "rule_sup_error",
     "uniform_rule_solver_identity",
 )
+
+# Derived denominator-box rules (the bent contour on crossing boxes, the
+# elliptic time-Ritz sector rule on sign-definite ones): the Sigma planner's
+# builder.  SciPy, so lazy.
+_ANALYTIC_BOX_NAMES = ("analytic_box_rule",)
 
 # Levelled (minimax-optimal) noncrossing rules: NumPy only, but lazy like
 # every builder so a bare import pays nothing.
@@ -124,6 +129,9 @@ def __getattr__(name: str):
     if name in _UNIFORM_RULE_NAMES:
         from minimax import uniform_rule as _uniform   # noqa: PLC0415
         return getattr(_uniform, name)
+    if name in _ANALYTIC_BOX_NAMES:
+        from minimax import analytic_box as _analytic_box  # noqa: PLC0415
+        return getattr(_analytic_box, name)
     if name in _LEVELLED_NAMES:
         from minimax import levelled as _levelled  # noqa: PLC0415
         return getattr(_levelled, name)
@@ -144,7 +152,7 @@ def __getattr__(name: str):
 def __dir__():
     return sorted(set(globals()) | set(_SOLVER_NAMES)
                   | set(_FREQUENCY_FIT_NAMES)
-                  | set(_UNIFORM_RULE_NAMES)
+                  | set(_UNIFORM_RULE_NAMES) | set(_ANALYTIC_BOX_NAMES)
                   | set(_LEVELLED_NAMES) | set(_RESPONSE_RULE_NAMES)
                   | set(_MATSUBARA_RULE_NAMES) | set(_ANALYTIC_NAMES)
                   | set(_ODD_LAPLACE_NAMES) | set(_DAMPED_RULE_NAMES))
@@ -164,8 +172,9 @@ __all__ = [
     "SamplingUnsupported",
     # --- complex-frequency resolvent fitting (lazy; scipy) -----------------
     *_FREQUENCY_FIT_NAMES,
-    # --- uniform denominator-box rules (lazy; scipy) -----------------------
+    # --- denominator-box rules (lazy; scipy) -------------------------------
     *_UNIFORM_RULE_NAMES,
+    *_ANALYTIC_BOX_NAMES,
     # --- levelled noncrossing rules (lazy; numpy) --------------------------
     *_LEVELLED_NAMES,
     # --- exploratory reciprocal constructors (lazy; scipy/mpmath) ---------
