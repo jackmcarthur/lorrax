@@ -195,3 +195,39 @@ def test_the_response_rules_do_not_depend_on_blas_threads():
         for (_get, put), count in zip(controls, saved):
             put(count)
     np.testing.assert_array_equal(times[0], times[1])
+
+
+@pytest.mark.parametrize('lo,hi,z,beta', [
+    (-.2, 1., [.7+.2j, .3+.2j, .45j], 0.),        # crossing levels only
+    (.05, 6., [.1j, .4j, 1.6j, .3+.2j, .6+.2j], 0.),  # insulator: sector family + bent contour family
+    (-1., 1., [.3+.19j], 40.),                       # metal envelope: Re T <= beta
+])
+def test_response_group_rules_are_derived_and_certified(lo, hi, z, beta):
+    """The nodes are the union of the families' derived sets at the returned
+    rungs (nothing searched), and the certified sup bounds a dense check."""
+    from minimax import complex_response as cr
+    z = np.asarray(z)
+    (rule,) = minimax.response_group_rules(lo, hi, z, rel_tol=1e-8, decay_rate=beta)
+    n = rule['count']
+    tol = 5e-9
+    eps = tol/np.log(4/tol)
+    levels = cr.response_levels(lo, hi, cr._poles(z))
+    (boxes,) = [p for p in cr.family_partitions(levels, eps, beta)
+                if [(bool(c), sorted(h)) for _b, c, h in p] == rule['families']][:1]
+    expected = np.unique(np.concatenate([cr.family_nodes(b, eps, r, c)
+                                         for (b, c, _), r in zip(boxes, rule['rungs'])]))
+    np.testing.assert_array_equal(rule['t'][:n], 1j*expected)
+    assert rule['sampled_error'].max() <= tol
+    d = np.linspace(lo, hi, 40001)
+    weight = np.exp(np.minimum(beta*d, 0.))
+    for row, zi in enumerate(z):
+        for side, (pole, t) in enumerate(((zi, rule["t"][:n]), (-zi, np.conj(rule["t"][:n])))):
+            basis = np.exp(-(d[:, None] - rule['reference_ry'])*t)
+            value = np.max(weight*abs(basis@rule['value'][row, side, :n] - 1/(d - pole)))*zi.imag
+            ds = (1 if side == 0 else -1)/(2*zi*(d - pole)**2)
+            slope = np.max(weight*abs(basis@rule['derivative'][row, side, :n] - ds))*zi.imag**3
+            assert max(value, slope) <= 1.05*tol, (value, slope)
+    re_t = rule['t'][:n].real
+    assert re_t.min()*(hi - lo) >= -3.0 - 1e-12
+    if beta:
+        assert re_t.max() <= beta

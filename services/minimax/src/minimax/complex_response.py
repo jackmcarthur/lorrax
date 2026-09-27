@@ -1,57 +1,48 @@
-"""Response-bank exponential sums shared by groups of samples.
+"""Response-bank exponential sums shared by groups of samples: derived nodes.
 
-Scalar construction only: a stacked Hankel shift pencil chooses complex
-Laplace times shared by every forward (z) and reverse (-conj z) pole of a
-sample group; linear projection fits 1/(d-p) and 1/(d-p)^2 on those nodes.
-No continuum certificate is claimed. Energies are Ry, times Ry^-1, slopes are
-d/d(z^2).
+A group's rule represents, for every pole p of its samples (forward z and
+reverse -conj z) and every real transition d in [lo, hi],
+
+    1/(d - p) ~ sum_j c_j exp(-(d - r) T_j),   1/(d - p)^2 on the same T_j,
+
+with one Green pair per complex time T_j. In D = p - d the targets are -1/D
+and 1/D^2 on the horizontal segment {p - d : d in [lo, hi]} at height Im p:
+the Sigma denominator-box problem on a thin box, T = i t. The poles of one
+height form one level. The levels split into families (sign-definite:
+elliptic sector rule; crossing: the bent contour of ``analytic_box``, plus a
+Gauss-Legendre leg and tall-box image-phase nodes; optionally the crossing
+levels whose narrow side lies within one height: sector rule), each on the
+smallest box holding its levels, built at eps = tol/ln(4/tol) so the ds rows
+meet tol too. The node set is the union of the families' sets. Nothing is
+fitted but linear weights: one least-squares solve per level on the union
+(value and ds together), and an evaluation-only certificate on each level's
+segment in the pole's own currency (eta_p |error| and eta_p^3 |ds error|). A
+family whose levels fail climbs its own fixed ladder. Energies are Ry, times
+Ry^-1, slopes are d/d(z^2). docs/theory/response-laplace.md owns the
+derivation and the node count.
 """
+import math
+
 import numpy as np
 from scipy import linalg as la
 
-from .uniform_rule import _pinned_blas_threads
+from .analytic_box import _CROSSING_RUNGS, _SECTOR_RUNGS, _sector_times
+from .analytic_box import corner_exponent, crossing_nodes
+from .uniform_rule import _BoundaryCloud, _cexp, _edge_points, _pinned_blas_threads
 
-RESPONSE_RULE_CAPACITY = 192
-# Node slots of one rule: a shared set uses at most one pencil's capacity; a
-# single sample whose forward and reverse poles need separate sets uses two.
+RESPONSE_RULE_CAPACITY = 384
+# Node slots of one rule (the stream kernel's compiled time extent; only the
+# live prefix is executed).
 RESPONSE_NODE_CAPACITY = 2*RESPONSE_RULE_CAPACITY
+# The executor's admitted term mass eta_p * sum |c exp(-(d - r) T)|, per pole.
 _RESPONSE_MAX_KAPPA = 5000.
-# A group's pencil geometry is abandoned after this many more exponentials
-# without a decade of accuracy; the next geometry, then a smaller group, is
-# tried. A single sample keeps the full scan, so it never refuses earlier.
-_STAGNATION_NODES = 24
-
-
-def _project(lo, hi, pole, times, decay_rate=0.):
-    eta = abs(pole.imag)
-    span, zp = (hi-lo)/eta, (pole-lo)/eta
-    x = np.unique(np.r_[0., span,
-        span/2*(1-np.cos(np.pi*(np.arange(1400)+.5)/1400)),
-        zp.real+np.linspace(-5, 5, 500)])
-    x = x[(x >= 0) & (x <= span)]
-    f = 1/(x-zp)
-    origin = 0. if decay_rate else lo
-    def basis(xx):
-        d = lo + eta*xx
-        weight = np.exp(np.minimum(decay_rate*d, 0.))
-        return np.exp(np.minimum(decay_rate*d, 0.)[:, None]
-                      - (d[:, None]-origin)*times), weight
-    a, weight = basis(x)
-    a = a/abs(f[:, None])
-    scale = la.norm(a, axis=0)
-    if np.any(scale == 0) or not np.isfinite(scale).all():
-        return None
-    coeff = la.lstsq(a/scale, weight[:, None]*np.column_stack((f, f*f))/abs(f[:, None]),
-                    cond=1e-14, lapack_driver='gelsd', check_finite=False)[0]/scale[:, None]
-    probe = np.unique(np.r_[x, np.linspace(0, span, 2501)])
-    error = np.zeros(2)
-    for xx in np.array_split(probe, 16):
-        exact = 1/(xx-zp)
-        a, weight = basis(xx)
-        error = np.maximum(error, np.max(abs(a@coeff
-                       - weight[:, None]*np.column_stack((exact, exact*exact))), axis=0))
-    mass = np.sum(abs(coeff), axis=0)
-    return coeff / np.array([eta, eta*eta]), error, mass
+# Ridge of the weight solve in units of the tolerance: a term-mass penalty,
+# 1/200 of the error budget per unit-maximum column (the mass gate accepts).
+_RIDGE = 0.005
+# Growth-side times: |Re T| (hi - lo) <= 3, so no Green factor grows past e^3.
+_GROWTH_CAP = 3.0
+# A column below exp(_DEAD) of the tolerance on a level is not fitted there.
+_DEAD = -40.0
 
 
 def _poles(z):
@@ -69,134 +60,199 @@ def _poles(z):
     return np.asarray(poles)
 
 
-def _fits(lo, hi, poles, times, tol, decay_rate, order=None):
-    """Project every pole on shared times; stop at the first rejected pole.
+def response_levels(lo, hi, poles):
+    """One thin box (re_lo, re_hi, y, y) of D = p - d per pole height y, Ry."""
+    return [(float(poles.real[poles.imag == y].min()) - hi,
+             float(poles.real[poles.imag == y].max()) - lo, float(y), float(y))
+            for y in np.unique(poles.imag)]
 
-    ``order`` is a caller-owned list of pole indices; a rejected pole moves to
-    its front, so the next candidate is tested on the hardest pole first.
+
+#: Thin-box corner exponent of the response rules: e^c amplifies the narrow
+#: edge, and the executor admits a term mass of 5000, so c = 6 leaves the
+#: least-squares cancellation a factor of ten (the Sigma rule's c = 4 sits
+#: under its own cap of 83 the same way).
+_BEND = 6.0
+
+
+def _hull(levels):
+    return (min(lv[0] for lv in levels), max(lv[1] for lv in levels),
+            min(lv[2] for lv in levels), max(lv[3] for lv in levels))
+
+
+def family_partitions(levels, eps, decay_rate=0.):
+    """Candidate family partitions of a group's levels, cheapest rung-0 union first.
+
+    Each partition is a list of ``(box, crossing, heights)``:
+
+    - sign-definite levels (Re D of one sign): one box, the elliptic sector rule;
+    - crossing levels: one box, the bent contour; or, in the second
+      candidate, the crossing levels whose narrow side lies within one height
+      (``min(-re_lo, re_hi) < y``: a high imaginary sample on a metal) split
+      off into one sector-rule box, keeping the highest such levels whose
+      rung-0 times hold ``0 <= Re T <= decay_rate`` (the lowest is dropped
+      until they do).
+
+    Each box is the smallest holding its levels. The candidates are ordered by
+    the size of their rung-0 node union, a formula of the boxes; the builder
+    takes the first whose ladders certify.
     """
-    order = list(range(len(poles))) if order is None else order
-    fits = [None]*len(poles)
-    worst = 0.
-    for position, index in enumerate(list(order)):
-        pole = poles[index]
-        fit = _project(lo, hi, pole, times, decay_rate)
-        error = np.inf if fit is None else float(np.max(fit[1]*[1., pole.imag/(2*abs(pole))]))
-        mass_rejected = fit is not None and error <= tol and fit[2][0] > _RESPONSE_MAX_KAPPA
-        if fit is None or not error <= tol or not np.isfinite(fit[2]).all() or mass_rejected:
-            order.insert(0, order.pop(position))
-            return None, error, bool(mass_rejected)
-        worst = max(worst, error)
-        fits[index] = fit
-    return fits, worst, False
+    definite = [lv for lv in levels if not lv[0] < 0.0 < lv[1]]
+    crossing = [lv for lv in levels if lv[0] < 0.0 < lv[1]]
+    base = [(_hull(definite), False, {lv[2] for lv in definite})] if definite else []
+    candidates = [base + ([(_hull(crossing), True, {lv[2] for lv in crossing})] if crossing else [])]
+    narrow = sorted((lv for lv in crossing if min(-lv[0], lv[1]) < lv[2]), key=lambda lv: lv[2])
+    while narrow:
+        re_t = (1j*_sector_times(_hull(narrow), eps, 0)[0]).real
+        if float(re_t.min()) >= 0.0 and (not decay_rate or float(re_t.max()) <= decay_rate):
+            rest = [lv for lv in crossing if lv not in narrow]
+            candidates.append(base + [(_hull(narrow), False, {lv[2] for lv in narrow})]
+                              + ([(_hull(rest), True, {lv[2] for lv in rest})] if rest else []))
+            break
+        narrow = narrow[1:]
+
+    def size(partition):
+        sets = [family_nodes(box, eps, 0, crossing) for box, crossing, _ in partition]
+        return np.unique(np.concatenate(sets)).size
+    return sorted(candidates, key=size)
 
 
-def _shared_times(lo, hi, poles, tol, previous=None, decay_rate=0., patience=None):
-    """Complex times shared by every pole, or None.
+def family_nodes(box, eps, rung, crossing, bend=_BEND):
+    """Derived times of one family box at ``rung``, or None past its ladder.
 
-    A stacked (multi-channel) Hankel shift pencil: each pole contributes the
-    Hankel matrix of 1/(x - z_p) sampled at the group's finest scale; their
-    common row space holds the shared exponentials. Coefficients are then the
-    per-pole linear projection of the single-pole construction, with the same
-    sampled-error and coefficient-mass acceptance.
+    Sign-definite: the elliptic sector rule, six rungs. Crossing: the bent
+    contour at ``c = bend`` capped by the tall-box leg phase, then ``c/2``,
+    ``c/4`` (six rungs each), plus two derived sets the Sigma rule does not
+    need at its tolerance:
+
+    - ``ceil((c + ln(1/eps))/2)`` Gauss-Legendre nodes on the leg
+      ``[0, -i c/m]``: the narrow side grows there as ``e^{c u}``, which the
+      geometric grading toward 0 leaves unresolved below 1e-8;
+    - on a tall box (height ratio H), ``ceil(gamma S (H - 1)/pi)``
+      Gauss-Legendre nodes on the decaying image axis ``[0, -i S]``: its
+      members turn their phase through ``S (H - 1)`` radians there.
     """
-    order = list(range(len(poles)))
-    if previous is not None and len(previous):
-        fits, _, _ = _fits(lo, hi, poles, previous, tol, decay_rate, order)
-        if fits is not None:
-            return previous, fits
-    eta = float(poles.imag.min())
-    origin = 0. if decay_rate else lo
-    span = max(abs(lo), abs(hi))/eta if decay_rate else (hi-lo)/eta
-    zps = (poles-origin)/eta
-    geometry = max(span, 8*max(float(zps.real.max()), 0.))
-    # Resolve the reciprocal and its square before taking the shift pencil:
-    # principal-log modes stop at pi/step; their tails decay as t*exp(-t).
-    horizon = -np.log(tol) + np.log(-np.log(tol)) + 6.
-    size = max(800, int(np.ceil((geometry + 16.)*horizon/(2*np.pi))))
-    ids = np.arange(size)
-    for padding, flatten in ((0., 1.), (2., .9), (4., .9), (8., 1.), (10., 1.), (16., .9)):
-        # A short interval ending near the resonance gives growing modes.
-        # Extend only the proposal geometry; fit/check the physical interval.
-        step = (geometry+padding)/(2*size)
-        base = -padding+(ids[:, None]+ids[None, :])*step
-        blocks, shifted = [], []
-        # The shared exponentials live in the ROW space (index i). A column
-        # subset dense near j=0, where 1/(x-z_p) varies fastest, and geometric
-        # beyond spans it; the stack stays ~2*size wide for any group.
-        width = max(32, 2*size//len(zps))
-        columns = np.unique(np.r_[ids[:16], np.round(np.geomspace(16, size-1, width)).astype(int)])
-        for zp in zps:
-            block = 1/(base[:, columns]-zp)
-            scale = 1/la.norm(block)
-            blocks.append(scale*block)
-            shifted.append(scale/(base[:, columns]+step-zp))
-        # The stack is size x (poles*size). Factor its tall adjoint once,
-        # H = R^H Q^H, and take the SVD of the small R^H: the same singular
-        # triplets as a direct SVD of the wide stack, at QR cost.
-        q, r = la.qr(np.hstack(blocks).conj().T, mode="economic", check_finite=False)
-        u, s, wh = la.svd(r.conj().T, check_finite=False)
-        rank = min(RESPONSE_RULE_CAPACITY, len(s))
-        shift = u[:, :rank].conj().T@(np.hstack(shifted)@q)@wh[:rank].conj().T
-        best, best_n = np.inf, 0
-        for n in range(8, rank + 1, 4):
-            roots = la.eigvals(shift[:n, :n]/np.sqrt(s[:n, None]*s[None, :n]),
-                              check_finite=False)
-            with np.errstate(divide='ignore', invalid='ignore'):
-                t = -np.log(roots)/step
-            if not np.isfinite(t).all() or np.any(t.real < 0):
-                continue
-            times = (flatten*t.real+1j*t.imag)/eta
-            if decay_rate:
-                times = times[times.real <= decay_rate]
-            if not len(times):
-                continue
-            fits, error, mass_rejected = _fits(lo, hi, poles, times, tol, decay_rate, order)
-            if fits is not None:
-                return times, fits
-            if mass_rejected:
-                break  # Try the next padding/flattening geometry, not more cancelling terms.
-            if error < best/10:
-                best, best_n = error, n
-            elif patience is not None and n - best_n >= patience:
-                break  # No decade of accuracy in this many more exponentials.
-    return None
+    if not crossing:
+        return _sector_times(box, eps, rung)[0] if rung < _SECTOR_RUNGS else None
+    if rung >= 3*_CROSSING_RUNGS:
+        return None
+    y = box[2]
+    c = corner_exponent(box, bend)/2.0**(rung//_CROSSING_RUNGS)
+    s, receipt = crossing_nodes(box, eps, rung % _CROSSING_RUNGS, c)
+    L, m, B0, gamma = math.log(1.0/eps), receipt["m"], receipt["B0"], receipt["gamma"]
+    parts = [s, -1j*receipt["tau_c"]*_unit_gauss(math.ceil((c + L)/2.0))]
+    horizon = (L + c)/max(1.0 - m/B0, 0.05)/B0
+    k = math.ceil(gamma*horizon*(box[3]/y - 1.0)/math.pi)
+    if k:
+        parts.append(-1j*horizon*_unit_gauss(k))
+    return np.concatenate(parts)/y
 
 
-def _rule(z, sets):
-    """Scatter pole fits on node sets into forward and reverse sample rows.
+def _unit_gauss(n):
+    """Gauss-Legendre nodes on [0, 1]."""
+    return 0.5*(np.polynomial.legendre.leggauss(n)[0] + 1.0)
 
-    ``sets`` is a list of (times, poles, fits). A node t is one Green pair
-    A(t): forward rows fit 1/(d-z) on t; reverse rows, evaluated at conj(t)
-    from conj(A(t)), fit 1/(d+z) as the conjugate of the -conj(z) fit on t.
-    A set without a sample's pole contributes zero weight to that row.
+
+def _live(level, times, eps):
+    """Columns alive somewhere on the level's segment (above exp(_DEAD) eps)."""
+    xa, xb, y, _ = level
+    edge = np.array([xa + 1j*y, xb + 1j*y])
+    log_max = np.max(-(edge[:, None]*times[None, :]).imag, axis=0)
+    return log_max > math.log(eps) + _DEAD
+
+
+def _level_weights(level, times, eps):
+    """Weights of 1/D and 1/D^2 on one level: one least-squares solve.
+
+    Rows sample the segment at two points per half wave of the largest live
+    ``|t|``; columns are scaled to unit maximum in log space; a ridge
+    ``_RIDGE*eps`` prices each term's largest contribution in the peak
+    currency. 1/D^2 in eta^2 currency is the same eta-scaled solve with the
+    right side divided by eta, ridge included.
     """
-    times = np.concatenate([t for t, _, _ in sets])
+    xa, xb, y, _ = level
+    live = _live(level, times, eps)
+    t = times[live]
+    x = _edge_points(xa, xb, lambda v: v + 1j*y, 0.0, float(np.abs(t).max()), 1e-300, 2.0, 8.0)
+    d = x + 1j*y
+    log_max = np.max(-(d[:, None]*t[None, :]).imag, axis=0)
+    a = y*_cexp(1j*d[:, None]*t[None, :] - log_max[None, :])
+    a = np.vstack([a, _RIDGE*eps*y*math.sqrt(d.size)*np.eye(t.size)])
+    rhs = np.zeros((a.shape[0], 2), complex)
+    rhs[:d.size, 0], rhs[:d.size, 1] = y/d, y/d**2
+    q, r = la.qr(a, mode="economic", check_finite=False)
+    w = np.zeros((times.size, 2), complex)
+    w[live] = la.solve_triangular(r, q.conj().T @ rhs, check_finite=False)*np.exp(-log_max)[:, None]
+    return w[:, 0], w[:, 1]
+
+
+def _certify(level, times, weights, poles):
+    """Evaluation-only sup of the value and ds errors on one level, and the mass.
+
+    The cloud resolves the largest ``|t|`` of the union everywhere (a union
+    of families has no single ray), and refines every sampled local maximum.
+    """
+    xa, xb, y, _ = level
+    cloud = _BoundaryCloud(level, 0.0, float(np.abs(times).max()), 1e-300, p=6.0, p_target=8.0)
+    value, _, mass = cloud.sup(times, weights[0], False)
+    slope, _, _ = cloud.sup(times, weights[1], False, power=2)
+    members = poles[poles.imag == y]
+    # ds currency eta^3 |d/ds error| = eta^2 |error of 1/D^2| * eta/(2|p|)
+    return value, slope*float((y/(2*np.abs(members))).max()), mass
+
+
+def _admissible(times, lo, hi, decay_rate):
+    """No Green factor grows past e^3, nor past a metal's occupation envelope."""
+    re_t = (1j*times).real
+    return (-float(re_t.min())*(hi - lo) <= _GROWTH_CAP*(1 + 1e-12)
+            and (not decay_rate or float(re_t.max()) <= decay_rate))
+
+
+def _fit(levels, poles, times, tol):
+    """Per-level weights and certificates on fixed times: {y: (weights, value, ds)}."""
+    out = {}
+    for level in levels:
+        weights = _level_weights(level, times, tol)
+        value, slope, mass = _certify(level, times, weights, poles)
+        ok = (np.isfinite([value, slope, mass]).all() and value <= tol
+              and slope <= tol and mass <= _RESPONSE_MAX_KAPPA)
+        out[level[2]] = (weights, value, slope, ok)
+    return out
+
+
+def _coefficients(pole, times, reference, level):
+    """(value, ds) coefficients of one pole on exp(-(d - reference) T), T = i t."""
+    (w_value, w_slope), value_error, slope_error, _ = level
+    phase = _cexp(1j*times*(pole - reference))
+    return (np.column_stack((-w_value*phase, w_slope*phase)),
+            np.array([value_error, slope_error]))
+
+
+def _rule(z, times, poles, fits, reference):
+    """Scatter pole coefficients into forward and reverse sample rows.
+
+    A node T is one Green pair A(T): forward rows fit 1/(d-z) on T; reverse
+    rows, evaluated at conj(T) from conj(A(T)), fit 1/(d+z) as the conjugate
+    of the -conj(z) fit on T.
+    """
     count = len(times)
-    t = np.zeros(RESPONSE_NODE_CAPACITY, complex)
-    t[:count] = times
+    T = np.zeros(RESPONSE_NODE_CAPACITY, complex)
+    T[:count] = 1j*times
     shape = (len(z), 2, RESPONSE_NODE_CAPACITY)
     value, derivative = np.zeros(shape, complex), np.zeros(shape, complex)
     errors, mass = np.zeros((len(z), 2, 2)), np.zeros((len(z), 2, 2))
     for j, point in enumerate(z):
-        start = 0
-        for set_times, poles, fits in sets:
-            stop = start + len(set_times)
-            for side, pole in enumerate((point, -point.conjugate())):
-                match = np.flatnonzero(abs(poles - pole) <= 1e-12*abs(pole))
-                if not match.size:
-                    continue
-                coefficient, fit_error = fits[int(match[0])][:2]
-                if side:
-                    coefficient = np.conj(coefficient)
-                value[j, side, start:stop] = coefficient[:, 0]
-                derivative[j, side, start:stop] = (1 if side == 0 else -1)*coefficient[:, 1]/(2*point)
-                errors[j, side] = [fit_error[0], fit_error[1]*abs(point.imag/(2*point))]
-            start = stop
+        for side, pole in enumerate((point, -point.conjugate())):
+            match = poles[np.flatnonzero(abs(poles - pole) <= 1e-12*abs(pole))[0]]
+            coefficient, error = _coefficients(match, times, reference, fits[match.imag])
+            if side:
+                coefficient = np.conj(coefficient)
+            value[j, side, :count] = coefficient[:, 0]
+            derivative[j, side, :count] = (1 if side == 0 else -1)*coefficient[:, 1]/(2*point)
+            errors[j, side] = error
         for side in (0, 1):
             mass[j, side] = [point.imag*np.sum(abs(value[j, side])),
                              point.imag**3*np.sum(abs(derivative[j, side]))]
-    return dict(t=t, value=value, derivative=derivative, count=count,
+    return dict(t=T, value=value, derivative=derivative, count=count,
                 sampled_error=errors, coefficient_mass=mass)
 
 
@@ -204,28 +260,26 @@ def response_group_rules(lo_ry, hi_ry, z_ry, *, rel_tol=1e-8, previous=None,
                          decay_rate=0.):
     """Shared complex-time rules for a group of response samples.
 
-    Built at the Sigma rule builder's pinned BLAS thread count: the Hankel
-    QR/SVD, eigvals and least squares sum in a thread-count dependent order,
-    and a different order picks different node times (Fe 4^3 map-1 group:
-    one node count, three time digests at 8, 16 and 32 threads, P2-S
-    2026-09-25). The shared-pole W poles inherit these rules.
+    Every node T is ONE Green-pair evaluation A(T): forward rows use the
+    exponential exp[-(d-reference_ry)*T] and fit 1/(d-z); reverse rows use
+    conj(A(T)), i.e. the exponential at conj(T), and fit 1/(d+z). The nodes
+    are the union of the group's family rules (module docstring); value and
+    ds are certified at rel_tol/2 each on every level. A family whose levels
+    fail climbs its own fixed ladder and the union is refit; the candidate
+    partitions (``family_partitions``) are tried cheapest first. A positive
+    decay_rate (the occupation envelope min(1, exp(decay_rate*d))) admits
+    only times with Re T <= decay_rate. No group is split and nothing is
+    searched: a group whose ladders run out refuses by name.
 
-    Every node t is ONE Green-pair evaluation A(t): forward rows use the
-    exponential exp[-(d-reference_ry)*t] and fit 1/(d-z); reverse rows use
-    conj(A(t)), i.e. the exponential at conj(t), and fit 1/(d+z). A group
-    whose shared fit fails is split in halves, down to single samples.
-    A successful shared rule can use more nodes than one member would need
-    alone; its Green-pair evaluations serve all members of the group.
-
-    Returns a list of rules. Each has ``members`` (indices into ``z_ry``),
-    ``t[RESPONSE_NODE_CAPACITY]``, ``value``/``derivative`` of shape
-    ``[members, 2 (forward, reverse), RESPONSE_NODE_CAPACITY]`` (value and
-    d/d(z^2)), ``count``, ``sampled_error`` and ``coefficient_mass``
-    ``[members, 2, 2]``, and ``reference_ry``. ``previous`` is a list of
-    earlier rules; one whose members match is tried first. A positive
-    decay_rate bounds occupation products by min(1,exp(decay_rate*d)); errors
-    then use that envelope and 0<=Re(t)<=decay_rate. Bounds are sampled, not
-    proven.
+    Returns a one-element list of rules. The rule has ``members`` (indices
+    into ``z_ry``), ``t[RESPONSE_NODE_CAPACITY]``, ``value``/``derivative`` of
+    shape ``[members, 2 (forward, reverse), RESPONSE_NODE_CAPACITY]`` (value
+    and d/d(z^2)), ``count``, ``sampled_error`` (certified sup, value and ds,
+    in eta and eta^3 currency), ``coefficient_mass`` ``[members, 2, 2]``,
+    ``reference_ry``, the per-family ``rungs`` and ``families``
+    ``[(crossing, heights)]``. ``previous`` is a list of
+    earlier rules; one whose members match is re-certified on its times and
+    reused.
     """
     lo, hi = float(lo_ry), float(hi_ry)
     z = np.asarray(z_ry, dtype=np.complex128).reshape(-1)
@@ -234,31 +288,52 @@ def response_group_rules(lo_ry, hi_ry, z_ry, *, rel_tol=1e-8, previous=None,
             or np.any(z.imag <= 0) or not 1e-13 <= rel_tol < .1):
         raise ValueError('invalid response frequency/domain/tolerance')
     reference = 0. if decay_rate else lo
-    old = {tuple(rule["members"]): rule["t"][:rule["count"]]
-           for rule in (previous or ())}
-
-    def build(members):
-        poles = _poles(z[members])
-        got = _shared_times(lo, hi, poles, rel_tol/2, old.get(tuple(members)), decay_rate,
-                            patience=None if len(members) == 1 else _STAGNATION_NODES)
-        if got is not None:
-            rule = _rule(z[members], [(*got[:1], poles, got[1])])
-            return [dict(rule, members=list(members), reference_ry=reference)]
-        if len(members) == 1:
-            # Forward and reverse poles on separate node sets: each node then
-            # serves one orientation, exactly as separate per-pole rules do.
-            sets = []
-            for pole in poles:
-                one = np.asarray([pole])
-                got = _shared_times(lo, hi, one, rel_tol/2, None, decay_rate)
-                if got is None:
-                    raise ValueError(f'response exponential fit failed: interval={lo, hi}, '
-                                     f'sample={z[members[0]]}, pole={pole}, tolerance={rel_tol}')
-                sets.append((got[0], one, got[1]))
-            rule = _rule(z[members], sets)
-            return [dict(rule, members=list(members), reference_ry=reference)]
-        half = len(members)//2
-        return build(members[:half]) + build(members[half:])
-
+    tol = rel_tol/2
+    # the ds target's time density is s exp(isD): one horizon factor Lam more
+    eps = tol/math.log(4.0/tol)
+    poles = _poles(z)
+    levels = response_levels(lo, hi, poles)
+    members = list(range(len(z)))
+    old = {tuple(rule["members"]): rule for rule in (previous or ())}
     with _pinned_blas_threads():
-        return build(list(range(len(z))))
+        warm = old.get(tuple(members))
+        if warm is not None:
+            times = -1j*np.asarray(warm["t"][:warm["count"]])
+            if _admissible(times, lo, hi, decay_rate):
+                fits = _fit(levels, poles, times, tol)
+                if all(f[3] for f in fits.values()):
+                    return [dict(_rule(z, times, poles, fits, reference), members=members,
+                                 reference_ry=reference, rungs=warm.get("rungs"),
+                                 families=warm.get("families"))]
+        for boxes in family_partitions(levels, eps, decay_rate):
+            rungs = [0]*len(boxes)
+            sets = [None]*len(boxes)
+
+            def climb(i, rung):
+                """The first admissible rung at or above ``rung`` (inadmissible rungs are skipped)."""
+                box, crossing, _heights = boxes[i]
+                while True:
+                    times = family_nodes(box, eps, rung, crossing)
+                    if times is None or _admissible(times, lo, hi, decay_rate):
+                        rungs[i], sets[i] = rung, times
+                        return times is not None
+                    rung += 1
+
+            alive = all([climb(i, 0) for i in range(len(boxes))])
+            while alive:
+                times = np.unique(np.concatenate(sets))
+                if times.size > RESPONSE_NODE_CAPACITY:
+                    break
+                fits = _fit(levels, poles, times, tol)
+                failing = sorted({i for i, (_b, _c, heights) in enumerate(boxes)
+                                  for level in levels if level[2] in heights and not fits[level[2]][3]})
+                if not failing:
+                    return [dict(_rule(z, times, poles, fits, reference), members=members,
+                                 reference_ry=reference, rungs=list(rungs),
+                                 families=[(bool(c), sorted(h)) for _b, c, h in boxes])]
+                alive = all([climb(i, rungs[i] + 1) for i in failing])
+    raise ValueError(
+        f'GATE response_rule_certificate: the derived level rules of {len(levels)} pole '
+        f'heights do not certify at tolerance {tol:.3e} within {RESPONSE_NODE_CAPACITY} nodes '
+        f'and their ladders (interval [{lo}, {hi}] Ry, samples {z.tolist()}, decay_rate '
+        f'{decay_rate})')
