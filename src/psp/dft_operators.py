@@ -22,7 +22,9 @@ Public API (G-vector layout):
 
 Public API (per-component builders):
   build_T_diag_from_kvec — |k+G|² + G-indices from an explicit k-vector + ecutwfc
-  build_V_scf           — combine V_loc + V_H + V_xc into one array
+  build_V_scf           — combine V_loc + V_H + V_xc (+ B_xc·σ) into one array
+  compute_V_H_and_V_xc_noncollinear — V_H, v_xc, B_xc from ρ and m (magnetic runs)
+  local_potential       — V ψ on the grid, scalar or 2x2 spin-matrix V_scf
   compute_V_H_and_V_xc  — @jax.jit: V_H (Poisson) + V_xc (PBE GGA) in 1.2 ms cached
   build_h_diag          — preconditioner diagonal: T + V_loc(G=0) + V_NL_diag
 
@@ -70,7 +72,8 @@ class HamiltonianK:
     # Kinetic: T|ψ⟩_G = T_diag[G] · ψ_G
     T_diag: jax.Array               # (nG,) float64 — |k+G|² in Ry
 
-    # Local self-consistent potential: V_scf = V_loc + V_H + V_xc
+    # Local self-consistent potential: V_scf = V_loc + V_H + V_xc; a magnetic
+    # run carries the spin matrix (2, 2, nx, ny, nz) complex128 (build_V_scf)
     V_scf: jax.Array                # (nx, ny, nz) float64 — Ry
 
     # G-vector map: FFT-box indices for the valid G-vectors at this k
@@ -551,10 +554,54 @@ def compute_V_H_and_V_xc(
     return V_H_r, V_xc_r
 
 
+@functools.partial(jax.jit, static_argnames=("truncation_2d", "blat"))
+def compute_V_H_and_V_xc_noncollinear(
+    rho_val: jax.Array,
+    rho_core: jax.Array,
+    rhog_core: jax.Array,
+    mag: jax.Array,
+    G_cart: jax.Array,
+    bdot: jax.Array,
+    bvec: jax.Array,
+    blat: float,
+    *,
+    truncation_2d: bool = False,
+) -> tuple[jax.Array, jax.Array, jax.Array]:
+    """V_H, v_xc and B_xc for a noncollinear magnetic run (PBE, QE's general branch).
+
+    ``mag`` is m(r) (3, nx, ny, nz) in ρ's units; ρ_core enters ρ only.
+    Returns ``(V_H_r, v_xc_r, B_xc_r)``; see :func:`psp.xc.compute_V_xc_noncollinear`.
+    """
+    from psp.xc import compute_V_xc_noncollinear, pbe_functional_polarized
+
+    rho_G_ortho = local_fftn3(rho_val, norm='ortho')
+    V_H_r = jnp.real(poisson_potential_from_rhoG(
+        rho_G_ortho, bdot, bvec, blat, truncation_2d=truncation_2d))
+    rho_total = rho_val + rho_core
+    rho_core_gridded = jnp.real(local_ifftn3(rhog_core))
+    rho_G_total = local_fftn3(rho_total - rho_core_gridded) + rhog_core
+    v_xc, B_xc = compute_V_xc_noncollinear(
+        rho_total, rho_G_total, mag, G_cart, pbe_functional_polarized())
+    return V_H_r, v_xc, B_xc
+
+
+def local_potential(psi_r: jax.Array, V_scf: jax.Array) -> jax.Array:
+    """V ψ on the real-space grid: ``V_scf`` (nx,ny,nz) scalar, or a spin matrix.
+
+    A magnetic run carries ``V_scf`` as (2, 2, nx, ny, nz), V^{αβ} = v δ_αβ +
+    B·σ_αβ (:func:`build_V_scf`), applied as (Vψ)_α = Σ_β V^{αβ} ψ_β on
+    ``psi_r`` (nvec, 2, nx, ny, nz).
+    """
+    if V_scf.ndim == 3:
+        return psi_r * V_scf
+    return jnp.einsum("abxyz,vbxyz->vaxyz", V_scf, psi_r)
+
+
 def build_V_scf(
     V_loc_r: jax.Array,
     V_H_r: jax.Array | None = None,
     V_xc_r: jax.Array | None = None,
+    B_xc_r: jax.Array | None = None,
 ) -> jax.Array:
     """Combine the local potentials into V_scf = V_loc + V_H + V_xc.
 
@@ -571,7 +618,14 @@ def build_V_scf(
         V_scf = V_scf + jnp.asarray(V_H_r, dtype=jnp.float64)
     if V_xc_r is not None:
         V_scf = V_scf + jnp.asarray(V_xc_r, dtype=jnp.float64)
-    return V_scf
+    if B_xc_r is None:
+        return V_scf
+    # Spin matrix v δ + B·σ (QE vloc_psi_nc: [[v+Bz, Bx-iBy], [Bx+iBy, v-Bz]]).
+    Bx, By, Bz = (jnp.asarray(b, dtype=jnp.float64) for b in B_xc_r)
+    return jnp.stack([
+        jnp.stack([V_scf + Bz, Bx - 1j * By]),
+        jnp.stack([Bx + 1j * By, V_scf - Bz]),
+    ]).astype(jnp.complex128)
 
 
 @jax.jit
@@ -765,7 +819,7 @@ def apply_H_k(psi_box, T_diag, V_scf, Gx, Gy, Gz, vnl_Z, vnl_E, mask):
     # ── V_scf: self-consistent local potential (real-space multiply) ─
     psi_r = local_ifftn3(psi_box, axes=(-3, -2, -1), norm='ortho')
     H_G = H_G + local_fftn3(
-       psi_r * V_scf, axes=(-3, -2, -1), norm='ortho'
+       local_potential(psi_r, V_scf), axes=(-3, -2, -1), norm='ortho'
    )[:, :, Gx, Gy, Gz] * mask_f
 
     # ── V_NL: Kleinman–Bylander (project → D → unproject) ───────────
@@ -803,7 +857,7 @@ def apply_H_k_from_G(psi_G, T_diag, V_scf, Gx, Gy, Gz, vnl_Z, vnl_E, mask):
     psi_G : (nvec, nspinor, nG_padded) complex128
     All other args as in ``apply_H_k``.
     """
-    nx, ny, nz = V_scf.shape
+    nx, ny, nz = V_scf.shape[-3:]
     mask_f = mask[None, None, :].astype(psi_G.dtype)
     psi_G_m = psi_G * mask_f
 
@@ -819,7 +873,7 @@ def apply_H_k_from_G(psi_G, T_diag, V_scf, Gx, Gy, Gz, vnl_Z, vnl_E, mask):
     psi_box = jnp.zeros((*psi_G.shape[:2], nx, ny, nz), dtype=psi_G.dtype)
     psi_box = psi_box.at[:, :, Gx, Gy, Gz].add(psi_G_m)
     psi_r = local_ifftn3(psi_box, axes=(-3, -2, -1), norm='ortho')
-    Vpsi_box = local_fftn3(psi_r * V_scf, axes=(-3, -2, -1), norm='ortho')
+    Vpsi_box = local_fftn3(local_potential(psi_r, V_scf), axes=(-3, -2, -1), norm='ortho')
     H_G = H_G + Vpsi_box[:, :, Gx, Gy, Gz] * mask_f
 
     # V_NL on the G-sphere directly.
@@ -875,7 +929,7 @@ def build_matrix_k(psi_box, T_diag, V_scf, Gx, Gy, Gz, vnl_Z, vnl_E, mask):
     # V_scf
     psi_r = local_ifftn3(psi_box, axes=(-3, -2, -1), norm='ortho')
     Vpsi_G = local_fftn3(
-       psi_r * V_scf, axes=(-3, -2, -1), norm='ortho'
+       local_potential(psi_r, V_scf), axes=(-3, -2, -1), norm='ortho'
    )[:, :, Gx, Gy, Gz] * mask_f
     H_mn = H_mn + jnp.einsum(
         'msG,nsG->mn', jnp.conj(psi_G), Vpsi_G, optimize=True,

@@ -88,9 +88,41 @@ def test_ultrasoft_and_paw_refuse(tmp_path, header):
     _refuses("pseudo_type", tmp_path=tmp_path, pseudos=_pseudos(**header))
 
 
-@pytest.mark.parametrize("over", [dict(nspin=2), dict(domag=True)])
-def test_magnetic_run_refuses(tmp_path, over):
-    _refuses("magnetism", tmp_path=tmp_path, crystal=_crystal(**over))
+def test_collinear_spin_polarized_refuses(tmp_path):
+    _refuses("magnetism", tmp_path=tmp_path, crystal=_crystal(nspin=2))
+
+
+_MAG_FIELDS = ("MillerIndices", "m_x", "m_y", "m_z", "rhotot_g")
+
+
+@pytest.mark.parametrize("branch", [None, "fixed_axis"])
+def test_noncollinear_magnetic_needs_the_general_branch(tmp_path, branch):
+    (tmp_path / "Si.upf").write_text("")
+    with pytest.raises(DenseHRefusal) as err:
+        validate_dense_h_inputs(
+            _crystal(domag=True), _pseudos(), sys_dim=3,
+            pseudo_dir=str(tmp_path), charge_density_fields=_MAG_FIELDS,
+            n_basis_max=100, budget_bytes=1e12, nc_gga_branch=branch)
+    assert err.value.rule == "nc_gga_branch"
+
+
+def test_noncollinear_magnetic_general_branch_passes(tmp_path):
+    (tmp_path / "Si.upf").write_text("")
+    validate_dense_h_inputs(
+        _crystal(domag=True), _pseudos(), sys_dim=3, pseudo_dir=str(tmp_path),
+        charge_density_fields=_MAG_FIELDS, n_basis_max=100, budget_bytes=1e12,
+        nc_gga_branch="general")
+
+
+def test_magnetic_run_without_magnetization_refuses(tmp_path):
+    (tmp_path / "Si.upf").write_text("")
+    with pytest.raises(DenseHRefusal) as err:
+        validate_dense_h_inputs(
+            _crystal(domag=True), _pseudos(), sys_dim=3,
+            pseudo_dir=str(tmp_path),
+            charge_density_fields=("MillerIndices", "rhotot_g"),
+            n_basis_max=100, budget_bytes=1e12, nc_gga_branch="general")
+    assert err.value.rule == "charge_density" and "m_x" in str(err.value)
 
 
 @pytest.mark.parametrize("fields", [(), ("MillerIndices",)])

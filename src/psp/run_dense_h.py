@@ -83,7 +83,7 @@ def solve_k(H_k, gvecs_file, nspinor, eigh, nbands):
 
 
 def run_dense_h(save_dir, wfn_path, output_path, *, sys_dim, pseudo_dir=None,
-                nbands=None):
+                nbands=None, nc_gga_branch=None):
     rank, nproc = process_rank(), process_count()
     verbose = rank == 0
     mesh = RUNTIME.mesh
@@ -103,7 +103,7 @@ def run_dense_h(save_dir, wfn_path, output_path, *, sys_dim, pseudo_dir=None,
             crystal, pseudos, sys_dim=sys_dim, pseudo_dir=pseudo_dir,
             charge_density_fields=crystal.charge_density_fields(),
             n_basis_max=int(crystal.nspinor) * int(ngk.max()),
-            budget_bytes=device_budget_bytes())
+            budget_bytes=device_budget_bytes(), nc_gga_branch=nc_gga_branch)
         if not 0 < nb <= int(n_basis.min()):
             raise ValueError(
                 f"nbands={nb}: the complete basis of the smallest sphere is "
@@ -114,8 +114,9 @@ def run_dense_h(save_dir, wfn_path, output_path, *, sys_dim, pseudo_dir=None,
                   f"writing {nb} bands, {nproc} rank(s)", flush=True)
 
         rho_val = jnp.asarray(crystal.load_charge_density()[0], jnp.float64)
+        mag = crystal.load_magnetization() if crystal.domag else None
         V_scf, V_loc, vnl_setup = build_dft_potentials(
-            crystal, pseudos, rho_val,
+            crystal, pseudos, rho_val, magnetization=mag,
             truncation_2d=crystal.assume_isolated == "2D", verbose=verbose)
         eigh = distrib_la.plan("eigh", single_device_mesh(), backend="off")
 
@@ -169,11 +170,16 @@ def main():
     parser.add_argument("--nbands", type=int, default=None,
                         help="bands to write (default: the complete basis)")
     parser.add_argument("--memory-per-device-gb", type=float, default=None)
+    parser.add_argument("--nc-gga-branch", choices=("general", "fixed_axis"),
+                        default=None,
+                        help="QE's noncollinear GGA branch (magnetic runs; "
+                             "the .save does not record it)")
     args = parser.parse_args()
     if args.memory_per_device_gb:
         set_device_budget_gb(args.memory_per_device_gb)
     run_dense_h(args.save, args.wfn, args.output, sys_dim=args.sys_dim,
-                pseudo_dir=args.pseudo_dir, nbands=args.nbands)
+                pseudo_dir=args.pseudo_dir, nbands=args.nbands,
+                nc_gga_branch=args.nc_gga_branch)
 
 
 if __name__ == "__main__":
