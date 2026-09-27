@@ -609,7 +609,7 @@ def _shared_pole_w_synthesis(io, meta, header, frequencies, schedule, *, mesh_xy
                       close, native_workspace, key, ordered=ordered)
 
 
-def shared_pole_static_wc(handle, meta, *, mesh_xy, layout="face"):
+def shared_pole_static_wc(handle, meta, *, mesh_xy, layout="face", stage="w0"):
     """Wc(q, omega = 0) of the current scalar shared-pole model, full q grid.
 
     The static screened correction the restart stores for BSE
@@ -625,6 +625,8 @@ def shared_pole_static_wc(handle, meta, *, mesh_xy, layout="face"):
     packed centroid order. Every array is an all-P tile. The synthesis
     admits its factors and panel workspace under ``w0.*`` ledger stages; the
     two full-q outputs (W_+ and the sum) are one more reservation of 2U.
+    ``stage`` names this call's reservations; repeated study contractions
+    supply distinct prefixes while retaining the same per-map ledger.
 
     Validated (claim 2856, runs/CrI3/504_w0persist_20260926): on CrI3
     8x8x1 SOC (mu 1446, 10 IBZ q) ``V + Wc(0)`` matches the GN-PPM Dyson
@@ -649,12 +651,12 @@ def shared_pole_static_wc(handle, meta, *, mesh_xy, layout="face"):
     Q, m = int(header["n_q_full"]), int(meta.mu_basis.n_packed)
     ambient = capacity.live_stages
     tile = -(-16 * Q * m * m // int(mesh_xy.size))
-    capacity.reserve("w0.static_output", resident_bytes_per_rank=2 * tile,
+    capacity.reserve(f"{stage}.static_output", resident_bytes_per_rank=2 * tile,
                      workspace_bytes_per_rank=0, concurrent_with=ambient)
-    capacity.live_stages = (*ambient, "w0.static_output")
+    capacity.live_stages = (*ambient, f"{stage}.static_output")
     try:
         schedule = _shared_pole_memory_schedule(meta, header, mesh_xy=mesh_xy,
-                                                layout=layout, stage="w0")
+                                                layout=layout, stage=stage)
         counts = np.asarray(header["K"], np.int64)
         intervals = device_put_process_local(
             np.stack([np.zeros_like(counts), counts], axis=1),
@@ -664,7 +666,7 @@ def shared_pole_static_wc(handle, meta, *, mesh_xy, layout="face"):
             synthesis = _shared_pole_w_synthesis(
                 reader, meta, header, None, schedule, mesh_xy=mesh_xy,
                 layout=schedule.get("factor_layout", layout),
-                weights_fn=_shared_pole_omega0_weights, stage="w0")
+                weights_fn=_shared_pole_omega0_weights, stage=stage)
         hole = shared_pole_hole_kernel(mesh_xy)
         face = NamedSharding(mesh_xy, P(None, "x", "y"))
 
