@@ -537,30 +537,56 @@ def project_little_group_operator(
         for parent, rows in enumerate(stabilizers):
             ops[:rows.size, parent] = rows
             valid[:rows.size, parent] = 1./rows.size
+        # Steps run in segments between the distinct little-group orders; a
+        # segment transforms only the parents whose group still has operations
+        # left.  Padding every parent to the largest group made the loop cost
+        # n_parents x max|G_q| tiles instead of sum|G_q| (bcc 8^3: 2784 vs 430,
+        # ~37 ms of a Na shared-pole Sigma tau node).  Each parent still adds
+        # its operations in the same order, and the dropped steps added exact
+        # zeros; the phase is formed over all parents as before.
+        bounds = [0] + sorted({int(c) for c in counts})
+        segments = tuple((lo, hi, tuple(int(p) for p in np.flatnonzero(counts >= hi)))
+                         for lo, hi in zip(bounds[:-1], bounds[1:]))
         sh = NamedSharding(mesh, P(None, "x", "y"))
 
         def local(plus, partner):
             x, y = jax.lax.axis_index("x"), jax.lax.axis_index("y")
             ml, nl = plus.shape[1:]
-            def step(index, total):
-                rows = jnp.asarray(ops)[index]
-                anti = rows >= nsp
-                source = jnp.where(anti[:, None, None], partner, plus)
-                selected_perm = jnp.asarray(perm)[rows]
-                left = certificates["x"]["local_perm"]
-                right = certificates["y"]["local_perm"]
-                transformed = _permute_isdf_operator_axes_local(
-                    source, selected_perm, selected_perm, mesh_x=px, mesh_y=py,
-                    left_local_source_map=(None if left is None else jnp.asarray(left)[rows]),
-                    right_local_source_map=(None if right is None else jnp.asarray(right)[rows]))
-                phase = jnp.exp(2j*jnp.pi*jnp.einsum(
-                    "qi,qmi->qm", jnp.asarray(qfrac), jnp.asarray(wraps)[rows]))
-                phase_x = jax.lax.dynamic_slice_in_dim(phase, x*ml, ml, axis=1)
-                phase_y = jax.lax.dynamic_slice_in_dim(phase, y*nl, nl, axis=1)
-                transformed = _apply_unfold_phase_and_trs_local(
-                    transformed, phase_x, phase_y, anti, pair_transpose=True)
-                return total + jnp.asarray(valid)[index, :, None, None]*transformed
-            return jax.lax.fori_loop(0, steps, step, jnp.zeros_like(plus))
+            total = jnp.zeros_like(plus)
+            for lo, hi, members in segments:
+                whole = len(members) == b
+                sel = None if whole else jnp.asarray(members, dtype=jnp.int32)
+                sub_plus = plus if whole else plus[sel]
+                sub_partner = partner if whole else partner[sel]
+
+                def step(index, acc, sel=sel, sub_plus=sub_plus, sub_partner=sub_partner):
+                    rows_all = jnp.asarray(ops)[index]
+                    phase = jnp.exp(2j*jnp.pi*jnp.einsum(
+                        "qi,qmi->qm", jnp.asarray(qfrac), jnp.asarray(wraps)[rows_all]))
+                    rows = rows_all if sel is None else rows_all[sel]
+                    weight = jnp.asarray(valid)[index]
+                    if sel is not None:
+                        phase, weight = phase[sel], weight[sel]
+                    anti = rows >= nsp
+                    source = jnp.where(anti[:, None, None], sub_partner, sub_plus)
+                    selected_perm = jnp.asarray(perm)[rows]
+                    left = certificates["x"]["local_perm"]
+                    right = certificates["y"]["local_perm"]
+                    transformed = _permute_isdf_operator_axes_local(
+                        source, selected_perm, selected_perm, mesh_x=px, mesh_y=py,
+                        left_local_source_map=(None if left is None else jnp.asarray(left)[rows]),
+                        right_local_source_map=(None if right is None else jnp.asarray(right)[rows]))
+                    phase_x = jax.lax.dynamic_slice_in_dim(phase, x*ml, ml, axis=1)
+                    phase_y = jax.lax.dynamic_slice_in_dim(phase, y*nl, nl, axis=1)
+                    transformed = _apply_unfold_phase_and_trs_local(
+                        transformed, phase_x, phase_y, anti, pair_transpose=True)
+                    return acc + weight[:, None, None]*transformed
+                if whole:
+                    total = jax.lax.fori_loop(lo, hi, step, total)
+                else:
+                    total = total.at[sel].set(
+                        jax.lax.fori_loop(lo, hi, step, total[sel]))
+            return total
 
         mapped = shard_map(local, mesh=mesh,
                            in_specs=(P(None, "x", "y"),)*2,
