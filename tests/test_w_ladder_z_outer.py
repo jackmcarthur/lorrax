@@ -16,7 +16,7 @@ def _fake_engine(monkeypatch, wl, calls):
     monkeypatch.setattr(wl, "enforce_trs_pair_gauge", lambda d, m: d)
     monkeypatch.setattr(wl, "build_ladder_resolvent", build)
     monkeypatch.setattr(wl, "build_finite_q_data",
-                        lambda d, q, m: dict(d, psi_c_W_X=1, q=q))
+                        lambda d, q, m: dict(d, q=q))
     monkeypatch.setattr(wl, "build_preconditioner_diagonal_sharded",
                         lambda d, m, include_W, use_tda: "diag")
     monkeypatch.setattr(wl, "build_probe_rhs", lambda G, d, gen, sh: "rhs")
@@ -38,7 +38,7 @@ def test_two_z_walk_order_and_per_z_handoff(monkeypatch, z_outer):
     q_list = [(0, 0, 0), (1, 0, 0)]
     z_list = [0.0, 0.5j]
     wl.sweep_q_wedge(
-        {}, None, q_list, z_list, include_w=True,
+        {}, None, q_list, z_list, include_w=False,
         probe_blocks_for_q=lambda iq, q: [(0, 1, "G")],
         gmres_tol=1e-6, gmres_max_iter=300, deflation_rank=0,
         on_result=lambda iq, q, iz, z, *a: calls.append(("result", iq, iz)),
