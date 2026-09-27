@@ -790,13 +790,13 @@ def _oneshot_sampled_support(config, enk_dft, wfn, occupation_state,
         requested_band_mask(e_ry * RYD_TO_EV, n_occ=int(wfn.nelec),
                             nval=config.nval, ncond=config.ncond,
                             gap_ev=config.sigma.regularization_ev))
-    grown, _ = plan_support_ev(config.sigma, requested, energy, states)
-    if np.array_equal(grown, requested):
+    planned, _ = plan_support_ev(config.sigma, energy, states)
+    if np.array_equal(planned, requested):
         return config
     print_fn(f"  Sigma sampled support (plan 0, clamp reads): "
              f"[{requested[0]:+.6f}, {requested[-1]:+.6f}] -> "
-             f"[{grown[0]:+.6f}, {grown[-1]:+.6f}] eV")
-    return replace(config, sc_omega_grid_ev=tuple(float(x) for x in grown))
+             f"[{planned[0]:+.6f}, {planned[-1]:+.6f}] eV")
+    return replace(config, sc_omega_grid_ev=tuple(float(x) for x in planned))
 
 
 def _run_oneshot_sigma(

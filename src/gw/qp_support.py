@@ -35,8 +35,8 @@ def requested_states(energy_relative_ev, required_kn):
                                     np.shape(energy_relative_ev)))
 
 
-def plan_support_ev(sigma, deck_grid_ev, energy_relative_ev, requested_kn, *,
-                    outer_pad_ev=SUPPORT_PAD_EV):
+def plan_support_ev(sigma, energy_relative_ev, requested_kn, *,
+                    outer_pad_ev=SUPPORT_PAD_EV, support_floor_ev=()):
     """Return the single contiguous support and its unrounded envelope."""
     e = np.asarray(energy_relative_ev, float)
     p = np.broadcast_to(np.asarray(requested_kn, bool), e.shape)
@@ -45,9 +45,20 @@ def plan_support_ev(sigma, deck_grid_ev, energy_relative_ev, requested_kn, *,
     pad = float(outer_pad_ev) + read_halfwidth_ev()
     envelope = (float(e[p].min()) - pad, float(e[p].max()) + pad)
     step = float(sigma.omega_step_ev)
-    deck = np.asarray(deck_grid_ev, float)
-    lo = np.floor(min(envelope[0], float(deck.min())) / step) * step
-    hi = np.ceil(max(envelope[1], float(deck.max())) / step) * step
+    lo, hi = envelope
+    if sigma.omega_min_ev is not None:
+        lo = min(lo, float(sigma.omega_min_ev))
+    if sigma.omega_max_ev is not None:
+        hi = max(hi, float(sigma.omega_max_ev))
+    # Only a previous physical support is a floor. The config's temporary
+    # near-zero grid is not a user request when either endpoint is absent.
+    floor = np.asarray(support_floor_ev, float)
+    if floor.size:
+        if floor.shape != (2,) or not np.isfinite(floor).all() or floor[0] >= floor[1]:
+            raise ValueError("Sigma rebuild floor must be a finite ordered interval")
+        lo, hi = min(lo, float(floor[0])), max(hi, float(floor[1]))
+    lo = np.floor(lo / step) * step
+    hi = np.ceil(hi / step) * step
     grid = lo + step * np.arange(int(round((hi-lo)/step)) + 1)
     return grid, envelope
 

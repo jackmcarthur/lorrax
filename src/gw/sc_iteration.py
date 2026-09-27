@@ -2636,10 +2636,9 @@ def _sc_sampled_support(inputs, partition, energies_loop, mu_ev):
     states = requested_states(energy, part.protected_mask)
     if session is None or "omega_grid_ev" not in session:
         rebuilding = bool(session and session.get("convergence_rebuilds"))
-        if rebuilding:
-            deck = np.concatenate((deck, session["rebuild_floor_ev"]))
         grid, envelope = plan_support_ev(
-            sigma, deck, energy, states, outer_pad_ev=0. if rebuilding else 2.)
+            sigma, energy, states, outer_pad_ev=0. if rebuilding else 2.,
+            support_floor_ev=session["rebuild_floor_ev"] if rebuilding else ())
         event = "rebuild" if rebuilding else "one-shot" if session is None else "plan"
     else:
         grid = np.asarray(session["omega_grid_ev"], float)
