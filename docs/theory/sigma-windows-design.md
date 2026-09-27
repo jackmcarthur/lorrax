@@ -17,6 +17,7 @@ The SC equations and artifact contract remain in [self consistency](../self_cons
 | Decision | Reason | Tau-pair cost |
 |---|---|---|
 | Close requested bands outward across adjacent DFT gaps ≤ eta, independently at each k; freeze those identities. | A requested edge must not bisect an unresolved manifold. | Only the resulting support extrema change the boxes; measure the total below. |
+| Bound automatic class-edge promotion to 2 eV per side; refuse a more distant gap. | A dense ladder cannot silently turn a small request into all states. | Zero pairs for accepted decks; no enlarged fallback. |
 | Keep the 2 eV outer pad on one-shot and SC map 0. | Both start from the same support policy. | Prior WINDESIGN Si estimate +50 pairs; remeasure at epsilon 1e-4. |
 | Include the ±0.5 eV Z stencil before adding the outer pad. | These are actual Sigma reads, not another motion allowance. | Included in each measured total. |
 | Plan once; never grow the grid or refit inside the SC loop. | Anderson must see one map with fixed interpolation and quadrature. | Zero in-loop rule-build cost; dormant boxes consume pairs only when populated. |
@@ -27,7 +28,7 @@ The SC equations and artifact contract remain in [self consistency](../self_cons
 | Use the provable insulator short side, including poles down to zero. | A trend in the gap is not a certificate. | Prior MoS2 estimate +61 pairs; remeasure at epsilon 1e-4. |
 | Use four times the initial far state, pole and damping extents. | Far-side growth costs logarithmically and cannot enlarge the crossing edge. | Prior estimate +8–9 pairs; remeasure with derived rules. |
 | Set epsilon = 1e-4; use QUADWIRE's derived rules. | One explicit accuracy target and one rule owner. | Measured per-deck totals decide the 500/1000 limits. |
-| Retain the existing scissor fit behind its existing API. | SPCOST B has no class-accuracy verdict yet; window geometry does not choose the fit form. | No quadrature pairs. |
+| Retain the existing scissor fit behind its existing API. | SPCOST B has map-0 comparisons but no converged fit verdict; window geometry does not choose the fit form. | No quadrature pairs. |
 
 ## Hamiltonian
 
@@ -41,7 +42,8 @@ energy sorting does not redefine a protected identity.
 
 The edge closure is a chosen approximation, not a bound on remote coupling.
 Its numerical acceptance requires the wide-reference test below. It may
-promote a whole connected manifold and hence increase the sampled range.
+promote a connected manifold within 2 eV of each requested edge; a more
+distant closure refuses and requires an explicit larger band request.
 A wide requested band range, including deep states, is intentionally costly;
 no hidden active-band cutoff overrides the user's requested states.
 
