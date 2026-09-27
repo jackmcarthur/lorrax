@@ -504,8 +504,9 @@ def minibz_inscribed_sphere_r2(bvec, kgrid, *, is_2d: bool = False) -> float:
     return best
 
 
-def minibz_coulomb_moment(bvec, kgrid, *, ndirections: int = 8192) -> np.ndarray:
-    r"""Coulomb-weighted second moment ``(3, 3)`` of the 3D mini-BZ Voronoi cell.
+def minibz_coulomb_moment(bvec, kgrid, *, is_2d: bool = False,
+                          ndirections: int = 8192) -> np.ndarray:
+    r"""Coulomb-weighted second moment ``(3, 3)`` of the mini-BZ Voronoi cell.
 
     .. math::
         Q_{ab}=\frac{\int_{\mathcal C} d^3q\,v(q)\,q_aq_b}{\int_{\mathcal C} d^3q\,v(q)}
@@ -518,8 +519,24 @@ def minibz_coulomb_moment(bvec, kgrid, *, ndirections: int = 8192) -> np.ndarray
     angular ones use a Fibonacci sphere.  ``Q`` is the q-scale the q = 0 head
     weights: the metallic head's pair split reads a pair's two-band
     extent on it (``gw.fermi_surface.intraband_pair_fraction``).
+
+    ``is_2d``: the slab cell is the in-plane Wigner--Seitz polygon of the
+    mini lattice and ``v`` the Ismail--Beigi kernel at ``q_z = 0``, so
+    ``Q_zz = 0``; the integrals use the exact polygon's finest
+    Gamma-to-edge Duffy--Gauss rule (the rule of
+    :func:`slab_minibz_photon_cubature`), whose radial Jacobian cancels the
+    ``1/q`` cusp.
     """
     bvec = np.asarray(bvec, dtype=np.float64)
+    if is_2d:
+        from vcoul.slab_2d import Slab2D
+        zc = Slab2D._truncation_half_height_from_bvec(bvec)
+        polygon, _, area = _slab_minibz_wigner_seitz_polygon(bvec, kgrid)
+        q, weight, _, _ = _slab_minibz_polygon_rule(
+            polygon, area, max(_SLAB_MINIBZ_PHOTON_ORDERS))
+        v, _ = _minibz_kernel_bare(np.zeros(3), q, kind="slab", zc=zc)
+        return (np.einsum("n,na,nb->ab", weight * v, q, q)
+                / float(np.sum(weight * v)))
     nk = np.asarray([int(s) for s in np.ravel(kgrid)], dtype=np.float64)
     if bvec.shape != (3, 3) or nk.shape != (3,) or np.any(nk < 1):
         raise ValueError("minibz_coulomb_moment needs bvec (3,3) and a 3D kgrid")

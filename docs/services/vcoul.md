@@ -103,10 +103,14 @@ takes a named rule with no silent alternative:
   `certificate_fn`; LORRAX reports it in `gwjax.out` as `Slab WS cert`.
 * `static_kappa2` (the 3D Thomas–Fermi model) raises `NotImplementedError`
   on the slab.
-* `Slab2D.q0_average_transverse_tensor` (the bare TT head used by
-  `gw.v_q_bispinor`'s `bare_transverse` route) still uses the Sobol draw and
-  carries its cusp sampling error; the packed route takes its TT head from
-  the exact receipt.
+* `Slab2D.q0_average_transverse_tensor` (the bare TT head of
+  `gw.v_q_bispinor`) reads the same receipt: `−D_TT` of the order-32 rule,
+  with the same 24→32 convergence refusal. The direct four-current head
+  (`gw.photon_direct_head`) averages on it too, so the TT tile it subtracts
+  from V is the one V holds.
+* `minibz_coulomb_moment(..., is_2d=True)` is the slab cell's
+  Coulomb-weighted `Q_ab` on the order-32 polygon rule (`Q_zz = 0`); the
+  metal pair split reads it.
 
 `Bulk3D.q0_average` takes no `rule`: the polygon construction is 2-D, so the
 3D head keeps the scrambled-Sobol draw plus the Baldereschi–Tosatti analytic

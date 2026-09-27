@@ -267,8 +267,9 @@ bank's consumer ([four-current heads §5](four-current-head-corrections.md#direc
 - **Estimators.** The intraband term uses tetrahedron weights and the
   interband term FD occupations; at coarse grids the two describe slightly
   different Fermi surfaces.
-- **Scope.** Bulk (`sys_dim = 3`) only; a slab metal refuses in
-  `gw.vcoul.compute_q0_averages`.
+- **Scope.** The scalar head is bulk (`sys_dim = 3`) only; a slab metal
+  refuses in `gw.vcoul.compute_q0_averages`. The four-current direct head
+  also runs on a slab ([four-current heads §5.1](four-current-head-corrections.md#direct-slab-head)).
 
 ## 6. Code owners
 

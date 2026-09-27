@@ -430,48 +430,174 @@ def direct_gamma_chunk_plan(mesh, operands, *, nsamples):
     return int(chunk), split
 
 
+def _bulk_gamma_cell_average(geometry, kgrid, operands, mesh, cell_volume):
+    """Bulk Γ cell: four Sobol replicates of the exterior plus the screened sphere.
+
+    Returns the seven head fields per volume, the replicate spread (Ry), the
+    largest Dyson residual and the rule's name.
+    """
+    from common.collectives import device_put_process_local
+
+    chunk_size, split = direct_gamma_chunk_plan(mesh, operands, nsamples=_GAMMA_SAMPLES)
+    samples = _gamma_sample_stream(geometry, kgrid, chunk_size)
+    total = [jnp.zeros(shape, dtype=jnp.complex128) for shape in _fields(operands)]
+    replicate = [jnp.zeros(shape, dtype=jnp.complex128) for shape in _fields(operands)]
+    spreads = []
+    count = 0
+    last_rep = 0
+    analytic_bare = None
+    max_error = jnp.asarray(0.0)
+
+    def finish_rep():
+        nonlocal replicate, count
+        if count == 0:
+            raise ValueError("GATE photon_direct_head_cubature: empty replicate")
+        normalized = [x / count for x in replicate]
+        spreads.append(normalized[0])
+        for i, value in enumerate(normalized):
+            total[i] = total[i] + value
+        replicate = [jnp.zeros(x.shape, dtype=jnp.complex128) for x in replicate]
+        count = 0
+
+    for rep, _start, _stop, q, D, valid, weight, analytic_D in samples:
+        if analytic_bare is None:
+            analytic_bare = float(analytic_D[0, 0])
+        if rep != last_rep:
+            finish_rep()
+            last_rep = rep
+        result = _direct_gamma_chunk(
+            device_put_process_local(q, split),
+            device_put_process_local(D, split),
+            device_put_process_local(weight, split), *operands)
+        for i in range(len(total)):
+            replicate[i] = replicate[i] + result[i]
+        max_error = jnp.maximum(max_error, result[-1])
+        count += int(valid)
+    finish_rep()
+    if len(spreads) != 4:
+        raise ValueError("GATE photon_direct_head_cubature: missing Sobol replicate")
+    if analytic_bare is None or analytic_bare <= 0:
+        raise ValueError("GATE photon_direct_head_cubature: missing analytic sphere")
+    sq, sD, sw = _bulk_sphere_rule(geometry, kgrid, analytic_bare, chunk_size)
+    sphere = _direct_gamma_chunk(
+        device_put_process_local(sq, split),
+        device_put_process_local(sD, split),
+        device_put_process_local(sw, split), *operands)
+    max_error = jnp.maximum(max_error, sphere[-1])
+    fields = [(np.asarray(total[i]) / len(spreads) + np.asarray(sphere[i]))
+              / cell_volume for i in range(len(total))]
+    spread_rows = np.asarray(jnp.stack(spreads))
+    spread = float(np.max(np.abs(spread_rows - np.mean(spread_rows, axis=0)))) / cell_volume
+    return (fields, spread, float(max_error),
+            "4x131072 Sobol exterior + 8x12x24 screened sphere")
+
+
+def _slab_gamma_cell_average(geometry, kgrid, operands, mesh, cell_volume):
+    """Slab Γ cell: the exact in-plane Wigner–Seitz polygon of vcoul.
+
+    Every node of the provider's Γ-to-edge Duffy–Gauss ladder (orders
+    16/24/32, normalized weights, ``D`` with the Ismail–Beigi kernel at
+    ``q_z = 0``) takes the full 4×4 Dyson solve before the weighted sum.
+    The radial Jacobian cancels the 2D ``1/q`` cusp, so there is no sphere.
+    The order-32 sums are the head; the 24→32 change is reported as the
+    rule's spread.  The same receipt gives the scalar charge head and the
+    bare TT Γ tile (``vcoul.Slab2D.q0_average_transverse_tensor``).
+    """
+    from common.collectives import device_put_process_local
+    from common.gpu_utils import device_budget_bytes, device_room_bytes, record_stage_price
+    from vcoul import get_kernel, slab_minibz_photon_cubature
+
+    receipt = slab_minibz_photon_cubature(get_kernel(2), geometry, kgrid)
+    n_dev = int(mesh.devices.size)
+    split = NamedSharding(mesh, P(tuple(mesh.axis_names)))
+    padded = int(receipt.padded_counts[-1])
+    rows = -(-padded // n_dev) * n_dev
+    sds = jax.ShapeDtypeStruct
+    compiled = _direct_gamma_chunk.lower(
+        sds((rows, 3), jnp.float64, sharding=split),
+        sds((rows, 4, 4), jnp.float64, sharding=split),
+        sds((rows,), jnp.float64, sharding=split), *operands).compile()
+    temp = float(getattr(compiled.memory_analysis(), "temp_size_in_bytes", 0))
+    record_stage_price(f"direct Gamma head, slab polygon {rows} nodes over {n_dev} ranks",
+                       device_budget_bytes() - device_room_bytes() + temp
+                       + 8.0 * (3 + 16 + 1) * rows / n_dev)
+    ladder = []
+    for chunk in receipt.chunks:
+        q = np.zeros((rows, 3))
+        D = np.zeros((rows, 4, 4))
+        w = np.zeros(rows)
+        q[:padded], D[:padded], w[:padded] = chunk.q_cart, chunk.D_raw, chunk.sample_weight
+        ladder.append(compiled(*(device_put_process_local(x, split) for x in (q, D, w)),
+                               *operands))
+    fields = [np.asarray(x) / cell_volume for x in ladder[-1][:-1]]
+    spread = max(float(np.max(np.abs(np.asarray(a) - np.asarray(b)))) / cell_volume
+                 for a, b in zip(ladder[-1][:-1], ladder[-2][:-1]))
+    max_error = max(float(result[-1]) for result in ladder)
+    edges = len(receipt.polygon_vertices)
+    return (fields, spread, max_error,
+            f"exact {edges}-edge Wigner-Seitz polygon, Duffy-Gauss orders "
+            f"{receipt.orders} ({receipt.physical_counts[-1]} nodes)")
+
+
+def _fields(operands):
+    """Shapes of the seven Γ fields for ``len(z)`` bank points."""
+    nz = int(operands[0].shape[0])
+    return ((nz,4,4), (nz,4,4), (nz,4,4), (nz,4,4), (4,4), (4,4,4), (4,4))
+
+
 def build_direct_photon_head(velocity_cart, wfns, occupation_state, *,
                              contact_packed, photon_g0_vectors, layout,
                              mesh, meta, wfn, frequencies_ry, print_fn=print):
-    """Sample the direct bulk Γ 4×4 Dyson once, then hand sectors small data.
+    """Solve the direct Γ 4×4 Dyson at every cell node once, then hand sectors small data.
 
     This first-order model uses dipole charge jets, a velocity-based
     approximation to the raw Breit current, and the existing FD contact.
-    It does not fold wings or microscopic body fields. The coupled screened
-    sphere is integrated radially and angularly; Sobol samples its exterior.
+    It does not fold wings or microscopic body fields.  The cell is the
+    bulk mini-BZ (``sys_dim = 3``: Sobol exterior plus a screened sphere) or
+    the slab's in-plane polygon (``sys_dim = 2``: the exact Wigner–Seitz
+    rule with the Ismail–Beigi kernel; ``docs/theory/four-current-head-corrections.md``).
+    An insulator (``occupation_state is None``, step occupations) has no
+    Fermi surface: its head is the interband tensor alone.
     """
     from ffi import _services
     _services.ensure_on_path()
     from vcoul import CoulombGeometry
     from common.collectives import device_put_process_local
 
-    if int(meta.sys_dim) != 3:
-        raise ValueError("GATE photon_direct_head_bulk: first-order direct Γ requires sys_dim=3")
-    if occupation_state is None or occupation_state.smearing_family != "fd":
+    sys_dim = int(meta.sys_dim)
+    if sys_dim not in (2, 3):
+        raise ValueError("GATE photon_direct_head_dim: the direct Γ cell is derived "
+                         f"for sys_dim 3 (bulk) and 2 (slab); got sys_dim={sys_dim}")
+    if occupation_state is not None and occupation_state.smearing_family != "fd":
         raise ValueError("GATE photon_direct_head_fd: metallic direct Γ requires current-map Fermi-Dirac occupations")
     nb = int(meta.b_id_4_chi_user) - int(meta.b_id_0)
     if velocity_cart.shape[-1] < nb or wfns.enk.shape[1] < nb:
         raise ValueError("GATE photon_direct_head_bands: dipole and response manifolds differ")
     z = np.asarray(frequencies_ry, dtype=np.complex128).reshape(-1)
     e = np.asarray(wfns.enk[:, :nb], dtype=np.float64)
-    f = np.asarray(occupation_state.f_kn[:, :nb], dtype=np.float64)
+    f = np.asarray(wfns.occ[:, :nb] if occupation_state is None
+                   else occupation_state.f_kn[:, :nb], dtype=np.float64)
+    if occupation_state is None and np.any((f != 0) & (f != 1)):
+        raise ValueError("GATE photon_direct_head_fd: fractional occupations need their FD state")
     geometry = CoulombGeometry.from_wfn(wfn)
     kgrid = tuple(int(n) for n in meta.kgrid)
     # One Fermi-surface owner with the scalar head: the tetrahedron table,
     # its multiplet rule, the Taylor-radius pair split and the velocity atoms
-    # (docs/theory/metal-q0-head.md).
+    # (docs/theory/metal-q0-head.md).  An insulator has an empty surface.
     from gw.fermi_surface import metal_head_surface_weights
     from gw.qsgw_head import metal_intraband_model
-    surface = metal_head_surface_weights(
-        e, float(occupation_state.mu_ry), sym=wfn.symmetry(), kgrid=wfn.kgrid,
-        bvec_cart=geometry.bvec)
+    surface = (np.zeros_like(e) if occupation_state is None else
+               metal_head_surface_weights(
+                   e, float(occupation_state.mu_ry), sym=wfn.symmetry(),
+                   kgrid=wfn.kgrid, bvec_cart=geometry.bvec))
     stored = int(velocity_cart.shape[-1])
     pad = ((0, 0), (0, stored - nb))
     drude, atoms, split = metal_intraband_model(
         velocity_cart, np.pad(surface, pad), np.pad(e, pad), mesh=mesh,
         nb_logical=nb, cell_volume=float(meta.cell_volume),
         nk_tot=int(meta.nk_tot), nspin=int(wfn.nspin),
-        nspinor=int(meta.nspinor_wfnfile), bvec_cart=geometry.bvec, kgrid=kgrid)
+        nspinor=int(meta.nspinor_wfnfile), bvec_cart=geometry.bvec, kgrid=kgrid,
+        is_2d=sys_dim == 2)
     dos = atoms.dos
     tensors = direct_photon_interband_tensors(velocity_cart, e, f, z,
         surface_kn=surface, pair_split=split,
@@ -487,75 +613,29 @@ def build_direct_photon_head(velocity_cart, wfns, occupation_state, *,
     operands = (tensors[0], tensors[1], tensors[2], points_device,
                 jnp.asarray(drude), jnp.asarray(dos, jnp.float64), contact,
                 atom_w, atom_u)
-    if jax.process_index() == 0:
+    if jax.process_index() == 0 and occupation_state is not None:
         from gw.qsgw_head import drude_report
         print("  direct photon Γ metal head: tetrahedron Fermi surface, "
               + drude_report(atoms)
               + f"; kappa_TF^2 = {8.0 * np.pi * dos:.6f} bohr^-2; "
               + atoms.describe(), file=sys.stderr, flush=True)
-    chunk_size, split = direct_gamma_chunk_plan(mesh, operands, nsamples=_GAMMA_SAMPLES)
-    samples = _gamma_sample_stream(geometry, kgrid, chunk_size)
-    fields = ((len(z),4,4), (len(z),4,4), (len(z),4,4),
-              (len(z),4,4), (4,4), (4,4,4), (4,4))
-    total = [jnp.zeros(shape, dtype=jnp.complex128) for shape in fields]
-    replicate = [jnp.zeros(shape, dtype=jnp.complex128) for shape in fields]
-    spreads = []
-    count = 0
-    last_rep = 0
-    analytic_bare = None
-    max_error = jnp.asarray(0.0)
-
-    def finish_rep():
-        nonlocal replicate, count
-        if count == 0:
-            raise ValueError("GATE photon_direct_head_cubature: empty replicate")
-        normalized = [x / count for x in replicate]
-        spreads.append(normalized[0])
-        for i, value in enumerate(normalized):
-            total[i] = total[i] + value
-        replicate = [jnp.zeros(shape, dtype=jnp.complex128) for shape in fields]
-        count = 0
-
-    for rep, _start, _stop, q, D, valid, weight, analytic_D in samples:
-        if analytic_bare is None:
-            analytic_bare = float(analytic_D[0, 0])
-        if rep != last_rep:
-            finish_rep()
-            last_rep = rep
-        result = _direct_gamma_chunk(
-            device_put_process_local(q, split),
-            device_put_process_local(D, split),
-            device_put_process_local(weight, split), *operands)
-        for i in range(len(fields)):
-            replicate[i] = replicate[i] + result[i]
-        max_error = jnp.maximum(max_error, result[-1])
-        count += int(valid)
-    finish_rep()
-    if len(spreads) != 4:
-        raise ValueError("GATE photon_direct_head_cubature: missing Sobol replicate")
-    if analytic_bare is None or analytic_bare <= 0:
-        raise ValueError("GATE photon_direct_head_cubature: missing analytic sphere")
-    sq, sD, sw = _bulk_sphere_rule(geometry, kgrid, analytic_bare, chunk_size)
-    sphere = _direct_gamma_chunk(
-        device_put_process_local(sq, split),
-        device_put_process_local(sD, split),
-        device_put_process_local(sw, split), *operands)
-    max_error = jnp.maximum(max_error, sphere[-1])
-    fields_mean = [(np.asarray(total[i]) / len(spreads) + np.asarray(sphere[i]))
-                   / float(meta.cell_volume) for i in range(len(fields))]
-    spread_rows = np.asarray(jnp.stack(spreads))
-    spread = float(np.max(np.abs(spread_rows - np.mean(spread_rows, axis=0)))) / float(meta.cell_volume)
+    cell_average = (_slab_gamma_cell_average if sys_dim == 2
+                    else _bulk_gamma_cell_average)
+    fields_mean, spread, max_error, rule = cell_average(
+        geometry, kgrid, operands, mesh, float(meta.cell_volume))
     if not all(np.all(np.isfinite(value)) for value in fields_mean):
         raise ValueError("GATE photon_direct_head_nonfinite: direct Γ cell average is not finite")
     if jax.process_index() == 0:
-        print_fn("  direct photon Γ: first-order CC/CT/TC/TT + Fermi-surface Lindhard cell; "
-                 "4×131072 Sobol exterior + 8×12×24 screened sphere; "
-                 f"max replicate spread={spread:.3e} Ry, "
-                 f"Dyson residual={float(max_error):.3e}", flush=True)
+        print_fn("  direct photon Γ: first-order CC/CT/TC/TT "
+                 + ("+ Fermi-surface Lindhard cell; " if occupation_state is not None
+                    else "(insulator: interband only); ")
+                 + f"{rule}; max rule spread={spread:.3e} Ry, "
+                 f"Dyson residual={max_error:.3e}", flush=True)
         origin = int(np.argmin(np.abs(z)))
         print(f"  direct photon Γ origin: z={complex(z[origin]):.6g} Ry, "
                  f"<W_h - W_inf>_CC/Omega={complex(fields_mean[0][origin][0, 0]):.9g}, "
                  f"TT trace={complex(np.trace(fields_mean[0][origin][1:, 1:])):.6g}", file=sys.stderr, flush=True)
-    return dict(zip(("Wc", "dWc_ds", "Wc_minus_q", "dWc_minus_q_ds",
-                     "constant", "moments", "bare"),
-                    fields_mean))
+    head = dict(zip(("Wc", "dWc_ds", "Wc_minus_q", "dWc_minus_q_ds",
+                     "constant", "moments", "bare"), fields_mean))
+    head["rule"] = rule
+    return head

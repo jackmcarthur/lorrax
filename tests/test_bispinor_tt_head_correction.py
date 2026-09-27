@@ -65,25 +65,15 @@ _SYS_DIM = 2
 
 
 def _bare_vc0() -> complex:
-    """``⟨v(q)⟩_mBZ`` at q=Γ, BARE units, on the SAME draw
-    ``_tt_head_tensor``/``q0_average_transverse_tensor`` uses (``nmax=1``,
-    ``is_2d=True``, ``kind='slab'``) -- independent of
-    ``vcoul.Slab2D.q0_average``'s own screened-head branches (S_cart /
-    epshead), which this module has no reason to exercise."""
-    from vcoul.minibz import (minibz_average, minibz_inscribed_sphere_r2,
-                               sample_minibz_qpoints)
-    from vcoul.geometry import CoulombGeometry
+    """``⟨v(q)⟩_mBZ`` at q=Γ, BARE units, on the exact Wigner--Seitz rule
+    ``_tt_head_tensor``/``q0_average_transverse_tensor`` uses -- the
+    scalar charge head of ``vcoul.Slab2D.q0_average``."""
+    from vcoul import CoulombGeometry, get_kernel
 
     geometry = CoulombGeometry(bvec=_BVEC, cell_volume=_CELL_VOLUME)
-    batches = sample_minibz_qpoints(
-        geometry, _KGRID, nsamples=2**18, method="sobol", qmc_reps=10,
-        nmax=1, is_2d=True)
-    q0sph2 = minibz_inscribed_sphere_r2(_BVEC, _KGRID, is_2d=True)
-    zc = float(np.pi / _BVEC[2, 2])
-    return minibz_average(
-        np.zeros(3), [np.asarray(b) for b in batches], kind="slab",
-        celvol=float(_CELL_VOLUME), n_kpts=int(np.prod(_KGRID)),
-        q0sph2=q0sph2, zc=zc, analytic_sphere=False, adaptive=True)
+    vc0, _ = get_kernel(2).q0_average(
+        geometry, _KGRID, S_cart=np.zeros((3, 3)))
+    return complex(vc0)
 
 
 def _one_q_gamma_g0_table():
@@ -301,9 +291,11 @@ def test_tt_head_tensor_matches_measured_slab_reference_ratio():
         bvec=_BVEC, cell_volume=_CELL_VOLUME, sys_dim=_SYS_DIM,
         kgrid=_KGRID)
     ratio = T / float(np.real(vc0_mean))
-    np.testing.assert_allclose(np.diag(ratio), [0.5, 0.5, 1.0], atol=5e-3)
+    # The exact polygon rule of a square cell is four-fold symmetric, so the
+    # in-plane split is exact, not a Monte-Carlo estimate.
+    np.testing.assert_allclose(np.diag(ratio), [0.5, 0.5, 1.0], atol=1e-12)
     off_diag_mask = ~np.eye(3, dtype=bool)
-    np.testing.assert_allclose(ratio[off_diag_mask], 0.0, atol=5e-3)
+    np.testing.assert_allclose(ratio[off_diag_mask], 0.0, atol=1e-12)
 
 
 # ---------------------------------------------------------------------------

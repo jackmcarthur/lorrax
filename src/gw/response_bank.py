@@ -1743,7 +1743,7 @@ def compute_photon_bank(wfns, wfns_transverse, meta, config, *, mesh_xy, sym,
             receipt["direct_gamma"] = dict(
                 approximation="first_order_dipole_current_fd",
                 sectors="CC_CT_TC_TT", local_fields=False,
-                samples="4x131072 Sobol exterior plus screened sphere",
+                samples=direct_head["rule"],
                 static_limit="Thomas-Fermi at z=0; dynamic Drude for Im(z)>0")
     before = time.monotonic()
     if jax.process_index() == 0:
