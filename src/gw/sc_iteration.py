@@ -2789,7 +2789,11 @@ def _classify_sc_partition(
             e_reference_loop, n_occ=int(inputs.meta.nelec),
             nval=inputs.config.nval, ncond=inputs.config.ncond,
             gap_ev=inputs.config.sigma.regularization_ev,
-            mu_ev=mu_ev if inputs.material_class == "metal" else None)
+            mu_ev=mu_ev if inputs.material_class == "metal" else None,
+            range_ev=(inputs.config.sigma.omega_min_ev, inputs.config.sigma.omega_max_ev),
+            range_mu_ev=(mu_ev if inputs.material_class == "metal" else 0.5 * (
+                float(np.max(e_reference_loop[:, int(inputs.meta.nelec) - 1]))
+                + float(np.min(e_reference_loop[:, int(inputs.meta.nelec)])))))
         partition = BandPartition(jnp.asarray(protected), jnp.asarray(protected))
         _record_sc(inputs, f"SC band classes: {int(protected.sum())} protected / "
                    f"{int((~protected).sum())} rotating; nval/ncond request "

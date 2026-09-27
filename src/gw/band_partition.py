@@ -22,7 +22,8 @@ import jax.numpy as jnp
 # Partition descriptor
 # ---------------------------------------------------------------------------
 
-def requested_band_mask(energies_ev, *, n_occ, nval, ncond, gap_ev, mu_ev=None):
+def requested_band_mask(energies_ev, *, n_occ, nval, ncond, gap_ev, mu_ev=None,
+                        range_ev=None, range_mu_ev=None):
     """Requested bands closed to the next resolved spectral gap at each k.
 
     ``nval``/``ncond`` count states below/above the Fermi level at each k.
@@ -30,8 +31,10 @@ def requested_band_mask(energies_ev, *, n_occ, nval, ncond, gap_ev, mu_ev=None):
     starts at the number of states below mu at that k, so a metal protects
     the same energy neighbourhood of E_F at every k; without it, or on an
     insulator, the count starts at ``n_occ``. A gap larger than eta separates
-    manifolds resolved by Sigma. Only the initial DFT ladder is classified.
-    The work is O(nk nb), with no axis loop.
+    manifolds resolved by Sigma. ``range_ev = (lo, hi)`` (either may be
+    None), relative to ``range_mu_ev``, only enlarges the set: every state in
+    it is protected, closed over its eta-resolved manifold. Only the initial
+    DFT ladder is classified. The work is O(nk nb), with no axis loop.
     """
     e = np.asarray(energies_ev, float)
     nk, nb = e.shape
@@ -61,6 +64,15 @@ def requested_band_mask(energies_ev, *, n_occ, nval, ncond, gap_ev, mu_ev=None):
             f"eta-resolved gap at k={k} requires {promotion[k]:.6f} eV, "
             f"beyond the {SUPPORT_PAD_EV:g} eV automatic-promotion limit; "
             "increase nval/ncond explicitly to include that manifold.")
+    if range_ev is not None and any(x is not None for x in range_ev):
+        lo_ev = -np.inf if range_ev[0] is None else float(range_ev[0])
+        hi_ev = np.inf if range_ev[1] is None else float(range_ev[1])
+        rel = e - float(range_mu_ev)
+        inside = (rel >= lo_ev) & (rel <= hi_ev)
+        hit = np.zeros((nk, nb + 1), bool)
+        np.put_along_axis(hit, np.where(inside, groups, nb), True, axis=1)
+        hit[:, nb] = False
+        protected = protected | np.take_along_axis(hit, groups, axis=1)
     return protected
 
 

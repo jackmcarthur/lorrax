@@ -9,8 +9,8 @@ The SC equations remain in [self consistency](../self_consistency.md).
 
 1. `nval` and `ncond` count the protected QP states below and above E_F at each k (at `nelec` on an insulator).
 2. `number_bands` sets the complete rotating and sum-band carrier.
-3. `sigma_omega_min_ev` only lowers the sampled lower endpoint, in eV relative to the Sigma reference.
-4. `sigma_omega_max_ev` only raises the sampled upper endpoint; either endpoint may be omitted.
+3. `sigma_omega_min_ev` protects every state at or above it and lowers the sampled lower endpoint, in eV relative to the Sigma reference.
+4. `sigma_omega_max_ev` protects every state at or below it and raises the sampled upper endpoint; either endpoint may be omitted.
 5. `sigma_omega_step_ev` sets sampling; `sigma_window_ev`, `sigma_out_of_grid`, `sigma_omega_patches_ev`, `sigma_window_edge_factor`, and `sc_frozen_core_bands` refuse by name.
 
 ## Decisions and cost

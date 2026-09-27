@@ -790,7 +790,9 @@ def _oneshot_sampled_support(config, enk_dft, wfn, occupation_state,
         requested_band_mask(e_ry * RYD_TO_EV, n_occ=int(wfn.nelec),
                             nval=config.nval, ncond=config.ncond,
                             gap_ev=config.sigma.regularization_ev,
-                            mu_ev=mu_ev if metal else None))
+                            mu_ev=mu_ev if metal else None,
+                            range_ev=(config.sigma.omega_min_ev, config.sigma.omega_max_ev),
+                            range_mu_ev=mu_ev))
     planned, _ = plan_support_ev(config.sigma, energy, states)
     if np.array_equal(planned, requested):
         return config
