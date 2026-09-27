@@ -105,9 +105,18 @@ def test_chi_supports_use_the_same_predicate():
 
 
 def test_there_is_one_predicate():
-    from gw import ppm_windows, w_isdf
-    for mod in (ppm_windows, w_isdf, SW):
+    from gw import ppm_windows, response_bank, w_isdf
+    for mod in (ppm_windows, w_isdf, SW, response_bank):
         assert mod.band_in_occupation_window is band_in_occupation_window
+
+
+def test_the_response_bank_samples_the_same_support():
+    from gw.response_bank import response_sample_weights
+    f = np.asarray([1.0, 0.5, 1e-15, 1e-17, 0.0])
+    ft, ut, receipt = response_sample_weights(f, 1.0 - f)
+    np.testing.assert_array_equal(ft != 0, band_in_occupation_window(f))
+    np.testing.assert_array_equal(ut != 0, band_in_occupation_window(1.0 - f))
+    assert receipt["occupation_activity_floor"] == OCCUPATION_WEIGHT_FLOOR
 
 
 def test_the_retired_key_refuses_by_name(tmp_path):
