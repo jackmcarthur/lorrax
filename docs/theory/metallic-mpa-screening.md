@@ -196,33 +196,25 @@ are different objects, and the head kernel keeps them apart by construction:
 
   with $C=2/(n_{\rm spin}n_{\rm spinor})$, $w$ the star-covariant tetrahedron
   weight of $\delta(E-\mu)$ times $N_k$ (`fermi_surface.metal_head_surface_weights`),
-  and the sum over each degenerate multiplet $\mathcal M$ (BGW's
-  TOL_Degeneracy, $10^{-6}$ Ry) with one weight per multiplet. The multiplet
-  trace is invariant under rotations inside the multiplet; its pairs are
-  excluded from $S$. Free electrons give $D=2n$, i.e. $\omega_p^2=16\pi n$ Ry$^2$.
+  and the sum over each pair's Fermi-surface share $\phi_{nm}$ (one for a
+  degenerate multiplet, the two-band Padé share of
+  [metal head §2](metal-q0-head.md) otherwise) with one weight per
+  multiplet. The trace is invariant under rotations inside a multiplet;
+  $S$ keeps $1-\phi$ of each pair. Free electrons give $D=2n$, i.e. $\omega_p^2=16\pi n$ Ry$^2$.
   Measured: Na bcc $8^3$ 5.95 eV (free electron at this density 6.05 eV);
   Fe bcc $4^3$ 2.09/2.31 eV, where $4^3$ does not converge the Fermi surface.
-- **The q = 0 cell.** The head is a mini-BZ average over $|q|\lesssim q_{\rm cell}$,
-  and inside the cell the two limits meet at $|\omega|=\bar v q$: the
-  particle-hole continuum screens statically below it, the Drude term holds
-  above it. The cell average therefore exchanges $q\cdot D\cdot q/z^2$ for the
-  finite-$q$ intraband response (`qsgw_head.lindhard_intraband_chi`)
-
-  $$
-  \chi_{\rm intra}(\mathbf q,z)=-N_0\,L\!\left(\frac{z}{\bar v(\hat q)|q|}\right),\quad
-  L(s)=1-\frac{s}{2}\ln\frac{s+1}{s-1},\quad
-  \bar v(\hat q)^2=\frac{3\,\hat q\cdot D\cdot\hat q}{N_0},
-  $$
-
-  which is exact in both limits for any Fermi surface and the exact
-  crossover for a spherical one: Drude for $|z|\gg\bar v q$ and
+- **The q = 0 cell.** The head is a mini-BZ average, and inside the cell the
+  two limits meet on the particle–hole continuum. The cell average exchanges
+  $q\cdot D\cdot q/z^2$ for the anisotropic Fermi-surface Lindhard function
+  of the computed band velocities, evaluated at every sample; it is
   Thomas–Fermi, $\kappa_{\rm TF}^2=8\pi N(E_F)/V_{\rm cell}$ with the same
-  tetrahedron weight sum, at $z=0$. At the metal plans' origin $i\varpi_0$ the
-  cell is statically screened, $\langle W\rangle=\langle8\pi/(q^2\epsilon_\infty+\kappa^2)\rangle$,
-  not $W=0$ (Na $8^3$: 35.9 against $8\pi/\kappa^2=36.1$ Ry bohr$^3$). A folded
-  head's exact $z=0$ row takes $\kappa_{\rm TF}^2$ through the static
-  wing/body fold (`qsgw_head._metal_static_head`). BerkeleyGW's GPP metal head
-  has the same static limit.
+  tetrahedron weight sum, at $z\to0$ and Drude for $|z|\gg qu$. The model,
+  its pair split and its static slot
+  $\langle8\pi/(q\cdot\epsilon_\infty\cdot q+\kappa^2)\rangle$ are owned by
+  [the metallic q→0 head](metal-q0-head.md). At the metal plans' origin
+  $i\varpi_0$ the cell is statically screened, not $W=0$ (Na $8^3$: 35.9
+  against $8\pi/\kappa^2=36.1$ Ry bohr$^3$). BerkeleyGW's GPP metal head has
+  the same static limit.
 
 **Every metallic head carries the metal's state.** The one-shot head, the
 frozen head of `sc_head_update = off` and the per-map head of `dft_velocity`

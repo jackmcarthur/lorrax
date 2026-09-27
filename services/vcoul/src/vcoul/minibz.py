@@ -481,6 +481,43 @@ def minibz_inscribed_sphere_r2(bvec, kgrid, *, is_2d: bool = False) -> float:
     return best
 
 
+def minibz_coulomb_moment(bvec, kgrid, *, ndirections: int = 8192) -> np.ndarray:
+    r"""Coulomb-weighted second moment ``(3, 3)`` of the 3D mini-BZ Voronoi cell.
+
+    .. math::
+        Q_{ab}=\frac{\int_{\mathcal C} d^3q\,v(q)\,q_aq_b}{\int_{\mathcal C} d^3q\,v(q)}
+        =\frac{\int d\Omega\,\hat q_a\hat q_b\,R(\hat q)^3/3}{\int d\Omega\,R(\hat q)},
+        \qquad v(q)=8\pi/q^2,
+
+    with ``R(qhat)`` the distance from the origin to the cell boundary along
+    ``qhat`` (the cell of :func:`wrap_points_to_voronoi`, lattice ``b_i/nk_i``,
+    neighbours to ``|n_i| <= 2``).  The radial integrals are exact; the
+    angular ones use a Fibonacci sphere.  ``Q`` is the q-scale the q = 0 head
+    weights: the metallic head's pair split reads a pair's two-band
+    extent on it (``gw.fermi_surface.intraband_pair_fraction``).
+    """
+    bvec = np.asarray(bvec, dtype=np.float64)
+    nk = np.asarray([int(s) for s in np.ravel(kgrid)], dtype=np.float64)
+    if bvec.shape != (3, 3) or nk.shape != (3,) or np.any(nk < 1):
+        raise ValueError("minibz_coulomb_moment needs bvec (3,3) and a 3D kgrid")
+    basis = bvec / nk[:, None]
+    shifts = np.stack(np.meshgrid(*(np.arange(-2, 3),) * 3, indexing="ij"),
+                      axis=-1).reshape(-1, 3)
+    shifts = shifts[np.any(shifts != 0, axis=1)]
+    g = shifts.astype(np.float64) @ basis
+    i = np.arange(int(ndirections)) + 0.5
+    polar = np.arccos(1.0 - 2.0 * i / float(ndirections))
+    azimuth = np.pi * (1.0 + 5.0 ** 0.5) * i
+    qhat = np.stack((np.sin(polar) * np.cos(azimuth),
+                     np.sin(polar) * np.sin(azimuth), np.cos(polar)), axis=1)
+    proj = qhat @ g.T
+    dist = np.where(proj > 0.0, 0.5 * np.sum(g * g, axis=1)[None, :]
+                    / np.where(proj > 0.0, proj, 1.0), np.inf)
+    radius = np.min(dist, axis=1)
+    moment = np.einsum("d,da,db->ab", radius ** 3 / 3.0, qhat, qhat)
+    return moment / float(np.sum(radius))
+
+
 def _minibz_kernel_bare(shift_cart, dq_cart, *, kind, alpha=None, zc=None):
     """Bare Coulomb kernel ``8π·[trunc]·[gauss]/|shift+δq|²`` (NO 1/celvol),
     evaluated on a batch of mini-BZ offsets ``dq_cart`` (N,3).  Returns

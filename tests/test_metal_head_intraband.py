@@ -168,7 +168,9 @@ def test_dft_head_takes_the_fixed_n_state_and_its_drude_term(monkeypatch, tmp_pa
     (tmp_path / "dipole.h5").write_bytes(b"")
     monkeypatch.setattr(qsgw_head, "read_authenticated_dipole_velocity",
                         lambda *a, **k: fx.velocity)
-    wfn = SimpleNamespace(nspin=1, kgrid=(fx.n,) * 3, symmetry=lambda: fx.sym)
+    wfn = SimpleNamespace(nspin=1, kgrid=(fx.n,) * 3, symmetry=lambda: fx.sym,
+                          blat=2.0 * np.pi / fx.a, bvec=np.eye(3),
+                          cell_volume=fx.a ** 3)
     meta = SimpleNamespace(b_id_0=0, b_id_4_chi_user=3, nk_tot=fx.n ** 3,
                            cell_volume=fx.a ** 3, nspinor_wfnfile=1, nelec=1,
                            nb_sigma=3)
@@ -183,10 +185,20 @@ def test_dft_head_takes_the_fixed_n_state_and_its_drude_term(monkeypatch, tmp_pa
         fx.energies, fx.state.mu_ry, sym=fx.sym, kgrid=(fx.n,) * 3)
     common = dict(mesh=_mesh(), nb_logical=3, cell_volume=fx.a ** 3,
                   nk_tot=fx.n ** 3, nspin=1, nspinor=1)
+    split = qsgw_head.metal_pair_split(
+        jnp.asarray(fx.velocity), mesh=_mesh(),
+        bvec_cart=2.0 * np.pi / fx.a * np.eye(3), kgrid=(fx.n,) * 3)
     want = np.asarray(head_s_tensor_sharded(
         jnp.asarray(fx.velocity), jnp.asarray(fx.energies),
         jnp.asarray(np.asarray(fx.state.f_kn)), z,
-        surface_weight_kn=jnp.asarray(surface), **common))
+        surface_weight_kn=jnp.asarray(surface), pair_split=split, **common))
+    # The metal head carries velocity atoms whose moments are N0 and Re D.
+    atoms = got.fermi_surface
+    np.testing.assert_allclose(8.0 * np.pi * atoms.dos, got.static_kappa2_bohr2,
+                               rtol=1e-12)
+    np.testing.assert_allclose(
+        np.einsum("s,sa,sb->ab", atoms.weights, atoms.velocities, atoms.velocities),
+        np.real(got.drude_tensor), rtol=1e-10, atol=1e-14)
     np.testing.assert_allclose(np.asarray(got.S_direct), want, rtol=1e-12,
                                atol=1e-12)
     np.testing.assert_array_equal(
@@ -245,39 +257,129 @@ def _textbook_lindhard(s):
     return 1.0 - 0.5 * s * np.log((s + 1.0) / (s - 1.0))
 
 
-def test_lindhard_intraband_limits_and_crossover():
-    from gw.qsgw_head import lindhard_intraband_chi
+def _fibonacci_sphere(n):
+    i = np.arange(n) + 0.5
+    polar = np.arccos(1.0 - 2.0 * i / n)
+    azimuth = np.pi * (1.0 + 5.0 ** 0.5) * i
+    return np.stack((np.sin(polar) * np.cos(azimuth),
+                     np.sin(polar) * np.sin(azimuth), np.cos(polar)), axis=1)
 
-    dos = 0.0277                                  # Na 8^3, Ry^-1 bohr^-3
-    D = np.diag([7.97e-3, 7.97e-3, 7.97e-3])      # omega_p = 5.95 eV
-    vbar = np.sqrt(3.0 * 7.97e-3 / dos)
-    rng = np.random.default_rng(9)
-    qhat = rng.normal(size=(64, 3))
+
+def _atoms(weights, velocities, spread=None):
+    from gw.fermi_surface import FermiSurfaceIntraband
+
+    n = len(weights)
+    spread = np.zeros((n, 1, 3, 3)) if spread is None else spread
+    diag = np.asarray(velocities, np.float64).T[:, :, None]
+    drude = (np.einsum("s,sa,sb->ab", weights, velocities, velocities)
+             + np.einsum("s,sab->ab", weights, spread[:, 0]))
+    return FermiSurfaceIntraband(np.asarray(weights)[:, None], diag, spread,
+                                 drude, capacity=1.0, cell_volume=1.0, nk_tot=1)
+
+
+def test_intraband_atoms_ellipsoid_against_analytic_lindhard():
+    """Ellipsoidal Fermi surface: the atoms against the exact anisotropic Lindhard.
+
+    ``E = sum_a k_a^2 / m_a`` maps to a sphere by ``k = A p``, so the
+    Fermi-surface measure is uniform in ``phat`` and ``q.u`` is distributed as
+    on a sphere with speed ``v(qhat) = 2 p_F |A^-1 qhat|``: the intraband
+    response is ``-N0 L(z / (v(qhat) |q|))`` with that direction's speed, which
+    equals ``sqrt(3 qhat.D.qhat / N0)``.  One ``vbar`` for every direction
+    would miss it by the mass anisotropy.
+    """
+    masses = np.array([0.6, 1.0, 2.5])
+    p_f, n0 = 0.7, 0.031
+    phat = _fibonacci_sphere(40000)
+    velocity = 2.0 * p_f * phat / np.sqrt(masses)[None, :]
+    atoms = _atoms(np.full(len(phat), n0 / len(phat)), velocity)
+    np.testing.assert_allclose(atoms.dos, n0, rtol=1e-13)
+    np.testing.assert_allclose(
+        atoms.drude, n0 * 4.0 * p_f ** 2 / 3.0 * np.diag(1.0 / masses),
+        rtol=2e-4, atol=1e-8)
+    rng = np.random.default_rng(3)
+    qhat = rng.normal(size=(8, 3))
     qhat /= np.linalg.norm(qhat, axis=1)[:, None]
-    q = 0.05 * qhat
-    qDq = np.einsum("qa,ab,qb->q", q, D, q)
-    # z = 0: Thomas-Fermi for every direction.
-    np.testing.assert_allclose(
-        np.asarray(lindhard_intraband_chi(q, 0.0, D, dos)), -dos, rtol=1e-13)
-    # |z| >> vbar q: the q-first Drude term plus its first dispersion
-    # correction, q.D.q/z^2 (1 + 3/5 (vbar q / z)^2).
-    for z in (0.4j, 0.5 + 0.4j, 2.0j):
-        got = np.asarray(lindhard_intraband_chi(q, z, D, dos))
-        s2 = (vbar * 0.05 / z) ** 2
-        np.testing.assert_allclose(got, qDq / z ** 2 * (1 + 0.6 * s2),
-                                   rtol=2e-4)
-    # The crossover itself, including the continuum below vbar q, against an
-    # independent retarded textbook form (s -> s + i0 on the real axis).
-    for x in (0.2, 0.7, 1.5, 4.0):
-        z = x * vbar * 0.05 + 1.0e-9j
-        got = np.asarray(lindhard_intraband_chi(q[:1], z, D, dos))[0]
-        want = -dos * _textbook_lindhard(z / (vbar * 0.05))
-        assert got == pytest.approx(want, rel=1e-6)
-        if x < 1.0:
-            assert got.imag < 0.0          # Landau damping, retarded sign
+    for magnitude in (0.01, 0.05):
+        q = magnitude * qhat
+        speed = 2.0 * p_f * np.linalg.norm(qhat / np.sqrt(masses)[None, :], axis=1)
+        for z in (0.3j * magnitude, (0.5 + 0.4j) * magnitude,
+                  3.0j * magnitude, 0.2 + 0.1j):
+            got = np.asarray(atoms.density_response(q, z))
+            want = -n0 * _textbook_lindhard(z / (speed * magnitude))
+            np.testing.assert_allclose(got, want, rtol=2e-3, atol=2e-6 * n0)
+        # Static: Thomas-Fermi in every direction.
+        np.testing.assert_allclose(np.asarray(atoms.density_response(q, 0.0)),
+                                   -n0, rtol=1e-12)
     # Conjugate symmetry below the axis.
-    z = 0.3 * vbar * 0.05 - 0.01j
+    z = 0.01 - 0.004j
     np.testing.assert_allclose(
-        np.asarray(lindhard_intraband_chi(q, z, D, dos)),
-        np.conj(np.asarray(lindhard_intraband_chi(q, np.conj(z), D, dos))),
-        rtol=1e-14)
+        np.asarray(atoms.density_response(q, z)),
+        np.conj(np.asarray(atoms.density_response(q, np.conj(z)))), rtol=1e-12)
+
+
+def test_intraband_atoms_split_keeps_moments():
+    """A state with intraband partners splits into four atoms with exact moments."""
+    rng = np.random.default_rng(5)
+    half = rng.normal(size=(3, 3))
+    velocity = np.concatenate((half, -half))      # a closed surface: sum W u = 0
+    weights = np.tile(rng.uniform(0.1, 1.0, size=3), 2)
+    a = rng.normal(size=(3, 3, 2))
+    spread = np.tile(np.einsum("sai,sbi->sab", a, a), (2, 1, 1))[:, None]
+    spread[0] = spread[3] = 0.0
+    atoms = _atoms(weights, velocity, spread)
+    assert atoms.n_split == 4 and atoms.weights.size == 2 + 4 * 4
+    np.testing.assert_allclose(atoms.dos, weights.sum(), rtol=1e-13)
+    np.testing.assert_allclose(atoms.weights @ atoms.velocities,
+                               weights @ velocity, atol=1e-12)
+    # The Drude (large-z) limit of the scalar response is q.D.q / z^2.
+    q = np.array([[1e-4, -2e-4, 3e-4]])
+    z = 50.0j
+    got = complex(np.asarray(atoms.density_response(q, z))[0])
+    want = complex(q[0] @ atoms.drude @ q[0] / z ** 2)
+    assert abs(got - want) < 1e-6 * abs(want)
+
+
+def test_intraband_pair_fraction_two_band_share():
+    """A pair's Fermi-surface share is eps^2/(Delta^2+eps^2), only on the Fermi surface."""
+    from gw.fermi_surface import intraband_pair_fraction
+
+    moment = 0.01 * np.eye(3)                 # Coulomb-weighted <q q^T>, bohr^-2
+    v = np.zeros((3, 1, 2, 2), np.complex128)
+    v[0, 0, 0, 1] = v[0, 0, 1, 0] = 0.5       # eps^2 = 4 * 0.01 * 0.25 = 0.01
+    diag = np.zeros((3, 1, 2))
+
+    def share(gap, weight):
+        delta = np.array([[[0.0, -gap], [gap, 0.0]]])
+        w = np.full((1, 2), weight)
+        return np.asarray(intraband_pair_fraction(
+            jnp.asarray(v), jnp.asarray(delta), jnp.asarray(diag),
+            jnp.asarray(diag), jnp.asarray(w), jnp.asarray(w),
+            jnp.asarray(moment), 1e-6))
+
+    for gap, weight, want in ((0.1, 1.0, 0.5), (1.0, 1.0, 0.01 / 1.01),
+                              (1e-5, 1.0, 0.01 / (1e-10 + 0.01)),
+                              (1e-5, 0.0, 0.0), (1e-9, 0.0, 1.0)):
+        got = share(gap, weight)
+        assert got[0, 0, 1] == pytest.approx(want, rel=1e-12), (gap, weight)
+        assert got[0, 0, 0] == 1.0               # the diagonal is Fermi surface
+    # A velocity difference counts once, the coupling four times.
+    diag[0, 0, 1] = 1.0
+    assert share(0.1, 1.0)[0, 0, 1] == pytest.approx(0.02 / 0.03, rel=1e-12)
+
+
+def test_minibz_coulomb_moment_cubic_cell():
+    """sc lattice: Q is isotropic and scales as the cell size squared."""
+    from ffi import _services
+    _services.ensure_on_path()
+    from vcoul import minibz_coulomb_moment
+
+    b = 2.0 * np.pi * np.eye(3)
+    q4 = minibz_coulomb_moment(b, (4, 4, 4))
+    q8 = minibz_coulomb_moment(b, (8, 8, 8))
+    np.testing.assert_allclose(q4, q4[0, 0] * np.eye(3), atol=2e-3 * q4[0, 0])
+    np.testing.assert_allclose(q8, q4 / 4.0, rtol=1e-12, atol=1e-15)
+    # Between the inscribed and circumscribed spheres' R^2/9.
+    half = np.pi / 4.0
+    assert half ** 2 / 9.0 < q4[0, 0] < 3.0 * half ** 2 / 9.0
+
+

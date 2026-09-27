@@ -7,6 +7,8 @@ response and the photon contact are separate inputs to the Γ-cell solve.
 """
 from functools import lru_cache
 
+import sys
+
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -92,13 +94,31 @@ def add_direct_gamma_field(packed, coefficient, *, gamma_vectors, layout, mesh):
         left_rows_X=left, right_rows_Y=right)
 
 
+def hall_projection(tensor):
+    """Block-wise Cartesian antisymmetric part of ``(..., 6, 6)`` jet/current tensors.
+
+    Rows 0:3 are charge jets and 3:6 currents.  Each 3x3 block ``B`` keeps
+    ``(B - B^T)/2``; the jet-jet block is set to zero because
+    ``q.A.q = 0`` for antisymmetric ``A`` and its entries carry the pair's
+    ``1/Delta`` jets (``docs/theory/metal-q0-head.md`` section 2).
+    """
+    shape = tensor.shape
+    blocks = tensor.reshape(shape[:-2] + (2, 3, 2, 3))
+    swapped = jnp.swapaxes(blocks, -3, -1)
+    hall = (0.5 * (blocks - swapped)).reshape(shape)
+    return hall.at[..., :3, :3].set(0.0)
+
+
 @lru_cache(maxsize=16)
-def _interband_program(mesh: Mesh, nb_logical: int, degeneracy_ry: float):
+def _interband_program(mesh: Mesh, nb_logical: int):
     from jax.sharding import PartitionSpec as P
+    from gw.degen_average import TOL_DEGENERACY_RY
+    from gw.fermi_surface import intraband_pair_fraction
 
     ax_x, ax_y = _mesh_xy(mesh)
 
-    def local(v, e_x, e_y, f_x, f_y, frequencies, scale):
+    def local(v, e_x, e_y, f_x, f_y, frequencies, scale, d_x, d_y, w_x, w_y,
+              moment):
         nx, ny = v.shape[-2:]
         ix = jax.lax.axis_index(ax_x) * nx + jnp.arange(nx)
         iy = jax.lax.axis_index(ax_y) * ny + jnp.arange(ny)
@@ -107,8 +127,16 @@ def _interband_program(mesh: Mesh, nb_logical: int, degeneracy_ry: float):
         active = ((ix[:, None] < nb_logical) &
                   (iy[None, :] < nb_logical))[None]
         offdiag = active & (ix[None, :, None] != iy[None, None, :])
-        regular = offdiag & (jnp.abs(delta) > degeneracy_ry)
-        inverse = jnp.where(regular, 1 / jnp.where(regular, delta, 1.0), 0.0)
+        # One pair split with the scalar head: each pair keeps 1 - phi of its
+        # first-order tensor, and its Fermi-surface share phi keeps only the
+        # Hall (antisymmetric) part here; exact multiplets leave entirely.
+        share = intraband_pair_fraction(v, delta, d_x, d_y, w_x, w_y, moment,
+                                        TOL_DEGENERACY_RY)
+        exact = jnp.abs(delta) < TOL_DEGENERACY_RY
+        jet = offdiag & ~exact
+        regular = jnp.where(jet, 1.0 - share, 0.0)
+        hall_pairs = jnp.where(jet, share, 0.0)
+        inverse = jnp.where(jet, 1 / jnp.where(jet, delta, 1.0), 0.0)
         # In Ry and bohr units, ∂_k H has the dipole-file velocity.  The
         # packed Breit current uses Gamma_raw=(alpha_FS/2)*v_Ry.
         vertex = jnp.concatenate((v * inverse[None], HALFALPHA * v), axis=0)
@@ -119,58 +147,64 @@ def _interband_program(mesh: Mesh, nb_logical: int, degeneracy_ry: float):
                                 weight, vertex, optimize=True)
             return jax.lax.psum(value, (ax_x, ax_y))
 
+        def both(pairs_weight):
+            """Interband tensor plus the Hall part of the intraband pairs."""
+            return (contract(regular * pairs_weight)
+                    + hall_projection(contract(hall_pairs * pairs_weight)))
+
         # One orientation per directed pair.  scale is half the incumbent
         # energy-ordered S-tensor prefactor because both directions appear.
         def one(_, z):
             denom = z - delta
-            safe_denom = jnp.where(regular, denom, 1.0 + 0.0j)
-            weight = jnp.where(regular,
-                scale * occupation / safe_denom, 0.0)
+            safe_denom = jnp.where(jet, denom, 1.0 + 0.0j)
+            weight = scale * occupation / safe_denom
             safe_z = jnp.where(z == 0, 1.0 + 0.0j, z)
-            slope = jnp.where(regular & (z != 0),
+            slope = jnp.where(z != 0,
                 -scale * occupation /
                 (2 * safe_z * safe_denom * safe_denom), 0.0)
-            return None, (contract(weight), contract(slope))
+            return None, (both(weight), both(slope))
 
         _, (value, slope) = jax.lax.scan(one, None, frequencies, unroll=1)
-        moments = jnp.stack([contract(jnp.where(
-            regular, scale * occupation * delta**power, 0.0))
-            for power in range(4)])
-        skipped = jax.lax.psum(jnp.sum(offdiag & ~regular &
-                                     (jnp.abs(occupation) > 0)), (ax_x, ax_y))
-        return value, slope, moments, skipped
+        moments = jnp.stack([both(scale * occupation * delta**power)
+                             for power in range(4)])
+        return value, slope, moments
 
     return jax.jit(shard_map(local, mesh=mesh,
         in_specs=(P(None,None,"x","y"), P(None,"x"), P(None,"y"),
-                  P(None,"x"), P(None,"y"), P(None), P()),
+                  P(None,"x"), P(None,"y"), P(None), P(),
+                  P(None,None,"x"), P(None,None,"y"), P(None,"x"), P(None,"y"),
+                  P(None,None)),
         out_specs=(P(None,None,None), P(None,None,None),
-                   P(None,None,None), P()), check_vma=False))
+                   P(None,None,None)), check_vma=False))
 
 
 def direct_photon_interband_tensors(velocity_cart, energies_kn_ry,
                                     occupations_kn, frequencies_ry, *,
+                                    surface_kn, pair_split,
                                     mesh: Mesh, nb_logical: int,
                                     cell_volume: float, nk_tot: int,
-                                    nspin: int, nspinor_wfn: int,
-                                    degeneracy_ry: float = 1e-8):
+                                    nspin: int, nspinor_wfn: int):
     """Return ordered 6×6 value, d/d(z²), and 1/z..1/z⁴ coefficients.
 
-    Rows 0:3 multiply the mini-BZ Cartesian q; rows 3:6 are current.  The
-    declared first-order approximation drops interband charge vertices at
-    exactly degenerate pairs, whose eigenstate derivative is undefined.
+    Rows 0:3 multiply the mini-BZ Cartesian q; rows 3:6 are current.  Pairs
+    are split once with the scalar head (``pair_split``,
+    ``gw.qsgw_head.metal_pair_split``; ``surface_kn`` is the tetrahedron
+    table): each pair enters with ``1 - phi`` and its Fermi-surface share
+    ``phi`` only through :func:`hall_projection`; exact multiplets enter not
+    at all (their content is the Fermi-surface atoms').
     """
     v = jnp.asarray(velocity_cart, dtype=jnp.complex128)
     e = jnp.asarray(energies_kn_ry, dtype=jnp.float64)
     f = jnp.asarray(occupations_kn, dtype=jnp.float64)
+    w = jnp.asarray(surface_kn, dtype=jnp.float64)
     z = jnp.atleast_1d(jnp.asarray(frequencies_ry, dtype=jnp.complex128))
     if (v.ndim != 4 or tuple(v.shape[:2]) != (3, nk_tot)
             or v.shape[-1] != v.shape[-2] or e.shape != f.shape
-            or tuple(e.shape) != (nk_tot, nb_logical)
+            or tuple(e.shape) != (nk_tot, nb_logical) or w.shape != e.shape
             or nb_logical > v.shape[-1]):
         raise ValueError("direct photon head requires aligned 3×Nk×Nb×Nb dipoles and Nk×Nb states")
-    if not (cell_volume > 0 and nk_tot > 0 and nspin > 0 and
-            nspinor_wfn > 0 and degeneracy_ry > 0):
-        raise ValueError("direct photon head requires positive normalization and degeneracy threshold")
+    if not (cell_volume > 0 and nk_tot > 0 and nspin > 0 and nspinor_wfn > 0):
+        raise ValueError("direct photon head requires positive normalization")
     points = np.asarray(frequencies_ry, dtype=np.complex128)
     if np.any((np.imag(points) < 0) |
               ((np.imag(points) == 0) & (np.real(points) != 0))):
@@ -179,18 +213,14 @@ def direct_photon_interband_tensors(velocity_cart, energies_kn_ry,
         pad = int(v.shape[-1]) - int(nb_logical)
         e = jnp.pad(e, ((0, 0), (0, pad)))
         f = jnp.pad(f, ((0, 0), (0, pad)))
-    v, e, f, _ = _pad_head_band_manifold(v, e, f, jnp.zeros_like(e), mesh=mesh)
+        w = jnp.pad(w, ((0, 0), (0, pad)))
+    v, e, f, w = _pad_head_band_manifold(v, e, f, w, mesh=mesh)
+    d_x, d_y, moment = pair_split.operands(v)
     # Match the incumbent S_ab normalization for its charge-charge block.
     scale = 2.0 / (cell_volume * nk_tot * nspin * nspinor_wfn)
-    result = _interband_program(mesh, int(nb_logical), float(degeneracy_ry))(
-        v, e, e, f, f, z, jnp.asarray(scale, dtype=jnp.complex128))
-    skipped = int(np.asarray(result[3]))
-    if skipped:
-        raise ValueError("GATE photon_direct_degenerate_occupation: "
-                         f"{skipped} near-degenerate directed band pairs have "
-                         "unequal occupations; first-order charge jets are "
-                         "undefined for those pairs")
-    return result
+    return _interband_program(mesh, int(nb_logical))(
+        v, e, e, f, f, z, jnp.asarray(scale, dtype=jnp.complex128),
+        d_x, d_y, w, w, moment)
 
 
 @jax.jit
@@ -206,68 +236,33 @@ def project_first_order_photon_response(tensor, q_cart):
                       optimize=True)
 
 
-def metal_head_surface_tensors(velocity_cart, surface_weight_kn, energies_kn,
-                               *, mesh, nb_logical, cell_volume, nk_tot, nspin,
-                               nspinor_wfn):
-    """Use the incumbent sharded Drude contraction and current-map FD DOS."""
-    from gw.qsgw_head import head_drude_tensor_sharded
+def metal_intraband_photon_response(q_cart, z, drude_tensor, static_dos,
+                                     atom_w, atom_u):
+    """Intraband 4×4 response and its z² derivative at one frequency.
 
-    surface = jnp.asarray(surface_weight_kn, dtype=jnp.float64)
-    if surface.shape != (nk_tot, nb_logical):
-        raise ValueError("metal head surface weights do not match the band manifold")
-    stored = int(velocity_cart.shape[-1])
-    energies = jnp.asarray(energies_kn, dtype=jnp.float64)
-    if stored > nb_logical:
-        surface_stored = jnp.pad(surface, ((0, 0), (0, stored-nb_logical)))
-        energies = jnp.pad(energies, ((0, 0), (0, stored-nb_logical)))
-    else:
-        surface_stored = surface
-    drude = head_drude_tensor_sharded(velocity_cart, surface_stored, energies,
-        mesh=mesh, nb_logical=nb_logical, cell_volume=cell_volume,
-        nk_tot=nk_tot, nspin=nspin, nspinor=nspinor_wfn)
-    dos = (2.0 / (cell_volume * nk_tot * nspin * nspinor_wfn)
-           * jnp.sum(surface))
-    return drude, dos
-
-
-@jax.jit
-def metal_intraband_photon_response(q_cart, frequencies_ry, drude_tensor,
-                                     static_dos):
-    """Leading FD metal response with distinct dynamic and static limits.
-
-    At ``z != 0`` the longitudinal intraband tensor is fixed by the
-    Fermi-surface Drude tensor ``D_ab``: CC=qDq/z² and CT=qD·Gamma/z.
-    At ``z=0`` the finite-q limit is Thomas–Fermi CC=-DOS and the normal
-    current bubble is -Gamma·D·Gamma. Dynamic TT intraband starts at
-    higher order in q; its separate uniform contact remains in the photon
-    bank. No chemical-potential damping or artificial insulating gap enters.
+    At ``z != 0`` the anisotropic Fermi-surface Lindhard function of the
+    velocity atoms (``gw.fermi_surface.four_current_intraband_response``):
+    CC, CT = (alpha/2) sum W g u, TT = (alpha/2)^2 sum W g u u with
+    ``g = q.u/(z - q.u)``; Drude ``q.D.q/z^2`` for ``|z| >> q u``.  At
+    ``z = 0`` the static limit: Thomas–Fermi CC=-N0, TT=-(alpha/2)^2 D.
+    No chemical-potential damping or artificial insulating gap enters.
     """
+    from gw.fermi_surface import four_current_intraband_response
+
     q = jnp.asarray(q_cart, dtype=jnp.float64)
-    z = jnp.atleast_1d(jnp.asarray(frequencies_ry, dtype=jnp.complex128))
     D = jnp.asarray(drude_tensor, dtype=jnp.complex128)
-    if q.ndim != 2 or q.shape[1] != 3 or D.shape != (3, 3):
-        raise ValueError("metal head requires q[nq,3] and Drude[3,3]")
-    qD = q @ D
-    qDq = jnp.einsum("qa,qa->q", qD, q)
     static = jnp.zeros((q.shape[0], 4, 4), dtype=jnp.complex128)
     static = static.at[:, 0, 0].set(-static_dos)
     static = static.at[:, 1:, 1:].set(-HALFALPHA**2 * D)
-
-    def one(_, point):
-        safe = jnp.where(point == 0, 1.0 + 0.0j, point)
-        dynamic = jnp.zeros_like(static)
-        dynamic = dynamic.at[:, 0, 0].set(qDq / safe**2)
-        dynamic = dynamic.at[:, 0, 1:].set(HALFALPHA * qD / safe)
-        dynamic = dynamic.at[:, 1:, 0].set(HALFALPHA * (D @ q.T).T / safe)
-        return None, jnp.where(point == 0, static, dynamic)
-
-    _, values = jax.lax.scan(one, None, z, unroll=1)
-    return values
+    value, derivative = four_current_intraband_response(
+        q, z, atom_w, atom_u, HALFALPHA)
+    return (jnp.where(z == 0, static, value),
+            jnp.where(z == 0, 0.0, derivative))
 
 
 @jax.jit
 def _direct_gamma_chunk(q, bare, weight, interband, slopes, coefficients,
-                        frequencies, drude, dos, contact):
+                        frequencies, drude, dos, contact, atom_w, atom_u):
     """One small-matrix Γ cubature chunk; large centroid matrices never enter."""
     from gw.head_correction import _solve_photon_head
 
@@ -294,14 +289,10 @@ def _direct_gamma_chunk(q, bare, weight, interband, slopes, coefficients,
 
     def one(_, operands):
         z, tensor, derivative = operands
-        pi = (project_first_order_photon_response(tensor, q)
-              + metal_intraband_photon_response(q, z[None], drude, dos)[0])
-        dpi = project_first_order_photon_response(derivative, q)
-        safe = jnp.where(z == 0, 1.0 + 0.0j, z)
-        dpi = dpi.at[:, 0, 0].add(-qDq / safe**4)
-        dpi = dpi.at[:, 0, 1:].add(-HALFALPHA * qD / (2 * safe**3))
-        dpi = dpi.at[:, 1:, 0].add(
-            -HALFALPHA * (drude @ q.T).T / (2 * safe**3))
+        intra, dintra = metal_intraband_photon_response(
+            q, z, drude, dos, atom_w, atom_u)
+        pi = project_first_order_photon_response(tensor, q) + intra
+        dpi = project_first_order_photon_response(derivative, q) + dintra
         dpi = jnp.where(z == 0, 0.0, dpi)
         def solve(response, derivative):
             W, lhs = _solve_photon_head(bare, response - contact)
@@ -439,25 +430,47 @@ def build_direct_photon_head(velocity_cart, wfns, occupation_state, *,
     if velocity_cart.shape[-1] < nb or wfns.enk.shape[1] < nb:
         raise ValueError("GATE photon_direct_head_bands: dipole and response manifolds differ")
     z = np.asarray(frequencies_ry, dtype=np.complex128).reshape(-1)
-    e = wfns.enk[:, :nb]
-    f = occupation_state.f_kn[:, :nb]
-    tensors = direct_photon_interband_tensors(velocity_cart, e, f, z,
-        mesh=mesh, nb_logical=nb, cell_volume=float(meta.cell_volume),
+    e = np.asarray(wfns.enk[:, :nb], dtype=np.float64)
+    f = np.asarray(occupation_state.f_kn[:, :nb], dtype=np.float64)
+    geometry = CoulombGeometry.from_wfn(wfn)
+    kgrid = tuple(int(n) for n in meta.kgrid)
+    # One Fermi-surface owner with the scalar head: the tetrahedron table,
+    # its multiplet rule, the Taylor-radius pair split and the velocity atoms
+    # (docs/theory/metal-q0-head.md).
+    from gw.fermi_surface import metal_head_surface_weights
+    from gw.qsgw_head import metal_intraband_model
+    surface = metal_head_surface_weights(
+        e, float(occupation_state.mu_ry), sym=wfn.symmetry(), kgrid=wfn.kgrid)
+    stored = int(velocity_cart.shape[-1])
+    pad = ((0, 0), (0, stored - nb))
+    drude, atoms, split = metal_intraband_model(
+        velocity_cart, np.pad(surface, pad), np.pad(e, pad), mesh=mesh,
+        nb_logical=nb, cell_volume=float(meta.cell_volume),
         nk_tot=int(meta.nk_tot), nspin=int(wfn.nspin),
-        nspinor_wfn=int(meta.nspinor_wfnfile))
-    width = float(occupation_state.smearing_width_ry)
-    surface = f * (1.0 - f) / width
-    drude, dos = metal_head_surface_tensors(velocity_cart, surface, e,
+        nspinor=int(meta.nspinor_wfnfile), bvec_cart=geometry.bvec, kgrid=kgrid)
+    dos = atoms.dos
+    tensors = direct_photon_interband_tensors(velocity_cart, e, f, z,
+        surface_kn=surface, pair_split=split,
         mesh=mesh, nb_logical=nb, cell_volume=float(meta.cell_volume),
         nk_tot=int(meta.nk_tot), nspin=int(wfn.nspin),
         nspinor_wfn=int(meta.nspinor_wfnfile))
     contact = direct_photon_contact(contact_packed, photon_g0_vectors,
         layout=layout, mesh=mesh)
-    geometry = CoulombGeometry.from_wfn(wfn)
-    kgrid = tuple(int(n) for n in meta.kgrid)
     replicated = NamedSharding(mesh, P())
     points_device = device_put_process_local(z, replicated)
-    operands = (tensors[0], tensors[1], tensors[2], points_device, drude, dos, contact)
+    atom_w, atom_u = (device_put_process_local(np.asarray(x), replicated)
+                      for x in atoms.device_operands())
+    operands = (tensors[0], tensors[1], tensors[2], points_device,
+                jnp.asarray(drude), jnp.asarray(dos, jnp.float64), contact,
+                atom_w, atom_u)
+    if jax.process_index() == 0:
+        from common import RYD_TO_EV
+        wp = np.sqrt(np.maximum(8.0 * np.pi * np.linalg.eigvalsh(
+            np.real(0.5 * (drude + drude.T))), 0.0))
+        print("  direct photon Γ metal head: tetrahedron Fermi surface, omega_p principal = "
+                 + "/".join(f"{x * RYD_TO_EV:.4f}" for x in wp)
+                 + f" eV; kappa_TF^2 = {8.0 * np.pi * dos:.6f} bohr^-2; "
+                 + atoms.describe(), file=sys.stderr, flush=True)
     chunk_size, split = direct_gamma_chunk_plan(mesh, operands, nsamples=_GAMMA_SAMPLES)
     samples = iter_minibz_photon_samples(get_kernel(3), geometry,
         kgrid, nsamples=_GAMMA_SAMPLES,
@@ -515,10 +528,14 @@ def build_direct_photon_head(velocity_cart, wfns, occupation_state, *,
     if not all(np.all(np.isfinite(value)) for value in fields_mean):
         raise ValueError("GATE photon_direct_head_nonfinite: direct Γ cell average is not finite")
     if jax.process_index() == 0:
-        print_fn("  direct photon Γ: first-order CC/CT/TC/TT, FD Drude; "
+        print_fn("  direct photon Γ: first-order CC/CT/TC/TT + Fermi-surface Lindhard cell; "
                  "4×131072 Sobol exterior + 8×12×24 screened sphere; "
                  f"max replicate spread={spread:.3e} Ry, "
                  f"Dyson residual={float(max_error):.3e}", flush=True)
+        origin = int(np.argmin(np.abs(z)))
+        print(f"  direct photon Γ origin: z={complex(z[origin]):.6g} Ry, "
+                 f"<W_h - W_inf>_CC/Omega={complex(fields_mean[0][origin][0, 0]):.9g}, "
+                 f"TT trace={complex(np.trace(fields_mean[0][origin][1:, 1:])):.6g}", file=sys.stderr, flush=True)
     return dict(zip(("Wc", "dWc_ds", "Wc_minus_q", "dWc_minus_q_ds",
                      "constant", "moments", "bare"),
                     fields_mean))

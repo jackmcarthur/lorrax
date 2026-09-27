@@ -92,6 +92,7 @@ nav:
       - Shared-pole screened interaction: theory/shared-pole-w-model.md
       - Multipole frequency integration (MPA): theory/THEORY_mpa_implementation.md
       - Metallic MPA screening: theory/metallic-mpa-screening.md
+      - The metallic q→0 head: theory/metal-q0-head.md
   - Architecture:
       - Design decisions: architecture/decisions.md
       - Layers: architecture/layers.md
