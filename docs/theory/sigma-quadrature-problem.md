@@ -3,8 +3,8 @@
 Every dynamic self-energy reaches one planner and one executor through
 `gw.mpa.sigma.compute_sigma_c_mpa_omega_grid`: GN/HL-PPM (written as a
 one-pole in-memory store), elementwise MPA, the shared-pole W and its photon
-sectors. The planner is `gw.sigma_box_plan`, the rule builder
-`minimax.build_uniform_rule`, the τ kernel `gw.ppm_tau_kernel`. Pole models
+sectors. The planner is `gw.sigma_box_plan`, the rule builder the derived
+`minimax.analytic_box_rule` (§7), the τ kernel `gw.ppm_tau_kernel`. Pole models
 belong to [Multipole frequency integration](THEORY_mpa_implementation.md),
 [Metallic MPA screening](metallic-mpa-screening.md) and the
 [shared-pole model](../architecture/shared_pole_model.md); this page owns the
@@ -187,45 +187,23 @@ the peak already dominates.
 
 ## 7. The rule and its node laws
 
-`build_uniform_rule(box, ε)` discretizes 1/d = −i∫₀^∞ e^{itd} dt along a ray
-t = s e^{−iθ}. The angle θ is scanned over the interval where every member
-decays on the box, and the smallest numerical rank wins: symmetric crossing
-boxes get real time; sign-definite boxes rotate toward imaginary time, the
-Laplace family.
+`minimax.analytic_box_rule(box, ε)` places every node by formula and gets
+the weights from one linear least-squares solve; nothing is optimized. A
+crossing box gets the bent contour: a trapezoid line in complex time whose
+endpoint error is exactly two Laplace integrals on the imaginary time axes,
+carried by two Gauss image sets. A sign-definite box gets the elliptic
+time-Ritz sector rule with the local extremal-length count. A crossing box
+whose narrow side lies inside the peak takes the sector rule when its count
+is smaller. The derivation, the count laws and the fallback are
+[minimax quadrature §7](minimax-quadrature.md#7-σ-denominator-box-rules).
 
-**Crossing box: linear in A/η.** 1/d is band-limited. Resolving the peak
-needs time support T = ln(c/ε)/η_min, and covering an effective real width
-W_eff at the Nyquist density needs N ≈ W_eff T/2π nodes. W_eff = 2m plus a
-saturating share of the long side's excess over the short side m, because the
-nodes that cover a long side leave the real axis and damp it. For a symmetric
-box of half-width A,
-
-$$
-N\approx1.04\,\frac{A}{\eta_{\min}}\,\frac{\ln(0.086/\varepsilon)}{\pi}\approx2.6\,\frac{A}{\eta_{\min}}\quad(\varepsilon=3\cdot10^{-5}),
-$$
-
-which is within a constant of the band-limit floor (bandwidth × horizon/π).
-No construction removes the A/η law; the remaining node savings are in η, ε
-and the window geometry. The builder does not search for the count:
-`minimax.fixed_n_start.predict_nodes` sets it and `start_param` places the
-nodes (live-band Nyquist density, Im s damping the wider real edge within the
-off-ray cap, the last node at the amplitude floor). One variable-projection
-Levenberg–Marquardt polish follows, then the certificate. A failure raises
-the count by 10%, up to eight rungs; past that bracket the interpolatory
-ray-rank rule is polished once and then accepted or refused.
-
-**Sign-definite box: logarithmic.** 1/d there is a Braess–Hackbusch
-exponential sum with N = O(log R · log(1/ε)), R the corner dynamic range. The
-builder starts from the interpolatory rule at the ray rank (pivoted QR of the
-ray family's SVD basis) and removes nodes, in batches while far above the
-target. The survivors are re-solved by variable-projection LM on the sampled
-residual. A removal is kept while the sup on a finer check cloud stays ≤ ε
-and the cancellation ratio stays under its cap. The builder stops when no
-removal is accepted.
-
-Neither construction reads a clock, so the rule is a function of (box, ε)
-only, and a rule that cannot be certified is refused in planning, before the
-sweep starts.
+A crossing box costs about γ∫B(σ)dσ/2π nodes on the line, B(σ) the largest
+live |Re d|, plus O(log(M/η)·ln(1/ε)) image nodes; no construction goes
+below the band-limit floor (bandwidth × horizon/π), so the remaining savings
+are in η, ε and the window geometry. A sign-definite box costs
+O(log R · log(1/ε)). Neither rule reads a clock, so a rule is a function of
+(box, ε) only, and a rule that cannot be certified is refused in planning,
+before the sweep starts. The rule cache schema is `sigma-box-ry-v7`.
 
 ## 8. Acceptance
 

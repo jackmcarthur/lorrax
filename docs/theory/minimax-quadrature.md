@@ -1,10 +1,12 @@
-# Minimax quadrature for the space-time χ₀
+# Minimax quadrature for the space-time χ₀ and the Σ box rules
 
 This page covers the gapped imaginary-time (Laplace) χ₀ behind static,
-GN-PPM and HL-PPM screening, and the rules it consumes. Related material is
+GN-PPM and HL-PPM screening and the rules it consumes (§1–6), and the
+derived time rules for 1/d on Σ's denominator boxes (§7). Related material is
 owned elsewhere:
 
-- Σ's frequency integral: [the dynamic Σ(ω) quadrature](sigma-quadrature-problem.md).
+- Σ's frequency integral, its windows, boxes, currencies and acceptance:
+  [the dynamic Σ(ω) quadrature](sigma-quadrature-problem.md).
 - MPA sampling and its damped line rules:
   [Multipole frequency integration](THEORY_mpa_implementation.md).
 - Finite-occupation response: [Metallic MPA screening](metallic-mpa-screening.md)
@@ -145,6 +147,97 @@ is the only record.
 `gw.minimax_screening` owns the physical intervals, the energy reference, the
 rescaling and the probe adapters. `gw.w_isdf` owns the τ sweep. The Green's
 function builder and the FFT helpers carry no quadrature policy.
+
+## 7. Σ denominator-box rules
+
+`minimax.analytic_box_rule(box, ε)` returns Q(d) = Σ_k w_k e^{i t_k d} ≈ 1/d
+on a box [a, b] × [η, y_max], η > 0, in the box's currency: peak-relative
+η|Q − 1/d| on a crossing box (a < 0 < b), relative |d||Q − 1/d| on a
+sign-definite one. Every node is a formula of (box, ε); the weights are one
+linear least-squares solve on the box boundary with a ridge 0.05ε on each
+term's largest contribution in the currency. Units below are η = 1,
+L = ln(1/ε), Λ = ln(4/ε).
+
+**The trapezoid identity.** For Im d > 0 and |Re d| < B,
+
+$$
+\frac1d=\frac{\pi}{B}\cot\frac{\pi d}{B}+\frac2B\int_0^\infty\frac{\sinh(td/B)}{e^t-1}\,dt ,
+\qquad
+\frac{\pi}{B}\cot\frac{\pi d}{B}=-\frac{2\pi i}{B}\Big[\tfrac12+\sum_{k\ge1}e^{ik(2\pi/B)d}\Big].
+$$
+
+Proof: π cot πz − 1/z = ψ(1−z) − ψ(1+z) = −2∫₀^∞ sinh(zt)/(e^t − 1) dt.
+The cot term is the trapezoid rule of 1/d = −i∫₀^∞ e^{isd} ds at spacing
+2π/B; its whole error is the integral, which splits into e^{±td/B}, two
+Laplace integrals on the imaginary time axes s = ∓it/B, i.e. 1/d's images at
+d = ±B. Each is sign-definite on the box and costs O(log(M/η)·L) Gauss nodes.
+The line itself only has to meet the interior Nyquist condition.
+
+**The bent contour (crossing boxes).** Orient the box so its wide half-width
+M lies at x < 0 and its narrow half-width m at x > 0. At a node
+s = σ − iτ a member d = x + iy has |e^{isd}| = e^{−σy+τx}, so it is live
+while −σy + τx > −Λ, and Poisson summation folds a live x onto
+x − 2πj/Δ: the local density must be γB(σ)/2π with B(σ) the largest live |x|.
+The smallest τ that reaches the minimum B is
+
+$$
+\tau(\sigma)=\min\!\Big(\frac cm,\ \frac{\Lambda-\sigma}{m}\Big),\qquad c=4 ,
+$$
+
+so the contour is a vertical leg 0 → −ic/m (the wide side's Laplace part,
+⌈ln(Mc/m)L/π²⌉ nodes graded geometrically toward 0), the capped line
+σ − ic/m, and a linear fall to the real axis at σ = Λ, where every live member
+is below ε/4. c = 4 is the noise gate's: the narrow edge is amplified by e^c
+and the executor admits a term mass of 83. The two image sets sit at ±B₀,
+B₀ = γ·max(B(0), min(M, Λm/c)); each has
+K = ⌈ln(16R)(L + c)/π²⌉ Gauss–Legendre nodes, R = (B₀ + x_live)/(B₀ − m), and
+the growth-side image is capped at |Im s|(b − a) ≤ 3. With κ = c/L the line
+count is N_line = 1 + γI/2π,
+
+| regime | I = ∫B dσ |
+|---|---|
+| m ≤ M ≤ m(1+κ) | m[(1+κ)Λ − cκ/2] |
+| m(1+κ) < M ≤ mΛ/c | MΛ − cM²/(2m) + (mc/2)(1+κ+κ²) |
+| M > mΛ/c (saturated) | mΛ²/(2c) + (mc/2)(1+κ+κ²) |
+
+and the margin γ minimizes line plus image nodes, γ² − 1 = 8(L + c)/(πMΛ),
+clipped to [1 + 0.01·max(2, L − cM/m), 1.2]. A symmetric box bends too: the
+straight line leaves the far image to the growth-capped set and misses on a
+tall box ([−20, 20] × [1, 10]η: 1.49ε), where the bent contour certifies. The
+floor's 0.01 is the one calibrated constant. On a miss the ladder raises γ by
+1.1 and adds one node to the leg and to each image set, four rungs.
+
+**The sector rule and the local extremal-length law.** A box with Im d ≥ η
+lies in an open sector of the upper half plane. Rotate by the sector axis φ;
+the times are the elliptic time-Ritz times of the rotated box's real extent
+(`minimax.laplace_ritz.place_times`, a Lyapunov solve and one symmetric
+eigensolve) rotated back. In w = ln d the box is a strip of local half-gap
+g(ℓ) = π/2 − max|θ − φ| over the box's arc at radius e^ℓ, and the count is
+
+$$
+n=\frac{L}{\pi^2}\left[\int\frac{\pi/2}{g(\ell)}\,d\ell+\ln4\cdot\frac\pi2\Big(\frac1{g_{\rm near}}+\frac1{g_{\rm far}}\Big)\right],
+$$
+
+Zolotarev's ln 16 split into one ln 4 per end at that end's own gap; for a
+constant gap it is the strip count ln(16R)L/(π²(1 − 2γ/π)). φ minimizes the
+law on a fixed 200-point grid. The law has no calibrated constant: over 953
+fitted sign-definite rules its median fitted/law ratio is 1.000 (rms log
+0.132, no trend in the angle; claim 2873). The ladder is
+n → max(n + 1, ⌈1.1n⌉), six rungs. Sign-definite boxes weight the fit
+geometrically in |Re d|, the relative currency's measure.
+
+**Which family.** A sign-definite box takes the sector rule. A crossing box
+builds first the family with the smaller count, N_line + leg + images or the
+sector law, and the other when the first ladder ends uncertified. The sector
+rule wins when the narrow side lies inside the peak (m of a few η), where the
+bent contour's fixed 10–16-node overhead dominates. A rule neither family
+certifies is returned uncertified and the planner refuses the window by name.
+
+**Acceptance.** A rung is accepted when the boundary certificate
+([§8 of the Σ page](sigma-quadrature-problem.md#8-acceptance)) reads sup ≤ ε and
+the term mass ρΣ|w e^{itd}| ≤ the executor's 5·10⁻⁶/6·10⁻⁸ in the same
+currency. The cancellation ratio Σ|term|/|Q| is not the gate: on a crossing
+box it grows like |d|/η and reads 2.6·10⁴ on a certified Na box.
 
 ## References
 
