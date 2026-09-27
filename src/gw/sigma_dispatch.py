@@ -326,6 +326,7 @@ SIGMA_RESULT_K_AXES = {
 def sigma_result_on_kset(
     result: SigmaResult, *, kset: str, nk: int,
     select_rows: Callable | None = None,
+    select_axis: Callable | None = None,
 ) -> SigmaResult:
     """Return one Sigma result whose every k table is on ``kset``.
 
@@ -390,7 +391,11 @@ def sigma_result_on_kset(
 
         selected = value
         if select_rows is not None:
-            if k_axis:
+            if k_axis and select_axis is not None:
+                # SPCOST scratch execution seam. The existing selector and
+                # this owner's complete-table validation remain authoritative.
+                selected = select_axis(value, k_axis, select_rows)
+            elif k_axis:
                 moveaxis = (jnp.moveaxis if isinstance(value, jax.Array)
                             else np.moveaxis)
                 selected = moveaxis(value, k_axis, 0)
