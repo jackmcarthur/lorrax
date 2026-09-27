@@ -105,7 +105,7 @@ def check_fixed_point(session):
 #: node count scales as E_bw/eta. Replays (CLASSMIX round 2): Si conduction
 #: endpoints at 1 eV keep 0.7-0.8 meV; Fe semicore endpoints at 2 eV match
 #: the exact read (1.98 vs 1.95 meV) at half the 1 eV price.
-FAR_PATCH_ETA_EV = 1.0
+FAR_PATCH_ETA_EV = 0.5
 FAR_PATCH_ETA_BELOW_EV = 2.0
 #: Far-patch sampling step (eV): eta/2 resolves the broadened Sigma.
 FAR_PATCH_STEP_EV = 0.5
