@@ -5,10 +5,9 @@ rows for response kernels on a transition interval [L, H] that no sample
 frequency crosses. `minimax.laplace_ritz` owns the placement, the projection
 and the continuum certificate. The production consumer is the GN-PPM
 imaginary-axis probe ([Minimax quadrature §3](minimax-quadrature.md)). The
-shared-pole response bank uses the grouped shared-node rules of
-`minimax.response_group_rules` instead: complex times shared by a group of
-samples, with sampled rather than continuum error bounds
-([shared-pole model §2](../architecture/shared_pole_model.md)). Energies
+shared-pole response bank uses the grouped rules of
+`minimax.response_group_rules` (§ [Grouped response rules](#grouped-response-rules)
+below; [shared-pole model §2](../architecture/shared_pole_model.md)). Energies
 share one unit (Ry in GW), times its inverse, and derivatives are taken with
 respect to s = z².
 
@@ -100,3 +99,99 @@ panel, of which there are ⌈ln((H − W)/(L − W))/ln 1.15⌉.
 | `response rule node digest mismatch` | a corrupted reused rule |
 | `Loss of positivity in the time Ritz spectrum` | numerical breakdown of the Ritz solve |
 | `Reference shift exceeds scalar certification range` | e^{(r−L)t} overflows extended precision; raise r toward L |
+
+## Grouped response rules
+
+**The integral.** A sample group's rule serves, for every pole p of its
+samples (forward z and reverse −z̄, both with Im p > 0) and every real
+transition d ∈ [lo, hi] of the occupation support,
+
+$$
+\frac1{d-p}\simeq\sum_j c_j(p)\,e^{-(d-r)T_j},\qquad
+\frac1{(d-p)^2}\simeq\sum_j c'_j(p)\,e^{-(d-r)T_j},
+$$
+
+with one Green pair per complex time T_j (r = lo on an insulator, μ on a
+metal). The currency is the pole's own peak: Im p·|error| for the value and
+(Im p)³|error| for ∂_s = (2z)⁻¹∂_z, each at rel_tol/2. The bank calls it at a
+tenth of the tier's bank tolerance (`gw.response_bank._GROUP_RULE_MARGIN`):
+the derived rule's error is uniform at its certificate over the whole
+transition interval, and the shared-pole construction amplifies it (Na 8³
+map 0: eqp moves 1.17, 0.43 and 0.04 meV against a 10⁻¹⁰ reference at
+group tolerances 10⁻⁸, 10⁻⁹ and 10⁻¹⁰).
+
+**It is the Σ box problem.** With D = p − d the targets are −1/D and 1/D² on
+the horizontal segment {p − d} at height Im p, and T = it maps
+e^{−(d−r)T} to e^{itD} up to the pole factor e^{it(p−r)}. So the poles of one
+height form one thin box [min Re p − hi, max Re p − lo] × {Im p}, and the Σ
+box rules of [minimax quadrature §7](minimax-quadrature.md#7-σ-denominator-box-rules)
+apply unchanged in their node formulas.
+
+**Families.** The group's levels split into families, each on the smallest
+box holding its levels:
+
+- sign-definite levels (Re D of one sign, e.g. imaginary samples on a gapped
+  system): the elliptic sector rule (time-Ritz times of the rotated box,
+  `laplace_ritz.place_times`);
+- crossing levels: the bent contour.
+
+A second candidate splits off the crossing levels whose narrow side lies
+within one height (a high imaginary sample on a metal, −lo < Im z): they lie
+in an open sector too and take the sector rule, keeping the highest such
+levels whose rung-0 times hold 0 ≤ Re T ≤ β. The builder tries the candidates
+in order of their rung-0 node union (a formula of the boxes) and takes the
+first whose ladders certify: the split wins on Fe (188 against 228 nodes) and
+is the only one that certifies a 320 eV level on the 1 keV Fe interval; the
+merged partition wins on Na (144 against 165). A sign-definite or peak-narrow
+level inside the bent contour's box pays the line's Nyquist density at that
+box's lowest height. The node set is the union of the families' sets; every
+node is one Green pair for every member.
+
+**Three additions to the Σ bent contour**, each a formula, because the bank's
+tolerance (5·10⁻⁹ against Σ's 10⁻⁴) and its ds rows expose what Σ's rule
+leaves out:
+
+- nodes at ε = tol/ln(4/tol): the ds target's time density is s·e^{isD}, one
+  horizon factor larger than the value's;
+- ⌈(c + ln(1/ε))/2⌉ Gauss–Legendre nodes on the leg [0, −ic/m]: there the
+  narrow side grows as e^{cu}, which the geometric grading toward 0 does not
+  resolve below 10⁻⁸;
+- on a tall box (height ratio H), ⌈γS(H − 1)/π⌉ Gauss–Legendre nodes on the
+  decaying image axis [0, −iS], S = (L + c)/(max(1 − m/B₀, 0.05)B₀): its
+  members turn their phase through S(H − 1) radians there.
+
+The bend is c = 6 (capped by the tall-box leg phase as in Σ): the executor
+admits a term mass of 5000, and e⁶ leaves the least-squares cancellation a
+factor of ten, as Σ's c = 4 sits under its cap of 83.
+
+**Node count.** With η the crossing box's lowest height, m and M its narrow
+and wide half-widths in η, L = ln(1/ε) and Λ = ln(4/ε), the crossing family
+costs the Σ line count 1 + γI/2π (the I table of minimax quadrature §7) plus
+⌈ln(max(Mc/m, 2))L/π²⌉ leg, two ⌈ln(16R)(L + c)/π²⌉ image sets and the three
+additions above. On a complete-basis interval the box is saturated
+(M > mΛ/c), and
+
+$$
+N_C\approx\frac{\gamma\,m\,\Lambda^2}{4\pi c}+\mathcal O\!\left(\ln\frac{M}{m}\,L\right),
+\qquad m=\frac{\max\operatorname{Re}z-lo}{\eta},
+$$
+
+linear in the narrow side, logarithmic in the span: Fe's 1 keV interval
+enters only through ln(M/m). The sign-definite family costs the extremal-length
+law of §7, O(ln(span/η)·ln(1/ε)).
+
+**Weights and certificate.** Nothing but the weights is solved: one linear
+least-squares solve per pole height on the union (value and ds as two right
+sides, columns scaled to unit maximum, ridge 0.005·tol per term; columns dead
+below e⁻⁴⁰·ε on that level are left out). The certificate evaluates each
+level's segment at six points per half wave of the union's largest |t| and
+refines every local maximum by golden-section search; a level passes when
+value and ds sups are ≤ tol and the term mass Im p·Σ|c e^{−(d−r)T}| ≤ 5000.
+Admissibility is exact: |Re T|(hi − lo) ≤ 3 on growth-side times (no Green
+factor grows past e³) and Re T ≤ β under a metal's occupation envelope
+min(1, e^{βd}); an inadmissible rung is skipped. A family whose levels fail
+climbs its fixed ladder (sector: six rungs; bent contour: c, c/2, c/4 with six
+margin rungs each), and the union is refit. A group whose ladders run out, or
+whose union exceeds `RESPONSE_NODE_CAPACITY` = 768, refuses as
+`GATE response_rule_certificate`; no group is split and nothing is searched.
+

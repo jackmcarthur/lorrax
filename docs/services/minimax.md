@@ -83,22 +83,25 @@ derivatives are with respect to s = z². No rule sees band masks, occupations
 or response arrays, and none certifies W or Σ accuracy.
 
 * **`response_group_rules(lo_ry, hi_ry, z_ry, *, rel_tol=1e-8, previous=None,
-  decay_rate=0)`** (the shared-pole bank). A stacked Hankel shift pencil
-  proposes complex Laplace times shared by every forward (z) and reverse
-  (−z̄) pole of a sample group; linear projection fits 1/(d − p) and
-  1/(d − p)² on those nodes. Each node is one Green-pair evaluation A(t):
-  forward rows use exp[−(d − reference)t], reverse rows use conj(A(t)). A
-  group whose shared fit fails is halved down to single samples. Each rule
-  has `members`, `t[RESPONSE_NODE_CAPACITY]` (384; one pencil holds
-  `RESPONSE_RULE_CAPACITY = 192`), `value`/`derivative` of shape
-  `[members, 2, 384]`, `count`, `sampled_error`, `coefficient_mass` and
-  `reference_ry`; zero coefficients mark inactive slots. Errors are sampled,
-  not proven. A positive `decay_rate` bounds occupation products by
-  min(1, e^{decay_rate·d}) and restricts 0 ≤ Re t ≤ decay_rate. `previous`
-  rules with matching members are tried first. The build runs every loaded
-  OpenBLAS at 16 threads (the pin of `analytic_box_rule`): the pencil's QR,
-  SVD and least squares pick different times at different thread counts, and
-  the shared-pole W poles inherit them.
+  decay_rate=0)`** (the shared-pole bank). Derived complex times shared by
+  every forward (z) and reverse (−z̄) pole of a sample group: in D = p − d
+  each pole height is a thin Σ denominator box, the sign-definite levels take
+  one elliptic sector rule and the crossing levels one bent contour (the node
+  formulas of `analytic_box.node_ladder`'s families, plus a Gauss leg and
+  tall-box image-phase nodes); linear least squares per height gives the
+  1/(d − p) and 1/(d − p)² weights, and an evaluation certificate per height
+  passes value and ds at rel_tol/2. Each node is one Green-pair evaluation
+  A(t): forward rows use exp[−(d − reference)t], reverse rows use conj(A(t)).
+  A family that fails climbs its fixed ladder; nothing is split or searched,
+  and a group that does not certify refuses as `GATE
+  response_rule_certificate`. The rule has `members`,
+  `t[RESPONSE_NODE_CAPACITY]` (768), `value`/`derivative` of shape
+  `[members, 2, 768]`, `count`, `sampled_error` (the certified sups),
+  `coefficient_mass`, `reference_ry` and `rungs`; zero coefficients mark
+  inactive slots. A positive `decay_rate` admits only Re t ≤ decay_rate;
+  growth-side times keep |Re t|(hi − lo) ≤ 3. `previous` rules with matching
+  members are re-certified on their times first. Builds run at the pinned 16
+  BLAS threads. [Derivation and node count](../theory/response-laplace.md#grouped-response-rules).
 * **`response_laplace_rule(delta_lo_ry, delta_hi_ry, z_ry, *, rel_tol=1e-8,
   previous=None, domain_pad_ry=0, ordered=False, reference_ry=None)`** (remote
   noncrossing cells). Elliptic decay rates, a small Lyapunov solve and a
