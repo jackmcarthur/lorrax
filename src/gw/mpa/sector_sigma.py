@@ -81,14 +81,24 @@ def _w_contraction(mesh_xy, grid, nq, mc, nt_n, kcarrier, layout, tables):
     the same ordered-residue convention as the full-q endpoint contraction.
     Every quadratic operand retains P(None,'x','y').
     """
-    from distrib_la import gemm_plan
+    from distrib_la import gemm_plan, panel_matmul
+    from gw.greens_function_kernel import green_panel_bytes
     from symmetry_maps import q_negation_index, unfold_operator_from_load_tables
     from .sigma import _shared_pole_weights, _shared_pole_contract
     key = _static_key((mesh_xy, grid, nq, mc, nt_n, kcarrier, layout, tables))
     if key in _W_CONTRACTIONS:
         return _W_CONTRACTIONS[key]
-    gemm = gemm_plan(mesh_xy, m=mc, n=nt_n, k=kcarrier, nq=nq,
-                     dtype=np.complex128, layout=layout)
+    if layout == 'face':
+        # The output's full-q tile is already resident. Its byte extent
+        # bounds a useful panel; cap it at this rank's endpoint footprint
+        # so the quadratic pole factors remain distributed over all P.
+        factor_bytes = 16*nq*kcarrier*(mc+nt_n)//mesh_xy.size
+        panel = min(factor_bytes, green_panel_bytes(
+            n_rows=int(np.prod(grid)), m=mc, n=nt_n, mesh=mesh_xy))
+        gemm = partial(panel_matmul, mesh=mesh_xy, panel_bytes=panel)
+    else:
+        gemm = gemm_plan(mesh_xy, m=mc, n=nt_n, k=kcarrier, nq=nq,
+                         dtype=np.complex128, layout=layout)
     minus = jnp.asarray(q_negation_index(grid))
     anti = bool(np.any(tables.trs))
 
@@ -245,7 +255,9 @@ def sector_synthesis(readers, headers, bases, families, frequencies, meta, mesh_
     def place(value,spec):
         return _placer(mesh_xy,spec)(value)
     face_bytes=16*nq*kcarrier*(m*nc+n*nt)//mesh_xy.size
-    native=_native_workspace(mesh_xy,(((nq,m*nc,kcarrier),(nq,kcarrier,n*nt)),))
+    # Production factors use face panels, whose allocations enter AOT peak
+    # accounting. They do not call the native distributed GEMM.
+    native=0
     workspace=2*face_bytes+native
     # K scales with the centroid count: replicating its columns would retain
     # quadratic factors on only sqrt(P) ranks. Keep both face layouts on all
