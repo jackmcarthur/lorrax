@@ -996,8 +996,8 @@ def parse_support_sites(text):
     if not text:
         return None
     parts = text.split('|')
-    if len(parts) != 2:
-        raise ValueError(f"GATE shared_pole_support_sites: got: {text!r}; want: '<line eV list> | <imaginary eV list>'; why: the override replaces both ladders or neither")
+    if len(parts) not in (2, 3):
+        raise ValueError(f"GATE shared_pole_support_sites: got: {text!r}; want: '<line eV list> | <imaginary eV list> [| <re@im eV list>]'; why: the override replaces both ladders or neither")
 
     def sites(raw, name, floor, minimum):
         try:
@@ -1018,9 +1018,26 @@ def parse_support_sites(text):
         raise ValueError(f"GATE shared_pole_support_sites: got: imaginary site {imaginary[0]} eV; want: > 0; why: the imaginary ladder is geometric")
     # repr round-trips a double exactly, so the canonical text that enters
     # recipe_hash is the geometry the stream samples, to the last bit.
+    # Optional third field: extra fitted line-role supports at their own height,
+    # "re@im" in eV (Re >= 0, Im > 0); they never move the held midpoints.
+    off_axis = []
+    for token in (parts[2].replace(',', ' ').split() if len(parts) == 3 else ()):
+        re_ev, sep, im_ev = token.partition('@')
+        try:
+            point = (float(re_ev), float(im_ev)) if sep else None
+        except ValueError:
+            point = None
+        if point is None or not all(map(math.isfinite, point)) or point[0] < 0.0 or point[1] <= 0.0:
+            raise ValueError(f"GATE shared_pole_support_sites: got: {token!r} off-axis site; want: re@im eV with re >= 0, im > 0; why: a support off the causal quadrant has no bank evaluation")
+        off_axis.append(point)
+    if len(parts) == 3 and not off_axis:
+        raise ValueError(f"GATE shared_pole_support_sites: got: empty off-axis field in {text!r}; want: at least one re@im site; why: an empty field is a typo")
     canonical = (','.join(repr(v) for v in line) + '|'
                  + ','.join(repr(v) for v in imaginary))
-    return {'line_ev': line, 'imaginary_ev': imaginary, 'text': canonical}
+    if off_axis:
+        canonical += '|' + ','.join(f'{r!r}@{i!r}' for r, i in off_axis)
+    return {'line_ev': line, 'imaginary_ev': imaginary, 'off_axis_ev': off_axis,
+            'text': canonical}
 
 
 def imaginary_sample_count(kappa, tier, recipe=shared_real_pole_v1_r3b):
@@ -1230,6 +1247,8 @@ def resolve_shared_pole_recipe(config, wfns, meta, *, mesh_xy, print_fn,
         add(e, height, 'line', False)
     for i, u in enumerate(imaginary):
         add(0.0, u, 'imaginary', False)
+    for re_ev, im_ev in (override or {}).get('off_axis_ev', ()):
+        add(re_ev, im_ev, 'line', False)
     for i, e in enumerate(held_line):
         j = held_pairs[i]
         add(e, height, 'held_line', True, [j, j+1])
@@ -1252,6 +1271,13 @@ def resolve_shared_pole_recipe(config, wfns, meta, *, mesh_xy, print_fn,
         version = RECIPE_VERSION + '+support_sites'
         table = hashlib.sha256(
             (RECIPE_HASH + '|' + override['text']).encode()).hexdigest()
+    budget_fraction = policy.get('pole_budget_fraction')
+    budget_override = float(getattr(config.sigma, 'w_pole_budget_fraction', 0.0) or 0.0)
+    if budget_override > 0.0:
+        # A different pole budget is a different model: fold it into the identity.
+        budget_fraction = budget_override
+        version += '+pole_budget'
+        table = hashlib.sha256((table + '|pole_budget_fraction=' + repr(budget_override)).encode()).hexdigest()
     if sector_treatment is not None:
         version += '+sector_treatment'
         treatment_identity = {key: sector_treatment[key] for key in (
@@ -1295,8 +1321,9 @@ def resolve_shared_pole_recipe(config, wfns, meta, *, mesh_xy, print_fn,
         'infinity_width': math.ceil(n * policy['infinity_width_fraction']),
         'line_direction_cap': (math.ceil(n * policy['line_direction_cap_fraction'])
                                if 'line_direction_cap_fraction' in policy else None),
-        'pole_budget': (math.ceil(n * policy['pole_budget_fraction'])
-                        if 'pole_budget_fraction' in policy else None),
+        'pole_budget': (math.ceil(n * budget_fraction)
+                        if budget_fraction is not None else None),
+        'pole_budget_fraction': budget_fraction,
         'multiplet_relative_tolerance': recipe['multiplet_relative_tolerance'],
         'bank_rule_tolerance': policy['bank_rule_tolerance'],
         'moment_convention': recipe['moment_convention'], 'census': dict(census),
@@ -1318,7 +1345,7 @@ def resolve_shared_pole_recipe(config, wfns, meta, *, mesh_xy, print_fn,
         'top': 'L=omega_p+3.5 eV',
         'line': 'production: 18 fitted supports less the imaginary count, quantiles of the band-structure crossing density; relaxed 8 endpoints',
         'line_direction_cap': 'production ceil(n/16) right singular directions per line support (whole multiplets); relaxed none',
-        'pole_budget': 'production ceil(1.8 n) retained Gram directions per parent (largest first); relaxed none',
+        'pole_budget': 'production ceil(f n), f = 1.8 or sigma_w_pole_budget_fraction, retained Gram directions per parent (largest first); relaxed none',
         'imaginary': 'log-spaced u_min..u_max; round(log(16*(u_max/u_min)^2)*log(4000)/(2*pi^2)), min2; tier width ceil(f*n)',
         'held_line': 'adjacent-support midpoint nearest 25%/65% of the line interval; lower-index tie',
         'held_imaginary': 'geometric midpoint of first/last adjacent imaginary pair',
