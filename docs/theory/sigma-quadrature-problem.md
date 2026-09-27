@@ -187,6 +187,11 @@ the peak already dominates.
 
 ## 7. The rule and its node laws
 
+A [sampled reciprocal rank bound](sigma-quadrature-rank-bound.md) gives a
+necessary count for any complex exponential sum on a fixed certified box.
+It distinguishes per-window pair cost from globally shared times and does
+not assume real, uniform or optimized nodes.
+
 `build_uniform_rule(box, ε)` discretizes 1/d = −i∫₀^∞ e^{itd} dt along a ray
 t = s e^{−iθ}. The angle θ is scanned over the interval where every member
 decays on the box, and the smallest numerical rank wins: symmetric crossing
