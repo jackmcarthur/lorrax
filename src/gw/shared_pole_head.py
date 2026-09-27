@@ -43,6 +43,8 @@ ordered interband tensor is checked in ``tests/test_head_direct_ordered.py``.
 from types import SimpleNamespace
 from functools import lru_cache
 
+import sys
+
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -256,6 +258,17 @@ def build_shared_pole_head(handle, header, V_q, wfns, meta, config, *,
     if full:
         del args, b, poles, counts
     ledger.live_stages = ambient
+    if jax.process_index() == 0 and samples:
+        origin = min(range(len(points)), key=lambda i: abs(points[i]))
+        s0 = samples[origin]
+        print(f"  shared-pole head: origin sample z={complex(points[origin]):.6g} Ry, "
+              f"W^c={complex(s0.wcoul0) - complex(s0.vc0):.9g} Ry bohr^3 "
+              f"(<v>={complex(s0.vc0).real:.9g})", file=sys.stderr, flush=True)
+        if getattr(s0, "S_cart", None) is not None:
+            _S = np.real(np.asarray(s0.S_cart))
+            print("  shared-pole head: origin interband 8 pi qhat.S.qhat principal = "
+                  + "/".join(f"{x:.6g}" for x in 8.0 * np.pi * np.linalg.eigvalsh(0.5 * (_S + _S.T))),
+                  file=sys.stderr, flush=True)
     head = fit_head_samples(samples[:len(z)], z, int(config.mpa.n_poles),
         model="qsgw_schur_"+config.mpa.pole_solver if full else "dft_direct_"+config.mpa.pole_solver,
         solve=config.mpa.pole_solver, occupation_state=occupation_state)

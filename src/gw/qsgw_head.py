@@ -1365,14 +1365,17 @@ def _head_wing_interband_weight(
     )
 
 
-def _s_tensor_kernel(mesh: Mesh, *, nb_logical: int) -> Callable:
-    key = ("head_s", id(mesh), int(nb_logical))
+def _s_tensor_kernel(mesh: Mesh, *, nb_logical: int,
+                     metal_split: bool = False) -> Callable:
+    key = (("head_s", id(mesh), int(nb_logical)) if not metal_split
+           else ("head_s_metal", id(mesh), int(nb_logical)))
     hit = _KERNEL_CACHE.get(key)
     if hit is not None:
         return hit
     ax_x, ax_y = _mesh_xy(mesh)
 
-    def _local(v_local, e_bra, e_ket, f_bra, f_ket, omegas, prefactor, eta):
+    def _local(v_local, e_bra, e_ket, f_bra, f_ket, omegas, prefactor, eta,
+               *split):
         nx, ny = v_local.shape[-2:]
         ix = jax.lax.axis_index(ax_x) * nx + jnp.arange(nx)
         iy = jax.lax.axis_index(ax_y) * ny + jnp.arange(ny)
@@ -1384,6 +1387,14 @@ def _s_tensor_kernel(mesh: Mesh, *, nb_logical: int) -> Callable:
         # so filtering on f_v-f_c>0 would not implement Adler-Wiser.  A pair
         # inside one multiplet is intraband content (``_interband_weight``).
         transition = logical & (dE >= TOL_DEGENERACY_RY)
+        keep = None
+        if metal_split:
+            # A metal keeps 1 - phi of each pair here; its Fermi-surface share
+            # phi (``fermi_surface.intraband_pair_fraction``) goes to D.
+            from gw.fermi_surface import intraband_pair_fraction
+            d_x, d_y, w_x, w_y, moment = split
+            keep = 1.0 - intraband_pair_fraction(
+                v_local, dE, d_x, d_y, w_x, w_y, moment, TOL_DEGENERACY_RY)
 
         def _one(omega):
             z = omega + 1j * eta
@@ -1392,6 +1403,8 @@ def _s_tensor_kernel(mesh: Mesh, *, nb_logical: int) -> Callable:
                 _interband_weight(dE, f_diff, z, prefactor),
                 jnp.asarray(0.0 + 0.0j, dtype=jnp.complex128),
             )
+            if keep is not None:
+                weight = weight * keep
             local = jnp.einsum(
                 "akij,kij,bkij->ab", jnp.conj(v_local), weight, v_local, optimize=True
             )
@@ -1431,6 +1444,8 @@ def _s_tensor_kernel(mesh: Mesh, *, nb_logical: int) -> Callable:
         return out_blocks.reshape(
             n_padded, n_vertex, n_vertex)[:n_omega]
 
+    split_specs = ((P(None, None, "x"), P(None, None, "y"), P(None, "x"),
+                    P(None, "y"), P(None, None)) if metal_split else ())
     sm = shard_map(
         _local,
         mesh=mesh,
@@ -1443,7 +1458,7 @@ def _s_tensor_kernel(mesh: Mesh, *, nb_logical: int) -> Callable:
             P(None),
             P(),
             P(),
-        ),
+        ) + split_specs,
         out_specs=P(None, None, None),
         check_vma=False,
     )
@@ -2216,36 +2231,62 @@ def _static_wing_transport(mesh: Mesh) -> Callable:
     return kernel
 
 
-def _drude_tensor_kernel(mesh: Mesh, *, nb_logical: int) -> Callable:
-    """Compile the Fermi-surface velocity contraction once per band shape."""
-    key = ("head_drude", id(mesh), int(nb_logical))
+def _drude_tensor_kernel(mesh: Mesh, *, nb_logical: int,
+                         metal_split: bool = False) -> Callable:
+    """Compile the Fermi-surface velocity contraction once per band shape.
+
+    With ``metal_split`` each pair enters with its Fermi-surface share
+    ``phi`` of ``fermi_surface.intraband_pair_fraction`` (the S kernel keeps
+    ``1 - phi``), and the kernel also returns each state's intraband
+    velocity spread ``sum_{m != n} phi_nm Re(v_nm^* v_nm^T)``,
+    ``(nk, nb, 3, 3)`` sharded over x (``FermiSurfaceIntraband`` splits its
+    atoms with it).
+    """
+    key = ("head_drude", id(mesh), int(nb_logical), bool(metal_split))
     hit = _KERNEL_CACHE.get(key)
     if hit is not None:
         return hit
     ax_x, ax_y = _mesh_xy(mesh)
 
-    def _local(v_local, e_x, e_y, s_x, s_y, prefactor):
+    def _local(v_local, e_x, e_y, s_x, s_y, prefactor, *split):
         nx, ny = v_local.shape[-2:]
         ix = jax.lax.axis_index(ax_x) * nx + jnp.arange(nx)
         iy = jax.lax.axis_index(ax_y) * ny + jnp.arange(ny)
         logical = ((ix[:, None] < nb_logical)
                    & (iy[None, :] < nb_logical))[None, :, :]
-        multiplet = logical & (
-            jnp.abs(e_x[:, :, None] - e_y[:, None, :]) < TOL_DEGENERACY_RY)
-        weight = jnp.where(
-            multiplet, 0.5 * (s_x[:, :, None] + s_y[:, None, :]), 0.0)
+        if metal_split:
+            from gw.fermi_surface import intraband_pair_fraction
+            d_x, d_y, moment = split
+            share = jnp.where(logical, intraband_pair_fraction(
+                v_local, e_x[:, :, None] - e_y[:, None, :], d_x, d_y,
+                s_x, s_y, moment, TOL_DEGENERACY_RY), 0.0)
+        else:
+            share = (logical & (
+                jnp.abs(e_x[:, :, None] - e_y[:, None, :]) < TOL_DEGENERACY_RY)
+            ).astype(jnp.float64)
+        weight = share * 0.5 * (s_x[:, :, None] + s_y[:, None, :])
         local = prefactor * jnp.einsum(
             "akij,kij,bkij->ab",
             jnp.conj(v_local), weight, v_local, optimize=True,
         )
-        return jax.lax.psum(local, (ax_x, ax_y))
+        tensor = jax.lax.psum(local, (ax_x, ax_y))
+        if not metal_split:
+            return tensor
+        partner = jnp.where((ix[:, None] != iy[None, :])[None], share, 0.0)
+        spread = jnp.real(jnp.einsum(
+            "akij,kij,bkij->kiab", jnp.conj(v_local),
+            partner.astype(v_local.dtype), v_local, optimize=True))
+        return tensor, jax.lax.psum(spread, ax_y)
 
+    split_specs = ((P(None, None, "x"), P(None, None, "y"), P(None, None))
+                   if metal_split else ())
     sm = shard_map(
         _local,
         mesh=mesh,
         in_specs=(P(None, None, "x", "y"), P(None, "x"), P(None, "y"),
-                  P(None, "x"), P(None, "y"), P()),
-        out_specs=P(None, None),
+                  P(None, "x"), P(None, "y"), P()) + split_specs,
+        out_specs=((P(None, None), P(None, "x", None, None)) if metal_split
+                   else P(None, None)),
         check_vma=False,
     )
     kernel = jax.jit(sm)
@@ -2264,6 +2305,8 @@ def head_drude_tensor_sharded(
     nk_tot: int,
     nspin: int,
     nspinor: int,
+    pair_split: "MetalPairSplit | None" = None,
+    with_spread: bool = False,
 ):
     r"""Return the ab-initio Drude tensor ``D_ab`` in Rydberg units.
 
@@ -2283,7 +2326,15 @@ def head_drude_tensor_sharded(
     excluded from the interband ``S``.  The velocities include the nonlocal
     pseudopotential; in QSGW they are rotated into the current basis.  No
     fitted or experimental plasma frequency enters.
+
+    ``pair_split`` (every metallic production head) weights every pair by
+    its Fermi-surface share ``phi`` (``fermi_surface.intraband_pair_fraction``;
+    an exact multiplet has ``phi = 1``);
+    ``with_spread`` also returns each state's intraband velocity spread
+    ``(nk, nb_storage, 3, 3)`` on the host.
     """
+    if with_spread and pair_split is None:
+        raise ValueError("the intraband velocity spread needs a metal pair split")
     v = jnp.asarray(velocity_cart, dtype=jnp.complex128)
     surface = jnp.asarray(surface_weight_kn, dtype=jnp.float64)
     energies = jnp.asarray(energies_kn_ry, dtype=jnp.float64)
@@ -2307,10 +2358,84 @@ def head_drude_tensor_sharded(
         * float(max(int(nspin), 1))
         * float(max(int(nspinor), 1))
     )
-    tensor = _drude_tensor_kernel(mesh, nb_logical=int(nb_logical))(
+    split = () if pair_split is None else pair_split.operands(v)
+    result = _drude_tensor_kernel(
+        mesh, nb_logical=int(nb_logical), metal_split=pair_split is not None)(
         v, energies, energies, surface, surface,
-        jnp.asarray(pref, dtype=jnp.complex128))
-    return 0.5 * (tensor + jnp.conj(tensor.T))
+        jnp.asarray(pref, dtype=jnp.complex128), *split)
+    tensor = result if pair_split is None else result[0]
+    tensor = 0.5 * (tensor + jnp.conj(tensor.T))
+    if not with_spread:
+        return tensor
+    from common.collectives import gather_to_host
+    return tensor, np.asarray(gather_to_host(result[1]))
+
+
+@dataclass(frozen=True)
+class MetalPairSplit:
+    """Inputs of the metallic head's Taylor-radius pair split.
+
+    ``diag`` is the real diagonal velocity ``(3, nk, nb_storage)`` on the
+    padded head band carrier, replicated (``O(nk nb)`` bytes); ``moment`` the
+    q = 0 cell's Coulomb-weighted second moment ``(3, 3)`` in bohr^-2
+    (``vcoul.minibz_coulomb_moment``).  Every metallic head kernel (``S``,
+    ``D`` and the four-current interband tensor) splits its pairs with
+    ``fermi_surface.intraband_pair_fraction`` on these two objects.
+    """
+
+    diag: jax.Array
+    moment: np.ndarray
+    diag_host: np.ndarray
+
+    def operands(self, v_padded):
+        if int(self.diag.shape[-1]) != int(v_padded.shape[-1]):
+            raise ValueError(
+                "metal pair split was built on a different band carrier: "
+                f"{self.diag.shape} vs velocity {v_padded.shape}")
+        return (self.diag, self.diag,
+                jnp.asarray(self.moment, dtype=jnp.float64))
+
+    def host_diag(self, nb_logical):
+        return self.diag_host[:, :, :int(nb_logical)]
+
+
+def _velocity_diagonal_kernel(mesh: Mesh) -> Callable:
+    key = ("head_velocity_diag", id(mesh))
+    hit = _KERNEL_CACHE.get(key)
+    if hit is not None:
+        return hit
+    ax_x, ax_y = _mesh_xy(mesh)
+
+    def _local(v_local):
+        nx, ny = v_local.shape[-2:]
+        ix = jax.lax.axis_index(ax_x) * nx + jnp.arange(nx)
+        iy = jax.lax.axis_index(ax_y) * ny + jnp.arange(ny)
+        eq = (ix[:, None] == iy[None, :])[None, None]
+        return jax.lax.psum(
+            jnp.real(jnp.sum(jnp.where(eq, v_local, 0.0), axis=-1)), ax_y)
+
+    kernel = jax.jit(shard_map(
+        _local, mesh=mesh, in_specs=(P(None, None, "x", "y"),),
+        out_specs=P(None, None, "x"), check_vma=False))
+    _KERNEL_CACHE[key] = kernel
+    return kernel
+
+
+def metal_pair_split(velocity_cart, *, mesh: Mesh, bvec_cart, kgrid):
+    """Build the :class:`MetalPairSplit` of one velocity operator."""
+    from ffi import _services
+    _services.ensure_on_path()
+    from vcoul import minibz_coulomb_moment
+    from common.collectives import gather_to_host
+
+    v = jnp.asarray(velocity_cart, dtype=jnp.complex128)
+    e = jnp.zeros(v.shape[1:3], dtype=jnp.float64)
+    v, _e, _f, _s = _pad_head_band_manifold(v, e, e, e, mesh=mesh)
+    diag = np.asarray(gather_to_host(_velocity_diagonal_kernel(mesh)(v)))
+    moment = minibz_coulomb_moment(np.asarray(bvec_cart, dtype=np.float64),
+                                   tuple(int(n) for n in kgrid))
+    replicated = device_put_process_local(diag, NamedSharding(mesh, P()))
+    return MetalPairSplit(diag=replicated, moment=moment, diag_host=diag)
 
 
 def head_s_tensor_sharded(
@@ -2327,6 +2452,7 @@ def head_s_tensor_sharded(
     nspinor: int,
     eta_ry: float = 0.0,
     surface_weight_kn=None,
+    pair_split: "MetalPairSplit | None" = None,
 ):
     """Build interband plus optional Drude ``S(omega)`` from current velocity.
 
@@ -2389,7 +2515,13 @@ def head_s_tensor_sharded(
         * float(max(int(nspin), 1))
         * float(max(int(nspinor), 1))
     )
-    interband = _s_tensor_kernel(mesh, nb_logical=int(nb_logical))(
+    metal_split = include_surface and pair_split is not None
+    split = ()
+    if metal_split:
+        d_x, d_y, moment = pair_split.operands(v)
+        split = (d_x, d_y, surface, surface, moment)
+    interband = _s_tensor_kernel(mesh, nb_logical=int(nb_logical),
+                                 metal_split=metal_split)(
         v,
         e,
         e,
@@ -2398,6 +2530,7 @@ def head_s_tensor_sharded(
         omega,
         jnp.asarray(pref, dtype=jnp.complex128),
         jnp.asarray(float(eta_ry), dtype=jnp.float64),
+        *split,
     )
     if not include_surface:
         return interband
@@ -2416,6 +2549,7 @@ def head_s_tensor_sharded(
         nk_tot=int(nk_tot),
         nspin=int(nspin),
         nspinor=int(nspinor),
+        pair_split=pair_split,
     )
     z = omega + 1j * jnp.asarray(float(eta_ry), dtype=jnp.float64)
     # The exact static metallic limit is Thomas-Fermi, not the omega->0
@@ -2803,6 +2937,10 @@ class IterationHeadResponse:
     #: convention, ``omega_p(qhat)^2 = 8 pi qhat.D.qhat`` (Ry^2).  Reported
     #: by the drivers so every metallic log carries its plasma frequency.
     drude_tensor: np.ndarray | None = None
+    #: Metals only: the velocity atoms of the intraband response
+    #: (``fermi_surface.FermiSurfaceIntraband``), whose moments are ``N0``
+    #: and ``drude_tensor``; the q = 0 cell evaluates it at every sample.
+    fermi_surface: object | None = None
 
 
 @dataclass(frozen=True)
@@ -2827,11 +2965,44 @@ class IterationHeadSamples:
 
 
 def _metal_intraband(response):
-    """``(N0, D)`` of a metallic head response, ``None`` on an insulator."""
+    """The metallic head's intraband atoms, ``None`` on an insulator."""
     if response.drude_tensor is None:
         return None
-    return (float(response.static_kappa2_bohr2) / (8.0 * np.pi),
-            np.asarray(response.drude_tensor))
+    if response.fermi_surface is None:
+        raise ValueError(
+            "metallic head response carries a Drude tensor but no Fermi-surface "
+            "intraband model (gw.qsgw_head.metal_intraband_model)")
+    return response.fermi_surface
+
+
+def metal_intraband_model(velocity_cart, surface_weight_kn, energies_kn_ry, *,
+                          mesh: Mesh, nb_logical: int, cell_volume: float,
+                          nk_tot: int, nspin: int, nspinor: int, bvec_cart,
+                          kgrid):
+    """``(D, atoms, split)`` of a metal: one pair split, one surface table.
+
+    The split (:func:`metal_pair_split`) is built once from this velocity and
+    handed to every kernel that cuts pairs; ``D`` and each state's intraband
+    velocity spread come from the same masked contraction, and the atoms
+    (``fermi_surface.FermiSurfaceIntraband``) reproduce ``Re D`` and ``N0``.
+    """
+    from gw.fermi_surface import FermiSurfaceIntraband
+
+    split = metal_pair_split(velocity_cart, mesh=mesh, bvec_cart=bvec_cart,
+                             kgrid=kgrid)
+    surface = jnp.asarray(surface_weight_kn, dtype=jnp.float64)
+    drude, spread = head_drude_tensor_sharded(
+        velocity_cart, surface, energies_kn_ry, mesh=mesh,
+        nb_logical=int(nb_logical), cell_volume=float(cell_volume),
+        nk_tot=int(nk_tot), nspin=int(nspin), nspinor=int(nspinor),
+        pair_split=split, with_spread=True)
+    drude = np.asarray(drude)
+    capacity = 2.0 / (float(max(int(nspin), 1)) * float(max(int(nspinor), 1)))
+    atoms = FermiSurfaceIntraband(
+        np.asarray(surface_weight_kn, dtype=np.float64)[:, :int(nb_logical)],
+        split.diag_host, spread, drude, capacity=capacity,
+        cell_volume=float(cell_volume), nk_tot=int(nk_tot))
+    return drude, atoms, split
 
 
 def _fold_static_kappa2(response, W_body_gamma, cell_volume, mesh):
@@ -3080,47 +3251,6 @@ def finalize_iteration_head_samples(
     )
 
 
-def lindhard_intraband_chi(q_cart, z, drude_tensor, dos):
-    r"""Finite-q intraband density response of the q = 0 cell, in Ry.
-
-    .. math::
-        \chi_{\rm intra}(\mathbf q, z) = -N_0\, L(s), \qquad
-        L(s) = 1 - \frac{s}{2}\ln\frac{s+1}{s-1}, \qquad
-        s = \frac{z}{\bar v(\hat q)\,|q|}, \quad
-        \bar v(\hat q)^2 = \frac{3\,\hat q\cdot D\cdot\hat q}{N_0},
-
-    the Lindhard function of a Fermi surface with the head's own density of
-    states ``N0`` (per Ry per bohr^3) and Drude tensor ``D``.  It carries
-    both limits exactly for any Fermi surface: ``chi -> q.D.q / z^2`` for
-    ``|z| >> vbar q`` (the q-first Drude head) and ``chi -> -N0`` at
-    ``z = 0`` (Thomas-Fermi, ``kappa^2 = 8 pi N0``), and it is the exact
-    Lindhard crossover between them for a spherical one.  Inside the q = 0
-    cell ``|z| < vbar q`` is the particle-hole continuum; there the q-first
-    Drude form screens perfectly where the response is static.  Retarded in
-    the upper half plane, conjugate below.
-    """
-    q = jnp.asarray(q_cart, dtype=jnp.float64)
-    D = jnp.real(jnp.asarray(drude_tensor)).astype(jnp.float64)
-    qDq = jnp.einsum("qa,ab,qb->q", q, D, q)
-    z = complex(z)
-    lower = z.imag < 0.0
-    zz = z.conjugate() if lower else z
-    s = zz / jnp.sqrt(3.0 * jnp.maximum(qDq, 1.0e-300) / float(dos))
-    big = jnp.abs(s) > 20.0
-    s_big = jnp.where(big, s, 20.0 + 0.0j)
-    inv2 = 1.0 / (s_big * s_big)
-    series = jnp.zeros_like(s_big)
-    term = inv2
-    for n in range(1, 13):
-        series = series - term / (2 * n + 1)
-        term = term * inv2
-    s_small = jnp.where(big, 0.0 + 0.0j, s)
-    direct = 1.0 - 0.5 * s_small * (
-        jnp.log(s_small + 1.0) - jnp.log(s_small - 1.0))
-    chi = -float(dos) * jnp.where(big, series, direct)
-    return jnp.conj(chi) if lower else chi
-
-
 def head_samples_from_s(
     S_cart_omega,
     omegas_ry,
@@ -3135,13 +3265,14 @@ def head_samples_from_s(
 ) -> tuple[object, ...]:
     """Convert replicated 3x3 S tensors to mini-BZ averaged head samples.
 
-    ``intraband = (dos, D)`` marks a metal whose ``S`` carries the q-first
-    Drude term ``D / z^2``: at every sample that term is exchanged for the
-    finite-q intraband response of the cell
-    (:func:`lindhard_intraband_chi`), which is Thomas-Fermi at ``z = 0``
-    and Drude for ``|z| >> v_F q``.  ``static_kappa2_bohr2`` names the one
-    exact-zero row that is NOT taken from ``S``: the full head's folded
-    Thomas-Fermi slot.
+    ``intraband`` (``fermi_surface.FermiSurfaceIntraband``) marks a metal
+    whose ``S`` carries the q-first Drude term ``D / z^2``: at every sample
+    that term is exchanged for the anisotropic Fermi-surface Lindhard
+    response of the cell, evaluated at each q sample, which is Thomas-Fermi
+    at ``z = 0`` and Drude for ``|z| >> q u``
+    (``docs/theory/metal-q0-head.md``).  ``static_kappa2_bohr2`` names the
+    one exact-zero row whose Thomas-Fermi term is the full head's folded
+    kappa^2; on a metal that row keeps its interband ``S(0)``.
     """
     from gw.head_correction import (
         HeadResponseKind, HeadSample, resolve_head_override)
@@ -3157,6 +3288,7 @@ def head_samples_from_s(
     # RESOURCE_EXHAUSTED at this line.
     mem_probe("qsgw_head.head_samples_from_s.pre_readback")
     S_host = np.asarray(S_cart_omega, dtype=np.complex128)
+    intraband_drude = None if intraband is None else intraband.drude_tensor
     omegas = tuple(complex(z) for z in np.asarray(omegas_ry).reshape(-1))
     if S_host.shape != (len(omegas), 3, 3):
         raise ValueError(
@@ -3178,20 +3310,26 @@ def head_samples_from_s(
             static_kappa2_bohr2 is not None and abs(z) <= 1.0e-14)
         extra_chi = None
         if intraband is not None and not is_static_metal:
-            dos, drude = intraband
-            drude = np.asarray(drude, dtype=np.complex128)
+            drude = np.asarray(intraband_drude, dtype=np.complex128)
             if abs(z) > 1.0e-15:
                 S = S - drude / (z * z)
-            extra_chi = (lambda q, _z=z, _D=drude, _n=float(dos):
-                         lindhard_intraband_chi(q, _z, _D, _n))
+            extra_chi = (lambda q, _z=z, _atoms=intraband:
+                         _atoms.density_response(q, _z))
+        elif is_static_metal and intraband is not None:
+            # The folded static slot is the z -> 0+ limit of the same cell
+            # function: interband q.S(0).q (epsilon_inf) plus Thomas-Fermi,
+            # <8 pi / (q.eps_inf.q + kappa^2)>, never <8 pi/(q^2+kappa^2)>.
+            extra_chi = (lambda q, _n=float(static_kappa2_bohr2) / (8.0 * np.pi):
+                         jnp.full((q.shape[0],), -_n, dtype=jnp.complex128))
+        static_from_s = is_static_metal and intraband is not None
         vc0, wc0 = compute_q0_averages(
             wfn,
             jnp.asarray(0.0, dtype=jnp.float64),
             meta,
-            S_cart=None if is_static_metal else S,
+            S_cart=(S if (static_from_s or not is_static_metal) else None),
             static_kappa2=(
                 jnp.asarray(static_kappa2_bohr2, dtype=jnp.float64)
-                if is_static_metal else None),
+                if is_static_metal and not static_from_s else None),
             analytic_sphere=bool(getattr(
                 config.head, "analytic_q0_sphere",
                 config.head.head_minibz_average)),
@@ -3208,7 +3346,7 @@ def head_samples_from_s(
                     else f"{source_prefix}(omega={z} Ry)"
                 ),
                 omega=z,
-                S_cart=None if is_static_metal else S,
+                S_cart=(S if (static_from_s or not is_static_metal) else None),
                 response_kind=kind,
             )
         )
@@ -3304,6 +3442,13 @@ def build_iteration_head_response(
     # Physical state multiplicity belongs to the source WFN.  A
     # kinetic-balance lift changes only the stored spinor representation.
     normalization_nspinor = int(meta.nspinor_wfnfile)
+    drude_tensor = fermi_surface = pair_split = None
+    if surface_weight_qp_kn is not None:
+        drude_tensor, fermi_surface, pair_split = metal_intraband_model(
+            v_qp, surface_weight_qp_kn, energies_qp_kn_ry, mesh=mesh,
+            nb_logical=nb_logical, cell_volume=float(meta.cell_volume),
+            nk_tot=int(meta.nk_tot), nspin=int(wfn.nspin),
+            nspinor=normalization_nspinor, bvec_cart=bvec_cart, kgrid=kgrid)
     S = head_s_tensor_sharded(
         v_qp,
         energies_qp_kn_ry,
@@ -3317,6 +3462,7 @@ def build_iteration_head_response(
         nspinor=normalization_nspinor,
         eta_ry=resolved_eta_ry,
         surface_weight_kn=surface_weight_qp_kn,
+        pair_split=pair_split,
     )
     Y_x = Z_y = None
     static_Y_x = static_Z_y = static_chi_body_gamma = None
@@ -3338,13 +3484,7 @@ def build_iteration_head_response(
     omegas = tuple(complex(z) for z in np.asarray(omegas_ry).reshape(-1))
     static_Y_x = static_Z_y = static_chi_body_gamma = None
     static_kappa2 = None
-    drude_tensor = None
     if surface_weight_qp_kn is not None:
-        drude_tensor = np.asarray(head_drude_tensor_sharded(
-            v_qp, surface_weight_qp_kn, energies_qp_kn_ry, mesh=mesh,
-            nb_logical=nb_logical,
-            cell_volume=float(meta.cell_volume), nk_tot=int(meta.nk_tot),
-            nspin=int(wfn.nspin), nspinor=normalization_nspinor))
         (static_kappa2, static_Y_x, static_Z_y,
          static_chi_body_gamma) = _metal_static_head(
             wfns_qp, surface_weight_qp_kn, occupation_state, omegas,
@@ -3365,6 +3505,7 @@ def build_iteration_head_response(
         ],
         efermi_ry=float(efermi_ry),
         drude_tensor=drude_tensor,
+        fermi_surface=fermi_surface,
     )
 
 
@@ -3506,7 +3647,7 @@ def build_dft_head_response(
     surface = None
     static_kappa2 = None
     static_Y_x = static_Z_y = static_chi_body_gamma = None
-    drude_tensor = None
+    drude_tensor = fermi_surface = pair_split = None
     if occupation_state is not None:
         if b0 != 0:
             raise ValueError(
@@ -3525,11 +3666,12 @@ def build_dft_head_response(
             float(occupation_state.mu_ry), sym=wfn.symmetry(),
             kgrid=wfn.kgrid)
         surface = jnp.asarray(surface_host)
-        drude_tensor = np.asarray(head_drude_tensor_sharded(
+        drude_tensor, fermi_surface, pair_split = metal_intraband_model(
             jnp.asarray(velocity_cart), surface, energies, mesh=mesh,
             nb_logical=nb_logical, cell_volume=float(meta.cell_volume),
             nk_tot=int(meta.nk_tot), nspin=int(wfn.nspin),
-            nspinor=normalization_nspinor))
+            nspinor=normalization_nspinor, bvec_cart=_head_bvec(wfn),
+            kgrid=wfn.kgrid)
         (static_kappa2, static_Y_x, static_Z_y,
          static_chi_body_gamma) = _metal_static_head(
             wfns if wings else None, surface, occupation_state, z,
@@ -3540,7 +3682,8 @@ def build_dft_head_response(
         mesh=mesh, nb_logical=nb_logical,
         cell_volume=float(meta.cell_volume), nk_tot=int(meta.nk_tot),
         nspin=int(wfn.nspin), nspinor=normalization_nspinor,
-        eta_ry=float(config.head.wcoul0_eta), surface_weight_kn=surface)
+        eta_ry=float(config.head.wcoul0_eta), surface_weight_kn=surface,
+        pair_split=pair_split)
     Y_x = Z_y = None
     if wings:
         Y_x, Z_y = head_wings_sharded(
@@ -3575,7 +3718,16 @@ def build_dft_head_response(
         static_chi_body_gamma=static_chi_body_gamma,
         sigma_energies_ry=e_host[:, :int(meta.nb_sigma)],
         sigma_occupations=np.asarray(occupations)[:, :int(meta.nb_sigma)],
-        efermi_ry=efermi, drude_tensor=drude_tensor)
+        efermi_ry=efermi, drude_tensor=drude_tensor,
+        fermi_surface=fermi_surface)
+
+
+def _head_bvec(wfn):
+    """Cartesian reciprocal basis (rows b_i, bohr^-1) of the Coulomb service."""
+    from ffi import _services
+    _services.ensure_on_path()
+    from vcoul import CoulombGeometry
+    return np.asarray(CoulombGeometry.from_wfn(wfn).bvec, dtype=np.float64)
 
 
 def metal_head_summary(response: IterationHeadResponse, occupation_state) -> str:
@@ -3591,7 +3743,9 @@ def metal_head_summary(response: IterationHeadResponse, occupation_state) -> str
         f"{occupation_state.occ_hash}) plus the tetrahedron Fermi-surface "
         "intraband term; omega_p principal = "
         + "/".join(f"{x * RYD_TO_EV:.4f}" for x in wp) + " eV"
-        + ("" if kappa is None else f"; kappa_TF^2 = {kappa:.6f} bohr^-2"))
+        + ("" if kappa is None else f"; kappa_TF^2 = {kappa:.6f} bohr^-2")
+        + ("" if response.fermi_surface is None
+           else "; intraband cell: " + response.fermi_surface.describe()))
 
 
 def build_iteration_head_samples(

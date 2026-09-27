@@ -425,16 +425,22 @@ def test_dft_velocity_rotates_into_the_qp_basis_every_iteration():
         cell_volume=float(fx.meta.cell_volume), nk_tot=fx.nk,
         nspin=int(fx.wfn.nspin), nspinor=int(fx.meta.nspinor),
         eta_ry=0.05, surface_weight_kn=jnp.asarray(fx.surface))
+    # A metal head cuts its pairs with the split of its own (rotated) velocity.
+    split = qsgw_head.metal_pair_split(rotated, mesh=_mesh(),
+                                       bvec_cart=fx.bvec, kgrid=_KGRID)
     ref = np.asarray(head_s_tensor_sharded(
         rotated, jnp.asarray(fx.energies), jnp.asarray(fx.occupations),
-        fx.omegas, **common))
+        fx.omegas, pair_split=split, **common))
     np.testing.assert_allclose(got, ref, rtol=1e-13, atol=1e-13)
 
     # ...and the rotation is load-bearing: the unrotated velocity gives a
     # different head on this fixture.
     unrotated = np.asarray(head_s_tensor_sharded(
         jnp.asarray(fx.velocity), jnp.asarray(fx.energies),
-        jnp.asarray(fx.occupations), fx.omegas, **common))
+        jnp.asarray(fx.occupations), fx.omegas,
+        pair_split=qsgw_head.metal_pair_split(
+            jnp.asarray(fx.velocity), mesh=_mesh(), bvec_cart=fx.bvec,
+            kgrid=_KGRID), **common))
     assert np.max(np.abs(got - unrotated)) > 1e-3
 
 

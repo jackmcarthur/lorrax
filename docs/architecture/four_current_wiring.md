@@ -433,7 +433,8 @@ driver entry.
 | `photon_sigma_sector_closure`, `photon_head_sigma_sector_closure` | `photon_sigma` | sector sums do not close on the total |
 | `sigma_lorentz_column_closure` | `file_io.sigma_output` | `sigCC + sigCT + sigTT` does not reproduce the displayed total |
 | (no id) packed Σ envelope | `sigma_dispatch` packed arms | see Stage 4 |
-| `photon_direct_head_{bulk,fd,bands,cubature,nonfinite}`, `photon_direct_degenerate_occupation` | `photon_direct_head` | SP-full direct head: not bulk, not FD, mismatched manifolds, broken cubature, or undefined first-order jets |
+| `photon_direct_head_{bulk,fd,bands,cubature,nonfinite}` | `photon_direct_head` | SP-full direct head: not bulk, not FD, mismatched manifolds, or broken cubature |
+| `metal_intraband_{spread,moments}` | `fermi_surface` | a metal head's velocity atoms do not reproduce its Drude tensor (the pair splits of `D` and of the atoms differ) |
 
 ## Memory invariants
 

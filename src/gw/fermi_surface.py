@@ -301,5 +301,218 @@ def metal_head_surface_weights(energies_kn, chemical_potential, *, sym, kgrid,
     return np.pad(weights, ((0, 0), (0, width - energies.shape[1])))
 
 
+#: Unit vertices of a regular tetrahedron: zero mean, (1/4) sum t t^T = I/3.
+_TETRAHEDRON_UNIT = np.asarray(
+    ((1.0, 1.0, 1.0), (1.0, -1.0, -1.0), (-1.0, 1.0, -1.0), (-1.0, -1.0, 1.0)),
+    dtype=np.float64) / np.sqrt(3.0)
+#: Atoms per scan block of the intraband response (bounds the (nq, block) temporary).
+_ATOM_BLOCK = 64
+
+
+def intraband_pair_fraction(v_local, delta_e, diag_bra, diag_ket, w_bra, w_ket,
+                            cell_moment, tol_ry):
+    r"""Fermi-surface share ``phi`` of each band pair of a metallic head tile.
+
+    A pair's first-order long-wavelength vertex is the small-q end of the
+    two-band overlap ``sin^2 theta(q)``, whose Pade form
+    ``(x/4)/(1 + x/2)``, ``x = [(q.dv)^2 + 4|q.v_nm|^2]/Delta^2``
+    (``dv = v_mm - v_nn``), is exact at both ends.  Read at the q = 0
+    cell's Coulomb-weighted second moment ``Q`` (``vcoul.minibz_coulomb_moment``),
+
+    .. math:: \phi=\frac{\epsilon^2}{\Delta^2+\epsilon^2},\qquad
+              \epsilon^2=\mathrm{tr}\,Q\,[\delta v\,\delta v^{\sf T}+4\,\mathrm{Re}\,v_{nm}^*v_{nm}^{\sf T}],
+
+    the interband tensor keeps ``1 - phi`` of the pair and the Fermi-surface
+    term takes ``phi``.  Only pairs with Fermi-surface weight
+    (``w_bra + w_ket > 0``) move; an exact degeneracy (``|Delta| < tol_ry``)
+    has ``phi = 1``.  On an insulator every weight vanishes and ``phi`` is the
+    degeneracy rule.  ``docs/theory/metal-q0-head.md`` section 2.
+
+    Shapes (one shard_map tile): ``v_local (3,nk,nx,ny)`` complex,
+    ``delta_e (nk,nx,ny)``, ``diag_bra (3,nk,nx)``, ``diag_ket (3,nk,ny)``,
+    ``w_bra (nk,nx)``, ``w_ket (nk,ny)``, ``cell_moment (3,3)``.
+    """
+    import jax.numpy as jnp
+
+    Q = jnp.asarray(cell_moment, jnp.float64)
+    dv = diag_ket[:, :, None, :] - diag_bra[:, :, :, None]
+    q_dv = jnp.einsum("ab,akxy,bkxy->kxy", Q, dv, dv)
+    q_v = jnp.real(jnp.einsum("ab,akxy,bkxy->kxy", Q.astype(v_local.dtype),
+                              jnp.conj(v_local), v_local))
+    extent = q_dv + 4.0 * q_v
+    delta2 = delta_e * delta_e
+    exact = jnp.abs(delta_e) < tol_ry
+    on_surface = (w_bra[:, :, None] + w_ket[:, None, :]) > 0.0
+    share = extent / jnp.where(exact, 1.0, delta2 + extent)
+    return jnp.where(exact, 1.0, jnp.where(on_surface, share, 0.0))
+
+
+def _intraband_blocks(weights, velocities):
+    """Pad atoms to whole scan blocks; a padded atom has zero weight and velocity."""
+    n = int(weights.shape[0])
+    blocks = max(1, -(-n // _ATOM_BLOCK))
+    pad = blocks * _ATOM_BLOCK - n
+    w = np.pad(np.asarray(weights, np.float64), (0, pad))
+    u = np.pad(np.asarray(velocities, np.float64), ((0, pad), (0, 0)))
+    return (w.reshape(blocks, _ATOM_BLOCK),
+            u.reshape(blocks, _ATOM_BLOCK, 3))
+
+
+def _atom_kernel(q, z, u):
+    """``g = x/(z-x)`` and ``dg/d(z^2) = -x/(2 z (z-x)^2)``, ``x = q.u``."""
+    import jax.numpy as jnp
+
+    x = (q @ u.T).astype(jnp.complex128)
+    moving = x != 0
+    denom = jnp.where(moving, z - x, 1.0 + 0.0j)
+    g = jnp.where(moving, x / denom, 0.0)
+    safe_z = jnp.where(z == 0, 1.0 + 0.0j, z)
+    dg = jnp.where(moving & (z != 0), -x / (2.0 * safe_z * denom * denom), 0.0)
+    return g, dg
+
+
+def _density_response(q, z, w_blocks, u_blocks):
+    import jax
+    import jax.numpy as jnp
+
+    def one(total, block):
+        w, u = block
+        g, _ = _atom_kernel(q, z, u)
+        return total + g @ w.astype(jnp.complex128), None
+
+    total, _ = jax.lax.scan(one, jnp.zeros(q.shape[0], jnp.complex128),
+                            (w_blocks, u_blocks), unroll=1)
+    return total
+
+
+def _four_current_response(q, z, w_blocks, u_blocks, halfalpha):
+    import jax
+    import jax.numpy as jnp
+
+    def contract(g, w, u):
+        gw = g * w[None, :]
+        cc = jnp.sum(gw, axis=1)
+        ct = halfalpha * (gw @ u)
+        tt = halfalpha ** 2 * jnp.einsum("qs,sa,sb->qab", gw, u, u)
+        out = jnp.zeros((q.shape[0], 4, 4), jnp.complex128)
+        out = out.at[:, 0, 0].set(cc)
+        out = out.at[:, 0, 1:].set(ct)
+        out = out.at[:, 1:, 0].set(ct)
+        return out.at[:, 1:, 1:].set(tt)
+
+    def one(total, block):
+        w, u = block
+        g, dg = _atom_kernel(q, z, u)
+        return (total[0] + contract(g, w, u), total[1] + contract(dg, w, u)), None
+
+    zero = jnp.zeros((q.shape[0], 4, 4), jnp.complex128)
+    total, _ = jax.lax.scan(one, (zero, zero), (w_blocks, u_blocks), unroll=1)
+    return total
+
+
+_DENSITY_PROGRAM = []
+
+
+def _density_program():
+    """The one jitted scalar intraband program (traced once per shape)."""
+    if not _DENSITY_PROGRAM:
+        import jax
+        _DENSITY_PROGRAM.append(jax.jit(_density_response))
+    return _DENSITY_PROGRAM[0]
+
+
+class FermiSurfaceIntraband:
+    r"""Velocity atoms of a metal's intraband (Fermi-surface) response.
+
+    ``Pi_intra^{IJ}(q,z) = sum_s W_s (q.u_s)/(z - q.u_s) gamma^I_s gamma^J_s``
+    with ``gamma_s = (1, (alpha/2) u_s)``: the anisotropic Lindhard function
+    of the computed bands (``docs/theory/metal-q0-head.md`` section 1).
+    ``W_s = C w_s/(Omega Nk)`` from the tetrahedron table, so
+    ``sum W = N0 = kappa_TF^2/(8 pi)``.  A state keeps ``u = Re v_nn``; a
+    state with intraband partners (a multiplet, or any pair with a Fermi-surface share)
+    splits into four atoms ``u + sqrt(3) L_s t_j`` of weight ``W_s/4`` with
+    ``L_s L_s^T = sum_{m != n} phi_nm Re(v_nm^* v_nm^T)``, its own degenerate
+    velocity spread.  That keeps the zeroth, first and second moments
+    exact state by state, so ``sum W u u^T`` is the Drude tensor of
+    ``gw.qsgw_head.head_drude_tensor_sharded`` and both limits hold:
+    ``-N0`` static, ``q.D.q/z^2`` for ``|z| >> q u``.  Both metallic heads
+    (``gw.qsgw_head``, ``gw.photon_direct_head``) take their intraband
+    response here.  Atoms are replicated: bytes ``O(4 N_FS)``.
+    """
+
+    def __init__(self, surface_kn, velocity_diag, spread_kn, drude_tensor, *,
+                 capacity, cell_volume, nk_tot):
+        surface = np.asarray(surface_kn, dtype=np.float64)
+        diag = np.asarray(velocity_diag, dtype=np.float64)
+        spread = np.asarray(spread_kn, dtype=np.float64)
+        nk, nb = surface.shape
+        if diag.shape[:2] != (3, nk) or diag.shape[2] < nb:
+            raise ValueError(
+                f"velocity diagonal {diag.shape} does not cover the surface table {surface.shape}")
+        if spread.shape[:2] != (nk, diag.shape[2]) or spread.shape[2:] != (3, 3):
+            raise ValueError(f"velocity spread {spread.shape} does not match ({nk},{diag.shape[2]},3,3)")
+        scale = float(capacity) / (float(nk_tot) * float(cell_volume))
+        k_idx, n_idx = np.nonzero(surface > 0.0)
+        weights = scale * surface[k_idx, n_idx]
+        velocity = diag[:, k_idx, n_idx].T
+        spread = 0.5 * (spread[k_idx, n_idx] + np.swapaxes(spread[k_idx, n_idx], 1, 2))
+        lam, vec = np.linalg.eigh(spread)
+        scale_d = max(float(np.max(np.abs(np.real(drude_tensor)))), 1e-300)
+        if lam.size and float(np.min(lam)) * float(np.max(weights, initial=0.0)) < -1e-9 * scale_d:
+            raise ValueError(
+                "GATE metal_intraband_spread: a state's intraband velocity spread is not "
+                f"positive semidefinite (min eigenvalue {float(np.min(lam)):.3e})")
+        factor = vec * np.sqrt(np.maximum(lam, 0.0))[:, None, :]
+        split = np.max(lam, axis=1, initial=0.0) > 0.0 if lam.size else np.zeros(0, bool)
+        atoms_w = [weights[~split]]
+        atoms_u = [velocity[~split]]
+        if np.any(split):
+            offsets = np.sqrt(3.0) * np.einsum("sab,jb->sja", factor[split], _TETRAHEDRON_UNIT)
+            atoms_w.append(np.repeat(weights[split] / 4.0, 4))
+            atoms_u.append((velocity[split][:, None, :] + offsets).reshape(-1, 3))
+        self.weights = np.concatenate(atoms_w)
+        self.velocities = np.concatenate(atoms_u)
+        self.n_states = int(weights.size)
+        self.n_split = int(np.count_nonzero(split))
+        self.dos = float(np.sum(self.weights))
+        self.drude_tensor = np.asarray(drude_tensor, dtype=np.complex128)
+        self.drude = np.real(self.drude_tensor)
+        moment = np.einsum("s,sa,sb->ab", self.weights, self.velocities, self.velocities)
+        error = float(np.max(np.abs(moment - self.drude)))
+        if error > 1e-8 * scale_d:
+            raise ValueError(
+                "GATE metal_intraband_moments: velocity atoms miss the Drude tensor by "
+                f"{error:.3e} (scale {scale_d:.3e}); the pair split of the atoms and of D differ")
+        self.moment_error = error
+        self._blocks = _intraband_blocks(self.weights, self.velocities)
+
+    def describe(self) -> str:
+        return (f"{self.n_states} Fermi-surface states, {self.n_split} split by their "
+                f"intraband partners, {self.weights.size} velocity atoms; "
+                f"|sum W u u - D| = {self.moment_error:.2e}")
+
+    def density_response(self, q_cart, z):
+        """Scalar ``chi_intra(q,z)`` at every row of ``q_cart (nq,3)``."""
+        import jax.numpy as jnp
+        return _density_program()(
+            jnp.asarray(q_cart, jnp.float64), jnp.asarray(complex(z), jnp.complex128),
+            jnp.asarray(self._blocks[0]), jnp.asarray(self._blocks[1]))
+
+    def device_operands(self):
+        """Replicated ``(w_blocks, u_blocks)`` for jitted callers."""
+        import jax.numpy as jnp
+        return jnp.asarray(self._blocks[0]), jnp.asarray(self._blocks[1])
+
+
+def four_current_intraband_response(q, z, w_blocks, u_blocks, halfalpha):
+    """``(Pi_intra, d Pi_intra / d z^2)``, each ``(nq,4,4)``, from device atoms.
+
+    Traceable (the caller jits); ``z = 0`` returns ``g = -1`` per moving atom
+    and a zero derivative.  See :class:`FermiSurfaceIntraband`.
+    """
+    return _four_current_response(q, z, w_blocks, u_blocks, halfalpha)
+
+
 __all__ = ["tetrahedron_delta_weights", "star_symmetrize_weights",
-           "metal_head_surface_weights"]
+           "metal_head_surface_weights", "intraband_pair_fraction",
+           "FermiSurfaceIntraband", "four_current_intraband_response"]

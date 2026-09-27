@@ -436,9 +436,11 @@ first order in the long-wavelength vertex:
   $(\alpha_{FS}/2)v_{nm}$ (the dipole-velocity approximation of the raw
   Breit current). Their $6\times6$ tensors are built on two-axis-sharded
   band pairs, with the same normalization as the CC block of $S$.
-* **Intraband (FD).** At $z\ne0$ the Drude tensor $D_{ab}$ gives CC
-  $=qDq/z^2$ and CT $=(\alpha_{FS}/2)\,qD/z$. At $z=0$ the finite-$q$ limit
-  is Thomas–Fermi, CC $=-N(E_F)$, with TT $=-(\alpha_{FS}/2)^2D$.
+* **Intraband.** The anisotropic Fermi-surface Lindhard $4\times4$ block of
+  the velocity atoms, from the scalar head's tetrahedron table, pair split
+  and Drude tensor: Drude CC $=qDq/z^2$, CT $=(\alpha_{FS}/2)\,qD/z$ for
+  $|z|\gg qu$, and at $z=0$ Thomas–Fermi CC $=-N(E_F)$ with
+  TT $=-(\alpha_{FS}/2)^2D$ ([metal head](metal-q0-head.md)).
 * **Contact.** The bank's Fermi–Dirac contact $C$ is projected on the four
   uniform vertices.
 
@@ -460,12 +462,11 @@ replicate spread and the maximum Dyson residual. Only $6\times6$ and
 $4\times4$ objects are replicated; band pairs stay sharded over both mesh
 axes.
 
-The charge row is the first-order expansion in $q\cdot v/\Delta$. It
-degrades when a fractional-occupation pair lies closer than $|q\cdot v|$
-on the Γ cell. Near-degenerate directed pairs ($|\Delta|\le10^{-8}$ Ry)
-with unequal occupations refuse, because their charge jet is undefined
-(`GATE photon_direct_degenerate_occupation`). The model folds no wings and
-no microscopic local fields.
+The charge row is the first-order expansion in $q\cdot v/\Delta$. Each pair
+enters with $1-\phi$ of its tensor; its Fermi-surface share $\phi$ keeps
+only its Hall (antisymmetric) part here ([metal head §2](metal-q0-head.md)),
+so the charge jets stay bounded as $\Delta\to0$. The model folds no wings
+and no microscopic local fields.
 
 ## 6. Code owners
 
