@@ -36,7 +36,7 @@ service through its door and nowhere else.
 **The drivers**, the modules a physicist opens: `gw/gw_jax.py` ·
 `bse/bse_jax.py` · `bse/exciton_bands.py` · `bandstructure/htransform.py` ·
 `gw/kin_ion_io.py` · `gw/downfold_cli.py` · `centroid/kmeans_cli.py` ·
-`psp/{run_nscf,run_sternheimer,get_DFT_mtxels,get_dipole_mtxels,kpm_dos,orbital_magnetization,finite_q_head_interp}.py` ·
+`psp/{run_nscf,run_dense_h,run_sternheimer,get_DFT_mtxels,get_dipole_mtxels,kpm_dos,orbital_magnetization,finite_q_head_interp}.py` ·
 `bse/{bse_feast,bse_w_exact,bse_kpm}.py` · `gw/eqp_bgw.py` ·
 `postprocess/rotate_wfn_to_qp.py`.
 
@@ -50,7 +50,7 @@ service through its door and nowhere else.
 that concrete: a driver imports none of `jax.sharding`,
 `jax.experimental.shard_map`, `multihost_utils`, `mesh_utils` or `jax._src`,
 nor `shard_map` / `Mesh` / `NamedSharding` / `PartitionSpec` / `make_mesh`
-off `jax`, at module scope or lazily. Sixteen drivers carry none. Four carry
+off `jax`, at module scope or lazily. Seventeen drivers carry none. Four carry
 one import each, and `tests/test_layering.py::_DRIVER_PLUMBING_BUDGET` pins
 that count:
 
