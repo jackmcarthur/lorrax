@@ -3887,10 +3887,14 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
     if tail_fit is not None:
         from .scissor import qsgw_out_of_range_energies
         from .shared_pole_recipe import active_band_mask
+        # The rotating metallic branch follows the same rigid Fermi shift
+        # as rotating valence. EQP2's identity law for crossing bands does
+        # not apply to dynamic SC; only deep rotating states keep DFT below.
+        rigid_kn = (valence_kn if scissor_classes is None else
+                    valence_kn | crossing_kn)
         target = qsgw_out_of_range_energies(
-            e_dft_fit_ev, tail_fit, valence_kn,
-            fermi_displacement_ev=_mu_ev-float(inputs.wfn.efermi)*RYD_TO_EV,
-            crossing_mask_kn=(None if scissor_classes is None else crossing_kn)) / RYD_TO_EV
+            e_dft_fit_ev, tail_fit, rigid_kn,
+            fermi_displacement_ev=_mu_ev-float(inputs.wfn.efermi)*RYD_TO_EV) / RYD_TO_EV
         active = active_band_mask(np.asarray(inputs.e_dft_active_kn_ry), float(inputs.wfn.efermi))
         target = np.where(active[None, :], target, np.asarray(e_dft_fit))
     H_qp_dft_new = rotating_band_hamiltonian(

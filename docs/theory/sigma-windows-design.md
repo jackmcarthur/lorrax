@@ -28,13 +28,15 @@ The SC equations and artifact contract remain in [self consistency](../self_cons
 | Use the provable insulator short side, including poles down to zero. | A trend in the gap is not a certificate. | Prior MoS2 estimate +61 pairs; remeasure at epsilon 1e-4. |
 | Use four times the initial far state, pole and damping extents. | Far-side growth costs logarithmically and cannot enlarge the crossing edge. | Prior estimate +8–9 pairs; remeasure with derived rules. |
 | Default epsilon = 1e-4 on every W tier; use QUADWIRE's derived rules. | One explicit accuracy target and one rule owner. | Measured per-deck totals decide the 500/1000 limits. |
+| Route rotating Fermi-crossing bands through the existing rigid Fermi shift. | They need a rotating diagonal law; this keeps their bandwidth without a new fit parameter. | Zero pairs; map 0 is unchanged. |
 | Retain the existing scissor fit behind its existing API. | SPCOST B has map-0 comparisons but no converged fit verdict; window geometry does not choose the fit form. | No quadrature pairs. |
 
 ## Hamiltonian
 
 Protected bands P receive full QSGW Sigma and full mixing. Every other
 loaded band belongs to R. The R diagonal is the existing conduction scissor,
-the current Fermi displacement for ordinary valence, or DFT for deep bands.
+the current Fermi displacement for ordinary valence and Fermi-crossing bands,
+or DFT for deep bands.
 There are no R–R off-diagonal entries. A P–R entry uses the Hermitian part
 of Sigma_ij(E_i), i in P. P–P uses the usual Hermitian endpoint half-sum.
 The fixed DFT partition is transported through the current eigenvectors;
