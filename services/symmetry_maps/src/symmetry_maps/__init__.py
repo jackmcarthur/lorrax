@@ -271,6 +271,7 @@ from symmetry_maps.qirr_store import (
     write_qirr_tensor,
 )
 from symmetry_maps.orbit_syms import (
+    lattice_grid_point_group,
     CLOSURE_TOL_DEFAULT,
     FULL_BZ_CONSEQUENCE,
     CentroidClosureVerdict,

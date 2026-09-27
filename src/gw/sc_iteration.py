@@ -1108,10 +1108,12 @@ def _solve_head_occupations(
     # the plasma frequency from 6.09 to 7.68 eV).  One owner builds the
     # star-covariant tetrahedron table for every metallic head route.
     from .fermi_surface import metal_head_surface_weights
+    from .qsgw_head import _head_bvec
 
     surface_kn = jnp.asarray(metal_head_surface_weights(
         np.asarray(energies[:, :nb_logical], dtype=np.float64), mu_ry,
-        sym=inputs.sym, kgrid=inputs.wfn.kgrid, nb_storage=nb_storage),
+        sym=inputs.sym, kgrid=inputs.wfn.kgrid,
+        bvec_cart=_head_bvec(inputs.wfn), nb_storage=nb_storage),
         dtype=jnp.float64)
     return occ_state, surface_kn
 

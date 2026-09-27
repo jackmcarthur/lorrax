@@ -84,6 +84,28 @@ def _metric_preserving_integer_rotations(avec: np.ndarray) -> list[np.ndarray]:
     return rotations
 
 
+def lattice_grid_point_group(bvec, kgrid) -> np.ndarray:
+    """Reciprocal-lattice point group acting on integer grid offsets.
+
+    ``bvec`` contains Cartesian reciprocal basis vectors as rows. A
+    fractional reciprocal action M preserves B B.T; on grid offsets it is
+    D M D^-1, D=diag(kgrid). Keep only its integer (grid-preserving) rows.
+    This geometry-only group defines quadrature partitions. It grants no
+    symmetry to a wavefunction, density or operator, and is independent of
+    which operations a WFN stores.
+    """
+    grid = np.asarray(kgrid)
+    if (grid.shape != (3,) or grid.dtype.kind not in 'iu'
+            or np.any(grid <= 0)):
+        raise ValueError('kgrid must contain three positive integers')
+    rows = []
+    for rotation in _metric_preserving_integer_rotations(bvec):
+        numerator = grid[:, None] * rotation
+        if np.all(numerator % grid[None, :] == 0):
+            rows.append(numerator // grid[None, :])
+    return np.asarray(rows, dtype=np.int32)
+
+
 def _canonical_fractional_translation(tau: np.ndarray, tol: float) -> np.ndarray:
     """Canonical representative of a translation modulo lattice vectors."""
     out = np.mod(np.asarray(tau, dtype=np.float64), 1.0)

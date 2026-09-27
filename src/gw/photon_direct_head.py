@@ -463,7 +463,8 @@ def build_direct_photon_head(velocity_cart, wfns, occupation_state, *,
     from gw.fermi_surface import metal_head_surface_weights
     from gw.qsgw_head import metal_intraband_model
     surface = metal_head_surface_weights(
-        e, float(occupation_state.mu_ry), sym=wfn.symmetry(), kgrid=wfn.kgrid)
+        e, float(occupation_state.mu_ry), sym=wfn.symmetry(), kgrid=wfn.kgrid,
+        bvec_cart=geometry.bvec)
     stored = int(velocity_cart.shape[-1])
     pad = ((0, 0), (0, stored - nb))
     drude, atoms, split = metal_intraband_model(

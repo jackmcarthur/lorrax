@@ -103,7 +103,8 @@ def test_free_electron_drude_tensor_and_thomas_fermi(nspinor):
         v[:, :, 0, 0] = v[:, :, 1, 1] = velocity[:, :, 0, 0]
         velocity = v
     kf = 0.3 * 2.0 * np.pi / a
-    surface = metal_head_surface_weights(energy, kf * kf, sym=sym, kgrid=(n, n, n))
+    surface = metal_head_surface_weights(energy, kf * kf, sym=sym, kgrid=(n, n, n),
+                                        bvec_cart=np.eye(3))
     volume = a ** 3
     drude = np.asarray(head_drude_tensor_sharded(
         jnp.asarray(velocity, dtype=jnp.complex128), jnp.asarray(surface),
@@ -182,7 +183,8 @@ def test_dft_head_takes_the_fixed_n_state_and_its_drude_term(monkeypatch, tmp_pa
         config=config, wings=False, occupation_state=fx.state)
 
     surface = metal_head_surface_weights(
-        fx.energies, fx.state.mu_ry, sym=fx.sym, kgrid=(fx.n,) * 3)
+        fx.energies, fx.state.mu_ry, sym=fx.sym, kgrid=(fx.n,) * 3,
+        bvec_cart=np.eye(3))
     common = dict(mesh=_mesh(), nb_logical=3, cell_volume=fx.a ** 3,
                   nk_tot=fx.n ** 3, nspin=1, nspinor=1)
     split = qsgw_head.metal_pair_split(
@@ -381,5 +383,4 @@ def test_minibz_coulomb_moment_cubic_cell():
     # Between the inscribed and circumscribed spheres' R^2/9.
     half = np.pi / 4.0
     assert half ** 2 / 9.0 < q4[0, 0] < 3.0 * half ** 2 / 9.0
-
 
