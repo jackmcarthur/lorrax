@@ -3,9 +3,8 @@
 The branch weight is ``f`` on the occupied side and ``1 - f`` on the empty
 side.  ``gw.efermi.band_in_occupation_window`` keeps it iff ``|w| >= 1e-5``:
 for Fermi-Dirac, ``|E - mu| <= 11.5 kBT``.  The one-shot and every SC map
-use the same predicate, so identical occupations give identical branch
-support. These tests do not bound the complete GW energy change or certify
-bitwise equality of the full map. The retired deck key
+use the same predicate, so the same occupations give the same branch
+support.  The retired deck key
 ``occupation_window_threshold`` (a 0.005 weight floor by default) refuses.
 """
 
