@@ -110,6 +110,7 @@ nav:
       - Mesh-padded axes: architecture/padding.md
       - Fractional chi0 response face: architecture/fractional_chi0_response_face.md
       - Shared-pole W (implementation): architecture/shared_pole_model.md
+      - Plane-wave GW stage graph: architecture/plane_wave_gw_stages.md
   - Services:
       - distrib_la (distributed dense linalg): services/distrib_la.md
       - symmetry_maps (k-grid reduction, stars, unfolds): services/symmetry_maps.md
