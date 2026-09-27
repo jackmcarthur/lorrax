@@ -1166,11 +1166,14 @@ def _sc_padded_box_spec(spec, eta, *, plan_index):
     """
     a_lo, a_hi, gamma_lo, gamma_hi = spec["pole_extent"]
     frac = _SC_POLE_PAD_FRACTION
-    open_above = not np.isfinite(spec.get("pole_bounds", (0.0, 0.0))[1])
+    # Poles are re-selected on every map like states: a pole padded past the
+    # window's own selector bound belongs to the neighbouring window.
+    pole_lo, pole_hi = spec.get("pole_bounds", (-np.inf, np.inf))
+    open_above = not np.isfinite(pole_hi)
     padded_poles = [(
-        a_lo - frac * abs(a_lo),
+        max(a_lo - frac * abs(a_lo), pole_lo),
         (_SC_FAR_POLE_FACTOR * a_hi if open_above and a_hi > 0.0
-         else a_hi + frac * abs(a_hi)),
+         else min(a_hi + frac * abs(a_hi), pole_hi)),
         max(0.0, gamma_lo - frac * abs(gamma_lo)),
         gamma_hi + frac * abs(gamma_hi),
     )]
@@ -1217,14 +1220,17 @@ def _sc_padded_box_spec(spec, eta, *, plan_index):
     elif spec["kind"] == "sign_definite_positive":
         box[0] = max(box[0], _SC_ZERO_SIDE_CAP * spec["box"][0])
     # Membership can change without appreciable state motion: a state just
-    # outside a tail at map 0 can enter it at map 1. Cover the selector's
-    # guaranteed sign gap, not the accidental nearest initial sample.
+    # outside a tail at map 0 can enter it at map 1. Where the selectors
+    # guarantee a sign gap, every member on every map has |d| >= gap, so the
+    # zero-side edge is the gap itself: covered, and never dragged closer by
+    # the pads (the Fe 4^3 SC cond:pole_tail pads reached -0.11 eta against a
+    # 1.5 eta selector gap, an ill-conditioned box the rule refused, 2026-09-27).
     if "sc_selector_gap_ry" in spec:
         gap = float(spec["sc_selector_gap_ry"])
         if spec["kind"] == "sign_definite_negative":
-            box[1] = max(box[1], -gap)
+            box[1] = max(-gap, spec["box"][1])
         elif spec["kind"] == "sign_definite_positive":
-            box[0] = min(box[0], gap)
+            box[0] = min(gap, spec["box"][0])
     padded = dict(spec)
     padded["box"] = tuple(float(value) for value in box)
     padded["kind"] = (
