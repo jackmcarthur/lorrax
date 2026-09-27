@@ -3709,7 +3709,7 @@ def build_dft_head_response(
             surface_host = metal_head_surface_weights(
                 np.asarray(energies, dtype=np.float64),
                 float(occupation_state.mu_ry), sym=wfn.symmetry(),
-                kgrid=wfn.kgrid)
+                kgrid=wfn.kgrid, bvec_cart=_head_bvec(wfn))
             surface = jnp.asarray(surface_host)
             drude_tensor, fermi_surface, pair_split = metal_intraband_model(
                 jnp.asarray(velocity_cart), surface, energies, mesh=mesh,
