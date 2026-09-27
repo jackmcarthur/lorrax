@@ -49,8 +49,10 @@ must resolve to ``mathdx`` on this mesh (asserted, TASTE 30).
 5. The BSE W-term doors (rank-local, k-grids 8x8x1 and 3x2x4, K and n_c off the pads):
    ``make_local_kconv_klead_outer`` (both ``conj_r``) against the dense sum and the
    chain it replaces (XLA einsum, then ``make_local_kconv_klead``), and
-   ``make_local_kconv_klead_outer_decode`` against the dense sum and decode.  Red
-   twins: V_R rolled by one k, the decode's Pc rolled by one k.
+   ``make_local_kconv_klead_outer_decode`` against the dense sum and decode, also at
+   the ping-pong's step shapes (several two-pair steps with two c blocks; an odd last
+   pair; on A100 8x8x1 reads V from L2 and 3x2x4 stages it).  Red twins: V_R rolled
+   by one k, the decode's Pc rolled by one k.
 
 Parity 1e-13 (mathdx vs plan route), 1e-12 vs dense sums; each red twin
 must miss by more than 1e-3.
@@ -490,6 +492,22 @@ def outer_cases(mesh, rng):
         Ared = _local(apply(on(L), on(R), on(V), prep(on(np.roll(Pc, 1, 0))), conj_r=True))
         recs.append(dict(case="kconv_klead_outer_decode", kgrid=list(kg), n_c=n_c,
                          ref_decode_vs_numpy=_rel(A, ref_a), red_rolled_Pc=_rel(Ared, ref_a)))
+        # The ping-pong's step shapes (two groups, two banks): several two-pair steps with two c
+        # blocks and padded x/y blocks (na 2: the pairs of a step share a V tile), and an odd
+        # last pair on group 0 alone (na 1: the pairs of a step read different V tiles).
+        for na_, nb_, mx_, my_, K_, nc_ in ((2, 1, 20, 12, 8, 14), (1, 2, 24, 8, 5, 6)):
+            L_ = _crand(rng, nk, na_, mx_, K_)
+            R_ = _crand(rng, nk, K_, nb_, my_)
+            V_ = _crand(rng, mx_, my_, nk)
+            Pc_ = _crand(rng, nk, nc_, na_, mx_)
+            v3 = np.moveaxis(V_, -1, 0).reshape(kg + (mx_, my_))[:, :, :, None, :, None, :]
+            T_ = np.einsum("kaxK,kKby->kaxby", L_, np.conj(R_)).reshape(kg + (na_, mx_, nb_, my_))
+            u_ = _np3(_np3(T_, kg, 0, "ifftn", "ortho") * v3, kg, 0, "fftn", "ortho").reshape(nk, na_, mx_, nb_, my_)
+            ref_a = np.einsum("kctM,ktMsN->kcsN", np.conj(Pc_), u_)
+            A = _local(apply(on(L_), on(R_), on(V_), prep(on(Pc_)), conj_r=True))
+            Ared = _local(apply(on(L_), on(R_), on(np.roll(V_, 1, -1)), prep(on(Pc_)), conj_r=True))
+            recs.append(dict(case=f"kconv_klead_outer_decode_na{na_}_mx{mx_}_nc{nc_}", kgrid=list(kg), n_c=nc_,
+                             ref_decode_vs_numpy=_rel(A, ref_a), red_rolled_V=_rel(Ared, ref_a)))
     return recs
 
 
