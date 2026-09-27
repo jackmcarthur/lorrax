@@ -226,7 +226,28 @@ def _require_tile_carrier(
 # ---------------------------------------------------------------------------
 
 
+#: ``T_ab`` by (bvec, cell volume, sys_dim, kgrid).  It is pure geometry and
+#: the mini-BZ draw is seeded, so a hit is the array a recompute makes, bit
+#: for bit; the bispinor bank subtracts it at every SC map (0.8 s per map on
+#: Fe 4^3 before this table).  Callers get a copy.
+_TT_HEAD_TENSORS: dict = {}
+
+
 def _tt_head_tensor(
+    *, bvec: np.ndarray, cell_volume: float, sys_dim: int, kgrid,
+) -> np.ndarray:
+    """``T_ab = ⟨v(q) P^T_ab(q̂)⟩_mBZ`` at q=Γ, BARE units, computed once per geometry."""
+    key = (np.asarray(bvec, dtype=np.float64).tobytes(), float(cell_volume),
+           int(sys_dim), tuple(int(s) for s in kgrid))
+    held = _TT_HEAD_TENSORS.get(key)
+    if held is None:
+        held = _compute_tt_head_tensor(bvec=bvec, cell_volume=cell_volume,
+                                       sys_dim=sys_dim, kgrid=kgrid)
+        _TT_HEAD_TENSORS[key] = held
+    return held.copy()
+
+
+def _compute_tt_head_tensor(
     *, bvec: np.ndarray, cell_volume: float, sys_dim: int, kgrid,
 ) -> np.ndarray:
     """``T_ab = ⟨v(q) P^T_ab(q̂)⟩_mBZ`` at q=Γ, BARE units.
