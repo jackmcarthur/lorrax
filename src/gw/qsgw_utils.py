@@ -608,7 +608,7 @@ def _qsgw_build_kernel(mesh_xy: Mesh, *, replicated_output: bool):
             else P(None, "x", "y"))
 
         @jax.jit
-        def _kernel(sig_w, sig_x, ilo, ihi, wlo, whi):
+        def _kernel(sig_w, sig_x, ilo, ihi, wlo, whi, protected):
             # ilo/ihi/wlo/whi: (nk, nb) replicated; sig_w: (nω, nk, nb_m_X, nb_n_Y).
             # A[k, m, n] = Σ_c[idx[k, m], k, m, n] (interp at E_m(k))
             # B[k, m, n] = Σ_c[idx[k, n], k, m, n] (interp at E_n(k))
@@ -633,7 +633,9 @@ def _qsgw_build_kernel(mesh_xy: Mesh, *, replicated_output: bool):
             B_hi = jnp.take_along_axis(sig_w, ihi_n, axis=0)[0]
             B = wlo[:, None, :] * B_lo + whi[:, None, :] * B_hi
 
-            sigma_c = 0.5 * (A + B)
+            pm, pn = protected[:, :, None], protected[:, None, :]
+            # P-P: QSGW half-sum. P-R: both orientations at E_P before herm.
+            sigma_c = (pm * A + pn * B) / jnp.maximum(pm + pn, 1.)
 
             # Half-sum, then add static Σ_x.  Historical callers request a
             # replicated matrix before Hermitisation.  The fixed-Sigma evSC
@@ -659,7 +661,8 @@ def build_qsgw_sigma_xc(
     *,
     replicated_output: bool = True,
     band_axis=None,
-    out_of_grid: str = "cover",
+    out_of_grid: str = "clamp",
+    protected_kn=None,
 ) -> tuple[jax.Array, dict[str, float]]:
     """Build the static Hermitian QSGW Σ_xc[k, m, n].
 
@@ -773,10 +776,15 @@ def build_qsgw_sigma_xc(
     w_lo_j   = device_put_process_local(w_lo.astype(np.complex128), rep_2d)
     w_hi_j   = device_put_process_local(w_hi.astype(np.complex128), rep_2d)
 
+    protected = np.ones((nk, nb), float)
+    if protected_kn is not None:
+        protected.fill(0.)
+        protected[:, :logical_nb] = np.asarray(protected_kn, float)
+    protected_j = device_put_process_local(protected, rep_2d)
     sigma_xc_qsgw = _qsgw_build_kernel(
         mesh_xy, replicated_output=bool(replicated_output))(
         sigma_c_omega_ry, sigma_x_kij_ry,
-        idx_lo_j, idx_hi_j, w_lo_j, w_hi_j,
+        idx_lo_j, idx_hi_j, w_lo_j, w_hi_j, protected_j,
     )
     sigma_xc_qsgw.block_until_ready()
     if band_axis is not None and replicated_output:

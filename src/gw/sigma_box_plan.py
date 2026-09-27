@@ -1570,7 +1570,7 @@ def plan_sigma_windows(
             "fit_seconds": fit["seconds"],
             "sc_fixed_rule": frozen,
             "sc_fixed_padded_box_ry": (
-                list(fixed_rule_session["rules"][spec["name"]]["padded_box"])
+                list(fit["rule_box"])
                 if frozen else None),
         })
         if _resolve_uniform_rule_trace() and process_rank() == 0:
@@ -1625,8 +1625,8 @@ def plan_sigma_windows(
             "sc_state_edge_padding_fraction": fixed_receipt["pad_fraction"],
             "sc_plan_event": fixed_receipt["plan_event"],
             "sc_tau_capacity": int(fixed_receipt["tau_capacity"]),
-            "sc_pole_extent_padding_fraction": _SC_POLE_PAD_FRACTION,
-            "sc_far_pole_factor": _SC_FAR_POLE_FACTOR,
+            "sc_pole_extent_padding_fraction": 0.0,
+            "sc_far_pole_factor": 4.0,
             "sc_fixed_pole_support_ry": fixed_pole_support,
         })
     else:

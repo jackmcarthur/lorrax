@@ -35,8 +35,6 @@ def requested_states(sigma, frozen_core_bands, energy_relative_ev, required_kn,
     required = np.array(np.broadcast_to(np.asarray(required_kn, bool),
                                        np.shape(energy_relative_ev)))
     required[:, :int(frozen_core_bands)] = False
-    if active_n is not None:
-        required &= np.asarray(active_n, bool)[None, :]
     return required
 
 

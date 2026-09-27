@@ -780,7 +780,7 @@ def _oneshot_sampled_support(config, enk_dft, wfn, occupation_state,
 
     from .efermi import sigma_frame_mu_ev
     from .qp_support import plan_support_ev, requested_states
-    from .shared_pole_recipe import active_band_mask
+    from .band_partition import requested_band_mask
     e_ry = np.asarray(enk_dft, dtype=np.float64)
     metal = material_class == "metal" and occupation_state is not None
     mu_ev = sigma_frame_mu_ev(
@@ -791,7 +791,9 @@ def _oneshot_sampled_support(config, enk_dft, wfn, occupation_state,
     energy = e_ry * RYD_TO_EV - mu_ev
     states = requested_states(
         config.sigma, config.sc.frozen_core_bands, energy,
-        np.ones(e_ry.shape, dtype=bool), active_band_mask(e_ry, float(wfn.efermi)))
+        requested_band_mask(e_ry * RYD_TO_EV, n_occ=int(wfn.nelec),
+                            nval=config.nval, ncond=config.ncond,
+                            gap_ev=config.sigma.regularization_ev))
     grown, _ = plan_support_ev(config.sigma, requested, energy, states, 0)
     if grown.size == requested.size:
         return config
