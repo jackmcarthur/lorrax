@@ -1104,7 +1104,7 @@ def test_quadrature_deck_defaults_and_retired_sector_key(tmp_path):
     deck.write_text(_DECK)
     config = LorraxConfig.from_input_file(
         str(deck), print_fn=lambda *_args, **_kwargs: None)
-    assert config.sigma.quadrature_eps == 3.0e-5
+    assert config.sigma.quadrature_eps == 1.0e-4
     assert config.sigma.quadrature_cache_dir == "auto"
 
     deck.write_text(

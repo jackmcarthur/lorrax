@@ -1659,7 +1659,9 @@ _DEFAULTS = {
     # budget.  Its immutable rules are cached under the run's tmp directory
     # by default; "off" disables caching and any other spelling is a path
     # (relative paths are resolved beside the input deck).
-    "sigma_quadrature_eps": 3.0e-5,
+    # 1e-4 (owner 2026-09-27): at the requested window every deck's eqp0 is
+    # within 0.34 meV of an eps 1e-5 reference (QBUDGET, claim 2881).
+    "sigma_quadrature_eps": 1.0e-4,
     "sigma_quadrature_cache_dir": "auto",
     # Sigma frequency grid
     # None (unset): the grid comes from the protected Sigma band range under
@@ -3002,7 +3004,7 @@ def _report_early_retired_keys(
             ("mpa_sigma_sector_target_error",
              "MPA Sigma uses one uniform denominator-box rule per product "
              "window and has no measured-sector error apportionment. Remove "
-             "the key and use sigma_quadrature_eps (default 3e-5)."),
+             "the key and use sigma_quadrature_eps (default 1e-4)."),
             ("mpa_sigma_max_nodes",
              "the pair ceiling is gone and the box plan never refuses on "
              "count. Remove the key; sigma_quadrature_eps is the only "
