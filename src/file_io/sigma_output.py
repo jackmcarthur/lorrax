@@ -957,7 +957,8 @@ def _slab_to_host(a):
 
 
 def sigma_star_spread_stats(values, rows_to_keep, compact_irr, sym_idx_k,
-                            n_sym_spatial, *, k_axis=0, omega_index=None):
+                            n_sym_spatial, *, k_axis=0, omega_index=None,
+                            trs_rule="conj"):
 	"""How far this array is from its own star relation.  FOUR numbers.
 
 	Computed on the COMPLETE full-BZ array, before any row is dropped —
@@ -996,6 +997,10 @@ def sigma_star_spread_stats(values, rows_to_keep, compact_irr, sym_idx_k,
 	and measuring all of them would cost a second cube of memory for no
 	extra verdict.  The index is stamped alongside so the number is never
 	read as an all-ω claim.
+
+	The producer passes ``trs_rule='transpose'`` for a dynamic Σ cube:
+	antiunitary transport preserves its complex causal weights. Static
+	Hermitian operators use conjugation, equivalent to transpose there.
 	"""
 	from ffi import _services
 	_services.ensure_on_path()
@@ -1027,7 +1032,7 @@ def sigma_star_spread_stats(values, rows_to_keep, compact_irr, sym_idx_k,
 		sel, np.asarray(compact_irr), np.asarray(sym_idx_k),
 		int(n_sym_spatial),
 		irr_labels=np.arange(len(rows_to_keep), dtype=np.int32),
-		trs_reference="star_row"))
+		trs_reference="star_row", trs_rule=trs_rule))
 	raw = float(np.abs(M - unfolded).max()) if M.size else 0.0
 
 	diag = frob = trace = 0.0
@@ -1156,7 +1161,9 @@ def extract_and_stamp_k_irr(
 				continue
 			stats = sigma_star_spread_stats(
 				arr, rows_to_keep, compact_irr, sym_idx_k, n_sym_spatial,
-				k_axis=SIGMA_K_AXIS[name], omega_index=omega_index)
+				k_axis=SIGMA_K_AXIS[name], omega_index=omega_index,
+				trs_rule=("transpose" if name in (
+					"sigma_total_kij_ev", "sigma_c_kij_ev") else "conj"))
 			stamps[name] = stats
 			if print_fn is not None:
 				print_fn(

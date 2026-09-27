@@ -304,6 +304,11 @@ wrong conjugation predicate conjugates entire stars. Conjugation also leaves a
 Hermitian diagonal unchanged. Such errors show only against independently
 computed full-grid values.
 
+The `sigma_mnk.h5` producer measures dynamic Σ cubes with the service's
+transpose rule, preserving complex causal weights on antiunitary rows.
+Its static Hermitian arrays use conjugation (equal to transpose there).
+This choice changes the raw star-spread diagnostic, not the selected payload.
+
 An array stored on a wedge but indexed with a full-grid index returns a wrong
 row silently for every index below `nk_red`. Readers check the storage stamp
 (§9) before indexing.
