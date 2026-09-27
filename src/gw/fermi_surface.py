@@ -114,8 +114,11 @@ def _tetra_delta_vertex_weights(energy4, chemical_potential):
 def _uniform_grid_indices(kpoints_crystal, kgrid):
     points = np.mod(np.asarray(kpoints_crystal, dtype=np.float64), 1.0)
     grid = np.asarray(kgrid, dtype=np.int64)
-    if points.ndim != 2 or points.shape[1] != 3 or np.any(grid < 2):
-        raise ValueError("need kpoints (nk,3) and a three-dimensional kgrid >= 2")
+    # A one-point axis (a slab's z) is admitted: every tetrahedron step along
+    # it wraps to the same k, so the Kuhn cells reduce exactly to the
+    # triangle rule of the remaining axes (their fibres sum to one).
+    if points.ndim != 2 or points.shape[1] != 3 or grid.shape != (3,) or np.any(grid < 1):
+        raise ValueError("need kpoints (nk,3) and a three-dimensional kgrid >= 1")
     scaled = points * grid[None, :]
     # A common shift is defined modulo an integer.  Taking one point's
     # signed residual avoids the 0/1 branch cut that makes a median of

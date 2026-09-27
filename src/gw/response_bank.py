@@ -1737,6 +1737,8 @@ def compute_photon_bank(wfns, wfns_transverse, meta, config, *, mesh_xy, sym,
                 approximation="first_order_dipole_current_fd",
                 sectors="CC_CT_TC_TT", local_fields=False,
                 samples=direct_head["rule"],
+                rule_spread_ry=direct_head["rule_spread_ry"],
+                dyson_residual=direct_head["dyson_residual"],
                 static_limit="Thomas-Fermi at z=0; dynamic Drude for Im(z)>0")
     before = time.monotonic()
     if jax.process_index() == 0:

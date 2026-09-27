@@ -139,3 +139,23 @@ def test_zero_response_cell_average_is_the_bare_tt_tile():
     np.testing.assert_allclose(-bare[1:, 1:].real * _VOLUME, tt, rtol=1e-13, atol=1e-13)
     np.testing.assert_allclose(np.diag(tt) / tt[2, 2], [0.5, 0.5, 1.0], atol=1e-12)
     assert "Wigner-Seitz" in rule and residual < 1e-12
+
+
+def test_slab_fermi_surface_table_is_the_2d_dos():
+    """The tetrahedron table on an (n, n, 1) grid integrates a z-independent
+    band as the 2D free-electron Fermi circle: sum w = pi / A_BZ for E = k^2."""
+    from ffi import _services
+    _services.ensure_on_path()
+    from symmetry_maps import lattice_grid_point_group
+    from gw.fermi_surface import tetrahedron_delta_weights
+    n = 24
+    frac = np.stack(np.meshgrid(np.arange(n) / n, np.arange(n) / n, [0.0],
+                                indexing="ij"), -1).reshape(-1, 3)
+    wrapped = frac - np.rint(frac)
+    k = wrapped @ _BVEC
+    energies = np.sum(k[:, :2] ** 2, axis=1)[:, None]
+    w = tetrahedron_delta_weights(
+        energies, frac, (n, n, 1), 0.05,
+        symmetry_matrices=lattice_grid_point_group(_BVEC, (n, n, 1)))
+    area = abs(np.linalg.det(_BVEC[:2, :2]))
+    np.testing.assert_allclose(np.sum(w), np.pi / area, rtol=2e-2)

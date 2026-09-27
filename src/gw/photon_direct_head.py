@@ -641,5 +641,5 @@ def build_direct_photon_head(velocity_cart, wfns, occupation_state, *,
                  f"TT trace={complex(np.trace(fields_mean[0][origin][1:, 1:])):.6g}", file=sys.stderr, flush=True)
     head = dict(zip(("Wc", "dWc_ds", "Wc_minus_q", "dWc_minus_q_ds",
                      "constant", "moments", "bare"), fields_mean))
-    head["rule"] = rule
+    head.update(rule=rule, rule_spread_ry=spread, dyson_residual=max_error)
     return head
