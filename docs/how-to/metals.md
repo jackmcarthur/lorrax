@@ -30,7 +30,10 @@ not restate them.
 `WFN.h5` from a QE NSCF on the full $N^3$ grid with `smearing = 'fd'`
 ([inputs from DFT](../preprocessing.md)), `kin_ion.h5`, `dipole.h5` in the run
 directory (the [dipole driver](../drivers.md); the metal head reads its
-velocities, and a missing file refuses) and a centroid table. Read $E_F$ and
+velocities) and a centroid table. `dipole.h5` is stamped with the deck's
+`nval`, `ncond` and `number_bands`: run the dipole driver after the window
+is fixed (`python3 -m psp.get_dipole_mtxels -i cohsex.in`), or the head
+refuses (`GATE dft_head_dipole_provenance`). Read $E_F$ and
 the band energies from the NSCF output; a one-shot's `eqp0.dat` and the
 `E_F = ... (fixed-N mu)` line of `gwjax.out` give the same numbers at $k_BT$.
 
@@ -72,6 +75,8 @@ State `sys_dim = 3`. `fermi_reference = mp1_fixed_n` is required on a metal
 | `sc_head_update = interband_commutator` | `sc_head_interband_commutator_insulator_only` |
 | `head_correction = full` on a time-reversal-broken shared-pole store | `shared_pole_head_ordered` |
 | `sigma_w_model = mpa` on a time-reversal-broken metal | `mpa_ordered_metal` |
+| a `dipole.h5` written for another window or WFN | `dft_head_dipole_provenance` |
+| a window edge inside a degenerate multiplet | `BandWindowDegeneracyError` |
 | `occupation_window_threshold` | retired |
 
 ## Worked deck: bcc Fe, 4³, QSGW within 10 eV of $E_F$
