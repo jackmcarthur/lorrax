@@ -103,11 +103,13 @@ from .gw_config import (
 	infer_material_class, resolve_mpa_sampling_alpha,
 	validate_material_inputs)
 from .gw_init import (prepare_isdf_and_wavefunctions,
+                      prepare_band_metadata,
 	                  check_band_extrapolation_floor,
 	                  check_band_sum_degeneracy, resolve_zeta_fit_edge,
 	                  zeta_fit_band_ranges)
 from .compute_vcoul import build_bgw_v_grid_fn
 from .minimax_screening import build_static_quadrature
+from .efermi import solve_oneshot_occupations
 from . import quadrature_log
 from .screening import (
 	compute_screening_model, driver_persists_w0, restart_static_w, screening_requests_for)
@@ -208,58 +210,6 @@ def _compute_static_head(
 	return terms
 
 
-def _oneshot_mpa_occupation_state(config, wfn, wfns, material_class,
-                                  mesh_xy=None, print_fn=print):
-	"""Solve the fixed-N MP1 state consumed by one-shot metallic MPA or exchange.
-
-	The self-consistent driver already solves this state at map entry.  A
-	non-SC driver must solve it once from the DFT spectrum and thread that same
-	record to the MPA fit and Sigma; reconstructing either the chemical
-	potential or occupations at a consumer would violate the one-state rule.
-
-	One state per RUN also means one state across RANKS: the head fit is
-	stamped with rank 0's ``occ_hash`` and every rank's Sigma body asserts
-	against it, so the table is solved locally and then rank 0's copy is
-	broadcast (one psum) to all processes.  Measured on Na 8x8x8 at P=16
-	(2026-09-01): ranks 2 and 7 solved a table whose bytes differed from
-	rank 0's at the same mu to 12 digits and refused with "head fit and
-	Sigma body carry different occupation states".
-	"""
-	if material_class != "metal":
-		return None
-	from psp.get_DFT_mtxels import spin_degeneracy_factor
-	from common.collectives import process_count, process_rank, psum_replicate
-	from .efermi import OccupationState
-
-	energies = np.asarray(wfns.enk, dtype=np.float64)
-	if energies.ndim != 2 or min(energies.shape) < 1:
-		raise ValueError(
-			"one-shot metallic occupation energies must be nonempty "
-			f"(nk,nb), got {energies.shape}")
-	nk = int(energies.shape[0])
-	kweights = np.full(nk, 1.0 / float(nk), dtype=np.float64)
-	local = OccupationState.solve_smearing(
-		energies, kweights, float(wfn.num_electrons),
-		float(config.occ_broadening_ry),
-		family=config.occ_smearing_family,
-		logical_nband=wfns.slices.nb_full_logical,
-		state_capacity=spin_degeneracy_factor(wfn),
-		clamp_tol=float(config.occupation_clamp_tol))
-	if mesh_xy is None or process_count() <= 1:
-		return local
-	root = 1.0 if process_rank() == 0 else 0.0
-	f_kn = psum_replicate(np.asarray(local.f_kn, dtype=np.float64) * root, mesh_xy)
-	mu_ry = float(psum_replicate(np.array([float(local.mu_ry)]) * root, mesh_xy)[0])
-	state = OccupationState(
-		f_kn=f_kn, mu_ry=mu_ry, smearing_family=local.smearing_family,
-		smearing_width_ry=float(local.smearing_width_ry),
-		n_electrons=float(local.n_electrons))
-	if state.occ_hash != local.occ_hash:
-		print_fn(
-			f"  one-shot occupations: rank {process_rank()} solved occ_hash="
-			f"{local.occ_hash} (mu={float(local.mu_ry):.12g}); using rank 0's "
-			f"{state.occ_hash} (mu={mu_ry:.12g}) so head and body agree")
-	return state
 
 
 def _open_production_report(args):
@@ -412,40 +362,6 @@ def _load_system_inputs(config, input_dir, mesh_xy, report, print0, _config_prov
     return (config, wfn, material_class, sym, centroid_basis, centroid_indices, n_rmu, tmp_dir, tensors_filename)
 
 
-def _prepare_band_metadata(centroid_indices, config, mesh_xy, n_rmu, print0, sym, wfn):
-    """Produce the physical and padded band windows on the packed centroid basis."""
-    charge_bispinor = uses_four_spinor_finite_q_charge(
-        config.bispinor, config.bispinor_gw)
-    from common.centroid_basis import PackedCentroidBasis
-    mu_basis = PackedCentroidBasis.build(
-        centroid_indices, sym, wfn.fft_grid, mesh_xy)
-    print0(f"  {mu_basis.describe()}")
-    meta = Meta.from_system(wfn, sym,
-                            int(config.nval),
-                            int(config.ncond), config.nband,
-                            n_rmu, charge_bispinor,
-                            nband_chi=config.bands.chi,
-                            nband_sigma=config.bands.sigma,
-                            mesh_xy=mesh_xy, mu_basis=mu_basis)
-    meta.rank = RUNTIME.process_index
-    meta.n_proc = RUNTIME.process_count
-    meta.sys_dim = config.sys_dim
-    meta.bispinor = charge_bispinor
-    band_slices = BandSlices.from_band_edges(
-        *meta.band_edges, b4_chi=meta.b_id_4_chi,
-        b4_sigma=meta.b_id_4_sigma, b4_logical=meta.b_id_4_user)
-    zeta_fit_edge = resolve_zeta_fit_edge(
-        band_slices, getattr(config, "zeta_nband", None))
-    print0(f"  {config.bands.describe(zeta_fit_edge)}")
-    if config.bands.split:
-        print0(f"    chi0/W sums bands [{band_slices.b0}, "
-               f"{band_slices.b4_chi}); Sigma sums bands [{band_slices.b0}, "
-               f"{band_slices.b4_sigma}); psi is LOADED over "
-               f"[{band_slices.b0}, {band_slices.b4}) "
-               f"(padded from {meta.b_id_4_user} to the world size).")
-    check_band_sum_degeneracy(wfn, config, band_slices, log=print0)
-    check_band_extrapolation_floor(config, band_slices, meta)
-    return (meta, band_slices, zeta_fit_edge)
 
 
 def _report_sampling_and_bands(
@@ -504,7 +420,7 @@ def _prepare_isdf_carriers(
     wfns_sigma = wfns
     wfns_screening = wfns
     oneshot_occupation_state = (
-        _oneshot_mpa_occupation_state(
+        solve_oneshot_occupations(
             config, wfn, wfns, material_class, mesh_xy=mesh_xy, print_fn=print0)
         if (qp_solver is not QPSolver.SELF_CONSISTENT
             and mode in (ComputeMode.MPA, ComputeMode.X_ONLY)) else None)
@@ -816,7 +732,7 @@ def _persist_screening(
             and qp_solver is not QPSolver.SELF_CONSISTENT):
         W_static = restart_static_w(
             mode, W_by_role, V_q, config=config, meta=meta, mesh_xy=mesh_xy,
-            material_class=material_class, print_fn=print0)
+            material_class=material_class, head_source=head_resolver, print_fn=print0)
         if W_static is None:
             return
         with timing.section("gw_jax.persist_w0"):
@@ -1576,7 +1492,7 @@ def _run_gw_stages(args, _t_main, _pre_main, opened):
 	    tensors_filename) = _load_system_inputs(
 	    config, input_dir, mesh_xy, report, print0, _config_provenance)
 	(
-	    meta, band_slices, zeta_fit_edge) = _prepare_band_metadata(
+	    meta, band_slices, zeta_fit_edge) = prepare_band_metadata(
 	    centroid_indices, config, mesh_xy, n_rmu, print0, sym, wfn)
 	(
 	    enk_dft) = _report_sampling_and_bands(

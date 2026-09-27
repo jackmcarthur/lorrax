@@ -643,6 +643,11 @@ def unfold_parent_faces(faces, restart_file, input_file, mesh_xy, *, family="cha
     if not centroids.orbit_closed or (
             np.array_equal(rows, np.arange(sym.nk_tot)) and sym.nk_red != sym.nk_tot):
         sym = sym.trivial_view()
+    from gw.gw_init import prepare_band_metadata
+    _, bands, _ = prepare_band_metadata(
+        idx, cfg, mesh_xy, centroids.n_rmu, lambda *args: None, sym, wfn)
+    assert_restart_window_matches(
+        restart_file, band_slices=bands, n_rmu_logical=centroids.n_rmu)
     basis = PackedCentroidBasis.build(idx, sym, wfn.fft_grid, mesh_xy)
     plan = build_centroid_k_unfold_plan(
         sym, idx, wfn.fft_grid, mesh_xy, nspinor=faces[0].shape[2],
@@ -731,30 +736,22 @@ def read_wavefunctions(filename, input_file, mesh_xy, *, bands=None, family="cha
 
 
 def read_bse_payload(filename, input_file, mesh_xy, val_indices, cond_indices,
-                     *, nohead=False, full_exchange=False):
+                     *, nohead=False, full_exchange=False, screened_w=None):
     """Return canonical BSE ψ faces, Γ exchange and the screened q grid.
 
-    REFUSES a restart without a persisted static W0 (``W0_ready`` false).
-    Bare V is not a stand-in for W: it made ``D + V - V`` with a head-less
-    q = 0 tile (CrI3 8x8 SOC: E_1 = -7.09 eV, claim 2848).
+    A missing stored W is accepted only with an explicit screened body
+    from the response owner. Bare V is never used as the direct term.
     """
     m = read_metadata(filename)
-    if not m["screened_ready"]:
+    if not m["screened_ready"] and screened_w is None:
         raise ValueError(
-            f"GATE bse_requires_screened_w0: {filename} carries no persisted "
-            f"static screened interaction (W0_qmunu W0_ready = False"
-            f"{'' if m['screened_head'] is not None else ', no whead'}).  The "
-            f"BSE direct term needs W(omega = 0); bare V is not a substitute.  "
-            f"Fix: rerun the GW one-shot that writes this restart with "
-            f"write_restart_tensors = true on a route that persists W0 — "
-            f"compute_mode = cohsex, gn_ppm or hl_ppm, or compute_mode = mpa "
-            f"with sigma_w_model = shared_pole (one-shot, scalar store, "
-            f"insulator); that restart then carries W0_qmunu with "
-            f"W0_ready = True and the vhead/whead scalars.")
+            "GATE bse_requires_screened_w0: missing stored W0 and no "
+            "screened body supplied by the static response owner")
     v = read_wavefunctions(filename, input_file, mesh_xy, bands=val_indices)
     c = read_wavefunctions(filename, input_file, mesh_xy, bands=cond_indices)
     V = read_interaction(filename, "bare", mesh_xy, nohead=nohead)
-    W = read_interaction(filename, "screened", mesh_xy, nohead=nohead)
+    W = (read_interaction(filename, "screened", mesh_xy, nohead=nohead)
+         if screened_w is None else screened_w)
     grid = tuple(int(n) for n in m["grid"])
     def qgrid(a):
         return jax.jit(lambda x: x.reshape(grid+x.shape[-2:]).transpose(3,4,0,1,2),

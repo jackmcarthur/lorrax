@@ -1025,3 +1025,57 @@ def occupied_band_count(occ_kn, kweights) -> float:
     return float(jnp.einsum("k,kn->",
                             jnp.asarray(kweights, dtype=jnp.float64),
                             jnp.asarray(occ_kn, dtype=jnp.float64)))
+
+
+def solve_oneshot_occupations(config, wfn, wfns, material_class,
+                                  mesh_xy=None, print_fn=print):
+	"""Solve the fixed-N MP1 state consumed by one-shot metallic MPA or exchange.
+
+	The self-consistent driver already solves this state at map entry.  A
+	non-SC driver must solve it once from the DFT spectrum and thread that same
+	record to the MPA fit and Sigma; reconstructing either the chemical
+	potential or occupations at a consumer would violate the one-state rule.
+
+	One state per RUN also means one state across RANKS: the head fit is
+	stamped with rank 0's ``occ_hash`` and every rank's Sigma body asserts
+	against it, so the table is solved locally and then rank 0's copy is
+	broadcast (one psum) to all processes.  Measured on Na 8x8x8 at P=16
+	(2026-09-01): ranks 2 and 7 solved a table whose bytes differed from
+	rank 0's at the same mu to 12 digits and refused with "head fit and
+	Sigma body carry different occupation states".
+	"""
+	if material_class != "metal":
+		return None
+	from psp.get_DFT_mtxels import spin_degeneracy_factor
+	from common.collectives import process_count, process_rank, psum_replicate
+	from common.units import RYD_TO_EV
+
+	energies = np.asarray(wfns.enk, dtype=np.float64)
+	if energies.ndim != 2 or min(energies.shape) < 1:
+		raise ValueError(
+			"one-shot metallic occupation energies must be nonempty "
+			f"(nk,nb), got {energies.shape}")
+	nk = int(energies.shape[0])
+	kweights = np.full(nk, 1.0 / float(nk), dtype=np.float64)
+	local = OccupationState.solve_smearing(
+		energies, kweights, float(wfn.num_electrons),
+		float(config.occ_broadening_ry),
+		family=config.occ_smearing_family,
+		logical_nband=wfns.slices.nb_full_logical,
+		state_capacity=spin_degeneracy_factor(wfn),
+		clamp_tol=float(config.occupation_clamp_tol))
+	if mesh_xy is None or process_count() <= 1:
+		return local
+	root = 1.0 if process_rank() == 0 else 0.0
+	f_kn = psum_replicate(np.asarray(local.f_kn, dtype=np.float64) * root, mesh_xy)
+	mu_ry = float(psum_replicate(np.array([float(local.mu_ry)]) * root, mesh_xy)[0])
+	state = OccupationState(
+		f_kn=f_kn, mu_ry=mu_ry, smearing_family=local.smearing_family,
+		smearing_width_ry=float(local.smearing_width_ry),
+		n_electrons=float(local.n_electrons))
+	if state.occ_hash != local.occ_hash:
+		print_fn(
+			f"  one-shot occupations: rank {process_rank()} solved occ_hash="
+			f"{local.occ_hash} (mu={float(local.mu_ry):.12g}); using rank 0's "
+			f"{state.occ_hash} (mu={mu_ry:.12g}) so head and body agree")
+	return state

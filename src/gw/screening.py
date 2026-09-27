@@ -158,6 +158,7 @@ def compute_static_w(
     gamma_chi_override: jax.Array | None = None,
     head_channel=None,
     ordered_orientations: bool = False,
+    occupation_state=None,
 ):
     """W = (1 − Vχ₀)⁻¹V, solved and KEPT on the IBZ wedge when legal.
 
@@ -262,7 +263,18 @@ def compute_static_w(
             # buffer.  Do NOT use ``_chi_sec.watch(...)`` here — it
             # keeps a bound ``block_until_ready`` method alive on the
             # section object past W-solve, which blocks donation.
-            if ordered_orientations:
+            if occupation_state is not None:
+                from .w_isdf import compute_chi0_matsubara
+                if role != "static":
+                    raise ValueError("Static finite-temperature screening requires role=static")
+                with timing.section("chi.exec", announce=True,
+                                    label=f"{_w} finite-temperature static response"):
+                    chi0_q = compute_chi0_matsubara(
+                        wfns, meta, mesh_xy, occupation_state=occupation_state,
+                        nu_indices=(0,), rel_tol=config.minimax_config.target_error,
+                        ordered=not sym.trs_allowed)
+                    chi0_q.block_until_ready()
+            elif ordered_orientations:
                 # ORDERED ORIENTATIONS (measured-broken-TR deck, imaginary
                 # probe): the kernel's own orientation and its q-negated
                 # conjugate partner each get their own resolvent weight, so
@@ -486,6 +498,7 @@ def compute_screening(
     print_fn: Callable = print,
     head_channel=None,
     iteration_head_response=None,
+    occupation_state=None,
 ) -> dict[str, jax.Array]:
     """Evaluate W at each requested frequency.
 
@@ -580,6 +593,7 @@ def compute_screening(
                 sym=sym, centroid_indices=centroid_indices,
                 config=config, meta=meta, mesh_xy=mesh_xy,
                 role=req.role, head_channel=head_channel,
+                occupation_state=occupation_state,
                 gamma_chi_override=(
                     iteration_head_response.static_chi_body_gamma
                     if iteration_head_response is not None else None))
@@ -859,7 +873,7 @@ def driver_persists_w0(mode, config) -> bool:
     Four runs answer no:
 
     * ``compute_mode = x_only`` — it builds no W, so there is nothing to
-      persist; a BSE on the restart refuses by name.
+      persist; BSE reconstructs the scalar static response.
     * ``screening_diagrams = w_bse`` or ``w_rpa_resolvent`` — the stage
       helper has ALREADY persisted, because the RPA W(0) it wrote is the
       restart-handoff input the ladder facade reads back (both arms run
@@ -875,8 +889,7 @@ def driver_persists_w0(mode, config) -> bool:
       "do it again".
     * ``compute_mode = mpa`` with ``sigma_w_model = mpa`` — its W is a
       per-element Pade fit on disk with no ω = 0 evaluator, so nothing is
-      persisted and a BSE on the restart refuses by name
-      (``file_io.restart_bundle.read_bse_payload``).
+      persisted; BSE reconstructs the scalar static response.
     * ``compute_mode = mpa`` on a bispinor deck (four-component charge or
       photon sector stores): the static W of those models is not built
       (future work), with the same BSE refusal.
@@ -905,7 +918,7 @@ def driver_persists_w0(mode, config) -> bool:
 
 
 def restart_static_w(mode, W_by_role, V_q, *, config, meta, mesh_xy,
-                     material_class=None, print_fn=print):
+                     material_class=None, head_source=None, print_fn=print):
     """The static W the driver persists as ``W0_qmunu``, or ``None``.
 
     Non-MPA modes: the ``static`` role, the Dyson W(ω = 0) (``V_q`` when
@@ -919,18 +932,18 @@ def restart_static_w(mode, W_by_role, V_q, *, config, meta, mesh_xy,
     that writes no restart pays nothing.
 
     ``None`` is returned, with the reason printed, when the head at ω = 0
-    that must be stored beside it does not exist: a metal (its q → 0 limit
-    at ω = 0 is the Drude one, which this writer does not store) and
+    that must be stored beside it does not exist: a metal (this writer
+    does not retain its static metallic head) and
     ``head_correction = full`` without a finalized ω = 0 sample.  A BSE on
-    that restart then refuses by name; nothing falls back.
+    that restart rebuilds the scalar static response through its owner.
     """
     if mode is not ComputeMode.MPA:
         return W_by_role.get("static", V_q)
     from .gw_config import HeadCorrection
     why = None
     if material_class == "metal":
-        why = ("material_class = metal; the q -> 0 head at omega = 0 is the "
-               "Drude limit, which the static head writer does not store")
+        why = ("material_class = metal; this writer does not retain the "
+               "static metallic head")
     elif getattr(config.head, "correction", None) is HeadCorrection.FULL and not any(
             abs(complex(z)) <= 1.0e-12
             for z in getattr(W_by_role.get("iteration_head"), "omegas", ())):
@@ -938,37 +951,17 @@ def restart_static_w(mode, W_by_role, V_q, *, config, meta, mesh_xy,
                "omega = 0 on this MPA plan")
     if why is not None:
         print_fn(f"  W0_qmunu NOT persisted: {why}.  A BSE on this restart "
-                 "refuses by name.")
+                 "rebuilds the scalar static response.")
         return None
     handle = W_by_role["shared_pole"]
 
     def evaluate():
-        from symmetry_maps import QirrOperator
-        from .mpa.sigma import shared_pole_static_wc
-        from .restart_q_storage import deposit_pre_unfold
-
-        V_op = QirrOperator.of(V_q)
-        wc = shared_pole_static_wc(handle, meta, mesh_xy=mesh_xy)
-        if tuple(wc.shape) != (V_op.n_full, *V_op.values.shape[1:]):
-            raise ValueError(
-                "GATE shared_pole_static_w: model Wc(0) has shape "
-                f"{tuple(wc.shape)}; V_q is {V_op.n_full} q x "
-                f"{tuple(V_op.values.shape[1:])}; the two must share one "
-                "packed centroid carrier")
-        W0 = V_op.with_values(
-            V_op.values + QirrOperator.whole_zone(wc).at_rows(V_op.full_rows))
-        del wc
-        if not V_op.is_whole_zone():
-            deposit_pre_unfold(
-                "W0_qmunu", W0.values, n_rmu_logical=int(meta.n_rmu),
-                q_irr_frac=V_op.q_irr_frac, irr_idx_q=V_op.irr_idx,
-                sym_idx_q=V_op.sym_idx, sym_perm=V_op.sym_perm,
-                L_table=V_op.L_table, n_sym_spatial=V_op.n_sym_spatial,
-                mu_basis=getattr(meta, "mu_basis", None))
-        print_fn("  W0 (restart): V + Wc(omega = 0) of the shared-pole "
-                 f"model {str(handle.get('digest', ''))[:12]}, on {V_op.n_wedge} of "
-                 f"{V_op.n_full} q")
+        from .static_screening import build_static_screened_w
+        W0, _ = build_static_screened_w(
+            None, V_q, config=config, meta=meta, mesh_xy=mesh_xy,
+            shared_pole=handle, head_resolver=head_source, print_fn=print_fn)
         return W0
+
     return evaluate
 
 

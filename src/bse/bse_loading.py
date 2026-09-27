@@ -156,6 +156,15 @@ def load_bse_data_from_restart_sharded(
     n_rmu = header["centroid_count"]
     n_rmu_pad = padded_mu_extent(n_rmu, mesh_xy)
     w0_ready = header["screened_ready"]
+    screened_w = None
+    built_head = None
+    if not w0_ready:
+        if header["head_vector"] is None:
+            raise ValueError("GATE bse_static_w_head_vector: missing ISDF G=0 vector; regenerate the restart")
+        from gw.static_screening import build_static_w_from_restart
+        screened_w, built_head, cell_volume = build_static_w_from_restart(
+            restart_file, input_file, mesh_xy, print_fn=_log0)
+        w0_ready = True
     n_occ = resolve_n_occ(enk_full, n_occ=n_occ, input_file=input_file,
         fermi_energy=fermi_energy if fermi_energy != 0.0 else None)
     nb_total = header["logical_band_count"]
@@ -173,6 +182,9 @@ def load_bse_data_from_restart_sharded(
     g0_X = g0_Y = None
     vhead_restart = header["bare_head"]
     whead_restart = header["screened_head"]
+    if built_head is not None:
+        vhead_restart = built_head.vc0
+        whead_restart = np.asarray([built_head.wcoul0])
     if header["head_vector"] is not None:
         from common.collectives import device_put_process_local
         from runtime.padding import pad_to_axis, padded_mu_axis
@@ -181,7 +193,7 @@ def load_bse_data_from_restart_sharded(
         g0_Y = device_put_process_local(g0, NamedSharding(mesh_xy, P("y")))
     psi_v_X, psi_c_X, V_q0, W_q, V_q_full = read_bse_payload(
         restart_file, input_file, mesh_xy, val_indices, cond_indices,
-        nohead=use_nohead, full_exchange=load_v_full)
+        nohead=use_nohead, full_exchange=load_v_full, screened_w=screened_w)
 
     if pad_bands:
         # ψ pad = 0 (bilinear ⇒ inert, and it is what decouples the pad
@@ -231,6 +243,7 @@ def load_bse_data_from_restart_sharded(
                     "whead": float(complex(whead[0]).real),
                     "cell_volume": float(cell_volume),
                     "gamma_cell": w_head_gamma_cell,
+                    "static_sample": built_head,
                 }
         else:
             # G0_mu_nu is present and inject_head is True, but the head cannot

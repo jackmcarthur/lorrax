@@ -6648,7 +6648,9 @@ def run_sc_driver(
                 dict(static=screening.static_w, shared_pole=screening.shared_pole,
                      iteration_head=screening.iteration_head),
                 V_q, config=config, meta=meta, mesh_xy=mesh_xy,
-                material_class=material_class, print_fn=print_fn)
+                material_class=material_class,
+                head_source=(screening.iteration_head or head_resolver),
+                print_fn=print_fn)
             from .gw_output import persist_w0_and_head
             with timing.section("gw_jax.persist_w0"):
                 if W_static is not None:

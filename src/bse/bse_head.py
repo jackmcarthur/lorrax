@@ -6,7 +6,8 @@ AUTHORITY RULE — ``vhead`` goes on the exchange tile unconditionally, and
 q=0 exchange tile is bare Coulomb either way and reinstating the mini-BZ
 average is always right.  ``whead`` is the head of the SCREENED interaction.
 The restart loaders no longer fall back to bare ``V`` for ``W``: a restart
-without a ready ``W0_qmunu`` refuses in ``read_bse_payload`` (claim 2848).
+without a ready ``W0_qmunu`` requests the static response owner through
+``bse_loading``; ``read_bse_payload`` still refuses a missing screened body.
 ``_inject_q0_head`` still owns the ``w0_ready`` gate in ONE spelling, so a
 screened head can never reach an unscreened tile by any other door.
 

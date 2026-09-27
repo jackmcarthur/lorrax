@@ -3226,3 +3226,43 @@ def prepare_isdf_and_wavefunctions(
 		head_channel=head_channel,
 		photon_g0_vectors=photon_g0_vectors,
 	)
+
+
+def prepare_band_metadata(centroid_indices, config, mesh_xy, n_rmu, print0, sym, wfn):
+    """Produce the physical and padded band windows on the packed centroid basis."""
+    from common import Meta
+    from .wavefunction_bundle import BandSlices
+    from .gw_config import uses_four_spinor_finite_q_charge
+    charge_bispinor = uses_four_spinor_finite_q_charge(
+        config.bispinor, config.bispinor_gw)
+    from common.centroid_basis import PackedCentroidBasis
+    mu_basis = PackedCentroidBasis.build(
+        centroid_indices, sym, wfn.fft_grid, mesh_xy)
+    print0(f"  {mu_basis.describe()}")
+    meta = Meta.from_system(wfn, sym,
+                            int(config.nval),
+                            int(config.ncond), config.nband,
+                            n_rmu, charge_bispinor,
+                            nband_chi=config.bands.chi,
+                            nband_sigma=config.bands.sigma,
+                            mesh_xy=mesh_xy, mu_basis=mu_basis)
+    meta.rank = jax.process_index()
+    meta.n_proc = jax.process_count()
+    meta.sys_dim = config.sys_dim
+    meta.bispinor = charge_bispinor
+    band_slices = BandSlices.from_band_edges(
+        *meta.band_edges, b4_chi=meta.b_id_4_chi,
+        b4_sigma=meta.b_id_4_sigma, b4_logical=meta.b_id_4_user)
+    zeta_fit_edge = resolve_zeta_fit_edge(
+        band_slices, getattr(config, "zeta_nband", None))
+    print0(f"  {config.bands.describe(zeta_fit_edge)}")
+    if config.bands.split:
+        print0(f"    chi0/W sums bands [{band_slices.b0}, "
+               f"{band_slices.b4_chi}); Sigma sums bands [{band_slices.b0}, "
+               f"{band_slices.b4_sigma}); psi is LOADED over "
+               f"[{band_slices.b0}, {band_slices.b4}) "
+               f"(padded from {meta.b_id_4_user} to the world size).")
+    check_band_sum_degeneracy(wfn, config, band_slices, log=print0)
+    check_band_extrapolation_floor(config, band_slices, meta)
+    return (meta, band_slices, zeta_fit_edge)
+

@@ -328,11 +328,23 @@ solve: ψ and ε through one htransform $f(H)$, W by zero-padding in R (exact
 trigonometric interpolation, `bse.bse_densify.make_w_densifier`).
 
 Consumes the run directory's single `isdf_tensors_*.h5` (more than one refuses,
-`GATE bse_restart_ambiguous`), plus optionally `eqp1.dat`. If `W0_qmunu` lacks
-`W0_ready`, the direct term is the bare V: the GW run never screened. The GW
-band-window and centroid stamps are not re-verified here; point `-i` at the run
-whose physics you mean. Writes `bse.out` and, with `--write-eigs`,
-BerkeleyGW-layout `eigenvectors.h5` (rank 0).
+`GATE bse_restart_ambiguous`), plus optionally `eqp1.dat`. Stored screened
+`W0_qmunu` is reused with the authenticated WFN and centroid bundle. If
+`W0_ready` is false, `gw.static_screening.build_static_w_from_restart` builds
+RPA W(0) through the response owner at one frequency and resolves the matching
+Gamma-cell head. It does not run Sigma, fit poles, or modify the restart.
+Scalar insulators use the gapped response; scalar Fermi-Dirac metals use the
+zero-frequency Matsubara response and the Thomas-Fermi head. Missing dipoles
+or provenance refuse. A missing-W0 four-current bundle refuses by name until
+the packed sectors have a BSE handoff; a QSGW deck without final-map W0 also
+refuses, because its parent DFT WFN cannot reconstruct that map.
+
+GW persistence uses the same static-screening entry point for a retained
+shared-pole state. It remains necessary for QSGW: that model and its head
+belong to the accepted map, including its orbital rotation and band tail.
+A BSE `--eqp` correction changes transition energies, not this screening state.
+Writes `bse.out` and, with `--write-eigs`, BerkeleyGW-layout `eigenvectors.h5`
+(rank 0).
 
 Invoke: `python -u -m bse.bse_jax -i cohsex.in --lanczos --bse ...` in the GW
 run directory. The mesh is the run's square startup mesh; `--px`/`--py` must
