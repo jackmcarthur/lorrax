@@ -3,6 +3,8 @@
 !!! note "Measured"
     Si 4×4×4 SOC, 25 Ry, 460-band NSCF; Perlmutter A100, main ea047c3cc,
     2026-09-26 (sandbox run `runs/Si/110_bandtruth_20260926`, claim 2860).
+    The complete-basis section uses a dense-H WFN of the same system
+    (sandbox run `runs/Si/113_denseh_20260926`, claim 2865).
     A second system (Si scalar 4³, lane RSK5) is reported beside it.
     Read the numbers as a calibration, not a law.
 
@@ -106,6 +108,30 @@ On this system, with the centroids selected on the Σ pair set (`--fit-window` =
 2. Take \(N_\mu\) as a fraction of \(r\).
 
 The valence window (bands 1–8) carries the largest error at every \(N_\mu\), because valence–valence pairs have the largest \(|M|^2\) at small \(\mathbf Q\). The high-band windows (153–412) reach 0.1 meV median by \(0.5\,r\).
+
+## Out to the complete basis
+
+A 460-band NSCF stops at B = 412, 36 % of the spinor basis. `psp.run_dense_h`
+diagonalizes the dense \(H_{\mathbf k}(sG,s'G')\) on each k's whole 25 Ry sphere
+(1074–1176 states per k) and writes the first 1074 bands, which is every state
+at Γ. The exact Σ_x above, recomputed on that WFN, matches the 460-band
+reference on bands 1–412 to 0.002 meV (claim 2865).
+
+![Σ_x error to the complete basis, and r(B)](isdf-exchange-accuracy-allband.png)
+
+**Figure 3.** Left, middle: RMS and max of \(|\Delta\Sigma_x|\) over bands 1..B against \(N_\mu/r(B)\). Linear axes; RMS clipped at 5 meV, max at 20 meV, clipped points on the top edge. Circles: B ≤ 412 on the QE WFN (Figure 1). Squares: B = 692 and 1072 on the complete-basis WFN. B = 1072 is the complete basis at Γ less its top Kramers pair: the Σ band sum refuses a cut at the WFN extent or through a multiplet. Right: \(r(B)\) up to the complete basis.
+
+| B | r(B) | r / 4573 | N_μ for RMS ≤ 1 meV | N_μ for max ≤ 1 meV |
+|---|---|---|---|---|
+| 412 | 3069 | 0.67 | ≈ 0.41 r | ≈ 1.0 r |
+| 692 | 3751 | 0.82 | ≤ 0.50 r | ≤ 0.75 r |
+| 1072 | 4308–4335 | 0.94–0.95 | ≈ 0.50 r | ≤ 0.65 r |
+
+- **The collapse holds to completeness.** At B = 692 and 1072 the curves fall on the B ≤ 412 set in \(N_\mu/r\). At \(N_\mu = r\) the max is 0.1 meV over all 1072 bands, and 0.0 meV at 1.3 r.
+- **r(B) approaches the density sphere.** \(r\) grows to 4335 at the complete basis, 0.95 of the 4573 plane waves in the 100 Ry (\(4E_{\rm wfc}\)) sphere. The rank is measured on a candidate pool, so it is a lower bound. On an 8700-point pool, B = 1074 gives 4335; on 6503 points it gives 4167. At B = 412 the pool changes it by 0.3 % (9000 → 13 650 points); at B = 692, by 5.5 % (5670 → 13 650).
+- **Consequence.** An all-band Σ_x needs \(N_\mu \approx r \approx N_G(4E_{\rm wfc})\). The ISDF basis is then as large as the plane-wave density basis, and its compression over that basis is gone. What remains is the factor \(N_r/N_G(4E_{\rm wfc}) \approx 3\) between the FFT grid and the sphere. ISDF compresses a truncated band sum: \(r(64) = 0.39\,N_G(4E_{\rm wfc})\).
+- **Per band.** At the complete basis 1.0 r is 4 centroids per band, against 27.6 at B = 64.
+- **Running it.** The pruner refuses a band window above half the plane-wave basis (`centroid/pivoted_cholesky.py`). The measurement hid that guard in a harness without a source edit. At B ≥ 850 a 13 650-point pool ran out of memory on 40 GB A100s, so the pool was 8700 points.
 
 ## Why the old 960-point set failed
 
