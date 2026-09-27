@@ -139,9 +139,8 @@ def check_photon_bank_store(mesh, path, *, resident=False):
     """Full packed sample/derivative/moment/constant roundtrip on P4.
 
     ``resident`` ("device" or "pinned_host") runs the identical contract on a
-    resident payload of that tier (``path`` then names its static-reference
-    file): every read route, including the C/T sector rectangles, must equal
-    the fixture exactly.
+    resident payload of that tier (``path`` then only labels it): every read
+    route, including the C/T sector rectangles, must equal the fixture exactly.
     """
     from test_shared_pole_bank import _bank_fixture
     from test_shared_pole_store import _fixture
@@ -158,7 +157,6 @@ def check_photon_bank_store(mesh, path, *, resident=False):
     meta.shared_pole_capacity.live_stages = ('fixture',)
     basis = meta.mu_basis
     layout = PhotonBasisLayout.from_centroid_extents(basis.n_logical, basis.n_logical, mesh)
-    reference_path = path
     if resident:
         path = store.ResidentBankPayload(mesh, carrier=layout.packed_extent, label=str(path),
                                          memory_kind=resident)
@@ -207,18 +205,9 @@ def check_photon_bank_store(mesh, path, *, resident=False):
             rows=raw[ids][...,indices(sector[0]),:][...,indices(sector[1])]
             np.testing.assert_array_equal(gather_to_host(got['Wc']),rows)
             np.testing.assert_array_equal(gather_to_host(got['M1']),2*rows[:,0])
-    # Static contact: stored beside the payload, and published for later maps in
-    # its own small file on both tiers (never the bank itself).
+    # Static contact: each map's own diagnostics, stored beside the payload.
     contact = {name: put(raw[:1,0]*(k+2)) for k, name in enumerate(('Pi_grid','Drude','TT_contact'))}
     store.write_bank_contact(path, contact, mesh_xy=mesh)
-    if not resident:
-        from pathlib import Path
-        reference_path = Path(reference_path).with_name("photon_static_reference.h5")
-    reference = store.write_static_reference(reference_path, contact, header=header, mesh_xy=mesh)
-    record, arrays = store.read_static_reference(reference, n=n, mesh_xy=mesh)
-    assert record['photon_layout'] == header['photon_layout'] and record['commit']
-    for array, name in zip(arrays, ('Pi_grid','Drude','TT_contact')):
-        assert bool(jnp.all(array == contact[name])), name
 
 
 def test_resident_photon_bank_equals_file_bank(tmp_path):
@@ -227,5 +216,5 @@ def test_resident_photon_bank_equals_file_bank(tmp_path):
         pytest.skip("photon store contract runs on a 2x2 mesh")
     mesh = Mesh(np.asarray(jax.devices()).reshape(2, 2), ("x", "y"))
     check_photon_bank_store(mesh, tmp_path / "photon_bank.h5")
-    check_photon_bank_store(mesh, tmp_path / "photon_static_reference.h5", resident="device")
-    check_photon_bank_store(mesh, tmp_path / "host_static_reference.h5", resident="pinned_host")
+    check_photon_bank_store(mesh, tmp_path / "device_bank", resident="device")
+    check_photon_bank_store(mesh, tmp_path / "host_bank", resident="pinned_host")
