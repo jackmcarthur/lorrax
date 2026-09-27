@@ -192,9 +192,7 @@ the weights from one linear least-squares solve; nothing is optimized. A
 crossing box gets the bent contour: a trapezoid line in complex time whose
 endpoint error is exactly two Laplace integrals on the imaginary time axes,
 carried by two Gauss image sets. A sign-definite box gets the elliptic
-time-Ritz sector rule with the local extremal-length count. A crossing box
-whose narrow side lies inside the peak takes the sector rule when its count
-is smaller. The derivation, the count laws and the fallback are
+time-Ritz sector rule with the local extremal-length count. The derivation, the count laws and the fallback are
 [minimax quadrature §7](minimax-quadrature.md#7-σ-denominator-box-rules).
 
 A crossing box costs about γ∫B(σ)dσ/2π nodes on the line, B(σ) the largest

@@ -2,7 +2,7 @@
 import numpy as np
 import pytest
 
-from minimax.analytic_box import analytic_box_rule, crossing_nodes, sector_degree
+from minimax.analytic_box import analytic_box_rule, crossing_nodes
 from minimax.uniform_rule import rule_roundoff_amplification, rule_sup_error
 
 ETA = 0.02
@@ -93,24 +93,23 @@ def test_asymmetric_crossing_box_bends_and_beats_csc(box_eta, eps, most):
     assert rule.node_count <= most
 
 
-def test_narrow_crossing_box_takes_the_sector_rule():
-    """A narrow side inside the peak (m = 0.26 eta): the sector law is below
-    the bent contour's count, so the sector rule is built (fitted: 9)."""
-    box = (-9.12 * ETA, 0.26 * ETA, ETA, 1.01 * ETA)
-    assert sector_degree(box, 3.0e-5)[4] < crossing_nodes(box, 3.0e-5)[0].size
-    rule = analytic_box_rule(box, 3.0e-5)
-    _check(rule, box, 3.0e-5)
-    assert not rule.relative and abs(rule.theta_deg) > 1.0
-    assert rule.node_count <= 12
-
-
-def test_the_other_family_is_the_fallback():
-    """[-3.72, 65] eta at 5e-4: the bent contour is the cheaper law but its
-    ladder ends uncertified (m < 4 eta); the sector rule certifies."""
-    box = (-3.72 * ETA, 65.0 * ETA, ETA, 1.01 * ETA)
-    rule = analytic_box_rule(box, 5.0e-4)
-    _check(rule, box, 5.0e-4)
-    assert abs(rule.theta_deg) > 1.0
+@pytest.mark.parametrize("box_eta,eps", [
+    ((-9.12, 0.26), 3.0e-5),            # narrow side inside the peak (fitted: 9)
+    ((-3.72, 65.0), 5.0e-4),            # m < 4 eta at a loose eps
+    ((-2.71, 47.63), 3.0e-5),           # core fixture A val:resonant
+])
+def test_narrow_crossing_box_is_the_floored_bent_contour(box_eta, eps):
+    """m < 4 eta is built as the bent contour with m = 4 eta; weights and the
+    certificate stay on the true box.  The sector rule, which also certified
+    these boxes, put |w| ~ 1e10 on core fixture A's box and the executor's
+    Sigma came out non-finite; the floored contour keeps |w| of order one."""
+    box = (box_eta[0] * ETA, box_eta[1] * ETA, ETA, 1.01 * ETA)
+    s, info = crossing_nodes(box, eps)
+    assert info["m"] == pytest.approx(4.0) and info["tau_c"] == pytest.approx(1.0)
+    rule = analytic_box_rule(box, eps)
+    _check(rule, box, eps)
+    assert abs(rule.theta_deg) < 1.0
+    assert np.abs(rule.weights).max() * ETA < 100.0
 
 
 def test_tall_narrow_crossing_box_is_returned_uncertified():

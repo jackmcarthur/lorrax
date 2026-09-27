@@ -210,7 +210,7 @@ expression, sets γ on 290 of the 371 corpus crossing boxes (claim 2882). A
 symmetric box bends too: the straight line leaves the far image to the
 growth-capped set and misses on a tall box ([−20, 20] × [1, 10]η: 1.49ε),
 where the bent contour certifies. On a miss the ladder raises γ by 1.1 and
-adds one node to the leg and to each image set, four rungs.
+adds one node to the leg and to each image set, six rungs.
 
 A crossing box whose narrow side is 4–8η and whose height is 10η or more
 certifies in neither family ((−60, 6) × (1, 20)η at 10⁻⁴ ends at 7ε), where
@@ -239,12 +239,15 @@ the rest, and the certified counts sit at a median 1.15× the rung-0 law.
 Sign-definite boxes weight the fit geometrically in |Re d|, the relative
 currency's measure.
 
-**Which family.** A sign-definite box takes the sector rule. A crossing box
-builds first the family with the smaller count, N_line + leg + images or the
-sector law, and the other when the first ladder ends uncertified. The sector
-rule wins when the narrow side lies inside the peak (m of a few η), where the
-bent contour's fixed 10–16-node overhead dominates. A rule neither family
-certifies is returned uncertified and the planner refuses the window by name.
+**Which family.** A sign-definite box takes the sector rule; a crossing box
+takes the bent contour. A narrow side inside the peak, m < 4η, is built as
+m = 4η: 1/d varies on the scale η there, so the line needs no sharper bend,
+and the weights and the certificate stay on the true box. All 31 corpus
+crossing boxes with m < 4η certify that way, at 1.58× their fitted counts
+and |w| ≤ 5.2η. The sector rule also certifies those boxes, but on a crossing
+box its rotated times cancel at |w| ~ 10¹⁰, and core fixture A's Σ came out
+non-finite in the executor, so it is not used there. A rule that does not
+certify is returned uncertified and the planner refuses the window by name.
 
 **Chosen constants.** None of these is derived; each was fixed once and not
 tuned per box. Corner exponent c = 4 (under ln 83.3); line end Λ = ln(4/ε);
@@ -253,7 +256,7 @@ floor slope 0.01 (the one constant calibrated against the corpus) and margin
 cap 1.2; leg start 0.05/(Mτ_c); the image-horizon guard
 1/max(1 − m/B₀, 0.05); ridge 0.05ε; fit density 2 points per half wave of the
 largest |t| on the real edges and 40 geometric points on the sides; the
-ladders (×1.1, four crossing and six sector rungs); the sector φ grid (200
+narrowest built side 4η; the ladders (×1.1, six rungs each); the sector φ grid (200
 points) and its gap guard (0.02 rad).
 
 **Acceptance.** A rung is accepted when the boundary certificate

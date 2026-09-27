@@ -32,10 +32,10 @@ local extremal-length law
 
 ``g(l)`` the half-gap between the box's arc at radius ``e^l`` and the
 sector edges ``phi +- pi/2``; ``phi`` minimizes the law on a fixed grid.  A
-sign-definite box always takes this rule.  A crossing box builds whichever
-of the two families has the smaller count law first and the other if the
-first ladder ends uncertified (the sector rule wins on boxes whose narrow
-side is inside the peak, ``m`` of a few ``eta``).
+sign-definite box takes this rule; a crossing box takes the bent contour,
+a narrow side under ``_NARROW_MIN`` = 4 eta built as 4 eta (on a crossing
+box the sector rule's rotated times cancel at ``|w| ~ 1e10``, and the
+executor's Sigma came out non-finite on core fixture A).
 
 Acceptance of every rung: the refined boundary sup is at most ``eps`` and
 the term mass ``rho sum_k |w_k exp(i t_k d)|`` (the executor's noise
@@ -65,7 +65,9 @@ _RIDGE = 0.05
 _MARGIN_SLOPE = 0.01
 #: Ladders: the crossing rule raises gamma by 1.1 and adds one node per
 #: Laplace set per rung; the sector rule raises n -> max(n + 1, ceil(1.1 n)).
-_CROSSING_RUNGS, _SECTOR_RUNGS, _LADDER_GROWTH = 4, 6, 1.10
+_CROSSING_RUNGS, _SECTOR_RUNGS, _LADDER_GROWTH = 6, 6, 1.10
+#: The narrowest side the bent contour is built for, in units of eta.
+_NARROW_MIN = 4.0
 #: Fit cloud density along Re d, in points per half wave of the largest |t|.
 _FIT_POINTS = 2.0
 
@@ -81,7 +83,11 @@ def crossing_nodes(box, eps, rung=0):
     a, b = re_lo / im_lo, re_hi / im_lo
     flip = b > -a
     M, m = (b, -a) if flip else (-a, b)
-    M, m = max(M, 1.0e-3), max(m, 1.0e-3)
+    # A narrow side inside the peak is built as _NARROW_MIN: 1/d varies on
+    # the scale eta there, so the line needs no finer bend than c/_NARROW_MIN
+    # (weights and certificate stay on the true box).
+    m = max(m, _NARROW_MIN)
+    M = max(M, m)
     L, Lam = math.log(1.0 / eps), math.log(_FLOOR / eps)
     # Always bent, a symmetric box too: the straight line (tau = 0) leaves the
     # far image to the growth-capped set, and on [-20, 20] x [1, 10] eta it
@@ -260,11 +266,11 @@ def analytic_box_rule(box, eps, *, mass_cap=83.0, relative=None):
     if relative:
         families = [(lambda r: _sector_rule(box, eps, r, True), _SECTOR_RUNGS)]
     else:
-        crossing = (lambda r: _crossing_rule(box, eps, r), _CROSSING_RUNGS)
-        sector = (lambda r: _sector_rule(box, eps, r, False), _SECTOR_RUNGS)
-        families = [crossing, sector]
-        if sector_degree(box, eps)[4] < crossing_nodes(box, eps)[0].size:
-            families.reverse()
+        # A crossing box takes the bent contour only. The sector rule
+        # certifies narrow crossing boxes, but its rotated times cancel at
+        # |w| ~ 1e10 there and the executor's Sigma came out non-finite
+        # (core fixture A, [-2.71, 47.63] eta, 2026-09-27).
+        families = [(lambda r: _crossing_rule(box, eps, r), _CROSSING_RUNGS)]
     started = time.perf_counter()
     with _pinned_blas_threads():
         for build, rungs in families:
