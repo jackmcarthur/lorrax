@@ -518,15 +518,21 @@ class PlaneWaveGW:
             tau_kernel_factory=factory, print_fn=print_fn)
 
     # ------------------------------------------------------------------ shared pole
-    def sphere_meta(self):
+    def sphere_meta(self, port_count=None):
         """The metadata the shared-pole owners read, with the response sphere as the port axis:
         ``n_rmu`` is the sphere's logical width, ``n_rmu_padded`` its carrier (the ISDF packed
-        centroid count's slots).  No centroid basis (``mu_basis = None``)."""
+        centroid count's slots).  No centroid basis (``mu_basis = None``).
+
+        ``port_count`` (diagnostic): the port count the recipe sizes its direction widths and
+        pole budget from, in place of the sphere width (they are fractions of it), so the
+        sphere model can carry the direction and pole counts an ISDF basis of that size gets.
+        The operators stay on the sphere."""
         ax = self.screen.axis
+        ports = int(ax.logical) if port_count is None else int(port_count)
         kx, ky, kz = (int(v) for v in self.s.kgrid)
         return SimpleNamespace(nk_tot=kx * ky * kz, nkx=kx, nky=ky, nkz=kz, nspinor=self.ns,
                                nspinor_wfnfile=self.ns, nspin=1, cell_volume=self.omega_cell,
-                               n_rmu=int(ax.logical), n_rmu_padded=int(ax.carrier),
+                               n_rmu=ports, n_rmu_padded=max(ports, int(ax.carrier)),
                                b_id_4_chi_user=self.nb, mu_basis=None)
 
     def shared_pole_recipe(self, config, wfns, meta, *, print_fn=print):
@@ -1040,7 +1046,7 @@ def _one_shot_shared_pole(args, mesh, system, gw, say, t_read, config, wfns, sig
     Dyson W^c(z) at complex z, with the 8-pole MPA of the same samples beside it."""
     import jax
     import jax.numpy as jnp
-    meta = gw.sphere_meta()
+    meta = gw.sphere_meta(args.port_count)
     model = gw.shared_pole_model(config, wfns, meta, print_fn=say)
     stage("shared_pole_model")
     for row in model["gates"]:
@@ -1153,6 +1159,10 @@ def _write_shared_pole_result(args, mesh, system, gw, say, t_read, config, model
                w_model="shared_pole",
                shared_pole=dict(K=model["counts"].tolist(), K_carrier=model["K"],
                                 pole_budget=recipe.get("pole_budget"), n=int(gw.screen.axis.logical),
+                                port_count=args.port_count,
+                                widths=dict(imaginary=recipe["imaginary_width"],
+                                            infinity=recipe["infinity_width"],
+                                            line_cap=recipe["line_direction_cap"]),
                                 gates=model["gates"], response_nodes=model["response_nodes"],
                                 support_z_ev=[[v.real * _RY_EV, v.imag * _RY_EV] for v in model["points"]],
                                 fit_ids=[int(i) for i in recipe["fit_ids"]],
@@ -1189,6 +1199,9 @@ def main(argv=None):
     ap.add_argument("--deck", default=None,
                     help="a gw_jax deck (compute_mode = mpa): run Σ_x + the MPA Σ_c(ω) one-shot on its "
                          "Σ grid, η, ε and MPA plan instead of the iω χ/W diagnostic")
+    ap.add_argument("--port-count", type=int, default=None,
+                    help="shared-pole deck, diagnostic: size the recipe's direction widths and pole "
+                         "budget from this port count instead of the sphere width")
     ap.add_argument("--skip-complex-z", action="store_true",
                     help="shared-pole deck: skip the model-vs-exact W^c(z) comparison")
     ap.add_argument("--out", required=True)
