@@ -1,6 +1,6 @@
 """``sigma_out_of_grid`` (owner 2026-09-24): cover (default) grows the SC grid
-over every non-frozen protected identity; clamp reads the nearest grid edge;
-static reads omega = 0.  One classification (``qsgw_utils.omega_coverage``)
+over every requested state (gw.qp_support, flat pads, owner 2026-09-27); clamp
+reads the nearest grid edge; static reads omega = 0.  One classification (``qsgw_utils.omega_coverage``)
 feeds the Sigma build, the growth and the tail mask.  Host NumPy + one CPU
 device."""
 from types import SimpleNamespace as NS
@@ -68,10 +68,10 @@ def test_cover_grows_over_every_non_frozen_identity_and_nothing_else():
     e = np.array([[-100.0, -5.0, 9.8, 11.7]])            # rel mu; band 1 is semicore
     _, grown, *_ = _sc_sampled_support(_inputs("cover", 1), part, e, 0.0)
     assert grown[0] == GRID[0]                           # frozen core does not grow it
-    assert 11.7 + 0.5 + 1.17 <= grown[-1] < 11.7 + 0.5 + 1.17 + 0.25
-    # Bounded by the spectrum it covers: unfrozen semicore reaches E - pad(E).
+    assert 11.7 + 2.0 <= grown[-1] < 11.7 + 2.0 + 0.25   # flat 2 eV, not 10% of E
+    # Bounded by the spectrum it covers: unfrozen semicore reaches E - 2 eV.
     _, grown, *_ = _sc_sampled_support(_inputs("cover", 0), part, e, 0.0)
-    assert -100.0 - 10.5 - 0.25 < grown[0] <= -100.0 - 10.5
+    assert -100.0 - 2.0 - 0.25 < grown[0] <= -100.0 - 2.0
     # ... unless the W model calls it inactive (shared_pole_recipe.active_band_mask):
     # then no fc key is needed and the semicore keeps Sigma(0) as under static.
     from gw.shared_pole_recipe import active_band_mask
@@ -92,10 +92,9 @@ def test_frozen_core_cannot_extend_the_sampled_grid(policy):
     # The core is just outside the sampled grid, inside the SC pad.  Only
     # the valence identity can request a new Sigma sample.
     e = np.array([[-12.25, -1.0]])
-    _, frozen_grid, _, required, _ = _sc_sampled_support(
-        _inputs(policy, 1), part, e, 0.0)
-    np.testing.assert_array_equal(frozen_grid, GRID)
-    np.testing.assert_array_equal(required, [[False, True]])
+    support = _sc_sampled_support(_inputs(policy, 1), part, e, 0.0)
+    np.testing.assert_array_equal(support.grown, GRID)
+    np.testing.assert_array_equal(support.requested, [[False, True]])
     _, live_grid, *_ = _sc_sampled_support(
         _inputs(policy, 0), part, e, 0.0)
     assert live_grid[0] < GRID[0]
@@ -131,25 +130,28 @@ def test_coverage_is_judged_in_the_frame_the_sigma_build_uses():
 
 def _commit(session, support):
     """What the SC map writes back after logging (sc_iteration)."""
-    sampled, grown, _, _, event = support
+    grown, event = support.grown, support.event
     session["omega_grid_ev"] = tuple(grown)
+    session["support_envelope_ev"] = support.envelope
     session["window_plan"] = {"index": 0 if event == "plan" else 1, "event": event}
     return grown, event
 
 
 def test_sc_window_plan_one_shot_then_plan_then_hold_then_extend():
-    """Owner 2026-09-25: map 0 is the one-shot grid, map 1 plans once at 1 eV,
-    later maps hold while every read support [E - 0.5, E + 0.5] is inside,
-    and a crossing extends only its edge, to E + 1 eV."""
-    from gw.scissor import SC_WINDOW_PAD_EV, sc_read_halfwidth_ev
-    assert SC_WINDOW_PAD_EV == (2.0, 1.0) and sc_read_halfwidth_ev() == 0.5
+    """Owner 2026-09-25/27: map 0 is the one-shot grid (requested states +/- 2
+    eV), map 1 plans once at 1 eV, later maps hold while every read support
+    [E - 0.5, E + 0.5] is inside, and a crossing extends only its edge, to
+    E + 1 eV."""
+    from gw.qp_support import SUPPORT_BUFFER_EV, SUPPORT_PAD_EV, read_halfwidth_ev
+    assert SUPPORT_PAD_EV == (2.0, 1.0) and SUPPORT_BUFFER_EV == 1.0
+    assert read_halfwidth_ev() == 0.5
     part = BandPartition(protected_mask=np.ones(3, bool), in_range_mask=np.ones(3, bool))
     session = {}
     inputs = _inputs("cover", 0, session, grid=np.arange(-12.0, 8.0 + 1e-9, 0.25))
     grid0, event = _commit(session, _sc_sampled_support(
         inputs, part, np.array([[-5.0, 0.3, 9.9]]), 0.0))
-    assert event == "plan"                                  # one-shot growth: E + pad(E)
-    assert 9.9 + 0.5 + 0.99 <= grid0[-1] < 9.9 + 0.5 + 0.99 + 0.25
+    assert event == "plan"                                  # the first plan: E + 2 eV
+    assert 9.9 + 2.0 <= grid0[-1] < 9.9 + 2.0 + 0.25
     grid1, event = _commit(session, _sc_sampled_support(
         inputs, part, np.array([[-5.0, 0.3, 12.0]]), 0.0))
     assert event == "re-plan"
@@ -191,11 +193,11 @@ def test_unset_grid_edges_derive_the_grid_from_the_bands():
         with pytest.raises(ValueError, match="needs sigma_out_of_grid = cover"):
             DynamicSigmaConfig(omega_min_ev=None, omega_max_ev=5.0,
                                out_of_grid=policy, **base)
-    from gw.scissor import grow_sigma_support_ev
+    from gw.qp_support import plan_support_ev
     requested = np.arange(-0.25, 0.25 + 1e-9, 0.25)
-    grown, _ = grow_sigma_support_ev(unset, 0, requested, np.array([[-6.0, 2.0]]),
-                                     np.ones((1, 2), bool))
-    assert grown[0] <= -6.0 - 1.1 and grown[-1] >= 2.0 + 0.7
+    grown, envelope = plan_support_ev(unset, requested, np.array([[-6.0, 2.0]]),
+                                      np.ones((1, 2), bool), 0)
+    assert grown[0] == -8.0 and grown[-1] == 4.0 and envelope == (-8.0, 4.0)
     assert np.isclose(grown, 0.0).any()
 
 
@@ -215,3 +217,53 @@ def test_a_patch_deck_sets_both_edges_before_the_cover_only_refusal(tmp_path):
     deck.write_text(base)
     with pytest.raises(ValueError, match="needs sigma_out_of_grid = cover"):
         LorraxConfig.from_input_file(str(deck), print_fn=lambda *a, **k: None)
+
+
+def test_a_runaway_state_cannot_grow_the_grid():
+    """Owner 2026-09-27: the support stays inside the deck request joined with
+    the requested quasiparticles' E_in +/- pad.  A requested state whose Z at
+    the previous map lies outside (0, 1] (Na 8^3 b63: Z = -382, eqp1 -1031 eV)
+    does not move it, on the map-1 plan or on a held map; a quasiparticle
+    just past the edge still extends it.  Roots are no input at all."""
+    part = BandPartition(protected_mask=np.ones(3, bool), in_range_mask=np.ones(3, bool))
+    session = {}
+    inputs = _inputs("cover", 0, session, grid=np.arange(-12.0, 8.0 + 1e-9, 0.25))
+    grid0, _ = _commit(session, _sc_sampled_support(
+        inputs, part, np.array([[-5.0, 0.3, 9.9]]), 0.0))
+    # Map 1: the third state ran away with Z = -0.003; the plan ignores it.
+    runaway = np.array([[-5.0, 0.3, -1031.0]])
+    z_bad = np.array([[0.8, 0.9, -0.003]])
+    support = _sc_sampled_support(inputs, part, runaway, 0.0, None, z_bad)
+    grid1, event = _commit(session, support)
+    assert event == "re-plan"
+    np.testing.assert_array_equal(grid1, np.arange(-12.0, 8.0 + 1e-9, 0.25))
+    np.testing.assert_array_equal(support.no_qp, [[False, False, True]])
+    assert support.envelope == (-6.0, 1.3)
+    # Map 2: still running away (+500 eV, Z = 2.8); the grid holds.
+    held = _sc_sampled_support(inputs, part, np.array([[-5.0, 0.3, 500.0]]), 0.0,
+                               None, np.array([[0.8, 0.9, 2.8]]))
+    assert held.event == "hold"
+    np.testing.assert_array_equal(held.grown, grid1)
+    # The same energy with Z = 1 (a quasiparticle, flat Sigma) extends it.
+    moved = _sc_sampled_support(inputs, part, np.array([[-5.0, 0.3, 8.0]]), 0.0,
+                                None, np.array([[0.8, 0.9, 1.0]]))
+    assert moved.event == "extend" and 9.0 <= moved.grown[-1] < 9.25
+
+
+def test_the_support_envelope_refuses_a_grid_grown_past_it():
+    """The invariant check: a grid that reaches past D joined with the
+    requested envelope (for instance one grown from a root or from every
+    band) is a refusal; a grid inside it passes."""
+    from gw.qp_support import assert_support_in_envelope, grow_support_ev
+    deck = np.arange(-12.0, 8.0 + 1e-9, 0.25)
+    envelope = (-7.0, 11.9)
+    inside = grow_support_ev(deck, np.array([[9.9]]), np.ones((1, 1), bool), 0.25,
+                             pad_ev=2.0, trigger_ev=2.0)
+    assert_support_in_envelope(inside, deck, envelope, 0.25, context="test")
+    grown_by_a_root = grow_support_ev(deck, np.array([[-1031.0]]), np.ones((1, 1), bool),
+                                      0.25, pad_ev=2.0, trigger_ev=2.0)
+    with pytest.raises(ValueError, match="GATE sigma_support_envelope"):
+        assert_support_in_envelope(grown_by_a_root, deck, envelope, 0.25, context="test")
+    with pytest.raises(ValueError, match="GATE sigma_support_envelope"):
+        assert_support_in_envelope(np.arange(-12.0, 12.5, 0.25), deck, envelope, 0.25,
+                                   context="test")

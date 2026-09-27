@@ -851,19 +851,19 @@ def _prepare_static_head(config, do_screened, head_resolver, meta, mode, print0,
 
 def _oneshot_sampled_support(config, enk_dft, wfn, occupation_state,
                              material_class, print_fn):
-    """The one-shot's sampled Sigma(omega) support, grown by the rule every
-    SC map uses (``scissor.grow_sigma_support_ev``; owner 2026-09-24).
+    """The one-shot's sampled Sigma(omega) support: the first plan of
+    ``gw.qp_support`` (the deck request joined with every requested state's
+    E_DFT +/- 2 eV), the plan SC map 0 makes, so SC map 0 is this calculation.
 
-    Every requested band is required, as on SC map 0, and it is judged in the
-    frame the Sigma build measures from (``efermi.sigma_frame_mu_ev``), so SC
-    map 0 is this calculation: the same grid, rules and out-of-grid set.
-    Under ``cover`` an active state outside the requested grid now reads its
-    own Sigma(E) here too, where it used to read Sigma(0).
+    The requested states are the Sigma window's identities the W model treats
+    as active, judged in the frame the Sigma build measures from
+    (``efermi.sigma_frame_mu_ev``).  Under ``cover`` an active state outside
+    the requested grid reads its own Sigma(E).
     """
     from dataclasses import replace
 
     from .efermi import sigma_frame_mu_ev
-    from .scissor import grow_sigma_support_ev
+    from .qp_support import plan_support_ev, requested_states
     from .shared_pole_recipe import active_band_mask
     e_ry = np.asarray(enk_dft, dtype=np.float64)
     metal = material_class == "metal" and occupation_state is not None
@@ -872,13 +872,14 @@ def _oneshot_sampled_support(config, enk_dft, wfn, occupation_state,
         float(occupation_state.mu_ry) if metal else float(wfn.efermi),
         occupation_state if metal else None)
     requested = np.asarray(config.omega_grid_ev, dtype=np.float64)
-    grown, _ = grow_sigma_support_ev(
-        config.sigma, config.sc.frozen_core_bands, requested,
-        e_ry * RYD_TO_EV - mu_ev, np.ones(e_ry.shape, dtype=bool),
-        active_band_mask(e_ry, float(wfn.efermi)))
+    energy = e_ry * RYD_TO_EV - mu_ev
+    states = requested_states(
+        config.sigma, config.sc.frozen_core_bands, energy,
+        np.ones(e_ry.shape, dtype=bool), active_band_mask(e_ry, float(wfn.efermi)))
+    grown, _ = plan_support_ev(config.sigma, requested, energy, states, 0)
     if grown.size == requested.size:
         return config
-    print_fn(f"  Sigma sampled support ({config.sigma.out_of_grid}): "
+    print_fn(f"  Sigma sampled support ({config.sigma.out_of_grid}, plan 0): "
              f"[{requested[0]:+.6f}, {requested[-1]:+.6f}] -> "
              f"[{grown[0]:+.6f}, {grown[-1]:+.6f}] eV")
     return replace(config, sc_omega_grid_ev=tuple(float(x) for x in grown))

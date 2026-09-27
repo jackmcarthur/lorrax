@@ -54,7 +54,7 @@ import math as _math
 import os
 import time
 from dataclasses import dataclass, replace
-from typing import Callable
+from typing import Callable, NamedTuple
 
 import numpy as np
 
@@ -589,7 +589,8 @@ class SCState:
     convergence_verdict: ConvergenceVerdict | None = None
     # The previous map's quasiparticle weights Z_n = 1/(1 - dReSigma_nn/dw)
     # at each identity's own energy, (nk_loop, nb_active) in DFT-identity
-    # order: the sum-band tail's fit weights (owner 2026-09-24).  Sigma of a
+    # order: the sum-band tail's fit weights (owner 2026-09-24) and the
+    # quasiparticle set of the Sigma support (gw.qp_support).  Sigma of a
     # map exists only after its tail feeds chi0/W, so the weights ride the
     # carry one map behind, like ``partition``; None (map 0) is unit weight.
     tail_z_kn: np.ndarray | None = None
@@ -2640,29 +2641,40 @@ def _sc_head_frequency_plan(
 from .efermi import sigma_frame_mu_ev  # noqa: E402  (shared with the one-shot)
 
 
-def _sc_sampled_support(inputs, partition, energies_loop, mu_ev, active_n=None):
-    """This map's sampled Sigma(omega) support under the SC window plan:
-    ``(sampled, grown, E - mu, required, event)``, or None for a static Sigma
-    (no grid, no fallback).  Pure; the caller logs it and writes the session.
+class SCSupport(NamedTuple):
+    """One map's sampled Sigma(omega) support (``_sc_sampled_support``)."""
+    sampled: np.ndarray        # the grid this map started from, eV
+    grown: np.ndarray          # the grid this map samples, eV
+    energy: np.ndarray         # E_in - mu per identity, eV
+    requested: np.ndarray      # the requested set R (gw.qp_support)
+    event: str                 # one-shot | plan | re-plan | hold | extend
+    envelope: tuple | None     # R's envelope since the last plan, eV
+    no_qp: np.ndarray          # requested identities dropped for Z outside (0, 1]
 
-    The plan (owner 2026-09-25, ``scissor.SC_WINDOW_PAD_EV``):
 
-    * ``plan`` (map 0): the one-shot grid, grown by the one-shot rule, so SC
-      map 0 is the one-shot calculation;
-    * ``re-plan`` (map 1, once): the requested grid grown to cover every
-      required state +/- the later pad (1 eV); it may shrink;
-    * ``hold`` (later maps): unchanged while every required state's read
-      support [E - dE, E + dE] (``scissor.sc_read_halfwidth_ev``) lies inside;
+def _sc_sampled_support(inputs, partition, energies_loop, mu_ev, active_n=None,
+                        z_in_kn=None):
+    """This map's sampled Sigma(omega) support (``gw.qp_support``), an
+    :class:`SCSupport`, or None for a static Sigma (no grid, no fallback).
+    Pure; the caller logs it and writes the session.
+
+    * ``plan`` (map 0) and ``one-shot``: the deck request joined with every
+      requested state's E_in +/- 2 eV, so SC map 0 is the one-shot;
+    * ``re-plan`` (map 1, once): the same from the deck request at 1 eV; it may
+      shrink;
+    * ``hold`` (later maps): unchanged while every requested read support
+      [E - dE, E + dE] (``qp_support.read_halfwidth_ev``) lies inside;
     * ``extend``: otherwise only the crossed edge grows, to E +/- 1 eV.
 
-    ``one-shot``: a single-map run (no quadrature session) grows by the
-    one-shot rule.
+    ``z_in_kn`` is the previous map's Z per identity: a requested state with
+    Z outside (0, 1] has no quasiparticle and cannot move the support.
     """
     if not inputs.config.compute_mode.is_dynamic:
         return None
-    from .scissor import SC_WINDOW_PAD_EV, grow_sigma_support_ev, sc_read_halfwidth_ev
-    grid_pad = SC_WINDOW_PAD_EV[-1]
+    from .qp_support import (hold_support_ev, plan_support_ev, quasiparticle_mask,
+                             requested_states)
 
+    sigma = inputs.config.sigma
     session = inputs.fixed_quadrature_session
     requested = np.asarray(inputs.config.omega_grid_ev, dtype=np.float64)
     plan = None if session is None else session.get("window_plan")
@@ -2673,45 +2685,44 @@ def _sc_sampled_support(inputs, partition, energies_loop, mu_ev, active_n=None):
         support_partition.protected_mask | support_partition.in_range_mask,
         dtype=bool), energies_loop.shape)
     energy_relative_ev = energies_loop - mu_ev
-    # Owner 2026-09-24: cover grows over every protected identity the W
-    # model treats as active (``active_n``: shared_pole_recipe.active_band_mask
-    # on the fixed DFT ladder), never over frozen core; the mask is by
-    # identity and fixed, so no state switches between Sigma(E) and Sigma(0).
-    # The one-shot applies the same rule, so SC map 0 is the one-shot.
-    grow = _functools.partial(grow_sigma_support_ev, inputs.config.sigma,
-                   inputs.config.sc.frozen_core_bands)
+    # Owner 2026-09-24: the requested states are the protected identities the
+    # W model treats as active (``active_n``: shared_pole_recipe.active_band_mask
+    # on the fixed DFT ladder), never frozen core; owner 2026-09-27: only
+    # quasiparticles move the support.
+    everyone = requested_states(sigma, inputs.config.sc.frozen_core_bands,
+                                energy_relative_ev, required_kn, active_n)
+    quasiparticle = (None if z_in_kn is None else
+                     quasiparticle_mask(np.broadcast_to(z_in_kn, energies_loop.shape)))
+    states = everyone if quasiparticle is None else everyone & quasiparticle
+    no_qp = everyone & ~states
     if plan is None:
         event = "one-shot" if session is None else "plan"
-        expanded_grid, required_kn = grow(
-            requested, energy_relative_ev, required_kn, active_n)
+        grid, envelope = plan_support_ev(sigma, requested, energy_relative_ev, states, 0)
     elif int(plan["index"]) == 0:
         event = "re-plan"
-        pad = grid_pad
-        expanded_grid, required_kn = grow(
-            requested, energy_relative_ev, required_kn, active_n,
-            pad_ev=pad, trigger_ev=pad)
+        grid, envelope = plan_support_ev(sigma, requested, energy_relative_ev, states, 1)
     else:
-        expanded_grid, required_kn = grow(
-            sampled_grid, energy_relative_ev, required_kn, active_n,
-            pad_ev=grid_pad, trigger_ev=sc_read_halfwidth_ev())
-        event = "hold" if expanded_grid.size == sampled_grid.size else "extend"
-    return sampled_grid, expanded_grid, energy_relative_ev, required_kn, event
+        grid, envelope, event = hold_support_ev(
+            sigma, requested, sampled_grid, session.get("support_envelope_ev"),
+            energy_relative_ev, states)
+    return SCSupport(sampled_grid, grid, energy_relative_ev, states, event,
+                     envelope, no_qp)
 
 
-def _record_sc_window_plan(inputs, iteration, event, sampled_grid, grown_grid,
-                           energy_relative_ev, required_kn):
+def _record_sc_window_plan(inputs, iteration, support):
     """One log record per map for the SC window plan (``_sc_sampled_support``).
 
-    ``plan``/``one-shot``: one line per required state outside the requested
-    grid (the one-shot growth).  ``re-plan``: the grid change and the states
-    that set its edges.  ``hold``: the tightest read support.  ``extend``: one
-    line per state whose read support crossed an edge, with the new edge.
+    ``plan``/``one-shot``: one line per requested state outside the requested
+    grid.  ``re-plan``: the grid change and the states that set its edges.
+    ``hold``: the tightest read support.  ``extend``: one line per state whose
+    read support crossed an edge, with the new edge.  Every map: one line per
+    requested state without a quasiparticle that lies off the grid.
     """
-    from .scissor import (SC_WINDOW_PAD_EV, sc_read_halfwidth_ev,
-                          sc_state_pad_ev)
+    from .qp_support import SUPPORT_BUFFER_EV, SUPPORT_PAD_EV, read_halfwidth_ev
 
-    e = np.asarray(energy_relative_ev, dtype=np.float64)
-    req = np.asarray(required_kn, dtype=bool)
+    sampled_grid, grown_grid, e, req, event = support[:5]
+    e = np.asarray(e, dtype=np.float64)
+    req = np.asarray(req, dtype=bool)
     b0 = int(inputs.band_slices.b0)
 
     def state(k, n):
@@ -2719,24 +2730,29 @@ def _record_sc_window_plan(inputs, iteration, event, sampled_grid, grown_grid,
 
     grids = (f"[{sampled_grid[0]:+.6f}, {sampled_grid[-1]:+.6f}] -> "
              f"[{grown_grid[0]:+.6f}, {grown_grid[-1]:+.6f}] eV")
+    off_grid = np.asarray(support.no_qp, dtype=bool) & (
+        (e < grown_grid[0]) | (e > grown_grid[-1]))
+    for k, n in zip(*np.nonzero(off_grid)):
+        _record_sc(inputs, f"SC window no-quasiparticle (map {iteration}): {state(k, n)}; "
+                   "Z outside (0, 1] at the previous map, off the grid; it does not "
+                   "move the support and reads the out-of-grid rule")
     if event in ("plan", "one-shot"):
         outside = req & ((e < sampled_grid[0]) | (e > sampled_grid[-1]))
         for k, n in zip(*np.nonzero(outside)):
             _record_sc(inputs, f"SC sampled-support growth: {state(k, n)}, "
-                       f"pad={float(sc_state_pad_ev(e[k, n])):.6f} eV; "
-                       f"sampled {grids}")
+                       f"pad={SUPPORT_PAD_EV[0]:.6f} eV; sampled {grids}")
         return
     if not req.any():
-        _record_sc(inputs, f"SC window {event} (map {iteration}): no required state; grid {grids}")
+        _record_sc(inputs, f"SC window {event} (map {iteration}): no requested state; grid {grids}")
         return
     masked_lo = np.where(req, e, np.inf)
     masked_hi = np.where(req, e, -np.inf)
     lo_kn = np.unravel_index(int(np.argmin(masked_lo)), e.shape)
     hi_kn = np.unravel_index(int(np.argmax(masked_hi)), e.shape)
-    half = sc_read_halfwidth_ev()
+    half = read_halfwidth_ev()
     if event == "re-plan":
         _record_sc(inputs, f"SC window re-plan (map {iteration}, pad "
-                   f"{SC_WINDOW_PAD_EV[-1]:.2f} eV): grid {grids}; lowest "
+                   f"{SUPPORT_PAD_EV[1]:.2f} eV): grid {grids}; lowest "
                    f"{state(*lo_kn)}, highest {state(*hi_kn)}")
         return
     if event == "hold":
@@ -2753,7 +2769,7 @@ def _record_sc_window_plan(inputs, iteration, event, sampled_grid, grown_grid,
         side = "upper" if e[k, n] + half > sampled_grid[-1] else "lower"
         _record_sc(inputs, f"SC window extension (map {iteration}): {state(k, n)}; "
                    f"read support [{e[k, n] - half:+.6f}, {e[k, n] + half:+.6f}] eV "
-                   f"crosses the {side} edge; pad {SC_WINDOW_PAD_EV[-1]:.2f} eV; grid {grids}")
+                   f"crosses the {side} edge; pad {SUPPORT_BUFFER_EV:.2f} eV; grid {grids}")
 
 
 def _sc_active_identities(inputs):
@@ -2793,11 +2809,9 @@ def _fit_sum_band_tail(fit_kwargs, fit_mask_kn, sigma0_kn, z_kn=None):
     mask = fit_mask_kn & ~sigma0_kn
     weights = None
     if z_kn is not None:
-        from .sigma_box_plan import snap_outward
+        from .qp_support import quasiparticle_mask
         z = np.asarray(z_kn, dtype=np.float64)
-        finite_z = np.where(np.isfinite(z) & (z > 0.0), z, 0.0)
-        z_down = np.vectorize(lambda x: snap_outward(x, 1., -1))(finite_z)
-        quasiparticle = np.isfinite(z) & (z > 0.0) & (z_down <= 1.0)
+        quasiparticle = quasiparticle_mask(z)
         mask = mask & quasiparticle
         weights = np.where(quasiparticle, z, 1.0)
     fit = fit_scissor(fit_mask_kn=mask, state_weights_kn=weights,
@@ -3300,7 +3314,7 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
                   _sc_sampled_support(inputs, partition, energies_loop, sigma_frame_mu_ev(
                       inputs.config, inputs.wfn, E_full, efermi_ry,
                       entry_occ_state if inputs.material_class == "metal" else None),
-                      _sc_active_identities(inputs)))
+                      _sc_active_identities(inputs), state.tail_z_kn))
     sigma0_kn = (np.zeros(energies_loop.shape, dtype=bool) if sc_support is None
                  else ~omega_coverage(sc_support[1], sc_support[2])[0])
 
@@ -3854,10 +3868,10 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
     sigma_config = inputs.config
     if sc_support is not None:
         session = inputs.fixed_quadrature_session
-        sampled_grid, expanded_grid, energy_relative_ev, required_kn, event = sc_support
-        _record_sc_window_plan(inputs, int(state.iteration), event, sampled_grid,
-                               expanded_grid, energy_relative_ev, required_kn)
+        expanded_grid, event = sc_support.grown, sc_support.event
+        _record_sc_window_plan(inputs, int(state.iteration), sc_support)
         if session is not None:
+            session["support_envelope_ev"] = sc_support.envelope
             # A grid that leaves a held Sigma certificate is a box escape and
             # refits only the windows it crossed (sigma_box_plan).
             session["omega_grid_ev"] = tuple(float(x) for x in expanded_grid)
@@ -4099,9 +4113,9 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
             exact_hartree_dft=exact_hartree_dft,
         ),
     )
-    if tail_fit is not None:
+    if inputs.config.compute_mode.is_dynamic:
         # This map's Z at each identity's own input energy: the next map's
-        # tail weights.  Sigma was built in the input carry's eigenbasis,
+        # tail weights and quasiparticle set (gw.qp_support).  Sigma was built in the input carry's eigenbasis,
         # whose sorted columns indices_loop maps to identities.  Collective,
         # every rank.
         z_sorted = _sc_z_factors(inputs, state_out, energies_loop)

@@ -79,7 +79,8 @@ def test_map0_grid_is_the_requested_grid_and_grows_only_on_escape():
     # a RETAINED state escapes, to E +/- pad(E), keeping every old sample.
     from types import SimpleNamespace
     from gw.gw_config import LorraxConfig, QPSolver
-    from gw.scissor import extend_sc_omega_grid_ev, sc_padded_window_ev
+    from gw.qp_support import grow_support_ev
+    from gw.scissor import sc_padded_window_ev
     sigma = SimpleNamespace(omega_min_ev=-2., omega_max_ev=5.,
                             omega_step_ev=.25, parsed_omega_patches_ev=lambda: [])
     original = -2. + .25 * np.arange(29)
@@ -100,13 +101,13 @@ def test_map0_grid_is_the_requested_grid_and_grows_only_on_escape():
     energies = np.array([[-1., 0.5, 5.3, 9.]])
     retained = np.array([True, True, False, False])
     np.testing.assert_array_equal(
-        extend_sc_omega_grid_ev(original, energies, retained, .25), original)
-    # a retained state at 5.3 eV escaped the top: grow to E + pad(E), keep
-    # every old sample, do not grow the bottom
+        grow_support_ev(original, energies, retained, .25, pad_ev=1., trigger_ev=0.), original)
+    # a retained state at 5.3 eV escaped the top: grow to E + pad (flat,
+    # gw.qp_support), keep every old sample, do not grow the bottom
     retained[2] = True
-    extended = extend_sc_omega_grid_ev(original, energies, retained, .25)
+    extended = grow_support_ev(original, energies, retained, .25, pad_ev=1., trigger_ev=0.)
     np.testing.assert_array_equal(extended[:29], original)
-    assert extended[-1] >= 5.3 + sc_state_pad_ev(5.3)
+    assert 5.3 + 1. <= extended[-1] < 5.3 + 1. + .25
     assert extended[0] == -2. and np.allclose(np.diff(extended), .25)
 
 
@@ -126,7 +127,7 @@ def test_identity_priority_preserves_established_readout_assignment():
 
 
 def test_promoted_multiplet_grows_sampled_support_and_reuses_it():
-    from gw.scissor import extend_sc_omega_grid_ev
+    from gw.qp_support import grow_support_ev
 
     reference = np.array([[0., 4., 4.], [0., 4., 8.]])
     energy = np.array([[0., 4., 7.], [0., 4., 8.]])
@@ -134,42 +135,42 @@ def test_promoted_multiplet_grows_sampled_support_and_reuses_it():
     required = np.asarray(part.protected_mask | part.in_range_mask)
     assert required[0, 2] and not required[1, 2]
     original = np.arange(-3., 6.25 + .125, .25)
-    grown = extend_sc_omega_grid_ev(original, energy, required, .25)
+    grown = grow_support_ev(original, energy, required, .25, pad_ev=1.25, trigger_ev=0.)
     assert grown[-1] == pytest.approx(8.25)
     assert grown[0] == original[0]
     np.testing.assert_array_equal(grown[:original.size], original)
     # Without growth the retained 7 eV member would interpolate to 6.25.
     assert np.interp(7., original, original) != pytest.approx(7.)
     assert np.interp(7., grown, grown) == pytest.approx(7.)
-    repeated = extend_sc_omega_grid_ev(grown, energy, required, .25)
+    repeated = grow_support_ev(grown, energy, required, .25, pad_ev=1.25, trigger_ev=0.)
     np.testing.assert_array_equal(repeated, grown)
 
 
 def test_sc_support_growth_low_edge_and_unrequired_outlier():
-    from gw.scissor import extend_sc_omega_grid_ev
+    from gw.qp_support import grow_support_ev
 
     original = np.arange(-3., 6.25 + .125, .25)
     energy = np.array([[-4., 0., 50.]])
-    grown = extend_sc_omega_grid_ev(original, energy, [[True, True, False]], .25)
+    grown = grow_support_ev(original, energy, [[True, True, False]], .25, pad_ev=1., trigger_ev=0.)
     assert grown[0] == pytest.approx(-5.)
     assert grown[-1] == original[-1]
     np.testing.assert_array_equal(grown[-original.size:], original)
 
 
 def test_sc_support_unchanged_for_covered_energies():
-    from gw.scissor import extend_sc_omega_grid_ev
+    from gw.qp_support import grow_support_ev
 
     original = np.arange(-3., 6.25 + .125, .25)
-    grown = extend_sc_omega_grid_ev(original, [[-3., 6.25]], [[True, True]], .25)
+    grown = grow_support_ev(original, [[-3., 6.25]], [[True, True]], .25, pad_ev=1., trigger_ev=0.)
     np.testing.assert_array_equal(grown, original)
 
 
 def test_sc_support_retains_patched_grid_hole_refusal():
-    from gw.scissor import extend_sc_omega_grid_ev
+    from gw.qp_support import grow_support_ev
 
     patched = np.r_[np.arange(-3., -.9, .25), np.arange(2., 6.3, .25)]
     with pytest.raises(ValueError, match="omega_grid_hole"):
-        extend_sc_omega_grid_ev(patched, [[0.]], [[True]], .25)
+        grow_support_ev(patched, [[0.]], [[True]], .25, pad_ev=1., trigger_ev=0.)
 
 
 def test_scissor_fit_keeps_a_crossed_protected_sample_paired():
