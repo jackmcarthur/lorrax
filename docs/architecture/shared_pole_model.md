@@ -93,7 +93,8 @@ sampled, not continuum certificates; a matched QP comparison is the acceptance
 check.
 
 **Domain and occupations.** The transition interval spans every nonzero
-occupied/empty weight pair after a sample-only $10^{-14}$ activity floor,
+occupied/empty weight pair on the one branch support
+(`gw.efermi.band_in_occupation_window`, $|w|\ge 2^{-53}$; samples only),
 including negative transition energies and signed metallic weights; the exact
 moments keep every weight. The occupation envelope
 $|f_nu_m|\le A_fA_u\min(1,e^{\beta(E_m-E_n)})$, with $A=\max(1,\max|\cdot|)$ and
