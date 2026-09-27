@@ -150,7 +150,27 @@ def _coulomb_resource(value, meta, sym, mesh_xy, path):
             io.sync_writes()
             del canonical
     return dict(path=str(path), dataset="V_canonical_qwedge", basis="canonical",
-                q_irr_full_idx=qids.tolist(), sha256=resource_digest(path))
+                q_irr_full_idx=qids.tolist(), sha256=resource_digest(path),
+                operator=_operator_token(op.values))
+
+
+#: The one bare-V operator of this process, by token.  The strong reference
+#: keeps the token (an object id) unique for the operator's lifetime, which is
+#: the run's: every SC map screens with the same V_q.
+_COULOMB_OPERATORS: dict = {}
+
+
+def _operator_token(values):
+    """Process-local identity of the bare V operator, stable across SC maps.
+
+    ``gw.response_bank._coulomb_batch`` keys its held Coulomb roots on it, so
+    a map that stages the same V again reuses the first map's roots.
+    """
+    token = f"V@{id(values):x}"
+    if _COULOMB_OPERATORS.get(token) is not values:
+        _COULOMB_OPERATORS.clear()
+        _COULOMB_OPERATORS[token] = values
+    return token
 
 
 def _bank_residence(meta, config, *, mesh_xy, sym, root, label, photon, mu_bases=None):
@@ -408,6 +428,9 @@ def screen_shared_poles(wfns, V_q, meta, config, *, mesh_xy, sym,
             saved_bank_receipt = json.loads((root / 'bank_receipt.json').read_text())
             coulomb = (None if photon else dict(saved_bank_receipt['coulomb_identity'],
                            path=str(root / 'coulomb.h5')))
+            if coulomb is not None:
+                # A saved token names another process's operator: no held roots.
+                coulomb.pop('operator', None)
         else:
             coulomb = (None if photon else
                        _coulomb_resource(V_q, meta, sym, mesh_xy, root / "coulomb.h5"))

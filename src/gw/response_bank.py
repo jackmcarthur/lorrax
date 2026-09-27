@@ -673,13 +673,43 @@ def _coulomb_pack(basis,mesh_xy):
     return jax.jit(lambda v: basis.pack_operator(v,spec=P(None,"x","y")))
 
 
+#: V^(1/2), V^(-1/2) and support ranks of the run's bare Coulomb operator, per
+#: requested q span.  V is the same operator at every SC map (fixed ISDF basis
+#: and q set), so the bank, moments and constructor of every map after the
+#: first reuse the first map's roots instead of re-reading V and re-solving its
+#: eigenproblems.  Keyed by the operator token of the resource
+#: (``shared_pole_screening._coulomb_resource``), the span and the solve layout;
+#: a new operator drops the old roots.  Held bytes per rank: 32 N_mu_packed^2 per
+#: held q row / P; the bank and moments share (0, N_q), the constructor's
+#: rounds add one more set, so 64 N_q N_mu_packed^2 / P in all.
+_COULOMB_ROOTS: dict = {}
+
+
 def _coulomb_batch(meta, config, bank_io, mesh_xy, q_span, execute):
     """Read one authenticated canonical V batch; convert through its owner."""
     if "photon_v" in bank_io:
         value = bank_io["photon_v"][q_span[0]:q_span[1]]
         return value, None, [value.shape[-1]] * (q_span[1]-q_span[0])
-    from file_io.slab_io import SlabIO
     basis = meta.mu_basis
+    resource = bank_io["coulomb"]
+    layout = config.get("linalg", "local") if hasattr(config, "get") else config.backend.linalg
+    token = resource.get("operator")
+    key = None if token is None else (token, (int(q_span[0]), int(q_span[1])),
+                                      basis.n_packed, basis.n_logical, layout, mesh_xy)
+    held = _COULOMB_ROOTS.get(key)
+    if held is not None and not any(x.is_deleted() for x in held[:2]):
+        return held
+    h, hi, ranks = _coulomb_roots(meta, basis, resource, layout, mesh_xy, q_span, execute)
+    if key is not None:
+        for stale in [k for k in _COULOMB_ROOTS if k[0] != token]:
+            del _COULOMB_ROOTS[stale]
+        _COULOMB_ROOTS[key] = (h, hi, ranks)
+    return h, hi, ranks
+
+
+def _coulomb_roots(meta, basis, resource, layout, mesh_xy, q_span, execute):
+    """Read the q span of V and return its PSD roots through the service plan."""
+    from file_io.slab_io import SlabIO
     shape = (q_span[1]-q_span[0], basis.n_canonical, basis.n_canonical)
     spec = P(None, "x", "y")
     abstract = jax.ShapeDtypeStruct(shape, jnp.complex128,
@@ -688,13 +718,11 @@ def _coulomb_batch(meta, config, bank_io, mesh_xy, q_span, execute):
     memory = compiled.memory_analysis()
     _reserve(meta, "coulomb_read_pack", memory.argument_size_in_bytes,
              memory.output_size_in_bytes + memory.temp_size_in_bytes)
-    resource = bank_io["coulomb"]
     with SlabIO(resource["path"], mode="r", mesh=mesh_xy) as io:
         canonical = io.read_slab(resource["dataset"], shape=shape,
             offset=(q_span[0], 0, 0), partition_spec=spec)
         v = compiled(canonical)
     del canonical
-    layout = config.get("linalg", "local") if hasattr(config, "get") else config.backend.linalg
     kernel = _coulomb_algebra(mesh_xy, basis.n_packed, basis.n_logical, layout)
     h, hi, negative, ranks = execute(kernel, (v,), "coulomb_sqrt")
     if bool(negative):
