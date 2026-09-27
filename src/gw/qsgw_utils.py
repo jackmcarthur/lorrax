@@ -567,12 +567,12 @@ _QSGW_FAR_KERNEL_CACHE: dict[tuple[int, bool], object] = {}
 
 
 def _qsgw_far_kernel(mesh_xy: Mesh, *, replicated_output: bool):
-    """As ``_qsgw_build_kernel``, with every rotating endpoint read from the far cube.
+    """As ``_qsgw_build_kernel``, with rotating endpoints beyond the near support read far.
 
     Sigma_c,ij = 1/2 [Sigma_ij(E_i) + Sigma_ij(E_j)], each endpoint read from
-    the near cube when that state is protected and from the far-patch cube
-    otherwise; the rotating block itself is replaced downstream except its
-    diagonal, which is the rotating state's own-energy read.
+    the near cube (``protected`` = 1: protected, or rotating inside the near
+    support) or from the far-patch cube (0); the rotating block is replaced
+    downstream except its diagonal, the rotating state's own-energy read.
     """
     key = (id(mesh_xy), bool(replicated_output))
     fn = _QSGW_FAR_KERNEL_CACHE.get(key)
@@ -747,15 +747,21 @@ def build_qsgw_sigma_xc(
         sig_f, far_omega = far
         far_omega = np.asarray(far_omega, dtype=np.float64)
         flo, fhi, fwl, fwh, finside = _interp_tables(far_omega, E)
+        # A rotating state inside the near support reads the near cube; only
+        # rotating states beyond it read the far patches (which were planned
+        # over exactly those energies).
+        beyond = (E < omega_lo) | (E > omega_hi)
+        near_read = np.where((protected < 0.5) & beyond, 0.0, 1.0)
         n_far_clipped = int(np.count_nonzero(
-            (~finside[:, :logical_nb]) & (protected[:, :logical_nb] < 0.5)))
+            (~finside[:, :logical_nb]) & (near_read[:, :logical_nb] < 0.5)))
         put = lambda a, t: device_put_process_local(a.astype(t), rep_2d)
         sigma_xc_qsgw = _qsgw_far_kernel(
             mesh_xy, replicated_output=bool(replicated_output))(
             sigma_c_omega_ry, sig_f, sigma_x_kij_ry,
             idx_lo_j, idx_hi_j, w_lo_j, w_hi_j,
             put(flo, np.int32), put(fhi, np.int32),
-            put(fwl, np.complex128), put(fwh, np.complex128), protected_j)
+            put(fwl, np.complex128), put(fwh, np.complex128),
+            device_put_process_local(near_read, rep_2d))
     else:
         sigma_xc_qsgw = _qsgw_build_kernel(
             mesh_xy, replicated_output=bool(replicated_output))(
