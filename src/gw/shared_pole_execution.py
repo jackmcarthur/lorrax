@@ -12,6 +12,28 @@ import numpy as np
 from jax.sharding import NamedSharding, PartitionSpec as P
 
 
+def local_reduction_fits(plan, side, budget_bytes):
+    """Whether one parent's pencil reduces on one device.
+
+    The local round holds eight [side, side] complex128 blocks of one parent
+    (G, H, their equilibrated copies, the eigenvectors and the metric
+    products) plus the device-local eigensolver's workspace on its own rank;
+    ``distrib_la.fits_local`` prices exactly that. A native workspace query
+    that refuses the side (nonzero status) means the local eigensolver cannot
+    run it at all, so the answer is also False; a build without the query
+    still raises. One owner for the routing admission and the round's own
+    admission, so a parent the route admits locally always reduces locally.
+    """
+    import distrib_la
+    try:
+        return bool(distrib_la.fits_local(plan, "eigh", ((1, int(side), int(side)),) * 8,
+                                          np.complex128, int(budget_bytes)))
+    except RuntimeError as exc:
+        if "failed with status" in str(exc):
+            return False
+        raise
+
+
 def constructor_side_upper_bound(recipe, *, ordered, odd_moments,
                                  logical_n=None,
                                  column_extent=lambda width: width):
@@ -188,6 +210,17 @@ def constructor_execution(meta, resolution, recipe, *, mesh, ledger, upstream,
             selection_face_count=selection_faces,
             retained_output_upper_bound_bytes_per_rank=retained_outputs,
             local_selection=resident_selection, local_reduction=resident_reduction)
+    # A parent that cannot reduce on one device runs on the face: admission,
+    # not a refusal. The conservative side bounds every round's actual side,
+    # so the round's own admission (constructor ``_admit``) then always fits.
+    if cross_original_sides is None and not local_reduction_fits(
+            local.eigenplan(side), side, ledger.device_budget_bytes_per_rank):
+        return 'face', dict(
+            reason='local parent pencil (conservative side) cannot reduce on one device',
+            requested_layout=resolution.layout, conservative_pencil_side=side,
+            selection_face_count=selection_faces,
+            retained_output_upper_bound_bytes_per_rank=retained_outputs,
+            local_selection=resident_selection, local_reduction=None)
     selection = preview('selection', **selection_args)
     reduction = None if defer_reduction else preview(reduction_phase, **reduction_args)
     admitted = all(row['device_budget_status'] == 'PASS'

@@ -298,9 +298,23 @@ diagnostic supports and the $M_1/M_3$ block are additional.
 Placement is a condenser problem, not a choice of interesting frequencies:
 
 * **Imaginary ladder.** Log-spaced on $[u_{\min},u_{\max}]$ with
-  $u_{\min}=\max(4\eta,E_g)$, $u_{\max}=\max(16\ \mathrm{eV},L)$,
-  $L=\omega_p+3.5\ \mathrm{eV}$ ($\omega_p$ from the active electron density),
-  $\kappa=L/u_{\min}$, and the count of (W 23).
+  $u_{\min}=\max(4\eta,E_g)$ and $u_{\max}=\Omega_{\rm top}=\max(D_{\max},\omega_p)$,
+  $D_{\max}=\max E_{\rm cond}-\min E_{\rm val}$ the response transition span
+  ($\omega_p$ from the active electron density), $\kappa=u_{\max}/u_{\min}$,
+  and the count of (W 23). The imaginary axis $s=-u^2$ is the mirror image of
+  the spectral support $[\Omega_{\min}^2,\Omega_{\rm top}^2]$, so the
+  condenser is symmetric and its sites end where the spectrum ends. A site
+  above $\Omega_{\rm top}$ adds only $O((\Omega/u)^4)$ beyond the $M_1/M_3$
+  block, and its $H$ entries $s\,G-Q^\dagger O=\int d\mu\,t/(u^2+t)^2$ are a
+  cancellation of $O(1)$ terms: the Ritz step then returns noise-born
+  negative $\lambda$ of order $-u^2$ (Na 8³, 86 bands, $D_{\max}=150$ eV: a
+  320 eV site gives 60 negative Ritz values down to $-110$ Ry² and refuses the
+  zero-Ritz gate; a 640 eV site $-2000$ Ry²; sites $\le 160$ eV give none,
+  claim 2913). Nothing here is metallic: the Si set 1/$\sqrt{320}$/320 eV works
+  on the 536-band Si reference because its $D_{\max}=332$ eV. For a metal
+  $E_g=0$, so $u_{\min}=4\eta$; the plasmon lies inside the ladder and the
+  $q\to0$ Drude/Fermi-surface term is the head's (Section 7 of the
+  implementation page), not the body parent's.
 * **Line ladder.** Height $h=\max(2.6\ \mathrm{eV},4\eta)$; the remaining
   $18-m$ sites are equal quantiles of $\rho^{1/2}$ on
   $[\max(h,\text{first spacing}),\,\omega_{\rm reach}]$, where $\rho$ is the

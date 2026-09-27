@@ -27,7 +27,12 @@ shared_real_pole_v1_r3b = {
     "active_depth_ev": 15.0,
     "borderline_depth_ev": 25.0,
     "plasma_margin_ev": 3.5,
-    "imaginary_floor_max_ev": 16.0,
+    # Imaginary ladder top (METALW 2026-09-27): the spectral top of W^c, the
+    # response transition span max(E_cond) - min(E_val) (never below omega_p).
+    # A support above it duplicates the M1/M3 infinity block to O((top/u)^4)
+    # and its H entries are cancellation noise (negative Ritz values); a top
+    # far below it leaves the spectrum above to two moments.
+    "imaginary_top": "max(response transition span, omega_p)",
     "imaginary_count_epsilon": 1.0e-3,
     "imaginary_min_count": 2,
     "imaginary_count_rule": "max(2, round(log(16*(L/u_min)^2)*log(4000)/(2*pi^2)))",
@@ -63,7 +68,13 @@ shared_real_pole_v1_r3b = {
 # and version. Composite checks retain their individual dimensional thresholds.
 _GATE_ROWS = {
     "normalized_gram_keep": ("retain gamma/gamma_max strictly above cut", 1.0e-8),
-    "normalized_gram_validity": ("gamma_min/gamma_max >= threshold", -1.0e-7),
+    "normalized_gram_validity": ("gamma_min/gamma_max >= threshold; the photon sector route and direct unit calls only (the scalar routes use gram_rounding_validity)", -1.0e-7),
+    # METALW 2026-09-27: the exact Gram is PSD, so a negative computed eigenvalue
+    # is rounding. Weyl: gamma_min >= -||E||_2 >= -gamma_n ||D^-1/2 Sigma D^-1/2||_F
+    # with Sigma the uncancelled magnitude of each divided-difference entry
+    # (shared_pole_reduction.gram_rounding_floor), plus R u gamma_max for the solver.
+    "gram_rounding_validity": ("equilibrated gamma_min >= -(bound_factor * gamma_n ||D^-1/2 Sigma D^-1/2||_F + R u gamma_max); gamma_n = n u/(1-n u), Sigma the uncancelled divided-difference magnitudes",
+                               {"bound_factor": 1.0, "unit_roundoff": 2.0 ** -53}),
     "zero_ritz_policy": ("drop lambda <= cutoff only within factor-weight budget",
                          {"lambda_cutoff_ry2": 1.0e-6, "max_dropped_weight_fraction": 1.0e-6}),
     # Legacy C denotes b: preserve this hashed predicate for stored identities.
@@ -670,6 +681,9 @@ def build_construction_row(model, counts, diagnostics, *, span, roles, price,
     measurements = {
         "normalized_gram_keep": dict(value=int(reduction["retained_rank"][0]), passed=True, reason="normalized Gram cut, current q"),
         "normalized_gram_validity": dict(value=float(reduction["gram_min_relative"][0]), passed=True, reason="normalized Gram spectrum"),
+        "gram_rounding_validity": dict(value={"gram_min_relative": float(reduction["gram_min_relative"][0]),
+                                              "floor_relative": float(reduction["gram_floor_relative"][0])},
+                                       passed=True, reason="propagated float64 floor of the equilibrated Gram"),
         "zero_ritz_policy": dict(value=float(zero["dropped_factor_weight_fraction"][0]), passed=True, reason="physical factor weight, sentinels excluded"),
         "finite_factors_poles": dict(value=True, passed=True, reason="zero policy, active prefix and exact inert sentinels"),
         "passivity": dict(value={k: np.asarray(v).tolist() for k, v in passive.items() if k != "passivity"}, passed=True, reason=("signed particle-hole model, Hermitian part at i eta; anti-Hermitian part is the odd channel, reported" if ordered else "raw latent model; authenticated inverse Coulomb square root at current eta; projected operator not measured")),
@@ -1143,7 +1157,10 @@ def resolve_shared_pole_recipe(config, wfns, meta, *, mesh_xy, print_fn,
                                / census['cell_volume_bohr3'])
     top = plasma_ry * RYD_TO_EV + recipe['plasma_margin_ev']
     umin = max(recipe['height_eta_factor'] * eta, census['gap_ev'])
-    umax = max(recipe['imaginary_floor_max_ev'], top)
+    # The imaginary condenser is the image of W^c's spectral support
+    # [Omega_min^2, Omega_top^2] on the negative s axis, cut below at the
+    # consumer's resolution 4 eta (or the gap): docs/theory/shared-pole-w-model.md 5.1.
+    umax = max(census['response_transition_span_ry'], plasma_ry) * RYD_TO_EV
     if umin >= umax:
         raise ValueError(f"GATE shared_pole_interval: got: u_min={umin} >= u_max={umax} eV; want: u_min < u_max; why: imaginary support interval is unresolved")
     support_receipt = None
@@ -1157,7 +1174,7 @@ def resolve_shared_pole_recipe(config, wfns, meta, *, mesh_xy, print_fn,
         retained = support_receipt['retained']
         top, umin, umax = (retained['line_top_ev'], retained['u_min_ev'],
                            retained['u_max_ev'])
-    kappa = top / umin
+    kappa = umax / umin
     count = imaginary_sample_count(kappa, tier, recipe)
     imaginary = np.geomspace(umin, umax, count)
     if tier == 'relaxed':
@@ -1185,7 +1202,7 @@ def resolve_shared_pole_recipe(config, wfns, meta, *, mesh_xy, print_fn,
         imaginary = np.asarray(override['imaginary_ev'], dtype=np.float64)
         count = int(imaginary.size)
         umin, umax = float(imaginary[0]), float(imaginary[-1])
-        kappa = top / umin
+        kappa = umax / umin
     mids = 0.5 * (line[:-1] + line[1:])
     held_pairs = [int(np.argmin(abs(mids - (line[0] + fraction*(line[-1] - line[0])))))
                   for fraction in recipe['held_line_fractions']]
@@ -1298,10 +1315,10 @@ def resolve_shared_pole_recipe(config, wfns, meta, *, mesh_xy, print_fn,
         'line': 'production: 18 fitted supports less the imaginary count, quantiles of the band-structure crossing density; relaxed 8 endpoints',
         'line_direction_cap': 'production ceil(n/16) right singular directions per line support (whole multiplets); relaxed none',
         'pole_budget': 'production ceil(1.8 n) retained Gram directions per parent (largest first); relaxed none',
-        'imaginary': 'log-spaced u_min..u_max; round(log(16*(L/u_min)^2)*log(4000)/(2*pi^2)), min2; tier width ceil(f*n)',
+        'imaginary': 'log-spaced u_min..u_max; round(log(16*(u_max/u_min)^2)*log(4000)/(2*pi^2)), min2; tier width ceil(f*n)',
         'held_line': 'adjacent-support midpoint nearest 25%/65% of the line interval; lower-index tie',
         'held_imaginary': 'geometric midpoint of first/last adjacent imaginary pair',
-        'u_min': 'max(h,logical gap)', 'u_max': 'max(16 eV,L)', 'kappa': 'L/u_min',
+        'u_min': 'max(4 eta,logical gap)', 'u_max': 'max(response transition span, omega_p): the spectral top of W^c', 'kappa': 'u_max/u_min',
         'infinity': 'ceil(tier infinity fraction*n)', 'direction': 'tier relative singular cutoff',
         'multiplet': 'whole multiplets within relative 1e-6',
         'bank': 'fixed Hermite certificate tolerance 1e-8',
@@ -1312,8 +1329,8 @@ def resolve_shared_pole_recipe(config, wfns, meta, *, mesh_xy, print_fn,
     }
     if support_receipt is not None:
         rules.update(top='SC high-water envelope of omega_p+3.5 eV',
-                     u_min='SC low-water envelope of max(h,logical gap)',
-                     u_max='SC high-water envelope of max(16 eV,L)',
+                     u_min='SC low-water envelope of max(4 eta,logical gap)',
+                     u_max='SC high-water envelope of max(response transition span, omega_p)',
                      support_envelope='current required bounds and retained sampling enclosure; not an interpolation-error certificate')
     for key, value in result.items():
         shown = value.tolist() if isinstance(value, np.ndarray) else value
