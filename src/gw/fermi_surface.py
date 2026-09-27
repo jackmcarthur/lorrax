@@ -385,13 +385,26 @@ def _atom_kernel(q, z, u):
 
 
 def _density_response(q, z, w_blocks, u_blocks):
+    """``sum_s W_s x_s / (z - x_s)``, ``x_s = q.u_s``, one atom block per scan step.
+
+    ``x`` is formed by broadcasting rather than a K = 3 GEMM and the weighted
+    atom sum is a reduction, so each block is one fused elementwise-reduce
+    kernel that never writes its ``(nq, block)`` table to device memory.  The
+    ``g @ w`` form materialized that table per block and was memory bound:
+    2.8 s of a Na 8^3 SC map (17 frequencies x 10 draws x 30 blocks).  The
+    ``moving``/``denom`` guards are those of :func:`_atom_kernel`.
+    """
     import jax
     import jax.numpy as jnp
 
     def one(total, block):
         w, u = block
-        g, _ = _atom_kernel(q, z, u)
-        return total + g @ w.astype(jnp.complex128), None
+        x = (q[:, 0, None] * u[None, :, 0] + q[:, 1, None] * u[None, :, 1]
+             + q[:, 2, None] * u[None, :, 2]).astype(jnp.complex128)
+        moving = x != 0
+        denom = jnp.where(moving, z - x, 1.0 + 0.0j)
+        g = jnp.where(moving, x / denom, 0.0)
+        return total + jnp.sum(g * w.astype(jnp.complex128)[None, :], axis=1), None
 
     total, _ = jax.lax.scan(one, jnp.zeros(q.shape[0], jnp.complex128),
                             (w_blocks, u_blocks), unroll=1)
