@@ -1,6 +1,6 @@
 """QP wavefunction rotation matrix I/O.
 
-Two writers live here:
+Three writers live here:
 
 * :func:`write_qp_rotations_h5` — small ``(U, E_qp)`` companion file used
   by tools that want to apply the QP rotation themselves.
@@ -8,6 +8,9 @@ Two writers live here:
   rotated and energies replaced.  This is the canonical "QP WFN" output
   consumed by downstream BSE / restart paths that just want a WFN.h5
   drop-in replacement.
+* :func:`write_complete_wfn_h5` — the same collective writer on the same
+  source header for a band set computed elsewhere (``psp.run_dense_h``:
+  every band of the G-sphere basis).
 
 WHICH k-SET ``qp_wfn_rotations.h5`` IS STORED ON
 ------------------------------------------------------------------------
@@ -828,21 +831,6 @@ def write_qp_wfn_h5(
 
     from common import timing
     from .slab_io import SlabIO
-    from .wfn_writer import wfn_header_tables
-
-    ngk = np.asarray(wfn.ngk_valid(k="ibz"), dtype=np.int32)
-    gvecs_ibz = wfn.gvecs(k="ibz")                           # (nk, ngkmax, 3)
-    gvecs = np.concatenate(
-        [gvecs_ibz[ik, :int(ngk[ik])] for ik in range(nk)],
-        axis=0).astype(np.int32)
-    tables = wfn_header_tables(
-        wfn,
-        kpoints=np.asarray(wfn.kpoints, dtype=np.float64),
-        weights=np.asarray(wfn.kweights, dtype=np.float64),
-        kgrid=tuple(int(x) for x in wfn.kgrid),
-        nbands=nbands, ngk=ngk, occupations=occupations, nosym=False,
-        shift=tuple(float(x) for x in wfn.shift))
-    tables["mf_header/kpoints/el"][0] = enk_full_ry
 
     # THE FILE SAYS WHAT IT IS.  ψ and E in here are a MATCHED PAIR: the
     # rotated orbitals carry the QP eigenvalues that produced the rotation,
@@ -863,11 +851,9 @@ def write_qp_wfn_h5(
     }
 
     with timing.section("qp_wfn.write"):
-        with SlabIO(output_path, mode="w", mesh=mesh) as io:
-            for name, value in tables.items():
-                io.write_attr(name, value)
-            io.write_attr("wfns/gvecs", gvecs)
-            io.stamp_dataset_attrs("/", stamps)
+        ngk = _write_source_header(
+            output_path, wfn, nbands=nbands, energies_ry=enk_full_ry,
+            occupations=occupations, stamps=stamps, mesh=mesh)
         with SlabIO(wfn.path, mode="r", mesh=mesh) as src, \
                 SlabIO(output_path, mode="a", mesh=mesh) as dst:
             _write_rotated_coefficients(
@@ -875,6 +861,111 @@ def write_qp_wfn_h5(
                 band_start=int(band_start), band_stop=int(band_stop),
                 nbands=nbands, nspinor=int(wfn.nspinor), ngk=ngk,
                 kpt_starts=np.asarray(wfn.kpt_starts, dtype=np.int64))
+
+
+def _write_source_header(output_path, wfn, *, nbands, energies_ry,
+                         occupations, stamps, mesh) -> np.ndarray:
+    """COLLECTIVE: a new ``WFN.h5`` holding ``wfn``'s header, k-set and G-lists.
+
+    ``mf_header`` comes from :func:`file_io.wfn_writer.wfn_header_tables` on
+    the source loader with ``nbands`` bands and ``energies_ry`` (nk, nbands);
+    ``wfns/gvecs`` is the source's, so symmetry consumers unfold the output
+    exactly as they unfold the source.  All of it, and the root ``stamps``,
+    is SlabIO deferred metadata landed by rank 0 at this handle's close,
+    which also creates the ``wfns`` group the coefficients then need.
+    Returns the per-k ``ngk``.
+    """
+    from .slab_io import SlabIO
+    from .wfn_writer import wfn_header_tables
+
+    nk = int(wfn.nkpts)
+    ngk = np.asarray(wfn.ngk_valid(k="ibz"), dtype=np.int32)
+    gvecs_ibz = wfn.gvecs(k="ibz")                           # (nk, ngkmax, 3)
+    gvecs = np.concatenate(
+        [gvecs_ibz[ik, :int(ngk[ik])] for ik in range(nk)],
+        axis=0).astype(np.int32)
+    tables = wfn_header_tables(
+        wfn,
+        kpoints=np.asarray(wfn.kpoints, dtype=np.float64),
+        weights=np.asarray(wfn.kweights, dtype=np.float64),
+        kgrid=tuple(int(x) for x in wfn.kgrid),
+        nbands=int(nbands), ngk=ngk, occupations=occupations, nosym=False,
+        shift=tuple(float(x) for x in wfn.shift))
+    tables["mf_header/kpoints/el"][0] = energies_ry
+    with SlabIO(output_path, mode="w", mesh=mesh) as io:
+        for name, value in tables.items():
+            io.write_attr(name, value)
+        io.write_attr("wfns/gvecs", gvecs)
+        io.stamp_dataset_attrs("/", stamps)
+    return ngk
+
+
+#: Root attribute naming a WFN whose band set is the complete G-sphere basis.
+COMPLETE_WFN_ATTR = "lorrax_complete_basis_wfn"
+
+
+def write_complete_wfn_h5(output_path: str, wfn, energies_ry: np.ndarray,
+                          local_coefficients: dict, *, mesh,
+                          stamps: dict) -> None:
+    """COLLECTIVE over ``mesh``: a ``WFN.h5`` on ``wfn``'s header with new bands.
+
+    The writer for a band set computed away from the source (the dense-H
+    route, :mod:`psp.run_dense_h`): same k-set, symmetry and G-lists as
+    ``wfn``, ``energies_ry`` ``(nk, nbands)`` replicated on every rank, and
+    each k's coefficients ``(nbands, nspinor, ngk[k])`` complex128 in the
+    source's G order held by ONE rank, in ``local_coefficients[k]`` there.
+    Per k, one all-reduce puts the owner's block on every rank (``nbands ·
+    nspinor · ngk · 16`` B), each rank slices its G window and every window
+    is written collectively through ``file_io.slab_io`` as
+    :func:`write_qp_wfn_h5` writes its rotated slabs.  ``stamps`` land at the
+    root beside :data:`COMPLETE_WFN_ATTR` = the band count.
+    """
+    from jax.sharding import NamedSharding, PartitionSpec as P
+    from common import timing
+    from common.collectives import device_put_process_local, psum_replicate
+    from .slab_io import SlabIO
+
+    nk = int(wfn.nkpts)
+    nspinor = int(wfn.nspinor)
+    energies_ry = np.asarray(energies_ry, dtype=np.float64)
+    if energies_ry.ndim != 2 or energies_ry.shape[0] != nk:
+        raise ValueError(
+            f"write_complete_wfn_h5: energies shape {energies_ry.shape} is "
+            f"not (nk={nk}, nbands).")
+    nbands = int(energies_ry.shape[1])
+    stamps = {**stamps, COMPLETE_WFN_ATTR: nbands}
+    with timing.section("complete_wfn.write"):
+        ngk = _write_source_header(
+            output_path, wfn, nbands=nbands, energies_ry=energies_ry,
+            occupations=None, stamps=stamps, mesh=mesh)
+        kpt_starts = np.asarray(wfn.kpt_starts, dtype=np.int64)
+        width = _coefficient_window(mesh, nbands=nbands, nspinor=nspinor,
+                                    ngkmax=int(np.max(ngk)))
+        sharding = NamedSharding(
+            mesh, P(None, None, tuple(mesh.axis_names), None))
+        with SlabIO(output_path, mode="a", mesh=mesh) as dst:
+            dst.create_dataset("wfns/coeffs",
+                               shape=(nbands, nspinor, int(np.sum(ngk)), 2),
+                               dtype=np.float64)
+            for ik in range(nk):
+                n_g = int(ngk[ik])
+                block = local_coefficients.get(ik)
+                if block is None:
+                    block = np.zeros((nbands, nspinor, n_g), np.complex128)
+                elif block.shape != (nbands, nspinor, n_g):
+                    raise ValueError(
+                        f"write_complete_wfn_h5: k={ik} coefficients "
+                        f"{block.shape} are not {(nbands, nspinor, n_g)}.")
+                block = psum_replicate(np.asarray(block, np.complex128), mesh)
+                for g0 in range(0, n_g, width):
+                    w = min(width, n_g - g0)
+                    host = np.zeros((nbands, nspinor, width, 2), np.float64)
+                    host[:, :, :w, 0] = block[:, :, g0:g0 + w].real
+                    host[:, :, :w, 1] = block[:, :, g0:g0 + w].imag
+                    dst.write_slab(
+                        "wfns/coeffs", device_put_process_local(host, sharding),
+                        offset=(0, 0, int(kpt_starts[ik]) + g0, 0),
+                        valid_shape=(nbands, nspinor, w, 2))
 
 
 def _write_rotated_coefficients(src, dst, *, mesh, U_kmn, band_start,

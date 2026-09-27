@@ -10,6 +10,7 @@ Public API (Hamiltonian construction + application):
   setup_H_k_from_kvec  — build HamiltonianK from k-vector (standalone/Davidson)
   apply_H_k            — fused JIT H|ψ⟩, psi_box donated; 2 ms on A100 for Si
   build_matrix_k       — full ⟨m|H|n⟩ matrix
+  dense_matrix_k       — H_k(sG, s'G') on the whole G-sphere (complete basis)
 
 Public API (G-vector layout):
   padded_gvectors       — the loader's FIXED-shape (nk, ngkmax, 3) table
@@ -884,6 +885,32 @@ def build_matrix_k(psi_box, T_diag, V_scf, Gx, Gy, Gz, vnl_Z, vnl_E, mask):
     H_mn = H_mn + vnl_ops.vnl_matrix(psi_G, vnl_Z, vnl_E)
 
     return H_mn
+
+
+@functools.partial(jax.jit, static_argnames=("nspinor",))
+def dense_matrix_k(T_diag, V_scf, Gx, Gy, Gz, vnl_Z, vnl_E, mask, *, nspinor):
+    """H_k(sG, s'G') on the whole G-sphere: ``apply_H_k_batched`` on the unit basis.
+
+    Column ``(s', G')`` is H applied to the plane wave ``e_{s'G'}``, so every
+    term (T, V_scf through the FFT box, V_NL) is the operator the Davidson
+    route applies, not a second assembly of it.  Rows and columns are
+    spinor-major, ``s·ngkmax + G``; returns ``(N, N)`` complex128 with
+    ``N = nspinor·ngkmax``.
+
+    Padded G (``mask`` false; ``setup_H_k_from_kvec(..., ngkmax=)``) carry
+    zero rows and columns except a diagonal ``h_pad`` above the whole
+    spectrum (the Gershgorin bound of the physical block plus 1 Ry), so the
+    lowest ``nspinor·nG`` eigenpairs are exactly the physical ones and
+    every k has one shape.  Returns ``(H, h_pad)``.
+    """
+    n = nspinor * int(T_diag.shape[0])
+    unit = jnp.eye(n, dtype=jnp.complex128).reshape(n, nspinor, -1)
+    columns = apply_H_k_batched(unit, T_diag, V_scf, Gx, Gy, Gz,
+                                vnl_Z, vnl_E, mask)
+    H = columns.reshape(n, n).T
+    h_pad = jnp.max(jnp.sum(jnp.abs(H), axis=1)) + 1.0
+    pad = jnp.tile(~mask, nspinor)
+    return H + jnp.diag(jnp.where(pad, h_pad, 0.0)), h_pad
 
 
 def matrix(psi_box: jax.Array, H_k: HamiltonianK) -> jax.Array:
