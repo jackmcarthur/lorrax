@@ -3066,7 +3066,7 @@ def _report_remaining_retired_keys(
         raise ValueError(
             "Input key 'occupation_window_threshold' is retired: a band "
             "belongs to a Green's-function branch iff its weight (f, or "
-            "1 - f) is resolved in float64, |w| >= 2**-53 "
+            "1 - f) has |w| >= 1e-5, 11.5 kBT for Fermi-Dirac "
             "(gw.efermi.band_in_occupation_window), the same support for the "
             "one-shot and every SC map.  Remove the key.")
     if section.get("low_mem_bands", fallback=None) is not None:
