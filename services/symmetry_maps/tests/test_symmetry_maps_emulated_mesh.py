@@ -753,7 +753,7 @@ def test_the_lorentz_mixing_matches_a_dense_numpy_reference(px, py):
             tiles[(i, j)] = a
     out = mix_lorentz_blocks(
         {k: jnp.asarray(v) for k, v in tiles.items()},
-        sym=_TypedSym(R), sym_idx=_SYM, mesh_xy=mesh)
+        sym=_TypedSym(R), current_rows=None, sym_idx=_SYM, mesh_xy=mesh)
 
     Rq = R[np.asarray(_SYM)]                                  # (n_q, 3, 3)
     for i in (1, 2, 3):
@@ -813,11 +813,11 @@ def test_the_lorentz_mix_zero_fills_absent_blocks_and_refuses_bad_actions():
     mesh = _mesh(1, 1)
     sym = _TypedSym(_inverse_axial_rows(np.random.default_rng(31), _NTRAN))
     tile = jnp.ones((5, 4, 4), dtype=jnp.complex128)
-    partial = mix_lorentz_blocks({(2, 3): tile}, sym=sym, sym_idx=_SYM, mesh_xy=mesh)
+    partial = mix_lorentz_blocks({(2, 3): tile}, sym=sym, current_rows=None, sym_idx=_SYM, mesh_xy=mesh)
     complete = mix_lorentz_blocks(
         {(i, j): tile if (i, j) == (2, 3) else jnp.zeros_like(tile)
          for i in (1, 2, 3) for j in (1, 2, 3)},
-        sym=sym, sym_idx=_SYM, mesh_xy=mesh)
+        sym=sym, current_rows=None, sym_idx=_SYM, mesh_xy=mesh)
     for key in complete:
         np.testing.assert_array_equal(partial[key], complete[key])
 
@@ -826,9 +826,9 @@ def test_the_lorentz_mix_zero_fills_absent_blocks_and_refuses_bad_actions():
             return np.zeros((len(rows), 3, 3))
 
     with pytest.raises(ValueError, match="typed Lorentz actions"):
-        mix_lorentz_blocks({(2, 3): tile}, sym=_BadTypedSym(), sym_idx=_SYM, mesh_xy=mesh)
+        mix_lorentz_blocks({(2, 3): tile}, sym=_BadTypedSym(), current_rows=None, sym_idx=_SYM, mesh_xy=mesh)
     with pytest.raises(TypeError, match="host metadata"):
-        mix_lorentz_blocks({(2, 3): tile}, sym=sym, sym_idx=jnp.asarray(_SYM), mesh_xy=mesh)
+        mix_lorentz_blocks({(2, 3): tile}, sym=sym, current_rows=None, sym_idx=jnp.asarray(_SYM), mesh_xy=mesh)
 
 
 # ---------------------------------------------------------------------------

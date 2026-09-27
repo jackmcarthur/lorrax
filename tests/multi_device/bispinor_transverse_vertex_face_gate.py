@@ -162,7 +162,7 @@ def check_sigma_sx_chain_matches_dense(
     from full_photon_head_sigma_gate import _bundle
     parent = _bundle(mesh, psi_np, enk_np, np.zeros_like(enk_np), slices)
     photon_block = _make_photon_static_class_kernel(
-        mesh, kgrid, nk, parent, parent, [(mu_L, nu_L)])
+        mesh, kgrid, nk, parent, parent, [(mu_L, nu_L)], current_rows=None)
     weights = np.zeros((nk, nb_full), dtype=np.complex128)
     weights[:, :nb_sigma] = f_np
     weights = _put(weights, mesh, (None, None))

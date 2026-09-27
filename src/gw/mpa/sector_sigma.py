@@ -370,6 +370,7 @@ def instantaneous_sector_sigma(handle, families, bases, meta, mesh_xy, *,
     del raw
     response=SimpleNamespace(V_packed=packed,W_packed=packed,layout=layout,
         family_plans=tuple(f.green_parent.plan for f in families),head_completion=None,
+        current_rows=meta.current_rep_rows,
         qgrid_policy=qgrid_trs_policy_from_shared_pole_store(header,announce=False))
     gij=_resolve_Gij(None,meta,mesh_xy,occupation_state)
     keys=tuple((a,b) for a in range(4) for b in range(4))

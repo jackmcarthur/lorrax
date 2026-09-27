@@ -290,7 +290,7 @@ def test_parent_sigma_all_vertices_q_convolution_and_projection(monkeypatch):
             hs = np.einsum('ac,kcmdv,db->kambv',gamma[a],
                 -green*head[0][None,None,:,None,:]/9,gamma[b])
             head_full += np.einsum('kiam,kambv,kjbv->kij',child.conj(),hs,child)
-        kernel = _make_photon_static_class_kernel(mesh,(3,3,1),9,wfns,wfns,keys,with_head=True)
+        kernel = _make_photon_static_class_kernel(mesh,(3,3,1),9,wfns,wfns,keys,with_head=True,current_rows=None)
         vertices = jax.tree.map(lambda *x:jnp.stack(x),
             *((gamma_perm_phase(a),gamma_perm_phase(b)) for a,b in keys))
         # The class operand is (nk, mx, nA, my, nB), blocks A-major.
@@ -375,7 +375,7 @@ def test_nonzero_ct_covariance_recomputed_from_spinors():
         recomputed = _chi_literal(*children,gamma,.2,energy)
         source = original.conj() if anti else original
         mixed = mix_lorentz_blocks({(a,b):jnp.asarray(source[a,b]) for a in range(4) for b in range(4)},
-            sym=sym,sym_idx=np.full(9,row),mesh_xy=mesh)
+            sym=sym,current_rows=None, sym_idx=np.full(9,row),mesh_xy=mesh)
         for a in range(4):
             for b in range(4):
                 np.testing.assert_allclose(mixed[a,b],recomputed[a,b,full_index],rtol=3e-12,atol=3e-12)
@@ -444,7 +444,7 @@ def test_q_star_unfold_all_blocks_ward_contact_and_daggers():
         selected = [key for key in keys if tuple(map(bool,key)) == (bool(a),bool(b))]
         if selected:
             restored.update(photon_blocks_full_q(response.W_packed,selected,layout=response.layout,
-                family_plans=response.family_plans,qgrid_policy=response.qgrid_policy))
+                family_plans=response.family_plans,qgrid_policy=response.qgrid_policy,current_rows=None))
     qfrac = bgw_integer_q_to_fractional(sym.q_irr_kgrid_int,(3,3,1))
     for q,(p,row) in enumerate(zip(sym.irr_idx_q,policy.unfold_sym_idx)):
         perm = plan.sym_perm[row]
@@ -637,7 +637,7 @@ def test_full_band_unfold_matches_literal_sigma_on_symmetric_complete_toy(monkey
     child = _literal_children(raw,plan)
     parent_sigma = None
     for a,scale in ((1,-1.),(2,-1.),(3,-2.)):
-        kernel = _make_photon_static_class_kernel(mesh,(3,3,1),9,wfns,wfns,[(a,a)])
+        kernel = _make_photon_static_class_kernel(mesh,(3,3,1),9,wfns,wfns,[(a,a)],current_rows=None)
         value = kernel(carrier,carrier,jnp.ones((9,nb)),
                        put((scale*interaction)[:,:,None,:,None],P(None,'x',None,'y',None)),jnp.array(1.))
         parent_sigma = value if parent_sigma is None else parent_sigma+value

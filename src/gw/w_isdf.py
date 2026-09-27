@@ -2036,10 +2036,13 @@ class StaticPhotonResponse:
     head_completion: object | None = None
     current_model: str = STATIC_PHOTON_NO_PAIR_MODEL
     qgrid_policy: object = None
+    #: The current index's basis (Meta.current_rep_rows); the static photon
+    #: routes are Cartesian (None).
+    current_rows: object = None
     family_plans: tuple = ()
 
 
-def photon_blocks_full_q(packed, keys, *, layout, family_plans, qgrid_policy):
+def photon_blocks_full_q(packed, keys, *, layout, family_plans, qgrid_policy, current_rows):
     """Restore each source once and apply the canonical Lorentz mixing for one class."""
     from symmetry_maps import unfold_isdf_operator, mix_lorentz_blocks
     from symmetry_maps import bgw_integer_q_to_fractional
@@ -2067,6 +2070,7 @@ def photon_blocks_full_q(packed, keys, *, layout, family_plans, qgrid_policy):
     restored = jax.lax.map(restore, parent_blocks)
     sources = {pair: restored[i] for i, pair in enumerate(pairs)}
     yield from mix_lorentz_blocks(sources, sym=sym, sym_idx=policy.unfold_sym_idx,
+                                 current_rows=current_rows,
                                  mesh_xy=mesh, keys=keys).items()
 
 
@@ -2099,7 +2103,8 @@ def photon_charge_for_restart(response, meta):
     def restore(packed):
         return next(photon_blocks_full_q(
             packed, ((0, 0),), layout=response.layout,
-            family_plans=response.family_plans, qgrid_policy=policy))[1]
+            family_plans=response.family_plans, qgrid_policy=policy,
+            current_rows=None))[1]
 
     completion = response.head_completion
     head = HeadSample(

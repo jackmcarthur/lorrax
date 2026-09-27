@@ -60,11 +60,11 @@ def test_lorentz_mixer_tt_identity_and_rectangular_ct():
                         for a in (1, 2, 3)])
     old = jax.jit(lambda v: jnp.einsum(
         "qia,qjb,abqmn->ijqmn", axial, axial, v))(values)
-    new = mix_lorentz_blocks(tt, sym=sym, sym_idx=rows, mesh_xy=mesh)
+    new = mix_lorentz_blocks(tt, sym=sym, current_rows=None, sym_idx=rows, mesh_xy=mesh)
     for key in tt:
         np.testing.assert_array_equal(new[key], old[key[0]-1, key[1]-1])
     ct = jnp.asarray(rng.normal(size=(len(rows), 6, 4)))
-    mixed = mix_lorentz_blocks({(0, 2): ct}, sym=sym, sym_idx=rows, mesh_xy=mesh)
+    mixed = mix_lorentz_blocks({(0, 2): ct}, sym=sym, current_rows=None, sym_idx=rows, mesh_xy=mesh)
     action = sym.cartesian_action(rows, axial=False, time_odd=True)
     for j in (1, 2, 3):
         np.testing.assert_allclose(mixed[0, j], action[:, j-1, 1, None, None] * ct,
@@ -78,8 +78,8 @@ def test_selected_lorentz_output_matches_complete_sector():
     mesh = Mesh(np.asarray(jax.devices()).reshape(2, 2), ('x', 'y'))
     values = jnp.arange(96 * 6 * 4, dtype=jnp.float64).reshape(96, 6, 4)
     blocks = {(0, 1): values, (0, 2): values * 2, (0, 3): values * -3}
-    complete = mix_lorentz_blocks(blocks, sym=sym, sym_idx=rows, mesh_xy=mesh)
-    selected = mix_lorentz_blocks(blocks, sym=sym, sym_idx=rows,
+    complete = mix_lorentz_blocks(blocks, sym=sym, current_rows=None, sym_idx=rows, mesh_xy=mesh)
+    selected = mix_lorentz_blocks(blocks, sym=sym, current_rows=None, sym_idx=rows,
                                   mesh_xy=mesh, keys=((0, 2), (1, 1)))
     assert set(selected) == {(0, 2)}
     np.testing.assert_allclose(selected[0, 2], complete[0, 2], atol=1e-12)

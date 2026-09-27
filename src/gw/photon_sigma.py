@@ -113,7 +113,7 @@ def _require_packed_operator(name, packed, mesh_xy):
 
 
 def _make_photon_static_class_kernel(
-    mesh_xy, kgrid, nk_tot, wfns_left, wfns_right, keys, *, with_head=False,
+    mesh_xy, kgrid, nk_tot, wfns_left, wfns_right, keys, *, current_rows, with_head=False,
 ):
     """Share the parent Green, its one transform and the projection across one Lorentz class.
 
@@ -131,8 +131,9 @@ def _make_photon_static_class_kernel(
     keys = tuple((int(A), int(B)) for A, B in keys)
     shapes = tuple((p.n_parent, c.psi_nmu.shape[1], p.n_centroid_packed, p.nspinor)
                    for c, p in zip((left, right), plans))
+    rows = None if current_rows is None else np.asarray(current_rows)
     key = (_mesh_key(mesh_xy), tuple(kgrid), tuple(map(id, plans)), shapes, layout, ffi_dial_key(),
-           keys, with_head)
+           keys, with_head, None if rows is None else rows.tobytes())
     if key in _photon_sigma_kernel_cache:
         return _photon_sigma_kernel_cache[key]
     plan_key = ("plans", _mesh_key(mesh_xy), tuple(kgrid), nk_tot, shapes, layout, ffi_dial_key())
@@ -143,9 +144,8 @@ def _make_photon_static_class_kernel(
             n=shapes[1][2]*shapes[1][3], nq=shapes[0][0], dtype=jnp.complex128, layout=layout)
         _photon_sigma_kernel_cache[plan_key] = project, g_plan
     project, g_plan = _photon_sigma_kernel_cache[plan_key]
-    # The static photon route keeps Cartesian operators (Meta.current_rep_rows).
     convolve = make_lorentz_convolution(mesh_xy, kgrid, nk_tot, keys, plans[0], plans[1],
-                                        current_rows=None)
+                                        current_rows=rows)
     head_product = make_lorentz_q0_product(nk_tot) if with_head else None
     rows = np.asarray(plans[0].parent_full_rows)
     @jax.jit
@@ -226,11 +226,14 @@ def _make_photon_class_restore(response, keys, mesh_xy):
     """
     from .w_isdf import photon_blocks_full_q
     from .cohsex_sigma import lorentz_class_vertices
-    from common.gamma_matrices import gamma_perm_phase
+    from common.gamma_matrices import current_vertex_perm_phase_host
     layout, plans, policy = response.layout, response.family_plans, response.qgrid_policy
     # By value, not identity: every SC map builds a new (equal) layout and
     # policy, and an id key recompiled this program in every map.
-    key = ("restore", layout, tuple(map(id, plans)), _policy_key(policy), keys, _mesh_key(mesh_xy))
+    rows = getattr(response, "current_rows")
+    rows = None if rows is None else np.asarray(rows)
+    key = ("restore", layout, tuple(map(id, plans)), _policy_key(policy), keys, _mesh_key(mesh_xy),
+           None if rows is None else rows.tobytes())
     if key not in _photon_sigma_kernel_cache:
         lefts, rights = lorentz_class_vertices(keys)
         spec = NamedSharding(mesh_xy, P(None, "x", None, "y", None))
@@ -238,12 +241,14 @@ def _make_photon_class_restore(response, keys, mesh_xy):
         @jax.jit
         def restore(packed):
             blocks = jnp.stack([value for _, value in photon_blocks_full_q(
-                packed, keys, layout=layout, family_plans=plans, qgrid_policy=policy)])
+                packed, keys, layout=layout, family_plans=plans, qgrid_policy=policy,
+                current_rows=rows)])
             nq, mx, my = (int(d) for d in blocks.shape[1:])
             interactions = jax.lax.with_sharding_constraint(jnp.transpose(
                 blocks.reshape(len(lefts), len(rights), nq, mx, my), (2, 3, 0, 4, 1)), spec)
+            vertex = lambda C: tuple(jnp.asarray(t) for t in current_vertex_perm_phase_host(C, rows))
             vertices = jax.tree.map(lambda *v: jnp.stack(v),
-                *((gamma_perm_phase(A), gamma_perm_phase(B)) for A, B in keys))
+                *((vertex(A), vertex(B)) for A, B in keys))
             return interactions, vertices
         _photon_sigma_kernel_cache[key] = restore
     return _photon_sigma_kernel_cache[key]
@@ -280,7 +285,8 @@ def contract_lorentz_blocks(blocks, *, families, term, response, Gij, meta, mesh
                 - (photon_q0_low_rank_block(bare, response.layout, A, B, mesh_xy) if bare else 0)
                 for A, B in keys])
         kernel = _make_photon_static_class_kernel(mesh_xy, meta.kgrid, meta.nk_tot,
-                                                  left, right, keys, with_head=with_head)
+                                                  left, right, keys, with_head=with_head,
+                                                  current_rows=response.current_rows)
         arguments = (left.green_parent, right.green_parent, weights, interactions,
                      -0.5 if term == _TERM_COH else 1.0, head_blocks,
                      vertices if with_head else None)

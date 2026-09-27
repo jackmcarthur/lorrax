@@ -1781,20 +1781,32 @@ def _get_unfold_isdf_one_leg_jit(
     return _do_unfold
 
 
-def mix_lorentz_blocks(blocks, *, sym, sym_idx, mesh_xy, keys=None):
-    """Mix each rectangular charge/current sector by Λ⊗Λ, with absent source blocks zero."""
+def mix_lorentz_blocks(blocks, *, sym, sym_idx, mesh_xy, current_rows, keys=None):
+    """Mix each rectangular charge/current sector by Λ⊗Λ, with absent source blocks zero.
+
+    ``current_rows``: the current index's basis (None Cartesian); Λ is
+    diag(1, :func:`current_component_action`), a phased permutation in the
+    circular basis, where each target block reads one source block.
+    """
     if isinstance(sym_idx, (jax.Array, jax.core.Tracer)):
         raise TypeError("mix_lorentz_blocks: sym_idx is host metadata.")
     rows = np.asarray(sym_idx)
     if rows.ndim != 1:
         raise ValueError("mix_lorentz_blocks: sym_idx must be rank one.")
-    action = np.asarray(sym.lorentz_action(rows), dtype=np.float64)
+    current = np.asarray(current_component_action(sym, rows, current_rows))
+    if current.shape != (rows.size, 3, 3):
+        raise ValueError("mix_lorentz_blocks: typed Lorentz actions must have shape (n_q,4,4).")
+    action = np.zeros((rows.size, 4, 4), dtype=np.complex128)
+    action[:, 0, 0] = 1.0
+    action[:, 1:, 1:] = current
+    if current_rows is None:
+        action = action.real
     if action.shape != (rows.size, 4, 4):
         raise ValueError("mix_lorentz_blocks: typed Lorentz actions must have shape (n_q,4,4).")
     if keys is not None:
         spec = NamedSharding(mesh_xy, P(None, 'x', 'y'))
         return {(a, b): jax.lax.with_sharding_constraint(sum(
-            jnp.asarray(action[:, a, c] * action[:, b, d])[:, None, None] * value
+            jnp.asarray(action[:, a, c] * np.conj(action[:, b, d]))[:, None, None] * value
             for (c, d), value in blocks.items()
             if (a == 0) == (c == 0) and (b == 0) == (d == 0)), spec)
             for a, b in keys
@@ -1813,7 +1825,7 @@ def mix_lorentz_blocks(blocks, *, sym, sym_idx, mesh_xy, keys=None):
             values = jnp.stack([jnp.stack([blocks.get((a, b), zero)
                                 for b in right]) for a in left])
             L = jnp.asarray(action[:, left, :][:, :, left])
-            R = jnp.asarray(action[:, right, :][:, :, right])
+            R = jnp.asarray(np.conj(action[:, right, :][:, :, right]))
             spec = NamedSharding(mesh_xy, P(None, None, None, 'x', 'y'))
             mixed = jax.jit(lambda l, r, v: jnp.einsum(
                 'qia,qjb,abqmn->ijqmn', l, r, v), out_shardings=spec)(L, R, values)
