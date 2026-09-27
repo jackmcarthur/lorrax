@@ -1,0 +1,120 @@
+"""A band is in a Green's-function branch iff its weight is resolved in float64.
+
+The branch weight is ``f`` on the occupied side and ``1 - f`` on the empty
+side.  ``gw.efermi.band_in_occupation_window`` keeps it iff
+``|w| >= 2**-53``, the smallest nonzero value of ``1.0 - f``: the float64
+resolution of the partition ``f + (1 - f) = 1``.  The conduction weight has
+that support by rounding; the floor gives the valence weight the same one
+instead of letting it run on to the underflow of ``f``.  The one-shot and every SC map
+use the same predicate, so SC map 0 is the one-shot.  The retired deck key
+``occupation_window_threshold`` (a 0.005 weight floor by default) refuses.
+"""
+
+import numpy as np
+import pytest
+
+import jax.numpy as jnp
+
+from gw import efermi
+from gw.efermi import OCCUPATION_WEIGHT_FLOOR, band_in_occupation_window
+from gw.mpa import sigma_windows as SW
+from gw.ppm_windows import _SigmaBranch, branches_for_omega_grid
+
+
+_OMEGA = np.asarray([0.0, 0.25, 0.5])
+_IDX = np.arange(_OMEGA.size)
+
+
+def _branch(energies, weights, *, space="val"):
+    E_A = jnp.asarray(np.asarray(energies, dtype=np.float64)[None, :])
+    bw = (None if weights is None
+          else jnp.asarray(np.asarray(weights, dtype=np.float64)[None, :]))
+    return _SigmaBranch("pos_" + space, E_A, jnp.ones_like(E_A, dtype=bool),
+                        space, False, _OMEGA, _IDX, band_weight=bw)
+
+
+def _support(branch):
+    mask, bounds = SW._a_space(branch, lambda E: np.ones(E.shape, bool))
+    return np.asarray(mask)[0], bounds
+
+
+def _branch_masks(f):
+    f = jnp.asarray(np.asarray(f, dtype=np.float64)[None, :])
+    E = jnp.zeros_like(f)
+    branches = branches_for_omega_grid(
+        np.asarray([0.0, 0.25]), E_cond=E, H_val=-E,
+        cond_mask=(f != 1.0), val_mask=(f != 0.0),
+        cond_weight=1.0 - f, val_weight=f)
+    got = {b.space: np.asarray(b.base_mask_A)[0] for b in branches}
+    return got["cond"], got["val"]
+
+
+def test_the_floor_is_the_smallest_nonzero_conduction_weight():
+    floor = OCCUPATION_WEIGHT_FLOOR
+    assert floor == 2.0 ** -53
+    assert 1.0 - np.nextafter(1.0, 0.0) == floor
+    w = np.asarray([0.0, np.nextafter(floor, 0.0), floor, 1e-300,
+                    -floor, 0.5, 1.0])
+    np.testing.assert_array_equal(band_in_occupation_window(w),
+                                  [False, False, True, False, True, True, True])
+
+
+def test_the_conduction_weight_support_is_unchanged():
+    """``1.0 - f`` is 0 or at least 2**-53 for f in [0.5, 1]: floor-invariant."""
+    f = np.asarray([0.5, 0.75, 1.0 - 2.0 ** -53, 1.0 - 3 * 2.0 ** -53, 1.0])
+    u = 1.0 - f
+    np.testing.assert_array_equal(band_in_occupation_window(u), u != 0.0)
+
+
+def test_fermi_dirac_valence_support_ends_at_53_ln2_kbt():
+    """f >= 2**-53 iff E - mu <= kBT * 53 ln 2 = 36.74 kBT."""
+    kbt = 0.02
+    E = np.asarray([0.0, 36.5, 37.0]) * kbt
+    f = np.asarray(efermi.fd_occupations(E[None, :], 0.0, kbt))[0]
+    _cond, val = _branch_masks(f)
+    np.testing.assert_array_equal(val, [True, True, False])
+
+
+def test_states_the_old_floor_dropped_are_kept():
+    """The CLAIMS 2793 pair straddled 0.005; both belong to the branch now."""
+    f = [0.00499944814812, 0.00500410083235, 1e-15, 1e-18, 0.0]
+    _cond, val = _branch_masks(f)
+    np.testing.assert_array_equal(val, [True, True, True, False, False])
+
+
+def test_negative_mp1_weights_are_kept_and_zeros_excluded():
+    keep, bounds = _support(_branch([-0.2, -0.1, 0.1, 0.2],
+                                    [-0.0355, 0.0, 1e-17, 0.3]))
+    np.testing.assert_array_equal(keep, [True, False, False, True])
+    assert bounds == (-0.2, 0.2)
+
+
+def test_an_insulating_branch_has_no_weight_and_is_untouched():
+    keep, bounds = _support(_branch([0.1, 0.2, 0.3], None))
+    assert keep.all() and bounds == (0.1, 0.3)
+
+
+def test_chi_supports_use_the_same_predicate():
+    from gw.w_isdf import _occupation_support_slices
+    occ = np.asarray([[1.0, 1.0 - 1e-17, 0.4, 1e-17, 1e-15, 0.0]])
+    f_slice, u_slice = _occupation_support_slices(occ)
+    assert f_slice == slice(0, 5)
+    assert u_slice == slice(2, 6)
+    gapped = np.asarray([[1.0, 1.0, 0.0, 0.0]])
+    assert _occupation_support_slices(gapped) == (slice(0, 2), slice(2, 4))
+
+
+def test_there_is_one_predicate():
+    from gw import ppm_windows, w_isdf
+    for mod in (ppm_windows, w_isdf, SW):
+        assert mod.band_in_occupation_window is band_in_occupation_window
+
+
+def test_the_retired_key_refuses_by_name(tmp_path):
+    from gw.gw_config import LorraxConfig
+    deck = tmp_path / "gw.in"
+    deck.write_text("[cohsex]\nsys_dim = 3\ncompute_mode = mpa\n"
+                    "sigma_w_model = shared_pole\nnval = 4\nncond = 20\n"
+                    "number_bands = 40\noccupation_window_threshold = 0.995\n")
+    with pytest.raises(ValueError, match="occupation_window_threshold"):
+        LorraxConfig.from_input_file(str(deck), print_fn=lambda _: None)

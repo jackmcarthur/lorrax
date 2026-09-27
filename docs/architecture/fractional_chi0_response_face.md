@@ -61,8 +61,8 @@ with positive times t_l and weights h_l from a damped-line rule, followed by
 one FFT R → q.
 
 **Band weights.** `_occupation_support_slices` returns the smallest
-contiguous band ranges on which |f|, respectively |1 − f|, exceeds the floor
-1 − `occupation_window_threshold`. MP overshoot is kept by magnitude, and a
+contiguous band ranges on which |f|, respectively |1 − f|, is resolved in
+float64, |w| ≥ 2⁻⁵³ (`gw.efermi.band_in_occupation_window`). MP overshoot is kept by magnitude, and a
 partially occupied band belongs to both. The weights are f̃ = f·1_f and
 ũ = (1 − f)·1_u, inverted before masking so that a band outside the empty
 support carries exactly zero. On the face layout a support is applied as a
@@ -162,7 +162,7 @@ confined to the one near-origin sample.
 | `GATE direct_fractional_needs_nonzero_z` | z = 0 in the pair scan; static χ₀ is `compute_chi0_matsubara` at ν = 0 |
 | `GATE direct_fractional_ordered_rows` | an ordered call whose k − q row is not a permutation of the full grid |
 | contour `Im(z) > 0` | the retarded contour needs upper-half-plane z; static is the Matsubara route |
-| no band clearing the occupation window on one side | raise `occupation_window_threshold` toward 1, or check the occupation table |
+| no band with a resolved weight on one side | check the occupation table |
 | face carrier narrower than the energy table | load at least as many bands as the table names |
 | `GATE response_vertex` | current vertices need ordered full-k endpoints, applied after the symmetry unfold |
 | negative or nonfinite time nodes, or weights not shaped (n_z, n_t) | caller error |

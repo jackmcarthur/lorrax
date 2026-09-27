@@ -75,6 +75,7 @@ nav:
       - Drivers: drivers.md
       - Input reference: input_reference.md
       - Self-consistency: self_consistency.md
+      - "How-to: metals": how-to/metals.md
       - Downfold driver: downfold.md
   - Theory:
       - Overview: theory/overview.md

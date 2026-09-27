@@ -1221,8 +1221,6 @@ def _compute_mpa_sigma(
         quadrature_cache_dir=quadrature_cache_dir,
         omega_grid_step_ry=(
             float(config.sigma.omega_step_ev) / RYD_TO_EV),
-        occupation_window_threshold=float(
-            config.mpa.occupation_window_threshold),
         pole_batch_size=int(config.mpa.pole_batch_size),
         expected_screening_diagrams=config.screening.diagrams,
         fixed_quadrature_session=(

@@ -57,9 +57,8 @@ argument is ``(E-mu)/(2*broadening_ry)``.  Matching QE therefore uses
 ``broadening_ry=degauss/2``.
 
 TWO OCCUPANCY RULES LIVE HERE AND THEY ARE NOT THE SAME RULE.
-``occupation_window_threshold`` (:func:`band_in_occupation_window`) decides
-which bands are worth putting in a Green's-function branch — a per-consumer
-band-set question.  ``occupation_clamp_tol``
+:func:`band_in_occupation_window` decides which bands are in a
+Green's-function branch -- the float64 support of the branch weight.  ``occupation_clamp_tol``
 (:func:`clamp_occupation_tail`) decides whether a meaningless value exists
 in the table at all, and it is applied once, at evaluation, so every
 consumer sees the same support.  Neither subsumes the other and neither
@@ -83,13 +82,13 @@ from common.units import RYD_TO_EV
 __all__ = [
     "OCCUPATION_CLAMP_TOL_DEFAULT",
     "OCCUPATION_CLAMP_TOL_MAX",
-    "OCCUPATION_WINDOW_THRESHOLD_DEFAULT",
+    "OCCUPATION_WEIGHT_FLOOR",
     "MP1_LOBE_EXTREMUM",
     "OccupationState", "assert_fixed_n", "assert_wfn_occupation_consistency",
     "band_in_occupation_window", "clamp_occupation_tail", "fermi_level_step",
     "legacy_square_mesh_occupation_digests",
     "mp1_negative_derivative", "mp1_occupations",
-    "occupation_clamp_tol", "occupation_digest", "occupation_weight_floor",
+    "occupation_clamp_tol", "occupation_digest",
     "occupied_band_count", "resolve_sigma_efermi_ry",
     "solve_mp1_occupations", "solve_smearing_occupations", "fd_occupations",
     "step_occupations",
@@ -161,17 +160,24 @@ def resolve_sigma_efermi_ry(fermi_reference, *, occupation_state, wfn):
 
 
 # ---------------------------------------------------------------------------
-#  The occupancy threshold that decides whether a band is in a
-#  Green's-function branch at all.  ONE predicate, ONE floor, ONE default —
-#  every consumer imports from here rather than re-spelling the rule.  The
-#  consumers are listed in ``docs/input_reference.md`` under
-#  ``occupation_window_threshold``.
+#  The branch-weight floor that decides whether a band is in a
+#  Green's-function branch at all.  ONE predicate, ONE floor -- every
+#  consumer imports from here rather than re-spelling the rule.  The
+#  consumers are the Sigma branch supports (``gw.ppm_windows``), the MPA
+#  pole-window geometry (``gw.mpa.sigma_windows``) and the chi0
+#  fractional-occupation supports (``gw.w_isdf``).
 # ---------------------------------------------------------------------------
 
-#: Deck default for ``occupation_window_threshold``.  See
-#: :func:`occupation_weight_floor` for the occupancy→weight mapping and
-#: :func:`band_in_occupation_window` for the rule itself.
-OCCUPATION_WINDOW_THRESHOLD_DEFAULT = 0.995
+#: The float64 resolution of the partition ``f + (1 - f) = 1``.  The
+#: conduction weight ``1.0 - f`` is a multiple of ``2**-53`` (the spacing of
+#: doubles just below 1), so its smallest nonzero value is ``2**-53`` and
+#: its support is set by rounding.  A valence weight ``f`` below ``2**-53`` is
+#: finer than its own complement resolves; keeping it lets the valence
+#: support run on to the underflow of ``f``.  Both branches therefore keep
+#: ``|w| >= 2**-53``.  For a Fermi-Dirac state that is the energy cut
+#: ``|E - mu| <= kBT * 53 ln 2 = 36.74 kBT`` on either side of mu.  It is a
+#: property of float64, not a tuned constant.
+OCCUPATION_WEIGHT_FLOOR = float(np.finfo(np.float64).epsneg)  # 2**-53
 
 
 def sigma_frame_mu_ev(config, wfn, E_full_ry, efermi_ry, occupation_state):
@@ -201,70 +207,42 @@ def sigma_frame_mu_ev(config, wfn, E_full_ry, efermi_ry, occupation_state):
     return float(ref_ry) * RYD_TO_EV
 
 
-def occupation_weight_floor(occupation_window_threshold):
-    """Map the deck's OCCUPANCY threshold onto a branch-WEIGHT floor.
+def band_in_occupation_window(weight):
+    """``abs(weight) >= OCCUPATION_WEIGHT_FLOOR`` -- the one band-inclusion predicate.
 
-    The deck key is an occupancy because that is how the knob is reasoned
-    about ("keep a band until it is 99.5% occupied"), but every cut is on a
-    branch WEIGHT, which is ``f`` on the occupied/hole branch and ``1 − f``
-    on the empty/electron branch (``gw/mpa/sigma.py`` ``val_weight=f,
-    cond_weight=1.0 - f``; ``gw/w_isdf.py`` ``band_weight=occ_f`` and
-    ``band_weight=1.0 - occ_u``).  A band at occupancy 0.995 therefore
-    carries weight 0.995 in the occupied branch and 0.005 in the empty one,
-    and a band at occupancy 0.005 the mirror pair, so ONE floor
-    ``1 − threshold`` cuts both branches symmetrically at the same physical
-    distance from a filled/empty state.  Occupancy 0.995 ⇒ floor 0.005.
+    ONE SUPPORT FOR ONE-SHOT AND EVERY SC MAP.  A tuned occupancy floor
+    (0.995 until 2026-09-26, a weight floor of 0.005 = 5.3 kBT) dropped
+    states that carry weight: 2.6 meV RMS / 8.4 meV max of Fe 4^3 Sigma
+    against the same model (CLAIMS 2451), and a 5.4 meV switch of one
+    occupied-branch term when an SC state crossed it (CLAIMS 2793).
 
-    ``threshold = 1.0`` gives floor 0.0, i.e. ``abs(w) > 0.0`` ≡ ``w != 0.0``
-    — the exact incumbent rule, bit-for-bit, at every consumer.  That is the
-    deliberate escape hatch and the A/B control for this knob.
-    """
-    t = float(occupation_window_threshold)
-    if not (np.isfinite(t) and 0.5 <= t <= 1.0):
-        raise ValueError(
-            "occupation_window_threshold must be an occupancy in [0.5, 1.0]; "
-            f"got {occupation_window_threshold!r}.  It is the occupancy at "
-            "which a band stops counting toward a Green's-function branch; "
-            "the weight floor applied is 1 - threshold.  1.0 reproduces the "
-            "exact `weight != 0` rule.")
-    return 1.0 - t
-
-
-def band_in_occupation_window(weight, weight_floor):
-    """``abs(weight) > weight_floor`` — the one band-inclusion predicate.
+    WHY NOT ``w != 0``.  The Sigma executor multiplies each band's factor
+    ``exp(-i (E - E_ref) t)`` by its weight, and the planner puts ``E_ref`` at
+    the edge of the states it admits, so no factor grows with the weight's
+    size: the conditioning is gated per window by ``factor_growth`` in
+    ``gw.sigma_box_plan``, whatever the support.  What the support decides
+    is the box.  Exact nonzero support keeps a valence weight ``f`` down to
+    its underflow, 708 kBT above mu -- every band of a metal deck -- and
+    widens the occupied branch's box by that excursion; the conduction
+    weight ``1.0 - f`` stops at ``2**-53`` by rounding.  The floor applies
+    that same float64 resolution to both branches
+    (:data:`OCCUPATION_WEIGHT_FLOOR`).
 
     MAGNITUDE, NEVER A ONE-SIDED CUT.  :attr:`OccupationState.f_kn` is never
-    clipped.  Metals now take Fermi-Dirac occupations (GATE
-    metal_occupations_fermi_dirac), whose weights lie in [0, 1]; under an MP1
-    state, whose overshoot beyond [0, 1] is part of its quadrature (see
-    :func:`mp1_occupations`), a band just above μ carries
-    a NEGATIVE occupied-branch weight, down to about **-0.0355** at the MP1
-    lobe minimum — seven times the 0.005 floor the default threshold sets.
-    ``weight > floor`` would silently discard every one of them; the exact
-    incumbent rule ``weight != 0.0`` kept them, and
-    ``mpa: wrong-side fractional states keep their branch's algebra``
-    (6d3b6b47) exists to route them correctly.  ``abs`` keeps them and drops
-    only what is genuinely negligible.
-
-    EXACT ZEROS STAY EXCLUDED at every threshold, since ``0 > floor`` is
-    false for floor ≥ 0.  The reason the exact rule existed is preserved
-    rather than traded away: the exact cut excludes only what UNDERFLOWED to
-    zero, which for MP1 is ~54 smearing widths out from μ — the -0.53 Ry
-    phantom excursion of the first metallic Σ arm (claim 0196), whose
-    smallest live weight was the subnormal 2.67e-322.  A fixed occupancy
-    threshold instead cuts at a fixed number of smearing widths (0.995 ⇒
-    about 4.28), because the MP1 weight depends on ``(E-μ)/(2W)`` alone.
+    clipped; under an MP1 state a band just above mu carries a NEGATIVE
+    occupied-branch weight (down to about -0.0355 at the lobe minimum), and
+    ``abs`` keeps it.  Exact zeros stay excluded.
 
     Works on numpy and jax arrays alike; returns whatever ``abs``/``>`` give
     for the operand type, so a caller keeps its own array library.
     """
-    return abs(weight) > weight_floor
+    return abs(weight) >= OCCUPATION_WEIGHT_FLOOR
 
 
 # ---------------------------------------------------------------------------
-#  The far-tail clamp.  ADDITIVE TO, NOT A REPLACEMENT FOR, the threshold
-#  above: they answer different questions.  ``occupation_window_threshold``
-#  decides which bands are worth putting in a Green's-function branch;
+#  The far-tail clamp.  ADDITIVE TO, NOT A REPLACEMENT FOR, the branch
+#  floor above: they answer different questions.  The floor decides which
+#  bands are in a Green's-function branch;
 #  the clamp decides whether a meaningless value exists in the table at all.
 # ---------------------------------------------------------------------------
 
@@ -298,9 +276,7 @@ def occupation_clamp_tol(value) -> float:
     """Validate the far-tail clamp tolerance and return it as a float.
 
     ``0.0`` disables the clamp exactly — ``abs(f) < 0.0`` is false for every
-    finite ``f`` — which is the A/B control and the bit-for-bit escape hatch,
-    the same role ``occupation_window_threshold = 1.0`` plays for the
-    threshold.  The upper bound is :data:`OCCUPATION_CLAMP_TOL_MAX`; see
+    finite ``f`` — which is the A/B control and the bit-for-bit escape hatch.  The upper bound is :data:`OCCUPATION_CLAMP_TOL_MAX`; see
     :func:`clamp_occupation_tail` for why it is where it is.
     """
     t = float(value)

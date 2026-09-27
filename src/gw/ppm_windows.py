@@ -14,11 +14,7 @@ from typing import NamedTuple
 import jax
 import numpy as np
 
-from .efermi import (
-    OCCUPATION_WINDOW_THRESHOLD_DEFAULT,
-    band_in_occupation_window,
-    occupation_weight_floor,
-)
+from .efermi import band_in_occupation_window
 from .minimax_screening import MinimaxNodes
 
 
@@ -204,14 +200,13 @@ def _iter_branches(
     val_mask: jax.Array,
     cond_weight: jax.Array | None = None,
     val_weight: jax.Array | None = None,
-    weight_floor: float = 0.0,
 ) -> list[_SigmaBranch]:
     """Enumerate the four causal branches, skipping empty omega halves."""
 
     def _narrow(mask, weight):
         if weight is None:
             return mask
-        return mask & band_in_occupation_window(weight, weight_floor)
+        return mask & band_in_occupation_window(weight)
 
     cond_mask = _narrow(cond_mask, cond_weight)
     val_mask = _narrow(val_mask, val_weight)
@@ -254,13 +249,12 @@ def branches_for_omega_grid(
     val_mask: jax.Array,
     cond_weight: jax.Array | None = None,
     val_weight: jax.Array | None = None,
-    occupation_window_threshold: float = OCCUPATION_WINDOW_THRESHOLD_DEFAULT,
 ) -> list[_SigmaBranch]:
     """Split a signed omega grid and enumerate its causal branches.
 
     Energy and mask construction remains with the pole-model caller.  A
-    supplied fractional occupation weight is narrowed at the shared
-    occupation threshold; the insulating boolean-mask path is unchanged.
+    supplied fractional occupation weight is narrowed to its float64
+    support (``gw.efermi.band_in_occupation_window``); the insulating boolean-mask path is unchanged.
     """
     omega = np.asarray(omega_grid_ry, np.float64)
     idx_pos = np.where(omega >= 0.0)[0]
@@ -276,7 +270,6 @@ def branches_for_omega_grid(
         val_mask=val_mask,
         cond_weight=cond_weight,
         val_weight=val_weight,
-        weight_floor=occupation_weight_floor(occupation_window_threshold),
     )
 
 
