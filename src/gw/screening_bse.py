@@ -919,6 +919,11 @@ def _assemble_wedge_w(wc_wedge, V_q, *, sym, centroid_indices, meta,
             "solve to the full BZ).  Use a closed centroid set, or keep "
             "screening_diagrams = w_rpa.")
     tables, policy = wedge
+    mu_basis = getattr(meta, "mu_basis", None)
+    if mu_basis is not None:
+        # The facade reads the bundle, whose centroid axes are in canonical
+        # FILE order; V_q and the wedge tables are in the run's packed basis.
+        wc_wedge = mu_basis.pack_operator(wc_wedge)
     mu_target = int(np.asarray(tables["sym_perm"]).shape[-1])
     V_wedge = QirrOperator.of(V_q).at_rows(sym.q_irr_full_idx)
     W_wedge = _assert_mu_width(
