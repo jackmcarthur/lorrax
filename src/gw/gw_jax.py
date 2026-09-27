@@ -489,10 +489,13 @@ def _prepare_oneshot_response(
     # The shared-pole route takes its direct head from the same sharded
     # response as the full one, with the wings skipped and the fold never
     # evaluated (``gw.shared_pole_head`` docstring): the head an ordered
-    # store carries.
+    # store carries.  The four-current sector bank builds its own direct
+    # CC/CT/TC/TT head (``gw.photon_direct_head``) and consumes no scalar
+    # head response, as on the SC route (``sc_iteration``).
     direct_only_shared_pole = (
         config.head.correction is HeadCorrection.NO_LOCAL_FIELDS
-        and config.sigma.w_model == "shared_pole")
+        and config.sigma.w_model == "shared_pole"
+        and not uses_direct_bispinor_shared_pole_head(config))
     if (do_screened
             and (config.head.correction is HeadCorrection.FULL or direct_only_shared_pole)
             and config.screening.diagrams is ScreeningDiagrams.W_RPA
