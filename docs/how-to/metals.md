@@ -22,9 +22,10 @@ page does not restate them.
   (`GATE mpa_ordered_metal`).
 - **One band support.** A band is in a χ or Σ branch iff its weight ($f$ or
   $1-f$) is at least $10^{-5}$, i.e. $|E-\mu|\le 11.5\,k_BT$. A state that
-  crosses the cut between SC maps moves Σ by about $10^{-5}$ of its term,
-  0.01 meV. It is the same in the one-shot and every SC map, so SC map 0 is
-  the one-shot. There is no key.
+  crosses the cut between SC maps switches one weighted term on or off.
+  The floor alone does not bound the resulting GW energy change: screening,
+  quadrature and the raw `eqp1` derivative also enter. The one-shot and every
+  SC map use the same support for the same occupations. There is no key.
 
 ## Inputs
 
