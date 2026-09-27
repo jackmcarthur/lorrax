@@ -288,16 +288,21 @@ def prepare_photon_carriers(wfns, wfns_transverse, mu_bases, *,
 
 def photon_static_contact(wfns, meta, *, mesh_xy, layout, vertex,
                           occupation_state, sample_plan, execute, receipt):
-    r"""Build Pi_grid(0,0), centroid D and their TT sum once per bank.
+    r"""Build the TT Ward contact ``Pi_FD(0,0)``, with ``Pi_grid`` and centroid D, once per bank.
 
-    The FD zero-Matsubara stream contains ``-D`` on diagonal transitions.
-    Therefore ``Pi_grid=Pi_FD+D`` removes that contribution; the prescribed
-    contact is then ``Pi_grid+D``. Both quantities here are physical density
-    responses (one factor ``1/Omega``). ``response_algebra`` converts the
-    contact to the convention of the stored ``V/ Omega`` at insertion.
-    For a step-occupation insulator the same stream uses its ordinary
-    Laplace weights and D is exactly zero. It never assigns a gap to a metal.
-    All returned packed operators are ``[1,N,N]`` at ``P(None,'x','y')``.
+    The FD zero-Matsubara stream at q = 0 is the static limit
+    ``lim_{q->0} Pi(q, 0)``: its diagonal transitions carry the Fermi-surface
+    term ``-D`` (the same sign as the head's static ``-(alpha/2)^2 D``).
+    The Ward contact is that limit, so a normal metal's static transverse
+    response ``Pi(q, 0) - contact`` vanishes as q -> 0 and its dynamic limit
+    ``Pi(0, z) - contact`` is ``+D``, the Drude weight.  ``Pi_grid = Pi_FD+D``
+    (the interband part) and D are returned as diagnostics only.  Both are
+    physical density responses (one factor ``1/Omega``). ``response_algebra``
+    converts the contact to the convention of the stored ``V/ Omega`` at
+    insertion.  For a step-occupation insulator the same stream uses its
+    ordinary Laplace weights and D is exactly zero. It never assigns a gap to
+    a metal.  All returned packed operators are ``[1,N,N]`` at
+    ``P(None,'x','y')``.
     """
     from common.shard_map import shard_map
     from .static_gauge_response import (fermi_dirac_current_drude,
@@ -357,9 +362,9 @@ def photon_static_contact(wfns, meta, *, mesh_xy, layout, vertex,
         mesh=mesh_xy, in_specs=P(None, "x", "y"), out_specs=P(None, "x", "y"), check_vma=False)
     pi_fd = jax.jit(tt_only)(raw[:, 0] * (_w_solve_pref_scalar(meta)/float(meta.cell_volume)))
     pi_grid = pi_fd + drude
-    contact = pi_grid + drude
+    contact = pi_fd
     receipt["correlation_count"] += count
-    receipt["contact"] = dict(equation="Pi_grid(0,0)+D", diagonal_reference="Pi_FD=Pi_grid-D",
+    receipt["contact"] = dict(equation="Pi_FD(0,0)=Pi_grid(0,0)-D", diagonal_reference="Pi_grid=Pi_FD+D",
         units="physical response density, 1/Omega", scope="built once for this bank state")
     return pi_grid, drude, contact
 
@@ -1603,7 +1608,7 @@ def compute_photon_bank(wfns, wfns_transverse, meta, config, *, mesh_xy, sym,
                         mu_bases, layout, occupation_state, sample_plan, bank_io,
                         wfn=None, photon_g0_vectors=None,
                         wfn_fingerprint_binding=None, photon_head_cache=None,
-                        photon_head_rotation=None,
+                        photon_head_state=None,
                         print_fn=print):
     """Build a full photon bank through the existing sample/moment stages.
 
@@ -1612,8 +1617,12 @@ def compute_photon_bank(wfns, wfns_transverse, meta, config, *, mesh_xy, sym,
     ``constant`` field is W_infinity-V. M0..M3 use the same convention as the
     ordered charge bank. Both CT and TC are retained. The scalar producer,
     memory planner, quadrature, transaction masks and reader are shared.
-    Later SC maps supply ``bank_io['static_reference']`` with the initial
-    bank's ``path`` and ``identity`` to keep its contact fixed.
+    Every call, every SC map included, builds its own static contact: the
+    Ward proxy subtracts the static limit of this map's response.
+    ``photon_head_state = (rotation, wfns, occupation_state)`` sets the
+    direct head's state (``sc_head_update``): None entries are the bank's own
+    state and no rotation (one-shot); SC ``dft_velocity`` passes the map's
+    QP rotation, ``off`` the DFT bundle and its fixed-N state.
     """
     from file_io.shared_pole_store import validate_shared_pole_bank
 
@@ -1678,31 +1687,12 @@ def compute_photon_bank(wfns, wfns_transverse, meta, config, *, mesh_xy, sym,
     if jax.process_index() == 0:
         print("photon bank: centroid D and static grid reference", flush=True)
     with timing.section("bank.static_contact"):
-        from file_io.shared_pole_store import (ResidentBankPayload, read_static_reference,
-                                               write_bank_contact, write_static_reference)
-        reference = bank.get("static_reference")
-        initial = None
-        if reference is None:
-            grid, drude, contact = photon_static_contact(wfns, meta, mesh_xy=mesh_xy,
-                layout=layout, vertex=vertex, occupation_state=occupation_state,
-                sample_plan=sample_plan, execute=execute, receipt=receipt)
-            # Later maps freeze this contact from its own small file, written on
-            # both tiers beside (not inside) this map's scratch generation.
-            generation = Path(bank["path"].label if isinstance(bank["path"], ResidentBankPayload)
-                              else bank["path"]).parent
-            reference = write_static_reference(
-                generation.with_name(generation.name + "_photon_static_reference.h5"),
-                dict(Pi_grid=grid, Drude=drude, TT_contact=contact),
-                header=header, mesh_xy=mesh_xy)
-        else:
-            initial, (grid, drude, contact) = read_static_reference(reference, n=n, mesh_xy=mesh_xy)
-            for key in ("photon_layout", "photon_centroid_digests"):
-                if initial.get(key) != header[key]:
-                    raise ValueError(f"GATE photon_static_reference: initial/current {key} differs")
-        receipt["static_reference"] = reference
+        from file_io.shared_pole_store import write_bank_contact
+        grid, drude, contact = photon_static_contact(wfns, meta, mesh_xy=mesh_xy,
+            layout=layout, vertex=vertex, occupation_state=occupation_state,
+            sample_plan=sample_plan, execute=execute, receipt=receipt)
         bank["minus_q_operator_provenance"] = dict(coulomb=bank["coulomb"],
-            static_reference=reference,
-            static_reference_commit=(initial["commit"] if initial is not None else None),
+            static_contact="this map's Pi_FD(0,0)",
             state_identity=bank["identity"],
             moments="M0,M1,M2,M3 and constant computed with the identical photon_v and contact arrays")
         # Persist the contact's two physically defined pieces as bank diagnostics;
@@ -1729,12 +1719,15 @@ def compute_photon_bank(wfns, wfns_transverse, meta, config, *, mesh_xy, sym,
                     host, empty, empty, empty, mesh=mesh_xy)
                 cache["direct_photon_velocity"] = velocity
                 del host
-            if photon_head_rotation is not None:
+            rotation, head_wfns, head_occupation = (
+                photon_head_state or (None, None, None))
+            if rotation is not None:
                 from .qsgw_head import rotate_velocity_active_to_qp
                 velocity = rotate_velocity_active_to_qp(
-                    velocity, photon_head_rotation, mesh=mesh_xy)
+                    velocity, rotation, mesh=mesh_xy)
             direct_head = build_direct_photon_head(
-                velocity, wfns, occupation_state, contact_packed=contact,
+                velocity, wfns if head_wfns is None else head_wfns,
+                occupation_state if head_occupation is None else head_occupation,
                 photon_g0_vectors=direct_gamma, layout=layout,
                 mesh=mesh_xy, meta=meta, wfn=wfn,
                 frequencies_ry=bank_points(sample_plan), print_fn=print_fn)

@@ -2,8 +2,8 @@
 
 Each SC map screens into ``tmp/mpa/sc_NNNN_shared_pole/``; a file-tier bank
 there is 0.87 TB on Fe 8^3, so without retention the scratch grows linearly in
-maps.  Only exact managed generation names may go; the current map's stays, and the
-photon static reference beside the generations (run-lifetime) is never touched.
+maps.  Only exact managed generation names may go; the current map's stays, and
+any other file beside the generations is never touched.
 """
 from gw import shared_pole_screening
 

@@ -441,8 +441,17 @@ first order in the long-wavelength vertex:
   and Drude tensor: Drude CC $=qDq/z^2$, CT $=(\alpha_{FS}/2)\,qD/z$ for
   $|z|\gg qu$, and at $z=0$ Thomas–Fermi CC $=-N(E_F)$ with
   TT $=-(\alpha_{FS}/2)^2D$ ([metal head](metal-q0-head.md)).
-* **Contact.** The bank's Fermi–Dirac contact $C$ is projected on the four
-  uniform vertices.
+* **Contact.** The Ward proxy $\Pi(\mathbf q)-\Pi(0)$ subtracts the static
+  limit of the same response: $C=\Pi_h(\mathbf q\to0,0)$ on TT, the static
+  interband current tensor minus $(\alpha_{FS}/2)^2D$; CC and CT carry none.
+  The head's static TT then vanishes at every Γ-cell $\mathbf q$ and its
+  dynamic limit is $+(\alpha_{FS}/2)^2D$. The body's contact is its own
+  static limit, the Fermi–Dirac zero-Matsubara $\Pi(0,0)$
+  (`response_bank.photon_static_contact`), whose diagonal transitions carry
+  $-D$. The two producers differ in the current vertex and the Fermi
+  surface (dipole velocity and tetrahedron atoms against the raw
+  kinetic-balance current and Fermi–Dirac weights), so neither can borrow
+  the other's limit.
 
 The head solves
 $W_h(\mathbf q,z)=[1-D(\mathbf q)(\Pi(\mathbf q,z)-C)]^{-1}D(\mathbf q)$

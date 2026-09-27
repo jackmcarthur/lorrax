@@ -3,7 +3,8 @@
 The six rows are three derivatives of the charge vertex followed by three
 uniform current vertices.  Only the final 6 by 6 tensors are replicated;
 band pairs remain tiled over both processor axes.  The metallic diagonal
-response and the photon contact are separate inputs to the Γ-cell solve.
+response and the head's own static TT limit (its Ward contact) are separate
+inputs to the Γ-cell solve.
 """
 from functools import lru_cache
 
@@ -58,24 +59,23 @@ def subtract_bare_tt_from_bank(packed_v, photon_g0_vectors, *, layout,
         left_rows_X=left, right_rows_Y=right)
 
 
-@lru_cache(maxsize=16)
-def _contact_projection_program(mesh):
-    ax_x, ax_y = _mesh_xy(mesh)
+def head_ward_contact(static_tensor, drude_tensor):
+    """The head's Ward contact: its own static limit Pi_h(q -> 0, z = 0) on TT.
 
-    def local(x, contact, y):
-        reduced = jnp.einsum("am,mn,bn->ab", jnp.conj(x),
-                             contact[0], y, optimize=True)
-        return jax.lax.psum(reduced, (ax_x, ax_y))
-
-    return jax.jit(shard_map(local, mesh=mesh,
-        in_specs=(P(None,"x"), P(None,"x","y"), P(None,"y")),
-        out_specs=P(None,None), check_vma=False))
-
-
-def direct_photon_contact(contact_packed, photon_g0_vectors, *, layout, mesh):
-    """Project the bank's one FD contact onto the four uniform vertices."""
-    x, y = packed_gamma_vectors(photon_g0_vectors, layout, mesh)
-    return _contact_projection_program(mesh)(x, contact_packed, y)
+    The Ward proxy Pi(q) - Pi(0) must subtract the static limit of the SAME
+    response: the head's current vertex is the dipole velocity (with its
+    nonlocal part) and its Fermi surface the tetrahedron atoms, so the bank's
+    raw-current FD contact is another producer's limit.  At first order the TT
+    block is q independent: the static interband current tensor (rows 3:6 of
+    ``static_tensor``, the 6x6 value at z = 0) plus the static intraband
+    ``-(alpha/2)^2 D``.  CC and CT carry no contact.  With it the head's
+    static TT response vanishes at every Γ-cell q and its dynamic limit is
+    ``+(alpha/2)^2 D``, the Drude weight of the scalar head's tensor.
+    """
+    tensor = jnp.asarray(static_tensor, dtype=jnp.complex128)
+    contact = jnp.zeros((4, 4), dtype=jnp.complex128)
+    return contact.at[1:, 1:].set(
+        tensor[3:, 3:] - HALFALPHA**2 * jnp.asarray(drude_tensor, dtype=jnp.complex128))
 
 
 def add_direct_gamma_field(packed, coefficient, *, gamma_vectors, layout, mesh):
@@ -546,12 +546,13 @@ def _fields(operands):
 
 
 def build_direct_photon_head(velocity_cart, wfns, occupation_state, *,
-                             contact_packed, photon_g0_vectors, layout,
+                             photon_g0_vectors, layout,
                              mesh, meta, wfn, frequencies_ry, print_fn=print):
     """Solve the direct Γ 4×4 Dyson at every cell node once, then hand sectors small data.
 
     This first-order model uses dipole charge jets, a velocity-based
-    approximation to the raw Breit current, and the existing FD contact.
+    approximation to the raw Breit current, and its own static limit as the
+    TT Ward contact (:func:`head_ward_contact`).
     It does not fold wings or microscopic body fields.  The cell is the
     bulk mini-BZ (``sys_dim = 3``: Sobol exterior plus a screened sphere) or
     the slab's in-plane polygon (``sys_dim = 2``: the exact Wigner–Seitz
@@ -599,13 +600,16 @@ def build_direct_photon_head(velocity_cart, wfns, occupation_state, *,
         nspinor=int(meta.nspinor_wfnfile), bvec_cart=geometry.bvec, kgrid=kgrid,
         is_2d=sys_dim == 2)
     dos = atoms.dos
-    tensors = direct_photon_interband_tensors(velocity_cart, e, f, z,
+    # One scan over the bank points plus the static point z = 0 that the
+    # head's Ward contact needs (moments are frequency independent).
+    value, slope, moments = direct_photon_interband_tensors(
+        velocity_cart, e, f, np.append(z, 0.0j),
         surface_kn=surface, pair_split=split,
         mesh=mesh, nb_logical=nb, cell_volume=float(meta.cell_volume),
         nk_tot=int(meta.nk_tot), nspin=int(wfn.nspin),
         nspinor_wfn=int(meta.nspinor_wfnfile))
-    contact = direct_photon_contact(contact_packed, photon_g0_vectors,
-        layout=layout, mesh=mesh)
+    tensors = (value[:-1], slope[:-1], moments)
+    contact = head_ward_contact(value[-1], drude)
     replicated = NamedSharding(mesh, P())
     points_device = device_put_process_local(z, replicated)
     atom_w, atom_u = (device_put_process_local(np.asarray(x), replicated)

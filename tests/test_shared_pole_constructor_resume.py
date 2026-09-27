@@ -51,19 +51,10 @@ def test_photon_constructor_resume_requires_complete_bound_bank(tmp_path, monkey
     bank_path = root/'bank.h5'
     bank_path.symlink_to(source_bank)
     receipt_path = root/'bank_receipt.json'
-    # The run-wide static reference is its own committed record beside the
-    # generation; resume authenticates it by that commit, never by the bank.
-    import hashlib, h5py
-    record = dict(identity=identity, photon_layout={}, photon_centroid_digests=[],
-                  kind=store._STATIC_REFERENCE_KIND)
-    record['commit'] = hashlib.sha256(store._json(record).encode()).hexdigest()
-    reference_path = tmp_path/'sc_0000_shared_pole_photon_static_reference.h5'
-    with h5py.File(reference_path, 'w') as f:
-        f['static_reference_json'] = store._json(record).encode()
-    reference = dict(path=str(reference_path), identity=identity,
-                     kind=store._STATIC_REFERENCE_KIND, commit=record['commit'])
+    # Every map builds its own static contact, so resume binds only the
+    # bank's identity, stage and completion.
     receipt = dict(identity=identity, completion=True, bank_complete=True,
-                   stage='photon', static_reference=reference)
+                   stage='photon')
     receipt_path.write_text(json.dumps(receipt))
 
     def validate(path, *, expected_identity, mesh_xy, require_complete,
@@ -78,10 +69,8 @@ def test_photon_constructor_resume_requires_complete_bound_bank(tmp_path, monkey
     assert not _authenticated_constructor_resume(
         root, dict(identity, hamiltonian='map:other'), recipe, photon=True)
     assert not _authenticated_constructor_resume(root, identity, {'eta_ev': 0.3}, photon=True)
-    for stale in (dict(identity=identity, path=str(source_bank)),      # a bank-path reference
-                  dict(reference, commit='0' * 64)):                     # a torn record
-        receipt_path.write_text(json.dumps(dict(receipt, static_reference=stale)))
-        assert not _authenticated_constructor_resume(root, identity, recipe, photon=True)
+    receipt_path.write_text(json.dumps(dict(receipt, stage='charge')))
+    assert not _authenticated_constructor_resume(root, identity, recipe, photon=True)
     receipt_path.write_text(json.dumps(receipt))
     assert _authenticated_constructor_resume(root, identity, recipe, photon=True)
     receipt['bank_complete'] = False
