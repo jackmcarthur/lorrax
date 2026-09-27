@@ -33,7 +33,21 @@ def requested_band_mask(energies_ev, *, n_occ, nval, ncond, gap_ev):
         raise ValueError(f"protected band range [{lo}, {hi}) outside {e.shape}")
     groups = np.cumsum(np.concatenate((np.zeros((e.shape[0], 1), bool),
                                       np.diff(e, axis=1) > float(gap_ev)), axis=1), axis=1)
-    return (groups >= groups[:, lo:lo+1]) & (groups <= groups[:, hi-1:hi])
+    protected = (groups >= groups[:, lo:lo+1]) & (groups <= groups[:, hi-1:hi])
+    # A dense ladder must not turn a small request into an all-band window.
+    # This bounds automatic edge closure, not the user's requested extent.
+    from .qp_support import SUPPORT_PAD_EV
+    lower = np.min(np.where(protected, e, np.inf), axis=1)
+    upper = np.max(np.where(protected, e, -np.inf), axis=1)
+    promotion = np.maximum(e[:, lo] - lower, upper - e[:, hi-1])
+    if np.any(promotion > SUPPORT_PAD_EV):
+        k = int(np.argmax(promotion))
+        raise ValueError(
+            "GATE sigma_band_edge_gap: closing the requested bands to an "
+            f"eta-resolved gap at k={k} requires {promotion[k]:.6f} eV, "
+            f"beyond the {SUPPORT_PAD_EV:g} eV automatic-promotion limit; "
+            "increase nval/ncond explicitly to include that manifold.")
+    return protected
 
 
 @dataclass(frozen=True)
