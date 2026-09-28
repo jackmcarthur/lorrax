@@ -231,7 +231,39 @@ def _passivity_response_checks(response, *, eigh, gates):
             "passivity_max": maximum, "passivity_antihermitian_relative": anti}
 
 
-def shared_pole_reciprocity(value, reference, *, gates):
+def reciprocity_rounding_bound(reference_relative, *, gram_condition, inner_length):
+    """Float64 first-order bound on the model's relative transpose defect.
+
+    DERIVATION (PARTITION, 2026-09-28). Every step of the even reduction is
+    covariant under complex conjugation of its inputs: direction selection
+    (eigenvectors/singular vectors of conj W are conj of those of W), the
+    pencil GEMMs and divided differences, the Hermitian eigensolves, the
+    Newton-Schulz metric correction and the Ritz step. In exact arithmetic
+    the model therefore obeys M(conj W) = conj M(W) = M(W)^T (M Hermitian on
+    the held axis), so its transpose defect is M(W) - M(conj W) plus rounding.
+    The model depends on the pencil through the whitening of the kept Gram:
+    a normwise relative perturbation e of (G, H, O) moves M by at most
+    kappa_q * e relative, kappa_q = gamma_max / gamma_min(kept) <= 1 /
+    normalized_gram_keep. The held data enter with their own relative
+    defect (``reference_relative``, measured per sample); every pencil entry
+    is an inner product of length at most m, whose worst-case relative
+    rounding is gamma_m = m u / (1 - m u), u = 2**-53, and the model defect
+    counts the rounding twice (||dM - dM^T|| <= 2 ||dM||). Hence
+
+        defect(M) <= kappa_q * (reference_relative + 2 gamma_m).
+
+    No constant is fitted. The resolvent factor ||T|| / dist(s, poles) of a
+    held sample is not included (held samples lie off the pole axis).
+    Works on numpy and jax arrays; ``gram_condition`` broadcasts against
+    ``reference_relative``.
+    """
+    m = float(inner_length)
+    u = float(np.finfo(np.float64).eps) / 2
+    gamma_m = m * u / (1.0 - m * u)
+    return gram_condition * (reference_relative + 2.0 * gamma_m)
+
+
+def shared_pole_reciprocity(value, reference, *, gates, gram_condition=None, inner_length=None):
     """Check W(s).T=W(s) where held input data have this extra symmetry.
 
     ``value`` and ``reference`` are matching [...,n,n] complex128 response
@@ -241,6 +273,12 @@ def shared_pole_reciprocity(value, reference, *, gates):
     s axis is equivalent to entrywise realness on the negative s axis.
     Scalar TRS alone does not impose this symmetry at a generic fixed q.
     This is a sampled model gate, not a certificate at every frequency.
+
+    The ceiling is :func:`reciprocity_rounding_bound`. Without the measured
+    kept Gram condition it takes the keep cut's guaranteed ceiling
+    1/normalized_gram_keep; without the pencil side the inner length is n.
+    The constructor re-evaluates the verdict with the parent's measured
+    condition and side (``reciprocity_rounding_verdict``).
     """
     threshold = gates["model_reciprocity"]["threshold"]
     def defect(a):
@@ -248,7 +286,32 @@ def shared_pole_reciprocity(value, reference, *, gates):
             jnp.linalg.norm(a, axis=(-2, -1)), jnp.finfo(jnp.float64).tiny)
     exact, measured = defect(reference), defect(value)
     applicable = exact <= threshold["reference_relative_max"]
+    kappa = (1.0 / float(gates["normalized_gram_keep"]["threshold"])
+             if gram_condition is None else gram_condition)
+    bound = reciprocity_rounding_bound(
+        exact, gram_condition=kappa,
+        inner_length=int(value.shape[-1]) if inner_length is None else inner_length)
     passed = (jnp.isfinite(exact) & jnp.isfinite(measured)
-              & (~applicable | (measured <= threshold["model_relative_max"])))
+              & (~applicable | (measured <= bound)))
     return {"passed": passed, "applicable": applicable,
-            "reference_relative": exact, "model_relative": measured}
+            "reference_relative": exact, "model_relative": measured,
+            "model_bound": bound}
+
+
+def reciprocity_rounding_verdict(record, *, gram_condition, inner_length):
+    """Host verdict of one parent's reciprocity record at its measured condition.
+
+    ``record`` holds numpy ``applicable``, ``reference_relative`` and
+    ``model_relative`` arrays for one parent. Returns a copy whose
+    ``model_bound`` is :func:`reciprocity_rounding_bound` at the parent's
+    kept Gram condition and inner length and whose ``passed`` compares the
+    applicable records against it. The receipt records this bound.
+    """
+    exact = np.asarray(record["reference_relative"], dtype=np.float64)
+    measured = np.asarray(record["model_relative"], dtype=np.float64)
+    applicable = np.asarray(record["applicable"], dtype=bool)
+    bound = reciprocity_rounding_bound(
+        exact, gram_condition=float(gram_condition), inner_length=int(inner_length))
+    passed = (np.isfinite(exact) & np.isfinite(measured)
+              & np.isfinite(bound) & (~applicable | (measured <= bound)))
+    return dict(record, passed=passed, model_bound=bound)
