@@ -292,8 +292,9 @@ a fixed set of **supports** $z_a$: points on the damped line $z=\omega+ih$ and
 on the imaginary axis $z=iu$. $W$ is never formed at a real frequency; one
 occupation-weighted time rule covers the whole active transition interval
 ([the bank](../architecture/shared_pole_model.md#2-the-response-bank)), and the
-moments are exact band sums. Production uses 18 fitted supports; held
-diagnostic supports and the $M_1/M_3$ block are additional.
+moments are exact band sums. The line and imaginary ladders are sized
+independently, each by its own law below; held diagnostic supports and the
+$M_1/M_3$ block are additional.
 
 Placement is a condenser problem, not a choice of interesting frequencies:
 
@@ -317,12 +318,28 @@ Placement is a condenser problem, not a choice of interesting frequencies:
   $E_g=0$, so $u_{\min}=4\eta$; the plasmon lies inside the ladder and the
   $q\to0$ Drude/Fermi-surface term is the head's (Section 7 of the
   implementation page), not the body parent's.
-* **Line ladder.** Height $h=\max(2.6\ \mathrm{eV},4\eta)$; the remaining
-  $18-m$ sites are equal quantiles of $\rho^{1/2}$ on
-  $[\max(h,\text{first spacing}),\,\omega_{\rm reach}]$, where $\rho$ is the
-  $\eta$-broadened density of the crossings $|E-\epsilon_{mk}|$ that contour
-  deformation actually meets for states delivered within $\pm5$ eV of $\mu$.
-  The rule reads band energies, $\mu$ and $\eta$ only; it is not fitted to $W$.
+* **Line ladder.** Sites $z_j=j\Delta+ih$, $j=1,\dots,\lceil L/\Delta\rceil$,
+  with $h=\Delta=4\eta$ and $L=\max|\text{requested window}|+2$ eV; the
+  requested window is the deck's $\Sigma$ request joined with the requested
+  states, about $\mu$ (`gw.qp_support`). $\Sigma_c(\omega)$ reads $W_c$ on the
+  line at $|\omega-\epsilon|+i\eta$ for the crossing levels $\epsilon$ between
+  $\mu$ and $\omega$, so $|\omega-\epsilon|\le|\omega-\mu|$ and the roots read
+  the line out to the window's far side. The sites rebuild that line by
+  continuation from their own height down to $\eta$: a pole at $\Omega$ enters
+  a sample through $1/(x-\Omega+ih)$, a Lorentzian of width $h$, and the
+  continuation holds while $h$ is a few $\eta$ and adjacent sites are no
+  farther apart than their height. The continuation degrades within a few
+  spacings of the ladder's end, hence the 2 eV past the window. On Si 4³ at
+  $\eta=0.25$ eV, with $h,\Delta\le4\eta$ no added site, height or extent
+  step moves an edge root inside $\pm10$ eV by more than 0.06 meV; $h=8\eta$
+  costs 0.77 meV, $\Delta=8\eta$ 2.36 meV, and stopping at the window
+  0.28 meV (claim 2906). The rule reads $\eta$, $\mu$ and the requested
+  energies only; it is not fitted to $W$. The line count does not trade
+  against the imaginary count: one line site taken by the imaginary ladder
+  moved Fe 4³ window edges by 35 meV (claim 2915). Scope: certified at
+  $\eta=0.25$ eV; Na 8³ edges are 3–8× more sensitive to the line placement
+  than Si's, and the count grows as $L/4\eta$ (about 2.2 s of bank time per
+  site on Si 4³).
 
 At each fitted support a narrow direction set $Q_a\in\mathbb C^{n\times r_a}$
 is selected from the sample itself:
@@ -659,9 +676,10 @@ The cap is a cost decision. Storage is $16N_\mu K$ bytes per parent and one
 synthesis of $W_c(\tau)$ costs $O(N_\mu^2K)$ per $\tau$ node, so
 $K\propto N_\mu$ keeps the screened-interaction algebra cubic per parent. The
 pencil side is bounded by the direction widths of §5.1,
-$R\le\big[2(18-m)/16+m/4+1/8\big]N_\mu$ with conjugate line partners counted
-($2.75N_\mu$ at $m=3$), and twice that for the ordered route; eight $[R,R]$
-complex128 blocks plus the eigensolver workspace must fit one device.
+$R\le\big[2\ell/16+m/4+1/8\big]N_\mu$ for $\ell$ line and $m$ imaginary
+sites, with conjugate line partners counted ($2.4N_\mu$ at $\ell=12$, $m=3$),
+and twice that for the ordered route; eight $[R,R]$ complex128 blocks plus the
+eigensolver workspace must fit one device, or the round runs on the face.
 
 The cap is a budget, not convergence. At the cap the Si QP-energy RMS against
 a contour-deformation reference is 0.80 meV (claim 2431); the uncapped store at

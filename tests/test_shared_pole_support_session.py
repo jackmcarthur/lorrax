@@ -29,10 +29,10 @@ def rebind(wfns, meta):
                            state_capacity=2., kweights=[.5, .5])
 
 
-def resolve(args, session=None):
+def resolve(args, session=None, window=(-6., 4.)):
     return resolve_shared_pole_recipe(
         *args, mesh_xy=NS(shape={"x": 2, "y": 2}), print_fn=lambda *_: None,
-        support_session=session)
+        requested_window_ev=window, support_session=session)
 
 
 # An interacting map's envelope is snapped outward onto the Sigma build grid
@@ -87,9 +87,8 @@ def test_gap_growth_keeps_points_roles_but_rebinds_current_state():
     assert not np.array_equal(current["imaginary_ev"], resolve(args)["imaginary_ev"])
     assert current["support_envelope"]["status"] == "hit"
     assert current["support_envelope"]["epoch"] == 0
-    assert set(session) == {"reference_complete", "key", "envelope", "epoch", "line_ev"}
+    assert set(session) == {"reference_complete", "key", "envelope", "epoch"}
     assert all(isinstance(v, float) for v in session["envelope"].values())
-    assert session["line_ev"] == tuple(first["line_ev"])
 
 
 def test_sector_treatment_ceiling_freezes_map0_and_masks_after_span_growth():
@@ -133,12 +132,23 @@ def test_plasma_interval_expands_and_never_shrinks():
     # omega_p 26.5 eV lifts the spectral top above D_max = 20.35 eV (u_max floors to 2**4.5).
     expanded = resolve(inputs(top=30.), session)
     assert expanded["support_envelope"]["status"] == "expanded"
-    assert expanded["top_ev"] > first["top_ev"]
     assert expanded["u_max_ev"] > first["u_max_ev"]
+    assert expanded["line_ev"].tobytes() == first["line_ev"].tobytes()
     contracted = resolve(inputs(top=18.), session)
     assert_same_geometry(expanded, contracted)
     assert contracted["plasma_ev"] < expanded["plasma_ev"]
-    assert contracted["support_envelope"]["required"]["line_top_ev"] < contracted["top_ev"]
+
+
+def test_line_top_is_the_requested_window_high_water():
+    args = inputs()
+    session, first = interacting_session(args)
+    wider = resolve(args, session, window=(-9., 4.))
+    assert wider["support_envelope"]["status"] == "expanded"
+    assert wider["top_ev"] > first["top_ev"] == 8.0
+    np.testing.assert_array_equal(wider["line_ev"][:first["line_count"]], first["line_ev"])
+    narrower = resolve(args, session, window=(-5., 4.))
+    assert_same_geometry(wider, narrower)
+    assert narrower["support_envelope"]["required"]["line_top_ev"] < narrower["top_ev"]
 
 
 @pytest.mark.parametrize("changed", ["eta", "tier", "basis"])
@@ -156,7 +166,7 @@ def test_policy_or_basis_change_starts_a_new_envelope(changed):
     assert current["support_envelope"]["epoch"] == 1
     assert_same_geometry(current, resolve(args), rtol=SNAP_RTOL)
     if changed == "eta":
-        assert current["height_ev"] == first["height_ev"] == 2.6
+        assert current["height_ev"] == 2 * first["height_ev"] == 2.0
         assert current["u_min_ev"] == pytest.approx(2*first["u_min_ev"], rel=SNAP_RTOL)
 
 
@@ -194,7 +204,7 @@ def test_independent_resolution_remains_current_and_has_no_session_receipt():
 
 def test_reference_interval_is_not_retained_by_first_interacting_map():
     session = {}
-    reference = resolve(inputs(.7, top=24.), session)
+    reference = resolve(inputs(.7, top=24.), session, window=(-9., 4.))
     assert reference["support_envelope"]["status"] == "initial_reference"
     assert reference["support_envelope"]["epoch"] == -1
     assert session == {"reference_complete": True}

@@ -109,6 +109,19 @@ def support_envelope_ev(energy_relative_ev, requested_kn, pad_ev):
             float(np.max(energy[requested])) + float(pad_ev))
 
 
+def requested_window_ev(requested_grid_ev, energy_relative_ev, requested_kn):
+    """The requested window about mu, eV: the deck request ``D`` (the requested
+    grid's edges) joined with ``[min_R E, max_R E]``.
+
+    The shared-pole line ladder reaches its far side plus a pad
+    (``gw.shared_pole_recipe``): Sigma_c(omega) reads W on the line at
+    ``|omega - eps| <= |omega - mu|``.
+    """
+    grid = np.asarray(requested_grid_ev, dtype=np.float64)
+    return union_envelope((float(grid.min()), float(grid.max())),
+                          support_envelope_ev(energy_relative_ev, requested_kn, 0.0))
+
+
 def union_envelope(first, second):
     """The smallest interval holding both envelopes (None is empty)."""
     if first is None:

@@ -22,11 +22,17 @@ ROLE_CODES = {"line": 0, "imaginary": 1, "infinity": 2, "held_line": 3, "held_im
 
 shared_real_pole_v1_r3b = {
     "version": RECIPE_VERSION,
+    # Line ladder (SPCOST2 2026-09-27, claim 2906): Sigma_c reads W^c on the
+    # line at the crossings |E - eps| + i eta, and the line sites rebuild that
+    # line by continuation from their own height. Sites at height 4 eta, 4 eta
+    # apart, from 4 eta up to the requested window plus 2 eV: on Si 4^3 no
+    # further site moves an edge root by more than 0.06 meV, while 8 eta height
+    # costs 0.77 meV, 8 eta spacing 2.36 meV and stopping at the window 0.28 meV.
     "height_eta_factor": 4.0,
-    "height_floor_ev": 2.6,
+    "line_spacing_eta_factor": 4.0,
+    "line_extent_pad_ev": 2.0,
     "active_depth_ev": 15.0,
     "borderline_depth_ev": 25.0,
-    "plasma_margin_ev": 3.5,
     # Imaginary ladder top (METALW 2026-09-27): the spectral top of W^c, the
     # response transition span max(E_cond) - min(E_val) (never below omega_p).
     # A support above it duplicates the M1/M3 infinity block to O((top/u)^4)
@@ -37,26 +43,20 @@ shared_real_pole_v1_r3b = {
     "imaginary_min_count": 2,
     "imaginary_count_rule": "max(2, round(log(16*(L/u_min)^2)*log(4000)/(2*pi^2)))",
     "held_line_fractions": (0.25, 0.65),
-    # Production line sites (report section IV.B, the support rule): quantiles of the
-    # consumer's crossing-pair density to the power alpha on [omega_lo, omega_reach].
-    # Delivered: states within the window of mu, at offsets of the window on its step
-    # (the Si rule's +/-5 eV, 0.25 eV grid). Si Sigma optimum flat over alpha 0.25-0.75.
-    "support_density_power": 0.5,
-    "support_delivery_window_ev": 5.0,
-    "support_offset_step_ev": 0.25,
     "multiplet_relative_tolerance": 1.0e-6,
     "moment_convention": "S_m = 2 M_(2m+1); physical M1 and M3 only",
     "operator_realization": "little-group-reynolds-v1",
     # bank_rule_tolerance is tier-owned (METAL 2026-09-16): the remote-cell certificate
     # floor on a deep-semicore metal (Fe: even rows 3.4e-9 against 1e-8/4/amp) is a
     # deck property; production keeps 1e-8 bit for bit, relaxed admits 1e-7.
-    # Production sizing (owner ruling 2026-09-17): 18 fitted supports counted as the sparse
-    # n14 rung counts them (line + imaginary; held and the M1/M3 block are extra), line
-    # sites by the support rule; at most N_mu/16 right singular directions per line
-    # support; at most 1.8 N_mu retained Gram directions, the pole count K per parent.
+    # Production sizing: the line and imaginary ladders are counted independently
+    # (no shared support budget: METALW measured one line site lost to the
+    # imaginary ladder moving Fe's window edges by 35 meV); at most N_mu/16 right
+    # singular directions per line support; at most 1.8 N_mu retained Gram
+    # directions, the pole count K per parent (owner ruling 2026-09-17).
     "production": {"direction_cutoff": 1.0e-3, "imaginary_width_fraction": 0.25,
                    "infinity_width_fraction": 0.125,
-                   "bank_rule_tolerance": 1.0e-8, "fitted_support_count": 18,
+                   "bank_rule_tolerance": 1.0e-8,
                    "line_direction_cap_fraction": 0.0625, "pole_budget_fraction": 1.8},
     "relaxed": {"direction_cutoff": 1.0e-2, "imaginary_width_fraction": 0.125,
                 "infinity_width_fraction": 0.0625,
@@ -1038,51 +1038,19 @@ def imaginary_sample_count(kappa, tier, recipe=shared_real_pole_v1_r3b):
     return recipe[tier]['imaginary_count']
 
 
-def support_rule_line_sites(energies_ev, mu_ev, eta_ev, height_ev, top_ev, count,
-                            recipe=shared_real_pole_v1_r3b, grid=4001):
-    """Line sites from the band structure alone: the support rule (report section IV.B).
+def line_ladder_ev(top_ev, spacing_ev):
+    """Production line sites ``j * spacing``, ``j = 1 .. max(2, ceil(top/spacing))``, eV.
 
-    Sigma evaluates W on the line at the crossings |E - eps|: E a delivered energy (a
-    state within the delivery window W of ``mu_ev``, at an offset of the window's own
-    frequency grid) and eps any level, at any k (k - q spans the zone), strictly between
-    mu and E. ``energies_ev`` [k, bands]. The crossing density rho broadens each
-    crossing at ``eta_ev``; ``count`` sites sit at equal quantiles of rho**alpha on
-    [omega_lo, omega_reach], omega_reach the largest crossing and omega_lo the fixed point
-    max(height, first spacing). Crossings at or below the height count as none; with none
-    rho is flat on [omega_lo, ``top_ev``]. Distances from mu are binned at 0.01 eV (far
-    below eta) and paired by one correlation per side of mu; sites land on a grid of
-    ``grid`` points. Returns strictly increasing sites in eV.
+    A fixed lattice from the first spacing to the first lattice point at or
+    above ``top_ev``: the sites never move with ``top_ev``, so a growing top
+    (an SC high-water envelope) only appends sites. Starting at one spacing
+    keeps the ladder off the imaginary axis, whose ladder starts at 4 eta.
+    A top within 0.1% above a lattice point does not add a site, so the SC
+    envelope's outward snap (1e-4 relative) of a top such as 10 + 2 eV keeps
+    the one-shot's ladder.
     """
-    levels = np.asarray(energies_ev, dtype=np.float64).ravel() - mu_ev
-    window, step, delta = (recipe['support_delivery_window_ev'], recipe['support_offset_step_ev'], 0.01)
-    offsets = np.arange(-window, window + step / 2, step)
-    evaluation = (levels[np.abs(levels) <= window][:, None] + offsets[None, :]).ravel()
-    pairs = np.zeros(1)
-    for side in (1.0, -1.0):
-        e, eps = side * evaluation, side * levels
-        e, eps = e[e > 0], eps[eps > 0]
-        if not e.size:
-            continue
-        n = int(np.rint(e.max() / delta)) + 1
-        he = np.bincount(np.rint(e / delta).astype(np.int64), minlength=n)
-        hs = np.bincount(np.rint(eps[eps <= e.max()] / delta).astype(np.int64), minlength=n)[:n]
-        lagged = np.correlate(he, hs, 'full')[n - 1:]            # [l] = sum_i he[i] hs[i - l]
-        pairs = np.pad(pairs, (0, max(0, n - pairs.size))) + np.pad(lagged, (0, max(0, pairs.size - n)))
-    pairs[:int(np.floor(height_ev / delta)) + 1] = 0
-    lags = np.flatnonzero(pairs)
-    reach = float(lags[-1] * delta) if lags.size else float(top_ev)
-    x = np.linspace(0.0, reach, grid)
-    rho = (eta_ev / math.pi * (pairs[lags] / ((x[:, None] - lags * delta) ** 2 + eta_ev ** 2)).sum(axis=1)
-           ) ** recipe['support_density_power'] if lags.size else np.ones(grid)
-    lo = float(height_ev)
-    for _ in range(200):
-        k = x >= lo - 1e-12
-        c = np.concatenate([[0.0], np.cumsum(np.diff(x[k]) * 0.5 * (rho[k][1:] + rho[k][:-1]))])
-        sites = np.interp(np.linspace(0.0, c[-1], int(count)), c, x[k])
-        lo, previous = max(float(height_ev), float(sites[1] - sites[0])), lo
-        if abs(lo - previous) < 1e-10:
-            break
-    return sites
+    count = max(2, math.ceil(float(top_ev) / float(spacing_ev) * (1.0 - 1.0e-3)))
+    return float(spacing_ev) * np.arange(1, count + 1, dtype=np.float64)
 
 
 def matsubara_indices(beta_ry_inv, bandwidth_ry, tier, recipe=shared_real_pole_v1_r3b):
@@ -1106,7 +1074,7 @@ def matsubara_indices(beta_ry_inv, bandwidth_ry, tier, recipe=shared_real_pole_v
 
 
 def resolve_shared_pole_recipe(config, wfns, meta, *, mesh_xy, print_fn,
-                              support_session=None):
+                              requested_window_ev, support_session=None):
     """Resolve DESIGN §5 from current metadata into scalars and small arrays.
 
     ``bind_shared_pole_census`` must have consumed this map's occupation state.
@@ -1116,8 +1084,11 @@ def resolve_shared_pole_recipe(config, wfns, meta, *, mesh_xy, print_fn,
     role code is reserved (moments need no bank evaluation). Conjugates are
     constructor states, never bank calls. ``support_pair`` int64 [role,2]
     binds held endpoints; [-1,-1] means not a held midpoint.
-    ``support_session`` optionally retains support bounds, the small line-site
-    tuple and a policy/basis key across SC maps, after one unretained reference map.
+    ``requested_window_ev`` is the requested window ``(lo, hi)`` about mu in eV
+    (``gw.qp_support.requested_window_ev``: the deck request joined with the
+    requested states); the line ladder reaches its larger side plus 2 eV.
+    ``support_session`` optionally retains support bounds and a policy/basis
+    key across SC maps, after one unretained reference map.
     Enclosed current intervals retain the same points and roles, while
     the census and capacity ledger remain fresh.
     Expanding intervals enlarge the envelope; policy changes start a new one.
@@ -1151,11 +1122,17 @@ def resolve_shared_pole_recipe(config, wfns, meta, *, mesh_xy, print_fn,
     eta = float(config.sigma.regularization_ev)
     if not math.isfinite(eta) or eta <= 0:
         raise ValueError("GATE shared_pole_eta: got: invalid eta; want: finite positive sigma_regularization_ev; why: causal sampling height")
-    height = max(recipe['height_floor_ev'], recipe['height_eta_factor'] * eta)
+    height = recipe['height_eta_factor'] * eta
+    spacing = recipe['line_spacing_eta_factor'] * eta
     override = parse_support_sites(getattr(config.sigma, 'w_support_sites_ev', ''))
     plasma_ry = 2.0 * math.sqrt(4.0 * math.pi * census['active_electrons']
                                / census['cell_volume_bohr3'])
-    top = plasma_ry * RYD_TO_EV + recipe['plasma_margin_ev']
+    window = tuple(float(v) for v in requested_window_ev)
+    if not (len(window) == 2 and all(map(math.isfinite, window)) and window[0] <= window[1]):
+        raise ValueError(f"GATE shared_pole_line_top: got: requested window {requested_window_ev!r} eV; want: finite (lo, hi) about mu with lo <= hi; why: the line ladder reaches the requested window plus {recipe['line_extent_pad_ev']} eV")
+    # Sigma_c(omega) reads the line at |omega - eps| <= |omega - mu|, so the
+    # ladder must cover the requested window's far side, plus the pad.
+    top = max(abs(window[0]), abs(window[1])) + recipe['line_extent_pad_ev']
     umin = max(recipe['height_eta_factor'] * eta, census['gap_ev'])
     # The imaginary condenser is the image of W^c's spectral support
     # [Omega_min^2, Omega_top^2] on the negative s axis, cut below at the
@@ -1182,21 +1159,9 @@ def resolve_shared_pole_recipe(config, wfns, meta, *, mesh_xy, print_fn,
     count = imaginary_sample_count(kappa, tier, recipe)
     imaginary = np.geomspace(umin, umax, count)
     if tier == 'relaxed':
-        line = np.linspace(0.0, top, policy['line_count'])
+        line = top * np.arange(1, policy['line_count'] + 1, dtype=np.float64) / policy['line_count']
     else:
-        # The fitted budget less the imaginary ladder, placed by the support rule.
-        line = support_rule_line_sites(energies * RYD_TO_EV, census['mu_ry'] * RYD_TO_EV, eta, height, top,
-                                       policy['fitted_support_count'] - count)
-        if support_receipt is not None and support_receipt['status'] != 'initial_reference':
-            previous_line = support_session.get('line_ev')
-            if support_receipt['status'] == 'hit' and previous_line is not None:
-                if line[-1] <= previous_line[-1]:
-                    line = np.asarray(previous_line, dtype=np.float64)
-                else:
-                    support_session['epoch'] += 1
-                    support_receipt.update(status='expanded', epoch=support_session['epoch'])
-            # This is the existing SC sampling geometry, never W samples or a model.
-            support_session['line_ev'] = tuple(float(v) for v in line)
+        line = line_ladder_ev(top, spacing)
     if override is not None:
         # Both ladders are replaced together; height, held fractions, widths,
         # zero policy and every gate stay the resolver's own. u_min/u_max/kappa
@@ -1276,7 +1241,7 @@ def resolve_shared_pole_recipe(config, wfns, meta, *, mesh_xy, print_fn,
         'accuracy_reason': 'resolved geometry has no authenticated matching campaign receipt',
         'eta_ev': eta, 'height_ev': height, 'height_ry': height / RYD_TO_EV,
         'plasma_ev': plasma_ry * RYD_TO_EV, 'plasma_ry': plasma_ry,
-        'top_ev': top,
+        'requested_window_ev': window, 'top_ev': top, 'line_spacing_ev': spacing,
         'line_ev': line, 'imaginary_ev': imaginary,
         'held_line_ev': held_line, 'held_imaginary_ev': held_imag,
         'u_min_ev': umin, 'u_max_ev': umax, 'kappa': kappa,
@@ -1315,8 +1280,10 @@ def resolve_shared_pole_recipe(config, wfns, meta, *, mesh_xy, print_fn,
         'support_sites': 'sigma_w_support_sites_ev; "" = the resolver ladder, else explicit line|imaginary eV sites folded into recipe_version/recipe_hash',
         'height': 'h=4*eta', 'eta': 'literal sigma_regularization_ev',
         'plasma': '2*sqrt(4*pi*active_electrons/volume) Ry',
-        'top': 'L=omega_p+3.5 eV',
-        'line': 'production: 18 fitted supports less the imaginary count, quantiles of the band-structure crossing density; relaxed 8 endpoints',
+        'requested_window': 'deck request joined with the requested states, about mu (gw.qp_support)',
+        'top': 'L = max|requested window| + 2 eV',
+        'line_spacing': 'Delta = 4*eta',
+        'line': 'production: j*Delta, j = 1..ceil(L/Delta), independent of the imaginary count; relaxed 8 sites j*L/8',
         'line_direction_cap': 'production ceil(n/16) right singular directions per line support (whole multiplets); relaxed none',
         'pole_budget': 'production ceil(1.8 n) retained Gram directions per parent (largest first); relaxed none',
         'imaginary': 'log-spaced u_min..u_max; round(log(16*(u_max/u_min)^2)*log(4000)/(2*pi^2)), min2; tier width ceil(f*n)',
@@ -1332,10 +1299,15 @@ def resolve_shared_pole_recipe(config, wfns, meta, *, mesh_xy, print_fn,
         'metadata': 'sum of replicated metadata array nbytes',
     }
     if support_receipt is not None:
-        rules.update(top='SC high-water envelope of omega_p+3.5 eV',
+        rules.update(top='SC high-water envelope of max|requested window| + 2 eV',
                      u_min='SC low-water envelope of max(4 eta,logical gap)',
                      u_max='SC high-water envelope of max(response transition span, omega_p) floored onto 2**(k/4) eV',
                      support_envelope='current required bounds and retained sampling enclosure; not an interpolation-error certificate')
+    # One durable line (the production report keeps it with debug off).
+    print_fn(f'  Shared-pole supports: line {len(line)} sites {line[0]:.3f}..{line[-1]:.3f} eV '
+             f'at height {height:.3f} eV (requested window {window[0]:+.2f}..{window[1]:+.2f} eV, '
+             f'top {top:.2f} eV); imaginary {count} sites {umin:.3f}..{umax:.2f} eV; '
+             f'recipe_hash {table[:12]}')
     for key, value in result.items():
         shown = value.tolist() if isinstance(value, np.ndarray) else value
         rule = next((v for prefix, v in rules.items() if key.startswith(prefix)),

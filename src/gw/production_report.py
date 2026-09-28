@@ -248,9 +248,10 @@ class GWProductionReport:
         # The μ-batch ζ fit's plan and its measured store/timing receipts are
         # the run's record of where Z lived and what the transfers cost; the
         # ladder resolvent's per-z receipts (wall, iterations, residual,
-        # high-water, fingerprints) are the same kind of record.
+        # high-water, fingerprints) are the same kind of record, as is the
+        # shared-pole support geometry (where W was sampled).
         if text.startswith(("  ISDF μ-batch plan", "  μ-batch ", "  Z store: ", "  [host mem] ",
-                            "  Zeta output: ", "  Ladder W(z) ")):
+                            "  Zeta output: ", "  Ladder W(z) ", "  Shared-pole supports: ")):
             self.emit(text)
             return
         # Every box plan carries a durable policy and accepted-rule receipt,
