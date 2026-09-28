@@ -1221,11 +1221,11 @@ def _fit_fixed_sc_rules(specs, eta, *, eps, cache_dir, session, material_class=N
     if initialized:
         fixed = [_selector_box_spec(spec, spec.get("eta_ry", eta))
                  for spec in (rows if plan_specs is None else plan_specs)]
-        # One fit call per (broadening, tolerance): a patch window keeps its own.
+        # One fit call per broadening: a far-patch window keeps its own eta.
         fits, fit_rows = [None] * len(fixed), []
-        key = lambda f: (float(f.get("eta_ry", eta)), float(f.get("eps", eps)))
-        for eta_g, eps_g in sorted({key(f) for f in fixed}):
-            ids = [i for i, f in enumerate(fixed) if key(f) == (eta_g, eps_g)]
+        for eta_g in sorted({float(f.get("eta_ry", eta)) for f in fixed}):
+            ids = [i for i, f in enumerate(fixed) if float(f.get("eta_ry", eta)) == eta_g]
+            eps_g = float(fixed[ids[0]].get("eps", eps))
             got, got_rows = fit_sigma_box_specs([fixed[i] for i in ids], eta_g, eps=eps_g,
                                                 cache_dir=cache_dir, cache_build_widen=False)
             for i, fit in zip(ids, got):
@@ -1540,12 +1540,9 @@ def plan_sigma_windows(
 
     fixed_receipt = None
     if far_eps is not None:
-        # (above E_F, below E_F): rotating-endpoint patches sit above E_F,
-        # semicore patches below; one number serves both.
-        above, below = far_eps if isinstance(far_eps, tuple) else (far_eps, far_eps)
         for spec in plan_specs:
             if float(spec.get("eta_ry", eta)) != float(eta):
-                spec["eps"] = float(below if spec["branch"].neg_omega_half else above)
+                spec["eps"] = float(far_eps)
     fits, fit_rows, fixed_receipt = _fit_fixed_sc_rules(
         specs, eta, eps=tolerance, cache_dir=cache_dir,
         session={} if fixed_rule_session is None else fixed_rule_session,
