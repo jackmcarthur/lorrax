@@ -223,7 +223,7 @@ def test_geometry_padding_charge_and_holds():
     # (6 eV) plus 2 eV, at height 4 eta; independent of the imaginary count.
     assert r['height_ev']==1.0 and r['top_ev']==8.0
     np.testing.assert_array_equal(r['line_ev'],np.arange(1.,9.))
-    assert r['line_direction_cap']==2 and r['pole_budget']==31      # ceil(17/16), ceil(1.8*17)
+    assert r['line_direction_cap']==2 and r['pole_budget'] is None  # ceil(17/16); no pole cap (F5)
     assert not set(r['fit_ids']) & set(r['held_ids'])
     assert len(r['role']) == r['unique_evaluations']
     assert r['imaginary_count']==3
