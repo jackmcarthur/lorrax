@@ -313,42 +313,11 @@ K_POINTS {crystal_b}
 ## bse — `bse.bse_jax`
 
 Solves the Bethe–Salpeter equation for $Q = 0$ excitons in the transition
-basis $|vk \to ck\rangle$. The resonant block is
-
-$$A = D + 2V - W \quad(\text{scalar, singlet}),\qquad A = D + V - W \quad(\text{spinor}),$$
-
-with $D = \varepsilon_c - \varepsilon_v$, $V$ the bare exchange and $W$ the
-statically screened direct term, both applied in the ISDF μ basis without
-forming $A$. The default is the full (non-TDA) problem with the coupling block
-$B$; `--tda` keeps $A$ only. `--rpa` (the default kernel) drops $W$; `--bse`
-includes it. The matvec, shardings and output layout are in the
-[BSE README](../src/bse/context/README.md).
-
-Every sharded solver (Lanczos, block Lanczos, Davidson, thick-restart Lanczos,
-FEAST) applies $H$ through the one trial-stack matvec
-(`bse_stack_matvec`), whose trial axis is scanned so one direct-term tensor is
-alive regardless of block width. `bse_k_grid` densifies the bundle before any
-solve: ψ and ε through one htransform $f(H)$, W by zero-padding in R (exact
-trigonometric interpolation, `bse.bse_densify.make_w_densifier`).
-
-Consumes the run directory's single `isdf_tensors_*.h5` (more than one refuses,
-`GATE bse_restart_ambiguous`), plus optionally `eqp1.dat`. Stored screened
-`W0_qmunu` is reused with the authenticated WFN and centroid bundle. If
-`W0_ready` is false, `gw.static_screening.build_static_w_from_restart` builds
-RPA W(0) through the response owner at one frequency and resolves the matching
-Gamma-cell head. It does not run Sigma, fit poles, or modify the restart.
-Scalar insulators use the gapped response; scalar Fermi-Dirac metals use the
-zero-frequency Matsubara response and the Thomas-Fermi head. Missing dipoles
-or provenance refuse. A missing-W0 four-current bundle refuses by name until
-the packed sectors have a BSE handoff; a QSGW deck without final-map W0 also
-refuses, because its parent DFT WFN cannot reconstruct that map.
-
-GW persistence uses the same static-screening entry point for a retained
-shared-pole state. It remains necessary for QSGW: that model and its head
-belong to the accepted map, including its orbital rotation and band tail.
-A BSE `--eqp` correction changes transition energies, not this screening state.
-Writes `bse.out` and, with `--write-eigs`, BerkeleyGW-layout `eigenvectors.h5`
-(rank 0).
+basis $|vk \to ck\rangle$: the full (non-TDA) problem by default, the resonant
+block $A$ with `--tda`. `--rpa` (the default kernel) drops $W$; `--bse`
+includes it. The Hamiltonian, the inputs, the screened W(0) handoff, the
+matvec and its kernels, the solvers, the dipoles, the outputs and the refusals
+are on [the BSE page](architecture/bse.md).
 
 Invoke: `python -u -m bse.bse_jax -i cohsex.in --lanczos --bse ...` in the GW
 run directory. The mesh is the run's square startup mesh; `--px`/`--py` must
@@ -356,13 +325,6 @@ be square and use every device. The CLI is strict: an unknown flag refuses,
 and so does a flag the chosen route (Lanczos, `--kpm-dos`, or the default
 FEAST) does not read — `--eqp`, `--n-eig`, `--n-occ` and the solver flags are
 Lanczos-only.
-
-Without `--lanczos` the driver hands the solve to FEAST and forwards only
-`-i`, `--n-val`, `--n-cond`, `--px`/`--py`, `--bse`/`--rpa`/`--tda` and the
-`--feast-*`, `--gmres-*` and `--kpm-*` knobs. The rows marked *Lanczos* below
-apply to the `--lanczos` route only; a FEAST run with `--eqp` gets DFT-energy
-excitons. The driver parses with `parse_known_args`, so an unknown flag is
-ignored, not refused.
 
 | flag | default | meaning |
 |---|---|---|
@@ -374,6 +336,7 @@ ignored, not refused.
 | `--solver` | `lanczos` | *Lanczos*. `lanczos` (spectrum shape), `davidson` (per-state convergence, `--davidson-*`), `trlan` (thick restart, bounded memory, `--trlan-*`) |
 | `--block-size` / `--max-lanczos-iter` / `--n-reorth` | 1 / auto / −1 | *Lanczos*. Block width / total Krylov dimension / reorthogonalization window (−1 = full, needed for degenerate spinor spectra) |
 | `--n-eig` / `--write-eigs [N]` | 5 / off | *Lanczos*. Eigenpairs; write `eigenvectors.h5` |
+| `--dipole FILE` | none | *Lanczos*, with `--write-eigs` and `--tda`: store each written state's dipole $\langle 0\lvert\hat r\rvert S\rangle$ from `FILE` (a `dipole.h5`) in `eigenvectors.h5` |
 | `--eqp FILE` | none | *Lanczos*. Diagonal QP energies from the wedge `eqp1.dat`, unfolded through the symmetry service; the restart must be proved to come from the same unrotated WFN |
 | `bse_k_grid` (deck) | `""` | fine grid "NX NY NZ", each axis at least the coarse extent |
 | `head_minibz_average` (deck) | false | mini-BZ cell average of the exchange head ([LT head](theory/lt-exchange-head.md)); also rebuilds the q = 0 tile on `bse_k_grid` |

@@ -1,36 +1,13 @@
 # Bispinor GW — Phase-1 Design (DHF + Bare-Breit)
 
-> **SUPERSEDED IN PART; CURRENT IMPLEMENTATION NOTES UPDATED 2026-08-29.**
-> This remains the phase-1 physics record. The current source map and ζ
-> schedule supersede the original implementation plan:
->
-> - Σ^B assembly lives in `src/gw/sigma_x_bispinor.py` (the planned
->   `src/gw/breit_sigma.py` was never created); V_q^{μν} tiles in
->   `src/gw/v_q_bispinor.py`.
-> - Transverse ζ uses the Hermitian-indefinite CCT path: pivoted LU with a
->   trace-scaled ridge. Fresh μ=1,2,3 fits share one route-G loop (one
->   ψ(G) read, shared pair GEMM and plane FFTs) with a k-convolution, factor
->   and file per channel. See
->   [the solve seam](architecture/zeta_fit_mubatch.md#the-solve-seam).
-> - File-map rows that no longer exist: `src/common/load_wfns.py`,
->   `src/common/isdf_fitting.py` (now `src/gw/isdf_fitting.py` +
->   `src/isdf/core.py`), `src/centroid/centroid_io.py` (centroid provenance
->   is written by `kmeans_cli`; the GW contract is the configured file role
->   plus a hash of its FFT-index table),
->   `docs/PHYSICS_COMPREHENSIVE.md` /
->   `docs/CODEBASE_COMPREHENSIVE.md` (see `docs/theory/physics.md` /
->   `docs/architecture/codebase.md`), and the `runs/MoS2/...` validation dirs
->   (machine-local, not shipped).
-> - Current usage: manual ch. 8 (bispinor GW) and `docs/drivers.md`
->   (two-centroid-file convention, `--density-mode current`).
-> - The q→0 head of every channel, the packed screened photon head, and the
->   frequency treatment are owned by
->   [Four-current heads and frequency](theory/four-current-head-corrections.md);
->   §11 below keeps only the 2026-08-01 measurements.
-
-**Status:** historical physics design with current implementation addenda
-
-**Last update:** 2026-08-29
+The physics record of the bispinor (Dirac–Hartree–Fock + bare Breit) GW:
+conventions, equations, the four-density ISDF and the 2026-08-01 q = Γ
+measurements. Routes, objects and refusals are
+[Four-current wiring](../architecture/four_current_wiring.md); the q→0 head of
+every channel and the frequency treatment are
+[Four-current heads and frequency](four-current-head-corrections.md). Usage:
+manual ch. 8 and [drivers](../drivers.md) (two centroid files,
+`--density-mode current`).
 
 ## 1. Scope
 
@@ -40,7 +17,7 @@ DHF + bare-Breit GW with bispinor wavefunctions:
 - $\Sigma_{\alpha\beta}=\Sigma^C_{\alpha\beta}+\Sigma^B_{\alpha\beta}$.  $\Sigma^C$ uses $W_{00}$; $\Sigma^B$ uses the **bare** $D^{ij}$ — no transverse screening, no retardation.
 - Four ISDF $\zeta$ bases, one per $\tilde\gamma^{\mu_L}$, on **two centroid sets**: the charge feature-row norm for $\mu_L=0$ and the three-current feature-row norm for $\mu_L\in\{1,2,3\}$.
 
-Deferred (phase-2+): full $\chi^{\mu\nu}/W^{\mu\nu}$, transverse screening, retarded Breit, vertex corrections, higher-order kinetic balance, bispinor-aware Sternheimer source.
+This phase leaves out transverse screening; §8 says which of it is now on main.
 
 ## 2. Conventions
 
@@ -52,7 +29,7 @@ Deferred (phase-2+): full $\chi^{\mu\nu}/W^{\mu\nu}$, transverse screening, reta
 | $i,j$ | 1–3 | spatial Lorentz subset |
 | $\mu_c,\nu_c,\lambda_c$ | 1–$n_{r\mu}$ | ISDF centroid |
 
-**γ-matrix convention** (already in [`gamma_matrices.py`](../src/common/gamma_matrices.py)): the stored matrices are $\tilde\gamma^\mu\equiv\gamma^0\gamma^\mu$, so `gamma0` $=I_4$ and `gamma_i` $=\alpha^i$. We always write $\rho^{\mu_L}=\psi^\dagger\tilde\gamma^{\mu_L}\psi$ (no explicit $\bar\psi$).
+**γ-matrix convention** (already in [`gamma_matrices.py`](../../src/common/gamma_matrices.py)): the stored matrices are $\tilde\gamma^\mu\equiv\gamma^0\gamma^\mu$, so `gamma0` $=I_4$ and `gamma_i` $=\alpha^i$. We always write $\rho^{\mu_L}=\psi^\dagger\tilde\gamma^{\mu_L}\psi$ (no explicit $\bar\psi$).
 
 **Gauge:** Coulomb. The bare 4×4 photon propagator is block-diagonal,
 
@@ -67,7 +44,7 @@ Off-block ($D^{0i}=0$) is exact in Coulomb gauge.
 $$\Psi_{nk}(G) = \begin{pmatrix}\psi_L\\\psi_S\end{pmatrix},\quad
 \psi_S = \tfrac{\alpha_{\rm FS}}{2}\,\big[\sigma\!\cdot\!(k+G)\big]\,\psi_L,$$
 
-with $(k+G)$ in Bohr⁻¹ — i.e. the BGW HDF5 `wfn.bvec` (stored in reciprocal-lattice units) is multiplied by `wfn.blat = 2π/alat` once at the `WfnLoader` file-format boundary.  [`bispinor_init.py`](../src/common/bispinor_init.py) accepts only that explicitly Cartesian basis.
+with $(k+G)$ in Bohr⁻¹ — i.e. the BGW HDF5 `wfn.bvec` (stored in reciprocal-lattice units) is multiplied by `wfn.blat = 2π/alat` once at the `WfnLoader` file-format boundary.  [`bispinor_init.py`](../../src/common/bispinor_init.py) accepts only that explicitly Cartesian basis.
 
 **Polarizability and screening (charge channel only):**
 
@@ -158,9 +135,9 @@ applied per G tile. Partial reuse fits only the missing channels, in the same
 loop.
 
 The detailed loop and sharding contract is in
-[ζ fit by μ-batches](architecture/zeta_fit_mubatch.md).
+[ζ fit by μ-batches](../architecture/zeta_fit_mubatch.md).
 Closed-form memory and capacity policy belong to the
-[memory model](architecture/memory-model.md); this page does not duplicate
+[memory model](../architecture/memory-model.md); this page does not duplicate
 them.
 
 ### 4.2 Historical proper-Gram alternative
@@ -175,16 +152,16 @@ band-pair cost; it is not the implemented path.
 
 | File | Phase-1 change |
 |---|---|
-| [`src/common/bispinor_init.py`](../src/common/bispinor_init.py) | Single σ·p implementation; requires an explicitly Cartesian reciprocal basis in Bohr⁻¹. |
-| [`services/wfn_loader/`](services/wfn_loader.md) | The WFN-format boundary folds `wfn.blat` into raw `wfn.bvec` once before calling the lift. |
-| [`src/gw/isdf_fitting.py`](../src/gw/isdf_fitting.py) + [`src/isdf/core.py`](../src/isdf/core.py) | One fit driver and one pair-density/CCT/Z/solve implementation for charge and transverse vertices; the private coordinator only schedules those owners. |
-| [`services/symmetry_maps/`](services/symmetry_maps.md) (`import symmetry_maps`) | Canonical typed operation, Cartesian, spinor, and translation actions used by the fit, IBZ writer, and V reconstruction. |
-| [`src/centroid/sampling_metric.py`](../src/centroid/sampling_metric.py) | Shared charge/current feature-Gram diagonal from streamed subspace projectors. |
-| [`src/centroid/kmeans_cli.py`](../src/centroid/kmeans_cli.py) | `--density-mode {scalar,current}` flag; auto-suffixes the output (`""` / `"_current"`); writes feature-fit, source-WFN, and intended-channel provenance. |
-| [`src/gw/sigma_x_bispinor.py`](../src/gw/sigma_x_bispinor.py) | $D^{ij}_{\rm bare}$ + $\tilde\gamma^i G^0 \tilde\gamma^j$ contraction for $\Sigma^B_{\alpha\beta}$. |
-| [`src/gw/v_q_bispinor.py`](../src/gw/v_q_bispinor.py) + [`src/gw/compute_vcoul.py`](../src/gw/compute_vcoul.py) | Channel-aware $V_q$ orchestration and the Coulomb/transverse projector kernel. |
-| [`src/gw/cohsex_sigma.py`](../src/gw/cohsex_sigma.py), [`ppm_sigma.py`](../src/gw/ppm_sigma.py) | Parameterise spinor axis size; $\tilde\gamma^0$ vertices made explicit (identity, but expose contraction shape for phase-2). |
-| [`src/gw/gw_init.py`](../src/gw/gw_init.py), [`gw_config.py`](../src/gw/gw_config.py) | Resolve independent reuse, select coupled versus sequential transverse fitting, and bind the `bispinor_gw` policy. |
+| [`src/common/bispinor_init.py`](../../src/common/bispinor_init.py) | Single σ·p implementation; requires an explicitly Cartesian reciprocal basis in Bohr⁻¹. |
+| [`services/wfn_loader/`](../services/wfn_loader.md) | The WFN-format boundary folds `wfn.blat` into raw `wfn.bvec` once before calling the lift. |
+| [`src/gw/isdf_fitting.py`](../../src/gw/isdf_fitting.py) + [`src/isdf/core.py`](../../src/isdf/core.py) | One fit driver and one pair-density/CCT/Z/solve implementation for charge and transverse vertices; the private coordinator only schedules those owners. |
+| [`services/symmetry_maps/`](../services/symmetry_maps.md) (`import symmetry_maps`) | Canonical typed operation, Cartesian, spinor, and translation actions used by the fit, IBZ writer, and V reconstruction. |
+| [`src/centroid/sampling_metric.py`](../../src/centroid/sampling_metric.py) | Shared charge/current feature-Gram diagonal from streamed subspace projectors. |
+| [`src/centroid/kmeans_cli.py`](../../src/centroid/kmeans_cli.py) | `--density-mode {scalar,current}` flag; auto-suffixes the output (`""` / `"_current"`); writes feature-fit, source-WFN, and intended-channel provenance. |
+| [`src/gw/sigma_x_bispinor.py`](../../src/gw/sigma_x_bispinor.py) | $D^{ij}_{\rm bare}$ + $\tilde\gamma^i G^0 \tilde\gamma^j$ contraction for $\Sigma^B_{\alpha\beta}$. |
+| [`src/gw/v_q_bispinor.py`](../../src/gw/v_q_bispinor.py) + [`src/gw/compute_vcoul.py`](../../src/gw/compute_vcoul.py) | Channel-aware $V_q$ orchestration and the Coulomb/transverse projector kernel. |
+| [`src/gw/cohsex_sigma.py`](../../src/gw/cohsex_sigma.py), [`ppm_sigma.py`](../../src/gw/ppm_sigma.py) | Parameterise spinor axis size; $\tilde\gamma^0$ vertices made explicit (identity, but expose contraction shape for phase-2). |
+| [`src/gw/gw_init.py`](../../src/gw/gw_init.py), [`gw_config.py`](../../src/gw/gw_config.py) | Resolve independent reuse, select coupled versus sequential transverse fitting, and bind the `bispinor_gw` policy. |
 
 ## 6. Phasing
 
@@ -204,9 +181,13 @@ band-pair cost; it is not the implemented path.
 2. **$c\to\infty$ limit**: as $\alpha_{\rm FS}\to0$, $\psi_S\to0$ and $\Sigma^B\to0$.
 3. **Light-atom DHFB-Breit reference** (Ne/Ar/Kr): order-of-magnitude match for $\Sigma^B$ core corrections.  Quantitative match is phase-2 (transverse screening matters at ~10%).
 
-## 8. Out of scope (phase-2)
+## 8. Beyond phase 1
 
-$\chi^{0i},\chi^{ij}$ • $W^{\mu\nu}$ Dyson (4×4 matrix) • retarded Breit ($D^{ij}(\omega)$) • Sternheimer-side bispinor source • higher-order kinetic balance (DKH4 / σ·v).
+Screened transverse response is on main: `bispinor_gw = full_static_cohsex` builds all
+sixteen χ blocks and one packed Dyson solve, and `full_shared_pole` carries ordered
+CC/CT/TC/TT sectors ([four-current wiring](../architecture/four_current_wiring.md)).
+Not built: retarded Breit ($D^{ij}(\omega)$), vertex corrections, higher-order kinetic
+balance (DKH4, σ·v; `common/bispinor_init.py`).
 
 ## 9. Open questions
 
@@ -220,20 +201,20 @@ Historical validation provenance was recorded under the machine-local
 `runs/MoS2/B_bispinor_pd_smoke_2026-05-02/` directory. It is not shipped and
 does not certify the current coupled schedule.
 
-Internal: [`docs/theory/physics.md`](theory/physics.md) (scalar ISDF GW) and [`docs/architecture/codebase.md`](architecture/codebase.md). *These two links named `PHYSICS_COMPREHENSIVE.md` / `CODEBASE_COMPREHENSIVE.md` until 2026-08-06; both were deleted in the 2026-07-31 restructure, and the banner at the top of this page had already recorded their successors while these links kept pointing at the graves.*
+Internal: [physics](physics.md) (scalar ISDF GW) and the [codebase map](../codebase.md).
 
 ## 11. q=Γ measurements on the bi4 deck (2026-08-01 audit)
 
 The argument for how each `(μ_L, ν_L)` tile behaves at `q → 0`, and the
 correction the code applies, live in
-[Four-current heads and frequency](theory/four-current-head-corrections.md)
+[Four-current heads and frequency](four-current-head-corrections.md)
 §2. This section keeps only the provenance measurements that page cites.
 Deck: MoS2 4×4, 402 charge + 143 transverse centroids, P=4, `sys_dim=2`,
 job 7885325 (Frontera; artifacts were machine-local and are not shipped).
 These are historical measurements of the former TT-slot overlay, not a
 current route claim: at `34228021` no deck key reaches that overlay, while
 the packed slab routes obtain `⟨D_TT⟩` from the coupled Γ completion. See the
-single [implementation-status statement](theory/four-current-head-corrections.md#four-current-phase-status).
+single [implementation-status statement](four-current-head-corrections.md#four-current-phase-status).
 
 | quantity | value |
 |---|---|

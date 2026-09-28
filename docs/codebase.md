@@ -64,6 +64,7 @@ contracts, equations, shapes, and run policy remain on the owner pages in the
 | `photon_direct_head.py` | First-order direct bulk photon head from the dipole vertex. |
 | `photon_layout.py` | Defines the packed current-channel array layout. |
 | `photon_sigma.py` | Evaluates self-energy contributions in the packed current layout. |
+| `plane_wave_pipeline.py` | One-shot real-space (ISDF-free) GW stages, ψ(G) → χ₀ → W → Σ_x, Σ_c(ω); `python -m gw.plane_wave_pipeline` (not wired). |
 | `plane_wave_screening.py` | Screened interaction W_q(G, G') on the plane-wave response sphere, per wedge q (not wired). |
 | `ppm_accumulators.py` | Accumulates plasmon-pole self-energy terms. |
 | `ppm_pipeline.py` | Orchestrates plasmon-pole setup and evaluation. |
@@ -99,6 +100,7 @@ contracts, equations, shapes, and run policy remain on the owner pages in the
 | `sigma_dispatch.py` | Dispatches one self-energy call per resolved compute mode. |
 | `sigma_x_bispinor.py` | Implements bare-current exchange routes for spinor inputs. |
 | `static_gauge_response.py` | Builds packed static-gauge response inputs. |
+| `static_screening.py` | Static RPA W(0) and its q→0 head for consumers without a dynamical W: the BSE rebuild and the shared-pole W0 persist. |
 | `v_q_bispinor.py` | Builds the packed bare-current interaction operator. |
 | `v_q_g_flat.py` | Builds Coulomb matrices from flattened reciprocal-space data. |
 | `vcoul.py` | Compatibility imports for the vcoul service. |

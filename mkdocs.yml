@@ -76,6 +76,7 @@ nav:
       - Input reference: input_reference.md
       - Self-consistency: self_consistency.md
       - "How-to: metals": how-to/metals.md
+      - "How-to: complete-basis WFN": how-to/complete-basis-wfn.md
       - Downfold driver: downfold.md
   - Theory:
       - Overview: theory/overview.md
@@ -91,6 +92,7 @@ nav:
       - LT splitting and the exchange head: theory/lt-exchange-head.md
       - Four-current heads and frequency: theory/four-current-head-corrections.md
       - HL-GPP derivation: theory/hl-gpp-derivation.md
+      - "Bispinor GW: DHF + bare Breit": theory/BISPINOR_DHFB_DESIGN.md
       - Shared-pole screened interaction: theory/shared-pole-w-model.md
       - Multipole frequency integration (MPA): theory/THEORY_mpa_implementation.md
       - Metallic MPA screening: theory/metallic-mpa-screening.md
@@ -100,6 +102,7 @@ nav:
       - Layers: architecture/layers.md
       - Codebase: codebase.md
       - Four-current wiring: architecture/four_current_wiring.md
+      - BSE: architecture/bse.md
       - Substrate services: architecture/services.md
       - The FFI layer: architecture/ffi_layout.md
       - SlabIO (sharded-slab HDF5): architecture/slab_io.md
@@ -110,7 +113,7 @@ nav:
       - Mesh-padded axes: architecture/padding.md
       - Fractional chi0 response face: architecture/fractional_chi0_response_face.md
       - Shared-pole W (implementation): architecture/shared_pole_model.md
-      - Plane-wave GW stage graph: architecture/plane_wave_gw_stages.md
+      - Real-space (ISDF-free) GW: architecture/plane_wave_gw_stages.md
   - Services:
       - distrib_la (distributed dense linalg): services/distrib_la.md
       - symmetry_maps (k-grid reduction, stars, unfolds): services/symmetry_maps.md
