@@ -701,7 +701,7 @@ def test_a_non_default_window_dipole_passes_its_own_provenance_guard(tmp_path):
 
     wfn = _FakeWfn()
     p = tmp_path / "dipole.h5"
-    _write_stamped(p, wfn, **_NONDEFAULT_WINDOW)
+    _write_stamped(p, wfn, vnl_velocity_sign=+1, **_NONDEFAULT_WINDOW)
     lines = []
     _check_dipole_provenance(p, params=_head_params(**_NONDEFAULT_WINDOW),
                              wfn=wfn, print_fn=lines.append)
@@ -723,7 +723,7 @@ def test_a_stale_wfn_still_refuses_on_that_same_window(tmp_path, monkeypatch):
     monkeypatch.setattr(sanity, "sanity_strict", lambda: False)
     old, new = _FakeWfn(seed=0), _FakeWfn(seed=1)
     p = tmp_path / "dipole.h5"
-    _write_stamped(p, old, **_NONDEFAULT_WINDOW)
+    _write_stamped(p, old, vnl_velocity_sign=+1, **_NONDEFAULT_WINDOW)
     lines = []
     _check_dipole_provenance(p, params=_head_params(**_NONDEFAULT_WINDOW),
                              wfn=new, print_fn=lines.append)
@@ -732,6 +732,39 @@ def test_a_stale_wfn_still_refuses_on_that_same_window(tmp_path, monkeypatch):
     assert not any("prov_nval" in ln or "prov_ncond" in ln or "prov_nband" in ln
                    for ln in lines), (
         "a stale-WFN report must not also accuse the band window", lines)
+
+
+def test_the_head_checker_names_a_skip_vnl_or_legacy_sign_dipole(tmp_path, monkeypatch):
+    """RED arm for the operator stamps: the one-shot head compares
+    ``prov_skip_vnl`` and ``prov_vnl_velocity_sign`` as the SC head does."""
+    from common import sanity
+    from gw.head_correction import _check_dipole_provenance
+
+    monkeypatch.setattr(sanity, "sanity_strict", lambda: False)
+    wfn = _FakeWfn()
+    for tag, stamp, field in (("p only", dict(skip_vnl=True), "prov_skip_vnl"),
+                              ("legacy sign", dict(vnl_velocity_sign=-1),
+                               "prov_vnl_velocity_sign")):
+        p = tmp_path / f"dipole_{field}.h5"
+        kw = dict(vnl_velocity_sign=+1, **_NONDEFAULT_WINDOW)
+        kw.update({k: v for k, v in stamp.items() if k != "skip_vnl"})
+        _write_stamped_operator(p, wfn, skip_vnl=stamp.get("skip_vnl", False), **kw)
+        lines = []
+        _check_dipole_provenance(p, params=_head_params(**_NONDEFAULT_WINDOW),
+                                 wfn=wfn, print_fn=lines.append)
+        assert any(field in ln for ln in lines), (tag, lines)
+
+
+def _write_stamped_operator(path, wfn, *, skip_vnl, nb_written=4, **kw):
+    import h5py
+    from psp.get_dipole_mtxels import stamp_dipole_provenance
+
+    with h5py.File(str(path), "w") as h5:
+        h5.create_dataset("dipole_cart", data=np.zeros((3, 1, nb_written, nb_written)))
+        h5.create_dataset("band_energies", data=np.zeros((1, nb_written)))
+        stamp_dipole_provenance(h5, wfn=wfn, wfn_path="WFN.h5",
+                                 nb_written=nb_written, bispinor=False,
+                                 skip_vnl=skip_vnl, vnl_mode="analytic", **kw)
 
 
 def test_the_head_checker_refuses_a_params_dict_with_no_window(tmp_path):

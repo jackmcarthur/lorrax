@@ -385,32 +385,23 @@ def _dipole_window_from_params(params, wfn) -> tuple[int, int, int]:
 
 
 def _check_dipole_provenance(dipole_path, *, params, wfn, print_fn) -> None:
-    """Was ``dipole.h5`` built from THIS DFT solution and THIS band window?; see docs/architecture/four_current_wiring.md."""
-    from common import sanity
-    from common.four_current_model import resolve_four_current_representation
+    """Was ``dipole.h5`` built from THIS DFT solution, THIS band window and THIS velocity operator?; see docs/architecture/four_current_wiring.md.
 
-    representation = resolve_four_current_representation(
-        bool(params.get("_four_current_bispinor", False)),
-        params.get("bispinor_gw"))
-    explicit_comparison = bool(params.get("_four_current_bispinor", False)) and (
-        not representation.scalar_head_bispinor)
-    if not sanity.sanity_enabled() and not explicit_comparison:
+    The operator fields are the ones the SC head authenticates
+    (``qsgw_head.read_authenticated_dipole_velocity``): V_NL included,
+    the analytic arm, and the deck's resolved ``vnl_velocity_sign``.
+    """
+    from common import sanity
+
+    if not sanity.sanity_enabled():
         return
     nval, ncond, nband = _dipole_window_from_params(params, wfn)
     try:
         from file_io.restart_bundle import (
             check_dipole_provenance,
         )
+        from psp.get_dipole_mtxels import resolve_vnl_velocity_sign
     except Exception as exc:            # psp stack unavailable (h5py-less env)
-        if explicit_comparison:
-            raise ValueError(
-                "GATE comparison_charge_dipole_provenance: the explicit "
-                "Pauli comparison cannot authenticate its dipole artifact.\n"
-                f"  got:  provenance checker import failed with "
-                f"{type(exc).__name__}: {exc}\n"
-                "  want: an available check_dipole_provenance owner\n"
-                "  why:  without the checker the run cannot establish "
-                "that dipole.h5 was built for the scalar charge carrier") from exc
         print_fn(f"  [dipole provenance] check unavailable "
                  f"({type(exc).__name__}: {exc})")
         return
@@ -421,21 +412,12 @@ def _check_dipole_provenance(dipole_path, *, params, wfn, print_fn) -> None:
         params.get("hubbard_input", ""), params.get("hubbard_occupations", ""),
         wfn=wfn, base_dir=os.path.dirname(os.path.abspath(dipole_path)),
         caller="gw.head_correction dipole")
-    authenticated = check_dipole_provenance(
+    check_dipole_provenance(
         dipole_path, wfn=wfn, nval=nval, ncond=ncond, nband=nband,
-        bispinor=expected_bispinor, print_fn=print_fn,
-        hubbard=expected_hubbard)
-    if explicit_comparison and not authenticated:
-        raise ValueError(
-            "GATE comparison_charge_dipole_provenance: the explicit "
-            "four-current comparison received an unauthenticated dipole.\n"
-            f"  got:  dipole_file = {dipole_path!r}, "
-            f"prov_bispinor != {expected_bispinor!r} or another provenance "
-            "field mismatched\n"
-            "  want: dipole.h5 regenerated from this exact deck with "
-            "prov_bispinor = false\n"
-            "  why:  the comparison's charge head uses the Pauli carrier; "
-            "a four-spinor or stale artifact measures a different operator")
+        bispinor=expected_bispinor, skip_vnl=False, vnl_mode="analytic",
+        vnl_velocity_sign=resolve_vnl_velocity_sign(
+            None, params.get("vnl_velocity_sign", "")),
+        print_fn=print_fn, hubbard=expected_hubbard)
 
 
 def resolve_head_sample(params, input_dir, wfn, sym, meta, print_fn, omega) -> HeadSample:
@@ -1385,10 +1367,7 @@ class HeadResolver:
             "nval": config.nval,
             "ncond": config.ncond,
             "nband": config.nband,
-            "bispinor_gw": getattr(
-                getattr(config, "bispinor_gw", "bare_transverse"),
-                "value", getattr(config, "bispinor_gw", "bare_transverse")),
-            "_four_current_bispinor": bool(config.bispinor),
+            "vnl_velocity_sign": getattr(config, "vnl_velocity_sign", ""),
             "_charge_bispinor": representation.scalar_head_bispinor,
             "wcoul0_source": head.wcoul0_source,
             "wcoul0_eta": head.wcoul0_eta,
