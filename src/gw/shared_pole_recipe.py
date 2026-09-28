@@ -53,8 +53,10 @@ shared_real_pole_v1_r3b = {
     # Production sizing: the line and imaginary ladders are counted independently
     # (no shared support budget: METALW measured one line site lost to the
     # imaginary ladder moving Fe's window edges by 35 meV); at most N_mu/16 right
-    # singular directions per line support; at most 1.8 N_mu retained Gram
-    # directions, the pole count K per parent (owner ruling 2026-09-17).
+    # singular directions per line support. No pole-count cap beyond memory
+    # (CONSENSUS F5, owner 2026-09-28): the 1.8 N_mu cap bound on Fe 4^3 and
+    # cost it 23 meV against cap 3.0 (claim 2919); every retained Gram
+    # direction above the tier cutoff is a pole.
     # response_group_tolerance: the derived group rules deliver exactly their
     # certificate over the whole transition interval and the shared-pole
     # construction amplifies it (Na 8^3 map-0 eqp 1.17 / 0.43 / 0.04 meV at
@@ -65,7 +67,7 @@ shared_real_pole_v1_r3b = {
     "production": {"direction_cutoff": 1.0e-3, "imaginary_width_fraction": 0.25,
                    "infinity_width_fraction": 0.125,
                    "bank_rule_tolerance": 1.0e-8, "response_group_tolerance": 1.0e-9,
-                   "line_direction_cap_fraction": 0.0625, "pole_budget_fraction": 1.8},
+                   "line_direction_cap_fraction": 0.0625},
     "relaxed": {"direction_cutoff": 1.0e-2, "imaginary_width_fraction": 0.125,
                 "infinity_width_fraction": 0.0625,
                 "line_count": 8, "imaginary_count": 2,
@@ -1302,7 +1304,7 @@ def resolve_shared_pole_recipe(config, wfns, meta, *, mesh_xy, print_fn,
         'line_spacing': 'Delta = 4*eta',
         'line': 'production: j*Delta, j = 1..ceil(L/Delta), independent of the imaginary count; relaxed 8 sites j*L/8',
         'line_direction_cap': 'production ceil(n/16) right singular directions per line support (whole multiplets); relaxed none',
-        'pole_budget': 'production ceil(1.8 n) retained Gram directions per parent (largest first); relaxed none',
+        'pole_budget': 'none: every retained Gram direction above the tier cutoff (memory admits the pencil side)',
         'imaginary': 'log-spaced u_min..u_max; round(log(16*(u_max/u_min)^2)*log(4000)/(2*pi^2)), min2; tier width ceil(f*n)',
         'held_line': 'adjacent-support midpoint nearest 25%/65% of the line interval; lower-index tie',
         'held_imaginary': 'geometric midpoint of first/last adjacent imaginary pair',

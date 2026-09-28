@@ -170,7 +170,8 @@ def constructor_execution(meta, resolution, recipe, *, mesh, ledger, upstream,
     local.batch_width = int(mesh.size)
     pole_budget = recipe.get('pole_budget')
     if pole_budget is None:
-        pole_budget = int(meta.n_rmu)
+        # Uncapped: the retained Gram directions are bounded by the pencil side.
+        pole_budget = int(side)
     output_width = column_extent(max(1, int(pole_budget)))
     retained_outputs = int(np.ceil(
         16 * int(parent_count) * int(retained_output_families)
