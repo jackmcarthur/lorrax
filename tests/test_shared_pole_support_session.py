@@ -108,7 +108,7 @@ def test_recipe_hash_binds_the_ladder():
     c = resolve(inputs(top=30.))
     assert c["imaginary_ev"].tobytes() != a["imaginary_ev"].tobytes()
     assert c["recipe_hash"] != a["recipe_hash"]
-    assert a["response_group_tolerance"] == 1e-10
+    assert a["response_group_tolerance"] == 1e-9
 
 
 def test_sector_treatment_ceiling_freezes_map0_and_masks_after_span_growth():
