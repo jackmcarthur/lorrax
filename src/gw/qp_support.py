@@ -1,63 +1,16 @@
-"""The sampled Σ(ω) support: the one owner of where the dynamic Σ grid reaches.
+"""Fixed sampled Sigma support, in eV relative to the Sigma chemical potential.
 
-Invariant (owner 2026-09-27). The support the one-shot and every SC map sample
-stays inside
-
-    D  ∪  [ min_{n∈R} E_in,n − P ,  max_{n∈R} E_in,n + P ]
-
-* ``D`` is the deck's explicit request (``sigma_omega_min_ev`` /
-  ``sigma_omega_max_ev``, or the patch list): a fixed interval that never grows.
-  Unset edges give the sample next to E_F.
-* ``R`` is the requested states: the QP-window identities (nval/ncond) the W
-  model treats as active (``shared_pole_recipe.active_band_mask``), outside
-  ``sc_frozen_core_bands``, and quasiparticles at the previous map
-  (:func:`quasiparticle_mask`).  Under ``clamp``/``static`` only those inside
-  the padded requested window (``scissor.sc_padded_window_ev``).
-* ``E_in`` is each state's input energy for the map: DFT at the one-shot and SC
-  map 0, the carried QP eigenvalue after.  It is never a root: eqp0, eqp1, Z
-  and a fixed-point solve do not enter this module.
-* ``P`` is flat: :data:`SUPPORT_PAD_EV` = 2 eV at the first plan (the one-shot
-  and SC map 0) and 1 eV at the map-1 plan; later maps hold the support and
-  move an edge only when a requested state's read support [E − h, E + h]
-  (h = :func:`read_halfwidth_ev`, the Z stencil) leaves it, to
-  E ± :data:`SUPPORT_BUFFER_EV`.  Between plans the envelope is the union over
-  the maps since the last plan.
-
-A requested state with Z ∉ (0, 1] at the previous map has no quasiparticle
-(UNIFY §2.4: its energy sits within ~η of a pole cluster of Σ_n).  It leaves
-``R``: its energy never moves the support, and while it lies off the support
-it reads the out-of-grid rule of ``qsgw_utils.sigma_eval_omega`` and is named
-in the log.  This is what keeps a runaway state (Na 8^3 b63, Z ≈ −382;
-Fe 4^3 k4 b26, Z = 2.82) from growing the grid.
-
-:func:`assert_support_in_envelope` refuses a support that leaves the
-invariant; every caller checks the grid it is about to sample.
+Only requested protected bands set the interval. The optional deck endpoints
+can enlarge it. The Z stencil and one 2 eV outer pad are included once;
+iterates clamp and only a failed convergence check may rebuild once.
 """
-
 from __future__ import annotations
-
 import numpy as np
 
-#: Flat support pad of the first plan (one-shot, SC map 0) and of the map-1
-#: plan, in eV (owner 2026-09-27: "highest requested state + 2 eV for the
-#: first window, new highest + 1 eV for the second window").
-SUPPORT_PAD_EV = (2.0, 1.0)
-
-#: Pad of an extension on a held map, in eV.  An extension triggers when a
-#: requested state's read support E ± h (h = 0.5 eV) leaves the grid; a
-#: buffer of 2h leaves that state h of free motion before it can trigger
-#: again, and equals the map-1 pad so a map-1 plan and a later extension set
-#: the same edge for the same state.
-SUPPORT_BUFFER_EV = 1.0
+SUPPORT_PAD_EV = 2.0
 
 
 def read_halfwidth_ev():
-    """Half-width of the Σ(ω) samples one state's evaluation reads.
-
-    Σ(E) is read at E and the Z stencil at E ± dE
-    (``eqp_bgw.compute_z_factor_from_omega_grid``), so a state is on its grid
-    while [E − dE, E + dE] is.
-    """
     from .eqp_bgw import Z_FINITE_DIFFERENCE_EV
     return float(Z_FINITE_DIFFERENCE_EV)
 
@@ -70,151 +23,140 @@ def quasiparticle_mask(z_kn):
     noise, and an exact ``z <= 1`` lets round-off drop it (Fe 4^3 SC: 76 vs 75
     tail samples).
     """
-    from .sigma_box_plan import snap_outward
     z = np.asarray(z_kn, dtype=np.float64)
     finite = np.where(np.isfinite(z) & (z > 0.0), z, 0.0)
-    z_down = np.vectorize(lambda x: snap_outward(x, 1., -1))(finite)
+    z_down = np.floor(finite * 1e4) / 1e4
     return np.isfinite(z) & (z > 0.0) & (z_down <= 1.0)
 
 
-def requested_states(sigma, frozen_core_bands, energy_relative_ev, required_kn,
-                     active_n=None, quasiparticle_kn=None):
-    """The requested set ``R`` of this map (module docstring), ``(nk, nb)`` bool."""
-    energy = np.asarray(energy_relative_ev, dtype=np.float64)
-    required = np.array(np.broadcast_to(
-        np.asarray(required_kn, dtype=bool), energy.shape))
-    # Frozen core blocks stay at DFT in the SC Hamiltonian; they never
-    # require a Sigma sample.
-    required[:, :int(frozen_core_bands)] = False
-    if sigma.out_of_grid == "cover":
-        if active_n is not None:
-            required &= np.asarray(active_n, dtype=bool)[None, :]
-    else:
-        from .gw_config import sigma_classification_window_ev
-        from .scissor import sc_padded_window_ev
-        win_lo, win_hi = sc_padded_window_ev(*sigma_classification_window_ev(sigma))
-        required &= (energy >= win_lo) & (energy <= win_hi)
-    if quasiparticle_kn is not None:
-        required &= np.asarray(quasiparticle_kn, dtype=bool)
-    return required
+def requested_states(energy_relative_ev, required_kn):
+    """Protected identities; omega endpoints and previous Z never select bands."""
+    return np.array(np.broadcast_to(np.asarray(required_kn, bool),
+                                    np.shape(energy_relative_ev)))
 
 
-def support_envelope_ev(energy_relative_ev, requested_kn, pad_ev):
-    """``[min_R E − pad, max_R E + pad]`` in eV, or None when ``R`` is empty."""
-    energy = np.asarray(energy_relative_ev, dtype=np.float64)
-    requested = np.broadcast_to(np.asarray(requested_kn, dtype=bool), energy.shape)
-    if not requested.any():
-        return None
-    return (float(np.min(energy[requested])) - float(pad_ev),
-            float(np.max(energy[requested])) + float(pad_ev))
-
-
-def union_envelope(first, second):
-    """The smallest interval holding both envelopes (None is empty)."""
-    if first is None:
-        return second
-    if second is None:
-        return first
-    return (min(first[0], second[0]), max(first[1], second[1]))
-
-
-def assert_support_in_envelope(grid_ev, deck_grid_ev, envelope_ev, step_ev, *,
-                               context):
-    """Refuse a sampled support that leaves ``D ∪ envelope`` (module docstring).
-
-    A grown edge lands on the step lattice, so it may overshoot its envelope
-    edge by less than one step; one step is the tolerance.
-    """
-    grid = np.asarray(grid_ev, dtype=np.float64)
-    deck = np.asarray(deck_grid_ev, dtype=np.float64)
-    lo, hi = float(deck[0]), float(deck[-1])
-    if envelope_ev is not None:
-        lo, hi = min(lo, float(envelope_ev[0])), max(hi, float(envelope_ev[1]))
-    tol = float(step_ev) * (1.0 + 1e-9)
-    if grid[0] < lo - tol or grid[-1] > hi + tol:
-        raise ValueError(
-            f"GATE sigma_support_envelope ({context}): the sampled Sigma support "
-            f"[{grid[0]:+.4f}, {grid[-1]:+.4f}] eV leaves the deck request "
-            f"[{deck[0]:+.4f}, {deck[-1]:+.4f}] eV joined with the requested-state "
-            f"envelope {envelope_ev} eV (E_in of the requested quasiparticles "
-            f"+/- the plan pad).  FALSE case: every sampled frequency is the deck's "
-            f"or within a pad of a requested state's input energy.  A root, a "
-            f"no-quasiparticle state or a state outside the Sigma window may not "
-            f"grow the grid; see gw/qp_support.py.")
-
-
-def grow_support_ev(grid_ev, energy_relative_ev, requested_kn, step_ev, *,
-                    pad_ev, trigger_ev):
-    """Extend only the outer samples of ``grid_ev`` over the triggering states.
-
-    A requested state triggers when E ∓ ``trigger_ev`` leaves the grid; the
-    crossed edge moves to E ∓ ``pad_ev`` on the ``step_ev`` lattice.  Every
-    old sample is kept, and an interior hole of a patched grid keeps its
-    refusal (``qsgw_utils.assert_omega_grid_covers``).
-    """
-    from common.units import RYD_TO_EV
-    from .qsgw_utils import assert_omega_grid_covers
-
-    grid = np.asarray(grid_ev, dtype=np.float64)
-    energy = np.asarray(energy_relative_ev, dtype=np.float64)
-    requested = np.asarray(requested_kn, dtype=bool)
-    step = float(step_ev)
-    if (grid.ndim != 1 or grid.size < 2 or not np.isfinite(grid).all()
-            or np.any(np.diff(grid) <= 0.0)
-            or not np.isfinite(step) or step <= 0.0):
-        raise ValueError("Sigma support requires an ascending finite grid and positive step")
-    if energy.ndim != 2 or requested.shape not in ((energy.shape[1],), energy.shape):
-        raise ValueError("Sigma support: energies and requested identity masks disagree")
-    requested = np.broadcast_to(requested, energy.shape)
-    if not np.isfinite(energy[requested]).all():
-        raise ValueError("Sigma support: requested energies must be finite")
-    trigger, pad = float(trigger_ev), float(pad_ev)
-    if not (np.isfinite(trigger) and trigger >= 0.0 and np.isfinite(pad) and pad >= trigger):
-        raise ValueError("Sigma support: need 0 <= trigger_ev <= pad_ev")
-    assert_omega_grid_covers(
-        energy / RYD_TO_EV, requested, grid / RYD_TO_EV,
-        context="Sigma requested-state support")
-    below = requested & (energy - trigger < grid[0])
-    above = requested & (energy + trigger > grid[-1])
-    if not (below.any() or above.any()):
-        return grid
-    lower = float(np.min(energy[below])) - pad if below.any() else float(grid[0])
-    upper = float(np.max(energy[above])) + pad if above.any() else float(grid[-1])
-    n_lower = int(np.ceil((grid[0] - lower) / step))
-    n_upper = int(np.ceil((upper - grid[-1]) / step))
-    return np.concatenate((
-        grid[0] - step * np.arange(n_lower, 0, -1), grid,
-        grid[-1] + step * np.arange(1, n_upper + 1)))
-
-
-def plan_support_ev(sigma, deck_grid_ev, energy_relative_ev, requested_kn, plan_index):
-    """A plan: ``D ∪ [min_R E − P, max_R E + P]`` with P = SUPPORT_PAD_EV[plan_index].
-
-    Returns ``(grid, envelope)``.  The plan starts from the deck grid, so a
-    map-1 plan may shrink against map 0.
-    """
-    pad = SUPPORT_PAD_EV[min(int(plan_index), len(SUPPORT_PAD_EV) - 1)]
-    grid = grow_support_ev(deck_grid_ev, energy_relative_ev, requested_kn,
-                           float(sigma.omega_step_ev), pad_ev=pad, trigger_ev=pad)
-    envelope = support_envelope_ev(energy_relative_ev, requested_kn, pad)
-    assert_support_in_envelope(grid, deck_grid_ev, envelope, sigma.omega_step_ev,
-                               context=f"plan {int(plan_index)}")
+def plan_support_ev(sigma, energy_relative_ev, requested_kn, *,
+                    outer_pad_ev=SUPPORT_PAD_EV, support_floor_ev=()):
+    """Return the single contiguous support and its unrounded envelope."""
+    e = np.asarray(energy_relative_ev, float)
+    p = np.broadcast_to(np.asarray(requested_kn, bool), e.shape)
+    if not np.any(p) or not np.isfinite(e[p]).all():
+        raise ValueError("Sigma support needs finite protected-state energies")
+    pad = float(outer_pad_ev) + read_halfwidth_ev()
+    envelope = (float(e[p].min()) - pad, float(e[p].max()) + pad)
+    step = float(sigma.omega_step_ev)
+    lo, hi = envelope
+    if sigma.omega_min_ev is not None:
+        lo = min(lo, float(sigma.omega_min_ev))
+    if sigma.omega_max_ev is not None:
+        hi = max(hi, float(sigma.omega_max_ev))
+    # Only a previous physical support is a floor. The config's temporary
+    # near-zero grid is not a user request when either endpoint is absent.
+    floor = np.asarray(support_floor_ev, float)
+    if floor.size:
+        if floor.shape != (2,) or not np.isfinite(floor).all() or floor[0] >= floor[1]:
+            raise ValueError("Sigma rebuild floor must be a finite ordered interval")
+        lo, hi = min(lo, float(floor[0])), max(hi, float(floor[1]))
+    lo = np.floor(lo / step) * step
+    hi = np.ceil(hi / step) * step
+    grid = lo + step * np.arange(int(round((hi-lo)/step)) + 1)
     return grid, envelope
 
 
-def hold_support_ev(sigma, deck_grid_ev, held_grid_ev, held_envelope,
-                    energy_relative_ev, requested_kn):
-    """A held map: keep ``held_grid_ev`` unless a requested read support leaves it.
+def clamped_reads(energy_relative_ev, protected_kn, grid_ev):
+    """Mask of protected states whose energy or Z stencil leaves the support."""
+    e = np.asarray(energy_relative_ev, float)
+    h = read_halfwidth_ev()
+    return np.asarray(protected_kn, bool) & ((e-h < grid_ev[0]) | (e+h > grid_ev[-1]))
 
-    Returns ``(grid, envelope, event)`` with event ``"hold"`` or ``"extend"``;
-    the envelope is the running union since the last plan.
+
+def check_fixed_point(session):
+    """Accept the fixed plan, or clear it for its sole convergence rebuild.
+
+    Returns True only on a rebuild. Rule dictionaries are owned by the Sigma
+    consumers; the small recursive walk visits sessions, never physical axes.
     """
-    grid = grow_support_ev(held_grid_ev, energy_relative_ev, requested_kn,
-                           float(sigma.omega_step_ev), pad_ev=SUPPORT_BUFFER_EV,
-                           trigger_ev=read_halfwidth_ev())
-    envelope = union_envelope(held_envelope, support_envelope_ev(
-        energy_relative_ev, requested_kn, SUPPORT_BUFFER_EV))
-    assert_support_in_envelope(grid, deck_grid_ev, envelope, sigma.omega_step_ev,
-                               context="held map")
-    event = "hold" if grid.size == np.asarray(held_grid_ev).size else "extend"
-    return grid, envelope, event
+    if session is None:
+        return False
+    reasons = []
+    def collect(d):
+        if d.get("outside_plan"):
+            reasons.extend(d["outside_plan"])
+        for value in d.values():
+            if isinstance(value, dict):
+                collect(value)
+    collect(session)
+    if not reasons:
+        return False
+    if session.get("convergence_rebuilds", 0):
+        raise ValueError("GATE sigma_plan_fixed_point: support failed after its one "
+                         "rebuild; enlarge nval/ncond or sigma_omega_min_ev/max_ev. "
+                         + "; ".join(reasons))
+    old_grid = session.get("omega_grid_ev", ())
+    floor = () if not len(old_grid) else (old_grid[0], old_grid[-1])
+    session.clear()
+    session["convergence_rebuilds"] = 1
+    session["rebuild_floor_ev"] = floor
+    return True
+
+
+#: Broadening of the rotating-band far patches (eV), above and below E_F.
+#: The P-R coupling needs Sigma_io(E_o) only to modest accuracy and a patch's
+#: node count scales as E_bw/eta. Replays (CLASSMIX round 2): Si conduction
+#: endpoints at 1 eV keep 0.7-0.8 meV; Fe semicore endpoints match the exact
+#: read at 2 eV (1.98 vs 1.95 meV) and move 0.1 meV more at 4 eV (round 4),
+#: which halves their far window (82 -> 45 nodes).
+FAR_PATCH_ETA_EV = 1.0
+FAR_PATCH_ETA_BELOW_EV = 4.0
+#: Rule tolerance of the far-patch crossing windows. A far window's node
+#: count is set by its short side over eta (the patch top above the lowest
+#: state), not by its pole range, so splitting cannot shorten it; the coupling
+#: needs only percent accuracy (CLASSMIX round 4: 158 -> 90 nodes at 1e-2).
+FAR_PATCH_EPS = 1.0e-2
+#: Far-patch sampling step (eV): eta/2 resolves the broadened Sigma.
+FAR_PATCH_STEP_EV = 0.5
+#: Outer pad of each far patch about its rotating DFT energies (eV).
+FAR_PATCH_PAD_EV = 2.0
+
+
+def far_patches_ev(energy_rel_ev, rotating_kn, near_support_ev):
+    """Contiguous far patches covering every rotating DFT energy outside the near support.
+
+    ``energy_rel_ev`` (nk, nb) is about the Sigma frame's E_F. Energies are
+    padded by FAR_PATCH_PAD_EV, merged where padded intervals overlap, clipped
+    against the near support and snapped outward to FAR_PATCH_STEP_EV.
+    Returns ((lo, hi), ...) ascending; empty when no rotating state lies outside.
+    """
+    e = np.asarray(energy_rel_ev, float)[np.asarray(rotating_kn, bool)]
+    lo_near, hi_near = float(near_support_ev[0]), float(near_support_ev[1])
+    e = np.sort(e[(e < lo_near) | (e > hi_near)])
+    if e.size == 0:
+        return ()
+    step, pad = FAR_PATCH_STEP_EV, FAR_PATCH_PAD_EV
+    breaks = np.nonzero(np.diff(e) > 2.0 * pad)[0]
+    starts = np.concatenate(([0], breaks + 1)); stops = np.concatenate((breaks, [e.size - 1]))
+    out = []
+    for a, b in zip(starts, stops):
+        lo, hi = e[a] - pad, e[b] + pad
+        if hi > hi_near and lo < hi_near:
+            lo = hi_near + step
+        if lo < lo_near and hi > lo_near:
+            hi = lo_near - step
+        lo, hi = float(np.floor(lo / step) * step), float(np.ceil(hi / step) * step)
+        if out and lo - out[-1][1] <= 2.0 * pad:      # a short hole costs more than it saves
+            out[-1] = (out[-1][0], hi)
+        else:
+            out.append((lo, hi))
+    return tuple(out)
+
+
+def far_patch_eta_ev(patch):
+    """A patch wholly below E_F takes the broad semicore eta."""
+    return FAR_PATCH_ETA_BELOW_EV if float(patch[1]) <= 0.0 else FAR_PATCH_ETA_EV
+
+
+def far_patch_grid_ev(patch):
+    lo, hi = float(patch[0]), float(patch[1])
+    step = 0.5 * far_patch_eta_ev(patch)
+    n = int(np.ceil((hi - lo) / step - 1e-9)) + 1
+    return np.linspace(lo, hi, max(n, 2))      # ends at hi: never enters the near grid

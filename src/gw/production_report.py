@@ -574,8 +574,8 @@ class GWProductionReport:
                     "WARNING: dynamic Sigma grid is incomplete for requested "
                     "DFT output bands (" + "; ".join(shortfalls) + f"){affected}; "
                     f"out-of-range policy={policy_name}: those states use "
-                    "Sigma(omega=0). Widen sigma_omega_min_ev / sigma_omega_max_ev "
-                    "or add a sigma_omega_patches_ev window to sample them.")
+                    "the nearest sampled edge. Enlarge sigma_omega_min_ev / "
+                    "sigma_omega_max_ev to sample them.")
 
         state = "ON" if config.sigma.band_extrapolation else "OFF"
         estimator = (getattr(
