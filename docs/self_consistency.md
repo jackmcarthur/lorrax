@@ -193,7 +193,7 @@ cost no evaluation and have no tunable constant:
   the history.
 
 A discrete map event does not restart the history. Such an event is a Σ rule
-rebuild or a grid change (the map-1 plan, an extension), logged as `SC map
+rebuild or a grid extension, logged as `SC map
 event`. Restarting there would reduce the method to Picard steps, which
 diverge on an expansive map.
 
@@ -282,20 +282,24 @@ $\Sigma(E)$, not $\Sigma(0)$, for an active state outside the requested grid.
   $Z \in (0, 1]$; under `clamp` and `static` only those inside the padded
   window (`scissor.sc_padded_window_ev`). $E^{\rm in}$ is DFT at map 0 and
   the carried QP eigenvalue after; eqp0, eqp1 and $Z$ are never an input.
-  The pad is flat: $P$ = 2 eV at the first plan (the one-shot and SC map 0)
-  and 1 eV at the map-1 plan, which starts again from $D$ and may shrink.
-  Later maps hold the grid while every requested state's read support
+  The pad is flat, $P$ = 2 eV, and there is one plan: the one-shot and SC
+  map 0 (owner 2026-09-28). Every later map holds the grid while every
+  requested state's read support
   $[E - 0.5, E + 0.5]$ eV (the $Z$ stencil, `eqp_bgw.Z_FINITE_DIFFERENCE_EV`)
   lies inside it; when one is about to cross, only that edge grows, to
-  $E \pm 1$ eV, and one `SC window extension` line names the band, k,
-  $E - \mu$ and the edge. A requested state with $Z \notin (0, 1]$ has no
+  $E \pm P$, the edge the plan would set for that state, and one
+  `SC window extension` line names the band, k, $E - \mu$, the edge and the
+  run's extension count. A map-1 re-plan at 1 eV was deleted: it changed the
+  grid, so every Σ executable recompiled at map 1, while the held rules
+  already paid for the map-0 grid. A requested state with $Z \notin (0, 1]$ has no
   quasiparticle: its energy never moves the grid, and off the grid it reads
   the out-of-grid rule and is named in an `SC window no-quasiparticle`
   line. A grid that reaches far above $E_F$ therefore means the deck
   requested states there: the Na 8³ deck with `ncond` = 81 requests every
   band, up to +96 eV. Old samples do not move on an extension and an interior
-  hole refuses. The Σ rule certificates below pad the band-sum states by
-  $\max(2/1\ \mathrm{eV}, 10\%\,\lvert E - \mu\rvert)$.
+  hole refuses. The Σ rule certificates below pad the band-sum states'
+  outer edge by $\max(2\ \mathrm{eV}, 10\%\,\lvert E - \mu\rvert)$ and
+  a crossing window's inner edge by $2\eta$.
   Coverage is judged in the frame the Σ build measures from: the current
   spectrum's VBM or midgap for GN/HL-PPM (`ppm_sigma.ppm_fermi_frame`),
   `efermi.resolve_sigma_efermi_ry` for MPA. On MoS2 3×3 the PPM frame sat
@@ -311,22 +315,33 @@ $\Sigma(E)$, not $\Sigma(0)$, for an active state outside the requested grid.
   `sigma_quadrature_eps`.
 - **Held rules** (`sigma_box_plan._fit_fixed_sc_rules`). Map 0 is served
   by the one-shot planner's rules, and the same balanced pass certifies the
-  first plan: one rule per product window on its box over the map-0 grid,
-  each state edge padded by `scissor.sc_window_pad_ev` =
-  max(2 eV, 10 % of $\lvert E - \mu\rvert$), clipped to the window's own
-  selector interval. Near $E_F$ that is the owner's 2 eV; far away the 10 %
-  is the QP stretch (Na 8³: top state +96 → +101 eV at map 1), which a flat
-  pad cannot hold: a flat 1 eV map-1 plan refit Na's 1265- and 1669-node
-  crossing windows in 553 s. Poles are padded by 10 % at the near edges and
+  plan, the only one: one rule per product window on its box over the map-0
+  grid. In the branch's own coordinate ($E - \mu$ on a conduction branch,
+  $\mu - E$ on a valence one) the outer state edge is padded by
+  `scissor.sc_window_pad_ev` = max(2 eV, 10 % of $\lvert E - \mu\rvert$).
+  Near $E_F$ that is the owner's 2 eV; far away the 10 % is the QP stretch
+  (Na 8³: top state +96 → +101 eV at map 1), which a flat pad cannot hold: a
+  flat 1 eV map-1 plan refit Na's 1265- and 1669-node crossing windows in
+  553 s. The inner edge of a crossing window is padded by
+  `scissor.SC_WINDOW_INNER_PAD_ETA` = $2\eta$ and, on a metal, never past
+  $-X$, the occupation floor's reach (`efermi.occupation_floor_reach_ry`:
+  $X = k_BT \ln(1/10^{-5} - 1)$ = 11.5 $k_BT$ for Fermi-Dirac). That edge
+  sets the crossing short side $\lvert\omega\rvert_{\max} + x -
+  \Omega_{\min}$ and so the node count, and its state does not move toward
+  resonance: an insulator's gap edge moves away as the gap opens, and a
+  metal's cannot pass $-X$. A sign-definite window keeps the outer pad on
+  both edges. Both edges stop at the window's own selector interval. Poles are padded by 10 % at the near edges and
   widths, and 2× at the far edge of an unbounded selector (deep and bulk
   windows), because the highest shared-pole mode moves 10–30 % per map and a
   sign-definite relative rule pays about one node for it. From map 1 the
   rules are held: a map reuses a rule by containment
-  (`cache=hit:sc-fixed`), and only the grid re-plans at map 1. A window
-  whose box leaves its rule, a new window, or a sign change is refit alone
-  at max(1 eV, 10 %) (`rebuild:sc-fixed`),
-  and its reason names the state (k, band, $E - \mu$), the pole extent or
-  the grid edge that crossed. The zero-side edge of a sign-definite box
+  (`cache=hit:sc-fixed`). A window whose box leaves its rule, a new window,
+  or a sign change is an escape: it is rebuilt alone by the same plan rule
+  around its current states (`rebuild:sc-fixed`) and held again, its reason
+  names the state (k, band, $E - \mu$) and the certified edge, the pole
+  extent or the grid edge that crossed, and the receipt counts the maps
+  with an escape (`escape_maps_total`) and the windows rebuilt
+  (`rebuilds_total`) over the run. The zero-side edge of a sign-definite box
   stops at 5 % of its distance to zero, so the box stays sign-definite. The
   window executables keep the session's largest node count, so a refit
   recompiles them only when it raises it. A change of material class

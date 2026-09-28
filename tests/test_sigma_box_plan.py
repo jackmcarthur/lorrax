@@ -545,6 +545,106 @@ def test_sc_fixed_session_rebuilds_an_escaped_window_and_says_so(monkeypatch):
             == first["sc_fixed_initial_window_tau_pairs"])
 
 
+def test_sc_short_edge_escape_rebuilds_by_the_plan_rule_and_is_logged(
+        monkeypatch, capsys):
+    """A crossing window's inner state crossing its 2 eta pad is an escape:
+    the window is rebuilt by the plan's own rule around its current state,
+    logged by name with the state and the edge, and counted; the run holds
+    again until a second escape, which rebuilds and counts the same way."""
+    calls = []
+
+    def counted(box, eps, **kwargs):
+        calls.append(tuple(box))
+        return _fake_rule(box, eps, **kwargs)
+
+    monkeypatch.setattr("gw.sigma_box_plan._BOX_RULE_BUILDER", counted)
+    poles = ((0.3, 0.05), (3.0, 0.08))      # the far pole stays deep on every map
+    session = _freezing_session()
+
+    def plan(inner):
+        # The 0.6 Ry state keeps the resonant window crossing on every map.
+        branch = _SigmaBranch(
+            tag="positive conduction", space="cond", neg_omega_half=False,
+            E_A=jnp.asarray([[inner, 0.6, 3.0]]),
+            base_mask_A=jnp.asarray([[True, True, True]]),
+            omega_abs=np.asarray([0.2, 0.5]), omega_idx=np.arange(2))
+        calls.clear()
+        _, geometry = plan_sigma_windows(
+            _summaries([branch], poles), [branch], np.asarray([0.2, 0.5]), 0.1,
+            eps=1.0e-4, cache_dir=None, fixed_rule_session=session,
+            print_fn=lambda *_args, **_kwargs: None)
+        return geometry, len(calls)
+
+    name = "positive conduction:resonant"
+    first, _ = plan(0.1)
+    assert first["sc_fixed_initialized"] and first["sc_fixed_escape_maps_total"] == 0
+    # The certified inner edge is 2 eta = 0.2 Ry below the inner state.
+    assert session["rules"][name]["certified"]["states_ry"][0] == pytest.approx(-0.1)
+    held, built = plan(0.1)
+    assert built == 0 and held["sc_plan_event"] == "hold"
+    capsys.readouterr()
+    # The gap edge moves 0.25 Ry toward mu: past its 0.2 Ry pad.
+    escaped, built = plan(-0.15)
+    reasons = escaped["sc_fixed_recompute_reasons"]
+    assert name in reasons and built == len(reasons)
+    assert "state k=0 band=1" in reasons[name] and "real_hi" in reasons[name]
+    assert "currency" not in reasons[name]           # still a crossing window
+    assert escaped["sc_plan_event"] == "extend"
+    assert escaped["sc_fixed_escape_maps_total"] == 1
+    rebuilt = session["rules"][name]
+    assert rebuilt["fit"]["cache_status"].startswith("rebuild:sc-fixed")
+    # The same rule around the current state: 2 eta inside it.
+    assert rebuilt["certified"]["states_ry"][0] == pytest.approx(-0.35)
+    assert rebuilt["pad_ev"][0] == pytest.approx(0.2 * RYD_TO_EV)
+    log = capsys.readouterr().out
+    assert f"rebuilt the rule for {name!r} by the plan rule" in log
+    assert "escape maps 1" in log
+    # Inside the rebuilt pad: held, nothing fitted, the count unchanged.
+    held, built = plan(-0.3)
+    assert built == 0 and held["sc_fixed_escape_maps_total"] == 1
+    # A second escape rebuilds and counts too.
+    again, built = plan(-0.45)
+    assert name in again["sc_fixed_recompute_reasons"] and built > 0
+    assert again["sc_fixed_escape_maps_total"] == 2
+    assert again["sc_fixed_total_rebuild_count"] >= 2
+
+
+def test_sc_metal_crossing_inner_edge_stops_at_the_occupation_reach():
+    """A metal's inner state cannot pass -X (the occupation floor's reach):
+    the 2 eta pad is clipped there, and never cuts into a live state."""
+    eta = 0.02
+    spec = make_sigma_box_spec(
+        name="crossing", frequencies=(0.0, 1.0), states=(-0.2, 0.3),
+        pole_stats=((0.05, 0.5, 0.0, 0.0),), pole_sign=1.0, eta_ry=eta)
+    assert spec["kind"] == "crossing"
+    free = _sc_padded_box_spec(spec, eta)
+    clipped = _sc_padded_box_spec(spec, eta, occupation_reach_ry=0.21)
+    live = _sc_padded_box_spec(spec, eta, occupation_reach_ry=0.1)
+    assert free["sc_certified_states_ry"][0] == pytest.approx(-0.2 - 2 * eta)
+    assert clipped["sc_certified_states_ry"][0] == pytest.approx(-0.21)
+    assert live["sc_certified_states_ry"][0] == pytest.approx(-0.2)
+    assert clipped["box"][1] < free["box"][1]
+
+
+def test_occupation_floor_reach_solves_the_floor_weight():
+    from types import SimpleNamespace
+    import math
+    from gw.efermi import OCCUPATION_WEIGHT_FLOOR, occupation_floor_reach_ry
+    fd = occupation_floor_reach_ry(SimpleNamespace(
+        smearing_family="fd", smearing_width_ry=0.02))
+    assert 1.0 / (1.0 + math.exp(fd / 0.02)) == pytest.approx(
+        OCCUPATION_WEIGHT_FLOOR, rel=1e-9)
+    assert fd * RYD_TO_EV == pytest.approx(3.1328, abs=1e-4)   # Fe 4^3: 11.51 kBT
+    mp1 = occupation_floor_reach_ry(SimpleNamespace(
+        smearing_family="mp1", smearing_width_ry=0.01))
+    x = mp1 / 0.02
+    f = 0.5 * math.erfc(x) - x * math.exp(-x * x) / (2.0 * math.sqrt(math.pi))
+    assert abs(f) == pytest.approx(OCCUPATION_WEIGHT_FLOOR, rel=1e-9)
+    assert occupation_floor_reach_ry(None) is None
+    assert occupation_floor_reach_ry(SimpleNamespace(
+        smearing_family="fixed", smearing_width_ry=0.0)) is None
+
+
 def test_sc_fixed_session_keeps_receipt_for_temporarily_empty_window(
         monkeypatch):
     calls = []
@@ -695,8 +795,9 @@ def test_sc_map0_is_the_one_shot_plan_and_certifies_the_held_rules(monkeypatch, 
     # Map 1 holds: each current box is inside its first-plan rule.
     assert planned == 0 and second["sc_fixed_rebuilds_this_iteration"] == 0
     resonant = session["rules"]["positive conduction:resonant"]
-    assert resonant["pad_ev"][0] == pytest.approx(2.0)          # max(2 eV, 10% of 1.4 eV)
-    assert resonant["certified"]["states_ry"][0] == pytest.approx(0.1 - 2.0 / RYD_TO_EV)
+    # A crossing window's inner edge is padded by 2 eta (eta = 0.1 Ry here).
+    assert resonant["pad_ev"][0] == pytest.approx(0.2 * RYD_TO_EV)
+    assert resonant["certified"]["states_ry"][0] == pytest.approx(0.1 - 0.2)
     assert held == 0 and third["sc_fixed_rebuilds_this_iteration"] == 0
     assert all(w["cache_status"] == "hit:sc-fixed"
                for w in third["branches"][0]["windows"])
@@ -706,19 +807,19 @@ def test_sc_map0_is_the_one_shot_plan_and_certifies_the_held_rules(monkeypatch, 
     assert third["sc_tau_capacity"] == second["sc_tau_capacity"] == 2
 
 
-def test_sc_rule_padding_is_the_flat_plan_pad_and_ten_percent_on_poles():
-    eta = 0.1
+def test_sc_crossing_pad_is_two_eta_inside_two_ev_outside_and_ten_percent_on_poles():
+    eta = 0.01
     spec = make_sigma_box_spec(
         name="crossing", frequencies=(-2.0, 2.0), states=(-0.2, 0.2),
         pole_stats=((1.0, 2.0, 0.5, 1.0),), pole_sign=1.0,
         eta_ry=eta)
     spec["pole_bounds"] = (0.0, 2.5)                     # a bounded (shallow) selector
     assert spec["kind"] == "crossing"
-    padded = _sc_padded_box_spec(spec, eta, plan_index=1)
+    padded = _sc_padded_box_spec(spec, eta)
     expanded_poles = ((0.9, 2.2, 0.45, 1.1),)
-    pad_ry = 1.0 / RYD_TO_EV
+    outer_ry = 2.0 / RYD_TO_EV                           # max(2 eV, 10% of 2.7 eV)
     pole_box, _, _ = _box_for_window(
-        spec["frequencies"], (-0.2 - pad_ry, 0.2 + pad_ry), expanded_poles,
+        spec["frequencies"], (-0.2 - 2 * eta, 0.2 + outer_ry), expanded_poles,
         spec["pole_sign"], eta)
     expected = (
         min(spec["box"][0], pole_box[0]),
@@ -727,7 +828,7 @@ def test_sc_rule_padding_is_the_flat_plan_pad_and_ten_percent_on_poles():
         max(spec["box"][3], pole_box[3]),
     )
     np.testing.assert_allclose(padded["box"], expected, rtol=0.0, atol=0.0)
-    assert padded["sc_state_pad_ev"] == (1.0, 1.0)
+    assert padded["sc_state_pad_ev"] == pytest.approx((2 * eta * RYD_TO_EV, 2.0))
     assert padded["sc_pole_pad_fraction"] == 0.10
     assert padded["sc_certified_poles_ry"][:2] == pytest.approx((0.9, 2.2))
 
@@ -740,10 +841,8 @@ def test_sc_rule_state_pad_follows_the_qp_stretch_far_from_mu():
     spec = make_sigma_box_spec(
         name="val bulk", frequencies=(0.0, 1.0), states=(0.1, far),
         pole_stats=((0.5, 1.0, 0.0, 0.0),), pole_sign=-1.0, eta_ry=eta)
-    first = _sc_padded_box_spec(spec, eta, plan_index=0)
-    later = _sc_padded_box_spec(spec, eta, plan_index=1)
+    first = _sc_padded_box_spec(spec, eta)
     assert first["sc_state_pad_ev"] == pytest.approx((2.0, 9.6))
-    assert later["sc_state_pad_ev"] == pytest.approx((1.0, 9.6))
     moved = make_sigma_box_spec(
         name="moved", frequencies=(0.0, 1.0), states=(0.1, 101.0 / RYD_TO_EV),
         pole_stats=((0.5, 1.0, 0.0, 0.0),), pole_sign=-1.0, eta_ry=eta)
@@ -759,7 +858,7 @@ def test_sc_rule_far_pole_edge_of_an_open_selector_is_doubled():
         name="cond pole_tail", frequencies=(0.0, 1.0), states=(0.1, 0.5),
         pole_stats=((2.0, 10.0, 0.0, 0.0),), pole_sign=1.0, eta_ry=eta)
     spec["pole_bounds"] = (1.5, np.inf)
-    padded = _sc_padded_box_spec(spec, eta, plan_index=1)
+    padded = _sc_padded_box_spec(spec, eta)
     assert _SC_FAR_POLE_FACTOR == 2.0
     assert padded["sc_certified_poles_ry"][:2] == pytest.approx((1.8, 20.0))
     moved = make_sigma_box_spec(
@@ -782,10 +881,10 @@ def test_sc_pad_does_not_cross_the_windows_own_state_selector():
         name="val bulk", frequencies=(0.0, 1.0), states=(0.03, 0.5),
         pole_stats=((0.01, 1.0, 0.0, 0.5),), pole_sign=-1.0, eta_ry=eta)
     assert spec["kind"] == "sign_definite_positive"
-    unbounded = _sc_padded_box_spec(spec, eta, plan_index=1)
+    unbounded = _sc_padded_box_spec(spec, eta)
     assert unbounded["box"][0] == _SC_ZERO_SIDE_CAP * spec["box"][0]
     spec["state_interval"] = (state_lo, np.inf)
-    bounded = _sc_padded_box_spec(spec, eta, plan_index=1)
+    bounded = _sc_padded_box_spec(spec, eta)
     nearest_member = 0.0 + state_lo + 0.9 * 0.01
     assert bounded["box"][0] >= 0.7 * nearest_member * (1 - 1e-12)
     assert bounded["box"][0] > 10 * unbounded["box"][0]
@@ -805,12 +904,17 @@ def test_states_drifting_within_their_pads_stay_inside_the_frozen_box():
             pole_stats=(pole,), pole_sign=1.0, eta_ry=eta)
         if spec["kind"] != "crossing":
             continue
-        padded = _sc_padded_box_spec(spec, eta, plan_index=1)
-        pads = np.maximum(1.0 / RYD_TO_EV, 0.10 * np.abs(states))
+        padded = _sc_padded_box_spec(spec, eta)
+        # The inner state moves at most 2 eta toward mu, every other state
+        # at most its outer pad max(2 eV, 10% |E - mu|).
+        pads = np.maximum(2.0 / RYD_TO_EV, 0.10 * np.abs(states))
+        pads[0] = 2 * eta
         for shift in (-1.0, 1.0, rng.uniform(-1.0, 1.0, states.size)):
+            moved_states = states + shift * pads
+            moved_states[1:] = np.maximum(moved_states[1:], states[0] - 2 * eta)
             moved = make_sigma_box_spec(
                 name="moved", frequencies=frequencies,
-                states=states + shift * pads, pole_stats=(pole,),
+                states=moved_states, pole_stats=(pole,),
                 pole_sign=1.0, eta_ry=eta)
             assert all((padded["box"][0] <= moved["box"][0],
                         padded["box"][1] >= moved["box"][1])), (trial, shift)
@@ -853,7 +957,7 @@ def test_sc_pad_keeps_a_sign_definite_support_sign_definite():
             "box": (-2.0, -0.3, 0.05, 0.4),
             "pole_extent": (-3.0, -0.05, 0.05, 0.4), "frequencies": np.asarray([0.0]),
             "states": np.asarray([0.0]), "pole_sign": 1}
-    padded = _sc_padded_box_spec(spec, 0.02, plan_index=1)
+    padded = _sc_padded_box_spec(spec, 0.02)
     # The pads alone would cross zero here; the zero side stops at the cap.
     assert padded["kind"] == "sign_definite_negative"
     assert padded["box"][1] == _SC_ZERO_SIDE_CAP * spec["box"][1]

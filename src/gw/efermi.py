@@ -68,6 +68,7 @@ should be collapsed into the other.
 from __future__ import annotations
 
 import hashlib
+import math
 from functools import partial
 from dataclasses import dataclass
 
@@ -88,7 +89,7 @@ __all__ = [
     "band_in_occupation_window", "clamp_occupation_tail", "fermi_level_step",
     "legacy_square_mesh_occupation_digests",
     "mp1_negative_derivative", "mp1_occupations",
-    "occupation_clamp_tol", "occupation_digest",
+    "occupation_clamp_tol", "occupation_digest", "occupation_floor_reach_ry",
     "occupied_band_count", "resolve_sigma_efermi_ry",
     "solve_mp1_occupations", "solve_smearing_occupations", "fd_occupations",
     "step_occupations",
@@ -212,6 +213,42 @@ def sigma_frame_mu_ev(config, wfn, E_full_ry, efermi_ry, occupation_state):
         config.sigma.fermi_reference, occupation_state=occupation_state,
         wfn=wfn)
     return float(ref_ry) * RYD_TO_EV
+
+
+def occupation_floor_reach_ry(occupation_state):
+    """How far past mu a band still carries floor weight, in Ry (None on a step).
+
+    A state enters a Sigma branch on its wrong side of mu (a conduction state
+    below mu, a valence state above it) only while its weight there reaches
+    :data:`OCCUPATION_WEIGHT_FLOOR` (:func:`band_in_occupation_window`); that
+    weight is ``w(|E - mu|)`` for both branches.  The reach X solves
+    ``|w(X)| = floor``:
+
+    * Fermi-Dirac: ``w = 1 / (1 + exp(u / kBT))``, X = kBT ln(1/floor - 1)
+      (11.51 kBT; Fe 4^3 at 0.02 Ry: 3.13 eV).
+    * MP1: ``|f(x)|`` with ``x = u / (2 W)`` falls monotonically past its lobe
+      extremum at sqrt(3/2) (:data:`MP1_LOBE_EXTREMUM`), so X is the bisection
+      root there.
+    * A step (``"fixed"``) or no state: None.  An insulator's branches are not
+      clipped at mu (an inverted or small-gap state may sit on its wrong side;
+      ``mpa.sigma._branches``), so it has no reach.
+    """
+    if occupation_state is None or occupation_state.smearing_family == "fixed":
+        return None
+    width = float(occupation_state.smearing_width_ry)
+    floor = OCCUPATION_WEIGHT_FLOOR
+    if occupation_state.smearing_family == "fd":
+        return width * math.log(1.0 / floor - 1.0)
+
+    def excess(x):
+        f = 0.5 * math.erfc(x) - x * math.exp(-x * x) / (2.0 * math.sqrt(math.pi))
+        return abs(f) - floor
+
+    lo, hi = math.sqrt(1.5), float(_MP1_BRACKET_WIDTHS)
+    for _ in range(_MP1_BISECTION_STEPS):
+        mid = 0.5 * (lo + hi)
+        lo, hi = (mid, hi) if excess(mid) > 0.0 else (lo, mid)
+    return 2.0 * width * hi
 
 
 def band_in_occupation_window(weight):

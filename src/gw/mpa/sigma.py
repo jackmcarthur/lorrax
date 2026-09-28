@@ -23,6 +23,7 @@ from file_io.restart_bundle import (
     open_pole_reader,
     validate_fit_store,
 )
+from gw.efermi import occupation_floor_reach_ry
 from gw.ppm_accumulators import DeviceOmegaAccumulator
 from gw.ppm_sigma import SigmaOmegaResult, _residue_for_space, sigma_band_axis
 from gw.ppm_tau_kernel import (_get_sigma_kij_kernel,
@@ -1802,7 +1803,8 @@ def compute_sigma_c_mpa_omega_grid(
                 analytic_line=bool(analytic_line),
                 material_class=material_class,
                 fixed_pole_support_ry=fixed_pole_support_ry,
-                certificate_pole_summaries=certificate)
+                certificate_pole_summaries=certificate,
+                occupation_reach_ry=occupation_floor_reach_ry(occupation_state))
         quadrature_log.record_sigma_plan(geometry)
         print_fn(
             f"  MPA windows [box]: "
@@ -1832,8 +1834,13 @@ def compute_sigma_c_mpa_omega_grid(
                 f"initial_pair_cost="
                 f"{geometry['sc_fixed_initial_window_tau_pairs']}, "
                 f"plan={geometry['sc_plan_event']}, "
-                f"state_pad=max({geometry['sc_state_edge_padding_ev']:.2f} eV, "
+                f"escape_maps_total={geometry['sc_fixed_escape_maps_total']}, "
+                f"state_pad=outer max({geometry['sc_state_edge_padding_ev']:.2f} eV, "
                 f"{100.0 * geometry['sc_state_edge_padding_fraction']:.0f}%|E-mu|), "
+                f"crossing inner {geometry['sc_inner_state_padding_eta']:g} eta"
+                + ("" if geometry['sc_occupation_reach_ry'] is None else
+                   f" clipped at -{geometry['sc_occupation_reach_ry'] * RYD_TO_EV:.4f} eV")
+                + ", "
                 f"pole_pad="
                 f"{100.0 * geometry['sc_pole_extent_padding_fraction']:.1f}% "
                 f"(far x{geometry['sc_far_pole_factor']:g}), "

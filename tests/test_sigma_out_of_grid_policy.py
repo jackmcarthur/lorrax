@@ -133,38 +133,34 @@ def _commit(session, support):
     grown, event = support.grown, support.event
     session["omega_grid_ev"] = tuple(grown)
     session["support_envelope_ev"] = support.envelope
-    session["window_plan"] = {"index": 0 if event == "plan" else 1, "event": event}
+    session["window_plan"] = {"event": event}
     return grown, event
 
 
-def test_sc_window_plan_one_shot_then_plan_then_hold_then_extend():
-    """Owner 2026-09-25/27: map 0 is the one-shot grid (requested states +/- 2
-    eV), map 1 plans once at 1 eV, later maps hold while every read support
-    [E - 0.5, E + 0.5] is inside, and a crossing extends only its edge, to
-    E + 1 eV."""
-    from gw.qp_support import SUPPORT_BUFFER_EV, SUPPORT_PAD_EV, read_halfwidth_ev
-    assert SUPPORT_PAD_EV == (2.0, 1.0) and SUPPORT_BUFFER_EV == 1.0
+def test_sc_window_plan_once_then_hold_then_extend_by_the_plan_pad():
+    """Owner 2026-09-25/27/28: map 0 is the one-shot grid (requested states
+    +/- 2 eV) and the only plan; every later map holds it while every read
+    support [E - 0.5, E + 0.5] is inside, and a crossing extends only its
+    edge, to E + 2 eV (the plan's pad around that state)."""
+    from gw.qp_support import SUPPORT_PAD_EV, read_halfwidth_ev
+    assert SUPPORT_PAD_EV == 2.0
     assert read_halfwidth_ev() == 0.5
     part = BandPartition(protected_mask=np.ones(3, bool), in_range_mask=np.ones(3, bool))
     session = {}
     inputs = _inputs("cover", 0, session, grid=np.arange(-12.0, 8.0 + 1e-9, 0.25))
     grid0, event = _commit(session, _sc_sampled_support(
         inputs, part, np.array([[-5.0, 0.3, 9.9]]), 0.0))
-    assert event == "plan"                                  # the first plan: E + 2 eV
+    assert event == "plan"                                  # the plan: E + 2 eV
     assert 9.9 + 2.0 <= grid0[-1] < 9.9 + 2.0 + 0.25
-    grid1, event = _commit(session, _sc_sampled_support(
-        inputs, part, np.array([[-5.0, 0.3, 12.0]]), 0.0))
-    assert event == "re-plan"
-    assert grid1[0] == -12.0 and 13.0 <= grid1[-1] < 13.25   # from the requested grid, 1 eV
     held, event = _commit(session, _sc_sampled_support(
-        inputs, part, np.array([[-5.0, 0.3, 12.5]]), 0.0))
-    assert event == "hold"                                  # 12.5 + 0.5 <= 13.0
-    np.testing.assert_array_equal(held, grid1)
+        inputs, part, np.array([[-5.0, 0.3, 11.4]]), 0.0))
+    assert event == "hold"                                  # map 1: no re-plan
+    np.testing.assert_array_equal(held, grid0)              # 11.4 + 0.5 <= 12.0
     grown, event = _commit(session, _sc_sampled_support(
-        inputs, part, np.array([[-5.0, 0.3, 12.6]]), 0.0))
-    assert event == "extend"                                # 12.6 + 0.5 > 13.0
-    assert grown[0] == grid1[0] and 13.6 <= grown[-1] < 13.85
-    np.testing.assert_array_equal(grown[:grid1.size], grid1)   # old samples kept
+        inputs, part, np.array([[-5.0, 0.3, 11.6]]), 0.0))
+    assert event == "extend"                                # 11.6 + 0.5 > 12.0
+    assert grown[0] == grid0[0] and 13.6 <= grown[-1] < 13.85
+    np.testing.assert_array_equal(grown[:grid0.size], grid0)   # old samples kept
     shrunk, event = _commit(session, _sc_sampled_support(
         inputs, part, np.array([[-5.0, 0.3, 10.0]]), 0.0))
     assert event == "hold" and shrunk.size == grown.size    # a hold never shrinks
@@ -196,7 +192,7 @@ def test_unset_grid_edges_derive_the_grid_from_the_bands():
     from gw.qp_support import plan_support_ev
     requested = np.arange(-0.25, 0.25 + 1e-9, 0.25)
     grown, envelope = plan_support_ev(unset, requested, np.array([[-6.0, 2.0]]),
-                                      np.ones((1, 2), bool), 0)
+                                      np.ones((1, 2), bool))
     assert grown[0] == -8.0 and grown[-1] == 4.0 and envelope == (-8.0, 4.0)
     assert np.isclose(grown, 0.0).any()
 
@@ -223,31 +219,31 @@ def test_a_runaway_state_cannot_grow_the_grid():
     """Owner 2026-09-27: the support stays inside the deck request joined with
     the requested quasiparticles' E_in +/- pad.  A requested state whose Z at
     the previous map lies outside (0, 1] (Na 8^3 b63: Z = -382, eqp1 -1031 eV)
-    does not move it, on the map-1 plan or on a held map; a quasiparticle
-    just past the edge still extends it.  Roots are no input at all."""
+    does not move it on a held map; a quasiparticle just past the edge still
+    extends it.  Roots are no input at all."""
     part = BandPartition(protected_mask=np.ones(3, bool), in_range_mask=np.ones(3, bool))
     session = {}
     inputs = _inputs("cover", 0, session, grid=np.arange(-12.0, 8.0 + 1e-9, 0.25))
     grid0, _ = _commit(session, _sc_sampled_support(
         inputs, part, np.array([[-5.0, 0.3, 9.9]]), 0.0))
-    # Map 1: the third state ran away with Z = -0.003; the plan ignores it.
+    # Map 1: the third state ran away with Z = -0.003; the held map ignores it.
     runaway = np.array([[-5.0, 0.3, -1031.0]])
     z_bad = np.array([[0.8, 0.9, -0.003]])
     support = _sc_sampled_support(inputs, part, runaway, 0.0, None, z_bad)
     grid1, event = _commit(session, support)
-    assert event == "re-plan"
-    np.testing.assert_array_equal(grid1, np.arange(-12.0, 8.0 + 1e-9, 0.25))
+    assert event == "hold"
+    np.testing.assert_array_equal(grid1, grid0)
     np.testing.assert_array_equal(support.no_qp, [[False, False, True]])
-    assert support.envelope == (-6.0, 1.3)
+    assert support.envelope == (-7.0, 11.9)
     # Map 2: still running away (+500 eV, Z = 2.8); the grid holds.
     held = _sc_sampled_support(inputs, part, np.array([[-5.0, 0.3, 500.0]]), 0.0,
                                None, np.array([[0.8, 0.9, 2.8]]))
     assert held.event == "hold"
     np.testing.assert_array_equal(held.grown, grid1)
-    # The same energy with Z = 1 (a quasiparticle, flat Sigma) extends it.
-    moved = _sc_sampled_support(inputs, part, np.array([[-5.0, 0.3, 8.0]]), 0.0,
+    # A quasiparticle (Z = 1, flat Sigma) past the edge extends it.
+    moved = _sc_sampled_support(inputs, part, np.array([[-5.0, 0.3, 12.0]]), 0.0,
                                 None, np.array([[0.8, 0.9, 1.0]]))
-    assert moved.event == "extend" and 9.0 <= moved.grown[-1] < 9.25
+    assert moved.event == "extend" and 14.0 <= moved.grown[-1] < 14.25
 
 
 def test_the_support_envelope_refuses_a_grid_grown_past_it():

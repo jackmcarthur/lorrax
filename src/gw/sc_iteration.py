@@ -2649,7 +2649,7 @@ class SCSupport(NamedTuple):
     grown: np.ndarray          # the grid this map samples, eV
     energy: np.ndarray         # E_in - mu per identity, eV
     requested: np.ndarray      # the requested set R (gw.qp_support)
-    event: str                 # one-shot | plan | re-plan | hold | extend
+    event: str                 # one-shot | plan | hold | extend
     envelope: tuple | None     # R's envelope since the last plan, eV
     no_qp: np.ndarray          # requested identities dropped for Z outside (0, 1]
 
@@ -2662,11 +2662,10 @@ def _sc_sampled_support(inputs, partition, energies_loop, mu_ev, active_n=None,
 
     * ``plan`` (map 0) and ``one-shot``: the deck request joined with every
       requested state's E_in +/- 2 eV, so SC map 0 is the one-shot;
-    * ``re-plan`` (map 1, once): the same from the deck request at 1 eV; it may
-      shrink;
-    * ``hold`` (later maps): unchanged while every requested read support
+    * ``hold`` (every later map): unchanged while every requested read support
       [E - dE, E + dE] (``qp_support.read_halfwidth_ev``) lies inside;
-    * ``extend``: otherwise only the crossed edge grows, to E +/- 1 eV.
+    * ``extend``: otherwise only the crossed edge grows, to E +/- 2 eV (the
+      plan's pad around that state).
 
     ``z_in_kn`` is the previous map's Z per identity: a requested state with
     Z outside (0, 1] has no quasiparticle and cannot move the support.
@@ -2699,10 +2698,7 @@ def _sc_sampled_support(inputs, partition, energies_loop, mu_ev, active_n=None,
     no_qp = everyone & ~states
     if plan is None:
         event = "one-shot" if session is None else "plan"
-        grid, envelope = plan_support_ev(sigma, requested, energy_relative_ev, states, 0)
-    elif int(plan["index"]) == 0:
-        event = "re-plan"
-        grid, envelope = plan_support_ev(sigma, requested, energy_relative_ev, states, 1)
+        grid, envelope = plan_support_ev(sigma, requested, energy_relative_ev, states)
     else:
         grid, envelope, event = hold_support_ev(
             sigma, requested, sampled_grid, session.get("support_envelope_ev"),
@@ -2715,12 +2711,12 @@ def _record_sc_window_plan(inputs, iteration, support):
     """One log record per map for the SC window plan (``_sc_sampled_support``).
 
     ``plan``/``one-shot``: one line per requested state outside the requested
-    grid.  ``re-plan``: the grid change and the states that set its edges.
-    ``hold``: the tightest read support.  ``extend``: one line per state whose
-    read support crossed an edge, with the new edge.  Every map: one line per
-    requested state without a quasiparticle that lies off the grid.
+    grid.  ``hold``: the tightest read support.  ``extend``: one line per state
+    whose read support crossed an edge, with the new edge and the run's
+    extension count (``support_extensions`` of the session).  Every map: one
+    line per requested state without a quasiparticle that lies off the grid.
     """
-    from .qp_support import SUPPORT_BUFFER_EV, SUPPORT_PAD_EV, read_halfwidth_ev
+    from .qp_support import SUPPORT_PAD_EV, read_halfwidth_ev
 
     sampled_grid, grown_grid, e, req, event = support[:5]
     e = np.asarray(e, dtype=np.float64)
@@ -2742,7 +2738,7 @@ def _record_sc_window_plan(inputs, iteration, support):
         outside = req & ((e < sampled_grid[0]) | (e > sampled_grid[-1]))
         for k, n in zip(*np.nonzero(outside)):
             _record_sc(inputs, f"SC sampled-support growth: {state(k, n)}, "
-                       f"pad={SUPPORT_PAD_EV[0]:.6f} eV; sampled {grids}")
+                       f"pad={SUPPORT_PAD_EV:.6f} eV; sampled {grids}")
         return
     if not req.any():
         _record_sc(inputs, f"SC window {event} (map {iteration}): no requested state; grid {grids}")
@@ -2752,11 +2748,6 @@ def _record_sc_window_plan(inputs, iteration, support):
     lo_kn = np.unravel_index(int(np.argmin(masked_lo)), e.shape)
     hi_kn = np.unravel_index(int(np.argmax(masked_hi)), e.shape)
     half = read_halfwidth_ev()
-    if event == "re-plan":
-        _record_sc(inputs, f"SC window re-plan (map {iteration}, pad "
-                   f"{SUPPORT_PAD_EV[1]:.2f} eV): grid {grids}; lowest "
-                   f"{state(*lo_kn)}, highest {state(*hi_kn)}")
-        return
     if event == "hold":
         slack_lo = float(e[lo_kn]) - half - float(grown_grid[0])
         slack_hi = float(grown_grid[-1]) - float(e[hi_kn]) - half
@@ -2766,12 +2757,15 @@ def _record_sc_window_plan(inputs, iteration, support):
                    f"[{grown_grid[0]:+.6f}, {grown_grid[-1]:+.6f}] eV held; "
                    f"tightest read support {where}, {edge:.4f} eV inside its edge")
         return
+    session = inputs.fixed_quadrature_session or {}
+    count = int(session.get("support_extensions", 0))
     crossed = req & ((e - half < sampled_grid[0]) | (e + half > sampled_grid[-1]))
     for k, n in zip(*np.nonzero(crossed)):
         side = "upper" if e[k, n] + half > sampled_grid[-1] else "lower"
         _record_sc(inputs, f"SC window extension (map {iteration}): {state(k, n)}; "
                    f"read support [{e[k, n] - half:+.6f}, {e[k, n] + half:+.6f}] eV "
-                   f"crosses the {side} edge; pad {SUPPORT_BUFFER_EV:.2f} eV; grid {grids}")
+                   f"crosses the {side} edge; pad {SUPPORT_PAD_EV:.2f} eV; grid {grids}; "
+                   f"extension {count} of this run")
 
 
 def _sc_active_identities(inputs):
@@ -3871,15 +3865,17 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
     if sc_support is not None:
         session = inputs.fixed_quadrature_session
         expanded_grid, event = sc_support.grown, sc_support.event
+        if session is not None and event == "extend":
+            session["support_extensions"] = int(
+                session.get("support_extensions", 0)) + 1
         _record_sc_window_plan(inputs, int(state.iteration), sc_support)
         if session is not None:
             session["support_envelope_ev"] = sc_support.envelope
             # A grid that leaves a held Sigma certificate is a box escape and
-            # refits only the windows it crossed (sigma_box_plan).
+            # rebuilds only the windows it crossed (sigma_box_plan).
             session["omega_grid_ev"] = tuple(float(x) for x in expanded_grid)
             session["window_plan"] = {
-                "index": 0 if event == "plan" else 1, "event": event,
-                "iteration": int(state.iteration)}
+                "event": event, "iteration": int(state.iteration)}
         sigma_config = replace(
             inputs.config, sc_omega_grid_ev=tuple(float(x) for x in expanded_grid))
     sigma_result = compute_sigma_xc(

@@ -795,7 +795,7 @@ def _oneshot_sampled_support(config, enk_dft, wfn, occupation_state,
     states = requested_states(
         config.sigma, config.sc.frozen_core_bands, energy,
         np.ones(e_ry.shape, dtype=bool), active_band_mask(e_ry, float(wfn.efermi)))
-    grown, _ = plan_support_ev(config.sigma, requested, energy, states, 0)
+    grown, _ = plan_support_ev(config.sigma, requested, energy, states)
     if grown.size == requested.size:
         return config
     print_fn(f"  Sigma sampled support ({config.sigma.out_of_grid}, plan 0): "

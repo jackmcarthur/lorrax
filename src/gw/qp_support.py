@@ -16,12 +16,12 @@ stays inside
 * ``E_in`` is each state's input energy for the map: DFT at the one-shot and SC
   map 0, the carried QP eigenvalue after.  It is never a root: eqp0, eqp1, Z
   and a fixed-point solve do not enter this module.
-* ``P`` is flat: :data:`SUPPORT_PAD_EV` = 2 eV at the first plan (the one-shot
-  and SC map 0) and 1 eV at the map-1 plan; later maps hold the support and
-  move an edge only when a requested state's read support [E − h, E + h]
-  (h = :func:`read_halfwidth_ev`, the Z stencil) leaves it, to
-  E ± :data:`SUPPORT_BUFFER_EV`.  Between plans the envelope is the union over
-  the maps since the last plan.
+* ``P`` is flat: :data:`SUPPORT_PAD_EV` = 2 eV at the one plan (the one-shot
+  and SC map 0; owner 2026-09-28: one plan, held).  Later maps hold the
+  support and move an edge only when a requested state's read support
+  [E − h, E + h] (h = :func:`read_halfwidth_ev`, the Z stencil) leaves it, to
+  E ± P, the plan's own pad around that state.  The envelope is the union
+  over the maps since the plan.
 
 A requested state with Z ∉ (0, 1] at the previous map has no quasiparticle
 (UNIFY §2.4: its energy sits within ~η of a pole cluster of Σ_n).  It leaves
@@ -38,17 +38,16 @@ from __future__ import annotations
 
 import numpy as np
 
-#: Flat support pad of the first plan (one-shot, SC map 0) and of the map-1
-#: plan, in eV (owner 2026-09-27: "highest requested state + 2 eV for the
-#: first window, new highest + 1 eV for the second window").
-SUPPORT_PAD_EV = (2.0, 1.0)
-
-#: Pad of an extension on a held map, in eV.  An extension triggers when a
-#: requested state's read support E ± h (h = 0.5 eV) leaves the grid; a
-#: buffer of 2h leaves that state h of free motion before it can trigger
-#: again, and equals the map-1 pad so a map-1 plan and a later extension set
-#: the same edge for the same state.
-SUPPORT_BUFFER_EV = 1.0
+#: Flat support pad of the one plan (one-shot, SC map 0) and of every
+#: extension, in eV (owner 2026-09-27: "highest requested state + 2 eV";
+#: 2026-09-28: plan once, hold, rebuild by the same rule on an escape).  An
+#: extension triggers when a requested state's read support E ± h (h = 0.5 eV)
+#: leaves the grid, and moves that edge to E ± 2 eV, the edge the plan would
+#: set for that state: 1.5 eV of free motion before it can trigger again.
+#: Tempting, and why not: the map-1 re-plan at 1 eV.  It changed the grid,
+#: and so every Sigma executable's frequency extent, on every SC run (a
+#: recompile at map 1), while the held rules already paid for the map-0 grid.
+SUPPORT_PAD_EV = 2.0
 
 
 def read_halfwidth_ev():
@@ -187,18 +186,17 @@ def grow_support_ev(grid_ev, energy_relative_ev, requested_kn, step_ev, *,
         grid[-1] + step * np.arange(1, n_upper + 1)))
 
 
-def plan_support_ev(sigma, deck_grid_ev, energy_relative_ev, requested_kn, plan_index):
-    """A plan: ``D ∪ [min_R E − P, max_R E + P]`` with P = SUPPORT_PAD_EV[plan_index].
+def plan_support_ev(sigma, deck_grid_ev, energy_relative_ev, requested_kn):
+    """The plan: ``D ∪ [min_R E − P, max_R E + P]`` with P = SUPPORT_PAD_EV.
 
-    Returns ``(grid, envelope)``.  The plan starts from the deck grid, so a
-    map-1 plan may shrink against map 0.
+    Returns ``(grid, envelope)``.
     """
-    pad = SUPPORT_PAD_EV[min(int(plan_index), len(SUPPORT_PAD_EV) - 1)]
+    pad = SUPPORT_PAD_EV
     grid = grow_support_ev(deck_grid_ev, energy_relative_ev, requested_kn,
                            float(sigma.omega_step_ev), pad_ev=pad, trigger_ev=pad)
     envelope = support_envelope_ev(energy_relative_ev, requested_kn, pad)
     assert_support_in_envelope(grid, deck_grid_ev, envelope, sigma.omega_step_ev,
-                               context=f"plan {int(plan_index)}")
+                               context="plan")
     return grid, envelope
 
 
@@ -210,10 +208,10 @@ def hold_support_ev(sigma, deck_grid_ev, held_grid_ev, held_envelope,
     the envelope is the running union since the last plan.
     """
     grid = grow_support_ev(held_grid_ev, energy_relative_ev, requested_kn,
-                           float(sigma.omega_step_ev), pad_ev=SUPPORT_BUFFER_EV,
+                           float(sigma.omega_step_ev), pad_ev=SUPPORT_PAD_EV,
                            trigger_ev=read_halfwidth_ev())
     envelope = union_envelope(held_envelope, support_envelope_ev(
-        energy_relative_ev, requested_kn, SUPPORT_BUFFER_EV))
+        energy_relative_ev, requested_kn, SUPPORT_PAD_EV))
     assert_support_in_envelope(grid, deck_grid_ev, envelope, sigma.omega_step_ev,
                                context="held map")
     event = "hold" if grid.size == np.asarray(held_grid_ev).size else "extend"
