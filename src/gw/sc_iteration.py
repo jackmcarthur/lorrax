@@ -5612,6 +5612,8 @@ def _run_anderson(
     _identity_history = {}
     _map_event: list = [False]
     _floor_history: list[float] = []
+    _fesc_win: list = [None]
+    _e_dft0 = np.real(np.diagonal(np.asarray(H0), axis1=1, axis2=2)).astype(np.float64)
 
     def _event_key():
         """Discrete map-changing state: sampled grid, rule rebuild counts."""
@@ -5675,6 +5677,19 @@ def _run_anderson(
         metric_mask = np.broadcast_to(np.asarray(
             metric_partition.protected_mask | metric_partition.in_range_mask,
             dtype=bool), (int(x0.shape[0]), nb))
+        _fesc_win_ev = os.environ.get("LORRAX_FESC_METRIC_WINDOW_EV")
+        if _fesc_win_ev:
+            # FESC study (never lands): the Gram sees only DFT identities within
+            # +- window of the map-0 entry mu; every identity still moves.
+            if _fesc_win[0] is None:
+                _occ0 = state_out.occupation_state
+                _mu0 = (float(_occ0.mu_ry) if _occ0 is not None
+                        else 0.5 * float(np.median(np.real(_e_dft0))))
+                _fesc_win[0] = np.abs(_e_dft0 - _mu0) * RYD_TO_EV <= float(_fesc_win_ev)
+                _record_sc(inputs, f"    FESC metric window: +-{float(_fesc_win_ev):.1f} eV of "
+                                   f"mu0 = {_mu0 * RYD_TO_EV:.4f} eV keeps "
+                                   f"{int(_fesc_win[0].sum())} of {_fesc_win[0].size} identities in the Gram")
+            metric_mask = metric_mask & _fesc_win[0]
         _metric_np[:, :nb, :nb] = metric_k * (metric_mask[:, :, None] * metric_mask[:, None, :])
         _occ_state[0] = state_out.occupation_state
         _head_surface_weight[0] = state_out.head_surface_weight_kn
