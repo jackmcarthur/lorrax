@@ -9,7 +9,7 @@ Every channel density is written with ``psi^dagger`` (never ``psi-bar``):
 ``rho^mu = psi^dagger gamma_tilde^mu psi`` -- charge for ``mu = 0``, the
 current ``psi^dagger alpha^i psi`` for ``mu = i``.  Physics owner:
 ``docs/theory/four-current-head-corrections.md`` and
-``docs/BISPINOR_DHFB_DESIGN.md`` section 2.
+``docs/theory/BISPINOR_DHFB_DESIGN.md`` section 2.
 
 WHY THE LITERALS ARE BUILT THROUGH NUMPY.  Every constant below is a fixed
 4x4 (or 2x2) table, and this module is on the import path of every driver

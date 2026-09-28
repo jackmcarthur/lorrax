@@ -727,7 +727,8 @@ def compute_cohsex_sigma(
         # X_ONLY (which uses compute_sigma_x) or the packed full-photon
         # route (which replaces all three photon components).  No-op when
         # ``wfns_transverse`` or ``bispinor_v_q_path`` is missing.  See
-        # ``gw.sigma_x_bispinor`` and ``BISPINOR_DHFB_DESIGN.md`` §3.
+        # ``gw.sigma_x_bispinor`` and
+        # ``docs/theory/BISPINOR_DHFB_DESIGN.md`` §3.
         if wfns_transverse is not None and bispinor_v_q_path is not None:
             # face-layout defensive backstop REMOVED 2026-08-23
             # (feat/transverse-zeta-face-2026-08-23): compute_sigma_x_

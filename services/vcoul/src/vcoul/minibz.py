@@ -1520,7 +1520,7 @@ def minibz_transverse_head_avg(
     ``⟨t_ab⟩_angle = (2/3) δ_ab`` (the projector's trace is 2 in every
     direction); for the in-plane mini-BZ of a slab it is
     ``diag(1/2, 1/2, 1)`` — the measured LORRAX reference value
-    (``docs/BISPINOR_DHFB_DESIGN.md`` §11, bi4 deck: 0.4993, 0.5007,
+    (``docs/theory/BISPINOR_DHFB_DESIGN.md`` §11, bi4 deck: 0.4993, 0.5007,
     1.0000).  Neither closed form is assumed here; both fall out of the
     same Monte-Carlo estimator ``minibz_average`` already uses, weighted
     by ``t_ab`` instead of ``1``.

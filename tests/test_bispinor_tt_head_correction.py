@@ -9,7 +9,7 @@ HDF5/FFI write path, mirroring ``tests/test_sigma_x_bispinor.py``'s own
 
 WHAT IS BEING PINNED.  Physics owner:
 ``docs/theory/four-current-head-corrections.md``.  Physics source:
-``docs/BISPINOR_DHFB_DESIGN.md`` §11 (the bi4/MoS2 4×4 measurement) and
+``docs/theory/BISPINOR_DHFB_DESIGN.md`` §11 (the bi4/MoS2 4×4 measurement) and
 ``KNOWN_LORRAX_ISSUES.md``'s bispinor row (claim 41, job 7885325).
 
 Four things are checked, each an observable that FAILS if the physics or
@@ -27,10 +27,10 @@ the wiring is wrong (TASTE.md pattern 1):
    for a wrong index, a wrong sign, or a wrong projector formula
    (``test_tt_head_tensor_trace_identity_matches_2_vc0``).
 4. The measured slab reference ratio ``diag(1/2, 1/2, 1)`` for an
-   in-plane-isotropic mini-BZ, reproducing ``docs/BISPINOR_DHFB_DESIGN.
-   md``'s bi4 measurement (0.4993, 0.5007, 1.0000) independently, on a
-   different synthetic cell (``test_tt_head_tensor_matches_measured_
-   slab_reference_ratio``).
+   in-plane-isotropic mini-BZ, reproducing ``docs/theory/
+   BISPINOR_DHFB_DESIGN.md``'s bi4 measurement (0.4993, 0.5007, 1.0000)
+   independently, on a different synthetic cell
+   (``test_tt_head_tensor_matches_measured_slab_reference_ratio``).
 
 Plus the parse-time refusal envelope (rule id, all five message parts,
 no-op at the default) mirroring ``tests/test_face_carrier_config.py``'s
@@ -280,7 +280,7 @@ def test_tt_head_tensor_trace_identity_matches_2_vc0():
 
 def test_tt_head_tensor_matches_measured_slab_reference_ratio():
     """In-plane-isotropic slab cell: T/vc0 -> diag(1/2, 1/2, 1), matching
-    docs/BISPINOR_DHFB_DESIGN.md §11's bi4 measurement (0.4993, 0.5007,
+    docs/theory/BISPINOR_DHFB_DESIGN.md §11's bi4 measurement (0.4993, 0.5007,
     1.0000) to Monte-Carlo tolerance on an UNRELATED synthetic cell --
     the shape is a property of the physics (the in-plane mini-BZ angular
     average of the transverse projector), not of one deck's geometry."""

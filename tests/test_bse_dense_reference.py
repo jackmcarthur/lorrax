@@ -71,9 +71,9 @@ def _build_dense_H(data):
     # Exchange — DENSE in (k,k′).  Kx[c,v,k, c',v',k'] = M V M†: the bra carries
     # the bare vertex, the ket the conjugate (transition density
     # <0|ρ̂|Ψ> = Σ A_cvk ψ_ck ψ*_vk).
-    # Scalar-singlet weight (bse/context/README.md): D + 2V − W for a scalar
-    # run, D + V − W for spinors.  Spelled here, not imported, so the oracle
-    # stays independent of the matvec it checks.
+    # Scalar-singlet weight (docs/architecture/bse.md#hamiltonian): D + 2V − W
+    # for a scalar run, D + V − W for spinors.  Spelled here, not imported, so
+    # the oracle stays independent of the matvec it checks.
     w_x = 2.0 if psi_c.shape[2] == 1 else 1.0
     lhs = np.einsum("kcvM,MN->kcvN", M, V_q0)            # M·V
     Kx = w_x * np.einsum("kcvN,KCVN->cvkCVK", lhs, np.conj(M)) / nk
