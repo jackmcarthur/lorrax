@@ -206,8 +206,9 @@ def fixture(*, metal=False, eta=.25, tier='production', top=20.):
     return config,wf,meta
 
 
-def resolve(args):
-    return resolve_shared_pole_recipe(*args,mesh_xy=NS(shape={'x':2,'y':2}),print_fn=lambda *_:None)
+def resolve(args, window=(-6., 4.)):
+    return resolve_shared_pole_recipe(*args,mesh_xy=NS(shape={'x':2,'y':2}),print_fn=lambda *_:None,
+                                      requested_window_ev=window)
 
 
 def test_geometry_padding_charge_and_holds():
@@ -216,11 +217,10 @@ def test_geometry_padding_charge_and_holds():
     assert r['n']==17 and r['imaginary_width']==5 and r['infinity_width']==3
     assert r['census']['active_electrons']==2
     assert r['census']['borderline_bands']==[0]
-    # Production: 18 fitted supports = imaginary ladder + support-rule line sites. The +/-1 eV
-    # levels cross at every 0.25 eV offset to 5 eV; the farthest is E = 2 + 5 eV against 1 eV.
-    assert r['line_count']+r['imaginary_count']==18
-    line=r['line_ev']
-    assert np.all(np.diff(line)>0) and line[0]>=r['height_ev'] and line[-1]==pytest.approx(6.0,abs=.011)
+    # Production line ladder: 4 eta apart from 4 eta to the requested window's far side
+    # (6 eV) plus 2 eV, at height 4 eta; independent of the imaginary count.
+    assert r['height_ev']==1.0 and r['top_ev']==8.0
+    np.testing.assert_array_equal(r['line_ev'],np.arange(1.,9.))
     assert r['line_direction_cap']==2 and r['pole_budget']==31      # ceil(17/16), ceil(1.8*17)
     assert not set(r['fit_ids']) & set(r['held_ids'])
     assert len(r['role']) == r['unique_evaluations']
@@ -228,6 +228,10 @@ def test_geometry_padding_charge_and_holds():
     assert r['accuracy_status']=='NOT_MEASURED'
     args[1].enk[:,-1] *= 10
     np.testing.assert_array_equal(resolve(args)['line_ev'],r['line_ev'])
+    # The ladder only extends as the window grows: 8.2 eV adds one lattice site.
+    np.testing.assert_array_equal(resolve(args,(-6.2,4.))['line_ev'],np.arange(1.,10.))
+    with pytest.raises(ValueError,match='GATE shared_pole_line_top'):
+        resolve(args,(1.,-1.))
 
 
 def test_treatment_span_uses_the_chi_response_extent_on_a_split_deck():
@@ -245,10 +249,9 @@ def test_treatment_span_uses_the_chi_response_extent_on_a_split_deck():
 
 def test_metal_and_eta_scaling():
     r=resolve(fixture(metal=True,eta=.1,top=10))
-    assert r['height_ev']==2.6
+    assert r['height_ev']==pytest.approx(.4)
     assert r['census']['partial_at_mu']
-    # The farthest crossing is E = 2 + 5 eV against the level at 1 eV.
-    assert r['line_ev'][-1]==pytest.approx(6.0,abs=.011) and r['line_ev'][0]>=r['height_ev']
+    np.testing.assert_allclose(r['line_ev'],.4*np.arange(1,21),rtol=1e-15)
     r=resolve(fixture(eta=.1,top=10))
     assert not r['census']['partial_at_mu']
 
@@ -256,6 +259,7 @@ def test_metal_and_eta_scaling():
 def test_relaxed():
     r=resolve(fixture(tier='relaxed',eta=.1))
     assert r['line_count']==8 and r['imaginary_count']==2
+    np.testing.assert_allclose(r['line_ev'],np.arange(1,9)*r['top_ev']/8,rtol=1e-15)
     assert r['held_count']==3  # duplicate imaginary held roles share one call
     assert r['imaginary_width']==3 and r['infinity_width']==2
     assert r['line_direction_cap'] is None and r['pole_budget'] is None
