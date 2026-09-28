@@ -51,11 +51,14 @@ def requested_band_mask(energies_ev, *, n_occ, nval, ncond, gap_ev, mu_ev=None,
     nk, nb = e.shape
     below = (np.full(nk, int(n_occ)) if mu_ev is None
              else np.count_nonzero(e < float(mu_ev), axis=1))
-    lo, hi = below - int(nval), below + int(ncond)
-    if np.any(lo < 0) or np.any(hi > nb) or np.any(lo >= hi):
-        k = int(np.argmax((lo < 0) | (hi > nb)))
-        raise ValueError(f"protected band range [{lo[k]}, {hi[k]}) at k={k} outside {e.shape}; "
-                         "reduce nval/ncond or load more bands")
+    # A request for more states than a k holds on one side takes all of them:
+    # a metal's count below E_F varies with k (Na 8^3: 4 or 5 below E_F).
+    lo = np.maximum(below - int(nval), 0)
+    hi = np.minimum(below + int(ncond), nb)
+    if np.any(lo >= hi):
+        k = int(np.argmax(lo >= hi))
+        raise ValueError(f"protected band range [{lo[k]}, {hi[k]}) at k={k} is empty in {e.shape}; "
+                         "increase nval/ncond or load more bands")
     groups = np.cumsum(np.concatenate((np.zeros((nk, 1), bool),
                                       np.diff(e, axis=1) > float(gap_ev)), axis=1), axis=1)
     g_lo = np.take_along_axis(groups, lo[:, None], axis=1)
