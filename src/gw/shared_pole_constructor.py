@@ -344,7 +344,7 @@ def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output):
                                     f"want: Gram min >= -(propagated float64 floor) (gram_rounding_validity) "
                                     "and valid diagonal/retained metric; why: no PSD repair")
                         if not round_zero["zero_policy"][slot]:
-                            raise ValueError(f"GATE shared_pole_zero_ritz: got: failed at q={q}, dropped {round_zero['dropped_count'][slot]} Ritz values carrying {round_zero['dropped_factor_weight_fraction'][slot]:.3e} of the factor weight; want: finite positive response within dropped-weight budget; why: no pole clipping")
+                            raise ValueError(f"GATE shared_pole_zero_ritz: got: failed at q={q}, dropped {round_zero['dropped_count'][slot]} Ritz values carrying {round_zero['dropped_factor_weight_fraction'][slot]:.3e} of the factor weight{f", weight at |mu| -> 0 (poles at infinity) {round_reduction['infinite_weight_fraction'][slot]:.3e}" if ordered else ''}; want: finite positive response within dropped-weight budget; why: no pole clipping")
                         # The ordered identity is on the ORIGINAL infinity directions: exact only for the
                         # full Galerkin span, projection accuracy after the keep/retention cuts. It is
                         # reported beside the full_m1/full_m3 diagnostic bands, as the TRS route reports
