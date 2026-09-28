@@ -477,7 +477,27 @@ def reduce_ordered_shared_pole_pencil(pencil, active_columns, *, eigh, matmul, g
     del null_r, h_r
     correction_r, metric_r_ok, paired_metric_diagnostics = _metric_inverse_root(
         metric_r, matmul=matmul, tolerance=gates["retained_subspace_moments"]["threshold"], matrix_sharding=matrix_sharding)
-    del metric_r
+    # STUDY (FEREF r3, Fe 4^3 complete basis q=3): the Newton-Schulz start needs ||I - M||_inf < 1, and the paired
+    # metric reads 26.2 there (rank 11190). Where that bound fails, take M^(-1/2) from M's own eigendecomposition
+    # (Loewdin), exact in exact arithmetic; the retained-metric residual gate below is unchanged.
+    ns_failed = ~(jnp.isfinite(paired_metric_diagnostics["metric_initial_infinity_norm"])
+                  & (paired_metric_diagnostics["metric_initial_infinity_norm"] < 1))
+    lam_m, v_m = eigh(metric_r)
+    inv_m = jnp.where(lam_m > 0, 1 / jnp.sqrt(jnp.where(lam_m > 0, lam_m, 1)), 0)
+    loewdin = _matrix_layout(matmul(v_m * inv_m[:, None, :], v_m, transb="C"), matrix_sharding)
+    del v_m
+    correction_r = jnp.where(ns_failed[:, None, None], loewdin, correction_r)
+    del loewdin
+    eye_r = diagonal_like(jnp.ones(metric_r.shape[:1] + metric_r.shape[-1:]), metric_r)
+    residual_r = jnp.linalg.norm(matmul(correction_r, matmul(metric_r, correction_r)) - eye_r, axis=(-2, -1)) \
+        / jnp.sqrt(metric_r.shape[-1])
+    del eye_r
+    metric_r_ok = jnp.where(ns_failed, jnp.all(lam_m > 0, axis=-1) & jnp.isfinite(residual_r)
+                            & (residual_r <= gates["retained_subspace_moments"]["threshold"]), metric_r_ok)
+    paired_metric_diagnostics = dict(paired_metric_diagnostics,
+                                     metric_inverse_root_residual_relative=residual_r,
+                                     loewdin_used=ns_failed, loewdin_min_eigenvalue=jnp.min(lam_m, axis=-1))
+    del metric_r, lam_m
     y = matmul(y, correction_r) * keep_r[:, None, :]
     del correction_r
     mu, rotation = eigh(hermitian_part(matmul(y, matmul(g_r, y), transa="C")))
@@ -523,6 +543,8 @@ def reduce_ordered_shared_pole_pencil(pencil, active_columns, *, eigh, matmul, g
         "paired_metric_ok": metric_r_ok,
         "paired_metric_initial_infinity_norm": paired_metric_diagnostics["metric_initial_infinity_norm"],
         "paired_metric_inverse_root_residual_relative": paired_metric_diagnostics["metric_inverse_root_residual_relative"],
+        "paired_metric_loewdin_used": paired_metric_diagnostics["loewdin_used"],
+        "paired_metric_loewdin_min_eigenvalue": paired_metric_diagnostics["loewdin_min_eigenvalue"],
         "retained_metric_relative": metric_relative,
         "positive_count": jnp.sum(positive, axis=-1, dtype=jnp.int64),
         "negative_count": jnp.sum(retained & (mu < 0), axis=-1, dtype=jnp.int64),
