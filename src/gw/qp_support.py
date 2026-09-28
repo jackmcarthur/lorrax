@@ -87,7 +87,7 @@ SEMICORE_ETA_EV = None
 #: How semicore endpoints are read: "patch" (own energy on the SEMICORE_ETA_EV
 #: patches) or "sigma0" (Sigma(omega = 0) on the near grid, main's rule for
 #: states below E_F - 15 eV; no semicore crossing windows).
-SEMICORE_READ = "sigma0"
+SEMICORE_READ = "patch"
 #: Rule tolerance of the far-patch crossing windows. A far window's node
 #: count is set by its short side over eta (the patch top above the lowest
 #: state), not by its pole range, so splitting cannot shorten it; the coupling
