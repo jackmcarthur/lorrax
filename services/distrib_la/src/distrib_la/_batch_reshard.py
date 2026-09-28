@@ -410,9 +410,10 @@ def batch_layout_eigh_call(op: str, mesh: Mesh, A, *, real_rows: int | None = No
     through one ``all_gather``; vectors stay in batch layout. ``op`` is
     ``eigh``, ``checked_eigh`` or ``normal_eigh`` (the right singular
     vectors of ``A`` from the N x N eigh of ``A.H @ A``; the spectrum is the
-    N singular values, ascending), the same kernels as
-    :func:`batch_reshard_call`, so a batch-layout call equals the face route's
-    local solve row for row.
+    N singular values, ascending), the same equations as
+    :func:`batch_reshard_call`. For eigh the two routes run the same local
+    solve row for row; for normal_eigh the reshard route forms W.H W in one
+    batched GEMM and this route one row at a time, so they agree to round-off.
     """
     if op not in ("eigh", "checked_eigh", "normal_eigh"):
         raise ValueError(
@@ -504,11 +505,11 @@ def batch_reshard_call(
             A = local[0]
 
             if op == "normal_eigh":
-                from distrib_la.polar import _normal_matrix
+                from distrib_la.polar import _normal_matrix, _singular_values
                 G = _normal_matrix(A)
                 W, Z = (_dense_real_rows("eigh", G, nbatch=nbatch, py=py)
                         if batch_pad else jnp.linalg.eigh(G))
-                W = _replicate_batch_vector(jnp.sqrt(jnp.maximum(W, 0)), px=px, py=py)[:nbatch]
+                W = _replicate_batch_vector(_singular_values(W), px=px, py=py)[:nbatch]
                 return W, _batch_to_face(Z, px=px, py=py)[:nbatch]
             if op in ("eigh", "checked_eigh"):
                 if batch_pad:

@@ -76,6 +76,25 @@ def test_batch_layout_selection_equals_the_face_route_bitwise(leading):
         assert all(np.array_equal(a, b) for a, b in zip(flat(vb), flat(vf))), name
 
 
+def test_normal_matrix_directions_refuse_a_cut_near_roundoff():
+    """The cut is tau**2 on the W^H W spectrum; tau**2 < 1e4 m eps refuses by name, 1e-3 runs."""
+    from jax.sharding import PartitionSpec as P
+    mesh = _mesh()
+    n = 8
+    w, _ = _stacks(np.random.default_rng(4060), (4,), n)
+    eig = D.plan("eigh", mesh, backend="off", n=n, batched_route="batch_reshard")
+    face = _put(w, mesh, P(None, "x", "y"))
+    extent = lambda r: 2 * ((r + 1) // 2)
+    for tau in (0.0, 1e-7):
+        with pytest.raises(ValueError, match="too close to round-off"):
+            D.right_singular_vectors(face, tau, eigh_plan=eig, column_extent=extent)
+    _, values = D.right_singular_vectors(face, 1e-3, eigh_plan=eig, column_extent=extent)
+    s = np.linalg.svd(w, compute_uv=False)
+    assert [len(v) for v in values] == [int(np.sum(row > 1e-3 * row[0])) for row in s]
+    np.testing.assert_allclose(np.concatenate([np.asarray(v) for v in values]),
+                               np.concatenate([row[:len(v)] for row, v in zip(s, values)]), rtol=1e-12)
+
+
 def test_real_rows_never_solve_synthetic_slots(monkeypatch):
     import jax
     import jax.numpy as jnp

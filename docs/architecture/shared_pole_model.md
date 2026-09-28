@@ -182,8 +182,8 @@ parents per rank when their blocks and the $n\times n$ eigensystem fit, else the
 face) and the bank stores the panels (§7). The constructor reads them
 (`line_panel_states`) and selects the supports on the imaginary axis from their
 dense samples per round. On the local route both sides run the same one-parent
-eigensolve of $W^\dagger W$ on the same bits, so $Q$ and every count are the ones the
-constructor would select; the action GEMMs run at a different panel width
+eigensolve of $W^\dagger W$ on the same equations, so $Q$ and every count are the ones
+the constructor would select, to round-off; the action GEMMs run at a different panel width
 and agree to round-off.
 
 ## 4 Pencils and reduction

@@ -376,7 +376,12 @@ the eigenvectors of the m×m normal matrix $W^\dagger W$ (formed rank-locally on
 the batch routes, with the service GEMM on the whole mesh), σ = √max(λ, 0):
 one eighth of the eigensolver flops of the 2m dilation. The cut is τ² on λ, so
 `right_singular_vectors` refuses τ² < 10⁴·m·ε (the shared-pole cuts are 10⁻³
-and 10⁻²). The polar factor keeps the dilation. Only the O(m) spectra cross
+and 10⁻²). On a cuSOLVERMp plan the normal matrix is solved as the positive
+matrix $I + G/\lVert G\rVert_F$ and the eigenvalues mapped back by
+$(\mu - 1)\lVert G\rVert_F$ (provider route only): the reproduced cuSOLVERMp STEDC
+failure on a zero cluster (Fe4, P16) does not recur, eigenvectors are unchanged,
+and σ at the cut moves by ~ε√r/τ² (3·10⁻⁸ at r = 2·10⁴, τ = 10⁻³), below the
+10⁻⁶ multiplet tolerance. The polar factor keeps the dilation. Only the O(m) spectra cross
 the host, broadcast from one process as bit patterns so every rank makes the
 same cut.
 

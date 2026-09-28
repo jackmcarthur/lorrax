@@ -25,8 +25,8 @@ def shared_pole_byte_terms(meta, *, mesh_xy, resolution, pencil_side,
                            padding_output_bytes_per_rank=0):
     """Price constructor carriers; the map CapacityLedger owns admission.
 
-    Selection holds samples, current narrow actions and the n/2n direction
-    solve; it has no R-by-R pencil. ``selection_faces`` is an internal count
+    Selection holds samples, current narrow actions and the n x n direction
+    solve (eigh of W^H W); it has no R-by-R pencil. ``selection_faces`` is an internal count
     of the caller's already resident sample and moment faces when that count
     differs from the ordered scalar default. Reduction holds the actual selected
     pencil. Model checks hold factors and bounded samples, with no pencil.
@@ -218,7 +218,7 @@ class ConstructorCapacity:
             side, phase=phase, sample_batch=sample_batch,
             selection_faces=selection_faces, cross_original_sides=cross_original_sides,
             padding_output_bytes_per_rank=padding_output_bytes_per_rank)
-        extents = {n, 2*n} if phase == "selection" else (
+        extents = {n} if phase == "selection" else (
             {side if eigen_side is None else int(eigen_side)} if phase in ("reduction", "cross_reduction") else {n})
         # Eigh scratch is transient: replace it at each phase boundary.
         self._native_maxima["eigh"] = max(self.query_workspace(

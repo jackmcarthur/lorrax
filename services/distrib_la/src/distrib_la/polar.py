@@ -57,17 +57,11 @@ def _dilation_vectors(Q, n):
     return root2 * positive[..., :n, :], root2 * positive[..., n:, :]
 
 
-def _dilation_svd(A, eigh, *, shifted=False):
-    """Extract ascending singular triplets from [[0,A],[A.H,0]]."""
-    # The positive dilation avoids the measured cuSolverMp STEDC failure;
-    # its eigenvectors and the caller's relative singular cutoff are unchanged.
-    scale = jnp.linalg.norm(A, axis=(-2, -1)) if shifted else jnp.ones(A.shape[:-2])
-    scale = jnp.where(scale > 0, scale, 1)
-    h = _hermitian_dilation(A / scale[..., None, None])
-    evals, Q = eigh(h + int(shifted) * jnp.eye(h.shape[-1], dtype=h.dtype))
+def _dilation_svd(A, eigh):
+    """Extract ascending singular triplets from [[0,A],[A.H,0]] (the polar factor)."""
+    evals, Q = eigh(_hermitian_dilation(A))
     u, v = _dilation_vectors(Q, A.shape[-1])
-    s = (evals[..., A.shape[-1]:] - int(shifted)) * scale[..., None]
-    return jnp.maximum(s, 0), u, v
+    return jnp.maximum(evals[..., A.shape[-1]:], 0), u, v
 
 
 def _close_spectral_cut(values, count, tolerance):
@@ -188,10 +182,33 @@ def _normal_matrix(A):
     return (g + jnp.conj(jnp.swapaxes(g, -1, -2))) / 2
 
 
+def _singular_values(evals):
+    """sigma = sqrt(max(lambda, 0)) of a normal-matrix spectrum; round-off negatives read 0."""
+    return jnp.sqrt(jnp.maximum(evals, 0))
+
+
 def _normal_svd(A, eigh):
     """Ascending singular values and right singular vectors from eigh(A.H @ A)."""
     evals, v = eigh(_normal_matrix(A))
-    return jnp.sqrt(jnp.maximum(evals, 0)), v
+    return _singular_values(evals), v
+
+
+def _shifted_normal_eigh(g, eigh):
+    """eigh of the PSD normal matrix G as I + G/||G||_F, eigenvalues mapped back.
+
+    cuSOLVERMp STEDC failed (info 4, in58730813.3/.4) on the zero cluster of a
+    padded dilation at P16; the shifted positive matrix completed (.5). G has
+    the same, denser cluster, so the whole-mesh cuSOLVERMp route solves the
+    shifted matrix. Eigenvectors are those of G. The eigenvalue error becomes
+    ~2 eps ||G||_F <= 2 eps sqrt(r) lambda_max, so sigma at the cut
+    tau * sigma_max moves by ~eps sqrt(r) / tau**2 relative: 3e-8 at
+    r = 2e4, tau = 1e-3, against the 1e-6 multiplet tolerance.
+    """
+    scale = jnp.linalg.norm(g, axis=(-2, -1))
+    scale = jnp.where(scale > 0, scale, 1)
+    eye = jnp.eye(g.shape[-1], dtype=g.dtype)
+    mu, v = eigh(g / scale[..., None, None] + eye)
+    return (mu - 1) * scale[..., None], v
 
 
 def _host_spectrum(s):
@@ -287,12 +304,15 @@ def _direction_svd_kernel(eigh_plan, ndim):
     """Right singular vectors of the current face-tiled responses from the m x m normal matrix.
 
     A batch-reshard plan moves whole matrices and forms W.H W and its eigh
-    rank-locally; a whole-mesh plan forms W.H W with the service's
-    distributed GEMM and solves it with the planned eigh. Only the length-m
-    spectrum replicates.
+    rank-locally; a whole-mesh plan forms W.H W with the service GEMM on the
+    plan's provider and solves it with the planned eigh (on cuSOLVERMp as
+    I + G/||G||_F, ``_shifted_normal_eigh``). The provider eigh reads one
+    triangle, so the face G takes no Hermitian projection (no transpose of a
+    face-tiled matrix). Only the length-m spectrum replicates.
     """
     from distrib_la.matmul import matmul
     tile = NamedSharding(eigh_plan.mesh, P(*((None,) * (ndim - 2)), 'x', 'y'))
+    gemm_backend = "distributed" if eigh_plan.requested in ("auto", "off") else eigh_plan.requested
 
     @jax.jit(out_shardings=(NamedSharding(eigh_plan.mesh, P()), tile))
     def extract(w):
@@ -302,10 +322,12 @@ def _direction_svd_kernel(eigh_plan, ndim):
             s, v = batch_reshard_call("normal_eigh", eigh_plan.mesh, (stack,))
         else:
             g = matmul(stack, stack, mesh=eigh_plan.mesh, transa="C",
-                       backend="distributed", batched_route="auto")
-            g = (g + jnp.conj(jnp.swapaxes(g, -1, -2))) / 2
-            evals, v = eigh_plan.batched(g)
-            s = jnp.sqrt(jnp.maximum(evals, 0))
+                       backend=gemm_backend, batched_route="auto")
+            if eigh_plan.backend == "cusolvermp":
+                evals, v = _shifted_normal_eigh(g, eigh_plan.batched)
+            else:
+                evals, v = eigh_plan.batched(g)
+            s = _singular_values(evals)
         return (s, v) if w.ndim == 3 else (s[0], v[0])
 
     return extract
@@ -325,8 +347,12 @@ def right_singular_vectors(W, tau, *, eigh_plan, column_extent,
         movement whatever the plan's route, and returns Q in batch layout.
         Singular values carry W's units; vectors are dimensionless.
     tau
-        Finite nonnegative relative cutoff; whole adjacent multiplets at
-        relative gap <= multiplet_tol survive a boundary crossing.
+        Finite positive relative cutoff; whole adjacent multiplets at
+        relative gap <= multiplet_tol survive a boundary crossing. The cut is
+        tau**2 on the normal spectrum; tau**2 < 1e4 * m * eps refuses. The
+        realistic sigma error at the cut is ~eps / (2 tau**2) (1e-10 at
+        tau = 1e-3), four orders below multiplet_tol = 1e-6; the refusal
+        bound is the worst case m * eps / (2 tau**2) <= 5e-5.
     eigh_plan
         Resolved service eigh Plan for m. Its batched route owns the
         local/distributed policy. The directions are the eigenvectors of
