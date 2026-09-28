@@ -121,9 +121,9 @@ deck η and ε 1e-4. Protected states within ±10 eV of E_F; std / maxdev in meV
 | deck | τ pairs/map (main) | map 0 | fixed point | maps |
 |---|---|---|---|---|
 | Si 4³ 8v/8c (ω [−6,6] or [−13,10]); cut +15.2 eV | 520 (414) | 0.06 / 0.25 | 0.23 / 0.88 | 9 |
-| MoS2 3×3 10v/12c ω [−10,10]; semicore at η | 1472 (392) | 0.02 / 0.09 | 0.05 / 0.15; ±1 eV shell 0.07 | 14 |
+| MoS2 3×3 10v/12c ω [−10,10]; semicore at η | 982 (392) | 0.02 / 0.09 | 0.05 / 0.14; ±1 eV shell 0.07 | 14 |
 | Fe 4³ charge 6v/8c ω [−12,8]; semicore at η | 1659 (829) | 26.6 / 157 | converges (22 maps); reference stalls | 22 |
-| Na 8³ 86 requested | see claim 2930 | | SC-2 only | – |
+| Na 8³ 86 requested; semicore at η | 1284 (1621) | 1.43 / 6.8 | SC-2 only | – |
 
 - **Semicore at η costs the budget.** A crossing window's node count is
   N ≈ 2.7 s/η + 20 with s its short side, here the depth of the deepest
@@ -132,9 +132,12 @@ deck η and ε 1e-4. Protected states within ±10 eV of E_F; std / maxdev in meV
   shorten s, and the derived pad merges them anyway (MoS2 [−66.5, −10]).
   At η_semi 1 eV (ε 1e-2) the same frequencies cost 109 (MoS2) and 159 (Fe)
   nodes but leave MoS2 2.3 / 8.5 meV off at the fixed point; at 0.5 eV,
-  1.5 / 4.8 meV at 592 pairs. On MoS2 the deck-η semicore frequencies also
-  widen the ω ≥ E_F conduction crossing box from [−35.5, +17.5] to
-  [−63.5, +127] eV (203 → 693 nodes).
+  1.5 / 4.8 meV at 592 pairs.
+- **Cached rules.** A crossing request is served only by a cached rule
+  inside its twice-widened build box (`_rule_cache_lookup`). Before, the
+  map-0 probe pass's semicore rule ([−63.5, +127] eV, 693 nodes) served
+  MoS2's ω ≥ E_F conduction window ([−35.5, +17.5] eV, 203 when built):
+  1472 instead of 982 pairs per map.
 - **The cut gap.** Si's first gap after the request is 0.41 eV wide at
   +10.4 eV and leaves protected states 7.9 meV off at map 0; the ≥ 4η rule
   takes the 1.8 eV gap at +15.2 eV (0.88 meV at the fixed point). Protecting
