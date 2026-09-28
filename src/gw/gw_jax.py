@@ -438,11 +438,12 @@ def _prepare_isdf_carriers(
             trs_allowed=sym.trs_allowed,
             state_capacity=wfn.occupation_state_capacity,
             kweights=full_k_quadrature_weights(wfn, wfn.symmetry()))
-        from .qp_support import requested_window_ev
+        support = (_oneshot_support_grid(config, enk_dft, wfn, oneshot_occupation_state,
+                                         material_class) if mode.is_dynamic
+                   else np.asarray(config.omega_grid_ev, dtype=np.float64))
         meta.shared_pole_recipe = resolve_shared_pole_recipe(
             config, wfns, meta, mesh_xy=mesh_xy, print_fn=print0,
-            requested_window_ev=requested_window_ev(*_oneshot_requested_states(
-                config, enk_dft, wfn, oneshot_occupation_state, material_class)))
+            sigma_support_ev=(float(support[0]), float(support[-1])))
     wfns_transverse = getattr(isdf, 'wf_bundle_transverse', None)
     if config.bispinor and wfns_transverse is None:
         raise RuntimeError(
@@ -795,20 +796,28 @@ def _oneshot_requested_states(config, enk_dft, wfn, occupation_state, material_c
     return requested, energy, states
 
 
-def _oneshot_sampled_support(config, enk_dft, wfn, occupation_state,
-                             material_class, print_fn):
-    """The one-shot's sampled Sigma(omega) support: the first plan of
+def _oneshot_support_grid(config, enk_dft, wfn, occupation_state, material_class):
+    """The one-shot's sampled Sigma(omega) grid, eV: the first plan of
     ``gw.qp_support`` (the deck request joined with every requested state's
     E_DFT +/- 2 eV), the plan SC map 0 makes, so SC map 0 is this calculation.
+    The shared-pole line ladder reaches its far side plus 2 eV.
+    """
+    from .qp_support import plan_support_ev
+    requested, energy, states = _oneshot_requested_states(
+        config, enk_dft, wfn, occupation_state, material_class)
+    return plan_support_ev(config.sigma, requested, energy, states, 0)[0]
+
+
+def _oneshot_sampled_support(config, enk_dft, wfn, occupation_state,
+                             material_class, print_fn):
+    """The one-shot config sampling :func:`_oneshot_support_grid`.
     Under ``cover`` an active state outside the requested grid reads its own
     Sigma(E).
     """
     from dataclasses import replace
 
-    from .qp_support import plan_support_ev
-    requested, energy, states = _oneshot_requested_states(
-        config, enk_dft, wfn, occupation_state, material_class)
-    grown, _ = plan_support_ev(config.sigma, requested, energy, states, 0)
+    requested = np.asarray(config.omega_grid_ev, dtype=np.float64)
+    grown = _oneshot_support_grid(config, enk_dft, wfn, occupation_state, material_class)
     if grown.size == requested.size:
         return config
     print_fn(f"  Sigma sampled support ({config.sigma.out_of_grid}, plan 0): "

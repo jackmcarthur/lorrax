@@ -1117,15 +1117,6 @@ def response_support(wfns, meta, sample_plan, receipt, *, print_fn=print):
                 amplitude=amplitude, band_ranges=band_ranges)
 
 
-#: The derived group rules deliver exactly their certificate, uniformly over
-#: the transition interval, and the shared-pole construction amplifies that
-#: error: Na 8^3 map-0 eqp moves 1.17 / 0.43 / 0.04 meV (max, E_F +- 10 eV)
-#: against a 1e-10 reference at group tolerances 1e-8 / 1e-9 / 1e-10 (lane
-#: CHIRULE, 2026-09-27). The group rules therefore certify a decade below the
-#: tier's bank tolerance; the photon contact rules keep the tier's value.
-_GROUP_RULE_MARGIN = 0.1
-
-
 def response_quadrature(meta, sample_plan, receipt, support, *, group_size, print_fn=print):
     """Plan shared complex-time rules for sample groups; replicate small rules.
 
@@ -1166,7 +1157,7 @@ def response_quadrature(meta, sample_plan, receipt, support, *, group_size, prin
                     for rule in previous if set(rule["members"]) <= set(members)]
             rules = minimax.response_group_rules(
                 plan["lo"], plan["hi"], z[members],
-                rel_tol=_GROUP_RULE_MARGIN*sample_plan["bank_rule_tolerance"]/amplitude,
+                rel_tol=sample_plan["response_group_tolerance"]/amplitude,
                 decay_rate=decay_rate, previous=warm)
             return [dict(rule, members=[members[m] for m in rule["members"]]) for rule in rules]
 

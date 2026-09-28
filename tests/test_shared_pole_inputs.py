@@ -208,7 +208,7 @@ def fixture(*, metal=False, eta=.25, tier='production', top=20.):
 
 def resolve(args, window=(-6., 4.)):
     return resolve_shared_pole_recipe(*args,mesh_xy=NS(shape={'x':2,'y':2}),print_fn=lambda *_:None,
-                                      requested_window_ev=window)
+                                      sigma_support_ev=window)
 
 
 def test_geometry_padding_charge_and_holds():
