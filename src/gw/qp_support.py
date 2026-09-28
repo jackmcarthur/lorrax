@@ -74,14 +74,14 @@ def clamped_reads(energy_relative_ev, protected_kn, grid_ev):
     return np.asarray(protected_kn, bool) & ((e-h < grid_ev[0]) | (e+h > grid_ev[-1]))
 
 
-#: Broadening of the rotating-band far patches (eV), above and below E_F.
-#: The P-R coupling needs Sigma_io(E_o) only to modest accuracy and a patch's
-#: node count scales as E_bw/eta. Replays (CLASSMIX round 2): Si conduction
-#: endpoints at 1 eV keep 0.7-0.8 meV; Fe semicore endpoints match the exact
-#: read at 2 eV (1.98 vs 1.95 meV). The owner approved 1-2 eV for far reads
-#: (ruling Q4, 2026-09-28; INVARIANTS 12); protected states keep the deck eta.
+#: Broadening of the far patches (eV). Rotating (empty, above the protected
+#: cut) endpoints: the P-R coupling needs Sigma_io(E_o) only to modest
+#: accuracy (CLASSMIX: Si conduction endpoints at 1 eV keep 0.7-0.8 meV).
+#: Semicore (active, occupied below a wide gap) reads its own energy at
+#: SEMICORE_ETA_EV. The owner approved 1-2 eV for these reads (ruling Q4,
+#: 2026-09-28; INVARIANTS 12); protected states keep the deck eta.
 FAR_PATCH_ETA_EV = 1.0
-FAR_PATCH_ETA_BELOW_EV = 2.0
+SEMICORE_ETA_EV = 1.0
 #: Rule tolerance of the far-patch crossing windows. A far window's node
 #: count is set by its short side over eta (the patch top above the lowest
 #: state), not by its pole range, so splitting cannot shorten it; the coupling
@@ -89,37 +89,46 @@ FAR_PATCH_ETA_BELOW_EV = 2.0
 FAR_PATCH_EPS = 1.0e-2
 #: Far-patch sampling step (eV): eta/2 resolves the broadened Sigma.
 FAR_PATCH_STEP_EV = 0.5
-#: Outer pad of each far patch about its rotating DFT energies and map-0
-#: estimates (eV). A rotating state whose own-energy fixed point lies outside
-#: its patch flips between the own read and the side scissor from map to map,
-#: and the SC map has no fixed point. The pad must hold that fixed point in
-#: the frame Sigma is read in: on Fe 4^3 the 3s own-energy fixed point lies
-#: 3.3 eV below its DFT energy (the map-0 read moves it 0.1 eV: Sigma's slope
-#: there is near 1 at eta_far = 2 eV), and the metal frame mu moves +1.3 eV,
-#: 4.6 eV in all; 2 and 4 eV pads stalled Fe at 1-6 meV with 1-13 flips per
-#: map (PARTITION). A crossing far window's node count grows by about 2.7 per
-#: eV of short side over eta_far, so the pad costs a few pairs per patch.
-FAR_PATCH_PAD_EV = 6.0
+#: A global gap wider than this splits semicore from the valence manifold:
+#: twice the padded near-support halfwidth (outer pad + Z stencil), so a
+#: narrower gap would be sampled by the near support anyway.
+SEMICORE_GAP_EV = 2.0 * (SUPPORT_PAD_EV + 0.5)
 #: Offset of a far patch's first (last) sample past the near support's top
 #: (bottom) edge (eV): the two grids stay strictly ascending and join with
 #: no uncovered sliver.
 FAR_PATCH_EDGE_EV = 1.0e-3
 
 
-def far_patches_ev(energy_rel_ev, rotating_kn, near_support_ev):
-    """Contiguous far patches covering every rotating DFT energy outside the near support.
+def derived_pad_ev(e_dft_rel_ev, e_probe_rel_ev, mask_kn):
+    """Pad of a class's patches: max |E_map0 - E_DFT| over the class + SUPPORT_PAD_EV.
 
-    ``energy_rel_ev`` (nk, nb) is about the Sigma frame's E_F. Energies are
-    padded by FAR_PATCH_PAD_EV, merged where padded intervals overlap, clipped
-    against the near support and snapped outward to FAR_PATCH_STEP_EV.
-    Returns ((lo, hi), ...) ascending; empty when no rotating state lies outside.
+    ``e_probe_rel_ev`` stacks one or more (nk, nb) map-0 estimates. Without a
+    probe (the provisional map-0 plan) the pad is SUPPORT_PAD_EV.
     """
-    e = np.asarray(energy_rel_ev, float)[np.asarray(rotating_kn, bool)]
+    m = np.asarray(mask_kn, bool)
+    if e_probe_rel_ev is None or not m.any():
+        return float(SUPPORT_PAD_EV)
+    e0 = np.asarray(e_dft_rel_ev, float)
+    probe = np.asarray(e_probe_rel_ev, float).reshape((-1,) + e0.shape)
+    shift = np.max(np.abs(probe - e0[None])[:, m])
+    return float(shift) + float(SUPPORT_PAD_EV)
+
+
+def far_patches_ev(energy_rel_ev, mask_kn, near_support_ev, *, pad_ev):
+    """Contiguous patches covering every masked energy outside the near support.
+
+    ``energy_rel_ev`` (rows, nb) is about the Sigma frame's E_F (probe rows may
+    be stacked below the DFT rows). Energies are padded by ``pad_ev``, merged
+    where padded intervals overlap or a hole is shorter than 2 pad_ev, clipped
+    against the near support and snapped outward to FAR_PATCH_STEP_EV.
+    Returns ((lo, hi), ...) ascending; empty when no masked state lies outside.
+    """
+    e = np.asarray(energy_rel_ev, float)[np.asarray(mask_kn, bool)]
     lo_near, hi_near = float(near_support_ev[0]), float(near_support_ev[1])
     e = np.sort(e[(e < lo_near) | (e > hi_near)])
     if e.size == 0:
         return ()
-    step, pad = FAR_PATCH_STEP_EV, FAR_PATCH_PAD_EV
+    step, pad = FAR_PATCH_STEP_EV, float(pad_ev)
     breaks = np.nonzero(np.diff(e) > 2.0 * pad)[0]
     starts = np.concatenate(([0], breaks + 1)); stops = np.concatenate((breaks, [e.size - 1]))
     out = []
@@ -127,7 +136,7 @@ def far_patches_ev(energy_rel_ev, rotating_kn, near_support_ev):
         lo, hi = e[a] - pad, e[b] + pad
         lo, hi = float(np.floor(lo / step) * step), float(np.ceil(hi / step) * step)
         # A patch that reaches the near support starts FAR_PATCH_EDGE_EV past
-        # its edge, so no rotating energy falls in a sliver between the two.
+        # its edge, so no energy falls in a sliver between the two.
         if hi > hi_near and lo <= hi_near:
             lo = hi_near + FAR_PATCH_EDGE_EV
         if lo < lo_near and hi >= lo_near:
@@ -139,24 +148,20 @@ def far_patches_ev(energy_rel_ev, rotating_kn, near_support_ev):
     return tuple(out)
 
 
-def far_patch_eta_ev(patch):
-    """A patch wholly below E_F takes the broader semicore eta."""
-    return FAR_PATCH_ETA_BELOW_EV if float(patch[1]) <= 0.0 else FAR_PATCH_ETA_EV
-
-
 def far_patch_grid_ev(patch):
-    lo, hi = float(patch[0]), float(patch[1])
-    step = 0.5 * far_patch_eta_ev(patch)
+    """Samples of one (lo, hi, eta) patch at eta/2, ending exactly at hi."""
+    lo, hi, eta = float(patch[0]), float(patch[1]), float(patch[2])
+    step = 0.5 * eta
     n = int(np.ceil((hi - lo) / step - 1e-9)) + 1
     return np.linspace(lo, hi, max(n, 2))      # ends at hi: never enters the near grid
 
 
 def far_patch_covered(energy_rel_ev, patches):
-    """Mask of energies inside some far patch (inclusive), same frame as the patches."""
+    """Mask of energies inside some patch (inclusive), same frame as the patches."""
     e = np.asarray(energy_rel_ev, float)
     covered = np.zeros(e.shape, bool)
-    for lo, hi in patches:
-        covered |= (e >= float(lo)) & (e <= float(hi))
+    for patch in patches:
+        covered |= (e >= float(patch[0])) & (e <= float(patch[1]))
     return covered
 
 
@@ -165,35 +170,59 @@ class SigmaPlan(NamedTuple):
 
     ``grid_ev`` samples the protected (near) support at the deck eta;
     ``protected_support_ev`` is its [lo, hi], the 2 eV outer pad and the Z
-    stencil included. ``far_patches_ev`` are the rotating-endpoint patches,
-    ``far_eta_ev`` their broadening. The W sampling ladder reads this one
-    object (``SCSupport.plan``; the SC session's ``"sigma_plan"``).
+    stencil included. ``far_patches_ev``/``far_eta_ev`` are the rotating
+    patches (empty states above the protected cut), ``semicore_ev``/
+    ``semicore_eta_ev`` the semicore patches; each patch pad is derived
+    (``derived_pad_ev``). The W sampling ladder reads this one object
+    (``SCSupport.plan``; the SC session's ``"sigma_plan"``).
     """
     grid_ev: np.ndarray
     envelope_ev: tuple
     near_eta_ev: float
     far_patches_ev: tuple
     far_eta_ev: tuple
+    semicore_ev: tuple = ()
+    semicore_eta_ev: tuple = ()
+    far_pad_ev: float = SUPPORT_PAD_EV
+    semicore_pad_ev: float = SUPPORT_PAD_EV
 
     @property
     def protected_support_ev(self):
         return (float(self.grid_ev[0]), float(self.grid_ev[-1]))
 
+    @property
+    def patches(self):
+        """Every held patch as (lo, hi, eta), ascending."""
+        rows = ([(a, b, e) for (a, b), e in zip(self.far_patches_ev, self.far_eta_ev)]
+                + [(a, b, e) for (a, b), e in zip(self.semicore_ev, self.semicore_eta_ev)])
+        return tuple(sorted(rows))
+
 
 def plan_sigma_windows(sigma, energy_rel_ev, protected_kn, *, rotating_energy_rel_ev=None,
-                       rotating_kn=None, outer_pad_ev=SUPPORT_PAD_EV):
-    """THE one Sigma plan: protected support plus far patches, in one call.
+                       rotating_kn=None, semicore_kn=None, far_pad_ev=SUPPORT_PAD_EV,
+                       semicore_pad_ev=SUPPORT_PAD_EV, outer_pad_ev=SUPPORT_PAD_EV):
+    """THE one Sigma plan: protected support, rotating and semicore patches, in one call.
 
     ``energy_rel_ev``/``protected_kn`` set the near support
-    (:func:`plan_support_ev`); ``rotating_energy_rel_ev``/``rotating_kn``
-    (None: a route without far patches) set the far patches
-    (:func:`far_patches_ev`). Extra rows (map-0 probe estimates) may be
-    stacked below either energy array with the mask tiled to match.
+    (:func:`plan_support_ev`); ``rotating_energy_rel_ev`` with
+    ``rotating_kn`` / ``semicore_kn`` (None: a route without patches) set the
+    rotating and semicore patches (:func:`far_patches_ev`). Extra rows (map-0
+    probe estimates) may be stacked below either energy array with the masks
+    tiled to match.
     """
     grid, envelope = plan_support_ev(sigma, energy_rel_ev, protected_kn,
                                      outer_pad_ev=outer_pad_ev)
-    patches = (() if rotating_kn is None else
-               far_patches_ev(rotating_energy_rel_ev, rotating_kn,
-                              (float(grid[0]), float(grid[-1]))))
-    return SigmaPlan(grid, envelope, float(sigma.regularization_ev), tuple(patches),
-                     tuple(far_patch_eta_ev(p) for p in patches))
+    near = (float(grid[0]), float(grid[-1]))
+    far = (() if rotating_kn is None else
+           far_patches_ev(rotating_energy_rel_ev, rotating_kn, near, pad_ev=far_pad_ev))
+    semi = (() if semicore_kn is None else
+            far_patches_ev(rotating_energy_rel_ev, semicore_kn, near, pad_ev=semicore_pad_ev))
+    # A semicore patch never overlaps a rotating one (they sit on opposite
+    # sides of E_F); refuse rather than merge silently if they ever do.
+    rows = sorted([(a, b) for a, b in far] + [(a, b) for a, b in semi])
+    if any(r[0] <= q[1] for q, r in zip(rows[:-1], rows[1:])):
+        raise ValueError("GATE sigma_far_patch_order: rotating and semicore patches overlap")
+    return SigmaPlan(grid, envelope, float(sigma.regularization_ev), tuple(far),
+                     tuple(FAR_PATCH_ETA_EV for _ in far), tuple(semi),
+                     tuple(SEMICORE_ETA_EV for _ in semi), float(far_pad_ev),
+                     float(semicore_pad_ev))

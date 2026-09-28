@@ -630,12 +630,16 @@ def build_qsgw_sigma_xc(
     band_axis=None,
     protected_kn=None,
     far=None,
+    far_kn=None,
 ) -> tuple[jax.Array, dict[str, float]]:
     """Build the static Hermitian QSGW Σ_xc[k, m, n].
 
-    ``far = (sigma_c_far_omega_ry, far_omega_ev, patches_ev)`` (with
-    ``protected_kn``): rotating endpoints a patch covers read the far-patch
-    cube; see :func:`_qsgw_far_kernel`.
+    ``far = (sigma_c_far_omega_ry, far_omega_ev)`` with ``far_kn``: the
+    states of ``far_kn`` read their endpoints on the far-patch cube, those of
+    ``protected_kn`` on the near cube, and the rest (scissored rotating
+    states) supply no endpoint; see :func:`_qsgw_far_kernel`. The caller
+    (SC map) owns the classification and refuses any state a held cube does
+    not cover.
 
     Implements the standard QSGW ansatz
 
@@ -749,21 +753,13 @@ def build_qsgw_sigma_xc(
     n_far_clipped = 0
     if far is not None and protected_kn is not None:
         sig_f, far_omega = far[0], np.asarray(far[1], dtype=np.float64)
-        patches = far[2] if len(far) > 2 else ((far_omega[0], far_omega[-1]),)
         flo, fhi, fwl, fwh, _ = _interp_tables(far_omega, E)
-        # A rotating state inside the near support reads the near cube; a
-        # rotating state beyond it reads the far patch that covers its
-        # energy. One no patch covers (ruling Q3, 2026-09-28) contributes no
-        # endpoint of its own: its P-R entries are read at the protected
-        # energy and its diagonal is replaced by the side scissor downstream.
-        from .qp_support import far_patch_covered
-        beyond = (E < omega_lo) | (E > omega_hi)
-        rotating_beyond = (protected < 0.5) & beyond
-        covered = far_patch_covered(E, patches)
-        near_read = np.where(rotating_beyond, 0.0, 1.0)
-        far_read = np.where(rotating_beyond & covered, 1.0, 0.0)
+        far_read = np.zeros((nk, nb), float)
+        if far_kn is not None:
+            far_read[:, :logical_nb] = np.asarray(far_kn, float)
+        near_read = np.where(far_read > 0.5, 0.0, protected)
         n_far_clipped = int(np.count_nonzero(
-            (rotating_beyond & ~covered)[:, :logical_nb]))
+            ((near_read < 0.5) & (far_read < 0.5))[:, :logical_nb]))
         put = lambda a, t: device_put_process_local(a.astype(t), rep_2d)
         sigma_xc_qsgw = _qsgw_far_kernel(
             mesh_xy, replicated_output=bool(replicated_output))(
