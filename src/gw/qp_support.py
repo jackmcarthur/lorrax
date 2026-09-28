@@ -90,6 +90,10 @@ FAR_PATCH_EPS = 1.0e-2
 FAR_PATCH_STEP_EV = 0.5
 #: Outer pad of each far patch about its rotating DFT energies (eV).
 FAR_PATCH_PAD_EV = 2.0
+#: Offset of a far patch's first (last) sample past the near support's top
+#: (bottom) edge (eV): the two grids stay strictly ascending and join with
+#: no uncovered sliver.
+FAR_PATCH_EDGE_EV = 1.0e-3
 
 
 def far_patches_ev(energy_rel_ev, rotating_kn, near_support_ev):
@@ -111,11 +115,13 @@ def far_patches_ev(energy_rel_ev, rotating_kn, near_support_ev):
     out = []
     for a, b in zip(starts, stops):
         lo, hi = e[a] - pad, e[b] + pad
-        if hi > hi_near and lo < hi_near:
-            lo = hi_near + step
-        if lo < lo_near and hi > lo_near:
-            hi = lo_near - step
         lo, hi = float(np.floor(lo / step) * step), float(np.ceil(hi / step) * step)
+        # A patch that reaches the near support starts FAR_PATCH_EDGE_EV past
+        # its edge, so no rotating energy falls in a sliver between the two.
+        if hi > hi_near and lo <= hi_near:
+            lo = hi_near + FAR_PATCH_EDGE_EV
+        if lo < lo_near and hi >= lo_near:
+            hi = lo_near - FAR_PATCH_EDGE_EV
         if out and lo - out[-1][1] <= 2.0 * pad:      # a short hole costs more than it saves
             out[-1] = (out[-1][0], hi)
         else:

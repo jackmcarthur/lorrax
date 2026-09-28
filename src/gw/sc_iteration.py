@@ -2643,21 +2643,28 @@ def _sc_sampled_support(inputs, partition, energies_loop, mu_ev):
     energy = energies_loop - mu_ev
     states = requested_states(energy, part.protected_mask)
     if session is None or "omega_grid_ev" not in session:
-        grid, envelope = plan_support_ev(sigma, energy, states,
-                                         outer_pad_ev=SUPPORT_PAD_EV)
-        event = "one-shot" if session is None else "plan"
+        probe = None if session is None else session.get("probe_energy_ev")
+        grid, envelope = plan_support_ev(
+            sigma, energy if probe is None else np.concatenate([energy, probe]),
+            states if probe is None else np.concatenate([states, states]),
+            outer_pad_ev=SUPPORT_PAD_EV)
+        event = ("one-shot" if session is None else "plan" if probe is None
+                 else "plan from DFT + map-0 probe")
     else:
         grid = np.asarray(session["omega_grid_ev"], float)
         envelope = session["support_envelope_ev"]
         event = "hold"
     outside = clamped_reads(energy, states, grid)
-    if outside.any():
-        ks, ns = np.nonzero(outside)
+    # The Hamiltonian reads Sigma at E itself; the +-0.5 eV Z stencil is
+    # one-sided at an edge by design (eqp_bgw.compute_z_factor_from_omega_grid).
+    escaped = states & ((energy < grid[0]) | (energy > grid[-1]))
+    if escaped.any():
+        ks, ns = np.nonzero(escaped)
         worst = int(np.argmax(np.maximum(grid[0] - energy[ks, ns],
                                          energy[ks, ns] - grid[-1])))
         raise ValueError(
-            f"GATE sigma_plan_escape: {int(outside.sum())} protected read "
-            f"stencils left the Sigma support [{grid[0]:+.3f}, {grid[-1]:+.3f}] eV "
+            f"GATE sigma_plan_escape: {int(escaped.sum())} protected Sigma "
+            f"reads left the Sigma support [{grid[0]:+.3f}, {grid[-1]:+.3f}] eV "
             f"planned at SC map 0 (event {event}); worst: k={int(ks[worst])} "
             f"identity band={int(ns[worst]) + int(inputs.band_slices.b0) + 1} at "
             f"E-mu={float(energy[ks[worst], ns[worst]]):+.4f} eV. The plan is held "
@@ -2868,7 +2875,31 @@ def _record_sc_map_stages(inputs, iteration, started, before) -> None:
         + f" | wall {wall:.1f}")
 
 
+class _PlanFromProbe(Exception):
+    """Map 0's probe left the provisional plan; plan once from it (``gw_iteration_map``)."""
+
+
 def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
+    """One SC map; at map 0 the held Sigma plan is fixed from a probe.
+
+    THE ONE PLAN AT MAP 0.  Map 0 first evaluates Sigma on the plan from the
+    DFT energies (2 eV outer pad).  If a protected state's map-0 QP estimate
+    (the diagonal of the map-0 QSGW Hamiltonian) falls outside that support,
+    or a rotating one outside the near support and every far patch, the plan
+    is made once more from the DFT energies AND those estimates, with the
+    same pad, and map 0 is re-evaluated on it with the same W.  That plan is
+    then held; a later escape refuses (``GATE sigma_plan_escape``).  An
+    insulator's Sigma frame is the DFT midgap, so a rigid QP gap opening
+    (MoS2 3x3: +2.4 to +3.1 eV on the conduction states at map 0) would
+    otherwise leave every protected conduction edge outside a 2 eV pad.
+    """
+    try:
+        return _gw_iteration_map_once(state, inputs)
+    except _PlanFromProbe:
+        return _gw_iteration_map_once(state, inputs)
+
+
+def _gw_iteration_map_once(state: SCState, inputs: SCInputs) -> SCState:
     _map_started, _map_stages_before = time.perf_counter(), _sc_stage_seconds()
     map0_dft_table = None
     """One self-consistent QSGW step in the DFT basis.
@@ -3646,8 +3677,15 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
     # XLA cache hits on iteration ≥ 2 (same shapes, new values).
     # The pre-plan reuse call already returned this map's complete fit mapping.
     # A live producer runs here, after the current head response exists.
+    _probe_session = inputs.fixed_quadrature_session
     if screening_reuse is not None:
         W_by_role = screening_reuse
+    elif (_probe_session is not None and int(state.iteration) == 0
+          and "probe_W_by_role" in _probe_session):
+        # Map 0's second pass: same input state, same W; only the plan moved.
+        W_by_role = _probe_session.pop("probe_W_by_role")
+        inputs.print_fn("    SC map 0: W reused from the probe pass; Sigma "
+                        "re-evaluated on the plan fixed from the probe")
     elif elementwise_mpa and inputs.quad is None:
         # The external fit is valid only for the occupation state stamped in
         # it.  Once the SC spectrum changes, keep its exactly reconstructed
@@ -3781,9 +3819,14 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
                 inputs.config, inputs.wfn, E_full, efermi_ry,
                 entry_occ_state if inputs.material_class == "metal" else None)
             grid = np.asarray(sc_support.grown, float)
+            e_plan = e_dft_fit_ev - float(mu_frame_ev)
+            rot_plan = ~np.asarray(protected_loop, bool)
+            probe = None if session is None else session.get("probe_energy_ev")
+            if probe is not None:
+                e_plan = np.concatenate([e_plan, probe])
+                rot_plan = np.concatenate([rot_plan, rot_plan])
             far_patches = far_patches_ev(
-                e_dft_fit_ev - float(mu_frame_ev), ~np.asarray(protected_loop, bool),
-                (float(grid[0]), float(grid[-1])))
+                e_plan, rot_plan, (float(grid[0]), float(grid[-1])))
             if session is not None:
                 session["far_patches_ev"] = far_patches
             _record_sc(inputs, "    SC rotating far patches (planned once, held): "
@@ -3978,6 +4021,34 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
                        f"{int(rotating_loop.sum())} rotating (k,state)")
     H_qp_dft_new = rotating_band_hamiltonian(
         H_qp_dft_full, jnp.asarray(protected_loop), jnp.asarray(target), inputs.mesh_xy)
+
+    _session = inputs.fixed_quadrature_session
+    if (sc_support is not None and _session is not None and int(state.iteration) == 0
+            and "probe_energy_ev" not in _session):
+        from .qsgw_utils import static_sigma_diag_to_host
+        from .qp_support import far_patch_covered
+        mu_frame_ev = float(np.mean(np.asarray(energies_loop) - sc_support.energy))
+        probe = (np.asarray(static_sigma_diag_to_host(H_qp_dft_new, inputs.mesh_xy).real)
+                 * RYD_TO_EV - mu_frame_ev)
+        grid = np.asarray(sc_support.grown, float)
+        beyond = (probe < grid[0]) | (probe > grid[-1])
+        prot = np.asarray(protected_loop, bool)
+        escape_p = prot & beyond
+        escape_r = np.zeros_like(escape_p)
+        if far_patches:
+            escape_r = ~prot & beyond & ~far_patch_covered(probe, far_patches)
+        _session["probe_energy_ev"] = probe
+        if escape_p.any() or escape_r.any():
+            _record_sc(inputs, f"    SC map 0 probe: {int(escape_p.sum())} protected and "
+                       f"{int(escape_r.sum())} rotating QP estimates left the provisional plan "
+                       f"[{grid[0]:+.3f}, {grid[-1]:+.3f}] eV (probe range "
+                       f"[{float(probe[prot].min()):+.3f}, {float(probe[prot].max()):+.3f}] eV "
+                       "protected); planning once from DFT and probe energies")
+            _session.clear()
+            _session["probe_energy_ev"] = probe
+            _session["probe_W_by_role"] = W_by_role
+            raise _PlanFromProbe()
+        _record_sc(inputs, "    SC map 0 probe: every QP estimate inside the plan")
 
     # The occupation state CARRIED below is the ENTRY solve consumed by this
     # call's chi/head/Sigma.  The carry remains DIAGNOSTIC continuity only (mu drift between
