@@ -1,13 +1,23 @@
 """Fixed sampled Sigma support, in eV relative to the Sigma chemical potential.
 
-Only requested protected bands set the interval. The optional deck endpoints
-can enlarge it. The Z stencil and one 2 eV outer pad are included once;
-iterates clamp and only a failed convergence check may rebuild once.
+Only protected bands set the near interval: the requested states whose DFT
+energy lies within WINDOW_CLIP_EV of mu, plus every state inside the optional
+deck endpoints, which only enlarge. The Z stencil and one 2 eV outer pad are
+included once at map 0 and the plan is then held. A protected read that
+leaves the held support, or a product window that leaves its held box,
+refuses by name (``GATE sigma_plan_escape``): no clamp and no rebuild (owner
+ruling Q5, 2026-09-28). Rotating endpoints beyond the near
+support read far patches; a rotating state no patch covers takes the side
+scissor (ruling Q3).
 """
 from __future__ import annotations
 import numpy as np
 
 SUPPORT_PAD_EV = 2.0
+#: Requested states farther than this from mu are not protected (eV). They
+#: rotate, and their energies come from the far patches. The owner's
+#: protected-window rule (+-10 eV of E_F) and the pair budgets set it.
+WINDOW_CLIP_EV = 10.0
 
 
 def read_halfwidth_ev():
@@ -36,7 +46,7 @@ def requested_states(energy_relative_ev, required_kn):
 
 
 def plan_support_ev(sigma, energy_relative_ev, requested_kn, *,
-                    outer_pad_ev=SUPPORT_PAD_EV, support_floor_ev=()):
+                    outer_pad_ev=SUPPORT_PAD_EV):
     """Return the single contiguous support and its unrounded envelope."""
     e = np.asarray(energy_relative_ev, float)
     p = np.broadcast_to(np.asarray(requested_kn, bool), e.shape)
@@ -50,13 +60,6 @@ def plan_support_ev(sigma, energy_relative_ev, requested_kn, *,
         lo = min(lo, float(sigma.omega_min_ev))
     if sigma.omega_max_ev is not None:
         hi = max(hi, float(sigma.omega_max_ev))
-    # Only a previous physical support is a floor. The config's temporary
-    # near-zero grid is not a user request when either endpoint is absent.
-    floor = np.asarray(support_floor_ev, float)
-    if floor.size:
-        if floor.shape != (2,) or not np.isfinite(floor).all() or floor[0] >= floor[1]:
-            raise ValueError("Sigma rebuild floor must be a finite ordered interval")
-        lo, hi = min(lo, float(floor[0])), max(hi, float(floor[1]))
     lo = np.floor(lo / step) * step
     hi = np.ceil(hi / step) * step
     grid = lo + step * np.arange(int(round((hi-lo)/step)) + 1)
@@ -70,44 +73,14 @@ def clamped_reads(energy_relative_ev, protected_kn, grid_ev):
     return np.asarray(protected_kn, bool) & ((e-h < grid_ev[0]) | (e+h > grid_ev[-1]))
 
 
-def check_fixed_point(session):
-    """Accept the fixed plan, or clear it for its sole convergence rebuild.
-
-    Returns True only on a rebuild. Rule dictionaries are owned by the Sigma
-    consumers; the small recursive walk visits sessions, never physical axes.
-    """
-    if session is None:
-        return False
-    reasons = []
-    def collect(d):
-        if d.get("outside_plan"):
-            reasons.extend(d["outside_plan"])
-        for value in d.values():
-            if isinstance(value, dict):
-                collect(value)
-    collect(session)
-    if not reasons:
-        return False
-    if session.get("convergence_rebuilds", 0):
-        raise ValueError("GATE sigma_plan_fixed_point: support failed after its one "
-                         "rebuild; enlarge nval/ncond or sigma_omega_min_ev/max_ev. "
-                         + "; ".join(reasons))
-    old_grid = session.get("omega_grid_ev", ())
-    floor = () if not len(old_grid) else (old_grid[0], old_grid[-1])
-    session.clear()
-    session["convergence_rebuilds"] = 1
-    session["rebuild_floor_ev"] = floor
-    return True
-
-
 #: Broadening of the rotating-band far patches (eV), above and below E_F.
 #: The P-R coupling needs Sigma_io(E_o) only to modest accuracy and a patch's
 #: node count scales as E_bw/eta. Replays (CLASSMIX round 2): Si conduction
 #: endpoints at 1 eV keep 0.7-0.8 meV; Fe semicore endpoints match the exact
-#: read at 2 eV (1.98 vs 1.95 meV) and move 0.1 meV more at 4 eV (round 4),
-#: which halves their far window (82 -> 45 nodes).
+#: read at 2 eV (1.98 vs 1.95 meV). The owner approved 1-2 eV for far reads
+#: (ruling Q4, 2026-09-28; INVARIANTS 12); protected states keep the deck eta.
 FAR_PATCH_ETA_EV = 1.0
-FAR_PATCH_ETA_BELOW_EV = 4.0
+FAR_PATCH_ETA_BELOW_EV = 2.0
 #: Rule tolerance of the far-patch crossing windows. A far window's node
 #: count is set by its short side over eta (the patch top above the lowest
 #: state), not by its pole range, so splitting cannot shorten it; the coupling
@@ -151,7 +124,7 @@ def far_patches_ev(energy_rel_ev, rotating_kn, near_support_ev):
 
 
 def far_patch_eta_ev(patch):
-    """A patch wholly below E_F takes the broad semicore eta."""
+    """A patch wholly below E_F takes the broader semicore eta."""
     return FAR_PATCH_ETA_BELOW_EV if float(patch[1]) <= 0.0 else FAR_PATCH_ETA_EV
 
 
@@ -160,3 +133,12 @@ def far_patch_grid_ev(patch):
     step = 0.5 * far_patch_eta_ev(patch)
     n = int(np.ceil((hi - lo) / step - 1e-9)) + 1
     return np.linspace(lo, hi, max(n, 2))      # ends at hi: never enters the near grid
+
+
+def far_patch_covered(energy_rel_ev, patches):
+    """Mask of energies inside some far patch (inclusive), same frame as the patches."""
+    e = np.asarray(energy_rel_ev, float)
+    covered = np.zeros(e.shape, bool)
+    for lo, hi in patches:
+        covered |= (e >= float(lo)) & (e <= float(hi))
+    return covered

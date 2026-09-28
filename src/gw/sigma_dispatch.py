@@ -668,7 +668,7 @@ def finalize_dynamic_sigma(
                  f"({100*qsgw_diag['frac_clipped']:.1f}%)"
                  + ("" if sigma_c_far is None else
                     f"; rotating endpoints read far patches, "
-                    f"{int(qsgw_diag['n_far_clipped'])} clamped"))
+                    f"{int(qsgw_diag['n_far_clipped'])} outside every patch"))
 
         sigma_lorentz = None
         if sigma_lorentz_static_skij_ry is not None:
@@ -1358,7 +1358,8 @@ def _compute_mpa_sigma(
         order = np.argsort([float(g[0]) for g, _ in far_bodies], kind="stable")
         cubes = [cubes[i] for i in order]
         sigma_c_far = (cubes[0] if len(cubes) == 1 else jnp.concatenate(cubes, axis=0),
-                       np.concatenate([far_bodies[i][0] for i in order]))
+                       np.concatenate([far_bodies[i][0] for i in order]),
+                       tuple(config.sc_far_patches_ev))
         if np.any(np.diff(sigma_c_far[1]) <= 0):
             raise ValueError("GATE sigma_far_patch_order: far patches overlap or do not ascend")
     return finalize_dynamic_sigma(
