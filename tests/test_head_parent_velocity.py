@@ -31,10 +31,14 @@ def test_parent_velocity_ignores_nonparent_payload_and_slices_bands(tmp_path, mo
         h5['dipole_cart'] = velocity
     monkeypatch.setattr(reader, 'check_dipole_provenance', lambda *a, **k: True)
     monkeypatch.setattr(owner, 'resolve_vnl_velocity_sign', lambda *a: 1)
+    import jax
+    from jax.sharding import Mesh
+    mesh = Mesh(np.asarray(jax.devices()[:1]).reshape(1, 1), ("x", "y"))
     got = read_authenticated_dipole_velocity(
         path, wfn=SimpleNamespace(symmetry=lambda: sym),
         meta=SimpleNamespace(nspinor=2, b_id_0=1, b_id_4_chi_user=3),
-        config=SimpleNamespace(nval=1, ncond=1, nband=4, vnl_velocity_sign=''))
+        config=SimpleNamespace(nval=1, ncond=1, nband=4, vnl_velocity_sign=''),
+        mesh=mesh)
     assert got.shape == (3, 2, 2, 2)
     np.testing.assert_array_equal(got[:, 0], velocity[:, 0, 1:3, 1:3])
     np.testing.assert_array_equal(got[:, 1], -velocity[:, 0, 1:3, 1:3].conj())

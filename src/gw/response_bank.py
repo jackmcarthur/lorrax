@@ -1711,7 +1711,7 @@ def compute_photon_bank(wfns, wfns_transverse, meta, config, *, mesh_xy, sym,
             if velocity is None:
                 host = read_authenticated_dipole_velocity(
                     os.path.join(config.input_dir, "dipole.h5"), wfn=wfn,
-                    meta=meta, config=config,
+                    meta=meta, config=config, mesh=mesh_xy,
                     wfn_fingerprint_binding=wfn_fingerprint_binding)
                 nk, nb = int(host.shape[1]), int(host.shape[-1])
                 empty = np.zeros((nk, nb), np.float64)

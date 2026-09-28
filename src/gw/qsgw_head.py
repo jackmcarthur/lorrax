@@ -679,7 +679,7 @@ def load_dft_dipole_head(input_dir, *, mesh: Mesh, wfn, meta, config):
         raise ValueError("metal direct head requires a band manifold starting at 0")
     velocity = read_authenticated_dipole_velocity(
         os.path.join(input_dir, "dipole.h5"), wfn=wfn, meta=meta,
-        config=config)
+        config=config, mesh=mesh)
     nb = int(meta.b_id_4_chi_user)
     axis = padded_axis(
         nb, mesh, name="metal direct-head band carrier",
@@ -3621,10 +3621,13 @@ def expected_hubbard_stamp(config, *, wfn, fallback_dir, caller) -> str:
 
 
 def read_authenticated_dipole_velocity(
-    dipole_path, *, wfn, meta, config, wfn_fingerprint_binding=None,
+    dipole_path, *, wfn, meta, config, mesh: Mesh, wfn_fingerprint_binding=None,
 ):
-    """Read file-wedge velocities and restore their polar time-odd full-k action."""
-    import h5py
+    """Read file-wedge velocities and restore their polar time-odd full-k action.
+
+    COLLECTIVE over ``mesh``: the parent rows are read through SlabIO, each
+    rank its band tile (``file_io.restart_bundle.read_dipole_parent_window``).
+    """
     from symmetry_maps import unfold_file_wedge_polar_matrix
 
     # Fail before the host read and every sharded head allocation.  Shape does
@@ -3671,7 +3674,7 @@ def read_authenticated_dipole_velocity(
     b0, b4 = int(meta.b_id_0), int(meta.b_id_4_chi_user)
     from file_io.restart_bundle import read_dipole_parent_window
     parents = read_dipole_parent_window(
-        dipole_path, sym.kirr_fullids, b0, b4, nk_full=sym.nk_tot)
+        dipole_path, sym.kirr_fullids, b0, b4, nk_full=sym.nk_tot, mesh=mesh)
     return np.moveaxis(unfold_file_wedge_polar_matrix(sym, parents), 1, 0)
 
 
@@ -3737,7 +3740,7 @@ def build_dft_head_response(
                 "head_correction=full requires dipole.h5 to build the direct "
                 f"head and wings; missing {dipole_path}.")
         velocity_cart = read_authenticated_dipole_velocity(
-            dipole_path, wfn=wfn, meta=meta, config=config,
+            dipole_path, wfn=wfn, meta=meta, config=config, mesh=mesh,
             wfn_fingerprint_binding=wfn_fingerprint_binding)
     else:
         velocity_cart = parts["velocity_cart"]

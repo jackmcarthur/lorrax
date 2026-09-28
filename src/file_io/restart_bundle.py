@@ -2313,16 +2313,51 @@ def read_dipole_cv_block(path, *, nelec: int, mesh: Mesh):
                    out_shardings=(rep, rep))(v, e)
 
 
-def read_dipole_parent_window(path, parent_rows, band_start, band_stop, *, nk_full):
-    """Return parent-indexed Cartesian velocity blocks (parent, cart, band, band)."""
+def read_dipole_parent_window(path, parent_rows, band_start, band_stop, *,
+                              nk_full, mesh: Mesh):
+    """Parent-indexed Cartesian velocity blocks ``(parent, cart, band, band)``.
+
+    Read through SlabIO: one collective read of the parent rows, in which each
+    rank reads only its share of the band rows, then one all-gather of the
+    ``(3, n_parent, nb, nb)`` window.  The return is a host array on every
+    rank, element for element the h5py slice it replaces.  Before, every rank
+    read the whole window itself (``3 n_parent nb^2 16`` B per rank; the Fe
+    8^3 P64 head read it on 64 ranks, claim 2592).  COLLECTIVE over ``mesh``.
+    """
+    from runtime.padding import padded_axis
+    from .slab_io import SlabIO
     with h5py.File(path, "r") as f:
-        velocity = f["dipole_cart"]
-        if velocity.shape[1] != int(nk_full):
-            raise ValueError(
-                "dipole_cart must retain its full-BZ file indexing; "
-                f"got {velocity.shape[1]} rows, want {nk_full}")
-        return np.stack([velocity[:, int(row), band_start:band_stop,
-                                  band_start:band_stop] for row in parent_rows])
+        _, nk_file, nb_file, _ = f["dipole_cart"].shape
+    if nk_file != int(nk_full):
+        raise ValueError(
+            "dipole_cart must retain its full-BZ file indexing; "
+            f"got {nk_file} rows, want {nk_full}")
+    b0, b1 = int(band_start), int(band_stop)
+    if not 0 <= b0 < b1 <= int(nb_file):
+        raise ValueError(
+            f"dipole band window [{b0},{b1}) outside the file's {nb_file} bands")
+    rows = np.asarray(parent_rows, dtype=np.int64).reshape(-1)
+    # read_slabs wants disjoint windows in ascending file order.
+    order = np.argsort(rows, kind="stable")
+    sorted_rows = rows[order]
+    if sorted_rows.size and np.any(np.diff(sorted_rows) == 0):
+        raise ValueError("dipole parent rows must be distinct")
+    nb = b1 - b0
+    xy = tuple(mesh.axis_names)
+    nbp = int(padded_axis(nb, mesh, name="dipole parent band rows").carrier)
+    offsets = np.asarray([(0, int(r), b0, b0) for r in sorted_rows], np.int64)
+    valid = np.asarray([(3, 1, nb, nb)] * len(sorted_rows), np.int64)
+    with SlabIO(path, mode="r", mesh=mesh) as io:
+        v = io.read_slabs("dipole_cart", shape=(3, 1, nbp, nb),
+                          offsets=offsets, valid_shapes=valid,
+                          partition_spec=P(None, None, xy, None),
+                          window_axis=1, dtype=np.complex128)
+    rep = NamedSharding(mesh, P())
+    v = jax.jit(lambda a: a[:, :, 0, :nb, :], out_shardings=rep)(v)
+    window = np.asarray(v.addressable_data(0))          # (3, n_parent, nb, nb)
+    out = np.empty((len(rows), 3, nb, nb), dtype=np.complex128)
+    out[order] = np.moveaxis(window, 1, 0)
+    return out
 
 
 def load_kin_ion_submatrix(
