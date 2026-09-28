@@ -7,6 +7,7 @@ and stream-handle ownership stay in this module and its I/O services.
 """
 from __future__ import annotations
 
+import functools
 import glob
 import json
 import os
@@ -2313,6 +2314,13 @@ def read_dipole_cv_block(path, *, nelec: int, mesh: Mesh):
                    out_shardings=(rep, rep))(v, e)
 
 
+@functools.lru_cache(maxsize=8)
+def _parent_window_gather(nb: int, mesh: Mesh):
+    """Compiled crop + all-gather of :func:`read_dipole_parent_window`'s read, per ``(nb, mesh)``."""
+    return jax.jit(lambda a: a[:, :, 0, :nb, :],
+                   out_shardings=NamedSharding(mesh, P()))
+
+
 def read_dipole_parent_window(path, parent_rows, band_start, band_stop, *,
                               nk_full, mesh: Mesh):
     """Parent-indexed Cartesian velocity blocks ``(parent, cart, band, band)``.
@@ -2323,11 +2331,17 @@ def read_dipole_parent_window(path, parent_rows, band_start, band_stop, *,
     rank, element for element the h5py slice it replaces.  Before, every rank
     read the whole window itself (``3 n_parent nb^2 16`` B per rank; the Fe
     8^3 P64 head read it on 64 ranks, claim 2592).  COLLECTIVE over ``mesh``.
+
+    Bytes per rank: the file read is ``48 n_parent nbp nb / P`` (``nbp`` = nb
+    rounded up to P); the gathered device window and the host return are
+    ``48 n_parent nb^2`` each, transient.  The caller's full-BZ unfold,
+    ``48 nk_tot nb^2``, is the larger object.
     """
     from runtime.padding import padded_axis
+    from .dipole import DIPOLE_DATASET
     from .slab_io import SlabIO
     with h5py.File(path, "r") as f:
-        _, nk_file, nb_file, _ = f["dipole_cart"].shape
+        _, nk_file, nb_file, _ = f[DIPOLE_DATASET].shape
     if nk_file != int(nk_full):
         raise ValueError(
             "dipole_cart must retain its full-BZ file indexing; "
@@ -2348,16 +2362,28 @@ def read_dipole_parent_window(path, parent_rows, band_start, band_stop, *,
     offsets = np.asarray([(0, int(r), b0, b0) for r in sorted_rows], np.int64)
     valid = np.asarray([(3, 1, nb, nb)] * len(sorted_rows), np.int64)
     with SlabIO(path, mode="r", mesh=mesh) as io:
-        v = io.read_slabs("dipole_cart", shape=(3, 1, nbp, nb),
+        v = io.read_slabs(DIPOLE_DATASET, shape=(3, 1, nbp, nb),
                           offsets=offsets, valid_shapes=valid,
                           partition_spec=P(None, None, xy, None),
                           window_axis=1, dtype=np.complex128)
-    rep = NamedSharding(mesh, P())
-    v = jax.jit(lambda a: a[:, :, 0, :nb, :], out_shardings=rep)(v)
+    v = _parent_window_gather(nb, mesh)(v)
     window = np.asarray(v.addressable_data(0))          # (3, n_parent, nb, nb)
     out = np.empty((len(rows), 3, nb, nb), dtype=np.complex128)
     out[order] = np.moveaxis(window, 1, 0)
     return out
+
+
+def dipole_operator_mismatches(path, *, skip_vnl, vnl_mode, vnl_velocity_sign):
+    """``[(stamp, file value, run value)]`` for the velocity-operator stamps of
+    ``dipole.h5`` that differ from the run's; an absent stamp counts as different
+    (the operator that built the file cannot be named).  Empty when all agree."""
+    from psp.get_dipole_mtxels import _prov_ne
+    want ={"prov_skip_vnl": skip_vnl, "prov_vnl_mode": vnl_mode,
+            "prov_vnl_velocity_sign": vnl_velocity_sign}
+    with h5py.File(str(path), "r") as h5:
+        attrs = {k: h5.attrs[k] for k in want if k in h5.attrs}
+    return [(k, attrs.get(k, "<absent>"), v) for k, v in want.items()
+            if k not in attrs or _prov_ne(attrs[k], v)]
 
 
 def load_kin_ion_submatrix(
