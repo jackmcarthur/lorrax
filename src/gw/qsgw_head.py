@@ -3329,6 +3329,28 @@ def finalize_iteration_head_samples(
     )
 
 
+def _extra_chi_rows(extras, intraband):
+    """Every screened row's ``chi_extra`` [Z, n] on one mini-BZ batch ``q`` [n, 3], or None.
+
+    ``extras[i]`` is None, ``("lindhard", z)`` (the Fermi-surface Lindhard
+    term at z) or ``("constant", c)``; all Lindhard rows come from one
+    program per batch (``FermiSurfaceIntraband.density_response_rows``).
+    """
+    if all(e is None for e in extras):
+        return None
+    lindhard = [i for i, e in enumerate(extras) if e is not None and e[0] == "lindhard"]
+    zs = [extras[i][1] for i in lindhard]
+    constant = np.asarray([e[1] if e is not None and e[0] == "constant" else 0.0
+                           for e in extras], dtype=np.complex128)
+
+    def rows(q):
+        out = jnp.broadcast_to(jnp.asarray(constant)[:, None], (len(extras), q.shape[0]))
+        if lindhard:
+            out = out.at[np.asarray(lindhard)].set(intraband.density_response_rows(q, zs))
+        return out
+    return rows
+
+
 def head_samples_from_s(
     S_cart_omega,
     omegas_ry,
@@ -3397,14 +3419,12 @@ def head_samples_from_s(
             drude = np.asarray(intraband_drude, dtype=np.complex128)
             if abs(z) > 1.0e-15:
                 S = S - drude / (z * z)
-            extra_chi = (lambda q, _z=z, _atoms=intraband:
-                         _atoms.density_response(q, _z))
+            extra_chi = ("lindhard", z)
         elif is_static_metal and intraband is not None:
             # The folded static slot is the z -> 0+ limit of the same cell
             # function: interband q.S(0).q (epsilon_inf) plus Thomas-Fermi,
             # <8 pi / (q.eps_inf.q + kappa^2)>, never <8 pi/(q^2+kappa^2)>.
-            extra_chi = (lambda q, _n=float(static_kappa2_bohr2) / (8.0 * np.pi):
-                         jnp.full((q.shape[0],), -_n, dtype=jnp.complex128))
+            extra_chi = ("constant", -float(static_kappa2_bohr2) / (8.0 * np.pi))
         static_from_s = is_static_metal and intraband is not None
         rows.append(("screened" if (static_from_s or not is_static_metal)
                      else "kappa2", z, S, extra_chi, is_static_metal))
@@ -3413,8 +3433,9 @@ def head_samples_from_s(
     if screened:
         vc0, wcoul0 = compute_q0_averages_screened(
             wfn, meta, [rows[i][2] for i in screened],
-            extra_chis=[rows[i][3] for i in screened],
+            extra_chi_rows=_extra_chi_rows([rows[i][3] for i in screened], intraband),
             analytic_sphere=analytic_sphere)
+        vc0 = complex(vc0)
         averages.update(zip(screened, ((vc0, w) for w in wcoul0)))
     for i, row in enumerate(rows):
         if row[0] == "kappa2":

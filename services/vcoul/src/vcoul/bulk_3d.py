@@ -14,6 +14,26 @@ from vcoul.minibz import (_sample_q0_minibz_qpoints, minibz_average,
 __all__ = ["Bulk3D"]
 
 
+def _isotropic_vq(qcart):
+    """Bare ``v(q) = 8 pi/|q|^2`` at every row of ``qcart (n,3)``."""
+    denom = jnp.einsum("ij,ij->i", qcart, qcart)
+    return 8.0 * jnp.pi / denom
+
+
+@jax.jit
+def _screened_rows(rq, S, extra):
+    """``<v / (1 - v (q.S_z.q + chi_z(q)))>`` over one draw batch for every row z: [Z].
+
+    ``S`` [Z,3,3]; ``extra`` [Z,n] (the rows' ``chi_extra`` on this batch) or
+    None. One program per batch replaces one eager chain per row and batch.
+    """
+    vq = _isotropic_vq(rq).astype(jnp.complex128)[None]
+    qSq = jnp.einsum("qi,zij,qj->zq", rq, S, rq)
+    if extra is not None:
+        qSq = qSq + extra
+    return jnp.mean(vq / (1.0 - vq * qSq), axis=-1)
+
+
 class Bulk3D:
     sys_dim = SysDim.BULK_3D
 
@@ -40,8 +60,7 @@ class Bulk3D:
         return v_qG_single(self, geometry, qvec_wrapped, comps_qG)
 
     def _vq_isotropic(self, qcart):
-        denom = jnp.einsum("ij,ij->i", qcart, qcart)
-        return 8.0 * jnp.pi / denom
+        return _isotropic_vq(qcart)
 
     def q0_average(
         self, geometry: CoulombGeometry, kgrid, *,
@@ -85,7 +104,8 @@ class Bulk3D:
             return vc0_mean.astype(jnp.complex128), wcoul0.astype(jnp.complex128)
 
         if S_cart is not None:
-            wcoul0 = self._screened_mean(batches, None, S_cart, extra_chi)
+            rows = None if extra_chi is None else (lambda rq: extra_chi(rq)[None])
+            wcoul0 = self._screened_means(batches, [S_cart], rows)[0]
             return vc0_mean.astype(jnp.complex128), wcoul0.astype(jnp.complex128)
 
         # Isotropic Ismail-Beigi gamma fallback (epshead-driven).  Kept for
@@ -122,27 +142,23 @@ class Bulk3D:
         means = [jnp.mean(self._vq_isotropic(rq)) for rq in batches]
         return jnp.mean(jnp.stack(means))
 
-    def _screened_mean(self, batches, vqs, S_cart, extra_chi):
-        """Anisotropic screened ``w0 = <v / (1 - v (q.S.q + chi_extra(q)))>``, mean of batch means.
+    def _screened_means(self, batches, S_carts, extra_chi_rows):
+        """Anisotropic screened ``w0 = <v / (1 - v (q.S.q + chi_extra(q)))>`` of every row, mean of batch means: [Z].
 
-        ``vqs`` (the complex ``v(q)`` of each batch) may be given to share it
-        across calls on one draw; the arithmetic per batch is the same either way.
+        ``extra_chi_rows(rq)`` returns every row's ``chi_extra`` [Z, n] on one
+        batch, or is None. One program per batch serves all rows.
         """
-        S = jnp.asarray(S_cart, dtype=jnp.complex128)
-        wmeans = []
-        for i, rq in enumerate(batches):
-            vq = (self._vq_isotropic(rq).astype(jnp.complex128)
-                  if vqs is None else vqs[i])
-            qSq = jnp.einsum('qi,ij,qj->q', rq, S, rq)
-            if extra_chi is not None:
-                qSq = qSq + extra_chi(rq)
-            wmeans.append(jnp.mean(vq / (1.0 - vq * qSq)))
-        return jnp.mean(jnp.stack(wmeans))
+        S = jnp.asarray(np.stack([np.asarray(S, np.complex128) for S in S_carts]))
+        means = []
+        for rq in batches:
+            rq = jnp.asarray(rq)
+            means.append(_screened_rows(rq, S, None if extra_chi_rows is None else extra_chi_rows(rq)))
+        return jnp.mean(jnp.stack(means), axis=0)
 
     def q0_average_screened(
         self, geometry: CoulombGeometry, kgrid, *,
         S_carts,
-        extra_chis=None,
+        extra_chi_rows=None,
         nsamples: int = 2**18,
         method: str = "sobol",
         qmc_reps: int = 10,
@@ -150,30 +166,23 @@ class Bulk3D:
     ):
         """``q0_average`` at many screened tensors on one draw: ``(vc0_mean, [wcoul0])``.
 
-        Row ``i`` equals ``q0_average(S_cart=S_carts[i], extra_chi=extra_chis[i])``
-        bit for bit: the same draw and the same per-batch arithmetic.  The draw
-        crosses to the device once and ``<v>`` and ``v(q)`` are evaluated once,
-        instead of once per row (a metal head has ~20 rows per SC map).  The
-        device copy of the draw (``qmc_reps x nsamples x 3`` float64, 63 MB at
-        the defaults) lives only for this call.
+        ``extra_chi_rows(rq)`` returns every row's ``chi_extra`` [Z, n] on one
+        draw batch (None: no extra term). Each draw batch is one program for
+        all rows (a metal head has ~20 rows per SC map), so row ``i`` equals
+        ``q0_average(S_cart=S_carts[i], extra_chi=...)`` up to round-off (the
+        same draw and terms, regrouped sums). The device copy of the draw
+        (``qmc_reps x nsamples x 3`` float64, 63 MB at the defaults) and one
+        batch's [Z, n] complex rows live only for this call.
         """
         nkx, nky, nkz = (int(s) for s in kgrid)
-        S_carts = list(S_carts)
-        extra_chis = ([None] * len(S_carts) if extra_chis is None
-                      else list(extra_chis))
-        if len(extra_chis) != len(S_carts):
-            raise ValueError("q0_average_screened: one extra_chi per S_cart")
         batches = _sample_q0_minibz_qpoints(
             geometry, (nkx, nky, nkz), nsamples=nsamples, method=method,
             qmc_reps=qmc_reps, analytic_sphere=analytic_sphere, is_2d=False,
         )
         vc0_mean = self._vc0_mean(geometry, (nkx, nky, nkz), batches,
                                   analytic_sphere).astype(jnp.complex128)
-        device = [jnp.asarray(b) for b in batches]
-        vqs = [self._vq_isotropic(rq).astype(jnp.complex128) for rq in device]
-        wcoul0 = [self._screened_mean(device, vqs, S, chi).astype(jnp.complex128)
-                  for S, chi in zip(S_carts, extra_chis)]
-        return vc0_mean, wcoul0
+        wcoul0 = self._screened_means(batches, list(S_carts), extra_chi_rows)
+        return vc0_mean, list(np.asarray(wcoul0, dtype=np.complex128))
 
     def q0_average_transverse_tensor(
         self, geometry: CoulombGeometry, kgrid, *,
