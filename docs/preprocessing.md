@@ -26,6 +26,8 @@ Then, from `WFN.h5`, LORRAX's own three preprocessing steps produce `centroids_f
 `dipole.h5` and `kin_ion.h5` — see
 [Quickstart → Your first real calculation](quickstart.md#your-first-real-calculation),
 **including the three defects in that chain you should know about before you run it.**
+A WFN with every band of the plane-wave basis comes from the QE `.save` through
+[`psp.run_dense_h`](how-to/complete-basis-wfn.md).
 
 ## 1. What `WFN.h5` must contain — *verified*
 

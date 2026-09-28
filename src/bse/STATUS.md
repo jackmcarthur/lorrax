@@ -13,32 +13,8 @@
 
 ## Modules
 
-Absorption / eigensolvers (the 2026-04 arc, validated vs BGW below):
-
-| File | Role | Status |
-|---|---|---|
-| `bse_jax.py`            | CLI entry, sharded driver, `_preview_lanczos` | working; `--n-reorth -1` (full reorth) is the right default for spinor BSE |
-| `bse_ring_comm.py`      | shard_map + ppermute / all-gather matvec | **no longer the eigensolve matvec.** The TDA `build_bse_ring_matvec` is deleted (2026-09-24): FEAST bounds, KPM and pseudopoles use the stack, and the dense references are the TDA oracle.  `build_bse_ring_matvec_full` stays: it is the non-TDA `_materialize_A_B` oracle, the equality gates' twin, and the screening (w_bse) path |
-| `bse_lanczos.py`        | `solve_bse_sharded` Lanczos / block-Lanczos / convergence-driven | works; ghost eigenvalues at high N without full reorth. Reorthogonalisation is **CGS2 by default** since 2026-08-08 (`LORRAX_LANCZOS_REORTH`; `mgs` is the legacy fallback) |
-| `bse_stack_matvec.py`   | batched trial-stack matvec, one T-tensor regardless of `n_trials`; also the non-TDA fused pair applier | **THE matvec.** Every sharded solve (Lanczos / block-Lanczos / Davidson / FEAST) applies H through it. `build_bse_stack_pair_matvec` adds the coupling block as one fused program (1.83× predicted over two ring applies) |
-| `bse_nontda.py`         | structure-preserving non-TDA (full-BSE) eigensolver | working; dense build **3.30× faster** and guarded by a restart-reciprocity **preflight** that refuses a stale W before the O(N²) build. `solver="matrixfree"` (SDY Alg. 4) is opt-in and refuses on a sharded mesh |
-| `bse_feast.py`          | FEAST contour-integration eigensolver | see `context/feast_accuracy_notes.md` |
-| `bse_kpm.py`            | KPM Chebyshev moments → BSE density of states | working |
-| `bse_pseudopoles.py`    | FEAST-based pseudopole construction, density-biased seeds | working |
-| `bse_io.py`             | restart-bundle reader, padding utils, `write_eigenvectors_stream` | writer is BGW-compliant (see "Index ordering" below); also `pad_W_R_to_grid` / `bse_k_grid` coarse→fine |
-| `absorption_common.py`  | h5 readers + Lorentzian + JDOS + Kramers-Kronig + BGW-format `.dat` writers | working. **The single site** for the three formulas both drivers share: `exciton_dipole_projections` (the ⟨0\|r̂\|S⟩ contraction), `lorentzian_broaden`, and `jdos_from_transitions` (the 4th `absorption_*.dat` column). The two drivers and `eigvals_to_eps2` each carried their own copy of the last two until 2026-08-11 |
-| `absorption_eigvecs.py` | ε₂(ω) via Σ_S \|⟨0\|r̂\|S⟩\|²·L (sum-over-states) | working |
-| `absorption_haydock.py` | ε₂(ω) via continued fraction on (α_n, β_n), no eigvecs; the three polarisations are the stack matvec's trial block (C10, 2026-09-24) | *the* method to use vs BGW |
-| `eigenvectors.h5.spec`  | BGW spec, kept verbatim | reference |
-
-Finite-/arbitrary-Q and screened-W (the 2026-07 arc — see EXCITON_BANDS.md):
-
-| File | Role | Status |
-|---|---|---|
-| `vq_interp.py`          | arbitrary-Q bare-exchange tile `V_Q`, F-scheme + b26p | working; `build_vq_evaluator` is the entry point |
-| `exciton_bands.py`      | `E_S(Q)` along a Q path, finite-momentum TDA | working; single-compile `lax.scan`, `--extra-q` for the symmetry gate |
-| `w_omega_chain.py`      | full-frequency `W_q(ω)` via one block-Lanczos chain | working |
-| `bse_w_exact.py`        | exact `W_c(ω)` by shifted solves on the non-TDA RPA resolvent | cross-validation reference |
+The modules, the matvec, the solvers and the refusals are on
+[`docs/architecture/bse.md`](../../docs/architecture/bse.md).
 
 ## Index ordering — read this BEFORE comparing to BGW
 
@@ -137,11 +113,6 @@ lx run -N 1 -G 4 -n 4 -- env PYTHONPATH="$SOURCE_PATH" \
     --eqp <bgw_eqp.dat> --dipole dipole.h5 \
     --V-cell <V_bohr3> --n-iter 200 --eta-eV 0.15 --no-eps1
 
-# Absorption — eigenvector route (per-state oscillator strengths to BGW eigenvalues.dat format)
-lx run -N 1 -G 1 -n 1 -- env PYTHONPATH="$SOURCE_PATH" \
-  python3 -u -m bse.absorption_eigvecs \
-    --eigenvectors eigenvectors.h5 --dipole dipole.h5 \
-    --n-occ <Nocc> --V-cell <V_bohr3> --eta-eV 0.15 --no-eps1
 ```
 
 The payload-side source path is load-bearing on Perlmutter; use the runtime

@@ -111,8 +111,8 @@ The valence window (bands 1–8) carries the largest error at every \(N_\mu\), b
 
 ## Out to the complete basis
 
-A 460-band NSCF stops at B = 412, 36 % of the spinor basis. `psp.run_dense_h`
-diagonalizes the dense \(H_{\mathbf k}(sG,s'G')\) on each k's whole 25 Ry sphere
+A 460-band NSCF stops at B = 412, 36 % of the spinor basis.
+[`psp.run_dense_h`](../how-to/complete-basis-wfn.md) diagonalizes the dense \(H_{\mathbf k}(sG,s'G')\) on each k's whole 25 Ry sphere
 (1074–1176 states per k) and writes the first 1074 bands, which is every state
 at Γ. The exact Σ_x above, recomputed on that WFN, matches the 460-band
 reference on bands 1–412 to 0.002 meV (claim 2865).

@@ -29,8 +29,8 @@ Upstream source inspected: https://github.com/sail-sg/jax_xc at
 60c3eadeca710fede723bd449512fd12c9e9181b. Published wheel version: 0.0.11.
 The scalar-grid adapter sums unpolarized PBE exchange and correlation,
 vectorizes scalar kernels, and converts Hartree/electron to Ry/electron.
-It preserves the existing scalar XC model; spin-dependent magnetic XC is
-outside this adapter's contract.
+`pbe_functional_polarized` evaluates the spin-polarized kernels of the same two
+functionals for the noncollinear magnetic V_xc (`psp.xc.compute_V_xc_noncollinear`).
 
 Focused numerical test: `tests/test_xc_pbe.py` (requires patched dependency).
 Independent QE total-potential equivalence must be checked separately from
