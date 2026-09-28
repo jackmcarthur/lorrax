@@ -1,9 +1,11 @@
 """Band classes and Hamiltonian masks.
 
-Dynamic SC protects the requested DFT bands, counted from E_F at each k and
-closed outward to spectral gaps resolved at eta. Other bands rotate through
-their couplings to protected bands, with a DFT-plus-side-scissor diagonal and
-no rotating–rotating mixing.
+Dynamic SC protects the requested DFT bands, counted from E_F at each k,
+closed outward to spectral gaps resolved at eta and clipped to mu +- 10 eV
+(closed over degeneracies); the deck omega endpoints only enlarge the set.
+Other bands rotate through their couplings to protected bands, with an
+own-energy far-patch diagonal (side scissor where no patch covers the state)
+and no rotating-rotating mixing.
 The legacy three-mask helper below serves fixed-Sigma EQP2 only.
 """
 
@@ -23,7 +25,8 @@ import jax.numpy as jnp
 # ---------------------------------------------------------------------------
 
 def requested_band_mask(energies_ev, *, n_occ, nval, ncond, gap_ev, mu_ev=None,
-                        range_ev=None, range_mu_ev=None):
+                        range_ev=None, range_mu_ev=None, clip_ev=None,
+                        degeneracy_tol_ev=None):
     """Requested bands closed to the next resolved spectral gap at each k.
 
     ``nval``/``ncond`` count states below/above the Fermi level at each k.
@@ -35,6 +38,14 @@ def requested_band_mask(energies_ev, *, n_occ, nval, ncond, gap_ev, mu_ev=None,
     None), relative to ``range_mu_ev``, only enlarges the set: every state in
     it is protected, closed over its eta-resolved manifold. Only the initial
     DFT ladder is classified. The work is O(nk nb), with no axis loop.
+
+    ``clip_ev`` (SC only): a requested state farther than ``clip_ev`` from
+    ``range_mu_ev`` is not protected; it rotates and is still reported, its
+    energy read from the far patches. The clip is closed over exact
+    degeneracies (``degeneracy_tol_ev``) so it never cuts a multiplet, and
+    the automatic-promotion gate looks only at request edges inside the clip.
+    ``range_ev`` states are added after the clip: the deck endpoints only
+    enlarge the protected set.
     """
     e = np.asarray(energies_ev, float)
     nk, nb = e.shape
@@ -57,6 +68,11 @@ def requested_band_mask(energies_ev, *, n_occ, nval, ncond, gap_ev, mu_ev=None,
     upper = np.max(np.where(protected, e, -np.inf), axis=1)
     rows = np.arange(nk)
     promotion = np.maximum(e[rows, lo] - lower, upper - e[rows, hi - 1])
+    if clip_ev is not None:
+        rel_edge = lambda x: np.abs(x - float(range_mu_ev)) <= float(clip_ev)
+        promotion = np.maximum(
+            np.where(rel_edge(e[rows, lo]), e[rows, lo] - lower, 0.0),
+            np.where(rel_edge(e[rows, hi - 1]), upper - e[rows, hi - 1], 0.0))
     if np.any(promotion > SUPPORT_PAD_EV):
         k = int(np.argmax(promotion))
         raise ValueError(
@@ -64,6 +80,18 @@ def requested_band_mask(energies_ev, *, n_occ, nval, ncond, gap_ev, mu_ev=None,
             f"eta-resolved gap at k={k} requires {promotion[k]:.6f} eV, "
             f"beyond the {SUPPORT_PAD_EV:g} eV automatic-promotion limit; "
             "increase nval/ncond explicitly to include that manifold.")
+    if clip_ev is not None:
+        inside = protected & (np.abs(e - float(range_mu_ev)) <= float(clip_ev))
+        from common.band_degeneracy import DEGENERACY_TOL_RY
+        from common.units import RYD_TO_EV
+        tol = (DEGENERACY_TOL_RY * RYD_TO_EV if degeneracy_tol_ev is None
+               else float(degeneracy_tol_ev))
+        degenerate = np.cumsum(np.concatenate((np.zeros((nk, 1), bool),
+                                               np.diff(e, axis=1) > tol), axis=1), axis=1)
+        hit = np.zeros((nk, nb + 1), bool)
+        np.put_along_axis(hit, np.where(inside, degenerate, nb), True, axis=1)
+        hit[:, nb] = False
+        protected = protected & np.take_along_axis(hit, degenerate, axis=1)
     if range_ev is not None and any(x is not None for x in range_ev):
         lo_ev = -np.inf if range_ev[0] is None else float(range_ev[0])
         hi_ev = np.inf if range_ev[1] is None else float(range_ev[1])

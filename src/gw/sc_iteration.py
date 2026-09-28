@@ -2626,10 +2626,16 @@ class SCSupport(NamedTuple):
 
 
 def _sc_sampled_support(inputs, partition, energies_loop, mu_ev):
-    """Plan once on protected inputs; retain that grid on every later map."""
+    """Plan once on protected inputs at map 0; hold that grid; refuse an escape.
+
+    Owner ruling Q5 (2026-09-28): a protected state whose read stencil leaves
+    the held support refuses by name (``GATE sigma_plan_escape``). There is no
+    clamp and no rebuild.
+    """
     if not inputs.config.compute_mode.is_dynamic:
         return None
-    from .qp_support import plan_support_ev, requested_states, clamped_reads
+    from .qp_support import (SUPPORT_PAD_EV, clamped_reads, plan_support_ev,
+                             requested_states)
     sigma = inputs.config.sigma
     session = inputs.fixed_quadrature_session
     deck = np.asarray(inputs.config.omega_grid_ev, dtype=float)
@@ -2637,19 +2643,26 @@ def _sc_sampled_support(inputs, partition, energies_loop, mu_ev):
     energy = energies_loop - mu_ev
     states = requested_states(energy, part.protected_mask)
     if session is None or "omega_grid_ev" not in session:
-        rebuilding = bool(session and session.get("convergence_rebuilds"))
-        grid, envelope = plan_support_ev(
-            sigma, energy, states, outer_pad_ev=0. if rebuilding else 2.,
-            support_floor_ev=session["rebuild_floor_ev"] if rebuilding else ())
-        event = "rebuild" if rebuilding else "one-shot" if session is None else "plan"
+        grid, envelope = plan_support_ev(sigma, energy, states,
+                                         outer_pad_ev=SUPPORT_PAD_EV)
+        event = "one-shot" if session is None else "plan"
     else:
         grid = np.asarray(session["omega_grid_ev"], float)
         envelope = session["support_envelope_ev"]
         event = "hold"
     outside = clamped_reads(energy, states, grid)
-    if session is not None:
-        session["outside_plan"] = ([f"{int(outside.sum())} protected read stencils "
-                                    "outside the omega support"] if outside.any() else [])
+    if outside.any():
+        ks, ns = np.nonzero(outside)
+        worst = int(np.argmax(np.maximum(grid[0] - energy[ks, ns],
+                                         energy[ks, ns] - grid[-1])))
+        raise ValueError(
+            f"GATE sigma_plan_escape: {int(outside.sum())} protected read "
+            f"stencils left the Sigma support [{grid[0]:+.3f}, {grid[-1]:+.3f}] eV "
+            f"planned at SC map 0 (event {event}); worst: k={int(ks[worst])} "
+            f"identity band={int(ns[worst]) + int(inputs.band_slices.b0) + 1} at "
+            f"E-mu={float(energy[ks[worst], ns[worst]]):+.4f} eV. The plan is held "
+            "with no clamp and no rebuild (owner ruling 2026-09-28); protect fewer "
+            "edge states (nval/ncond, sigma_omega_min_ev/max_ev) or widen them.")
     return SCSupport(deck, grid, energy, states, event, envelope, outside)
 
 
@@ -2660,7 +2673,7 @@ def _record_sc_window_plan(inputs, iteration, support):
                f"[{grid[0]:+.6f}, {grid[-1]:+.6f}] eV; "
                f"protected={int(support.requested.sum())}; "
                f"clamped_stencils={int(support.clamped_kn.sum())}; "
-               "initial outer pad=2.00 eV; no repeated pad; fixed-point check pending")
+               "outer pad 2.00 eV at map 0, then held; an escape refuses")
 
 
 def _fit_sum_band_tail(fit_kwargs, fit_mask_kn, sigma0_kn, z_kn=None):
@@ -2787,19 +2800,30 @@ def _classify_sc_partition(
             "no band enters or leaves the set for the rest of the loop.")
     else:
         from .band_partition import requested_band_mask
-        protected = requested_band_mask(
-            e_reference_loop, n_occ=int(inputs.meta.nelec),
+        from .qp_support import WINDOW_CLIP_EV
+        classify = dict(
+            n_occ=int(inputs.meta.nelec),
             nval=inputs.config.nval, ncond=inputs.config.ncond,
             gap_ev=inputs.config.sigma.regularization_ev,
             mu_ev=mu_ev if inputs.material_class == "metal" else None,
-            range_ev=(inputs.config.sigma.omega_min_ev, inputs.config.sigma.omega_max_ev),
             range_mu_ev=(mu_ev if inputs.material_class == "metal" else 0.5 * (
                 float(np.max(e_reference_loop[:, int(inputs.meta.nelec) - 1]))
                 + float(np.min(e_reference_loop[:, int(inputs.meta.nelec)])))))
+        # THE PARTITION (owner scheme 2026-09-28): the requested states within
+        # mu +- WINDOW_CLIP_EV, closed over degeneracies, plus every state in
+        # the deck's omega endpoints. A requested state outside rotates and
+        # is still reported; its energy is read from the far patches.
+        protected = requested_band_mask(
+            e_reference_loop, **classify,
+            range_ev=(inputs.config.sigma.omega_min_ev, inputs.config.sigma.omega_max_ev),
+            clip_ev=WINDOW_CLIP_EV,
+            degeneracy_tol_ev=float(inputs.config.sc.exact_degeneracy_tol_ev))
         partition = BandPartition(jnp.asarray(protected), jnp.asarray(protected))
         _record_sc(inputs, f"SC band classes: {int(protected.sum())} protected / "
-                   f"{int((~protected).sum())} rotating; nval/ncond request "
-                   "closed to the next eta-resolved spectral gap")
+                   f"{int((~protected).sum())} rotating (k,state); requested "
+                   f"states beyond mu +- {WINDOW_CLIP_EV:g} eV rotate and are "
+                   "reported from far patches; nval/ncond closed to the next "
+                   "eta-resolved gap")
     if not ks.is_identity:
         partition = BandPartition(
             protected_mask=ks.broadcast(partition.protected_mask),
@@ -3731,8 +3755,7 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
             # convergence rebuild; no map escape refits a rule.
             session["omega_grid_ev"] = tuple(float(x) for x in expanded_grid)
             session["window_plan"] = {
-                "index": int(session.get("convergence_rebuilds", 0)), "event": event,
-                "iteration": int(state.iteration)}
+                "index": 0, "event": event, "iteration": int(state.iteration)}
         sigma_config = replace(
             inputs.config, sc_omega_grid_ev=tuple(float(x) for x in expanded_grid))
     protected_loop = np.broadcast_to(np.asarray(
@@ -3914,33 +3937,45 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
             inputs.print_fn)
     # The fixed DFT partition owns which endpoint carries dynamic Sigma.
     # Keep protected–rotating couplings; replace only the rotating block.
-    # A rotating diagonal is its DFT energy plus one scissor per side of mu,
-    # the mean QP correction H_ii - E_i of the protected occupied (empty)
-    # states. No rotating state is read at its own energy and none is held
-    # at DFT (deep states take the occupied-side scissor).
+    # Owner ruling Q3 (2026-09-28): a rotating diagonal is its own-energy
+    # read wherever the near support or a far patch covers its current
+    # energy; elsewhere (no patch covers it, or a sector route without
+    # patches) it is its DFT energy plus the side scissor (law A): the mean
+    # QP correction H_ii - E_i of the protected occupied (empty) states.
     from .band_partition import rotating_band_hamiltonian, rotating_diagonal
     target = np.asarray(e_dft_fit, float).copy()
     rotating_loop = ~np.asarray(protected_loop, dtype=bool)
-    if rotating_loop.any() and far_patches:
-        # The rotating diagonal is its own-energy far-patch read; keep it.
-        from .qsgw_utils import static_sigma_diag_to_host
-        target = static_sigma_diag_to_host(H_qp_dft_full, inputs.mesh_xy).real
-        _record_sc(inputs, "    SC rotating diagonal: own-energy far-patch read")
-    elif rotating_loop.any():
+    if rotating_loop.any():
         from .qsgw_utils import static_sigma_diag_to_host
         from .scissor import k_star_weights
-        empty_kn = ~np.asarray(valence_kn, dtype=bool)
-        occupied_kn = np.asarray(valence_kn, dtype=bool)
-        if scissor_classes is not None:
-            empty_kn = empty_kn & ~crossing_kn
-            occupied_kn = occupied_kn & ~crossing_kn
-        target, law = rotating_diagonal(
-            static_sigma_diag_to_host(H_qp_dft_full, inputs.mesh_xy).real,
-            np.asarray(e_dft_fit, float), np.asarray(protected_loop, dtype=bool),
-            below_kn=e_dft_fit_ev < float(_mu_ev),
-            fit_below_kn=occupied_kn, fit_above_kn=empty_kn,
-            k_weights=k_star_weights(ks))
-        _record_sc(inputs, f"    SC rotating diagonal: DFT + side scissor; {law}")
+        own = static_sigma_diag_to_host(H_qp_dft_full, inputs.mesh_xy).real
+        uncovered = rotating_loop
+        if far_patches:
+            from .qp_support import far_patch_covered
+            grid = np.asarray(sc_support.grown, float)
+            beyond = (sc_support.energy < grid[0]) | (sc_support.energy > grid[-1])
+            uncovered = rotating_loop & beyond & ~far_patch_covered(
+                sc_support.energy, far_patches)
+        target = own
+        if uncovered.any():
+            empty_kn = ~np.asarray(valence_kn, dtype=bool)
+            occupied_kn = np.asarray(valence_kn, dtype=bool)
+            if scissor_classes is not None:
+                empty_kn = empty_kn & ~crossing_kn
+                occupied_kn = occupied_kn & ~crossing_kn
+            scissored, law = rotating_diagonal(
+                own, np.asarray(e_dft_fit, float), np.asarray(protected_loop, dtype=bool),
+                below_kn=e_dft_fit_ev < float(_mu_ev),
+                fit_below_kn=occupied_kn, fit_above_kn=empty_kn,
+                k_weights=k_star_weights(ks))
+            target = np.where(uncovered, scissored, own)
+            _record_sc(inputs, f"    SC rotating diagonal: {int(uncovered.sum())} of "
+                       f"{int(rotating_loop.sum())} rotating (k,state) outside every "
+                       f"patch take DFT + side scissor ({law}); the rest read "
+                       "their own energy")
+        else:
+            _record_sc(inputs, f"    SC rotating diagonal: own-energy read on all "
+                       f"{int(rotating_loop.sum())} rotating (k,state)")
     H_qp_dft_new = rotating_band_hamiltonian(
         H_qp_dft_full, jnp.asarray(protected_loop), jnp.asarray(target), inputs.mesh_xy)
 
@@ -5302,9 +5337,9 @@ def _run_anderson(
     model already predicts (Wan & Miedlar 2024).  ``max_iter`` is the number
     of accelerated evaluations after map 0.
 
-    The sampled support and Sigma rules stay fixed during each solve.
-    At convergence, a failed support check permits one rebuild followed by
-    a fresh solve from the accepted input with an empty Anderson history.
+    The sampled support and Sigma rules are planned at map 0 and held; a
+    protected read or rule box that leaves them refuses by name
+    (``GATE sigma_plan_escape``), with no rebuild.
 
     THE STOP RULES.  CONVERGED when the criterion (max|dE| over the
     non-scissored identities, F(H) against H) is below ``tol_ev``.
@@ -5710,15 +5745,6 @@ def _run_anderson(
         print_fn(
             "  SC pad inertness: NOT CHECKED (early stop -- the "
             "check reads the solver's final x, not reached on this path)")
-        from .qp_support import check_fixed_point
-        if stop.verdict.converged and check_fixed_point(inputs.fixed_quadrature_session):
-            _record_sc(inputs, "SC Sigma support: rebuilding once at convergence; "
-                       "discarding the old Anderson history")
-            rebuilt, history = _run_anderson(
-                replace(stop.state, outputs=None, convergence_verdict=None), inputs,
-                max_iter=max_iter, tol_ev=tol_ev, history_depth=history_depth,
-                eigvalsh_kshard=eigvalsh_kshard, print_fn=print_fn, dump_dir=dump_dir)
-            return rebuilt, rms_history + history
         _maybe_dump_e_history(dump_dir, _e_history, print_fn)
         return stop.state, rms_history
 
