@@ -664,6 +664,7 @@ def finalize_dynamic_sigma(
             protected_kn=config.sc_sigma_protected_kn,
             far=sigma_c_far,
             far_kn=getattr(config, "sc_sigma_far_kn", None),
+            zero_kn=getattr(config, "sc_sigma_zero_kn", None),
         )
         print_fn(f"  QSGW: {int(qsgw_diag['n_clipped'])} clipped "
                  f"({100*qsgw_diag['frac_clipped']:.1f}%)"

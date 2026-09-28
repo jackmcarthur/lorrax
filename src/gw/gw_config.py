@@ -4655,6 +4655,9 @@ class LorraxConfig:
     #: Per sorted QP state: 1 reads its endpoints on the held patches
     #: (semicore, and rotating states beyond the near grid).
     sc_sigma_far_kn: object | None = None
+    #: Per sorted QP state: 1 reads Sigma(omega = 0) (semicore under
+    #: ``gw.qp_support.SEMICORE_READ = "sigma0"``).
+    sc_sigma_zero_kn: object | None = None
     #: Held patches: ((lo_ev, hi_ev, eta_ev), ...) about the Sigma frame's
     #: E_F, rotating and semicore, planned once at SC map 0
     #: (``gw.qp_support.plan_sigma_windows``).
