@@ -74,8 +74,15 @@ _GATE_ROWS = {
     "retained_subspace_moments": ("relative M1/M3 identity defect in retained Ritz infinity states P_R x_inf, with P_R Gram-metric orthogonal on span(OZ), after cut and zero policy <= threshold; original q_inf defect is diagnostic", 1.0e-10),
     "held_w": ("held W value/derivative relative defects with coordinates and receipt paths; diagnostic, no universal threshold", None),
     "model_reciprocity": ("at held W/dW samples that are transpose symmetric, the evaluated model preserves transpose symmetry; generic complex Hermitian residues are not required to be real",
-                          # owner 2026-09-22: 1e-10 refused TaAs 8x8x8 roundoff (3.5e-10 at q=58, held data 6e-15)
-                          {"reference_relative_max": 1.0e-12, "model_relative_max": 1.0e-8}),
+                          # 2026-09-28 (PARTITION): the fixed 1e-8 ceiling (owner 2026-09-22,
+                          # after 1e-10 refused TaAs 8x8x8 roundoff at 3.5e-10) refused MoS2
+                          # 3x3 SC map 1 at 2.28e-8, a state-dependent rounding value. The
+                          # ceiling is now the float64 first-order bound of the reduction
+                          # (gw.shared_pole_gates.reciprocity_rounding_bound): the kept Gram
+                          # condition times the held data's own defect plus twice the
+                          # inner-product rounding of length m = max(n, pencil side).
+                          {"reference_relative_max": 1.0e-12,
+                           "model_bound": "kappa_q * (reference_relative + 2 m u / (1 - m u)); kappa_q = kept Gram condition <= 1/normalized_gram_keep; m = max(n, pencil side); u = 2**-53"}),
     "full_m1_defect": ("maximum over q of relative full M1 defect after cut and zero policy; PASS within diagnostic band, WARN outside, never refuse", 2.0e-4),
     "full_m3_defect": ("maximum over q of relative full M3 defect after cut and zero policy; PASS within diagnostic band, WARN outside, never refuse", 2.0e-3),
     # The stored operator is the spin-traced mu x mu charge response on scalar and
@@ -96,6 +103,8 @@ shared_real_pole_gates_v1_r3b = {
 
 # The SC quadrature contract changed independently of all numerical gates.
 shared_real_pole_gates_v1_r3b["sc_rebuild"]["version"] = "sc_quadrature_recertification_20260910"
+# The reciprocity ceiling changed from a fixed number to a derived rounding bound.
+shared_real_pole_gates_v1_r3b["model_reciprocity"]["version"] = "reciprocity_rounding_bound_20260928"
 
 
 for _name, _range in (("full_m1_defect", (2.2e-6, 1.9e-5)),
