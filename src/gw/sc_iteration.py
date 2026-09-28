@@ -2627,6 +2627,7 @@ class SCSupport(NamedTuple):
     near_read: np.ndarray | None = None   # identities read on the near grid this map
     far_read: np.ndarray | None = None    # identities read on the held patches this map
     own_kn: np.ndarray | None = None      # rotating identities read at their own energy (fixed at map 0)
+    zero_read: np.ndarray | None = None   # semicore identities read at Sigma(omega = 0)
 
 
 def _sc_sampled_support(inputs, partition, energies_loop, mu_ev):
@@ -2645,10 +2646,15 @@ def _sc_sampled_support(inputs, partition, energies_loop, mu_ev):
     deck = np.asarray(inputs.config.omega_grid_ev, dtype=float)
     part = _partition_on_loop(partition, inputs)
     energy = energies_loop - mu_ev
+    from .qp_support import SEMICORE_READ
     active = requested_states(energy, part.protected_mask)
     semicore = _sc_semicore_loop(inputs, active.shape)
     states = active & ~semicore               # read on the near grid at the deck eta
     rotating = ~active
+    # SEMICORE_READ = "sigma0": semicore reads Sigma(omega = 0) on the near
+    # grid (no semicore patches, no semicore escape).
+    zero_read = semicore if SEMICORE_READ == "sigma0" else np.zeros_like(semicore)
+    semicore = semicore & ~zero_read
     far_route = (inputs.wfns_transverse is None
                  and inputs.config.compute_mode is ComputeMode.MPA)
     ks = _kstar(inputs)
@@ -2709,10 +2715,10 @@ def _sc_sampled_support(inputs, partition, energies_loop, mu_ev):
             f"{int(ns[worst]) + int(inputs.band_slices.b0) + 1} at "
             f"E-mu={float(energy[ks_[worst], ns[worst]]):+.4f} eV. The plan is held "
             "with no clamp and no rebuild (owner ruling 2026-09-28).")
-    near_read = states | (own & in_grid)
+    near_read = states | zero_read | (own & in_grid)
     far_read = semicore | (own & ~in_grid)
     return SCSupport(deck, grid, energy, states, event, envelope, outside, plan,
-                     near_read, far_read, own)
+                     near_read, far_read, own, zero_read)
 
 
 def _sc_semicore_loop(inputs, shape):
@@ -3885,6 +3891,8 @@ def _gw_iteration_map_once(state: SCState, inputs: SCInputs) -> SCState:
     sigma_config = replace(sigma_config, sc_sigma_protected_kn=_to_sorted(near_loop))
     if sc_support is not None and sc_support.far_read is not None and sc_support.far_read.any():
         sigma_config = replace(sigma_config, sc_sigma_far_kn=_to_sorted(sc_support.far_read))
+    if sc_support is not None and sc_support.zero_read is not None and sc_support.zero_read.any():
+        sigma_config = replace(sigma_config, sc_sigma_zero_kn=_to_sorted(sc_support.zero_read))
     # ROTATING-BAND FAR PATCHES: planned once at map 0 over the rotating DFT
     # energies outside the near support, then held. Each is an independent
     # Sigma delivery at FAR_PATCH_ETA_EV; rotating endpoints (couplings and

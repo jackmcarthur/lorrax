@@ -631,6 +631,7 @@ def build_qsgw_sigma_xc(
     protected_kn=None,
     far=None,
     far_kn=None,
+    zero_kn=None,
 ) -> tuple[jax.Array, dict[str, float]]:
     """Build the static Hermitian QSGW Σ_xc[k, m, n].
 
@@ -706,6 +707,11 @@ def build_qsgw_sigma_xc(
         sigma_x_kij_ry = pad_square(sigma_x_kij_ry, band_axis)
         E = np.asarray(pad_to_axis(
             jnp.asarray(E), band_axis, axis=-1))
+    if zero_kn is not None:
+        # These states read Sigma(omega = 0) (semicore, SEMICORE_READ = "sigma0").
+        zero = np.zeros(E.shape, bool)
+        zero[:, :np.shape(zero_kn)[1]] = np.asarray(zero_kn, bool)
+        E = np.where(zero, 0.0, E)
     if nb != nb2 or sigma_x_kij_ry.shape != (nk, nb, nb):
         raise ValueError(
             f"shape mismatch: sigma_c={sigma_c_omega_ry.shape}, "
