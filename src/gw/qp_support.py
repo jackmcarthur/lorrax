@@ -91,12 +91,14 @@ FAR_PATCH_STEP_EV = 0.5
 #: Outer pad of each far patch about its rotating DFT energies and map-0
 #: estimates (eV). A rotating state whose own-energy fixed point lies outside
 #: its patch flips between the own read and the side scissor from map to map,
-#: and the SC map has no fixed point: Fe 4^3's 3s settles 2.5 eV below its DFT
-#: energy while its map-0 read moves it 0.1 eV, and a 2 eV pad stalled Fe at
-#: 1-6 meV with 1-13 flips per map (PARTITION). A crossing far window's node
-#: count grows by about 2.7 per eV of short side over eta_far, so the wider
-#: pad costs a few pairs per patch.
-FAR_PATCH_PAD_EV = 4.0
+#: and the SC map has no fixed point. The pad must hold that fixed point in
+#: the frame Sigma is read in: on Fe 4^3 the 3s own-energy fixed point lies
+#: 3.3 eV below its DFT energy (the map-0 read moves it 0.1 eV: Sigma's slope
+#: there is near 1 at eta_far = 2 eV), and the metal frame mu moves +1.3 eV,
+#: 4.6 eV in all; 2 and 4 eV pads stalled Fe at 1-6 meV with 1-13 flips per
+#: map (PARTITION). A crossing far window's node count grows by about 2.7 per
+#: eV of short side over eta_far, so the pad costs a few pairs per patch.
+FAR_PATCH_PAD_EV = 6.0
 #: Offset of a far patch's first (last) sample past the near support's top
 #: (bottom) edge (eV): the two grids stay strictly ascending and join with
 #: no uncovered sliver.
