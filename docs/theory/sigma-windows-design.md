@@ -66,8 +66,13 @@ and the SC equations are in [self consistency](../self_consistency.md).
   η_far/2. Far patches join the near plan: each crossing window splits by the
   η of the frequencies it serves and certifies at ε_far = 1e-2
   (`FAR_PATCH_EPS`); sign-definite windows serve far frequencies at the near η.
-- **Held.** No map repads, refits or rebuilds a window. RECIPE3's W line
-  ladder reads this one map-0 support.
+- **Held.** No map repads, refits or rebuilds a window. The plan is one
+  object from one call, `qp_support.plan_sigma_windows` → `SigmaPlan`: the
+  protected support `protected_support_ev` (deck η, 2 eV pad and Z stencil
+  included) and the far patches `far_patches_ev` with their `far_eta_ev`. The
+  SC map carries it as `SCSupport.plan` and the session's `"sigma_plan"`;
+  the W sampling ladder reads it there. At map 0 the W of the probe pass is
+  built before the probe's plan exists; maps ≥ 1 read the held plan.
 - **Escape refuses** (ruling Q5). A protected state whose Σ read (its
   current energy) leaves the held support refuses with
   `GATE sigma_plan_escape`, naming the state. There is no clamp and no

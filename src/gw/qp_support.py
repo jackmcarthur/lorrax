@@ -11,6 +11,7 @@ support read far patches; a rotating state no patch covers takes the side
 scissor (ruling Q3).
 """
 from __future__ import annotations
+from typing import NamedTuple
 import numpy as np
 
 SUPPORT_PAD_EV = 2.0
@@ -157,3 +158,42 @@ def far_patch_covered(energy_rel_ev, patches):
     for lo, hi in patches:
         covered |= (e >= float(lo)) & (e <= float(hi))
     return covered
+
+
+class SigmaPlan(NamedTuple):
+    """The one Sigma plan of an SC run, made at map 0 and held; eV about the Sigma frame.
+
+    ``grid_ev`` samples the protected (near) support at the deck eta;
+    ``protected_support_ev`` is its [lo, hi], the 2 eV outer pad and the Z
+    stencil included. ``far_patches_ev`` are the rotating-endpoint patches,
+    ``far_eta_ev`` their broadening. The W sampling ladder reads this one
+    object (``SCSupport.plan``; the SC session's ``"sigma_plan"``).
+    """
+    grid_ev: np.ndarray
+    envelope_ev: tuple
+    near_eta_ev: float
+    far_patches_ev: tuple
+    far_eta_ev: tuple
+
+    @property
+    def protected_support_ev(self):
+        return (float(self.grid_ev[0]), float(self.grid_ev[-1]))
+
+
+def plan_sigma_windows(sigma, energy_rel_ev, protected_kn, *, rotating_energy_rel_ev=None,
+                       rotating_kn=None, outer_pad_ev=SUPPORT_PAD_EV):
+    """THE one Sigma plan: protected support plus far patches, in one call.
+
+    ``energy_rel_ev``/``protected_kn`` set the near support
+    (:func:`plan_support_ev`); ``rotating_energy_rel_ev``/``rotating_kn``
+    (None: a route without far patches) set the far patches
+    (:func:`far_patches_ev`). Extra rows (map-0 probe estimates) may be
+    stacked below either energy array with the mask tiled to match.
+    """
+    grid, envelope = plan_support_ev(sigma, energy_rel_ev, protected_kn,
+                                     outer_pad_ev=outer_pad_ev)
+    patches = (() if rotating_kn is None else
+               far_patches_ev(rotating_energy_rel_ev, rotating_kn,
+                              (float(grid[0]), float(grid[-1]))))
+    return SigmaPlan(grid, envelope, float(sigma.regularization_ev), tuple(patches),
+                     tuple(far_patch_eta_ev(p) for p in patches))
