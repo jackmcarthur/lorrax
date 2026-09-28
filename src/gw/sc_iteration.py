@@ -4068,9 +4068,18 @@ def _gw_iteration_map_once(state: SCState, inputs: SCInputs) -> SCState:
             _capacity = _session.get("probe_capacity")
             _session.clear()
             _session["probe_energy_ev"] = probe
-            _session["probe_W_by_role"] = W_by_role
-            if _capacity is not None:
-                _session["probe_capacity"] = _capacity
+            if inputs.wfns_transverse is None:
+                # A scalar model is file-resident: the second pass reads it again.
+                _session["probe_W_by_role"] = W_by_role
+                if _capacity is not None:
+                    _session["probe_capacity"] = _capacity
+            elif mpa_mode and inputs.config.sigma.w_model == "shared_pole":
+                # Sector models are device-resident and Sigma released them:
+                # the second pass rebuilds W into a fresh generation.
+                from .shared_pole_screening import retain_iteration_scratch
+                retain_iteration_scratch(
+                    os.path.join(inputs.input_dir, "tmp", "mpa"), "sc_probe",
+                    print_fn=inputs.print_fn)
             raise _PlanFromProbe()
         _session.pop("probe_capacity", None)
         _record_sc(inputs, "    SC map 0 probe: every QP estimate inside the plan")
