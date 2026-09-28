@@ -40,18 +40,27 @@ and the SC equations are in [self consistency](../self_consistency.md).
   ε = 1e-4 (ruling Q2). Crossing and non-crossing product windows are planned
   once with their reserves (`sigma_box_plan`).
 - **Map-0 probe.** Map 0 first evaluates Σ on that plan. If a protected
-  state's map-0 QP estimate (the diagonal of the map-0 QSGW Hamiltonian)
-  lies outside the support, or a rotating one outside the near support and
-  every far patch, the plan is made once from the DFT energies and those
-  estimates, with the same pad, and map 0 is re-evaluated with the same W
-  (`sc_iteration.gw_iteration_map`). An insulator's Σ frame is the DFT
+  state's map-0 QP estimate lies outside the support, or a rotating one
+  outside the near support and every far patch, the plan is made once from
+  the DFT energies and those estimates, with the same pad, and map 0 is
+  re-evaluated (`sc_iteration.gw_iteration_map`). The estimates are the
+  diagonal of the map-0 QSGW Hamiltonian and the output eigenvalue each DFT
+  identity carries into map 1 (`sc_state_identity.assign_qp_identity`);
+  strong P–R mixing separates the two by several eV (Fe 4³ bispinor). A
+  scalar route re-reads the same file-resident W; a sector route rebuilds W,
+  because Σ releases its device-resident models. An insulator's Σ frame is the DFT
   midgap, so the map-0 gap opening is not absorbed by the frame: MoS2 3×3
   conduction states move +2.4 to +3.1 eV and the Si 4³ conduction top
   +2.3 eV at map 0, beyond a 2 eV pad about the DFT energies.
 - **Far patches.** Every rotating DFT energy (and map-0 estimate) outside the
-  near support, padded by 4 eV and merged across holes ≤ 8 eV
+  near support, padded by 6 eV and merged across holes ≤ 12 eV
   (`qp_support.far_patches_ev`); a patch that reaches the near support starts
-  1e-3 eV past its edge, so no energy falls between the two. A
+  1e-3 eV past its edge, so no energy falls between the two. The 6 eV pad
+  keeps each rotating own-energy fixed point inside its patch in the frame
+  Σ is read in (Fe 4³ 3s: 3.3 eV below its DFT energy, plus a +1.3 eV move
+  of the metal μ); a fixed point outside flips between
+  the own read and the side scissor from map to map, and the SC map has no
+  fixed point. A
   patch above E_F is broadened to η_far = 1 eV, one below to 2 eV (ruling
   Q4; INVARIANTS 12 exception for rotating-endpoint reads only), sampled at
   η_far/2. Far patches join the near plan: each crossing window splits by the
