@@ -87,6 +87,11 @@ SEMICORE_ETA_EV = 1.0
 #: state), not by its pole range, so splitting cannot shorten it; the coupling
 #: needs only percent accuracy (CLASSMIX round 4: 158 -> 90 nodes at 1e-2).
 FAR_PATCH_EPS = 1.0e-2
+#: Rule tolerance of the semicore windows: semicore states are active, so
+#: their windows take the protected tolerance (ruling Q2). At 1e-2 the MoS2
+#: 3x3 semicore sat 0.15-0.3 eV off and shifted the valence by 3.7 meV at
+#: the fixed point (PARTITION round 2).
+SEMICORE_EPS = 1.0e-4
 #: Far-patch sampling step (eV): eta/2 resolves the broadened Sigma.
 FAR_PATCH_STEP_EV = 0.5
 #: A global gap wider than this splits semicore from the valence manifold:
