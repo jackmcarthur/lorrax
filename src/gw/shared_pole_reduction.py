@@ -203,7 +203,8 @@ def _validity_floor(scale, rounding, output_norm, largest, *, gates, ordered, **
     plus the eigensolver's R u gamma_max (gate row ``gram_rounding_validity``);
     without it, the legacy fixed relative row ``normalized_gram_validity``.
     """
-    if rounding is None:
+    # STUDY ARM (RECIPE2 C0, never land): main's fixed relative bar on every route.
+    if True:
         return -gates["normalized_gram_validity"]["threshold"] * jnp.maximum(largest, 0)
     if ordered:
         bound = ordered_gram_rounding_floor(scale, rounding, output_norm, **paired)
