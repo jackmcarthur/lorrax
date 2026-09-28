@@ -3702,13 +3702,25 @@ def _gw_iteration_map_once(state: SCState, inputs: SCInputs) -> SCState:
     # The pre-plan reuse call already returned this map's complete fit mapping.
     # A live producer runs here, after the current head response exists.
     _probe_session = inputs.fixed_quadrature_session
+    if (_probe_session is not None and int(state.iteration) == 0
+            and "probe_W_by_role" in _probe_session
+            and _probe_session.get("probe_recipe_hash") != (
+                getattr(inputs.meta, "shared_pole_recipe", None)
+                and inputs.meta.shared_pole_recipe["recipe_hash"])):
+        # The plan fixed from the probe moved the W frequency plan: the probe W
+        # was sampled elsewhere. Discard its generation (as the sector route
+        # does) and rebuild W on this pass's recipe.
+        from .shared_pole_screening import retain_iteration_scratch
+        _probe_session.pop("probe_W_by_role")
+        _probe_session.pop("probe_capacity", None)
+        retain_iteration_scratch(os.path.join(inputs.input_dir, "tmp", "mpa"), "sc_probe",
+                                 print_fn=inputs.print_fn)
+        inputs.print_fn("    SC map 0: the plan fixed from the probe moved the W frequency "
+                        "plan (recipe_hash); W rebuilt on it")
     if screening_reuse is not None:
         W_by_role = screening_reuse
     elif (_probe_session is not None and int(state.iteration) == 0
-          and "probe_W_by_role" in _probe_session
-          and _probe_session.get("probe_recipe_hash") == (
-              getattr(inputs.meta, "shared_pole_recipe", None)
-              and inputs.meta.shared_pole_recipe["recipe_hash"])):
+          and "probe_W_by_role" in _probe_session):
         # Map 0's second pass: same input state, same W; only the plan moved.
         W_by_role = _probe_session.pop("probe_W_by_role")
         _capacity = _probe_session.pop("probe_capacity", None)
@@ -3733,12 +3745,6 @@ def _gw_iteration_map_once(state: SCState, inputs: SCInputs) -> SCState:
             producer=_live_screening, quad_override=stored_ceiling)
     else:
         W_by_role = _screening(mpa_plan, iteration_head_response)
-    if _probe_session is not None and "probe_W_by_role" in _probe_session:
-        # The probe W was sampled on another W frequency plan: this pass rebuilt W.
-        _probe_session.pop("probe_W_by_role")
-        _probe_session.pop("probe_capacity", None)
-        inputs.print_fn("    SC map 0: the plan fixed from the probe moved the W frequency "
-                        "plan (recipe_hash); W rebuilt on it")
     if (_probe_session is not None and int(state.iteration) == 0
             and "probe_energy_ev" not in _probe_session
             and getattr(inputs.meta, "shared_pole_capacity", None) is not None):

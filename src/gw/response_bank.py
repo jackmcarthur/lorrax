@@ -1076,11 +1076,26 @@ def response_groups(z, group_size):
     """Consecutive sample groups: imaginary axis by Im z, then the rest by Re z.
 
     Neighbouring samples need nearly the same exponentials, so a group costs
-    about as many Green pairs as its hardest member.
+    about as many Green pairs as its hardest member. A group pays the union of
+    its pole heights' rule families, and line samples of different heights
+    (the fine and coarse line segments, ``shared_pole_recipe.line_segments_ev``)
+    share no nodes: each height run of the line starts a new group, and the
+    imaginary axis joins the first run. Fe 4^3 (9 heights, 40 samples): one
+    group needs 975 nodes, the fine run 307 and the coarse runs 279.
     """
     order = sorted(range(len(z)), key=lambda i: (z[i].real != 0.,
                    z[i].real if z[i].real != 0. else z[i].imag))
-    return [order[i:i+group_size] for i in range(0, len(order), group_size)]
+    runs, current, height = [], [], None
+    for i in order:
+        line_height = z[i].imag if z[i].real != 0. else None
+        if current and line_height is not None and height is not None and line_height != height:
+            runs.append(current)
+            current = []
+        current.append(i)
+        if line_height is not None:
+            height = line_height
+    runs.append(current)
+    return [run[i:i+group_size] for run in runs for i in range(0, len(run), group_size)]
 
 
 def _gather_group_rules(requests, build):
