@@ -36,10 +36,12 @@ TRACKER; round 2 of lane PARTITION). The rule construction is in
   there. Every state below it is protected at every k, so no rotating state
   sits among protected ones, and none within ~2η of the cut.
 - **Semicore S.** Occupied states below a gap wider than 5 eV: active (full
-  mixing, their rows kept), read at their own energy on held patches at the
-  deck η, step and tolerance (`SEMICORE_ETA_EV = None`). States inside
-  [ω_min, ω_max] stay protected. On a sector (bispinor) route there are no
-  patches and S is protected at η on the near grid.
+  mixing, their rows kept, never scissored). `SEMICORE_READ = "sigma0"`
+  (default, main's rule for states below E_F − 15 eV) reads every semicore
+  endpoint at Σ(ω = 0) on the near grid: no semicore window. `"patch"` reads
+  them at their own energy on held patches at `SEMICORE_ETA_EV` (None = the
+  deck η, step and tolerance). States inside [ω_min, ω_max] stay protected.
+  On a sector (bispinor) route there are no patches and S is protected at η.
 - **Rotating R.** The empty states above the cut. Classes are fixed by DFT
   identity at map 0 and follow the eigenvectors.
 
@@ -113,32 +115,33 @@ The QSGW kernel takes the two read masks from the SC map
   N ≈ 2.7 s/η + 20 (claim 2908): semicore reads at the deck η cost MoS2
   1580 pairs per map and Fe 1685; at η_semi 1 eV, 490 and 909.
 
-## Measured (PARTITION rounds 2–3, 2026-09-28; not main)
+## Measured (PARTITION rounds 2–4, 2026-09-28; not main)
 
-Same node, P4; reference = the same tree with every band protected at the
-deck η and ε 1e-4. Protected states within ±10 eV of E_F; std / maxdev in meV.
+Same node, P4. Reference: the same tree with every band protected at the deck
+η and ε 1e-4 (semicore at its own energy); for Σ(0) (D) also D's own reference
+(every non-semicore band protected, semicore at Σ(0)). Protected states within
+±10 eV of E_F; fixed-point std / maxdev in meV; τ pairs per map.
 
-| deck | τ pairs/map (main) | map 0 | fixed point | maps |
+| deck | semicore at η, patches (A) | η_semi 1 eV (B) | η_semi 0.5 eV (C) | Σ(0) (D), own ref / own-energy ref |
 |---|---|---|---|---|
-| Si 4³ 8v/8c (ω [−6,6] or [−13,10]); cut +15.2 eV | 520 (414) | 0.06 / 0.25 | 0.23 / 0.88 | 9 |
-| MoS2 3×3 10v/12c ω [−10,10]; semicore at η | 982 (392) | 0.02 / 0.09 | 0.05 / 0.14; ±1 eV shell 0.07 | 14 |
-| Fe 4³ charge 6v/8c ω [−12,8]; semicore at η | 1659 (829) | 26.6 / 157 | converges (22 maps); reference stalls | 22 |
-| Na 8³ 86 requested; semicore at η | 1284 (1621) | 1.43 / 6.8 | SC-2 only | – |
+| MoS2 3×3 | 982; 0.05 / 0.14 | 490; 2.3 / 8.5 | 592; 1.5 / 4.8 | 391; 0.03 / 0.08 / 23 / 46 |
+| Fe 4³ charge | 1659; converges | 909; 3s stalls | 1064; converges | 753; converges; D ref stalls |
+| Na 8³ (map 0) | 1284; 1.4 / 6.8 | 755; 1.8 / 7.2 | – | 654; – / 3.4 / 15 |
 
+- **Si 4³** has no semicore: 520 pairs, 0.23 / 0.88 meV with the cut rule;
+  482 pairs, 0.03 / 0.10 with every band protected (ω_max +20, a deck choice).
 - **Semicore at η costs the budget.** A crossing window's node count is
-  N ≈ 2.7 s/η + 20 with s its short side, here the depth of the deepest
-  semicore frequency: MoS2 s = 66.5 eV → 738 predicted, 725 measured; Fe
-  s = 100.6 eV → 1106 predicted, 1090 measured. Narrow patches do not
-  shorten s, and the derived pad merges them anyway (MoS2 [−66.5, −10]).
-  At η_semi 1 eV (ε 1e-2) the same frequencies cost 109 (MoS2) and 159 (Fe)
-  nodes but leave MoS2 2.3 / 8.5 meV off at the fixed point; at 0.5 eV,
-  1.5 / 4.8 meV at 592 pairs.
+  N ≈ 2.7 s/η + 20, s its short side, here the depth of the deepest semicore
+  frequency: MoS2 s = 66.5 eV → 738 predicted, 725 measured; Fe s = 100.6 eV
+  → 1106, 1090. Narrow patches do not shorten s; the derived pad merges them.
+- **Σ(0) is cheap but far from the own-energy semicore.** Semicore QP
+  energies sit 4–9 eV (MoS2) and 12–18 eV (Fe) below their own-energy values,
+  and protected states move 23 ± 23 meV (MoS2) and 36 ± 32 meV (Fe) against
+  the own-energy reference.
 - **Cached rules.** A crossing request is served only by a cached rule
-  inside its twice-widened build box (`_rule_cache_lookup`). Before, the
-  map-0 probe pass's semicore rule ([−63.5, +127] eV, 693 nodes) served
-  MoS2's ω ≥ E_F conduction window ([−35.5, +17.5] eV, 203 when built):
-  1472 instead of 982 pairs per map.
+  inside its twice-widened build box (`_rule_cache_lookup`); before, the
+  map-0 probe pass's semicore rule served MoS2's ω ≥ E_F conduction window
+  (1472 instead of 982 pairs).
 - **The cut gap.** Si's first gap after the request is 0.41 eV wide at
-  +10.4 eV and leaves protected states 7.9 meV off at map 0; the ≥ 4η rule
-  takes the 1.8 eV gap at +15.2 eV (0.88 meV at the fixed point). Protecting
-  the 8 rotating (k,state) above it as well (ω_max +20): 0.10 meV at 482 pairs.
+  +10.4 eV (7.9 meV at map 0); the ≥ 4η rule takes the 1.8 eV gap at
+  +15.2 eV.
