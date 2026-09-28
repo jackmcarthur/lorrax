@@ -1,8 +1,8 @@
 # Codebase map
 
 This is the one-line source inventory of `src/gw`, `src/common`,
-`src/centroid`, `src/file_io` and the service packages, regenerated
-2026-09-25. It says where to start reading;
+`src/centroid`, `src/file_io`, `src/bse` and the service packages, regenerated
+2026-09-25 (`src/bse` added 2026-09-28). It says where to start reading;
 contracts, equations, shapes, and run policy remain on the owner pages in the
 [documentation register](index.md#register).
 
@@ -100,7 +100,7 @@ contracts, equations, shapes, and run policy remain on the owner pages in the
 | `sigma_dispatch.py` | Dispatches one self-energy call per resolved compute mode. |
 | `sigma_x_bispinor.py` | Implements bare-current exchange routes for spinor inputs. |
 | `static_gauge_response.py` | Builds packed static-gauge response inputs. |
-| `static_screening.py` | Static RPA W(0) and its q→0 head for consumers without a dynamical W: the BSE rebuild and the shared-pole W0 persist. |
+| `static_screening.py` | Static W(0) and its q→0 head: an RPA Dyson solve for a BSE restart without W0, or the retained shared-pole model at ω = 0 for the W0 persist. |
 | `v_q_bispinor.py` | Builds the packed bare-current interaction operator. |
 | `v_q_g_flat.py` | Builds Coulomb matrices from flattened reciprocal-space data. |
 | `vcoul.py` | Compatibility imports for the vcoul service. |
@@ -199,6 +199,37 @@ contracts, equations, shapes, and run policy remain on the owner pages in the
 | `tagged_arrays.py` | Associates array payloads with metadata tags. |
 | `wfn_basis.py` | Reads wavefunction basis metadata. |
 | `wfn_writer.py` | Writes wavefunction files. |
+
+## `src/bse`
+
+The BSE contract is [BSE](architecture/bse.md); this table only says where each part lives.
+
+| Module | Role |
+|---|---|
+| `__init__.py` | Package marker for the BSE. |
+| `absorption_common.py` | Shared absorption helpers: dipole slicing to the window, the ⟨0\|r̂\|S⟩ contraction, Lorentzian, JDOS, Kramers–Kronig, `.dat`/`.h5` writers. |
+| `absorption_haydock.py` | ε₂(ω) by the Haydock continued fraction on the TDA BSE; `python -m bse.absorption_haydock`. |
+| `bse_davidson_helpers.py` | Start subspace and diagonal preconditioners for `solvers.davidson.davidson` on the BSE vector layout. |
+| `bse_densify.py` | Coarse-to-fine densification of the BSE bundle under `bse_k_grid`. |
+| `bse_feast.py` | FEAST contour eigensolver, its GMRES solves and the spectral deflation the W_BSE ladder reuses. |
+| `bse_head.py` | The q = 0 Coulomb head: its scalars and their rank-one injection. |
+| `bse_io.py` | Compatibility facade re-exporting `bse_window`, `bse_head`, `bse_densify` and `bse_loading`. |
+| `bse_jax.py` | The BSE driver: `python -m bse.bse_jax`. |
+| `bse_kpm.py` | KPM Chebyshev density of states of the BSE Hamiltonian. |
+| `bse_lanczos.py` | `solve_bse_sharded`: TDA Lanczos, Davidson and thick-restart Lanczos; non-TDA hands off to `bse_nontda`. |
+| `bse_loading.py` | Reads a GW restart into a BSE bundle: window, padding, head, static W(0) rebuild. |
+| `bse_nontda.py` | Structure-preserving full (non-TDA) eigensolver: dense build, and an opt-in matrix-free solver. |
+| `bse_preconditioner.py` | Transition energies, the exchange pair amplitude and the exchange spin weight. |
+| `bse_ring_comm.py` | The BSE mesh, shardings, and the full (A, B) ring matvec. |
+| `bse_stack_matvec.py` | The trial-stack TDA matvec and the non-TDA pair applier. |
+| `bse_w_exact.py` | Exact W_c(ω) by shifted solves on the RPA density resolvent; the TRS pair gauge the ladder uses. |
+| `bse_window.py` | The band window, its padding, the `--eqp` re-slice and the `eigenvectors.h5` writer. |
+| `exchange_path.py` | Exchange tiles V_Q along an exciton momentum path. |
+| `exciton_bands.py` | Finite-momentum TDA exciton bands E_S(Q); `python -m bse.exciton_bands`. |
+| `head_resolvent.py` | The ladder's q = 0 macroscopic tensor Ξ_ij(z). |
+| `vq_interp.py` | Arbitrary-Q bare-exchange tile V_Q. |
+| `w_ladder.py` | Ladder-corrected W_BSE(z) for `screening_diagrams = w_bse`. |
+| `w_omega_chain.py` | W_q(ω) from one block-Lanczos chain; called by `bse_w_exact`. |
 
 ## Service source packages
 

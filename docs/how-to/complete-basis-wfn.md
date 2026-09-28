@@ -22,8 +22,9 @@ with gradients kept on the density sphere $|G|^2 \le E_\mathrm{rho}$.
   not assembled a second time.
 - **One shape.** Every k is padded to `ngkmax`. Pad rows carry a diagonal above
   the Gershgorin bound of the physical block plus 1 Ry, so the lowest
-  `nspinor·ngk` eigenpairs are the physical ones. A Hermiticity skew above
-  1e-12, or eigenvector weight above 1e-10 on the pad, refuses.
+  `nspinor·ngk` eigenpairs are the physical ones. A Hermiticity skew
+  max|H − H^H| above 1e-12 of the pad diagonal, or a physical eigenvector with
+  weight above 1e-10 on the pad, refuses.
 - **Eigensolve.** `distrib_la.plan("eigh", single_device_mesh(), backend="off")`:
   a local eigh of one whole k per rank. In round r, rank p solves k = r·P + p.
   Nothing is distributed inside one k.
@@ -86,9 +87,10 @@ A slab run with matching truncation passes the preflight; none has been measured
 
 ## Cost
 
-Per k, the peak is five complex128 N×N matrices: the unit block, H, the
-eigenvectors and two for the solver, $80 N^2$ B with $N$ = `nspinor·ngk`.
-The eigh is $O(N^3)$ per k. Ranks take whole k-points, so the wall scales as
+The `memory` rule prices five complex128 N×N matrices, $80 N^2$ B with
+$N$ = `nspinor · max_k ngk`, the padded extent every k is solved at
+(`psp.operator_checks.dense_h_bytes`). That is a price, not the peak: the
+measured peaks below are 3.4–14× it. The eigh is $O(N^3)$ per k. Ranks take whole k-points, so the wall scales as
 $\lceil n_k/P\rceil N^3$.
 
 Measured on one node, 4 A100-40GB (claim 2865):
@@ -100,12 +102,15 @@ Measured on one node, 4 A100-40GB (claim 2865):
 | wall per k, first round / later | 3.1 / 0.7 s | 2.1 / 0.18 s | 3.3 / 0.1–0.5 s |
 | device peak per rank | 0.38 GB | 0.38 GB | 0.78 GB |
 
-The uniform ~5e-7 Ry residual is the PW92 constant difference of `psp.xc`
-against QE (claim 2229). On the Fe run, 1 − subspace overlap is 1.14e-8 at one
-band against a 1e-8 gate (claim 2865). The R52 landing gate reran Si 4³ scalar
-(537 bands, 8 k): max |Δε| 2.92e-7 Ry, 1 − subspace weight 5.1e-12. A gwjax
-`x_only` run on the dense Si scalar WFN reproduces Σ_x of the QE-WFN run within
-2 µeV per band (claim 2865).
+The uniform residual (2.8e-7 Ry on Si, 5.7e-7 Ry on Fe) matches the size of
+the PW92 constant difference of `psp.xc` against QE (claim 2865; the difference
+itself was measured on MoS2 at Γ, claim 2229). On the Fe run, 1 − subspace
+weight is 1.14e-8 at one band (k 6), which fails the 1e-8 gate by 1.14×; the
+claim attributes it to QE's Davidson threshold, ethr 1e-10 (claim 2865).
+
+The R52 landing gate reran Si 4³ scalar (537 bands, 8 k): max |Δε| 2.92e-7 Ry, 1 − subspace weight 5.1e-12. A gwjax
+`x_only` run on the dense Si scalar WFN (34 bands, 368 centroids) reproduces
+Σ_x of the QE-WFN run within 2 µeV per band (claim 2865).
 
 ## When to use it
 
@@ -114,8 +119,8 @@ band against a 1e-8 gate (claim 2865). The R52 landing gate reran Si 4³ scalar
   itself ([input reference](../input_reference.md)).
 - An all-band Σ_x needs an ISDF basis about as large as the plane-wave density
   basis: [ISDF exchange accuracy, out to the complete basis](../theory/isdf-exchange-accuracy.md#out-to-the-complete-basis).
-- **Blocked today:** the kmeans pruner refuses a band window above half the
-  plane-wave basis, `0.5 · ngk_max · nspinor`
+- **Blocked today:** the kmeans pruner refuses a band window whose top band
+  exceeds half the plane-wave basis, `0.5 · ngk_max · nspinor`
   (`centroid/pivoted_cholesky.py:1043`,
   `prune_candidates_by_pivoted_cholesky`). Pivoted-Cholesky pruning on a
   complete-basis pair set therefore refuses; `--oversample 1.0` skips pruning.

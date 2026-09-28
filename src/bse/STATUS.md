@@ -13,7 +13,9 @@
 
 ## Modules
 
-The modules, the matvec, the solvers and the refusals are on
+The module inventory is the `src/bse` table of
+[`docs/codebase.md`](../../docs/codebase.md). The matvec, the solvers, the
+outputs and the refusals are on
 [`docs/architecture/bse.md`](../../docs/architecture/bse.md).
 
 ## Index ordering — read this BEFORE comparing to BGW
@@ -25,7 +27,7 @@ BGW conventions (in HDF5 / `eigenvalues.dat` / vmtxel binary) — opposite of LO
 3. **Fortran column-major → numpy via h5py**: file shape `[scalar, ns, nv, nc, nk, N, nq]` (Fortran) becomes numpy shape `(nq, N, nk, nc, nv, ns, 2)` after axis reversal. Axis 3 = nc, axis 4 = nv. Verified by reading BGW source.
 4. **vmtxel binary** (`Common/misc.f90 bse_index`): flat index = `is + (iv-1 + (ic-1 + (ik-1)*nc)*nv)*nspin`, k slowest, v fastest. Reshape to `(nk, nc, nv)`.
 
-`write_eigenvectors_stream` in `bse_io.py` flips valence on write so our `eigenvectors.h5` is BGW-compliant for downstream consumers; converts Ry→eV on the eigenvalues dataset. No flips on conduction/k axes.
+`bse_window.write_eigenvectors_stream` writes `eigenvectors.h5` in this BGW layout, including the valence flip and the eigenvalues in eV; the datasets are listed under Outputs in [`docs/architecture/bse.md`](../../docs/architecture/bse.md#outputs).
 
 ## Fair-comparison measures applied to BGW (Si 4×4×4, n_val=8, n_cond=8)
 
