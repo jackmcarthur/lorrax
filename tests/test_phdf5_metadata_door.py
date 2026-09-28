@@ -213,10 +213,8 @@ def test_the_qsgw_head_loaders_do_not_import_h5py():
 
 
 def _serial_pt_imports(source):
-    """Guard all imports except the reader sharing the serial dipole producer."""
-    roots = [node for node in ast.parse(source).body
-             if not (isinstance(node, ast.FunctionDef)
-                     and node.name == "read_authenticated_dipole_velocity")]
+    """Guard every h5py import in the module, the dipole velocity reader included."""
+    roots = ast.parse(source).body
     return [node for root in roots for node in ast.walk(root)
             if (isinstance(node, ast.Import)
                 and any(alias.name.split(".")[0] == "h5py" for alias in node.names))
@@ -233,7 +231,7 @@ def test_serial_pt_import_guard_rejects_both_loaders_and_module_imports():
     assert _serial_pt_imports("def another_reader():\n import h5py")
     assert _serial_pt_imports("def load_parallel_transport_head():\n import h5py")
     assert _serial_pt_imports("def load_dft_velocity_head():\n from h5py import File")
-    assert not _serial_pt_imports(
+    assert _serial_pt_imports(
         "def read_authenticated_dipole_velocity():\n import h5py")
 
 
