@@ -150,8 +150,11 @@ class _BoundaryCloud:
     audit found 100 of 2,603 level-certified rules above eps, up to 247x on
     wide boxes (runs/DEV/326_minimax_fit_review_2026-09-11)."""
 
-    def __init__(self, box, theta, S, eps, *, p, p_target, top=True):
+    def __init__(self, box, theta, S, eps, *, p, p_target, top=True, weight=None):
         re_lo, re_hi, im_lo, im_hi = box
+        #: optional currency weight w(d) >= 0 multiplying the error (the
+        #: response rules' occupation envelope); None is weight 1
+        self.weight = weight
         kw = dict(theta=theta, S=S, eps=eps, p=p, p_target=p_target)
         x = _edge_points(re_lo, re_hi, lambda v: v + 1j * im_lo, **kw)
         edges = [(x, x + 1j * im_lo)]
@@ -180,8 +183,10 @@ class _BoundaryCloud:
     def _g(self, d, times, weights, relative, power=1):
         Q = _cexp(1j * d[:, None] * np.asarray(times)[None, :]) @ np.asarray(weights)
         if relative:
-            return np.abs(d ** power * Q - 1.0)
-        return self.im_lo ** power * np.abs(Q - 1.0 / d ** power)
+            g = np.abs(d ** power * Q - 1.0)
+        else:
+            g = self.im_lo ** power * np.abs(Q - 1.0 / d ** power)
+        return g if self.weight is None else g * self.weight(d)
 
     def sup(self, times, weights, relative, iters=20, power=1):
         """``(sup rho |Q - 1/d|, max kappa, max rho sum_k |w_k exp(i t_k d)|)``:
@@ -200,6 +205,8 @@ class _BoundaryCloud:
         Q = T.sum(1)
         g = (np.abs(self.d ** power * Q - 1.0) if relative
              else self.im_lo ** power * np.abs(Q - 1.0 / self.d ** power))
+        if self.weight is not None:
+            g = g * self.weight(self.d)
         term_mass = np.abs(T).sum(1)
         kappa = float((term_mass / np.maximum(np.abs(Q), 1e-300)).max())
         mass = float(((np.abs(self.d) if relative else self.im_lo) ** power * term_mass).max())

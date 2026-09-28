@@ -43,6 +43,17 @@ _RIDGE = 0.005
 _GROWTH_CAP = 3.0
 # A column below exp(_DEAD) of the tolerance on a level is not fitted there.
 _DEAD = -40.0
+# Error currency of the weight solve and the certificate: "relative" (both
+# |D| |dQ| and |D|^2 |dQ2|), "rellsq" (relative rows in the weight solve,
+# peak certificate) or "peak" (eta |dQ| and eta^2 |dQ2| in both).
+_CURRENCY = "peak"
+# Node tolerance of a family: "ds" (tol times min(1, 2|p|/(eta ln(4/tol))),
+# the ds horizon factor relieved by the ds currency's eta/(2|p|)) or "lam"
+# (tol/ln(4/tol) for every family).
+_EPS_RULE = "ds"
+# Metal occupation envelope in the currency, and node boxes clipped at its
+# knee d = 0 (x = max Re p) as the first candidate partition.
+_ENVELOPE = True
 
 
 def _poles(z):
@@ -79,7 +90,7 @@ def _hull(levels):
             min(lv[2] for lv in levels), max(lv[3] for lv in levels))
 
 
-def family_partitions(levels, eps, decay_rate=0.):
+def family_partitions(levels, eps_of, decay_rate=0., clipped=None):
     """Candidate family partitions of a group's levels, cheapest rung-0 union first.
 
     Each partition is a list of ``(box, crossing, heights)``:
@@ -92,31 +103,40 @@ def family_partitions(levels, eps, decay_rate=0.):
       rung-0 times hold ``0 <= Re T <= decay_rate`` (the lowest is dropped
       until they do).
 
-    Each box is the smallest holding its levels. The candidates are ordered by
-    the size of their rung-0 node union, a formula of the boxes; the builder
-    takes the first whose ladders certify.
+    Each box is the smallest holding its levels. ``clipped`` (a metal's
+    levels cut at the occupation envelope's knee) adds the same candidates on
+    those boxes; the certificate stays on the true segments. The candidates
+    are ordered by the size of their rung-0 node union, a formula of the
+    boxes; the builder takes the first whose ladders certify.
     """
+    candidates = []
+    for level_set in [levels] + ([clipped] if clipped else []):
+        candidates += _partitions(level_set, eps_of, decay_rate)
+
+    def size(partition):
+        sets = [family_nodes(box, eps_of(heights), 0, crossing) for box, crossing, heights in partition]
+        return np.unique(np.concatenate(sets)).size
+    return sorted(candidates, key=size)
+
+
+def _partitions(levels, eps_of, decay_rate):
     definite = [lv for lv in levels if not lv[0] < 0.0 < lv[1]]
     crossing = [lv for lv in levels if lv[0] < 0.0 < lv[1]]
     base = [(_hull(definite), False, {lv[2] for lv in definite})] if definite else []
     candidates = [base + ([(_hull(crossing), True, {lv[2] for lv in crossing})] if crossing else [])]
     narrow = sorted((lv for lv in crossing if min(-lv[0], lv[1]) < lv[2]), key=lambda lv: lv[2])
     while narrow:
-        re_t = (1j*_sector_times(_hull(narrow), eps, 0)[0]).real
+        re_t = (1j*_sector_times(_hull(narrow), eps_of({lv[2] for lv in narrow}), 0)[0]).real
         if float(re_t.min()) >= 0.0 and (not decay_rate or float(re_t.max()) <= decay_rate):
             rest = [lv for lv in crossing if lv not in narrow]
             candidates.append(base + [(_hull(narrow), False, {lv[2] for lv in narrow})]
                               + ([(_hull(rest), True, {lv[2] for lv in rest})] if rest else []))
             break
         narrow = narrow[1:]
-
-    def size(partition):
-        sets = [family_nodes(box, eps, 0, crossing) for box, crossing, _ in partition]
-        return np.unique(np.concatenate(sets)).size
-    return sorted(candidates, key=size)
+    return candidates
 
 
-def family_nodes(box, eps, rung, crossing, bend=_BEND):
+def family_nodes(box, eps, rung, crossing, bend=None):
     """Derived times of one family box at ``rung``, or None past its ladder.
 
     Sign-definite: the elliptic sector rule, six rungs. Crossing: the bent
@@ -136,7 +156,7 @@ def family_nodes(box, eps, rung, crossing, bend=_BEND):
     if rung >= 3*_CROSSING_RUNGS:
         return None
     y = box[2]
-    c = corner_exponent(box, bend)/2.0**(rung//_CROSSING_RUNGS)
+    c = corner_exponent(box, _BEND if bend is None else bend)/2.0**(rung//_CROSSING_RUNGS)
     s, receipt = crossing_nodes(box, eps, rung % _CROSSING_RUNGS, c)
     L, m, B0, gamma = math.log(1.0/eps), receipt["m"], receipt["B0"], receipt["gamma"]
     parts = [s, -1j*receipt["tau_c"]*_unit_gauss(math.ceil((c + L)/2.0))]
@@ -160,43 +180,62 @@ def _live(level, times, eps):
     return log_max > math.log(eps) + _DEAD
 
 
-def _level_weights(level, times, eps):
-    """Weights of 1/D and 1/D^2 on one level: one least-squares solve.
+def _envelope(level, poles, decay_rate):
+    """The occupation envelope of a level as a function of D: min(1, e^{beta d})
+    at d = max Re p - Re D (the level's least suppressed pole), or None."""
+    if not decay_rate:
+        return None
+    top = float(poles.real[poles.imag == level[2]].max())
+    return lambda D: np.exp(np.minimum(decay_rate*(top - np.real(D)), 0.0))
+
+
+def _level_weights(level, times, eps, envelope=None):
+    """Weights of 1/D and 1/D^2 on one level: two linear least-squares solves.
 
     Rows sample the segment at two points per half wave of the largest live
-    ``|t|``; columns are scaled to unit maximum in log space; a ridge
-    ``_RIDGE*eps`` prices each term's largest contribution in the peak
-    currency. 1/D^2 in eta^2 currency is the same eta-scaled solve with the
-    right side divided by eta, ridge included.
+    ``|t|``, each weighted by the certificate's currency (``|D|`` and
+    ``|D|^2`` relative, ``eta`` and ``eta^2`` peak); columns are scaled to
+    unit maximum in log space; a ridge ``_RIDGE*eps`` prices each term's
+    largest contribution in that currency.
     """
     xa, xb, y, _ = level
     live = _live(level, times, eps)
     t = times[live]
     x = _edge_points(xa, xb, lambda v: v + 1j*y, 0.0, float(np.abs(t).max()), 1e-300, 2.0, 8.0)
     d = x + 1j*y
-    log_max = np.max(-(d[:, None]*t[None, :]).imag, axis=0)
-    a = y*_cexp(1j*d[:, None]*t[None, :] - log_max[None, :])
-    a = np.vstack([a, _RIDGE*eps*y*math.sqrt(d.size)*np.eye(t.size)])
-    rhs = np.zeros((a.shape[0], 2), complex)
-    rhs[:d.size, 0], rhs[:d.size, 1] = y/d, y/d**2
-    q, r = la.qr(a, mode="economic", check_finite=False)
     w = np.zeros((times.size, 2), complex)
-    w[live] = la.solve_triangular(r, q.conj().T @ rhs, check_finite=False)*np.exp(-log_max)[:, None]
+    for k, power in enumerate((1, 2)):
+        rho = np.abs(d)**power if _CURRENCY in ("relative", "rellsq") else np.full(d.size, y**power)
+        if envelope is not None:
+            rho = rho*np.maximum(envelope(d), 1e-300)
+        log_rho = np.log(rho)
+        log_max = np.max(-(d[:, None]*t[None, :]).imag + log_rho[:, None], axis=0)
+        a = _cexp(1j*d[:, None]*t[None, :] + (log_rho[:, None] - log_max[None, :]))
+        a = np.vstack([a, _RIDGE*eps*math.sqrt(d.size)*np.eye(t.size)])
+        rhs = np.zeros(a.shape[0], complex)
+        rhs[:d.size] = rho/d**power
+        q, r = la.qr(a, mode="economic", check_finite=False)
+        w[live, k] = la.solve_triangular(r, q.conj().T @ rhs, check_finite=False)*np.exp(-log_max)
     return w[:, 0], w[:, 1]
 
 
-def _certify(level, times, weights, poles):
+def _certify(level, times, weights, poles, envelope=None):
     """Evaluation-only sup of the value and ds errors on one level, and the mass.
 
     The cloud resolves the largest ``|t|`` of the union everywhere (a union
     of families has no single ray), and refines every sampled local maximum.
     """
     xa, xb, y, _ = level
-    cloud = _BoundaryCloud(level, 0.0, float(np.abs(times).max()), 1e-300, p=6.0, p_target=8.0)
-    value, _, mass = cloud.sup(times, weights[0], False)
-    slope, _, _ = cloud.sup(times, weights[1], False, power=2)
+    relative = _CURRENCY == "relative"
+    cloud = _BoundaryCloud(level, 0.0, float(np.abs(times).max()), 1e-300, p=6.0, p_target=8.0,
+                           weight=envelope)
+    value, _, _ = cloud.sup(times, weights[0], relative)
+    slope, _, _ = cloud.sup(times, weights[1], relative, power=2)
+    # the executor's noise: eta times the value term mass, peak currency in both modes
+    terms = _cexp(1j*cloud.d[:, None]*times[None, :])*weights[0][None, :]
+    mass = y*float(np.abs(terms).sum(1).max())
     members = poles[poles.imag == y]
-    # ds currency eta^3 |d/ds error| = eta^2 |error of 1/D^2| * eta/(2|p|)
+    # ds currency: (eta^2 or |D|^2) |error of 1/D^2| * eta/(2|p|), i.e. eta^3 |d/ds error| at the peak
     return value, slope*float((y/(2*np.abs(members))).max()), mass
 
 
@@ -207,12 +246,17 @@ def _admissible(times, lo, hi, decay_rate):
             and (not decay_rate or float(re_t.max()) <= decay_rate))
 
 
-def _fit(levels, poles, times, tol):
-    """Per-level weights and certificates on fixed times: {y: (weights, value, ds)}."""
+def _fit(levels, poles, times, tol, decay_rate=0.):
+    """Per-level weights and certificates on fixed times: {y: (weights, value, ds)}.
+
+    On a metal the currency carries the occupation envelope min(1, e^{beta d})
+    (``response_bank.response_occupation_envelope`` bounds every occupation
+    product by it), in the weight solve and in the certificate."""
     out = {}
     for level in levels:
-        weights = _level_weights(level, times, tol)
-        value, slope, mass = _certify(level, times, weights, poles)
+        envelope = _envelope(level, poles, decay_rate) if _ENVELOPE else None
+        weights = _level_weights(level, times, tol, envelope)
+        value, slope, mass = _certify(level, times, weights, poles, envelope)
         ok = (np.isfinite([value, slope, mass]).all() and value <= tol
               and slope <= tol and mass <= _RESPONSE_MAX_KAPPA)
         out[level[2]] = (weights, value, slope, ok)
@@ -290,7 +334,16 @@ def response_group_rules(lo_ry, hi_ry, z_ry, *, rel_tol=1e-8, previous=None,
     reference = 0. if decay_rate else lo
     tol = rel_tol/2
     # the ds target's time density is s exp(isD): one horizon factor Lam more
-    eps = tol/math.log(4.0/tol)
+    horizon = math.log(4.0/tol)
+
+    def eps_of(heights):
+        """Node tolerance of a family: the ds target's density s exp(isD) needs one
+        horizon factor ln(4/tol) more than the value, and the ds currency
+        eta^3/(2|p|) relieves it by 2|p|/eta."""
+        if _EPS_RULE == "lam":
+            return tol/horizon
+        members = poles[np.isin(poles.imag, list(heights))]
+        return tol*min(1.0, float((2*np.abs(members)/members.imag).min())/horizon)
     poles = _poles(z)
     levels = response_levels(lo, hi, poles)
     members = list(range(len(z)))
@@ -300,20 +353,25 @@ def response_group_rules(lo_ry, hi_ry, z_ry, *, rel_tol=1e-8, previous=None,
         if warm is not None:
             times = -1j*np.asarray(warm["t"][:warm["count"]])
             if _admissible(times, lo, hi, decay_rate):
-                fits = _fit(levels, poles, times, tol)
+                fits = _fit(levels, poles, times, tol, decay_rate)
                 if all(f[3] for f in fits.values()):
                     return [dict(_rule(z, times, poles, fits, reference), members=members,
                                  reference_ry=reference, rungs=warm.get("rungs"),
                                  families=warm.get("families"))]
-        for boxes in family_partitions(levels, eps, decay_rate):
+        clipped = None
+        if _ENVELOPE and decay_rate:
+            # the envelope's knee d = 0 sits at x = max Re p of each level
+            clipped = [(lv[0], min(lv[1], float(poles.real[poles.imag == lv[2]].max())), lv[2], lv[3])
+                       for lv in levels]
+        for boxes in family_partitions(levels, eps_of, decay_rate, clipped):
             rungs = [0]*len(boxes)
             sets = [None]*len(boxes)
 
             def climb(i, rung):
                 """The first admissible rung at or above ``rung`` (inadmissible rungs are skipped)."""
-                box, crossing, _heights = boxes[i]
+                box, crossing, heights = boxes[i]
                 while True:
-                    times = family_nodes(box, eps, rung, crossing)
+                    times = family_nodes(box, eps_of(heights), rung, crossing)
                     if times is None or _admissible(times, lo, hi, decay_rate):
                         rungs[i], sets[i] = rung, times
                         return times is not None
@@ -324,7 +382,7 @@ def response_group_rules(lo_ry, hi_ry, z_ry, *, rel_tol=1e-8, previous=None,
                 times = np.unique(np.concatenate(sets))
                 if times.size > RESPONSE_NODE_CAPACITY:
                     break
-                fits = _fit(levels, poles, times, tol)
+                fits = _fit(levels, poles, times, tol, decay_rate)
                 failing = sorted({i for i, (_b, _c, heights) in enumerate(boxes)
                                   for level in levels if level[2] in heights and not fits[level[2]][3]})
                 if not failing:
