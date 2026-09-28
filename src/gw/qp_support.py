@@ -74,14 +74,16 @@ def clamped_reads(energy_relative_ev, protected_kn, grid_ev):
     return np.asarray(protected_kn, bool) & ((e-h < grid_ev[0]) | (e+h > grid_ev[-1]))
 
 
-#: Broadening of the far patches (eV). Rotating (empty, above the protected
-#: cut) endpoints: the P-R coupling needs Sigma_io(E_o) only to modest
-#: accuracy (CLASSMIX: Si conduction endpoints at 1 eV keep 0.7-0.8 meV).
-#: Semicore (active, occupied below a wide gap) reads its own energy at
-#: SEMICORE_ETA_EV. The owner approved 1-2 eV for these reads (ruling Q4,
-#: 2026-09-28; INVARIANTS 12); protected states keep the deck eta.
+#: Broadening of the rotating patches (eV): empty states above the protected
+#: cut; the P-R coupling needs Sigma_io(E_o) only to modest accuracy
+#: (CLASSMIX: Si conduction endpoints at 1 eV keep 0.7-0.8 meV). The owner
+#: approved 1-2 eV for these reads (ruling Q4, 2026-09-28; INVARIANTS 12).
 FAR_PATCH_ETA_EV = 1.0
-SEMICORE_ETA_EV = 1.0
+#: Semicore patches sample at the deck eta (SEMICORE_ETA_EV = None) on narrow
+#: patches: every semicore endpoint, diagonal and coupling, reads at eta.
+#: At eta_semi = 1 eV the P-S couplings put the MoS2 3x3 fixed point 8.5 meV
+#: off, at 0.5 eV 4.8 meV; protected at eta, 0.14 meV (PARTITION round 2).
+SEMICORE_ETA_EV = None
 #: Rule tolerance of the far-patch crossing windows. A far window's node
 #: count is set by its short side over eta (the patch top above the lowest
 #: state), not by its pole range, so splitting cannot shorten it; the coupling
@@ -89,6 +91,12 @@ SEMICORE_ETA_EV = 1.0
 FAR_PATCH_EPS = 1.0e-2
 #: Far-patch sampling step (eV): eta/2 resolves the broadened Sigma.
 FAR_PATCH_STEP_EV = 0.5
+#: The protected cut takes the first all-k gap at least CUT_GAP_ETAS * eta
+#: wide above the requested top, searched up to CUT_SEARCH_EV (else the widest
+#: gap there): a narrow cut gap leaves protected states within ~eta of
+#: rotating ones (Si 4^3: 0.41 eV gap, 7.9 meV at map 0; 1.8 eV gap, 0.25).
+CUT_GAP_ETAS = 4.0
+CUT_SEARCH_EV = 5.0
 #: A global gap wider than this splits semicore from the valence manifold:
 #: twice the padded near-support halfwidth (outer pad + Z stencil), so a
 #: narrower gap would be sampled by the near support anyway.
@@ -148,10 +156,10 @@ def far_patches_ev(energy_rel_ev, mask_kn, near_support_ev, *, pad_ev):
     return tuple(out)
 
 
-def far_patch_grid_ev(patch):
-    """Samples of one (lo, hi, eta) patch at eta/2, ending exactly at hi."""
+def far_patch_grid_ev(patch, *, step_ev=None):
+    """Samples of one (lo, hi, eta) patch at eta/2 (or ``step_ev``), ending exactly at hi."""
     lo, hi, eta = float(patch[0]), float(patch[1]), float(patch[2])
-    step = 0.5 * eta
+    step = 0.5 * eta if step_ev is None else float(step_ev)
     n = int(np.ceil((hi - lo) / step - 1e-9)) + 1
     return np.linspace(lo, hi, max(n, 2))      # ends at hi: never enters the near grid
 
@@ -222,7 +230,9 @@ def plan_sigma_windows(sigma, energy_rel_ev, protected_kn, *, rotating_energy_re
     rows = sorted([(a, b) for a, b in far] + [(a, b) for a, b in semi])
     if any(r[0] <= q[1] for q, r in zip(rows[:-1], rows[1:])):
         raise ValueError("GATE sigma_far_patch_order: rotating and semicore patches overlap")
-    return SigmaPlan(grid, envelope, float(sigma.regularization_ev), tuple(far),
+    eta = float(sigma.regularization_ev)
+    eta_semi = eta if SEMICORE_ETA_EV is None else float(SEMICORE_ETA_EV)
+    return SigmaPlan(grid, envelope, eta, tuple(far),
                      tuple(FAR_PATCH_ETA_EV for _ in far), tuple(semi),
-                     tuple(SEMICORE_ETA_EV for _ in semi), float(far_pad_ev),
+                     tuple(eta_semi for _ in semi), float(far_pad_ev),
                      float(semicore_pad_ev))

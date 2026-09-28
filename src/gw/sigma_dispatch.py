@@ -1277,8 +1277,12 @@ def _compute_mpa_sigma(
             from .qp_support import FAR_PATCH_EPS, far_patch_grid_ev
             near_ev = np.asarray(config.omega_grid_ev, dtype=np.float64)
             pieces = [(near_ev, np.full(near_ev.size, _xi.resolved_ry * RYD_TO_EV), True)]
+            near_eta_ev = _xi.resolved_ry * RYD_TO_EV
             for patch in far_patches:          # (lo, hi, eta) eV: rotating and semicore
-                grid_ev = far_patch_grid_ev(patch)
+                # A patch at the deck eta samples at the deck step, as the near grid.
+                grid_ev = far_patch_grid_ev(
+                    patch, step_ev=(float(config.sigma.omega_step_ev)
+                                    if abs(float(patch[2]) - near_eta_ev) < 1e-9 else None))
                 pieces.append((grid_ev, np.full(grid_ev.size, float(patch[2])), False))
             pieces.sort(key=lambda piece: float(piece[0][0]))
             union_ev = np.concatenate([p_[0] for p_ in pieces])
