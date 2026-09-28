@@ -1086,11 +1086,12 @@ def line_segments_ev(sigma_plan, eta_ev, recipe=shared_real_pole_v1_r3b):
     each window's far side + ``line_extent_pad_ev``:
     * fine: the protected support (``sigma_plan.protected_support_ev``) at the
       deck eta, from 0;
-    * coarse: each far patch (``far_patches_ev`` with ``far_eta_ev``), finest
-      first, from the reach so far to its own far side + pad.
-    A patch whose far side the finer segments already reach adds nothing.
-    Only the plan's interface is read, so new window classes (a semicore patch
-    with its own eta) enter as further (patch, eta) pairs.
+    * coarse: each held patch window ``(lo, hi, eta)`` of the plan
+      (``SigmaPlan.patches``: rotating, semicore and any later window class),
+      finest first, from the reach so far to its own far side + pad.
+    A window whose far side the finer segments already reach adds nothing.
+    Only the plan's windows and their eta are read, so a new window class
+    flows through without a change here.
     """
     pad, factor = float(recipe['line_extent_pad_ev']), float(recipe['line_spacing_eta_factor'])
     lo, hi = (float(v) for v in sigma_plan.protected_support_ev)
@@ -1099,8 +1100,12 @@ def line_segments_ev(sigma_plan, eta_ev, recipe=shared_real_pole_v1_r3b):
     fine = factor * float(eta_ev)
     reach = float(line_ladder_ev(max(abs(lo), abs(hi)) + pad, fine)[-1])
     segments = [(0.0, reach, fine)]
+    windows = getattr(sigma_plan, 'patches', None)
+    if windows is None:
+        windows = tuple((a, b, eta) for (a, b), eta in zip(sigma_plan.far_patches_ev,
+                                                           sigma_plan.far_eta_ev))
     far = sorted((factor * float(eta), max(abs(float(a)), abs(float(b))) + pad)
-                 for (a, b), eta in zip(sigma_plan.far_patches_ev, sigma_plan.far_eta_ev))
+                 for a, b, eta in windows)
     for spacing, top in far:
         if top > reach * (1.0 + 1.0e-3):
             count = max(1, math.ceil((top - reach) / spacing * (1.0 - 1.0e-3)))
@@ -1322,8 +1327,10 @@ def resolve_shared_pole_recipe(config, wfns, meta, *, mesh_xy, print_fn,
         'accuracy_reason': 'resolved geometry has no authenticated matching campaign receipt',
         'eta_ev': eta, 'height_ev': height, 'height_ry': height / RYD_TO_EV,
         'plasma_ev': plasma_ry * RYD_TO_EV, 'plasma_ry': plasma_ry,
-        'protected_support_ev': window, 'far_patches_ev': tuple(sigma_plan.far_patches_ev),
-        'far_eta_ev': tuple(sigma_plan.far_eta_ev), 'line_segments_ev': tuple(segments),
+        'protected_support_ev': window,
+        'patch_windows_ev': tuple(getattr(sigma_plan, 'patches', None) or (
+            (a, b, e) for (a, b), e in zip(sigma_plan.far_patches_ev, sigma_plan.far_eta_ev))),
+        'line_segments_ev': tuple(segments),
         'top_ev': top, 'line_spacing_ev': spacing, 'line_height_ev': line_height,
         'line_ev': line, 'imaginary_ev': imaginary,
         'held_line_ev': held_line, 'held_imaginary_ev': held_imag,
@@ -1365,7 +1372,7 @@ def resolve_shared_pole_recipe(config, wfns, meta, *, mesh_xy, print_fn,
         'height': 'h=4*eta', 'eta': 'literal sigma_regularization_ev',
         'plasma': '2*sqrt(4*pi*active_electrons/volume) Ry',
         'protected_support': 'the Sigma plan\'s protected support about mu, pad and Z stencil included (gw.qp_support.SigmaPlan)',
-        'far_': 'the Sigma plan\'s far patches and their broadening',
+        'patch_windows': 'the Sigma plan\'s held patch windows (lo, hi, eta): rotating, semicore, later classes',
         'line_segments': '(start, top, spacing): fine 4 eta to max|protected support| + 2 eV; one coarse 4 eta_p segment per far patch to its far side + 2 eV',
         'top': 'L = the last segment top',
         'line_spacing': 'Delta = 4*eta',
@@ -1394,7 +1401,7 @@ def resolve_shared_pole_recipe(config, wfns, meta, *, mesh_xy, print_fn,
     seg_text = ', '.join(f'{b:.2f}@{c:.2f}' for a, b, c in segments)
     print_fn(f'  Shared-pole supports: line {len(line)} sites {line[0]:.3f}..{line[-1]:.3f} eV '
              f'at height {height:.3f} eV (segments top@spacing {seg_text} eV; protected support '
-             f'{window[0]:+.2f}..{window[1]:+.2f} eV, far patches {tuple(sigma_plan.far_patches_ev)}); '
+             f'{window[0]:+.2f}..{window[1]:+.2f} eV, far patches {tuple(getattr(sigma_plan, "patches", None) or sigma_plan.far_patches_ev)}); '
              f'imaginary {count} sites {umin:.3f}..{umax:.2f} eV; '
              f'plan {"one-shot" if support_receipt is None else support_receipt["status"]}; '
              f'recipe_hash {table[:12]}')
