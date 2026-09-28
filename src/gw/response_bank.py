@@ -694,8 +694,9 @@ def _coulomb_pack(basis,mesh_xy):
 #: eigenproblems.  Keyed by the operator token of the resource
 #: (``shared_pole_screening._coulomb_resource``), the span and the solve layout;
 #: a new operator drops the old roots.  Held bytes per rank: 32 N_mu_packed^2 per
-#: held q row / P; the bank and moments share (0, N_q), the constructor's
-#: rounds add one more set, so 64 N_q N_mu_packed^2 / P in all.
+#: held q row / P; the bank, moments and constructor rounds share (0, N_q)
+#: (a round slices its rows, one transient round slice), so
+#: 32 N_q N_mu_packed^2 / P in all.
 _COULOMB_ROOTS: dict = {}
 
 
@@ -713,12 +714,28 @@ def _coulomb_batch(meta, config, bank_io, mesh_xy, q_span, execute):
     held = _COULOMB_ROOTS.get(key)
     if held is not None and not any(x.is_deleted() for x in held[:2]):
         return held
+    if key is not None:
+        # A constructor round asks for a sub-span of the parents the producer
+        # already rooted (the held all-q entry): slice those rows instead of a
+        # second read and eigensolve of the same V.
+        for (k_token, (k_lo, k_hi), *k_rest), cover in _COULOMB_ROOTS.items():
+            if (k_token == token and tuple(k_rest) == key[2:] and k_lo <= key[1][0]
+                    and key[1][1] <= k_hi and not any(x.is_deleted() for x in cover[:2])):
+                a, b = key[1][0] - k_lo, key[1][1] - k_lo
+                rows = _span_rows(mesh_xy, a, b)
+                return rows(cover[0]), rows(cover[1]), list(cover[2][a:b])
     h, hi, ranks = _coulomb_roots(meta, basis, resource, layout, mesh_xy, q_span, execute)
     if key is not None:
         for stale in [k for k in _COULOMB_ROOTS if k[0] != token]:
             del _COULOMB_ROOTS[stale]
         _COULOMB_ROOTS[key] = (h, hi, ranks)
     return h, hi, ranks
+
+
+@lru_cache(maxsize=32)
+def _span_rows(mesh_xy, a, b):
+    """Rows [a, b) of a face-tiled parent stack, kept on the face."""
+    return jax.jit(lambda x: x[a:b], out_shardings=NamedSharding(mesh_xy, P(None, "x", "y")))
 
 
 def _coulomb_roots(meta, basis, resource, layout, mesh_xy, q_span, execute):
@@ -1495,18 +1512,22 @@ def produce_sample_bank(wfns, meta, config, *, mesh_xy, sym, sample_plan, bank_i
                     ledger.live_stages = live + (stage,)
                     started_selection = time.monotonic()
                     value, slope = solve(raw, 0, 0, len(qids), bank_handle, sample)
-                    lines = selection.select(sample, value, slope)
+                    with timing.section('bank.line_select'):
+                        lines = selection.select(sample, value, slope)
                     del value, slope
                     if ordered:
                         value, slope = solve(raw, 1, 0, len(qids), bank_handle, sample)
-                        selection.mirror(sample, lines, value, slope)
+                        with timing.section('bank.line_mirror'):
+                            selection.mirror(sample, lines, value, slope)
                         del value, slope
-                    panels = selection.panels(sample, lines)
+                    with timing.section('bank.line_panels'):
+                        panels = selection.panels(sample, lines)
                     del lines
                     receipt["seconds"]["line_selection"] = (receipt["seconds"].get("line_selection", 0.)
                                                              + time.monotonic() - started_selection)
                     io_started = time.monotonic()
-                    write(q_span=(0, len(qids)), line=panels)
+                    with timing.section('bank.line_write'):
+                        write(q_span=(0, len(qids)), line=panels)
                     receipt["seconds"]["io"] = receipt["seconds"].get("io",0.)+time.monotonic()-io_started
                     ledger.live_stages = live
                     del panels
