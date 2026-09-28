@@ -713,12 +713,28 @@ def _coulomb_batch(meta, config, bank_io, mesh_xy, q_span, execute):
     held = _COULOMB_ROOTS.get(key)
     if held is not None and not any(x.is_deleted() for x in held[:2]):
         return held
+    if key is not None:
+        # A constructor round asks for a sub-span of the parents the producer
+        # already rooted (the held all-q entry): slice those rows instead of a
+        # second read and eigensolve of the same V.
+        for (k_token, (k_lo, k_hi), *k_rest), cover in _COULOMB_ROOTS.items():
+            if (k_token == token and tuple(k_rest) == key[2:] and k_lo <= key[1][0]
+                    and key[1][1] <= k_hi and not any(x.is_deleted() for x in cover[:2])):
+                a, b = key[1][0] - k_lo, key[1][1] - k_lo
+                rows = _span_rows(mesh_xy, a, b)
+                return rows(cover[0]), rows(cover[1]), list(cover[2][a:b])
     h, hi, ranks = _coulomb_roots(meta, basis, resource, layout, mesh_xy, q_span, execute)
     if key is not None:
         for stale in [k for k in _COULOMB_ROOTS if k[0] != token]:
             del _COULOMB_ROOTS[stale]
         _COULOMB_ROOTS[key] = (h, hi, ranks)
     return h, hi, ranks
+
+
+@lru_cache(maxsize=32)
+def _span_rows(mesh_xy, a, b):
+    """Rows [a, b) of a face-tiled parent stack, kept on the face."""
+    return jax.jit(lambda x: x[a:b], out_shardings=NamedSharding(mesh_xy, P(None, "x", "y")))
 
 
 def _coulomb_roots(meta, basis, resource, layout, mesh_xy, q_span, execute):
