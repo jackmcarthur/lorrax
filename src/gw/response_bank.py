@@ -1495,18 +1495,22 @@ def produce_sample_bank(wfns, meta, config, *, mesh_xy, sym, sample_plan, bank_i
                     ledger.live_stages = live + (stage,)
                     started_selection = time.monotonic()
                     value, slope = solve(raw, 0, 0, len(qids), bank_handle, sample)
-                    lines = selection.select(sample, value, slope)
+                    with timing.section('bank.line_select'):
+                        lines = selection.select(sample, value, slope)
                     del value, slope
                     if ordered:
                         value, slope = solve(raw, 1, 0, len(qids), bank_handle, sample)
-                        selection.mirror(sample, lines, value, slope)
+                        with timing.section('bank.line_mirror'):
+                            selection.mirror(sample, lines, value, slope)
                         del value, slope
-                    panels = selection.panels(sample, lines)
+                    with timing.section('bank.line_panels'):
+                        panels = selection.panels(sample, lines)
                     del lines
                     receipt["seconds"]["line_selection"] = (receipt["seconds"].get("line_selection", 0.)
                                                              + time.monotonic() - started_selection)
                     io_started = time.monotonic()
-                    write(q_span=(0, len(qids)), line=panels)
+                    with timing.section('bank.line_write'):
+                        write(q_span=(0, len(qids)), line=panels)
                     receipt["seconds"]["io"] = receipt["seconds"].get("io",0.)+time.monotonic()-io_started
                     ledger.live_stages = live
                     del panels

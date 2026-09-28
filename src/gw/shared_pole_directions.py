@@ -197,9 +197,12 @@ def _select(k, W, entries, kind, index, recipe, *, real, eigh_plan, svd_plan, co
     tol = recipe["multiplet_relative_tolerance"]
     stack = k.take(tuple(index[sid] for sid, _ in entries))(W)
     if kind == "line":
+        # The n x n eigh of W^H W, not the 2n dilation: the cut (1e-3 relative
+        # in production) is 1e-6 on the normal spectrum, far above round-off.
         return distrib_la.right_singular_vectors(
-            stack, recipe["direction_cutoff"], eigh_plan=svd_plan, column_extent=column_extent,
-            multiplet_tol=tol, real_rows=spectral_rows, max_rank=recipe.get("line_direction_cap"))
+            stack, recipe["direction_cutoff"], eigh_plan=eigh_plan, column_extent=column_extent,
+            multiplet_tol=tol, real_rows=spectral_rows, max_rank=recipe.get("line_direction_cap"),
+            normal=True)
     width = min(logical_n, max(1, int(recipe["imaginary_width"])))
     return leading_response_directions(
         k.negative_hermitian(stack), width, eigh_plan=eigh_plan, column_extent=column_extent,

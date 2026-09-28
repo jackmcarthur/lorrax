@@ -1,8 +1,10 @@
 """Distributed polar factor from a Hermitian-dilation SVD.
 
 The factorization is built from the service's planned eigh operation on
-[[0, A], [A.H, 0]].  It never diagonalizes A.H @ A, which would square the
-condition number.  Only the length-n singular-value vector is replicated;
+[[0, A], [A.H, 0]].  The polar factor never diagonalizes A.H @ A, which would
+square the condition number; a relative-cut direction selection may opt into
+it (``right_singular_vectors(normal=True)``) when the cut squared stays far
+above round-off.  Only the length-n singular-value vector is replicated;
 all matrix-shaped work stays two-dimensionally sharded at P('x','y').
 """
 from __future__ import annotations
@@ -179,6 +181,23 @@ def _retained_column_kernel(
     return select
 
 
+def _normal_matrix(A):
+    """A.H @ A, Hermitian by construction (the normal-matrix direction route)."""
+    g = jnp.matmul(jnp.conj(jnp.swapaxes(A, -1, -2)), A)
+    return (g + jnp.conj(jnp.swapaxes(g, -1, -2))) / 2
+
+
+def _normal_svd(A, eigh):
+    """Ascending singular values and right singular vectors from eigh(A.H @ A).
+
+    A direction selection only, never a polar factor: the normal matrix squares
+    the condition number, so the caller's relative cut must stay far above
+    sqrt(m * eps) (``right_singular_vectors`` refuses otherwise).
+    """
+    evals, v = eigh(_normal_matrix(A))
+    return jnp.sqrt(jnp.maximum(evals, 0)), v
+
+
 def _host_spectrum(s):
     """One O(n) spectrum for all eager rank cuts, including roundoff tails."""
     from jax.experimental.multihost_utils import broadcast_one_to_all
@@ -268,6 +287,30 @@ def retain_leading_eigenvectors(
 
 
 @lru_cache(maxsize=16)
+def _direction_normal_kernel(eigh_plan, ndim):
+    """Right singular directions from the planned m x m eigh of W.H @ W on the face."""
+    tile = NamedSharding(eigh_plan.mesh, P(*((None,) * (ndim - 2)), 'x', 'y'))
+
+    def eigh(h):
+        if h.ndim == 3:
+            return eigh_plan.batched(h)
+        s, q = eigh_plan.batched(h[None])
+        return s[0], q[0]
+
+    @jax.jit(out_shardings=(NamedSharding(eigh_plan.mesh, P()), tile))
+    def extract(w):
+        stack = w.shape if w.ndim == 3 else (1,) + w.shape
+        if eigh_plan.route_for(stack, w.dtype) == ROUTE_BATCH_RESHARD:
+            from distrib_la._batch_reshard import batch_reshard_call
+            s, v = batch_reshard_call("normal_eigh", eigh_plan.mesh,
+                                      (w if w.ndim == 3 else w[None],))
+            return (s[0], v[0]) if w.ndim == 2 else (s, v)
+        return _normal_svd(w, eigh)
+
+    return extract
+
+
+@lru_cache(maxsize=16)
 def _direction_svd_kernel(eigh_plan, ndim):
     """Reuse the planned dilation SVD with each current response as input."""
     tile = NamedSharding(eigh_plan.mesh, P(*((None,) * (ndim - 2)), 'x', 'y'))
@@ -297,7 +340,8 @@ def _direction_svd_kernel(eigh_plan, ndim):
 
 
 def right_singular_vectors(W, tau, *, eigh_plan, column_extent,
-                           multiplet_tol=1e-6, real_rows=None, max_rank=None):
+                           multiplet_tol=1e-6, real_rows=None, max_rank=None,
+                           normal=False):
     """Return right singular directions with sigma/sigma_max > tau.
 
     Parameters
@@ -328,6 +372,12 @@ def right_singular_vectors(W, tau, *, eigh_plan, column_extent,
         Optional cap on each row's retained count: the largest singular
         values above tau, at most max_rank of them, then closed over the
         multiplet at the boundary (a degenerate multiplet is never split).
+    normal
+        Take the directions from the m x m eigh of W.H @ W (``eigh_plan``
+        resolved for m) instead of the 2m dilation: one eighth of the
+        eigensolver flops. The normal matrix squares the condition number,
+        so it is refused unless tau**2 >= 1e4 * m * eps: the cut and the
+        retained span are then resolved to round-off, as on the dilation.
 
     Returns
     -------
@@ -342,21 +392,28 @@ def right_singular_vectors(W, tau, *, eigh_plan, column_extent,
         b0*...*bk rows: Q[b0,...,bk,m,max(r_padded)] keeps the leading axes
         and the spectra nest as tuples in the same order.
     """
-    layout = _direction_input(W, eigh_plan, dilation=True)
+    layout = _direction_input(W, eigh_plan, dilation=not normal)
     tau = _as_rcond(tau)
     if tau is None:
         raise ValueError("tau must be an explicit relative cutoff")
+    if normal and tau ** 2 < 1e4 * W.shape[-1] * np.finfo(np.float64).eps:
+        raise ValueError(f"normal-matrix directions need tau**2 >= 1e4*m*eps; got tau={tau} at m={W.shape[-1]}")
     if real_rows is not None and layout != 'batch':
         raise ValueError("real_rows applies to a batch-layout stack only")
     if W.ndim > 3:
         return _over_leading_axes(lambda w, rows: right_singular_vectors(
             w, tau, eigh_plan=eigh_plan, column_extent=column_extent,
-            multiplet_tol=multiplet_tol, real_rows=rows, max_rank=max_rank),
+            multiplet_tol=multiplet_tol, real_rows=rows, max_rank=max_rank, normal=normal),
             W, eigh_plan.mesh, layout, real_rows)
     if layout == 'batch':
         from distrib_la._batch_reshard import batch_layout_eigh_call
-        s, v = batch_layout_eigh_call("dilation_eigh", eigh_plan.mesh, W, real_rows=real_rows)
-        s = np.maximum(np.asarray(s)[..., W.shape[-1]:], 0)
+        if normal:
+            s, v = batch_layout_eigh_call("normal_eigh", eigh_plan.mesh, W, real_rows=real_rows)
+        else:
+            s, v = batch_layout_eigh_call("dilation_eigh", eigh_plan.mesh, W, real_rows=real_rows)
+            s = np.maximum(np.asarray(s)[..., W.shape[-1]:], 0)
+    elif normal:
+        s, v = _direction_normal_kernel(eigh_plan, W.ndim)(W)
     else:
         s, v = _direction_svd_kernel(eigh_plan, W.ndim)(W)
     values = _host_spectrum(s)
