@@ -362,9 +362,20 @@ def make_sigma_box_spec(
 
 
 def _rule_cache_lookup(
-    directory, box, eps, relative, *, noise_amplification_cap,
+    directory, box, eps, relative, *, noise_amplification_cap, eta=None,
 ):
     """Return the smallest compatible rule plus any unreadable-path warnings.
+
+    COMPATIBLE MEANS CONTAINING, AND FOR A CROSSING BOX NO LARGER THAN A
+    NEIGHBOUR'S BUILD. A cached box must contain the request; a crossing
+    request (``relative`` False) with ``eta`` also needs it inside the
+    request's build box widened twice (:func:`_build_box`): a neighbouring
+    request's own build (one widen) is served, a rule for a much larger box
+    is not. A crossing rule's node count grows with its box (N ~ 2.7 s/eta),
+    so an unbounded containment test served a 693-node rule for a 203-node
+    request: on MoS2 3x3 SC the map-0 probe pass had cached the semicore
+    window [-63.5, +127] eV and the second pass's ω≥E_F conduction window
+    [-35.5, +17.5] eV took it (PARTITION round 4).
 
     Only ``_RULE_CACHE_SCHEMA`` entries are served, and each is authenticated
     against its stored digest before any compatibility filter reads it.
@@ -399,6 +410,10 @@ def _rule_cache_lookup(
             f"path={path} error={type(exc).__name__}: {exc}")
         return None, tuple(warnings)
     best = None
+    # Crossing requests only: a sign-definite rule's node count grows like the
+    # log of its box ratio, so a containing rule of equal count is as good.
+    ceiling = (None if eta is None or relative else
+               _build_box(_build_box(box, eta, widen=True), eta, widen=True))
     for name in sorted(names):
         path = os.path.abspath(os.path.join(directory, name))
         try:
@@ -435,6 +450,8 @@ def _rule_cache_lookup(
                         and cached_box[1] >= box[1]
                         and cached_box[2] <= box[2]
                         and cached_box[3] >= box[3]):
+                    continue
+                if ceiling is not None and not _box_contains(ceiling, cached_box):
                     continue
                 if best is None or rule.node_count < best[0].node_count:
                     best = (rule, name)
@@ -802,7 +819,7 @@ def _fit_rule(spec, eps, cache_dir, eta, *, cache_build_widen=True):
     else:
         cached, cache_lookup_warnings = _rule_cache_lookup(
             cache_dir, requested_box, eps, relative,
-            noise_amplification_cap=noise_amplification_cap)
+            noise_amplification_cap=noise_amplification_cap, eta=eta)
         if cached is not None:
             rule, cache_name = cached
             cache_status = f"hit:{cache_name}"
