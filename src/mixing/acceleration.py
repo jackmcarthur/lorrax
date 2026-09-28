@@ -435,6 +435,14 @@ def anderson_nojit(
         if print_fn is not None:
             print_fn(f"  Anderson step {it:02d}: window {n_used + 1}"
                      f"{', secant fallback to the best pair' if fallback else ''}")
+            if os.environ.get("LORRAX_FESC_DUMP"):
+                _a = np.real(np.asarray(alpha))
+                _fn = [float(jnp.sqrt(jnp.sum(jnp.abs(_weighted(Fw[i])) ** 2)))
+                       for i in range(Fw.shape[0])]
+                print_fn("  FESC alpha step %02d: filled=%d n_used=%d alpha=[%s] "
+                         "|f_i|w=[%s]" % (it, filled, n_used,
+                                          " ".join(f"{v:+.3e}" for v in _a),
+                                          " ".join(f"{v:.3e}" for v in _fn)))
         Xhist = Xhist.at[head].set(x)
         Fhist = Fhist.at[head].set(f)
         head = (head + 1) % m
