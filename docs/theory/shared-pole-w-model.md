@@ -312,7 +312,7 @@ Placement is a condenser problem, not a choice of interesting frequencies:
   negative $\lambda$ of order $-u^2$ (Na 8³, 86 bands, $D_{\max}=150$ eV: a
   320 eV site gives 60 negative Ritz values down to $-110$ Ry² and refuses the
   zero-Ritz gate; a 640 eV site $-2000$ Ry²; sites $\le 160$ eV give none,
-  claim 2913). Nothing here is metallic: the Si set 1/$\sqrt{320}$/320 eV works
+  claim 2915). Nothing here is metallic: the Si set 1/$\sqrt{320}$/320 eV works
   on the 536-band Si reference because its $D_{\max}=332$ eV. For a metal
   $E_g=0$, so $u_{\min}=4\eta$; the plasmon lies inside the ladder and the
   $q\to0$ Drude/Fermi-surface term is the head's (Section 7 of the
