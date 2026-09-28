@@ -357,10 +357,10 @@ def jdos_from_transitions(d_alpha, de_cv, omegas_Ry, V_cell, n_k, eta_Ry,
     """Independent-particle ε₂⁰(ω) — the 4th column of BGW's absorption_*.dat.
 
     THIS IS THE SINGLE SITE, for the same reason
-    :func:`exciton_dipole_projections` is: the two absorption drivers
-    (``absorption_eigvecs``, ``absorption_haydock``) each carried their own
-    copy of this formula with the arguments in a different order, and one of
-    them inlined the Lorentzian instead of calling
+    :func:`exciton_dipole_projections` is: ``absorption_haydock`` and a second
+    absorption driver (the eigenvector route, since deleted) each carried
+    their own copy of this formula with the arguments in a different order,
+    and one of them inlined the Lorentzian instead of calling
     :func:`lorentzian_broaden`.
 
     ``f^α_{cvk} = |d^α_{cvk}|²`` at transition energies ``ΔE_cv``, broadened

@@ -414,6 +414,9 @@ $n_{f'}$ the cross rows of a photon family (absent on a charge bank) and $r_f$
 the carrier of the family's line cap. On Fe $8^3$ bispinor ($N_q=59$,
 $d=3164$, 14 line and 8 dense samples) this is 28.5 face tiles per parent
 against 77 with dense line samples. The producer's selection adds, beside one
-group's carry, the endpoint blocks of $W$ and $\partial_sW$ ($2\lceil N_q/P\rceil d^2$
-on the local route) and one $n\times n$ eigensystem of $W^\dagger W$
-(`line_selection_price`).
+group's carry, the endpoint blocks of $W$ and $\partial_sW$ and the
+$n\times n$ normal matrix $W^\dagger W$ with its eigenvectors, $n$ the largest
+family's rows (`line_selection_price`). On the local route that is
+$16\,(2\lceil N_q/P\rceil d^2 + 2n^2)$ B per rank, one parent at a time; on
+the face route $16\,(2N_q d^2 + 2N_q n^2)/P$, every parent of the stack at
+once. The eigh service's workspace comes on top.
