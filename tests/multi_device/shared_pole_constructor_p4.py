@@ -131,10 +131,8 @@ def run_checks(mesh):
                       z_ry=[.2j, .2j], role=[0, 1], held=[False, False],
                       direction_cutoff=.125, imaginary_width=2,
                       multiplet_relative_tolerance=1e-6)
-        svd = distrib_la.plan("eigh", mesh, n=16, backend=resolution.eigh_backend,
-                              batched_route=resolution.batched_route)
         selected, selected_counts, roles = round_states(
-            mesh, lambda slot, i: (host_sample, host_sample * .01), recipe, n=8, eig=pe, svd=svd,
+            mesh, lambda slot, i: (host_sample, host_sample * .01), recipe, n=8, eig=pe,
             extent=lambda width: 2*((width+1)//2))
         assert len(selected) == 2
         assert [role["width"] for role in roles[0]] == [3, 3], roles

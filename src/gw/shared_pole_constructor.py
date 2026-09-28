@@ -172,7 +172,7 @@ def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output):
         conservative_side = constructor_side_upper_bound(
             recipe, ordered=ordered, odd_moments=odd_moments,
             logical_n=logical_n, column_extent=column_extent)
-        eig, svd = budget.eigenplan(n), budget.eigenplan(2*n)
+        eig = budget.eigenplan(n)
         receipts, factors, store_poles, store_counts, placed = {}, [], [], [], []
         receipt_entry_start = 0
         held_ids = [int(i) for i in recipe["held_ids"]]
@@ -239,7 +239,7 @@ def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output):
                            for sid, (panels, counts) in line.items()}
             round_states, round_counts, round_roles = select_round_states(
                 samples, recipe, sample_ids=dense_fit, real=real, mesh_xy=mesh_xy, eigh_plan=eig,
-                svd_plan=svd, column_extent=column_extent, logical_n=logical_n, ordered=ordered,
+                column_extent=column_extent, logical_n=logical_n, ordered=ordered,
                 line_states=line_states)
             del samples, line, line_states, qi
         with timing.section("spole.reduction_admission"):

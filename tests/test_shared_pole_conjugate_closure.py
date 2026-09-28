@@ -31,7 +31,6 @@ def check(mesh):
         return padded_axis(width, mesh, name='closure_port',
                            specs=((P('x', 'y'), 0), (P('x', 'y'), 1))).carrier
     ep = D.plan('eigh', mesh, n=8, backend='off', batched_route='batch_reshard')
-    sp = D.plan('eigh', mesh, n=16, backend='off', batched_route='batch_reshard')
     def mm(a, b, **kwargs):
         # Provider-free staged route: 'auto' would resolve and probe a 2-D
         # provider, which needs one JAX process per mesh cell.
@@ -47,7 +46,7 @@ def check(mesh):
                       multiplet_relative_tolerance=1e-6)
         ranks = jax.device_count()
         round_, counts, roles = round_states(
-            mesh, lambda slot, i: sample(points[i]), recipe, n=8, eig=ep, svd=sp, extent=extent, batch=True)
+            mesh, lambda slot, i: sample(points[i]), recipe, n=8, eig=ep, extent=extent, batch=True)
         assert round_[1][1] is round_[0][2] and round_[3][1] is round_[2][2]
         m1, m3 = c @ adj(c)/2, (c*poles) @ adj(c)/2
         qi = np.linalg.eigh(m1)[1][:, -2:]

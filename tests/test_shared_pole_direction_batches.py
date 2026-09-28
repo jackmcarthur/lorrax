@@ -45,7 +45,6 @@ def check_direction_batches(mesh, arms=(_LOCAL_ARM, _DISTRIBUTED_ARM)):
     rows = []
     for label, backend, route in arms:
         ep = D.plan('eigh', mesh, n=n, backend=backend, batched_route=route)
-        sp = D.plan('eigh', mesh, n=2*n, backend=backend, batched_route=route)
         def project(q):
             # The staged route is provider-free; 'auto' would resolve a 2-D provider.
             return D.matmul(q, q, transb='C', mesh=mesh,
@@ -55,7 +54,7 @@ def check_direction_batches(mesh, arms=(_LOCAL_ARM, _DISTRIBUTED_ARM)):
                                                ('eigh', h, [3, 2, 2])]:
             def select(matrix):
                 if name == 'svd':
-                    return D.right_singular_vectors(matrix, .49, eigh_plan=sp,
+                    return D.right_singular_vectors(matrix, .49, eigh_plan=ep,
                                                      column_extent=extent)
                 return D.leading_eigenvectors(matrix, 2, eigh_plan=ep,
                                                column_extent=extent)
@@ -81,7 +80,7 @@ def check_direction_batches(mesh, arms=(_LOCAL_ARM, _DISTRIBUTED_ARM)):
         rotate = unitary()
         changed = w @ rotate
         q, values = D.right_singular_vectors(put(changed), .49,
-                    eigh_plan=sp, column_extent=extent)
+                    eigh_plan=ep, column_extent=extent)
         changed_right = adjoint(rotate) @ right
         got = project(q)
         changed_errors, stale_errors = [], []

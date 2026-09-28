@@ -274,8 +274,7 @@ def _round_setup():
     extent = lambda width: padded_axis(width, mesh, name="round_port",
                                        specs=((P("x", "y"), 0), (P("x", "y"), 1))).carrier
     ep = D.plan("eigh", mesh, n=8, backend="off", batched_route="batch_reshard")
-    sp = D.plan("eigh", mesh, n=16, backend="off", batched_route="batch_reshard")
-    return mesh, extent, ep, sp
+    return mesh, extent, ep
 
 
 def _round_infinity(mesh, plants, orders):
@@ -296,7 +295,7 @@ def test_round_program_pairs_mirrors_on_parents_of_different_sides():
     import jax
     from shared_pole_round_helpers import round_states
     from gw.shared_pole_local import reduce_round, round_tables
-    mesh, extent, ep, sp = _round_setup()
+    mesh, extent, ep = _round_setup()
     n = 8
     plants = [_trim(np.random.default_rng(41), 6, n, eps=.4), _trim(np.random.default_rng(42), 3, n, eps=.4)]
     slot_plants = [plants[0], plants[1], plants[1], plants[1]]
@@ -306,7 +305,7 @@ def test_round_program_pairs_mirrors_on_parents_of_different_sides():
                   imaginary_width=4, multiplet_relative_tolerance=1e-6)
     at = lambda plant, z: (plant.F(z), plant.dF(z) / (2 * z))
     states, counts, roles = round_states(
-        mesh, lambda slot, i: at(slot_plants[slot], nodes[i]), recipe, n=n, eig=ep, svd=sp, extent=extent,
+        mesh, lambda slot, i: at(slot_plants[slot], nodes[i]), recipe, n=n, eig=ep, extent=extent,
         ordered=True, real=2, batch=True,
         partner=lambda slot, i: at(slot_plants[slot], -np.conj(nodes[i])))
     half = len(states) // 2
@@ -342,7 +341,7 @@ def test_dedupe_drops_duplicate_partners_and_equals_even_on_symmetric_data():
     import jax
     from shared_pole_round_helpers import round_states
     from gw.shared_pole_local import reduce_round, round_tables
-    mesh, extent, ep, sp = _round_setup()
+    mesh, extent, ep = _round_setup()
     n = 8
     plant = _trim(np.random.default_rng(43), 6, n, eps=0.)
     nodes = [.9 + .35j, 1.7 + .6j, .5j, .35j]
@@ -353,7 +352,7 @@ def test_dedupe_drops_duplicate_partners_and_equals_even_on_symmetric_data():
     for label, ordered in (("even", False), ("ordered", True)):
         at = lambda z: (plant.F(z), plant.dF(z) / (2 * z))
         states, counts, _ = round_states(
-            mesh, lambda slot, i: at(nodes[i]), recipe, n=n, eig=ep, svd=sp, extent=extent,
+            mesh, lambda slot, i: at(nodes[i]), recipe, n=n, eig=ep, extent=extent,
             ordered=ordered, batch=True, partner=lambda slot, i: at(-np.conj(nodes[i])))
         if ordered:
             assert len(states) == 12

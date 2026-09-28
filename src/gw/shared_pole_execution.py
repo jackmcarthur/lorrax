@@ -77,16 +77,17 @@ def line_selection_price(rows, *, mesh, nq, execution):
     Live beside the caller's reservations: the selection copies of every
     endpoint block of W and of dW/ds (16 * 2 * sum_fg n_f n_g per parent;
     whole parents per rank, ceil(nq/P) of them, on the local route; tiles on
-    the face) and the largest family's 2n dilation eigensystem (its matrix and
-    vectors, one parent at a time on the local route), plus the service's
-    native eigh workspace. The panels are narrow and ride in the same bound.
+    the face) and the largest family's n x n normal matrix W^H W with its
+    eigenvectors (one parent at a time on the local route), plus the
+    service's native eigh workspace. The panels are narrow and ride in the
+    same bound.
     """
     import math
     import distrib_la
     from gw.shared_pole_capacity import constructor_eigenplan
     ranks = int(mesh.size)
     blocks = sum(int(a) * int(b) for a in rows for b in rows)
-    largest = 2 * max(int(r) for r in rows)
+    largest = max(int(r) for r in rows)
     plan = constructor_eigenplan(mesh, largest, execution)
     if execution == 'local':
         resident = 16 * (2 * math.ceil(int(nq) / ranks) * blocks + 2 * largest ** 2)

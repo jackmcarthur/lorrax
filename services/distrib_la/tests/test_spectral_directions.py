@@ -114,7 +114,7 @@ def test_leading_axes_select_like_the_flattened_batch():
         return jax.make_array_from_callback(a.shape, NamedSharding(mesh, spec), lambda idx: a[idx])
     extent = lambda r: 2 * ((r + 1) // 2)
     arms = (('svd', w, lambda a: D.right_singular_vectors(
-                a, 1e-3, eigh_plan=D.plan('eigh', mesh, backend='off', n=2 * n, batched_route='batch_reshard'),
+                a, 1e-3, eigh_plan=D.plan('eigh', mesh, backend='off', n=n, batched_route='batch_reshard'),
                 column_extent=extent)),
             ('eigh', h, lambda a: D.leading_eigenvectors(
                 a, 5, eigh_plan=D.plan('eigh', mesh, backend='off', n=n, batched_route='batch_reshard'),
@@ -159,7 +159,7 @@ def check_directions_and_gemm(mesh):
     rows = []
     for label, backend, route in [('local', 'off', 'batch_reshard'),
                                    ('distributed', 'distributed', 'auto')]:
-        eig = D.plan('eigh', mesh, backend=backend, n=24, batched_route=route)
+        eig = D.plan('eigh', mesh, backend=backend, n=12, batched_route=route)
         q, s = D.right_singular_vectors(put(w), .4999999, eigh_plan=eig,
                                         column_extent=lambda r: 6)
         assert s.size == 3, (label, s)

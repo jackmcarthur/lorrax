@@ -54,10 +54,10 @@ def validate_batch_reshard_operands(
     collective is entered.  The route accepts a ragged leading batch and
     pads it itself, but the matrix face must already tile the mesh.
     """
-    if op not in ("eigh", "checked_eigh", "dilation_eigh", "cholesky", "solve_lu"):
+    if op not in ("eigh", "checked_eigh", "normal_eigh", "cholesky", "solve_lu"):
         raise ValueError(
             f"batch_reshard: unsupported op {op!r}; expected "
-            "eigh|checked_eigh|dilation_eigh|cholesky|solve_lu")
+            "eigh|checked_eigh|normal_eigh|cholesky|solve_lu")
     expected = 2 if op == "solve_lu" else 1
     if len(ops) != expected:
         raise ValueError(
@@ -408,14 +408,15 @@ def batch_layout_eigh_call(op: str, mesh: Mesh, A, *, real_rows: int | None = No
     once) and skips rows whose global index is ``>= real_rows`` with a scalar
     ``lax.cond``: their outputs are exact zeros. Eigenvalues return replicated
     through one ``all_gather``; vectors stay in batch layout. ``op`` is
-    ``eigh``, ``checked_eigh`` or ``dilation_eigh`` (the right singular
-    vectors of ``A``, spectrum of length ``2N``), the same kernels as
+    ``eigh``, ``checked_eigh`` or ``normal_eigh`` (the right singular
+    vectors of ``A`` from the N x N eigh of ``A.H @ A``; the spectrum is the
+    N singular values, ascending), the same kernels as
     :func:`batch_reshard_call`, so a batch-layout call equals the face route's
     local solve row for row.
     """
-    if op not in ("eigh", "checked_eigh", "dilation_eigh"):
+    if op not in ("eigh", "checked_eigh", "normal_eigh"):
         raise ValueError(
-            f"batch layout: unsupported op {op!r}; expected eigh|checked_eigh|dilation_eigh")
+            f"batch layout: unsupported op {op!r}; expected eigh|checked_eigh|normal_eigh")
     axes = tuple(mesh.axis_names)
     if "x" not in axes or "y" not in axes:
         raise ValueError(f"batch layout: expected a mesh with ('x','y'), got {axes!r}")
@@ -436,22 +437,20 @@ def batch_layout_eigh_call(op: str, mesh: Mesh, A, *, real_rows: int | None = No
         spec = P(("x", "y"), None, None)
 
         def _body(local):
-            from distrib_la.polar import _dilation_vectors, _hermitian_dilation
+            from distrib_la.polar import _normal_svd
             local_nb = int(local.shape[0])
             first = (jax.lax.axis_index("x") * py + jax.lax.axis_index("y")) * local_nb
-            width = 2 * n if op == "dilation_eigh" else n
-            w0 = jnp.zeros((local_nb, width), dtype=jnp.real(local).dtype)
+            w0 = jnp.zeros((local_nb, n), dtype=jnp.real(local).dtype)
             z0 = jnp.zeros_like(local)
 
             def _work(a):
-                if op == "dilation_eigh":
-                    values, vectors = jnp.linalg.eigh(_hermitian_dilation(a))
-                    return values, _dilation_vectors(vectors, n)[1]
+                if op == "normal_eigh":
+                    return _normal_svd(a, jnp.linalg.eigh)
                 result = _checked_eigh(a) if op == "checked_eigh" else jnp.linalg.eigh(a)
                 return result[0], result[1]
 
             def _skip(a):
-                return (jnp.zeros((1, width), dtype=jnp.real(a).dtype), jnp.zeros_like(a))
+                return (jnp.zeros((1, n), dtype=jnp.real(a).dtype), jnp.zeros_like(a))
 
             def _one(i, acc):
                 W, Z = acc
@@ -478,10 +477,10 @@ def batch_reshard_call(
 
     The returned arrays obey the ordinary :meth:`Plan.batched` layout:
     matrix outputs at ``P(None,'x','y')`` and eigh eigenvalues replicated.
-    The service-internal ``dilation_eigh`` operation transports the original
-    square response and its right singular vectors. Dilation construction
-    and extraction use the polar owner's equations around the same local
-    eigh; its full length-2n spectrum keeps the ordinary vector gather.
+    The service-internal ``normal_eigh`` operation transports the original
+    square response and returns its right singular vectors and singular
+    values from the local eigh of ``A.H @ A`` (the polar owner's
+    ``_normal_svd``); the length-n spectrum keeps the ordinary vector gather.
     """
     ops = tuple(ops)
     nbatch, batch_pad = validate_batch_reshard_operands(op, mesh, ops)
@@ -495,7 +494,7 @@ def batch_reshard_call(
     fn = _JIT_CACHE.get(key)
     if fn is None:
         in_specs = tuple(P(None, "x", "y") for _ in ops)
-        out_specs = ((P(), P(None, "x", "y")) if op in ("eigh", "checked_eigh", "dilation_eigh")
+        out_specs = ((P(), P(None, "x", "y")) if op in ("eigh", "checked_eigh", "normal_eigh")
                      else P(None, "x", "y"))
 
         def _body(*local_faces):
@@ -504,11 +503,14 @@ def batch_reshard_call(
                 for a in local_faces)
             A = local[0]
 
-            if op in ("eigh", "checked_eigh", "dilation_eigh"):
-                if op == "dilation_eigh":
-                    from distrib_la.polar import _hermitian_dilation, _dilation_vectors
-                    n = A.shape[-1]
-                    A = _hermitian_dilation(A)
+            if op == "normal_eigh":
+                from distrib_la.polar import _normal_matrix
+                G = _normal_matrix(A)
+                W, Z = (_dense_real_rows("eigh", G, nbatch=nbatch, py=py)
+                        if batch_pad else jnp.linalg.eigh(G))
+                W = _replicate_batch_vector(jnp.sqrt(jnp.maximum(W, 0)), px=px, py=py)[:nbatch]
+                return W, _batch_to_face(Z, px=px, py=py)[:nbatch]
+            if op in ("eigh", "checked_eigh"):
                 if batch_pad:
                     W, Z = _dense_real_rows(
                         "checked_eigh" if op == "checked_eigh" else "eigh",
@@ -516,8 +518,6 @@ def batch_reshard_call(
                 else:
                     W, Z = _checked_eigh(A) if op == "checked_eigh" else jnp.linalg.eigh(A)
                 W = _replicate_batch_vector(W, px=px, py=py)[:nbatch]
-                if op == "dilation_eigh":
-                    _, Z = _dilation_vectors(Z, n)
                 Z = _batch_to_face(Z, px=px, py=py)[:nbatch]
                 return W, Z
             if op == "cholesky":

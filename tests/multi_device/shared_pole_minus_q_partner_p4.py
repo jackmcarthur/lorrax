@@ -55,10 +55,10 @@ def main():
                   held=np.array([False]), fit_ids=np.array([0]), direction_cutoff=1e-3,
                   multiplet_relative_tolerance=1e-6, line_direction_cap=None)
     extent = lambda width: 2 * ((width + 1) // 2)
-    eig, svd = constructor_eigenplan(mesh, n, 'local'), constructor_eigenplan(mesh, 2 * n, 'local')
+    eig = constructor_eigenplan(mesh, n, 'local')
     W, dW = value(z, square, square)
     line = line_sample_states(stack(W), stack(dW), recipe, sid=0, ordered=True, real=3, mesh_xy=mesh,
-                              eigh_plan=eig, svd_plan=svd, column_extent=extent, logical_n=n)
+                              eigh_plan=eig, column_extent=extent, logical_n=n)
     counts = line['counts'].tolist()
     expected = [int(np.sum(s > 1e-3 * s[0])) for s in np.linalg.svd(W[:3], compute_uv=False)]
     assert counts == expected + [0], (counts, expected)

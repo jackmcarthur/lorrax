@@ -1,8 +1,11 @@
 """Distributed polar factor from a Hermitian-dilation SVD.
 
 The factorization is built from the service's planned eigh operation on
-[[0, A], [A.H, 0]].  It never diagonalizes A.H @ A, which would square the
-condition number.  Only the length-n singular-value vector is replicated;
+[[0, A], [A.H, 0]].  The polar factor never diagonalizes A.H @ A, which would
+square the condition number.  Relative-cut direction selection
+(``right_singular_vectors``) does, on the m x m normal matrix: its cut
+squared stays far above round-off, and it costs an eighth of the 2m
+dilation eigensolve.  Only the length-n singular-value vector is replicated;
 all matrix-shaped work stays two-dimensionally sharded at P('x','y').
 """
 from __future__ import annotations
@@ -86,15 +89,15 @@ def _layout_spec(layout, ndim):
     return P(*((None,) * (ndim - 2)), 'x', 'y')
 
 
-def _direction_input(W, eig, dilation=False):
+def _direction_input(W, eig):
     """Validate a direction operand; return its layout, ``'face'`` or ``'batch'``."""
     if isinstance(W, jax.core.Tracer):
         raise ValueError("spectral direction selection is an eager construction stage")
     if W.ndim < 2 or W.shape[-2] != W.shape[-1]:
         raise ValueError("spectral directions require a square rank-2 matrix or a batch of them")
     _validate_dtype(W.dtype)
-    if eig.op != 'eigh' or eig.n not in (None, W.shape[-1] * (2 if dilation else 1)):
-        raise ValueError("eigh_plan must match the matrix/dilation extent")
+    if eig.op != 'eigh' or eig.n not in (None, W.shape[-1]):
+        raise ValueError("eigh_plan must match the matrix extent")
     if W.sharding.is_equivalent_to(NamedSharding(eig.mesh, _layout_spec('face', W.ndim)), W.ndim):
         return 'face'
     if W.ndim >= 3 and W.sharding.is_equivalent_to(
@@ -177,6 +180,18 @@ def _retained_column_kernel(
         active = jnp.arange(extent) < count[..., None]
         return jnp.where(active[..., None, :], selected, 0)
     return select
+
+
+def _normal_matrix(A):
+    """A.H @ A of a local (whole-matrix) stack, Hermitian by construction."""
+    g = jnp.matmul(jnp.conj(jnp.swapaxes(A, -1, -2)), A)
+    return (g + jnp.conj(jnp.swapaxes(g, -1, -2))) / 2
+
+
+def _normal_svd(A, eigh):
+    """Ascending singular values and right singular vectors from eigh(A.H @ A)."""
+    evals, v = eigh(_normal_matrix(A))
+    return jnp.sqrt(jnp.maximum(evals, 0)), v
 
 
 def _host_spectrum(s):
@@ -269,29 +284,29 @@ def retain_leading_eigenvectors(
 
 @lru_cache(maxsize=16)
 def _direction_svd_kernel(eigh_plan, ndim):
-    """Reuse the planned dilation SVD with each current response as input."""
-    tile = NamedSharding(eigh_plan.mesh, P(*((None,) * (ndim - 2)), 'x', 'y'))
+    """Right singular vectors of the current face-tiled responses from the m x m normal matrix.
 
-    def eigh(h):
-        if h.ndim == 3:
-            return eigh_plan.batched(h)
-        s, q = eigh_plan.batched(h[None])
-        return s[0], q[0]
+    A batch-reshard plan moves whole matrices and forms W.H W and its eigh
+    rank-locally; a whole-mesh plan forms W.H W with the service's
+    distributed GEMM and solves it with the planned eigh. Only the length-m
+    spectrum replicates.
+    """
+    from distrib_la.matmul import matmul
+    tile = NamedSharding(eigh_plan.mesh, P(*((None,) * (ndim - 2)), 'x', 'y'))
 
     @jax.jit(out_shardings=(NamedSharding(eigh_plan.mesh, P()), tile))
     def extract(w):
-        stack = w.shape if w.ndim == 3 else (1,) + w.shape
-        if eigh_plan.route_for(stack[:1] + (2 * stack[-2], 2 * stack[-1]), w.dtype) == ROUTE_BATCH_RESHARD:
+        stack = w if w.ndim == 3 else w[None]
+        if eigh_plan.route_for(stack.shape, w.dtype) == ROUTE_BATCH_RESHARD:
             from distrib_la._batch_reshard import batch_reshard_call
-            # Move W and V; the unchanged 2m eigensystem stays q-local.
-            evals, v = batch_reshard_call(
-                "dilation_eigh", eigh_plan.mesh,
-                (w if w.ndim == 3 else w[None],))
-            if w.ndim == 2:
-                evals, v = evals[0], v[0]
-            return jnp.maximum(evals[..., w.shape[-1]:], 0), v
-        s, _, v = _dilation_svd(w, eigh, shifted=eigh_plan.backend == "cusolvermp")
-        return s, v
+            s, v = batch_reshard_call("normal_eigh", eigh_plan.mesh, (stack,))
+        else:
+            g = matmul(stack, stack, mesh=eigh_plan.mesh, transa="C",
+                       backend="distributed", batched_route="auto")
+            g = (g + jnp.conj(jnp.swapaxes(g, -1, -2))) / 2
+            evals, v = eigh_plan.batched(g)
+            s = jnp.sqrt(jnp.maximum(evals, 0))
+        return (s, v) if w.ndim == 3 else (s[0], v[0])
 
     return extract
 
@@ -313,8 +328,11 @@ def right_singular_vectors(W, tau, *, eigh_plan, column_extent,
         Finite nonnegative relative cutoff; whole adjacent multiplets at
         relative gap <= multiplet_tol survive a boundary crossing.
     eigh_plan
-        Resolved service eigh Plan for 2m. Its batched route owns the
-        local/distributed policy, including dilation workspace.
+        Resolved service eigh Plan for m. Its batched route owns the
+        local/distributed policy. The directions are the eigenvectors of
+        the m x m normal matrix W.H W, sigma = sqrt(max(lambda, 0)); the
+        relative cut tau is tau**2 on lambda, so tau**2 must stay far above
+        round-off: tau**2 >= 1e4 * m * eps is required.
     column_extent
         Eager callable from physical retained rank to caller-planned padded
         width, which must tile y. Padding policy belongs to the caller.
@@ -342,10 +360,13 @@ def right_singular_vectors(W, tau, *, eigh_plan, column_extent,
         b0*...*bk rows: Q[b0,...,bk,m,max(r_padded)] keeps the leading axes
         and the spectra nest as tuples in the same order.
     """
-    layout = _direction_input(W, eigh_plan, dilation=True)
+    layout = _direction_input(W, eigh_plan)
     tau = _as_rcond(tau)
     if tau is None:
         raise ValueError("tau must be an explicit relative cutoff")
+    if tau ** 2 < 1e4 * W.shape[-1] * np.finfo(np.float64).eps:
+        raise ValueError(f"right_singular_vectors: tau={tau} at m={W.shape[-1]} is too close to round-off "
+                         "for the normal-matrix spectrum; want tau**2 >= 1e4*m*eps")
     if real_rows is not None and layout != 'batch':
         raise ValueError("real_rows applies to a batch-layout stack only")
     if W.ndim > 3:
@@ -355,8 +376,7 @@ def right_singular_vectors(W, tau, *, eigh_plan, column_extent,
             W, eigh_plan.mesh, layout, real_rows)
     if layout == 'batch':
         from distrib_la._batch_reshard import batch_layout_eigh_call
-        s, v = batch_layout_eigh_call("dilation_eigh", eigh_plan.mesh, W, real_rows=real_rows)
-        s = np.maximum(np.asarray(s)[..., W.shape[-1]:], 0)
+        s, v = batch_layout_eigh_call("normal_eigh", eigh_plan.mesh, W, real_rows=real_rows)
     else:
         s, v = _direction_svd_kernel(eigh_plan, W.ndim)(W)
     values = _host_spectrum(s)

@@ -370,13 +370,15 @@ leading `r` eigenvectors with the boundary multiplet closed; `rcond` further
 bounds the width by eigenvalues above `rcond·max|λ|`. Both are eager: `W` is a
 square face `P('x','y')`, a face stack `P(None,'x','y')`, or a batch-layout
 stack (solved rank-locally, returned in batch layout, `real_rows` marking
-synthetic trailing slots). `eigh_plan` is the caller's resolved eigh plan (of
-extent 2m for singular vectors); its route owns the local/distributed choice.
-Only the O(m) spectra cross the host, broadcast from one process as bit
-patterns so every rank makes the same cut. On a cuSOLVERMp plan the dilation
-is solved as the positive matrix $I + H/\lVert W\rVert_F$ and the eigenvalues
-mapped back by $(\lambda - 1)\lVert W\rVert_F$ (provider route only), which avoids a reproduced
-cuSOLVERMp STEDC convergence failure without changing eigenvectors or cuts.
+synthetic trailing slots). `eigh_plan` is the caller's resolved eigh plan of
+extent m; its route owns the local/distributed choice. Singular directions are
+the eigenvectors of the m×m normal matrix $W^\dagger W$ (formed rank-locally on
+the batch routes, with the service GEMM on the whole mesh), σ = √max(λ, 0):
+one eighth of the eigensolver flops of the 2m dilation. The cut is τ² on λ, so
+`right_singular_vectors` refuses τ² < 10⁴·m·ε (the shared-pole cuts are 10⁻³
+and 10⁻²). The polar factor keeps the dilation. Only the O(m) spectra cross
+the host, broadcast from one process as bit patterns so every rank makes the
+same cut.
 
 ## q-local batch with resident operands
 

@@ -25,7 +25,7 @@ def test_direction_cap_keeps_the_largest_and_closes_the_boundary_multiplet():
     spectrum = np.array([9.0, 8.0, 6.0, 6.0, 4.0, 3.0, 2.0, 1.0])
     w = np.stack([(u * spectrum) @ v.conj().T])
     face = jax.make_array_from_callback(w.shape, NamedSharding(mesh, P(None, "x", "y")), lambda i: w[i])
-    plan = D.plan("eigh", mesh, backend="off", n=2 * n, batched_route="batch_reshard")
+    plan = D.plan("eigh", mesh, backend="off", n=n, batched_route="batch_reshard")
     counts = {}
     for cap in (None, 5, 3, 2):
         _, values = D.right_singular_vectors(face, 0.3, eigh_plan=plan, column_extent=lambda r: 2 * ((r + 1) // 2),

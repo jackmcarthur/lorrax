@@ -14,7 +14,7 @@ layout, counts [P, A]).
 import numpy as np
 
 
-def round_states(mesh, sample, recipe, *, n, eig, svd, extent, ordered=False, slot=0, real=None,
+def round_states(mesh, sample, recipe, *, n, eig, extent, ordered=False, slot=0, real=None,
                  partner=None, batch=False):
     import jax
     from jax.sharding import NamedSharding, PartitionSpec as P
@@ -43,7 +43,7 @@ def round_states(mesh, sample, recipe, *, n, eig, svd, extent, ordered=False, sl
     for sid in line:
         W, dW = stack([sid], sample)
         selected = line_sample_states(W, dW, recipe, sid=sid, ordered=ordered, real=real, mesh_xy=mesh,
-                                      eigh_plan=eig, svd_plan=svd, column_extent=extent, logical_n=n)
+                                      eigh_plan=eig, column_extent=extent, logical_n=n)
         mirrors = (line_sample_mirrors(selected, stack([sid], partner), recipe, sid=sid, mesh_xy=mesh)
                    if ordered else [])
         states = selected["states"] + mirrors
@@ -53,7 +53,7 @@ def round_states(mesh, sample, recipe, *, n, eig, svd, extent, ordered=False, sl
     W, dW = stack(dense, sample)
     states, counts, roles = select_round_states(
         dict(Wc=W, dWc_ds=dW), recipe, sample_ids=dense, real=real, mesh_xy=mesh, eigh_plan=eig,
-        svd_plan=svd, column_extent=extent, logical_n=n, ordered=ordered, line_states=line_states)
+        column_extent=extent, logical_n=n, ordered=ordered, line_states=line_states)
     if batch:
         return states, counts, roles
     to_face, take = batch_to_face(mesh), face_rows(mesh, (slot,))

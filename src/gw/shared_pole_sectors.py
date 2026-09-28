@@ -658,7 +658,6 @@ def construct_diagonal_sector_round(samples, moments, meta, config, geometry, *,
     budget.plan(0,phase='selection',sample_batch=samples['Wc'].shape[1],
                 selection_faces=selection_faces)
     eig=budget.eigenplan(local_meta.n_rmu_padded)
-    svd=budget.eigenplan(2*local_meta.n_rmu_padded)
     extent=port_extent(mesh_xy)
     qi,values=leading_response_directions(moments['M1'],min(n,recipe['infinity_width']),
         eigh_plan=eig,column_extent=extent,multiplet_tol=recipe['multiplet_relative_tolerance'],
@@ -671,7 +670,7 @@ def construct_diagonal_sector_round(samples, moments, meta, config, geometry, *,
                                        recipe,sid=sid,ordered=True,mesh_xy=mesh_xy)
                  for sid,(panels,counts) in line.items()}
     states,counts,roles=select_round_states(samples,recipe,sample_ids=geometry['sample_ids'],
-        real=real,mesh_xy=mesh_xy,eigh_plan=eig,svd_plan=svd,column_extent=extent,
+        real=real,mesh_xy=mesh_xy,eigh_plan=eig,column_extent=extent,
         logical_n=n,ordered=True,line_states=line_states)
     del line_states
     # Reuse admitted carrier widths across this model's later SC maps.

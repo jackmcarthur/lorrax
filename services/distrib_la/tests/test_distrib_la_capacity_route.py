@@ -61,7 +61,7 @@ def test_batch_layout_selection_equals_the_face_route_bitwise(leading):
     none = (None,) * (len(leading) - 1)
     face = P(*((None,) * len(leading)), "x", "y")
     batch = P(("x", "y"), *none, None, None)
-    svd = D.plan("eigh", mesh, backend="off", n=2 * n, batched_route="batch_reshard")
+    svd = D.plan("eigh", mesh, backend="off", n=n, batched_route="batch_reshard")
     eig = D.plan("eigh", mesh, backend="off", n=n, batched_route="batch_reshard")
     for name, matrix, select in (
             ("svd", w, lambda a: D.right_singular_vectors(a, 1e-3, eigh_plan=svd, column_extent=extent)),
@@ -93,7 +93,7 @@ def test_real_rows_never_solve_synthetic_slots(monkeypatch):
 
     monkeypatch.setattr(jnp.linalg, "eigh", counted)
     br._JIT_CACHE.clear()
-    svd = D.plan("eigh", mesh, backend="off", n=2 * n, batched_route="batch_reshard")
+    svd = D.plan("eigh", mesh, backend="off", n=n, batched_route="batch_reshard")
     q, values = D.right_singular_vectors(_put(w, mesh, P(("x", "y"), None, None, None)), 1e-3,
                                          eigh_plan=svd, column_extent=lambda r: 2 * ((r + 1) // 2),
                                          real_rows=3)

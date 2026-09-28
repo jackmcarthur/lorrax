@@ -185,11 +185,12 @@ def _role_entries(recipe):
     return entries
 
 
-def _select(k, W, entries, kind, index, recipe, *, real, eigh_plan, svd_plan, column_extent, logical_n):
+def _select(k, W, entries, kind, index, recipe, *, real, eigh_plan, column_extent, logical_n):
     """Directions of every ``kind`` entry, one batched service call over [parent x sample].
 
     Line supports take the right singular vectors of W above the relative cutoff,
-    at most the line cap, closed over the boundary multiplet; imaginary supports
+    at most the line cap, closed over the boundary multiplet (the n x n eigh of
+    W^H W: the 1e-3 production cut is 1e-6 on its spectrum); imaginary supports
     the leading eigenvectors of -Herm W. Each row's count and multiplet closure
     read that row's own spectrum only. Returns ``(Q [.., e, n, r], spectra)``.
     """
@@ -198,7 +199,7 @@ def _select(k, W, entries, kind, index, recipe, *, real, eigh_plan, svd_plan, co
     stack = k.take(tuple(index[sid] for sid, _ in entries))(W)
     if kind == "line":
         return distrib_la.right_singular_vectors(
-            stack, recipe["direction_cutoff"], eigh_plan=svd_plan, column_extent=column_extent,
+            stack, recipe["direction_cutoff"], eigh_plan=eigh_plan, column_extent=column_extent,
             multiplet_tol=tol, real_rows=spectral_rows, max_rank=recipe.get("line_direction_cap"))
     width = min(logical_n, max(1, int(recipe["imaginary_width"])))
     return leading_response_directions(
@@ -280,7 +281,7 @@ def _roles(entries, counts, ranks, column_extent, **extra):
     return rows
 
 
-def line_sample_states(W, dW, recipe, *, sid, ordered, real, mesh_xy, eigh_plan, svd_plan,
+def line_sample_states(W, dW, recipe, *, sid, ordered, real, mesh_xy, eigh_plan,
                        column_extent, logical_n):
     """Directions and the states at z (and conj z) of one fitted line sample, Re z != 0.
 
@@ -303,7 +304,7 @@ def line_sample_states(W, dW, recipe, *, sid, ordered, real, mesh_xy, eigh_plan,
         raise ValueError(f"GATE shared_pole_line_panel: sample {sid} lies on the imaginary axis; it stays dense")
     put = replicated(mesh_xy)
     q_all, values = _select(k, W, entries[:1], "line", {sid: 0}, recipe, real=real, eigh_plan=eigh_plan,
-                            svd_plan=svd_plan, column_extent=column_extent, logical_n=logical_n)
+                            column_extent=column_extent, logical_n=logical_n)
     direction = k.column(q_all, put(np.int32(0)))
     widths = tuple(int(np.asarray(row[0]).size) for row in values)
     if any(w < 1 or w > logical_n for w in widths[:real]):
@@ -366,8 +367,7 @@ class LineSelection:
         self.ordered, self.execution, self.nq = bool(ordered), execution, int(nq)
         self.extent = port_extent(mesh_xy)
         self.to_face = selection_layout(mesh_xy, execution, self.nq)[2]
-        self.plans = {f["name"]: (constructor_eigenplan(mesh_xy, f["rows"], execution),
-                                  constructor_eigenplan(mesh_xy, 2 * f["rows"], execution))
+        self.plans = {f["name"]: constructor_eigenplan(mesh_xy, f["rows"], execution)
                       for f in families}
 
     def _rectangles(self, value, slope):
@@ -399,12 +399,12 @@ class LineSelection:
         """Directions and the states at z and conj z of every family, from W(z) and dW/ds."""
         lines = {}
         for family in self.families:
-            eig, svd = self.plans[family["name"]]
+            eig = self.plans[family["name"]]
             f = family["index"]
             W, dW = self.block(value, (f, f)), self.block(slope, (f, f))
             lines[family["name"]] = line_sample_states(
                 W, dW, family["recipe"], sid=sid, ordered=self.ordered,
-                real=self.nq, mesh_xy=self.mesh, eigh_plan=eig, svd_plan=svd,
+                real=self.nq, mesh_xy=self.mesh, eigh_plan=eig,
                 column_extent=self.extent, logical_n=family["logical_n"])
             del W, dW
         # The cross actions follow every diagonal selection, so the shared
@@ -490,7 +490,7 @@ def line_panel_states(panels, counts, recipe, *, sid, ordered, mesh_xy):
     return originals, mirrors, tuple(int(c) for c in counts)
 
 
-def select_round_states(samples, recipe, *, sample_ids, real, mesh_xy, eigh_plan, svd_plan,
+def select_round_states(samples, recipe, *, sample_ids, real, mesh_xy, eigh_plan,
                         column_extent, logical_n, ordered=False, line_states=None):
     """Directions, outputs and actions of one round of parents, batched per role (SP 3, SP 13).
 
@@ -524,7 +524,7 @@ def select_round_states(samples, recipe, *, sample_ids, real, mesh_xy, eigh_plan
                     if sid not in line_states and label.split(":", 1)[0] == kind]
              for kind in ("line", "imaginary")}
     selected = {kind: _select(k, W, kinds[kind], kind, index, recipe, real=real, eigh_plan=eigh_plan,
-                              svd_plan=svd_plan, column_extent=column_extent, logical_n=logical_n)
+                              column_extent=column_extent, logical_n=logical_n)
                 for kind in kinds if kinds[kind]}
     states, counts, records, mirrors, mirror_counts, mirror_records = [], [], [], [], [], []
     for sid in (int(i) for i in recipe["fit_ids"]):

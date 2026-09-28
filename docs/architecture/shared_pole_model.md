@@ -178,11 +178,11 @@ a photon bank the other family's rows of the same products, which are the
 CT/TC actions. The Gram cut, the pole budget, the round extent and the CT
 joint span act only on these panels. So the producer selects while
 $W_q(z_a)$, $\partial_sW_q$ and $W_m$ are in hand (`LineSelection`, whole
-parents per rank when their blocks and the $2n$ eigensystem fit, else the
+parents per rank when their blocks and the $n\times n$ eigensystem fit, else the
 face) and the bank stores the panels (§7). The constructor reads them
 (`line_panel_states`) and selects the supports on the imaginary axis from their
 dense samples per round. On the local route both sides run the same one-parent
-dilation eigensolve on the same bits, so $Q$ and every count are the ones the
+eigensolve of $W^\dagger W$ on the same bits, so $Q$ and every count are the ones the
 constructor would select; the action GEMMs run at a different panel width
 and agree to round-off.
 
@@ -415,5 +415,5 @@ the carrier of the family's line cap. On Fe $8^3$ bispinor ($N_q=59$,
 $d=3164$, 14 line and 8 dense samples) this is 28.5 face tiles per parent
 against 77 with dense line samples. The producer's selection adds, beside one
 group's carry, the endpoint blocks of $W$ and $\partial_sW$ ($2\lceil N_q/P\rceil d^2$
-on the local route) and one $2n$ dilation eigensystem
+on the local route) and one $n\times n$ eigensystem of $W^\dagger W$
 (`line_selection_price`).
