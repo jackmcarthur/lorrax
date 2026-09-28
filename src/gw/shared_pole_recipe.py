@@ -32,7 +32,7 @@ shared_real_pole_v1_r3b = {
     # A support above it duplicates the M1/M3 infinity block to O((top/u)^4)
     # and its H entries are cancellation noise (negative Ritz values); a top
     # far below it leaves the spectrum above to two moments.
-    "imaginary_top": "max(response transition span, omega_p)",
+    "imaginary_top": "max(response transition span, omega_p), floored onto the quarter-octave grid 2**(k/4) eV",
     "imaginary_count_epsilon": 1.0e-3,
     "imaginary_min_count": 2,
     "imaginary_count_rule": "max(2, round(log(16*(L/u_min)^2)*log(4000)/(2*pi^2)))",
@@ -1160,7 +1160,11 @@ def resolve_shared_pole_recipe(config, wfns, meta, *, mesh_xy, print_fn,
     # The imaginary condenser is the image of W^c's spectral support
     # [Omega_min^2, Omega_top^2] on the negative s axis, cut below at the
     # consumer's resolution 4 eta (or the gap): docs/theory/shared-pole-w-model.md 5.1.
-    umax = max(census['response_transition_span_ry'], plasma_ry) * RYD_TO_EV
+    # Snapped DOWN onto a quarter-octave grid: never above the spectral top (a
+    # site above it is noise), and unchanged by the few-percent QP shifts of the
+    # band edges between SC maps, so the support envelope holds.
+    spectral_top = max(census['response_transition_span_ry'], plasma_ry) * RYD_TO_EV
+    umax = 2.0 ** (math.floor(4.0 * math.log2(spectral_top)) / 4.0)
     if umin >= umax:
         raise ValueError(f"GATE shared_pole_interval: got: u_min={umin} >= u_max={umax} eV; want: u_min < u_max; why: imaginary support interval is unresolved")
     support_receipt = None
@@ -1318,7 +1322,7 @@ def resolve_shared_pole_recipe(config, wfns, meta, *, mesh_xy, print_fn,
         'imaginary': 'log-spaced u_min..u_max; round(log(16*(u_max/u_min)^2)*log(4000)/(2*pi^2)), min2; tier width ceil(f*n)',
         'held_line': 'adjacent-support midpoint nearest 25%/65% of the line interval; lower-index tie',
         'held_imaginary': 'geometric midpoint of first/last adjacent imaginary pair',
-        'u_min': 'max(4 eta,logical gap)', 'u_max': 'max(response transition span, omega_p): the spectral top of W^c', 'kappa': 'u_max/u_min',
+        'u_min': 'max(4 eta,logical gap)', 'u_max': 'max(response transition span, omega_p) floored onto 2**(k/4) eV: the spectral top of W^c', 'kappa': 'u_max/u_min',
         'infinity': 'ceil(tier infinity fraction*n)', 'direction': 'tier relative singular cutoff',
         'multiplet': 'whole multiplets within relative 1e-6',
         'bank': 'fixed Hermite certificate tolerance 1e-8',
@@ -1330,7 +1334,7 @@ def resolve_shared_pole_recipe(config, wfns, meta, *, mesh_xy, print_fn,
     if support_receipt is not None:
         rules.update(top='SC high-water envelope of omega_p+3.5 eV',
                      u_min='SC low-water envelope of max(4 eta,logical gap)',
-                     u_max='SC high-water envelope of max(response transition span, omega_p)',
+                     u_max='SC high-water envelope of max(response transition span, omega_p) floored onto 2**(k/4) eV',
                      support_envelope='current required bounds and retained sampling enclosure; not an interpolation-error certificate')
     for key, value in result.items():
         shown = value.tolist() if isinstance(value, np.ndarray) else value
