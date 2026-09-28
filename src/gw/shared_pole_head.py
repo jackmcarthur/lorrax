@@ -48,6 +48,7 @@ import sys
 import jax
 import jax.numpy as jnp
 import numpy as np
+from common import timing
 
 
 @lru_cache(maxsize=None)
@@ -249,26 +250,28 @@ def build_shared_pole_head(handle, header, V_q, wfns, meta, config, *,
     # the mini-BZ cell averages of all points then share one draw
     # (finalize_iteration_head_rows), bit-identical to one call per point.
     terms = []
-    for index, point in enumerate(points):
-        total = None
+    with timing.section("head.sample_terms"):
+        for index, point in enumerate(points):
+            total = None
+            if full:
+                value = evaluate(jnp.asarray(point*point, jnp.complex128), *args)
+                total = value[0]
+            if response is None:
+                samples.append(head_resolver.at(point))
+            else:
+                terms.append(iteration_head_sample_terms(response, index, total,
+                    meta=meta, config=config, mesh=mesh_xy))
+            del total
+            if full:
+                del value
         if full:
-            value = evaluate(jnp.asarray(point*point, jnp.complex128), *args)
-            total = value[0]
-        if response is None:
-            samples.append(head_resolver.at(point))
-        else:
-            terms.append(iteration_head_sample_terms(response, index, total,
-                meta=meta, config=config, mesh=mesh_xy))
-        del total
-        if full:
-            del value
-    if full:
-        del args, b, poles, counts
+            del args, b, poles, counts
     if terms:
         rows = [t for t in terms if isinstance(t, dict)]
-        averaged = iter(finalize_iteration_head_rows(
-            response, rows, wfn=wfn, meta=meta, config=config))
-        samples = [next(averaged) if isinstance(t, dict) else t for t in terms]
+        with timing.section("head.cell_average"):
+            averaged = iter(finalize_iteration_head_rows(
+                response, rows, wfn=wfn, meta=meta, config=config))
+            samples = [next(averaged) if isinstance(t, dict) else t for t in terms]
     ledger.live_stages = ambient
     if jax.process_index() == 0 and samples:
         origin = min(range(len(points)), key=lambda i: abs(points[i]))
@@ -281,9 +284,10 @@ def build_shared_pole_head(handle, header, V_q, wfns, meta, config, *,
             print("  shared-pole head: origin interband 8 pi qhat.S.qhat principal = "
                   + "/".join(f"{x:.6g}" for x in 8.0 * np.pi * np.linalg.eigvalsh(0.5 * (_S + _S.T))),
                   file=sys.stderr, flush=True)
-    head = fit_head_samples(samples[:len(z)], z, int(config.mpa.n_poles),
-        model="qsgw_schur_"+config.mpa.pole_solver if full else "dft_direct_"+config.mpa.pole_solver,
-        solve=config.mpa.pole_solver, occupation_state=occupation_state)
+    with timing.section("head.mpa_fit"):
+        head = fit_head_samples(samples[:len(z)], z, int(config.mpa.n_poles),
+            model="qsgw_schur_"+config.mpa.pole_solver if full else "dft_direct_"+config.mpa.pole_solver,
+            solve=config.mpa.pole_solver, occupation_state=occupation_state)
     head.update(identity=handle["identity"], body_digest=handle["digest"], completion=True)
     iteration = IterationHeadSamples(omegas=points, samples=tuple(samples),
         sigma_energies_ry=np.asarray(wfns.enk[:, wfns.slices.sigma]),

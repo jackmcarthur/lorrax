@@ -493,6 +493,21 @@ def write_shared_pole_model(path, b, poles2, K, *, q_span, meta, tables,
         if all(header["written_q"]):
             return _finalize_model(path, meta=meta, header=header, basis=basis)
         return header
+    if previous is None and (lo, hi) == (0, header["n_q_irr"]):
+        # One batch holds every parent: finalization writes the final datasets
+        # straight from this batch, with no staging group written and read back.
+        # The header (batch record included) and every stored byte are those of
+        # the staged route.
+        header["written_q"][lo:hi] = [True] * (hi-lo)
+        header["K"][lo:hi] = K.tolist()
+        header["batches"].append({"lo": lo, "hi": hi, "width": width, "name": name})
+        header["construction_receipts"].append({"q_span": [lo, hi], "receipt": receipts})
+        with SlabIO(path, mode="w", mesh=mesh) as io:
+            _write_metadata(io, header)
+            io.write_attr("written_q", np.asarray(header["written_q"], np.int8))
+            _write_header(io, header)
+        return _finalize_model(path, meta=meta, header=header, basis=basis,
+                               staged={name: (canonical, poles2)})
     if previous is None:
         with SlabIO(path, mode="w", mesh=mesh) as io:
             _write_metadata(io, header)
@@ -586,8 +601,27 @@ def _k_extent(meta, header, live, *, record):
     return extent
 
 
+@lru_cache(maxsize=16)
+def _staged_final_program(mesh, spec, shape, kmax):
+    """A staged batch as its staging read returns it: ``shape`` factor columns, ``kmax`` poles.
+
+    The staging dataset holds the batch's first ``width`` columns (every
+    column past Kmax is an inactive zero factor), and the read pads with
+    zeros; inactive poles are set to 1 by the caller either way.
+    """
+    def fit(a, n, axis, value):
+        a = jax.lax.slice_in_dim(a, 0, min(int(a.shape[axis]), n), axis=axis)
+        pad = [(0, 0)] * a.ndim
+        pad[axis] = (0, n - int(a.shape[axis]))
+        return jnp.pad(a, pad, constant_values=value)
+    def body(factor, poles):
+        factor = fit(fit(factor, shape[1], 1, 0), shape[3], 3, 0)
+        return factor, fit(poles, kmax, 1, 0.0)
+    return jax.jit(body, out_shardings=(NamedSharding(mesh, spec), NamedSharding(mesh, P())))
+
+
 @timing.timed("shared_pole_store.finalize")
-def _finalize_model(path, *, meta, header, basis=None):
+def _finalize_model(path, *, meta, header, basis=None, staged=None):
     basis = meta.mu_basis if basis is None else basis
     mesh = basis.mesh_xy
     components = header.get("factor_components", 1)
@@ -626,7 +660,10 @@ def _finalize_model(path, *, meta, header, basis=None):
             if kmax == 0:
                 continue
             with timing.section("staging_read_and_padding"):
-                if batch["width"]:
+                if staged is not None and batch["name"] in staged:
+                    factor, poles = _staged_final_program(mesh, spec, tuple(read_shape), kmax)(
+                        *staged[batch["name"]])
+                elif batch["width"]:
                     factor = io.read_slab(batch["name"] + "/factor",
                         shape=read_shape, offset=(0, 0, 0, 0), partition_spec=spec)
                     poles = io.read_slab(batch["name"] + "/poles2",
@@ -649,7 +686,8 @@ def _finalize_model(path, *, meta, header, basis=None):
     def finish():
         with h5py.File(path, "a") as f:
             set_commit_state(f, False)
-            del f["staging"]
+            if "staging" in f:
+                del f["staging"]
             header["finalized"] = True
             del f["header_json"]
             f.create_dataset("header_json", data=np.bytes_(_json(header)))
