@@ -225,7 +225,7 @@ family, and the (window, τ) pair count is reported, never refused on.
 ## 9. Self-consistent maps
 
 The [Sigma window decision](sigma-windows-design.md) owns support and
-immutable box geometry across SC maps, including the one convergence rebuild.
+immutable box geometry across SC maps and the escape refusal.
 This page owns the quadrature problem and its certificate currencies.
 
 ## 10. Cache, request scope and parallel planning
