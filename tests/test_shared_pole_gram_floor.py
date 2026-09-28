@@ -51,7 +51,8 @@ def _reduce(args):
 def test_exact_samples_sit_inside_the_rounding_floor():
     r = _reduce(_pencil_inputs())
     assert r['gram_valid']
-    assert 0 < r['gram_floor_relative'] < 1e-8
+    # Main's fixed -1e-7 Gram bar is the floor (CONSENSUS F7; the derived floor is withdrawn).
+    assert 0 < r['gram_floor_relative'] <= 1e-7
     assert r['gram_min_relative'] >= -r['gram_floor_relative']
 
 
