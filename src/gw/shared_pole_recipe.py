@@ -25,9 +25,10 @@ shared_real_pole_v1_r3b = {
     # Line ladder (SPCOST2 2026-09-27, claim 2906): Sigma_c reads W^c on the
     # line at the crossings |E - eps| + i eta, and the line sites rebuild that
     # line by continuation from their own height. Sites at height 4 eta, 4 eta
-    # apart, from 4 eta up to the requested window plus 2 eV: on Si 4^3 no
-    # further site moves an edge root by more than 0.06 meV, while 8 eta height
-    # costs 0.77 meV, 8 eta spacing 2.36 meV and stopping at the window 0.28 meV.
+    # apart, from 4 eta up to the map-0 Sigma(omega) support plus 2 eV: on Si
+    # 4^3 no further site moves an edge root by more than 0.06 meV, while 8 eta
+    # height costs 0.77 meV, 8 eta spacing 2.36 meV and stopping at the window
+    # 0.28 meV. The ladder is planned once (the one-shot, SC map 0) and held.
     "height_eta_factor": 4.0,
     "line_spacing_eta_factor": 4.0,
     "line_extent_pad_ev": 2.0,
@@ -54,14 +55,19 @@ shared_real_pole_v1_r3b = {
     # imaginary ladder moving Fe's window edges by 35 meV); at most N_mu/16 right
     # singular directions per line support; at most 1.8 N_mu retained Gram
     # directions, the pole count K per parent (owner ruling 2026-09-17).
+    # response_group_tolerance: the derived group rules deliver exactly their
+    # certificate over the whole transition interval and the shared-pole
+    # construction amplifies it (Na 8^3 map-0 eqp 1.17 / 0.43 / 0.04 meV at
+    # 1e-8 / 1e-9 / 1e-10; CHIRULE, claims 2913-2914). Interim 1e-10 until a
+    # per-sample margin eta/(<d>_w + |z|) is derived (CONSENSUS F6).
     "production": {"direction_cutoff": 1.0e-3, "imaginary_width_fraction": 0.25,
                    "infinity_width_fraction": 0.125,
-                   "bank_rule_tolerance": 1.0e-8,
+                   "bank_rule_tolerance": 1.0e-8, "response_group_tolerance": 1.0e-10,
                    "line_direction_cap_fraction": 0.0625, "pole_budget_fraction": 1.8},
     "relaxed": {"direction_cutoff": 1.0e-2, "imaginary_width_fraction": 0.125,
                 "infinity_width_fraction": 0.0625,
                 "line_count": 8, "imaginary_count": 2,
-                "bank_rule_tolerance": 1.0e-7},
+                "bank_rule_tolerance": 1.0e-7, "response_group_tolerance": 1.0e-8},
 }
 
 # Each entry is (predicate description, threshold); the public table adds name
@@ -923,44 +929,38 @@ def bind_shared_pole_census(wfns, meta, *, occupation_state, trs_allowed, state_
     }
 
 
-def _support_envelope(required, key, session):
-    """Keep a run-local scalar enclosure; never retain samples or a census.
+def _held_frequency_plan(planned, required, key, session):
+    """Plan W's frequency sites once (SC map 0) and hold them for every map.
 
-    The reference map uses its current interval without retaining it. The
-    first interacting map seeds the enclosure: an initial DFT gap can be
-    substantially smaller and select a different imaginary support count.
-    Increasing L/u_min is conservative for the imaginary-count heuristic.
-    This is a sampling-geometry enclosure, not an interpolation-error bound;
-    the bank still certifies its current energies at every supplied frequency.
+    ``planned`` holds this map's ``line_ev`` and ``imaginary_ev`` ladders and
+    their scalars; ``required`` this map's ``line_top_ev``, ``u_min_ev`` and
+    ``u_max_ev``. The first call retains ``planned``; every later call returns
+    the retained sites, so each map samples W at the same points and reuses the
+    map-0 response rules (``response_bank.response_quadrature``). A later map
+    whose Sigma(omega) support plus the pad reaches past the held line ladder
+    refuses by name, as ``qp_support`` refuses a Sigma support breach. The
+    imaginary ladder is held without a refusal: its ends are the map-0 gap and
+    spectral top, and the current ones are reported.
     """
-    version = "sc_interacting_support_enclosure_20260910"
-    scope = "sampling geometry only; interpolation accuracy not certified"
-    if not session.get("reference_complete", False):
-        session["reference_complete"] = True
-        return dict(version=version, status="initial_reference", epoch=-1,
-                    required=dict(required), retained=dict(required), scope=scope)
-    from gw.sigma_box_plan import snap_outward
-    previous = session.get("envelope")
-    same_policy = previous is not None and session.get("key") == key
-    # Compared and retained on the snap grid: 1 ulp of the census charge
-    # (line_top) otherwise flips hit/expanded, hence the SC sample sites.
-    envelope = {k: snap_outward(v, 1.0, -1 if k == "u_min_ev" else +1)
-                for k, v in required.items()}
-    if same_policy:
-        envelope = {
-            "line_top_ev": max(previous["line_top_ev"], envelope["line_top_ev"]),
-            "u_min_ev": min(previous["u_min_ev"], envelope["u_min_ev"]),
-            "u_max_ev": max(previous["u_max_ev"], envelope["u_max_ev"]),
-        }
-    changed = not same_policy or envelope != previous
-    status = ("initial" if previous is None else
-              "policy_changed" if not same_policy else
-              "expanded" if changed else "hit")
-    epoch = session.get("epoch", -1) + int(changed)
-    session.update(key=key, envelope=envelope, epoch=epoch)
-    return dict(version=version, status=status,
-                epoch=epoch, required=dict(required), retained=dict(envelope),
-                scope=scope)
+    version = "held_w_frequency_plan_20260927"
+    if session.get("plan") is None:
+        session.update(key=key, plan={k: (tuple(float(x) for x in v) if isinstance(v, np.ndarray)
+                                          else v) for k, v in planned.items()})
+        return dict(version=version, status="plan", required=dict(required)), planned
+    if session.get("key") != key:
+        raise ValueError(f"GATE shared_pole_held_plan: got: policy key {key!r}; want: the map-0 key "
+                         f"{session.get('key')!r}; why: the W frequency plan is fixed at map 0 and held")
+    held = session["plan"]
+    reach = float(held["line_ev"][-1])
+    if required["line_top_ev"] > reach * (1.0 + 1.0e-9):
+        raise ValueError(
+            f"GATE shared_pole_line_coverage: got: this map's Sigma(omega) support plus the pad "
+            f"reaches {required['line_top_ev']:.4f} eV; want: <= {reach:.4f} eV, the last site of the "
+            f"line ladder held from map 0; why: Sigma_c reads W on the line up to the support's far "
+            f"side, and the ladder is planned once and never grows (gw/qp_support.py).")
+    retained = {k: (np.asarray(v, dtype=np.float64) if k.endswith("_ev") and isinstance(v, tuple)
+                    else v) for k, v in held.items()}
+    return dict(version=version, status="held", required=dict(required)), retained
 
 
 def _sector_treatment_ceiling(response_span_ry, session):
@@ -1093,7 +1093,7 @@ def matsubara_indices(beta_ry_inv, bandwidth_ry, tier, recipe=shared_real_pole_v
 
 
 def resolve_shared_pole_recipe(config, wfns, meta, *, mesh_xy, print_fn,
-                              requested_window_ev, support_session=None):
+                              sigma_support_ev, support_session=None):
     """Resolve DESIGN §5 from current metadata into scalars and small arrays.
 
     ``bind_shared_pole_census`` must have consumed this map's occupation state.
@@ -1103,14 +1103,14 @@ def resolve_shared_pole_recipe(config, wfns, meta, *, mesh_xy, print_fn,
     role code is reserved (moments need no bank evaluation). Conjugates are
     constructor states, never bank calls. ``support_pair`` int64 [role,2]
     binds held endpoints; [-1,-1] means not a held midpoint.
-    ``requested_window_ev`` is the requested window ``(lo, hi)`` about mu in eV
-    (``gw.qp_support.requested_window_ev``: the deck request joined with the
-    requested states); the line ladder reaches its larger side plus 2 eV.
-    ``support_session`` optionally retains support bounds and a policy/basis
-    key across SC maps, after one unretained reference map.
-    Enclosed current intervals retain the same points and roles, while
-    the census and capacity ledger remain fresh.
-    Expanding intervals enlarge the envelope; policy changes start a new one.
+    ``sigma_support_ev`` is this map's sampled Sigma(omega) support ``(lo, hi)``
+    about mu in eV (``gw.qp_support.plan_support_ev``: the deck request joined
+    with the requested states +/- the plan pad); the line ladder reaches its
+    far side plus 2 eV.
+    ``support_session`` (SC) holds the first map's sites for every later map
+    (``_held_frequency_plan``): the census and capacity ledger stay fresh, the
+    sample points and their response rules do not move, and a later support
+    past the held line ladder refuses.
     All ranks execute the metadata work; only ``print_fn`` may filter by rank.
     """
     from common.units import RYD_TO_EV
@@ -1146,11 +1146,11 @@ def resolve_shared_pole_recipe(config, wfns, meta, *, mesh_xy, print_fn,
     override = parse_support_sites(getattr(config.sigma, 'w_support_sites_ev', ''))
     plasma_ry = 2.0 * math.sqrt(4.0 * math.pi * census['active_electrons']
                                / census['cell_volume_bohr3'])
-    window = tuple(float(v) for v in requested_window_ev)
+    window = tuple(float(v) for v in sigma_support_ev)
     if not (len(window) == 2 and all(map(math.isfinite, window)) and window[0] <= window[1]):
-        raise ValueError(f"GATE shared_pole_line_top: got: requested window {requested_window_ev!r} eV; want: finite (lo, hi) about mu with lo <= hi; why: the line ladder reaches the requested window plus {recipe['line_extent_pad_ev']} eV")
+        raise ValueError(f"GATE shared_pole_line_top: got: Sigma support {sigma_support_ev!r} eV; want: finite (lo, hi) about mu with lo <= hi; why: the line ladder reaches the Sigma support plus {recipe['line_extent_pad_ev']} eV")
     # Sigma_c(omega) reads the line at |omega - eps| <= |omega - mu|, so the
-    # ladder must cover the requested window's far side, plus the pad.
+    # ladder must cover the Sigma support's far side, plus the pad.
     top = max(abs(window[0]), abs(window[1])) + recipe['line_extent_pad_ev']
     umin = max(recipe['height_eta_factor'] * eta, census['gap_ev'])
     # The imaginary condenser is the image of W^c's spectral support
@@ -1163,17 +1163,6 @@ def resolve_shared_pole_recipe(config, wfns, meta, *, mesh_xy, print_fn,
     umax = 2.0 ** (math.floor(4.0 * math.log2(spectral_top)) / 4.0)
     if umin >= umax:
         raise ValueError(f"GATE shared_pole_interval: got: u_min={umin} >= u_max={umax} eV; want: u_min < u_max; why: imaginary support interval is unresolved")
-    support_receipt = None
-    if support_session is not None:
-        key = (RECIPE_HASH, tier, eta, int(meta.nspinor), int(meta.n_rmu),
-               census['logical_band_count'],
-               '' if override is None else override['text'])
-        support_receipt = _support_envelope(
-            dict(line_top_ev=top, u_min_ev=umin, u_max_ev=umax), key,
-            support_session)
-        retained = support_receipt['retained']
-        top, umin, umax = (retained['line_top_ev'], retained['u_min_ev'],
-                           retained['u_max_ev'])
     kappa = umax / umin
     count = imaginary_sample_count(kappa, tier, recipe)
     imaginary = np.geomspace(umin, umax, count)
@@ -1191,6 +1180,18 @@ def resolve_shared_pole_recipe(config, wfns, meta, *, mesh_xy, print_fn,
         count = int(imaginary.size)
         umin, umax = float(imaginary[0]), float(imaginary[-1])
         kappa = umax / umin
+    support_receipt = None
+    if support_session is not None:
+        key = (RECIPE_HASH, tier, eta, int(meta.nspinor), int(meta.n_rmu),
+               census['logical_band_count'],
+               '' if override is None else override['text'])
+        support_receipt, held = _held_frequency_plan(
+            dict(top_ev=top, u_min_ev=umin, u_max_ev=umax, kappa=kappa,
+                 imaginary_count=count, line_ev=line, imaginary_ev=imaginary),
+            dict(line_top_ev=top, u_min_ev=umin, u_max_ev=umax), key, support_session)
+        top, umin, umax, kappa, count = (held['top_ev'], held['u_min_ev'], held['u_max_ev'],
+                                         held['kappa'], held['imaginary_count'])
+        line, imaginary = held['line_ev'], held['imaginary_ev']
     mids = 0.5 * (line[:-1] + line[1:])
     held_pairs = [int(np.argmin(abs(mids - (line[0] + fraction*(line[-1] - line[0])))))
                   for fraction in recipe['held_line_fractions']]
@@ -1236,6 +1237,14 @@ def resolve_shared_pole_recipe(config, wfns, meta, *, mesh_xy, print_fn,
         version = RECIPE_VERSION + '+support_sites'
         table = hashlib.sha256(
             (RECIPE_HASH + '|' + override['text']).encode()).hexdigest()
+    # The sampled geometry itself (line height and sites, imaginary sites) is
+    # the model's identity: the ladders follow the Sigma support and the census,
+    # so a store or bank built on another ladder must refuse on restart. The
+    # response group tolerance is in the hashed table (RECIPE_HASH).
+    table = hashlib.sha256((table + '|' + json.dumps(
+        dict(height_ev=float(height), line_ev=[float(v) for v in line],
+             imaginary_ev=[float(v) for v in imaginary]),
+        sort_keys=True, separators=(',', ':'))).encode()).hexdigest()
     if sector_treatment is not None:
         version += '+sector_treatment'
         treatment_identity = {key: sector_treatment[key] for key in (
@@ -1260,7 +1269,7 @@ def resolve_shared_pole_recipe(config, wfns, meta, *, mesh_xy, print_fn,
         'accuracy_reason': 'resolved geometry has no authenticated matching campaign receipt',
         'eta_ev': eta, 'height_ev': height, 'height_ry': height / RYD_TO_EV,
         'plasma_ev': plasma_ry * RYD_TO_EV, 'plasma_ry': plasma_ry,
-        'requested_window_ev': window, 'top_ev': top, 'line_spacing_ev': spacing,
+        'sigma_support_ev': window, 'top_ev': top, 'line_spacing_ev': spacing,
         'line_ev': line, 'imaginary_ev': imaginary,
         'held_line_ev': held_line, 'held_imaginary_ev': held_imag,
         'u_min_ev': umin, 'u_max_ev': umax, 'kappa': kappa,
@@ -1283,6 +1292,7 @@ def resolve_shared_pole_recipe(config, wfns, meta, *, mesh_xy, print_fn,
                         if 'pole_budget_fraction' in policy else None),
         'multiplet_relative_tolerance': recipe['multiplet_relative_tolerance'],
         'bank_rule_tolerance': policy['bank_rule_tolerance'],
+        'response_group_tolerance': policy['response_group_tolerance'],
         'moment_convention': recipe['moment_convention'], 'census': dict(census),
         'operator_realization': recipe['operator_realization'],
         'U_bytes_per_rank': meta.shared_pole_capacity.U_bytes_per_rank,
@@ -1290,7 +1300,7 @@ def resolve_shared_pole_recipe(config, wfns, meta, *, mesh_xy, print_fn,
     if charge4:
         result['charge_operator'] = 'four-component-spin-traced-v1'
     if support_receipt is not None:
-        result['support_envelope'] = support_receipt
+        result['support_plan'] = support_receipt
     if sector_treatment is not None:
         result['sector_pole_treatment'] = sector_treatment
     result['metadata_array_bytes'] = sum(v.nbytes for v in result.values()
@@ -1299,8 +1309,8 @@ def resolve_shared_pole_recipe(config, wfns, meta, *, mesh_xy, print_fn,
         'support_sites': 'sigma_w_support_sites_ev; "" = the resolver ladder, else explicit line|imaginary eV sites folded into recipe_version/recipe_hash',
         'height': 'h=4*eta', 'eta': 'literal sigma_regularization_ev',
         'plasma': '2*sqrt(4*pi*active_electrons/volume) Ry',
-        'requested_window': 'deck request joined with the requested states, about mu (gw.qp_support)',
-        'top': 'L = max|requested window| + 2 eV',
+        'sigma_support': 'this map\'s sampled Sigma(omega) support about mu: deck request joined with the requested states +/- the plan pad (gw.qp_support)',
+        'top': 'L = max|Sigma support| + 2 eV',
         'line_spacing': 'Delta = 4*eta',
         'line': 'production: j*Delta, j = 1..ceil(L/Delta), independent of the imaginary count; relaxed 8 sites j*L/8',
         'line_direction_cap': 'production ceil(n/16) right singular directions per line support (whole multiplets); relaxed none',
@@ -1312,20 +1322,22 @@ def resolve_shared_pole_recipe(config, wfns, meta, *, mesh_xy, print_fn,
         'infinity': 'ceil(tier infinity fraction*n)', 'direction': 'tier relative singular cutoff',
         'multiplet': 'whole multiplets within relative 1e-6',
         'bank': 'fixed Hermite certificate tolerance 1e-8',
+        'response_group': 'derived group rules certify at this tolerance (production 1e-10, interim; CONSENSUS F6)',
         'census': 'current full-band occupations, authenticated k weights/capacity; active band top >= mu-15 eV',
         'sector_pole_treatment': 'bispinor-only numerical treatment at twice the map-0 chi transition span; not a physical pole bound',
         'U_bytes': '16*nk_full*(nspinor*nmu)^2/(Px*Py), logical bytes/rank',
         'metadata': 'sum of replicated metadata array nbytes',
     }
     if support_receipt is not None:
-        rules.update(top='SC high-water envelope of max|requested window| + 2 eV',
-                     u_min='SC low-water envelope of max(4 eta,logical gap)',
-                     u_max='SC high-water envelope of max(response transition span, omega_p) floored onto 2**(k/4) eV',
-                     support_envelope='current required bounds and retained sampling enclosure; not an interpolation-error certificate')
+        rules.update(top='held from SC map 0: max|map-0 Sigma support| + 2 eV; a later map past the held ladder refuses',
+                     u_min='held from SC map 0: max(4 eta, map-0 logical gap)',
+                     u_max='held from SC map 0: max(response transition span, omega_p) floored onto 2**(k/4) eV',
+                     support_plan='SC map 0 plans the W frequency sites; later maps hold them (required = this map\'s own values)')
     # One durable line (the production report keeps it with debug off).
     print_fn(f'  Shared-pole supports: line {len(line)} sites {line[0]:.3f}..{line[-1]:.3f} eV '
-             f'at height {height:.3f} eV (requested window {window[0]:+.2f}..{window[1]:+.2f} eV, '
+             f'at height {height:.3f} eV (Sigma support {window[0]:+.2f}..{window[1]:+.2f} eV, '
              f'top {top:.2f} eV); imaginary {count} sites {umin:.3f}..{umax:.2f} eV; '
+             f'plan {"one-shot" if support_receipt is None else support_receipt["status"]}; '
              f'recipe_hash {table[:12]}')
     for key, value in result.items():
         shown = value.tolist() if isinstance(value, np.ndarray) else value
