@@ -92,7 +92,7 @@ SEMICORE_READ = "patch"
 #: "scissor" (every one takes E_DFT + beta_above, scissor law A; no far patch,
 #: no own-energy read) or "own" (own-energy reads on held far patches, ruling
 #: Q3).
-ROTATING_READ = "scissor"
+ROTATING_READ = "own"
 #: Rule tolerance of the far-patch crossing windows. A far window's node
 #: count is set by its short side over eta (the patch top above the lowest
 #: state), not by its pole range, so splitting cannot shorten it; the coupling
