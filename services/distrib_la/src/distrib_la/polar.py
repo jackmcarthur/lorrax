@@ -420,6 +420,25 @@ def right_singular_vectors(W, tau, *, eigh_plan, column_extent,
                              column_extent=column_extent, layout=layout)
 
 
+@jax.jit
+def _hermitian_probe(w, s):
+    """``s`` with NaN rows where face-tiled ``w`` [..., n, n] is not finite Hermitian.
+
+    An O(n) sample, not the n^2 check: the first row against the conjugate
+    first column and the imaginary part of the diagonal, each against
+    1e-12 max|w|, plus finiteness through max|w|. Only O(n) entries cross the
+    mesh (no transposed temporary) and nothing syncs the host.
+    """
+    n = w.shape[-1]
+    row, column = w[..., 0, :], jnp.conj(w[..., :, 0])
+    diagonal = jax.lax.broadcasted_iota(jnp.int32, (n, n), 0) == jax.lax.broadcasted_iota(jnp.int32, (n, n), 1)
+    defect = jnp.maximum(jnp.max(jnp.abs(row - column), axis=-1),
+                         jnp.max(jnp.where(diagonal, jnp.abs(jnp.imag(w)), 0.0), axis=(-2, -1)))
+    scale = jnp.max(jnp.abs(w), axis=(-2, -1))
+    valid = jnp.isfinite(scale) & (defect <= 1e-12 * scale)
+    return jnp.where(valid[..., None], s, jnp.nan)
+
+
 def leading_eigenvectors(W, r, *, eigh_plan, column_extent,
                          multiplet_tol=1e-6, real_rows=None, rcond=None):
     """Return leading Hermitian eigenvectors, including the cut multiplet.
@@ -460,17 +479,15 @@ def leading_eigenvectors(W, r, *, eigh_plan, column_extent,
         if W.ndim == 2:
             s, q = s[0], q[0]
     else:
-        # A distributed solver never owns complete local rows; checking
-        # arbitrary off-diagonal faces still requires peer communication.
-        defect = jnp.max(jnp.abs(W - jnp.conj(jnp.swapaxes(W, -1, -2))), axis=(-2, -1))
-        scale = jnp.max(jnp.abs(W), axis=(-2, -1))
-        if not bool(jnp.all(jnp.isfinite(scale) & (defect <= 1e-12 * scale))):
-            raise ValueError("leading_eigenvectors requires finite Hermitian W")
         if W.ndim == 2:
             s, q = eigh_plan.batched(W[None])
             s, q = s[0], q[0]
         else:
             s, q = eigh_plan.batched(W)
+        # A distributed solver never owns complete local rows, so the full
+        # check would transpose W across the mesh. The O(n) probe marks an
+        # invalid row NaN on the device; the spectrum readback below refuses it.
+        s = _hermitian_probe(W, s)
     values = _host_spectrum(s)
     count = _leading_counts(
         values, r, multiplet_tol=multiplet_tol, real_rows=real_rows,
