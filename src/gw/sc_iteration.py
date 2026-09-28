@@ -2646,7 +2646,7 @@ def _sc_sampled_support(inputs, partition, energies_loop, mu_ev):
     deck = np.asarray(inputs.config.omega_grid_ev, dtype=float)
     part = _partition_on_loop(partition, inputs)
     energy = energies_loop - mu_ev
-    from .qp_support import SEMICORE_READ
+    from .qp_support import ROTATING_READ, SEMICORE_READ
     active = requested_states(energy, part.protected_mask)
     semicore = _sc_semicore_loop(inputs, active.shape)
     states = active & ~semicore               # read on the near grid at the deck eta
@@ -2668,7 +2668,8 @@ def _sc_sampled_support(inputs, partition, energies_loop, mu_ev):
         plan = plan_sigma_windows(
             sigma, stack(energy, probe), tile(states),
             rotating_energy_rel_ev=stack(e_dft, probe),
-            rotating_kn=tile(rotating) if far_route and rotating.any() else None,
+            rotating_kn=(tile(rotating) if far_route and rotating.any()
+                         and ROTATING_READ == "own" else None),
             semicore_kn=tile(semicore) if far_route and semicore.any() else None,
             far_pad_ev=derived_pad_ev(e_dft, probe, rotating),
             semicore_pad_ev=derived_pad_ev(e_dft, probe, semicore))
@@ -2680,7 +2681,8 @@ def _sc_sampled_support(inputs, partition, energies_loop, mu_ev):
         # energy and every map-0 estimate; side scissor otherwise, for good.
         inside = lambda x: (((x >= grid[0]) & (x <= grid[-1]))
                             | far_patch_covered(x, plan.far_patches_ev))
-        own = rotating & inside(e_dft) if far_route else np.zeros_like(rotating)
+        own = (rotating & inside(e_dft) if far_route and ROTATING_READ == "own"
+               else np.zeros_like(rotating))
         if probe is not None and far_route:
             own = own & np.all(inside(probe).reshape((reps,) + energy.shape), axis=0)
         if session is not None:

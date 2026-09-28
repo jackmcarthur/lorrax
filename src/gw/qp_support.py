@@ -83,11 +83,16 @@ FAR_PATCH_ETA_EV = 1.0
 #: patches: every semicore endpoint, diagonal and coupling, reads at eta.
 #: At eta_semi = 1 eV the P-S couplings put the MoS2 3x3 fixed point 8.5 meV
 #: off, at 0.5 eV 4.8 meV; protected at eta, 0.14 meV (PARTITION round 2).
-SEMICORE_ETA_EV = None
+SEMICORE_ETA_EV = 0.5
 #: How semicore endpoints are read: "patch" (own energy on the SEMICORE_ETA_EV
 #: patches) or "sigma0" (Sigma(omega = 0) on the near grid, main's rule for
 #: states below E_F - 15 eV; no semicore crossing windows).
-SEMICORE_READ = "sigma0"
+SEMICORE_READ = "patch"
+#: How states above the protected cut are read (owner scheme, round 5):
+#: "scissor" (every one takes E_DFT + beta_above, scissor law A; no far patch,
+#: no own-energy read) or "own" (own-energy reads on held far patches, ruling
+#: Q3).
+ROTATING_READ = "scissor"
 #: Rule tolerance of the far-patch crossing windows. A far window's node
 #: count is set by its short side over eta (the patch top above the lowest
 #: state), not by its pole range, so splitting cannot shorten it; the coupling
@@ -229,6 +234,10 @@ def plan_sigma_windows(sigma, energy_rel_ev, protected_kn, *, rotating_energy_re
            far_patches_ev(rotating_energy_rel_ev, rotating_kn, near, pad_ev=far_pad_ev))
     semi = (() if semicore_kn is None else
             far_patches_ev(rotating_energy_rel_ev, semicore_kn, near, pad_ev=semicore_pad_ev))
+    if semi:
+        # ONE coarse semicore window (owner, round 5): from the deepest semicore
+        # energy minus its pad up to just above the highest semicore band.
+        semi = ((semi[0][0], semi[-1][1]),)
     # A semicore patch never overlaps a rotating one (they sit on opposite
     # sides of E_F); refuse rather than merge silently if they ever do.
     rows = sorted([(a, b) for a, b in far] + [(a, b) for a, b in semi])

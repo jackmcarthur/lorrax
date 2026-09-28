@@ -171,6 +171,11 @@ def sc_band_classes(energies_ev, *, occupied_kn, requested_kn, range_mu_ev,
         if a - b > float(semicore_gap_ev):
             break
         bottom = float(b)
+    # The fine-window floor is min(valence bottom, lowest requested energy
+    # within the clip) (owner, round 5); it never rises above the valence bottom.
+    in_clip = req & (np.abs(e - mu) <= float(clip_ev))
+    if in_clip.any():
+        bottom = min(bottom, float(e[in_clip].min()))
     semicore = occ & (e < bottom)
     if lo_ev is not None:
         semicore &= e < lo_ev
