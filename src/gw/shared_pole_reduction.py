@@ -519,6 +519,10 @@ def reduce_ordered_shared_pole_pencil(pencil, active_columns, *, eigh, matmul, g
         "retained_rank": count,
         "gram_condition": largest / jnp.min(jnp.where(keep, gamma, jnp.inf), axis=-1),
         "retained_metric_positive": metric_ok & metric_r_ok,
+        # STUDY (FEREF r3): the paired H_r metric's own Newton-Schulz receipt, for the refusal message.
+        "paired_metric_ok": metric_r_ok,
+        "paired_metric_initial_infinity_norm": paired_metric_diagnostics["metric_initial_infinity_norm"],
+        "paired_metric_inverse_root_residual_relative": paired_metric_diagnostics["metric_inverse_root_residual_relative"],
         "retained_metric_relative": metric_relative,
         "positive_count": jnp.sum(positive, axis=-1, dtype=jnp.int64),
         "negative_count": jnp.sum(retained & (mu < 0), axis=-1, dtype=jnp.int64),

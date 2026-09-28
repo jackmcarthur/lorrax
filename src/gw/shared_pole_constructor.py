@@ -340,7 +340,11 @@ def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output):
                                     f"rounding floor/max={round_reduction['gram_floor_relative'][slot]}, "
                                     f"paired H_r min/max={round_reduction['paired_min_relative'][slot] if ordered else 'n/a'}, "
                                     f"metric infinity norm={round_reduction['metric_initial_infinity_norm'][slot]}, "
-                                    f"inverse-root residual={round_reduction['metric_inverse_root_residual_relative'][slot]}; "
+                                    f"inverse-root residual={round_reduction['metric_inverse_root_residual_relative'][slot]}, "
+                                    f"paired rank={round_reduction.get('paired_rank', [None]*(slot+1))[slot]}, "
+                                    f"paired metric ok={round_reduction.get('paired_metric_ok', [None]*(slot+1))[slot]}, "
+                                    f"paired metric infinity norm={round_reduction.get('paired_metric_initial_infinity_norm', [None]*(slot+1))[slot]}, "
+                                    f"paired inverse-root residual={round_reduction.get('paired_metric_inverse_root_residual_relative', [None]*(slot+1))[slot]}; "
                                     f"want: Gram min >= -(propagated float64 floor) (gram_rounding_validity) "
                                     "and valid diagonal/retained metric; why: no PSD repair")
                         if not round_zero["zero_policy"][slot]:
