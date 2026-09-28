@@ -130,7 +130,8 @@ def test_gap_shrink_expands_once_then_growth_stays_enclosed():
 
 def test_plasma_interval_expands_and_never_shrinks():
     session, first = interacting_session(inputs(top=20.))
-    expanded = resolve(inputs(top=24.), session)
+    # omega_p 26.5 eV lifts the spectral top above D_max = 20.35 eV (u_max floors to 2**4.5).
+    expanded = resolve(inputs(top=30.), session)
     assert expanded["support_envelope"]["status"] == "expanded"
     assert expanded["top_ev"] > first["top_ev"]
     assert expanded["u_max_ev"] > first["u_max_ev"]

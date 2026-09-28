@@ -301,7 +301,9 @@ Placement is a condenser problem, not a choice of interesting frequencies:
   $u_{\min}=\max(4\eta,E_g)$ and $u_{\max}=\Omega_{\rm top}=\max(D_{\max},\omega_p)$,
   $D_{\max}=\max E_{\rm cond}-\min E_{\rm val}$ the response transition span
   ($\omega_p$ from the active electron density), $\kappa=u_{\max}/u_{\min}$,
-  and the count of (W 23). The imaginary axis $s=-u^2$ is the mirror image of
+  and the count of (W 23); $u_{\max}$ is floored onto the grid $2^{k/4}$ eV,
+  so it never exceeds the top and QP shifts of the band edges between SC maps
+  do not move it. The imaginary axis $s=-u^2$ is the mirror image of
   the spectral support $[\Omega_{\min}^2,\Omega_{\rm top}^2]$, so the
   condenser is symmetric and its sites end where the spectrum ends. A site
   above $\Omega_{\rm top}$ adds only $O((\Omega/u)^4)$ beyond the $M_1/M_3$
