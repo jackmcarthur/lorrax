@@ -31,13 +31,15 @@ TRACKER; round 2 of lane PARTITION). The rule construction is in
   gap is sampled anyway), and every state up to the cut.
 - **The cut is a spectral gap.** `top` is the highest requested energy,
   clipped to μ + 10 eV (`WINDOW_CLIP_EV`) and raised to ω_max; the cut is
-  the midpoint of the widest gap of the all-k spectrum that opens in
-  [top, top + 2 eV). Every state below it is protected at every k, so no
-  rotating state sits among protected ones.
+  the midpoint of the first all-k gap at least 4η wide (`CUT_GAP_ETAS`)
+  that opens in [top, top + 5 eV) (`CUT_SEARCH_EV`), else of the widest gap
+  there. Every state below it is protected at every k, so no rotating state
+  sits among protected ones, and none within ~2η of the cut.
 - **Semicore S.** Occupied states below a gap wider than 5 eV: active (full
-  mixing, their rows kept), read at their own energy on held patches at
-  `SEMICORE_ETA_EV` = 1 eV. States inside [ω_min, ω_max] stay protected. On
-  a sector (bispinor) route there are no patches and S is protected at η.
+  mixing, their rows kept), read at their own energy on held patches at the
+  deck η, step and tolerance (`SEMICORE_ETA_EV = None`). States inside
+  [ω_min, ω_max] stay protected. On a sector (bispinor) route there are no
+  patches and S is protected at η on the near grid.
 - **Rotating R.** The empty states above the cut. Classes are fixed by DFT
   identity at map 0 and follow the eigenvectors.
 
@@ -58,8 +60,8 @@ TRACKER; round 2 of lane PARTITION). The rule construction is in
   rebuilds W. The insulator Σ frame is the DFT midgap, so the map-0 gap
   opening is not absorbed by the frame (MoS2 3×3 conduction +2.4 to
   +3.1 eV, Si 4³ conduction top +2.3 eV at map 0).
-- **Patches.** Rotating (above E_F, η_far = 1 eV) and semicore (below,
-  η_semi = 1 eV) energies outside the near support, each padded by a
+- **Patches.** Rotating (above E_F, η_far = 1 eV, ε 1e-2) and semicore
+  (below, deck η, ε 1e-4) energies outside the near support, each padded by a
   derived pad, max over the class of |E_map0 − E_DFT| + 2 eV
   (`qp_support.derived_pad_ev`), merged across holes shorter than twice the
   pad (`far_patches_ev`); a patch that reaches the near support starts
@@ -111,30 +113,29 @@ The QSGW kernel takes the two read masks from the SC map
   N ≈ 2.7 s/η + 20 (claim 2908): semicore reads at the deck η cost MoS2
   1580 pairs per map and Fe 1685; at η_semi 1 eV, 490 and 909.
 
-## Measured (PARTITION round 2, 2026-09-28; not main)
+## Measured (PARTITION rounds 2–3, 2026-09-28; not main)
 
 Same node, P4; reference = the same tree with every band protected at the
 deck η and ε 1e-4. Protected states within ±10 eV of E_F; std / maxdev in meV.
 
 | deck | τ pairs/map (main) | map 0 | fixed point | maps |
 |---|---|---|---|---|
-| Si 4³ 8v/8c (ω [−6,6] or [−13,10]) | 476 (414) | 1.10 / 7.7 | 1.14 / 2.6 | 9 |
-| MoS2 3×3 10v/12c ω [−10,10] | 490 (392) | 0.84 / 3.9 | 2.32 / 8.5; ±1 eV shell 2.0 | 10 |
-| Fe 4³ charge 6v/8c ω [−12,8] | 909 (829) | 26.7 / 158 | stalls (3s, 0.33 eV) | – |
-| Na 8³ 86 requested | 755 (1621) | 1.79 / 7.2 | SC-2 only | – |
+| Si 4³ 8v/8c (ω [−6,6] or [−13,10]); cut +15.2 eV | 520 (414) | 0.06 / 0.25 | 0.23 / 0.88 | 9 |
+| MoS2 3×3 10v/12c ω [−10,10]; semicore at η | 1472 (392) | 0.02 / 0.09 | 0.05 / 0.15; ±1 eV shell 0.07 | 14 |
+| Fe 4³ charge 6v/8c ω [−12,8]; semicore at η | 1659 (829) | 26.6 / 157 | converges (22 maps); reference stalls | 22 |
+| Na 8³ 86 requested | see claim 2930 | | SC-2 only | – |
 
-Attribution, one arm per class:
-
-- **Semicore** (read at η_semi on patches): MoS2 with the semicore protected
-  at η, 0.04 / 0.14 meV at the fixed point but 1580 pairs; η_semi 0.5 eV,
-  1.46 / 4.8 meV at 592 pairs. The error scales with η_semi through the P–S
-  couplings; ε_semi 1e-4 changes nothing (< 0.2 meV) and costs 80 pairs.
-  On Fe the 3s read at η_semi 1 eV does not converge (0.32 eV between
-  maps); protected at η it converges in 22 maps (1685 pairs).
-- **Rotating and edge**: Si with no rotating state (ω_max +20) matches the
-  reference to 0.03 / 0.10 meV. The Si cut sits in a 0.41 eV gap
-  ([10.24, 10.65] eV); the protected states just below it carry the error
-  (bands 17–20, 7.9 meV at map 0). With the cut in the 1.8 eV gap at
-  +14.3…+16.1 eV (ω_max +13, 8 rotating (k,state)): 0.23 / 0.88 meV at
-  520 pairs. Fe with no rotating state: map 0 1.3 / 8.3 against 26.7 / 158.
-- **Valence**: protected in every arm; no separate error.
+- **Semicore at η costs the budget.** A crossing window's node count is
+  N ≈ 2.7 s/η + 20 with s its short side, here the depth of the deepest
+  semicore frequency: MoS2 s = 66.5 eV → 738 predicted, 725 measured; Fe
+  s = 100.6 eV → 1106 predicted, 1090 measured. Narrow patches do not
+  shorten s, and the derived pad merges them anyway (MoS2 [−66.5, −10]).
+  At η_semi 1 eV (ε 1e-2) the same frequencies cost 109 (MoS2) and 159 (Fe)
+  nodes but leave MoS2 2.3 / 8.5 meV off at the fixed point; at 0.5 eV,
+  1.5 / 4.8 meV at 592 pairs. On MoS2 the deck-η semicore frequencies also
+  widen the ω ≥ E_F conduction crossing box from [−35.5, +17.5] to
+  [−63.5, +127] eV (203 → 693 nodes).
+- **The cut gap.** Si's first gap after the request is 0.41 eV wide at
+  +10.4 eV and leaves protected states 7.9 meV off at map 0; the ≥ 4η rule
+  takes the 1.8 eV gap at +15.2 eV (0.88 meV at the fixed point). Protecting
+  the 8 rotating (k,state) above it as well (ω_max +20): 0.10 meV at 482 pairs.
