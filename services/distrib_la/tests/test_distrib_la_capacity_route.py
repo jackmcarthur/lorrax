@@ -95,6 +95,37 @@ def test_normal_matrix_directions_refuse_a_cut_near_roundoff():
                                np.concatenate([row[:len(v)] for row, v in zip(s, values)]), rtol=1e-12)
 
 
+def test_distributed_route_probes_hermiticity_in_o_n_without_a_host_sync():
+    """leading_eigenvectors on the distributed route: a Hermitian stack selects as before;
+    a first-row defect or a complex diagonal reaches the host as a NaN spectrum row and
+    refuses at the readback; the probe moves no n x n operand across the mesh."""
+    import jax
+    import jax.numpy as jnp
+    from jax.sharding import PartitionSpec as P
+    from distrib_la.polar import _hermitian_probe
+    mesh = _mesh()
+    n = 8
+    _, h = _stacks(np.random.default_rng(4070), (4,), n)
+    eig = D.plan("eigh", mesh, backend="off", n=n, batched_route="auto")
+    extent = lambda r: 2 * ((r + 1) // 2)
+    face = P(None, "x", "y")
+    _, values = D.leading_eigenvectors(_put(h, mesh, face), 3, eigh_plan=eig, column_extent=extent)
+    for v, ref in zip(values, np.linalg.eigvalsh(h)[:, ::-1]):
+        np.testing.assert_allclose(np.asarray(v), ref[:len(v)], rtol=1e-12)
+    row, diag = h.copy(), h.copy()
+    row[2, 0, 5] += 1e-6
+    diag[1, 3, 3] += 1e-6j
+    for bad in (row, diag):
+        with pytest.raises(ValueError, match="must be finite"):
+            D.leading_eigenvectors(_put(bad, mesh, face), 3, eigh_plan=eig, column_extent=extent)
+    hlo = _hermitian_probe.lower(_put(h, mesh, face), jnp.zeros((4, n))).compile().as_text()
+    assert "all-to-all" not in hlo
+    for line in hlo.splitlines():
+        if "all-gather(" in line:
+            result = line.split("all-gather(")[0]
+            assert f"{n},{n}]" not in result, line
+
+
 def test_real_rows_never_solve_synthetic_slots(monkeypatch):
     import jax
     import jax.numpy as jnp
