@@ -518,6 +518,7 @@ def finalize_dynamic_sigma(
     write_sigma_omega_h5: bool = True,
     band_extrapolation: dict | None = None,
     sigma_c_body_omega_unextrap: jax.Array | None = None,
+    sigma_c_far=None,
     print_fn: Callable = print,
     efermi_ry=None,
     efermi_provenance=None,
@@ -660,10 +661,14 @@ def finalize_dynamic_sigma(
             sigma_c_omega, sig_x_rep,
             omega_grid_ev, e_qp_rel_ev, mesh_xy,
             band_axis=sigma_band_axis,
-            out_of_grid=config.sigma.out_of_grid,
+            protected_kn=config.sc_sigma_protected_kn,
+            far=sigma_c_far,
         )
         print_fn(f"  QSGW: {int(qsgw_diag['n_clipped'])} clipped "
-                 f"({100*qsgw_diag['frac_clipped']:.1f}%)")
+                 f"({100*qsgw_diag['frac_clipped']:.1f}%)"
+                 + ("" if sigma_c_far is None else
+                    f"; rotating endpoints read far patches, "
+                    f"{int(qsgw_diag['n_far_clipped'])} clamped"))
 
         sigma_lorentz = None
         if sigma_lorentz_static_skij_ry is not None:
@@ -694,7 +699,7 @@ def finalize_dynamic_sigma(
                 sigma_c_omega_unextrap, sig_x_rep,
                 omega_grid_ev, e_qp_rel_ev, mesh_xy,
                 band_axis=sigma_band_axis,
-                out_of_grid=config.sigma.out_of_grid,
+                    protected_kn=config.sc_sigma_protected_kn,
             )
 
         # Only append when this call created the base file.  SC iterations
@@ -1216,7 +1221,6 @@ def _compute_mpa_sigma(
         efermi_ry=sigma_efermi_ry,
         occupation_state=occupation_state,
         regularization_width_ry=_xi.resolved_ry,
-        edge_factor=float(config.sigma.window_edge_factor),
         quadrature_eps=float(config.sigma.quadrature_eps),
         quadrature_cache_dir=quadrature_cache_dir,
         omega_grid_step_ry=(
@@ -1231,6 +1235,11 @@ def _compute_mpa_sigma(
     lorentz_output = bool(config.debug.sigma_lorentz_debug_output)
     if not lorentz_output:
         sigma_lorentz = None
+    far_bodies = []
+    if (getattr(config, "sc_far_patches_ev", None)
+            and sector_handle.get("representation") == "sector-ordered-ph"):
+        raise ValueError("GATE sigma_far_patch_sector: far patches serve the scalar "
+                         "Sigma route only")
     if sector_handle.get("representation") == "sector-ordered-ph":
         from .mpa.sector_sigma import compute_sector_sigma
         on_shell = None
@@ -1244,7 +1253,7 @@ def _compute_mpa_sigma(
                 shell, _ = build_qsgw_sigma_xc(
                     value.sigma_c_kij, zero_x, config.omega_grid_ev,
                     e_qp_rel_ev, mesh_xy, band_axis=value.band_axis,
-                    out_of_grid=config.sigma.out_of_grid)
+                            protected_kn=config.sc_sigma_protected_kn)
                 return shell
 
         sector_result = compute_sector_sigma(
@@ -1258,9 +1267,51 @@ def _compute_mpa_sigma(
         else:
             body = sector_result
     else:
-        body = compute_sigma_c_mpa_omega_grid(
-            wfns, fit_path, meta, mesh_xy, sigma_w_model=sigma_w_model,
-            fit_identity=fit_identity, fit_digest=fit_digest, **body_options)
+        far_patches = getattr(config, "sc_far_patches_ev", None) or ()
+        if far_patches:
+            # ONE PLAN, PER-RANGE ETA: the far patches join the near grid as
+            # extra frequencies whose crossing windows carry the patch eta
+            # (gw.sigma_box_plan.plan_sigma_windows omega_eta_ry); the cube is
+            # split back into the near grid and the far patches below.
+            from .qp_support import FAR_PATCH_EPS, far_patch_eta_ev, far_patch_grid_ev
+            near_ev = np.asarray(config.omega_grid_ev, dtype=np.float64)
+            pieces = [(near_ev, np.full(near_ev.size, _xi.resolved_ry * RYD_TO_EV), True)]
+            for patch in far_patches:
+                grid_ev = far_patch_grid_ev(patch)
+                pieces.append((grid_ev, np.full(grid_ev.size, far_patch_eta_ev(patch)), False))
+            pieces.sort(key=lambda piece: float(piece[0][0]))
+            union_ev = np.concatenate([p_[0] for p_ in pieces])
+            if np.any(np.diff(union_ev) <= 0):
+                raise ValueError("GATE sigma_far_patch_order: far patches overlap the near grid")
+            union_eta_ev = np.concatenate([p_[1] for p_ in pieces])
+            near_mask = np.concatenate([np.full(p_[0].size, p_[2]) for p_ in pieces])
+            print_fn("  Sigma far patches in the near plan: "
+                     + ", ".join(f"[{g[0]:+.2f}, {g[-1]:+.2f}] eV at eta {e[0]:.3f}"
+                                 for g, e, near in pieces if not near))
+            body = compute_sigma_c_mpa_omega_grid(
+                wfns, fit_path, meta, mesh_xy, sigma_w_model=sigma_w_model,
+                fit_identity=fit_identity, fit_digest=fit_digest,
+                **dict(body_options, omega_grid_ry=union_ev / RYD_TO_EV,
+                       omega_eta_ry=union_eta_ev / RYD_TO_EV, far_eps=FAR_PATCH_EPS))
+            from dataclasses import replace as _replace_body
+            near_idx = np.nonzero(near_mask)[0]
+            far_idx = np.nonzero(~near_mask)[0]
+
+            def _slice(b, idx, keep_odd):
+                fields = dict(sigma_c_kij=jnp.take(b.sigma_c_kij, jnp.asarray(idx), axis=0))
+                if hasattr(b, "sigma_c_odd_kij"):
+                    fields["sigma_c_odd_kij"] = (
+                        None if (b.sigma_c_odd_kij is None or not keep_odd) else
+                        jnp.take(b.sigma_c_odd_kij, jnp.asarray(idx), axis=0))
+                if hasattr(b, "omega_ry"):
+                    fields["omega_ry"] = np.asarray(b.omega_ry)[idx]
+                return _replace_body(b, **fields)
+            far_bodies.append((union_ev[far_idx], _slice(body, far_idx, False)))
+            body = _slice(body, near_idx, True)
+        else:
+            body = compute_sigma_c_mpa_omega_grid(
+                wfns, fit_path, meta, mesh_xy, sigma_w_model=sigma_w_model,
+                fit_identity=fit_identity, fit_digest=fit_digest, **body_options)
     head_diag = None
     if head is not None:
         if iteration_head is None:
@@ -1289,6 +1340,27 @@ def _compute_mpa_sigma(
             occupations=head_occ,
             poles_ry=head["Omega_p"], residues_ry=head["B_p"],
             cell_volume=float(meta.cell_volume), nk_tot=int(meta.nk_tot))
+    sigma_c_far = None
+    if far_bodies:
+        from .dynamic_sigma import add_head_sigma_diag
+        cubes = []
+        for grid_ev, far_body in far_bodies:
+            far_head = None
+            if head is not None:
+                far_head = compute_complex_pole_head_sigma_diag(
+                    omega_grid_ry=grid_ev / RYD_TO_EV, enk_ry=head_enk,
+                    efermi_ry=sigma_efermi_ry, occupations=head_occ,
+                    poles_ry=head["Omega_p"], residues_ry=head["B_p"],
+                    cell_volume=float(meta.cell_volume), nk_tot=int(meta.nk_tot))
+            cubes.append(add_head_sigma_diag(far_body.sigma_c_kij, far_head,
+                                             band_axis=far_body.band_axis))
+        # The joined far axis must ascend: plans are grouped by eta, not energy.
+        order = np.argsort([float(g[0]) for g, _ in far_bodies], kind="stable")
+        cubes = [cubes[i] for i in order]
+        sigma_c_far = (cubes[0] if len(cubes) == 1 else jnp.concatenate(cubes, axis=0),
+                       np.concatenate([far_bodies[i][0] for i in order]))
+        if np.any(np.diff(sigma_c_far[1]) <= 0):
+            raise ValueError("GATE sigma_far_patch_order: far patches overlap or do not ascend")
     return finalize_dynamic_sigma(
         body.sigma_c_kij, head_diag,
         sigma_band_axis=body.band_axis,
@@ -1303,6 +1375,7 @@ def _compute_mpa_sigma(
         sigma_lorentz_static_skij_ry=sigma_lorentz,
         sigma_c_odd_body_omega=body.sigma_c_odd_kij,
         ppm_odd_even_residue_ratio=body.odd_even_residue_ratio,
+        sigma_c_far=sigma_c_far,
         print_fn=print_fn,
         efermi_ry=sigma_efermi_ry,
         efermi_provenance=sigma_efermi_provenance)

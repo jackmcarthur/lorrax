@@ -1,32 +1,16 @@
-"""Three-way band partition for QSGW: protected / non-protected-in-range / out-of-range.
+"""Band classes and Hamiltonian masks.
 
-The QSGW iteration map carries ``H_qp_dft`` over the **active subspace**
-(``band_slices.sigma`` of the wfn bundle).  Within that subspace, each
-band falls into one of three categories per the user-configured
-:class:`BandPartition`:
-
-================================  ===========================  =======================================
-Category                          ``protected_mask`` element   Diagonal of ``H_qp_dft`` per iteration
-================================  ===========================  =======================================
-Protected                         ``True``                     Full Σ at QP energy (off-diag mixed in)
-Non-protected, in ω-range         ``False``, ``in_range=True`` Diagonal Σ at actual band energy
-Non-protected, out of ω-range     ``False``, ``in_range=False`` Scissor extrapolation α·E_DFT + β
-================================  ===========================  =======================================
-
-Off-diagonals of ``H_qp_dft`` are kept **only** for protected×protected
-pairs.  All other off-diagonals are zeroed each iteration so the
-non-protected / out-of-range bands never mix into the protected
-subspace's eigenproblem.
-
-Masks follow DFT reference identities at each k.  Only fixed-Sigma EQP2
-builds a non-trivial partition (:func:`build_omega_band_partition`); the SC
-loop keeps every QP-window identity protected (owner rule 2026-09-22), so its
-partition is :meth:`BandPartition.all_protected`.
+Dynamic SC protects the requested DFT bands, counted from E_F at each k and
+closed outward to spectral gaps resolved at eta. Other bands rotate through
+their couplings to protected bands, with a DFT-plus-side-scissor diagonal and
+no rotating–rotating mixing.
+The legacy three-mask helper below serves fixed-Sigma EQP2 only.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
+from functools import partial
 
 import numpy as np
 
@@ -37,6 +21,60 @@ import jax.numpy as jnp
 # ---------------------------------------------------------------------------
 # Partition descriptor
 # ---------------------------------------------------------------------------
+
+def requested_band_mask(energies_ev, *, n_occ, nval, ncond, gap_ev, mu_ev=None,
+                        range_ev=None, range_mu_ev=None):
+    """Requested bands closed to the next resolved spectral gap at each k.
+
+    ``nval``/``ncond`` count states below/above the Fermi level at each k.
+    With ``mu_ev`` (absolute eV, the frame of ``energies_ev``) the count
+    starts at the number of states below mu at that k, so a metal protects
+    the same energy neighbourhood of E_F at every k; without it, or on an
+    insulator, the count starts at ``n_occ``. A gap larger than eta separates
+    manifolds resolved by Sigma. ``range_ev = (lo, hi)`` (either may be
+    None), relative to ``range_mu_ev``, only enlarges the set: every state in
+    it is protected, closed over its eta-resolved manifold. Only the initial
+    DFT ladder is classified. The work is O(nk nb), with no axis loop.
+    """
+    e = np.asarray(energies_ev, float)
+    nk, nb = e.shape
+    below = (np.full(nk, int(n_occ)) if mu_ev is None
+             else np.count_nonzero(e < float(mu_ev), axis=1))
+    lo, hi = below - int(nval), below + int(ncond)
+    if np.any(lo < 0) or np.any(hi > nb) or np.any(lo >= hi):
+        k = int(np.argmax((lo < 0) | (hi > nb)))
+        raise ValueError(f"protected band range [{lo[k]}, {hi[k]}) at k={k} outside {e.shape}; "
+                         "reduce nval/ncond or load more bands")
+    groups = np.cumsum(np.concatenate((np.zeros((nk, 1), bool),
+                                      np.diff(e, axis=1) > float(gap_ev)), axis=1), axis=1)
+    g_lo = np.take_along_axis(groups, lo[:, None], axis=1)
+    g_hi = np.take_along_axis(groups, (hi - 1)[:, None], axis=1)
+    protected = (groups >= g_lo) & (groups <= g_hi)
+    # A dense ladder must not turn a small request into an all-band window.
+    # This bounds automatic edge closure, not the user's requested extent.
+    from .qp_support import SUPPORT_PAD_EV
+    lower = np.min(np.where(protected, e, np.inf), axis=1)
+    upper = np.max(np.where(protected, e, -np.inf), axis=1)
+    rows = np.arange(nk)
+    promotion = np.maximum(e[rows, lo] - lower, upper - e[rows, hi - 1])
+    if np.any(promotion > SUPPORT_PAD_EV):
+        k = int(np.argmax(promotion))
+        raise ValueError(
+            "GATE sigma_band_edge_gap: closing the requested bands to an "
+            f"eta-resolved gap at k={k} requires {promotion[k]:.6f} eV, "
+            f"beyond the {SUPPORT_PAD_EV:g} eV automatic-promotion limit; "
+            "increase nval/ncond explicitly to include that manifold.")
+    if range_ev is not None and any(x is not None for x in range_ev):
+        lo_ev = -np.inf if range_ev[0] is None else float(range_ev[0])
+        hi_ev = np.inf if range_ev[1] is None else float(range_ev[1])
+        rel = e - float(range_mu_ev)
+        inside = (rel >= lo_ev) & (rel <= hi_ev)
+        hit = np.zeros((nk, nb + 1), bool)
+        np.put_along_axis(hit, np.where(inside, groups, nb), True, axis=1)
+        hit[:, nb] = False
+        protected = protected | np.take_along_axis(hit, groups, axis=1)
+    return protected
+
 
 @dataclass(frozen=True)
 class BandPartition:
@@ -245,3 +283,56 @@ def apply_band_partition(
 __all__ = [
     "BandPartition", "apply_band_partition", "build_omega_band_partition",
 ]
+
+
+def rotating_diagonal(h_diag_kn, e_dft_kn, protected_kn, *, below_kn,
+                      fit_below_kn, fit_above_kn, k_weights):
+    """Rotating diagonal: DFT energy plus one QP-correction scissor per side of mu.
+
+    ``h_diag_kn`` is the full QSGW diagonal in the DFT basis and ``e_dft_kn``
+    the DFT energies (Ry, identity order). The scissor below (above) mu is the
+    k-star-weighted mean of H_ii - E_i over the protected occupied (empty)
+    states; with no protected state on one side, that side takes the other
+    side's mean. Nothing is read at a rotating energy and no band is held at
+    DFT. A diagonal error reaches a protected state only at second order,
+    |V_io|^2 d(beta)/(E_i - E_o)^2, so the side mean is weighted by nothing
+    else (claim: CLASSMIX).
+    """
+    w = np.asarray(k_weights, float)[:, None]
+    p = np.asarray(protected_kn, bool)
+    e = np.asarray(e_dft_kn, float)
+    delta = np.asarray(h_diag_kn, float) - e
+    def side(mask):
+        wt = w * (p & mask)
+        total = float(wt.sum())
+        return (float((wt * delta).sum()) / total if total > 0 else None), int((p & mask).sum())
+    (b_lo, n_lo), (b_hi, n_hi) = side(fit_below_kn), side(fit_above_kn)
+    if b_lo is None and b_hi is None:
+        raise ValueError("rotating bands: no protected state fits the scissor")
+    b_lo = b_hi if b_lo is None else b_lo
+    b_hi = b_lo if b_hi is None else b_hi
+    target = e + np.where(below_kn, b_lo, b_hi)
+    from common.units import RYD_TO_EV
+    return target, (f"beta below={b_lo * RYD_TO_EV:+.6f} eV (n={n_lo}), "
+                    f"above={b_hi * RYD_TO_EV:+.6f} eV (n={n_hi})")
+
+
+@partial(jax.jit, static_argnames=("mesh",))
+def rotating_band_hamiltonian(H, protected_kn, rotating_diagonal_ry, mesh):
+    """Keep P-P and P-R, replace R diagonals and discard R-R mixing.
+
+    H is (nk, nb_X, nb_Y), energies are Ry. Masks/diagonals are bounded
+    (nk, nb) metadata; the matrix result stays on both processor axes.
+    """
+    from jax.sharding import NamedSharding, PartitionSpec as P
+    p = protected_kn
+    eye = jnp.eye(H.shape[-1], dtype=bool)[None]
+    keep = p[:, :, None] | p[:, None, :]
+    result = jnp.where(keep, H, jnp.where(eye, rotating_diagonal_ry[:, :, None], 0.))
+    from runtime.padding import pad_square, padded_axis
+    spec = P(None, "x", "y")
+    axis = padded_axis(H.shape[-1], mesh, name="rotating band Hamiltonian",
+                       specs=((spec, 1), (spec, 2)))
+    result = jax.lax.with_sharding_constraint(
+        pad_square(result, axis), NamedSharding(mesh, spec))
+    return result[:, :axis.logical, :axis.logical]

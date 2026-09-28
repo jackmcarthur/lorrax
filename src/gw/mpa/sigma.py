@@ -1606,13 +1606,15 @@ def _branches(wfns, omega, efermi_ry, occupation_state=None):
             f"state: efermi_ry={float(efermi_ry):.12g} Ry vs "
             f"occupation_state.mu_ry={mu:.12g} Ry.  One chemical potential "
             "per iteration — pass the state's own mu.")
+    from gw.efermi import OCCUPATION_WEIGHT_FLOOR
+    excursion = float(occupation_state.smearing_width_ry) * np.log(1.0 / OCCUPATION_WEIGHT_FLOOR)
     f = jnp.reshape(jnp.asarray(occupation_state.f_kn),
                     wfns.enk.shape)[:, wfns.slices.sigma_sum]
     energy = wfns.enk[:, wfns.slices.sigma_sum] - mu
     return branches_for_omega_grid(
         omega, E_cond=energy, H_val=-energy,
         cond_mask=(f != 1.0), val_mask=(f != 0.0),
-        cond_weight=1.0 - f, val_weight=f)
+        cond_weight=1.0 - f, val_weight=f, excursion_bound_ry=excursion)
 
 
 def compute_sigma_c_mpa_omega_grid(
@@ -1624,7 +1626,6 @@ def compute_sigma_c_mpa_omega_grid(
     omega_grid_ry,
     efermi_ry,
     regularization_width_ry,
-    edge_factor=1.5,
     quadrature_eps,
     quadrature_cache_dir,
     omega_grid_step_ry,
@@ -1643,6 +1644,8 @@ def compute_sigma_c_mpa_omega_grid(
     sector_context=None,
     odd_reference=True,
     tau_kernel_factory=None,
+    omega_eta_ry=None,
+    far_eps=None,
     print_fn=print,
 ):
     """Read a fitted MPA store, derive its windows, and compute Sigma_c.
@@ -1761,8 +1764,7 @@ def compute_sigma_c_mpa_omega_grid(
                 frequencies = shared_pole_frequencies(poles2, counts)
                 summaries = summarize_shared_poles(
                     poles2, counts, branches,
-                    regularization_width_ry=regularization_width_ry,
-                    edge_factor=edge_factor)
+                    regularization_width_ry=regularization_width_ry)
                 if scope is not None:
                     # The certificate boxes come from the same union, so the
                     # map's sector calls request one box set: the first fits
@@ -1773,8 +1775,7 @@ def compute_sigma_c_mpa_omega_grid(
                         union2[q, :len(row)] = np.sort(row)
                     certificate = summarize_shared_poles(
                         union2, np.asarray(union_counts, np.int64), branches,
-                        regularization_width_ry=regularization_width_ry,
-                        edge_factor=edge_factor)
+                        regularization_width_ry=regularization_width_ry)
         for lo in (() if shared_pole else range(0, n_poles, int(pole_batch_size))):
             hi = min(lo + int(pole_batch_size), n_poles)
             Omega, B, B_odd = reader.read(
@@ -1784,7 +1785,7 @@ def compute_sigma_c_mpa_omega_grid(
             summaries.extend(summarize_sigma_poles(
                 Omega, _geometry_residue(B, B_odd), branches,
                 regularization_width_ry=regularization_width_ry,
-                edge_factor=edge_factor, pole_offset=lo))
+                pole_offset=lo))
             del Omega, B, B_odd
             gc.collect()
         # Rule fitting is its own timing row: on the Si b80/c504 deck the
@@ -1797,12 +1798,13 @@ def compute_sigma_c_mpa_omega_grid(
                 regularization_width_ry,
                 eps=quadrature_eps,
                 cache_dir=quadrature_cache_dir,
-                print_fn=print_fn, edge_factor=edge_factor,
+                print_fn=print_fn,
                 fixed_rule_session=fixed_quadrature_session,
                 analytic_line=bool(analytic_line),
                 material_class=material_class,
                 fixed_pole_support_ry=fixed_pole_support_ry,
-                certificate_pole_summaries=certificate)
+                certificate_pole_summaries=certificate,
+                omega_eta_ry=omega_eta_ry, far_eps=far_eps)
         quadrature_log.record_sigma_plan(geometry)
         print_fn(
             f"  MPA windows [box]: "
