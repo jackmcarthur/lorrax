@@ -3389,9 +3389,12 @@ def _gw_iteration_map_once(state: SCState, inputs: SCInputs) -> SCState:
             trs_allowed=inputs.sym.trs_allowed,
             state_capacity=inputs.wfn.occupation_state_capacity,
             kweights=full_k_quadrature_weights(inputs.wfn, inputs.wfn.symmetry()))
+        from .qp_support import requested_window_ev
         inputs.meta.shared_pole_recipe = resolve_shared_pole_recipe(
             inputs.config, wfns_qp, inputs.meta, mesh_xy=inputs.mesh_xy,
             print_fn=inputs.print_fn,
+            requested_window_ev=requested_window_ev(
+                inputs.config.omega_grid_ev, sc_support.energy, sc_support.requested),
             support_session=(None if inputs.fixed_quadrature_session is None else
                              inputs.fixed_quadrature_session.setdefault(
                                  "shared_pole_supports", {})))
