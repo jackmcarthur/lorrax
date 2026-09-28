@@ -344,6 +344,13 @@ def _paired_output(a, inverse, *, half, finite, n_inf):
     return w, v
 
 
+def _schur_basis(y_s, bh_y_s, kept):
+    """[[Y_S, 0], [-B^H Y_S, diag(kept)]] [b, 2R, 2R]: P diag(Y_S, I_kept) with P = [[I, 0], [-B^H, I]]."""
+    eye = jnp.eye(y_s.shape[-1], dtype=y_s.dtype)[None] * kept[:, None, :].astype(y_s.dtype)
+    return jnp.concatenate((jnp.concatenate((y_s, jnp.zeros_like(y_s)), axis=-1),
+                            jnp.concatenate((-bh_y_s, eye), axis=-1)), axis=-2)
+
+
 def _restricted_block(ww, wv, vv):
     """Hermitian [[ww, wv], [wv^H, vv]] of the restricted paired pencil."""
     return hermitian_part(jnp.concatenate(
@@ -373,7 +380,10 @@ def reduce_ordered_shared_pole_pencil(pencil, active_columns, *, eigh, matmul, g
     times PSD, negative modes belong to the parent of -q (signed model only).
     |mu| <= keep*max|mu| (poles at infinity) is excluded and its output weight
     is reported. ``keep_budget`` caps the H'_vv keep cut at that many
-    directions, the largest first, so K <= keep_budget.
+    directions, the largest first, so K <= keep_budget. The second cut acts on
+    the eigenvalues of S (the kept v directions stay), and Y = L^-H on the kept
+    span is P diag(U_S Gamma_S^-1/2, I) with P = [[I, 0], [-B^H, I]], corrected
+    by Newton–Schulz against the computed H_r.
 
     Returns (b [b,n,R], poles2 [b,R], active [b,R]), the signed model
     (c [b,n,R], mu [b,R], retained [b,R]) and device diagnostics.
@@ -454,23 +464,34 @@ def reduce_ordered_shared_pole_pencil(pencil, active_columns, *, eigh, matmul, g
     # Restricted paired pencil on span(Z) in both halves. Its v-block is the metric
     # (identity after correction). On time-reversal-symmetric data H_r = diag(t_s, I),
     # t_s the even route's Z^H H_s Z; once time reversal is broken the halves mix and a
-    # w combination can lie in span(v), so a second relative keep cut on H_r removes
-    # exactly those redundant combinations before the H-metric Ritz step.
-    h_r = _matrix_layout(on_face(_restricted_block, face, project(z, h_ww), project(z, h_wv), metric), matrix_sharding)
-    del h_ww, h_wv, metric
+    # w combination can lie in span(v), so a second relative keep cut removes exactly
+    # those redundant combinations before the H-metric Ritz step. The cut acts on the
+    # Schur complement S = A - B B^H of the unit v-block: P^H H_r P = diag(S, I) with
+    # P = [[I, 0], [-B^H, I]], so only S is eigendecomposed and the structural unit
+    # half of H_r never enters the eigensolver (whole-H_r eigh: backward error
+    # 8e-4 top on Fe 4^3 complete-basis parents, claim of the PAIREDHR lane).
+    a_r, b_r = project(z, h_ww), project(z, h_wv)
+    h_r = _matrix_layout(on_face(_restricted_block, face, a_r, b_r, metric), matrix_sharding)
+    schur = _matrix_layout(hermitian_part(a_r - matmul(b_r, b_r, transb="C")), matrix_sharding)
+    del h_ww, h_wv, metric, a_r
     g_r = _matrix_layout(on_face(_restricted_block, face, project(z, g_ww), project(z, g_wv), project(z, g_vv)), matrix_sharding)
     del g_ww, g_wv, g_vv
     o_r = _matrix_layout(join_columns(matmul(o_w, z), matmul(o_v, z)), matrix_sharding)
     if retain_span:
         paired_span = scale[:, :, None] * z
     del o_w, o_v, z
-    gamma_r, u_r = eigh(h_r)
+    gamma_r, u_r = eigh(schur)
+    del schur
     top_r = gamma_r[:, -1]
     ratio_r = gamma_r[:, 0] / jnp.where(top_r > 0, top_r, 1)
-    keep_r = (gamma_r > keep_cut * top_r[:, None]) & (top_r[:, None] > 0)
-    count_r = jnp.sum(keep_r, axis=-1, dtype=jnp.int64)
-    y = u_r * (keep_r / jnp.sqrt(jnp.where(keep_r, gamma_r, 1)))[:, None, :]
+    keep_s = (gamma_r > keep_cut * top_r[:, None]) & (top_r[:, None] > 0)
+    y_s = u_r * (keep_s / jnp.sqrt(jnp.where(keep_s, gamma_r, 1)))[:, None, :]
     del u_r
+    # Y = P diag(Y_S, I_kept): Schur modes, then the kept v directions.
+    y = _matrix_layout(on_face(_schur_basis, face, y_s, matmul(b_r, y_s, transa="C"), kept), matrix_sharding)
+    del y_s, b_r
+    keep_r = jnp.concatenate((keep_s, kept), axis=-1)
+    count_r = jnp.sum(keep_r, axis=-1, dtype=jnp.int64)
     null_r = diagonal_like(~keep_r, h_r)
     metric_r = hermitian_part(matmul(y, matmul(h_r, y), transa="C")) + null_r
     # The restricted sources are released before the second metric correction.
