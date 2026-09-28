@@ -384,3 +384,41 @@ def test_minibz_coulomb_moment_cubic_cell():
     half = np.pi / 4.0
     assert half ** 2 / 9.0 < q4[0, 0] < 3.0 * half ** 2 / 9.0
 
+
+
+def test_head_rows_share_one_program_per_draw_batch():
+    """The metal head's cell averages over z: the Lindhard term of every row in one scan equals
+    one call per z, and q0_average_screened's rows (Lindhard, constant and bare rows mixed)
+    equal their own q0_average calls, to round-off (regrouped sums)."""
+    import jax.numpy as jnp
+    from gw.qsgw_head import _extra_chi_rows
+    from vcoul.bulk_3d import Bulk3D
+    from vcoul.geometry import CoulombGeometry
+    rng = np.random.default_rng(20260928)
+    atoms = _atoms(rng.uniform(0.01, 0.05, size=150), rng.normal(size=(150, 3)))
+    q = rng.normal(size=(300, 3)) * 0.05
+    zs = (0.3j, 0.05 + 0.02j, 1.5j, -0.2 + 0.1j)
+    rows = np.asarray(atoms.density_response_rows(q, zs))
+    for i, z in enumerate(zs):
+        np.testing.assert_allclose(rows[i], np.asarray(atoms.density_response(q, z)), rtol=1e-12, atol=0)
+    bvec = 2 * np.pi / 8.0 * np.array([[0.0, 1.0, 1.0], [1.0, 0.0, 1.0], [1.0, 1.0, 0.0]])
+    geometry = CoulombGeometry(bvec=bvec, cell_volume=128.0)
+    S = [np.diag([0.2, 0.25, 0.3]).astype(complex) * (1 + 0.1j * k) for k in range(3)]
+    extras = [("lindhard", zs[0]), ("constant", -0.01), None]
+    kw = dict(nsamples=2 ** 10, method="sobol", qmc_reps=2)
+    _, got = Bulk3D().q0_average_screened(geometry, (4, 4, 4), S_carts=S,
+                                          extra_chi_rows=_extra_chi_rows(extras, atoms), **kw)
+    from vcoul.minibz import _sample_q0_minibz_qpoints
+    draw = [np.asarray(b) for b in _sample_q0_minibz_qpoints(
+        geometry, (4, 4, 4), analytic_sphere=False, is_2d=False, **kw)]
+    single = (lambda qq: np.asarray(atoms.density_response(qq, zs[0])),
+              lambda qq: np.full(qq.shape[0], -0.01 + 0j), lambda qq: 0.0)
+    for g, s, chi in zip(got, S, single):
+        want = np.mean([np.mean((v := 8 * np.pi / np.einsum("qi,qi->q", b, b))
+                                / (1 - v * (np.einsum("qi,ij,qj->q", b, s, b) + chi(b))))
+                        for b in draw])
+        np.testing.assert_allclose(g, want, rtol=1e-12)
+        _, one = Bulk3D().q0_average(geometry, (4, 4, 4), S_cart=s, extra_chi=(
+            None if chi is single[2] else (lambda qq, f=chi: jnp.asarray(f(np.asarray(qq))))), **kw)
+        np.testing.assert_allclose(complex(one), want, rtol=1e-12)
+    assert _extra_chi_rows([None, None], atoms) is None
