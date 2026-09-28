@@ -2644,10 +2644,10 @@ def _sc_sampled_support(inputs, partition, energies_loop, mu_ev):
     states = requested_states(energy, part.protected_mask)
     if session is None or "omega_grid_ev" not in session:
         probe = None if session is None else session.get("probe_energy_ev")
+        reps = 0 if probe is None else probe.shape[0] // energy.shape[0]
         grid, envelope = plan_support_ev(
             sigma, energy if probe is None else np.concatenate([energy, probe]),
-            states if probe is None else np.concatenate([states, states]),
-            outer_pad_ev=SUPPORT_PAD_EV)
+            np.tile(states, (1 + reps, 1)), outer_pad_ev=SUPPORT_PAD_EV)
         event = ("one-shot" if session is None else "plan" if probe is None
                  else "plan from DFT + map-0 probe")
     else:
@@ -3832,7 +3832,7 @@ def _gw_iteration_map_once(state: SCState, inputs: SCInputs) -> SCState:
             probe = None if session is None else session.get("probe_energy_ev")
             if probe is not None:
                 e_plan = np.concatenate([e_plan, probe])
-                rot_plan = np.concatenate([rot_plan, rot_plan])
+                rot_plan = np.tile(rot_plan, (1 + probe.shape[0] // rot_plan.shape[0], 1))
             far_patches = far_patches_ev(
                 e_plan, rot_plan, (float(grid[0]), float(grid[-1])))
             if session is not None:
@@ -4035,12 +4035,25 @@ def _gw_iteration_map_once(state: SCState, inputs: SCInputs) -> SCState:
             and "probe_energy_ev" not in _session):
         from .qsgw_utils import static_sigma_diag_to_host
         from .qp_support import far_patch_covered
+        from common.collectives import gather_to_host
+        from .sc_state_identity import assign_qp_identity
         mu_frame_ev = float(np.mean(np.asarray(energies_loop) - sc_support.energy))
-        probe = (np.asarray(static_sigma_diag_to_host(H_qp_dft_new, inputs.mesh_xy).real)
-                 * RYD_TO_EV - mu_frame_ev)
+        # Two estimates per identity: the DFT-basis diagonal, and the map-0
+        # output eigenvalue carried by that identity (as the next map's input
+        # classifies it). Strong P-R mixing moves the second several eV from
+        # the first (Fe bispinor: band 25 to +16 eV against a +12.5 eV plan).
+        diag = np.asarray(static_sigma_diag_to_host(H_qp_dft_new, inputs.mesh_xy).real) * RYD_TO_EV
+        e_out, u_out = np.linalg.eigh(np.asarray(gather_to_host(H_qp_dft_new)))
+        e_out = e_out * RYD_TO_EV
+        idx, _, _, _ = assign_qp_identity(
+            None, np.asarray(e_dft_fit_ev, float), u_out, e_out,
+            np.ones(e_out.shape[1], dtype=bool),
+            degeneracy_tol_ev=float(inputs.config.sc.exact_degeneracy_tol_ev))
+        probe = np.concatenate([diag, np.take_along_axis(e_out, idx, axis=1)]) - mu_frame_ev
+        del e_out, u_out
         grid = np.asarray(sc_support.grown, float)
         beyond = (probe < grid[0]) | (probe > grid[-1])
-        prot = np.asarray(protected_loop, bool)
+        prot = np.tile(np.asarray(protected_loop, bool), (2, 1))
         escape_p = prot & beyond
         escape_r = np.zeros_like(escape_p)
         if far_patches:
