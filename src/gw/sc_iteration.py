@@ -2623,6 +2623,7 @@ class SCSupport(NamedTuple):
     event: str                 # one-shot | plan | hold | rebuild
     envelope: tuple | None     # protected envelope at the last plan, eV
     clamped_kn: np.ndarray      # protected states whose read stencil is clipped
+    plan: object = None         # the held gw.qp_support.SigmaPlan (near + far)
 
 
 def _sc_sampled_support(inputs, partition, energies_loop, mu_ev):
@@ -2634,23 +2635,37 @@ def _sc_sampled_support(inputs, partition, energies_loop, mu_ev):
     """
     if not inputs.config.compute_mode.is_dynamic:
         return None
-    from .qp_support import (SUPPORT_PAD_EV, clamped_reads, plan_support_ev,
-                             requested_states)
+    from .qp_support import clamped_reads, plan_sigma_windows, requested_states
     sigma = inputs.config.sigma
     session = inputs.fixed_quadrature_session
     deck = np.asarray(inputs.config.omega_grid_ev, dtype=float)
     part = _partition_on_loop(partition, inputs)
     energy = energies_loop - mu_ev
     states = requested_states(energy, part.protected_mask)
-    if session is None or "omega_grid_ev" not in session:
+    if session is None or "sigma_plan" not in session:
         probe = None if session is None else session.get("probe_energy_ev")
         reps = 0 if probe is None else probe.shape[0] // energy.shape[0]
-        grid, envelope = plan_support_ev(
+        rotating = ~np.asarray(states, bool)
+        far = (inputs.wfns_transverse is None
+               and inputs.config.compute_mode is ComputeMode.MPA and rotating.any())
+        # Far patches cover the rotating DFT energies (and map-0 estimates).
+        ks = _kstar(inputs)
+        e_dft = np.asarray(inputs.e_dft_active_kn_ry if ks.is_identity
+                           else ks.select(inputs.e_dft_active_kn_ry)) * RYD_TO_EV - mu_ev
+        plan = plan_sigma_windows(
             sigma, energy if probe is None else np.concatenate([energy, probe]),
-            np.tile(states, (1 + reps, 1)), outer_pad_ev=SUPPORT_PAD_EV)
+            np.tile(states, (1 + reps, 1)),
+            rotating_energy_rel_ev=(e_dft if probe is None
+                                    else np.concatenate([e_dft, probe])),
+            rotating_kn=np.tile(rotating, (1 + reps, 1)) if far else None)
+        grid, envelope = plan.grid_ev, plan.envelope_ev
         event = ("one-shot" if session is None else "plan" if probe is None
                  else "plan from DFT + map-0 probe")
+        if session is not None:
+            session["sigma_plan"] = plan
+            session["far_patches_ev"] = plan.far_patches_ev
     else:
+        plan = session["sigma_plan"]
         grid = np.asarray(session["omega_grid_ev"], float)
         envelope = session["support_envelope_ev"]
         event = "hold"
@@ -2670,7 +2685,7 @@ def _sc_sampled_support(inputs, partition, energies_loop, mu_ev):
             f"E-mu={float(energy[ks[worst], ns[worst]]):+.4f} eV. The plan is held "
             "with no clamp and no rebuild (owner ruling 2026-09-28); protect fewer "
             "edge states (nval/ncond, sigma_omega_min_ev/max_ev) or widen them.")
-    return SCSupport(deck, grid, energy, states, event, envelope, outside)
+    return SCSupport(deck, grid, energy, states, event, envelope, outside, plan)
 
 
 def _record_sc_window_plan(inputs, iteration, support):
@@ -3814,33 +3829,13 @@ def _gw_iteration_map_once(state: SCState, inputs: SCInputs) -> SCState:
     # energies outside the near support, then held. Each is an independent
     # Sigma delivery at FAR_PATCH_ETA_EV; rotating endpoints (couplings and
     # the rotating diagonal) read it instead of the protected-endpoint rule.
-    far_patches = ()
-    if (sc_support is not None and inputs.wfns_transverse is None
-            and inputs.config.compute_mode is ComputeMode.MPA
-            and (~np.asarray(protected_loop, bool)).any()):
-        session = inputs.fixed_quadrature_session
-        if session is not None and "far_patches_ev" in session:
-            far_patches = session["far_patches_ev"]
-        else:
-            from .qp_support import far_patches_ev
-            mu_frame_ev = sigma_frame_mu_ev(
-                inputs.config, inputs.wfn, E_full, efermi_ry,
-                entry_occ_state if inputs.material_class == "metal" else None)
-            grid = np.asarray(sc_support.grown, float)
-            e_plan = e_dft_fit_ev - float(mu_frame_ev)
-            rot_plan = ~np.asarray(protected_loop, bool)
-            probe = None if session is None else session.get("probe_energy_ev")
-            if probe is not None:
-                e_plan = np.concatenate([e_plan, probe])
-                rot_plan = np.tile(rot_plan, (1 + probe.shape[0] // rot_plan.shape[0], 1))
-            far_patches = far_patches_ev(
-                e_plan, rot_plan, (float(grid[0]), float(grid[-1])))
-            if session is not None:
-                session["far_patches_ev"] = far_patches
-            _record_sc(inputs, "    SC rotating far patches (planned once, held): "
-                       + (", ".join(f"[{a:+.2f}, {b:+.2f}]" for a, b in far_patches) or "none"))
-        if far_patches:
-            sigma_config = replace(sigma_config, sc_far_patches_ev=tuple(far_patches))
+    far_patches = () if sc_support is None else tuple(sc_support.plan.far_patches_ev)
+    if sc_support is not None and sc_support.event != "hold":
+        _record_sc(inputs, "    SC rotating far patches (planned once, held): "
+                   + (", ".join(f"[{a:+.2f}, {b:+.2f}] at eta {e:g}" for (a, b), e in
+                                zip(far_patches, sc_support.plan.far_eta_ev)) or "none"))
+    if far_patches:
+        sigma_config = replace(sigma_config, sc_far_patches_ev=tuple(far_patches))
     sigma_result = compute_sigma_xc(
         inputs.config.compute_mode,
         occupation_state=metal_occ_state,
