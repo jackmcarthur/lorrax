@@ -144,7 +144,9 @@ def test_line_top_is_the_requested_window_high_water():
     session, first = interacting_session(args)
     wider = resolve(args, session, window=(-9., 4.))
     assert wider["support_envelope"]["status"] == "expanded"
-    assert wider["top_ev"] > first["top_ev"] == 8.0
+    # The retained top is snapped outward (8.0004 eV); the lattice keeps 8 sites.
+    assert wider["top_ev"] > first["top_ev"] == pytest.approx(8.0, rel=SNAP_RTOL)
+    np.testing.assert_array_equal(first["line_ev"], np.arange(1., 9.))
     np.testing.assert_array_equal(wider["line_ev"][:first["line_count"]], first["line_ev"])
     narrower = resolve(args, session, window=(-5., 4.))
     assert_same_geometry(wider, narrower)
