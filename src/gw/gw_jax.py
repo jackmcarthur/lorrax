@@ -439,7 +439,9 @@ def _prepare_isdf_carriers(
             state_capacity=wfn.occupation_state_capacity,
             kweights=full_k_quadrature_weights(wfn, wfn.symmetry()))
         meta.shared_pole_recipe = resolve_shared_pole_recipe(
-            config, wfns, meta, mesh_xy=mesh_xy, print_fn=print0)
+            config, wfns, meta, mesh_xy=mesh_xy, print_fn=print0,
+            sigma_plan=_oneshot_sigma_plan(config, wfn, oneshot_occupation_state,
+                                           material_class, dynamic=mode.is_dynamic))
     wfns_transverse = getattr(isdf, 'wf_bundle_transverse', None)
     if config.bispinor and wfns_transverse is None:
         raise RuntimeError(
@@ -768,17 +770,16 @@ def _prepare_static_head(config, do_screened, head_resolver, meta, mode, print0,
     return (static_head_terms)
 
 
-def _oneshot_sampled_support(config, enk_dft, wfn, occupation_state,
-                             material_class, print_fn):
-    """Plan from requested bands on the full DFT ladder, as SC map 0 does.
+def _oneshot_sigma_plan(config, wfn, occupation_state, material_class, *, dynamic=True):
+    """The one-shot's Sigma plan (``gw.qp_support.SigmaPlan``), as SC map 0 plans it.
 
-    The loaded WFN energies are small metadata. Using the complete ladder
-    lets an edge close across a manifold beyond the output band's prefix.
+    Planned from the requested bands on the full DFT ladder; the loaded WFN
+    energies are small metadata, and the complete ladder lets an edge close
+    across a manifold beyond the output band's prefix. The one-shot has no far
+    patches. A static mode samples no Sigma(omega): its plan is the deck grid.
     """
-    from dataclasses import replace
-
     from .efermi import sigma_frame_mu_ev
-    from .qp_support import plan_support_ev, requested_states
+    from .qp_support import SigmaPlan, plan_sigma_windows, requested_states
     from .band_partition import requested_band_mask
     e_ry = np.asarray(wfn.energies[0, :, :config.nband], dtype=np.float64)
     metal = material_class == "metal" and occupation_state is not None
@@ -796,7 +797,18 @@ def _oneshot_sampled_support(config, enk_dft, wfn, occupation_state,
                             mu_ev=mu_ev if metal else None,
                             range_ev=(config.sigma.omega_min_ev, config.sigma.omega_max_ev),
                             range_mu_ev=mu_ev))
-    planned, _ = plan_support_ev(config.sigma, energy, states)
+    if not dynamic:
+        return SigmaPlan(requested, (float(requested[0]), float(requested[-1])),
+                         float(config.sigma.regularization_ev), (), ())
+    return plan_sigma_windows(config.sigma, energy, states)
+
+
+def _oneshot_sampled_support(config, wfn, occupation_state, material_class, print_fn):
+    """The one-shot config sampling :func:`_oneshot_sigma_plan`'s grid."""
+    from dataclasses import replace
+
+    requested = np.asarray(config.omega_grid_ev, dtype=np.float64)
+    planned = _oneshot_sigma_plan(config, wfn, occupation_state, material_class).grid_ev
     if np.array_equal(planned, requested):
         return config
     print_fn(f"  Sigma sampled support (plan 0, clamp reads): "
@@ -816,8 +828,7 @@ def _run_oneshot_sigma(
     if qp_solver is not QPSolver.SELF_CONSISTENT:
         if mode.is_dynamic:
             config = _oneshot_sampled_support(
-                config, enk_dft, wfn, oneshot_occupation_state,
-                material_class, print0)
+                config, wfn, oneshot_occupation_state, material_class, print0)
         with timing.section("gw_jax.sigma"):
             sigma_result = compute_sigma_xc(
                 mode,

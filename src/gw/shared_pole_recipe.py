@@ -24,11 +24,15 @@ shared_real_pole_v1_r3b = {
     "version": RECIPE_VERSION,
     # Line ladder (SPCOST2 2026-09-27, claim 2906): Sigma_c reads W^c on the
     # line at the crossings |E - eps| + i eta, and the line sites rebuild that
-    # line by continuation from their own height. Sites at height 4 eta, 4 eta
-    # apart, from 4 eta up to the map-0 Sigma(omega) support plus 2 eV: on Si
-    # 4^3 no further site moves an edge root by more than 0.06 meV, while 8 eta
-    # height costs 0.77 meV, 8 eta spacing 2.36 meV and stopping at the window
-    # 0.28 meV. The ladder is planned once (the one-shot, SC map 0) and held.
+    # line by continuation from their own height. W is sampled at 4x the
+    # broadening of the Sigma windows that read each frequency range (the one
+    # Sigma plan, gw.qp_support.SigmaPlan): a fine segment at height and
+    # spacing 4 eta from 4 eta to the protected support's far side + 2 eV, then
+    # one coarse segment per far patch broadening eta_p at 4 eta_p out to that
+    # patch's far side + 2 eV. On Si 4^3 no further fine site moves an edge root
+    # by more than 0.06 meV, while 8 eta height costs 0.77 meV, 8 eta spacing
+    # 2.36 meV and stopping at the window 0.28 meV. Planned once (the one-shot,
+    # SC map 0) and held; a later plan the held ladder does not match refuses.
     "height_eta_factor": 4.0,
     "line_spacing_eta_factor": 4.0,
     "line_extent_pad_ev": 2.0,
@@ -58,11 +62,13 @@ shared_real_pole_v1_r3b = {
     # response_group_tolerance: the derived group rules deliver exactly their
     # certificate over the whole transition interval and the shared-pole
     # construction amplifies it (Na 8^3 map-0 eqp 1.17 / 0.43 / 0.04 meV at
-    # 1e-8 / 1e-9 / 1e-10; CHIRULE, claims 2913-2914). Interim 1e-10 until a
-    # per-sample margin eta/(<d>_w + |z|) is derived (CONSENSUS F6).
+    # 1e-8 / 1e-9 / 1e-10; CHIRULE, claims 2913-2914). 1e-9 until a per-sample
+    # margin eta/(<d>_w + |z|) is derived (CONSENSUS F6): on the 4 eta line
+    # 1e-10 (5e-11 per spin-degenerate occupation amplitude) sits at the derived
+    # rules' float64 floor and refuses Na 8^3 and Si 536-band (RECIPE3, 2927).
     "production": {"direction_cutoff": 1.0e-3, "imaginary_width_fraction": 0.25,
                    "infinity_width_fraction": 0.125,
-                   "bank_rule_tolerance": 1.0e-8, "response_group_tolerance": 1.0e-10,
+                   "bank_rule_tolerance": 1.0e-8, "response_group_tolerance": 1.0e-9,
                    "line_direction_cap_fraction": 0.0625, "pole_budget_fraction": 1.8},
     "relaxed": {"direction_cutoff": 1.0e-2, "imaginary_width_fraction": 0.125,
                 "infinity_width_fraction": 0.0625,
@@ -932,17 +938,19 @@ def bind_shared_pole_census(wfns, meta, *, occupation_state, trs_allowed, state_
 def _held_frequency_plan(planned, required, key, session):
     """Plan W's frequency sites once (SC map 0) and hold them for every map.
 
-    ``planned`` holds this map's ``line_ev`` and ``imaginary_ev`` ladders and
-    their scalars; ``required`` this map's ``line_top_ev``, ``u_min_ev`` and
+    ``planned`` holds this map's line sites and heights, imaginary ladder and
+    scalars; ``required`` this map's segments ``((start, top, spacing), ...)``
+    in eV (``line_segments_ev`` of this map's Sigma plan) and ``u_min_ev`` /
     ``u_max_ev``. The first call retains ``planned``; every later call returns
     the retained sites, so each map samples W at the same points and reuses the
-    map-0 response rules (``response_bank.response_quadrature``). A later map
-    whose Sigma(omega) support plus the pad reaches past the held line ladder
-    refuses by name, as ``qp_support`` refuses a Sigma support breach. The
-    imaginary ladder is held without a refusal: its ends are the map-0 gap and
-    spectral top, and the current ones are reported.
+    response rules (``response_bank.response_quadrature``). A map whose Sigma
+    plan asks for segments the held ladder does not have refuses by name, as
+    ``qp_support`` refuses a Sigma plan escape: no extension, no rebuild
+    (owner ruling Q5, 2026-09-28). The imaginary ladder is held without a
+    refusal: its ends are the map-0 gap and spectral top; the current ones are
+    reported.
     """
-    version = "held_w_frequency_plan_20260927"
+    version = "held_w_frequency_plan_20260928"
     if session.get("plan") is None:
         session.update(key=key, plan={k: (tuple(float(x) for x in v) if isinstance(v, np.ndarray)
                                           else v) for k, v in planned.items()})
@@ -951,15 +959,15 @@ def _held_frequency_plan(planned, required, key, session):
         raise ValueError(f"GATE shared_pole_held_plan: got: policy key {key!r}; want: the map-0 key "
                          f"{session.get('key')!r}; why: the W frequency plan is fixed at map 0 and held")
     held = session["plan"]
-    reach = float(held["line_ev"][-1])
-    if required["line_top_ev"] > reach * (1.0 + 1.0e-9):
+    if tuple(required["segments_ev"]) != tuple(held["segments_ev"]):
         raise ValueError(
-            f"GATE shared_pole_line_coverage: got: this map's Sigma(omega) support plus the pad "
-            f"reaches {required['line_top_ev']:.4f} eV; want: <= {reach:.4f} eV, the last site of the "
-            f"line ladder held from map 0; why: Sigma_c reads W on the line up to the support's far "
-            f"side, and the ladder is planned once and never grows (gw/qp_support.py).")
-    retained = {k: (np.asarray(v, dtype=np.float64) if k.endswith("_ev") and isinstance(v, tuple)
-                    else v) for k, v in held.items()}
+            f"GATE shared_pole_line_coverage: got: this map's Sigma plan asks for line segments "
+            f"(start, top, spacing) {required['segments_ev']} eV; want: the segments held from SC "
+            f"map 0, {held['segments_ev']} eV; why: Sigma_c reads W on the line up to each window's "
+            f"far side, and the ladder is planned once and never changes (owner ruling Q5; "
+            f"gw/qp_support.py)")
+    retained = {k: (np.asarray(v, dtype=np.float64) if k.endswith("_ev") and k != "segments_ev"
+                    and isinstance(v, tuple) else v) for k, v in held.items()}
     return dict(version=version, status="held", required=dict(required)), retained
 
 
@@ -1058,18 +1066,61 @@ def imaginary_sample_count(kappa, tier, recipe=shared_real_pole_v1_r3b):
 
 
 def line_ladder_ev(top_ev, spacing_ev):
-    """Production line sites ``j * spacing``, ``j = 1 .. max(2, ceil(top/spacing))``, eV.
+    """Fine line sites ``j * spacing``, ``j = 1 .. max(2, ceil(top/spacing))``, eV.
 
     A fixed lattice from the first spacing to the first lattice point at or
-    above ``top_ev``: the sites never move with ``top_ev``, so a growing top
-    (an SC high-water envelope) only appends sites. Starting at one spacing
-    keeps the ladder off the imaginary axis, whose ladder starts at 4 eta.
-    A top within 0.1% above a lattice point does not add a site, so the SC
-    envelope's outward snap (1e-4 relative) of a top such as 10 + 2 eV keeps
-    the one-shot's ladder.
+    above ``top_ev``: the sites never move with ``top_ev``. Starting at one
+    spacing keeps the ladder off the imaginary axis, whose ladder starts at
+    4 eta. A top within 0.1% above a lattice point does not add a site.
     """
     count = max(2, math.ceil(float(top_ev) / float(spacing_ev) * (1.0 - 1.0e-3)))
     return float(spacing_ev) * np.arange(1, count + 1, dtype=np.float64)
+
+
+def line_segments_ev(sigma_plan, eta_ev, recipe=shared_real_pole_v1_r3b):
+    """Line segments ``((start, top, spacing), ...)`` in eV from the one Sigma plan.
+
+    Sigma_c(omega) reads W on the line at |omega - eps| <= |omega - mu| with
+    the broadening of the window that holds omega, so W is sampled at 4x that
+    broadening (spacing = height = ``line_spacing_eta_factor`` x eta) out to
+    each window's far side + ``line_extent_pad_ev``:
+    * fine: the protected support (``sigma_plan.protected_support_ev``) at the
+      deck eta, from 0;
+    * coarse: each far patch (``far_patches_ev`` with ``far_eta_ev``), finest
+      first, from the reach so far to its own far side + pad.
+    A patch whose far side the finer segments already reach adds nothing.
+    Only the plan's interface is read, so new window classes (a semicore patch
+    with its own eta) enter as further (patch, eta) pairs.
+    """
+    pad, factor = float(recipe['line_extent_pad_ev']), float(recipe['line_spacing_eta_factor'])
+    lo, hi = (float(v) for v in sigma_plan.protected_support_ev)
+    if not (math.isfinite(lo) and math.isfinite(hi) and lo <= hi):
+        raise ValueError(f"GATE shared_pole_line_top: got: protected support {(lo, hi)} eV; want: finite lo <= hi about mu; why: the fine line reaches its far side + {pad} eV")
+    fine = factor * float(eta_ev)
+    reach = float(line_ladder_ev(max(abs(lo), abs(hi)) + pad, fine)[-1])
+    segments = [(0.0, reach, fine)]
+    far = sorted((factor * float(eta), max(abs(float(a)), abs(float(b))) + pad)
+                 for (a, b), eta in zip(sigma_plan.far_patches_ev, sigma_plan.far_eta_ev))
+    for spacing, top in far:
+        if top > reach * (1.0 + 1.0e-3):
+            count = max(1, math.ceil((top - reach) / spacing * (1.0 - 1.0e-3)))
+            segments.append((reach, reach + spacing * count, spacing))
+            reach = reach + spacing * count
+    return tuple(segments)
+
+
+def line_sites_ev(segments):
+    """Line sites and their heights (eV) for ``line_segments_ev`` segments.
+
+    The fine segment is the ``line_ladder_ev`` lattice; a coarse segment of
+    spacing s adds ``start + j s`` at height s.
+    """
+    sites, heights = [], []
+    for start, top, spacing in segments:
+        count = max(1, int(round((top - start) / spacing)))
+        sites.extend(start + spacing * np.arange(1, count + 1))
+        heights.extend([spacing] * count)
+    return np.asarray(sites, dtype=np.float64), np.asarray(heights, dtype=np.float64)
 
 
 def matsubara_indices(beta_ry_inv, bandwidth_ry, tier, recipe=shared_real_pole_v1_r3b):
@@ -1093,7 +1144,7 @@ def matsubara_indices(beta_ry_inv, bandwidth_ry, tier, recipe=shared_real_pole_v
 
 
 def resolve_shared_pole_recipe(config, wfns, meta, *, mesh_xy, print_fn,
-                              sigma_support_ev, support_session=None):
+                              sigma_plan, support_session=None):
     """Resolve DESIGN §5 from current metadata into scalars and small arrays.
 
     ``bind_shared_pole_census`` must have consumed this map's occupation state.
@@ -1103,10 +1154,9 @@ def resolve_shared_pole_recipe(config, wfns, meta, *, mesh_xy, print_fn,
     role code is reserved (moments need no bank evaluation). Conjugates are
     constructor states, never bank calls. ``support_pair`` int64 [role,2]
     binds held endpoints; [-1,-1] means not a held midpoint.
-    ``sigma_support_ev`` is this map's sampled Sigma(omega) support ``(lo, hi)``
-    about mu in eV (``gw.qp_support.plan_support_ev``: the deck request joined
-    with the requested states +/- the plan pad); the line ladder reaches its
-    far side plus 2 eV.
+    ``sigma_plan`` is this map's Sigma plan (``gw.qp_support.SigmaPlan``: the
+    protected support and far patches about mu, in eV); the line segments
+    follow it (``line_segments_ev``).
     ``support_session`` (SC) holds the first map's sites for every later map
     (``_held_frequency_plan``): the census and capacity ledger stay fresh, the
     sample points and their response rules do not move, and a later support
@@ -1146,12 +1196,9 @@ def resolve_shared_pole_recipe(config, wfns, meta, *, mesh_xy, print_fn,
     override = parse_support_sites(getattr(config.sigma, 'w_support_sites_ev', ''))
     plasma_ry = 2.0 * math.sqrt(4.0 * math.pi * census['active_electrons']
                                / census['cell_volume_bohr3'])
-    window = tuple(float(v) for v in sigma_support_ev)
-    if not (len(window) == 2 and all(map(math.isfinite, window)) and window[0] <= window[1]):
-        raise ValueError(f"GATE shared_pole_line_top: got: Sigma support {sigma_support_ev!r} eV; want: finite (lo, hi) about mu with lo <= hi; why: the line ladder reaches the Sigma support plus {recipe['line_extent_pad_ev']} eV")
-    # Sigma_c(omega) reads the line at |omega - eps| <= |omega - mu|, so the
-    # ladder must cover the Sigma support's far side, plus the pad.
-    top = max(abs(window[0]), abs(window[1])) + recipe['line_extent_pad_ev']
+    window = tuple(float(v) for v in sigma_plan.protected_support_ev)
+    segments = line_segments_ev(sigma_plan, eta, recipe)
+    top = float(segments[-1][1])
     umin = max(recipe['height_eta_factor'] * eta, census['gap_ev'])
     # The imaginary condenser is the image of W^c's spectral support
     # [Omega_min^2, Omega_top^2] on the negative s axis, cut below at the
@@ -1168,14 +1215,16 @@ def resolve_shared_pole_recipe(config, wfns, meta, *, mesh_xy, print_fn,
     imaginary = np.geomspace(umin, umax, count)
     if tier == 'relaxed':
         line = top * np.arange(1, policy['line_count'] + 1, dtype=np.float64) / policy['line_count']
+        line_height = np.full(line.shape, height)
     else:
-        line = line_ladder_ev(top, spacing)
+        line, line_height = line_sites_ev(segments)
     if override is not None:
         # Both ladders are replaced together; height, held fractions, widths,
         # zero policy and every gate stay the resolver's own. u_min/u_max/kappa
         # follow the delivered imaginary ladder so the reported scalars and the
         # sampled geometry cannot disagree.
         line = np.asarray(override['line_ev'], dtype=np.float64)
+        line_height = np.full(line.shape, height)
         imaginary = np.asarray(override['imaginary_ev'], dtype=np.float64)
         count = int(imaginary.size)
         umin, umax = float(imaginary[0]), float(imaginary[-1])
@@ -1186,14 +1235,18 @@ def resolve_shared_pole_recipe(config, wfns, meta, *, mesh_xy, print_fn,
                census['logical_band_count'],
                '' if override is None else override['text'])
         support_receipt, held = _held_frequency_plan(
-            dict(top_ev=top, u_min_ev=umin, u_max_ev=umax, kappa=kappa,
-                 imaginary_count=count, line_ev=line, imaginary_ev=imaginary),
-            dict(line_top_ev=top, u_min_ev=umin, u_max_ev=umax), key, support_session)
-        top, umin, umax, kappa, count = (held['top_ev'], held['u_min_ev'], held['u_max_ev'],
-                                         held['kappa'], held['imaginary_count'])
-        line, imaginary = held['line_ev'], held['imaginary_ev']
+            dict(top_ev=top, segments_ev=segments, u_min_ev=umin, u_max_ev=umax, kappa=kappa,
+                 imaginary_count=count, line_ev=line, line_height_ev=line_height,
+                 imaginary_ev=imaginary),
+            dict(segments_ev=segments, u_min_ev=umin, u_max_ev=umax), key, support_session)
+        top, segments, umin, umax, kappa, count = (
+            held['top_ev'], held['segments_ev'], held['u_min_ev'], held['u_max_ev'],
+            held['kappa'], held['imaginary_count'])
+        line, line_height, imaginary = held['line_ev'], held['line_height_ev'], held['imaginary_ev']
     mids = 0.5 * (line[:-1] + line[1:])
-    held_pairs = [int(np.argmin(abs(mids - (line[0] + fraction*(line[-1] - line[0])))))
+    # Held midpoints sit between neighbours of equal height (one segment).
+    same = np.flatnonzero(line_height[:-1] == line_height[1:])
+    held_pairs = [int(same[np.argmin(abs(mids[same] - (line[0] + fraction*(line[-1] - line[0]))))])
                   for fraction in recipe['held_line_fractions']]
     held_line = mids[held_pairs]
     held_imag = np.sqrt(imaginary[[0, -2]] * imaginary[[1, -1]])
@@ -1212,12 +1265,12 @@ def resolve_shared_pole_recipe(config, wfns, meta, *, mesh_xy, print_fn,
         held_flags.append(held)
         support_pairs.append([-1, -1] if pair is None else pair)
     for i, e in enumerate(line):
-        add(e, height, 'line', False)
+        add(e, float(line_height[i]), 'line', False)
     for i, u in enumerate(imaginary):
         add(0.0, u, 'imaginary', False)
     for i, e in enumerate(held_line):
         j = held_pairs[i]
-        add(e, height, 'held_line', True, [j, j+1])
+        add(e, float(line_height[j]), 'held_line', True, [j, j+1])
     for i, u in enumerate(held_imag):
         add(0.0, u, 'held_imaginary', True,
             [0, 1] if i == 0 else [count-2, count-1])
@@ -1242,7 +1295,7 @@ def resolve_shared_pole_recipe(config, wfns, meta, *, mesh_xy, print_fn,
     # so a store or bank built on another ladder must refuse on restart. The
     # response group tolerance is in the hashed table (RECIPE_HASH).
     table = hashlib.sha256((table + '|' + json.dumps(
-        dict(height_ev=float(height), line_ev=[float(v) for v in line],
+        dict(height_ev=[float(v) for v in line_height], line_ev=[float(v) for v in line],
              imaginary_ev=[float(v) for v in imaginary]),
         sort_keys=True, separators=(',', ':'))).encode()).hexdigest()
     if sector_treatment is not None:
@@ -1269,7 +1322,9 @@ def resolve_shared_pole_recipe(config, wfns, meta, *, mesh_xy, print_fn,
         'accuracy_reason': 'resolved geometry has no authenticated matching campaign receipt',
         'eta_ev': eta, 'height_ev': height, 'height_ry': height / RYD_TO_EV,
         'plasma_ev': plasma_ry * RYD_TO_EV, 'plasma_ry': plasma_ry,
-        'sigma_support_ev': window, 'top_ev': top, 'line_spacing_ev': spacing,
+        'protected_support_ev': window, 'far_patches_ev': tuple(sigma_plan.far_patches_ev),
+        'far_eta_ev': tuple(sigma_plan.far_eta_ev), 'line_segments_ev': tuple(segments),
+        'top_ev': top, 'line_spacing_ev': spacing, 'line_height_ev': line_height,
         'line_ev': line, 'imaginary_ev': imaginary,
         'held_line_ev': held_line, 'held_imaginary_ev': held_imag,
         'u_min_ev': umin, 'u_max_ev': umax, 'kappa': kappa,
@@ -1309,10 +1364,12 @@ def resolve_shared_pole_recipe(config, wfns, meta, *, mesh_xy, print_fn,
         'support_sites': 'sigma_w_support_sites_ev; "" = the resolver ladder, else explicit line|imaginary eV sites folded into recipe_version/recipe_hash',
         'height': 'h=4*eta', 'eta': 'literal sigma_regularization_ev',
         'plasma': '2*sqrt(4*pi*active_electrons/volume) Ry',
-        'sigma_support': 'this map\'s sampled Sigma(omega) support about mu: deck request joined with the requested states +/- the plan pad (gw.qp_support)',
-        'top': 'L = max|Sigma support| + 2 eV',
+        'protected_support': 'the Sigma plan\'s protected support about mu, pad and Z stencil included (gw.qp_support.SigmaPlan)',
+        'far_': 'the Sigma plan\'s far patches and their broadening',
+        'line_segments': '(start, top, spacing): fine 4 eta to max|protected support| + 2 eV; one coarse 4 eta_p segment per far patch to its far side + 2 eV',
+        'top': 'L = the last segment top',
         'line_spacing': 'Delta = 4*eta',
-        'line': 'production: j*Delta, j = 1..ceil(L/Delta), independent of the imaginary count; relaxed 8 sites j*L/8',
+        'line': 'production: j*Delta on each segment at height Delta (line_height_ev), independent of the imaginary count; relaxed 8 sites j*L/8',
         'line_direction_cap': 'production ceil(n/16) right singular directions per line support (whole multiplets); relaxed none',
         'pole_budget': 'production ceil(1.8 n) retained Gram directions per parent (largest first); relaxed none',
         'imaginary': 'log-spaced u_min..u_max; round(log(16*(u_max/u_min)^2)*log(4000)/(2*pi^2)), min2; tier width ceil(f*n)',
@@ -1329,14 +1386,16 @@ def resolve_shared_pole_recipe(config, wfns, meta, *, mesh_xy, print_fn,
         'metadata': 'sum of replicated metadata array nbytes',
     }
     if support_receipt is not None:
-        rules.update(top='held from SC map 0: max|map-0 Sigma support| + 2 eV; a later map past the held ladder refuses',
+        rules.update(top='held from SC map 0 (the map-0 Sigma plan\'s segments); a later plan with other segments refuses',
                      u_min='held from SC map 0: max(4 eta, map-0 logical gap)',
                      u_max='held from SC map 0: max(response transition span, omega_p) floored onto 2**(k/4) eV',
                      support_plan='SC map 0 plans the W frequency sites; later maps hold them (required = this map\'s own values)')
     # One durable line (the production report keeps it with debug off).
+    seg_text = ', '.join(f'{b:.2f}@{c:.2f}' for a, b, c in segments)
     print_fn(f'  Shared-pole supports: line {len(line)} sites {line[0]:.3f}..{line[-1]:.3f} eV '
-             f'at height {height:.3f} eV (Sigma support {window[0]:+.2f}..{window[1]:+.2f} eV, '
-             f'top {top:.2f} eV); imaginary {count} sites {umin:.3f}..{umax:.2f} eV; '
+             f'at height {height:.3f} eV (segments top@spacing {seg_text} eV; protected support '
+             f'{window[0]:+.2f}..{window[1]:+.2f} eV, far patches {tuple(sigma_plan.far_patches_ev)}); '
+             f'imaginary {count} sites {umin:.3f}..{umax:.2f} eV; '
              f'plan {"one-shot" if support_receipt is None else support_receipt["status"]}; '
              f'recipe_hash {table[:12]}')
     for key, value in result.items():

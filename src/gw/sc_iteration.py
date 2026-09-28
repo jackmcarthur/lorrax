@@ -3440,14 +3440,18 @@ def _gw_iteration_map_once(state: SCState, inputs: SCInputs) -> SCState:
             trs_allowed=inputs.sym.trs_allowed,
             state_capacity=inputs.wfn.occupation_state_capacity,
             kweights=full_k_quadrature_weights(inputs.wfn, inputs.wfn.symmetry()))
-        # The W frequency plan follows this map's sampled Sigma support; SC
-        # map 0 plans it and later maps hold it (shared_pole_recipe).
-        support = (np.asarray(inputs.config.omega_grid_ev, dtype=np.float64)
-                   if sc_support is None else np.asarray(sc_support.grown))
+        # The W frequency plan follows the one Sigma plan (protected support
+        # and far patches); SC map 0 plans it and later maps hold it
+        # (shared_pole_recipe.line_segments_ev). A static Sigma has no plan:
+        # the deck grid stands in.
+        from .qp_support import SigmaPlan
+        deck_grid = np.asarray(inputs.config.omega_grid_ev, dtype=np.float64)
         inputs.meta.shared_pole_recipe = resolve_shared_pole_recipe(
             inputs.config, wfns_qp, inputs.meta, mesh_xy=inputs.mesh_xy,
             print_fn=inputs.print_fn,
-            sigma_support_ev=(float(support[0]), float(support[-1])),
+            sigma_plan=(sc_support.plan if sc_support is not None else SigmaPlan(
+                deck_grid, (float(deck_grid[0]), float(deck_grid[-1])),
+                float(inputs.config.sigma.regularization_ev), (), ())),
             support_session=(None if inputs.fixed_quadrature_session is None else
                              inputs.fixed_quadrature_session.setdefault(
                                  "shared_pole_supports", {})))
@@ -3752,7 +3756,10 @@ def _gw_iteration_map_once(state: SCState, inputs: SCInputs) -> SCState:
     if screening_reuse is not None:
         W_by_role = screening_reuse
     elif (_probe_session is not None and int(state.iteration) == 0
-          and "probe_W_by_role" in _probe_session):
+          and "probe_W_by_role" in _probe_session
+          and _probe_session.get("probe_recipe_hash") == (
+              getattr(inputs.meta, "shared_pole_recipe", None)
+              and inputs.meta.shared_pole_recipe["recipe_hash"])):
         # Map 0's second pass: same input state, same W; only the plan moved.
         W_by_role = _probe_session.pop("probe_W_by_role")
         _capacity = _probe_session.pop("probe_capacity", None)
@@ -3777,6 +3784,12 @@ def _gw_iteration_map_once(state: SCState, inputs: SCInputs) -> SCState:
             producer=_live_screening, quad_override=stored_ceiling)
     else:
         W_by_role = _screening(mpa_plan, iteration_head_response)
+    if _probe_session is not None and "probe_W_by_role" in _probe_session:
+        # The probe W was sampled on another W frequency plan: this pass rebuilt W.
+        _probe_session.pop("probe_W_by_role")
+        _probe_session.pop("probe_capacity", None)
+        inputs.print_fn("    SC map 0: the plan fixed from the probe moved the W frequency "
+                        "plan (recipe_hash); W rebuilt on it")
     if (_probe_session is not None and int(state.iteration) == 0
             and "probe_energy_ev" not in _probe_session
             and getattr(inputs.meta, "shared_pole_capacity", None) is not None):
@@ -4130,8 +4143,11 @@ def _gw_iteration_map_once(state: SCState, inputs: SCInputs) -> SCState:
             _session.clear()
             _session["probe_energy_ev"] = probe
             if inputs.wfns_transverse is None:
-                # A scalar model is file-resident: the second pass reads it again.
+                # A scalar model is file-resident: the second pass reads it again
+                # when its W frequency plan (recipe_hash) is unchanged.
                 _session["probe_W_by_role"] = W_by_role
+                _session["probe_recipe_hash"] = getattr(
+                    inputs.meta, "shared_pole_recipe", None) and inputs.meta.shared_pole_recipe["recipe_hash"]
                 if _capacity is not None:
                     _session["probe_capacity"] = _capacity
             elif mpa_mode and inputs.config.sigma.w_model == "shared_pole":

@@ -3,6 +3,7 @@ import configparser
 import json
 from types import SimpleNamespace as NS
 
+from gw.qp_support import SigmaPlan
 import numpy as np
 import pytest
 
@@ -208,7 +209,8 @@ def fixture(*, metal=False, eta=.25, tier='production', top=20.):
 
 def resolve(args, window=(-6., 4.)):
     return resolve_shared_pole_recipe(*args,mesh_xy=NS(shape={'x':2,'y':2}),print_fn=lambda *_:None,
-                                      sigma_support_ev=window)
+                                      sigma_plan=SigmaPlan(np.asarray(window, float), tuple(window),
+                                                           .25, (), ()))
 
 
 def test_geometry_padding_charge_and_holds():

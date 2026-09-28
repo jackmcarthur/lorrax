@@ -7,6 +7,7 @@ import pytest
 from common.units import RYD_TO_EV
 from gw.shared_pole_recipe import bind_shared_pole_census, resolve_shared_pole_recipe
 from gw.shared_pole_recipe import _sector_treatment_ceiling
+from gw.qp_support import SigmaPlan
 
 
 def inputs(gap=.7, *, eta=.25, tier="production", top=20.):
@@ -28,10 +29,14 @@ def rebind(wfns, meta):
                            state_capacity=2., kweights=[.5, .5])
 
 
-def resolve(args, session=None, window=(-6., 4.)):
+def plan(window=(-6., 4.), patches=(), etas=(), eta=.25):
+    return SigmaPlan(np.asarray(window, float), tuple(window), eta, tuple(patches), tuple(etas))
+
+
+def resolve(args, session=None, window=(-6., 4.), patches=(), etas=()):
     return resolve_shared_pole_recipe(
         *args, mesh_xy=NS(shape={"x": 2, "y": 2}), print_fn=lambda *_: None,
-        sigma_support_ev=window, support_session=session)
+        sigma_plan=plan(window, patches, etas), support_session=session)
 
 
 GEOMETRY = ("line_ev", "imaginary_ev", "held_line_ev", "held_imaginary_ev",
@@ -70,13 +75,29 @@ def test_line_ladder_reaches_the_map0_sigma_support_plus_the_pad():
     assert first["top_ev"] == 8.
 
 
-def test_a_later_support_past_the_held_ladder_refuses_by_name():
+def test_a_later_plan_with_other_segments_refuses_by_name():
     args = inputs()
     session = {}
     first = resolve(args, session, window=(-6., 4.))
-    assert_same_geometry(first, resolve(args, session, window=(-5.5, 6.)))
+    assert_same_geometry(first, resolve(args, session, window=(-5.5, 5.5)))  # same lattice top
     with pytest.raises(ValueError, match="GATE shared_pole_line_coverage"):
         resolve(args, session, window=(-6.5, 4.))
+    with pytest.raises(ValueError, match="GATE shared_pole_line_coverage"):
+        resolve(args, session, window=(-6., 4.), patches=((4.001, 14.),), etas=(1.,))
+
+
+def test_far_patches_add_coarse_segments_at_four_times_their_eta():
+    r = resolve(inputs(), window=(-6., 4.), patches=((-30., -20.), (4.001, 14.)), etas=(2., 1.))
+    # fine to 8 eV at 1 eV; eta_far 1 eV above E_F -> 4 eV to 16 (14 + 2);
+    # eta_far 2 eV below -> 8 eV spacing from 16 to 32 (30 + 2).
+    assert r["line_segments_ev"] == ((0., 8., 1.), (8., 16., 4.), (16., 32., 8.))
+    np.testing.assert_array_equal(r["line_ev"], np.r_[np.arange(1., 9.), 12., 16., 24., 32.])
+    np.testing.assert_array_equal(r["line_height_ev"], np.r_[np.ones(8), 4., 4., 8., 8.])
+    heights = r["z_ry"].imag[r["role"] == 0] * RYD_TO_EV
+    np.testing.assert_allclose(heights, r["line_height_ev"])
+    held = r["z_ry"][r["role"] == 3]
+    assert np.all(np.isin(np.round(held.imag * RYD_TO_EV, 9), [1., 4., 8.]))
+    assert r["recipe_hash"] != resolve(inputs(), window=(-6., 4.))["recipe_hash"]
 
 
 def test_recipe_hash_binds_the_ladder():
