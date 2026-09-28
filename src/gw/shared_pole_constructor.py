@@ -382,11 +382,25 @@ def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output):
                 mesh_xy=mesh_xy, eigh_plan=local_eigh, ordered=ordered)
             del inverse_sqrt, held, exact
         with timing.section("spole.gates"):
+            if not ordered:
+                # The ceiling is the float64 bound at each parent's measured kept
+                # Gram condition and inner length max(n, own pencil side)
+                # (gw.shared_pole_gates.reciprocity_rounding_bound).
+                from gw.shared_pole_gates import reciprocity_rounding_verdict
+                reciprocity = {key: np.array(value) for key, value in reciprocity.items()}
+                reciprocity["model_bound"] = np.zeros_like(reciprocity["model_relative"], dtype=np.float64)
+                for slot in range(real):
+                    row = reciprocity_rounding_verdict(
+                        {key: value[slot] for key, value in reciprocity.items()},
+                        gram_condition=float(round_reduction["gram_condition"][slot]),
+                        inner_length=max(int(logical_n), int(tables["own"][slot])))
+                    reciprocity["passed"][slot] = row["passed"]
+                    reciprocity["model_bound"][slot] = row["model_bound"]
             for slot, q in enumerate(ids[:real]):
                 if not passive["passivity"][slot]:
                     raise ValueError(f"GATE shared_pole_passivity: got: failed at q={q}; want: 0 <= V-whitened -W(i eta) <= I; why: passive screening")
                 if not ordered and not np.all(reciprocity["passed"][slot]):
-                    raise ValueError(f"GATE shared_pole_model_reciprocity: got: { {k: v[slot].tolist() for k, v in reciprocity.items()} } at q={q}; want: model preserves transpose symmetry of symmetric held data; why: conjugate-port closure must survive reduction")
+                    raise ValueError(f"GATE shared_pole_model_reciprocity: got: { {k: v[slot].tolist() for k, v in reciprocity.items()} } at q={q}, kept Gram condition {float(round_reduction['gram_condition'][slot]):.6e}; want: model defect <= kappa_q * (reference defect + 2 gamma_m), the float64 bound of the reduction; why: conjugate-port closure must survive reduction")
         with timing.section("spole.receipts"):
             price = budget.plan(side)
             counts = active.sum(axis=-1, dtype=np.int64)
