@@ -362,8 +362,9 @@ def _rule_cache_lookup(
 ):
     """Return the smallest compatible rule plus any unreadable-path warnings.
 
-    COMPATIBLE MEANS CONTAINING, AND NO LARGER THAN A NEIGHBOUR'S BUILD. A
-    cached box must contain the request and, with ``eta``, lie inside the
+    COMPATIBLE MEANS CONTAINING, AND FOR A CROSSING BOX NO LARGER THAN A
+    NEIGHBOUR'S BUILD. A cached box must contain the request; a crossing
+    request (``relative`` False) with ``eta`` also needs it inside the
     request's build box widened twice (:func:`_build_box`): a neighbouring
     request's own build (one widen) is served, a rule for a much larger box
     is not. A crossing rule's node count grows with its box (N ~ 2.7 s/eta),
@@ -405,7 +406,9 @@ def _rule_cache_lookup(
             f"path={path} error={type(exc).__name__}: {exc}")
         return None, tuple(warnings)
     best = None
-    ceiling = (None if eta is None else
+    # Crossing requests only: a sign-definite rule's node count grows like the
+    # log of its box ratio, so a containing rule of equal count is as good.
+    ceiling = (None if eta is None or relative else
                _build_box(_build_box(box, eta, widen=True), eta, widen=True))
     for name in sorted(names):
         path = os.path.abspath(os.path.join(directory, name))
