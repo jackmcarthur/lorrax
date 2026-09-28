@@ -266,6 +266,16 @@ def test_inverted_interval():
         resolve(fixture(eta=5,top=20))
 
 
+def test_imaginary_ladder_ends_at_the_spectral_top():
+    # D_max = max E_cond - min E_val = 2 - (-20) = 22 eV sets u_max, floored onto 2**(k/4) eV:
+    # 2**(17/4) = 19.03 eV, never above the top. omega_p (16.5 eV) only floors the top.
+    r=resolve(fixture())
+    assert r['u_max_ev']==pytest.approx(2**4.25) and r['imaginary_ev'][-1]==pytest.approx(2**4.25)
+    assert r['kappa']==pytest.approx(r['u_max_ev']/r['u_min_ev'])
+    r=resolve(fixture(top=40.))
+    assert r['u_max_ev']==pytest.approx(32.0)  # omega_p = 36.5 eV above D_max, floored to 2**5
+
+
 def test_stale_census():
     args=fixture();args[1].enk[0,0]+=.001
     with pytest.raises(ValueError,match='stale energies'):
@@ -274,7 +284,7 @@ def test_stale_census():
 
 def test_receipt_absence_and_nonfinite():
     rows=construction_receipt()['gates']
-    assert len(rows)==len(shared_real_pole_gates_v1_r3b)==16
+    assert len(rows)==len(shared_real_pole_gates_v1_r3b)==17
     assert all(r['status']=='NOT_MEASURED' for r in rows)
     assert gate_receipt('capacity',passed=True,reason='absent')['status']=='NOT_MEASURED'
     assert gate_receipt('capacity',4,passed=False,reason='4U')['status']=='FAIL'
