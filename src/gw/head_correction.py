@@ -387,23 +387,40 @@ def _dipole_window_from_params(params, wfn) -> tuple[int, int, int]:
 def _check_dipole_provenance(dipole_path, *, params, wfn, print_fn) -> None:
     """Was ``dipole.h5`` built from THIS DFT solution, THIS band window and THIS velocity operator?; see docs/architecture/four_current_wiring.md.
 
-    The operator fields are the ones the SC head authenticates
-    (``qsgw_head.read_authenticated_dipole_velocity``): V_NL included,
-    the analytic arm, and the deck's resolved ``vnl_velocity_sign``.
+    The velocity operator (V_NL included, the analytic arm, the deck's
+    resolved ``vnl_velocity_sign``) is REFUSED by name on a mismatch, whatever
+    ``LORRAX_SANITY`` says, as the SC and full heads refuse it
+    (``qsgw_head.read_authenticated_dipole_velocity``): a missing or flipped
+    i[r, V_NL] changes S(ω) by tens of percent (31 % in Si ε₀₀) and leaves the
+    file's shape intact.  The WFN and band-window stamps go through
+    ``common.sanity`` as before.
     """
     from common import sanity
+    from file_io.restart_bundle import (
+        check_dipole_provenance,
+        dipole_operator_mismatches,
+    )
+    from psp.get_dipole_mtxels import resolve_vnl_velocity_sign
 
-    if not sanity.sanity_enabled():
-        return
     nval, ncond, nband = _dipole_window_from_params(params, wfn)
-    try:
-        from file_io.restart_bundle import (
-            check_dipole_provenance,
-        )
-        from psp.get_dipole_mtxels import resolve_vnl_velocity_sign
-    except Exception as exc:            # psp stack unavailable (h5py-less env)
-        print_fn(f"  [dipole provenance] check unavailable "
-                 f"({type(exc).__name__}: {exc})")
+    operator = dict(
+        skip_vnl=False, vnl_mode="analytic",
+        vnl_velocity_sign=resolve_vnl_velocity_sign(
+            None, params.get("vnl_velocity_sign", "")))
+    bad = dipole_operator_mismatches(dipole_path, **operator)
+    if bad:
+        detail = "; ".join(f"{k}: file={got!r} run={want!r}"
+                           for k, got, want in bad)
+        raise ValueError(
+            "GATE static_head_dipole_operator: the q->0 head received a "
+            "dipole built with a different velocity operator.\n"
+            f"  got:  dipole_file = {str(dipole_path)!r}; {detail}\n"
+            "  want: p - i[r, V_NL], analytic arm, the deck's "
+            "vnl_velocity_sign (regenerate with python -m "
+            "psp.get_dipole_mtxels -i <deck>)\n"
+            "  why:  S(omega) would lack or flip the nonlocal commutator "
+            "while the file keeps its shape")
+    if not sanity.sanity_enabled():
         return
     expected_bispinor = params.get("_charge_bispinor")
     import os
@@ -414,10 +431,8 @@ def _check_dipole_provenance(dipole_path, *, params, wfn, print_fn) -> None:
         caller="gw.head_correction dipole")
     check_dipole_provenance(
         dipole_path, wfn=wfn, nval=nval, ncond=ncond, nband=nband,
-        bispinor=expected_bispinor, skip_vnl=False, vnl_mode="analytic",
-        vnl_velocity_sign=resolve_vnl_velocity_sign(
-            None, params.get("vnl_velocity_sign", "")),
-        print_fn=print_fn, hubbard=expected_hubbard)
+        bispinor=expected_bispinor, print_fn=print_fn,
+        hubbard=expected_hubbard, **operator)
 
 
 def resolve_head_sample(params, input_dir, wfn, sym, meta, print_fn, omega) -> HeadSample:

@@ -36,6 +36,7 @@ name.  Nothing in this file reads a loader-produced table.
 from __future__ import annotations
 
 import numpy as np
+import pytest
 
 import jax
 import jax.numpy as jnp
@@ -734,28 +735,41 @@ def test_a_stale_wfn_still_refuses_on_that_same_window(tmp_path, monkeypatch):
         "a stale-WFN report must not also accuse the band window", lines)
 
 
-def test_the_head_checker_names_a_skip_vnl_or_legacy_sign_dipole(tmp_path, monkeypatch):
-    """RED arm for the operator stamps: the one-shot head compares
-    ``prov_skip_vnl`` and ``prov_vnl_velocity_sign`` as the SC head does."""
+@pytest.mark.parametrize("sanity_on", [True, False])
+def test_the_head_checker_refuses_a_different_velocity_operator(
+        tmp_path, monkeypatch, sanity_on):
+    """RED arm for the operator stamps: the one-shot head REFUSES a dipole
+    built with ``--skip-vnl``, the numeric arm, the legacy sign, or no sign
+    stamp, by name and whatever ``LORRAX_SANITY`` says (as the SC head does)."""
     from common import sanity
     from gw.head_correction import _check_dipole_provenance
 
+    monkeypatch.setattr(sanity, "sanity_enabled", lambda: sanity_on)
     monkeypatch.setattr(sanity, "sanity_strict", lambda: False)
     wfn = _FakeWfn()
-    for tag, stamp, field in (("p only", dict(skip_vnl=True), "prov_skip_vnl"),
-                              ("legacy sign", dict(vnl_velocity_sign=-1),
-                               "prov_vnl_velocity_sign")):
-        p = tmp_path / f"dipole_{field}.h5"
-        kw = dict(vnl_velocity_sign=+1, **_NONDEFAULT_WINDOW)
-        kw.update({k: v for k, v in stamp.items() if k != "skip_vnl"})
-        _write_stamped_operator(p, wfn, skip_vnl=stamp.get("skip_vnl", False), **kw)
-        lines = []
-        _check_dipole_provenance(p, params=_head_params(**_NONDEFAULT_WINDOW),
-                                 wfn=wfn, print_fn=lines.append)
-        assert any(field in ln for ln in lines), (tag, lines)
+    cases = (("p only", dict(skip_vnl=True), "prov_skip_vnl"),
+             ("numeric arm", dict(vnl_mode="numeric"), "prov_vnl_mode"),
+             ("legacy sign", dict(vnl_velocity_sign=-1), "prov_vnl_velocity_sign"),
+             ("no sign stamp", dict(vnl_velocity_sign=None), "prov_vnl_velocity_sign"))
+    for tag, stamp, field in cases:
+        p = tmp_path / f"dipole_{tag.replace(' ', '_')}.h5"
+        kw = dict(skip_vnl=False, vnl_mode="analytic", vnl_velocity_sign=+1,
+                  **_NONDEFAULT_WINDOW)
+        kw.update(stamp)
+        _write_stamped_operator(p, wfn, **kw)
+        with pytest.raises(ValueError, match="GATE static_head_dipole_operator") as err:
+            _check_dipole_provenance(p, params=_head_params(**_NONDEFAULT_WINDOW),
+                                     wfn=wfn, print_fn=lambda *_a: None)
+        assert field in str(err.value), (tag, str(err.value))
+    # GREEN control on the same path: the deck's own operator passes.
+    p = tmp_path / "dipole_ok.h5"
+    _write_stamped_operator(p, wfn, skip_vnl=False, vnl_mode="analytic",
+                            vnl_velocity_sign=+1, **_NONDEFAULT_WINDOW)
+    _check_dipole_provenance(p, params=_head_params(**_NONDEFAULT_WINDOW),
+                             wfn=wfn, print_fn=lambda *_a: None)
 
 
-def _write_stamped_operator(path, wfn, *, skip_vnl, nb_written=4, **kw):
+def _write_stamped_operator(path, wfn, *, skip_vnl, vnl_mode, nb_written=4, **kw):
     import h5py
     from psp.get_dipole_mtxels import stamp_dipole_provenance
 
@@ -764,7 +778,7 @@ def _write_stamped_operator(path, wfn, *, skip_vnl, nb_written=4, **kw):
         h5.create_dataset("band_energies", data=np.zeros((1, nb_written)))
         stamp_dipole_provenance(h5, wfn=wfn, wfn_path="WFN.h5",
                                  nb_written=nb_written, bispinor=False,
-                                 skip_vnl=skip_vnl, vnl_mode="analytic", **kw)
+                                 skip_vnl=skip_vnl, vnl_mode=vnl_mode, **kw)
 
 
 def test_the_head_checker_refuses_a_params_dict_with_no_window(tmp_path):
