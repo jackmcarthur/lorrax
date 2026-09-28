@@ -569,10 +569,12 @@ _QSGW_FAR_KERNEL_CACHE: dict[tuple[int, bool], object] = {}
 def _qsgw_far_kernel(mesh_xy: Mesh, *, replicated_output: bool):
     """As ``_qsgw_build_kernel``, with rotating endpoints beyond the near support read far.
 
-    Sigma_c,ij = 1/2 [Sigma_ij(E_i) + Sigma_ij(E_j)], each endpoint read from
-    the near cube (``protected`` = 1: protected, or rotating inside the near
-    support) or from the far-patch cube (0); the rotating block is replaced
-    downstream except its diagonal, the rotating state's own-energy read.
+    Sigma_c,ij = [n_i A_ij + f_i Af_ij + n_j B_ij + f_j Bf_ij] / (n_i+f_i+n_j+f_j),
+    each endpoint read from the near cube (``near`` = 1: protected, or
+    rotating inside the near support) or from the far-patch cube (``far`` =
+    1: rotating, covered by a patch). A rotating endpoint no patch covers has
+    n = f = 0, so a P-R entry falls back to the protected-energy read. The
+    rotating block is replaced downstream except its diagonal.
     """
     key = (id(mesh_xy), bool(replicated_output))
     fn = _QSGW_FAR_KERNEL_CACHE.get(key)
@@ -592,11 +594,13 @@ def _qsgw_far_kernel(mesh_xy: Mesh, *, replicated_output: bool):
                     wl[:, None, :] * b_lo + wh[:, None, :] * b_hi)
 
         @jax.jit
-        def _kernel(sig_w, sig_f, sig_x, ilo, ihi, wlo, whi, flo, fhi, fwlo, fwhi, protected):
+        def _kernel(sig_w, sig_f, sig_x, ilo, ihi, wlo, whi, flo, fhi, fwlo, fwhi, near, far):
             A, B = _rows_cols(sig_w, ilo, ihi, wlo, whi)
             Af, Bf = _rows_cols(sig_f, flo, fhi, fwlo, fwhi)
-            pm, pn = protected[:, :, None], protected[:, None, :]
-            sigma_c = 0.5 * (pm * A + (1. - pm) * Af + pn * B + (1. - pn) * Bf)
+            pm, pn = near[:, :, None], near[:, None, :]
+            fm, fn = far[:, :, None], far[:, None, :]
+            sigma_c = ((pm * A + fm * Af + pn * B + fn * Bf)
+                       / jnp.maximum(pm + fm + pn + fn, 1.))
             M = jax.lax.with_sharding_constraint(sigma_c + sig_x, out_3d)
             Mh = 0.5 * (M + jnp.conj(jnp.swapaxes(M, -1, -2)))
             return jax.lax.with_sharding_constraint(Mh, out_3d)
@@ -629,9 +633,9 @@ def build_qsgw_sigma_xc(
 ) -> tuple[jax.Array, dict[str, float]]:
     """Build the static Hermitian QSGW Σ_xc[k, m, n].
 
-    ``far = (sigma_c_far_omega_ry, far_omega_ev)`` (with ``protected_kn``):
-    rotating endpoints read the far-patch cube instead of the protected
-    endpoint rule; see :func:`_qsgw_far_kernel`.
+    ``far = (sigma_c_far_omega_ry, far_omega_ev, patches_ev)`` (with
+    ``protected_kn``): rotating endpoints a patch covers read the far-patch
+    cube; see :func:`_qsgw_far_kernel`.
 
     Implements the standard QSGW ansatz
 
@@ -744,16 +748,22 @@ def build_qsgw_sigma_xc(
     protected_j = device_put_process_local(protected, rep_2d)
     n_far_clipped = 0
     if far is not None and protected_kn is not None:
-        sig_f, far_omega = far
-        far_omega = np.asarray(far_omega, dtype=np.float64)
-        flo, fhi, fwl, fwh, finside = _interp_tables(far_omega, E)
-        # A rotating state inside the near support reads the near cube; only
-        # rotating states beyond it read the far patches (which were planned
-        # over exactly those energies).
+        sig_f, far_omega = far[0], np.asarray(far[1], dtype=np.float64)
+        patches = far[2] if len(far) > 2 else ((far_omega[0], far_omega[-1]),)
+        flo, fhi, fwl, fwh, _ = _interp_tables(far_omega, E)
+        # A rotating state inside the near support reads the near cube; a
+        # rotating state beyond it reads the far patch that covers its
+        # energy. One no patch covers (ruling Q3, 2026-09-28) contributes no
+        # endpoint of its own: its P-R entries are read at the protected
+        # energy and its diagonal is replaced by the side scissor downstream.
+        from .qp_support import far_patch_covered
         beyond = (E < omega_lo) | (E > omega_hi)
-        near_read = np.where((protected < 0.5) & beyond, 0.0, 1.0)
+        rotating_beyond = (protected < 0.5) & beyond
+        covered = far_patch_covered(E, patches)
+        near_read = np.where(rotating_beyond, 0.0, 1.0)
+        far_read = np.where(rotating_beyond & covered, 1.0, 0.0)
         n_far_clipped = int(np.count_nonzero(
-            (~finside[:, :logical_nb]) & (near_read[:, :logical_nb] < 0.5)))
+            (rotating_beyond & ~covered)[:, :logical_nb]))
         put = lambda a, t: device_put_process_local(a.astype(t), rep_2d)
         sigma_xc_qsgw = _qsgw_far_kernel(
             mesh_xy, replicated_output=bool(replicated_output))(
@@ -761,7 +771,8 @@ def build_qsgw_sigma_xc(
             idx_lo_j, idx_hi_j, w_lo_j, w_hi_j,
             put(flo, np.int32), put(fhi, np.int32),
             put(fwl, np.complex128), put(fwh, np.complex128),
-            device_put_process_local(near_read, rep_2d))
+            device_put_process_local(near_read, rep_2d),
+            device_put_process_local(far_read, rep_2d))
     else:
         sigma_xc_qsgw = _qsgw_build_kernel(
             mesh_xy, replicated_output=bool(replicated_output))(
