@@ -1205,7 +1205,8 @@ def test_cache_lookup_prefers_a_certified_larger_rule_over_a_bad_smaller_one(tmp
              sup_error=0.04, kappa_max=float(good.kappa_max),
              roundoff_amplification=1.0)
     best, _warnings = _rule_cache_lookup(
-        str(tmp_path), box, 1.0e-4, True, noise_amplification_cap=1.0e9)
+        str(tmp_path), box, 1.0e-4, True, noise_amplification_cap=1.0e9,
+        ceiling_nodes=None)
     assert best is not None
     rule, name = best
     assert name != "rule_bad.npz" and rule.sup_error <= 1.0e-4
@@ -1303,10 +1304,10 @@ def test_changed_domain_rebuilds_even_with_same_input_identity(monkeypatch, tmp_
     rule = _fake_rule((-2., -.3, .05, .4), 1e-4)
     assert _rule_cache_store(str(tmp_path), rule, 1.) is None
     accepted, _ = _rule_cache_lookup(str(tmp_path), rule.box, 1e-4, True,
-                                    noise_amplification_cap=1e9)
+                                    noise_amplification_cap=1e9, ceiling_nodes=None)
     assert accepted is not None
     escaped, _ = _rule_cache_lookup(str(tmp_path), (-3., -.3, .05, .4), 1e-4, True,
-                                   noise_amplification_cap=1e9)
+                                   noise_amplification_cap=1e9, ceiling_nodes=None)
     assert escaped is None
 
 
@@ -1335,3 +1336,100 @@ def test_tall_narrow_crossing_window_is_accepted():
                         "E_ref_A": 0.0, "E_ref_B": 0.0},
                        rule, 1.0e-4, cache_status="miss", cache_dir=None)
     assert fit["node_count"] == rule.node_count
+
+
+# ---------------------------------------------------------------------------
+# One serving criterion (_may_serve): containment plus the closed-form count of
+# the request's own build. PARTITION round 4 / review REVIEW_cachefix.md.
+# ---------------------------------------------------------------------------
+
+def _sized_rule(box, eps, count):
+    """A certified-looking fake rule with ``count`` nodes on ``box``."""
+    count = int(count)
+    return UniformRule(
+        times=np.linspace(0.1, 0.4, count) + 0.02j,
+        weights=np.full(count, 0.2 / count - 0.05j / count),
+        box=tuple(box), eps=float(eps), relative=box[0] > 0.0 or box[1] < 0.0,
+        theta_deg=5.0, rank=3, sup_error=0.5 * eps, kappa_max=1.2, seconds=0.0)
+
+
+def _crossing_spec(frequencies=(0.2, 0.5), states=(0.1,), pole=(0.3, 0.3), eta=0.1):
+    from gw.sigma_box_plan import make_sigma_box_spec
+    spec = make_sigma_box_spec(
+        name="x", frequencies=list(frequencies), states=list(states),
+        pole_stats=[(pole[0], pole[1], 0.0, 0.0)], pole_sign=1.0, eta_ry=eta)
+    assert spec["kind"] == "crossing"
+    return spec
+
+
+def test_crossing_cache_hit_is_capped_by_the_law_count(monkeypatch, tmp_path):
+    """A much larger cached crossing rule is a miss; a neighbour's build hits.
+
+    On c5257230b the first lookup is a ``hit:`` (containment alone).
+    """
+    from gw.sigma_box_plan import (_build_box, _fit_rule, _law_node_count,
+                                   _rule_cache_store)
+    monkeypatch.setattr("gw.sigma_box_plan._BOX_RULE_BUILDER", _fake_rule)
+    eta, eps = 0.1, 1.0e-4
+    spec = _crossing_spec(eta=eta)
+    own = _build_box(spec["box"], eta, widen=True)
+    law = _law_node_count(own, eps)
+    lo, hi, g0, g1 = spec["box"]
+    big = (3.0 * lo, 3.0 * hi, g0, g1)
+    assert _law_node_count(big, eps) > law
+    _rule_cache_store(str(tmp_path), _sized_rule(big, eps, _law_node_count(big, eps)), 1.0)
+    assert _fit_rule(spec, eps, str(tmp_path), eta)["cache_status"] == "miss"
+    # A neighbour's build: a box 1% wider on the far edges at no more nodes.
+    neighbour = _build_box(own, eta, widen=True)
+    _rule_cache_store(str(tmp_path), _sized_rule(neighbour, eps, law), 1.0)
+    fit = _fit_rule(spec, eps, str(tmp_path), eta)
+    assert fit["cache_status"].startswith("hit:") and fit["node_count"] == law
+
+
+def test_sign_definite_cache_hit_follows_the_same_count(monkeypatch, tmp_path):
+    """A 3x larger sign-definite rule at no more nodes than the own build is served."""
+    from gw.sigma_box_plan import (_build_box, _fit_rule, _law_node_count,
+                                   _rule_cache_store, make_sigma_box_spec)
+    monkeypatch.setattr("gw.sigma_box_plan._BOX_RULE_BUILDER", _fake_rule)
+    eta, eps = 0.1, 1.0e-4
+    spec = make_sigma_box_spec(
+        name="sd", frequencies=[0.2, 0.5], states=[0.9],
+        pole_stats=[(0.3, 0.3, 0.0, 0.0)], pole_sign=1.0, eta_ry=eta)
+    assert spec["kind"] == "sign_definite_negative"
+    law = _law_node_count(_build_box(spec["box"], eta, widen=True), eps)
+    lo, hi, g0, g1 = spec["box"]
+    larger = (3.0 * lo, hi, g0, g1)
+    _rule_cache_store(str(tmp_path), _sized_rule(larger, eps, law), 1.0)
+    fit = _fit_rule(spec, eps, str(tmp_path), eta)
+    assert fit["cache_status"].startswith("hit:") and fit["node_count"] == law
+
+
+@pytest.mark.parametrize("b_offset", [+2, -1])
+def test_cold_crossing_plan_serves_the_rules_a_warm_rerun_would(
+        monkeypatch, tmp_path, b_offset):
+    """Crossing variant: window A inside window B, A's own build above its law
+    count (a rung flip), B built between them (+2) or below it (-1). The plan
+    (_serve_from_plan) and the later lookup (_rule_cache_lookup) apply the one
+    criterion, so a cold plan serves what its warm rerun serves."""
+    from gw.sigma_box_plan import (_build_box, _law_node_count,
+                                   fit_sigma_box_specs)
+    eta, eps = 0.1, 1.0e-4
+    small = _crossing_spec(eta=eta)
+    large = _crossing_spec(frequencies=(0.1, 0.6), states=(0.05, 0.15),
+                           pole=(0.25, 0.35), eta=eta)
+    assert (large["box"][0] <= small["box"][0] and large["box"][1] >= small["box"][1])
+    law_small = _law_node_count(_build_box(small["box"], eta, widen=True), eps)
+    small_build = _build_box(small["box"], eta, widen=True)
+
+    def sized(box, eps, **_kwargs):
+        same = np.allclose(box, small_build)
+        return _sized_rule(box, eps, law_small + 5 if same else law_small + b_offset)
+
+    monkeypatch.setattr("gw.sigma_box_plan._BOX_RULE_BUILDER", sized)
+    cold, _ = fit_sigma_box_specs([small, large], eta, eps=eps, cache_dir=str(tmp_path))
+    warm, _ = fit_sigma_box_specs([small, large], eta, eps=eps, cache_dir=str(tmp_path))
+    for left, right in zip(cold, warm):
+        assert left["node_count"] == right["node_count"]
+        assert left["node_digest"] == right["node_digest"]
+    served_large = cold[0]["node_count"] == law_small + b_offset
+    assert served_large == (b_offset <= 0)

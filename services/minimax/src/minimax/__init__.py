@@ -84,7 +84,7 @@ _UNIFORM_RULE_NAMES = (
 # Derived denominator-box rules (the bent contour on crossing boxes, the
 # elliptic time-Ritz sector rule on sign-definite ones): the Sigma planner's
 # builder.  SciPy, so lazy.
-_ANALYTIC_BOX_NAMES = ("analytic_box_rule",)
+_ANALYTIC_BOX_NAMES = ("analytic_box_rule", "crossing_nodes", "sector_degree")
 
 # Levelled (minimax-optimal) noncrossing rules: NumPy only, but lazy like
 # every builder so a bare import pays nothing.

@@ -19,7 +19,7 @@ def test_cache_one_ulp_request_reuses_authenticated_stored_eps(tmp_path):
     _rule_cache_store(str(tmp_path), rule, 1.)
     for eps in (np.nextafter(rule.eps, 0), np.nextafter(rule.eps, np.inf)):
         best, warnings = _rule_cache_lookup(str(tmp_path), rule.box, eps, True,
-                                           noise_amplification_cap=1e9)
+                                           noise_amplification_cap=1e9, ceiling_nodes=None)
         assert not warnings and best is not None
         assert best[0].eps == rule.eps
 
@@ -35,7 +35,7 @@ def test_cache_authenticates_stored_fields_before_filtering(tmp_path, field):
     values[field] = np.nextafter(rule.eps, np.inf) if field == 'eps' else False
     np.savez(path, **values)
     best, warnings = _rule_cache_lookup(str(tmp_path), rule.box, rule.eps, True,
-                                       noise_amplification_cap=1e9)
+                                       noise_amplification_cap=1e9, ceiling_nodes=None)
     assert best is None and len(warnings) == 1
     assert 'sigma_rule_integrity' in warnings[0]
 
