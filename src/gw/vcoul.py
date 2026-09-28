@@ -98,7 +98,7 @@ def compute_q0_averages_screened(
 	meta: Meta,
 	S_carts,
 	*,
-	extra_chis=None,
+	extra_chi_rows=None,
 	nsamples: int = 2**18,
 	method: str = "auto",
 	qmc_reps: int = 10,
@@ -106,22 +106,27 @@ def compute_q0_averages_screened(
 ):
 	"""``compute_q0_averages(S_cart=S_i, extra_chi=chi_i)`` for every row on one draw.
 
-	Returns ``(vc0_mean, [wcoul0_i])``; each row is bit-identical to its own
-	:func:`compute_q0_averages` call.  The 3D bulk shares the draw's device
-	copy, ``<v>`` and ``v(q)`` across rows (``vcoul.Bulk3D.q0_average_screened``);
-	other dimensions keep one call per row.
+	Returns ``(vc0_mean, [wcoul0_i])``.  ``extra_chi_rows(q)`` gives every
+	row's ``chi_extra`` [Z, n] on one draw batch ``q`` [n, 3] (3D bulk only).
+	The 3D bulk evaluates all rows in one program per draw batch
+	(``vcoul.Bulk3D.q0_average_screened``); each row equals its own
+	:func:`compute_q0_averages` call up to round-off.  Other dimensions keep
+	one call per row.
 	"""
 	S_carts = list(S_carts)
-	extra_chis = [None] * len(S_carts) if extra_chis is None else list(extra_chis)
 	if int(getattr(meta, 'sys_dim', 3)) == 3:
 		from .coulomb import get_kernel
 		return get_kernel(3).q0_average_screened(
-			wfn, meta, S_carts=S_carts, extra_chis=extra_chis,
+			wfn, meta, S_carts=S_carts, extra_chi_rows=extra_chi_rows,
 			nsamples=nsamples, method=method, qmc_reps=qmc_reps,
 			analytic_sphere=analytic_sphere)
+	if extra_chi_rows is not None:
+		raise NotImplementedError(
+			"extra_chi (the metallic finite-q intraband response) is "
+			"defined for the 3D bulk head only")
 	rows = [compute_q0_averages(
 		wfn, jnp.asarray(0.0, dtype=jnp.float64), meta, S_cart=S,
 		nsamples=nsamples, method=method, qmc_reps=qmc_reps,
-		analytic_sphere=analytic_sphere, extra_chi=chi)
-		for S, chi in zip(S_carts, extra_chis)]
+		analytic_sphere=analytic_sphere)
+		for S in S_carts]
 	return (rows[0][0] if rows else None), [w for _, w in rows]
