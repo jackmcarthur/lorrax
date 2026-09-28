@@ -81,7 +81,7 @@ def clamped_reads(energy_relative_ev, protected_kn, grid_ev):
 #: SEMICORE_ETA_EV. The owner approved 1-2 eV for these reads (ruling Q4,
 #: 2026-09-28; INVARIANTS 12); protected states keep the deck eta.
 FAR_PATCH_ETA_EV = 1.0
-SEMICORE_ETA_EV = 1.0
+SEMICORE_ETA_EV = 0.5
 #: Rule tolerance of the far-patch crossing windows. A far window's node
 #: count is set by its short side over eta (the patch top above the lowest
 #: state), not by its pole range, so splitting cannot shorten it; the coupling
