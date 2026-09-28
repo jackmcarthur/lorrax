@@ -569,6 +569,8 @@ def finalize_dynamic_sigma(
             sigma_c_body_omega, head_sigma_diag_w_kn_ry,
             band_axis=sigma_band_axis)
 
+        _prof_ev = timing.section("sigma.finalize.eval_at_dft")  # PROFILE study timer
+        _prof_ev.__enter__()
         (sigma_c_at_dft_ev,
          omega_dft_rel_ev,
          efermi_dft_ev,
@@ -604,6 +606,7 @@ def finalize_dynamic_sigma(
                     "GATE ppm_odd_sigma_reference: ordered-residue and total "
                     "Sigma_c were evaluated on different energy references")
 
+        _prof_ev.__exit__(None, None, None)
         # Static Sigma_x is added in the QSGW kernel.  E_F here is the SAME
         # reference the interpolation above used — one omega reference per
         # finalize, or the two reads sample different grid positions.
@@ -613,6 +616,7 @@ def finalize_dynamic_sigma(
             np.asarray(e_qp_ev, dtype=np.float64) - efermi_dft_ev)
 
         if write_sigma_omega_h5:
+          with timing.section("sigma.write_sigma_mnk"):  # PROFILE study timer
             sigma_omega_h5_path = write_sigma_omega(
                 sigma_c_omega,
                 sig_x=sig_x, sig_h=sig_h,
@@ -654,14 +658,16 @@ def finalize_dynamic_sigma(
             # EQP receipt.  Only the SC path passes False today, and it
             # replaces the field afterwards with the converged write.
             sigma_omega_h5_path = None
-        sig_x_rep = device_put_process_local(
-            sig_x, NamedSharding(mesh_xy, P(None, None, None)))
-        sigma_xc_qsgw, qsgw_diag = build_qsgw_sigma_xc(
-            sigma_c_omega, sig_x_rep,
-            omega_grid_ev, e_qp_rel_ev, mesh_xy,
-            band_axis=sigma_band_axis,
-            out_of_grid=config.sigma.out_of_grid,
-        )
+        with timing.section("sigma.finalize.qsgw_build") as _prof_qb:  # PROFILE study timer
+            sig_x_rep = device_put_process_local(
+                sig_x, NamedSharding(mesh_xy, P(None, None, None)))
+            sigma_xc_qsgw, qsgw_diag = build_qsgw_sigma_xc(
+                sigma_c_omega, sig_x_rep,
+                omega_grid_ev, e_qp_rel_ev, mesh_xy,
+                band_axis=sigma_band_axis,
+                out_of_grid=config.sigma.out_of_grid,
+            )
+            _prof_qb.watch(sigma_xc_qsgw)
         print_fn(f"  QSGW: {int(qsgw_diag['n_clipped'])} clipped "
                  f"({100*qsgw_diag['frac_clipped']:.1f}%)")
 
@@ -700,6 +706,7 @@ def finalize_dynamic_sigma(
         # Only append when this call created the base file.  SC iterations
         # pass False and append once, in the cube's own basis, at convergence.
         if write_sigma_omega_h5:
+          with timing.section("sigma.write_qsgw_cube"):  # PROFILE study timer
             from .qsgw_utils import write_qsgw_sigma_cube
             write_qsgw_sigma_cube(
                 sigma_omega_h5_path, sigma_xc_qsgw,
@@ -952,16 +959,20 @@ def _packed_dynamic_sigma_channels(
             "claim the SX/COH columns.")
     from .cohsex_sigma import _resolve_Gij
     photon_Gij = _resolve_Gij(Gij, meta, mesh_xy, occupation_state)
-    sig_x = compute_sigma_x(
-        wfns, V_q, meta, mesh_xy,
-        Gij=photon_Gij,
-        static_head_terms=static_head_terms,
-        wfns_transverse=None,
-        bispinor_v_q_path=None,
-        occupation_state=None,
-    )
+    with timing.section("sigma.exchange") as _prof_sx:  # PROFILE study timer
+        sig_x = compute_sigma_x(
+            wfns, V_q, meta, mesh_xy,
+            Gij=photon_Gij,
+            static_head_terms=static_head_terms,
+            wfns_transverse=None,
+            bispinor_v_q_path=None,
+            occupation_state=None,
+        )
+        _prof_sx.watch(sig_x)
     from .photon_sigma import (
         PHOTON_BLOCKS_CURRENT, compute_static_photon_sigma)
+    _prof_ph = timing.section("sigma.photon_static")  # PROFILE study timer
+    _prof_ph.__enter__()
     (cur_x, cur_sx, cur_coh,
      photon_head_diagnostics,
      photon_sigma_diagnostics) = compute_static_photon_sigma(
@@ -981,6 +992,7 @@ def _packed_dynamic_sigma_channels(
     current_correlation = (cur_sx - cur_x) + cur_coh
     sig_x = sig_x + cur_sx + cur_coh
     sig_x.block_until_ready()
+    _prof_ph.__exit__(None, None, None)
     sig_sx = sig_coh = jnp.zeros_like(sig_x)
     if print_fn is not None:
         _bare_scale = float(jnp.max(jnp.abs(jnp.diagonal(

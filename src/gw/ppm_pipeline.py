@@ -599,6 +599,8 @@ def compute_ppm_sigma_pipeline(
         else:
             fit_inputs = (W0_op.unfold(mesh_xy), Wp_op.unfold(mesh_xy), V_op.unfold(mesh_xy))
             wedge_kw = {}
+        _prof_fit = timing.section("ppm.fit")  # PROFILE study timer
+        _prof_fit.__enter__()
         ppm = fit_ppm(
             *fit_inputs, probe_omega, mesh_xy,
             **wedge_kw,
@@ -616,6 +618,8 @@ def compute_ppm_sigma_pipeline(
             coarsen_extreme_tails=not is_hl,
             ordered_orientations=ordered,
         )
+        _prof_fit.watch(lambda: jax.block_until_ready(jax.tree_util.tree_leaves(ppm)))
+        _prof_fit.__exit__(None, None, None)
 
         # Step 2: precompile + run Σ^c(ω, k, m, n)
         #
@@ -709,6 +713,8 @@ def compute_ppm_sigma_pipeline(
         sigma_c_body_omega_unextrap = None
 
         # Step 3: q→0 head construction (analytic, mini-BZ-averaged)
+        _prof_head = timing.section("ppm.head")  # PROFILE study timer
+        _prof_head.__enter__()
         head_gn = _fit_head_correction(
             head_resolver, config=config, meta=meta,
             probe_omega=probe_omega, print_fn=print_fn,
@@ -722,12 +728,15 @@ def compute_ppm_sigma_pipeline(
             body_efermi_ry=sigma_omega.efermi_ry,
             print_fn=print_fn,
         )
+        _prof_head.watch(head_sigma_diag_w_kn_ry)
+        _prof_head.__exit__(None, None, None)
 
         # Step 4: the band-convergence extrapolation report.  After the head,
         # because the head is part of the Σ_c being reported; before the
         # return, because the cube's leading axis does not survive it.
         extrap_payload = None
         if plan.enabled:
+          with timing.section("ppm.band_extrapolation") as _prof_bx:  # PROFILE study timer
             extrap_payload, extrap_weights = _report_band_extrapolation(
                 sigma_omega, head_sigma_diag_w_kn_ry,
                 plan=plan, config=config, band_slices=band_slices,
@@ -745,6 +754,7 @@ def compute_ppm_sigma_pipeline(
             sigma_c_body_omega = _extrapolated_point(
                 sigma_omega.sigma_c_kij, extrap_weights)
             sigma_c_body_omega_unextrap = sigma_c_body_omega_n3
+            _prof_bx.watch(sigma_c_body_omega)
 
     return PPMOutputs(
         sigma_c_body_omega=sigma_c_body_omega,
