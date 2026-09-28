@@ -86,9 +86,13 @@ eps2 = eps2_from_exciton_dipoles(omegas_Ry, E_Ry[:n_max], D[:n_max], eta_Ry,
                                  V_cell, n_k, n_spin, n_spinor)   # (n_omega, 3)
 ```
 
-It uses the Haydock route's prefactor and Lorentzian. There is no reader for
-BerkeleyGW's `eigenvalues.dat` on main; broaden it with the same Lorentzian
-(`absorption_common.lorentzian_broaden`) and prefactor. At matched `n_max`,
+It uses the Haydock route's prefactor and Lorentzian, in Ry. No `src/` or
+`tools/` module reads BerkeleyGW's `eigenvalues.dat`; only
+`tests/test_bse_bgw_regression.py` reads its energy column. Those energies are
+in eV. Convert them and η to Ry (÷ 13.6056980659) before
+`absorption_common.lorentzian_broaden` and the 16π²/(V·N_k·n_spin·n_spinor)
+prefactor: the Lorentzian carries 1/energy, so broadening in eV gives ε₂
+13.6× too small. At matched `n_max`,
 the LORRAX/BGW peak ratio reflects the per-state oscillator-strength
 agreement (eigenvector convergence + ISDF compression).
 

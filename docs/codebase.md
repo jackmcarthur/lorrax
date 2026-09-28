@@ -213,11 +213,11 @@ The BSE contract is [BSE](architecture/bse.md); this table only says where each 
 | `bse_densify.py` | Coarse-to-fine densification of the BSE bundle under `bse_k_grid`. |
 | `bse_feast.py` | FEAST contour eigensolver, its GMRES solves and the spectral deflation the W_BSE ladder reuses. |
 | `bse_head.py` | The q = 0 Coulomb head: its scalars and their rank-one injection. |
-| `bse_io.py` | Compatibility facade re-exporting `bse_window`, `bse_head`, `bse_densify` and `bse_loading`. |
+| `bse_io.py` | Compatibility facade: re-exports names from `bse_window`, `bse_head`, `bse_densify`, `bse_loading` and the window names of `common.band_degeneracy`. |
 | `bse_jax.py` | The BSE driver: `python -m bse.bse_jax`. |
 | `bse_kpm.py` | KPM Chebyshev density of states of the BSE Hamiltonian. |
 | `bse_lanczos.py` | `solve_bse_sharded`: TDA Lanczos, Davidson and thick-restart Lanczos; non-TDA hands off to `bse_nontda`. |
-| `bse_loading.py` | Reads a GW restart into a BSE bundle: window, padding, head, static W(0) rebuild. |
+| `bse_loading.py` | Reads a GW restart into a BSE bundle: window, padding and q = 0 head; builds a missing static W(0) through `gw.static_screening` when the restart has none. |
 | `bse_nontda.py` | Structure-preserving full (non-TDA) eigensolver: dense build, and an opt-in matrix-free solver. |
 | `bse_preconditioner.py` | Transition energies, the exchange pair amplitude and the exchange spin weight. |
 | `bse_ring_comm.py` | The BSE mesh, shardings, and the full (A, B) ring matvec. |
