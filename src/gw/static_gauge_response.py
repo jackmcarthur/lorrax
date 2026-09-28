@@ -37,6 +37,7 @@ completion.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from functools import lru_cache
 
 import jax
 import jax.numpy as jnp
@@ -77,8 +78,6 @@ def fermi_dirac_current_drude(current_faces, occupation_state, *,
     mesh_xy : Mesh
         Named x/y mesh. The result is complex ``[mu,nu]`` at ``P('x','y')``.
     """
-    from common.shard_map import shard_map
-
     if occupation_state.smearing_family != "fd":
         raise ValueError("GATE photon_contact_fd: TT metal contact requires FD state")
     width = float(occupation_state.smearing_width_ry)
@@ -95,14 +94,22 @@ def fermi_dirac_current_drude(current_faces, occupation_state, *,
             or weights.shape != (f.shape[0],) or not np.isfinite(weights).all()
             or np.any(weights < 0) or not np.isclose(weights.sum(), 1, rtol=0, atol=1e-12)):
         raise ValueError("GATE photon_contact_state: invalid FD scale, volume or k weights")
-    # Replicate only the band axis of these O(k*n*mu) carriers. Every
-    # quadratic output remains tiled over BOTH mesh axes throughout.
-    contract = shard_map(
+    weight = (capacity / volume) * jnp.asarray(weights)[:, None] * f * (1-f) / width
+    return _drude_contract(mesh_xy)(left, right, weight)
+
+
+@lru_cache(maxsize=8)
+def _drude_contract(mesh_xy):
+    """sum_kn l[k,m,n] w[k,n] conj(r[k,n,v]) at P('x','y'): one program per mesh, built at every SC map.
+
+    Replicate only the band axis of these O(k*n*mu) carriers. Every
+    quadratic output remains tiled over BOTH mesh axes throughout.
+    """
+    from common.shard_map import shard_map
+    return jax.jit(shard_map(
         lambda l, r, w: jnp.einsum("kmn,kn,knv->mv", l, w, r.conj()),
         mesh=mesh_xy, in_specs=(P(None, "x", None), P(None, None, "y"), P()),
-        out_specs=P("x", "y"), check_vma=False)
-    weight = (capacity / volume) * jnp.asarray(weights)[:, None] * f * (1-f) / width
-    return jax.jit(contract)(left, right, weight)
+        out_specs=P("x", "y"), check_vma=False))
 
 
 def photon_diagonal_current_faces(vertex, *, mesh_xy, layout, wfn_layout="face"):
@@ -118,22 +125,12 @@ def photon_diagonal_current_faces(vertex, *, mesh_xy, layout, wfn_layout="face")
     ``[k, band, nu]``; the charge channel and internal padding are exactly
     zero, so their outer product has TT support only.
     """
-    from functools import partial
-    from common.gamma_matrices import gamma_apply, gamma_perm_phase
-    from common.shard_map import shard_map
     from common.wfn_layout import psi_specs
-    from gw.photon_layout import TRANSVERSE, pack_photon_faces
-    from symmetry_maps import unfold_wavefunction_local
+    from gw.photon_layout import pack_photon_faces
 
     families = vertex.families
     plan = families.plans[1]
     nmu_spec, mun_spec = psi_specs(wfn_layout)
-
-    def density(face, spin_axis):
-        return jnp.stack([jnp.sum(jnp.conj(face) * gamma_apply(
-            face, *gamma_perm_phase(A), axis=spin_axis), axis=spin_axis)
-            for A in TRANSVERSE], axis=spin_axis)
-
     tables = ()
     if plan is not None:
         rows = np.asarray(plan.sym_idx)
@@ -142,25 +139,9 @@ def photon_diagonal_current_faces(vertex, *, mesh_xy, layout, wfn_layout="face")
                   np.zeros(np.shape(plan.L_table), np.float64),
                   np.asarray(plan.sym.cartesian_action(rows, axial=False, time_odd=True),
                              dtype=np.complex128))
-
-    def to_full_k(value, spin_axis, mu_axis, mesh_axis, *tables):
-        if not tables:
-            return value
-        irr, sym, kfrac, perm, wraps, mix = tables
-        return unfold_wavefunction_local(
-            value, irr_idx=irr, sym_idx=sym, k_irr_frac=kfrac, local_perm=perm,
-            L_table=wraps, spin_action_full=mix, n_sym_spatial=plan.n_sym_spatial,
-            spin_axis=spin_axis, mu_axis=mu_axis, mesh_axis=mesh_axis)
-
-    table_specs = (P(),) * len(tables)
-
-    @partial(shard_map, mesh=mesh_xy, in_specs=(mun_spec, nmu_spec) + table_specs,
-             out_specs=(mun_spec, nmu_spec), check_vma=False)
-    def currents(mun, nmu, *tables):
-        return (to_full_k(density(mun, 1), 1, 2, "x", *tables),
-                to_full_k(density(nmu, 2), 2, 3, "y", *tables))
-
-    left, right = jax.jit(currents)(vertex.mun[1], vertex.nmu[1], *tables)
+    currents = _current_density_program(mesh_xy, mun_spec, nmu_spec, len(tables),
+                                        None if plan is None else int(plan.n_sym_spatial))
+    left, right = currents(vertex.mun[1], vertex.nmu[1], *tables)
     if families.bases is not None:
         basis = families.bases[1]
         left = basis.unpack_axis(left, 2, spec=mun_spec)
@@ -168,8 +149,7 @@ def photon_diagonal_current_faces(vertex, *, mesh_xy, layout, wfn_layout="face")
     def zero(face, axis, spec):
         # The charge channel carries no current: an exact-zero face.
         shape = face.shape[:axis] + (1, layout.carrier_extent(0)) + face.shape[axis+2:]
-        return jax.jit(lambda: jnp.zeros(shape, face.dtype),
-                       out_shardings=NamedSharding(mesh_xy, spec))()
+        return _zero_face(mesh_xy, spec, tuple(shape), np.dtype(face.dtype))()
     faces_mun = (zero(left, 1, mun_spec),) + tuple(left[:, A:A+1] for A in range(3))
     faces_nmu = (zero(right, 2, nmu_spec),) + tuple(right[:, :, A:A+1] for A in range(3))
     left = pack_photon_faces(faces_mun, layout, mesh_xy, orientation="mun",
@@ -177,6 +157,49 @@ def photon_diagonal_current_faces(vertex, *, mesh_xy, layout, wfn_layout="face")
     right = pack_photon_faces(faces_nmu, layout, mesh_xy, orientation="nmu",
                               wfn_layout=wfn_layout)[:, :, 0]
     return left, right
+
+
+@lru_cache(maxsize=8)
+def _current_density_program(mesh_xy, mun_spec, nmu_spec, n_tables, n_sym_spatial):
+    """psi^dagger alpha_A psi on both endpoint faces, unfolded to full k: one program per layout.
+
+    The contact is built at every SC map; a program built per call was
+    traced and lowered again each map.
+    """
+    from functools import partial
+    from common.gamma_matrices import gamma_apply, gamma_perm_phase
+    from common.shard_map import shard_map
+    from gw.photon_layout import TRANSVERSE
+    from symmetry_maps import unfold_wavefunction_local
+
+    def density(face, spin_axis):
+        return jnp.stack([jnp.sum(jnp.conj(face) * gamma_apply(
+            face, *gamma_perm_phase(A), axis=spin_axis), axis=spin_axis)
+            for A in TRANSVERSE], axis=spin_axis)
+
+    def to_full_k(value, spin_axis, mu_axis, mesh_axis, *tables):
+        if not tables:
+            return value
+        irr, sym, kfrac, perm, wraps, mix = tables
+        return unfold_wavefunction_local(
+            value, irr_idx=irr, sym_idx=sym, k_irr_frac=kfrac, local_perm=perm,
+            L_table=wraps, spin_action_full=mix, n_sym_spatial=n_sym_spatial,
+            spin_axis=spin_axis, mu_axis=mu_axis, mesh_axis=mesh_axis)
+
+    table_specs = (P(),) * n_tables
+
+    @partial(shard_map, mesh=mesh_xy, in_specs=(mun_spec, nmu_spec) + table_specs,
+             out_specs=(mun_spec, nmu_spec), check_vma=False)
+    def currents(mun, nmu, *tables):
+        return (to_full_k(density(mun, 1), 1, 2, "x", *tables),
+                to_full_k(density(nmu, 2), 2, 3, "y", *tables))
+    return jax.jit(currents)
+
+
+@lru_cache(maxsize=16)
+def _zero_face(mesh_xy, spec, shape, dtype):
+    """An exact-zero face of ``shape`` sharded ``spec``: one program per shape."""
+    return jax.jit(lambda: jnp.zeros(shape, dtype), out_shardings=NamedSharding(mesh_xy, spec))
 
 
 def _canonical_wfn_sha256(value) -> str:
