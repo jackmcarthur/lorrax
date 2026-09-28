@@ -280,21 +280,48 @@ def check_roundtrip(mesh,path,layout="local"):
 
 
 def check_finalization_resume(mesh,path):
+    """Staged route: an interrupted finalization resumes from the closed staging census.
+    One-batch route (every parent in one call, no staging group): an interruption before
+    or after the final datasets leaves an empty census on disk, so resume refuses by
+    name and a rebuild writes the same model."""
     meta,tables,recipe,identity=_fixture(mesh)
     _,packed,poles,count=_model(meta)
-    original=store._finalize_model
-    def interrupt(*args,**kwargs):
-        raise RuntimeError('planted stop after staged close')
-    store._finalize_model=interrupt
-    try:
-        with pytest.raises(RuntimeError,match='planted stop'):
-            store.write_shared_pole_model(path,_device(packed,mesh,P(None,'x',None,'y')),
-                _device(poles,mesh,P(None,'y')),count,q_span=(0,3),meta=meta,tables=tables,
-                recipe=recipe,receipts={'identity':identity})
-    finally:
-        store._finalize_model=original
+    cdev=_device(packed,mesh,P(None,'x',None,'y'))
+    pdev=_device(poles,mesh,P(None,'y'))
+    write=lambda p,a,b:store.write_shared_pole_model(p,cdev[a:b],pdev[a:b],count[a:b],q_span=(a,b),
+        meta=meta,tables=tables,recipe=recipe,receipts={'identity':identity})
+    def interrupted(name,call):
+        original=getattr(store,name)
+        def stop(*args,**kwargs):
+            raise RuntimeError('planted stop in '+name)
+        setattr(store,name,stop)
+        try:
+            with pytest.raises(RuntimeError,match='planted stop'):
+                call()
+        finally:
+            setattr(store,name,original)
+    one=path.with_name(path.stem+'_one_batch.h5')
+    interrupted('_finalize_model',lambda:write(one,0,3))
+    with pytest.raises(ValueError,match='every staged parent'):
+        store.finalize_shared_pole_model(one,meta=meta,expected_identity=identity)
+    interrupted('_model_digest',lambda:write(one,0,3))
+    with pytest.raises(ValueError,match='every staged parent'):
+        store.finalize_shared_pole_model(one,meta=meta,expected_identity=identity)
+    with pytest.raises(ValueError,match='incomplete|missing final'):
+        store.validate_shared_pole_model(one,expected_identity=identity,mesh_xy=mesh,capacity=meta.shared_pole_capacity)
+    rebuilt=write(one,0,3)
+    assert rebuilt['finalized'] and rebuilt['staging_payload_bytes']==0
+    write(path,0,1)
+    interrupted('_finalize_model',lambda:write(path,1,3))
     header=store.finalize_shared_pole_model(path,meta=meta,expected_identity=identity)
-    assert header['finalized']
+    assert header['finalized'] and header['Kmax']==rebuilt['Kmax']
+    def same_bytes():
+        import h5py
+        with h5py.File(path,'r') as f,h5py.File(one,'r') as g:
+            for name in ('factor','poles2_ry2','K','written_q'):
+                np.testing.assert_array_equal(f[name][()],g[name][()])
+            assert 'staging' not in f and 'staging' not in g
+    rank0_transaction(path,stage='test.one_batch_equals_staged',write=same_bytes)
     for dataset in ('operations/rotation','q_irr_full_idx','qirr/n_sym_spatial'):
         def corrupt():
             import h5py
