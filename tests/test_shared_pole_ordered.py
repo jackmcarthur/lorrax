@@ -155,6 +155,44 @@ def test_ordered_full_order_exact_with_real_poles_and_paired_carrier():
     assert float(passive["passivity_antihermitian_relative"][0]) > 1e-3
 
 
+def test_ordered_paired_cut_eigendecomposes_only_the_schur_complement():
+    """The second keep cut solves S = A - B B^H, never the whole H_r = [[A, B], [B^H, I]].
+
+    Y = P diag(Y_S, I_kept), P = [[I, 0], [-B^H, I]], whitens H_r exactly: Y^H H_r Y =
+    diag(I, kept). On a TR-broken plant the reduction's eigensolves are H'_vv (side R),
+    S (side R) and the Ritz step (2R); no 2R solve precedes the Ritz step."""
+    import jax.numpy as jnp
+    from gw.shared_pole_reduction import _schur_basis
+    rng = np.random.default_rng(20260928)
+    r = 5
+    cplx = lambda *s: rng.normal(size=s) + 1j * rng.normal(size=s)
+    b, c = cplx(r, r) * .4, cplx(r, r)
+    a = b @ adj(b) + c @ adj(c) + np.eye(r)
+    h_r = np.block([[a, b], [adj(b), np.eye(r)]])
+    gamma, u = np.linalg.eigh(a - b @ adj(b))
+    y_s = u / np.sqrt(gamma)
+    for kept in (np.ones(r, bool), np.array([1, 0, 1, 1, 0], bool)):
+        y = np.asarray(_schur_basis(_put(y_s), _put(adj(b) @ y_s), jnp.asarray(kept[None])))[0]
+        want = np.diag(np.r_[np.ones(r), kept.astype(float)])
+        assert np.max(np.abs(adj(y) @ h_r @ y - want)) < 1e-12
+    mm, eigh = _ops()
+    sides = []
+    spy = lambda m: (sides.append(int(m.shape[-1])), eigh(m))[1]
+    from gw.shared_pole_pencil import assemble_ordered_shared_pole_pencil
+    from gw.shared_pole_reduction import reduce_ordered_shared_pole_pencil
+    from gw.shared_pole_recipe import shared_real_pole_gates_ordered_v1 as gates
+    plant = _trim(np.random.default_rng(20260915), 6, 3, eps=.4)
+    qi = np.linalg.eigh(plant.moment(1))[1][:, -1:]
+    infinity = tuple(_put(v) for v in (qi, *(plant.moment(k) / 2 @ qi for k in range(4))))
+    pencil = assemble_ordered_shared_pole_pencil(_states(plant, .9 + .35j), infinity, matmul=mm)
+    _, signed, diag = reduce_ordered_shared_pole_pencil(
+        pencil, jnp.ones((1, pencil[0].shape[-1]), bool), eigh=spy, matmul=mm, gates=gates)
+    assert sides == [sides[0], sides[0], 2 * sides[0]], sides
+    assert bool(diag["retained_metric_positive"][0])
+    for z in ZS:
+        assert rel(_signed_value(signed, z), plant.F(z)) < 1e-12
+
+
 def test_ordered_projected_moments_at_reduced_order():
     from gw.shared_pole_gates import ordered_moment_identity
     mm, _ = _ops()
