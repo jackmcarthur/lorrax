@@ -663,6 +663,7 @@ def finalize_dynamic_sigma(
             band_axis=sigma_band_axis,
             protected_kn=config.sc_sigma_protected_kn,
             far=sigma_c_far,
+            far_kn=getattr(config, "sc_sigma_far_kn", None),
         )
         print_fn(f"  QSGW: {int(qsgw_diag['n_clipped'])} clipped "
                  f"({100*qsgw_diag['frac_clipped']:.1f}%)"
@@ -1273,12 +1274,12 @@ def _compute_mpa_sigma(
             # extra frequencies whose crossing windows carry the patch eta
             # (gw.sigma_box_plan.plan_sigma_windows omega_eta_ry); the cube is
             # split back into the near grid and the far patches below.
-            from .qp_support import FAR_PATCH_EPS, far_patch_eta_ev, far_patch_grid_ev
+            from .qp_support import FAR_PATCH_EPS, far_patch_grid_ev
             near_ev = np.asarray(config.omega_grid_ev, dtype=np.float64)
             pieces = [(near_ev, np.full(near_ev.size, _xi.resolved_ry * RYD_TO_EV), True)]
-            for patch in far_patches:
+            for patch in far_patches:          # (lo, hi, eta) eV: rotating and semicore
                 grid_ev = far_patch_grid_ev(patch)
-                pieces.append((grid_ev, np.full(grid_ev.size, far_patch_eta_ev(patch)), False))
+                pieces.append((grid_ev, np.full(grid_ev.size, float(patch[2])), False))
             pieces.sort(key=lambda piece: float(piece[0][0]))
             union_ev = np.concatenate([p_[0] for p_ in pieces])
             if np.any(np.diff(union_ev) <= 0):
@@ -1358,8 +1359,7 @@ def _compute_mpa_sigma(
         order = np.argsort([float(g[0]) for g, _ in far_bodies], kind="stable")
         cubes = [cubes[i] for i in order]
         sigma_c_far = (cubes[0] if len(cubes) == 1 else jnp.concatenate(cubes, axis=0),
-                       np.concatenate([far_bodies[i][0] for i in order]),
-                       tuple(config.sc_far_patches_ev))
+                       np.concatenate([far_bodies[i][0] for i in order]))
         if np.any(np.diff(sigma_c_far[1]) <= 0):
             raise ValueError("GATE sigma_far_patch_order: far patches overlap or do not ascend")
     return finalize_dynamic_sigma(

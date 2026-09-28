@@ -13,6 +13,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from functools import partial
+from typing import NamedTuple
 
 import numpy as np
 
@@ -105,6 +106,81 @@ def requested_band_mask(energies_ev, *, n_occ, nval, ncond, gap_ev, mu_ev=None,
         hit[:, nb] = False
         protected = protected | np.take_along_axis(hit, groups, axis=1)
     return protected
+
+
+class SCBandClasses(NamedTuple):
+    """The SC classes of the DFT identities on the loop k-set (``sc_band_classes``)."""
+    protected: np.ndarray      # (nk, nb) read on the near grid at the deck eta
+    semicore: np.ndarray       # (nk, nb) active, read at SEMICORE_ETA_EV on held patches
+    cut_ev: float              # upper edge of the protected set, inside a global gap
+    gap_ev: tuple              # (below, above): the global gap the cut sits in
+    valence_bottom_ev: float   # lowest active state read on the near grid
+
+
+def sc_band_classes(energies_ev, *, occupied_kn, requested_kn, range_mu_ev,
+                    range_ev=None, clip_ev, semicore_gap_ev, far_route=True):
+    """Active / semicore / rotating classes from the DFT ladder (owner scheme, 2026-09-28 round 2).
+
+    1. Every occupied state is active; none rotates. The valence manifold
+       runs down from E_F through every global gap narrower than
+       ``semicore_gap_ev``; the occupied states below a wider gap are
+       semicore, active and read at their own energy on held patches. On a
+       route without patches (``far_route=False``) they are protected.
+    2. The protected set ends at a spectral gap: ``top`` is the highest
+       requested energy, clipped to ``range_mu_ev + clip_ev`` and raised to
+       the deck's omega_max; the cut is the midpoint of the widest gap of the
+       all-k spectrum that opens in [top, top + SUPPORT_PAD_EV) (the same
+       energy at every k). Every state below the cut and above the semicore
+       is protected, so no rotating state sits among protected ones.
+    3. The rest (empty states above the cut) rotate. ``range_ev`` states
+       (omega endpoints, about ``range_mu_ev``) are always protected.
+    A global gap is an interval with no eigenvalue at any k. O(nk nb log).
+    """
+    from .qp_support import SUPPORT_PAD_EV
+    e = np.asarray(energies_ev, float)
+    occ = np.asarray(occupied_kn, bool)
+    req = np.asarray(requested_kn, bool)
+    mu = float(range_mu_ev)
+    levels = np.sort(e.ravel())
+    lo_ev = hi_ev = None
+    if range_ev is not None:
+        lo_ev = None if range_ev[0] is None else mu + float(range_ev[0])
+        hi_ev = None if range_ev[1] is None else mu + float(range_ev[1])
+    top = min(float(e[req].max()), mu + float(clip_ev))
+    top = max(top, float(e[occ].max()))
+    if hi_ev is not None:
+        top = max(top, hi_ev)
+    above = levels[levels >= top]
+    if above.size == 0:
+        cut, gap = top, (top, np.inf)
+    else:
+        nxt = np.append(above[1:], np.inf)
+        opens = above < top + float(SUPPORT_PAD_EV)
+        widths = np.where(opens, nxt - above, -1.0)
+        i = int(np.argmax(widths))
+        gap = (float(above[i]), float(nxt[i]))
+        cut = gap[0] + 0.5 * (min(gap[1], gap[0] + 2 * float(SUPPORT_PAD_EV)) - gap[0])
+    # Valence bottom: walk down the occupied levels from E_F through gaps
+    # narrower than semicore_gap_ev.
+    occ_levels = np.sort(e[occ])[::-1]
+    bottom = float(occ_levels[0])
+    for a, b in zip(occ_levels[:-1], occ_levels[1:]):
+        if a - b > float(semicore_gap_ev):
+            break
+        bottom = float(b)
+    semicore = occ & (e < bottom)
+    if lo_ev is not None:
+        semicore &= e < lo_ev
+    if not far_route:
+        semicore = np.zeros_like(semicore)
+    protected = (e < cut) & ~semicore
+    if lo_ev is not None or hi_ev is not None:
+        inside = ((e >= (-np.inf if lo_ev is None else lo_ev))
+                  & (e <= (np.inf if hi_ev is None else hi_ev)))
+        protected |= inside
+        semicore &= ~inside
+    return SCBandClasses(protected, semicore, float(cut), gap,
+                         float(e[protected].min()))
 
 
 @dataclass(frozen=True)

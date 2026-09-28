@@ -4650,10 +4650,14 @@ class LorraxConfig:
     #: Internal sampled SC support, retained by the quadrature session.
     #: This is not a deck knob; requested Sigma bounds stay unchanged.
     sc_omega_grid_ev: tuple[float, ...] | None = None
+    #: Per sorted QP state: 1 reads its QSGW endpoints on the near grid.
     sc_sigma_protected_kn: object | None = None
-    #: Rotating-band far patches: ((lo_ev, hi_ev), ...) about the Sigma frame's
-    #: E_F, each an independent Sigma delivery at ``gw.qp_support.FAR_PATCH_ETA_EV``;
-    #: planned once at SC map 0 (``gw.qp_support.far_patches_ev``).
+    #: Per sorted QP state: 1 reads its endpoints on the held patches
+    #: (semicore, and rotating states beyond the near grid).
+    sc_sigma_far_kn: object | None = None
+    #: Held patches: ((lo_ev, hi_ev, eta_ev), ...) about the Sigma frame's
+    #: E_F, rotating and semicore, planned once at SC map 0
+    #: (``gw.qp_support.plan_sigma_windows``).
     sc_far_patches_ev: tuple | None = None
 
     def __post_init__(self):
