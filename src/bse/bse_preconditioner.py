@@ -23,7 +23,7 @@ def exchange_spin_weight(nspinor: int) -> float:
 
     This is the single owner of the textbook singlet split, ``D + 2V - W`` for a
     spin-restricted scalar run (``nspinor == 1``) against ``D + V - W`` for spinors
-    (bse/context/README.md, "Note on spin factors"). A scalar run stores one of
+    (``docs/architecture/bse.md#hamiltonian``). A scalar run stores one of
     the two degenerate spin channels per transition. A spinor run's
     :func:`compute_pair_amplitude` already sums both components through ``Σ_s``.
 

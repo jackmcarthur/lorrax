@@ -254,7 +254,7 @@ def _compute_tt_head_tensor(
 
     The missing q=Γ, G=0 slot of the bare TT tiles — see
     ``_make_per_q_v_builder_for_tile``'s ``tt_head_correction`` docstring
-    and ``docs/BISPINOR_DHFB_DESIGN.md`` §11.  One (3,3) tensor call per
+    and ``docs/theory/BISPINOR_DHFB_DESIGN.md`` §11.  One (3,3) tensor call per
     run (not per tile, not per q); callers slice ``T[i, j]``.  Routed
     through the same ``vcoul`` mini-BZ sampler ``q0_average`` uses for the
     charge head's ``vc0`` — no second sampler.  This helper owns the
