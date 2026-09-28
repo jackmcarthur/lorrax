@@ -5749,6 +5749,22 @@ def _run_anderson(
         _record_sc(inputs, f"    SC matrix residual: call={call_index} "
                            f"max_k ||f_k||_2 = {_spec:.6e} meV; ||f||_F = "
                            f"{_frob:.6e} meV (protected block)")
+        _fesc_dir = os.environ.get("LORRAX_FESC_DUMP")
+        if _fesc_dir:
+            # FESC study instrumentation (never lands): per-call H_in, H_out,
+            # identity-ordered Z, entry mu; rank 0 writes.
+            _occ = state_out.occupation_state
+            _mu = float("nan") if _occ is None else float(_occ.mu_ry) * RYD_TO_EV
+            _z = state_out.tail_z_kn
+            _record_sc(inputs, f"    FESC map {call_index}: entry mu = {_mu:.6f} eV")
+            _h_in, _h_out = np.asarray(H), np.asarray(state_out.H_qp_dft)
+            if jax.process_index() == 0:
+                os.makedirs(_fesc_dir, exist_ok=True)
+                np.savez(os.path.join(_fesc_dir, f"call{call_index:04d}.npz"),
+                         H_in=_h_in, H_out=_h_out,
+                         E_in=E_in, E_out=E_new, mu_ev=_mu,
+                         z_id=(np.zeros(0) if _z is None else np.asarray(_z)),
+                         kstar_w=np.asarray(metric_k[:, 0, 0]) ** 2)
         _iter_idx[0] += 1
         if call_index > 0:
             _floor_history.append(float(_spec))
@@ -5831,6 +5847,15 @@ def _run_anderson(
         "  SC Anderson metric: full-grid star-weighted Gram over the per-k "
         "non-scissored DFT identity block; masks refreshed after each map, "
         "scissored rows follow the map")
+    _fesc_replay = os.environ.get("LORRAX_FESC_REPLAY")
+    if _fesc_replay:
+        # FESC study instrumentation (never lands): map 0 from the DFT carry,
+        # then the map at each stored H in order; outputs go to the dump.
+        _hs = np.load(_fesc_replay)["H_list"]
+        residual_fn(x0)
+        for _i in range(_hs.shape[0]):
+            residual_fn(_to_entry(jnp.asarray(_hs[_i])))
+        raise RuntimeError(f"FESC replay done: {_hs.shape[0]} maps after map 0")
     try:
         result = anderson_nojit(
             residual_fn,
