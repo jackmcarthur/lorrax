@@ -361,21 +361,49 @@ def make_sigma_box_spec(
     }
 
 
+def _law_node_count(box, eps):
+    """Closed-form node count of the rung-0 rule a build on ``box`` takes.
+
+    ``minimax.analytic_box``: ``crossing_nodes`` for a crossing box (the count
+    follows the short side over im_lo, the narrow side floored at 4 eta),
+    ``sector_degree`` for a sign-definite one (logarithmic in the radial
+    ratio). A build that fails rung 0 takes a later rung and more nodes.
+    """
+    from minimax import crossing_nodes, sector_degree
+    box = tuple(float(value) for value in box)
+    if box[0] > 0.0 or box[1] < 0.0:
+        return int(sector_degree(box, eps)[0])
+    return int(crossing_nodes(box, eps)[0].size)
+
+
+def _may_serve(rule_box, rule_nodes, box, *, ceiling_nodes):
+    """THE serving criterion, shared by the cache lookup and the plan.
+
+    A rule serves a request iff its box contains the request's and its node
+    count is at most ``ceiling_nodes``, the closed-form count of the
+    request's own build. Containment alone let a much larger crossing rule
+    serve a small request at several times the cost (a crossing count grows
+    with its short side): on MoS2 3x3 SC with the semicore at eta (branch
+    feat/qsgw-partition-2026-09-28) the map-0 probe pass's semicore rule
+    ([-63.5, +127] eV, 693 nodes) served the omega>=E_F conduction window
+    ([-35.5, +17.5] eV, law 203), 1472 instead of 982 pairs per map. On main
+    a foreign rule reaches a request through a sector call, a restart or a
+    second plan in one request scope. One criterion for both servers keeps a
+    cold plan equal to its warm rerun.
+    """
+    return (_box_contains(tuple(float(value) for value in rule_box), box)
+            and (ceiling_nodes is None or int(rule_nodes) <= int(ceiling_nodes)))
+
+
 def _rule_cache_lookup(
-    directory, box, eps, relative, *, noise_amplification_cap, eta=None,
+    directory, box, eps, relative, *, noise_amplification_cap, ceiling_nodes,
 ):
     """Return the smallest compatible rule plus any unreadable-path warnings.
 
-    COMPATIBLE MEANS CONTAINING, AND FOR A CROSSING BOX NO LARGER THAN A
-    NEIGHBOUR'S BUILD. A cached box must contain the request; a crossing
-    request (``relative`` False) with ``eta`` also needs it inside the
-    request's build box widened twice (:func:`_build_box`): a neighbouring
-    request's own build (one widen) is served, a rule for a much larger box
-    is not. A crossing rule's node count grows with its box (N ~ 2.7 s/eta),
-    so an unbounded containment test served a 693-node rule for a 203-node
-    request: on MoS2 3x3 SC the map-0 probe pass had cached the semicore
-    window [-63.5, +127] eV and the second pass's ω≥E_F conduction window
-    [-35.5, +17.5] eV took it (PARTITION round 4).
+    COMPATIBLE is :func:`_may_serve`: the cached box contains the request and
+    the rule has at most ``ceiling_nodes`` nodes, the closed-form count of
+    the request's own build (:func:`_law_node_count`). ``None`` states "no
+    count bound" explicitly (tools and tests that inspect a cache).
 
     Only ``_RULE_CACHE_SCHEMA`` entries are served, and each is authenticated
     against its stored digest before any compatibility filter reads it.
@@ -410,10 +438,6 @@ def _rule_cache_lookup(
             f"path={path} error={type(exc).__name__}: {exc}")
         return None, tuple(warnings)
     best = None
-    # Crossing requests only: a sign-definite rule's node count grows like the
-    # log of its box ratio, so a containing rule of equal count is as good.
-    ceiling = (None if eta is None or relative else
-               _build_box(_build_box(box, eta, widen=True), eta, widen=True))
     for name in sorted(names):
         path = os.path.abspath(os.path.join(directory, name))
         try:
@@ -446,12 +470,8 @@ def _rule_cache_lookup(
                         or amplification > noise_amplification_cap
                         or rule.sup_error > eps):
                     continue
-                if not (cached_box[0] <= box[0]
-                        and cached_box[1] >= box[1]
-                        and cached_box[2] <= box[2]
-                        and cached_box[3] >= box[3]):
-                    continue
-                if ceiling is not None and not _box_contains(ceiling, cached_box):
+                if not _may_serve(cached_box, rule.node_count, box,
+                                  ceiling_nodes=ceiling_nodes):
                     continue
                 if best is None or rule.node_count < best[0].node_count:
                     best = (rule, name)
@@ -817,9 +837,12 @@ def _fit_rule(spec, eps, cache_dir, eta, *, cache_build_widen=True):
         cache_lookup_warnings = ()
         cache_status = "analytic-line"
     else:
+        ceiling_nodes = _law_node_count(_build_box(requested_box, eta, widen=(
+            cache_dir is not None and cache_build_widen)), eps)
         cached, cache_lookup_warnings = _rule_cache_lookup(
             cache_dir, requested_box, eps, relative,
-            noise_amplification_cap=noise_amplification_cap, eta=eta)
+            noise_amplification_cap=noise_amplification_cap,
+            ceiling_nodes=ceiling_nodes)
         if cached is not None:
             rule, cache_name = cached
             cache_status = f"hit:{cache_name}"
@@ -857,7 +880,8 @@ def _fit_rule(spec, eps, cache_dir, eta, *, cache_build_widen=True):
                        cache_dir=cache_dir)
     fit.update(built=built, analytic_line=analytic_line,
                cache_lookup_warnings=tuple(cache_lookup_warnings),
-               rule_table=rule_table, rule_table_key=table_key)
+               rule_table=rule_table, rule_table_key=table_key,
+               serve_ceiling_nodes=None if analytic_line else ceiling_nodes)
     return fit
 
 
@@ -942,8 +966,9 @@ def _serve_from_plan(specs, fits, eps, cache_dir):
     Resolution runs after every miss is built, on the replicated receipts, in
     a fixed order: candidates are the window's own rule (a pre-plan cache hit
     or its build) and every rule this plan built, ranked by (node count,
-    certificate digest), the same key a later cache lookup uses. The result
-    is the rule a warm rerun would pick and does not depend on rank timing:
+    certificate digest), and a candidate must pass :func:`_may_serve`, the
+    criterion a later cache lookup applies. The result is the rule a warm
+    rerun would pick and does not depend on rank timing:
     before this, whether a window saw another window's fresh rule depended on
     how far the other rank had got (Si shared-pole ``cond:pole_tail`` took
     the 9-node own rule or the 7-node ``cond:bulk`` one, eqp1 0.80 ueV apart;
@@ -966,7 +991,8 @@ def _serve_from_plan(specs, fits, eps, cache_dir):
                 if (abs(rule.eps - eps) > 1.0e-12 * eps
                         or bool(rule.relative) != relative
                         or other["roundoff_amplification"] > cap
-                        or not _box_contains(tuple(rule.box), box)):
+                        or not _may_serve(rule.box, other["node_count"], box,
+                                          ceiling_nodes=own.get("serve_ceiling_nodes"))):
                     continue
                 try:
                     chosen = _accept_rule(

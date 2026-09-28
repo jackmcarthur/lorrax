@@ -125,7 +125,7 @@ def test_default_table_sits_beside_the_compile_cache(monkeypatch, tmp_path):
 def test_fresh_request_scope_is_an_empty_cache_not_a_failure(tmp_path):
     assert _rule_cache_lookup(
         str(tmp_path / "request_fresh"), _BOX, 1.0e-4, False,
-        noise_amplification_cap=1.0e9) == (None, ())
+        noise_amplification_cap=1.0e9, ceiling_nodes=None) == (None, ())
 
 
 # ------------------------------------------------------------- red twins
