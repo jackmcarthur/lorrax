@@ -382,6 +382,21 @@ class CapacityLedger:
             raise ValueError("capacity bytes must be nonnegative integers")
         return result
 
+    def snapshot(self):
+        """A detached copy of this map's admissions.
+
+        The SC map-0 probe (``sc_iteration.gw_iteration_map``) re-evaluates
+        Sigma on the same W; its second pass restores the ledger as it stood
+        when that W was admitted, so Sigma's stages are admitted once.
+        """
+        twin = copy.copy(self)
+        twin.entries = copy.deepcopy(self.entries)
+        twin._accepted = copy.deepcopy(self._accepted)
+        twin.geometry = copy.deepcopy(self.geometry)
+        for name in ("measured_peak", "stream_peak", "sigma_peak"):
+            setattr(twin, name, copy.deepcopy(getattr(self, name)))
+        return twin
+
     def reserve(self, stage, *, resident_bytes_per_rank,
                 workspace_bytes_per_rank, concurrent_with=()):
         """Admit actual-batch bytes before allocation, or record FAIL and refuse.
