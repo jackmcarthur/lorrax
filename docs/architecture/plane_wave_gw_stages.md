@@ -69,10 +69,13 @@ not wired.
   `sigma_w_model` is not read, and `compute_sigma_c_mpa_omega_grid` refuses a
   `tau_kernel_factory` on the shared-pole route.
 - No Γ head: v(q + G = 0) = 0 and the Γ W is the head-removed body. A deck compared
-  against it needs `head_correction = off` and `mc_average_vcoul_body = false`.
+  against it needs `head_correction = off` and `mc_average_vcoul_body = false`; the
+  comparison decks also set `bare_coulomb_cutoff = 25` (claims 2864, 2868).
 - No band-tail extrapolation.
 - Other refusals come from the owners: `GATE screened-coulomb-cutoff` (the cutoff at or
-  above the box's alias cap), `GATE pairconv-capacity`, `GATE pw-screening-budget`.
+  above the box's alias cap) and `GATE pairconv-capacity`. The W stage has no budget
+  check: `GATE pw-screening-budget` is raised only by `SphereScreening.plan_q_chunks`,
+  which the pipeline does not call.
 
 ## Validation
 
@@ -80,25 +83,26 @@ Si_scalar deck: 4³, 25 Ry, 24³ box, 34 bands, 8 IBZ k, P4 A100-40GB.
 
 | check | against | result | claim |
 |---|---|---|---|
-| pair convolution, both products, n_s 1/2/4, typed parents incl. Fe 4³ TR-broken SymMaps, wedge, expand at the parents | dense supercell references, CPU P1/P4 and GPU P4 | ≤ 1.2e-15 of max\|X\| | 2787, 2809, 2800, 2837, 2838 |
+| pair convolution: `'trace'` at n_s 1/2/4, `'scalar'` at n_s 1/2; typed parents incl. Fe 4³ TR-broken SymMaps, wedge, expand at the parents | dense supercell references, CPU P1/P4 and GPU P4 | ≤ 1.2e-15 of max\|X\| | 2787, 2809, 2800, 2837, 2838 |
 | χ normalization | a BerkeleyGW band sum | χ_q = −s·X/(Ω·N_r²), s = 2/(n_spin·n_spinor) | 2811 |
 | W_q, Γ cell, antiunitary conj rule | dense references, CPU/GPU, P1/P4, n_s 1/2 | round-off | 2811 |
 | pipeline, wedge vs dense (Si) | the dense pipeline run | Σ_x 3.6e-11 eV, ε⁻¹ 4e-12 | 2857 |
 | Σ_x (Si), head off, plain v | ISDF Σ_x, centroids and ζ fit on the Σ_x pair set (rank 1450) | max 13.7 / 1.36 / 0.54 meV at 480 / 920 / 1440 centroids | 2864 |
 | eqp0 (Si), MPA 8 poles, η 0.25 eV, ε 3e-5, head off, no tail | ISDF gwjax, 1956 centroids | gap 0.9 meV; max 19.5 meV (bands 1–4), 6.2 meV (5–8), 85 meV (9–34) | 2864 |
 
-The bands 9–34 residual does not move between 0.66 r and 0.93 r centroids, so it is
-not ISDF basis error. Its cause is not proven: the plane-wave Σ_c itself moves by up to
+The bands 9–34 residual barely moves between 1292 and 1956 centroids (max 82 → 85 meV),
+so it is not ISDF basis error. Its cause is not proven: the plane-wave Σ_c itself moves by up to
 53 meV between 8 and 12 MPA poles (claim 2864). Not checked: any comparison with a
 BerkeleyGW Σ or eqp, n_s = 2 through the pipeline, slabs, metals.
 
-**Cost** (P4 A100-40GB, warm). One τ node at Fe 8³ n_s = 2: χ₀ 31.1 s dense (claim
+**Cost** (P4 A100-40GB). One τ node at Fe 8³ n_s = 2, warm: χ₀ 31.1 s dense (claim
 2787), 3.07 s with the wedge (claim 2800), 2.51 s with the expand at the parents
 (claim 2837); Σ 2.95 s, peak 24.68 GB per rank (claim 2838). The Si one-shot with the
-wedge: Σ_x 1.4 s, χ at 16 MPA samples 35 s, Dyson and MPA fit 9.6 s, Σ_c τ sweep
-(1048 τ nodes) 70 s, peak 6.58 GB per rank (claim 2864). No N_k·N_r² object is
-formed. The per-stage memory laws are `MixedBasisPairConvolution.describe()` and
-`SphereScreening.describe()`; the pipeline prints both. The kernels (mode 6 and
+wedge, one run including compiles: Σ_x 1.4 s, χ at 16 MPA samples 35 s, Dyson and MPA
+fit 9.6 s, Σ_c τ sweep (1048 τ nodes) 70 s, peak 6.58 GB per rank (claim 2864). No
+N_k·N_r² object is formed. The per-stage memory laws are
+`MixedBasisPairConvolution.describe()`, which the pipeline prints, and
+`SphereScreening.describe()`, which it writes to the JSON as `screen_law`. The kernels (mode 6 and
 `LocalFourierPlan`) are in [the FFI layer](ffi_layout.md#k-convolution-router-and-the-mathdx-family).
 
 ## The one idea
@@ -112,7 +116,7 @@ sphere slot of k, zero-padded to one carrier `padded_axis(ngkmax, P)`:
 | `ParentGreenCarrier.psi_nmu` | (n_par, n, s, μ) | P(None,'x',None,'y') | the same values; conjugated operand and projection face |
 
 A pad slot holds a zero coefficient, so it is inert in every contraction; the loader's
-pad G-vector is the FFT-box sentinel (`WfnLoader.load`, `wfn_loader/loader.py:1711`).
+pad G-vector is the FFT-box sentinel (`WfnLoader.load`, `services/wfn_loader/src/wfn_loader/loader.py:1711`).
 Every k shares one carrier, so one static shape serves every program.
 
 With ψ(G) in those arrays, `build_G_parents` (`greens_function_kernel.py:147`) returns
@@ -124,13 +128,13 @@ the compact G, G' tiles through `SphereTransport.typed`
 
 | # | stage | output | owner (file:line) |
 |---|---|---|---|
-| 0 | inputs | WFN tables, SymMaps, v geometry | `WfnLoader.symmetry` (`wfn_loader/loader.py:720`), `vcoul.CoulombGeometry.from_wfn` |
+| 0 | inputs | WFN tables, SymMaps, v geometry | `WfnLoader.symmetry` (`services/wfn_loader/src/wfn_loader/loader.py:720`), `vcoul.CoulombGeometry.from_wfn` |
 | 1 | ψ store | ψ(G) in the r_μ faces, E_nk | `WfnLoader.load(k='ibz')`; `ParentGreenCarrier` |
 | 2 | v_q(G) | v on the χ sphere at the q-IBZ; exact zero at q + G = 0 | `plane_wave_screening.sphere_coulomb` (:155) → `compute_vcoul.compute_v_q_per_G` (:55) |
 | 3 | G(τ) | G_k(p, p'; τ) at the parents | `build_G_parents` (:147) |
 | 4 | χ₀(τ) | raw pair sum X_q(G, G') | `MixedBasisPairConvolution(product='trace')` (:765) |
 | 5 | χ(z) | χ at each frequency sample | `plane_wave_screening.accumulate_chi` (:144) with the rules of `minimax_screening.solve_laplace_minimax_interval` (:1065) and `solve_laplace_minimax_imag_interval` (:1121) |
-| 6 | W(z) | Dyson, Γ head, W^c, poles | `plane_wave_screening.SphereScreening` (:215) → `w_isdf.solve_w`, `head_correction.fold_small_head_wings_sharded`, `pade_fit.fit_mpa_poles_batched` (:1103) |
+| 6 | W(z) | Dyson, W^c, poles; the Γ head and wings not wired (`wcoul0 = vc0 = 0`) | `plane_wave_screening.SphereScreening` (:215) → `w_isdf.solve_w`, `mpa/pade_fit.fit_mpa_poles_batched` (:1103); the unwired head fold would be `head_correction.fold_small_head_wings_sharded` |
 | 7 | Σ_x | Σ_x,k(p, p') | `MixedBasisPairConvolution(product='scalar')` with B = v |
 | 8 | Σ_c(τ) → Σ(ω) | Σ_nm(k, ω) | the Σ owner's τ executor, `mpa/sigma.py:1088` `_integrate_sigma_batches`, with a plane-wave `sigma_kij` (below) |
 | 9 | QP | eqp0, eqp1 | not wired; the owners would be `qsgw_utils.solve_qp` (:877), `sigma_dispatch.sigma_result_on_kset` (:326), `eqp_bgw` |
@@ -144,7 +148,7 @@ The Σ(ω) quadrature is reused whole ([Σ quadrature](../theory/sigma-quadratur
 `compute_sigma_c_mpa_omega_grid` passes a `tau_kernel_factory` through
 `integrate_sigma_store` to `_integrate_sigma_batches`, and
 `ppm_tau_kernel.get_shared_sigma_tau_kernel` takes a caller's `_sigma_kij`. The windows,
-the box rules (`sigma_box_plan.plan_sigma_windows`, :1539), `build_shared_w_tau` (:333)
+the box rules (`sigma_box_plan.plan_sigma_windows`, :1539), `ppm_tau_kernel.build_shared_w_tau` (:333)
 and `DeviceOmegaAccumulator` (`ppm_accumulators.py:76`) are unchanged. Only the τ body's
 middle differs from the ISDF one (`get_sigma_spatial_kernel`):
 
@@ -155,8 +159,8 @@ middle differs from the ISDF one (`get_sigma_spatial_kernel`):
 
 χ at the MPA samples goes through `mpa.model._evaluate_samples` with this basis as its
 χ producer (`chi=`), on `make_mpa_plan` over `build_static_quadrature`: the z grid and
-every rule are the ISDF run's. Each τ node is one `'trace'` pair convolution; the
-conduction Green carries e^{-(E−μ)τ} and the valence Green e^{+(E−μ)τ̄}, so each pair
+every rule are the ISDF run's. Each τ node is one `'trace'` pair convolution per
+particle–hole orientation it takes; the conduction Green carries e^{-(E−μ)τ} and the valence Green e^{+(E−μ)τ̄}, so each pair
 carries e^{-Δτ}. Static and imaginary points take the minimax rule on both
 particle–hole orientations; line points the damped-line rule on one orientation
 (`w_isdf._chi0_contour_alpha_rows` about E_gap = 0). W then goes

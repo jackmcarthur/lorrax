@@ -17,7 +17,7 @@ DHF + bare-Breit GW with bispinor wavefunctions:
 - $\Sigma_{\alpha\beta}=\Sigma^C_{\alpha\beta}+\Sigma^B_{\alpha\beta}$.  $\Sigma^C$ uses $W_{00}$; $\Sigma^B$ uses the **bare** $D^{ij}$ — no transverse screening, no retardation.
 - Four ISDF $\zeta$ bases, one per $\tilde\gamma^{\mu_L}$, on **two centroid sets**: the charge feature-row norm for $\mu_L=0$ and the three-current feature-row norm for $\mu_L\in\{1,2,3\}$.
 
-This phase leaves out transverse screening; §8 says which of it is now on main.
+Phase 1 has no transverse screening, retardation or vertex; §8 lists what main has built since.
 
 ## 2. Conventions
 
@@ -186,14 +186,14 @@ band-pair cost; it is not the implemented path.
 Screened transverse response is on main: `bispinor_gw = full_static_cohsex` builds all
 sixteen χ blocks and one packed Dyson solve, and `full_shared_pole` carries ordered
 CC/CT/TC/TT sectors ([four-current wiring](../architecture/four_current_wiring.md)).
-Not built: retarded Breit ($D^{ij}(\omega)$), vertex corrections, higher-order kinetic
-balance (DKH4, σ·v; `common/bispinor_init.py`).
+Not built: retarded Breit ($D^{ij}(\omega)$), vertex corrections, a bispinor
+Sternheimer source (`psp/run_sternheimer.py` loads `bispinor=False` only), and
+higher-order kinetic balance (DKH4, σ·v; `common/bispinor_init.py`).
 
 ## 9. Open questions
 
 1. Does a proper positive-semidefinite band-pair Gram improve transverse ζ accuracy enough to justify replacing the cheaper indefinite Schur CCT?
 2. What external DHFB/Breit reference should certify the absolute transverse self-energy, beyond internal carrier and mesh parity?
-3. Which screened transverse terms belong in the first phase-2 model, and what q→0 completion must accompany them?
 
 ## 10. Reference
 

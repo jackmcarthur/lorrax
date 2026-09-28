@@ -25,8 +25,9 @@ authenticates the bundle against the deck (`restart_bundle.unfold_parent_faces`)
 the WFN fingerprint, the centroid content hash, the stored band window and
 $N_\mu$ (`assert_restart_window_matches`), and the parent rows.
 
-**Band window.** The valence count comes from `--n-occ` or the Fermi level of
-`enk_full` (`bse_window.resolve_n_occ`). The window is
+**Band window.** The occupied-band count $n_{occ}$ is `--n-occ` (Lanczos
+route), else the deck WFN's `ifmax` (`WfnLoader.nelec`,
+`bse_window.resolve_n_occ`). The window is
 $[n_{occ} - n_v,\; n_{occ} + n_c)$, clamped to the stored bands. An edge inside
 a multiplet follows `--band-degeneracy` (`common.band_degeneracy`). Every band
 of the window must lie in both legs of the ζ fit, because the direct term reads
@@ -93,6 +94,9 @@ $w_x = 2$ for a spin-restricted scalar run (singlet) and $w_x = 1$ for spinors,
 whose pair amplitude already sums both components
 (`bse_preconditioner.exchange_spin_weight`, applied at every exchange encode).
 The Tamm–Dancoff approximation keeps $A$; the RPA kernel drops $W$ and $W^B$.
+`bse_jax` applies the RPA kernel, D + V, unless `--bse` is given; `--tda`
+selects the Tamm–Dancoff problem, and without it every route solves the full
+one.
 
 With $\psi_{nk,s}(\mu) \equiv \psi_{nk,s}(r_\mu)$:
 
@@ -109,18 +113,22 @@ $U = \mathrm{FFT}_k\big(W_R \cdot \mathrm{IFFT}_k T\big)$, with $W_R$ the
 screened tile already in R space. A dense $N_k \times N_k$ contraction is not
 used: it is $O(N_k^2)$ against the FFT's $O(N_k \log N_k)$.
 
-`head_minibz_average = true` adds the cell-averaged exchange head as a rank-3
-term over transitions, $K^{head} = \frac{1}{N_k}\, d^*_a M_{ab} d_b$
-([LT head](../theory/lt-exchange-head.md)).
-
-`bse_k_grid` densifies the whole bundle before any solve: ψ and ε through one
-htransform $f(H)$, V through `bse.vq_interp`, W by zero-padding in R
-(`bse.bse_densify`).
+`bse_k_grid` densifies the bundle before any solve (`bse.bse_densify`). ψ and
+ε go through one htransform $f(H)$. W's body, with its Γ head removed, is
+zero-padded in R, and the head is re-attached analytically at each fine q. The
+q = 0 exchange tile is k-grid invariant and is carried through unchanged,
+unless `head_minibz_average = true`: then it is rebuilt through
+`bse.vq_interp` with the fine grid's mini-BZ head
+([LT head](../theory/lt-exchange-head.md)), and the W head's Γ-cell reference
+uses the analytic sphere. Without `bse_k_grid` the optical BSE does not read
+`head_minibz_average`.
 
 ## The matvec
 
-`bse_stack_matvec.build_bse_stack_matvec` is the one TDA/RPA matvec every
-sharded solver uses. Per trial block:
+`bse_stack_matvec.build_bse_stack_matvec` is the TDA matvec: Lanczos,
+Davidson and thick-restart Lanczos, FEAST and KPM under `--tda`, the
+spectral-bound Lanczos of FEAST and KPM on either route, Haydock, and
+`bse.exciton_bands`. Per trial block:
 
 1. one all-gather of the block over `'y'` then `'x'`: each rank holds every
    trial whole, $(n_c, n_v, N_k)$;
@@ -131,47 +139,46 @@ sharded solver uses. Per trial block:
 The exchange runs outside the scan: a k-summed encode to
 $(n_{trials}, N_\mu)$, one product with $V_{q0}$, a broadcast decode.
 
-**The W term** takes the first route that serves the mesh, the k-grid and the
-band counts. The choice is made at trace time and printed once (`[bse] W term:`
-and `[bse] W term decode:`):
+**The W term** has three routes, chosen at trace time by what the device
+serves and printed once (`[bse] W term:`, `[bse] W term decode:`):
 
-| route | door (`ffi.fft`) | CUDA target | T and U |
-|---|---|---|---|
-| fused outer load + decode (R45, ping-pong R54) | `make_local_kconv_klead_outer_decode` | `lorrax_mathdx_kconv_klead_outer_decode` | T formed on the load, U contracted in the store; neither reaches HBM |
-| outer load, XLA decode (R44) | `make_local_kconv_klead_outer` | `lorrax_mathdx_kconv_klead_outer` | T formed on the load; U stored |
-| XLA encode, k-leading convolution | `make_local_kconv_klead` | mode 2 | T and U stored, one T tile per rank |
+1. T is formed from its two legs, $T = \sum_K L\,R$ with $K = \min(n_c, n_v)$,
+   on the convolution's load, and the decode's (t, μ) contraction runs in its
+   store: neither T nor U reaches HBM (R44, R45; two warp groups since R54).
+2. T is formed on the load; U is stored and decoded by XLA (R44).
+3. XLA builds T; the k-leading convolution reads it and writes U.
 
-On CUDA the outer routes form $T = \sum_K L\,R$, $K = \min(n_c, n_v)$, on the
-fp64 tensor cores; on a cpu mesh the same doors compose an einsum and the plan
-route. On the fused route, `LORRAX_BSE_OUTER_KSUM=fma` moves the K sum to the
-FMA pipe for A/B comparison ([env registry](../dev/env_vars.md)). When each
-route refuses: `ffi.fft.klead_outer_refusal` and `klead_outer_decode_refusal`
-([doors](ffi_layout.md#k-convolution-router-and-the-mathdx-family)). The decode
-keeps the XLA route's (t, μ)-first order on every route.
+The kernels, their refusals and the `LORRAX_BSE_OUTER_KSUM` A/B switch are in
+[the FFI layer](ffi_layout.md#kernel-operations). The decode keeps the
+(t, μ)-first order on every route.
 
-Full BSE uses `build_bse_stack_pair_matvec`, the real-linear applier
-$\mathrm{pair}(X, s) = AX + s\,B\bar X$ ($s = \pm 1$ traced; Shao–da
-Jornada–Yang, Algorithm 4). The $A$ and $B$ encodes share one shape and one
-sharding, so their sum takes one convolution and one decode.
-`bse_ring_comm.build_bse_ring_matvec_full` stays as the dense $(A, B)$ oracle of
-the equality gates and as the ladder's operator for `w_bse`.
+Full (non-TDA) BSE runs on `bse_ring_comm.build_bse_ring_matvec_full`: it is
+the operator of FEAST and KPM without `--tda`, and `bse_nontda` builds the
+dense $(A, B)$ from it (N ≤ 4096). `build_bse_stack_pair_matvec`, the
+real-linear applier $\mathrm{pair}(X, s) = AX + s\,B\bar X$ (Shao–da
+Jornada–Yang, Algorithm 4), serves only `bse_nontda`'s matrix-free solver,
+which the CLI does not select. The ring matvec is also the screening operator
+of `bse.w_ladder` (`w_bse`), `bse.bse_w_exact` and `bse.w_omega_chain`.
 
 Measured on `main` 05b2e4f7 (release R54 gate; kernel claim 2874): CrI3
-8×8×1 SOC, 8v × 14c, P4 A100-40GB. One Haydock step (D + V − W on three trials) takes 13.2–13.4 ms;
-100 steps take 1.28 s; the solve peak is 2159 MiB per rank. The fused kernel
-runs at 2.27× the flop floor.
+8×8×1 SOC, 8v × 14c, P4 A100-40GB. One Haydock step (D + V − W on three
+trials) takes 13.2–13.4 ms; 100 steps take 1.28 s; the solve peak is 2159 MiB
+per rank. The fused kernel runs at 2.27× the flop floor.
 
 ## Solvers
 
-| route | driver flag | module | use |
+| route | driver flags | module | use |
 |---|---|---|---|
-| FEAST | default (no `--lanczos`) | `bse.bse_feast` | contour eigensolve in KPM-sized windows |
-| Lanczos, block Lanczos | `--lanczos` | `bse_lanczos.solve_bse_sharded` | spectrum shape; CGS2 reorthogonalization, full window by default |
-| Davidson | `--lanczos --solver davidson` | `bse.bse_davidson_helpers` | per-state convergence |
-| thick-restart Lanczos | `--lanczos --solver trlan` | `solvers.thick_restart_lanczos` | Krylov memory capped at `--trlan-m-max` |
-| full BSE | `--lanczos` without `--tda` | `bse.bse_nontda` | structure-preserving non-TDA solve |
-| density of states | `--kpm-dos` | `bse.bse_kpm` | KPM Chebyshev moments |
-| absorption | `python -m bse.absorption_haydock` | `bse.absorption_haydock` | ε₂(ω) by continued fraction, no eigenvectors |
+| FEAST | no `--lanczos`; `--tda` or not | `bse.bse_feast` | contour eigensolve in KPM-sized windows |
+| Lanczos, block Lanczos | `--lanczos --tda` | `bse_lanczos.solve_bse_sharded` | spectrum shape; CGS2 reorthogonalization, full window by default |
+| Davidson | `--lanczos --tda --solver davidson` | `solvers.davidson.davidson`, preconditioner and start subspace from `bse.bse_davidson_helpers` | per-state convergence |
+| thick-restart Lanczos | `--lanczos --tda --solver trlan` | `solvers.thick_restart_lanczos` | Krylov memory capped at `--trlan-m-max` |
+| full BSE | `--lanczos` without `--tda` | `bse.bse_nontda`, dense build | structure-preserving non-TDA solve, N ≤ 4096 |
+| density of states | `--kpm-dos`; `--tda` or not | `bse.bse_kpm` | KPM Chebyshev moments |
+| absorption | `python -m bse.absorption_haydock` | `bse.absorption_haydock` | ε₂(ω) by continued fraction on the TDA BSE (D + V − W), no eigenvectors |
+
+Without `--tda`, `--lanczos` ignores `--solver`, `--block-size` and
+`--n-reorth` without a message (`bse/bse_lanczos.py:118-121`).
 
 ## Dipoles and absorption
 
@@ -182,33 +189,37 @@ dipole file's own `band_energies`: DFT energies for `dipole.h5`, $E_{QP}$ for
 `dipole_qsgw.h5`. `--eqp` changes the transition energies of the Hamiltonian,
 not the dipoles.
 
-`absorption_haydock` seeds one Lanczos recursion per polarization; the three
+`absorption_haydock` always uses the TDA BSE kernel, D + V − W, and needs at
+least two devices. It seeds one Lanczos recursion per polarization; the three
 seeds are one trial block of the stack matvec. It does not reorthogonalize and
-runs 200 steps by default. At 200 steps both the plain and the CGS2 recursion
-match the exact resolvent to ≤ 1e-5 of max ε₂ on CrI3 8×8×1 SOC (claim 2848);
-at 100 steps both are truncated, about 0.5% of max ε₂ off.
-$\varepsilon_2^\alpha(\omega) = \frac{16\pi^2}{\Omega N_k n_{spin} n_{spinor}}
-\|d^\alpha\|^2 \left(-\mathrm{Im}\,g(\omega + i\eta)/\pi\right)$, as in
-BerkeleyGW's `absh.f90`.
+runs 200 steps by default. Claim 2848 measured the solver on CrI3 8×8×1 SOC
+(with bare V as W, before R56) against a 500-state sum over states plus a
+deflated CGS2 tail: at 200 steps both the plain and the CGS2 recursion agree
+with it to ≤ 1e-5 of max ε₂; at 100 steps both are truncated, 0.2–0.5% of
+max ε₂ off. The ε₂ normalization and its BerkeleyGW match are in
+`src/bse/STATUS.md`.
 
-Per-state dipoles: `bse_jax --lanczos --tda --write-eigs N --dipole dipole.h5`
-contracts each written eigenvector with the dipole
-(`absorption_common.exciton_dipole_projections`, on each rank's own eigenvector
-tile) and stores $\langle 0|\hat r_\alpha|S\rangle$ as `exciton_data/dipoles`,
-shape (1, N, 3, 2), in bohr. `--dipole` requires `--write-eigs` and `--tda`.
+Per-state dipoles: `bse_jax --lanczos --tda --bse --write-eigs N --dipole
+dipole.h5` contracts each written eigenvector with the dipole
+(`absorption_common.exciton_dipoles_distributed`, blocked over each rank's own
+eigenvector tile) and stores $\langle 0|\hat r_\alpha|S\rangle$ as
+`exciton_data/dipoles`, shape (1, N, 3, 2), in bohr. Flag rules:
+[drivers](../drivers.md#bse-bsebse_jax).
 
 ## Outputs
 
-- `bse.out`: the run report (`--report-file`).
+- `bse.out`: the run report of the `--lanczos` route (`--report-file`;
+  FEAST and KPM refuse that flag).
 - `eigenvectors.h5` (`--write-eigs`), rank 0, BerkeleyGW layout
   (`src/bse/eigenvectors.h5.spec`) through `bse_window.write_eigenvectors_stream`:
   `exciton_data/eigenvalues` in eV; `exciton_data/eigenvectors`
   (1, N, N_k, n_c, n_v, 1, 2); full BSE adds `eigenvectors_coupling` (Y). The
-  valence axis is reversed on write (BerkeleyGW `iv = 1` is the highest valence
-  band). The writer refuses to trim nonzero amplitude when the declared window
-  is narrower than the solved one.
-- `absorption_haydock.h5` (ε₂, ε₁, JDOS, α, β, norms) and one
-  `absorption_haydock_<pol>_eh.dat` per polarization.
+  index conventions against BerkeleyGW, including the reversed valence axis,
+  are in `src/bse/STATUS.md` ("Index ordering"). The writer refuses to trim
+  nonzero amplitude when the declared window is narrower than the solved one.
+- `absorption_haydock.h5` (ε₂, ε₁, JDOS, α, β, norms; with `--no-eps1` the
+  ε₁ dataset is ones) and one `absorption_haydock_<pol>_eh.dat` per
+  polarization, `<pol>` = `b1`, `b2`, `b3`.
 
 ## W_BSE: the ladder in GW screening
 
@@ -217,8 +228,7 @@ $W(z) - v = v(z - H)^{-1}v$, with the BSE Hamiltonian's static direct rung in
 $H$ (`gw.screening_bse`, `bse.w_ladder`). The stage persists the RPA W(0), then
 solves the resolvent one z at a time with ψ held 2-D at 1/P, by GMRES with a
 recycled spectral deflation per (q, z) (`bse_feast.harvest_spectral_deflation`).
-It runs under `compute_mode = cohsex` and `gn_ppm`. Keys, supported modes and
-refusals: [input reference](../input_reference.md).
+Keys, supported modes and refusals: [input reference](../input_reference.md).
 
 ## Refusals
 
@@ -234,22 +244,22 @@ refusals: [input reference](../input_reference.md).
 | `BseWindowOutsideZetaTrainingError` | `bse_window.assert_bse_window_in_zeta_training` | a window band outside the ζ fit legs |
 | band-window degeneracy | `common.band_degeneracy.resolve_band_window` | a window edge inside a multiplet under `--band-degeneracy strict` |
 | route-ignored flag | `bse_jax.parse_args` | a flag set on a route that does not read it; a retired flag |
+| non-TDA reciprocity preflight | `bse_nontda.check_restart_reciprocity` | `--lanczos` without `--tda`, with W on: a restart whose W fails the q ↔ −q reciprocity check, before the dense build |
+| non-TDA dense size | `bse_nontda` (`_DENSE_N_MAX`) | `--lanczos` without `--tda` at N = n_c,pad · n_v,pad · N_k > 4096 |
+| Haydock device count | `absorption_haydock.run_haydock` | fewer than two devices |
 
 ## Limits
 
-These are open entries in the development tracker `KNOWN_LORRAX_ISSUES.md`,
-named by title there; the entries hold the mechanism and the evidence.
-
-- Four-current BSE: only a stored charge W0 is read (the
-  `bse_static_w_bispinor_sectors` refusal above).
-- QSGW → BSE uses the parent DFT ψ with `--eqp`, the diagonal approximation.
-  QP ψ need a restart generated from `WFN_qp.h5`.
-- "MPA × W_BSE is still refused on parent-route bundles".
-- "W_BSE ladder resolvent does not converge at finite q on Si 4³ SOC
-  (preconditioned spectrum straddles zero)".
-- "Spinor Kramers TRIM-closure gate is tighter than the WFN's own error".
-- "The unchunked w_bse ladder assembly loses q=0 Hermiticity at production
-  size" (set `ladder_probe_chunk = 64`).
-- "Scalar-Si w_bse wedge reciprocity residual sits at ~2e-3 after TRS pair
-  gauging".
-- "`psp.get_dipole_mtxels`: the j-averaged (`soc=False`) velocity is all NaN".
+- A four-current bundle is read only with a stored W0: the BSE direct term has
+  no packed CC/CT/TC/TT handoff (`gw/static_screening.py:86`).
+- The BSE reads ψ from the restart, which holds the deck WFN's states. `--eqp`
+  replaces energies only (`bse/bse_window.py:569`), so a QSGW BSE with QP ψ
+  needs a GW restart generated from `WFN_qp.h5`.
+- Full BSE through `--lanczos` is dense and stops at N = 4096
+  (`bse/bse_nontda.py:95`); the matrix-free solver is not reachable from the
+  CLI.
+- `compute_mode = mpa` with `screening_diagrams = w_bse` refuses at setup
+  (`GATE parent_screening_diagrams`, `file_io/restart_bundle.py:4369`).
+- The `w_bse` ladder refuses a degenerate TRIM block whose Kramers misclosure
+  exceeds 1e-8 of its scale (`GATE trs_gauge_block_not_theta_closed`,
+  `bse/bse_w_exact.py:538`).

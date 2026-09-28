@@ -60,18 +60,14 @@ lx run -N 1 -G 4 -n 4 -- env PYTHONPATH="$SOURCE_PATH" \
 
 # 2b) Eigenvector route — only if you need per-state oscillators.
 #     Peak height converges SLOWLY with n_eig (n=100 ≈ 18% of full peak).
-#     For fair vs-BGW comparison: use eigvals_to_eps2.py with matched n_max.
+#     --dipole stores <0|r|S> per written state in eigenvectors.h5.
 lx run -N 1 -G 4 -n 4 -- env PYTHONPATH="$SOURCE_PATH" \
   python3 -u -m bse.bse_jax \
     -i cohsex.in --eqp <bgw_run>/eqp.dat \
     --bse --lanczos --tda \
     --n-val 4 --n-cond 4 --n-occ 8 --n-reorth -1 \
-    --max-lanczos-iter 2400 --n-eig 100 --px 2 --py 2 --write-eigs 100
-lx run -N 1 -G 1 -n 1 -- env PYTHONPATH="$SOURCE_PATH" \
-  python3 -u -m bse.absorption_eigvecs \
-    --eigenvectors eigenvectors.h5 --dipole dipole_p_only.h5 \
-    --n-occ 8 --V-cell <V_bohr3> --eta-eV 0.15 --no-eps1 \
-    --out-prefix absorption_eigvec
+    --max-lanczos-iter 2400 --n-eig 100 --px 2 --py 2 --write-eigs 100 \
+    --dipole dipole_p_only.h5
 ```
 
 The source path is on the payload side because the Perlmutter container
@@ -80,25 +76,21 @@ requested checkout and all first-party services.
 
 ## Comparing spectra at custom η / matched n_eig
 
-Both BGW (`absorption.x`) and LORRAX (`absorption_eigvecs`) write a
-common-format `eigenvalues.dat` (or `eigenvalues_b1.dat` per
-polarisation): `# neig`, `# vol`, `# nspin, nspinor` header followed
-by `(E_eV, |d|², Re d, Im d)` rows. **Use `bse.eigvals_to_eps2` to
-broaden either at any η and any truncation:**
+The sum-over-states ε₂ of the LORRAX eigenvector route, at any η and any
+truncation, comes from the saved dipoles:
 
-```bash
-python3 -m bse.eigvals_to_eps2 \
-    --files <bgw>/eigenvalues.dat <lorrax>/eigenvalues_b1.dat \
-    --eta-eV 0.05 --n-max 100 \
-    --label "BGW (100)" "LORRAX (100)" \
-    --out cmp.png
+```python
+from bse.absorption_common import load_exciton_dipoles_h5, eps2_from_exciton_dipoles
+E_Ry, D = load_exciton_dipoles_h5("eigenvectors.h5")        # (N,), (N, 3)
+eps2 = eps2_from_exciton_dipoles(omegas_Ry, E_Ry[:n_max], D[:n_max], eta_Ry,
+                                 V_cell, n_k, n_spin, n_spinor)   # (n_omega, 3)
 ```
 
-Calibration: at η = 0.20 with all 500 states, the script reproduces
-BGW's `absorption_eh.dat` peak (143.7) to within 0.4%. At matched
-`n_max`, the LORRAX/BGW peak ratio reflects the real per-state
-oscillator-strength agreement (eigenvector convergence + ISDF
-compression).
+It uses the Haydock route's prefactor and Lorentzian. There is no reader for
+BerkeleyGW's `eigenvalues.dat` on main; broaden it with the same Lorentzian
+(`absorption_common.lorentzian_broaden`) and prefactor. At matched `n_max`,
+the LORRAX/BGW peak ratio reflects the per-state oscillator-strength
+agreement (eigenvector convergence + ISDF compression).
 
 ## Common mistakes — every one has bitten an agent
 

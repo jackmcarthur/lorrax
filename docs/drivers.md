@@ -319,7 +319,7 @@ includes it. The Hamiltonian, the inputs, the screened W(0) handoff, the
 matvec and its kernels, the solvers, the dipoles, the outputs and the refusals
 are on [the BSE page](architecture/bse.md).
 
-Invoke: `python -u -m bse.bse_jax -i cohsex.in --lanczos --bse ...` in the GW
+Invoke: `python -u -m bse.bse_jax -i cohsex.in --lanczos --tda --bse ...` in the GW
 run directory. The mesh is the run's square startup mesh; `--px`/`--py` must
 be square and use every device. The CLI is strict: an unknown flag refuses,
 and so does a flag the chosen route (Lanczos, `--kpm-dos`, or the default
@@ -330,8 +330,8 @@ Lanczos-only.
 |---|---|---|
 | `--lanczos` | off | Krylov eigensolve; without it the driver runs FEAST (`bse_feast`) |
 | `--bse` / `--rpa` | RPA | `--bse` adds $-W$ |
-| `--tda` | off | resonant block only |
-| `--n-val` / `--n-cond` / `--n-occ` | 4 / 4 / auto | transition window; valence resolved from $\varepsilon < E_F$ (`--n-occ`: *Lanczos*) |
+| `--tda` | off | resonant block only; without it every route solves the full BSE, and `--lanczos` goes to the dense `bse_nontda` solver, ignoring `--solver`, `--block-size` and `--n-reorth` |
+| `--n-val` / `--n-cond` / `--n-occ` | 4 / 4 / the WFN's `ifmax` | transition window; the occupied-band count is `--n-occ` (*Lanczos*), else the deck WFN's `ifmax` |
 | `--band-degeneracy` | `strict` | *Lanczos*. A window edge inside a multiplet: `strict` refuses and names working counts, `snap` widens outward, `off` proceeds; tolerance `--degeneracy-tol-ry` (1 meV) |
 | `--solver` | `lanczos` | *Lanczos*. `lanczos` (spectrum shape), `davidson` (per-state convergence, `--davidson-*`), `trlan` (thick restart, bounded memory, `--trlan-*`) |
 | `--block-size` / `--max-lanczos-iter` / `--n-reorth` | 1 / auto / −1 | *Lanczos*. Block width / total Krylov dimension / reorthogonalization window (−1 = full, needed for degenerate spinor spectra) |
@@ -339,7 +339,7 @@ Lanczos-only.
 | `--dipole FILE` | none | *Lanczos*, with `--write-eigs` and `--tda`: store each written state's dipole $\langle 0\lvert\hat r\rvert S\rangle$ from `FILE` (a `dipole.h5`) in `eigenvectors.h5` |
 | `--eqp FILE` | none | *Lanczos*. Diagonal QP energies from the wedge `eqp1.dat`, unfolded through the symmetry service; the restart must be proved to come from the same unrotated WFN |
 | `bse_k_grid` (deck) | `""` | fine grid "NX NY NZ", each axis at least the coarse extent |
-| `head_minibz_average` (deck) | false | mini-BZ cell average of the exchange head ([LT head](theory/lt-exchange-head.md)); also rebuilds the q = 0 tile on `bse_k_grid` |
+| `head_minibz_average` (deck) | false | read only under `bse_k_grid`: rebuilds the q = 0 exchange tile with the fine grid's mini-BZ head and takes the W head's Γ-cell reference from the analytic sphere ([LT head](theory/lt-exchange-head.md)); must match the GW run |
 
 Forgetting `--bse` gives RPA. Absorption comparisons with BerkeleyGW:
 `src/bse/BGW_COMPARE.md`; module status: `src/bse/STATUS.md`.
