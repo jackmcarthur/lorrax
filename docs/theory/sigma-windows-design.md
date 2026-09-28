@@ -39,8 +39,19 @@ and the SC equations are in [self consistency](../self_consistency.md).
   2 eV outer pad, enlarged to the ω endpoints; sampled at the deck η and
   ε = 1e-4 (ruling Q2). Crossing and non-crossing product windows are planned
   once with their reserves (`sigma_box_plan`).
-- **Far patches.** Every rotating DFT energy outside the near support, padded
-  by 2 eV and merged across holes ≤ 4 eV (`qp_support.far_patches_ev`). A
+- **Map-0 probe.** Map 0 first evaluates Σ on that plan. If a protected
+  state's map-0 QP estimate (the diagonal of the map-0 QSGW Hamiltonian)
+  lies outside the support, or a rotating one outside the near support and
+  every far patch, the plan is made once from the DFT energies and those
+  estimates, with the same pad, and map 0 is re-evaluated with the same W
+  (`sc_iteration.gw_iteration_map`). An insulator's Σ frame is the DFT
+  midgap, so the map-0 gap opening is not absorbed by the frame: MoS2 3×3
+  conduction states move +2.4 to +3.1 eV and the Si 4³ conduction top
+  +2.3 eV at map 0, beyond a 2 eV pad about the DFT energies.
+- **Far patches.** Every rotating DFT energy (and map-0 estimate) outside the
+  near support, padded by 2 eV and merged across holes ≤ 4 eV
+  (`qp_support.far_patches_ev`); a patch that reaches the near support starts
+  1e-3 eV past its edge, so no energy falls between the two. A
   patch above E_F is broadened to η_far = 1 eV, one below to 2 eV (ruling
   Q4; INVARIANTS 12 exception for rotating-endpoint reads only), sampled at
   η_far/2. Far patches join the near plan: each crossing window splits by the
@@ -48,11 +59,13 @@ and the SC equations are in [self consistency](../self_consistency.md).
   (`FAR_PATCH_EPS`); sign-definite windows serve far frequencies at the near η.
 - **Held.** No map repads, refits or rebuilds a window. RECIPE3's W line
   ladder reads this one map-0 support.
-- **Escape refuses** (ruling Q5). A protected read stencil outside the held
-  support, or a product window whose current states or poles leave its held
-  box, refuses with `GATE sigma_plan_escape`, naming the state or window.
-  There is no clamp and no rebuild. The remedy is a deck change: protect
-  fewer edge states or move the ω endpoints.
+- **Escape refuses** (ruling Q5). A protected state whose Σ read (its
+  current energy) leaves the held support refuses with
+  `GATE sigma_plan_escape`, naming the state. There is no clamp and no
+  rebuild. The ±0.5 eV Z stencil is one-sided at an edge by design
+  (`eqp_bgw.compute_z_factor_from_omega_grid`) and is counted, not refused.
+  A product window whose live box leaves its held box (W poles move between
+  maps) keeps its rule and is counted in the receipt (`escaped`).
 
 ## Hamiltonian
 
