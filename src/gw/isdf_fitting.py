@@ -704,6 +704,14 @@ def fit_zeta_to_h5(
                      f"{'' if v == 0 else f', {_bname} basis: ' + ' + '.join(f'({w:.3g})U{i}{j}' for w, i, j in terms)}): "
                      f"{k_unfold_plan.n_parent} -> {nk_tot} k rows")
             C_q = None
+            # Complex channel weights (circular currents): each Cartesian vertex
+            # pair's RL block is conj(LR) at -q, so complete every pair Gram
+            # before weighting it, exactly as isdf.zeta_mubatch completes each
+            # Z pair before the same weights.  Completing the weighted sum
+            # would conjugate the weights on the RL half (channel c's LR plus
+            # the conjugate channel's RL).
+            _per_pair_completion = (_q_neg_idx is not None and any(
+                complex(w).imag != 0.0 for w, _, _ in terms))
             for w, i, j in terms:
                 part = c_q_from_psi_sm(
                     kgrid=kgrid, mesh_xy=mesh_xy,
@@ -711,6 +719,11 @@ def fit_zeta_to_h5(
                     weight_l=weight_l_face, weight_r=weight_r_face,
                     gemm=_face_gemm, k_unfold_plan=k_unfold_plan,
                     gamma_L=i, gamma_R=j)
+                if _per_pair_completion:
+                    part = complete_ordered_pair_normal_equations(
+                        jax.lax.with_sharding_constraint(
+                            part.reshape(nq, n_rmu_padded, n_rmu_padded), flat_shard),
+                        _q_neg_idx)
                 if len(terms) > 1 or w != 1.0:
                     part = w * part
                 C_q = part if C_q is None else C_q + part
@@ -728,7 +741,7 @@ def fit_zeta_to_h5(
                 # Rank-local by construction (Fe3GeTe2 P36/P16 OOM, 2026-09-21).
                 C_q_flat = add_pad_diagonal_sharded(
                     C_q_flat, mu_basis.active_mask, float(n_rmu), mesh_xy=mesh_xy)
-            if _q_neg_idx is not None:
+            if _q_neg_idx is not None and not _per_pair_completion:
                 C_q_flat = complete_ordered_pair_normal_equations(
                     C_q_flat, _q_neg_idx)
             # IBZ cascade: slice C_q to the stored rows before the per-q factor.
