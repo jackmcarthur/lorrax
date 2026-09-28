@@ -286,6 +286,20 @@ def prepare_photon_carriers(wfns, wfns_transverse, mu_bases, *,
                            (left.psi_nmu, right.psi_nmu), left.enk)
 
 
+@lru_cache(maxsize=8)
+def _tt_only(mesh_xy, width):
+    """Zero the charge rows/columns [:width] of each rank's face tile: one program per mesh and width."""
+    from common.shard_map import shard_map
+    return jax.jit(shard_map(lambda x: x.at[:, :width, :].set(0).at[:, :, :width].set(0),
+        mesh=mesh_xy, in_specs=P(None, "x", "y"), out_specs=P(None, "x", "y"), check_vma=False))
+
+
+@lru_cache(maxsize=8)
+def _face_zeros(mesh_xy, shape):
+    """A zero face-tiled complex operator [.., N, N]: one program per mesh and shape."""
+    return jax.jit(lambda: jnp.zeros(shape, complex), out_shardings=NamedSharding(mesh_xy, P(None, "x", "y")))
+
+
 def photon_static_contact(wfns, meta, *, mesh_xy, layout, vertex,
                           occupation_state, sample_plan, execute, receipt):
     r"""Build the TT Ward contact ``Pi_FD(0,0)``, with ``Pi_grid`` and centroid D, once per bank.
@@ -304,7 +318,6 @@ def photon_static_contact(wfns, meta, *, mesh_xy, layout, vertex,
     a metal.  All returned packed operators are ``[1,N,N]`` at
     ``P(None,'x','y')``.
     """
-    from common.shard_map import shard_map
     from .static_gauge_response import (fermi_dirac_current_drude,
                                          photon_diagonal_current_faces)
     from .w_isdf import _w_solve_pref_scalar, matsubara_rule
@@ -313,7 +326,6 @@ def photon_static_contact(wfns, meta, *, mesh_xy, layout, vertex,
     live = (np.arange(energy.shape[1])[None, :]
             < census["band_stop"]-census["band_start"])
     live = np.broadcast_to(live, energy.shape)
-    face = NamedSharding(mesh_xy, P(None, "x", "y"))
     if occupation_state is not None:
         if not np.array_equal(np.asarray(occupation_state.f_kn), np.asarray(wfns.occ)):
             raise ValueError("GATE photon_contact_state: bank and FD occupations differ")
@@ -352,15 +364,12 @@ def photon_static_contact(wfns, meta, *, mesh_xy, layout, vertex,
             stream_weights(wfns, np.stack((f, np.zeros_like(f))), mesh_xy),
             stream_weights(wfns, np.stack((u, np.zeros_like(u))), mesh_xy),
             jnp.asarray([lo, hi])), "static_reference")
-        drude = jax.jit(lambda: jnp.zeros((1, layout.packed_extent, layout.packed_extent), complex),
-                        out_shardings=face)()
+        drude = _face_zeros(mesh_xy, (1, layout.packed_extent, layout.packed_extent))()
         receipt["static_rule"] = dict(provenance=quad.provenance, max_error=quad.max_error)
         count = len(quad.tau)
     # Remove charge rows/columns locally; only TT has a body contact.
     width = layout.carrier_extent(0)//layout.mesh_side
-    tt_only = shard_map(lambda x: x.at[:, :width, :].set(0).at[:, :, :width].set(0),
-        mesh=mesh_xy, in_specs=P(None, "x", "y"), out_specs=P(None, "x", "y"), check_vma=False)
-    pi_fd = jax.jit(tt_only)(raw[:, 0] * (_w_solve_pref_scalar(meta)/float(meta.cell_volume)))
+    pi_fd = _tt_only(mesh_xy, width)(raw[:, 0] * (_w_solve_pref_scalar(meta)/float(meta.cell_volume)))
     pi_grid = pi_fd + drude
     contact = pi_fd
     receipt["correlation_count"] += count

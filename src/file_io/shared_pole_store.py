@@ -606,8 +606,8 @@ def _k_extent(meta, header, live, *, record):
 
 
 @lru_cache(maxsize=None)
-def _zero_columns(mesh, spec, shape):
-    """Zero factor columns [nq, n_canonical, components, width] on the writer's layout."""
+def _zeros_program(mesh, spec, shape):
+    """A complex zero array of ``shape`` sharded ``spec``: one program per mesh, spec and shape."""
     return jax.jit(lambda: jnp.zeros(shape, jnp.complex128), out_shardings=NamedSharding(mesh, spec))
 
 
@@ -674,7 +674,7 @@ def _finalize_model(path, *, meta, header, basis=None, one_batch=None):
                     io.write_slab("factor", factor)
                     if kmax > written:
                         pad = mesh_divisible_shape((nq, basis.n_canonical, components, kmax-written), mesh, spec)
-                        io.write_slab("factor", _zero_columns(mesh, spec, tuple(pad))(), offset=(0, 0, 0, written))
+                        io.write_slab("factor", _zeros_program(mesh, spec, tuple(pad))(), offset=(0, 0, 0, written))
                     io.write_slab("poles2_ry2", poles)
             with timing.section("sync_writes"):
                 io.sync_writes()
@@ -698,8 +698,7 @@ def _finalize_model(path, *, meta, header, basis=None, one_batch=None):
                     poles = io.read_slab(batch["name"] + "/poles2",
                         shape=(hi-lo, kmax), offset=(0, 0), partition_spec=P())
                 else:
-                    factor = jax.jit(lambda: jnp.zeros(read_shape, jnp.complex128),
-                                     out_shardings=NamedSharding(mesh, spec))()
+                    factor = _zeros_program(mesh, spec, tuple(read_shape))()
                     poles = jnp.ones((hi-lo, kmax), jnp.float64)
                 active = jnp.arange(kmax)[None, :] < jnp.asarray(header["K"][lo:hi])[:, None]
                 poles = jnp.where(active, poles, 1.0)
@@ -1159,8 +1158,7 @@ def read_shared_pole_faces(io, q_span, *, meta, header, column_span=None, basis=
     if header["Kmax"] == 0 and column_span is None:
         _admit(ledger,"empty_faces",8*(hi-lo))
         shape = (hi-lo,basis.n_packed,components,0)
-        faces = {axis: jax.jit(lambda: jnp.zeros(shape,jnp.complex128),
-                              out_shardings=NamedSharding(io.mesh,P(None,axis,None,"y" if axis == "x" else "x")))()
+        faces = {axis: _zeros_program(io.mesh, P(None,axis,None,"y" if axis == "x" else "x"), shape)()
                  for axis in orientations}
         return (faces.get("x"), faces.get("y"), jnp.ones((hi-lo,0),jnp.float64),
                 jnp.zeros(hi-lo,jnp.int64))
@@ -1478,11 +1476,8 @@ class ResidentBankPayload:
         return value if layout == "face" else _bank_face_to_batch(self.mesh, value.ndim)(value)
 
 
-@lru_cache(maxsize=None)
 def _resident_zeros(mesh, shape):
-    spec = P(*((None,) * (len(shape) - 2)), "x", "y")
-    return jax.jit(lambda: jnp.zeros(shape, jnp.complex128),
-                   out_shardings=NamedSharding(mesh, spec))
+    return _zeros_program(mesh, P(*((None,) * (len(shape) - 2)), "x", "y"), tuple(shape))
 
 
 def _logical_mask(value, logical):
@@ -2813,8 +2808,7 @@ def export_shared_pole_outputs(handle, *, meta, config, mesh_xy, source_wfn,
                 try:
                     canonical = (io.read_slab("factor", shape=shape,
                         offset=(q, 0, 0, 0), partition_spec=spec) if model["Kmax"] else
-                        jax.jit(lambda: jnp.zeros(shape, jnp.complex128),
-                            out_shardings=NamedSharding(mesh_xy, spec))())
+                        _zeros_program(mesh_xy, spec, tuple(shape))())
                     b = basis.pack_axis(canonical, 1, spec=spec)
                     poles = (io.read_slab("poles2_ry2", shape=(1, shape[-1]),
                         offset=(q, 0), partition_spec=P()) if model["Kmax"] else
