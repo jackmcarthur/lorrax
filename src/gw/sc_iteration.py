@@ -3684,6 +3684,9 @@ def _gw_iteration_map_once(state: SCState, inputs: SCInputs) -> SCState:
           and "probe_W_by_role" in _probe_session):
         # Map 0's second pass: same input state, same W; only the plan moved.
         W_by_role = _probe_session.pop("probe_W_by_role")
+        _capacity = _probe_session.pop("probe_capacity", None)
+        if _capacity is not None:
+            inputs.meta.shared_pole_capacity = _capacity
         inputs.print_fn("    SC map 0: W reused from the probe pass; Sigma "
                         "re-evaluated on the plan fixed from the probe")
     elif elementwise_mpa and inputs.quad is None:
@@ -3703,6 +3706,11 @@ def _gw_iteration_map_once(state: SCState, inputs: SCInputs) -> SCState:
             producer=_live_screening, quad_override=stored_ceiling)
     else:
         W_by_role = _screening(mpa_plan, iteration_head_response)
+    if (_probe_session is not None and int(state.iteration) == 0
+            and "probe_energy_ev" not in _probe_session
+            and getattr(inputs.meta, "shared_pole_capacity", None) is not None):
+        # The ledger as this W left it, for a possible second map-0 pass.
+        _probe_session["probe_capacity"] = inputs.meta.shared_pole_capacity.snapshot()
 
     # MPA owns a shared complex-frequency model rather than the finite role
     # table above.  Its fit mapping is not a body-W role mapping; without
@@ -4044,10 +4052,14 @@ def _gw_iteration_map_once(state: SCState, inputs: SCInputs) -> SCState:
                        f"[{grid[0]:+.3f}, {grid[-1]:+.3f}] eV (probe range "
                        f"[{float(probe[prot].min()):+.3f}, {float(probe[prot].max()):+.3f}] eV "
                        "protected); planning once from DFT and probe energies")
+            _capacity = _session.get("probe_capacity")
             _session.clear()
             _session["probe_energy_ev"] = probe
             _session["probe_W_by_role"] = W_by_role
+            if _capacity is not None:
+                _session["probe_capacity"] = _capacity
             raise _PlanFromProbe()
+        _session.pop("probe_capacity", None)
         _record_sc(inputs, "    SC map 0 probe: every QP estimate inside the plan")
 
     # The occupation state CARRIED below is the ENTRY solve consumed by this
