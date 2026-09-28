@@ -21,8 +21,8 @@ def local_reduction_fits(plan, side, budget_bytes):
     ``distrib_la.fits_local`` prices exactly that. A native workspace query
     that refuses the side (nonzero status) means the local eigensolver cannot
     run it at all, so the answer is also False; a build without the query
-    still raises. One owner for the routing admission and the round's own
-    admission, so a parent the route admits locally always reduces locally.
+    still raises. The constructor asks it of every local round's actual side;
+    a round that does not fit reruns the map on the face (``LocalPencilUnfit``).
     """
     import distrib_la
     try:
@@ -210,17 +210,6 @@ def constructor_execution(meta, resolution, recipe, *, mesh, ledger, upstream,
             selection_face_count=selection_faces,
             retained_output_upper_bound_bytes_per_rank=retained_outputs,
             local_selection=resident_selection, local_reduction=resident_reduction)
-    # A parent that cannot reduce on one device runs on the face: admission,
-    # not a refusal. The conservative side bounds every round's actual side,
-    # so the round's own admission (constructor ``_admit``) then always fits.
-    if cross_original_sides is None and not local_reduction_fits(
-            local.eigenplan(side), side, ledger.device_budget_bytes_per_rank):
-        return 'face', dict(
-            reason='local parent pencil (conservative side) cannot reduce on one device',
-            requested_layout=resolution.layout, conservative_pencil_side=side,
-            selection_face_count=selection_faces,
-            retained_output_upper_bound_bytes_per_rank=retained_outputs,
-            local_selection=resident_selection, local_reduction=None)
     selection = preview('selection', **selection_args)
     reduction = None if defer_reduction else preview(reduction_phase, **reduction_args)
     admitted = all(row['device_budget_status'] == 'PASS'
