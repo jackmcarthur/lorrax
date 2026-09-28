@@ -493,6 +493,24 @@ def write_shared_pole_model(path, b, poles2, K, *, q_span, meta, tables,
         if all(header["written_q"]):
             return _finalize_model(path, meta=meta, header=header, basis=basis)
         return header
+    if (lo, hi) == (0, header["n_q_irr"]):
+        # One batch holds every parent (the scalar constructor's only call):
+        # its factor goes straight to the final datasets, with no staging
+        # group written, synced and read back. The file keeps an empty census
+        # (written_q all False) until finalization commits the census with
+        # the digest, so an interrupted write refuses resume by name and is
+        # rebuilt. Nothing is staged (no parent written), so recreating the
+        # file loses nothing.
+        with SlabIO(path, mode="w", mesh=mesh) as io:
+            _write_metadata(io, header)
+            _write_header(io, header)
+        census = dict(header, written_q=[True] * (hi-lo), K=K.tolist(),
+                      batches=[{"lo": lo, "hi": hi, "width": width, "name": None}],
+                      construction_receipts=[{"q_span": [lo, hi], "receipt": receipts}])
+        # The finalizer consumes the canonical factor; this frame holds no reference.
+        batch = [canonical, poles2]
+        del canonical
+        return _finalize_model(path, meta=meta, header=census, basis=basis, one_batch=batch)
     if previous is None:
         with SlabIO(path, mode="w", mesh=mesh) as io:
             _write_metadata(io, header)
@@ -537,7 +555,8 @@ def finalize_shared_pole_model(path, *, meta, expected_identity, basis=None):
     _check_identity(header["identity"], expected_identity)
     basis = _check_basis(meta, header, basis)
     if header["schema"] != SCHEMA or not all(header["written_q"]):
-        _refuse("finalization requires every staged parent")
+        _refuse("finalization requires every staged parent (a one-batch write "
+                "stages none: an interrupted one is rebuilt, not resumed)")
     if header["finalized"]:
         return validate_shared_pole_model(
             path, expected_identity=expected_identity, mesh_xy=meta.mu_basis.mesh_xy,
@@ -586,20 +605,44 @@ def _k_extent(meta, header, live, *, record):
     return extent
 
 
+@lru_cache(maxsize=None)
+def _zero_columns(mesh, spec, shape):
+    """Zero factor columns [nq, n_canonical, components, width] on the writer's layout."""
+    return jax.jit(lambda: jnp.zeros(shape, jnp.complex128), out_shardings=NamedSharding(mesh, spec))
+
+
 @timing.timed("shared_pole_store.finalize")
-def _finalize_model(path, *, meta, header, basis=None):
+def _finalize_model(path, *, meta, header, basis=None, one_batch=None):
+    """Write the final datasets and commit the census with the digest.
+
+    ``one_batch=[canonical, poles2]`` (every parent, from the writer) is
+    consumed: its columns go straight to the final datasets. Otherwise the
+    staged batches are read back one at a time. Per-rank device peak of the
+    one-batch route, admitted here: N_q (16 c N_can (ceil(K_p/P_y) +
+    ceil(max(K_max - K_p, 0)/P_y))/P_x + 24 K_max) bytes, K_p the writer's
+    column extent; the staged route admits one batch read,
+    b (16 c N_can ceil(K_max/P_y)/P_x + 24 K_max).
+    """
     basis = meta.mu_basis if basis is None else basis
     mesh = basis.mesh_xy
     components = header.get("factor_components", 1)
     nq, nmu = header["n_q_irr"], header["n_mu_logical"]
     kmax = _k_extent(meta, header, max(header["K"]), record=True)
-    panel = 16*components*basis.n_canonical*((kmax+int(mesh.shape["y"])-1)//int(mesh.shape["y"]))/int(mesh.shape["x"])
+    px, py = int(mesh.shape["x"]), int(mesh.shape["y"])
+    columns = lambda k: 16*components*basis.n_canonical*((k+py-1)//py)/px
+    panel = columns(kmax)
     batch_width = max(v["hi"] - v["lo"] for v in header["batches"])
-    _admit(_capacity(meta), "finalize", batch_width*(int(panel)+24*kmax),
-           device_panel=batch_width*max(int(panel),8*kmax), native_host=True)
+    if one_batch is None:
+        _admit(_capacity(meta), "finalize", batch_width*(int(panel)+24*kmax),
+               device_panel=batch_width*max(int(panel),8*kmax), native_host=True)
+    else:
+        written = int(one_batch[0].shape[-1])
+        _admit(_capacity(meta), "finalize", nq*(int(columns(written) + columns(max(kmax-written, 0)))+24*kmax),
+               device_panel=nq*max(int(columns(max(written, kmax))),8*kmax), native_host=True)
     header["Kmax"] = kmax
     header["compact_payload_bytes"] = nq * (16*nmu*components*kmax + 8*kmax + 8)
-    header["staging_payload_bytes"] = sum((v["hi"]-v["lo"]) * v["width"] * (16*nmu*components+8) for v in header["batches"])
+    header["staging_payload_bytes"] = sum((v["hi"]-v["lo"]) * v["width"] * (16*nmu*components+8)
+                                          for v in header["batches"] if v["name"] is not None)
     header["peak_payload_bytes"] = header["compact_payload_bytes"] + header["staging_payload_bytes"]
     if isinstance(path, ResidentSectorModel):
         path.finalize_payload(header, n_canonical=basis.n_canonical)
@@ -616,7 +659,30 @@ def _finalize_model(path, *, meta, header, basis=None):
     with SlabIO(path, mode="a", mesh=mesh) as io:
         io.create_dataset("factor", shape=(nq, nmu, components, kmax), dtype=np.complex128)
         io.create_dataset("poles2_ry2", shape=(nq, kmax), dtype=np.float64)
-        for batch in header["batches"]:
+        if one_batch is not None:
+            factor, poles = one_batch
+            one_batch.clear()
+            spec = P(None, "x", None, "y")
+            active = jnp.arange(kmax)[None, :] < jnp.asarray(header["K"])[:, None]
+            poles = jnp.where(active, jnp.pad(poles[:, :kmax], ((0, 0), (0, max(kmax-written, 0))),
+                                              constant_values=1.0), 1.0)
+            with timing.section("write_slab"):
+                # write_slab keeps min(A.shape, dataset) per axis: rows past
+                # N_mu and columns past K_max are dropped. Columns past each
+                # parent's K are exact zeros (the writer's sentinel gate).
+                if kmax:
+                    io.write_slab("factor", factor)
+                    if kmax > written:
+                        pad = mesh_divisible_shape((nq, basis.n_canonical, components, kmax-written), mesh, spec)
+                        io.write_slab("factor", _zero_columns(mesh, spec, tuple(pad))(), offset=(0, 0, 0, written))
+                    io.write_slab("poles2_ry2", poles)
+            with timing.section("sync_writes"):
+                io.sync_writes()
+            del factor, poles, active
+            # The validator's written_q array; header_json, the resume
+            # authority, keeps the empty census until finish() below.
+            io.write_attr("written_q", np.asarray(header["written_q"], np.int8))
+        for batch in (() if one_batch is not None else header["batches"]):
             # Preserve the constructor's admitted q batch through finalization.
             # Kmax is already known from the committed census; no all-q carrier.
             lo, hi = batch["lo"], batch["hi"]
@@ -644,12 +710,14 @@ def _finalize_model(path, *, meta, header, basis=None):
                 io.sync_writes()
             del factor, poles
         io.write_attr("K", np.asarray(header["K"], np.int64))
-        _write_header(io, header)
+        if one_batch is None:
+            _write_header(io, header)
     header["digest"] = _model_digest(path, header, mesh, capacity=_capacity(meta))
     def finish():
         with h5py.File(path, "a") as f:
             set_commit_state(f, False)
-            del f["staging"]
+            if "staging" in f:
+                del f["staging"]
             header["finalized"] = True
             del f["header_json"]
             f.create_dataset("header_json", data=np.bytes_(_json(header)))
