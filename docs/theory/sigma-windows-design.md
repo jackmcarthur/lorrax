@@ -113,9 +113,34 @@ is the side scissor and P–R is read at the protected energy.
   ±10 eV clip keeps a band-count request within ≤ 500 τ pairs per map on
   insulators and ≤ 1000 on metals.
 
-## Measured
+## Measured (PARTITION, 2026-09-28; not main)
 
-Claim PARTITION (this lane) holds the gate numbers: τ pairs per map, the
-±10 eV std and maxdev against a same-tree all-protected reference at map 0
-and at the fixed point, and the cost against main, on Si 4³, MoS2 3×3,
-Fe 4³ charge, Na 8³ and Fe 4³ bispinor.
+Same node, P4; reference = the same tree with every band protected at the deck
+η and ε 1e-4. Protected states within ±10 eV of E_F; std and maxdev in meV.
+
+| deck | τ pairs/map (main) | map 0 std / maxdev | fixed point std / maxdev | maps |
+|---|---|---|---|---|
+| Si 4³, 8v/8c, ω [−6, 6] | 416 (414) | 5.8 / 44 | 3.4 / 8.9, mean +11 | 7 |
+| Si 4³, 8v/8c, ω [−13, 10] | 446 | 1.1 / 7.7 | 1.9 / 5.9, mean +1.0 | 9 |
+| MoS2 3×3, 10v/12c, ω [−10, 10] | 429 (392) | 1.3 / 5.7 | 3.3 / 13 | 8 |
+| Fe 4³ charge, 6v/8c, ω [−12, 8] | 765 (829) | 28 / 160 | reference stalls | 14 |
+| Na 8³, all 86 bands requested | 654 (1621) | 1.7 / 7.0 | SC-2 only | – |
+
+- **Occupied rotating states set the fixed-point error.** From map 1 on,
+  Σ_x and W are built from every occupied orbital. A rotating occupied
+  state shifts every protected state: the Si Γ valence bottom (−12.3 eV, cut
+  by the ±10 eV clip) moves the Si fixed point +11 meV; protecting it
+  (ω_min −13 eV) leaves +1.0 meV. MoS2's rotating semicore (read at
+  η_far 2 eV, 0.1–0.4 eV off) opens its gap 6 meV. A frozen-W replay cannot
+  see this.
+- **An interleaved P/R edge sets the map-0 error.** Requested bands that
+  end inside a dense spectrum leave rotating states at the same energies as
+  protected ones (Si bands 15–16 at +9.7 eV: 45 meV at map 0; with every
+  state below +10 eV protected: 7.7 meV).
+- **Fe is not attributed.** Protecting every requested state (ω_max +24 eV,
+  924 pairs) moves Fe's map-0 std from 28 to 21 meV and its ±1 eV shell from
+  30 to 4.3 meV; single rows near E_F differ by up to 156 meV in both, and
+  the all-protected Fe reference stalls at 73 meV after 30 maps.
+- Requested states outside the window read far patches: Si Γ valence bottom
+  16 meV at map 0; Fe +10.4…+23.8 eV median 163 meV; Na (2357 (k,state))
+  median 0.22 eV, max 1.2 eV.
