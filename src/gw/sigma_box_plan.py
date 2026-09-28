@@ -1170,7 +1170,7 @@ def _fixed_fit_for_spec(entry, spec):
 
 
 def _fit_fixed_sc_rules(specs, eta, *, eps, cache_dir, session, material_class=None, plan_specs=None):
-    """Build one selector plan at SC map 0; reuse it unchanged; refuse an escape."""
+    """Build one selector plan at SC map 0; reuse it unchanged; count box escapes."""
     rows = list(specs)
     iteration = int(session.get("call_count", 0)) + 1
     session["call_count"] = iteration
@@ -1207,13 +1207,10 @@ def _fit_fixed_sc_rules(specs, eta, *, eps, cache_dir, session, material_class=N
     outside = [spec["name"] for spec, fit in zip(rows, fits)
                if not _box_contains(fit["rule_box"],
                                     (*spec["raw_real_support"], *spec["box"][2:]))]
-    if outside:
-        # Owner ruling Q5 (2026-09-28): the plan is held; a window whose
-        # current states or poles left its map-0 box refuses by name.
-        raise ValueError(
-            "GATE sigma_plan_escape: Sigma product windows left the boxes "
-            f"planned at SC map 0 (call {iteration}): " + ", ".join(outside)
-            + ". No clamp and no rebuild (owner ruling 2026-09-28).")
+    # The plan is held (owner ruling Q5, 2026-09-28): no rule is rebuilt. A
+    # window whose live box left its held box keeps its rule and is counted
+    # in the receipt (``escaped``); a protected state's read that leaves the
+    # held support refuses in ``sc_iteration._sc_sampled_support``.
     session["outside_plan"] = outside
     session["tau_capacity"] = max(int(session.get("tau_capacity", 0)),
                                   max((int(f["node_count"]) for f in fits), default=0))

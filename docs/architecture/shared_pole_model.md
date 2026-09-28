@@ -353,7 +353,7 @@ four-component charge store has its own `representation` row
 | `zero_ritz_policy` | $\lambda\le10^{-6}$ Ry² dropped within $10^{-6}$ factor weight; ordered also `infinite_weight_ok` | yes |
 | `finite_factors_poles` | finite `b`, positive finite active $\Lambda$, exact inert sentinels | yes |
 | `passivity` | V-whitened $-\operatorname{Herm}W_c(i\eta)$ in $[0,I]$ (W 9); ordered reports the anti-Hermitian part | yes |
-| `model_reciprocity` | TRS only: transpose symmetry at transpose-symmetric held samples | yes (TRS) |
+| `model_reciprocity` | TRS only: transpose symmetry at transpose-symmetric held samples, within the float64 bound of the reduction κ_q·(D_ref + 2γ_m), κ_q the kept Gram condition, γ_m = mu/(1 − mu), m = max(n, pencil side) (`shared_pole_gates.reciprocity_rounding_bound`) | yes (TRS) |
 | `held_w` | held $W$, $\partial_sW$ relative errors | diagnostic |
 | `full_m1_defect`, `full_m3_defect` | full-matrix moment defects | WARN only |
 | `capacity` | aggregate live bytes within the device budget; WARN above the $3U$ scaling target, $U=16N_q(n_{\rm spinor}n_\mu)^2/P$ | above budget |

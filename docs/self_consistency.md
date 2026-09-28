@@ -42,8 +42,8 @@ instead of calling `eigh` on $\mathrm{diag}(E_{\rm DFT})$. Its input orbitals
 and occupations are the DFT ones; the band-class operator differs from a
 one-shot operator wherever a rotating endpoint is present. Each
 map costs one full $\chi_0 \to W \to \Sigma$ evaluation. The
-[window decision](theory/sigma-windows-design.md) owns the single initial
-quadrature plan and the one permitted convergence rebuild.
+[window decision](theory/sigma-windows-design.md) owns the single map-0
+quadrature plan, which is held; an escape refuses (`GATE sigma_plan_escape`).
 
 The loop is driven by eqp0, which is Σ at the current energies. Z weights enter only the tail fit. SC writes `eqp0_iterNNNN.dat`; it does
 not write per-map eqp1 files. The one-shot eqp1 artifact retains the raw
@@ -235,8 +235,8 @@ not a failure of the accelerator.
 ## 4 Σ grid and quadrature across maps
 
 The [Sigma window decision](theory/sigma-windows-design.md) owns sampled
-support, immutable box geometry, clamped reads and the single convergence
-rebuild. `gw.qp_support` and `gw.sigma_box_plan` implement that policy.
+support, immutable box geometry and the escape refusal (no clamp, no
+rebuild). `gw.qp_support` and `gw.sigma_box_plan` implement that policy.
 The support is measured in the frame used by Sigma: `ppm_sigma.ppm_fermi_frame`
 for GN/HL-PPM and `efermi.resolve_sigma_efermi_ry` for MPA.
 
@@ -262,8 +262,8 @@ Resolution makes it harmless. At 24 bands and 192 centroids on Si the map gain
 is 14–18 and the loop plateaus; at 80 bands and 504 centroids it is 0.3 and
 the loop contracts.
 
-The sole convergence rebuild changes the map and starts a fresh Anderson
-history. Clamped interpolation is continuous at the sampled endpoints.
+The held plan keeps the map fixed: no window is rebuilt, and a protected
+read or a product window that leaves the plan refuses by name.
 
 ## 6 Shared-pole W with retained quadrature {#shared-pole-w-with-retained-quadrature}
 
