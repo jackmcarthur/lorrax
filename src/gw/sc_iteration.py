@@ -2880,7 +2880,8 @@ def _classify_sc_partition(
 def _sc_band_classes(inputs, e_reference_loop, mu_ev):
     """Owner scheme round 2 classes on the loop k-set; stores the semicore mask."""
     from .band_partition import sc_band_classes
-    from .qp_support import SEMICORE_GAP_EV, WINDOW_CLIP_EV
+    from .qp_support import (CUT_GAP_ETAS, CUT_SEARCH_EV, SEMICORE_GAP_EV,
+                             WINDOW_CLIP_EV)
     e = np.asarray(e_reference_loop, float)
     nk, nb = e.shape
     metal = inputs.material_class == "metal"
@@ -2896,6 +2897,8 @@ def _sc_band_classes(inputs, e_reference_loop, mu_ev):
         e, occupied_kn=occupied, requested_kn=requested, range_mu_ev=range_mu,
         range_ev=(inputs.config.sigma.omega_min_ev, inputs.config.sigma.omega_max_ev),
         clip_ev=WINDOW_CLIP_EV, semicore_gap_ev=SEMICORE_GAP_EV,
+        cut_gap_ev=CUT_GAP_ETAS * float(inputs.config.sigma.regularization_ev),
+        cut_search_ev=CUT_SEARCH_EV,
         far_route=(inputs.wfns_transverse is None
                    and inputs.config.compute_mode is ComputeMode.MPA))
     session = inputs.fixed_quadrature_session
