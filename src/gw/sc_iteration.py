@@ -5776,7 +5776,9 @@ def _run_anderson(
             _mu = float("nan") if _occ is None else float(_occ.mu_ry) * RYD_TO_EV
             _z = state_out.tail_z_kn
             _record_sc(inputs, f"    FESC map {call_index}: entry mu = {_mu:.6f} eV")
-            _h_in, _h_out = np.asarray(H), np.asarray(state_out.H_qp_dft)
+            from jax.experimental import multihost_utils as _mhu
+            _h_in = np.asarray(_mhu.process_allgather(H, tiled=True))
+            _h_out = np.asarray(_mhu.process_allgather(state_out.H_qp_dft, tiled=True))
             if jax.process_index() == 0:
                 os.makedirs(_fesc_dir, exist_ok=True)
                 np.savez(os.path.join(_fesc_dir, f"call{call_index:04d}.npz"),
