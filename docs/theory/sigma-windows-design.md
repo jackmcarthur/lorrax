@@ -49,7 +49,7 @@ and the SC equations are in [self consistency](../self_consistency.md).
   conduction states move +2.4 to +3.1 eV and the Si 4³ conduction top
   +2.3 eV at map 0, beyond a 2 eV pad about the DFT energies.
 - **Far patches.** Every rotating DFT energy (and map-0 estimate) outside the
-  near support, padded by 2 eV and merged across holes ≤ 4 eV
+  near support, padded by 4 eV and merged across holes ≤ 8 eV
   (`qp_support.far_patches_ev`); a patch that reaches the near support starts
   1e-3 eV past its edge, so no energy falls between the two. A
   patch above E_F is broadened to η_far = 1 eV, one below to 2 eV (ruling
