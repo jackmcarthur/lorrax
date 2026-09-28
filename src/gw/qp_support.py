@@ -101,15 +101,11 @@ FAR_PATCH_EPS = 1.0e-2
 #: Far-patch sampling step (eV): eta/2 resolves the broadened Sigma.
 FAR_PATCH_STEP_EV = 0.5
 #: The protected cut takes the first all-k gap at least CUT_GAP_ETAS * eta
-#: wide above the requested top, searched up to CUT_SEARCH_EV (else the widest
-#: gap there): a narrow cut gap leaves protected states within ~eta of
+#: wide above the requested top, searched up to CUT_SEARCH_ETAS * eta (else the
+#: widest gap there): a narrow cut gap leaves protected states within ~eta of
 #: rotating ones (Si 4^3: 0.41 eV gap, 7.9 meV at map 0; 1.8 eV gap, 0.25).
 CUT_GAP_ETAS = 4.0
-CUT_SEARCH_EV = 5.0
-#: A global gap wider than this splits semicore from the valence manifold:
-#: twice the padded near-support halfwidth (outer pad + Z stencil), so a
-#: narrower gap would be sampled by the near support anyway.
-SEMICORE_GAP_EV = 2.0 * (SUPPORT_PAD_EV + 0.5)
+CUT_SEARCH_ETAS = 20.0
 #: Offset of a far patch's first (last) sample past the near support's top
 #: (bottom) edge (eV): the two grids stay strictly ascending and join with
 #: no uncovered sliver.

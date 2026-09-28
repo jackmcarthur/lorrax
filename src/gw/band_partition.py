@@ -111,32 +111,30 @@ def requested_band_mask(energies_ev, *, n_occ, nval, ncond, gap_ev, mu_ev=None,
 class SCBandClasses(NamedTuple):
     """The SC classes of the DFT identities on the loop k-set (``sc_band_classes``)."""
     protected: np.ndarray      # (nk, nb) read on the near grid at the deck eta
-    semicore: np.ndarray       # (nk, nb) active, read at their own energy on held patches
+    semicore: np.ndarray       # (nk, nb) coarse: active, read at their own energy on the coarse window
     cut_ev: float              # upper edge of the protected set, inside a global gap
     gap_ev: tuple              # (below, above): the global gap the cut sits in
-    valence_bottom_ev: float   # lowest active state read on the near grid
+    valence_bottom_ev: float   # lowest protected (fine-window) state
 
 
 def sc_band_classes(energies_ev, *, occupied_kn, requested_kn, range_mu_ev,
-                    range_ev=None, clip_ev, semicore_gap_ev, cut_gap_ev,
-                    cut_search_ev, far_route=True):
-    """Active / semicore / rotating classes from the DFT ladder (owner scheme, 2026-09-28 round 2).
+                    range_ev=None, clip_ev, cut_gap_ev, cut_search_ev, far_route=True):
+    """Fine / coarse / rotating classes from the DFT ladder (owner rule, 2026-09-28 round 5).
 
-    1. Every occupied state is active; none rotates. The valence manifold
-       runs down from E_F through every global gap narrower than
-       ``semicore_gap_ev``; the occupied states below a wider gap are
-       semicore, active and read at their own energy on held patches. On a
-       route without patches (``far_route=False``) they are protected.
-    2. The protected set ends at a spectral gap: ``top`` is the highest
-       requested energy, clipped to ``range_mu_ev + clip_ev`` and raised to
-       the deck's omega_max; the cut is the midpoint of the first all-k gap
-       at least ``cut_gap_ev`` wide that opens in [top, top + cut_search_ev),
-       else of the widest gap opening there (the same energy at every k).
-       Every state below the cut and above the semicore is protected, so no
-       rotating state sits among protected ones.
-    3. The rest (empty states above the cut) rotate. ``range_ev`` states
-       (omega endpoints, about ``range_mu_ev``) are always protected.
-    A global gap is an interval with no eigenvalue at any k. O(nk nb log).
+    1. The fine window (read at the deck eta) runs from the minimum energy of
+       the lowest requested band up to the cut. A requested band counts if it
+       reaches into ``range_mu_ev +- clip_ev``; ``range_ev`` (omega endpoints)
+       only enlarges the window. Every state in it is protected at every k.
+    2. The cut: ``top`` is the highest requested energy, clipped to
+       ``range_mu_ev + clip_ev`` and raised to omega_max; the cut is the
+       midpoint of the first all-k gap at least ``cut_gap_ev`` wide that opens
+       in [top, top + cut_search_ev), else of the widest gap opening there.
+    3. Every occupied state below the fine window is coarse ("semicore"):
+       active, read at its own energy on one coarse window (on a route without
+       patches, ``far_route=False``, it joins the fine window).
+    4. The rest (empty states above the cut) rotate.
+    No gap threshold decides a class; a global gap is an interval with no
+    eigenvalue at any k. O(nk nb log).
     """
     from .qp_support import SUPPORT_PAD_EV
     e = np.asarray(energies_ev, float)
@@ -148,7 +146,17 @@ def sc_band_classes(energies_ev, *, occupied_kn, requested_kn, range_mu_ev,
     if range_ev is not None:
         lo_ev = None if range_ev[0] is None else mu + float(range_ev[0])
         hi_ev = None if range_ev[1] is None else mu + float(range_ev[1])
-    top = min(float(e[req].max()), mu + float(clip_ev))
+    band_req = req.any(axis=0)
+    band_min, band_max = e.min(axis=0), e.max(axis=0)
+    band_in = band_req & (band_max >= mu - float(clip_ev)) & (band_min <= mu + float(clip_ev))
+    if not band_in.any():
+        raise ValueError("SC band classes: no requested band reaches mu +- "
+                         f"{float(clip_ev):g} eV; increase nval/ncond")
+    floor = float(band_min[band_in].min())
+    if lo_ev is not None:
+        floor = min(floor, lo_ev)
+    top = min(float(e[req & (e <= mu + float(clip_ev))].max(initial=-np.inf)),
+              mu + float(clip_ev))
     top = max(top, float(e[occ].max()))
     if hi_ev is not None:
         top = max(top, hi_ev)
@@ -163,32 +171,27 @@ def sc_band_classes(energies_ev, *, occupied_kn, requested_kn, range_mu_ev,
         i = int(wide[0]) if wide.size else int(np.argmax(widths))
         gap = (float(above[i]), float(nxt[i]))
         cut = gap[0] + 0.5 * (min(gap[1], gap[0] + 2 * float(SUPPORT_PAD_EV)) - gap[0])
-    # Valence bottom: walk down the occupied levels from E_F through gaps
-    # narrower than semicore_gap_ev.
-    occ_levels = np.sort(e[occ])[::-1]
-    bottom = float(occ_levels[0])
-    for a, b in zip(occ_levels[:-1], occ_levels[1:]):
-        if a - b > float(semicore_gap_ev):
-            break
-        bottom = float(b)
-    # The fine-window floor is min(valence bottom, lowest requested energy
-    # within the clip) (owner, round 5); it never rises above the valence bottom.
-    in_clip = req & (np.abs(e - mu) <= float(clip_ev))
-    if in_clip.any():
-        bottom = min(bottom, float(e[in_clip].min()))
-    semicore = occ & (e < bottom)
-    if lo_ev is not None:
-        semicore &= e < lo_ev
+    protected = (e >= floor) & (e < cut)
+    if hi_ev is not None:
+        protected |= (e >= floor) & (e <= hi_ev)
+    semicore = occ & ~protected & (e < floor)
     if not far_route:
+        protected |= semicore
         semicore = np.zeros_like(semicore)
-    protected = (e < cut) & ~semicore
-    if lo_ev is not None or hi_ev is not None:
-        inside = ((e >= (-np.inf if lo_ev is None else lo_ev))
-                  & (e <= (np.inf if hi_ev is None else hi_ev)))
-        protected |= inside
-        semicore &= ~inside
     return SCBandClasses(protected, semicore, float(cut), gap,
                          float(e[protected].min()))
+
+
+def coarse_band_report(energies_ev, semicore_kn, *, mu_ev, band_offset=0):
+    """One line per band with coarse (semicore) states: index, DFT range about mu, k count."""
+    e = np.asarray(energies_ev, float)
+    s = np.asarray(semicore_kn, bool)
+    rows = []
+    for n in np.flatnonzero(s.any(axis=0)):
+        vals = e[s[:, n], n] - float(mu_ev)
+        rows.append(f"band {int(n) + int(band_offset) + 1}: [{vals.min():+.3f}, {vals.max():+.3f}] eV "
+                    f"on {int(s[:, n].sum())}/{s.shape[0]} k")
+    return rows
 
 
 @dataclass(frozen=True)

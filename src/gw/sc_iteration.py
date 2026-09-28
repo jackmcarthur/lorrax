@@ -2870,7 +2870,7 @@ def _classify_sc_partition(
         partition = BandPartition(jnp.asarray(active), jnp.asarray(active))
         _record_sc(inputs, f"SC band classes: {int(classes.protected.sum())} protected, "
                    f"{int(classes.semicore.sum())} semicore, {int((~active).sum())} "
-                   f"rotating (k,state); protected set from the valence bottom "
+                   f"rotating (k,state); protected set from "
                    f"{classes.valence_bottom_ev - mu_ev:+.3f} eV to the cut "
                    f"{classes.cut_ev - mu_ev:+.3f} eV in the global gap "
                    f"[{classes.gap_ev[0] - mu_ev:+.3f}, {classes.gap_ev[1] - mu_ev:+.3f}] eV "
@@ -2888,8 +2888,7 @@ def _classify_sc_partition(
 def _sc_band_classes(inputs, e_reference_loop, mu_ev):
     """Owner scheme round 2 classes on the loop k-set; stores the semicore mask."""
     from .band_partition import sc_band_classes
-    from .qp_support import (CUT_GAP_ETAS, CUT_SEARCH_EV, SEMICORE_GAP_EV,
-                             WINDOW_CLIP_EV)
+    from .qp_support import CUT_GAP_ETAS, CUT_SEARCH_ETAS, WINDOW_CLIP_EV
     e = np.asarray(e_reference_loop, float)
     nk, nb = e.shape
     metal = inputs.material_class == "metal"
@@ -2904,14 +2903,19 @@ def _sc_band_classes(inputs, e_reference_loop, mu_ev):
     classes = sc_band_classes(
         e, occupied_kn=occupied, requested_kn=requested, range_mu_ev=range_mu,
         range_ev=(inputs.config.sigma.omega_min_ev, inputs.config.sigma.omega_max_ev),
-        clip_ev=WINDOW_CLIP_EV, semicore_gap_ev=SEMICORE_GAP_EV,
+        clip_ev=WINDOW_CLIP_EV,
         cut_gap_ev=CUT_GAP_ETAS * float(inputs.config.sigma.regularization_ev),
-        cut_search_ev=CUT_SEARCH_EV,
+        cut_search_ev=CUT_SEARCH_ETAS * float(inputs.config.sigma.regularization_ev),
         far_route=(inputs.wfns_transverse is None
                    and inputs.config.compute_mode is ComputeMode.MPA))
     session = inputs.fixed_quadrature_session
     if session is not None:
         session["semicore_kn"] = classes.semicore
+    from .band_partition import coarse_band_report
+    rows = coarse_band_report(e, classes.semicore, mu_ev=range_mu,
+                              band_offset=int(inputs.band_slices.b0))
+    _record_sc(inputs, "SC coarse (occupied below the lowest requested band) bands: "
+               + ("; ".join(rows) if rows else "none"))
     return classes
 
 
