@@ -70,13 +70,21 @@ def test_line_ladder_reaches_the_map0_sigma_support_plus_the_pad():
     assert first["top_ev"] == 8.
 
 
-def test_a_later_support_past_the_held_ladder_refuses_by_name():
+def test_a_later_support_past_the_held_ladder_extends_it_once():
     args = inputs()
     session = {}
-    first = resolve(args, session, window=(-6., 4.))
-    assert_same_geometry(first, resolve(args, session, window=(-5.5, 6.)))
-    with pytest.raises(ValueError, match="GATE shared_pole_line_coverage"):
-        resolve(args, session, window=(-6.5, 4.))
+    first = resolve(args, session, window=(-6., 4.))            # ladder 1..8 eV
+    held = resolve(args, session, window=(-7.5, 6.))             # far side 7.5 <= 8: held
+    assert held["support_plan"]["status"] == "held"
+    assert_same_geometry(first, held)
+    wider = resolve(args, session, window=(-8.5, 4.))            # far side 8.5 > 8: extend to 10.5
+    assert wider["support_plan"]["status"] == "extended"
+    np.testing.assert_array_equal(wider["line_ev"], np.arange(1., 12.))
+    np.testing.assert_array_equal(wider["imaginary_ev"], first["imaginary_ev"])
+    assert wider["recipe_hash"] != first["recipe_hash"]
+    again = resolve(args, session, window=(-6., 4.))
+    assert again["support_plan"]["status"] == "held"
+    assert_same_geometry(wider, again)
 
 
 def test_recipe_hash_binds_the_ladder():
@@ -87,7 +95,7 @@ def test_recipe_hash_binds_the_ladder():
     c = resolve(inputs(top=30.))
     assert c["imaginary_ev"].tobytes() != a["imaginary_ev"].tobytes()
     assert c["recipe_hash"] != a["recipe_hash"]
-    assert a["response_group_tolerance"] == 1e-10
+    assert a["response_group_tolerance"] == 1e-9
 
 
 def test_sector_treatment_ceiling_freezes_map0_and_masks_after_span_growth():

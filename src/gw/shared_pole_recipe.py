@@ -58,11 +58,13 @@ shared_real_pole_v1_r3b = {
     # response_group_tolerance: the derived group rules deliver exactly their
     # certificate over the whole transition interval and the shared-pole
     # construction amplifies it (Na 8^3 map-0 eqp 1.17 / 0.43 / 0.04 meV at
-    # 1e-8 / 1e-9 / 1e-10; CHIRULE, claims 2913-2914). Interim 1e-10 until a
-    # per-sample margin eta/(<d>_w + |z|) is derived (CONSENSUS F6).
+    # 1e-8 / 1e-9 / 1e-10; CHIRULE, claims 2913-2914). 1e-9 until a per-sample
+    # margin eta/(<d>_w + |z|) is derived (CONSENSUS F6): on the 4 eta line
+    # 1e-10 (5e-11 per spin-degenerate occupation amplitude) sits at the derived
+    # rules' float64 floor and refuses Na 8^3 and Si 536-band (RECIPE3).
     "production": {"direction_cutoff": 1.0e-3, "imaginary_width_fraction": 0.25,
                    "infinity_width_fraction": 0.125,
-                   "bank_rule_tolerance": 1.0e-8, "response_group_tolerance": 1.0e-10,
+                   "bank_rule_tolerance": 1.0e-8, "response_group_tolerance": 1.0e-9,
                    "line_direction_cap_fraction": 0.0625, "pole_budget_fraction": 1.8},
     "relaxed": {"direction_cutoff": 1.0e-2, "imaginary_width_fraction": 0.125,
                 "infinity_width_fraction": 0.0625,
@@ -914,14 +916,17 @@ def _held_frequency_plan(planned, required, key, session):
     """Plan W's frequency sites once (SC map 0) and hold them for every map.
 
     ``planned`` holds this map's ``line_ev`` and ``imaginary_ev`` ladders and
-    their scalars; ``required`` this map's ``line_top_ev``, ``u_min_ev`` and
-    ``u_max_ev``. The first call retains ``planned``; every later call returns
-    the retained sites, so each map samples W at the same points and reuses the
-    map-0 response rules (``response_bank.response_quadrature``). A later map
-    whose Sigma(omega) support plus the pad reaches past the held line ladder
-    refuses by name, as ``qp_support`` refuses a Sigma support breach. The
-    imaginary ladder is held without a refusal: its ends are the map-0 gap and
-    spectral top, and the current ones are reported.
+    their scalars; ``required`` this map's ``support_far_ev`` (the Sigma
+    support's far side about mu), ``line_top_ev`` (far side + pad),
+    ``u_min_ev`` and ``u_max_ev``. The first call retains ``planned``; every
+    later call returns the retained sites, so each map samples W at the same
+    points and reuses the response rules (``response_bank.response_quadrature``).
+    Sigma_c reads the line up to the support's far side, so the held line
+    ladder serves a map while that far side stays on it; the plan's pad is
+    the margin for QP motion. A map whose support leaves the held ladder
+    extends it, as ``qp_support`` extends a Sigma support a state leaves: the
+    lattice ladder appends sites up to this map's far side + pad (status
+    ``extended``, its rules are rebuilt once) and the imaginary ladder stays.
     """
     version = "held_w_frequency_plan_20260927"
     if session.get("plan") is None:
@@ -932,16 +937,17 @@ def _held_frequency_plan(planned, required, key, session):
         raise ValueError(f"GATE shared_pole_held_plan: got: policy key {key!r}; want: the map-0 key "
                          f"{session.get('key')!r}; why: the W frequency plan is fixed at map 0 and held")
     held = session["plan"]
-    reach = float(held["line_ev"][-1])
-    if required["line_top_ev"] > reach * (1.0 + 1.0e-9):
-        raise ValueError(
-            f"GATE shared_pole_line_coverage: got: this map's Sigma(omega) support plus the pad "
-            f"reaches {required['line_top_ev']:.4f} eV; want: <= {reach:.4f} eV, the last site of the "
-            f"line ladder held from map 0; why: Sigma_c reads W on the line up to the support's far "
-            f"side, and the ladder is planned once and never grows (gw/qp_support.py).")
+    reach = max(float(held["line_ev"][-1]), float(held["top_ev"]))
+    status = "held"
+    if required["support_far_ev"] > reach * (1.0 + 1.0e-9):
+        # The production lattice keeps every held site (line_ladder_ev).
+        held = dict(held, line_ev=tuple(float(v) for v in planned["line_ev"]),
+                    top_ev=float(planned["top_ev"]))
+        session["plan"] = held
+        status = "extended"
     retained = {k: (np.asarray(v, dtype=np.float64) if k.endswith("_ev") and isinstance(v, tuple)
                     else v) for k, v in held.items()}
-    return dict(version=version, status="held", required=dict(required)), retained
+    return dict(version=version, status=status, required=dict(required)), retained
 
 
 def _sector_treatment_ceiling(response_span_ry, session):
@@ -1091,7 +1097,7 @@ def resolve_shared_pole_recipe(config, wfns, meta, *, mesh_xy, print_fn,
     ``support_session`` (SC) holds the first map's sites for every later map
     (``_held_frequency_plan``): the census and capacity ledger stay fresh, the
     sample points and their response rules do not move, and a later support
-    past the held line ladder refuses.
+    whose far side leaves the held line ladder extends it once.
     All ranks execute the metadata work; only ``print_fn`` may filter by rank.
     """
     from common.units import RYD_TO_EV
@@ -1169,7 +1175,8 @@ def resolve_shared_pole_recipe(config, wfns, meta, *, mesh_xy, print_fn,
         support_receipt, held = _held_frequency_plan(
             dict(top_ev=top, u_min_ev=umin, u_max_ev=umax, kappa=kappa,
                  imaginary_count=count, line_ev=line, imaginary_ev=imaginary),
-            dict(line_top_ev=top, u_min_ev=umin, u_max_ev=umax), key, support_session)
+            dict(support_far_ev=top - recipe['line_extent_pad_ev'], line_top_ev=top,
+                 u_min_ev=umin, u_max_ev=umax), key, support_session)
         top, umin, umax, kappa, count = (held['top_ev'], held['u_min_ev'], held['u_max_ev'],
                                          held['kappa'], held['imaginary_count'])
         line, imaginary = held['line_ev'], held['imaginary_ev']
@@ -1310,7 +1317,7 @@ def resolve_shared_pole_recipe(config, wfns, meta, *, mesh_xy, print_fn,
         'metadata': 'sum of replicated metadata array nbytes',
     }
     if support_receipt is not None:
-        rules.update(top='held from SC map 0: max|map-0 Sigma support| + 2 eV; a later map past the held ladder refuses',
+        rules.update(top='held from SC map 0: max|map-0 Sigma support| + 2 eV; a map whose support far side leaves the held ladder extends it to its far side + 2 eV',
                      u_min='held from SC map 0: max(4 eta, map-0 logical gap)',
                      u_max='held from SC map 0: max(response transition span, omega_p) floored onto 2**(k/4) eV',
                      support_plan='SC map 0 plans the W frequency sites; later maps hold them (required = this map\'s own values)')
