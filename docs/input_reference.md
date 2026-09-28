@@ -154,7 +154,7 @@ at its default, `false`.
 | `band_extrapolation_estimator` | str | `spectral_shell` | Which estimator consumes the three sums; it changes no compute. `spectral_shell`: a per-state decay exponent β from the two shell increments against spectral moments of the DFT eigenvalues, with the tail integrated to the plane-wave basis; a state whose two increments give no exponent in (0.05, 40) keeps its computed N3 sum, and the log counts those states. The only accepted value; `band_index_only` (the two-parameter S∞ + A/N least squares) was deleted 2026-09-27 and refuses by name. |
 | `no_degen_averaging` | bool | `false` | Disables BerkeleyGW-style averaging of diagonal Σ within degenerate sets in the terminal output. |
 | `degen_avg_tol_ry` | float | `1e-6` | Degeneracy tolerance (Ry) of that terminal averaging. It is not an SC tolerance. |
-| `sigma_freq_debug_output` | bool | `false` | Writes the per-branch Σ(ω) debug table. |
+| `sigma_freq_debug_output` | bool | `false` | Writes the per-branch Σ(ω) debug table; also enables the head attribution and, on an ordered (time-reversal-broken) shared-pole bank, the `TRBANK tr_odd_census` diagnostic (one extra Dyson solve per imaginary sample at each TRIM parent). |
 | `sigma_freq_debug_file` | str | `sigma_freq_debug.dat` | Path of that table. |
 | `sigma_lorentz_debug_output` | bool | `false` | Writes each four-current SC map's on-shell (CC, CT+TC, TT) matrices to `sigma_lorentz_iterNNNN.h5`. Under `full_shared_pole` it also evaluates the mixed and transverse sectors on shell. |
 

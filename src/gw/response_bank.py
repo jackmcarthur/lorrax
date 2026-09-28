@@ -1050,7 +1050,9 @@ def _tr_odd_census(receipt, solve_value, h, chi, value, z, q_full):
     symmetric part (max and Frobenius), the Hermiticity of the ordered
     W = V + Wc, of the even-route W from the symmetric part through the same
     Coulomb root and Dyson algebra, and max|W - W^T|/max|W|. Scalars only;
-    every rank computes, rank 0 prints one line per sample.
+    every rank computes, rank 0 prints one line per sample. Runs only under
+    ``sigma_freq_debug_output``: no gate reads it, and its extra Dyson solve
+    per imaginary sample is debug work (owner rule: none in the prefactor).
     """
     imaginary = np.flatnonzero(np.real(np.asarray(z)) == 0.0)
     if not imaginary.size:
@@ -1314,6 +1316,7 @@ def produce_sample_bank(wfns, meta, config, *, mesh_xy, sym, sample_plan, bank_i
         # conj in R space (the -q orientation); remote cells add the odd kernel.
         # ordered=True stores the physical orientation W_q = FT_q[W].
         ordered = vertex is not None or not bool(sym.trs_allowed)
+        tr_odd_census = bool(config.debug.sigma_freq_debug_output)
         if ordered != bool(header.get("ordered")):
             raise ValueError("GATE response_representation: got: a bank whose ordered layout disagrees "
                              "with the measured time reversal; fix: rebuild the bank")
@@ -1475,7 +1478,10 @@ def produce_sample_bank(wfns, meta, config, *, mesh_xy, sym, sample_plan, bank_i
                 if vertex is None and _self_negative(int(qids[iq]),meta):
                     part = slice(iq-q0,iq-q0+1)
                     _reciprocity_census(receipt,value[part],z[sample:sample+1],int(qids[iq]),iq,meta)
-                    if ordered:
+                    # Diagnostic only (nothing reads it): an extra Dyson solve per
+                    # imaginary sample at every TRIM parent, so it runs under the
+                    # debug-output dial, never in the production prefactor.
+                    if ordered and tr_odd_census:
                         _tr_odd_census(receipt,solve_value,h[part],chi_value[part],value[part],z[sample:sample+1],int(qids[iq]))
         return value, slope
 
