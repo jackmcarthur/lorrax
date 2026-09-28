@@ -91,7 +91,7 @@ FAR_PATCH_EPS = 1.0e-2
 #: their windows take the protected tolerance (ruling Q2). At 1e-2 the MoS2
 #: 3x3 semicore sat 0.15-0.3 eV off and shifted the valence by 3.7 meV at
 #: the fixed point (PARTITION round 2).
-SEMICORE_EPS = 1.0e-4
+SEMICORE_EPS = 1.0e-2
 #: Far-patch sampling step (eV): eta/2 resolves the broadened Sigma.
 FAR_PATCH_STEP_EV = 0.5
 #: A global gap wider than this splits semicore from the valence manifold:
