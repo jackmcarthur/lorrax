@@ -1140,6 +1140,19 @@ def response_quadrature(meta, sample_plan, receipt, support, *, group_size, prin
              and old["decay_rate"] <= decay_rate and old["amplitude"] >= amplitude
              and old["metallic"] == metallic and np.array_equal(old["z"], z)
              and old["group_size"] == group_size)
+    if old is not None and not reuse and jax.process_index() == 0:
+        # An SC map that rebuilds names the reuse condition that failed.
+        failed = {"interval": not (old["lo"] <= lo and hi <= old["hi"]),
+                  "decay_rate": not old["decay_rate"] <= decay_rate,
+                  "amplitude": not old["amplitude"] >= amplitude,
+                  "metallic": old["metallic"] != metallic,
+                  "samples": not np.array_equal(old["z"], z),
+                  "group_size": old["group_size"] != group_size}
+        print_fn("Response quadrature: rebuild, failed reuse conditions "
+                 + ", ".join(k for k, v in failed.items() if v)
+                 + f"; interval (eV) [{lo*RYD_TO_EV:.6g}, {hi*RYD_TO_EV:.6g}] vs held "
+                 f"[{old['lo']*RYD_TO_EV:.6g}, {old['hi']*RYD_TO_EV:.6g}]; decay {decay_rate:.8g} vs "
+                 f"{old['decay_rate']:.8g} Ry^-1; amplitude {amplitude:.8g} vs {old['amplitude']:.8g}", flush=True)
     if reuse:
         plan = old
     else:
