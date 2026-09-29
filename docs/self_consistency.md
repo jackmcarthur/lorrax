@@ -13,9 +13,11 @@ the Hartree rebuild ([direct Hartree field](theory/hartree.md)).
 ## 1 The map
 
 The carry is the QP Hamiltonian in the fixed DFT basis, $H_k$ of shape
-`(nk, nb, nb)`. Dynamic SC spans the complete `number_bands` carrier on
-the loop's k-set; the [window decision](theory/sigma-windows-design.md)
-separates requested protected bands from rotating bands. One map $F: H \to H'$ does five things:
+`(nk, nb, nb)`. Dynamic SC spans the QP matrix [0, b3) on the loop's k-set, where b3 is
+the absolute band cut and equals the ζ fit's left range; bands [b3,
+`number_bands`) are the scissored tail. The
+[window decision](theory/sigma-windows-design.md) owns the cut and the
+protected/semicore classes. One map $F: H \to H'$ does five things:
 
 1. diagonalize $H_k = U_k\,\mathrm{diag}(E_k)\,U_k^\dagger$;
 2. rotate the original DFT orbitals by $U$. There is no cumulative product,
@@ -39,8 +41,8 @@ $F$ is a pure function of $H$: re-evaluating the same input returns a
 bitwise-identical output (CLAIMS 2678). Every evaluated pair
 $(H, F(H) - H)$ is therefore valid secant data. Map 0 takes $U = I$ exactly
 instead of calling `eigh` on $\mathrm{diag}(E_{\rm DFT})$. Its input orbitals
-and occupations are the DFT ones; the band-class operator differs from a
-one-shot operator wherever a rotating endpoint is present. Each
+and occupations are the DFT ones; its operator differs from a one-shot
+operator only where a semicore endpoint reads its patch. Each
 map costs one full $\chi_0 \to W \to \Sigma$ evaluation. The
 [window decision](theory/sigma-windows-design.md) owns the single map-0
 quadrature plan, which is held; an escape refuses (`GATE sigma_plan_escape`).
@@ -123,10 +125,9 @@ energies, so it takes these dipoles at the same diagonal approximation.
 
 ## 2 Band treatment
 
-The [Sigma window decision](theory/sigma-windows-design.md) owns the
-protected/rotating classes, endpoint evaluation, requested band edges and
-their closure. The complete loaded carrier rotates. The following tail fit
-is an independent policy consumed by that partition.
+The [Sigma window decision](theory/sigma-windows-design.md) owns the band
+cut, the protected/semicore classes and endpoint evaluation. The QP matrix
+rotates; the tail above the cut keeps DFT ψ and takes the following law.
 
 **Tail law.** The rigid shift is
 

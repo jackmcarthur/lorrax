@@ -1,9 +1,10 @@
-# Sigma windows: one plan, fine and coarse windows
+# Sigma windows: the band cut, one plan, one semicore patch
 
 This page owns the Σ window policy of self-consistent QSGW: which states are
-read finely, coarsely or by scissor, where Σ is sampled, and what happens
+in the QP matrix, how each is read, where Σ is sampled, and what happens
 when a state leaves the plan. The scheme is the owner's of 2026-09-28
-(rulings Q2–Q5 and the round-5 rule, TRACKER). The rule construction is in
+(rulings Q2–Q5, "only fitted ISDF pairs", the absolute band cut and the
+21:40 semicore rule). The rule construction is in
 [minimax quadrature](minimax-quadrature.md) and the SC equations are in
 [self consistency](../self_consistency.md).
 
@@ -11,44 +12,54 @@ when a state leaves the plan. The scheme is the owner's of 2026-09-28
 
 1. `nval` and `ncond` request states below and above E_F at each k (from
    `nelec` on an insulator); a request larger than a k holds takes all.
-   `number_bands` sets the whole rotating and sum-band carrier.
+   `number_bands` sets the loaded bands: the QP matrix plus the scissored tail.
 2. `sigma_omega_min_ev` and `sigma_omega_max_ev` (eV from the Σ Fermi
-   reference, either may be omitted) only enlarge the fine window.
+   reference, either may be omitted) only enlarge the near window; ω_max
+   also raises the band cut.
 3. `sigma_omega_step_ev` sets the near sampling step. `sigma_window_ev`,
    `sigma_out_of_grid`, `sigma_omega_patches_ev`, `sigma_window_edge_factor`
    and `sc_frozen_core_bands` refuse by name.
 
-## Classes (`band_partition.sc_band_classes`, from the DFT ladder at map 0)
+## The band cut (`band_partition.qp_band_cut`, before the ζ fit)
 
-The owner's rule, literally: "evaluate Σ(E_nk) the valence way with small
-broadening down to an energy just below min of the user requested lowest
-protected Σ band, and start large broadening right above max of the band
-below that one". No gap threshold decides a class.
+- **The QP matrix is the ζ fit's left range**, [0, b3) at every k. The ζ fit
+  is least squares on pairs ψ_i*ψ_j, i in the left range; a QP state above
+  it would carry Σ on unfitted pairs. A run whose QP matrix reaches past the
+  left range (for example `zeta_nband` < b3) refuses:
+  `GATE qp_matrix_zeta_left` (`gw_init.assert_qp_matrix_fitted`).
+- **b3 is one band index**, decided from the DFT ladder in
+  `gw_init.qp_band_cut_for_deck`. The need is every occupied state, every
+  requested state within μ ± 10 eV (`WINDOW_CLIP_EV`) and every state below
+  μ + ω_max; b3 is the smallest boundary holding it, moved up to the first
+  band gap ≥ 4η (`CUT_GAP_ETAS`) opening within 20η (`CUT_SEARCH_ETAS`),
+  else to the least-overlapping boundary there. A boundary that cuts a
+  degenerate multiplet at any k is skipped.
+- **A band gap is not a level gap.** A band gap at boundary n is
+  min_k E[n] − max_k E[n−1] > 0; a gap in the union of all k levels does not
+  fix the band count below it, which varies with k. Above E_F a dispersive
+  ladder has no band gap on Si 4³, Fe 4³ or Na 8³, so their cut overlaps:
+  the matrix's top band reaches above the tail's lowest band at another k.
+- **The tail [b3, nband)** is the SC sum-band tail: DFT ψ, energies shifted
+  by main's conduction law (`sc_iteration._fit_sum_band_tail`: one rigid
+  shift, the Z-weighted mean QP correction of the conduction states that
+  read Σ; α = 1), in G and χ only. No Σ row, no mixing.
+- **Requested states above the cut** (beyond the 10 eV clip) are tail states
+  and the log counts them.
 
-- **Fine (protected) window, deck η, ε 1e-4.** From the minimum energy of the
-  lowest requested band (a band counts if it reaches μ ± 10 eV,
-  `WINDOW_CLIP_EV`; ω_min only lowers the floor) up to the cut. Every state
-  in it is protected at every k.
-- **The cut is a spectral gap.** `top` is the highest requested energy,
-  clipped to μ + 10 eV and raised to ω_max; the cut is the midpoint of the
-  first all-k gap at least 4η wide (`CUT_GAP_ETAS`) that opens in
-  [top, top + 20η) (`CUT_SEARCH_ETAS`), else of the widest gap there.
-- **Coarse.** Every occupied state below the fine window: active (full
-  mixing, rows kept, never scissored), read at its own energy on one coarse
-  window at `SEMICORE_ETA_EV` (0.5 eV) and ε 1e-2 (`SEMICORE_READ =
-  "patch"`; `"sigma0"` reads Σ(0) instead). The SC log lists every coarse band
-  with its DFT range at startup. A user who requests too few valence bands
-  pays for it here: those bands are read coarsely. A coarse state inside the
-  fine window (its lower pad, the owner's "overlap") reads the fine grid;
-  below it, the coarse window; no coarse patch enters the fine grid.
-- **Above the cut.** `ROTATING_READ = "scissor"` (default): every state takes
-  E_DFT + β_above (scissor law A), with no far patch and no own-energy read;
-  Q3's own-energy read is not used in this arm. `"own"` keeps the far
-  patches and own-energy reads.
-- Classes are fixed by DFT identity at map 0 and follow the eigenvectors.
-- **Remaining eV constants:** the 10 eV clip, the 2 eV outer pad
-  (`SUPPORT_PAD_EV`, derived pads = max |E_map0 − E_DFT| + 2 eV), the
-  ±0.5 eV Z stencil, η_semi 0.5 eV and η_far 1 eV (ruling Q4: 1–2 eV).
+## Classes inside the QP matrix (`sc_iteration._sc_band_classes`)
+
+- **Semicore:** occupied bands below a band gap of at least 4 eV
+  (`SEMICORE_GAP_EV`) under the valence manifold, and below every requested
+  band within the clip. They keep full mixing and are read at their own
+  energy on one held patch at η_semi = 1 eV (`SEMICORE_ETA_EV`, fixed by the
+  owner; its systematic error is reported apart from the 1 meV budget). A
+  sector route (bispinor) has no patches: its semicore reads the near grid
+  at the deck η.
+- **Protected:** every other QP-matrix state, read on the near grid at the
+  deck η.
+- The SC log lists every semicore band with its DFT range at startup, and the
+  semicore Z of the patch stencil (min / median / max, states outside
+  (0, 1]) every map.
 
 ## One plan at map 0, held
 
@@ -56,73 +67,43 @@ below that one". No gap threshold decides a class.
   2 eV outer pad, enlarged to the ω endpoints; sampled at the deck η and
   ε = 1e-4 (ruling Q2). Crossing and non-crossing product windows are planned
   once with their reserves (`sigma_box_plan`).
-- **Map-0 probe ("plan at the first iteration").** Map 0 first evaluates Σ
-  on a provisional plan. The plan is then made once from the DFT energies
-  and the map-0 estimates (the diagonal of the map-0 QSGW Hamiltonian and
-  the output eigenvalue each DFT identity carries into map 1,
-  `sc_state_identity.assign_qp_identity`), and map 0 is re-evaluated. This
-  happens whenever a protected estimate leaves the provisional support or
-  the deck has semicore or rotating states (their pads derive from the
-  probe). A scalar route re-reads the same file-resident W; a sector route
-  rebuilds W. The insulator Σ frame is the DFT midgap, so the map-0 gap
-  opening is not absorbed by the frame (MoS2 3×3 conduction +2.4 to
-  +3.1 eV, Si 4³ conduction top +2.3 eV at map 0).
-- **Patches.** Rotating (above E_F, η_far = 1 eV, ε 1e-2, only with
-  `ROTATING_READ = "own"`) and coarse (below, one window from the deepest
-  coarse energy minus its pad to just above the highest coarse band,
-  η_semi, ε 1e-2) energies outside the near support, each padded by a
-  derived pad, max over the class of |E_map0 − E_DFT| + 2 eV
-  (`qp_support.derived_pad_ev`), merged across holes shorter than twice the
-  pad (`far_patches_ev`); a patch that reaches the near support starts
-  1e-3 eV past its edge. Sampled at η/2. Patches join the near plan: each
-  crossing window splits by the η of its frequencies and certifies at
-  ε_far = 1e-2 (`FAR_PATCH_EPS`); sign-definite windows serve patch
-  frequencies at the near η. The split is decided at map 0 and held, so
-  moving poles never add a window. Ruling Q4 (INVARIANTS 12) admits η 1–2 eV
-  here.
-- **Read mode fixed at map 0 (Q3 continuity).** A rotating state reads its
-  own energy if the near grid or a rotating patch covers its DFT energy and
-  every map-0 estimate, and takes the side scissor otherwise, for good.
-- **Held, one object.** `qp_support.plan_sigma_windows` → `SigmaPlan`:
-  `protected_support_ev` (deck η, pad and Z stencil included),
-  `far_patches_ev`/`far_eta_ev` (rotating), `semicore_ev`/`semicore_eta_ev`,
-  and the two pads. The SC map carries it as `SCSupport.plan` and the
-  session's `"sigma_plan"`; the W sampling ladder reads it there. At map 0
-  the probe pass's W precedes the final plan; maps ≥ 1 read the held plan.
-- **Escape refuses** (ruling Q5). A protected read outside the near support,
-  a semicore read outside its patches, or an own-energy rotating read
-  outside the near support and its patches refuses with
-  `GATE sigma_plan_escape`, naming the state. No clamp, no rebuild. The
-  ±0.5 eV Z stencil is one-sided at an edge by design and is counted. A
-  product window whose live box leaves its held box (W poles move) keeps its
-  rule and is counted in the receipt (`escaped`).
+- **Map-0 probe.** Map 0 first evaluates Σ on a provisional plan. The plan is
+  then made once from the DFT energies and the map-0 estimates, and map 0 is
+  re-evaluated. This happens whenever a protected estimate leaves the
+  provisional support or the deck has semicore states (their pad derives
+  from the probe). The insulator Σ frame is the DFT midgap, so the map-0 gap
+  opening is not absorbed by the frame.
+- **The semicore patch.** One window from the deepest semicore energy minus
+  its pad to just above the highest semicore band, pad = max over the class
+  of |E_map0 − E_DFT| + 2 eV (`qp_support.derived_pad_ev`), sampled at
+  η_semi/2; it joins the near plan, and its crossing windows certify at
+  ε = 1e-2 (`FAR_PATCH_EPS`) unless η_semi equals the deck η. A semicore
+  state inside the near window reads the near grid.
+- **Held, one object.** `qp_support.plan_sigma_windows` → `SigmaPlan`
+  (`protected_support_ev`, `semicore_ev`/`semicore_eta_ev`, the pad), carried
+  as `SCSupport.plan` and the session's `"sigma_plan"`.
+- **Escape refuses** (ruling Q5). A protected read outside the near support
+  or a semicore read outside its patch refuses with
+  `GATE sigma_plan_escape`, naming the state. No clamp, no rebuild.
 
 ## Hamiltonian
 
-In the DFT basis, with endpoints read at the current QP energies:
-
-| block | rule |
-|---|---|
-| P–P, P–S, S–S | the half-sum ½[Σ_ij(E_i) + Σ_ij(E_j)], Hermitian part; a P endpoint reads the fine window, an S (coarse) endpoint the coarse window |
-| P–R, S–R | scissor arm: read at the active energy only (R contributes no endpoint); own arm: the half-sum with the rotating endpoint on its near grid or far patch |
-| R diagonal | scissor arm: E_DFT,o + β_above (law A); own arm: own-energy read |
-| R–R off-diagonal | zero (CLASSMIX: keeping the static block moves protected states ≤ 0.3 meV) |
-
-The QSGW kernel takes the two read masks from the SC map
-(`sc_sigma_protected_kn`, `sc_sigma_far_kn`; `qsgw_utils._qsgw_far_kernel`).
+Every QP-matrix block is the half-sum ½[Σ_ij(E_i) + Σ_ij(E_j)], Hermitian
+part; a protected endpoint reads the near grid, a semicore endpoint below it
+the semicore patch (`sc_sigma_protected_kn`, `sc_sigma_far_kn`;
+`qsgw_utils._qsgw_far_kernel`). There is no rotating class and no
+replaced diagonal: the cut, not a class, ends the matrix.
 
 ## Why
 
-- A rotating-diagonal error δβ reaches a protected state at second order,
-  |V|²δβ/Δ²; a coupling error δV at first order, 2|V|δV/Δ. Reading P–R
-  couplings only at the protected energy makes δV = ½[Σ_io(E_o) − Σ_io(E_i)],
-  of order V (CLASSMIX, claim 2896); far reads at η_far 1–2 eV recover most
-  of it (claims 2902, 2905, 2908).
+- **Only fitted pairs** (owner): in the PARTITION rounds the QP matrix
+  exceeded the ζ left range (Fe 1–35 vs 1–26, Si 1–28 vs 1–16, MoS2 1–44 vs
+  1–38), so those accuracy numbers used unfitted pairs.
 - From map 1 on Σ_x and W are built from every occupied orbital, so an
-  occupied state that rotates shifts every protected state (claim 2928).
+  occupied state is never in the tail (claim 2928).
 - A crossing window's node count follows its short side over η,
-  N ≈ 2.7 s/η + 20 (claim 2908): semicore reads at the deck η cost MoS2
-  1580 pairs per map and Fe 1685; at η_semi 1 eV, 490 and 909.
+  N ≈ 2.7 s/η + 20 (claim 2908): semicore reads at the deck η cost
+  1000–1700 pairs per map; η_semi 1 eV brings them near the budget.
 
 ## Measured (PARTITION round 5, 2026-09-28; not main)
 
