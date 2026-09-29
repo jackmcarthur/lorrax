@@ -127,7 +127,7 @@ energies, so it takes these dipoles at the same diagonal approximation.
 | bands | block of $H'$ |
 |---|---|
 | the QP matrix `[0, b3)` = the ζ fit's left range | full $\Sigma^{\rm QSGW}$, off-diagonals kept within the matrix |
-| its semicore bands `[0, b_semicore)` | full rows, read at their own energy on one held patch at $\eta_{\rm semi}$ = 1 eV (below) |
+| its coarse (semicore) states, occupied and below the lowest requested valence band | full rows, read at their own energy on one held patch at $\eta_{\rm semi}$ = 1 eV (below) |
 | the lowest `sc_frozen_core_bands` | held at the DFT block $\mathrm{diag}(E_{\rm DFT})$; they stay in the $\Sigma_x$ and $\chi_0$ sums |
 | the scissored tail `[b3, number_bands)` | DFT orbitals with an energy-only rigid shift, refit every map, in G and $\chi_0$ only: the $Z$-weighted mean QP correction of the matrix's conduction states that read their own $\Sigma(E)$ (below) |
 
@@ -146,8 +146,14 @@ state outside the fit would carry Σ on unfitted pairs. Above $E_F$ a dispersive
 the cost is the dropped Σ coupling to those tail bands (TWOCLASS, CLAIMS
 2945).
 
-**Semicore.** An occupied band below a band gap of at least 4 eV (all k) is
-semicore. It stays in the matrix and mixes fully, but its Σ is read on one
+**Semicore (the coarse class).** The fine window, read at the deck η, runs
+down to the minimum energy of the lowest requested valence band
+(`nelec − nval` at each k, the count below μ on a metal; `sigma_omega_min_ev`
+only lowers it). Every occupied state below that energy is coarse (owner,
+2026-09-29). No gap threshold decides it; a deck whose `nval` covers every
+occupied band has none. The rule is energy-based, so a coarse state inside
+the fine grid's lower pad reads the fine grid: the two windows may overlap.
+A coarse state stays in the matrix and mixes fully, but its Σ is read on one
 patch of the grid below the near support, at $\eta_{\rm semi}$ = 1 eV,
 sampled at $\eta_{\rm semi}/2$ (`qp_support.SEMICORE_*`). Only the crossing
 windows that own patch samples take $\eta_{\rm semi}$; the sign-definite

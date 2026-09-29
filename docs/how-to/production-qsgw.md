@@ -119,8 +119,9 @@ claim 2952) holds the rest of the recipe. It is not on main.
   (`GATE qp_matrix_zeta_left`). Every dynamic SC deck moves once: on Si 4³
   map 0 the ± 10 eV states move +48 meV mean, 167 meV max, all from b3
   (claim 2952).
-- **Semicore patch.** Bands below a gap of at least 4 eV are read on one held
-  patch at η_semi = 1 eV. It reproduces the study legs of claim 2945 on the
+- **Semicore patch.** Every occupied state below the lowest requested valence
+  band (`nval`) is coarse and read on one held patch at η_semi = 1 eV; the
+  fine window above it is read at the deck η, and the two may overlap. It reproduces the study legs of claim 2945 on the
   protected states within 0.69 meV (MoS2) and 0.10 meV (Si) at maps 0–2
   (claim 2952).
 - **Owner calls.** (a) The patch ε: 1e-2 biases semicore QP by +20 to

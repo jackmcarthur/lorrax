@@ -2658,20 +2658,25 @@ class SCSupport(NamedTuple):
     joined: np.ndarray | None = None     # patch samples + the near grid: what Sigma samples
 
 
-def _sc_semicore_bands(inputs):
-    """Semicore band count of the QP matrix on a route that reads the patch.
+def _sc_coarse_identities(inputs, shape):
+    """Coarse (semicore) identities on the loop k-set, a ``shape`` bool mask.
 
-    The bands [0, b_semicore) of the absolute band cut (``band_partition.
-    qp_band_cut``, decided before the ζ fit and kept on ``meta``).  Only the
-    scalar MPA/shared-pole Sigma reads the patch; a sector route reads the
-    near grid under main's rule, so it has none here.
+    Every state whose DFT energy lies below the coarse floor of the absolute
+    band cut (``band_partition.qp_band_cut``: the minimum energy of the lowest
+    requested valence band, decided before the ζ fit and kept on ``meta``).
+    Fixed for the run.  Only the scalar MPA/shared-pole Sigma reads the patch;
+    a sector route reads the near grid under main's rule, so it has none.
     """
     from .qp_support import semicore_patch_route
     cut = getattr(getattr(inputs, "meta", None), "qp_band_cut", None)
-    if cut is None or not semicore_patch_route(inputs.config.compute_mode,
-                                               inputs.wfns_transverse):
-        return 0
-    return int(cut.b_semicore)
+    if (cut is None or not cut.n_coarse
+            or not semicore_patch_route(inputs.config.compute_mode, inputs.wfns_transverse)):
+        return np.zeros(shape, dtype=bool)
+    ks = _kstar(inputs)
+    e_ry = (inputs.e_dft_active_kn_ry if ks.is_identity
+            else ks.select(inputs.e_dft_active_kn_ry))
+    e_ev = np.asarray(e_ry, dtype=np.float64) * RYD_TO_EV
+    return np.broadcast_to(e_ev < float(cut.coarse_floor_ev), shape)
 
 
 def _sc_sampled_support(inputs, partition, energies_loop, mu_ev, active_n=None,
@@ -2706,21 +2711,18 @@ def _sc_sampled_support(inputs, partition, energies_loop, mu_ev, active_n=None,
         support_partition.protected_mask | support_partition.in_range_mask,
         dtype=bool), energies_loop.shape)
     energy_relative_ev = energies_loop - mu_ev
-    # THE SEMICORE CLASS reads its own patch (gw.qp_support); every other
-    # QP-matrix identity is protected at the deck eta and reads the near grid.
-    n_semi = _sc_semicore_bands(inputs)
-    semicore = np.zeros(energies_loop.shape, dtype=bool)
-    semicore[:, :n_semi] = True
-    if n_semi:
-        # Semicore leaves R; every other band keeps main's W-active rule.
-        active_n = ((True if active_n is None else np.asarray(active_n, dtype=bool))
-                    & (np.arange(energies_loop.shape[1]) >= n_semi))
+    # THE COARSE (SEMICORE) CLASS reads its own patch (gw.qp_support); every
+    # other QP-matrix identity is protected at the deck eta, on the near grid.
+    semicore = _sc_coarse_identities(inputs, energies_loop.shape)
+    n_semi = int(np.count_nonzero(semicore))
     # Owner 2026-09-24: the requested states are the protected identities the
     # W model treats as active (``active_n``: shared_pole_recipe.active_band_mask
     # on the fixed DFT ladder), never frozen core; owner 2026-09-27: only
     # quasiparticles move the support.
     everyone = requested_states(sigma, inputs.config.sc.frozen_core_bands,
                                 energy_relative_ev, required_kn, active_n)
+    # Coarse leaves R; every other identity keeps main's W-active rule.
+    everyone = everyone & ~semicore
     quasiparticle = (None if z_in_kn is None else
                      quasiparticle_mask(np.broadcast_to(z_in_kn, energies_loop.shape)))
     states = everyone if quasiparticle is None else everyone & quasiparticle
@@ -3947,7 +3949,7 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
                        f"{int(state.iteration)}): [{_lo:+.2f}, {_hi:+.2f}] eV at eta "
                        f"{_eta:g} eV below the near grid [{expanded_grid[0]:+.2f}, "
                        f"{expanded_grid[-1]:+.2f}] eV; {int(sc_support.semicore.sum())} "
-                       "semicore (k,state) keep their full Sigma rows")
+                       "coarse (k,state) keep their full Sigma rows")
         from .qp_support import patch_on_grid_ev
         sigma_config = replace(
             inputs.config, sc_omega_grid_ev=tuple(float(x) for x in sc_support.joined),

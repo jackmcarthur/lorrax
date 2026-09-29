@@ -16,11 +16,14 @@ route) moves once. See [self-consistency §2](docs/self_consistency.md#2-band-tr
   38 → 44 (no tail), Fe 4³ charge 26 → 26, Na 8³ 86 → 10. Requested states
   above the cut become scissored tail (DFT ψ, rigid shift, no Σ); the log
   counts them. A need above `zeta_nband` refuses (`GATE qp_band_cut_zeta`).
-- **Semicore moves to a patch.** Occupied bands below a ≥ 4 eV band gap were
-  read at Σ(ω = 0) (below E_F − 15 eV) or on the near grid at the deck η.
-  On the scalar MPA/shared-pole route they are now read at their own energy
-  on one held patch at η_semi = 1 eV (Fe 3s/3p, MoS2 Mo 4s/4p and S 3s).
-  Sector (bispinor) routes keep the old rule.
+- **Semicore moves to a patch.** Every occupied state below the minimum
+  energy of the lowest requested valence band (`nval` counts down from E_F at
+  each k) is coarse: on the scalar MPA/shared-pole route it is read at its own
+  energy on one held patch at η_semi = 1 eV instead of at Σ(ω = 0) (below
+  E_F − 15 eV) or on the near grid at the deck η. No gap threshold decides the
+  class, and a deck whose `nval` covers every occupied band has none; a
+  smaller `nval` moves more valence states onto the patch. Sector (bispinor)
+  routes keep the old rule.
 - **A new refusal.** `zeta_nband` below b3 now refuses on every run,
   one-shot included (`GATE qp_matrix_zeta_left`; it was a warning).
 ## 2026-09-29 — shared-pole χ₀ direct stream through mathdx mode 11

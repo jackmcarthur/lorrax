@@ -22,7 +22,7 @@ The last section documents a different input file, the `[downfold]` deck.
 
 | key | type | default | meaning |
 |---|---|---|---|
-| `nval` | int | `5` | Valence edge of the Σ window: b1 = nelec − nval. It sets the ISDF pair-density right window, not the bottom of the QP window. |
+| `nval` | int | `5` | Valence edge of the Σ window: b1 = nelec − nval. It sets the ISDF pair-density right window, not the bottom of the QP window. On a dynamic self-consistent run it also sets the semicore (coarse) class: every occupied state below the lowest requested valence band is read on the 1 eV patch ([self-consistency §2](self_consistency.md#2-band-treatment)). |
 | `ncond` | int | `5` | Conduction bands in the Σ/QP window. Σ diagonals are computed for bands [0, nelec + ncond). On a dynamic self-consistent run (`qp_solver = self_consistent`) it only marks the requested states: the QP matrix is [0, b3) with b3 from the absolute band cut (`QP band cut` in the log; [self-consistency §2](self_consistency.md#2-band-treatment)), which may land above or below nelec + ncond. Requested states above the cut are scissored tail, counted in that log line. |
 | `number_bands` | int | `100` | Umbrella band count. It sets both the χ0/W band sum and the Σ band sum. |
 | `number_bands_chi` | int | unset (= `number_bands`) | Band count of the χ0/W sum. Its edge takes a strict `band_degeneracy` check and refuses on a split multiplet (`LORRAX_BAND_DEGENERACY=snap` warns instead). Setting it and `number_bands` to different values refuses. Changing it on `restart = true` refuses. |
