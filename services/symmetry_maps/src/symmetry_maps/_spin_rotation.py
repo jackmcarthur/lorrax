@@ -1,6 +1,5 @@
 """Local complex128 spin rotation; spatial symmetry stays in maps.py."""
 from functools import lru_cache, partial
-from pathlib import Path
 
 import jax
 import jax.numpy as jnp
@@ -20,15 +19,14 @@ _SPECS = {
 
 
 def _checkout_candidates():
-    """The checkout's build tree, the default the other two loaders search
-    (``src/ffi/cpp/build{,_host}/``); a pinned ``LORRAX_FFI_SO`` still wins."""
+    """The checkout's build tree, as the other two loaders search it
+    (``native_provider.checkout_build_dir``); a pinned ``LORRAX_FFI_SO``
+    still wins."""
     found = {}
     for name, sub in (("CUDA", "build"), ("cpu", "build_host")):
-        for parent in Path(__file__).resolve().parents:
-            cand = parent / "src" / "ffi" / "cpp" / sub / _SPECS[name]["so_name"]
-            if cand.is_file():
-                found[name] = [cand]
-                break
+        build_dir = native_provider.checkout_build_dir(__file__, sub)
+        if build_dir is not None:
+            found[name] = [build_dir / _SPECS[name]["so_name"]]
     return found
 
 

@@ -52,6 +52,7 @@ failure signatures. [`tests/hsuite/README.md`](../tests/hsuite/README.md) owns
 the fixture, the coverage table and the tolerances.
 
 ```bash
+source config/perlmutter/gpu_env.sh   # Perlmutter machine settings
 # the verdict: four pytest ranks, each running its own driver processes
 srun --jobid=$JOBID -N 1 -n 4 --gpus-per-node=4 src/ffi/cpp/select_gpu.sh \
   .venv/bin/python -m pytest tests/hsuite -q -p no:cacheprovider

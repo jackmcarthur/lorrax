@@ -78,13 +78,18 @@ build. Sealing a pair for other users is
 ## 3. Run the test suite {#suite}
 
 ```bash
+source config/perlmutter/gpu_env.sh
 srun --jobid=$JOBID -N 1 -n 4 --gpus-per-node=4 src/ffi/cpp/select_gpu.sh \
   .venv/bin/python -m pytest tests/hsuite -q -p no:cacheprovider
 ```
 
-The result is `1 passed` in about 5 min on cold caches. Set no environment
-variable. [Contributing](../contributing.md#the-test-suite) owns what the suite
-checks.
+The result is `1 passed` in about 5 min on cold caches.
+[Contributing](../contributing.md#the-test-suite) owns what the suite checks.
+
+- `config/perlmutter/gpu_env.sh` holds the machine's run settings; today it
+  sets only `MPICH_GPU_SUPPORT_ENABLED=0`
+  ([why](../environment/machines/perlmutter.md#2-the-lorrax_a-module-and-the-ffi-bundle)).
+  Source it once per shell before any GPU `srun`. Nothing else needs setting.
 
 - Use one rank per GPU. `select_gpu.sh` pins each rank to one GPU and leaves
   the other three visible, which NCCL needs. `--gpus-per-task=1` hides them,

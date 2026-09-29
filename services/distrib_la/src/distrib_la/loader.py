@@ -189,22 +189,14 @@ _ERR_CAP = 512
 
 def _checkout_build_dir(platform: str) -> Optional[Path]:
     """``<lorrax>/src/ffi/cpp/<build_subdir>``, when this service sits
-    inside a LORRAX checkout.
+    inside a LORRAX checkout (``lxkit.native_provider.checkout_build_dir``).
 
-    The ``.so`` is a LORRAX build artifact, so an in-tree build directory
-    is a real candidate whenever there is an in-tree — but distrib_la
-    installs standalone too, where there is no ``src/ffi/cpp`` at all.
-    Walk up rather than hard-code a depth: the answer must not change if
-    the service directory moves.  ``None`` means "installed on its own",
-    and then the env pin (or ``sys.path``) is the only route, which is
-    what the not-found message says.
+    distrib_la installs standalone too, where there is no ``src/ffi/cpp``;
+    ``None`` then leaves the env pin (or ``sys.path``) as the only route,
+    which is what the not-found message says.
     """
-    tail = Path("src") / "ffi" / "cpp" / _PLATFORMS[platform]["build_subdir"]
-    for parent in Path(__file__).resolve().parents:
-        cand = parent / tail
-        if cand.is_dir():
-            return cand
-    return None
+    return _native.checkout_build_dir(
+        __file__, _PLATFORMS[platform]["build_subdir"])
 
 
 def _candidate_paths(platform: str) -> list[Path]:

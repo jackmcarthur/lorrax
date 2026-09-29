@@ -34,6 +34,7 @@ On Perlmutter, the fixture chain alone (one GPU, output on a shared
 filesystem) is
 
 ```bash
+source config/perlmutter/gpu_env.sh
 srun --jobid=$JOBID -N 1 -n 1 --gpus-per-node=1 \
   .venv/bin/python -m tests.hsuite.chain --out "$SCRATCH/lorrax_quickstart_$(date +%s)"
 ```

@@ -715,7 +715,10 @@ fi
 say "--- GATE 11 (handler-signature ABI) ---"
 _abi_sym="lorrax_ffi_${LEG}_abi_version"
 _stamp_abi="$(printf '%s\n' "$STAMP" | grep -oE 'abi=[0-9]+' | cut -d= -f2 | head -1)"
-if ! printf '%s\n' "$DEFINED" | grep -qx "$_abi_sym"; then
+# A here-string, not `printf | grep -q`: on the CUDA leg the table outgrows
+# the pipe buffer, grep -q exits at the match, printf dies of SIGPIPE, and
+# pipefail turned every stamped CUDA leg into "does not export" (2026-09-29).
+if ! grep -qx "$_abi_sym" <<<"$DEFINED"; then
     # COULD NOT RUN, not FAILED, and the distinction is the same one the
     # Python loaders make.  An UNSTAMPED library was built before 2026-08-08;
     # that is not evidence it is wrong, and the deployed pair plus every

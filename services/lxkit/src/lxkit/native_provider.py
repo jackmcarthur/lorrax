@@ -38,7 +38,8 @@ from lxkit.probe import LibraryNotBuilt, LibraryUnusable
 
 __all__ = [
     "BUNDLE_MANIFEST", "BundleAttestation", "NativeAbiMismatch",
-    "assert_one_mapped_mpi_runtime", "check_abi", "describe_library",
+    "assert_one_mapped_mpi_runtime", "check_abi", "checkout_build_dir",
+    "describe_library",
     "is_private_redistributable", "locate_library", "open_and_attest",
     "process_can_use_cuda",
     "refuse_private_library",
@@ -294,6 +295,24 @@ def _read_bundle(manifest: Path, *, expected_abi: int,
         manifest_path=manifest, bundle_root=root, bundle_id=bundle_id,
         source_revision=revision, abi=abi, libraries=paths,
         library_hashes=hashes, private_libraries=tuple(private))
+
+
+def checkout_build_dir(anchor: str | Path, build_subdir: str) -> Path | None:
+    """``<checkout>/src/ffi/cpp/<build_subdir>`` for the nearest LORRAX
+    checkout above ``anchor`` (a caller's ``__file__``), or ``None``.
+
+    The one in-tree search every provider loader uses, so the default
+    candidate order has one source of truth.  Walk up rather than hard-code
+    a depth: the answer must not change if a service directory moves.
+    ``None`` means "installed on its own"; then only the env pin (or
+    ``sys.path``) can select a library.
+    """
+    tail = Path("src") / "ffi" / "cpp" / build_subdir
+    for parent in Path(anchor).resolve().parents:
+        cand = parent / tail
+        if cand.is_dir():
+            return cand
+    return None
 
 
 def _same_file(a: Path, b: Path) -> bool:

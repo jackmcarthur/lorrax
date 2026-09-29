@@ -88,7 +88,10 @@ refuses a library whose handler ABI differs from the source's and announces
 an unsealed library as `LEGACY-UNSEALED`. The mathdx k-convolution also needs
 the `nvidia-mathdx` wheel in the venv (`GATE mathdx-headers` otherwise).
 Cray MPICH GPU support is off (`MPICH_GPU_SUPPORT_ENABLED=0`); cuSOLVERMp and
-cuBLASMp communicate through NCCL. Each leg carries the pinned HDF5 and MPICH
+cuBLASMp communicate through NCCL. The site's default `craype-accel-nvidia80`
+exports `1`, and then `MPI_Init` in either leg aborts ("GTL library is not
+linked"). The module sets `0`; a clone's GPU steps source
+`config/perlmutter/gpu_env.sh`, which sets it. Each leg carries the pinned HDF5 and MPICH
 lib dirs on its RPATH, because `/opt/cray/pe/lib64` points
 `libhdf5_parallel_gnu.so.310` at the site-default HDF5, which links the
 site-default MPI. The legs build with `config/perlmutter/build_ffi_host.sh`
