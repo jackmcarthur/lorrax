@@ -2623,10 +2623,9 @@ class SCSupport(NamedTuple):
     event: str                 # one-shot | plan | hold | rebuild
     envelope: tuple | None     # protected envelope at the last plan, eV
     clamped_kn: np.ndarray      # protected states whose read stencil is clipped
-    plan: object = None         # the held gw.qp_support.SigmaPlan (near + far)
+    plan: object = None         # the held gw.qp_support.SigmaPlan (near + semicore patch)
     near_read: np.ndarray | None = None   # identities read on the near grid this map
-    far_read: np.ndarray | None = None    # identities read on the held patches this map
-    own_kn: np.ndarray | None = None      # rotating identities read at their own energy (fixed at map 0)
+    far_read: np.ndarray | None = None    # identities read on the held semicore patch this map
     zero_read: np.ndarray | None = None   # semicore identities read at Sigma(omega = 0)
 
 
@@ -2635,7 +2634,8 @@ def _sc_sampled_support(inputs, partition, energies_loop, mu_ev):
 
     Owner ruling Q5 (2026-09-28): a protected state whose read stencil leaves
     the held support refuses by name (``GATE sigma_plan_escape``). There is no
-    clamp and no rebuild.
+    clamp and no rebuild. Every QP-matrix state is protected or semicore; the
+    tail above the band cut reads nothing.
     """
     if not inputs.config.compute_mode.is_dynamic:
         return None
@@ -2646,11 +2646,10 @@ def _sc_sampled_support(inputs, partition, energies_loop, mu_ev):
     deck = np.asarray(inputs.config.omega_grid_ev, dtype=float)
     part = _partition_on_loop(partition, inputs)
     energy = energies_loop - mu_ev
-    from .qp_support import ROTATING_READ, SEMICORE_READ
+    from .qp_support import SEMICORE_READ
     active = requested_states(energy, part.protected_mask)
     semicore = _sc_semicore_loop(inputs, active.shape)
     states = active & ~semicore               # read on the near grid at the deck eta
-    rotating = ~active
     # SEMICORE_READ = "sigma0": semicore reads Sigma(omega = 0) on the near
     # grid (no semicore patches, no semicore escape).
     zero_read = semicore if SEMICORE_READ == "sigma0" else np.zeros_like(semicore)
@@ -2667,52 +2666,35 @@ def _sc_sampled_support(inputs, partition, energies_loop, mu_ev):
         tile = lambda m: np.tile(m, (1 + reps, 1))
         plan = plan_sigma_windows(
             sigma, stack(energy, probe), tile(states),
-            rotating_energy_rel_ev=stack(e_dft, probe),
-            rotating_kn=(tile(rotating) if far_route and rotating.any()
-                         and ROTATING_READ == "own" else None),
+            semicore_energy_rel_ev=stack(e_dft, probe),
             semicore_kn=tile(semicore) if far_route and semicore.any() else None,
-            far_pad_ev=derived_pad_ev(e_dft, probe, rotating),
             semicore_pad_ev=derived_pad_ev(e_dft, probe, semicore))
         grid, envelope = plan.grid_ev, plan.envelope_ev
         event = ("one-shot" if session is None else "plan" if probe is None
                  else "plan from DFT + map-0 probe")
-        # Q3 CONTINUITY: each rotating state's read mode is fixed here. Own
-        # energy where the near grid or a rotating patch covers its DFT
-        # energy and every map-0 estimate; side scissor otherwise, for good.
-        inside = lambda x: (((x >= grid[0]) & (x <= grid[-1]))
-                            | far_patch_covered(x, plan.far_patches_ev))
-        own = (rotating & inside(e_dft) if far_route and ROTATING_READ == "own"
-               else np.zeros_like(rotating))
-        if probe is not None and far_route:
-            own = own & np.all(inside(probe).reshape((reps,) + energy.shape), axis=0)
         if session is not None:
             session["sigma_plan"] = plan
             session["far_patches_ev"] = plan.patches
-            session["rotating_own_kn"] = own
     else:
         plan = session["sigma_plan"]
         grid = np.asarray(session["omega_grid_ev"], float)
         envelope = session["support_envelope_ev"]
-        own = np.asarray(session["rotating_own_kn"], bool)
         event = "hold"
     outside = clamped_reads(energy, states, grid)
     # The Hamiltonian reads Sigma at E itself; the +-0.5 eV Z stencil is
     # one-sided at an edge by design (eqp_bgw.compute_z_factor_from_omega_grid).
     in_grid = (energy >= grid[0]) & (energy <= grid[-1])
     in_semi = far_patch_covered(energy, plan.semicore_ev)
-    in_far = far_patch_covered(energy, plan.far_patches_ev)
-    # Overlap (owner, round 5: "these may overlap slightly"): a coarse state
-    # inside the fine window reads the fine grid; below it, the coarse window.
+    # Overlap (owner, round 5: "these may overlap slightly"): a semicore state
+    # inside the near window reads the near grid; below it, the semicore patch.
     # The read follows the state each map; no patch enters the near grid.
     semi_far = semicore & ~in_grid
-    escaped = ((states & ~in_grid) | (semi_far & ~in_semi)
-               | (own & ~in_grid & ~in_far))
+    escaped = (states & ~in_grid) | (semi_far & ~in_semi)
     if escaped.any():
         ks_, ns = np.nonzero(escaped)
         worst = int(np.argmax(np.maximum(grid[0] - energy[ks_, ns],
                                          energy[ks_, ns] - grid[-1])))
-        kind = ("protected" if states[ks_[worst], ns[worst]] else "semicore"
-                if semicore[ks_[worst], ns[worst]] else "rotating own-energy")
+        kind = "protected" if states[ks_[worst], ns[worst]] else "semicore"
         raise ValueError(
             f"GATE sigma_plan_escape: {int(escaped.sum())} Sigma reads left the plan "
             f"made at SC map 0 (event {event}; near [{grid[0]:+.3f}, {grid[-1]:+.3f}] eV, "
@@ -2721,10 +2703,9 @@ def _sc_sampled_support(inputs, partition, energies_loop, mu_ev):
             f"{int(ns[worst]) + int(inputs.band_slices.b0) + 1} at "
             f"E-mu={float(energy[ks_[worst], ns[worst]]):+.4f} eV. The plan is held "
             "with no clamp and no rebuild (owner ruling 2026-09-28).")
-    near_read = states | zero_read | (semicore & in_grid) | (own & in_grid)
-    far_read = semi_far | (own & ~in_grid)
+    near_read = states | zero_read | (semicore & in_grid)
     return SCSupport(deck, grid, energy, states, event, envelope, outside, plan,
-                     near_read, far_read, own, zero_read)
+                     near_read, semi_far, zero_read)
 
 
 def _sc_semicore_loop(inputs, shape):
@@ -2869,16 +2850,13 @@ def _classify_sc_partition(
             f"in_range={_band_ranges(partition.in_range_mask, band_offset=int(inputs.band_slices.b0))}; "
             "no band enters or leaves the set for the rest of the loop.")
     else:
-        classes = _sc_band_classes(inputs, e_reference_loop, mu_ev)
-        active = classes.protected | classes.semicore
+        semicore = _sc_band_classes(inputs, e_reference_loop, mu_ev)
+        active = np.ones(semicore.shape, bool)
         partition = BandPartition(jnp.asarray(active), jnp.asarray(active))
-        _record_sc(inputs, f"SC band classes: {int(classes.protected.sum())} protected, "
-                   f"{int(classes.semicore.sum())} semicore, {int((~active).sum())} "
-                   f"rotating (k,state); protected set from "
-                   f"{classes.valence_bottom_ev - mu_ev:+.3f} eV to the cut "
-                   f"{classes.cut_ev - mu_ev:+.3f} eV in the global gap "
-                   f"[{classes.gap_ev[0] - mu_ev:+.3f}, {classes.gap_ev[1] - mu_ev:+.3f}] eV "
-                   "(about mu); every occupied state is active")
+        _record_sc(inputs, f"SC band classes: {int((~semicore).sum())} protected, "
+                   f"{int(semicore.sum())} semicore (k,state); the QP matrix ends at the "
+                   f"absolute band cut b3={int(inputs.band_slices.b3)} (= the zeta fit's "
+                   "left range); every QP-matrix state keeps its full Sigma row")
     if frozen_partition and inputs.fixed_quadrature_session is not None \
             and "semicore_kn" not in inputs.fixed_quadrature_session:
         _sc_band_classes(inputs, e_reference_loop, mu_ev)
@@ -2890,9 +2868,16 @@ def _classify_sc_partition(
 
 
 def _sc_band_classes(inputs, e_reference_loop, mu_ev):
-    """Owner scheme round 2 classes on the loop k-set; stores the semicore mask."""
-    from .band_partition import sc_band_classes
-    from .qp_support import CUT_GAP_ETAS, CUT_SEARCH_ETAS, WINDOW_CLIP_EV
+    """Semicore identities of the QP matrix on the loop k-set; stores the mask.
+
+    Semicore: the bands below the highest band gap of at least
+    SEMICORE_GAP_EV under the valence manifold (``band_partition.qp_band_cut``,
+    the same rule the band cut used before the ζ fit). On a route without
+    patches (sector routes) they read the near grid at the deck eta.
+    """
+    from .band_partition import qp_band_cut
+    from .qp_support import (CUT_GAP_ETAS, CUT_SEARCH_ETAS, SEMICORE_GAP_EV,
+                             WINDOW_CLIP_EV)
     e = np.asarray(e_reference_loop, float)
     nk, nb = e.shape
     metal = inputs.material_class == "metal"
@@ -2900,27 +2885,25 @@ def _sc_band_classes(inputs, e_reference_loop, mu_ev):
     range_mu = (mu_ev if metal else 0.5 * (float(np.max(e[:, n_occ - 1]))
                                            + float(np.min(e[:, n_occ]))))
     below = (np.count_nonzero(e < mu_ev, axis=1) if metal else np.full(nk, n_occ))
-    idx = np.arange(nb)[None, :]
-    occupied = idx < below[:, None]
-    requested = ((idx >= np.maximum(below - int(inputs.config.nval), 0)[:, None])
-                 & (idx < np.minimum(below + int(inputs.config.ncond), nb)[:, None]))
-    classes = sc_band_classes(
-        e, occupied_kn=occupied, requested_kn=requested, range_mu_ev=range_mu,
-        range_ev=(inputs.config.sigma.omega_min_ev, inputs.config.sigma.omega_max_ev),
-        clip_ev=WINDOW_CLIP_EV,
-        cut_gap_ev=CUT_GAP_ETAS * float(inputs.config.sigma.regularization_ev),
-        cut_search_ev=CUT_SEARCH_ETAS * float(inputs.config.sigma.regularization_ev),
-        far_route=(inputs.wfns_transverse is None
-                   and inputs.config.compute_mode is ComputeMode.MPA))
+    eta = float(inputs.config.sigma.regularization_ev)
+    cut = qp_band_cut(e, n_below_k=below, nval=int(inputs.config.nval),
+                      ncond=int(inputs.config.ncond), mu_ev=range_mu,
+                      clip_ev=WINDOW_CLIP_EV, cut_gap_ev=CUT_GAP_ETAS * eta,
+                      cut_search_ev=CUT_SEARCH_ETAS * eta, semicore_gap_ev=SEMICORE_GAP_EV)
+    far_route = (inputs.wfns_transverse is None
+                 and inputs.config.compute_mode is ComputeMode.MPA)
+    semicore = np.zeros((nk, nb), bool)
+    if far_route:
+        semicore[:, :cut.b_semicore] = True
     session = inputs.fixed_quadrature_session
     if session is not None:
-        session["semicore_kn"] = classes.semicore
+        session["semicore_kn"] = semicore
     from .band_partition import coarse_band_report
-    rows = coarse_band_report(e, classes.semicore, mu_ev=range_mu,
+    rows = coarse_band_report(e, semicore, mu_ev=range_mu,
                               band_offset=int(inputs.band_slices.b0))
-    _record_sc(inputs, "SC coarse (occupied below the lowest requested band) bands: "
-               + ("; ".join(rows) if rows else "none"))
-    return classes
+    _record_sc(inputs, "SC semicore bands (below a band gap >= "
+               f"{SEMICORE_GAP_EV:g} eV): " + ("; ".join(rows) if rows else "none"))
+    return semicore
 
 
 #: One SC map's named stages (label, outermost timing row). The per-map line
@@ -2970,7 +2953,7 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
     THE ONE PLAN AT MAP 0.  Map 0 first evaluates Sigma on the plan from the
     DFT energies (2 eV outer pad).  If a protected state's map-0 QP estimate
     (the diagonal of the map-0 QSGW Hamiltonian) falls outside that support,
-    or a rotating one outside the near support and every far patch, the plan
+    or a semicore one outside the near support and the semicore patch, the plan
     is made once more from the DFT energies AND those estimates, with the
     same pad, and map 0 is re-evaluated on it with the same W.  That plan is
     then held; a later escape refuses (``GATE sigma_plan_escape``).  An
@@ -3903,17 +3886,13 @@ def _gw_iteration_map_once(state: SCState, inputs: SCInputs) -> SCState:
         sigma_config = replace(sigma_config, sc_sigma_far_kn=_to_sorted(sc_support.far_read))
     if sc_support is not None and sc_support.zero_read is not None and sc_support.zero_read.any():
         sigma_config = replace(sigma_config, sc_sigma_zero_kn=_to_sorted(sc_support.zero_read))
-    # ROTATING-BAND FAR PATCHES: planned once at map 0 over the rotating DFT
-    # energies outside the near support, then held. Each is an independent
-    # Sigma delivery at FAR_PATCH_ETA_EV; rotating endpoints (couplings and
-    # the rotating diagonal) read it instead of the protected-endpoint rule.
+    # THE SEMICORE PATCH: planned once at map 0 over the semicore DFT energies
+    # below the near support, then held. It is an independent Sigma delivery
+    # at SEMICORE_ETA_EV; semicore endpoints below the near grid read it.
     far_patches = () if sc_support is None else tuple(sc_support.plan.patches)
     if sc_support is not None and sc_support.event != "hold":
         _plan = sc_support.plan
-        _record_sc(inputs, "    SC held patches (planned once): rotating "
-                   + (", ".join(f"[{a:+.2f}, {b:+.2f}]@{e:g}" for (a, b), e in
-                                zip(_plan.far_patches_ev, _plan.far_eta_ev)) or "none")
-                   + f" (pad {_plan.far_pad_ev:.2f} eV); semicore "
+        _record_sc(inputs, "    SC held patches (planned once): semicore "
                    + (", ".join(f"[{a:+.2f}, {b:+.2f}]@{e:g}" for (a, b), e in
                                 zip(_plan.semicore_ev, _plan.semicore_eta_ev)) or "none")
                    + f" (pad {_plan.semicore_pad_ev:.2f} eV)")
@@ -4064,46 +4043,9 @@ def _gw_iteration_map_once(state: SCState, inputs: SCInputs) -> SCState:
              ("delta_h_dft", delta_h_dft),
              ("H_qp_dft_full", H_qp_dft_full)),
             inputs.print_fn)
-    # The fixed DFT partition owns which endpoint carries dynamic Sigma.
-    # Keep protected–rotating couplings; replace only the rotating block.
-    # Owner ruling Q3 (2026-09-28): a rotating diagonal is its own-energy
-    # read wherever the near support or a far patch covers its current
-    # energy; elsewhere (no patch covers it, or a sector route without
-    # patches) it is its DFT energy plus the side scissor (law A): the mean
-    # QP correction H_ii - E_i of the protected occupied (empty) states.
-    from .band_partition import rotating_band_hamiltonian, rotating_diagonal
-    target = np.asarray(e_dft_fit, float).copy()
-    rotating_loop = ~np.asarray(protected_loop, dtype=bool)
-    if rotating_loop.any():
-        from .qsgw_utils import static_sigma_diag_to_host
-        from .scissor import k_star_weights
-        own = static_sigma_diag_to_host(H_qp_dft_full, inputs.mesh_xy).real
-        # The read mode is fixed at map 0 (Q3 continuity): own-energy states
-        # stay own-energy (an escape refused above), the rest are scissored.
-        uncovered = rotating_loop & ~(
-            np.zeros_like(rotating_loop) if sc_support is None or sc_support.own_kn is None
-            else np.asarray(sc_support.own_kn, bool))
-        target = own
-        if uncovered.any():
-            empty_kn = ~np.asarray(valence_kn, dtype=bool)
-            occupied_kn = np.asarray(valence_kn, dtype=bool)
-            if scissor_classes is not None:
-                empty_kn = empty_kn & ~crossing_kn
-                occupied_kn = occupied_kn & ~crossing_kn
-            scissored, law = rotating_diagonal(
-                own, np.asarray(e_dft_fit, float), np.asarray(protected_loop, dtype=bool),
-                below_kn=e_dft_fit_ev < float(_mu_ev),
-                fit_below_kn=occupied_kn, fit_above_kn=empty_kn,
-                k_weights=k_star_weights(ks))
-            target = np.where(uncovered, scissored, own)
-            _record_sc(inputs, f"    SC rotating diagonal: {int(uncovered.sum())} of "
-                       f"{int(rotating_loop.sum())} rotating (k,state) scissored since "
-                       f"map 0 ({law}); the rest read their own energy")
-        else:
-            _record_sc(inputs, f"    SC rotating diagonal: own-energy read on all "
-                       f"{int(rotating_loop.sum())} rotating (k,state)")
-    H_qp_dft_new = rotating_band_hamiltonian(
-        H_qp_dft_full, jnp.asarray(protected_loop), jnp.asarray(target), inputs.mesh_xy)
+    # Every QP-matrix state is protected or semicore and keeps its full
+    # Sigma row; the band cut, not a class, ends the matrix (gw.band_partition).
+    H_qp_dft_new = H_qp_dft_full
 
     _session = inputs.fixed_quadrature_session
     if (sc_support is not None and _session is not None and int(state.iteration) == 0
@@ -4131,8 +4073,8 @@ def _gw_iteration_map_once(state: SCState, inputs: SCInputs) -> SCState:
         near_states = np.tile(np.asarray(sc_support.requested, bool), (2, 1))
         escape_p = near_states & beyond
         # Patch pads are derived from the probe (max |E_map0 - E_DFT| + 2 eV),
-        # so a deck with semicore or rotating states always plans once more.
-        patched = bool(sc_support.plan.patches) or bool(np.any(sc_support.own_kn))
+        # so a deck with semicore states always plans once more.
+        patched = bool(sc_support.plan.patches)
         _session["probe_energy_ev"] = probe
         if escape_p.any() or patched:
             _record_sc(inputs, f"    SC map 0 probe: {int(escape_p.sum())} protected QP "
@@ -5900,8 +5842,7 @@ def _run_anderson(
     _metric_np[:, :nb, :nb] = metric_k * (_fit_mask[:, :, None] | _fit_mask[:, None, :])
     print_fn(
         "  SC Anderson metric: full-grid star-weighted Gram over "
-        "protected-protected and protected-rotating DFT entries; rotating "
-        "diagonals follow the map")
+        "entries with at least one requested identity")
     try:
         result = anderson_nojit(
             residual_fn,

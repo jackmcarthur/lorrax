@@ -942,7 +942,7 @@ clears-fh-and-the-tile-null-still-refuses.md`` §3).
 	nothing downstream would notice.  :func:`assert_isdf_window_is_the_max`
 	states the invariant where it can fail; this is why.
 	"""
-	left = (band_slices.b0, band_slices.b3_requested or band_slices.b3)
+	left = (band_slices.b0, band_slices.b3)
 	right = (band_slices.b0, band_slices.b4)
 	if zeta_nband is None:
 		return left, right
@@ -954,21 +954,32 @@ clears-fh-and-the-tile-null-still-refuses.md`` §3).
 			f"centroid ψ spans [b0, b4) = [{band_slices.b0}, "
 			f"{band_slices.b4}).  zeta_nband can only NARROW the ζ-fit "
 			f"window; it cannot move it outside the loaded bands.")
-	left = (band_slices.b0, min(band_slices.b3_requested or band_slices.b3, b4_zeta))
+	assert_qp_matrix_fitted(band_slices, b4_zeta)
+	left = (band_slices.b0, band_slices.b3)
 	right = (band_slices.b0, b4_zeta)
 	log(f"    ζ-fit window DECOUPLED from the band sum: logical physical "
 	    f"edge zeta_nband={b4_zeta}; the loaded band carrier ends at "
 	    f"b4={band_slices.b4} (any tail above the logical loaded extent is "
 	    f"exact-zero mesh padding).  ζ is fitted on left {left} x right "
 	    f"{right}.")
-	if band_slices.b3 > b4_zeta:
-		log(f"    *** zeta_nband={b4_zeta} is BELOW the Σ evaluation window's "
-		    f"top b3={band_slices.b3}.  Quasiparticle energies for bands "
-		    f"[{b4_zeta}, {band_slices.b3}) are then built on pair densities "
-		    f"whose bra leg was never fitted — the ζ basis is EXTRAPOLATED "
-		    f"there.  Lower ncond to {b4_zeta - band_slices.b2} if those "
-		    f"bands are wanted. ***")
 	return left, right
+
+
+def assert_qp_matrix_fitted(band_slices, zeta_left_top):
+	"""Refuse a QP matrix that reaches past the ζ fit's left range (owner, 2026-09-28).
+
+	The ζ fit is least squares on pairs ψ_i*ψ_j with i in the left range
+	[b0, zeta_left_top). A QP-matrix state above that edge carries Σ built on
+	pairs the fit never saw and mixes into fitted states: "if it's not fitted
+	correctly by the isdf lstsq fitting it's not correct". One check, one name.
+	"""
+	b3, top = int(band_slices.b3), int(zeta_left_top)
+	if b3 > top:
+		raise ValueError(
+			f"GATE qp_matrix_zeta_left: the QP matrix [{int(band_slices.b0)}, {b3}) "
+			f"reaches past the ζ fit's left range [{int(band_slices.b0)}, {top}); "
+			f"bands [{top}, {b3}) would carry Σ on unfitted pairs.  Raise "
+			f"zeta_nband to at least {b3} or lower ncond to {top - int(band_slices.b2)}.")
 
 
 
@@ -3312,6 +3323,41 @@ def prepare_isdf_and_wavefunctions(
 	)
 
 
+def qp_band_cut_for_deck(config, wfn, print0):
+    """The SC run's absolute band cut from the loaded DFT ladder, before the ζ fit.
+
+    The QP matrix, and with it the ζ fit's left range, is [0, b3). Bands
+    [b3, nband) are the scissored tail (``gw.band_partition``).
+    """
+    from common.units import RYD_TO_EV
+    from .band_partition import qp_band_cut
+    from .gw_config import infer_material_class
+    from .qp_support import (CUT_GAP_ETAS, CUT_SEARCH_ETAS, SEMICORE_GAP_EV,
+                             WINDOW_CLIP_EV)
+    e = np.asarray(wfn.energies[0, :, :config.nband], dtype=np.float64) * RYD_TO_EV
+    n_occ = int(wfn.nelec)
+    metal = infer_material_class(wfn.occs) == "metal"
+    mu = (float(wfn.efermi) * RYD_TO_EV if metal
+          else 0.5 * (float(e[:, n_occ - 1].max()) + float(e[:, n_occ].min())))
+    below = np.count_nonzero(e < mu, axis=1) if metal else np.full(e.shape[0], n_occ)
+    eta = float(config.sigma.regularization_ev)
+    cut = qp_band_cut(
+        e, n_below_k=below, nval=int(config.nval), ncond=int(config.ncond), mu_ev=mu,
+        clip_ev=WINDOW_CLIP_EV, cut_gap_ev=CUT_GAP_ETAS * eta,
+        cut_search_ev=CUT_SEARCH_ETAS * eta, semicore_gap_ev=SEMICORE_GAP_EV,
+        omega_max_rel_ev=config.sigma.omega_max_ev)
+    width = cut.gap_ev[1] - cut.gap_ev[0]
+    print0(f"  QP band cut (absolute, from the DFT ladder about mu={mu:+.4f} eV): "
+           f"QP matrix = zeta left = bands 1-{cut.b3}; tail {cut.b3 + 1}-{int(config.nband)} "
+           f"scissored (DFT psi, no Sigma, no mixing); cut {cut.cut_ev - mu:+.3f} eV in the "
+           f"band gap [{cut.gap_ev[0] - mu:+.3f}, {cut.gap_ev[1] - mu:+.3f}] eV (width "
+           f"{width:.3f} eV); top of the need {cut.top_ev - mu:+.3f} eV; semicore bands 1-"
+           f"{cut.b_semicore}" + (f" below the gap [{cut.semicore_gap_ev[0] - mu:+.3f}, "
+                                  f"{cut.semicore_gap_ev[1] - mu:+.3f}] eV" if cut.b_semicore else "")
+           + f"; {cut.n_requested_tail} requested (k,state) in the tail")
+    return cut
+
+
 def prepare_band_metadata(centroid_indices, config, mesh_xy, n_rmu, print0, sym, wfn):
     """Produce the physical and padded band windows on the packed centroid basis."""
     from common import Meta
@@ -3323,10 +3369,11 @@ def prepare_band_metadata(centroid_indices, config, mesh_xy, n_rmu, print0, sym,
     mu_basis = PackedCentroidBasis.build(
         centroid_indices, sym, wfn.fft_grid, mesh_xy)
     print0(f"  {mu_basis.describe()}")
-    rotating_bands = config.compute_mode.is_dynamic and config.qp_solver == "self_consistent"
+    ncond = int(config.ncond)
+    if config.compute_mode.is_dynamic and config.qp_solver == "self_consistent":
+        ncond = qp_band_cut_for_deck(config, wfn, print0).b3 - int(wfn.nelec)
     meta = Meta.from_system(wfn, sym,
-                            int(config.nval),
-                            (config.nband - int(wfn.nelec) if rotating_bands else int(config.ncond)), config.nband,
+                            int(config.nval), ncond, config.nband,
                             n_rmu, charge_bispinor,
                             nband_chi=config.bands.chi,
                             nband_sigma=config.bands.sigma,
@@ -3338,9 +3385,6 @@ def prepare_band_metadata(centroid_indices, config, mesh_xy, n_rmu, print0, sym,
     band_slices = BandSlices.from_band_edges(
         *meta.band_edges, b4_chi=meta.b_id_4_chi,
         b4_sigma=meta.b_id_4_sigma, b4_logical=meta.b_id_4_user)
-    if rotating_bands:
-        from dataclasses import replace
-        band_slices = replace(band_slices, b3_requested=int(wfn.nelec) + int(config.ncond))
     zeta_fit_edge = resolve_zeta_fit_edge(
         band_slices, getattr(config, "zeta_nband", None))
     print0(f"  {config.bands.describe(zeta_fit_edge)}")

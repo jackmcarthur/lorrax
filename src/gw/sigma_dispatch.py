@@ -669,8 +669,12 @@ def finalize_dynamic_sigma(
         print_fn(f"  QSGW: {int(qsgw_diag['n_clipped'])} clipped "
                  f"({100*qsgw_diag['frac_clipped']:.1f}%)"
                  + ("" if sigma_c_far is None else
-                    f"; rotating endpoints read far patches, "
+                    f"; semicore endpoints read the semicore patch, "
                     f"{int(qsgw_diag['n_far_clipped'])} outside every patch"))
+        far_kn = getattr(config, "sc_sigma_far_kn", None)
+        if sigma_c_far is not None and far_kn is not None and np.any(far_kn):
+            _report_patch_z(sigma_c_far, far_kn, e_qp_rel_ev, mesh_xy,
+                            sigma_band_axis, print_fn)
 
         sigma_lorentz = None
         if sigma_lorentz_static_skij_ry is not None:
@@ -1385,6 +1389,35 @@ def _compute_mpa_sigma(
         print_fn=print_fn,
         efermi_ry=sigma_efermi_ry,
         efermi_provenance=sigma_efermi_provenance)
+
+
+def _report_patch_z(sigma_c_far, far_kn, e_rel_ev, mesh_xy, band_axis, print_fn):
+    """Semicore Z on the held patch: the SC loop's own +-0.5 eV stencil (eqp_bgw).
+
+    One line per map: min / median / max over the patch-read (k, state) and
+    the states with Z outside (0, 1], named by band (owner question,
+    2026-09-28: is the semicore Z pathological as eta_semi shrinks?).
+    Collective: every rank extracts the diagonal.
+    """
+    from .eqp_bgw import compute_z_factor_from_omega_grid
+    from .qsgw_utils import extract_sigma_diag_replicated
+    cube, grid_ev = sigma_c_far
+    diag = np.asarray(extract_sigma_diag_replicated(cube, mesh_xy), dtype=np.complex128) * RYD_TO_EV
+    if band_axis is not None:
+        from runtime.padding import strip_axis
+        diag = np.asarray(strip_axis(diag, band_axis, axis=-1))
+    mask = np.asarray(far_kn, bool)
+    nb = mask.shape[1]
+    e = np.asarray(e_rel_ev, dtype=np.float64)[:, :nb]
+    _, z = compute_z_factor_from_omega_grid(
+        sigma_c_omega_diag_ev=diag[:, :, :nb], omega_rel_ev=np.asarray(grid_ev, float),
+        e_dft_rel_ev=e)
+    zs = np.asarray(z, float)[mask]
+    bad = mask & ~((np.asarray(z) > 0.0) & (np.asarray(z) <= 1.0))
+    bands = sorted(set((np.nonzero(bad)[1] + 1).tolist()))
+    print_fn(f"  SC semicore Z (patch stencil, +-0.5 eV): n={zs.size} min={zs.min():+.4f} "
+             f"median={np.median(zs):+.4f} max={zs.max():+.4f}; outside (0, 1]: "
+             f"{int(bad.sum())} (k,state)" + (f" in sorted bands {bands}" if bands else ""))
 
 
 def _compute_ppm_sigma(

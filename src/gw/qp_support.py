@@ -1,24 +1,27 @@
 """Fixed sampled Sigma support, in eV relative to the Sigma chemical potential.
 
-Only protected bands set the near interval: the requested states whose DFT
-energy lies within WINDOW_CLIP_EV of mu, plus every state inside the optional
-deck endpoints, which only enlarge. The Z stencil and one 2 eV outer pad are
-included once at map 0 and the plan is then held. A protected read that
-leaves the held support, or a product window that leaves its held box,
-refuses by name (``GATE sigma_plan_escape``): no clamp and no rebuild (owner
-ruling Q5, 2026-09-28). Rotating endpoints beyond the near
-support read far patches; a rotating state no patch covers takes the side
-scissor (ruling Q3).
+Only protected bands set the near interval: the QP-matrix states above the
+semicore, plus every state inside the optional deck endpoints, which only
+enlarge. The Z stencil and one 2 eV outer pad are included once at map 0 and
+the plan is then held. Semicore states read one held patch at
+SEMICORE_ETA_EV. A protected or semicore read that leaves the held support,
+or a product window that leaves its held box, refuses by name
+(``GATE sigma_plan_escape``): no clamp and no rebuild (owner ruling Q5,
+2026-09-28). Bands above the QP matrix are the scissored tail and read
+nothing (``gw.band_partition``).
 """
 from __future__ import annotations
 from typing import NamedTuple
 import numpy as np
 
 SUPPORT_PAD_EV = 2.0
-#: Requested states farther than this from mu are not protected (eV). They
-#: rotate, and their energies come from the far patches. The owner's
-#: protected-window rule (+-10 eV of E_F) and the pair budgets set it.
+#: Requested states farther than this from mu do not set the band cut (eV):
+#: they stay in the QP matrix only if the cut lands above them, else they are
+#: tail states. The owner's window rule (+-10 eV of E_F) sets it.
 WINDOW_CLIP_EV = 10.0
+#: An occupied state is semicore when a band gap at least this wide (eV, all
+#: k) separates it from the valence manifold above (owner, 2026-09-28 21:40).
+SEMICORE_GAP_EV = 4.0
 
 
 def read_halfwidth_ev():
@@ -74,39 +77,27 @@ def clamped_reads(energy_relative_ev, protected_kn, grid_ev):
     return np.asarray(protected_kn, bool) & ((e-h < grid_ev[0]) | (e+h > grid_ev[-1]))
 
 
-#: Broadening of the rotating patches (eV): empty states above the protected
-#: cut; the P-R coupling needs Sigma_io(E_o) only to modest accuracy
-#: (CLASSMIX: Si conduction endpoints at 1 eV keep 0.7-0.8 meV). The owner
-#: approved 1-2 eV for these reads (ruling Q4, 2026-09-28; INVARIANTS 12).
-FAR_PATCH_ETA_EV = 1.0
-#: Semicore patches sample at the deck eta (SEMICORE_ETA_EV = None) on narrow
-#: patches: every semicore endpoint, diagonal and coupling, reads at eta.
-#: At eta_semi = 1 eV the P-S couplings put the MoS2 3x3 fixed point 8.5 meV
-#: off, at 0.5 eV 4.8 meV; protected at eta, 0.14 meV (PARTITION round 2).
-SEMICORE_ETA_EV = 0.5
+#: Broadening of the semicore patch (eV), fixed by the owner (2026-09-28
+#: 21:40). Its systematic error is reported apart from the 1 meV budget of the
+#: controllable errors (PARTITION round 2: MoS2 3x3 8.5 meV at the fixed point).
+SEMICORE_ETA_EV = 1.0
 #: How semicore endpoints are read: "patch" (own energy on the SEMICORE_ETA_EV
-#: patches) or "sigma0" (Sigma(omega = 0) on the near grid, main's rule for
+#: patch) or "sigma0" (Sigma(omega = 0) on the near grid, main's rule for
 #: states below E_F - 15 eV; no semicore crossing windows).
 SEMICORE_READ = "patch"
-#: How states above the protected cut are read (owner scheme, round 5):
-#: "scissor" (every one takes E_DFT + beta_above, scissor law A; no far patch,
-#: no own-energy read) or "own" (own-energy reads on held far patches, ruling
-#: Q3).
-ROTATING_READ = "scissor"
-#: Rule tolerance of the far-patch crossing windows. A far window's node
-#: count is set by its short side over eta (the patch top above the lowest
-#: state), not by its pole range, so splitting cannot shorten it; the coupling
-#: needs only percent accuracy (CLASSMIX round 4: 158 -> 90 nodes at 1e-2).
+#: Rule tolerance of the semicore patch's crossing windows. A patch window's
+#: node count is set by its short side over eta (the patch top above the
+#: lowest state), not by its pole range, so splitting cannot shorten it
+#: (CLASSMIX round 4: 158 -> 90 nodes at 1e-2).
 FAR_PATCH_EPS = 1.0e-2
-#: Far-patch sampling step (eV): eta/2 resolves the broadened Sigma.
+#: Patch sampling step (eV): eta/2 resolves the broadened Sigma.
 FAR_PATCH_STEP_EV = 0.5
-#: The protected cut takes the first all-k gap at least CUT_GAP_ETAS * eta
-#: wide above the requested top, searched up to CUT_SEARCH_ETAS * eta (else the
-#: widest gap there): a narrow cut gap leaves protected states within ~eta of
-#: rotating ones (Si 4^3: 0.41 eV gap, 7.9 meV at map 0; 1.8 eV gap, 0.25).
+#: The band cut takes the first band gap at least CUT_GAP_ETAS * eta wide
+#: above the need, searched up to CUT_SEARCH_ETAS * eta (else the widest
+#: boundary there, which may overlap): ``band_partition.qp_band_cut``.
 CUT_GAP_ETAS = 4.0
 CUT_SEARCH_ETAS = 20.0
-#: Offset of a far patch's first (last) sample past the near support's top
+#: Offset of a patch's first (last) sample past the near support's top
 #: (bottom) edge (eV): the two grids stay strictly ascending and join with
 #: no uncovered sliver.
 FAR_PATCH_EDGE_EV = 1.0e-3
@@ -183,20 +174,16 @@ class SigmaPlan(NamedTuple):
 
     ``grid_ev`` samples the protected (near) support at the deck eta;
     ``protected_support_ev`` is its [lo, hi], the 2 eV outer pad and the Z
-    stencil included. ``far_patches_ev``/``far_eta_ev`` are the rotating
-    patches (empty states above the protected cut), ``semicore_ev``/
-    ``semicore_eta_ev`` the semicore patches; each patch pad is derived
-    (``derived_pad_ev``). The W sampling ladder reads this one object
-    (``SCSupport.plan``; the SC session's ``"sigma_plan"``).
+    stencil included. ``semicore_ev``/``semicore_eta_ev`` are the semicore
+    patch (one window); its pad is derived (``derived_pad_ev``). The W
+    sampling ladder reads this one object (``SCSupport.plan``; the SC
+    session's ``"sigma_plan"``).
     """
     grid_ev: np.ndarray
     envelope_ev: tuple
     near_eta_ev: float
-    far_patches_ev: tuple
-    far_eta_ev: tuple
     semicore_ev: tuple = ()
     semicore_eta_ev: tuple = ()
-    far_pad_ev: float = SUPPORT_PAD_EV
     semicore_pad_ev: float = SUPPORT_PAD_EV
 
     @property
@@ -206,42 +193,29 @@ class SigmaPlan(NamedTuple):
     @property
     def patches(self):
         """Every held patch as (lo, hi, eta), ascending."""
-        rows = ([(a, b, e) for (a, b), e in zip(self.far_patches_ev, self.far_eta_ev)]
-                + [(a, b, e) for (a, b), e in zip(self.semicore_ev, self.semicore_eta_ev)])
-        return tuple(sorted(rows))
+        return tuple(sorted((a, b, e) for (a, b), e in zip(self.semicore_ev, self.semicore_eta_ev)))
 
 
-def plan_sigma_windows(sigma, energy_rel_ev, protected_kn, *, rotating_energy_rel_ev=None,
-                       rotating_kn=None, semicore_kn=None, far_pad_ev=SUPPORT_PAD_EV,
-                       semicore_pad_ev=SUPPORT_PAD_EV, outer_pad_ev=SUPPORT_PAD_EV):
-    """THE one Sigma plan: protected support, rotating and semicore patches, in one call.
+def plan_sigma_windows(sigma, energy_rel_ev, protected_kn, *, semicore_energy_rel_ev=None,
+                       semicore_kn=None, semicore_pad_ev=SUPPORT_PAD_EV,
+                       outer_pad_ev=SUPPORT_PAD_EV, semicore_eta_ev=SEMICORE_ETA_EV):
+    """THE one Sigma plan: protected support and the semicore patch, in one call.
 
     ``energy_rel_ev``/``protected_kn`` set the near support
-    (:func:`plan_support_ev`); ``rotating_energy_rel_ev`` with
-    ``rotating_kn`` / ``semicore_kn`` (None: a route without patches) set the
-    rotating and semicore patches (:func:`far_patches_ev`). Extra rows (map-0
-    probe estimates) may be stacked below either energy array with the masks
-    tiled to match.
+    (:func:`plan_support_ev`); ``semicore_energy_rel_ev`` with ``semicore_kn``
+    (None: a route without patches) sets the semicore patch
+    (:func:`far_patches_ev`), one window from the deepest semicore energy
+    minus its pad to just above the highest semicore band (owner, round 5).
+    Extra rows (map-0 probe estimates) may be stacked below either energy
+    array with the masks tiled to match.
     """
     grid, envelope = plan_support_ev(sigma, energy_rel_ev, protected_kn,
                                      outer_pad_ev=outer_pad_ev)
     near = (float(grid[0]), float(grid[-1]))
-    far = (() if rotating_kn is None else
-           far_patches_ev(rotating_energy_rel_ev, rotating_kn, near, pad_ev=far_pad_ev))
     semi = (() if semicore_kn is None else
-            far_patches_ev(rotating_energy_rel_ev, semicore_kn, near, pad_ev=semicore_pad_ev))
+            far_patches_ev(semicore_energy_rel_ev, semicore_kn, near, pad_ev=semicore_pad_ev))
     if semi:
-        # ONE coarse semicore window (owner, round 5): from the deepest semicore
-        # energy minus its pad up to just above the highest semicore band.
         semi = ((semi[0][0], semi[-1][1]),)
-    # A semicore patch never overlaps a rotating one (they sit on opposite
-    # sides of E_F); refuse rather than merge silently if they ever do.
-    rows = sorted([(a, b) for a, b in far] + [(a, b) for a, b in semi])
-    if any(r[0] <= q[1] for q, r in zip(rows[:-1], rows[1:])):
-        raise ValueError("GATE sigma_far_patch_order: rotating and semicore patches overlap")
-    eta = float(sigma.regularization_ev)
-    eta_semi = eta if SEMICORE_ETA_EV is None else float(SEMICORE_ETA_EV)
-    return SigmaPlan(grid, envelope, eta, tuple(far),
-                     tuple(FAR_PATCH_ETA_EV for _ in far), tuple(semi),
-                     tuple(eta_semi for _ in semi), float(far_pad_ev),
-                     float(semicore_pad_ev))
+    eta_semi = float(sigma.regularization_ev) if semicore_eta_ev is None else float(semicore_eta_ev)
+    return SigmaPlan(grid, envelope, float(sigma.regularization_ev), tuple(semi),
+                     tuple(eta_semi for _ in semi), float(semicore_pad_ev))

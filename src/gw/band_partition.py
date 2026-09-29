@@ -1,18 +1,19 @@
 """Band classes and Hamiltonian masks.
 
-Dynamic SC protects the requested DFT bands, counted from E_F at each k,
-closed outward to spectral gaps resolved at eta and clipped to mu +- 10 eV
-(closed over degeneracies); the deck omega endpoints only enlarge the set.
-Other bands rotate through their couplings to protected bands, with an
-own-energy far-patch diagonal (side scissor where no patch covers the state)
-and no rotating-rotating mixing.
+Dynamic SC works on an absolute band cut (owner, 2026-09-28): the QP matrix
+is the bands below one k-independent index b3, the ζ fit's left range. b3 is
+decided from the DFT ladder before the ζ fit (:func:`qp_band_cut`), inside a
+band gap above the requested top. Inside the QP matrix every state is
+protected (read at the deck eta) or semicore (occupied, below a wide band gap,
+read at eta_semi on one held patch). Bands at and above b3 are the scissored
+tail: DFT ψ, one rigid conduction scissor, in G and χ only, no Σ and no
+mixing. There is no rotating class.
 The legacy three-mask helper below serves fixed-Sigma EQP2 only.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from functools import partial
 from typing import NamedTuple
 
 import numpy as np
@@ -26,8 +27,7 @@ import jax.numpy as jnp
 # ---------------------------------------------------------------------------
 
 def requested_band_mask(energies_ev, *, n_occ, nval, ncond, gap_ev, mu_ev=None,
-                        range_ev=None, range_mu_ev=None, clip_ev=None,
-                        degeneracy_tol_ev=None):
+                        range_ev=None, range_mu_ev=None):
     """Requested bands closed to the next resolved spectral gap at each k.
 
     ``nval``/``ncond`` count states below/above the Fermi level at each k.
@@ -39,14 +39,6 @@ def requested_band_mask(energies_ev, *, n_occ, nval, ncond, gap_ev, mu_ev=None,
     None), relative to ``range_mu_ev``, only enlarges the set: every state in
     it is protected, closed over its eta-resolved manifold. Only the initial
     DFT ladder is classified. The work is O(nk nb), with no axis loop.
-
-    ``clip_ev`` (SC only): a requested state farther than ``clip_ev`` from
-    ``range_mu_ev`` is not protected; it rotates and is still reported, its
-    energy read from the far patches. The clip is closed over exact
-    degeneracies (``degeneracy_tol_ev``) so it never cuts a multiplet, and
-    the automatic-promotion gate looks only at request edges inside the clip.
-    ``range_ev`` states are added after the clip: the deck endpoints only
-    enlarge the protected set.
     """
     e = np.asarray(energies_ev, float)
     nk, nb = e.shape
@@ -72,11 +64,6 @@ def requested_band_mask(energies_ev, *, n_occ, nval, ncond, gap_ev, mu_ev=None,
     upper = np.max(np.where(protected, e, -np.inf), axis=1)
     rows = np.arange(nk)
     promotion = np.maximum(e[rows, lo] - lower, upper - e[rows, hi - 1])
-    if clip_ev is not None:
-        rel_edge = lambda x: np.abs(x - float(range_mu_ev)) <= float(clip_ev)
-        promotion = np.maximum(
-            np.where(rel_edge(e[rows, lo]), e[rows, lo] - lower, 0.0),
-            np.where(rel_edge(e[rows, hi - 1]), upper - e[rows, hi - 1], 0.0))
     if np.any(promotion > SUPPORT_PAD_EV):
         k = int(np.argmax(promotion))
         raise ValueError(
@@ -84,18 +71,6 @@ def requested_band_mask(energies_ev, *, n_occ, nval, ncond, gap_ev, mu_ev=None,
             f"eta-resolved gap at k={k} requires {promotion[k]:.6f} eV, "
             f"beyond the {SUPPORT_PAD_EV:g} eV automatic-promotion limit; "
             "increase nval/ncond explicitly to include that manifold.")
-    if clip_ev is not None:
-        inside = protected & (np.abs(e - float(range_mu_ev)) <= float(clip_ev))
-        from common.band_degeneracy import DEGENERACY_TOL_RY
-        from common.units import RYD_TO_EV
-        tol = (DEGENERACY_TOL_RY * RYD_TO_EV if degeneracy_tol_ev is None
-               else float(degeneracy_tol_ev))
-        degenerate = np.cumsum(np.concatenate((np.zeros((nk, 1), bool),
-                                               np.diff(e, axis=1) > tol), axis=1), axis=1)
-        hit = np.zeros((nk, nb + 1), bool)
-        np.put_along_axis(hit, np.where(inside, degenerate, nb), True, axis=1)
-        hit[:, nb] = False
-        protected = protected & np.take_along_axis(hit, degenerate, axis=1)
     if range_ev is not None and any(x is not None for x in range_ev):
         lo_ev = -np.inf if range_ev[0] is None else float(range_ev[0])
         hi_ev = np.inf if range_ev[1] is None else float(range_ev[1])
@@ -108,78 +83,93 @@ def requested_band_mask(energies_ev, *, n_occ, nval, ncond, gap_ev, mu_ev=None,
     return protected
 
 
-class SCBandClasses(NamedTuple):
-    """The SC classes of the DFT identities on the loop k-set (``sc_band_classes``)."""
-    protected: np.ndarray      # (nk, nb) read on the near grid at the deck eta
-    semicore: np.ndarray       # (nk, nb) coarse: active, read at their own energy on the coarse window
-    cut_ev: float              # upper edge of the protected set, inside a global gap
-    gap_ev: tuple              # (below, above): the global gap the cut sits in
-    valence_bottom_ev: float   # lowest protected (fine-window) state
+class QPBandCut(NamedTuple):
+    """The absolute band cut of an SC run (:func:`qp_band_cut`); indices are 0-based band counts."""
+    b_semicore: int        # bands [0, b_semicore) are semicore: occupied, below a wide band gap
+    b3: int                # bands [0, b3) are the QP matrix = the ζ fit's left range
+    cut_ev: float          # midpoint of the band gap at b3 (absolute eV; inf when b3 = nb)
+    gap_ev: tuple          # (max_k E[b3-1], min_k E[b3]) absolute eV; negative width = overlap
+    top_ev: float          # highest energy the QP matrix must hold (absolute eV)
+    semicore_gap_ev: tuple  # the band gap at b_semicore (absolute eV), or () without semicore
+    n_requested_tail: int  # requested (k, state) above the cut: tail states, not in the QP matrix
 
 
-def sc_band_classes(energies_ev, *, occupied_kn, requested_kn, range_mu_ev,
-                    range_ev=None, clip_ev, cut_gap_ev, cut_search_ev, far_route=True):
-    """Fine / coarse / rotating classes from the DFT ladder (owner rule, 2026-09-28 round 5).
+def band_gaps_ev(energies_ev):
+    """Band-index gaps of a ladder: (lo, hi) with lo[n-1] = max_k E[:, n-1], hi[n-1] = min_k E[:, n].
 
-    1. The fine window (read at the deck eta) runs from the minimum energy of
-       the lowest requested band up to the cut. A requested band counts if it
-       reaches into ``range_mu_ev +- clip_ev``; ``range_ev`` (omega endpoints)
-       only enlarges the window. Every state in it is protected at every k.
-    2. The cut: ``top`` is the highest requested energy, clipped to
-       ``range_mu_ev + clip_ev`` and raised to omega_max; the cut is the
-       midpoint of the first all-k gap at least ``cut_gap_ev`` wide that opens
-       in [top, top + cut_search_ev), else of the widest gap opening there.
-    3. Every occupied state below the fine window is coarse ("semicore"):
-       active, read at its own energy on one coarse window (on a route without
-       patches, ``far_route=False``, it joins the fine window).
-    4. The rest (empty states above the cut) rotate.
-    No gap threshold decides a class; a global gap is an interval with no
-    eigenvalue at any k. O(nk nb log).
+    A boundary n with hi > lo holds the same n states below it at every k.
     """
-    from .qp_support import SUPPORT_PAD_EV
     e = np.asarray(energies_ev, float)
-    occ = np.asarray(occupied_kn, bool)
-    req = np.asarray(requested_kn, bool)
-    mu = float(range_mu_ev)
-    levels = np.sort(e.ravel())
-    lo_ev = hi_ev = None
-    if range_ev is not None:
-        lo_ev = None if range_ev[0] is None else mu + float(range_ev[0])
-        hi_ev = None if range_ev[1] is None else mu + float(range_ev[1])
-    band_req = req.any(axis=0)
-    band_min, band_max = e.min(axis=0), e.max(axis=0)
-    band_in = band_req & (band_max >= mu - float(clip_ev)) & (band_min <= mu + float(clip_ev))
-    if not band_in.any():
-        raise ValueError("SC band classes: no requested band reaches mu +- "
-                         f"{float(clip_ev):g} eV; increase nval/ncond")
-    floor = float(band_min[band_in].min())
-    if lo_ev is not None:
-        floor = min(floor, lo_ev)
-    top = min(float(e[req & (e <= mu + float(clip_ev))].max(initial=-np.inf)),
-              mu + float(clip_ev))
-    top = max(top, float(e[occ].max()))
-    if hi_ev is not None:
-        top = max(top, hi_ev)
-    above = levels[levels >= top]
-    if above.size == 0:
-        cut, gap = top, (top, np.inf)
+    return e.max(axis=0)[:-1], e.min(axis=0)[1:]
+
+
+def qp_band_cut(energies_ev, *, n_below_k, nval, ncond, mu_ev, clip_ev, cut_gap_ev,
+                cut_search_ev, semicore_gap_ev, omega_max_rel_ev=None):
+    """Absolute band cut from the DFT ladder, decided before the ζ fit (owner, 2026-09-28).
+
+    ``energies_ev`` (nk, nb) absolute eV on the loaded k set; ``n_below_k`` the
+    states below mu at each k (``n_occ`` on an insulator); ``mu_ev`` the frame.
+
+    1. The QP matrix must hold every occupied state, every requested state
+       within ``mu +- clip_ev`` and every state below ``mu + omega_max``.
+       ``top`` is the highest such energy.
+    2. b3 is a band-index boundary n: bands [0, n) at every k. It takes the
+       first boundary at or above that need whose band gap
+       ``min_k E[n] - max_k E[n-1]`` is at least ``cut_gap_ev`` and opens
+       below ``top + cut_search_ev``; else the widest boundary opening there.
+       Above E_F a dispersive ladder often has no band gap at all (Si 4^3,
+       Fe 4^3, Na 8^3): the widest boundary then has a negative width, an
+       overlap of the matrix's top band with the tail's lowest, and the log
+       states it. A gap in the union of all k levels is not enough: the
+       number of states below it varies with k. When the need reaches the
+       last loaded band, b3 = nb and there is no tail.
+    3. b_semicore: the highest boundary at or below the lowest occupied count
+       and below every requested band within the clip whose gap is at least
+       ``semicore_gap_ev``; 0 when there is none.
+    Requested states above b3 are the tail: DFT ψ, the rigid conduction
+    scissor, no Σ. O(nk nb).
+    """
+    e = np.asarray(energies_ev, float)
+    nk, nb = e.shape
+    below = np.broadcast_to(np.asarray(n_below_k, int), (nk,))
+    mu = float(mu_ev)
+    idx = np.arange(nb)[None, :]
+    lo_req = np.maximum(below - int(nval), 0)[:, None]
+    hi_req = np.minimum(below + int(ncond), nb)[:, None]
+    requested = (idx >= lo_req) & (idx < hi_req)
+    within = requested & (np.abs(e - mu) <= float(clip_ev))
+    if not within.any():
+        raise ValueError(f"QP band cut: no requested state lies within mu +- {float(clip_ev):g} eV; "
+                         "increase nval/ncond")
+    need = within | (idx < below[:, None])
+    if omega_max_rel_ev is not None:
+        need |= e <= mu + float(omega_max_rel_ev)
+    n_min = int(np.max(np.where(need, idx + 1, 0)))
+    top = float(e[need].max())
+    gap_lo, gap_hi = band_gaps_ev(e)
+    width = gap_hi - gap_lo                      # boundary n at position n - 1
+    if n_min >= nb:
+        b3 = nb
     else:
-        nxt = np.append(above[1:], np.inf)
-        opens = above < top + float(cut_search_ev)
-        widths = np.where(opens, nxt - above, -1.0)
-        wide = np.nonzero(widths >= float(cut_gap_ev))[0]
-        i = int(wide[0]) if wide.size else int(np.argmax(widths))
-        gap = (float(above[i]), float(nxt[i]))
-        cut = gap[0] + 0.5 * (min(gap[1], gap[0] + 2 * float(SUPPORT_PAD_EV)) - gap[0])
-    protected = (e >= floor) & (e < cut)
-    if hi_ev is not None:
-        protected |= (e >= floor) & (e <= hi_ev)
-    semicore = occ & ~protected & (e < floor)
-    if not far_route:
-        protected |= semicore
-        semicore = np.zeros_like(semicore)
-    return SCBandClasses(protected, semicore, float(cut), gap,
-                         float(e[protected].min()))
+        bounds = np.arange(n_min, nb)            # candidate boundaries
+        w = width[bounds - 1]
+        opens = gap_lo[bounds - 1] < top + float(cut_search_ev)
+        opens[0] = True
+        wide = np.flatnonzero(w >= float(cut_gap_ev))
+        wide = wide[opens[wide]]
+        b3 = int(bounds[wide[0]]) if wide.size else int(bounds[np.argmax(np.where(opens, w, -np.inf))])
+    if b3 < nb:
+        gap = (float(gap_lo[b3 - 1]), float(gap_hi[b3 - 1]))
+        cut = 0.5 * (gap[0] + gap[1])
+    else:
+        gap, cut = (float(e[:, nb - 1].max()), np.inf), np.inf
+    n_occ_min = int(below.min())
+    req_lo = int(np.min(np.where(within, idx, nb)))
+    semi = [n for n in range(1, min(n_occ_min, req_lo) + 1) if width[n - 1] >= float(semicore_gap_ev)]
+    b_semi = semi[-1] if semi else 0
+    semi_gap = (float(gap_lo[b_semi - 1]), float(gap_hi[b_semi - 1])) if b_semi else ()
+    n_tail = int(np.count_nonzero(requested & (idx >= b3)))
+    return QPBandCut(b_semi, b3, float(cut), gap, top, semi_gap, n_tail)
 
 
 def coarse_band_report(energies_ev, semicore_kn, *, mu_ev, band_offset=0):
@@ -401,56 +391,3 @@ def apply_band_partition(
 __all__ = [
     "BandPartition", "apply_band_partition", "build_omega_band_partition",
 ]
-
-
-def rotating_diagonal(h_diag_kn, e_dft_kn, protected_kn, *, below_kn,
-                      fit_below_kn, fit_above_kn, k_weights):
-    """Rotating diagonal: DFT energy plus one QP-correction scissor per side of mu.
-
-    ``h_diag_kn`` is the full QSGW diagonal in the DFT basis and ``e_dft_kn``
-    the DFT energies (Ry, identity order). The scissor below (above) mu is the
-    k-star-weighted mean of H_ii - E_i over the protected occupied (empty)
-    states; with no protected state on one side, that side takes the other
-    side's mean. Nothing is read at a rotating energy and no band is held at
-    DFT. A diagonal error reaches a protected state only at second order,
-    |V_io|^2 d(beta)/(E_i - E_o)^2, so the side mean is weighted by nothing
-    else (claim: CLASSMIX).
-    """
-    w = np.asarray(k_weights, float)[:, None]
-    p = np.asarray(protected_kn, bool)
-    e = np.asarray(e_dft_kn, float)
-    delta = np.asarray(h_diag_kn, float) - e
-    def side(mask):
-        wt = w * (p & mask)
-        total = float(wt.sum())
-        return (float((wt * delta).sum()) / total if total > 0 else None), int((p & mask).sum())
-    (b_lo, n_lo), (b_hi, n_hi) = side(fit_below_kn), side(fit_above_kn)
-    if b_lo is None and b_hi is None:
-        raise ValueError("rotating bands: no protected state fits the scissor")
-    b_lo = b_hi if b_lo is None else b_lo
-    b_hi = b_lo if b_hi is None else b_hi
-    target = e + np.where(below_kn, b_lo, b_hi)
-    from common.units import RYD_TO_EV
-    return target, (f"beta below={b_lo * RYD_TO_EV:+.6f} eV (n={n_lo}), "
-                    f"above={b_hi * RYD_TO_EV:+.6f} eV (n={n_hi})")
-
-
-@partial(jax.jit, static_argnames=("mesh",))
-def rotating_band_hamiltonian(H, protected_kn, rotating_diagonal_ry, mesh):
-    """Keep P-P and P-R, replace R diagonals and discard R-R mixing.
-
-    H is (nk, nb_X, nb_Y), energies are Ry. Masks/diagonals are bounded
-    (nk, nb) metadata; the matrix result stays on both processor axes.
-    """
-    from jax.sharding import NamedSharding, PartitionSpec as P
-    p = protected_kn
-    eye = jnp.eye(H.shape[-1], dtype=bool)[None]
-    keep = p[:, :, None] | p[:, None, :]
-    result = jnp.where(keep, H, jnp.where(eye, rotating_diagonal_ry[:, :, None], 0.))
-    from runtime.padding import pad_square, padded_axis
-    spec = P(None, "x", "y")
-    axis = padded_axis(H.shape[-1], mesh, name="rotating band Hamiltonian",
-                       specs=((spec, 1), (spec, 2)))
-    result = jax.lax.with_sharding_constraint(
-        pad_square(result, axis), NamedSharding(mesh, spec))
-    return result[:, :axis.logical, :axis.logical]
