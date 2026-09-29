@@ -259,7 +259,13 @@ def _get_sigma_kij_kernel(
     def _bracketed_face(psi_coh_xn, psi_coh_yr, psi_proj_xr, psi_proj_yn,
                         E_A, mask_A, E_min, E_max, E_ref_A, t_node,
                         W_prep, build_g, conv):
-        """Mask each bracket on the last band axis while retaining one Green tile at a time."""
+        """Mask each bracket on the last band axis while retaining one Green tile at a time.
+
+        A bracket whose selector has no nonzero band builds an identically zero
+        Green (every band weight is an exact zero), so its convolution and
+        projection are exact zeros too: it is skipped and contributes zeros.
+        The predicate is the replicated selector's, so every rank takes the
+        same branch."""
         nb_full = int(mask_A.shape[-1])
         idx = jnp.arange(nb_full)
         endpoints = jnp.asarray(
@@ -271,10 +277,18 @@ def _get_sigma_kij_kernel(
             in_range = (idx >= lo) & (idx < hi)
             mask_bracket = (mask_A & in_range if mask_A.dtype == jnp.bool_
                            else mask_A * in_range.astype(mask_A.dtype))
-            G_k = build_g(psi_coh_xn, psi_coh_yr, E_A, mask_bracket,
-                         E_min, E_max, E_ref_A, t_node,
-                         band_range=(lo, hi))
-            projected = conv(psi_proj_xr, psi_proj_yn, G_k, W_prep)
+
+            def live(_):
+                G_k = build_g(psi_coh_xn, psi_coh_yr, E_A, mask_bracket,
+                             E_min, E_max, E_ref_A, t_node,
+                             band_range=(lo, hi))
+                return conv(psi_proj_xr, psi_proj_yn, G_k, W_prep)
+
+            shape = jax.eval_shape(live, None)
+            projected = jax.lax.cond(
+                jnp.any(mask_bracket != 0), live,
+                lambda _: jax.tree.map(lambda a: jnp.zeros(a.shape, a.dtype), shape),
+                None)
             return None, projected
 
         # Only the small band-projected outputs acquire a bracket axis.
