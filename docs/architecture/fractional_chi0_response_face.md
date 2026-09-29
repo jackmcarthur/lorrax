@@ -89,7 +89,14 @@ assumes. Under time reversal the two are equal and the default trace is kept.
 In `direct` mode each complex node t is one Green pair
 A(t) = G_u(t) ⊙ G_f(t̄)^*, and it serves every member of a shared-node sample
 group (rules from `minimax.response_group_rules`). The forward rows take A(t) at q; the reverse orientation at time t̄ is
-conj(A(t)), read from the −q rows of the same transform. With current
+conj(A(t)), read from the −q rows of the same transform. On a raw-parent
+plan the charge stream forms A(t) with mathdx mode 11
+(`ffi.fft.make_kconv_chi_unfold`) from the two parent Greens and their
+antiunitary partner tiles, one node per call: mode 11 returns
+v = Σ_ab conj(G_u′) G_f′ with G′ = ifftn_k of the typed unfold, which is the
+default trace's A(t); the ordered A(R) = conj(v(−R)), whose transform is
+conj(𝓕_q[v]), so the conjugation moves from the reverse rows to the forward
+rows. One FFT per node and the selected-row carry are unchanged. With current
 vertices (`vertex=True`, photon carriers) the empty Green's function uses the
 vertex-applied endpoints and the occupied one the bare endpoints, and the
 spin pairs are scanned one at a time, so no full spin Green's function pair
@@ -98,12 +105,17 @@ is resident.
 **Cost per node** (P ranks, N_μ centroids, n_s spinor components):
 
 - two complex GEMMs, each 8 N_k^in (N_μn_s)² N_b / P flops (N_b becomes the
-  support width with active ranges);
-- two flat-k FFTs, O((N_μn_s)² N_k log N_k / P);
-- the product and spin trace, O(N_k (N_μn_s)² / P).
+  support width with active ranges), twice that with antiunitary partner tiles;
+- mode 11: the typed unfold, one inverse transform of 2 n_s² columns per
+  (μ, ν) pair and the spin trace in one pass, O((N_μn_s)² N_k log N_k / P);
+- one flat-k FFT of A, O(N_μ² N_k log N_k / P).
 
-The live set is two full-k Green tiles at `P(None, 'x', None, 'y', None)`,
-2 N_k (N_μn_s)² complex numbers over P, plus the accumulator.
+The live set is the parent Greens (and partners) at
+`P(None, 'x', None, 'y', None)`, N_k^in (N_μn_s)² complex numbers over P
+each, A and its transform (N_k N_μ² over P each), plus the accumulator.
+Without a parent plan, with photon carriers, or on a grid mode 11 refuses,
+each Green is unfolded to full k, transformed by mode 3 and traced in XLA:
+two full-k Green tiles, 2 N_k (N_μn_s)² complex numbers over P.
 
 ## Ordered-pair scan
 
