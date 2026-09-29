@@ -1966,7 +1966,10 @@ static ffi::Error build(int mode, int nkx, int nky, int nkz, int ns, bool f32,
     // load of the resident arm it replaces at such grids).  Neither fits: refused by name.  The tile
     // tables (whole 4-spinor groups, sm_80+ cp.async) take the largest tile of at most the plan's
     // pairs whose bank and tables (UnfoldTiles, W_R staged) fit two blocks on an SM; otherwise the
-    // register load.  A 4-spinor register load keeps 256 threads (12 ns^2 = 192 live registers).
+    // register load.  A 4-spinor register load keeps 256 threads and the whole register file (12 ns^2
+    // = 192 live registers); an n_s <= 2 register load is built for the blocks the tile's shared memory
+    // admits, at most two (Fe 8^3: 2 x 512 threads at <= 64 registers; unbounded, NVCC took 95 and
+    // held one block per SM).
     const int blk = (mode == 7 && variant > 0) ? variant : ns;    // mode 7's output spin block
     int m7_tp = 0, m7_blocks = 0, m7_tr = 0, m7_threads = 0;
     long long m7_smem = 0;
@@ -1990,6 +1993,14 @@ static ffi::Error build(int mode, int nkx, int nky, int nkz, int ns, bool f32,
         m7_tr = kp.tr * group;
         m7_threads = tile_tables_pay(ns) ? kThreads : kp.threads;
         m7_smem = kp.smem;
+        if (!tile_tables_pay(ns)) {
+            int smem_sm = 0, smem_rsv = 0;
+            LRX_CUDA_CHECK(cudaDeviceGetAttribute(&smem_sm, cudaDevAttrMaxSharedMemoryPerMultiprocessor, dev),
+                           "shared memory per SM");
+            LRX_CUDA_CHECK(cudaDeviceGetAttribute(&smem_rsv, cudaDevAttrReservedSharedMemoryPerBlock, dev),
+                           "reserved shared memory per block");
+            m7_blocks = static_cast<int>(std::max(1LL, std::min(2LL, smem_sm / (m7_smem + smem_rsv))));
+        }
         if (group == sso && blk == ns && nsr == ns && cc_major >= 8 && tile_tables_pay(ns)) {
             const TilePlan tt = tile_table_plan(dev, kp.tr, static_cast<long long>(sso) * g.rs() * 16, nk, ns, 1,
                                                 false);
@@ -2090,7 +2101,7 @@ static ffi::Error build(int mode, int nkx, int nky, int nkz, int ns, bool f32,
     if (mode == 7) {
         defs.push_back("-DLRX_TT=" + std::string(m7_tp ? "1" : "0"));
         defs.push_back("-DLRX_TP=" + std::to_string(m7_tp));
-        defs.push_back("-DLRX_MINB=" + std::to_string(m7_tp ? m7_blocks : 1));
+        defs.push_back("-DLRX_MINB=" + std::to_string(std::max(1, m7_blocks)));
         defs.push_back("-DLRX_TR=" + std::to_string(m7_tr));
         defs.push_back("-DLRX_THREADS=" + std::to_string(m7_threads));
     }
