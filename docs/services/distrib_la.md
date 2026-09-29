@@ -56,7 +56,8 @@ SLATE: [Perlmutter §2](../environment/machines/perlmutter.md#2-the-lorrax_a-mod
 | `dispatch_batched_eigh(A, mesh, backend='distributed', *, batched_route='batch_reshard')` | `plan('eigh', …).batched(A)` for `gw.qsgw_density`. |
 | `matmul(A, B, C=None, *, mesh, alpha=1, beta=0, transa='N', transb='N', backend='auto', batched_route='batch_reshard', budget_bytes=None)`, `resolve_matmul_backend` | Distributed GEMM, § [matmul](#matmul). |
 | `gemm_plan(...) -> GemmPlan`, `local_gemm_plan(...)` | Resolve-once N,N GEMM for hot loops, § [Planned GEMM](#planned-gemm). |
-| `panel_matmul(A, B, *, mesh, panel_bytes, bounds=None, weights=None, partner=False)` | Batched 2-D SUMMA face GEMM with bounded contraction panels, § [Bounded face products](#bounded-face-products). |
+| `panel_matmul(A, B, *, mesh, panel_bytes, bounds=None, weights=None, partner=False, resident=None)` | Batched 2-D SUMMA face GEMM with bounded contraction panels, § [Bounded face products](#bounded-face-products). |
+| `panel_resident(A, B, *, mesh, panel_bytes)`, `panel_resident_bytes(...)` | The first SUMMA panels of `panel_matmul(A, B)`, gathered once for a caller that multiplies the same `A`, `B` under many weight rows, and their per-rank bytes. |
 | `contract_faces(b_X, b_Y, weights, start, stop, *, mesh, return_transpose=False)` | `(b_X·w) @ b_Yᴴ` for row faces `[b,m,K]` at `P(None,'x',None)` / `P(None,'y',None)` (or `[b,μ,s,K]`, spin merged into μ) with replicated weights `[b,K]` and interval `[start,stop)`; output `[b,m,m]` at `P(None,'x','y')`. Local GEMMs only, no collective, no provider. |
 | `polar_factor`, `plan_polar_factor`, `PolarPlan` | Square polar factor / SVD, § [Polar factor](#polar-factor-and-spectral-directions). |
 | `right_singular_vectors`, `leading_eigenvectors`, `retain_leading_eigenvectors` | Eager spectral-direction selection on face or batch-layout stacks, § [Polar factor](#polar-factor-and-spectral-directions). |
@@ -410,7 +411,7 @@ boundary: `ceil(B/P)` whole matrices plus their RHS blocks per rank.
 
 ## Bounded face products
 
-`panel_matmul(A, B, *, mesh, panel_bytes, bounds=None, weights=None, partner=False)`
+`panel_matmul(A, B, *, mesh, panel_bytes, bounds=None, weights=None, partner=False, resident=None)`
 forms `A @ B` as a batched 2-D SUMMA inside one `shard_map`. `A` is `[q,m,k]`
 at `P(None,'x','y')`; `B` is `[q,k,n]` in the same layout or `[q,s,k,n]` at
 `P(None,None,'x','y')`, in which case each A panel is broadcast once outside
@@ -428,7 +429,16 @@ local active-range GEMM), so dead bands cost no flops. `weights` `(q,k)`
 scale each panel slice of `A` on its way into the gather. `partner=True`
 also returns `conj(A)·diag(w)·conj(B)` from the same exchange, each gathered
 panel conjugated before its own GEMM (the face Green and its antiunitary
-partner). Rectangular meshes and the sample axis stream owner panels by
+partner). The gathered panels of the partner route do not depend on the
+weights, so a caller that multiplies the same `A`, `B` under many weight rows
+(a Green function at many τ) can hold the first of them: `panel_resident(A, B)`
+gathers `R = min(2, ⌊k/(2·p·w)⌋)` panels once (at most half of every owner
+block, none for a one-panel product), and `panel_matmul(..., resident=...)`
+exchanges only the rest. The product is the same bit for bit on the partner
+route and without weights; a single weight row then scales the gathered
+panel instead of the slice (bitwise on the CUDA face-parity cases). The Σ τ
+window runner holds them for its whole node loop (`gw.ppm_tau_kernel.SigmaKij`).
+Rectangular meshes and the sample axis stream owner panels by
 masked `psum` and contract every column. The budget bounds the operand panels
 only: the caller admits input/output faces, compiled temporaries
 (`memory_analysis()`) and provider workspace.
@@ -445,8 +455,10 @@ Measured (A100-40GB, warm, ms per Green-sized product; CrI3 8×8
 
 cuBLASMp runs one SUMMA per q and joins the XLA stream by events at entry and
 exit, so it cannot overlap neighbouring work; this route exchanges every q in
-one collective per panel, and XLA overlaps the next panel's all-gather with
-the current GEMM. At P16 the exchange is most of a build (1.2 of 1.85 ms on
+one collective per panel. In the Σ τ window executable XLA runs these
+all-gathers on the compute stream, so nothing overlaps (TAUPIPE nsys, Fe 8³ at
+P4 and P16), and the first gather of each τ node costs ~17 ms on every rank
+whatever its size. At P16 the exchange is most of a build (1.2 of 1.85 ms on
 CrI3).
 
 ## Face-pinned block glue
