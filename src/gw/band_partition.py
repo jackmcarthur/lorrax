@@ -122,7 +122,8 @@ def qp_band_cut(energies_ev, *, n_below_k, nval, ncond, mu_ev, clip_ev, cut_gap_
        overlap of the matrix's top band with the tail's lowest, and the log
        states it. A gap in the union of all k levels is not enough: the
        number of states below it varies with k. When the need reaches the
-       last loaded band, b3 = nb and there is no tail.
+       last loaded band, b3 = nb and there is no tail. A boundary that
+       cuts a degenerate multiplet at any k is skipped.
     3. b_semicore: the highest boundary at or below the lowest occupied count
        and below every requested band within the clip whose gap is at least
        ``semicore_gap_ev``; 0 when there is none.
@@ -148,10 +149,16 @@ def qp_band_cut(energies_ev, *, n_below_k, nval, ncond, mu_ev, clip_ev, cut_gap_
     top = float(e[need].max())
     gap_lo, gap_hi = band_gaps_ev(e)
     width = gap_hi - gap_lo                      # boundary n at position n - 1
-    if n_min >= nb:
+    # A boundary that cuts a degenerate multiplet at any k is never a cut
+    # (common.band_degeneracy: the zeta fit refuses such a left window).
+    from common.band_degeneracy import DEGENERACY_TOL_RY, boundary_min_gaps
+    from common.units import RYD_TO_EV
+    clean = boundary_min_gaps(e / RYD_TO_EV, is_full_spectrum=True) > DEGENERACY_TOL_RY
+    bounds = np.arange(n_min, nb)
+    bounds = bounds[clean[bounds]]
+    if n_min >= nb or bounds.size == 0:
         b3 = nb
     else:
-        bounds = np.arange(n_min, nb)            # candidate boundaries
         w = width[bounds - 1]
         opens = gap_lo[bounds - 1] < top + float(cut_search_ev)
         opens[0] = True
