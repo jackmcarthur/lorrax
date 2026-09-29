@@ -270,24 +270,27 @@ def test_the_support_envelope_refuses_a_grid_grown_past_it():
 # ---------------------------------------------------------------------------
 
 def test_semicore_patches_one_per_manifold_held_and_extended():
-    from gw.qp_support import (SEMICORE_ETA_EV, coarse_windows_ev, joined_grid_ev,
-                               semicore_patch_escapes, semicore_patches_ev, window_labels)
-    # Two coarse manifolds 20 eV apart: two patches; each 2 eV pad snapped to 0.5 eV.
+    from gw.qp_support import (SEMICORE_ETA_EV, SEMICORE_PATCH_STEP_EV, coarse_windows_ev,
+                               joined_grid_ev, semicore_patch_escapes, semicore_patches_ev,
+                               window_labels)
+    # Two coarse manifolds 20 eV apart: two patches; each 2 eV pad snapped to eta/2.
     e = np.array([[-72.0, -52.0, -50.3, -5.0, 1.0], [-71.9, -51.8, -50.1, -4.8, 1.2]])
     semi = np.zeros(e.shape, bool)
     semi[:, :3] = True
     near = np.arange(-7.0, 3.01, 0.25)
     patches = semicore_patches_ev(e, semi, near[0])
-    assert patches == ((-74.0, -69.5, SEMICORE_ETA_EV), (-54.0, -48.0, SEMICORE_ETA_EV))
+    snap = lambda lo, hi: (float(np.floor(lo / SEMICORE_PATCH_STEP_EV) * SEMICORE_PATCH_STEP_EV),
+                           float(np.ceil(hi / SEMICORE_PATCH_STEP_EV) * SEMICORE_PATCH_STEP_EV))
+    assert patches == (snap(-74.0, -69.9) + (SEMICORE_ETA_EV,), snap(-54.0, -48.1) + (SEMICORE_ETA_EV,))
     windows = coarse_windows_ev(near[0], patches)
     joined = joined_grid_ev(near, windows)
-    assert np.all(np.diff(joined) > 0) and joined[0] == -74.0
+    assert np.all(np.diff(joined) > 0) and joined[0] == patches[0][0]
     eta, group = window_labels(joined, windows, 0.25)
     assert set(group[joined < near[0]].tolist()) == {0, 1} and np.all(group[joined >= near[0]] == -1)
     assert np.all(eta[group >= 0] == SEMICORE_ETA_EV) and np.all(eta[group < 0] == 0.25)
     # Inside the pad: held.  A read that leaves it: the patch grows, never shrinks.
     assert not semicore_patch_escapes(e + 1.4, semi, near[0], patches).any()
-    moved = e.copy(); moved[:, 1] -= 2.0
+    moved = e.copy(); moved[:, 1] -= 4.0
     assert semicore_patch_escapes(moved, semi, near[0], patches).any()
     grown = semicore_patches_ev(moved, semi, near[0], previous=patches)
     assert grown[1][0] < patches[1][0] and grown[1][1] == patches[1][1]
@@ -300,18 +303,18 @@ def test_far_conduction_windows_sit_above_the_near_grid_held_and_extended():
                                far_patches_ev, joined_grid_ev, semicore_patches_ev,
                                window_labels)
     # Far conduction states above mu + 10 eV, the near grid ending at +12 eV.
-    e = np.array([[-52.0, -3.0, 1.0, 11.0, 18.0, 23.0], [-51.8, -2.8, 1.2, 11.5, 18.3, 23.4]])
+    e = np.array([[-52.0, -3.0, 1.0, 11.0, 14.5, 18.0], [-51.8, -2.8, 1.2, 11.5, 14.8, 18.3]])
     far = np.zeros(e.shape, bool); far[:, 3:] = True
     semi = np.zeros(e.shape, bool); semi[:, 0] = True
     near = np.arange(-7.0, 12.01, 0.25)
     patches = far_patches_ev(e, far, near[-1])
     # one merged window from above the near grid to the top state + pad, snapped to eta/2
     assert len(patches) == 1 and patches[0][2] == FAR_ETA_EV
-    assert near[-1] < patches[0][0] <= 16.0 and patches[0][1] >= 23.4 + 2.0
+    assert near[-1] < patches[0][0] <= 14.5 - 2.0 and patches[0][1] >= 18.3 + 2.0
     windows = tuple(coarse_windows_ev(near[0], semicore_patches_ev(e, semi, near[0]))) + tuple(
         (lo, hi, eta, False) for lo, hi, eta in patches)
     joined = joined_grid_ev(near, windows)
-    assert np.all(np.diff(joined) > 0) and joined[0] < near[0] and joined[-1] >= 25.4
+    assert np.all(np.diff(joined) > 0) and joined[0] < near[0] and joined[-1] >= 20.3
     eta, group = window_labels(joined, windows, 0.25)
     assert np.all(group[joined > near[-1]] == 1) and np.all(eta[joined > near[-1]] == FAR_ETA_EV)
     assert np.all(group[(joined >= near[0]) & (joined <= near[-1])] == -1)

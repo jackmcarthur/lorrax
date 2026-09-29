@@ -232,11 +232,16 @@ def hold_support_ev(sigma, deck_grid_ev, held_grid_ev, held_envelope,
 # (never shrinks), as the near support does.  A semicore state that rises into
 # the near grid reads the near grid.
 
-#: Broadening of the semicore patch (eV), fixed by the owner (2026-09-28
-#: 21:40).  Its systematic error is reported apart from the 1 meV budget of
-#: the controllable errors.  At the deck eta the Fe 3s Z leaves (0, 1] from
-#: map 1 and the reference stalls (TWOCLASS, claim 2945).
-SEMICORE_ETA_EV = 1.0
+#: Broadening of the automatic coarse (semicore) windows (eV).  Owner
+#: 2026-09-29: "i don't care if the broadening is like, 8 eV or something.
+#: there should be some broadening that works".  Converged fixed points at
+#: coarse eps 3e-3, far windows at 1 eV (claim 2960), E_F +- 1 eV std/max
+#: against the smallest converged eta: Fe 4^3 charge (ref 1 eV) 1.2/8.0 meV at
+#: 3 eV, 3.6/15.9 at 5, 8.2/26.7 at 8; MoS2 3x3 (ref: deck eta) 2.9/20.0 at 5,
+#: 4.6/31.8 at 8.  5 eV is the largest with a few meV std on both; the coarse
+#: windows then add 47 (Fe) and 37 (MoS2) tau pairs per map, and every
+#: coarse Z stays in (0, 1].
+SEMICORE_ETA_EV = 5.0
 #: Patch sampling step (eV): eta_semi / 2 resolves the broadened Sigma.
 SEMICORE_PATCH_STEP_EV = 0.5 * SEMICORE_ETA_EV
 #: A patch's top sample stays this far (eV) below the near grid's bottom (and
