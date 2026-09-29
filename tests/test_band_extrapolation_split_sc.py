@@ -131,7 +131,7 @@ def test_one_split_config_sizes_the_isdf_by_the_max_and_brackets_the_sigma():
         enabled=True, enk_ry=_flat_spectrum(counts.sigma), n_occ=N_OCC,
         nb_logical=counts.sigma, nb_padded=counts.sigma,
         fractions=BRACKET_FRACTIONS)
-    assert plan.counts == (80, 90, 100)
+    assert plan.counts == (70, 85, 100)
     assert max(plan.counts) == counts.sigma
 
     # -- and the two are DIFFERENT numbers, which is the whole point --
@@ -232,8 +232,8 @@ def test_the_wrong_band_count_is_INVISIBLE_in_the_weights():
         f"{w_chi}")
 
     # Where it DOES show up: the bands actually summed.
-    assert sigma_plan.counts == (80, 90, 100)
-    assert chi_counts == (198, 223, 248)
+    assert sigma_plan.counts == (70, 85, 100)
+    assert chi_counts == (174, 211, 248)
     assert max(sigma_plan.counts) == counts.sigma < counts.chi
     assert sigma_plan.bounds[-1][1] == counts.sigma, (
         "the last bracket's upper bound is the only place the count is "
