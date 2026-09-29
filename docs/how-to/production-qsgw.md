@@ -133,7 +133,7 @@ claim 2952) holds the rest of the recipe. It is not on main.
   at a gap pays only when the deeper window's η can rise faster than its
   depth: at equal feedback on E_F it needs q < (1 − r)²/(4r), r the depth
   ratio shallow/deep and q the feedback slope ratio deep/shallow; measured
-  q is 0.69 (MoS2, needs < 0.58) and 0.54 (Fe, needs < 0.05) (claim WINSPLIT).
+  q is 0.69 (MoS2, needs < 0.58) and 0.54 (Fe, needs < 0.05) (claim 2960).
   `sigma_omega_patches_ev` takes `lo:hi:eta` user windows. Against the
   semicore-at-deck-η read at map 0: ±10 eV states 0.90 / 3.82 meV std / max
   (MoS2), 1.30 / 7.87 (Fe); MoS2 gap −0.36 meV (claim 2952).

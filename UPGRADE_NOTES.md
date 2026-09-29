@@ -12,7 +12,7 @@ owner 2026-09-29); every other Σ window keeps `sigma_quadrature_eps`. At
 1087 → 982; states within E_F ± 10 eV move ≤ 0.06 meV at maps 0–1 (≤ 1.9 meV
 at map 2 of the unconverged Fe run); semicore QP ≤ 4.3 meV at map 0. The
 planner's node law for grouping coarse windows is now evaluated on the box
-each run is built on, so it equals the certified count (claim WINSPLIT).
+each run is built on, so it equals the certified count (claim 2960).
 
 ## 2026-09-29 — the production QSGW partition: absolute band cut, semicore patch
 
