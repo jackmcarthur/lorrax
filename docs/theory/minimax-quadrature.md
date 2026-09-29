@@ -262,12 +262,16 @@ certify is returned uncertified and the planner refuses the window by name.
 **Chosen constants.** None of these is derived; each was fixed once and not
 tuned per box. Corner exponent c = 4 (under ln 83.3); line end Λ = ln(4/ε);
 growth-side image cap |Im s|(b − a) ≤ 3 (the fitted rules' off-ray cap); margin
-floor slope 0.01 (the one constant calibrated against the corpus) and margin
+floor slope 0.01 (calibrated against the corpus) and margin
 cap 1.2; leg start 0.05/(Mτ_c); the image-horizon guard
 1/max(1 − m/B₀, 0.05); ridge 0.05ε; fit density 2 points per half wave of the
-fastest term live at each point of the real edges (live: its contour share,
-nearest-node spacing times modulus, above 10⁻²ε, which drops the line's far
-end) and 40 geometric points on the sides; the
+fastest term live at each point of the real edges, and at least 8 rows per |d|
+(the certificate's p_target); live means a contour share (nearest-node spacing
+times modulus) above 10⁻²ε, the second constant calibrated against the corpus
+(10⁻² certifies all 119 gate-deck windows at their node counts, 3·10⁻² puts two
+a rung up); the line's far end has share (ε/4)|Δs_far|, 1.5·10⁻⁴ to 1.8·10⁻¹ε
+over the 35 gate crossing windows, so the floor drops it on the wide ones; 40
+geometric points per side, corners included; the
 narrowest built side 4η; the tall-box leg phase 8 rad and the bend floor 2;
 the ladders (×1.1, six rungs each; the bend c, c/2, c/4); the sector φ grid (200
 points) and its gap guard (0.02 rad).

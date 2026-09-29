@@ -79,10 +79,18 @@ _LEG_PHASE, _BEND_MIN = 8.0, 2.0
 _FIT_POINTS = 2.0
 #: A term is live at d while its contour share ``|ds_k| |exp(i s_k d/eta)|``
 #: exceeds ``_LIVE_SHARE eps`` (units eta = 1; ``|ds_k|``, the distance to its
-#: nearest node, is the weight the contour integral gives it).  1e-2 drops the
-#: line's far end (share ~3e-3 eps) and certifies every gate-deck window at its
-#: main node count; 3e-2 put two of the 119 gate windows a rung up (RULEFAST).
+#: nearest node, is the weight the contour integral gives it).  Calibrated on
+#: the 119 gate-deck windows, not derived: 1e-2 certifies every one at its
+#: main node count, 3e-2 put two a rung up (RULEFAST).  The line's far end has
+#: share ``(eps/4) |ds_far|`` (1.5e-4 to 1.8e-1 eps over the 35 gate crossing
+#: windows), so the floor drops it on the wide ones only.
 _LIVE_SHARE = 1.0e-2
+#: Fit rows per ``|d|`` at least (1/d varies on the scale ``|d|``); the
+#: certificate's ``p_target``.  A choice, not calibrated.
+_FIT_PER_MODULUS = 8.0
+#: Geometric points per side of a box with a top edge, corners included (the
+#: 38 interior ones are rows).
+_SIDE_POINTS = 40
 
 
 # ------------------------------------------------------------ crossing: nodes
@@ -235,10 +243,10 @@ def _live_rate(d, times, eta, eps):
 def _edge_cloud(lo, hi, y, eta, times, eps):
     """Points ``x + i y``, ``x`` in ``[lo, hi]`` with ends, at ``_FIT_POINTS``
     per half wave of the fastest live term (:func:`_live_rate`), and at least
-    8 per ``|d|`` (1/d itself varies on ``|d|``)."""
+    ``_FIT_PER_MODULUS`` per ``|d|``."""
     aux = np.linspace(lo, hi, 4001)
     rate = _live_rate(aux + 1j * y, times, eta, eps)
-    density = np.maximum(_FIT_POINTS * rate / math.pi, 8.0 / np.abs(aux + 1j * y))
+    density = np.maximum(_FIT_POINTS * rate / math.pi, _FIT_PER_MODULUS / np.abs(aux + 1j * y))
     cum = np.concatenate([[0.0], np.cumsum(0.5 * (density[1:] + density[:-1]) * np.diff(aux))])
     x = np.interp(np.linspace(0.0, cum[-1], max(int(math.ceil(cum[-1])), 2) + 1), cum, aux)
     x[0], x[-1] = lo, hi
@@ -247,13 +255,13 @@ def _edge_cloud(lo, hi, y, eta, times, eps):
 
 def _fit_cloud(box, times, eps):
     """Least-squares rows: the real edges at ``_FIT_POINTS`` per half wave of
-    the fastest term live at each point (:func:`_edge_cloud`), 38 geometric
-    points on each side.  A thin box keeps its top edge: without it one gate
+    the fastest term live at each point (:func:`_edge_cloud`), and the
+    ``_SIDE_POINTS - 2`` interior geometric points of each side.  A thin box keeps its top edge: without it one gate
     window (M = 100, m = 61, H = 1.01 eta) certified a rung up (RULEFAST)."""
     a, b, c, d = (float(v) for v in box)
     rows = [_edge_cloud(a, b, c, c, times, eps)]
     if d > c:
-        y = np.geomspace(c, d, 40)[1:-1]
+        y = np.geomspace(c, d, _SIDE_POINTS)[1:-1]
         rows += [_edge_cloud(a, b, d, c, times, eps), a + 1j * y, b + 1j * y]
     return np.concatenate(rows)
 

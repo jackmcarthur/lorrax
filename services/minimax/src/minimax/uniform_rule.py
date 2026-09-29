@@ -50,7 +50,11 @@ __all__ = [
 #: for every mask of 16 or more CPUs; a smaller mask builds at its own count
 #: (16 threads on 5 CPUs took over 600 s against 13 s; NOCACHE review).
 #: 16 is the physical core count of a Perlmutter GPU rank
-#: (``runtime.default_blas_threads``), whose mask has 32.
+#: (``runtime.default_blas_threads``), whose mask has 32. Ranks agree because
+#: a rule reaches other ranks only through the planners' all-gathers, so a
+#: smaller mask changes a rule's round-off, never agreement between ranks;
+#: any new caller of ``analytic_box_rule`` or ``response_group_rules`` must
+#: gather too.
 _BLAS_THREADS = 16
 _BLAS_CONTROLS = None
 #: Complex entries per row block of a sampled term matrix (1 MiB): a worker's
