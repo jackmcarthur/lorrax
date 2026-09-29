@@ -2652,6 +2652,25 @@ class SCSupport(NamedTuple):
     event: str                 # one-shot | plan | hold | extend
     envelope: tuple | None     # R's envelope since the last plan, eV
     no_qp: np.ndarray          # requested identities dropped for Z outside (0, 1]
+    semicore: np.ndarray | None = None   # semicore identities (read on the patch)
+    patch: tuple | None = None           # the held semicore patch (lo, hi, eta), eV
+    patch_event: str = ""                # plan | hold | extend
+    joined: np.ndarray | None = None     # patch samples + the near grid: what Sigma samples
+
+
+def _sc_semicore_bands(inputs):
+    """Semicore band count of the QP matrix on a route that reads the patch.
+
+    The bands [0, b_semicore) of the absolute band cut (``band_partition.
+    qp_band_cut``, decided before the ζ fit and kept on ``meta``).  Only the
+    scalar MPA/shared-pole Sigma reads the patch; a sector route reads the
+    near grid under main's rule, so it has none here.
+    """
+    cut = getattr(getattr(inputs, "meta", None), "qp_band_cut", None)
+    if (cut is None or inputs.wfns_transverse is not None
+            or inputs.config.compute_mode is not ComputeMode.MPA):
+        return 0
+    return int(cut.b_semicore)
 
 
 def _sc_sampled_support(inputs, partition, energies_loop, mu_ev, active_n=None,
@@ -2686,6 +2705,13 @@ def _sc_sampled_support(inputs, partition, energies_loop, mu_ev, active_n=None,
         support_partition.protected_mask | support_partition.in_range_mask,
         dtype=bool), energies_loop.shape)
     energy_relative_ev = energies_loop - mu_ev
+    # THE SEMICORE CLASS reads its own patch (gw.qp_support); every other
+    # QP-matrix identity is protected at the deck eta and reads the near grid.
+    n_semi = _sc_semicore_bands(inputs)
+    semicore = np.zeros(energies_loop.shape, dtype=bool)
+    semicore[:, :n_semi] = True
+    if n_semi:
+        active_n = np.arange(energies_loop.shape[1]) >= n_semi
     # Owner 2026-09-24: the requested states are the protected identities the
     # W model treats as active (``active_n``: shared_pole_recipe.active_band_mask
     # on the fixed DFT ladder), never frozen core; owner 2026-09-27: only
@@ -2703,8 +2729,23 @@ def _sc_sampled_support(inputs, partition, energies_loop, mu_ev, active_n=None,
         grid, envelope, event = hold_support_ev(
             sigma, requested, sampled_grid, session.get("support_envelope_ev"),
             energy_relative_ev, states)
+    patch, patch_event = None, ""
+    if n_semi:
+        from .qp_support import semicore_patch_escapes, semicore_patch_ev
+        near_lo = float(grid[0])
+        held = None if session is None else session.get("semicore_patch_ev")
+        if plan is None or held is None:
+            patch, patch_event = semicore_patch_ev(
+                energy_relative_ev, semicore, near_lo), "plan"
+        elif semicore_patch_escapes(energy_relative_ev, semicore, near_lo, held).any():
+            patch, patch_event = semicore_patch_ev(
+                energy_relative_ev, semicore, near_lo, previous=held), "extend"
+        else:
+            patch, patch_event = held, "hold"
+    from .qp_support import joined_grid_ev
     return SCSupport(sampled_grid, grid, energy_relative_ev, states, event,
-                     envelope, no_qp)
+                     envelope, no_qp, semicore, patch, patch_event,
+                     joined_grid_ev(grid, patch))
 
 
 def _record_sc_window_plan(inputs, iteration, support):
@@ -2766,6 +2807,30 @@ def _record_sc_window_plan(inputs, iteration, support):
                    f"read support [{e[k, n] - half:+.6f}, {e[k, n] + half:+.6f}] eV "
                    f"crosses the {side} edge; pad {SUPPORT_PAD_EV:.2f} eV; grid {grids}; "
                    f"extension {count} of this run")
+
+
+def _record_semicore_z(inputs, iteration, z_kn, semicore_kn):
+    """One receipt per map: semicore Z on the patch (the SC +-0.5 eV stencil).
+
+    Owner question 2026-09-28: is the semicore Z pathological as eta_semi
+    shrinks?  Rank 0 also writes it to stderr (production stdout is
+    /dev/null).
+    """
+    import sys
+    z = np.asarray(z_kn, dtype=np.float64)
+    mask = np.broadcast_to(np.asarray(semicore_kn, bool), z.shape)
+    if not mask.any():
+        return
+    zs = z[mask]
+    bad = mask & ~((z > 0.0) & (z <= 1.0))
+    bands = sorted(set((np.nonzero(bad)[1] + 1).tolist()))
+    line = (f"    SC semicore Z (map {iteration}, patch, +-0.5 eV stencil): n={zs.size} "
+            f"min={zs.min():+.4f} median={np.median(zs):+.4f} max={zs.max():+.4f}; "
+            f"outside (0, 1]: {int(bad.sum())} (k,state)"
+            + (f" in bands {bands}" if bands else ""))
+    _record_sc(inputs, line)
+    if jax.process_index() == 0:
+        print(line, file=sys.stderr, flush=True)
 
 
 def _sc_active_identities(inputs):
@@ -3312,7 +3377,7 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
                       entry_occ_state if inputs.material_class == "metal" else None),
                       _sc_active_identities(inputs), state.tail_z_kn))
     sigma0_kn = (np.zeros(energies_loop.shape, dtype=bool) if sc_support is None
-                 else ~omega_coverage(sc_support[1], sc_support[2])[0])
+                 else ~omega_coverage(sc_support.joined, sc_support.energy)[0])
 
     # ENERGY-ONLY SCISSOR FOR THE SUM-BAND TAIL.  No new iteration state:
     # the fit is derived from the current carry's eigenspectrum and the
@@ -3876,8 +3941,17 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
             session["omega_grid_ev"] = tuple(float(x) for x in expanded_grid)
             session["window_plan"] = {
                 "event": event, "iteration": int(state.iteration)}
+            session["semicore_patch_ev"] = sc_support.patch
+        if sc_support.patch is not None and sc_support.patch_event != "hold":
+            _lo, _hi, _eta = sc_support.patch
+            _record_sc(inputs, f"    SC semicore patch ({sc_support.patch_event}, map "
+                       f"{int(state.iteration)}): [{_lo:+.2f}, {_hi:+.2f}] eV at eta "
+                       f"{_eta:g} eV below the near grid [{expanded_grid[0]:+.2f}, "
+                       f"{expanded_grid[-1]:+.2f}] eV; {int(sc_support.semicore.sum())} "
+                       "semicore (k,state) keep their full Sigma rows")
         sigma_config = replace(
-            inputs.config, sc_omega_grid_ev=tuple(float(x) for x in expanded_grid))
+            inputs.config, sc_omega_grid_ev=tuple(float(x) for x in sc_support.joined),
+            sc_semicore_patch_ev=sc_support.patch)
     sigma_result = compute_sigma_xc(
         inputs.config.compute_mode,
         occupation_state=metal_occ_state,
@@ -4119,6 +4193,9 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
         z_sorted = _sc_z_factors(inputs, state_out, energies_loop)
         state_out = replace(state_out, tail_z_kn=np.take_along_axis(
             np.asarray(z_sorted, dtype=np.float64), indices_loop, axis=1))
+        if sc_support is not None and sc_support.patch is not None:
+            _record_semicore_z(inputs, int(state.iteration), state_out.tail_z_kn,
+                               sc_support.semicore)
     _record_sc_map_stages(inputs, state.iteration, _map_started,
                           _map_stages_before)
     return state_out

@@ -3386,10 +3386,11 @@ def prepare_band_metadata(centroid_indices, config, mesh_xy, n_rmu, print0, sym,
     mu_basis = PackedCentroidBasis.build(
         centroid_indices, sym, wfn.fft_grid, mesh_xy)
     print0(f"  {mu_basis.describe()}")
-    ncond = int(config.ncond)
+    ncond, cut = int(config.ncond), None
     if config.compute_mode.is_dynamic and config.qp_solver == "self_consistent":
         # The QP matrix [0, b3) is the absolute band cut (gw.band_partition).
-        ncond = qp_band_cut_for_deck(config, wfn, print0).b3 - int(wfn.nelec)
+        cut = qp_band_cut_for_deck(config, wfn, print0)
+        ncond = cut.b3 - int(wfn.nelec)
     meta = Meta.from_system(wfn, sym,
                             int(config.nval),
                             ncond, config.nband,
@@ -3400,6 +3401,7 @@ def prepare_band_metadata(centroid_indices, config, mesh_xy, n_rmu, print0, sym,
     meta.rank = jax.process_index()
     meta.n_proc = jax.process_count()
     meta.sys_dim = config.sys_dim
+    meta.qp_band_cut = cut
     meta.bispinor = charge_bispinor
     band_slices = BandSlices.from_band_edges(
         *meta.band_edges, b4_chi=meta.b_id_4_chi,

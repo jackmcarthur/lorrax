@@ -1233,6 +1233,19 @@ def _compute_mpa_sigma(
             fixed_quadrature_session.setdefault(sigma_w_model, {})),
         material_class=material_class,
         print_fn=print_fn)
+    patch = getattr(config, "sc_semicore_patch_ev", None)
+    if patch is not None:
+        # THE SEMICORE PATCH (gw.qp_support): its samples sit in the grid below
+        # the near support and are evaluated at eta_semi; its crossing windows
+        # split off at that eta and the patch tolerance (sigma_box_plan).
+        if sector_handle.get("representation") == "sector-ordered-ph":
+            raise ValueError("GATE semicore_patch_route: the semicore patch serves the "
+                             "scalar Sigma route only; sector routes read the near grid")
+        from .qp_support import SEMICORE_PATCH_EPS, patch_eta_ev
+        omega_ev = np.asarray(config.omega_grid_ev, dtype=np.float64)
+        body_options.update(
+            omega_eta_ry=patch_eta_ev(omega_ev, patch, _xi.resolved_ry * RYD_TO_EV) / RYD_TO_EV,
+            split_eps=SEMICORE_PATCH_EPS)
     lorentz_output = bool(config.debug.sigma_lorentz_debug_output)
     if not lorentz_output:
         sigma_lorentz = None

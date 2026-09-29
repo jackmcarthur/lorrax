@@ -136,6 +136,33 @@ def test_three_product_partition_uses_raw_tuple_boxes(monkeypatch):
     np.testing.assert_array_equal(plan[2].pole_indices, [1])
 
 
+def test_a_patch_eta_splits_only_crossing_windows_and_carries_its_eps(monkeypatch):
+    """The SC semicore patch (gw.qp_support): frequencies at a second eta
+    split a crossing window into its own box, rule and executor weights at
+    that eta and the patch tolerance; sign-definite windows serve every
+    frequency at the plan's eta."""
+    plan, geometry = _plan(monkeypatch, omega_eta_ry=np.asarray([0.1, 0.3]),
+                           split_eps=1.0e-2)
+    names = [row.window.name for row in plan]
+    assert names == [
+        "positive conduction:resonant",
+        "positive conduction:resonant@eta4.08",
+        "positive conduction:state_tail",
+        "positive conduction:pole_tail",
+    ]
+    report = {row["name"]: row for row in geometry["branches"][0]["windows"]}
+    split = report["positive conduction:resonant@eta4.08"]
+    assert split["eta_ry"] == 0.3 and split["eps"] == 1.0e-2
+    assert report["positive conduction:resonant"]["eps"] == 1.0e-4
+    np.testing.assert_array_equal(plan[0].omega_idx, [0])
+    np.testing.assert_array_equal(plan[1].omega_idx, [1])
+    np.testing.assert_array_equal(plan[3].omega_idx, [0, 1])
+    # The executor weights carry the window's own eta exactly once.
+    np.testing.assert_allclose(
+        np.asarray(plan[1].window.nodes.alpha) / np.asarray(plan[0].window.nodes.alpha),
+        np.exp(-(0.3 - 0.1) * np.asarray(plan[0].window.nodes.t)), rtol=1e-12)
+
+
 def test_ppm_flat_crossing_line_nodes_reach_sigma_executor(monkeypatch):
     ppm_summaries = _summaries(poles=((0.3, 0.0), (1.0, 0.0)))
     plan, geometry = _plan(monkeypatch, summaries=ppm_summaries,

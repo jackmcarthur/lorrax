@@ -4726,6 +4726,11 @@ class LorraxConfig:
     #: Internal sampled SC support, retained by the quadrature session.
     #: This is not a deck knob; requested Sigma bounds stay unchanged.
     sc_omega_grid_ev: tuple[float, ...] | None = None
+    #: Internal: the SC semicore patch (lo_ev, hi_ev, eta_ev) about the Sigma
+    #: frame's E_F, held from map 0 (``gw.qp_support.semicore_patch_ev``).
+    #: Its samples lie inside ``sc_omega_grid_ev`` below the near grid and
+    #: are evaluated at eta_ev.  Not a deck knob.
+    sc_semicore_patch_ev: tuple[float, float, float] | None = None
 
     def __post_init__(self):
         """Refuse head settings outside their landed scope."""
