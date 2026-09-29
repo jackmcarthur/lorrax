@@ -57,7 +57,15 @@ are `P(None,'x','y')` on the square X/Y mesh with `P = Px·Py`.
    goes to pinned host memory if it fits half the host budget; otherwise it
    stays a scratch file. `write_w` and a distributed `linalg` always use the
    file.
-4. **Constructor** (§3–§6) → `model.h5`, one parent round at a time.
+4. **Constructor** (§3–§6) → `model.h5`, one parent round at a time. An SC
+   map keeps the model on the devices instead (`ResidentSectorModel`, the
+   photon sectors' carrier) when the model at its stored column bound and one
+   copy fit half the device budget; the head, Σ and, on the accepted final
+   map, the `W0_qmunu` persist read it there, and the next map's boundary or
+   the end of the loop releases it. `write_w`, `write_poles`, a one-shot
+   (restart member) and a refused admission write `model.h5`. A rerun of an
+   interrupted SC run finds no committed model in a resident map's scratch and
+   rebuilds that map; a committed `model.h5` still refuses a rebuild.
 5. **Σ** (§8) synthesizes $W_c(\tau)$ from the factors.
 
 Every map rebuilds samples, directions, poles and ranks from the current
@@ -287,8 +295,8 @@ $\omega=0$ coefficient $-1/(2\Lambda)$ and adds the hole branch
 $W_+(-q,0)^{\mathsf T}$ (ordered) or $W_+$ (TRS), i.e. $-b\Lambda^{-1}b^\dagger$
 on a TRS store. A one-shot stores the resolver's $\omega=0$ head; a
 self-consistent run evaluates the accepted final map's model once, after the
-loop, from that map's retained scratch generation, and stores the map's
-iteration head at $\omega=0$. Plain-MPA, bispinor and metal restarts carry no
+loop, from the devices (step 4) or that map's retained scratch generation, and
+stores the map's iteration head at $\omega=0$. Plain-MPA, bispinor and metal restarts carry no
 `W0_qmunu`, and a BSE on them refuses.
 `write_w = true` dumps the bank as stored (line supports as panels) and is a
 debug output.

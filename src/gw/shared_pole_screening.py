@@ -1,13 +1,14 @@
 """Deck-driven shared real-pole screening (DESIGN §3, rulings15–16).
 
 The response, constructor and persistence owners implement their own stages.
-This helper authenticates the current map and passes only disk handles between
-stages. Samples, directions and poles are rebuilt across changed maps;
-the SC owner may retain time nodes after current-domain certification.
+This helper authenticates the current map and passes handles between stages:
+files, or the device-resident bank and SC model when they fit. Samples,
+directions and poles are rebuilt across changed maps; the SC owner may retain
+time nodes after current-domain certification.
 """
 from pathlib import Path
 import dataclasses
-from functools import lru_cache
+from functools import lru_cache, partial
 import hashlib
 import json
 import shutil
@@ -297,6 +298,55 @@ def _bank_residence(meta, config, *, mesh_xy, sym, root, label, photon, mu_bases
     return ResidentBankPayload(mesh_xy, carrier=carrier, label=bank_label), receipt
 
 
+#: The device-resident scalar model of this process's latest SC map (at most
+#: one). It lives from its constructor through the map's head and Sigma and,
+#: on the accepted final map, the W0 persist; the next map's boundary or the
+#: end of the SC run releases it (:func:`release_resident_model`).
+_RESIDENT_MODEL: list = []
+
+
+def release_resident_model():
+    """Release the latest SC map's device-resident scalar model, if any."""
+    while _RESIDENT_MODEL:
+        _RESIDENT_MODEL.pop().release()
+
+
+def _scalar_model_residence(meta, nq, width, *, mesh_xy, root, identity):
+    """Keep an SC map's scalar model on the devices when it fits.
+
+    The model file of an SC map has three readers in the same process: the
+    head, Sigma and, on the accepted final map, the W0 persist
+    (``gw.mpa.sigma.shared_pole_static_wc``); no later run reads it (SC
+    scratch never serves a restart). It stays resident under the sector
+    models' admission rule (``shared_pole_sectors._sector_model_residence``):
+    R, its bytes at the stored K extent's bound (``model_column_bound`` of
+    the constructor's column width), and one copy fit in half of the device
+    budget beside the live stages. The constructor has finished when this is
+    asked, so its route cannot change. Otherwise model.h5 is written as
+    before. Returns ``(model or None, receipt)``; a resident R is reserved as
+    ``receipt["stage"]`` and the model is held for :func:`release_resident_model`.
+    """
+    from file_io.shared_pole_store import ResidentSectorModel, model_column_bound
+    ledger = meta.shared_pole_capacity
+    R = ResidentSectorModel.payload_bytes(mesh_xy, nq, meta.mu_basis.n_canonical,
+                                          model_column_bound(meta, width))
+    receipt = dict(residence="file", payload_bytes_per_rank=int(R))
+    both = ledger.preview(resident_bytes_per_rank=2 * R, workspace_bytes_per_rank=0,
+                          concurrent_with=ledger.live_stages)
+    receipt["half_budget_bytes_per_rank"] = both["available_device_bytes_per_rank"] // 2
+    if both["aggregate_bytes_per_rank"] > receipt["half_budget_bytes_per_rank"]:
+        receipt["reason"] = "model and one copy exceed half the device budget"
+        return None, receipt
+    stage = f"scalar_model.{identity['iteration_id']}"
+    ledger.reserve(stage, resident_bytes_per_rank=R, workspace_bytes_per_rank=0,
+                   concurrent_with=ledger.live_stages)
+    receipt.update(residence="device", stage=stage,
+                   reason="model and one copy fit in half the device budget")
+    model = ResidentSectorModel(mesh_xy, label=str(root / "model.h5"))
+    _RESIDENT_MODEL.append(model)
+    return model, receipt
+
+
 #: The per-map scratch generation ``screen_shared_poles`` creates under an SC
 #: label (bank, Coulomb staging, constant and receipts).
 _MANAGED_SCRATCH = r"sc_[0-9]{4}_shared_pole"
@@ -392,6 +442,8 @@ def screen_shared_poles(wfns, V_q, meta, config, *, mesh_xy, sym,
         recipe, ledger = meta.shared_pole_recipe, meta.shared_pole_capacity
         # This is the top-level map boundary. All upstream V/psi carriers are
         # inherited; no newly allocated bank/constructor arrays exist yet.
+        # The previous SC map's resident model has had its last reader.
+        release_resident_model()
         ledger.live_stages = ()
         if occupation_state is not None:
             from common.collectives import replicate_to_mesh
@@ -549,8 +601,15 @@ def screen_shared_poles(wfns, V_q, meta, config, *, mesh_xy, sym,
         result = construct_sector_poles(bank, meta, config,
             mesh_xy=mesh_xy, output=str(root / "model.h5"))
     else:
+        # An SC map keeps its model on the devices when it fits; an export
+        # (write_w, write_poles) reads model.h5 and a one-shot registers it
+        # as a restart member, so those write it.
+        model_rule = None
+        if sc_scratch and not (config.debug.write_w or config.write_poles):
+            model_rule = partial(_scalar_model_residence, meta, mesh_xy=mesh_xy,
+                                 root=root, identity=identity)
         result = construct_shared_poles(bank, bank, meta, config,
-            mesh_xy=mesh_xy, output=str(root / "model.h5"))
+            mesh_xy=mesh_xy, output=str(root / "model.h5"), residence=model_rule)
     if resident is not None:
         # The model is committed; the constructor was the bank's last reader.
         resident.release()
@@ -558,14 +617,18 @@ def screen_shared_poles(wfns, V_q, meta, config, *, mesh_xy, sym,
     receipts["bank_residence"] = residence
     with timing.section("spole.screening_finalize"):
         record("constructor", result)
-        if photon:
-            models = result["model_residence"]
-            print_fn(f"shared-pole sector models: {models['residence']}; "
-                     f"{models['payload_bytes_per_rank'] / 2**30:.3f} GiB/rank bound; {models['reason']}")
+        models = result["model_residence"]
+        if "payload_bytes_per_rank" in models:
+            print_fn(f"shared-pole {'sector models' if photon else 'model'}: {models['residence']}; "
+                     f"{models['payload_bytes_per_rank'] / 2**30:.3f} GiB/rank"
+                     f"{' bound' if photon else ''}; {models['reason']}")
         header = None if photon else result["model_header"]
         handle = (result['handle'] if photon else
-                  dict(path=str(root / "model.h5"), identity=identity,
+                  dict(path=result["model"], identity=identity,
                        digest=header["digest"], K=list(header["K"])))
+        if not photon and models.get("stage"):
+            # Sigma and the final-map W0 persist read it; the next map releases it.
+            handle["model_stage"] = models["stage"]
         # Device-resident sector models stay live until Sigma releases them.
         ledger.live_stages = (handle['model_stage'],) if handle.get('model_stage') else ()
         result = dict(shared_pole=handle)

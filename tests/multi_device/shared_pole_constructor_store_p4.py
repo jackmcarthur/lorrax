@@ -219,6 +219,7 @@ def run_checks(mesh, directory):
         parity[arm] = dict(reference=reference, max_rel_or_abs=diff, bitwise=bitwise)
         assert (bitwise if reference == 'local' else diff <= 1e-10), (arm, parity[arm])
     rows.append(dict(name='constructor_route_parity', status='PASS', parity=parity))
+    rows.append(_resident_model_checks(meta, bank, identity, mesh, directory, construct_shared_poles))
     resident.release()
     for layout in ('local', 'distributed'):
         # Independent red map: upstream already owns the full 3U budget.
@@ -244,6 +245,74 @@ def run_checks(mesh, directory):
     return rows
 
 
+def _resident_model_checks(meta, bank, identity, mesh, directory, construct):
+    """An SC map's device-resident scalar model reads the file model's bytes.
+
+    The map owner's residence rule (``_scalar_model_residence``) admits the
+    model, the constructor writes it on the devices, and every reader the
+    head, Sigma and the W0 persist use (census, both faces, the Gamma
+    matrix) returns the 'local' file arm's arrays bit for bit. A refused
+    admission writes model.h5 as before; a released model refuses reads.
+    """
+    import functools
+    import numpy as np
+    from types import SimpleNamespace
+    from unittest import mock
+    from file_io import shared_pole_store as store
+    from gw import shared_pole_screening as screening
+
+    config = SimpleNamespace(backend=SimpleNamespace(linalg='local'))
+    rule = functools.partial(screening._scalar_model_residence, meta, mesh_xy=mesh,
+                             root=directory, identity=identity)
+    ledger = meta.shared_pole_capacity
+    ledger.live_stages = ()
+    result = construct(bank, bank, meta, config, mesh_xy=mesh,
+                       output=directory / "model_resident.h5", residence=rule)
+    receipt, model = result['model_residence'], result['model']
+    assert receipt['residence'] == 'device' and isinstance(model, store.ResidentSectorModel), receipt
+    assert not (directory / "model_resident.h5").exists()
+    assert screening._RESIDENT_MODEL == [model]
+    assert any(row['stage'] == receipt['stage'] for row in ledger.entries)
+    ledger.live_stages = (receipt['stage'],)
+    file_path = directory / "model_local.h5"
+    headers = [store.validate_shared_pole_model(source, expected_identity=identity,
+                                                mesh_xy=mesh, capacity=ledger)
+               for source in (file_path, model)]
+    assert headers[0]['K'] == headers[1]['K'] and headers[0]['Kmax'] == headers[1]['Kmax']
+    reads = []
+    for source, header in zip((file_path, model), headers):
+        with store.open_shared_pole_model(source, mesh_xy=mesh) as io:
+            arrays = list(store.read_shared_pole_census(io, header=header, capacity=ledger))
+            arrays += list(store.read_shared_pole_faces(io, (0, 3), meta=meta, header=header))
+            for q in range(3):
+                arrays += list(store.read_shared_pole_matrix(io, (q, q + 1), meta=meta, header=header))
+        reads.append([np.asarray(a) for a in arrays])
+    bitwise = all(a.shape == b.shape and np.array_equal(a, b) for a, b in zip(*reads))
+    assert bitwise, [float(np.max(np.abs(a - b))) for a, b in zip(*reads) if a.shape == b.shape]
+    screening.release_resident_model()
+    assert screening._RESIDENT_MODEL == []
+    try:
+        model.read_slab('factor')
+        released = False
+    except ValueError:
+        released = True
+    assert released
+    # Refused admission: the file route, unchanged.
+    ledger.live_stages = ()
+    with mock.patch.object(store.ResidentSectorModel, 'payload_bytes',
+                           staticmethod(lambda *a: int(ledger.limit_bytes_per_rank))):
+        refused = construct(bank, bank, meta, config, mesh_xy=mesh,
+                            output=directory / "model_refused.h5", residence=rule)
+    assert refused['model_residence']['residence'] == 'file', refused['model_residence']
+    assert refused['model'] == directory / "model_refused.h5"
+    assert store.validate_shared_pole_model(
+        refused['model'], expected_identity=identity, mesh_xy=mesh,
+        capacity=ledger)['K'] == headers[0]['K']
+    assert screening._RESIDENT_MODEL == []
+    return dict(name='constructor_resident_model', status='PASS', bitwise_reads=len(reads[0]),
+                residence=receipt, refused=refused['model_residence'])
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--output', type=Path, required=True)
@@ -256,7 +325,7 @@ def main():
     rows = run_checks(mesh, args.output.parent)
     if jax.process_index() == 0:
         args.output.write_text(json.dumps(dict(status='PASS', checks=rows,
-            expected_checks=8, jobid=os.environ['SLURM_JOB_ID'], stepid=os.environ['SLURM_STEP_ID'],
+            expected_checks=9, jobid=os.environ['SLURM_JOB_ID'], stepid=os.environ['SLURM_STEP_ID'],
             mesh={axis: int(mesh.shape[axis]) for axis in ('x', 'y')},
             scope='square-mesh constructor and actual scratch/model store plus authenticated response Coulomb accessor; planted positive measure and native workspace queries; device peaks NOT_MEASURED'),
             indent=2, allow_nan=False)+'\n')

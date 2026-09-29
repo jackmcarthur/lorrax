@@ -50,7 +50,7 @@ def constructor_route(meta, config, recipe, *, mesh_xy, ledger, upstream, ordere
     return execution, receipt, column_extent, faces, moment_fields
 
 
-def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output):
+def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output, residence=None):
     """Construct and write a current-state, bounded-batch real-pole model.
 
     Parameters
@@ -72,6 +72,12 @@ def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output):
         Supplied named x/y mesh, never reconstructed by this driver.
     output : path-like
         New immutable compact model file, written by the store owner.
+    residence : callable, optional
+        The map owner's model residence rule, ``residence(nq, width)`` ->
+        ``(ResidentSectorModel or None, receipt)``, asked once the model's
+        column width is known and before it is written. A resident target
+        replaces ``output`` and its stage stays reserved for the caller; the
+        receipt is returned as ``model_residence``.
 
     Returns
     -------
@@ -439,14 +445,21 @@ def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output):
         budget.live((public_b,))
         del factors
     with timing.section("spole.writer"):
+        target, model_residence = output, dict(residence="file")
+        if residence is not None:
+            resident, model_residence = residence(nq, width)
+            if resident is not None:
+                target = resident
+                ledger.live_stages = (*ledger.live_stages, model_residence["stage"])
         store_header = write_shared_pole_model(
-            output, public_b, jax.device_put(store_poles, NamedSharding(mesh_xy, P())),
+            target, public_b, jax.device_put(store_poles, NamedSharding(mesh_xy, P())),
             np.concatenate(store_counts)[order], q_span=(0, nq), meta=meta, tables=bank["tables"], recipe=recipe,
             receipts={"identity": identity, "q_receipts": [receipts[q] for q in range(nq)]}, ordered=ordered)
         ledger.live_stages = upstream
         del public_b
     with timing.section("spole.return"):
         return {"q_receipts": [receipts[q] for q in range(nq)], "model_header": store_header,
+                "model": target, "model_residence": model_residence,
                 "capacity": ledger.receipt(),
                 "identity": identity, "status": "CONSTRUCTED",
                 "execution": dict(mode=execution, **execution_receipt)}

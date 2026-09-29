@@ -605,6 +605,16 @@ def _k_extent(meta, header, live, *, record):
     return extent
 
 
+def model_column_bound(meta, width, *, sector=None):
+    """An upper bound of the K extent finalization stores for a writer width.
+
+    The SC run's held extent when the width fits it, else the width plus
+    :data:`_K_HEADROOM` (``_k_extent`` grows a held extent by that much).
+    """
+    return max(_k_extent(meta, dict(sector=sector), int(width), record=False),
+               int(np.ceil(int(width) * (1.0 + _K_HEADROOM))))
+
+
 @lru_cache(maxsize=None)
 def _zeros_program(mesh, spec, shape):
     """A complex zero array of ``shape`` sharded ``spec``: one program per mesh, spec and shape."""
@@ -1527,18 +1537,29 @@ def _resident_slice(mesh, ndim, lead_shape):
 
 
 class ResidentSectorModel:
-    """One sector model held on the devices for Sigma instead of a file.
+    """One shared-pole model held on the devices instead of a file.
 
-    The constructor writes each sector round by round and Sigma reads it once
-    (census, then endpoint faces) in the same map. When the four models fit
-    (``gw.shared_pole_sectors._sector_model_residence``) they stay here:
-    ``write_shared_pole_model`` stages each batch, finalization assembles the
-    file's own datasets (``factor`` [nq, nmu, components, Kmax], exact zeros
-    past each K; ``poles2_ry2`` [nq, Kmax], 1 past each K) on a mesh-divisible
-    carrier, and every reader (census, faces, digest) goes through
-    ``read_slab`` with SlabIO's semantics, so Sigma reads the file route's
-    values bit for bit. Only reads are implemented; writes are the staging.
+    The constructor writes the model and Sigma reads it in the same map: the
+    four sector models of a photon map
+    (``gw.shared_pole_sectors._sector_model_residence``) and the scalar model
+    of an SC map (``gw.shared_pole_screening._scalar_model_residence``), each
+    when it fits. ``write_shared_pole_model`` stages each batch, finalization
+    assembles the file's own datasets (``factor`` [nq, nmu, components,
+    Kmax], exact zeros past each K; ``poles2_ry2`` [nq, Kmax], 1 past each K)
+    on a mesh-divisible carrier, and every reader (census, faces, matrix,
+    digest) goes through ``read_slab`` with SlabIO's semantics, so Sigma, the
+    head and the static W read the file route's values bit for bit. Only
+    reads are implemented; writes are the staging.
     """
+
+    @staticmethod
+    def payload_bytes(mesh, nq, rows, kmax):
+        """Per-rank bytes of a finalized model: the factor [nq, rows, K carrier]
+        on the XY face plus the replicated poles [nq, K]. ``rows`` is the
+        canonical centroid extent times the factor components."""
+        carrier = padded_axis(max(int(kmax), 1), combined_divisor(mesh.shape["x"], mesh.shape["y"]),
+                              name="shared_pole_model_K").carrier
+        return 16*int(nq)*int(rows)*carrier//int(mesh.size) + 8*int(nq)*int(kmax)
 
     def __init__(self, mesh, *, label):
         self.mesh = mesh
@@ -1582,8 +1603,11 @@ class ResidentSectorModel:
                 canonical, np.int32(width)))
             poles.append(_model_pole_block(self.mesh, staged.shape, kmax)(
                 staged, counts[batch["lo"]:batch["hi"]]))
-        self._fields["factor"] = _model_concat(self.mesh, 4)(*factors)
-        self._fields["poles2_ry2"] = _model_concat(self.mesh, 2)(*poles)
+        # One batch (the scalar constructor's only write) is already the
+        # dataset: no concatenated copy beside it.
+        self._fields["factor"] = factors[0] if len(factors) == 1 else _model_concat(self.mesh, 4)(*factors)
+        self._fields["poles2_ry2"] = poles[0] if len(poles) == 1 else _model_concat(self.mesh, 2)(*poles)
+        del factors, poles
         self._logical["factor"] = (nq, nmu, components, kmax)
         self._logical["poles2_ry2"] = (nq, kmax)
 

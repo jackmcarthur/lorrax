@@ -13,7 +13,7 @@ def test_ordered_store_refuses_the_time_reversal_even_gamma_head(monkeypatch):
     name before any factor is read, and point at the direct head an ordered store does
     carry (head_correction = no_local_fields; owner scope 2026-09-21).
     """
-    from file_io import slab_io
+    from file_io import shared_pole_store
     from gw.gw_config import HeadCorrection
     from gw.mpa import sample_plan
     from gw.shared_pole_head import build_shared_pole_head
@@ -31,7 +31,7 @@ def test_ordered_store_refuses_the_time_reversal_even_gamma_head(monkeypatch):
     def tensor_read(*_args, **_kwargs):
         raise AssertionError("factors read before the representation was checked")
 
-    monkeypatch.setattr(slab_io, "SlabIO", tensor_read)
+    monkeypatch.setattr(shared_pole_store, "open_shared_pole_model", tensor_read)
     with pytest.raises(ValueError, match="GATE shared_pole_head_ordered") as caught:
         build_shared_pole_head(dict(path="not-opened.h5"), header, None, None, meta, config,
             mesh_xy=mesh, wfn=None, response=NS(omegas=(1+.5j,)),
@@ -47,7 +47,7 @@ def test_ordered_store_carries_the_direct_head_without_a_fold(monkeypatch):
     deferred (owner scope 2026-09-21); this pins that nothing evaluates it by accident."""
     import gw.qsgw_head as qsgw_head
     import gw.mpa.model as mpa_model
-    from file_io import slab_io
+    from file_io import shared_pole_store
     from gw import qgrid_symmetry
     from gw.gw_config import HeadCorrection
     from gw.mpa import sample_plan
@@ -65,7 +65,7 @@ def test_ordered_store_carries_the_direct_head_without_a_fold(monkeypatch):
                 mpa=NS(n_poles=4, pole_solver="loewner"))
     z = np.array([1+.5j, 2+.5j])
     monkeypatch.setattr(sample_plan, "plan_z", lambda _plan: z)
-    monkeypatch.setattr(slab_io, "SlabIO",
+    monkeypatch.setattr(shared_pole_store, "open_shared_pole_model",
         lambda *a, **k: (_ for _ in ()).throw(AssertionError("factors read for a direct head")))
     monkeypatch.setattr(qgrid_symmetry, "shared_pole_operator_realizer",
         lambda *a, **k: (_ for _ in ()).throw(AssertionError("realizer bound for a direct head")))
@@ -98,7 +98,7 @@ def test_ordered_store_carries_the_direct_head_without_a_fold(monkeypatch):
     (64, 384, True),  # The actual Si geometry is unchanged by this guard.
 ])
 def test_head_projection_logical_bound_precedes_tensor_reads(monkeypatch, q_count, packed, allowed):
-    from file_io import slab_io
+    from file_io import shared_pole_store
     from gw import qgrid_symmetry
     from gw.gw_config import HeadCorrection
     from gw.mpa import sample_plan
@@ -129,7 +129,7 @@ def test_head_projection_logical_bound_precedes_tensor_reads(monkeypatch, q_coun
         reached.append("tensor_read")
         raise TensorReadReached
 
-    monkeypatch.setattr(slab_io, "SlabIO", tensor_read)
+    monkeypatch.setattr(shared_pole_store, "open_shared_pole_model", tensor_read)
     expected = TensorReadReached if allowed else ValueError
     match = None if allowed else "Gamma projection exceeds the all-P logical matrix bound"
     with pytest.raises(expected, match=match):
@@ -142,7 +142,7 @@ def test_head_projection_logical_bound_precedes_tensor_reads(monkeypatch, q_coun
 
 def _two_component_geometry(monkeypatch, *, map_nspinor, store_nspinor):
     """A 368-centroid Gamma parent whose map and store may disagree on N_spinor."""
-    from file_io import slab_io
+    from file_io import shared_pole_store
     from gw import qgrid_symmetry
     from gw.gw_config import HeadCorrection
     from gw.mpa import sample_plan
@@ -168,7 +168,7 @@ def _two_component_geometry(monkeypatch, *, map_nspinor, store_nspinor):
         reached.append("tensor_read")
         raise TensorReadReached
 
-    monkeypatch.setattr(slab_io, "SlabIO", tensor_read)
+    monkeypatch.setattr(shared_pole_store, "open_shared_pole_model", tensor_read)
     return meta, header, config, mesh, reached, TensorReadReached
 
 

@@ -169,8 +169,7 @@ def build_shared_pole_head(handle, header, V_q, wfns, meta, config, *,
     The fit uses unbroadened complex sample coordinates; the existing MPA
     Sigma-head consumer owns its causal evaluation convention.
     """
-    from file_io.slab_io import SlabIO
-    from file_io.shared_pole_store import read_shared_pole_matrix
+    from file_io.shared_pole_store import open_shared_pole_model, read_shared_pole_matrix
     from .gw_config import HeadCorrection
     from .mpa.model import fit_head_samples
     from .mpa.sample_plan import plan_z
@@ -228,7 +227,7 @@ def build_shared_pole_head(handle, header, V_q, wfns, meta, config, *,
         iq = int(parents[0])
         realize = shared_pole_operator_realizer(meta, header,
             q_full_idx=np.asarray([0]), mesh_xy=mesh_xy)
-        with SlabIO(handle["path"], mode="r", mesh=mesh_xy) as io:
+        with open_shared_pole_model(handle["path"], mesh_xy=mesh_xy) as io:
             b, poles, counts = read_shared_pole_matrix(io, (iq, iq+1), meta=meta, header=header)
         # The linalg service owns the distributed rectangular products and
         # workspace estimate. No q-local whole-matrix copy is introduced.

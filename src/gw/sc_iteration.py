@@ -6692,6 +6692,11 @@ def run_sc_driver(
         del v_qsgw, U_qsgw, e_qsgw
     # W0 is the only large object in the final-map payload.  Drop it before
     # WFN/sigma artifact construction; the tiny head/term provenance remains.
+    # A device-resident shared-pole model has had its last reader (the W0
+    # persist above) and is released with it.
+    if screening.shared_pole is not None:
+        from .shared_pole_screening import release_resident_model
+        release_resident_model()
     screening = dataclasses.replace(
         screening, static_w=None, shared_pole=None, qsgw_velocity=None)
     state_final = dataclasses.replace(
