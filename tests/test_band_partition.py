@@ -134,3 +134,30 @@ def test_the_semicore_floor_sets_no_band_count():
     assert not hasattr(band_partition, "qp_band_cut")
     assert set(band_partition.CoarseClass._fields) == {"coarse_floor_ev", "n_coarse"}
     assert "b3" not in inspect.signature(band_partition.semicore_floor).parameters
+
+
+def test_semicore_dft_pin_keeps_mixing_and_the_dft_block():
+    """sc_semicore = dft: the coarse labels' block is diag(E_DFT) in the DFT
+    basis; protected-semicore and protected-protected elements are kept."""
+    from gw.gw_config import SCConfig
+    from gw.sc_iteration import _pin_semicore_block_to_dft
+
+    H = _random_hermitian(2, 5, seed=3)
+    pin = np.zeros((2, 5), bool)
+    pin[0, :2] = True
+    pin[1, :1] = True
+    e = np.array([[-3.0, -2.9, 0, 0, 0], [-3.1, 0, 0, 0, 0]])
+    out = np.asarray(_pin_semicore_block_to_dft(H, e, pin))
+    ref = np.array(H)
+    ref[0, :2, :2] = np.diag(e[0, :2])
+    ref[1, 0, 0] = e[1, 0]
+    np.testing.assert_array_equal(out, ref)
+    assert SCConfig(max_iter=1, tol_ev=1e-4, accelerator="anderson", history_depth=1,
+                    mixing=1.0, dump_dir=None).semicore == "qp"
+    try:
+        SCConfig(max_iter=1, tol_ev=1e-4, accelerator="anderson", history_depth=1,
+                 mixing=1.0, dump_dir=None, semicore="frozen")
+    except ValueError as exc:
+        assert "sc_semicore" in str(exc)
+    else:
+        raise AssertionError("sc_semicore = frozen was accepted")

@@ -180,6 +180,26 @@ reported apart from the 1 meV budget of the controllable errors. Only the
 scalar MPA/shared-pole Σ reads coarse windows; a sector (bispinor) route
 keeps the rule below.
 
+**Pinned semicore** (`sc_semicore = dft`, owner 2026-09-29: the pseudopotentials
+are fitted to DFT, so the semicore stays at its DFT energies while its mixing
+with the protected states is kept). H is carried in the fixed DFT basis, and
+the pin is on the projector $P_S$ onto the coarse labels' DFT orbitals:
+
+$$P_S H P_S = P_S H^{\rm DFT} P_S = {\rm diag}(E^{\rm DFT}_s),\qquad
+H_{ps} = \tfrac12\big[\Sigma_{ps}(E^{\rm QP}_p) + \Sigma_{ps}(E^{\rm DFT}_s)\big]^{\rm h} - V^{\rm xc}_{ps}.$$
+
+The semicore–semicore block carries no $\Sigma - V^{\rm xc}$; every other
+element is the QSGW one. The Hermitian average is formed in the current QP
+eigenbasis, where a QP column reads at the $E^{\rm DFT}$ of the coarse label
+`sc_state_identity.assign_qp_identity` gives it (largest $|U|^2$ overlap; a DFT
+multiplet is one capacity block with one energy, so its internal gauge does
+not enter), and the rotation back to the DFT basis carries it. The labels are
+the map-0 coarse class, fixed for the run; the coarse windows are planned on
+their DFT energies and are held (only a drift of μ past their pad would extend
+them). The semicore QP energies still move by the level repulsion of the kept
+mixing, $-\sum_p |H_{ps}|^2/(E_p - E_s)$ to second order. `qp` (the default)
+lets the class move with its own Σ.
+
 Every other matrix band is protected: under the default `sigma_out_of_grid =
 cover` it reads Σ at its own energy, and the grid grows over it; on a route
 without the patch a band deeper than the W model's active depth reads
