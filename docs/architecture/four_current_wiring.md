@@ -4,7 +4,8 @@ This page maps the four-current layer stage by stage: for each stage, the
 owning function, the object it produces with its shape and sharding, the
 route it serves, what it costs and what refuses. The physics (the Γ-cell
 heads, the frequency each channel carries, what is zero by construction) is
-[Four-current heads and frequency](../theory/four-current-head-corrections.md).
+[Four-current heads and frequency](../theory/four-current-head-corrections.md);
+the terms each route keeps are [Bispinor GW](../theory/bispinor-gw.md#routes).
 Deck-key semantics are the [input reference](../input_reference.md)'s, and
 module one-liners are [Codebase](../codebase.md)'s.
 
@@ -54,7 +55,7 @@ by the route predicate and by the screened mode's refusal:
 | `qp_solver = one_shot_dft` | both |
 | `screening_diagrams = w_rpa` | both |
 | `head_correction ∈ {full, off}` | both |
-| `linalg = distributed` | both |
+| `linalg = distributed` | screened (the bare route solves no packed Dyson equation, so `linalg` never selects it) |
 | no scalar-head override named (`scalar_head_overrides_named`) | screened |
 
 `sys_dim` is outside the table. P-bare treats `sys_dim = 2` as a routing
@@ -62,8 +63,7 @@ condition. P-screened refuses `sys_dim ≠ 2` only under
 `head_correction = full` (`GATE static_bispinor_photon_head_slab_only`),
 and one row cannot express both. The route predicate returns
 `(taken, reason)`. The driver prints the reason as the `Photon route`
-line, because the routes differ in their $q\to0$ mechanism. With the
-default `linalg = local`, `bare_transverse` stays on B.
+line, because the routes differ in their $q\to0$ mechanism.
 
 Further predicates:
 

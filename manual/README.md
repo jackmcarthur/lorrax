@@ -19,7 +19,7 @@ outline, editorial threads (T1–T5), and pre-writing task list live in
 | 05 ISDF | drafted; reviewed; PRL-density sweep 2026-07-11 |
 | 06 The Coulomb interaction | drafted; reviewed; PRL-density sweep 2026-07-11 |
 | 07 Frequency integration | drafted; PRL-density sweep 2026-07-11 (§7.6 periodic numbers blocked on gate run) |
-| 08 Bispinor GW | 8.1-8.4 drafted 2026-07-13, revived from `agent/manual` and re-synced to `origin/main@8b6e3cc7` on 2026-09-01; the status section routes to `docs/theory/four-current-head-corrections.md` rather than restating it |
+| 08 Bispinor GW | one routing page (2026-09-29); theory, heads and wiring live in `docs/theory/bispinor-gw.md`, `docs/theory/four-current-head-corrections.md` and `docs/architecture/four_current_wiring.md` |
 | 09 Supporting formalisms | not started |
 | 10–13 Reference + architecture | not started |
 | Appendices A–F | B revived 2026-09-01 as a short router to the four-current head owner page; A, C–F not started |

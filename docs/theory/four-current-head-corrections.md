@@ -19,29 +19,12 @@ vertex carries one factor of $\alpha_{FS}/2$.
 
 ## 1. Routes, and what each channel carries {#four-current-phase-status}
 
-`bispinor_gw` selects which Lorentz blocks are screened and which Σ owner
-contracts them. All three values ride the same four-spinor carrier.
-
-| route | selected by | screened blocks and frequency | Γ-cell head | Σ owner |
-|---|---|---|---|---|
-| packed, screened, static | `full_static_cohsex`, `compute_mode = cohsex` | all sixteen $\chi^{IJ}_0$ at $\omega=0$, one packed Dyson solve | coupled 4×4 completion (§4) | sixteen-block X/SX/COH |
-| packed, screened, dynamic | `full_static_cohsex`, `compute_mode ∈ {gn_ppm, hl_ppm}` | CC: scalar $W_{00}(\omega)$ with the plasmon-pole model; the fifteen current-index blocks of the packed $\omega=0$ solve | CC: scalar dynamic head (§3.3) and $\langle v\rangle$ for $\Sigma_X$; current blocks: §4 completion | scalar $\Sigma_x+\Sigma_c(\omega)$ plus current blocks at $\omega=0$ |
-| packed, bare | `bare_transverse` inside the packed envelope | $\chi_{TT}=\chi_{CT}=0$, so $W=\mathrm{diag}(W_{00},D_{TT})$; CC dynamic under GN/HL as above | §4 completion with a charge-only response: $\mathrm{diag}(W^{00}_h,\langle D_{TT}\rangle)$ | as the two rows above |
-| incumbent, bare | `bare_transverse` outside the envelope | CC: scalar $W$ in any compute mode; TT: bare | charge: §3; TT: the bare overlay (§2.1) for GN/HL and `x_only` under `head_correction = full`, none otherwise | scalar Σ plus $\Sigma^B=X(D_{TT})$ |
-| shared-pole hybrid | `bare_transverse`, `compute_mode = mpa`, `sigma_w_model = shared_pole` | CC: full-frequency shared-pole $W$ on the four-spinor charge; TT: bare | charge: `full`, or `no_local_fields` (direct $S(\omega)$, required on an ordered store); TT: bare overlay unless `off` | shared-pole $\Sigma_c$ plus $\Sigma^B$ |
-| full shared-pole | `full_shared_pole`, `compute_mode = mpa`, `sigma_w_model = shared_pole` | ordered CC/CT/TC/TT sectors, each with its own poles ([shared-pole model](../architecture/shared_pole_model.md)) | first-order direct head (bulk or slab) under `no_local_fields` (§5); `full` refuses | [sector Σ consumer](../dev/sector_sigma_consumer.md) |
-
-**The packed envelope** is `compute_mode ∈ {cohsex, gn_ppm, hl_ppm}`,
-`qp_solver = one_shot_dft`, `screening_diagrams = w_rpa` and
-`head_correction ∈ {full, off}`. The bare route also needs `sys_dim = 2`;
-it solves no packed Dyson equation, so `linalg` never chooses it (one Σ^B
-route under either value, owner 2026-09-24). The screened mode additionally
-needs `linalg = distributed` (its packed Dyson solve has only that plan; on
-CUDA a true 2-D mesh, $p_x,p_y\ge2$), refuses a named scalar-head override,
-and refuses `sys_dim ≠ 2` under `head_correction = full`. Outside the
-envelope, `full_static_cohsex` refuses; `bare_transverse` takes the
-incumbent route, and the run record's `Photon route` line names the first
-unmet condition.
+Which Lorentz blocks each `bispinor_gw` route screens, their $1/c$ order and
+the Σ owner: [Bispinor GW §6](bispinor-gw.md#routes). Admission and the
+packed envelope: [wiring](../architecture/four_current_wiring.md#routes-and-predicates).
+The Γ-cell head per route: packed routes take the coupled completion (§4);
+the incumbent and shared-pole hybrid take the scalar charge head (§3) and
+the bare TT overlay (§2.1); `full_shared_pole` takes the direct head (§5).
 
 **Heads are always on** ([decisions, 2026-09-01](../architecture/decisions.md)).
 `head_correction = off` is a DEBUG skip with a loud banner on every route.
@@ -62,7 +45,9 @@ integral on the imaginary axis, so $|\chi_{TT}(i\omega)|\le|\chi_{TT}(0)|$.
 The static term is exactly the difference between the packed bare and
 packed screened modes on one deck. On MoS₂ 3×3 it is $1.2\times10^{-8}$ eV
 over 270 quasiparticle states (CLAIMS 581), far below the sub-meV
-transverse Γ-cell head (§2.1). Outside `full_shared_pole`, no current block
+transverse Γ-cell head (§2.1). The bound does not cover CT under time
+reversal: there $\chi_{CT}(0)=0$ while the dynamic $\chi_{CT}(\omega)$ is
+nonzero ([Bispinor GW §5](bispinor-gw.md#bare-transverse)). Outside `full_shared_pole`, no current block
 depends on frequency.
 
 ## 2. The bare propagator and its Γ-cell average

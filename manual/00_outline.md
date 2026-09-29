@@ -40,8 +40,7 @@ Part II — Theory & Methods (~22 pp)
 7. Frequency integration: 7.1 pole-convolution constraint · 7.2 minimax machinery ·
    7.3 χ · 7.4 W as multi-pole (GN two-point fit) · 7.5 Σᶜ(ω) (three-window) ·
    7.6 accuracy & validation
-8. Bispinor GW: 8.1 formalism · 8.2 four-density ISDF + cost model · 8.3 Σ^B assembly ·
-   8.4 status & validation
+8. Bispinor GW: one page routing to the theory, heads and wiring owners
 9. Supporting formalisms: 9.1 DFT operators (dipoles, i[r,Σ] upgrade) · 9.2 BSE
    (matvec-without-matrix, solver menu) · 9.3 bandstructure (htransform, distributed
    linalg mandatory at large n_μ)
