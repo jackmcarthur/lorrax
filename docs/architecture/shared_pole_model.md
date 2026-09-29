@@ -328,7 +328,9 @@ It reads the same parent pair (projected $W_p$ and $W_p^{\mathsf T}$) with the
 swapped source and the transposed phase rule
 (`unfold_operator_local(transposed_output=True)`).
 The little-group projector forms its transposed output the same way, as the
-average of the swapped pair. So one tile exchange per τ node remains: the
+average of the swapped pair, whenever its endpoint action is owner-local; it
+does no exchange, whatever the group order (large groups pay local work instead:
+Na 8³ Σ τ +7 % at P4). So one tile exchange per τ node remains: the
 synthesis $W_p^{\mathsf T}$. Both local forms equal the exchanged transposes bit
 for bit. The exchange let the off-diagonal ranks move their tiles while the
 diagonal ranks copied theirs and waited, which cost 26 % of a P16 node
