@@ -3,6 +3,14 @@
 User-visible changes, newest first. Binding rulings behind the breaking
 changes live in `docs/architecture/decisions.md`.
 
+## 2026-09-28 — band extrapolation on the shared-pole Σ
+
+- Scalar `compute_mode = mpa` (shared pole or MPA fit) now extrapolates the Σ_c
+  band sum with the same brackets and pooled (β, Ω) fit as GN/HL-PPM.
+  `use_band_extrapolation` defaults on, so every scalar shared-pole run moves
+  once, and a deck with `number_bands_sigma` < 2·n_occ now refuses at startup;
+  set `use_band_extrapolation = false` there. Bispinor `mpa` is unchanged.
+
 ## 2026-09-28 — band extrapolation: pooled denominator shell, cuts at 70/85/100 %
 
 - `spectral_shell` now fits one (β, Ω) over the QP window's states: band A adds
@@ -17,7 +25,6 @@ changes live in `docs/architecture/decisions.md`.
 - `sigma_mnk.h5`: `sigma_c_extrap_beta_kn` holds the pooled β (NaN on states
   without a tail); new attributes `pooled_beta`, `pooled_omega_ev`,
   `pooled_residual_rms_ev`, `pooled_state_count`.
-- Shared-pole and other non-PPM Σ stages are unchanged: they do not extrapolate.
 
 ## 2026-09-24 — k-axis convolutions on nvidia-mathdx (branch, not yet main)
 

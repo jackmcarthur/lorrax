@@ -8,11 +8,13 @@ deck keys are in the [input reference](../input_reference.md).
 
 ## Where it runs
 
-Only the plasmon-pole Σ stages (`gn_ppm`, `hl_ppm`) consume it. On every other
-`compute_mode`, shared pole included, a defaulted-on key disables itself with a
-log note and a named key refuses. On a static Coulomb hole the band limit
-anti-converges, so the guard is a correctness rule
-([decisions](../architecture/decisions.md)).
+The plasmon-pole stages (`gn_ppm`, `hl_ppm`) and the scalar `mpa` stage
+(shared pole or MPA fit) consume it: all three run the same pole-sum Σ
+executor, which splits the Green band sum into brackets. A static stage and a
+bispinor `mpa` stage (a sum of four-current sector bodies, no bracket axis) do
+not: a defaulted-on key disables itself with a log note and a named key
+refuses. On a static Coulomb hole the band limit anti-converges, so that guard
+is a correctness rule ([decisions](../architecture/decisions.md)).
 
 ## Three sums from one pass
 

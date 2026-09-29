@@ -556,7 +556,8 @@ keys themselves are in the [input reference](../input_reference.md).
   `sigma_band_extrapolation` a deprecated alias; both named and disagreeing
   refuses. `explicit` selects the behaviour on a non-PPM mode: a defaulted-on
   key auto-disables with a note, an explicitly named one refuses.
-  `band_extrapolation_is_consumable` is `ppm_model is not None` on any stage.
+  `band_extrapolation_is_consumable` is true when any stage is GN/HL-PPM or a
+  scalar (non-bispinor) MPA stage.
 - **`sigma_stage_modes`** returns every mode the run dispatches Σ under, in
   order: the staged ladder when `config.sc.stages` exists, else the one
   `compute_mode`. A run-level refusal asks this, never the current stage.
