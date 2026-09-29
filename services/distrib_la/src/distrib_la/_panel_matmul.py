@@ -129,8 +129,9 @@ def _interleaved_width(p, k, limit):
 
 
 def _resident_count(p, k, width):
-    """Panels :func:`panel_resident` may hold: at most two, at most half of every owner block."""
-    return min(2, (k // p) // (2 * width))
+    """Panels :func:`panel_resident` holds: the first panel (``p·width ≤ K/p`` columns)
+    of a product that streams at least two, else none."""
+    return 1 if (k // p) // width >= 2 else 0
 
 
 def panel_resident(a, b, *, mesh, panel_bytes):
@@ -139,13 +140,15 @@ def panel_resident(a, b, *, mesh, panel_bytes):
 
     A caller whose weights change and whose ``a``, ``b`` do not (a Green function
     at many times, ``ψ·diag(w(τ))·ψ†``) exchanges the same panels at every call.
-    Holding the first ``R = min(2, ⌊K/(2·p·width)⌋)`` of them removes their
-    exchange from every later call.  At most half the contraction columns are
-    resident (``R·p·width ≤ K/2``), so no rank holds a band-complete copy, and a
-    product of one panel holds none.  Returns ``None`` when nothing may be
-    resident (``R = 0``, a non-square mesh, 4-D ``b``), else ``(left, right)``:
-    ``(R, q, m, p·width)`` at ``P(None,None,'x',None)`` and ``(R, q, p·width, n)``
-    at ``P(None,None,None,'y')``, per rank :func:`panel_resident_bytes`.
+    Holding the first panel (``p·width ≤ K/p`` columns: the next call's first
+    panel, already gathered) removes its exchange from every later call.  A
+    call's build then has that panel and at most the two streamed panels live,
+    as main's build has its own two, so the live set stays three panels of at
+    most ``K/p`` columns; a product of one panel holds none.  Returns ``None``
+    when nothing is held (one panel, a non-square mesh, 4-D ``b``), else
+    ``(left, right)``: ``(1, q, m, p·width)`` at ``P(None,None,'x',None)`` and
+    ``(1, q, p·width, n)`` at ``P(None,None,None,'y')``, per rank
+    :func:`panel_resident_bytes`.
     """
     px, py = int(mesh.shape['x']), int(mesh.shape['y'])
     if px != py or a.ndim != 3 or b.ndim != 3:
@@ -270,8 +273,8 @@ def _interleaved_kernel(mesh, q, m, k, n, width, active=False, weighted=False, p
     each panel's local slice of A before its all-gather.  ``partner``: the
     raw panels are gathered and each product gets its own weighted (and, for
     the partner, conjugated) panel copy; two accumulators, no tile copy.
-    ``n_res``: panels ``0 … n_res-1`` arrive gathered (:func:`panel_resident`;
-    ``n_res ≤ 2``, the two panels gathered before the streamed loop), and the
+    ``n_res``: panels ``0 … n_res-1`` arrive gathered (:func:`panel_resident`
+    holds one; at most the two gathered before the streamed loop), and the
     weights scale every gathered panel, as for ``partner``.
     """
     p = int(mesh.shape['x'])

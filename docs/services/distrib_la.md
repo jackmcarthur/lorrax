@@ -432,9 +432,9 @@ panel conjugated before its own GEMM (the face Green and its antiunitary
 partner). The gathered panels of the partner route do not depend on the
 weights, so a caller that multiplies the same `A`, `B` under many weight rows
 (a Green function at many τ) can hold the first of them: `panel_resident(A, B)`
-gathers `R = min(2, ⌊k/(2·p·w)⌋)` panels once (at most half of every owner
-block, none for a one-panel product), and `panel_matmul(..., resident=...)`
-exchanges only the rest. The product is the same bit for bit on the partner
+gathers the first panel once (`p·w ≤ k/p` columns; none for a one-panel
+product), and `panel_matmul(..., resident=...)` exchanges only the rest, so a
+build has at most that panel and its two streamed panels live. The product is the same bit for bit on the partner
 route and without weights; a single weight row then scales the gathered
 panel instead of the slice (bitwise on the CUDA face-parity cases). The Σ τ
 window runner holds them for its whole node loop (`gw.ppm_tau_kernel.SigmaKij`).

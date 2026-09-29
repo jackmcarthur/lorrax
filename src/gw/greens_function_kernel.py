@@ -93,10 +93,10 @@ def green_resident_panels(psi_mun, psi_nmu, *, gemm, mesh, n_full=None):
 
     ``G(τ) = ψ·diag(w(τ))·ψ†``: only the weights change with τ, so a τ loop
     exchanges the same ψ panels at every node.  ``distrib_la.panel_resident``
-    holds the first of them (at most half the bands, never band-complete); a
-    loop that passes them to every :func:`build_G_tau` of the same ψ drops their
-    exchange from each node.  ``None`` off the face route or when a build has
-    fewer than two panels.  Bytes: :func:`green_resident_bytes`.
+    holds the first of them (``≤ N_b/p_x`` bands: the next node's first panel,
+    already gathered); a loop that passes it to every :func:`build_G_tau` of the
+    same ψ drops its exchange from each node.  ``None`` off the face route or
+    when a build has one panel.  Bytes: :func:`green_resident_bytes`.
     """
     from distrib_la import panel_resident
     if getattr(gemm, "backend", "local") == "local":
