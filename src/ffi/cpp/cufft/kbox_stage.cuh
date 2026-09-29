@@ -78,7 +78,8 @@ struct Plan {
 // line for every thread in every axis pass (tr * nk / max axis >= 256), capped by two
 // single-buffered blocks per SM; below min_tr instances the split arm.  min_tr = 2 protects
 // the 128-byte contiguous runs of a cp.async load; a gathered direct Load of a spin group
-// (modes 7, 11) has no run to protect and passes min_tr = 1: one instance per block that fits
+// (modes 7, 8, 9, 11; and modes 4/5, whose k-minor runs lie along k) has no run to protect and
+// passes min_tr = 1: one instance per block that fits
 // the opt-in memory stays single-pass (one HBM pass, no scratch).  Threads: 256, or 512 for a
 // convolution (transforms = 2: inverse, Mid, forward) whose axis passes have >= 384 lines.
 inline Plan kbox_plan(int nx, int ny, int nz, int group, int n_operands, int elem, long long optin_smem,
@@ -270,13 +271,16 @@ __device__ void mid_tile(C* bank, long long col0, long long ncols, const Mid& mi
 // get(q) a reference to the group's column q at k in the bank: the Mid reads what it needs when
 // it needs it (no GROUP-wide register array) and writes what it changes, e.g. a spin-group mix,
 // or a reduction that leaves the tile (mode 11 accumulates chi_R).
-template <int NX, int NY, int NZ, int TR, int GROUP, bool kSync = true, class C, class Mid>
+// kFastK = true puts consecutive threads on consecutive k of one group instead (a Mid that reads
+// many group columns: the pairs-fastest order puts a 16-byte phase's threads GROUP padded columns
+// apart, which is one bank group whenever GROUP * RS * 16 B is a multiple of 128).
+template <int NX, int NY, int NZ, int TR, int GROUP, bool kSync = true, bool kFastK = false, class C, class Mid>
 __device__ void mid_group_tile(C* bank, long long col0, long long ncols, const Mid& mid) {
     static_assert(TR % GROUP == 0, "a tile holds whole groups");
     using G = Geo<NX, NY, NZ>;
     constexpr int ng = TR / GROUP;
     for (int i = threadIdx.x; i < ng * G::NK; i += blockDim.x) {
-        const int g = i % ng, k = i / ng;
+        const int g = kFastK ? i / G::NK : i % ng, k = kFastK ? i % G::NK : i / ng;
         if (col0 + g * GROUP >= ncols) continue;
         mid.group(k, (col0 + g * GROUP) / GROUP,
                   [&](int q) -> C& { return bank[(g * GROUP + q) * G::RS + G::at(k)]; });

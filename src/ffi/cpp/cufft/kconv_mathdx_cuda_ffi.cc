@@ -106,7 +106,8 @@
 // opt-in shared memory, or an axis above the fp64 thread-FFT limit (40), is
 // refused by name.  The k-box modes (2, 3, 8, 11) need one (ky, kz) plane of a
 // tile in shared memory; modes 4, 5, 7 and 9 (single arm only) one whole padded k-box column.
-// Modes 2/3/4/5 may run in place: every block reads the elements it stores before it stores them.
+// Modes 2, 3 and 5, and mode 4 with out_layout 0, may run in place: every block reads the
+// elements it stores before it stores them.
 //
 // Headers: the Python router passes the installed wheel's nvidia/mathdx
 // directory as the string attribute `mathdx_root`; the CUDA toolkit include
@@ -157,10 +158,6 @@ static constexpr int kAxisMax = 40;        // cuFFTDx fp64 thread-FFT limit
 static constexpr int kRowsMax = 16;        // modes 0/1/6 (three banks per row)
 static constexpr int kThreads = 256;
 static constexpr long long kSmemBudget = 100 * 1024;
-// Modes 2-5 keep ONE bank per row; ~48 KiB per block lets three blocks share
-// an A100 SM.  ponytail: rows-per-block is a fixed heuristic, not tuned per grid.
-static constexpr int kRowsMax1 = 64;
-static constexpr long long kSmemBudget1 = 48 * 1024;
 // Mode 10 packs small planes into one block up to this much shared memory.
 static constexpr long long kPlaneGroupBytes = 64 * 1024;
 
@@ -1285,7 +1282,10 @@ extern "C" __global__ void __launch_bounds__(LRX_THREADS) lrx_kconv(LorArgs a, U
     for (long long c0 = (long long)blockIdx.x * TRC; c0 < ncols; c0 += (long long)gridDim.x * TRC) {
         lrx_kbox::stage_tile<NX, NY, NZ, TRC>(sm, c0, ncols, ld);
         lrx_kbox::transform3<NX, NY, NZ, TRC, LRX_SM, fft_direction::inverse>(sm);
-        lrx_kbox::mid_group_tile<NX, NY, NZ, TRC, SS>(sm, c0, ncols, LorGroupMid{a.kern, a.p0, a.mx, a.my, v});
+        // k fastest across threads: consecutive threads read one group's column at consecutive k,
+        // distinct banks (pairs fastest put a phase's 8 threads 16 padded columns apart, one bank).
+        lrx_kbox::mid_group_tile<NX, NY, NZ, TRC, SS, true, true>(sm, c0, ncols,
+                                                                  LorGroupMid{a.kern, a.p0, a.mx, a.my, v});
         lrx_kbox::transform3<NX, NY, NZ, TRC, LRX_SM, fft_direction::forward>(sm);
         lrx_kbox::store_tile<NX, NY, NZ, TRC>(sm, c0, ncols, st);
     }
@@ -1854,17 +1854,18 @@ static ffi::Error build(int mode, int nkx, int nky, int nkz, int ns, bool f32,
     LRX_CUDA_CHECK(cudaDeviceGetAttribute(&smem_optin, cudaDevAttrMaxSharedMemoryPerBlockOptin, dev),
                    "max opt-in shared memory");
     const int nk = nkx * nky * nkz, sp = nk | 1;
-    const bool pair = mode < 2 || mode == 6;           // three banks per row
-    const int banks = pair ? 3 : 1;
-    const long long rows_max = pair ? kRowsMax : kRowsMax1;
-    long long row_bytes = static_cast<long long>(banks) * (f32 ? 8 : 16) * sp;
-    // The budget never exceeds this device's opt-in maximum (99 KiB on sm_86/89/120, below the
-    // pair modes' 100 KiB): an unclamped budget asked for more than the device grants at launch.
-    const long long budget = std::min<long long>(pair ? kSmemBudget : kSmemBudget1, smem_optin);
-    long long rb = std::min<long long>(rows_max, budget / row_bytes);
-    if (rb < 1) rb = std::min<long long>(rows_max, smem_optin / row_bytes);
-    // Mode 8 runs on the k-box stage: the single arm when a tile of whole spin groups (ns^2 columns
-    // each) fits the opt-in memory, else the split arm.
+    // Modes 0/1/6 keep three nk-long banks per row (complex128); every other mode sets its own
+    // tile below.  The budget never exceeds this device's opt-in maximum (99 KiB on sm_86/89/120,
+    // below 100 KiB): an unclamped budget asked for more than the device grants at launch.
+    const bool pair = mode < 2 || mode == 6;
+    long long row_bytes = 3LL * 16 * sp;
+    long long rb = 1;
+    if (pair) {
+        rb = std::min<long long>(kRowsMax, std::min<long long>(kSmemBudget, smem_optin) / row_bytes);
+        if (rb < 1) rb = std::min<long long>(kRowsMax, smem_optin / row_bytes);
+    }
+    // Mode 8 runs on the k-box stage: the single arm when a tile of whole spin groups (ns^2 padded
+    // columns each) fits the opt-in memory, else the split arm.
     const lrx_kbox::Plan lor_plan = mode == 8
         ? lrx_kbox::kbox_plan(nkx, nky, nkz, ns * ns, 1, 16, smem_optin, 2, 1) : lrx_kbox::Plan{};
     const bool lor_split = mode == 8 && lor_plan.arm == 1;
@@ -1975,8 +1976,6 @@ static ffi::Error build(int mode, int nkx, int nky, int nkz, int ns, bool f32,
             return sticky("residency", os.str(), ffi::ErrorCode::kInvalidArgument);
         }
     }
-    if ((mode == 8 || mode == 9) && rb >= ns * nsr)
-        rb -= rb % (ns * nsr);                         // whole spin groups: the grouped load
     // Mode 7 runs on the k-box stage's single arm: kbox_plan sizes the tile in whole pairs (one pair
     // = the blk^2 columns of its stored spin block; a convolution: 512 threads at >= 384 lines), or,
     // where one pair does not fit the opt-in memory, in columns (one element per column; the register
@@ -2083,7 +2082,7 @@ static ffi::Error build(int mode, int nkx, int nky, int nkz, int ns, bool f32,
     if (rb < 1) {
         std::ostringstream os;
         os << "GATE mathdx-kconv-residency: got k-grid (" << nkx << "," << nky << "," << nkz
-           << ") whose resident row needs " << banks << "*" << (f32 ? 8 : 16) << "*(nk|1)=" << row_bytes << " B"
+           << ") whose resident row needs 3*16*(nk|1)=" << row_bytes << " B"
            << "; want <= " << smem_optin << " B of opt-in shared memory on this device; why: the fused "
               "one-pass family keeps a k-row in shared memory; fix: a smaller k-grid (the "
               "family has no out-of-core arm)";
