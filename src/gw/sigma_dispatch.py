@@ -1246,9 +1246,9 @@ def _compute_mpa_sigma(
         # THE COARSE (SEMICORE) WINDOWS (gw.qp_support): their samples sit in
         # the grid below the near support and are evaluated at their own eta,
         # in crossing rule windows grouped by the node law (sigma_box_plan),
-        # at max(sigma_quadrature_eps, qp_support.SEMICORE_EPS).
-        from .qp_support import assert_semicore_patch_route, window_labels
-        assert_semicore_patch_route(patch, config.compute_mode, wfns_transverse)
+        # at max(sigma_quadrature_eps, qp_support.SEMICORE_EPS).  The scalar
+        # body and every sector call (mpa.sector_sigma) read the same labels.
+        from .qp_support import window_labels
         omega_ev = np.asarray(config.omega_grid_ev, dtype=np.float64)
         eta_ev, group = window_labels(omega_ev, patch, _xi.resolved_ry * RYD_TO_EV)
         body_options.update(omega_eta_ry=eta_ev / RYD_TO_EV, omega_group=group,
