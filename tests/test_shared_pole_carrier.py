@@ -202,6 +202,40 @@ def test_synthesis_reads_once_and_runs_inside_one_program(
     synthesis.close()
 
 
+@pytest.mark.parametrize('parent_capacity,column_capacity', [(2,5),(1,3)])
+def test_ordered_valence_branch_is_the_exchanged_minus_q_transpose(
+        monkeypatch, parent_capacity, column_capacity):
+    """An ordered store's valence W is W_+(-q)^T, unfolded on each rank's own tile.
+
+    ``w_kernel(..., True)`` writes each child's transpose onto row -c without
+    the full-q transpose exchange; it must equal that exchange,
+    ``shared_pole_hole_kernel(w_kernel(..., False), -q)``, bit for bit, on
+    whole, parent-panel and column-chunk schedules.  An (8,1,1) grid makes
+    -q a nontrivial row permutation.
+    """
+    from gw.mpa.sigma import _shared_pole_w_synthesis, shared_pole_hole_kernel
+    from symmetry_maps import q_negation_index
+    fx = _synthesis_fixture(monkeypatch)
+    mesh, meta, header = fx.mesh, fx.meta, dict(fx.header)
+    header.update(representation='scalar-ordered-ph', grid=(8,1,1),
+                  qirr=dict(header['qirr'], q_irr_frac=np.asarray([[0.,0.,0.],[.125,0.,0.]])))
+    schedule=dict(status='PASS',parent_capacity=parent_capacity,
+                  column_capacity=column_capacity,endpoint_budgets={})
+    synthesis=_shared_pole_w_synthesis(None,meta,header,fx.omega,schedule,mesh_xy=mesh)
+    assert synthesis.ordered
+    bounds=np.tile([0,np.inf,-np.inf,-np.inf,np.inf,np.inf],(2,1))
+    operands=synthesis.window_operands('val',np.arange(2),bounds)
+    w=jax.jit(lambda ops,e,t,hole: synthesis.w_kernel(*ops,e,t,hole),static_argnums=3)
+    minus_q=q_negation_index((8,1,1))
+    assert minus_q.tolist()==[0,7,6,5,4,3,2,1]
+    plus=w(operands,.3,.7+.2j,False)
+    exchanged=shared_pole_hole_kernel(mesh)(plus,fx.put(minus_q,P()))
+    direct=w(operands,.3,.7+.2j,True)
+    np.testing.assert_array_equal(np.asarray(direct),np.asarray(exchanged))
+    assert np.max(np.abs(np.asarray(direct)-np.asarray(plus)))>1e-3
+    synthesis.close()
+
+
 def _matrix_reader_fixture(monkeypatch, mesh, *, Kmax, basis_mesh=None):
     from file_io import shared_pole_store as store
     import hashlib

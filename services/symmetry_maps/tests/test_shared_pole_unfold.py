@@ -191,6 +191,17 @@ def check_local_transposes_are_bitwise(mesh):
     ordinary = np.asarray(unfold(wd, wtd, False))
     direct = np.asarray(unfold(wtd, wd, True))
     assert np.array_equal(direct, ordinary.swapaxes(-1, -2)), np.max(np.abs(direct - ordinary.swapaxes(-1, -2)))
+    try:                                          # one table must serve both endpoints
+        shard_map(lambda a, at: S.unfold_operator_local(
+            a, irr_idx=irr, sym_idx=sym, q_irr_frac=q, left_local_perm=local,
+            right_local_perm=local, left_L_table=wraps, right_L_table=wraps + 1,
+            n_sym_spatial=2, trs_rule='pair_transpose', transposed_parent_local=at,
+            transposed_output=True), mesh=mesh, in_specs=(P(None, 'x', 'y'),)*2,
+            out_specs=P(None, 'x', 'y'), check_vma=False)(wtd, wd)
+    except ValueError as ex:
+        assert 'identical left/right' in str(ex)
+    else:
+        raise AssertionError('missing transposed_output table refusal')
     # The little-group projector on the same owner-local action: its second
     # output is formed on every rank's tile, without a collective permute.
     rotations = np.stack((np.eye(3), -np.eye(3), -np.eye(3), np.eye(3))).astype(np.int32)

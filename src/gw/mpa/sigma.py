@@ -242,13 +242,6 @@ def _shared_pole_hole_order(header, rows):
     return order, targets[order].astype(np.int32)
 
 
-def _shared_pole_direct_hole(tables):
-    """The local unfold can emit a child's transpose itself (one table for both endpoints)."""
-    cert = tables["certificates"]
-    left, right = cert["x"]["local_perm"], cert["y"]["local_perm"]
-    return left is not None and right is not None and np.array_equal(left, right)
-
-
 def _shared_pole_panel_unfold(meta, header, q_span, *, mesh_xy, tables=None, hole=False):
     """Realize each parent and apply its local child operation.
 
@@ -278,8 +271,6 @@ def _shared_pole_panel_unfold(meta, header, q_span, *, mesh_xy, tables=None, hol
 
     rows, parent_rows, sym_rows = tables["rows"], tables["parent_rows"], tables["sym_rows"]
     if hole:
-        if not _shared_pole_direct_hole(tables):
-            raise ValueError("a direct valence unfold needs one owner-local table for both endpoints")
         order, rows = _shared_pole_hole_order(header, rows)
         parent_rows, sym_rows = parent_rows[order], sym_rows[order]
 
@@ -508,12 +499,8 @@ def _shared_pole_w_synthesis(io, meta, header, frequencies, schedule, *, mesh_xy
                 workspace_plan, "gemm", ((count, m, width), (count, width, m)),
                 np.complex128))
 
-            # An ordered store's valence branch unfolds each child's transpose
-            # on its own tile (no full-q transpose exchange) wherever the
-            # panel's endpoint action is one owner-local table.
-            direct = ordered and (not local or _shared_pole_direct_hole(tables))
 
-            def program(span=(lo, hi), tables=tables, local=local, count=count, direct=direct):
+            def program(span=(lo, hi), tables=tables, local=local, count=count):
                 from distrib_la import gemm_plan
                 # As G's plan: pole columns outside a window's interval are
                 # never contracted, and no warm-up (the plan runs inside the
@@ -522,7 +509,9 @@ def _shared_pole_w_synthesis(io, meta, header, frequencies, schedule, *, mesh_xy
                                  dtype=np.complex128, layout=layout,
                                  enable_active_range=True, warmup=False)
                 kernels = {}
-                for hole in ((False, True) if direct else (False,)):
+                # An ordered store's valence branch unfolds each child's
+                # transpose on its own tile: no full-q transpose exchange.
+                for hole in ((False, True) if ordered else (False,)):
                     if local:
                         _rows, unfold = _shared_pole_panel_unfold(
                             meta, header, span, mesh_xy=mesh_xy, tables=tables, hole=hole)
@@ -547,19 +536,14 @@ def _shared_pole_w_synthesis(io, meta, header, frequencies, schedule, *, mesh_xy
                 return dict(kernel=kernels[False], hole=kernels.get(True))
             kind = ("synthesis" if weights_fn is _shared_pole_weights
                     else "synthesis." + weights_fn.__name__)
-            programs = _synthesis_program((static, kind, count, m, width, direct), program)
+            programs = _synthesis_program((static, kind, count, m, width, ordered), program)
             rows = np.asarray(tables["rows"], np.int32)
             panels.append(dict(span=(lo, hi), rows=rows,
                                hole_rows=(_shared_pole_hole_order(header, rows)[1]
-                                          if direct else None),
+                                          if ordered else None),
                                kernel=programs["kernel"], hole=programs["hole"],
                                route=route, static=static, count=count))
         schedule["native_gemm_workspace_bytes_per_rank"] = native_workspace
-        from symmetry_maps import q_negation_index
-        minus_q = np.asarray(q_negation_index(tuple(int(v) for v in header["grid"])))
-        # Every panel direct, or the full-q transpose after the sum.
-        direct_hole = all(p["hole"] is not None for p in panels)
-        hole_kernel = shared_pole_hole_kernel(mesh_xy)
     _band_fence('tau.factor_read', sync_ranks=True)
     with timing.section('tau.factor_read'):
         capacity = getattr(meta, "shared_pole_capacity", None)
@@ -603,7 +587,7 @@ def _shared_pole_w_synthesis(io, meta, header, frequencies, schedule, *, mesh_xy
         total = None
         for ((lo, hi), rows, kernel, hole_rows, hole_program, route), factors, poles2 in zip(
                 spans, factors_by_panel, poles_by_panel):
-            if hole and direct_hole:
+            if hole:
                 # The valence branch: each child's transpose, on the rows -c.
                 rows, kernel = hole_rows, hole_program
             ranges = intervals[lo:hi]
@@ -643,8 +627,6 @@ def _shared_pole_w_synthesis(io, meta, header, frequencies, schedule, *, mesh_xy
                                     add, lambda acc: acc, acc)
             total = jax.lax.fori_loop(
                 0, n_chunks, chunk, _zeros(mesh_xy, (Q, m, m))() if total is None else total)
-        if hole and not direct_hole:
-            return hole_kernel(total, jnp.asarray(minus_q))
         return total
 
     def window_operands(_space, indices, bounds):

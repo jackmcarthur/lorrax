@@ -958,6 +958,14 @@ def unfold_operator_local(
             raise ValueError("transposed_parent_local must match parent shape/dtype")
     elif transposed_parent_local is not None:
         raise ValueError("transposed_parent_local requires pair_transpose")
+    if transposed_output and not (
+            pair_transpose
+            and np.array_equal(np.asarray(left_local_perm), np.asarray(right_local_perm))
+            and np.array_equal(np.asarray(left_L_table), np.asarray(right_L_table))):
+        # Element [a, b] of the transpose takes its row factor at the column
+        # index: one table must serve both endpoints (host metadata).
+        raise ValueError("unfold_operator_local transposed_output needs the pair_transpose "
+                         "rule and identical left/right perm and L tables")
     irr = jnp.asarray(irr_idx, dtype=jnp.int32)
     sym = jnp.asarray(sym_idx, dtype=jnp.int32)
     trs_mask = sym >= int(n_sym_spatial)

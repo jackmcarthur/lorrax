@@ -514,7 +514,7 @@ def project_little_group_operator(
     """
     import jax
     import jax.numpy as jnp
-    from jax.sharding import NamedSharding, PartitionSpec as P
+    from jax.sharding import PartitionSpec as P
     from ._shard_map import shard_map
     from .maps import (_apply_unfold_phase_and_trs_local,
                        _permute_isdf_operator_axes_local,
@@ -583,15 +583,14 @@ def project_little_group_operator(
         # phase is formed over all parents.
         segments = _little_group_segments(
             counts, tile_bytes=16*m*m//(int(mesh.shape["x"])*int(mesh.shape["y"])))
-        sh = NamedSharding(mesh, P(None, "x", "y"))
 
-        def local(plus, partner, both=False):
-            # ``both``: also this rank's tile of the average's TRANSPOSE, from
-            # the swapped pair in the same step (see
-            # _apply_unfold_phase_and_trs_local); returns (average, transpose).
+        def local(plus, partner):
+            # This rank's tiles of the average and of its TRANSPOSE, the latter
+            # from the swapped pair in the same step (see
+            # _apply_unfold_phase_and_trs_local).
             x, y = jax.lax.axis_index("x"), jax.lax.axis_index("y")
             ml, nl = plus.shape[1:]
-            totals = (jnp.zeros_like(plus),)*(2 if both else 1)
+            totals = (jnp.zeros_like(plus),)*2
             for lo, hi, members in segments:
                 whole = len(members) == b
                 sel = None if whole else jnp.asarray(members, dtype=jnp.int32)
@@ -635,49 +634,21 @@ def project_little_group_operator(
                 else:
                     parts = jax.lax.fori_loop(lo, hi, step, tuple(t[sel] for t in totals))
                     totals = tuple(t.at[sel].set(v) for t, v in zip(totals, parts))
-            return totals if both else totals[0]
+            return totals
 
-        mapped = shard_map(local, mesh=mesh,
-                           in_specs=(P(None, "x", "y"),)*2,
-                           out_specs=P(None, "x", "y"), check_vma=False)
-        if px != py:
-            raise ValueError(
-                f"little-group projection: the transpose partner needs a "
-                f"square mesh, got {px}x{py}")
-        left, right = (certificates[a]["local_perm"] for a in ("x", "y"))
-        if left is not None and right is not None and np.array_equal(left, right):
-            # Owner-local maps with one table for both endpoints: the
-            # average's transpose is the average of the swapped pair,
-            # (T_s W)^T = T'_s(W^T, W), formed on every rank's own tile.  No
-            # exchange, so diagonal and off-diagonal ranks do equal work
-            # (an exchange moves the off-diagonal tiles while the diagonal
-            # ranks copy theirs and wait, claim 2954).  Bitwise the exchanged
-            # transpose: the partner is the exact transpose of the operator.
-            pair = shard_map(lambda a, b: local(a, b, both=True), mesh=mesh,
-                             in_specs=(P(None, "x", "y"),)*2,
-                             out_specs=(P(None, "x", "y"),)*2, check_vma=False)
+        # The average's transpose is the average of the swapped pair,
+        # (T_s W)^T = T'_s(W^T, W), formed on every rank's own tile in the
+        # same step: no transpose exchange, so diagonal and off-diagonal ranks
+        # do equal work (an exchange moves the off-diagonal tiles while the
+        # diagonal ranks copy theirs and wait, claim 2954).  Bitwise the
+        # exchanged transpose when the partner is the operator's exact
+        # transpose.  Nonlocal maps route both through the same all-to-all.
+        pair = shard_map(local, mesh=mesh, in_specs=(P(None, "x", "y"),)*2,
+                         out_specs=(P(None, "x", "y"),)*2, check_vma=False)
 
-            @jax.jit
-            def project(plus, partner):
-                return pair(plus, partner)
-            compiled = _LITTLE_GROUP_PROJECTORS[key] = project
-            return compiled(operator, transposed_partner)
-        # The (mu, nu) transpose of an ('x','y')-tiled operator: each rank
-        # transposes its tile and sends it to its transpose partner, rank
-        # (i, j) -> (j, i), on the square mesh.  A GSPMD swapaxes on this
-        # layout all-gathers the operator instead.  (LORRAX's twin is
-        # common.collectives.transpose_xy; this service cannot import it.)
-        transpose_tiles = shard_map(
-            lambda t: jax.lax.ppermute(
-                jnp.swapaxes(t, -2, -1), ("x", "y"),
-                [(i*py + j, j*py + i) for i in range(px) for j in range(py)]),
-            mesh=mesh, in_specs=P(None, "x", "y"), out_specs=P(None, "x", "y"))
         @jax.jit
         def project(plus, partner):
-            average = mapped(plus, partner)
-            transposed = jax.lax.with_sharding_constraint(
-                transpose_tiles(average), sh)
-            return average, transposed
+            return pair(plus, partner)
         compiled = _LITTLE_GROUP_PROJECTORS[key] = project
     return compiled(operator, transposed_partner)
 
