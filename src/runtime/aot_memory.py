@@ -477,7 +477,9 @@ class ChunkCheck:
     ``chunk``/``compiled`` are what runs.  ``analytic`` is the planner's price
     ``fixed + chunk0·per_unit`` of the chunk it chose, ``compiled_bytes`` the
     executable's figure for that chunk, ``price`` the figure of the chunk that
-    runs (compiled when it was higher), ``per_unit`` the slope that chose it.
+    runs (compiled when it was higher), ``per_unit`` the slope that chose it,
+    ``seconds`` the wall of reading the figures (memory analysis, HLO parse,
+    cuFFT plan query), compiles excluded.
     """
     chunk: int
     compiled: object
@@ -486,6 +488,7 @@ class ChunkCheck:
     price: int
     per_unit: float
     recompiled: bool
+    seconds: float = 0.0
 
 
 def compiled_new_bytes(compiled, *, extra: int = 0, platform: str | None = None) -> int:
@@ -515,14 +518,17 @@ def check_chunk(chunk: int, *, build, fixed: float, per_unit: float, room: float
     bisection: a second figure still over the room refuses by name
     (``GATE compiled_chunk_capacity``) before the stage runs.
     """
+    import time
     chunk = int(chunk)
     if compiled is None:
         compiled = build(chunk)
     analytic = int(fixed + chunk * per_unit)
+    started = time.perf_counter()
     got = compiled_new_bytes(compiled, extra=int(extra(chunk, compiled)), platform=platform)
+    seconds = time.perf_counter() - started
     if got <= analytic or got <= room or chunk <= minimum:
         return ChunkCheck(chunk, compiled, analytic, got, max(analytic, got),
-                          float(per_unit), False)
+                          float(per_unit), False, seconds)
     slope = max(float(per_unit), (got - float(fixed)) / chunk)
     solved = max(int(minimum), min(chunk - 1, int((float(room) - float(fixed)) // slope)))
     announce_once(f"check-chunk:{stage}:{chunk}:{solved}",
@@ -531,11 +537,13 @@ def check_chunk(chunk: int, *, build, fixed: float, per_unit: float, room: float
                   f"{chunk}; slope {per_unit / 1e6:.1f} -> {slope / 1e6:.1f} MB per unit, "
                   f"chunk {chunk} -> {solved}, recompiled once")
     compiled = build(solved)
+    started = time.perf_counter()
     again = compiled_new_bytes(compiled, extra=int(extra(solved, compiled)), platform=platform)
+    seconds += time.perf_counter() - started
     if again > room:
         raise MemoryError(
             f"GATE compiled_chunk_capacity: {stage}: got {again / 1e9:.2f} GB/rank at chunk "
             f"{solved} after one corrected recompile (chunk {chunk}: {got / 1e9:.2f} GB, "
             f"analytic {analytic / 1e9:.2f} GB); want <= the room {room / 1e9:.2f} GB; "
             "fix: more ranks or a larger memory_per_device_gb")
-    return ChunkCheck(solved, compiled, analytic, got, again, slope, True)
+    return ChunkCheck(solved, compiled, analytic, got, again, slope, True, seconds)

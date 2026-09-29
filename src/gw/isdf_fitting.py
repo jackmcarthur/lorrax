@@ -374,7 +374,7 @@ def _fit_mubatch(
     batch_executable = check.compiled
     b = int(mb.b)
     print_fn(f"  μ-batch executable: new bytes/rank analytic {check.analytic / 1e9:.2f} GB, "
-             f"compiled {check.compiled_bytes / 1e9:.2f} GB"
+             f"compiled {check.compiled_bytes / 1e9:.2f} GB (read in {check.seconds:.3f} s)"
              f"{' (recompiled at ' + str(check.chunk) + ' rows per owner)' if check.recompiled else ''}")
     del check
     split_kernels = {}

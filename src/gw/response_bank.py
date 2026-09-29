@@ -1485,7 +1485,7 @@ def produce_sample_bank(wfns, meta, config, *, mesh_xy, sym, sample_plan, bank_i
                            live + check.price, section="bank.dispatch.direct")
         receipt["group_check"] = dict(chunk=check.chunk, analytic=check.analytic,
             compiled=check.compiled_bytes, price=check.price, live=live, room=room,
-            recompiled=check.recompiled)
+            recompiled=check.recompiled, seconds=check.seconds)
         del whole, check
         rules = response_quadrature(meta, sample_plan, receipt, support,
                                     group_size=group_size, print_fn=print_fn)
