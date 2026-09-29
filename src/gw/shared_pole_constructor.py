@@ -459,7 +459,8 @@ def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output, resi
         del public_b
     with timing.section("spole.return"):
         return {"q_receipts": [receipts[q] for q in range(nq)], "model_header": store_header,
-                "model": target, "model_residence": model_residence,
+                "model": target if model_residence.get("stage") else str(output),
+                "model_residence": model_residence,
                 "capacity": ledger.receipt(),
                 "identity": identity, "status": "CONSTRUCTED",
                 "execution": dict(mode=execution, **execution_receipt)}

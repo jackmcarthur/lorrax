@@ -305,12 +305,13 @@ def _resident_model_checks(meta, bank, identity, mesh, directory, construct):
         refused = construct(bank, bank, meta, config, mesh_xy=mesh,
                             output=directory / "model_refused.h5", residence=rule)
     assert refused['model_residence']['residence'] == 'file', refused['model_residence']
-    assert refused['model'] == directory / "model_refused.h5"
+    assert refused['model'] == str(directory / "model_refused.h5")
     assert store.validate_shared_pole_model(
         refused['model'], expected_identity=identity, mesh_xy=mesh,
         capacity=ledger)['K'] == headers[0]['K']
     assert screening._RESIDENT_MODEL == []
     return dict(name='constructor_resident_model', status='PASS', bitwise_reads=len(reads[0]),
+                resident_model=str(model),
                 residence=receipt, refused=refused['model_residence'])
 
 
