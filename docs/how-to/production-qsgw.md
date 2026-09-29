@@ -111,7 +111,7 @@ extrapolation is not implemented: on the stored Si samples a state-independent
 
 ## Pending the owner
 
-Branch `feat/qsgw-production-partition-2026-09-29-r2` (lane TWOPORT,
+Branch `feat/qsgw-production-partition-2026-09-29-r3` (lane TWOPORT,
 claim 2952) holds the rest of the recipe. It is not on main.
 
 - **Absolute band cut.** b3 is set before the ζ fit, capped at the ζ left
