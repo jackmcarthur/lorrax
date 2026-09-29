@@ -1086,14 +1086,20 @@ struct M7Load {                                // the register load of the typed
     }
 };
 
-struct M7Mid {                                 // the kernel V[k, x, y] of the column's pair
+struct M7Mid {                                 // the kernel V[k, x, y] of a pair, times its columns
     const lrx_c2* __restrict__ kern;
     XBlock xb;
     long long my;
-    __device__ lrx_c2 operator()(int k, long long col, lrx_c2 v) const {
-        const long long pr = col / SSO, rx = pr / my, yy = pr - rx * my;
-        const long long xx = min(lrx_x_of(xb, rx), xb.mx - 1);
-        return lrx_mul(v, kern[((long long)k * xb.mx + xx) * my + yy]);
+    __device__ lrx_c2 w(int k, long long pr) const {
+        const long long rx = pr / my, yy = pr - rx * my;
+        return kern[((long long)k * xb.mx + min(lrx_x_of(xb, rx), xb.mx - 1)) * my + yy];
+    }
+    __device__ lrx_c2 operator()(int k, long long col, lrx_c2 v) const { return lrx_mul(v, w(k, col / SSO)); }
+    template <class Get>                       // whole groups: one thread per (k, pair) reads V once
+    __device__ void group(int k, long long pr, const Get& get) const {
+        const lrx_c2 wv = w(k, pr);
+#pragma unroll
+        for (int q = 0; q < SSO; ++q) get(q) = lrx_mul(get(q), wv);
     }
 };
 #endif
@@ -1144,7 +1150,8 @@ extern "C" __global__ void __launch_bounds__(LRX_THREADS, LRX_MINB) lrx_kconv(
     for (long long col0 = (long long)blockIdx.x * TRC; col0 < ncols; col0 += (long long)gridDim.x * TRC) {
         lrx_kbox::stage_tile<NX, NY, NZ, TRC>(sm, col0, ncols, ld);
         lrx_kbox::transform3<NX, NY, NZ, TRC, LRX_SM, fft_direction::inverse>(sm);
-        lrx_kbox::mid_tile<NX, NY, NZ, TRC>(sm, col0, ncols, mid);
+        if constexpr (TRC % SSO == 0) lrx_kbox::mid_group_tile<NX, NY, NZ, TRC, SSO>(sm, col0, ncols, mid);
+        else lrx_kbox::mid_tile<NX, NY, NZ, TRC>(sm, col0, ncols, mid);
         lrx_kbox::transform3<NX, NY, NZ, TRC, LRX_SM, fft_direction::forward>(sm);
         lrx_kbox::store_tile<NX, NY, NZ, TRC>(sm, col0, ncols, st);
     }
