@@ -135,8 +135,8 @@ claim 2952) holds the rest of the recipe. It is not on main.
   `sigma_omega_patches_ev` takes `lo:hi:eta` user windows. Against the
   semicore-at-deck-η read at the converged fixed point: E_F ± 1 eV 2.9 / 20.0
   meV std / max (MoS2). Every protected conduction state is read at the
-  deck η. Keep `number_bands_protected` at a count that closes its band
-  manifold (the log warns and names it). Semicore sits at its DFT block by default (`sc_semicore = dft`). Slab decks
+  deck η; the scissored tail's rigid shift is fitted on the protected
+  conduction states near the matrix top. Semicore sits at its DFT block by default (`sc_semicore = dft`). Slab decks
   (`sys_dim = 2`) should keep `number_bands_protected` below the vacuum states:
   no vacuum-level check exists yet.
 - **Owner calls.** (a) Coarse cost: at ε 3e-3 and η_semi 5 eV the coarse

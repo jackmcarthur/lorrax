@@ -185,11 +185,9 @@ have the same broadening"): every protected conduction state is read on the
 near grid at the deck η; there is no far-conduction class. On Fe 4³ prot
 (`number_bands_protected = 26`) the matrix-top band 26 at k 4/11 then sits
 among the scissored tail's levels (+20.6 to +21 eV) with a resonant Σ, and
-the SC map is bistable; `number_bands_protected = 35`, which closes the
-manifold, removes the tail there (claim 2960).
-A QP matrix [b0, b3) that ends inside a band manifold (band b3's maximum over
-k above band b3+1's minimum) is warned about in the log, which names the
-`number_bands_protected` that closes the manifold; it is not refused. Only the
+the SC map is bistable when the tail law is fitted on every conduction band
+(claim 2960). The tail law is therefore fitted only on the protected
+conduction states near the top (below). Only the
 scalar MPA/shared-pole Σ reads coarse windows; a sector (bispinor) route
 keeps the rule below.
 
@@ -226,8 +224,11 @@ $$
 \qquad Z_{nk} = \bigl(1 - \partial_\omega \mathrm{Re}\,\Sigma_{nn}(\omega)\rvert_{E_{nk}}\bigr)^{-1},
 $$
 
-over the window's conduction states that are on the sampled grid and have
-$0 < Z \le 1$. A state on a satellite or near a pole of Σ has small $Z$ and
+over the window's conduction states that are on the sampled grid, have
+$0 < Z \le 1$, and whose DFT energy lies within $0.2\,(E_{c,\max} - E_F)$ of
+$E_{c,\max}$, the top protected band's DFT maximum over k
+(`band_partition.tail_fit_states`, owner 2026-09-29: the tail's bottom follows
+the states near the matrix's top, not the conduction mean). A state on a satellite or near a pole of Σ has small $Z$ and
 cannot drag the tail: a state moved 3 eV onto a satellite with $Z = 0.1$
 shifts β by 21 meV, where the plain mean moves 188 meV (CLAIMS 2710). An
 off-grid state is excluded because its energy did not come from its own

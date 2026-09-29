@@ -3335,8 +3335,7 @@ def coarse_class_for_deck(config, wfn, print0):
     """
     import sys
     from common.units import RYD_TO_EV
-    from .band_partition import (SEMICORE_GAP_EV, WINDOW_CLIP_EV, manifold_closing_count,
-                                 semicore_floor)
+    from .band_partition import SEMICORE_GAP_EV, WINDOW_CLIP_EV, semicore_floor
     from .gw_config import infer_material_class
     e_ry = np.asarray(wfn.energies[0, :, :config.nband], dtype=np.float64)
     e = e_ry * RYD_TO_EV
@@ -3373,15 +3372,6 @@ def coarse_class_for_deck(config, wfn, print0):
                if getattr(config, "number_bands_protected", None) is None else
                f"under a band gap >= {SEMICORE_GAP_EV:g} eV (number_bands_protected)"))
            if coarse.n_coarse else "none"))
-    b3 = n_occ + int(config.ncond)
-    closing = manifold_closing_count(e, b3)
-    if closing is not None:
-        say(f"  WARNING: the QP matrix [b0, {b3}) ends inside a band manifold: band {b3} "
-            f"reaches {float(e[:, b3 - 1].max()) - mu:+.3f} eV and band {b3 + 1} starts at "
-            f"{float(e[:, b3].min()) - mu:+.3f} eV (E - mu), so the top bands lose their mixing "
-            f"with the scissored tail.  number_bands_protected = {closing} closes the manifold"
-            + ("" if closing < int(config.nband) else " (the loaded band count; no gap below it)")
-            + ".")
     return coarse
 
 
