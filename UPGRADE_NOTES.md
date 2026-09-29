@@ -56,11 +56,6 @@ self_consistent`, scalar MPA/shared-pole route) moves once. See
   at the deck η, certified at max(`sigma_quadrature_eps`, 3e-3).
   `sigma_omega_patches_ev` accepts `lo:hi:eta` triples as user coarse windows
   (`GATE sigma_coarse_window`). Sector (bispinor) routes keep the old rule.
-- **Far conduction.** From map 1, protected conduction states broader than the
-  deck η at map 0 (Γ_n = |Im Σ_nn(E_n)|, above the highest sharp one) are read
-  on held windows above the near grid at η_n = max(η, Γ_n), rounded down to
-  η·2^j; map 1 re-plans the support and the rules once. The protected end of
-  every off-diagonal average stays at the deck η, so mixing is kept.
 - **A warning.** A QP matrix that ends inside a band manifold is logged with the
   `number_bands_protected` that closes it.
 - **A new refusal.** `zeta_nband` below b3 now refuses on every run,

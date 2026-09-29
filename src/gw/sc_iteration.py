@@ -2715,8 +2715,6 @@ class SCSupport(NamedTuple):
     patch_event: str = ""                # plan | hold | extend
     joined: np.ndarray | None = None     # coarse-window samples + the near grid: what Sigma samples
     windows: tuple = ()                  # this map's coarse windows (lo, hi, eta, user), eV
-    far: np.ndarray | None = None        # far-conduction identities (read above the near grid)
-    far_patch: tuple | None = None       # the held far-conduction windows ((lo, hi, eta), ...), eV
 
 
 def _sc_coarse_identities(inputs, shape):
@@ -2739,14 +2737,6 @@ def _sc_coarse_identities(inputs, shape):
             else ks.select(inputs.e_dft_active_kn_ry))
     e_ev = np.asarray(e_ry, dtype=np.float64) * RYD_TO_EV
     return np.broadcast_to(e_ev < float(cut.coarse_floor_ev), shape)
-
-
-def _sc_far_route(inputs):
-    """True when the far-conduction class can apply: the production band
-    request on the scalar MPA/shared-pole route (the coarse-window predicate)."""
-    from .qp_support import semicore_patch_route
-    return (getattr(getattr(inputs, "meta", None), "coarse_class", None) is not None
-            and semicore_patch_route(inputs.config.compute_mode, inputs.wfns_transverse))
 
 
 def _sc_sampled_support(inputs, partition, energies_loop, mu_ev, active_n=None,
@@ -2791,16 +2781,8 @@ def _sc_sampled_support(inputs, partition, energies_loop, mu_ev, active_n=None,
     # quasiparticles move the support.
     everyone = requested_states(sigma, inputs.config.sc.frozen_core_bands,
                                 energy_relative_ev, required_kn, active_n)
-    # Coarse and far-conduction identities leave R; every other identity keeps
-    # main's W-active rule.
-    gamma = None if session is None else session.get("far_gamma_kn")
-    if gamma is not None and _sc_far_route(inputs):
-        from .qp_support import far_class_kn
-        far = far_class_kn(energies_loop - mu_ev, np.broadcast_to(gamma, energies_loop.shape),
-                           everyone & ~semicore, float(sigma.regularization_ev))
-    else:
-        far = np.zeros(energies_loop.shape, dtype=bool)
-    everyone = everyone & ~semicore & ~far
+    # Coarse leaves R; every other identity keeps main's W-active rule.
+    everyone = everyone & ~semicore
     quasiparticle = (None if z_in_kn is None else
                      quasiparticle_mask(np.broadcast_to(z_in_kn, energies_loop.shape)))
     states = everyone if quasiparticle is None else everyone & quasiparticle
@@ -2833,29 +2815,10 @@ def _sc_sampled_support(inputs, partition, energies_loop, mu_ev, active_n=None,
         else:
             patch, patch_event = held, "hold"
         windows = coarse_windows_ev(near_lo, patch, users)
-    far_patch = None
-    if far.any():
-        from .qp_support import (SEMICORE_PATCH_EDGE_EV, extend_far_windows_ev,
-                                 far_patch_escapes, far_windows_ev)
-        near_hi = float(grid[-1])
-        held_far = None if session is None else session.get("far_patches_ev")
-        if plan is None or held_far is None:
-            far_patch, far_event = far_windows_ev(
-                energy_relative_ev, far, np.broadcast_to(gamma, energies_loop.shape), near_hi,
-                float(sigma.regularization_ev)), "plan"
-        elif far_patch_escapes(energy_relative_ev, far, near_hi, held_far).any():
-            far_patch, far_event = extend_far_windows_ev(
-                held_far, energy_relative_ev, far), "extend"
-        else:
-            far_patch, far_event = held_far, "hold"
-        patch_event = patch_event if patch_event not in ("", "hold") else far_event
-        windows = tuple(windows) + tuple(
-            (max(float(lo), near_hi + SEMICORE_PATCH_EDGE_EV), float(hi), float(eta), False)
-            for lo, hi, eta in far_patch if float(hi) > near_hi + SEMICORE_PATCH_EDGE_EV)
     from .qp_support import joined_grid_ev
     return SCSupport(sampled_grid, grid, energy_relative_ev, states, event,
                      envelope, no_qp, semicore, patch, patch_event,
-                     joined_grid_ev(grid, windows), windows, far, far_patch)
+                     joined_grid_ev(grid, windows), windows)
 
 
 def _record_sc_window_plan(inputs, iteration, support):
@@ -4080,7 +4043,6 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
             session["window_plan"] = {
                 "event": event, "iteration": int(state.iteration)}
             session["semicore_patches_ev"] = sc_support.patch
-            session["far_patches_ev"] = sc_support.far_patch
         if sc_support.windows and sc_support.patch_event != "hold":
             _record_sc(inputs, f"    SC coarse windows ({sc_support.patch_event}, map "
                        f"{int(state.iteration)}): " + ", ".join(
@@ -4088,8 +4050,7 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
                            for w in sc_support.windows)
                        + f" eV around the near grid [{expanded_grid[0]:+.2f}, "
                        f"{expanded_grid[-1]:+.2f}] eV; {int(sc_support.semicore.sum())} "
-                       f"coarse and {int(0 if sc_support.far is None else sc_support.far.sum())} "
-                       "far-conduction (k,state) keep their full Sigma rows")
+                       "coarse (k,state) keep their full Sigma rows")
         sigma_config = replace(
             inputs.config, sc_omega_grid_ev=tuple(float(x) for x in sc_support.joined),
             sc_coarse_windows_ev=tuple(sc_support.windows) or None)
@@ -4342,7 +4303,6 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
         # whose sorted columns indices_loop maps to identities.  Collective,
         # every rank.
         z_sorted = _sc_z_factors(inputs, state_out, energies_loop)
-        _sc_record_far_gamma(inputs, state, state_out, indices_loop)
         state_out = replace(state_out, tail_z_kn=np.take_along_axis(
             np.asarray(z_sorted, dtype=np.float64), indices_loop, axis=1))
         if sc_support is not None and sc_support.windows:
@@ -4731,50 +4691,6 @@ def _sc_edge_ambiguity(inputs: SCInputs, state_out: SCState) -> tuple[int, str]:
                f"{int(b) + 1}, E-mu={float(e_rel[k, b]):+.3f} eV; grid "
                f"[{float(omega[0]):+.2f}, {float(omega[-1]):+.2f}] eV, growth window "
                f"[{window[0]:+.2f}, {window[1]:+.2f}] eV")
-
-
-def _sc_record_far_gamma(inputs, state, state_out, indices_loop):
-    """At SC map 0: Gamma_n = |Im Sigma_nn(E_n)| per identity (eV), from this
-    map's Sigma on its grid (read coarsely, at the deck eta), kept on the
-    session for the far-conduction class (``qp_support.far_class_kn``), and the
-    one planned re-plan of the support and the Sigma rules at map 1."""
-    session = inputs.fixed_quadrature_session
-    if (session is None or int(state.iteration) != 0 or "far_gamma_kn" in session
-            or not _sc_far_route(inputs)):
-        return
-    sigma = state_out.outputs.sigma_result
-    cube, omega = sigma.sigma_c_omega_kij_ry, sigma.omega_grid_ev
-    if cube is None or omega is None:
-        return
-    from .qsgw_utils import extract_sigma_diag_replicated
-    diag = np.asarray(extract_sigma_diag_replicated(cube, inputs.mesh_xy),
-                      dtype=np.complex128) * RYD_TO_EV
-    if sigma.sigma_band_axis is not None:
-        from runtime.padding import strip_axis
-        diag = np.asarray(strip_axis(diag, sigma.sigma_band_axis, axis=-1))
-    w = np.asarray(omega, dtype=np.float64)
-    e_rel = np.asarray(sigma.e_eval_ev, dtype=np.float64) - float(sigma.efermi_dft_ev)
-    # linear interpolation of Im Sigma_nn at each E_n on the (ascending) grid, all (k, n) at once
-    j = np.clip(np.searchsorted(w, e_rel), 1, w.size - 1)
-    t = np.clip((e_rel - w[j - 1]) / (w[j] - w[j - 1]), 0.0, 1.0)
-    im = diag.imag
-    lo = np.take_along_axis(im, (j - 1)[None], axis=0)[0]
-    hi = np.take_along_axis(im, j[None], axis=0)[0]
-    gamma = np.abs((1.0 - t) * lo + t * hi)
-    # The SC map's Sigma result is on the loop k-set (sigma_result_on_kset,
-    # as _sc_z_factors reads it); a full-BZ table is moved to it here.
-    idx = np.asarray(indices_loop)
-    if gamma.shape[0] != idx.shape[0]:
-        gamma = np.asarray(_kstar(inputs).select(gamma))
-    gamma = np.take_along_axis(gamma, idx, axis=1)
-    session["far_gamma_kn"] = gamma
-    # one planned re-plan at map 1: the far class leaves the near grid.  The
-    # Sigma rule sessions are per W model (sigma_dispatch: session[model]);
-    # each is recognised by its tau capacity, the chi session is left alone.
-    session.pop("window_plan", None)
-    for sub in session.values():
-        if isinstance(sub, dict) and "tau_capacity" in sub:
-            sub.pop("rules", None)
 
 
 def _sc_z_factors(

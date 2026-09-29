@@ -134,12 +134,11 @@ claim 2952) holds the rest of the recipe. It is not on main.
   q is 0.69 (MoS2, needs < 0.58) and 0.54 (Fe, needs < 0.05) (claim 2960).
   `sigma_omega_patches_ev` takes `lo:hi:eta` user windows. Against the
   semicore-at-deck-η read at the converged fixed point: E_F ± 1 eV 2.9 / 20.0
-  meV std / max (MoS2). From map 1, protected conduction states broader
-  than the deck η at map 0 read on far windows at η_n = max(η, |Im Σ_nn(E_n)|);
-  the protected end of their off-diagonals stays at the deck η (mixing kept).
-  Semicore sits at its DFT block by default (`sc_semicore = dft`). Slab decks
+  meV std / max (MoS2). Every protected conduction state is read at the
+  deck η. Keep `number_bands_protected` at a count that closes its band
+  manifold (the log warns and names it). Semicore sits at its DFT block by default (`sc_semicore = dft`). Slab decks
   (`sys_dim = 2`) should keep `number_bands_protected` below the vacuum states:
-  no vacuum-level check exists yet, so the far rule would read them.
+  no vacuum-level check exists yet.
 - **Owner calls.** (a) Coarse cost: at ε 3e-3 and η_semi 5 eV the coarse
   windows take 47 (Fe 4³) and 37 (MoS2 3×3) τ pairs per map, against 253 and
   186 at ε 1e-4 and 1 eV (claim 2960). (b) Fe 4³ map 2 misses 2 meV: at matched
