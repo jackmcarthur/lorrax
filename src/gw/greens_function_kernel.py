@@ -1,6 +1,6 @@
 """Build parent Green operators and transport them with typed local symmetry actions."""
 import dataclasses
-from functools import partial
+from functools import lru_cache, partial
 
 import jax
 
@@ -8,6 +8,23 @@ import numpy as np
 import jax.numpy as jnp
 
 from common.contract_bands import merge_spin_centroid
+
+
+def _band_weight_bounds(phases, band_range, nq, nb, dtype):
+    """``(w, bounds)``: the phase row zeroed outside each row's ``band_range``, and that interval clipped to ``[0, nb]``."""
+    weight = None if phases is None else phases.astype(dtype)
+    if band_range is None:
+        return weight, None
+    lo, hi = (jnp.broadcast_to(jnp.reshape(jnp.asarray(v, jnp.int32), (-1,)), (nq,))
+              for v in band_range)
+    idx = jnp.arange(nb)[None, :]
+    live = (idx >= lo[:, None]) & (idx < hi[:, None])
+    weight = (live.astype(dtype) if weight is None
+              else jnp.where(live, weight, jnp.zeros((), dtype)))
+    # The interval also bounds the gathered local product: the columns
+    # outside it are zero, so skipping them is the same product.
+    hi = jnp.clip(hi, 0, nb)
+    return weight, jnp.stack([jnp.clip(lo, 0, hi), hi], axis=1)
 
 
 def face_band_gather_product(A, B, mesh, phases, band_range, n_full=None):
@@ -26,28 +43,74 @@ def face_band_gather_product(A, B, mesh, phases, band_range, n_full=None):
     (every band on every rank, for this call only), when it fits; otherwise
     interleaved band chunks, two live at a time (one prefetched), sized so
     that pair fits the tile.  Nothing band-complete outlives the call.
+    A caller that builds many Greens from the same faces holds the panels
+    instead (:class:`HeldPanels`).
     """
     from distrib_la import panel_matmul
 
     nq, m, nb = (int(v) for v in A.shape)
     n = int(B.shape[-1])
-    weight = None if phases is None else phases.astype(A.dtype)
-    bounds = None
-    if band_range is not None:
-        lo, hi = (jnp.broadcast_to(jnp.reshape(jnp.asarray(v, jnp.int32), (-1,)), (nq,))
-                  for v in band_range)
-        idx = jnp.arange(nb)[None, :]
-        live = (idx >= lo[:, None]) & (idx < hi[:, None])
-        weight = (live.astype(A.dtype) if weight is None
-                  else jnp.where(live, weight, jnp.zeros((), A.dtype)))
-        # The interval also bounds the gathered local product: the columns
-        # outside it are zero, so skipping them is the same product.
-        hi = jnp.clip(hi, 0, nb)
-        bounds = jnp.stack([jnp.clip(lo, 0, hi), hi], axis=1)
+    weight, bounds = _band_weight_bounds(phases, band_range, nq, nb, A.dtype)
     if weight is not None:
         A = A * weight[:, None, :]
     tile_bytes = green_panel_bytes(n_rows=int(n_full or nq), m=m, n=n, mesh=mesh)
     return panel_matmul(A, B, mesh=mesh, panel_bytes=tile_bytes, bounds=bounds)
+
+
+@dataclasses.dataclass(frozen=True)
+class HeldPanels:
+    """The band-complete ψ panels of one Green contraction, gathered once and held.
+
+    ``left`` = ``merge_spin_centroid(ψ_mun)`` ``(nk, μ·s, N_b)`` at
+    ``P(None,'x',None)``; ``right`` = ``merge_spin_centroid(conj ψ_nmu)``
+    ``(nk, N_b, ν·s)`` at ``P(None,None,'y')`` (``distrib_la.gather_panels``).
+    They are what every Green build of :func:`face_band_gather_product`
+    gathers from the same faces, so a caller that builds a Green per τ node
+    passes them in the faces' place: ``build_G*(held, None, ...)``.  Only the
+    band weights change between builds; they scale the held left panel
+    locally.  ``conj()`` is the antiunitary partner's pair.  A pytree:
+    ``left``/``right`` are leaves, ``ns`` is static.
+    """
+    left: jax.Array
+    right: jax.Array
+    ns: int
+
+    def conj(self):
+        return HeldPanels(jnp.conj(self.left), jnp.conj(self.right), self.ns)
+
+
+jax.tree_util.register_pytree_node(
+    HeldPanels, lambda h: ((h.left, h.right), h.ns),
+    lambda ns, leaves: HeldPanels(leaves[0], leaves[1], ns))
+
+
+def held_panel_bytes(psi_mun, psi_nmu, *, mesh):
+    """Per-rank bytes of the :class:`HeldPanels` of these faces, and the left panel's share."""
+    from distrib_la import gathered_panel_bytes
+    nk, s, mu_l, nb = (int(v) for v in psi_mun.shape)
+    s_r, mu_r = (int(v) for v in psi_nmu.shape[2:])
+    total = gathered_panel_bytes(nk, mu_l * s, nb, mu_r * s_r, mesh=mesh)
+    left = gathered_panel_bytes(nk, mu_l * s, nb, 0, mesh=mesh)
+    return total, left
+
+
+def hold_panels(psi_mun, psi_nmu, *, mesh):
+    """Gather the :class:`HeldPanels` of the faces ``(ψ_mun, ψ_nmu)`` (the two Green operands)."""
+    left, right = _hold_program(mesh)(psi_mun, psi_nmu)
+    return HeldPanels(left, right, int(psi_mun.shape[1]))
+
+
+@lru_cache(maxsize=8)
+def _hold_program(mesh):
+    """One program: the two merges of :func:`_build_G_face` and ``distrib_la.gather_panels``."""
+    from distrib_la import gather_panels
+
+    @jax.jit
+    def hold(psi_mun, psi_nmu):
+        A = merge_spin_centroid(psi_mun, 1, 2)
+        B = merge_spin_centroid(jnp.conj(psi_nmu), 2, 3)
+        return gather_panels(A, B, mesh=mesh)
+    return hold
 
 
 def green_panel_bytes(*, n_rows, m, n, mesh, room=None):
@@ -73,6 +136,9 @@ def _build_G_face(psi_mun, psi_nmu, *, gemm, Gij=None, phases=None, mesh=None,
     """
     if Gij is not None:
         raise NotImplementedError("Green faces support diagonal band weights, not dense Gij.")
+    if isinstance(psi_mun, HeldPanels):
+        return _build_G_held(psi_mun, phases=phases, mesh=mesh, band_range=band_range,
+                             prepared_active_gemm=prepared_active_gemm)
     nk_, s_, mu_l_, n_ = psi_mun.shape
     nk_r_, n_r_, s_r_, mu_r_ = psi_nmu.shape
     if nk_r_ != nk_ or n_r_ != n_ or s_r_ != s_:
@@ -115,6 +181,26 @@ def _build_G_face(psi_mun, psi_nmu, *, gemm, Gij=None, phases=None, mesh=None,
     # Green is stored ``(nk, mu_X, s, nu_Y, s')`` and is never transposed to
     # a spin-major order.  The parent-k unfold transports this order as-is.
     return G_flat.reshape(nk_, mu_l_, s_, mu_r_, s_)
+
+
+def _build_G_held(held, *, phases, mesh, band_range, prepared_active_gemm):
+    """:func:`_build_G_face` on :class:`HeldPanels`: the local product of the held panels, no exchange."""
+    from distrib_la import gathered_matmul
+    if prepared_active_gemm is not None or phases is None:
+        raise ValueError("held Green panels take per-band phases and no prepared GEMM")
+    nk_, m_, nb_ = (int(v) for v in held.left.shape)
+    n_ = int(held.right.shape[2])
+    weight, bounds = _band_weight_bounds(phases, band_range, nk_, nb_, held.left.dtype)
+    G_flat = gathered_matmul(held.left, held.right, mesh=mesh, weights=weight, bounds=bounds)
+    s_ = held.ns
+    return G_flat.reshape(nk_, m_ // s_, s_, n_ // s_, s_)
+
+
+def _conj_operands(psi_xn, psi_yr):
+    """The antiunitary partner's operands: conjugate faces, or conjugate held panels."""
+    if isinstance(psi_xn, HeldPanels):
+        return psi_xn.conj(), None
+    return jnp.conj(psi_xn), jnp.conj(psi_yr)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -163,7 +249,7 @@ def build_G_parents(psi_xn, psi_yr, *, Gij=None, phases=None, layout='face', gem
                 or not jnp.issubdtype(phases.dtype, jnp.complexfloating)):
             return ParentGreen(G, None, conj_partner=True)
         elif real_weights is False:
-            transposed = _build_G_face(jnp.conj(psi_xn), jnp.conj(psi_yr),
+            transposed = _build_G_face(*_conj_operands(psi_xn, psi_yr),
                                        gemm=gemm, Gij=Gij, phases=phases, mesh=k_unfold_plan.mesh_xy,
                                        band_range=band_range,
                                        prepared_active_gemm=prepared_active_gemm,
@@ -172,7 +258,7 @@ def build_G_parents(psi_xn, psi_yr, *, Gij=None, phases=None, layout='face', gem
             transposed = jax.lax.cond(
                 (jnp.any(jnp.imag(phases) != 0) if real_weights is None
                  else ~jnp.asarray(real_weights)),
-                lambda _: _build_G_face(jnp.conj(psi_xn), jnp.conj(psi_yr),
+                lambda _: _build_G_face(*_conj_operands(psi_xn, psi_yr),
                                         gemm=gemm, Gij=Gij, phases=phases, mesh=k_unfold_plan.mesh_xy,
                                         band_range=band_range,
                                         prepared_active_gemm=prepared_active_gemm,
@@ -426,23 +512,11 @@ def _green_terms(*, n_parent, n_rmu, ns, n_band, mesh):
     return tile, panels
 
 
-def sigma_spin_block(*, n_parent, n_rmu, ns, n_full, n_band, mesh, partner_tiles):
-    """The block size ``d`` (a divisor of ``ns``): a parent-row Σ convolution stores its output in (ns/d)² x blocks.
-
-    New per rank beside what is live: the parent Green ``T_p``, ``partner_tiles`` more of
-    it (1 when the antiunitary partner is its own GEMM, 0 when it is read as conj(G)),
-    the widest stored x block ``T_p·xn·bx/μ_x`` (``(d/ns)²`` of it up to a row per slab
-    piece, :func:`sigma_row_blocks`), the full-k W(τ) out of the k-convolution
-    ``16·N_k·μ²/P``, and the panels of the Green and partner builds ``2·M_axis``.  The
-    largest ``d`` whose set fits the stage room (:func:`_green_stage_room`) wins, else 1.
-    Every process computes the same ``d``.
-    """
-    if int(ns) <= 1:
-        return 1
+def _sigma_pass(*, n_parent, n_rmu, ns, n_full, n_band, mesh, partner_tiles, room):
+    """``(d, new(d), panels)``: :func:`sigma_spin_block`'s choice against ``room`` and its per-rank price."""
     tile, panels = _green_terms(n_parent=n_parent, n_rmu=n_rmu, ns=ns, n_band=n_band,
                                 mesh=mesh)
     w_tau = 16.0 * int(n_full) * int(n_rmu) ** 2 / (int(mesh.shape['x']) * int(mesh.shape['y']))
-    live, room = _green_stage_room(ns)
     mx = int(n_rmu) // int(mesh.shape['x'])
 
     def frac(d):
@@ -452,12 +526,59 @@ def sigma_spin_block(*, n_parent, n_rmu, ns, n_full, n_band, mesh, partner_tiles
                      + (1.0 + float(partner_tiles)) * panels)
     divisors = sorted((d for d in range(1, int(ns) + 1) if int(ns) % d == 0), reverse=True)
     d = next((d for d in divisors if new(d) <= room), 1)
-    if new(d) > room:
-        _over_room("the Sigma tau pass at d = 1", new(d), room)
+    return d, new(d), (1.0 + float(partner_tiles)) * panels
+
+
+def sigma_spin_block(*, n_parent, n_rmu, ns, n_full, n_band, mesh, partner_tiles):
+    """The block size ``d`` (a divisor of ``ns``): a parent-row Σ convolution stores its output in (ns/d)² x blocks.
+
+    New per rank beside what is live: the parent Green ``T_p``, ``partner_tiles`` more of
+    it (1 when the antiunitary partner is its own GEMM, 0 when it is read as conj(G)),
+    the widest stored x block ``T_p·xn·bx/μ`` (``(d/ns)²`` of it up to a row per slab
+    piece, :func:`sigma_row_blocks`), the full-k W(τ) out of the k-convolution
+    ``16·N_k·μ²/P``, and the panels of the Green and partner builds ``2·M_axis``.  The
+    largest ``d`` whose set fits the stage room (:func:`_green_stage_room`) wins, else 1.
+    Every process computes the same ``d``.
+    """
+    if int(ns) <= 1:
+        return 1
+    live, room = _green_stage_room(ns)
+    d, new, _ = _sigma_pass(n_parent=n_parent, n_rmu=n_rmu, ns=ns, n_full=n_full,
+                            n_band=n_band, mesh=mesh, partner_tiles=partner_tiles, room=room)
+    if new > room:
+        _over_room("the Sigma tau pass at d = 1", new, room)
     from common.gpu_utils import record_stage_price
-    record_stage_price(f"Sigma tau, sigma_spin_block d={d}/{int(ns)}", live + new(d),
+    record_stage_price(f"Sigma tau, sigma_spin_block d={d}/{int(ns)}", live + new,
                        section="sigma.tau_sweep")
     return d
+
+
+def held_panels_fit(*, n_parent, n_rmu, ns, n_full, n_band, mesh, held_bytes, left_bytes,
+                    partner_tiles=1):
+    """Whether a Σ τ sweep may hold its :class:`HeldPanels` beside its τ pass (no shared-pole ledger).
+
+    Held, the panels stay live for the whole sweep (``held_bytes``); each node's build
+    then adds only the weighted left panel (``left_bytes``), and the partner build its
+    conjugate pair — at most ``held_bytes`` — where :func:`sigma_spin_block` priced
+    ``(1 + partner_tiles)`` gathered panel pairs.  The τ pass at its block size ``d``
+    plus any excess must fit the Green stage room; the price is recorded.  Every
+    process computes the same answer (the room is the minimum over processes).
+    """
+    live, room = _green_stage_room(ns)
+    if int(ns) <= 1:
+        d, new, priced = 1, 0.0, 0.0
+    else:
+        d, new, priced = _sigma_pass(n_parent=n_parent, n_rmu=n_rmu, ns=ns, n_full=n_full,
+                                     n_band=n_band, mesh=mesh,
+                                     partner_tiles=partner_tiles, room=room)
+    transient = float(left_bytes) + float(partner_tiles) * (float(held_bytes) - float(left_bytes))
+    need = new + max(0.0, float(held_bytes) + transient - priced)
+    if need > room:
+        return False
+    from common.gpu_utils import record_stage_price
+    record_stage_price(f"Sigma tau, held Green panels d={d}/{int(ns)}", live + need,
+                       section="sigma.tau_sweep")
+    return True
 
 
 def price_chi0_node(*, n_parent, n_rmu, ns, n_full, n_out, n_band, mesh, partner):

@@ -85,8 +85,11 @@ def panel_matmul(a, b, *, mesh, panel_bytes, bounds=None):
     return _kernel(mesh, q, m, k, n, width, sample_axis)(a, b)
 
 
-def _local_interval_product(mesh):
-    """The local active-range GEMM of this mesh's platform: ``(left, right, bounds) -> left @ right`` over each row's interval."""
+def _local_interval_product(mesh, weighted=False):
+    """The local active-range GEMM of this mesh's platform: ``(left, right, bounds) -> left @ right`` over each row's interval.
+
+    ``weighted``: ``(left, right, bounds, weights) -> left·diag(w) @ right``, the
+    handler's own column weighting of ``left``."""
     one, zero = np.complex128(1.0), np.complex128(0.0)
     if mesh_platform(mesh) == "CUDA":
         from ._active_local_cuda import active_local_cuda, require_active_local_cuda
@@ -94,6 +97,11 @@ def _local_interval_product(mesh):
         contract = active_local_cuda
     else:
         from ._active_local import active_local_matmul as contract
+
+    if weighted:
+        def weighted_product(left, right, bounds, weights):
+            return contract(left, right, bounds, weights, alpha=one, beta=zero)
+        return weighted_product
 
     def product(left, right, bounds):
         weights = jnp.ones(left.shape[::2], left.dtype)
@@ -196,3 +204,89 @@ def _interleaved_kernel(mesh, q, m, k, n, width):
 
     face = NamedSharding(mesh, P(None, 'x', 'y'))
     return jax.jit(product, in_shardings=(face, face), out_shardings=face)
+
+
+def gathered_panel_bytes(q, m, k, n, *, mesh, itemsize=16):
+    """Per-rank bytes of the complete panels :func:`gather_panels` holds: ``itemsize·q·k·(m/p_x + n/p_y)``."""
+    px, py = int(mesh.shape['x']), int(mesh.shape['y'])
+    return int(itemsize) * int(q) * int(k) * (int(m) // px + int(n) // py)
+
+
+def gather_panels(a, b, *, mesh):
+    """The complete contraction panels of ``a @ b``, gathered once for a caller that holds them.
+
+    ``a`` ``(q,m,k)`` and ``b`` ``(q,k,n)`` sit at ``P(None,'x','y')``.  Returns
+    ``(left, right)``: ``a`` all-gathered over ``y`` (``(q,m,k)`` at
+    ``P(None,'x',None)``) and ``b`` over ``x`` (``(q,k,n)`` at
+    ``P(None,None,'y')``), :func:`gathered_panel_bytes` per rank.  These are the
+    panels :func:`panel_matmul` gathers on every call when the complete panel
+    fits; a caller multiplying many column weightings of the same faces
+    (the Σ τ nodes) gathers them once and calls :func:`gathered_matmul`.
+    """
+    px, py = int(mesh.shape['x']), int(mesh.shape['y'])
+    if a.ndim != 3 or b.ndim != 3 or a.dtype != b.dtype:
+        raise ValueError('gather_panels requires rank-3 A and B of one dtype')
+    q, m, k = a.shape
+    if b.shape[0] != q or b.shape[1] != k:
+        raise ValueError('gather_panels batch/contraction extents disagree')
+    n = b.shape[2]
+    if m % px or k % px or k % py or n % py:
+        raise ValueError('gather_panels requires producer-padded face extents')
+    return _gather_kernel(mesh)(a, b)
+
+
+@lru_cache(maxsize=16)
+def _gather_kernel(mesh):
+    face = NamedSharding(mesh, P(None, 'x', 'y'))
+    rows, cols = P(None, 'x', None), P(None, None, 'y')
+
+    @partial(shard_map, mesh=mesh, in_specs=(P(None, 'x', 'y'),) * 2,
+             out_specs=(rows, cols), check_vma=False)
+    def gathered(a, b):
+        return (lax.all_gather(a, 'y', axis=2, tiled=True),
+                lax.all_gather(b, 'x', axis=1, tiled=True))
+
+    return jax.jit(gathered, in_shardings=(face, face),
+                   out_shardings=(NamedSharding(mesh, rows), NamedSharding(mesh, cols)))
+
+
+def gathered_matmul(left, right, *, mesh, weights, bounds=None):
+    """``left·diag(w)·right`` from panels held by :func:`gather_panels`, with no exchange.
+
+    ``weights`` ``(q,k)`` replicated scales the contraction columns of
+    ``left`` on the rank's own rows; ``bounds`` (``(q,2)``, replicated) is
+    :func:`panel_matmul`'s per-row interval, outside which the caller has
+    zeroed the weights.  Each rank multiplies its row panel by its column
+    panel into its own ``P(None,'x','y')`` output tile.  The products are the
+    ones :func:`panel_matmul` forms after its complete-panel gather: the
+    weighted panel ``left·w`` holds the same elements as the gathered
+    ``(a·w)``, and the local product is the same call.
+    """
+    if left.ndim != 3 or right.ndim != 3 or left.dtype != right.dtype:
+        raise ValueError('gathered_matmul requires rank-3 panels of one dtype')
+    q, _, k = left.shape
+    if right.shape[0] != q or right.shape[1] != k or tuple(weights.shape) != (q, k):
+        raise ValueError('gathered_matmul panel/weight extents disagree')
+    weights = jnp.asarray(weights).astype(left.dtype)
+    if bounds is None:
+        return _gathered_kernel(mesh, False)(left, right, weights)
+    bounds = jnp.asarray(bounds, jnp.int32).reshape(q, 2)
+    return _gathered_kernel(mesh, True)(left, right, weights, bounds)
+
+
+@lru_cache(maxsize=16)
+def _gathered_kernel(mesh, active):
+    rows, cols, face = P(None, 'x', None), P(None, None, 'y'), P(None, 'x', 'y')
+    if active:
+        interval_product = _local_interval_product(mesh, weighted=True)
+
+        @partial(shard_map, mesh=mesh, in_specs=(rows, cols, P(), P()),
+                 out_specs=face, check_vma=False)
+        def product(left, right, weights, bounds):
+            return interval_product(left, right, bounds, weights)
+    else:
+        @partial(shard_map, mesh=mesh, in_specs=(rows, cols, P()),
+                 out_specs=face, check_vma=False)
+        def product(left, right, weights):
+            return (left * weights[:, None, :]) @ right
+    return jax.jit(product, out_shardings=NamedSharding(mesh, face))

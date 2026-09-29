@@ -114,6 +114,19 @@ def check_tau_kernel_parent_dense(mesh, *, ns, nk_tuple, n_rmu, nb_full,
     got = _to_host(kernel(xn, yr, xr, yn, energy, sel,
         B_poles, Omega_poles, pole_indices, bounds, phase_real,
         E_ref_A, E_ref_B, t_node), mesh)[..., :nb_sigma, :nb_sigma]
+    # Held Green panels (gathered once for a whole Σ call).  This fixture's
+    # per-node build streams band chunks (its full-k tile budget is below one
+    # panel), while held panels multiply once, so the band sum is ordered
+    # differently: round-off.  The Σ executor holds panels only where the
+    # per-node build gathers the complete panel, and there it is the same
+    # product (bitwise on the production decks).
+    from gw.greens_function_kernel import hold_panels
+    held = _to_host(kernel(hold_panels(xn, yr, mesh=mesh), None, xr, yn, energy, sel,
+        B_poles, Omega_poles, pole_indices, bounds, phase_real,
+        E_ref_A, E_ref_B, t_node), mesh)[..., :nb_sigma, :nb_sigma]
+    held_rel = float(np.max(np.abs(held - got))) / max(float(np.max(np.abs(got))), 1e-300)
+    p0(f"  held panels vs per-node gathers: max_rel={held_rel:.3e}")
+    assert held_rel < 1e-13
     reference = _dense_tau(psi_full, np.asarray(E_A), np.asarray(sel),
         np.asarray(B_poles[0]), np.asarray(Omega_q), complex(t_node),
         brackets, nb_sigma)

@@ -175,7 +175,8 @@ def sector_tau_factory(left, right, keys, meta, mesh_xy):
         key=(mesh_xy,a.layout,shapes,int(b),tuple(keys),tuple(int(v) for v in meta.kgrid),
              int(meta.nk_tot),id(plans[0]),id(plans[1]))
         return SynthesisTau(spatial, synthesis, right_yr, right_proj,
-                         native+synthesis.native, f'sigma.sector.tau.{keys[0]}', meta, key, plans)
+                         native+synthesis.native, f'sigma.sector.tau.{keys[0]}', meta, key, plans,
+                         panel_budget=panel if face_green else 0)
     return factory
 
 

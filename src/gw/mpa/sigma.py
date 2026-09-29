@@ -1044,12 +1044,33 @@ class SynthesisTau:
     device buffer, so the accumulator's runner cache retains no factors.
     """
 
-    def __init__(self, spatial, synthesis, right_yr, right_proj, native, stage, meta, key, plans):
+    def __init__(self, spatial, synthesis, right_yr, right_proj, native, stage, meta, key, plans,
+                 *, panel_budget=None):
         self._spatial, self._synthesis = spatial, synthesis
         self._right = (right_yr, right_proj)
         self._native, self._stage, self._meta = native, stage, meta
         self._key, self._plans = key, plans
         self._admitted = False
+        self._held = None
+        #: The per-node Green build's band-panel budget (None: the sigma_kij route's own).
+        self.panel_budget = panel_budget
+
+    @property
+    def stage(self):
+        return self._stage
+
+    @property
+    def right_green(self):
+        """The right Green operand the window arguments supply (``ψ_nmu`` of the right family)."""
+        return self._right[0]
+
+    def hold(self, held, held_bytes):
+        """Supply held Green panels in the faces' place for the rest of this Σ call."""
+        self._held = (held, int(held_bytes))
+
+    def release(self):
+        """Drop the held Green panels at the end of the Σ call."""
+        self._held = None
 
     def window_kernel(self, space):
         """The τ body for ``space``, one function object per static configuration.
@@ -1073,17 +1094,59 @@ class SynthesisTau:
 
     def window_arguments(self, xn, xr, energies, weight, e_ref_a, e_ref_b, space, indices, bounds):
         w_operands = self._synthesis.window_operands(space, indices, bounds)
-        return (xn, self._right[0], xr, self._right[1], energies, weight, w_operands,
+        green = (xn, self._right[0]) if self._held is None else (self._held[0], None)
+        return (*green, xr, self._right[1], energies, weight, w_operands,
                 e_ref_a, e_ref_b)
 
     def admit(self, compiled, arguments):
-        """Reserve the first window executable; the resident factors are the synthesis's stage."""
+        """Reserve the first window executable; the resident factors are the synthesis's stage
+        and held Green panels their own (:func:`_hold_sigma_green_panels`)."""
         if self._admitted:
             return
         counted = sum(int(x.addressable_shards[0].data.nbytes)
                       for x in jax.tree.leaves(self._synthesis.resident_operands()))
+        if self._held is not None:
+            counted += self._held[1]
         _admit(compiled, self._meta, self._stage, native=self._native, counted=counted)
         self._admitted = True
+
+
+def _hold_sigma_green_panels(left_mun, right_nmu, *, mesh_xy, ledger, stage, panel_budget,
+                             pass_shape):
+    """The Σ call's Green ψ panels gathered once (:class:`gw.greens_function_kernel.HeldPanels`), or none.
+
+    Every τ node's Green build gathers the complete band panels of the same two
+    faces (and again for the antiunitary partner); only the band weights
+    change between nodes.  They are held when (a) the per-node build gathers
+    the complete panel (``panel_budget`` holds it), so the held product is the
+    same product, and (b) they fit: a shared-pole map admits them in its
+    CapacityLedger before the gather (INVARIANTS 24); elsewhere
+    :func:`gw.greens_function_kernel.held_panels_fit` prices them beside the
+    τ pass.  Returns ``(held, bytes_per_rank, ledger_stage)``; ``held`` is
+    ``None`` when either fails, and the nodes gather as before.
+    """
+    from gw.greens_function_kernel import held_panel_bytes, held_panels_fit, hold_panels
+    held_bytes, left_bytes = held_panel_bytes(left_mun, right_nmu, mesh=mesh_xy)
+    if not panel_budget or held_bytes > int(panel_budget):
+        return None, 0, None
+    name = None
+    if ledger is not None:
+        live = ledger.live_stages
+        taken = {row.get("stage") for row in ledger.entries}
+        name, n = f"{stage}.green_panels", 1
+        while name in taken:
+            n += 1
+            name = f"{stage}.green_panels.{n}"
+        row = ledger.preview(resident_bytes_per_rank=held_bytes, workspace_bytes_per_rank=0,
+                             concurrent_with=live)
+        if row["device_budget_status"] != "PASS":
+            return None, 0, None
+        ledger.reserve(name, resident_bytes_per_rank=held_bytes, workspace_bytes_per_rank=0,
+                       concurrent_with=live)
+    elif pass_shape is None or not held_panels_fit(
+            **pass_shape, mesh=mesh_xy, held_bytes=held_bytes, left_bytes=left_bytes):
+        return None, 0, None
+    return hold_panels(left_mun, right_nmu, mesh=mesh_xy), held_bytes, name
 
 
 def _integrate_sigma_batches(
@@ -1178,6 +1241,41 @@ def _integrate_sigma_batches(
             tau_kernel = get_shared_sigma_tau_kernel(
                 mesh_xy=mesh_xy, kgrid=kgrid, brackets=brackets,
                 q_wedge=q_wedge, **face_kwargs)
+        # The Green's ψ band panels do not depend on τ: gather them once for
+        # the whole call and hold them (the nodes then only weight them).
+        from distrib_la import mesh_is_cpu
+        from gw.greens_function_kernel import green_panel_bytes
+        green_right = tau_kernel.right_green if synthesis else psi_coh_yr
+        panel_budget = tau_kernel.panel_budget if synthesis else None
+        if panel_budget is None:
+            # The sigma_kij Green build's own budget (face_band_gather_product).
+            panel_budget = (green_panel_bytes(
+                n_rows=k_unfold_plan.n_full,
+                m=int(psi_coh_xn.shape[1]) * int(psi_coh_xn.shape[2]),
+                n=int(green_right.shape[2]) * int(green_right.shape[3]), mesh=mesh_xy)
+                if face_kwargs.get("layout", "face") == "face" and not mesh_is_cpu(mesh_xy)
+                else 0)
+        face_shape = face_kwargs.get("face_shape")
+        ledger = meta.shared_pole_capacity if synthesis else None
+        held, held_bytes, held_stage = _hold_sigma_green_panels(
+            psi_coh_xn, green_right, mesh_xy=mesh_xy, ledger=ledger,
+            stage=(tau_kernel.stage if synthesis else "sigma.tau"),
+            panel_budget=panel_budget,
+            pass_shape=None if face_shape is None else dict(
+                n_parent=int(k_unfold_plan.n_parent), n_rmu=int(face_shape[2]),
+                ns=int(face_shape[3]), n_full=int(np.prod(kgrid)),
+                n_band=int(face_shape[1])))
+        ambient = None
+        if held is not None:
+            if held_stage is not None:
+                ambient = ledger.live_stages
+                ledger.live_stages = (*ambient, held_stage)
+            if synthesis:
+                tau_kernel.hold(held, held_bytes)
+            else:
+                psi_coh_xn, psi_coh_yr = held, None
+            print_fn(f"  Sigma tau: Green psi panels held for the call "
+                     f"({held_bytes / 1e9:.3f} GB/rank)")
         # The residues' carrier on the wedge: the pair-transpose tables with
         # their device load, placed once per run (see ppm_tau_kernel).
         q_pair = (None if q_wedge is None else dataclasses.replace(
@@ -1316,6 +1414,12 @@ def _integrate_sigma_batches(
         del B, B_odd, Omega
         gc.collect()
     progress.finish()
+    # The held panels end with the node loop, before the finalize allocates.
+    if held is not None and synthesis:
+        tau_kernel.release()
+    if ambient is not None:
+        ledger.live_stages = ambient
+    held = psi_coh_xn = psi_coh_yr = tau_arguments = None
 
     fence('tau.finalize', sync_ranks=True)
     with timing.section('tau.finalize'):
