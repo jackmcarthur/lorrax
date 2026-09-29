@@ -301,7 +301,7 @@ def _resident_model_checks(meta, bank, identity, mesh, directory, construct):
     # Refused admission: the file route, unchanged.
     ledger.live_stages = ()
     with mock.patch.object(store.ResidentSectorModel, 'payload_bytes',
-                           staticmethod(lambda *a: int(ledger.limit_bytes_per_rank))):
+                           staticmethod(lambda *a: 1 << 50)):
         refused = construct(bank, bank, meta, config, mesh_xy=mesh,
                             output=directory / "model_refused.h5", residence=rule)
     assert refused['model_residence']['residence'] == 'file', refused['model_residence']

@@ -337,7 +337,7 @@ def _scalar_model_residence(meta, nq, width, *, mesh_xy, root, identity):
     if both["aggregate_bytes_per_rank"] > receipt["half_budget_bytes_per_rank"]:
         receipt["reason"] = "model and one copy exceed half the device budget"
         return None, receipt
-    stage = f"scalar_model.{identity['iteration_id']}"
+    stage = f"scalar_model.{identity['iteration_id']}.{len(ledger.entries)}"
     ledger.reserve(stage, resident_bytes_per_rank=R, workspace_bytes_per_rank=0,
                    concurrent_with=ledger.live_stages)
     receipt.update(residence="device", stage=stage,
