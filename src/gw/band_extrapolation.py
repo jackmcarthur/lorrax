@@ -212,8 +212,8 @@ that deck), the ladder is continued with the SAME Weyl form.  That
 continuation is used ONLY to extend the eigenvalue SEQUENCE; no self-energy,
 no matrix element and no exponent is ever taken from it.
 
-WHAT THE ESTIMATOR IS APPLIED TO, AND WHY THAT NEEDED A RULING.  The fit is
-per external state, so its three combination coefficients ``[−r, 0, 1 + r]``
+WHAT THE ESTIMATOR IS APPLIED TO, AND WHY THAT NEEDED A RULING.  The tail
+ratio r is per external state, so the three combination coefficients ``[−r, 0, 1 + r]``
 carry a ``(nk, nb)`` shape rather than being three scalars.  The Σ object that
 drives the iteration is the full ``(nω, nk, nb, nb)`` cube, whose element
 ``(i, j)`` has TWO external states.  The coefficient applied there is the mean
@@ -2100,7 +2100,7 @@ def static_limit_tail_ruling(
 SPECTRAL_EXTRAP_DATASETS = (
     "sigma_c_extrap_inf_kn_ev",     # Ŝ, the extrapolated Σ_c
     "sigma_c_extrap_last_kn_ev",    # S(N₃), the ordinary full-band Σ_c
-    "sigma_c_extrap_beta_kn",       # β, the per-state exponent (dimensionless)
+    "sigma_c_extrap_beta_kn",       # the pooled β on states with a tail, NaN elsewhere
     "sigma_c_extrap_sigma_kn_ev",   # the p90 uncertainty envelope
 )
 
