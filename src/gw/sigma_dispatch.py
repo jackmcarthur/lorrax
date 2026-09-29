@@ -1238,10 +1238,9 @@ def _compute_mpa_sigma(
         # THE SEMICORE PATCH (gw.qp_support): its samples sit in the grid below
         # the near support and are evaluated at eta_semi; its crossing windows
         # split off at that eta and the patch tolerance (sigma_box_plan).
-        if sector_handle.get("representation") == "sector-ordered-ph":
-            raise ValueError("GATE semicore_patch_route: the semicore patch serves the "
-                             "scalar Sigma route only; sector routes read the near grid")
-        from .qp_support import SEMICORE_PATCH_EPS, patch_eta_ev
+        from .qp_support import (SEMICORE_PATCH_EPS, assert_semicore_patch_route,
+                                 patch_eta_ev)
+        assert_semicore_patch_route(patch, config.compute_mode, wfns_transverse)
         omega_ev = np.asarray(config.omega_grid_ev, dtype=np.float64)
         body_options.update(
             omega_eta_ry=patch_eta_ev(omega_ev, patch, _xi.resolved_ry * RYD_TO_EV) / RYD_TO_EV,

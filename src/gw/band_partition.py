@@ -84,7 +84,7 @@ def band_gaps_ev(energies_ev):
 
 
 def qp_band_cut(energies_ev, *, n_below_k, nval, ncond, mu_ev, clip_ev, cut_gap_ev,
-                cut_search_ev, semicore_gap_ev, omega_max_rel_ev=None):
+                cut_search_ev, semicore_gap_ev, omega_max_rel_ev=None, b_max=None):
     """Absolute band cut from the DFT ladder, decided before the ζ fit (owner, 2026-09-28).
 
     ``energies_ev`` (nk, nb) absolute eV on the loaded k set; ``n_below_k`` the
@@ -103,7 +103,9 @@ def qp_band_cut(energies_ev, *, n_below_k, nval, ncond, mu_ev, clip_ev, cut_gap_
        states it. A gap in the union of all k levels is not enough: the
        number of states below it varies with k. When the need reaches the
        last loaded band, b3 = nb and there is no tail. A boundary that cuts a
-       degenerate multiplet at any k is skipped.
+       degenerate multiplet at any k is skipped. ``b_max`` (the ζ fit's edge,
+       ``zeta_nband``) caps the search: the matrix is the fit's left range, so
+       a need above it refuses (``GATE qp_band_cut_zeta``).
     3. b_semicore: the highest boundary at or below the lowest occupied count
        and below every requested band within the clip whose gap is at least
        ``semicore_gap_ev``; 0 when there is none.
@@ -134,10 +136,17 @@ def qp_band_cut(energies_ev, *, n_below_k, nval, ncond, mu_ev, clip_ev, cut_gap_
     from common.band_degeneracy import DEGENERACY_TOL_RY, boundary_min_gaps
     from common.units import RYD_TO_EV
     clean = boundary_min_gaps(e / RYD_TO_EV, is_full_spectrum=True) > DEGENERACY_TOL_RY
-    bounds = np.arange(n_min, nb)
+    cap = nb if b_max is None else min(int(b_max), nb)
+    if n_min > cap:
+        raise ValueError(
+            f"GATE qp_band_cut_zeta: the QP matrix must hold bands [0, {n_min}) (every "
+            f"occupied state, every requested state within mu +- {float(clip_ev):g} eV and "
+            f"every state below omega_max) but the zeta fit ends at band {cap}.  Raise "
+            "zeta_nband (or number_bands), or lower ncond / sigma_omega_max_ev.")
+    bounds = np.arange(n_min, cap)
     bounds = bounds[clean[bounds]]
-    if n_min >= nb or bounds.size == 0:
-        b3 = nb
+    if n_min >= cap or bounds.size == 0:
+        b3 = cap
     else:
         w = width[bounds - 1]
         opens = gap_lo[bounds - 1] < top + float(cut_search_ev)

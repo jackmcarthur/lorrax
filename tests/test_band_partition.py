@@ -133,3 +133,13 @@ def test_band_cut_holds_every_state_below_omega_max():
     e = np.array([row])
     assert _cut(e).b3 == 5
     assert _cut(e, omega_max_rel_ev=9.5).b3 == 7
+
+
+def test_band_cut_is_capped_at_the_zeta_fit_edge_and_refuses_a_need_above_it():
+    import pytest
+    row = [-30.0, -3.0, -1.0, 1.0, 2.0, 2.5, 4.0, 4.1, 4.2]
+    e = np.array([row])
+    assert _cut(e).b3 == 6
+    assert _cut(e, b_max=5).b3 == 5          # capped: the matrix is the fit's left range
+    with pytest.raises(ValueError, match="GATE qp_band_cut_zeta"):
+        _cut(e, b_max=4)                     # the need reaches band 5

@@ -23,7 +23,7 @@ The last section documents a different input file, the `[downfold]` deck.
 | key | type | default | meaning |
 |---|---|---|---|
 | `nval` | int | `5` | Valence edge of the Σ window: b1 = nelec − nval. It sets the ISDF pair-density right window, not the bottom of the QP window. |
-| `ncond` | int | `5` | Conduction bands in the Σ/QP window. Σ diagonals are computed for bands [0, nelec + ncond). |
+| `ncond` | int | `5` | Conduction bands in the Σ/QP window. Σ diagonals are computed for bands [0, nelec + ncond). On a dynamic self-consistent run (`qp_solver = self_consistent`) it only marks the requested states: the QP matrix is [0, b3) with b3 from the absolute band cut (`QP band cut` in the log; [self-consistency §2](self_consistency.md#2-band-treatment)), which may land above or below nelec + ncond. Requested states above the cut are scissored tail, counted in that log line. |
 | `number_bands` | int | `100` | Umbrella band count. It sets both the χ0/W band sum and the Σ band sum. |
 | `number_bands_chi` | int | unset (= `number_bands`) | Band count of the χ0/W sum. Its edge takes a strict `band_degeneracy` check and refuses on a split multiplet (`LORRAX_BAND_DEGENERACY=snap` warns instead). Setting it and `number_bands` to different values refuses. Changing it on `restart = true` refuses. |
 | `number_bands_sigma` | int | unset (= `number_bands`) | Band count of the Σ sum; the band-extrapolation brackets are fractions of this count. It has the same strict degeneracy check and the same conflict refusal as `number_bands_chi`. It may change on `restart = true`, because no restart tensor depends on it. |

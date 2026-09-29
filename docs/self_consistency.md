@@ -137,9 +137,10 @@ state, every requested (`nval`/`ncond`) state within $\mu \pm 10$ eV and
 every state below `sigma_omega_max_ev`, moved up to the first band gap of at
 least $4\eta$ within $20\eta$, else to the boundary with the least overlap,
 never inside a degenerate multiplet; a metal's frame is the deck's fixed-N
-smearing $\mu$. The QP matrix is the ζ fit's left range, and a `zeta_nband`
-below b3 refuses (`GATE qp_matrix_zeta_left`): a state outside the fit would
-carry Σ on unfitted pairs. Above $E_F$ a dispersive ladder has no band gap
+smearing $\mu$. The search stops at `zeta_nband`, and a need above it refuses
+(`GATE qp_band_cut_zeta`). The QP matrix is the ζ fit's left range, and a
+`zeta_nband` below b3 refuses on every route (`GATE qp_matrix_zeta_left`): a
+state outside the fit would carry Σ on unfitted pairs. Above $E_F$ a dispersive ladder has no band gap
 (Si 4³, Fe 4³, Na 8³), so the matrix's top band overlaps the tail at other k;
 the cost is the dropped Σ coupling to those tail bands (TWOCLASS, CLAIMS
 2945).
@@ -147,8 +148,15 @@ the cost is the dropped Σ coupling to those tail bands (TWOCLASS, CLAIMS
 **Semicore.** An occupied band below a band gap of at least 4 eV (all k) is
 semicore. It stays in the matrix and mixes fully, but its Σ is read on one
 patch of the grid below the near support, at $\eta_{\rm semi}$ = 1 eV,
-sampled at $\eta_{\rm semi}/2$ and certified at $10^{-2}$
-(`qp_support.SEMICORE_*`). The patch is planned at map 0 over the semicore
+sampled at $\eta_{\rm semi}/2$ (`qp_support.SEMICORE_*`). Only the crossing
+windows that own patch samples take $\eta_{\rm semi}$; the sign-definite
+windows serve those samples at the deck $\eta$, where the node count barely
+depends on $\eta$. The crossing windows are certified at $10^{-2}$, an owner
+call not yet settled (a second ε beside `sigma_quadrature_eps`): against
+$10^{-4}$ on Fe 4³ charge SC it biases the semicore QP by +20 to +32 meV
+(mean), moves the ±10 eV states by up to 8 meV at map 2 (the first Anderson
+step) and 0.44 meV at the fixed point, while $10^{-4}$ costs 1095 against 964
+τ pairs per map, over the 1000-pair metal budget (CLAIMS 2952). The patch is planned at map 0 over the semicore
 DFT energies with the plan's 2 eV pad and held; a semicore read that leaves
 it extends it, as the near support is extended. At the deck $\eta$ the Fe 3s
 $Z$ leaves $(0, 1]$ from map 1 and the loop stalls; at 1 eV every semicore
