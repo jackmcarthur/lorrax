@@ -171,7 +171,7 @@ def test_the_solved_announcement_says_when_the_target_was_missed():
         nodes=np.ones(3), weights=np.ones(3), family="crossing",
         target="hgl", range_param="A_dim", range_value=20.0,
         error_bound=1.0e-6, max_error=3.0e-6, kappa0=None, kappa1=None,
-        provenance=runtime_provenance("x", "numpy"))
+        provenance=runtime_provenance(np.ones(3), np.ones(3)))
     door._SERVE_ANNOUNCED.clear()
     with warnings.catch_warnings(record=True) as caught:
         warnings.simplefilter("always")
