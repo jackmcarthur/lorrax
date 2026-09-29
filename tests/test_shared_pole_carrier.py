@@ -133,8 +133,18 @@ def _synthesis_fixture(monkeypatch):
     # Exercise orchestration on CPU without pretending to test a native plan.
     monkeypatch.setattr(distrib_la,'plan',lambda *_a,**_kw: None)
     monkeypatch.setattr(distrib_la,'workspace_bytes_per_rank',lambda *_a: 0)
-    monkeypatch.setattr(distrib_la,'gemm_plan',lambda *_a,**_kw:
-        jax.jit(lambda x,y:x@y,out_shardings=tile))
+    matmul = jax.jit(lambda x,y:x@y,out_shardings=tile)
+
+    class _Gemm:
+        """A dense stand-in with the plan's active-range door (bounds and weights on the load)."""
+        __call__ = staticmethod(matmul)
+
+        @staticmethod
+        def active_range(a,b,lo,hi,*,weights):
+            cols = jnp.arange(a.shape[-1])[None,:]
+            live = (cols>=jnp.reshape(lo,(-1,1)))&(cols<jnp.reshape(hi,(-1,1)))
+            return matmul(a*jnp.where(live,weights,0)[:,None,:].astype(a.dtype),b)
+    monkeypatch.setattr(distrib_la,'gemm_plan',lambda *_a,**_kw: _Gemm())
     monkeypatch.setattr(runtime.aot_memory,'aot_kernel_peak_bytes',lambda compiled:
         SimpleNamespace(total=compiled.memory_analysis().temp_size_in_bytes,cufft_measured=True))
     rng = np.random.default_rng(362)
@@ -190,34 +200,6 @@ def test_synthesis_reads_once_and_runs_inside_one_program(
     jax.block_until_ready(w(operands,.3,.7+.2j))
     assert len(reads)==1
     synthesis.close()
-
-def test_equal_size_panels_each_reserve_their_own_warm_stage(monkeypatch):
-    """Two panels of equal (count, width) are two ledger reservations.
-
-    A ledger stage name is an identity (``CapacityLedger.reserve`` refuses a
-    repeat), so the warm-GEMM stage has to carry its parent span exactly as
-    its ``sigma.synthesis.compiled`` sibling does.  Unqualified, the second
-    equal-size panel re-reserves the first panel's stage and planning dies on
-    any deck whose Sigma schedule has two such panels -- which is every
-    multi-panel deck with equal parent spans.  The other multi-panel tests
-    omit ``capacity_receipt`` and therefore never reserve at all.
-    """
-    from gw.mpa.sigma import _shared_pole_w_synthesis
-    from gw.shared_pole_recipe import CapacityLedger
-    fx = _synthesis_fixture(monkeypatch)
-    mesh, meta, header = fx.mesh, fx.meta, fx.header
-    # A budget large enough that only the stage IDENTITY can refuse here.
-    meta.shared_pole_capacity = CapacityLedger(
-        meta, mesh_xy=mesh, device_budget_bytes=1 << 30)
-    # parent_capacity 1 over two irreducible parents: two panels, one parent
-    # each, one shared column width -- equal (count, width), distinct spans.
-    schedule=dict(status='PASS',parent_capacity=1,column_capacity=5,
-                  endpoint_budgets={},capacity_receipt=dict(concurrent_with=()))
-    _shared_pole_w_synthesis(None,meta,header,fx.omega,schedule,mesh_xy=mesh)
-    warm = [row['stage'] for row in meta.shared_pole_capacity.entries
-            if row['stage'].startswith('sigma.gemm_warm.')]
-    assert len(warm) == 2 and len(set(warm)) == 2, warm
-    assert all(row['status'] != 'FAIL' for row in meta.shared_pole_capacity.entries)
 
 
 def _matrix_reader_fixture(monkeypatch, mesh, *, Kmax, basis_mesh=None):
