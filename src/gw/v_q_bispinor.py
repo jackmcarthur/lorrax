@@ -311,7 +311,8 @@ def _make_per_q_v_builder_for_tile(
     scalar V carries at q ≠ 0: the mini-BZ average ``⟨v⟩`` at every argmin
     ``|q+G|`` slot.  The CC tile takes it as the scalar V does; a TT tile
     takes ``⟨v⟩ P^T(K̂)``, which keeps the trace (``tr P^T = 2``) of the
-    tensor average ``⟨v P^T⟩`` exactly.
+    tensor average ``⟨v P^T⟩`` exactly but not its anisotropy (the
+    traceless part is taken at the cell's point direction ``K̂``).
 
     The ``K̂`` factor uses ``K2_safe = max(|q+G|², eps_K2)`` to keep
     the per-q-Γ slot finite; at K=0 the bare ``v`` is already zero
