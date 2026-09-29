@@ -9,6 +9,8 @@ in the order a user runs them:
            -> gwjax shared-pole QSGW (2 maps) -> BSE -> htransform
            -> exciton bands -> restarted: COHSEX, GN-PPM SC (1 map),
               shared-pole one-shot with W and pole exports
+           -> bispinor kin_ion -> four-current shared-pole one-shot
+           -> restarted: four-current shared-pole QSGW (2 maps)
 
 Each stage is then checked against the stored outputs in ``reference/``
 (eqp columns, numeric members of the written h5 files, solver outputs)
@@ -191,6 +193,49 @@ write_w = true
 write_poles = true
 """),
 }
+
+# The four-current route, last in the chain: its fresh bispinor zeta fit
+# rewrites the tmp/ restart the scalar restarted steps read.  SP-full
+# (bispinor_gw = full_shared_pole: ordered CC/CT/TC/TT sector poles, direct
+# four-current Gamma head) one-shot with its own kinetic-balance kin_ion,
+# then the same route through the SC driver for two maps, restarted from
+# the one-shot's zeta and V(q), with the per-map head (dft_velocity) and the
+# live four-current density (density_self_consistent, required).
+_BISP_COMMON = """bispinor = true
+bispinor_gw = full_shared_pole
+compute_mode = mpa
+sigma_w_model = shared_pole
+head_correction = no_local_fields
+mpa_n_poles = 2
+sigma_regularization_ev = 0.25
+linalg = local
+"""
+
+
+def _bisp_deck(prefix, body):
+    return (_DECK_COMMON.replace("bispinor = false\n", "")
+            .replace("kin_ion_file = kin_ion.h5", "kin_ion_file = kin_ion_bisp.h5")
+            + _BISP_COMMON + body + f"""\
+sigma_diag_file = {prefix}_sigma.dat
+eqp0_file = {prefix}_eqp0.dat
+eqp1_file = {prefix}_eqp1.dat
+report_file = {prefix}.out
+sigma_omega_h5_file = {prefix}_sigma.h5
+""")
+
+
+RESTART_DECKS.update({
+    "bisp_os.in": _bisp_deck("bos", """restart = false
+qp_solver = one_shot_dft
+"""),
+    "bisp_sc.in": _bisp_deck("bsc", """restart = true
+qp_solver = self_consistent
+sc_max_iter = 2
+sc_tol_ev = 1.5
+sc_head_update = dft_velocity
+density_self_consistent = true
+"""),
+})
 _P = ["--px", _SIDE, "--py", _SIDE]
 
 # (name, module, argv, deck name -> template).  The decks are written into
@@ -226,6 +271,9 @@ STAGES = (
     ("cohsex", "gw.gw_jax", ["-i", "cohsex.in"]),
     ("gnppm_sc", "gw.gw_jax", ["-i", "gnppm_sc.in"]),
     ("sp_export", "gw.gw_jax", ["-i", "sp_export.in"]),
+    ("kin_ion_bisp", "gw.kin_ion_io", ["-i", "bisp_os.in"]),
+    ("bisp_oneshot", "gw.gw_jax", ["-i", "bisp_os.in"]),
+    ("bisp_sc", "gw.gw_jax", ["-i", "bisp_sc.in"]),
 )
 
 # What each stage leaves behind and how it is compared.
@@ -254,6 +302,13 @@ CHECKS = {
     "sp_export": {"eqp": ["spx_eqp0.dat", "spx_eqp1.dat"],
                   "h5": ["spx_sigma.h5", "tmp/mpa/oneshot_w.h5"],
                   "shapes": ["tmp/mpa/oneshot_poles.h5"]},
+    "kin_ion_bisp": {"h5": ["kin_ion_bisp.h5"]},
+    "bisp_oneshot": {"eqp": ["bos_eqp0.dat", "bos_eqp1.dat"],
+                     "h5": ["bos_sigma.h5"]},
+    "bisp_sc": {"eqp": ["bsc_eqp0.dat", "bsc_eqp1.dat"],
+                "h5": ["bsc_sigma.h5"],
+                "report_floats": ("bsc.out",
+                                  r"SC iteration: call=\d+ .*?max\|dE\|=([0-9.e+-]+)")},
 }
 
 
