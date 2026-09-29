@@ -10,22 +10,20 @@ import jax.numpy as jnp
 from common.contract_bands import merge_spin_centroid
 
 
-def face_band_gather_product(A, B, mesh, phases, band_range, n_full=None):
-    """``A·diag(w)·B`` on band-distributed faces by gathered band panels.
+def face_green_product(A, B, mesh, phases, band_range, n_full=None):
+    """``A·diag(w)·B`` on band-distributed faces by the 2-D distributed GEMM.
 
     ``A`` ``(nq, M, N_b)`` and ``B`` ``(nq, N_b, N)`` are both
     ``P(None,'x','y')``.  ``w`` is the phase row, zero outside the per-row
-    ``band_range``.  ``distrib_la.panel_matmul`` all-gathers the band panels
-    (A over y, B over x) and multiplies them locally into the rank's own
-    output tile, so no reduction follows; the local product runs only over
-    each row's ``band_range`` (the local active-range GEMM).  Every Green-building stage
-    reserves one full-k Green tile, ``16·N_k·(M/p_x)·(N/p_y)`` bytes
+    ``band_range``.  ``distrib_la.panel_matmul`` runs a batched SUMMA: band
+    panels of at most ``N_b/p`` columns are all-gathered (A over y, B over
+    x), every k in each exchange and each local GEMM, and multiplied into the
+    rank's own output tile, so no reduction follows and no rank holds a
+    band-complete panel.  Each panel's local product runs only over the
+    rows' ``band_range`` (the local active-range GEMM).  The two live panels
+    are bounded by one full-k Green tile, ``16·N_k·(M/p_x)·(N/p_y)`` bytes
     (``N_k = n_full``, the parents' full zone; ``nq`` when the faces are
-    already at full k), for these transient panels, so the panel count is
-    derived from that reservation: one panel, the complete band extent
-    (every band on every rank, for this call only), when it fits; otherwise
-    interleaved band chunks, two live at a time (one prefetched), sized so
-    that pair fits the tile.  Nothing band-complete outlives the call.
+    already at full k), which every Green-building stage reserves.
     """
     from distrib_la import panel_matmul
 
@@ -103,7 +101,7 @@ def _build_G_face(psi_mun, psi_nmu, *, gemm, Gij=None, phases=None, mesh=None,
         G_flat = prepared_active_gemm(A, B, weights=phases)
     elif getattr(gemm, "backend", "local") != "local":
         # A already carries the phases when there is no band range (above).
-        G_flat = face_band_gather_product(
+        G_flat = face_green_product(
             A, B, gemm.mesh, None if band_range is None else phases, band_range,
             n_full=n_full)
     else:
@@ -418,11 +416,12 @@ def _over_room(what, need, room):
 
 def _green_terms(*, n_parent, n_rmu, ns, n_band, mesh):
     """(T_p, M_axis): one parent Green tile ``16·n_parent·ns²·μ²/P``, and one Green build's
-    band-complete panels of both ψ orientations ``16·n_parent·ns·μ·N_b·(1/p_x + 1/p_y)``
-    (``face_band_gather_product``), per rank."""
+    two live SUMMA panels of both ψ orientations, at most ``N_b/p_x`` bands each,
+    ``2·16·n_parent·ns·μ·(N_b/p_x)·(1/p_x + 1/p_y)`` (``face_green_product``), per rank."""
     px, py = int(mesh.shape['x']), int(mesh.shape['y'])
     tile = 16.0 * int(n_parent) * int(ns) ** 2 * int(n_rmu) ** 2 / (px * py)
-    panels = 16.0 * int(n_parent) * int(ns) * int(n_rmu) * int(n_band) * (1.0 / px + 1.0 / py)
+    panels = (32.0 * int(n_parent) * int(ns) * int(n_rmu) * (int(n_band) / px)
+              * (1.0 / px + 1.0 / py))
     return tile, panels
 
 

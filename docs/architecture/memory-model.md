@@ -88,13 +88,13 @@ and then spend the GW feasibility floor (`4·G_tile`) on wavefunctions. For
 
 (`M_axis` in `G_tile`; `M_face = 0.2·s/n_s` at every P.)
 
-A Green build `G = ψ·diag(f)·ψ†` on faces all-gathers its band panels (`A`
-over `y`, `B` over `x`, `distrib_la.panel_matmul`) and multiplies them into
-the rank's own tile, so no reduction follows. Every Green-building stage
-reserves one full-k Green tile for these transient panels, and the panel
-count follows from that reservation: one panel, the complete band extent,
-when `M_axis ≤ G_tile`; interleaved band chunks, two live at a time with the
-next prefetched, otherwise. The Σ projector `ψ†·O·ψ` reshards the two
+A Green build `G = ψ·diag(f)·ψ†` on faces is a batched 2-D SUMMA
+(`distrib_la.panel_matmul`): band panels of at most `N_b/p` columns are
+all-gathered (`A` over `y`, `B` over `x`), every k in each exchange, and
+multiplied into the rank's own tile, so no reduction follows and no rank holds
+a band-complete panel. Two panels are live, the next prefetched; every
+Green-building stage reserves one full-k Green tile, which bounds them.
+The Σ projector `ψ†·O·ψ` reshards the two
 projected-band ψ faces to the band-complete orientation for the call and
 contracts each `(μ_x, ν_y)` slab locally, so the μ-sized operator never
 moves; its transient is `M_axis` at the projected band count.

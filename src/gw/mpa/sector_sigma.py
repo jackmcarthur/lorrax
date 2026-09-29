@@ -135,9 +135,9 @@ def sector_tau_factory(left, right, keys, meta, mesh_xy):
             _native_workspace(mesh_xy,(((q,m,k),(q,k,n)),)))
     ledger = meta.shared_pole_capacity
     warm = 2*16*q*(m*k+k*n+m*n)//mesh_xy.size + native
-    # The face Green's band panels: one parent Green tile when the ledger's room
-    # beside the warm workspace holds it (the whole band extent in one gather),
-    # else what the room holds (greens_function_kernel.green_panel_bytes).
+    # The face Green's SUMMA band panels (distrib_la.panel_matmul, at most N_b/p
+    # bands each): one parent Green tile when the ledger's room beside the warm
+    # workspace holds it, else what the room holds (green_panel_bytes).
     panel = (green_panel_bytes(n_rows=q, m=m, n=n, mesh=mesh_xy,
                                room=ledger.room_bytes_per_rank(ledger.live_stages) - warm)
              if face_green else 0)

@@ -56,7 +56,7 @@ SLATE: [Perlmutter §2](../environment/machines/perlmutter.md#2-the-lorrax_a-mod
 | `dispatch_batched_eigh(A, mesh, backend='distributed', *, batched_route='batch_reshard')` | `plan('eigh', …).batched(A)` for `gw.qsgw_density`. |
 | `matmul(A, B, C=None, *, mesh, alpha=1, beta=0, transa='N', transb='N', backend='auto', batched_route='batch_reshard', budget_bytes=None)`, `resolve_matmul_backend` | Distributed GEMM, § [matmul](#matmul). |
 | `gemm_plan(...) -> GemmPlan`, `local_gemm_plan(...)` | Resolve-once N,N GEMM for hot loops, § [Planned GEMM](#planned-gemm). |
-| `panel_matmul(A, B, *, mesh, panel_bytes)` | Face GEMM with bounded contraction panels, § [Bounded face products](#bounded-face-products). |
+| `panel_matmul(A, B, *, mesh, panel_bytes, bounds=None)` | Batched 2-D SUMMA face GEMM with bounded contraction panels, § [Bounded face products](#bounded-face-products). |
 | `contract_faces(b_X, b_Y, weights, start, stop, *, mesh, return_transpose=False)` | `(b_X·w) @ b_Yᴴ` for row faces `[b,m,K]` at `P(None,'x',None)` / `P(None,'y',None)` (or `[b,μ,s,K]`, spin merged into μ) with replicated weights `[b,K]` and interval `[start,stop)`; output `[b,m,m]` at `P(None,'x','y')`. Local GEMMs only, no collective, no provider. |
 | `polar_factor`, `plan_polar_factor`, `PolarPlan` | Square polar factor / SVD, § [Polar factor](#polar-factor-and-spectral-directions). |
 | `right_singular_vectors`, `leading_eigenvectors`, `retain_leading_eigenvectors` | Eager spectral-direction selection on face or batch-layout stacks, § [Polar factor](#polar-factor-and-spectral-directions). |
@@ -410,15 +410,23 @@ boundary: `ceil(B/P)` whole matrices plus their RHS blocks per rank.
 
 ## Bounded face products
 
-`panel_matmul(A, B, *, mesh, panel_bytes)` forms `A @ B` by broadcasting
-contraction panels inside a `shard_map` scan. `A` is `[q,m,k]` at
+`panel_matmul(A, B, *, mesh, panel_bytes, bounds=None)` forms `A @ B` as a
+batched 2-D SUMMA inside one `shard_map`. `A` is `[q,m,k]` at
 `P(None,'x','y')`; `B` is `[q,k,n]` in the same layout or `[q,s,k,n]` at
 `P(None,None,'x','y')`, in which case each A panel is broadcast once outside
-the sample loop. Output faces keep both mesh axes; no complete row or column
-is gathered. The service picks a contraction width dividing both shard
-extents with `itemsize·q·width·(m/Px + n/Py) ≤ panel_bytes`. That bounds the
-operand panels only: the caller admits input/output faces, compiled
-temporaries (`memory_analysis()`) and provider workspace.
+the sample loop. On a square mesh each panel takes `w` local columns of every
+owner block (one all-gather per operand, `p·w ≤ k/p` columns, every batch row
+in the same exchange and the same local GEMM); the next panel is gathered
+before the current one is multiplied. Output faces keep both mesh axes; no
+rank holds a band-complete row or column panel. `w` divides `k/p` with
+`itemsize·q·2·p·w·(m/Px + n/Py) ≤ panel_bytes`. Optional replicated
+`bounds` `(q,2)` name each row's live contraction interval (the caller has
+zeroed the rest): each panel's local product runs over that interval's one
+contiguous run of panel columns (the local active-range GEMM), so dead bands
+cost no flops. Rectangular meshes and the sample axis stream owner panels by
+masked `psum` and contract every column. The budget bounds the operand panels
+only: the caller admits input/output faces, compiled temporaries
+(`memory_analysis()`) and provider workspace.
 
 ## Face-pinned block glue
 
