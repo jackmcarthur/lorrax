@@ -3489,10 +3489,15 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
     semicore_pin, energies_read_loop, E_read_full = None, energies_loop, E_full
     if inputs.config.sc.semicore == "dft":
         semicore_pin = np.array(_sc_coarse_identities(inputs, energies_loop.shape))
-        if not semicore_pin.any():
+        if not semicore_pin.any() and getattr(inputs.config.sc, "semicore_explicit", False):
             raise ValueError(
                 "GATE sc_semicore: sc_semicore = dft pins the coarse (semicore) class "
                 "of the scalar MPA/shared-pole route, and this run has none.")
+    if semicore_pin is not None and not semicore_pin.any():
+        # the default with no coarse class (static modes, sector routes, an
+        # nval that covers every occupied band): nothing to pin
+        semicore_pin = None
+    if semicore_pin is not None:
         e_dft_loop_ry = np.asarray(
             inputs.e_dft_active_kn_ry if ks.is_identity
             else ks.select(inputs.e_dft_active_kn_ry), dtype=np.float64)
@@ -4756,7 +4761,12 @@ def _sc_record_far_gamma(inputs, state, state_out, indices_loop):
     lo = np.take_along_axis(im, (j - 1)[None], axis=0)[0]
     hi = np.take_along_axis(im, j[None], axis=0)[0]
     gamma = np.abs((1.0 - t) * lo + t * hi)
-    gamma = np.take_along_axis(gamma, np.asarray(indices_loop), axis=1)
+    # The SC map's Sigma result is on the loop k-set (sigma_result_on_kset,
+    # as _sc_z_factors reads it); a full-BZ table is moved to it here.
+    idx = np.asarray(indices_loop)
+    if gamma.shape[0] != idx.shape[0]:
+        gamma = np.asarray(_kstar(inputs).select(gamma))
+    gamma = np.take_along_axis(gamma, idx, axis=1)
     session["far_gamma_kn"] = gamma
     # one planned re-plan at map 1: the far class leaves the near grid
     session.pop("window_plan", None)
