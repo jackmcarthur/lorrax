@@ -83,7 +83,7 @@ def _layout_spec(layout, ndim):
     return P(*((None,) * (ndim - 2)), 'x', 'y')
 
 
-def _direction_input(W, eig):
+def _direction_input(W, eig, real_rows=None):
     """Validate a direction operand; return its layout, ``'face'`` or ``'batch'``."""
     if isinstance(W, jax.core.Tracer):
         raise ValueError("spectral direction selection is an eager construction stage")
@@ -92,10 +92,18 @@ def _direction_input(W, eig):
     _validate_dtype(W.dtype)
     if eig.op != 'eigh' or eig.n not in (None, W.shape[-1]):
         raise ValueError("eigh_plan must match the matrix extent")
-    if W.sharding.is_equivalent_to(NamedSharding(eig.mesh, _layout_spec('face', W.ndim)), W.ndim):
+    face = W.sharding.is_equivalent_to(
+        NamedSharding(eig.mesh, _layout_spec('face', W.ndim)), W.ndim)
+    batch = W.ndim >= 3 and W.sharding.is_equivalent_to(
+        NamedSharding(eig.mesh, _layout_spec('batch', W.ndim)), W.ndim)
+    if face and batch:
+        # One device (P1) holds both layouts, so placement cannot tell them
+        # apart. ``real_rows`` exists only for a batch stack, so a caller
+        # that passes it has declared the batch layout.
+        return 'batch' if real_rows is not None else 'face'
+    if face:
         return 'face'
-    if W.ndim >= 3 and W.sharding.is_equivalent_to(
-            NamedSharding(eig.mesh, _layout_spec('batch', W.ndim)), W.ndim):
+    if batch:
         return 'batch'
     raise ValueError("spectral directions require W face-tiled over x/y or in batch layout "
                      "P(('x','y'),None,...)")
@@ -386,7 +394,7 @@ def right_singular_vectors(W, tau, *, eigh_plan, column_extent,
         b0*...*bk rows: Q[b0,...,bk,m,max(r_padded)] keeps the leading axes
         and the spectra nest as tuples in the same order.
     """
-    layout = _direction_input(W, eigh_plan)
+    layout = _direction_input(W, eigh_plan, real_rows)
     tau = _as_rcond(tau)
     if tau is None:
         raise ValueError("tau must be an explicit relative cutoff")
@@ -433,7 +441,7 @@ def leading_eigenvectors(W, r, *, eigh_plan, column_extent,
     is also bounded by the positive spectrum above ``rcond * max(abs(values))``
     before multiplet closure; eigenvalues themselves are never changed.
     """
-    layout = _direction_input(W, eigh_plan)
+    layout = _direction_input(W, eigh_plan, real_rows)
     rcond = _as_rcond(rcond)
     if isinstance(r, (tuple, list, np.ndarray)):
         # One width per row of the flattened batch; 0 retains nothing for that row.
