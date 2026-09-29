@@ -2668,7 +2668,8 @@ def _sc_sampled_support(inputs, partition, energies_loop, mu_ev):
             sigma, stack(energy, probe), tile(states),
             semicore_energy_rel_ev=stack(e_dft, probe),
             semicore_kn=tile(semicore) if far_route and semicore.any() else None,
-            semicore_pad_ev=derived_pad_ev(e_dft, probe, semicore))
+            semicore_pad_ev=derived_pad_ev(e_dft, probe, semicore),
+            **_study_eta_semi())
         grid, envelope = plan.grid_ev, plan.envelope_ev
         event = ("one-shot" if session is None else "plan" if probe is None
                  else "plan from DFT + map-0 probe")
@@ -2706,6 +2707,14 @@ def _sc_sampled_support(inputs, partition, energies_loop, mu_ev):
     near_read = states | zero_read | (semicore & in_grid)
     return SCSupport(deck, grid, energy, states, event, envelope, outside, plan,
                      near_read, semi_far, zero_read)
+
+
+def _study_eta_semi():
+    """STUDY ONLY (TWOCLASS, not for landing): TWOCLASS_ETA_SEMI=deck|<eV>."""
+    v = os.environ.get("TWOCLASS_ETA_SEMI")
+    if not v:
+        return {}
+    return {"semicore_eta_ev": None if v == "deck" else float(v)}
 
 
 def _sc_semicore_loop(inputs, shape):

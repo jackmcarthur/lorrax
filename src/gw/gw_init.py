@@ -3346,6 +3346,13 @@ def qp_band_cut_for_deck(config, wfn, print0):
         clip_ev=WINDOW_CLIP_EV, cut_gap_ev=CUT_GAP_ETAS * eta,
         cut_search_ev=CUT_SEARCH_ETAS * eta, semicore_gap_ev=SEMICORE_GAP_EV,
         omega_max_rel_ev=config.sigma.omega_max_ev)
+    import os
+    if os.environ.get("TWOCLASS_B3"):      # STUDY ONLY (TWOCLASS cut height), not for landing
+        from .band_partition import band_gaps_ev
+        b3 = int(os.environ["TWOCLASS_B3"])
+        lo, hi = band_gaps_ev(e)
+        gap = (float(lo[b3 - 1]), float(hi[b3 - 1])) if b3 < e.shape[1] else (float(e[:, -1].max()), np.inf)
+        cut = cut._replace(b3=b3, gap_ev=gap, cut_ev=0.5 * (gap[0] + gap[1]))
     width = cut.gap_ev[1] - cut.gap_ev[0]
     print0(f"  QP band cut (absolute, from the DFT ladder about mu={mu:+.4f} eV): "
            f"QP matrix = zeta left = bands 1-{cut.b3}; tail {cut.b3 + 1}-{int(config.nband)} "
