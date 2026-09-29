@@ -1540,6 +1540,7 @@ class SpectralShellFit:
     fit_seconds: float            # wall of fit + apply
     ladder: BandLadder
     shells: tuple                 # ((lo,hi), (lo,hi), (lo,hi)) ABSOLUTE
+    held: bool = False            # (β, Ω) held from an earlier SC map, not refitted
 
     @property
     def n_failed(self) -> int:
@@ -1663,7 +1664,7 @@ def _pooled_shell_grid(ladder: BandLadder, a1: int, a2: int, a3: int,
 
 def fit_band_extrapolation_spectral(
     counts, s_at_counts: np.ndarray, ladder: BandLadder, *,
-    e_state_ev, fit_mask=None,
+    e_state_ev, fit_mask=None, held=None,
 ) -> SpectralShellFit:
     """The pooled denominator-shell estimator over three points.
 
@@ -1682,6 +1683,12 @@ def fit_band_extrapolation_spectral(
     fit_mask : bool array of the trailing shape, optional
         The states (β, Ω) is pooled over.  Default: every state (the run's
         QP evaluation window is its requested set).
+    held : (β, Ω) or None
+        A pooled pair from an earlier map of the same SC run.  Given, the grid
+        is not searched: r_i then depends only on the DFT ladder and E_i, so
+        the extrapolation is the same linear map on Σ at every SC map.  A grid
+        argmin re-selected per map would jump between grid points and inject
+        a discontinuity into the fixed-point map.
 
     The model (module docstring, POOLED DENOMINATOR SHELL): band A adds
     ``a_i · Σ_k w_k (E_Ak − E_i + Ω)^(−β)`` to state i, with ONE (β, Ω) pooled
@@ -1733,7 +1740,10 @@ def fit_band_extrapolation_spectral(
     # The pooled set: requested states below every band of the shells at
     # Ω = 0, so each one is in the model's domain at every grid point.
     fit = pool & (e < floor)
-    if fit.any():
+    if held is not None:
+        beta, omega = (float(v) for v in held)
+        rms = float("nan")
+    elif fit.any():
         beta, omega, rms = _pooled_shell_grid(
             ladder, a1, a2, a3, e[fit], y1[fit], y2[fit], y3[fit])
     else:
@@ -1775,6 +1785,7 @@ def fit_band_extrapolation_spectral(
         fit_seconds=float(time.perf_counter() - t0),
         ladder=ladder,
         shells=shells,
+        held=held is not None,
     )
 
 
@@ -1795,6 +1806,9 @@ def spectral_trust_verdict(fit: SpectralShellFit) -> str:
         edge.append(f"Omega at its bound {fit.omega_ev:g} eV")
     no_tail = (f"  {fit.n_failed} of {fit.n_states} states have no tail and "
                f"keep S(N3)." if fit.n_failed else "")
+    if fit.held:
+        return (f"pooled beta = {fit.beta:.2f}, Omega = {fit.omega_ev:.1f} eV "
+                f"held from SC map 0; apply {fit.fit_seconds:.3f} s.{no_tail}")
     return (f"pooled beta = {fit.beta:.2f}, Omega = {fit.omega_ev:.1f} eV over "
             f"{int(np.count_nonzero(fit.fit_mask))} states; rms middle-point "
             f"residual {fit.residual_ev * 1e3:.3f} meV"

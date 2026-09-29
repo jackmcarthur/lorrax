@@ -330,6 +330,7 @@ def _extrapolated_point(cube, weights):
 def _report_band_extrapolation(
     sigma_omega, head_sigma_diag_w_kn_ry, *,
     plan, config, band_slices, wfn, sym, meta, mesh_xy, print_fn,
+    held_session=None,
 ) -> dict:
     """Log the three band-count Σ_c's, the fit and its diagnostics.
 
@@ -405,8 +406,15 @@ def _report_band_extrapolation(
     # The pooled (beta, Omega) fit reads each external state's DFT energy on
     # the ladder's own (absolute eV) reference: the model's denominator is
     # E_A - E_i + Omega.  It is pooled over every state of the QP window.
+    # Under self-consistency (held_session is the SC run's held-plan session)
+    # the pooled (beta, Omega) is fitted at map 0 and held, like the Sigma
+    # windows: a grid argmin re-selected per map is a discontinuous map.
+    held = None if held_session is None else held_session.get("beta_omega")
     fit = fit_band_extrapolation_spectral(
-        sigma_omega.band_counts, s_at_counts, ladder, e_state_ev=enk_ev)
+        sigma_omega.band_counts, s_at_counts, ladder, e_state_ev=enk_ev,
+        held=held)
+    if held_session is not None and held is None and np.isfinite(fit.beta):
+        held_session["beta_omega"] = (fit.beta, fit.omega_ev)
 
     # THE STATES A GW RUN IS FOR.  The band edges, located from the actual
     # eigenvalues over the QP window rather than assumed to sit at index
@@ -732,6 +740,10 @@ def compute_ppm_sigma_pipeline(
                 plan=plan, config=config, band_slices=band_slices,
                 wfn=wfn, sym=sym, meta=meta, mesh_xy=mesh_xy,
                 print_fn=print_fn,
+                held_session=(
+                    None if fixed_quadrature_session is None else
+                    fixed_quadrature_session.setdefault(
+                        "band_extrapolation", {})),
             )
             # ── WHICH Σ DRIVES THE ITERATION ────────────────────────────
             # The EXTRAPOLATED Σ_c, so the band-sum tail is included in the
