@@ -1808,12 +1808,11 @@ def spectral_trust_verdict(fit: SpectralShellFit) -> str:
                f"keep S(N3)." if fit.n_failed else "")
     if fit.held:
         return (f"pooled beta = {fit.beta:.2f}, Omega = {fit.omega_ev:.1f} eV "
-                f"held from SC map 0; apply {fit.fit_seconds:.3f} s.{no_tail}")
+                f"held from SC map 0.{no_tail}")
     return (f"pooled beta = {fit.beta:.2f}, Omega = {fit.omega_ev:.1f} eV over "
             f"{int(np.count_nonzero(fit.fit_mask))} states; rms middle-point "
             f"residual {fit.residual_ev * 1e3:.3f} meV"
-            f"{' (' + '; '.join(edge) + ')' if edge else ''}; "
-            f"fit {fit.fit_seconds:.3f} s.{no_tail}")
+            f"{' (' + '; '.join(edge) + ')' if edge else ''}.{no_tail}")
 
 
 def tolerance_bar_ev(fit, quantile: str = "p90") -> tuple:
@@ -2205,6 +2204,8 @@ def spectral_h5_payload(plan: BandBracketPlan, fit: SpectralShellFit,
             "pooled_omega_ev": float(fit.omega_ev),
             "pooled_residual_rms_ev": float(fit.residual_ev),
             "pooled_state_count": int(np.count_nonzero(fit.fit_mask)),
+            # A wall time, so it differs run to run; the verdict above does not.
+            "pooled_fit_seconds": float(fit.fit_seconds),
             "band_counts": np.asarray(plan.counts, dtype=np.int64),
             "band_counts_requested": np.asarray(plan.requested,
                                                 dtype=np.int64),
@@ -2269,7 +2270,8 @@ def format_spectral_report(
         f"(min(ngk)*nspinor), not infinity.  Bands "
         f"{lad.n_dft + 1}..{lad.n_target} come from the Weyl ladder, used to "
         f"extend the EIGENVALUE SEQUENCE only.",
-        f"       pooled fit: {spectral_trust_verdict(fit)}",
+        f"       pooled fit: {spectral_trust_verdict(fit)}  "
+        f"(fit + apply {fit.fit_seconds:.3f} s)",
     ]
     for slabel, index in (states or []):
         f1 = fit.at(index)
