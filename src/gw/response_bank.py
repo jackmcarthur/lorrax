@@ -1281,7 +1281,18 @@ def _stream_workspace(wfns, meta, mesh_xy, support, *, q_ids, n_outputs, ordered
         memory = kernel.lower(*abstract).compile().memory_analysis()
     if memory is None:
         raise ValueError("GATE response_capacity: compiled memory unavailable")
-    return int(memory.temp_size_in_bytes)
+    # The charge stream's mathdx mode 11 draws its split-arm scratch at run time,
+    # outside the compiled temporaries (w_isdf direct stream on a raw-parent plan).
+    scratch = 0
+    parent = wfns.green_parent
+    if vertex is None and parent is not None:
+        from .greens_function_kernel import chi0_door_scratch
+        from .w_isdf import _chi_door_serves
+        kgrid, ns = (meta.nkx, meta.nky, meta.nkz), int(meta.nspinor)
+        if _chi_door_serves(mesh_xy, kgrid, ns):
+            scratch = chi0_door_scratch(kgrid=kgrid, n_parent=int(parent.plan.n_parent),
+                                        n_rmu=n, ns=ns, mesh=mesh_xy)
+    return int(memory.temp_size_in_bytes) + int(scratch)
 
 
 def response_group_size(meta, mesh_xy, *, n_samples, carry_per_sample, stream_workspace,

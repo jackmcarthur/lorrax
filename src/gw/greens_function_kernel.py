@@ -500,14 +500,26 @@ def sigma_spin_block(*, n_parent, n_rmu, ns, n_full, n_band, mesh, partner_tiles
     return d
 
 
-def price_chi0_node(*, n_parent, n_rmu, ns, n_full, n_out, n_band, mesh, partner):
+def chi0_door_scratch(*, kgrid, n_parent, n_rmu, ns, mesh):
+    """Per-rank run-time scratch of one mathdx mode-11 call: its split arm's intermediate,
+    at most one local parent-Green tile ``T_p`` (``ffi.fft.chi_unfold_scratch_bytes``);
+    0 on the single pass and off the mathdx backend."""
+    from ffi import fft as F
+    if F.kconv_backend(mesh) != "mathdx":
+        return 0
+    tile, _ = _green_terms(n_parent=n_parent, n_rmu=n_rmu, ns=ns, n_band=0, mesh=mesh)
+    return F.chi_unfold_scratch_bytes(kgrid, ns, int(tile))
+
+
+def price_chi0_node(*, n_parent, n_rmu, ns, n_full, n_out, n_band, mesh, partner, kgrid):
     """Record the price of one fused chi0 node (``w_isdf._get_chi_minimax_kernel_fused``).
 
     New per rank beside what is live: the valence and conduction parent Greens
     ``2·(1 + partner)·T_p`` (``partner`` when an antiunitary row reads a conjugate-face
-    tile), the accumulator ``16·n_out·N_k·μ²/P`` and the builds' panels
-    ``2·(1 + partner)·M_axis`` (:func:`_green_terms`).  Nothing here is chunked: every term
-    is a whole (μ, ν) tile, and ``distrib_la.panel_matmul`` bounds the panels itself.
+    tile), the accumulator ``16·n_out·N_k·μ²/P``, the builds' panels
+    ``2·(1 + partner)·M_axis`` (:func:`_green_terms`) and mode 11's run-time scratch
+    (:func:`chi0_door_scratch`).  Nothing here is chunked: every term is a whole (μ, ν)
+    tile, and ``distrib_la.panel_matmul`` bounds the panels itself.
     """
     tile, panels = _green_terms(n_parent=n_parent, n_rmu=n_rmu, ns=ns, n_band=n_band,
                                 mesh=mesh)
@@ -515,7 +527,8 @@ def price_chi0_node(*, n_parent, n_rmu, ns, n_full, n_out, n_band, mesh, partner
         int(mesh.shape['x']) * int(mesh.shape['y']))
     from common.gpu_utils import record_stage_price
     live, room = _green_stage_room(ns)
-    new = 2.0 * (1.0 + float(bool(partner))) * (tile + panels) + acc
+    new = (2.0 * (1.0 + float(bool(partner))) * (tile + panels) + acc
+           + chi0_door_scratch(kgrid=kgrid, n_parent=n_parent, n_rmu=n_rmu, ns=ns, mesh=mesh))
     if new > room:
         _over_room("the chi0 node", new, room)
     record_stage_price("chi0 node, price_chi0_node", live + new, section="chi.exec")

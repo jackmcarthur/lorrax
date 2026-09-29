@@ -163,6 +163,7 @@ __all__ = [
     "make_kconv_lorentz_unfold", "KCONV_KLEAD_LORENTZ_TARGET",
     "make_kfft_klead_unfold", "KFFT_KLEAD_UNFOLD_TARGET",
     "make_kconv_chi_unfold", "KCONV_CHI_UNFOLD_TARGET", "chi_unfold_refusal",
+    "chi_unfold_scratch_bytes",
     "make_kconv_kminor", "kconv_kminor_out_shape",
     "make_kfft_klead", "make_kfft_kminor",
     "make_local_kfft_klead", "make_local_kfft_kminor", "make_local_kconv_kminor",
@@ -1825,6 +1826,22 @@ def chi_unfold_refusal(kgrid, ns: int, optin: int | None = None) -> str:
             f"{plane} B / group pencil {pencil} B; the device has {have} B of opt-in shared memory")
 
 
+def chi_unfold_scratch_bytes(kgrid, ns: int, tile_bytes: int, optin: int | None = None) -> int:
+    """Per-rank bytes mode 11 draws from XLA's scratch allocator at run time.
+
+    The split arm (a pair's ``2 ns^2`` columns do not fit the opt-in shared memory, the
+    rule :func:`chi_unfold_refusal` reads) chunks its pairs through a ``(N_k, chunk·2ns²)``
+    intermediate bounded by ``scratch_bytes``, by default one local parent-Green tile
+    (``tile_bytes``, :func:`make_kconv_chi_unfold`); the single pass draws none.  A runtime
+    allocation: compiled ``memory_analysis()`` does not count it, so callers price it.
+    """
+    nx, ny, nz = (int(v) for v in kgrid)
+    have = _optin_smem_bytes() if optin is None else int(optin)
+    grp = 2 * int(ns) * int(ns)
+    single = have is not None and grp * (((nx * ny * (nz | 1)) | 1) * 16) <= have
+    return 0 if single else int(tile_bytes)
+
+
 def make_kconv_chi_unfold(mesh: Mesh, kgrid, tables, *, n_out: int, complete: bool,
                           norm: str | None = "ortho", scratch_bytes: int | None = None) -> Callable:
     """One tau node of the chi0 response read from the RAW-PARENT Green pair:
@@ -1870,7 +1887,7 @@ def make_kconv_chi_unfold(mesh: Mesh, kgrid, tables, *, n_out: int, complete: bo
         def local(acc, gv, gc, alpha, gvt, gct, conj_src):
             t = local_unfold_load_tables(tables)
             budget = (int(scratch_bytes) if scratch_bytes is not None
-                      else int(gv.size) * 16)       # one parent Green tile (the split arm's chunk)
+                      else int(gv.size) * 16)       # one parent Green tile (chi_unfold_scratch_bytes)
             call = jax.ffi.ffi_call(KCONV_CHI_UNFOLD_TARGET, jax.ShapeDtypeStruct(acc.shape, acc.dtype),
                                     input_output_aliases={12: 0})
             return call(flat(gv), flat(gvt), flat(gc), flat(gct), t.row, t.trs, t.lsrc, t.rsrc,

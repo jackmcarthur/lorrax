@@ -41,8 +41,9 @@ must resolve to ``mathdx`` on this mesh (asserted, TASTE 30).
 3f. The shared-pole direct stream (``w_isdf`` pair_mode "direct") with mode 11
    forming each node's correlation from the parent Greens, against the same
    factory on its full-k Green route: 1e-12 of max|ref|, complex node times,
-   both orientations, glide (ns 2, 4) and C3 (ns 2).  Red twin: the physical
-   orientation against the incumbent (C3).
+   both orientations, glide (ns 2, 4) and C3 (ns 2) on face faces, C3 on axis
+   faces with active band ranges.  Red twin: the physical orientation against
+   the incumbent (C3).
 4. The stored-kernel doors (modes 2-5) against NumPy ``np.fft`` on sharded
    operands, including an odd grid and 8x8x8: ``make_kconv_klead`` (Σ/COHSEX,
    prep + apply), ``make_kconv_kminor`` (BSE rung, both store layouts),
@@ -380,17 +381,20 @@ def chi_cases(mesh, rng):
 def chi_direct_cases(mesh, rng):
     """The shared-pole direct stream (``w_isdf`` pair_mode "direct") through mode 11 against
     its full-k Green route, the same factory with mode 11 refused: complex node times, both
-    orientations, the glide plans (ns 2, 4; an antiunitary row) and C3 (ns 2, q != -q).
-    Red twin: the physical orientation against the incumbent must miss (C3 only: every row of
-    the 2x2x1 glide grid is its own negative)."""
+    orientations, the glide plans (ns 2, 4; an antiunitary row) and C3 (ns 2, q != -q) on face
+    faces, and C3 on axis faces with prepared active band ranges.  Red twin: the physical
+    orientation against the incumbent must miss (C3 only: every row of the 2x2x1 glide grid
+    is its own negative)."""
     import zeta_mubatch_fixtures as fixtures
     from common.wfn_layout import psi_specs
     from gw import w_isdf
     from test_kconv_klead_unfold import c3_fixture
-    sn, sm = psi_specs("face")
     recs = []
-    for fx in (fixtures._glide_fixture(mesh, rng, 2), fixtures._glide_fixture(mesh, rng, 4),
-               c3_fixture(mesh, 2)):
+    c3 = c3_fixture(mesh, 2)
+    for fx, layout, bounds in ((fixtures._glide_fixture(mesh, rng, 2), "face", None),
+                               (fixtures._glide_fixture(mesh, rng, 4), "face", None),
+                               (c3, "face", None), (c3, "axis", ((0, 4), (2, 6)))):
+        sn, sm = psi_specs(layout)
         plan, kg = fx["plan"], tuple(fx["kgrid"])
         ns, mu, npar, nk = int(plan.nspinor), int(plan.n_centroid_packed), int(plan.n_parent), int(plan.n_full)
         nb, n_out = 6, 2
@@ -412,7 +416,8 @@ def chi_direct_cases(mesh, rng):
             try:
                 kernel = w_isdf._get_chi_fractional_contour_kernel_face(
                     mesh, kg, n_out, (npar, nb, mu, ns), k_unfold_plan=plan, selected_q=q,
-                    pair_mode="direct", ordered=ordered, bank_carry=True, layout="face")
+                    pair_mode="direct", ordered=ordered, bank_carry=True, layout=layout,
+                    band_ranges=bounds)
             finally:
                 w_isdf._chi_door_serves = serves
             carry = put(np.zeros((n_out, len(q), mu, mu), complex), P(None, None, "x", "y"))
@@ -420,7 +425,8 @@ def chi_direct_cases(mesh, rng):
         rel = lambda a, b: float(np.max(np.abs(a - b)) / np.max(np.abs(b)))
         got = {o: (run(o, True), run(o, False)) for o in (False, True)}
         for o, (new, old) in got.items():
-            r = dict(case=f"chi_direct_ns{ns}_nk{nk}_{'physical' if o else 'incumbent'}",
+            r = dict(case=f"chi_direct_ns{ns}_nk{nk}_{layout}{'_bands' if bounds else ''}_"
+                          f"{'physical' if o else 'incumbent'}",
                      antiunitary=bool(np.any(np.asarray(plan.sym_idx) >= plan.n_sym_spatial)),
                      ref_direct_vs_full_k_route=rel(new, old))
             if nk > 4 and o:

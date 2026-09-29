@@ -161,7 +161,7 @@ def _chi_door_serves(mesh_xy, kgrid, ns) -> bool:
     if why:
         from ffi.gate import announce_once
         announce_once(("chi_unfold", tuple(kgrid), int(ns)),
-                      f"[chi0] k-grid {tuple(kgrid)} ns={int(ns)}: the face kernel, "
+                      f"[chi0] k-grid {tuple(kgrid)} ns={int(ns)}: the full-k Green route, "
                       f"not mathdx mode 11: {why}", scope="rank0")
     return not why
 
@@ -503,7 +503,7 @@ def _get_chi_minimax_kernel_fused(mesh_xy, kgrid, nk, n_out, complex_contour,
     # weights even when alpha is complex (the ordered imaginary probe): their antiunitary
     # partner is conj(G), read on the load, so no partner tile is built.
     real_t = real_times or not complex_contour
-    price_chi0_node(n_parent=nk_in, n_rmu=n_rmu, ns=ns, n_full=nk, n_out=n_out,
+    price_chi0_node(n_parent=nk_in, n_rmu=n_rmu, ns=ns, n_full=nk, n_out=n_out, kgrid=kgrid,
                     n_band=nb_full, mesh=mesh_xy, partner=anti and not real_t)
     if nk_in != k_unfold_plan.n_parent or k_unfold_plan.n_full != nk:
         raise ValueError("chi parent plan: face k extent or full-k extent disagrees with its plan.")
@@ -808,6 +808,10 @@ def _get_chi_fractional_contour_kernel_face(
         # Green build waits on a host-read predicate inside the node loop.
         direct = pair_mode == "direct"
 
+        def oriented(weight, t):
+            """The (weight, time) the Green is built at: conjugated for the physical orientation."""
+            return (jnp.conj(weight), jnp.conj(t)) if physical else (weight, t)
+
         def green_k(weight, t, ref, *, current=False, family_pair=None, halves=None):
             left, right, plan, right_plan = psi_mun, psi_nmu, k_unfold_plan, None
             sign = None
@@ -824,19 +828,14 @@ def _get_chi_fractional_contour_kernel_face(
                 if half_parity is not None:
                     sign = jnp.where(h == g, 1.0, jnp.asarray(half_parity))
             # Incumbent: conj(G(w, t)) = G(conj w, conj t)^T. Physical: G(conj w, conj t).
-            if physical:
-                g = build_G_tau(left, right, enk_full, jnp.conj(t), e_ref=ref,
-                                band_weight=jnp.conj(weight), layout=layout,
-                                gemm=g_plan, k_unfold_plan=plan,
-                                right_k_unfold_plan=right_plan,
-                                prepared_active_gemm=active_gemms[int(current)],
-                                real_weights=False if direct else None)
-            else:
-                g = jnp.conj(build_G_tau(left, right, enk_full, t, e_ref=ref,
-                                         band_weight=weight, layout=layout,
-                                         gemm=g_plan, k_unfold_plan=plan,
-                                         prepared_active_gemm=active_gemms[int(current)],
-                                         real_weights=False if direct else None))
+            weight, t = oriented(weight, t)
+            g = build_G_tau(left, right, enk_full, t, e_ref=ref,
+                            band_weight=weight, layout=layout,
+                            gemm=g_plan, k_unfold_plan=plan,
+                            right_k_unfold_plan=right_plan,
+                            prepared_active_gemm=active_gemms[int(current)],
+                            real_weights=False if direct else None)
+            g = g if physical else jnp.conj(g)
             if sign is not None:
                 g = g * sign[:, None, None, None, None]
             return jax.lax.with_sharding_constraint(g, G_shard)
@@ -985,9 +984,7 @@ def _get_chi_fractional_contour_kernel_face(
             so the conjugation moves from the reverse rows to the forward rows.
             """
             def parent(weight, t, ref, current):
-                # green_k's conjugation rule, on the parents.
-                if physical:
-                    t, weight = jnp.conj(t), jnp.conj(weight)
+                weight, t = oriented(weight, t)
                 return build_G_tau(psi_mun, psi_nmu, enk_full, t, e_ref=ref,
                                    band_weight=weight, layout=layout, gemm=g_plan,
                                    k_unfold_plan=k_unfold_plan, unfold=False,
