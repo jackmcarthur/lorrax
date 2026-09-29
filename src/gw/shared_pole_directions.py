@@ -22,8 +22,16 @@ from jax.sharding import NamedSharding, PartitionSpec as P
 
 
 def replicated(mesh_xy):
-    """Place a small host scalar or table replicated on the mesh (sample indices, node scales)."""
-    return lambda value: jax.device_put(value, NamedSharding(mesh_xy, P()))
+    """Place a small host scalar or table replicated on the mesh (sample indices, node scales).
+
+    Every process holds the same value, so it is placed process-locally: a
+    raw ``jax.device_put`` to a multi-process sharding first all-gathers the
+    value to assert equality (``lxkit.placement``), one collective and host
+    wait per index or scale.
+    """
+    from common.collectives import device_put_process_local
+    sharding = NamedSharding(mesh_xy, P())
+    return lambda value: device_put_process_local(np.asarray(value), sharding)
 
 
 def _sample_point(recipe, sample_id):
@@ -306,7 +314,7 @@ def line_sample_states(W, dW, recipe, *, sid, ordered, real, mesh_xy, eigh_plan,
     q_all, values = _select(k, W, entries[:1], "line", {sid: 0}, recipe, real=real, eigh_plan=eigh_plan,
                             column_extent=column_extent, logical_n=logical_n)
     direction = k.column(q_all, put(np.int32(0)))
-    widths = tuple(int(np.asarray(row[0]).size) for row in values)
+    widths = tuple(int(row[0].size) for row in values)
     if any(w < 1 or w > logical_n for w in widths[:real]):
         raise ValueError(f"GATE shared_pole_directions: got: ranks {widths[:real]}; want: 1..{logical_n}; why: empty or padded physical direction set")
     states, flags, counts = _sample_states(k, W, dW, put(np.int32(0)), z, "line", direction, widths, recipe,
@@ -547,7 +555,7 @@ def select_round_states(samples, recipe, *, sample_ids, real, mesh_xy, eigh_plan
                     continue
                 q_all, values = selected[kind]
                 direction = k.column(q_all, put(np.int32(e)))
-                widths = tuple(int(np.asarray(row[e]).size) for row in values)
+                widths = tuple(int(row[e].size) for row in values)
                 if any(w < 1 or w > logical_n for w in widths[:real]):
                     raise ValueError(f"GATE shared_pole_directions: got: ranks {widths[:real]}; want: 1..{logical_n}; why: empty or padded physical direction set")
                 new, flags, new_counts = _sample_states(
@@ -598,7 +606,7 @@ def _round_partner_directions(q, output, cutoff, *, real, kernels, eigh_plan, co
     directions, kept = distrib_la.retain_leading_eigenvectors(
         directions, spectrum, counts, mesh=eigh_plan.mesh,
         column_extent=column_extent, multiplet_tol=tol, real_rows=spectral_rows)
-    return directions, tuple(int(np.asarray(v).size) for v in kept)
+    return directions, tuple(int(v.size) for v in kept)
 
 
 def _model_diagnostics(model, moments, infinity_directions, *, matmul):
