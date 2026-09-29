@@ -83,7 +83,7 @@ def _flat_spectrum(nb, nk=4):
 # ---------------------------------------------------------------------------
 
 def test_the_brackets_are_fractions_of_the_sigma_count():
-    """~(80, 90, 100), not ~(198, 223, 248).
+    """~(70, 85, 100), not ~(174, 211, 248).
 
     The fixture is the load-bearing part: χ and Σ differ by 148 bands, so a
     planner fed the wrong one is off by more than the whole Σ sum and no
@@ -92,10 +92,10 @@ def test_the_brackets_are_fractions_of_the_sigma_count():
     plan = plan_band_brackets(
         enabled=True, enk_ry=_flat_spectrum(SIGMA), n_occ=N_OCC,
         nb_logical=SIGMA, nb_padded=SIGMA, fractions=BRACKET_FRACTIONS)
-    assert plan.counts == (80, 90, 100), plan.counts
+    assert plan.counts == (70, 85, 100), plan.counts
 
     chi_rule = tuple(int(round(f * CHI)) for f in BRACKET_FRACTIONS) + (CHI,)
-    assert chi_rule == (198, 223, 248)
+    assert chi_rule == (174, 211, 248)
     assert plan.counts != chi_rule, "brackets must be of the SIGMA count"
     assert max(plan.counts) <= SIGMA, (
         "no bracket may reach past the last band the Sigma sum owns")
