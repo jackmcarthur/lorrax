@@ -25,21 +25,27 @@ converged physical reference.
 | gnppm | `gw.gw_jax` | fresh ζ fit, GN-PPM one-shot, `head_correction = full`, spectral_shell band extrapolation, local linalg |
 | shared_pole_sc | `gw.gw_jax` | shared-pole full-frequency QSGW, 2 maps to a 1.5 eV criterion, ordered (TR-broken) store with the direct head, ζ restart, distributed linalg |
 | bse | `bse.bse_jax` | TDA Davidson on the GN-PPM restart bundle, screened direct term (D + V − W) |
-| exciton_bands | `bse.exciton_bands` | htransform (fH) interpolation, then finite-Q TDA (1v × 1c) on a G–X–M path |
+| htransform | `bandstructure.htransform` | Galerkin band interpolation on a G–X–M path |
+| exciton_bands | `bse.exciton_bands` | fH interpolation, then finite-Q TDA (1v × 1c) on the same path |
+| cohsex | `gw.gw_jax` | static COHSEX one-shot, restarted |
+| gnppm_sc | `gw.gw_jax` | GN-PPM through the SC driver, one map (map 0; QP rotations and `WFN_qp.h5` written), restarted |
+| sp_export | `gw.gw_jax` | shared-pole one-shot with `write_w`/`write_poles` (the file-model path), restarted; the W bank is compared by value, the pole model by member shapes |
 
-Every stage runs on all four ranks. It is then checked on its outputs, not
-its exit code: the eqp0/eqp1 columns, every numeric member of the h5 files it
-writes, and its eigenvalue tables, against `reference/`. Every rank log is
-also scanned for failure signatures (`chain.FAILURE_SIGNATURES`).
-Tolerances are in `chain.ATOL`.
+All stages run in one Python process per rank (`chain.run_stage` calls each
+driver's `main` in sequence): one `jax.distributed` world, one FFI load, one
+compile cache. No driver code changes were needed for re-entry. Between
+drivers the runner runs `gc.collect()` and `jax.clear_caches()`. The
+restarted steps read the `tmp/` state (ζ, V(q), W0) the chain has written.
 
-Each launch pays about 8 s of process and runtime bring-up, so the suite is
-seven launches and every option that can ride on one does. Not covered:
-- the standalone `bandstructure.htransform` CLI and writer (its fH
-  interpolation runs inside exciton bands);
-- static COHSEX Σ, GN-PPM self-consistency, and the shared-pole
-  `write_w`/`write_poles` export (file-model) path: each needs its own launch
-  (≈ 17–24 s restarted);
+Every stage is then checked on its outputs, not its exit code: the
+eqp0/eqp1 columns, every numeric member of the h5 files it writes, and its
+eigenvalue tables, against `reference/`. Every rank log is also scanned for
+failure signatures (`chain.FAILURE_SIGNATURES`). Tolerances are in
+`chain.ATOL`. A driver that fails on one rank exits its process, so srun
+ends the step instead of leaving the other ranks in a collective.
+
+Not covered:
+- GN-PPM map-to-map update: the shared-pole stage is the one two-map SC run;
 - `screening_diagrams = w_bse`: it refuses on a time-reversal-broken
   reference (`GATE w_bse_requires_measured_trs`);
 - the planners' chunked paths: at μ = 6 every object is KB-sized, and a

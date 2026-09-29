@@ -1,11 +1,14 @@
 """The driver chain on the magnetic H2+ spinor fixture, at P4 on one node.
 
-Every stage is a production driver run as its own process on each of the
-four srun ranks (one GPU each, MPI world 4), in one shared run directory,
+Every stage is a production driver's entry point, called in sequence in one
+Python process on each of the four srun ranks (one GPU each, MPI world 4;
+one runtime, one FFI load, one compile cache), in one shared run directory,
 in the order a user runs them:
 
     kmeans -> kin_ion -> dipole -> gwjax GN-PPM one-shot
-           -> gwjax shared-pole QSGW (2 maps) -> BSE -> exciton bands
+           -> gwjax shared-pole QSGW (2 maps) -> BSE -> htransform
+           -> exciton bands -> restarted: COHSEX, GN-PPM SC (1 map),
+              shared-pole one-shot with W and pole exports
 
 Each stage is then checked against the stored outputs in ``reference/``
 (eqp columns, numeric members of the written h5 files, solver outputs)
@@ -48,6 +51,7 @@ REFERENCE = HERE / "reference"
 # the Sigma tolerance is the 0.5 meV rule-set budget of the old core GN cell.
 ATOL = {
     "h5": 1.0e-8,        # kin_ion / dipole members (relative + absolute)
+    "w_bank": 1.0e-6,    # exported shared-pole W samples (relative)
     "eqp_ev": 5.0e-4,    # eqp0/eqp1 columns, GN-PPM and shared pole
     "bse_ev": 2.0e-3,    # BSE and exciton-band eigenvalues: Krylov solves
                          # on a P-dependent padded space (P1 vs P4 1.2 meV)
@@ -147,6 +151,44 @@ htransform_qr_eps = 1e-2
 """ + _PATH
 
 _SIDE = "2" if rank_session._resolve_proc_count() == 4 else "1"
+
+# Restarted steps: each reads the tmp/ state (zeta, V(q), W0) the chain has
+# written and covers one more route.
+def _restart_deck(prefix, body):
+    return _DECK_COMMON + "restart = true\nlinalg = local\n" + body + f"""\
+sigma_diag_file = {prefix}_sigma.dat
+eqp0_file = {prefix}_eqp0.dat
+eqp1_file = {prefix}_eqp1.dat
+report_file = {prefix}.out
+sigma_omega_h5_file = {prefix}_sigma.h5
+"""
+
+
+RESTART_DECKS = {
+    "cohsex.in": _restart_deck("cohsex", """compute_mode = cohsex
+qp_solver = one_shot_dft
+"""),
+    # GN-PPM self-consistency, one map: map 0's max|dE| (2.59 eV) is inside
+    # the 3 eV criterion, so the SC driver stops converged after one map.
+    "gnppm_sc.in": _restart_deck("gnsc", """compute_mode = gn_ppm
+qp_solver = self_consistent
+sc_max_iter = 1
+sc_tol_ev = 3.0
+sigma_regularization_ev = 0.25
+write_qsgw_datasets = true
+"""),
+    # The shared-pole file-model path: one-shot with the W bank and the
+    # pole model exported.
+    "sp_export.in": _restart_deck("spx", """compute_mode = mpa
+sigma_w_model = shared_pole
+head_correction = no_local_fields
+mpa_n_poles = 2
+qp_solver = one_shot_dft
+sigma_regularization_ev = 0.25
+write_w = true
+write_poles = true
+"""),
+}
 _P = ["--px", _SIDE, "--py", _SIDE]
 
 # (name, module, argv, deck name -> template).  The decks are written into
@@ -169,6 +211,9 @@ STAGES = (
       "--band-degeneracy", "off", "--max-lanczos-iter", "40",
       "--n-eig", "2", "--block-size", "1", *_P,
       "--report-file", "bse.out"]),
+    ("htransform", "bandstructure.htransform",
+     ["-i", "excited.in", "--guard-bands", "1", "-o", "htransform.dat",
+      "--report-file", "htransform.out"]),
     # One conduction band: the window's top band must lie below the fitted
     # window's top, or fH cannot see it (compute_wfns_fi refuses).
     ("exciton_bands", "bse.exciton_bands",
@@ -176,6 +221,9 @@ STAGES = (
       "--block-size", "1", "--max-iter", "40", "--vq-mode", "ongrid",
       "--q-per-segment", "1", "--band-degeneracy", "off", *_P,
       "--out-prefix", "exciton", "--report-file", "exciton.out"]),
+    ("cohsex", "gw.gw_jax", ["-i", "cohsex.in"]),
+    ("gnppm_sc", "gw.gw_jax", ["-i", "gnppm_sc.in"]),
+    ("sp_export", "gw.gw_jax", ["-i", "sp_export.in"]),
 )
 
 # What each stage leaves behind and how it is compared.
@@ -193,25 +241,32 @@ CHECKS = {
                                          r"SC iteration: call=\d+ .*?max\|dE\|=([0-9.e+-]+)")},
     "bse": {"stdout_floats": r"^\s*S\d+\s+([0-9.+-]+)\s*$"},
     "exciton_bands": {"rows": [("exciton.dat", 6)]},
+    "htransform": {"rows": [("htransform.dat", 6)]},
+    "cohsex": {"eqp": ["cohsex_eqp0.dat", "cohsex_eqp1.dat"]},
+    "gnppm_sc": {"eqp": ["gnsc_eqp0.dat", "gnsc_eqp1.dat"],
+                 "h5": ["gnsc_sigma.h5"],
+                 "report_floats": ("gnsc.out",
+                                   r"SC iteration: call=\d+ .*?max\|dE\|=([0-9.e+-]+)")},
+    # The exported W bank is compared by value; the pole model (b, Lambda)
+    # has a gauge per pole, so only its members' shapes are pinned.
+    "sp_export": {"eqp": ["spx_eqp0.dat", "spx_eqp1.dat"],
+                  "h5": ["spx_sigma.h5", "tmp/mpa/oneshot_w.h5"],
+                  "shapes": ["tmp/mpa/oneshot_poles.h5"]},
 }
 
 
 def _env(cache_dir):
-    env = dict(os.environ)
-    for name in list(env):
-        if name.startswith("PYTEST_"):
-            env.pop(name)
+    """The drivers' environment, set in this process before any driver import."""
+    env = os.environ
     env.pop("JAX_COMPILATION_CACHE_DIR", None)
     if rank_session._resolve_proc_count() == 1:
-        # P1 (lx test): one driver process on ONE device.  A single process
+        # P1 (lx test): the drivers run on ONE device.  A single process
         # holding four devices is the in-process mesh the flat-k FFT refuses.
         visible = env.get("CUDA_VISIBLE_DEVICES", "0").split(",")
         env["CUDA_VISIBLE_DEVICES"] = visible[0]
     env["ISDF_JAX_CACHE_DIR"] = str(cache_dir)
     env["JAX_ENABLE_X64"] = "1"
     env["PYTHONUNBUFFERED"] = "1"
-    env["PYTHONPATH"] = str(REPO / "src") + (
-        os.pathsep + env["PYTHONPATH"] if env.get("PYTHONPATH") else "")
     return env
 
 
@@ -230,23 +285,69 @@ def write_decks(run):
     (run / "sp_sc.in").write_text(SP_SC_DECK.format(
         centroids=centroids, linalg="distributed" if _SIDE == "2" else "local"))
     (run / "excited.in").write_text(EXCITED_DECK.format(centroids=centroids))
+    for fname, deck in RESTART_DECKS.items():
+        (run / fname).write_text(deck.format(centroids=centroids))
     return centroids
 
 
+def _release_devices():
+    """Drop what one driver left behind before the next one starts."""
+    import gc
+    import jax
+    gc.collect()
+    jax.clear_caches()
+    gc.collect()
+
+
 def run_stage(run, name, module, argv, env, timeout):
-    """Run one driver on every rank; return (ok, wall) agreed by all ranks."""
-    import subprocess
+    """Run one driver's entry point in this process on every rank.
+
+    One runtime per rank for the whole chain: one jax.distributed world,
+    one FFI load, one compile cache.  The driver's stdout/stderr (Python
+    and native) go to ``<name>.rank<r>.log``.  A driver that fails on one
+    rank would leave the others in a collective, so a failure exits the
+    process at once and srun ends the step.
+    """
+    import importlib
+    import inspect
+    import traceback
     t0 = time.monotonic()
     rank = rank_session._resolve_proc_id()
+    log = run / f"{name}.rank{rank}.log"
+    sys.stdout.flush()
+    sys.stderr.flush()
+    saved = (os.dup(1), os.dup(2))
+    fd = os.open(log, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
+    os.dup2(fd, 1)
+    os.dup2(fd, 2)
+    os.close(fd)
+    cwd, saved_argv = os.getcwd(), sys.argv
+    rc = 0
     try:
-        proc = subprocess.run(
-            [sys.executable, "-u", "-m", module, *argv], cwd=run, env=env,
-            capture_output=True, text=True, timeout=timeout, check=False)
-        rc, out, err = proc.returncode, proc.stdout, proc.stderr
-    except subprocess.TimeoutExpired as exc:
-        rc, out, err = 124, str(exc.stdout or ""), f"{exc.stderr or ''}\nTIMED OUT"
-    (run / f"{name}.rank{rank}.log").write_text(
-        f"rc={rc}\n{out}\n--- stderr ---\n{err}")
+        os.chdir(run)
+        sys.argv = [module, *argv]
+        main = importlib.import_module(module).main
+        try:
+            ret = main(argv) if inspect.signature(main).parameters else main()
+            rc = int(ret or 0)
+        except SystemExit as exc:
+            rc = exc.code if isinstance(exc.code, int) else int(exc.code is not None)
+        except BaseException:                                  # noqa: BLE001
+            traceback.print_exc()
+            rc = 1
+    finally:
+        sys.stdout.flush()
+        sys.stderr.flush()
+        os.dup2(saved[0], 1)
+        os.dup2(saved[1], 2)
+        os.close(saved[0])
+        os.close(saved[1])
+        os.chdir(cwd)
+        sys.argv = saved_argv
+    if rc != 0:
+        print(f"hsuite FAIL {name}: rc={rc} on rank {rank}; see {log}", flush=True)
+        os._exit(rc)
+    _release_devices()
     rcs = rank_session.exchange(rc)
     return all(r == 0 for r in rcs), rcs, time.monotonic() - t0
 
@@ -300,6 +401,9 @@ def captured(run, name, rule):
     for fname in rule.get("h5", []):
         for key, value in _h5_members(run / fname).items():
             got[f"{fname}:{key}"] = value
+    for fname in rule.get("shapes", []):
+        for key, value in _h5_members(run / fname).items():
+            got[f"{fname}:{key}:shape"] = np.asarray(value.shape)
     for fname, skip in rule.get("rows", []):
         got[fname] = _rows(run / fname, skip)
     if "report_floats" in rule:
@@ -315,6 +419,11 @@ def captured(run, name, rule):
 
 def _tol(label):
     """(atol, relative?) for one captured array."""
+    if label.endswith(":shape"):
+        return 0.0, False
+    if "_w.h5:" in label:
+        # The W bank: chi0 and V(q) reductions reorder with P.
+        return ATOL["w_bank"], True
     if "sigma" in label or "eqp" in label:
         # Sigma-derived: absolute, in the file's energy unit (eV).
         return ATOL["eqp_ev"], False
@@ -408,7 +517,7 @@ def run_chain(out, *, regenerate=False, cache_dir=None, timeout=600,
             got = {"centroids": pts}
         else:
             got = captured(run, name, rule)
-        if regenerate:
+        if regenerate == "all" or (regenerate == "missing" and _load(name) is None):
             REFERENCE.mkdir(exist_ok=True)
             _save(name, got)
             continue
@@ -439,8 +548,10 @@ def run_chain(out, *, regenerate=False, cache_dir=None, timeout=600,
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     parser.add_argument("--out", required=True, help="new directory for the run")
-    parser.add_argument("--regenerate", action="store_true",
-                        help="rewrite reference/ from this run")
+    parser.add_argument("--regenerate", nargs="?", const="all", default=None,
+                        choices=("all", "missing"),
+                        help="rewrite reference/ from this run (all), or write "
+                             "only the stages that have none (missing)")
     parser.add_argument("--cache-dir", default=None,
                         help="compile cache (default: <out>/jax-cache, cold)")
     parser.add_argument("--only", nargs="*", default=None)
