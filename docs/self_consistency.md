@@ -126,15 +126,43 @@ energies, so it takes these dipoles at the same diagonal approximation.
 
 | bands | block of $H'$ |
 |---|---|
-| the `nval + ncond` QP window | full $\Sigma^{\rm QSGW}$, off-diagonals kept within the window |
+| the QP matrix `[0, b3)` = the ζ fit's left range | full $\Sigma^{\rm QSGW}$, off-diagonals kept within the matrix |
+| its semicore bands `[0, b_semicore)` | full rows, read at their own energy on one held patch at $\eta_{\rm semi}$ = 1 eV (below) |
 | the lowest `sc_frozen_core_bands` | held at the DFT block $\mathrm{diag}(E_{\rm DFT})$; they stay in the $\Sigma_x$ and $\chi_0$ sums |
-| the sum-band tail `[b3, number_bands)` | DFT orbitals with an energy-only rigid shift, refit every map: the $Z$-weighted mean QP correction of the window's conduction states that read their own $\Sigma(E)$ (below) |
+| the scissored tail `[b3, number_bands)` | DFT orbitals with an energy-only rigid shift, refit every map, in G and $\chi_0$ only: the $Z$-weighted mean QP correction of the matrix's conduction states that read their own $\Sigma(E)$ (below) |
 
-Every window band keeps its full Σ. Under the default `sigma_out_of_grid =
-cover` a band the W model treats as active reads Σ at its own energy, and
-the grid grows over it; a deeper band reads $\Sigma(\omega = 0)$ (§4). Map 0, or an
-authenticated seed, classifies the band set once, and the set stays frozen:
-no band enters or leaves it later.
+**The absolute band cut** (owner 2026-09-28/29; `band_partition.qp_band_cut`,
+decided from the DFT ladder before the ζ fit, logged as `QP band cut`). b3 is
+one k-independent band index: the smallest boundary holding every occupied
+state, every requested (`nval`/`ncond`) state within $\mu \pm 10$ eV and
+every state below `sigma_omega_max_ev`, moved up to the first band gap of at
+least $4\eta$ within $20\eta$, else to the boundary with the least overlap,
+never inside a degenerate multiplet; a metal's frame is the deck's fixed-N
+smearing $\mu$. The QP matrix is the ζ fit's left range, and a `zeta_nband`
+below b3 refuses (`GATE qp_matrix_zeta_left`): a state outside the fit would
+carry Σ on unfitted pairs. Above $E_F$ a dispersive ladder has no band gap
+(Si 4³, Fe 4³, Na 8³), so the matrix's top band overlaps the tail at other k;
+the cost is the dropped Σ coupling to those tail bands (TWOCLASS, CLAIMS
+2945).
+
+**Semicore.** An occupied band below a band gap of at least 4 eV (all k) is
+semicore. It stays in the matrix and mixes fully, but its Σ is read on one
+patch of the grid below the near support, at $\eta_{\rm semi}$ = 1 eV,
+sampled at $\eta_{\rm semi}/2$ and certified at $10^{-2}$
+(`qp_support.SEMICORE_*`). The patch is planned at map 0 over the semicore
+DFT energies with the plan's 2 eV pad and held; a semicore read that leaves
+it extends it, as the near support is extended. At the deck $\eta$ the Fe 3s
+$Z$ leaves $(0, 1]$ from map 1 and the loop stalls; at 1 eV every semicore
+$Z$ stays inside (one `SC semicore Z` receipt per map). Its systematic is
+reported apart from the 1 meV budget of the controllable errors. Only the
+scalar MPA/shared-pole Σ reads the patch; a sector (bispinor) route keeps
+the rule below.
+
+Every other matrix band is protected: under the default `sigma_out_of_grid =
+cover` it reads Σ at its own energy, and the grid grows over it; on a route
+without the patch a band deeper than the W model's active depth reads
+$\Sigma(\omega = 0)$ (§4). Map 0, or an authenticated seed, classifies the
+band set once, and the set stays frozen: no band enters or leaves it later.
 
 **Tail law.** The rigid shift is
 
