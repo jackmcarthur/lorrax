@@ -249,3 +249,12 @@ def test_payload_and_report():
     text = format_spectral_report(plan, fit, states=[("VBM", (0, 1))])
     assert "pooled beta = 3.00" in text and "Omega = 8.0 eV" in text
     assert "[VBM]" in text
+
+
+def test_pool_is_ten_ev_of_ef_closed_over_multiplets():
+    from gw.band_extrapolation import SHELL_POOL_WINDOW_EV, pooled_state_mask
+    # 10.0 is inside; 10.00005 is outside but in its multiplet, so it enters.
+    e = np.array([[-30.0, -10.5, -9.0, 10.0, 10.0 + 5e-5, 12.0]])
+    m = pooled_state_mask(e)
+    assert SHELL_POOL_WINDOW_EV == 10.0
+    assert m.tolist() == [[False, False, True, True, True, False]]

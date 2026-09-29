@@ -102,7 +102,7 @@ SIGMA_K_AXIS = {
 	"sigma_c_extrap_inf_kn_ev": 0,
 	"sigma_c_extrap_last_kn_ev": 0,
 	"sigma_c_extrap_sigma_kn_ev": 0,
-	# The per-state decay exponent written by ``spectral_shell``.
+	# The pooled beta of ``spectral_shell`` on states with a tail, NaN elsewhere.
 	"sigma_c_extrap_beta_kn": 0,
 	# The energies THIS Sigma was evaluated at, omega-relative, band
 	# diagonal (nk, nb) -> k is axis 0.  Registered here rather than merely
