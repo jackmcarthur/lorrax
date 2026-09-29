@@ -94,6 +94,19 @@ def _shared_pole_omega0_weights(poles2, intervals, E_ref_B, t_node):
                      0.0).astype(jnp.complex128)
 
 
+# Kernel lessons: the W(tau) synthesis b d(tau) b^dagger and its transposes (numbers: sandbox
+# claim ids).
+# Over plain JAX: none; it runs on G's GEMM route.  What paid was placement and communication:
+#   tau-invariant factors placed once, Sigma tau -30% scalar Fe 4^3 (2732), -40% bispinor sectors
+#   (2726); only each window's live pole columns contracted, Fe 8^3 map-0 Sigma tau -5.0% (2955);
+#   transposes formed on the rank that needs them, Fe 8^3 Sigma tau -9.3% at P4, -24.5% at P16 (2958).
+# Did not pay: W^T by a second GEMM, +10% at P4, +2% at P16 (2958), +5.7% on Fe 8^3 (2955); the 2-D
+#   face layout for the Sigma residues, Sigma tau +25% Na 8^3, +160% Fe 4^3 (2955); the local
+#   projector transpose costs Na 8^3 (group order 14.8) +6.4%, accepted (2958); a sync-free tau
+#   loop, null (2829).  The latency-hiding scheduler: distrib_la.panel_matmul's lessons.
+# Decides it: rank imbalance, not bytes.  transpose_xy copies on diagonal ranks and moves the tile on
+#   the others, so diagonal ranks waited ~16 ms per node at the next collective (2954).  Left: this
+#   transpose, 5.1 vs 1.5 ms per node at P16, ~7% of a node (2958).
 def synthesize_shared_pole_parents(
     b_X, b_Y, poles2, intervals, E_ref_B, t_node, *, mesh_xy, gemm, layout="face",
     weights_fn=_shared_pole_weights, active_range=False,

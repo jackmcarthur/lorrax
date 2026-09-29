@@ -135,6 +135,17 @@ def _prepared_native(a, b, c, *, active_bounds, alpha, beta):
     return result
 
 
+# Kernel lessons: the local active-range GEMM (numbers: sandbox claim ids).
+# Over plain JAX: the Sigma tau Green over each parent's live bands instead of an XLA ZGEMM over all
+#   bands, CrI3 6x6 mu3088 Sigma tau 88.5 -> 59.7 s (1.48x), its Green ZGEMM 45.1 -> 13.0 s (2833);
+#   8192 bands at P16, 18.1x narrow and 3.6x wide over the masked product (2266).
+# Paid: the no-C target writes every row itself, so the aliased zero fill (746 x 4.35 ms) is gone (2841).
+# Did not pay: band slices bucketed by width with their own compiles, CrI3 tau sweep 5.02 -> 7.67 s
+#   (2724); host-planned bounds to drop the per-call bounds read and sync, which idles the GPU
+#   <= 1.2% (2954) and would not be bitwise, since the live bands move with tau (I); a sync-free tau
+#   loop, host-blocked 2.04 -> 0 s with the sweep unchanged (2829).
+# Decides it: flops scale with the live interval; the bounds read is cheap because the GPU queue
+#   refills within ~20 us of it (2829).
 def active_local_cuda(a, b, bounds, weights, c=None, *, alpha, beta):
     """Compute weighted local interval products with fixed allocation shapes.
 

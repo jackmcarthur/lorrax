@@ -445,8 +445,10 @@ Measured (A100-40GB, warm, ms per Green-sized product; CrI3 8×8
 
 cuBLASMp runs one SUMMA per q and joins the XLA stream by events at entry and
 exit, so it cannot overlap neighbouring work; this route exchanges every q in
-one collective per panel, and XLA overlaps the next panel's all-gather with
-the current GEMM. At P16 the exchange is most of a build (1.2 of 1.85 ms on
+one collective per panel. It gathers the next panel before the current GEMM,
+but under XLA's default scheduler that gather runs on the compute stream and
+does not overlap it (measured in the Σ τ loop; the lessons comment above
+`panel_matmul`). At P16 the exchange is most of a build (1.2 of 1.85 ms on
 CrI3).
 
 ## Face-pinned block glue

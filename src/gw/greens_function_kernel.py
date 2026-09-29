@@ -43,8 +43,9 @@ def face_green_product(A, B, mesh, phases, band_range, n_full=None, partner=Fals
     this route 2.64 s at v1 (before the one-exchange partner pair).  cuBLASMp
     loses because it runs one SUMMA per k (nq calls of p broadcast rounds) and
     joins the XLA stream by events at entry and exit, so it overlaps nothing;
-    this route moves the same bytes once per panel for every k, and XLA's
-    async all-gathers overlap the previous panel's GEMM.  At P16 the exchange
+    this route moves the same bytes once per panel for every k.  Its
+    prefetched gather does not overlap the GEMM either under XLA's default
+    scheduler (``distrib_la.panel_matmul``'s lessons).  At P16 the exchange
     is most of a build (all-gathers 1.2 of 1.85 ms on CrI3).
     """
     from distrib_la import panel_matmul

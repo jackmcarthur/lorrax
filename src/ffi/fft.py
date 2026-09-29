@@ -733,6 +733,19 @@ def _parent_open_spin(D, tables, right: bool):
 
 # ---- the router's pair-convolution factories --------------------------------
 
+# Kernel lessons: the zeta-fit pair convolution and plane FFT, modes 0, 1, 6 and 10 (numbers:
+# sandbox claim ids).
+# Over plain JAX: mode 10 against run concat + jnp.fft.fftn, 1.49-2.33x, production planes 54^2
+#   1.69x and 80^2 1.53x (2749), zeta charge loop -18.7% / -20.6% (2750); mode 6 (Bloch phase and
+#   L/R split on load) against the XLA moveaxis/phase/split + mode 1, route-G device time -30.7%
+#   (2704).
+# Paid: mode 10 at 512 threads, 80^2 3.26 -> 2.60 ms; its cp.async gather 1.11-1.37x (2785).
+# Did not pay: mode 1's typed parent load, 0.84-0.95x of XLA at VI3 12x12x1, 1.2-1.9x on TaAs
+#   (2650); a DFT GEMM on a full axis, never faster than cuFFT (2748); the CUDA leg on FFT-only
+#   plans, 1.20-1.33x slower than the XLA leg (2786); plan supports for density, mtxel and the
+#   zeta cylinder, <= 2% of FFT time (2785); one plane per block at N <= 40 (2749).
+# Decides it: HBM passes (mode 10 writes each plane once; route G runs at 64% of HBM) until
+#   residency binds: mode 6 at Fe 8^3 is 1 block per SM with 62% excess bank wavefronts (2796).
 def make_fused_conv_kpair(
     mesh: Mesh,
     kgrid: tuple[int, int, int],
@@ -1383,6 +1396,22 @@ def _outer_ksum_fma() -> int:
     return int(v == "fma")
 
 
+# Kernel lessons: the BSE W term's outer-product load and fused decode (numbers: sandbox claim ids).
+# Over plain JAX: one-trial matvec 9.76 -> 4.8 ms against the XLA encode and decode ZGEMMs around
+#   mode 2 (2.0x; 2844, 2874); CrI3 8x8 SOC Haydock step 55.0 -> 13.6 ms with the layout fixes
+#   (4.0x; 2834, 2874).
+# Paid: T formed on the load on DMMA and never stored, 9.76 -> 6.80 ms (2844); the decode in the
+#   store, U never stored, 7.0 -> 5.4 ms (2846); ping-pong of 2 x 8 warps, kernel 1.14x (2874);
+#   row-fastest FFT lines, mode 2 6.0 -> 4.4 ms (2845).
+# Did not pay: the FMA K sum, 8.85 against 4.97 ms on DMMA (2846; kept buildable); prefetch, unroll
+#   and L2-persisting variants (2844); a reordered decode, no speed while memory-bound (2844); the
+#   Mid folded into the inverse x pass 4.73 vs 4.65 ms, psi_c loads hoisted per k pair 5.06 ms,
+#   per-warp base pointers 4.69 ms, an even stream-K split 6.12 ms from L2 thrash (2846); 1 or 4 k
+#   in flight in the load, 3% slower than 2 (2874); a pair tile reusing both ISDF legs does not fit
+#   one SM (I).
+# Decides it: T bytes (the encode is ~7 flop/B) until T and U leave HBM; then one block per SM,
+#   fixed by the 128 KB register accumulator; now L2 operand latency (long_scoreboard 38%, pipe
+#   58%; 2874).  DMMA and named barriers are CUDA-only; ROCm takes the XLA encode and mode 2 (I).
 def make_local_kconv_klead_outer_decode(mesh: Mesh, kgrid, *, norm: str | None = "ortho") -> tuple:
     """Rank-local ``(prep, apply)``: :func:`make_local_kconv_klead_outer` with the BSE decode's first
     contraction fused into its store, so U never reaches HBM.
@@ -1469,6 +1498,25 @@ def x_block_rows(rows) -> np.ndarray:
     return (r // bx) * xs + x0 + r % bx
 
 
+# Kernel lessons: the k-box k-convolution, modes 2-5, 7-9 and 11 (numbers: sandbox claim ids).
+# Over plain JAX: BSE W conv, jnp.fft chain -> mode 4, 33.5 -> 7.1 ms (4.7x, 3x3x1 mu2048; 2672);
+#   kpair 8^3, cuFFT plan chain -> fused cuFFTDx, 115 -> 12.5 ms (9.2x; 2651); mode 7's load vs the
+#   XLA unfold + spin FFI + mode 2, 26.0 -> 17.2 ms per tau node (2705).
+# Paid: tile tables at n_s 4, mode 7 1.90x, mode 11 1.73x (2799); mode 7 on the stage with
+#   conflict-free lines and 2 blocks/SM, Fe 8^3 1.68x (2943); mode 11 accumulating on every thread,
+#   1.44x (2789); x blocks instead of d x d spin blocks, mu3088 d=1 201.8 -> 58.5 s (2841); tile
+#   super-order, Fe 8^3 1.28x (2956, branch); mode 11 on the metal direct stream: the freed memory,
+#   not the kernel, cut Green pairs 344 -> 100 per Fe 8^3 map (2950).
+# Did not pay: phase-balanced thread counts 1.014-1.029x (2827); cp.async double buffering -21%
+#   (2799); a staged load reading its tables per cell, 1.63x slower on mode 11, 1.10x on mode 7
+#   (2789); padded shared rows +7% on mode 11, +19% on mode 7 (2845); a per-member vertex Mid
+#   0.76-0.94x (2947); tile tables at n_s 2, CrI3 8x8 Sigma tau 5.58 -> 6.24 s (2799); small-grid
+#   butterflies, kernel -28%, tau sweep flat (2320); tau batching, Sigma_mn projection fusion and
+#   W-prep fusion have no mechanism, FP32 adds an error source (I); ping-pong: HIP has no named
+#   barriers and mode 7 already keeps 3-4 blocks per SM (I).
+# Decides it: blocks resident per SM (<= 64 registers, >= 2 blocks) and odd, conflict-free shared
+#   strides, not HBM or FP64 (Fe 8^3 mode 7 at ~50 GB/s and 0.8 TF/s; 2935); after that the
+#   unfold gather's L2 latency (long_scoreboard 49%; 2956).
 def make_kconv_klead_unfold(mesh: Mesh, kgrid, tables, *, store_rows, norm: str | None = "ortho",
                             mult: float = 1.0) -> Callable:
     """The Σ k-leading convolution read from the RAW-PARENT Green: ``fn(G, Gt, W_prep) -> U``.

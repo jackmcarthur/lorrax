@@ -112,6 +112,21 @@ shared memory per SM and its SM count, except the fixed budgets named in the
 router section. `cp.async` (sm_80+) is the only architecture-specific
 instruction (`common/lrx_async_gather.h`, `cufft/kbox_stage.cuh`).
 
+**Kernel lessons.** Each family's measured record (its largest speedup over
+the plain-XLA path, what was tried and did not pay, what limits it) is one
+comment block, with sandbox claim ids, at its Python owner. It stays out of
+the CUDA sources: the cubin key hashes the embedded kernel text, comments
+included (`common/nvrtc_build.h`).
+
+| family | block above |
+|---|---|
+| k-box k-convolution, modes 2–5, 7–9, 11 | `src/ffi/fft.py:make_kconv_klead_unfold` |
+| ζ-fit pair convolution and plane FFT, modes 0, 1, 6, 10 | `src/ffi/fft.py:make_fused_conv_kpair` |
+| BSE outer-product load and fused decode | `src/ffi/fft.py:make_local_kconv_klead_outer_decode` |
+| local active-range GEMM | `services/distrib_la/src/distrib_la/_active_local_cuda.py:active_local_cuda` |
+| 2-D SUMMA Green build | `services/distrib_la/src/distrib_la/_panel_matmul.py:panel_matmul` |
+| shared-pole W(τ) synthesis and transposes | `src/gw/mpa/sigma.py:synthesize_shared_pole_parents` |
+
 ### Dense linear algebra targets
 
 `distrib_la` owns these doors, their selection and their refusals

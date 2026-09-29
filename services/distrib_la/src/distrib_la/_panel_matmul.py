@@ -12,6 +12,21 @@ from ._shard_map import shard_map
 from .resolve import mesh_platform
 
 
+# Kernel lessons: the batched 2-D SUMMA Green build (numbers: sandbox claim ids).
+# Over plain JAX: none; it is XLA collectives plus the local active-range GEMM, 1.03-1.43x slower
+#   than the retired band-complete XLA gather, kept by the layout rule, not for speed (2949).
+#   Against cuBLASMp (one SUMMA per k, fenced into the XLA stream): 1.6-2.7x faster, except Fe 8^3
+#   at P16 (7.37 vs 5.11 ms) (2949).
+# Did not pay: cuBLASMp for G, faster only in CrI3 conduction windows (1.16 vs 1.66 ms), 31.5 vs
+#   6.8 ms on Fe 8^3 (2949); two K/2 panels, 1.85 ms at P16 but every band live on a rank, refused
+#   (2951); panels held across a Sigma call, 1/p_x of psi per rank, withdrawn (2944); holding only
+#   the first panel, Sigma tau -1 to -3% for 30 MB (2953, branch); conjugating the finished partner
+#   tile, Fe 4^3 W peak 1.50 -> 1.59 GB (2951).
+# Overlap: under XLA's default scheduler the prefetched gather runs on the compute stream, 0.01-0.02
+#   ms per tau node overlapped (2953).  The latency-hiding scheduler hides it (Sigma tau -4 to -6% at
+#   P16; 2953, 2958) but stays off: +0.5 GB/rank unpriced (2953), and before 676eeb9a2 remat
+#   reordered a loop-counter read under it (2961).
+# Decides it: at P16 the band-panel exchange is most of a build (all-gathers 1.2 of 1.85 ms; 2949).
 def panel_matmul(a, b, *, mesh, panel_bytes, bounds=None, weights=None, partner=False):
     """Multiply face matrices by a batched 2-D SUMMA over bounded contraction panels.
 
@@ -182,12 +197,14 @@ def _interleaved_kernel(mesh, q, m, k, n, width, active=False, weighted=False, p
     global K set ``{i·K/p + j·w + t}``, in the same order, so the local
     product of the two gathered panels is that panel's exact contribution to
     the rank's own output tile.  No reduction follows.  Panel ``j+1`` is
-    gathered before panel ``j`` is multiplied, so the collectives overlap the
-    GEMM.  ``active``: each row's interval ``[lo, hi)`` meets a panel in ONE
-    run of panel positions (a suffix of the first live owner's segment, whole
-    segments, a prefix of the last), so the local active-range GEMM contracts
-    only that run.  ``weighted``: a replicated ``(q, K)`` weight row scales
-    each panel's local slice of A before its all-gather.  ``partner``: the
+    gathered before panel ``j`` is multiplied; XLA's default scheduler still
+    runs the gather on the compute stream, so it does not overlap the GEMM
+    (see the lessons above ``panel_matmul``).  ``active``: each row's
+    interval ``[lo, hi)`` meets a panel in ONE run of panel positions (a
+    suffix of the first live owner's segment, whole segments, a prefix of the
+    last), so the local active-range GEMM contracts only that run.
+    ``weighted``: a replicated ``(q, K)`` weight row scales each panel's
+    local slice of A before its all-gather.  ``partner``: the
     raw panels are gathered and each product gets its own weighted (and, for
     the partner, conjugated) panel copy; two accumulators, no tile copy.
     """
