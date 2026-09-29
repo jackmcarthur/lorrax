@@ -69,3 +69,41 @@ def test_panel_matmul_partner_shares_one_exchange():
         for shard in tile.addressable_shards:
             np.testing.assert_allclose(np.asarray(shard.data), want[s][shard.index],
                                        rtol=1e-12, atol=1e-12)
+
+
+def test_panel_matmul_resident_panels():
+    """panel_resident's first panels, gathered once, give the same product: bit for bit
+    without weights and with partner=True (the exchanged panels are weight-free there);
+    one weight row then scales the gathered panel, so it matches the dense product.
+    At most half of every owner block is resident."""
+    from distrib_la import panel_resident, panel_resident_bytes
+    platform = jax.default_backend()
+    require_devices(4, platform)
+    mesh = Mesh(np.asarray(jax.devices(platform)[:4]).reshape(2, 2), ("x", "y"))
+    rng = np.random.default_rng(13)
+    q, m, k, n = 3, 6, 8, 10
+    a_h = rng.standard_normal((q, m, k)) + 1j * rng.standard_normal((q, m, k))
+    b_h = rng.standard_normal((q, k, n)) + 1j * rng.standard_normal((q, k, n))
+    w_h = rng.standard_normal((q, k)) + 1j * rng.standard_normal((q, k))
+    rows = np.asarray([[1, 7], [0, 8], [4, 5]], np.int32)
+    face = NamedSharding(mesh, P(None, "x", "y"))
+    rep = NamedSharding(mesh, P())
+    a, b = device_put_process_local(a_h, face), device_put_process_local(b_h, face)
+    res = panel_resident(a, b, mesh=mesh, panel_bytes=1 << 30)
+    assert res is not None and res[0].shape[0] * res[0].shape[-1] <= k // 2
+    assert panel_resident_bytes(q=q, m=m, k=k, n=n, mesh=mesh, panel_bytes=1 << 30) == (
+        16 * q * (m // 2 + n // 2) * res[0].shape[-1] * res[0].shape[0])
+    weighted = dict(bounds=device_put_process_local(rows, rep),
+                    weights=device_put_process_local(w_h, rep))
+    for kw in (dict(), dict(weighted, partner=True)):
+        base = panel_matmul(a, b, mesh=mesh, panel_bytes=1 << 30, **kw)
+        held = panel_matmul(a, b, mesh=mesh, panel_bytes=1 << 30, resident=res, **kw)
+        for x, y in zip(jax.tree.leaves(base), jax.tree.leaves(held)):
+            for sx, sy in zip(x.addressable_shards, y.addressable_shards):
+                assert np.array_equal(np.asarray(sx.data), np.asarray(sy.data)), kw.keys()
+    want = np.zeros((q, m, n), complex)
+    for i, (lo, hi) in enumerate(rows):
+        want[i] = (a_h[i, :, lo:hi] * w_h[i, lo:hi]) @ b_h[i, lo:hi, :]
+    held = panel_matmul(a, b, mesh=mesh, panel_bytes=1 << 30, resident=res, **weighted)
+    for shard in held.addressable_shards:
+        np.testing.assert_allclose(np.asarray(shard.data), want[shard.index], rtol=1e-12, atol=1e-12)

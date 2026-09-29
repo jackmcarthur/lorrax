@@ -123,6 +123,16 @@ def check_tau_kernel_parent_dense(mesh, *, ns, nk_tuple, n_rmu, nb_full,
         E_ref_A, E_ref_B, t_node), mesh)[..., :nb_sigma, :nb_sigma]
     if dead_from is not None:
         assert not np.any(got[-1]), "a bracket with no live band must read zero"
+    # The window runner's loop invariant (the Green's resident SUMMA panels,
+    # gathered once): bit for bit on the partner route, round-off on a single
+    # weight row (the phases then scale the gathered panel).
+    args = (xn, yr, xr, yn, energy, sel, B_poles, Omega_poles, pole_indices, bounds,
+            phase_real, E_ref_A, E_ref_B)
+    held = _to_host(kernel(*args, t_node, None, kernel.loop_invariants(*args)),
+                    mesh)[..., :nb_sigma, :nb_sigma]
+    moved = float(np.max(np.abs(held - got)))
+    p0(f"  resident panels: max|dSigma| = {moved:.3e}")
+    assert moved <= 1e-13 * max(float(np.max(np.abs(got))), 1e-300)
     reference = _dense_tau(psi_full, np.asarray(E_A), np.asarray(sel),
         np.asarray(B_poles[0]), np.asarray(Omega_q), complex(t_node),
         brackets, nb_sigma)
