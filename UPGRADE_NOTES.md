@@ -3,6 +3,66 @@
 User-visible changes, newest first. Binding rulings behind the breaking
 changes live in `docs/architecture/decisions.md`.
 
+## 2026-09-29 — `sc_semicore = dft`: semicore pinned at its DFT block, mixing kept
+
+New SC key, default `dft` (owner 2026-09-29: "sure we can keep DFT the default"); `qp` is the previous behaviour. Every dynamic SC deck with a coarse class moves once.
+Under `dft` the coarse (semicore) class keeps its DFT block of H in the DFT
+basis and its end of every protected–semicore element reads Σ at E_DFT on the
+held coarse windows ([self-consistency §2](docs/self_consistency.md#2-band-treatment)).
+Fe 4³ and MoS2 3×3 prot at η_semi 5 and 8 eV: same maps to converge (14, 8),
+equal or fewer τ pairs (MoS2 333 → 321), semicore QP within 27 meV of DFT
+(qp: 0.1–6 eV deeper), and the protected states' η_semi 8 − 5 spread falls
+3–6× (E_F ± 10 eV std Fe 5.1 → 1.4, MoS2 5.0 → 0.8 meV). A run without a
+coarse class refuses (`GATE sc_semicore`). Sandbox claim 2964.
+
+## 2026-09-29 — coarse (semicore) windows certified at ε 3e-3
+
+Self-consistent decks with a coarse class move once. The coarse windows are
+certified at max(`sigma_quadrature_eps`, 3e-3) (`qp_support.SEMICORE_EPS`,
+owner 2026-09-29); every other Σ window keeps `sigma_quadrature_eps`. At
+η_semi 1 eV against ε 1e-4: map-2 τ pairs MoS2 3×3 530 → 465, Fe 4³ charge
+1087 → 982; states within E_F ± 10 eV move ≤ 0.06 meV at maps 0–1 (≤ 1.9 meV
+at map 2 of the unconverged Fe run); semicore QP ≤ 4.3 meV at map 0. The
+planner's node law for grouping coarse windows is now evaluated on the box
+each run is built on, so it equals the certified count (claim 2960).
+
+## 2026-09-29 — the production QSGW partition: counted b3, semicore Σ read class
+
+Every dynamic self-consistent deck with a coarse class (`qp_solver =
+self_consistent`, scalar MPA/shared-pole route) moves once. See
+[self-consistency §2](docs/self_consistency.md#2-band-treatment).
+
+- **b3 counts bands, as before.** b3 = nelec + `ncond` (owner 2026-09-29: "b3
+  will count bands as on main yes, and only bands between b0 and b3 will be
+  rotated amongst each other"). The QP matrix [b0, b3) rotates among itself;
+  [b3, number_bands) is the scissored tail (DFT ψ, rigid shift, no Σ, no
+  mixing). The ζ fit is unchanged. The classes below change only where
+  Σ_c(ω) is read.
+- **One request key, `number_bands_protected`** (the documented form): every
+  occupied band plus conduction bands up to that total. Its semicore (coarse)
+  class is every occupied band below a ≥ 4 eV band gap. The `nval` / `ncond`
+  form stays: there the coarse class is every occupied state below the
+  lowest requested valence band (a smaller `nval` moves more valence states
+  onto the coarse windows). Giving both forms refuses
+  (`GATE band_request_forms`). A dipole artifact is stamped with the request
+  window, so a deck switched to `number_bands_protected` needs a dipole
+  written with `nval` = the occupied count.
+- **Semicore moves to coarse windows.** On the scalar MPA/shared-pole route the
+  coarse states are read at their own energy on held windows at η_semi = 5 eV
+  (one per coarse manifold; the Σ plan groups them to the least closed-form
+  node count) instead of at Σ(ω = 0) (below E_F − 15 eV) or on the near grid
+  at the deck η, certified at max(`sigma_quadrature_eps`, 3e-3).
+  `sigma_omega_patches_ev` accepts `lo:hi:eta` triples as user coarse windows
+  (`GATE sigma_coarse_window`). Sector (bispinor) routes keep the old rule.
+- **Far conduction.** From map 1, protected conduction states broader than the
+  deck η at map 0 (Γ_n = |Im Σ_nn(E_n)|, above the highest sharp one) are read
+  on held windows above the near grid at η_n = max(η, Γ_n), rounded down to
+  η·2^j; map 1 re-plans the support and the rules once. The protected end of
+  every off-diagonal average stays at the deck η, so mixing is kept.
+- **A warning.** A QP matrix that ends inside a band manifold is logged with the
+  `number_bands_protected` that closes it.
+- **A new refusal.** `zeta_nband` below b3 now refuses on every run,
+  one-shot included (`GATE qp_matrix_zeta_left`; it was a warning).
 ## 2026-09-29 — shared-pole χ₀ direct stream through mathdx mode 11
 
 - The shared-pole bank's direct stream (charge, metal or insulator, on a

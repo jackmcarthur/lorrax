@@ -359,6 +359,8 @@ def _load_system_inputs(config, input_dir, mesh_xy, report, print0, _config_prov
             report.emit(line.strip())
     report.architecture()
     report.method(config=config)
+    # The QP request (number_bands_protected) resolves against the WFN here.
+    config = config.with_band_request(wfn, print0)
     return (config, wfn, material_class, sym, centroid_basis, centroid_indices, n_rmu, tmp_dir, tensors_filename)
 
 

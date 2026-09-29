@@ -482,6 +482,22 @@ def _freeze_core_block_to_dft(H, e_dft_kn_ry, n_frozen):
     return H.at[:, idx, idx].set(diag)
 
 
+@jax.jit
+def _pin_semicore_block_to_dft(H, e_dft_kn_ry, pin_kn):
+    """``sc_semicore = dft``: the coarse block of H is the DFT block.
+
+    ``pin_kn`` names DFT labels (the fixed basis H is carried in), so the pin
+    is on the projector P_S onto the DFT semicore orbitals and is untouched
+    by the QP rotation: H_ss' = delta_ss' E_DFT_s; every protected-semicore
+    element H_ps is kept (mixing).  Elementwise, so it keeps H's sharding.
+    """
+    both = pin_kn[:, :, None] & pin_kn[:, None, :]
+    eye = jnp.eye(H.shape[-1], dtype=bool)[None]
+    dft = jnp.where(eye, e_dft_kn_ry.astype(H.dtype)[:, :, None],
+                    jnp.zeros((), H.dtype))
+    return jnp.where(both, dft, H)
+
+
 @dataclass(frozen=True)
 class SCMapScreeningArtifacts:
     """Screening artifacts owned by one completed QSGW map evaluation.
@@ -2694,6 +2710,43 @@ class SCSupport(NamedTuple):
     event: str                 # one-shot | plan | hold | extend
     envelope: tuple | None     # R's envelope since the last plan, eV
     no_qp: np.ndarray          # requested identities dropped for Z outside (0, 1]
+    semicore: np.ndarray | None = None   # semicore identities (read on the patch)
+    patch: tuple | None = None           # the held automatic patches ((lo, hi, eta), ...), eV
+    patch_event: str = ""                # plan | hold | extend
+    joined: np.ndarray | None = None     # coarse-window samples + the near grid: what Sigma samples
+    windows: tuple = ()                  # this map's coarse windows (lo, hi, eta, user), eV
+    far: np.ndarray | None = None        # far-conduction identities (read above the near grid)
+    far_patch: tuple | None = None       # the held far-conduction windows ((lo, hi, eta), ...), eV
+
+
+def _sc_coarse_identities(inputs, shape):
+    """Coarse (semicore) identities on the loop k-set, a ``shape`` bool mask.
+
+    Every state whose DFT energy lies below the coarse floor
+    (``band_partition.semicore_floor``: the minimum energy of the lowest
+    requested valence band, or a >= 4 eV gap under number_bands_protected;
+    kept on ``meta.coarse_class``).
+    Fixed for the run.  Only the scalar MPA/shared-pole Sigma reads the patch;
+    a sector route reads the near grid under main's rule, so it has none.
+    """
+    from .qp_support import semicore_patch_route
+    cut = getattr(getattr(inputs, "meta", None), "coarse_class", None)
+    if (cut is None or not cut.n_coarse
+            or not semicore_patch_route(inputs.config.compute_mode, inputs.wfns_transverse)):
+        return np.zeros(shape, dtype=bool)
+    ks = _kstar(inputs)
+    e_ry = (inputs.e_dft_active_kn_ry if ks.is_identity
+            else ks.select(inputs.e_dft_active_kn_ry))
+    e_ev = np.asarray(e_ry, dtype=np.float64) * RYD_TO_EV
+    return np.broadcast_to(e_ev < float(cut.coarse_floor_ev), shape)
+
+
+def _sc_far_route(inputs):
+    """True when the far-conduction class can apply: the production band
+    request on the scalar MPA/shared-pole route (the coarse-window predicate)."""
+    from .qp_support import semicore_patch_route
+    return (getattr(getattr(inputs, "meta", None), "coarse_class", None) is not None
+            and semicore_patch_route(inputs.config.compute_mode, inputs.wfns_transverse))
 
 
 def _sc_sampled_support(inputs, partition, energies_loop, mu_ev, active_n=None,
@@ -2728,12 +2781,26 @@ def _sc_sampled_support(inputs, partition, energies_loop, mu_ev, active_n=None,
         support_partition.protected_mask | support_partition.in_range_mask,
         dtype=bool), energies_loop.shape)
     energy_relative_ev = energies_loop - mu_ev
+    # THE COARSE (SEMICORE) CLASS reads its own patch (gw.qp_support); every
+    # other QP-matrix identity is protected at the deck eta, on the near grid.
+    semicore = _sc_coarse_identities(inputs, energies_loop.shape)
+    n_semi = int(np.count_nonzero(semicore))
     # Owner 2026-09-24: the requested states are the protected identities the
     # W model treats as active (``active_n``: shared_pole_recipe.active_band_mask
     # on the fixed DFT ladder), never frozen core; owner 2026-09-27: only
     # quasiparticles move the support.
     everyone = requested_states(sigma, inputs.config.sc.frozen_core_bands,
                                 energy_relative_ev, required_kn, active_n)
+    # Coarse and far-conduction identities leave R; every other identity keeps
+    # main's W-active rule.
+    gamma = None if session is None else session.get("far_gamma_kn")
+    if gamma is not None and _sc_far_route(inputs):
+        from .qp_support import far_class_kn
+        far = far_class_kn(energies_loop - mu_ev, np.broadcast_to(gamma, energies_loop.shape),
+                           everyone & ~semicore, float(sigma.regularization_ev))
+    else:
+        far = np.zeros(energies_loop.shape, dtype=bool)
+    everyone = everyone & ~semicore & ~far
     quasiparticle = (None if z_in_kn is None else
                      quasiparticle_mask(np.broadcast_to(z_in_kn, energies_loop.shape)))
     states = everyone if quasiparticle is None else everyone & quasiparticle
@@ -2745,8 +2812,50 @@ def _sc_sampled_support(inputs, partition, energies_loop, mu_ev, active_n=None,
         grid, envelope, event = hold_support_ev(
             sigma, requested, sampled_grid, session.get("support_envelope_ev"),
             energy_relative_ev, states)
+    patch, patch_event, windows = None, "", ()
+    users = getattr(sigma, "coarse_windows_ev", tuple)()
+    if users and not n_semi:
+        raise ValueError(
+            "GATE sigma_coarse_window: sigma_omega_patches_ev lo:hi:eta windows serve the "
+            "SC coarse (semicore) class on the scalar MPA/shared-pole route, and this run "
+            "has none.")
+    if n_semi:
+        from .qp_support import (_inside_any, coarse_windows_ev, semicore_patch_escapes,
+                                 semicore_patches_ev)
+        near_lo = float(grid[0])
+        auto = semicore & ~_inside_any(energy_relative_ev, users)
+        held = None if session is None else session.get("semicore_patches_ev")
+        if plan is None or held is None:
+            patch, patch_event = semicore_patches_ev(energy_relative_ev, auto, near_lo), "plan"
+        elif semicore_patch_escapes(energy_relative_ev, semicore, near_lo, held, users).any():
+            patch, patch_event = semicore_patches_ev(
+                energy_relative_ev, auto, near_lo, previous=held), "extend"
+        else:
+            patch, patch_event = held, "hold"
+        windows = coarse_windows_ev(near_lo, patch, users)
+    far_patch = None
+    if far.any():
+        from .qp_support import (SEMICORE_PATCH_EDGE_EV, extend_far_windows_ev,
+                                 far_patch_escapes, far_windows_ev)
+        near_hi = float(grid[-1])
+        held_far = None if session is None else session.get("far_patches_ev")
+        if plan is None or held_far is None:
+            far_patch, far_event = far_windows_ev(
+                energy_relative_ev, far, np.broadcast_to(gamma, energies_loop.shape), near_hi,
+                float(sigma.regularization_ev)), "plan"
+        elif far_patch_escapes(energy_relative_ev, far, near_hi, held_far).any():
+            far_patch, far_event = extend_far_windows_ev(
+                held_far, energy_relative_ev, far), "extend"
+        else:
+            far_patch, far_event = held_far, "hold"
+        patch_event = patch_event if patch_event not in ("", "hold") else far_event
+        windows = tuple(windows) + tuple(
+            (max(float(lo), near_hi + SEMICORE_PATCH_EDGE_EV), float(hi), float(eta), False)
+            for lo, hi, eta in far_patch if float(hi) > near_hi + SEMICORE_PATCH_EDGE_EV)
+    from .qp_support import joined_grid_ev
     return SCSupport(sampled_grid, grid, energy_relative_ev, states, event,
-                     envelope, no_qp)
+                     envelope, no_qp, semicore, patch, patch_event,
+                     joined_grid_ev(grid, windows), windows, far, far_patch)
 
 
 def _record_sc_window_plan(inputs, iteration, support):
@@ -2808,6 +2917,26 @@ def _record_sc_window_plan(inputs, iteration, support):
                    f"read support [{e[k, n] - half:+.6f}, {e[k, n] + half:+.6f}] eV "
                    f"crosses the {side} edge; pad {SUPPORT_PAD_EV:.2f} eV; grid {grids}; "
                    f"extension {count} of this run")
+
+
+def _record_semicore_z(inputs, iteration, z_kn, semicore_kn):
+    """One receipt per map: semicore Z on the patch (the SC +-0.5 eV stencil).
+
+    Owner question 2026-09-28: is the semicore Z pathological as eta_semi
+    shrinks?
+    """
+    z = np.asarray(z_kn, dtype=np.float64)
+    mask = np.broadcast_to(np.asarray(semicore_kn, bool), z.shape)
+    if not mask.any():
+        return
+    zs = z[mask]
+    bad = mask & ~((z > 0.0) & (z <= 1.0))
+    bands = sorted(set((np.nonzero(bad)[1] + 1).tolist()))
+    line = (f"    SC semicore Z (map {iteration}, patch, +-0.5 eV stencil): n={zs.size} "
+            f"min={zs.min():+.4f} median={np.median(zs):+.4f} max={zs.max():+.4f}; "
+            f"outside (0, 1]: {int(bad.sum())} (k,state)"
+            + (f" in bands {bands}" if bands else ""))
+    _record_sc(inputs, line)
 
 
 def _sc_active_identities(inputs):
@@ -3353,13 +3482,35 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
     # below uses and qsgw_utils.omega_coverage, the classification
     # build_qsgw_sigma_xc reads (sigma_eval_omega).  The tail law excludes it.
     from .qsgw_utils import omega_coverage
+    # SC_SEMICORE = DFT (owner 2026-09-29).  The coarse class is a set of DFT
+    # labels (fixed at map 0); the QP column assign_qp_identity maps to a
+    # label reads Sigma at that label's E_DFT, so its end of every H_ps is
+    # Sigma_ps(E_DFT_s) and its held coarse windows never follow it.
+    semicore_pin, energies_read_loop, E_read_full = None, energies_loop, E_full
+    if inputs.config.sc.semicore == "dft":
+        semicore_pin = np.array(_sc_coarse_identities(inputs, energies_loop.shape))
+        if not semicore_pin.any():
+            raise ValueError(
+                "GATE sc_semicore: sc_semicore = dft pins the coarse (semicore) class "
+                "of the scalar MPA/shared-pole route, and this run has none.")
+        e_dft_loop_ry = np.asarray(
+            inputs.e_dft_active_kn_ry if ks.is_identity
+            else ks.select(inputs.e_dft_active_kn_ry), dtype=np.float64)
+        energies_read_loop = np.where(
+            semicore_pin, e_dft_loop_ry * RYD_TO_EV, energies_loop)
+        read_ry = np.array(E_qp_ry, dtype=np.float64)
+        rows, labels = np.nonzero(semicore_pin)
+        read_ry[rows, indices_loop[rows, labels]] = e_dft_loop_ry[rows, labels]
+        E_read = device_put_process_local(
+            read_ry.astype(E_qp_ry.dtype), E_qp_ry.sharding)
+        E_read_full = E_read if ks.is_identity else ks.broadcast(E_read)
     sc_support = (None if not inputs.config.compute_mode.is_dynamic else
-                  _sc_sampled_support(inputs, partition, energies_loop, sigma_frame_mu_ev(
+                  _sc_sampled_support(inputs, partition, energies_read_loop, sigma_frame_mu_ev(
                       inputs.config, inputs.wfn, E_full, efermi_ry,
                       entry_occ_state if inputs.material_class == "metal" else None),
                       _sc_active_identities(inputs), state.tail_z_kn))
     sigma0_kn = (np.zeros(energies_loop.shape, dtype=bool) if sc_support is None
-                 else ~omega_coverage(sc_support[1], sc_support[2])[0])
+                 else ~omega_coverage(sc_support.joined, sc_support.energy)[0])
 
     # ENERGY-ONLY SCISSOR FOR THE SUM-BAND TAIL.  No new iteration state:
     # the fit is derived from the current carry's eigenspectrum and the
@@ -3923,8 +4074,20 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
             session["omega_grid_ev"] = tuple(float(x) for x in expanded_grid)
             session["window_plan"] = {
                 "event": event, "iteration": int(state.iteration)}
+            session["semicore_patches_ev"] = sc_support.patch
+            session["far_patches_ev"] = sc_support.far_patch
+        if sc_support.windows and sc_support.patch_event != "hold":
+            _record_sc(inputs, f"    SC coarse windows ({sc_support.patch_event}, map "
+                       f"{int(state.iteration)}): " + ", ".join(
+                           f"[{w[0]:+.2f}, {w[1]:+.2f}]@{w[2]:g}{' user' if w[3] else ''}"
+                           for w in sc_support.windows)
+                       + f" eV around the near grid [{expanded_grid[0]:+.2f}, "
+                       f"{expanded_grid[-1]:+.2f}] eV; {int(sc_support.semicore.sum())} "
+                       f"coarse and {int(0 if sc_support.far is None else sc_support.far.sum())} "
+                       "far-conduction (k,state) keep their full Sigma rows")
         sigma_config = replace(
-            inputs.config, sc_omega_grid_ev=tuple(float(x) for x in expanded_grid))
+            inputs.config, sc_omega_grid_ev=tuple(float(x) for x in sc_support.joined),
+            sc_coarse_windows_ev=tuple(sc_support.windows) or None)
     sigma_result = compute_sigma_xc(
         inputs.config.compute_mode,
         occupation_state=metal_occ_state,
@@ -3933,7 +4096,7 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
         bispinor_v_q_path=inputs.bispinor_v_q_path, mu_bases=inputs.mu_bases,
         # FULL-BZ E, for the same reason as hartree_basis_rotation above:
         # every operand compute_sigma_xc sees is on the full BZ.
-        e_qp_ev=np.asarray(E_full) * RYD_TO_EV,
+        e_qp_ev=np.asarray(E_read_full) * RYD_TO_EV,
         static_head_terms=iteration_static_head_terms,
         head_resolver=inputs.head_resolver,
         quad=inputs.quad,
@@ -4038,6 +4201,13 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
         if int(state.iteration) == 0:
             _record_sc(inputs, f"    SC frozen core: bands 1-{n_frozen_core} "
                                "held at their DFT block (not updated)")
+    if semicore_pin is not None:
+        H_qp_dft_full = _pin_semicore_block_to_dft(
+            H_qp_dft_full, e_dft_loop_ry, semicore_pin)
+        if int(state.iteration) == 0:
+            _record_sc(inputs, f"    SC semicore = dft: {int(semicore_pin.sum())} coarse "
+                               "(k,label) hold their DFT block; H_ps reads Sigma_ps at "
+                               "E_DFT_s (mixing kept)")
 
     # ── THE UN-EXTRAPOLATED TWIN ────────────────────────────────────────
     # Present only when ``use_band_extrapolation`` drove this stage's Σ.
@@ -4056,8 +4226,11 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
                 if transverse is None else
                 _add_exact_four_current_hartree(
                     delta_h_dft_n3, scalar, transverse))
+        H_n3 = inputs.kin_ion_dft + delta_h_dft_n3
+        if semicore_pin is not None:
+            H_n3 = _pin_semicore_block_to_dft(H_n3, e_dft_loop_ry, semicore_pin)
         _report_extrapolation_eqp_shift(
-            H_qp_dft_full, inputs.kin_ion_dft + delta_h_dft_n3,
+            H_qp_dft_full, H_n3,
             mesh_xy=inputs.mesh_xy, n_occ=n_occ,
             iteration=state.iteration, print_fn=inputs.print_fn)
 
@@ -4164,8 +4337,12 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
         # whose sorted columns indices_loop maps to identities.  Collective,
         # every rank.
         z_sorted = _sc_z_factors(inputs, state_out, energies_loop)
+        _sc_record_far_gamma(inputs, state, state_out, indices_loop)
         state_out = replace(state_out, tail_z_kn=np.take_along_axis(
             np.asarray(z_sorted, dtype=np.float64), indices_loop, axis=1))
+        if sc_support is not None and sc_support.windows:
+            _record_semicore_z(inputs, int(state.iteration), state_out.tail_z_kn,
+                               sc_support.semicore)
     _record_sc_map_stages(inputs, state.iteration, _map_started,
                           _map_stages_before)
     return state_out
@@ -4549,6 +4726,41 @@ def _sc_edge_ambiguity(inputs: SCInputs, state_out: SCState) -> tuple[int, str]:
                f"{int(b) + 1}, E-mu={float(e_rel[k, b]):+.3f} eV; grid "
                f"[{float(omega[0]):+.2f}, {float(omega[-1]):+.2f}] eV, growth window "
                f"[{window[0]:+.2f}, {window[1]:+.2f}] eV")
+
+
+def _sc_record_far_gamma(inputs, state, state_out, indices_loop):
+    """At SC map 0: Gamma_n = |Im Sigma_nn(E_n)| per identity (eV), from this
+    map's Sigma on its grid (read coarsely, at the deck eta), kept on the
+    session for the far-conduction class (``qp_support.far_class_kn``), and the
+    one planned re-plan of the support and the Sigma rules at map 1."""
+    session = inputs.fixed_quadrature_session
+    if (session is None or int(state.iteration) != 0 or "far_gamma_kn" in session
+            or not _sc_far_route(inputs)):
+        return
+    sigma = state_out.outputs.sigma_result
+    cube, omega = sigma.sigma_c_omega_kij_ry, sigma.omega_grid_ev
+    if cube is None or omega is None:
+        return
+    from .qsgw_utils import extract_sigma_diag_replicated
+    diag = np.asarray(extract_sigma_diag_replicated(cube, inputs.mesh_xy),
+                      dtype=np.complex128) * RYD_TO_EV
+    if sigma.sigma_band_axis is not None:
+        from runtime.padding import strip_axis
+        diag = np.asarray(strip_axis(diag, sigma.sigma_band_axis, axis=-1))
+    w = np.asarray(omega, dtype=np.float64)
+    e_rel = np.asarray(sigma.e_eval_ev, dtype=np.float64) - float(sigma.efermi_dft_ev)
+    # linear interpolation of Im Sigma_nn at each E_n on the (ascending) grid, all (k, n) at once
+    j = np.clip(np.searchsorted(w, e_rel), 1, w.size - 1)
+    t = np.clip((e_rel - w[j - 1]) / (w[j] - w[j - 1]), 0.0, 1.0)
+    im = diag.imag
+    lo = np.take_along_axis(im, (j - 1)[None], axis=0)[0]
+    hi = np.take_along_axis(im, j[None], axis=0)[0]
+    gamma = np.abs((1.0 - t) * lo + t * hi)
+    gamma = np.take_along_axis(gamma, np.asarray(indices_loop), axis=1)
+    session["far_gamma_kn"] = gamma
+    # one planned re-plan at map 1: the far class leaves the near grid
+    session.pop("window_plan", None)
+    session.pop("rules", None)
 
 
 def _sc_z_factors(

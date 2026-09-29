@@ -125,15 +125,107 @@ energies, so it takes these dipoles at the same diagonal approximation.
 
 | bands | block of $H'$ |
 |---|---|
-| the `nval + ncond` QP window | full $\Sigma^{\rm QSGW}$, off-diagonals kept within the window |
+| the QP matrix `[b0, b3)`, b3 = nelec + `ncond` as counted on main | full $\Sigma^{\rm QSGW}$, off-diagonals kept within the matrix |
+| its coarse (semicore) states (below) | full rows, read at their own energy on held coarse windows at $\eta_{\rm semi}$ = 5 eV |
 | the lowest `sc_frozen_core_bands` | held at the DFT block $\mathrm{diag}(E_{\rm DFT})$; they stay in the $\Sigma_x$ and $\chi_0$ sums |
-| the sum-band tail `[b3, number_bands)` | DFT orbitals with an energy-only rigid shift, refit every map: the $Z$-weighted mean QP correction of the window's conduction states that read their own $\Sigma(E)$ (below) |
+| the scissored tail `[b3, number_bands)` | DFT orbitals with an energy-only rigid shift, refit every map, in G and $\chi_0$ only: the $Z$-weighted mean QP correction of the matrix's conduction states that read their own $\Sigma(E)$ (below) |
 
-Every window band keeps its full Σ. Under the default `sigma_out_of_grid =
-cover` a band the W model treats as active reads Σ at its own energy, and
-the grid grows over it; a deeper band reads $\Sigma(\omega = 0)$ (§4). Map 0, or an
-authenticated seed, classifies the band set once, and the set stays frozen:
-no band enters or leaves it later.
+**b3 counts bands** (owner 2026-09-29: "b3 will count bands as on main yes,
+and only bands between b0 and b3 will be rotated amongst each other"). b3 =
+nelec + `ncond` (`number_bands_protected` resolves to the same count); only
+[b0, b3) rotates, and the ζ fit is untouched. A `zeta_nband` below b3
+refuses on every route (`GATE qp_matrix_zeta_left`): a state outside the
+fit's left range would carry Σ on unfitted pairs. The classes below change
+only where each QP-matrix state's $\Sigma_c(\omega)$ is read
+(`band_partition.semicore_floor`, `qp_support`).
+
+**The request and the coarse (semicore) class.** Two exclusive forms name the
+QP request; giving both refuses (`GATE band_request_forms`).
+
+- `number_bands_protected = N` (the documented form, owner 2026-09-29): every
+  occupied band plus conduction bands up to N in total. The coarse class is
+  every occupied band below a band gap of at least
+  `band_partition.SEMICORE_GAP_EV` = 4 eV (all k) under the requested bands
+  within μ ± 10 eV; none without such a gap.
+- `nval` / `ncond`: the fine window, read at the deck η, runs down to the
+  minimum energy of the lowest requested valence band (`nelec − nval` at each
+  k, the count below μ on a metal; `sigma_omega_min_ev` only lowers it), and
+  every occupied state below that energy is coarse. A deck whose `nval`
+  covers every occupied band has none. The rule is energy-based, so a coarse
+  state inside the fine grid's lower pad reads the fine grid.
+
+A coarse state stays in the matrix and mixes fully, but its Σ is read at its
+own energy on coarse windows of the grid below the near support. The
+automatic windows are one per coarse manifold (levels separated by a global
+gap wider than twice the 2 eV plan pad), at $\eta_{\rm semi}$ = 5 eV, sampled
+at $\eta_{\rm semi}/2$ (`qp_support.SEMICORE_*`), planned at map 0 over the
+coarse DFT energies and held; a coarse read that leaves them extends them, as
+the near support is extended. `sigma_omega_patches_ev` triples `lo:hi:eta`
+(eV about E_F) are user windows: the coarse states inside one read it at its
+own η instead (`GATE sigma_coarse_window` refuses a malformed, overlapping or
+sub-deck-η triple, or one without a coarse class). In the Σ plan the
+crossing windows that own coarse samples serve them at the window's η and
+max(`sigma_quadrature_eps`, `qp_support.SEMICORE_EPS` = 3e-3) (owner
+2026-09-29; against 1e-4 it moves states within E_F ± 10 eV by ≤ 0.06 meV
+at maps 0–1 and semicore QP by ≤ 4.3 meV at map 0, for 10–12 % fewer map
+pairs on MoS2 and Fe); adjacent automatic windows of one η share a rule
+window when that lowers the summed closed-form node count of the boxes the
+runs are built on (`sigma_box_plan._coarse_runs`, decided at map 0 and
+held); a user window is never grouped; sign-definite windows serve coarse
+samples at the deck η. Broadening flattens $d\Sigma/d\omega$: at the deck η the
+Fe 3s $Z$ leaves $(0, 1]$ from map 1 and the loop stalls; at 5 eV every coarse
+$Z$ stays inside (one `SC semicore Z` receipt per map). The η_semi systematic
+is reported apart from the 1 meV budget of the controllable errors: converged
+E_F ± 1 eV std/max 3.6/15.9 meV (Fe 4³, against η_semi 1 eV) and 2.9/20.0 meV
+(MoS2 3×3, against the deck η), growing about 1.2 and 0.6 meV std per eV
+(claim 2960).
+
+**Far conduction** (owner 2026-09-29; no material constant). A protected
+conduction state n is read at $\eta_n = \max(\eta, \Gamma_n)$, with
+$\Gamma_n = |{\rm Im}\,\Sigma_{nn}(E_n)|$ from the map-0 Σ (read on the near
+grid at the deck η). The far class is every protected state above the highest
+protected conduction state with $\Gamma_n \le \eta$ (`qp_support.far_class_kn`);
+from map 1 it leaves the near grid, whose crossing window's short side it
+set, and is read at its own energy on held windows above it
+(`qp_support.far_windows_ev`: each window's η is a step of
+$\min_{E_m \ge E}\eta_m$ rounded down to $\eta\,2^j$, so no window reads a state
+broader than its own $\Gamma$), grouped and certified as the coarse windows.
+Map 1 re-plans the support and the Σ rules once for this; then they are
+held. The protected end of every off-diagonal Hermitian average is still read
+on the near grid at the deck η, so the mixing of far states with protected
+ones is kept. At the deck η the matrix-top states of Fe 4³ sit in a resonance
+with the tail's levels and the SC map is bistable there (claim 2960).
+A QP matrix [b0, b3) that ends inside a band manifold (band b3's maximum over
+k above band b3+1's minimum) is warned about in the log, which names the
+`number_bands_protected` that closes the manifold; it is not refused. Only the
+scalar MPA/shared-pole Σ reads coarse windows; a sector (bispinor) route
+keeps the rule below.
+
+**Pinned semicore** (`sc_semicore = dft`, owner 2026-09-29: the pseudopotentials
+are fitted to DFT, so the semicore stays at its DFT energies while its mixing
+with the protected states is kept). H is carried in the fixed DFT basis, and
+the pin is on the projector $P_S$ onto the coarse labels' DFT orbitals:
+
+$$P_S H P_S = P_S H^{\rm DFT} P_S = {\rm diag}(E^{\rm DFT}_s),\qquad
+H_{ps} = \tfrac12\big[\Sigma_{ps}(E^{\rm QP}_p) + \Sigma_{ps}(E^{\rm DFT}_s)\big]^{\rm h} - V^{\rm xc}_{ps}.$$
+
+The semicore–semicore block carries no $\Sigma - V^{\rm xc}$; every other
+element is the QSGW one. The Hermitian average is formed in the current QP
+eigenbasis, where a QP column reads at the $E^{\rm DFT}$ of the coarse label
+`sc_state_identity.assign_qp_identity` gives it (largest $|U|^2$ overlap; a DFT
+multiplet is one capacity block with one energy, so its internal gauge does
+not enter), and the rotation back to the DFT basis carries it. The labels are
+the map-0 coarse class, fixed for the run; the coarse windows are planned on
+their DFT energies and are held (only a drift of μ past their pad would extend
+them). The semicore QP energies still move by the level repulsion of the kept
+mixing, $-\sum_p |H_{ps}|^2/(E_p - E_s)$ to second order. `qp` (the default)
+lets the class move with its own Σ.
+
+Every other matrix band is protected: under the default `sigma_out_of_grid =
+cover` it reads Σ at its own energy, and the grid grows over it; on a route
+without the patch a band deeper than the W model's active depth reads
+$\Sigma(\omega = 0)$ (§4). Map 0, or an authenticated seed, classifies the
+band set once, and the set stays frozen: no band enters or leaves it later.
 
 **Tail law.** The rigid shift is
 
