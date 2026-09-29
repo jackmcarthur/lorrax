@@ -173,4 +173,8 @@ def test_static_key_digests_numeric_tables_by_content():
     assert _static_key(table) == _static_key(same) != _static_key(other)
     assert _static_key([1, 2]) != _static_key([1.0, 2.0])
     assert _static_key([[0, 1], [2]]) == _static_key([[0, 1], [2]])  # ragged: element-wise
+    # Values float64 cannot hold exactly key element by element, never merged.
+    assert _static_key([0.5, 2**53 + 1]) != _static_key([0.5, 2**53])
+    assert _static_key([2**63, -1]) != _static_key([2**63 - 1, -1])
+    assert _static_key([2**63, -1]) == _static_key([2**63, -1])
     hash(_static_key(("scalar", (1, 2), [np.arange(3), None], ())))

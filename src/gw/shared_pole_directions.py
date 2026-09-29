@@ -27,11 +27,11 @@ def replicated(mesh_xy):
     Every process holds the same value, so it is placed process-locally: a
     raw ``jax.device_put`` to a multi-process sharding first all-gathers the
     value to assert equality (``lxkit.placement``), one collective and host
-    wait per index or scale.
+    wait per index or scale.  ``LORRAX_CHECK_REPLICA=1`` restores that check.
     """
     from common.collectives import device_put_process_local
     sharding = NamedSharding(mesh_xy, P())
-    return lambda value: device_put_process_local(np.asarray(value), sharding)
+    return lambda value: device_put_process_local(value, sharding)
 
 
 def _sample_point(recipe, sample_id):

@@ -119,7 +119,7 @@ def synthesize_shared_pole_parents(
         Eagerly planned N,N contraction for this parent and padded pole panel.
     active_range : bool
         ``gemm`` was planned with ``enable_active_range=True``: contract only
-        each parent's ``intervals`` columns, the weight applied on the load.
+        each parent's ``intervals`` columns, each scaled by its weight.
 
     Returns
     -------
@@ -160,9 +160,10 @@ def _shared_pole_contract(b_X, b_Y, weights, *, gemm, layout="face", intervals=N
     below are local axis views, giving exactly psi_mun and psi_nmu layouts.
 
     ``intervals`` ``[q,2]`` (the half-open pole columns outside which
-    ``weights`` is zero) contracts only those columns with the weight applied
-    on the load, as G's build does with its band interval; ``gemm`` must then
-    be planned with ``enable_active_range=True``.
+    ``weights`` is zero) contracts only those columns, each scaled by its
+    weight, as G's build does with its band interval (the face route scales
+    each gathered panel slice; the axis route a weighted copy of the factor,
+    as before); ``gemm`` must then be planned with ``enable_active_range=True``.
     """
     from gw.greens_function_kernel import build_G
 
@@ -1000,15 +1001,25 @@ def _admit(compiled, meta, stage, *, native=0, resident=0, counted=0):
 
 
 def _numeric_table(value):
-    """A nested list or tuple of Python numbers as one array, else ``None``."""
+    """A nested list or tuple of Python numbers as one array, else ``None``.
+
+    ``None`` too when the array would not keep every value exactly: a float or
+    complex table with a magnitude at or above 2**53, where an integer
+    promoted to float64 can merge with its neighbour (``[0.5, 2**53+1]`` and
+    ``[0.5, 2**53]``), so the caller keys it element by element.
+    """
     if not value or not all(isinstance(v, (bool, int, float, complex, np.number, list, tuple))
                             for v in value):
         return None
     try:
         table = np.asarray(value)
-    except ValueError:  # ragged
+    except (ValueError, OverflowError):  # ragged, or an integer outside every dtype
         return None
-    return table if table.dtype.kind in "biufc" else None
+    if table.dtype.kind not in "biufc":
+        return None
+    if table.dtype.kind in "fc" and table.size and not np.abs(table).max() < 2.0**53:
+        return None
+    return table
 
 
 def _static_key(value):
