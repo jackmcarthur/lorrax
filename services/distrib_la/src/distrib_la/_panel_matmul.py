@@ -52,6 +52,15 @@ def panel_matmul(a, b, *, mesh, panel_bytes, bounds=None, weights=None):
         panel spans at most K/p contraction columns), and exchanged panels
         never exceed ``panel_bytes`` per rank.  Every batch row rides in each
         panel exchange and each local GEMM: one collective per panel, not per q.
+
+    Notes
+    -----
+    Measured against the alternatives (A100-40GB, per complex Green-sized
+    product, CrI3 8x8 q=10 m=n=2904 k=144 / Fe 8³ q=59 m=n=2560 k=120):
+    at P16 (4x4) the full-k gather takes 1.86 / 5.14 ms, two panels 1.85 / 5.95,
+    four to six panels 2.6-3.1 / 7.4-8.0, cuBLASMp (one SUMMA per q) 6.88 / 5.11;
+    at P4 the gather 2.68 / 6.59, two panels 3.22 / 6.79, cuBLASMp 6.68 / 10.95.
+    Two panels is the default: the fastest width without a band-complete copy.
     """
     px, py = int(mesh.shape['x']), int(mesh.shape['y'])
     if a.ndim != 3 or b.ndim not in (3, 4) or a.dtype != b.dtype:
