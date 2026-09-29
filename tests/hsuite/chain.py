@@ -5,8 +5,7 @@ four srun ranks (one GPU each, MPI world 4), in one shared run directory,
 in the order a user runs them:
 
     kmeans -> kin_ion -> dipole -> gwjax GN-PPM one-shot
-           -> gwjax shared-pole QSGW (2 maps) -> BSE -> htransform
-           -> exciton bands
+           -> gwjax shared-pole QSGW (2 maps) -> BSE -> exciton bands
 
 Each stage is then checked against the stored outputs in ``reference/``
 (eqp columns, numeric members of the written h5 files, solver outputs)
@@ -52,7 +51,6 @@ ATOL = {
     "eqp_ev": 5.0e-4,    # eqp0/eqp1 columns, GN-PPM and shared pole
     "bse_ev": 2.0e-3,    # BSE and exciton-band eigenvalues: Krylov solves
                          # on a P-dependent padded space (P1 vs P4 1.2 meV)
-    "htransform_ev": 5.0e-4,
 }
 
 # h5 members not compared.  qp_diag_self_consistent_ev is a diagnostic
@@ -171,9 +169,6 @@ STAGES = (
       "--band-degeneracy", "off", "--max-lanczos-iter", "40",
       "--n-eig", "2", "--block-size", "1", *_P,
       "--report-file", "bse.out"]),
-    ("htransform", "bandstructure.htransform",
-     ["-i", "excited.in", "--guard-bands", "1", "-o", "htransform.dat",
-      "--report-file", "htransform.out"]),
     # One conduction band: the window's top band must lie below the fitted
     # window's top, or fH cannot see it (compute_wfns_fi refuses).
     ("exciton_bands", "bse.exciton_bands",
@@ -197,7 +192,6 @@ CHECKS = {
                        "report_floats": ("sp.out",
                                          r"SC iteration: call=\d+ .*?max\|dE\|=([0-9.e+-]+)")},
     "bse": {"stdout_floats": r"^\s*S\d+\s+([0-9.+-]+)\s*$"},
-    "htransform": {"rows": [("htransform.dat", 6)]},
     "exciton_bands": {"rows": [("exciton.dat", 6)]},
 }
 
@@ -326,8 +320,6 @@ def _tol(label):
         return ATOL["eqp_ev"], False
     if ".h5:" in label:
         return ATOL["h5"], True
-    if label.startswith("htransform"):
-        return ATOL["htransform_ev"], False
     return ATOL["bse_ev"], False
 
 

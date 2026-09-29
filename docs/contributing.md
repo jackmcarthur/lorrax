@@ -44,8 +44,8 @@ direction and the driver plumbing budgets ([Layers](architecture/layers.md)),
 The suite is `tests/hsuite`: the production drivers run end to end on one tiny
 magnetic system (two H atoms, one electron, noncollinear with spin-orbit, time
 reversal broken), at P4 on one node. The chain is kmeans → kin_ion → dipole →
-gwjax GN-PPM one-shot → gwjax shared-pole QSGW (2 maps) → BSE → htransform →
-exciton bands. Each stage is checked on its outputs (eqp columns, the numeric
+gwjax GN-PPM one-shot → gwjax shared-pole QSGW (2 maps) → BSE → exciton bands
+(which runs the htransform interpolation). Each stage is checked on its outputs (eqp columns, the numeric
 members of the h5 files it writes, eigenvalue tables) against the stored
 references in `tests/hsuite/reference/`, and every rank log is scanned for
 failure signatures. [`tests/hsuite/README.md`](../tests/hsuite/README.md) owns

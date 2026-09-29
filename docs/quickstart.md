@@ -11,7 +11,7 @@ produce a `WFN.h5` ([Preparing inputs from DFT](preprocessing.md)).
 
 The fixture ships its own `WFN.h5`, pseudopotential and QE inputs. The chain
 copies it into a new directory and runs kmeans → kin_ion → dipole → GN-PPM
-one-shot → shared-pole QSGW (2 maps) → BSE → htransform → exciton bands there,
+one-shot → shared-pole QSGW (2 maps) → BSE → exciton bands there,
 writing each driver's decks beside it:
 
 ```bash
