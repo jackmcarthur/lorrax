@@ -1481,12 +1481,19 @@ def plan_sigma_windows(
             owned_all = owned
             owned_eta = (np.full(owned_all.size, float(eta)) if omega_eta is None
                          else omega_eta[positions[owned_all]])
-            if np.unique(owned_eta).size > 1 and make_sigma_box_spec(
-                    name="probe", frequencies=frequencies[owned_all], states=states,
-                    pole_stats=fit_poles, pole_sign=pole_sign, eta_ry=eta)["kind"] != "crossing":
+            held = None if fixed_rule_session is None else fixed_rule_session.get("rules")
+            if np.unique(owned_eta).size > 1 and (
+                    make_sigma_box_spec(
+                        name="probe", frequencies=frequencies[owned_all], states=states,
+                        pole_stats=fit_poles, pole_sign=pole_sign,
+                        eta_ry=eta)["kind"] != "crossing"
+                    if held is None else
+                    not any(k.startswith(f"{branch.tag}:{name}@eta") for k in held)):
                 # A sign-definite window's node count barely depends on eta:
                 # it serves every frequency it owns at the near eta, so a far
-                # patch adds no window here.
+                # patch adds no window here. The split is decided once, at
+                # map 0, and held: moving poles never add a window (Si 4^3
+                # nval 4 refused at map 1 on ``val:pole_tail@eta0.5``).
                 owned_eta = np.full(owned_all.size, float(eta))
             for eta_w in np.unique(owned_eta):
               owned = owned_all[owned_eta == eta_w]
