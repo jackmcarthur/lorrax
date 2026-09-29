@@ -119,16 +119,7 @@ def _get_chi_minimax_kernel(mesh_xy: Mesh, kgrid: tuple[int, int, int],
              and right_face_shape is None and k_unfold_plan is not None
              and not isinstance(k_unfold_plan, tuple))
     if fused:
-        # A grid mode 11 cannot hold (ffi.fft.chi_unfold_refusal) keeps the face kernel.
-        from ffi import fft as _F
-        why = (_F.chi_unfold_refusal(kgrid, int(face_shape[3]))
-               if _F.kconv_backend(mesh_xy) == "mathdx" else "")
-        if why:
-            from ffi.gate import announce_once
-            announce_once(("chi_unfold", tuple(kgrid), int(face_shape[3])),
-                          f"[chi0] k-grid {tuple(kgrid)} ns={int(face_shape[3])}: the face kernel, "
-                          f"not mathdx mode 11: {why}", scope="rank0")
-            fused = False
+        fused = _chi_door_serves(mesh_xy, kgrid, int(face_shape[3]))
     cache_key = (_mesh_key(mesh_xy), kgrid, ffi_dial_key(), n_out,
                  complex_contour, layout, face_shape, right_face_shape,
                  vertex_classes, (tuple(id(p) for p in k_unfold_plan)
@@ -156,6 +147,23 @@ def _get_chi_minimax_kernel(mesh_xy: Mesh, kgrid: tuple[int, int, int],
             fermi_dirac=fermi_dirac, ordered=bool(ordered))
     _chi_minimax_kernel_cache[cache_key] = kernel
     return kernel
+
+
+def _chi_door_serves(mesh_xy, kgrid, ns) -> bool:
+    """Whether mathdx mode 11 (``ffi.fft.make_kconv_chi_unfold``) holds this grid.
+
+    A grid it cannot hold (``ffi.fft.chi_unfold_refusal``) keeps the full-k
+    Green route; the refusal is announced once.
+    """
+    from ffi import fft as _F
+    why = (_F.chi_unfold_refusal(kgrid, int(ns))
+           if _F.kconv_backend(mesh_xy) == "mathdx" else "")
+    if why:
+        from ffi.gate import announce_once
+        announce_once(("chi_unfold", tuple(kgrid), int(ns)),
+                      f"[chi0] k-grid {tuple(kgrid)} ns={int(ns)}: the face kernel, "
+                      f"not mathdx mode 11: {why}", scope="rank0")
+    return not why
 
 
 def _contract_chi_vertices(Gv_R, Gc_R, operands, identities, complex_contour):
@@ -738,6 +746,15 @@ def _get_chi_fractional_contour_kernel_face(
                            enable_active_range=band_ranges is not None)
     active_gemms = (tuple(g_plan.prepare_active_range(*bounds) for bounds in band_ranges)
                    if band_ranges is not None else (None, None))
+    # The charge direct stream on a raw-parent plan forms each node's correlation
+    # with mathdx mode 11 from the two parent Greens (``direct_rows``): no full-k
+    # Green, no transform of either Green, no XLA spin trace.
+    chi_door = None
+    if (pair_mode == "direct" and photon is None and k_unfold_plan is not None
+            and _chi_door_serves(mesh_xy, grid, ns)):
+        from common.fft_helpers import make_kconv_chi_unfold
+        chi_door = make_kconv_chi_unfold(mesh_xy, grid, k_unfold_plan.unfold_load_tables(),
+                                         n_out=1, complete=False, norm="ortho")
     def _finish(value):
         value = chi_fftn(value)
         if negate_full_q is None:
@@ -958,6 +975,34 @@ def _get_chi_fractional_contour_kernel_face(
 
             return jax.lax.cond(window == 0, crossing, remote, None), None
 
+        def direct_rows(time):
+            """One node's forward and reverse rows through mathdx mode 11.
+
+            Mode 11 returns ``v = sum_ab conj(Gu'_ab) Gf'_ab`` from the raw
+            parents (``G' = ifftn_k`` of the typed unfold), which is the
+            incumbent A(t) itself.  The physical A(R) = conj(v(-R)), since
+            ``fftn(G)(R) = ifftn(G)(-R)``; its q transform is conj(FT[v](q)),
+            so the conjugation moves from the reverse rows to the forward rows.
+            """
+            def parent(weight, t, ref, current):
+                # green_k's conjugation rule, on the parents.
+                if physical:
+                    t, weight = jnp.conj(t), jnp.conj(weight)
+                return build_G_tau(psi_mun, psi_nmu, enk_full, t, e_ref=ref,
+                                   band_weight=weight, layout=layout, gemm=g_plan,
+                                   k_unfold_plan=k_unfold_plan, unfold=False,
+                                   prepared_active_gemm=active_gemms[int(current)],
+                                   real_weights=False)
+            lower = parent(occ_f, -time, energy_reference[0], False)
+            upper = parent(occ_u, jnp.conj(time), energy_reference[1], True)
+            partners = () if lower.conj_partner else (lower.transpose, upper.transpose)
+            zero = jax.lax.with_sharding_constraint(
+                jnp.zeros((1, nk, n_mu, n_mu), jnp.complex128), selected_shard)
+            value = chi_fftn(chi_door(zero, lower.G, upper.G,
+                                      jnp.ones((1,), jnp.complex128), *partners)[0])
+            ahead, behind = rows(value, gather_q), rows(value, reverse_q)
+            return (jnp.conj(ahead), behind) if physical else (ahead, jnp.conj(behind))
+
         def direct_node(index, accumulators):
             # ONE Green pair A(t)=Gu(t) conj(Gf(conj(t))) per node serves
             # both orientations: the reverse product at time conj(t) is
@@ -968,10 +1013,14 @@ def _get_chi_fractional_contour_kernel_face(
                 projection_rows[0], index, axis=1, keepdims=False)
             reverse = jax.lax.dynamic_index_in_dim(
                 projection_rows[1], index, axis=1, keepdims=False)
-            value = chi_fftn(spin_correlation(occ_f, -time, energy_reference[0],
-                occ_u, jnp.conj(time), energy_reference[1]))
-            accumulators = accumulate_selected(accumulators, rows(value, gather_q), forward)
-            return accumulate_selected(accumulators, jnp.conj(rows(value, reverse_q)), reverse)
+            if chi_door is not None:
+                ahead, behind = direct_rows(time)
+            else:
+                value = chi_fftn(spin_correlation(occ_f, -time, energy_reference[0],
+                    occ_u, jnp.conj(time), energy_reference[1]))
+                ahead, behind = rows(value, gather_q), jnp.conj(rows(value, reverse_q))
+            accumulators = accumulate_selected(accumulators, ahead, forward)
+            return accumulate_selected(accumulators, behind, reverse)
 
         def direct_stream(accumulators):
             # The rule is padded to RESPONSE_NODE_CAPACITY slots with zero
