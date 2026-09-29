@@ -554,7 +554,7 @@ keys themselves are in the [input reference](../input_reference.md).
   `one_shot_dft`. eqp0/eqp1 use the same at-DFT formula under every solver.
 - **`resolve_band_extrapolation`**: `use_band_extrapolation` is the key and
   `sigma_band_extrapolation` a deprecated alias; both named and disagreeing
-  refuses. `explicit` selects the behaviour on a non-PPM mode: a defaulted-on
+  refuses. `explicit` selects the behaviour on a non-consuming stage: a defaulted-on
   key auto-disables with a note, an explicitly named one refuses.
   `band_extrapolation_is_consumable` is true when any stage is GN/HL-PPM or a
   scalar (non-bispinor) MPA stage.

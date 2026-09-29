@@ -545,7 +545,6 @@ def plan_sigma_band_brackets(config, wfns, meta, *, print_fn, where):
 def extrapolate_sigma_body(
     sigma_omega, head_sigma_diag_w_kn_ry, *,
     plan, config, band_slices, wfn, sym, meta, mesh_xy, print_fn,
-    held_session=None,
 ):
     """``(extrapolated body, h5 payload)`` from a bracketed Σ_c cube.
 
@@ -562,7 +561,7 @@ def extrapolate_sigma_body(
         sigma_omega, head_sigma_diag_w_kn_ry,
         plan=plan, config=config, band_slices=band_slices,
         wfn=wfn, sym=sym, meta=meta, mesh_xy=mesh_xy,
-        print_fn=print_fn, held_session=held_session)
+        print_fn=print_fn)
     return (_extrapolated_point(sigma_omega.sigma_c_kij, extrap_weights),
             extrap_payload)
 
