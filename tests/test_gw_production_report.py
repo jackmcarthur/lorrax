@@ -131,6 +131,10 @@ def test_report_is_scientific_rank_zero_output(tmp_path):
         "  SC fixed quadrature: iteration=2, initialized=False, "
         "rebuilds_this_iteration=0, rebuilds_total=0, pair_cost=61")
     report.legacy_print(
+        "    SC fixed quadrature recompute: 'c:resonant' (escape: state k=0 "
+        "band=3 (Sigma band carrier) at E-mu=+1.3872 eV left the certified "
+        "[+2.8546, +16.7397] eV)")
+    report.legacy_print(
         "    SC fixed window: c:bulk: n_tau=8, nodes=0123456789abcdef, "
         "cache=hit:sc-fixed, padded_box=(-13.6, 27.2, 1.36, 2.72) eV")
     report.legacy_print("WARNING: protected state leaves the omega grid")
@@ -217,6 +221,7 @@ def test_report_is_scientific_rank_zero_output(tmp_path):
     assert "tau node 5 / 10" in text
     assert "SC fixed quadrature: iteration=2" in text
     assert "SC fixed window: c:bulk" in text
+    assert "SC fixed quadrature recompute: 'c:resonant' (escape: state k=0" in text
     assert "nodes=0123456789abcdef" in text
     assert "protected state leaves the omega grid" in text
     zeta_line = next(line for line in text.splitlines()

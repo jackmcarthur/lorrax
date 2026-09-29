@@ -80,12 +80,12 @@ def _fake_rule(box, eps, **_kwargs):
 
 def _freezing_session():
     """A fresh SC session: its first call serves map 0 one-shot and certifies
-    the first plan; the second re-plans (map 1)."""
+    the plan; every later call holds it (map 1 on)."""
     return {}
 
 
 def _held(plan_call):
-    """Run map 0 (one-shot + first plan) and map 1 (the re-plan); return map 1's result."""
+    """Run map 0 (one-shot + the plan) and map 1 (held); return map 1's result."""
     plan_call()
     return plan_call()
 
@@ -546,11 +546,13 @@ def test_sc_fixed_session_rebuilds_an_escaped_window_and_says_so(monkeypatch):
 
 
 def test_sc_short_edge_escape_rebuilds_by_the_plan_rule_and_is_logged(
-        monkeypatch, capsys):
+        monkeypatch):
     """A crossing window's inner state crossing its 2 eta pad is an escape:
     the window is rebuilt by the plan's own rule around its current state,
-    logged by name with the state and the edge, and counted; the run holds
-    again until a second escape, which rebuilds and counts the same way."""
+    named in the receipt with the state and the edge (the Sigma caller prints
+    it to the report as ``SC fixed quadrature recompute:``), and counted; the
+    run holds again until a second escape, which rebuilds and counts the same
+    way."""
     calls = []
 
     def counted(box, eps, **kwargs):
@@ -582,7 +584,6 @@ def test_sc_short_edge_escape_rebuilds_by_the_plan_rule_and_is_logged(
     assert session["rules"][name]["certified"]["states_ry"][0] == pytest.approx(-0.1)
     held, built = plan(0.1)
     assert built == 0 and held["sc_plan_event"] == "hold"
-    capsys.readouterr()
     # The gap edge moves 0.25 Ry toward mu: past its 0.2 Ry pad.
     escaped, built = plan(-0.15)
     reasons = escaped["sc_fixed_recompute_reasons"]
@@ -596,9 +597,8 @@ def test_sc_short_edge_escape_rebuilds_by_the_plan_rule_and_is_logged(
     # The same rule around the current state: 2 eta inside it.
     assert rebuilt["certified"]["states_ry"][0] == pytest.approx(-0.35)
     assert rebuilt["pad_ev"][0] == pytest.approx(0.2 * RYD_TO_EV)
-    log = capsys.readouterr().out
-    assert f"rebuilt the rule for {name!r} by the plan rule" in log
-    assert "escape maps 1" in log
+    assert name in escaped["sc_fixed_rebuilt_windows"]
+    assert escaped["sc_fixed_total_rebuild_count"] == len(reasons)
     # Inside the rebuilt pad: held, nothing fitted, the count unchanged.
     held, built = plan(-0.3)
     assert built == 0 and held["sc_fixed_escape_maps_total"] == 1

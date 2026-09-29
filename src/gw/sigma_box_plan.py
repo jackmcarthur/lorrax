@@ -1207,13 +1207,16 @@ def _sc_padded_box_spec(spec, eta, *, occupation_reach_ry=None):
     is an escape, and only that window is rebuilt, by this same rule around
     its current states.
 
-    Why the inner edge of a crossing window is not padded 2 eV: it sets the
-    short side |omega|max + x - Omega_min, which sets the node count, and its
-    state does not move toward resonance. An insulator's gap edge moves away
-    as the gap opens (MoS2 3x3 held cond:resonant: 12.82 eV paid for a short
-    side of 6.5-8.6 eV, 163 -> 210 nodes), and a metal's inner state cannot
-    pass the floor reach (Fe 4^3: live x 3.01-3.13 eV, reach 3.13 eV). The
-    2 eV pad on it cost 138-154 tau pairs per held map (claim 2877).
+    Why the inner edge of a crossing window is deliberately tight: it sets the
+    short side |omega|max + x - Omega_min, which sets the node count, and a
+    2 eV pad there cost 18-26 nodes per crossing window (claims 2877, 2936).
+    The trade: that slack also absorbed motion the tight edge now rebuilds.
+    Any inward motion of the inner state (MoS2 3x3 map 2: the gap edge came
+    back 1.5 eV after its map-1 overshoot), any grid extension on the
+    crossing half (Fe 4^3 map 2: 26.0 -> 28.25 eV) and any drop of the near
+    pole edge past its 10% pad (Fe 4^3 map 1: 0.28 -> 0.19 eV) is an escape,
+    rebuilt and logged (Fe 4^3 charge SC-3: 12 windows rebuilt against 9).
+    Only a metal's clip is a bound: no branch state passes -X.
 
     Tempting, and why not: a flat outer pad. QP corrections stretch the
     spectrum by about 10%, so a flat 1 eV pad refit Na 8^3's two crossing
@@ -1561,14 +1564,11 @@ def _fit_fixed_sc_rules(
             fit_rows.extend(new_rows)
             fits.append(dict(rebuilt))
     if recomputed:
+        # Each rebuild is named in the receipt (``sc_fixed_recompute_reasons``),
+        # which the Sigma caller prints to the report as one
+        # ``SC fixed quadrature recompute:`` line per window.
         session["rebuild_count"] = int(
             session.get("rebuild_count", 0)) + len(recomputed)
-        if process_rank() == 0:
-            for name, reason in recomputed.items():
-                print(f"  [sc-fixed] iteration {iteration}: rebuilt the rule "
-                      f"for {name!r} by the plan rule ({reason}); escape "
-                      f"maps {int(session.get('escape_maps', 0))}, windows "
-                      f"rebuilt {int(session['rebuild_count'])} this run")
     return fits, fit_rows, receipt(
         "frozen", fits, event=("extend" if reasons_by_name else "hold"),
         rebuilt=(name for name in (spec["name"] for spec in rows) if name in recomputed),

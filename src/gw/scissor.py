@@ -338,11 +338,12 @@ SC_WINDOW_PAD_FRACTION = 0.10
 
 #: Inner state pad of a held crossing box, in units of the broadening eta
 #: (owner 2026-09-28): the state edge nearest mu. It sets the crossing short
-#: side |omega|max + x - Omega_min and so the rule's node count, and that
-#: state does not move toward resonance: an insulator's gap edge moves away
-#: as the gap opens (MoS2 3x3: short side 10.5 -> 6.5-8.6 eV over maps 1-3),
-#: and a metal's is bounded by the occupation floor's reach
-#: (``gw.efermi.occupation_floor_reach_ry``).
+#: side |omega|max + x - Omega_min and so the rule's node count; on a metal it
+#: is clipped at the occupation floor's reach
+#: (``gw.efermi.occupation_floor_reach_ry``), which no branch state passes.
+#: It is deliberately tight: inward motion of the inner state, a grid
+#: extension on the crossing half or a near-pole drop past its 10% pad is a
+#: logged escape and rebuild (``sigma_box_plan._sc_padded_box_spec``).
 SC_WINDOW_INNER_PAD_ETA = 2.0
 
 

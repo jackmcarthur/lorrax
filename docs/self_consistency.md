@@ -327,9 +327,15 @@ $\Sigma(E)$, not $\Sigma(0)$, for an active state outside the requested grid.
   $-X$, the occupation floor's reach (`efermi.occupation_floor_reach_ry`:
   $X = k_BT \ln(1/10^{-5} - 1)$ = 11.5 $k_BT$ for Fermi-Dirac). That edge
   sets the crossing short side $\lvert\omega\rvert_{\max} + x -
-  \Omega_{\min}$ and so the node count, and its state does not move toward
-  resonance: an insulator's gap edge moves away as the gap opens, and a
-  metal's cannot pass $-X$. A sign-definite window keeps the outer pad on
+  \Omega_{\min}$ and so the node count; a 2 eV pad there cost 18–26 nodes
+  per crossing window. The edge is deliberately tight, and only a metal's
+  clip is a bound (no branch state passes $-X$). The old 2 eV slack also
+  absorbed motion that the tight edge now rebuilds: an inward move of the
+  inner state (MoS2 3×3 map 2, the gap edge back 1.5 eV after its map-1
+  overshoot), a grid extension on the crossing half (Fe 4³ map 2) and a
+  near-pole drop past its 10 % pad (Fe 4³ map 1, 0.28 → 0.19 eV) each
+  escape and rebuild (Fe 4³ charge SC-3: 12 windows against 9; claim 2936).
+  A sign-definite window keeps the outer pad on
   both edges. Both edges stop at the window's own selector interval. Poles are padded by 10 % at the near edges and
   widths, and 2× at the far edge of an unbounded selector (deep and bulk
   windows), because the highest shared-pole mode moves 10–30 % per map and a
@@ -337,8 +343,9 @@ $\Sigma(E)$, not $\Sigma(0)$, for an active state outside the requested grid.
   rules are held: a map reuses a rule by containment
   (`cache=hit:sc-fixed`). A window whose box leaves its rule, a new window,
   or a sign change is an escape: it is rebuilt alone by the same plan rule
-  around its current states (`rebuild:sc-fixed`) and held again, its reason
-  names the state (k, band, $E - \mu$) and the certified edge, the pole
+  around its current states (`rebuild:sc-fixed`) and held again; one
+  `SC fixed quadrature recompute:` line in the report names the window and
+  its reason, the state (k, band, $E - \mu$) and the certified edge, the pole
   extent or the grid edge that crossed, and the receipt counts the maps
   with an escape (`escape_maps_total`) and the windows rebuilt
   (`rebuilds_total`) over the run. The zero-side edge of a sign-definite box

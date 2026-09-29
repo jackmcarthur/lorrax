@@ -261,8 +261,9 @@ class GWProductionReport:
         # Fixed-SC quadrature identity is a physics invariant, not backend
         # chatter: retain its compact receipt so every map's exact node set
         # and zero-rebuild claim remain auditable after live stdout is gone.
-        if (text.startswith("  SC fixed quadrature: ")
-                or text.startswith("    SC fixed window: ")):
+        if text.startswith(("  SC fixed quadrature: ",
+                            "    SC fixed quadrature recompute: ",
+                            "    SC fixed window: ")):
             self.progress(text)
             return
         # The long-loop cadence is part of the scientific run record, not
