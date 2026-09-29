@@ -12,7 +12,7 @@ from ._shard_map import shard_map
 from .resolve import mesh_platform
 
 
-def panel_matmul(a, b, *, mesh, panel_bytes, bounds=None):
+def panel_matmul(a, b, *, mesh, panel_bytes, bounds=None, weights=None):
     """Multiply face matrices by a batched 2-D SUMMA over bounded contraction panels.
 
     Parameters
@@ -35,6 +35,10 @@ def panel_matmul(a, b, *, mesh, panel_bytes, bounds=None):
         interval's columns in that panel (the local active-range GEMM), so
         the dropped columns cost no flops; the result is the same product.
         The other streams contract every column (the zeros make that exact).
+    weights : jax.Array, optional
+        (q,k) replicated contraction weights, ``a·diag(w)·b``.  On a square
+        mesh each panel's slice of ``a`` is scaled on its way into the
+        all-gather, so no weighted copy of ``a`` is made.
 
     Returns
     -------
@@ -65,13 +69,21 @@ def panel_matmul(a, b, *, mesh, panel_bytes, bounds=None):
         # own K columns to each panel, so a panel is ONE all-gather per operand
         # over the mesh axis (p·width columns, at most one owner block K/p).
         # Two panels are live (the one multiplied and the one prefetched).
+        # Two panels, each half of every owner block: the fastest width with no
+        # band-complete copy at P4 and P16 (the measured table below).
         kl = k // px
-        cap = max(1, min(limit // (2 * px), kl // px if px > 1 else kl))
+        cap = max(1, min(limit // (2 * px), kl // 2 if px > 1 else kl))
         width = max(d for d in range(1, kl + 1) if kl % d == 0 and d <= cap)
-        if bounds is None:
-            return _interleaved_kernel(mesh, q, m, k, n, width)(a, b)
-        bounds = jnp.asarray(bounds, jnp.int32).reshape(q, 2)
-        return _interleaved_kernel(mesh, q, m, k, n, width, True)(a, b, bounds)
+        kernel = _interleaved_kernel(mesh, q, m, k, n, width, bounds is not None,
+                                     1, weights is not None)
+        args = (a, b)
+        if bounds is not None:
+            args += (jnp.asarray(bounds, jnp.int32).reshape(q, 2),)
+        if weights is not None:
+            args += (jnp.asarray(weights, a.dtype).reshape(q, k),)
+        return kernel(*args)
+    if weights is not None:
+        a = a * jnp.asarray(weights, a.dtype)[:, None, :]
     common = gcd(k // px, k // py)
     width = min(common, limit)
     while common % width:
@@ -142,7 +154,7 @@ def _kernel(mesh, q, m, k, n, width, sample_axis):
 
 
 @lru_cache(maxsize=64)
-def _interleaved_kernel(mesh, q, m, k, n, width, active=False, depth=1):
+def _interleaved_kernel(mesh, q, m, k, n, width, active=False, depth=1, weighted=False):
     """Batched SUMMA on a square mesh: K streamed in interleaved panels, ``depth`` prefetched.
 
     Rank ``(x, y)`` holds the K block ``[y·K/p, (y+1)·K/p)`` of A and
@@ -156,7 +168,8 @@ def _interleaved_kernel(mesh, q, m, k, n, width, active=False, depth=1):
     ``active``: each row's interval ``[lo, hi)`` meets a panel in ONE run of
     panel positions (a suffix of the first live owner's segment, whole
     segments, a prefix of the last), so the local active-range GEMM contracts
-    only that run.
+    only that run.  ``weighted``: a replicated ``(q, K)`` weight row scales each
+    panel's local slice of A before its all-gather (no weighted copy of A).
     """
     p = int(mesh.shape['x'])
     mx, ny, kl = m // p, n // p, k // p
@@ -165,9 +178,12 @@ def _interleaved_kernel(mesh, q, m, k, n, width, active=False, depth=1):
     contract = _panel_contraction(mesh) if active else None
     owner = np.arange(p, dtype=np.int32)[None, :]
 
-    def body(a, b, bounds):
+    def body(a, b, bounds, weights):
         def gather(j):
             left = lax.dynamic_slice_in_dim(a, j * width, width, axis=2)
+            if weighted:
+                start = lax.axis_index('y') * kl + j * width
+                left = left * lax.dynamic_slice_in_dim(weights, start, width, axis=1)[:, None, :]
             right = lax.dynamic_slice_in_dim(b, j * width, width, axis=1)
             return (lax.all_gather(left, 'y', axis=2, tiled=True),
                     lax.all_gather(right, 'x', axis=1, tiled=True))
@@ -200,12 +216,13 @@ def _interleaved_kernel(mesh, q, m, k, n, width, active=False, depth=1):
         return c
 
     face = NamedSharding(mesh, P(None, 'x', 'y'))
-    if active:
-        kernel = shard_map(body, mesh=mesh, in_specs=(P(None, 'x', 'y'),) * 2 + (P(),),
-                           out_specs=P(None, 'x', 'y'), check_vma=False)
-        return jax.jit(kernel, in_shardings=(face, face, NamedSharding(mesh, P())),
-                       out_shardings=face)
-    kernel = shard_map(lambda a, b: body(a, b, None), mesh=mesh,
-                       in_specs=(P(None, 'x', 'y'),) * 2, out_specs=P(None, 'x', 'y'),
-                       check_vma=False)
-    return jax.jit(kernel, in_shardings=(face, face), out_shardings=face)
+    rep = NamedSharding(mesh, P())
+    extra = (('bounds',) if active else ()) + (('weights',) if weighted else ())
+
+    def local(a, b, *rest):
+        named = dict(zip(extra, rest))
+        return body(a, b, named.get('bounds'), named.get('weights'))
+
+    kernel = shard_map(local, mesh=mesh, in_specs=(P(None, 'x', 'y'),) * 2 + (P(),) * len(extra),
+                       out_specs=P(None, 'x', 'y'), check_vma=False)
+    return jax.jit(kernel, in_shardings=(face, face) + (rep,) * len(extra), out_shardings=face)
