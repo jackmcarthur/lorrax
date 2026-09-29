@@ -140,8 +140,8 @@ claim 2952) holds the rest of the recipe. It is not on main.
   Semicore sits at its DFT block by default (`sc_semicore = dft`). Slab decks
   (`sys_dim = 2`) should keep `number_bands_protected` below the vacuum states:
   no vacuum-level check exists yet, so the far rule would read them.
-- **Owner calls.** (a) Cost of the one ε: at 1e-4 the coarse windows take
-  MoS2 530 against 448 τ pairs per map and Fe 1087 against 959 (over the
-  1000-pair metal budget); splitting does not win it back. (b) Fe 4³ map 2 misses 2 meV: at matched
+- **Owner calls.** (a) Coarse cost: at ε 3e-3 and η_semi 5 eV the coarse
+  windows take 47 (Fe 4³) and 37 (MoS2 3×3) τ pairs per map, against 253 and
+  186 at ε 1e-4 and 1 eV (claim 2960). (b) Fe 4³ map 2 misses 2 meV: at matched
   ε 1e-4 it is 7.57 meV, with 3 of 172 states over 2 meV and the cause not
   isolated; the fixed points agree within 0.78 meV (claim 2952).
