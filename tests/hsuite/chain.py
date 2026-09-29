@@ -61,8 +61,10 @@ ATOL = {
 # diagonal fixed point E = h0 + Re Sigma(E) with plain mixing; on this fixture
 # (SC map gain ~5) it lands on different roots from Sigma inputs that agree to
 # 30 ueV (P1 vs P4: 0.79 eV on one state).  The terminal eqp columns and the
-# Sigma matrices it is built from are compared instead.
-H5_UNCOMPARED = ("qp_diag_self_consistent_ev",)
+# Sigma matrices it is built from are compared instead.  line_charge_* are
+# the W bank's selected direction states: a gauge per direction, and padded
+# to the mesh (P1 6x1, P4 8x2); Wc, dWc_ds and the moments are compared.
+H5_UNCOMPARED = ("qp_diag_self_consistent_ev", "_w.h5:line_charge_")
 
 FAILURE_SIGNATURES = (
     "Traceback (most recent call last)",
@@ -435,7 +437,7 @@ def _tol(label):
 def compare(name, got, ref):
     problems = []
     for label, want in ref.items():
-        if label.endswith(H5_UNCOMPARED):
+        if any(tag in label for tag in H5_UNCOMPARED):
             continue
         if label not in got:
             problems.append(f"{name}: {label} missing")

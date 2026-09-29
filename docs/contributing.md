@@ -46,15 +46,16 @@ magnetic system (two H atoms, one electron, noncollinear with spin-orbit, time
 reversal broken), at P4 on one node. The chain is kmeans → kin_ion → dipole →
 gwjax GN-PPM one-shot → gwjax shared-pole QSGW (2 maps) → BSE → htransform →
 exciton bands, then restarted COHSEX, GN-PPM SC (one map) and a shared-pole
-one-shot with its W and pole exports, all in one process per rank. Each stage is checked on its outputs (eqp columns, the numeric
-members of the h5 files it writes, eigenvalue tables) against the stored
+one-shot with its W and pole exports, all in one process per rank. Each stage
+is checked on its outputs (eqp columns, the numeric members of the h5 files it
+writes, eigenvalue tables) against the stored
 references in `tests/hsuite/reference/`, and every rank log is scanned for
 failure signatures. [`tests/hsuite/README.md`](../tests/hsuite/README.md) owns
 the fixture, the coverage table and the tolerances.
 
 ```bash
 source config/perlmutter/gpu_env.sh   # Perlmutter machine settings
-# the verdict: four pytest ranks, each running its own driver processes
+# the verdict: four pytest ranks, each running the drivers in its own process
 srun --jobid=$JOBID -N 1 -n 4 --gpus-per-node=4 src/ffi/cpp/select_gpu.sh \
   .venv/bin/python -m pytest tests/hsuite -q -p no:cacheprovider
 # regenerate the stored outputs after an intended change; review the diff
