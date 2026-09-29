@@ -66,6 +66,7 @@ class CoarseClass(NamedTuple):
     """The coarse (semicore) read class of an SC run (:func:`semicore_floor`)."""
     coarse_floor_ev: float  # coarse: E < this (absolute eV; -inf = none)
     n_coarse: int           # coarse (k, state) on the loaded k set
+    mu_ev: float = float("nan")  # the DFT chemical potential the class was drawn about (eV)
 
 
 def band_gaps_ev(energies_ev):
@@ -94,6 +95,23 @@ def manifold_closing_count(energies_ev, b3):
         if e[:, n - 1].max() < e[:, n].min():
             return n
     return nb
+
+
+#: The sum-band tail law is fitted on the protected conduction bands that reach
+#: within this fraction of (E_cmax - E_F) of E_cmax, E_cmax the top protected
+#: band's DFT maximum (owner 2026-09-29: "fit it only to whatever bands at some
+#: k come within 0.2*(Ecmax-Efermi) of Ecmax").
+TAIL_FIT_TOP_FRACTION = 0.2
+
+
+def tail_fit_bands(e_dft_ev, mu_ev):
+    """Protected bands (columns of ``e_dft_ev``, the QP matrix on DFT energies)
+    whose maximum over k lies within TAIL_FIT_TOP_FRACTION (E_cmax - E_F) of
+    E_cmax = the top band's maximum; all k of such a band enter the fit."""
+    e = np.asarray(e_dft_ev, float)
+    band_max = e.max(axis=0)
+    top = float(band_max[-1])
+    return band_max >= top - TAIL_FIT_TOP_FRACTION * (top - float(mu_ev))
 
 
 def semicore_floor(energies_ev, *, n_below_k, nval, mu_ev, clip_ev, omega_min_rel_ev=None,
@@ -135,7 +153,7 @@ def semicore_floor(energies_ev, *, n_below_k, nval, mu_ev, clip_ev, omega_min_re
                 if gap_hi[n - 1] - gap_lo[n - 1] >= float(semicore_gap_ev)]
         floor = float(gap_hi[semi[-1] - 1]) if semi else -np.inf
     n_coarse = int(np.count_nonzero(e < floor))
-    return CoarseClass(floor if n_coarse else -np.inf, n_coarse)
+    return CoarseClass(floor if n_coarse else -np.inf, n_coarse, mu)
 
 
 def coarse_band_report(energies_ev, semicore_kn, *, mu_ev, band_offset=0):
