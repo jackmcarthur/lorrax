@@ -368,9 +368,10 @@ using TFFT = decltype(cufftdx::Size<N>() + cufftdx::Precision<lrx_real>() +
                       cufftdx::Thread() + cufftdx::SM<LRX_SM>());
 
 // One axis of the 3-D transform on RB resident rows: every block thread runs
-// whole library line-FFTs (flat k is C-order, kz fastest).  From 8 rows up the row
+// whole library line-FFTs (flat k is C-order, kz fastest).  From 2 rows up the row
 // runs fastest across threads: the 8 threads of a 16-byte shared phase take one line
-// offset in 8 rows SP apart, SP is odd, so they hit 8 distinct bank groups.  Line
+// offset in min(RB, 8) rows SP apart, SP is odd, so they hit 8 distinct bank groups
+// (RB >= 8) or at most ceil(8 / RB) threads share one (RB 4 at 8^3: 2-way).  Line
 // fastest put them on lines N*STRIDE apart (8x8x1's y pass, 8^3's z pass: one group,
 // 8-way).  Which thread runs a line does not change its arithmetic (bitwise).
 template <int N, int STRIDE, cufftdx::fft_direction Dir>
@@ -380,7 +381,7 @@ __device__ __forceinline__ void axis_pass(lrx_c2* bank) {
         using V = typename F::value_type;
         constexpr int lines = NK / N;
         for (int l = threadIdx.x; l < RB * lines; l += blockDim.x) {
-            const int j = RB >= 8 ? l % RB : l / lines, li = RB >= 8 ? l / RB : l % lines;
+            const int j = RB >= 2 ? l % RB : l / lines, li = RB >= 2 ? l / RB : l % lines;
             lrx_c2* p = bank + j * SP + (li / STRIDE) * N * STRIDE + (li % STRIDE);
             V v[F::storage_size];
 #pragma unroll
