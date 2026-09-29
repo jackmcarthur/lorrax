@@ -10,7 +10,7 @@ import jax.numpy as jnp
 from common.contract_bands import merge_spin_centroid
 
 
-def face_green_product(A, B, mesh, phases, band_range, n_full=None):
+def face_green_product(A, B, mesh, phases, band_range, n_full=None, partner=False):
     """``A·diag(w)·B`` on band-distributed faces by the 2-D distributed GEMM.
 
     ``A`` ``(nq, M, N_b)`` and ``B`` ``(nq, N_b, N)`` are both
@@ -24,28 +24,28 @@ def face_green_product(A, B, mesh, phases, band_range, n_full=None):
     are bounded by one full-k Green tile, ``16·N_k·(M/p_x)·(N/p_y)`` bytes
     (``N_k = n_full``, the parents' full zone; ``nq`` when the faces are
     already at full k), which every Green-building stage reserves.
-    ``phases`` may be stacked ``(s, nq, N_b)``: the ``s`` Greens then share
-    each panel exchange (``_build_G_face(pair=True)``).
+    ``partner``: also the conjugate-face Green ``conj(A)·diag(w)·conj(B)``
+    from the same panel exchange (``_build_G_face(pair=True)``).
 
-    Why this route (GEMM2D, A100-40GB, warm; ms per build at P16 = 4x4,
-    CrI3 8x8 N_b 144 / Fe 8³ N_b 120, valence windows):
+    Why this route (GEMM2D, A100-40GB, warm; ms per build, CrI3 8x8 N_b 144 /
+    Fe 8³ N_b 120, valence windows):
 
-    ======================================  =======  =======
-    route                                   CrI3     Fe 8³
-    ======================================  =======  =======
-    band-complete gather (retired)          1.86     5.14
-    batched SUMMA, 2 panels (this)          1.85     5.95
-    batched SUMMA, 4 / 6 panels             2.57     7.37
-    cuBLASMp SUMMA, one call per k          6.88     5.11
-    ======================================  =======  =======
+    ==========================================  =============  =============
+    route                                       P4             P16 (4x4)
+    ==========================================  =============  =============
+    band-complete gather (retired)              2.68 / 6.59    1.86 / 5.14
+    batched SUMMA, panels <= N_b/p (this)       3.22 / 6.79    2.57 / 7.37
+    two N_b/2 panels (all bands live: refused)  (same as this) 1.85 / 5.95
+    cuBLASMp SUMMA, one call per k              6.68 / 10.95   6.88 / 5.11
+    ==========================================  =============  =============
 
-    CrI3 8x8 one-shot Σ τ sweep at P16: gather 2.30 s, this route 2.08 s
-    (with the partner pair), cuBLASMp 2.57 s; equal peaks.  cuBLASMp loses
-    because it runs one SUMMA per k (nq calls of p broadcast rounds) and joins
-    the XLA stream by events at entry and exit, so it overlaps nothing; this
-    route moves the same bytes once per panel for every k, and XLA's async
-    all-gathers overlap the previous panel's GEMM.  At P16 the exchange is
-    most of a build (all-gathers 1.2 of 1.85 ms on CrI3).
+    CrI3 8x8 one-shot Σ τ sweep at P16: gather 2.30 s, cuBLASMp 2.57 s,
+    this route 2.64 s at v1 (before the one-exchange partner pair).  cuBLASMp
+    loses because it runs one SUMMA per k (nq calls of p broadcast rounds) and
+    joins the XLA stream by events at entry and exit, so it overlaps nothing;
+    this route moves the same bytes once per panel for every k, and XLA's
+    async all-gathers overlap the previous panel's GEMM.  At P16 the exchange
+    is most of a build (all-gathers 1.2 of 1.85 ms on CrI3).
     """
     from distrib_la import panel_matmul
 
@@ -64,19 +64,19 @@ def face_green_product(A, B, mesh, phases, band_range, n_full=None):
         # outside it are zero, so skipping them is the same product.
         hi = jnp.clip(hi, 0, nb)
         bounds = jnp.stack([jnp.clip(lo, 0, hi), hi], axis=1)
-        if weight.ndim == 3:
-            bounds = jnp.broadcast_to(bounds, (weight.shape[0], nq, 2))
     tile_bytes = green_panel_bytes(n_rows=int(n_full or nq), m=m, n=n, mesh=mesh)
-    return panel_matmul(A, B, mesh=mesh, panel_bytes=tile_bytes, bounds=bounds, weights=weight)
+    return panel_matmul(A, B, mesh=mesh, panel_bytes=tile_bytes, bounds=bounds, weights=weight,
+                        partner=partner)
 
 
 def green_panel_bytes(*, n_rows, m, n, mesh, room=None):
     """The transient band-panel budget of one Green build, per rank.
 
-    One Green tile, ``16·n_rows·(m/p_x)·(n/p_y)`` (the stage reserves it), so the
-    complete band extent is one gather whenever that fits; at most ``room`` when the
-    caller's ledger has less beside its live stages; never below one contraction
-    column ``16·n_rows·(m/p_x + n/p_y)`` (``distrib_la.panel_matmul``'s floor).
+    One Green tile, ``16·n_rows·(m/p_x)·(n/p_y)`` (the stage reserves it), which
+    bounds the two live SUMMA panels (each at most ``N_b/p_x`` bands, so the tile
+    rarely binds); at most ``room`` when the caller's ledger has less beside its
+    live stages; never below one contraction column ``16·n_rows·(m/p_x + n/p_y)``
+    (``distrib_la.panel_matmul``'s floor).
     """
     px, py = int(mesh.shape['x']), int(mesh.shape['y'])
     tile = 16 * int(n_rows) * (int(m) // px) * (int(n) // py)
@@ -90,8 +90,9 @@ def _build_G_face(psi_mun, psi_nmu, *, gemm, Gij=None, phases=None, mesh=None,
 
     Returns the Green ``(nk, mu_X, s, nu_Y, s')``: centroid-major, the
     GEMM's own merged endpoint order split by a reshape.  ``pair`` (face
-    route only): also the conjugate-face partner ``conj(ψ)·diag(w)·conj(ψ)† =
-    conj(A·diag(w*)·B)``, the second weighting of the SAME panel exchange.
+    route only): also the conjugate-face partner ``conj(A)·diag(w)·conj(B)``
+    from the SAME panel exchange (each gathered panel conjugated before its
+    own local GEMM; no conjugated tile).
     """
     if Gij is not None:
         raise NotImplementedError("Green faces support diagonal band weights, not dense Gij.")
@@ -127,11 +128,10 @@ def _build_G_face(psi_mun, psi_nmu, *, gemm, Gij=None, phases=None, mesh=None,
     elif face:
         # The phases scale each panel's slice of A on its way into the gather.
         if pair:
-            G_flat, partner = face_green_product(
-                A, B, gemm.mesh, jnp.stack([phases, jnp.conj(phases)]), band_range,
-                n_full=n_full)
+            G_flat, partner = face_green_product(A, B, gemm.mesh, phases, band_range,
+                                                 n_full=n_full, partner=True)
             return (G_flat.reshape(nk_, mu_l_, s_, mu_r_, s_),
-                    jnp.conj(partner).reshape(nk_, mu_l_, s_, mu_r_, s_))
+                    partner.reshape(nk_, mu_l_, s_, mu_r_, s_))
         G_flat = face_green_product(A, B, gemm.mesh, phases, band_range, n_full=n_full)
     else:
         G_flat = (gemm(A, B) if band_range is None

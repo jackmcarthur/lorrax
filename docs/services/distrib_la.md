@@ -56,7 +56,7 @@ SLATE: [Perlmutter §2](../environment/machines/perlmutter.md#2-the-lorrax_a-mod
 | `dispatch_batched_eigh(A, mesh, backend='distributed', *, batched_route='batch_reshard')` | `plan('eigh', …).batched(A)` for `gw.qsgw_density`. |
 | `matmul(A, B, C=None, *, mesh, alpha=1, beta=0, transa='N', transb='N', backend='auto', batched_route='batch_reshard', budget_bytes=None)`, `resolve_matmul_backend` | Distributed GEMM, § [matmul](#matmul). |
 | `gemm_plan(...) -> GemmPlan`, `local_gemm_plan(...)` | Resolve-once N,N GEMM for hot loops, § [Planned GEMM](#planned-gemm). |
-| `panel_matmul(A, B, *, mesh, panel_bytes, bounds=None, weights=None)` | Batched 2-D SUMMA face GEMM with bounded contraction panels, § [Bounded face products](#bounded-face-products). |
+| `panel_matmul(A, B, *, mesh, panel_bytes, bounds=None, weights=None, partner=False)` | Batched 2-D SUMMA face GEMM with bounded contraction panels, § [Bounded face products](#bounded-face-products). |
 | `contract_faces(b_X, b_Y, weights, start, stop, *, mesh, return_transpose=False)` | `(b_X·w) @ b_Yᴴ` for row faces `[b,m,K]` at `P(None,'x',None)` / `P(None,'y',None)` (or `[b,μ,s,K]`, spin merged into μ) with replicated weights `[b,K]` and interval `[start,stop)`; output `[b,m,m]` at `P(None,'x','y')`. Local GEMMs only, no collective, no provider. |
 | `polar_factor`, `plan_polar_factor`, `PolarPlan` | Square polar factor / SVD, § [Polar factor](#polar-factor-and-spectral-directions). |
 | `right_singular_vectors`, `leading_eigenvectors`, `retain_leading_eigenvectors` | Eager spectral-direction selection on face or batch-layout stacks, § [Polar factor](#polar-factor-and-spectral-directions). |
@@ -410,25 +410,28 @@ boundary: `ceil(B/P)` whole matrices plus their RHS blocks per rank.
 
 ## Bounded face products
 
-`panel_matmul(A, B, *, mesh, panel_bytes, bounds=None, weights=None)` forms `A @ B` as a
-batched 2-D SUMMA inside one `shard_map`. `A` is `[q,m,k]` at
-`P(None,'x','y')`; `B` is `[q,k,n]` in the same layout or `[q,s,k,n]` at
+`panel_matmul(A, B, *, mesh, panel_bytes, bounds=None, weights=None, partner=False)`
+forms `A @ B` as a batched 2-D SUMMA inside one `shard_map`. `A` is `[q,m,k]`
+at `P(None,'x','y')`; `B` is `[q,k,n]` in the same layout or `[q,s,k,n]` at
 `P(None,None,'x','y')`, in which case each A panel is broadcast once outside
 the sample loop. On a square mesh each panel takes `w` local columns of every
 owner block (one all-gather per operand, `p·w ≤ k/p` columns, every batch row
 in the same exchange and the same local GEMM); the next panel is gathered
-before the current one is multiplied. Output faces keep both mesh axes; no
-rank holds a band-complete row or column panel. `w` divides `k/p` with
-`itemsize·q·2·p·w·(m/Px + n/Py) ≤ panel_bytes`. Optional replicated
-`bounds` `(q,2)` name each row's live contraction interval (the caller has
-zeroed the rest): each panel's local product runs over that interval's one
-contiguous run of panel columns (the local active-range GEMM), so dead bands
-cost no flops. Rectangular meshes and the sample axis stream owner panels by
+before the current one is multiplied, so two panels of at most one owner block
+are live and no rank holds a band-complete row or column panel. `w` is the
+largest even split of `k/p` into panels of at most `k/p²` columns with
+`itemsize·q·2·p·w·(m/Px + n/Py) ≤ panel_bytes`; a remainder ends in one
+narrower panel. Optional replicated `bounds` `(q,2)` name each row's live
+contraction interval (the caller has zeroed the rest): each panel's local
+product runs over that interval's one contiguous run of panel columns (the
+local active-range GEMM), so dead bands cost no flops. `weights` `(q,k)`
+scale each panel slice of `A` on its way into the gather. `partner=True`
+also returns `conj(A)·diag(w)·conj(B)` from the same exchange, each gathered
+panel conjugated before its own GEMM (the face Green and its antiunitary
+partner). Rectangular meshes and the sample axis stream owner panels by
 masked `psum` and contract every column. The budget bounds the operand panels
 only: the caller admits input/output faces, compiled temporaries
-(`memory_analysis()`) and provider workspace. Stacked `(s,q,k)` weights
-return the `s` products `A·diag(w_s)·B` from one exchange of each panel (the
-face Green and its conjugate-face partner share it).
+(`memory_analysis()`) and provider workspace.
 
 Measured (A100-40GB, warm, ms per Green-sized product; CrI3 8×8
 `q=10, m=n=2904, k=144`, Fe 8³ `q=59, m=n=2560, k=120`, valence windows):
@@ -436,16 +439,15 @@ Measured (A100-40GB, warm, ms per Green-sized product; CrI3 8×8
 | route | P4 CrI3 | P4 Fe 8³ | P16 CrI3 | P16 Fe 8³ |
 |---|---|---|---|---|
 | full-k gather (retired: band-complete) | 2.68 | 6.59 | 1.86 | 5.14 |
-| batched SUMMA, 2 panels (default) | 3.22 | 6.79 | 1.85 | 5.95 |
-| batched SUMMA, 4-6 panels | 4.4-5.7 | 9.4 | 2.6-3.1 | 7.4-8.0 |
+| batched SUMMA, panels ≤ k/p (default) | 3.22 | 6.79 | 2.57 | 7.37 |
+| two k/2 panels (every band live on a rank: refused) | 3.22 | 6.79 | 1.85 | 5.95 |
 | cuBLASMp SUMMA, one call per q | 6.68 | 10.95 | 6.88 | 5.11 |
 
-On the CrI3 8×8 one-shot at P16 the Σ τ sweep is 2.30 s (gather), 2.08 s
-(default, partner pair), 2.57 s (cuBLASMp); peaks are equal. cuBLASMp runs one
-SUMMA per q and joins the XLA stream by events at entry and exit, so it cannot
-overlap neighbouring work; this route exchanges every q in one collective per
-panel, and XLA overlaps the next panel's all-gather with the current GEMM. At
-P16 the exchange is most of a build (1.2 of 1.85 ms on CrI3).
+cuBLASMp runs one SUMMA per q and joins the XLA stream by events at entry and
+exit, so it cannot overlap neighbouring work; this route exchanges every q in
+one collective per panel, and XLA overlaps the next panel's all-gather with
+the current GEMM. At P16 the exchange is most of a build (1.2 of 1.85 ms on
+CrI3).
 
 ## Face-pinned block glue
 
