@@ -3,8 +3,9 @@
 `qp_solver = self_consistent` finds the quasiparticle self-consistent GW fixed
 point by accelerating the GW map with one-evaluation Anderson mixing. This page
 covers the map, how each band is treated, the acceleration and its stop rules,
-the Σ grid and quadrature across maps, and the production requirements. Other
-pages own the deck keys and defaults ([input reference](input_reference.md)),
+and the Σ grid and quadrature across maps. Other pages own the production
+recipe and its error budget ([production QSGW](how-to/production-qsgw.md)),
+the deck keys and defaults ([input reference](input_reference.md)),
 metallic occupations and heads
 ([metallic MPA screening §6–7](theory/metallic-mpa-screening.md)), the Σ(ω)
 rules ([the Σ(ω) quadrature problem](theory/sigma-quadrature-problem.md)) and
@@ -239,7 +240,7 @@ metals it can stay above 1 at Fermi-crossing states, where exchange responds to
 an occupation flip within the smearing width. That is the physics of the map,
 not a failure of the accelerator.
 
-## 4 Σ grid and quadrature across maps
+## 4 Σ grid and quadrature across maps {#sigma-grid-and-quadrature}
 
 The ω grid is measured from $E_F$. The one-shot and every SC map grow the
 requested grid by one rule (`qp_support`, below), so SC map 0
@@ -308,8 +309,10 @@ $\Sigma(E)$, not $\Sigma(0)$, for an active state outside the requested grid.
   jump of its map output (CLAIMS 2736).
 - **Width.** The crossing-rule node count grows linearly in bandwidth$/\eta$,
   and Σ far from $E_F$ is not smoother: on Fe the curvature at
-  $\lvert\omega\rvert \ge 15$ eV is 13× that near $E_F$. Put deep semicore in
-  `sc_frozen_core_bands`, where it stays at its DFT block and costs nothing.
+  $\lvert\omega\rvert \ge 15$ eV is 13× that near $E_F$.
+  `sc_frozen_core_bands` holds a band at its DFT block at no Σ cost, but that
+  law fails on Fe 3s/3p and CrI3 I 5s (CLAIMS 2859), so production decks do
+  not freeze semicore.
   `sigma_regularization_ev` is the literal broadening η of every ansatz and
   is not a speed knob. The quadrature page owns η and
   `sigma_quadrature_eps`.
@@ -341,7 +344,7 @@ $\Sigma(E)$, not $\Sigma(0)$, for an active state outside the requested grid.
   windows), because the highest shared-pole mode moves 10–30 % per map and a
   sign-definite relative rule pays about one node for it. From map 1 the
   rules are held: a map reuses a rule by containment
-  (`cache=hit:sc-fixed`). A window whose box leaves its rule, a new window,
+  (`rule_source` `hit:sc-fixed`). A window whose box leaves its rule, a new window,
   or a sign change is an escape: it is rebuilt alone by the same plan rule
   around its current states (`rebuild:sc-fixed`) and held again; one
   `SC fixed quadrature recompute:` line in the report names the window and
@@ -518,23 +521,3 @@ Insulators keep `parallel_transport` and `dft_velocity`.
   `sigma_lorentz_debug_output = true`, four-current maps write
   `sigma_lorentz_iterNNNN.h5`: the CC, CT+TC and TT sectors in the map's input
   QP basis.
-
-## 9 Production requirements (owner rulings, 2026-09-03)
-
-- At least **20 conduction bands** in the Σ window (`ncond >= 20`).
-- **Centroids ≥ 10 × `number_bands`**, taking the nearest orbit-closed count.
-  About 6 per band is diagnostic only.
-- The ζ fit is built on the Gram of **all bands that enter Σ**
-  (`zeta_nband = number_bands`). If the strict rank ceiling refuses, the owner
-  decides `zeta_rcond`; the run does not drop to a smaller basis.
-- Band extrapolation stays on (the default). An explicit
-  `use_band_extrapolation` on a mode that does not consume it refuses.
-- **Band structures** come from htransform fitted on the whole WFN band set,
-  returning at least 16 corrected conduction bands with at least 8 guard
-  bands. The htransform coarse k-grid is its own convergence parameter,
-  independent of the GW screening grid. Take it from a dedicated uniform
-  NSCF WFN, and use a separate QE `calculation='bands'` run along the same
-  path as the reference. Densify it until the energy-ordered,
-  per-path-VBM-aligned QE certificate is at most **20 meV** for every plotted
-  cell whose QE energy lies in [−8, +8] eV. Report the all-state maximum too;
-  cells outside the window do not gate. Start Si-class cells at 8×8×8.

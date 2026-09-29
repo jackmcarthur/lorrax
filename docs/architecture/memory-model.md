@@ -55,24 +55,27 @@ receipt prints every term as a `G_tile` ratio against a ceiling of
 `4·G_tile`, so a reader sees at once whether the fit, rather than the GW
 stages, sets the node count.
 
-## ψ carriers: faces and band panels
+## ψ carriers: faces and band panels {#psi-carriers}
 
 The raw-parent carrier holds two orientations of `ψ_{n k̄ s}(r_μ)` on the
 `n_par` parents, stored as faces: bands on one mesh axis, centroids on the
-other. A band-complete (axis) copy exists only inside one contraction:
+other. A Green build never holds a band-complete copy; the Σ projector holds
+one for the length of its call:
 
 ```text
-M_face = 2·16·n_par·n_s·μ·N_b / P                  resident; μ and bands both tiled
-M_axis = 16·n_par·n_s·μ·N_b·(1/p_x + 1/p_y)
-       = 2·16·n_par·n_s·μ·N_b / √P                 one band-complete copy, per call
+M_face  = 2·16·n_par·n_s·μ·N_b / P                      resident; μ and bands both tiled
+M_axis  = 16·n_par·n_s·μ·N_b·(1/p_x + 1/p_y)
+        = 2·16·n_par·n_s·μ·N_b / √P                     one band-complete copy: the Σ projector
+M_panel = 2·16·n_par·n_s·μ·(N_b/p_x)·(1/p_x + 1/p_y)    one Green build's two live SUMMA panels
 ```
 
 With `s = n_par/N_k` (the symmetry reduction) and `r = N_b/μ`, in units of
 the Green tile:
 
 ```text
-M_face / G_tile = 2·s·r / n_s          independent of P
-M_axis / G_tile = 2·s·r·√P / n_s       grows as √P
+M_face / G_tile  = 2·s·r / n_s          independent of P
+M_axis / G_tile  = 2·s·r·√P / n_s       grows as √P
+M_panel / G_tile = 4·s·r / n_s          independent of P
 ```
 
 A resident axis copy would overtake one Green tile at `√P = n_s/(2·s·r)`
@@ -86,7 +89,7 @@ and then spend the GW feasibility floor (`4·G_tile`) on wavefunctions. For
 | 256 | 3.2 | 1.6 | 0.8 | 0.27 |
 | 1024 | 6.4 | 3.2 | 1.6 | 0.53 |
 
-(`M_axis` in `G_tile`; `M_face = 0.2·s/n_s` at every P.)
+(`M_axis` in `G_tile`; `M_face = 0.2·s/n_s` and `M_panel = 0.4·s/n_s` at every P.)
 
 A Green build `G = ψ·diag(f)·ψ†` on faces is a batched 2-D SUMMA
 (`distrib_la.panel_matmul`): band panels of at most `N_b/p` columns are
@@ -105,14 +108,17 @@ moves; its transient is `M_axis` at the projected band count.
 fused k-convolution, which unfolds them on its load, so no full-k Green
 exists. A Green of real weights (real node times) reads its antiunitary
 partner as `conj(G)` on the load; complex times build a conjugate-face
-partner tile (`partner = 1`). Each Green build adds its band-complete panels
-`M_axis` ([§ ψ carriers](#ψ-carriers-faces-and-band-panels)). New bytes per
+partner tile (`partner = 1`). Each Green build adds its two live SUMMA
+panels `M_panel` ([§ ψ carriers](#psi-carriers)). New bytes per
 rank beside what is live:
 
 ```text
-χ₀ node   = 2·(1 + partner)·(T_p + M_axis) + 16·n_out·N_k·μ²/P            nothing chunks
-Σ(τ) pass = (1 + partner + (d/n_s)²)·T_p + 16·N_k·μ²/P + (1 + partner)·M_axis
+χ₀ node   = 2·(1 + partner)·(T_p + M_panel) + 16·n_out·N_k·μ²/P + S_11   nothing chunks
+Σ(τ) pass = (1 + partner + (d/n_s)²)·T_p + 16·N_k·μ²/P + (1 + partner)·M_panel
 ```
+
+`S_11` is mode 11's split-arm scratch, at most one `T_p`
+(`greens_function_kernel.chi0_door_scratch`); it is 0 on the single pass.
 
 `sigma_spin_block` picks the largest output spin block `d` (a divisor of
 `n_s`) whose pass fits the room times the spinor's utilization, else 1.
@@ -125,9 +131,9 @@ the static Σ channels read it, before Hartree and the τ sweep.
 
 | stage | resident per rank (leading terms) | priced by | refuses |
 |---|---|---|---|
-| ψ(G) and centroid faces | charge fit: conj ψ(G) on the rank's G slots, `16·N_k·N_b·n_s·N_Gψ/P`. Centroid carrier `ψ(r_μ)`: `M_face` resident; each band contraction adds its transient panels, at most one `G_tile` ([§ ψ carriers](#ψ-carriers-faces-and-band-panels)) | `plan_zeta_route_g` | with the fit |
-| ζ fit, charge channel (route G) | C factor, one μ-batch working set, the ψ(G) slice; the Z store `16·Q·μ·N_G/P` lives on host or disk | `plan_zeta_route_g` ([§ route G](#route-g-every-ζ-fit)) | `GATE zeta-mubatch-capacity` |
-| ζ fit, current channels (bispinor) | the same, at μ_T, with three factors, accumulators and Z stores | `plan_zeta_route_g(n_vertex=3)` ([§ route G](#route-g-every-ζ-fit)) | `GATE zeta-mubatch-capacity` |
+| ψ(G) and centroid faces | charge fit: conj ψ(G) on the rank's G slots, `16·N_k·N_b·n_s·N_Gψ/P`. Centroid carrier `ψ(r_μ)`: `M_face` resident; each band contraction adds its transient panels, at most one `G_tile` ([§ ψ carriers](#psi-carriers)) | `plan_zeta_route_g` | with the fit |
+| ζ fit, charge channel (route G) | C factor, one μ-batch working set, the ψ(G) slice; the Z store `16·Q·μ·N_G/P` lives on host or disk | `plan_zeta_route_g` ([§ route G](#route-g-zeta-fit)) | `GATE zeta-mubatch-capacity` |
+| ζ fit, current channels (bispinor) | the same, at μ_T, with three factors, accumulators and Z stores | `plan_zeta_route_g(n_vertex=3)` ([§ route G](#route-g-zeta-fit)) | `GATE zeta-mubatch-capacity` |
 | V_q | `V_acc` `16·Q·μ_L·μ_R/P`, one q-tile of ζ rows, G panels | `vq_tile_bytes` ([§ V_q](#vq-g-panels-and-q-tiles)) | `GATE vq_tile_budget` |
 | V_q unfold | `16·N_k·μ²/P`, sharded `P(None,'x','y')` | — | — |
 | shared-pole screening and Σ | response-bank faces, pencils, eigh workspace, then G and W tiles | the capacity ledger ([shared-pole model](shared_pole_model.md), byte model) | before allocating, when a stage and its named concurrent stages exceed the budget |
@@ -151,7 +157,7 @@ whole k axis on every rank. A completed W of an earlier screening role is
 spilled to host (`common.collectives.spill_to_host`) while a later role runs,
 and restored afterwards.
 
-## Route G: every ζ fit
+## Route G: every ζ fit {#route-g-zeta-fit}
 
 Each ζ fit forms `Z_q(μ, G)` a batch of centroids at a time and solves
 `ζ = C⁻¹ Z` once, in G tiles

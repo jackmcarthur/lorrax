@@ -221,6 +221,9 @@ which \(W\) samples they request and how they turn them into poles:
 | `mpa`, `sigma_w_model = mpa` | two complex-frequency lines | several complex poles per element, Loewner fit | [MPA](THEORY_mpa_implementation.md) |
 | `mpa`, `sigma_w_model = shared_pole` | a response sample bank | \(W^c_q(z)=\sum_j b_jb_j^\dagger/(z^2-\Omega_j^2)\): one real pole set per q shared by all elements, \(16N_\mu K_q\) bytes per stored q | [shared-pole W](shared-pole-w-model.md) |
 
+The production calculation is the last row under `qp_solver = self_consistent`
+([production QSGW](../how-to/production-qsgw.md)).
+
 The \(\mathbf q\to0\) head and the four-current channels add to this table per
 [four-current heads](four-current-head-corrections.md#four-current-phase-status).
 

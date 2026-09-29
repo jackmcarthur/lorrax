@@ -45,7 +45,7 @@ the band energies from the NSCF output; a one-shot's `eqp0.dat` and the
 | $k_BT$ | `occ_smearing_width_ry` = the DFT `degauss`. Use 0.01 Ry at $N\ge 8$ and 0.02 Ry at $N=4$–6 (the Na 8³ and Fe 4³/8³ production decks) | the grid must resolve the Fermi surface: $k_BT$ of order the band dispersion across one k spacing. Halve it when you double $N$ |
 | QP window top | `ncond` = (highest band whose minimum over k lies below $E_F+E_{\rm win}$) − `nelec`, where `nelec` is the WFN's occupied-band boundary (`max(ifmax)`; `kmeans.out` prints it as `occupied-band boundary`) | Σ diagonals are computed for bands $[0,$ `nelec + ncond`$)$. The edge may not split a degenerate multiplet at any k (1 meV tolerance; `BandWindowDegeneracyError` refuses), so raise `ncond` to the top of the multiplet. States above the window are a rigid tail ([self-consistency §2](../self_consistency.md#2-band-treatment)) |
 | pair window | `nval` = the occupied bands whose maximum over k lies above $E_F-E_{\rm win}$ | it sets the lower edge of the ISDF pair-density window, not the bottom of the QP window. Do not freeze deep bands with `sc_frozen_core_bands`: on Fe 3s/3p the frozen law is off by hundreds of meV (CLAIMS 2859) |
-| band sums | `number_bands`: the bands the NSCF has | the χ0 and Σ sums; band-count convergence is a separate study |
+| band sums | `number_bands`: the bands the NSCF has, at least 2·`nelec` while band extrapolation is on (the default) | one count for the χ0 and Σ sums; Σ's is extrapolated, χ0's is not ([production QSGW](production-qsgw.md#error-budget)). Below 2·`nelec` the run refuses at startup; set `use_band_extrapolation = false` there |
 | centroids | select on the Σ pair set, `--fit-window 0:B,0:number_bands` with `B = nelec + ncond`. First run `python3 -m centroid.kmeans_cli` with a large request and read `achieved numerical rank=r` in `kmeans.out`; then select $N_\mu$ between $0.5r$ and $1.3r$. The rank line appears only when the snapped candidates outnumber the request (`pruning: not applied` otherwise), so keep the probe request below the FFT-grid point count | the ISDF exchange error falls with $N_\mu/r$: RMS ≤ 1 meV near $0.5r$, max ≤ 1 meV near $1.3r$ (CLAIMS 2860). See [drivers](../drivers.md) |
 | head | `head_correction = no_local_fields` (direct charge head: the interband $S(\omega)$ and the Fermi-surface Lindhard term, averaged over the q = 0 cell), or `full` on a scalar deck | [the metallic q→0 head](../theory/metal-q0-head.md) owns the head model |
 | SC head | `sc_head_update = off` (default: fixed DFT head on the DFT Fermi–Dirac state), or `dft_velocity` with `dipole.h5` | [self-consistency §7](../self_consistency.md#metals-direct-drude-head) |
@@ -89,7 +89,8 @@ gives $E_F$ = 18.01 eV and `nelec` = 18. Bands 19–24 have their minimum
 below $E_F$ + 10 eV and band 25 does not, but bands 24–26 are one multiplet
 at Γ (0.7 meV), so `ncond` = 8. Occupied bands 9–18 reach above
 $E_F$ − 10 eV, so `nval` = 10. Centroids are selected on
-`--fit-window 0:26,0:35`.
+`--fit-window 0:26,0:35`. The 35 bands are fewer than 2·`nelec` = 36, so the
+deck turns band extrapolation off.
 
 ```ini
 [cohsex]
@@ -108,6 +109,7 @@ fermi_reference = mp1_fixed_n
 head_correction = no_local_fields
 qp_solver = self_consistent
 sc_tol_ev = 1e-3
+use_band_extrapolation = false
 ```
 
 A one-shot G0W0 is the same deck with `qp_solver = one_shot_dft`.

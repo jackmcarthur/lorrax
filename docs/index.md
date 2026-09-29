@@ -5,8 +5,12 @@ multi-GPU/CPU implementation of an $O(N^3)$-scaling GW formalism, accelerated by
 Interpolative Separable Density Fitting (ISDF) and real-frequency-axis integration.
 The main GW driver is **GWJAX** (`gw.gw_jax`): it reads BerkeleyGW-format plane-wave
 DFT wavefunctions (`WFN.h5`) and computes quasiparticle corrections using
-static or frequency-dependent screening, including the
-[shared-pole W model](theory/shared-pole-w-model.md).
+static or frequency-dependent screening.
+
+**The production calculation is full-frequency QSGW with the
+[shared-pole W](theory/shared-pole-w-model.md), built from residues**, not
+GN-PPM: [production QSGW](how-to/production-qsgw.md) gives the recipe, its
+error budget and what is still pending.
 
 - **Input**: DFT wavefunctions on a plane-wave grid, symmetry maps, and k-point sampling
 - **Core idea**: replace dense charge-density products with a compact ISDF basis defined by centroids $r_\mu$
@@ -99,9 +103,10 @@ one sentence and a link.
 | **what an environment variable is called and what it defaults to** | [`docs/dev/env_vars.md`](dev/env_vars.md) | **spelling, default, class, and parse grammar — and nothing else.** Machine-enforced by `tests/test_env_registry.py`. Every row's *explanation* lives on the owner page it links to. |
 | **which JAX generation may run** | [`docs/dev/jax_support.md`](dev/jax_support.md) | the single JAX/JAXLIB 0.9 contract, its package/preflight/runtime enforcement, and the Perlmutter launch pins. Historical run records do not redefine this policy. |
 | **what a deck key does** | [Input reference](input_reference.md) | generated from the parser; the deck is the record for anything that changes the numbers. |
+| **what the production GW calculation is, its options and its error budget** | [Production QSGW](how-to/production-qsgw.md) | the route (full-frequency QSGW with the shared-pole W), the keys it sets, the owner's production requirements, the error budget in its two classes (controllable to about 1 meV; systematic, reported apart) with measured sizes and scope, and which parts are on main or pending the owner. The ruling itself: [decisions](architecture/decisions.md#production-gw-route). |
 | **how to set up a GW or QSGW run on a metal** | [Metals how-to](how-to/metals.md) | the metal rules (Fermi–Dirac, shared-pole W, the one band support), the choices a request leaves open and their defaults, what the code derives, what refuses, and a worked deck. It links the theory and the SC rules; it does not restate them. |
 | **how to get a WFN with every band of the plane-wave basis** | [Complete-basis WFN](how-to/complete-basis-wfn.md) | `psp.run_dense_h`: the dense H_k build and full eigh, the output WFN, the patched `jax_xc` requirement, the `[dense_h:<rule>]` preflight refusals, the per-k memory and time cost, and when to use it. |
-| **how the Σ_c band sum is extrapolated past `number_bands_sigma`** | [Band extrapolation](theory/band-extrapolation.md) | where it runs (PPM stages only), the three bracket sums from one pass and their default cuts, the pooled denominator-shell model `spectral_shell` and its fit, the no-tail rule, cost, and the measured Si errors with their scope. Deck keys: the input reference. |
+| **how the Σ_c band sum is extrapolated past `number_bands_sigma`** | [Band extrapolation](theory/band-extrapolation.md) | where it runs (GN/HL-PPM and the scalar `mpa` stage, shared pole included), the three bracket sums from one pass and their default cuts, the pooled denominator-shell model `spectral_shell` and its fit, the no-tail rule, cost, and the measured Si errors with their scope. Deck keys: the input reference. |
 | **how self-consistent GW converges and when it refuses** | [Self-consistency](self_consistency.md) | the QSGW map, band treatment, one-evaluation Anderson and its CONVERGED / STALLED / NOT UNIQUE verdicts, the Σ grid and frozen quadrature across maps, metals, seeding and outputs. |
 | **the Sigma quadrature problem and its constraints** | [The Sigma(omega) quadrature problem](theory/sigma-quadrature-problem.md) | separability and per-node cost, product windows, the two error currencies, node laws, acceptance, the grouped rule set per map and its request scope, the SC freeze, and refusals. |
 | **how MPA samples chi0, fits W and windows Sigma** | [Multipole frequency integration](theory/THEORY_mpa_implementation.md) | the frequency equations, validity domains, the ordered fit and window evaluation. Rule construction: the Σ quadrature row. |

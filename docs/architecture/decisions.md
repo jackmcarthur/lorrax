@@ -11,6 +11,41 @@ The last two sections are agent-tier: the GW driver's binding invariants and
 the per-function contracts of `gw.gw_config`, whose one-line docstrings point
 here.
 
+## 2026-09-29 — Production GW is full-frequency QSGW with the shared-pole W {#production-gw-route}
+
+**Rule (owner).** The production GW calculation is full-frequency QSGW with
+W built from residues: `compute_mode = mpa`, `sigma_w_model = shared_pole`,
+`qp_solver = self_consistent`. GN-PPM is a comparison route, and it refuses
+metals. One band count serves χ₀ and Σ, and Σ's band sum is extrapolated by
+the pooled `spectral_shell` fit. The error budget has two classes, reported
+apart: the Σ quadrature ε, the ISDF basis and the W model are held to about
+1 meV; the semicore read, band extrapolation, the scissored tail and W's own
+band truncation are systematic and reported with their measured size. The
+recipe, its budget and its pending parts are
+[production QSGW](../how-to/production-qsgw.md).
+
+**Why.** The owner's interest is the full-frequency calculation ("much more
+interested in the full freq shared pole GW calc than GNPPM"). The shared-pole
+W is a pole sum with real poles and positive residues by construction
+([shared-pole W §4.3](../theory/shared-pole-w-model.md)), the form a Green's
+function has; GN-PPM fits one pole per matrix element.
+
+## 2026-09-28 — No quadrature rule is stored across runs
+
+**Rule (owner).** Every run places its own quadrature rules; nothing is
+stored on disk or across processes ("i really don't want any cached rules for
+quadratures at all"). Reuse is in process only, as the
+[Σ quadrature page §10](../theory/sigma-quadrature-problem.md) describes.
+
+**Why.** The owner's ruling. A cold plan now costs about what a warm plan
+cost with the table, and results are bitwise to a cold run with it
+(claim 2941).
+
+**Deleted.** The Σ rule table, the run-local rule store, the minimax disk
+cache; the deck key `sigma_quadrature_cache_dir` refuses by name, and
+`LORRAX_MINIMAX_CACHE_DIR` and `LORRAX_DISABLE_MINIMAX_DISK_CACHE` are not
+read.
+
 ## 2026-09-25 — GEMM or FFT per axis is decided by measurement, per device
 
 **Rule (owner).** A local transform axis takes a stored-matrix GEMM instead of

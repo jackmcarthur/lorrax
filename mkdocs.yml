@@ -75,6 +75,7 @@ nav:
       - Drivers: drivers.md
       - Input reference: input_reference.md
       - Self-consistency: self_consistency.md
+      - "How-to: production QSGW": how-to/production-qsgw.md
       - "How-to: metals": how-to/metals.md
       - "How-to: complete-basis WFN": how-to/complete-basis-wfn.md
       - Downfold driver: downfold.md

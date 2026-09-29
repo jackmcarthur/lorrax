@@ -61,9 +61,11 @@ centroids and n_s spinor components:
 | two FFTs over the k grid | O((N_μn_s)² N_k log N_k / P) |
 | product and spin trace in R | O(N_k (N_μn_s)² / P) |
 
-One final FFT R → q follows the sweep, and every q is produced at once. The
-live set is two full-k Green tiles and the accumulator, each
-O(N_k (N_μn_s)² / P). The total, O(N_τ N_k N_μ² (N_b + log N_k)), is cubic in
+One final FFT R → q follows the sweep, and every q is produced at once. On a
+raw-parent plan mathdx mode 11 unfolds both Greens on its load and forms the
+product and spin trace in the same pass, so the live set is the two parent
+Greens and the accumulator, O(N_k (N_μn_s)² / P); the per-rank bytes are in
+the [memory model](../architecture/memory-model.md#the-green-side-stages). The total, O(N_τ N_k N_μ² (N_b + log N_k)), is cubic in
 system size; the direct pair sum costs O(N_q N_k N_v N_c N_μ²). N_τ is the
 only frequency-dependent factor.
 
@@ -86,7 +88,8 @@ N=\mathcal O\!\left(\log R\,\log\frac1\epsilon\right).
 $$
 
 Rules are computed at run time in milliseconds, capped at `minimax_max_nodes`,
-and cached by (log R, target, cap).
+and reused within the process by (log R, target, cap); none is stored across
+runs.
 
 **GN probe at iω_p.** `minimax.response_laplace_rule` places positive times
 on [Δ_min, Δ_max] at the single sample z = iω_p (reference Δ_min) and projects
@@ -143,12 +146,12 @@ is the only record.
 
 ## 6. Ownership
 
-`services/minimax` owns the targets, solvers, certificates and caches.
+`services/minimax` owns the targets, solvers, certificates and in-process caches.
 `gw.minimax_screening` owns the physical intervals, the energy reference, the
 rescaling and the probe adapters. `gw.w_isdf` owns the τ sweep. The Green's
 function builder and the FFT helpers carry no quadrature policy.
 
-## 7. Σ denominator-box rules
+## 7. Σ denominator-box rules {#sigma-box-rules}
 
 `minimax.analytic_box_rule(box, ε)` returns Q(d) = Σ_k w_k e^{i t_k d} ≈ 1/d
 on a box [a, b] × [η, y_max], η > 0, in the box's currency: peak-relative

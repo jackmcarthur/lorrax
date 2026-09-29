@@ -22,6 +22,13 @@ The wavefunction allocation shapes and distributed Green tiles stay fixed.
 Only native contraction dimensions change. Do not replace the sequential
 bracket scan with a stack of Green functions.
 
+A bracket whose masked selector has no nonzero band on any parent builds an
+exactly zero Green, so `_bracketed_face` skips it: a `lax.cond` on the
+replicated selector returns zeros without the Green build, the k-convolution
+or the Σ_mn projection, and every rank takes the same branch. The result is
+bitwise; on CrI3 (N_μ 3088, GN-PPM, extrapolation on) the Σ τ sweep went from
+129.8 to 55.7 s (sandbox claim 2944, addendum).
+
 `gw.mpa.sigma._batch_rows` returns fixed-width pole-index, bound, and phase
 arrays plus an int32 active-prefix count. Production passes that count as a
 replicated dynamic operand to the shared tau callable. The W synthesis loop

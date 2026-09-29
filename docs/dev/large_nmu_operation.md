@@ -47,7 +47,7 @@ divide both axes.
 The transverse ridge factor is the whole-tile local LU on every layout (route
 G applies it per G tile; [the solve seam](../architecture/zeta_fit_mubatch.md#the-solve-seam)),
 priced with the three current channels in the
-[memory model](../architecture/memory-model.md#route-g-every-ζ-fit).
+[memory model](../architecture/memory-model.md#route-g-zeta-fit).
 
 ## Where the ζ factor saturates
 

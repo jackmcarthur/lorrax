@@ -192,7 +192,7 @@ Invoke: `python -m gw.gw_jax -i gw.in`.
 | key | default | meaning |
 |---|---|---|
 | `number_bands` / `nval` / `ncond` | 100 / 5 / 5 | χ₀ and Σ band-sum top / interior valence edge / Σ conduction count. `number_bands_chi` and `number_bands_sigma` split the two sums |
-| `compute_mode` | `auto` | Σ ansatz: `x_only` \| `cohsex` \| `gn_ppm` \| `hl_ppm` \| `mpa`. `auto` infers from the legacy flags and never selects `mpa`. `gn_ppm` refuses metallic occupations ([input reference](input_reference.md)) |
+| `compute_mode` | `auto` | Σ ansatz: `x_only` \| `cohsex` \| `gn_ppm` \| `hl_ppm` \| `mpa`. `auto` infers from the legacy flags and never selects `mpa`. `gn_ppm` refuses metallic occupations ([input reference](input_reference.md)). Production: `mpa` with `sigma_w_model = shared_pole` ([production QSGW](how-to/production-qsgw.md)) |
 | `qp_solver` | `auto` → `one_shot_dft` | `one_shot_dft`: full-matrix effective H with Σ at $E_\mathrm{DFT}$, Hermitian-symmetrized; `fixed_point`: on-shell diagonal solve (dynamic modes); `self_consistent`: the QSGW loop ([self-consistency](self_consistency.md)) |
 | `write_eqp2` | false | dynamic one-shot: iterate the fixed Σ(ω) matrix in the evolving QP basis and write `eqp2.dat`; screening and Σ are not rebuilt. Keys `eqp2_*` in the [input reference](input_reference.md) |
 | `restart` | false | `true` reuses `tmp/isdf_tensors_<N_mu>.h5` after authentication |

@@ -68,9 +68,8 @@ keeps S(N₃); the log names it.
 
 ## Why pooled
 
-The estimator it replaced solved one β per state from the ratio of the two top
-shell increments. On narrow top shells that ratio is band texture, and a
-per-state β amplifies it. Pooling fixes the shape from every requested state
+A β solved per state from the ratio of the two top shell increments reads
+band texture on narrow top shells and amplifies it. Pooling fixes the shape from every requested state
 and leaves each state one amplitude, which the widest shell determines.
 
 ## Cost
@@ -83,12 +82,21 @@ in the pooled states: about 10 ms for the 71 Si 4³ states of the rescore,
 
 ## Measured
 
-**Production route (GN-PPM).** Si 4³, 25 Ry, scalar, complete-basis WFN, 78
-against 536 bands with the same ISDF basis and ε, head off; std over the
-±10 eV states / max 4v4c / median 4v4c / gap error, meV (sandbox run
-DEV/602): no extrapolation 34.4 / 107.1 / 36.8 / −96.4; the per-state form
-(cuts 64, 72, 78) 87.8 / 187.1 / 74.0 / −104.8; pooled (cuts 50, 64, 78;
-β 4.75, Ω 38 eV) 19.9 / 72.0 / 20.5 / −53.3.
+End to end, Si 4³, 25 Ry, scalar, complete-basis WFN, 78 against 536 bands
+with the same ISDF basis and ε; std over the ±10 eV states / max 4v4c /
+median 4v4c / gap error, meV. χ₀ is at 78 bands in both arms, so W keeps its
+own band truncation.
+
+| route | no extrapolation | pooled |
+|---|---|---|
+| shared pole, one-shot (claim 2948) | 35.6 / 125.1 / 37.0 / −120.4 | 21.2 / 83.7 / 24.3 / −72.8 (β 4.75, Ω 36 eV) |
+| GN-PPM, head off (claim 2942) | 34.4 / 107.1 / 36.8 / −96.4 | 19.9 / 72.0 / 20.5 / −53.3 (β 4.75, Ω 38 eV) |
+
+The shared-pole legs ran with a study Gram-validity dial (the stock gate
+refuses 78 bands on 2532 centroids). The extrapolation covers Σ's G sum only:
+most of the remainder is W's band truncation, which the study below
+separates (case c against case a). The error budget that carries both is
+[production QSGW](../how-to/production-qsgw.md#error-budget).
 
 **Study (shared-pole W, stored samples).** Si 4³, 25 Ry, scalar, complete
 basis (536 bands) as the truth;
@@ -105,8 +113,7 @@ error / median 4v4c direct error, meV (sandbox BANDEX study, claims 2898 and
 | 50 | 20, 34, 50 | 23.2 / 81.9 / 23.0 | 36.8 / 151.7 / 30.7 |
 | 34 | 14, 20, 34 | 49.0 / 168.0 / 52.8 | 53.6 / 179.3 / 57.8 |
 
-The per-state form at the old default cuts (64, 72, 78) scored
-109 / 278 / 113 meV in case a. The pooled form's std moves by at most
+The pooled form's std moves by at most
 2.7 meV (case a) and 3.6 meV (case c) across the placements measured at 78
 bands.
 

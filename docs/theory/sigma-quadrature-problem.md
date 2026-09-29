@@ -193,7 +193,7 @@ crossing box gets the bent contour: a trapezoid line in complex time whose
 endpoint error is exactly two Laplace integrals on the imaginary time axes,
 carried by two Gauss image sets. A sign-definite box gets the elliptic
 time-Ritz sector rule with the local extremal-length count. The derivation, the count laws and the fallback are
-[minimax quadrature §7](minimax-quadrature.md#7-σ-denominator-box-rules).
+[minimax quadrature §7](minimax-quadrature.md#sigma-box-rules).
 
 A crossing box costs about γ∫B(σ)dσ/2π nodes on the line, B(σ) the largest
 live |Re d|, plus O(log(M/η)·ln(1/ε)) image nodes; no construction goes
@@ -290,7 +290,9 @@ travels as data and raises on every rank.
   scalar route at the irreducible parents, then unfolded to the full q grid;
   a sector from its endpoint factors on the full grid.
 - **Band brackets.** For band-convergence extrapolation, one W preparation per
-  node is shared by one G build, convolution and projection per bracket.
+  node is shared by one G build, convolution and projection per bracket; a
+  bracket with no live band is skipped
+  ([fixed-shape kernels](../dev/gw_fixed_shape_kernels.md)).
 
 A per-stage split of a node is a `jax.profiler` trace of the window executable.
 

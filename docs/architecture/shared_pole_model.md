@@ -84,7 +84,10 @@ $$
 
 The forward product is $A(t)=G_u(t)\,\overline{G_f(\bar t)}$; the reverse is
 $\overline{A(\bar t)}$ — the same damping with the orbital product reversed, not
-$\overline{A(t)}$. The nodes come from a stacked Hankel shift pencil; a group
+$\overline{A(t)}$. On a raw-parent plan the charge stream forms $A(t)$ with
+mathdx mode 11 from the two parent Greens, metals included
+([fractional χ₀ response face](fractional_chi0_response_face.md)).
+The nodes come from a stacked Hankel shift pencil; a group
 whose shared fit fails is split in halves down to single samples, so no sample
 uses more nodes than its own rule needs. The group size is the largest whose
 donated carry `[2·members, q, μ_X, ν_Y]` and compiled stream temporaries fit the
@@ -323,6 +326,11 @@ gathered at $-q$ on the replicated q axis and transposed on its faces
 
 **Two-component decks.** $W$ is spin-scalar; $G$ carries the spinor axes and the
 τ kernel broadcasts $W_q$ over both (`ppm_tau_kernel` `prep_w`).
+
+**Band brackets.** With `use_band_extrapolation` (on by default) the scalar
+consumer splits the Green band sum into the three brackets of
+[band extrapolation](../theory/band-extrapolation.md) inside the same window
+executable and applies the pooled fit; a sector (bispinor) consumer does not.
 
 **Γ head** (`gw.shared_pole_head`). `head_correction = full` evaluates the
 current TRS body at Γ one frequency at a time, folds the common head wings

@@ -1,6 +1,6 @@
 # LORRAX: The LOw-scaling Real-space Real-Axis eXcited state package in BerkeleyGW
 
-The LORRAX code is a new GW-BSE package to be made available in BerkeleyGW in 2026. LORRAX is a JAX multi-GPU(/CPU) implementation of an $O(N^3)$-scaling formalism for the full-frequency (WIP), plasmon-pole (WIP), and static COHSEX self-energies $\Sigma^{GW}$ for one-shot $G_{0}W_{0}$ and quasiparticle-self consistent QSGW calculations. This provides significant speedups, with potential memory tradeoffs, relative to the canonical $O(N^4)$ scaling plane-wave formalism in BerkeleyGW. Iterative diagonalization of the Electron-Hole Bethe-Salpeter Equation Hamiltonian is also under development. LORRAX will shortly contain a novel $O(N^4)$ $QSG\hat{W}$ implementation with ladder vertex corrections in the screened interaction.
+The LORRAX code is a new GW-BSE package to be made available in BerkeleyGW in 2026. LORRAX is a JAX multi-GPU(/CPU) implementation of an $O(N^3)$-scaling formalism for the full-frequency (the production route: QSGW with the shared-pole $W$), plasmon-pole (WIP), and static COHSEX self-energies $\Sigma^{GW}$ for one-shot $G_{0}W_{0}$ and quasiparticle-self consistent QSGW calculations. This provides significant speedups, with potential memory tradeoffs, relative to the canonical $O(N^4)$ scaling plane-wave formalism in BerkeleyGW. Iterative diagonalization of the Electron-Hole Bethe-Salpeter Equation Hamiltonian is also under development. LORRAX will shortly contain a novel $O(N^4)$ $QSG\hat{W}$ implementation with ladder vertex corrections in the screened interaction.
 
 Besides these reduced scaling exponents, LORRAX gets its name from: 1.) our real-space framework for evaluating diagrammatic quantities, with the basis size reduced by the interpolative separable density fitting (ISDF) method, and 2.) real-frequency-axis integrations for the GW $\chi(\omega)$ and $\Sigma(\omega)$, avoiding ill-conditioned analytic continuation to recover real-axis quantities as in the majority of $O(N^3)$ scaling GW codes. The real-axis method has greater but comparable cost to imaginary-axis techniques, much improved by our novel real-axis minimax quadrature scheme.
 
@@ -34,6 +34,7 @@ bash $LORRAX_ROOT/config/frontera/templates/gw_dev.sbatch
 
 Detailed physics, code architecture, and environment setup are in `docs/`:
 
+- **[`docs/how-to/production-qsgw.md`](docs/how-to/production-qsgw.md)** — The production calculation, full-frequency QSGW with the shared-pole W: its options, error budget, and what is still pending
 - **[`docs/drivers.md`](docs/drivers.md)** — The core drivers in chain order: invocation, keys/flags, outputs, failure modes
 - **[`docs/input_reference.md`](docs/input_reference.md)** — Every deck key: name, default, one-line meaning (maintained by hand)
 - **[`docs/theory/physics.md`](docs/theory/physics.md)** — ISDF theory, GW equations, ISDF basis (zeta) fitting, JAX sharding
