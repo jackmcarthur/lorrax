@@ -136,8 +136,17 @@ def synthesize_shared_pole_parents(
     plus = _shared_pole_contract(b_X, b_Y, weights, gemm=gemm, layout=layout,
                                  intervals=intervals if active_range else None)
     # Both faces store the same physical b. Thus (b d b†)^T = b* d b^T
-    # even for complex d: transpose the all-mesh operator, never conjugate
-    # its causal phase or contract the same pole columns a second time.
+    # even for complex d: never conjugate its causal phase.
+    if active_range and layout == "axis":
+        # Each rank holds its rows of both factors with every pole column, so
+        # b* d b^T is a second local contraction of the window's columns: no
+        # (i,j) -> (j,i) tile exchange, which only the off-diagonal ranks pay
+        # and the diagonal ones then wait for (SYNC17).
+        transposed = _shared_pole_contract(jnp.conj(b_X), jnp.conj(b_Y), weights, gemm=gemm,
+                                           layout=layout, intervals=intervals)
+        return plus, transposed
+    # The face layout transposes the all-mesh operator instead of
+    # contracting the same pole columns a second time.
     from common.collectives import transpose_xy
     transposed = jax.lax.with_sharding_constraint(
         transpose_xy(plus, mesh_xy), NamedSharding(mesh_xy, P(None, "x", "y")))
