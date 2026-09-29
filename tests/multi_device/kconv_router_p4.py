@@ -38,6 +38,11 @@ must resolve to ``mathdx`` on this mesh (asserted, TASTE 30).
    mode 7's fused load, reported) on both antiunitary rules for the glide, A-cubic and C3 plans,
    and a 3x3 Lorentz block against unfold-then-rotate in XLA.  Red twin: the
    right source table rolled.
+3f. The shared-pole direct stream (``w_isdf`` pair_mode "direct") with mode 11
+   forming each node's correlation from the parent Greens, against the same
+   factory on its full-k Green route: 1e-12 of max|ref|, complex node times,
+   both orientations, glide (ns 2, 4) and C3 (ns 2).  Red twin: the physical
+   orientation against the incumbent (C3).
 4. The stored-kernel doors (modes 2-5) against NumPy ``np.fft`` on sharded
    operands, including an odd grid and 8x8x8: ``make_kconv_klead`` (Σ/COHSEX,
    prep + apply), ``make_kconv_kminor`` (BSE rung, both store layouts),
@@ -372,6 +377,58 @@ def chi_cases(mesh, rng):
     return recs
 
 
+def chi_direct_cases(mesh, rng):
+    """The shared-pole direct stream (``w_isdf`` pair_mode "direct") through mode 11 against
+    its full-k Green route, the same factory with mode 11 refused: complex node times, both
+    orientations, the glide plans (ns 2, 4; an antiunitary row) and C3 (ns 2, q != -q).
+    Red twin: the physical orientation against the incumbent must miss (C3 only: every row of
+    the 2x2x1 glide grid is its own negative)."""
+    import zeta_mubatch_fixtures as fixtures
+    from common.wfn_layout import psi_specs
+    from gw import w_isdf
+    from test_kconv_klead_unfold import c3_fixture
+    sn, sm = psi_specs("face")
+    recs = []
+    for fx in (fixtures._glide_fixture(mesh, rng, 2), fixtures._glide_fixture(mesh, rng, 4),
+               c3_fixture(mesh, 2)):
+        plan, kg = fx["plan"], tuple(fx["kgrid"])
+        ns, mu, npar, nk = int(plan.nspinor), int(plan.n_centroid_packed), int(plan.n_parent), int(plan.n_full)
+        nb, n_out = 6, 2
+        psi = fixtures._crand(rng, npar, ns, mu, nb) / 4
+        energy = np.sort(rng.uniform(-1.0, 2.0, (npar, nb)), axis=1)
+        f = 1.0 / (1.0 + np.exp(energy / 0.3))
+        t = np.asarray([0.13 + 0.27j, 0.41 - 0.11j, 0.0])
+        c = fixtures._crand(rng, 2, n_out, t.size)
+        c[..., -1] = 0.0                                  # a padded slot
+        q = tuple(range(0, nk, 2))
+        put = lambda a, spec=P(): fixtures._put(a, NamedSharding(mesh, spec))
+        args = (put(t), put(c), put(psi, sm), put(psi.transpose(0, 3, 1, 2), sn), put(energy),
+                put(f), put(1.0 - f), put(np.asarray([0.1, -0.2])))
+
+        def run(ordered, door):
+            serves = w_isdf._chi_door_serves
+            if not door:
+                w_isdf._chi_door_serves = lambda *a: False
+            try:
+                kernel = w_isdf._get_chi_fractional_contour_kernel_face(
+                    mesh, kg, n_out, (npar, nb, mu, ns), k_unfold_plan=plan, selected_q=q,
+                    pair_mode="direct", ordered=ordered, bank_carry=True, layout="face")
+            finally:
+                w_isdf._chi_door_serves = serves
+            carry = put(np.zeros((n_out, len(q), mu, mu), complex), P(None, None, "x", "y"))
+            return fixtures._host(kernel(*args, carry))
+        rel = lambda a, b: float(np.max(np.abs(a - b)) / np.max(np.abs(b)))
+        got = {o: (run(o, True), run(o, False)) for o in (False, True)}
+        for o, (new, old) in got.items():
+            r = dict(case=f"chi_direct_ns{ns}_nk{nk}_{'physical' if o else 'incumbent'}",
+                     antiunitary=bool(np.any(np.asarray(plan.sym_idx) >= plan.n_sym_spatial)),
+                     ref_direct_vs_full_k_route=rel(new, old))
+            if nk > 4 and o:
+                r["red_orientation"] = rel(new, got[False][1])
+            recs.append(r)
+    return recs
+
+
 def _np3(x, kg, axis0, kind, norm):
     """np.fft over three consecutive k axes starting at axis0 of the reshaped array."""
     f = np.fft.ifftn if kind == "ifftn" else np.fft.fftn
@@ -518,7 +575,7 @@ def main() -> int:
     rng = np.random.default_rng(20260924)
     recs = ([downfold_case(mesh, rng), face_parent_case(mesh, rng), plane_case(mesh, rng)]
             + unfold_cases(mesh, rng) + lorentz_cases(mesh, rng) + wedge_cases(mesh, rng)
-            + chi_cases(mesh, rng) + block_cases(mesh, rng)
+            + chi_cases(mesh, rng) + chi_direct_cases(mesh, rng) + block_cases(mesh, rng)
             + stored_cases(mesh, rng) + outer_cases(mesh, rng))
     bad = []
     for r in recs:
