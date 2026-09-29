@@ -256,6 +256,10 @@ The planner decides in this order:
 4. **G tile.** G_tile is the largest multiple of P with
    G_tile·6·ceil(Q/P)·μ·16 ≤ target/4,
    capped at ceil(N_G/P)·P.
+5. **Compiled check.** The batch executable is compiled before the first
+   batch and its new bytes (plus the lookahead batch's rows) are checked
+   against the working set; the loop runs that executable
+   ([memory model](memory-model.md#the-compiled-check)).
 
 The fit then packs whole orbits into bins with the least padded work,
 n_batch·(c+1) (`best_owner_orbit_batches`). A bin is at least the widest

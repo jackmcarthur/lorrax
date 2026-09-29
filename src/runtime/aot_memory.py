@@ -21,6 +21,14 @@ callers are the stage memory planners that compile their own kernel
 (``common.wfn_transforms``, ``isdf.core``, ``gw.mpa.sigma``,
 ``gw.mpa.sector_sigma``).
 
+:func:`check_chunk` is the one compiled check of an analytic chunk: a
+planner's closed form chooses the chunk, the chosen executable is compiled
+anyway, and its figure corrects the per-unit slope, re-solves the chunk and
+recompiles once only when it exceeds both the closed form and the room
+(the response direct stream, the ζ μ batch; the Σ τ window reads
+:func:`compiled_new_bytes`).  :func:`runtime_reserve_bytes` is the measured
+per-platform, per-P reserve the capacity ledger takes off the budget.
+
 Works on CPU and GPU.  On a non-CUDA platform there are no cuFFT plans, so
 the scratch term is an exact 0 — NOT a demotion.  That has to be decided
 from the platform, not the HLO: measured on jax 0.9.1 (job 7882062),
@@ -422,3 +430,104 @@ def aot_kernel_peak_bytes(compiled, *, platform: str | None = None
         fft_specs=fft_specs,
         resident_increment=compiled_increment + cufft_scratch,
     )
+
+
+# ---------------------------------------------------------------------------
+# One compiled check of an analytic chunk -- every stage planner calls this
+# ---------------------------------------------------------------------------
+
+#: Per-rank bytes a stage draws from XLA's pool at run time that neither its
+#: planner's closed form nor ``memory_analysis()`` shows, by (platform, P):
+#: allocator rounding and the runtime scratch of library calls that the planner
+#: does not price by name.  Measured once (docs/architecture/memory-model.md,
+#: "What compiled statistics miss"); a (platform, P) not in the table uses the
+#: largest measured entry of its platform, announced.  NCCL buffers, the CUDA
+#: context and cuSOLVERMp's grow-only workspace are outside the pool: they are
+#: the headroom between the budget and the device, not part of this reserve.
+RUNTIME_RESERVE_BYTES = {
+    ("gpu", 4): 0,
+}
+
+
+def runtime_reserve_bytes(platform: str | None = None, n_ranks: int | None = None) -> int:
+    """The measured in-pool reserve for ``platform`` at ``n_ranks`` (see the table)."""
+    import jax
+    if platform is None:
+        platform = jax.devices()[0].platform
+    platform = "gpu" if platform in ("gpu", "cuda") else str(platform)
+    if n_ranks is None:
+        n_ranks = jax.device_count()
+    key = (platform, int(n_ranks))
+    if key in RUNTIME_RESERVE_BYTES:
+        return int(RUNTIME_RESERVE_BYTES[key])
+    same = [v for (p, _), v in RUNTIME_RESERVE_BYTES.items() if p == platform]
+    value = int(max(same, default=0))
+    announce_once(f"runtime-reserve:{key}",
+                  f"runtime reserve not measured for {platform} at P={n_ranks}; "
+                  f"using the largest measured {platform} entry, {value / 1e9:.2f} GB")
+    return value
+
+
+@dataclass(frozen=True)
+class ChunkCheck:
+    """What :func:`check_chunk` decided.
+
+    ``chunk``/``compiled`` are what runs.  ``analytic`` is the planner's price
+    ``fixed + chunk0·per_unit`` of the chunk it chose, ``compiled_bytes`` the
+    executable's figure for that chunk, ``price`` the figure of the chunk that
+    runs (compiled when it was higher), ``per_unit`` the slope that chose it.
+    """
+    chunk: int
+    compiled: object
+    analytic: int
+    compiled_bytes: int
+    price: int
+    per_unit: float
+    recompiled: bool
+
+
+def compiled_new_bytes(compiled, *, extra: int = 0, platform: str | None = None) -> int:
+    """New bytes per rank of ``compiled`` beside its live arguments:
+    ``temp + outputs - alias`` plus cuFFT plan scratch, plus ``extra`` (what the
+    stage adds that buffer assignment cannot see: donated carries allocated by
+    the caller, a native handler's run-time scratch)."""
+    return int(aot_kernel_peak_bytes(compiled, platform=platform).resident_increment) + int(extra)
+
+
+def check_chunk(chunk: int, *, build, fixed: float, per_unit: float, room: float,
+                extra=lambda c, compiled: 0, minimum: int = 1, compiled=None, stage: str = "",
+                platform: str | None = None) -> ChunkCheck:
+    """Check the chunk an analytic model chose against its compiled executable.
+
+    The planner prices its stage as ``fixed + chunk·per_unit`` new bytes per
+    rank beside what is live and chose ``chunk`` for ``room``.  ``build(c)``
+    compiles the executable of chunk ``c`` (``compiled`` passes one already
+    built for ``chunk``).  Its figure is :func:`compiled_new_bytes` plus
+    ``extra(c, compiled)``: what the stage holds beside it (a donated carry
+    the caller allocates, a native handler's run-time scratch, a lookahead
+    copy of its output).  At or below the analytic price, or within the room, the
+    chunk runs as planned: nothing is recompiled and results are unchanged.
+    Above both, the slope is corrected from this one point,
+    ``per_unit = (compiled - fixed) / chunk``, the chunk solved directly,
+    ``floor((room - fixed) / per_unit)``, and compiled once more.  No
+    bisection: if the second figure is still over the room the stage runs and
+    its admission (or the stage-memory table) says so.
+    """
+    chunk = int(chunk)
+    if compiled is None:
+        compiled = build(chunk)
+    analytic = int(fixed + chunk * per_unit)
+    got = compiled_new_bytes(compiled, extra=int(extra(chunk, compiled)), platform=platform)
+    if got <= analytic or got <= room or chunk <= minimum:
+        return ChunkCheck(chunk, compiled, analytic, got, max(analytic, got),
+                          float(per_unit), False)
+    slope = max(float(per_unit), (got - float(fixed)) / chunk)
+    solved = max(int(minimum), min(chunk - 1, int((float(room) - float(fixed)) // slope)))
+    announce_once(f"check-chunk:{stage}:{chunk}:{solved}",
+                  f"{stage}: compiled {got / 1e9:.2f} GB over the analytic "
+                  f"{analytic / 1e9:.2f} GB and the room {room / 1e9:.2f} GB at chunk "
+                  f"{chunk}; slope {per_unit / 1e6:.1f} -> {slope / 1e6:.1f} MB per unit, "
+                  f"chunk {chunk} -> {solved}, recompiled once")
+    compiled = build(solved)
+    again = compiled_new_bytes(compiled, extra=int(extra(solved, compiled)), platform=platform)
+    return ChunkCheck(solved, compiled, analytic, got, again, slope, True)

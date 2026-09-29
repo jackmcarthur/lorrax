@@ -317,21 +317,65 @@ def _fit_mubatch(
     zt = zmb.zeta_plane_tables(gvec_components, ngk_per_q, fft_grid, axis, g_axis)
     # μ-owned rows: rank p owns slots p·c + [0, c) of every batch, whole
     # orbits per owner (the owner unfolds its own pair projectors).
-    mb = zmb.best_owner_orbit_batches(k_unfold_plan, mu_pad, P_,
-                                      c_max=max(1, int(plan.b) // P_))
-    b = int(mb.b)
     # The widest orbit can make the bins wider than planned: the owner then
     # streams its rows through the planes at the planned width (or refuses).
     from gw.gflat_memory_model import route_g_plane_chunk
-    c_out, n_blk = route_g_plane_chunk(plan, int(mb.c), P_)
-    kern_args = dict(
-        mesh=mesh_xy, kgrid=kgrid, fft_grid=fft_grid, ns=ns, b=b,
-        q_sel=q_irr_full_idx, q_axis=q_axis, q_neg=q_neg_idx, qvec_frac=q_frac,
-        n_col=int(cyl[0].shape[1]), n_s=int(cyl[0].shape[2]),
-        plane_from_col=np.asarray(jax.device_get(cyl[2])), n_pg=int(plan.r_sub),
-        axis=axis, n_src=n_par, vertices=vertices, c_out=c_out, n_blk=n_blk,
-        vertex_terms=vertex_terms)
-    kernel = zmb.make_route_g_kernel(**kern_args)
+    plane_from_col = np.asarray(jax.device_get(cyl[2]))
+    canon = np.asarray(k_unfold_plan.layout.axis.packed_to_canonical)
+    x_cent = np.asarray(centroid_indices, dtype=np.float64) / np.asarray(fft_grid)
+    ops = (_device_put_process_local(w_l, rep), _device_put_process_local(w_r, rep),
+           _device_put_process_local(kpar, rep))
+    rank_sh = NamedSharding(mesh_xy, P(('x', 'y')))
+    tabs = (tuple(_device_put_process_local(np.asarray(a), rep) for a in cyl[:2]),
+            tuple(_device_put_process_local(a, rep) for a in zt))
+
+    def launch_args(beta, mb):
+        slots = mb.mu[beta]
+        live = (slots >= 0).astype(np.float64)
+        xmu = x_cent[canon[np.clip(slots, 0, None)]] * live[:, None]
+        lt = tuple(jax.make_array_from_callback(a.shape, rank_sh, lambda i, a=a: a[i])
+                   for a in (mb.left_perm[beta], mb.left_L[beta]))
+        return (cbar, *ops, g3, _device_put_process_local(xmu, rep),
+                _device_put_process_local(live, rep), *tabs, unf, lt)
+
+    builds = {}
+
+    def build(c_max):
+        """The batch executable at ``c_max`` rows per owner (runtime.aot_memory.check_chunk)."""
+        mb = zmb.best_owner_orbit_batches(k_unfold_plan, mu_pad, P_, c_max=int(c_max))
+        c_out, n_blk = route_g_plane_chunk(plan, int(mb.c), P_)
+        kern_args = dict(
+            mesh=mesh_xy, kgrid=kgrid, fft_grid=fft_grid, ns=ns, b=int(mb.b),
+            q_sel=q_irr_full_idx, q_axis=q_axis, q_neg=q_neg_idx, qvec_frac=q_frac,
+            n_col=int(cyl[0].shape[1]), n_s=int(cyl[0].shape[2]),
+            plane_from_col=plane_from_col, n_pg=int(plan.r_sub),
+            axis=axis, n_src=n_par, vertices=vertices, c_out=c_out, n_blk=n_blk,
+            vertex_terms=vertex_terms)
+        kernel = zmb.make_route_g_kernel(**kern_args)
+        with timing.section("zeta_fit.mubatch.compile"):
+            compiled = kernel.lower(*launch_args(0, mb)).compile()
+        builds[int(c_max)] = (mb, c_out, n_blk, kern_args, kernel)
+        return compiled
+
+    # The plan's batch working set is fixed + c·slope per owner row c = b/P
+    # (gflat_memory_model.plan_zeta_route_g); its executable is checked before
+    # the first batch runs.  The lookahead batch keeps one more output live.
+    from runtime.aot_memory import check_chunk
+    n_pg_plan = int(plan.r_sub)
+    at = lambda c: plan.working_set(P_ * c, n_pg_plan, c, 1)
+    slope = at(2) - at(1)
+    check = check_chunk(
+        max(1, int(plan.b) // P_), build=build, stage="zeta route-G mu batch",
+        fixed=at(1) - slope - plan.working_set(0, n_pg_plan, 0, 1), per_unit=slope,
+        room=plan.target_bytes - plan.working_set(0, n_pg_plan, 0, 1),
+        extra=lambda c, compiled: int(compiled.memory_analysis().output_size_in_bytes))
+    mb, c_out, n_blk, kern_args, kernel = builds[check.chunk]
+    batch_executable = check.compiled
+    b = int(mb.b)
+    print_fn(f"  μ-batch executable: new bytes/rank analytic {check.analytic / 1e9:.2f} GB, "
+             f"compiled {check.compiled_bytes / 1e9:.2f} GB"
+             f"{' (recompiled at ' + str(check.chunk) + ' rows per owner)' if check.recompiled else ''}")
+    del check
     split_kernels = {}
     if debug_print_enabled():
         # Debug split timers: the same kernel truncated after each stage.
@@ -344,13 +388,6 @@ def _fit_mubatch(
         scratch_path=os.path.join(
             scratch_dir, "zeta_Z_store.scratch.h5" if v == 0
             else f"zeta_Z_store_mu{v}.scratch.h5")) for v in vertices]
-    canon = np.asarray(k_unfold_plan.layout.axis.packed_to_canonical)
-    x_cent = np.asarray(centroid_indices, dtype=np.float64) / np.asarray(fft_grid)
-    ops = (_device_put_process_local(w_l, rep), _device_put_process_local(w_r, rep),
-           _device_put_process_local(kpar, rep))
-    rank_sh = NamedSharding(mesh_xy, P(('x', 'y')))
-    tabs = (tuple(_device_put_process_local(np.asarray(a), rep) for a in cyl[:2]),
-            tuple(_device_put_process_local(a, rep) for a in zt))
     n_batch = int(mb.n_batch)
     print_fn(f"  μ-batch fit (route G): {n_batch} batches of {b} centroids "
              f"(whole orbits per owner; planned {int(plan.b)}; planes {c_out} "
@@ -375,22 +412,13 @@ def _fit_mubatch(
     n_run = 0
     n_go = n_batch if _max_n is None else min(n_batch, _max_n)
 
-    def launch_args(beta):
-        slots = mb.mu[beta]
-        live = (slots >= 0).astype(np.float64)
-        xmu = x_cent[canon[np.clip(slots, 0, None)]] * live[:, None]
-        lt = tuple(jax.make_array_from_callback(a.shape, rank_sh, lambda i, a=a: a[i])
-                   for a in (mb.left_perm[beta], mb.left_L[beta]))
-        return (cbar, *ops, g3, _device_put_process_local(xmu, rep),
-                _device_put_process_local(live, rep), *tabs, unf, lt)
-
     def launch(beta):
         """Dispatch batch β (asynchronous); the caller writes it later."""
-        return kernel(*launch_args(beta))
+        return batch_executable(*launch_args(beta, mb))
 
     if debug_print_enabled():
         # The collective count of one batch, read from the compiled HLO.
-        hlo = kernel.lower(*launch_args(0)).compile().as_text()
+        hlo = batch_executable.as_text()
         n_coll = {k: hlo.count(k + '(') + hlo.count(k + '-start(')
                   for k in ('all-to-all', 'all-reduce', 'all-gather',
                             'reduce-scatter', 'collective-permute')}
@@ -414,7 +442,7 @@ def _fit_mubatch(
             if n_run % 10 == 0:
                 print_fn(_host_mem(f"after μ-batch {n_run}"))
             if split_kernels and beta in (1, 2):
-                args = launch_args(beta)
+                args = launch_args(beta, mb)
                 t_stage = {}
                 for stage, kfn in list(split_kernels.items()) + [('full', kernel)]:
                     ts = time.perf_counter()

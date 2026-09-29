@@ -337,6 +337,12 @@ class CapacityLedger:
             else self._bytes(device_budget_bytes))
         if self.device_budget_bytes_per_rank <= 0:
             raise ValueError("capacity device budget must be positive")
+        # What the pool draws at run time beyond every priced and compiled
+        # byte, measured per platform and P (runtime.aot_memory); it is taken
+        # off the budget once here, so every admission sees it.
+        from runtime.aot_memory import runtime_reserve_bytes
+        self.reserve_bytes_per_rank = int(runtime_reserve_bytes(
+            mesh_xy.devices.flat[0].platform, g['px'] * g['py']))
         self.entries = []
         self._accepted = {}
         self._live_stages = None
@@ -431,7 +437,8 @@ class CapacityLedger:
         inherited = max((row.get('value', {}).get('shared_bytes_per_rank') or 0
                          for row in (self.stream_peak, self.sigma_peak)
                          if isinstance(row.get('value'), dict)), default=0)
-        available = max(0, self.device_budget_bytes_per_rank - inherited)
+        available = max(0, self.device_budget_bytes_per_rank - inherited
+                        - self.reserve_bytes_per_rank)
         passed = total <= available
         g = self.geometry
         max_ranks = math.floor(self.limit_bytes_per_rank * g['px'] * g['py'] / total) if total else None
@@ -453,6 +460,7 @@ class CapacityLedger:
                    limit_bytes_per_rank=self.limit_bytes_per_rank,
                    device_budget_bytes_per_rank=self.device_budget_bytes_per_rank,
                    inherited_peak_bytes_per_rank=inherited,
+                   runtime_reserve_bytes_per_rank=self.reserve_bytes_per_rank,
                    available_device_bytes_per_rank=available,
                    device_budget_status='PASS' if passed else 'FAIL',
                    concurrent_with=sorted(live), live_stages=sorted(live),

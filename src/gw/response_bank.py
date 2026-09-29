@@ -623,7 +623,9 @@ def _compiled(kernel, args):
 
 def _bank_execution(meta, mesh_xy, receipt, config, *, photon=False):
     """Compile and admit new dense work; stream outputs are reserved by batch."""
-    def execute(kernel, args, stage):
+    def execute(kernel, args, stage, runtime_bytes=0):
+        """``runtime_bytes``: what the executable draws at run time outside its
+        buffer assignment (mathdx mode 11's split arm), admitted with it."""
         with timing.section('bank.compile.' + stage, announce=True):
             started = time.monotonic()
             executable = _compiled(kernel, args)
@@ -638,7 +640,7 @@ def _bank_execution(meta, mesh_xy, receipt, config, *, photon=False):
                 # The caller reserves the sole carry; admit the actual
                 # Green/FFT workspace, without compiling a legacy comparator.
                 _, row = _reserve(meta, stage + "_temporaries", 0,
-                                  memory.temp_size_in_bytes)
+                                  memory.temp_size_in_bytes + int(runtime_bytes))
                 receipt["memory"].append(row)
             elif not stream:
                 layout = config.get("linalg", "local") if hasattr(config,"get") else config.backend.linalg
@@ -652,6 +654,7 @@ def _bank_execution(meta, mesh_xy, receipt, config, *, photon=False):
                 arguments=memory.argument_size_in_bytes, outputs=memory.output_size_in_bytes,
                 temporaries=memory.temp_size_in_bytes,
                 aliases=memory.alias_size_in_bytes,
+                runtime=int(runtime_bytes),
                 inherited_stream=False,
                 stream_temporaries_admitted=stream))
         with timing.section('bank.dispatch.' + stage, announce=stream,
@@ -1253,17 +1256,14 @@ def integrate_response_group(wfns, meta, mesh_xy, rules, group, *, q_ids,
     args = (jnp.asarray(times), jnp.asarray(weights), *fixed,
         stream_weights(wfns, rules["f"], mesh_xy), stream_weights(wfns, rules["u"], mesh_xy),
         jnp.asarray(rules["refs"]), raw)
-    raw = execute(kernel, args, "direct")
+    raw = execute(kernel, args, "direct",
+                  runtime_bytes=_stream_scratch(wfns, meta, mesh_xy, vertex))
     receipt["correlation_count"] += int(group["count"])
     return raw
 
 
-def _stream_workspace(wfns, meta, mesh_xy, support, *, q_ids, n_outputs, ordered, vertex):
-    """Compiled temporaries of the group stream; nothing is allocated.
-
-    Lowered with the production shapes, so the first group's dispatch reuses
-    this compilation when every sample fits in one group.
-    """
+def _stream_executable(wfns, meta, mesh_xy, support, *, q_ids, n_outputs, ordered, vertex):
+    """The group stream compiled at ``n_outputs`` production shapes; nothing is allocated."""
     import minimax
     n = meta.mu_basis.n_packed if vertex is None else vertex.n
     kernel, fixed = response_stream(wfns, meta, mesh_xy=mesh_xy, q_ids=q_ids,
@@ -1278,43 +1278,68 @@ def _stream_workspace(wfns, meta, mesh_xy, support, *, q_ids, n_outputs, ordered
                 jax.ShapeDtypeStruct((n_outputs, len(q_ids), n, n), jnp.complex128,
                     sharding=NamedSharding(mesh_xy, P(None, None, "x", "y"))))
     with timing.section('bank.compile.direct', announce=True):
-        memory = kernel.lower(*abstract).compile().memory_analysis()
-    if memory is None:
+        compiled = kernel.lower(*abstract).compile()
+    if compiled.memory_analysis() is None:
         raise ValueError("GATE response_capacity: compiled memory unavailable")
-    # The charge stream's mathdx mode 11 draws its split-arm scratch at run time,
-    # outside the compiled temporaries (w_isdf direct stream on a raw-parent plan).
-    scratch = 0
+    return compiled
+
+
+def _stream_scratch(wfns, meta, mesh_xy, vertex):
+    """Run-time scratch of the charge stream outside its compiled temporaries:
+    mathdx mode 11's split arm on a raw-parent plan (w_isdf direct stream)."""
     parent = wfns.green_parent
-    if vertex is None and parent is not None:
-        from .greens_function_kernel import chi0_door_scratch
-        from .w_isdf import _chi_door_serves
-        kgrid, ns = (meta.nkx, meta.nky, meta.nkz), int(meta.nspinor)
-        if _chi_door_serves(mesh_xy, kgrid, ns):
-            scratch = chi0_door_scratch(kgrid=kgrid, n_parent=int(parent.plan.n_parent),
-                                        n_rmu=n, ns=ns, mesh=mesh_xy)
-    return int(memory.temp_size_in_bytes) + int(scratch)
+    if vertex is not None or parent is None:
+        return 0
+    from .greens_function_kernel import chi0_door_scratch
+    from .w_isdf import _chi_door_serves
+    kgrid, ns = (meta.nkx, meta.nky, meta.nkz), int(meta.nspinor)
+    if not _chi_door_serves(mesh_xy, kgrid, ns):
+        return 0
+    return int(chi0_door_scratch(kgrid=kgrid, n_parent=int(parent.plan.n_parent),
+                                 n_rmu=meta.mu_basis.n_packed, ns=ns, mesh=mesh_xy))
+
+
+def _stream_workspace(wfns, meta, mesh_xy, support, *, q_ids, n_outputs, ordered, vertex):
+    """(compiled temporaries + run-time scratch of the group stream, its executable).
+
+    Lowered with the production shapes, so the first group's dispatch reuses
+    this compilation when every sample fits in one group.
+    """
+    compiled = _stream_executable(wfns, meta, mesh_xy, support, q_ids=q_ids,
+                                  n_outputs=n_outputs, ordered=ordered, vertex=vertex)
+    return (int(compiled.memory_analysis().temp_size_in_bytes)
+            + _stream_scratch(wfns, meta, mesh_xy, vertex)), compiled
 
 
 def response_group_size(meta, mesh_xy, *, n_samples, carry_per_sample, stream_workspace,
                         selection=(0, 0)):
-    """Largest sample group whose carry and stream workspace fit the ledger.
+    """Largest sample group whose carry and stream workspace fit, and its room.
 
     One route and no dial: every sample in one group when it fits (symmetric
     decks), otherwise the largest group that does (about four on a
     two-component deck without q symmetry, where the carry is G/2 Green tiles).
     ``selection`` is the line selection's (resident, workspace) bytes, which
-    run beside the group's carry after its stream.
+    run beside the group's carry after its stream.  The group must fit both
+    the ledger and the device room (``common.gpu_utils.device_room_bytes``:
+    the budget less the bytes actually live, which counts residents no ledger
+    row names), as :func:`moment_q_width` reads it; on the device the stream
+    and the selection are two phases, so a group's new bytes are its carry
+    plus the larger phase.  Returns ``(size, fixed, room, live)``: the group's
+    bytes beside its carry, the device room, and the live bytes.  Every
+    process enters.
     """
+    from common.gpu_utils import device_budget_bytes, device_room_bytes
     ledger = meta.shared_pole_capacity
-    fits = lambda g: ledger.preview(resident_bytes_per_rank=g*carry_per_sample+int(selection[0]),
+    device_room = device_room_bytes()
+    fixed = max(int(stream_workspace), int(selection[0]) + int(selection[1]))
+    fits = lambda g: (ledger.preview(resident_bytes_per_rank=g*carry_per_sample+int(selection[0]),
         workspace_bytes_per_rank=max(stream_workspace, int(selection[1])),
         concurrent_with=ledger.live_stages)["device_budget_status"] == "PASS"
-    if not fits(1):
-        return 1   # admission refuses with the actual compiled bytes
-    size = 1
+        and g*carry_per_sample + fixed <= device_room)
+    size = 1   # at one sample the admission refuses with the actual compiled bytes
     while size < n_samples and fits(size+1):
         size += 1
-    return size
+    return size, fixed, device_room, int(device_budget_bytes()) - device_room
 
 
 def produce_sample_bank(wfns, meta, config, *, mesh_xy, sym, sample_plan, bank_io,
@@ -1428,11 +1453,32 @@ def produce_sample_bank(wfns, meta, config, *, mesh_xy, sym, sample_plan, bank_i
         ledger.live_stages = ambient
         # Price the stream once at "every sample in one group"; the compiled
         # temporaries do not grow with the group, only the donated carry does.
-        workspace = _stream_workspace(wfns, meta, mesh_xy, support, q_ids=response_rows,
+        workspace, whole = _stream_workspace(wfns, meta, mesh_xy, support, q_ids=response_rows,
             n_outputs=2*len(z), ordered=ordered, vertex=vertex)
-        group_size = response_group_size(meta, mesh_xy, n_samples=len(z),
+        chosen = (0, 0) if selection is None else (selection_resident, selection_workspace)
+        group_size, fixed, room, live = response_group_size(meta, mesh_xy, n_samples=len(z),
             carry_per_sample=carry_per_sample, stream_workspace=workspace,
-            selection=(0, 0) if selection is None else (selection_resident, selection_workspace))
+            selection=chosen)
+        # The chosen group's executable, checked before it runs
+        # (runtime.aot_memory.check_chunk): the carry is a donated argument
+        # the caller allocates, the mode-11 scratch a run-time draw.
+        from runtime.aot_memory import check_chunk
+        from common.gpu_utils import record_stage_price
+        scratch = _stream_scratch(wfns, meta, mesh_xy, vertex)
+        check = check_chunk(
+            group_size, stage="response direct stream",
+            build=lambda g: _stream_executable(wfns, meta, mesh_xy, support,
+                q_ids=response_rows, n_outputs=2*g, ordered=ordered, vertex=vertex),
+            compiled=whole if group_size == len(z) else None,
+            fixed=fixed, per_unit=carry_per_sample, room=room,
+            extra=lambda g, _: g*carry_per_sample + scratch)
+        group_size = check.chunk
+        record_stage_price(f"response direct stream, group {group_size}/{len(z)}",
+                           live + check.price, section="bank.dispatch.direct")
+        receipt["group_check"] = dict(chunk=check.chunk, analytic=check.analytic,
+            compiled=check.compiled_bytes, price=check.price, live=live, room=room,
+            recompiled=check.recompiled)
+        del whole, check
         rules = response_quadrature(meta, sample_plan, receipt, support,
                                     group_size=group_size, print_fn=print_fn)
     # The group accumulator is all-P sharded. Dense work and slab I/O batch

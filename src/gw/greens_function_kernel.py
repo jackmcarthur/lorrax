@@ -467,7 +467,7 @@ def _green_terms(*, n_parent, n_rmu, ns, n_band, mesh):
     return tile, panels
 
 
-def sigma_spin_block(*, n_parent, n_rmu, ns, n_full, n_band, mesh, partner_tiles):
+def sigma_spin_block(*, n_parent, n_rmu, ns, n_full, n_band, mesh, partner_tiles, plan=None):
     """The block size ``d`` (a divisor of ``ns``): a parent-row Σ convolution stores its output in (ns/d)² x blocks.
 
     New per rank beside what is live: the parent Green ``T_p``, ``partner_tiles`` more of
@@ -476,7 +476,9 @@ def sigma_spin_block(*, n_parent, n_rmu, ns, n_full, n_band, mesh, partner_tiles
     piece, :func:`sigma_row_blocks`), the full-k W(τ) out of the k-convolution
     ``16·N_k·μ²/P``, and the panels of the Green and partner builds ``2·M_axis``.  The
     largest ``d`` whose set fits the stage room (:func:`_green_stage_room`) wins, else 1.
-    Every process computes the same ``d``.
+    Every process computes the same ``d``.  ``plan`` (a dict) receives ``d``, the
+    live bytes, the pass's new bytes and the room, for the compiled check of the
+    window executable (``gw.mpa.sigma.SynthesisTau.admit``).
     """
     if int(ns) <= 1:
         return 1
@@ -498,6 +500,8 @@ def sigma_spin_block(*, n_parent, n_rmu, ns, n_full, n_band, mesh, partner_tiles
     from common.gpu_utils import record_stage_price
     record_stage_price(f"Sigma tau, sigma_spin_block d={d}/{int(ns)}", live + new(d),
                        section="sigma.tau_sweep")
+    if plan is not None:
+        plan.update(d=int(d), ns=int(ns), live=float(live), new=float(new(d)), room=float(room))
     return d
 
 

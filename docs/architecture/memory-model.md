@@ -232,6 +232,56 @@ reduction shrinks the ζ store and the fit's accumulator by `N_k/Q`, not the
 
 ## What the closed forms cannot see
 
+### The compiled check
+
+A planner's closed form chooses its chunk; the chosen executable is compiled
+anyway, and `runtime.aot_memory.check_chunk` reads it before it runs. The
+stage is priced as `fixed + chunk·per_unit` new bytes per rank beside what is
+live. The executable's figure is `temp + outputs − alias` plus cuFFT plan
+scratch (`compiled_new_bytes`), plus what the stage holds beside it that buffer
+assignment cannot see: a donated carry the caller allocated, a native
+handler's run-time scratch, a lookahead copy of the output. At or below the
+closed form, or within the room, the chunk runs unchanged. Above both, the
+slope is corrected from that one point, `per_unit = (compiled − fixed)/chunk`,
+the chunk solved directly, and compiled once more. There is no bisection.
+
+| stage | chunk | compiled figure available | what it misses (priced elsewhere) |
+|---|---|---|---|
+| response direct stream (`gw.response_bank`) | samples per group | yes: temporaries | the donated carry (an argument), mode 11's split-arm scratch (`chi0_door_scratch`), residents no ledger row names (the device room) |
+| Σ τ window (`gw.mpa.sigma.SynthesisTau.admit`) | spin block `d` | yes: the first window executable | the synthesis GEMM's native workspace (added); `d` is not re-solved, a `d` over its room is announced |
+| ζ μ batch (`gw.isdf_fitting`, route G) | centroids per owner | yes: the batch executable, which the loop then runs | the lookahead batch's rows (its output, added) |
+
+The direct stream's group must also fit the device room
+(`device_room_bytes`, the budget less the bytes actually live), as the
+moment bank's width does: the shared-pole ledger does not own the ψ carriers
+and other residents live when W is built. On a device the stream and the line
+selection are two phases, so a group costs its carry plus the larger phase.
+
+### What compiled statistics miss
+
+Measured on Fe 8³ charge, map 0, P4, A100-40GB, `memory_per_device_gb = 36`
+(sandbox `runs/DEV/624_memprice_20260929`). Peaks are the pool high-water of
+the stage's section; prices are what the stage-memory table prints.
+
+| stage | closed form | compiled | measured peak |
+|---|---|---|---|
+| response direct stream (group 16 of 22) | 34.01 (ledger only) | 35.58 (temporaries 9.71 = priced; residents 1.96) | 35.58 |
+| Σ τ sweep (`d = 2`) | 13.30 | 14.02 | 13.96 |
+| ζ μ batch (320 centroids) | 29.38 new, 29.97 total | 22.68 new | 23.73 total |
+
+Two reserves follow from this.
+
+* **In the pool** (`runtime.aot_memory.RUNTIME_RESERVE_BYTES`, taken off the
+  capacity ledger's budget): what the pool draws beyond every priced and
+  compiled byte. 0 at (gpu, P4): the direct stream's peak equals its price
+  once residents are counted. A (platform, P) not in the table uses the
+  largest measured entry of its platform, announced.
+* **Outside the pool**: the CUDA context, NCCL communicators, library handles
+  and the mathdx modules peaked at 2.65 GB per rank above the pool's
+  reservation (`nvidia-smi` 38 983 MiB against 0.89 × 40 960 MiB; 4.7 GB with
+  a cuSOLVERMp context, `runtime.set_default_env`). The budget does not
+  include them: they must fit between the pool reservation and the card.
+
 ### Native handlers
 
 The nvidia-mathdx k-convolution kernels allocate no device workspace beyond

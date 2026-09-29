@@ -103,7 +103,9 @@ The nodes come from a stacked Hankel shift pencil; a group
 whose shared fit fails is split in halves down to single samples, so no sample
 uses more nodes than its own rule needs. The group size is the largest whose
 donated carry `[2·members, q, μ_X, ν_Y]` and compiled stream temporaries fit the
-map ledger: every sample in one group on symmetric decks. The accuracies are
+map ledger and the device room (the budget less the bytes actually live):
+every sample in one group on symmetric decks. The chosen group's executable is
+then checked before it runs ([memory model](memory-model.md#the-compiled-check)). The accuracies are
 sampled, not continuum certificates; a matched QP comparison is the acceptance
 check.
 

@@ -1175,6 +1175,22 @@ class SynthesisTau:
                       for x in jax.tree.leaves(self._synthesis.resident_operands()))
         _admit(compiled, self._meta, self._stage, native=self._native, counted=counted)
         self._admitted = True
+        from gw.ppm_tau_kernel import sigma_pass_price
+        plan = sigma_pass_price(self._spatial)
+        if plan is not None:
+            # The pass sigma_spin_block priced, from the window executable
+            # (runtime.aot_memory): its new bytes beside the live arguments plus
+            # the synthesis GEMM's native workspace.
+            from runtime.aot_memory import compiled_new_bytes, announce_once
+            from common.gpu_utils import record_stage_price
+            got = compiled_new_bytes(compiled, extra=self._native)
+            record_stage_price(f"Sigma tau, compiled window d={plan['d']}/{plan['ns']}",
+                               plan["live"] + max(plan["new"], got), section="sigma.tau_sweep")
+            if got > max(plan["new"], plan["room"]) and plan["d"] > 1:
+                announce_once(f"sigma-pass-over-room:{plan['d']}",
+                              f"Sigma tau pass d={plan['d']}: compiled {got/1e9:.2f} GB over "
+                              f"the room {plan['room']/1e9:.2f} GB; the stage-memory table "
+                              "shows the peak")
 
 
 def _integrate_sigma_batches(

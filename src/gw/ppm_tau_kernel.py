@@ -86,9 +86,14 @@ class SpatialKernel(NamedTuple):
         and the ψ projection.  Paid ONCE PER G(τ).  ``G_parents`` is the
         :class:`gw.greens_function_kernel.ParentGreen` pair; Σ_k leaves
         spin-major, the face projector's contract.
+    ``price``
+        ``sigma_spin_block``'s analytic plan (``d``, the live bytes, the new
+        bytes of one pass and the room), which the window executable's
+        compiled figure is checked against.
     """
     prep_w: Callable[..., jax.Array]
     conv_project: Callable[..., jax.Array]
+    price: dict | None = None
 
 
 def get_sigma_spatial_kernel(
@@ -138,9 +143,10 @@ def get_sigma_spatial_kernel(
         raise ValueError("Sigma spatial kernel requires the typed parent unfold plan.")
     from .greens_function_kernel import sigma_row_blocks, sigma_spin_block
     ns = int(face_shape[3])
+    price = {}
     d = sigma_spin_block(n_parent=k_unfold_plan.n_parent, n_rmu=int(face_shape[2]), ns=ns,
                          n_full=nk_tot, n_band=int(face_shape[1]), mesh=mesh_xy,
-                         partner_tiles=partner_tiles)
+                         partner_tiles=partner_tiles, plan=price)
     unfold_conv = make_kconv_klead_unfold(mesh_xy, kgrid, k_unfold_plan.unfold_load_tables(),
                                           store_rows=k_unfold_plan.parent_full_rows,
                                           norm='ortho', mult=-1.0 / np.sqrt(float(nk_tot)))
@@ -184,7 +190,7 @@ def get_sigma_spatial_kernel(
         # typed unfold, spin action and reorder are the convolution's load,
         # and the other full-k rows are never stored.
         return convolve_project(psi_proj_xr, psi_proj_yn, G_parents, W_prep)
-    pair = SpatialKernel(prep_w=prep_w, conv_project=conv_project)
+    pair = SpatialKernel(prep_w=prep_w, conv_project=conv_project, price=price or None)
     _sigma_spatial_kernel_cache[key] = pair
     return pair
 
@@ -330,7 +336,18 @@ def _get_sigma_kij_kernel(
                 E_A, mask_A, None, None, E_ref_A, t_node, W_q, W_pt, load)
 
     _sigma_kij_kernel_cache[key] = kernel
+    _SIGMA_PASS_PRICE[id(kernel)] = spatial.price
     return kernel
+
+
+#: ``sigma_spin_block``'s plan per cached Σ kernel (cached for the process,
+#: so its id is stable), for the window executable's compiled check.
+_SIGMA_PASS_PRICE: dict[int, dict | None] = {}
+
+
+def sigma_pass_price(kernel):
+    """The analytic Σ pass plan behind ``kernel`` (a Σ_kij or spatial kernel), or None."""
+    return _SIGMA_PASS_PRICE.get(id(kernel), getattr(kernel, "price", None))
 
 
 def _wedge_residues(B_poles):
