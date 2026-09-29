@@ -3362,10 +3362,12 @@ def coarse_class_for_deck(config, wfn, print0):
     # writes the class to stderr, which reaches the rank-0 log.
     say = print0 if jax.process_index() else (
         lambda line: print(line, file=sys.stderr, flush=True))
-    say(f"  QP matrix: bands 1-{n_occ + int(config.ncond)} counted (nval={int(config.nval)}, "
-        f"ncond={int(config.ncond)}), rotated among themselves; bands "
-        f"{n_occ + int(config.ncond) + 1}-{int(config.nband)} scissored (no Sigma, no mixing); "
-        "coarse (semicore) Sigma read: "
+    top = n_occ + int(config.ncond)
+    say(f"  QP matrix: bands 1-{top} counted (nval={int(config.nval)}, "
+        f"ncond={int(config.ncond)}), rotated among themselves; "
+        + (f"bands {top + 1}-{int(config.nband)} scissored (no Sigma, no mixing); "
+           if top < int(config.nband) else "no scissored tail; ")
+        + "coarse (semicore) Sigma read: "
         + ((f"{coarse.n_coarse} (k,state) below E-mu = {coarse.coarse_floor_ev - mu:+.3f} eV, "
             + (f"the lowest requested valence band (nval={int(config.nval)})"
                if getattr(config, "number_bands_protected", None) is None else
