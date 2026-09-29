@@ -1005,11 +1005,17 @@ def _get_chi_fractional_contour_kernel_face(
             # both orientations: the reverse product at time conj(t) is
             # conj(A(t)), read from the -q rows of the same transform.
             # green_k owns its own physical/incumbent conjugation.
-            time = time_nodes[index]
-            forward = jax.lax.dynamic_index_in_dim(
-                projection_rows[0], index, axis=1, keepdims=False)
-            reverse = jax.lax.dynamic_index_in_dim(
-                projection_rows[1], index, axis=1, keepdims=False)
+            # The node's inputs are read from the loop counter once, here, and
+            # held behind a barrier. XLA's post-scheduling rematerialization
+            # otherwise may clone a counter-indexed slice AFTER the body's
+            # in-place counter increment (same buffer), so it reads node
+            # index+1: under the latency-hiding schedule the reverse weights
+            # did (Fe 8^3 P4, Gram min -16.1). A barrier output is an indirect
+            # use, which remat does not clone.
+            time, forward, reverse = jax.lax.optimization_barrier((
+                time_nodes[index],
+                jax.lax.dynamic_index_in_dim(projection_rows[0], index, axis=1, keepdims=False),
+                jax.lax.dynamic_index_in_dim(projection_rows[1], index, axis=1, keepdims=False)))
             if chi_door is not None:
                 ahead, behind = direct_rows(time)
             else:
