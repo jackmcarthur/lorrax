@@ -91,22 +91,27 @@ Both legs link one MPI, pinned in `config/perlmutter/ffi_mpi.sh`: cray-mpich
 install already require), cray-libsci 25.09.0, with darshan unloaded. Change
 those values there and nowhere else.
 
+- SLATE (host leg): `bash src/ffi/cpp/stage/slate_build_perlmutter.sh cpu`,
+  which pins the same MPI and LibSci after `PrgEnv-gnu`.
 - Host leg: `bash config/perlmutter/build_ffi_host.sh --fresh`.
-- CUDA leg: the CUDA-13 runtime recipe
-  ([Perlmutter §2](environment/machines/perlmutter.md#2-the-lorrax_a-module-and-the-ffi-bundle)),
-  which sources `ffi_mpi.sh` from the checkout it builds.
-- Build from a clean checkout in a zero-GPU compute step
-  (`lx run --pool POOL -N 1 -G 0 -n 1 -- …`). On a login node the default HDF5 module links
-  a second MPI and GATE 1 fails.
-- Seal the two legs as above.
+- CUDA leg: `bash config/perlmutter/build_ffi_cuda.sh --fresh`, against
+  `cudatoolkit/13.2` and the clone's `uv sync --extra cuda13` venv; it stages
+  the cuSOLVERMp/cuBLASMp wheels under `LORRAX_BUILD_PREFIX`
+  (default `<clone>/.build`).
+- Build in a zero-GPU compute step; the
+  [install page](installation/perlmutter.md#build)
+  gives the `srun` line. Every leg carries the pinned HDF5 lib dir on its
+  RPATH, so a run needs no `LD_LIBRARY_PATH`.
+- Seal the two legs as above to publish them; a private build runs unsealed.
 
 The site recipe carries this machine's answers: the explicit LibSci ScaLAPACK
 link line (CMake's probe expects an MKL layout), the `_mp` threading flavour
 that matches the `gpu_backend=none` SLATE install, LibSci and FFTW prefixes
 captured and their modules unloaded before CMake runs, and the phdf5 stage to
-compare HDF5 against. The generic `src/ffi/cpp/build_host.sh` hands over to it
-on Perlmutter and Frontera; `LORRAX_FFI_GENERIC_BUILD=1` builds generically
-instead.
+compare HDF5 against (default: the HDF5 module's own prefix). The XLA FFI
+headers come from the clone's venv (`jax.ffi.include_dir()`). The generic
+`src/ffi/cpp/build_host.sh` hands over to it on Perlmutter and Frontera;
+`LORRAX_FFI_GENERIC_BUILD=1` builds generically instead.
 
 ## Frontera
 

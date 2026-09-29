@@ -100,3 +100,7 @@ src/ffi/cpp/build_host_cloud/
 # tests/hsuite run directories and its compile cache.
 .hsuite_runs/
 .hsuite_jax_cache/
+
+# user builds (config/perlmutter/build_ffi_{cuda,host}.sh, SLATE stage)
+.build/
+src/ffi/cpp/build_host/

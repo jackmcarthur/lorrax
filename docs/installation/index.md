@@ -14,7 +14,7 @@ pins; [ffi_layout.md](../architecture/ffi_layout.md) owns the native design.
 
 | platform | route | page |
 |---|---|---|
-| NERSC Perlmutter (A100, CUDA 13.2, JAX 0.9.1) | the `lorrax_A` base module, which supplies the runtime and one sealed FFI bundle; launch with `lx` | [Perlmutter](perlmutter.md) |
+| NERSC Perlmutter (A100, CUDA 13.2, JAX 0.9.1) | `uv sync --extra cuda13`, build both legs with `config/perlmutter/build_ffi_{host,cuda}.sh`, launch with `srun`; project m4598 can use the `lorrax_A` module and `lx` instead | [Perlmutter](perlmutter.md) |
 | TACC Frontera (CPU) | build the host leg with `config/frontera/build_ffi_host.sh` | [Frontera](../environment/machines/frontera.md), `config/frontera/README.md` |
 | another site | build both legs from the stage scripts and seal them | [Building the FFI libraries](../building_ffi.md), [FFI native libraries](ffi-native-libs.md) |
 
@@ -22,7 +22,7 @@ pins; [ffi_layout.md](../architecture/ffi_layout.md) owns the native design.
 
 | refusal | cause | fix |
 |---|---|---|
-| `Could not locate liblorrax_ffi_host.so (platform=cpu)` or `… liblorrax_ffi.so (platform=CUDA)`, with the paths searched | no library for this platform | Perlmutter: launch through `lx`, which selects the `lorrax_A` module. Elsewhere: build the leg the message names. |
+| `Could not locate liblorrax_ffi_host.so (platform=cpu)` or `… liblorrax_ffi.so (platform=CUDA)`, with the paths searched | no library for this platform | build the leg the message names ([Perlmutter](perlmutter.md#build)); with `lx`, the `lorrax_A` module supplies both |
 | `HANDLER ABI MISMATCH` | the library and the Python tree disagree on `LORRAX_FFI_ABI_VERSION` | rebase onto current main, or rebuild and reseal both legs from the same tree |
 | `partial sealed-bundle override refused` | only one of `LORRAX_FFI_SO` / `LORRAX_FFI_HOST_SO` is set | unset both, or pin both legs of one sealed bundle |
 | `mixed native providers` | the two selected legs claim different bundle manifests | select both legs from one bundle |

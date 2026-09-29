@@ -3,10 +3,11 @@
 This directory describes site capabilities. It does not own allocation,
 launcher, JAX, HDF5, compile-cache, or profiling policy.
 
-On Perlmutter, `lx` is the only supported launcher:
-
-`lx` selects the `lorrax_A` base module by default; `LX_BASE_MODULE` is an
-expert override.
+On Perlmutter, a clone installs and runs with plain `srun`
+([docs/installation/perlmutter.md](../docs/installation/perlmutter.md));
+`config/perlmutter/build_ffi_{host,cuda}.sh` build its FFI pair. Project m4598
+can use the maintainers' `lx` launcher, which selects the `lorrax_A` base
+module by default (`LX_BASE_MODULE` is an expert override):
 
 ```bash
 export LORRAX_CHECKOUT=/path/to/lorrax

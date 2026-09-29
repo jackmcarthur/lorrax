@@ -104,7 +104,7 @@ CANDIDATE="$WORK_DIR/install"
 
 if ! type module >/dev/null 2>&1; then
     # shellcheck disable=SC1091
-    source /usr/share/lmod/lmod/init/bash
+    source /opt/cray/pe/lmod/lmod/init/bash
 fi
 if [[ -n "${LORRAX_PM_PRGENV:-}" && \
       "$LORRAX_PM_PRGENV" != "$LORRAX_PM_PRGENV_DEFAULT" ]] || \

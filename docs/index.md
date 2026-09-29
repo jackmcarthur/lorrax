@@ -18,26 +18,27 @@ error budget and what is still pending.
 
 ## Try it
 
-The fastest way to confirm LORRAX works on your machine is to build the native
-layer and run every driver on the bundled test fixture:
+The fastest way to confirm LORRAX works on your machine is to install it,
+build the native pair, and run every driver on the bundled test fixture. The
+native pair is required on every platform, at every process count
+([design decisions](architecture/decisions.md)); a missing library refuses at
+startup with `Could not locate liblorrax_ffi_host.so` or `… liblorrax_ffi.so`.
+
+| platform | install and build | then |
+|---|---|---|
+| Perlmutter, any account | [Installation › Perlmutter](installation/perlmutter.md), steps 1–2 | its step 3 runs the suite |
+| Perlmutter, project m4598 | nothing: the `lorrax_A` module supplies the pair | `lx run -N 1 -G 4 -n 4 -- python -m pytest tests/hsuite` |
+| Frontera, another site | [Installation](installation/index.md) | [Quickstart](quickstart.md) |
+
+On Perlmutter, the fixture chain alone (one GPU, output on a shared
+filesystem) is
 
 ```bash
-uv sync
-bash src/ffi/cpp/build_host.sh      # see below: this step is NOT optional
-uv run python -m tests.hsuite.chain --out "$(mktemp -d)/quickstart"
+srun --jobid=$JOBID -N 1 -n 1 --gpus-per-node=1 \
+  .venv/bin/python -m tests.hsuite.chain --out "$SCRATCH/lorrax_quickstart_$(date +%s)"
 ```
 
-!!! warning "The native build is required"
-    `uv sync` alone is not enough, on any platform, at any process count. The
-    FFI layer is required ([design decisions](architecture/decisions.md)): a
-    missing or unloadable library refuses at startup with `RuntimeError: The
-    required FFTW3-ABI host backend is unavailable … Could not locate
-    liblorrax_ffi_host.so`. `build_host.sh` needs a SLATE `gpu_backend=none`
-    install and refuses without one, naming
-    `src/ffi/cpp/stage/slate_build_perlmutter.sh cpu` as the step before it.
-
-See the [Quickstart](quickstart.md) for the worked example, and
-[Installation](installation/index.md) for the GPU / distributed / from-source tracks.
+See the [Quickstart](quickstart.md) for the worked example.
 
 ## High-level pipeline
 

@@ -5,10 +5,10 @@
 #   src/ffi/cpp/stage/slate_build_perlmutter.sh gpu   [--fresh]
 #   src/ffi/cpp/stage/slate_build_perlmutter.sh cpu   [--fresh]
 #
-# Produces:
-#   $HOME/software/slate_builds/src/slate        shared source checkout (pinned)
-#   $HOME/software/slate_builds/gpu/{build,install}   gpu_backend=cuda
-#   $HOME/software/slate_builds/cpu/{build,install}   gpu_backend=none
+# Produces (PREFIX = $LORRAX_BUILD_PREFIX, default <checkout>/.build):
+#   $PREFIX/slate/src/slate                  shared source checkout (pinned)
+#   $PREFIX/slate/gpu/{build,install}        gpu_backend=cuda (not used by LORRAX)
+#   $PREFIX/slate/cpu/{build,install}        gpu_backend=none (the host leg's SLATE)
 #
 # Where to run: the script is host-side (NO shifter container — SLATE is
 # built against the Cray PE so it gets libsci BLAS/LAPACK/ScaLAPACK and
@@ -35,15 +35,14 @@
 # drags in libcuda.so.1 (the driver), which does not exist on CPU nodes.
 #
 # Overrides (env):
-#   LORRAX_SLATE_BUILDS_DIR   root dir     (default $HOME/software/slate_builds)
+#   LORRAX_BUILD_PREFIX       build root   (default <checkout>/.build; the
+#                             SLATE tree is $LORRAX_BUILD_PREFIX/slate)
 #   LORRAX_SLATE_REPO         git URL/path (default github icl-utk-edu/slate)
 #   LORRAX_SLATE_COMMIT       commit/tag   (default ded15290 = v2025.05.28-1,
 #                                           same as the $HOME/software/slate
 #                                           evaluation build)
-#   LORRAX_SLATE_CUDATOOLKIT  cudatoolkit module version (default 12.9 — must
-#                             stay CUDA-12 to match the nvcr.io/nvidia/jax
-#                             container the LORRAX FFI runs in; libcudart
-#                             ABI is compatible within a major version)
+#   LORRAX_SLATE_CUDATOOLKIT  cudatoolkit module version for the gpu variant
+#                             (default 13.2, the CUDA the runtime uses)
 #   LORRAX_SLATE_MAKE_J       parallel build jobs (default 32)
 
 set -euo pipefail
@@ -55,10 +54,11 @@ case "${VARIANT}" in gpu|cpu) ;; *)
 esac
 FRESH="${2:-}"
 
-ROOT="${LORRAX_SLATE_BUILDS_DIR:-$HOME/software/slate_builds}"
+LORRAX_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../../.." && pwd)"
+ROOT="${LORRAX_BUILD_PREFIX:-$LORRAX_ROOT/.build}/slate"
 REPO="${LORRAX_SLATE_REPO:-https://github.com/icl-utk-edu/slate.git}"
 COMMIT="${LORRAX_SLATE_COMMIT:-ded15290}"
-CTK_VER="${LORRAX_SLATE_CUDATOOLKIT:-12.9}"
+CTK_VER="${LORRAX_SLATE_CUDATOOLKIT:-13.2}"
 JOBS="${LORRAX_SLATE_MAKE_J:-32}"
 
 SRC="${ROOT}/src/slate"
@@ -71,11 +71,18 @@ PREFIX="${ROOT}/${VARIANT}/install"
 # ---------------------------------------------------------------------------
 if ! type module >/dev/null 2>&1; then
     # shellcheck disable=SC1091
-    source /usr/share/lmod/lmod/init/bash
+    source /opt/cray/pe/lmod/lmod/init/bash
 fi
 
 module load PrgEnv-gnu       # gcc-native compiler under the CC/cc/ftn wrappers
-module load cray-libsci      # BLAS/LAPACK/ScaLAPACK (wrapper links it implicitly)
+# Loading PrgEnv-gnu resets cray-mpich and cray-libsci to the site defaults,
+# so pin them AFTER it: the host leg links this SLATE beside the one MPI both
+# FFI legs are pinned to (config/perlmutter/ffi_mpi.sh).  A SLATE built on the
+# defaults (cray-mpich 9.1.0) puts a second libmpi in the host leg (GATE 1).
+# shellcheck disable=SC1091
+source "$LORRAX_ROOT/config/perlmutter/ffi_mpi.sh"
+lorrax_pm_pin_mpi
+module load "$LORRAX_PM_LIBSCI_MODULE"   # BLAS/LAPACK/ScaLAPACK (wrapper links it implicitly)
 module load cmake
 if [[ "${VARIANT}" == gpu ]]; then
     module load "cudatoolkit/${CTK_VER}"

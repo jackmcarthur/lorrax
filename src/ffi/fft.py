@@ -612,8 +612,8 @@ def _require_target(target: str, platform: str) -> None:
         raise RuntimeError(
             f"GATE kconv-target: got a liblorrax_ffi without {target} on "
             f"{platform} ({why}); want the handler this router selects; fix: "
-            "rebuild the native library (src/ffi/cpp/build.sh) and point "
-            "LORRAX_FFI_SO at it.")
+            "rebuild the native library (Perlmutter: "
+            "config/perlmutter/build_ffi_cuda.sh) from this tree.")
 
 
 def _mathdx_attrs(kgrid, ns, perm_l, phase_l, perm_r, phase_r, scale) -> dict:

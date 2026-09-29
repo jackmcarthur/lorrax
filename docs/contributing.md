@@ -53,10 +53,18 @@ the fixture, the coverage table and the tolerances.
 
 ```bash
 # the verdict: four pytest ranks, each running its own driver processes
-lx run -N 1 -G 4 -n 4 -- python -m pytest tests/hsuite
+srun --jobid=$JOBID -N 1 -n 4 --gpus-per-node=4 src/ffi/cpp/select_gpu.sh \
+  .venv/bin/python -m pytest tests/hsuite -q -p no:cacheprovider
 # regenerate the stored outputs after an intended change; review the diff
-lx run -N 1 -G 4 -n 4 -- python -m tests.hsuite.chain --out DIR --regenerate
+srun --jobid=$JOBID -N 1 -n 4 --gpus-per-node=4 src/ffi/cpp/select_gpu.sh \
+  .venv/bin/python -m tests.hsuite.chain --out DIR --regenerate
 ```
+
+With `lx` (project m4598) the same two lines are
+`lx run -N 1 -G 4 -n 4 -- python -m pytest tests/hsuite` and
+`lx run -N 1 -G 4 -n 4 -- python -m tests.hsuite.chain --out DIR --regenerate`.
+pytest captures the per-stage walls; add `-s` to see them. The suite's compile
+cache is `.hsuite_jax_cache` in the clone (`HSUITE_CACHE_DIR` moves it).
 
 The drivers' parallel HDF5 needs an MPI world of four, which only srun gives,
 so the P4 verdict is the `lx run -n 4` line above. `lx test` launches one task

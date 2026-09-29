@@ -9,11 +9,10 @@
 #   srun --jobid=$SLURM_JOBID --overlap -N1 -n1 -c 32 \
 #       bash src/ffi/cpp/build_host.sh
 #
-# XLA FFI headers: they must match the RUNTIME jaxlib — the Shifter
-# container's jax, NOT the host venv's (which may ship a newer XLA FFI API;
-# newer-headers-on-older-runtime is the unsupported direction).  This
-# script stages the container's jax.ffi.include_dir() tree to
-# $HOME/software/lorrax_xla_ffi_headers/<image tag>/ once and reuses it.
+# XLA FFI headers: they must match the RUNTIME jaxlib (newer headers on an
+# older runtime is the unsupported direction).  The default is this
+# checkout's venv, the runtime itself; LORRAX_FFI_HOST_IMAGE stages them out
+# of a container image instead.
 #
 # Output: src/ffi/cpp/build_host/liblorrax_ffi_host.so
 #         (ffi_loader.py finds it there; override with LORRAX_FFI_HOST_SO)
@@ -21,16 +20,17 @@
 # Overrides (env):
 #   LORRAX_FFI_HOST_BUILD_DIR      alternate build dir
 #   LORRAX_SLATE_HOST_INSTALL_DIR  SLATE none-backend install
-#                                  (default $HOME/software/slate_builds/cpu/install)
+#                                  (default $LORRAX_BUILD_PREFIX/slate/cpu/install,
+#                                   LORRAX_BUILD_PREFIX default <checkout>/.build)
 #   LORRAX_XLA_FFI_HEADERS_DIR     pre-staged header dir (skips staging)
-#   LORRAX_FFI_HOST_IMAGE          required Shifter image to stage headers
-#                                  from. It must be the JAX-0.9 image under
-#                                  which the .so will be loaded.
+#   LORRAX_FFI_HOST_IMAGE          a Shifter image to stage headers from
+#                                  (container runs only; the JAX-0.9 image
+#                                  under which the .so will be loaded).
 
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-LORRAX_ROOT="${LORRAX_ROOT:-$(cd "${SCRIPT_DIR}/../../.." && pwd)}"
+LORRAX_ROOT="$(cd "${SCRIPT_DIR}/../../.." && pwd)"   # this checkout; an exported LORRAX_ROOT is ignored
 
 # ===========================================================================
 # ON A MACHINE THAT HAS A SITE RECIPE, USE THE SITE RECIPE.
@@ -78,22 +78,23 @@ if [[ -n "$_site" ]]; then
 fi
 
 BUILD_DIR="${LORRAX_FFI_HOST_BUILD_DIR:-${SCRIPT_DIR}/build_host}"
-SLATE_DIR="${LORRAX_SLATE_HOST_INSTALL_DIR:-$HOME/software/slate_builds/cpu/install}"
-# Staging headers from a different generation is an ABI skew.  Do not hide
-# that choice behind a default—the old default was a retired JAX-0.7 image.
+SLATE_DIR="${LORRAX_SLATE_HOST_INSTALL_DIR:-${LORRAX_BUILD_PREFIX:-$LORRAX_ROOT/.build}/slate/cpu/install}"
+# XLA FFI headers must match the RUNTIME jaxlib.  Default: this checkout's
+# venv (`uv sync`), whose jaxlib ships them.  LORRAX_FFI_HOST_IMAGE instead
+# stages them out of a container image once.
 IMAGE="${LORRAX_FFI_HOST_IMAGE:-}"
-if [[ -z "${IMAGE}" ]]; then
-    echo "[build_host] LORRAX_FFI_HOST_IMAGE is required (JAX 0.9)." >&2
+if [[ -n "${IMAGE}" ]]; then
+    IMAGE_TAG="${IMAGE##*:}"
+    HDR_DIR="${LORRAX_XLA_FFI_HEADERS_DIR:-${LORRAX_BUILD_PREFIX:-$LORRAX_ROOT/.build}/xla_ffi_headers/${IMAGE_TAG}}"
+elif [[ -n "${LORRAX_XLA_FFI_HEADERS_DIR:-}" ]]; then
+    HDR_DIR="${LORRAX_XLA_FFI_HEADERS_DIR}"
+elif [[ -x "${LORRAX_ROOT}/.venv/bin/python" ]]; then
+    HDR_DIR="$("${LORRAX_ROOT}/.venv/bin/python" -c 'import jax.ffi; print(jax.ffi.include_dir())')"
+else
+    echo "[build_host] no XLA FFI headers: run 'uv sync' in ${LORRAX_ROOT}" >&2
+    echo "[build_host]   (or set LORRAX_XLA_FFI_HEADERS_DIR / LORRAX_FFI_HOST_IMAGE)." >&2
     exit 2
 fi
-case "${IMAGE}" in
-    *jax-2025-07-21*|*25.04-py3*)
-        echo "[build_host] refusing retired pre-0.9 image ${IMAGE}." >&2
-        exit 2
-        ;;
-esac
-IMAGE_TAG="${IMAGE##*:}"
-HDR_DIR="${LORRAX_XLA_FFI_HEADERS_DIR:-$HOME/software/lorrax_xla_ffi_headers/${IMAGE_TAG}}"
 
 if [[ ! -d "${SLATE_DIR}/lib64" ]]; then
     echo "[build_host] ERROR: SLATE gpu_backend=none install not found at" >&2
@@ -110,7 +111,7 @@ fi
 # ---------------------------------------------------------------------------
 if ! type module >/dev/null 2>&1; then
     # shellcheck disable=SC1091
-    source /usr/share/lmod/lmod/init/bash
+    source /opt/cray/pe/lmod/lmod/init/bash
 fi
 module load PrgEnv-gnu
 module load cray-libsci
@@ -121,7 +122,7 @@ module unload cudatoolkit           2>/dev/null || true
 # ---------------------------------------------------------------------------
 # Stage the container's XLA FFI headers (once).
 # ---------------------------------------------------------------------------
-if [[ ! -f "${HDR_DIR}/xla/ffi/api/ffi.h" ]]; then
+if [[ -n "${IMAGE}" && ! -f "${HDR_DIR}/xla/ffi/api/ffi.h" ]]; then
     echo "[build_host] staging XLA FFI headers from ${IMAGE} -> ${HDR_DIR}"
     mkdir -p "${HDR_DIR}"
     STAGE_CMD=(shifter "--image=${IMAGE}" bash -c

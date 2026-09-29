@@ -1,5 +1,6 @@
 """Local complex128 spin rotation; spatial symmetry stays in maps.py."""
 from functools import lru_cache, partial
+from pathlib import Path
 
 import jax
 import jax.numpy as jnp
@@ -18,10 +19,24 @@ _SPECS = {
 }
 
 
+def _checkout_candidates():
+    """The checkout's build tree, the default the other two loaders search
+    (``src/ffi/cpp/build{,_host}/``); a pinned ``LORRAX_FFI_SO`` still wins."""
+    found = {}
+    for name, sub in (("CUDA", "build"), ("cpu", "build_host")):
+        for parent in Path(__file__).resolve().parents:
+            cand = parent / "src" / "ffi" / "cpp" / sub / _SPECS[name]["so_name"]
+            if cand.is_file():
+                found[name] = [cand]
+                break
+    return found
+
+
 @lru_cache(maxsize=1)
 def _register():
     path = native_provider.locate_library(
-        "CUDA", specs=_SPECS, candidates={}, expected_abi=_ABI)
+        "CUDA", specs=_SPECS, candidates=_checkout_candidates(),
+        expected_abi=_ABI)
     lib, _ = native_provider.open_and_attest(
         path, platform="CUDA", expected_abi=_ABI,
         abi_symbols={"CUDA": "lorrax_ffi_cuda_abi_version"},

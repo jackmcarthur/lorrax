@@ -693,6 +693,12 @@ def set_default_env(*, platform: str = "gpu") -> None:
     else:
         raise ValueError(f"platform must be 'gpu' or 'cpu', got {platform!r}")
     _check_allocator_env()
+    # Cray MPICH GPU support needs the GTL library linked into the program;
+    # neither FFI leg links it (NCCL carries device traffic).  Perlmutter's
+    # default craype-accel-nvidia80 module exports MPICH_GPU_SUPPORT_ENABLED=1,
+    # which aborts the legs' MPI_Init ("GTL library is not linked").  MPICH
+    # reads it at MPI_Init, after this point.
+    os.environ["MPICH_GPU_SUPPORT_ENABLED"] = "0"
     if platform == "gpu":
         set_default_gpu_pool()
     tune_glibc_malloc()

@@ -2,9 +2,8 @@
 # ============================================================================
 # The ONE MPI every Perlmutter FFI build links: sourced by BOTH legs.
 #   host leg: config/perlmutter/build_ffi_host.sh
-#   CUDA leg: the CUDA-13 runtime recipe (docs/environment/machines/
-#             perlmutter.md §2; sources this file from the checkout it
-#             builds, $LORRAX_CUDA13_ROOT)
+#   CUDA leg: config/perlmutter/build_ffi_cuda.sh
+#   SLATE:    src/ffi/cpp/stage/slate_build_perlmutter.sh (after PrgEnv-gnu)
 #
 # In a GPU run both legs are dlopened into one process, so they must name the
 # same libmpi.  cray-hdf5-parallel/1.14.3.7 (the phdf5 stage both legs share)

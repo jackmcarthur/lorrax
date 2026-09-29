@@ -2,9 +2,9 @@
 
 This page runs every LORRAX driver end to end on the bundled test fixture,
 `tests/hsuite/fixture`: a tiny magnetic H2+ crystal (one electron,
-noncollinear with spin-orbit, 9 bands, 5×5×1 k). It needs the native FFI pair,
-which the Perlmutter `lorrax_A` module supplies
-([Installation](installation/index.md)). To start from a crystal instead, first
+noncollinear with spin-orbit, 9 bands, 5×5×1 k). It needs the native FFI pair
+([Installation](installation/index.md); on Perlmutter,
+[steps 1–2](installation/perlmutter.md)). To start from a crystal instead, first
 produce a `WFN.h5` ([Preparing inputs from DFT](preprocessing.md)).
 
 ## 1. Run the bundled fixture
@@ -16,9 +16,13 @@ writing each driver's decks beside it:
 
 ```bash
 cd /path/to/lorrax
-lx run --pool POOL --wait 900 -N 1 -G 1 -n 1 -- \
-  python -m tests.hsuite.chain --out "$SCRATCH/lorrax_quickstart_$(date +%s)"
+srun --jobid=$JOBID -N 1 -n 1 --gpus-per-node=1 \
+  .venv/bin/python -m tests.hsuite.chain --out "$SCRATCH/lorrax_quickstart_$(date +%s)"
 ```
+
+This is one GPU (P1), which is enough for a smoke run; the suite below is the
+P4 verdict. With `lx` (project m4598) the launch is
+`lx run --pool POOL -N 1 -G 1 -n 1 -- python -m tests.hsuite.chain --out …`.
 
 On Frontera, build the host leg with `config/frontera/build_ffi_host.sh` and
 launch as [Frontera](environment/machines/frontera.md) describes.
@@ -38,7 +42,7 @@ The suite is the same chain at P4 on one node.
 ## Your first real calculation {#your-first-real-calculation}
 
 Given a `WFN.h5` in the run directory, the chain is three preprocessing steps
-and GW, each as its own `lx run`:
+and GW, each as its own launch (`srun … .venv/bin/python -u -m …`, or `lx run`):
 
 1. **Centroids:** `python3 -m centroid.kmeans_cli <N> --seed 42`. It reads
    `WFN.h5` from the working directory (there is no flag for another name),

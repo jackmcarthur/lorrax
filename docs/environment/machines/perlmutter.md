@@ -1,8 +1,10 @@
 # Perlmutter (NERSC)
 
 The GPU reference platform: A100 40/80 GB nodes, bare-host CUDA 13.2, JAX and
-JAXLIB 0.9.1, one sealed FFI bundle, all selected by the `lorrax_A` module and
-launched by `lx`. Porting knobs are in [`config/README.md`](../../../config/README.md);
+JAXLIB 0.9.1. A clone installs with `uv sync --extra cuda13` and builds its own
+FFI pair ([install page](../../installation/perlmutter.md)); project m4598 can
+instead use one sealed bundle selected by the `lorrax_A` module and launched
+by `lx`. Porting knobs are in [`config/README.md`](../../../config/README.md);
 JAX and the GPU memory pool are in the [overview](../overview.md#gpu-pool).
 
 **Certified scope.** GPU: 1–4 nodes × 4 A100 at P=4 and P=16. CPU
@@ -10,7 +12,12 @@ JAX and the GPU memory pool are in the [overview](../overview.md#gpu-pool).
 two nodes) and P=16 (four nodes), and a P=4 GN-PPM GW run matching its
 reference Σ cell for cell. Larger CPU runs are not certified.
 
-## 1. Entry point: `lx` {#1-entry-point-lx}
+## 1. Entry point: `srun`, or `lx` {#1-entry-point-lx}
+
+A plain `srun` with `src/ffi/cpp/select_gpu.sh` as the rank wrapper runs a
+step from a clone: the [install page](../../installation/perlmutter.md#suite)
+gives the line. The rest of this section is the maintainers' `lx` launcher,
+which is not in this repository.
 
 `lx` runs a step on a compute node. It joins an allocation (`--pool NAME` or
 `--jid N`), claims a free node per step, loads the base module (`lorrax_A` by
@@ -81,9 +88,14 @@ refuses a library whose handler ABI differs from the source's and announces
 an unsealed library as `LEGACY-UNSEALED`. The mathdx k-convolution also needs
 the `nvidia-mathdx` wheel in the venv (`GATE mathdx-headers` otherwise).
 Cray MPICH GPU support is off (`MPICH_GPU_SUPPORT_ENABLED=0`); cuSOLVERMp and
-cuBLASMp communicate through NCCL. Building, sealing and publishing a bundle
-is the runtime recipe,
-`/global/common/software/m4598/jackm/lorrax_cuda13_runtime/recipe/README.md`.
+cuBLASMp communicate through NCCL. Each leg carries the pinned HDF5 and MPICH
+lib dirs on its RPATH, because `/opt/cray/pe/lib64` points
+`libhdf5_parallel_gnu.so.310` at the site-default HDF5, which links the
+site-default MPI. The legs build with `config/perlmutter/build_ffi_host.sh`
+and `config/perlmutter/build_ffi_cuda.sh`, and seal with
+`src/ffi/cpp/stage/seal_bundle.py` ([building_ffi.md](../../building_ffi.md#seal-the-deployable-pair)).
+The module's own venv, the bundle acceptance (Gate 10 and a P4 run) and the
+publication steps are still kept outside this repository, with the module.
 
 ## 3. CPU multi-process runs (Milan)
 

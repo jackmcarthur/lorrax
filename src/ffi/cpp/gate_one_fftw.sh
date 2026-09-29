@@ -192,6 +192,14 @@ def die(msg_lines, rc=1):
     sys.exit(rc)
 
 
+# The runtime imports h5py before its RTLD_GLOBAL load (lxkit
+# native_provider._prefer_process_hdf5).  Do the same: loaded after the leg,
+# h5py binds the leg's parallel HDF5 symbols and the loader refuses it.
+try:
+    import h5py  # noqa: F401
+except ImportError:
+    pass
+
 # Load the artifacts into THIS process, globally, exactly as the runtime
 # does.  RTLD_GLOBAL matters: it is what lets the handler's stage-1 resolver
 # see anything the ladder brings in.

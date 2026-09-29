@@ -6,9 +6,12 @@
 #
 #   config/perlmutter/build_ffi_host.sh [--fresh]
 #
-# Output: $LORRAX_FFI_HOST_STAGE/liblorrax_ffi_host.so
-#   (default $LORRAX_ROOT/src/ffi/cpp/build_host, where ffi_loader.py looks;
-#    override at runtime with LORRAX_FFI_HOST_SO).
+# Output: <checkout>/src/ffi/cpp/build_host/liblorrax_ffi_host.so, where
+#   ffi_loader.py looks by default (LORRAX_FFI_HOST_STAGE moves it).
+# Needs: `uv sync --extra cuda13` in this checkout (the venv's jaxlib supplies
+#   the XLA FFI headers) and the gpu_backend=none SLATE from
+#   src/ffi/cpp/stage/slate_build_perlmutter.sh cpu, both under
+#   $LORRAX_BUILD_PREFIX (default <checkout>/.build).
 #
 # This is the Perlmutter twin of config/frontera/build_ffi_host.sh.  The two
 # are deliberately STRUCTURALLY PARALLEL — same section headers, same variable
@@ -101,7 +104,12 @@
 
 set -euo pipefail
 
-LORRAX_ROOT="${LORRAX_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)}"
+# The checkout is the one this script lives in.  An exported LORRAX_ROOT is
+# ignored on purpose: a shell that loaded a module setting it would otherwise
+# build that module's release snapshot instead of this checkout.
+LORRAX_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+LORRAX_BUILD_PREFIX="${LORRAX_BUILD_PREFIX:-$LORRAX_ROOT/.build}"
+LORRAX_VENV_PY="$LORRAX_ROOT/.venv/bin/python"
 SRC="$LORRAX_ROOT/src/ffi/cpp"
 BUILD="${LORRAX_FFI_HOST_STAGE:-$SRC/build_host}"
 
@@ -154,22 +162,25 @@ LORRAX_PM_CMAKE="${LORRAX_PM_CMAKE:-cmake}"
 # from config/perlmutter/site_config.sh so there is ONE source of truth for
 # it — the modulefile's --volume= source and this gate must not be able to
 # name different trees.
-if [[ -z "${LORRAX_FFI_PHDF5_DIR:-}" && -r "$(dirname "$0")/site_config.sh" ]]; then
-    # shellcheck disable=SC1091
-    LORRAX_FFI_PHDF5_DIR="$(. "$(dirname "$0")/site_config.sh" >/dev/null 2>&1;
-                            printf %s "$LORRAX_FFI_PHDF5_DIR_DEFAULT")"
-fi
+# Bare host, both legs load the cray-hdf5-parallel module's library, so the
+# stage defaults to that module's HDF5_DIR (set below, once it is loaded).
 LORRAX_PM_PHDF5_STAGE="${LORRAX_FFI_PHDF5_DIR:-}"
 # LibSci threading flavour.  MUST match the SLATE install's, or the process
 # ends up with both libsci_gnu_mpi and libsci_gnu_mpi_mp loaded and ELF load
 # order silently decides which BLAS/ScaLAPACK runs.  The gpu_backend=none
 # SLATE here was built threaded, so: _mp.
 LORRAX_PM_LIBSCI_FLAVOUR="${LORRAX_PM_LIBSCI_FLAVOUR:-_mp}"
-LORRAX_SLATE_HOST_INSTALL_DIR="${LORRAX_SLATE_HOST_INSTALL_DIR:-$HOME/software/slate_builds/cpu/install}"
+LORRAX_SLATE_HOST_INSTALL_DIR="${LORRAX_SLATE_HOST_INSTALL_DIR:-$LORRAX_BUILD_PREFIX/slate/cpu/install}"
 # XLA FFI headers must match the RUNTIME jaxlib, not whatever python is first
-# on PATH.  src/ffi/cpp/build_host.sh stages these out of the Shifter image;
-# reuse that stage.
-LORRAX_XLA_FFI_HEADERS_DIR="${LORRAX_XLA_FFI_HEADERS_DIR:-$HOME/software/lorrax_xla_ffi_headers/25.04-py3}"
+# on PATH.  The runtime is this checkout's venv, whose jaxlib ships them.
+if [[ -z "${LORRAX_XLA_FFI_HEADERS_DIR:-}" ]]; then
+    [[ -x "$LORRAX_VENV_PY" ]] || {
+        echo "[build_ffi_host] ERROR: no venv at $LORRAX_ROOT/.venv." >&2
+        echo "[build_ffi_host]   Run 'uv sync --extra cuda13' in $LORRAX_ROOT first." >&2
+        exit 2
+    }
+    LORRAX_XLA_FFI_HEADERS_DIR="$("$LORRAX_VENV_PY" -c 'import jax.ffi; print(jax.ffi.include_dir())')"
+fi
 
 # ---------------------------------------------------------------------------
 # Modules.  craype-accel-nvidia80 / cudatoolkit are UNLOADED on purpose: with
@@ -178,7 +189,7 @@ LORRAX_XLA_FFI_HEADERS_DIR="${LORRAX_XLA_FFI_HEADERS_DIR:-$HOME/software/lorrax_
 # ---------------------------------------------------------------------------
 if ! type module >/dev/null 2>&1; then
     # shellcheck disable=SC1091
-    source /usr/share/lmod/lmod/init/bash
+    source /opt/cray/pe/lmod/lmod/init/bash
 fi
 module load "$LORRAX_PM_PRGENV"
 lorrax_pm_pin_mpi   # the shared cray-mpich, before anything built against it
@@ -210,6 +221,7 @@ module unload cudatoolkit           2>/dev/null || true
 LORRAX_PM_LIBSCI_DIR="$CRAY_LIBSCI_PREFIX_DIR"
 LORRAX_PM_MPICH_DIR="$CRAY_MPICH_DIR"
 LORRAX_PM_HDF5_DIR="$HDF5_DIR"
+LORRAX_PM_PHDF5_STAGE="${LORRAX_PM_PHDF5_STAGE:-$HDF5_DIR}"
 module unload cray-libsci 2>/dev/null || true
 
 # Capture the FFTW3 prefix, THEN unload cray-fftw — the SAME hazard as
@@ -258,7 +270,8 @@ export LORRAX_CBLAS_DIR="$LORRAX_PM_LIBSCI_DIR"
 if [[ ! -f "$LORRAX_XLA_FFI_HEADERS_DIR/xla/ffi/api/ffi.h" ]]; then
     echo "[build_ffi_host] ERROR: XLA FFI headers not staged at" >&2
     echo "[build_ffi_host]   $LORRAX_XLA_FFI_HEADERS_DIR" >&2
-    echo "[build_ffi_host] Stage them once with: bash src/ffi/cpp/build_host.sh" >&2
+    echo "[build_ffi_host] Run 'uv sync --extra cuda13' in $LORRAX_ROOT, or set" >&2
+    echo "[build_ffi_host]   LORRAX_XLA_FFI_HEADERS_DIR to the runtime jaxlib's include dir." >&2
     exit 2
 fi
 if [[ ! -d "$LORRAX_SLATE_HOST_INSTALL_DIR/lib64" ]]; then
@@ -322,6 +335,10 @@ FFTW_ARGS=()
 if [[ -n "$LORRAX_PM_FFTW_LIB" ]]; then
     FFTW_ARGS=(-DLORRAX_FFTW3_LIBRARY="$LORRAX_PM_FFTW_LIB")
 fi
+# The pinned HDF5's lib dir goes on the RPATH.  /opt/cray/pe/lib64 (the
+# ld.so.cache fallback) points libhdf5_parallel_gnu.so.310 at the site-default
+# HDF5, which links the site-default MPI, not the pinned one; without the
+# RPATH a process gets two MPIs unless LD_LIBRARY_PATH names the pinned HDF5.
 cmake "$SRC" \
     "${FFTW_ARGS[@]}" \
     -DLORRAX_FFI_PLATFORM=host \
@@ -335,7 +352,8 @@ cmake "$SRC" \
     -DLORRAX_MPI_INCLUDE_DIR="$LORRAX_PM_MPICH_DIR/include" \
     -DLORRAX_MPICH_LIB_DIR="$LORRAX_PM_MPICH_DIR/lib" \
     -DLORRAX_MPI_LIBRARY="$LORRAX_PM_MPI_LIBRARY" \
-    -DHDF5_ROOT="$LORRAX_PM_HDF5_DIR"
+    -DHDF5_ROOT="$LORRAX_PM_HDF5_DIR" \
+    -DCMAKE_SHARED_LINKER_FLAGS="-Wl,-rpath,$LORRAX_PM_HDF5_DIR/lib"
 
 cmake --build . --parallel "${LORRAX_BUILD_JOBS:-8}"
 
@@ -489,6 +507,7 @@ LORRAX_FFI_EXPECT_MPI="${LORRAX_FFI_EXPECT_MPI:-$LORRAX_PM_MPI_SONAME}" \
 LORRAX_FFI_EXPECT_HDF5_SOVERSION="${LORRAX_FFI_EXPECT_HDF5_SOVERSION:-$_stage_sov}" \
 LORRAX_PHDF5_STAGE="$LORRAX_PM_PHDF5_STAGE" \
 LD_LIBRARY_PATH="$LORRAX_SLATE_HOST_INSTALL_DIR/lib64:${LD_LIBRARY_PATH:-}" \
+LORRAX_GATE_FFTW_PY="${LORRAX_GATE_FFTW_PY:-$LORRAX_VENV_PY}" \
 GATE_TAG=build_ffi_host \
     bash "$LORRAX_ROOT/scripts/verify_ffi_build.sh" --leg host "$SO_FILE" || {
         echo "[build_ffi_host] FAILED: the library does not meet the build" >&2
@@ -527,5 +546,4 @@ GATE_TAG=build_ffi_host \
 
 echo
 echo "[build_ffi_host] done.  .so at: $SO_FILE"
-echo "[build_ffi_host] run with: export LORRAX_FFI_HOST_SO=$SO_FILE"
-echo "[build_ffi_host]           export LD_LIBRARY_PATH=$LORRAX_SLATE_HOST_INSTALL_DIR/lib64:\$LD_LIBRARY_PATH"
+echo "[build_ffi_host] the loader finds it here by default; its RUNPATH carries SLATE."

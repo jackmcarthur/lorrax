@@ -251,7 +251,9 @@ nothing. Build legs: [`architecture/ffi_layout.md`](../architecture/ffi_layout.m
 `LORRAX_HAVE_SLATE`, `LORRAX_HOST_HAVE_SLATE`, `LORRAX_DARSHAN_LIB_DIR`,
 `LORRAX_XLA_CMDBUF`, `LORRAX_NNODES`, `LORRAX_NTASKS`, `LORRAX_NGPU`,
 `LORRAX_SELECT_GPU`, `LORRAX_TIER2_WORKDIR`, `LORRAX_INPUT`,
-`LORRAX_FFI_VERIFY_STRICT`, `LORRAX_BUILD_JOBS` (`8`),
+`LORRAX_FFI_VERIFY_STRICT`, `LORRAX_BUILD_JOBS` (`8`; `16` for the CUDA leg),
+`LORRAX_BUILD_PREFIX` (`<checkout>/.build`: the SLATE tree and the
+cuSOLVERMp/cuBLASMp stage of the Perlmutter build scripts),
 `LORRAX_MPICH_CONTAINER_DIR` (`/opt/udiImage/modules/mpich`),
 `LORRAX_SAPI_EXTRA_INCLUDES`, `LORRAX_{PY,VENV_DIR,SRC_DIR}`,
 `LORRAX_OVERLAY_BUILD_DIR`, `LORRAX_MKL_LIB`.
@@ -321,6 +323,7 @@ Read by `config/frontera/stage_runtime.sh`, `build_cpu_runtime_bundle.sh`,
 | `JAX_CPU_COLLECTIVES_IMPLEMENTATION` | Multi-process CPU runs require `mpi`; `runtime.announce_cpu_collectives()` refuses any other backend. Why: [`environment/transports.md`](../environment/transports.md). |
 | `MPITRAMPOLINE_LIB` | MPItrampoline's adapter, absolute, set before JAX import: Frontera's patched Intel-MPI build, Perlmutter's unmodified upstream build from `config/perlmutter/build_mpiwrapper.sh`. A vendor `libmpi.so` is not an adapter. Contract: [`mpi_collectives.md`](mpi_collectives.md). |
 | `LD_PRELOAD` | Perlmutter CPU-MPI: `config/perlmutter/cpu_mpi_env.sh` prepends `/opt/cray/pe/lib64/libpmi.so.0` and verifies it resolves under the Cray tree; foreign MPI, MPItrampoline/MPIwrapper and `libpmi2` entries refuse. The startup report records whether `libpmi.so.0` is preloaded. |
+| `MPICH_GPU_SUPPORT_ENABLED` | `runtime.set_default_env` sets `0` unconditionally: neither FFI leg links Cray's GTL (NCCL carries device traffic), and Perlmutter's default `craype-accel-nvidia80` exports `1`, which aborts `MPI_Init`. The user sets nothing. |
 | `MPICH_ASYNC_PROGRESS` | The Perlmutter CPU-MPI prelude sets `1`, so Cray MPICH grants `MPI_THREAD_MULTIPLE` to XLA's FUNNELED request with one progress thread per rank; the prelude unsets `MPIR_CVAR_ASYNC_PROGRESS`. |
 | `LORRAX_MPI_FORCE_THREAD_MAIN`, `LORRAX_MPI_FINALIZE_FIX` | Frontera MPIwrapper/overlay controls, unset in production; `runtime` reads both only to print them in the startup report. `common.collectives.warm_mesh_cliques()` creates every communicator from the main thread, and drivers using `runtime.finalize_process()` need no finalize overlay. |
 | `SLATE_SCALAPACK_TARGET` | SLATE's own dial, read by `blacs_grid.h` to announce the demotion it controls: unset means `HostTask`, so a CUDA-built SLATE runs on the CPU unless it is `devices`. Relevant only with `LORRAX_SCALAPACK_ALLOW_SLATE_API`. |

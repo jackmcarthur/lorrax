@@ -209,7 +209,7 @@ _PLATFORMS = {
         env="LORRAX_FFI_SO",
         build_subdir="build",
         targets=_CUDA_TARGET_SYMBOLS,
-        build_hint="src/ffi/cpp/run_shifter.sh bash src/ffi/cpp/build.sh",
+        build_hint="bash config/perlmutter/build_ffi_cuda.sh (Perlmutter; docs/installation/perlmutter.md)",
     ),
     "cpu": dict(
         so_name="liblorrax_ffi_host.so",
@@ -1233,7 +1233,7 @@ def phdf5_dataset_geometry(ctx_handle: int, ds_name: str,
         raise RuntimeError(
             "phdf5_dataset_geometry: the loaded FFI library does not export "
             "lrx_phdf5_dataset_geometry.  It predates 2026-08-22; rebuild it "
-            "(src/ffi/cpp/build.sh for the CUDA leg, "
+            "(config/perlmutter/build_ffi_cuda.sh for the CUDA leg, "
             "config/perlmutter/build_ffi_host.sh for the host leg).")
     ShapeArr = ctypes.c_int64 * _GEOM_MAX_NDIM
     shape_buf = ShapeArr()
@@ -1282,7 +1282,7 @@ def phdf5_read_whole(ctx_handle: int, ds_name: str, *, shape, dtype_name: str,
         raise RuntimeError(
             "phdf5_read_whole: the loaded FFI library does not export "
             "lrx_phdf5_read_whole.  It predates 2026-08-22; rebuild it "
-            "(src/ffi/cpp/build.sh for the CUDA leg, "
+            "(config/perlmutter/build_ffi_cuda.sh for the CUDA leg, "
             "config/perlmutter/build_ffi_host.sh for the host leg).")
     if dtype_name not in _DTYPE_TAG:
         raise ValueError(f"phdf5_read_whole: unsupported dtype {dtype_name}")
