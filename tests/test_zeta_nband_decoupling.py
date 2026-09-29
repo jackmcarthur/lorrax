@@ -328,16 +328,14 @@ def test_the_narrowed_window_is_what_the_fit_gets_and_b4_is_untouched():
     assert bs.b4 == 60 and bs.nb_full == 60
 
 
-def test_the_left_window_is_capped_too_and_the_extrapolation_is_announced():
-    """``left`` is ``(b0, b3)``.  If b3 outran the fit window the bra leg of
-    ρ_mn would carry bands ζ was never fitted on — so it is capped, and the
-    fact that Σ then evaluates QP bands above the fit window is said out
-    loud rather than discovered later."""
+def test_a_qp_matrix_past_the_left_window_refuses_by_name():
+    """``left`` is ``(b0, b3)``, the QP matrix.  If b3 outran the fit window
+    the bra leg of ρ_mn would carry bands ζ was never fitted on, and those
+    QP states would mix into fitted ones: ``GATE qp_matrix_zeta_left``
+    refuses (owner 2026-09-28; it was a warning)."""
     bs = _slices(b0=0, b1=0, b2=8, b3=60, b4=60)     # ncond 52, nband 60
-    said = []
-    left, right = _init().zeta_fit_band_ranges(bs, 52, log=said.append)
-    assert left == (0, 52) and right == (0, 52)
-    assert any("EXTRAPOLATED" in s for s in said), said
+    with pytest.raises(ValueError, match="GATE qp_matrix_zeta_left"):
+        _init().zeta_fit_band_ranges(bs, 52, log=lambda *_: None)
 
 
 def test_the_decoupling_is_announced_with_both_numbers():

@@ -93,3 +93,43 @@ def test_only_unprotected_outofrange_diagonal_takes_scissor():
             np.testing.assert_allclose(
                 out[k, n, n], expected, atol=1e-14,
                 err_msg=f"diagonal at ({k},{n}) wrong: got {out[k, n, n]}, expected {expected}")
+
+
+# ---------------------------------------------------------------------------
+# The absolute band cut (gw.band_partition.qp_band_cut)
+# ---------------------------------------------------------------------------
+
+def _cut(e, **kw):
+    from gw.band_partition import qp_band_cut
+    args = dict(n_below_k=3, nval=2, ncond=2, mu_ev=0.0, clip_ev=10.0,
+                cut_gap_ev=1.0, cut_search_ev=5.0, semicore_gap_ev=4.0)
+    args.update(kw)
+    return qp_band_cut(np.asarray(e, float), **args)
+
+
+def test_band_cut_takes_the_first_wide_gap_above_the_need_and_finds_semicore():
+    # band 0 deep semicore (gap 20 eV), bands 1-2 valence, 3-4 conduction,
+    # a 2 eV gap above band 4, then a dense tail.
+    row = [-30.0, -3.0, -1.0, 1.0, 2.0, 4.0, 4.1, 4.2]
+    e = np.array([row, [x + 0.05 for x in row]])
+    cut = _cut(e)
+    assert cut.b3 == 5 and cut.b_semicore == 1
+    assert cut.gap_ev[1] - cut.gap_ev[0] > 1.0 and cut.n_requested_tail == 0
+
+
+def test_band_cut_without_a_gap_takes_the_least_overlap_and_names_it():
+    # A dispersive ladder above E_F: every boundary overlaps across k.
+    e = np.array([[-2.0, -1.0, -0.5, 1.0, 2.0, 3.0, 4.0],
+                  [-2.0, -1.0, -0.5, 2.5, 3.2, 4.1, 5.5]])
+    cut = _cut(e, cut_gap_ev=1.0)
+    assert 5 <= cut.b3 <= 7
+    if cut.b3 < 7:
+        assert cut.gap_ev[1] - cut.gap_ev[0] < 0.0   # an overlap, stated
+    assert cut.b_semicore == 0
+
+
+def test_band_cut_holds_every_state_below_omega_max():
+    row = [-3.0, -1.0, -0.5, 1.0, 2.0, 5.0, 9.0, 12.0]
+    e = np.array([row])
+    assert _cut(e).b3 == 5
+    assert _cut(e, omega_max_rel_ev=9.5).b3 == 7
