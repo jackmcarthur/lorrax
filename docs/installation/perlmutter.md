@@ -18,10 +18,11 @@ and its `lx` launcher, which supply a prebuilt sealed pair
 | SLATE and the cuSOLVERMp/cuBLASMp stage | `<clone>/.build` | `LORRAX_BUILD_PREFIX` (share one SLATE between clones) |
 | the two FFI libraries | `<clone>/src/ffi/cpp/build{,_host}/` | nothing; the loader looks there |
 | JAX compile cache, mathdx kernel cache | `$SCRATCH/.cache/lorrax/` | [`ISDF_JAX_CACHE_DIR`](../dev/env_vars.md) (compile cache only) |
+| the CUDA driver's JIT cache | `$SCRATCH/.nv/ComputeCache` once `gpu_env.sh` is sourced (CUDA's default is `~/.nv`) | `CUDA_CACHE_PATH` |
 | uv's download cache and Python | `~/.cache/uv`, `~/.local/share/uv` | `UV_CACHE_DIR`, `UV_PYTHON_INSTALL_DIR` (uv's own variables) |
 
-Only uv writes under `$HOME` by default. The home quota is small, so the
-commands below point uv at `$SCRATCH`. `$SCRATCH` is purged; keep the clone
+By default uv and the CUDA driver's JIT cache write under `$HOME`. The home
+quota is small, so the commands below point both at `$SCRATCH`. `$SCRATCH` is purged; keep the clone
 on CFS or rebuild after a purge.
 
 ## 1. Environment
@@ -86,10 +87,11 @@ srun --jobid=$JOBID -N 1 -n 4 --gpus-per-node=4 src/ffi/cpp/select_gpu.sh \
 The result is `1 passed` in about 5 min on cold caches.
 [Contributing](../contributing.md#the-test-suite) owns what the suite checks.
 
-- `config/perlmutter/gpu_env.sh` holds the machine's run settings; today it
-  sets only `MPICH_GPU_SUPPORT_ENABLED=0`
-  ([why](../environment/machines/perlmutter.md#2-the-lorrax_a-module-and-the-ffi-bundle)).
-  Source it once per shell before any GPU `srun`. Nothing else needs setting.
+- `config/perlmutter/gpu_env.sh` holds the machine's run settings:
+  `MPICH_GPU_SUPPORT_ENABLED=0`
+  ([why](../environment/machines/perlmutter.md#2-the-lorrax_a-module-and-the-ffi-bundle))
+  and `CUDA_CACHE_PATH` on `$SCRATCH`. Source it once per shell before any
+  GPU `srun`. Nothing else needs setting.
 
 - Use one rank per GPU. `select_gpu.sh` pins each rank to one GPU and leaves
   the other three visible, which NCCL needs. `--gpus-per-task=1` hides them,

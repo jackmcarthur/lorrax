@@ -13,3 +13,9 @@
 # leg's cuSOLVERMp/cuBLASMp communicate through NCCL.
 # ============================================================================
 export MPICH_GPU_SUPPORT_ENABLED=0
+
+# CUDA_CACHE_PATH.  The CUDA driver's JIT cache defaults to ~/.nv/ComputeCache;
+# one fresh test suite plus the P1 chain put 208 MB there, and NERSC home
+# quotas are small.
+# A value the caller set is kept.
+export CUDA_CACHE_PATH="${CUDA_CACHE_PATH:-${SCRATCH:?SCRATCH is not set}/.nv/ComputeCache}"
