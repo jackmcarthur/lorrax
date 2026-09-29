@@ -730,7 +730,8 @@ def _parallel_fits(specs, worker, costs):
 
     Each window is built whole on one rank (:func:`_rank_assignment`) and
     every rank uses the gathered bytes, so no rank's plan depends on its own
-    BLAS; the bytes do follow the launch binding (core count), see
+    BLAS; the bytes are the same under any binding of 16 or more CPUs per
+    rank, see
     ``minimax.uniform_rule._BLAS_THREADS``. ``worker(index)``.
     """
     rank, world = int(process_rank()), int(process_count())

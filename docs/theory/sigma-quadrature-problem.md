@@ -256,9 +256,9 @@ formula and solves one weight system, and the sampled term matrices of the
 weight solve and the certificate are evaluated in row blocks on the rank's
 cores (`minimax.uniform_rule._map_rows`), which changes no bit. The widest
 crossing window of the gate decks (Na 8³, [−15, 19] eV, 1148 nodes) builds
-in about 1 s (fit rows follow the fastest live term; Qᴴf from the reflectors). A rule's bytes follow the launch
-binding (core count) at round-off, since scipy's OpenBLAS is not under the
-builder's thread pin; one binding reproduces them run to run.
+in about 1 s (fit rows follow the fastest live term; Qᴴf from the reflectors). The builder pins numpy's and scipy's
+OpenBLAS at min(16, CPUs of the mask), so a rule's bytes are a function of
+(box, ε) on one machine class for every mask of 16 or more CPUs.
 
 **Request scope.** Within one run a rule is reused only through an in-process
 scope. The shared-pole route keys the scope by the map's physical identity

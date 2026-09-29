@@ -187,6 +187,22 @@ def test_the_rule_does_not_depend_on_threads():
         np.testing.assert_array_equal(rules[0].weights, rules[1].weights)
 
 
+def test_the_pin_covers_every_openblas_and_never_oversubscribes():
+    """numpy's and scipy's OpenBLAS both run at the pin inside a build, and the
+    pin never exceeds the CPUs of the affinity mask."""
+    import os
+    from minimax import uniform_rule
+    controls = uniform_rule._openblas_controls()
+    with open("/proc/self/maps", encoding="ascii") as maps:
+        mapped = {line.split()[-1] for line in maps
+                  if "openblas" in line.rsplit("/", 1)[-1].lower()}
+    assert len(controls) == len(mapped)
+    threads = uniform_rule._blas_threads()
+    assert 1 <= threads <= min(uniform_rule._BLAS_THREADS, len(os.sched_getaffinity(0)))
+    with uniform_rule._pinned_blas_threads():
+        assert [get() for get, _put in controls] == [threads] * len(controls)
+
+
 @pytest.mark.slow
 def test_random_boxes_certify_on_a_finer_cloud():
     """Crossing, sign-definite (R up to 1e4) and nearly sign-definite boxes
@@ -223,8 +239,8 @@ def test_random_boxes_certify_on_a_finer_cloud():
     ((-0.6, 0.4, 0.1, 0.1), {}),
 ])
 def test_the_builder_repeats_its_bytes_in_one_process(box, kwargs):
-    """Same process, same binding: same bytes. Across core counts crossing
-    rules differ at round-off (scipy's OpenBLAS is not under the pin)."""
+    """Same process, same binding: same bytes. The pin covers scipy's
+    OpenBLAS too, so masks of 16 or more CPUs agree (RULEFAST)."""
     first = analytic_box_rule(box, 1.0e-4, **kwargs)
     second = analytic_box_rule(box, 1.0e-4, **kwargs)
     assert first.times.tobytes() == second.times.tobytes()

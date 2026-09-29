@@ -41,14 +41,16 @@ __all__ = [
 
 # ----------------------------------------------------------------- BLAS threads
 #: The thread count every rule build runs its BLAS at, whatever the launch
-#: environment. OpenBLAS sums in a thread-count dependent order, so the weight
-#: solve's round-off, and with it a marginal certificate, would otherwise
-#: follow the environment. The pin covers the OpenBLAS copies loaded when it is
-#: first taken; scipy's own copy loads later (``analytic_box`` imports
-#: ``scipy.linalg`` inside the pin), so crossing rules still follow the launch
-#: binding (core count) at round-off (KNOWN_LORRAX_ISSUES, NOCACHE review).
+#: environment: 16, or the logical CPUs of the affinity mask when it has fewer
+#: (:func:`_blas_threads`). OpenBLAS sums in a thread-count dependent order, so
+#: the weight solve's round-off, and with it a marginal certificate, would
+#: otherwise follow the environment. The pin covers numpy's and scipy's
+#: OpenBLAS (scipy.linalg is imported before the one scan), so a rule's bytes
+#: are a function of (box, eps) on one machine class (OpenBLAS build and CPU)
+#: for every mask of 16 or more CPUs; a smaller mask builds at its own count
+#: (16 threads on 5 CPUs took over 600 s against 13 s; NOCACHE review).
 #: 16 is the physical core count of a Perlmutter GPU rank
-#: (``runtime.default_blas_threads``).
+#: (``runtime.default_blas_threads``), whose mask has 32.
 _BLAS_THREADS = 16
 _BLAS_CONTROLS = None
 #: Complex entries per row block of a sampled term matrix (1 MiB): a worker's
@@ -57,17 +59,30 @@ _ROW_BLOCK_ENTRIES = 1 << 16
 _ROW_POOL = None
 
 
+def _blas_threads():
+    """``min(_BLAS_THREADS, logical CPUs of the affinity mask)``: never more
+    BLAS threads than CPUs to run them."""
+    import os
+    try:
+        cpus = len(os.sched_getaffinity(0))
+    except (AttributeError, OSError):
+        cpus = os.cpu_count() or 1
+    return max(1, min(_BLAS_THREADS, cpus))
+
+
 def _openblas_controls():
     """``(get, set)`` for each OpenBLAS in this process; empty if none.
 
     numpy's and scipy's wheels each bundle one (``scipy_openblas64_`` and
     ``scipy_openblas``), and the builder calls both. They are found by path
     in ``/proc/self/maps``, since threadpoolctl is not in the runtime, once
-    per process: both are loaded by the imports above.
+    per process, after importing ``scipy.linalg`` so that scipy's copy is
+    mapped (``import minimax`` alone never loads it).
     """
     global _BLAS_CONTROLS
     if _BLAS_CONTROLS is None:
         import ctypes
+        import scipy.linalg  # noqa: F401  (maps scipy's OpenBLAS before the scan)
         try:
             with open("/proc/self/maps", encoding="ascii") as maps:
                 paths = sorted({line.split()[-1] for line in maps
@@ -93,11 +108,11 @@ def _openblas_controls():
 
 @contextmanager
 def _pinned_blas_threads():
-    """Run the enclosed rule build at ``_BLAS_THREADS``, then restore."""
-    controls = _openblas_controls()
+    """Run the enclosed rule build at :func:`_blas_threads`, then restore."""
+    controls, threads = _openblas_controls(), _blas_threads()
     saved = [get() for get, _put in controls]
     for _get, put in controls:
-        put(_BLAS_THREADS)
+        put(threads)
     try:
         yield
     finally:
@@ -110,13 +125,8 @@ def _row_pool():
     """One thread pool per process, as wide as the BLAS pin (or the cores)."""
     global _ROW_POOL
     if _ROW_POOL is None:
-        import os
         from concurrent.futures import ThreadPoolExecutor
-        try:
-            cores = len(os.sched_getaffinity(0))
-        except (AttributeError, OSError):
-            cores = os.cpu_count() or 1
-        _ROW_POOL = ThreadPoolExecutor(max_workers=max(1, min(_BLAS_THREADS, cores)),
+        _ROW_POOL = ThreadPoolExecutor(max_workers=_blas_threads(),
                                        thread_name_prefix="minimax-rows")
     return _ROW_POOL
 
