@@ -252,10 +252,11 @@ def _weights(box, times, eps, relative):
     log_max = np.max(np.stack(_map_rows(
         lambda lo, hi: np.max(-(d[lo:hi, None] * times[None, :]).imag, axis=0),
         d.size, times.size)), axis=0)
-    # Column-major, factored in place: the same geqrf/ungqr on the same
-    # values as a row-major copy, without the 0.3 GB transposing copy that
-    # the widest crossing window paid (Na 8^3 [-15, 19] eV, 1.8e4 x 1148).
-    A = np.empty((d.size + times.size, times.size), np.complex128, order="F")
+    # Row-major, as the whole-matrix build: a column-major matrix factored in
+    # place gives other bytes from the same LAPACK calls (every crossing rule
+    # of the gate decks moved at round-off, sup equal to 7 digits; NOCACHE
+    # 2026-09-28), so the layout is part of the rule.
+    A = np.empty((d.size + times.size, times.size), np.complex128)
 
     def fill(lo, hi):
         A[lo:hi] = rho * _cexp(1j * d[lo:hi, None] * times[None, :] - log_max[None, :])
@@ -265,7 +266,7 @@ def _weights(box, times, eps, relative):
     # unit-maximum column), so the penalty is scale-free in eta
     A[d.size:] = _RIDGE * eps * rho * math.sqrt(d.size) * np.eye(times.size)
     f = np.concatenate([rho / d, np.zeros(times.size)])
-    q, r = linalg.qr(A, mode="economic", overwrite_a=True)
+    q, r = linalg.qr(A, mode="economic")
     return linalg.solve_triangular(r, q.conj().T @ f) * np.exp(-log_max)
 
 
