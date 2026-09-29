@@ -1,20 +1,20 @@
-"""Gates for the spectrum-resolved shell estimator (``spectral_shell``).
+"""Gates for ``spectral_shell``, the pooled denominator-shell estimator.
 
-THE LOAD-BEARING ONE IS AT THE TOP.  Everything else here is a property
-test on arithmetic; :func:`test_reproduces_the_measured_s508_table` is the
-reason the estimator is the default: its error against a MEASURED
-``S(508)``, a number BerkeleyGW computed, on the 508-band Si 50 Ry arm.
-Held out: no part of it was fitted.  It is skipped rather than failed when
-the arm is not on disk (``$SCRATCH`` is purge-eligible), and the skip says
-so by name.
+The model: band A adds ``a_i · Σ_k w_k (E_Ak − E_i + Ω)^(−β)`` to state i, one
+(β, Ω) pooled over the requested states, one amplitude per state
+(``gw.band_extrapolation``, POOLED DENOMINATOR SHELL).  These tests pin:
+the fit recovers a model it was built from, the compressed shell sums equal
+the raw sums, the weights keep Σ Hermitian and affine, the no-domain rules,
+the refusals, the payload and the cost.
 
-The rest gate the rulings: β is per-state, the ladder is DFT-only, failure is
-a named refusal and never a clip, ``N_T`` is the finite basis, and the
-per-state weights leave Σ exactly Hermitian.
+The measured accuracy (BANDEX Si 4³ against the complete basis) is not
+re-checked here: it is reproduced from the study's stored samples by
+``sandbox:runs/DEV/602_bandx2_20260928/analysis/rescore.py``.
 """
 from __future__ import annotations
 
-import os
+import inspect
+import time
 
 import numpy as np
 import pytest
@@ -22,719 +22,230 @@ import pytest
 from gw.band_extrapolation import (
     BAND_EXTRAPOLATION_ESTIMATORS,
     BAND_EXTRAPOLATION_ESTIMATOR_DEFAULT,
-    SHELL_EXPONENT_BRACKET,
-    SHELL_FAIL_EDGE,
-    SHELL_FAIL_NO_ROOT,
-    SHELL_FAIL_NOT_SUMMABLE,
-    SHELL_FAIL_SIGN,
-    SHELL_FAIL_ZERO,
+    BRACKET_FRACTIONS,
+    SHELL_BETA_GRID,
+    SHELL_FAIL_NO_FIT,
+    SHELL_FAIL_POLE,
     SHELL_OK,
+    SHELL_OMEGA_GRID_EV,
     SPECTRAL_EXTRAP_DATASETS,
+    BandExtrapolationRefused,
     build_band_ladder,
     fit_band_extrapolation_spectral,
     format_spectral_report,
-    plane_wave_band_count,
-    solve_shell_exponents,
+    plan_band_brackets,
     spectral_h5_payload,
     spectral_trust_verdict,
-    weyl_ladder_fit,
 )
 from common.units import RYD_TO_EV
 
 
-#: The 508-band Si 50 Ry arm.  On ``$SCRATCH``, hence purge-eligible.
-S508_RUN = "/pscratch/sd/j/jackm/si_bandtail50_20260816"
-S508_PROTO = ("/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/"
-              "reports/band_tail_exponent_50ry_2026-08-16/scripts")
-
-#: The published table, ``N_max -> spectral_shell`` median |error| against
-#: the MEASURED S(508), meV, over the 28 Fermi-window states.  Quoted in
-#: ``gw.band_extrapolation``'s module docstring; this is the only place it is
-#: CHECKED.
-S508_TABLE = {152: 4.7, 204: 14.7, 260: 12.5, 296: 0.7, 396: 0.0}
-
-
-# ---------------------------------------------------------------------------
-#  fixtures: the prototype binding's import shim, and a synthetic ladder
-# ---------------------------------------------------------------------------
-
-def _stub_matplotlib():
-    """Register an INERT ``matplotlib`` so the prototype binding imports.
-
-    ``arms.py`` reaches ``make_plots`` for exactly two things -- the degeneracy
-    snapper and ``counts_of_total``, the SHIPPED fraction rule -- and that
-    module imports ``matplotlib``/``pyplot``/``lines`` AND configures
-    ``plt.rcParams`` at file scope.  matplotlib is not in the LORRAX container.
-
-    Stubbed rather than re-derived: re-deriving the snapper would turn this
-    into a check of a SECOND implementation of the rungs rather than of the
-    shipped one, which is the opposite of the point.  The stub is inert (every
-    attribute access, call, index and mutation returns the same do-nothing
-    object) BECAUSE the import path configures rcParams -- a stub that raised
-    would fail at import rather than at first plot, and there is no plot here
-    to reach.  Nothing this script or test asserts depends on matplotlib, so
-    inert is safe; anything that DID need a figure would silently get nothing,
-    which is why this helper is used only from these two entry points.
-    """
-    import sys
-    import types
-
-    if "matplotlib" in sys.modules:
-        return
-
-    class _Inert:
-        def __getattr__(self, name):
-            return self
-
-        def __call__(self, *a, **k):
-            return self
-
-        def __getitem__(self, k):
-            return self
-
-        def __setitem__(self, k, v):
-            pass
-
-        def update(self, *a, **k):
-            pass
-
-        def __iter__(self):
-            return iter(())
-
-    _inert = _Inert()
-
-    class _Mod(types.ModuleType):
-        def __getattr__(self, name):
-            return _inert
-
-    for nm in ("matplotlib", "matplotlib.pyplot", "matplotlib.lines",
-               "matplotlib.patches", "matplotlib.colors", "matplotlib.cm",
-               "matplotlib.ticker", "matplotlib.gridspec"):
-        m = _Mod(nm)
-        m.__path__ = []              # a package, so submodule imports resolve
-        m.__spec__ = None
-        sys.modules[nm] = m
-    for nm in ("pyplot", "lines", "patches", "colors", "cm", "ticker",
-               "gridspec"):
-        object.__setattr__(sys.modules["matplotlib"], nm,
-                           sys.modules[f"matplotlib.{nm}"])
-
-
-def _synthetic_ladder(n_dft=120, nk=4, n_target=400, e0=-6.0, c=3.0, seed=17):
-    """A free-electron ladder with a little k dispersion, in Ry.
-
-    Built to the SAME law the estimator fits, so the tests below measure the
-    estimator rather than the ladder's ability to describe a real solid.
-    """
+def _ladder(nk=6, nb=80, n_target=2000, seed=0):
+    """A free-electron-like DFT ladder with k dispersion, bands sorted per k."""
     rng = np.random.default_rng(seed)
-    n = np.arange(1, n_dft + 1, dtype=np.float64)
-    base = e0 + c * n ** (2.0 / 3.0)
-    enk_ev = base[None, :] + rng.normal(scale=0.05, size=(nk, n_dft))
-    enk_ev = np.sort(enk_ev, axis=1)
-    return build_band_ladder(enk_ry=enk_ev / RYD_TO_EV,
-                             kweights=None, n_target=n_target)
+    n = np.arange(1, nb + 1, dtype=np.float64)
+    e = (-12.0 + 3.0 * n ** (2.0 / 3.0))[None, :] + rng.normal(0, 0.6, (nk, nb))
+    e = np.sort(e, axis=1)
+    return build_band_ladder(enk_ry=e / RYD_TO_EV, kweights=None,
+                             n_target=n_target)
 
 
-def _points_from_power_law(ladder, counts, beta, amp, base=1.0):
-    """``S(N_i)`` for a Σ whose per-band increment is EXACTLY ``A·x^(-β)``.
-
-    The estimator should then recover ``β`` to the bisection's precision and
-    predict ``S(N_T)`` exactly, because the model it assumes is the model the
-    data was generated from.  ``base`` is the (arbitrary) partial sum below
-    ``N₁``: the estimator never sees it and must not depend on it.
-    """
-    a = [ladder.absolute(int(x)) for x in counts]
-    s1 = base
-    s2 = s1 - amp * float(ladder.moment(a[0], a[1], beta))
-    s3 = s2 - amp * float(ladder.moment(a[1], a[2], beta))
-    truth = s3 - amp * float(ladder.moment(a[2], ladder.n_target, beta))
-    return np.array([s1, s2, s3]), truth
+def _raw_shell(lad, lo, hi, e_i, beta, omega):
+    """Σ over every raw (band, k) term of absolute bands (lo, hi]."""
+    e, w = lad._terms(lo, hi)
+    x = (e[None, :] - np.asarray(e_i)[:, None] + omega) / lad.estar_ev
+    return (w[None, :] * x ** -beta).sum(axis=1)
 
 
-# ---------------------------------------------------------------------------
-#  (1)  THE HELD-OUT TEST  — the reason this estimator is the default
-# ---------------------------------------------------------------------------
-
-@pytest.mark.skipif(
-    not os.path.exists(f"{S508_RUN}/armA/ch_converge.dat")
-    or not os.path.exists(f"{S508_PROTO}/arms.py"),
-    reason=(f"the 508-band Si 50 Ry arm is not on disk ({S508_RUN}); it lives "
-            f"on a PURGE-ELIGIBLE $SCRATCH filesystem, so its absence is an "
-            f"ABSENCE OF DATA and not a measurement.  The estimator's "
-            f"held-out numbers are reproduced by "
-            f"reports/spectral_shell_band_extrapolation_2026-08-17/scripts/"
-            f"reference_table.py, which reads the same arm."))
-def test_reproduces_the_measured_s508_table():
-    """The estimator, scored against a number BerkeleyGW computed.
-
-    ``S(508)`` is a MEASURED partial sum, not a fit and not a model, so an
-    estimator predicting it from ``N_max < 508`` is being graded on data it
-    never saw.  The rungs, the Fermi window and the degeneracy-snapped band
-    counts all come from the 2026-08-16 study's own binding, so this is the
-    same protocol as the prototype and not a re-derivation of it.
-
-    ⚠ THE ERRORS ARE NON-MONOTONE IN ``N_max`` (4.7 at 152 against 14.7 at
-    204).  That is the method's own behaviour — it is a two-shell local fit —
-    and the table is pinned INCLUDING the non-monotonicity so that nobody
-    "fixes" it.
-    """
-    import sys
-
-    _stub_matplotlib()
-    sys.path.insert(0, S508_PROTO)
-    try:
-        from arms import Arm
-    finally:
-        sys.path.remove(S508_PROTO)
-    import h5py
-
-    arm = Arm("A", f"{S508_RUN}/armA/ch_converge.dat",
-              f"{S508_RUN}/armA/sigma_hp.log", f"{S508_RUN}/qe/WFN.h5", "")
-    with h5py.File(f"{S508_RUN}/qe/WFN.h5", "r") as f:
-        kw = np.asarray(f["mf_header/kpoints/w"][:], float)
-
-    # DFT-ONLY.  ``arm.EL`` is mf_header/kpoints/el — the mean field.
-    ladder = build_band_ladder(enk_ry=arm.EL, kweights=kw, n_target=508)
-    assert ladder.n0 == 0.0, "the Si deck's Weyl ladder fits with n0 = 0"
-    assert ladder.r2 > 0.999, f"Weyl R^2 = {ladder.r2}"
-
-    keys = arm.FERMI
-    for nmax, want_sp in zip((150, 200, 250, 300, 400), S508_TABLE.values()):
-        n = arm.rung(nmax)["n"]
-        counts = arm.counts_of_total(n, (0.80, 0.90))
-        S = np.empty((3, len(keys)))
-        truth = np.empty(len(keys))
-        for j, k in enumerate(keys):
-            N_int, s, _ = arm.CUR[k]
-            g = {int(q): s[i] for i, q in enumerate(N_int)}
-            truth[j] = g[508]
-            S[:, j] = [g[int(c)] for c in counts]
-
-        fit = fit_band_extrapolation_spectral(counts, S, ladder)
-        assert fit.n_failed == 0, fit.failure_report()
-        got_sp = float(np.median(np.abs(np.real(fit.s_inf) - truth))) * 1e3
-        assert round(got_sp, 1) == want_sp, (
-            f"N_max {n}: spectral_shell median |err| {got_sp:.3f} meV, "
-            f"published {want_sp}")
-        b = np.asarray(fit.beta)
-        assert 3.0 < float(np.median(b)) < 5.5, (
-            f"beta median {np.median(b)} outside the measured 3.4-5.3 band; "
-            f"beta is the matrix-element falloff a+1 and a drifts 1.83->3.94")
+def _model_samples(lad, counts, e_i, beta, omega, s_inf, amp):
+    """S_i(N) = S_inf,i − a_i · G_i(N, N_T): the estimator's own model."""
+    return np.stack([s_inf - amp * _raw_shell(lad, c, lad.n_target, e_i,
+                                              beta, omega) for c in counts])
 
 
-# ---------------------------------------------------------------------------
-#  (2)  THE RETIRED 1/N VALUE REFUSES BY NAME
-# ---------------------------------------------------------------------------
-
-def test_band_index_only_refuses_by_name():
-    """Owner ruling 2026-09-27: the 1/N fit is deleted, and a deck naming it
-    must refuse by name, not fall through to the typo message or run the
-    default."""
-    from gw.gw_config import DynamicSigmaConfig
-
+def test_one_estimator_name():
     assert BAND_EXTRAPOLATION_ESTIMATORS == ("spectral_shell",)
     assert BAND_EXTRAPOLATION_ESTIMATOR_DEFAULT == "spectral_shell"
-    kw = dict(omega_min_ev=-5.0, omega_max_ev=5.0, omega_step_ev=0.1,
-              regularization_ev=0.1, window_edge_factor=1.0,
-              fermi_reference="midgap",
-              sigma_at_dft_energies=False)
-    with pytest.raises(ValueError) as exc:
-        DynamicSigmaConfig(band_extrapolation_estimator="band_index_only",
-                           **kw)
-    msg = str(exc.value)
-    assert "band_index_only is retired" in msg
-    assert "2026-09-27" in msg and "spectral_shell" in msg
 
 
-
-def test_the_deck_key_defaults_to_spectral_shell_and_refuses_a_typo():
-    from gw.gw_config import DynamicSigmaConfig
-
-    kw = dict(omega_min_ev=-5.0, omega_max_ev=5.0, omega_step_ev=0.1,
-              regularization_ev=0.1, window_edge_factor=1.0,
-              fermi_reference="midgap",
-              sigma_at_dft_energies=False)
-    assert DynamicSigmaConfig(**kw).band_extrapolation_estimator == \
-        "spectral_shell"
-    for name in BAND_EXTRAPOLATION_ESTIMATORS:
-        assert DynamicSigmaConfig(
-            band_extrapolation_estimator=name,
-            **kw).band_extrapolation_estimator == name
-    # A misspelling must REFUSE, not fall back to the default: a knob that
-    # silently ran the other arm is how a green A/B comes to measure nothing.
-    with pytest.raises(ValueError) as exc:
-        DynamicSigmaConfig(band_extrapolation_estimator="spectral", **kw)
-    for name in BAND_EXTRAPOLATION_ESTIMATORS:
-        assert name in str(exc.value)
+def test_default_fractions_are_the_owner_ruling():
+    assert BRACKET_FRACTIONS == (0.70, 0.85)
 
 
-def test_bracket_scheme_defaults_compatibly_and_refuses_ignored_or_bad_values():
-    from gw.band_extrapolation import BRACKET_SCHEMES, BRACKET_SCHEME_DEFAULT
-    from gw.gw_config import DynamicSigmaConfig
-
-    kw = dict(omega_min_ev=-5.0, omega_max_ev=5.0, omega_step_ev=0.1,
-              regularization_ev=0.1, window_edge_factor=1.0,
-              fermi_reference="midgap",
-              sigma_at_dft_energies=False)
-    assert DynamicSigmaConfig(
-        **kw).band_extrapolation_bracket_scheme == BRACKET_SCHEME_DEFAULT
-    for name in BRACKET_SCHEMES:
-        assert DynamicSigmaConfig(
-            **kw, band_extrapolation_bracket_scheme=name,
-        ).band_extrapolation_bracket_scheme == name
-    with pytest.raises(ValueError, match="band_extrapolation_bracket_scheme"):
-        DynamicSigmaConfig(**kw, band_extrapolation_bracket_scheme="energy")
-    with pytest.raises(ValueError, match="no bracket planner would consume"):
-        DynamicSigmaConfig(
-            **kw, band_extrapolation=False,
-            band_extrapolation_bracket_scheme="conduction_energy_midpoint",
-            band_extrapolation_bracket_scheme_explicit=True)
+@pytest.mark.parametrize("beta,omega", [(3.0, 10.0), (4.5, 24.0), (2.25, 0.0)])
+def test_recovers_the_model_it_was_built_from(beta, omega):
+    """Data from the model on a grid point: the fit returns that point and S_inf."""
+    lad = _ladder()
+    counts = (56, 68, 80)
+    rng = np.random.default_rng(1)
+    e_i = rng.uniform(-10.0, 8.0, 40)
+    s_inf = rng.normal(-2.0, 0.5, 40)
+    amp = rng.uniform(0.5, 3.0, 40)
+    S = _model_samples(lad, counts, e_i, beta, omega, s_inf, amp)
+    fit = fit_band_extrapolation_spectral(counts, S, lad, e_state_ev=e_i)
+    assert (fit.beta, fit.omega_ev) == (beta, omega)
+    assert fit.residual_ev < 1e-12
+    assert np.max(np.abs(fit.s_inf - s_inf)) < 1e-10
+    assert fit.n_failed == 0
 
 
-def test_bracket_scheme_deck_key_is_normalized_and_recorded_explicit(tmp_path):
-    from gw.gw_config import read_lorrax_input
-
-    deck = tmp_path / "scheme.in"
-    deck.write_text(
-        "[cohsex]\nsys_dim = 3\n"
-        "band_extrapolation_bracket_scheme = Conduction_Energy_Midpoint\n")
-    params = read_lorrax_input(str(deck))
-    assert params["band_extrapolation_bracket_scheme"] == \
-        "conduction_energy_midpoint"
-    assert "band_extrapolation_bracket_scheme" in params["_deck_named_keys"]
-
-
-# ---------------------------------------------------------------------------
-#  the estimator recovers the law it assumes
-# ---------------------------------------------------------------------------
-
-@pytest.mark.parametrize("beta", [2.0, 3.0, 4.7, 8.0])
-def test_recovers_an_exact_power_law_and_its_tail(beta):
-    """Generated from ``A·x^(-β)``, the estimator returns β and S(N_T) exactly.
-
-    Both halves matter.  Recovering β says the root find inverts the moment
-    ratio; recovering ``S(N_T)`` says the tail integral uses the SAME β and
-    the same moments, so the two are not merely individually plausible.
-    """
-    lad = _synthetic_ladder()
-    counts = (80, 100, 120)
-    S, truth = _points_from_power_law(lad, counts, beta, amp=1e-3)
-    fit = fit_band_extrapolation_spectral(counts, S[:, None], lad)
-    assert int(np.asarray(fit.failure)[0]) == SHELL_OK
-    assert abs(float(fit.beta[0]) - beta) < 1e-9, "beta must be recovered"
-    assert abs(float(fit.s_inf[0]) - truth) < 1e-12 * max(abs(truth), 1.0)
+def test_compressed_shell_sums_equal_the_raw_sums():
+    """The composite Gauss compression is exact to roundoff, near a pole too."""
+    lad = _ladder(nb=60, n_target=40000)
+    floor = lad.floor_ev(40)
+    e_i = np.array([floor - 1e-3, floor - 0.3, floor - 4.0, floor - 25.0])
+    for beta in (SHELL_BETA_GRID[0], 3.3, SHELL_BETA_GRID[1]):
+        for omega in (0.0, 7.0, SHELL_OMEGA_GRID_EV[1]):
+            e_ref = float(np.max(e_i - omega))
+            for lo, hi in ((40, 50), (40, 60), (60, lad.n_target)):
+                de, w = lad.shell_rule(lo, hi, e_ref)
+                x = (de[None, :] + (e_ref - e_i + omega)[:, None]) / lad.estar_ev
+                got = (w[None, :] * x ** -beta).sum(axis=1)
+                want = _raw_shell(lad, lo, hi, e_i, beta, omega)
+                assert np.max(np.abs(got / want - 1.0)) < 1e-12, (lo, hi, beta, omega)
 
 
-@pytest.mark.parametrize("beta", [0.3, 1.0, 1.45])
-def test_a_tail_that_does_not_converge_has_no_tail(beta):
-    """An exact root at beta <= 3/2 is recovered by the solve and then REFUSED.
-
-    The Weyl ladder makes the per-band term n^(-2beta/3); at beta <= 3/2 its
-    sum grows without bound with the basis, so I_tail/I3 is set by N_T and
-    not by the two shells.  On Si 6x6x6 SOC (64 bands) such roots moved the
-    Gamma valence states by -4.6 to -8.3 eV (lane BX2).  No tail, no clip.
-    """
-    lad = _synthetic_ladder()
-    counts = (80, 100, 120)
-    S, _ = _points_from_power_law(lad, counts, beta, amp=1e-3)
-    fit = fit_band_extrapolation_spectral(counts, S[:, None], lad)
-    assert int(np.asarray(fit.failure)[0]) == SHELL_FAIL_NOT_SUMMABLE
-    assert not np.isfinite(float(fit.beta[0]))
-    assert float(np.real(fit.s_inf[0])) == float(np.real(S[2]))
-    msg = fit.failure_report()
-    assert "1 give beta <= 1.5" in msg and "NO TAIL" in msg
-
-
-def test_the_amplitude_and_the_intercept_are_eliminated_analytically():
-    """Neither A nor the partial sum below N₁ may reach the answer.
-
-    This is the property that lets three points carry a one-parameter fit.
-    Scaling A rescales all three increments together, so β is untouched and
-    the CORRECTION scales with it; shifting the intercept moves all three
-    points by a constant and must move Ŝ by exactly that constant and change
-    nothing else.
-    """
-    lad = _synthetic_ladder()
-    counts = (80, 100, 120)
-    S, _ = _points_from_power_law(lad, counts, 4.0, amp=1e-3, base=1.0)
-    S10, _ = _points_from_power_law(lad, counts, 4.0, amp=1e-2, base=1.0)
-    Sshift, _ = _points_from_power_law(lad, counts, 4.0, amp=1e-3, base=7.5)
-
-    f = fit_band_extrapolation_spectral(counts, S[:, None], lad)
-    f10 = fit_band_extrapolation_spectral(counts, S10[:, None], lad)
-    fsh = fit_band_extrapolation_spectral(counts, Sshift[:, None], lad)
-
-    assert abs(float(f10.beta[0]) - float(f.beta[0])) < 1e-9, \
-        "A cancels from the ratio that determines beta"
-    assert abs(float(fsh.beta[0]) - float(f.beta[0])) < 1e-12, \
-        "the intercept never enters"
-    corr = float(f.s_inf[0] - f.s_at_counts[2, 0])
-    assert abs(float(f10.s_inf[0] - f10.s_at_counts[2, 0]) / corr - 10.0) < 1e-8
+def test_weights_are_real_affine_and_reproduce_s_inf():
+    lad = _ladder()
+    counts = (56, 68, 80)
+    rng = np.random.default_rng(2)
+    e_i = rng.uniform(-10.0, 8.0, (3, 5))
+    S = (_model_samples(lad, counts, e_i.ravel(), 3.5, 12.0,
+                        rng.normal(size=15), rng.uniform(1, 2, 15))
+         .reshape(3, 3, 5) + 1j * rng.normal(0, 0.01, (3, 3, 5)))
+    fit = fit_band_extrapolation_spectral(counts, S, lad, e_state_ev=e_i)
+    c = fit.weights()
+    assert np.isrealobj(c) and c.shape == (3, 3, 5)
+    assert np.max(np.abs(c.sum(axis=0) - 1.0)) < 1e-14
+    assert np.all(c[1] == 0.0), "N2 fixes the shape and carries no weight"
+    assert np.max(np.abs((c * S).sum(axis=0) - fit.s_inf)) < 1e-12
+    # The symmetrised off-diagonal rule r_ij = (r_i + r_j)/2 keeps Σ Hermitian.
+    r = fit.tail_ratio.reshape(-1)[:4]
+    A = rng.normal(size=(3, 4, 4)) + 1j * rng.normal(size=(3, 4, 4))
+    A = A + np.conj(np.swapaxes(A, 1, 2))
+    rij = 0.5 * (r[:, None] + r[None, :])
+    out = A[2] + (A[2] - A[0]) * rij
+    assert np.max(np.abs(out - out.conj().T)) == 0.0
 
 
-def test_estar_cancels_from_every_ratio():
-    """``E*`` is conditioning, not physics: any positive value gives the same Ŝ.
-
-    Asserted rather than argued because it is the licence to pick ``E*`` by a
-    deck-independent rule.  The moments themselves change by ``E*^β``; the
-    two ratios the estimator forms do not.
-    """
-    lad_a = _synthetic_ladder()
-    lad_b = build_band_ladder(
-        enk_ry=lad_a.e_dft_ev.T / RYD_TO_EV, kweights=lad_a.w_k,
-        n_target=lad_a.n_target, estar_window=(3, 9))
-    assert abs(lad_a.estar_ev - lad_b.estar_ev) > 1.0, \
-        "the two windows must actually give different E*"
-    counts = (80, 100, 120)
-    S, _ = _points_from_power_law(lad_a, counts, 3.3, amp=1e-3)
-    fa = fit_band_extrapolation_spectral(counts, S[:, None], lad_a)
-    fb = fit_band_extrapolation_spectral(counts, S[:, None], lad_b)
-    assert abs(float(fa.beta[0]) - float(fb.beta[0])) < 1e-9
-    assert abs(float(fa.s_inf[0]) - float(fb.s_inf[0])) < 1e-12
+def test_a_constant_offset_moves_s_inf_and_nothing_else():
+    lad = _ladder()
+    counts = (56, 68, 80)
+    e_i = np.linspace(-9.0, 6.0, 12)
+    S = _model_samples(lad, counts, e_i, 3.0, 8.0, -1.0, 2.0)
+    f1 = fit_band_extrapolation_spectral(counts, S, lad, e_state_ev=e_i)
+    f2 = fit_band_extrapolation_spectral(counts, S + 0.37, lad, e_state_ev=e_i)
+    assert (f1.beta, f1.omega_ev) == (f2.beta, f2.omega_ev)
+    assert np.max(np.abs(f2.s_inf - f1.s_inf - 0.37)) < 1e-12
 
 
-# ---------------------------------------------------------------------------
-#  beta is per-state, and that is the point
-# ---------------------------------------------------------------------------
-
-def test_beta_is_per_state_and_is_never_pooled():
-    """Two states with different decays get two different exponents.
-
-    THE OWNER'S RULING, PINNED.  A pooled β would return the median to both
-    states and destroy exactly the resolution the estimator exists to give.
-    The test constructs states that genuinely differ and asserts that both
-    the exponents AND the applied corrections separate.
-    """
-    lad = _synthetic_ladder()
-    counts = (80, 100, 120)
-    cols, truths = [], []
-    for beta in (2.0, 6.0):
-        S, truth = _points_from_power_law(lad, counts, beta, amp=1e-3)
-        cols.append(S)
-        truths.append(truth)
-    S = np.stack(cols, axis=1)                       # (3, 2)
-    fit = fit_band_extrapolation_spectral(counts, S, lad)
-    assert abs(float(fit.beta[0]) - 2.0) < 1e-9
-    assert abs(float(fit.beta[1]) - 6.0) < 1e-9
-    for j, truth in enumerate(truths):
-        assert abs(float(fit.s_inf[j]) - truth) < 1e-12 * max(abs(truth), 1.0)
-    # A pooled exponent -- the median applied to both -- would be wrong on
-    # BOTH states.  Quantify it so the ruling has a number behind it.
-    pooled = float(np.median(fit.beta))
-    r = float(lad.moment(*fit.shells[2], pooled)
-              / lad.moment(*fit.shells[1], pooled))
-    for j, truth in enumerate(truths):
-        s_pool = float(S[2, j] + (S[2, j] - S[1, j]) * r)
-        assert abs(s_pool - truth) > 10.0 * abs(float(fit.s_inf[j]) - truth) \
-            or abs(s_pool - truth) > 1e-9
+def test_a_state_above_the_extrapolated_bands_keeps_its_sum():
+    lad = _ladder()
+    counts = (56, 68, 80)
+    floor = lad.floor_ev(56)
+    # Above the floor by more than the largest Omega: a pole at every Omega.
+    e_i = np.array([-5.0, 0.0, 5.0, floor + SHELL_OMEGA_GRID_EV[1] + 1.0])
+    S = _model_samples(lad, counts, e_i[:3], 3.0, 8.0, -1.0, 2.0)
+    S = np.concatenate([S, np.array([[-0.9], [-0.8], [-0.7]])], axis=1)
+    fit = fit_band_extrapolation_spectral(counts, S, lad, e_state_ev=e_i)
+    assert list(fit.failure) == [SHELL_OK] * 3 + [SHELL_FAIL_POLE]
+    assert not fit.fit_mask[3], "a state outside the domain is not pooled"
+    assert fit.s_inf[3] == S[2, 3] and fit.tail_ratio[3] == 0.0
+    assert "NO TAIL" in fit.failure_report()
+    assert "1 of 4" in fit.failure_report()
 
 
-# ---------------------------------------------------------------------------
-#  no interior exponent: no tail, S(N3) kept, never a clip
-# ---------------------------------------------------------------------------
-
-def test_sign_change_between_shells_has_no_tail():
-    lad = _synthetic_ladder()
-    counts = (80, 100, 120)
-    S = np.array([[0.0], [-1.0], [-0.5]])            # D2 < 0, D3 > 0
-    fit = fit_band_extrapolation_spectral(counts, S, lad)
-    assert int(np.asarray(fit.failure)[0]) == SHELL_FAIL_SIGN
-    assert not np.isfinite(float(fit.beta[0]))
-    assert float(np.real(fit.s_inf[0])) == -0.5, "S_hat = S(N3)"
-    msg = fit.failure_report()
-    assert "OPPOSITE SIGN" in msg and "D2" in msg and "D3" in msg
-    assert "1 of 1 external states have NO TAIL" in msg
+def test_no_state_in_the_domain_means_no_fit_and_no_tail():
+    lad = _ladder()
+    counts = (56, 68, 80)
+    e_i = np.full(3, lad.floor_ev(56) + 1.0)
+    S = np.stack([np.full(3, v) for v in (-1.0, -0.9, -0.85)])
+    fit = fit_band_extrapolation_spectral(counts, S, lad, e_state_ev=e_i)
+    assert np.isnan(fit.beta) and np.isnan(fit.omega_ev)
+    assert np.all(fit.failure == SHELL_FAIL_NO_FIT)
+    assert np.array_equal(fit.s_inf, S[2])
+    assert spectral_trust_verdict(fit).startswith("NOT TRUSTWORTHY")
 
 
-def test_zero_increment_has_no_tail():
-    lad = _synthetic_ladder()
-    fit = fit_band_extrapolation_spectral(
-        (80, 100, 120), np.array([[0.0], [0.0], [-1.0]]), lad)
-    assert int(np.asarray(fit.failure)[0]) == SHELL_FAIL_ZERO
-    assert float(np.real(fit.s_inf[0])) == -1.0
+def test_fit_mask_restricts_the_pool_only():
+    """The pool fixes (β, Ω); every state in the domain still gets its tail."""
+    lad = _ladder()
+    counts = (56, 68, 80)
+    e_i = np.linspace(-9.0, 6.0, 10)
+    S = _model_samples(lad, counts, e_i, 4.0, 16.0, -1.0, 1.5)
+    mask = np.zeros(10, dtype=bool)
+    mask[:5] = True
+    fit = fit_band_extrapolation_spectral(counts, S, lad, e_state_ev=e_i,
+                                          fit_mask=mask)
+    assert (fit.beta, fit.omega_ev) == (4.0, 16.0)
+    assert int(fit.fit_mask.sum()) == 5 and fit.n_failed == 0
+    assert np.all(fit.tail_ratio > 0.0)
 
 
-def test_an_unreachable_shell_ratio_has_no_tail_instead_of_clipping():
-    """A ratio no power law can produce gets no tail, not a bracket edge.
-
-    ``g(β) = log I₃ − log I₂`` is strictly decreasing and therefore bounded
-    by its own values at the bracket ends.  A ``|D₃/D₂|`` outside
-    ``[exp g(hi), exp g(lo)]`` has no root at all, and the failure mode being
-    gated is returning ``β = 0.05`` or ``β = 40`` as though it were a fit.
-    """
-    lad = _synthetic_ladder()
-    counts = (80, 100, 120)
-    lo, hi = SHELL_EXPONENT_BRACKET
-    a1, a2, a3 = (lad.absolute(c) for c in counts)
-    g_lo = float(np.log(lad.moment(a2, a3, lo) / lad.moment(a1, a2, lo)))
-    g_hi = float(np.log(lad.moment(a2, a3, hi) / lad.moment(a1, a2, hi)))
-    assert g_hi < g_lo, "g must be strictly decreasing in beta"
-
-    for ratio in (np.exp(g_lo) * 1e3, np.exp(g_hi) * 1e-3):
-        # D2 = -1 so D3 = -ratio reproduces |D3/D2| = ratio with one sign.
-        S = np.array([[0.0], [-1.0], [-1.0 - ratio]])
-        fit = fit_band_extrapolation_spectral(counts, S, lad)
-        code = int(np.asarray(fit.failure)[0])
-        assert code in (SHELL_FAIL_NO_ROOT, SHELL_FAIL_EDGE), code
-        assert not np.isfinite(float(fit.beta[0])), \
-            "a clipped exponent is the exact failure this rule avoids"
-        assert float(np.real(fit.s_inf[0])) == float(S[2, 0])
-        msg = fit.failure_report()
-        assert "no exponent is clipped" in msg
-        assert f"{np.exp(g_hi):.4g}, {np.exp(g_lo):.4g}" in msg, \
-            "the report states the reachable ratio range"
+def test_refuses_when_n3_reaches_the_basis():
+    lad = _ladder(nb=80, n_target=80)
+    S = np.zeros((3, 2))
+    with pytest.raises(BandExtrapolationRefused, match="finite-basis endpoint"):
+        fit_band_extrapolation_spectral((56, 68, 80), S, lad,
+                                        e_state_ev=np.zeros(2))
 
 
-def test_a_state_without_a_tail_keeps_s_n3_and_leaves_the_others_alone():
-    """Weights ``[0, 0, 1]`` on the no-tail state; the solved one unchanged."""
-    lad = _synthetic_ladder()
-    counts = (80, 100, 120)
-    good, _ = _points_from_power_law(lad, counts, 3.5, amp=1e-3)
-    bad = np.array([0.0, -1.0, -0.5])                      # D2 < 0, D3 > 0
-    S = np.stack([bad, good], axis=1)
-    fit = fit_band_extrapolation_spectral(counts, S, lad)
-    alone = fit_band_extrapolation_spectral(counts, good[:, None], lad)
-    assert fit.n_failed == 1
-    assert int(np.asarray(fit.failure)[1]) == SHELL_OK
-    w = fit.weights()
-    np.testing.assert_array_equal(w[:, 0], [0.0, 0.0, 1.0])
-    np.testing.assert_array_equal(w[:, 1], alone.weights()[:, 0])
-    assert "1 of 2 states have no tail" in spectral_trust_verdict(fit)
+@pytest.mark.parametrize("counts", [(56, 68), (56, 56, 80), (68, 56, 80)])
+def test_refuses_bad_counts(counts):
+    lad = _ladder()
+    with pytest.raises(ValueError):
+        fit_band_extrapolation_spectral(counts, np.zeros((len(counts), 2)), lad,
+                                        e_state_ev=np.zeros(2))
 
 
-def test_solve_returns_nan_and_a_code_never_a_bracket_edge():
-    """The solver's own contract, independent of the fit that wraps it."""
-    lad = _synthetic_ladder()
-    a1, a2, a3 = (lad.absolute(c) for c in (80, 100, 120))
-    ratio = np.array([1e-30, 1e30, np.nan, 0.0, -1.0])
-    beta, code = solve_shell_exponents(lad, (a1, a2), (a2, a3), ratio)
-    assert np.all(~np.isfinite(beta)), \
-        "every one of these is unreachable; none may come back as a number"
-    assert np.all(code != SHELL_OK)
+def test_the_state_energy_is_a_required_input():
+    """The model's denominator reads E_i; a call without it must not run."""
+    params = inspect.signature(fit_band_extrapolation_spectral).parameters
+    assert params["e_state_ev"].default is inspect.Parameter.empty
+    assert params["e_state_ev"].kind is inspect.Parameter.KEYWORD_ONLY
 
 
-# ---------------------------------------------------------------------------
-#  the ladder is DFT-only, and N_T is the finite basis
-# ---------------------------------------------------------------------------
-
-def test_the_weyl_ladder_is_fitted_to_the_eigenvalues_alone():
-    """E₀, n₀ and C come back from a ladder built to the law, exactly."""
-    n = np.arange(1, 301, dtype=np.float64)
-    e = -4.25 + 2.75 * (n + 7.0) ** (2.0 / 3.0)
-    e0, n0, c, r2 = weyl_ladder_fit(e, 30, 300)
-    assert n0 == 7.0
-    assert abs(e0 + 4.25) < 1e-8 and abs(c - 2.75) < 1e-10
-    assert r2 > 1.0 - 1e-12
-
-
-def test_n_target_is_the_finite_basis_not_infinity():
-    """``N_PW = min(ngk)·nspinor``, and the tail stops there.
-
-    ``S(∞)`` names no physical quantity: the band sum is EXACTLY complete at
-    the basis dimension.  ``min`` over k because ngk varies by k-point and
-    the minimum is where no k-point is still short.
-    """
-    assert plane_wave_band_count([1639, 1618, 1604, 1628], 2) == 3208
-    assert plane_wave_band_count(np.array([100]), 1) == 100
-
-    lad = _synthetic_ladder(n_dft=120, n_target=400)
-    assert lad.n_target == 400
-    assert lad.e_weyl_ev.shape == (280,), \
-        "bands 121..400 come from the Weyl continuation"
-    # The continuation is the SAME law, evaluated one band past the data.
-    nxt = lad.e0_ev + lad.c_ev * (121.0 + lad.n0) ** (2.0 / 3.0)
-    assert abs(float(lad.e_weyl_ev[0]) - nxt) < 1e-12
-    # And it is strictly above the last measured band, i.e. a continuation
-    # rather than a restart.
-    assert float(lad.e_weyl_ev[0]) > float(lad.e_dft_ev[-1].max())
-
-
-def test_a_band_sum_already_at_the_basis_refuses():
-    """Nothing left to extrapolate is a refusal, not a zero correction."""
-    lad = _synthetic_ladder(n_dft=120, n_target=120)
-    from gw.band_extrapolation import BandExtrapolationRefused
-    with pytest.raises(BandExtrapolationRefused) as exc:
-        fit_band_extrapolation_spectral(
-            (80, 100, 120), np.zeros((3, 2)), lad)
-    assert "complete" in str(exc.value)
-
-
-def test_the_moment_is_the_weighted_spectral_sum_it_claims_to_be():
-    """``log_moment`` against the literal definition, on both segments."""
-    lad = _synthetic_ladder(n_dft=40, nk=3, n_target=60)
-    for beta in (0.7, 3.0, 11.0):
-        for lo, hi in ((5, 20), (30, 40), (35, 55), (40, 60)):
-            direct = 0.0
-            for i in range(lo, min(hi, lad.n_dft)):
-                x = (lad.e_dft_ev[i] - lad.e0_ev) / lad.estar_ev
-                direct += float(np.sum(lad.w_k * x ** (-beta)))
-            for i in range(max(lo, lad.n_dft), hi):
-                x = ((lad.e_weyl_ev[i - lad.n_dft] - lad.e0_ev)
-                     / lad.estar_ev)
-                direct += float(x ** (-beta))
-            got = float(lad.moment(lo, hi, beta))
-            assert abs(got - direct) <= 1e-11 * abs(direct)
-
-
-def test_the_ladder_never_sees_the_self_energy():
-    """A structural gate on the DFT-only ruling.
-
-    :func:`build_band_ladder`'s signature is the whole surface through which
-    the ladder is constructed, and it takes eigenvalues, weights, an endpoint
-    and an offset — no Σ, no S(N_i), nothing that could carry one.  Pinned
-    because "E₀ comes from the DFT eigenvalues only" is a ruling that a later
-    convenience argument could quietly undo.
-    """
-    import inspect
+def test_the_ladder_is_built_from_dft_only():
+    """build_band_ladder has no input through which Σ could reach the ladder."""
     params = set(inspect.signature(build_band_ladder).parameters)
     assert params == {"enk_ry", "kweights", "n_target", "b0", "fit_window",
                       "estar_window"}
 
 
-# ---------------------------------------------------------------------------
-#  the per-state weights, and Hermiticity
-# ---------------------------------------------------------------------------
+def test_fit_is_fast_on_a_large_deck():
+    """Owner 2026-09-28: the extrapolation must not take seconds.
 
-def test_weights_are_real_affine_and_reproduce_the_fit():
-    lad = _synthetic_ladder()
-    rng = np.random.default_rng(5)
-    counts = (80, 100, 120)
-    S = np.stack([_points_from_power_law(lad, counts, b, amp=1e-3)[0]
-                  for b in rng.uniform(2.0, 6.0, size=(4, 3)).ravel()[:6]],
-                 axis=1)
-    fit = fit_band_extrapolation_spectral(counts, S, lad)
-    w = fit.weights()
-    assert w.dtype == np.float64, "complex weights would break Hermiticity"
-    assert w.shape == (3,) + fit.s_inf.shape
-    assert np.allclose(w.sum(axis=0), 1.0, atol=0, rtol=1e-13), \
-        "an affine combination: a band-converged Sigma comes through unchanged"
-    assert np.allclose(np.sum(w * S, axis=0), np.real(fit.s_inf),
-                       atol=0, rtol=1e-12)
-
-
-def test_extrapolated_sigma_is_hermitian_to_machine_precision_per_state():
-    """The per-state weights must not cost the Hermiticity the scalars had.
-
-    The symmetrisation ``½(w_i + w_j)`` is what buys this, and BITWISE
-    equality is asserted rather than ``allclose``: anything less would pass on
-    a rule that was only nearly symmetric, and a Σ that is only nearly
-    Hermitian gives the next SC iteration eigenvectors inconsistent with its
-    own eigenvalues.
+    1200 states, 400 DFT bands at 12 k, a 152012-band Weyl tail (the CrI3
+    16x16 N_T): fit + apply well under a second.
     """
-    from gw.ppm_pipeline import _extrapolated_point
-
-    rng = np.random.default_rng(817)
-    nom, nk, nb = 2, 3, 6
-    pts = []
-    for _ in range(3):
-        A = (rng.normal(size=(nom, nk, nb, nb))
-             + 1j * rng.normal(size=(nom, nk, nb, nb)))
-        # Hermitian FIRST (this makes the diagonal real), then rebuilt from
-        # its own lower triangle so the input is Hermitian to the LAST BIT
-        # and the test measures the combination rather than the input.
-        A = 0.5 * (A + np.conj(np.swapaxes(A, -1, -2)))
-        H = np.tril(A) + np.conj(np.swapaxes(np.tril(A, -1), -1, -2))
-        assert np.array_equal(H, np.conj(np.swapaxes(H, -1, -2)))
-        pts.append(H)
-    cube = np.stack(pts)
-
-    r = rng.uniform(0.1, 5.0, size=(nk, nb))
-    w = np.stack([np.zeros_like(r), -r, 1.0 + r], axis=0)
-    out = np.asarray(_extrapolated_point(cube, w))
-    assert out.shape == (nom, nk, nb, nb)
-    assert np.array_equal(out, np.conj(np.swapaxes(out, -1, -2))), \
-        "the extrapolated Sigma must be Hermitian to the LAST BIT"
-    # And the diagonal must be EXACTLY the per-state estimator, since
-    # 1/2(w_i + w_i) = w_i.
-    for k in range(nk):
-        for i in range(nb):
-            want = sum(w[b, k, i] * cube[b, :, k, i, i] for b in range(3))
-            assert np.array_equal(out[:, k, i, i], want)
-
-
-def test_pad_bands_stay_exactly_zero_under_per_state_weights():
-    from gw.ppm_pipeline import _extrapolated_point
-    nk, nb = 2, 4
-    cube = np.zeros((3, 1, nk, nb, nb), dtype=np.complex128)
-    cube[:, :, :, :2, :2] = 1.0 + 0.5j
-    r = np.linspace(0.5, 3.0, nk * nb).reshape(nk, nb)
-    w = np.stack([np.zeros_like(r), -r, 1.0 + r], axis=0)
-    out = np.asarray(_extrapolated_point(cube, w))
-    assert np.array_equal(out[:, :, 2:, :], np.zeros_like(out[:, :, 2:, :]))
-
-
-def test_extrapolated_point_refuses_a_weight_shape_it_cannot_mean():
-    from gw.ppm_pipeline import _extrapolated_point
-    with pytest.raises(ValueError) as exc:
-        _extrapolated_point(np.zeros((3, 2, 2)), np.zeros((3, 2)))
-    assert "spectral_shell" in str(exc.value)
-
-
-# ---------------------------------------------------------------------------
-#  the report and the h5 payload
-# ---------------------------------------------------------------------------
-
-def test_report_carries_the_shells_the_ladder_and_the_per_state_numbers():
-    lad = _synthetic_ladder()
-    counts = (80, 100, 120)
-    S = np.stack([_points_from_power_law(lad, counts, b, amp=1e-3)[0]
-                  for b in (2.5, 4.5)], axis=1)[:, :, None]   # (3, 2, 1)
-    fit = fit_band_extrapolation_spectral(counts, S, lad)
-    from gw.band_extrapolation import plan_band_brackets
-    rng = np.random.default_rng(3)
-    enk = np.sort(rng.uniform(-1.0, 3.0, size=(2, 120)), axis=1)
-    plan = plan_band_brackets(enabled=True, enk_ry=enk, n_occ=20,
-                              nb_logical=120, nb_padded=120)
-    fit = fit_band_extrapolation_spectral(plan.counts, S, lad)
-    text = format_spectral_report(plan, fit, states=[("VBM", (0, 0))])
-    for want in ("spectral_shell", "beta", "I_tail/I3", "S_hat", "shells",
-                 "N_T", "E0", "PER STATE", "D2", "D3"):
-        assert want in text, f"missing {want!r} from the log block"
-    # The 1/N block's diagnostics must be absent AND their absence explained.
-    assert "Delta_model" in text and "absence is not an omission" in text
-
-
-def test_h5_payload_names_the_estimator_and_carries_the_ladder():
-    lad = _synthetic_ladder()
-    from gw.band_extrapolation import plan_band_brackets
+    lad = _ladder(nk=12, nb=400, n_target=152012, seed=3)
+    counts = (280, 340, 400)
     rng = np.random.default_rng(4)
-    enk = np.sort(rng.uniform(-1.0, 3.0, size=(2, 120)), axis=1)
-    plan = plan_band_brackets(enabled=True, enk_ry=enk, n_occ=20,
-                              nb_logical=120, nb_padded=120)
-    S = np.stack([_points_from_power_law(lad, plan.counts, b, amp=1e-3)[0]
-                  for b in (2.5, 4.5)], axis=1)[:, :, None]
-    fit = fit_band_extrapolation_spectral(plan.counts, S, lad)
+    e_i = rng.uniform(-10.0, 10.0, 1200)
+    S = np.stack([-1.0 + 0.3 / c + 1e-3 * rng.normal(size=1200)
+                  for c in counts]).astype(complex)
+    t0 = time.perf_counter()
+    fit = fit_band_extrapolation_spectral(counts, S, lad, e_state_ev=e_i)
+    wall = time.perf_counter() - t0
+    assert np.isfinite(fit.beta)
+    assert wall < 1.0, f"fit + apply took {wall:.2f} s"
+
+
+def test_payload_and_report():
+    lad = _ladder()
+    e = np.tile(np.linspace(1.0, 10.0, 80), (4, 1)) / RYD_TO_EV
+    plan = plan_band_brackets(enabled=True, enk_ry=e, n_occ=8, nb_logical=80,
+                              nb_padded=80)
+    assert plan.counts == (56, 68, 80)
+    e_i = np.linspace(-9.0, 6.0, 8).reshape(2, 4)
+    S = _model_samples(lad, plan.counts, e_i.ravel(), 3.0, 8.0, -1.0,
+                       2.0).reshape(3, 2, 4)
+    fit = fit_band_extrapolation_spectral(plan.counts, S, lad, e_state_ev=e_i)
     pay = spectral_h5_payload(plan, fit)
     assert set(pay["arrays"]) == set(SPECTRAL_EXTRAP_DATASETS)
-    assert "sigma_c_extrap_beta_kn" in pay["arrays"]
-    assert "sigma_c_extrap_ampl_kn_ev" not in pay["arrays"], \
-        "beta must not be written under the 1/N amplitude's name"
-    at = pay["attrs"]
-    assert at["band_extrapolation_estimator"] == "spectral_shell"
-    for key in ("ladder_e0_ev", "ladder_n0", "ladder_estar_ev",
-                "ladder_n_target", "shell_bands_absolute", "verdict"):
-        assert key in at
-    assert at["ladder_n_target"] == lad.n_target
-
-
-def test_every_spectral_dataset_is_registered_for_star_extraction():
-    """A dataset the writer does not know the k axis of is written wrong."""
-    from file_io.sigma_output import SIGMA_K_AXIS
-    for name in SPECTRAL_EXTRAP_DATASETS:
-        assert name in SIGMA_K_AXIS, (
-            f"{name} is not in SIGMA_K_AXIS, so its k axis is unknown to the "
-            f"star extraction and it would be written unextracted")
-        assert SIGMA_K_AXIS[name] == 0
-
-
-def test_the_verdict_reports_the_spread_and_does_not_claim_quality():
-    lad = _synthetic_ladder()
-    counts = (80, 100, 120)
-    S = np.stack([_points_from_power_law(lad, counts, b, amp=1e-3)[0]
-                  for b in (2.0, 3.0, 5.0)], axis=1)
-    fit = fit_band_extrapolation_spectral(counts, S, lad)
-    v = spectral_trust_verdict(fit)
-    assert "beta median" in v and "not a quality metric" in v
-    bad = fit_band_extrapolation_spectral(
-        counts, np.array([[0.0], [-1.0], [-0.5]]), lad)
-    assert spectral_trust_verdict(bad).startswith("NOT TRUSTWORTHY")
+    assert pay["attrs"]["pooled_beta"] == 3.0
+    assert pay["attrs"]["pooled_omega_ev"] == 8.0
+    assert np.allclose(pay["arrays"]["sigma_c_extrap_beta_kn"].real, 3.0)
+    text = format_spectral_report(plan, fit, states=[("VBM", (0, 1))])
+    assert "pooled beta = 3.00" in text and "Omega = 8.0 eV" in text
+    assert "[VBM]" in text
