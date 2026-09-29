@@ -137,8 +137,9 @@ claim 2952) holds the rest of the recipe. It is not on main.
   meV std / max (MoS2). From map 1, protected conduction states broader
   than the deck η at map 0 read on far windows at η_n = max(η, |Im Σ_nn(E_n)|);
   the protected end of their off-diagonals stays at the deck η (mixing kept).
-  Semicore sits at its DFT block by default (`sc_semicore = dft`). Slabs: the
-  vacuum-level warning is not built yet.
+  Semicore sits at its DFT block by default (`sc_semicore = dft`). Slab decks
+  (`sys_dim = 2`) should keep `number_bands_protected` below the vacuum states:
+  no vacuum-level check exists yet, so the far rule would read them.
 - **Owner calls.** (a) Cost of the one ε: at 1e-4 the coarse windows take
   MoS2 530 against 448 τ pairs per map and Fe 1087 against 959 (over the
   1000-pair metal budget); splitting does not win it back. (b) Fe 4³ map 2 misses 2 meV: at matched
