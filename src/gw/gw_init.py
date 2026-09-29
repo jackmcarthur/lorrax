@@ -3335,8 +3335,8 @@ def qp_band_cut_for_deck(config, wfn, print0):
     """
     import sys
     from common.units import RYD_TO_EV
-    from .band_partition import (CUT_GAP_ETAS, CUT_SEARCH_ETAS, WINDOW_CLIP_EV,
-                                 qp_band_cut)
+    from .band_partition import (CUT_GAP_ETAS, CUT_SEARCH_ETAS, SEMICORE_GAP_EV,
+                                 WINDOW_CLIP_EV, qp_band_cut)
     from .gw_config import infer_material_class
     e_ry = np.asarray(wfn.energies[0, :, :config.nband], dtype=np.float64)
     e = e_ry * RYD_TO_EV
@@ -3359,7 +3359,9 @@ def qp_band_cut_for_deck(config, wfn, print0):
         clip_ev=WINDOW_CLIP_EV, cut_gap_ev=CUT_GAP_ETAS * eta,
         cut_search_ev=CUT_SEARCH_ETAS * eta,
         omega_min_rel_ev=config.sigma.omega_min_ev, omega_max_rel_ev=config.sigma.omega_max_ev,
-        b_max=getattr(config, "zeta_nband", None))
+        b_max=getattr(config, "zeta_nband", None),
+        n_protected=getattr(config, "number_bands_protected", None),
+        semicore_gap_ev=SEMICORE_GAP_EV)
     width = cut.gap_ev[1] - cut.gap_ev[0]
     # Production stdout is /dev/null (runtime.production_stream): rank 0
     # writes the cut to stderr, which reaches the rank-0 log.
@@ -3370,8 +3372,11 @@ def qp_band_cut_for_deck(config, wfn, print0):
         f"scissored (DFT psi, no Sigma, no mixing); cut {cut.cut_ev - mu:+.3f} eV in the "
         f"band gap [{cut.gap_ev[0] - mu:+.3f}, {cut.gap_ev[1] - mu:+.3f}] eV (width "
         f"{width:.3f} eV); top of the need {cut.top_ev - mu:+.3f} eV; coarse (semicore): "
-        + (f"{cut.n_coarse} (k,state) below E-mu = {cut.coarse_floor_ev - mu:+.3f} eV, the lowest "
-           f"requested valence band (nval={int(config.nval)})" if cut.n_coarse else "none")
+        + ((f"{cut.n_coarse} (k,state) below E-mu = {cut.coarse_floor_ev - mu:+.3f} eV, "
+            + (f"the lowest requested valence band (nval={int(config.nval)})"
+               if getattr(config, "number_bands_protected", None) is None else
+               f"under a band gap >= {SEMICORE_GAP_EV:g} eV (number_bands_protected)"))
+           if cut.n_coarse else "none")
         + f"; {cut.n_requested_tail} requested (k,state) in the tail")
     return cut
 

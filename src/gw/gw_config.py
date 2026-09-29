@@ -962,6 +962,11 @@ _DEFAULTS = {
     # System geometry
     "nval": 5,
     "ncond": 5,
+    # The QP request as one band count (owner 2026-09-29, the documented
+    # form): every occupied band plus conduction bands up to this total.
+    # Exclusive with nval/ncond (GATE band_request_forms); resolved against
+    # the WFN by LorraxConfig.with_band_request.
+    "number_bands_protected": None,
     # ── THE BAND-COUNT FAMILY ───────────────────────────────────────────
     # FOUR keys, ONE resolver (:func:`resolve_band_counts`), and this dict
     # is the only place a NUMBER lives.
@@ -1918,6 +1923,7 @@ _NULLABLE_BOOL = frozenset({
 #: non-integral value raises out of ``configparser.getint`` by name.
 _NULLABLE_INT = frozenset({
     "zeta_nband",
+    "number_bands_protected",
     "sys_dim",
     "mpa_sampling_alpha",
     # The band-count family's three "the deck did not say" slots.  They are
@@ -2737,6 +2743,24 @@ def _input_band_windows(
     return (_bands, _zeta_nband)
 
 
+def _band_request_form(params, named_keys):
+    """``number_bands_protected`` or None; refuse it beside nval/ncond (GATE band_request_forms)."""
+    value = params.get("number_bands_protected")
+    if value in (None, ""):
+        return None
+    both = sorted({"nval", "ncond"} & set(named_keys))
+    if both:
+        raise ValueError(
+            "GATE band_request_forms: number_bands_protected and "
+            + " / ".join(both) + " both name the QP request.  Give one form: "
+            "number_bands_protected (every occupied band plus conduction bands up to "
+            "that total) or nval / ncond.")
+    value = int(value)
+    if value < 1:
+        raise ValueError(f"number_bands_protected={value} must be >= 1")
+    return value
+
+
 def _assemble_input_config(
         _bands, _effective_named_keys, _occ_family, _occ_width, _qp_rot_k_storage,
         _resolved_do_g0, _restart_q_storage, _zeta_nband, backend, bse, cls, debug, eqp2,
@@ -2745,6 +2769,7 @@ def _assemble_input_config(
     resolved = cls(
         nval=int(params["nval"]),
         ncond=int(params["ncond"]),
+        number_bands_protected=_band_request_form(params, _effective_named_keys),
         nband=int(_bands.isdf),
         bands=_bands,
         zeta_nband=_zeta_nband,
@@ -4068,6 +4093,7 @@ class DynamicSigmaConfig:
                 "sigma_out_of_grid must be 'cover', 'clamp' or 'static'; got "
                 f"{self.out_of_grid!r}.")
         self.parsed_omega_patches_ev()
+        self.coarse_windows_ev()
         if self.fermi_reference not in ("vbm", "midgap", "mp1_fixed_n"):
             raise ValueError(
                 "fermi_reference must be 'vbm', 'midgap' or 'mp1_fixed_n'.")
@@ -4121,18 +4147,27 @@ class DynamicSigmaConfig:
         """The validated ``[(lo, hi), ...]`` patch list, or ``[]``; see docs/architecture/decisions.md."""
         return self.parse_omega_patches_ev(self.omega_patches_ev, self.omega_step_ev)
 
+    def coarse_windows_ev(self):
+        """The user's coarse windows: the ``lo:hi:eta`` triples of ``sigma_omega_patches_ev``."""
+        return self.parse_coarse_windows_ev(self.omega_patches_ev, self.regularization_ev)
+
+    @staticmethod
+    def _patch_pieces(text):
+        text = str(text or "").strip()
+        return [p.strip() for p in text.split(",") if p.strip()] if text else []
+
     @staticmethod
     def parse_omega_patches_ev(text, step_ev):
-        """Parse a ``sigma_omega_patches_ev`` spelling at ``step_ev``; see :meth:`parsed_omega_patches_ev`."""
-        text = str(text or "").strip()
-        if not text:
-            return []
+        """Parse the ``lo:hi`` pieces of ``sigma_omega_patches_ev`` at ``step_ev``.
+
+        ``lo:hi:eta`` triples are coarse windows (:meth:`parse_coarse_windows_ev`)
+        and are skipped here.
+        """
         patches = []
-        for piece in text.split(","):
-            piece = piece.strip()
-            if not piece:
-                continue
+        for piece in DynamicSigmaConfig._patch_pieces(text):
             parts = piece.split(":")
+            if len(parts) == 3:
+                continue
             try:
                 lo, hi = (float(parts[0]), float(parts[1])) \
                     if len(parts) == 2 else (np.nan, np.nan)
@@ -4140,7 +4175,7 @@ class DynamicSigmaConfig:
                 lo = hi = np.nan
             if not (np.isfinite(lo) and np.isfinite(hi) and hi > lo):
                 raise ValueError(
-                    "sigma_omega_patches_ev must be 'lo:hi, lo:hi, ...' "
+                    "sigma_omega_patches_ev must be 'lo:hi' or 'lo:hi:eta' pieces "
                     f"with hi > lo in eV; could not parse {piece!r}")
             patches.append((lo, hi))
         for (l0, h0), (l1, h1) in zip(patches, patches[1:]):
@@ -4151,6 +4186,42 @@ class DynamicSigmaConfig:
                     f"[{l1}:{h1}] at step {step_ev}. Merge "
                     "them into one patch instead.")
         return patches
+
+    @staticmethod
+    def parse_coarse_windows_ev(text, eta_ev):
+        """Parse the ``lo:hi:eta`` triples of ``sigma_omega_patches_ev`` (eV about E_F).
+
+        A user's coarse (semicore) window: the SC coarse states inside it at
+        map 0 are read on it at its own eta instead of the automatic patches
+        (``gw.qp_support.coarse_windows_ev``).  Refuses by name
+        (``GATE sigma_coarse_window``) a malformed triple, eta below the deck
+        eta, or overlapping windows.
+        """
+        windows = []
+        for piece in DynamicSigmaConfig._patch_pieces(text):
+            parts = piece.split(":")
+            if len(parts) != 3:
+                continue
+            try:
+                lo, hi, eta = (float(x) for x in parts)
+            except ValueError:
+                lo = hi = eta = np.nan
+            if not (np.isfinite([lo, hi, eta]).all() and hi > lo and eta > 0.0):
+                raise ValueError(
+                    "GATE sigma_coarse_window: a sigma_omega_patches_ev triple must be "
+                    f"'lo:hi:eta' in eV with hi > lo and eta > 0; got {piece!r}")
+            if eta < float(eta_ev) * (1.0 - 1e-12):
+                raise ValueError(
+                    f"GATE sigma_coarse_window: {piece!r} has eta {eta:g} eV below the "
+                    f"deck's sigma_regularization_ev {float(eta_ev):g} eV")
+            windows.append((lo, hi, eta))
+        windows.sort()
+        for (l0, h0, _), (l1, h1, _) in zip(windows, windows[1:]):
+            if l1 <= h0:
+                raise ValueError(
+                    f"GATE sigma_coarse_window: coarse windows [{l0}:{h0}] and [{l1}:{h1}] "
+                    "overlap")
+        return tuple(windows)
 
 
 @dataclass(frozen=True)
@@ -4726,11 +4797,15 @@ class LorraxConfig:
     #: Internal sampled SC support, retained by the quadrature session.
     #: This is not a deck knob; requested Sigma bounds stay unchanged.
     sc_omega_grid_ev: tuple[float, ...] | None = None
-    #: Internal: the SC semicore patch (lo_ev, hi_ev, eta_ev) about the Sigma
-    #: frame's E_F, held from map 0 (``gw.qp_support.semicore_patch_ev``).
-    #: Its samples lie inside ``sc_omega_grid_ev`` below the near grid and
-    #: are evaluated at eta_ev.  Not a deck knob.
-    sc_semicore_patch_ev: tuple[float, float, float] | None = None
+    #: Internal: this map's coarse (semicore) windows ((lo_ev, hi_ev, eta_ev,
+    #: user), ...) about the Sigma frame's E_F (``gw.qp_support.
+    #: coarse_windows_ev``).  Their samples lie inside ``sc_omega_grid_ev``
+    #: below the near grid and are evaluated at eta_ev.  Not a deck knob.
+    sc_coarse_windows_ev: tuple | None = None
+    #: ``number_bands_protected`` (None: the nval/ncond form).  Once resolved
+    #: against the WFN (:meth:`with_band_request`), nval = the occupied count
+    #: and ncond = this total minus it.
+    number_bands_protected: int | None = None
 
     def __post_init__(self):
         """Refuse head settings outside their landed scope."""
@@ -4795,6 +4870,26 @@ class LorraxConfig:
     # ------------------------------------------------------------------
     #  Derived config objects
     # ------------------------------------------------------------------
+
+    def with_band_request(self, wfn, print_fn=print):
+        """Resolve ``number_bands_protected`` against the WFN (identity otherwise).
+
+        nval = every occupied band (``wfn.nelec``), ncond = the total minus it;
+        the key stays set so the band cut takes its semicore rule
+        (``band_partition.qp_band_cut``).
+        """
+        total = self.number_bands_protected
+        if total is None:
+            return self
+        n_occ = int(wfn.nelec)
+        if not n_occ <= int(total) <= int(self.nband):
+            raise ValueError(
+                f"GATE band_request_forms: number_bands_protected={int(total)} must lie in "
+                f"[{n_occ} (the occupied bands), {int(self.nband)} (number_bands)].")
+        from dataclasses import replace as _replace
+        print_fn(f"  QP request: number_bands_protected={int(total)} -> nval={n_occ} "
+                 f"(every occupied band), ncond={int(total) - n_occ}")
+        return _replace(self, nval=n_occ, ncond=int(total) - n_occ)
 
     @property
     def occ_broadening_ry(self) -> float:

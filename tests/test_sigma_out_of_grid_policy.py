@@ -269,37 +269,49 @@ def test_the_support_envelope_refuses_a_grid_grown_past_it():
 # The SC semicore patch (gw.qp_support)
 # ---------------------------------------------------------------------------
 
-def test_semicore_patch_is_planned_below_the_near_grid_held_and_extended():
-    from gw.qp_support import (SEMICORE_ETA_EV, joined_grid_ev, patch_eta_ev,
-                               semicore_patch_escapes, semicore_patch_ev)
-    e = np.array([[-52.0, -50.3, -5.0, 1.0], [-51.8, -50.1, -4.8, 1.2]])
+def test_semicore_patches_one_per_manifold_held_and_extended():
+    from gw.qp_support import (SEMICORE_ETA_EV, coarse_windows_ev, joined_grid_ev,
+                               semicore_patch_escapes, semicore_patches_ev, window_labels)
+    # Two coarse manifolds 20 eV apart: two patches; each 2 eV pad snapped to 0.5 eV.
+    e = np.array([[-72.0, -52.0, -50.3, -5.0, 1.0], [-71.9, -51.8, -50.1, -4.8, 1.2]])
     semi = np.zeros(e.shape, bool)
-    semi[:, :2] = True
+    semi[:, :3] = True
     near = np.arange(-7.0, 3.01, 0.25)
-    patch = semicore_patch_ev(e, semi, near[0])
-    assert patch == (-54.0, -48.0, SEMICORE_ETA_EV)
-    joined = joined_grid_ev(near, patch)
-    assert np.all(np.diff(joined) > 0) and joined[0] == -54.0
-    np.testing.assert_allclose(joined[joined < near[0]][1:] - joined[joined < near[0]][:-1], 0.5)
-    eta = patch_eta_ev(joined, patch, 0.25)
-    assert np.all(eta[joined < near[0]] == SEMICORE_ETA_EV) and np.all(eta[joined >= near[0]] == 0.25)
-    # Inside the pad: held.  A read support that leaves it: the patch grows, never shrinks.
-    assert not semicore_patch_escapes(e + 1.4, semi, near[0], patch).any()
-    moved = e.copy(); moved[:, 0] -= 2.0
-    assert semicore_patch_escapes(moved, semi, near[0], patch).any()
-    grown = semicore_patch_ev(moved, semi, near[0], previous=patch)
-    assert grown[0] < patch[0] and grown[1] == patch[1]
+    patches = semicore_patches_ev(e, semi, near[0])
+    assert patches == ((-74.0, -69.5, SEMICORE_ETA_EV), (-54.0, -48.0, SEMICORE_ETA_EV))
+    windows = coarse_windows_ev(near[0], patches)
+    joined = joined_grid_ev(near, windows)
+    assert np.all(np.diff(joined) > 0) and joined[0] == -74.0
+    eta, group = window_labels(joined, windows, 0.25)
+    assert set(group[joined < near[0]].tolist()) == {0, 1} and np.all(group[joined >= near[0]] == -1)
+    assert np.all(eta[group >= 0] == SEMICORE_ETA_EV) and np.all(eta[group < 0] == 0.25)
+    # Inside the pad: held.  A read that leaves it: the patch grows, never shrinks.
+    assert not semicore_patch_escapes(e + 1.4, semi, near[0], patches).any()
+    moved = e.copy(); moved[:, 1] -= 2.0
+    assert semicore_patch_escapes(moved, semi, near[0], patches).any()
+    grown = semicore_patches_ev(moved, semi, near[0], previous=patches)
+    assert grown[1][0] < patches[1][0] and grown[1][1] == patches[1][1]
     # The top never enters the near grid.
-    assert semicore_patch_ev(e, semi, -49.0)[1] < -49.0
+    assert semicore_patches_ev(e, semi, -49.0)[-1][1] < -49.0
+
+
+def test_a_user_window_overrides_the_automatic_patch_for_its_states():
+    from gw.qp_support import coarse_windows_ev
+    patches = ((-74.0, -48.0, 1.0),)
+    windows = coarse_windows_ev(-7.0, patches, ((-60.0, -55.0, 0.5),))
+    assert [w[3] for w in windows] == [False, True, False]
+    np.testing.assert_allclose([w[:3] for w in windows], [(-74.0, -60.001, 1.0),
+                               (-60.0, -55.0, 0.5), (-54.999, -48.0, 1.0)], atol=1e-12)
 
 
 def test_a_held_patch_is_clipped_to_a_near_grid_that_grew_into_it():
-    from gw.qp_support import joined_grid_ev, patch_eta_ev, patch_on_grid_ev
-    patch = (-20.0, -9.0, 1.0)                     # planned under a near grid from -8.5
+    from gw.qp_support import coarse_windows_ev, joined_grid_ev, window_labels
+    patch = ((-20.0, -9.0, 1.0),)                  # planned under a near grid from -8.5
     near = np.arange(-12.0, 2.01, 0.25)           # the near grid has since grown to -12
-    joined = joined_grid_ev(near, patch)
+    windows = coarse_windows_ev(near[0], patch)
+    joined = joined_grid_ev(near, windows)
     assert np.all(np.diff(joined) > 0)
-    eta = patch_eta_ev(joined, patch_on_grid_ev(patch, near[0]), 0.25)
+    eta, _ = window_labels(joined, windows, 0.25)
     assert np.all(eta[joined >= near[0]] == 0.25) and np.all(eta[joined < near[0]] == 1.0)
 
 
@@ -316,3 +328,22 @@ def test_the_semicore_patch_route_gate_refuses_a_sector_route():
     other = next(mode for mode in ComputeMode if mode is not ComputeMode.MPA)
     with pytest.raises(ValueError, match="GATE semicore_patch_route"):
         assert_semicore_patch_route(patch, other, None)
+
+
+def test_coarse_window_triples_parse_and_refuse_by_name():
+    from gw.gw_config import DynamicSigmaConfig
+    text = "-12:8, -60:-50:1.0, -40:-30:0.5"
+    assert DynamicSigmaConfig.parse_omega_patches_ev(text, 0.25) == [(-12.0, 8.0)]
+    assert DynamicSigmaConfig.parse_coarse_windows_ev(text, 0.25) == (
+        (-60.0, -50.0, 1.0), (-40.0, -30.0, 0.5))
+    for bad in ("-60:-50:0.1", "-60:-50:x", "-60:-50:1, -55:-45:1", "-50:-60:1"):
+        with pytest.raises(ValueError, match="GATE sigma_coarse_window"):
+            DynamicSigmaConfig.parse_coarse_windows_ev(bad, 0.25)
+
+
+def test_number_bands_protected_refuses_beside_nval_or_ncond():
+    from gw.gw_config import _band_request_form
+    assert _band_request_form({"number_bands_protected": None}, {"nval"}) is None
+    assert _band_request_form({"number_bands_protected": 30}, set()) == 30
+    with pytest.raises(ValueError, match="GATE band_request_forms"):
+        _band_request_form({"number_bands_protected": 30}, {"ncond"})

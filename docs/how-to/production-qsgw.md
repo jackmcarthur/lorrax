@@ -119,13 +119,21 @@ claim 2952) holds the rest of the recipe. It is not on main.
   (`GATE qp_matrix_zeta_left`). Every dynamic SC deck moves once: on Si 4³
   map 0 the ± 10 eV states move +48 meV mean, 167 meV max, all from b3
   (claim 2952).
-- **Semicore patch.** Every occupied state below the lowest requested valence
-  band (`nval`) is coarse and read on one held patch at η_semi = 1 eV; the
-  fine window above it is read at the deck η, and the two may overlap. It reproduces the study legs of claim 2945 on the
-  protected states within 0.69 meV (MoS2) and 0.10 meV (Si) at maps 0–2
-  (claim 2952).
-- **Owner calls.** (a) The patch ε: 1e-2 biases semicore QP by +20 to
-  +32 meV mean; 1e-4 removes the bias for 1095 against 964 τ pairs on Fe,
-  over the 1000-pair metal budget. (b) Fe 4³ map 2 misses 2 meV: at matched
+- **The request.** `number_bands_protected = N` (the documented form): every
+  occupied band plus conduction bands up to N; its semicore (coarse) class is
+  every occupied band below a ≥ 4 eV band gap. `nval` / `ncond` remain; there
+  the coarse class is every occupied state below the lowest requested valence
+  band. Both forms refuse by name. On MoS2 3×3 and Fe 4³ charge the two forms
+  give identical results (claim 2952).
+- **Coarse windows.** Coarse states are read on held windows at η_semi = 1 eV,
+  one per coarse manifold, certified at the deck's `sigma_quadrature_eps`; the
+  Σ plan groups them to the least closed-form node count, which is one window
+  on both decks (MoS2 182 against 349 law nodes split, Fe 247 against 436).
+  `sigma_omega_patches_ev` takes `lo:hi:eta` user windows. Against the
+  semicore-at-deck-η read at map 0: ±10 eV states 0.90 / 3.82 meV std / max
+  (MoS2), 1.30 / 7.87 (Fe); MoS2 gap −0.36 meV (claim 2952).
+- **Owner calls.** (a) Cost of the one ε: at 1e-4 the coarse windows take
+  MoS2 530 against 448 τ pairs per map and Fe 1087 against 959 (over the
+  1000-pair metal budget); splitting does not win it back. (b) Fe 4³ map 2 misses 2 meV: at matched
   ε 1e-4 it is 7.57 meV, with 3 of 172 states over 2 meV and the cause not
   isolated; the fixed points agree within 0.78 meV (claim 2952).

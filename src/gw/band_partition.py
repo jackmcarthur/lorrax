@@ -58,6 +58,12 @@ WINDOW_CLIP_EV = 10.0
 #: manifolds Sigma resolves.
 CUT_GAP_ETAS = 4.0
 CUT_SEARCH_ETAS = 20.0
+#: ``number_bands_protected`` mode only (owner 2026-09-29): an occupied state
+#: is semicore when a band gap at least this wide (eV, all k) separates it from
+#: the valence manifold above.  That request protects every occupied band, so
+#: the class needs its own boundary; 4 eV is 16 deck etas, wide enough that
+#: the coarse patch never reads a band the fine grid resolves.
+SEMICORE_GAP_EV = 4.0
 
 
 class QPBandCut(NamedTuple):
@@ -81,7 +87,8 @@ def band_gaps_ev(energies_ev):
 
 
 def qp_band_cut(energies_ev, *, n_below_k, nval, ncond, mu_ev, clip_ev, cut_gap_ev,
-                cut_search_ev, omega_min_rel_ev=None, omega_max_rel_ev=None, b_max=None):
+                cut_search_ev, omega_min_rel_ev=None, omega_max_rel_ev=None, b_max=None,
+                n_protected=None, semicore_gap_ev=None):
     """Absolute band cut from the DFT ladder, decided before the ζ fit (owner, 2026-09-28).
 
     ``energies_ev`` (nk, nb) absolute eV on the loaded k set; ``n_below_k`` the
@@ -110,6 +117,10 @@ def qp_band_cut(energies_ev, *, n_below_k, nval, ncond, mu_ev, clip_ev, cut_gap_
        decides it, and a deck whose ``nval`` covers every occupied band has
        none.  Energy-based, so a coarse state inside the fine grid's lower
        pad reads the fine grid (the two windows may overlap).
+       With ``n_protected`` (``number_bands_protected``) the request is bands
+       [0, n_protected) at every k and the coarse class is instead every
+       occupied band below a band gap of at least ``semicore_gap_ev`` under
+       the requested bands within the clip (none without such a gap).
     Requested states above b3 are the tail: DFT ψ, the rigid conduction
     scissor, no Σ. O(nk nb).
     """
@@ -118,8 +129,12 @@ def qp_band_cut(energies_ev, *, n_below_k, nval, ncond, mu_ev, clip_ev, cut_gap_
     below = np.broadcast_to(np.asarray(n_below_k, int), (nk,))
     mu = float(mu_ev)
     idx = np.arange(nb)[None, :]
-    lo_req = np.maximum(below - int(nval), 0)[:, None]
-    hi_req = np.minimum(below + int(ncond), nb)[:, None]
+    if n_protected is None:
+        lo_req = np.maximum(below - int(nval), 0)[:, None]
+        hi_req = np.minimum(below + int(ncond), nb)[:, None]
+    else:
+        lo_req = np.zeros((nk, 1), int)
+        hi_req = np.full((nk, 1), min(int(n_protected), nb))
     requested = (idx >= lo_req) & (idx < hi_req)
     within = requested & (np.abs(e - mu) <= float(clip_ev))
     if not within.any():
@@ -160,10 +175,16 @@ def qp_band_cut(energies_ev, *, n_below_k, nval, ncond, mu_ev, clip_ev, cut_gap_
         cut = 0.5 * (gap[0] + gap[1])
     else:
         gap, cut = (float(e[:, nb - 1].max()), np.inf), np.inf
-    lowest = np.clip(below - int(nval), 0, nb - 1)
-    floor = float(np.min(e[np.arange(nk), lowest]))
-    if omega_min_rel_ev is not None:
-        floor = min(floor, mu + float(omega_min_rel_ev))
+    if n_protected is None:
+        lowest = np.clip(below - int(nval), 0, nb - 1)
+        floor = float(np.min(e[np.arange(nk), lowest]))
+        if omega_min_rel_ev is not None:
+            floor = min(floor, mu + float(omega_min_rel_ev))
+    else:
+        req_lo = int(np.min(np.where(within, idx, nb)))
+        semi = [n for n in range(1, min(int(below.min()), req_lo) + 1)
+                if width[n - 1] >= float(semicore_gap_ev)]
+        floor = float(gap_hi[semi[-1] - 1]) if semi else -np.inf
     n_coarse = int(np.count_nonzero(e < floor))
     n_tail = int(np.count_nonzero(requested & (idx >= b3)))
     return QPBandCut(floor if n_coarse else -np.inf, n_coarse, b3, float(cut), gap, top, n_tail)

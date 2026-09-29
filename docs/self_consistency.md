@@ -127,7 +127,7 @@ energies, so it takes these dipoles at the same diagonal approximation.
 | bands | block of $H'$ |
 |---|---|
 | the QP matrix `[0, b3)` = the ζ fit's left range | full $\Sigma^{\rm QSGW}$, off-diagonals kept within the matrix |
-| its coarse (semicore) states, occupied and below the lowest requested valence band | full rows, read at their own energy on one held patch at $\eta_{\rm semi}$ = 1 eV (below) |
+| its coarse (semicore) states (below) | full rows, read at their own energy on held coarse windows at $\eta_{\rm semi}$ = 1 eV |
 | the lowest `sc_frozen_core_bands` | held at the DFT block $\mathrm{diag}(E_{\rm DFT})$; they stay in the $\Sigma_x$ and $\chi_0$ sums |
 | the scissored tail `[b3, number_bands)` | DFT orbitals with an energy-only rigid shift, refit every map, in G and $\chi_0$ only: the $Z$-weighted mean QP correction of the matrix's conduction states that read their own $\Sigma(E)$ (below) |
 
@@ -146,31 +146,42 @@ state outside the fit would carry Σ on unfitted pairs. Above $E_F$ a dispersive
 the cost is the dropped Σ coupling to those tail bands (TWOCLASS, CLAIMS
 2945).
 
-**Semicore (the coarse class).** The fine window, read at the deck η, runs
-down to the minimum energy of the lowest requested valence band
-(`nelec − nval` at each k, the count below μ on a metal; `sigma_omega_min_ev`
-only lowers it). Every occupied state below that energy is coarse (owner,
-2026-09-29). No gap threshold decides it; a deck whose `nval` covers every
-occupied band has none. The rule is energy-based, so a coarse state inside
-the fine grid's lower pad reads the fine grid: the two windows may overlap.
-A coarse state stays in the matrix and mixes fully, but its Σ is read on one
-patch of the grid below the near support, at $\eta_{\rm semi}$ = 1 eV,
-sampled at $\eta_{\rm semi}/2$ (`qp_support.SEMICORE_*`). Only the crossing
-windows that own patch samples take $\eta_{\rm semi}$; the sign-definite
-windows serve those samples at the deck $\eta$, where the node count barely
-depends on $\eta$. The crossing windows are certified at $10^{-2}$, an owner
-call not yet settled (a second ε beside `sigma_quadrature_eps`): against
-$10^{-4}$ on Fe 4³ charge SC it biases the semicore QP by +20 to +32 meV
-(mean), moves the ±10 eV states by up to 8 meV at map 2 (the first Anderson
-step) and 0.44 meV at the fixed point, while $10^{-4}$ costs 1095 against 964
-τ pairs per map, over the 1000-pair metal budget (CLAIMS 2952). The patch is planned at map 0 over the semicore
-DFT energies with the plan's 2 eV pad and held; a semicore read that leaves
-it extends it, as the near support is extended. At the deck $\eta$ the Fe 3s
-$Z$ leaves $(0, 1]$ from map 1 and the loop stalls; at 1 eV every semicore
-$Z$ stays inside (one `SC semicore Z` receipt per map). Its systematic is
+**The request and the coarse (semicore) class.** Two exclusive forms name the
+QP request; giving both refuses (`GATE band_request_forms`).
+
+- `number_bands_protected = N` (the documented form, owner 2026-09-29): every
+  occupied band plus conduction bands up to N in total. The coarse class is
+  every occupied band below a band gap of at least
+  `band_partition.SEMICORE_GAP_EV` = 4 eV (all k) under the requested bands
+  within μ ± 10 eV; none without such a gap.
+- `nval` / `ncond`: the fine window, read at the deck η, runs down to the
+  minimum energy of the lowest requested valence band (`nelec − nval` at each
+  k, the count below μ on a metal; `sigma_omega_min_ev` only lowers it), and
+  every occupied state below that energy is coarse. A deck whose `nval`
+  covers every occupied band has none. The rule is energy-based, so a coarse
+  state inside the fine grid's lower pad reads the fine grid.
+
+A coarse state stays in the matrix and mixes fully, but its Σ is read at its
+own energy on coarse windows of the grid below the near support. The
+automatic windows are one per coarse manifold (levels separated by a global
+gap wider than twice the 2 eV plan pad), at $\eta_{\rm semi}$ = 1 eV, sampled
+at $\eta_{\rm semi}/2$ (`qp_support.SEMICORE_*`), planned at map 0 over the
+coarse DFT energies and held; a coarse read that leaves them extends them, as
+the near support is extended. `sigma_omega_patches_ev` triples `lo:hi:eta`
+(eV about E_F) are user windows: the coarse states inside one read it at its
+own η instead (`GATE sigma_coarse_window` refuses a malformed, overlapping or
+sub-deck-η triple, or one without a coarse class). In the Σ plan the
+crossing windows that own coarse samples serve them at the window's η and
+the deck's `sigma_quadrature_eps` (one ε, owner 2026-09-26); adjacent
+automatic windows of one η share a rule window when that lowers the summed
+closed-form node count (`sigma_box_plan._coarse_runs`, decided at map 0 and
+held); a user window is never grouped; sign-definite windows serve coarse
+samples at the deck η. At the deck η the Fe 3s $Z$ leaves $(0, 1]$ from map 1
+and the loop stalls; at 1 eV the coarse $Z$ stays inside except the Fe 3s at
+maps 1–2 (one `SC semicore Z` receipt per map). The η_semi systematic is
 reported apart from the 1 meV budget of the controllable errors. Only the
-scalar MPA/shared-pole Σ reads the patch; a sector (bispinor) route keeps
-the rule below.
+scalar MPA/shared-pole Σ reads coarse windows; a sector (bispinor) route
+keeps the rule below.
 
 Every other matrix band is protected: under the default `sigma_out_of_grid =
 cover` it reads Σ at its own energy, and the grid grows over it; on a route

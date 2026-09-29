@@ -2653,9 +2653,10 @@ class SCSupport(NamedTuple):
     envelope: tuple | None     # R's envelope since the last plan, eV
     no_qp: np.ndarray          # requested identities dropped for Z outside (0, 1]
     semicore: np.ndarray | None = None   # semicore identities (read on the patch)
-    patch: tuple | None = None           # the held semicore patch (lo, hi, eta), eV
+    patch: tuple | None = None           # the held automatic patches ((lo, hi, eta), ...), eV
     patch_event: str = ""                # plan | hold | extend
-    joined: np.ndarray | None = None     # patch samples + the near grid: what Sigma samples
+    joined: np.ndarray | None = None     # coarse-window samples + the near grid: what Sigma samples
+    windows: tuple = ()                  # this map's coarse windows (lo, hi, eta, user), eV
 
 
 def _sc_coarse_identities(inputs, shape):
@@ -2734,23 +2735,31 @@ def _sc_sampled_support(inputs, partition, energies_loop, mu_ev, active_n=None,
         grid, envelope, event = hold_support_ev(
             sigma, requested, sampled_grid, session.get("support_envelope_ev"),
             energy_relative_ev, states)
-    patch, patch_event = None, ""
+    patch, patch_event, windows = None, "", ()
+    users = getattr(sigma, "coarse_windows_ev", tuple)()
+    if users and not n_semi:
+        raise ValueError(
+            "GATE sigma_coarse_window: sigma_omega_patches_ev lo:hi:eta windows serve the "
+            "SC coarse (semicore) class on the scalar MPA/shared-pole route, and this run "
+            "has none.")
     if n_semi:
-        from .qp_support import semicore_patch_escapes, semicore_patch_ev
+        from .qp_support import (_inside_any, coarse_windows_ev, semicore_patch_escapes,
+                                 semicore_patches_ev)
         near_lo = float(grid[0])
-        held = None if session is None else session.get("semicore_patch_ev")
+        auto = semicore & ~_inside_any(energy_relative_ev, users)
+        held = None if session is None else session.get("semicore_patches_ev")
         if plan is None or held is None:
-            patch, patch_event = semicore_patch_ev(
-                energy_relative_ev, semicore, near_lo), "plan"
-        elif semicore_patch_escapes(energy_relative_ev, semicore, near_lo, held).any():
-            patch, patch_event = semicore_patch_ev(
-                energy_relative_ev, semicore, near_lo, previous=held), "extend"
+            patch, patch_event = semicore_patches_ev(energy_relative_ev, auto, near_lo), "plan"
+        elif semicore_patch_escapes(energy_relative_ev, semicore, near_lo, held, users).any():
+            patch, patch_event = semicore_patches_ev(
+                energy_relative_ev, auto, near_lo, previous=held), "extend"
         else:
             patch, patch_event = held, "hold"
+        windows = coarse_windows_ev(near_lo, patch, users)
     from .qp_support import joined_grid_ev
     return SCSupport(sampled_grid, grid, energy_relative_ev, states, event,
                      envelope, no_qp, semicore, patch, patch_event,
-                     joined_grid_ev(grid, patch))
+                     joined_grid_ev(grid, windows), windows)
 
 
 def _record_sc_window_plan(inputs, iteration, support):
@@ -3942,19 +3951,18 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
             session["omega_grid_ev"] = tuple(float(x) for x in expanded_grid)
             session["window_plan"] = {
                 "event": event, "iteration": int(state.iteration)}
-            session["semicore_patch_ev"] = sc_support.patch
-        if sc_support.patch is not None and sc_support.patch_event != "hold":
-            _lo, _hi, _eta = sc_support.patch
-            _record_sc(inputs, f"    SC semicore patch ({sc_support.patch_event}, map "
-                       f"{int(state.iteration)}): [{_lo:+.2f}, {_hi:+.2f}] eV at eta "
-                       f"{_eta:g} eV below the near grid [{expanded_grid[0]:+.2f}, "
+            session["semicore_patches_ev"] = sc_support.patch
+        if sc_support.windows and sc_support.patch_event != "hold":
+            _record_sc(inputs, f"    SC coarse windows ({sc_support.patch_event}, map "
+                       f"{int(state.iteration)}): " + ", ".join(
+                           f"[{w[0]:+.2f}, {w[1]:+.2f}]@{w[2]:g}{' user' if w[3] else ''}"
+                           for w in sc_support.windows)
+                       + f" eV below the near grid [{expanded_grid[0]:+.2f}, "
                        f"{expanded_grid[-1]:+.2f}] eV; {int(sc_support.semicore.sum())} "
                        "coarse (k,state) keep their full Sigma rows")
-        from .qp_support import patch_on_grid_ev
         sigma_config = replace(
             inputs.config, sc_omega_grid_ev=tuple(float(x) for x in sc_support.joined),
-            sc_semicore_patch_ev=(None if sc_support.patch is None else
-                                  patch_on_grid_ev(sc_support.patch, expanded_grid[0])))
+            sc_coarse_windows_ev=tuple(sc_support.windows) or None)
     sigma_result = compute_sigma_xc(
         inputs.config.compute_mode,
         occupation_state=metal_occ_state,
@@ -4196,7 +4204,7 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
         z_sorted = _sc_z_factors(inputs, state_out, energies_loop)
         state_out = replace(state_out, tail_z_kn=np.take_along_axis(
             np.asarray(z_sorted, dtype=np.float64), indices_loop, axis=1))
-        if sc_support is not None and sc_support.patch is not None:
+        if sc_support is not None and sc_support.windows:
             _record_semicore_z(inputs, int(state.iteration), state_out.tail_z_kn,
                                sc_support.semicore)
     _record_sc_map_stages(inputs, state.iteration, _map_started,

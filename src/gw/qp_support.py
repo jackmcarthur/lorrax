@@ -237,88 +237,127 @@ def hold_support_ev(sigma, deck_grid_ev, held_grid_ev, held_envelope,
 #: the controllable errors.  At the deck eta the Fe 3s Z leaves (0, 1] from
 #: map 1 and the reference stalls (TWOCLASS, claim 2945).
 SEMICORE_ETA_EV = 1.0
-#: Certificate tolerance of the patch's split windows.  A patch window's node
-#: count is set by its short side over eta, not its pole range (158 -> 90
-#: nodes at 1e-2 on the TWOCLASS decks).  OWNER CALL, not settled: it is a
-#: second eps beside ``sigma_quadrature_eps``.  Measured against 1e-4 on
-#: Fe 4^3 charge SC (claim 2952): it biases the semicore QP by +20 to +32 meV
-#: (mean), moves the +-10 eV states by up to 8 meV at map 2 (the first
-#: Anderson step) and 0.44 meV at the fixed point; 1e-4 costs 1095 against
-#: 964 tau pairs per map on Fe, over the 1000-pair metal budget.
-SEMICORE_PATCH_EPS = 1.0e-2
 #: Patch sampling step (eV): eta_semi / 2 resolves the broadened Sigma.
 SEMICORE_PATCH_STEP_EV = 0.5 * SEMICORE_ETA_EV
-#: The patch's top sample stays this far (eV) below the near grid's bottom,
-#: so the joined grid ascends strictly with no uncovered sliver.
+#: A patch's top sample stays this far (eV) below the near grid's bottom (and
+#: an automatic patch this far outside a user window), so the joined grid
+#: ascends strictly with no uncovered sliver.
 SEMICORE_PATCH_EDGE_EV = 1.0e-3
+# The patch windows are certified at the deck's sigma_quadrature_eps (owner's
+# one-eps rule, 2026-09-29); there is no patch tolerance of its own.
 
 
-def semicore_patch_ev(energy_rel_ev, semicore_kn, near_lo_ev, *, pad_ev=SUPPORT_PAD_EV,
-                      previous=None):
-    """The held patch ``(lo, hi, eta)`` over every semicore energy below the near grid.
+def _snap(lo, hi, step):
+    return float(np.floor(lo / step) * step), float(np.ceil(hi / step) * step)
 
-    ``[min E - pad, max E + pad]`` of the masked energies below ``near_lo_ev``,
-    snapped outward to SEMICORE_PATCH_STEP_EV, its top clipped
-    SEMICORE_PATCH_EDGE_EV under ``near_lo_ev`` and joined with ``previous``
-    (a patch only grows).  None when no semicore state lies below the near
-    grid.
+
+def semicore_patches_ev(energy_rel_ev, semicore_kn, near_lo_ev, *, pad_ev=SUPPORT_PAD_EV,
+                        previous=()):
+    """The held automatic patches, one per coarse manifold: ``((lo, hi, eta), ...)``.
+
+    Each masked energy below the near grid is padded by ``pad_ev``; padded
+    intervals that touch merge, so the manifolds are the coarse levels
+    separated by global gaps wider than twice the pad.  Each is snapped
+    outward to SEMICORE_PATCH_STEP_EV, joined with ``previous`` (a patch only
+    grows) and its top kept SEMICORE_PATCH_EDGE_EV under ``near_lo_ev``.
+    How manifolds share Sigma rule windows is the planner's choice
+    (``sigma_box_plan.plan_sigma_windows``, the closed-form node law).
     """
     e = np.asarray(energy_rel_ev, float)[np.asarray(semicore_kn, bool)]
-    e = e[e < float(near_lo_ev)]
-    if e.size == 0:
-        return previous
+    e = np.sort(e[e < float(near_lo_ev)])
     step, pad = SEMICORE_PATCH_STEP_EV, float(pad_ev)
-    lo = float(np.floor((e.min() - pad) / step) * step)
-    hi = float(np.ceil((e.max() + pad) / step) * step)
-    if previous is not None:
-        lo, hi = min(lo, float(previous[0])), max(hi, float(previous[1]))
-    hi = min(hi, float(near_lo_ev) - SEMICORE_PATCH_EDGE_EV)
-    return (lo, hi, float(SEMICORE_ETA_EV))
+    spans = [_snap(x - pad, x + pad, step) for x in e] + [
+        (float(p[0]), float(p[1])) for p in (previous or ())]
+    merged = []
+    for lo, hi in sorted(spans):
+        if merged and lo <= merged[-1][1]:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], hi))
+        else:
+            merged.append((lo, hi))
+    top = float(near_lo_ev) - SEMICORE_PATCH_EDGE_EV
+    return tuple((lo, min(hi, top), float(SEMICORE_ETA_EV)) for lo, hi in merged if lo < top)
 
 
-def semicore_patch_escapes(energy_rel_ev, semicore_kn, near_lo_ev, patch):
-    """Semicore states below the near grid whose read support [E-h, E+h] leaves the patch."""
+def _inside_any(e, windows):
+    inside = np.zeros(np.shape(e), bool)
+    for w in windows or ():
+        inside |= (e >= float(w[0])) & (e <= float(w[1]))
+    return inside
+
+
+def semicore_patch_escapes(energy_rel_ev, semicore_kn, near_lo_ev, patches, user_windows=()):
+    """Coarse states below the near grid, outside every user window, whose read
+    support [E-h, E+h] leaves the automatic patches.  A patch top that abuts
+    the near grid is open: its stencil reads the near grid."""
     e = np.asarray(energy_rel_ev, float)
     h = read_halfwidth_ev()
-    below = np.asarray(semicore_kn, bool) & (e < float(near_lo_ev))
-    if patch is None:
-        return below
-    lo, hi = float(patch[0]), float(patch[1])
-    # The top leaves only while the patch does not yet abut the near grid.
-    open_top = hi < float(near_lo_ev) - 2.0 * SEMICORE_PATCH_EDGE_EV
-    return below & ((e - h < lo) | ((e + h > hi) & open_top))
+    below = (np.asarray(semicore_kn, bool) & (e < float(near_lo_ev))
+             & ~_inside_any(e, user_windows))
+    ok = np.zeros(e.shape, bool)
+    for lo, hi, _ in patches or ():
+        abuts = float(hi) >= float(near_lo_ev) - 2.0 * SEMICORE_PATCH_EDGE_EV
+        ok |= (e - h >= float(lo)) & ((e + h <= float(hi)) | (abuts & (e <= float(hi))))
+    return below & ~ok
 
 
 def patch_on_grid_ev(patch, near_lo_ev):
-    """The held patch as sampled on this map: its top clipped below the near grid.
-
-    A held patch keeps its planned top; the near grid may since have grown
-    down into it, and there the near grid (deck eta) reads.
-    """
+    """A held window as sampled on this map: its top clipped below the near grid."""
     return (float(patch[0]), min(float(patch[1]), float(near_lo_ev) - SEMICORE_PATCH_EDGE_EV),
             float(patch[2]))
 
 
-def patch_grid_ev(patch, near_lo_ev):
-    """The patch's samples at SEMICORE_PATCH_STEP_EV, strictly below the near grid."""
-    lo, hi = patch_on_grid_ev(patch, near_lo_ev)[:2]
-    n = int(np.ceil((hi - lo) / SEMICORE_PATCH_STEP_EV - 1e-9)) + 1
+def coarse_windows_ev(near_lo_ev, patches, user_windows=()):
+    """The coarse windows of this map, ascending: ``((lo, hi, eta, fixed), ...)``.
+
+    User windows (``sigma_omega_patches_ev`` triples) are fixed; an automatic
+    patch is clipped below the near grid and outside every user window, and
+    may split around one.  ``fixed`` windows are never grouped with another.
+    """
+    edge = SEMICORE_PATCH_EDGE_EV
+    users = sorted((float(u[0]), float(u[1]), float(u[2])) for u in (user_windows or ()))
+    out = [(lo, min(hi, float(near_lo_ev) - edge), eta, True) for lo, hi, eta in users
+           if lo < float(near_lo_ev) - edge]
+    for p in patches or ():
+        pieces = [patch_on_grid_ev(p, near_lo_ev)[:2]]
+        for u_lo, u_hi, _ in users:
+            cut = []
+            for lo, hi in pieces:
+                if hi < u_lo - edge or lo > u_hi + edge:
+                    cut.append((lo, hi))
+                    continue
+                if lo < u_lo - edge:
+                    cut.append((lo, u_lo - edge))
+                if hi > u_hi + edge:
+                    cut.append((u_hi + edge, hi))
+            pieces = cut
+        out += [(lo, hi, float(p[2]), False) for lo, hi in pieces if hi > lo]
+    return tuple(sorted(out))
+
+
+def window_grid_ev(window):
+    """One coarse window's samples at eta/2, ending exactly at its top."""
+    lo, hi, eta = float(window[0]), float(window[1]), float(window[2])
+    n = int(np.ceil((hi - lo) / (0.5 * eta) - 1e-9)) + 1
     return np.linspace(lo, hi, max(n, 2))
 
 
-def joined_grid_ev(near_grid_ev, patch):
-    """The sampled Sigma support: the patch's samples, then the near grid."""
+def joined_grid_ev(near_grid_ev, windows):
+    """The sampled Sigma support: every coarse window's samples, then the near grid."""
     near = np.asarray(near_grid_ev, dtype=np.float64)
-    if patch is None:
+    if not windows:
         return near
-    return np.concatenate((patch_grid_ev(patch, near[0]), near))
+    return np.concatenate([window_grid_ev(w) for w in windows] + [near])
 
 
-def patch_eta_ev(omega_ev, patch, eta_ev):
-    """Per-sample broadening (eV): the patch's eta on its samples, ``eta_ev`` elsewhere."""
+def window_labels(omega_ev, windows, eta_ev):
+    """Per sample: its broadening (eV) and its coarse window index (-1 = near grid)."""
     w = np.asarray(omega_ev, dtype=np.float64)
-    inside = (w >= float(patch[0]) - 1e-9) & (w <= float(patch[1]) + 1e-9)
-    return np.where(inside, float(patch[2]), float(eta_ev))
+    eta = np.full(w.shape, float(eta_ev))
+    group = np.full(w.shape, -1, dtype=np.int64)
+    for g, win in enumerate(windows or ()):
+        inside = (w >= float(win[0]) - 1e-9) & (w <= float(win[1]) + 1e-9)
+        eta[inside], group[inside] = float(win[2]), g
+    return eta, group
 
 
 def semicore_patch_route(compute_mode, wfns_transverse):

@@ -675,7 +675,7 @@ def _serve_from_plan(specs, fits, eps):
     served = []
     for spec, own in zip(specs, fits):
         chosen = own
-        spec_eps = _spec_eps(spec, eps)
+        spec_eps = eps
         if not own["analytic_line"]:
             box = spec["box"]
             relative = box[0] > 0.0 or box[1] < 0.0
@@ -704,16 +704,9 @@ def _serve_from_plan(specs, fits, eps):
 
 
 def _spec_eta(spec, eta):
-    """A window's own broadening (Ry): the semicore patch's split windows carry
-    ``eta_ry`` (:func:`plan_sigma_windows` ``omega_eta_ry``), every other one
-    the plan's."""
+    """A window's own broadening (Ry): a coarse window carries ``eta_ry``
+    (:func:`plan_sigma_windows` ``omega_eta_ry``), every other one the plan's."""
     return float(spec.get("eta_ry", eta))
-
-
-def _spec_eps(spec, eps):
-    """A window's own certificate tolerance: the semicore patch's split windows
-    carry ``eps`` (``qp_support.SEMICORE_PATCH_EPS``), every other one the plan's."""
-    return float(spec.get("eps", eps))
 
 
 def _fit_cost(spec, eta):
@@ -832,7 +825,7 @@ def fit_sigma_box_spec_groups(groups, eta_ry, *, eps, scope):
         raise ValueError("sigma_quadrature_eps must lie in (0, 1)")
     fits, fit_rows = _parallel_fits(
         rows, lambda index: _fit_rule(
-            rows[index], _spec_eps(rows[index], tolerance), scope,
+            rows[index], tolerance, scope,
             _spec_eta(rows[index], eta), build_widen=widen[index]),
         [_fit_cost(spec, _spec_eta(spec, eta)) for spec in rows])
     # Every rank has looked up by now (the gather above) and holds the same
@@ -1295,6 +1288,84 @@ def sigma_box_executor_nodes(
         alpha=jnp.asarray(alpha_exec, dtype=jnp.complex128))
 
 
+def _coarse_runs(base_name, owned, positions, frequencies, omega_eta, omega_grp, fixed,
+                 states, pole_stats, pole_sign, eta, eps, held_rules):
+    """How one product window serves the coarse (semicore) windows it owns.
+
+    Returns ``([(suffix, owned indices, eta), ...], report)``.  Near samples
+    keep the plan's eta.  On a crossing window the coarse windows are grouped
+    into runs of adjacent automatic windows of one eta (a user window is a run
+    of its own); the grouping minimizes the summed closed-form node count
+    (:func:`_law_node_count` of each run's box at ``eps``), fewer runs on a
+    tie.  At SC map 0 the choice is made and the held rule names carry it
+    later.  A sign-definite window serves everything at ``eta``.  O(G^2) laws.
+    """
+    grp = omega_grp[positions[owned]]
+    if not np.any(grp >= 0):
+        return [("", owned, eta)], None
+    near = owned[grp < 0]
+    pieces = [("", near, eta)] if near.size else []
+    prefix = base_name + "@"
+    held = (None if held_rules is None
+            else sorted(k[len(prefix):] for k in held_rules if k.startswith(prefix)))
+    crossing = make_sigma_box_spec(
+        name=base_name, frequencies=frequencies[owned], states=states,
+        pole_stats=pole_stats, pole_sign=pole_sign, eta_ry=eta)["kind"] == "crossing"
+    if (held is None and not crossing) or (held is not None and not held):
+        return [("", owned, eta)], None
+    groups = sorted(set(int(g) for g in grp[grp >= 0]))
+    eta_of = {g: float(omega_eta[positions[owned[grp == g]]][0]) for g in groups}
+
+    def box_law(run):
+        idx = owned[np.isin(grp, run)]
+        spec = make_sigma_box_spec(name=base_name, frequencies=frequencies[idx], states=states,
+                                   pole_stats=pole_stats, pole_sign=pole_sign,
+                                   eta_ry=eta_of[run[0]])
+        return _law_node_count(spec["box"], eps)
+
+    if held is not None:
+        runs = []
+        for key in held:
+            a, b = (int(x) for x in key.split("g", 1)[1].split("-"))
+            run = [g for g in groups if a <= g <= b]
+            if run:
+                runs.append(run)
+        runs += [[g] for g in groups if not any(g in r for r in runs)]
+    else:
+        n = len(groups)
+        best = [(0, 0, None)] + [None] * n          # (law, run count, previous cut)
+        for j in range(1, n + 1):
+            for i in range(j, 0, -1):
+                run = groups[i - 1:j]
+                if (len(run) > 1 and (any(fixed[g] for g in run if g < len(fixed))
+                                      or len({eta_of[g] for g in run}) > 1
+                                      or run[-1] - run[0] != len(run) - 1)):
+                    break
+                cand = (best[i - 1][0] + box_law(run), best[i - 1][1] + 1, i - 1)
+                if best[j] is None or cand[:2] < best[j][:2]:
+                    best[j] = cand
+        runs, j = [], n
+        while j > 0:
+            i = best[j][2]
+            runs.append(groups[i:j])
+            j = i
+        runs.reverse()
+    for run in runs:
+        idx = owned[np.isin(grp, run)]
+        pieces.append((f"@eta{eta_of[run[0]] * RYD_TO_EV:.3g}g{run[0]}-{run[-1]}", idx,
+                       eta_of[run[0]]))
+    report = None
+    if held is None:
+        one = (box_law(groups) if len({eta_of[g] for g in groups}) == 1
+               and not any(fixed[g] for g in groups if g < len(fixed)) else None)
+        report = {"window": base_name, "coarse_windows": len(groups),
+                  "one_window_law": one,
+                  "per_window_law": int(sum(box_law([g]) for g in groups)),
+                  "runs": [list(r) for r in runs],
+                  "chosen_law": int(sum(box_law(r) for r in runs))}
+    return pieces, report
+
+
 def plan_sigma_windows(
     pole_summaries,
     branches,
@@ -1312,7 +1383,8 @@ def plan_sigma_windows(
     certificate_pole_summaries=None,
     occupation_reach_ry=None,
     omega_eta_ry=None,
-    split_eps=None,
+    omega_group=None,
+    group_fixed=None,
 ):
     """Build the complete MPA Sigma quadrature from raw support boxes.
 
@@ -1368,16 +1440,19 @@ def plan_sigma_windows(
         ``-X`` in its own coordinate, so the SC plan clips a crossing window's
         inner state pad there.  None (an insulator) leaves the 2 eta pad.
         Used only with ``fixed_rule_session``.
-    omega_eta_ry, split_eps
+    omega_eta_ry, omega_group, group_fixed
         Optional per-frequency broadening (one value >= ``eta_ry`` per
-        ``omega_ry`` sample; the SC semicore patch, ``gw.qp_support``) and
-        the tolerance of the windows it splits off.  A crossing product
-        window whose frequencies carry two etas is split in two, each with
-        its own box, rule and executor weights; a sign-definite one serves
-        every frequency it owns at ``eta_ry`` (its node count barely depends
-        on eta).  In an SC run the split is decided at map 0 and held, so a
-        moving pole never adds a window.  State and pole edges stay at
-        ``eta_ry``.
+        ``omega_ry`` sample), coarse-window index (-1 = the near grid) and,
+        per index, whether the window is a user's (``gw.qp_support``,
+        the SC semicore class).  A crossing product window that owns coarse
+        samples serves them in their own windows at their own eta, at the
+        plan's eps: :func:`_coarse_runs` groups adjacent automatic windows of
+        one eta so that the closed-form node count (:func:`_law_node_count`)
+        is least; a user window is never grouped.  A sign-definite product
+        window serves every frequency it owns at ``eta_ry`` (its node count
+        barely depends on eta).  In an SC run the grouping is decided at map
+        0 and held, so a moving pole never adds a window.  State and pole
+        edges stay at ``eta_ry``.
 
     Returns
     -------
@@ -1443,6 +1518,10 @@ def plan_sigma_windows(
         if (omega_eta.shape != omega_grid.shape or not np.isfinite(omega_eta).all()
                 or np.any(omega_eta < eta * (1.0 - 1.0e-12))):
             raise ValueError("omega_eta_ry must give one finite eta >= eta_ry per frequency")
+    omega_grp = (np.full(omega_grid.shape, -1, np.int64) if omega_group is None
+                 else np.asarray(omega_group, dtype=np.int64).reshape(-1))
+    fixed = tuple(bool(x) for x in (group_fixed or ()))
+    split_reports = []
     held_rules = (None if fixed_rule_session is None
                   else fixed_rule_session.get("rules"))
     state_rows, geometry = _product_geometry(branch_rows, eta, edge)
@@ -1476,30 +1555,20 @@ def plan_sigma_windows(
                 continue
             states = raw_energy[local]
             owned_all = owned
-            owned_eta = (np.full(owned_all.size, eta) if omega_eta is None
-                         else omega_eta[positions[owned_all]])
             base_name = f"{branch.tag}:{name}"
-            if np.unique(owned_eta).size > 1 and not (
-                    make_sigma_box_spec(
-                        name=base_name, frequencies=frequencies[owned_all],
-                        states=states, pole_stats=pole_stats,
-                        pole_sign=pole_sign, eta_ry=eta)["kind"] == "crossing"
-                    if held_rules is None else
-                    any(key.startswith(base_name + "@eta") for key in held_rules)):
-                owned_eta = np.full(owned_all.size, eta)
-            for eta_w in np.unique(owned_eta):
-                owned = owned_all[owned_eta == eta_w]
+            pieces, split_report = _coarse_runs(
+                base_name, owned_all, positions, frequencies, omega_eta, omega_grp, fixed,
+                states, pole_stats, pole_sign, eta, tolerance, held_rules)
+            if split_report is not None:
+                split_reports.append(split_report)
+            for suffix, owned, eta_w in pieces:
                 eta_w = float(eta_w)
-                split = eta_w != eta
                 spec = make_sigma_box_spec(
-                    name=base_name + (f"@eta{eta_w * RYD_TO_EV:.3g}" if split else ""),
-                    frequencies=frequencies[owned],
+                    name=base_name + suffix, frequencies=frequencies[owned],
                     states=states, pole_stats=pole_stats,
                     pole_sign=pole_sign, eta_ry=eta_w)
-                if split:
+                if eta_w != eta:
                     spec["eta_ry"] = eta_w
-                    if split_eps is not None:
-                        spec["eps"] = float(split_eps)
                 if certificate_pole_summaries is not None:
                     _, union_stats = _pole_rows(certificate_pole_summaries, selector)
                     union = (make_sigma_box_spec(
@@ -1605,8 +1674,8 @@ def plan_sigma_windows(
             "node_digest": fit["node_digest"],
             "criterion": ("relative" if fit["relative"]
                           else "peak-relative"),
-            "sup_error": fit["sup_error"], "eps": _spec_eps(spec, tolerance),
-            "requested_eps": _spec_eps(spec, tolerance),
+            "sup_error": fit["sup_error"], "eps": tolerance,
+            "requested_eps": tolerance,
             "eta_ry": _spec_eta(spec, eta),
             "kappa_max": fit["kappa_max"],
             "roundoff_amplification": fit["roundoff_amplification"],
@@ -1644,6 +1713,7 @@ def plan_sigma_windows(
         "critical_fit_wall_seconds": max(
             (row["wall_seconds"] for row in fit_rows), default=0.0),
         "branches": branch_reports,
+        "coarse_window_split": split_reports,
     })
     if fixed_rule_session is not None:
         geometry.update({

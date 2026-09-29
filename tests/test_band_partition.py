@@ -155,3 +155,11 @@ def test_coarse_class_follows_nval_and_omega_min_only_lowers_the_floor():
     assert _cut(e, nval=1).n_coarse == 4              # bands 0 and 1 are coarse
     assert _cut(e, nval=1, omega_min_rel_ev=-5.0).n_coarse == 2
     assert _cut(e, nval=1, omega_min_rel_ev=-0.5).n_coarse == 4
+
+
+def test_number_bands_protected_requests_every_occupied_band_and_splits_semicore_by_gap():
+    row = [-30.0, -3.0, -1.0, 1.0, 2.0, 4.0, 4.1, 4.2]
+    e = np.array([row, [x + 0.05 for x in row]])
+    cut = _cut(e, n_protected=5, semicore_gap_ev=4.0)
+    assert cut.b3 == 5 and cut.n_coarse == 2          # band 0, below the 27 eV gap
+    assert _cut(e, n_protected=5, semicore_gap_ev=30.0).n_coarse == 0   # no such gap

@@ -16,14 +16,22 @@ route) moves once. See [self-consistency §2](docs/self_consistency.md#2-band-tr
   38 → 44 (no tail), Fe 4³ charge 26 → 26, Na 8³ 86 → 10. Requested states
   above the cut become scissored tail (DFT ψ, rigid shift, no Σ); the log
   counts them. A need above `zeta_nband` refuses (`GATE qp_band_cut_zeta`).
-- **Semicore moves to a patch.** Every occupied state below the minimum
-  energy of the lowest requested valence band (`nval` counts down from E_F at
-  each k) is coarse: on the scalar MPA/shared-pole route it is read at its own
-  energy on one held patch at η_semi = 1 eV instead of at Σ(ω = 0) (below
-  E_F − 15 eV) or on the near grid at the deck η. No gap threshold decides the
-  class, and a deck whose `nval` covers every occupied band has none; a
-  smaller `nval` moves more valence states onto the patch. Sector (bispinor)
-  routes keep the old rule.
+- **One request key, `number_bands_protected`** (the documented form): every
+  occupied band plus conduction bands up to that total. Its semicore (coarse)
+  class is every occupied band below a ≥ 4 eV band gap. The `nval` / `ncond`
+  form stays: there the coarse class is every occupied state below the
+  lowest requested valence band (a smaller `nval` moves more valence states
+  onto the coarse windows). Giving both forms refuses
+  (`GATE band_request_forms`). A dipole artifact is stamped with the request
+  window, so a deck switched to `number_bands_protected` needs a dipole
+  written with `nval` = the occupied count.
+- **Semicore moves to coarse windows.** On the scalar MPA/shared-pole route the
+  coarse states are read at their own energy on held windows at η_semi = 1 eV
+  (one per coarse manifold; the Σ plan groups them to the least closed-form
+  node count) instead of at Σ(ω = 0) (below E_F − 15 eV) or on the near grid
+  at the deck η, certified at the deck's `sigma_quadrature_eps`.
+  `sigma_omega_patches_ev` accepts `lo:hi:eta` triples as user coarse windows
+  (`GATE sigma_coarse_window`). Sector (bispinor) routes keep the old rule.
 - **A new refusal.** `zeta_nband` below b3 now refuses on every run,
   one-shot included (`GATE qp_matrix_zeta_left`; it was a warning).
 ## 2026-09-29 — shared-pole χ₀ direct stream through mathdx mode 11

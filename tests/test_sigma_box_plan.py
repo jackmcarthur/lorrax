@@ -136,24 +136,23 @@ def test_three_product_partition_uses_raw_tuple_boxes(monkeypatch):
     np.testing.assert_array_equal(plan[2].pole_indices, [1])
 
 
-def test_a_patch_eta_splits_only_crossing_windows_and_carries_its_eps(monkeypatch):
-    """The SC semicore patch (gw.qp_support): frequencies at a second eta
-    split a crossing window into its own box, rule and executor weights at
-    that eta and the patch tolerance; sign-definite windows serve every
-    frequency at the plan's eta."""
+def test_a_coarse_window_splits_only_crossing_windows_at_its_eta_and_the_plan_eps(monkeypatch):
+    """The SC coarse (semicore) windows (gw.qp_support): coarse samples split
+    off a crossing window into their own box, rule and executor weights at
+    their eta and the plan's eps; sign-definite windows serve every frequency
+    at the plan's eta."""
     plan, geometry = _plan(monkeypatch, omega_eta_ry=np.asarray([0.1, 0.3]),
-                           split_eps=1.0e-2)
+                           omega_group=np.asarray([-1, 0]), group_fixed=(False,))
     names = [row.window.name for row in plan]
     assert names == [
         "positive conduction:resonant",
-        "positive conduction:resonant@eta4.08",
+        "positive conduction:resonant@eta4.08g0-0",
         "positive conduction:state_tail",
         "positive conduction:pole_tail",
     ]
     report = {row["name"]: row for row in geometry["branches"][0]["windows"]}
-    split = report["positive conduction:resonant@eta4.08"]
-    assert split["eta_ry"] == 0.3 and split["eps"] == 1.0e-2
-    assert report["positive conduction:resonant"]["eps"] == 1.0e-4
+    split = report["positive conduction:resonant@eta4.08g0-0"]
+    assert split["eta_ry"] == 0.3 and split["eps"] == 1.0e-4
     np.testing.assert_array_equal(plan[0].omega_idx, [0])
     np.testing.assert_array_equal(plan[1].omega_idx, [1])
     np.testing.assert_array_equal(plan[3].omega_idx, [0, 1])
@@ -161,6 +160,35 @@ def test_a_patch_eta_splits_only_crossing_windows_and_carries_its_eps(monkeypatc
     np.testing.assert_allclose(
         np.asarray(plan[1].window.nodes.alpha) / np.asarray(plan[0].window.nodes.alpha),
         np.exp(-(0.3 - 0.1) * np.asarray(plan[0].window.nodes.t)), rtol=1e-12)
+
+
+def test_coarse_windows_are_grouped_by_the_least_closed_form_node_count(monkeypatch):
+    from gw.sigma_box_plan import _law_node_count
+    omega_abs = np.asarray([0.2, 0.5, 0.9, 2.5], np.float64)
+    branch = _SigmaBranch(
+        tag="positive conduction", E_A=jnp.asarray([[0.1, 3.0]], dtype=jnp.float64),
+        base_mask_A=jnp.asarray([[True, True]]), space="cond", neg_omega_half=False,
+        omega_abs=omega_abs, omega_idx=np.arange(omega_abs.size, dtype=np.int64))
+    group = np.asarray([-1, 0, 1, 2])
+    plan, geometry = _plan(monkeypatch, branch=branch, summaries=_summaries([branch]),
+                           omega_eta_ry=np.asarray([0.1, 0.3, 0.3, 0.3]),
+                           omega_group=group, group_fixed=(False, False, False))
+    rows = [r for r in geometry["coarse_window_split"] if r["window"].endswith(":resonant")]
+    assert rows
+    row = rows[0]
+    assert row["coarse_windows"] == 3
+    assert row["chosen_law"] <= min(row["one_window_law"], row["per_window_law"])
+    assert [g for run in row["runs"] for g in run] == [0, 1, 2]
+    _, again = _plan(monkeypatch, branch=branch, summaries=_summaries([branch]),
+                     omega_eta_ry=np.asarray([0.1, 0.3, 0.3, 0.3]),
+                     omega_group=group, group_fixed=(False, False, False))
+    assert again["coarse_window_split"] == geometry["coarse_window_split"]
+    # A user (fixed) window is never grouped.
+    _, fixed = _plan(monkeypatch, branch=branch, summaries=_summaries([branch]),
+                     omega_eta_ry=np.asarray([0.1, 0.3, 0.3, 0.3]),
+                     omega_group=group, group_fixed=(False, True, False))
+    row = [r for r in fixed["coarse_window_split"] if r["window"].endswith(":resonant")][0]
+    assert [1] in row["runs"]
 
 
 def test_ppm_flat_crossing_line_nodes_reach_sigma_executor(monkeypatch):

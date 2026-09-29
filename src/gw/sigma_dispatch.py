@@ -1233,18 +1233,18 @@ def _compute_mpa_sigma(
             fixed_quadrature_session.setdefault(sigma_w_model, {})),
         material_class=material_class,
         print_fn=print_fn)
-    patch = getattr(config, "sc_semicore_patch_ev", None)
+    patch = getattr(config, "sc_coarse_windows_ev", None) or None
     if patch is not None:
-        # THE SEMICORE PATCH (gw.qp_support): its samples sit in the grid below
-        # the near support and are evaluated at eta_semi; its crossing windows
-        # split off at that eta and the patch tolerance (sigma_box_plan).
-        from .qp_support import (SEMICORE_PATCH_EPS, assert_semicore_patch_route,
-                                 patch_eta_ev)
+        # THE COARSE (SEMICORE) WINDOWS (gw.qp_support): their samples sit in
+        # the grid below the near support and are evaluated at their own eta,
+        # in crossing rule windows grouped by the node law (sigma_box_plan),
+        # at the deck's sigma_quadrature_eps.
+        from .qp_support import assert_semicore_patch_route, window_labels
         assert_semicore_patch_route(patch, config.compute_mode, wfns_transverse)
         omega_ev = np.asarray(config.omega_grid_ev, dtype=np.float64)
-        body_options.update(
-            omega_eta_ry=patch_eta_ev(omega_ev, patch, _xi.resolved_ry * RYD_TO_EV) / RYD_TO_EV,
-            split_eps=SEMICORE_PATCH_EPS)
+        eta_ev, group = window_labels(omega_ev, patch, _xi.resolved_ry * RYD_TO_EV)
+        body_options.update(omega_eta_ry=eta_ev / RYD_TO_EV, omega_group=group,
+                            group_fixed=tuple(bool(w[3]) for w in patch))
     lorentz_output = bool(config.debug.sigma_lorentz_debug_output)
     if not lorentz_output:
         sigma_lorentz = None
