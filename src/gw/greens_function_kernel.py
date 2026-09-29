@@ -24,6 +24,28 @@ def face_green_product(A, B, mesh, phases, band_range, n_full=None):
     are bounded by one full-k Green tile, ``16·N_k·(M/p_x)·(N/p_y)`` bytes
     (``N_k = n_full``, the parents' full zone; ``nq`` when the faces are
     already at full k), which every Green-building stage reserves.
+    ``phases`` may be stacked ``(s, nq, N_b)``: the ``s`` Greens then share
+    each panel exchange (``_build_G_face(pair=True)``).
+
+    Why this route (GEMM2D, A100-40GB, warm; ms per build at P16 = 4x4,
+    CrI3 8x8 N_b 144 / Fe 8³ N_b 120, valence windows):
+
+    ======================================  =======  =======
+    route                                   CrI3     Fe 8³
+    ======================================  =======  =======
+    band-complete gather (retired)          1.86     5.14
+    batched SUMMA, 2 panels (this)          1.85     5.95
+    batched SUMMA, 4 / 6 panels             2.57     7.37
+    cuBLASMp SUMMA, one call per k          6.88     5.11
+    ======================================  =======  =======
+
+    CrI3 8x8 one-shot Σ τ sweep at P16: gather 2.30 s, this route 2.08 s
+    (with the partner pair), cuBLASMp 2.57 s; equal peaks.  cuBLASMp loses
+    because it runs one SUMMA per k (nq calls of p broadcast rounds) and joins
+    the XLA stream by events at entry and exit, so it overlaps nothing; this
+    route moves the same bytes once per panel for every k, and XLA's async
+    all-gathers overlap the previous panel's GEMM.  At P16 the exchange is
+    most of a build (all-gathers 1.2 of 1.85 ms on CrI3).
     """
     from distrib_la import panel_matmul
 
