@@ -2724,13 +2724,13 @@ def _sc_coarse_identities(inputs, shape):
     (``band_partition.semicore_floor``: the minimum energy of the lowest
     requested valence band, or a >= 4 eV gap under number_bands_protected;
     kept on ``meta.coarse_class``).
-    Fixed for the run.  Only the scalar MPA/shared-pole Sigma reads the patch;
-    a sector route reads the near grid under main's rule, so it has none.
+    Fixed for the run.  The MPA/shared-pole Sigma reads the patch on every
+    route, scalar or sector (``qp_support.semicore_patch_route``).
     """
     from .qp_support import semicore_patch_route
     cut = getattr(getattr(inputs, "meta", None), "coarse_class", None)
     if (cut is None or not cut.n_coarse
-            or not semicore_patch_route(inputs.config.compute_mode, inputs.wfns_transverse)):
+            or not semicore_patch_route(inputs.config.compute_mode)):
         return np.zeros(shape, dtype=bool)
     ks = _kstar(inputs)
     e_ry = (inputs.e_dft_active_kn_ry if ks.is_identity
@@ -2799,8 +2799,9 @@ def _sc_sampled_support(inputs, partition, energies_loop, mu_ev, active_n=None,
     if users and not n_semi:
         raise ValueError(
             "GATE sigma_coarse_window: sigma_omega_patches_ev lo:hi:eta windows serve the "
-            "SC coarse (semicore) class on the scalar MPA/shared-pole route, and this run "
-            "has none.")
+            "SC coarse (semicore) class of the MPA/shared-pole Sigma (scalar or sector), "
+            "and no occupied state of this run lies below the coarse floor (or its Sigma "
+            "is PPM/static).")
     if n_semi:
         from .qp_support import (_inside_any, coarse_windows_ev, semicore_patch_escapes,
                                  semicore_patches_ev)
@@ -3458,13 +3459,12 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
     semicore_pin, energies_read_loop, E_read_full = None, energies_loop, E_full
     if inputs.config.sc.semicore == "dft":
         semicore_pin = np.array(_sc_coarse_identities(inputs, energies_loop.shape))
-        if not semicore_pin.any() and getattr(inputs.config.sc, "semicore_explicit", False):
-            raise ValueError(
-                "GATE sc_semicore: sc_semicore = dft pins the coarse (semicore) class "
-                "of the scalar MPA/shared-pole route, and this run has none.")
     if semicore_pin is not None and not semicore_pin.any():
-        # the default with no coarse class (static modes, sector routes, an
-        # nval that covers every occupied band): nothing to pin
+        # no coarse class (PPM/static Sigma, an nval or number_bands_protected
+        # that covers every occupied band): nothing to pin, on every route
+        if int(state.iteration) == 0:
+            _record_sc(inputs, "    SC semicore = dft: no coarse (semicore) class in this "
+                               "run; nothing to pin")
         semicore_pin = None
     if semicore_pin is not None:
         e_dft_loop_ry = np.asarray(

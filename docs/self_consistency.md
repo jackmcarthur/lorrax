@@ -185,9 +185,13 @@ have the same broadening"): every protected conduction state is read on the
 near grid at the deck η; there is no far-conduction class. On Fe 4³ prot
 (`number_bands_protected = 26`) the matrix-top band 26 at k 4/11 then sits
 among the scissored tail's levels (+20.6 to +21 eV) with a resonant Σ, and
-the SC map is bistable there (claim 2960). Only the
-scalar MPA/shared-pole Σ reads coarse windows; a sector (bispinor) route
-keeps the rule below.
+the SC map is bistable there (claim 2960). The
+coarse class is built once from the DFT ladder (`gw_init.coarse_class_for_deck`,
+`meta.coarse_class`), above the Σ route: the scalar and the sector (bispinor)
+MPA/shared-pole Σ read the same class and the same coarse windows, because
+the sector Σ calls the one pole executor and window planner once per sector
+pair (`qp_support.semicore_patch_route`). A PPM or static Σ reads no coarse
+windows.
 
 **Pinned semicore** (`sc_semicore = dft`, the default; owner 2026-09-29: the pseudopotentials
 are fitted to DFT, so the semicore stays at its DFT energies while its mixing
@@ -207,7 +211,9 @@ the map-0 coarse class, fixed for the run; the coarse windows are planned on
 their DFT energies and are held (only a drift of μ past their pad would extend
 them). The semicore QP energies still move by the level repulsion of the kept
 mixing, $-\sum_p |H_{ps}|^2/(E_p - E_s)$ to second order. `qp` lets the class
-move with its own Σ. The default does nothing on a run without a coarse class.
+move with its own Σ. On a run without a coarse class (a PPM or static Σ, or
+a request that covers every occupied band) either value logs that there is
+nothing to pin.
 
 Every other matrix band is protected: under the default `sigma_out_of_grid =
 cover` it reads Σ at its own energy, and the grid grows over it; on a route

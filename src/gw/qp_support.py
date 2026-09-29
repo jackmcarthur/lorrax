@@ -370,18 +370,14 @@ def window_labels(omega_ev, windows, eta_ev):
     return eta, group
 
 
-def semicore_patch_route(compute_mode, wfns_transverse):
+def semicore_patch_route(compute_mode):
     """THE one predicate for a Sigma route that reads the semicore patch.
 
-    The scalar MPA/shared-pole Sigma (no transverse wavefunctions).  A sector
-    (bispinor) route reads the near grid under main's rule.
+    The MPA/shared-pole Sigma, scalar or sector (bispinor): both run the one
+    pole executor and window planner (``mpa.sigma.compute_sigma_c_mpa_omega_grid``;
+    ``mpa.sector_sigma`` calls it once per sector pair with the same options),
+    so the coarse class (``meta.coarse_class``, built once in
+    ``gw_init.coarse_class_for_deck``) and its windows are route-independent.
     """
     from .gw_config import ComputeMode
-    return wfns_transverse is None and compute_mode is ComputeMode.MPA
-
-
-def assert_semicore_patch_route(patch, compute_mode, wfns_transverse):
-    """Refuse a semicore patch on a route that does not read it (GATE semicore_patch_route)."""
-    if patch is not None and not semicore_patch_route(compute_mode, wfns_transverse):
-        raise ValueError("GATE semicore_patch_route: the semicore patch serves the scalar "
-                         "MPA/shared-pole Sigma only; a sector route reads the near grid")
+    return compute_mode is ComputeMode.MPA

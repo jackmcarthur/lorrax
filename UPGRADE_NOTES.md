@@ -3,6 +3,20 @@
 User-visible changes, newest first. Binding rulings behind the breaking
 changes live in `docs/architecture/decisions.md`.
 
+## 2026-09-29 — the semicore class on the bispinor (sector) route
+
+Every dynamic self-consistent bispinor deck with a coarse class
+(`bispinor_gw = full_shared_pole` or any bispinor `compute_mode = mpa`)
+moves once. The coarse (semicore) class was already built once from the DFT
+ladder, above the Σ route; the sector Σ now reads it as the scalar Σ does:
+the coarse states are read on held windows at η_semi = 5 eV, certified at
+max(`sigma_quadrature_eps`, 3e-3), instead of at Σ(ω = 0), and
+`sc_semicore = dft` (the default) pins their DFT block. `sc_semicore` and
+`sigma_omega_patches_ev` `lo:hi:eta` triples behave the same on both routes.
+`sc_semicore = dft` named on a run without a coarse class no longer refuses
+(`GATE sc_semicore` is gone); it logs that there is nothing to pin.
+Scalar decks are bitwise.
+
 ## 2026-09-29 — bulk bispinor V carries the mini-BZ head average; bispinor refusals move to setup
 
 Every bulk (`sys_dim = 3`) bispinor deck with `mc_average_vcoul_body = true`
@@ -26,9 +40,8 @@ Fe 4³ and MoS2 3×3 prot at η_semi 5 and 8 eV: same maps to converge (14, 8),
 equal or fewer τ pairs (MoS2 333 → 321), semicore QP within 27 meV of DFT
 (qp: 0.1–6 eV deeper), and the protected states' η_semi 8 − 5 spread falls
 3–6× (E_F ± 10 eV std Fe 5.1 → 1.4, MoS2 5.0 → 0.8 meV). The default is a
-no-op on a run without a coarse class (static modes, sector routes, an `nval`
-that covers every occupied band); naming `sc_semicore = dft` on such a run
-refuses (`GATE sc_semicore`). Sandbox claim 2964.
+no-op on a run without a coarse class (static modes, an `nval`
+that covers every occupied band). Sandbox claim 2964.
 
 ## 2026-09-29 — coarse (semicore) windows certified at max(ε, 3e-3)
 
@@ -69,7 +82,7 @@ self_consistent`, scalar MPA/shared-pole route) moves once. See
   node count) instead of at Σ(ω = 0) (below E_F − 15 eV) or on the near grid
   at the deck η, certified at max(`sigma_quadrature_eps`, 3e-3).
   `sigma_omega_patches_ev` accepts `lo:hi:eta` triples as user coarse windows
-  (`GATE sigma_coarse_window`). Sector (bispinor) routes keep the old rule.
+  (`GATE sigma_coarse_window`).
 - **Continuous tail weights.** The scissored tail's rigid shift Δ_c weights
   each conduction state by min(Z, 1/Z) (0 for Z ≤ 0) instead of Z inside a
   hard Z ∈ (0, 1] cut, so the tail law has no jump where a state's Z crosses 1.
