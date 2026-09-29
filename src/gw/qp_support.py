@@ -221,7 +221,7 @@ def hold_support_ev(sigma, deck_grid_ev, held_grid_ev, held_envelope,
 # ---------------------------------------------------------------------------
 # The semicore patch (owner 2026-09-28/29)
 # ---------------------------------------------------------------------------
-# Coarse ("semicore") states (``band_partition.qp_band_cut``: occupied, below
+# Coarse ("semicore") states (``band_partition.semicore_floor``: occupied, below
 # the minimum energy of the lowest requested valence band) stay in the QP
 # matrix with their full Sigma
 # rows, but are read at their own energy on ONE held patch of the grid, below

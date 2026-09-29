@@ -114,11 +114,9 @@ extrapolation is not implemented: on the stored Si samples a state-independent
 Branch `feat/qsgw-production-partition-2026-09-29-r3` (lane TWOPORT,
 claim 2952) holds the rest of the recipe. It is not on main.
 
-- **Absolute band cut.** b3 is set before the ζ fit, capped at the ζ left
-  range (`GATE qp_band_cut_zeta`), so the QP matrix is always inside it
-  (`GATE qp_matrix_zeta_left`). Every dynamic SC deck moves once: on Si 4³
-  map 0 the ± 10 eV states move +48 meV mean, 167 meV max, all from b3
-  (claim 2952).
+- **b3 counts bands, as on main** (owner 2026-09-29): the QP matrix
+  [b0, nelec + `ncond`) rotates among itself and must lie inside the ζ left
+  range (`GATE qp_matrix_zeta_left`); the tail above is scissored.
 - **The request.** `number_bands_protected = N` (the documented form): every
   occupied band plus conduction bands up to N; its semicore (coarse) class is
   every occupied band below a ≥ 4 eV band gap. `nval` / `ncond` remain; there

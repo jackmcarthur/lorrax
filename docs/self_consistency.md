@@ -126,25 +126,19 @@ energies, so it takes these dipoles at the same diagonal approximation.
 
 | bands | block of $H'$ |
 |---|---|
-| the QP matrix `[0, b3)` = the ζ fit's left range | full $\Sigma^{\rm QSGW}$, off-diagonals kept within the matrix |
+| the QP matrix `[b0, b3)`, b3 = nelec + `ncond` as counted on main | full $\Sigma^{\rm QSGW}$, off-diagonals kept within the matrix |
 | its coarse (semicore) states (below) | full rows, read at their own energy on held coarse windows at $\eta_{\rm semi}$ = 1 eV |
 | the lowest `sc_frozen_core_bands` | held at the DFT block $\mathrm{diag}(E_{\rm DFT})$; they stay in the $\Sigma_x$ and $\chi_0$ sums |
 | the scissored tail `[b3, number_bands)` | DFT orbitals with an energy-only rigid shift, refit every map, in G and $\chi_0$ only: the $Z$-weighted mean QP correction of the matrix's conduction states that read their own $\Sigma(E)$ (below) |
 
-**The absolute band cut** (owner 2026-09-28/29; `band_partition.qp_band_cut`,
-decided from the DFT ladder before the ζ fit, logged as `QP band cut`). b3 is
-one k-independent band index: the smallest boundary holding every occupied
-state, every requested (`nval`/`ncond`) state within $\mu \pm 10$ eV and
-every state below `sigma_omega_max_ev`, moved up to the first band gap of at
-least $4\eta$ within $20\eta$, else to the boundary with the least overlap,
-never inside a degenerate multiplet; a metal's frame is the deck's fixed-N
-smearing $\mu$. The search stops at `zeta_nband`, and a need above it refuses
-(`GATE qp_band_cut_zeta`). The QP matrix is the ζ fit's left range, and a
-`zeta_nband` below b3 refuses on every route (`GATE qp_matrix_zeta_left`): a
-state outside the fit would carry Σ on unfitted pairs. Above $E_F$ a dispersive ladder has no band gap
-(Si 4³, Fe 4³, Na 8³), so the matrix's top band overlaps the tail at other k;
-the cost is the dropped Σ coupling to those tail bands (TWOCLASS, CLAIMS
-2945).
+**b3 counts bands** (owner 2026-09-29: "b3 will count bands as on main yes,
+and only bands between b0 and b3 will be rotated amongst each other"). b3 =
+nelec + `ncond` (`number_bands_protected` resolves to the same count); only
+[b0, b3) rotates, and the ζ fit is untouched. A `zeta_nband` below b3
+refuses on every route (`GATE qp_matrix_zeta_left`): a state outside the
+fit's left range would carry Σ on unfitted pairs. The classes below change
+only where each QP-matrix state's $\Sigma_c(\omega)$ is read
+(`band_partition.semicore_floor`, `qp_support`).
 
 **The request and the coarse (semicore) class.** Two exclusive forms name the
 QP request; giving both refuses (`GATE band_request_forms`).

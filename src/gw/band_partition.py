@@ -23,14 +23,17 @@ builds a non-trivial partition (:func:`build_omega_band_partition`); the SC
 loop keeps every QP-window identity protected (owner rule 2026-09-22), so its
 partition is :meth:`BandPartition.all_protected`.
 
-THE ABSOLUTE BAND CUT (dynamic SC; owner 2026-09-28/29).  The QP matrix is
-the bands below one k-independent index b3, the ζ fit's left range, decided
-from the DFT ladder before the ζ fit (:func:`qp_band_cut`).  Inside it every
-state keeps its full Σ row: coarse ("semicore": occupied, below the minimum
-energy of the lowest requested valence band; read at its own energy on one
-held patch at ``qp_support.SEMICORE_ETA_EV``) or protected (the deck eta).
-Bands [b3, nband) are the scissored tail: DFT ψ, the rigid conduction scissor, in G
-and χ only, no Σ and no mixing.  There is no rotating class.
+THE QP MATRIX AND ITS SIGMA READ CLASSES (dynamic SC; owner 2026-09-29: "b3
+will count bands as on main yes, and only bands between b0 and b3 will be
+rotated amongst each other").  b3 counts bands as on main (nval/ncond, or
+``number_bands_protected`` resolved to them); the QP matrix [b0, b3) rotates
+among itself and [b3, nband) is the scissored tail (DFT psi, the rigid
+conduction scissor, in G and chi only, no Sigma, no mixing).  Nothing here is
+energy-dependent in the zeta fit.  Inside the QP matrix every state keeps its
+full Sigma row; only where its Sigma_c(omega) is read differs: coarse
+("semicore", :func:`semicore_floor`; read at its own energy on held windows
+below the near grid, ``qp_support``) or protected (the near grid at the deck
+eta).  There is no rotating class.
 """
 
 from __future__ import annotations
@@ -45,36 +48,24 @@ import jax.numpy as jnp
 
 
 # ---------------------------------------------------------------------------
-# The absolute band cut (dynamic SC)
+# The coarse (semicore) read class (dynamic SC; Sigma_c(omega) quadrature only)
 # ---------------------------------------------------------------------------
 
-#: Requested states farther than this from mu (eV) do not set the band cut:
-#: they stay in the QP matrix only if the cut lands above them, else they are
-#: tail states.  The owner's window rule (+-10 eV of E_F).
+#: The owner's window rule (+-10 eV of E_F): under ``number_bands_protected``
+#: the semicore gap is searched under the requested bands within it.
 WINDOW_CLIP_EV = 10.0
-#: The cut takes the first band gap at least CUT_GAP_ETAS * eta wide above
-#: the need, searched up to CUT_SEARCH_ETAS * eta above it; else the widest
-#: boundary there, which may overlap.  A gap of 4 eta separates two
-#: manifolds Sigma resolves.
-CUT_GAP_ETAS = 4.0
-CUT_SEARCH_ETAS = 20.0
 #: ``number_bands_protected`` mode only (owner 2026-09-29): an occupied state
 #: is semicore when a band gap at least this wide (eV, all k) separates it from
 #: the valence manifold above.  That request protects every occupied band, so
 #: the class needs its own boundary; 4 eV is 16 deck etas, wide enough that
-#: the coarse patch never reads a band the fine grid resolves.
+#: the coarse window never reads a band the near grid resolves.
 SEMICORE_GAP_EV = 4.0
 
 
-class QPBandCut(NamedTuple):
-    """The absolute band cut of an SC run (:func:`qp_band_cut`); 0-based band counts."""
-    coarse_floor_ev: float  # coarse (semicore): E < this (absolute eV; -inf = none)
-    n_coarse: int          # coarse (k, state) on the loaded k set
-    b3: int                # bands [0, b3) are the QP matrix = the ζ fit's left range
-    cut_ev: float          # midpoint of the band gap at b3 (absolute eV; inf when b3 = nb)
-    gap_ev: tuple          # (max_k E[b3-1], min_k E[b3]) absolute eV; negative width = overlap
-    top_ev: float          # highest energy the QP matrix must hold (absolute eV)
-    n_requested_tail: int  # requested (k, state) above the cut: tail states, not in the QP matrix
+class CoarseClass(NamedTuple):
+    """The coarse (semicore) read class of an SC run (:func:`semicore_floor`)."""
+    coarse_floor_ev: float  # coarse: E < this (absolute eV; -inf = none)
+    n_coarse: int           # coarse (k, state) on the loaded k set
 
 
 def band_gaps_ev(energies_ev):
@@ -86,108 +77,46 @@ def band_gaps_ev(energies_ev):
     return e.max(axis=0)[:-1], e.min(axis=0)[1:]
 
 
-def qp_band_cut(energies_ev, *, n_below_k, nval, ncond, mu_ev, clip_ev, cut_gap_ev,
-                cut_search_ev, omega_min_rel_ev=None, omega_max_rel_ev=None, b_max=None,
-                n_protected=None, semicore_gap_ev=None):
-    """Absolute band cut from the DFT ladder, decided before the ζ fit (owner, 2026-09-28).
+def semicore_floor(energies_ev, *, n_below_k, nval, mu_ev, clip_ev, omega_min_rel_ev=None,
+                   n_protected=None, semicore_gap_ev=None):
+    """The coarse (semicore) class from the DFT ladder: which QP-matrix states
+    read Sigma_c(omega) on the coarse windows instead of the near grid.
 
-    ``energies_ev`` (nk, nb) absolute eV on the loaded k set; ``n_below_k`` the
-    states below mu at each k (``n_occ`` on an insulator); ``mu_ev`` the frame.
+    ``energies_ev`` (nk, nb) absolute eV on the loaded k set; ``n_below_k``
+    the states below mu at each k (``n_occ`` on an insulator).  It sets no
+    band count: b3 and the zeta fit are the counted bands, as on main.
 
-    1. The QP matrix must hold every occupied state, every requested state
-       within ``mu +- clip_ev`` and every state below ``mu + omega_max``.
-       ``top`` is the highest such energy.
-    2. b3 is a band-index boundary n: bands [0, n) at every k. It takes the
-       first boundary at or above that need whose band gap
-       ``min_k E[n] - max_k E[n-1]`` is at least ``cut_gap_ev`` and opens
-       below ``top + cut_search_ev``; else the widest boundary opening there.
-       Above E_F a dispersive ladder often has no band gap at all (Si 4^3,
-       Fe 4^3, Na 8^3): the widest boundary then has a negative width, an
-       overlap of the matrix's top band with the tail's lowest, and the log
-       states it. A gap in the union of all k levels is not enough: the
-       number of states below it varies with k. When the need reaches the
-       last loaded band, b3 = nb and there is no tail. A boundary that cuts a
-       degenerate multiplet at any k is skipped. ``b_max`` (the ζ fit's edge,
-       ``zeta_nband``) caps the search: the matrix is the fit's left range, so
-       a need above it refuses (``GATE qp_band_cut_zeta``).
-    3. Coarse (owner, round 5 and 2026-09-29): the fine window at the deck
-       eta runs down to the minimum energy of the lowest requested valence
-       band, ``n_below_k - nval`` at each k (``omega_min`` only lowers it);
-       every occupied state below that energy is coarse.  No gap threshold
-       decides it, and a deck whose ``nval`` covers every occupied band has
-       none.  Energy-based, so a coarse state inside the fine grid's lower
-       pad reads the fine grid (the two windows may overlap).
-       With ``n_protected`` (``number_bands_protected``) the request is bands
-       [0, n_protected) at every k and the coarse class is instead every
-       occupied band below a band gap of at least ``semicore_gap_ev`` under
-       the requested bands within the clip (none without such a gap).
-    Requested states above b3 are the tail: DFT ψ, the rigid conduction
-    scissor, no Σ. O(nk nb).
+    * nval/ncond (owner, 2026-09-29): every occupied state below the minimum
+      energy of the lowest requested valence band, ``n_below_k - nval`` at
+      each k (``omega_min`` only lowers it); none when ``nval`` covers every
+      occupied band.  Energy-based, so a coarse state inside the near grid's
+      lower pad reads the near grid.
+    * ``n_protected`` (``number_bands_protected``): every occupied band below
+      a band gap of at least ``semicore_gap_ev`` under the requested bands
+      within ``mu +- clip_ev`` (none without such a gap).
     """
     e = np.asarray(energies_ev, float)
     nk, nb = e.shape
     below = np.broadcast_to(np.asarray(n_below_k, int), (nk,))
     mu = float(mu_ev)
-    idx = np.arange(nb)[None, :]
-    if n_protected is None:
-        lo_req = np.maximum(below - int(nval), 0)[:, None]
-        hi_req = np.minimum(below + int(ncond), nb)[:, None]
-    else:
-        lo_req = np.zeros((nk, 1), int)
-        hi_req = np.full((nk, 1), min(int(n_protected), nb))
-    requested = (idx >= lo_req) & (idx < hi_req)
-    within = requested & (np.abs(e - mu) <= float(clip_ev))
-    if not within.any():
-        raise ValueError(f"QP band cut: no requested state lies within mu +- {float(clip_ev):g} eV; "
-                         "increase nval/ncond")
-    need = within | (idx < below[:, None])
-    if omega_max_rel_ev is not None:
-        need |= e <= mu + float(omega_max_rel_ev)
-    n_min = int(np.max(np.where(need, idx + 1, 0)))
-    top = float(e[need].max())
-    gap_lo, gap_hi = band_gaps_ev(e)
-    width = gap_hi - gap_lo                      # boundary n at position n - 1
-    # A boundary that cuts a degenerate multiplet at any k is never a cut
-    # (common.band_degeneracy: the zeta fit refuses such a left window).
-    from common.band_degeneracy import DEGENERACY_TOL_RY, boundary_min_gaps
-    from common.units import RYD_TO_EV
-    clean = boundary_min_gaps(e / RYD_TO_EV, is_full_spectrum=True) > DEGENERACY_TOL_RY
-    cap = nb if b_max is None else min(int(b_max), nb)
-    if n_min > cap:
-        raise ValueError(
-            f"GATE qp_band_cut_zeta: the QP matrix must hold bands [0, {n_min}) (every "
-            f"occupied state, every requested state within mu +- {float(clip_ev):g} eV and "
-            f"every state below omega_max) but the zeta fit ends at band {cap}.  Raise "
-            "zeta_nband (or number_bands), or lower ncond / sigma_omega_max_ev.")
-    bounds = np.arange(n_min, cap)
-    bounds = bounds[clean[bounds]]
-    if n_min >= cap or bounds.size == 0:
-        b3 = cap
-    else:
-        w = width[bounds - 1]
-        opens = gap_lo[bounds - 1] < top + float(cut_search_ev)
-        opens[0] = True
-        wide = np.flatnonzero(w >= float(cut_gap_ev))
-        wide = wide[opens[wide]]
-        b3 = int(bounds[wide[0]]) if wide.size else int(bounds[np.argmax(np.where(opens, w, -np.inf))])
-    if b3 < nb:
-        gap = (float(gap_lo[b3 - 1]), float(gap_hi[b3 - 1]))
-        cut = 0.5 * (gap[0] + gap[1])
-    else:
-        gap, cut = (float(e[:, nb - 1].max()), np.inf), np.inf
     if n_protected is None:
         lowest = np.clip(below - int(nval), 0, nb - 1)
         floor = float(np.min(e[np.arange(nk), lowest]))
         if omega_min_rel_ev is not None:
             floor = min(floor, mu + float(omega_min_rel_ev))
     else:
+        idx = np.arange(nb)[None, :]
+        within = (idx < min(int(n_protected), nb)) & (np.abs(e - mu) <= float(clip_ev))
+        if not within.any():
+            raise ValueError(f"semicore class: no requested state lies within mu +- "
+                             f"{float(clip_ev):g} eV; raise number_bands_protected")
+        gap_lo, gap_hi = band_gaps_ev(e)
         req_lo = int(np.min(np.where(within, idx, nb)))
         semi = [n for n in range(1, min(int(below.min()), req_lo) + 1)
-                if width[n - 1] >= float(semicore_gap_ev)]
+                if gap_hi[n - 1] - gap_lo[n - 1] >= float(semicore_gap_ev)]
         floor = float(gap_hi[semi[-1] - 1]) if semi else -np.inf
     n_coarse = int(np.count_nonzero(e < floor))
-    n_tail = int(np.count_nonzero(requested & (idx >= b3)))
-    return QPBandCut(floor if n_coarse else -np.inf, n_coarse, b3, float(cut), gap, top, n_tail)
+    return CoarseClass(floor if n_coarse else -np.inf, n_coarse)
 
 
 def coarse_band_report(energies_ev, semicore_kn, *, mu_ev, band_offset=0):

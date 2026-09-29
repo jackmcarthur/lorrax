@@ -3325,18 +3325,17 @@ def prepare_isdf_and_wavefunctions(
 	)
 
 
-def qp_band_cut_for_deck(config, wfn, print0):
-    """The SC run's absolute band cut from the loaded DFT ladder, before the ζ fit.
+def coarse_class_for_deck(config, wfn, print0):
+    """The SC run's coarse (semicore) read class from the loaded DFT ladder.
 
-    The QP matrix, and with it the ζ fit's left range, is [0, b3).  Bands
-    [b3, nband) are the scissored tail (``gw.band_partition``).  A metal's
-    frame is the deck's fixed-N smearing mu on the DFT ladder, as the SC map
-    solves it (``wfn.efermi`` is a band-index midgap, not a metal's mu).
+    Sigma_c(omega) quadrature only (``band_partition.semicore_floor``): it sets
+    no band count; b3 and the zeta fit are the counted bands, as on main.  A
+    metal's frame is the deck's fixed-N smearing mu on the DFT ladder, as the
+    SC map solves it (``wfn.efermi`` is a band-index midgap, not a metal's mu).
     """
     import sys
     from common.units import RYD_TO_EV
-    from .band_partition import (CUT_GAP_ETAS, CUT_SEARCH_ETAS, SEMICORE_GAP_EV,
-                                 WINDOW_CLIP_EV, qp_band_cut)
+    from .band_partition import SEMICORE_GAP_EV, WINDOW_CLIP_EV, semicore_floor
     from .gw_config import infer_material_class
     e_ry = np.asarray(wfn.energies[0, :, :config.nband], dtype=np.float64)
     e = e_ry * RYD_TO_EV
@@ -3353,32 +3352,25 @@ def qp_band_cut_for_deck(config, wfn, print0):
     else:
         mu = 0.5 * (float(e[:, n_occ - 1].max()) + float(e[:, n_occ].min()))
     below = np.count_nonzero(e < mu, axis=1) if metal else np.full(e.shape[0], n_occ)
-    eta = float(config.sigma.regularization_ev)
-    cut = qp_band_cut(
-        e, n_below_k=below, nval=int(config.nval), ncond=int(config.ncond), mu_ev=mu,
-        clip_ev=WINDOW_CLIP_EV, cut_gap_ev=CUT_GAP_ETAS * eta,
-        cut_search_ev=CUT_SEARCH_ETAS * eta,
-        omega_min_rel_ev=config.sigma.omega_min_ev, omega_max_rel_ev=config.sigma.omega_max_ev,
-        b_max=getattr(config, "zeta_nband", None),
+    coarse = semicore_floor(
+        e, n_below_k=below, nval=int(config.nval), mu_ev=mu, clip_ev=WINDOW_CLIP_EV,
+        omega_min_rel_ev=config.sigma.omega_min_ev,
         n_protected=getattr(config, "number_bands_protected", None),
         semicore_gap_ev=SEMICORE_GAP_EV)
-    width = cut.gap_ev[1] - cut.gap_ev[0]
     # Production stdout is /dev/null (runtime.production_stream): rank 0
-    # writes the cut to stderr, which reaches the rank-0 log.
+    # writes the class to stderr, which reaches the rank-0 log.
     say = print0 if jax.process_index() else (
         lambda line: print(line, file=sys.stderr, flush=True))
-    say(f"  QP band cut (absolute, from the DFT ladder about mu={mu:+.4f} eV): "
-        f"QP matrix = zeta left = bands 1-{cut.b3}; tail {cut.b3 + 1}-{int(config.nband)} "
-        f"scissored (DFT psi, no Sigma, no mixing); cut {cut.cut_ev - mu:+.3f} eV in the "
-        f"band gap [{cut.gap_ev[0] - mu:+.3f}, {cut.gap_ev[1] - mu:+.3f}] eV (width "
-        f"{width:.3f} eV); top of the need {cut.top_ev - mu:+.3f} eV; coarse (semicore): "
-        + ((f"{cut.n_coarse} (k,state) below E-mu = {cut.coarse_floor_ev - mu:+.3f} eV, "
+    say(f"  QP matrix: bands 1-{n_occ + int(config.ncond)} counted (nval={int(config.nval)}, "
+        f"ncond={int(config.ncond)}), rotated among themselves; bands "
+        f"{n_occ + int(config.ncond) + 1}-{int(config.nband)} scissored (no Sigma, no mixing); "
+        "coarse (semicore) Sigma read: "
+        + ((f"{coarse.n_coarse} (k,state) below E-mu = {coarse.coarse_floor_ev - mu:+.3f} eV, "
             + (f"the lowest requested valence band (nval={int(config.nval)})"
                if getattr(config, "number_bands_protected", None) is None else
                f"under a band gap >= {SEMICORE_GAP_EV:g} eV (number_bands_protected)"))
-           if cut.n_coarse else "none")
-        + f"; {cut.n_requested_tail} requested (k,state) in the tail")
-    return cut
+           if coarse.n_coarse else "none"))
+    return coarse
 
 
 def prepare_band_metadata(centroid_indices, config, mesh_xy, n_rmu, print0, sym, wfn):
@@ -3392,14 +3384,13 @@ def prepare_band_metadata(centroid_indices, config, mesh_xy, n_rmu, print0, sym,
     mu_basis = PackedCentroidBasis.build(
         centroid_indices, sym, wfn.fft_grid, mesh_xy)
     print0(f"  {mu_basis.describe()}")
-    ncond, cut = int(config.ncond), None
+    coarse = None
     if config.compute_mode.is_dynamic and config.qp_solver == "self_consistent":
-        # The QP matrix [0, b3) is the absolute band cut (gw.band_partition).
-        cut = qp_band_cut_for_deck(config, wfn, print0)
-        ncond = cut.b3 - int(wfn.nelec)
+        # b3 counts bands as on main; the coarse class is a Sigma read class.
+        coarse = coarse_class_for_deck(config, wfn, print0)
     meta = Meta.from_system(wfn, sym,
                             int(config.nval),
-                            ncond, config.nband,
+                            int(config.ncond), config.nband,
                             n_rmu, charge_bispinor,
                             nband_chi=config.bands.chi,
                             nband_sigma=config.bands.sigma,
@@ -3407,7 +3398,7 @@ def prepare_band_metadata(centroid_indices, config, mesh_xy, n_rmu, print0, sym,
     meta.rank = jax.process_index()
     meta.n_proc = jax.process_count()
     meta.sys_dim = config.sys_dim
-    meta.qp_band_cut = cut
+    meta.coarse_class = coarse
     meta.bispinor = charge_bispinor
     band_slices = BandSlices.from_band_edges(
         *meta.band_edges, b4_chi=meta.b_id_4_chi,

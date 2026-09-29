@@ -4875,8 +4875,8 @@ class LorraxConfig:
         """Resolve ``number_bands_protected`` against the WFN (identity otherwise).
 
         nval = every occupied band (``wfn.nelec``), ncond = the total minus it;
-        the key stays set so the band cut takes its semicore rule
-        (``band_partition.qp_band_cut``).
+        b3 = nval + ncond counts bands as on main; the key stays set so the
+        coarse (semicore) read class takes its gap rule (``band_partition.semicore_floor``).
         """
         total = self.number_bands_protected
         if total is None:

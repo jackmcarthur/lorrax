@@ -2662,14 +2662,15 @@ class SCSupport(NamedTuple):
 def _sc_coarse_identities(inputs, shape):
     """Coarse (semicore) identities on the loop k-set, a ``shape`` bool mask.
 
-    Every state whose DFT energy lies below the coarse floor of the absolute
-    band cut (``band_partition.qp_band_cut``: the minimum energy of the lowest
-    requested valence band, decided before the ζ fit and kept on ``meta``).
+    Every state whose DFT energy lies below the coarse floor
+    (``band_partition.semicore_floor``: the minimum energy of the lowest
+    requested valence band, or a >= 4 eV gap under number_bands_protected;
+    kept on ``meta.coarse_class``).
     Fixed for the run.  Only the scalar MPA/shared-pole Sigma reads the patch;
     a sector route reads the near grid under main's rule, so it has none.
     """
     from .qp_support import semicore_patch_route
-    cut = getattr(getattr(inputs, "meta", None), "qp_band_cut", None)
+    cut = getattr(getattr(inputs, "meta", None), "coarse_class", None)
     if (cut is None or not cut.n_coarse
             or not semicore_patch_route(inputs.config.compute_mode, inputs.wfns_transverse)):
         return np.zeros(shape, dtype=bool)

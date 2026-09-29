@@ -96,70 +96,41 @@ def test_only_unprotected_outofrange_diagonal_takes_scissor():
 
 
 # ---------------------------------------------------------------------------
-# The absolute band cut (gw.band_partition.qp_band_cut)
+# The coarse (semicore) read class (gw.band_partition.semicore_floor)
 # ---------------------------------------------------------------------------
 
-def _cut(e, **kw):
-    from gw.band_partition import qp_band_cut
-    args = dict(n_below_k=3, nval=2, ncond=2, mu_ev=0.0, clip_ev=10.0,
-                cut_gap_ev=1.0, cut_search_ev=5.0)
+def _coarse(e, **kw):
+    from gw.band_partition import semicore_floor
+    args = dict(n_below_k=3, nval=2, mu_ev=0.0, clip_ev=10.0)
     args.update(kw)
-    return qp_band_cut(np.asarray(e, float), **args)
-
-
-def test_band_cut_takes_the_first_wide_gap_above_the_need_and_finds_the_coarse_class():
-    # band 0 deep semicore (gap 20 eV), bands 1-2 valence, 3-4 conduction,
-    # a 2 eV gap above band 4, then a dense tail.
-    row = [-30.0, -3.0, -1.0, 1.0, 2.0, 4.0, 4.1, 4.2]
-    e = np.array([row, [x + 0.05 for x in row]])
-    cut = _cut(e)
-    assert cut.b3 == 5
-    # Coarse: every state below the lowest requested valence band (band 1 here).
-    assert cut.coarse_floor_ev == -3.0 and cut.n_coarse == 2
-    assert cut.gap_ev[1] - cut.gap_ev[0] > 1.0 and cut.n_requested_tail == 0
-
-
-def test_band_cut_without_a_gap_takes_the_least_overlap_and_names_it():
-    # A dispersive ladder above E_F: every boundary overlaps across k.
-    e = np.array([[-2.0, -1.0, -0.5, 1.0, 2.0, 3.0, 4.0],
-                  [-2.0, -1.0, -0.5, 2.5, 3.2, 4.1, 5.5]])
-    cut = _cut(e, cut_gap_ev=1.0)
-    assert 5 <= cut.b3 <= 7
-    if cut.b3 < 7:
-        assert cut.gap_ev[1] - cut.gap_ev[0] < 0.0   # an overlap, stated
-    # No gap threshold: band 0 lies below the lowest requested band (band 1).
-    assert cut.n_coarse == 2
-
-
-def test_band_cut_holds_every_state_below_omega_max():
-    row = [-3.0, -1.0, -0.5, 1.0, 2.0, 5.0, 9.0, 12.0]
-    e = np.array([row])
-    assert _cut(e).b3 == 5
-    assert _cut(e, omega_max_rel_ev=9.5).b3 == 7
-
-
-def test_band_cut_is_capped_at_the_zeta_fit_edge_and_refuses_a_need_above_it():
-    import pytest
-    row = [-30.0, -3.0, -1.0, 1.0, 2.0, 2.5, 4.0, 4.1, 4.2]
-    e = np.array([row])
-    assert _cut(e).b3 == 6
-    assert _cut(e, b_max=5).b3 == 5          # capped: the matrix is the fit's left range
-    with pytest.raises(ValueError, match="GATE qp_band_cut_zeta"):
-        _cut(e, b_max=4)                     # the need reaches band 5
+    return semicore_floor(np.asarray(e, float), **args)
 
 
 def test_coarse_class_follows_nval_and_omega_min_only_lowers_the_floor():
     row = [-30.0, -3.0, -1.0, 1.0, 2.0, 4.0, 4.1, 4.2]
     e = np.array([row, [x + 0.05 for x in row]])
-    assert _cut(e, nval=3).n_coarse == 0              # nval covers every occupied band
-    assert _cut(e, nval=1).n_coarse == 4              # bands 0 and 1 are coarse
-    assert _cut(e, nval=1, omega_min_rel_ev=-5.0).n_coarse == 2
-    assert _cut(e, nval=1, omega_min_rel_ev=-0.5).n_coarse == 4
+    # Every state below the lowest requested valence band (band 1 at nval 2).
+    c = _coarse(e)
+    assert c.coarse_floor_ev == -3.0 and c.n_coarse == 2
+    assert _coarse(e, nval=3).n_coarse == 0              # nval covers every occupied band
+    assert _coarse(e, nval=1).n_coarse == 4              # bands 0 and 1 are coarse
+    assert _coarse(e, nval=1, omega_min_rel_ev=-5.0).n_coarse == 2
+    assert _coarse(e, nval=1, omega_min_rel_ev=-0.5).n_coarse == 4
 
 
-def test_number_bands_protected_requests_every_occupied_band_and_splits_semicore_by_gap():
+def test_number_bands_protected_splits_semicore_by_gap():
     row = [-30.0, -3.0, -1.0, 1.0, 2.0, 4.0, 4.1, 4.2]
     e = np.array([row, [x + 0.05 for x in row]])
-    cut = _cut(e, n_protected=5, semicore_gap_ev=4.0)
-    assert cut.b3 == 5 and cut.n_coarse == 2          # band 0, below the 27 eV gap
-    assert _cut(e, n_protected=5, semicore_gap_ev=30.0).n_coarse == 0   # no such gap
+    c = _coarse(e, n_protected=5, semicore_gap_ev=4.0)
+    assert c.n_coarse == 2                               # band 0, below the 27 eV gap
+    assert _coarse(e, n_protected=5, semicore_gap_ev=30.0).n_coarse == 0   # no such gap
+
+
+def test_the_semicore_floor_sets_no_band_count():
+    """Owner 2026-09-29: b3 counts bands as on main; the coarse class is a
+    Sigma_c(omega) read class and returns no band index."""
+    import inspect
+    from gw import band_partition
+    assert not hasattr(band_partition, "qp_band_cut")
+    assert set(band_partition.CoarseClass._fields) == {"coarse_floor_ev", "n_coarse"}
+    assert "b3" not in inspect.signature(band_partition.semicore_floor).parameters

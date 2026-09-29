@@ -14,19 +14,18 @@ at map 2 of the unconverged Fe run); semicore QP ≤ 4.3 meV at map 0. The
 planner's node law for grouping coarse windows is now evaluated on the box
 each run is built on, so it equals the certified count (claim 2960).
 
-## 2026-09-29 — the production QSGW partition: absolute band cut, semicore patch
+## 2026-09-29 — the production QSGW partition: counted b3, semicore Σ read class
 
-Every dynamic self-consistent deck (`qp_solver = self_consistent`, every
-route) moves once. See [self-consistency §2](docs/self_consistency.md#2-band-treatment).
+Every dynamic self-consistent deck with a coarse class (`qp_solver =
+self_consistent`, scalar MPA/shared-pole route) moves once. See
+[self-consistency §2](docs/self_consistency.md#2-band-treatment).
 
-- **b3 comes from the cut, not `ncond`.** The QP matrix is [0, b3), the ζ fit's
-  left range, with b3 from the DFT ladder (`QP band cut` in the log): every
-  occupied state, every requested state within μ ± 10 eV and every state
-  below `sigma_omega_max_ev`, moved to a band gap ≥ 4η or the least overlap.
-  `ncond` only marks the requested states. Measured: Si 4³ 16 → 24, MoS2 3×3
-  38 → 44 (no tail), Fe 4³ charge 26 → 26, Na 8³ 86 → 10. Requested states
-  above the cut become scissored tail (DFT ψ, rigid shift, no Σ); the log
-  counts them. A need above `zeta_nband` refuses (`GATE qp_band_cut_zeta`).
+- **b3 counts bands, as before.** b3 = nelec + `ncond` (owner 2026-09-29: "b3
+  will count bands as on main yes, and only bands between b0 and b3 will be
+  rotated amongst each other"). The QP matrix [b0, b3) rotates among itself;
+  [b3, number_bands) is the scissored tail (DFT ψ, rigid shift, no Σ, no
+  mixing). The ζ fit is unchanged. The classes below change only where
+  Σ_c(ω) is read.
 - **One request key, `number_bands_protected`** (the documented form): every
   occupied band plus conduction bands up to that total. Its semicore (coarse)
   class is every occupied band below a ≥ 4 eV band gap. The `nval` / `ncond`
