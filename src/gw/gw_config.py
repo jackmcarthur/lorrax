@@ -1761,7 +1761,7 @@ _DEFAULTS = {
     # pooled; the ladder comes from the DFT eigenvalues only).
     "band_extrapolation_estimator": BAND_EXTRAPOLATION_ESTIMATOR_DEFAULT,
     # WHICH three compile-time band brackets feed the estimator.  Preserve
-    # the incumbent total-band 80/90/100 geometry unless a deck explicitly
+    # the incumbent total-band 70/85/100 geometry unless a deck explicitly
     # selects a conduction-coordinate experiment.  This is a COMPUTE
     # choice, unlike band_extrapolation_estimator: changing it recompiles and
     # re-runs Sigma.
