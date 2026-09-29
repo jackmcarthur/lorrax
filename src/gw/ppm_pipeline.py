@@ -402,8 +402,11 @@ def _report_band_extrapolation(
         n_target=plane_wave_band_count(wfn.ngk, int(wfn.nspinor)),
         b0=int(band_slices.b0),
     )
+    # The pooled (beta, Omega) fit reads each external state's DFT energy on
+    # the ladder's own (absolute eV) reference: the model's denominator is
+    # E_A - E_i + Omega.  It is pooled over every state of the QP window.
     fit = fit_band_extrapolation_spectral(
-        sigma_omega.band_counts, s_at_counts, ladder)
+        sigma_omega.band_counts, s_at_counts, ladder, e_state_ev=enk_ev)
 
     # THE STATES A GW RUN IS FOR.  The band edges, located from the actual
     # eigenvalues over the QP window rather than assumed to sit at index
