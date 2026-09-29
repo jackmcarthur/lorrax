@@ -96,7 +96,7 @@ def _shared_pole_omega0_weights(poles2, intervals, E_ref_B, t_node):
 
 def synthesize_shared_pole_parents(
     b_X, b_Y, poles2, intervals, E_ref_B, t_node, *, mesh_xy, gemm, layout="face",
-    weights_fn=_shared_pole_weights,
+    weights_fn=_shared_pole_weights, active_range=False,
 ):
     """Synthesize both raw-parent orientations through the configured G service.
 
@@ -117,6 +117,9 @@ def synthesize_shared_pole_parents(
         Existing mesh with named x/y axes.
     gemm : distrib_la.GemmPlan
         Eagerly planned N,N contraction for this parent and padded pole panel.
+    active_range : bool
+        ``gemm`` was planned with ``enable_active_range=True``: contract only
+        each parent's ``intervals`` columns, the weight applied on the load.
 
     Returns
     -------
@@ -130,7 +133,8 @@ def synthesize_shared_pole_parents(
     if b_X.shape[2] not in (1, 3) or b_Y.shape[2] not in (1, 3):
         raise ValueError("GATE shared_pole_components: expected charge=1 or current=3")
     weights = weights_fn(poles2, intervals, E_ref_B, t_node)
-    plus = _shared_pole_contract(b_X, b_Y, weights, gemm=gemm, layout=layout)
+    plus = _shared_pole_contract(b_X, b_Y, weights, gemm=gemm, layout=layout,
+                                 intervals=intervals if active_range else None)
     # Both faces store the same physical b. Thus (b d b†)^T = b* d b^T
     # even for complex d: transpose the all-mesh operator, never conjugate
     # its causal phase or contract the same pole columns a second time.
@@ -146,7 +150,7 @@ def _shared_pole_factor_specs(layout):
             (P(None, "x", None, None), P(None, "y", None, None)))
 
 
-def _shared_pole_contract(b_X, b_Y, weights, *, gemm, layout="face"):
+def _shared_pole_contract(b_X, b_Y, weights, *, gemm, layout="face", intervals=None):
     """W(τ) = b d b† through G's configured face or axis contraction.
 
     Factors [q,mu,spin,K] use G's face placement under ``layout='face'``;
@@ -154,6 +158,11 @@ def _shared_pole_contract(b_X, b_Y, weights, *, gemm, layout="face"):
     endpoint over its assigned mesh axis.  The result always uses both axes.
     The causal weight [q,K] is separate and replicated. The permutations
     below are local axis views, giving exactly psi_mun and psi_nmu layouts.
+
+    ``intervals`` ``[q,2]`` (the half-open pole columns outside which
+    ``weights`` is zero) contracts only those columns with the weight applied
+    on the load, as G's build does with its band interval; ``gemm`` must then
+    be planned with ``enable_active_range=True``.
     """
     from gw.greens_function_kernel import build_G
 
@@ -162,9 +171,10 @@ def _shared_pole_contract(b_X, b_Y, weights, *, gemm, layout="face"):
     # CT then has different row extents but the same unit spin axis.
     b_X = b_X.reshape(b_X.shape[0], b_X.shape[1] * b_X.shape[2], 1, b_X.shape[3])
     b_Y = b_Y.reshape(b_Y.shape[0], b_Y.shape[1] * b_Y.shape[2], 1, b_Y.shape[3])
+    band_range = None if intervals is None else (intervals[:, 0], intervals[:, 1])
     value = build_G(jnp.transpose(b_X, (0, 2, 1, 3)),
                     jnp.transpose(b_Y, (0, 3, 2, 1)),
-                    phases=weights, layout=layout, gemm=gemm)
+                    phases=weights, layout=layout, gemm=gemm, band_range=band_range)
     # build_G is centroid-major (q, mu, s, nu, s'); the unit spin axes are 2, 4.
     return value[:, :, 0, :, 0]
 
@@ -313,6 +323,7 @@ def _shared_pole_child_ids(header, tables):
 def _shared_pole_routed_synthesis(
     factors, poles2, intervals, E_ref_B, t_node, *, header, tables,
     realize, mesh_xy, gemm, layout="face", weights_fn=_shared_pole_weights,
+    active_range=False,
 ):
     """Synthesize W from routed child factors, DESIGN §3.4 fallback.
 
@@ -325,9 +336,12 @@ def _shared_pole_routed_synthesis(
     children, partners = factors[:2], factors[2:]
     weights = weights_fn(poles2, intervals, E_ref_B, t_node)
     child_weights = weights[tables["parent_rows"]]
-    plus = _shared_pole_contract(*children, child_weights, gemm=gemm, layout=layout)
+    child_intervals = intervals[tables["parent_rows"]] if active_range else None
+    plus = _shared_pole_contract(*children, child_weights, gemm=gemm, layout=layout,
+                                 intervals=child_intervals)
     if partners:
-        transposed = _shared_pole_contract(*partners, child_weights, gemm=gemm, layout=layout)
+        transposed = _shared_pole_contract(*partners, child_weights, gemm=gemm, layout=layout,
+                                           intervals=child_intervals)
         plus, _ = policy.project_fixed_q(
             plus, child_ids, transposed_partner=transposed, measure=False)
     # Conjugacy of stabilizers makes child-space averaging equivalent to
@@ -450,24 +464,15 @@ def _shared_pole_w_synthesis(io, meta, header, frequencies, schedule, *, mesh_xy
             native_workspace = max(native_workspace, workspace_bytes_per_rank(
                 workspace_plan, "gemm", ((count, m, width), (count, width, m)),
                 np.complex128))
-            if "capacity_receipt" in schedule:
-                # Include both asynchronous eager warm calls and their
-                # throwaway A/B/C operands before the actual factor read.
-                # Span-qualified: a ledger stage is an identity, and two panels
-                # of equal (count, width) are two reservations.
-                factor_bytes = (2*m*width/int(mesh_xy.size) if layout == "face" else
-                                m*width*(1/mesh_xy.shape["x"]+1/mesh_xy.shape["y"]))
-                warm_bytes = int(16*count*(factor_bytes+m*m/int(mesh_xy.size)))
-                meta.shared_pole_capacity.reserve(
-                    f"{stage}.gemm_warm.{lo}.{hi}.{count}.{width}",
-                    resident_bytes_per_rank=0,
-                    workspace_bytes_per_rank=2*warm_bytes+native_workspace,
-                    concurrent_with=tuple(schedule["capacity_receipt"]["concurrent_with"]))
 
             def program(span=(lo, hi), tables=tables, local=local, count=count):
                 from distrib_la import gemm_plan
+                # As G's plan: pole columns outside a window's interval are
+                # never contracted, and no warm-up (the plan runs inside the
+                # window executable).
                 gemm = gemm_plan(mesh_xy, m=m, k=width, n=m, nq=count,
-                                 dtype=np.complex128, layout=layout)
+                                 dtype=np.complex128, layout=layout,
+                                 enable_active_range=True, warmup=False)
                 if local:
                     _rows, unfold = _shared_pole_panel_unfold(
                         meta, header, span, mesh_xy=mesh_xy, tables=tables)
@@ -475,7 +480,7 @@ def _shared_pole_w_synthesis(io, meta, header, frequencies, schedule, *, mesh_xy
                     def body(factors, poles2, ranges, e, t):
                         plus, transposed = synthesize_shared_pole_parents(
                             *factors, poles2, ranges, e, t, mesh_xy=mesh_xy, gemm=gemm,
-                            layout=layout, weights_fn=weights_fn)
+                            layout=layout, weights_fn=weights_fn, active_range=True)
                         return unfold(plus, transposed)
                 else:
                     # The realization is the magnetic little-group average the
@@ -486,7 +491,8 @@ def _shared_pole_w_synthesis(io, meta, header, frequencies, schedule, *, mesh_xy
                         _shared_pole_routed_synthesis, header=header, tables=tables,
                         realize=shared_pole_operator_realizer(
                             meta, header, q_full_idx=tables["rows"], mesh_xy=mesh_xy),
-                        mesh_xy=mesh_xy, gemm=gemm, layout=layout, weights_fn=weights_fn)
+                        mesh_xy=mesh_xy, gemm=gemm, layout=layout, weights_fn=weights_fn,
+                        active_range=True)
                 return dict(kernel=jax.jit(body))
             kind = ("synthesis" if weights_fn is _shared_pole_weights
                     else "synthesis." + weights_fn.__name__)
