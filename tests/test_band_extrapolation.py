@@ -500,8 +500,11 @@ def test_snapping_never_crosses_the_next_request():
     gaps = boundary_min_gaps(e, is_full_spectrum=True)
     clean = [n for n in range(39, 64) if gaps[n] > DEGENERACY_TOL_RY]
     assert clean == [40, 60], clean
+    # The 0.80/0.90 fractions that met the defect, named: the fixture pins
+    # the snapping rule, not the default fractions.
     plan = plan_band_brackets(
-        enabled=True, enk_ry=e, n_occ=8, nb_logical=nb, nb_padded=nb)
+        enabled=True, enk_ry=e, n_occ=8, nb_logical=nb, nb_padded=nb,
+        fractions=(0.80, 0.90))
     assert plan.requested == (51, 58, 64)
     assert plan.counts == (40, 60, 64), plan.counts
     assert not plan.notes
