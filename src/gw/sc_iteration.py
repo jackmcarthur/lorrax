@@ -3518,21 +3518,6 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
         if scissor_classes is not None:
             valence_kn, crossing_kn = scissor_classes.masks(e_dft_fit_ev.shape)
             fit_mask_kn = fit_mask_kn & ~crossing_kn
-        # THE TAIL FIT SET (owner 2026-09-29): the protected conduction states
-        # whose DFT energy is within 0.2 (E_cmax - E_F) of E_cmax, the top
-        # protected band's DFT maximum; DFT energies, so the set is fixed.
-        coarse = getattr(getattr(inputs, "meta", None), "coarse_class", None)
-        mu_dft = float(getattr(coarse, "mu_ev", float("nan")))
-        if np.isfinite(mu_dft):
-            from .band_partition import tail_fit_states
-            e_cmax = float(np.max(np.asarray(inputs.e_dft_active_kn_ry,
-                                             dtype=np.float64)[:, -1])) * RYD_TO_EV
-            fit_mask_kn = fit_mask_kn & tail_fit_states(e_dft_fit_ev, e_cmax, mu_dft)
-            if int(state.iteration) == 0:
-                _record_sc(inputs, "    SC sum-band tail fit set: "
-                           f"{int(np.count_nonzero(fit_mask_kn & ~valence_kn))} conduction "
-                           f"(k,state) with E_DFT within 0.2 (E_cmax - E_F) of E_cmax = "
-                           f"{e_cmax - mu_dft:+.3f} eV (before the Z/off-grid exclusions)")
         # The SUM-BAND tail (bands beyond the Sigma window) keeps its
         # per-map refit: freezing it moved the Si b80/c504 QSGW gap by 22 meV
         # at map 6 (si_p4_replay4 vs attempt 3), a closure change on
