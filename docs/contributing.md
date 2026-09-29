@@ -67,9 +67,9 @@ With `lx` (project m4598) the same two lines are
 pytest captures the per-stage walls; add `-s` to see them. The suite's compile
 cache is `.hsuite_jax_cache` in the clone (`HSUITE_CACHE_DIR` moves it).
 
-The drivers' parallel HDF5 needs an MPI world of four, which only srun gives,
-so the P4 verdict is the `lx run -n 4` line above. `lx test` launches one task
-and runs the same cell at P1.
+The P4 verdict is the four-rank `srun` line above (`lx run -n 4` with `lx`).
+A one-rank launch (`lx test`, or `srun -n 1 --gpus-per-node=1`) runs the same
+cell at P1, which is a smoke run, not the verdict.
 
 Beside the suite are the five static AST suites (`test_layering.py`,
 `test_crossfile_requests.py`, `test_env_registry.py`, `test_env_grammar.py`,
