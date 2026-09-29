@@ -49,13 +49,15 @@ def _spectral_fit(counts, S):
     """The shipped estimator on a free-electron ladder of 200 DFT bands.
 
     For the tests of the rulings the fit feeds (SC tolerance, static tail,
-    report notes).  ``-1 + 30/N`` data gives β ≈ 3 and a tail of about
-    0.5 eV at N₃ ≈ 50.
+    report notes).  Every external state sits at 0 eV, far below the
+    sampled shells, so the pooled fit always has a domain.
     """
     n = np.arange(1, 201, dtype=np.float64)
     enk_ry = ((-6.0 + 3.0 * n ** (2.0 / 3.0)) / RYD_TO_EV)[None, :]
     ladder = build_band_ladder(enk_ry=enk_ry, kweights=None, n_target=400)
-    return fit_band_extrapolation_spectral(counts, S, ladder)
+    S = np.asarray(S)
+    return fit_band_extrapolation_spectral(
+        counts, S, ladder, e_state_ev=np.zeros(S.shape[1:]))
 
 
 # ---------------------------------------------------------------------------
