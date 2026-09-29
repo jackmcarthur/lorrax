@@ -1415,9 +1415,14 @@ def _report_patch_z(sigma_c_far, far_kn, e_rel_ev, mesh_xy, band_axis, print_fn)
     zs = np.asarray(z, float)[mask]
     bad = mask & ~((np.asarray(z) > 0.0) & (np.asarray(z) <= 1.0))
     bands = sorted(set((np.nonzero(bad)[1] + 1).tolist()))
-    print_fn(f"  SC semicore Z (patch stencil, +-0.5 eV): n={zs.size} min={zs.min():+.4f} "
-             f"median={np.median(zs):+.4f} max={zs.max():+.4f}; outside (0, 1]: "
-             f"{int(bad.sum())} (k,state)" + (f" in sorted bands {bands}" if bands else ""))
+    line = (f"  SC semicore Z (patch stencil, +-0.5 eV): n={zs.size} min={zs.min():+.4f} "
+            f"median={np.median(zs):+.4f} max={zs.max():+.4f}; outside (0, 1]: "
+            f"{int(bad.sum())} (k,state)" + (f" in sorted bands {bands}" if bands else ""))
+    # The SC loop's print_fn does not reach the production record; rank 0
+    # writes this receipt to stdout as well.
+    print_fn(line)
+    if jax.process_index() == 0:
+        print(line, flush=True)
 
 
 def _compute_ppm_sigma(
