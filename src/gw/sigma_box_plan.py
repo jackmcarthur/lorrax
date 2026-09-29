@@ -14,8 +14,8 @@ both routes.
 
 No rule outlives its process (owner, 2026-09-28: "i really don't want any
 cached rules for quadratures at all"): every plan builds its rules cold, the
-widest crossing window in about a second on the rank's cores
-(``minimax.uniform_rule._map_rows``). Within one run a rule is reused only
+widest crossing window of the gate decks (1148 nodes) in about 3 s on the
+rank's cores (``minimax.uniform_rule._map_rows``), most of it the weight QR. Within one run a rule is reused only
 through the in-process request scope (:func:`_scope_lookup`), so the sector
 calls of one map share their fits.
 """
@@ -55,7 +55,7 @@ from minimax import (
 
 #: The box-rule builder: derived nodes and counts, weights from one linear
 #: solve (``minimax.analytic_box``), certified on the box boundary; no node is
-#: optimized, so a cold plan costs about a second per large window.
+#: optimized; the widest gate window (1148 nodes) builds in about 3 s.
 _BOX_RULE_BUILDER = analytic_box_rule
 
 
@@ -728,9 +728,10 @@ def _rank_assignment(costs, world):
 def _parallel_fits(specs, worker, costs):
     """Fit independent windows once across ranks and replicate small rules.
 
-    Each window is built whole on one rank (:func:`_rank_assignment`); the
-    rule does not depend on the rank, since every rank runs the same BLAS
-    configuration. ``worker(index)``.
+    Each window is built whole on one rank (:func:`_rank_assignment`) and
+    every rank uses the gathered bytes, so no rank's plan depends on its own
+    BLAS; the bytes do follow the launch binding (core count), see
+    ``minimax.uniform_rule._BLAS_THREADS``. ``worker(index)``.
     """
     rank, world = int(process_rank()), int(process_count())
     local = []

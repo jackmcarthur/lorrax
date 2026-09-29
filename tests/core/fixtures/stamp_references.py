@@ -154,9 +154,9 @@ def expected(label: str) -> dict:
         # (89eaa9a3 retired the quadrature time-budget key; d4214ace and
         # a5a35701 renamed the SC accelerator).  No reference was regenerated;
         # the mpa_sc1_* family stays the strict xfail in tests/KNOWN_FAILURES.md.
-        # 2026-09-26: mpa.in / mpa_sc1.in run at the test-deck floor 5e-4; the
-        # shipped rule cache is the schema-v5 set the 8aeb755fc run wrote (the
-        # 23 older-schema files were ignored).  No reference was regenerated.
+        # 2026-09-26: mpa.in / mpa_sc1.in run at the test-deck floor 5e-4.
+        # 2026-09-28: the fixtures ship no Sigma rule files (no rule is stored
+        # across runs); every run builds its rules.  No reference was regenerated.
         result["additional_reference_source_commits"] = {
             "mpa_sc_pad_identity":
                 "0262d4833c470ef5768270ca048de1faaaf06a9b",

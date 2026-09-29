@@ -273,6 +273,23 @@ from types import SimpleNamespace as _NS
 import pytest
 
 
+@pytest.fixture(autouse=True)
+def _fresh_sigma_rule_scopes():
+    """Each cell starts with no Sigma rule held in the in-process scope.
+
+    ``gw.sigma_box_plan._SCOPES`` lives for the process (one run per process
+    in production); without this a later cell could be served an earlier
+    cell's rule by containment (a patched fake, or another deck's), and a
+    result would depend on test order. Read through ``sys.modules`` so a cell
+    that never imports the planner does not import it here.
+    """
+    import sys
+    plan = sys.modules.get("gw.sigma_box_plan")
+    if plan is not None:
+        plan._SCOPES.clear()
+    yield
+
+
 # ---------------------------------------------------------------------------
 # `@pytest.mark.mesh(n)` — THE CELLS THE PIN ABOVE USED TO SILENCE  (2026-08-10)
 # ---------------------------------------------------------------------------

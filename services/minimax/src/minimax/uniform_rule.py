@@ -17,7 +17,8 @@ builder and the planner share:
   (:func:`_map_rows`) the sampled term matrices are evaluated on.
 
 Nothing here is stored across processes: every rule is built cold, in about
-a second for the widest crossing window (owner, 2026-09-28).
+3 s for the widest crossing window of the gate decks (1148 nodes; owner,
+2026-09-28).
 
 Currencies: the RELATIVE error ``|d| |Q - 1/d|`` on a sign-definite box, the
 peak-relative ``eta |Q - 1/d|`` on a crossing box
@@ -42,8 +43,10 @@ __all__ = [
 #: The thread count every rule build runs its BLAS at, whatever the launch
 #: environment. OpenBLAS sums in a thread-count dependent order, so the weight
 #: solve's round-off, and with it a marginal certificate, would otherwise
-#: follow the environment; the pin makes a rule a function of (box, eps) on
-#: one machine class, so a plan is the same on every rank and in every run.
+#: follow the environment. The pin covers the OpenBLAS copies loaded when it is
+#: first taken; scipy's own copy loads later (``analytic_box`` imports
+#: ``scipy.linalg`` inside the pin), so crossing rules still follow the launch
+#: binding (core count) at round-off (KNOWN_LORRAX_ISSUES, NOCACHE review).
 #: 16 is the physical core count of a Perlmutter GPU rank
 #: (``runtime.default_blas_threads``).
 _BLAS_THREADS = 16

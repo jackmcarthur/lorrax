@@ -213,16 +213,18 @@ def test_random_boxes_certify_on_a_finer_cloud():
 
 
 # ---------------------------------------------------------------------------
-# No rule is stored across processes (owner, 2026-09-28): a plan is
-# reproducible because the builder is a function of its arguments, and the
-# row blocks that make a cold build fast change no bit.
+# No rule is stored across processes (owner, 2026-09-28): a plan repeats
+# because the builder repeats its bytes under one launch binding, and the row
+# blocks that make a cold build fast change no bit.
 # ---------------------------------------------------------------------------
 
 @pytest.mark.parametrize("box,kwargs", [
     ((0.05, 3.0, 0.05, 0.05), dict(mass_cap=100.0)),
     ((-0.6, 0.4, 0.1, 0.1), {}),
 ])
-def test_the_builder_is_a_function_of_its_arguments(box, kwargs):
+def test_the_builder_repeats_its_bytes_in_one_process(box, kwargs):
+    """Same process, same binding: same bytes. Across core counts crossing
+    rules differ at round-off (scipy's OpenBLAS is not under the pin)."""
     first = analytic_box_rule(box, 1.0e-4, **kwargs)
     second = analytic_box_rule(box, 1.0e-4, **kwargs)
     assert first.times.tobytes() == second.times.tobytes()

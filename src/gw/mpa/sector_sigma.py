@@ -426,8 +426,8 @@ def compute_sector_sigma(handle, families, bases, meta, mesh_xy, *,
     sectors=manifest['sectors']
     headers=manifest['model_headers']
     # One Sigma-rule scope for the map's sector calls. Their windows differ
-    # only at each sector's pole extremes, and the cache serves any rule whose
-    # certified box contains the request, so TT and CT reuse CC's fits (Fe 4^3
+    # only at each sector's pole extremes, and the in-process scope serves any
+    # rule whose certified box contains the request, so TT and CT reuse CC's fits (Fe 4^3
     # bispinor: 27 cold fits -> 9 per map). Deterministic: fixed sector order.
     from file_io.shared_pole_store import read_shared_pole_census
     census=[]

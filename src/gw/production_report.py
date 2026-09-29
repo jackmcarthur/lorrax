@@ -782,7 +782,7 @@ class GWProductionReport:
                              - sum(value for _, value in screening_details)).floor()
 
         # The dynamic-Sigma executor opens ``sigma.rule_plan`` (box-rule
-        # fitting, cached by box and tolerance) and ``sigma.tau_sweep`` (the
+        # building, reused within the run by box and tolerance) and ``sigma.tau_sweep`` (the
         # tau contraction) under gw_jax.sigma or, in a self-consistent run,
         # under gw_jax.sc_driver. Shared finalization and the fenced setup
         # phases below are disjoint from the plan and sweep.

@@ -54,7 +54,7 @@ def _served(tau, alpha, err, *, family="noncrossing", target="inverse",
         range_param="R", range_value=10.0, error_bound=1.0e-6,
         max_error=err, kappa0=None, kappa1=None,
         provenance=mm.Provenance(
-            source=source, catalog_entry="synthetic/fixture.npz",
+            source=source,
             table_hash="sha256:0000000000000000",
             generator_commit="test", generation_backend="test",
             certified=False))

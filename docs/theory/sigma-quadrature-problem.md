@@ -153,7 +153,7 @@ at most 30% of its distance toward zero, so padding never turns a
 sign-definite box into a crossing one.
 
 No histogram, sampled lattice or error apportionment enters. The same box
-gives the same rule on every deck, which makes rules cacheable and certifies a
+gives the same rule on every deck, which lets one run's plans share rules and certifies a
 low-mass state at the Fermi level exactly as it certifies a heavy one; a
 mass-weighted fit is what loses such a state.
 
@@ -201,7 +201,8 @@ below the band-limit floor (bandwidth × horizon/π), so the remaining savings
 are in η, ε and the window geometry. A sign-definite box costs
 O(log R · log(1/ε)). Neither rule reads a clock, so a rule is a function of
 (box, ε) only, and a rule that cannot be certified is refused in planning,
-before the sweep starts. The rule cache schema is `sigma-box-ry-v7`.
+before the sweep starts. The rule family `sigma-box-ry-v7` salts each rule's
+digest, which orders equal-count candidates when a plan serves a window.
 
 ## 8. Acceptance
 
@@ -254,8 +255,10 @@ The receipt names every refit window and its reason.
 formula and solves one weight system, and the sampled term matrices of the
 weight solve and the certificate are evaluated in row blocks on the rank's
 cores (`minimax.uniform_rule._map_rows`), which changes no bit. The widest
-crossing window of the gate decks (Na 8³, [−15, 19] eV, about 1150 nodes)
-builds in about a second.
+crossing window of the gate decks (Na 8³, [−15, 19] eV, 1148 nodes) builds
+in about 3 s, most of it the weight QR. A rule's bytes follow the launch
+binding (core count) at round-off, since scipy's OpenBLAS is not under the
+builder's thread pin; one binding reproduces them run to run.
 
 **Request scope.** Within one run a rule is reused only through an in-process
 scope. The shared-pole route keys the scope by the map's physical identity
