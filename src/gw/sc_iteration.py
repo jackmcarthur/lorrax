@@ -2691,7 +2691,7 @@ def _sc_far_identities(inputs, shape, mu_ev):
     """
     from .band_partition import WINDOW_CLIP_EV
     from .qp_support import semicore_patch_route
-    cut = getattr(getattr(inputs, "meta", None), "qp_band_cut", None)
+    cut = getattr(getattr(inputs, "meta", None), "coarse_class", None)
     if (cut is None
             or not semicore_patch_route(inputs.config.compute_mode, inputs.wfns_transverse)):
         return np.zeros(shape, dtype=bool)

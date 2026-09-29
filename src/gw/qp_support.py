@@ -290,8 +290,13 @@ def semicore_patches_ev(energy_rel_ev, semicore_kn, near_lo_ev, *, pad_ev=SUPPOR
 #: band_partition.WINDOW_CLIP_EV (outside the owner's +-10 eV error budget)
 #: leave the near grid, whose crossing window's short side they set (Fe 4^3
 #: charge: +26 eV, 347 of 988 map pairs), and are read at their own energy on
-#: held windows above it, grouped by the node law (sigma_box_plan).
-FAR_ETA_EV = 3.0
+#: held windows above it, grouped by the node law (sigma_box_plan).  At the
+#: deck eta those states sit in a resonance with the tail's levels (Fe 4^3
+#: band 26 at k 4/11: QP +19.6..+21.0 eV against tail bands 27/28 at +20.6/
+#: +20.9) and the SC map is bistable there; a far read at 1 eV converges it
+#: (14 maps) and moves E_F +- 1 eV states 6.8 meV std less than 3 eV does
+#: (claim 2960).
+FAR_ETA_EV = 1.0
 
 
 def far_patches_ev(energy_rel_ev, far_kn, near_hi_ev, *, pad_ev=SUPPORT_PAD_EV, previous=()):
