@@ -42,10 +42,8 @@ def face_green_product(A, B, mesh, phases, band_range, n_full=None):
         # outside it are zero, so skipping them is the same product.
         hi = jnp.clip(hi, 0, nb)
         bounds = jnp.stack([jnp.clip(lo, 0, hi), hi], axis=1)
-    if weight is not None:
-        A = A * weight[:, None, :]
     tile_bytes = green_panel_bytes(n_rows=int(n_full or nq), m=m, n=n, mesh=mesh)
-    return panel_matmul(A, B, mesh=mesh, panel_bytes=tile_bytes, bounds=bounds)
+    return panel_matmul(A, B, mesh=mesh, panel_bytes=tile_bytes, bounds=bounds, weights=weight)
 
 
 def green_panel_bytes(*, n_rows, m, n, mesh, room=None):
@@ -79,8 +77,9 @@ def _build_G_face(psi_mun, psi_nmu, *, gemm, Gij=None, phases=None, mesh=None,
             "share (nk, nb, nspinor); got "
             f"{psi_mun.shape} and {psi_nmu.shape}.")
     A = merge_spin_centroid(psi_mun, 1, 2)          # (nk, mu*s, n) P(_,'x','y')
+    face = getattr(gemm, "backend", "local") != "local"
     if (phases is not None and band_range is None
-            and prepared_active_gemm is None):
+            and prepared_active_gemm is None and not face):
         w = phases.astype(A.dtype)                  # (nk, n)
         A = A * w[:, None, :]
     B = merge_spin_centroid(jnp.conj(psi_nmu), 2, 3)  # (nk, n, mu*s) P(_,'x','y')
@@ -99,11 +98,9 @@ def _build_G_face(psi_mun, psi_nmu, *, gemm, Gij=None, phases=None, mesh=None,
         if phases is None:
             raise ValueError("prepared_active_gemm requires per-band phases")
         G_flat = prepared_active_gemm(A, B, weights=phases)
-    elif getattr(gemm, "backend", "local") != "local":
-        # A already carries the phases when there is no band range (above).
-        G_flat = face_green_product(
-            A, B, gemm.mesh, None if band_range is None else phases, band_range,
-            n_full=n_full)
+    elif face:
+        # The phases scale each panel's slice of A on its way into the gather.
+        G_flat = face_green_product(A, B, gemm.mesh, phases, band_range, n_full=n_full)
     else:
         G_flat = (gemm(A, B) if band_range is None
                   else gemm.active_range(A, B, *band_range, weights=phases))
