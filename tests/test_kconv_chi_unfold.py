@@ -121,3 +121,14 @@ def test_chi_unfold_refusal_matches_the_handler_residency_rule():
     assert chi_unfold_refusal((12, 12, 9), 2, a100) == ""     # single pass at one pair, 166016 B
     assert chi_unfold_refusal((8, 8, 8), 4, a100) == ""       # split: plane 18688 B, pencil 33792 B
     assert "opt-in" in chi_unfold_refusal((40, 40, 40), 4, a100)
+
+
+def test_chi_unfold_scratch_follows_the_arm():
+    """The split arm's run-time scratch (one local parent-Green tile) is priced; the single
+    pass draws none (A100 opt-in 166912 B)."""
+    from ffi.fft import chi_unfold_scratch_bytes
+    a100, tile = 166912, 123456789
+    assert chi_unfold_scratch_bytes((8, 8, 8), 2, tile, a100) == 0         # Fe 8^3 ns 2: 73856 B
+    assert chi_unfold_scratch_bytes((12, 12, 9), 2, tile, a100) == 0       # 166016 B, one pair
+    assert chi_unfold_scratch_bytes((8, 8, 8), 4, tile, a100) == tile      # split arm
+    assert chi_unfold_scratch_bytes((12, 12, 12), 2, tile, a100) == tile   # split arm
