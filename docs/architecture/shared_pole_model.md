@@ -60,11 +60,15 @@ are `P(None,'x','y')` on the square X/Y mesh with `P = Px·Py`.
 4. **Constructor** (§3–§6) → `model.h5`, one parent round at a time. An SC
    map keeps the model on the devices instead (`ResidentSectorModel`, the
    photon sectors' carrier) when the model at its stored column bound and one
-   copy fit half the device budget; the head, Σ and, on the accepted final
-   map, the `W0_qmunu` persist read it there, and the next map's boundary or
-   the end of the loop releases it. `write_w`, `write_poles`, a one-shot
-   (restart member) and a refused admission write `model.h5`. A rerun of an
-   interrupted SC run finds no committed model in a resident map's scratch and
+   copy fit half the device budget (`shared_pole_store.admit_resident_model`,
+   the sectors' rule); the head, Σ and, on the accepted final map, the
+   `W0_qmunu` persist read it there, and the next map's entry or the end of
+   the loop releases it. Reads are the file's bytes; Σ and W0 match the file
+   route bit for bit where their panel schedule is unchanged (the resident
+   stage narrows their budget by the model's bytes). `write_w`, `write_poles`,
+   a one-shot (restart member) and a refused admission write `model.h5`. A
+   rerun of an interrupted SC run finds no committed model in a resident map's
+   scratch: it resumes the constructor from a retained file bank, else
    rebuilds that map; a committed `model.h5` still refuses a rebuild.
 5. **Σ** (§8) synthesizes $W_c(\tau)$ from the factors.
 

@@ -605,13 +605,13 @@ def _k_extent(meta, header, live, *, record):
     return extent
 
 
-def model_column_bound(meta, width, *, sector=None):
+def model_column_bound(meta, width):
     """An upper bound of the K extent finalization stores for a writer width.
 
     The SC run's held extent when the width fits it, else the width plus
     :data:`_K_HEADROOM` (``_k_extent`` grows a held extent by that much).
     """
-    return max(_k_extent(meta, dict(sector=sector), int(width), record=False),
+    return max(_k_extent(meta, dict(sector=None), int(width), record=False),
                int(np.ceil(int(width) * (1.0 + _K_HEADROOM))))
 
 
@@ -1536,6 +1536,33 @@ def _resident_slice(mesh, ndim, lead_shape):
     return jax.jit(take, out_shardings=spec)
 
 
+def _model_carrier(mesh, kmax):
+    """The resident model's pole-column carrier: Kmax padded to both mesh axes."""
+    return padded_axis(max(int(kmax), 1), combined_divisor(mesh.shape["x"], mesh.shape["y"]),
+                       name="shared_pole_model_K").carrier
+
+
+def admit_resident_model(ledger, R, stage, upstream):
+    """The one admission of a device-resident model (scalar or sector).
+
+    It stays resident when R and one copy fit in half of the device budget
+    beside ``upstream``; R is then reserved as ``stage``. Returns the receipt:
+    ``residence`` "device" with ``stage``, or "file" with the reason.
+    """
+    receipt = dict(residence="file", payload_bytes_per_rank=int(R))
+    both = ledger.preview(resident_bytes_per_rank=2 * R, workspace_bytes_per_rank=0,
+                          concurrent_with=upstream)
+    receipt["half_budget_bytes_per_rank"] = int(both["available_device_bytes_per_rank"]) // 2
+    if both["aggregate_bytes_per_rank"] > receipt["half_budget_bytes_per_rank"]:
+        receipt["reason"] = "model and one copy exceed half the device budget"
+        return receipt
+    ledger.reserve(stage, resident_bytes_per_rank=R, workspace_bytes_per_rank=0,
+                   concurrent_with=upstream)
+    receipt.update(residence="device", stage=stage,
+                   reason="model and one copy fit in half the device budget")
+    return receipt
+
+
 class ResidentSectorModel:
     """One shared-pole model held on the devices instead of a file.
 
@@ -1548,8 +1575,10 @@ class ResidentSectorModel:
     Kmax], exact zeros past each K; ``poles2_ry2`` [nq, Kmax], 1 past each K)
     on a mesh-divisible carrier, and every reader (census, faces, matrix,
     digest) goes through ``read_slab`` with SlabIO's semantics, so Sigma, the
-    head and the static W read the file route's values bit for bit. Only
-    reads are implemented; writes are the staging.
+    head and the static W read the file route's values bit for bit (their
+    results are bitwise where the Sigma/W0 panel schedule is unchanged: the
+    resident stage narrows that budget by R). Only reads are implemented;
+    writes are the staging.
     """
 
     @staticmethod
@@ -1557,9 +1586,7 @@ class ResidentSectorModel:
         """Per-rank bytes of a finalized model: the factor [nq, rows, K carrier]
         on the XY face plus the replicated poles [nq, K]. ``rows`` is the
         canonical centroid extent times the factor components."""
-        carrier = padded_axis(max(int(kmax), 1), combined_divisor(mesh.shape["x"], mesh.shape["y"]),
-                              name="shared_pole_model_K").carrier
-        return 16*int(nq)*int(rows)*carrier//int(mesh.size) + 8*int(nq)*int(kmax)
+        return 16*int(nq)*int(rows)*_model_carrier(mesh, kmax)//int(mesh.size) + 8*int(nq)*int(kmax)
 
     def __init__(self, mesh, *, label):
         self.mesh = mesh
@@ -1592,8 +1619,7 @@ class ResidentSectorModel:
         """Assemble the file's final datasets from the staged batches."""
         nq, nmu, kmax = header["n_q_irr"], header["n_mu_logical"], header["Kmax"]
         components = header.get("factor_components", 1)
-        carrier = padded_axis(max(kmax, 1), combined_divisor(self.mesh.shape["x"], self.mesh.shape["y"]),
-                              name="shared_pole_model_K").carrier
+        carrier = _model_carrier(self.mesh, kmax)
         counts = np.asarray(header["K"], np.int64)
         factors, poles = [], []
         for batch in sorted(header["batches"], key=lambda row: row["lo"]):

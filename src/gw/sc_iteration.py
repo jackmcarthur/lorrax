@@ -2982,6 +2982,11 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
     call lives here directly — adding a new Σ scheme that wants extra
     W frequencies is purely a screening + compute_sigma_xc change.
     """
+    # The previous map's device-resident shared-pole model has had its last
+    # reader; release it before the rotation and the Hartree rebuild, which
+    # no capacity planner prices it against.
+    from .shared_pole_screening import release_resident_model
+    release_resident_model()
     n_occ = int(inputs.meta.nelec)
     E_qp_ry = U_qp = None
     if state.iteration == 0:
@@ -6640,7 +6645,8 @@ def run_sc_driver(
     # matching fixed-name pre-unfold capture when IBZ storage is selected.
     # The shared-pole route has no static W body: its W0 is the accepted
     # final map's model evaluated at omega = 0 (``restart_static_w``), read
-    # from that map's retained scratch generation.
+    # from the devices (the map's resident model) or from that map's retained
+    # scratch generation.
     from .restart_q_storage import take_pre_unfold
     from .screening import driver_persists_w0, restart_static_w
     mpa = config.compute_mode is ComputeMode.MPA

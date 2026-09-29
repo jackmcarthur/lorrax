@@ -300,8 +300,10 @@ def _bank_residence(meta, config, *, mesh_xy, sym, root, label, photon, mu_bases
 
 #: The device-resident scalar model of this process's latest SC map (at most
 #: one). It lives from its constructor through the map's head and Sigma and,
-#: on the accepted final map, the W0 persist; the next map's boundary or the
-#: end of the SC run releases it (:func:`release_resident_model`).
+#: on the accepted final map, the W0 persist; the next map's entry
+#: (``sc_iteration.gw_iteration_map``, before the wavefunction rotation and
+#: the Hartree rebuild, which no planner prices it against) or the end of the
+#: SC run releases it (:func:`release_resident_model`).
 _RESIDENT_MODEL: list = []
 
 
@@ -318,30 +320,25 @@ def _scalar_model_residence(meta, nq, width, *, mesh_xy, root, identity):
     head, Sigma and, on the accepted final map, the W0 persist
     (``gw.mpa.sigma.shared_pole_static_wc``); no later run reads it (SC
     scratch never serves a restart). It stays resident under the sector
-    models' admission rule (``shared_pole_sectors._sector_model_residence``):
-    R, its bytes at the stored K extent's bound (``model_column_bound`` of
-    the constructor's column width), and one copy fit in half of the device
+    models' admission (``shared_pole_store.admit_resident_model``): R, its
+    bytes at the stored K extent's bound (``model_column_bound`` of the
+    constructor's column width), and one copy fit in half of the device
     budget beside the live stages. The constructor has finished when this is
-    asked, so its route cannot change. Otherwise model.h5 is written as
-    before. Returns ``(model or None, receipt)``; a resident R is reserved as
+    asked, so its route cannot change; Sigma and the W0 persist price R, so
+    their results match the file route bit for bit where their panel schedule
+    is unchanged. Otherwise model.h5 is written as before. Returns ``(model or None, receipt)``; a resident R is reserved as
     ``receipt["stage"]`` and the model is held for :func:`release_resident_model`.
     """
-    from file_io.shared_pole_store import ResidentSectorModel, model_column_bound
+    from file_io.shared_pole_store import (ResidentSectorModel, admit_resident_model,
+                                           model_column_bound)
     ledger = meta.shared_pole_capacity
     R = ResidentSectorModel.payload_bytes(mesh_xy, nq, meta.mu_basis.n_canonical,
                                           model_column_bound(meta, width))
-    receipt = dict(residence="file", payload_bytes_per_rank=int(R))
-    both = ledger.preview(resident_bytes_per_rank=2 * R, workspace_bytes_per_rank=0,
-                          concurrent_with=ledger.live_stages)
-    receipt["half_budget_bytes_per_rank"] = both["available_device_bytes_per_rank"] // 2
-    if both["aggregate_bytes_per_rank"] > receipt["half_budget_bytes_per_rank"]:
-        receipt["reason"] = "model and one copy exceed half the device budget"
+    receipt = admit_resident_model(
+        ledger, R, f"scalar_model.{identity['iteration_id']}.{len(ledger.entries)}",
+        ledger.live_stages)
+    if receipt["residence"] != "device":
         return None, receipt
-    stage = f"scalar_model.{identity['iteration_id']}.{len(ledger.entries)}"
-    ledger.reserve(stage, resident_bytes_per_rank=R, workspace_bytes_per_rank=0,
-                   concurrent_with=ledger.live_stages)
-    receipt.update(residence="device", stage=stage,
-                   reason="model and one copy fit in half the device budget")
     model = ResidentSectorModel(mesh_xy, label=str(root / "model.h5"))
     _RESIDENT_MODEL.append(model)
     return model, receipt
@@ -442,8 +439,7 @@ def screen_shared_poles(wfns, V_q, meta, config, *, mesh_xy, sym,
         recipe, ledger = meta.shared_pole_recipe, meta.shared_pole_capacity
         # This is the top-level map boundary. All upstream V/psi carriers are
         # inherited; no newly allocated bank/constructor arrays exist yet.
-        # The previous SC map's resident model has had its last reader.
-        release_resident_model()
+        # (The SC map entry already released the previous map's resident model.)
         ledger.live_stages = ()
         if occupation_state is not None:
             from common.collectives import replicate_to_mesh

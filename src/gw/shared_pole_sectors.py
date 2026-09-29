@@ -440,29 +440,22 @@ def _sector_model_residence(meta,config,header,mu_bases,execution_rows,*,mesh_xy
     Returns ``(models or None, receipt)``; a resident R is reserved as
     ``receipt["stage"]``.
     """
-    from file_io.shared_pole_store import ResidentSectorModel
+    from file_io.shared_pole_store import ResidentSectorModel,admit_resident_model
     ledger=meta.shared_pole_capacity
     nq=int(header['n_q_irr'])
     bound=[min(row['signed_side_bound'],row['conservative_pencil_side']) for row in execution_rows]
     rows=dict(CC=(mu_bases[0].n_canonical,bound[0]),TT=(3*mu_bases[1].n_canonical,bound[1]),
               CT_C=(mu_bases[0].n_canonical,sum(bound)),CT_T=(3*mu_bases[1].n_canonical,sum(bound)))
     R=sum(ResidentSectorModel.payload_bytes(mesh_xy,nq,n,k) for n,k in rows.values())
-    receipt=dict(residence='file',payload_bytes_per_rank=int(R))
-    both=ledger.preview(resident_bytes_per_rank=2*R,workspace_bytes_per_rank=0,
-                        concurrent_with=upstream)
-    receipt['half_budget_bytes_per_rank']=both['available_device_bytes_per_rank']//2
-    if both['aggregate_bytes_per_rank']>receipt['half_budget_bytes_per_rank']:
-        receipt['reason']='models and one copy exceed half the device budget'
+    receipt=admit_resident_model(ledger,R,f"sector_models.{header['identity']['iteration_id']}",upstream)
+    if receipt['residence']!='device':
         return None,receipt
-    stage=f"sector_models.{header['identity']['iteration_id']}"
-    ledger.reserve(stage,resident_bytes_per_rank=R,workspace_bytes_per_rank=0,
-                   concurrent_with=upstream)
     if sector_execution(meta,config,mu_bases,nq,mesh_xy=mesh_xy,
-                        upstream=(*upstream,stage))[0]!=route:
-        receipt['reason']='constructor would change route with the models live'
+                        upstream=(*upstream,receipt['stage']))[0]!=route:
+        receipt.update(residence='file',reason='constructor would change route with the models live')
+        del receipt['stage']
         return None,receipt
-    receipt.update(residence='device',stage=stage,
-                   reason='models, one copy and the unchanged constructor route fit')
+    receipt['reason']='models, one copy and the unchanged constructor route fit'
     return {name:ResidentSectorModel(mesh_xy,label=str(root/(name+'.h5'))) for name in rows},receipt
 
 
