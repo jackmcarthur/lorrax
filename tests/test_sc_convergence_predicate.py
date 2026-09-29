@@ -134,3 +134,24 @@ def test_mismatched_energy_shapes_refuse():
         protected_band_convergence(
             np.zeros((2, 6)), np.zeros((3, 6)),
             np.ones(6, dtype=bool), np.ones(6, dtype=bool), 5.0e-3)
+
+
+def test_nonconvergence_block_names_bands_not_k():
+    """The last-map block: median over all states, bands (1-based) by class."""
+    e_prev = np.zeros((3, 6))
+    e_new = e_prev.copy()
+    protected = np.array([True] * 4 + [False] * 2)
+    in_range = protected.copy()
+    e_new[1, 1] = 30.0e-3            # > 20 meV
+    e_new[2, 3] = 2.0e-3             # > cutoff only
+    e_new[0, 5] = 50.0e-3            # scissored: median only, never listed
+    v = protected_band_convergence(e_new, e_prev, protected, in_range, 1.0e-3)
+    assert not v.converged
+    assert v.median_abs_all_ev == 0.0
+    assert v.bands_over_large_move == (1,)
+    assert v.bands_over_cutoff == (1, 3)
+    lines = v.nonconvergence_lines(band_offset=10, n_maps=3)
+    assert "3 GW map calls" in lines[0]
+    assert "median |dE| over all states = 0.0000 meV" in lines[1]
+    assert lines[2].endswith("> 20 meV: 12")
+    assert lines[3].endswith("sc_tol_ev = 1 meV: 12,14")
