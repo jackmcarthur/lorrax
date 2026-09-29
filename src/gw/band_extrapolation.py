@@ -65,9 +65,9 @@ something other than band convergence:
 WHERE THE POINTS GO.  Default 70 / 85 / 100 % of the total Σ band count
 (owner ruling 2026-09-28; ``BRACKET_FRACTIONS``).  The pooled form reads
 the widest shell for each state's amplitude and one interior point for the
-shape, so it wants the shells wide; its scores move by ≤ 3 meV across
-placements at 78 bands on Si, where the per-state form moved by up to
-100 meV.
+shape, so it wants the shells wide; its std moves by ≤ 2.7 meV (case a)
+and ≤ 3.6 meV (case c) across placements at 78 bands on Si, where the
+per-state form moved by up to 100 meV.
 
 THE DEFAULT FRACTIONS ARE OF THE TOTAL BAND COUNT, NOT OF THE CONDUCTION
 COUNT — and since 2026-08-22 that is a NAMED default
@@ -161,9 +161,10 @@ wins.  Then
 
     Ŝ_i = S(N₃) + (S(N₃) − S(N₁)) · G_i(N₃, N_T) / G_i(N₁, N₃).
 
-The pooled set is the requested states (the QP window) that lie below every
-band above N₁, ``E_i < min_k E[N₁+1, k]``, so every one of them is in the
-model's domain at every grid point.  The grid is searched, not optimised: a
+The pooled set is the states within ±10 eV of E_F (closed over multiplets,
+:func:`pooled_state_mask`) that lie below every band above N₁,
+``E_i < min_k E[N₁+1, k]``, so every one of them is in the model's domain at
+every grid point.  Every state of the QP window in the domain gets its tail.  The grid is searched, not optimised: a
 closed-form evaluation per point, no nonlinear solver.  The shell sums are
 evaluated on a composite Gauss compression of each shell's spectrum in
 ``log(E − E_ref)`` (:func:`_log_energy_rule`), exact to ~1e-16 relative, so
@@ -190,8 +191,8 @@ median 4v4c direct, meV.  This function reproduces the study's scores to
     34   14, 20, 34   49.0 / 168.0 / 52.8  53.6 / 179.3 / 57.8
 
 No extrapolation at 78 bands: 29.2 / 90.5 / 35.8 (a), 34.6 / 121.8 / 38.0 (c).
-The pooled form moves by ≤ 3 meV std across placements at 78 bands; the
-per-state form moved by up to 100 meV.  One material; the gap error (−19 to
+The pooled form's std moves by ≤ 2.7 meV (case a) and ≤ 3.6 meV (case c)
+across placements at 78 bands; the per-state form moved by up to 100 meV.  One material; the gap error (−19 to
 +19 meV at 78 bands, case a) is not controlled by the fit.
 
 **E₀ AND THE BAND LADDER COME FROM THE DFT EIGENVALUES ONLY, NEVER FROM THE
@@ -278,9 +279,9 @@ from common.units import RYD_TO_EV
 #: of the spectrum into the fit.  On Si 4³ at 78 bands (complete-basis truth,
 #: sandbox run DEV/602) these fractions snap to (50, 64, 78): 9.2 meV std over
 #: the ±10 eV states and 32.9 meV max 4v4c error with W at 536 bands; the old
-#: (0.80, 0.90) snap to (64, 72, 78): 6.5 / 33.6 meV.  The pooled form moves
-#: by ≤ 3 meV std over every placement measured at 78 bands, so the choice is
-#: not tuned on that difference.  The cuts are then degeneracy-snapped by
+#: (0.80, 0.90) snap to (64, 72, 78): 6.5 / 33.6 meV.  The pooled form's std
+#: moves by ≤ 2.7 meV (case a) and ≤ 3.6 meV (case c) over the placements
+#: measured at 78 bands, so the choice is not tuned on that difference.  The cuts are then degeneracy-snapped by
 #: :func:`plan_band_brackets`.
 BRACKET_FRACTIONS: tuple[float, float] = (0.70, 0.85)
 
@@ -1150,6 +1151,29 @@ SHELL_BETA_GRID: tuple[float, float, float] = (2.0, 8.0, 0.25)
 #: of the BANDEX study.
 SHELL_OMEGA_GRID_EV: tuple[float, float, float] = (0.0, 40.0, 2.0)
 
+#: The pooled set: states within this distance of E_F, eV, closed over
+#: degenerate multiplets at each k (:func:`pooled_state_mask`).  It is the
+#: owner's ±10 eV requested budget and the set the BANDEX study validated
+#: the form on; semicore states in a wide QP window must not set (β, Ω).
+SHELL_POOL_WINDOW_EV: float = 10.0
+
+#: Two states at one k closer than this, eV, are one multiplet for the pool
+#: (the 0.1 meV threshold of the BANDEX scorer).
+SHELL_POOL_DEGENERACY_EV: float = 1.0e-4
+
+
+def pooled_state_mask(e_rel_ev) -> np.ndarray:
+    """States that set (β, Ω): ``|E − E_F| ≤`` :data:`SHELL_POOL_WINDOW_EV`, closed over multiplets.
+
+    ``e_rel_ev`` is ``(nk, nb)``, E − E_F in eV.  A state enters if any state
+    of its own k within :data:`SHELL_POOL_DEGENERACY_EV` is inside the window.
+    """
+    e = np.asarray(e_rel_ev, dtype=np.float64)
+    inside = np.abs(e) <= SHELL_POOL_WINDOW_EV
+    same = np.abs(e[..., :, None] - e[..., None, :]) <= SHELL_POOL_DEGENERACY_EV
+    return np.any(same & inside[..., None, :], axis=-1)
+
+
 #: Offsets scanned when fitting ``E_n = E₀ + C·(n + n₀)^(2/3)``.  n₀ is a
 #: single integer shift of the band ladder, so an integer scan is the whole
 #: parameter space; on the Si deck the minimum lands at n₀ = 0.
@@ -1680,8 +1704,8 @@ def fit_band_extrapolation_spectral(
     e_state_ev : array broadcastable to the trailing shape
         DFT energy of each external state, eV, on the ladder's reference.
     fit_mask : bool array of the trailing shape, optional
-        The states (β, Ω) is pooled over.  Default: every state (the run's
-        QP evaluation window is its requested set).
+        The states (β, Ω) is pooled over.  Default: every state.  Production
+        passes :func:`pooled_state_mask` (±10 eV of E_F).
 
     The model (module docstring, POOLED DENOMINATOR SHELL): band A adds
     ``a_i · Σ_k w_k (E_Ak − E_i + Ω)^(−β)`` to state i, with ONE (β, Ω) pooled
@@ -2311,6 +2335,9 @@ __all__ = [
     "SHELL_FAIL_NO_FIT",
     "SHELL_BETA_GRID",
     "SHELL_OMEGA_GRID_EV",
+    "SHELL_POOL_WINDOW_EV",
+    "SHELL_POOL_DEGENERACY_EV",
+    "pooled_state_mask",
     "extrapolation_weights",
     "spectral_h5_payload",
     "BandBracketCountMismatch",

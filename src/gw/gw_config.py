@@ -1693,7 +1693,7 @@ _DEFAULTS = {
     # Band-convergence extrapolation of Sigma_c (gw.band_extrapolation).
     # ON by default since 2026-08-16 (owner ruling).  ON evaluates the
     # Sigma_c band sum at THREE band counts in one pass.  The default
-    # bracket scheme is 80 %, 90 % and 100 % of the TOTAL **SIGMA** band
+    # bracket scheme is 70 %, 85 % and 100 % of the TOTAL **SIGMA** band
     # count (``number_bands_sigma``, NOT ``number_bands_chi``); the explicit
     # ``band_extrapolation_bracket_scheme`` below can instead select the
     # conduction-half / k-mean-energy-midpoint geometry.  Both prefer
@@ -1739,22 +1739,14 @@ _DEFAULTS = {
     # WHICH band-convergence estimator consumes the three bracket sums.  One
     # value is accepted; the key changes no compute.
     #
-    #   spectral_shell   DEFAULT since 2026-08-17.  Solves one decay exponent
-    #                    PER EXTERNAL STATE from the ratio of the two observed
-    #                    shell increments against spectral moments of the DFT
-    #                    eigenvalues, then integrates the remaining tail to
-    #                    the finite plane-wave basis N_PW = min(ngk)*nspinor.
-    #                    Held out against a MEASURED S(508) on the Si 50 Ry
-    #                    508-band arm its median error is 4.7 / 14.7 / 12.5 /
-    #                    0.7 / 0.0 meV at N_max = 152 / 204 / 260 / 296 / 396.
-    #                    A state with no usable exponent keeps S(N3); it never
-    #                    clips and never substitutes.
+    #   spectral_shell   the pooled denominator shell (since 2026-09-28):
+    #                    one (beta, Omega) over the requested states, tail to
+    #                    N_PW = min(ngk)*nspinor; docs/theory/band-extrapolation.md.
     #   band_index_only  DELETED 2026-09-27 (owner ruling); refuses by name,
     #                    see _RETIRED_BAND_EXTRAPOLATION_ESTIMATORS.
     #
-    # See gw.band_extrapolation's module docstring for the derivation, the
-    # held-out table and the owner rulings (beta is per-state and is never
-    # pooled; the ladder comes from the DFT eigenvalues only).
+    # See gw.band_extrapolation's module docstring for the model and the
+    # measured errors (the ladder comes from the DFT eigenvalues only).
     "band_extrapolation_estimator": BAND_EXTRAPOLATION_ESTIMATOR_DEFAULT,
     # WHICH three compile-time band brackets feed the estimator.  Preserve
     # the incumbent total-band 70/85/100 geometry unless a deck explicitly
@@ -4093,10 +4085,8 @@ class DynamicSigmaConfig:
                 f"{self.band_extrapolation_estimator!r} is not a known "
                 f"band-convergence estimator.  The one accepted value is "
                 f"{BAND_EXTRAPOLATION_ESTIMATORS}: 'spectral_shell' (the "
-                f"DEFAULT -- one decay exponent per external state from the "
-                f"two shell increments against spectral moments of the DFT "
-                f"eigenvalues, tail integrated to the finite plane-wave "
-                f"basis).")
+                f"pooled denominator shell; "
+                f"docs/theory/band-extrapolation.md).")
         if self.band_extrapolation_bracket_scheme not in BRACKET_SCHEMES:
             raise ValueError(
                 f"band_extrapolation_bracket_scheme = "

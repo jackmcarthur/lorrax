@@ -57,9 +57,12 @@ to the DFT eigenvalues only. The coefficients (−r_i, 0, 1 + r_i) are real and
 sum to 1; an off-diagonal element uses (r_i + r_j)/2, so the extrapolated Σ
 stays Hermitian and is diagonalized after extrapolation.
 
-The pooled states are the QP window's states below every band above N₁
-(E_i < min_k E_{N₁+1,k}). A state with E_i − Ω at or above that band has a
-pole of the model inside the sum and keeps S(N₃); the log names it.
+The pooled states are those within ±10 eV of E_F, closed over degenerate
+multiplets, that lie below every band above N₁ (E_i < min_k E_{N₁+1,k}).
+Semicore states in a wide QP window therefore do not set (β, Ω); every
+QP-window state in the model's domain still gets its tail. A state with
+E_i − Ω at or above that band has a pole of the model inside the sum and
+keeps S(N₃); the log names it.
 
 ## Why pooled
 
@@ -71,13 +74,22 @@ and leaves each state one amplitude, which the widest shell determines.
 ## Cost
 
 Every shell sum is evaluated on a composite Gauss compression of the shell's
-spectrum in log(E − E_ref), exact to about 1e-16 relative. The 525-point grid
-and the tail cost about 10 ms on Si 4³ (71 pooled states) and 0.08 s for 1200
-states with a 152 012-band tail.
+spectrum in log(E − E_ref), exact to about 1e-16 relative. The cost is linear
+in the pooled states: about 10 ms for the 71 Si 4³ states of the rescore,
+0.038 s for 896 pooled states in a production GN-PPM run (compute node), and
+0.08 s for 1200 states with a 152 012-band tail (login node, one thread).
 
 ## Measured
 
-Si 4³, 25 Ry, scalar, shared-pole W, complete basis (536 bands) as the truth;
+**Production route (GN-PPM).** Si 4³, 25 Ry, scalar, complete-basis WFN, 78
+against 536 bands with the same ISDF basis and ε, head off; std over the
+±10 eV states / max 4v4c / median 4v4c / gap error, meV (sandbox run
+DEV/602): no extrapolation 34.4 / 107.1 / 36.8 / −96.4; the per-state form
+(cuts 64, 72, 78) 87.8 / 187.1 / 74.0 / −104.8; pooled (cuts 50, 64, 78;
+β 4.75, Ω 38 eV) 19.9 / 72.0 / 20.5 / −53.3.
+
+**Study (shared-pole W, stored samples).** Si 4³, 25 Ry, scalar, complete
+basis (536 bands) as the truth;
 71 degeneracy-closed states within ±10 eV of midgap. G truncated at N; W at
 536 bands (case a) or at N (case c). Std over the states / max 4v4c difference
 error / median 4v4c direct error, meV (sandbox BANDEX study, claims 2898 and
@@ -92,8 +104,17 @@ error / median 4v4c direct error, meV (sandbox BANDEX study, claims 2898 and
 | 34 | 14, 20, 34 | 49.0 / 168.0 / 52.8 | 53.6 / 179.3 / 57.8 |
 
 The per-state form at the old default cuts (64, 72, 78) scored
-109 / 278 / 113 meV in case a. The pooled form moves by at most 3 meV std
-across the placements measured at 78 bands. The gap error (−19 to +19 meV at
+109 / 278 / 113 meV in case a. The pooled form's std moves by at most
+2.7 meV (case a) and 3.6 meV (case c) across the placements measured at 78
+bands.
+
+The fitted Ω sits at 36–38 eV, near its 40 eV bound, on 5 of the 6 distinct
+placements at 78 bands (the exception is (34, 50, 78), case a, Ω = 12 eV).
+The residual is flat along a ridge in (β, Ω). With the bound at 80 eV the
+fit moves along it (Ω 44–80 eV, β up to 6.75) and the scores change by
+−1.3 to +2.2 meV std at 78 bands, mostly for the worse (default cuts: 9.2 →
+9.3 meV in case a, 20.5 → 21.9 meV in case c); at 34 and 50 bands by 0 to
++3.5 meV. The 40 eV bound is kept. The gap error (−19 to +19 meV at
 78 bands, case a) is not controlled by the fit. One material: Si. At 34 and 50
 bands the default cuts fall inside multiplets on this spectrum and were not
 among the stored samples.
