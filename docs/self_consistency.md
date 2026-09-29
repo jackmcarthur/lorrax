@@ -180,21 +180,13 @@ E_F ± 1 eV std/max 3.6/15.9 meV (Fe 4³, against η_semi 1 eV) and 2.9/20.0 meV
 (MoS2 3×3, against the deck η), growing about 1.2 and 0.6 meV std per eV
 (claim 2960).
 
-**Far conduction** (owner 2026-09-29; no material constant). A protected
-conduction state n is read at $\eta_n = \max(\eta, \Gamma_n)$, with
-$\Gamma_n = |{\rm Im}\,\Sigma_{nn}(E_n)|$ from the map-0 Σ (read on the near
-grid at the deck η). The far class is every protected state above the highest
-protected conduction state with $\Gamma_n \le \eta$ (`qp_support.far_class_kn`);
-from map 1 it leaves the near grid, whose crossing window's short side it
-set, and is read at its own energy on held windows above it
-(`qp_support.far_windows_ev`: each window's η is a step of
-$\min_{E_m \ge E}\eta_m$ rounded down to $\eta\,2^j$, so no window reads a state
-broader than its own $\Gamma$), grouped and certified as the coarse windows.
-Map 1 re-plans the support and the Σ rules once for this; then they are
-held. The protected end of every off-diagonal Hermitian average is still read
-on the near grid at the deck η, so the mixing of far states with protected
-ones is kept. At the deck η the matrix-top states of Fe 4³ sit in a resonance
-with the tail's levels and the SC map is bistable there (claim 2960).
+**Conduction states** (owner 2026-09-29: "i'd rather default be all cond bands
+have the same broadening"): every protected conduction state is read on the
+near grid at the deck η; there is no far-conduction class. On Fe 4³ prot
+(`number_bands_protected = 26`) the matrix-top band 26 at k 4/11 then sits
+among the scissored tail's levels (+20.6 to +21 eV) with a resonant Σ, and
+the SC map is bistable; `number_bands_protected = 35`, which closes the
+manifold, removes the tail there (claim 2960).
 A QP matrix [b0, b3) that ends inside a band manifold (band b3's maximum over
 k above band b3+1's minimum) is warned about in the log, which names the
 `number_bands_protected` that closes the manifold; it is not refused. Only the
