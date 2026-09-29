@@ -82,6 +82,11 @@ V_QMUNU_FORMAT = "bispinor_lorentz_v2"
 V_QMUNU_INVENTORY_SCHEMA = 1
 V_QMUNU_INVENTORY_DATASET = "v_qmunu_unique_tile_inventory"
 V_QMUNU_DATA_READY_DATASET = "v_qmunu_data_ready"
+# One generation receipt per written file: the producing policy (formatted
+# Coulomb policy, TT head flag) plus a fresh generation id.  The restart
+# tensor written in the same run copies it; a restart refuses a file whose
+# receipt differs (``file_io.restart_bundle.require_bispinor_v_pairing``).
+V_QMUNU_RECEIPT_DATASET = "v_qmunu_generation_receipt"
 V_QMUNU_TILE_DTYPE = np.dtype(np.complex128)
 
 
@@ -751,6 +756,7 @@ def compute_V_q_bispinor_g_flat_to_h5(
     cc_tile: "ParkedVTiles | None" = None,
     tt_tiles: "ParkedVTiles | None" = None,
     current_basis_rows=None,
+    policy: dict | None = None,
 ) -> tuple[Path, tuple[jax.Array, jax.Array, jax.Array, jax.Array]]:
     """Stream the 7 unique bispinor V_q^{μ_L, ν_L} tiles to HDF5 via the
     G-flat per-q + G-chunked path.
@@ -906,6 +912,13 @@ def compute_V_q_bispinor_g_flat_to_h5(
     # coordination.  data_ready=True is deliberately the final mutation.
     if jax.process_index() == 0:
         with h5py.File(output_h5_path, "a") as f:
+            if policy is not None:
+                import uuid
+                if V_QMUNU_RECEIPT_DATASET in f:
+                    del f[V_QMUNU_RECEIPT_DATASET]
+                f.create_dataset(V_QMUNU_RECEIPT_DATASET, data=json.dumps(
+                    {**policy, "generation": uuid.uuid4().hex},
+                    sort_keys=True))
             _publish_unique_tile_inventory(
                 f, filename=output_h5_path, n_q_total=nq_total,
                 n_rmu_C=n_rmu_C, n_rmu_T=n_rmu_T,

@@ -1750,12 +1750,55 @@ def _transverse_lu_ridge(trace, n_log):
     return _TRANSVERSE_LU_RIDGE * jnp.sign(jnp.real(trace)) * jnp.abs(trace) / n_log
 
 
+#: Largest normwise backward error of the transverse LU solve, measured on a
+#: fixed probe right-hand side (a stable pivoted LU gives ~1e-15..1e-13).
+_TRANSVERSE_LU_BACKWARD_MAX = 1e-8
+
+
 def _transverse_lu_math(C_log: jax.Array, n_log: int):
-    """Factor the logical signed Gram with its sign-aware ridge before the unchanged RHS solve."""
+    """Factor the logical signed Gram with its sign-aware ridge before the unchanged RHS solve.
+
+    Also returns the solve's normwise backward error on one fixed probe,
+    eta = ||C x - b|| / (||C||_F ||x|| + ||b||) with b = C x0 and x0 unit
+    phases: O(n^2) next to the O(n^3) factor, on the whole tile the factor
+    already holds.  LU and pivots are unchanged by it.
+    """
     ridge = _transverse_lu_ridge(jnp.trace(C_log), n_log)
     C_reg = C_log + ridge * jnp.eye(n_log, dtype=C_log.dtype)
     lu, piv, _perm = jax.lax.linalg.lu(C_reg)
-    return lu, piv.astype(jnp.int32)
+    piv = piv.astype(jnp.int32)
+    phase = jnp.arange(n_log, dtype=jnp.float64) * 0.6180339887498949
+    x0 = jnp.exp(2j * jnp.pi * phase).astype(C_reg.dtype)
+    b = C_reg @ x0
+    x = jax.scipy.linalg.lu_solve((lu, piv), b, trans=0)
+    eta = (jnp.linalg.norm(C_reg @ x - b)
+           / (jnp.linalg.norm(C_reg) * jnp.linalg.norm(x) + jnp.linalg.norm(b)))
+    return lu, piv, eta.astype(jnp.float64)
+
+
+def _certify_transverse_lu_residual(eta_q, *, where: str) -> None:
+    """Refuse a transverse ζ LU whose probe backward error exceeds the bound."""
+    mode = rank_criterion.resolve_policy_mode(
+        os.environ.get(rank_criterion.POLICY_MODE_ENV))
+    if mode == "off":
+        return
+    eta = np.asarray(jax.device_get(eta_q), dtype=float).reshape(-1)
+    worst = float(np.max(eta)) if eta.size else 0.0
+    q_at = int(np.argmax(eta)) if eta.size else -1
+    if jax.process_index() == 0:
+        print(f"  [{where}] residual: probe backward error "
+              f"||Cx-b||/(||C||_F||x||+||b||) worst over q = {worst:.3e} at "
+              f"q={q_at} (bound {_TRANSVERSE_LU_BACKWARD_MAX:.0e})", flush=True)
+    if np.isfinite(worst) and worst <= _TRANSVERSE_LU_BACKWARD_MAX:
+        return
+    msg = (f"GATE transverse_zeta_lu_residual: {where}: probe backward error "
+           f"{worst:.3e} at q={q_at} exceeds {_TRANSVERSE_LU_BACKWARD_MAX:.0e}; "
+           f"the pivoted LU of the indefinite current Gram does not solve it.  "
+           f"Fix: reduce the transverse centroid count.  Override: "
+           f"{rank_criterion.POLICY_MODE_ENV}=warn.")
+    if mode == "refuse":
+        raise rank_criterion.RankPolicyError(msg)
+    print("*** " + msg, flush=True)
 
 
 def _certify_transverse_ridge(LU_q: jax.Array, *, n_log: int,
@@ -1821,7 +1864,7 @@ def _embed_lu_padded(LU_log: jax.Array, n_rmu: int, n_log: int,
 
 def _factor_c_q_transverse_lu(
     C_q: jax.Array, mesh_xy: Mesh, n_rmu_logical: int,
-) -> tuple[jax.Array, jax.Array]:
+) -> tuple[jax.Array, jax.Array, jax.Array]:
     """LOCAL-plan hoisted transverse factor: per-q pivoted LU of the ridged LOGICAL block, once per channel; see docs/architecture/zeta_fit_face_psi_cct.md."""
     nq, n_rmu, _ = C_q.shape
     n_log = int(n_rmu_logical)
@@ -1838,7 +1881,8 @@ def _factor_c_q_transverse_lu(
         key = (_mesh_key(mesh_xy), int(n_rmu), n_log, 'batch')
         if key not in _transverse_lu_cache:
             @partial(jax.jit,
-                     out_shardings=(out_sh, NamedSharding(mesh_xy, P(None, None))))
+                     out_shardings=(out_sh, NamedSharding(mesh_xy, P(None, None)),
+                                    NamedSharding(mesh_xy, P(None))))
             def _fn(C):
                 def _fact_log(C_log):
                     C_log = jax.lax.with_sharding_constraint(
@@ -1847,9 +1891,9 @@ def _factor_c_q_transverse_lu(
                         lambda C1: _transverse_lu_math(C1, n_log))(C_log)
                 # Slice to logical, factor, re-embed (LU only; perm is
                 # logical-extent by definition).
-                LU_log, perm = _fact_log(C[:, :n_log, :n_log])
+                LU_log, perm, eta = _fact_log(C[:, :n_log, :n_log])
                 return _embed_lu_padded(LU_log, int(n_rmu), n_log,
-                                        mesh_xy), perm
+                                        mesh_xy), perm, eta
             _transverse_lu_cache[key] = _fn
         _fn = _transverse_lu_cache[key]
         if step >= nq:
@@ -1861,7 +1905,8 @@ def _factor_c_q_transverse_lu(
         perm_q = jax.device_put(
             jnp.concatenate([p[1] for p in parts], axis=0),
             NamedSharding(mesh_xy, P(None, None)))
-        return LU_q, perm_q
+        eta_q = jnp.concatenate([p[2] for p in parts], axis=0)
+        return LU_q, perm_q, eta_q
     key = (_mesh_key(mesh_xy), int(nq), int(n_rmu), n_log, 'qpar')
     if key not in _transverse_lu_cache:
         _qparallel_announce_transverse(nq, n_rmu, n_log, mesh_xy)
@@ -1881,36 +1926,42 @@ def _factor_c_q_transverse_lu(
             dev = jax.lax.axis_index('x') * py + jax.lax.axis_index('y')
 
             def _fact(C1):
-                lu1, perm1 = _transverse_lu_math(C1[0], n_log)
-                return lu1[None], perm1[None]
+                lu1, perm1, eta1 = _transverse_lu_math(C1[0], n_log)
+                return lu1[None], perm1[None], eta1[None]
 
             def _skip(C1):
                 return (jnp.zeros_like(C1),
-                        jnp.zeros((1, n_log), dtype=jnp.int32))
+                        jnp.zeros((1, n_log), dtype=jnp.int32),
+                        jnp.zeros((1,), dtype=jnp.float64))
 
             def _one(i, accs):
-                LU_acc, perm_acc = accs
+                LU_acc, perm_acc, eta_acc = accs
                 C1 = jax.lax.dynamic_slice_in_dim(C_loc, i, 1, axis=0)
-                LU1, perm1 = jax.lax.cond(
+                LU1, perm1, eta1 = jax.lax.cond(
                     dev * blk + i < nq, _fact, _skip, C1)
                 return (jax.lax.dynamic_update_slice(
                             LU_acc, LU1, (i, 0, 0)),
                         jax.lax.dynamic_update_slice(
-                            perm_acc, perm1, (i, 0)))
+                            perm_acc, perm1, (i, 0)),
+                        jax.lax.dynamic_update_slice(
+                            eta_acc, eta1, (i,)))
 
             return jax.lax.fori_loop(
                 0, blk, _one,
                 (jnp.zeros_like(C_loc),
-                 jnp.zeros((blk, n_log), dtype=jnp.int32)))
+                 jnp.zeros((blk, n_log), dtype=jnp.int32),
+                 jnp.zeros((blk,), dtype=jnp.float64)))
 
         _sm = shard_map(_local_factor, mesh=mesh_xy,
                         in_specs=P(('x', 'y'), None, None),
                         out_specs=(P(('x', 'y'), None, None),
-                                   P(('x', 'y'), None)),
+                                   P(('x', 'y'), None),
+                                   P(('x', 'y'))),
                         check_vma=False)
 
         @partial(jax.jit,
-                 out_shardings=(out_sh, NamedSharding(mesh_xy, P(None, None))))
+                 out_shardings=(out_sh, NamedSharding(mesh_xy, P(None, None)),
+                                NamedSharding(mesh_xy, P(None))))
         def _fn(C):
             C = C[:, :n_log, :n_log]
             if nq_pad > nq:
@@ -1918,12 +1969,12 @@ def _factor_c_q_transverse_lu(
             # Single-axis staging both ways (see the charge fold).
             C = jax.lax.with_sharding_constraint(C, mid_sh)
             C = jax.lax.with_sharding_constraint(C, q_sh)
-            LU_log, perm = _sm(C)
+            LU_log, perm, eta = _sm(C)
             LU_log = LU_log[:nq]
             perm = perm[:nq]
             LU_log = jax.lax.with_sharding_constraint(LU_log, mid_sh)
             return _embed_lu_padded(LU_log, int(n_rmu), n_log,
-                                    mesh_xy), perm
+                                    mesh_xy), perm, eta[:nq]
         _transverse_lu_cache[key] = _fn
     return _transverse_lu_cache[key](C_q)
 
@@ -2118,16 +2169,19 @@ def factor_c_q(
         if t_kind != 'lu':
             raise ValueError(
                 f"factor_c_q: unknown transverse solver_kind {t_kind!r}")
-        _lu_out = _factor_c_q_transverse_lu(C_q, mesh_xy, n_rmu_logical)
+        LU_q, perm_q, eta_q = _factor_c_q_transverse_lu(
+            C_q, mesh_xy, n_rmu_logical)
         # THE DEFAULT TRANSVERSE PATH'S ONLY CONDITIONING NUMBER.  See
         # _certify_transverse_ridge for what it measures, what it costs and
         # why a LOWER bound is the right instrument for this gate.
         _certify_transverse_ridge(
-            _lu_out[0],
+            LU_q,
             n_log=int(n_rmu_logical if n_rmu_logical is not None
                       else C_q.shape[-1]),
             where="zeta transverse ridge (LU)")
-        return _lu_out
+        _certify_transverse_lu_residual(
+            eta_q, where="zeta transverse ridge (LU)")
+        return LU_q, perm_q
 
     solver_kind = _resolve_solver_kind(
         0, solver_kind, n_rmu=n_rmu_logical, nq=int(nq))
