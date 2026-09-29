@@ -338,11 +338,16 @@ def _load_system_inputs(config, input_dir, mesh_xy, report, print0, _config_prov
                 f"orbit-closed centroid set; fix: regenerate the centroids with "
                 f"kmeans (orbit-closed), or use screening_diagrams = w_rpa; doc: "
                 f"docs/architecture/symmetry_register.md §7.")
-    # Before any basis, bank or constructor: the full shared-pole head refuses
-    # an ordered or N_spinor != 1 store here, on the final symmetry verdict.
+    # Before any basis, bank or constructor: the full shared-pole head, the
+    # w_bse ladder and HL-PPM refuse an ordered store here, on the final
+    # symmetry verdict.
     from .shared_pole_head import refuse_unsupported_shared_pole_head
+    from .screening import refuse_w_bse_without_trs
+    from .ppm_pipeline import refuse_hl_ppm_without_trs
     refuse_unsupported_shared_pole_head(
         config, trs_allowed=sym.trs_allowed, nspinor=wfn.nspinor)
+    refuse_w_bse_without_trs(config, sym)
+    refuse_hl_ppm_without_trs(config, sym)
     centroid_indices = centroid_basis.centroid_indices
     n_rmu = centroid_basis.n_rmu
     tmp_dir = os.path.join(input_dir, "tmp")

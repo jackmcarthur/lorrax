@@ -566,6 +566,26 @@ def extrapolate_sigma_body(
             extrap_payload)
 
 
+def refuse_hl_ppm_without_trs(config, sym) -> None:
+    """``GATE hl_ppm_requires_measured_trs``, before any basis, ζ or V.
+
+    HL fits one residue on a real-axis probe, which cannot carry the
+    anti-Hermitian residue of a time-reversal-broken store; GN's ordered
+    fit splits W(iω_p) into both halves.
+    """
+    if config.compute_mode.ppm_model != "hl":
+        return
+    from .screening import _trs_verdict
+    if not _trs_verdict(sym):
+        raise ValueError(
+            "GATE hl_ppm_requires_measured_trs: compute_mode = hl_ppm keeps "
+            "one residue, but SymMaps.trs_allowed is false, so W(ω) has an "
+            "anti-Hermitian residue the real-axis probe cannot carry.\n"
+            "  want: compute_mode = gn_ppm (its ordered fit carries both "
+            "halves)\n"
+            "  doc:  docs/dev/notes/DERIVATION_gnppm_nonhermitian.md §6.")
+
+
 def compute_ppm_sigma_pipeline(
     *,
     wfns,
@@ -656,9 +676,10 @@ def compute_ppm_sigma_pipeline(
         # through the ordered kernel in ``gw.screening.compute_screening``
         # (one measurement, ``SymMaps.trs_allowed``, read the same way) now
         # tells the fit to split W(iω_p) into its Hermitian and
-        # anti-Hermitian halves.  HL keeps the incumbent single-residue fit
-        # everywhere: a real-axis probe cannot carry the odd residue
-        # (``docs/dev/notes/DERIVATION_gnppm_nonhermitian.md`` §6).
+        # anti-Hermitian halves.  HL keeps the single-residue fit: a
+        # real-axis probe cannot carry the odd residue
+        # (``docs/dev/notes/DERIVATION_gnppm_nonhermitian.md`` §6), so an
+        # ordered store refuses HL at setup (``refuse_hl_ppm_without_trs``).
         from .screening import _trs_verdict
         ordered = bool((not is_hl) and (_trs_verdict(sym) is False))
         # GN fits on the q wedge (owner, 2026-09-25): W(0), W(iω_p) and V

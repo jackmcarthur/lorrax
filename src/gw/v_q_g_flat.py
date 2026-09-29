@@ -554,6 +554,27 @@ def _head_shell(n_q, *slot_lists):
     return out
 
 
+def v_head_fn_in_V(*, mc_average_vcoul_body, sys_dim, kgrid, bvec,
+                   cell_volume):
+    """The head-slot value every production ``V`` tile carries at q != 0.
+
+    The mini-BZ average ``<v(K+dq)>`` (``build_v_head_miniBZ_fn_3d``) on 3D
+    bulk with ``mc_average_vcoul_body``; ``None`` (the point ``v(q+G)``)
+    otherwise.  The 2D ``f2d -> 0`` regularisation already removes the
+    G=0 divergence, so the flag is a 3D-only refinement.  One owner for
+    the scalar V (:func:`compute_all_V_q_g_flat`) and the bispinor tiles
+    (``gw.v_q_bispinor``), so the two routes cannot carry different V.
+    """
+    if not (mc_average_vcoul_body and int(sys_dim) == 3):
+        return None
+    # ORDER IS LOAD-BEARING: .compute_vcoul runs the service path bootstrap
+    # at its module scope, so it must be imported BEFORE the door.
+    from .compute_vcoul import compute_v_q_per_G
+    from vcoul import build_v_head_miniBZ_fn_3d
+    del compute_v_q_per_G
+    return build_v_head_miniBZ_fn_3d(kgrid, bvec, cell_volume)
+
+
 def _head_slot_table(q_irr_frac, gvec_components, *, sys_dim, bvec,
                      cell_volume, bdot, fft_grid, bare_coulomb_cutoff_ry,
                      v_head_fn=None):
@@ -1066,14 +1087,8 @@ def compute_all_V_q_g_flat(
             f"(0-D box per-q v(G) not wired); got {sys_dim}.")
     # compute_v_q_per_G is gw's wfn-facing translation over the vcoul door
     # (old bvec/cell_volume/sys_dim signature) and correctly stays a gw
-    # import; build_v_head_miniBZ_fn_3d is a pure service symbol, so its
-    # true dependency is the door (replumbed 2026-08-07).  ORDER IS
-    # LOAD-BEARING: .compute_vcoul runs the service path bootstrap at its
-    # module scope, so it must be imported BEFORE the door — the blind
-    # audit arm measured the swapped order dying with ModuleNotFoundError
-    # in a stripped process where nothing else had bootstrapped yet.
+    # import; the head function comes from ``v_head_fn_in_V``.
     from .compute_vcoul import compute_v_q_per_G
-    from vcoul import build_v_head_miniBZ_fn_3d
 
     # 3D bulk: build the mini-BZ-averaged head ⟨v(K+δq)⟩ ONCE, as a
     # function of the Cartesian K = q+G.  ``v_qG_table`` evaluates it at
@@ -1086,10 +1101,9 @@ def compute_all_V_q_g_flat(
     # so injecting at every IBZ q is sufficient — no separate full-BZ pass.
     # 2D ``f2d → 0`` regularizes v at G=0 already; the MC flag is a 3D-
     # only refinement and is silently no-op'd for sys_dim=2.
-    _v_head_fn = None
-    if mc_average_vcoul_body and sys_dim == 3:
-        _v_head_fn = build_v_head_miniBZ_fn_3d(
-            kgrid, bvec, cell_volume)
+    _v_head_fn = v_head_fn_in_V(
+        mc_average_vcoul_body=mc_average_vcoul_body, sys_dim=sys_dim,
+        kgrid=kgrid, bvec=bvec, cell_volume=cell_volume)
 
     def _bare_v_per_G(q_irr_frac, gvec_components):
         v = compute_v_q_per_G(

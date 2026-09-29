@@ -744,15 +744,6 @@ def compute_screening_model(
     """
     diagrams = coerce_screening_diagrams(
         getattr(config.screening, "diagrams", ScreeningDiagrams.W_RPA))
-    trs_allowed = _trs_verdict(sym)
-    if diagrams is ScreeningDiagrams.W_BSE and not trs_allowed:
-        raise RuntimeError(
-            "GATE w_bse_requires_measured_trs: screening_diagrams = w_bse "
-            "uses a time-reversal pair gauge for the ladder's anti-resonant "
-            "channel, but SymMaps.trs_allowed is false.  The measured DFT "
-            "reference therefore does not license that construction; use "
-            "screening_diagrams = w_rpa (or w_rpa_resolvent) until the "
-            "ladder owns a general ordered-response construction.")
     if mode is ComputeMode.MPA:
         if static_only:
             return {}
@@ -979,6 +970,24 @@ _TR_ODD_W_HERMITICITY_CAUSE = (
     "an index/shard mixing fault.  Judge it against the same run's ω = 0 "
     "role, which is gated unconditionally."
 )
+
+
+def refuse_w_bse_without_trs(config, sym) -> None:
+    """``GATE w_bse_requires_measured_trs``, before any basis, ζ or V.
+
+    The verdict is measured from the WFN, so this runs once the symmetry
+    tables exist (``gw_jax._load_system_inputs``), not at deck parse.
+    """
+    diagrams = coerce_screening_diagrams(
+        getattr(config.screening, "diagrams", ScreeningDiagrams.W_RPA))
+    if diagrams is ScreeningDiagrams.W_BSE and not _trs_verdict(sym):
+        raise RuntimeError(
+            "GATE w_bse_requires_measured_trs: screening_diagrams = w_bse "
+            "uses a time-reversal pair gauge for the ladder's anti-resonant "
+            "channel, but SymMaps.trs_allowed is false.  The measured DFT "
+            "reference therefore does not license that construction; use "
+            "screening_diagrams = w_rpa (or w_rpa_resolvent) until the "
+            "ladder owns a general ordered-response construction.")
 
 
 def _trs_verdict(sym) -> bool:

@@ -2278,6 +2278,7 @@ def _bispinor_charge_tile(zeta_g, *, cfg, meta, wfn, sym, centroid_indices,
                 centroid_C_idx=(np.asarray(jax.device_get(centroid_indices),
                                            dtype=np.int32)
                                 if centroid_indices is not None else None),
+                mc_average_vcoul_body=cfg.head.mc_average_vcoul_body,
                 print_fn=print_fn)
     finally:
         zeta_g.close()
@@ -2306,6 +2307,7 @@ def _bispinor_current_tiles(zetas_T, *, cfg, meta_T, wfn, sym, centroid_T_idx,
                                 or bool(cfg.head.bispinor_tt_head_correction)
                                 or uses_direct_bispinor_shared_pole_head(cfg)),
             current_basis_rows=meta_T.current_basis_rows,
+            mc_average_vcoul_body=cfg.head.mc_average_vcoul_body,
             print_fn=print_fn)
 
 
@@ -2420,6 +2422,7 @@ def _compute_photon_vq(
                     spatial_current_representation=None,
                     cc_tile=cc_tile, tt_tiles=tt_tiles,
                     current_basis_rows=meta.current_basis_rows,
+                    mc_average_vcoul_body=cfg.head.mc_average_vcoul_body,
                 )
     from file_io.restart_bundle import read_photon_charge
     V_q_raw = read_photon_charge(bispinor_h5_path, mesh_xy)
@@ -2433,12 +2436,9 @@ def _compute_photon_vq(
     head_channel = None
     if str(getattr(cfg.head, 'mc_average_placement', 'off')) != 'off':
         raise NotImplementedError(
-            "mc_average_placement is not implemented on the bispinor V_q "
-            "builder: v_q_bispinor.py passes no v_head_fn, so its CC tile "
-            "already carries a different G=0 slot from the scalar V_q at "
-            "every q != 0.  Deciding the placement for one builder and not "
-            "the other would make that divergence permanent.  Run with "
-            "bispinor = false, or land the bispinor v_head_fn first.")
+            "mc_average_placement is not wired on the bispinor route: its "
+            "head channel is built only for the BGW metal q0 shift.  Run "
+            "with bispinor = false, or leave mc_average_placement = off.")
     if bool(getattr(cfg.head, 'uses_bgw_metal_q0shift', False)):
         with ZetaLoader(zeta_h5_path, mesh=mesh_xy) as zeta_io:
             with mesh_xy:
