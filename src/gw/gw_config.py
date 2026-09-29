@@ -2470,6 +2470,19 @@ def _input_head(
                 f"mapping it to head_correction = "
                 f"{_head_correction.value}. Prefer the named policy in "
                 "new decks.")
+    elif ("head_correction" not in _named_keys
+            and bool(params["bispinor"])
+            and coerce_bispinor_gw_mode(params["bispinor_gw"])
+            is BispinorGWMode.FULL_SHARED_POLE):
+        # The ordered four-current sector bank has only the direct Gamma
+        # head (no local-field fold), so its default is that head.  An
+        # explicit ``full`` still refuses (GATE full_shared_pole_head).
+        _head_correction = HeadCorrection.NO_LOCAL_FIELDS
+        print_fn(
+            "  [config provenance] bispinor_gw = full_shared_pole with "
+            "head_correction unset: head_correction = no_local_fields "
+            "(the sector bank's direct Gamma head; full has no local-field "
+            "fold on this route).")
     _resolved_do_g0 = _head_correction is not HeadCorrection.OFF
     head = HeadConfig(
         correction=_head_correction,
@@ -3639,10 +3652,6 @@ def warn_headless_shared_pole_self_consistency(config, print_fn=print) -> None:
     numerically at ``GATE shared_pole_gram_valid``, and the signed Gamma
     head remains the production path for ordered stores.
 
-    The 2026-09-17 bispinor-metal proof permits heads off while its head
-    model is pending. This exception uses the existing bispinor and FD
-    settings; it does not bypass any bank or Gram validity gate.
-
     SCOPED TO SELF-CONSISTENCY ON PURPOSE.  A headless shared-pole
     ONE-SHOT run is not covered by this evidence and is not refused here;
     it remains a legitimate debug run.
@@ -3650,9 +3659,6 @@ def warn_headless_shared_pole_self_consistency(config, print_fn=print) -> None:
     if (getattr(config.sigma, "w_model", "mpa") != "shared_pole"
             or config.qp_solver is not QPSolver.SELF_CONSISTENT
             or config.head.correction is not HeadCorrection.OFF):
-        return
-    if (bool(getattr(config, "bispinor", False))
-            and getattr(config, "occ_smearing_width_ry", None) is not None):
         return
     print_fn(
         "  [config warning] shared-pole SC with head_correction = off is "
@@ -3777,6 +3783,20 @@ def refuse_unsupported_bispinor_gw(config) -> None:
                 "only; parallel-transport links and the interband-commutator "
                 "velocity have no four-current consumer, so either would be "
                 "ignored\n"
+                "  doc:  docs/architecture/four_current_wiring.md, "
+                "'Self-consistency and restart'.")
+        if (config.qp_solver is QPSolver.SELF_CONSISTENT
+                and config.sc.head_update == "dft_velocity"
+                and int(config.sc.max_iter) < 2):
+            raise ValueError(
+                "GATE full_shared_pole_dft_velocity_one_map: the "
+                "four-current dft_velocity head follows the maps after "
+                "map 0, so a one-map run has no accepted iteration head "
+                "and would refuse only at the end "
+                "(GATE sc_final_map_requires_iteration_head).\n"
+                f"  got:  sc_head_update = dft_velocity, sc_max_iter = "
+                f"{int(config.sc.max_iter)}\n"
+                "  want: sc_max_iter >= 2, or sc_head_update = off\n"
                 "  doc:  docs/architecture/four_current_wiring.md, "
                 "'Self-consistency and restart'.")
         return

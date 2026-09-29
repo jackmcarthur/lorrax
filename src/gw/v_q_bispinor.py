@@ -299,12 +299,19 @@ def _make_per_q_v_builder_for_tile(
     tt_head_correction: bool = False,
     tt_head_tensor: np.ndarray | None = None,
     current_U: np.ndarray | None = None,
+    v_head_fn=None,
 ):
     """Return ``builder(q_irr_frac, gvec_components) → (n_q, ngkmax) c128``.
 
     CC tile (μ_L=ν_L=0): bare Coulomb ``v(q+G)`` (real, ≥0).
     TT diagonal (i=j): ``−v(q+G) · (1 − K̂_i²)``.
     TT off-diagonal (i≠j): ``+v(q+G) · K̂_i K̂_j``.
+
+    ``v_head_fn`` (``v_q_g_flat.v_head_fn_in_V``) is the head-slot value the
+    scalar V carries at q ≠ 0: the mini-BZ average ``⟨v⟩`` at every argmin
+    ``|q+G|`` slot.  The CC tile takes it as the scalar V does; a TT tile
+    takes ``⟨v⟩ P^T(K̂)``, which keeps the trace (``tr P^T = 2``) of the
+    tensor average ``⟨v P^T⟩`` exactly.
 
     The ``K̂`` factor uses ``K2_safe = max(|q+G|², eps_K2)`` to keep
     the per-q-Γ slot finite; at K=0 the bare ``v`` is already zero
@@ -385,7 +392,7 @@ def _make_per_q_v_builder_for_tile(
             q_irr_frac, gvec_components,
             bvec=bvec_f, cell_volume=cell_volume,
             sys_dim=sys_dim, vcoul_cutoff_ry=vcoul_cutoff_ry,
-            bdot=bdot,
+            bdot=bdot, v_head_fn=v_head_fn,
         )                                                # (n_q, ngkmax) f64
         if is_CC:
             return v.astype(np.complex128)
@@ -441,7 +448,7 @@ def _bispinor_tile_spec(mu_L, nu_L, *, zeta_C, zeta_T, use_ibz_C, use_ibz_T,
                         bvec, cell_volume, sys_dim, vcoul_cutoff_ry, bdot,
                         kgrid, fft_grid, tt_head_correction, tt_head_tensor,
                         bgw_v_grid_fn, n_rmu_C, n_rmu_T, verbose, print_fn,
-                        current_basis_rows):
+                        current_basis_rows, v_head_fn):
     """One unique tile's ζ sources, v(q+G) builder and one-leg action.
 
     ``zeta_C``/``zeta_T[i]`` are ζ sources: a ``ZetaLoader`` on the ζ file, or
@@ -460,6 +467,7 @@ def _bispinor_tile_spec(mu_L, nu_L, *, zeta_C, zeta_T, use_ibz_C, use_ibz_T,
         kgrid=kgrid, tt_head_correction=tt_head_correction,
         tt_head_tensor=tt_head_tensor,
         current_U=None if is_CC else current_basis_rows,
+        v_head_fn=v_head_fn,
     )
     # BGW vcoul overlay only meaningful on the CC tile; transverse
     # tiles are pure projector applications.  Wrap the builder.
@@ -654,11 +662,12 @@ def compute_bispinor_cc_tile(
     bare_coulomb_cutoff_ry: float | None = None,
     bdot: np.ndarray | None = None, g_chunk: int | None = None,
     sym=None, centroid_C_idx: np.ndarray | None = None,
+    mc_average_vcoul_body: bool,
     print_fn=print, verbose: bool = True,
 ) -> ParkedVTiles:
     """The CC tile of :func:`compute_V_q_bispinor_g_flat_to_h5`, from the
     charge fit's in-memory ζ (``zeta_C``: a ``ZetaG``), parked on host."""
-    from .v_q_g_flat import _compute_V_q_g_flat_tiles
+    from .v_q_g_flat import _compute_V_q_g_flat_tiles, v_head_fn_in_V
     use_ibz_C = _bispinor_ibz(sym, centroid_C_idx, kgrid, fft_grid,
                               "bispinor charge V")
     spec = _bispinor_tile_spec(
@@ -668,7 +677,10 @@ def compute_bispinor_cc_tile(
         vcoul_cutoff_ry=bare_coulomb_cutoff_ry, bdot=bdot, kgrid=kgrid,
         fft_grid=fft_grid, tt_head_correction=False, tt_head_tensor=None,
         bgw_v_grid_fn=None, n_rmu_C=n_rmu_C, n_rmu_T=0, verbose=verbose,
-        print_fn=print_fn, current_basis_rows=None)
+        print_fn=print_fn, current_basis_rows=None,
+        v_head_fn=v_head_fn_in_V(
+            mc_average_vcoul_body=mc_average_vcoul_body, sys_dim=sys_dim,
+            kgrid=kgrid, bvec=bvec, cell_volume=cell_volume))
     results = _compute_V_q_g_flat_tiles(
         [spec], kgrid=kgrid, fft_grid=fft_grid, mesh_xy=mesh_xy,
         g_chunk=g_chunk, sym=sym, centroid_indices=centroid_C_idx,
@@ -686,17 +698,21 @@ def compute_bispinor_tt_tiles(
     sym=None, centroid_T_idx: np.ndarray | None = None,
     tt_head_correction: bool = False,
     current_basis_rows=None,
+    mc_average_vcoul_body: bool,
     print_fn=print, verbose: bool = True,
 ) -> ParkedVTiles:
     """The six TT tiles of :func:`compute_V_q_bispinor_g_flat_to_h5`, from the
     current fit's three in-memory ζ (``ZetaG``) in ONE pass over the G tiles
     (``isdf.zeta_mubatch.contract_v_group``), parked on host."""
-    from .v_q_g_flat import _compute_V_q_g_flat_tiles
+    from .v_q_g_flat import _compute_V_q_g_flat_tiles, v_head_fn_in_V
     use_ibz_T = _bispinor_ibz(sym, centroid_T_idx, kgrid, fft_grid,
                               "bispinor current V")
     tt_head_tensor = (_tt_head_tensor(
         bvec=bvec, cell_volume=cell_volume, sys_dim=sys_dim, kgrid=kgrid)
         if tt_head_correction else None)
+    v_head_fn = v_head_fn_in_V(
+        mc_average_vcoul_body=mc_average_vcoul_body, sys_dim=sys_dim,
+        kgrid=kgrid, bvec=bvec, cell_volume=cell_volume)
     specs = [_bispinor_tile_spec(
         mu_L, nu_L, zeta_C=None, zeta_T=tuple(zeta_T), use_ibz_C=False,
         use_ibz_T=use_ibz_T, bvec=bvec, cell_volume=cell_volume,
@@ -704,7 +720,7 @@ def compute_bispinor_tt_tiles(
         kgrid=kgrid, fft_grid=fft_grid, tt_head_correction=tt_head_correction,
         tt_head_tensor=tt_head_tensor, bgw_v_grid_fn=None, n_rmu_C=0,
         n_rmu_T=n_rmu_T, verbose=verbose, print_fn=print_fn,
-        current_basis_rows=current_basis_rows)
+        current_basis_rows=current_basis_rows, v_head_fn=v_head_fn)
         for (mu_L, nu_L) in UNIQUE_TILES[1:]]
     results = _compute_V_q_g_flat_tiles(
         specs, kgrid=kgrid, fft_grid=fft_grid, mesh_xy=mesh_xy,
@@ -751,6 +767,7 @@ def compute_V_q_bispinor_g_flat_to_h5(
     cc_tile: "ParkedVTiles | None" = None,
     tt_tiles: "ParkedVTiles | None" = None,
     current_basis_rows=None,
+    mc_average_vcoul_body: bool,
 ) -> tuple[Path, tuple[jax.Array, jax.Array, jax.Array, jax.Array]]:
     """Stream the 7 unique bispinor V_q^{μ_L, ν_L} tiles to HDF5 via the
     G-flat per-q + G-chunked path.
@@ -778,7 +795,7 @@ def compute_V_q_bispinor_g_flat_to_h5(
     """
     from file_io.slab_io import SlabIO
     import h5py
-    from .v_q_g_flat import _compute_V_q_g_flat_tiles
+    from .v_q_g_flat import _compute_V_q_g_flat_tiles, v_head_fn_in_V
 
     output_h5_path = Path(output_h5_path)
     if tt_tiles is None and len(zeta_T_loaders) != 3:
@@ -817,6 +834,9 @@ def compute_V_q_bispinor_g_flat_to_h5(
     tt_head_tensor = (_tt_head_tensor(
         bvec=bvec, cell_volume=cell_volume, sys_dim=sys_dim, kgrid=kgrid)
         if tt_head_correction else None)
+    v_head_fn = v_head_fn_in_V(
+        mc_average_vcoul_body=mc_average_vcoul_body, sys_dim=sys_dim,
+        kgrid=kgrid, bvec=bvec, cell_volume=cell_volume)
 
     def _tile_spec(mu_L, nu_L):
         return _bispinor_tile_spec(
@@ -827,7 +847,8 @@ def compute_V_q_bispinor_g_flat_to_h5(
             fft_grid=fft_grid, tt_head_correction=tt_head_correction,
             tt_head_tensor=tt_head_tensor, bgw_v_grid_fn=bgw_v_grid_fn,
             n_rmu_C=n_rmu_C, n_rmu_T=n_rmu_T, verbose=verbose,
-            print_fn=print_fn, current_basis_rows=current_basis_rows)
+            print_fn=print_fn, current_basis_rows=current_basis_rows,
+            v_head_fn=v_head_fn)
 
     # CC alone, then the six TT tiles as ONE group: each ζ_T is read once
     # per q-tile instead of once per tile that uses it (three times).
