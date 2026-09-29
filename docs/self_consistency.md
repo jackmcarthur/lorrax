@@ -185,9 +185,7 @@ have the same broadening"): every protected conduction state is read on the
 near grid at the deck η; there is no far-conduction class. On Fe 4³ prot
 (`number_bands_protected = 26`) the matrix-top band 26 at k 4/11 then sits
 among the scissored tail's levels (+20.6 to +21 eV) with a resonant Σ, and
-the SC map is bistable when the tail law is fitted on every conduction band
-(claim 2960). The tail law is therefore fitted only on the protected
-conduction states near the top (below). Only the
+the SC map is bistable there (claim 2960). Only the
 scalar MPA/shared-pole Σ reads coarse windows; a sector (bispinor) route
 keeps the rule below.
 
@@ -225,10 +223,7 @@ $$
 \qquad Z_{nk} = \bigl(1 - \partial_\omega \mathrm{Re}\,\Sigma_{nn}(\omega)\rvert_{E_{nk}}\bigr)^{-1},
 $$
 
-over the window's conduction states that are on the sampled grid and whose DFT energy lies within $0.2\,(E_{c,\max} - E_F)$ of
-$E_{c,\max}$, the top protected band's DFT maximum over k
-(`band_partition.tail_fit_states`, owner 2026-09-29: the tail's bottom follows
-the states near the matrix's top, not the conduction mean). The weight $u$ is
+over the window's conduction states that are on the sampled grid. The weight $u$ is
 continuous in $s = \partial_\omega{\rm Re}\,\Sigma$ ($u = Z$ for $s \le 0$,
 $1 - s$ for $0 < s < 1$, 0 for $s \ge 1$), so the tail law, and with it the SC
 map, has no jump where a state's $Z$ crosses 1. A state on a satellite or near a pole of Σ has small $Z$ and

@@ -70,11 +70,9 @@ self_consistent`, scalar MPA/shared-pole route) moves once. See
   at the deck η, certified at max(`sigma_quadrature_eps`, 3e-3).
   `sigma_omega_patches_ev` accepts `lo:hi:eta` triples as user coarse windows
   (`GATE sigma_coarse_window`). Sector (bispinor) routes keep the old rule.
-- **The tail law's fit set.** The scissored tail's rigid shift Δ_c is fitted
-  on the protected conduction states whose DFT energy lies within
-  0.2 (E_cmax − E_F) of E_cmax, the top protected band's DFT maximum (owner
-  2026-09-29), with the Z weights and exclusions as before; the set size is
-  logged once (`SC sum-band tail fit set`) and Δ_c every map.
+- **Continuous tail weights.** The scissored tail's rigid shift Δ_c weights
+  each conduction state by min(Z, 1/Z) (0 for Z ≤ 0) instead of Z inside a
+  hard Z ∈ (0, 1] cut, so the tail law has no jump where a state's Z crosses 1.
 - **A new refusal.** `zeta_nband` below b3 now refuses on every run,
   one-shot included (`GATE qp_matrix_zeta_left`; it was a warning).
 
