@@ -15,9 +15,9 @@ both routes.
 No rule outlives its process (owner, 2026-09-28: "i really don't want any
 cached rules for quadratures at all"): every plan builds its rules cold, the
 widest crossing window of the gate decks (1148 nodes) in about 3 s on the
-rank's cores (``minimax.uniform_rule._map_rows``), most of it the weight QR. Within one run a rule is reused only
-through the in-process request scope (:func:`_scope_lookup`), so the sector
-calls of one map share their fits.
+rank's cores (``minimax.uniform_rule._map_rows``), most of it the weight QR.
+Within one run a rule is reused only through the in-process request scope
+(:func:`_scope_lookup`), so the sector calls of one map share their fits.
 """
 
 from __future__ import annotations
