@@ -61,6 +61,9 @@ class Meta:
     # select_current_basis rows; None = Cartesian), resolved once from the
     # physical group by gw_init and read by every current-index consumer.
     current_basis_rows: object = None
+    # The dynamic SC run's coarse (semicore) Σ read class
+    # (gw.band_partition.CoarseClass), from the DFT ladder by gw_init; None elsewhere.
+    coarse_class: object = None
 
     @property
     def mu_solve_extent(self) -> int:

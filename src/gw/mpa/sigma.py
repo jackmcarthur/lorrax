@@ -1750,9 +1750,15 @@ def compute_sigma_c_mpa_omega_grid(
     sector_context=None,
     odd_reference=True,
     tau_kernel_factory=None,
+    omega_eta_ry=None,
+    omega_group=None,
+    group_fixed=None,
     print_fn=print,
 ):
     """Read a fitted MPA store, derive its windows, and compute Sigma_c.
+
+    ``omega_eta_ry``/``omega_group``/``group_fixed``: the SC coarse windows'
+    per-frequency broadening and window labels (``sigma_box_plan.plan_sigma_windows``).
 
     ``occupation_state`` (duck-typed ``gw.efermi.OccupationState``): None is
     the incumbent insulating semantics, bit-exact.  With a state, the causal
@@ -1912,7 +1918,9 @@ def compute_sigma_c_mpa_omega_grid(
                 material_class=material_class,
                 fixed_pole_support_ry=fixed_pole_support_ry,
                 certificate_pole_summaries=certificate,
-                occupation_reach_ry=occupation_floor_reach_ry(occupation_state))
+                occupation_reach_ry=occupation_floor_reach_ry(occupation_state),
+                omega_eta_ry=omega_eta_ry, omega_group=omega_group,
+                group_fixed=group_fixed)
         quadrature_log.record_sigma_plan(geometry)
         print_fn(
             f"  MPA windows [box]: "
