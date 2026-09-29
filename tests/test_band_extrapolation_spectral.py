@@ -249,3 +249,17 @@ def test_payload_and_report():
     text = format_spectral_report(plan, fit, states=[("VBM", (0, 1))])
     assert "pooled beta = 3.00" in text and "Omega = 8.0 eV" in text
     assert "[VBM]" in text
+
+
+def test_a_held_pair_skips_the_grid_and_reproduces_the_fit():
+    """SC maps after map 0 pass the map-0 (β, Ω); the result is the same fit."""
+    lad = _ladder()
+    counts = (56, 68, 80)
+    e_i = np.linspace(-9.0, 6.0, 12)
+    S = _model_samples(lad, counts, e_i, 3.5, 14.0, -1.0, 2.0)
+    fitted = fit_band_extrapolation_spectral(counts, S, lad, e_state_ev=e_i)
+    held = fit_band_extrapolation_spectral(counts, S, lad, e_state_ev=e_i,
+                                           held=(fitted.beta, fitted.omega_ev))
+    assert held.held and not fitted.held
+    assert np.array_equal(held.s_inf, fitted.s_inf)
+    assert "held from SC map 0" in spectral_trust_verdict(held)

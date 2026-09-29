@@ -303,7 +303,8 @@ def test_the_driving_sigma_is_the_extrapolated_point_of_the_planned_counts():
             in src_pipe), (
         "the driving weights must come back from the one seam that builds "
         "the fit; anything else is a second derivation of the estimator")
-    assert ("sigma_omega.band_counts, s_at_counts, ladder)" in src_pipe), (
+    assert ("sigma_omega.band_counts, s_at_counts, ladder, e_state_ev=enk_ev"
+            in src_pipe), (
         "the spectral fit must read the PLAN's counts, the same counts the "
         "cube was bracketed at")
     # ...and band_counts is the PLAN's counts, not a band count re-read from
