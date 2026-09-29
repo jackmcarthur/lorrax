@@ -122,7 +122,7 @@ def test_the_serving_surface_answers_with_no_lorrax_no_jax_and_no_scipy():
     the surface: it counts ``__all__`` and resolves every non-lazy name
     with no scipy arriving, then solves a real ``noncrossing`` request and
     reads its provenance with no jax arriving.  The solve itself may import
-    scipy when it is installed: the cache key records scipy's version.
+    scipy when it is installed: the provenance records scipy's version.
     """
     run = import_isolation(
         "minimax", _lorrax_roots(), src_dir=_SVC_SRC, deps=_DEPS,
@@ -130,13 +130,12 @@ def test_the_serving_surface_answers_with_no_lorrax_no_jax_and_no_scipy():
         preamble=(
             _CPU_PIN +
             "import os, sys\n"
-            "os.environ['LORRAX_DISABLE_MINIMAX_DISK_CACHE'] = '1'\n"
             "import minimax as M\n"
             # A PIN, and it is meant to drift only on purpose: the count
             # is what catches an __all__ that quietly emptied, and a
             # deliberate door change is exactly the kind of edit that
             # should have to touch a test.
-            "assert len(M.__all__) == 56, (len(M.__all__), M.__all__)\n"
+            "assert len(M.__all__) == 54, (len(M.__all__), M.__all__)\n"
             # Only the NON-lazy half is touched by name here: hasattr on a
             # solver name would fire the PEP-562 __getattr__ and import
             # scipy, which is the very thing the next assertion denies.

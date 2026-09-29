@@ -41,12 +41,6 @@
     "tmp/mpa/mpa_fit_sc_0001.h5": "0d292478f33c16899e10eb8e33e185c56a0b5cea851ccef38c329ea1ffdf6d61",
     "tmp/mpa/mpa_samples_oneshot.h5": "2d3f236baec778ef2c9e72286c8d44eccf1ab652fd4009b08b2abb40872ba1fa",
     "tmp/mpa/mpa_samples_sc_0001.h5": "84fa6d217d8eb90a10ab2d7f5d832d5c8ac2bdcbb3c1f193d5a0d90ca1b3a33a",
-    "tmp/sigma_quadrature_rules/rule_sigma-box-ry-v5_17a0a34d363718ecfbc8d52ea758a728270d529bacbb8849556b7c37809d0507.npz": "c9b647369debc609631a20e10147d0e09c2c951be53d0a115ca299c0863eee09",
-    "tmp/sigma_quadrature_rules/rule_sigma-box-ry-v5_33d530f65c3d1554b036776c28c0554bd5a87fd8152a66ed8b06ce04998f13b4.npz": "79f36ce3521e45432b1d497de15004dbfcdc4fffd02f93c245d466f0f92ff3a8",
-    "tmp/sigma_quadrature_rules/rule_sigma-box-ry-v5_74e653a81004cc9fbbf0bbd20b5c89c4c0dc27a33c767fb5c87fc3e0a17ed7db.npz": "1987aeb18ef3c658233ec85c26f5848a53e350b87e0351e530c0712d0ded934d",
-    "tmp/sigma_quadrature_rules/rule_sigma-box-ry-v5_d09ab36653ab1d2c6a74446a82f40e382c97827d295e8c1a975a5cb2a71104c5.npz": "c0511a2f8b0e0ed8612c817ef676faa804ae587ee3d701374abbcca4744ef69a",
-    "tmp/sigma_quadrature_rules/rule_sigma-box-ry-v5_d64a748f669dd41dad2fbd5320efac2c461b77b515e32fd5411513d0c8de8de2.npz": "98cdcc8a34ab975c9834663ef3c345e20adf78e117836974b0f2f29fd4c89fcc",
-    "tmp/sigma_quadrature_rules/rule_sigma-box-ry-v5_edeb06805d1fa40dccaf927957c4cf6ff8e01a1f34bf95377751a7e917320496.npz": "f15a95a9418854f98a3a1b61595cf00d2321ae1b16689941f0832620337b9c13",
     "tmp/zeta_q.h5": "63f7e013655917ed7915f51ed916d01b7bccbcf22768cc002970afb22c9a2133"
   },
   "reference_source_commit": "298c89ac588300460f241191bff2e65d8a50b824",

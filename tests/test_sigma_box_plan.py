@@ -105,7 +105,7 @@ def _plan(monkeypatch, branch=None, summaries=None, **kwargs):
         _summaries([branch]) if summaries is None else summaries,
         [branch], omega, 0.1,
         eps=1.0e-4,
-        cache_dir=None, print_fn=lambda *_args, **_kwargs: None,
+        scope=None, print_fn=lambda *_args, **_kwargs: None,
         **kwargs)
 
 
@@ -141,8 +141,8 @@ def test_ppm_flat_crossing_line_nodes_reach_sigma_executor(monkeypatch):
     plan, geometry = _plan(monkeypatch, summaries=ppm_summaries,
                            analytic_line=True)
     report = geometry["branches"][0]["windows"]
-    assert report[0]["cache_status"] == "analytic-line"
-    assert report[1]["cache_status"] != "analytic-line"
+    assert report[0]["rule_source"] == "analytic-line"
+    assert report[1]["rule_source"] != "analytic-line"
     box = tuple(report[0]["box_ry"])
     rule = analytic_line_box_rule(box, 1.0e-4)
     nodes = plan[0].window.nodes
@@ -161,7 +161,7 @@ def test_ppm_flat_crossing_line_nodes_reach_sigma_executor(monkeypatch):
 
 def test_analytic_line_request_keeps_damped_poles_on_box_rule(monkeypatch):
     _plan_rows, geometry = _plan(monkeypatch, analytic_line=True)
-    assert all(row["cache_status"] != "analytic-line"
+    assert all(row["rule_source"] != "analytic-line"
                for row in geometry["branches"][0]["windows"])
 
 
@@ -238,7 +238,7 @@ def test_crossing_branch_uses_its_own_halfs_pole_edge(monkeypatch):
     omega = np.asarray([-0.0, -0.1, -0.2, -0.5, 0.0, 2.0])
     _, geometry = plan_sigma_windows(
         _summaries([negative, far], _METAL_POLES), [negative, far], omega, 0.1,
-        eps=1.0e-4, cache_dir=None, print_fn=lambda *_a, **_k: None)
+        eps=1.0e-4, scope=None, print_fn=lambda *_a, **_k: None)
     edges = geometry["pole_edges_ry"]
     assert edges["neg"] == pytest.approx(0.5 + 0.17)
     assert edges["pos"] == pytest.approx(2.0 + 0.17)
@@ -280,7 +280,7 @@ def test_executor_conventions_and_lower_half_conjugation(monkeypatch):
     assert val[0].window.omega_sign == -1
 
 
-def test_containment_cache_reuses_rules_without_a_builder_call(
+def test_scope_reuses_rules_without_a_builder_call(
         monkeypatch, tmp_path):
     calls = []
 
@@ -291,7 +291,7 @@ def test_containment_cache_reuses_rules_without_a_builder_call(
     monkeypatch.setattr("gw.sigma_box_plan._BOX_RULE_BUILDER", counted)
     args = dict(
         eps=1.0e-4,
-        cache_dir=str(tmp_path), print_fn=lambda *_args, **_kwargs: None)
+        scope=str(tmp_path), print_fn=lambda *_args, **_kwargs: None)
     first, first_geometry = plan_sigma_windows(
         _summaries(), [_branch()], np.asarray([0.2, 0.5]), 0.1, **args)
     assert len(calls) == 3
@@ -299,7 +299,7 @@ def test_containment_cache_reuses_rules_without_a_builder_call(
     second, second_geometry = plan_sigma_windows(
         _summaries(), [_branch()], np.asarray([0.2, 0.5]), 0.1, **args)
     assert not calls
-    assert all(window["cache_status"].startswith("hit:")
+    assert all(window["rule_source"].startswith("scope:")
                for window in second_geometry["branches"][0]["windows"])
     for left, right in zip(first, second):
         np.testing.assert_array_equal(left.window.nodes.t,
@@ -332,7 +332,7 @@ def test_cold_plan_serves_the_rules_a_warm_rerun_would(monkeypatch, tmp_path):
     real_poles = tuple((index, {
         key: None if row is None else (*row[:2], 0.05, 0.05)
         for key, row in groups.items()}) for index, groups in _summaries())
-    args = dict(eps=1.0e-4, cache_dir=str(tmp_path),
+    args = dict(eps=1.0e-4, scope=str(tmp_path),
                 print_fn=lambda *_args, **_kwargs: None)
     _, cold = plan_sigma_windows(
         real_poles, [_branch()], np.asarray([0.2, 0.5]), 0.1, **args)
@@ -344,27 +344,8 @@ def test_cold_plan_serves_the_rules_a_warm_rerun_would(monkeypatch, tmp_path):
         w["node_digest"] for w in warm_rows]
     served = {w["name"]: w for w in cold_rows}
     assert served["positive conduction:state_tail"]["node_count"] == 2
-    assert served["positive conduction:state_tail"]["cache_status"].startswith("plan:")
-    assert all(w["cache_status"].startswith("hit:") for w in warm_rows)
-
-
-def test_cache_temporary_names_are_unique_per_node_rank_and_process(
-        monkeypatch, tmp_path):
-    import socket
-    from gw.sigma_box_plan import _rule_cache_store
-
-    seen = []
-    real_replace = __import__("os").replace
-
-    def spy(source, target):
-        seen.append(str(source))
-        return real_replace(source, target)
-
-    monkeypatch.setattr("gw.sigma_box_plan.os.replace", spy)
-    assert _rule_cache_store(str(tmp_path), _fake_rule(
-        (-3.0, -0.3, 0.05, 0.4), 1.0e-4), 1.0) is None
-    assert len(seen) == 1
-    assert f".{socket.gethostname()}.0." in seen[0] and seen[0].endswith(".tmp")
+    assert served["positive conduction:state_tail"]["rule_source"].startswith("plan:")
+    assert all(w["rule_source"].startswith("scope:") for w in warm_rows)
 
 
 @pytest.mark.parametrize("space,negative", [("cond", False), ("val", True)])
@@ -393,7 +374,7 @@ def test_sc_fixed_tail_covers_a_state_crossing_the_product_edge(
             omega_abs=omega_abs, omega_idx=np.arange(2))
         return plan_sigma_windows(
             summaries, [branch], omega, 0.1, eps=1.e-4,
-            cache_dir=None, fixed_rule_session=session,
+            scope=None, fixed_rule_session=session,
             fixed_pole_support_ry=pole_support, print_fn=lambda *_a, **_k: None)
 
     # The selector boundary is .65 Ry. A .02 Ry motion introduces a new
@@ -417,7 +398,7 @@ def test_sc_fixed_session_reuses_identical_nodes_without_refitting(monkeypatch):
     monkeypatch.setattr("gw.sigma_box_plan._BOX_RULE_BUILDER", counted)
     session = _freezing_session()
     args = dict(
-        eps=1.0e-4, cache_dir=None,
+        eps=1.0e-4, scope=None,
         fixed_rule_session=session,
         print_fn=lambda *_args, **_kwargs: None)
     plan_sigma_windows(
@@ -447,7 +428,7 @@ def test_sc_fixed_session_reuses_identical_nodes_without_refitting(monkeypatch):
     assert second_geometry["sc_fixed_rebuilds_this_iteration"] == 0
     assert second_geometry["sc_plan_event"] == "hold"
     assert second_geometry["sc_fixed_total_rebuild_count"] == 0
-    assert all(row["cache_status"] == "hit:sc-fixed"
+    assert all(row["rule_source"] == "hit:sc-fixed"
                for row in second_geometry["branches"][0]["windows"])
     second_digests = [
         row["node_digest"]
@@ -468,7 +449,7 @@ def test_sc_fixed_rule_covers_the_declared_pole_support(monkeypatch):
     monkeypatch.setattr("gw.sigma_box_plan._BOX_RULE_BUILDER", counted)
     session = _freezing_session()
     args = dict(
-        eps=1.0e-4, cache_dir=None, fixed_rule_session=session,
+        eps=1.0e-4, scope=None, fixed_rule_session=session,
         fixed_pole_support_ry=5.0,
         print_fn=lambda *_args, **_kwargs: None)
     _, first_geometry = _held(lambda: plan_sigma_windows(
@@ -504,7 +485,7 @@ def test_sc_fixed_session_rebuilds_an_escaped_window_and_says_so(monkeypatch):
     monkeypatch.setattr("gw.sigma_box_plan._BOX_RULE_BUILDER", counted)
     session = _freezing_session()
     args = dict(
-        eps=1.0e-4, cache_dir=None,
+        eps=1.0e-4, scope=None,
         fixed_rule_session=session,
         print_fn=lambda *_args, **_kwargs: None)
     _, first = _held(lambda: plan_sigma_windows(
@@ -538,7 +519,7 @@ def test_sc_fixed_session_rebuilds_an_escaped_window_and_says_so(monkeypatch):
     assert len(calls) == len(reasons)
     for name, row in rows.items():
         refit = name in reasons
-        assert row["cache_status"].startswith("rebuild:sc-fixed") == refit
+        assert row["rule_source"].startswith("rebuild:sc-fixed") == refit
         if not refit:
             assert row["node_digest"] == frozen[name]
     assert (escaped["sc_fixed_initial_window_tau_pairs"]
@@ -573,7 +554,7 @@ def test_sc_short_edge_escape_rebuilds_by_the_plan_rule_and_is_logged(
         calls.clear()
         _, geometry = plan_sigma_windows(
             _summaries([branch], poles), [branch], np.asarray([0.2, 0.5]), 0.1,
-            eps=1.0e-4, cache_dir=None, fixed_rule_session=session,
+            eps=1.0e-4, scope=None, fixed_rule_session=session,
             print_fn=lambda *_args, **_kwargs: None)
         return geometry, len(calls)
 
@@ -593,7 +574,7 @@ def test_sc_short_edge_escape_rebuilds_by_the_plan_rule_and_is_logged(
     assert escaped["sc_plan_event"] == "extend"
     assert escaped["sc_fixed_escape_maps_total"] == 1
     rebuilt = session["rules"][name]
-    assert rebuilt["fit"]["cache_status"].startswith("rebuild:sc-fixed")
+    assert rebuilt["fit"]["rule_source"].startswith("rebuild:sc-fixed")
     # The same rule around the current state: 2 eta inside it.
     assert rebuilt["certified"]["states_ry"][0] == pytest.approx(-0.35)
     assert rebuilt["pad_ev"][0] == pytest.approx(0.2 * RYD_TO_EV)
@@ -656,7 +637,7 @@ def test_sc_fixed_session_keeps_receipt_for_temporarily_empty_window(
     monkeypatch.setattr("gw.sigma_box_plan._BOX_RULE_BUILDER", counted)
     session = _freezing_session()
     args = dict(
-        eps=1.0e-4, cache_dir=None,
+        eps=1.0e-4, scope=None,
         fixed_rule_session=session,
         print_fn=lambda *_args, **_kwargs: None)
     _, first_geometry = _held(lambda: plan_sigma_windows(
@@ -701,7 +682,7 @@ def test_sc_fixed_session_rebuilds_for_a_window_absent_from_iteration_one(
     monkeypatch.setattr("gw.sigma_box_plan._BOX_RULE_BUILDER", counted)
     session = _freezing_session()
     args = dict(
-        eps=1.0e-4, cache_dir=None,
+        eps=1.0e-4, scope=None,
         fixed_rule_session=session,
         print_fn=lambda *_args, **_kwargs: None)
     _held(lambda: plan_sigma_windows(
@@ -728,7 +709,7 @@ def test_sc_fixed_session_refits_only_on_material_class_flip(monkeypatch):
     monkeypatch.setattr("gw.sigma_box_plan._BOX_RULE_BUILDER", counted)
     session = _freezing_session()
     args = dict(
-        eps=1.0e-4, cache_dir=None,
+        eps=1.0e-4, scope=None,
         fixed_rule_session=session,
         print_fn=lambda *_args, **_kwargs: None)
     _, first = _held(lambda: plan_sigma_windows(
@@ -763,14 +744,14 @@ def test_sc_map0_is_the_one_shot_plan_and_certifies_the_held_rules(monkeypatch, 
     quiet = dict(eps=1.0e-4, print_fn=lambda *_args, **_kwargs: None)
     one_shot, one_shot_geometry = plan_sigma_windows(
         _summaries(), [_branch_at((0.1, 3.0))], np.asarray([0.2, 0.5]), 0.1,
-        cache_dir=str(tmp_path / "one_shot"), **quiet)
+        scope=str(tmp_path / "one_shot"), **quiet)
     session = {}
     receipts = []
     for energies in ((0.1, 3.0), (0.12, 3.05), (0.125, 3.06)):
         calls.clear()
         plan, geometry = plan_sigma_windows(
             _summaries(), [_branch_at(energies)], np.asarray([0.2, 0.5]),
-            0.1, cache_dir=str(tmp_path / "sc"), fixed_rule_session=session,
+            0.1, scope=str(tmp_path / "sc"), fixed_rule_session=session,
             **quiet)
         receipts.append((plan, geometry, len(calls)))
     (map0, first, built), (_, second, planned), (_, third, held) = receipts
@@ -785,12 +766,12 @@ def test_sc_map0_is_the_one_shot_plan_and_certifies_the_held_rules(monkeypatch, 
     assert [w["rule_box_ry"] for w in windows] == [
         w["rule_box_ry"] for w in one_shot_geometry["branches"][0]["windows"]]
     assert not any(w["sc_fixed_rule"] or w["sc_fixed_padded_box_ry"] for w in windows)
-    # The same call fitted the padded set beside the one-shot set: the three
-    # one-shot fits are the one-shot plan's own builds, served by the rule
-    # table (3 hits), and the builder ran only for the three padded held rules
-    # (3 builds) that map 1 then serves.
-    assert first["sc_fixed_initialized"] and built == 3
-    assert first["rule_table_lookups"] == {"hit": 3, "built": 3}
+    # The same call fitted the padded set beside the one-shot set: three
+    # one-shot builds (no rule outlives a plan's scope, and the one-shot
+    # plan above ran in another scope) and three padded held rules that map 1
+    # then serves.
+    assert first["sc_fixed_initialized"] and built == 6
+    assert first["rules_built"] == 6
     assert first["sc_fixed_initial_window_tau_pairs"] == 6
     # Map 1 holds: each current box is inside its first-plan rule.
     assert planned == 0 and second["sc_fixed_rebuilds_this_iteration"] == 0
@@ -799,7 +780,7 @@ def test_sc_map0_is_the_one_shot_plan_and_certifies_the_held_rules(monkeypatch, 
     assert resonant["pad_ev"][0] == pytest.approx(0.2 * RYD_TO_EV)
     assert resonant["certified"]["states_ry"][0] == pytest.approx(0.1 - 0.2)
     assert held == 0 and third["sc_fixed_rebuilds_this_iteration"] == 0
-    assert all(w["cache_status"] == "hit:sc-fixed"
+    assert all(w["rule_source"] == "hit:sc-fixed"
                for w in third["branches"][0]["windows"])
     assert [w["node_digest"] for w in third["branches"][0]["windows"]] == [
         w["node_digest"] for w in second["branches"][0]["windows"]]
@@ -941,7 +922,7 @@ def test_fixed_sc_refuses_a_rule_above_eps_without_retrying(monkeypatch):
         plan_sigma_windows(
             _summaries(), [_branch()], np.asarray([0.2, 0.5]), 0.1,
             eps=1.0e-4,
-            cache_dir=None, fixed_rule_session=_freezing_session(),
+            scope=None, fixed_rule_session=_freezing_session(),
             print_fn=lambda *_args, **_kwargs: None)
     assert "do not loosen sigma_quadrature_eps" in str(err.value)
     assert not any("time_budget" in kw or "reduction_steps" in kw
@@ -976,7 +957,7 @@ def test_one_shot_preserves_the_historical_sup_error_refusal(monkeypatch):
         plan_sigma_windows(
             _summaries(), [_branch()], np.asarray([0.2, 0.5]), 0.1,
             eps=1.0e-4,
-            cache_dir=None, print_fn=lambda *_args, **_kwargs: None)
+            scope=None, print_fn=lambda *_args, **_kwargs: None)
 
 
 def test_crossing_noise_gate_uses_peak_relative_term_mass(monkeypatch):
@@ -993,7 +974,7 @@ def test_crossing_noise_gate_uses_peak_relative_term_mass(monkeypatch):
     plan, geometry = plan_sigma_windows(
         _summaries(), [_branch()], np.asarray([0.2, 0.5]), 0.1,
         eps=1.0e-4,
-        cache_dir=None, print_fn=lambda *_args, **_kwargs: None)
+        scope=None, print_fn=lambda *_args, **_kwargs: None)
     assert len(plan) == 3
     assert geometry["branches"][0]["windows"][0]["kappa_max"] == 1.0e6
     assert all(
@@ -1019,7 +1000,7 @@ def test_executor_noise_gate_refuses_large_term_mass(monkeypatch):
         plan_sigma_windows(
             _summaries(), [_branch()], np.asarray([0.2, 0.5]), 0.1,
             eps=1.0e-4,
-            cache_dir=None, print_fn=lambda *_args, **_kwargs: None)
+            scope=None, print_fn=lambda *_args, **_kwargs: None)
 
 
 def test_builder_receives_executor_noise_cap(monkeypatch):
@@ -1033,7 +1014,7 @@ def test_builder_receives_executor_noise_cap(monkeypatch):
     plan_sigma_windows(
         _summaries(), [_branch()], np.asarray([0.2, 0.5]), 0.1,
         eps=1.0e-4,
-        cache_dir=None, print_fn=lambda *_args, **_kwargs: None)
+        scope=None, print_fn=lambda *_args, **_kwargs: None)
     # One cap in both currencies: the executor's noise budget over its
     # per-term roundoff, the term mass the planner's noise gate bounds.
     expected = 5.0e-6 / 6.0e-8
@@ -1046,109 +1027,13 @@ def test_builder_receives_executor_noise_cap(monkeypatch):
                for kwargs in crossing + sign_definite)
 
 
-def test_cache_rule_missing_active_noise_cap_does_not_shadow_builder(
-        monkeypatch, tmp_path):
-    monkeypatch.setattr("gw.sigma_box_plan._BOX_RULE_BUILDER", _fake_rule)
-    args = dict(
-        eps=1.0e-4,
-        cache_dir=str(tmp_path), print_fn=lambda *_args, **_kwargs: None)
-    plan_sigma_windows(
-        _summaries(), [_branch()], np.asarray([0.2, 0.5]), 0.1, **args)
-    paths = list(tmp_path.glob("*.npz"))
-    assert len(paths) == 3
-    for path in paths:
-        with np.load(path) as data:
-            payload = {name: np.asarray(data[name]) for name in data.files}
-        payload["roundoff_amplification"] = np.asarray(1.0e6)
-        np.savez(path, **payload)
-
-    calls = []
-
-    def counted(box, eps, **kwargs):
-        calls.append(tuple(box))
-        return _fake_rule(box, eps, **kwargs)
-
-    monkeypatch.setattr("gw.sigma_box_plan._BOX_RULE_BUILDER", counted)
-    _plan, geometry = plan_sigma_windows(
-        _summaries(), [_branch()], np.asarray([0.2, 0.5]), 0.1, **args)
-    assert len(calls) == 3
-    assert all(
-        row["cache_status"] == "miss"
-        for row in geometry["branches"][0]["windows"])
-
-    calls.clear()
-    _plan, geometry = plan_sigma_windows(
-        _summaries(), [_branch()], np.asarray([0.2, 0.5]), 0.1, **args)
-    assert calls == []
-    assert all(
-        row["cache_status"].startswith("hit:")
-        for row in geometry["branches"][0]["windows"])
-
-
-def test_corrupt_cache_entry_is_announced_and_repaired(
-        monkeypatch, tmp_path):
-    monkeypatch.setattr("gw.sigma_box_plan._BOX_RULE_BUILDER", _fake_rule)
-    args = dict(
-        eps=1.0e-4,
-        cache_dir=str(tmp_path))
-    plan_sigma_windows(
-        _summaries(), [_branch()], np.asarray([0.2, 0.5]), 0.1,
-        print_fn=lambda *_args: None, **args)
-    damaged = sorted(tmp_path.glob("*.npz"))[0]
-    damaged.write_bytes(b"not an npz certificate")
-
-    lines = []
-    plan, geometry = plan_sigma_windows(
-        _summaries(), [_branch()], np.asarray([0.2, 0.5]), 0.1,
-        print_fn=lines.append, **args)
-    warnings = [line for line in lines
-                if "cache entry is unreadable" in line]
-    assert len(plan) == 3
-    assert len(warnings) == 1
-    assert str(damaged.resolve()) in warnings[0]
-    assert "error=" in warnings[0]
-    assert sum(row["cache_status"] == "miss"
-               for row in geometry["branches"][0]["windows"]) == 1
-
-    lines.clear()
-    _plan, geometry = plan_sigma_windows(
-        _summaries(), [_branch()], np.asarray([0.2, 0.5]), 0.1,
-        print_fn=lines.append, **args)
-    assert not [line for line in lines if "cache entry is unreadable" in line]
-    assert all(row["cache_status"].startswith("hit:")
-               for row in geometry["branches"][0]["windows"])
-
-
-def test_each_cache_write_failure_is_announced_without_rejecting_rule(
-        monkeypatch, tmp_path):
-    monkeypatch.setattr("gw.sigma_box_plan._BOX_RULE_BUILDER", _fake_rule)
-    monkeypatch.setattr(
-        "gw.sigma_box_plan.os.replace",
-        lambda *_args: (_ for _ in ()).throw(OSError("read-only cache")))
-    lines = []
-    plan, geometry = plan_sigma_windows(
-        _summaries(), [_branch()], np.asarray([0.2, 0.5]), 0.1,
-        eps=1.0e-4,
-        cache_dir=str(tmp_path), print_fn=lines.append)
-
-    assert len(plan) == 3
-    warnings = [line for line in lines
-                if line.startswith("WARNING sigma quadrature cache")]
-    assert len(warnings) == 3
-    assert all(str(tmp_path) in line for line in warnings)
-    assert all("OSError: read-only cache" in line for line in warnings)
-    assert all(row["cache_status"] == "miss"
-               for row in geometry["branches"][0]["windows"])
-    assert not list(tmp_path.glob("*.tmp"))
-
-
 def test_no_pair_ceiling(monkeypatch):
     # Owner ruling 2026-09-02: the plan reports its pair count, never refuses on it.
     monkeypatch.setattr("gw.sigma_box_plan._BOX_RULE_BUILDER", _fake_rule)
     plan, geometry = plan_sigma_windows(
         _summaries(), [_branch()], np.asarray([0.2, 0.5]), 0.1,
         eps=1.0e-4,
-        cache_dir=None, print_fn=lambda *_args, **_kwargs: None)
+        scope=None, print_fn=lambda *_args, **_kwargs: None)
     assert "pair_ceiling" not in geometry and geometry["window_tau_pairs"] > 5
 
 
@@ -1209,16 +1094,18 @@ def test_quadrature_deck_defaults_and_retired_sector_key(tmp_path):
     config = LorraxConfig.from_input_file(
         str(deck), print_fn=lambda *_args, **_kwargs: None)
     assert config.sigma.quadrature_eps == 1.0e-4
-    assert config.sigma.quadrature_cache_dir == "auto"
 
-    deck.write_text(
-        _DECK
-        + "sigma_quadrature_eps = 2e-4\n"
-        + "sigma_quadrature_cache_dir = off\n")
+    deck.write_text(_DECK + "sigma_quadrature_eps = 2e-4\n")
     config = LorraxConfig.from_input_file(
         str(deck), print_fn=lambda *_args, **_kwargs: None)
     assert config.sigma.quadrature_eps == 2.0e-4
-    assert config.sigma.quadrature_cache_dir == "off"
+
+    # No quadrature rule is stored across runs: the cache key refuses by name.
+    for value in ("auto", "off", "rules"):
+        deck.write_text(_DECK + f"sigma_quadrature_cache_dir = {value}\n")
+        with pytest.raises(ValueError, match="sigma_quadrature_cache_dir' is retired"):
+            LorraxConfig.from_input_file(
+                str(deck), print_fn=lambda *_args, **_kwargs: None)
 
     # A deck that still names a reduction budget is refused, not ignored:
     # the builder has no budget of any kind and silently dropping the key
@@ -1262,7 +1149,7 @@ def test_nan_weights_with_finite_sup_are_not_a_certificate(monkeypatch):
         plan_sigma_windows(
             _summaries(), [_branch()], np.asarray([0.2, 0.5]), 0.1,
             eps=1.0e-4,
-            cache_dir=None, fixed_rule_session=_freezing_session(),
+            scope=None, fixed_rule_session=_freezing_session(),
             print_fn=lambda *_args, **_kwargs: None)
 
 
@@ -1278,42 +1165,8 @@ def test_infinite_sup_refuses_and_names_the_value(monkeypatch):
         plan_sigma_windows(
             _summaries(), [_branch()], np.asarray([0.2, 0.5]), 0.1,
             eps=1.0e-4,
-            cache_dir=None, print_fn=lambda *_args, **_kwargs: None)
+            scope=None, print_fn=lambda *_args, **_kwargs: None)
     assert "inf" in str(err.value)
-
-
-def test_cache_store_refuses_a_non_finite_rule(tmp_path):
-    import dataclasses
-    from gw.sigma_box_plan import _rule_cache_store
-    rule = _fake_rule((-2.0, -0.3, 0.05, 0.4), 1.0e-4)
-    bad = dataclasses.replace(
-        rule, times=np.array(rule.times, dtype=np.complex128) * np.nan)
-    warning = _rule_cache_store(str(tmp_path), bad, 1.0)
-    assert warning is not None and "refused" in warning
-    assert not list(tmp_path.glob("*.npz"))
-
-
-def test_cache_lookup_prefers_a_certified_larger_rule_over_a_bad_smaller_one(tmp_path):
-    import dataclasses
-    from gw.sigma_box_plan import _rule_cache_lookup, _rule_cache_store
-    box = (-2.0, -0.3, 0.05, 0.4)
-    good = _fake_rule(box, 1.0e-4)
-    small_bad = dataclasses.replace(
-        good, times=np.array(good.times[:2]), weights=np.array(good.weights[:2]),
-        sup_error=0.04)
-    # store the good rule through the guarded path, and the bad one raw
-    assert _rule_cache_store(str(tmp_path), good, 1.0) is None
-    np.savez(tmp_path / "rule_bad.npz", times=small_bad.times,
-             weights=small_bad.weights, box=np.asarray(box), eps=1.0e-4,
-             relative=True, theta_deg=float(good.theta_deg), rank=int(good.rank),
-             sup_error=0.04, kappa_max=float(good.kappa_max),
-             roundoff_amplification=1.0)
-    best, _warnings = _rule_cache_lookup(
-        str(tmp_path), box, 1.0e-4, True, noise_amplification_cap=1.0e9,
-        ceiling_nodes=None)
-    assert best is not None
-    rule, name = best
-    assert name != "rule_bad.npz" and rule.sup_error <= 1.0e-4
 
 
 # Shared-pole rule-request namespace and durable receipt (union review items 10 and 18).
@@ -1349,7 +1202,7 @@ def test_durable_receipt_is_strict_json_with_null_open_edges(monkeypatch, tmp_pa
     try:
         plan_sigma_windows(
             _summaries(), [_branch()], np.array([.2, .5]), .1,
-            eps=1e-4, cache_dir=None,
+            eps=1e-4, scope=None,
             print_fn=report.legacy_print)
     finally:
         report.close()
@@ -1373,19 +1226,17 @@ def _refuse_json_constant(token):
 @pytest.mark.parametrize("changed", ["hamiltonian", "recipe_hash", "poles", "eta", "eps"])
 def test_current_input_request_cannot_reuse_changed_map_rules(
         monkeypatch, tmp_path, changed):
-    from gw.sigma_box_plan import sigma_rule_request_cache
+    from gw.sigma_box_plan import sigma_rule_scope
     monkeypatch.setattr("gw.sigma_box_plan._BOX_RULE_BUILDER", _fake_rule)
     identity = _sc_identity(1)
     poles, counts = np.array([[.09, 1.]]), np.array([2])
     kw = dict(eta=.1, eps=1e-4)
-    first_dir = sigma_rule_request_cache(str(tmp_path), identity, poles, counts, **kw)
+    first_dir = sigma_rule_scope(identity, poles, counts, **kw)
     args = dict(eps=1e-4, print_fn=lambda *_: None)
     plan_sigma_windows(_summaries(), [_branch()], np.array([.2, .5]), .1,
-                       cache_dir=first_dir, **args)
-    # THE NEXT SC MAP, same physics: same namespace, or the on-disk cache is
-    # dead across maps (review item 10).
-    assert first_dir == sigma_rule_request_cache(
-        str(tmp_path), _sc_identity(2), poles, counts, **kw)
+                       scope=first_dir, **args)
+    # THE NEXT SC MAP, same physics: same scope (review item 10).
+    assert first_dir == sigma_rule_scope(_sc_identity(2), poles, counts, **kw)
     if changed == "hamiltonian":
         identity = _sc_identity(2, occ_hash="fd-b")
     elif changed == "recipe_hash":
@@ -1394,25 +1245,51 @@ def test_current_input_request_cannot_reuse_changed_map_rules(
         poles[0, 0] += .001
     else:
         kw[changed] *= .9
-    new_dir = sigma_rule_request_cache(str(tmp_path), identity, poles, counts, **kw)
+    new_dir = sigma_rule_scope(identity, poles, counts, **kw)
     assert new_dir != first_dir
     _, geometry = plan_sigma_windows(
         _summaries(), [_branch()], np.array([.2, .5]), .1,
-        cache_dir=new_dir, **args)
-    assert all(row["cache_status"] == "miss"
+        scope=new_dir, **args)
+    assert all(row["rule_source"] == "built"
                for row in geometry["branches"][0]["windows"])
 
 
 def test_changed_domain_rebuilds_even_with_same_input_identity(monkeypatch, tmp_path):
-    from gw.sigma_box_plan import _rule_cache_lookup, _rule_cache_store
+    from gw.sigma_box_plan import _scope_lookup
     rule = _fake_rule((-2., -.3, .05, .4), 1e-4)
-    assert _rule_cache_store(str(tmp_path), rule, 1.) is None
-    accepted, _ = _rule_cache_lookup(str(tmp_path), rule.box, 1e-4, True,
-                                    noise_amplification_cap=1e9, ceiling_nodes=None)
+    _hold(str(tmp_path), rule, 1.)
+    accepted = _scope_lookup(str(tmp_path), rule.box, 1e-4, True,
+                             noise_amplification_cap=1e9, ceiling_nodes=None)
     assert accepted is not None
-    escaped, _ = _rule_cache_lookup(str(tmp_path), (-3., -.3, .05, .4), 1e-4, True,
-                                   noise_amplification_cap=1e9, ceiling_nodes=None)
+    escaped = _scope_lookup(str(tmp_path), (-3., -.3, .05, .4), 1e-4, True,
+                            noise_amplification_cap=1e9, ceiling_nodes=None)
     assert escaped is None
+
+
+def test_scope_lookup_skips_an_uncertified_smaller_rule(tmp_path):
+    import dataclasses
+    from gw.sigma_box_plan import _scope_lookup
+    box = (-2.0, -0.3, 0.05, 0.4)
+    good = _fake_rule(box, 1.0e-4)
+    small_bad = dataclasses.replace(
+        good, times=np.array(good.times[:2]), weights=np.array(good.weights[:2]),
+        sup_error=0.04)
+    _hold(str(tmp_path), good, 1.0)
+    _hold(str(tmp_path), small_bad, 1.0)
+    rule, _amplification, _digest = _scope_lookup(
+        str(tmp_path), box, 1.0e-4, True, noise_amplification_cap=1.0e9,
+        ceiling_nodes=None)
+    assert rule.sup_error <= 1.0e-4 and rule.node_count == good.node_count
+
+
+def test_no_rule_outlives_the_process(monkeypatch, tmp_path):
+    """Nothing is written anywhere: the plan touches no file."""
+    monkeypatch.setattr("gw.sigma_box_plan._BOX_RULE_BUILDER", _fake_rule)
+    monkeypatch.chdir(tmp_path)
+    plan_sigma_windows(
+        _summaries(), [_branch()], np.asarray([0.2, 0.5]), 0.1,
+        eps=1.0e-4, scope=str(tmp_path), print_fn=lambda *_a, **_k: None)
+    assert not list(tmp_path.rglob("*"))
 
 
 def test_rank_assignment_spreads_the_longest_fits_and_reduces_to_round_robin():
@@ -1438,7 +1315,7 @@ def test_tall_narrow_crossing_window_is_accepted():
                         "pole_sign": 1.0, "states": np.asarray([0.0]),
                         "pole_stats": [(0.1, 0.2, 0.0, 0.3)],
                         "E_ref_A": 0.0, "E_ref_B": 0.0},
-                       rule, 1.0e-4, cache_status="miss", cache_dir=None)
+                       rule, 1.0e-4, rule_source="built")
     assert fit["node_count"] == rule.node_count
 
 
@@ -1457,6 +1334,14 @@ def _sized_rule(box, eps, count):
         theta_deg=5.0, rank=3, sup_error=0.5 * eps, kappa_max=1.2, seconds=0.0)
 
 
+def _hold(scope, rule, amplification):
+    """Put an accepted rule into ``scope`` the way a plan's build joins it."""
+    from gw.sigma_box_plan import _rule_digest, _scope_store
+    _scope_store(scope, [{"built": True, "rule": rule,
+                          "rule_digest": _rule_digest(rule, amplification),
+                          "roundoff_amplification": amplification}])
+
+
 def _crossing_spec(frequencies=(0.2, 0.5), states=(0.1,), pole=(0.3, 0.3), eta=0.1):
     from gw.sigma_box_plan import make_sigma_box_spec
     spec = make_sigma_box_spec(
@@ -1466,13 +1351,12 @@ def _crossing_spec(frequencies=(0.2, 0.5), states=(0.1,), pole=(0.3, 0.3), eta=0
     return spec
 
 
-def test_crossing_cache_hit_is_capped_by_the_law_count(monkeypatch, tmp_path):
-    """A much larger cached crossing rule is a miss; a neighbour's build hits.
+def test_crossing_scope_reuse_is_capped_by_the_law_count(monkeypatch, tmp_path):
+    """A much larger held crossing rule is not reused; a neighbour's build is.
 
-    On c5257230b the first lookup is a ``hit:`` (containment alone).
+    On c5257230b the first lookup is a hit (containment alone).
     """
-    from gw.sigma_box_plan import (_build_box, _fit_rule, _law_node_count,
-                                   _rule_cache_store)
+    from gw.sigma_box_plan import _build_box, _fit_rule, _law_node_count
     monkeypatch.setattr("gw.sigma_box_plan._BOX_RULE_BUILDER", _fake_rule)
     eta, eps = 0.1, 1.0e-4
     spec = _crossing_spec(eta=eta)
@@ -1481,19 +1365,19 @@ def test_crossing_cache_hit_is_capped_by_the_law_count(monkeypatch, tmp_path):
     lo, hi, g0, g1 = spec["box"]
     big = (3.0 * lo, 3.0 * hi, g0, g1)
     assert _law_node_count(big, eps) > law
-    _rule_cache_store(str(tmp_path), _sized_rule(big, eps, _law_node_count(big, eps)), 1.0)
-    assert _fit_rule(spec, eps, str(tmp_path), eta)["cache_status"] == "miss"
+    _hold(str(tmp_path), _sized_rule(big, eps, _law_node_count(big, eps)), 1.0)
+    assert _fit_rule(spec, eps, str(tmp_path), eta)["rule_source"] == "built"
     # A neighbour's build: a box 1% wider on the far edges at no more nodes.
     neighbour = _build_box(own, eta, widen=True)
-    _rule_cache_store(str(tmp_path), _sized_rule(neighbour, eps, law), 1.0)
+    _hold(str(tmp_path), _sized_rule(neighbour, eps, law), 1.0)
     fit = _fit_rule(spec, eps, str(tmp_path), eta)
-    assert fit["cache_status"].startswith("hit:") and fit["node_count"] == law
+    assert fit["rule_source"].startswith("scope:") and fit["node_count"] == law
 
 
-def test_sign_definite_cache_hit_follows_the_same_count(monkeypatch, tmp_path):
+def test_sign_definite_scope_reuse_follows_the_same_count(monkeypatch, tmp_path):
     """A 3x larger sign-definite rule at no more nodes than the own build is served."""
     from gw.sigma_box_plan import (_build_box, _fit_rule, _law_node_count,
-                                   _rule_cache_store, make_sigma_box_spec)
+                                   make_sigma_box_spec)
     monkeypatch.setattr("gw.sigma_box_plan._BOX_RULE_BUILDER", _fake_rule)
     eta, eps = 0.1, 1.0e-4
     spec = make_sigma_box_spec(
@@ -1503,9 +1387,9 @@ def test_sign_definite_cache_hit_follows_the_same_count(monkeypatch, tmp_path):
     law = _law_node_count(_build_box(spec["box"], eta, widen=True), eps)
     lo, hi, g0, g1 = spec["box"]
     larger = (3.0 * lo, hi, g0, g1)
-    _rule_cache_store(str(tmp_path), _sized_rule(larger, eps, law), 1.0)
+    _hold(str(tmp_path), _sized_rule(larger, eps, law), 1.0)
     fit = _fit_rule(spec, eps, str(tmp_path), eta)
-    assert fit["cache_status"].startswith("hit:") and fit["node_count"] == law
+    assert fit["rule_source"].startswith("scope:") and fit["node_count"] == law
 
 
 @pytest.mark.parametrize("b_offset", [+2, -1])
@@ -1513,7 +1397,7 @@ def test_cold_crossing_plan_serves_the_rules_a_warm_rerun_would(
         monkeypatch, tmp_path, b_offset):
     """Crossing variant: window A inside window B, A's own build above its law
     count (a rung flip), B built between them (+2) or below it (-1). The plan
-    (_serve_from_plan) and the later lookup (_rule_cache_lookup) apply the one
+    (_serve_from_plan) and the later lookup (_scope_lookup) apply the one
     criterion, so a cold plan serves what its warm rerun serves."""
     from gw.sigma_box_plan import (_build_box, _law_node_count,
                                    fit_sigma_box_specs)
@@ -1530,8 +1414,8 @@ def test_cold_crossing_plan_serves_the_rules_a_warm_rerun_would(
         return _sized_rule(box, eps, law_small + 5 if same else law_small + b_offset)
 
     monkeypatch.setattr("gw.sigma_box_plan._BOX_RULE_BUILDER", sized)
-    cold, _ = fit_sigma_box_specs([small, large], eta, eps=eps, cache_dir=str(tmp_path))
-    warm, _ = fit_sigma_box_specs([small, large], eta, eps=eps, cache_dir=str(tmp_path))
+    cold, _ = fit_sigma_box_specs([small, large], eta, eps=eps, scope=str(tmp_path))
+    warm, _ = fit_sigma_box_specs([small, large], eta, eps=eps, scope=str(tmp_path))
     for left, right in zip(cold, warm):
         assert left["node_count"] == right["node_count"]
         assert left["node_digest"] == right["node_digest"]

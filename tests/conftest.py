@@ -273,39 +273,6 @@ from types import SimpleNamespace as _NS
 import pytest
 
 
-@pytest.fixture(scope="session")
-def _sigma_rule_table_root():
-    """This process's rule-table root, removed at session end.
-
-    Not under basetemp: the P4 harness shares one ``--basetemp`` across
-    pytest ranks, and a per-cell ``getbasetemp()`` made every rank clear
-    and recreate it at once (FileExistsError on rank 0).
-    """
-    import shutil
-    import tempfile
-    root = tempfile.mkdtemp(prefix="lorrax_rule_table_")
-    yield _Path(root)
-    shutil.rmtree(root, ignore_errors=True)
-
-
-@pytest.fixture(autouse=True)
-def _private_sigma_rule_table(request, _sigma_rule_table_root, monkeypatch):
-    """Give every cell its own run-independent Σ rule table.
-
-    Cells patch the Sigma box-rule builder (``gw.sigma_box_plan._BOX_RULE_BUILDER``) with fakes: a fake stored in the
-    user's table would be served to a real run with the same build box, and
-    a rule another cell stored would replace a cell's own fake. One
-    subdirectory per cell, created only when the cell stores a rule; a
-    driver subprocess inherits the variable. The root is
-    per-process, so srun-launched pytest ranks do not share a table: peers
-    rebuild the rule rank 0 stored, which is the same rule bit for bit.
-    """
-    import hashlib
-    cell = hashlib.sha256(request.node.nodeid.encode()).hexdigest()[:16]
-    monkeypatch.setenv("LORRAX_SIGMA_RULE_TABLE_TEST_DIR",
-                       str(_sigma_rule_table_root / cell))
-
-
 # ---------------------------------------------------------------------------
 # `@pytest.mark.mesh(n)` — THE CELLS THE PIN ABOVE USED TO SILENCE  (2026-08-10)
 # ---------------------------------------------------------------------------

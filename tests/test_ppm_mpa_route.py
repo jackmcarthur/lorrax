@@ -76,7 +76,6 @@ def test_ppm_fit_is_handed_in_memory_to_the_mpa_route(monkeypatch):
         omega_grid_ry=omega_grid,
         ansatz="gn_ppm",
         screening_diagrams="w_rpa",
-        quadrature_cache_dir="/tmp/rule-cache",
         plan=plan,
         print_fn=lambda *_args, **_kwargs: None)
 
@@ -93,7 +92,7 @@ def test_ppm_fit_is_handed_in_memory_to_the_mpa_route(monkeypatch):
     assert provenance["pole_model"] == "gn_ppm"
     assert provenance["ppm_invalid_mode"] == "zero"
     assert mpa_kw["quadrature_eps"] == 3.0e-5
-    assert mpa_kw["quadrature_cache_dir"] == "/tmp/rule-cache"
+    assert "quadrature_cache_dir" not in mpa_kw
     assert mpa_kw["analytic_line"] is False
     assert mpa_kw["pole_batch_size"] == 4
     assert mpa_kw["band_brackets"] == plan.bounds

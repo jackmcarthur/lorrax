@@ -247,43 +247,34 @@ events change that:
 
 The receipt names every refit window and its reason.
 
-## 10. Cache, request scope and parallel planning
+## 10. In-run reuse and parallel planning
 
-**Cache.** Rules are immutable certificates keyed by (box, ε, currency) and
-authenticated by a digest. A lookup serves the smallest rule whose certified
-box contains the request at the same ε and currency with noise amplification
-under the cap. On a miss the build box widens only real edges farther than 3η
-from zero (by 1% of max(width, η)) and the far imaginary edge (by 1%), so
-nearby maps hit without widening a crossing rank.
-`sigma_quadrature_cache_dir = auto` places the cache at
-`<input_dir>/tmp/sigma_quadrature_rules`; `off` disables it; a relative path
-resolves against the deck. The cache accelerates; it is never a second
-correctness path, and a failed write only warns.
+**No stored rules.** No quadrature rule outlives its process (owner,
+2026-09-28). Every plan builds its rules cold: the builder places nodes by
+formula and solves one weight system, and the sampled term matrices of the
+weight solve and the certificate are evaluated in row blocks on the rank's
+cores (`minimax.uniform_rule._map_rows`), which changes no bit. The widest
+crossing window of the gate decks (Na 8³, [−15, 19] eV, about 1150 nodes)
+builds in about a second.
 
-**Rule table.** Below the cache, every builder call is memoized in one
-run-independent table, `$SCRATCH/.cache/lorrax/sigma_box_rules`. It is keyed
-exactly by the snapped build box, ε, the currency, the κ cap, the rule schema
-and the solver identity (the builder, the minimax sources, numerics backend, CPU model and
-pinned BLAS threads). The builder reads no clock and pins its threads, so a
-hit is the rule a cold build returns, bit for bit (claim 2737). A warm run is
-therefore the cold run that wrote the table, and no run depends on which
-other decks wrote it; the table never serves by containment. The first writer
-of a key wins; an entry whose schema, key or digest does not authenticate is a
-named miss and is replaced. `off` disables the table too.
+**Request scope.** Within one run a rule is reused only through an in-process
+scope. The shared-pole route keys the scope by the map's physical identity
+(energies, occupations and recipe, with the SC map label stripped), η, ε and
+the pole census; the PPM and MPA routes use one scope per run. A sector Σ
+call scopes by the union census of its CC, TT and CT_C models, so the four
+sector calls of a map reuse each other's fits; a changed spectrum never
+inherits another map's plan. A lookup serves the smallest rule whose box
+contains the request at the same ε and currency, with noise amplification
+under the cap and at most the closed-form node count of the request's own
+build. The build box widens only real edges farther than 3η from zero (by 1%
+of max(width, η)) and the far imaginary edge (by 1%), so sector calls reuse
+by containment without widening a crossing rank.
 
-**Request scope.** The shared-pole route scopes the cache to a subdirectory
-keyed by the map's physical identity (energies, occupations and recipe, with
-the SC map label stripped), η, ε and the pole census. Equal physical inputs
-share rules across restarts and maps, and a changed spectrum never inherits
-another map's plan. There is one scope per map: a sector Σ call scopes by the
-union census of its CC, TT and CT_C models, so the four sector calls of a map
-reuse each other's fits.
-
-**Parallel planning.** Windows are fit round-robin across processes, and only
-the small rules and receipts are gathered. Each window is then served the
-smallest compatible rule of the whole plan, ranked by (node count, digest),
-which is what a warm rerun would pick and does not depend on rank timing. A
-refusal on one rank travels as data and raises on every rank.
+**Parallel planning.** Windows are fit across processes, longest predicted
+fit first, and only the small rules and receipts are gathered. Each window is
+then served the smallest compatible rule of the whole plan, ranked by (node
+count, digest), which does not depend on rank timing. A refusal on one rank
+travels as data and raises on every rank.
 
 ## 11. Execution
 

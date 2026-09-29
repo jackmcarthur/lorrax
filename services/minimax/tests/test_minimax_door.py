@@ -69,7 +69,7 @@ def _solved_lines(caught):
     return [str(w.message) for w in caught if "SOLVED" in str(w.message)]
 
 
-def test_a_solve_announces_its_origin_once(isolated_cache):
+def test_a_solve_announces_its_origin_once():
     """The first serve of a request announces; the second of the SAME
     request does not."""
     with warnings.catch_warnings(record=True) as caught:
@@ -84,7 +84,7 @@ def test_a_solve_announces_its_origin_once(isolated_cache):
     assert "sha256:" in lines[0] or "runtime solve" in lines[0]
 
 
-def test_a_different_request_announces_separately(isolated_cache):
+def test_a_different_request_announces_separately():
     """RED TWIN for the once-only rule.  Announce-once must be keyed on the
     REQUEST; a global "announced already" flag would silence the second
     rule entirely, which makes a log look clean while two different rules
@@ -100,7 +100,7 @@ def test_a_different_request_announces_separately(isolated_cache):
     assert lines[0] != lines[1]
 
 
-def test_the_announcement_reset_is_not_a_no_op(isolated_cache):
+def test_the_announcement_reset_is_not_a_no_op():
     """RED TWIN for the conftest fixture.
 
     Every announcement cell in this suite depends on the autouse reset
@@ -122,18 +122,16 @@ def test_the_announcement_reset_is_not_a_no_op(isolated_cache):
 #  3.  Every rule is computed at run time
 # ---------------------------------------------------------------------------
 
-def test_serve_solves_in_process(isolated_cache):
-    """The rule comes from a runtime solve (or its disk cache), never from
-    a precomputed artifact."""
+def test_serve_solves_in_process():
+    """The rule comes from a runtime solve, never from a stored artifact."""
     q = M.serve(family="noncrossing", target="inverse", range_value=10.0,
                 error_bound=1.0e-6, n_max=64)
-    assert q.provenance.source in ("runtime-uncertified", "cache")
+    assert q.provenance.source == "runtime-uncertified"
     assert q.provenance.certified is False
     assert q.max_error <= 1.0e-6
 
 
-def test_a_retired_use_shipped_selector_refuses_rather_than_being_ignored(
-        isolated_cache):
+def test_a_retired_use_shipped_selector_refuses_rather_than_being_ignored():
     """An un-updated caller must hear that the selector is gone; silently
     dropping it is the parsed-but-ignored-key defect (TASTE 13)."""
     with pytest.raises(M.UnknownTarget) as excinfo:
@@ -142,7 +140,7 @@ def test_a_retired_use_shipped_selector_refuses_rather_than_being_ignored(
     assert "use_shipped" in str(excinfo.value)
 
 
-def test_the_solve_announces_itself_once_with_its_numbers(isolated_cache):
+def test_the_solve_announces_itself_once_with_its_numbers():
     """The loudest line in the service: the request, the achieved error,
     the measured Σ|w| and κ₀.
 
@@ -154,7 +152,7 @@ def test_the_solve_announces_itself_once_with_its_numbers(isolated_cache):
         warnings.simplefilter("always")
         q = M.serve(family="crossing", target="hgl", range_value=20.0,
                     error_bound=1.0e-6, n_max=60, eps_q=1.0e-3)
-    assert q.provenance.source in ("runtime-uncertified", "cache")
+    assert q.provenance.source == "runtime-uncertified"
     assert q.kappa0 is not None
     lines = [str(w.message) for w in caught if "SOLVED" in str(w.message)]
     assert len(lines) == 1, lines

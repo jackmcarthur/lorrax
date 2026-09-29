@@ -7,8 +7,8 @@ This module is intentionally scoped to the static path first:
 
 WHAT THIS MODULE IS AFTER THE 2026-08-08 EXTRACTION.  It is the RUNTIME
 layer over the ``minimax`` service, and the boundary is the one
-``docs/architecture/layers.md`` recorded years ago: the solvers, the
-shipped catalog and the disk cache are ``services/minimax/`` now; what
+``docs/architecture/layers.md`` recorded years ago: the solvers are
+``services/minimax/`` now (no catalog and no disk cache remain); what
 stays here is everything that knows about physics.  Concretely:
 
 * the three ``solve_*`` wrappers rescale the service's SCALED tables
@@ -132,7 +132,8 @@ def _scalar_to_host_float(a) -> float:
 
 
 # ---------------------------------------------------------------------------
-#  THE CATALOG, THE DISK CACHE AND THE SOLVERS LEFT THIS MODULE (2026-08-08).
+#  THE SOLVERS LEFT THIS MODULE (2026-08-08); THE CATALOG AND THE DISK CACHE
+#  ARE DELETED (no quadrature rule is stored across runs, 2026-09-28).
 #
 #  They are `services/minimax/` now, reached through the door as `_mm`.  What
 #  used to sit here was ~190 lines carrying six `except Exception:` handlers

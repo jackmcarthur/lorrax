@@ -126,15 +126,17 @@ def check(mesh, root, layout, resident=False):
     handle=store.write_shared_pole_sector_manifest(root/'manifest.json',models=models,
         bank=dict(path=bank),identity=identity,receipts=dict(scope='synthetic oracle'),mesh_xy=mesh)
     omega=np.array([-.3,.0,.35])
+    from gw import sigma_box_plan as _plan
+    scopes_before=set(_plan._SCOPES)
     started=time.perf_counter()
     result=compute_sector_sigma(handle,tuple(families),tuple(bases),meta,mesh,
         omega_grid_ry=omega,efermi_ry=occ.mu_ry,occupation_state=occ,
-        regularization_width_ry=eta,quadrature_eps=1e-4,quadrature_cache_dir=str(root/'rules'),
+        regularization_width_ry=eta,quadrature_eps=1e-4,
         omega_grid_step_ry=.3,print_fn=print)
     result.sigma_c_kij.block_until_ready()
     consumer_wall_s=time.perf_counter()-started
     # The four sector calls share one Sigma-rule request scope (union census).
-    assert len([p for p in (root/'rules').iterdir() if p.name.startswith('request_')])==1
+    assert len([s for s in _plan._SCOPES if s not in scopes_before and s.startswith('request_')])==1
     pauli=(np.array([[0,1],[1,0]]),np.array([[0,-1j],[1j,0]]),np.diag([1,-1]))
     gamma=[np.eye(4)]+[np.block([[np.zeros((2,2)),a],[a,np.zeros((2,2))]]) for a in pauli]
     expected=np.zeros((len(omega),nk,nb,nb),complex)

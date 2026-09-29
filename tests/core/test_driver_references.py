@@ -28,13 +28,7 @@ ZETA_ATOL = 2.0e-10
 
 def _stage(source, target):
     shutil.copytree(source, target)
-    rules = target / "tmp" / "sigma_quadrature_rules"
-    saved_rules = target.parent / f"{target.name}_rules"
-    if rules.is_dir():
-        shutil.copytree(rules, saved_rules)
     shutil.rmtree(target / "tmp", ignore_errors=True)
-    if saved_rules.is_dir():
-        shutil.copytree(saved_rules, rules)
     harness.make_writable(target)
     return target
 

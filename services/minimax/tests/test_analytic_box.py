@@ -210,3 +210,47 @@ def test_random_boxes_certify_on_a_finer_cloud():
         rule = analytic_box_rule(box, eps)
         assert rule.relative == kind.startswith("sd")
         _check(rule, box, eps)
+
+
+# ---------------------------------------------------------------------------
+# No rule is stored across processes (owner, 2026-09-28): a plan is
+# reproducible because the builder is a function of its arguments, and the
+# row blocks that make a cold build fast change no bit.
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("box,kwargs", [
+    ((0.05, 3.0, 0.05, 0.05), dict(mass_cap=100.0)),
+    ((-0.6, 0.4, 0.1, 0.1), {}),
+])
+def test_the_builder_is_a_function_of_its_arguments(box, kwargs):
+    first = analytic_box_rule(box, 1.0e-4, **kwargs)
+    second = analytic_box_rule(box, 1.0e-4, **kwargs)
+    assert first.times.tobytes() == second.times.tobytes()
+    assert first.weights.tobytes() == second.weights.tobytes()
+    assert (first.sup_error, first.kappa_max) == (second.sup_error, second.kappa_max)
+
+
+@pytest.mark.parametrize("box", [
+    (-0.6, 0.4, 0.1, 0.101),        # crossing: weight matrix + certificate
+    (0.05, 3.0, 0.05, 0.0505),      # sign-definite: certificate
+])
+def test_row_blocks_change_no_bit(monkeypatch, box):
+    """Blocks of 64 entries on the pool against one whole-matrix block."""
+    from minimax import uniform_rule
+    from minimax.uniform_rule import boundary_samples
+
+    def build():
+        rule = analytic_box_rule(box, 1.0e-4, mass_cap=5.0e-6 / 6.0e-8)
+        cloud = boundary_samples(rule.box, rule.theta_deg,
+                                 float(np.max(np.abs(rule.times))), 1.0e-4)
+        rho = np.abs(cloud) if rule.relative else float(np.min(cloud.imag))
+        return rule, rule_roundoff_amplification(rule.times, rule.weights, cloud, rho)
+
+    monkeypatch.setattr(uniform_rule, "_ROW_BLOCK_ENTRIES", 1 << 40)
+    whole, whole_mass = build()
+    monkeypatch.setattr(uniform_rule, "_ROW_BLOCK_ENTRIES", 64)
+    blocked, blocked_mass = build()
+    assert whole.times.tobytes() == blocked.times.tobytes()
+    assert whole.weights.tobytes() == blocked.weights.tobytes()
+    assert (whole.sup_error, whole.kappa_max) == (blocked.sup_error, blocked.kappa_max)
+    assert whole_mass == blocked_mass

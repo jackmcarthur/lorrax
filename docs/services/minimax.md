@@ -9,10 +9,10 @@ and mpmath come from the `solve` extra.
 The namespace holds several distinct rule families, one per kernel, domain
 and error currency. A rule valid for one target is not valid for another with
 the same bandwidth, so callers select the constructor that matches their
-kernel. The disk cache is controlled by `LORRAX_MINIMAX_CACHE_DIR` and
-`LORRAX_DISABLE_MINIMAX_DISK_CACHE`, whose rules
-[`docs/dev/env_vars.md`](../dev/env_vars.md) owns. A cached rule always carries
-`source='cache'` and `certified=False`.
+kernel. Every rule is solved in the calling process and nothing is stored
+across processes: a repeated request in one process is served by an
+in-process `lru_cache`. A served rule carries `source='runtime-uncertified'`
+and `certified=False`.
 
 ## Caller contract
 

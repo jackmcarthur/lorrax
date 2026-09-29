@@ -94,8 +94,7 @@ SHAPES = {
 }
 
 EXTRA_GLOBS = {
-    "A": ("tmp/sigma_quadrature_rules/*.npz",),
-    "B": ("tmp/sigma_quadrature_rules/*.npz", "tmp/mpa/*.h5"),
+    "B": ("tmp/mpa/*.h5",),
 }
 
 

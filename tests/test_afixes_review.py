@@ -13,31 +13,36 @@ def _rule():
         theta_deg=5., rank=1, sup_error=5e-5, kappa_max=1., seconds=0.)
 
 
-def test_cache_one_ulp_request_reuses_authenticated_stored_eps(tmp_path):
-    from gw.sigma_box_plan import _rule_cache_store, _rule_cache_lookup
+def _hold(scope, rule, amplification):
+    from gw.sigma_box_plan import _rule_digest, _scope_store
+    _scope_store(scope, [{"built": True, "rule": rule,
+                          "rule_digest": _rule_digest(rule, amplification),
+                          "roundoff_amplification": amplification}])
+
+
+def test_scope_one_ulp_request_reuses_the_held_eps(tmp_path):
+    from gw.sigma_box_plan import _scope_lookup
     rule = _rule()
-    _rule_cache_store(str(tmp_path), rule, 1.)
+    _hold(str(tmp_path), rule, 1.)
     for eps in (np.nextafter(rule.eps, 0), np.nextafter(rule.eps, np.inf)):
-        best, warnings = _rule_cache_lookup(str(tmp_path), rule.box, eps, True,
-                                           noise_amplification_cap=1e9, ceiling_nodes=None)
-        assert not warnings and best is not None
+        best = _scope_lookup(str(tmp_path), rule.box, eps, True,
+                             noise_amplification_cap=1e9, ceiling_nodes=None)
+        assert best is not None
         assert best[0].eps == rule.eps
 
 
 @pytest.mark.parametrize('field', ['eps', 'relative'])
-def test_cache_authenticates_stored_fields_before_filtering(tmp_path, field):
-    from gw.sigma_box_plan import _rule_cache_store, _rule_cache_lookup
+def test_scope_filters_on_the_held_fields(tmp_path, field):
+    from gw.sigma_box_plan import _scope_lookup
     rule = _rule()
-    _rule_cache_store(str(tmp_path), rule, 1.)
-    path, = tmp_path.glob('rule_*.npz')
-    with np.load(path) as data:
-        values = dict(data)
-    values[field] = np.nextafter(rule.eps, np.inf) if field == 'eps' else False
-    np.savez(path, **values)
-    best, warnings = _rule_cache_lookup(str(tmp_path), rule.box, rule.eps, True,
-                                       noise_amplification_cap=1e9, ceiling_nodes=None)
-    assert best is None and len(warnings) == 1
-    assert 'sigma_rule_integrity' in warnings[0]
+    _hold(str(tmp_path), rule, 1.)
+    eps, relative = rule.eps, True
+    if field == 'eps':
+        eps = 1.1*rule.eps
+    else:
+        relative = False
+    assert _scope_lookup(str(tmp_path), rule.box, eps, relative,
+                         noise_amplification_cap=1e9, ceiling_nodes=None) is None
 
 
 def test_restart_local_open_error_agrees_before_payload(monkeypatch, tmp_path):

@@ -87,32 +87,15 @@ def _fresh_announcements():
 
     Both directions matter.  Before: a cell that asserts an announcement
     fired must not be silenced by an earlier cell having announced the
-    same request.  After: a cell that deliberately triggers a legacy-cache
-    or uncertified-solve announcement must not leave that registry primed
-    for the next one.
+    same request.  After: a cell that deliberately triggers an
+    uncertified-solve announcement must not leave that registry primed for
+    the next one.
     """
     import minimax                                 # noqa: PLC0415
-    from minimax import cache as _cache            # noqa: PLC0415
 
     minimax.reset_announcements()
-    _cache.reset_announcements()
     yield
     minimax.reset_announcements()
-    _cache.reset_announcements()
-
-
-@pytest.fixture()
-def isolated_cache(tmp_path, monkeypatch):
-    """A disk cache nobody else's run can have written to.
-
-    The WP1 census found a four-month-old entry in the shared ``$HOME``
-    cache serving a frozen gate, so a cache cell that used the real
-    directory would be testing that machine's history rather than this
-    code.
-    """
-    monkeypatch.setenv("LORRAX_MINIMAX_CACHE_DIR", str(tmp_path / "mmcache"))
-    monkeypatch.delenv("LORRAX_DISABLE_MINIMAX_DISK_CACHE", raising=False)
-    return tmp_path / "mmcache"
 
 
 def pytest_collection_modifyitems(config, items):
