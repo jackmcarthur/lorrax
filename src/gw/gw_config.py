@@ -1386,6 +1386,11 @@ _DEFAULTS = {
     # at their DFT Hamiltonian block in every QSGW map -- still in the Sigma_x
     # and chi0 sums, never updated.  0 updates every QP-window band.
     "sc_frozen_core_bands": 0,
+    # Owner 2026-09-29 (SEMIDFT): where the coarse (semicore) class sits.
+    # "qp": it reads Sigma at its own QP energy and moves (main's rule).
+    # "dft": its block of H stays the DFT block in the DFT basis and its end
+    # of every protected-semicore element reads Sigma at E_DFT; mixing kept.
+    "sc_semicore": "qp",
     # Optional fourth text output beside the ordinary one-shot eqp0/eqp1
     # pair.  This iterates ONLY the eigenvalues/eigenvectors against the
     # already-computed full Sigma_c(omega) table: W, screening, and Sigma
@@ -2610,6 +2615,7 @@ def _input_iteration(
         exact_degeneracy_tol_ev=float(
             params["sc_exact_degeneracy_tol_ev"]),
         frozen_core_bands=int(params["sc_frozen_core_bands"]),
+        semicore=str(params["sc_semicore"]).strip().lower(),
         eigh=_linalg.sc_eigh,
         head_update=str(params["sc_head_update"]).strip().lower(),
         initial_qp_rotations_file=(
@@ -4375,6 +4381,9 @@ class SCConfig:
     dump_dir: str | None
     exact_degeneracy_tol_ev: float = 1.0e-4
     frozen_core_bands: int = 0
+    #: "qp" | "dft": the coarse (semicore) class moves with its own Sigma, or
+    #: its DFT-basis block stays DFT and it reads Sigma at E_DFT (mixing kept).
+    semicore: str = "qp"
     eigh: str = "auto"    # "auto" | "native" | "distributed"
     #: "off" | "parallel_transport" | "dft_velocity" | "interband_commutator".
     #: Every non-off mode rebuilds the head. Only ``dft_velocity`` with an
@@ -4428,6 +4437,9 @@ class SCConfig:
                 "resolved physical splittings; it is not an SC damping knob.")
         if self.frozen_core_bands < 0:
             raise ValueError("sc_frozen_core_bands must be >= 0.")
+        if self.semicore not in ("qp", "dft"):
+            raise ValueError(
+                f"sc_semicore must be 'qp' or 'dft'; got {self.semicore!r}.")
         if self.eigh not in ("auto", "native", "distributed"):
             raise ValueError(
                 f"sc_eigh must be 'auto', 'native' or 'distributed'; "

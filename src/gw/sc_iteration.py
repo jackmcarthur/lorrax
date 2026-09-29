@@ -440,6 +440,22 @@ def _freeze_core_block_to_dft(H, e_dft_kn_ry, n_frozen):
     return H.at[:, idx, idx].set(diag)
 
 
+@jax.jit
+def _pin_semicore_block_to_dft(H, e_dft_kn_ry, pin_kn):
+    """``sc_semicore = dft``: the coarse block of H is the DFT block.
+
+    ``pin_kn`` names DFT labels (the fixed basis H is carried in), so the pin
+    is on the projector P_S onto the DFT semicore orbitals and is untouched
+    by the QP rotation: H_ss' = delta_ss' E_DFT_s; every protected-semicore
+    element H_ps is kept (mixing).  Elementwise, so it keeps H's sharding.
+    """
+    both = pin_kn[:, :, None] & pin_kn[:, None, :]
+    eye = jnp.eye(H.shape[-1], dtype=bool)[None]
+    dft = jnp.where(eye, e_dft_kn_ry.astype(H.dtype)[:, :, None],
+                    jnp.zeros((), H.dtype))
+    return jnp.where(both, dft, H)
+
+
 @dataclass(frozen=True)
 class SCMapScreeningArtifacts:
     """Screening artifacts owned by one completed QSGW map evaluation.
@@ -3421,8 +3437,30 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
     # below uses and qsgw_utils.omega_coverage, the classification
     # build_qsgw_sigma_xc reads (sigma_eval_omega).  The tail law excludes it.
     from .qsgw_utils import omega_coverage
+    # SC_SEMICORE = DFT (owner 2026-09-29).  The coarse class is a set of DFT
+    # labels (fixed at map 0); the QP column assign_qp_identity maps to a
+    # label reads Sigma at that label's E_DFT, so its end of every H_ps is
+    # Sigma_ps(E_DFT_s) and its held coarse windows never follow it.
+    semicore_pin, energies_read_loop, E_read_full = None, energies_loop, E_full
+    if inputs.config.sc.semicore == "dft":
+        semicore_pin = np.array(_sc_coarse_identities(inputs, energies_loop.shape))
+        if not semicore_pin.any():
+            raise ValueError(
+                "GATE sc_semicore: sc_semicore = dft pins the coarse (semicore) class "
+                "of the scalar MPA/shared-pole route, and this run has none.")
+        e_dft_loop_ry = np.asarray(
+            inputs.e_dft_active_kn_ry if ks.is_identity
+            else ks.select(inputs.e_dft_active_kn_ry), dtype=np.float64)
+        energies_read_loop = np.where(
+            semicore_pin, e_dft_loop_ry * RYD_TO_EV, energies_loop)
+        read_ry = np.array(E_qp_ry, dtype=np.float64)
+        rows, labels = np.nonzero(semicore_pin)
+        read_ry[rows, indices_loop[rows, labels]] = e_dft_loop_ry[rows, labels]
+        E_read = device_put_process_local(
+            read_ry.astype(E_qp_ry.dtype), E_qp_ry.sharding)
+        E_read_full = E_read if ks.is_identity else ks.broadcast(E_read)
     sc_support = (None if not inputs.config.compute_mode.is_dynamic else
-                  _sc_sampled_support(inputs, partition, energies_loop, sigma_frame_mu_ev(
+                  _sc_sampled_support(inputs, partition, energies_read_loop, sigma_frame_mu_ev(
                       inputs.config, inputs.wfn, E_full, efermi_ry,
                       entry_occ_state if inputs.material_class == "metal" else None),
                       _sc_active_identities(inputs), state.tail_z_kn))
@@ -4013,7 +4051,7 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
         bispinor_v_q_path=inputs.bispinor_v_q_path, mu_bases=inputs.mu_bases,
         # FULL-BZ E, for the same reason as hartree_basis_rotation above:
         # every operand compute_sigma_xc sees is on the full BZ.
-        e_qp_ev=np.asarray(E_full) * RYD_TO_EV,
+        e_qp_ev=np.asarray(E_read_full) * RYD_TO_EV,
         static_head_terms=iteration_static_head_terms,
         head_resolver=inputs.head_resolver,
         quad=inputs.quad,
@@ -4118,6 +4156,13 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
         if int(state.iteration) == 0:
             _record_sc(inputs, f"    SC frozen core: bands 1-{n_frozen_core} "
                                "held at their DFT block (not updated)")
+    if semicore_pin is not None:
+        H_qp_dft_full = _pin_semicore_block_to_dft(
+            H_qp_dft_full, e_dft_loop_ry, semicore_pin)
+        if int(state.iteration) == 0:
+            _record_sc(inputs, f"    SC semicore = dft: {int(semicore_pin.sum())} coarse "
+                               "(k,label) hold their DFT block; H_ps reads Sigma_ps at "
+                               "E_DFT_s (mixing kept)")
 
     # ── THE UN-EXTRAPOLATED TWIN ────────────────────────────────────────
     # Present only when ``use_band_extrapolation`` drove this stage's Σ.
@@ -4136,8 +4181,11 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
                 if transverse is None else
                 _add_exact_four_current_hartree(
                     delta_h_dft_n3, scalar, transverse))
+        H_n3 = inputs.kin_ion_dft + delta_h_dft_n3
+        if semicore_pin is not None:
+            H_n3 = _pin_semicore_block_to_dft(H_n3, e_dft_loop_ry, semicore_pin)
         _report_extrapolation_eqp_shift(
-            H_qp_dft_full, inputs.kin_ion_dft + delta_h_dft_n3,
+            H_qp_dft_full, H_n3,
             mesh_xy=inputs.mesh_xy, n_occ=n_occ,
             iteration=state.iteration, print_fn=inputs.print_fn)
 
