@@ -193,7 +193,7 @@ k above band b3+1's minimum) is warned about in the log, which names the
 scalar MPA/shared-pole Σ reads coarse windows; a sector (bispinor) route
 keeps the rule below.
 
-**Pinned semicore** (`sc_semicore = dft`, owner 2026-09-29: the pseudopotentials
+**Pinned semicore** (`sc_semicore = dft`, the default; owner 2026-09-29: the pseudopotentials
 are fitted to DFT, so the semicore stays at its DFT energies while its mixing
 with the protected states is kept). H is carried in the fixed DFT basis, and
 the pin is on the projector $P_S$ onto the coarse labels' DFT orbitals:
@@ -210,8 +210,8 @@ not enter), and the rotation back to the DFT basis carries it. The labels are
 the map-0 coarse class, fixed for the run; the coarse windows are planned on
 their DFT energies and are held (only a drift of μ past their pad would extend
 them). The semicore QP energies still move by the level repulsion of the kept
-mixing, $-\sum_p |H_{ps}|^2/(E_p - E_s)$ to second order. `qp` (the default)
-lets the class move with its own Σ.
+mixing, $-\sum_p |H_{ps}|^2/(E_p - E_s)$ to second order. `qp` lets the class
+move with its own Σ. The default does nothing on a run without a coarse class.
 
 Every other matrix band is protected: under the default `sigma_out_of_grid =
 cover` it reads Σ at its own energy, and the grid grows over it; on a route

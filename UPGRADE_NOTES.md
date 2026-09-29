@@ -17,11 +17,12 @@ no-op on a run without a coarse class (static modes, sector routes, an `nval`
 that covers every occupied band); naming `sc_semicore = dft` on such a run
 refuses (`GATE sc_semicore`). Sandbox claim 2964.
 
-## 2026-09-29 — coarse (semicore) windows certified at ε 3e-3
+## 2026-09-29 — coarse (semicore) windows certified at max(ε, 3e-3)
 
 Self-consistent decks with a coarse class move once. The coarse windows are
 certified at max(`sigma_quadrature_eps`, 3e-3) (`qp_support.SEMICORE_EPS`,
-owner 2026-09-29); every other Σ window keeps `sigma_quadrature_eps`. At
+owner 2026-09-29), so at the default ε 1e-4 they take 3e-3; every other Σ
+window keeps `sigma_quadrature_eps`. At
 η_semi 1 eV against ε 1e-4: map-2 τ pairs MoS2 3×3 530 → 465, Fe 4³ charge
 1087 → 982; states within E_F ± 10 eV move ≤ 0.06 meV at maps 0–1 (≤ 1.9 meV
 at map 2 of the unconverged Fe run); semicore QP ≤ 4.3 meV at map 0. The
