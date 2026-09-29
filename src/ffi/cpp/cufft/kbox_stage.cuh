@@ -78,7 +78,7 @@ struct Plan {
 // line for every thread in every axis pass (tr * nk / max axis >= 256), capped by two
 // single-buffered blocks per SM; below min_tr instances the split arm.  min_tr = 2 protects
 // the 128-byte contiguous runs of a cp.async load; a gathered direct Load of a spin group
-// (mode 11) has no run to protect and passes min_tr = 1: one instance per block that fits
+// (modes 7, 11) has no run to protect and passes min_tr = 1: one instance per block that fits
 // the opt-in memory stays single-pass (one HBM pass, no scratch).  Threads: 256, or 512 for a
 // convolution (transforms = 2: inverse, Mid, forward) whose axis passes have >= 384 lines.
 inline Plan kbox_plan(int nx, int ny, int nz, int group, int n_operands, int elem, long long optin_smem,
