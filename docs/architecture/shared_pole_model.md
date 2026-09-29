@@ -332,7 +332,7 @@ average of the swapped pair. So one tile exchange per τ node remains: the
 synthesis $W_p^{\mathsf T}$. Both local forms equal the exchanged transposes bit
 for bit. The exchange let the off-diagonal ranks move their tiles while the
 diagonal ranks copied theirs and waited, which cost 26 % of a P16 node
-(`services/symmetry_maps/tests/test_shared_pole_unfold.py`, claim WTRANS).
+(`services/symmetry_maps/tests/test_shared_pole_unfold.py`, claim 2958).
 The full-q transpose (`shared_pole_hole_kernel`) remains only for the static
 $W(0)$ restart and for a panel whose endpoint tables differ between the faces.
 
