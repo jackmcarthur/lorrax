@@ -489,6 +489,89 @@ def _report_band_extrapolation(
     return spectral_h5_payload(plan, fit), fit.weights()
 
 
+def plan_sigma_band_brackets(config, wfns, meta, *, print_fn, where):
+    """The Σ band-bracket plan of one dynamic stage, validated and logged.
+
+    One owner for every pole-sum Σ (GN/HL-PPM and scalar MPA): the plan fixes
+    the τ kernel's Green-build count, its AOT signature and the Σ cube's
+    leading extent, so it is resolved once, before anything compiles.
+    ``use_band_extrapolation = false`` gives the trivial one-bracket plan.
+    """
+    s = wfns.slices
+    # THE CUTS ARE WITHIN THE Σ COUNT, NOT THE χ COUNT.  ``b_id_4_sigma``
+    # / ``sigma_sum``, never ``b_id_4_user`` / ``full``: the latter pair
+    # is the LOADED extent = max(chi, sigma), so on a default-scheme deck
+    # running χ at 248 and Σ at 100 they would bracket at
+    # ~(198, 223, 248) — three points on a curve this run never evaluates
+    # — instead of ~(80, 90, 100).  The conduction-coordinate scheme
+    # likewise defines n_occ, n_cond and its DFT ladder inside this same
+    # Σ window.  Identical counts on an unsplit deck.
+    # Pinned by tests/test_band_extrapolation_sigma_count.py.
+    plan = plan_band_brackets(
+        enabled=bool(config.sigma.band_extrapolation),
+        enk_ry=np.asarray(wfns.enk[:, s.sigma_sum]),
+        n_occ=int(s.b2 - s.b0),
+        nb_logical=int(meta.b_id_4_sigma_user or s.b4) - int(s.b0),
+        nb_padded=int(s.nb_sigma_sum),
+        bracket_scheme=str(
+            config.sigma.band_extrapolation_bracket_scheme),
+    )
+    # ...AND THE COMMENT ABOVE IS NOT ENOUGH, SO THIS IS CHECKED.  A plan
+    # built from the wrong count is invisible in every weight-level
+    # diagnostic — the OLS coefficients depend only on the abscissae's
+    # RATIOS and the fractions are the same 0.80/0.90/1.00 of whichever
+    # count, so a wrong-count run is Hermitian, converges, and prints
+    # ordinary numbers.  This is the last place that can see it: here the
+    # plan and the band slices its brackets will slice are both in scope.
+    # Before the shared MPA planner opens the fit store, so a mismatch
+    # costs neither I/O nor a compile.
+    assert_brackets_match_ols_abscissae(
+        plan, s, meta=meta, where=where)
+    if plan.enabled:
+        print_fn(
+            f"  Σc band extrapolation: ON — bracket scheme "
+            f"{plan.bracket_scheme}; {plan.n_brackets} disjoint "
+            f"band brackets {plan.bounds} against ONE W(τ) per τ; "
+            f"band counts {plan.counts} (requested {plan.requested}).")
+        # Emitted HERE and not only in the report block at the end: a
+        # planner fallback is a fact about the run that the operator
+        # should see before Σ is spent, not after.  ``WARNING:`` is what
+        # keeps it in the production log's warning block.
+        for note in plan.notes:
+            print_fn(f"WARNING: Σc band extrapolation: {note}")
+    return plan
+
+
+def extrapolate_sigma_body(
+    sigma_omega, head_sigma_diag_w_kn_ry, *,
+    plan, config, band_slices, wfn, sym, meta, mesh_xy, print_fn,
+    held_session=None,
+):
+    """``(extrapolated body, h5 payload)`` from a bracketed Σ_c cube.
+
+    ``sigma_omega`` carries the cumulative band-count axis
+    (``SigmaOmegaResult``).  The fit reads the band diagonal with the q→0
+    head added (:func:`_report_band_extrapolation`); the weights it returns
+    combine the three cumulative cubes (:func:`_extrapolated_point`).  The
+    EXTRAPOLATED Σ_c drives E_nk; the caller keeps the un-extrapolated N₃
+    cube (:func:`sigma_band_count_point`) beside it so the driver
+    diagonalizes both and reports the eqp-level correction.  Extrapolating Σ
+    and then diagonalizing is the only order that yields a Hermitian operator.
+    """
+    extrap_payload, extrap_weights = _report_band_extrapolation(
+        sigma_omega, head_sigma_diag_w_kn_ry,
+        plan=plan, config=config, band_slices=band_slices,
+        wfn=wfn, sym=sym, meta=meta, mesh_xy=mesh_xy,
+        print_fn=print_fn, held_session=held_session)
+    return (_extrapolated_point(sigma_omega.sigma_c_kij, extrap_weights),
+            extrap_payload)
+
+
+def sigma_band_count_point(cube, i: int):
+    """The cumulative band-count point ``cube[i]``, trailing sharding kept."""
+    return _band_count_point(cube, i)
+
+
 def compute_ppm_sigma_pipeline(
     *,
     wfns,
@@ -630,48 +713,9 @@ def compute_ppm_sigma_pipeline(
         # three see.  ``use_band_extrapolation = false`` gives the trivial
         # one-bracket plan and the whole path below is bit-identical to the
         # un-bracketed code.
-        s = wfns.slices
-        # THE CUTS ARE WITHIN THE Σ COUNT, NOT THE χ COUNT.  ``b_id_4_sigma``
-        # / ``sigma_sum``, never ``b_id_4_user`` / ``full``: the latter pair
-        # is the LOADED extent = max(chi, sigma), so on a default-scheme deck
-        # running χ at 248 and Σ at 100 they would bracket at
-        # ~(198, 223, 248) — three points on a curve this run never evaluates
-        # — instead of ~(80, 90, 100).  The conduction-coordinate scheme
-        # likewise defines n_occ, n_cond and its DFT ladder inside this same
-        # Σ window.  Identical counts on an unsplit deck.
-        # Pinned by tests/test_band_extrapolation_sigma_count.py.
-        plan = plan_band_brackets(
-            enabled=bool(config.sigma.band_extrapolation),
-            enk_ry=np.asarray(wfns.enk[:, s.sigma_sum]),
-            n_occ=int(s.b2 - s.b0),
-            nb_logical=int(meta.b_id_4_sigma_user or s.b4) - int(s.b0),
-            nb_padded=int(s.nb_sigma_sum),
-            bracket_scheme=str(
-                config.sigma.band_extrapolation_bracket_scheme),
-        )
-        # ...AND THE COMMENT ABOVE IS NOT ENOUGH, SO THIS IS CHECKED.  A plan
-        # built from the wrong count is invisible in every weight-level
-        # diagnostic — the OLS coefficients depend only on the abscissae's
-        # RATIOS and the fractions are the same 0.80/0.90/1.00 of whichever
-        # count, so a wrong-count run is Hermitian, converges, and prints
-        # ordinary numbers.  This is the last place that can see it: here the
-        # plan and the band slices its brackets will slice are both in scope.
-        # Before the shared MPA planner opens the fit store, so a mismatch
-        # costs neither I/O nor a compile.
-        assert_brackets_match_ols_abscissae(
-            plan, s, meta=meta, where="ppm_pipeline plan seam")
-        if plan.enabled:
-            print_fn(
-                f"  Σc band extrapolation: ON — bracket scheme "
-                f"{plan.bracket_scheme}; {plan.n_brackets} disjoint "
-                f"band brackets {plan.bounds} against ONE W(τ) per τ; "
-                f"band counts {plan.counts} (requested {plan.requested}).")
-            # Emitted HERE and not only in the report block at the end: a
-            # planner fallback is a fact about the run that the operator
-            # should see before Σ is spent, not after.  ``WARNING:`` is what
-            # keeps it in the production log's warning block.
-            for note in plan.notes:
-                print_fn(f"WARNING: Σc band extrapolation: {note}")
+        plan = plan_sigma_band_brackets(
+            config, wfns, meta, print_fn=print_fn,
+            where="ppm_pipeline plan seam")
         with timing.section("sigma.exec"):
             sigma_omega = compute_sigma_c_ppm_omega_grid(
                 wfns, ppm, meta, mesh_xy,
@@ -729,22 +773,12 @@ def compute_ppm_sigma_pipeline(
         # return, because the cube's leading axis does not survive it.
         extrap_payload = None
         if plan.enabled:
-            extrap_payload, extrap_weights = _report_band_extrapolation(
+            sigma_c_body_omega, extrap_payload = extrapolate_sigma_body(
                 sigma_omega, head_sigma_diag_w_kn_ry,
                 plan=plan, config=config, band_slices=band_slices,
                 wfn=wfn, sym=sym, meta=meta, mesh_xy=mesh_xy,
                 print_fn=print_fn,
             )
-            # ── WHICH Σ DRIVES THE ITERATION ────────────────────────────
-            # The EXTRAPOLATED Σ_c, so the band-sum tail is included in the
-            # E_nk the SC loop converges.  The un-extrapolated N₃ cube is
-            # kept beside it — not as a fallback, but so the driver can
-            # diagonalize BOTH once per iteration and report the eqp-level
-            # correction side by side.  Extrapolating Σ and then
-            # diagonalizing is the only order that yields a Hermitian
-            # operator; see ``_extrapolated_point``.
-            sigma_c_body_omega = _extrapolated_point(
-                sigma_omega.sigma_c_kij, extrap_weights)
             sigma_c_body_omega_unextrap = sigma_c_body_omega_n3
 
     return PPMOutputs(

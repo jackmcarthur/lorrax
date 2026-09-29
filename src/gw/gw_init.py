@@ -1220,19 +1220,20 @@ def assert_isdf_window_is_the_max(band_slices, band_range_right, zeta_nband,
 
 
 def check_band_extrapolation_floor(cfg, band_slices, meta):
-	"""Refuse a PPM run whose Σ band sum cannot carry ``use_band_extrapolation``.
+	"""Refuse a run whose Σ band sum cannot carry ``use_band_extrapolation``.
 
 	Runs at startup, beside :func:`check_band_sum_degeneracy`, so a deck with
 	``number_bands_sigma < 2 n_occ`` refuses before the ζ fit and the W build
 	rather than at the Σ stage.  The rule and its message have one owner,
 	``gw.band_extrapolation.require_extrapolation_band_floor``; a run with no
-	PPM stage never consumes the key and is not checked.
+	consuming stage (PPM, or scalar MPA) never reads the key and is not checked.
 	"""
 	from .band_extrapolation import require_extrapolation_band_floor
 	from .gw_config import band_extrapolation_is_consumable, sigma_stage_modes
 	if not bool(cfg.sigma.band_extrapolation):
 		return
-	if not band_extrapolation_is_consumable(sigma_stage_modes(cfg)):
+	if not band_extrapolation_is_consumable(
+			sigma_stage_modes(cfg), bispinor=getattr(cfg, "bispinor", False)):
 		return
 	b0 = int(band_slices.b0)
 	require_extrapolation_band_floor(

@@ -2152,9 +2152,15 @@ def sigma_stage_modes(config, fallback=None) -> tuple:
     return tuple(out)
 
 
-def band_extrapolation_is_consumable(modes) -> bool:
-    """Does ANY stage of this run reach the kernel that reads the key?; see docs/architecture/decisions.md."""
-    return any(getattr(m, "ppm_model", None) is not None for m in modes)
+def band_extrapolation_is_consumable(modes, *, bispinor: bool = False) -> bool:
+    """Does ANY stage of this run reach a kernel that reads the key?; see docs/architecture/decisions.md.
+
+    The GN/HL-PPM stages and the scalar MPA stage (shared pole or MPA fit)
+    bracket the Green band sum in the one pole-sum executor.  A bispinor MPA
+    stage sums four-current sector bodies, which carry no bracket axis.
+    """
+    return any(getattr(m, "ppm_model", None) is not None
+               or (m is ComputeMode.MPA and not bool(bispinor)) for m in modes)
 
 
 # ---------------------------------------------------------------------------
@@ -4021,10 +4027,11 @@ class DynamicSigmaConfig:
     #: ``use_band_extrapolation`` (default TRUE) and its deprecated alias
     #: ``sigma_band_extrapolation`` by
     #: :func:`resolve_band_extrapolation`.  Applied by the GN/HL-PPM pipeline
-    #: (``gw.ppm_pipeline``); on a non-PPM ``compute_mode`` it is turned OFF
-    #: with a recorded note (or refused -- see ``band_extrapolation_explicit``)
-    #: by ``gw.sigma_dispatch``, because the 1/N limit is mode-dependent and
-    #: wrong for a static Coulomb hole.
+    #: and the scalar MPA Σ (``gw.ppm_pipeline``'s band-extrapolation seam);
+    #: on a static or bispinor-MPA stage it is turned OFF with a recorded note
+    #: (or refused -- see ``band_extrapolation_explicit``) by
+    #: ``gw.sigma_dispatch``: the static Coulomb hole anti-converges, and the
+    #: four-current sector Σ has no bracket axis.
     band_extrapolation: bool = USE_BAND_EXTRAPOLATION_DEFAULT
     #: Did a deck NAME either spelling?  Selects between auto-disabling and
     #: refusing on a non-PPM mode; see :func:`resolve_band_extrapolation`.

@@ -420,14 +420,14 @@ def _stage(mode):
     return types.SimpleNamespace(mode=mode)
 
 
-def _cfg(modes=None, deck_mode=None, explicit=True):
+def _cfg(modes=None, deck_mode=None, explicit=True, bispinor=False):
     """A config shaped like the real one, with or without a ladder."""
     sc = None if modes is None else types.SimpleNamespace(
         stages=tuple(_stage(m) for m in modes))
     ns = types.SimpleNamespace(
         sigma=types.SimpleNamespace(band_extrapolation=True,
                                     band_extrapolation_explicit=explicit),
-        sc=sc)
+        sc=sc, bispinor=bispinor)
     if deck_mode is not None:
         ns.compute_mode = deck_mode
     return ns
@@ -460,10 +460,13 @@ def test_the_mpa_default_ladder_is_consumable():
     cfg_mod = _gw_config()
     CM = cfg_mod.ComputeMode
     assert cfg_mod.band_extrapolation_is_consumable((CM.GN_PPM, CM.MPA))
-    # and MPA alone is not -- ppm_model is None for it, dynamic though it is
-    assert not cfg_mod.band_extrapolation_is_consumable((CM.MPA,))
-    assert CM.MPA.is_dynamic and CM.MPA.ppm_model is None, (
-        "the predicate must be ppm_model, not is_dynamic: MPA separates them")
+    # Scalar MPA brackets its Green band sum in the shared pole-sum executor;
+    # a bispinor MPA stage sums four-current sector bodies and does not.
+    assert cfg_mod.band_extrapolation_is_consumable((CM.MPA,))
+    assert not cfg_mod.band_extrapolation_is_consumable(
+        (CM.MPA,), bispinor=True)
+    assert cfg_mod.band_extrapolation_is_consumable(
+        (CM.GN_PPM, CM.MPA), bispinor=True)
 
 
 def test_a_static_only_ladder_is_not_consumable():
@@ -529,7 +532,8 @@ def test_a_run_with_no_consuming_stage_still_REFUSES_an_explicit_key():
 
     from gw.sigma_dispatch import validate_band_extrapolation
     with pytest.raises(NotImplementedError, match="NO stage of this run consumes"):
-        validate_band_extrapolation(_cfg([CM.MPA], explicit=True), CM.MPA)
+        validate_band_extrapolation(
+            _cfg([CM.MPA], explicit=True, bispinor=True), CM.MPA)
 
 
 def test_an_mpa_stage_now_REACHES_the_guard_and_gets_the_dynamic_reason():
@@ -563,7 +567,8 @@ def test_an_mpa_stage_now_REACHES_the_guard_and_gets_the_dynamic_reason():
         "something is unimplemented again, say which and why here")
     said = []
     with pytest.raises(BaseException):
-        _dispatch(CM.MPA, _cfg([CM.GN_PPM, CM.MPA], explicit=True),
+        _dispatch(CM.MPA, _cfg([CM.GN_PPM, CM.MPA], explicit=True,
+                               bispinor=True),
                   print_fn=said.append)
     notes = [s for s in said if "band extrapolation" in s]
     assert notes, (

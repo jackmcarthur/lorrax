@@ -59,7 +59,17 @@ def test_startup_floor_refuses_a_ppm_run_before_the_zeta_fit():
 
 
 @pytest.mark.parametrize("enabled,mode", [(False, "gn_ppm"), (True, "cohsex"),
-                                          (True, "mpa")])
+                                          (False, "mpa")])
 def test_startup_floor_skips_runs_that_do_not_consume_the_key(enabled, mode):
     check_band_extrapolation_floor(_cfg(enabled=enabled, mode=mode),
                                    _SLICES, _META)
+
+
+def test_startup_floor_refuses_a_scalar_mpa_run_and_skips_a_bispinor_one():
+    """Scalar MPA consumes the key; a bispinor MPA stage (sector sum) does not."""
+    with pytest.raises(BandExtrapolationRefused, match="n_cond = 4"):
+        check_band_extrapolation_floor(
+            _cfg(enabled=True, mode="mpa"), _SLICES, _META)
+    cfg = _cfg(enabled=True, mode="mpa")
+    cfg.bispinor = True
+    check_band_extrapolation_floor(cfg, _SLICES, _META)

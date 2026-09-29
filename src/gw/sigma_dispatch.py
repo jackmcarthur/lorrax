@@ -811,8 +811,11 @@ def _validate_sigma_stage(
 
 def validate_band_extrapolation(config, mode, *, print_fn=None):
     """Refuse unsupported explicit requests before screening; report at Sigma."""
-    # AUTO-DISABLED, LOUDLY: non-PPM stages keep the ordinary full-band sum.
-    if bool(config.sigma.band_extrapolation) and mode.ppm_model is None:
+    # AUTO-DISABLED, LOUDLY: a stage with no bracketed pole sum (static, or
+    # bispinor MPA) keeps the ordinary full-band sum.
+    bispinor = bool(getattr(config, "bispinor", False))
+    if bool(config.sigma.band_extrapolation) and not (
+            band_extrapolation_is_consumable((mode,), bispinor=bispinor)):
         explicit_switch = bool(getattr(
             config.sigma, "band_extrapolation_explicit", False))
         explicit_scheme = bool(getattr(
@@ -820,7 +823,8 @@ def validate_band_extrapolation(config, mode, *, print_fn=None):
             False))
         explicit = explicit_switch or explicit_scheme
         run_modes = sigma_stage_modes(config, fallback=mode)
-        consumable = band_extrapolation_is_consumable(run_modes)
+        consumable = band_extrapolation_is_consumable(
+            run_modes, bispinor=bispinor)
         ladder = " -> ".join(getattr(m, "value", str(m)) for m in run_modes)
         bracket_scheme = getattr(
             config.sigma, "band_extrapolation_bracket_scheme",
@@ -835,14 +839,17 @@ def validate_band_extrapolation(config, mode, *, print_fn=None):
                 f"[{ladder}]; the "
                 f"stage refusing here is compute_mode = "
                 f"{getattr(mode, 'value', mode)}.  The band-convergence "
-                f"extrapolation is wired into the two-point plasmon-pole Σ_c "
-                f"kernel only (gn_ppm / hl_ppm), and this is a CORRECTNESS "
+                f"extrapolation is wired into the bracketed pole-sum Σ_c "
+                f"(gn_ppm / hl_ppm, and scalar mpa), and for a static stage "
+                f"this is a CORRECTNESS "
                 f"guard rather than a wiring gap: the 1/N -> 0 limit point is "
                 f"mode-dependent, and on a static Coulomb hole it overshoots "
                 f"the exact answer by ~340 meV and gets WORSE with more bands "
                 f"(MEASURED against BerkeleyGW's exact static CH: 94.9 meV MAE "
                 f"at nband 60 rising to 288.2 at nband 124, against 171.3 "
-                f"falling to 32.8 for GN-PPM).  Use compute_mode = gn_ppm, add "
+                f"falling to 32.8 for GN-PPM).  A bispinor MPA stage sums "
+                f"four-current sector bodies with no bracket axis.  Use "
+                f"compute_mode = gn_ppm or a scalar mpa, add "
                 f"a gnppm stage to the sc_stage_N_type ladder, or set "
                 f"use_band_extrapolation = false.  (This deck NAMES the key; "
                 f"had it been left at its default the feature would have "
@@ -862,11 +869,11 @@ def validate_band_extrapolation(config, mode, *, print_fn=None):
         if getattr(mode, "is_dynamic", False):
             because = (
                 "MPA is dynamic, so the static Coulomb-hole measurement below "
-                "is NOT the reason here: the reason is that the 1/N -> 0 "
-                "limit has never been measured for this ansatz and its Σ_c is "
-                "not built by the bracketed two-point PPM kernel, so there is "
-                "no bracket axis to fit.  Extrapolating it would be an "
-                "unvalidated claim, not a correction")
+                "is NOT the reason here: the reason is that a bispinor MPA "
+                "stage sums four-current sector bodies, which carry no band "
+                "bracket, so there is no bracket axis to fit, and the 1/N -> 0 "
+                "limit has never been measured on that sum.  Extrapolating it "
+                "would be an unvalidated claim, not a correction")
         else:
             because = (
                 "The 1/N -> 0 limit is MODE-DEPENDENT and is wrong for a "
@@ -1167,6 +1174,8 @@ def _compute_mpa_sigma(
     from .head_correction import compute_complex_pole_head_sigma_diag
     from .mpa.sigma import compute_sigma_c_mpa_omega_grid
     from .efermi import resolve_sigma_efermi_ry
+    from .ppm_pipeline import (
+        extrapolate_sigma_body, plan_sigma_band_brackets, sigma_band_count_point)
     from .ppm_windows import sigma_regularization_for_config
     sigma_w_model = getattr(config.sigma, "w_model", "mpa")
     fit_path, head_fit_path, fit_identity, fit_digest = _mpa_sigma_model_resources(
@@ -1227,6 +1236,7 @@ def _compute_mpa_sigma(
     lorentz_output = bool(config.debug.sigma_lorentz_debug_output)
     if not lorentz_output:
         sigma_lorentz = None
+    plan = None
     if sector_handle.get("representation") == "sector-ordered-ph":
         from .mpa.sector_sigma import compute_sector_sigma
         on_shell = None
@@ -1254,6 +1264,14 @@ def _compute_mpa_sigma(
         else:
             body = sector_result
     else:
+        # The scalar pole sum brackets its Green band sum exactly as the PPM
+        # route does (one executor, one plan owner, one pooled fit).
+        if bool(config.sigma.band_extrapolation) and band_extrapolation_is_consumable(
+                (ComputeMode.MPA,), bispinor=bool(getattr(config, "bispinor", False))):
+            plan = plan_sigma_band_brackets(
+                config, wfns, meta, print_fn=print_fn,
+                where="sigma_dispatch MPA plan seam")
+            body_options.update(band_brackets=plan.bounds, band_counts=plan.counts)
         body = compute_sigma_c_mpa_omega_grid(
             wfns, fit_path, meta, mesh_xy, sigma_w_model=sigma_w_model,
             fit_identity=fit_identity, fit_digest=fit_digest, **body_options)
@@ -1285,8 +1303,23 @@ def _compute_mpa_sigma(
             occupations=head_occ,
             poles_ry=head["Omega_p"], residues_ry=head["B_p"],
             cell_volume=float(meta.cell_volume), nk_tot=int(meta.nk_tot))
+    body_omega, body_odd = body.sigma_c_kij, body.sigma_c_odd_kij
+    body_unextrap = extrap_payload = None
+    if plan is not None:
+        # The fit reads Sigma in the body's own omega frame (sigma_efermi_ry).
+        last = plan.n_brackets - 1
+        body_unextrap = sigma_band_count_point(body_omega, last)
+        if body_odd is not None:
+            body_odd = sigma_band_count_point(body_odd, last)
+        body_omega, extrap_payload = extrapolate_sigma_body(
+            replace(body, efermi_ry=sigma_efermi_ry), head_diag,
+            plan=plan, config=config, band_slices=band_slices,
+            wfn=wfn, sym=sym, meta=meta, mesh_xy=mesh_xy, print_fn=print_fn,
+            held_session=(
+                None if fixed_quadrature_session is None else
+                fixed_quadrature_session.setdefault("band_extrapolation", {})))
     return finalize_dynamic_sigma(
-        body.sigma_c_kij, head_diag,
+        body_omega, head_diag,
         sigma_band_axis=body.band_axis,
         sig_x=sig_x, sig_h=sig_h,
         v_h_scalar=v_h_scalar, h_transverse=h_transverse,
@@ -1297,7 +1330,9 @@ def _compute_mpa_sigma(
         input_dir=input_dir,
         write_sigma_omega_h5=write_sigma_omega_h5,
         sigma_lorentz_static_skij_ry=sigma_lorentz,
-        sigma_c_odd_body_omega=body.sigma_c_odd_kij,
+        sigma_c_odd_body_omega=body_odd,
+        band_extrapolation=extrap_payload,
+        sigma_c_body_omega_unextrap=body_unextrap,
         ppm_odd_even_residue_ratio=body.odd_even_residue_ratio,
         print_fn=print_fn,
         efermi_ry=sigma_efermi_ry,
