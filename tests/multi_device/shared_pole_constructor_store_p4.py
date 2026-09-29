@@ -255,7 +255,7 @@ def _resident_model_checks(meta, bank, identity, mesh, directory, construct):
     admission writes model.h5 as before; a released model refuses reads.
     """
     import functools
-    import numpy as np
+    import jax.numpy as jnp
     from types import SimpleNamespace
     from unittest import mock
     from file_io import shared_pole_store as store
@@ -286,9 +286,10 @@ def _resident_model_checks(meta, bank, identity, mesh, directory, construct):
             arrays += list(store.read_shared_pole_faces(io, (0, 3), meta=meta, header=header))
             for q in range(3):
                 arrays += list(store.read_shared_pole_matrix(io, (q, q + 1), meta=meta, header=header))
-        reads.append([np.asarray(a) for a in arrays])
-    bitwise = all(a.shape == b.shape and np.array_equal(a, b) for a, b in zip(*reads))
-    assert bitwise, [float(np.max(np.abs(a - b))) for a, b in zip(*reads) if a.shape == b.shape]
+        reads.append(arrays)
+    # Global arrays span every process: compare on the devices.
+    same = [a.shape == b.shape and bool(jnp.array_equal(a, b)) for a, b in zip(*reads)]
+    assert all(same), same
     screening.release_resident_model()
     assert screening._RESIDENT_MODEL == []
     try:
