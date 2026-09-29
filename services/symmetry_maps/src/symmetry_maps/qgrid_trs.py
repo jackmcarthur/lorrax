@@ -445,6 +445,16 @@ def _little_group_operations(q_full_idx, *, kgrid, sym_mats_k,
 
 _LITTLE_GROUP_PROJECTORS = {}
 
+# The projector forms its transposed output on each rank's own tile, instead
+# of exchanging the average with the transpose partner, while the parents'
+# mean little-group order sum_q |G_q| / n_q is at most this.  The local form
+# costs about two more tile passes per group operation at HBM bandwidth.  The
+# exchange costs one tile per parent over the link, and the diagonal ranks
+# wait for it.  The break-even is HBM / (2 x link) bandwidth, about 8 over
+# NVLink.  Measured at P4 A100 (claim 2958): Fe 8^3 (mean 3.1) Sigma tau
+# -9 %, Fe 4^3 (6.1) neutral, Na 8^3 (14.8) +7 % when local.
+_LOCAL_PARTNER_MAX_MEAN_ORDER = 8
+
 #: Streaming bytes one extra segment's dispatches cost (its sub-batch gather,
 #: scatter and loop launch); the segment planner weighs it against the tile
 #: transforms a segment saves.  An order-of-magnitude constant, not a tuning dial.
@@ -645,9 +655,10 @@ def project_little_group_operator(
                 f"little-group projection: the transpose partner needs a "
                 f"square mesh, got {px}x{py}")
         left, right = (certificates[a]["local_perm"] for a in ("x", "y"))
-        if left is not None and right is not None and np.array_equal(left, right):
-            # Owner-local maps with one table for both endpoints: the
-            # average's transpose is the average of the swapped pair,
+        if (left is not None and right is not None and np.array_equal(left, right)
+                and counts.sum() <= _LOCAL_PARTNER_MAX_MEAN_ORDER*b):
+            # Owner-local maps with one table for both endpoints and small
+            # little groups: the average's transpose is the average of the swapped pair,
             # (T_s W)^T = T'_s(W^T, W), formed on every rank's own tile.  No
             # exchange, so diagonal and off-diagonal ranks do equal work
             # (an exchange moves the off-diagonal tiles while the diagonal

@@ -320,9 +320,21 @@ valence windows to the particle–hole partner,
 
 $$ W_-(q,\tau) = W_+(-q,\tau)^{\mathsf T}, \tag{SP 5} $$
 
-gathered at $-q$ on the replicated q axis and transposed on its faces
-(`shared_pole_hole_kernel`); TRS stores never take this branch
+TRS stores never take this branch
 (`tests/test_shared_pole_ordered.py`, `tests/test_shared_pole_lattice_sigma.py`).
+The valence synthesis never transposes the full-q $W$. Its unfold writes each
+child's $W_+(c)^{\mathsf T}$ straight onto row $-c$, working on every rank's own tile.
+It reads the same parent pair (projected $W_p$ and $W_p^{\mathsf T}$) with the
+swapped source and the transposed phase rule
+(`unfold_operator_local(transposed_output=True)`).
+The little-group projector forms its transposed output the same way, as the
+average of the swapped pair. So one tile exchange per τ node remains: the
+synthesis $W_p^{\mathsf T}$. Both local forms equal the exchanged transposes bit
+for bit. The exchange let the off-diagonal ranks move their tiles while the
+diagonal ranks copied theirs and waited, which cost 26 % of a P16 node
+(`services/symmetry_maps/tests/test_shared_pole_unfold.py`, claim WTRANS).
+The full-q transpose (`shared_pole_hole_kernel`) remains only for the static
+$W(0)$ restart and for a panel whose endpoint tables differ between the faces.
 
 **Two-component decks.** $W$ is spin-scalar; $G$ carries the spinor axes and the
 τ kernel broadcasts $W_q$ over both (`ppm_tau_kernel` `prep_w`).
