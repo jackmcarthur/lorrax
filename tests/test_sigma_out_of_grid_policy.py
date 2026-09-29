@@ -295,6 +295,34 @@ def test_semicore_patches_one_per_manifold_held_and_extended():
     assert semicore_patches_ev(e, semi, -49.0)[-1][1] < -49.0
 
 
+def test_far_conduction_windows_sit_above_the_near_grid_held_and_extended():
+    from gw.qp_support import (FAR_ETA_EV, coarse_windows_ev, far_patch_escapes,
+                               far_patches_ev, joined_grid_ev, semicore_patches_ev,
+                               window_labels)
+    # Far conduction states above mu + 10 eV, the near grid ending at +12 eV.
+    e = np.array([[-52.0, -3.0, 1.0, 11.0, 18.0, 23.0], [-51.8, -2.8, 1.2, 11.5, 18.3, 23.4]])
+    far = np.zeros(e.shape, bool); far[:, 3:] = True
+    semi = np.zeros(e.shape, bool); semi[:, 0] = True
+    near = np.arange(-7.0, 12.01, 0.25)
+    patches = far_patches_ev(e, far, near[-1])
+    # one merged window from above the near grid to the top state + pad, snapped to eta/2
+    assert len(patches) == 1 and patches[0][2] == FAR_ETA_EV
+    assert near[-1] < patches[0][0] <= 16.0 and patches[0][1] >= 23.4 + 2.0
+    windows = tuple(coarse_windows_ev(near[0], semicore_patches_ev(e, semi, near[0]))) + tuple(
+        (lo, hi, eta, False) for lo, hi, eta in patches)
+    joined = joined_grid_ev(near, windows)
+    assert np.all(np.diff(joined) > 0) and joined[0] < near[0] and joined[-1] >= 25.4
+    eta, group = window_labels(joined, windows, 0.25)
+    assert np.all(group[joined > near[-1]] == 1) and np.all(eta[joined > near[-1]] == FAR_ETA_EV)
+    assert np.all(group[(joined >= near[0]) & (joined <= near[-1])] == -1)
+    # Held inside its pad; a read above it extends the window, never shrinks it.
+    assert not far_patch_escapes(e + 0.3, far, near[-1], patches).any()
+    moved = e.copy(); moved[:, 5] += 3.0
+    assert far_patch_escapes(moved, far, near[-1], patches).any()
+    grown = far_patches_ev(moved, far, near[-1], previous=patches)
+    assert grown[0][1] > patches[0][1] and grown[0][0] == patches[0][0]
+
+
 def test_a_user_window_overrides_the_automatic_patch_for_its_states():
     from gw.qp_support import coarse_windows_ev
     patches = ((-74.0, -48.0, 1.0),)
