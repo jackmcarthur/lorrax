@@ -17,7 +17,7 @@ from pathlib import Path
 import time
 
 from tests.hsuite import chain
-from core import rank_session
+from tests.hsuite import rank_session
 
 
 def test_driver_chain_matches_references():

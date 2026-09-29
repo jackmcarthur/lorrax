@@ -37,9 +37,8 @@ import numpy as np
 
 HERE = Path(__file__).resolve().parent
 REPO = HERE.parents[1]
-sys.path.insert(0, str(REPO / "tests"))
 sys.path.insert(0, str(REPO / "src"))
-from core import rank_session  # noqa: E402
+from tests.hsuite import rank_session  # noqa: E402
 
 FIXTURE = HERE / "fixture"
 REFERENCE = HERE / "reference"
@@ -193,15 +192,6 @@ CHECKS = {
 
 def _env(cache_dir):
     env = dict(os.environ)
-    # The caller's JAX device shape, as the pytest session recorded it
-    # before collection (tests/conftest.py); absent outside pytest.
-    if "LORRAX_SESSION_JAX_ENV" in env:
-        snap = json.loads(env["LORRAX_SESSION_JAX_ENV"] or "{}")
-        for name in ("JAX_PLATFORMS", "XLA_FLAGS"):
-            if snap.get(name) is None:
-                env.pop(name, None)
-            else:
-                env[name] = snap[name]
     for name in list(env):
         if name.startswith("PYTEST_"):
             env.pop(name)

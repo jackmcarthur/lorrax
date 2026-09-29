@@ -18,7 +18,7 @@ import time
 
 from runtime import _resolve_proc_count, _resolve_proc_id
 
-ROOT = Path(__file__).resolve().parents[2] / ".pytest_core_runs"
+ROOT = Path(__file__).resolve().parents[2] / ".hsuite_runs"
 _SEQUENCE = 0
 
 

@@ -1,77 +1,27 @@
 # LORRAX test suite
 
-## Core, core-extended, and full
-
-The default suite is the two-minute core tier. It combines the cached tiny
-fixture family under `tests/core/` with an exact roster of established service
-and runtime contract cells in `tests/core/manifest.py`.
-
-```bash
-lx test                    # developer pre-push: default core, P=4 node
-lx test --core-extended    # additional tiny-system and provider coverage
-lx test --full             # nightly: the complete non-extra suite
-```
-
-`--census` and `-m census` remain aliases for `--full` for old automation.
-The full tier is the owner of `tests/KNOWN_FAILURES.md` accounting. A named
-path, `-m`, `-k`, or a service-selection option is an explicit selection and
-therefore stands the default narrowing down.
-
-The core roster is deliberately small and exact. A stale node ID is a usage
-error, not a silently smaller green run. The default contains:
-
-- dense-linalg routing, factorization, padding, reshards, and a real P4
-  program;
-- SlabIO host/emulated and hostile-extent cells;
-- ISDF, centroid, zeta-loader, symmetry, Coulomb, and WFN-loader checks on
-  the tiny fixture family;
-- A-system COHSEX and GN-PPM, B-system MPA plus exactly one SC update;
-- a three-point htransform pin and a tiny finite-Q TDA/exciton solve;
-- strict deck/refusal, source-closure, compile-agreement, lint, and native
-  provider attestations.
-
-The old real-deck regressions and the per-defect assertion zoo remain in the
-full tier. Redundant parameter sizes and retired-route duplicates are not a
-reason to grow core; one hostile size and one actionable refusal are enough.
-
-## Cached fixtures
-
-`tests/core/fixtures/` contains four tiny mean-field members forming two
-physics fixtures: the A family for ISDF/static/GN-PPM/excited-state coverage,
-and single-atom B for MPA/QSGW. Every retained input and reference is
-SHA-256-authenticated by `PROVENANCE.json`.
-
-The normal suite never runs Quantum ESPRESSO. Fixture maintenance is a
-separate, un-timed action:
+The suite is the production drivers run end to end on one tiny magnetic
+system: [`hsuite/`](hsuite/README.md). Its chain is kmeans → kin_ion →
+dipole → GN-PPM one-shot → shared-pole QSGW (2 maps) → BSE → htransform →
+exciton bands, at P4 on one node. Each stage is checked against the stored
+outputs in `hsuite/reference/`.
 
 ```bash
-lx test --build-fixtures
+lx run -N 1 -G 4 -n 4 -- python3 -m pytest tests/hsuite -q -p no:cacheprovider   # P4
+lx test                                   # the same cell at P1, plus the AST suites
 ```
 
-That command builds or hits the hash-addressed QE cache, verifies every
-committed derived-reference stamp, and exits before test collection.
+Beside it are the five static AST suites that `gate0` and
+`tools/release_check.sh` run as scripts: `test_layering.py`,
+`test_crossfile_requests.py`, `test_env_registry.py`, `test_env_grammar.py`
+and `test_fft_shardmap_context.py`. They also collect under pytest.
 
-## Process geometry
+`bench/` holds standalone benchmark drivers. They are not tests, and pytest
+does not collect them.
 
-The cached driver family supports four independent pytest ranks, which is
-the landing command for the core fixture layer:
+A driver change is judged by the chain's outputs. If a change moves the
+stored numbers on purpose, regenerate them and review the diff:
 
 ```bash
-lx run -N 1 -G 4 -n 4 python3 -m pytest tests/core -p no:cacheprovider -q --tb=short --basetemp=<scratch>/core
+lx run -N 1 -G 4 -n 4 -- python3 -m tests.hsuite.chain --out DIR --regenerate
 ```
-
-`lx test` uses one task and xdist workers; it is a different launch shape.
-Under plain P4 pytest, `core/rank_session.py` stages each driver directory
-once on rank zero and broadcasts its absolute path. It waits for all child
-exit codes and shares rank-zero stdout before the next driver starts. The
-children retain their Slurm rank environment and initialize MPI/JAX themselves.
-The pytest parents use bounded socket rendezvous, without initializing MPI.
-The dense-linalg child uses those four existing ranks rather than spawning
-another process group. Excited-state drivers use a 2x2 mesh at P4.
-
-Shared driver work directories are retained in `.pytest_core_runs/` in the
-checkout, outside pytest's temporary-directory cleanup. An explicit basetemp
-is suffixed per rank for ordinary private fixtures. This supports both default
-`/tmp` basetemp and a shared scratch basetemp without collective HDF5 opens
-using different filenames, or one rank deleting another rank's work.
-Delete `.pytest_core_runs/` only after all associated pytest jobs have ended.
