@@ -585,12 +585,13 @@ def project_little_group_operator(
             counts, tile_bytes=16*m*m//(int(mesh.shape["x"])*int(mesh.shape["y"])))
         sh = NamedSharding(mesh, P(None, "x", "y"))
 
-        def local(plus, partner, transposed=False):
-            # ``transposed``: this rank's tile of the average's TRANSPOSE, from
-            # the swapped pair (see _apply_unfold_phase_and_trs_local).
+        def local(plus, partner, both=False):
+            # ``both``: also this rank's tile of the average's TRANSPOSE, from
+            # the swapped pair in the same step (see
+            # _apply_unfold_phase_and_trs_local); returns (average, transpose).
             x, y = jax.lax.axis_index("x"), jax.lax.axis_index("y")
             ml, nl = plus.shape[1:]
-            total = jnp.zeros_like(plus)
+            totals = (jnp.zeros_like(plus),)*(2 if both else 1)
             for lo, hi, members in segments:
                 whole = len(members) == b
                 sel = None if whole else jnp.asarray(members, dtype=jnp.int32)
@@ -600,7 +601,7 @@ def project_little_group_operator(
                 sub_ops = ops if whole else ops[:, list(members)]
                 sub_valid = valid if whole else valid[:, list(members)]
 
-                def step(index, acc, sel=sel, sub_plus=sub_plus, sub_partner=sub_partner,
+                def step(index, accs, sel=sel, sub_plus=sub_plus, sub_partner=sub_partner,
                          sub_ops=sub_ops, sub_valid=sub_valid):
                     rows_all = jnp.asarray(ops)[index]
                     phase = jnp.exp(2j*jnp.pi*jnp.einsum(
@@ -610,26 +611,31 @@ def project_little_group_operator(
                     if sel is not None:
                         phase = phase[sel]
                     anti = rows >= nsp
-                    source = jnp.where(anti[:, None, None], sub_partner, sub_plus)
                     selected_perm = jnp.asarray(perm)[rows]
                     left = certificates["x"]["local_perm"]
                     right = certificates["y"]["local_perm"]
-                    transformed = _permute_isdf_operator_axes_local(
-                        source, selected_perm, selected_perm, mesh_x=px, mesh_y=py,
-                        left_local_source_map=(None if left is None else jnp.asarray(left)[rows]),
-                        right_local_source_map=(None if right is None else jnp.asarray(right)[rows]))
                     phase_x = jax.lax.dynamic_slice_in_dim(phase, x*ml, ml, axis=1)
                     phase_y = jax.lax.dynamic_slice_in_dim(phase, y*nl, nl, axis=1)
-                    transformed = _apply_unfold_phase_and_trs_local(
-                        transformed, phase_x, phase_y, anti, pair_transpose=True,
-                        transposed=transposed)
-                    return acc + weight[:, None, None]*transformed
+                    out = []
+                    for transposed, acc in zip((False, True), accs):
+                        source = (jnp.where(anti[:, None, None], sub_plus, sub_partner)
+                                  if transposed else
+                                  jnp.where(anti[:, None, None], sub_partner, sub_plus))
+                        transformed = _permute_isdf_operator_axes_local(
+                            source, selected_perm, selected_perm, mesh_x=px, mesh_y=py,
+                            left_local_source_map=(None if left is None else jnp.asarray(left)[rows]),
+                            right_local_source_map=(None if right is None else jnp.asarray(right)[rows]))
+                        transformed = _apply_unfold_phase_and_trs_local(
+                            transformed, phase_x, phase_y, anti, pair_transpose=True,
+                            transposed=transposed)
+                        out.append(acc + weight[:, None, None]*transformed)
+                    return tuple(out)
                 if whole:
-                    total = jax.lax.fori_loop(lo, hi, step, total)
+                    totals = jax.lax.fori_loop(lo, hi, step, totals)
                 else:
-                    total = total.at[sel].set(
-                        jax.lax.fori_loop(lo, hi, step, total[sel]))
-            return total
+                    parts = jax.lax.fori_loop(lo, hi, step, tuple(t[sel] for t in totals))
+                    totals = tuple(t.at[sel].set(v) for t, v in zip(totals, parts))
+            return totals if both else totals[0]
 
         mapped = shard_map(local, mesh=mesh,
                            in_specs=(P(None, "x", "y"),)*2,
@@ -647,7 +653,7 @@ def project_little_group_operator(
             # (an exchange moves the off-diagonal tiles while the diagonal
             # ranks copy theirs and wait, claim 2954).  Bitwise the exchanged
             # transpose: the partner is the exact transpose of the operator.
-            pair = shard_map(lambda a, b: (local(a, b), local(b, a, True)), mesh=mesh,
+            pair = shard_map(lambda a, b: local(a, b, both=True), mesh=mesh,
                              in_specs=(P(None, "x", "y"),)*2,
                              out_specs=(P(None, "x", "y"),)*2, check_vma=False)
 
