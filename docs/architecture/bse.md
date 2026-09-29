@@ -51,7 +51,8 @@ store it (`gw.screening.driver_persists_w0`, `restart_static_w`):
 | `mpa` with `sigma_w_model = shared_pole`, scalar store, one-shot | $V + W^c(0)$ of the model (`gw.mpa.sigma.shared_pole_static_wc`) |
 | the same, `qp_solver = self_consistent` | $V + W^c(0)$ of the accepted final map, evaluated once after the loop |
 | `w_bse`, `w_rpa_resolvent` | the RPA W(0), written by the ladder stage before the ladder runs |
-| `x_only`; `mpa` with `sigma_w_model = mpa`; bispinor `mpa` | nothing |
+| bispinor `mpa`, shared pole, `bispinor_gw = bare_transverse`, one-shot or self-consistent | $V + W^c(0)$ of the four-component charge store on the charge V, the same evaluator (charge sector only) |
+| `x_only`; `mpa` with `sigma_w_model = mpa`; `bispinor_gw = full_shared_pole` | nothing |
 | shared pole on a metal, or `head_correction = full` without an ω = 0 head sample | nothing; the log says why |
 
 **Rebuilt W0.** With `W0_ready = false`, the loader calls
@@ -251,7 +252,12 @@ Keys, supported modes and refusals: [input reference](../input_reference.md).
 ## Limits
 
 - A four-current bundle is read only with a stored W0: the BSE direct term has
-  no packed CC/CT/TC/TT handoff (`gw/static_screening.py:86`).
+  no packed CC/CT/TC/TT handoff (`gw/static_screening.py:86`). The stored W0
+  is the charge sector: the direct term screens with $W_{CC}(0)$ and the
+  exchange term uses the charge V; the CT/TC/TT blocks, screened or bare,
+  never enter the BSE kernel. On `bispinor_gw = full_shared_pole` no W0 is
+  stored (its CC sector lives on raw-sector endpoints with no ω = 0
+  evaluator), so BSE refuses there.
 - The BSE reads ψ from the restart, which holds the deck WFN's states. `--eqp`
   replaces energies only (`bse/bse_window.py:569`), so a QSGW BSE with QP ψ
   needs a GW restart generated from `WFN_qp.h5`.

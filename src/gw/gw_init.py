@@ -1241,11 +1241,12 @@ def check_band_extrapolation_floor(cfg, band_slices, meta):
 	consuming stage (PPM, or scalar MPA) never reads the key and is not checked.
 	"""
 	from .band_extrapolation import require_extrapolation_band_floor
-	from .gw_config import band_extrapolation_is_consumable, sigma_stage_modes
+	from .gw_config import (band_extrapolation_is_consumable,
+	                        mpa_sigma_runs_scalar_executor, sigma_stage_modes)
 	if not bool(cfg.sigma.band_extrapolation):
 		return
 	if not band_extrapolation_is_consumable(
-			sigma_stage_modes(cfg), bispinor=getattr(cfg, "bispinor", False)):
+			sigma_stage_modes(cfg), scalar_mpa=mpa_sigma_runs_scalar_executor(cfg)):
 		return
 	b0 = int(band_slices.b0)
 	require_extrapolation_band_floor(

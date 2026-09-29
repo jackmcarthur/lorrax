@@ -45,6 +45,7 @@ import common.timing as timing
 from . import quadrature_log
 from .gw_config import (
     ComputeMode, ScreeningDiagrams, coerce_screening_diagrams,
+    uses_bare_transverse_shared_pole,
 )
 
 
@@ -879,15 +880,23 @@ def driver_persists_w0(mode, config) -> bool:
     * ``compute_mode = mpa`` with ``sigma_w_model = mpa`` — its W is a
       per-element Pade fit on disk with no ω = 0 evaluator, so nothing is
       persisted; BSE reconstructs the scalar static response.
-    * ``compute_mode = mpa`` on a bispinor deck (four-component charge or
-      photon sector stores): the static W of those models is not built
-      (future work), with the same BSE refusal.
+    * ``compute_mode = mpa`` on the four-current sector bank
+      (``bispinor_gw = full_shared_pole``): its CC sector is stored on
+      raw-sector endpoints that only ``mpa.sector_sigma`` realizes, and no
+      ω = 0 evaluator reads them yet, so BSE refuses
+      (``GATE bse_static_w_bispinor_sectors``).
 
     ``compute_mode = mpa`` with ``sigma_w_model = shared_pole`` (the
     production W) answers yes, one-shot and self-consistent alike:
     :func:`restart_static_w` evaluates the model at ω = 0 through the Σ
     synthesis owner.  A self-consistent run evaluates the accepted final
     map's model, once, after the loop (``sc_iteration.run_sc_driver``).
+    The bispinor charge route (``bispinor_gw = bare_transverse`` with the
+    shared pole) is included: its store is the four-component charge
+    operator in the scalar representations, so the same evaluator gives
+    the charge-sector ``V + Wc(0)`` on the run's charge V.  BSE reads that
+    charge W0 only; the bare TT exchange of that route never enters the
+    restart, and CT/TT are unscreened there by construction.
 
     Lives here rather than in ``gw_jax`` so the driver keeps one call and
     no mode/diagram arithmetic, and so the reasons sit next to the fork
@@ -902,7 +911,8 @@ def driver_persists_w0(mode, config) -> bool:
     if mode is ComputeMode.MPA:
         sigma = getattr(config, "sigma", None)
         return (getattr(sigma, "w_model", "mpa") == "shared_pole"
-                and not bool(getattr(config, "bispinor", False)))
+                and (not bool(getattr(config, "bispinor", False))
+                     or uses_bare_transverse_shared_pole(config)))
     return True
 
 

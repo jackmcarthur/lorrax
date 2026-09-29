@@ -589,8 +589,10 @@ keys themselves are in the [input reference](../input_reference.md).
   `sigma_band_extrapolation` a deprecated alias; both named and disagreeing
   refuses. `explicit` selects the behaviour on a non-consuming stage: a defaulted-on
   key auto-disables with a note, an explicitly named one refuses.
-  `band_extrapolation_is_consumable` is true when any stage is GN/HL-PPM or a
-  scalar (non-bispinor) MPA stage.
+  `band_extrapolation_is_consumable` is true when any stage is GN/HL-PPM or an
+  MPA stage whose Σ_c runs the scalar executor
+  (`mpa_sigma_runs_scalar_executor`: scalar decks and the bispinor charge
+  route, `bare_transverse` with the shared pole).
 - **`sigma_stage_modes`** returns every mode the run dispatches Σ under, in
   order: the staged ladder when `config.sc.stages` exists, else the one
   `compute_mode`. A run-level refusal asks this, never the current stage.

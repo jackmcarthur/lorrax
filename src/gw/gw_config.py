@@ -2164,15 +2164,30 @@ def sigma_stage_modes(config, fallback=None) -> tuple:
     return tuple(out)
 
 
-def band_extrapolation_is_consumable(modes, *, bispinor: bool = False) -> bool:
+def band_extrapolation_is_consumable(modes, *, scalar_mpa: bool = True) -> bool:
     """Does ANY stage of this run reach a kernel that reads the key?; see docs/architecture/decisions.md.
 
-    The GN/HL-PPM stages and the scalar MPA stage (shared pole or MPA fit)
-    bracket the Green band sum in the one pole-sum executor.  A bispinor MPA
-    stage sums four-current sector bodies, which carry no bracket axis.
+    The GN/HL-PPM stages and an MPA stage whose Σ_c runs the scalar pole-sum
+    executor bracket the Green band sum in that one executor.  ``scalar_mpa``
+    is :func:`mpa_sigma_runs_scalar_executor` of the run's config.
     """
     return any(getattr(m, "ppm_model", None) is not None
-               or (m is ComputeMode.MPA and not bool(bispinor)) for m in modes)
+               or (m is ComputeMode.MPA and bool(scalar_mpa)) for m in modes)
+
+
+def mpa_sigma_runs_scalar_executor(config) -> bool:
+    """Does this run's MPA Σ_c run the scalar pole-sum executor?; see docs/architecture/decisions.md.
+
+    Scalar decks do, and so does the bispinor charge route
+    (``bispinor_gw = bare_transverse`` with the shared pole): its store is
+    the four-component charge operator and ``sigma_dispatch._compute_mpa_sigma``
+    hands it to ``compute_sigma_c_mpa_omega_grid`` like a scalar store.  The
+    four-current sector bank (``full_shared_pole``) sums CC/TT/CT on their own
+    pole sets in ``mpa.sector_sigma`` with no bracket plan, and a bispinor
+    MPA fit is unmeasured; both keep the full-band sum.
+    """
+    return (not bool(getattr(config, "bispinor", False))
+            or uses_bare_transverse_shared_pole(config))
 
 
 # ---------------------------------------------------------------------------

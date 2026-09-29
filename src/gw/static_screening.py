@@ -88,7 +88,9 @@ def build_static_w_from_restart(filename, input_file, mesh_xy, *, print_fn=print
             "GATE bse_static_w_bispinor_sectors: missing screened W0 on a "
             "four-current restart; the BSE direct kernel has no packed "
             "CC/CT/TC/TT response handoff. Supply an authenticated stored "
-            "charge W0; a scalar rebuild would omit the coupled sectors.")
+            "charge W0 (a bispinor_gw = bare_transverse shared-pole run "
+            "stores one; full_shared_pole does not); a scalar rebuild would "
+            "omit the coupled sectors.")
     if config.qp_solver is QPSolver.SELF_CONSISTENT:
         raise ValueError(
             "GATE bse_static_w_sc_state: missing final-map W0 on a QSGW "
