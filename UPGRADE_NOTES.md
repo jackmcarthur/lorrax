@@ -3,6 +3,22 @@
 User-visible changes, newest first. Binding rulings behind the breaking
 changes live in `docs/architecture/decisions.md`.
 
+## 2026-09-28 — band extrapolation: pooled denominator shell, cuts at 70/85/100 %
+
+- `spectral_shell` now fits one (β, Ω) over the QP window's states: band A adds
+  a_i·Σ_k w_k (E_Ak − E_i + Ω)^−β to state i, with a per-state amplitude from
+  the widest shell. The per-state exponent is gone. Every GN/HL-PPM run with
+  `use_band_extrapolation` on moves once. On Si 4³ at 78 bands against the
+  complete basis the std over the ±10 eV states drops from 109 meV (per-state,
+  cuts 64/72/78) to 9.2 meV (pooled, cuts 50/64/78); see
+  [Band extrapolation](docs/theory/band-extrapolation.md).
+- `total_fractions` cuts are 70 % and 85 % of `number_bands_sigma` (were 80 % and
+  90 %), so the three bracket counts change and the Σ τ-loop recompiles once.
+- `sigma_mnk.h5`: `sigma_c_extrap_beta_kn` holds the pooled β (NaN on states
+  without a tail); new attributes `pooled_beta`, `pooled_omega_ev`,
+  `pooled_residual_rms_ev`, `pooled_state_count`.
+- Shared-pole and other non-PPM Σ stages are unchanged: they do not extrapolate.
+
 ## 2026-09-24 — k-axis convolutions on nvidia-mathdx (branch, not yet main)
 
 - **NVIDIA GPUs now require the `nvidia-mathdx` wheel** (pinned in the

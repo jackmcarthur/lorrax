@@ -87,6 +87,7 @@ nav:
       - Minimax quadrature: theory/minimax-quadrature.md
       - Space-time response (Laplace): theory/response-laplace.md
       - The Sigma(omega) quadrature problem: theory/sigma-quadrature-problem.md
+      - Sigma_c band extrapolation: theory/band-extrapolation.md
       - Symmetry: theory/symmetry.md
       - S-tensor convention: theory/s-tensor-convention.md
       - LT splitting and the exchange head: theory/lt-exchange-head.md
