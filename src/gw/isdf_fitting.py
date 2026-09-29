@@ -364,11 +364,12 @@ def _fit_mubatch(
     n_pg_plan = int(plan.r_sub)
     at = lambda c: plan.working_set(P_ * c, n_pg_plan, c, 1)
     slope = at(2) - at(1)
-    check = check_chunk(
-        max(1, int(plan.b) // P_), build=build, stage="zeta route-G mu batch",
-        fixed=at(1) - slope - plan.working_set(0, n_pg_plan, 0, 1), per_unit=slope,
-        room=plan.target_bytes - plan.working_set(0, n_pg_plan, 0, 1),
-        extra=lambda c, compiled: int(compiled.memory_analysis().output_size_in_bytes))
+    with timing.section("zeta_fit.mubatch.memcheck"):
+        check = check_chunk(
+            max(1, int(plan.b) // P_), build=build, stage="zeta route-G mu batch",
+            fixed=at(1) - slope - plan.working_set(0, n_pg_plan, 0, 1), per_unit=slope,
+            room=plan.target_bytes - plan.working_set(0, n_pg_plan, 0, 1),
+            extra=lambda c, compiled: int(compiled.memory_analysis().output_size_in_bytes))
     mb, c_out, n_blk, kern_args, kernel = builds[check.chunk]
     batch_executable = check.compiled
     b = int(mb.b)

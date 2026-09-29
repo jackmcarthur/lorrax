@@ -610,7 +610,8 @@ def _compiled(kernel, args):
     AOT lowering bypasses jit's executable cache, so an admission repeated at
     every sample of every SC map would recompile an unchanged program.  The
     kernels are module-cached builders, so their identity is stable; the
-    caller still admits the executable's memory on every call.
+    caller still admits the executable's memory on every call.  An abstract
+    leaf keys by its shape, dtype and sharding, as the array it stands for.
     """
     key = (kernel, jax.tree.structure(args), tuple(
         (tuple(x.shape), str(x.dtype), getattr(x, "sharding", None))
@@ -1263,22 +1264,26 @@ def integrate_response_group(wfns, meta, mesh_xy, rules, group, *, q_ids,
 
 
 def _stream_executable(wfns, meta, mesh_xy, support, *, q_ids, n_outputs, ordered, vertex):
-    """The group stream compiled at ``n_outputs`` production shapes; nothing is allocated."""
+    """The group stream at ``n_outputs``, compiled once under the key its dispatch
+    looks up (:func:`_compiled`), so the executable the planner checks is the
+    one that runs.  The small operands are zero placeholders built as the
+    dispatch builds them; the carry is abstract, so nothing large is allocated.
+    """
     import minimax
     n = meta.mu_basis.n_packed if vertex is None else vertex.n
     kernel, fixed = response_stream(wfns, meta, mesh_xy=mesh_xy, q_ids=q_ids,
         n_outputs=n_outputs, pair_mode="direct", bank_carry=True, ordered=ordered,
         vertex=vertex, band_ranges=support["band_ranges"])
     capacity = minimax.RESPONSE_NODE_CAPACITY
-    abstract = (jax.ShapeDtypeStruct((capacity,), jnp.complex128),
-                jax.ShapeDtypeStruct((2, n_outputs, capacity), jnp.complex128),
-                *fixed, stream_weights(wfns, support["f"], mesh_xy),
-                stream_weights(wfns, support["u"], mesh_xy),
-                jax.ShapeDtypeStruct((2,), jnp.float64),
-                jax.ShapeDtypeStruct((n_outputs, len(q_ids), n, n), jnp.complex128,
-                    sharding=NamedSharding(mesh_xy, P(None, None, "x", "y"))))
+    args = (jnp.asarray(np.zeros(capacity, np.complex128)),
+            jnp.asarray(np.zeros((2, n_outputs, capacity), np.complex128)),
+            *fixed, stream_weights(wfns, support["f"], mesh_xy),
+            stream_weights(wfns, support["u"], mesh_xy),
+            jnp.asarray(np.zeros_like(support["refs"])),
+            jax.ShapeDtypeStruct((n_outputs, len(q_ids), n, n), jnp.complex128,
+                sharding=NamedSharding(mesh_xy, P(None, None, "x", "y"))))
     with timing.section('bank.compile.direct', announce=True):
-        compiled = kernel.lower(*abstract).compile()
+        compiled = _compiled(kernel, args)
     if compiled.memory_analysis() is None:
         raise ValueError("GATE response_capacity: compiled memory unavailable")
     return compiled
@@ -1457,22 +1462,24 @@ def produce_sample_bank(wfns, meta, config, *, mesh_xy, sym, sample_plan, bank_i
         workspace, whole = _stream_workspace(wfns, meta, mesh_xy, support, q_ids=response_rows,
             n_outputs=2*len(z), ordered=ordered, vertex=vertex)
         chosen = (0, 0) if selection is None else (selection_resident, selection_workspace)
-        group_size, fixed, room, live = response_group_size(meta, mesh_xy, n_samples=len(z),
-            carry_per_sample=carry_per_sample, stream_workspace=workspace,
-            selection=chosen)
+        with timing.section('bank.plan.direct'):
+            group_size, fixed, room, live = response_group_size(meta, mesh_xy, n_samples=len(z),
+                carry_per_sample=carry_per_sample, stream_workspace=workspace,
+                selection=chosen)
         # The chosen group's executable, checked before it runs
         # (runtime.aot_memory.check_chunk): the carry is a donated argument
         # the caller allocates, the mode-11 scratch a run-time draw.
         from runtime.aot_memory import check_chunk
         from common.gpu_utils import record_stage_price
         scratch = _stream_scratch(wfns, meta, mesh_xy, vertex)
-        check = check_chunk(
-            group_size, stage="response direct stream",
-            build=lambda g: _stream_executable(wfns, meta, mesh_xy, support,
-                q_ids=response_rows, n_outputs=2*g, ordered=ordered, vertex=vertex),
-            compiled=whole if group_size == len(z) else None,
-            fixed=fixed, per_unit=carry_per_sample, room=room,
-            extra=lambda g, _: g*carry_per_sample + scratch)
+        with timing.section('bank.memcheck.direct'):
+            check = check_chunk(
+                group_size, stage="response direct stream",
+                build=lambda g: _stream_executable(wfns, meta, mesh_xy, support,
+                    q_ids=response_rows, n_outputs=2*g, ordered=ordered, vertex=vertex),
+                compiled=whole if group_size == len(z) else None,
+                fixed=fixed, per_unit=carry_per_sample, room=room,
+                extra=lambda g, _: g*carry_per_sample + scratch)
         group_size = check.chunk
         record_stage_price(f"response direct stream, group {group_size}/{len(z)}",
                            live + check.price, section="bank.dispatch.direct")

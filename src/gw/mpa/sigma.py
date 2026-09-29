@@ -1041,10 +1041,12 @@ def _batch_rows(row, batch):
     )
 
 
-def _admit(compiled, meta, stage, *, native=0, resident=0, counted=0):
-    """Reserve a compiled executable's peak; ``counted`` argument bytes are charged elsewhere."""
+def _admit(compiled, meta, stage, *, native=0, resident=0, counted=0, peak=None):
+    """Reserve a compiled executable's peak; ``counted`` argument bytes are charged elsewhere.
+    ``peak`` passes an ``aot_kernel_peak_bytes`` breakdown the caller already read."""
     from runtime.aot_memory import aot_kernel_peak_bytes
-    peak = aot_kernel_peak_bytes(compiled)
+    if peak is None:
+        peak = aot_kernel_peak_bytes(compiled)
     if not peak.cufft_measured:
         raise ValueError(f"GATE shared_pole_capacity: {stage} FFT workspace unavailable")
     meta.shared_pole_capacity.reserve(
@@ -1173,7 +1175,11 @@ class SynthesisTau:
             return
         counted = sum(int(x.addressable_shards[0].data.nbytes)
                       for x in jax.tree.leaves(self._synthesis.resident_operands()))
-        _admit(compiled, self._meta, self._stage, native=self._native, counted=counted)
+        from runtime.aot_memory import aot_kernel_peak_bytes
+        with timing.section('tau.memcheck'):
+            peak = aot_kernel_peak_bytes(compiled)
+        _admit(compiled, self._meta, self._stage, native=self._native, counted=counted,
+               peak=peak)
         self._admitted = True
         from gw.ppm_tau_kernel import sigma_pass_price
         plan = sigma_pass_price(self._spatial)
@@ -1181,9 +1187,9 @@ class SynthesisTau:
             # The pass sigma_spin_block priced, from the window executable
             # (runtime.aot_memory): its new bytes beside the live arguments plus
             # the synthesis GEMM's native workspace.
-            from runtime.aot_memory import compiled_new_bytes, announce_once
+            from runtime.aot_memory import announce_once
             from common.gpu_utils import record_stage_price
-            got = compiled_new_bytes(compiled, extra=self._native)
+            got = int(peak.resident_increment) + int(self._native)
             record_stage_price(f"Sigma tau, compiled window d={plan['d']}/{plan['ns']}",
                                plan["live"] + max(plan["new"], got), section="sigma.tau_sweep")
             if got > max(plan["new"], plan["room"]) and plan["d"] > 1:
