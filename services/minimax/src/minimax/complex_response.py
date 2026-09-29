@@ -9,7 +9,7 @@ d/d(z^2).
 import numpy as np
 from scipy import linalg as la
 
-from .uniform_rule import _pinned_blas_threads
+from .uniform_rule import _map_rows, _pinned_blas_threads
 
 RESPONSE_RULE_CAPACITY = 192
 # Node slots of one rule: a shared set uses at most one pencil's capacity; a
@@ -32,10 +32,15 @@ def _project(lo, hi, pole, times, decay_rate=0.):
     f = 1/(x-zp)
     origin = 0. if decay_rate else lo
     def basis(xx):
+        # Row blocks on the service's pool: each row is the same elementwise
+        # arithmetic as the whole-matrix expression, so the same bytes.
         d = lo + eta*xx
-        weight = np.exp(np.minimum(decay_rate*d, 0.))
-        return np.exp(np.minimum(decay_rate*d, 0.)[:, None]
-                      - (d[:, None]-origin)*times), weight
+        damp = np.minimum(decay_rate*d, 0.)
+        a = np.empty((d.size, times.size), np.complex128)
+        def fill(i, j):
+            a[i:j] = np.exp(damp[i:j, None] - (d[i:j, None]-origin)*times)
+        _map_rows(fill, d.size, times.size)
+        return a, np.exp(damp)
     a, weight = basis(x)
     a = a/abs(f[:, None])
     scale = la.norm(a, axis=0)
@@ -45,11 +50,16 @@ def _project(lo, hi, pole, times, decay_rate=0.):
                     cond=1e-14, lapack_driver='gelsd', check_finite=False)[0]/scale[:, None]
     probe = np.unique(np.r_[x, np.linspace(0, span, 2501)])
     error = np.zeros(2)
+    # One row-blocked basis for the whole probe; the products stay on the
+    # same 16 row chunks as before (a chunk of rows is a contiguous view).
+    a, weight = basis(probe)
+    start = 0
     for xx in np.array_split(probe, 16):
+        stop = start + xx.size
         exact = 1/(xx-zp)
-        a, weight = basis(xx)
-        error = np.maximum(error, np.max(abs(a@coeff
-                       - weight[:, None]*np.column_stack((exact, exact*exact))), axis=0))
+        error = np.maximum(error, np.max(abs(a[start:stop]@coeff
+                       - weight[start:stop, None]*np.column_stack((exact, exact*exact))), axis=0))
+        start = stop
     mass = np.sum(abs(coeff), axis=0)
     return coeff / np.array([eta, eta*eta]), error, mass
 
