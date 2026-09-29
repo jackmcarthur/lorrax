@@ -619,7 +619,7 @@ def _get_chi_fractional_contour_kernel_face(
     """
     from common.fft_helpers import make_flat_k_fftn
     from distrib_la import gemm_plan
-    from .greens_function_kernel import build_G_tau, face_band_gather_product
+    from .greens_function_kernel import build_G_tau, face_green_product
     from .wavefunction_bundle import (
         G_FFT7D_SPEC,
         G_FLATK_SPEC,
@@ -719,7 +719,7 @@ def _get_chi_fractional_contour_kernel_face(
     if band_ranges is not None and (layout != "axis" or pair_mode != "direct"):
         raise ValueError("prepared response band ranges require the axis direct stream")
     if photon is not None:
-        g_plan = partial(face_band_gather_product, mesh=mesh_xy, phases=None, band_range=None)
+        g_plan = partial(face_green_product, mesh=mesh_xy, phases=None, band_range=None)
         if n_rmu != photon.layout.packed_extent or ns != 4:
             raise ValueError(
                 f"four-current stream: face_shape extent {n_rmu}, spin {ns}; want "
