@@ -318,11 +318,16 @@ def run_stage(run, name, module, argv, env, timeout):
     log = run / f"{name}.rank{rank}.log"
     sys.stdout.flush()
     sys.stderr.flush()
+    # Both levels: native writes go to fds 1/2, Python writes to sys.stdout /
+    # sys.stderr, which pytest's capture replaces with objects that never
+    # reach fd 1.  One append-mode stream on the log serves both.
+    log.write_text("")
+    stream = open(log, "a", buffering=1, encoding="utf-8", errors="replace")
     saved = (os.dup(1), os.dup(2))
-    fd = os.open(log, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
-    os.dup2(fd, 1)
-    os.dup2(fd, 2)
-    os.close(fd)
+    saved_py = (sys.stdout, sys.stderr)
+    os.dup2(stream.fileno(), 1)
+    os.dup2(stream.fileno(), 2)
+    sys.stdout = sys.stderr = stream
     cwd, saved_argv = os.getcwd(), sys.argv
     rc = 0
     try:
@@ -338,12 +343,13 @@ def run_stage(run, name, module, argv, env, timeout):
             traceback.print_exc()
             rc = 1
     finally:
-        sys.stdout.flush()
-        sys.stderr.flush()
+        stream.flush()
+        sys.stdout, sys.stderr = saved_py
         os.dup2(saved[0], 1)
         os.dup2(saved[1], 2)
         os.close(saved[0])
         os.close(saved[1])
+        stream.close()
         os.chdir(cwd)
         sys.argv = saved_argv
     if rc != 0:
