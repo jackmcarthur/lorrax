@@ -1064,9 +1064,15 @@ class SynthesisTau:
         if key not in _SYNTHESIS_TAU:
             spatial, w_kernel = self._spatial, self._synthesis.w_kernel
 
-            def tau(xn, yr, xr, yn, energies, weight, w_operands, e_ref_a, e_ref_b, t, _active):
+            def tau(xn, yr, xr, yn, energies, weight, w_operands, e_ref_a, e_ref_b, t, _active,
+                    resident=None):
                 interactions = w_kernel(*w_operands, e_ref_b, t, hole)
-                return spatial(xn, yr, xr, yn, energies, weight, e_ref_a, t, interactions)
+                return spatial(xn, yr, xr, yn, energies, weight, e_ref_a, t, interactions,
+                               resident=resident)
+            resident = getattr(spatial, "resident_panels", None)
+            if resident is not None:
+                # The Green's τ-invariant panels, gathered once per window (ppm_accumulators).
+                tau.loop_invariants = lambda xn, yr, *_rest: resident(xn, yr)
             # The plans ride along so the ids in the key cannot be reused.
             _SYNTHESIS_TAU[key] = (self._plans, tau)
         return _SYNTHESIS_TAU[key][1]

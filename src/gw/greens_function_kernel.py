@@ -10,7 +10,8 @@ import jax.numpy as jnp
 from common.contract_bands import merge_spin_centroid
 
 
-def face_green_product(A, B, mesh, phases, band_range, n_full=None, partner=False):
+def face_green_product(A, B, mesh, phases, band_range, n_full=None, partner=False,
+                       resident=None):
     """``A·diag(w)·B`` on band-distributed faces by the 2-D distributed GEMM.
 
     ``A`` ``(nq, M, N_b)`` and ``B`` ``(nq, N_b, N)`` are both
@@ -43,9 +44,12 @@ def face_green_product(A, B, mesh, phases, band_range, n_full=None, partner=Fals
     this route 2.64 s at v1 (before the one-exchange partner pair).  cuBLASMp
     loses because it runs one SUMMA per k (nq calls of p broadcast rounds) and
     joins the XLA stream by events at entry and exit, so it overlaps nothing;
-    this route moves the same bytes once per panel for every k, and XLA's
-    async all-gathers overlap the previous panel's GEMM.  At P16 the exchange
-    is most of a build (all-gathers 1.2 of 1.85 ms on CrI3).
+    this route moves the same bytes once per panel for every k.  In the Σ τ
+    window executable the all-gathers run on the compute stream and overlap
+    nothing (TAUPIPE nsys, Fe 8³ at P4 and P16).  At P16 the exchange is most
+    of a build (all-gathers 1.2 of 1.85 ms on CrI3).  ``resident``
+    (:func:`green_resident_panels` of the same faces) supplies the first panels
+    already gathered (see ``distrib_la.panel_matmul``).
     """
     from distrib_la import panel_matmul
 
@@ -66,7 +70,50 @@ def face_green_product(A, B, mesh, phases, band_range, n_full=None, partner=Fals
         bounds = jnp.stack([jnp.clip(lo, 0, hi), hi], axis=1)
     tile_bytes = green_panel_bytes(n_rows=int(n_full or nq), m=m, n=n, mesh=mesh)
     return panel_matmul(A, B, mesh=mesh, panel_bytes=tile_bytes, bounds=bounds, weights=weight,
-                        partner=partner)
+                        partner=partner, resident=resident)
+
+
+def _green_faces(psi_mun, psi_nmu, gemm):
+    """``(A, B)`` = ``(ψ, conj ψ)`` as the GEMM's merged operands, on the plan's input shardings."""
+    A = merge_spin_centroid(psi_mun, 1, 2)          # (nk, mu*s, n) P(_,'x','y')
+    B = merge_spin_centroid(jnp.conj(psi_nmu), 2, 3)  # (nk, n, mu*s) P(_,'x','y')
+    # Eager operations may erase singleton mesh axes before the GEMM boundary.
+    from jax import lax
+    in_sharding_a = getattr(gemm, "in_sharding_a", None)
+    in_sharding_b = getattr(gemm, "in_sharding_b", None)
+    if in_sharding_a is not None:
+        A = lax.with_sharding_constraint(A, in_sharding_a)
+    if in_sharding_b is not None:
+        B = lax.with_sharding_constraint(B, in_sharding_b)
+    return A, B
+
+
+def green_resident_panels(psi_mun, psi_nmu, *, gemm, mesh, n_full=None):
+    """The τ-invariant first SUMMA panels of a face Green build, gathered once.
+
+    ``G(τ) = ψ·diag(w(τ))·ψ†``: only the weights change with τ, so a τ loop
+    exchanges the same ψ panels at every node.  ``distrib_la.panel_resident``
+    holds the first of them (at most half the bands, never band-complete); a
+    loop that passes them to every :func:`build_G_tau` of the same ψ drops their
+    exchange from each node.  ``None`` off the face route or when a build has
+    fewer than two panels.  Bytes: :func:`green_resident_bytes`.
+    """
+    from distrib_la import panel_resident
+    if getattr(gemm, "backend", "local") == "local":
+        return None
+    A, B = _green_faces(psi_mun, psi_nmu, gemm)
+    nq, m, _ = (int(v) for v in A.shape)
+    tile_bytes = green_panel_bytes(n_rows=int(n_full or nq), m=m, n=int(B.shape[-1]), mesh=mesh)
+    return panel_resident(A, B, mesh=mesh, panel_bytes=tile_bytes)
+
+
+def green_resident_bytes(*, n_parent, n_rmu, ns, n_band, n_full, mesh):
+    """Per-rank bytes :func:`green_resident_panels` holds for a parent-row face Green."""
+    from distrib_la import panel_resident_bytes
+    m = int(n_rmu) * int(ns)
+    return panel_resident_bytes(
+        q=n_parent, m=m, k=n_band, n=m, mesh=mesh,
+        panel_bytes=green_panel_bytes(n_rows=int(n_full), m=m, n=m, mesh=mesh))
 
 
 def green_panel_bytes(*, n_rows, m, n, mesh, room=None):
@@ -85,7 +132,8 @@ def green_panel_bytes(*, n_rows, m, n, mesh, room=None):
 
 
 def _build_G_face(psi_mun, psi_nmu, *, gemm, Gij=None, phases=None, mesh=None,
-                  band_range=None, prepared_active_gemm=None, n_full=None, pair=False):
+                  band_range=None, prepared_active_gemm=None, n_full=None, pair=False,
+                  resident=None):
     """Contract band-replicated faces locally or band-distributed faces with their GEMM plan.
 
     Returns the Green ``(nk, mu_X, s, nu_Y, s')``: centroid-major, the
@@ -103,21 +151,13 @@ def _build_G_face(psi_mun, psi_nmu, *, gemm, Gij=None, phases=None, mesh=None,
             "build_G(layout='face'): left psi_mun and right psi_nmu must "
             "share (nk, nb, nspinor); got "
             f"{psi_mun.shape} and {psi_nmu.shape}.")
-    A = merge_spin_centroid(psi_mun, 1, 2)          # (nk, mu*s, n) P(_,'x','y')
+    A, B = _green_faces(psi_mun, psi_nmu, gemm)
     face = getattr(gemm, "backend", "local") != "local"
     if (phases is not None and band_range is None
             and prepared_active_gemm is None and not face):
-        w = phases.astype(A.dtype)                  # (nk, n)
-        A = A * w[:, None, :]
-    B = merge_spin_centroid(jnp.conj(psi_nmu), 2, 3)  # (nk, n, mu*s) P(_,'x','y')
-    # Eager operations may erase singleton mesh axes before the GEMM boundary.
-    from jax import lax
-    in_sharding_a = getattr(gemm, "in_sharding_a", None)
-    in_sharding_b = getattr(gemm, "in_sharding_b", None)
-    if in_sharding_a is not None:
-        A = lax.with_sharding_constraint(A, in_sharding_a)
-    if in_sharding_b is not None:
-        B = lax.with_sharding_constraint(B, in_sharding_b)
+        A = A * phases.astype(A.dtype)[:, None, :]  # (nk, n) weights on the local route
+        if getattr(gemm, "in_sharding_a", None) is not None:
+            A = jax.lax.with_sharding_constraint(A, gemm.in_sharding_a)
     if prepared_active_gemm is not None:
         if band_range is not None:
             raise ValueError(
@@ -126,13 +166,15 @@ def _build_G_face(psi_mun, psi_nmu, *, gemm, Gij=None, phases=None, mesh=None,
             raise ValueError("prepared_active_gemm requires per-band phases")
         G_flat = prepared_active_gemm(A, B, weights=phases)
     elif face:
-        # The phases scale each panel's slice of A on its way into the gather.
+        # The phases scale each panel of A (on its slice before the gather, or on
+        # the gathered panel for the pair and for resident panels).
         if pair:
             G_flat, partner = face_green_product(A, B, gemm.mesh, phases, band_range,
-                                                 n_full=n_full, partner=True)
+                                                 n_full=n_full, partner=True, resident=resident)
             return (G_flat.reshape(nk_, mu_l_, s_, mu_r_, s_),
                     partner.reshape(nk_, mu_l_, s_, mu_r_, s_))
-        G_flat = face_green_product(A, B, gemm.mesh, phases, band_range, n_full=n_full)
+        G_flat = face_green_product(A, B, gemm.mesh, phases, band_range, n_full=n_full,
+                                    resident=resident)
     else:
         G_flat = (gemm(A, B) if band_range is None
                   else gemm.active_range(A, B, *band_range, weights=phases))
@@ -173,8 +215,11 @@ jax.tree_util.register_pytree_node(
 
 def build_G_parents(psi_xn, psi_yr, *, Gij=None, phases=None, layout='face', gemm=None,
                     k_unfold_plan, real_weights=None, band_range=None,
-                    prepared_active_gemm=None) -> ParentGreen:
-    """The parent Green and its antiunitary partner, before the typed unfold (see :class:`ParentGreen`)."""
+                    prepared_active_gemm=None, resident=None) -> ParentGreen:
+    """The parent Green and its antiunitary partner, before the typed unfold (see :class:`ParentGreen`).
+
+    ``resident``: :func:`green_resident_panels` of ``(psi_xn, psi_yr)``, read by the
+    builds of those faces (never by a conjugate-face build of ``conj ψ``)."""
     if layout not in ('face', 'axis'):
         raise ValueError("build_G requires canonical faces with layout=face or axis.")
     if gemm is None:
@@ -189,13 +234,14 @@ def build_G_parents(psi_xn, psi_yr, *, Gij=None, phases=None, layout='face', gem
         # conj(G) exactly, so no device predicate is needed.
         G, transposed = _build_G_face(psi_xn, psi_yr, gemm=gemm, phases=phases,
                                       mesh=k_unfold_plan.mesh_xy, band_range=band_range,
-                                      n_full=k_unfold_plan.n_full, pair=True)
+                                      n_full=k_unfold_plan.n_full, pair=True,
+                                      resident=resident)
         return ParentGreen(G, transposed)
     G = _build_G_face(psi_xn, psi_yr, gemm=gemm, Gij=Gij, phases=phases,
                       mesh=k_unfold_plan.mesh_xy,
                       band_range=band_range,
                       prepared_active_gemm=prepared_active_gemm,
-                      n_full=k_unfold_plan.n_full)
+                      n_full=k_unfold_plan.n_full, resident=resident)
     transposed = None
     if antiunitary:
         if (real_weights is True or phases is None
@@ -358,7 +404,7 @@ def build_G_tau(psi_xn, psi_yr, enk, t, *, e_ref=0.0, mask=None,
                 layout='face', gemm=None, k_unfold_plan=None, band_range=None,
                 trim_zero_bands=False, prepared_active_gemm=None,
                 conjugate=False, unfold=True, right_k_unfold_plan=None,
-                real_weights=None):
+                real_weights=None, resident=None):
     """Contract phases exp(-t*(energy-reference)) with energy windows, identity masks and signed weights.
 
     ``unfold=False`` returns the :class:`ParentGreen` pair instead of the
@@ -372,6 +418,8 @@ def build_G_tau(psi_xn, psi_yr, enk, t, *, e_ref=0.0, mask=None,
     builds an antiunitary partner as the conjugate-face GEMM with no device
     predicate, so a node loop does not stop on a host-read conditional; at a
     node whose phases are real that GEMM equals ``conj(G)``.
+    ``resident``: :func:`green_resident_panels` of ``(psi_xn, psi_yr)``, gathered
+    once by a τ loop (``unfold=False`` builds only).
     """
     if real_weights is None:
         real_weights = not jnp.issubdtype(jnp.result_type(t), jnp.complexfloating)
@@ -404,7 +452,10 @@ def build_G_tau(psi_xn, psi_yr, enk, t, *, e_ref=0.0, mask=None,
         return build_G_parents(
             psi_xn, psi_yr, phases=phases, layout=layout, gemm=gemm,
             k_unfold_plan=k_unfold_plan, real_weights=real_weights,
-            band_range=band_range, prepared_active_gemm=prepared_active_gemm)
+            band_range=band_range, prepared_active_gemm=prepared_active_gemm,
+            resident=resident)
+    if resident is not None:
+        raise ValueError("build_G_tau: resident panels serve the parent builds (unfold=False)")
     return build_G(
         psi_xn, psi_yr, phases=phases, layout=layout, gemm=gemm,
         k_unfold_plan=k_unfold_plan, right_k_unfold_plan=right_k_unfold_plan,
@@ -473,7 +524,8 @@ def sigma_spin_block(*, n_parent, n_rmu, ns, n_full, n_band, mesh, partner_tiles
     it (1 when the antiunitary partner is its own GEMM, 0 when it is read as conj(G)),
     the widest stored x block ``T_p·xn·bx/μ_x`` (``(d/ns)²`` of it up to a row per slab
     piece, :func:`sigma_row_blocks`), the full-k W(τ) out of the k-convolution
-    ``16·N_k·μ²/P``, and the panels of the Green and partner builds ``2·M_axis``.  The
+    ``16·N_k·μ²/P``, the panels of the Green and partner builds ``2·M_axis``, and the
+    Green's τ-invariant panels a τ loop holds (:func:`green_resident_bytes`).  The
     largest ``d`` whose set fits the stage room (:func:`_green_stage_room`) wins, else 1.
     Every process computes the same ``d``.
     """
@@ -488,8 +540,10 @@ def sigma_spin_block(*, n_parent, n_rmu, ns, n_full, n_band, mesh, partner_tiles
     def frac(d):
         b = sigma_row_blocks(n_rmu=n_rmu, ns=ns, d=d, mesh=mesh)[0]
         return 1.0 if b is None else b[1] * b[3] / mx
+    resident = float(green_resident_bytes(n_parent=n_parent, n_rmu=n_rmu, ns=ns,
+                                          n_band=n_band, n_full=n_full, mesh=mesh))
     new = lambda d: ((1.0 + float(partner_tiles) + frac(d)) * tile + w_tau
-                     + (1.0 + float(partner_tiles)) * panels)
+                     + (1.0 + float(partner_tiles)) * panels + resident)
     divisors = sorted((d for d in range(1, int(ns) + 1) if int(ns) % d == 0), reverse=True)
     d = next((d for d in divisors if new(d) <= room), 1)
     if new(d) > room:

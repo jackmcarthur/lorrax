@@ -195,6 +195,25 @@ def get_sigma_spatial_kernel(
 _NO_BRACKETS = None
 
 
+class SigmaKij:
+    """The τ contraction ``sigma_kij(..., resident=None)`` and its loop-invariant half.
+
+    ``resident_panels(psi_coh_xn, psi_coh_yr)`` gathers the Green's first SUMMA
+    panels once (:func:`gw.greens_function_kernel.green_resident_panels`); a τ
+    loop passes the result as ``resident`` to every node, so each node's Green
+    build exchanges only the remaining panels.  Σ is the same bit for bit.
+    """
+
+    def __init__(self, kernel, resident_panels):
+        self._kernel, self.resident_panels = kernel, resident_panels
+
+    def __call__(self, *args, **kwargs):
+        return self._kernel(*args, **kwargs)
+
+    def lower(self, *args, **kwargs):
+        return self._kernel.lower(*args, **kwargs)
+
+
 def _get_sigma_kij_kernel(
     *, mesh_xy: Mesh, kgrid: tuple[int, int, int], merged_x: bool = True,
     brackets: tuple[tuple[int, int], ...] | None = _NO_BRACKETS,
@@ -246,11 +265,11 @@ def _get_sigma_kij_kernel(
                        nq=k_unfold_plan.n_parent, dtype=jnp.complex128, layout=layout,
                        enable_active_range=True, warmup=False)
 
-    def _g_from_selector(xn, yr, E, sel, E_min, E_max, ref, t, band_range=None):
+    def _g_from_selector(xn, yr, E, sel, E_min, E_max, ref, t, band_range=None, resident=None):
         """Apply boolean identity masks or signed occupation weights without clipping."""
         options = dict(e_ref=ref, layout=layout, gemm=g_plan,
                        k_unfold_plan=k_unfold_plan, band_range=band_range,
-                       trim_zero_bands=True, unfold=False)
+                       trim_zero_bands=True, unfold=False, resident=resident)
         options["mask" if sel.dtype == jnp.bool_ else "band_weight"] = sel
         if energy_windows:
             options.update(E_min=E_min, E_max=E_max)
@@ -258,7 +277,7 @@ def _get_sigma_kij_kernel(
 
     def _bracketed_face(psi_coh_xn, psi_coh_yr, psi_proj_xr, psi_proj_yn,
                         E_A, mask_A, E_min, E_max, E_ref_A, t_node,
-                        W_prep, build_g, conv):
+                        W_prep, build_g, conv, resident=None):
         """Mask each bracket on the last band axis while retaining one Green tile at a time.
 
         A bracket whose selector has no nonzero band builds an identically zero
@@ -281,7 +300,7 @@ def _get_sigma_kij_kernel(
             def live(_):
                 G_k = build_g(psi_coh_xn, psi_coh_yr, E_A, mask_bracket,
                              E_min, E_max, E_ref_A, t_node,
-                             band_range=(lo, hi))
+                             band_range=(lo, hi), resident=resident)
                 return conv(psi_proj_xr, psi_proj_yn, G_k, W_prep)
 
             shape = jax.eval_shape(live, None)
@@ -302,6 +321,7 @@ def _get_sigma_kij_kernel(
     def _kernel_impl(
         psi_coh_xn, psi_coh_yr, psi_proj_xr, psi_proj_yn,
         E_A, mask_A, E_min, E_max, E_ref_A, t_node, W_q, W_pt=None, load=None,
+        resident=None,
     ):
         # ONE W preparation per τ, ABOVE the bracket loop.  Explicit, not
         # left to CSE: on the decomposed chain this is ``ifftn(W)``, the
@@ -309,13 +329,13 @@ def _get_sigma_kij_kernel(
         W_prep = prep_w(W_q, W_pt, load)
         if brackets is None:
             G_k = _g_from_selector(psi_coh_xn, psi_coh_yr, E_A, mask_A,
-                                   E_min, E_max, E_ref_A, t_node)
+                                   E_min, E_max, E_ref_A, t_node, resident=resident)
             return spatial.conv_project(
                 psi_proj_xr, psi_proj_yn, G_k, W_prep)
         return _bracketed_face(
             psi_coh_xn, psi_coh_yr, psi_proj_xr, psi_proj_yn,
             E_A, mask_A, E_min, E_max, E_ref_A, t_node, W_prep,
-            _g_from_selector, spatial.conv_project)
+            _g_from_selector, spatial.conv_project, resident)
 
     if energy_windows:
         kernel = partial(jax.jit, donate_argnums=(10,))(_kernel_impl)
@@ -323,12 +343,19 @@ def _get_sigma_kij_kernel(
         @partial(jax.jit, donate_argnums=(8,))
         def kernel(
             psi_coh_xn, psi_coh_yr, psi_proj_xr, psi_proj_yn,
-            E_A, mask_A, E_ref_A, t_node, W_q, W_pt=None, load=None,
+            E_A, mask_A, E_ref_A, t_node, W_q, W_pt=None, load=None, resident=None,
         ):
             return _kernel_impl(
                 psi_coh_xn, psi_coh_yr, psi_proj_xr, psi_proj_yn,
-                E_A, mask_A, None, None, E_ref_A, t_node, W_q, W_pt, load)
+                E_A, mask_A, None, None, E_ref_A, t_node, W_q, W_pt, load, resident)
 
+    from .greens_function_kernel import green_resident_panels
+
+    def resident_panels(psi_coh_xn, psi_coh_yr):
+        return green_resident_panels(psi_coh_xn, psi_coh_yr, gemm=g_plan,
+                                     mesh=k_unfold_plan.mesh_xy, n_full=k_unfold_plan.n_full)
+
+    kernel = SigmaKij(kernel, resident_panels)
     _sigma_kij_kernel_cache[key] = kernel
     return kernel
 
@@ -434,10 +461,10 @@ def get_shared_sigma_tau_kernel(
         return jax.lax.with_sharding_constraint(W_t, q_mu_sharding)
 
     @jax.jit
-    def _tau(
+    def _tau_jit(
         psi_coh_xn, psi_coh_yr, psi_proj_xr, psi_proj_yn,
         E_A, mask_A, B_poles, Omega_poles, pole_indices, bounds,
-        phase_real, E_ref_A, E_ref_B, t_node, active_count=None,
+        phase_real, E_ref_A, E_ref_B, t_node, active_count=None, resident=None,
     ):
         B_poles, load = _wedge_residues(B_poles)
         W_t = _build(B_poles, Omega_poles, pole_indices, bounds,
@@ -447,7 +474,15 @@ def get_shared_sigma_tau_kernel(
                 if partner_needed else None)
         return sigma_kij(
             psi_coh_xn, psi_coh_yr, psi_proj_xr, psi_proj_yn,
-            E_A, mask_A, E_ref_A, t_node, W_t, W_pt, load)
+            E_A, mask_A, E_ref_A, t_node, W_t, W_pt, load, resident=resident)
+
+    def _tau(*args, **kwargs):
+        return _tau_jit(*args, **kwargs)
+    resident = getattr(sigma_kij, "resident_panels", None)
+    if resident is not None:
+        # The window runner gathers these once per window (ppm_accumulators).
+        _tau.loop_invariants = lambda psi_coh_xn, psi_coh_yr, *_rest: resident(
+            psi_coh_xn, psi_coh_yr)
 
     # Never publish a kernel built around a caller's spatial kernel.
     if _sigma_kij is None:

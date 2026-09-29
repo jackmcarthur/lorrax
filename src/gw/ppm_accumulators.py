@@ -58,10 +58,20 @@ def _device_window_runner(tau_kernel, sharding, omega_axis, antihermitian):
     and one compile.  The node loop runs ``n_active`` iterations; nothing
     returns to the host between nodes.  An anti-Hermitian window sums its
     one-sided ``Z`` first and adds ``(Z - Z†)/(2i)`` once.
+
+    A kernel with ``loop_invariants(*tau_arguments)`` (the Green's τ-invariant
+    SUMMA panels, :class:`gw.ppm_tau_kernel.SigmaKij`) has them built once here,
+    before the node loop, and receives them as its last argument at every node:
+    no node re-exchanges them.  They are live for the whole loop, so the
+    compiled executable's peak (the caller's admission) counts them.
     """
+    invariants = getattr(tau_kernel, "loop_invariants", None)
+
     def run(total, tau_arguments, t_nodes, coeff, n_active, active_count):
+        extra = () if invariants is None else (invariants(*tau_arguments),)
+
         def one(i, acc):
-            sigma = tau_kernel(*tau_arguments, t_nodes[i], active_count)
+            sigma = tau_kernel(*tau_arguments, t_nodes[i], active_count, *extra)
             return _omega_fold(acc, sigma, coeff[i], omega_axis)
 
         if not antihermitian:

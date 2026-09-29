@@ -12,7 +12,8 @@ from ._shard_map import shard_map
 from .resolve import mesh_platform
 
 
-def panel_matmul(a, b, *, mesh, panel_bytes, bounds=None, weights=None, partner=False):
+def panel_matmul(a, b, *, mesh, panel_bytes, bounds=None, weights=None, partner=False,
+                 resident=None):
     """Multiply face matrices by a batched 2-D SUMMA over bounded contraction panels.
 
     Parameters
@@ -44,6 +45,14 @@ def panel_matmul(a, b, *, mesh, panel_bytes, bounds=None, weights=None, partner=
         product ``conj(a)·diag(w)·conj(b)`` from the SAME panel exchange,
         each gathered panel conjugated before its own local GEMM (no
         conjugated copy of a tile).  Returns the pair.
+    resident : tuple, optional
+        :func:`panel_resident` of the same ``a``, ``b`` and ``panel_bytes``:
+        its first panels are taken as already gathered and only the rest are
+        exchanged.  ``weights`` then scale every gathered panel of ``a``
+        before its local GEMM (as ``partner`` does), so the exchanged panels
+        are weight-free.  With ``partner`` or without weights the product is
+        the same bit for bit; a single weight row moves it at round-off (the
+        scaling runs after the gather instead of before).
 
     Returns
     -------
@@ -86,13 +95,13 @@ def panel_matmul(a, b, *, mesh, panel_bytes, bounds=None, weights=None, partner=
         # live panels (the one multiplied and the one prefetched) never hold
         # a band-complete row or column.  A kl with no such divisor ends in
         # one narrower panel.
-        kl = k // px
-        cap = max(1, min(limit // (2 * px), kl // px if px > 1 else kl))
-        n_panel = -(-kl // cap)
-        width = -(-kl // n_panel)
+        width = _interleaved_width(px, k, limit)
+        n_res = 0 if resident is None else int(resident[0].shape[0])
+        if n_res and tuple(resident[0].shape[1:]) != (q, m, px * width):
+            raise ValueError('panel_matmul: resident panels of another operand or budget')
         kernel = _interleaved_kernel(mesh, q, m, k, n, width, bounds is not None,
-                                     weights is not None, bool(partner))
-        args = (a, b)
+                                     weights is not None, bool(partner), n_res)
+        args = (a, b) + (tuple(resident) if n_res else ())
         if bounds is not None:
             args += (jnp.asarray(bounds, jnp.int32).reshape(q, 2),)
         if weights is not None:
@@ -107,6 +116,76 @@ def panel_matmul(a, b, *, mesh, panel_bytes, bounds=None, weights=None, partner=
     while common % width:
         width -= 1
     return _kernel(mesh, q, m, k, n, width, sample_axis)(a, b)
+
+
+def _interleaved_width(p, k, limit):
+    """The interleaved SUMMA panel width: ``p·width ≤ K/p`` columns per panel (one
+    owner block), two live panels within ``limit`` columns; a ``K/p`` with no such
+    divisor ends in one narrower panel (``panel_matmul``'s square-mesh route)."""
+    kl = k // p
+    cap = max(1, min(limit // (2 * p), kl // p if p > 1 else kl))
+    n_panel = -(-kl // cap)
+    return -(-kl // n_panel)
+
+
+def _resident_count(p, k, width):
+    """Panels :func:`panel_resident` may hold: at most two, at most half of every owner block."""
+    return min(2, (k // p) // (2 * width))
+
+
+def panel_resident(a, b, *, mesh, panel_bytes):
+    """The first SUMMA panels of ``panel_matmul(a, b)``, gathered once, for a caller
+    that multiplies the same ``a`` and ``b`` under many weight rows.
+
+    A caller whose weights change and whose ``a``, ``b`` do not (a Green function
+    at many times, ``ψ·diag(w(τ))·ψ†``) exchanges the same panels at every call.
+    Holding the first ``R = min(2, ⌊K/(2·p·width)⌋)`` of them removes their
+    exchange from every later call.  At most half the contraction columns are
+    resident (``R·p·width ≤ K/2``), so no rank holds a band-complete copy, and a
+    product of one panel holds none.  Returns ``None`` when nothing may be
+    resident (``R = 0``, a non-square mesh, 4-D ``b``), else ``(left, right)``:
+    ``(R, q, m, p·width)`` at ``P(None,None,'x',None)`` and ``(R, q, p·width, n)``
+    at ``P(None,None,None,'y')``, per rank :func:`panel_resident_bytes`.
+    """
+    px, py = int(mesh.shape['x']), int(mesh.shape['y'])
+    if px != py or a.ndim != 3 or b.ndim != 3:
+        return None
+    q, m, k = a.shape
+    n = b.shape[-1]
+    per_column = a.dtype.itemsize * q * (m // px + n // py)
+    width = _interleaved_width(px, k, int(panel_bytes) // per_column)
+    n_res = _resident_count(px, k, width)
+    if n_res < 1:
+        return None
+    return _resident_kernel(mesh, q, m, k, n, width, n_res)(a, b)
+
+
+def panel_resident_bytes(*, q, m, k, n, mesh, panel_bytes, itemsize=16):
+    """Per-rank bytes :func:`panel_resident` holds for these extents (0 when none)."""
+    px, py = int(mesh.shape['x']), int(mesh.shape['y'])
+    if px != py:
+        return 0
+    per_column = int(itemsize) * int(q) * (int(m) // px + int(n) // py)
+    width = _interleaved_width(px, int(k), int(panel_bytes) // per_column)
+    return _resident_count(px, int(k), width) * per_column * px * width
+
+
+@lru_cache(maxsize=16)
+def _resident_kernel(mesh, q, m, k, n, width, n_res):
+    """All-gather panels ``0 … n_res-1`` exactly as ``_interleaved_kernel``'s gather does, weight-free."""
+    def local(a, b):
+        left = [lax.all_gather(lax.dynamic_slice_in_dim(a, j * width, width, axis=2),
+                               'y', axis=2, tiled=True) for j in range(n_res)]
+        right = [lax.all_gather(lax.dynamic_slice_in_dim(b, j * width, width, axis=1),
+                                'x', axis=1, tiled=True) for j in range(n_res)]
+        return jnp.stack(left), jnp.stack(right)
+
+    specs = (P(None, None, 'x', None), P(None, None, None, 'y'))
+    kernel = shard_map(local, mesh=mesh, in_specs=(P(None, 'x', 'y'),) * 2,
+                       out_specs=specs, check_vma=False)
+    face = NamedSharding(mesh, P(None, 'x', 'y'))
+    return jax.jit(kernel, in_shardings=(face, face),
+                   out_shardings=tuple(NamedSharding(mesh, sp) for sp in specs))
 
 
 def _panel_contraction(mesh):
@@ -172,7 +251,8 @@ def _kernel(mesh, q, m, k, n, width, sample_axis):
 
 
 @lru_cache(maxsize=64)
-def _interleaved_kernel(mesh, q, m, k, n, width, active=False, weighted=False, partner=False):
+def _interleaved_kernel(mesh, q, m, k, n, width, active=False, weighted=False, partner=False,
+                        n_res=0):
     """Batched SUMMA on a square mesh: K streamed in interleaved panels, one prefetched.
 
     Rank ``(x, y)`` holds the K block ``[y·K/p, (y+1)·K/p)`` of A and
@@ -190,17 +270,26 @@ def _interleaved_kernel(mesh, q, m, k, n, width, active=False, weighted=False, p
     each panel's local slice of A before its all-gather.  ``partner``: the
     raw panels are gathered and each product gets its own weighted (and, for
     the partner, conjugated) panel copy; two accumulators, no tile copy.
+    ``n_res``: panels ``0 … n_res-1`` arrive gathered (:func:`panel_resident`;
+    ``n_res ≤ 2``, the two panels gathered before the streamed loop), and the
+    weights scale every gathered panel, as for ``partner``.
     """
     p = int(mesh.shape['x'])
     kl = k // p
     n_full, rest = divmod(kl, width)
     contract = _panel_contraction(mesh) if active else None
     owner = np.arange(p, dtype=np.int32)[None, :]
+    post = weighted and (partner or n_res > 0)   # weights scale the gathered panel
+    if n_res > min(2, n_full):
+        raise ValueError('_interleaved_kernel: resident panels must be full panels gathered '
+                         'before the streamed loop')
 
-    def body(a, b, bounds, weights):
-        def gather(off, wd):
+    def body(a, b, bounds, weights, res_left=None, res_right=None):
+        def gather(off, wd, idx=None):
+            if idx is not None and idx < n_res:
+                return res_left[idx], res_right[idx]
             left = lax.dynamic_slice_in_dim(a, off, wd, axis=2)
-            if weighted and not partner:
+            if weighted and not post:
                 start = lax.axis_index('y') * kl + off
                 left = left * lax.dynamic_slice_in_dim(weights, start, wd, axis=1)[:, None, :]
             right = lax.dynamic_slice_in_dim(b, off, wd, axis=1)
@@ -223,6 +312,9 @@ def _interleaved_kernel(mesh, q, m, k, n, width, active=False, weighted=False, p
                 wc = (jnp.take(weights, cols, axis=1)[:, None, :] if weighted
                       else jnp.ones((), left.dtype))
                 pairs = ((left * wc, right), (jnp.conj(left) * wc, jnp.conj(right)))
+            elif post:
+                cols = (owner.T * kl + off + jnp.arange(wd)[None, :]).reshape(-1)
+                pairs = ((left * jnp.take(weights, cols, axis=1)[:, None, :], right),)
             else:
                 pairs = ((left, right),)
             outs = []
@@ -234,10 +326,10 @@ def _interleaved_kernel(mesh, q, m, k, n, width, active=False, weighted=False, p
                     outs.append(lhs @ rhs if c is None else c + lhs @ rhs)
             return tuple(outs)
 
-        cur = gather(0, width)
+        cur = gather(0, width, 0)
         cs = None
         if n_full >= 2:
-            nxt = gather(width, width)
+            nxt = gather(width, width, 1)
             cs = product(None, cur, 0, width)
 
             def step(carry, j):
@@ -256,13 +348,19 @@ def _interleaved_kernel(mesh, q, m, k, n, width, active=False, weighted=False, p
     rep = NamedSharding(mesh, P())
     extra = (('bounds',) if active else ()) + (('weights',) if weighted else ())
 
+    res_specs = (P(None, None, 'x', None), P(None, None, None, 'y')) if n_res else ()
+
     def local(a, b, *rest_args):
+        res, rest_args = rest_args[:len(res_specs)], rest_args[len(res_specs):]
         named = dict(zip(extra, rest_args))
-        return body(a, b, named.get('bounds'), named.get('weights'))
+        return body(a, b, named.get('bounds'), named.get('weights'), *res)
 
     n_out = 2 if partner else 1
     out = (P(None, 'x', 'y'),) * 2 if partner else P(None, 'x', 'y')
-    kernel = shard_map(local, mesh=mesh, in_specs=(P(None, 'x', 'y'),) * 2 + (P(),) * len(extra),
+    kernel = shard_map(local, mesh=mesh,
+                       in_specs=(P(None, 'x', 'y'),) * 2 + res_specs + (P(),) * len(extra),
                        out_specs=out, check_vma=False)
-    return jax.jit(kernel, in_shardings=(face, face) + (rep,) * len(extra),
+    return jax.jit(kernel, in_shardings=((face, face)
+                                         + tuple(NamedSharding(mesh, sp) for sp in res_specs)
+                                         + (rep,) * len(extra)),
                    out_shardings=(face,) * n_out if partner else face)
