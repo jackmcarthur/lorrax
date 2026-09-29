@@ -42,6 +42,8 @@ def face_green_product(A, B, mesh, phases, band_range, n_full=None):
         # outside it are zero, so skipping them is the same product.
         hi = jnp.clip(hi, 0, nb)
         bounds = jnp.stack([jnp.clip(lo, 0, hi), hi], axis=1)
+        if weight.ndim == 3:
+            bounds = jnp.broadcast_to(bounds, (weight.shape[0], nq, 2))
     tile_bytes = green_panel_bytes(n_rows=int(n_full or nq), m=m, n=n, mesh=mesh)
     return panel_matmul(A, B, mesh=mesh, panel_bytes=tile_bytes, bounds=bounds, weights=weight)
 
@@ -61,11 +63,13 @@ def green_panel_bytes(*, n_rows, m, n, mesh, room=None):
 
 
 def _build_G_face(psi_mun, psi_nmu, *, gemm, Gij=None, phases=None, mesh=None,
-                  band_range=None, prepared_active_gemm=None, n_full=None):
+                  band_range=None, prepared_active_gemm=None, n_full=None, pair=False):
     """Contract band-replicated faces locally or band-distributed faces with their GEMM plan.
 
     Returns the Green ``(nk, mu_X, s, nu_Y, s')``: centroid-major, the
-    GEMM's own merged endpoint order split by a reshape.
+    GEMM's own merged endpoint order split by a reshape.  ``pair`` (face
+    route only): also the conjugate-face partner ``conj(ψ)·diag(w)·conj(ψ)† =
+    conj(A·diag(w*)·B)``, the second weighting of the SAME panel exchange.
     """
     if Gij is not None:
         raise NotImplementedError("Green faces support diagonal band weights, not dense Gij.")
@@ -100,6 +104,12 @@ def _build_G_face(psi_mun, psi_nmu, *, gemm, Gij=None, phases=None, mesh=None,
         G_flat = prepared_active_gemm(A, B, weights=phases)
     elif face:
         # The phases scale each panel's slice of A on its way into the gather.
+        if pair:
+            G_flat, partner = face_green_product(
+                A, B, gemm.mesh, jnp.stack([phases, jnp.conj(phases)]), band_range,
+                n_full=n_full)
+            return (G_flat.reshape(nk_, mu_l_, s_, mu_r_, s_),
+                    jnp.conj(partner).reshape(nk_, mu_l_, s_, mu_r_, s_))
         G_flat = face_green_product(A, B, gemm.mesh, phases, band_range, n_full=n_full)
     else:
         G_flat = (gemm(A, B) if band_range is None
@@ -147,13 +157,25 @@ def build_G_parents(psi_xn, psi_yr, *, Gij=None, phases=None, layout='face', gem
         raise ValueError("build_G requires canonical faces with layout=face or axis.")
     if gemm is None:
         raise ValueError("build_G requires a GEMM plan or typed parent plan-provided GEMM callable.")
+    antiunitary = bool(np.any(np.asarray(k_unfold_plan.sym_idx) >= k_unfold_plan.n_sym_spatial))
+    if (antiunitary and getattr(gemm, "backend", "local") != "local"
+            and prepared_active_gemm is None and Gij is None and phases is not None
+            and real_weights is not True
+            and jnp.issubdtype(phases.dtype, jnp.complexfloating)):
+        # The face route builds G and its conjugate-face partner from ONE panel
+        # exchange (two weightings, w and w*); at real phases the partner is
+        # conj(G) exactly, so no device predicate is needed.
+        G, transposed = _build_G_face(psi_xn, psi_yr, gemm=gemm, phases=phases,
+                                      mesh=k_unfold_plan.mesh_xy, band_range=band_range,
+                                      n_full=k_unfold_plan.n_full, pair=True)
+        return ParentGreen(G, transposed)
     G = _build_G_face(psi_xn, psi_yr, gemm=gemm, Gij=Gij, phases=phases,
                       mesh=k_unfold_plan.mesh_xy,
                       band_range=band_range,
                       prepared_active_gemm=prepared_active_gemm,
                       n_full=k_unfold_plan.n_full)
     transposed = None
-    if np.any(np.asarray(k_unfold_plan.sym_idx) >= k_unfold_plan.n_sym_spatial):
+    if antiunitary:
         if (real_weights is True or phases is None
                 or not jnp.issubdtype(phases.dtype, jnp.complexfloating)):
             return ParentGreen(G, None, conj_partner=True)
