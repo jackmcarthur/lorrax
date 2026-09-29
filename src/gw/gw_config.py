@@ -2617,6 +2617,7 @@ def _input_iteration(
             params["sc_exact_degeneracy_tol_ev"]),
         frozen_core_bands=int(params["sc_frozen_core_bands"]),
         semicore=str(params["sc_semicore"]).strip().lower(),
+        semicore_explicit="sc_semicore" in frozenset(params.get(_DECK_NAMED_KEYS, ())),
         eigh=_linalg.sc_eigh,
         head_update=str(params["sc_head_update"]).strip().lower(),
         initial_qp_rotations_file=(
@@ -4385,6 +4386,9 @@ class SCConfig:
     #: "qp" | "dft": the coarse (semicore) class moves with its own Sigma, or
     #: its DFT-basis block stays DFT and it reads Sigma at E_DFT (mixing kept).
     semicore: str = "dft"
+    #: The deck named ``sc_semicore``: only then does ``dft`` without a coarse
+    #: class refuse (``GATE sc_semicore``); the default is a no-op there.
+    semicore_explicit: bool = False
     eigh: str = "auto"    # "auto" | "native" | "distributed"
     #: "off" | "parallel_transport" | "dft_velocity" | "interband_commutator".
     #: Every non-off mode rebuilds the head. Only ``dft_velocity`` with an

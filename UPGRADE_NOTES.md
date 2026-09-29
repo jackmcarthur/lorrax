@@ -12,8 +12,10 @@ held coarse windows ([self-consistency §2](docs/self_consistency.md#2-band-trea
 Fe 4³ and MoS2 3×3 prot at η_semi 5 and 8 eV: same maps to converge (14, 8),
 equal or fewer τ pairs (MoS2 333 → 321), semicore QP within 27 meV of DFT
 (qp: 0.1–6 eV deeper), and the protected states' η_semi 8 − 5 spread falls
-3–6× (E_F ± 10 eV std Fe 5.1 → 1.4, MoS2 5.0 → 0.8 meV). A run without a
-coarse class refuses (`GATE sc_semicore`). Sandbox claim 2964.
+3–6× (E_F ± 10 eV std Fe 5.1 → 1.4, MoS2 5.0 → 0.8 meV). The default is a
+no-op on a run without a coarse class (static modes, sector routes, an `nval`
+that covers every occupied band); naming `sc_semicore = dft` on such a run
+refuses (`GATE sc_semicore`). Sandbox claim 2964.
 
 ## 2026-09-29 — coarse (semicore) windows certified at ε 3e-3
 
