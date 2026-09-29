@@ -13,6 +13,7 @@ from common.units import RYD_TO_EV
 from gw.mpa.sigma import _batch_rows
 from gw.mpa.sigma_windows import sigma_pole_edges
 from gw.ppm_windows import _SigmaBranch
+from gw.qp_support import SEMICORE_EPS
 from gw.sigma_box_plan import (
     _box_for_window,
     _sc_padded_box_spec,
@@ -136,11 +137,11 @@ def test_three_product_partition_uses_raw_tuple_boxes(monkeypatch):
     np.testing.assert_array_equal(plan[2].pole_indices, [1])
 
 
-def test_a_coarse_window_splits_only_crossing_windows_at_its_eta_and_the_plan_eps(monkeypatch):
+def test_a_coarse_window_splits_only_crossing_windows_at_its_eta_and_the_coarse_eps(monkeypatch):
     """The SC coarse (semicore) windows (gw.qp_support): coarse samples split
     off a crossing window into their own box, rule and executor weights at
-    their eta and the plan's eps; sign-definite windows serve every frequency
-    at the plan's eta."""
+    their eta and max(plan eps, SEMICORE_EPS); sign-definite windows serve
+    every frequency at the plan's eta and eps."""
     plan, geometry = _plan(monkeypatch, omega_eta_ry=np.asarray([0.1, 0.3]),
                            omega_group=np.asarray([-1, 0]), group_fixed=(False,))
     names = [row.window.name for row in plan]
@@ -152,7 +153,10 @@ def test_a_coarse_window_splits_only_crossing_windows_at_its_eta_and_the_plan_ep
     ]
     report = {row["name"]: row for row in geometry["branches"][0]["windows"]}
     split = report["positive conduction:resonant@eta4.08g0-0"]
-    assert split["eta_ry"] == 0.3 and split["eps"] == 1.0e-4
+    assert split["eta_ry"] == 0.3 and split["eps"] == max(1.0e-4, SEMICORE_EPS)
+    assert split["sup_error"] <= split["eps"]
+    assert report["positive conduction:resonant"]["eps"] == 1.0e-4
+    assert report["positive conduction:state_tail"]["eps"] == 1.0e-4
     np.testing.assert_array_equal(plan[0].omega_idx, [0])
     np.testing.assert_array_equal(plan[1].omega_idx, [1])
     np.testing.assert_array_equal(plan[3].omega_idx, [0, 1])
@@ -179,6 +183,14 @@ def test_coarse_windows_are_grouped_by_the_least_closed_form_node_count(monkeypa
     assert row["coarse_windows"] == 3
     assert row["chosen_law"] <= min(row["one_window_law"], row["per_window_law"])
     assert [g for run in row["runs"] for g in run] == [0, 1, 2]
+    # The law is evaluated on the box each run is built on (the request
+    # widened and snapped), at the coarse eps, not on the request box.
+    from gw.sigma_box_plan import _build_box
+    coarse = [w for w in geometry["branches"][0]["windows"] if "@eta" in w["name"]]
+    assert coarse and all(w["eps"] == max(1.0e-4, SEMICORE_EPS) for w in coarse)
+    assert row["chosen_law"] == sum(
+        _law_node_count(_build_box(tuple(w["box_ry"]), w["eta_ry"], widen=True), w["eps"])
+        for w in coarse)
     _, again = _plan(monkeypatch, branch=branch, summaries=_summaries([branch]),
                      omega_eta_ry=np.asarray([0.1, 0.3, 0.3, 0.3]),
                      omega_group=group, group_fixed=(False, False, False))

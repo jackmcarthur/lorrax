@@ -44,6 +44,7 @@ from common.collectives import (all_gather_processes, gather_to_host,
 from common.units import RYD_TO_EV
 from gw.minimax_screening import MinimaxNodes
 from gw.mpa.sigma_windows import SharedSigmaWindow, sigma_pole_edges
+from gw.qp_support import SEMICORE_EPS
 from gw.ppm_windows import _SigmaWindow
 from minimax import (
     analytic_box_rule,
@@ -675,7 +676,7 @@ def _serve_from_plan(specs, fits, eps):
     served = []
     for spec, own in zip(specs, fits):
         chosen = own
-        spec_eps = eps
+        spec_eps = _spec_eps(spec, eps)
         if not own["analytic_line"]:
             box = spec["box"]
             relative = box[0] > 0.0 or box[1] < 0.0
@@ -707,6 +708,13 @@ def _spec_eta(spec, eta):
     """A window's own broadening (Ry): a coarse window carries ``eta_ry``
     (:func:`plan_sigma_windows` ``omega_eta_ry``), every other one the plan's."""
     return float(spec.get("eta_ry", eta))
+
+
+def _spec_eps(spec, eps):
+    """A window's own certificate tolerance: a coarse window carries ``eps``
+    (``qp_support.SEMICORE_EPS``, never tighter than the plan's), every other
+    one the plan's."""
+    return float(spec.get("eps", eps))
 
 
 def _fit_cost(spec, eta):
@@ -825,7 +833,7 @@ def fit_sigma_box_spec_groups(groups, eta_ry, *, eps, scope):
         raise ValueError("sigma_quadrature_eps must lie in (0, 1)")
     fits, fit_rows = _parallel_fits(
         rows, lambda index: _fit_rule(
-            rows[index], tolerance, scope,
+            rows[index], _spec_eps(rows[index], tolerance), scope,
             _spec_eta(rows[index], eta), build_widen=widen[index]),
         [_fit_cost(spec, _spec_eta(spec, eta)) for spec in rows])
     # Every rank has looked up by now (the gather above) and holds the same
@@ -1296,8 +1304,11 @@ def _coarse_runs(base_name, owned, positions, frequencies, omega_eta, omega_grp,
     keep the plan's eta.  On a crossing window the coarse windows are grouped
     into runs of adjacent automatic windows of one eta (a user window is a run
     of its own); the grouping minimizes the summed closed-form node count
-    (:func:`_law_node_count` of each run's box at ``eps``), fewer runs on a
-    tie.  At SC map 0 the choice is made and the held rule names carry it
+    (:func:`_law_node_count` of the box each run is built on, the request
+    widened and snapped by :func:`_build_box`, at the coarse ``eps``), fewer
+    runs on a tie.  On the build box the law is the certified count of 300 of
+    311 crossing windows in the 2026-09-28/29 receipts (runs/DEV 584-610); the
+    request box missed the 1 % widening, up to 37 nodes on a coarse window.  At SC map 0 the choice is made and the held rule names carry it
     later.  A sign-definite window serves everything at ``eta``.  O(G^2) laws.
     """
     grp = omega_grp[positions[owned]]
@@ -1321,7 +1332,7 @@ def _coarse_runs(base_name, owned, positions, frequencies, omega_eta, omega_grp,
         spec = make_sigma_box_spec(name=base_name, frequencies=frequencies[idx], states=states,
                                    pole_stats=pole_stats, pole_sign=pole_sign,
                                    eta_ry=eta_of[run[0]])
-        return _law_node_count(spec["box"], eps)
+        return _law_node_count(_build_box(spec["box"], eta_of[run[0]], widen=True), eps)
 
     if held is not None:
         runs = []
@@ -1445,8 +1456,8 @@ def plan_sigma_windows(
         ``omega_ry`` sample), coarse-window index (-1 = the near grid) and,
         per index, whether the window is a user's (``gw.qp_support``,
         the SC semicore class).  A crossing product window that owns coarse
-        samples serves them in their own windows at their own eta, at the
-        plan's eps: :func:`_coarse_runs` groups adjacent automatic windows of
+        samples serves them in their own windows at their own eta, at
+        ``max(eps, qp_support.SEMICORE_EPS)``: :func:`_coarse_runs` groups adjacent automatic windows of
         one eta so that the closed-form node count (:func:`_law_node_count`)
         is least; a user window is never grouped.  A sign-definite product
         window serves every frequency it owns at ``eta_ry`` (its node count
@@ -1518,6 +1529,7 @@ def plan_sigma_windows(
         if (omega_eta.shape != omega_grid.shape or not np.isfinite(omega_eta).all()
                 or np.any(omega_eta < eta * (1.0 - 1.0e-12))):
             raise ValueError("omega_eta_ry must give one finite eta >= eta_ry per frequency")
+    coarse_eps = max(tolerance, SEMICORE_EPS)
     omega_grp = (np.full(omega_grid.shape, -1, np.int64) if omega_group is None
                  else np.asarray(omega_group, dtype=np.int64).reshape(-1))
     fixed = tuple(bool(x) for x in (group_fixed or ()))
@@ -1558,7 +1570,7 @@ def plan_sigma_windows(
             base_name = f"{branch.tag}:{name}"
             pieces, split_report = _coarse_runs(
                 base_name, owned_all, positions, frequencies, omega_eta, omega_grp, fixed,
-                states, pole_stats, pole_sign, eta, tolerance, held_rules)
+                states, pole_stats, pole_sign, eta, coarse_eps, held_rules)
             if split_report is not None:
                 split_reports.append(split_report)
             for suffix, owned, eta_w in pieces:
@@ -1569,6 +1581,8 @@ def plan_sigma_windows(
                     pole_sign=pole_sign, eta_ry=eta_w)
                 if eta_w != eta:
                     spec["eta_ry"] = eta_w
+                if suffix:
+                    spec["eps"] = coarse_eps
                 if certificate_pole_summaries is not None:
                     _, union_stats = _pole_rows(certificate_pole_summaries, selector)
                     union = (make_sigma_box_spec(
@@ -1674,8 +1688,8 @@ def plan_sigma_windows(
             "node_digest": fit["node_digest"],
             "criterion": ("relative" if fit["relative"]
                           else "peak-relative"),
-            "sup_error": fit["sup_error"], "eps": tolerance,
-            "requested_eps": tolerance,
+            "sup_error": fit["sup_error"], "eps": _spec_eps(spec, tolerance),
+            "requested_eps": _spec_eps(spec, tolerance),
             "eta_ry": _spec_eta(spec, eta),
             "kappa_max": fit["kappa_max"],
             "roundoff_amplification": fit["roundoff_amplification"],

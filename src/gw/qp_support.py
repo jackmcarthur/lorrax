@@ -243,8 +243,13 @@ SEMICORE_PATCH_STEP_EV = 0.5 * SEMICORE_ETA_EV
 #: an automatic patch this far outside a user window), so the joined grid
 #: ascends strictly with no uncovered sliver.
 SEMICORE_PATCH_EDGE_EV = 1.0e-3
-# The patch windows are certified at the deck's sigma_quadrature_eps (owner's
-# one-eps rule, 2026-09-29); there is no patch tolerance of its own.
+#: Certificate tolerance of the coarse windows (peak-relative, never tighter
+#: than the deck's sigma_quadrature_eps; owner 2026-09-29: "maybe like 3e-3 for
+#: that error is a good place to start").  The crossing count falls with
+#: ln(1/eps): the Fe 4^3 coarse window takes 188 nodes at 3e-3 against 253 at
+#: 1e-4, MoS2 3x3 125 against 186 (closed-form law, eta 1 eV).  Its semicore QP
+#: bias and protected feedback are measured in claim (WINSPLIT).
+SEMICORE_EPS = 3.0e-3
 
 
 def _snap(lo, hi, step):

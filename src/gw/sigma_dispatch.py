@@ -1238,7 +1238,7 @@ def _compute_mpa_sigma(
         # THE COARSE (SEMICORE) WINDOWS (gw.qp_support): their samples sit in
         # the grid below the near support and are evaluated at their own eta,
         # in crossing rule windows grouped by the node law (sigma_box_plan),
-        # at the deck's sigma_quadrature_eps.
+        # at max(sigma_quadrature_eps, qp_support.SEMICORE_EPS).
         from .qp_support import assert_semicore_patch_route, window_labels
         assert_semicore_patch_route(patch, config.compute_mode, wfns_transverse)
         omega_ev = np.asarray(config.omega_grid_ev, dtype=np.float64)

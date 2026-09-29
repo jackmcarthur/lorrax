@@ -172,9 +172,12 @@ the near support is extended. `sigma_omega_patches_ev` triples `lo:hi:eta`
 own η instead (`GATE sigma_coarse_window` refuses a malformed, overlapping or
 sub-deck-η triple, or one without a coarse class). In the Σ plan the
 crossing windows that own coarse samples serve them at the window's η and
-the deck's `sigma_quadrature_eps` (one ε, owner 2026-09-26); adjacent
-automatic windows of one η share a rule window when that lowers the summed
-closed-form node count (`sigma_box_plan._coarse_runs`, decided at map 0 and
+max(`sigma_quadrature_eps`, `qp_support.SEMICORE_EPS` = 3e-3) (owner
+2026-09-29; against 1e-4 it moves states within E_F ± 10 eV by ≤ 0.06 meV
+at maps 0–1 and semicore QP by ≤ 4.3 meV at map 0, for 10–12 % fewer map
+pairs on MoS2 and Fe); adjacent automatic windows of one η share a rule
+window when that lowers the summed closed-form node count of the boxes the
+runs are built on (`sigma_box_plan._coarse_runs`, decided at map 0 and
 held); a user window is never grouped; sign-definite windows serve coarse
 samples at the deck η. At the deck η the Fe 3s $Z$ leaves $(0, 1]$ from map 1
 and the loop stalls; at 1 eV the coarse $Z$ stays inside except the Fe 3s at

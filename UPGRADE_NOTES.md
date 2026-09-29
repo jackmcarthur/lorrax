@@ -3,6 +3,17 @@
 User-visible changes, newest first. Binding rulings behind the breaking
 changes live in `docs/architecture/decisions.md`.
 
+## 2026-09-29 — coarse (semicore) windows certified at ε 3e-3
+
+Self-consistent decks with a coarse class move once. The coarse windows are
+certified at max(`sigma_quadrature_eps`, 3e-3) (`qp_support.SEMICORE_EPS`,
+owner 2026-09-29); every other Σ window keeps `sigma_quadrature_eps`. At
+η_semi 1 eV against ε 1e-4: map-2 τ pairs MoS2 3×3 530 → 465, Fe 4³ charge
+1087 → 982; states within E_F ± 10 eV move ≤ 0.06 meV at maps 0–1 (≤ 1.9 meV
+at map 2 of the unconverged Fe run); semicore QP ≤ 4.3 meV at map 0. The
+planner's node law for grouping coarse windows is now evaluated on the box
+each run is built on, so it equals the certified count (claim WINSPLIT).
+
 ## 2026-09-29 — the production QSGW partition: absolute band cut, semicore patch
 
 Every dynamic self-consistent deck (`qp_solver = self_consistent`, every
@@ -29,7 +40,7 @@ route) moves once. See [self-consistency §2](docs/self_consistency.md#2-band-tr
   coarse states are read at their own energy on held windows at η_semi = 1 eV
   (one per coarse manifold; the Σ plan groups them to the least closed-form
   node count) instead of at Σ(ω = 0) (below E_F − 15 eV) or on the near grid
-  at the deck η, certified at the deck's `sigma_quadrature_eps`.
+  at the deck η, certified at max(`sigma_quadrature_eps`, 3e-3).
   `sigma_omega_patches_ev` accepts `lo:hi:eta` triples as user coarse windows
   (`GATE sigma_coarse_window`). Sector (bispinor) routes keep the old rule.
 - **A new refusal.** `zeta_nband` below b3 now refuses on every run,

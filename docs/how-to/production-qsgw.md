@@ -126,9 +126,14 @@ claim 2952) holds the rest of the recipe. It is not on main.
   band. Both forms refuse by name. On MoS2 3×3 and Fe 4³ charge the two forms
   give identical results (claim 2952).
 - **Coarse windows.** Coarse states are read on held windows at η_semi = 1 eV,
-  one per coarse manifold, certified at the deck's `sigma_quadrature_eps`; the
-  Σ plan groups them to the least closed-form node count, which is one window
-  on both decks (MoS2 182 against 349 law nodes split, Fe 247 against 436).
+  one per coarse manifold, certified at max(`sigma_quadrature_eps`, 3e-3); the
+  Σ plan groups them to the least closed-form node count of the boxes it
+  builds, which is one window on both decks (MoS2 125 against 248 nodes
+  split, Fe 188 against 308; the law equals the certified count). A split
+  at a gap pays only when the deeper window's η can rise faster than its
+  depth: at equal feedback on E_F it needs q < (1 − r)²/(4r), r the depth
+  ratio shallow/deep and q the feedback slope ratio deep/shallow; measured
+  q is 0.69 (MoS2, needs < 0.58) and 0.54 (Fe, needs < 0.05) (claim WINSPLIT).
   `sigma_omega_patches_ev` takes `lo:hi:eta` user windows. Against the
   semicore-at-deck-η read at map 0: ±10 eV states 0.90 / 3.82 meV std / max
   (MoS2), 1.30 / 7.87 (Fe); MoS2 gap −0.36 meV (claim 2952).
