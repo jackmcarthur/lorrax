@@ -66,6 +66,7 @@ class CoarseClass(NamedTuple):
     """The coarse (semicore) read class of an SC run (:func:`semicore_floor`)."""
     coarse_floor_ev: float  # coarse: E < this (absolute eV; -inf = none)
     n_coarse: int           # coarse (k, state) on the loaded k set
+    mu_ev: float = float("nan")  # the DFT chemical potential it was drawn about (eV)
 
 
 def band_gaps_ev(energies_ev):
@@ -77,23 +78,19 @@ def band_gaps_ev(energies_ev):
     return e.max(axis=0)[:-1], e.min(axis=0)[1:]
 
 
-def manifold_closing_count(energies_ev, b3):
-    """None when bands [0, b3) end at an all-k band gap, else the smallest band
-    count n > b3 that does (max_k E[n-1] < min_k E[n]), or the loaded count.
+#: The sum-band tail law is fitted on the protected conduction states whose
+#: DFT energy lies within this fraction of (E_cmax - E_F) of E_cmax, E_cmax the
+#: top protected band's DFT maximum over k (owner 2026-09-29: "fit it only to
+#: whatever bands at some k come within 0.2*(Ecmax-Efermi) of Ecmax"; the
+#: states near the top, so the tail's bottom follows the matrix's top).
+TAIL_FIT_TOP_FRACTION = 0.2
 
-    Owner 2026-09-29: warn, do not refuse, when the QP matrix [b0, b3) ends
-    inside a band manifold -- its top bands then lose their mixing with the
-    manifold's rest, which is the scissored tail.
-    """
-    e = np.asarray(energies_ev, float)
-    nb = e.shape[1]
-    b3 = int(b3)
-    if b3 >= nb or e[:, b3 - 1].max() < e[:, b3].min():
-        return None
-    for n in range(b3 + 1, nb):
-        if e[:, n - 1].max() < e[:, n].min():
-            return n
-    return nb
+
+def tail_fit_states(e_dft_ev, e_cmax_ev, mu_ev):
+    """(k, n) mask of states whose DFT energy is within TAIL_FIT_TOP_FRACTION
+    (E_cmax - E_F) of E_cmax; DFT energies, so the set is fixed for the run."""
+    top = float(e_cmax_ev)
+    return np.asarray(e_dft_ev, float) >= top - TAIL_FIT_TOP_FRACTION * (top - float(mu_ev))
 
 
 def semicore_floor(energies_ev, *, n_below_k, nval, mu_ev, clip_ev, omega_min_rel_ev=None,
@@ -135,7 +132,7 @@ def semicore_floor(energies_ev, *, n_below_k, nval, mu_ev, clip_ev, omega_min_re
                 if gap_hi[n - 1] - gap_lo[n - 1] >= float(semicore_gap_ev)]
         floor = float(gap_hi[semi[-1] - 1]) if semi else -np.inf
     n_coarse = int(np.count_nonzero(e < floor))
-    return CoarseClass(floor if n_coarse else -np.inf, n_coarse)
+    return CoarseClass(floor if n_coarse else -np.inf, n_coarse, mu)
 
 
 def coarse_band_report(energies_ev, semicore_kn, *, mu_ev, band_offset=0):
