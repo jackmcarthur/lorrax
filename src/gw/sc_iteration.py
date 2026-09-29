@@ -2813,10 +2813,8 @@ def _record_semicore_z(inputs, iteration, z_kn, semicore_kn):
     """One receipt per map: semicore Z on the patch (the SC +-0.5 eV stencil).
 
     Owner question 2026-09-28: is the semicore Z pathological as eta_semi
-    shrinks?  Rank 0 also writes it to stderr (production stdout is
-    /dev/null).
+    shrinks?
     """
-    import sys
     z = np.asarray(z_kn, dtype=np.float64)
     mask = np.broadcast_to(np.asarray(semicore_kn, bool), z.shape)
     if not mask.any():
@@ -2829,8 +2827,6 @@ def _record_semicore_z(inputs, iteration, z_kn, semicore_kn):
             f"outside (0, 1]: {int(bad.sum())} (k,state)"
             + (f" in bands {bands}" if bands else ""))
     _record_sc(inputs, line)
-    if jax.process_index() == 0:
-        print(line, file=sys.stderr, flush=True)
 
 
 def _sc_active_identities(inputs):
