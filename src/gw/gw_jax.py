@@ -280,7 +280,8 @@ def _report_head_and_photon_policy(config, print0, report):
         elif uses_bare_transverse_shared_pole(config):
             report.progress(
                 "Photon route   : four-spinor CC full-frequency shared-pole "
-                "screening plus bare TT exchange; no CT/TT Dyson solve")
+                "screening plus bare TT exchange; no CT/TT Dyson solve "
+                "[theory: docs/theory/bispinor-gw.md#bare-transverse]")
         elif config.bispinor_gw.value == "full_static_cohsex":
             report.progress(
                 "Photon route   : packed screened static photon operator "
@@ -297,7 +298,8 @@ def _report_head_and_photon_policy(config, print0, report):
                    f"<D_TT>) -- {_bare_reason}"
                    if _bare_taken else
                    "incumbent charge-screened W + Sigma^B "
-                   f"(gw.sigma_x_bispinor) -- {_bare_reason}"))
+                   f"(gw.sigma_x_bispinor) -- {_bare_reason}")
+                + " [theory: docs/theory/bispinor-gw.md#bare-transverse]")
         if not uses_static_photon_response(config):
             _banner, _head_record = incumbent_bispinor_head_record(config)
             if _banner:

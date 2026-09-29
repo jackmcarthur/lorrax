@@ -54,9 +54,8 @@ $\langle m|\alpha\cdot A|n\rangle$ ([Direct Hartree field](hartree.md)).
 
 ### 1.1 Why the current blocks may be frozen at ω = 0 {#frozen-current-blocks}
 
-$\chi_{TT}$ enters $W$ at $\alpha_{FS}^2$. $\chi_{CT}$ enters at
-$\alpha_{FS}$ times a transverse–charge overlap that vanishes in Coulomb
-gauge as $q\to0$. The neglected $W_{AB}(\omega)-W_{AB}(0)$, $AB\neq CC$, is
+The $1/c$ order of each block and of its contribution to $\Sigma$ is
+[Bispinor GW §3](bispinor-gw.md#counting). The neglected $W_{AB}(\omega)-W_{AB}(0)$, $AB\neq CC$, is
 bounded by the static current screening $W_{AB}(0)-D_{AB}$. The
 Ward-subtracted no-pair current response is a positive-weight spectral
 integral on the imaginary axis, so $|\chi_{TT}(i\omega)|\le|\chi_{TT}(0)|$.
