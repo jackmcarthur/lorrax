@@ -83,6 +83,10 @@ from .wavefunction_bundle import (
 # Convergence: max|dE| over the NON-SCISSORED bands
 # ---------------------------------------------------------------------------
 
+#: A state moving more than this at the last map is named in the
+#: non-convergence block (owner 2026-09-29); fixed, not a deck key.
+NONCONVERGENCE_LARGE_MOVE_EV = 20.0e-3
+
 @dataclass(frozen=True)
 class ConvergenceVerdict:
     """One convergence decision, with the numbers it was made from.
@@ -111,6 +115,38 @@ class ConvergenceVerdict:
     #: discontinuous and the fixed point reached depends on the path.
     edge_ambiguous: int = 0
     edge_ambiguous_detail: str = ""
+    #: Median |dE| over ALL active states (every k, every band, scissored
+    #: included) -- the non-convergence block's headline number.
+    median_abs_all_ev: float = float("nan")
+    #: 0-based active columns where some k-state of the criterion set moved
+    #: by more than :data:`NONCONVERGENCE_LARGE_MOVE_EV`; and by at least
+    #: ``cutoff_ev``, i.e. failed the test.
+    bands_over_large_move: tuple[int, ...] = ()
+    bands_over_cutoff: tuple[int, ...] = ()
+
+    def nonconvergence_lines(self, *, band_offset: int,
+                             n_maps: int) -> tuple[str, ...]:
+        """The block printed when the SC budget ends without convergence.
+
+        Bands are 1-based DFT band indices (``band_offset`` = first active
+        band, 0-based); k is not listed.  The band lists cover the criterion
+        set only, so every band named under the cutoff is one that keeps
+        the run from converging.
+        """
+        def bands(cols):
+            mask = np.zeros(self.n_total, dtype=bool)
+            mask[list(cols)] = True
+            return _band_ranges(mask, band_offset=band_offset)
+        return (
+            f"  SC NOT CONVERGED: last map of {n_maps} GW map calls",
+            f"    median |dE| over all states = "
+            f"{self.median_abs_all_ev * 1e3:.4f} meV",
+            f"    non-scissored bands with a state moving > "
+            f"{NONCONVERGENCE_LARGE_MOVE_EV * 1e3:.0f} meV: "
+            f"{bands(self.bands_over_large_move)}",
+            f"    non-scissored bands with a state moving >= sc_tol_ev = "
+            f"{self.cutoff_ev * 1e3:.4g} meV: {bands(self.bands_over_cutoff)}",
+        )
 
     def summary(self) -> str:
         """The log line.  Says which number is the test and which is not."""
@@ -299,6 +335,7 @@ def protected_band_convergence(
     rms_prot = float(np.sqrt(np.mean(d_prot ** 2)))
     worst_k, worst_band = np.unravel_index(
         int(np.argmax(np.where(mask, delta, -np.inf))), delta.shape)
+    moved = np.where(mask, delta, 0.0)
     return ConvergenceVerdict(
         converged=bool(max_abs < float(cutoff_ev)),
         max_abs_ev=max_abs,
@@ -309,6 +346,11 @@ def protected_band_convergence(
         worst_k=int(worst_k),
         worst_band=worst_band,
         cutoff_ev=float(cutoff_ev),
+        median_abs_all_ev=float(np.nanmedian(delta)),
+        bands_over_large_move=tuple(int(b) for b in np.flatnonzero(
+            np.any(moved > NONCONVERGENCE_LARGE_MOVE_EV, axis=0))),
+        bands_over_cutoff=tuple(int(b) for b in np.flatnonzero(
+            np.any(moved >= float(cutoff_ev), axis=0))),
     )
 
 
@@ -6587,6 +6629,10 @@ def run_sc_driver(
             inputs, "  SC verdict: ONE-MAP DIAGNOSTIC (convergence was not "
             f"requested); {verdict.summary()}")
     elif not verdict.converged:
+        for line in verdict.nonconvergence_lines(
+                band_offset=int(inputs.band_slices.sigma.start),
+                n_maps=len(rms_history)):
+            _record_sc(inputs, line)
         _record_sc(
             inputs, f"  SC verdict: NOT CONVERGED after {len(rms_history)} "
             f"GW map calls; {verdict.summary()}")

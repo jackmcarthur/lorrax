@@ -217,7 +217,10 @@ evaluated input:
 
 A stalled or budget-exhausted run refuses with
 `GATE sc_fixed_point_not_converged`. The per-map `eqp0_iterNNNN.dat` files
-remain, and no terminal QP result is reported.
+remain, and no terminal QP result is reported. Just before the refusal the
+record prints one block for the last map: the median $\lvert\Delta E\rvert$
+over all states, then the 1-based bands (no k) of the non-scissored set with
+a state moving more than 20 meV, and with a state moving at least `sc_tol_ev`.
 
 **Cost.** The history is $2(m+1)$ copies of the carry, stacked on a leading,
 never-sharded axis. Bra bands sit on `x` and ket bands on `y`
