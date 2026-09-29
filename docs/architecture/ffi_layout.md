@@ -27,7 +27,7 @@ the code at `origin/main` 9379b694 (2026-09-25).
 |---|---|---|---|---|---|---|
 | **χ₀ = G ⋆ G**, one τ node: `χ₀(R) += α_τ Σ_ab conj(Gᶜ_ab(R))·Gᵛ_ab(R)`, one FFT_k after the τ sum | gwjax screening (`gw.w_isdf`) → χ₀_q(μ,ν;τ) | mode 11 on the k-box stage for the identity-vertex step response on a raw-parent plan; every other χ₀ kernel (vertex pairs, Fermi–Dirac occupations, distinct left and right centroid sets, the fractional contour) takes mode 3 on unfolded Greens with the spin trace in XLA ([router](#k-convolution-router-and-the-mathdx-family)) | typed unfold and spin trace in XLA, host flat-k transforms | none | `tests/multi_device/kconv_router_p4.py`, `tests/test_kconv_chi_unfold.py` | `ffi.fft.make_kconv_chi_unfold`; `gw.w_isdf._get_chi_minimax_kernel` |
 | **Σ = G ⋆ W**: `Σ_k = FFT_k[IFFT_k Ĝ · W(R)]`, Ĝ the Green unfolded on load | gwjax Σ: `gw.ppm_tau_kernel` (τ stream), `gw.cohsex_sigma` → Σ_k(μ,ν;τ) at the caller's k rows | mode 7 on the raw-parent Green (typed unfold and spin action on load); mode 2 on the k-box stage for a full-k operand ([router](#k-convolution-router-and-the-mathdx-family)) | typed unfold in XLA (a full-k copy), then `lorrax_mklfft_gw_conv` | none | `kconv_router_p4.py`, `tests/test_kconv_klead_unfold.py` | `ffi.fft.make_kconv_klead_unfold`, `make_kconv_klead` |
-| **Four-current Σ**: `Σ = FFT_k Σ_AB γ_A (IFFT_k Ĝ) γ_B† ∘ W_AB(R)` | gwjax bispinor Σ: `gw.cohsex_sigma`, `gw.centroid_k_unfold` | mode 8: resident arm when a whole `ns²` spin group fits the opt-in shared memory, else the k-box split arm | mode 7's host composition, the γ block sum in XLA | none | `kconv_router_p4.py`, `tests/test_kconv_lorentz_unfold.py` | `ffi.fft.make_kconv_lorentz_unfold` |
+| **Four-current Σ**: `Σ = FFT_k Σ_AB γ_A (IFFT_k Ĝ) γ_B† ∘ W_AB(R)` | gwjax bispinor Σ: `gw.cohsex_sigma`, `gw.centroid_k_unfold` | mode 8 on the k-box stage: the single arm when a whole `ns²` spin group fits the opt-in shared memory, else the split arm | mode 7's host composition, the γ block sum in XLA | none | `kconv_router_p4.py`, `tests/test_kconv_lorentz_unfold.py` | `ffi.fft.make_kconv_lorentz_unfold` |
 | **W, V wedge → R space**: `Y_k = IFFT_k(L_k Ô_k R_k†)`, Ô read from the irreducible q wedge | the W and V operands of the two Σ rows: `gw.screening`, `gw.ppm_tau_kernel`, `gw.cohsex_sigma` | mode 9; a full-zone operand takes mode 3 | unfold in XLA (`apply_unfold_load_tables_local`), then the host flat-k transform | none | `kconv_router_p4.py`, `tests/test_kfft_klead_unfold.py` | `ffi.fft.make_kfft_klead_unfold`; `symmetry_maps.QirrOperator` |
 | **k-axis FFT**: `Y = s·FFT^±_k X`, k leading or trailing | χ₀(R) → χ₀(q) (`gw.w_isdf`), the q→0 head (`gw.qsgw_head`), `gw.wavefunction_bundle`, band interpolation (`bandstructure.htransform`, `.orbital`), BSE (k trailing) | mode 3 on the k-box stage (k leading), mode 5 (k trailing) | `lorrax_mklfft_flat_k`, the FFTW3 advanced interface bound by `dlsym` ([§3c](#3c-which-fft-engine-the-host-library-binds)); k trailing: XLA transposes around it. `LORRAX_FFT_FFI=0` refuses | none | `kconv_router_p4.py`, `tests/test_fft_flat_k_numerics.py`, GATE 5, GATE 8 | `ffi.fft.make_kfft_klead`, `make_kfft_kminor`; `common.fft_helpers.make_flat_k_fft` |
 | **ζ-fit pair Gram** `C_q`: the pair convolution `s·FFT_k Σ_ab φ_a φ_b conj(IFFT_k P^L)·IFFT_k P^R` of the band projectors `P_k(μ,ν)` (mode 0 in the [mode table](#k-convolution-router-and-the-mathdx-family)) | gwjax face-ψ ζ fit (`gw.isdf_fitting`, one C_q per channel), `gw.downfold` | mode 1, the typed parent load ([mode 1](#parent-load-isdf-pair-convolution-mode-1)); mode 0 on full-k operands | typed parent load in XLA (a full-k open-spin copy per side), host transforms, spin contraction in XLA | none | `kconv_router_p4.py`, `tests/test_isdf_parent_conv.py`, `tests/test_isdf_zq_parent_parity.py` | `ffi.fft.make_fused_conv_kparent`, `make_fused_conv_kpair` ← `isdf.core.c_q_from_psi_sm`, `c_q_downfold` |
@@ -615,7 +615,7 @@ specialised per grid when NVRTC compiles the kernel.
 | 2 router | `ffi/fft.py`: the doors below. `common.fft_helpers` re-exports them; its `get_donated_kfft_kminor` is `make_kfft_kminor` jitted with its input donated, memoised per `(mesh, kgrid, spec, kind, norm)`, and the caller drops its own reference after the call |
 | 3 gate | `require_kconv`, then `require_fourier_plan`, called by `runtime.initialize_communicator_stack` after the FFT and GEMM gates. `require_kconv` on CUDA: the wheel's headers, every `ffi.fft.KCONV_TARGETS` target, and one probe compile (mode 3, k-grid 2×1×1, disk-cached), so a device the installed cuFFTDx cannot compile for refuses at startup (`GATE mathdx-probe`, naming its compute capability and the wheel); cpu: `lorrax_mklfft_flat_k`. `require_fourier_plan` on CUDA: `lorrax_fourier_plan_mathdx` only, since no wheel version is checked at startup (the fused pair checks its wheel at plan build); cpu: nothing (XLA ops). Each factory re-probes its own target (a `LocalFourierPlan` that CUDA can lower probes `lorrax_fourier_plan_mathdx` at construction); operand shapes and dtypes are checked at trace time |
 | 4 target | CUDA, in `liblorrax_ffi.so`: the `lorrax_mathdx_*` target of each mode in the mode table below, and five kept for older source trees (`_kconv_klead_unfold_block`: mode 7's `d × d` output spin block; `_kconv_klead_unfold_rows`, `_kconv_klead_lorentz_rows`: modes 7 and 8 without the conj-on-load partner and the stored block; `_kconv_klead_unfold`, `_kconv_klead_lorentz`: every k row stored). `lorrax_fourier_plan_mathdx` and, for older trees, `lorrax_fourier_plan` ([§ Local Fourier plan](#local-fourier-plan-localfourierplan)). cpu, in `liblorrax_ffi_host.so`: `lorrax_mklfft_flat_k`, `lorrax_mklfft_gw_conv` (§3c) |
-| 5 handler | CUDA: `cpp/cufft/kconv_mathdx_cuda_ffi.cc`; the two BSE outer targets are `cpp/cufft/kconv_outer_cuda_ffi.cc`, which embeds the same `kbox_stage.cuh` in its own NVRTC programs. Modes 0–9 and 11 share one embedded cuFFTDx source (`kSrc`); mode 10 has its own (`kPlaneSrc`); the k-box modes (2, 3, 7, 11 and mode 8's split arm) also embed `cufft/kbox_stage.cuh` as the named header `kbox_stage.cuh`, turned into text at configure time (`kbox_stage_src.h.in`). NVRTC compiles an image for the device's own `sm_<cc>` per (CUDA context, mode, `nkx`, `nky`, `nkz`, `ns`, right width, precision, variant) into an in-process cache, backed by the disk cubin cache below. cpu: `cpp/fftw/fft_flat_k_ffi.cc` (`MklFftFlatKHostFfi`, `MklFftGwConvHostFfi`) |
+| 5 handler | CUDA: `cpp/cufft/kconv_mathdx_cuda_ffi.cc`; the two BSE outer targets are `cpp/cufft/kconv_outer_cuda_ffi.cc`, which embeds the same `kbox_stage.cuh` in its own NVRTC programs. Modes 0–9 and 11 share one embedded cuFFTDx source (`kSrc`); mode 10 has its own (`kPlaneSrc`); every k-box mode (2, 3, 4, 5, 7, 8, 9 and 11) also embeds `cufft/kbox_stage.cuh` as the named header `kbox_stage.cuh`, turned into text at configure time (`kbox_stage_src.h.in`). NVRTC compiles an image for the device's own `sm_<cc>` per (CUDA context, mode, `nkx`, `nky`, `nkz`, `ns`, right width, precision, variant) into an in-process cache, backed by the disk cubin cache below. cpu: `cpp/fftw/fft_flat_k_ffi.cc` (`MklFftFlatKHostFfi`, `MklFftGwConvHostFfi`) |
 
 **Doors.** Pick the door whose k position matches the tile you hold. A caller
 never transposes to reach another door.
@@ -666,12 +666,12 @@ The modes of the one handler file. The target column is the string
 | 1 parent | `kconv_parent` | mode 0 on the typed parent load ([below](#parent-load-isdf-pair-convolution-mode-1)) | `D_l`, `D_r` `(n_parent, ns, μ, ns, ν)` and ten tables → `U` `(N_k, μ, ν)` | 3 |
 | 2 klead conv | `kconv_klead` | `U = s·FFT_k(IFFT_k T · V_R[:, None, :, None, :])`, `V_R` already in R space (mode 3 made it) | `T`, `U` `(N_k, a, m_x, b, m_y)`; `V_R` `(N_k, m_x, m_y)` | 1 |
 | 3 klead fft | `kfft_klead` | `Y = s·FFT^±_k X` | `(N_k, rows)` | 1 |
-| 4 kminor conv | `kconv_kminor` | `U = s·FFT_k(IFFT_k X · K_R[None, :, :, None, None, :])`, `K_R` already in R space (the caller made it with mode 5) | `X` `(d0, d1, d2, d3, d4, N_k)`, `K_R` `(d1, d2, N_k)` → `U` in X's layout (`out_layout=0`) or `(d0, N_k, d3, d1, d4, d2)` (`out_layout=1`) | 1 |
-| 5 kminor fft | `kfft_kminor` | `Y = s·FFT^±_k X` | `(rows, N_k)` | 1 |
+| 4 kminor conv | `kconv_kminor` | `U = s·FFT_k(IFFT_k X · K_R[None, :, :, None, None, :])`, `K_R` already in R space (the caller made it with mode 5) | `X` `(d0, d1, d2, d3, d4, N_k)`, `K_R` `(d1, d2, N_k)` → `U` in X's layout (`out_layout=0`) or `(d0, N_k, d3, d1, d4, d2)` (`out_layout=1`) | the k-box stage (single arm) |
+| 5 kminor fft | `kfft_kminor` | `Y = s·FFT^±_k X` | `(rows, N_k)` | the k-box stage (single arm) |
 | 6 plane | `kconv_plane` | mode 0 on the identity plan, loaded from the route-G D-plane FFT output: `P^X = conj(F·D^X)` with the Bloch phase `F[k,g,p]`, L = slots `[0, c)` and R = slots `[c, 2c)` of the `2c` axis, split on load | `D` `(N_k, g, ns, 2c, ns, p)`, `F` `(N_k, g, p)` → `U` `(N_k, c, g·p)` | 3 |
 | 7 klead unfold conv | `kconv_klead_unfold_xblock` | mode 2 on the typed unfold of the raw-parent Green, formed on load through `symmetry_maps.unfold_load_tables`: `Ĝ_k = U_k·[(mph_k·G_{row(k)}[lsrc_k, rsrc_k])·nph_k]·U_k†`, reading the partner `Gt` on an antiunitary row, or `conj(G)` when `conj_src = 1` | `G`, `Gt` `(n_parent, μ·ns, ν·ns)`, `V_R` `(N_k, μ, ν)`, `kout` `(N_k,)` → `U` `(n_out, ns, xn·bx, ns, ν)`: full-k row `k` stored at `kout[k]` (−1: transformed, not stored), block row `r` the local left centroid `(r / bx)·xs + x0 + r % bx` (`≥ μ`: a zero padding row; `bx = 0` stores all); a pass reads only its own pairs' sources, so x blocks read `G` and `W` once in all | the k-box stage: `ns²` columns per pair |
-| 8 klead lorentz conv | `kconv_klead_lorentz_conj` | mode 7's load, then the four-current vertex sum in R space: `U = mult·s_f·FFT_k Σ_{A,B} γ_A (s_g·IFFT_k Ĝ) γ_B† ∘ V_R[k, x, A, y, B]`, `γ` signed spin permutations (attributes); one transform of `Ĝ` serves every block | `G`, `Gt` as mode 7, `V_R` `(N_k, μ, n_A, ν, n_B)`, `n_A, n_B ≤ 4` → `U` `(n_out, ns, μ, ns, ν)` through `kout` | 1, a whole `ns²` spin group per block |
-| 9 klead unfold fft | `kfft_klead_unfold` | `Y_k = s·IFFT_k(L_k·Ô_k·R_k†)`, `Ô_k` the gathered, phased wedge tile of an interaction (partner tile on an antiunitary row, or its conjugate when `conj_trs = 1`), `L`, `R` the endpoint actions: the R-space operand modes 2, 7 and 8 take | `W`, `Wt` `(n_wedge, μ·n_l, ν·n_r)`, `spin_l` `(N_k, n_l, n_l)`, `spin_r` `(N_k, n_r, n_r)`, `n_l, n_r ≤ 4` → `Y` `(N_k, μ·n_l, ν·n_r)` | 1 |
+| 8 klead lorentz conv | `kconv_klead_lorentz_conj` | mode 7's load, then the four-current vertex sum in R space: `U = mult·s_f·FFT_k Σ_{A,B} γ_A (s_g·IFFT_k Ĝ) γ_B† ∘ V_R[k, x, A, y, B]`, `γ` signed spin permutations (attributes); one transform of `Ĝ` serves every block | `G`, `Gt` as mode 7, `V_R` `(N_k, μ, n_A, ν, n_B)`, `n_A, n_B ≤ 4` → `U` `(n_out, ns, μ, ns, ν)` through `kout` | the k-box stage: tiles of whole `ns²` spin groups |
+| 9 klead unfold fft | `kfft_klead_unfold` | `Y_k = s·IFFT_k(L_k·Ô_k·R_k†)`, `Ô_k` the gathered, phased wedge tile of an interaction (partner tile on an antiunitary row, or its conjugate when `conj_trs = 1`), `L`, `R` the endpoint actions: the R-space operand modes 2, 7 and 8 take | `W`, `Wt` `(n_wedge, μ·n_l, ν·n_r)`, `spin_l` `(N_k, n_l, n_l)`, `spin_r` `(N_k, n_r, n_r)`, `n_l, n_r ≤ 4` → `Y` `(N_k, μ·n_l, ν·n_r)` | the k-box stage (single arm): tiles of whole `n_l·n_r` groups, else single columns |
 | 10 plane fft gather | `plane_fft_gather` | the route-G plane transform, gathered on load ([below](#plane-fft-with-gather-on-load-mode-10)) | `F` `(A, S, …, n_col)` → `Y` `(A, n_pg, …, n_b, n_c)` | whole planes |
 | 11 klead chi unfold | `kconv_chi_unfold` | one τ node of χ₀: `acc[o] += α_o Σ_ab conj(s_i·IFFT_k Ĝ^c)_ab · (s_i·IFFT_k Ĝ^v)_ab` (+ its conjugate when `complete`), `Ĝ^{v,c}` mode 7's typed unfold of each Green; the forward transform follows the τ sum | `Gv`, `Gvt`, `Gc`, `Gct` `(n_parent, μ·ns, ν·ns)`, `α` `(n_out,)` → `acc` `(n_out, N_k, μ, ν)`, updated in place | the k-box stage: `2ns²` columns per pair |
 
@@ -684,27 +684,31 @@ The modes of the one handler file. The target column is the string
   operand 0 to the result (`input_output_aliases={0: 0}`); mode 11 aliases
   `acc`. This is safe because each block reads all `N_k` values of its rows
   before it stores any of them.
-- **Launch geometry (resident rows: modes 0, 1, 4–6, 8 and 9).** One 256-thread
-  block per `rb` rows; a row needs `banks·16·(N_k|1)` bytes of shared memory
-  (8 per element for complex64). Modes 0, 1 and 6 take
-  `rb = min(16, ⌊B / row⌋)` with `B = min(100 KiB, opt-in)`, the others
-  `rb = min(64, ⌊min(48 KiB, opt-in) / row⌋)`; when that is 0, `rb` is what
-  the device's opt-in maximum holds. Mode 8 reaches for the opt-in maximum
-  until a whole `ns²` spin group fits, and takes the k-box split arm when none
-  does. Modes 2, 3, 7 and 11 run on the k-box stage and have no `rb`. Modes 8 and 9 round
-  `rb` down to whole spin groups (`ns·n_r` rows) when one fits and then load
-  each pair's sources once for the group; below one group each bank loads its
-  own row with the same arithmetic. From 2 rows up an axis pass hands out
-  lines row fastest (rows `N_k|1` apart), so a 16-byte shared phase spans
-  `min(rb, 8)` bank groups.
-- **The k-box stage (modes 2, 3, 7, 11, and mode 8's split arm).**
+- **Launch geometry (resident rows: modes 0, 1 and 6).** One 256-thread
+  block per `rb` rows; a row needs `3·16·(N_k|1)` bytes of shared memory
+  (three banks), and `rb = min(16, ⌊B / row⌋)` with `B = min(100 KiB, opt-in)`;
+  when that is 0, `rb` is what the device's opt-in maximum holds. From 2 rows
+  up an axis pass hands out lines row fastest (rows `N_k|1` apart), so a
+  16-byte shared phase spans `min(rb, 8)` bank groups.
+- **The k-box stage (modes 2, 3, 4, 5, 7, 8, 9 and 11).**
   `kbox_stage.cuh` owns the box transform and its launch rule,
   `kbox_plan(grid, group, operands, elem, opt-in)`, computed from the k-grid
-  and the device's opt-in shared memory. Modes 2 and 3 stage whole columns in
-  padded shared memory, or, where two columns do not fit a block, run plane
-  and pencil passes through the output in place. Mode 8's split arm runs the
-  plane and group-pencil passes chunked over pairs through an
-  `(N_k, chunk·ns²)` intermediate no larger than its output. For mode 11,
+  and the device's opt-in shared memory; a mode supplies its Load, Mid and
+  Store. Modes 2 and 3 stage whole columns in padded shared memory, or, where
+  two columns do not fit a block, run plane and pencil passes through the
+  output in place. Modes 4 and 5 (k-minor) and mode 9 run the single arm
+  only, with one-column tiles as the floor (a column above the opt-in memory
+  refuses, `GATE mathdx-kconv-kbox-residency`): modes 4/5 load each column's
+  k run and store k fastest (mode 4's `out_layout=1` rows fastest); mode 9
+  takes tiles of whole `n_l·n_r` groups when one fits (the pair's sources
+  read once, as mode 7's grouped load) and single columns otherwise. Mode 8
+  takes the single arm when a tile of whole `ns²` spin groups fits: the
+  unfolded Green as a direct Load, the vertex sum as a group Mid (one thread
+  per `(k, pair)`, the resident kernel's; a per-member Mid measured
+  0.76–0.94× at the CrI3 6×6 and Fe 4³ `ns = 4` doors), the scaled `kout`
+  Store; its load holds a spin group per thread, so it runs 256 threads. Otherwise the
+  split arm runs the plane and group-pencil passes chunked over pairs through
+  an `(N_k, chunk·ns²)` intermediate no larger than its output. For mode 11,
   single pass: `tr`
   whole pairs per block in a padded bank (odd z-line and row strides),
   gathered on load through mode 7's typed unfold, the three axis passes
@@ -769,8 +773,8 @@ The modes of the one handler file. The target column is the string
 | `GATE mathdx-probe` | startup | the mode-3 probe kernel fails to compile or run on this device | an nvidia-mathdx wheel whose cuFFTDx supports the device's compute capability |
 | `GATE kconv-kgrid` | factory | the k-grid is not three positive axes | pass the run's `(nkx, nky, nkz)` |
 | `GATE mathdx-kconv-axis` | factory; handler | on CUDA, a k-grid axis above 40 (`KCONV_AXIS_MAX`, the fp64 cuFFTDx thread-FFT limit); the cpu leg (FFTW) has no cap | a smaller k-grid |
-| `GATE mathdx-kconv-residency` | first call (kernel build) | one resident row, `banks·16·(N_k|1)` bytes (8 per element for complex64), exceeds the device's opt-in shared memory per block. On an A100 (166 912 B) that is `N_k > 3477` for modes 0/1/6 and `N_k > 10431` for the one-bank modes in complex128 | a smaller k-grid; modes 0, 1, 4–7 and 9 have no out-of-core arm |
-| `GATE mathdx-kconv-kbox-residency` | first call | modes 2 and 3, and mode 8's split arm: the k-box tile, or its `(k_y, k_z)` plane or pencil, exceeds the opt-in maximum | a smaller k-grid |
+| `GATE mathdx-kconv-residency` | first call (kernel build) | one resident row of modes 0/1/6, `3·16·(N_k|1)` bytes, exceeds the device's opt-in shared memory per block (on an A100, 166 912 B: `N_k > 3477`) | a smaller k-grid; modes 0, 1 and 6 have no out-of-core arm |
+| `GATE mathdx-kconv-kbox-residency` | first call | modes 2 and 3, and mode 8's split arm: the k-box tile, or its `(k_y, k_z)` plane or pencil, exceeds the opt-in maximum; modes 4, 5, 7 and 9: one whole column `16·((n_kx·n_ky·(n_kz|1))|1)` B (8 per element for complex64) exceeds it | a smaller k-grid |
 | `GATE mathdx-kconv-lorentz-scratch` | apply | mode 8's split arm: XLA's scratch allocator refuses the chunk intermediate | none on the door: the chunk is already at most the output's size |
 | `GATE mathdx-kconv-chi-residency` | first call | mode 11: the k-box arm `kbox_plan` picked does not fit the opt-in maximum, or its plane tile splits a spin group | a smaller k-grid; the χ₀ route has no fallback for this grid |
 | `GATE mathdx-kconv-chi-scratch` | apply | mode 11's split arm: XLA's scratch allocator refuses the `(N_k, chunk·2ns²)` intermediate | a smaller `scratch_bytes` |

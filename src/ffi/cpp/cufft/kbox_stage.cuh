@@ -296,6 +296,19 @@ __device__ void store_tile(const C* bank, long long col0, long long ncols, const
     __syncthreads();
 }
 
+// store_tile with k fastest across threads: a k-MINOR Store (element (col, k) at col*NK + k)
+// writes one contiguous run per column.  The same elements and values as store_tile.
+template <int NX, int NY, int NZ, int TR, class C, class Store>
+__device__ void store_tile_kfast(const C* bank, long long col0, long long ncols, const Store& st) {
+    using G = Geo<NX, NY, NZ>;
+    constexpr int tr = TR;
+    for (int i = threadIdx.x; i < tr * G::NK; i += blockDim.x) {
+        const int k = i % G::NK, j = i / G::NK;
+        if (col0 + j < ncols) st.put(k, col0 + j, bank[j * G::RS + G::at(k)]);
+    }
+    __syncthreads();
+}
+
 // ---- split arm ------------------------------------------------------------------------------
 // Plain k-leading access to the intermediate buffer between split passes.
 template <class C>
