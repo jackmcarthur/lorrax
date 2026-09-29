@@ -127,7 +127,7 @@ energies, so it takes these dipoles at the same diagonal approximation.
 | bands | block of $H'$ |
 |---|---|
 | the QP matrix `[b0, b3)`, b3 = nelec + `ncond` as counted on main | full $\Sigma^{\rm QSGW}$, off-diagonals kept within the matrix |
-| its coarse (semicore) states (below) | full rows, read at their own energy on held coarse windows at $\eta_{\rm semi}$ = 1 eV |
+| its coarse (semicore) states (below) | full rows, read at their own energy on held coarse windows at $\eta_{\rm semi}$ = 5 eV |
 | the lowest `sc_frozen_core_bands` | held at the DFT block $\mathrm{diag}(E_{\rm DFT})$; they stay in the $\Sigma_x$ and $\chi_0$ sums |
 | the scissored tail `[b3, number_bands)` | DFT orbitals with an energy-only rigid shift, refit every map, in G and $\chi_0$ only: the $Z$-weighted mean QP correction of the matrix's conduction states that read their own $\Sigma(E)$ (below) |
 
@@ -158,7 +158,7 @@ QP request; giving both refuses (`GATE band_request_forms`).
 A coarse state stays in the matrix and mixes fully, but its Σ is read at its
 own energy on coarse windows of the grid below the near support. The
 automatic windows are one per coarse manifold (levels separated by a global
-gap wider than twice the 2 eV plan pad), at $\eta_{\rm semi}$ = 1 eV, sampled
+gap wider than twice the 2 eV plan pad), at $\eta_{\rm semi}$ = 5 eV, sampled
 at $\eta_{\rm semi}/2$ (`qp_support.SEMICORE_*`), planned at map 0 over the
 coarse DFT energies and held; a coarse read that leaves them extends them, as
 the near support is extended. `sigma_omega_patches_ev` triples `lo:hi:eta`
@@ -173,10 +173,23 @@ pairs on MoS2 and Fe); adjacent automatic windows of one η share a rule
 window when that lowers the summed closed-form node count of the boxes the
 runs are built on (`sigma_box_plan._coarse_runs`, decided at map 0 and
 held); a user window is never grouped; sign-definite windows serve coarse
-samples at the deck η. At the deck η the Fe 3s $Z$ leaves $(0, 1]$ from map 1
-and the loop stalls; at 1 eV the coarse $Z$ stays inside except the Fe 3s at
-maps 1–2 (one `SC semicore Z` receipt per map). The η_semi systematic is
-reported apart from the 1 meV budget of the controllable errors. Only the
+samples at the deck η. Broadening flattens $d\Sigma/d\omega$: at the deck η the
+Fe 3s $Z$ leaves $(0, 1]$ from map 1 and the loop stalls; at 5 eV every coarse
+$Z$ stays inside (one `SC semicore Z` receipt per map). The η_semi systematic
+is reported apart from the 1 meV budget of the controllable errors: converged
+E_F ± 1 eV std/max 3.6/15.9 meV (Fe 4³, against η_semi 1 eV) and 2.9/20.0 meV
+(MoS2 3×3, against the deck η), growing about 1.2 and 0.6 meV std per eV
+(claim 2960).
+
+**Far conduction** (owner 2026-09-29: "max out the broadening for the far
+away cond bands"). QP-matrix states above μ + 10 eV (`band_partition.
+WINDOW_CLIP_EV`) leave the near grid, whose crossing window's short side they
+set, and are read at their own energy on held windows above it at
+`qp_support.FAR_ETA_EV` = 1 eV, grouped and certified as the coarse windows.
+At the deck η the matrix-top states of Fe 4³ sit in a resonance with the
+tail's levels (band 26 at k 4/11: QP +19.6 to +21.0 eV against tail bands
+27/28 at +20.6/+20.9 eV) and the SC map is bistable there; with far windows
+every η_semi from 1 to 12 eV converges (14–18 maps). Only the
 scalar MPA/shared-pole Σ reads coarse windows; a sector (bispinor) route
 keeps the rule below.
 

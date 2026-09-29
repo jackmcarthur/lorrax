@@ -81,7 +81,7 @@ about 10 meV together.
 | Σ quadrature ε | controllable | eqp0 within 0.89 meV of ε 1e-6 at the default 1e-4 (Fe 4³ charge SC, E_F ± 15 eV; claims 2881, 2887) | `sigma_quadrature_eps` |
 | ISDF basis | controllable | Σ_x RMS ≤ 1 meV near N_μ = 0.5 r, exact to 0.1 meV near 1.3 r, r the rank of the Σ pair set (Si 4³ SOC; claim 2860) | centroid count and pair set |
 | W model | controllable | QP RMS 0.80 meV against contour deformation at the pole cap (Si, near-gap window); 8.2 meV non-rigid RMS in a wider window at the same supports (claim 2431) | poles and supports ([pole count](../theory/shared-pole-w-model.md#shared-pole-pole-count)) |
-| semicore read at η_semi = 1 eV | systematic | ≤ 1.4 meV std, ≤ 8.1 meV max on states within ± 10 eV at map 0, against the deck-η read (MoS2 3×3, Fe 4³, Na 8³; claim 2945) | pending, below |
+| semicore read at η_semi = 5 eV | systematic | converged E_F ± 1 eV 3.6/15.9 meV std/max (Fe 4³, against η_semi 1 eV), 2.9/20.0 (MoS2 3×3, against the deck η) (claim 2960) | pending, below |
 | Σ band extrapolation (G tail) | systematic | 9.2 meV std, 32.9 meV max 4v4c at 78 against 536 bands with χ complete (Si 4³, shared-pole samples; claims 2898, 2900, reproduced in 2942) | N |
 | W's band truncation (χ at N) | systematic | with χ also at 78 the extrapolated score is 20.5 meV std (same study); end to end on the shared-pole route 21.2 meV std, gap −72.8 meV, against 35.6 meV unextrapolated (Si 4³ one-shot; claim 2948). Before extrapolation the 78-band error splits into χ tail 8.0, G tail 25.8 and their cross term 15.1 meV std (CHIEXT report, 2026-09-29, Si only) | N |
 | scissored tail | systematic, hard to control, possibly large | moving the QP-matrix top b3 from 24 to 28 moves the ± 1 eV shell 9.7 meV std at map 0 (Si 4³, 968 centroids; claim 2945); from 16 to 24, the ± 10 eV states +48 meV mean (Si 4³, 192 centroids, ISDF-limited; claim 2952) | the QP window top |
@@ -123,7 +123,7 @@ claim 2952) holds the rest of the recipe. It is not on main.
   the coarse class is every occupied state below the lowest requested valence
   band. Both forms refuse by name. On MoS2 3×3 and Fe 4³ charge the two forms
   give identical results (claim 2952).
-- **Coarse windows.** Coarse states are read on held windows at η_semi = 1 eV,
+- **Coarse windows.** Coarse states are read on held windows at η_semi = 5 eV,
   one per coarse manifold, certified at max(`sigma_quadrature_eps`, 3e-3); the
   Σ plan groups them to the least closed-form node count of the boxes it
   builds, which is one window on both decks (MoS2 125 against 248 nodes
@@ -133,8 +133,9 @@ claim 2952) holds the rest of the recipe. It is not on main.
   ratio shallow/deep and q the feedback slope ratio deep/shallow; measured
   q is 0.69 (MoS2, needs < 0.58) and 0.54 (Fe, needs < 0.05) (claim 2960).
   `sigma_omega_patches_ev` takes `lo:hi:eta` user windows. Against the
-  semicore-at-deck-η read at map 0: ±10 eV states 0.90 / 3.82 meV std / max
-  (MoS2), 1.30 / 7.87 (Fe); MoS2 gap −0.36 meV (claim 2952).
+  semicore-at-deck-η read at the converged fixed point: E_F ± 1 eV 2.9 / 20.0
+  meV std / max (MoS2). QP-matrix states above μ + 10 eV read on far windows
+  at 1 eV; this converges Fe 4³ at every η_semi (claim 2960).
 - **Owner calls.** (a) Cost of the one ε: at 1e-4 the coarse windows take
   MoS2 530 against 448 τ pairs per map and Fe 1087 against 959 (over the
   1000-pair metal budget); splitting does not win it back. (b) Fe 4³ map 2 misses 2 meV: at matched

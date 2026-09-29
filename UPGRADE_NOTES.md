@@ -36,12 +36,16 @@ self_consistent`, scalar MPA/shared-pole route) moves once. See
   window, so a deck switched to `number_bands_protected` needs a dipole
   written with `nval` = the occupied count.
 - **Semicore moves to coarse windows.** On the scalar MPA/shared-pole route the
-  coarse states are read at their own energy on held windows at η_semi = 1 eV
+  coarse states are read at their own energy on held windows at η_semi = 5 eV
   (one per coarse manifold; the Σ plan groups them to the least closed-form
   node count) instead of at Σ(ω = 0) (below E_F − 15 eV) or on the near grid
   at the deck η, certified at max(`sigma_quadrature_eps`, 3e-3).
   `sigma_omega_patches_ev` accepts `lo:hi:eta` triples as user coarse windows
   (`GATE sigma_coarse_window`). Sector (bispinor) routes keep the old rule.
+- **Far conduction.** QP-matrix states above μ + 10 eV are read on held
+  windows above the near grid at 1 eV (`qp_support.FAR_ETA_EV`), which
+  converges Fe 4³ charge SC in 14 maps at η_semi 5 eV (the deck-η read of
+  those states was bistable). Fe 4³ map pairs 988 → 775 (claim 2960).
 - **A new refusal.** `zeta_nband` below b3 now refuses on every run,
   one-shot included (`GATE qp_matrix_zeta_left`; it was a warning).
 ## 2026-09-29 — shared-pole χ₀ direct stream through mathdx mode 11
