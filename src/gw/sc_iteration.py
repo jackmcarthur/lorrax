@@ -4768,9 +4768,13 @@ def _sc_record_far_gamma(inputs, state, state_out, indices_loop):
         gamma = np.asarray(_kstar(inputs).select(gamma))
     gamma = np.take_along_axis(gamma, idx, axis=1)
     session["far_gamma_kn"] = gamma
-    # one planned re-plan at map 1: the far class leaves the near grid
+    # one planned re-plan at map 1: the far class leaves the near grid.  The
+    # Sigma rule sessions are per W model (sigma_dispatch: session[model]);
+    # each is recognised by its tau capacity, the chi session is left alone.
     session.pop("window_plan", None)
-    session.pop("rules", None)
+    for sub in session.values():
+        if isinstance(sub, dict) and "tau_capacity" in sub:
+            sub.pop("rules", None)
 
 
 def _sc_z_factors(
