@@ -99,3 +99,6 @@ src/ffi/cpp/build_host_cloud/
 
 # Shared, retained P4 pytest driver staging and rendezvous.
 .pytest_core_runs/
+# tests/hsuite run directories and its compile cache.
+.hsuite_runs/
+.hsuite_jax_cache/
