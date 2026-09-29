@@ -2701,7 +2701,11 @@ def _sc_sampled_support(inputs, partition, energies_loop, mu_ev):
     in_grid = (energy >= grid[0]) & (energy <= grid[-1])
     in_semi = far_patch_covered(energy, plan.semicore_ev)
     in_far = far_patch_covered(energy, plan.far_patches_ev)
-    escaped = ((states & ~in_grid) | (semicore & ~in_semi)
+    # Overlap (owner, round 5: "these may overlap slightly"): a coarse state
+    # inside the fine window reads the fine grid; below it, the coarse window.
+    # The read follows the state each map; no patch enters the near grid.
+    semi_far = semicore & ~in_grid
+    escaped = ((states & ~in_grid) | (semi_far & ~in_semi)
                | (own & ~in_grid & ~in_far))
     if escaped.any():
         ks_, ns = np.nonzero(escaped)
@@ -2717,8 +2721,8 @@ def _sc_sampled_support(inputs, partition, energies_loop, mu_ev):
             f"{int(ns[worst]) + int(inputs.band_slices.b0) + 1} at "
             f"E-mu={float(energy[ks_[worst], ns[worst]]):+.4f} eV. The plan is held "
             "with no clamp and no rebuild (owner ruling 2026-09-28).")
-    near_read = states | zero_read | (own & in_grid)
-    far_read = semicore | (own & ~in_grid)
+    near_read = states | zero_read | (semicore & in_grid) | (own & in_grid)
+    far_read = semi_far | (own & ~in_grid)
     return SCSupport(deck, grid, energy, states, event, envelope, outside, plan,
                      near_read, far_read, own, zero_read)
 
