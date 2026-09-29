@@ -64,6 +64,9 @@ QP-window state in the model's domain still gets its tail. A state with
 E_i − Ω at or above that band has a pole of the model inside the sum and
 keeps S(N₃); the log names it.
 
+Under self-consistency (β, Ω) is fitted at map 0 and held for the later maps,
+as the Σ windows are, so the extrapolation is one linear map on Σ at every map.
+
 ## Why pooled
 
 The estimator it replaced solved one β per state from the ratio of the two top
