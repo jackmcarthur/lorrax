@@ -15,7 +15,6 @@ def main(runtime):
     import numpy as np
     from jax.sharding import PartitionSpec as P
     from file_io import shared_pole_store as store
-    from file_io.slab_io import SlabIO
     from gw.mpa.sigma import _shared_pole_w_synthesis, _shared_pole_fixed_q_policy
     from gw.mpa.sigma_windows import shared_pole_frequencies
 
@@ -41,6 +40,17 @@ def main(runtime):
         receipts={'identity': identity, 'scope': 'planted W execution parity'})
     header = store.validate_shared_pole_model(
         path, expected_identity=identity, mesh_xy=mesh, capacity=meta.shared_pole_capacity)
+    # The same model held on the devices (an SC map's resident model): every
+    # synthesis below must return the file's W bit for bit.
+    resident = store.ResidentSectorModel(mesh, label='p4 resident model')
+    store.write_shared_pole_model(
+        resident, put(packed, P(None, 'x', None, 'y')),
+        put(poles, P(None, 'y')), counts, q_span=(0, 3),
+        meta=meta, tables=tables, recipe=recipe,
+        receipts={'identity': identity, 'scope': 'planted W execution parity'})
+    resident_header = store.validate_shared_pole_model(
+        resident, expected_identity=identity, mesh_xy=mesh, capacity=meta.shared_pole_capacity)
+    assert (resident_header['K'], resident_header['Kmax']) == (header['K'], header['Kmax'])
     frequencies = shared_pole_frequencies(poles, counts)
     indices = np.arange(3, dtype=np.int32)
     bounds = np.tile([1., 4., -np.inf, -np.inf, np.inf, np.inf], (3, 1))
@@ -60,32 +70,42 @@ def main(runtime):
     assert np.max(np.abs(expected-expected[neg].transpose(0,2,1)))<1e-10
     oracle = put(expected, P(None, 'x', 'y'))
     results = []
-    with SlabIO(path, mode='r', mesh=mesh) as io:
-        for layout, b, c in (("face", 3, 5), ("axis", 3, 5), ("axis", 1, 2), ("axis", 2, 3), ("axis", 3, 1)):
-            schedule = dict(status="PASS", parent_capacity=b, column_capacity=c)
-            synthesis = _shared_pole_w_synthesis(
-                io, meta, header, frequencies,
-                schedule, mesh_xy=mesh, layout=layout)
-            # W(τ) as the window executable runs it: one traced program.
-            build = jax.jit(lambda ops, e, t: synthesis.w_kernel(*ops, e, t, False))
-            got = build(synthesis.window_operands("cond", indices, bounds), e, t)
-            error = float(jax.numpy.max(jax.numpy.abs(got-oracle)))
-            assert error < 1e-10, (b, c, error)
-            # Each window brings its own selectors, including an empty interval
-            # that returns the complete zero full-q W.
-            empty = np.tile([20., 30., -np.inf, -np.inf, np.inf, np.inf], (3, 1))
-            zero = build(synthesis.window_operands("cond", indices, empty), e, t)
-            assert float(jax.numpy.max(jax.numpy.abs(zero))) == 0
-            again = build(synthesis.window_operands("cond", indices, bounds), e, t)
-            repeat = float(jax.numpy.max(jax.numpy.abs(again-oracle)))
-            assert repeat < 1e-10
-            results.append(dict(layout=layout, parent_capacity=b, column_capacity=c,
-                                dense_error=error, restored_window_error=repeat,
-                                q_pair_rewired=policy.n_pair_rewired))
-            synthesis.close()
-            del synthesis, build, got, zero, again
+    file_w = {}
+    for source, source_header in ((path, header), (resident, resident_header)):
+        with store.open_shared_pole_model(source, mesh_xy=mesh) as io:
+            for layout, b, c in (("face", 3, 5), ("axis", 3, 5), ("axis", 1, 2), ("axis", 2, 3), ("axis", 3, 1)):
+                schedule = dict(status="PASS", parent_capacity=b, column_capacity=c)
+                synthesis = _shared_pole_w_synthesis(
+                    io, meta, source_header, frequencies,
+                    schedule, mesh_xy=mesh, layout=layout)
+                # W(τ) as the window executable runs it: one traced program.
+                build = jax.jit(lambda ops, e, t: synthesis.w_kernel(*ops, e, t, False))
+                got = build(synthesis.window_operands("cond", indices, bounds), e, t)
+                error = float(jax.numpy.max(jax.numpy.abs(got-oracle)))
+                assert error < 1e-10, (b, c, error)
+                key = (layout, b, c)
+                if source is path:
+                    file_w[key] = got
+                else:
+                    assert bool(jax.numpy.array_equal(got, file_w.pop(key))), ('resident', key)
+                # Each window brings its own selectors, including an empty interval
+                # that returns the complete zero full-q W.
+                empty = np.tile([20., 30., -np.inf, -np.inf, np.inf, np.inf], (3, 1))
+                zero = build(synthesis.window_operands("cond", indices, empty), e, t)
+                assert float(jax.numpy.max(jax.numpy.abs(zero))) == 0
+                again = build(synthesis.window_operands("cond", indices, bounds), e, t)
+                repeat = float(jax.numpy.max(jax.numpy.abs(again-oracle)))
+                assert repeat < 1e-10
+                results.append(dict(layout=layout, parent_capacity=b, column_capacity=c,
+                                    source='file' if source is path else 'resident',
+                                    dense_error=error, restored_window_error=repeat,
+                                    q_pair_rewired=policy.n_pair_rewired))
+                synthesis.close()
+                del synthesis, build, got, zero, again
+    assert not file_w
+    resident.release()
     report = dict(status='PASS', job_step=os.environ['SLURM_JOB_ID']+'.'+os.environ['SLURM_STEP_ID'],
-        scope='P4 canonical store + local full-q synthesis inside one traced program, ragged K, forced q/K panels and per-window selectors',
+        scope='P4 canonical store (file and device-resident, bitwise) + local full-q synthesis inside one traced program, ragged K, forced q/K panels and per-window selectors',
         results=results, aggregate_3U='NOT_MEASURED', nonlocal_fallback='NOT_MEASURED',
         full_sigma='NOT_MEASURED')
     (args.output/f'receipt_rank{jax.process_index()}.json').write_text(json.dumps(report, indent=2)+'\n')
