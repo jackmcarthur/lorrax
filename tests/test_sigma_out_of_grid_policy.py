@@ -291,3 +291,28 @@ def test_semicore_patch_is_planned_below_the_near_grid_held_and_extended():
     assert grown[0] < patch[0] and grown[1] == patch[1]
     # The top never enters the near grid.
     assert semicore_patch_ev(e, semi, -49.0)[1] < -49.0
+
+
+def test_a_held_patch_is_clipped_to_a_near_grid_that_grew_into_it():
+    from gw.qp_support import joined_grid_ev, patch_eta_ev, patch_on_grid_ev
+    patch = (-20.0, -9.0, 1.0)                     # planned under a near grid from -8.5
+    near = np.arange(-12.0, 2.01, 0.25)           # the near grid has since grown to -12
+    joined = joined_grid_ev(near, patch)
+    assert np.all(np.diff(joined) > 0)
+    eta = patch_eta_ev(joined, patch_on_grid_ev(patch, near[0]), 0.25)
+    assert np.all(eta[joined >= near[0]] == 0.25) and np.all(eta[joined < near[0]] == 1.0)
+
+
+def test_the_semicore_patch_route_gate_refuses_a_sector_route():
+    from gw.gw_config import ComputeMode
+    from gw.qp_support import assert_semicore_patch_route, semicore_patch_route
+    patch = (-60.0, -40.0, 1.0)
+    assert semicore_patch_route(ComputeMode.MPA, None)
+    assert not semicore_patch_route(ComputeMode.MPA, object())
+    assert_semicore_patch_route(patch, ComputeMode.MPA, None)
+    assert_semicore_patch_route(None, ComputeMode.MPA, object())
+    with pytest.raises(ValueError, match="GATE semicore_patch_route"):
+        assert_semicore_patch_route(patch, ComputeMode.MPA, object())
+    other = next(mode for mode in ComputeMode if mode is not ComputeMode.MPA)
+    with pytest.raises(ValueError, match="GATE semicore_patch_route"):
+        assert_semicore_patch_route(patch, other, None)

@@ -2666,9 +2666,10 @@ def _sc_semicore_bands(inputs):
     scalar MPA/shared-pole Sigma reads the patch; a sector route reads the
     near grid under main's rule, so it has none here.
     """
+    from .qp_support import semicore_patch_route
     cut = getattr(getattr(inputs, "meta", None), "qp_band_cut", None)
-    if (cut is None or inputs.wfns_transverse is not None
-            or inputs.config.compute_mode is not ComputeMode.MPA):
+    if cut is None or not semicore_patch_route(inputs.config.compute_mode,
+                                               inputs.wfns_transverse):
         return 0
     return int(cut.b_semicore)
 
@@ -2711,7 +2712,9 @@ def _sc_sampled_support(inputs, partition, energies_loop, mu_ev, active_n=None,
     semicore = np.zeros(energies_loop.shape, dtype=bool)
     semicore[:, :n_semi] = True
     if n_semi:
-        active_n = np.arange(energies_loop.shape[1]) >= n_semi
+        # Semicore leaves R; every other band keeps main's W-active rule.
+        active_n = ((True if active_n is None else np.asarray(active_n, dtype=bool))
+                    & (np.arange(energies_loop.shape[1]) >= n_semi))
     # Owner 2026-09-24: the requested states are the protected identities the
     # W model treats as active (``active_n``: shared_pole_recipe.active_band_mask
     # on the fixed DFT ladder), never frozen core; owner 2026-09-27: only
@@ -3945,9 +3948,11 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
                        f"{_eta:g} eV below the near grid [{expanded_grid[0]:+.2f}, "
                        f"{expanded_grid[-1]:+.2f}] eV; {int(sc_support.semicore.sum())} "
                        "semicore (k,state) keep their full Sigma rows")
+        from .qp_support import patch_on_grid_ev
         sigma_config = replace(
             inputs.config, sc_omega_grid_ev=tuple(float(x) for x in sc_support.joined),
-            sc_semicore_patch_ev=sc_support.patch)
+            sc_semicore_patch_ev=(None if sc_support.patch is None else
+                                  patch_on_grid_ev(sc_support.patch, expanded_grid[0])))
     sigma_result = compute_sigma_xc(
         inputs.config.compute_mode,
         occupation_state=metal_occ_state,

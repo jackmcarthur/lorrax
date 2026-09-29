@@ -238,7 +238,12 @@ def hold_support_ev(sigma, deck_grid_ev, held_grid_ev, held_envelope,
 SEMICORE_ETA_EV = 1.0
 #: Certificate tolerance of the patch's split windows.  A patch window's node
 #: count is set by its short side over eta, not its pole range (158 -> 90
-#: nodes at 1e-2 on the TWOCLASS decks).
+#: nodes at 1e-2 on the TWOCLASS decks).  OWNER CALL, not settled: it is a
+#: second eps beside ``sigma_quadrature_eps``.  Measured against 1e-4 on
+#: Fe 4^3 charge SC (claim 2952): it biases the semicore QP by +20 to +32 meV
+#: (mean), moves the +-10 eV states by up to 8 meV at map 2 (the first
+#: Anderson step) and 0.44 meV at the fixed point; 1e-4 costs 1095 against
+#: 964 tau pairs per map on Fe, over the 1000-pair metal budget.
 SEMICORE_PATCH_EPS = 1.0e-2
 #: Patch sampling step (eV): eta_semi / 2 resolves the broadened Sigma.
 SEMICORE_PATCH_STEP_EV = 0.5 * SEMICORE_ETA_EV
@@ -283,9 +288,19 @@ def semicore_patch_escapes(energy_rel_ev, semicore_kn, near_lo_ev, patch):
     return below & ((e - h < lo) | ((e + h > hi) & open_top))
 
 
+def patch_on_grid_ev(patch, near_lo_ev):
+    """The held patch as sampled on this map: its top clipped below the near grid.
+
+    A held patch keeps its planned top; the near grid may since have grown
+    down into it, and there the near grid (deck eta) reads.
+    """
+    return (float(patch[0]), min(float(patch[1]), float(near_lo_ev) - SEMICORE_PATCH_EDGE_EV),
+            float(patch[2]))
+
+
 def patch_grid_ev(patch, near_lo_ev):
     """The patch's samples at SEMICORE_PATCH_STEP_EV, strictly below the near grid."""
-    lo, hi = float(patch[0]), min(float(patch[1]), float(near_lo_ev) - SEMICORE_PATCH_EDGE_EV)
+    lo, hi = patch_on_grid_ev(patch, near_lo_ev)[:2]
     n = int(np.ceil((hi - lo) / SEMICORE_PATCH_STEP_EV - 1e-9)) + 1
     return np.linspace(lo, hi, max(n, 2))
 
@@ -303,3 +318,20 @@ def patch_eta_ev(omega_ev, patch, eta_ev):
     w = np.asarray(omega_ev, dtype=np.float64)
     inside = (w >= float(patch[0]) - 1e-9) & (w <= float(patch[1]) + 1e-9)
     return np.where(inside, float(patch[2]), float(eta_ev))
+
+
+def semicore_patch_route(compute_mode, wfns_transverse):
+    """THE one predicate for a Sigma route that reads the semicore patch.
+
+    The scalar MPA/shared-pole Sigma (no transverse wavefunctions).  A sector
+    (bispinor) route reads the near grid under main's rule.
+    """
+    from .gw_config import ComputeMode
+    return wfns_transverse is None and compute_mode is ComputeMode.MPA
+
+
+def assert_semicore_patch_route(patch, compute_mode, wfns_transverse):
+    """Refuse a semicore patch on a route that does not read it (GATE semicore_patch_route)."""
+    if patch is not None and not semicore_patch_route(compute_mode, wfns_transverse):
+        raise ValueError("GATE semicore_patch_route: the semicore patch serves the scalar "
+                         "MPA/shared-pole Sigma only; a sector route reads the near grid")

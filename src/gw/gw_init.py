@@ -3358,7 +3358,8 @@ def qp_band_cut_for_deck(config, wfn, print0):
         e, n_below_k=below, nval=int(config.nval), ncond=int(config.ncond), mu_ev=mu,
         clip_ev=WINDOW_CLIP_EV, cut_gap_ev=CUT_GAP_ETAS * eta,
         cut_search_ev=CUT_SEARCH_ETAS * eta, semicore_gap_ev=SEMICORE_GAP_EV,
-        omega_max_rel_ev=config.sigma.omega_max_ev)
+        omega_max_rel_ev=config.sigma.omega_max_ev,
+        b_max=getattr(config, "zeta_nband", None))
     width = cut.gap_ev[1] - cut.gap_ev[0]
     # Production stdout is /dev/null (runtime.production_stream): rank 0
     # writes the cut to stderr, which reaches the rank-0 log.
