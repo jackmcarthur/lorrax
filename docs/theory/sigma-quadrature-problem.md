@@ -256,7 +256,7 @@ formula and solves one weight system, and the sampled term matrices of the
 weight solve and the certificate are evaluated in row blocks on the rank's
 cores (`minimax.uniform_rule._map_rows`), which changes no bit. The widest
 crossing window of the gate decks (Na 8³, [−15, 19] eV, 1148 nodes) builds
-in about 3 s, most of it the weight QR. A rule's bytes follow the launch
+in about 1 s (fit rows follow the fastest live term; Qᴴf from the reflectors). A rule's bytes follow the launch
 binding (core count) at round-off, since scipy's OpenBLAS is not under the
 builder's thread pin; one binding reproduces them run to run.
 

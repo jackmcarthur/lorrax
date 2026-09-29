@@ -74,8 +74,15 @@ _NARROW_MIN = 4.0
 #: The leg's largest phase at the top edge, tau_c (H - 1), in radians, and the
 #: floor of the bend it sets (tall crossing boxes).
 _LEG_PHASE, _BEND_MIN = 8.0, 2.0
-#: Fit cloud density along Re d, in points per half wave of the largest |t|.
+#: Fit cloud density along Re d, in points per half wave of the fastest term
+#: still live at d (:func:`_live_rate`).
 _FIT_POINTS = 2.0
+#: A term is live at d while its contour share ``|ds_k| |exp(i s_k d/eta)|``
+#: exceeds ``_LIVE_SHARE eps`` (units eta = 1; ``|ds_k|``, the distance to its
+#: nearest node, is the weight the contour integral gives it).  1e-2 drops the
+#: line's far end (share ~3e-3 eps) and certifies every gate-deck window at its
+#: main node count; 3e-2 put two of the 119 gate windows a rung up (RULEFAST).
+_LIVE_SHARE = 1.0e-2
 
 
 # ------------------------------------------------------------ crossing: nodes
@@ -204,18 +211,50 @@ def sector_degree(box, eps, rung=0):
 
 
 # ------------------------------------------------------------ weights
-def _fit_cloud(box, times):
-    """Least-squares rows: the four edges, the real ones at ``_FIT_POINTS``
-    per half wave of the largest ``|t|``.  A thin box keeps its top edge: a
-    term's modulus changes by ``exp(-Re t (im_hi - im_lo))`` across it, 0.35
-    for a sector rule's far times on a 1.01-eta box."""
+def _live_rate(d, times, eta, eps):
+    """The fastest ``|t|`` still live at each ``d`` (see ``_LIVE_SHARE``).
+
+    On the bent contour a member ``s = sigma - i tau`` has modulus
+    ``exp(-sigma y + tau x)``: past the narrow half-width on the wide side the
+    capped line's members die, and only the line's far end (``tau -> 0``,
+    modulus ``eps/4`` everywhere) stays, at a share of ``eps/4`` times its node
+    spacing.  So the fastest live term falls from ``Lam/eta`` to about
+    ``(Lam - c X/m)/eta`` across the wide side.
+    """
+    s = times * eta
+    gap = np.abs(s[:, None] - s[None, :])
+    np.fill_diagonal(gap, np.inf)
+    log_share = np.log(gap.min(axis=1))
+    rate, floor = np.abs(times), math.log(_LIVE_SHARE * eps)
+    return np.concatenate(_map_rows(
+        lambda lo, hi: np.max(np.where(
+            log_share[None, :] - (d[lo:hi, None] * times[None, :]).imag > floor,
+            rate[None, :], 0.0), axis=1), d.size, times.size))
+
+
+def _edge_cloud(lo, hi, y, eta, times, eps):
+    """Points ``x + i y``, ``x`` in ``[lo, hi]`` with ends, at ``_FIT_POINTS``
+    per half wave of the fastest live term (:func:`_live_rate`), and at least
+    8 per ``|d|`` (1/d itself varies on ``|d|``)."""
+    aux = np.linspace(lo, hi, 4001)
+    rate = _live_rate(aux + 1j * y, times, eta, eps)
+    density = np.maximum(_FIT_POINTS * rate / math.pi, 8.0 / np.abs(aux + 1j * y))
+    cum = np.concatenate([[0.0], np.cumsum(0.5 * (density[1:] + density[:-1]) * np.diff(aux))])
+    x = np.interp(np.linspace(0.0, cum[-1], max(int(math.ceil(cum[-1])), 2) + 1), cum, aux)
+    x[0], x[-1] = lo, hi
+    return x + 1j * y
+
+
+def _fit_cloud(box, times, eps):
+    """Least-squares rows: the real edges at ``_FIT_POINTS`` per half wave of
+    the fastest term live at each point (:func:`_edge_cloud`), 38 geometric
+    points on each side.  A thin box keeps its top edge: without it one gate
+    window (M = 100, m = 61, H = 1.01 eta) certified a rung up (RULEFAST)."""
     a, b, c, d = (float(v) for v in box)
-    h = math.pi / (_FIT_POINTS * float(np.abs(times).max()))
-    x = np.linspace(a, b, int(math.ceil((b - a) / h)) + 1)
-    rows = [x + 1j * c]
+    rows = [_edge_cloud(a, b, c, c, times, eps)]
     if d > c:
         y = np.geomspace(c, d, 40)[1:-1]
-        rows += [x + 1j * d, a + 1j * y, b + 1j * y]
+        rows += [_edge_cloud(a, b, d, c, times, eps), a + 1j * y, b + 1j * y]
     return np.concatenate(rows)
 
 
@@ -245,7 +284,7 @@ def _weights(box, times, eps, relative):
         norm = np.linalg.norm(matrix, axis=0)
         return linalg.lstsq(matrix / norm, np.ones(d.size), cond=1e-14,
                             lapack_driver="gelsd")[0] / norm
-    d = _fit_cloud(box, times)
+    d = _fit_cloud(box, times, eps)
     rho = float(box[2])
     # Row blocks on the service's pool (_map_rows): the same per-entry
     # arithmetic as the whole-matrix expression, so the same bytes.
@@ -266,8 +305,9 @@ def _weights(box, times, eps, relative):
     # unit-maximum column), so the penalty is scale-free in eta
     A[d.size:] = _RIDGE * eps * rho * math.sqrt(d.size) * np.eye(times.size)
     f = np.concatenate([rho / d, np.zeros(times.size)])
-    q, r = linalg.qr(A, mode="economic")
-    return linalg.solve_triangular(r, q.conj().T @ f) * np.exp(-log_max)
+    # Q^H f from the Householder reflectors (Q is never formed): f^H Q, conjugated.
+    qhf, r = linalg.qr_multiply(A, f.conj()[None, :], mode="right")
+    return linalg.solve_triangular(r, np.conj(qhf[0])) * np.exp(-log_max)
 
 
 # ------------------------------------------------------------ the builder

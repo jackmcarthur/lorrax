@@ -17,8 +17,8 @@ builder and the planner share:
   (:func:`_map_rows`) the sampled term matrices are evaluated on.
 
 Nothing here is stored across processes: every rule is built cold, in about
-3 s for the widest crossing window of the gate decks (1148 nodes; owner,
-2026-09-28).
+1 s for the widest crossing window of the gate decks (1148 nodes; owner,
+2026-09-28; RULEFAST).
 
 Currencies: the RELATIVE error ``|d| |Q - 1/d|`` on a sign-definite box, the
 peak-relative ``eta |Q - 1/d|`` on a crossing box

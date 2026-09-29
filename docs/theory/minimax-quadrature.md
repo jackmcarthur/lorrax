@@ -154,7 +154,7 @@ function builder and the FFT helpers carry no quadrature policy.
 on a box [a, b] × [η, y_max], η > 0, in the box's currency: peak-relative
 η|Q − 1/d| on a crossing box (a < 0 < b), relative |d||Q − 1/d| on a
 sign-definite one. Every node is a formula of (box, ε); the weights are one
-linear least-squares solve on the box boundary with a ridge 0.05ε on each
+linear least-squares solve on the box boundary (Qᴴf applied from the Householder reflectors) with a ridge 0.05ε on each
 term's largest contribution in the currency. Units below are η = 1,
 L = ln(1/ε), Λ = ln(4/ε).
 
@@ -265,7 +265,9 @@ growth-side image cap |Im s|(b − a) ≤ 3 (the fitted rules' off-ray cap); mar
 floor slope 0.01 (the one constant calibrated against the corpus) and margin
 cap 1.2; leg start 0.05/(Mτ_c); the image-horizon guard
 1/max(1 − m/B₀, 0.05); ridge 0.05ε; fit density 2 points per half wave of the
-largest |t| on the real edges and 40 geometric points on the sides; the
+fastest term live at each point of the real edges (live: its contour share,
+nearest-node spacing times modulus, above 10⁻²ε, which drops the line's far
+end) and 40 geometric points on the sides; the
 narrowest built side 4η; the tall-box leg phase 8 rad and the bend floor 2;
 the ladders (×1.1, six rungs each; the bend c, c/2, c/4); the sector φ grid (200
 points) and its gap guard (0.02 rad).
