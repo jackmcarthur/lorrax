@@ -30,7 +30,7 @@ from gw.ppm_tau_kernel import (_get_sigma_kij_kernel,
                                get_shared_sigma_tau_kernel)
 from gw.ppm_windows import branches_for_omega_grid
 from gw import quadrature_log
-from gw.sigma_box_plan import plan_sigma_windows, sigma_rule_request_cache
+from gw.sigma_box_plan import RUN_SCOPE, plan_sigma_windows, sigma_rule_scope
 from gw.wavefunction_bundle import (
     parent_sigma_operands, sigma_face_kernel_kwargs)
 from runtime.padding import combined_divisor, pad_to_axis, padded_axis
@@ -1627,7 +1627,6 @@ def compute_sigma_c_mpa_omega_grid(
     regularization_width_ry,
     edge_factor=1.5,
     quadrature_eps,
-    quadrature_cache_dir,
     omega_grid_step_ry,
     pole_batch_size=4,
     fit_identity=None,
@@ -1745,6 +1744,8 @@ def compute_sigma_c_mpa_omega_grid(
         # never constructs a sampled state-pole lattice.
         summaries = []
         certificate = None
+        # A route without a pole census reuses rules across the run's plans.
+        rule_scope = RUN_SCOPE
         if shared_pole:
             from file_io.shared_pole_store import read_shared_pole_census
             with timing.section("sigma.census"):
@@ -1755,8 +1756,8 @@ def compute_sigma_c_mpa_omega_grid(
                 # A sector call scopes its rules by the map's union census
                 # (compute_sector_sigma), so sectors reuse each other's fits.
                 scope = (sector_context or {}).get("rule_census")
-                quadrature_cache_dir = sigma_rule_request_cache(
-                    quadrature_cache_dir, ledger["identity"],
+                rule_scope = sigma_rule_scope(
+                    ledger["identity"],
                     *((poles2, counts) if scope is None else scope),
                     eta=regularization_width_ry, eps=quadrature_eps)
                 frequencies = shared_pole_frequencies(poles2, counts)
@@ -1797,7 +1798,7 @@ def compute_sigma_c_mpa_omega_grid(
                 summaries, branches, omega_grid_ry,
                 regularization_width_ry,
                 eps=quadrature_eps,
-                cache_dir=quadrature_cache_dir,
+                scope=rule_scope,
                 print_fn=print_fn, edge_factor=edge_factor,
                 fixed_rule_session=fixed_quadrature_session,
                 analytic_line=bool(analytic_line),
@@ -1814,7 +1815,8 @@ def compute_sigma_c_mpa_omega_grid(
             f"{geometry['n_windows']} logical windows, "
             f"{geometry['window_tau_pairs']} (window,tau) pairs, "
             f"{geometry['distinct_tau_count']} branch-distinct tau, "
-            f"cache={geometry['cache_dir'] or 'off'}")
+            f"rule_scope={(geometry['rule_scope'] or 'none')[:24]}, "
+            f"rules_built={geometry['rules_built']}")
         if geometry["sc_fixed_quadrature"]:
             reasons = geometry.get("sc_fixed_recompute_reasons") or {}
             print_fn(
@@ -1866,7 +1868,7 @@ def compute_sigma_c_mpa_omega_grid(
                     f"{prefix}{window['name']}: "
                     f"n_tau={window['node_count']}, "
                     f"nodes={window['node_digest']}, "
-                    f"cache={window['cache_status']}, "
+                    f"rule={window['rule_source']}, "
                     f"box={box} "
                     f"{'eV' if window['sc_fixed_rule'] else 'Ry'}, "
                     f"{padded}"

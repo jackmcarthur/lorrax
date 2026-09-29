@@ -1655,14 +1655,10 @@ _DEFAULTS = {
     # replacing a fully-ready sample store or a finalized/certified pole fit.
     # This key authorizes replacement; it does NOT enable partial-store resume.
     "mpa_overwrite_completed_artifacts": False,
-    # The MPA Sigma box rule owns one accuracy target and one reduction-wall
-    # budget.  Its immutable rules are cached under the run's tmp directory
-    # by default; "off" disables caching and any other spelling is a path
-    # (relative paths are resolved beside the input deck).
+    # The MPA Sigma box rule owns one accuracy target.
     # 1e-4 (owner 2026-09-27): at the requested window every deck's eqp0 is
     # within 0.34 meV of an eps 1e-5 reference (QBUDGET, claim 2881).
     "sigma_quadrature_eps": 1.0e-4,
-    "sigma_quadrature_cache_dir": "auto",
     # Sigma frequency grid
     # None (unset): the grid comes from the protected Sigma band range under
     # the SC window plan; a value is a minimum extent honoured every map.
@@ -2553,8 +2549,6 @@ def _input_response(
         window_edge_factor=float(params["sigma_window_edge_factor"]),
         fermi_reference=str(params["fermi_reference"]).strip().lower(),
         quadrature_eps=float(params["sigma_quadrature_eps"]),
-        quadrature_cache_dir=str(
-            params["sigma_quadrature_cache_dir"]).strip(),
         sigma_at_dft_energies=bool(params["sigma_at_dft_energies"]),
         omega_patches_ev=str(params["sigma_omega_patches_ev"]).strip(),
         band_extrapolation_estimator=str(
@@ -3023,7 +3017,7 @@ def _report_early_retired_keys(
                 f"Input key '{legacy_key}' is retired: GN/HL-PPM now "
                 "writes a one-pole MPA store and uses the shared dynamic "
                 "Sigma route. Remove the key and use "
-                "sigma_quadrature_eps, sigma_quadrature_cache_dir."
+                "sigma_quadrature_eps."
             )
     return (retired)
 
@@ -3075,6 +3069,12 @@ def _report_remaining_retired_keys(
             "1 - f) has |w| >= 1e-5, 11.5 kBT for Fermi-Dirac "
             "(gw.efermi.band_in_occupation_window), the same support for the "
             "one-shot and every SC map.  Remove the key.")
+    if section.get("sigma_quadrature_cache_dir", fallback=None) is not None:
+        raise ValueError(
+            "Input key 'sigma_quadrature_cache_dir' is retired: no quadrature "
+            "rule is stored across runs; every Sigma plan builds its rules "
+            "cold (seconds) and reuses them only within the run.  Remove "
+            "the key.")
     if section.get("low_mem_bands", fallback=None) is not None:
         raise ValueError(
             "Input key 'low_mem_bands' is retired: ψ is always stored "
@@ -4016,7 +4016,6 @@ class DynamicSigmaConfig:
     #: gated by ``gw.shared_pole_recipe.parse_support_sites``.
     w_support_sites_ev: str = _DEFAULTS["sigma_w_support_sites_ev"]
     quadrature_eps: float = _DEFAULTS["sigma_quadrature_eps"]
-    quadrature_cache_dir: str = "auto"
     #: ``sigma_omega_patches_ev``: "" (default, the contiguous
     #: [min, max] grid) or "lo:hi, lo:hi, ..." — a union of uniform
     #: patches at ``omega_step_ev``, replacing the contiguous grid.  The
@@ -4075,9 +4074,6 @@ class DynamicSigmaConfig:
                 "fermi_reference must be 'vbm', 'midgap' or 'mp1_fixed_n'.")
         if not 0.0 < self.quadrature_eps < 1.0:
             raise ValueError("sigma_quadrature_eps must lie in (0, 1).")
-        if not str(self.quadrature_cache_dir).strip():
-            raise ValueError(
-                "sigma_quadrature_cache_dir must be 'auto', 'off', or a path.")
         # REFUSE a retired or unrecognised estimator by name rather than
         # falling back to the default.  A misspelling that silently ran the
         # default would be an A/B measuring nothing -- the same rule

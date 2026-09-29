@@ -8,23 +8,28 @@ Pole fields remain distributed.  MPA supplies the bounded per-pole extrema
 returned by :func:`gw.mpa.sigma_windows.summarize_sigma_poles`; PPM supplies
 the scalar extrema of each exact ``(q, mu, nu)`` pane.  No residue histogram,
 sampled lattice, error apportionment, or campaign-wide selection enters the
-quadrature.  The box construction, lower-half-plane conjugation, cache policy,
-fit guards, and conversion to executor ``(t, alpha)`` live here once for both
-routes.
+quadrature.  The box construction, lower-half-plane conjugation, in-run rule
+reuse, fit guards, and conversion to executor ``(t, alpha)`` live here once for
+both routes.
+
+No rule outlives its process (owner, 2026-09-28: "i really don't want any
+cached rules for quadratures at all"): every plan builds its rules cold, the
+widest crossing window in about a second on the rank's cores
+(``minimax.uniform_rule._map_rows``). Within one run a rule is reused only
+through the in-process request scope (:func:`_scope_lookup`), so the sector
+calls of one map share their fits.
 """
 
 from __future__ import annotations
 
-import errno
 import hashlib
 import json
 import os
 import re
 import pickle
-import socket
 import time
-import uuid
-import zipfile
+from collections import OrderedDict
+from dataclasses import replace
 
 from ffi import _services
 
@@ -46,7 +51,6 @@ from minimax import (
     UniformRule,
     boundary_samples,
     rule_roundoff_amplification,
-    uniform_rule_solver_identity,
 )
 
 #: The box-rule builder: derived nodes and counts, weights from one linear
@@ -68,20 +72,22 @@ _BOX_SIGN_FRACTION = 0.7
 #: Pad toward zero for a sign-definite SC window: 0.5 of its distance escaped by 1.6% on TaAs 8^3
 #: map 1 and 0.25 again at map 2 (semimetal valence state 30 -> 15 -> 6 meV from E_F); 0.05 floors it below 1 meV.
 _SC_ZERO_SIDE_CAP = 0.05
-#: v7: derived rules (bent contour + sector rule, ``minimax.analytic_box``)
-#: accepted on the term mass in the box's currency; v6 (csc + sine, strip
-#: count) and fitted v5 entries are not served, so a run never mixes
-#: families.  v5: rules are built on outward-snapped boxes (_build_box).
-_RULE_CACHE_SCHEMA = "sigma-box-ry-v7"
-#: The run-independent rule table's entry format and key definition
-#: (:func:`_rule_table_key`); a new value opens a new namespace.
-_RULE_TABLE_FORMAT = "sigma-box-table-v1"
+#: The rule family every digest names: derived rules (bent contour + sector
+#: rule, ``minimax.analytic_box``) on outward-snapped boxes, accepted on the
+#: term mass in the box's currency.  It enters :func:`_rule_digest`, which
+#: orders equal-count candidates when a plan serves a window.
+_RULE_FAMILY = "sigma-box-ry-v7"
+#: Request scopes held by this process (:func:`_scope_lookup`): the newest
+#: few, so a long SC run holds a bounded set.  Sector calls of one map share
+#: one scope; a later map with other poles opens its own.
+_SCOPE_LIMIT = 4
+_SCOPES = OrderedDict()
 
 
 def _rule_digest(rule, noise_amplification):
-    """Authenticate the certificate and its complex128 Ry-inverse nodes."""
+    """Name the certificate and its complex128 Ry-inverse nodes."""
     identity = hashlib.sha256(json.dumps(
-        [_RULE_CACHE_SCHEMA, list(rule.box), float(rule.eps),
+        [_RULE_FAMILY, list(rule.box), float(rule.eps),
          bool(rule.relative)]).encode())
     for array in (rule.times, rule.weights):
         identity.update(np.asarray(array, dtype="<c16").tobytes())
@@ -131,47 +137,30 @@ def _receipt_json(receipt):
     return json.dumps(finite(receipt), sort_keys=True, allow_nan=False)
 
 
-def sigma_rule_request_cache(directory, identity, poles2, counts, *, eta, eps):
-    """Scope shared-pole rules to authenticated current-map physical inputs.
+#: The request scope of a route without a pole census (PPM, MPA): one per run.
+RUN_SCOPE = "run"
+
+
+def sigma_rule_scope(identity, poles2, counts, *, eta, eps):
+    """The in-process request scope of a shared-pole Sigma call.
 
     ``identity`` is the model's energy/occupation/recipe provenance;
     ``poles2`` [Nq,K] in Ry**2 and ``counts`` [Nq] are the small host census.
-    Map labels are excluded (:func:`_map_invariant_identity`): equal physical
-    inputs on restart and across SC maps share rules, but changed spectra or
-    occupations cannot inherit a previous map's plan.
-    Domain containment and the executor noise/growth gates still run on hits.
+    Map labels are excluded (:func:`_map_invariant_identity`): the sector
+    calls of one map (which pass the map's union census) and a later map with
+    equal physical inputs share rules, but changed spectra or occupations
+    cannot inherit a previous map's plan. Nothing in a scope outlives the
+    process. Domain containment and the executor noise/growth gates still run
+    on every reuse.
     """
-    if directory is None:
-        return None
     inputs = _map_invariant_identity(identity)
     digest = hashlib.sha256(json.dumps(
-        [_RULE_CACHE_SCHEMA, inputs, float(eta), float(eps)],
+        [_RULE_FAMILY, inputs, float(eta), float(eps)],
         sort_keys=True).encode())
     for row, count in zip(poles2, counts):
         digest.update(np.asarray([count], dtype="<i8").tobytes())
         digest.update(np.asarray(row[:int(count)], dtype="<f8").tobytes())
-    return os.path.join(directory, "request_" + digest.hexdigest())
-
-
-def resolve_sigma_box_cache_dir(setting, input_dir):
-    """Resolve the deck's uniform-rule cache spelling beside its input.
-
-    ``"auto"`` selects ``<input_dir>/tmp/sigma_quadrature_rules``;
-    ``"off"`` disables the acceleration, including the run-independent rule
-    table (:func:`resolve_sigma_rule_table_dir`); any other relative path is
-    resolved against ``input_dir``.  A cache is not an accuracy path: every
-    loaded rule is still checked for box containment and the requested error
-    currency.
-    """
-    raw = str(setting).strip()
-    if raw.lower() == "off":
-        return None
-    root = os.path.abspath(input_dir)
-    if raw.lower() == "auto":
-        return os.path.join(root, "tmp", "sigma_quadrature_rules")
-    expanded = os.path.expanduser(raw)
-    return (expanded if os.path.isabs(expanded)
-            else os.path.join(root, expanded))
+    return "request_" + digest.hexdigest()
 
 
 def _resolve_uniform_rule_trace():
@@ -377,7 +366,7 @@ def _law_node_count(box, eps):
 
 
 def _may_serve(rule_box, rule_nodes, box, *, ceiling_nodes):
-    """THE serving criterion, shared by the cache lookup and the plan.
+    """THE serving criterion, shared by the scope lookup and the plan.
 
     A rule serves a request iff its box contains the request's and its node
     count is at most ``ceiling_nodes``, the closed-form count of the
@@ -386,118 +375,60 @@ def _may_serve(rule_box, rule_nodes, box, *, ceiling_nodes):
     with its short side): on MoS2 3x3 SC with the semicore at eta (branch
     feat/qsgw-partition-2026-09-28) the map-0 probe pass's semicore rule
     ([-63.5, +127] eV, 693 nodes) served the omega>=E_F conduction window
-    ([-35.5, +17.5] eV, law 203), 1472 instead of 982 pairs per map. On main
-    a foreign rule reaches a request through a sector call, a restart or a
-    second plan in one request scope. One criterion for both servers keeps a
-    cold plan equal to its warm rerun.
+    ([-35.5, +17.5] eV, law 203), 1472 instead of 982 pairs per map. A
+    foreign rule reaches a request through a sector call or a second plan in
+    one request scope; one criterion for both servers.
     """
     return (_box_contains(tuple(float(value) for value in rule_box), box)
             and (ceiling_nodes is None or int(rule_nodes) <= int(ceiling_nodes)))
 
 
-def _rule_cache_lookup(
-    directory, box, eps, relative, *, noise_amplification_cap, ceiling_nodes,
+def _scope_lookup(
+    scope, box, eps, relative, *, noise_amplification_cap, ceiling_nodes,
 ):
-    """Return the smallest compatible rule plus any unreadable-path warnings.
+    """``(rule, amplification, digest)``: the smallest compatible rule this
+    process accepted earlier in ``scope``, or ``None``.
 
-    COMPATIBLE is :func:`_may_serve`: the cached box contains the request and
+    COMPATIBLE is :func:`_may_serve`: the rule's box contains the request and
     the rule has at most ``ceiling_nodes`` nodes, the closed-form count of
-    the request's own build (:func:`_law_node_count`). ``None`` states "no
-    count bound" explicitly (tools and tests that inspect a cache).
-
-    Only ``_RULE_CACHE_SCHEMA`` entries are served, and each is authenticated
-    against its stored digest before any compatibility filter reads it.
-    Other schemas (including clock-reduced entries written before
-    2026-09-11) are ignored with one warning, not deleted.
+    the request's own build (:func:`_law_node_count`); plus the same error
+    currency, noise ceiling and certificate. Equal counts go to the smaller
+    digest, a fixed order. ``scope=None`` reuses nothing.
     """
-    if directory is None:
-        return None, ()
-    warnings = []
-    try:
-        entries = [name for name in os.listdir(directory)
-                   if name.startswith("rule_") and name.endswith(".npz")]
-        names = [name for name in entries
-                 if name.startswith(f"rule_{_RULE_CACHE_SCHEMA}_")]
-        stale = sorted(set(entries) - set(names))
-        if stale:
-            warnings.append(
-                "WARNING sigma quadrature cache schema migration: "
-                f"path={os.path.abspath(directory)}; schema={_RULE_CACHE_SCHEMA}; "
-                f"ignored {len(stale)} rule file(s) of another schema, first={stale[0]}; "
-                "affected windows will be rebuilt. The files are retained "
-                "as prior-run evidence.")
-    except FileNotFoundError:
-        # A fresh request scope: nothing stored yet is an empty cache. The
-        # plan's builds create the directory when they are stored.
-        return None, ()
-    except OSError as exc:
-        path = os.path.abspath(directory)
-        warnings.append(
-            "WARNING sigma quadrature cache lookup failed; rules will be "
-            "rebuilt in memory: "
-            f"path={path} error={type(exc).__name__}: {exc}")
-        return None, tuple(warnings)
     best = None
-    for name in sorted(names):
-        path = os.path.abspath(os.path.join(directory, name))
-        try:
-            with np.load(path) as data:
-                # Authenticate the stored object before compatibility filtering.
-                # A nearby requested eps may reuse this certificate, but is
-                # never substituted into the digest of its immutable identity.
-                cached_box = tuple(float(value) for value in data["box"])
-                rule = UniformRule(
-                    times=np.asarray(data["times"]),
-                    weights=np.asarray(data["weights"]),
-                    box=cached_box, eps=float(data["eps"]),
-                    relative=bool(data["relative"]),
-                    theta_deg=float(data["theta_deg"]),
-                    rank=int(data["rank"]),
-                    sup_error=float(data["sup_error"]),
-                    kappa_max=float(data["kappa_max"]), seconds=0.0)
-                amplification = float(data["roundoff_amplification"])
-                if (str(data["schema"]) != _RULE_CACHE_SCHEMA
-                        or not _rule_is_certified(rule, rule.eps)
-                        or rule.times.ndim != 1 or rule.weights.ndim != 1
-                        or not np.isfinite(amplification)
-                        or str(data["digest"]) != _rule_digest(rule, amplification)):
-                    raise ValueError("GATE sigma_rule_integrity: certificate digest/schema mismatch")
-                # A cached certificate above eps, or one built for a looser
-                # noise consumer, is not a rule for this request whatever its
-                # node count (Na pole-tail, 2026-09-05).
-                if (abs(rule.eps - eps) > 1.0e-12 * eps
-                        or rule.relative != relative
-                        or amplification > noise_amplification_cap
-                        or rule.sup_error > eps):
-                    continue
-                if not _may_serve(cached_box, rule.node_count, box,
-                                  ceiling_nodes=ceiling_nodes):
-                    continue
-                if best is None or rule.node_count < best[0].node_count:
-                    best = (rule, name)
-        except (zipfile.BadZipFile, EOFError) as exc:
-            # A CORRUPT archive (a torn write, a quota-truncated copy) is a
-            # miss, never a refusal: zipfile.BadZipFile is not an OSError, so
-            # it used to escape this loop and refuse every later run in the
-            # scope.  Rank 0 deletes it so the scope heals; a peer reading
-            # it concurrently also misses (or finds it gone: an OSError).
-            removed = ""
-            if process_rank() == 0:
-                try:
-                    os.unlink(path)
-                    removed = "; deleted by rank 0"
-                except OSError as unlink_exc:
-                    removed = f"; delete failed: {unlink_exc}"
-            warnings.append(
-                "WARNING sigma quadrature cache entry is corrupt and was "
-                f"treated as a miss: path={path} "
-                f"error={type(exc).__name__}: {exc}{removed}")
-        except (OSError, KeyError, ValueError) as exc:
-            warnings.append(
-                "WARNING sigma quadrature cache entry is unreadable and "
-                "will not be used: "
-                f"path={path} error={type(exc).__name__}: {exc}")
-    return best, tuple(warnings)
+    for digest, (rule, amplification) in sorted(_SCOPES.get(scope, {}).items()):
+        # A certificate above eps, or one built for a looser noise consumer,
+        # is not a rule for this request whatever its node count (Na
+        # pole-tail, 2026-09-05).
+        if (abs(rule.eps - eps) > 1.0e-12 * eps
+                or rule.relative != relative
+                or amplification > noise_amplification_cap
+                or rule.sup_error > eps):
+            continue
+        if not _may_serve(rule.box, rule.node_count, box,
+                          ceiling_nodes=ceiling_nodes):
+            continue
+        if best is None or rule.node_count < best[0].node_count:
+            best = (rule, amplification, digest)
+    return best
+
+
+def _scope_store(scope, fits):
+    """Hold this plan's builds in ``scope`` for the rest of the process.
+
+    Every rank stores the same replicated receipts after the plan's gather,
+    so no rank's lookup depends on how far another has got.
+    """
+    if scope is None:
+        return
+    entries = _SCOPES.setdefault(scope, {})
+    _SCOPES.move_to_end(scope)
+    for fit in fits:
+        if fit["built"] and _rule_is_certified(fit["rule"], float(fit["rule"].eps)):
+            entries.setdefault(fit["rule_digest"],
+                               (fit["rule"], fit["roundoff_amplification"]))
+    while len(_SCOPES) > _SCOPE_LIMIT:
+        _SCOPES.popitem(last=False)
 
 
 def _rule_is_certified(rule, eps) -> bool:
@@ -516,222 +447,6 @@ def _rule_is_certified(rule, eps) -> bool:
         and np.isfinite(float(rule.sup_error))
         and float(rule.sup_error) <= float(eps)
         and np.isfinite(float(rule.kappa_max)))
-
-
-def _rule_cache_store(directory, rule, noise_amplification):
-    """Atomically store one immutable box certificate, or return a warning."""
-    if directory is None:
-        return None
-    if not (_rule_is_certified(rule, float(rule.eps))
-            and np.isfinite(float(noise_amplification))):
-        return ("WARNING sigma quadrature cache store refused an uncertified "
-                "or non-finite rule (nothing written)")
-    digest = _rule_digest(rule, noise_amplification)
-    path = os.path.abspath(os.path.join(
-        directory, f"rule_{_RULE_CACHE_SCHEMA}_{digest}.npz"))
-    temporary = None
-    try:
-        os.makedirs(directory, exist_ok=True)
-        temporary = _temporary_name(path)
-        _write_rule_archive(temporary, rule, noise_amplification, digest)
-        os.replace(temporary, path)
-    except OSError as exc:
-        if temporary is not None:
-            try:
-                os.unlink(temporary)
-            except OSError:
-                pass
-        # A cache is an acceleration, never a second correctness path, so the
-        # accepted rule remains usable. Silence is still wrong: it turns every
-        # restart into a cold 100+s plan with no explanation.
-        return (
-            "WARNING sigma quadrature cache write failed; this accepted rule "
-            "will be rebuilt on a later run: "
-            f"path={path} error={type(exc).__name__}: {exc}")
-    return None
-
-
-def _temporary_name(path):
-    """A sibling name no other node, rank or process can pick for ``path``."""
-    return (f"{path}.{socket.gethostname()}.{process_rank()}.{os.getpid()}."
-            f"{uuid.uuid4().hex[:12]}.tmp")
-
-
-def _write_rule_archive(path, rule, noise_amplification, digest, **extra):
-    """Write one rule archive at ``path`` and make it durable."""
-    with open(path, "wb") as handle:
-        np.savez(
-            handle, schema=_RULE_CACHE_SCHEMA, digest=digest,
-            box=np.asarray(rule.box, np.float64),
-            eps=float(rule.eps), relative=bool(rule.relative),
-            times=rule.times, weights=rule.weights,
-            sup_error=float(rule.sup_error),
-            kappa_max=float(rule.kappa_max),
-            roundoff_amplification=float(noise_amplification),
-            theta_deg=float(rule.theta_deg), rank=int(rule.rank),
-            seconds=float(rule.seconds), **extra)
-        # Durable before it becomes visible: without this a node loss
-        # after the rename can leave a torn archive under the final name.
-        handle.flush()
-        os.fsync(handle.fileno())
-
-
-# ---------------------------------------------------------------- rule table
-# The run-local request scope above is a SERVING policy: containment inside
-# one physical scope, so sector calls and restarts share rules. The table
-# below is a MEMO of the builder: ``_BOX_RULE_BUILDER(build_box, eps,
-# mass_cap)`` reads no clock and pins its BLAS threads, so its result is a
-# function of the snapped build box, the currency and the solver identity
-# (claim 2737). A hit returns the bytes a cold build returns, so a warm run
-# equals the cold run that wrote the table, and no run's answer depends on
-# which other decks wrote it. Serving across runs by containment would.
-
-def resolve_sigma_rule_table_dir(cache_dir):
-    """The run-independent rule table, or ``None`` when caching is off.
-
-    ``$SCRATCH/.cache/lorrax/sigma_box_rules``, beside the compile caches
-    (:func:`common.jax_compile_cache.default_cache_root`); no knob.
-    ``sigma_quadrature_cache_dir = off`` (``cache_dir is None``) turns it
-    off with the run-local scope. ``LORRAX_SIGMA_RULE_TABLE_TEST_DIR`` is
-    the suite's private table (``tests/conftest.py``): tests patch the
-    builder, and a fake rule must never reach the user's table.
-    """
-    if cache_dir is None:
-        return None
-    private = os.environ.get("LORRAX_SIGMA_RULE_TABLE_TEST_DIR", "").strip()
-    if private:
-        return private
-    from common.jax_compile_cache import default_cache_root
-    return os.path.join(str(default_cache_root().parent), "sigma_box_rules")
-
-
-def _rule_table_key(build_box, eps, relative, mass_cap):
-    """Everything a builder call's result depends on, JSON-ready.
-
-    ``builder`` names the function that answers: a patched builder (a test
-    fake) opens its own namespace and can never answer a production key.
-    """
-    return {
-        "format": _RULE_TABLE_FORMAT, "schema": _RULE_CACHE_SCHEMA,
-        "builder": (f"{_BOX_RULE_BUILDER.__module__}."
-                    f"{_BOX_RULE_BUILDER.__qualname__}"),
-        "box": [float(value) for value in build_box], "eps": float(eps),
-        "relative": bool(relative),
-        "mass_cap": None if mass_cap is None else float(mass_cap),
-        "solver": uniform_rule_solver_identity(),
-    }
-
-
-def _rule_table_path(root, key):
-    """``(path, key_json)``: one namespace per format and solver identity.
-
-    JSON spells a float by its shortest round-trip repr, so equal keys are
-    equal bit for bit."""
-    blob = json.dumps(key, sort_keys=True, separators=(",", ":"))
-    digest = hashlib.sha256(blob.encode()).hexdigest()
-    solver = hashlib.sha256(json.dumps(
-        [key["builder"], key["solver"]], sort_keys=True).encode()).hexdigest()[:16]
-    return (os.path.join(root, f"{key['format']}_{solver}", digest[:2],
-                         f"rule_{digest}.npz"), blob)
-
-
-def _rule_table_lookup(root, key):
-    """``((rule, amplification, digest), None)`` on a hit, else ``(None, why)``.
-
-    ``why`` is ``None`` for an absent entry and a named warning for one that
-    exists but is not served: another format or schema, another key, or a
-    certificate whose digest does not authenticate.
-    """
-    path, blob = _rule_table_path(root, key)
-    try:
-        with np.load(path, allow_pickle=False) as data:
-            stored = (str(data["table_format"]), str(data["schema"]))
-            if stored != (_RULE_TABLE_FORMAT, _RULE_CACHE_SCHEMA):
-                raise ValueError(
-                    f"schema mismatch: entry {stored[0]}/{stored[1]}, "
-                    f"this build reads {_RULE_TABLE_FORMAT}/{_RULE_CACHE_SCHEMA}")
-            box = tuple(float(value) for value in data["box"])
-            if str(data["key"]) != blob or list(box) != key["box"]:
-                raise ValueError("key mismatch: the entry answers another request")
-            rule = UniformRule(
-                times=np.asarray(data["times"]),
-                weights=np.asarray(data["weights"]),
-                box=box, eps=float(data["eps"]),
-                relative=bool(data["relative"]),
-                theta_deg=float(data["theta_deg"]), rank=int(data["rank"]),
-                sup_error=float(data["sup_error"]),
-                kappa_max=float(data["kappa_max"]), seconds=0.0)
-            amplification = float(data["roundoff_amplification"])
-            digest = _rule_digest(rule, amplification)
-            if (str(data["digest"]) != digest
-                    or not _rule_is_certified(rule, rule.eps)
-                    or rule.times.ndim != 1 or rule.weights.ndim != 1
-                    or not np.isfinite(amplification)):
-                raise ValueError("certificate digest mismatch")
-    except FileNotFoundError:
-        return None, None
-    except (OSError, KeyError, ValueError, EOFError, zipfile.BadZipFile) as exc:
-        return None, (
-            "WARNING sigma rule table entry not served (a miss; this run "
-            f"builds the rule and replaces the entry): path={path} "
-            f"error={type(exc).__name__}: {exc}")
-    return (rule, amplification, digest), None
-
-
-def _rule_table_store(root, key, rule, noise_amplification):
-    """Publish one built rule; the first writer wins. Returns a warning or ``None``.
-
-    The archive is written and synced under a private name, then hard-linked
-    to its key: ``link`` fails when the key exists, so a published entry
-    never changes and readers never see a partial file. A published entry
-    whose rule differs from this build is a DETERMINISM warning (the builder
-    is meant to be a function of the key); the table keeps the first. An
-    unservable entry is replaced by rename. Where the filesystem has no hard
-    links, rename publishes (the last writer wins, still whole).
-    """
-    path, blob = _rule_table_path(root, key)
-    digest = _rule_digest(rule, noise_amplification)
-    temporary = None
-    try:
-        os.makedirs(os.path.dirname(path), exist_ok=True)
-        temporary = _temporary_name(path)
-        _write_rule_archive(temporary, rule, noise_amplification, digest,
-                            table_format=_RULE_TABLE_FORMAT, key=blob)
-        try:
-            os.link(temporary, path)
-            return None
-        except FileExistsError:
-            pass
-        except OSError as exc:
-            if exc.errno not in (errno.EPERM, errno.EOPNOTSUPP, errno.EXDEV,
-                                 errno.EMLINK, errno.ENOSYS):
-                raise
-            os.replace(temporary, path)
-            temporary = None
-            return None
-        existing, problem = _rule_table_lookup(root, key)
-        if existing is None:
-            os.replace(temporary, path)
-            temporary = None
-            return None if problem is None else (
-                problem + "; replaced by this run's build")
-        if existing[2] != digest:
-            return (
-                "WARNING sigma rule table DETERMINISM: this run built a "
-                "different rule for a key already in the table (the table "
-                f"keeps the first; this run used its own build): path={path} "
-                f"table digest={existing[2][:16]} build digest={digest[:16]}")
-        return None
-    except OSError as exc:
-        return ("WARNING sigma rule table write failed; this rule will be "
-                f"rebuilt by a later run: path={path} "
-                f"error={type(exc).__name__}: {exc}")
-    finally:
-        if temporary is not None:
-            try:
-                os.unlink(temporary)
-            except OSError:
-                pass
 
 
 #: Relative cell of the logarithmic grid every build box is snapped outward to.
@@ -757,8 +472,8 @@ def snap_outward(x, scale, outward):
 def _build_box(box, eta, *, widen):
     """The box a rule is built on: the request, optionally widened, snapped outward.
 
-    ``widen`` adds 1% of the width to the far edges (|x| > 3 eta) so nearby
-    SC maps and sector calls hit by containment. The snap makes the rule a
+    ``widen`` adds 1% of the width to the far edges (|x| > 3 eta) so the
+    sector calls of one map reuse by containment. The snap makes the rule a
     function of a grid cell rather than of the exact request: a request
     moved by round-off (extreme shared-pole edges differ 1e-9-4e-8 relative
     between two exact GEMM orders) otherwise lands on a different rule (the
@@ -811,96 +526,79 @@ def _noise_amplification_cap():
     return _RUNTIME_NOISE_BUDGET / _RUNTIME_NOISE_EPSILON
 
 
-def _fit_rule(spec, eps, cache_dir, eta, *, cache_build_widen=True):
-    """Look up or build one window's rule and accept it; never write the cache.
+def _fit_rule(spec, eps, scope, eta, *, build_widen=True):
+    """Reuse or build one window's rule and accept it; never store it.
 
-    The lookup reads only certificates written before this plan: the plan's
+    The scope lookup reads only rules accepted before this plan: the plan's
     own builds are stored after every rank has looked up (see
-    :func:`fit_sigma_box_specs`), so no window's choice depends on how far
-    another rank has got.
+    :func:`fit_sigma_box_spec_groups`), so no window's choice depends on how
+    far another rank has got.
     """
     requested_box = spec["box"]
     # This is exactly the builder's default currency predicate.  It is used
-    # here only to search cache metadata; cache misses still leave the choice
-    # to _BOX_RULE_BUILDER(relative=None).
+    # here only to match reused rules; a build still leaves the choice to
+    # _BOX_RULE_BUILDER(relative=None).
     relative = requested_box[0] > 0.0 or requested_box[1] < 0.0
     noise_amplification_cap = _noise_amplification_cap()
     analytic_line = (bool(spec.get("analytic_line")) and not relative
                      and requested_box[2] == requested_box[3]
                      and spec["pole_extent"][2:] == (0.0, 0.0))
-    built = False
-    rule_table, table_key = "none", None
+    built, amplification = False, None
     if analytic_line:
         # PPM's real poles make Im(d)=eta exactly.  Ask the analytic service
-        # for that line; a cached rectangle rule cannot silently preempt it.
+        # for that line; a reused rectangle rule cannot silently preempt it.
         rule = analytic_line_box_rule(requested_box, eps)
-        cache_lookup_warnings = ()
-        cache_status = "analytic-line"
+        rule_source = "analytic-line"
     else:
-        ceiling_nodes = _law_node_count(_build_box(requested_box, eta, widen=(
-            cache_dir is not None and cache_build_widen)), eps)
-        cached, cache_lookup_warnings = _rule_cache_lookup(
-            cache_dir, requested_box, eps, relative,
+        build_box = _build_box(requested_box, eta, widen=build_widen)
+        ceiling_nodes = _law_node_count(build_box, eps)
+        reused = _scope_lookup(
+            scope, requested_box, eps, relative,
             noise_amplification_cap=noise_amplification_cap,
             ceiling_nodes=ceiling_nodes)
-        if cached is not None:
-            rule, cache_name = cached
-            cache_status = f"hit:{cache_name}"
+        if reused is not None:
+            rule, amplification, digest = reused
+            rule = replace(rule, seconds=0.0)
+            rule_source = f"scope:{digest[:16]}"
         else:
-            build_box = _build_box(requested_box, eta, widen=(
-                cache_dir is not None and cache_build_widen))
             # The builder's ladder steps on the executor's own noise gate:
             # the term mass rho*sum|w e^{itd}| in the box's currency (rho =
             # |d| or eta), the quantity _accept_rule bounds below.
-            build_kwargs = {"mass_cap": noise_amplification_cap}
-            table = resolve_sigma_rule_table_dir(cache_dir)
-            entry = None
-            if table is not None:
-                table_key = _rule_table_key(
-                    build_box, eps, build_box[0] > 0.0 or build_box[1] < 0.0,
-                    noise_amplification_cap)
-                entry, table_warning = _rule_table_lookup(table, table_key)
-                if table_warning is not None:
-                    cache_lookup_warnings += (table_warning,)
-            if entry is not None:
-                rule, rule_table = entry[0], "hit"
-            else:
-                rule = _BOX_RULE_BUILDER(build_box, eps, **build_kwargs)
-                rule_table = "off" if table is None else "built"
-            # A table hit is this plan's build in every later step (the
-            # request-scope store and _serve_from_plan), so warm equals cold.
+            rule = _BOX_RULE_BUILDER(build_box, eps,
+                                     mass_cap=noise_amplification_cap)
             built = True
-            cache_status = "miss" if cache_dir is not None else "off"
+            rule_source = "built"
         # There is no retry.  The builder takes no clock and no pass count,
         # so a second call with the same inputs returns the same rule; the
         # old 5x-budget retry existed only because the first attempt could
         # have been cut short by a deadline, and there is no deadline to
         # lengthen.  A refusal here is now a statement about the box.
-    fit = _accept_rule(spec, rule, eps, cache_status=cache_status,
-                       cache_dir=cache_dir)
+    fit = _accept_rule(spec, rule, eps, rule_source=rule_source,
+                       noise_amplification=amplification)
     fit.update(built=built, analytic_line=analytic_line,
-               cache_lookup_warnings=tuple(cache_lookup_warnings),
-               rule_table=rule_table, rule_table_key=table_key,
                serve_ceiling_nodes=None if analytic_line else ceiling_nodes)
     return fit
 
 
-def _accept_rule(spec, rule, eps, *, cache_status, cache_dir):
-    """Accept one rule for one window, or refuse; return its executor receipt."""
+def _accept_rule(spec, rule, eps, *, rule_source, noise_amplification=None):
+    """Accept one rule for one window, or refuse; return its executor receipt.
+
+    ``noise_amplification`` is the rule's own term mass when an earlier
+    acceptance in this process already measured it (a function of the rule
+    and ``eps`` only); ``None`` measures it here.
+    """
     noise_budget = _RUNTIME_NOISE_BUDGET
     # ONE ACCEPTANCE ON EVERY PATH.  One-shot, fixed-SC initialization and
     # its rebuilds all require the certified sup error at or below eps; the
     # fixed-SC bypass (enforce_sup_error=False, 2026-09-03) let Na retain a
     # conduction pole-tail rule at 400 x eps in every self-consistent arm.
     if not _rule_is_certified(rule, eps):
-        cache_note = ("" if cache_dir is None
-                      else f", cache directory {os.path.abspath(cache_dir)}")
         raise RuntimeError(
             f"Sigma box window {spec['name']!r} refused: rule sup error "
             f"{float(rule.sup_error):.6g} exceeds eps={eps:.6g} or the rule "
             f"is not finite ({int(np.asarray(rule.times).size)} nodes on box "
             f"{tuple(round(float(v), 6) for v in rule.box)}, kind "
-            f"{spec.get('kind', '?')}, cache={cache_status}{cache_note}"
+            f"{spec.get('kind', '?')}, rule={rule_source}"
             f"). Remedy: a sign-preserving or split product window (the SC "
             f"pad now keeps sign-definite supports sign-definite), or a "
             f"certified crossing rule; do not loosen sigma_quadrature_eps to "
@@ -911,12 +609,13 @@ def _accept_rule(spec, rule, eps, *, cache_status, cache_dir):
     # error by ~|d|/eta at its far edge.  Measure rho*sum|term| directly.
     # the noise mass has a subharmonic logarithm, so its box maximum lies on
     # the boundary: sample the edges at the rule's own horizon
-    noise_cloud = boundary_samples(
-        rule.box, rule.theta_deg, float(np.max(np.abs(rule.times))), eps)
-    noise_rho = (np.abs(noise_cloud) if rule.relative
-                 else float(np.min(noise_cloud.imag)))
-    noise_amplification = rule_roundoff_amplification(
-        rule.times, rule.weights, noise_cloud, noise_rho)
+    if noise_amplification is None:
+        noise_cloud = boundary_samples(
+            rule.box, rule.theta_deg, float(np.max(np.abs(rule.times))), eps)
+        noise_rho = (np.abs(noise_cloud) if rule.relative
+                     else float(np.min(noise_cloud.imag)))
+        noise_amplification = rule_roundoff_amplification(
+            rule.times, rule.weights, noise_cloud, noise_rho)
     noise_bound = noise_amplification * _RUNTIME_NOISE_EPSILON
     if not np.isfinite(noise_bound) or noise_bound > noise_budget:
         raise RuntimeError(
@@ -946,29 +645,25 @@ def _accept_rule(spec, rule, eps, *, cache_status, cache_dir):
         "relative": bool(rule.relative), "sup_error": float(rule.sup_error),
         "kappa_max": float(rule.kappa_max), "theta_deg": float(rule.theta_deg),
         "rank": int(rule.rank), "seconds": float(rule.seconds),
-        "cache_status": cache_status, "factor_growth": growth,
+        "rule_source": rule_source, "factor_growth": growth,
         "noise_bound": noise_bound, "noise_budget": noise_budget,
         "roundoff_amplification": noise_amplification,
         "node_digest": node_digest,
         "rule": rule, "rule_digest": _rule_digest(rule, noise_amplification),
-        "cache_write_warning": None, "cache_lookup_warnings": (),
-        "rule_table": "none", "rule_table_key": None,
-        "rule_table_warning": None,
         "one_line": (f"analytic line: {rule.node_count} nodes, "
                      f"sup {rule.sup_error:.2e} (eps {eps:g})"
-                     if cache_status == "analytic-line" else rule.one_line()),
+                     if rule_source == "analytic-line" else rule.one_line()),
     }
 
 
-def _serve_from_plan(specs, fits, eps, cache_dir):
+def _serve_from_plan(specs, fits, eps):
     """Give each window the smallest compatible rule of this whole plan.
 
-    Resolution runs after every miss is built, on the replicated receipts, in
-    a fixed order: candidates are the window's own rule (a pre-plan cache hit
-    or its build) and every rule this plan built, ranked by (node count,
-    certificate digest), and a candidate must pass :func:`_may_serve`, the
-    criterion a later cache lookup applies. The result is the rule a warm
-    rerun would pick and does not depend on rank timing:
+    Resolution runs after every build, on the replicated receipts, in a fixed
+    order: candidates are the window's own rule (a scope reuse or its build)
+    and every rule this plan built, ranked by (node count, certificate
+    digest), and a candidate must pass :func:`_may_serve`, the criterion the
+    scope lookup applies. The result does not depend on rank timing:
     before this, whether a window saw another window's fresh rule depended on
     how far the other rank had got (Si shared-pole ``cond:pole_tail`` took
     the 9-node own rule or the 7-node ``cond:bulk`` one, eqp1 0.80 ueV apart;
@@ -996,12 +691,12 @@ def _serve_from_plan(specs, fits, eps, cache_dir):
                     continue
                 try:
                     chosen = _accept_rule(
-                        spec, rule, eps, cache_dir=cache_dir,
-                        cache_status=f"plan:{other['rule_digest'][:16]}")
+                        spec, rule, eps,
+                        rule_source=f"plan:{other['rule_digest'][:16]}",
+                        noise_amplification=other["roundoff_amplification"])
                 except RuntimeError:
                     continue
-                chosen.update(built=False, analytic_line=False,
-                              cache_lookup_warnings=own["cache_lookup_warnings"])
+                chosen.update(built=False, analytic_line=False)
                 break
         served.append(chosen)
     return served
@@ -1060,8 +755,8 @@ def _parallel_fits(specs, worker, costs):
         lengths = np.asarray(all_gather_processes(
             np.asarray(payload.size, np.int32)), dtype=np.int64).reshape(-1)
         # A power-of-two carrier: the gather's shape is part of its compile
-        # key, and the pickled receipts carry the run's rule-cache path, so
-        # an exact width gave every run directory its own executable.
+        # key, and the pickled receipts' size follows the run's paths and
+        # windows, so an exact width gave every run its own executable.
         width = 1 << max(0, int(np.max(lengths)) - 1).bit_length()
         padded = np.zeros(width, np.uint8)
         padded[:payload.size] = payload
@@ -1079,33 +774,34 @@ def _parallel_fits(specs, worker, costs):
     return [row["value"] for row in rows], rows
 
 
-def fit_sigma_box_specs(
-    specs, eta_ry, *, eps, cache_dir, cache_build_widen=True,
-):
+def fit_sigma_box_specs(specs, eta_ry, *, eps, scope, build_widen=True):
     """One plan: :func:`fit_sigma_box_spec_groups` with a single group."""
     (fits, fit_rows), = fit_sigma_box_spec_groups(
-        [(specs, cache_build_widen)], eta_ry, eps=eps, cache_dir=cache_dir)
+        [(specs, build_widen)], eta_ry, eps=eps, scope=scope)
     return fits, fit_rows
 
 
-def fit_sigma_box_spec_groups(groups, eta_ry, *, eps, cache_dir):
+def fit_sigma_box_spec_groups(groups, eta_ry, *, eps, scope):
     """Fit independent route-neutral box specifications across processes.
 
     The input rows must come from :func:`make_sigma_box_spec`.  This function
-    owns the shared cache lookup/build, rule acceptance, lower-half-plane
+    owns the in-run reuse and the build, rule acceptance, lower-half-plane
     conjugation, runtime-noise guard, and factored-growth guard.  It returns
     only small replicated rule receipts; route-specific physical selectors
-    stay with the caller.  With a cache, every window is looked up against
-    the certificates present before the plan, every miss is built, the
-    builds are stored, and each window is then served the smallest
+    stay with the caller.  Every window is looked up in ``scope`` as it was
+    before the plan (:func:`_scope_lookup`), every other window is built, the
+    builds join the scope, and each window is then served the smallest
     compatible rule of the plan in a fixed order (:func:`_serve_from_plan`),
-    so the result does not depend on rank timing.
+    so the result does not depend on rank timing.  ``scope=None`` reuses
+    nothing across plans.
 
-    ``groups`` is a list of ``(specs, cache_build_widen)``; each group is one
-    plan, looked up against the cache as it was before this call and served
-    only from its own builds, but all groups share one balanced parallel pass
-    (the SC map-0 one-shot and padded sets, P2-E 2026-09-24). Returns one
-    ``(fits, fit_rows)`` per group.
+    ``groups`` is a list of ``(specs, build_widen)``; each group is one plan,
+    looked up in the scope as it was before this call and served only from
+    its own builds, but all groups share one balanced parallel pass (the SC
+    map-0 one-shot and padded sets, P2-E 2026-09-24). ``build_widen`` widens
+    the far edges of a build box by 1% (:func:`_build_box`), so the sector
+    calls of one map reuse by containment. Returns one ``(fits, fit_rows)``
+    per group.
     """
     rows, widen, bounds = [], [], []
     for specs, group_widen in groups:
@@ -1120,39 +816,14 @@ def fit_sigma_box_spec_groups(groups, eta_ry, *, eps, cache_dir):
         raise ValueError("sigma_quadrature_eps must lie in (0, 1)")
     fits, fit_rows = _parallel_fits(
         rows, lambda index: _fit_rule(
-            rows[index], tolerance, cache_dir, eta,
-            cache_build_widen=widen[index]),
+            rows[index], tolerance, scope, eta, build_widen=widen[index]),
         [_fit_cost(spec, eta) for spec in rows])
-    if cache_dir is None:
-        return [(fits[lo:hi], fit_rows[lo:hi]) for lo, hi in bounds]
-    # Every rank has looked up by now (the gather above), so writing the
-    # plan's builds cannot change any choice made in it. One writer: the
-    # replicated receipts already hold every build.
-    table = resolve_sigma_rule_table_dir(cache_dir)
-    if process_rank() == 0:
-        stored, published = {}, {}
-        for fit in fits:
-            if fit["built"] and fit["rule_digest"] not in stored:
-                stored[fit["rule_digest"]] = _rule_cache_store(
-                    cache_dir, fit["rule"], fit["roundoff_amplification"])
-            if fit["built"]:
-                fit["cache_write_warning"] = stored[fit["rule_digest"]]
-            if fit["rule_table"] == "built" and table is not None:
-                # Every builder call of the plan, served or not, is memoized.
-                key = json.dumps(fit["rule_table_key"], sort_keys=True)
-                if key not in published:
-                    published[key] = _rule_table_store(
-                        table, fit["rule_table_key"], fit["rule"],
-                        fit["roundoff_amplification"])
-                fit["rule_table_warning"] = published[key]
-    if process_count() > 1 and any(fit["built"] for fit in fits):
-        # ORDER the store before any rank's NEXT lookup.  Sector Sigma calls
-        # share one scope (eb19474d): without this a peer can look up the TT
-        # or CT windows before rank 0 has stored CC's builds, miss, and fit a
-        # different (within-eps) rule, so the plan would depend on rank
-        # timing.  ``fits`` is replicated, so every rank takes this or none.
-        all_gather_processes(np.asarray(0, np.int32))
-    return [(_serve_from_plan(rows[lo:hi], fits[lo:hi], tolerance, cache_dir),
+    # Every rank has looked up by now (the gather above) and holds the same
+    # replicated receipts, so storing the plan's builds on every rank cannot
+    # change any choice made in it, and the next plan sees the same scope on
+    # every rank.
+    _scope_store(scope, fits)
+    return [(_serve_from_plan(rows[lo:hi], fits[lo:hi], tolerance),
              fit_rows[lo:hi]) for lo, hi in bounds]
 
 
@@ -1334,14 +1005,8 @@ def _fixed_fit_for_spec(entry, spec):
             f"refused while reusing its fixed SC rule: factored log growth "
             f"{max(growth):.6g} exceeds {_FACTOR_GROWTH_CAP:g}")
     fit["factor_growth"] = growth
-    fit["cache_status"] = "hit:sc-fixed"
-    fit["rule_table"] = "none"
+    fit["rule_source"] = "hit:sc-fixed"
     fit["seconds"] = 0.0
-    # A failed write was announced on the iteration that attempted it. Reusing
-    # the in-memory fixed rule must not repeat the old warning every SC map.
-    fit["cache_write_warning"] = None
-    fit["rule_table_warning"] = None
-    fit["cache_lookup_warnings"] = ()
     return fit
 
 
@@ -1404,7 +1069,7 @@ def _certified_entry(fit, padded_spec, spec, **extra):
 
 
 def _fit_fixed_sc_rules(
-    specs, eta, *, eps, cache_dir, session, material_class=None,
+    specs, eta, *, eps, scope, session, material_class=None,
     occupation_reach_ry=None,
 ):
     """The SC window plan's rules: plan once at map 0, hold, rebuild on an escape.
@@ -1484,10 +1149,10 @@ def _fit_fixed_sc_rules(
         padded = [_sc_padded_box_spec(spec, eta, occupation_reach_ry=occupation_reach_ry)
                   for spec in rows]
         (served, fit_rows), (fits, padded_rows) = fit_sigma_box_spec_groups(
-            [(rows, True), (padded, False)], eta, eps=eps, cache_dir=cache_dir)
+            [(rows, True), (padded, False)], eta, eps=eps, scope=scope)
         session["rules"] = {
             spec["name"]: _certified_entry(
-                dict(fit, cache_status=f"init:{fit['cache_status']}"), padded_spec, spec)
+                dict(fit, rule_source=f"init:{fit['rule_source']}"), padded_spec, spec)
             for spec, padded_spec, fit in zip(rows, padded, fits)}
         session["initial_window_tau_pairs"] = int(sum(
             fit["node_count"] for fit in fits))
@@ -1527,11 +1192,10 @@ def _fit_fixed_sc_rules(
         with timing.section("sigma.rule_refit", announce=True,
                             label=f"Sigma rule refit ({len(padded)} {label} windows)"):
             new_fits, fit_rows = fit_sigma_box_specs(
-                padded, eta, eps=eps, cache_dir=cache_dir,
-                cache_build_widen=False)
+                padded, eta, eps=eps, scope=scope, build_widen=False)
         for spec, padded_spec, fit in zip(refit, padded, new_fits):
             rules[spec["name"]] = _certified_entry(
-                dict(fit, cache_status=f"rebuild:sc-fixed:{fit['cache_status']}"),
+                dict(fit, rule_source=f"rebuild:sc-fixed:{fit['rule_source']}"),
                 padded_spec, spec, rebuilt_at_iteration=iteration,
                 rebuild_reason=reasons_by_name[spec["name"]])
     # A product window may temporarily have no live state/pole tuples.  Keep
@@ -1554,9 +1218,9 @@ def _fit_fixed_sc_rules(
                                 label="Sigma rule refit (validity)"):
                 new_fits, new_rows = fit_sigma_box_specs(
                     [padded_spec], eta, eps=eps,
-                    cache_dir=cache_dir, cache_build_widen=False)
+                    scope=scope, build_widen=False)
             rebuilt = dict(new_fits[0])
-            rebuilt["cache_status"] = "rebuild:sc-fixed-validity"
+            rebuilt["rule_source"] = "rebuild:sc-fixed-validity"
             rules[spec["name"]] = _certified_entry(
                 rebuilt, padded_spec, spec, rebuilt_at_iteration=iteration,
                 rebuild_reason=f"validity: {exc}")
@@ -1619,7 +1283,7 @@ def plan_sigma_windows(
     eta_ry,
     *,
     eps,
-    cache_dir,
+    scope,
     print_fn=print,
     edge_factor=1.5,
     fixed_rule_session=None,
@@ -1654,8 +1318,10 @@ def plan_sigma_windows(
         at this value, using relative error on sign-definite boxes and
         peak-relative error on crossing boxes; this matches the measured
         Sigma error currency.
-    cache_dir
-        Directory for immutable box-rule certificates, or ``None``.
+    scope
+        The in-process request scope (:func:`sigma_rule_scope`,
+        :data:`RUN_SCOPE`) whose earlier rules this plan may reuse, or
+        ``None``; nothing in it outlives the process.
     fixed_rule_session
         Mutable run-local receipt used only by a multi-map SC calculation.
         Its first call serves the one-shot rules and certifies the same
@@ -1701,7 +1367,7 @@ def plan_sigma_windows(
       error; the builder's relative currency measured 0.1 rather than 4 meV.
     * Retry at tighter ``eps``: a sup, noise, growth, or resource refusal is
       already about this box; a hidden retry is a second accuracy policy.
-    * Widen near-zero edges for cache hits: those edges set crossing rank and
+    * Widen near-zero edges for reuse hits: those edges set crossing rank and
       do not drift; measured 3% all-edge widening added 67 pairs on Na.
     * Reserve another factor for the number of product windows: the windows
       partition the causal ``(state, pole, omega-sign)`` tuples, so every
@@ -1826,25 +1492,13 @@ def plan_sigma_windows(
     fixed_receipt = None
     if fixed_rule_session is None:
         fits, fit_rows = fit_sigma_box_specs(
-            specs, eta, eps=tolerance, cache_dir=cache_dir)
+            specs, eta, eps=tolerance, scope=scope)
     else:
         fits, fit_rows, fixed_receipt = _fit_fixed_sc_rules(
             specs, eta, eps=tolerance,
-            cache_dir=cache_dir, session=fixed_rule_session,
+            scope=scope, session=fixed_rule_session,
             material_class=material_class,
             occupation_reach_ry=occupation_reach_ry)
-    if process_rank() == 0:
-        announced = set()
-        for fit in fits:
-            warnings = tuple(fit.get("cache_lookup_warnings", ()))
-            for write_warning in (fit.get("cache_write_warning"),
-                                  fit.get("rule_table_warning")):
-                if write_warning:
-                    warnings += (write_warning,)
-            for warning in warnings:
-                if warning not in announced:
-                    print_fn(warning)
-                    announced.add(warning)
     # The (window, tau) pair count is reported, never refused on: the owner
     # eliminated the pair ceiling (2026-09-02).  A count above what a deck
     # can afford is a planning question answered by eps and the window
@@ -1868,7 +1522,7 @@ def plan_sigma_windows(
             max_error=fit["sup_error"],
             provenance=(
                 f"uniform denominator box {spec['box']}; "
-                f"{fit['one_line']}; cache={fit['cache_status']}; "
+                f"{fit['one_line']}; rule={fit['rule_source']}; "
                 f"factor_growth={fit['factor_growth']}"))
         output.append(SharedSigmaWindow(
             window=window, E_A=spec["branch"].E_A,
@@ -1898,8 +1552,7 @@ def plan_sigma_windows(
             "runtime_noise_bound": fit["noise_bound"],
             "runtime_noise_budget": fit["noise_budget"],
             "factor_growth": list(fit["factor_growth"]),
-            "cache_status": fit["cache_status"],
-            "rule_table": fit["rule_table"],
+            "rule_source": fit["rule_source"],
             "fit_seconds": fit["seconds"],
             "sc_fixed_rule": frozen,
             "sc_fixed_padded_box_ry": (
@@ -1920,13 +1573,9 @@ def plan_sigma_windows(
         "planner": "uniform_denominator_boxes",
         "eta_ry": eta, "eps": tolerance,
         "rule_eps": tolerance,
-        "cache_dir": cache_dir, "rule_cache_schema": _RULE_CACHE_SCHEMA,
-        "rule_table_dir": resolve_sigma_rule_table_dir(cache_dir),
-        "rule_table_format": _RULE_TABLE_FORMAT,
-        "rule_table_lookups": {
-            status: sum(1 for row in fit_rows
-                        if (row.get("value") or {}).get("rule_table") == status)
-            for status in ("hit", "built")},
+        "rule_scope": scope, "rule_family": _RULE_FAMILY,
+        "rules_built": sum(1 for row in fit_rows
+                           if (row.get("value") or {}).get("built")),
         "n_windows": len(output),
         "window_tau_pairs": pairs, "distinct_tau_count": distinct,
         "plan_seconds": time.perf_counter() - started,
@@ -1968,7 +1617,7 @@ def plan_sigma_windows(
     else:
         geometry["sc_fixed_quadrature"] = False
     # Keep the accepted rule identity in the normal scientific report,
-    # including cache-off and repeated SC planning calls.
+    # including repeated SC planning calls.
     if process_rank() == 0:
         print_fn("Sigma quadrature receipt: " + _receipt_json(geometry))
     return output, geometry
@@ -1978,6 +1627,6 @@ __all__ = [
     "fit_sigma_box_specs",
     "make_sigma_box_spec",
     "plan_sigma_windows",
-    "resolve_sigma_box_cache_dir",
     "sigma_box_executor_nodes",
+    "sigma_rule_scope",
 ]

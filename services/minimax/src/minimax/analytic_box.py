@@ -51,7 +51,7 @@ import time
 
 import numpy as np
 
-from .uniform_rule import UniformRule, _BoundaryCloud, _cexp, _pinned_blas_threads
+from .uniform_rule import UniformRule, _BoundaryCloud, _cexp, _map_rows, _pinned_blas_threads
 
 __all__ = ["analytic_box_rule", "corner_exponent", "crossing_nodes", "sector_degree"]
 
@@ -247,11 +247,20 @@ def _weights(box, times, eps, relative):
                             lapack_driver="gelsd")[0] / norm
     d = _fit_cloud(box, times)
     rho = float(box[2])
-    log_max = np.max(-(d[:, None] * times[None, :]).imag, axis=0)
-    A = rho * _cexp(1j * d[:, None] * times[None, :] - log_max[None, :])
+    # Row blocks on the service's pool (_map_rows): the same per-entry
+    # arithmetic as the whole-matrix expression, so the same bytes.
+    log_max = np.max(np.stack(_map_rows(
+        lambda lo, hi: np.max(-(d[lo:hi, None] * times[None, :]).imag, axis=0),
+        d.size, times.size)), axis=0)
+    A = np.empty((d.size + times.size, times.size), np.complex128)
+
+    def fill(lo, hi):
+        A[lo:hi] = rho * _cexp(1j * d[lo:hi, None] * times[None, :] - log_max[None, :])
+
+    _map_rows(fill, d.size, times.size)
     # the ridge row prices a term in the error currency (rho times its
     # unit-maximum column), so the penalty is scale-free in eta
-    A = np.vstack([A, _RIDGE * eps * rho * math.sqrt(d.size) * np.eye(times.size)])
+    A[d.size:] = _RIDGE * eps * rho * math.sqrt(d.size) * np.eye(times.size)
     f = np.concatenate([rho / d, np.zeros(times.size)])
     q, r = linalg.qr(A, mode="economic")
     return linalg.solve_triangular(r, q.conj().T @ f) * np.exp(-log_max)

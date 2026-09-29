@@ -1184,9 +1184,6 @@ def _compute_mpa_sigma(
     sigma_efermi_ry, sigma_efermi_provenance = resolve_sigma_efermi_ry(
         config.sigma.fermi_reference,
         occupation_state=occupation_state, wfn=wfn)
-    from .sigma_box_plan import resolve_sigma_box_cache_dir
-    quadrature_cache_dir = resolve_sigma_box_cache_dir(
-        config.sigma.quadrature_cache_dir, input_dir)
     sector_handle = W_by_role.get("shared_pole", {})
     head = None
     if head_fit_path is None:
@@ -1218,7 +1215,6 @@ def _compute_mpa_sigma(
         regularization_width_ry=_xi.resolved_ry,
         edge_factor=float(config.sigma.window_edge_factor),
         quadrature_eps=float(config.sigma.quadrature_eps),
-        quadrature_cache_dir=quadrature_cache_dir,
         omega_grid_step_ry=(
             float(config.sigma.omega_step_ev) / RYD_TO_EV),
         pole_batch_size=int(config.mpa.pole_batch_size),

@@ -667,9 +667,6 @@ def compute_ppm_sigma_pipeline(
             # keeps it in the production log's warning block.
             for note in plan.notes:
                 print_fn(f"WARNING: Σc band extrapolation: {note}")
-        from .sigma_box_plan import resolve_sigma_box_cache_dir
-        quadrature_cache_dir = resolve_sigma_box_cache_dir(
-            config.sigma.quadrature_cache_dir, config.input_dir)
         with timing.section("sigma.exec"):
             sigma_omega = compute_sigma_c_ppm_omega_grid(
                 wfns, ppm, meta, mesh_xy,
@@ -679,7 +676,6 @@ def compute_ppm_sigma_pipeline(
                 omega_grid_ry=config.omega_grid_ry,
                 ansatz=config.compute_mode,
                 screening_diagrams=config.screening.diagrams,
-                quadrature_cache_dir=quadrature_cache_dir,
                 occupation_state=occupation_state,
                 plan=plan,
                 fixed_quadrature_session=(

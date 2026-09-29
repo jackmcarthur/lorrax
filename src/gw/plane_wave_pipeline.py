@@ -423,7 +423,6 @@ class PlaneWaveGW:
         from .mpa.sigma import MemoryPoleSource, compute_sigma_c_mpa_omega_grid
         from .ppm_tau_kernel import get_shared_sigma_tau_kernel
         from .ppm_windows import sigma_regularization_for_config
-        from .sigma_box_plan import resolve_sigma_box_cache_dir
         mesh, plan, ns = self.mesh, self.s.plan, self.ns
         face_shape = (self.n_par, self.nb_c, self.M, ns)
         g_plan = gemm_plan(mesh, m=self.M * ns, k=self.nb_c, n=self.M * ns, nq=self.n_par,
@@ -466,8 +465,6 @@ class PlaneWaveGW:
             regularization_width_ry=xi.resolved_ry,
             edge_factor=float(config.sigma.window_edge_factor),
             quadrature_eps=float(config.sigma.quadrature_eps),
-            quadrature_cache_dir=resolve_sigma_box_cache_dir(config.sigma.quadrature_cache_dir,
-                                                             config.input_dir),
             omega_grid_step_ry=float(config.sigma.omega_step_ev) / RYD_TO_EV,
             # one pole batch: every τ node pays one pair convolution, whatever the pole count
             pole_batch_size=min(int(config.mpa.n_poles), 8), material_class="insulator",

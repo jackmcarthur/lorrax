@@ -188,38 +188,25 @@ def serve(*, family: str, target: str, range_value: float,
 # ---------------------------------------------------------------------------
 #  The in-process solvers
 # ---------------------------------------------------------------------------
-#  The three wrappers below are carried VERBATIM from
-#  `gw.minimax_screening._solve_*_scaled_cached`: the same `lru_cache`
-#  sizes, the same key rounding, the same disk-cache payload dicts.  That is
-#  not tidiness — the payload dict IS the legacy cache key, so any change
-#  here would silently invalidate every warm cache in the fleet and move
-#  numbers (including the frozen G2 reference's) inside a refactor commit.
+#  One solve per distinct request per process (``lru_cache``); nothing is
+#  stored across processes (owner, 2026-09-28: no cached quadrature rules).
+#  The key rounding is carried verbatim from the original call sites.
 
 @lru_cache(maxsize=64)
 def _solve_noncrossing_scaled_cached(logR_key: float, target_key: float,
                                      max_nodes: int):
-    payload = {"solver": "noncrossing", "logR_key": float(logR_key),
-               "target_key": float(target_key), "max_nodes": int(max_nodes)}
-    from minimax import cache as _cache                # noqa: PLC0415
-    cached = _cache.load("noncrossing", payload)
-    if cached is not None:
-        return cached
     # The levelled Remez rule: smallest N whose best N-term error meets
     # the target, certified by alternation, in milliseconds.  It replaced a
     # VarPro+Lawson ladder that measured 2-4x above the best error at its
     # N, used 1-2 extra nodes at eps >= 1e-8 and up to 24 extra (negative
     # weights, kappa0 4.8e3) at 1e-10, and took 0.1-45 s per request; that
-    # ladder is deleted (runs/DEV/326).  The cache payload is unchanged, so
-    # a warm cache keeps serving old entries until it is cleared.
+    # ladder is deleted (runs/DEV/326).
     from minimax import levelled as _levelled          # noqa: PLC0415
     tau, w, _n, err = _levelled.noncrossing_levelled(
         float(np.exp(logR_key)), float(target_key), N_max=max_nodes)
     tau = np.asarray(tau, dtype=np.float64)
     w = np.asarray(w, dtype=np.float64)
-    err = float(err)
-    _cache.store("noncrossing", payload, tau, w, err)
-    return tau, w, err, runtime_provenance(
-        _cache._payload_hash(tau, w), _cache.backend_tag())
+    return tau, w, float(err), runtime_provenance(tau, w)
 
 
 @lru_cache(maxsize=64)
@@ -227,36 +214,19 @@ def _solve_noncrossing_imag_scaled_cached(logR_key: float,
                                           omega_hat_key: float,
                                           target_key: float,
                                           max_nodes: int):
-    payload = {"solver": "noncrossing_imag", "logR_key": float(logR_key),
-               "omega_hat_key": float(omega_hat_key),
-               "target_key": float(target_key), "max_nodes": int(max_nodes)}
-    from minimax import cache as _cache                # noqa: PLC0415
-    cached = _cache.load("noncrossing_imag", payload)
-    if cached is not None:
-        return cached
     from minimax import solver as _solver              # noqa: PLC0415
     tau, w, _n, err = _solver.noncrossing_imag_grids(
         float(np.exp(logR_key)), float(omega_hat_key), float(target_key),
         N_start=2, N_max=max_nodes)
     tau = np.asarray(tau, dtype=np.float64)
     w = np.asarray(w, dtype=np.float64)
-    err = float(err)
-    _cache.store("noncrossing_imag", payload, tau, w, err)
-    return tau, w, err, runtime_provenance(
-        _cache._payload_hash(tau, w), _cache.backend_tag())
+    return tau, w, float(err), runtime_provenance(tau, w)
 
 
 @lru_cache(maxsize=128)
 def _solve_crossing_scaled_cached(A_key: float, target_key: float,
                                   max_nodes: int, eps_q_key: float,
                                   target_kind: str):
-    payload = {"solver": "crossing", "A_key": float(A_key),
-               "target_key": float(target_key), "max_nodes": int(max_nodes),
-               "eps_q_key": float(eps_q_key), "target_kind": str(target_kind)}
-    from minimax import cache as _cache                # noqa: PLC0415
-    cached = _cache.load("crossing", payload)
-    if cached is not None:
-        return cached
     from minimax import solver as _solver              # noqa: PLC0415
     if target_kind == "hgl":
         G_func, tau_max_func = _solver.G_hgl, _solver.tau_max_hgl
@@ -270,17 +240,14 @@ def _solve_crossing_scaled_cached(A_key: float, target_key: float,
         eps_q=float(eps_q_key), N_max=max_nodes)
     tau = np.asarray(tau, dtype=np.float64)
     w = np.asarray(w, dtype=np.float64)
-    err = float(err)
-    _cache.store("crossing", payload, tau, w, err)
-    return tau, w, err, runtime_provenance(
-        _cache._payload_hash(tau, w), _cache.backend_tag())
+    return tau, w, float(err), runtime_provenance(tau, w)
 
 
 def _tolerance_key(error_bound: float) -> float:
-    """Round a tolerance for the cache key WITHOUT rounding it away.
+    """Round a tolerance for the in-process solve key WITHOUT rounding it away.
 
     ``round(x, 14)`` is the key rounding carried verbatim from the original
-    call sites, and it is kept so every stored entry still hits.  But a
+    call sites.  But a
     tolerance is a positive number that may legitimately be far below 1e-14
     once rescaled into ``[1, R]`` units (the Laplace bound asks the service
     for ``eps_phys * x_min``), and rounding such a value to 14 decimals
@@ -293,8 +260,7 @@ def _tolerance_key(error_bound: float) -> float:
     looked like a hang.
 
     So: keep the decimal key where it is faithful, and fall back to a
-    significant-figure key only where it would underflow. Existing cache
-    entries are unaffected.
+    significant-figure key only where it would underflow.
     """
     x = float(error_bound)
     if not np.isfinite(x) or x <= 0.0:
@@ -314,8 +280,8 @@ def solve_uncertified(*, family: str, target: str, range_value: float,
                       omega_hat: float | None = None) -> Quadrature:
     """Run the offline solver in-process, and SAY SO.
 
-    The rounding of every cache key below is carried verbatim from the
-    pre-extraction call sites, for the reason given above the wrappers.
+    The rounding of every solve key below is carried verbatim from the
+    pre-extraction call sites.
     """
     spec, target_kind = _resolve(family, target)
     if family == "noncrossing":
@@ -348,24 +314,3 @@ def solve_uncertified(*, family: str, target: str, range_value: float,
         provenance=prov)
     _announce_solved(quad, _sum_abs_w(w), int(n_max))
     return quad
-
-
-def cached_solve_payload(family: str, **kw) -> dict[str, Any]:
-    """The disk-cache payload dict for a request.  Test/diagnostic surface."""
-    if family == "noncrossing":
-        return {"solver": "noncrossing", "logR_key": float(kw["logR_key"]),
-                "target_key": float(kw["target_key"]),
-                "max_nodes": int(kw["max_nodes"])}
-    if family == "noncrossing_imag":
-        return {"solver": "noncrossing_imag",
-                "logR_key": float(kw["logR_key"]),
-                "omega_hat_key": float(kw["omega_hat_key"]),
-                "target_key": float(kw["target_key"]),
-                "max_nodes": int(kw["max_nodes"])}
-    if family == "crossing":
-        return {"solver": "crossing", "A_key": float(kw["A_key"]),
-                "target_key": float(kw["target_key"]),
-                "max_nodes": int(kw["max_nodes"]),
-                "eps_q_key": float(kw["eps_q_key"]),
-                "target_kind": str(kw["target_kind"])}
-    raise UnknownTarget(f"minimax: no solver payload shape for {family!r}.")

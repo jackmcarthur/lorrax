@@ -32,7 +32,6 @@ from minimax.door import (
     solve_uncertified,
 )
 from minimax.records import (
-    SOURCES,
     Provenance,
     Quadrature,
     runtime_provenance,
@@ -73,12 +72,10 @@ _FREQUENCY_FIT_NAMES = (
 )
 
 # The denominator-box rule record, its boundary certificate and noise
-# measure, and the solver identity the rule table keys on.  Lazy, like every
-# numerical module below.
+# measure.  Lazy, like every numerical module below.
 _UNIFORM_RULE_NAMES = (
     "UniformRule", "boundary_samples",
     "rule_roundoff_amplification", "rule_sup_error",
-    "uniform_rule_solver_identity",
 )
 
 # Derived denominator-box rules (the bent contour on crossing boxes, the
@@ -163,7 +160,7 @@ __all__ = [
     "TARGETS", "FAMILIES", "CHARACTERS", "TargetSpec", "FamilySpec",
     "families_for_character", "family_for_character",
     # --- what you get back -------------------------------------------------
-    "Quadrature", "Provenance", "SOURCES", "runtime_provenance",
+    "Quadrature", "Provenance", "runtime_provenance",
     # --- the door ----------------------------------------------------------
     "serve", "solve_uncertified", "reset_announcements",
     "noncrossing_kappa0",

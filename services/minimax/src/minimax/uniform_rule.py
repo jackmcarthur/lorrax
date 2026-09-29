@@ -5,7 +5,7 @@ A rule for ``1/d`` on a denominator box ``[re_lo, re_hi] x [im_lo, im_hi]``
 executor convention ``1/d ~= sum_k w_k exp(i t_k d)``, the box and ``eps``
 it answers, and the certificate it passed.  The builder is
 :func:`minimax.analytic_box.analytic_box_rule`; this module holds what the
-builder, the planner and the rule table share:
+builder and the planner share:
 
 - :class:`_BoundaryCloud`, the acceptance certificate: the error and the
   executor's noise mass are analytic/subharmonic on the closed box, so their
@@ -13,8 +13,11 @@ builder, the planner and the rule table share:
   by a bracketed golden-section search;
 - :func:`rule_sup_error` and :func:`rule_roundoff_amplification`, the same
   two numbers on a caller's cloud (the planner's noise gate);
-- the 16-thread BLAS pin every build runs under, and
-  :func:`uniform_rule_solver_identity`, which keys the persistent rule table.
+- the 16-thread BLAS pin every build runs under, and the row-block pool
+  (:func:`_map_rows`) the sampled term matrices are evaluated on.
+
+Nothing here is stored across processes: every rule is built cold, in about
+a second for the widest crossing window (owner, 2026-09-28).
 
 Currencies: the RELATIVE error ``|d| |Q - 1/d|`` on a sign-definite box, the
 peak-relative ``eta |Q - 1/d|`` on a crossing box
@@ -31,7 +34,7 @@ import numpy as np
 
 __all__ = [
     "UniformRule", "boundary_samples", "rule_roundoff_amplification",
-    "rule_sup_error", "uniform_rule_solver_identity",
+    "rule_sup_error",
 ]
 
 
@@ -40,10 +43,15 @@ __all__ = [
 #: environment. OpenBLAS sums in a thread-count dependent order, so the weight
 #: solve's round-off, and with it a marginal certificate, would otherwise
 #: follow the environment; the pin makes a rule a function of (box, eps) on
-#: one machine class, which the rule table's memo needs. 16 is the physical
-#: core count of a Perlmutter GPU rank (``runtime.default_blas_threads``).
+#: one machine class, so a plan is the same on every rank and in every run.
+#: 16 is the physical core count of a Perlmutter GPU rank
+#: (``runtime.default_blas_threads``).
 _BLAS_THREADS = 16
 _BLAS_CONTROLS = None
+#: Complex entries per row block of a sampled term matrix (1 MiB): a worker's
+#: temporaries stay in its core's cache.
+_ROW_BLOCK_ENTRIES = 1 << 16
+_ROW_POOL = None
 
 
 def _openblas_controls():
@@ -92,6 +100,42 @@ def _pinned_blas_threads():
     finally:
         for (_get, put), count in zip(controls, saved):
             put(count)
+
+
+# ----------------------------------------------------------------- row blocks
+def _row_pool():
+    """One thread pool per process, as wide as the BLAS pin (or the cores)."""
+    global _ROW_POOL
+    if _ROW_POOL is None:
+        import os
+        from concurrent.futures import ThreadPoolExecutor
+        try:
+            cores = len(os.sched_getaffinity(0))
+        except (AttributeError, OSError):
+            cores = os.cpu_count() or 1
+        _ROW_POOL = ThreadPoolExecutor(max_workers=max(1, min(_BLAS_THREADS, cores)),
+                                       thread_name_prefix="minimax-rows")
+    return _ROW_POOL
+
+
+def _map_rows(block, rows, cols):
+    """``[block(lo, hi) ...]`` over row blocks of a ``rows x cols`` term matrix,
+    in block order, evaluated concurrently.
+
+    A sampled term matrix ``exp(i d_j t_k)`` of the widest crossing window is
+    5e4 x 1.1e3 complex entries, and numpy's elementwise work on it runs on
+    one core: 3/4 of a cold build before this (Na 8^3 [-15, 19] eV, 1148
+    nodes, 5.4 s). ``block`` does only row-wise work (elementwise maps and
+    reductions along a row), which numpy computes per row whatever the block
+    height, so the result does not depend on the block size or the thread
+    count, bit for bit (``test_analytic_box.py``). No BLAS inside a block:
+    the pinned BLAS pool is not shared across threads.
+    """
+    step = max(1, _ROW_BLOCK_ENTRIES // max(1, int(cols)))
+    bounds = [(lo, min(int(rows), lo + step)) for lo in range(0, int(rows), step)]
+    if len(bounds) <= 1:
+        return [block(0, int(rows))]
+    return list(_row_pool().map(lambda bound: block(*bound), bounds))
 
 
 # ----------------------------------------------------------------- boundary cloud
@@ -193,10 +237,16 @@ class _BoundaryCloud:
         error falls 4x within two samples, and the vertex misread the sup by
         -1.3% and +0.5% where the bracketed search reads the dense value
         (runs/DEV/326_minimax_fit_review_2026-09-11/tools/diag_refinement.py)."""
-        T = _cexp(1j * self.d[:, None] * np.asarray(times)[None, :]) * np.asarray(weights)[None, :]
-        Q = T.sum(1)
+        times, weights = np.asarray(times), np.asarray(weights)
+
+        def rows(lo, hi):
+            T = _cexp(1j * self.d[lo:hi, None] * times[None, :]) * weights[None, :]
+            return T.sum(1), np.abs(T).sum(1)
+
+        parts = _map_rows(rows, self.d.size, times.size)
+        Q = np.concatenate([part[0] for part in parts])
+        term_mass = np.concatenate([part[1] for part in parts])
         g = np.abs(self.d * Q - 1.0) if relative else self.im_lo * np.abs(Q - 1.0 / self.d)
-        term_mass = np.abs(T).sum(1)
         kappa = float((term_mass / np.maximum(np.abs(Q), 1e-300)).max())
         mass = float(((np.abs(self.d) if relative else self.im_lo) * term_mass).max())
         best, start = float(g.max()), 0
@@ -282,8 +332,13 @@ def rule_roundoff_amplification(times, weights, d, rho):
         raise ValueError(
             "roundoff amplification needs d as a vector and rho as a "
             f"scalar or matching vector; got {d.shape} and {scale.shape}")
-    A = _cexp(1j * d[:, None] * np.asarray(times)[None, :])
-    mass = np.sum(np.abs(A * np.asarray(weights)[None, :]), axis=1)
+    times, weights = np.asarray(times), np.asarray(weights)
+
+    def rows(lo, hi):
+        A = _cexp(1j * d[lo:hi, None] * times[None, :])
+        return np.sum(np.abs(A * weights[None, :]), axis=1)
+
+    mass = np.concatenate(_map_rows(rows, d.size, times.size))
     return float(np.max(scale * mass))
 
 
@@ -291,7 +346,7 @@ def rule_roundoff_amplification(times, weights, d, rho):
 class UniformRule:
     """A finished rule: ``times``/``weights`` in the executor's convention
     (``1/d ~= sum weights * exp(i times * d)``), the box and ``eps`` it was
-    built for (its cache key), the family's ray angle, its degree (the count
+    built for, the family's ray angle, its degree (the count
     law's answer), and the sup error and cancellation ratio measured on the
     certificate cloud."""
     times: np.ndarray
@@ -314,44 +369,3 @@ class UniformRule:
                 f"degree {self.rank}, sup {self.sup_error:.2e} (eps {self.eps:g}, "
                 f"{'relative' if self.relative else 'peak-relative'}), "
                 f"kappa {self.kappa_max:.3g}, {self.seconds:.1f} s")
-
-
-_STATIC_IDENTITY = None
-
-
-def uniform_rule_solver_identity():
-    """What an :func:`minimax.analytic_box_rule` result depends on besides
-    its arguments, as a JSON-ready dict.
-
-    The builder reads no clock and pins its BLAS threads, so two calls with
-    equal arguments return the same rule bit for bit when these fields are
-    equal: the minimax sources (sha256 over every ``.py`` of the package),
-    the numerics backend (:func:`minimax.cache.backend_tag`), the CPU model
-    (OpenBLAS dispatches its kernels by it) and the pinned thread count.
-    A persistent rule table keys on this dict,
-    so an edited builder or another machine class opens a new namespace
-    instead of being served another solver's rule.
-    """
-    global _STATIC_IDENTITY
-    if _STATIC_IDENTITY is None:
-        import hashlib
-        from pathlib import Path
-
-        from .cache import backend_tag
-        package = Path(__file__).resolve().parent
-        digest = hashlib.sha256()
-        for path in sorted(package.rglob("*.py")):
-            digest.update(str(path.relative_to(package)).encode() + b"\0")
-            digest.update(path.read_bytes() + b"\0")
-        cpu = "unknown"
-        try:
-            with open("/proc/cpuinfo", encoding="ascii", errors="replace") as info:
-                cpu = next((line.split(":", 1)[1].strip() for line in info
-                            if line.startswith("model name")), cpu)
-        except OSError:
-            pass
-        _STATIC_IDENTITY = {
-            "minimax_sources": digest.hexdigest(), "backend": backend_tag(),
-            "cpu": cpu, "blas_threads": _BLAS_THREADS,
-        }
-    return dict(_STATIC_IDENTITY)
