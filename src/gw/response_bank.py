@@ -1325,12 +1325,13 @@ def response_group_size(meta, mesh_xy, *, n_samples, carry_per_sample, stream_wo
     row names), as :func:`moment_q_width` reads it; on the device the stream
     and the selection are two phases, so a group's new bytes are its carry
     plus the larger phase.  Returns ``(size, fixed, room, live)``: the group's
-    bytes beside its carry, the device room, and the live bytes.  Every
-    process enters.
+    bytes beside its carry, the device room, and the live bytes (both with the
+    ledger's run-time reserve counted as live).  Every process enters.
     """
     from common.gpu_utils import device_budget_bytes, device_room_bytes
     ledger = meta.shared_pole_capacity
-    device_room = device_room_bytes()
+    reserve = ledger.reserve_bytes_per_rank
+    device_room = device_room_bytes() - reserve
     fixed = max(int(stream_workspace), int(selection[0]) + int(selection[1]))
     fits = lambda g: (ledger.preview(resident_bytes_per_rank=g*carry_per_sample+int(selection[0]),
         workspace_bytes_per_rank=max(stream_workspace, int(selection[1])),

@@ -3,6 +3,22 @@
 User-visible changes, newest first. Binding rulings behind the breaking
 changes live in `docs/architecture/decisions.md`.
 
+## 2026-09-29 — the planners check their compiled executables
+
+- Each chosen chunk's executable is checked against its planner's price
+  before it runs (`runtime.aot_memory.check_chunk`; the response direct
+  stream's sample group, the ζ μ batch, and the Σ τ window's price). When a
+  chunk is over its room, it is recompiled once at a corrected size. If it is
+  still over, the run refuses (`GATE compiled_chunk_capacity`).
+- The shared-pole response group must also fit the device room, which counts
+  resident bytes the capacity ledger does not own. A deck whose group was
+  sized into that gap gets a smaller group and moves once. Fe 8³ charge P4 at
+  36 GB keeps its group of 16 and is bitwise. With the latency-hiding flag it
+  runs 15 and peaks at 34.55 GB instead of 36.04 GB.
+- Leave at least 5 GB between `memory_per_device_gb` and the card for NCCL,
+  the CUDA context and cuSOLVERMp. See
+  `docs/architecture/memory-model.md` for what compiled statistics miss.
+
 ## 2026-09-29 — shared-pole χ₀ direct stream through mathdx mode 11
 
 - The shared-pole bank's direct stream (charge, metal or insulator, on a

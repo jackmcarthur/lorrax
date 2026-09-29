@@ -243,7 +243,7 @@ assignment cannot see: a donated carry the caller allocated, a native
 handler's run-time scratch, a lookahead copy of the output. At or below the
 closed form, or within the room, the chunk runs unchanged. Above both, the
 slope is corrected from that one point, `per_unit = (compiled − fixed)/chunk`,
-the chunk solved directly, and compiled once more. There is no bisection.
+the chunk solved directly, and compiled once more. There is no bisection; a second figure still over the room refuses.
 
 | stage | chunk | compiled figure available | what it misses (priced elsewhere) |
 |---|---|---|---|
@@ -269,18 +269,31 @@ the stage's section; prices are what the stage-memory table prints.
 | Σ τ sweep (`d = 2`) | 13.30 | 14.02 | 13.96 |
 | ζ μ batch (320 centroids) | 29.38 new, 29.97 total | 22.68 new | 23.73 total |
 
+With the latency-hiding scheduler flag the direct stream's temporaries grow:
+the group of 16 compiled 34.08 GB of new bytes against a 34.04 GB room, the
+slope was corrected, and the group of 15 ran once recompiled (priced 34.55,
+peak 34.55; main ran 16 and peaked 36.04, over the budget).
+
 Two reserves follow from this.
 
-* **In the pool** (`runtime.aot_memory.RUNTIME_RESERVE_BYTES`, taken off the
-  capacity ledger's budget): what the pool draws beyond every priced and
-  compiled byte. 0 at (gpu, P4): the direct stream's peak equals its price
-  once residents are counted. A (platform, P) not in the table uses the
-  largest measured entry of its platform, announced.
+* **In the pool** (`runtime.aot_memory.RUNTIME_RESERVE_BYTES`): what the pool
+  draws beyond every priced and compiled byte. The capacity ledger takes it
+  off its budget and the direct stream adds it to its price. At (gpu, P4) the
+  direct stream's peak was 0.51 MB above its price (the dispatch's small
+  arguments), so the table holds 1 MB. P16 and other meshes are not measured:
+  they use the largest measured entry of their platform, announced.
 * **Outside the pool**: the CUDA context, NCCL communicators, library handles
   and the mathdx modules peaked at 2.65 GB per rank above the pool's
-  reservation (`nvidia-smi` 38 983 MiB against 0.89 × 40 960 MiB; 4.7 GB with
-  a cuSOLVERMp context, `runtime.set_default_env`). The budget does not
-  include them: they must fit between the pool reservation and the card.
+  reservation (`nvidia-smi` 38 983 MiB against 0.89 × 40 960 MiB), and at
+  4.7 GB with a cuSOLVERMp context (`runtime.set_default_env`). The budget
+  does not include them. They live in the headroom between
+  `memory_per_device_gb` and the card, so leave at least 5 GB of it: on a
+  40 GB A100 (42.9 GB) a budget of 36 leaves 6.9 GB. Never set the budget to
+  the card size.
+
+When a recompiled chunk is still over its room, `check_chunk` refuses by name
+(`GATE compiled_chunk_capacity`) before the stage runs; it does not leave the
+stage to fail at allocation.
 
 ### Native handlers
 

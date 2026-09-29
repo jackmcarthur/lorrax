@@ -445,7 +445,9 @@ def aot_kernel_peak_bytes(compiled, *, platform: str | None = None
 #: context and cuSOLVERMp's grow-only workspace are outside the pool: they are
 #: the headroom between the budget and the device, not part of this reserve.
 RUNTIME_RESERVE_BYTES = {
-    ("gpu", 4): 0,
+    # Fe 8^3 charge map 0, A100-40GB: the direct stream peaked 511 120 B above
+    # its price (the dispatch's small arguments), rounded up to 1 MB.
+    ("gpu", 4): 1_000_000,
 }
 
 
@@ -510,8 +512,8 @@ def check_chunk(chunk: int, *, build, fixed: float, per_unit: float, room: float
     Above both, the slope is corrected from this one point,
     ``per_unit = (compiled - fixed) / chunk``, the chunk solved directly,
     ``floor((room - fixed) / per_unit)``, and compiled once more.  No
-    bisection: if the second figure is still over the room the stage runs and
-    its admission (or the stage-memory table) says so.
+    bisection: a second figure still over the room refuses by name
+    (``GATE compiled_chunk_capacity``) before the stage runs.
     """
     chunk = int(chunk)
     if compiled is None:
@@ -530,4 +532,10 @@ def check_chunk(chunk: int, *, build, fixed: float, per_unit: float, room: float
                   f"chunk {chunk} -> {solved}, recompiled once")
     compiled = build(solved)
     again = compiled_new_bytes(compiled, extra=int(extra(solved, compiled)), platform=platform)
+    if again > room:
+        raise MemoryError(
+            f"GATE compiled_chunk_capacity: {stage}: got {again / 1e9:.2f} GB/rank at chunk "
+            f"{solved} after one corrected recompile (chunk {chunk}: {got / 1e9:.2f} GB, "
+            f"analytic {analytic / 1e9:.2f} GB); want <= the room {room / 1e9:.2f} GB; "
+            "fix: more ranks or a larger memory_per_device_gb")
     return ChunkCheck(solved, compiled, analytic, got, again, slope, True)
