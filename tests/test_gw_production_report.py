@@ -136,7 +136,7 @@ def test_report_is_scientific_rank_zero_output(tmp_path):
         "[+2.8546, +16.7397] eV)")
     report.legacy_print(
         "    SC fixed window: c:bulk: n_tau=8, nodes=0123456789abcdef, "
-        "cache=hit:sc-fixed, padded_box=(-13.6, 27.2, 1.36, 2.72) eV")
+        "rule=hit:sc-fixed, padded_box=(-13.6, 27.2, 1.36, 2.72) eV")
     report.legacy_print("WARNING: protected state leaves the omega grid")
     report.qp_gap(band_slices=bands, e_dft_ry=energies,
                   e_qp_ry=energies + 0.1 / RYD_TO_EV)
@@ -509,7 +509,7 @@ def test_quadrature_section_reports_chi_and_sigma_rules(tmp_path):
         "name": "cond:resonant", "kind": "crossing",
         "box_ry": [-50.0 * eta, 24.0 * eta, eta, 1.01 * eta],
         "node_count": 95, "sup_error": 9.8e-5, "eps": 1.0e-4,
-        "kappa_max": 310.0, "fit_seconds": 42.1, "cache_status": "miss"}
+        "kappa_max": 310.0, "fit_seconds": 42.1, "rule_source": "built"}
     quadrature_log.record_sigma_plan({
         "eta_ry": eta, "eps": 1.0e-4, "n_windows": 1,
         "window_tau_pairs": 95, "distinct_tau_count": 95,
@@ -526,7 +526,7 @@ def test_quadrature_section_reports_chi_and_sigma_rules(tmp_path):
     assert "1 window, 95 (window,tau) pairs" in text
     row = next(line for line in text.splitlines() if "cond:resonant" in line)
     assert "crossing" in row and "-50.0..  +24.0" in row
-    assert " 0.980 " in row and "miss" in row
+    assert " 0.980 " in row and "built" in row
 def test_sigma_residual_subphases_are_not_double_counted(tmp_path):
     output=[]
     report=GWProductionReport(str(tmp_path/'gwjax.out'),runtime=_runtime(),debug=False,stdout=output.append)

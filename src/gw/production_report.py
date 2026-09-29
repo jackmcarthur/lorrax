@@ -145,7 +145,7 @@ def _sigma_rule_lines(geometry: dict, plans: int) -> list[str]:
     lines.append(
         f"  {'window':<{width}}  {'kind':<8}  {'Re d / eta':>16}  "
         f"{'Im d / eta':>12}  {'nodes':>5}  {'sup/eps':>7}  {'kappa':>8}  "
-        f"{'fit s':>6}  cache")
+        f"{'fit s':>6}  rule")
     for w in windows:
         lo, hi, gamma_lo, gamma_hi = (float(v) / eta for v in w["box_ry"])
         lines.append(
@@ -153,7 +153,7 @@ def _sigma_rule_lines(geometry: dict, plans: int) -> list[str]:
             f"{lo:+7.1f}..{hi:+7.1f}  {gamma_lo:5.2f}..{gamma_hi:5.2f}  "
             f"{w['node_count']:>5}  {w['sup_error'] / w['eps']:>7.3f}  "
             f"{w['kappa_max']:>8.2e}  {w['fit_seconds']:>6.1f}  "
-            f"{w['cache_status']}")
+            f"{w['rule_source']}")
     return lines
 
 
