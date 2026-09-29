@@ -216,3 +216,90 @@ def hold_support_ev(sigma, deck_grid_ev, held_grid_ev, held_envelope,
                                context="held map")
     event = "hold" if grid.size == np.asarray(held_grid_ev).size else "extend"
     return grid, envelope, event
+
+
+# ---------------------------------------------------------------------------
+# The semicore patch (owner 2026-09-28/29)
+# ---------------------------------------------------------------------------
+# Semicore states (``band_partition.qp_band_cut``: occupied, below a band gap
+# of at least SEMICORE_GAP_EV) stay in the QP matrix with their full Sigma
+# rows, but are read at their own energy on ONE held patch of the grid, below
+# the near support and at SEMICORE_ETA_EV, instead of stretching the near grid
+# (and its crossing windows) down to them at the deck eta.  The patch is
+# planned at SC map 0 over the semicore DFT energies with the plan's pad and
+# held; a semicore read support that leaves it extends it by the same rule
+# (never shrinks), as the near support does.  A semicore state that rises into
+# the near grid reads the near grid.
+
+#: Broadening of the semicore patch (eV), fixed by the owner (2026-09-28
+#: 21:40).  Its systematic error is reported apart from the 1 meV budget of
+#: the controllable errors.  At the deck eta the Fe 3s Z leaves (0, 1] from
+#: map 1 and the reference stalls (TWOCLASS, claim 2945).
+SEMICORE_ETA_EV = 1.0
+#: Certificate tolerance of the patch's split windows.  A patch window's node
+#: count is set by its short side over eta, not its pole range (158 -> 90
+#: nodes at 1e-2 on the TWOCLASS decks).
+SEMICORE_PATCH_EPS = 1.0e-2
+#: Patch sampling step (eV): eta_semi / 2 resolves the broadened Sigma.
+SEMICORE_PATCH_STEP_EV = 0.5 * SEMICORE_ETA_EV
+#: The patch's top sample stays this far (eV) below the near grid's bottom,
+#: so the joined grid ascends strictly with no uncovered sliver.
+SEMICORE_PATCH_EDGE_EV = 1.0e-3
+
+
+def semicore_patch_ev(energy_rel_ev, semicore_kn, near_lo_ev, *, pad_ev=SUPPORT_PAD_EV,
+                      previous=None):
+    """The held patch ``(lo, hi, eta)`` over every semicore energy below the near grid.
+
+    ``[min E - pad, max E + pad]`` of the masked energies below ``near_lo_ev``,
+    snapped outward to SEMICORE_PATCH_STEP_EV, its top clipped
+    SEMICORE_PATCH_EDGE_EV under ``near_lo_ev`` and joined with ``previous``
+    (a patch only grows).  None when no semicore state lies below the near
+    grid.
+    """
+    e = np.asarray(energy_rel_ev, float)[np.asarray(semicore_kn, bool)]
+    e = e[e < float(near_lo_ev)]
+    if e.size == 0:
+        return previous
+    step, pad = SEMICORE_PATCH_STEP_EV, float(pad_ev)
+    lo = float(np.floor((e.min() - pad) / step) * step)
+    hi = float(np.ceil((e.max() + pad) / step) * step)
+    if previous is not None:
+        lo, hi = min(lo, float(previous[0])), max(hi, float(previous[1]))
+    hi = min(hi, float(near_lo_ev) - SEMICORE_PATCH_EDGE_EV)
+    return (lo, hi, float(SEMICORE_ETA_EV))
+
+
+def semicore_patch_escapes(energy_rel_ev, semicore_kn, near_lo_ev, patch):
+    """Semicore states below the near grid whose read support [E-h, E+h] leaves the patch."""
+    e = np.asarray(energy_rel_ev, float)
+    h = read_halfwidth_ev()
+    below = np.asarray(semicore_kn, bool) & (e < float(near_lo_ev))
+    if patch is None:
+        return below
+    lo, hi = float(patch[0]), float(patch[1])
+    # The top leaves only while the patch does not yet abut the near grid.
+    open_top = hi < float(near_lo_ev) - 2.0 * SEMICORE_PATCH_EDGE_EV
+    return below & ((e - h < lo) | ((e + h > hi) & open_top))
+
+
+def patch_grid_ev(patch, near_lo_ev):
+    """The patch's samples at SEMICORE_PATCH_STEP_EV, strictly below the near grid."""
+    lo, hi = float(patch[0]), min(float(patch[1]), float(near_lo_ev) - SEMICORE_PATCH_EDGE_EV)
+    n = int(np.ceil((hi - lo) / SEMICORE_PATCH_STEP_EV - 1e-9)) + 1
+    return np.linspace(lo, hi, max(n, 2))
+
+
+def joined_grid_ev(near_grid_ev, patch):
+    """The sampled Sigma support: the patch's samples, then the near grid."""
+    near = np.asarray(near_grid_ev, dtype=np.float64)
+    if patch is None:
+        return near
+    return np.concatenate((patch_grid_ev(patch, near[0]), near))
+
+
+def patch_eta_ev(omega_ev, patch, eta_ev):
+    """Per-sample broadening (eV): the patch's eta on its samples, ``eta_ev`` elsewhere."""
+    w = np.asarray(omega_ev, dtype=np.float64)
+    inside = (w >= float(patch[0]) - 1e-9) & (w <= float(patch[1]) + 1e-9)
+    return np.where(inside, float(patch[2]), float(eta_ev))

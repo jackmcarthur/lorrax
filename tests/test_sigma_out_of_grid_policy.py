@@ -263,3 +263,31 @@ def test_the_support_envelope_refuses_a_grid_grown_past_it():
     with pytest.raises(ValueError, match="GATE sigma_support_envelope"):
         assert_support_in_envelope(np.arange(-12.0, 12.5, 0.25), deck, envelope, 0.25,
                                    context="test")
+
+
+# ---------------------------------------------------------------------------
+# The SC semicore patch (gw.qp_support)
+# ---------------------------------------------------------------------------
+
+def test_semicore_patch_is_planned_below_the_near_grid_held_and_extended():
+    from gw.qp_support import (SEMICORE_ETA_EV, joined_grid_ev, patch_eta_ev,
+                               semicore_patch_escapes, semicore_patch_ev)
+    e = np.array([[-52.0, -50.3, -5.0, 1.0], [-51.8, -50.1, -4.8, 1.2]])
+    semi = np.zeros(e.shape, bool)
+    semi[:, :2] = True
+    near = np.arange(-7.0, 3.01, 0.25)
+    patch = semicore_patch_ev(e, semi, near[0])
+    assert patch == (-54.0, -48.0, SEMICORE_ETA_EV)
+    joined = joined_grid_ev(near, patch)
+    assert np.all(np.diff(joined) > 0) and joined[0] == -54.0
+    np.testing.assert_allclose(joined[joined < near[0]][1:] - joined[joined < near[0]][:-1], 0.5)
+    eta = patch_eta_ev(joined, patch, 0.25)
+    assert np.all(eta[joined < near[0]] == SEMICORE_ETA_EV) and np.all(eta[joined >= near[0]] == 0.25)
+    # Inside the pad: held.  A read support that leaves it: the patch grows, never shrinks.
+    assert not semicore_patch_escapes(e + 1.4, semi, near[0], patch).any()
+    moved = e.copy(); moved[:, 0] -= 2.0
+    assert semicore_patch_escapes(moved, semi, near[0], patch).any()
+    grown = semicore_patch_ev(moved, semi, near[0], previous=patch)
+    assert grown[0] < patch[0] and grown[1] == patch[1]
+    # The top never enters the near grid.
+    assert semicore_patch_ev(e, semi, -49.0)[1] < -49.0

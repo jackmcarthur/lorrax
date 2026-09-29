@@ -675,6 +675,7 @@ def _serve_from_plan(specs, fits, eps):
     served = []
     for spec, own in zip(specs, fits):
         chosen = own
+        spec_eps = _spec_eps(spec, eps)
         if not own["analytic_line"]:
             box = spec["box"]
             relative = box[0] > 0.0 or box[1] < 0.0
@@ -683,7 +684,7 @@ def _serve_from_plan(specs, fits, eps):
                 if (other["node_count"], other["rule_digest"]) >= own_key:
                     break
                 rule = other["rule"]
-                if (abs(rule.eps - eps) > 1.0e-12 * eps
+                if (abs(rule.eps - spec_eps) > 1.0e-12 * spec_eps
                         or bool(rule.relative) != relative
                         or other["roundoff_amplification"] > cap
                         or not _may_serve(rule.box, other["node_count"], box,
@@ -691,7 +692,7 @@ def _serve_from_plan(specs, fits, eps):
                     continue
                 try:
                     chosen = _accept_rule(
-                        spec, rule, eps,
+                        spec, rule, spec_eps,
                         rule_source=f"plan:{other['rule_digest'][:16]}",
                         noise_amplification=other["roundoff_amplification"])
                 except RuntimeError:
@@ -700,6 +701,19 @@ def _serve_from_plan(specs, fits, eps):
                 break
         served.append(chosen)
     return served
+
+
+def _spec_eta(spec, eta):
+    """A window's own broadening (Ry): the semicore patch's split windows carry
+    ``eta_ry`` (:func:`plan_sigma_windows` ``omega_eta_ry``), every other one
+    the plan's."""
+    return float(spec.get("eta_ry", eta))
+
+
+def _spec_eps(spec, eps):
+    """A window's own certificate tolerance: the semicore patch's split windows
+    carry ``eps`` (``qp_support.SEMICORE_PATCH_EPS``), every other one the plan's."""
+    return float(spec.get("eps", eps))
 
 
 def _fit_cost(spec, eta):
@@ -818,8 +832,9 @@ def fit_sigma_box_spec_groups(groups, eta_ry, *, eps, scope):
         raise ValueError("sigma_quadrature_eps must lie in (0, 1)")
     fits, fit_rows = _parallel_fits(
         rows, lambda index: _fit_rule(
-            rows[index], tolerance, scope, eta, build_widen=widen[index]),
-        [_fit_cost(spec, eta) for spec in rows])
+            rows[index], _spec_eps(rows[index], tolerance), scope,
+            _spec_eta(rows[index], eta), build_widen=widen[index]),
+        [_fit_cost(spec, _spec_eta(spec, eta)) for spec in rows])
     # Every rank has looked up by now (the gather above) and holds the same
     # replicated receipts, so storing the plan's builds on every rank cannot
     # change any choice made in it, and the next plan sees the same scope on
@@ -1148,7 +1163,8 @@ def _fit_fixed_sc_rules(
         # pass the first plan's held set is certified at the first pad.
         session["eta_ry"] = float(eta)
         session["eps"] = float(eps)
-        padded = [_sc_padded_box_spec(spec, eta, occupation_reach_ry=occupation_reach_ry)
+        padded = [_sc_padded_box_spec(spec, _spec_eta(spec, eta),
+                                      occupation_reach_ry=occupation_reach_ry)
                   for spec in rows]
         (served, fit_rows), (fits, padded_rows) = fit_sigma_box_spec_groups(
             [(rows, True), (padded, False)], eta, eps=eps, scope=scope)
@@ -1186,7 +1202,8 @@ def _fit_fixed_sc_rules(
     refit = [spec for spec in rows if spec["name"] in reasons_by_name]
     if refit:
         session["escape_maps"] = int(session.get("escape_maps", 0)) + 1
-        padded = [_sc_padded_box_spec(spec, eta, occupation_reach_ry=occupation_reach_ry)
+        padded = [_sc_padded_box_spec(spec, _spec_eta(spec, eta),
+                                      occupation_reach_ry=occupation_reach_ry)
                   for spec in refit]
         # Its own stage: a refit is host work between the W response and the
         # Sigma tau sweep, 2-27 s per CrI3 8x8 SC map (P2-S, 2026-09-25).
@@ -1215,7 +1232,7 @@ def _fit_fixed_sc_rules(
             fits.append(_fixed_fit_for_spec(entry, spec))
         except _RuleValidityFailure as exc:
             padded_spec = _sc_padded_box_spec(
-                spec, eta, occupation_reach_ry=occupation_reach_ry)
+                spec, _spec_eta(spec, eta), occupation_reach_ry=occupation_reach_ry)
             with timing.section("sigma.rule_refit", announce=True,
                                 label="Sigma rule refit (validity)"):
                 new_fits, new_rows = fit_sigma_box_specs(
@@ -1294,6 +1311,8 @@ def plan_sigma_windows(
     fixed_pole_support_ry=None,
     certificate_pole_summaries=None,
     occupation_reach_ry=None,
+    omega_eta_ry=None,
+    split_eps=None,
 ):
     """Build the complete MPA Sigma quadrature from raw support boxes.
 
@@ -1349,6 +1368,16 @@ def plan_sigma_windows(
         ``-X`` in its own coordinate, so the SC plan clips a crossing window's
         inner state pad there.  None (an insulator) leaves the 2 eta pad.
         Used only with ``fixed_rule_session``.
+    omega_eta_ry, split_eps
+        Optional per-frequency broadening (one value >= ``eta_ry`` per
+        ``omega_ry`` sample; the SC semicore patch, ``gw.qp_support``) and
+        the tolerance of the windows it splits off.  A crossing product
+        window whose frequencies carry two etas is split in two, each with
+        its own box, rule and executor weights; a sign-definite one serves
+        every frequency it owns at ``eta_ry`` (its node count barely depends
+        on eta).  In an SC run the split is decided at map 0 and held, so a
+        moving pole never adds a window.  State and pole edges stay at
+        ``eta_ry``.
 
     Returns
     -------
@@ -1408,6 +1437,14 @@ def plan_sigma_windows(
     if not summaries:
         raise ValueError("Sigma box planning needs at least one pole summary")
     omega_grid = np.asarray(omega_ry, dtype=np.float64)
+    omega_eta = None
+    if omega_eta_ry is not None:
+        omega_eta = np.asarray(omega_eta_ry, dtype=np.float64).reshape(-1)
+        if (omega_eta.shape != omega_grid.shape or not np.isfinite(omega_eta).all()
+                or np.any(omega_eta < eta * (1.0 - 1.0e-12))):
+            raise ValueError("omega_eta_ry must give one finite eta >= eta_ry per frequency")
+    held_rules = (None if fixed_rule_session is None
+                  else fixed_rule_session.get("rules"))
     state_rows, geometry = _product_geometry(branch_rows, eta, edge)
 
     specs, branch_reports = [], []
@@ -1438,55 +1475,76 @@ def plan_sigma_windows(
             if not local.size or not owned.size or not pole_indices.size:
                 continue
             states = raw_energy[local]
-            spec = make_sigma_box_spec(
-                name=f"{branch.tag}:{name}", frequencies=frequencies[owned],
-                states=states, pole_stats=pole_stats,
-                pole_sign=pole_sign, eta_ry=eta)
-            if certificate_pole_summaries is not None:
-                _, union_stats = _pole_rows(certificate_pole_summaries, selector)
-                union = (make_sigma_box_spec(
-                    name=spec["name"], frequencies=frequencies[owned],
-                    states=states,
-                    pole_stats=union_stats, pole_sign=pole_sign, eta_ry=eta)
-                    if union_stats else None)
-                if (union is not None and union["kind"] == spec["kind"]
-                        and _box_contains(union["box"], spec["box"])):
-                    spec.update(box=union["box"],
-                                raw_real_support=union["raw_real_support"],
-                                pole_extent=union["pole_extent"])
-            spec["analytic_line"] = bool(analytic_line)
-            if fixed_pole_support is not None:
-                support_lo = max(0.0, float(pole_lo))
-                support_hi = min(fixed_pole_support, float(pole_hi))
-                if support_hi > support_lo:
-                    spec["sc_support_pole_extent"] = (
-                        support_lo, support_hi, 0.0, 0.0)
-            if (fixed_rule_session is not None
-                    and name in ("bulk", "state_tail", "pole_tail",
-                                 "omega_tail")
-                    and geometry["state_edge_ry"] > 0.0
-                    and (fixed_pole_support is not None or all(
-                        lo >= 0.0 and gamma_lo == gamma_hi == 0.0
-                        for lo, _, gamma_lo, gamma_hi in pole_stats))):
-                # The selectors guarantee this gap for positive real poles,
-                # including scalar W without a sector treatment ceiling
-                # (omega_tail: its |omega| cut follows this map's excursion).
-                # Cover future selector members, not only initial samples.
-                spec["sc_selector_gap_ry"] = (
-                    _BOX_SIGN_FRACTION * geometry["state_edge_ry"])
-            spec.update({
-                "branch": branch,
-                "state_indices": flat_indices[local],
-                "state_shape": state_shape.shape,
-                "state_interval": (float(state_lo), float(state_hi)),
-                "pole_indices": pole_indices,
-                "pole_bounds": (float(pole_lo), float(pole_hi)),
-                "omega_interval": (float(omega_lo), float(omega_hi)),
-                "omega_abs": omega_abs[owned],
-                "omega_idx": positions[owned],
-                "branch_report": report,
-            })
-            specs.append(spec)
+            owned_all = owned
+            owned_eta = (np.full(owned_all.size, eta) if omega_eta is None
+                         else omega_eta[positions[owned_all]])
+            base_name = f"{branch.tag}:{name}"
+            if np.unique(owned_eta).size > 1 and not (
+                    make_sigma_box_spec(
+                        name=base_name, frequencies=frequencies[owned_all],
+                        states=states, pole_stats=pole_stats,
+                        pole_sign=pole_sign, eta_ry=eta)["kind"] == "crossing"
+                    if held_rules is None else
+                    any(key.startswith(base_name + "@eta") for key in held_rules)):
+                owned_eta = np.full(owned_all.size, eta)
+            for eta_w in np.unique(owned_eta):
+                owned = owned_all[owned_eta == eta_w]
+                eta_w = float(eta_w)
+                split = eta_w != eta
+                spec = make_sigma_box_spec(
+                    name=base_name + (f"@eta{eta_w * RYD_TO_EV:.3g}" if split else ""),
+                    frequencies=frequencies[owned],
+                    states=states, pole_stats=pole_stats,
+                    pole_sign=pole_sign, eta_ry=eta_w)
+                if split:
+                    spec["eta_ry"] = eta_w
+                    if split_eps is not None:
+                        spec["eps"] = float(split_eps)
+                if certificate_pole_summaries is not None:
+                    _, union_stats = _pole_rows(certificate_pole_summaries, selector)
+                    union = (make_sigma_box_spec(
+                        name=spec["name"], frequencies=frequencies[owned],
+                        states=states,
+                        pole_stats=union_stats, pole_sign=pole_sign, eta_ry=eta_w)
+                        if union_stats else None)
+                    if (union is not None and union["kind"] == spec["kind"]
+                            and _box_contains(union["box"], spec["box"])):
+                        spec.update(box=union["box"],
+                                    raw_real_support=union["raw_real_support"],
+                                    pole_extent=union["pole_extent"])
+                spec["analytic_line"] = bool(analytic_line)
+                if fixed_pole_support is not None:
+                    support_lo = max(0.0, float(pole_lo))
+                    support_hi = min(fixed_pole_support, float(pole_hi))
+                    if support_hi > support_lo:
+                        spec["sc_support_pole_extent"] = (
+                            support_lo, support_hi, 0.0, 0.0)
+                if (fixed_rule_session is not None
+                        and name in ("bulk", "state_tail", "pole_tail",
+                                     "omega_tail")
+                        and geometry["state_edge_ry"] > 0.0
+                        and (fixed_pole_support is not None or all(
+                            lo >= 0.0 and gamma_lo == gamma_hi == 0.0
+                            for lo, _, gamma_lo, gamma_hi in pole_stats))):
+                    # The selectors guarantee this gap for positive real poles,
+                    # including scalar W without a sector treatment ceiling
+                    # (omega_tail: its |omega| cut follows this map's excursion).
+                    # Cover future selector members, not only initial samples.
+                    spec["sc_selector_gap_ry"] = (
+                        _BOX_SIGN_FRACTION * geometry["state_edge_ry"])
+                spec.update({
+                    "branch": branch,
+                    "state_indices": flat_indices[local],
+                    "state_shape": state_shape.shape,
+                    "state_interval": (float(state_lo), float(state_hi)),
+                    "pole_indices": pole_indices,
+                    "pole_bounds": (float(pole_lo), float(pole_hi)),
+                    "omega_interval": (float(omega_lo), float(omega_hi)),
+                    "omega_abs": omega_abs[owned],
+                    "omega_idx": positions[owned],
+                    "branch_report": report,
+                })
+                specs.append(spec)
         report["plan_stop"] = len(specs)
         report["window_count"] = report["plan_stop"] - report["plan_start"]
         branch_reports.append(report)
@@ -1516,7 +1574,7 @@ def plan_sigma_windows(
         window = _SigmaWindow(
             name=spec["name"],
             nodes=sigma_box_executor_nodes(
-                fit, spec["pole_sign"], eta),
+                fit, spec["pole_sign"], _spec_eta(spec, eta)),
             mask_A=mask.reshape(spec["state_shape"]),
             E_ref_A=spec["E_ref_A"], E_ref_B=spec["E_ref_B"],
             omega_sign=int(spec["pole_sign"]) * external_sign,
@@ -1547,8 +1605,9 @@ def plan_sigma_windows(
             "node_digest": fit["node_digest"],
             "criterion": ("relative" if fit["relative"]
                           else "peak-relative"),
-            "sup_error": fit["sup_error"], "eps": tolerance,
-            "requested_eps": tolerance,
+            "sup_error": fit["sup_error"], "eps": _spec_eps(spec, tolerance),
+            "requested_eps": _spec_eps(spec, tolerance),
+            "eta_ry": _spec_eta(spec, eta),
             "kappa_max": fit["kappa_max"],
             "roundoff_amplification": fit["roundoff_amplification"],
             "runtime_noise_bound": fit["noise_bound"],
