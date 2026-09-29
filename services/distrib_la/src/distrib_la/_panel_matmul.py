@@ -38,7 +38,10 @@ def panel_matmul(a, b, *, mesh, panel_bytes, bounds=None, weights=None):
     weights : jax.Array, optional
         (q,k) replicated contraction weights, ``a·diag(w)·b``.  On a square
         mesh each panel's slice of ``a`` is scaled on its way into the
-        all-gather, so no weighted copy of ``a`` is made.
+        all-gather, so no weighted copy of ``a`` is made.  (s,q,k) stacked
+        weights (square mesh, 3-D ``b``) return the tuple of the ``s``
+        products ``a·diag(w_s)·b`` from ONE exchange of each panel, each
+        scaled after its gather; ``bounds`` is then (s,q,2).
 
     Returns
     -------
@@ -74,15 +77,17 @@ def panel_matmul(a, b, *, mesh, panel_bytes, bounds=None, weights=None):
         kl = k // px
         cap = max(1, min(limit // (2 * px), kl // 2 if px > 1 else kl))
         width = max(d for d in range(1, kl + 1) if kl % d == 0 and d <= cap)
-        kernel = _interleaved_kernel(mesh, q, m, k, n, width, bounds is not None,
-                                     1, weights is not None)
+        n_w = 0 if weights is None else (int(weights.shape[0]) if weights.ndim == 3 else 1)
+        kernel = _interleaved_kernel(mesh, q, m, k, n, width, bounds is not None, 1, n_w)
         args = (a, b)
         if bounds is not None:
-            args += (jnp.asarray(bounds, jnp.int32).reshape(q, 2),)
+            args += (jnp.asarray(bounds, jnp.int32).reshape(max(n_w, 1), q, 2),)
         if weights is not None:
-            args += (jnp.asarray(weights, a.dtype).reshape(q, k),)
+            args += (jnp.asarray(weights, a.dtype).reshape(max(n_w, 1), q, k),)
         return kernel(*args)
     if weights is not None:
+        if weights.ndim == 3:
+            raise ValueError('panel_matmul: stacked weights need a square mesh and 3-D b')
         a = a * jnp.asarray(weights, a.dtype)[:, None, :]
     common = gcd(k // px, k // py)
     width = min(common, limit)
@@ -154,7 +159,7 @@ def _kernel(mesh, q, m, k, n, width, sample_axis):
 
 
 @lru_cache(maxsize=64)
-def _interleaved_kernel(mesh, q, m, k, n, width, active=False, depth=1, weighted=False):
+def _interleaved_kernel(mesh, q, m, k, n, width, active=False, depth=1, n_w=0):
     """Batched SUMMA on a square mesh: K streamed in interleaved panels, ``depth`` prefetched.
 
     Rank ``(x, y)`` holds the K block ``[y·K/p, (y+1)·K/p)`` of A and
@@ -168,61 +173,79 @@ def _interleaved_kernel(mesh, q, m, k, n, width, active=False, depth=1, weighted
     ``active``: each row's interval ``[lo, hi)`` meets a panel in ONE run of
     panel positions (a suffix of the first live owner's segment, whole
     segments, a prefix of the last), so the local active-range GEMM contracts
-    only that run.  ``weighted``: a replicated ``(q, K)`` weight row scales each
+    only that run.  ``n_w = 1``: a replicated ``(q, K)`` weight row scales each
     panel's local slice of A before its all-gather (no weighted copy of A).
+    ``n_w ≥ 2``: ``n_w`` weightings share each panel exchange, each scaling
+    the gathered panel before its own local GEMM; a tuple of ``n_w`` tiles.
     """
     p = int(mesh.shape['x'])
-    mx, ny, kl = m // p, n // p, k // p
+    kl = k // p
     n_chunk = kl // width
     depth = max(1, min(int(depth), n_chunk - 1))
     contract = _panel_contraction(mesh) if active else None
     owner = np.arange(p, dtype=np.int32)[None, :]
+    n_out = max(int(n_w), 1)
 
     def body(a, b, bounds, weights):
         def gather(j):
             left = lax.dynamic_slice_in_dim(a, j * width, width, axis=2)
-            if weighted:
+            if n_w == 1:
                 start = lax.axis_index('y') * kl + j * width
-                left = left * lax.dynamic_slice_in_dim(weights, start, width, axis=1)[:, None, :]
+                left = left * lax.dynamic_slice_in_dim(weights[0], start, width, axis=1)[:, None, :]
             right = lax.dynamic_slice_in_dim(b, j * width, width, axis=1)
             return (lax.all_gather(left, 'y', axis=2, tiled=True),
                     lax.all_gather(right, 'x', axis=1, tiled=True))
 
-        def product(c, panel, j):
-            left, right = panel
-            if not active:
-                return left @ right if c is None else c + left @ right
+        def interval(bd, j):
             base = owner * kl + j * width
-            start = owner * width + jnp.clip(bounds[:, :1] - base, 0, width)
-            stop = owner * width + jnp.clip(bounds[:, 1:] - base, 0, width)
+            start = owner * width + jnp.clip(bd[:, :1] - base, 0, width)
+            stop = owner * width + jnp.clip(bd[:, 1:] - base, 0, width)
             live = stop > start
             hi = jnp.max(jnp.where(live, stop, 0), axis=1)
             lo = jnp.minimum(jnp.min(jnp.where(live, start, p * width), axis=1), hi)
-            return contract(left, right, jnp.stack([lo, hi], axis=1).astype(jnp.int32), c)
+            return jnp.stack([lo, hi], axis=1).astype(jnp.int32)
+
+        def product(cs, panel, j):
+            left, right = panel
+            if n_w > 1:
+                cols = (owner.T * kl + j * width + jnp.arange(width)[None, :]).reshape(-1)
+            outs = []
+            for i in range(n_out):
+                lhs = (left if n_w < 2
+                       else left * jnp.take(weights[i], cols, axis=1)[:, None, :])
+                c = None if cs is None else cs[i]
+                if active:
+                    outs.append(contract(lhs, right, interval(bounds[i], j), c))
+                else:
+                    outs.append(lhs @ right if c is None else c + lhs @ right)
+            return tuple(outs)
 
         if n_chunk == 1:
-            return product(None, gather(0), 0)
-        first = gather(0)
-        ahead = tuple(gather(j) for j in range(1, depth + 1))
-        c = product(None, first, 0)
+            cs = product(None, gather(0), 0)
+        else:
+            first = gather(0)
+            ahead = tuple(gather(j) for j in range(1, depth + 1))
+            cs = product(None, first, 0)
 
-        def step(carry, j):
-            c, ahead = carry
-            return (product(c, ahead[0], j), ahead[1:] + (gather(j + depth),)), None
+            def step(carry, j):
+                cs, ahead = carry
+                return (product(cs, ahead[0], j), ahead[1:] + (gather(j + depth),)), None
 
-        (c, ahead), _ = lax.scan(step, (c, ahead), jnp.arange(1, n_chunk - depth), unroll=1)
-        for i, panel in enumerate(ahead):
-            c = product(c, panel, n_chunk - depth + i)
-        return c
+            (cs, ahead), _ = lax.scan(step, (cs, ahead), jnp.arange(1, n_chunk - depth), unroll=1)
+            for i, panel in enumerate(ahead):
+                cs = product(cs, panel, n_chunk - depth + i)
+        return cs if n_w > 1 else cs[0]
 
     face = NamedSharding(mesh, P(None, 'x', 'y'))
     rep = NamedSharding(mesh, P())
-    extra = (('bounds',) if active else ()) + (('weights',) if weighted else ())
+    extra = (('bounds',) if active else ()) + (('weights',) if n_w else ())
 
     def local(a, b, *rest):
         named = dict(zip(extra, rest))
         return body(a, b, named.get('bounds'), named.get('weights'))
 
+    out = (P(None, 'x', 'y'),) * n_out if n_w > 1 else P(None, 'x', 'y')
     kernel = shard_map(local, mesh=mesh, in_specs=(P(None, 'x', 'y'),) * 2 + (P(),) * len(extra),
-                       out_specs=P(None, 'x', 'y'), check_vma=False)
-    return jax.jit(kernel, in_shardings=(face, face) + (rep,) * len(extra), out_shardings=face)
+                       out_specs=out, check_vma=False)
+    return jax.jit(kernel, in_shardings=(face, face) + (rep,) * len(extra),
+                   out_shardings=(face,) * n_out if n_w > 1 else face)
