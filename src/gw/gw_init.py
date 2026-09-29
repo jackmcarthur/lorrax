@@ -3334,11 +3334,22 @@ def qp_band_cut_for_deck(config, wfn, print0):
     from .gw_config import infer_material_class
     from .qp_support import (CUT_GAP_ETAS, CUT_SEARCH_ETAS, SEMICORE_GAP_EV,
                              WINDOW_CLIP_EV)
-    e = np.asarray(wfn.energies[0, :, :config.nband], dtype=np.float64) * RYD_TO_EV
+    e_ry = np.asarray(wfn.energies[0, :, :config.nband], dtype=np.float64)
+    e = e_ry * RYD_TO_EV
     n_occ = int(wfn.nelec)
     metal = infer_material_class(wfn.occs) == "metal"
-    mu = (float(wfn.efermi) * RYD_TO_EV if metal
-          else 0.5 * (float(e[:, n_occ - 1].max()) + float(e[:, n_occ].min())))
+    if metal:
+        # The deck's fixed-N smearing state on the DFT ladder, as the SC map
+        # solves it; ``wfn.efermi`` is a band-index midgap, not a metal's mu.
+        from psp.get_DFT_mtxels import spin_degeneracy_factor
+        from .efermi import OccupationState
+        w = np.asarray(wfn.kweights, dtype=np.float64)
+        mu = float(OccupationState.solve_smearing(
+            e_ry, w / w.sum(), float(wfn.num_electrons), float(config.occ_broadening_ry),
+            family=config.occ_smearing_family, state_capacity=spin_degeneracy_factor(wfn),
+            clamp_tol=float(config.occupation_clamp_tol)).mu_ry) * RYD_TO_EV
+    else:
+        mu = 0.5 * (float(e[:, n_occ - 1].max()) + float(e[:, n_occ].min()))
     below = np.count_nonzero(e < mu, axis=1) if metal else np.full(e.shape[0], n_occ)
     eta = float(config.sigma.regularization_ev)
     cut = qp_band_cut(
