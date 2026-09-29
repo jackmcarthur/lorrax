@@ -159,3 +159,18 @@ def test_branches_metallize_only_with_an_occupation_state():
         assert "inconsistent" in str(err)
     else:
         raise AssertionError("mu mismatch was not refused")
+
+
+def test_static_key_digests_numeric_tables_by_content():
+    """Nested numeric lists (a store header's symmetry tables) key by content, as one digest."""
+    from gw.mpa.sigma import _static_key
+    table = dict(qirr=dict(sym_perm=[[0, 1], [1, 0]], n_sym_spatial=2), grid=[8, 8, 8],
+                 representation="scalar-trs-even-s")
+    same = dict(qirr=dict(sym_perm=[[0, 1], [1, 0]], n_sym_spatial=2), grid=[8, 8, 8],
+                representation="scalar-trs-even-s")
+    other = dict(qirr=dict(sym_perm=[[1, 0], [0, 1]], n_sym_spatial=2), grid=[8, 8, 8],
+                 representation="scalar-trs-even-s")
+    assert _static_key(table) == _static_key(same) != _static_key(other)
+    assert _static_key([1, 2]) != _static_key([1.0, 2.0])
+    assert _static_key([[0, 1], [2]]) == _static_key([[0, 1], [2]])  # ragged: element-wise
+    hash(_static_key(("scalar", (1, 2), [np.arange(3), None], ())))

@@ -999,13 +999,33 @@ def _admit(compiled, meta, stage, *, native=0, resident=0, counted=0):
     return compiled
 
 
+def _numeric_table(value):
+    """A nested list or tuple of Python numbers as one array, else ``None``."""
+    if not value or not all(isinstance(v, (bool, int, float, complex, np.number, list, tuple))
+                            for v in value):
+        return None
+    try:
+        table = np.asarray(value)
+    except ValueError:  # ragged
+        return None
+    return table if table.dtype.kind in "biufc" else None
+
+
 def _static_key(value):
-    """Hashable content key of a small table tree (arrays by bytes digest)."""
+    """Hashable content key of a small table tree (arrays by bytes digest).
+
+    A store header carries its symmetry tables as nested lists (qirr's
+    permutations, wraps and orbits); each is digested as one array, not
+    element by element (0.35 s per SC map on Na 8^3, 48 operations).
+    """
     import hashlib
     if isinstance(value, dict):
         return tuple(sorted((k, _static_key(v)) for k, v in value.items()))
     if isinstance(value, (list, tuple)):
-        return tuple(_static_key(v) for v in value)
+        table = _numeric_table(value)
+        if table is None:
+            return tuple(_static_key(v) for v in value)
+        value = table
     if isinstance(value, (np.ndarray, jax.Array)):
         a = np.asarray(value)
         return ('array', a.shape, a.dtype.str,
