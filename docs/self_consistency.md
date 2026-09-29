@@ -220,15 +220,18 @@ band set once, and the set stays frozen: no band enters or leaves it later.
 **Tail law.** The rigid shift is
 
 $$
-\beta = \frac{\sum_{kn} w_k Z_{nk}\,(E^{\rm QP}_{nk} - E^{\rm DFT}_{nk})}{\sum_{kn} w_k Z_{nk}},
+\beta = \frac{\sum_{kn} w_k u_{nk}\,(E^{\rm QP}_{nk} - E^{\rm DFT}_{nk})}{\sum_{kn} w_k u_{nk}},
+\qquad u_{nk} = \min(Z_{nk}, Z_{nk}^{-1})\ (Z_{nk} > 0),\ 0\ \text{otherwise},
 \qquad Z_{nk} = \bigl(1 - \partial_\omega \mathrm{Re}\,\Sigma_{nn}(\omega)\rvert_{E_{nk}}\bigr)^{-1},
 $$
 
-over the window's conduction states that are on the sampled grid, have
-$0 < Z \le 1$, and whose DFT energy lies within $0.2\,(E_{c,\max} - E_F)$ of
+over the window's conduction states that are on the sampled grid and whose DFT energy lies within $0.2\,(E_{c,\max} - E_F)$ of
 $E_{c,\max}$, the top protected band's DFT maximum over k
 (`band_partition.tail_fit_states`, owner 2026-09-29: the tail's bottom follows
-the states near the matrix's top, not the conduction mean). A state on a satellite or near a pole of Σ has small $Z$ and
+the states near the matrix's top, not the conduction mean). The weight $u$ is
+continuous in $s = \partial_\omega{\rm Re}\,\Sigma$ ($u = Z$ for $s \le 0$,
+$1 - s$ for $0 < s < 1$, 0 for $s \ge 1$), so the tail law, and with it the SC
+map, has no jump where a state's $Z$ crosses 1. A state on a satellite or near a pole of Σ has small $Z$ and
 cannot drag the tail: a state moved 3 eV onto a satellite with $Z = 0.1$
 shifts β by 21 meV, where the plain mean moves 188 meV (CLAIMS 2710). An
 off-grid state is excluded because its energy did not come from its own
