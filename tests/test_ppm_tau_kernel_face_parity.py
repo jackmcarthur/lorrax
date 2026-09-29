@@ -66,6 +66,11 @@ _CASES = (
     ("unbracketed_ns4", dict(
         ns=4, nk_tuple=(2, 1, 1), n_rmu=4, nb_full=8, nb_sigma=5,
         weight_kind="float", brackets=None, seed=204)),
+    # The last bracket holds no live band: it is skipped and reads zero.
+    ("dead_bracket_ns2", dict(
+        ns=2, nk_tuple=(2, 1, 1), n_rmu=4, nb_full=10, nb_sigma=10,
+        weight_kind="float", brackets=((0, 3), (3, 7), (7, 10)), seed=205,
+        dead_from=7)),
 )
 
 
@@ -77,7 +82,7 @@ def _to_host(x, mesh):
 
 def check_tau_kernel_parent_dense(mesh, *, ns, nk_tuple, n_rmu, nb_full,
                                  nb_sigma, weight_kind, brackets,
-                                 seed):
+                                 seed, dead_from=None):
     p0 = print if jax.process_index() == 0 else (lambda *a, **k: None)
     nkx, nky, nkz = nk_tuple
     nk = nkx * nky * nkz
@@ -90,6 +95,8 @@ def check_tau_kernel_parent_dense(mesh, *, ns, nk_tuple, n_rmu, nb_full,
         sel = jnp.asarray(rng.uniform(size=(nk, nb_full)) > 0.5)
     else:
         sel = jnp.asarray(rng.uniform(-0.125, 1.125, size=(nk, nb_full)))
+    if dead_from is not None:
+        sel = sel.at[:, dead_from:].set(0)
     B_q = jnp.asarray(_crand(rng, nk, n_rmu, n_rmu))
     Omega_q = jnp.asarray(
         rng.uniform(0.2, 3.0, size=(nk, n_rmu, n_rmu))
@@ -127,6 +134,8 @@ def check_tau_kernel_parent_dense(mesh, *, ns, nk_tuple, n_rmu, nb_full,
     held_rel = float(np.max(np.abs(held - got))) / max(float(np.max(np.abs(got))), 1e-300)
     p0(f"  held panels vs per-node gathers: max_rel={held_rel:.3e}")
     assert held_rel < 1e-13
+    if dead_from is not None:
+        assert not np.any(got[-1]), "a bracket with no live band must read zero"
     reference = _dense_tau(psi_full, np.asarray(E_A), np.asarray(sel),
         np.asarray(B_poles[0]), np.asarray(Omega_q), complex(t_node),
         brackets, nb_sigma)
