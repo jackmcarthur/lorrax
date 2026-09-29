@@ -3354,6 +3354,7 @@ def qp_band_cut_for_deck(config, wfn, print0):
         gap = (float(lo[b3 - 1]), float(hi[b3 - 1])) if b3 < e.shape[1] else (float(e[:, -1].max()), np.inf)
         cut = cut._replace(b3=b3, gap_ev=gap, cut_ev=0.5 * (gap[0] + gap[1]))
     width = cut.gap_ev[1] - cut.gap_ev[0]
+    print0 = print0 if jax.process_index() else (lambda line: print(line, flush=True))
     print0(f"  QP band cut (absolute, from the DFT ladder about mu={mu:+.4f} eV): "
            f"QP matrix = zeta left = bands 1-{cut.b3}; tail {cut.b3 + 1}-{int(config.nband)} "
            f"scissored (DFT psi, no Sigma, no mixing); cut {cut.cut_ev - mu:+.3f} eV in the "
