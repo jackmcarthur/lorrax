@@ -724,7 +724,12 @@ The modes of the one handler file. The target column is the string
   store through `kout` (Fe 8³ at `ns = 2`: 2 pairs, 512 threads, 73.9 KB, two
   blocks per SM). Where one pair does not fit, the tile counts columns and
   each column forms its own element; where one padded column does not fit,
-  the build refuses (`GATE mathdx-kconv-kbox-residency`).
+  the build refuses (`GATE mathdx-kconv-kbox-residency`). The register load
+  visits its tiles in super-tiles of 16 block rows × 16 pairs of y
+  (`M7Order`): symmetric centroids are stored in contiguous orbits, so a
+  super-tile's full-k sources stay in about 16 × 16 centroids of each parent
+  and are re-read from L2, not DRAM (Fe 8³ `ns = 2`: 24.5 → 5.6 GB read per
+  call, 61.2 → 47.7 ms, bitwise).
 - **The tile-table load (modes 7 and 11, sm_80+).** Where the register load
   cannot keep two blocks resident (its live `g`, `U`, `Ur` are `12·ns²`
   registers: 192 at `ns = 4`, 48 at `ns = 2`, which already runs three

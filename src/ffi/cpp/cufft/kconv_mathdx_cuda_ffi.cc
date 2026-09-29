@@ -1044,6 +1044,31 @@ struct M7Store {                               // U[(ko, a, rx, b, y)], full-k r
 #if LRX_TT
 static_assert(TRC == TT_ROWS, "the host passes the tile's pairs and columns together");
 #else
+// The register load's tile order.  Symmetric ISDF centroids are stored in contiguous orbits, each
+// mapped into itself by every operation, so for every full k the sources of the pairs (x, y) with x
+// and y in a band of kSB consecutive centroids lie in the parent rows and columns of about that
+// band.  Tiles run in super-tiles of kSB block rows x kSB pairs of y, row-block by row-block: a
+// parent source, read once per full k of its star, is re-read from L2 within a super-tile instead
+// of from DRAM across the call (Fe 8^3 n_s 2, 59 parents of 512 full k: DRAM read 24.5 -> 5.6 GB
+// per call).  Which block computes a tile, and when, changes nothing it computes: bitwise.  tpr is
+// tiles per block row, 0 when tiles straddle block rows (the linear order); tile(n) is a bijection
+// of [0, rows * tpr).
+struct M7Order {
+    static constexpr long long kSB = 16;
+    long long rows, tpr, sw;                   // block rows; tiles per block row; super-tile width in tiles
+    __device__ long long tile(long long n) const {
+        if (tpr == 0) return n;
+        const long long x0 = (n / (kSB * tpr)) * kSB, h = min(kSB, rows - x0), n1 = n - x0 * tpr;
+        const long long c = n1 / (h * sw), w = min(sw, tpr - c * sw), n2 = n1 - c * h * sw;
+        return (x0 + n2 / w) * tpr + c * sw + n2 % w;
+    }
+};
+__device__ __forceinline__ M7Order m7_order(long long rows, long long my) {
+    const long long rc = my * SSO;             // columns per block row
+    if (rc % TRC) return M7Order{rows, 0, 1};
+    return M7Order{rows, rc / TRC, max(1LL, M7Order::kSB * SSO / TRC)};
+}
+
 struct M7Load {                                // the register load of the typed unfold
     static constexpr bool kDirect = true, kFinish = false;
     const lrx_c2 *gp, *gt;
@@ -1116,7 +1141,9 @@ extern "C" __global__ void __launch_bounds__(LRX_THREADS, LRX_MINB) lrx_kconv(
 #else
     const M7Load ld{gp, gt, &t, my, pairs};
     const M7Mid mid{kern, xb, my};
-    for (long long col0 = (long long)blockIdx.x * TRC; col0 < ncols; col0 += (long long)gridDim.x * TRC) {
+    const M7Order ord = m7_order(xb.rows, my);
+    for (long long n = blockIdx.x; n < (ncols + TRC - 1) / TRC; n += gridDim.x) {
+        const long long col0 = ord.tile(n) * TRC;
         lrx_kbox::stage_tile<NX, NY, NZ, TRC>(sm, col0, ncols, ld);
         lrx_kbox::transform3<NX, NY, NZ, TRC, LRX_SM, fft_direction::inverse>(sm);
         if constexpr (TRC % SSO == 0) lrx_kbox::mid_group_tile<NX, NY, NZ, TRC, SSO>(sm, col0, ncols, mid);
