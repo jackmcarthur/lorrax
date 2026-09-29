@@ -29,6 +29,9 @@
 //                  store emits X's layout (out_layout 0) or (d0,nk,d3,d1,d4,d2)
 //                  (out_layout 1): the BSE ladder-W rung.
 //   5 kminor fft   Y[r,k] = s * FFT^{+-}_k X[r,.] on a k-MINOR (rows, nk) tile.
+//             Modes 4 and 5 run on the k-box stage's single arm: the Load reads
+//             each column's k run, the Store writes k fastest (or mode 4's
+//             out_layout 1 rows fastest).
 //   6 plane   the pair contraction of mode 0 read straight from the route-G
 //             D-plane transform output D (nk, g, ns, 2c, ns, p): the load
 //             applies the Bloch phase F[k,g,p] and takes L = slots [0,c) and
@@ -58,10 +61,12 @@
 //             transform of G serves every Lorentz block; the scales and the
 //             product/sum order of the vertex sum are those of the XLA chain it
 //             replaces (mode-3 transforms and a scan over the blocks); mode 7's
-//             fused load makes it round-off equal to that chain.  On the k-box stage's split arm: the
-//             group pencil forms each (member, pair) on its own thread with V
-//             staged by cp.async; chunked over pairs through an intermediate no
-//             larger than U.
+//             fused load makes it round-off equal to that chain.  On the k-box
+//             stage: the single arm when a spin group fits (the vertex sum a
+//             group Mid, one thread per (k, pair)); else the split
+//             arm, whose group pencil forms each (member, pair) on its own
+//             thread with V staged by cp.async, chunked over pairs through an
+//             intermediate no larger than U.
 //   9 klead unfold fft   mode 3's inverse transform read from the WEDGE tiles
 //             of an interaction (W, V, a pole field) through mode 7's load:
 //             Y[k, i, j] = s * IFFT_k( L_k O_k R_k^dagger )[i, j] with O_k
@@ -75,6 +80,8 @@
 //             interaction: no partner tile).  The products are the fused
 //             forms of mode 7's load: round-off equal to the XLA unfold
 //             (symmetry_maps unfold_isdf_operator) and mode 3 they replace.
+//             On the k-box stage's single arm (tiles of whole spin groups
+//             when one fits, else single columns).
 //  10 plane fft gather   Y[..., kb, kc] = FFT2_{b,c}(plane[..., b, c]) (forward,
 //             unscaled: jnp.fft.fftn(norm='backward') over the last two axes)
 //             where the plane is the route-G cylinder F (..., n_col) scattered
@@ -95,11 +102,11 @@
 // code and a handler below, (3) a router factory in ffi/fft.py.
 //
 // Residency: modes 0/1/6 keep three nk-long banks per row (one (col,mu) pair) in
-// shared memory, modes 4/5 one; a k-grid whose row does not fit the device's
+// shared memory; a k-grid whose row does not fit the device's
 // opt-in shared memory, or an axis above the fp64 thread-FFT limit (40), is
 // refused by name.  The k-box modes (2, 3, 8, 11) need one (ky, kz) plane of a
-// tile in shared memory; mode 7 (single arm only) one whole padded k-box column.  Modes 2/3/5 may run in place: every block reads the
-// elements it stores before it stores them.
+// tile in shared memory; modes 4, 5, 7 and 9 (single arm only) one whole padded k-box column.
+// Modes 2/3/4/5 may run in place: every block reads the elements it stores before it stores them.
 //
 // Headers: the Python router passes the installed wheel's nvidia/mathdx
 // directory as the string attribute `mathdx_root`; the CUDA toolkit include
@@ -585,61 +592,79 @@ extern "C" __global__ void __launch_bounds__(LRX_THREADS) lrx_kconv(
 #endif
 }
 #elif LRX_MODE < 7
-// Modes 4-5: one resident bank per row.  k-MINOR tiles hold (r, k) at r*NK + k
-// and walk k fastest.  x and y may alias (in place): every element a block
-// stores is one it loaded.
+// Modes 4 (convolution) and 5 (transform) on the k-box stage's single arm: k-MINOR tiles hold
+// (r, k) at r*NK + k.  The Load reads each column's k run (k fastest across threads); the kernel
+// multiply is the resident family's K[(r / m1) % m0, k]; the Store writes X's layout k fastest
+// (out_layout 0) or mode 4's (d0, nk, d3, d1, d4, d2) rows fastest (out_layout 1).  Each line sees
+// the family's thread FFT on the same inputs in the same axis order (z, y, x each way), so the
+// result is the resident kernel's bit for bit.  x and y may alias (in place): a block stages its
+// tile's columns whole before it stores them.  One column always fits (the host refuses a k-box
+// row above the opt-in memory), so there is no split arm.
+#include "kbox_stage.cuh"
 constexpr bool CONV = (LRX_MODE == 4);
+constexpr int TRC = LRX_TR;
 
-__device__ __forceinline__ long long lrx_elem(long long row, int k, long long rows) {
-    return row * NK + k;
-}
+struct MinorLoad {
+    static constexpr bool kDirect = true, kFinish = false;
+    const lrx_c2* x;
+    template <class View>
+    __device__ void direct(const View& view, int k0, int k1, long long col0, int width, long long ncols) const {
+        const int nkr = k1 - k0;
+        for (int i = threadIdx.x; i < nkr * width; i += blockDim.x) {
+            const int k = k0 + i % nkr, j = i / nkr;
+            lrx_c2 v = {0.0, 0.0};
+            if (col0 + j < ncols) v = x[(col0 + j) * NK + k];
+            view(k, j) = v;
+        }
+    }
+};
+struct MinorKernMid {                              // mode 4: K[(r / m1) % m0, k], R space
+    const lrx_c2* __restrict__ kern;
+    RowGeo g;
+    __device__ lrx_c2 operator()(int k, long long row, lrx_c2 v) const {
+        return lrx_mul(v, kern[((row / g.m1) % g.m0) * NK + k]);
+    }
+};
+struct MinorStore {
+    lrx_c2* y;
+    RowGeo g;
+    __device__ void put(int k, long long row, lrx_c2 v) const {
+        lrx_c2 w;
+        w.x = (lrx_real)(v.x * g.scale);
+        w.y = (lrx_real)(v.y * g.scale);
+        long long o = row * NK + k;
+        if (LRX_MODE == 4 && g.out_layout == 1) {       // (d0,nk,d3,d1,d4,d2)
+            long long t = row;
+            const long long i4 = t % g.d4; t /= g.d4;
+            const long long i3 = t % g.d3; t /= g.d3;
+            const long long i2 = t % g.d2; t /= g.d2;
+            const long long i1 = t % g.d1; const long long i0 = t / g.d1;
+            o = ((((i0 * NK + k) * g.d3 + i3) * g.d1 + i1) * g.d4 + i4) * g.d2 + i2;
+        }
+        y[o] = w;
+    }
+};
 
-extern "C" __global__ void __launch_bounds__(256) lrx_kconv(
-    const lrx_c2* x, const lrx_c2* __restrict__ kern, lrx_c2* y, RowGeo g) {
+extern "C" __global__ void __launch_bounds__(LRX_THREADS) lrx_kconv(
+    const lrx_c2* x, const lrx_c2* __restrict__ kern, lrx_c2* y, RowGeo g, int phase) {
     extern __shared__ lrx_c2 sm[];
-    const long long r0 = (long long)blockIdx.x * RB;
     using namespace cufftdx;
-    for (int i = threadIdx.x; i < RB * NK; i += blockDim.x) {
-        const int k = i % NK, j = i / NK;
-        const long long row = r0 + j;
-        lrx_c2 v = {0.0, 0.0};
-        if (row < g.rows) v = x[lrx_elem(row, k, g.rows)];
-        sm[j * SP + k] = v;
-    }
-    __syncthreads();
-    if (CONV || !g.forward) transform3<fft_direction::inverse>(sm);
-    else transform3<fft_direction::forward>(sm);
-    if (CONV) {
-        for (int i = threadIdx.x; i < RB * NK; i += blockDim.x) {
-            const int k = i % NK, j = i / NK;
-            const long long row = r0 + j;
-            if (row < g.rows) {
-                const long long kidx = ((row / g.m1) % g.m0) * NK + k;
-                sm[j * SP + k] = lrx_mul(sm[j * SP + k], kern[kidx]);
-            }
+    (void)phase;
+    const bool inv = CONV || !g.forward;               // the first direction
+    const MinorLoad ld{x};
+    const MinorStore st{y, g};
+    const long long tiles = (g.rows + TRC - 1) / TRC;
+    for (long long t = blockIdx.x; t < tiles; t += gridDim.x) {
+        const long long c0 = t * TRC;
+        lrx_kbox::stage_tile<NX, NY, NZ, TRC>(sm, c0, g.rows, ld);
+        if (inv) lrx_kbox::transform3<NX, NY, NZ, TRC, LRX_SM, fft_direction::inverse>(sm);
+        else lrx_kbox::transform3<NX, NY, NZ, TRC, LRX_SM, fft_direction::forward>(sm);
+        if constexpr (CONV) {
+            lrx_kbox::mid_tile<NX, NY, NZ, TRC>(sm, c0, g.rows, MinorKernMid{kern, g});
+            lrx_kbox::transform3<NX, NY, NZ, TRC, LRX_SM, fft_direction::forward>(sm);
         }
-        __syncthreads();
-        transform3<fft_direction::forward>(sm);
-    }
-    for (int i = threadIdx.x; i < RB * NK; i += blockDim.x) {
-        const int k = i % NK, j = i / NK;
-        const long long row = r0 + j;
-        if (row < g.rows) {
-            const lrx_c2 v = sm[j * SP + k];
-            lrx_c2 w;
-            w.x = (lrx_real)(v.x * g.scale);
-            w.y = (lrx_real)(v.y * g.scale);
-            long long o = lrx_elem(row, k, g.rows);
-            if (LRX_MODE == 4 && g.out_layout == 1) {       // (d0,nk,d3,d1,d4,d2)
-                long long t = row;
-                const long long i4 = t % g.d4; t /= g.d4;
-                const long long i3 = t % g.d3; t /= g.d3;
-                const long long i2 = t % g.d2; t /= g.d2;
-                const long long i1 = t % g.d1; const long long i0 = t / g.d1;
-                o = ((((i0 * NK + k) * g.d3 + i3) * g.d1 + i1) * g.d4 + i4) * g.d2 + i2;
-            }
-            y[o] = w;
-        }
+        if (LRX_MODE == 4 && g.out_layout == 1) lrx_kbox::store_tile<NX, NY, NZ, TRC>(sm, c0, g.rows, st);
+        else lrx_kbox::store_tile_kfast<NX, NY, NZ, TRC>(sm, c0, g.rows, st);
     }
 }
 #elif LRX_MODE <= 9 || LRX_MODE == 11
@@ -664,7 +689,6 @@ constexpr int SS = NS * NR;
 #endif
 constexpr int NA = LRX_NA;
 constexpr int SSO = (NA == NS) ? SS : NA * NA;   // rows per pair
-constexpr bool GROUPED = (RB % SSO) == 0;
 
 // The typed unfold of one (k, x, y) pair (symmetry_maps unfold_isdf_operator,
 // axis-local pair_transpose arm): source row, both endpoint gathers, then
@@ -747,68 +771,62 @@ __device__ __forceinline__ long long lrx_x_of(const XBlock& b, long long r) {
     return (r / b.bx) * b.xs + b.x0 + r % b.bx;
 }
 
-// The grouped load (RB holds whole spin groups): PB pairs per block, the NS*NS
-// sources of a pair read once and U G U^dagger formed in registers; bank
-// (jp, a, b) = row jp*SS + a*NS + b holds all NK values of that element.
-// Pair pr is (block row, y) = (pr / my, pr % my) of the stored x block (lrx_x_block).
-template <int PB>
-__device__ __forceinline__ void lrx_group_load(
-    const lrx_c2* __restrict__ gp, const lrx_c2* __restrict__ gt, const UnfoldTab& t,
-    long long p0, long long pairs, long long my, lrx_c2* sm) {
+// The typed unfold of a tile of columns into a direct Load's view (kbox_stage.cuh stage_tile):
+// column c is (pair, a, b), pair = p0 + c / SSO = (block row, y) of the stored x block
+// (lrx_x_block), and (a, b) its element of U O Ur^dagger (mode 7's NA < NS: of the stored spin
+// block).  GROUPS (the tile holds whole spin groups): one thread per (k, pair) reads the pair's
+// sources once and forms its elements in registers; else one thread per (k, column) forms its own
+// element with the same arithmetic.  A pair past `pairs` or a padding row loads as zero.  Modes 7,
+// 8 and 9 load through it.
+template <bool GROUPS, class View>
+__device__ __forceinline__ void lrx_unfold_direct(
+    const View& view, const lrx_c2* __restrict__ gp, const lrx_c2* __restrict__ gt, const UnfoldTab& t,
+    long long p0, long long my, long long pairs, int k0, int k1, long long col0, int width, long long ncols) {
     const XBlock xb = lrx_x_block(t);
-    for (int i = threadIdx.x; i < PB * NK; i += blockDim.x) {
-        const int k = i / PB, jp = i % PB;
-        const long long pr = p0 + jp;
-        const long long rx = pr / my, yy = pr - rx * my, xx = lrx_x_of(xb, rx);
-        if (pr < pairs && xx < xb.mx) {
-            lrx_c2 g[NS][NR], u[NS][NS], ur[NR][NR];
-            lrx_unfold_pair(gp, gt, t, k, xx, yy, g, u, ur);
-#pragma unroll
-            for (int a = 0; a < NS; ++a) {
-                if constexpr (NA != NS) { if (a < t.a0 || a >= t.a0 + NA) continue; }
-                lrx_c2 out[NR];
-                lrx_spin_row(u, ur, g, a, out);
-#pragma unroll
-                for (int b = 0; b < NR; ++b) {
-                    if constexpr (NA != NS) {
-                        if (b < t.b0 || b >= t.b0 + NA) continue;
-                        sm[(jp * SSO + (a - t.a0) * NA + (b - t.b0)) * SP + k] = out[b];
-                    } else {
-                        sm[(jp * SS + a * NR + b) * SP + k] = out[b];
-                    }
-                }
-            }
-        } else {
-#pragma unroll
-            for (int ab = 0; ab < SSO; ++ab) sm[(jp * SSO + ab) * SP + k] = {0.0, 0.0};
-        }
-    }
-}
-
-// The load of modes 7 and 9: the block's RB rows r = (pair, a, b) of the
-// unfolded operand into the banks, grouped when RB holds whole spin groups.
-__device__ __forceinline__ void lrx_unfold_load(
-    const lrx_c2* __restrict__ gp, const lrx_c2* __restrict__ gt, const UnfoldTab& t,
-    long long r0, lrx_c2* sm) {
-    const XBlock xb = lrx_x_block(t);
-    const long long my = t.nl / NR, pairs = xb.rows * my;
-    if constexpr (GROUPED) {
-        lrx_group_load<RB / SSO>(gp, gt, t, r0 / SSO, pairs, my, sm);
-    } else {
-        for (int i = threadIdx.x; i < RB * NK; i += blockDim.x) {
-            const int k = i / RB, j = i % RB;
-            const long long r = r0 + j, pr = r / SSO;
-            lrx_c2 v = {0.0, 0.0};
+    if constexpr (GROUPS) {
+        const int groups = width / SSO;
+        for (int i = threadIdx.x; i < (k1 - k0) * groups; i += blockDim.x) {
+            const int k = k0 + i / groups, j = i % groups;
+            const long long pr = p0 + col0 / SSO + j;
             const long long rx = pr / my, yy = pr - rx * my, xx = lrx_x_of(xb, rx);
             if (pr < pairs && xx < xb.mx) {
-                const int a = (NA == NS) ? (int)((r % SS) / NR) : t.a0 + (int)((r % SSO) / NA);
-                const int b = (NA == NS) ? (int)(r % NR) : t.b0 + (int)((r % SSO) % NA);
+                lrx_c2 g[NS][NR], u[NS][NS], ur[NR][NR];
+                lrx_unfold_pair(gp, gt, t, k, xx, yy, g, u, ur);
+#pragma unroll
+                for (int a = 0; a < NS; ++a) {
+                    if constexpr (NA != NS) { if (a < t.a0 || a >= t.a0 + NA) continue; }
+                    lrx_c2 out[NR];
+                    lrx_spin_row(u, ur, g, a, out);
+#pragma unroll
+                    for (int b = 0; b < NR; ++b) {
+                        if constexpr (NA != NS) {
+                            if (b < t.b0 || b >= t.b0 + NA) continue;
+                            view(k, j * SSO + (a - t.a0) * NA + (b - t.b0)) = out[b];
+                        } else {
+                            view(k, j * SSO + a * NR + b) = out[b];
+                        }
+                    }
+                }
+            } else {
+#pragma unroll
+                for (int ab = 0; ab < SSO; ++ab) view(k, j * SSO + ab) = {0.0, 0.0};
+            }
+        }
+    } else {
+        for (int i = threadIdx.x; i < (k1 - k0) * width; i += blockDim.x) {
+            const int k = k0 + i / width, j = i % width;
+            const long long c = col0 + j, pr = p0 + c / SSO;
+            const long long rx = pr / my, yy = pr - rx * my, xx = lrx_x_of(xb, rx);
+            lrx_c2 v = {0.0, 0.0};
+            if (c < ncols && pr < pairs && xx < xb.mx) {
+                const int a = (NA == NS) ? (int)((c % SS) / NR) : t.a0 + (int)((c % SSO) / NA);
+                const int b = (NA == NS) ? (int)(c % NR) : t.b0 + (int)((c % SSO) % NA);
                 lrx_c2 g[NS][NR], u[NS][NS], ur[NR][NR], out[NR];
                 lrx_unfold_pair(gp, gt, t, k, xx, yy, g, u, ur);
                 lrx_spin_row(u, ur, g, a, out);
                 v = out[b];
             }
-            sm[j * SP + k] = v;
+            view(k, j) = v;
         }
     }
 }
@@ -1036,53 +1054,7 @@ struct M7Load {                                // the register load of the typed
     long long my, pairs;
     template <class View>
     __device__ void direct(const View& view, int k0, int k1, long long col0, int width, long long ncols) const {
-        const XBlock xb = lrx_x_block(*t);
-        if constexpr (TRC % SSO == 0) {        // whole spin groups: a pair's sources read once
-            const int groups = width / SSO;
-            for (int i = threadIdx.x; i < (k1 - k0) * groups; i += blockDim.x) {
-                const int k = k0 + i / groups, j = i % groups;
-                const long long pr = col0 / SSO + j;
-                const long long rx = pr / my, yy = pr - rx * my, xx = lrx_x_of(xb, rx);
-                if (pr < pairs && xx < xb.mx) {
-                    lrx_c2 g[NS][NR], u[NS][NS], ur[NR][NR];
-                    lrx_unfold_pair(gp, gt, *t, k, xx, yy, g, u, ur);
-#pragma unroll
-                    for (int a = 0; a < NS; ++a) {
-                        if constexpr (NA != NS) { if (a < t->a0 || a >= t->a0 + NA) continue; }
-                        lrx_c2 out[NR];
-                        lrx_spin_row(u, ur, g, a, out);
-#pragma unroll
-                        for (int b = 0; b < NR; ++b) {
-                            if constexpr (NA != NS) {
-                                if (b < t->b0 || b >= t->b0 + NA) continue;
-                                view(k, j * SSO + (a - t->a0) * NA + (b - t->b0)) = out[b];
-                            } else {
-                                view(k, j * SSO + a * NR + b) = out[b];
-                            }
-                        }
-                    }
-                } else {
-#pragma unroll
-                    for (int ab = 0; ab < SSO; ++ab) view(k, j * SSO + ab) = {0.0, 0.0};
-                }
-            }
-        } else {                               // fewer columns than a group: one element per column
-            for (int i = threadIdx.x; i < (k1 - k0) * width; i += blockDim.x) {
-                const int k = k0 + i / width, j = i % width;
-                const long long c = col0 + j, pr = c / SSO;
-                const long long rx = pr / my, yy = pr - rx * my, xx = lrx_x_of(xb, rx);
-                lrx_c2 v = {0.0, 0.0};
-                if (c < ncols && pr < pairs && xx < xb.mx) {
-                    const int a = (NA == NS) ? (int)((c % SS) / NR) : t->a0 + (int)((c % SSO) / NA);
-                    const int b = (NA == NS) ? (int)(c % NR) : t->b0 + (int)((c % SSO) % NA);
-                    lrx_c2 g[NS][NR], u[NS][NS], ur[NR][NR], out[NR];
-                    lrx_unfold_pair(gp, gt, *t, k, xx, yy, g, u, ur);
-                    lrx_spin_row(u, ur, g, a, out);
-                    v = out[b];
-                }
-                view(k, j) = v;
-            }
-        }
+        lrx_unfold_direct<TRC % SSO == 0>(view, gp, gt, *t, 0, my, pairs, k0, k1, col0, width, ncols);
     }
 };
 
@@ -1158,104 +1130,34 @@ extern "C" __global__ void __launch_bounds__(LRX_THREADS, LRX_MINB) lrx_kconv(
 #endif
 }
 #elif LRX_MODE == 8
-// Mode 8 has two arms, chosen at build from the grid and the opt-in shared memory:
-// LRX_ARM 0, the resident kernel, when a spin group's ns^2 rows fit one block (the unfolded
-// load and the vertex sum in one pass: A100 door, ns 4, 1.04-1.44x the split at 4^3-8^3 and
-// 6x6x1/12x12x1); LRX_ARM 1, the k-box split arm, where they do not (it has no residency limit).
-#if LRX_ARM == 0
-// Mode 8: mode 7's load, then the Lorentz vertex sum in R space.  Per (k, pair)
-// one thread holds the NS*NS transformed Green values g (scaled by si as the
-// mode-3 transform stores them) and accumulates, block by block in (A, B)
-// order, acc[a][b] += (i^code g[perm_A[a]][perm_B[b]]) * V[k, x, A, y, B]: the
-// signed permutation is exact, the product is XLA's (no FMA) and the sum starts
-// at zero, as the scan over blocks did.  The result goes back to the same banks.
-static_assert(GROUPED && RB >= SS, "mode 8 keeps whole spin groups resident (the host picks RB)");
-extern "C" __global__ void __launch_bounds__(256) lrx_kconv(
-    const lrx_c2* __restrict__ gp, const lrx_c2* __restrict__ gt,
-    const lrx_c2* __restrict__ kern, lrx_c2* __restrict__ y, UnfoldTab t, LorentzTab v) {
-    extern __shared__ lrx_c2 sm[];
-    using namespace cufftdx;
-    constexpr int PB = RB / SS;
-    const long long mx = t.ml / NS, my = t.nl / NS, pairs = mx * my;
-    const long long p0 = (long long)blockIdx.x * PB;
-    lrx_group_load<PB>(gp, gt, t, p0, pairs, my, sm);
-    __syncthreads();
-    transform3<fft_direction::inverse>(sm);
-    const long long wy = (long long)my * v.nb, wx = (long long)v.na * wy;
-    for (int i = threadIdx.x; i < PB * NK; i += blockDim.x) {
-        const int k = i / PB, jp = i % PB;
-        const long long pr = p0 + jp;
-        if (pr >= pairs) continue;
-        const long long xx = pr / my, yy = pr - xx * my;
-        lrx_c2 g[SS], acc[SS];
-#pragma unroll
-        for (int ab = 0; ab < SS; ++ab) {
-            const lrx_c2 z = sm[(jp * SS + ab) * SP + k];
-            g[ab].x = __dmul_rn(z.x, v.s_g);
-            g[ab].y = __dmul_rn(z.y, v.s_g);
-            acc[ab].x = 0.0;
-            acc[ab].y = 0.0;
-        }
-        const lrx_c2* __restrict__ w = kern + ((long long)k * mx + xx) * wx + yy * v.nb;
-        for (int ia = 0; ia < v.na; ++ia) {
-            for (int ib = 0; ib < v.nb; ++ib) {
-                const lrx_c2 wv = w[ia * wy + ib];
-#pragma unroll
-                for (int a = 0; a < NS; ++a) {
-                    const int pa = (int)((v.perm_l >> (16 * ia + 4 * a)) & 15);
-                    const int ca = (int)((v.phase_l >> (8 * ia + 2 * a)) & 3);
-#pragma unroll
-                    for (int b = 0; b < NS; ++b) {
-                        const int pb = (int)((v.perm_r >> (16 * ib + 4 * b)) & 15);
-                        const int cb = (int)((v.phase_r >> (8 * ib + 2 * b)) & 3);
-                        // phase_A[a] * conj(phase_B[b]) as one quarter turn.
-                        const lrx_c2 p = lrx_mul_xla(lrx_phase(g[pa * NS + pb], (ca + 4 - cb) & 3), wv);
-                        acc[a * NS + b].x = __dadd_rn(acc[a * NS + b].x, p.x);
-                        acc[a * NS + b].y = __dadd_rn(acc[a * NS + b].y, p.y);
-                    }
-                }
-            }
-        }
-#pragma unroll
-        for (int ab = 0; ab < SS; ++ab) sm[(jp * SS + ab) * SP + k] = acc[ab];
-    }
-    __syncthreads();
-    transform3<fft_direction::forward>(sm);
-    for (int i = threadIdx.x; i < RB * NK; i += blockDim.x) {
-        const int k = i / RB, j = i % RB;
-        const long long r = (long long)blockIdx.x * RB + j, pr = r / SS;
-        const long long ko = lrx_out_row(t, k);
-        if (pr < pairs && ko >= 0) {
-            const long long xx = pr / my, yy = pr - xx * my;
-            const int a = (int)((r % SS) / NS), b = (int)(r % NS);
-            const lrx_c2 z = sm[j * SP + k];
-            y[((ko * NS + a) * mx + xx) * t.nl + b * my + yy] =
-                {__dmul_rn(__dmul_rn(z.x, v.s_f), v.mult), __dmul_rn(__dmul_rn(z.y, v.s_f), v.mult)};
-        }
-    }
-}
-#else
-// Arm 1: the k-box stage's split arm (kbox_stage.cuh), chunked over pairs through the
-// (nk, npairs * SS) intermediate y:
-//   phase 0  plane (z, y) inverse of the unfolded Green (every spin element of a pair, formed as
-//            lrx_group_load forms it) -> y
-//   phase 1  group pencil: the x inverse of every member; each (member, t) thread forms its
-//            member's vertex sum from the group's values and V[k, x, A, y, B] (staged by cp.async)
-//   phase 2  plane (z, y) forward, y -> y
-//   phase 3  pencil x forward, the scales, the store into U (kout rows)
-// Per (k, pair, a, b), with g = s_g * (the transformed Green), the sum runs block by block in
-// (A, B) order: acc += (i^code g[perm_A[a]][perm_B[b]]) * V[A, B], XLA's product (no FMA) and
-// __dadd_rn from zero, and the transforms run z,y then x each way: it rounds as arm 0.
+// Mode 8 runs on the k-box stage (kbox_stage.cuh) in two arms, chosen at build by kbox_plan from the
+// grid and the opt-in shared memory (a tile of whole spin groups, ns^2 columns each):
+//   LRX_ARM 0, single pass, when a spin group fits: stage_tile with the unfolded Green as a direct
+//            Load (every spin element of a pair, formed as the family's unfold load forms it), the
+//            inverse transform, the vertex sum as a group Mid (one thread per (k, pair)), the
+//            forward transform, the scaled kout Store: the resident kernel it replaced, on the
+//            stage's padded bank.
+//   LRX_ARM 1, the split arm, where it does not, chunked over pairs through the (nk, npairs * SS)
+//            intermediate y:
+//     phase 0  plane (z, y) inverse of the unfolded Green -> y
+//     phase 1  group pencil: the x inverse of every member; each (member, t) thread forms its
+//              member's vertex sum from the group's values and V[k, x, A, y, B] (staged by cp.async)
+//     phase 2  plane (z, y) forward, y -> y
+//     phase 3  pencil x forward, the scales, the store into U (kout rows)
+// Per (k, pair, a, b), with g = s_g * (the transformed Green), the sum runs block by block in (A, B)
+// order: acc += (i^code g[perm_A[a]][perm_B[b]]) * V[A, B], XLA's product (no FMA) and __dadd_rn
+// from zero, as the scan over blocks did; the transforms run z,y then x each way.  Both arms round
+// alike, and as the resident kernel they replaced (one thread per (k, pair), 182 registers: its
+// Mid ran on PB*NK threads, 144 of 256 on CrI3 6x6 ns 4).
 #include "kbox_stage.cuh"
 static_assert(NR == NS, "mode 8 loads Greens: one spin width");
-constexpr int TRC = LRX_TR;                    // plane tile columns (whole spin groups)
-constexpr int TY = LRX_TY;                     // pair instances per group-pencil block
+constexpr int TRC = LRX_TR;                    // tile columns (whole spin groups)
 
 struct LorArgs {
     const lrx_c2 *gp, *gt, *kern;              // parent Green, partner, V (nk, mx, na, my, nb)
     lrx_c2* u;                                 // (n_out, NS, mx, NS, my)
-    lrx_c2* y;                                 // (NK, npairs * SS) intermediate
-    long long p0, npairs, mx, my;              // this chunk's pairs [p0, p0 + npairs)
+    lrx_c2* y;                                 // split arm: the (NK, npairs * SS) intermediate
+    long long p0, npairs, mx, my;              // this launch's pairs [p0, p0 + npairs)
 };
 
 struct LorLoad {                               // tile column c: pair p0 + c / SS, member c % SS
@@ -1265,28 +1167,131 @@ struct LorLoad {                               // tile column c: pair p0 + c / S
     template <class View>
     __device__ void direct(const View& view, int k0, int k1, long long col0, int width,
                            long long ncols) const {
-        const int groups = width / SS;
-        for (int i = threadIdx.x; i < (k1 - k0) * groups; i += blockDim.x) {
-            const int k = k0 + i / groups, j = i % groups;
-            const long long c0 = col0 + (long long)j * SS;
-            if (c0 < ncols) {
-                const long long pr = a->p0 + c0 / SS, xx = pr / a->my, yy = pr - xx * a->my;
-                lrx_c2 g[NS][NR], u[NS][NS], ur[NR][NR];
-                lrx_unfold_pair(a->gp, a->gt, *t, k, xx, yy, g, u, ur);
-#pragma unroll
-                for (int r = 0; r < NS; ++r) {
-                    lrx_c2 out[NR];
-                    lrx_spin_row(u, ur, g, r, out);
-#pragma unroll
-                    for (int b = 0; b < NR; ++b) view(k, j * SS + r * NR + b) = out[b];
-                }
-            } else {
-#pragma unroll
-                for (int e = 0; e < SS; ++e) view(k, j * SS + e) = {0.0, 0.0};
-            }
-        }
+        lrx_unfold_direct<true>(view, a->gp, a->gt, *t, a->p0, a->my, a->p0 + ncols / SS, k0, k1, col0, width,
+                                ncols);
     }
 };
+
+// A member's vertex tables: block e = (A, B) = (e / nb, e % nb) reads group element src[e] =
+// perm_A[a] * NS + perm_B[b] with the quarter turn code[e] = phase_A[a] - phase_B[b] (member = a*NS + b).
+struct LorMember {
+    int src[16], code[16], ne;
+};
+__device__ __forceinline__ LorMember lor_member(const LorentzTab& v, int member) {
+    LorMember m;
+    const int ma = member / NS, mb = member % NS;
+    m.ne = v.na * v.nb;
+#pragma unroll
+    for (int e = 0; e < 16; ++e) {
+        const int ia = e / v.nb, ib = e % v.nb;
+        if (e < m.ne) {
+            const int pa = (int)((v.perm_l >> (16 * ia + 4 * ma)) & 15);
+            const int ca = (int)((v.phase_l >> (8 * ia + 2 * ma)) & 3);
+            const int pb = (int)((v.perm_r >> (16 * ib + 4 * mb)) & 15);
+            const int cb = (int)((v.phase_r >> (8 * ib + 2 * mb)) & 3);
+            m.src[e] = pa * NS + pb;
+            m.code[e] = (ca + 4 - cb) & 3;
+        } else {
+            m.src[e] = 0;
+            m.code[e] = 0;
+        }
+    }
+    return m;
+}
+
+struct LorFinal {                              // (z s_f) mult
+    double s_f, mult;
+    __device__ lrx_c2 operator()(int, long long, lrx_c2 z) const {
+        return {__dmul_rn(__dmul_rn(z.x, s_f), mult), __dmul_rn(__dmul_rn(z.y, s_f), mult)};
+    }
+};
+
+// The functors hold the kernel arguments they use by value: a store through a->u could alias the
+// argument struct in the compiler's view and reload it after every store.
+struct LorStore {                              // U[(ko, a, x, b, y)], full-k row k at kout[k]
+    lrx_c2* u;
+    const int* kout;
+    long long p0, mx, my, nl;
+    __device__ LorStore(const LorArgs& a, const UnfoldTab& t)
+        : u(a.u), kout(t.kout), p0(a.p0), mx(a.mx), my(a.my), nl(t.nl) {}
+    __device__ void put(int k, long long col, lrx_c2 v) const {
+        const long long ko = kout ? (long long)kout[k] : (long long)k;
+        if (ko < 0) return;
+        const long long pr = p0 + col / SS, xx = pr / my, yy = pr - xx * my;
+        const int m = int(col % SS), ma = m / NS, mb = m % NS;
+        u[((ko * NS + ma) * mx + xx) * nl + mb * my + yy] = v;
+    }
+};
+
+#if LRX_ARM == 0
+// The vertex sum as a group Mid: one thread per (k, pair) holds the pair's NS*NS transformed
+// values and accumulates every member, block by block in (A, B) order, reading V through L1 (the
+// resident kernel's Mid; a member Mid, one thread per (k, pair, member), measured 0.76-0.94x).
+struct LorGroupMid {
+    const lrx_c2* kern;
+    long long p0, mx, my;
+    LorentzTab v;
+    template <class Get>
+    __device__ void group(int k, long long grp, const Get& get) const {
+        const long long pr = p0 + grp, xx = pr / my, yy = pr - xx * my;
+        const long long wy = my * v.nb, wx = (long long)v.na * wy;
+        lrx_c2 acc[SS];
+#pragma unroll
+        for (int ab = 0; ab < SS; ++ab) {
+            acc[ab].x = 0.0;
+            acc[ab].y = 0.0;
+        }
+        const lrx_c2* __restrict__ w = kern + ((long long)k * mx + xx) * wx + yy * v.nb;
+        for (int ia = 0; ia < v.na; ++ia) {
+            for (int ib = 0; ib < v.nb; ++ib) {
+                const lrx_c2 wv = w[ia * wy + ib];
+#pragma unroll
+                for (int aa = 0; aa < NS; ++aa) {
+                    const int pa = (int)((v.perm_l >> (16 * ia + 4 * aa)) & 15);
+                    const int ca = (int)((v.phase_l >> (8 * ia + 2 * aa)) & 3);
+#pragma unroll
+                    for (int bb = 0; bb < NS; ++bb) {
+                        const int pb = (int)((v.perm_r >> (16 * ib + 4 * bb)) & 15);
+                        const int cb = (int)((v.phase_r >> (8 * ib + 2 * bb)) & 3);
+                        // g = s_g * (the transformed value), read from the bank where it is used (a
+                        // runtime-indexed register array would live in local memory)
+                        const lrx_c2 z = get(pa * NS + pb);
+                        const lrx_c2 g = {__dmul_rn(z.x, v.s_g), __dmul_rn(z.y, v.s_g)};
+                        const lrx_c2 p = lrx_mul_xla(lrx_phase(g, (ca + 4 - cb) & 3), wv);
+                        acc[aa * NS + bb].x = __dadd_rn(acc[aa * NS + bb].x, p.x);
+                        acc[aa * NS + bb].y = __dadd_rn(acc[aa * NS + bb].y, p.y);
+                    }
+                }
+            }
+        }
+#pragma unroll
+        for (int ab = 0; ab < SS; ++ab) get(ab) = acc[ab];
+    }
+};
+
+struct LorScaledStore {
+    LorStore st;
+    LorFinal fin;
+    __device__ void put(int k, long long col, lrx_c2 z) const { st.put(k, col, fin(k, col, z)); }
+};
+
+extern "C" __global__ void __launch_bounds__(LRX_THREADS) lrx_kconv(LorArgs a, UnfoldTab t, LorentzTab v, int phase) {
+    extern __shared__ lrx_c2 sm[];
+    using namespace cufftdx;
+    (void)phase;
+    const long long ncols = a.npairs * SS;
+    const LorLoad ld{&a, &t};
+    const LorScaledStore st{LorStore(a, t), LorFinal{v.s_f, v.mult}};
+    for (long long c0 = (long long)blockIdx.x * TRC; c0 < ncols; c0 += (long long)gridDim.x * TRC) {
+        lrx_kbox::stage_tile<NX, NY, NZ, TRC>(sm, c0, ncols, ld);
+        lrx_kbox::transform3<NX, NY, NZ, TRC, LRX_SM, fft_direction::inverse>(sm);
+        lrx_kbox::mid_group_tile<NX, NY, NZ, TRC, SS>(sm, c0, ncols, LorGroupMid{a.kern, a.p0, a.mx, a.my, v});
+        lrx_kbox::transform3<NX, NY, NZ, TRC, LRX_SM, fft_direction::forward>(sm);
+        lrx_kbox::store_tile<NX, NY, NZ, TRC>(sm, c0, ncols, st);
+    }
+}
+#else
+constexpr int TY = LRX_TY;                     // pair instances per group-pencil block
 
 struct LorCols {
     __device__ long long col(long long inst, int member) const { return inst * SS + member; }
@@ -1311,16 +1316,16 @@ struct LorMid {                                // the vertex sum; V staged per (
         }
     }
     struct F {
-        int src[16], code[16], ne;
+        LorMember m;
         double s_g;
         __device__ lrx_c2 operator()(const lrx_c2* grp, const lrx_c2* aux) const {
             lrx_c2 acc = {0.0, 0.0};
 #pragma unroll
             for (int e = 0; e < 16; ++e) {
-                if (e < ne) {
-                    const lrx_c2 z = grp[src[e] * TY];
+                if (e < m.ne) {
+                    const lrx_c2 z = grp[m.src[e] * TY];
                     const lrx_c2 g = {__dmul_rn(z.x, s_g), __dmul_rn(z.y, s_g)};
-                    const lrx_c2 q = lrx_mul_xla(lrx_phase(g, code[e]), aux[e]);
+                    const lrx_c2 q = lrx_mul_xla(lrx_phase(g, m.code[e]), aux[e]);
                     acc.x = __dadd_rn(acc.x, q.x);
                     acc.y = __dadd_rn(acc.y, q.y);
                 }
@@ -1328,28 +1333,7 @@ struct LorMid {                                // the vertex sum; V staged per (
             return acc;
         }
     };
-    __device__ F bind(int member) const {       // member = a * NS + b
-        F f;
-        const int ma = member / NS, mb = member % NS;
-        f.ne = v.na * v.nb;
-        f.s_g = v.s_g;
-#pragma unroll
-        for (int e = 0; e < 16; ++e) {
-            const int ia = e / v.nb, ib = e % v.nb;
-            if (e < f.ne) {
-                const int pa = (int)((v.perm_l >> (16 * ia + 4 * ma)) & 15);
-                const int ca = (int)((v.phase_l >> (8 * ia + 2 * ma)) & 3);
-                const int pb = (int)((v.perm_r >> (16 * ib + 4 * mb)) & 15);
-                const int cb = (int)((v.phase_r >> (8 * ib + 2 * mb)) & 3);
-                f.src[e] = pa * NS + pb;
-                f.code[e] = (ca + 4 - cb) & 3;
-            } else {
-                f.src[e] = 0;
-                f.code[e] = 0;
-            }
-        }
-        return f;
-    }
+    __device__ F bind(int member) const { return F{lor_member(v, member), v.s_g}; }
 };
 
 struct LorYLoad {                              // the intermediate, staged by cp.async
@@ -1357,25 +1341,6 @@ struct LorYLoad {                              // the intermediate, staged by cp
     const lrx_c2* y;
     long long n;
     __device__ const lrx_c2* stage(int k, long long c) const { return y + (long long)k * n + c; }
-};
-
-struct LorFinal {                              // (z s_f) mult, as the resident store scaled
-    double s_f, mult;
-    __device__ lrx_c2 operator()(int, long long, lrx_c2 z) const {
-        return {__dmul_rn(__dmul_rn(z.x, s_f), mult), __dmul_rn(__dmul_rn(z.y, s_f), mult)};
-    }
-};
-
-struct LorStore {                              // U[(ko, a, x, b, y)], full-k row k at kout[k]
-    const LorArgs* a;
-    const UnfoldTab* t;
-    __device__ void put(int k, long long col, lrx_c2 v) const {
-        const long long ko = lrx_out_row(*t, k);
-        if (ko < 0) return;
-        const long long pr = a->p0 + col / SS, xx = pr / a->my, yy = pr - xx * a->my;
-        const int m = int(col % SS), ma = m / NS, mb = m % NS;
-        a->u[((ko * NS + ma) * a->mx + xx) * t->nl + mb * a->my + yy] = v;
-    }
 };
 
 extern "C" __global__ void __launch_bounds__(256) lrx_kconv(LorArgs a, UnfoldTab t, LorentzTab v, int phase) {
@@ -1392,33 +1357,57 @@ extern "C" __global__ void __launch_bounds__(256) lrx_kconv(LorArgs a, UnfoldTab
         lrx_kbox::plane_pass<NX, NY, NZ, LRX_SM, fft_direction::forward, TRC>(sm, ncols, LorYLoad{a.y, ncols}, yy);
     } else {
         lrx_kbox::pencil_pass<NX, NY, NZ, LRX_SM, false, fft_direction::forward>(
-            a.y, ncols, LorFinal{v.s_f, v.mult}, LorStore{&a, &t});
+            a.y, ncols, LorFinal{v.s_f, v.mult}, LorStore(a, t));
     }
 }
 #endif
 #elif LRX_MODE == 9
-// Mode 9: mode 3's inverse transform of the interaction unfolded on its load
-// from the wedge tiles; Y k-LEADING (nk, ml, nl), the row (pair, A, B) stored
-// at merged endpoints (x*NS + A, y*NR + B), scaled as mode 3 scales.
-extern "C" __global__ void __launch_bounds__(256) lrx_kconv(
+// Mode 9: mode 3's inverse transform of the interaction unfolded on its load from the wedge tiles,
+// on the k-box stage's single arm.  Tile column c is row (pair, A, B) = (c / SS, (c % SS) / NR,
+// c % NR); Y k-LEADING (nk, ml, nl) at merged endpoints (x*NS + A, y*NR + B), scaled as mode 3
+// scales.  LRX_GROUPED (a spin group fits the plan's tile): one thread per (k, pair) reads the
+// pair's sources once and forms every (A, B) of U O Ur^dagger in registers; else one thread per
+// (k, column) forms its own element with the same arithmetic.  The values, the thread FFTs and their
+// axis order are the resident kernel's, so the result is too, bit for bit.
+#include "kbox_stage.cuh"
+constexpr int TRC = LRX_TR;                    // tile columns (whole spin groups when LRX_GROUPED)
+
+struct WedgeLoad {
+    static constexpr bool kDirect = true, kFinish = false;
+    const lrx_c2 *gp, *gt;
+    const UnfoldTab* t;
+    long long my;
+    template <class View>
+    __device__ void direct(const View& view, int k0, int k1, long long col0, int width,
+                           long long ncols) const {
+        lrx_unfold_direct<LRX_GROUPED != 0>(view, gp, gt, *t, 0, my, ncols / SS, k0, k1, col0, width, ncols);
+    }
+};
+
+struct WedgeStore {
+    lrx_c2* y;
+    const UnfoldTab* t;
+    long long my;
+    double scale;
+    __device__ void put(int k, long long c, lrx_c2 v) const {
+        const long long pr = c / SS, xx = pr / my, yy = pr - xx * my;
+        const int a = (int)((c % SS) / NR), b = (int)(c % NR);
+        y[((long long)k * t->ml + xx * NS + a) * t->nl + yy * NR + b] = {v.x * scale, v.y * scale};
+    }
+};
+
+extern "C" __global__ void __launch_bounds__(LRX_THREADS) lrx_kconv(
     const lrx_c2* __restrict__ gp, const lrx_c2* __restrict__ gt, lrx_c2* __restrict__ y,
     UnfoldTab t, double scale) {
     extern __shared__ lrx_c2 sm[];
     using namespace cufftdx;
-    const long long my = t.nl / NR, pairs = (t.ml / NS) * my;
-    const long long r0 = (long long)blockIdx.x * RB;
-    lrx_unfold_load(gp, gt, t, r0, sm);
-    __syncthreads();
-    transform3<fft_direction::inverse>(sm);
-    for (int i = threadIdx.x; i < RB * NK; i += blockDim.x) {
-        const int k = i / RB, j = i % RB;
-        const long long r = r0 + j, pr = r / SS;
-        if (pr < pairs) {
-            const long long xx = pr / my, yy = pr - xx * my;
-            const int a = (int)((r % SS) / NR), b = (int)(r % NR);
-            const lrx_c2 v = sm[j * SP + k];
-            y[((long long)k * t.ml + xx * NS + a) * t.nl + yy * NR + b] = {v.x * scale, v.y * scale};
-        }
+    const long long my = t.nl / NR, ncols = (t.ml / NS) * my * SS;
+    const WedgeLoad ld{gp, gt, &t, my};
+    const WedgeStore st{y, &t, my, scale};
+    for (long long c0 = (long long)blockIdx.x * TRC; c0 < ncols; c0 += (long long)gridDim.x * TRC) {
+        lrx_kbox::stage_tile<NX, NY, NZ, TRC>(sm, c0, ncols, ld);
+        lrx_kbox::transform3<NX, NY, NZ, TRC, LRX_SM, fft_direction::inverse>(sm);
+        lrx_kbox::store_tile<NX, NY, NZ, TRC>(sm, c0, ncols, st);
     }
 }
 #else
@@ -1873,10 +1862,12 @@ static ffi::Error build(int mode, int nkx, int nky, int nkz, int ns, bool f32,
     // pair modes' 100 KiB): an unclamped budget asked for more than the device grants at launch.
     const long long budget = std::min<long long>(pair ? kSmemBudget : kSmemBudget1, smem_optin);
     long long rb = std::min<long long>(rows_max, budget / row_bytes);
-    // Mode 8's resident arm sums the Lorentz blocks across a pair's spin rows, so it needs a
-    // whole spin group per block: reach for the opt-in shared memory first.
-    if (rb < 1 || (mode == 8 && rb < ns * ns)) rb = std::min<long long>(rows_max, smem_optin / row_bytes);
-    const bool lor_split = mode == 8 && rb < ns * ns;   // no resident spin group: the split arm
+    if (rb < 1) rb = std::min<long long>(rows_max, smem_optin / row_bytes);
+    // Mode 8 runs on the k-box stage: the single arm when a tile of whole spin groups (ns^2 columns
+    // each) fits the opt-in memory, else the split arm.
+    const lrx_kbox::Plan lor_plan = mode == 8
+        ? lrx_kbox::kbox_plan(nkx, nky, nkz, ns * ns, 1, 16, smem_optin, 2, 1) : lrx_kbox::Plan{};
+    const bool lor_split = mode == 8 && lor_plan.arm == 1;
     // Mode 11 runs on the k-box stage: its launch rule (kbox_plan) decides the arm, the tile and
     // the shared memory from the grid and this device's opt-in budget; RB is unused.
     const int chi_grp = 2 * ns * ns;
@@ -1912,26 +1903,51 @@ static ffi::Error build(int mode, int nkx, int nky, int nkz, int ns, bool f32,
             chi_smem2 = (static_cast<long long>(nkx) * chi_grp * chi_ty + static_cast<long long>(nkx) * chi_ty) * 16;
         }
     }
-    // Modes 2 and 3 run on the k-box stage: kbox_plan decides the arm, the tile and the shared
-    // memory from the grid and this device's opt-in budget (RB is unused).  Mode 8 takes the
-    // stage's split arm where its resident arm has no room for a spin group: the group pencil
-    // forms each member on its own thread (a single arm's group Mid runs one thread per (k, pair):
-    // 3766 vs 2156 us at 8^3 in the standalone bench).  Kept 2026-09-25 (FP): mode 3 is 90% of the
+    // Modes 2-5, 8 and 9 run on the k-box stage: kbox_plan decides the arm, the tile and the shared
+    // memory from the grid and this device's opt-in budget (RB is unused).  Modes 2/3 stage
+    // k-leading tiles (128-byte runs per k) and have a split arm; modes 4/5 (k-minor) and 9 (the
+    // gathered wedge unfold) run the single arm only, with one-column tiles as the floor (min_tr
+    // 1), which is what the resident rows they replaced could hold.  Mode 9 takes tiles of whole
+    // spin groups when one fits (its grouped load reads a pair's sources once), else single
+    // columns.  Mode 8 takes the single arm when a spin group fits and the split arm otherwise: the
+    // group pencil forms each member on its own thread (3766 vs 2156 us at 8^3 in the standalone
+    // bench for a per-(k, pair) Mid).  The single arm keeps the resident kernel's per-(k, pair)
+    // group Mid: a member Mid measured 0.76-0.94x at the CrI3 6x6 and Fe 4^3 ns 4 doors (V staged
+    // or not), since the register load fixes one block per SM either way.  Its load holds a spin
+    // group per thread (48 complex values at ns 4), so it runs 256 threads, not the plan's 512 (a
+    // 128-register cap would spill it).  Kept 2026-09-25 (FP): mode 3 is 90% of the
     // FFT-family time of an Fe 8^3 shared-pole SC map, and the stage is 1.14-1.23x at its door
-    // (claim 2779); mode 8's split arm serves 10^3-16^3 at ns 4, which the resident arm refuses.
-    const bool kbox_rows = mode == 2 || mode == 3;
-    int kb_arm = 0, kb_tr = 0, kb_ty = 0, kb_threads = 0, kb_threads2 = 0;
+    // (claim 2779); mode 8's split arm serves 10^3-16^3 at ns 4.
+    const bool kbox_rows = (mode >= 2 && mode <= 5) || mode == 9;
+    const bool kbox_single_only = mode == 4 || mode == 5 || mode == 9;
+    int kb_arm = 0, kb_tr = 0, kb_ty = 0, kb_threads = 0, kb_threads2 = 0, kb_grouped = 0;
     long long kb_smem = 0, kb_smem2 = 0;
-    if (kbox_rows || lor_split) {
+    if (kbox_rows || mode == 8) {
         const lrx_kbox::Geometry g{nkx, nky, nkz};
         rb = 1;
-        if (kbox_rows) {
+        if (mode == 9) {
+            const int ss = ns * nsr;
+            lrx_kbox::Plan kp = lrx_kbox::kbox_plan(nkx, nky, nkz, ss, 1, 16, smem_optin, 1, 1);
+            kb_grouped = kp.arm == 0 ? 1 : 0;
+            if (kp.arm == 0) kp.tr *= ss;              // the plan counts whole spin groups
+            else kp = lrx_kbox::kbox_plan(nkx, nky, nkz, 1, 1, 16, smem_optin, 1, 1);
+            kb_arm = kp.arm;
+            kb_tr = kp.tr;
+            kb_threads = kp.threads;
+            kb_smem = kp.smem;
+        } else if (kbox_rows) {
             const lrx_kbox::Plan kp = lrx_kbox::kbox_plan(nkx, nky, nkz, 1, 1, f32 ? 8 : 16, smem_optin,
-                                                          mode == 2 ? 2 : 1);
+                                                          mode == 2 || mode == 4 ? 2 : 1,
+                                                          kbox_single_only ? 1 : 2);
             kb_arm = kp.arm;
             kb_tr = kp.tr;
             kb_threads = kp.arm == 0 ? kp.threads : kThreads;
             kb_smem = kp.smem;                         // single: the tile; split: the plane pass
+        } else if (!lor_split) {
+            kb_arm = 0;
+            kb_tr = lor_plan.tr * ns * ns;             // the plan counts whole spin groups
+            kb_threads = kThreads;
+            kb_smem = lor_plan.smem;
         } else {
             const int ss = ns * ns;
             kb_arm = 1;
@@ -1949,12 +1965,13 @@ static ffi::Error build(int mode, int nkx, int nky, int nkz, int ns, bool f32,
             kb_smem = static_cast<long long>(kb_tr) * g.pr() * 16;
             kb_smem2 = (static_cast<long long>(nkx) * ss * kb_ty + static_cast<long long>(nkx) * kb_ty * 17) * 16;
         }
-        if (kb_smem > smem_optin || kb_smem2 > smem_optin) {
+        if (kb_smem > smem_optin || kb_smem2 > smem_optin || (kbox_single_only && kb_arm != 0)) {
             std::ostringstream os;
             os << "GATE mathdx-kconv-kbox-residency: got k-grid (" << nkx << "," << nky << "," << nkz << ") with ns="
-               << ns << ", whose k-box " << (kb_arm ? "plane/pencil" : "tile") << " needs " << kb_smem << " / "
-               << kb_smem2 << " B; want <= " << smem_optin << " B of opt-in shared memory on this device; why: the "
-                  "stage keeps a (ky, kz) plane of its tile columns resident; fix: a smaller k-grid";
+               << ns << " (mode " << mode << "), whose k-box " << (kb_arm ? "plane/pencil" : "tile") << " needs "
+               << kb_smem << " / " << kb_smem2 << " B; want <= " << smem_optin << " B of opt-in shared memory on "
+                  "this device" << (kbox_single_only ? " for one whole column (modes 4, 5 and 9 have no split arm)" : "")
+               << "; why: the stage keeps a (ky, kz) plane of its tile columns resident; fix: a smaller k-grid";
             return sticky("residency", os.str(), ffi::ErrorCode::kInvalidArgument);
         }
     }
@@ -2105,12 +2122,12 @@ static ffi::Error build(int mode, int nkx, int nky, int nkz, int ns, bool f32,
         defs.push_back("-DLRX_TR=" + std::to_string(m7_tr));
         defs.push_back("-DLRX_THREADS=" + std::to_string(m7_threads));
     }
-    if (mode == 8 && !lor_split) defs.push_back("-DLRX_ARM=0");
-    if (kbox_rows || lor_split) {
+    if (kbox_rows || mode == 8) {
         defs.push_back("-DLRX_ARM=" + std::to_string(kb_arm));
         defs.push_back("-DLRX_TR=" + std::to_string(kb_tr));
         defs.push_back("-DLRX_TY=" + std::to_string(kb_ty));
         defs.push_back("-DLRX_THREADS=" + std::to_string(kb_threads));
+        if (mode == 9) defs.push_back("-DLRX_GROUPED=" + std::to_string(kb_grouped));
     }
     if (mode == 11) {
         defs.push_back("-DLRX_ARM=" + std::to_string(kplan.arm));
@@ -2136,7 +2153,7 @@ static ffi::Error build(int mode, int nkx, int nky, int nkz, int ns, bool f32,
     prog.name = "lrx_kconv_mathdx.cu";
     if (std::string_view(prog.src).find(ag::kHeaderName) != std::string_view::npos)
         prog.headers = {{ag::kHeaderName, ag::kHeaderSrc}};
-    if (mode == 11 || mode == 7 || kbox_rows || lor_split)
+    if (mode == 7 || mode == 8 || mode == 11 || kbox_rows)
         prog.headers.push_back({kbox::kHeaderName, kbox::kHeaderSrc});
     prog.defs = defs;
     nvrtc::mathdx_toolchain(root, cuda_inc, "cufftdx", &prog);
@@ -2164,7 +2181,7 @@ static ffi::Error build(int mode, int nkx, int nky, int nkz, int ns, bool f32,
     b.rb = static_cast<int>(rb);
     b.threads = plane_threads;
     b.smem = static_cast<int>(rb * (row_bytes + plane_stage));
-    if (kbox_rows || lor_split) {
+    if (kbox_rows || mode == 8) {
         int sms = 0;
         LRX_CUDA_CHECK(cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev), "SM count");
         b.arm = kb_arm;
@@ -2387,7 +2404,7 @@ static ffi::Error PlaneDispatch(cudaStream_t stream, ffi::AnyBuffer D, ffi::AnyB
                   mathdx_root, cubin_dir, nullptr, &plane);
 }
 
-// Modes 2-5: one bank per row.  `mode` fixes the layout; shapes are checked
+// Modes 2-5 (the k-box stage).  `mode` fixes the layout; shapes are checked
 // against it here, geometry derived from the operand dimensions.
 static ffi::Error LaunchRows(cudaStream_t stream, int mode, ffi::AnyBuffer X, const ffi::AnyBuffer* K,
                              ffi::Result<ffi::AnyBuffer> Y, int64_t nkx, int64_t nky, int64_t nkz,
@@ -2445,39 +2462,30 @@ static ffi::Error LaunchRows(cudaStream_t stream, int mode, ffi::AnyBuffer X, co
     const void* xp = X.untyped_data();
     const void* kp = K ? K->untyped_data() : nullptr;
     void* yp = Y->untyped_data();
-    if (mode == 2 || mode == 3) {                      // the k-box stage (single arm, or the split passes)
-        auto launch = [&](int phase, long long blocks, int threads, int smem) -> ffi::Error {
-            blocks = std::max(1LL, std::min(blocks, 2147483647LL));
-            void* args[] = {(void*)&xp, (void*)&kp, (void*)&yp, (void*)&g, (void*)&phase};
-            CUresult cr = driver_api().LaunchKernel(k->fn, static_cast<unsigned>(blocks), 1, 1, threads, 1, 1,
-                                                    static_cast<unsigned>(smem),
-                                                    reinterpret_cast<CUstream>(stream), args, nullptr);
-            if (cr != CUDA_SUCCESS) return fail("cuLaunchKernel", cu_err(cr));
-            return ffi::Error::Success();
-        };
-        if (k->arm == 0) {                             // one block per tile; mode 2 tiles each a slab
-            const long long seg = mode == 2 ? g.m2 * g.m1 : g.rows;
-            return launch(0, (g.rows / seg) * ((seg + k->tr - 1) / k->tr), k->threads, k->smem);
-        }
-        const long long cap = static_cast<long long>(k->sms) * 8;
-        const long long plane = nkx * ((g.rows + k->tr - 1) / k->tr);
-        const long long pencil = (nky * nkz * g.rows + kThreads - 1) / kThreads;
-        const int phases = mode == 2 ? 4 : 2;          // conv: z,y | x.V | z,y | x.s ; fft: z,y | x.s
-        for (int ph = 0; ph < phases; ++ph) {
-            const bool is_plane = ph % 2 == 0;
-            if (auto e = launch(ph, std::min(is_plane ? plane : pencil, cap), kThreads, is_plane ? k->smem : 0);
-                !e.success())
-                return e;
-        }
+    // The k-box stage: the single arm, or modes 2/3's split passes.
+    auto launch = [&](int phase, long long blocks, int threads, int smem) -> ffi::Error {
+        blocks = std::max(1LL, std::min(blocks, 2147483647LL));
+        void* args[] = {(void*)&xp, (void*)&kp, (void*)&yp, (void*)&g, (void*)&phase};
+        CUresult cr = driver_api().LaunchKernel(k->fn, static_cast<unsigned>(blocks), 1, 1, threads, 1, 1,
+                                                static_cast<unsigned>(smem),
+                                                reinterpret_cast<CUstream>(stream), args, nullptr);
+        if (cr != CUDA_SUCCESS) return fail("cuLaunchKernel", cu_err(cr));
         return ffi::Error::Success();
+    };
+    if (k->arm == 0) {                             // one block per tile; mode 2 tiles each a slab
+        const long long seg = mode == 2 ? g.m2 * g.m1 : g.rows;
+        return launch(0, (g.rows / seg) * ((seg + k->tr - 1) / k->tr), k->threads, k->smem);
     }
-    void* args[] = {(void*)&xp, (void*)&kp, (void*)&yp, (void*)&g};
-    const long long blocks = (g.rows + k->rb - 1) / k->rb;
-    if (blocks > 2147483647LL) return bad("grid.x overflow");
-    CUresult cr = driver_api().LaunchKernel(k->fn, static_cast<unsigned>(blocks), 1, 1, kThreads, 1, 1,
-                                            static_cast<unsigned>(k->smem),
-                                            reinterpret_cast<CUstream>(stream), args, nullptr);
-    if (cr != CUDA_SUCCESS) return fail("cuLaunchKernel", cu_err(cr));
+    const long long cap = static_cast<long long>(k->sms) * 8;
+    const long long plane = nkx * ((g.rows + k->tr - 1) / k->tr);
+    const long long pencil = (nky * nkz * g.rows + kThreads - 1) / kThreads;
+    const int phases = mode == 2 ? 4 : 2;          // conv: z,y | x.V | z,y | x.s ; fft: z,y | x.s
+    for (int ph = 0; ph < phases; ++ph) {
+        const bool is_plane = ph % 2 == 0;
+        if (auto e = launch(ph, std::min(is_plane ? plane : pencil, cap), kThreads, is_plane ? k->smem : 0);
+            !e.success())
+            return e;
+    }
     return ffi::Error::Success();
 }
 
@@ -2688,34 +2696,9 @@ static ffi::Error KleadLorentzImpl(
                 static_cast<const double*>(mph.untyped_data()), static_cast<const double*>(nph.untyped_data()),
                 static_cast<const double*>(spin.untyped_data()), ml, nl,
                 kout ? static_cast<const int*>(kout->untyped_data()) : nullptr, conj_src ? 2 : 0, nullptr, 0, 0};
-    if (k->arm == 0) {                                 // the resident arm: whole spin groups per block
-        const void* gpp = Gp.untyped_data();
-        const void* gtp = Gt.untyped_data();
-        const void* vp = V.untyped_data();
-        void* up = U->untyped_data();
-        void* args[] = {(void*)&gpp, (void*)&gtp, (void*)&vp, (void*)&up, (void*)&t, (void*)&v};
-        const long long blocks = (pairs * ns * ns + k->rb - 1) / k->rb;
-        if (blocks > 2147483647LL) return bad("grid.x overflow");
-        CUresult cr = driver_api().LaunchKernel(k->fn, static_cast<unsigned>(blocks), 1, 1, kThreads, 1, 1,
-                                                static_cast<unsigned>(k->smem),
-                                                reinterpret_cast<CUstream>(stream), args, nullptr);
-        if (cr != CUDA_SUCCESS) return fail("cuLaunchKernel", cu_err(cr));
-        return ffi::Error::Success();
-    }
-    // The k-box split arm, chunked over pairs through a (nk, chunk * ns^2) intermediate no
-    // larger than U itself (the budget: the output this call writes, n_out >= 1 rows of nk).
-    const long long ss = ns * ns, per_pair = nk * ss * 16;
-    const long long n_out = U->dimensions()[0];
-    const long long chunk = std::max(1LL, std::min<long long>(pairs, pairs * n_out / nk));
-    auto y = scratch.Allocate(static_cast<size_t>(chunk * per_pair));
-    if (!y.has_value()) {
-        std::ostringstream os;
-        os << "GATE mathdx-kconv-lorentz-scratch: got a refused " << chunk * per_pair << " B intermediate ("
-           << chunk << " pairs); want the XLA scratch allocator to grant it";
-        return fail("scratch", os.str(), ffi::ErrorCode::kResourceExhausted);
-    }
-    LorentzArgs a{Gp.untyped_data(), Gt.untyped_data(), V.untyped_data(), U->untyped_data(), *y,
-                  0, 0, ml / ns, nl / ns};
+    const long long ss = ns * ns;
+    LorentzArgs a{Gp.untyped_data(), Gt.untyped_data(), V.untyped_data(), U->untyped_data(), nullptr,
+                  0, pairs, ml / ns, nl / ns};
     auto launch = [&](int phase, long long blocks, int threads, int smem) -> ffi::Error {
         blocks = std::max(1LL, std::min(blocks, 2147483647LL));
         void* args[] = {(void*)&a, (void*)&t, (void*)&v, (void*)&phase};
@@ -2725,6 +2708,21 @@ static ffi::Error KleadLorentzImpl(
         if (cr != CUDA_SUCCESS) return fail("cuLaunchKernel", cu_err(cr));
         return ffi::Error::Success();
     };
+    if (k->arm == 0)                                   // the single arm: one block per tile of whole spin groups
+        return launch(0, (pairs * ss + k->tr - 1) / k->tr, k->threads, k->smem);
+    // The k-box split arm, chunked over pairs through a (nk, chunk * ns^2) intermediate no
+    // larger than U itself (the budget: the output this call writes, n_out >= 1 rows of nk).
+    const long long per_pair = nk * ss * 16;
+    const long long n_out = U->dimensions()[0];
+    const long long chunk = std::max(1LL, std::min<long long>(pairs, pairs * n_out / nk));
+    auto y = scratch.Allocate(static_cast<size_t>(chunk * per_pair));
+    if (!y.has_value()) {
+        std::ostringstream os;
+        os << "GATE mathdx-kconv-lorentz-scratch: got a refused " << chunk * per_pair << " B intermediate ("
+           << chunk << " pairs); want the XLA scratch allocator to grant it";
+        return fail("scratch", os.str(), ffi::ErrorCode::kResourceExhausted);
+    }
+    a.y = *y;
     const long long cap = static_cast<long long>(k->sms) * 8;
     for (long long p0 = 0; p0 < pairs; p0 += chunk) {
         a.p0 = p0;
@@ -2826,9 +2824,8 @@ static ffi::Error KleadUnfoldFft(
     double sc = scale;
     void* args[] = {(void*)&wpp, (void*)&wtp, (void*)&yp, (void*)&t, (void*)&sc};
     const long long rows = pairs * nsl * nsr;
-    const long long blocks = (rows + k->rb - 1) / k->rb;
-    if (blocks > 2147483647LL) return bad("grid.x overflow");
-    CUresult cr = driver_api().LaunchKernel(k->fn, static_cast<unsigned>(blocks), 1, 1, kThreads, 1, 1,
+    const long long blocks = std::min((rows + k->tr - 1) / k->tr, 2147483647LL);   // one block per tile
+    CUresult cr = driver_api().LaunchKernel(k->fn, static_cast<unsigned>(blocks), 1, 1, k->threads, 1, 1,
                                             static_cast<unsigned>(k->smem),
                                             reinterpret_cast<CUstream>(stream), args, nullptr);
     if (cr != CUDA_SUCCESS) return fail("cuLaunchKernel", cu_err(cr));
