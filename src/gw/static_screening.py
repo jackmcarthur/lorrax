@@ -100,7 +100,8 @@ def build_static_w_from_restart(filename, input_file, mesh_xy, *, print_fn=print
     basis = load_centroid_basis(config.paths.centroids_file, wfn.fft_grid, sym=sym)
     if not basis.orbit_closed:
         sym = sym.trivial_view()
-    config = dataclasses.replace(config, restart=True, do_screened=True)
+    config = dataclasses.replace(config, restart=True, do_screened=True).with_band_request(
+        wfn, print_fn)
     meta, bands, _ = prepare_band_metadata(
         basis.centroid_indices, config, mesh_xy, basis.n_rmu, print_fn, sym, wfn)
     isdf = prepare_isdf_and_wavefunctions(

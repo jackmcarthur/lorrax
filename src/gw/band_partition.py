@@ -22,16 +22,132 @@ Masks follow DFT reference identities at each k.  Only fixed-Sigma EQP2
 builds a non-trivial partition (:func:`build_omega_band_partition`); the SC
 loop keeps every QP-window identity protected (owner rule 2026-09-22), so its
 partition is :meth:`BandPartition.all_protected`.
+
+THE QP MATRIX AND ITS SIGMA READ CLASSES (dynamic SC; owner 2026-09-29: "b3
+will count bands as on main yes, and only bands between b0 and b3 will be
+rotated amongst each other").  b3 counts bands as on main (nval/ncond, or
+``number_bands_protected`` resolved to them); the QP matrix [b0, b3) rotates
+among itself and [b3, nband) is the scissored tail (DFT psi, the rigid
+conduction scissor, in G and chi only, no Sigma, no mixing).  Nothing here is
+energy-dependent in the zeta fit.  Inside the QP matrix every state keeps its
+full Sigma row; only where its Sigma_c(omega) is read differs: coarse
+("semicore", :func:`semicore_floor`; read at its own energy on held windows
+below the near grid, ``qp_support``) or protected (the near grid at the deck
+eta).  There is no rotating class.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import NamedTuple
 
 import numpy as np
 
 import jax
 import jax.numpy as jnp
+
+
+# ---------------------------------------------------------------------------
+# The coarse (semicore) read class (dynamic SC; Sigma_c(omega) quadrature only)
+# ---------------------------------------------------------------------------
+
+#: The owner's window rule (+-10 eV of E_F): under ``number_bands_protected``
+#: the semicore gap is searched under the requested bands within it.
+WINDOW_CLIP_EV = 10.0
+#: ``number_bands_protected`` mode only (owner 2026-09-29): an occupied state
+#: is semicore when a band gap at least this wide (eV, all k) separates it from
+#: the valence manifold above.  That request protects every occupied band, so
+#: the class needs its own boundary; 4 eV is 16 deck etas, wide enough that
+#: the coarse window never reads a band the near grid resolves.
+SEMICORE_GAP_EV = 4.0
+
+
+class CoarseClass(NamedTuple):
+    """The coarse (semicore) read class of an SC run (:func:`semicore_floor`)."""
+    coarse_floor_ev: float  # coarse: E < this (absolute eV; -inf = none)
+    n_coarse: int           # coarse (k, state) on the loaded k set
+
+
+def band_gaps_ev(energies_ev):
+    """Band-index gaps of a ladder: (lo, hi) with lo[n-1] = max_k E[:, n-1], hi[n-1] = min_k E[:, n].
+
+    A boundary n with hi > lo holds the same n states below it at every k.
+    """
+    e = np.asarray(energies_ev, float)
+    return e.max(axis=0)[:-1], e.min(axis=0)[1:]
+
+
+def manifold_closing_count(energies_ev, b3):
+    """None when bands [0, b3) end at an all-k band gap, else the smallest band
+    count n > b3 that does (max_k E[n-1] < min_k E[n]), or the loaded count.
+
+    Owner 2026-09-29: warn, do not refuse, when the QP matrix [b0, b3) ends
+    inside a band manifold -- its top bands then lose their mixing with the
+    manifold's rest, which is the scissored tail.
+    """
+    e = np.asarray(energies_ev, float)
+    nb = e.shape[1]
+    b3 = int(b3)
+    if b3 >= nb or e[:, b3 - 1].max() < e[:, b3].min():
+        return None
+    for n in range(b3 + 1, nb):
+        if e[:, n - 1].max() < e[:, n].min():
+            return n
+    return nb
+
+
+def semicore_floor(energies_ev, *, n_below_k, nval, mu_ev, clip_ev, omega_min_rel_ev=None,
+                   n_protected=None, semicore_gap_ev=None):
+    """The coarse (semicore) class from the DFT ladder: which QP-matrix states
+    read Sigma_c(omega) on the coarse windows instead of the near grid.
+
+    ``energies_ev`` (nk, nb) absolute eV on the loaded k set; ``n_below_k``
+    the states below mu at each k (``n_occ`` on an insulator).  It sets no
+    band count: b3 and the zeta fit are the counted bands, as on main.
+
+    * nval/ncond (owner, 2026-09-29): every occupied state below the minimum
+      energy of the lowest requested valence band, ``n_below_k - nval`` at
+      each k (``omega_min`` only lowers it); none when ``nval`` covers every
+      occupied band.  Energy-based, so a coarse state inside the near grid's
+      lower pad reads the near grid.
+    * ``n_protected`` (``number_bands_protected``): every occupied band below
+      a band gap of at least ``semicore_gap_ev`` under the requested bands
+      within ``mu +- clip_ev`` (none without such a gap).
+    """
+    e = np.asarray(energies_ev, float)
+    nk, nb = e.shape
+    below = np.broadcast_to(np.asarray(n_below_k, int), (nk,))
+    mu = float(mu_ev)
+    if n_protected is None:
+        lowest = np.clip(below - int(nval), 0, nb - 1)
+        floor = float(np.min(e[np.arange(nk), lowest]))
+        if omega_min_rel_ev is not None:
+            floor = min(floor, mu + float(omega_min_rel_ev))
+    else:
+        idx = np.arange(nb)[None, :]
+        within = (idx < min(int(n_protected), nb)) & (np.abs(e - mu) <= float(clip_ev))
+        if not within.any():
+            raise ValueError(f"semicore class: no requested state lies within mu +- "
+                             f"{float(clip_ev):g} eV; raise number_bands_protected")
+        gap_lo, gap_hi = band_gaps_ev(e)
+        req_lo = int(np.min(np.where(within, idx, nb)))
+        semi = [n for n in range(1, min(int(below.min()), req_lo) + 1)
+                if gap_hi[n - 1] - gap_lo[n - 1] >= float(semicore_gap_ev)]
+        floor = float(gap_hi[semi[-1] - 1]) if semi else -np.inf
+    n_coarse = int(np.count_nonzero(e < floor))
+    return CoarseClass(floor if n_coarse else -np.inf, n_coarse)
+
+
+def coarse_band_report(energies_ev, semicore_kn, *, mu_ev, band_offset=0):
+    """One line per band with coarse states: index, DFT range about mu, k count."""
+    e = np.asarray(energies_ev, float)
+    s = np.asarray(semicore_kn, bool)
+    rows = []
+    for n in np.flatnonzero(s.any(axis=0)):
+        vals = e[s[:, n], n] - float(mu_ev)
+        rows.append(f"band {int(n) + int(band_offset) + 1}: [{vals.min():+.3f}, {vals.max():+.3f}] eV "
+                    f"on {int(s[:, n].sum())}/{s.shape[0]} k")
+    return rows
 
 
 # ---------------------------------------------------------------------------

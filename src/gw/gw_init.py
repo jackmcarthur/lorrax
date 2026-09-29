@@ -954,21 +954,33 @@ clears-fh-and-the-tile-null-still-refuses.md`` §3).
 			f"centroid ψ spans [b0, b4) = [{band_slices.b0}, "
 			f"{band_slices.b4}).  zeta_nband can only NARROW the ζ-fit "
 			f"window; it cannot move it outside the loaded bands.")
-	left = (band_slices.b0, min(band_slices.b3, b4_zeta))
+	assert_qp_matrix_fitted(band_slices, b4_zeta)
+	left = (band_slices.b0, band_slices.b3)
 	right = (band_slices.b0, b4_zeta)
 	log(f"    ζ-fit window DECOUPLED from the band sum: logical physical "
 	    f"edge zeta_nband={b4_zeta}; the loaded band carrier ends at "
 	    f"b4={band_slices.b4} (any tail above the logical loaded extent is "
 	    f"exact-zero mesh padding).  ζ is fitted on left {left} x right "
 	    f"{right}.")
-	if band_slices.b3 > b4_zeta:
-		log(f"    *** zeta_nband={b4_zeta} is BELOW the Σ evaluation window's "
-		    f"top b3={band_slices.b3}.  Quasiparticle energies for bands "
-		    f"[{b4_zeta}, {band_slices.b3}) are then built on pair densities "
-		    f"whose bra leg was never fitted — the ζ basis is EXTRAPOLATED "
-		    f"there.  Lower ncond to {b4_zeta - band_slices.b2} if those "
-		    f"bands are wanted. ***")
 	return left, right
+
+
+def assert_qp_matrix_fitted(band_slices, zeta_left_top):
+	"""Refuse a QP matrix that reaches past the ζ fit's left range (owner, 2026-09-28).
+
+	The ζ fit is least squares on pairs ψ_i*ψ_j with i in the left range
+	[b0, zeta_left_top).  A QP-matrix state above that edge carries Σ built on
+	pairs the fit never saw and mixes into fitted states: "if it's not fitted
+	correctly by the isdf lstsq fitting it's not correct".  One check, one
+	name; it replaces the warning that let ``zeta_nband < b3`` run.
+	"""
+	b3, top = int(band_slices.b3), int(zeta_left_top)
+	if b3 > top:
+		raise ValueError(
+			f"GATE qp_matrix_zeta_left: the QP matrix [{int(band_slices.b0)}, {b3}) "
+			f"reaches past the ζ fit's left range [{int(band_slices.b0)}, {top}); "
+			f"bands [{top}, {b3}) would carry Σ on unfitted pairs.  Raise "
+			f"zeta_nband to at least {b3} or lower ncond to {top - int(band_slices.b2)}.")
 
 
 
@@ -3313,6 +3325,64 @@ def prepare_isdf_and_wavefunctions(
 	)
 
 
+def coarse_class_for_deck(config, wfn, print0):
+    """The SC run's coarse (semicore) read class from the loaded DFT ladder.
+
+    Sigma_c(omega) quadrature only (``band_partition.semicore_floor``): it sets
+    no band count; b3 and the zeta fit are the counted bands, as on main.  A
+    metal's frame is the deck's fixed-N smearing mu on the DFT ladder, as the
+    SC map solves it (``wfn.efermi`` is a band-index midgap, not a metal's mu).
+    """
+    import sys
+    from common.units import RYD_TO_EV
+    from .band_partition import (SEMICORE_GAP_EV, WINDOW_CLIP_EV, manifold_closing_count,
+                                 semicore_floor)
+    from .gw_config import infer_material_class
+    e_ry = np.asarray(wfn.energies[0, :, :config.nband], dtype=np.float64)
+    e = e_ry * RYD_TO_EV
+    n_occ = int(wfn.nelec)
+    metal = infer_material_class(wfn.occs) == "metal"
+    if metal:
+        from psp.get_DFT_mtxels import spin_degeneracy_factor
+        from .efermi import OccupationState
+        w = np.asarray(wfn.kweights, dtype=np.float64)
+        mu = float(OccupationState.solve_smearing(
+            e_ry, w / w.sum(), float(wfn.num_electrons), float(config.occ_broadening_ry),
+            family=config.occ_smearing_family, state_capacity=spin_degeneracy_factor(wfn),
+            clamp_tol=float(config.occupation_clamp_tol)).mu_ry) * RYD_TO_EV
+    else:
+        mu = 0.5 * (float(e[:, n_occ - 1].max()) + float(e[:, n_occ].min()))
+    below = np.count_nonzero(e < mu, axis=1) if metal else np.full(e.shape[0], n_occ)
+    coarse = semicore_floor(
+        e, n_below_k=below, nval=int(config.nval), mu_ev=mu, clip_ev=WINDOW_CLIP_EV,
+        omega_min_rel_ev=config.sigma.omega_min_ev,
+        n_protected=getattr(config, "number_bands_protected", None),
+        semicore_gap_ev=SEMICORE_GAP_EV)
+    # Production stdout is /dev/null (runtime.production_stream): rank 0
+    # writes the class to stderr, which reaches the rank-0 log.
+    say = print0 if jax.process_index() else (
+        lambda line: print(line, file=sys.stderr, flush=True))
+    say(f"  QP matrix: bands 1-{n_occ + int(config.ncond)} counted (nval={int(config.nval)}, "
+        f"ncond={int(config.ncond)}), rotated among themselves; bands "
+        f"{n_occ + int(config.ncond) + 1}-{int(config.nband)} scissored (no Sigma, no mixing); "
+        "coarse (semicore) Sigma read: "
+        + ((f"{coarse.n_coarse} (k,state) below E-mu = {coarse.coarse_floor_ev - mu:+.3f} eV, "
+            + (f"the lowest requested valence band (nval={int(config.nval)})"
+               if getattr(config, "number_bands_protected", None) is None else
+               f"under a band gap >= {SEMICORE_GAP_EV:g} eV (number_bands_protected)"))
+           if coarse.n_coarse else "none"))
+    b3 = n_occ + int(config.ncond)
+    closing = manifold_closing_count(e, b3)
+    if closing is not None:
+        say(f"  WARNING: the QP matrix [b0, {b3}) ends inside a band manifold: band {b3} "
+            f"reaches {float(e[:, b3 - 1].max()) - mu:+.3f} eV and band {b3 + 1} starts at "
+            f"{float(e[:, b3].min()) - mu:+.3f} eV (E - mu), so the top bands lose their mixing "
+            f"with the scissored tail.  number_bands_protected = {closing} closes the manifold"
+            + ("" if closing < int(config.nband) else " (the loaded band count; no gap below it)")
+            + ".")
+    return coarse
+
+
 def prepare_band_metadata(centroid_indices, config, mesh_xy, n_rmu, print0, sym, wfn):
     """Produce the physical and padded band windows on the packed centroid basis."""
     from common import Meta
@@ -3324,6 +3394,10 @@ def prepare_band_metadata(centroid_indices, config, mesh_xy, n_rmu, print0, sym,
     mu_basis = PackedCentroidBasis.build(
         centroid_indices, sym, wfn.fft_grid, mesh_xy)
     print0(f"  {mu_basis.describe()}")
+    coarse = None
+    if config.compute_mode.is_dynamic and config.qp_solver == "self_consistent":
+        # b3 counts bands as on main; the coarse class is a Sigma read class.
+        coarse = coarse_class_for_deck(config, wfn, print0)
     meta = Meta.from_system(wfn, sym,
                             int(config.nval),
                             int(config.ncond), config.nband,
@@ -3334,6 +3408,7 @@ def prepare_band_metadata(centroid_indices, config, mesh_xy, n_rmu, print0, sym,
     meta.rank = jax.process_index()
     meta.n_proc = jax.process_count()
     meta.sys_dim = config.sys_dim
+    meta.coarse_class = coarse
     meta.bispinor = charge_bispinor
     band_slices = BandSlices.from_band_edges(
         *meta.band_edges, b4_chi=meta.b_id_4_chi,
