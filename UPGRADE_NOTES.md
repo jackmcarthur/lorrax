@@ -3,6 +3,19 @@
 User-visible changes, newest first. Binding rulings behind the breaking
 changes live in `docs/architecture/decisions.md`.
 
+## 2026-09-29 — shared-pole χ₀ direct stream through mathdx mode 11
+
+- The shared-pole bank's direct stream (charge, metal or insulator, on a
+  raw-parent plan) forms each node's correlation with mathdx mode 11 from the
+  parent Greens; no full-k Green is built. Decks whose response groups keep
+  their size move at round-off (Fe 4³ charge SC ≤ 0.2 µeV).
+- The freed memory lets the response group grow, and the group size still
+  follows `memory_per_device_gb`. A deck whose group grows gets a different
+  shared-node rule, with the same certified accuracy, and moves once: Fe 8³
+  charge SC groups go from 2 to 16 samples, Green pairs per map from 344 to
+  100, the held map from 335 to 276 s, and eqp0 within E_F ± 10 eV by at most
+  1.28 meV (median ≤ 13 µeV).
+
 ## 2026-09-28 — band extrapolation on the shared-pole Σ
 
 - Scalar `compute_mode = mpa` (shared pole or MPA fit) now extrapolates the Σ_c
