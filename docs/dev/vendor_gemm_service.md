@@ -107,8 +107,7 @@ is a rank-local call that wants the full team.
    reassociates.
 2. HLO pins on the 4-emulated-device mesh: `lorrax_mklblas_gemm_batch`
    custom-call counts, reduce-scatter payloads identical on and off, zero
-   rank ≥ 2 `convert(f64)→c128`. `tests/test_contract_bands.py` is the
-   reference.
+   rank ≥ 2 `convert(f64)→c128`.
 3. HLO and collective-table gates only from a cache-cold compile.
 4. Gate the dial itself: grammar, announce strings, refusal texts, and that an
    off dial loads no library, each with a deliberately broken twin that must

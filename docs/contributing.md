@@ -34,45 +34,47 @@ Both rules have machine enforcement: `tests/test_layering.py` for the import
 direction and the driver plumbing budgets ([Layers](architecture/layers.md)),
 `tests/test_env_registry.py` for the environment surface.
 
-## Test tiers
+## The test suite
 
-> **THE FOUR-GPU RULE — every GPU verification leg runs at P=4.** It applies to
-> both tiers below. A P=1-only verification is never sufficient for landing;
-> unit and CPU cells are exempt. The owner's rationale, verbatim: *"use four
-> gpus for 100% of all testing so that never ever do we run something on one
-> GPU and then learn it doesn't generalize later"*. `lx test` already takes all
-> four GPUs on the node; a driver leg wants `-G 4` rather than the one-GPU
-> default.
+> **THE FOUR-GPU RULE — every GPU verification leg runs at P=4.** A P=1-only
+> verification is never sufficient for landing. The owner's rationale,
+> verbatim: *"use four gpus for 100% of all testing so that never ever do we
+> run something on one GPU and then learn it doesn't generalize later"*.
 
-The ordinary developer verdict is a two-minute core over tiny cached systems.
-The old suite is the nightly full tier.
+The suite is `tests/hsuite`: the production drivers run end to end on one tiny
+magnetic system (two H atoms, one electron, noncollinear with spin-orbit, time
+reversal broken), at P4 on one node. The chain is kmeans → kin_ion → dipole →
+gwjax GN-PPM one-shot → gwjax shared-pole QSGW (2 maps) → BSE → htransform →
+exciton bands. Each stage is checked on its outputs (eqp columns, the numeric
+members of the h5 files it writes, eigenvalue tables) against the stored
+references in `tests/hsuite/reference/`, and every rank log is scanned for
+failure signatures. [`tests/hsuite/README.md`](../tests/hsuite/README.md) owns
+the fixture, the coverage table and the tolerances.
 
 ```bash
-uv run python -m pytest -q                 # default core
-uv run python -m pytest -q --full          # nightly full tier
-lx test                                    # developer pre-push
-lx test --full                             # nightly
+# the verdict: four pytest ranks, each running its own driver processes
+lx run -N 1 -G 4 -n 4 -- python -m pytest tests/hsuite
+# regenerate the stored outputs after an intended change; review the diff
+lx run -N 1 -G 4 -n 4 -- python -m tests.hsuite.chain --out DIR --regenerate
 ```
 
-The default core authenticates and runs only the tiny A/B fixture family plus
-the exact service/runtime roster in `tests/core/manifest.py`. It covers the
-major modules and one hostile size per contract without running a production
-deck. `--core-extended` adds redundant standalone tiny drivers and optional
-provider checks while staying below ten minutes.
+The drivers' parallel HDF5 needs an MPI world of four, which only srun gives,
+so the P4 verdict is the `lx run -n 4` line above. `lx test` launches one task
+and runs the same cell at P1.
 
-The **full tier** owns the historical real-deck regressions, per-defect twins,
-and `tests/KNOWN_FAILURES.md` accounting. `--census` and `-m census` remain
-compatible aliases. A named path, `-m`, `-k`, or service-selection option is
-an explicit selection and stands the default narrowing down.
+Beside the suite are the five static AST suites (`test_layering.py`,
+`test_crossfile_requests.py`, `test_env_registry.py`, `test_env_grammar.py`,
+`test_fft_shardmap_context.py`). They run as scripts on a login node and also
+collect under pytest.
 
-Fixture generation is not part of either timing. `lx test --build-fixtures`
-builds or hits the hash-addressed QE cache, verifies the committed SHA-256
-reference stamps, and exits without running tests.
+`tests/bench` holds performance tools: standalone benchmark and profiling
+drivers used to measure kernels and stages. They are not tests, and pytest does
+not collect them.
 
 ## Before committing
 
-- `lx test` is the developer pre-push verdict. Run `lx test --full` in the
-  nightly/release lane.
+- The P4 suite run above is the pre-push verdict for a driver or physics
+  change.
 - `tools/release_check.sh` is the one command that runs the pre-push set: the
   login-node AST suites (layering, cross-file, env registry, env grammar, FFT
   shard-map), the input-reference drift check, and the origin-delta blob and

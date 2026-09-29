@@ -54,7 +54,3 @@ service with `capacity = m_max + 1` and `n_eig = n_keep`
 orthogonalizes only the initialized prefix; restart reconstructs the retained
 rows without slicing the full basis, and stale slots stay allocated but
 excluded until overwritten, so no capacity-sized buffer is cleared.
-
-Tests: `tests/test_lanczos_planned.py` covers full and partial active windows,
-finite-depth subspaces compared through phase-invariant projectors, and
-early-convergence eigenpairs with unused storage remaining.

@@ -159,8 +159,7 @@ literal nonzero coordinate, by the ordered band-pair scan
 point use the fractional contour. The file's ordinate and value describe the
 same analytic function. The scan's band-pair work is quadratic, so it serves
 this one sample per fit and never a frequency grid. No metal point reaches the
-insulating kernels, whose positive-gap split a metal breaks
-(`tests/test_chi_contour_kernel.py` pins the dispatch).
+insulating kernels, whose positive-gap split a metal breaks.
 
 The plan is one trade: the one unaffordable sampled row becomes an exact
 evaluation that is both cheaper and more accurate, and every other row keeps a
@@ -276,9 +275,7 @@ reach zero, and un-split it would mis-evaluate exactly the Fermi-surface states
 a metal run is for. The planner deepens the shallow/deep pole edge by the
 branches' worst negative-$E_A$ excursion, keeping every deep rectangle
 sign-definite and routing the straddle into the crossing core; an insulator has
-zero excursion and unchanged geometry. `tests/test_sigma_fermi_split.py` pins
-the weighted split against an exact fractional reference and the $f>0.5$ mask
-semantics as a failing control. Box construction and its dynamic-range cost are
+zero excursion and unchanged geometry. Box construction and its dynamic-range cost are
 [the Σ quadrature problem](sigma-quadrature-problem.md).
 
 ### 5.3 Head residues

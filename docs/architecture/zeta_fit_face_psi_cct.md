@@ -151,14 +151,3 @@ antiunitary action; the measured time-reversal verdict is unchanged. `parent_k_d
 k as its own parent. The plan then has n_parent = N_k, identity actions and
 every q row. The same parent route and route G run unchanged. The binding
 ruling is in [decisions](decisions.md).
-
-## Verification
-
-- **`tests/test_isdf_zq_parent_parity.py`** compares the parent C_q and Z_q
-  with direct NumPy q and band sums on typed full-k children. It uses a
-  nonsymmorphic glide, spin mixing and antiunitary rows at ns = 1, 2, 4, and
-  all three current vertices, at 1e-10.
-- **`tests/test_parent_projector_unfold_oracle.py`** checks the parent → child
-  projector transport against an independent oracle.
-- **`tests/multi_device/zeta_mubatch_p4.py`** gates route G ([route G,
-  verification](zeta_fit_mubatch.md#verification)).

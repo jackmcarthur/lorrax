@@ -131,8 +131,7 @@ time reversal. An ordered bank (`ordered=True` in `response_bank.response_stream
 builds $G(\bar w,\bar t)$ and gathers rows at $-q$, which is
 $\mathcal F_q[\chi]$; the transposed orientation on a TR-broken deck would hand
 each Green branch the other branch's residues,
-$\Sigma[W^{\rm even}]-\Sigma^{\rm odd}$
-(`tests/test_shared_pole_stream_orientation.py`).
+$\Sigma[W^{\rm even}]-\Sigma^{\rm odd}$.
 
 **Minus-q partner.** The ordered pencil's state $X(-z)$ acts with
 $W_q(-\bar z)=\overline{W_{-q}(z)}$ on the directions of $X(z)$, and it must be
@@ -156,7 +155,7 @@ the constant separate.
 **Moments.** `exact_bare_moments` forms the band-sum coefficients and
 `response_algebra.moments` applies (W 12): $M_1=C_2/2$, $M_3=C_4/2$, and for an
 ordered bank $M_0,M_2$. The Coulomb prefactor and orthonormal FFT together
-scale them by $1/N_k$ (`tests/test_shared_pole_bank_moment_roundtrip.py`).
+scale them by $1/N_k$.
 
 **Cost.** Green-pair evaluations $\approx\sum_{\rm groups}(\text{nodes})$, each
 one flat-k FFT convolution producing all members; Dyson is one batched solve per
@@ -205,8 +204,8 @@ and agree to round-off.
 
 `gw.shared_pole_pencil` assembles (W 18)–(W 19) for a TRS bank and
 (W 25)–(W 26) for an ordered bank, from `Q`, `O`, `D` and the moments only;
-blocks come out `P(None,'x','y')` on either route
-(`tests/test_shared_pole_pencil_faces.py`). `gw.shared_pole_reduction` applies
+blocks come out `P(None,'x','y')` on either route.
+`gw.shared_pole_reduction` applies
 (W 20): diagonal equilibration, keep cut `normalized_gram_keep`, the coupled
 Newton–Schulz inverse root (iteration count fixed from the initial
 infinity-norm bound, never from an on-device residual), and one Hermitian
@@ -332,8 +331,7 @@ valence windows to the particle–hole partner,
 
 $$ W_-(q,\tau) = W_+(-q,\tau)^{\mathsf T}, \tag{SP 5} $$
 
-TRS stores never take this branch
-(`tests/test_shared_pole_ordered.py`, `tests/test_shared_pole_lattice_sigma.py`).
+TRS stores never take this branch.
 The valence synthesis never transposes the full-q $W$. Its unfold writes each
 child's $W_+(c)^{\mathsf T}$ straight onto row $-c$, working on every rank's own tile.
 It reads the same parent pair (projected $W_p$ and $W_p^{\mathsf T}$) with the
@@ -344,8 +342,7 @@ as the average of the swapped pair, in the same loop step; it does no transpose
 exchange, whatever the group order (large groups pay local work instead: Na 8³
 Σ τ +7 % at P4). One tile exchange per τ node remains: the synthesis
 $W_p^{\mathsf T}$. Both local forms equal the exchanged transposes bit for bit
-(`services/symmetry_maps/tests/test_shared_pole_unfold.py`,
-`tests/test_shared_pole_carrier.py`, claim 2958). An exchange lets the
+(claim 2958). An exchange lets the
 off-diagonal ranks move their tiles while the diagonal ranks copy theirs and
 wait; that cost 26 % of a P16 node. The full-q transpose
 (`shared_pole_hole_kernel`) remains only for the static $W(0)$ restart.
@@ -366,8 +363,7 @@ states per band. It refuses on an ordered store
 (`GATE shared_pole_head_ordered`: the Γ body evaluator is the even form) and on
 the four-component charge store (`GATE shared_pole_head_nspinor`). An ordered
 store carries `head_correction = no_local_fields`: the direct tensor $S(\omega)$,
-finalized with no Γ body ([four-current heads](../theory/four-current-head-corrections.md),
-`tests/test_head_direct_ordered.py`). Metal head routes are
+finalized with no Γ body ([four-current heads](../theory/four-current-head-corrections.md)). Metal head routes are
 [self-consistency](../self_consistency.md#metals-direct-drude-head).
 
 ## 9 Gates and tests
@@ -392,20 +388,6 @@ four-component charge store has its own `representation` row
 | `full_m1_defect`, `full_m3_defect` | full-matrix moment defects | WARN only |
 | `capacity` | aggregate live bytes within the device budget; WARN above the $3U$ scaling target, $U=16N_q(n_{\rm spinor}n_\mu)^2/P$ | above budget |
 | `rule_validity`, `sc_rebuild` | bank and Σ certificates cover the current domains; SC rebuilds from current state | yes |
-
-Fast CPU tests (4 host devices where a mesh is needed):
-
-| test | pins |
-|---|---|
-| `test_shared_pole_ordered.py` | planted ordered oracle, projected moments, ordered = even on TRS data at equal rank, dedupe keeps no partner, generic-q assembly, Σ orientations, two-component routing |
-| `test_shared_pole_stream_orientation.py` | the ordered stream stores $\mathcal F_q[\chi]$ (SP 2) |
-| `test_shared_pole_lattice_sigma.py` | ordered Σ = real-space $iGW$ on a TR-broken lattice; swapped routing fails (SP 5) |
-| `test_shared_pole_bank_moment_roundtrip.py` | bank → constructor moments, $M_k=m_k/2$ |
-| `test_shared_pole_pencil_faces.py` | pencil blocks are `P(None,'x','y')` on both routes |
-| `test_shared_pole_head_two_component.py` | a spin-doubled two-component store reproduces the scalar head; SU(2) invariance |
-| `test_shared_pole_head_capacity.py` | the head admits $N_{\rm spinor}$ 1, 2 and refuses ordered stores and the four-component lift by name |
-| `test_shared_pole_support_rule.py`, `test_shared_pole_sizing.py` | support placement and recipe sizing |
-| `test_shared_pole_capacity.py` | byte terms and route admission |
 
 ## 10 Byte model
 

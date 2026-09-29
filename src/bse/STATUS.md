@@ -81,9 +81,7 @@ Gauge-DEPENDENT quantities (do NOT compare per-state directly):
 ## Run artifacts
 
 **Purged** (checked 2026-09-24: the directory below no longer exists; the
-figures and BGW reference dirs are gone with it).  The in-tree Si BSE deck is
-`tests/regression/si_bse_debug` (Si 4×4×4 SOC, BGW-anchored eigenvalues); the
-C10 Haydock gate of 2026-09-24 ran on it with a `--skip-vnl` dipole.
+figures and BGW reference dirs are gone with it).
 Formerly in `/pscratch/sd/j/jackm/lorrax_sandbox/runs/Si/04_si_4x4x4_bse/C_lorrax_bse_bgweqp/`:
 
 - `eps2_8x8_haydock_compare.png` — BGW Haydock 100 vs LORRAX Haydock 100 (the apples-to-apples plot)

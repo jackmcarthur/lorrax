@@ -24,9 +24,7 @@ Three independent surfaces enforce the same contract:
    blessed version over a different `jax._src`, and the patched functions
    would die on the first compile.
 
-`tests/test_jax_support.py` proves that the package and runtime windows cannot
-drift, that both JAX and JAXLIB are checked, and that 0.7/0.8/0.10 refuse.
-`tests/test_require_jax09.py` provides positive and negative preflight arms.
+Both JAX and JAXLIB are checked, and 0.7/0.8/0.10 refuse.
 There is no unsupported-version escape hatch.
 
 On Perlmutter, `lx` selects the `lorrax_A` module by default. Launch from a

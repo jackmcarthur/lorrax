@@ -39,8 +39,7 @@ $F$ is a pure function of $H$: re-evaluating the same input returns a
 bitwise-identical output (CLAIMS 2678). Every evaluated pair
 $(H, F(H) - H)$ is therefore valid secant data. Map 0 takes $U = I$ exactly
 instead of calling `eigh` on $\mathrm{diag}(E_{\rm DFT})$, so SC map 0 equals the
-one-shot G0W0 bit for bit
-(`tests/test_invariance_gates.py::test_sc_iteration1_equals_one_shot`). Each
+one-shot G0W0 bit for bit. Each
 map costs one full $\chi_0 \to W \to \Sigma$ evaluation. Σ rule planning is
 paid on map 0 (the one-shot plan) and map 1 (the held plan), and after that
 only for a window a state crosses (§4).

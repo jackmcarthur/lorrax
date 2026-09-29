@@ -75,6 +75,3 @@ Rebuild through the [FFI owner](../architecture/ffi_layout.md).
 
 `plan_subspace(...).orthogonalize` uses the same implementation, so planned
 Davidson and scalar, block and thick-restart Lanczos share it.
-`tests/test_subspace_orthogonalize.py` covers active windows, poisoned inactive
-rows, nearly dependent inputs, input preservation and real distributed
-execution.

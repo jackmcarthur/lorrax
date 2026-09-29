@@ -1,27 +1,23 @@
 # Quickstart
 
-This page runs one static-COHSEX calculation end to end on the bundled
-regression fixture, `tests/regression/cohsex_debug`, on one process. It needs
-the native FFI pair, which the Perlmutter `lorrax_A` module supplies
+This page runs every LORRAX driver end to end on the bundled test fixture,
+`tests/hsuite/fixture`: a tiny magnetic H2+ crystal (one electron,
+noncollinear with spin-orbit, 9 bands, 5×5×1 k). It needs the native FFI pair,
+which the Perlmutter `lorrax_A` module supplies
 ([Installation](installation/index.md)). To start from a crystal instead, first
 produce a `WFN.h5` ([Preparing inputs from DFT](preprocessing.md)).
 
 ## 1. Run the bundled fixture
 
-The fixture ships its own wavefunction (`WFNsmall.h5`), centroids
-(`centroids_frac_60.txt`), `dipole.h5` and `kin_ion.h5`, so it needs no
-preprocessing. It is read-only and GWJAX writes beside the deck, so copy it to
-a writable directory on a filesystem the compute nodes see:
+The fixture ships its own `WFN.h5`, pseudopotential and QE inputs. The chain
+copies it into a new directory and runs kmeans → kin_ion → dipole → GN-PPM
+one-shot → shared-pole QSGW (2 maps) → BSE → htransform → exciton bands there,
+writing each driver's decks beside it:
 
 ```bash
-export LORRAX_CHECKOUT=/path/to/lorrax       # the copy is outside the checkout
-QS=$(mktemp -d -p "$SCRATCH")
-mkdir -p "$QS/tests/regression"
-cp -a "$LORRAX_CHECKOUT/tests/regression/cohsex_debug" "$QS/tests/regression/"
-chmod -R u+w "$QS"
-cd "$QS"
+cd /path/to/lorrax
 lx run --pool POOL --wait 900 -N 1 -G 1 -n 1 -- \
-  python -m gw.gw_jax -i tests/regression/cohsex_debug/cohsex_test.in
+  python -m tests.hsuite.chain --out "$SCRATCH/lorrax_quickstart_$(date +%s)"
 ```
 
 On Frontera, build the host leg with `config/frontera/build_ffi_host.sh` and
@@ -29,25 +25,15 @@ launch as [Frontera](environment/machines/frontera.md) describes.
 
 ## 2. Check the answer
 
-The run writes `eqp_test.dat` beside the deck and the frozen `eqp_ref.dat`.
-Compare them without the first line, which is a generation timestamp:
-
-```bash
-cd "$QS/tests/regression/cohsex_debug"
-diff <(sed 1d eqp_test.dat) <(sed 1d eqp_ref.dat)
-```
-
-A match prints nothing.
-
-The bundled WFN has no co-staged QE `*.save` directory, so the run prints
-`SYMMETRY PROVENANCE WARNING` and uses the global DFT time-reversal verdict.
-This is expected for the fixture. Production inputs co-stage the QE `*.save`
-directory that generated the WFN.
+Each stage is compared with the stored outputs in `tests/hsuite/reference/`.
+The run ends with one line per stage and its wall time, then `hsuite PASS`, or
+an `hsuite FAIL` line naming the stage, the quantity and its deviation. The
+decks, reports and outputs of every driver are in `<out>/run/`.
 
 ## 3. Run the test suite
 
-`lx test` runs the two-minute core tier on a Perlmutter compute node.
-[Contributing](contributing.md) owns the tiers and when each is required.
+The suite is the same chain at P4 on one node.
+[Contributing](contributing.md#the-test-suite) owns the command.
 
 ## Your first real calculation {#your-first-real-calculation}
 

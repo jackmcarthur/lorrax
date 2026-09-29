@@ -239,19 +239,13 @@ hooks; skip-honesty profile rows for h5py (always), slab_io/FFI presence
   commit (coverage never gaps).
 - Red twins for every new refusal/guard (falsification doctrine).
 - Step-1a adjudications (Fable, recorded): (i) `file_io.wfn_loader` is now a
-  module-scope bootstrap consumer with NO bare-launch cell —
-  `tests/test_service_path_bootstrap.py`'s parametrization is
-  distrib_la-specific; step 2 generalizes it to (module, service) pairs and
-  adds the wfn_loader cell (the "green suite, red cluster" class from the
-  flagship's adjudication #1). (ii) `arm_skip_honesty` cannot be called by a
+  module-scope bootstrap consumer with NO bare-launch cell (the "green
+  suite, red cluster" class from the flagship's adjudication #1). (ii) `arm_skip_honesty` cannot be called by a
   second service — `lxkit/testing.py:801` `_ARMED` is a module-global a
   second caller would clobber (verified). wfn_loader's skip-honesty gate is
   implemented SERVICE-LOCALLY, consuming lxkit's machine-profile vocabulary
   read-only; per-scope arming in lxkit is REGISTERED as a change request to
   the main Fable (lxkit is frozen this wave, ruling 3).
-- Registered test-side repairs OUTSIDE this service's files, fixed as
-  flagged consumer-site commits: the two bare-`return` silent non-skips in
-  `tests/test_sanity_gates_jax.py:849,882`.
 
 ## DECISION 5 — replumb scope (step 3, two-arm)
 

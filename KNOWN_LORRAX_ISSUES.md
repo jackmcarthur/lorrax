@@ -14,10 +14,9 @@
 | 5 | `src/ffi/fft.py:814`, `src/runtime/__init__.py:2243` | Fixed: independent parent FFI dial, startup enforcement and collision-free announcements. |
 | 6 | `src/ffi/fft.py:1031` | Fixed: shared planner probes the selected gate target; parent ns=4 uses two-stage above the portable floor; every shape decision is announced. |
 | 7 | `src/gw/{w_isdf,cohsex_sigma,photon_sigma,photon_layout}.py` | Fixed: seal service paths before module-scope distrib_la imports; bare-launch tests cover all four consumers. |
-| 8 | `tests/test_w_bse_wiring_closure.py:136`, `src/gw/gw_config.py:4323` | Fixed stale full request/default. Closure gate blocked on missing CPU FFTW3-ABI provider `liblorrax_ffi_host.so`; 4 setup errors before driver compute (`08_restart_q_contract/retry.log`). |
+| 8 | `src/gw/gw_config.py:4323` | Fixed stale full request/default. |
 | 9 | `src/gw/gw_jax.py:708,475`, `docs/architecture/decisions.md:971` | Fixed: removed ineffective detach and unused local carrier reference; documentation says the shared carrier stays resident. |
 | 10 | `src/gw/greens_function_kernel.py:168`, static Σ callers | Fixed: real occupation dtype is enforced, static real weights exclude the second GEMM at tracing, and complex band weights preserve their imaginary part. Si P4 eqp and compile-count gate passes. |
-| CPU gate exclusions | `tests/test_windowed_exp_iEt.py`, `tests/test_sigma_fermi_split.py` | Three existing refusal-regex expectations still name the pre-merge Green API; four static-kernel cells need absent `liblorrax_ffi_host.so`. Listed in `10_real_weights/cpu.log`; excluded by name from the 42-pass focused rerun. |
 | 11 | `services/distrib_la/src/distrib_la/matmul_plan.py:558` | Fixed: local beta-zero GEMM does not donate the ignored addend; actual out-buffer liveness and numerics tested. |
 | 12 | `src/gw/gw_config.py:3587` | Fixed: explicit dense Gij refusal describes both layouts and reports the selected layout from config. |
 
@@ -45,7 +44,6 @@
 
 | Verification limits for moved readers | Source / invocation | Evidence |
 |---|---|---|
-| P4-only unit invocation mismatch | `tests/test_htransform_qp_state.py:36`, `tests/test_centroid_k_unfold.py`; `python3 -c 'from runtime import initialize_communicator_stack; initialize_communicator_stack(); import pytest; pytest.main([...])'` with exact selection in `00_audit/shared_final.sh` | 61 passed;6 htransform and4 parent-plan unit tests attempt NumPy access to non-addressable distributed arrays. CPU alternatives requiring driver startup are blocked by the already registered missing host FFI. Actual P4 BSE/EQP/htransform and reader parity drivers pass; no unit failure hidden |
 | CPU native I/O unavailable | `src/file_io/_slab_io_ffi.py:1002`; exact selection in `00_audit/zeta_headers_cpu.lx.log` | 33 passed, two cells (`test_zeta_reader_loads_mf_and_isdf_headers`, `test_zeta_q_headers_append_onto_phdf5_created_inode`) require unavailable host native I/O. Final52-pass EQP/header selection excludes those named cells |
 
 
@@ -71,11 +69,8 @@
 
 MAIN-SUITE-FIX CPU control, 2026-09-07: the optional broad CPU4 gate cannot import
 `bandstructure.htransform` at `src/bandstructure/htransform.py:16` because the
-required host `liblorrax_ffi_host.so` is absent (`src/ffi/gate.py:402`). This affects
-`tests/test_pad_parity_gates.py:734` (`test_resolve_extra_rank_pad_reads_the_env_and_refuses_garbage`)
-and `tests/test_pad_parity_gates.py:759` (`test_extra_rank_pad_only_adds_mesh_aligned_null_directions`).
-Both fail identically on untouched `d3d4b03a` (baseline test lines 725/750) and pass
-in the one-GPU landing census. No assertion or FFI requirement was relaxed.
+required host `liblorrax_ffi_host.so` is absent (`src/ffi/gate.py:402`). The import
+fails identically on untouched `d3d4b03a`. No assertion or FFI requirement was relaxed.
 Evidence: `/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/runs/DEV/123_main_landing_suite_fix_codex_2026-09-07/17_cpu_ffi_baseline/pytest.log`
 and sibling `13_screening_admission/pytest.log`. This is an inherited CPU environment
 limitation, not a remaining GPU landing-suite failure.

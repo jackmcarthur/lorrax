@@ -80,9 +80,8 @@ C-BLACS, measured) + CBLAS (distro OpenBLAS). SLATE off, mklfft
 self-disables (DFTI is Intel-only; the XLA FFT lowering stands). `launch.sh`
 exports both `LORRAX_FFI_SO` and `LORRAX_FFI_HOST_SO`.
 
-Verified end-to-end 2026-08-26: the tracked GN-PPM regression deck
-(`tests/regression/gnppm_debug/gnppm_test.in`, `memory_per_device_gb`
-lowered 28→6 for an 8 GB laptop GPU) ran to completion on the RTX 5070 —
+Verified end-to-end 2026-08-26: the GN-PPM regression deck
+(`memory_per_device_gb` lowered 28→6 for an 8 GB laptop GPU) ran to completion on the RTX 5070 —
 170 s wall, sigma table + `sigma_mnk.h5` written. Against the frozen
 2026-08-09 reference: sigX, VH, Eo **byte-identical**; sigC differs by up
 to 5.5e-2 eV, consistent with the post-freeze head-correction landings on

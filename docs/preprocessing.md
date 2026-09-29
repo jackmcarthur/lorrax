@@ -31,7 +31,7 @@ A WFN with every band of the plane-wave basis comes from the QE `.save` through
 
 ## 1. What `WFN.h5` must contain — *verified*
 
-Read directly from the bundled fixture `tests/regression/cohsex_debug/WFNsmall.h5`
+Read directly from a `WFN.h5` fixture
 (2026-08-06). Two top-level groups:
 
 | path | contents |

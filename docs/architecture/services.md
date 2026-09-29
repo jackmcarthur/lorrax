@@ -38,7 +38,7 @@ A capability is a service when it has all four of:
 | **`ffi.common.ffi_loader`** over `lxkit.native_provider` | `get_lib(platform)`, `probe_target(target, platform)` | which library pair: a sealed bundle or a build tree | no: `LORRAX_FFI_SO` / `LORRAX_FFI_HOST_SO` pin a path, and a pin that is not a file refuses | [FFI layer §2c–§2d](ffi_layout.md) |
 | **`common.collectives`** | `prepare_mesh()`, `gather_k_blocks()` | NCCL on CUDA; MPI on CPU | no: the CPU transport is a deployment fact | [transports](../environment/transports.md) |
 | **`runtime`** | `initialize_communicator_stack()` | allocator, plugin discovery, CPU or GPU backend, network transport | no | [below](#runtime) |
-| **`common.jax_compile_cache`** | called once by `runtime` | filesystem, world size, jaxlib generation | no | `tests/test_compile_cache_agreement.py` |
+| **`common.jax_compile_cache`** | called once by `runtime` | filesystem, world size, jaxlib generation | no | — |
 
 ### Single-owner services
 
@@ -68,7 +68,7 @@ mesh; never build a second one. `runtime.finalize_process(rc)` is the
 sanctioned driver exit. The startup report and its debug form are described
 in the [environment overview](../environment/overview.md#startup-block);
 knob spellings are in [`env_vars.md`](../dev/env_vars.md). A dial missing from
-the report fails `tests/test_runtime_startup_report.py`.
+the report is a defect.
 
 ### Backends are not services {#ffilinalg}
 
@@ -149,9 +149,8 @@ loose environment reads. Refuse at resolve time where the fact is known
 there, and at trace time where it is not. Make every announcement greppable
 and rank-disciplined. A factory-time dial goes into `ffi.FFI_DIAL_ENV` and
 `ffi.ffi_dial_key()`, so it enters kernel cache keys and the compile cache's
-cross-rank fingerprint (`tests/cache_key_lint.py`, rule `env-dial`).
-`tests/test_layering.py` and `tests/test_runtime_startup_report.py` enforce
-the level and the announcement.
+cross-rank fingerprint.
+`tests/test_layering.py` enforces the level.
 
 Decide explicitly whether the caller picks the backend, and record why.
 Default to *no*: a dial whose settings are "correct" and "worse in every

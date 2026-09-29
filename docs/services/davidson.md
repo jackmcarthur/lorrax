@@ -47,8 +47,8 @@ assert int(info.status) == CONVERGED
   every persistent buffer and conditional output keeps the trailing vector
   layout. Explicit shard maps flatten only each rank's local tile; CGS2 uses
   two batched coefficient reductions and never gathers a vector. Incremental
-  projection reduces only new matrix entries. `tests/test_davidson_planned.py`
-  fails on any synchronous or asynchronous all-gather in the compiled HLO.
+  projection reduces only new matrix entries. The compiled HLO holds no
+  synchronous or asynchronous all-gather.
 * **Host API.** Pass `data=payload` and callbacks that take the payload first
   when arrays are distributed; JAX cannot close over non-addressable arrays.
   `solvers.davidson.LAST_RUN` holds one final snapshot with its status.
@@ -114,9 +114,3 @@ at planning, with no padded-math or CPU fallback. The
 [FFI layout](../architecture/ffi_layout.md) owns provider selection. The
 [orthogonalization service](orthogonalization.md) owns CGS2, its coefficient
 communication and the correction-buffer alias.
-
-Tests: `tests/test_davidson_fixed.py`, `tests/test_davidson_planned.py` and
-`services/distrib_la/tests/test_active_subspace.py` cover complex and
-degenerate spectra, restarts, every failure status, changed operator data,
-rank-one correction tails, poisoned inactive storage and distributed-input
-refusal.

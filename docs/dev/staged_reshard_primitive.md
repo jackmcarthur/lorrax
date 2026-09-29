@@ -146,8 +146,7 @@ partitioner cannot re-plan it into replicated intermediates.
    unit shapes) and claims nothing more.
 2. HLO pins on the 4-emulated-device mesh, asserted on optimized text: zero
    rank ≥ 2 `convert(f64)→c128`, dot dtype/shape classes, exact collective
-   count, dtype and payload shape. `tests/test_contract_bands.py` and
-   `tests/test_projection_lgemm.py` are the reference pattern.
+   count, dtype and payload shape.
 3. Collective tables on production dumps: reduce-scatter payloads unchanged,
    and no collective carries a full `(μ, μ)` tile. HLO and collective-table
    gates are valid only from a cache-cold compile (`ISDF_JAX_CACHE_DIR=""`,

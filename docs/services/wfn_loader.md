@@ -13,8 +13,9 @@ There are two supported spellings: `import wfn_loader` and top-level names
 direct-library caller, has selected the service set), or
 `from file_io import WfnLoader` / `WFNReader` (an alias of the same class
 object). `from wfn_loader.loader import …` fails `tests/test_layering.py`, and
-`src/file_io/wfn_loader.py` must not exist
-(`tests/test_service_path_bootstrap.py::test_the_retired_shim_files_are_gone`).
+`src/file_io/wfn_loader.py` must not exist. Every module-scope importer of
+the door in `src/` carries a runtime or compatibility seal on a line above the
+import.
 
 ## API
 
@@ -119,30 +120,6 @@ request's IBZ k-count, the axis production decks grow along. Each rank
 reads its band block straight from the file's stripes, so a
 `stripe_count = 1` file serves every rank from one OST; rank 0 announces the
 file's stripe layout at open.
-
-## Tests
-
-Markers `services` and `wfn_loader`: `pytest services/wfn_loader/tests`, or
-`pytest -m wfn_loader` in the monorepo (deselect with `--no-services` /
-`--only-service=NAME`, never a second `-m`).
-
-| tier | file | needs |
-|---|---|---|
-| contract | `test_wfn_loader_contract.py`, `test_wfn_loader_close.py` | the checked-in fixtures |
-| emulated 2×2 | `test_wfn_loader_emulated_mesh.py` | four emulated devices (service conftest); skips below four |
-| real multi-process | `test_wfn_loader_multiproc.py` (`check_*` bodies plus `_CLI_CELLS`) | one process per device |
-| skip honesty | `test_wfn_loader_skip_honesty.py` | a machine profile |
-| import isolation | `test_wfn_loader_import_isolation.py` | `python -S`; asserts `sys.modules` and `sys.path` |
-| layering and bootstrap | `tests/test_layering.py`, `tests/test_service_path_bootstrap.py` | AST and subprocesses |
-
-Hostile geometry runs on real checked-in decks (gnppm: `mnband = 82`, so
-82 mod 4 = 2, ragged `ngk` 1917–1963) with self-assertions that the band
-window does not divide the world and pad slots exist. The real-process cells
-assert the padding conjunction and eager/phdf5 bit identity, and log per-rank
-clamped band counts (`[3,3,3,1]` on the hostile window) next to a perturbed
-negative control. `tests/test_service_path_bootstrap.py` walks the AST of
-`src/` and requires every module-scope importer of the door to have a runtime
-or compatibility seal on a line above the import, with a red twin.
 
 ## Antipatterns
 

@@ -50,12 +50,7 @@ manifest beside the libraries; no environment variable names it.
 
 ## The verify contract
 
-Every build path ends at `scripts/verify_ffi_build.sh`, and
-`services/distrib_la/tests/test_so_acceptance.py` runs the same script as
-pytest cells, so the suite and the build agree on what a good library is.
-Its handler-name cells read `distrib_la.loader`'s tables only, and seven of
-them (both name cells and check 6) are skipped until the loader's rows
-without a C++ handler go.
+Every build path ends at `scripts/verify_ffi_build.sh`.
 
 ```bash
 scripts/verify_ffi_build.sh --leg host build_host/liblorrax_ffi_host.so
@@ -78,7 +73,7 @@ Two further gates are properties of the pair, not of one artifact:
 
 | gate | property | where it runs |
 |---|---|---|
-| 9 | nothing LORRAX-owned is on the dynamic table, and every shared `lrx_*` entry point carries its leg's suffix | at link time in `config/perlmutter/build_ffi_host.sh` and `src/ffi/cpp/build.sh`; check 6 of `test_so_acceptance.py`, skipped today, intersects the two libraries |
+| 9 | nothing LORRAX-owned is on the dynamic table, and every shared `lrx_*` entry point carries its leg's suffix | at link time in `config/perlmutter/build_ffi_host.sh` and `src/ffi/cpp/build.sh` |
 | 10 | a CUDA-capable process with both libraries open does host phdf5 work | `src/ffi/cpp/gate_one_odr.py`, inside a GPU allocation |
 
 A gate that cannot run reports `COULD NOT RUN` and is counted separately; GATE

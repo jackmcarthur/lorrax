@@ -14,7 +14,7 @@ for htransform and exciton bands: a segment count, then one line per vertex,
 `kx ky kz n  # label`.
 
 This page is maintained by hand. `tools/gen_input_reference.py` cannot evaluate
-the imported defaults in `_DEFAULTS` and writes nothing (`tests/KNOWN_FAILURES.md`).
+the imported defaults in `_DEFAULTS` and writes nothing.
 
 The last section documents a different input file, the `[downfold]` deck.
 

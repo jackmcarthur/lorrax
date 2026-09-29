@@ -22,10 +22,7 @@ each stage reuses. The path is opt-in; **`gw.gw_jax` does not import any of it.*
 **Wiring.** The only entry is `python -m gw.plane_wave_pipeline`. The deck key
 `screened_coulomb_cutoff` ([input reference](../input_reference.md)) is parsed, but no
 driver reads it; the pipeline takes the same value as `--screened-coulomb-cutoff`. No
-test drives the pipeline. The pair convolution and the screening have CPU suites
-(`tests/test_mixed_basis_pair_convolution.py`, `tests/test_plane_wave_screening.py`)
-and P4 gates (`tests/multi_device/mixed_basis_pair_conv_p4.py`,
-`tests/multi_device/plane_wave_screening_p4.py`).
+test drives the pipeline.
 
 **On branches, not main.**
 

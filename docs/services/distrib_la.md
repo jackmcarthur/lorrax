@@ -133,8 +133,7 @@ never picks an FFI backend on a CPU mesh and never picks `native2d`.
 * **Unguarded defect:** cuSOLVERMp `eigh` on a 3×3 mesh hangs silently for
   n ≥ 3072 (n = 2049 completes; 2×2 at n = 8192 completes). The resolver
   does not refuse it. Keep large eigh (including the 2n polar dilation) off
-  3×3 meshes. Evidence: `tests/KNOWN_FAILURES.md`, "`distributed_eigh` hangs
-  at a 3×3 mesh".
+  3×3 meshes.
 * **ROCm is declared-untested.** LORRAX builds no ROCm `.so`, and JAX reports
   `Device.platform == 'gpu'` for both vendors, so a ROCm mesh currently
   resolves as CUDA (`resolve.FFI_PLATFORMS`).
@@ -164,6 +163,9 @@ Public selection is `batched_route ∈ {'batch_reshard', 'auto'}`;
 `factor`/`solve` keep their provider plans. Route and backend selection are
 orthogonal: an explicit backend is still resolved and probed before route (c)
 runs its native kernel; `backend='off'` is the provider-free spelling.
+The scan and stacked routes agree to 0 ulp in both W and Z;
+`Plan.batched(..., _route=...)` is the private override that makes that
+comparison possible.
 
 Explicit `auto` resolves to (b) when the backend has a stacked entry, else
 (a). On CUDA with handlers present:
@@ -515,38 +517,6 @@ Route (c)'s exchanges and the scan route compile once per signature. A Python
 loop over the batch recompiles SLATE's eager `shard_map` wrappers per matrix;
 never factor a batch that way.
 
-## Tests
-
-`services/distrib_la/tests/` runs from the package (`python -m pytest`) or the
-repository root (`python -m pytest services/distrib_la/tests`); the service
-conftest creates four emulated CPU devices before JAX imports and applies the
-`services` and `distrib_la` markers through a collection hook. Inside the
-LORRAX suite, select with `-m distrib_la` and deselect with `--no-services` /
-`--only-service=NAME`, never a second `-m`: an explicit `-m` replaces
-`addopts = "-m 'not extra'"`.
-
-| tier | file | needs |
-|---|---|---|
-| shape and contract algebra | `test_distrib_la_shape_algebra.py` | nothing |
-| emulated multi-device, route (c), matmul, gemm_plan refusals, polar | `test_distrib_la_{emulated_mesh,batch_reshard,matmul,matmul_plan,polar}.py` and siblings | four emulated CPU devices; skips below four |
-| real multi-process | `test_distrib_la_multiproc.py` (`check_*` bodies plus a `__main__` CLI over `_CLI_CELLS`) | one process per device |
-| `.so` contract and ELF acceptance | `test_distrib_la_contract.py`, `test_so_acceptance.py` | pinned libraries; binutils |
-| import isolation | `test_distrib_la_import_isolation.py` | a `python -S` subprocess |
-| skip honesty | `test_distrib_la_skip_honesty.py` | a machine profile: absent capability skips, built-and-broken fails |
-
-Every check ships with its red twin, and the real 2×2 cells use non-dividing
-extents with padding round trips. On Perlmutter the real-process gate is
-
-```bash
-lx run --pool POOL -N 1 -G 4 -n 4 python3 -u \
-  services/distrib_la/tests/test_distrib_la_multiproc.py --mesh 2x2 --only batch_reshard_local_ops
-```
-
-(`--only gemm_plan` for the planned GEMM). `tests/multi_device/batched_eigh_dispatch_gate.py`
-and its twin `check_batched_eigh_dispatch` require the scan and stacked routes
-to agree to 0 ulp in both W and Z; `Plan.batched(..., _route=...)` is the
-private override that makes that comparison possible.
-
 ## Antipatterns
 
 * **Calling `jnp.linalg.svd` or `eigh(A.H @ A)` at a consumer.** Use
@@ -571,9 +541,7 @@ private override that makes that comparison possible.
 * **Hand-rolled mesh identities.** Use `mesh_key(mesh)`; `id(mesh)` is safe
   only when the cached value retains the mesh.
 * **Wrapping a refusal in `try/except` at a call site.** An explicit backend
-  that cannot be honoured must raise out of the driver;
-  `tests/test_charge_zeta_route.py` pins the probe calls in `isdf/core.py`
-  that exist for their raise.
+  that cannot be honoured must raise out of the driver; the probe calls in
+  `isdf/core.py` exist for their raise.
 * **Editing `sys.path` or importing a LORRAX path helper from a consumer.** An
-  installed consumer imports `distrib_la` directly;
-  `tests/test_service_path_bootstrap.py` covers the checkout integration.
+  installed consumer imports `distrib_la` directly.

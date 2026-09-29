@@ -178,13 +178,3 @@ confined to the one near-origin sample.
 | face carrier narrower than the energy table | load at least as many bands as the table names |
 | `GATE response_vertex` | current vertices need ordered full-k endpoints, applied after the symmetry unfold |
 | negative or nonfinite time nodes, or weights not shaped (n_z, n_t) | caller error |
-
-## Gates
-
-`tests/test_chi0_fractional_face_parity.py` compares both kernels with
-independent NumPy band-pair sums at n_s = 1 and 2 on a 2 × 2 mesh. The
-occupation table has an exact degeneracy and deep occupied and empty tails
-(±40–50 Ry), so both supports are strictly narrower than the band range and
-asymmetric; a wrong support weight fails it. The native four-rank run covers
-the vendor FFT that CPU workers omit. `tests/multi_device/fractional_chi_gate.py`
-is the P = 4 dense Kubo gate for the contour kernel.

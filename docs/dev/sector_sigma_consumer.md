@@ -57,11 +57,3 @@ the cuFFT plan scratch of the kernel's XLA FFT ops (`runtime.aot_memory`;
 refuses with `GATE shared_pole_capacity` when that scratch cannot be measured
 on CUDA) plus the `distrib_la` native workspace of the distributed GEMMs. These
 are capacity estimates, not measured runtime peaks.
-
-The gate is `tests/multi_device/sector_sigma_frequency_p4.py`. It writes real
-endpoint stores, a bank and a manifest, then calls the production entry with
-unequal charge/current centroid extents, distinct sector poles, nonreciprocal q
-dependence, fractional occupations and a nonzero constant, against an explicit
-band/q/pole oracle that exists only in that harness; read its receipt before
-treating a run as passing. It covers both layouts. Full-frequency material
-validation is separate from this synthetic gate.

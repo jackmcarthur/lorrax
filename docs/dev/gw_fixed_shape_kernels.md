@@ -43,19 +43,9 @@ Bracket indices and affine weights are operands, not captured constants.
 The spectral estimator forms one symmetric per-state weight matrix at a time
 and sums in bracket order. Unsharded callers run the eager operation sequence.
 
-Validation is split:
-
-- `tests/multi_device/active_band_sigma_gate.py` compares bracketed and
-  unbracketed projected tau kernels with frozen full-band owners, including
-  scalar/spinor carriers, time reversal, signed/complex selectors, per-parent
-  ranges, empty parents, and interior holes.
-- `tests/test_gw_fixed_shape.py` verifies one compiled executable accepts
-  changed active counts and skips poisoned inactive pole rows, and that
-  postprocessing accepts changed indices and weights.
-- `tests/test_sigma_box_plan.py` checks selector capacity/count packing.
-- `tests/multi_device/band_bracket_partition_p4.py` checks the production
-  bracket partition, explicit P4 output sharding, and bitwise equality
-  between one bracket and the unbracketed kernel.
+One compiled executable accepts changed active counts and skips poisoned
+inactive pole rows. One bracket is bitwise equal to the unbracketed kernel,
+and the production bracket partition keeps the explicit P4 output sharding.
 
 For changes to the loop or layouts, inspect optimized P4 HLO and compiled
 memory statistics as well as numerical outputs. The distributed GEMM and

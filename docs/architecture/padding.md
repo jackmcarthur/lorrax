@@ -86,10 +86,8 @@ different centroid table.
 4. Cyclic ring and `ppermute` modulo expressions select neighbour ranks, not
    carrier extents.
 
-`tests/test_padding_owner_static.py` is the executable register. It scans
-`src/` and the service sources and rejects any second round-up spelling,
-mesh-divisor modulo or mesh-divisibility refusal outside the owner, unless the
-exception is registered with its reason and follow-up. The deck doctor
+`src/` and the service sources hold no second round-up spelling,
+mesh-divisor modulo or mesh-divisibility refusal outside the owner. The deck doctor
 (`lxkit.deck_doctor`) prints the Σ window's logical extent, carrier, divisor
 and pad from `sigma_band_axis`. An indivisible physical band window is carried
 by that padding, and the doctor does not refuse it at preflight.

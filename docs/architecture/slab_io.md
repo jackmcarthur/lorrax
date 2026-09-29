@@ -437,9 +437,7 @@ striping_unit   = the power of two nearest in log2 to (nranks/16) MiB, clamped t
 (2.9 GiB/s at 16 ranks).
 
 **One policy, two writers.** The C++ `stripe_policy_count` and
-`stripe_policy_unit` (`context.cc`) transcribe `_stripe_policy`, and
-`tests/test_slab_io_routing.py::test_cpp_stripe_policy_transcribes_the_python_one`
-compiles and diffs them. `_FfiBackend` exports the resolved values into
+`stripe_policy_unit` (`context.cc`) transcribe `_stripe_policy`. `_FfiBackend` exports the resolved values into
 `LORRAX_PHDF5_STRIPE_COUNT` and `LORRAX_PHDF5_STRIPE_SIZE_FS` before opening,
 so a run's environment records its layout. An explicit value overrides the
 policy. Both writers refuse a malformed value and a negative count (a
@@ -540,7 +538,6 @@ compile cache hits. A non-int64 operand refuses (`ffi.io.require_control_i64`).
   symptoms. To check, `comm -12` of `nm -D --defined-only` on the two legs,
   filtered to `lrx_|lorrax_ffi`, must print nothing;
   `src/ffi/cpp/gate_one_odr.py` checks a live process.
-  `tests/KNOWN_FAILURES.md` L1 owns the history.
 
 ---
 

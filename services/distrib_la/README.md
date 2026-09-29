@@ -16,18 +16,7 @@ helper. From a LORRAX source checkout, install the two distributions with:
 cd services/distrib_la
 python -m pip install -e ../lxkit -e '.[test]'
 python -c "import distrib_la; print(distrib_la.BATCHED_ROUTE_CHOICES)"
-python -m pytest tests/test_distrib_la_shape_algebra.py \
-  tests/test_distrib_la_emulated_mesh.py \
-  tests/test_distrib_la_import_isolation.py \
-  tests/test_distrib_la_batch_reshard.py \
-  tests/test_distrib_la_matmul.py
 ```
-
-That provider-free subset exercises the package boundary and native routes.
-The full `python -m pytest` suite also runs FFI/ELF and machine-profile gates;
-on a machine such as Perlmutter whose profile promises provider libraries,
-set the documented `.so` pins and library paths first. Missing promised
-capabilities are failures there, not skips.
 
 If `h5py` happens to be installed, the FFI loader imports it in a caught,
 best-effort block before `dlopen` so h5py's HDF5 symbols win the process-wide

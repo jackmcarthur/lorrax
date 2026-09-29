@@ -60,7 +60,6 @@ window, and the smaller consumer takes a slice inside it.
 | the `max` | `gw_config.BandCounts.isdf` (one property) |
 | the invariant at the consuming seam | `gw_init.assert_isdf_window_is_the_max`, called from `fit_zeta`; refuses otherwise |
 | which count won, and what the fit was built for | logged every run by `BandCounts.describe()` |
-| tests | `tests/test_band_count_split.py` |
 
 `zeta_nband` may narrow the fit below a band sum's top (the BSE Galerkin
 capacity bound is why it exists); the consumer left above the fit edge then

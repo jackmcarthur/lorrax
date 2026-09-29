@@ -36,15 +36,6 @@ Tolerances are in `chain.ATOL`.
 
 ## Commands
 
-```bash
-# P4, the landing shape (four pytest ranks, each running its own drivers)
-lx run -N 1 -G 4 -n 4 -- python3 -m pytest tests/hsuite -q -p no:cacheprovider
-# the same chain without pytest, into a directory of your choice
-lx run -N 1 -G 4 -n 4 -- python3 -m tests.hsuite.chain --out DIR
-# regenerate reference/ (review the diff before committing it)
-lx run -N 1 -G 4 -n 4 -- python3 -m tests.hsuite.chain --out DIR --regenerate
-```
-
-`lx test tests/hsuite` runs the same cell at P1, since `lx test` launches
-one task. A local four-process launch cannot replace srun here: the drivers'
-parallel HDF5 needs an MPI world of four.
+[Contributing](../../docs/contributing.md#the-test-suite) owns the canonical
+invocation (`lx run -N 1 -G 4 -n 4 -- python -m pytest tests/hsuite`) and the
+regenerate command.

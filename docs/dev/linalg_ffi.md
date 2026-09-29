@@ -114,10 +114,3 @@ environmental.
   the calling thread's team through `mkl_set_num_threads_local`
   (`common/mkl_thread_pin.h`) to `min(current, 4)`; `LORRAX_SCALAPACK_MKL_THREADS`
   overrides, and the pin is a no-op on non-MKL ScaLAPACK.
-
-## Verification
-
-* `tests/test_charge_zeta_route.py`, `tests/test_zeta_mesh_invariance.py`:
-  route pins and the replication-cap refusal (4+ host devices).
-* `services/distrib_la/tests/test_distrib_la_contract.py` (marker
-  `distrib_la`): wrapper shape and layout contracts against the real builds.

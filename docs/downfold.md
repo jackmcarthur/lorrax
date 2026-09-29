@@ -75,9 +75,8 @@ cross-checks its q = 0, G = 0 column against the independently transported
     have not been re-taken. For the size of the correction, the one lineage that
     was re-run on the fixed tree moved its exciton error from −348.6 meV to
     −42.6 meV and its median `eps_W` from 1.056e-02 to 1.196e-02, so the error
-    bar barely moved while the observable moved by an order of magnitude
-    (`tests/known_failures/2026-08-11-qsign-recut-verdicts.md`). Read what
-    follows for the mechanism and the shape of the guidance, and re-measure
+    bar barely moved while the observable moved by an order of magnitude. Read
+    what follows for the mechanism and the shape of the guidance, and re-measure
     before quoting a figure.
 
 What the drop-in does **not** fix is how large μ_S has to be. Measured on the
@@ -564,7 +563,7 @@ by unfolding the child's wedge block with those tables and comparing against the
 child on the full BZ. On the production deck that gate now reads 3.7e-08 against
 a tolerance scaled by the run's achieved conditioning, and passes with 5.4× of
 margin; it read 1.170 and REFUTED for two days because the Gram behind it was
-built at −q (`tests/known_failures/2026-08-11-downfold-gram-q-sign.md`).
+built at −q.
 `gw.downfold.orbit_complete_keep` survives as an offline instrument for a kept
 set that came from somewhere else, and is no longer on the selection path.
 

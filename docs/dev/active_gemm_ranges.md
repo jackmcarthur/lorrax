@@ -134,17 +134,6 @@ an all-NaN output without a callback, rather than silently clamping slices.
 Plan construction executes a genuine partial interval when K>1; warming only
 full intervals would bypass the active native handlers.
 
-- `services/distrib_la/tests/test_active_gemm_range.py`: distributed CUDA
-  scalar/per-parent intervals, owner crossings, alpha/beta, full/empty bounds,
-  poisoned inactive operands, bitwise full-range parity, and immutable
-  prepared metadata after mutation of the caller's original bounds arrays.
-- `services/distrib_la/tests/test_local_active_gemm_range.py`: local CPU/CUDA
-  intervals, non-power-of-two capacities, complex weights, poisoned inactive
-  A/B/weights, empty parents, one compiled scan, prepared calls without
-  runtime bounds operands, and invalid-bound behavior.
-- `tests/multi_device/active_band_sigma_gate.py`: typed scalar/spinor tau
-  projections, time reversal, selectors, energy windows and bracket additivity.
-
 CPU emulation verifies local JAX semantics only; the complete CPU driver
 route additionally needs the attested MPI adapter
 ([MPI collectives](mpi_collectives.md)).

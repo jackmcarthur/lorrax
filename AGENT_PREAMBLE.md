@@ -12,7 +12,7 @@ code; the register at the foot says which page owns what.
 | 2 | **One combined P=4 leg per verification:** gates, driver and red twin in one dispatch. | Each extra dispatch repays the bring-up floor (`initialize_communicator_stack`) | `lx run --pool POOL -N 1 -G 4 -n 4`, `lx test` |
 | 3 | **Warm worker** when one geometry runs more than twice; landing evidence still comes from a cold leg. | A warm leg skips the bring-up and the compile | `lx warm start`, `lx warm submit`, `lx batch --mode auto` |
 | 4 | **Lane weight named in the report's first line.** Light (mechanical fix, one number): five one-sentence lines — changed, proof, evidence path, owed, branch. Heavy (design, investigation): a full report. | Readers triage by weight | — |
-| 5 | **Ledger as you go:** evidence path in every report; supersession recorded where the superseded result is indexed. | Hand-resolved ledger conflicts and orphaned workspaces | `tests/known_failures/<date>-<slug>.md`, `tests/known_failures/SMALL_ISSUES.md` |
+| 5 | **Ledger as you go:** evidence path in every report; supersession recorded where the superseded result is indexed. | Hand-resolved ledger conflicts and orphaned workspaces | — |
 
 Rules 1 and 2 are complements: fan out across independent work, combine
 within one verification. The measurements behind them are in
@@ -80,7 +80,6 @@ class number.
 | need | read |
 |---|---|
 | the code: modules, conventions, running | `AGENTS.md` |
-| is this red already known | `tests/KNOWN_FAILURES.md` (one level above `tests/known_failures/`) |
 | is this claim or check sound | `docs/dev/QUALITY_PATTERNS.md` |
 | what a deck key is called and does | `docs/input_reference.md` |
 | which page owns a documented fact | the register in `docs/index.md` |

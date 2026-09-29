@@ -50,9 +50,17 @@ REFERENCE = HERE / "reference"
 ATOL = {
     "h5": 1.0e-8,        # kin_ion / dipole members (relative + absolute)
     "eqp_ev": 5.0e-4,    # eqp0/eqp1 columns, GN-PPM and shared pole
-    "bse_ev": 5.0e-4,    # BSE and exciton-band eigenvalues
+    "bse_ev": 2.0e-3,    # BSE and exciton-band eigenvalues: Krylov solves
+                         # on a P-dependent padded space (P1 vs P4 1.2 meV)
     "htransform_ev": 5.0e-4,
 }
+
+# h5 members not compared.  qp_diag_self_consistent_ev is a diagnostic
+# diagonal fixed point E = h0 + Re Sigma(E) with plain mixing; on this fixture
+# (SC map gain ~5) it lands on different roots from Sigma inputs that agree to
+# 30 ueV (P1 vs P4: 0.79 eV on one state).  The terminal eqp columns and the
+# Sigma matrices it is built from are compared instead.
+H5_UNCOMPARED = ("qp_diag_self_consistent_ev",)
 
 FAILURE_SIGNATURES = (
     "Traceback (most recent call last)",
@@ -153,6 +161,10 @@ STAGES = (
     ("dipole", "psp.get_dipole_mtxels", ["-i", "gnppm.in"]),
     ("gnppm", "gw.gw_jax", ["-i", "gnppm.in"]),
     ("shared_pole_sc", "gw.gw_jax", ["-i", "sp_sc.in"]),
+    # A regression check, not physics: the DFT gap is 48 meV between the
+    # exchange-split bonding states, far below the ~1 eV exciton binding of
+    # this unscreened one-electron molecule, so the TDA eigenvalues come out
+    # negative (-1.19, -0.81 eV).
     ("bse", "bse.bse_jax",
      ["-i", "gnppm.in", "--bse", "--lanczos", "--tda", "--solver", "davidson",
       "--n-val", "1", "--n-cond", "2", "--n-occ", "1",
@@ -322,6 +334,8 @@ def _tol(label):
 def compare(name, got, ref):
     problems = []
     for label, want in ref.items():
+        if label.endswith(H5_UNCOMPARED):
+            continue
         if label not in got:
             problems.append(f"{name}: {label} missing")
             continue
@@ -335,6 +349,14 @@ def compare(name, got, ref):
         tol, relative = _tol(label)
         scale = max(1.0, float(np.max(np.abs(want)))) if (
             relative and want.size) else 1.0
+        if label.endswith("_kij_ev"):
+            # Band-basis matrices carry the wavefunction phases, which the
+            # eigensolver may choose differently (P1 vs P4): compare the
+            # diagonal and the element moduli, which a phase change keeps.
+            have = np.concatenate([np.einsum("...ii->...i", have).ravel(),
+                                   np.abs(have).ravel()])
+            want = np.concatenate([np.einsum("...ii->...i", want).ravel(),
+                                   np.abs(want).ravel()])
         err = float(np.max(np.abs(have - want))) if want.size else 0.0
         if err > tol * scale:
             problems.append(f"{name}: {label} max|diff| {err:.3e} > {tol * scale:.1e}")

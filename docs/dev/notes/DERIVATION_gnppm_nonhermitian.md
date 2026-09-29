@@ -4,8 +4,7 @@ The time-reversal-broken (magnetic) GN-PPM and ordered MPA: the Hermitian
 and anti-Hermitian parts of $W(i\omega_p)$ fix two Hermitian residues, and
 each causal Σ branch consumes one of them. Code: `src/gw/w_isdf.py` (χ₀
 kernels), `src/gw/minimax_screening.py` (the fit), `src/gw/ppm_sigma.py`,
-`src/gw/ppm_accumulators.py` and `src/gw/mpa/sigma.py` (the Σ windows). Every
-identity below is pinned by `tests/test_gnppm_ordered_orientations.py`.
+`src/gw/ppm_accumulators.py` and `src/gw/mpa/sigma.py` (the Σ windows).
 
 ## 1. Exact pole structure without time reversal
 
@@ -50,8 +49,7 @@ inherits every statement above ($V_q$ Hermitian, $V_{-q}=\overline{V_q}$).
 
 The Laplace kernel (`w_isdf._get_chi_minimax_kernel`, real τ) forms one
 orientation per node, $A_q(\tau)=\sum P^{\rm kern}_{q}\,e^{-\tau(\Delta-E_{\rm gap})}$,
-where the kernel's own object is $P^{\rm kern}=|\overline{\psi_c}\psi_v\rangle\langle\cdot|$
-(the oracle `_direct_node_sum` in `tests/test_chi_contour_kernel.py`), i.e. the
+where the kernel's own object is $P^{\rm kern}=|\overline{\psi_c}\psi_v\rangle\langle\cdot|$, i.e. the
 $-\Delta$-pole orientation, and completes it as $A_q+\overline{A_{-q}}$
 (`_complete_static_vertex_orientations`) before weighting with the EVEN
 kernel $\alpha_l\approx x/(x^2+\omega_p^2)$. Exact at $\omega=0$ and under
@@ -269,12 +267,6 @@ GN-PPM.  Pole-window planning uses the union of the live support of both
 residues; the delivered-error planner measures the selected residue separately
 for each branch.  The scalar charge head remains the even object of §6 and
 therefore retains the single-residue fit.
-
-`tests/test_gnppm_ordered_orientations.py` plants a two-pole non-Hermitian
-$W$, fits the ordered samples, reconstructs a dense imaginary-axis grid, and
-compares the branch-selected $\Sigma_c$ with an independent imaginary-axis
-contour.  Its red twin Hermitises the samples before fitting and is required to
-move the answer macroscopically.
 
 For observability, ordered MPA executes that same planned contraction once
 more with $D=0$, exactly as GN-PPM does, and records

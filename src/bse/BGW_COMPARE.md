@@ -38,8 +38,7 @@ Skipping any of the six conventions below produces silent O(1) errors.
 Prereq: a run dir with `cohsex.in`, `centroids_frac_*.txt`, `WFN.h5`,
 `tmp/isdf_tensors_*.h5` from a prior `gw_jax` pass, plus a BGW
 reference dir with `eqp.dat`, `vcoul`, `absorption_eh.dat`,
-`eigenvalues.dat`. (The `runs/Si/04_si_4x4x4_bse/` example this line used to
-cite was purged; the in-tree Si BSE deck is `tests/regression/si_bse_debug`.)
+`eigenvalues.dat`.
 
 ```bash
 export LX_BASE_MODULE=lorrax_A LORRAX_CHECKOUT=/path/to/lorrax
@@ -87,8 +86,7 @@ eps2 = eps2_from_exciton_dipoles(omegas_Ry, E_Ry[:n_max], D[:n_max], eta_Ry,
 ```
 
 It uses the Haydock route's prefactor and Lorentzian, in Ry. No `src/` or
-`tools/` module reads BerkeleyGW's `eigenvalues.dat`; only
-`tests/test_bse_bgw_regression.py` reads its energy column. Those energies are
+`tools/` module reads BerkeleyGW's `eigenvalues.dat`. Its energies are
 in eV. Convert them and η to Ry (÷ 13.6056980659) before
 `absorption_common.lorentzian_broaden` and the 16π²/(V·N_k·n_spin·n_spinor)
 prefactor: the Lorentzian carries 1/energy, so broadening in eV gives ε₂

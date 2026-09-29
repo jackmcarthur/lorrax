@@ -31,7 +31,3 @@ The scalar-grid adapter sums unpolarized PBE exchange and correlation,
 vectorizes scalar kernels, and converts Hartree/electron to Ry/electron.
 `pbe_functional_polarized` evaluates the spin-polarized kernels of the same two
 functionals for the noncollinear magnetic V_xc (`psp.xc.compute_V_xc_noncollinear`).
-
-Focused numerical test: `tests/test_xc_pbe.py` (requires patched dependency).
-Independent QE total-potential equivalence must be checked separately from
-point-functional and autodiff tests.

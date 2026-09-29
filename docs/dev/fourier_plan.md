@@ -44,5 +44,3 @@ and otherwise joins the one FFT group. `GEMM_CROSSOVER` in `common/fourier_plan.
 **Reference patterns (NVIDIA).**
 - Mode 10's structure is cuFFTDx's `05_fft_Xd/fft_3d_box_single_block`: the whole volume sits in shared memory, thread FFTs run per line, one sync per pass, and the store is coalesced. Mode 10 adds row sparsity and several planes per block.
 - nvmath-python's FFT "truncation" (`examples/fft/truncation.py`) is a prefix copy followed by a full FFT. It is not a substitute for supports or the gather.
-
-**Gates.** `tests/test_fourier_plan.py` runs on every leg the platform has. `tests/test_plane_fft_gather.py` and `tests/multi_device/plane_fft_gather_p4.py` cover the plane form.

@@ -517,7 +517,7 @@ $$
 $$
 
 so a TRS bank adds no partner columns and **the ordered model equals the even
-model at equal retained span** (`tests/test_shared_pole_ordered.py`).
+model at equal retained span**.
 
 ## 7 How the self-energy consumes the model
 
@@ -568,10 +568,7 @@ Unoccupied intermediate states couple to $W_q$'s positive-frequency weight,
 occupied states to the transposed positive weight of the partner parent: the
 occupied branch contracts $|p^{\mathsf T}b_k(-q)|^2$ where the unoccupied branch
 contracts $|p^\dagger b_j(q)|^2$, so the hole branch costs a gather at $-q$ and a
-transpose, no extra product. `tests/test_shared_pole_lattice_sigma.py`
-reproduces real-space $\Sigma=iGW$ on a time-reversal-broken lattice to
-$10^{-10}$ relative and misses by more than $10^{-3}$ with the orientations
-swapped.
+transpose, no extra product.
 
 ### 7.3 The odd channel in the self-energy
 

@@ -124,8 +124,6 @@ an intact node digest and passing current-frequency bounds at the requested
 tolerance (the bank rule also needs an unchanged tolerance); otherwise a new
 rule is built, and corrupt integration arrays refuse. Results report
 `reuse_status`, `reuse_reason`, `node_digest` and the certified domain.
-`services/minimax/tests/test_response_rules.py` checks analytic kernels, the missing-1/(2z)
-derivative red twin, positivity and refusals.
 
 ## Finite-temperature Matsubara rules
 
@@ -145,9 +143,6 @@ amplification above 0.1·rel_tol/ε_machine refuses. Nodes come from pivoted-QR
 compression of a graded Gauss–Legendre pool with least-squares weights (the
 Kaltak–Kresse finite-temperature problem, PRB 101, 205145 (2020), solved
 without their nonlinear minimax optimization).
-`services/minimax/tests/test_matsubara_rules.py` checks the Lindhard weight
-(f_m − f_n)/(x − iν) pair by pair, including −∂f/∂ε at ν₀, with a
-wrong-frequency red twin.
 
 ## Analytic reciprocal constructors
 
@@ -169,6 +164,5 @@ finite-height rectangles use `analytic_box_rule`.
 
 ## Verification
 
-Package tests live in `services/minimax/tests/`; the monorepo layering test
-enforces the top-level door. `test_minimax_import_isolation.py` measures that
-`import minimax` and a `noncrossing` solve load neither JAX nor SciPy.
+The monorepo layering test enforces the top-level door. `import minimax` and a
+`noncrossing` solve load neither JAX nor SciPy.

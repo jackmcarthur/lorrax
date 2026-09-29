@@ -59,20 +59,6 @@ The token intentionally hides `SlateLowerL`; it cannot be reshared or passed
 through `jit`. Backend maintainers who need the raw primitives may use
 `slate = distrib_la.backend_module('slate')`, but application code should not.
 
-Local service tests and the current Perlmutter multi-process spelling are:
-
-```bash
-cd services/distrib_la
-python -m pytest tests/test_distrib_la_contract.py -k slate
-python -m pytest tests/test_distrib_la_matmul.py
-
-cd ../..
-export LX_BASE_MODULE=lorrax_J070
-lx run -N 1 -G 4 -n 4 python3 -u \
-  services/distrib_la/tests/test_distrib_la_multiproc.py \
-  --mesh 2x2 --only slate
-```
-
 The claims-style performance driver is
 `services/distrib_la/bench/bench_distrib_la.py`. It records baselines and is
 not a pass/fail test.
@@ -322,9 +308,7 @@ a GPU-backend process.  Input-file selection: `distributed_cholesky =
 slate` now passes through on the CPU backend (still never auto-picked;
 still fails loudly with build pointers when the library is absent).
 
-Tests: `services/distrib_la/tests/test_distrib_la_contract.py::test_slate_*_cpu` (1×1 CPU
-mesh, skipif-clean without the host lib) + the CLI matrix under
-`JAX_PLATFORMS=cpu` for multi-rank CPU meshes.  The first additional
+The first additional
 host backend landed the same way: `ffi.scalapack` (Cray LibSci
 pXgetrf+pXgetrs, `distributed_lu = scalapack`) compiles into the same
 library and registration table — see `distrib_la._scalapack` (the C++ is
@@ -361,14 +345,10 @@ FFI touch is a host target gets a device-less SLATE.
 
 Both loaders therefore open **CUDA before cpu**
 (`distrib_la.loader._open_cuda_before_host`, and the same rule in
-`src/ffi/common/ffi_loader.py`).  `test_so_acceptance.py::test_check_5_*`
-is the ratchet on the premise: it fails the day the two stacks stop
-sharing a SONAME, which is the day to delete the rule.
+`src/ffi/common/ffi_loader.py`).  The rule can go the day the two
+stacks stop sharing a SONAME.
 
-Tests: `services/distrib_la/tests/test_distrib_la_contract.py` (the
-`slate_*` cells, and the SONAME-race section) and
-`test_distrib_la_multiproc.py --mesh 2x2`; run via `lx run` / `lx test`
-inside an allocation.  The benches are `services/distrib_la/bench/`.
+The benches are `services/distrib_la/bench/`.
 
 ### Batched potrf/trsm targets
 

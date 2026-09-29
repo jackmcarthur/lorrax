@@ -293,21 +293,3 @@ the store and the finalize. The ψ G slots, the plane groups and the fit bands
 are padded by name. Pad q rows and pad G slots carry v = 0 and ngk = 0, so
 they contribute nothing to V. Pad batch slots are −1 in
 `OwnerOrbitBatches.mu`, and their Z rows are zero.
-
-## Verification
-
-- **`tests/multi_device/zeta_mubatch_p4.py`** (P = 4) checks the kernel, both
-  store placements and both read layouts against the dense full-BZ sum at
-  1e-12. It covers a glide group with spin mixing and an antiunitary row
-  (ns = 2), the 48-operation A-cubic fixture (ns = 1), a ragged deck where
-  no axis divides the mesh, and the glide group at ns = 4 with the three
-  current vertices in one kernel. Its red twins shift the ζ-sphere axis index
-  by one, and compare channel 1 against channel 2's reference; both must miss
-  by more than 1e-3. It also checks the current solve seam against a dense
-  (C + δI)⁻¹Z on an indefinite C, with the PSD cut
-  as the red twin.
-- **`tests/test_zeta_mubatch_orbit_tables.py`** checks the whole-orbit batch
-  tables against a direct Seitz evaluation, and checks that a split orbit
-  refuses.
-- **`tests/multi_device/pair_kernels_p4.py`** checks the pair GEMM;
-  `tests/multi_device/kconv_router_p4.py` checks the router.

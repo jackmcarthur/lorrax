@@ -29,10 +29,6 @@ evaluation with `lax.cond`, so padded atoms evaluate no full-G exponential;
 the scan stays reverse-mode differentiable and active atom counts stay runtime
 operands.
 
-`tests/test_vnl_compact.py` covers complex `nspinor = 1` and `2` operator and
-full-Hamiltonian parity, preconditioner-diagonal parity, inactive-NaN
-positions and reverse-mode gradients.
-
 ## NSCF use
 
 `psp.run_nscf.run_nscf` sets `compact_vnl=True` for its planned local

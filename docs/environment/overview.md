@@ -173,9 +173,7 @@ independent of whether the pool is reserved.
 
 **One process per GPU.** The release does not cross processes: a second
 process on the same GPU gets only $M - R$ minus the first process's outside
-bytes. `tests/conftest.py` therefore pins its workers to BFC with
-`PREALLOCATE=false` (they share GPUs with `tests/harness.py`'s mesh-cell child,
-which runs `ALLOCATOR=platform`).
+bytes.
 
 **Accounting.** `cuda_async` and BFC keep `memory_stats()` populated.
 `platform` is plain `cudaMalloc` and reports `bytes_limit = peak_bytes_in_use =

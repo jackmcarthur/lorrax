@@ -106,9 +106,7 @@ aliases of `unfold_isdf_operator`, `spinor_rotation_for_sym_row`,
   takes the highest matching irreducible k, then the lowest symmetry index;
   `find_irreducible_bz_points`' anchored branch reproduces it bit for bit.
   Changing it moves eqp by up to 15.9 eV (V_H column) and is an owner
-  decision. The tripwire is the bit-equality of `(irr_idx_k, sym_idx_k)` on
-  the four in-tree decks against
-  `services/symmetry_maps/tests/data/star_tables_e9340d1.json`.
+  decision.
 * **Translations: one array, two conventions.** `SymMaps.translations` is raw
   BGW `tnp` (= 2π·τ). G-space consumes it undivided (`tau_phase_row`); every
   real-space `orbit_syms` entry point divides by 2π. Passing one function's
@@ -221,32 +219,8 @@ shardings, and a sharded `jax.Array` is never pulled to the host to be
 indexed. The star index tables are `n_k` host integers; the operand
 (`(n_k, nb, nb)` complex128, 9.2 GB at nk = 144, nb = 2000) is what the helpers
 are written not to move. `spread_rel` on a device operand costs one reduction
-and one 16-byte transfer.
-
-## Tests
-
-`services/symmetry_maps/tests` (markers `services`, `symmetry_maps`) runs on a
-laptop: `pytest services/symmetry_maps/tests`, or `pytest -m symmetry_maps`
-from the monorepo (deselect with `--no-services` /
-`--only-service=symmetry_maps`, never a second `-m`, which replaces
-`addopts = "-m 'not extra'"`).
-
-| tier | file | needs |
-|---|---|---|
-| star contract, algebra, typed actions | `test_symmetry_maps_star_contract.py`, `test_symmetry_maps_algebra.py`, `test_typed_representation_actions.py`, `test_symmetry_maps_r_cart.py` | nothing |
-| deck tables | `test_symmetry_maps_deck_tables.py` | h5py and the four in-tree WFN headers |
-| emulated mesh | `test_symmetry_maps_emulated_mesh.py` | four forced CPU devices; skips below four |
-| real multi-process | `test_symmetry_maps_multiproc.py` (`check_*` bodies plus a `_CLI_CELLS` CLI) | one process per device |
-| import isolation, skip honesty | `test_symmetry_maps_import_isolation.py`, `test_symmetry_maps_skip_honesty.py` | `python -S`; a machine profile (absent skips, present-and-broken fails) |
-
-* Star tests use hand-verified production tables
-  (`tests/data/star_tables_e9340d1.json`), never tables derived from a
-  generated grid, and each table-driven cell asserts that `'star_row'` and
-  `'ibz_slab'` disagree on the expected number of rows (8 on gnppm, 6 on
-  cohsex) so it cannot pass as a tautology.
-* Hostile geometry is mandatory: `n_rmu % (Px·Py) ≠ 0` must refuse.
-* `spread_rel` on a NaN-poisoned sharded operand returns `nan` on real
-  processes; the emulated-mesh result differs (`tests/KNOWN_FAILURES.md`).
+and one 16-byte transfer. On a NaN-poisoned sharded operand it returns
+`nan` on real processes; the emulated-mesh result differs.
 
 ## Antipatterns
 

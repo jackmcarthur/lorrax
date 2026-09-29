@@ -18,19 +18,13 @@ error budget and what is still pending.
 
 ## Try it
 
-The fastest way to confirm LORRAX works on your machine — a complete static-COHSEX
-calculation end-to-end on the bundled fixture, which ships its own wavefunction and
-needs no GPU:
+The fastest way to confirm LORRAX works on your machine is to build the native
+layer and run every driver on the bundled test fixture:
 
 ```bash
 uv sync
 bash src/ffi/cpp/build_host.sh      # see below: this step is NOT optional
-LORRAX_SOURCE=$PWD
-LORRAX_QUICKSTART=$(mktemp -d)
-mkdir -p "$LORRAX_QUICKSTART/tests/regression"
-cp -a tests/regression/cohsex_debug "$LORRAX_QUICKSTART/tests/regression/"
-chmod -R u+w "$LORRAX_QUICKSTART"
-(cd "$LORRAX_QUICKSTART" && uv run --project "$LORRAX_SOURCE" python -m gw.gw_jax -i tests/regression/cohsex_debug/cohsex_test.in)
+uv run python -m tests.hsuite.chain --out "$(mktemp -d)/quickstart"
 ```
 
 !!! warning "The native build is required"

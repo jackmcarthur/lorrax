@@ -305,9 +305,7 @@ the guard by accident and put pad transitions below the optical onset.
 slot. A call site copied from the wrong one is wrong only when the extent is
 not already a mesh multiple, which no mesh-divisible validation run sees. Do
 not reintroduce a positional or single-value return, and do not add a second
-helper. `tests/test_pad_parity_gates.py` pins both
-(`test_pad_axis_fill_is_keyword_only_and_signed`, and a source gate against a
-second helper).
+helper.
 
 ## 2026-08-18 — The ζ band chunk is 16
 
@@ -470,11 +468,10 @@ Every per-k kernel takes the loader's fixed `(n_k, ngkmax, 3)` G table and its
 mask rather than a ragged slice to each k's `ngk`. Every k then presents
 identical operand shapes, the kernel lowers once, and the k sweep is dispatches
 of one executable that `collectives.sweep_local_k` pipelines behind one host
-readback. Padded-vs-ragged agreement is gated at `RTOL_D10 = 1e-12` relative,
-not bit-exactness, because appended zeros change XLA's reduction blocking
-(`tests/test_kin_ion_padded_gvectors.py`, `tests/test_psp_padded_gvectors.py`).
-`psp.dft_operators.generate_gvectors_k` stays only as the reference route
-those gates compare against. A code comment cannot mint an "owner decision":
+readback. Padded-vs-ragged agreement is held to `RTOL_D10 = 1e-12` relative,
+not bit-exactness, because appended zeros change XLA's reduction blocking.
+`psp.dft_operators.generate_gvectors_k` stays only as the ragged reference
+route. A code comment cannot mint an "owner decision":
 cite an entry here.
 
 ## Standing rulings
@@ -513,7 +510,7 @@ Binding rules of the driver's phases that no docstring carries.
 - **One head resolver.** Every q→0 head sample of a run (COHSEX static head,
   W0 restart head, PPM dynamic head) comes from `head_correction.HeadResolver`.
 - **SC iteration 1 is the one-shot.** SC runs skip the one-shot Σ; the first
-  map reproduces it (`tests/test_invariance_gates.py::test_sc_iteration1_equals_one_shot`).
+  map reproduces it.
 - **Σ_x gate.** Every Σ_x diagonal entry must be negative
   (`sanity.check_sign`); a positive one is a sign, conjugation or band-index
   slip.

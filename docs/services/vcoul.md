@@ -132,28 +132,6 @@ for the Sobol generator. `v_qG_table` runs once per consumer setup
 (seconds at `nmc = 2**18`, doubled by centrosymmetrization); neither is on the
 GPU steady state.
 
-## Tests
-
-`services/vcoul/tests` (markers `services`, `vcoul`; deselect with
-`--no-services`):
-
-* `test_vcoul_import_isolation.py` runs the public surface in a `python -S`
-  subprocess with only the service on the path, including the no-scipy
-  refusal, with a red twin.
-* `test_vcoul_door_smoke.py` covers every kernel, both refusal classes, the
-  head-slot rule (argmin vs label, tied-set mean, Γ skip, table refusal) and
-  the head-before-cutoff order on cubic and hexagonal cells.
-* `test_vcoul_minibz_consolidation.py` pins golden body-head values, a
-  composition test with a red twin, and closure of the δq set under negation.
-* `test_vcoul_head_slot_reciprocity.py` rebuilds the Si per-q G-lists,
-  checks the $K \mapsto -K$ pairing, and requires
-  `max |v(+q,i) − v(−q,pair(i))| == 0.0`; red twins reinstate the Miller-label
-  rule and a one-sided draw.
-
-`tests/test_vcoul_minibz_head_draw.py` in the main suite guards the draw
-convention with hexagonal-cell discrimination; silicon cannot see that bug
-class.
-
 ## Antipatterns
 
 * **Hand-rolling a fractional-to-Cartesian draw.** `randvals @ bvec.T` has the

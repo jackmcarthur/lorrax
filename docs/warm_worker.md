@@ -83,9 +83,9 @@ as the latter would be the same overreach the brief made.
 **The "two to four minutes" figure appears to be inherited from two true
 statements about other things.** `bin/lx`'s own header records 8–21 minutes of
 `sbatch` queue wait for 30-second jobs, measured 2026-08-05 — before the pool
-existed, which is the mechanism `lx` was built to delete. And
-`tests/test_import_time_gate.py` says roughly four-fifths of a warm driver's
-wall is bring-up rather than physics, which is a correct *ratio*; the wall it
+existed, which is the mechanism `lx` was built to delete. And a
+separate measurement puts roughly four-fifths of a warm driver's wall in
+bring-up rather than physics, which is a correct *ratio*; the wall it
 is a ratio of is about fifteen seconds. A ratio and a queue-wait measurement
 combined into an absolute, and the absolute survived.
 
