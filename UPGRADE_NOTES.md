@@ -8,8 +8,10 @@ changes live in `docs/architecture/decisions.md`.
 - Scalar `compute_mode = mpa` (shared pole or MPA fit) now extrapolates the Σ_c
   band sum with the same brackets and pooled (β, Ω) fit as GN/HL-PPM.
   `use_band_extrapolation` defaults on, so every scalar shared-pole run moves
-  once, and a deck with `number_bands_sigma` < 2·n_occ now refuses at startup;
-  set `use_band_extrapolation = false` there. Bispinor `mpa` is unchanged.
+  once, and a deck with `number_bands_sigma` < 2·n_occ now refuses at startup,
+  as GN/HL-PPM already does: for example Fe 4³ scalar at 35 bands (needs 36)
+  and MoS2 at 44 bands (needs 52). Raise the band count or set
+  `use_band_extrapolation = false` there. Bispinor `mpa` is unchanged.
 
 ## 2026-09-28 — band extrapolation: pooled denominator shell, cuts at 70/85/100 %
 

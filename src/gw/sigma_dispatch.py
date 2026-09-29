@@ -847,15 +847,15 @@ def validate_band_extrapolation(config, mode, *, print_fn=None):
                 f"the exact answer by ~340 meV and gets WORSE with more bands "
                 f"(MEASURED against BerkeleyGW's exact static CH: 94.9 meV MAE "
                 f"at nband 60 rising to 288.2 at nband 124, against 171.3 "
-                f"falling to 32.8 for GN-PPM).  A bispinor MPA stage sums "
-                f"four-current sector bodies with no bracket axis.  Use "
+                f"falling to 32.8 for GN-PPM).  Bispinor MPA is not "
+                f"extrapolated: unvalidated.  Use "
                 f"compute_mode = gn_ppm or a scalar mpa, add "
                 f"a gnppm stage to the sc_stage_N_type ladder, or set "
                 f"use_band_extrapolation = false.  (This deck NAMES the key; "
                 f"had it been left at its default the feature would have "
                 f"disabled itself here with a note instead of refusing.  A "
                 f"ladder containing ANY gn_ppm / hl_ppm stage also does not "
-                f"refuse — the non-PPM stages in it disable themselves and the "
+                f"refuse — the non-consuming stages in it disable themselves and the "
                 f"run continues.)")
         if print_fn is None:
             return
@@ -869,11 +869,11 @@ def validate_band_extrapolation(config, mode, *, print_fn=None):
         if getattr(mode, "is_dynamic", False):
             because = (
                 "MPA is dynamic, so the static Coulomb-hole measurement below "
-                "is NOT the reason here: the reason is that a bispinor MPA "
-                "stage sums four-current sector bodies, which carry no band "
-                "bracket, so there is no bracket axis to fit, and the 1/N -> 0 "
-                "limit has never been measured on that sum.  Extrapolating it "
-                "would be an unvalidated claim, not a correction")
+                "is NOT the reason here: the reason is that bispinor MPA is "
+                "not extrapolated -- its four-current sector sum has no "
+                "bracket axis to fit, and the 1/N -> 0 limit has never been "
+                "measured on any bispinor MPA route.  Extrapolating it would "
+                "be an unvalidated claim, not a correction")
         else:
             because = (
                 "The 1/N -> 0 limit is MODE-DEPENDENT and is wrong for a "
@@ -1175,7 +1175,7 @@ def _compute_mpa_sigma(
     from .mpa.sigma import compute_sigma_c_mpa_omega_grid
     from .efermi import resolve_sigma_efermi_ry
     from .ppm_pipeline import (
-        extrapolate_sigma_body, plan_sigma_band_brackets, sigma_band_count_point)
+        band_count_point, extrapolate_sigma_body, plan_sigma_band_brackets)
     from .ppm_windows import sigma_regularization_for_config
     sigma_w_model = getattr(config.sigma, "w_model", "mpa")
     fit_path, head_fit_path, fit_identity, fit_digest = _mpa_sigma_model_resources(
@@ -1308,9 +1308,9 @@ def _compute_mpa_sigma(
     if plan is not None:
         # The fit reads Sigma in the body's own omega frame (sigma_efermi_ry).
         last = plan.n_brackets - 1
-        body_unextrap = sigma_band_count_point(body_omega, last)
+        body_unextrap = band_count_point(body_omega, last)
         if body_odd is not None:
-            body_odd = sigma_band_count_point(body_odd, last)
+            body_odd = band_count_point(body_odd, last)
         body_omega, extrap_payload = extrapolate_sigma_body(
             replace(body, efermi_ry=sigma_efermi_ry), head_diag,
             plan=plan, config=config, band_slices=band_slices,

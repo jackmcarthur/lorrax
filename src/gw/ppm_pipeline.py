@@ -250,7 +250,7 @@ def _extrapolation_kernel(sharding):
     return jax.jit(_combine_extrapolation, out_shardings=sharding)
 
 
-def _band_count_point(cube, i: int):
+def band_count_point(cube, i: int):
     """``cube[i]`` with the TRAILING (ω, k, m, n) sharding preserved.
 
     The Σ cube's leading axis is the band count and is replicated, so
@@ -297,7 +297,7 @@ def _extrapolated_point(cube, weights):
     the gate.
 
     Sharding is restated on the way out for the same reason
-    :func:`_band_count_point` restates it: the leading axis is dropped, and
+    :func:`band_count_point` restates it: the leading axis is dropped, and
     ``sigma_omega_layout=sharded``'s contract is that consumers read the
     layout off the array rather than trusting XLA to propagate it through a
     reduction.
@@ -369,7 +369,7 @@ def _report_band_extrapolation(
         # The cube lives on the padded band carrier; the head, the DFT
         # energies and the fit are logical.  Strip at this consumer boundary.
         diag_w_kn = np.asarray(
-            extract_sigma_diag_replicated(_band_count_point(cube, i), mesh_xy))
+            extract_sigma_diag_replicated(band_count_point(cube, i), mesh_xy))
         if sigma_omega.band_axis is not None:
             diag_w_kn = np.asarray(strip_axis(
                 diag_w_kn, sigma_omega.band_axis, axis=-1))
@@ -553,7 +553,7 @@ def extrapolate_sigma_body(
     head added (:func:`_report_band_extrapolation`); the weights it returns
     combine the three cumulative cubes (:func:`_extrapolated_point`).  The
     EXTRAPOLATED Σ_c drives E_nk; the caller keeps the un-extrapolated N₃
-    cube (:func:`sigma_band_count_point`) beside it so the driver
+    cube (:func:`band_count_point`) beside it so the driver
     diagonalizes both and reports the eqp-level correction.  Extrapolating Σ
     and then diagonalizing is the only order that yields a Hermitian operator.
     """
@@ -564,11 +564,6 @@ def extrapolate_sigma_body(
         print_fn=print_fn)
     return (_extrapolated_point(sigma_omega.sigma_c_kij, extrap_weights),
             extrap_payload)
-
-
-def sigma_band_count_point(cube, i: int):
-    """The cumulative band-count point ``cube[i]``, trailing sharding kept."""
-    return _band_count_point(cube, i)
 
 
 def compute_ppm_sigma_pipeline(
@@ -738,7 +733,7 @@ def compute_ppm_sigma_pipeline(
         # the shape it has always had.  The last element IS the ordinary
         # full-band Σ_c (the cumulative sum's final term), so at
         # n_bracket = 1 this index is the identity.
-        sigma_c_body_omega_n3 = _band_count_point(
+        sigma_c_body_omega_n3 = band_count_point(
             sigma_omega.sigma_c_kij, sigma_omega.sigma_c_kij.shape[0] - 1)
         # OFF: ``sigma_c_body_omega`` IS the N₃ point and the second cube is
         # None, so the object graph below is exactly what it always was.
