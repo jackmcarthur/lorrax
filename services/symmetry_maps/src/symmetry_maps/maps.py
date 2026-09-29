@@ -879,15 +879,36 @@ def _endpoint_panel_kernel(mesh, mesh_axis, is_local, n_sym_spatial):
 
 def _apply_unfold_phase_and_trs_local(
     V_full_local, phase_mu, phase_nu, trs_mask, *, pair_transpose: bool,
+    transposed: bool = False,
 ):
-    """The umklapp phase and the time-reversal rule on one local tile; see docs/architecture/symmetry_register.md."""
+    """The umklapp phase and the time-reversal rule on one local tile; see docs/architecture/symmetry_register.md.
+
+    ``transposed=True`` (pair-transpose rule only) returns this tile of the
+    TRANSPOSE of the ordinary output, given ``V_full_local`` permuted from the
+    swapped source pair (the operator where the ordinary output reads its
+    transposed partner, and vice versa).  Element ``[a, b]`` is then
+    ``(m_b V[a, b]) n_a`` with the ordinary row factor ``m`` taken at the
+    column index and the column factor ``n`` at the row index, in the ordinary
+    operand order, so it equals the ordinary ``(m_b V[b, a]) n_a`` bit for bit
+    (complex products commute exactly; the operand order keeps any FMA
+    contraction the same).  It requires identical row and column phase tables.
+    """
     if pair_transpose:
         mu_phase = jnp.where(trs_mask[:, None],
                              jnp.conj(phase_mu), phase_mu)
         nu_phase = jnp.where(trs_mask[:, None],
                              phase_nu, jnp.conj(phase_nu))
+        if transposed:
+            row_rule_at_columns = jnp.where(trs_mask[:, None],
+                                            jnp.conj(phase_nu), phase_nu)
+            column_rule_at_rows = jnp.where(trs_mask[:, None],
+                                            phase_mu, jnp.conj(phase_mu))
+            return (row_rule_at_columns[:, None, :] * V_full_local
+                    * column_rule_at_rows[:, :, None])
         return (mu_phase[:, :, None] * V_full_local
                 * nu_phase[:, None, :])
+    if transposed:
+        raise ValueError("a transposed unfold output requires the pair-transpose rule")
     V_full_local = (phase_mu[:, :, None] * V_full_local
                     * jnp.conj(phase_nu)[:, None, :])
     return jnp.where(
@@ -909,8 +930,16 @@ def unfold_operator_local(
     transposed_parent_local=None,
     left_mesh_axis='x',
     right_mesh_axis='y',
+    transposed_output=False,
 ):
     """Transport one local rectangular tile from raw parents to full k; see docs/architecture/symmetry_register.md.
+
+    ``transposed_output=True`` (pair-transpose rule, identical left and right
+    tables) returns this rank's tile of each child's TRANSPOSE, formed
+    locally with no exchange: pass the transposed parent as
+    ``operator_parent_local`` and the parent as ``transposed_parent_local``.
+    Bitwise the transpose of the ordinary output when the two parents are
+    exact transposes (``_apply_unfold_phase_and_trs_local``).
 
     ``left_mesh_axis``/``right_mesh_axis`` name the mesh axis whose shard of
     the endpoint tables this rank holds (the tables span the whole endpoint
@@ -976,7 +1005,8 @@ def unfold_operator_local(
     phase_nu = jax.lax.dynamic_slice_in_dim(
         phase_right, right_start, nu_local, axis=1)
     return _apply_unfold_phase_and_trs_local(
-        V_full_local, phase_mu, phase_nu, trs_mask, pair_transpose=pair_transpose)
+        V_full_local, phase_mu, phase_nu, trs_mask, pair_transpose=pair_transpose,
+        transposed=transposed_output)
 
 
 def unfold_wavefunction_local(

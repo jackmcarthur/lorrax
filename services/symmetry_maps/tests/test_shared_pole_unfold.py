@@ -154,3 +154,62 @@ def test_shared_pole_unfold():
     from lxkit.testing import require_devices
     require_devices(4, 'cpu')
     check_shared_pole_unfold(Mesh(np.asarray(jax.devices('cpu')[:4]).reshape(2, 2), ('x', 'y')))
+
+
+def check_local_transposes_are_bitwise(mesh):
+    """The unfold's and the projector's local transposed outputs equal the exchanged transposes bit for bit."""
+    import jax
+    import jax.numpy as jnp
+    from jax.sharding import NamedSharding, PartitionSpec as P
+    import symmetry_maps as S
+    from symmetry_maps._shard_map import shard_map
+    rng = np.random.default_rng(20260929)
+    sh = NamedSharding(mesh, P(None, 'x', 'y'))
+    def put(a):
+        return jax.make_array_from_callback(a.shape, sh, lambda i: a[i])
+    w = rng.normal(size=(2, 12, 12)) + 1j*rng.normal(size=(2, 12, 12))
+    swap = np.arange(12)
+    swap[[0, 1, 6, 7]] = [1, 0, 7, 6]            # owner-local on both 2x2 faces
+    perm = np.stack((np.arange(12), swap, np.arange(12), swap)).astype(np.int32)
+    wraps = rng.integers(-2, 3, (4, 12, 3)).astype(np.int32)
+    wraps[[0, 2]] = 0
+    local = S.certify_endpoint_locality(perm, mesh=mesh, mesh_axis='x')['local_perm']
+    assert local is not None
+    q = np.array([[.25, 0., 0.], [.5, 0., 0.]])
+    irr, sym = np.array([1, 0, 1, 0, 1]), np.array([0, 1, 2, 3, 1])
+
+    @partial(jax.jit, static_argnums=2)
+    def unfold(a, at, transposed):
+        return shard_map(lambda a, at: S.unfold_operator_local(
+            a, irr_idx=irr, sym_idx=sym, q_irr_frac=q,
+            left_local_perm=local, right_local_perm=local,
+            left_L_table=wraps, right_L_table=wraps, n_sym_spatial=2,
+            trs_rule='pair_transpose', transposed_parent_local=at,
+            transposed_output=transposed), mesh=mesh, in_specs=(P(None, 'x', 'y'),)*2,
+            out_specs=P(None, 'x', 'y'), check_vma=False)(a, at)
+    wd, wtd = put(w), put(w.swapaxes(-1, -2))
+    ordinary = np.asarray(unfold(wd, wtd, False))
+    direct = np.asarray(unfold(wtd, wd, True))
+    assert np.array_equal(direct, ordinary.swapaxes(-1, -2)), np.max(np.abs(direct - ordinary.swapaxes(-1, -2)))
+    # The little-group projector on the same owner-local action: its second
+    # output is formed on every rank's tile, without a collective permute.
+    rotations = np.stack((np.eye(3), -np.eye(3), -np.eye(3), np.eye(3))).astype(np.int32)
+    metadata = dict(q_full_idx=np.array([16, 32], np.int32), q_irr_frac=q, sym_mats_k=rotations,
+                    sym_perm=perm, L_table=wraps, active_symmetry_rows=np.arange(4, dtype=np.int32),
+                    kgrid=(4, 4, 4), n_sym_spatial=2, mesh=mesh)
+    project = jax.jit(lambda a, at: S.project_little_group_operator(
+        a, transposed_partner=at, **metadata))
+    average, average_t = (np.asarray(x) for x in project(wd, wtd))
+    assert np.array_equal(average_t, average.swapaxes(-1, -2))
+    assert np.max(np.abs(average - w)) > .1         # the projection did act
+    hlo = project.lower(wd, wtd).compile().as_text()
+    assert 'collective-permute' not in hlo and 'all-to-all' not in hlo
+
+
+def test_local_transposes_are_bitwise():
+    import jax
+    from jax.sharding import Mesh
+    from lxkit.testing import require_devices
+    require_devices(4, 'cpu')
+    check_local_transposes_are_bitwise(
+        Mesh(np.asarray(jax.devices('cpu')[:4]).reshape(2, 2), ('x', 'y')))

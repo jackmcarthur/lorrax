@@ -227,12 +227,39 @@ def _shared_pole_panel_tables(meta, header, q_span, *, mesh_xy):
                 n_sym_spatial=int(qt["n_sym_spatial"]))
 
 
-def _shared_pole_panel_unfold(meta, header, q_span, *, mesh_xy, tables=None):
+def _shared_pole_hole_order(header, rows):
+    """Where an ordered store's valence branch puts each child's transpose.
+
+    The valence W at q is W_+(-q)^T (SP 5), so child row ``c`` lands on row
+    ``-c``.  Returns ``(order, targets)``: the children in ascending target
+    order and those sorted, unique targets.
+    """
+    from symmetry_maps import q_negation_index
+
+    minus_q = np.asarray(q_negation_index(tuple(int(v) for v in header["grid"])))
+    targets = minus_q[np.asarray(rows)]
+    order = np.argsort(targets, kind="stable").astype(np.int32)
+    return order, targets[order].astype(np.int32)
+
+
+def _shared_pole_direct_hole(tables):
+    """The local unfold can emit a child's transpose itself (one table for both endpoints)."""
+    cert = tables["certificates"]
+    left, right = cert["x"]["local_perm"], cert["y"]["local_perm"]
+    return left is not None and right is not None and np.array_equal(left, right)
+
+
+def _shared_pole_panel_unfold(meta, header, q_span, *, mesh_xy, tables=None, hole=False):
     """Realize each parent and apply its local child operation.
 
     Returns explicit full-q row IDs and a compiled pair-transpose unfold.
     Nonlocal maps refuse here; the caller routes bounded endpoint factors
     through the symmetry service before contraction for those maps.
+
+    ``hole=True`` (an ordered store's valence branch) returns the rows ``-c``
+    and each child's transpose W_+(c)^T, formed on every rank's own tile from
+    the parent pair (``unfold_operator_local(transposed_output=True)``): no
+    full-q transpose exchange, bitwise the exchanged one.
     """
     from common.shard_map import shard_map
     from gw.qgrid_symmetry import shared_pole_operator_realizer
@@ -249,18 +276,28 @@ def _shared_pole_panel_unfold(meta, header, q_span, *, mesh_xy, tables=None):
     realize = shared_pole_operator_realizer(
         meta, header, q_full_idx=qids, mesh_xy=mesh_xy)
 
+    rows, parent_rows, sym_rows = tables["rows"], tables["parent_rows"], tables["sym_rows"]
+    if hole:
+        if not _shared_pole_direct_hole(tables):
+            raise ValueError("a direct valence unfold needs one owner-local table for both endpoints")
+        order, rows = _shared_pole_hole_order(header, rows)
+        parent_rows, sym_rows = parent_rows[order], sym_rows[order]
+
     def body(plus, transposed):
         projected, _ = policy.project_fixed_q(
             plus, qids, transposed_partner=transposed, measure=False)
         transposed, _ = policy.project_fixed_q(
             transposed, qids, transposed_partner=plus, measure=False)
+        if hole:
+            projected, transposed = transposed, projected
         return unfold_operator_local(
-            projected, irr_idx=tables["parent_rows"], sym_idx=tables["sym_rows"],
+            projected, irr_idx=parent_rows, sym_idx=sym_rows,
             q_irr_frac=tables["q_frac"],
             left_local_perm=cert["x"]["local_perm"], left_L_table=tables["wraps"],
             right_local_perm=cert["y"]["local_perm"], right_L_table=tables["wraps"],
             n_sym_spatial=tables["n_sym_spatial"],
-            trs_rule="pair_transpose", transposed_parent_local=transposed)
+            trs_rule="pair_transpose", transposed_parent_local=transposed,
+            transposed_output=hole)
 
     unfold_local = jax.jit(shard_map(
         body, mesh=mesh_xy,
@@ -271,7 +308,7 @@ def _shared_pole_panel_unfold(meta, header, q_span, *, mesh_xy, tables=None):
     def unfold(plus, transposed):
         return unfold_local(*realize(plus, transposed))
 
-    return tables["rows"], unfold
+    return rows, unfold
 
 
 def _shared_pole_routed_children(meta, header, tables, *, endpoint_budgets, mesh_xy, layout):
@@ -324,13 +361,15 @@ def _shared_pole_child_ids(header, tables):
 def _shared_pole_routed_synthesis(
     factors, poles2, intervals, E_ref_B, t_node, *, header, tables,
     realize, mesh_xy, gemm, layout="face", weights_fn=_shared_pole_weights,
-    active_range=False,
+    active_range=False, hole=False,
 ):
     """Synthesize W from routed child factors, DESIGN §3.4 fallback.
 
     ``factors`` is ``_shared_pole_routed_children``'s output: the two child
     endpoint faces, then their conjugate partners when a child is
-    self-negative. No all-star factor cache is retained.
+    self-negative. No all-star factor cache is retained.  ``hole=True``
+    returns the realizer's transposed output, each child's W_+(c)^T, in the
+    ascending ``-c`` order of :func:`_shared_pole_hole_order`.
     """
     policy = tables["policy"]
     child_ids = _shared_pole_child_ids(header, tables)
@@ -352,6 +391,9 @@ def _shared_pole_routed_synthesis(
     from common.collectives import transpose_xy
     transposed = jax.lax.with_sharding_constraint(
         transpose_xy(plus, mesh_xy), NamedSharding(mesh_xy, P(None, "x", "y")))
+    if hole:
+        order, _targets = _shared_pole_hole_order(header, tables["rows"])
+        return realize(plus, transposed)[1][order]
     return realize(plus, transposed)[0]
 
 
@@ -466,7 +508,12 @@ def _shared_pole_w_synthesis(io, meta, header, frequencies, schedule, *, mesh_xy
                 workspace_plan, "gemm", ((count, m, width), (count, width, m)),
                 np.complex128))
 
-            def program(span=(lo, hi), tables=tables, local=local, count=count):
+            # An ordered store's valence branch unfolds each child's transpose
+            # on its own tile (no full-q transpose exchange) wherever the
+            # panel's endpoint action is one owner-local table.
+            direct = ordered and (not local or _shared_pole_direct_hole(tables))
+
+            def program(span=(lo, hi), tables=tables, local=local, count=count, direct=direct):
                 from distrib_la import gemm_plan
                 # As G's plan: pole columns outside a window's interval are
                 # never contracted, and no warm-up (the plan runs inside the
@@ -474,35 +521,44 @@ def _shared_pole_w_synthesis(io, meta, header, frequencies, schedule, *, mesh_xy
                 gemm = gemm_plan(mesh_xy, m=m, k=width, n=m, nq=count,
                                  dtype=np.complex128, layout=layout,
                                  enable_active_range=True, warmup=False)
-                if local:
-                    _rows, unfold = _shared_pole_panel_unfold(
-                        meta, header, span, mesh_xy=mesh_xy, tables=tables)
+                kernels = {}
+                for hole in ((False, True) if direct else (False,)):
+                    if local:
+                        _rows, unfold = _shared_pole_panel_unfold(
+                            meta, header, span, mesh_xy=mesh_xy, tables=tables, hole=hole)
 
-                    def body(factors, poles2, ranges, e, t):
-                        plus, transposed = synthesize_shared_pole_parents(
-                            *factors, poles2, ranges, e, t, mesh_xy=mesh_xy, gemm=gemm,
-                            layout=layout, weights_fn=weights_fn, active_range=True)
-                        return unfold(plus, transposed)
-                else:
-                    # The realization is the magnetic little-group average the
-                    # store's policy authenticates; on the local branch it is
-                    # already inside ``unfold``.
-                    from gw.qgrid_symmetry import shared_pole_operator_realizer
-                    body = partial(
-                        _shared_pole_routed_synthesis, header=header, tables=tables,
-                        realize=shared_pole_operator_realizer(
-                            meta, header, q_full_idx=tables["rows"], mesh_xy=mesh_xy),
-                        mesh_xy=mesh_xy, gemm=gemm, layout=layout, weights_fn=weights_fn,
-                        active_range=True)
-                return dict(kernel=jax.jit(body))
+                        def body(factors, poles2, ranges, e, t, unfold=unfold):
+                            plus, transposed = synthesize_shared_pole_parents(
+                                *factors, poles2, ranges, e, t, mesh_xy=mesh_xy, gemm=gemm,
+                                layout=layout, weights_fn=weights_fn, active_range=True)
+                            return unfold(plus, transposed)
+                    else:
+                        # The realization is the magnetic little-group average the
+                        # store's policy authenticates; on the local branch it is
+                        # already inside ``unfold``.
+                        from gw.qgrid_symmetry import shared_pole_operator_realizer
+                        body = partial(
+                            _shared_pole_routed_synthesis, header=header, tables=tables,
+                            realize=shared_pole_operator_realizer(
+                                meta, header, q_full_idx=tables["rows"], mesh_xy=mesh_xy),
+                            mesh_xy=mesh_xy, gemm=gemm, layout=layout, weights_fn=weights_fn,
+                            active_range=True, hole=hole)
+                    kernels[hole] = jax.jit(body)
+                return dict(kernel=kernels[False], hole=kernels.get(True))
             kind = ("synthesis" if weights_fn is _shared_pole_weights
                     else "synthesis." + weights_fn.__name__)
-            kernel = _synthesis_program((static, kind, count, m, width), program)["kernel"]
-            panels.append(dict(span=(lo, hi), rows=np.asarray(tables["rows"], np.int32),
-                               kernel=kernel, route=route, static=static, count=count))
+            programs = _synthesis_program((static, kind, count, m, width, direct), program)
+            rows = np.asarray(tables["rows"], np.int32)
+            panels.append(dict(span=(lo, hi), rows=rows,
+                               hole_rows=(_shared_pole_hole_order(header, rows)[1]
+                                          if direct else None),
+                               kernel=programs["kernel"], hole=programs["hole"],
+                               route=route, static=static, count=count))
         schedule["native_gemm_workspace_bytes_per_rank"] = native_workspace
         from symmetry_maps import q_negation_index
         minus_q = np.asarray(q_negation_index(tuple(int(v) for v in header["grid"])))
+        # Every panel direct, or the full-q transpose after the sum.
+        direct_hole = all(p["hole"] is not None for p in panels)
         hole_kernel = shared_pole_hole_kernel(mesh_xy)
     _band_fence('tau.factor_read', sync_ranks=True)
     with timing.section('tau.factor_read'):
@@ -540,13 +596,16 @@ def _shared_pole_w_synthesis(io, meta, header, frequencies, schedule, *, mesh_xy
                              workspace_bytes_per_rank=0, concurrent_with=ambient)
             capacity.live_stages = (*ambient, f"{stage}.synthesis.resident")
 
-    spans = tuple((p["span"], p["rows"], p["kernel"],
+    spans = tuple((p["span"], p["rows"], p["kernel"], p["hole_rows"], p["hole"],
                    None if p["span"] == (0, nq) else p["route"]) for p in panels)
 
     def w_kernel(factors_by_panel, poles_by_panel, intervals, e_ref, t_node, hole):
         total = None
-        for ((lo, hi), rows, kernel, route), factors, poles2 in zip(
+        for ((lo, hi), rows, kernel, hole_rows, hole_program, route), factors, poles2 in zip(
                 spans, factors_by_panel, poles_by_panel):
+            if hole and direct_hole:
+                # The valence branch: each child's transpose, on the rows -c.
+                rows, kernel = hole_rows, hole_program
             ranges = intervals[lo:hi]
             if total is not None:
                 # One panel's temporaries at a time: the next panel's
@@ -584,7 +643,7 @@ def _shared_pole_w_synthesis(io, meta, header, frequencies, schedule, *, mesh_xy
                                     add, lambda acc: acc, acc)
             total = jax.lax.fori_loop(
                 0, n_chunks, chunk, _zeros(mesh_xy, (Q, m, m))() if total is None else total)
-        if hole:
+        if hole and not direct_hole:
             return hole_kernel(total, jnp.asarray(minus_q))
         return total
 
