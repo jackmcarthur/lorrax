@@ -244,6 +244,13 @@ handler's run-time scratch, a lookahead copy of the output. At or below the
 closed form, or within the room, the chunk runs unchanged. Above both, the
 slope is corrected from that one point, `per_unit = (compiled − fixed)/chunk`,
 the chunk solved directly, and compiled once more. There is no bisection; a second figure still over the room refuses.
+The direct stream's check compiles through the dispatch's own executable cache
+(`gw.response_bank._compiled`), so the checked executable is the one that runs.
+Reading a figure costs 0.01–0.07 s for the direct stream, 0.02–0.12 s for the
+Σ τ window per map, and 0.02–0.04 s once for the ζ batch (Fe 4³ and Fe 8³, P4).
+When the samples split into groups, the one-group executable that prices the
+temporaries is compiled once at map 0 and never runs (Fe 8³: 2.3 s cold,
+0.15 s warm).
 
 | stage | chunk | compiled figure available | what it misses (priced elsewhere) |
 |---|---|---|---|
