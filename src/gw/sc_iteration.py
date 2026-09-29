@@ -5775,13 +5775,48 @@ def _run_anderson(
             from jax.experimental import multihost_utils as _mhu
             _h_in = np.asarray(_mhu.process_allgather(H, tiled=True))
             _h_out = np.asarray(_mhu.process_allgather(state_out.H_qp_dft, tiled=True))
+            # FEDIAG: the diagonal Sigma_c(omega) this map built, in the input
+            # QP basis (collective extraction, every rank), and the shared-pole
+            # model's squared pole energies with per-pole strengths (rank 0).
+            _sr = state_out.outputs.sigma_result
+            _sig = np.zeros(0, np.complex128)
+            _omg = np.zeros(0)
+            _eev = np.zeros(0)
+            _efd = float("nan")
+            if _sr is not None and _sr.sigma_c_omega_kij_ry is not None:
+                from .qsgw_utils import extract_sigma_diag_replicated as _xd
+                _sig = np.asarray(_mhu.process_allgather(
+                    _xd(_sr.sigma_c_omega_kij_ry, inputs.mesh_xy), tiled=True),
+                    dtype=np.complex128) * RYD_TO_EV
+                if _sr.sigma_band_axis is not None:
+                    from runtime.padding import strip_axis as _strip
+                    _sig = np.asarray(_strip(_sig, _sr.sigma_band_axis, axis=-1))
+                _omg = np.asarray(_sr.omega_grid_ev, dtype=np.float64)
+                _eev = np.asarray(_sr.e_eval_ev, dtype=np.float64)
+                _efd = float(_sr.efermi_dft_ev)
             if jax.process_index() == 0:
                 os.makedirs(_fesc_dir, exist_ok=True)
+                _poles2 = _pstr = _kact = np.zeros(0)
+                try:
+                    _hd = state_out.outputs.screening.shared_pole
+                    import h5py as _h5
+                    with _h5.File(_hd["path"], "r") as _f:
+                        _poles2 = np.asarray(_f["poles2_ry2"][...])
+                        _fac = _f["factor"]
+                        _pstr = np.zeros(_poles2.shape)
+                        for _q in range(_fac.shape[0]):
+                            _pstr[_q] = np.sum(np.abs(np.asarray(_fac[_q])) ** 2, axis=(0, 1))
+                        _kact = np.asarray(_hd.get("K", []))
+                except Exception as _e:   # study dump only
+                    _record_sc(inputs, f"    FEDIAG pole dump skipped: {_e!r}")
                 np.savez(os.path.join(_fesc_dir, f"call{call_index:04d}.npz"),
                          H_in=_h_in, H_out=_h_out,
                          E_in=E_in, E_out=E_new, mu_ev=_mu,
                          z_id=(np.zeros(0) if _z is None else np.asarray(_z)),
-                         kstar_w=np.asarray(metric_k[:, 0, 0]) ** 2)
+                         kstar_w=np.asarray(metric_k[:, 0, 0]) ** 2,
+                         sigc_diag_ev=_sig, omega_ev=_omg, e_eval_ev=_eev,
+                         efermi_frame_ev=_efd, poles2_ry2=_poles2,
+                         pole_strength=_pstr, K_active=_kact)
         _iter_idx[0] += 1
         if call_index > 0:
             _floor_history.append(float(_spec))
