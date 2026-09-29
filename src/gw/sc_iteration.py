@@ -2657,8 +2657,6 @@ class SCSupport(NamedTuple):
     patch_event: str = ""                # plan | hold | extend
     joined: np.ndarray | None = None     # coarse-window samples + the near grid: what Sigma samples
     windows: tuple = ()                  # this map's coarse windows (lo, hi, eta, user), eV
-    far: np.ndarray | None = None        # far-conduction identities (read above the near grid)
-    far_patch: tuple | None = None       # the held far-conduction windows ((lo, hi, eta), ...), eV
 
 
 def _sc_coarse_identities(inputs, shape):
@@ -2680,25 +2678,6 @@ def _sc_coarse_identities(inputs, shape):
             else ks.select(inputs.e_dft_active_kn_ry))
     e_ev = np.asarray(e_ry, dtype=np.float64) * RYD_TO_EV
     return np.broadcast_to(e_ev < float(cut.coarse_floor_ev), shape)
-
-
-def _sc_far_identities(inputs, shape, mu_ev):
-    """Far-conduction identities on the loop k-set, a ``shape`` bool mask: every
-    state whose DFT energy lies above mu + band_partition.WINDOW_CLIP_EV (the
-    owner's error budget covers mu +- 10 eV).  The conduction-side mirror of
-    :func:`_sc_coarse_identities`, on the same route (scalar MPA/shared pole).
-    """
-    from .band_partition import WINDOW_CLIP_EV
-    from .qp_support import semicore_patch_route
-    cut = getattr(getattr(inputs, "meta", None), "qp_band_cut", None)
-    if (cut is None
-            or not semicore_patch_route(inputs.config.compute_mode, inputs.wfns_transverse)):
-        return np.zeros(shape, dtype=bool)
-    ks = _kstar(inputs)
-    e_ry = (inputs.e_dft_active_kn_ry if ks.is_identity
-            else ks.select(inputs.e_dft_active_kn_ry))
-    e_ev = np.asarray(e_ry, dtype=np.float64) * RYD_TO_EV
-    return np.broadcast_to(e_ev - float(mu_ev) > WINDOW_CLIP_EV, shape)
 
 
 def _sc_sampled_support(inputs, partition, energies_loop, mu_ev, active_n=None,
@@ -2743,10 +2722,8 @@ def _sc_sampled_support(inputs, partition, energies_loop, mu_ev, active_n=None,
     # quasiparticles move the support.
     everyone = requested_states(sigma, inputs.config.sc.frozen_core_bands,
                                 energy_relative_ev, required_kn, active_n)
-    # Coarse and far-conduction identities leave R; every other identity keeps
-    # main's W-active rule.
-    far = _sc_far_identities(inputs, energies_loop.shape, mu_ev) & ~semicore & everyone
-    everyone = everyone & ~semicore & ~far
+    # Coarse leaves R; every other identity keeps main's W-active rule.
+    everyone = everyone & ~semicore
     quasiparticle = (None if z_in_kn is None else
                      quasiparticle_mask(np.broadcast_to(z_in_kn, energies_loop.shape)))
     states = everyone if quasiparticle is None else everyone & quasiparticle
@@ -2779,26 +2756,10 @@ def _sc_sampled_support(inputs, partition, energies_loop, mu_ev, active_n=None,
         else:
             patch, patch_event = held, "hold"
         windows = coarse_windows_ev(near_lo, patch, users)
-    far_patch = None
-    if far.any():
-        from .qp_support import SEMICORE_PATCH_EDGE_EV, far_patch_escapes, far_patches_ev
-        near_hi = float(grid[-1])
-        held_far = None if session is None else session.get("far_patches_ev")
-        if plan is None or held_far is None:
-            far_patch, far_event = far_patches_ev(energy_relative_ev, far, near_hi), "plan"
-        elif far_patch_escapes(energy_relative_ev, far, near_hi, held_far).any():
-            far_patch, far_event = far_patches_ev(
-                energy_relative_ev, far, near_hi, previous=held_far), "extend"
-        else:
-            far_patch, far_event = held_far, "hold"
-        patch_event = patch_event if patch_event not in ("", "hold") else far_event
-        windows = tuple(windows) + tuple(
-            (max(float(lo), near_hi + SEMICORE_PATCH_EDGE_EV), float(hi), float(eta), False)
-            for lo, hi, eta in far_patch if float(hi) > near_hi + SEMICORE_PATCH_EDGE_EV)
     from .qp_support import joined_grid_ev
     return SCSupport(sampled_grid, grid, energy_relative_ev, states, event,
                      envelope, no_qp, semicore, patch, patch_event,
-                     joined_grid_ev(grid, windows), windows, far, far_patch)
+                     joined_grid_ev(grid, windows), windows)
 
 
 def _record_sc_window_plan(inputs, iteration, support):
@@ -3991,16 +3952,14 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
             session["window_plan"] = {
                 "event": event, "iteration": int(state.iteration)}
             session["semicore_patches_ev"] = sc_support.patch
-            session["far_patches_ev"] = sc_support.far_patch
         if sc_support.windows and sc_support.patch_event != "hold":
             _record_sc(inputs, f"    SC coarse windows ({sc_support.patch_event}, map "
                        f"{int(state.iteration)}): " + ", ".join(
                            f"[{w[0]:+.2f}, {w[1]:+.2f}]@{w[2]:g}{' user' if w[3] else ''}"
                            for w in sc_support.windows)
-                       + f" eV around the near grid [{expanded_grid[0]:+.2f}, "
+                       + f" eV below the near grid [{expanded_grid[0]:+.2f}, "
                        f"{expanded_grid[-1]:+.2f}] eV; {int(sc_support.semicore.sum())} "
-                       f"coarse and {int(0 if sc_support.far is None else sc_support.far.sum())} "
-                       "far-conduction (k,state) keep their full Sigma rows")
+                       "coarse (k,state) keep their full Sigma rows")
         sigma_config = replace(
             inputs.config, sc_omega_grid_ev=tuple(float(x) for x in sc_support.joined),
             sc_coarse_windows_ev=tuple(sc_support.windows) or None)

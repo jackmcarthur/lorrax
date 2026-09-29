@@ -283,53 +283,6 @@ def semicore_patches_ev(energy_rel_ev, semicore_kn, near_lo_ev, *, pad_ev=SUPPOR
     return tuple((lo, min(hi, top), float(SEMICORE_ETA_EV)) for lo, hi in merged if lo < top)
 
 
-#: Broadening (eV) of the far-conduction windows (owner 2026-09-29: "0.25 eV is
-#: still what i want for the majority of the valence bands, i just want to max
-#: out the broadening for the far away cond bands").  The conduction-side
-#: mirror of the semicore class: QP-matrix states above mu +
-#: band_partition.WINDOW_CLIP_EV (outside the owner's +-10 eV error budget)
-#: leave the near grid, whose crossing window's short side they set (Fe 4^3
-#: charge: +26 eV, 347 of 988 map pairs), and are read at their own energy on
-#: held windows above it, grouped by the node law (sigma_box_plan).
-FAR_ETA_EV = 3.0
-
-
-def far_patches_ev(energy_rel_ev, far_kn, near_hi_ev, *, pad_ev=SUPPORT_PAD_EV, previous=()):
-    """The held far-conduction windows above the near grid: ``((lo, hi, eta), ...)``.
-
-    The mirror of :func:`semicore_patches_ev`: each far energy above the near
-    grid padded by ``pad_ev``, touching intervals merged, snapped outward to
-    FAR_ETA_EV/2, joined with ``previous`` (a window only grows), and its
-    bottom kept SEMICORE_PATCH_EDGE_EV above ``near_hi_ev``.
-    """
-    e = np.asarray(energy_rel_ev, float)[np.asarray(far_kn, bool)]
-    e = np.sort(e[e > float(near_hi_ev)])
-    step, pad = 0.5 * FAR_ETA_EV, float(pad_ev)
-    spans = [_snap(x - pad, x + pad, step) for x in e] + [
-        (float(p[0]), float(p[1])) for p in (previous or ())]
-    merged = []
-    for lo, hi in sorted(spans):
-        if merged and lo <= merged[-1][1]:
-            merged[-1] = (merged[-1][0], max(merged[-1][1], hi))
-        else:
-            merged.append((lo, hi))
-    bottom = float(near_hi_ev) + SEMICORE_PATCH_EDGE_EV
-    return tuple((max(lo, bottom), hi, float(FAR_ETA_EV)) for lo, hi in merged if hi > bottom)
-
-
-def far_patch_escapes(energy_rel_ev, far_kn, near_hi_ev, patches):
-    """Far states above the near grid whose read support [E-h, E+h] leaves the
-    held far windows; a window bottom that abuts the near grid is open."""
-    e = np.asarray(energy_rel_ev, float)
-    h = read_halfwidth_ev()
-    above = np.asarray(far_kn, bool) & (e > float(near_hi_ev))
-    ok = np.zeros(e.shape, bool)
-    for lo, hi, _ in patches or ():
-        abuts = float(lo) <= float(near_hi_ev) + 2.0 * SEMICORE_PATCH_EDGE_EV
-        ok |= (e + h <= float(hi)) & ((e - h >= float(lo)) | (abuts & (e >= float(lo))))
-    return above & ~ok
-
-
 def _inside_any(e, windows):
     inside = np.zeros(np.shape(e), bool)
     for w in windows or ():
@@ -394,14 +347,11 @@ def window_grid_ev(window):
 
 
 def joined_grid_ev(near_grid_ev, windows):
-    """The sampled Sigma support, ascending: the coarse windows below the near
-    grid, the near grid, then the far-conduction windows above it."""
+    """The sampled Sigma support: every coarse window's samples, then the near grid."""
     near = np.asarray(near_grid_ev, dtype=np.float64)
     if not windows:
         return near
-    below = [window_grid_ev(w) for w in windows if float(w[1]) < near[0]]
-    above = [window_grid_ev(w) for w in sorted(windows) if float(w[0]) > near[-1]]
-    return np.concatenate(below + [near] + above)
+    return np.concatenate([window_grid_ev(w) for w in windows] + [near])
 
 
 def window_labels(omega_ev, windows, eta_ev):
