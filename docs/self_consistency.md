@@ -45,9 +45,16 @@ paid on map 0 (the one-shot plan) and map 1 (the held plan), and after that
 only for a window a state crosses (§4).
 
 The loop is driven by eqp0, which is Σ at the current energies. No Z-factor
-enters the iteration. Each map also writes the BerkeleyGW-shaped linearization
-$\mathrm{eqp1} = E_{\rm in} + Z\,(\mathrm{eqp0} - E_{\rm in})$, which equals
-eqp0 at a fixed point.
+enters the iteration.
+
+An SC run's `eqp0.dat` and `eqp1.dat` hold the SC eigenvalues: the accepted
+map's output $\mathrm{eigvalsh}\,F(H_{\rm in})$, with its tail scissor and
+semicore pin, sorted per k. Both files equal the body of that map's
+`eqp0_iterNNNN.dat` bit for bit; the header says so. No fixed-DFT-state
+diagonal and no Z-linearization reach them. The gap report reads the same
+array. `WFN_qp.h5`, `qp_wfn_rotations.h5` and `dipole_qsgw.h5` carry the
+accepted map's input QP states, the basis its Σ, W and head were built in;
+they agree with the eqp files to `sc_tol_ev` on the non-scissored states.
 
 With `sc_on_ibz = true` (the default), $H$, $E$, $U$, every retained k-indexed
 `SigmaResult` table and the density-SC Hartree components carry the star

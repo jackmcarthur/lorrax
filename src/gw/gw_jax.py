@@ -1042,7 +1042,7 @@ def _sigma_output_fields(
 
 def _diagonalize_qp_hamiltonian(
         band_slices, config, input_dir, kin_ion, mesh_xy, print0, qp_solver, sigma_total, wfn):
-    """Produce the QP eigensystem and initialize output timing."""
+    """Produce the one-shot QP eigensystem and initialize output timing."""
     from common import sanity
     sanity.refuse_nonfinite("kin_ion (from kin_ion.h5)", kin_ion,
                             print_fn=print0,
@@ -1067,7 +1067,7 @@ def _diagonalize_qp_hamiltonian(
                "so this is the last place a NaN spectrum can be stopped "
                "before eqp0/eqp1/WFN_qp.h5.")
     _t_out = time.perf_counter()
-    if config.debug.write_wfn_h5 and qp_solver is not QPSolver.SELF_CONSISTENT:
+    if config.debug.write_wfn_h5:
         write_qp_wfn_oneshot(
             U_full, E_full, wfn=wfn, band_slices=band_slices,
             input_dir=input_dir, qp_solver=qp_solver, mesh=mesh_xy,
@@ -1218,7 +1218,7 @@ def _assemble_gw_results(
         h_transverse_diag_ry=h_transverse_diag_ry,
         sig_x_diag_ry=sig_x_diag_ry,
         E_qp_ry=np.array(E_full),
-        U_qp=np.array(U_full),
+        U_qp=None if U_full is None else np.array(U_full),
         E_dft_ry=np.array(enk_dft),
         kin_ion_ry=np.array(kin_ion),
         band_start=band_slices.b0,
@@ -1322,7 +1322,7 @@ def _close_timing(_pre_main, _t_main, meta, print0):
 def _report_final_observables(
         E_full, band_slices, config, enk_dft, eqp2_result, head_sigma_split_skn_ry,
         q0_certificates, report, sig_x_diag_ry, sigma_c_at_dft_ev, sigma_c_odd_at_dft_ev,
-        sigma_lorentz_diag_skn_ry, sigma_result, sc_qp_energies_ry):
+        sigma_lorentz_diag_skn_ry, sigma_result):
     """Report the final Sigma coverage, sector summaries and QP gaps."""
     if sigma_lorentz_diag_skn_ry is not None:
         _labels = ("CC", "CT+TC", "TT")
@@ -1385,7 +1385,7 @@ def _report_final_observables(
         sigma_result=sigma_result)
     report.qp_gap(
         band_slices=band_slices, e_dft_ry=enk_dft,
-        e_qp_ry=(E_full if sc_qp_energies_ry is None else sc_qp_energies_ry))
+        e_qp_ry=E_full)
     if eqp2_result is not None:
         report.eqp2_summary(
             band_slices=band_slices,
@@ -1596,9 +1596,14 @@ def _run_gw_stages(args, _t_main, _pre_main, opened):
 	    sigma_lorentz_skij_ry, sigma_omega_h5_path, sigma_total, sigma_xc_at_dft_ev) = _sigma_output_fields(
 	    config, enk_dft, final_static_head_terms, mesh_xy, qp_solver, sc_result, sigma_result,
 	    sigma_total)
-	(
-	    E_full, U_full, _t_out) = _diagonalize_qp_hamiltonian(
-	    band_slices, config, input_dir, kin_ion, mesh_xy, print0, qp_solver, sigma_total, wfn)
+	if sc_result is None:
+	    (
+	        E_full, U_full, _t_out) = _diagonalize_qp_hamiltonian(
+	        band_slices, config, input_dir, kin_ion, mesh_xy, print0, qp_solver, sigma_total, wfn)
+	else:
+	    # SC: the accepted map's spectrum (eqp0/eqp1.dat, WFN_qp and the
+	    # rotations are the SC driver's); no second, unpartitioned eigh.
+	    E_full, U_full, _t_out = sc_result.qp_energies_ry, None, time.perf_counter()
 	(
 	    h_transverse_diag_ry, head_sigma_split_skn_ry, omega_rel_ev, sig_coh_diag_ry,
 	    sig_h_diag_ry, sig_h_scalar_diag_ry, sig_sx_diag_ry, sigma_c_diag_at_dft_ry,
@@ -1624,8 +1629,7 @@ def _run_gw_stages(args, _t_main, _pre_main, opened):
 	_report_final_observables(
 	    E_full, band_slices, config, enk_dft, eqp2_result, head_sigma_split_skn_ry,
 	    q0_certificates, report, sig_x_diag_ry, sigma_c_at_dft_ev, sigma_c_odd_at_dft_ev,
-	    sigma_lorentz_diag_skn_ry, sigma_result,
-	    None if sc_result is None else sc_result.qp_energies_ry)
+	    sigma_lorentz_diag_skn_ry, sigma_result)
 	(
 	    _file_rows) = _report_file_rows(
 	    args, config, input_dir, report, sigma_omega_h5_path, tensors_filename,

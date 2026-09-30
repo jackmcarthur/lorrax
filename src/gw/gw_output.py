@@ -64,9 +64,11 @@ class GWResults:
         Bare exchange Σ_X (Ry).  Used as the "sigX" column in PPM mode
         and as a quality-of-fit check in COHSEX mode.
     E_qp_ry : np.ndarray, (nk, nb)
-        Quasiparticle eigenvalues from diagonalisation (Rydberg).
-    U_qp : np.ndarray, (nk, nb, nb)
-        Quasiparticle eigenvectors  U[k,m,n] = ⟨m_DFT|n_QP⟩.
+        Quasiparticle eigenvalues from diagonalisation (Rydberg); under SC
+        the accepted map's output spectrum.
+    U_qp : np.ndarray or None, (nk, nb, nb)
+        Quasiparticle eigenvectors  U[k,m,n] = ⟨m_DFT|n_QP⟩; None under SC,
+        whose rotations the SC driver writes.
     E_dft_ry : np.ndarray, (nk, nb)
         DFT reference eigenvalues (Rydberg).
     kin_ion_ry : np.ndarray, (nk, nb, nb)
@@ -97,7 +99,7 @@ class GWResults:
     sig_h: np.ndarray
     sig_x: np.ndarray
     E_qp_ry: np.ndarray
-    U_qp: np.ndarray
+    U_qp: np.ndarray | None
     E_dft_ry: np.ndarray
     kin_ion_ry: np.ndarray
     band_start: int
@@ -1417,12 +1419,12 @@ def write_results(
     Writes (always):
 
     1. ``sigma_diag.dat``  — LORRAX per-(k,n) Σ-decomposition diagnostic.
-    2. ``eqp0.dat``        — BGW-format zeroth-order QP energies.
+    2. ``eqp0.dat``        — BGW-format zeroth-order QP energies (one-shot).
     3. ``eqp1.dat``        — BGW-format Z-linearized QP energies (Z=1 in
-       static COHSEX, BGW central-difference Z in dynamic modes).  The
-       linearization is centred on the energies Σ was evaluated at
-       (``results.e_eval_ev``): E_DFT for one-shot — BGW's own case — and
-       the converged QP energies under self-consistency.
+       static COHSEX, BGW central-difference Z in dynamic modes), centred
+       on E_DFT (one-shot).  A self-consistent run's eqp pair is the SC
+       spectrum, written by ``sc_iteration._write_sc_result_eqp``; this
+       writer writes none for it.
     Conditional:
 
     4. ``eqp2.dat`` — fixed-Sigma eigenvalue-self-consistent QP energies,
@@ -1815,7 +1817,10 @@ def write_results(
             print_fn=print_fn,
         )
 
-    assembly.write(eqp0_path=eqp0_file, eqp1_path=eqp1_file)
+    # SC runs: the eqp pair is the accepted map's spectrum, already written
+    # by the SC driver; the diagonal assembly stays a sigma_diag/receipt fact.
+    if not results.self_consistent:
+        assembly.write(eqp0_path=eqp0_file, eqp1_path=eqp1_file)
 
     # ── eqp2.dat: fixed-Sigma eigenvalue self-consistency ─────────────────
     if results.E_eqp2_ry is not None:

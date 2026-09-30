@@ -595,7 +595,7 @@ class SCDriverResult:
 
     sigma_result_dft: SigmaResult
     sigma_total_dft: jax.Array
-    qp_energies_ry: np.ndarray  # accepted SC spectrum, same loop k set as Sigma
+    qp_energies_ry: np.ndarray  # accepted map's output = eqp0/eqp1.dat, loop k set
     rms_history_ev: list[float]
     rotations_written: bool
     static_head_terms_dft: object | None
@@ -652,6 +652,10 @@ class SCState:
     # map exists only after its tail feeds chi0/W, so the weights ride the
     # carry one map behind, like ``partition``; None (map 0) is unit weight.
     tail_z_kn: np.ndarray | None = None
+    # eigvalsh(F(H_in)) of the map this state closes, loop k-set, eV: the
+    # spectrum its eqp snapshot wrote.  Set on the returned final state only;
+    # the run's eqp0.dat/eqp1.dat are this array (``_write_sc_result_eqp``).
+    map_output_ev: np.ndarray | None = None
 
 
 def _sc_output_tables_on_loop_kset(
@@ -5178,6 +5182,85 @@ def _process_memory_receipt() -> str:
             f"{staged}")
 
 
+def _sc_loop_to_file_wedge(inputs: SCInputs, state_out: SCState):
+    """The loop k-set -> WFN file wedge, through the symmetry service."""
+    from ffi import _services
+    _services.ensure_on_path()
+    from symmetry_maps import (
+        reduce_full_bz_to_file_wedge, unfold_star_wedge_to_full_bz)
+
+    def to_file_wedge(a):
+        table = np.asarray(a)
+        if state_out.outputs.sigma_result.kset == SIGMA_KSET_STAR_WEDGE:
+            table = unfold_star_wedge_to_full_bz(inputs.sym, table)
+        return np.asarray(
+            reduce_full_bz_to_file_wedge(inputs.wfn.symmetry(), table),
+            dtype=np.float64)
+    return to_file_wedge
+
+
+def _sc_eqp_file_rows(inputs: SCInputs, state_out: SCState, e_output_kn_ev):
+    """``(k, E_DFT, E_QP)`` of an SC eqp table on the WFN file wedge, eV.
+
+    The one conversion behind every SC eqp file: the per-map snapshots and
+    the run's ``eqp0.dat``/``eqp1.dat``, so the final files are the accepted
+    snapshot's rows bit for bit.
+    """
+    from ffi import _services
+    _services.ensure_on_path()
+    from symmetry_maps import reduce_full_bz_to_file_wedge
+
+    def to_file_wedge(a):
+        return np.asarray(
+            reduce_full_bz_to_file_wedge(inputs.wfn.symmetry(), np.asarray(a)),
+            dtype=np.float64)
+
+    kpoints = to_file_wedge(
+        np.asarray(inputs.sym.unfolded_kpts, dtype=np.float64))
+    e_dft = to_file_wedge(
+        np.asarray(inputs.e_dft_active_kn_ry, dtype=np.float64) * RYD_TO_EV)
+    e_output = _sc_loop_to_file_wedge(inputs, state_out)(e_output_kn_ev)
+    return kpoints, e_dft, e_output
+
+
+def _write_sc_result_eqp(inputs: SCInputs, state_final: SCState, *,
+                         call_index: int, eqp_paths) -> None:
+    """Write an SC run's ``eqp0.dat`` and ``eqp1.dat``: the SC eigenvalues.
+
+    Both files hold the accepted map's output, ``eigvalsh(F(H_in))`` with
+    that map's tail scissor and semicore pin, which is the body of
+    ``eqp0_iter{call_index:04d}.dat`` bit for bit (same rows, same writer).
+    Band indices denote sorted eigenvalues, as in the snapshots.  There is
+    no Z-linearization: at the fixed point the map output is the root of
+    the QP equation.  Rank 0 writes; the arrays are replicated host data.
+    """
+    from common.collectives import process_rank
+    from .eqp_bgw import write_bgw_eqp
+
+    if process_rank() != 0:
+        return
+    if state_final.map_output_ev is None:
+        raise RuntimeError(
+            "GATE sc_result_eqp_missing_map_output: the accepted SC state "
+            "carries no map-output spectrum; the SC eqp files have no source")
+    kpoints, e_dft, e_qp = _sc_eqp_file_rows(
+        inputs, state_final, state_final.map_output_ev)
+    snapshot = f"eqp0_iter{int(call_index):04d}.dat"
+    comments = (
+        f"QSGW self-consistent eigenvalues: accepted SC map "
+        f"{int(call_index):04d}, eigvalsh(F(H_in)) with its tail scissor and "
+        f"semicore pin; body identical to {snapshot}",
+        "eqp body band indices denote sorted eigenvalues; eqp0 and eqp1 are "
+        "the same SC spectrum (no linearization at the fixed point)",
+    )
+    for path in eqp_paths:
+        write_bgw_eqp(path, kpoints, e_dft, e_qp,
+                      band_offset=int(inputs.band_slices.sigma.start),
+                      nspin=1, comments=comments)
+    _record_sc(inputs, f"  SC eqp files: {', '.join(eqp_paths)} "
+               f"(= {snapshot} body)")
+
+
 def _write_sc_eqp_snapshot(
     inputs: SCInputs,
     state_out: SCState,
@@ -5240,10 +5323,6 @@ def _write_sc_eqp_snapshot(
     symmetry service calls; nothing here holds an index table.
     """
     from common.collectives import process_rank
-    from ffi import _services
-    _services.ensure_on_path()
-    from symmetry_maps import (
-        reduce_full_bz_to_file_wedge, unfold_star_wedge_to_full_bz)
 
     from .eqp_bgw import write_bgw_eqp
 
@@ -5283,24 +5362,8 @@ def _write_sc_eqp_snapshot(
     if process_rank() != 0:
         return None
 
-    sym = inputs.sym
-
-    def _to_file_wedge(a):
-        return np.asarray(
-            reduce_full_bz_to_file_wedge(inputs.wfn.symmetry(), np.asarray(a)),
-            dtype=np.float64)
-
-    def _loop_to_file_wedge(a):
-        table = np.asarray(a)
-        if state_out.outputs.sigma_result.kset == SIGMA_KSET_STAR_WEDGE:
-            table = unfold_star_wedge_to_full_bz(sym, table)
-        return _to_file_wedge(table)
-
-    kpoints = _to_file_wedge(
-        np.asarray(sym.unfolded_kpts, dtype=np.float64))
-    e_dft = _to_file_wedge(
-        np.asarray(inputs.e_dft_active_kn_ry, dtype=np.float64) * RYD_TO_EV)
-    e_output = _loop_to_file_wedge(e_output)
+    _loop_to_file_wedge = _sc_loop_to_file_wedge(inputs, state_out)
+    kpoints, e_dft, e_output = _sc_eqp_file_rows(inputs, state_out, e_output)
 
     snapshot_partition = _partition_on_loop(
         _state_partition(state_out, inputs), inputs)
@@ -5541,7 +5604,8 @@ def run_self_consistency(
         verdict, state_new = _sc_identity_for_call(
             inputs, state_new, e_initial_ev, e_new_ev, {}, cutoff_ev=tol_ev,
             u_out=out_eig[1])
-        state_new = replace(state_new, convergence_verdict=verdict)
+        state_new = replace(state_new, convergence_verdict=verdict,
+                            map_output_ev=e_new_ev)
         _write_sc_eqp_snapshot(
             inputs, state_new, e_new_ev,
             call_index=0, role="one_shot", rms_ev=rms,
@@ -5704,7 +5768,8 @@ def _run_linear_mixing(
         out_eig = None
         _record_sc(inputs, f"    SC convergence: {verdict.summary()}")
         last_evaluated = replace(
-            last_evaluated, convergence_verdict=verdict)
+            last_evaluated, convergence_verdict=verdict,
+            map_output_ev=E_candidate_ev)
         if verdict.converged:
             state = last_evaluated
             break
@@ -6076,7 +6141,8 @@ def _run_anderson(
                         occupation_state=state_out.occupation_state,
                         head_surface_weight_kn=state_out.head_surface_weight_kn,
                         outputs=state_out.outputs,
-                        convergence_verdict=_verdict),
+                        convergence_verdict=_verdict,
+                        map_output_ev=E_new),
                 _verdict)
         return _to_entry(state_out.H_qp_dft - H)
 
@@ -6202,6 +6268,7 @@ def _run_anderson(
         head_surface_weight_kn=_head_surface_weight[0],
         outputs=_last_outputs[0],
         convergence_verdict=_last_verdict[0],
+        map_output_ev=_e_history[-1],
     )
     _maybe_dump_e_history(dump_dir, _e_history, print_fn)
     return state_final, rms_history
@@ -7049,7 +7116,7 @@ def run_sc_driver(
     # The small U/E artifact always represents the accepted SC Hamiltonian.
     # Gating it with the optional full-WFN write lets the generic writer
     # replace it with the unpartitioned post-Sigma eigensolve.
-    _, _, _, qp_energies_ry = dump_qp_wfn_artifacts(
+    dump_qp_wfn_artifacts(
         state_final, n_occ=int(meta.nelec), mesh_xy=mesh_xy,
         kstar=kstar_io, state_on_ibz=kstar is not None,
         wfn=wfn, sym=sym, band_slices=band_slices, kgrid=meta.kgrid,
@@ -7061,6 +7128,13 @@ def run_sc_driver(
         clamp_tol=float(config.occupation_clamp_tol),
     )
     rotations_written = True
+    # THE SC EIGENVALUES: the accepted map's output, as its eqp snapshot
+    # wrote them.  The driver's generic writer writes no eqp pair for SC, and
+    # the gap report reads this same array.
+    _write_sc_result_eqp(
+        inputs, state_final, call_index=max(len(rms_history) - 1, 0),
+        eqp_paths=(config.paths.eqp0_file, config.paths.eqp1_file))
+    qp_energies_ry = np.asarray(state_final.map_output_ev) / RYD_TO_EV
     sigma_omega_h5_path = dump_sigma_omega_h5_final(
         state_final, config=config, meta=meta, mesh_xy=mesh_xy,
         input_dir=input_dir, sym=sym,
