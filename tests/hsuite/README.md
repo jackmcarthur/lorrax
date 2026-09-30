@@ -32,6 +32,7 @@ converged physical reference.
 | kin_ion_bisp | `gw.kin_ion_io` | four-component kinetic-balance kinetic + ionic matrix elements |
 | dipole_bisp | `psp.get_dipole_mtxels` | the four-component dipole the direct head authenticates |
 | bisp_sc | `gw.gw_jax` | `bispinor_gw = full_shared_pole` through the SC driver, 2 maps: fresh charge + transverse ζ (both on the charge centroid set), ordered CC/CT/TC/TT sector poles, direct four-current Γ head, `sc_head_update = dft_velocity`, live four-current density; map 0 is the one-shot |
+| bse_bisp | `bse.bse_jax` | TDA Davidson after `bisp_sc` on the four-component restart: the final map's W0 = V + W_c,CC(0) (charge sector only) |
 
 All stages run in one Python process per rank (`chain.run_stage` calls each
 driver's `main` in sequence): one `jax.distributed` world, one FFI load, one

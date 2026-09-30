@@ -270,6 +270,14 @@ STAGES = (
     # the four-component route writes its own (over the scalar one).
     ("dipole_bisp", "psp.get_dipole_mtxels", ["-i", "bisp_sc.in"]),
     ("bisp_sc", "gw.gw_jax", ["-i", "bisp_sc.in"]),
+    # BSE after SP-full: the final map's W0 = V + Wc_CC(0) (charge sector
+    # only; CT/TC/TT are not stored), on the four-component restart.
+    ("bse_bisp", "bse.bse_jax",
+     ["-i", "bisp_sc.in", "--bse", "--lanczos", "--tda", "--solver", "davidson",
+      "--n-val", "1", "--n-cond", "2", "--n-occ", "1",
+      "--band-degeneracy", "off", "--max-lanczos-iter", "40",
+      "--n-eig", "2", "--block-size", "1", *_P,
+      "--report-file", "bse_bisp.out"]),
 )
 
 # What each stage leaves behind and how it is compared.
@@ -300,6 +308,7 @@ CHECKS = {
                 "h5": ["bsc_sigma.h5"],
                 "report_floats": ("bsc.out",
                                   r"SC iteration: call=\d+ .*?max\|dE\|=([0-9.e+-]+)")},
+    "bse_bisp": {"stdout_floats": r"^\s*S\d+\s+([0-9.+-]+)\s*$"},
 }
 
 

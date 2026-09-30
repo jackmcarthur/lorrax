@@ -450,6 +450,18 @@ def persist_w0_and_head(
         from .w_isdf import photon_charge_for_restart
         W_q, static_head_sample = photon_charge_for_restart(photon_response, meta)
         static_head_only = True
+    from .gw_config import uses_full_bispinor_shared_pole
+    if uses_full_bispinor_shared_pole(config) and iteration_head is None:
+        # The four-current bank injects its direct Γ head (W_h - V_h at
+        # each sample, response_bank's add_direct_gamma_field) into the q = 0
+        # body, so the CC sector's Wc(0) in this W0 already carries it.  The
+        # BSE loader adds whead once, so the stored whead is the bare head
+        # v_h (geometry only; no DFT screened head enters).
+        bare = head_resolver.at(0.0 + 0.0j)
+        from dataclasses import replace
+        static_head_sample = replace(
+            bare, wcoul0=bare.vc0, S_cart=None, source="sector_body_bare_head")
+        static_head_only = True
     is_sc = (
         getattr(config, "qp_solver", None) is not None
         and getattr(config.qp_solver, "value", config.qp_solver)
@@ -463,7 +475,7 @@ def persist_w0_and_head(
     requires_iteration_head = (
         is_sc and _head_correction != "off"
         and (_head_correction == "full" or _sc_head_update != "off"))
-    if requires_iteration_head and iteration_head is None:
+    if requires_iteration_head and iteration_head is None and static_head_sample is None:
         raise ValueError(
             "GATE persist_sc_requires_iteration_head: iteration_head got: "
             f"None for head_correction={_head_correction!r}, "
