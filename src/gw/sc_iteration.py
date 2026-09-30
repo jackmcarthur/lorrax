@@ -3836,6 +3836,9 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
                          HEAD_LINK_RTOL)
                         if forward_links is not None else None),
             velocity_kinetic_cart=getattr(pt, "velocity_kinetic_cart", None),
+            velocity_base_cart=(pt.velocity_dft_cart
+                                if isinstance(pt, InterbandCommutatorHeadData)
+                                else None),
         )
         velocity_kind = (
             "QSGW finite-link covariant velocity" if forward_links is not None

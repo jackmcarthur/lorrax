@@ -3709,6 +3709,7 @@ def build_iteration_head_response(
     nb_links: int | None = None,
     link_bound: tuple[float, float] | None = None,
     velocity_kinetic_cart=None,
+    velocity_base_cart=None,
 ) -> IterationHeadResponse:
     """Build current-basis direct head and, when requested, its wings.
 
@@ -3725,6 +3726,11 @@ def build_iteration_head_response(
     """
     v_dft_basis = jnp.asarray(velocity_dft_cart, dtype=jnp.complex128)
     base, correction, bound = v_dft_basis, None, None
+    if velocity_base_cart is not None:
+        # interband_commutator hands v + [DeltaH, W]: its Sigma term is the
+        # difference from the DFT velocity p + i[r, V_NL].
+        base = jnp.asarray(velocity_base_cart, dtype=jnp.complex128)
+        correction = v_dft_basis - base
     if forward_links is not None:
         if forward_neighbors is None:
             raise ValueError(
