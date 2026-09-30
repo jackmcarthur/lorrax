@@ -15,8 +15,7 @@ code; the register at the foot says which page owns what.
 | 5 | **Ledger as you go:** evidence path in every report; supersession recorded where the superseded result is indexed. | Hand-resolved ledger conflicts and orphaned workspaces | — |
 
 Rules 1 and 2 are complements: fan out across independent work, combine
-within one verification. The measurements behind them are in
-[`docs/warm_worker.md`](docs/warm_worker.md).
+within one verification.
 
 ## Measurement discipline
 

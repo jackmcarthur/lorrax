@@ -10,10 +10,10 @@ produce a `WFN.h5` ([Preparing inputs from DFT](preprocessing.md)).
 ## 1. Run the bundled fixture
 
 The fixture ships its own `WFN.h5`, pseudopotential and QE inputs. The chain
-copies it into a new directory and runs kmeans → kin_ion → dipole → GN-PPM
-one-shot → shared-pole QSGW (2 maps) → BSE → htransform → exciton bands →
-restarted COHSEX, GN-PPM SC and shared-pole export runs there,
-writing each driver's decks beside it:
+copies it into a new directory, runs every driver there (GW one-shot and 2-map
+QSGW, BSE, htransform, exciton bands; the stages are listed in
+[Contributing](contributing.md#the-test-suite)) and writes each driver's deck
+beside its outputs:
 
 ```bash
 cd /path/to/lorrax
@@ -43,17 +43,54 @@ The suite is the same chain at P4 on one node.
 
 ## Your first real calculation {#your-first-real-calculation}
 
-Given a `WFN.h5` in the run directory, the chain is three preprocessing steps
-and GW, each as its own launch (`srun … .venv/bin/python -u -m …`, or `lx run`):
+The run directory holds `WFN.h5` ([Preparing inputs from DFT](preprocessing.md)),
+the `*.upf` pseudopotentials of the DFT run, and one deck. The deck below is a
+complete static (COHSEX) one-shot; every key it omits takes its default.
+
+```ini
+[cohsex]
+wfn_file = WFN.h5
+centroids_file = centroids_frac_<n>.txt   ; written by step 1
+sys_dim = 3           ; 3 bulk, 2 slab (truncated Coulomb); required
+nval = 4              ; valence bands in the output window
+ncond = 8             ; conduction bands in the output window
+number_bands = 80     ; top of the chi0 and Sigma band sums, at most the WFN's
+compute_mode = cohsex
+```
+
+The chain is three preprocessing steps and GW, each as its own launch
+(`srun … .venv/bin/python -u -m …`, or `lx run`), all with the same deck:
 
 1. **Centroids:** `python3 -m centroid.kmeans_cli <N> --seed 42`. It reads
    `WFN.h5` from the working directory (there is no flag for another name),
    and writes `centroids_frac_<n>.txt`, where `n` is the count that survives
    deduplication and pruning, which can be below `N`. Set `centroids_file`
-   from its `Saved centroids to …` line.
-2. **Dipoles:** `python3 -m psp.get_dipole_mtxels -i cohsex.in` → `dipole.h5`.
-3. **Kinetic + ionic:** `python3 -m gw.kin_ion_io -i cohsex.in` → `kin_ion.h5`.
-4. **GW:** `python3 -m gw.gw_jax -i cohsex.in`.
+   from its `Saved centroids to …` line. Start at N = 10 × `number_bands`
+   ([how many](theory/isdf-exchange-accuracy.md)).
+2. **Dipoles:** `python3 -m psp.get_dipole_mtxels -i gw.in` → `dipole.h5`.
+3. **Kinetic + ionic:** `python3 -m gw.kin_ion_io -i gw.in` → `kin_ion.h5`.
+4. **GW:** `python3 -m gw.gw_jax -i gw.in`.
+
+The quasiparticle energies are in `eqp0.dat` and `eqp1.dat` (BerkeleyGW
+format, eV, irreducible wedge); `gwjax.out` is the run report. Every output
+file is listed in [drivers](drivers.md#gw-gwgw_jax). A `dipole.h5`,
+`kin_ion.h5` or restart bundle that does not match the deck or the WFN refuses
+by name; rerun the step that wrote it.
+
+From here:
+
+- **Production QSGW.** Change the deck to the keys of
+  [production QSGW](how-to/production-qsgw.md) (`compute_mode = mpa`,
+  `sigma_w_model = shared_pole`, `qp_solver = self_consistent`) and rerun
+  step 4. A metal also needs [the metal keys](how-to/metals.md).
+- **Bands.** `python3 -m bandstructure.htransform -i ht.in --qp-rotations
+  qp_wfn_rotations.h5` interpolates the QP bands along the deck's
+  `K_POINTS {crystal_b}` path. Its window rules (`nval` equal to the electron
+  count, guard bands) are in
+  [drivers](drivers.md#htransform-bandstructurehtransform).
+- **Excitons.** `python3 -m bse.bse_jax -i gw.in --lanczos --tda --bse` in
+  the GW run directory. It reads the restart bundle the GW run wrote ([drivers](drivers.md#bse-bsebse_jax),
+  [BSE](architecture/bse.md)).
 
 Take key defaults from the [input reference](input_reference.md#system) and do
 not copy routing or layout keys from older decks: the driver prints every

@@ -27,7 +27,7 @@ Part I — Overview & Getting Started (~7 pp)
 1. Introduction: 1.1 what LORRAX is · 1.2 capability matrix · 1.3 relation to other
    codes, ending with LORRAX-vs-legacy-BGW pros/cons · 1.4 units, notation, citing
 2. Installation: owned by `docs/installation/`; the manual has no chapter.
-3. Tutorial: 3.1 Si end-to-end · 3.2 same system GN-PPM · 3.3 2D+SOC teaser
+3. Tutorial: owned by `docs/quickstart.md` and `docs/preprocessing.md`; the manual has no chapter.
 
 Part II — Theory & Methods (~22 pp)
 4. GW in real space and real time: 4.1 objects (r,r′ disclaimer box) · 4.2 two-sums

@@ -89,8 +89,7 @@ head $S(\omega)$ of Σ and by the BSE head term ([theory](theory/physics.md)).
 Reads the deck (`wfn_file`, `nval`, `ncond`, `nband`, `bispinor`) and the
 `*.upf` files (deck directory, then `../qe/scf`, `../qe/nscf`). Writes
 `dipole.h5` (`file_io.dipole`): `dipole_cart` `(3, nk, nb, nb)`,
-`band_energies` `(nk, nb)` (readers derive $E_b - E_{b'}$; a file written
-before 2026-09-25 stores it as `deltaE`), and root provenance attributes (`prov_wfn_sha256` and its
+`band_energies` `(nk, nb)` (readers derive $E_b - E_{b'}$), and root provenance attributes (`prov_wfn_sha256` and its
 fingerprint scheme, `prov_{nval,ncond,nband,nb_written,wfn_file}`, the
 representation, V_NL and $q\to0$-operator schemes). `check_dipole_provenance`
 refuses a file whose WFN, band extent, representation or V_NL convention does

@@ -5,14 +5,12 @@ LORRAX does not do DFT. It starts from a converged plane-wave DFT solution expor
 by LORRAX's own preprocessing steps. This page is the step before
 [Quickstart](quickstart.md): how a crystal becomes a `WFN.h5`.
 
-!!! note "Provenance of this page"
+!!! note "Scope"
     The **LORRAX side** (what `WFN.h5` must contain, what reads it, what is available on
-    Perlmutter) was read off a real file and a real machine on 2026-08-06 and is marked
-    *verified* below. The **Quantum ESPRESSO side** (the `&system` and `&input_pw2bgw`
-    namelists) is transcribed from the manual draft `manual/03_tutorial/3.1_silicon_end_to_end.md`
-    and was **not executed in this pass** — no QE run was performed. Treat the namelists as
-    a starting point to check against your QE version's documentation, not as a certified
-    recipe.
+    Perlmutter) was read off a real file and a real machine and is marked *verified*
+    below. The **Quantum ESPRESSO namelists** of §2 are a starting point to check against
+    your QE version's documentation; the inputs of a run that was executed are
+    `tests/hsuite/fixture/{scf,nscf,pw2bgw}.in`.
 
 ## The chain
 
@@ -24,8 +22,7 @@ by LORRAX's own preprocessing steps. This page is the step before
 
 Then, from `WFN.h5`, LORRAX's own three preprocessing steps produce `centroids_frac_<N>.txt`,
 `dipole.h5` and `kin_ion.h5` — see
-[Quickstart → Your first real calculation](quickstart.md#your-first-real-calculation),
-**including the three defects in that chain you should know about before you run it.**
+[Quickstart → Your first real calculation](quickstart.md#your-first-real-calculation).
 A WFN with every band of the plane-wave basis comes from the QE `.save` through
 [`psp.run_dense_h`](how-to/complete-basis-wfn.md).
 
@@ -53,7 +50,7 @@ both are properties of the `pw2bgw` writer, not of the spec, which describes `tn
 writer and reader line references. If you are producing `WFN.h5` with anything other than
 `pw2bgw`, read that page first.
 
-## 2. Quantum ESPRESSO — *not executed in this pass*
+## 2. Quantum ESPRESSO
 
 SCF on a converged grid, then NSCF on the **unshifted GW k-grid** with the empty states and
 a tight `conv_thr` (1e-10). LORRAX's production path is noncollinear with spin-orbit
@@ -139,5 +136,3 @@ The consumption path and default filenames on the LORRAX side for these two file
 - [Quickstart](quickstart.md) — the bundled fixture, and the first real calculation
 - [Theory → Symmetry](theory/symmetry.md) — the `mtrx`/`tnp` conventions, authoritative
 - [Input reference](input_reference.md) — every deck key, generated from the parser
-- `manual/03_tutorial/3.1_silicon_end_to_end.md` — the fuller silicon walkthrough this page
-  draws on (repo only, a working draft with unfrozen numbers)

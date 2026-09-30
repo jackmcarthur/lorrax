@@ -2,7 +2,7 @@
 
 Runs LORRAX's device leg on a rented single-node GPU box — Vast.ai, RunPod,
 DataCrunch, Lambda, or any Ubuntu machine with an NVIDIA datacenter driver.
-Cloud twin of [`config/perlmutter/cuda13_module/`](../perlmutter/cuda13_module/):
+Cloud twin of [`config/perlmutter/module/`](../perlmutter/module/):
 same pins (JAX 0.9.1, cuSOLVERMp 0.9.1, CUDA 13), but where Perlmutter takes
 the toolchain from Lmod modules and NVHPC, here **everything is pip wheels**
 — `jax[cuda13]` pulls the entire CUDA 13 userspace *including nvcc*, and the
@@ -31,7 +31,7 @@ site-specific survives in the closure.
   closure; that failure mode was observed, then fixed, during bring-up.)
 * NOT yet verified: multi-GPU (this box has one), production GW decks, QE.
   First action on a real 4-GPU box:
-  `launch.sh -n 4 python -u config/perlmutter/cuda13_module/verify_runtime.py`.
+  `launch.sh -n 4 python -u config/perlmutter/module/verify_runtime.py`.
 
 ## Renting the box
 
@@ -53,7 +53,7 @@ git clone -b cloud/h100-cuda13-bootstrap https://github.com/jackmcarthur/lorrax
 cd lorrax
 bash config/cloud/setup_env.sh     # venv + CUDA13 wheels + parallel HDF5 (~10 min)
 bash config/cloud/build_ffi.sh     # liblorrax_ffi.so + full acceptance gates
-bash config/cloud/launch.sh -n 4 python -u config/perlmutter/cuda13_module/verify_runtime.py
+bash config/cloud/launch.sh -n 4 python -u config/perlmutter/module/verify_runtime.py
 bash config/cloud/launch.sh -n 4 python -u services/distrib_la/bench/cusolvermp_eigh_test.py -n 512 --grid 2 2
 ```
 

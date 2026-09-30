@@ -44,4 +44,5 @@ and its hash, as a developer path; it is not a production provider.
 
 - [Environment](../environment/overview.md): the runtime stack, JAX
   configuration and the startup block.
-- [Quickstart](../quickstart.md): the bundled COHSEX fixture, end to end.
+- [Quickstart](../quickstart.md): every driver on the bundled fixture, then
+  a first calculation on your own `WFN.h5`.

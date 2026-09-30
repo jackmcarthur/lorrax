@@ -14,7 +14,7 @@ Available as console commands: `gw_jax`, `lorrax-gw`, `lorrax-centroids` (= `cen
 
 ## Quick start
 
-[Try it](docs/index.md#try-it) runs the bundled COHSEX fixture, and the [Quickstart](docs/quickstart.md) walks through it. The native FFI pair is required at every process count ([Installation](docs/installation/index.md)).
+[Try it](docs/index.md#try-it) runs every driver on the bundled test fixture, and the [Quickstart](docs/quickstart.md) walks through it and through a first calculation on your own `WFN.h5`. The native FFI pair is required at every process count ([Installation](docs/installation/index.md)).
 
 Which runtime is the default on which machine: [runtime defaults](docs/installation/index.md#defaults). A NERSC Perlmutter clone for development is [installation/perlmutter.md](docs/installation/perlmutter.md) (`uv sync --extra cuda13`, two build scripts, `srun`). On Frontera this differs; see [`docs/environment/machines/frontera.md`](docs/environment/machines/frontera.md) and the working examples below.
 
@@ -45,6 +45,6 @@ Detailed physics, code architecture, and environment setup are in `docs/`:
 
 **Which page owns which fact** is stated once, in the register at the top of [`docs/index.md`](docs/index.md#register). Start there — every page below links back to it rather than restating its neighbours.
 
-The documentation site is built with mkdocs (`uv run --extra docs mkdocs serve`); developer notes, plans, and the frozen archive live under `docs/dev/` (outside the rendered site). The pre-push checklist is [`docs/contributing.md`](docs/contributing.md); users upgrading from origin/main should read [`UPGRADE_NOTES.md`](UPGRADE_NOTES.md).
+The documentation site is built with mkdocs (`uv run --extra docs mkdocs serve`); developer notes live under `docs/dev/` (outside the rendered site). The pre-push checklist is [`docs/contributing.md`](docs/contributing.md); users upgrading from origin/main should read [`UPGRADE_NOTES.md`](UPGRADE_NOTES.md).
 
 Contributors and coding agents working in this repository should also read [`AGENTS.md`](AGENTS.md) for the module map and coding standards.
