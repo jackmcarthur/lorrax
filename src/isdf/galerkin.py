@@ -36,7 +36,6 @@ from common.wfn_layout import band_sphere_spec
 from common.wfn_transforms import (
     FULL_BLOCH_TRANSFORM_SCHEME,
     gflat_to_rchunk_aot_memory,
-    load_centroids_band_chunked,
 )
 from distrib_la import plan as linalg_plan
 from runtime.padding import spec_divisor
@@ -2170,8 +2169,7 @@ def _basis_at_nodes_from_selected_chunks(
     """Sample resident full-Bloch pivots, then use the existing row solve.
 
     Only a bounded node panel participates in each collective; the selected
-    real-space chunks retain their all-P column placement throughout. The
-    old evaluator remains the small-reference owner for parity controls.
+    real-space chunks retain their all-P column placement throughout.
     """
     indices = np.asarray(centroid_indices, dtype=np.int64)
     grid = tuple(int(n) for n in fft_grid)
@@ -2225,35 +2223,6 @@ def _basis_at_nodes_from_selected_chunks(
         mesh=mesh_xy, rank=rank_carrier, nspinor=nspinor,
         r_carrier=n_nodes, row_layout=rows_layout)
     return solve(factor, rows)
-
-
-def _basis_at_nodes_from_selected_states(
-        *, psi_rmu, selected_states, factor, rank_carrier: int,
-        n_nodes: int, mesh_xy: Mesh):
-    """Evaluate ``B=L^-1 X`` at registered centroids in the same gauge."""
-    selected = np.asarray(selected_states, dtype=np.int64)
-    rank_phys = int(selected.size)
-    nspinor = int(psi_rmu.shape[2])
-    mu_carrier = int(psi_rmu.shape[3])
-    out_sharding = _fit(
-        mesh_xy, P(None, None, 'y'),
-        (int(rank_carrier), nspinor, int(n_nodes)),
-        "galerkin.basis_at_nodes(mu-axis)")
-    rep = NamedSharding(mesh_xy, P())
-    in_sharding = psi_rmu.sharding
-
-    @partial(
-        jax.jit, in_shardings=(in_sharding, rep),
-        out_shardings=out_sharding)
-    def _evaluate(psi, L):
-        flat = psi.reshape(-1, nspinor, mu_carrier)
-        rows = flat[jnp.asarray(selected)]
-        if int(rank_carrier) > rank_phys:
-            rows = jnp.pad(
-                rows, ((0, int(rank_carrier) - rank_phys), (0, 0), (0, 0)))
-        return _solve_selected_basis_rows(L, rows)[..., :int(n_nodes)]
-
-    return _evaluate(psi_rmu, factor)
 
 
 @dataclass(frozen=True)
