@@ -4703,6 +4703,16 @@ def _refuse_empty_map_output(e_output_kn_ev: np.ndarray, *,
             f"downstream residual reads zero, i.e. FALSE converged.")
 
 
+def _record_sc_verdict(inputs, verdict):
+    """Log a map's verdict and hand its max|dE| to the held W line sites,
+    which move only past the iterate's own error (shared_pole_recipe
+    LINE_SITE_HOLD_EV)."""
+    _record_sc(inputs, f"    SC convergence: {verdict.summary()}")
+    if inputs.fixed_quadrature_session is not None:
+        inputs.fixed_quadrature_session.setdefault(
+            "shared_pole_supports", {})["sc_residual_ev"] = float(verdict.max_abs_ev)
+
+
 def _record_shared_pole_replans(inputs, iteration, recipe):
     """One SC log line per held W sampling object re-planned on this map
     (``shared_pole_recipe``: line sites past LINE_SITE_HOLD_EV, a sector
@@ -5660,7 +5670,7 @@ def run_self_consistency(
             map_gain=None,
             output_eigensystem=out_eig,
         )
-        _record_sc(inputs, f"    SC convergence: {verdict.summary()}")
+        _record_sc_verdict(inputs, verdict)
         return state_new, []
 
     if accelerator == "anderson":
@@ -5807,7 +5817,7 @@ def _run_linear_mixing(
             output_eigensystem=out_eig,
         )
         out_eig = None
-        _record_sc(inputs, f"    SC convergence: {verdict.summary()}")
+        _record_sc_verdict(inputs, verdict)
         last_evaluated = replace(
             last_evaluated, convergence_verdict=verdict,
             map_output_ev=E_candidate_ev)
@@ -6146,7 +6156,7 @@ def _run_anderson(
             output_eigensystem=_out_eig,
         )
         _out_eig = None
-        _record_sc(inputs, f"    SC convergence: {_verdict.summary()}")
+        _record_sc_verdict(inputs, _verdict)
         # LABEL-FREE MATRIX RESIDUAL.  The per-k spectral norm bounds every
         # sorted-eigenvalue residual (Weyl) and also sees eigenvector
         # (off-diagonal) error, so identity relabelling of hybridized pairs
