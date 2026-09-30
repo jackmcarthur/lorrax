@@ -34,22 +34,20 @@ c_i(A) = a_i \sum_{\mathbf k} w_{\mathbf k}\,
 \big(E_{A\mathbf k} - E_i + \Omega\big)^{-\beta},
 $$
 
-with one (β, Ω) for the run and one amplitude a_i per state. A high band is a
+with β = 3, one Ω for the run and one amplitude a_i per state. A high band is a
 plane wave of energy E. Its matrix element and W^c each fall as 1/E and the
 denominator of the empty-branch remainder as 1/(E + Ω − E_i), so the leading
 exponent is β = 3 with a state-independent amplitude, and the state enters
-through E_i in the denominator. The search ranges are physical bounds:
-β ∈ [2, 8] (above 3/2 the tail is summable on the E ∝ n^{2/3} ladder; 8 is
-twice the first state-dependent exponent) in steps of 0.25, and
-Ω ∈ [0, 40] eV (a pole energy; twice a solid's valence plasmon) in steps of
-2 eV.
+through E_i in the denominator. β is fixed at 3 and only Ω is searched,
+on Ω ∈ [0, 40] eV (a pole energy; twice a solid's valence plasmon) in steps
+of 2 eV.
 
 With $G_i(l,h) = \sum_{l<A\le h}\sum_{\mathbf k} w_{\mathbf k}
 (E_{A\mathbf k}-E_i+\Omega)^{-\beta}$:
 
-1. For each grid point, $a_i = (S_3 - S_1)/G_i(N_1,N_3)$ and the model predicts
+1. For each Ω on the grid, $a_i = (S_3 - S_1)/G_i(N_1,N_3)$ and the model predicts
    $\hat S_{2,i} = S_1 + a_i G_i(N_1,N_2)$.
-2. The grid point minimising $\sum_i (\hat S_{2,i} - S_{2,i})^2$ over the
+2. The Ω minimising $\sum_i (\hat S_{2,i} - S_{2,i})^2$ over the
    pooled states wins.
 3. $\hat S_i = S(N_3) + \big(S(N_3)-S(N_1)\big)\,G_i(N_3,N_T)/G_i(N_1,N_3)$.
 
@@ -71,6 +69,19 @@ keeps S(N₃); the log names it.
 A β solved per state from the ratio of the two top shell increments reads
 band texture on narrow top shells and amplifies it. Pooling fixes the shape from every requested state
 and leaves each state one amplitude, which the widest shell determines.
+
+## Why β is fixed
+
+Until 2026-09-30, β was also searched, on [2, 8] in steps of 0.25. With W
+converged in its own bands the free fit landed on β = 3. With W truncated at
+the same N it drifted to 4.25–5.25, because it was absorbing part of W's own
+truncation. In a self-consistent run it also toggled between grid points from
+one map to the next. A 28-band Si QSGW run with extrapolation stalled at
+10.7 meV that way, while the same run at β = 3 converged in 8 maps. Measured
+with β = 3 (sandbox EXTRAPSTAB, claim 2984): Si scalar 4³, χ₀ and G at 78
+bands, against 536, std / gap error 20.5 / −69 → 16.7 / −53 meV; Si SOC 4³,
+the gap change from 100 to 116 bands +29.5 → +24.9 meV (eqp0) and +21.9 →
++18.9 meV (eqp1).
 
 ## Cost
 
@@ -117,13 +128,8 @@ The pooled form's std moves by at most
 2.7 meV (case a) and 3.6 meV (case c) across the placements measured at 78
 bands.
 
-The fitted Ω sits at 36–38 eV, near its 40 eV bound, on 5 of the 6 distinct
-placements at 78 bands (the exception is (34, 50, 78), case a, Ω = 12 eV).
-The residual is flat along a ridge in (β, Ω). With the bound at 80 eV the
-fit moves along it (Ω 44–80 eV, β up to 6.75) and the scores change by
-−1.3 to +2.2 meV std at 78 bands, mostly for the worse (default cuts: 9.2 →
-9.3 meV in case a, 20.5 → 21.9 meV in case c); at 34 and 50 bands by 0 to
-+3.5 meV. The 40 eV bound is kept. The gap error (−19 to +19 meV at
-78 bands, case a) is not controlled by the fit. One material: Si. At 34 and 50
+The measurements in this section used the free (β, Ω) fit. The fixed-β
+numbers at 78 bands are in [Why β is fixed](#why-β-is-fixed). The gap error
+(−19 to +19 meV at 78 bands, case a) is not controlled by the fit. One material: Si. At 34 and 50
 bands the default cuts fall inside multiplets on this spectrum and were not
 among the stored samples.
