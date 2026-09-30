@@ -145,7 +145,9 @@ energies, so it takes these dipoles at the same diagonal approximation.
 **b3 counts bands** (owner 2026-09-29: "b3 will count bands as on main yes,
 and only bands between b0 and b3 will be rotated amongst each other"). b3 =
 nelec + `ncond` (`number_bands_protected` resolves to the same count); only
-[b0, b3) rotates, and the ζ fit is untouched. A `zeta_nband` below b3
+[b0, b3) rotates, and the ζ fit is untouched. b3 is a convergence
+parameter; its measured error is in
+[production QSGW](how-to/production-qsgw.md#error-budget). A `zeta_nband` below b3
 refuses on every route (`GATE qp_matrix_zeta_left`): a state outside the
 fit's left range would carry Σ on unfitted pairs. The classes below change
 only where each QP-matrix state's $\Sigma_c(\omega)$ is read
@@ -593,7 +595,7 @@ of that object ([QSGW dipoles](#interband-commutator-head)).
 
 | status on a metal | what | where |
 |---|---|---|
-| default | `sc_head_update = off`: the fixed DFT response on the DFT fixed-N Fermi-Dirac state, with the tetrahedron Drude term and the Thomas–Fermi static slot | `qsgw_head.build_dft_head_response`, `sc_iteration._fixed_dft_head_occupation_state` |
+| unnamed with neither `parallel_transport_file` nor `dipole.h5`, or named | `sc_head_update = off`: the fixed DFT response on the DFT fixed-N Fermi-Dirac state, with the tetrahedron Drude term and the Thomas–Fermi static slot | `qsgw_head.build_dft_head_response`, `sc_iteration._fixed_dft_head_occupation_state` |
 | admitted: shared-pole, `head_correction = no_local_fields`, or `full` on a scalar deck | `dft_velocity`: the `dipole.h5` velocity rotated into each map's QP basis, the current fixed-N μ and tetrahedron weights; the dynamic Drude tensor at $\omega \ne 0$, Thomas–Fermi at $\omega = 0$; `full` folds it through intraband wings and the static Γ body | `qsgw_head.qp_velocity`, `qsgw_head.build_iteration_head_response`, `sc_iteration._solve_head_occupations`, `gw_config.uses_metal_direct_drude_head` |
 | admitted: shared-pole scalar deck, `no_local_fields` or `full` | `parallel_transport`: the same head on $U^\dagger(v_{DFT} + D_k\Delta H)U$, where the finite-link covariant derivative of this map's $\Delta H$ is $i[\Delta H, r]$, so the Drude term sees the QP Fermi velocity. The default when `parallel_transport_file` exists and `sc_head_update` is not named (without it: `dft_velocity` from `dipole.h5`, else `off`). The links run on an outer band set (`get_dipole_mtxels --parallel-transport-bands`, default every WFN band); $D_k\Delta H$ is taken there, with the diagonal scissor tail continued past the head, and restricted to the head's bands, so `GATE pt_head_window_hybridized` judges the outer edge (the outer link's top head-count singular values). Only $D_k\Delta H$ goes through the links, so each map logs rel_err(links) × ‖$D_k\Delta H$‖/‖$v_{DFT}$‖ on the elements the head reads (transitions, Fermi-surface diagonal); Fe 4³ 3.9e-3, Si 4³ 6.2e-3 at their fixed points. The head stays `parallel_transport` for the whole run: on a map whose links cannot serve the Σ term (links incomplete, the stencil or window-hybridization gate fails, or the bound exceeds 1 %) $D_k\Delta H = 0$, the head runs on $U^\dagger v_{DFT} U$, the map logs one line with its reason and bound, and the next map checks again; there is no refusal and no other mode, and the run ends with the count of zeroed maps (`qsgw_head.sigma_term_zeroed`). Each map writes one block to the record: each term's (p, V_NL, Σ) contribution to $\omega_p^2$ (metals) or share of $S_{aa}(0)$ (insulators), the total, the link bound and the band gap | `qsgw_head.qp_velocity`, `qsgw_head.build_iteration_head_response`, `qsgw_head.covariant_link_derivative`, `gw_config._apply_input_envelope` |
 | refused (`GATE metal_sc_head_update_disabled`) | `parallel_transport` on a bispinor deck; `dft_velocity` with `full` on a bispinor deck | `gw_config.validate_material_inputs` |

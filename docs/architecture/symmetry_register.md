@@ -346,8 +346,9 @@ on the [service page](../services/symmetry_maps.md#directed-band-matrix-edges).
 The table exists only when every operation maps an elementary mesh step to ±
 an elementary step (`file_io.parallel_transport.link_symmetry_reduction_applies`).
 That holds for simple-cubic, tetragonal and orthorhombic primitive cells and
-fails for bcc and fcc primitive cells, whose links are streamed on the full
-grid.
+fails for bcc and fcc primitive cells. The table also cannot complete when a k
+is represented through time reversal (k₁ = −k₂, e.g. MoS2 3×3×1). In both
+cases the links are streamed on the full grid, chosen once at dipole time.
 
 ## 9. What each file stores
 

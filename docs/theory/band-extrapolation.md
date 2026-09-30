@@ -21,7 +21,11 @@ is a correctness rule ([decisions](../architecture/decisions.md)).
 The Green's-function band sum is cut into three disjoint brackets at
 N₁ < N₂ < N₃ = `number_bands_sigma`. Each bracket is contracted against the
 same W(τ), so the cumulative sums S(N₁), S(N₂), S(N₃) come from one Σ pass.
-W, the ISDF basis, the quadrature and the evaluation energy (E_DFT) are shared.
+W, the ISDF basis, the quadrature and the evaluation energy are shared. The
+evaluation energy is the energy each state's Σ row is read at: E_DFT in a
+one-shot and at SC map 0, the map's read energies from map 1 on (semicore
+rows at their DFT label). The fit is redone on every SC map, and a multiplet
+that reorders against DFT keeps one tail ratio, so Σ stays symmetric.
 Default cuts: 70 %, 85 % and 100 % of the total Σ band count, moved to the
 nearest degeneracy-clean boundary (`band_extrapolation_bracket_scheme`).
 
@@ -80,7 +84,8 @@ converged in its own bands the free fit landed on β = 3. With W truncated at
 the same N it drifted to 4.25–5.25, because it was absorbing part of W's own
 truncation. In a self-consistent run it also toggled between grid points from
 one map to the next. A 28-band Si QSGW run with extrapolation stalled at
-10.7 meV that way, while the same run at β = 3 converged in 8 maps. Measured
+10.7 meV that way, while the same run at β = 3 converged in 8 maps, and in 7
+with the Ω bound above. Measured
 with β = 3 (sandbox EXTRAPSTAB, claim 2984): Si scalar 4³, χ₀ and G at 78
 bands, against 536, std / gap error 20.5 / −69 → 16.7 / −53 meV; Si SOC 4³,
 the gap change from 100 to 116 bands +29.5 → +24.9 meV (eqp0) and +21.9 →

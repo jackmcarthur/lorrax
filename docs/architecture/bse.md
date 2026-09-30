@@ -242,6 +242,7 @@ Keys, supported modes and refusals: [input reference](../input_reference.md).
 | `GATE bse_static_w_sc_state` | the same | a QSGW deck without final-map W0: the parent WFN is the DFT state |
 | `GATE bse_static_w_provenance` | the same | the bundle has no WFN/centroid receipt |
 | `GATE bse_static_w_head_vector` | `bse_loading.load_bse_data_from_restart_sharded` | a rebuild on a bundle without `G0_mu_nu` |
+| `GATE dipole_basis` | `file_io.dipole.require_dipole_basis` | a dipole whose `basis` stamp (`dft` or `qp`; an unstamped file reads `dft`) differs from the basis of the WFN's ψ, e.g. `dipole_qsgw.h5` with a DFT WFN |
 | `BseWindowOutsideZetaTrainingError` | `bse_window.assert_bse_window_in_zeta_training` | a window band outside the ζ fit legs |
 | band-window degeneracy | `common.band_degeneracy.resolve_band_window` | a window edge inside a multiplet under `--band-degeneracy strict` |
 | route-ignored flag | `bse_jax.parse_args` | a flag set on a route that does not read it; a retired flag |
