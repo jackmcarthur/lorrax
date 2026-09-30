@@ -111,73 +111,93 @@ def _w_contraction(mesh_xy, grid, nk, mc, nt_n, kcarrier, layout, weights_fn):
 
 
 def sector_tau_factory(left, right, keys, meta, mesh_xy):
-    """Bind Gamma_A G_AB(t) Gamma_B to the window executor.
+    """Stream exact Dirac quarters and Lorentz components through mode7.
 
-    G[k,mu_X,s,nu_Y,s'] has rectangular centroid endpoints. The at-most-nine
-    Lorentz blocks share one transform of the raw-parent Green in the
-    four-current door (``gw.cohsex_sigma.make_lorentz_convolution``). Only
-    the small projected band operator survives the call.
+    Fixed monomial vertices act on projector faces, so each convolution
+    carries two spinors and one scalar W_AB, including the mixed sectors.
+    The native typed load owns quarter parity and antiunitary partners.
+    No full four-spinor Sigma or 3x3 Lorentz interaction is constructed.
     """
-    from distrib_la import gemm_plan, panel_matmul
+    from distrib_la import panel_matmul
     from common.contract_bands import contract_bands_block_reshard
+    from common.gamma_matrices import gamma_projector_half
+    from common.fft_helpers import make_kconv_klead_unfold, make_kfft_klead
     from gw.greens_function_kernel import (build_G_parents, _weighted_tau_phases,
-                                           green_panel_bytes)
-    from gw.cohsex_sigma import make_lorentz_convolution
+                                           green_panel_bytes, sigma_row_blocks)
+    from gw.cohsex_sigma import lorentz_class_vertices
 
     a, b = left.green_parent, right.green_parent
     plans = a.plan, b.plan
-    shapes = tuple((p.n_parent, c.psi_nmu.shape[1], p.n_centroid_packed, p.nspinor)
+    if a.layout != 'face' or b.layout != 'face' or any(p.nspinor != 4 for p in plans):
+        raise ValueError('GATE sector_sigma_stream: four-spinor all-P face operands required')
+    halves = tuple(p.dirac_halves()[0] for p in plans)
+    shapes = tuple((p.n_parent, c.psi_nmu.shape[1], p.n_centroid_packed, 2)
                    for c, p in zip((a, b), plans))
-    q=shapes[0][0];m=shapes[0][2]*shapes[0][3];n=shapes[1][2]*shapes[1][3];k=shapes[0][1]
-    # The face Green has a narrow band contraction. Its persistent ψ and G
-    # remain two-axis tiled; only a bounded contraction panel is gathered.
-    face_green = a.layout == 'face'
-    native=(0 if face_green else
-            _native_workspace(mesh_xy,(((q,m,k),(q,k,n)),)))
+    q, k, m, ns = shapes[0]
+    n = shapes[1][2]
+    if shapes[1][:2] != shapes[0][:2]:
+        raise ValueError('GATE sector_sigma_stream: parent/band extents differ')
+    lefts, rights = lorentz_class_vertices(keys)
+    grid = tuple(int(v) for v in meta.kgrid)
+    prep = make_kfft_klead(mesh_xy, grid, P(None, 'x', 'y'), kind='ifftn', norm='ortho')
+    doors = tuple(make_kconv_klead_unfold(mesh_xy, grid,
+        plans[0].dirac_quarter_load_tables(0, g, None if plans[1] is plans[0] else plans[1]),
+        store_rows=plans[0].parent_full_rows, norm='ortho',
+        mult=-1.0/np.sqrt(float(meta.nk_tot))) for g in (0, 1))
     ledger = meta.shared_pole_capacity
-    warm = 2*16*q*(m*k+k*n+m*n)//mesh_xy.size + native
-    # The face Green's SUMMA band panels (distrib_la.panel_matmul, two live, at
-    # most N_b/p_x bands each) are bounded by one parent Green tile when the
-    # ledger's room beside the warm workspace holds it, else by what the room
-    # holds (green_panel_bytes).
-    panel = (green_panel_bytes(n_rows=q, m=m, n=n, mesh=mesh_xy,
-                               room=ledger.room_bytes_per_rank(ledger.live_stages) - warm)
-             if face_green else 0)
-    ledger.reserve(f'sigma.sector.tau.warm.{keys[0]}',
-        resident_bytes_per_rank=0, workspace_bytes_per_rank=warm + panel,
-        concurrent_with=ledger.live_stages)
-    if face_green:
-        gemm = partial(panel_matmul, mesh=mesh_xy, panel_bytes=panel)
-    else:
-        gemm = gemm_plan(mesh_xy, m=m, k=k, n=n, nq=q,
-                         dtype=jnp.complex128, layout=a.layout)
-    convolve = make_lorentz_convolution(mesh_xy, meta.kgrid, meta.nk_tot, keys,
-                                        plans[0], plans[1])
+    # Both raw-parent quarters and their SUMMA faces; the W stage reserves
+    # its one scalar tile independently. The final window AOT owns admission.
+    warm = 2*16*q*(2*m*k+k*2*n+4*m*n)//mesh_xy.size
+    panel = green_panel_bytes(n_rows=q,m=2*m,n=2*n,mesh=mesh_xy,
+        room=ledger.room_bytes_per_rank(ledger.live_stages)-warm)
+    ledger.reserve(f'sigma.sector.tau.warm.{keys[0]}',resident_bytes_per_rank=0,
+        workspace_bytes_per_rank=warm+panel,concurrent_with=ledger.live_stages)
+    gemm = partial(panel_matmul, mesh=mesh_xy, panel_bytes=panel)
+    blocks = sigma_row_blocks(n_rmu=m, ns=2, d=1, mesh=mesh_xy)
 
     def factory(synthesis, band_axis):
-        project = contract_bands_block_reshard(mesh_xy, layout=a.layout,
-            face_shape=shapes[0], right_face_shape=shapes[1],
-            face_band_extent=band_axis.padded)
+        # The output x blocks keep even the quarter-spin Sigma bounded.
+        project = contract_bands_block_reshard(mesh_xy,layout='face',
+            face_shape=shapes[0],right_face_shape=shapes[1],
+            face_band_extent=band_axis.padded,row_block=blocks[0][1]*blocks[0][3])
         _, right_yr, _, right_proj, _, _ = parent_sigma_operands(right)
         right_proj = pad_to_axis(right_proj, band_axis, axis=3)
 
         def spatial(xn, yr, xr, yn, energies, weight, reference, time, interactions):
-            phases = _weighted_tau_phases(energies, 1j*time, e_ref=reference,
-                                         band_weight=weight)
-            green = build_G_parents(xn, yr, phases=phases, layout=a.layout,
-                                    gemm=gemm, k_unfold_plan=plans[0])
-            return project(xr, convolve(green, interactions), yn)
+            phases = _weighted_tau_phases(energies,1j*time,e_ref=reference,band_weight=weight)
+            band_shape=(q,band_axis.padded,band_axis.padded)
+            result=jnp.zeros(band_shape,jnp.complex128)
 
-        b=band_axis.padded
-        projector_shapes=(((q,b,m),(q,m,n)),((q,b,n),(q,n,b)))
-        native=_native_workspace(mesh_xy,projector_shapes if face_green
-            else (((q,m,k),(q,k,n)),*projector_shapes))
-        # Everything spatial() closes over is a function of this key; SC maps
-        # keep the parent plans, so their identities are stable.
-        key=(mesh_xy,a.layout,shapes,int(b),tuple(keys),tuple(int(v) for v in meta.kgrid),
+            def quarter(index,total):
+                h,g=index//2,index%2
+                xhalf=jax.lax.dynamic_slice_in_dim(xn,2*h,2,axis=1)
+                yhalf=jax.lax.dynamic_slice_in_dim(yr,2*g,2,axis=2)
+                green=build_G_parents(xhalf,yhalf,phases=phases,layout='face',
+                                      gemm=gemm,k_unfold_plan=halves[0])
+                # Both doors have the same typed two-spinor action; only the
+                # authenticated p^(h+g) endpoint sign differs.
+                def component(index,total):
+                    ia,ib=index//len(rights),index%len(rights)
+                    A=jnp.asarray(lefts)[ia];B=jnp.asarray(rights)[ib]
+                    faces=project.prepare(gamma_projector_half(xr,A,h,axis=2),
+                        gamma_projector_half(yn,B,g,axis=1))
+                    interaction=prep(interactions.component(ia,ib))
+                    partial_band=None
+                    for rows in blocks:
+                        calls=tuple(partial(door,green.G,green.transpose,interaction,
+                            conj_partner=green.conj_partner,rows=rows) for door in doors)
+                        operator=jax.lax.cond(h==g,calls[0],calls[1])
+                        partial_band=project.accumulate(faces,operator,rows=rows,acc=partial_band)
+                    return total+project.finish(partial_band)
+                return jax.lax.fori_loop(0,len(keys),component,total)
+            return jax.lax.fori_loop(0,4,quarter,result)
+
+        native=_native_workspace(mesh_xy,(((q,band_axis.padded,2*m),(q,2*m,2*n)),
+            ((q,band_axis.padded,2*n),(q,2*n,band_axis.padded))))
+        key=('quarter-stream',mesh_xy,shapes,int(band_axis.padded),tuple(keys),grid,
              int(meta.nk_tot),id(plans[0]),id(plans[1]))
-        return SynthesisTau(spatial, synthesis, right_yr, right_proj,
-                         native+synthesis.native, f'sigma.sector.tau.{keys[0]}', meta, key, plans)
+        return SynthesisTau(spatial,synthesis,right_yr,right_proj,
+            native+synthesis.native,f'sigma.sector.tau.{keys[0]}',meta,key,plans)
     return factory
 
 
@@ -204,6 +224,161 @@ def _endpoint_route(header, basis, sym, span, rows, mesh_xy, axis, width):
     return _endpoint_unfold(kwargs), cost
 
 
+class _SectorComponents:
+    """Trace-time recipe for one W_AB; no Lorentz-sized device buffer."""
+    def __init__(self, kernel, operands, ref, time, hole):
+        self.kernel,self.operands,self.ref,self.time,self.hole=kernel,operands,ref,time,hole
+
+    def component(self, left, right):
+        return self.kernel(*self.operands,self.ref,self.time,self.hole,left,right)
+
+
+def _sector_component_kernel(panels, mesh_xy, grid, nk, m, n, width, weights_fn):
+    """One scalar W_AB, from bounded parent-q and pole-column panels.
+
+    Endpoint routing retains every physical current component: the spatial
+    action may mix them. Selection of A/B follows that action, then GEMM.
+    Hole rows land at -q, conjugating faces but retaining causal weights.
+    """
+    from distrib_la import gemm_plan
+    from symmetry_maps import q_negation_index
+    from .sigma import _shared_pole_contract
+    programs=[]
+    minus=np.asarray(q_negation_index(grid),np.int32)
+    native=0
+    for item in panels:
+        span,rows,routes=item['span'],item['rows'],item['routes']
+        count=len(rows)
+        parent=np.asarray(item['parent'],np.int32)
+        gemm=gemm_plan(mesh_xy,m=m,n=n,k=width,nq=count,dtype=np.complex128,
+                       layout='face',enable_active_range=True,warmup=False)
+        native=max(native,_native_workspace(mesh_xy,(((count,m,width),(count,width,n)),)))
+        programs.append((span,rows,minus[rows],routes,parent,gemm))
+    face=NamedSharding(mesh_xy,P(None,'x','y'))
+
+    @partial(jax.jit,static_argnums=(6,))
+    def kernel(x,y,poles,intervals,ref,time,hole,A,B):
+        out=jnp.zeros((nk,m,n),jnp.complex128)
+        for span,rows,hole_rows,routes,parent,gemm in programs:
+            lo,hi=span
+            # One panel has all pole chunks; the loop slices one and routes
+            # it on all P, never replicating its contraction-column axis.
+            def column(chunk,out):
+                sx=jax.lax.dynamic_index_in_dim(x,chunk,axis=0,keepdims=False)[lo:hi]
+                sy=jax.lax.dynamic_index_in_dim(y,chunk,axis=0,keepdims=False)[lo:hi]
+                omega=jax.lax.dynamic_index_in_dim(poles,chunk,axis=0,keepdims=False)[lo:hi]
+                bounds=jnp.clip(intervals[lo:hi]-chunk*width,0,width)[parent]
+                omega=omega[parent]
+                bx=routes[0](sx);by=routes[1](sy)
+                # Dynamic selection only touches the unsharded component
+                # axis; its original face placement remains all-P.
+                bx=jax.lax.dynamic_slice_in_dim(bx,A,1,axis=2)
+                by=jax.lax.dynamic_slice_in_dim(by,B,1,axis=2)
+                if hole:bx=jnp.conj(bx);by=jnp.conj(by)
+                weights=weights_fn(omega,bounds,ref,time)
+                value=_shared_pole_contract(bx,by,weights,gemm=gemm,layout='face',intervals=bounds)
+                return out.at[jnp.asarray(hole_rows if hole else rows)].add(value)
+            out=jax.lax.fori_loop(0,x.shape[0],column,out)
+            out=jax.lax.optimization_barrier(out)
+        return jax.lax.with_sharding_constraint(out,face)
+    return kernel,native
+
+
+def _sector_stream_synthesis(readers,headers,bases,syms,layout,frequencies,meta,mesh_xy):
+    """All-P factor residency plus a bounded component synthesis schedule."""
+    from file_io.shared_pole_store import read_shared_pole_faces,face_width
+    from .sigma import _chunk_major,_shared_pole_weights
+    from .sigma_windows import shared_pole_intervals
+    if layout!='face':
+        raise ValueError('GATE sector_sigma_stream: endpoint factors must use all-P faces')
+    left,right=headers
+    for key in ('K','Kmax','q_irr_full_idx','identity'):
+        if left[key]!=right[key]:
+            raise ValueError('GATE shared_pole_sector_census: endpoint identities differ')
+    nc,nt=(int(h.get('factor_components',1)) for h in headers)
+    m,n=(int(b.n_packed) for b in bases)
+    nq,nk,kmax=int(left['n_q_irr']),int(left['n_q_full']),int(left['Kmax'])
+    grid=tuple(int(v) for v in left['grid'])
+    ledger=meta.shared_pole_capacity;ambient=ledger.live_stages
+    tag=f'{left.get("sector")}.{right.get("sector")}'
+    if not kmax:
+        zero=_zeros(mesh_xy,(nk,m,n))
+        return WSynthesis(lambda ref,time,hole:_SectorComponents(
+            lambda *_args:zero(),(),ref,time,hole),lambda *_args:(),lambda:(),
+            lambda _result=None:None,0,('sector-zero',mesh_xy,nk,m,n,nc,nt),ordered=True)
+    carrier=face_width(mesh_xy,kmax)
+    resident=16*nq*carrier*(m*nc+n*nt)//mesh_xy.size+8*nq*carrier
+    # The physical faces are read at their native two-axis placement and
+    # then split into chunk-major carriers. Count both generations at setup.
+    setup=f'sigma.sector.setup.{tag}';held=f'sigma.sector.resident.{tag}'
+    ledger.reserve(setup,resident_bytes_per_rank=2*resident,
+        workspace_bytes_per_rank=0,concurrent_with=ambient)
+    room=ledger.room_bytes_per_rank(ambient)-resident
+    tile=16*nk*m*n//mesh_xy.size
+    parent_map=np.asarray(left['qirr']['irr_idx_q'],np.int32)
+    divisor=max(int(mesh_xy.shape['x']),int(mesh_xy.shape['y']))
+    bcap=nq;width=carrier
+    while True:
+        panels=[];peak=0
+        for lo in range(0,nq,bcap):
+            hi=min(lo+bcap,nq)
+            rows=np.flatnonzero((parent_map>=lo)&(parent_map<hi)).astype(np.int32)
+            routes=[];costs=[]
+            for header,basis,sym,axis in zip(headers,bases,syms,('x','y')):
+                route,cost=_endpoint_route(header,basis,sym,(lo,hi),rows,mesh_xy,axis,width)
+                routes.append(route);costs.append(cost)
+            peak=max(peak,sum(c['estimated_live_bytes_per_rank'] for c in costs)
+                +16*len(rows)*m*n//mesh_xy.size)
+            panels.append(dict(span=(lo,hi),rows=rows,routes=tuple(routes),parent=parent_map[rows]-lo))
+        # The window owns compiled admission of W, raw-quarter Greens and
+        # projection. This search only bounds endpoint/GEMM staging beside
+        # its one scalar interaction and the raw-factor residents.
+        if 2*tile+peak<=room:break
+        if bcap>1:bcap=max(1,bcap//2)
+        elif width>divisor:width=max(divisor,((width//2+divisor-1)//divisor)*divisor)
+        else:
+            raise MemoryError(f'GATE shared_pole_capacity: scalar sector component minimum '
+                              f'{2*tile+peak} bytes exceeds room {room}')
+    n_chunks=-(-carrier//width)
+    # A final rounded chunk may have extra zero columns; read and split
+    # capacities include them in the retained residency.
+    resident=16*nq*n_chunks*width*(m*nc+n*nt)//mesh_xy.size+8*nq*n_chunks*width
+    ledger.reserve(setup,resident_bytes_per_rank=2*resident,
+        workspace_bytes_per_rank=0,concurrent_with=ambient)
+    ledger.live_stages=(*ambient,setup)
+    try:
+        lhs=read_shared_pole_faces(readers[0],(0,nq),meta=meta,header=left,basis=bases[0],orientations=('x',))
+        rhs=read_shared_pole_faces(readers[1],(0,nq),meta=meta,header=right,basis=bases[1],orientations=('y',))
+        if not bool(jnp.all(lhs[2]==rhs[2])):
+            raise ValueError('GATE shared_pole_sector_census: unequal pole values')
+        x=_chunk_major(mesh_xy,P(None,'x',None,'y'),n_chunks,width)(lhs[0])
+        y=_chunk_major(mesh_xy,P(None,'y',None,'x'),n_chunks,width)(rhs[1])
+        poles=_chunk_major(mesh_xy,P(),n_chunks,width)(lhs[2])
+        jax.block_until_ready((x,y,poles));del lhs,rhs
+        ledger.reserve(held,resident_bytes_per_rank=resident,workspace_bytes_per_rank=0,concurrent_with=ambient)
+        ledger.live_stages=(*ambient,held)
+        kernel,native=_sector_component_kernel(panels,mesh_xy,grid,nk,m,n,width,_shared_pole_weights)
+    except BaseException:
+        ledger.live_stages=ambient
+        raise
+    replicated=NamedSharding(mesh_xy,P())
+    def window_operands(space,indices,bounds):
+        intervals=shared_pole_intervals(frequencies,np.asarray(indices),np.asarray(bounds))
+        return x,y,poles,device_put_process_local(np.ascontiguousarray(intervals),replicated)
+    closed=False
+    def close(result=None):
+        nonlocal x,y,poles,closed
+        if closed:return
+        try:jax.block_until_ready(result if result is not None else (x,y,poles))
+        finally:
+            x=y=poles=None;ledger.live_stages=ambient;closed=True
+    def w_kernel(x,y,poles,intervals,ref,time,hole):
+        return _SectorComponents(kernel,(x,y,poles,intervals),ref,time,hole)
+    return WSynthesis(w_kernel,window_operands,lambda:(x,y,poles),close,native,
+        ('sector-components',mesh_xy,grid,nk,m,n,nc,nt,carrier,width,bcap,
+         tuple(_static_key((h,b.active_mask)) for h,b in zip(headers,bases))),ordered=True)
+
+
 def sector_synthesis(readers, headers, bases, syms, layout, frequencies, meta, mesh_xy,
                      *, weights_fn=None, stage='sigma'):
     """Retain full-q endpoint factors and form one W(t) tile per tau.
@@ -218,6 +393,8 @@ def sector_synthesis(readers, headers, bases, syms, layout, frequencies, meta, m
     :func:`sector_static_wc`, whose ledger stages ``stage`` prefixes.
     Occupied windows use conj(B_A(-q)) d(t) B_B(-q)^T; d is never conjugated.
     """
+    if stage=='sigma' and weights_fn is None:
+        return _sector_stream_synthesis(readers,headers,bases,syms,layout,frequencies,meta,mesh_xy)
     from file_io.shared_pole_store import read_shared_pole_faces
     from .sigma import _shared_pole_factor_specs, _shared_pole_weights
     from .sigma_windows import shared_pole_intervals
