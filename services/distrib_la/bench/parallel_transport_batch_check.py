@@ -28,11 +28,80 @@ parser.add_argument('--spinor-wfn', required=True)
 parser.add_argument('--perf-wfn')
 parser.add_argument('--perf-bands', type=int, default=225)
 parser.add_argument('--perf-only', action='store_true')
+parser.add_argument('--validation-price', action='store_true')
 args = parser.parse_args()
 
 
 def host(value):
     return np.asarray(gather_to_host(value))
+
+
+def validation_reduction_check(*, production_price=False):
+    from file_io.parallel_transport import (_block_scoped_metrics,
+                                            _block_scoped_reductions)
+    rng = np.random.default_rng(814)
+    shape = (3, 67, 12, 12)
+    exact = rng.normal(size=shape) + 1j*rng.normal(size=shape)
+    reconstructed = exact.copy()
+    reconstructed[:, :, :5, :5] += 1e-7
+    # The last, ragged panel and an unaligned band extent must both be read.
+    reconstructed[2, -1, 8, 8] += .2j
+    blocks = (1, 5, 9, 12)
+    atol, rtol = 1e-6, 1e-3
+    shard = NamedSharding(R.mesh, P(None, None, 'x', 'y'))
+    rd = device_put_process_local(reconstructed, shard)
+    ed = device_put_process_local(exact, shard)
+    got = _block_scoped_metrics(rd, ed, blocks, atol=atol, rtol=rtol)
+    max_error = 0.0
+    for m, row in zip(blocks, got):
+        error = np.abs(reconstructed[:, :, :m, :m]-exact[:, :, :m, :m])
+        magnitude = np.abs(exact[:, :, :m, :m])
+        diag = np.eye(m, dtype=bool)[None, None]
+        expected = dict(max_abs=error.max(),
+            max_abs_diagonal=np.where(diag, error, 0).max(),
+            max_abs_offdiagonal=np.where(~diag, error, 0).max(),
+            max_rel=(error/np.maximum(magnitude, atol)).max(),
+            passed=bool(np.all(error <= atol+rtol*magnitude)))
+        assert row['passed'] == expected['passed']
+        max_error = max(max_error, *(abs(row[k]-expected[k])
+                                    for k in expected if k != 'passed'))
+    assert max_error < 2e-15, max_error
+    assert [row['passed'] for row in got] == [True, True, False, False]
+    # Changing the tile must preserve all five reductions exactly.
+    tile_one = jax.device_get(_block_scoped_reductions(
+        rd, ed, blocks=blocks, atol=atol, rtol=rtol, q_tile=1))
+    tile_default = jax.device_get(_block_scoped_reductions(
+        rd, ed, blocks=blocks, atol=atol, rtol=rtol))
+    for a, b in zip(tile_one, tile_default):
+        assert np.array_equal(a, b)
+    receipt = dict(max_absolute_error=max_error, shape=list(shape),
+                   blocks=list(blocks), ragged_last_panel_detected=True,
+                   failed_controls=[not row['passed'] for row in got],
+                   tile_one_exact=True)
+    if production_price:
+        abstract = jax.ShapeDtypeStruct((3, 8000, 232, 232), jnp.complex128,
+                                       sharding=shard)
+        exe = _block_scoped_reductions.lower(abstract, abstract,
+            blocks=(18, 68, 92, 138, 184), atol=atol, rtol=rtol).compile()
+        mem = exe.memory_analysis()
+        assert mem.temp_size_in_bytes < 256*1024**2, mem
+        assert 'all-gather' not in exe.as_text()
+        # The previous eager owner retained both full real arrays before
+        # slicing each block. Price those actual executable outputs, rather
+        # than a fused legacy surrogate that eliminates their lifetime.
+        legacy_error = jax.jit(lambda a, b: jnp.abs(a-b)).lower(
+            abstract, abstract).compile().memory_analysis()
+        legacy_magnitude = jax.jit(lambda a: jnp.abs(a)).lower(
+            abstract).compile().memory_analysis()
+        retained = (legacy_error.output_size_in_bytes
+                    + legacy_magnitude.output_size_in_bytes)
+        assert retained > 16*mem.temp_size_in_bytes
+        receipt['production_shape'] = dict(shape=list(abstract.shape),
+            abstract_only=True, argument_bytes=mem.argument_size_in_bytes,
+            output_bytes=mem.output_size_in_bytes,
+            temporary_bytes=mem.temp_size_in_bytes, no_all_gather=True,
+            legacy_retained_error_magnitude_bytes=retained)
+    return receipt
 
 
 def raw_edges(wfn, nb, count, *, bispinor=False):
@@ -114,6 +183,12 @@ def main():
     out = Path(args.out)
     receipts = []
     with R.mesh:
+        if args.validation_price:
+            result = validation_reduction_check(production_price=True)
+            rank0_transaction(out/'validation.json', stage='PT validation reductions',
+                write=lambda:(out/'validation.json').write_text(json.dumps(result,indent=2)+'\n'))
+            print(json.dumps(result),flush=True)
+            return
         if args.perf_only:
             if not args.perf_wfn:
                 raise ValueError('--perf-only requires --perf-wfn')
@@ -204,7 +279,8 @@ def main():
             assert int(io.read_small('velocity_validation_complete',dtype=np.int32)) == 1
             assert int(io.read_small('links_symmetry_reduced',dtype=np.int32)) == 0
         row.update(kind='bcc_artifact',nk=int(meta.nk_tot),velocity_max_error=v_error,
-                   outer_bands=14,head_bands=13,authenticated=True)
+                   outer_bands=14,head_bands=13,authenticated=True,
+                   validation_reductions=validation_reduction_check())
         receipts.append(row)
 
         if args.perf_wfn:
