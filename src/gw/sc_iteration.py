@@ -3830,6 +3830,7 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
             link_bound=((float(pt.validation["link_relative_error"]),
                          float(pt.validation["rtol"]))
                         if forward_links is not None else None),
+            velocity_kinetic_cart=getattr(pt, "velocity_kinetic_cart", None),
         )
         velocity_kind = (
             "QSGW finite-link covariant velocity" if forward_links is not None
@@ -3868,6 +3869,9 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
             from .qsgw_head import metal_head_summary
             _record_sc(inputs, "    SC " + metal_head_summary(
                 iteration_head_response, entry_occ_state))
+        _record_head_block(inputs, int(state.iteration),
+                           iteration_head_response,
+                           np.asarray(jax.device_get(wfns_qp.enk[:, :nb_storage])))
 
     elif fixed_dft_full_head:
         # ``sc_head_update=off`` freezes the DFT direct response; it does not
@@ -4670,6 +4674,56 @@ def _record_shared_pole_replans(inputs, iteration, recipe):
         _record_sc(inputs, f"SC W treatment ceiling re-planned (map {iteration}): "
                    f"{ceiling['ceiling_ry']:.6f} Ry = 2 x current span "
                    f"{ceiling['current_response_span_ry']:.6f} Ry")
+
+
+def _record_head_block(inputs, iteration, response, energies_qp_kn_ry) -> None:
+    """The per-map head block: the p, V_NL and Sigma shares of the head velocity.
+
+    Metals print each term's contribution to omega_p^2 (eV^2, the diagonal
+    of the Drude tensor, Fermi-surface weights); insulators print each
+    term's share (%) of the static q->0 head S_aa(0).  Then the link bound
+    (``qsgw_head.link_correction_bound``) and the band gap (0.0 eV for a
+    metal).
+    """
+    from common import RYD_TO_EV
+
+    terms = response.velocity_terms
+    if terms is None:
+        return
+    names, shares, bound = terms
+    metal = response.drude_tensor is not None
+    if metal:
+        total = 8.0 * np.pi * np.real(np.diagonal(
+            np.asarray(response.drude_tensor))) * RYD_TO_EV ** 2
+        values, unit = shares * total[None], "eV^2"
+        what = "omega_p^2 by term (Fermi-surface Drude weight)"
+    else:
+        total = np.ones(3)
+        values, unit = 100.0 * shares, "%"
+        what = "share of the q->0 head S_aa(0) by term"
+    lines = [f"    SC head velocity, map {iteration}: {what}",
+             f"      {'term':<10}{'x':>12}{'y':>12}{'z':>12}  [{unit}]"]
+    for name, row in zip(names, values):
+        lines.append(f"      {name:<10}" + "".join(f"{v:12.4f}" for v in row))
+    tot = total if metal else 100.0 * shares.sum(axis=0)
+    lines.append(f"      {'total':<10}" + "".join(f"{v:12.4f}" for v in tot)
+                 + (("   omega_p = " + "/".join(
+                     f"{np.sqrt(max(v, 0.0)):.4f}" for v in total) + " eV")
+                    if metal else ""))
+    if bound is not None:
+        link_error, ratio, value, rtol = bound
+        lines.append(
+            f"      link bound: rel_err(links) {link_error:.3e} x "
+            f"|D_k dH|/|v_DFT| {ratio:.3e} = {value:.3e} (rtol {rtol:.1e})")
+    gap = 0.0
+    if not metal:
+        e = np.asarray(energies_qp_kn_ry, dtype=np.float64)
+        n_occ = int(np.count_nonzero(
+            np.asarray(response.sigma_occupations)[0] > 0.5))
+        gap = float(np.min(e[:, n_occ]) - np.max(e[:, n_occ - 1])) * RYD_TO_EV
+    lines.append(f"      band gap: {gap:.4f} eV" + (" (metal)" if metal else ""))
+    for line in lines:
+        _record_sc(inputs, line)
 
 
 def _record_sc(inputs: SCInputs, line: str) -> None:

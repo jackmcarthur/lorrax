@@ -44,6 +44,8 @@ SINGULAR_VALUES_DATASET = "singular_values_ibz"
 CONNECTION_REDUCED_DATASET = "berry_connection_reduced"
 CONNECTION_CART_DATASET = "berry_connection_cart"
 VELOCITY_DFT_DATASET = "velocity_dft_cart"
+#: ``p`` alone (no V_NL, no V_U), same layout; optional (newer artifacts).
+VELOCITY_KINETIC_DATASET = "velocity_kinetic_cart"
 HUBBARD_PROVENANCE_ATTR = "hubbard_provenance_utf8"
 #: ``(3, nk, nb, nb)`` band matrix of the reduced-coordinate position
 #: ``b_a . r`` on every COLLAPSED axis a (one mesh point; a vacuum direction),
@@ -420,6 +422,7 @@ def initialize_parallel_transport_artifact(
     hubbard_provenance: str | None = None,
     collapsed_position_kmajor=None,
     collapsed_axis_centers=None,
+    velocity_kinetic_kmajor=None,
 ) -> None:
     """Create the schema and write exact velocity before the WFN stream.
 
@@ -543,6 +546,17 @@ def initialize_parallel_transport_artifact(
                 "units": "WFN velocity convention",
                 "manifold": "bands [band_start, band_stop)",
             })
+        if velocity_kinetic_kmajor is not None:
+            io.create_dataset(
+                VELOCITY_KINETIC_DATASET, shape=(3, nk, nb, nb),
+                dtype=np.complex128,
+                attrs={
+                    "k_storage": "full_bz",
+                    "components": "Cartesian",
+                    "band_layout": "P(None,None,x,y)",
+                    "units": "WFN velocity convention",
+                    "operator": "p alone (no V_NL, no V_U)",
+                })
         if position is not None:
             # Only a grid with a collapsed axis carries the dataset; a 3D
             # artifact's schema is unchanged.
@@ -588,6 +602,10 @@ def initialize_parallel_transport_artifact(
             velocity_dir_major,
             NamedSharding(mesh, P(None, None, "x", "y")))
         io.write_slab(VELOCITY_DFT_DATASET, velocity_dir_major)
+        if velocity_kinetic_kmajor is not None:
+            io.write_slab(VELOCITY_KINETIC_DATASET, jax.lax.with_sharding_constraint(
+                jnp.moveaxis(velocity_kinetic_kmajor, 1, 0),
+                NamedSharding(mesh, P(None, None, "x", "y"))))
         if position is not None:
             position_dir_major = jax.lax.with_sharding_constraint(
                 jnp.moveaxis(position, 1, 0),
@@ -2032,7 +2050,8 @@ def collapsed_axis_position_operators(
 def publish_dft_velocity(path, velocity_kmajor, psi_G, *, wfn, sym, geom,
                          gtab_file, mesh, nbands, effective_nspinor, bispinor,
                          hubbard_provenance, wfn_path, vnl_velocity_sign,
-                         vnl_included, rcond, emit=print) -> None:
+                         vnl_included, rcond, emit=print,
+                         velocity_kinetic=None) -> None:
     """The artifact's velocity stage, from the producer's live sweep.
 
     The exact DFT velocity ``v = p + i[r, V_NL]`` stays sharded and is
@@ -2060,7 +2079,8 @@ def publish_dft_velocity(path, velocity_kmajor, psi_G, *, wfn, sym, geom,
             wfn_fingerprint=wfn_fingerprint(wfn),
             vnl_velocity_sign=vnl_velocity_sign, vnl_included=vnl_included,
             rcond=rcond, collapsed_position_kmajor=position,
-            collapsed_axis_centers=centers)
+            collapsed_axis_centers=centers,
+            velocity_kinetic_kmajor=velocity_kinetic)
 
 
 def complete_parallel_transport(path, *, wfn, sym, mesh, nbands, bispinor,
