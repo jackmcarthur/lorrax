@@ -63,7 +63,13 @@ shared_real_pole_v1_r3b = {
 # and version. Composite checks retain their individual dimensional thresholds.
 _GATE_ROWS = {
     "normalized_gram_keep": ("retain gamma/gamma_max strictly above cut", 1.0e-8),
-    "normalized_gram_validity": ("gamma_min/gamma_max >= threshold", -1.0e-7),
+    "normalized_gram_validity": ("gamma_min/gamma_max >= threshold; the ordered route, the sector CT round, the paired H_r and direct unit calls (the even parent Gram uses gram_rounding_validity)", -1.0e-7),
+    # The exact Gram is PSD, so a negative computed eigenvalue is rounding.
+    # Weyl: gamma_min >= -||E||_2 >= -gamma_n ||D^-1/2 Sigma D^-1/2||_F with
+    # Sigma the uncancelled magnitude of each divided-difference entry
+    # (shared_pole_reduction.gram_rounding_floor), plus R u gamma_max for the solver.
+    "gram_rounding_validity": ("equilibrated gamma_min >= -(bound_factor * gamma_n ||D^-1/2 Sigma D^-1/2||_F + R u gamma_max); gamma_n = n u/(1-n u), Sigma the uncancelled divided-difference magnitudes",
+                               {"bound_factor": 1.0, "unit_roundoff": 2.0 ** -53}),
     "zero_ritz_policy": ("drop lambda <= cutoff only within factor-weight budget",
                          {"lambda_cutoff_ry2": 1.0e-6, "max_dropped_weight_fraction": 1.0e-6}),
     # Legacy C denotes b: preserve this hashed predicate for stored identities.
@@ -678,6 +684,9 @@ def build_construction_row(model, counts, diagnostics, *, span, roles, price,
     measurements = {
         "normalized_gram_keep": dict(value=int(reduction["retained_rank"][0]), passed=True, reason="normalized Gram cut, current q"),
         "normalized_gram_validity": dict(value=float(reduction["gram_min_relative"][0]), passed=True, reason="normalized Gram spectrum"),
+        "gram_rounding_validity": dict(value={"gram_min_relative": float(reduction["gram_min_relative"][0]),
+                                              "floor_relative": float(reduction["gram_floor_relative"][0])},
+                                       passed=True, reason="propagated float64 floor of the equilibrated Gram"),
         "zero_ritz_policy": dict(value=float(zero["dropped_factor_weight_fraction"][0]), passed=True, reason="physical factor weight, sentinels excluded"),
         "finite_factors_poles": dict(value=True, passed=True, reason="zero policy, active prefix and exact inert sentinels"),
         "passivity": dict(value={k: np.asarray(v).tolist() for k, v in passive.items() if k != "passivity"}, passed=True, reason=("signed particle-hole model, Hermitian part at i eta; anti-Hermitian part is the odd channel, reported" if ordered else "raw latent model; authenticated inverse Coulomb square root at current eta; projected operator not measured")),
