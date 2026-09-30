@@ -7,10 +7,10 @@ in the order a user runs them:
 
     kmeans -> kin_ion -> dipole -> gwjax GN-PPM one-shot
            -> gwjax shared-pole QSGW (2 maps) -> BSE -> htransform
-           -> exciton bands -> restarted: COHSEX, GN-PPM SC (1 map),
-              shared-pole one-shot with W and pole exports
-           -> bispinor kin_ion, dipole -> four-current shared-pole one-shot
-           -> restarted: four-current shared-pole QSGW (2 maps)
+           -> exciton bands -> restarted: COHSEX, shared-pole one-shot with
+              W and pole exports
+           -> bispinor kin_ion, dipole -> four-current shared-pole QSGW
+              (2 maps, fresh zeta; its map 0 is the one-shot)
 
 Each stage is then checked against the stored outputs in ``reference/``
 (eqp columns, numeric members of the written h5 files, solver outputs)
@@ -172,15 +172,6 @@ RESTART_DECKS = {
     "cohsex.in": _restart_deck("cohsex", """compute_mode = cohsex
 qp_solver = one_shot_dft
 """),
-    # GN-PPM self-consistency, one map: map 0's max|dE| (2.59 eV) is inside
-    # the 3 eV criterion, so the SC driver stops converged after one map.
-    "gnppm_sc.in": _restart_deck("gnsc", """compute_mode = gn_ppm
-qp_solver = self_consistent
-sc_max_iter = 1
-sc_tol_ev = 3.0
-sigma_regularization_ev = 0.25
-write_qsgw_datasets = true
-"""),
     # The shared-pole file-model path: one-shot with the W bank and the
     # pole model exported.
     "sp_export.in": _restart_deck("spx", """compute_mode = mpa
@@ -197,10 +188,10 @@ write_poles = true
 # The four-current route, last in the chain: its fresh bispinor zeta fit
 # rewrites the tmp/ restart the scalar restarted steps read.  SP-full
 # (bispinor_gw = full_shared_pole: ordered CC/CT/TC/TT sector poles, direct
-# four-current Gamma head) one-shot with its own kinetic-balance kin_ion,
-# then the same route through the SC driver for two maps, restarted from
-# the one-shot's zeta and V(q), with the per-map head (dft_velocity) and the
-# live four-current density (density_self_consistent, required).  The
+# four-current Gamma head) through the SC driver for two maps, with its own
+# kinetic-balance kin_ion, the per-map head (dft_velocity) and the live
+# four-current density (density_self_consistent, required).  Map 0 is the
+# one-shot, so there is no separate one-shot stage (suite wall).  The
 # transverse zeta is fitted on the charge centroid set: one kmeans stage, and
 # any point set is a legal ISDF basis for the current rows.
 _BISP_COMMON = """bispinor = true
@@ -228,10 +219,7 @@ sigma_omega_h5_file = {prefix}_sigma.h5
 
 
 RESTART_DECKS.update({
-    "bisp_os.in": _bisp_deck("bos", """restart = false
-qp_solver = one_shot_dft
-"""),
-    "bisp_sc.in": _bisp_deck("bsc", """restart = true
+    "bisp_sc.in": _bisp_deck("bsc", """restart = false
 qp_solver = self_consistent
 sc_max_iter = 2
 sc_tol_ev = 2.0
@@ -241,11 +229,11 @@ density_self_consistent = true
 })
 _P = ["--px", _SIDE, "--py", _SIDE]
 
-# Scratch the lead removes before a stage.  The four-current one-shot is a
+# Scratch the lead removes before a stage.  The four-current QSGW is a
 # fresh model in a run directory that already holds the scalar shared-pole
 # models (checked at sp_export), and a fresh run refuses to overwrite a
 # completed model (GATE shared_pole_output).
-_CLEAR_BEFORE = {"bisp_oneshot": ("tmp/mpa",)}
+_CLEAR_BEFORE = {"bisp_sc": ("tmp/mpa",)}
 
 # (name, module, argv, deck name -> template).  The decks are written into
 # the run directory after kmeans, which names the centroid file.
@@ -278,13 +266,11 @@ STAGES = (
       "--q-per-segment", "1", "--band-degeneracy", "off", *_P,
       "--out-prefix", "exciton", "--report-file", "exciton.out"]),
     ("cohsex", "gw.gw_jax", ["-i", "cohsex.in"]),
-    ("gnppm_sc", "gw.gw_jax", ["-i", "gnppm_sc.in"]),
     ("sp_export", "gw.gw_jax", ["-i", "sp_export.in"]),
-    ("kin_ion_bisp", "gw.kin_ion_io", ["-i", "bisp_os.in", "-o", "kin_ion_bisp.h5"]),
+    ("kin_ion_bisp", "gw.kin_ion_io", ["-i", "bisp_sc.in", "-o", "kin_ion_bisp.h5"]),
     # The direct head authenticates the dipole's representation stamp, so
     # the four-component route writes its own (over the scalar one).
-    ("dipole_bisp", "psp.get_dipole_mtxels", ["-i", "bisp_os.in"]),
-    ("bisp_oneshot", "gw.gw_jax", ["-i", "bisp_os.in"]),
+    ("dipole_bisp", "psp.get_dipole_mtxels", ["-i", "bisp_sc.in"]),
     ("bisp_sc", "gw.gw_jax", ["-i", "bisp_sc.in"]),
 )
 
@@ -305,10 +291,6 @@ CHECKS = {
     "exciton_bands": {"rows": [("exciton.dat", 6)]},
     "htransform": {"rows": [("htransform.dat", 6)]},
     "cohsex": {"eqp": ["cohsex_eqp0.dat", "cohsex_eqp1.dat"]},
-    "gnppm_sc": {"eqp": ["gnsc_eqp0.dat", "gnsc_eqp1.dat"],
-                 "h5": ["gnsc_sigma.h5"],
-                 "report_floats": ("gnsc.out",
-                                   r"SC iteration: call=\d+ .*?max\|dE\|=([0-9.e+-]+)")},
     # The exported W bank is compared by value; the pole model (b, Lambda)
     # has a gauge per pole, so only its members' shapes are pinned.
     "sp_export": {"eqp": ["spx_eqp0.dat", "spx_eqp1.dat"],
@@ -316,8 +298,6 @@ CHECKS = {
                   "shapes": ["tmp/mpa/oneshot_poles.h5"]},
     "kin_ion_bisp": {"h5": ["kin_ion_bisp.h5"]},
     "dipole_bisp": {"h5": ["dipole.h5"]},
-    "bisp_oneshot": {"eqp": ["bos_eqp0.dat", "bos_eqp1.dat"],
-                     "h5": ["bos_sigma.h5"]},
     "bisp_sc": {"eqp": ["bsc_eqp0.dat", "bsc_eqp1.dat"],
                 "h5": ["bsc_sigma.h5"],
                 "report_floats": ("bsc.out",

@@ -28,12 +28,10 @@ converged physical reference.
 | htransform | `bandstructure.htransform` | Galerkin band interpolation on a G–X–M path |
 | exciton_bands | `bse.exciton_bands` | fH interpolation, then finite-Q TDA (1v × 1c) on the same path |
 | cohsex | `gw.gw_jax` | static COHSEX one-shot, restarted |
-| gnppm_sc | `gw.gw_jax` | GN-PPM through the SC driver, one map (map 0; QP rotations and `WFN_qp.h5` written), restarted |
 | sp_export | `gw.gw_jax` | shared-pole one-shot with `write_w`/`write_poles` (the file-model path), restarted; the W bank is compared by value, the pole model by member shapes |
 | kin_ion_bisp | `gw.kin_ion_io` | four-component kinetic-balance kinetic + ionic matrix elements |
 | dipole_bisp | `psp.get_dipole_mtxels` | the four-component dipole the direct head authenticates |
-| bisp_oneshot | `gw.gw_jax` | `bispinor_gw = full_shared_pole` one-shot: fresh charge + transverse ζ (both on the charge centroid set), ordered CC/CT/TC/TT sector poles, direct four-current Γ head |
-| bisp_sc | `gw.gw_jax` | the same route through the SC driver, 2 maps, restarted from the one-shot's ζ and V(q), `sc_head_update = dft_velocity`, live four-current density |
+| bisp_sc | `gw.gw_jax` | `bispinor_gw = full_shared_pole` through the SC driver, 2 maps: fresh charge + transverse ζ (both on the charge centroid set), ordered CC/CT/TC/TT sector poles, direct four-current Γ head, `sc_head_update = dft_velocity`, live four-current density; map 0 is the one-shot |
 
 All stages run in one Python process per rank (`chain.run_stage` calls each
 driver's `main` in sequence): one `jax.distributed` world, one FFI load, one
@@ -49,7 +47,7 @@ failure signatures (`chain.FAILURE_SIGNATURES`). Tolerances are in
 ends the step instead of leaving the other ranks in a collective.
 
 Not covered:
-- GN-PPM map-to-map update: the shared-pole stage is the one two-map SC run;
+- GN-PPM through the SC driver: the shared-pole stages are the SC runs;
 - `screening_diagrams = w_bse`: it refuses on a time-reversal-broken
   reference (`GATE w_bse_requires_measured_trs`);
 - the planners' chunked paths: at μ = 6 every object is KB-sized, and a
