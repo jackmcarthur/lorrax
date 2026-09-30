@@ -57,7 +57,7 @@ W_AV_DENSITY_DATASET = "w_av_density_mtxel"
 W_AV_SCHEMA_VERSION = 3
 OCCUPATIONS_DATASET = "dft_occupations_full"
 
-def link_symmetry_reduction_applies(sym, kgrid) -> bool:
+def link_symmetry_reduction_applies(sym, kgrid, *, wfn=None) -> bool:
     """Whether the IBZ link stream + directed-edge unfold is DEFINED here.
 
     The reduction stores one link per (IBZ k, elementary +b_i/N_i step) and
@@ -74,6 +74,12 @@ def link_symmetry_reduction_applies(sym, kgrid) -> bool:
 
     Uses the same step map as
     ``symmetry_maps.directed_edges._mapped_step``: round(S @ (b/N) * N).
+
+    With ``wfn`` the directed-edge table itself must also complete: a point
+    represented through time reversal (k1 = -k2) makes the edge
+    ``k1 -> k1 + b`` the reverse of itself, and with ``+b`` steps only it
+    has no stored image (``PT-EDGE-INCOMPLETE``; MoS2 3x3x1).  Then the
+    links are streamed on the full BZ, as on bcc/fcc.
     """
     mats_all = np.asarray(sym.sym_mats_k, dtype=np.float64)
     active = np.asarray(
@@ -96,6 +102,24 @@ def link_symmetry_reduction_applies(sym, kgrid) -> bool:
                 return False
             if tuple(int(x) for x in rounded) not in allowed:
                 return False
+    if wfn is None:
+        return True
+    from symmetry_maps import directed_edge_orbit_table
+    try:
+        directed_edge_orbit_table(
+            kgrid=np.asarray(wfn.kgrid, dtype=np.int32),
+            kgrid_shift=np.asarray(wfn.shift, dtype=np.float64),
+            sym_mats_k=np.asarray(sym.sym_mats_k, dtype=np.int32),
+            irr_idx_k=np.asarray(sym.irr_idx_k, dtype=np.int32),
+            sym_idx_k=np.asarray(sym.sym_idx_k, dtype=np.int32),
+            source_full_ids=np.asarray(sym.kirr_fullids, dtype=np.int32),
+            source_steps=np.eye(3, dtype=np.int32),
+            n_sym_spatial=int(wfn.ntran),
+            target_steps=np.eye(3, dtype=np.int32))
+    except ValueError as exc:
+        if "PT-EDGE-INCOMPLETE" not in str(exc):
+            raise
+        return False
     return True
 
 
@@ -472,7 +496,7 @@ def initialize_parallel_transport_artifact(
     vnl_sign = require_vnl_velocity_sign(vnl_velocity_sign)
     nb = int(nbands)
     kgrid = tuple(int(n) for n in np.asarray(wfn.kgrid).reshape(3))
-    reduced = link_symmetry_reduction_applies(sym, kgrid)
+    reduced = link_symmetry_reduction_applies(sym, kgrid, wfn=wfn)
     nk = int(sym.nk_tot)
     nrk = int(np.asarray(sym.kirr_fullids).size) if reduced else nk
     energies, occupations = _full_band_tables(wfn, sym, nb)
@@ -684,7 +708,7 @@ def _write_link_stage(
     # full BZ and every center is addressed by its full-BZ id, exactly the
     # way the neighbor already is.
     reduced = link_symmetry_reduction_applies(
-        sym, tuple(int(n) for n in np.asarray(wfn.kgrid).reshape(3)))
+        sym, tuple(int(n) for n in np.asarray(wfn.kgrid).reshape(3)), wfn=wfn)
     source_full = (np.asarray(sym.kirr_fullids, dtype=np.int32) if reduced
                    else np.arange(int(sym.nk_tot), dtype=np.int32))
     nrk = int(source_full.size)
@@ -774,7 +798,7 @@ def _write_connection_stage(
     nb = int(nbands)
     nb_storage = band_storage_extent(mesh, nb)
     reduced = link_symmetry_reduction_applies(
-        sym, tuple(int(n) for n in np.asarray(wfn.kgrid).reshape(3)))
+        sym, tuple(int(n) for n in np.asarray(wfn.kgrid).reshape(3)), wfn=wfn)
     table = None
     if reduced:
         table = directed_edge_orbit_table(
