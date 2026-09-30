@@ -11,7 +11,7 @@ from common.collectives import device_put_process_local,gather_to_host,rank0_tra
 from common.grouped_layout import identity_square_grouped_shard_layout
 from gw.centroid_k_unfold import CentroidKUnfoldPlan
 from gw.w_isdf import _get_chi_fractional_contour_kernel_face as factory
-ap=argparse.ArgumentParser();ap.add_argument('--output',required=True);ap.add_argument('--aot-only',action='store_true');a=ap.parse_args()
+ap=argparse.ArgumentParser();ap.add_argument('--output',required=True);ap.add_argument('--aot-only',action='store_true');ap.add_argument('--parent-width',type=int);a=ap.parse_args()
 def plan(kg,np_,m,anti):
  nk=int(np.prod(kg));rng=np.random.default_rng(913);sym=(np.arange(nk)%2).astype(np.int32)
  U=np.array([[np.cos(.23),1j*np.sin(.23)],[1j*np.sin(.23),np.cos(.23)]])
@@ -24,7 +24,10 @@ def main():
   base=Path('/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/runs/Fe/73_soc80_20nscf_closed_buffer_20260930/qe')
   w=WFNReader(str(base/'WFN.h5'),mesh=R.mesh,qe_schema=str(base/'data-file-schema.xml'));s=w.symmetry();kg=tuple(map(int,w.kgrid));np_,m,nb=1062,904,90
   pl=CentroidKUnfoldPlan(R.mesh,identity_square_grouped_shard_layout(m,m,(2,2)),np.asarray(s.irr_idx_k),np.asarray(s.sym_idx_k),np.tile(np.arange(m),(2*int(w.ntran),1)),np.zeros((2*int(w.ntran),m,3)),np.asarray(s.unfolded_kpts)[np.asarray(s.kirr_fullids)],np.asarray(s.spinor_action(s.sym_idx_k,nspinor=2)),int(w.ntran),2,parent_full_rows=np.asarray(s.kirr_fullids,dtype=np.int32))
-  neg=np.asarray(q_negation_index(kg));parents=np.asarray(s.kirr_fullids);q=tuple(dict.fromkeys(parents.tolist()+neg[parents].tolist()));assert len(q)==2120,len(q)
+  neg=np.asarray(q_negation_index(kg));parents=np.asarray(s.kirr_fullids)
+  if a.parent_width is not None:parents=parents[:a.parent_width]
+  q=tuple(dict.fromkeys(parents.tolist()+neg[parents].tolist()))
+  if a.parent_width is None:assert len(q)==2120,len(q)
   fn=factory(R.mesh,kg,2,(np_,nb,m,2),k_unfold_plan=pl,layout='face',selected_q=q,pair_mode='direct',ordered=True,bank_carry=True)
   sd=lambda sh,dt,sp:jax.ShapeDtypeStruct(sh,dt,sharding=NamedSharding(R.mesh,sp))
   import minimax

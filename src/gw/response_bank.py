@@ -1347,12 +1347,23 @@ def response_group_size(meta, mesh_xy, *, n_samples, carry_per_sample, stream_wo
 
 
 def photon_parent_stream_workspace(wfns,meta,mesh_xy,vertex):
-    """Owner-local quarter-Green/FFT byte hint, including typed partner demand."""
+    """Owner-local parent-Green/FFT byte hint, including typed partner demand.
+
+    Scalar identity vertices and Dirac-quarter vertices use the same selected
+    parent-pair producer. Only their authenticated parent extent differs.
+    """
     from .greens_function_kernel import _green_terms
-    plans = vertex.families.plans
-    parent = int(vertex.families.n_parent or meta.nk_tot)
-    mu = max(int(v) for v in vertex.families.packed_layout.carrier_extents)
-    tile,panels = _green_terms(n_parent=parent,n_rmu=mu,ns=2,
+    if vertex is None:
+        carrier = wfns.green_parent
+        plans = (None if carrier is None else carrier.plan,)
+        parent = int(meta.nk_tot if carrier is None else carrier.plan.n_parent)
+        mu, ns = int(meta.mu_basis.n_packed), int(meta.nspinor)
+    else:
+        plans = vertex.families.plans
+        parent = int(vertex.families.n_parent or meta.nk_tot)
+        mu = max(int(v) for v in vertex.families.packed_layout.carrier_extents)
+        ns = 2
+    tile,panels = _green_terms(n_parent=parent,n_rmu=mu,ns=ns,
                                n_band=int(wfns.slices.nb_full),mesh=mesh_xy)
     antiunitary = any(plan is not None and np.any(
         np.asarray(plan.sym_idx) >= int(plan.n_sym_spatial)) for plan in plans)
@@ -1369,12 +1380,12 @@ def photon_parent_stream_workspace(wfns,meta,mesh_xy,vertex):
                 summa_panel_bytes=int(panels),scalar_fft_tile_bytes=scalar_tile)
 
 
-def photon_response_q_width(wfns,meta,mesh_xy,vertex,*,n_q,face_bytes):
+def photon_response_q_width(wfns,meta,mesh_xy,vertex,*,n_q,face_bytes,retained_bytes=0):
     """Native live-set hint; compiled admission remains authoritative."""
     from common.gpu_utils import device_room_bytes
     quote = photon_parent_stream_workspace(wfns,meta,mesh_xy,vertex)
     ledger = meta.shared_pole_capacity
-    room = min(ledger.room_bytes_per_rank(ledger.live_stages),device_room_bytes())
+    room = min(ledger.room_bytes_per_rank(ledger.live_stages),device_room_bytes()) - int(retained_bytes)
     return max(1,min(int(n_q),int(max(0,room-quote["fixed_bytes_per_rank"])//(12*face_bytes))))
 
 
@@ -1450,10 +1461,10 @@ def produce_sample_bank(wfns, meta, config, *, mesh_xy, sym, sample_plan, bank_i
     # The coupled photon solve is independent per q. Keep its 4-current
     # matrix intact and bound the response carry by authenticated q panels.
     q_width = len(qids)
-    if vertex is not None:
-        ledger.live_stages = ambient
-        q_width = photon_response_q_width(wfns,meta,mesh_xy,vertex,n_q=len(qids),
-            face_bytes=16*n*n//mesh_xy.size)
+    ledger.live_stages = ambient
+    face_bytes = 16*n*n//mesh_xy.size
+    q_width = photon_response_q_width(wfns,meta,mesh_xy,vertex,n_q=len(qids),
+        face_bytes=face_bytes,retained_bytes=len(qids)*face_bytes if vertex is None else 0)
     q_spans = tuple((q0,min(q0+q_width,len(qids))) for q0 in range(0,len(qids),q_width))
     selection_nq = q_spans[0][1] - q_spans[0][0]
     response_rows = max((panel_rows(*span) for span in q_spans), key=len)
@@ -1502,7 +1513,7 @@ def produce_sample_bank(wfns, meta, config, *, mesh_xy, sym, sample_plan, bank_i
         # Photon q panels price one sample first; the existing group planner
         # then prices its chosen shared-node carry with compiled admission.
         workspace, whole = _stream_workspace(wfns, meta, mesh_xy, support, q_ids=response_rows,
-            n_outputs=2 if vertex is not None and len(q_spans)>1 else 2*len(z),
+            n_outputs=2 if len(q_spans)>1 else 2*len(z),
             ordered=ordered, vertex=vertex)
         chosen = (0, 0) if selection is None else (selection_resident, selection_workspace)
         with timing.section('bank.plan.direct'):
@@ -1520,7 +1531,7 @@ def produce_sample_bank(wfns, meta, config, *, mesh_xy, sym, sample_plan, bank_i
                 group_size, stage="response direct stream",
                 build=lambda g: _stream_executable(wfns, meta, mesh_xy, support,
                     q_ids=response_rows, n_outputs=2*g, ordered=ordered, vertex=vertex),
-                compiled=whole if (group_size == 1 if vertex is not None and len(q_spans)>1
+                compiled=whole if (group_size == 1 if len(q_spans)>1
                                    else group_size == len(z)) else None,
                 fixed=fixed, per_unit=carry_per_sample, room=room,
                 extra=lambda g, _: g*carry_per_sample + scratch)
@@ -1603,7 +1614,7 @@ def produce_sample_bank(wfns, meta, config, *, mesh_xy, sym, sample_plan, bank_i
                         _tr_odd_census(receipt,solve_value,h[part],chi_value[part],value[part],z[sample:sample+1],int(qids[iq]))
         return value, slope
 
-    if vertex is not None and len(q_spans) > 1:
+    if len(q_spans) > 1:
         from .shared_pole_sectors import sector_line_selection
         from .shared_pole_directions import spill_line_q_panel,restore_line_q_panel,line_q_restore_bytes
         for group in rules["plan"]["groups"]:
@@ -1629,8 +1640,10 @@ def produce_sample_bank(wfns, meta, config, *, mesh_xy, sym, sample_plan, bank_i
                     if held:
                         execution,selection_resident,selection_workspace = line_selection_execution(
                             rows,mesh=mesh_xy,ledger=ledger,nq=nq,carry=0)
-                        selection = sector_line_selection(bank_io,meta,mesh_xy=mesh_xy,
-                                                           execution=execution,nq=nq)
+                        selection = (charge_line_selection(meta,mesh_xy=mesh_xy,
+                            ordered=ordered,execution=execution,nq=nq) if vertex is None
+                            else sector_line_selection(bank_io,meta,mesh_xy=mesh_xy,
+                                                       execution=execution,nq=nq))
                     for row,sample in enumerate(members):
                         if sample not in pending:
                             continue
