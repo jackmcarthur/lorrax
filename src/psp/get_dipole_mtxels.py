@@ -576,8 +576,29 @@ def stamp_dipole_provenance(h5, **kwargs) -> None:
         h5.attrs[key] = value
 
 
+def _kinetic_velocity(psi_G, *, geom, gtab_file, wfn, sym):
+    """``p`` alone on the same sweep (no V_NL, no V_U): the head's p/V_NL split.
+
+    Written beside the full velocity in the parallel-transport artifact, so
+    the SC head can print the p, V_NL and Sigma shares of its velocity
+    (``gw.qsgw_head.velocity_term_shares``).
+    """
+    op = dipole_operator(geom, bvec=wfn.bvec, blat=wfn.blat, vnl_setup=None,
+                         hubbard=None)
+    return unfold_file_wedge_polar_matrix(sym, sweep_matrix_elements(
+        psi_G, operator=op, geom=geom, gvecs=gtab_file.gvecs,
+        gmask=gtab_file.mask, box_index=wfn.box_index(k="ibz"),
+        kvecs=np.asarray(gtab_file.kvecs)))
+
+
 def _parallel_transport_outer_bands(args, wfn, head_nbands, parser):
     """``(sweep extent, head extent)``: the outer set when links are written.
+
+    A defaulted artifact (``args.parallel_transport_defaulted``) is dropped
+    here when the k grid has no link stencil on some axis
+    (``common.parallel_transport.undersampled_link_axes``).  Its outer set
+    defaults to ``min(WFN bands, ceil(1.25 x head))``: a buffer that holds the
+    outer edge's link collapse (Fe 4^3: head 35, outer 44).
 
     The head is the deck's band set (``head_nbands``); the links run on an
     outer set above it (``--parallel-transport-bands``, default every WFN
@@ -585,10 +606,18 @@ def _parallel_transport_outer_bands(args, wfn, head_nbands, parser):
     (:func:`file_io.parallel_transport.complete_velocity_validation`).
     Without links the extent is the head's.
     """
+    from common.parallel_transport import undersampled_link_axes
+    if getattr(args, "parallel_transport_defaulted", False) and \
+            undersampled_link_axes(wfn.kgrid):
+        print("  parallel-transport artifact: not written (the k grid "
+              f"{tuple(int(n) for n in wfn.kgrid)} has no link stencil on "
+              f"{undersampled_link_axes(wfn.kgrid)})", flush=True)
+        args.parallel_transport_out = None
     if (args.parallel_transport_out is None
             or args.parallel_transport_velocity_only or args.w_av_only):
         return int(head_nbands), int(head_nbands)
-    outer = int(args.parallel_transport_bands) or int(wfn.nbands)
+    outer = int(args.parallel_transport_bands) or min(
+        int(wfn.nbands), -(-5 * int(head_nbands) // 4))
     if not int(head_nbands) <= outer <= int(wfn.nbands):
         parser.error(
             f"--parallel-transport-bands={outer} must lie in "
@@ -738,8 +767,15 @@ def build_parser() -> argparse.ArgumentParser:
 		type=str,
 		default=None,
 		help="SlabIO parallel-transport output, or the standalone W-av output "
-		     "when --w-av-only is selected. The default dipole path and "
-		     "dipole.h5 schema are unchanged.",
+		     "when --w-av-only is selected.  Default: parallel_transport.h5 "
+		     "beside --out whenever the k grid supports links (the SC head "
+		     "then defaults to sc_head_update = parallel_transport); "
+		     "--no-parallel-transport skips it.",
+	)
+	parser.add_argument(
+		"--no-parallel-transport",
+		action="store_true",
+		help="Do not write the default parallel-transport artifact.",
 	)
 	parser.add_argument(
 		"--w-av-only",
@@ -768,9 +804,9 @@ def build_parser() -> argparse.ArgumentParser:
 		default=0,
 		help="Outer band set of the parallel-transport links (and of the "
 		     "velocity written with them): bands 1..N.  0 (default) takes "
-		     "every WFN band.  The mandatory velocity gate judges the deck's "
-		     "own band set (the head), so the outer edge's link collapse "
-		     "stays in the buffer above it.",
+		     "min(WFN bands, ceil(1.25 x the deck's bands)).  The velocity "
+		     "reconstruction is judged on the deck's own bands (the head), "
+		     "so the outer edge's link collapse stays in the buffer above it.",
 	)
 	parser.add_argument(
 		"--parallel-transport-rcond",
@@ -832,6 +868,18 @@ def parse_args(argv=None):
 	if args.static_gauge_hall_out is not None and not args.static_gauge_hall_only:
 		parser.error(
 			"--static-gauge-hall-out requires --static-gauge-hall-only")
+	# The standard dipole step writes the parallel-transport artifact too,
+	# unless another producer is selected or the operator cannot carry it;
+	# a k grid without a link stencil drops it after the WFN loads
+	# (_parallel_transport_outer_bands).
+	args.parallel_transport_defaulted = bool(
+		args.parallel_transport_out is None and not args.no_parallel_transport
+		and not (args.static_gauge_hall_only or args.w_av_only
+		         or args.with_finite_q or args.skip_vnl)
+		and args.vnl_mode == "analytic")
+	if args.parallel_transport_defaulted:
+		args.parallel_transport_out = str(
+			Path(args.out).resolve().with_name("parallel_transport.h5"))
 	if args.parallel_transport_velocity_only and args.parallel_transport_out is None:
 		parser.error(
 			"--parallel-transport-velocity-only requires "
@@ -1445,7 +1493,10 @@ def main(argv=None):
 						vnl_velocity_sign=vnl_velocity_sign,
 						vnl_included=not args.skip_vnl,
 						rcond=float(args.parallel_transport_rcond),
-						emit=report.emit)
+						emit=report.emit,
+						velocity_kinetic=_kinetic_velocity(
+							psi_G, geom=geom, gtab_file=gtab_file, wfn=wfn,
+							sym=sym))
 				# The velocity stays sharded, 1/P of (nk, 3, nb, nb) per rank,
 				# until SlabIO writes it from those shards below.
 				velocity = H_v

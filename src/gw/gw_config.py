@@ -2895,6 +2895,18 @@ def _apply_input_envelope(
             f"{resolved.paths.parallel_transport_file} exists; using "
             "parallel_transport (per-map QSGW velocity with the "
             "covariant i[DeltaH, r])")
+    # The four-current direct Gamma head has no link consumer; its best head
+    # follows every map on the QP-rotated dipole velocity.
+    if (resolved.qp_solver is QPSolver.SELF_CONSISTENT
+            and "sc_head_update" not in _named_keys
+            and resolved.sc.head_update == "off"
+            and uses_full_bispinor_shared_pole(resolved)):
+        resolved = _dc_replace(resolved, sc=_dc_replace(
+            resolved.sc, head_update="dft_velocity"))
+        print_fn(
+            "  [config provenance] sc_head_update was not named on "
+            "bispinor_gw = full_shared_pole; using dft_velocity (the direct "
+            "Gamma head follows every map on the QP-rotated velocity)")
     if "restart" not in _named_keys:
         print_fn(
             "  [config provenance] restart was not named; using the "

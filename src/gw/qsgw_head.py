@@ -265,6 +265,9 @@ class ParallelTransportHeadData:
     #: ``nb_logical`` bands; ``velocity_dft_cart`` is the head block.
     #: 0 means the head's own set.
     nb_links: int = 0
+    #: ``p`` alone (head block, DFT basis) when the artifact carries it:
+    #: the p / V_NL split of the per-map head block (velocity_term_shares).
+    velocity_kinetic_cart: object = None
 
 
 @dataclass(frozen=True)
@@ -537,6 +540,14 @@ def load_parallel_transport_head(
         velocity = head_band_block(io.read_slab(
             VELOCITY_DFT_DATASET, shape=large_shape, partition_spec=spec
         ), expected_nb, mesh=mesh, nb_outer=nb_outer)
+        try:
+            from file_io.parallel_transport import VELOCITY_KINETIC_DATASET
+            velocity_kinetic = head_band_block(io.read_slab(
+                VELOCITY_KINETIC_DATASET, shape=large_shape,
+                partition_spec=spec), expected_nb, mesh=mesh,
+                nb_outer=nb_outer)
+        except (KeyError, RuntimeError, OSError, ValueError):
+            velocity_kinetic = None       # an artifact that predates it
         # Small (O(nk*nb) real) host-resident diagnostic, read in the SAME
         # handle as everything above -- one owner, one open, per this
         # loader's own docstring.  Not consulted here; the D3(a) window
@@ -619,6 +630,7 @@ def load_parallel_transport_head(
         singular_values=singular_values,
         collapsed_position=collapsed_position,
         nb_links=nb_outer,
+        velocity_kinetic_cart=velocity_kinetic,
     )
 
 
@@ -870,7 +882,7 @@ def _spectral_kernel(mesh: Mesh, kgrid: tuple[int, int, int]) -> Callable:
 
 
 def link_correction_bound(correction, velocity_dft, *, link_error: float,
-                          rtol: float, print_fn=print) -> float:
+                          rtol: float) -> tuple[float, float, float, float]:
     r"""Judge the link error on what the head uses: ``D_k DeltaH``.
 
     The head's velocity is ``v_DFT + D_k DeltaH``; ``v_DFT`` is exact and
@@ -881,18 +893,15 @@ def link_correction_bound(correction, velocity_dft, *, link_error: float,
 
         ``link_error * |D_k DeltaH|_F / |v_DFT|_F  <=  rtol``
 
-    (the artifact's stamped tolerance, default 5e-3).  Logged at every map;
-    above ``rtol`` the map refuses (``GATE pt_head_link_bound``).  A
-    DFT-start map 0 has ``DeltaH = 0`` and a zero bound.
+    (the artifact's stamped tolerance, default 5e-3).  Returns
+    ``(link_error, ratio, bound, rtol)`` for the per-map head block; above
+    ``rtol`` the map refuses (``GATE pt_head_link_bound``).  A DFT-start
+    map 0 has ``DeltaH = 0`` and a zero bound.
     """
     ratio = float(jax.device_get(
         jnp.linalg.norm(correction)
         / jnp.maximum(jnp.linalg.norm(velocity_dft), 1.0e-30)))
     bound = float(link_error) * ratio
-    print_fn(
-        f"    SC head link bound: rel_err(links) {float(link_error):.3e} x "
-        f"|D_k DeltaH|/|v_DFT| {ratio:.3e} = {bound:.3e} "
-        f"(rtol {float(rtol):.1e})", flush=True)
     if not np.isfinite(bound) or bound > float(rtol):
         raise ValueError(
             "GATE pt_head_link_bound: the finite-link error on this map's "
@@ -905,7 +914,41 @@ def link_correction_bound(correction, velocity_dft, *, link_error: float,
             "  why:  only D_k DeltaH goes through the links; their relative "
             "error, measured on the DFT velocity, scales it\n"
             "  doc:  docs/self_consistency.md, 'Metals: direct Drude head'")
-    return bound
+    return float(link_error), ratio, bound, float(rtol)
+
+
+def velocity_term_shares(v_qp, pieces, *, nb_logical, surface_weight_kn=None,
+                         energies_kn=None, occupations_kn=None):
+    r"""Each velocity term's share of the head, per Cartesian axis.
+
+    ``v_qp = sum_X X`` (QP basis); the share of term ``X`` is
+    ``sum w Re(conj(v) X) / sum w |v|^2``, so the shares add to 1.  Metals
+    (``surface_weight_kn``): the Fermi-surface weights on the diagonal, i.e.
+    the share of the Drude weight ``omega_p^2``.  Insulators: interband
+    pairs with ``w = |f_m - f_n| / |E_m - E_n|^3``, the share of the static
+    q->0 head ``S_aa(0)``.  Returns ``(names, shares[n_terms, 3])``.
+    """
+    nb = int(v_qp.shape[-1])
+    keep = jnp.arange(nb) < int(nb_logical)
+    if surface_weight_kn is not None:
+        w = jnp.asarray(surface_weight_kn, dtype=jnp.float64)[:, :nb] * keep
+        v = jnp.diagonal(v_qp, axis1=-2, axis2=-1)
+        total = jnp.sum(w[None] * jnp.abs(v) ** 2, axis=(1, 2))
+        parts = [jnp.sum(w[None] * jnp.real(jnp.conj(v) * jnp.diagonal(
+            x, axis1=-2, axis2=-1)), axis=(1, 2)) for _, x in pieces]
+    else:
+        e = jnp.asarray(energies_kn, dtype=jnp.float64)[:, :nb]
+        f = jnp.asarray(occupations_kn, dtype=jnp.float64)[:, :nb]
+        dE = jnp.abs(e[:, :, None] - e[:, None, :])
+        df = jnp.abs(f[:, :, None] - f[:, None, :])
+        live = (dE > 1.0e-6) & (df > 1.0e-10) & keep[:, None] & keep[None, :]
+        w = jnp.where(live, df / jnp.where(live, dE, 1.0) ** 3, 0.0)
+        total = jnp.sum(w[None] * jnp.abs(v_qp) ** 2, axis=(1, 2, 3))
+        parts = [jnp.sum(w[None] * jnp.real(jnp.conj(v_qp) * x), axis=(1, 2, 3))
+                 for _, x in pieces]
+    shares = np.asarray(jax.device_get(jnp.stack(parts) / jnp.maximum(
+        total, 1.0e-300)[None]), dtype=np.float64)
+    return tuple(name for name, _ in pieces), shares
 
 
 def covariant_link_derivative(
@@ -3051,6 +3094,10 @@ class IterationHeadResponse:
     #: (``fermi_surface.FermiSurfaceIntraband``), whose moments are ``N0``
     #: and ``drude_tensor``; the q = 0 cell evaluates it at every sample.
     fermi_surface: object | None = None
+    #: ``(names, shares[n_terms, 3], link_bound)`` from
+    #: :func:`velocity_term_shares` and :func:`link_correction_bound`, for
+    #: the per-map head block (``sc_iteration._record_head_block``).
+    velocity_terms: tuple | None = None
 
 
 @dataclass(frozen=True)
@@ -3626,6 +3673,7 @@ def build_iteration_head_response(
     collapsed_position=None,
     nb_links: int | None = None,
     link_bound: tuple[float, float] | None = None,
+    velocity_kinetic_cart=None,
 ) -> IterationHeadResponse:
     """Build current-basis direct head and, when requested, its wings.
 
@@ -3641,6 +3689,7 @@ def build_iteration_head_response(
     at ``n = 0`` on it, which refuses any family but Fermi-Dirac.
     """
     v_dft_basis = jnp.asarray(velocity_dft_cart, dtype=jnp.complex128)
+    base, correction, bound = v_dft_basis, None, None
     if forward_links is not None:
         if forward_neighbors is None:
             raise ValueError(
@@ -3659,13 +3708,24 @@ def build_iteration_head_response(
         ), int(nb_logical), mesh=mesh,
             nb_outer=int(nb_links or nb_logical))
         if link_bound is not None:
-            link_correction_bound(
+            bound = link_correction_bound(
                 correction, v_dft_basis, link_error=link_bound[0],
-                rtol=link_bound[1],
-                print_fn=(print if jax.process_index() == 0
-                          else (lambda *a, **k: None)))  # flushed: a refusal exits without teardown
+                rtol=link_bound[1])
         v_dft_basis = v_dft_basis + correction
     v_qp = rotate_velocity_active_to_qp(v_dft_basis, U_dft_to_qp, mesh=mesh)
+    # The per-map head block: p, V_NL and Sigma shares of this velocity.
+    pieces = ([("p", velocity_kinetic_cart),
+               ("V_NL", base - velocity_kinetic_cart)]
+              if velocity_kinetic_cart is not None else [("p + V_NL", base)])
+    if correction is not None:
+        pieces.append(("Sigma", correction))
+    velocity_terms = velocity_term_shares(
+        v_qp, [(name, rotate_velocity_active_to_qp(
+            jnp.asarray(x, dtype=jnp.complex128), U_dft_to_qp, mesh=mesh))
+            for name, x in pieces],
+        nb_logical=nb_logical, surface_weight_kn=surface_weight_qp_kn,
+        energies_kn=energies_qp_kn_ry, occupations_kn=occupations_qp_kn
+    ) + (bound,)
     resolved_eta_ry = (
         float(config.head.wcoul0_eta)
         if eta_ry is None else float(eta_ry)
@@ -3737,6 +3797,7 @@ def build_iteration_head_response(
         efermi_ry=float(efermi_ry),
         drude_tensor=drude_tensor,
         fermi_surface=fermi_surface,
+        velocity_terms=velocity_terms,
     )
 
 
