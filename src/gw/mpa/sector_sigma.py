@@ -200,6 +200,7 @@ def sector_tau_factory(left, right, keys, meta, mesh_xy, *, real_weights=False, 
              int(meta.nk_tot),id(plans[0]),id(plans[1]))
         return SynthesisTau(spatial,synthesis,right_yr,right_proj,
             native+synthesis.native,f'{stage}.{keys[0]}',meta,key,plans)
+    factory.workspace_bytes=warm+panel
     return factory
 
 
@@ -288,7 +289,7 @@ def _sector_component_kernel(panels, mesh_xy, grid, nk, m, n, width, weights_fn,
     return kernel,native
 
 
-def _sector_stream_synthesis(readers,headers,bases,syms,layout,frequencies,meta,mesh_xy):
+def _sector_stream_synthesis(readers,headers,bases,syms,layout,frequencies,meta,mesh_xy,*,spatial_workspace=0):
     """All-P factor residency plus a bounded component synthesis schedule."""
     from file_io.shared_pole_store import read_shared_pole_faces,face_width
     from .sigma import _chunk_major,_shared_pole_weights
@@ -315,7 +316,7 @@ def _sector_stream_synthesis(readers,headers,bases,syms,layout,frequencies,meta,
     # The physical faces are read at their native two-axis placement and
     # then split into chunk-major carriers. Count both generations at setup.
     setup=f'sigma.sector.setup.{tag}';held=f'sigma.sector.resident.{tag}'
-    room=ledger.room_bytes_per_rank(ambient)-resident
+    room=ledger.room_bytes_per_rank(ambient)-resident-int(spatial_workspace)
     tile=16*nk*m*n//mesh_xy.size
     parent_map=np.asarray(left['qirr']['irr_idx_q'],np.int32)
     divisor=max(int(mesh_xy.shape['x']),int(mesh_xy.shape['y']))
@@ -392,7 +393,7 @@ def _sector_stream_synthesis(readers,headers,bases,syms,layout,frequencies,meta,
 
 
 def sector_synthesis(readers, headers, bases, syms, layout, frequencies, meta, mesh_xy,
-                     *, weights_fn=None, stage='sigma'):
+                     *, weights_fn=None, stage='sigma', spatial_workspace=0):
     """Retain full-q endpoint factors and form one W(t) tile per tau.
 
     The store and symmetry services are called once at setup.  The factors
@@ -406,7 +407,8 @@ def sector_synthesis(readers, headers, bases, syms, layout, frequencies, meta, m
     Occupied windows use conj(B_A(-q)) d(t) B_B(-q)^T; d is never conjugated.
     """
     if stage=='sigma' and weights_fn is None:
-        return _sector_stream_synthesis(readers,headers,bases,syms,layout,frequencies,meta,mesh_xy)
+        return _sector_stream_synthesis(readers,headers,bases,syms,layout,frequencies,meta,mesh_xy,
+                                        spatial_workspace=spatial_workspace)
     from file_io.shared_pole_store import read_shared_pole_faces
     from .sigma import _shared_pole_factor_specs, _shared_pole_weights
     from .sigma_windows import shared_pole_intervals
@@ -451,19 +453,8 @@ def sector_synthesis(readers, headers, bases, syms, layout, frequencies, meta, m
                 +8*nk*kcarrier+16*nk*m*nc*n*nt//mesh_xy.size)
     native=_native_workspace(mesh_xy,(((nk,m*nc,kcarrier),(nk,kcarrier,n*nt)),))
     workspace=sum(c['estimated_live_bytes_per_rank'] for c in costs)+native
-    # A face input is required by the established symmetry route. After it
-    # completes the factors are placed once for every tau: they do not depend
-    # on tau, only d(tau) does. With K replicated (axis orientation) each tau
-    # is a local batched GEMM with no collective; the face GEMM's per-q SUMMA
-    # re-broadcast the same panels every call (Fe 4^3 bispinor: 158k NCCL
-    # broadcasts, 9.9 s of the first sector sweep). Face stays the fallback
-    # when the ledger cannot admit the replicated pole columns.
+    # Sector factors retain both processor axes, including charge W0.
     factor_layout=layout
-    if layout=='face' and capacity.preview(
-            resident_bytes_per_rank=resident_for('axis')+2*face_bytes,
-            workspace_bytes_per_rank=workspace,
-            concurrent_with=ambient)['device_budget_status']=='PASS':
-        factor_layout='axis'
     factor_spec=_shared_pole_factor_specs(factor_layout)
     resident_bytes=resident_for(factor_layout)
     setup=f'{stage}.sector.setup.{tag}'
@@ -581,7 +572,13 @@ def instantaneous_sector_sigma(handle, families, bases, meta, mesh_xy, *,
     parents=np.asarray(plans[0].sym.irr_idx_q,np.int32)
     policy=qgrid_trs_policy_from_shared_pole_store(header,announce=False)
     ledger=meta.shared_pole_capacity;ambient=ledger.live_stages
-    room=ledger.room_bytes_per_rank(ambient)
+    factories={}
+    for a,b in ((0,0),(0,1),(1,0),(1,1)):
+        keys=tuple((A,B) for A in ((1,2,3) if a else (0,))
+                   for B in ((1,2,3) if b else (0,)))
+        factories[a,b]=sector_tau_factory(families[a],families[b],keys,meta,mesh_xy,
+            real_weights=True,stage='sigma.sector.constant.plan')
+    room=ledger.room_bytes_per_rank(ambient)-max(f.workspace_bytes for f in factories.values())
     tile=16*meta.nk_tot*max(b.n_packed for b in bases)**2//mesh_xy.size
     bcap=nq
     while True:
@@ -626,8 +623,7 @@ def instantaneous_sector_sigma(handle, families, bases, meta, mesh_xy, *,
                 xn,_,xr,_,_,_=parent_sigma_operands(family)
                 axis=sigma_band_axis(int(family.slices.nb_sigma),mesh_xy,ansatz='dynamic')
                 synthesis=SimpleNamespace(native=0)
-                tau=sector_tau_factory(family,families[b],keys,meta,mesh_xy,real_weights=True,
-                    stage=f'sigma.sector.constant.q{lo}')(synthesis,axis)
+                tau=factories[a,b](synthesis,axis)
                 m,n=bases[a].n_packed,bases[b].n_packed
                 contract=_constant_component_contract(tau,rows,meta.nk_tot,m,n)
                 args=(xn,tau._right[0],pad_to_axis(xr,axis,axis=1),tau._right[1],energy,weight,children)
@@ -701,13 +697,15 @@ def compute_sector_sigma(handle, families, bases, meta, mesh_xy, *,
                     raise ValueError('GATE shared_pole_sectors: endpoint wavefunction layouts differ')
                 builder=sector_synthesis((reader,other),pair,(bases[a],bases[b]),
                     tuple(f.green_parent.plan.sym for f in (families[a],families[b])),
-                    families[a].layout,freq,meta,mesh_xy)
+                    families[a].layout,freq,meta,mesh_xy,
+                    spatial_workspace=tau_factory.workspace_bytes)
                 bound.append(builder)
                 stack.callback(builder.close)
                 return builder
+            tau_factory=sector_tau_factory(families[a],families[b],keys,meta,mesh_xy)
             context=dict(schedule=lambda _header:dict(route='sector-panels'),
                 synthesis=synthesis,rule_census=rule_census,
-                tau_kernel=sector_tau_factory(families[a],families[b],keys,meta,mesh_xy))
+                tau_kernel=tau_factory)
             opts=dict(options)
             sessions=opts.pop('fixed_quadrature_session',None)
             if sessions is not None:opts['fixed_quadrature_session']=sessions.setdefault('_'.join(names),{})
