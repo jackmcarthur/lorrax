@@ -261,7 +261,7 @@ _EXTRACT_DIAG_KERNEL_CACHE: dict[int, object] = {}
 # Sharded-layout siblings (one per mesh): the diagonal-only extractor and
 # the band-diagonal adder used by the ``sigma_omega_layout=sharded`` path.
 _EXTRACT_DIAG_SHARDED_KERNEL_CACHE: dict[int, object] = {}
-_ADD_BAND_DIAG_KERNEL_CACHE: dict[int, object] = {}
+_ADD_BAND_DIAG_KERNEL_CACHE: dict[tuple[int, bool], object] = {}
 _SET_BAND_DIAG_KERNEL_CACHE: dict[int, object] = {}
 
 
@@ -317,7 +317,8 @@ def _extract_diag_sharded_kernel(mesh_xy: Mesh):
     return fn
 
 
-def add_band_diag_sharded(sigma_w_kij: jax.Array, diag_w_kn) -> jax.Array:
+def add_band_diag_sharded(sigma_w_kij: jax.Array, diag_w_kn, *,
+                          donate: bool = False) -> jax.Array:
     """``Σ += diag(d)`` on a P(None,None,'x','y')-sharded Σ_c — rank-local.
 
     The analytic q→0 head is band-diagonal; on the sharded layout it is
@@ -330,38 +331,43 @@ def add_band_diag_sharded(sigma_w_kij: jax.Array, diag_w_kn) -> jax.Array:
     ``diag_w_kn`` is host numpy (nω, nk, nb), bit-identical on every rank
     by construction (pure function of replicated inputs) — placed with
     ``device_put_process_local`` per the AA.1 rule.
+
+    ``donate=True`` hands ``sigma_w_kij``'s buffer to the result (the select
+    is elementwise, so XLA writes it in place) and deletes the input: the
+    caller must not read it again.  The Σ finalize uses this so the body
+    and the head-added cube are not both resident (Na 8^3 [-100,+150] eV:
+    2 x 14.12 GiB).
     """
     from common.collectives import device_put_process_local
 
     mesh_xy = sigma_w_kij.sharding.mesh
-    key = id(mesh_xy)
+    key = (id(mesh_xy), bool(donate))
     fn = _ADD_BAND_DIAG_KERNEL_CACHE.get(key)
     if fn is None:
         from functools import partial
         from common.shard_map import shard_map
 
-        @jax.jit
+        @partial(jax.jit, donate_argnums=(0,) if donate else ())
         @partial(shard_map, mesh=mesh_xy,
                  in_specs=(P(None, None, 'x', 'y'), P(None, None, None)),
                  out_specs=P(None, None, 'x', 'y'),
                  check_vma=False)
         def _add_diag(tile, diag):
+            # One elementwise select, not a scatter-add: XLA:GPU lowers
+            # ``tile.at[:, :, a, b].add`` through a transposed copy of the
+            # whole tile, a third tile-sized buffer beside input and output
+            # (the Na 8^3 [-100,+150] eV OOM, 14.12 GiB).  Diagonal slots
+            # take the same IEEE ``x + d``; off-diagonal slots are returned
+            # untouched.
             ix = jax.lax.axis_index('x')
             iy = jax.lax.axis_index('y')
-            mb = tile.shape[2]
-            nbl = tile.shape[3]
-            nb = diag.shape[2]
-            i = jnp.arange(nb)
-            a = i - ix * mb
-            b = i - iy * nbl
-            own = (a >= 0) & (a < mb) & (b >= 0) & (b < nbl)
-            a_c = jnp.clip(a, 0, mb - 1)
-            b_c = jnp.clip(b, 0, nbl - 1)
-            contrib = jnp.where(own[None, None, :], diag,
-                                jnp.zeros((), dtype=diag.dtype))
-            # Non-owned i map to clipped duplicate (a, b) slots with exact-0
-            # contributions — scatter-add of zeros, value- and bit-neutral.
-            return tile.at[:, :, a_c, b_c].add(contrib)
+            mb, nbl = tile.shape[2], tile.shape[3]
+            rows = ix * mb + jnp.arange(mb)
+            cols = iy * nbl + jnp.arange(nbl)
+            on_diagonal = rows[:, None] == cols[None, :]
+            d_rows = jnp.take(diag, rows, axis=2)[..., :, None]
+            return jnp.where(on_diagonal[None, None, :, :],
+                             tile + d_rows, tile)
 
         fn = _add_diag
         _ADD_BAND_DIAG_KERNEL_CACHE[key] = fn

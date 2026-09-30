@@ -68,8 +68,7 @@ from common.fft_helpers import local_fftn3, local_ifftn3
 # Per ``device_kind`` prefix: the axis lengths ``N`` at which the stored-matrix
 # GEMM beats the library FFT, for a full N→N axis and for an axis with a
 # support (whose FFT arm pays the embedding gather or the restriction take).
-# A missing device, or an ``N`` outside the range, means FFT.  Sweep:
-# ``tests/bench/bench_fourier_plan.py``.
+# A missing device, or an ``N`` outside the range, means FFT.
 #
 # A100, complex128, measured through the CUDA leg (one custom call): a batched
 # cuFFT costs about one HBM pass for every N in 2..256, and the Fourier ZGEMMs

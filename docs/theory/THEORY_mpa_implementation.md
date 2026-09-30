@@ -311,9 +311,9 @@ the matrix-valued cube at the requested energies, writes `sigma_mnk.h5` and buil
 the static Hermitian QSGW operator.
 Self-consistent QSGW rebuilds $\chi$, $W$, the body fit and the head on every
 map (the stores are written under per-iteration names and one complete pair is
-retained); no model tensor lives in `SCState`. With
-`sc_head_update = parallel_transport` the fixed-DFT head is replaced each map by
-the direct QP-basis head. The loop itself is [self-consistency](../self_consistency.md).
+retained); no model tensor lives in `SCState`. With a velocity head
+(`sc_head_update`; unnamed, `parallel_transport` where the link artifact
+exists) the fixed-DFT head is replaced each map by the QP-basis head. The loop itself is [self-consistency](../self_consistency.md).
 
 ## 9. What changes the cost or the answer
 

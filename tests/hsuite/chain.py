@@ -216,10 +216,10 @@ _P = ["--px", _SIDE, "--py", _SIDE]
 # partition by number_bands_protected (2s and 2p lie below a 20 eV gap, so
 # they are the coarse class, read on held windows at eta_semi and pinned at
 # their DFT block by the default sc_semicore = dft), the rigid tail above the
-# QP window with its min(Z, 1/Z) law, the unnamed head update (the 3^3
-# links fail the window gate, so the metal falls back to dft_velocity) and
-# its per-map head block (gap 0 on a metal), spectral_shell extrapolation,
-# and the held SC windows, all at their defaults.  Scalar WFN, fresh zeta.
+# QP window with its min(Z, 1/Z) law, the unnamed head update
+# (parallel_transport; the 3^3 links fail the window gate, so its Sigma term
+# is zero on every map) and its per-map head block (gap 0 on a metal),
+# spectral_shell extrapolation, and the held SC windows, all at their defaults.  Scalar WFN, fresh zeta.
 NA_DECK = """[cohsex]
 centroids_file = {centroids}
 number_bands_protected = 8
@@ -355,10 +355,9 @@ REQUIRED_LINES = {
          r"SC semicore = dft: 16 coarse \(k,label\) hold their DFT block"),
         ("tail law with min(Z, 1/Z) weights at map 1",
          r"SC sum-band tail: scissored \[8, 13\) .*Z-weighted\)"),
-        ("unnamed sc_head_update: the metal falls back to dft_velocity",
-         r"SC head: sc_head_update was not named and .* cannot serve the "
-         r"parallel_transport head \(GATE pt_head_window_hybridized.*falls back "
-         r"to dft_velocity"),
+        ("unnamed sc_head_update: parallel_transport, Sigma term zeroed",
+         r"SC head: map 1: parallel_transport Sigma term D_k dH set to 0 "
+         r"\(GATE pt_head_window_hybridized"),
         ("Fermi-Dirac fixed-N metal head",
          r"SC metal head: fixed-N fd occupations"),
         ("per-map head block at map 1, metal gap",

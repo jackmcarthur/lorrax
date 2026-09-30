@@ -1,7 +1,8 @@
-# Driver suite on the magnetic H2+ spinor fixture
+# Driver suite on the magnetic H2+ spinor and bcc Na fixtures
 
-The test suite is the production drivers run end to end on one tiny
-magnetic system, at P4 on one node, checked against stored outputs.
+The test suite is the production drivers run end to end on two tiny systems,
+a magnetic H2+ spinor cell and a bcc Na metal, at P4 on one node, checked
+against stored outputs.
 
 ## Fixture
 
@@ -44,7 +45,7 @@ bands. The Na stages run in `run/na/`.
 | bse_bisp | `bse.bse_jax` | TDA Davidson after `bisp_sc` on the four-component restart: the final map's W0 = V + W_c,CC(0) (charge sector only) |
 | na_kin_ion | `gw.kin_ion_io` | bcc Na kinetic + ionic matrix elements; the 56 orbit-closed centroids (fitted on the ζ legs, 8 × 13) are stored in `fixture_na/` |
 | na_dipole | `psp.get_dipole_mtxels` | the default dipole: q→0 velocity plus the parallel-transport link artifact |
-| na_sc | `gw.gw_jax` | metal shared-pole QSGW, 2 maps to a 1.5 eV criterion, production defaults: Fermi-Dirac fixed-N occupations and metal head, `number_bands_protected = 8` (QP matrix 1–8, tail 9–13), 2s and 2p read on two coarse windows at η 5 eV, `sc_semicore = dft`, the rigid tail with min(Z, 1/Z) weights, spectral_shell extrapolation, held Σ windows re-planned on escape, `write_qsgw_datasets`, the unnamed `sc_head_update` (the 3³ links fail `GATE pt_head_window_hybridized`, so the metal falls back to `dft_velocity`) with its per-map head block, distributed linalg |
+| na_sc | `gw.gw_jax` | metal shared-pole QSGW, 2 maps to a 1.5 eV criterion, production defaults: Fermi-Dirac fixed-N occupations and metal head, `number_bands_protected = 8` (QP matrix 1–8, tail 9–13), 2s and 2p read on two coarse windows at η 5 eV, `sc_semicore = dft`, the rigid tail with min(Z, 1/Z) weights, spectral_shell extrapolation, held Σ windows re-planned on escape, `write_qsgw_datasets`, the unnamed `sc_head_update`, which resolves to `parallel_transport` (the 3³ links fail `GATE pt_head_window_hybridized`, so the map runs with the Σ term D_kΔH zeroed) with its per-map head block, distributed linalg |
 
 Cut from the suite (2026-09-30, suite wall), with what covers each path now:
 - `shared_pole_sc` (H2+ scalar shared-pole QSGW, 2 maps, about 20 s warm):
@@ -65,7 +66,7 @@ restarted steps read the `tmp/` state (ζ, V(q), W0) the chain has written.
 The `na_sc` rank-0 log must also show, by name, each default the stage
 covers (`chain.REQUIRED_LINES`): the partition line, the two coarse windows
 at η 5 eV, the `sc_semicore = dft` pin, the Z-weighted tail at map 1, the
-metal's fallback from the unnamed head to `dft_velocity`, the Fermi-Dirac
+unnamed head's `parallel_transport` map with the Σ term zeroed, the Fermi-Dirac
 metal head, the map-1 head block with a 0.0000 eV gap, and the
 map-1 Σ window re-plan.
 

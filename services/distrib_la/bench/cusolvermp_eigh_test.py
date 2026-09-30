@@ -4,12 +4,12 @@ Usage (Perlmutter)::
 
     export LX_BASE_MODULE=lorrax_A LORRAX_CHECKOUT=$PWD
     lx run -N 1 -G 4 -n 4 -- env PYTHONPATH="$LORRAX_CHECKOUT/src" \\
-        python3 -u tests/bench/cusolvermp_eigh_test.py
+        python3 -u services/distrib_la/bench/cusolvermp_eigh_test.py
 
 or, for a 1-GPU smoke::
 
     lx run -N 1 -G 1 -n 1 -- env PYTHONPATH="$LORRAX_CHECKOUT/src" \\
-        python3 -u tests/bench/cusolvermp_eigh_test.py --grid 1 1
+        python3 -u services/distrib_la/bench/cusolvermp_eigh_test.py --grid 1 1
 
 The one-GPU arm is diagnostic only; it is not landing evidence.
 
@@ -69,7 +69,8 @@ def _maybe_init_jax_distributed():
 
 _maybe_init_jax_distributed()
 
-from ffi.cusolvermp import distributed_eigh  # noqa: E402
+from ffi import _services      # noqa: F401,E402  (path bootstrap for services/*/src)
+from distrib_la._cusolvermp import distributed_eigh  # noqa: E402
 
 
 # ===========================================================================

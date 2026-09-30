@@ -27,8 +27,8 @@ any occupation family but Fermi–Dirac (`GATE metal_occupations_fermi_dirac`);
 `fermi_reference` other than `mp1_fixed_n`; the ladder `wc_source`
 (`GATE w_bse_insulators_only`); elementwise MPA with time reversal measured
 broken (`GATE mpa_ordered_metal`: that route fits one residue with no odd
-channel); `parallel_transport` and a folded bispinor velocity head
-(`GATE metal_sc_head_update_disabled`, §4); and a folded head on an ordered
+channel); `parallel_transport` on `bare_transverse` and a folded bispinor
+velocity head (`GATE metal_sc_head_update_disabled`, §4); and a folded head on an ordered
 store (`GATE shared_pole_head_ordered`).
 
 ## 1. The finite-occupation response and its cancellation structure
@@ -220,10 +220,12 @@ are different objects, and the head kernel keeps them apart by construction:
   the same static limit.
 
 **Every metallic head carries the metal's state.** The one-shot head, the
-frozen head of `sc_head_update = off` and the per-map head of `dft_velocity`
-take the fixed-N Fermi–Dirac state that the body and $\Sigma$ take, and the
-intraband term above; `dft_velocity` rebuilds it each map from the DFT
-velocity rotated into the map's basis. A 0/1 table by band index is never a
+frozen head of `sc_head_update = off` and the per-map heads of
+`parallel_transport` and `dft_velocity` take the fixed-N Fermi–Dirac state
+that the body and $\Sigma$ take, and the intraband term above; the per-map
+heads rebuild it each map from `qsgw_head.qp_velocity` rotated into the
+map's basis ($v_{\rm DFT} + D_k\Delta H$ on `parallel_transport`,
+$v_{\rm DFT}$ on `dft_velocity`). A 0/1 table by band index is never a
 metallic head occupation: it cuts degenerate multiplets and, before the
 multiplet rule, put $1/(\Delta E\,z^2)$ with $\Delta E\sim10^{-14}$ Ry into $S$
 (Na $8^3$: $W=0$ at every sample up to 11 Ry). The route table is owned by

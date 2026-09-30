@@ -208,7 +208,6 @@ the suite. An import of a service's top-level package is not an exception:
 | **R4** | `mixing.acceleration` sets `JAX_ENABLE_X64` at module scope | 2, 5 | Its consumer (`gw.sc_iteration`) imports it lazily after bootstrap, but a bare `import mixing.acceleration` in a fresh process would otherwise run the accelerator in f32 silently. Physics decision. |
 | — | `gw/__init__.py` sets `JAX_ENABLE_X64` | 5 | Inert for both GW drivers, whose startup call owns x64 (`runtime.set_x64_on_imported_jax`; a resolved `False` refuses, override `LORRAX_ALLOW_X64_OFF=1`). Kept for import paths with no bootstrap. |
 | — | `centroid/kmeans_plot.py` sets `MPLBACKEND=Agg` | 5 | Not a compute knob; a plotting helper choosing a headless renderer is the right owner. |
-| — | `ffi.cusolvermp.{batched, eigh, context}` reach past the `distrib_la` door (5 + 1 + 1 edges) | 6 | `ffi/cublasmp/batched.py` takes `get_or_init_context` from `ffi.cusolvermp`, and cuBLASMp is a future `gemm` service, not `distrib_la`. The edges go when that service is extracted. |
 
 **Mesh construction (rule 4).** Only these modules may call `Mesh(`:
 `common.collectives` (`resolve_mesh`, `single_device_mesh`), `runtime`
@@ -248,14 +247,13 @@ These refusals are load-bearing; each was reached by measurement.
    mathdx kernel family with its cubin cache, the FFTW3-ABI advanced-layout
    plans with OpenMP chunking, and a scratch-free BLAS call share an FFI
    signature and nothing else.
-5. **Do not force the bench drivers in `tests/bench/` through
-   `resolve_mesh`.** They build meshes differently on purpose:
-   `tests/bench/profile_batched.py` parses `--mesh 2x2` and exits on a
-   mismatch, which is right for a benchmark that sweeps geometries.
+5. **Do not force the service bench drivers in `services/*/bench/` through
+   `resolve_mesh`.** They build meshes differently on purpose: a benchmark
+   that sweeps geometries parses its own mesh and exits on a mismatch.
 
-**Bench drivers live in `tests/bench/`**: argv-driven scripts that pytest does
-not collect, run as `python3 tests/bench/<name>.py` with `src/` on
-`PYTHONPATH`. A module under `src/` with a bench-shaped name (`test_*`,
+**Bench drivers live in `services/<svc>/bench/`**: argv-driven scripts that
+pytest does not collect, run as `python3 services/<svc>/bench/<name>.py` with
+`src/` on `PYTHONPATH`. A module under `src/` with a bench-shaped name (`test_*`,
 `*_test`, `*_bench`, `benchmark*`, `profile_*`, `.tests.`, `.archive.`) fails
 the gate.
 

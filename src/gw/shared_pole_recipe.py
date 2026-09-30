@@ -1042,6 +1042,11 @@ def imaginary_sample_count(kappa, tier, recipe=shared_real_pole_v1_r3b):
 #: of a DFT start sat 0.32 eV off the rule's sites at the fixed point and left
 #: E_F +- 10 eV states 99 meV from a fresh plan's end point; 0.003 eV gave
 #: 0.9 meV; REPLAN, runs/Fe/67-71, 2026-09-29), so 3 meV keeps it near 1 meV.
+#: The hold is max(this, a tenth of the SC's last max|dE|): site moves an
+#: order below the iterate's own error only make each map a different
+#: function, and Anderson then mixes residuals of different maps (Fe 4^3
+#: scalar parallel_transport: 10 re-plans in 15 maps, STALLED; FESTALL,
+#: runs/Fe/82, 2026-09-30).
 LINE_SITE_HOLD_EV = 3.0e-3
 
 
@@ -1196,7 +1201,8 @@ def resolve_shared_pole_recipe(config, wfns, meta, *, mesh_xy, print_fn,
                 drift = (float(np.max(np.abs(line - held))) if line.shape == held.shape
                          else math.inf)
                 support_receipt['line_site_drift_ev'] = drift
-                if drift <= LINE_SITE_HOLD_EV:
+                hold = max(LINE_SITE_HOLD_EV, 0.1 * float(support_session.get('sc_residual_ev', 0.0)))
+                if drift <= hold:
                     line = held
                 else:
                     support_session['epoch'] += 1
@@ -1204,7 +1210,7 @@ def resolve_shared_pole_recipe(config, wfns, meta, *, mesh_xy, print_fn,
                     worst = (int(np.argmax(np.abs(line - held)))
                              if line.shape == held.shape else -1)
                     support_receipt['line_site_replan'] = (
-                        f"max site drift {drift:.4f} eV > {LINE_SITE_HOLD_EV:.4f} eV "
+                        f"max site drift {drift:.4f} eV > {hold:.4f} eV "
                         f"(site {worst}: {held[worst] if worst >= 0 else float('nan'):.4f} -> "
                         f"{line[worst] if worst >= 0 else float('nan'):.4f} eV); "
                         f"epoch {support_session['epoch']}")
