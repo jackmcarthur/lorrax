@@ -91,7 +91,6 @@ SIGMA_K_AXIS = {
 	"hartree_scalar_kij_ev": 0,
 	"hartree_transverse_kij_ev": 0,
 	"sigma_xc_qsgw_kij_ev": 0,
-	"qp_diag_self_consistent_ev": 0,
 	"qp_omega0_ev": 0,
 	"qp_static_cohsex_ev": 0,
 	# The Σ_c band-convergence fit, band-DIAGONAL (nk, nb), so k is axis 0.
@@ -270,7 +269,6 @@ QSGW_PLOT_DATASETS = (
 	"sigma_xc_qsgw_kij_ev",
 	"qp_static_cohsex_ev",
 	"qp_omega0_ev",
-	"qp_diag_self_consistent_ev",
 )
 
 

@@ -935,14 +935,21 @@ def _runnable_modes_building(*channels: SigmaChannel) -> str:
 # ---------------------------------------------------------------------------
 # The QP ladders of sigma_mnk.h5's plotting appendix
 # ---------------------------------------------------------------------------
-# THREE LADDERS OF ONE H₀, which is the whole reason they are worth
-# plotting together: ``kin_ion + V_H`` is common to all three and only
+# TWO LADDERS OF ONE H₀, which is the whole reason they are worth
+# plotting together: ``kin_ion + V_H`` is common to both and only
 # the Σ_xc added to it changes, so the vertical distance between two
 # curves IS the difference between two approximations at that (k, n) and
 # nothing else.  They are eigenvalues, so unlike the Σ cubes beside them
 # they are BASIS-FREE — ``eigvalsh(U†HU) == eigvalsh(H)`` — which is why
 # one seam serves the one-shot and the self-consistent paths alike even
 # though those two hand this function matrices in different bases.
+#
+# NO DIAGONAL FIXED POINT E = h₀ + ReΣ(E).  It is not basis-free, it has
+# several roots per state wherever Σ_c,nn has poles near E, and plain
+# mixing cannot reach a root where ReΣ' < −(1−m)/m: the value written was
+# an unconverged iterate that moved by 0.79 eV between P1 and P4 on inputs
+# equal to 30 µeV (HSUITE fixture).  The diagonal root has one owner,
+# ``eqp_bgw.solve_qp_root`` (``eqp_root.dat``).
 #
 # WHAT IS NOT HERE, and why it is not manufactured.  ``qp_static_cohsex_ev``
 # is H₀ + Σ_SX + Σ_COH, and those two channels are built only by
@@ -968,7 +975,6 @@ def write_qsgw_qp_ladders(
     *,
     config,
     e_qp_ry,
-    sigma_c_omega_diag_ev,
     omega_grid_ev,
     sigma_c_omega=None,
     print_fn=print,
@@ -997,8 +1003,7 @@ def write_qsgw_qp_ladders(
             " for the appendix.")
         return []
     from file_io import append_qsgw_datasets_h5
-    from .qsgw_utils import (
-        is_band_sharded_sigma_omega, solve_diagonal_sigma_fixed_point)
+    from .qsgw_utils import is_band_sharded_sigma_omega
 
     def _band_sharded(a):
         spec = getattr(getattr(a, "sharding", None), "spec", None)
@@ -1010,7 +1015,6 @@ def write_qsgw_qp_ladders(
     static_band_sharded = any(_band_sharded(a) for a in (
         results.sig_h, results.sig_x, results.sig_sx, results.sig_coh))
     kin_ion = np.asarray(results.kin_ion_ry)
-    efermi_ev = float(results.efermi_ev or 0.0)
     payload: dict[str, np.ndarray] = {}
     omitted: list[str] = []
 
@@ -1077,43 +1081,6 @@ def write_qsgw_qp_ladders(
         sig_x = np.asarray(results.sig_x)
         payload["qp_omega0_ev"] = _eigen_ladder_ev(
             kin_ion + sig_h + sig_x + sigma_c_0)
-
-    # ---- qp_diag_self_consistent_ev: E = h₀ + ReΣ_xc(E) ---------------
-    # The SAME solver and the same operands ``qsgw_utils.solve_qp``'s
-    # fixed_point branch uses, run here in eV on the diagonals ``gw_jax``
-    # already extracted — so this ladder is what ``qp_solver =
-    # fixed_point`` would have solved, whatever solver this run used.
-    # Bands whose E_DFT leaves the ω grid are CLAMPED TO E_DFT rather
-    # than to the grid edge: the solver's Σ_c is pinned at the boundary
-    # for those, and a pinned Σ makes a QP energy that says more about
-    # the grid than about the band.
-    if sigma_c_omega_diag_ev is not None and omega_grid_ev is not None:
-        omega_ev = np.asarray(omega_grid_ev, dtype=np.float64)
-        h0_diag_ev = (
-            np.real(np.diagonal(kin_ion, axis1=1, axis2=2))
-            + np.real(_result_matrix_diag(results, "sig_h"))) * RYD_TO_EV
-        sig_x_diag_ev = np.real(
-            _result_matrix_diag(results, "sig_x")) * RYD_TO_EV
-        sigma_xc_diag_w_kn_ev = (np.real(np.asarray(sigma_c_omega_diag_ev))
-                                 + sig_x_diag_ev[None, :, :])
-        e_dft_rel_ev = (np.asarray(results.E_dft_ry, dtype=np.float64)
-                        * RYD_TO_EV - efermi_ev)
-        e_sc_rel_ev, _, n_iter = solve_diagonal_sigma_fixed_point(
-            h0_diag_ev - efermi_ev, sigma_xc_diag_w_kn_ev, omega_ev,
-            max_iter=120, tol_ev=1.0e-7, mixing=0.6,
-        )
-        in_grid = ((e_dft_rel_ev >= omega_ev[0])
-                   & (e_dft_rel_ev <= omega_ev[-1]))
-        e_sc_rel_ev = np.where(in_grid, e_sc_rel_ev, e_dft_rel_ev)
-        payload["qp_diag_self_consistent_ev"] = (
-            e_sc_rel_ev + efermi_ev).astype(np.float64)
-        print_fn(
-            f"  QP ladders: diagonal Σ(E) fixed point converged in "
-            f"{n_iter} iterations, {int(in_grid.sum())}/{in_grid.size} "
-            f"(k, n) inside the ω grid")
-    else:
-        omitted.append(
-            "qp_diag_self_consistent_ev (no Σ_c(ω) diagonal in this run)")
 
     if omitted:
         print_fn(

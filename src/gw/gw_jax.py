@@ -1230,7 +1230,7 @@ def _assemble_gw_results(
 def _write_gw_results(
         _t_out, config, e_eval_ev, final_static_head_terms, head_sigma_diag_w_kn_ry,
         input_dir, meta, omega_dft_rel_ev, omega_grid_ev, omega_grid_ry, print0, qp_solver,
-        results, rotations_written, sigma_c_omega, sigma_c_omega_diag_ev, sym, wfn):
+        results, rotations_written, sigma_c_omega, sym, wfn):
     """Write the QP and diagnostic results on the reporting rank."""
     if meta.rank == 0:
         write_freq_debug(
@@ -1246,7 +1246,6 @@ def _write_gw_results(
         write_qsgw_qp_ladders(
             results, config=config,
             e_qp_ry=results.E_qp_ry,
-            sigma_c_omega_diag_ev=sigma_c_omega_diag_ev,
             omega_grid_ev=omega_grid_ev,
             sigma_c_omega=sigma_c_omega,
             print_fn=print0,
@@ -1589,7 +1588,7 @@ def _run_gw_stages(args, _t_main, _pre_main, opened):
 	_write_gw_results(
 	    _t_out, config, e_eval_ev, final_static_head_terms, head_sigma_diag_w_kn_ry, input_dir,
 	    meta, omega_dft_rel_ev, omega_grid_ev, omega_grid_ry, print0, qp_solver, results,
-	    rotations_written, sigma_c_omega, sigma_c_omega_diag_ev, sym, wfn)
+	    rotations_written, sigma_c_omega, sym, wfn)
 	(_wall) = _close_timing(_pre_main, _t_main, meta, print0)
 	_report_final_observables(
 	    E_full, band_slices, config, enk_dft, eqp2_result, head_sigma_split_skn_ry,

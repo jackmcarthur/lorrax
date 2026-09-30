@@ -1213,9 +1213,6 @@ _DEFAULTS = {
     #       self-consistency, the DFT basis one-shot).
     #   qp_omega0_ev               (nk, nb) real — the QP ladder of
     #       H₀ + Σ_x + Σ_c(ω≈0), one extra eigh of an (nk, nb, nb).
-    #   qp_diag_self_consistent_ev (nk, nb) real — the diagonal on-shell
-    #       fixed point E = h₀ + ReΣ(E), host-side, ~100 iterations of a
-    #       (nk, nb) map.
     #   qp_static_cohsex_ev        (nk, nb) real — the static COHSEX
     #       ladder, H₀ + Σ_SX + Σ_COH.  Written only by a run that BUILT
     #       those two channels, which today means compute_mode = cohsex;

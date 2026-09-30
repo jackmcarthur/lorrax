@@ -55,18 +55,16 @@ ATOL = {
     "h5": 1.0e-8,        # kin_ion / dipole members (relative + absolute)
     "w_bank": 1.0e-6,    # exported shared-pole W samples (relative)
     "eqp_ev": 5.0e-4,    # eqp0/eqp1 columns, GN-PPM and shared pole
-    "bse_ev": 2.0e-3,    # BSE and exciton-band eigenvalues: Krylov solves
-                         # on a P-dependent padded space (P1 vs P4 1.2 meV)
+    "bse_ev": 2.0e-3,    # BSE and exciton-band eigenvalues.  BSE agrees
+                         # < 10 ueV P1 vs P4; exciton bands 1.2 meV at M,
+                         # because the fH basis pivots differ with P (not
+                         # the Krylov tolerance; KNOWN_LORRAX_ISSUES)
 }
 
-# h5 members not compared.  qp_diag_self_consistent_ev is a diagnostic
-# diagonal fixed point E = h0 + Re Sigma(E) with plain mixing; on this fixture
-# (SC map gain ~5) it lands on different roots from Sigma inputs that agree to
-# 30 ueV (P1 vs P4: 0.79 eV on one state).  The terminal eqp columns and the
-# Sigma matrices it is built from are compared instead.  line_charge_* are
-# the W bank's selected direction states: a gauge per direction, and padded
-# to the mesh (P1 6x1, P4 8x2); Wc, dWc_ds and the moments are compared.
-H5_UNCOMPARED = ("qp_diag_self_consistent_ev", "_w.h5:line_charge_")
+# h5 members not compared.  line_charge_* are the W bank's selected
+# direction states: a gauge per direction, and padded to the mesh (P1 6x1,
+# P4 8x2); Wc, dWc_ds and the moments are compared.
+H5_UNCOMPARED = ("_w.h5:line_charge_",)
 
 FAILURE_SIGNATURES = (
     "Traceback (most recent call last)",

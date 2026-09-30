@@ -202,7 +202,7 @@ at its default, `false`.
 | `restart_q_storage` | str | `auto` | q set of the restart store. `auto`: the q-IBZ producer block when the q grid reduces, otherwise the full q axis. `ibz`: additionally requires a reduced wedge. |
 | `qp_rotations_k_storage` | str | `auto` | k set of `qp_wfn_rotations.h5`. `auto`: the WFN wedge when the reader's own round trip reproduces the arrays exactly, otherwise full BZ, naming the array that failed. `ibz`: the wedge, refusing instead of falling back. `full`: the full BZ. A dataset without a `k_storage` attribute reads as full BZ. |
 | `write_wfn_h5` | bool | `true` | Writes `WFN_qp.h5` at the end of the run (ψ rotated by the final U, QP energies). `qp_wfn_rotations.h5` is written regardless. |
-| `write_qsgw_datasets` | bool | `false` | Adds `sigma_xc_qsgw_kij_ev`, `qp_omega0_ev`, `qp_diag_self_consistent_ev` and (only under `compute_mode = cohsex`) `qp_static_cohsex_ev` to `sigma_mnk.h5` on its own k set. The cost is one (nk, nb, nb) eigh. |
+| `write_qsgw_datasets` | bool | `false` | Adds `sigma_xc_qsgw_kij_ev`, `qp_omega0_ev` and (only under `compute_mode = cohsex`) `qp_static_cohsex_ev` to `sigma_mnk.h5` on its own k set. The cost is one (nk, nb, nb) eigh. |
 | `write_poles` | bool | `false` | Shared-pole MPA only: exports `tmp/mpa/<map>_poles.h5` with `b[q, μ, spin, j]`, Λ = Ω² (`poles2_ry2[q, j]`) and the active columns `K[q]`, where W_c(z) = b(z² − Λ)⁻¹b†. It is complete for a static-W consumer: W(0) = v − bΛ⁻¹b†. Existing outputs are immutable. |
 | `write_w` | bool | `false` | Debug, shared-pole MPA only: writes the full W_c sample bank to `tmp/mpa/<map>_w.h5`, about 16× the pole export. BSE does not need it; use `write_poles`. |
 
