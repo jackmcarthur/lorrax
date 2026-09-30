@@ -3498,6 +3498,7 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
     # single owner of occupation rebuilding after an energy change.
     enk_base = None
     tail_fit = None
+    _tx_anchor = None
     tail_start = int(inputs.band_slices.sigma.stop)
     logical_stop = (
         int(inputs.meta.b_id_4_user) - int(inputs.band_slices.b0))
@@ -3530,17 +3531,40 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
         # correction of every trusted conduction state in the window (owner
         # 2026-09-23; the lowest-multiplet law put CrI3's tail on one
         # localized Cr-d band, +7.0 eV against the window mean +3.5 eV).
+        # EXPERIMENT TAILX (not for landing): LORRAX_EXP_TAILX = const | xanchor.
+        # xanchor: tail dE_n = d_n + c, d = [Sigma_x - V_xc]_nn (DFT level, full
+        # BZ, eV, from LORRAX_EXP_TAILX_ANCHOR .npy); c fitted as the rigid mean
+        # of (E_QP - E_DFT - d) on the same weighted rows.
+        _tx_anchor = None
+        if os.environ.get("LORRAX_EXP_TAILX", "const") == "xanchor":
+            _tx_anchor, _tx_eo = np.load(os.environ["LORRAX_EXP_TAILX_ANCHOR"])
+            _tx_e = np.asarray(inputs.wfns_dft.enk, dtype=np.float64) * RYD_TO_EV
+            if (_tx_anchor.shape[0] != _tx_e.shape[0]
+                    or _tx_anchor.shape[1] < logical_stop
+                    or np.abs(_tx_eo[:, :logical_stop] - _tx_e[:, :logical_stop]).max() > 1e-4):
+                raise RuntimeError(f"TAILX anchor shape {_tx_anchor.shape} vs enk {_tx_e.shape}, "
+                                   f"stop {logical_stop}, ks identity {ks.is_identity}, E mismatch "
+                                   f"{np.abs(_tx_eo[:, :logical_stop] - _tx_e[:, :logical_stop]).max()}")
         tail_fit, n_sigma0_excluded, tail_note = _fit_sum_band_tail(dict(
             E_dft_kn_ev=e_dft_fit_ev,
-            E_qp_kn_ev=energies_loop,
+            E_qp_kn_ev=(energies_loop if _tx_anchor is None else
+                        np.asarray(energies_loop, dtype=np.float64)
+                        - (_tx_anchor if ks.is_identity else _tx_anchor[np.asarray(ks.rows)])[
+                            :, :energies_loop.shape[1]]),
             valence_mask_kn=valence_kn,
             k_weights=k_star_weights(ks),
         ), fit_mask_kn, sigma0_kn, state.tail_z_kn)
         if tail_note:
             _record_sc(inputs, f"    SC sum-band tail: {tail_note}")
     if tail_fit is not None:
+        _tx_e_in = np.asarray(inputs.wfns_dft.enk, dtype=np.float64) * RYD_TO_EV
+        if _tx_anchor is not None:
+            _tx_e_in = _tx_e_in.copy()
+            _tx_e_in[:, tail_start:logical_stop] += _tx_anchor[:, tail_start:logical_stop]
+            _record_sc(inputs, f"    TAILX EXPERIMENT xanchor: c={tail_fit.beta_c_ev:+.6f} eV; "
+                               f"tail d mean {_tx_anchor[:, tail_start:logical_stop].mean():+.4f} eV")
         enk_base_ev = apply_conduction_scissor_to_tail(
-            np.asarray(inputs.wfns_dft.enk, dtype=np.float64) * RYD_TO_EV,
+            _tx_e_in,
             tail_fit,
             tail_start=tail_start,
             logical_stop=logical_stop,
