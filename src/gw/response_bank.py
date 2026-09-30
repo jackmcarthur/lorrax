@@ -1294,18 +1294,12 @@ def _stream_executable(wfns, meta, mesh_xy, support, *, q_ids, n_outputs, ordere
 
 
 def _stream_scratch(wfns, meta, mesh_xy, vertex):
-    """Run-time scratch of the charge stream outside its compiled temporaries:
-    mathdx mode 11's split arm on a raw-parent plan (w_isdf direct stream)."""
-    parent = wfns.green_parent
-    if vertex is not None or parent is None:
-        return 0
-    from .greens_function_kernel import chi0_door_scratch
-    from .w_isdf import _chi_door_serves
-    kgrid, ns = (meta.nkx, meta.nky, meta.nkz), int(meta.nspinor)
-    if not _chi_door_serves(mesh_xy, kgrid, ns):
-        return 0
-    return int(chi0_door_scratch(kgrid=kgrid, n_parent=int(parent.plan.n_parent),
-                                 n_rmu=meta.mu_basis.n_packed, ns=ns, mesh=mesh_xy))
+    """Selected parent pairs hold their bounded FFT tiles in compiled temporaries.
+
+    The selected scalar route no longer calls mode 11's full-q accumulator,
+    so it has no separate split-arm scratch reservation.
+    """
+    return 0
 
 
 def _stream_workspace(wfns, meta, mesh_xy, support, *, q_ids, n_outputs, ordered, vertex):

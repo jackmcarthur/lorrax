@@ -751,16 +751,22 @@ def _get_chi_fractional_contour_kernel_face(
                            enable_active_range=band_ranges is not None)
     active_gemms = (tuple(g_plan.prepare_active_range(*bounds) for bounds in band_ranges)
                    if band_ranges is not None else (None, None))
-    # Selected charge streams on a raw-parent plan form each node's correlation
-    # with mathdx mode 11 from the two parent Greens (``direct_rows``): no full-k
-    # Green, no transform of either Green, no XLA spin trace.
-    chi_door = None
+    # Selected charge and photon streams share the bounded parent-pair owner.
+    # Identity vertices keep the scalar trace, selecting q before an all-centroid
+    # output exists. No full-q R bank is carried beside the selected bank.
+    charge_door = None
     if (pair_mode in ("direct", "retarded", "kms_static") and selected_q is not None
             and photon is None and k_unfold_plan is not None
             and _chi_door_serves(mesh_xy, grid, ns)):
-        from common.fft_helpers import make_kconv_chi_unfold
-        chi_door = make_kconv_chi_unfold(mesh_xy, grid, k_unfold_plan.unfold_load_tables(),
-                                         n_out=1, complete=False, norm="ortho")
+        from common.fft_helpers import make_selected_parent_pairs
+        charge_rows = tuple(dict.fromkeys(tuple(gather_q) + tuple(reverse_q)))
+        charge_ahead = np.asarray([charge_rows.index(q) for q in gather_q])
+        charge_behind = np.asarray([charge_rows.index(q) for q in reverse_q])
+        tables = k_unfold_plan.unfold_load_tables()
+        charge_door = make_selected_parent_pairs(mesh_xy, grid, tables, tables,
+            selected_q=charge_rows,
+            vertex_terms=((np.arange(ns), np.ones(ns), np.arange(ns), np.ones(ns)),),
+            norm="ortho")
     photon_doors = None
     if _photon_selected_rows_serve(photon, selected_q, pair_mode):
         from common.fft_helpers import make_selected_parent_pairs
@@ -1046,7 +1052,7 @@ def _get_chi_fractional_contour_kernel_face(
 
         def correlation_rows(lower_weight, lower_time, lower_ref,
                              upper_weight, upper_time, upper_ref):
-            """One node's forward and reverse rows through mathdx mode 11.
+            """One node's forward and reverse rows through the parent-pair owner.
 
             Mode 11 returns ``v = sum_ab conj(Gu'_ab) Gf'_ab`` from the raw
             parents (``G' = ifftn_k`` of the typed unfold), which is the
@@ -1066,13 +1072,13 @@ def _get_chi_fractional_contour_kernel_face(
                                    real_weights=False)
             lower = parent(lower_weight, lower_time, lower_ref, False)
             upper = parent(upper_weight, upper_time, upper_ref, True)
-            partners = (() if lower.conj_partner and upper.conj_partner
-                        else (lower.partner(), upper.partner()))
-            zero = jax.lax.with_sharding_constraint(
-                jnp.zeros((1, nk, n_mu, n_mu), jnp.complex128), selected_shard)
-            value = chi_fftn(chi_door(zero, lower.G, upper.G,
-                                      jnp.ones((1,), jnp.complex128), *partners)[0])
-            ahead, behind = rows(value, gather_q), rows(value, reverse_q)
+            lp, up = lower.partner(), upper.partner()
+            lp = lower.G if lp is None else lp
+            up = upper.G if up is None else up
+            value = charge_door(upper.G, lower.G, up, lp,
+                                jnp.ones(nk), jnp.ones(nk))[0]
+            ahead = jnp.take(value, jnp.asarray(charge_ahead), axis=0)
+            behind = jnp.take(value, jnp.asarray(charge_behind), axis=0)
             return (jnp.conj(ahead), behind) if physical else (ahead, jnp.conj(behind))
 
         def direct_rows(time):
@@ -1095,7 +1101,7 @@ def _get_chi_fractional_contour_kernel_face(
                 time_nodes[index],
                 jax.lax.dynamic_index_in_dim(projection_rows[0], index, axis=1, keepdims=False),
                 jax.lax.dynamic_index_in_dim(projection_rows[1], index, axis=1, keepdims=False)))
-            if chi_door is not None or photon_doors is not None:
+            if charge_door is not None or photon_doors is not None:
                 ahead, behind = direct_rows(time)
             else:
                 value = chi_fftn(spin_correlation(occ_f, -time, energy_reference[0],
@@ -1123,7 +1129,7 @@ def _get_chi_fractional_contour_kernel_face(
 
         def body(accumulators, node):
             time, projection = node
-            if chi_door is not None or photon_doors is not None:
+            if charge_door is not None or photon_doors is not None:
                 if pair_mode == "retarded":
                     tau = -jnp.asarray(1j, jnp.complex128) * time
                     ahead, behind = correlation_rows(occ_f, tau, energy_reference,
