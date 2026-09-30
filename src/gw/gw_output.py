@@ -960,8 +960,9 @@ def _runnable_modes_building(*channels: SigmaChannel) -> str:
 # several roots per state wherever Σ_c,nn has poles near E, and plain
 # mixing cannot reach a root where ReΣ' < −(1−m)/m: the value written was
 # an unconverged iterate that moved by 0.79 eV between P1 and P4 on inputs
-# equal to 30 µeV (HSUITE fixture).  The diagonal root has one owner,
-# ``eqp_bgw.solve_qp_root`` (``eqp_root.dat``).
+# equal to 30 µeV (HSUITE fixture).  No QP root is solved anywhere: eqp0
+# reads Σ at the energies it was evaluated at and eqp1 is the linearized
+# BerkeleyGW column (owner 2026-09-29).
 #
 # WHAT IS NOT HERE, and why it is not manufactured.  ``qp_static_cohsex_ev``
 # is H₀ + Σ_SX + Σ_COH, and those two channels are built only by
@@ -1486,7 +1487,7 @@ def write_results(
         write_eqp_g0w0,
         write_qp_rotations_h5,
     )
-    from .eqp_bgw import QP_STATUS_NAMES, assemble_eqp
+    from .eqp_bgw import assemble_eqp
 
     r2e = RYD_TO_EV
 
@@ -1741,11 +1742,9 @@ def write_results(
         sigma_c_odd_kn_eV=(
             None if results.sigma_c_odd_diag_at_dft_ry is None
             else r2e * _wedge(results.sigma_c_odd_diag_at_dft_ry)),
-        # Z (the eqp1 stencil at E_DFT) beside the QP-root status.  SC output
-        # has neither: its map output is the root.
-        z_factor_kn=(None if assembly.qp_root is None else assembly.z_factor),
-        qp_status_kn=(None if assembly.qp_root is None else np.asarray(
-            QP_STATUS_NAMES)[assembly.qp_root.status.astype(int)]),
+        # Z, the eqp1 stencil, only where eqp1 was linearized at E_DFT.
+        z_factor_kn=(None if assembly.e_eval_ev is not None
+                     else assembly.z_factor),
     )
 
     # ``sigma_mnk.h5``'s full operators intentionally remain raw: changing

@@ -3,6 +3,14 @@
 User-visible changes, newest first. Binding rulings behind the breaking
 changes live in `docs/architecture/decisions.md`.
 
+## 2026-09-29 — `qp_solver = fixed_point` and `eqp_root.dat` are retired
+
+`qp_solver = fixed_point` refuses by name; set `one_shot_dft` (Σ at E_DFT)
+or `self_consistent` (Σ at each map's own energies). No QP equation
+E = h₀ + ReΣ(E) is solved on any route. The dynamic one-shot run no longer
+writes `eqp_root.dat`, and `sigma_diag.dat` drops its `QP_status` column
+(`Z` stays). `eqp0.dat` and `eqp1.dat` are unchanged.
+
 ## 2026-09-29 — the semicore class on the bispinor (sector) route
 
 Every dynamic self-consistent bispinor deck with a coarse class

@@ -75,7 +75,7 @@ contracts, equations, shapes, and run policy remain on the owner pages in the
 | `qgrid_symmetry.py` | Resolves q-grid symmetry policy and index tables. |
 | `qsgw_density.py` | Builds density state for QSGW iterations. |
 | `qsgw_head.py` | Builds finite-link velocity and head data for QSGW. |
-| `qsgw_utils.py` | The QSGW Σ_xc build, the `qp_solver` dispatch (`fixed_point` calls `eqp_bgw.solve_qp_root`) and matrix I/O helpers. |
+| `qsgw_utils.py` | The QSGW Σ_xc build, the one-shot `solve_qp` seam (Σ_xc + V_H, no QP root) and matrix I/O helpers. |
 | `quadrature_log.py` | Records the quadrature rules a run used, for the production report. |
 | `response_bank.py` | Response-bank algebra for the shared-pole construction. |
 | `restart_q_storage.py` | Resolves q-axis restart storage and compatibility. |

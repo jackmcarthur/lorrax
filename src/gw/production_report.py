@@ -345,8 +345,8 @@ class GWProductionReport:
         self.heading("Method and physical pathways")
         self.emit(f"Self-energy    : {mode_text}; {solver_text}")
         self.emit(
-            f"QP consistency  : {solver} | other options: fixed_point "
-            "(diagonal on-shell), self_consistent (rebuild G/W/Sigma)")
+            f"QP consistency  : {solver} | other options: one_shot_dft "
+            "(Sigma at E_DFT), self_consistent (rebuild G/W/Sigma)")
         eqp2 = getattr(config, "eqp2", None)
         if bool(getattr(eqp2, "enabled", False)):
             self.emit(

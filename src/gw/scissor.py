@@ -674,8 +674,7 @@ def fit_scissor(
         choice of reference (typically E_F-relative).
     E_qp_kn_ev : np.ndarray, (nk, nb), real or complex
         QP eigenvalues per (k, n) at the corresponding state.  Complex
-        inputs are reduced to the real part, matching the convention of
-        ``solve_diagonal_sigma_fixed_point``.
+        inputs are reduced to the real part.
     valence_mask_kn : np.ndarray, (nk, nb) of bool
         True where the valence law applies, False where the conduction law
         does.  On a metal build it from :func:`classify_scissor_bands` —
