@@ -25,7 +25,8 @@ from file_io.restart_bundle import (
 )
 from gw.efermi import occupation_floor_reach_ry
 from gw.ppm_accumulators import DeviceOmegaAccumulator
-from gw.ppm_sigma import SigmaOmegaResult, _residue_for_space, sigma_band_axis
+from gw.ppm_sigma import (
+    BandCountCube, SigmaOmegaResult, _residue_for_space, sigma_band_axis)
 from gw.ppm_tau_kernel import (_get_sigma_kij_kernel,
                                get_shared_sigma_tau_kernel)
 from gw.ppm_windows import branches_for_omega_grid
@@ -1432,11 +1433,15 @@ def _integrate_sigma_batches(
 
     fence('tau.finalize', sync_ranks=True)
     with timing.section('tau.finalize'):
-        sigma = _unfold_sigma_cube(
-            accumulator.finalize(), k_unfold_plan.sym,
-            k_axis=2 if bracketed else 1, sharding=output_sharding)
+        sigma = accumulator.finalize()
         if bracketed:
-            sigma = _bracket_cumsum_fn(sigma.sharding)(sigma)
+            # Cumulate on the wedge; each count is unfolded when it is read.
+            sigma = BandCountCube(
+                wedge=_bracket_cumsum_fn(output_sharding)(sigma),
+                unfold=_band_count_point_fn(
+                    k_unfold_plan.sym,
+                    NamedSharding(mesh_xy, P(None, None, "x", "y"))),
+                nk=int(k_unfold_plan.sym.nk_tot))
             if band_counts is None:
                 band_counts = tuple(
                     int(s.nb_sigma_sum) if hi is None else int(hi)
@@ -1446,6 +1451,9 @@ def _integrate_sigma_batches(
             if len(band_counts) != len(brackets):
                 raise ValueError(
                     "MPA Sigma band_counts must align with band brackets")
+        else:
+            sigma = _unfold_sigma_cube(
+                sigma, k_unfold_plan.sym, k_axis=1, sharding=output_sharding)
         # Format read by the sandbox parser (tools/parse_lorrax_sigma_run.py);
         # every node now runs inside its window's executable, so none is
         # left undispatched.
@@ -1493,6 +1501,15 @@ def _unfold_sigma_cube_fn(sym, k_axis, sharding):
         unfold_file_wedge_band_operator(
             sym, jnp.moveaxis(value, k_axis, 0),
             trs_rule="transpose"), 0, k_axis),
+        out_shardings=sharding)
+
+
+@lru_cache(maxsize=8)
+def _band_count_point_fn(sym, sharding):
+    """``(wedge, i) -> count i`` on the full BZ: :attr:`BandCountCube.unfold`."""
+    unfold = _unfold_sigma_cube_fn(sym, 1, sharding)
+    return jax.jit(lambda wedge, i: unfold(
+        jax.lax.dynamic_index_in_dim(wedge, i, 0, keepdims=False)),
         out_shardings=sharding)
 
 
@@ -1642,8 +1659,9 @@ def integrate_sigma_store(
 
     ``brackets`` optionally partitions the intermediate-state band sum into
     disjoint slices.  The spatial kernel then returns a leading bracket axis;
-    this executor inserts omega behind it and cumulatively sums the brackets
-    before returning.  ``None`` preserves the ordinary MPA rank-4 result.
+    this executor inserts omega behind it, cumulatively sums the brackets on
+    the FILE wedge and returns a ``BandCountCube``, which unfolds one count
+    at a time.  ``None`` preserves the ordinary MPA rank-4 result.
 
     ``tau_kernel_factory`` replaces the resident pole route's τ body (the
     plane-wave path's ``get_shared_sigma_tau_kernel(_sigma_kij=...)``); see
