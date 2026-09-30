@@ -2875,7 +2875,8 @@ def _apply_input_envelope(
             "V_H stays at the DFT density on every map (comparison mode, "
             "not production QSGW)")
     # The QSGW head follows the owner's velocity rule (2026-09-29): an unnamed
-    # sc_head_update takes the best head this scalar deck can build.
+    # sc_head_update takes the best head this scalar or four-current deck
+    # can build.
     # parallel_transport, v = U^dagger (p + i[r, V_NL] + i[r, DeltaSigma]) U
     # with the Sigma term from this map's DeltaH, where the link artifact
     # exists (zero on a map whose links cannot serve it, owner 2026-09-30);
@@ -2883,7 +2884,9 @@ def _apply_input_envelope(
     if (resolved.qp_solver is QPSolver.SELF_CONSISTENT
             and "sc_head_update" not in _named_keys
             and resolved.sc.head_update == "off"
-            and not bool(resolved.bispinor) and bool(resolved.do_G0)
+            and (not bool(resolved.bispinor)
+                 or uses_full_bispinor_shared_pole(resolved))
+            and bool(resolved.do_G0)
             and resolved.sigma.w_model == "shared_pole"
             and resolved.head.correction in (
                 HeadCorrection.NO_LOCAL_FIELDS, HeadCorrection.FULL)):
@@ -2902,8 +2905,8 @@ def _apply_input_envelope(
         print_fn(
             f"  [config provenance] sc_head_update was not named: {mode} "
             f"({why})")
-    # The four-current direct Gamma head has no link consumer; its best head
-    # follows every map on the QP-rotated dipole velocity.
+    # A four-current deck with neither file still follows every map on the
+    # QP-rotated dipole velocity (the bank refuses a missing dipole.h5).
     if (resolved.qp_solver is QPSolver.SELF_CONSISTENT
             and "sc_head_update" not in _named_keys
             and resolved.sc.head_update == "off"
@@ -3826,16 +3829,14 @@ def refuse_unsupported_bispinor_gw(config) -> None:
                 and config.sc.head_update not in PHOTON_DIRECT_HEAD_UPDATES):
             raise ValueError(
                 "GATE full_shared_pole_head_update: the four-current direct "
-                "Gamma head has two SC modes.\n"
+                "Gamma head has three SC modes.\n"
                 f"  got:  sc_head_update = {config.sc.head_update}\n"
-                "  want: dft_velocity (the head follows every map: QP-rotated "
-                "dipole velocity, this map's Fermi-Dirac state and its own "
-                "Ward contact) or off (the DFT head, rebuilt at each map's "
-                "frequencies)\n"
-                "  why:  gw.photon_direct_head consumes the dipole velocity "
-                "only; parallel-transport links and the interband-commutator "
-                "velocity have no four-current consumer, so either would be "
-                "ignored\n"
+                "  want: parallel_transport (the map's QSGW velocity "
+                "v_DFT + D_k DeltaH from the links), dft_velocity (the "
+                "QP-rotated dipole velocity) or off (the DFT head, rebuilt "
+                "at each map's frequencies)\n"
+                "  why:  the interband-commutator velocity is defined only "
+                "across a gap and has no four-current consumer\n"
                 "  doc:  docs/architecture/four_current_wiring.md, "
                 "'Self-consistency and restart'.")
         return
@@ -4405,8 +4406,9 @@ HEAD_UPDATES = METAL_HEAD_UPDATES + INSULATOR_HEAD_UPDATES
 
 #: The SC head modes of the four-current direct Γ head
 #: (``bispinor_gw = full_shared_pole``): ``off`` builds it on the DFT state,
-#: ``dft_velocity`` on each map's state with the QP-rotated velocity.
-PHOTON_DIRECT_HEAD_UPDATES = ("off", "dft_velocity")
+#: ``dft_velocity`` on each map's state with the QP-rotated velocity, and
+#: ``parallel_transport`` with the map's QSGW velocity (``qsgw_head.qp_velocity``).
+PHOTON_DIRECT_HEAD_UPDATES = ("off", "dft_velocity", "parallel_transport")
 
 
 def uses_metal_direct_drude_head(config) -> bool:
@@ -4421,19 +4423,20 @@ def uses_metal_direct_drude_head(config) -> bool:
     per-map routes); an ordered (time-reversal-broken) store still refuses
     it at the head (``GATE shared_pole_head_ordered``).
 
-    ``parallel_transport`` is admitted on scalar decks: the same head on
-    the QSGW velocity ``U^dagger (v_DFT + D_k DeltaH) U``, whose finite-link
-    covariant derivative carries ``i[DeltaH, r]`` at this map, so the Drude
-    term sees the QP Fermi velocity.  The four-current bank reads the dipole
-    only (``GATE full_shared_pole_head_update``).
+    ``parallel_transport`` is admitted on scalar and four-current decks:
+    the same head on the QSGW velocity ``U^dagger (v_DFT + D_k DeltaH) U``,
+    whose finite-link covariant derivative carries ``i[DeltaH, r]`` at this
+    map, so the Drude term sees the QP Fermi velocity.  The four-current
+    bank takes that velocity from the SC (``photon_head_state``).
     """
     if not (config.qp_solver is QPSolver.SELF_CONSISTENT
             and config.sc.head_update in METAL_HEAD_UPDATES
             and config.sigma.w_model == "shared_pole"):
         return False
     if config.sc.head_update == "parallel_transport":
-        return not config.bispinor and config.head.correction in (
-            HeadCorrection.NO_LOCAL_FIELDS, HeadCorrection.FULL)
+        return ((not config.bispinor or uses_direct_bispinor_shared_pole_head(config))
+                and config.head.correction in (
+                    HeadCorrection.NO_LOCAL_FIELDS, HeadCorrection.FULL))
     if config.head.correction is HeadCorrection.NO_LOCAL_FIELDS:
         return (not config.bispinor or uses_bare_transverse_shared_pole(config)
                 or uses_full_bispinor_shared_pole(config))
@@ -4687,11 +4690,11 @@ def validate_material_inputs(config, material_class):
                 "static head)\n"
                 "  want: sc_head_update = off, or dft_velocity with "
                 "shared_pole and no_local_fields (direct Drude head) or full "
-                "(scalar decks), or parallel_transport on a scalar "
-                "shared_pole deck\n"
+                "(scalar decks), or parallel_transport on a scalar or "
+                "bispinor_gw = full_shared_pole deck\n"
                 "  why:  a folded bispinor metal head has no derived "
-                "completion, and the four-current head reads the dipole "
-                "velocity only\n"
+                "completion, and the bare-transverse head has no link "
+                "consumer\n"
                 "  doc:  docs/self_consistency.md, 'Metals: direct Drude head'")
         if width_ry is None:
             raise ValueError(

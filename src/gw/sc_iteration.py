@@ -3713,10 +3713,12 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
                         photon_g0_vectors=inputs.photon_g0_vectors,
                         photon_head_cache=inputs.screening_seed_cache,
                         photon_head_state=(
-                            (U_full, None, None)
-                            if inputs.config.sc.head_update == "dft_velocity"
+                            (U_full, None, None, photon_velocity)
+                            if inputs.config.sc.head_update in (
+                                "dft_velocity", "parallel_transport")
                             else (None, inputs.wfns_dft,
-                                  _fixed_dft_head_occupation_state(inputs))))
+                                  _fixed_dft_head_occupation_state(inputs),
+                                  None)))
                    if inputs.config.sigma.w_model == "shared_pole"
                    and wfns_transverse_qp is not None else {}),
                 print_fn=inputs.print_fn)
@@ -3740,6 +3742,9 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
     iteration_static_head_terms = inputs.static_head_terms
     head_occ_kn = None
     qsgw_velocity = None
+    # The four-current bank's velocity on this map (parallel_transport):
+    # this map's qp_velocity; None reads the dipole velocity (dft_velocity).
+    photon_velocity = None
     pt = getattr(inputs, "parallel_transport", None)
     # The shared-pole route also carries the direct-only head
     # (no_local_fields) through this frozen DFT response, with the wings
@@ -3829,6 +3834,23 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
                                  correction=None),
                          U_full, wfns_qp.enk[:, :nb_storage],
                          int(pt.nb_logical))
+    if pt is not None and uses_direct_bispinor_shared_pole_head(inputs.config):
+        # The four-current bank builds the direct Gamma head from U^H v U of
+        # this velocity (response_bank.compute_photon_bank); here only the
+        # per-map head block is formed from it.
+        from .qsgw_head import head_velocity_terms
+        photon_velocity = velocity.dft_cart
+        _record_sc(inputs, f"    SC head: four-current direct Gamma head on "
+                           f"{velocity.label} (nb={pt.nb_logical})")
+        _record_head_block(inputs, int(state.iteration), head_velocity_terms(
+            velocity, U_full, wfns_qp.enk[:, :nb_storage], head_occ_kn,
+            surface_weight_qp_kn=head_surface_weight_kn, mesh=inputs.mesh_xy,
+            kgrid=tuple(int(n) for n in inputs.wfn.kgrid),
+            bvec_cart=pt.reciprocal_lattice_cart,
+            nb_logical=int(pt.nb_logical), wfn=inputs.wfn, meta=inputs.meta,
+            velocity_kinetic_cart=getattr(pt, "velocity_kinetic_cart", None)),
+            np.asarray(jax.device_get(wfns_qp.enk[:, :nb_storage])))
+    elif pt is not None:
         iteration_head_response = build_iteration_head_response(
             velocity,
             U_full,
@@ -6610,9 +6632,12 @@ def load_head_velocity_source(
     mode = str(config.sc.head_update)
     if mode not in HEAD_UPDATES:
         return None
-    if uses_direct_bispinor_shared_pole_head(config):
+    if (uses_direct_bispinor_shared_pole_head(config)
+            and mode != "parallel_transport"):
         # The four-current bank reads and rotates the dipole velocity itself
         # (``response_bank.compute_photon_bank``); no scalar head consumes one.
+        # parallel_transport loads the links below and hands the bank the
+        # map's QSGW velocity (``photon_head_state``).
         print_fn(
             "  SC head: four-current direct Gamma head follows every map "
             "(sc_head_update = dft_velocity): QP-rotated dipole velocity, "

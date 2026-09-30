@@ -3849,6 +3849,79 @@ def qp_velocity(
                       bound=bound, zeroed=zeroed, label=label)
 
 
+@dataclass(frozen=True)
+class HeadVelocityTerms:
+    """One map's QP velocity, its p / V_NL / Sigma shares and Drude tensor.
+
+    ``velocity_terms = (names, shares, bound, zeroed)`` feeds the per-map
+    head block; ``drude_tensor`` (metals) is the q=0-cell Drude weight;
+    ``sigma_occupations`` the occupations the block's gap reads.
+    """
+
+    v_qp: jax.Array
+    velocity_terms: tuple
+    drude_tensor: object
+    fermi_surface: object
+    pair_split: object
+    sigma_occupations: np.ndarray
+
+
+def head_velocity_terms(
+    velocity: QPVelocity,
+    U_dft_to_qp,
+    energies_qp_kn_ry,
+    occupations_qp_kn,
+    *,
+    surface_weight_qp_kn=None,
+    mesh: Mesh,
+    kgrid: tuple[int, int, int],
+    bvec_cart,
+    nb_logical: int,
+    wfn,
+    meta,
+    velocity_kinetic_cart=None,
+) -> HeadVelocityTerms:
+    """The head block's operands, one owner for the scalar and four-current heads.
+
+    Rotates ``velocity`` into the QP basis, splits it into its p, V_NL and
+    Sigma shares (``velocity_term_shares``) and, on a metal, forms the
+    Fermi-surface Drude tensor (``metal_intraband_model``).
+    """
+    v_dft_basis, base = velocity.dft_cart, velocity.base
+    correction, bound, zeroed = (velocity.correction, velocity.bound,
+                                 velocity.zeroed)
+    v_qp = rotate_velocity_active_to_qp(v_dft_basis, U_dft_to_qp, mesh=mesh)
+    # The per-map head block: p, V_NL and Sigma shares of this velocity.
+    pieces = ([("p", velocity_kinetic_cart),
+               ("V_NL", base - velocity_kinetic_cart)]
+              if velocity_kinetic_cart is not None else [("p + V_NL", base)])
+    if correction is not None:
+        pieces.append(("Sigma", correction))
+    names, shares = velocity_term_shares(
+        v_qp, [(name, rotate_velocity_active_to_qp(
+            jnp.asarray(x, dtype=jnp.complex128), U_dft_to_qp, mesh=mesh))
+            for name, x in pieces],
+        nb_logical=nb_logical, surface_weight_kn=surface_weight_qp_kn,
+        energies_kn=energies_qp_kn_ry, occupations_kn=occupations_qp_kn)
+    if zeroed is not None:
+        names, shares = names + ("Sigma",), np.vstack([shares, np.zeros((1, 3))])
+    # Physical state multiplicity belongs to the source WFN.  A
+    # kinetic-balance lift changes only the stored spinor representation.
+    drude_tensor = fermi_surface = pair_split = None
+    if surface_weight_qp_kn is not None:
+        drude_tensor, fermi_surface, pair_split = metal_intraband_model(
+            v_qp, surface_weight_qp_kn, energies_qp_kn_ry, mesh=mesh,
+            nb_logical=nb_logical, cell_volume=float(meta.cell_volume),
+            nk_tot=int(meta.nk_tot), nspin=int(wfn.nspin),
+            nspinor=int(meta.nspinor_wfnfile), bvec_cart=bvec_cart,
+            kgrid=kgrid)
+    return HeadVelocityTerms(
+        v_qp=v_qp, velocity_terms=(names, shares, bound, zeroed),
+        drude_tensor=drude_tensor, fermi_surface=fermi_surface,
+        pair_split=pair_split,
+        sigma_occupations=np.asarray(occupations_qp_kn, dtype=np.float64))
+
+
 def build_iteration_head_response(
     velocity: QPVelocity,
     U_dft_to_qp,
@@ -3882,39 +3955,19 @@ def build_iteration_head_response(
     its ``f_kn``); the static Gamma body is ``gw.w_isdf.compute_chi0_matsubara``
     at ``n = 0`` on it, which refuses any family but Fermi-Dirac.
     """
-    v_dft_basis, base = velocity.dft_cart, velocity.base
-    correction, bound, zeroed = (velocity.correction, velocity.bound,
-                                 velocity.zeroed)
-    v_qp = rotate_velocity_active_to_qp(v_dft_basis, U_dft_to_qp, mesh=mesh)
-    # The per-map head block: p, V_NL and Sigma shares of this velocity.
-    pieces = ([("p", velocity_kinetic_cart),
-               ("V_NL", base - velocity_kinetic_cart)]
-              if velocity_kinetic_cart is not None else [("p + V_NL", base)])
-    if correction is not None:
-        pieces.append(("Sigma", correction))
-    names, shares = velocity_term_shares(
-        v_qp, [(name, rotate_velocity_active_to_qp(
-            jnp.asarray(x, dtype=jnp.complex128), U_dft_to_qp, mesh=mesh))
-            for name, x in pieces],
-        nb_logical=nb_logical, surface_weight_kn=surface_weight_qp_kn,
-        energies_kn=energies_qp_kn_ry, occupations_kn=occupations_qp_kn)
-    if zeroed is not None:
-        names, shares = names + ("Sigma",), np.vstack([shares, np.zeros((1, 3))])
-    velocity_terms = (names, shares, bound, zeroed)
+    terms = head_velocity_terms(
+        velocity, U_dft_to_qp, energies_qp_kn_ry, occupations_qp_kn,
+        surface_weight_qp_kn=surface_weight_qp_kn, mesh=mesh, kgrid=kgrid,
+        bvec_cart=bvec_cart, nb_logical=nb_logical, wfn=wfn, meta=meta,
+        velocity_kinetic_cart=velocity_kinetic_cart)
+    v_qp, velocity_terms = terms.v_qp, terms.velocity_terms
+    drude_tensor, fermi_surface, pair_split = (
+        terms.drude_tensor, terms.fermi_surface, terms.pair_split)
     resolved_eta_ry = (
         float(config.head.wcoul0_eta)
         if eta_ry is None else float(eta_ry)
     )
-    # Physical state multiplicity belongs to the source WFN.  A
-    # kinetic-balance lift changes only the stored spinor representation.
     normalization_nspinor = int(meta.nspinor_wfnfile)
-    drude_tensor = fermi_surface = pair_split = None
-    if surface_weight_qp_kn is not None:
-        drude_tensor, fermi_surface, pair_split = metal_intraband_model(
-            v_qp, surface_weight_qp_kn, energies_qp_kn_ry, mesh=mesh,
-            nb_logical=nb_logical, cell_volume=float(meta.cell_volume),
-            nk_tot=int(meta.nk_tot), nspin=int(wfn.nspin),
-            nspinor=normalization_nspinor, bvec_cart=bvec_cart, kgrid=kgrid)
     S = head_s_tensor_sharded(
         v_qp,
         energies_qp_kn_ry,

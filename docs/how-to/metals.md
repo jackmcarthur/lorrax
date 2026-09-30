@@ -74,7 +74,7 @@ fixed-N μ).
 | `compute_mode = gn_ppm`, `cohsex` or `hl_ppm` | `gn_ppm_refuses_metals`, `fractional_occupations_require_mpa` |
 | no `occ_smearing_width_ry`, or `occ_smearing_family` | required; `metal_occupations_fermi_dirac` |
 | `occ_broadening > 0` beside `occ_smearing_width_ry` (MP1 smeared head) | `metal_sc_head_update_disabled` |
-| `sc_head_update = parallel_transport` on a bispinor deck, or `dft_velocity` with `full` on a bispinor deck | `metal_sc_head_update_disabled` |
+| `sc_head_update = parallel_transport` on a `bare_transverse` bispinor deck, or `dft_velocity` with `full` on a bispinor deck | `metal_sc_head_update_disabled` |
 | `sc_head_update = interband_commutator` | `sc_head_interband_commutator_insulator_only` |
 | `head_correction = full` on a time-reversal-broken shared-pole store | `shared_pole_head_ordered` |
 | `sigma_w_model = mpa` on a time-reversal-broken metal | `mpa_ordered_metal` |

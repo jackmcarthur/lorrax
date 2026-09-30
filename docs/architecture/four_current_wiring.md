@@ -457,9 +457,13 @@ on one rank ([decisions](decisions.md); plan table in
 
 Packed routes are one-shot (`qp_solver = one_shot_dft`). On SP-full every
 map rebuilds the sector bank and its Ward contact from the map's state.
-The direct Γ head follows `sc_head_update`: `dft_velocity` builds it on the
-map's state with the QP-rotated dipole velocity, and `off` on the DFT state
-at the map's frequencies (`compute_photon_bank(photon_head_state=…)`).
+The direct Γ head follows `sc_head_update`: `parallel_transport` builds it
+on the map's state with the map's QSGW velocity
+$U^\dagger(v_{DFT} + D_k\Delta H)U$ (`qsgw_head.qp_velocity`, the scalar
+head's owner, with its link bound and per-map zeroing; the default where the
+link artifact exists), `dft_velocity` with the QP-rotated dipole velocity,
+and `off` on the DFT state at the map's frequencies
+(`compute_photon_bank(photon_head_state=…)`).
 The two differ by the head's Fermi surface (Fe 4³: ω_p 2.13 → 2.47 eV over
 maps 0–2 under `dft_velocity`). On B,
 self-consistency requires `density_self_consistent = true`. Each map
