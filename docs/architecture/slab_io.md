@@ -77,6 +77,18 @@ the dataset's extent.
 - **Unchanged:** the bytes in the file, the dataset layout and every call
   signature.
 
+**Bounded compact-row reads.** When the requested layout uses every mesh
+axis on dimensions after a replicated split axis, the same file-order
+planner bounds each rank's read piece to64MiB. The native reader reads only
+its compact logical rows; device code pads the later dimensions and reverses
+the writer's volume-preserving exchanges into the requested sharding. Each
+insertion donates the resident output, whose size is the carrier bytes/P.
+For the Ni link carrier8000×3×232² atP4, the compiled insertion adds129MB
+of device scratch beside its64MiB piece and5.17GB donated output. The
+memory bound applies to layouts accepted by the planner; tiny/short file
+runs, replicated or unsupported layouts, and rows larger than the piece
+budget retain the ordinary collective reader. No caller setting changes.
+
 **One collective lane per process.** Every handle's asynchronous writes go
 through one queue and one worker (`_slab_io_ffi._CollectiveLane`), so
 collective HDF5 calls leave in program order, which is the same on every
