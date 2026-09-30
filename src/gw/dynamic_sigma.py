@@ -128,14 +128,21 @@ def add_head_sigma_diag(
             "dynamic Sigma head shape must match the body diagonal: "
             f"head={head.shape}, body={sigma_c_body_omega.shape}")
     if band_axis is not None:
-        from runtime.padding import authenticate_axis, pad_to_axis
+        from runtime.padding import authenticate_axis
         authenticate_axis(
             sigma_c_body_omega, band_axis, axis=-2,
             where="dynamic Sigma body producer")
         authenticate_axis(
             sigma_c_body_omega, band_axis, axis=-1,
             where="dynamic Sigma body producer")
-        head = pad_to_axis(jnp.asarray(head), band_axis, axis=-1)
+        # Padded on the host, and only when the carrier is wider: a device
+        # pad pulled back by the adder was a second (n_omega, nk, nb) host
+        # copy and a device copy per call.
+        if int(band_axis.carrier) != int(head.shape[-1]):
+            padded = np.zeros(head.shape[:-1] + (int(band_axis.carrier),),
+                              dtype=head.dtype)
+            padded[..., :head.shape[-1]] = head
+            head = padded
 
     from .qsgw_utils import add_band_diag_sharded, is_band_sharded_sigma_omega
     if is_band_sharded_sigma_omega(sigma_c_body_omega):
