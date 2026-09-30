@@ -2,6 +2,8 @@
 from pathlib import Path
 import json
 import argparse
+import hashlib
+from dataclasses import replace
 from runtime import initialize_communicator_stack
 rt = initialize_communicator_stack(platform='gpu')
 import numpy as np
@@ -12,6 +14,8 @@ from common.collectives import device_put_process_local, gather_to_host
 from isdf.galerkin import (_reduce_projection_partials, _assemble_coefficient_chunks,
     _solve_coefficient_projection, _selected_gram_from_projection,
     _galerkin_rank_metrics_kernel, _coefficients_from_projection)
+from isdf.galerkin import (GalerkinBasis, _basis_check,
+    _coefficient_null_tail_max, QRCP_RNG_VERSION)
 from bandstructure.fh_interp import _apply_qp_block_to_compact_state
 from file_io.slab_io import SlabIO
 parser=argparse.ArgumentParser();parser.add_argument("--output-dir",type=Path,required=True)
@@ -58,6 +62,39 @@ with SlabIO(path,mode='r',mesh=mesh) as io:
     reread=io.read_slab('C',shape=(nk,nb,rank),partition_spec=sh.spec)
 expected=np.pad(reference[:,:,:physical],((0,0),(0,0),(0,rank-physical)))
 assert np.max(np.abs(gather_to_host(reread)-expected))<2e-15
+# Publication checks an unaligned all-P coefficient tail before SlabIO.
+nodes=np.zeros((rank,2,3),dtype=np.complex128)
+nodes[:physical]=rng.normal(size=(physical,2,3))
+factor=np.eye(rank,dtype=np.complex128)
+pivots=np.arange(physical,dtype='<i8')
+basis=GalerkinBasis(ctilde=reread,
+    basis_at_nodes=device_put_process_local(nodes,NamedSharding(mesh,P(None,None,'y'))),
+    rank_physical=physical,band_range=(0,nb),selected_state_indices=tuple(pivots),
+    selection_factor=device_put_process_local(factor,rep),qrcp_seed=0,
+    qrcp_rng_version=QRCP_RNG_VERSION,qrcp_eps=1e-3,qrcp_raw_rank=physical,
+    qrcp_search_rank=rank,candidate_hash='a'*64,
+    pivot_hash=hashlib.sha256(pivots.tobytes()).hexdigest())
+provenance=dict(band_range=(0,nb),nk=nk,nb=nb,nspinor=2,
+    centroid_shape=(3,),qrcp_seed=0,qrcp_eps=1e-3,qrcp_rng=QRCP_RNG_VERSION)
+_basis_check(basis,provenance)
+corrupt=expected.copy();corrupt[-1,-1,-1]=1e-14
+corrupt=device_put_process_local(corrupt,sh)
+assert float(_coefficient_null_tail_max(corrupt,physical=physical))==1e-14
+try:
+    _basis_check(replace(basis,ctilde=corrupt),provenance)
+    raise AssertionError('nonzero synthetic coefficient was accepted')
+except ValueError as exc:
+    assert 'exact-null/identity' in str(exc)
+tail_shape=(8000,184,2108)
+tail_abstract=jax.ShapeDtypeStruct(tail_shape,jnp.complex128,sharding=sh)
+tail_exe=_coefficient_null_tail_max.lower(tail_abstract,physical=2105).compile()
+tail_mem=tail_exe.memory_analysis()
+assert tail_mem.temp_size_in_bytes<64*1024**2,tail_mem
+assert 'all-gather' not in tail_exe.as_text()
+tail_receipt=dict(shape=tail_shape,physical_rank=2105,carried_rank=2108,
+    temp_bytes=tail_mem.temp_size_in_bytes,argument_bytes=tail_mem.argument_size_in_bytes,
+    output_bytes=tail_mem.output_size_in_bytes,no_all_gather=True,
+    exact_zero_passed=True,nonzero_1e_minus14_refused=True)
 metrics_small=_galerkin_rank_metrics_kernel(mesh,solved.shape,selected_rows=tuple(selected),physical=len(selected))(solved,ld)
 gram=np.einsum('kna,kma->knm',reference,reference.conj())
 norm=np.diagonal(gram,axis1=1,axis2=2).real
@@ -89,5 +126,7 @@ assert legacy_mem.output_size_in_bytes==local*4
 assert "all-gather" in legacy.as_text()
 if jax.process_index()==0:
     target=out/'result.json'
-    target.write_text(json.dumps(dict(parity_max_abs=err,rows=rows,replicated_negative_output_bytes=legacy_mem.output_size_in_bytes),indent=2)+'\n')
+    target.write_text(json.dumps(dict(parity_max_abs=err,rows=rows,
+        publication_tail=tail_receipt,
+        replicated_negative_output_bytes=legacy_mem.output_size_in_bytes),indent=2)+'\n')
     print('GALERKIN RANK SHARDS PASS',json.dumps(rows),flush=True)
