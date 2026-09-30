@@ -797,10 +797,19 @@ def _get_chi_fractional_contour_kernel_face(
                            enable_active_range=band_ranges is not None)
     # Four-current stream on raw-parent plans: each quadrant's parent Green pair
     # goes straight into mathdx mode 11 with the channel vertices (unfold on the
-    # load, the traces in its Mid); no full-k Green exists.
+    # load, the traces in its Mid); no full-k Green exists.  A CUDA grid the
+    # door cannot hold refuses (no full-k fallback on the GPU); a non-CUDA
+    # backend takes the door's reference arm.
     photon_doors = None
-    if (photon is not None and half_parity is not None
-            and _chi_door_serves(mesh_xy, grid, 2)):
+    if photon is not None and half_parity is not None:
+        from ffi import fft as _F
+        why = _F.chi_unfold_refusal(grid, 2) if _F.kconv_backend(mesh_xy) == "mathdx" else ""
+        if why:
+            raise ValueError(
+                f"GATE response_vertex_grid: got k-grid {grid} for the four-current "
+                f"response; want a grid mathdx mode 11 holds at ns=2; why: {why}, and "
+                "the stream builds its Greens only on the raw parents (no full-k "
+                "Green quadrant on the GPU)")
         photon_doors = _photon_chi_doors(mesh_xy, grid, half_plans, half_parity)
     active_gemms = (tuple(g_plan.prepare_active_range(*bounds) for bounds in band_ranges)
                    if band_ranges is not None else (None, None))
