@@ -355,7 +355,11 @@ def _coefficient_null_tail_max(ctilde, *, physical):
     shards keeps the large input at its owner and only reduces one scalar.
     """
     null = jnp.arange(ctilde.shape[-1]) >= int(physical)
-    return jnp.max(jnp.where(null, jnp.abs(ctilde), 0.0))
+    maximum = jnp.max(jnp.where(null, jnp.abs(ctilde), 0.0))
+    # GPU max may suppress NaN; the exact-null publication gate must refuse
+    # any nonfinite carried coefficient as well as finite contamination.
+    nonfinite = jnp.any(null & ~jnp.isfinite(ctilde))
+    return jnp.where(nonfinite, jnp.nan, maximum)
 
 
 def _basis_check(basis: GalerkinBasis, provenance: dict) -> None:
