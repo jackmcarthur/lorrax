@@ -15,7 +15,11 @@ max(`sigma_quadrature_eps`, 3e-3), instead of at Σ(ω = 0), and
 `sigma_omega_patches_ev` `lo:hi:eta` triples behave the same on both routes.
 `sc_semicore = dft` named on a run without a coarse class no longer refuses
 (`GATE sc_semicore` is gone); it logs that there is nothing to pin.
-Scalar decks are bitwise.
+Scalar decks are bitwise. A `full_shared_pole` SC run's head is its sector
+model, so a converged run no longer refuses at the end
+(`GATE sc_final_map_requires_iteration_head`), and a one-map
+`dft_velocity` run is admitted (`GATE full_shared_pole_dft_velocity_one_map`
+is gone).
 
 ## 2026-09-29 — bulk bispinor V carries the mini-BZ head average; bispinor refusals move to setup
 
@@ -24,8 +28,7 @@ Every bulk (`sys_dim = 3`) bispinor deck with `mc_average_vcoul_body = true`
 average at the q ≠ 0 head slot (`v_q_g_flat.v_head_fn_in_V`, one owner); a TT
 slot takes ⟨v⟩ P^T(K̂). Slab decks are unchanged. `full_shared_pole` with
 `head_correction` unset resolves to `no_local_fields` (logged); an explicit
-`full` still refuses. `full_shared_pole` SC with `dft_velocity` and
-`sc_max_iter < 2` refuses at parse. `w_bse` and `hl_ppm` on a WFN without
+`full` still refuses. `w_bse` and `hl_ppm` on a WFN without
 measured time reversal refuse before the basis, not after ζ and V (HL-PPM used
 to keep one residue silently). Headless shared-pole SC warns on bispinor FD
 metals too.
