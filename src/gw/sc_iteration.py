@@ -3638,6 +3638,8 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
             support_session=(None if inputs.fixed_quadrature_session is None else
                              inputs.fixed_quadrature_session.setdefault(
                                  "shared_pole_supports", {})))
+        _record_shared_pole_replans(inputs, int(state.iteration),
+                                    inputs.meta.shared_pole_recipe)
         bind_shared_pole_sc_identity(
             inputs.meta, state, occupation_state=entry_occ_state,
             print_fn=inputs.print_fn)
@@ -4649,6 +4651,22 @@ def _refuse_empty_map_output(e_output_kn_ev: np.ndarray, *,
             f"map_output_RMS_dE_prev_output then comes back as RMS|E_DFT| "
             f"(24.68 eV on the sodium 48b one-shot metallic arm), and every "
             f"downstream residual reads zero, i.e. FALSE converged.")
+
+
+def _record_shared_pole_replans(inputs, iteration, recipe):
+    """One SC log line per held W sampling object re-planned on this map
+    (``shared_pole_recipe``: line sites past LINE_SITE_HOLD_EV, a sector
+    ceiling below twice the current span)."""
+    if not recipe:
+        return
+    replan = (recipe.get("support_envelope") or {}).get("line_site_replan")
+    if replan:
+        _record_sc(inputs, f"SC W line sites re-planned (map {iteration}): {replan}")
+    ceiling = recipe.get("sector_pole_treatment") or {}
+    if ceiling.get("status") == "replanned":
+        _record_sc(inputs, f"SC W treatment ceiling re-planned (map {iteration}): "
+                   f"{ceiling['ceiling_ry']:.6f} Ry = 2 x current span "
+                   f"{ceiling['current_response_span_ry']:.6f} Ry")
 
 
 def _record_sc(inputs: SCInputs, line: str) -> None:

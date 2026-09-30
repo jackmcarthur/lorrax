@@ -1203,11 +1203,11 @@ def resolve_shared_pole_recipe(config, wfns, meta, *, mesh_xy, print_fn,
                     support_receipt.update(status='expanded', epoch=support_session['epoch'])
                     worst = (int(np.argmax(np.abs(line - held)))
                              if line.shape == held.shape else -1)
-                    print_fn(f"  SC W line sites re-planned: max site drift {drift:.4f} eV > "
-                             f"{LINE_SITE_HOLD_EV:.4f} eV (site {worst}: "
-                             f"{held[worst] if worst >= 0 else float('nan'):.4f} -> "
-                             f"{line[worst] if worst >= 0 else float('nan'):.4f} eV); "
-                             f"epoch {support_session['epoch']}")
+                    support_receipt['line_site_replan'] = (
+                        f"max site drift {drift:.4f} eV > {LINE_SITE_HOLD_EV:.4f} eV "
+                        f"(site {worst}: {held[worst] if worst >= 0 else float('nan'):.4f} -> "
+                        f"{line[worst] if worst >= 0 else float('nan'):.4f} eV); "
+                        f"epoch {support_session['epoch']}")
             # This is the existing SC sampling geometry, never W samples or a model.
             support_session['line_ev'] = tuple(float(v) for v in line)
     if override is not None:
