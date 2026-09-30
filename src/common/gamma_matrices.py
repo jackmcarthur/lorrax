@@ -90,6 +90,17 @@ sigma_y = jnp.asarray(_T_SIGMA_Y)
 sigma_z = jnp.asarray(_T_SIGMA_Z)
 paulis = jnp.asarray(_np.stack((_T_SIGMA_X, _T_SIGMA_Y, _T_SIGMA_Z)))
 
+# Physical Dirac spin S_i/hbar = diag(sigma_i, sigma_i)/2 in the native
+# [Psi_L; Psi_S] kinetic-balance ordering. Expectations use the norm of the
+# complete carrier, including its small components (bispinor-gw.md section 1).
+_T_DIRAC_SPINS = _np.stack(tuple(
+    _np.kron(_np.eye(2), sigma) / 2
+    for sigma in (_T_SIGMA_X, _T_SIGMA_Y, _T_SIGMA_Z)))
+dirac_spin_x = jnp.asarray(_T_DIRAC_SPINS[0])
+dirac_spin_y = jnp.asarray(_T_DIRAC_SPINS[1])
+dirac_spin_z = jnp.asarray(_T_DIRAC_SPINS[2])
+dirac_spins = jnp.asarray(_T_DIRAC_SPINS)
+
 gamma0 = jnp.asarray(_T_GAMMA0)
 gamma1 = jnp.asarray(_T_GAMMA1)
 gamma2 = jnp.asarray(_T_GAMMA2)
@@ -428,6 +439,7 @@ def set_gamma_contract_mode(mode: str) -> None:
 
 __all__ = [
     "sigma_x", "sigma_y", "sigma_z", "paulis",
+    "dirac_spin_x", "dirac_spin_y", "dirac_spin_z", "dirac_spins",
     "gamma0", "gamma1", "gamma2", "gamma3", "gamma5",
     "gammas_perm", "gammas_phase",
     "gamma_perm_phase", "gamma_apply", "gamma_double_contract",
