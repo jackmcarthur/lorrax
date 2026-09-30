@@ -132,6 +132,9 @@ _TEST_MAX_PANEL_BLOCKS = None
 #: Test hook: the largest parent-q panel the instantaneous constant is read
 #: and packed in (``None``: the ledger decides).
 _TEST_CONSTANT_Q_SPAN = None
+#: Test hook: build the antiunitary partner by its GEMM even when the ledger
+#: holds lax.cond's copy of it.
+_TEST_DIRECT_PARTNER = False
 
 
 class LorentzPanels:
@@ -184,9 +187,17 @@ def sector_tau_factory(left, right, keys, meta, mesh_xy):
     # most N_b/p_x bands each) are bounded by one parent Green tile when the
     # ledger's room beside the warm workspace holds it, else by what the room
     # holds (green_panel_bytes).
-    panel = (green_panel_bytes(n_rows=q, m=m, n=n, mesh=mesh_xy,
-                               room=ledger.room_bytes_per_rank(ledger.live_stages) - warm)
+    room = ledger.room_bytes_per_rank(ledger.live_stages) - warm
+    panel = (green_panel_bytes(n_rows=q, m=m, n=n, mesh=mesh_xy, room=room)
              if face_green else 0)
+    # The antiunitary partner behind build_G_parents' device predicate
+    # (lax.cond: conj(G) at real weights, else its own GEMM) is held twice at
+    # the cond's exit, branch value and output.  When the room beside the warm
+    # workspace cannot hold that copy and the door's Sigma_k (two parent tiles,
+    # Fe 20^3/P36 24.5 GB/rank each), the partner is built by its GEMM with no
+    # predicate: the same values (conj of a product is exact), one tile.
+    tile = 16*q*m*n//mesh_xy.size
+    direct_partner = bool(_TEST_DIRECT_PARTNER) or room - panel < 2*tile
     ledger.reserve(f'sigma.sector.tau.warm.{keys[0]}',
         resident_bytes_per_rank=0, workspace_bytes_per_rank=warm + panel,
         concurrent_with=ledger.live_stages)
@@ -218,7 +229,8 @@ def sector_tau_factory(left, right, keys, meta, mesh_xy):
             phases = _weighted_tau_phases(energies, 1j*time, e_ref=reference,
                                          band_weight=weight)
             green = build_G_parents(xn, yr, phases=phases, layout=a.layout,
-                                    gemm=gemm, k_unfold_plan=plans[0])
+                                    gemm=gemm, k_unfold_plan=plans[0],
+                                    real_weights=False if direct_partner else None)
             if whole is not None:
                 return project(xr, doors[0](green, whole), yn)
             # Panels in sequence: the barrier makes panel i+1's W(t) wait for
@@ -238,7 +250,7 @@ def sector_tau_factory(left, right, keys, meta, mesh_xy):
         # Everything spatial() closes over is a function of this key; SC maps
         # keep the parent plans, so their identities are stable.
         key=(mesh_xy,a.layout,shapes,int(b),tuple(keys),tuple(int(v) for v in meta.kgrid),
-             int(meta.nk_tot),id(plans[0]),id(plans[1]),panels)
+             int(meta.nk_tot),id(plans[0]),id(plans[1]),panels,direct_partner)
         return SynthesisTau(spatial, synthesis, right_yr, right_proj,
                          native+synthesis.native, f'sigma.sector.tau.{keys[0]}', meta, key, plans)
     return factory
