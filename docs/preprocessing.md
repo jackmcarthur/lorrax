@@ -9,20 +9,24 @@ by LORRAX's own preprocessing steps. This page is the step before
     The **LORRAX side** (what `WFN.h5` must contain, what reads it, what is available on
     Perlmutter) was read off a real file and a real machine and is marked *verified*
     below. The **Quantum ESPRESSO namelists** of §2 are a starting point to check against
-    your QE version's documentation; the inputs of a run that was executed are
-    `tests/hsuite/fixture/{scf,nscf,pw2bgw}.in`.
+    your QE version's documentation. The inputs of a chain that was executed, for a
+    magnetic spinor cell, are `tests/hsuite/fixture/{scf,nscf,pw2bgw}.in`.
 
 ## The chain
 
 ```text
   QE scf  →  QE nscf (empty states, GW k-grid)  →  pw2bgw.x  →  wfn2hdf.x  →  WFN.h5
-                                                       │
-                                                       └→ vxc.dat, kih.dat (optional)
+                  │                                    │
+                  │                                    └→ vxc.dat, kih.dat (BerkeleyGW only, §4)
+                  └→ <prefix>.save/data-file-schema.xml (keep it beside WFN.h5)
 ```
+
+A LORRAX run directory holds three things from the DFT side: `WFN.h5`, the `*.upf`
+pseudopotentials, and `data-file-schema.xml`.
 
 Then, from `WFN.h5`, LORRAX's own three preprocessing steps produce `centroids_frac_<N>.txt`,
 `dipole.h5` and `kin_ion.h5` — see
-[Quickstart → Your first real calculation](quickstart.md#your-first-real-calculation).
+[Quickstart → A first GW calculation](quickstart.md#first-calculation).
 A WFN with every band of the plane-wave basis comes from the QE `.save` through
 [`psp.run_dense_h`](how-to/complete-basis-wfn.md).
 
@@ -76,60 +80,78 @@ Export with `pw2bgw.x`, then convert the binary to HDF5:
    real_or_complex = 2
    wfng_flag = .true.,  wfng_file = 'WFN'
    wfng_kgrid = .true., wfng_nk1 = 4, wfng_nk2 = 4, wfng_nk3 = 4
-   vxc_flag = .true.,   vxc_file = 'vxc.dat'
-   kih_flag = .true.,   kih_file = 'kih.dat'
+   vxc_flag = .false.
+   kih_flag = .false.
 /
 ```
 
 ```bash
 pw2bgw.x -in pw2bgw.in > pw2bgw.out
 wfn2hdf.x BIN WFN WFN.h5
+cp Si.save/data-file-schema.xml .
 ```
 
-`nbnd` here is the summation band count and becomes `nband` in the LORRAX deck; they should
-match. `wfng_nk*` must be the unshifted grid you intend to run GW on.
+Run `pw2bgw.x` right after the NSCF: each `pw.x` run overwrites `<prefix>.save/`.
 
-!!! warning "Stock `pw2bgw` does not export spinor wavefunctions with magnetization"
-    LORRAX's spinor path needs a **patched** `pw2bgw`. The patched source
-    `pw2bgw_qe7.2_with_spinor_mag.f90` supports both full-spinor and non-spinor
-    calculations, and enables magnetization for full-spinor runs **with no symmetries
-    allowed**. Install it by copying it over `QE7.2/PP/src/pw2bgw.f90` and rebuilding QE.
-    This is also the writer whose `tnp = (S⁻¹·ft)·2π` convention
-    [Theory → Symmetry](theory/symmetry.md) documents.
+- `nbnd` must exceed the deck's `number_bands` by at least one band, and the band at
+  `number_bands` must not split a degenerate multiplet. GW refuses a deck that breaks
+  either rule and names the fix.
+- `wfng_nk*` must be the unshifted grid you intend to run GW on.
+- `data-file-schema.xml` goes beside `WFN.h5` (or leave the `.save` directory there).
+  The WFN header does not say which symmetry operations include time reversal; LORRAX
+  reads that from the schema. Without it a run prints `SYMMETRY PROVENANCE WARNING` and
+  treats every header operation as purely spatial, which is wrong for a magnet whose QE
+  symmetries include one combined with time reversal.
 
-    The patched source and its README are **not in this repository**. They live with the
-    BerkeleyGW MeanField sources; the copy this project has been using is under a
-    `docs_bgw/` tree alongside `wfn.h5.spec`. Ask before assuming a stock QE build will do.
+### Magnetic spinor wavefunctions {#magnetic}
+
+| QE version | `pw2bgw.x` |
+|---|---|
+| 7.3.1 | The stock tool exports a noncollinear magnetic WFN and keeps its symmetry operations. The bundled H2+ fixture was written this way, with NERSC's `espresso/7.3.1-libxc-6.2.2-cpu` module (4 operations, 2 with fractional translations). |
+| 7.2 | BerkeleyGW ships a replacement source, `MeanField/ESPRESSO/version-7.2/pw2bgw_qe7.2_with_spinor_mag.f90` in the BerkeleyGW 4.0 tree. Copy it over `PP/src/pw2bgw.f90` in the QE 7.2 source and rebuild QE. Its README allows magnetization only in a run with no symmetries. LORRAX has not been run on its output. |
+
+No patch is kept in this repository.
 
 ## 3. On Perlmutter — *verified*
 
-Neither tool is on `PATH` by default. Measured 2026-08-06:
+Neither tool is on `PATH` by default:
 
 | tool | where |
 |---|---|
 | `wfn2hdf.x`, `hdf2wfn.x`, `kgrid.x` | `module load berkeleygw/4.0-gcc-12.3` (or `4.0-nvhpc-23.9`), which prepends `/global/common/software/nersc9/berkeleygw/zen3/gcc-12/mpich/berkeleygw/BerkeleyGW-4.0/bin` |
-| `pw2bgw.x` | **not** in the BerkeleyGW module — it is a Quantum ESPRESSO post-processing tool and ships in QE's `bin`. NERSC provides `espresso/7.3.1-libxc-6.2.2-{cpu,gpu}` and `espresso/7.5-libxc-7.0.0-{cpu,gpu}` |
+| `pw.x`, `pw2bgw.x` | `module load espresso/7.3.1-libxc-6.2.2-cpu` (or `espresso/7.5-libxc-7.0.0-cpu`). `pw2bgw.x` is a Quantum ESPRESSO tool and is not in the BerkeleyGW module. |
 
-Since the spinor path needs a patched `pw2bgw.f90` (§2), the NERSC `espresso` modules will
-not supply it — that route requires your own QE build.
+The two bundled fixtures were built with these modules: the magnetic spinor H2+ cell with
+7.3.1, the scalar Na cell with 7.5. No private QE build is needed.
 
 Run all of this on a compute node (`srun`, as in
 [Installation › Perlmutter](installation/perlmutter.md#suite)), not on a login node.
 
-## 4. `vxc.dat` and `kih.dat`
+## 4. `vxc.dat` and `kih.dat` {#vxc-kih}
 
-`pw2bgw` can also export the exchange-correlation (`vxc_flag`) and kinetic+ionic
-(`kih_flag`) matrix elements. LORRAX computes its own kinetic+ionic term with
-`gw.kin_ion_io` (step 3 of the preprocessing chain), so `kih.dat` is not required — but it
-is the natural independent cross-check when the `H0 = kin_ion + V_H` sanity banner fires,
-and the banner itself suggests it:
+LORRAX reads neither file, and no deck key names them. It builds the mean-field side
+itself: `gw.kin_ion_io` writes the kinetic and ionic matrix ($T + V_\mathrm{ion}$,
+`kin_ion.h5`), `gw.gw_jax` adds the Hartree term from the density, and the quasiparticle
+energies come from $T + V_\mathrm{ion} + V_H + \Sigma$. $V_{xc}$ never enters. For a
+LORRAX-only run set `vxc_flag = .false.` and `kih_flag = .false.`, as
+`tests/hsuite/fixture/pw2bgw.in` does.
 
-```text
-Cross-check H0 against pw2bgw's kih.dat.
-```
+Write them in two cases:
 
-The consumption path and default filenames on the LORRAX side for these two files are
-**not documented and were not verified here**; treat them as an expert route.
+- **A BerkeleyGW comparison.** `sigma.x` needs `vxc.dat` or `kih.dat` (its
+  `sigma.inp` documents the choice). Add to `&input_pw2bgw`:
+
+    ```fortran
+       vxc_flag = .true.,  vxc_file = 'vxc.dat'
+       kih_flag = .true.,  kih_file = 'kih.dat'
+       vxc_diag_nmin = 1,  vxc_diag_nmax = 80     ! 1 … nbnd
+    ```
+
+- **A check of the mean-field side.** `kih.dat` is QE's own diagonal of
+  $T + V_\mathrm{ion} + V_H$. When `gwjax.out` prints the banner
+  `H0 = kin_ion + V_H … is UNPHYSICAL`, compare `kih.dat` by hand with LORRAX's same
+  quantity: the diagonal of `kin_ion.h5` plus the `VH` column of `sigma_diag.dat`. No
+  LORRAX tool reads `kih.dat`.
 
 ## See also
 
