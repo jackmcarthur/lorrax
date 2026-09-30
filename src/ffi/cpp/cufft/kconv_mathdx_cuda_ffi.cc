@@ -1532,6 +1532,12 @@ struct ChiArgs {
     long long p0, npairs, pairs, my;           // this launch's pairs [p0, p0 + npairs) of pairs
     int n_out;
     double si;                                 // the inverse transform's scale
+    // LRX_VTX: the four-current channels.  Vertex i of a side is packed as mode 8's LorentzTab
+    // (perm entry (i, a) at bits 16*i + 4*a, phase code (i, a) at bits 8*i + 2*a); channel
+    // ch = i*vnb + j writes acc planes [ch*n_out, (ch+1)*n_out).  vch0: the split arm's first
+    // channel of this pencil pass (members vch0 .. vch0 + GRP - 1).
+    unsigned long long vperm_l, vphase_l, vperm_r, vphase_r;
+    int vna, vnb, vch0;
 };
 
 struct ChiLoad {
@@ -1596,6 +1602,44 @@ __device__ __forceinline__ void lrx_chi_acc(const ChiArgs& a, int k, long long p
     }
 }
 
+#if LRX_VTX
+// Channel ch = (i, j): the four-current trace of the pair's two transformed operands,
+//     v = sum_ab conj(ph_l[i,a]) ph_r[j,b] conj(si Gc'[pl a, pr b]) (si Gv'_ab)   (a-major)
+// the product conj(ph_l conj(ph_r) si Gc') being an exact rotation; the identity vertex is
+// lrx_chi_value's product bit for bit.  The vertices act on the Gc operand's spin indices.
+template <class Get>
+__device__ __forceinline__ lrx_c2 lrx_chi_vertex(const Get& g, const ChiArgs& a, int ch) {
+    const int i = ch / a.vnb, j = ch - (ch / a.vnb) * a.vnb;
+    lrx_c2 v = {0.0, 0.0};
+#pragma unroll
+    for (int p = 0; p < NS; ++p) {
+        const int pa = (int)((a.vperm_l >> (16 * i + 4 * p)) & 15);
+        const int ca = (int)((a.vphase_l >> (8 * i + 2 * p)) & 3);
+#pragma unroll
+        for (int r = 0; r < NS; ++r) {
+            const int pb = (int)((a.vperm_r >> (16 * j + 4 * r)) & 15);
+            const int cb = (int)((a.vphase_r >> (8 * j + 2 * r)) & 3);
+            const lrx_c2 gv = g(p * NS + r), gc = g(SS + pa * NS + pb);
+            const lrx_c2 w = lrx_phase({gc.x * a.si, gc.y * a.si}, (ca + 4 - cb) & 3);
+            const lrx_c2 x = {w.x, -w.y};
+            const lrx_c2 y = {gv.x * a.si, gv.y * a.si};
+            lrx_cmac(v, x, y);
+        }
+    }
+    return v;
+}
+
+// acc plane ch*n_out + o += alpha[o] * v.
+__device__ __forceinline__ void lrx_chi_acc_ch(const ChiArgs& a, int k, long long pr, int ch, lrx_c2 v) {
+    for (int o = 0; o < a.n_out; ++o) {
+        lrx_c2* e = a.acc + ((long long)(ch * a.n_out + o) * NK + k) * a.pairs + pr;
+        lrx_c2 w = *e;
+        lrx_cmac(w, a.alpha[o], v);
+        *e = w;
+    }
+}
+#endif
+
 // Single arm: the group Mid reduces the pair's GRP transformed values and accumulates them.
 // mid_group_tile runs one thread per (k, pair) of the tile, so every thread of the block takes
 // part in the accumulation (a column-wise Store would leave it to the pairs' leading columns).
@@ -1603,15 +1647,26 @@ struct ChiMid {
     const ChiArgs* a;
     template <class Get>
     __device__ void group(int k, long long g, const Get& get) const {
+#if LRX_VTX
+        for (int ch = 0; ch < a->vna * a->vnb; ++ch)
+            lrx_chi_acc_ch(*a, k, a->p0 + g, ch, lrx_chi_vertex(get, *a, ch));
+#else
         lrx_chi_acc(*a, k, a->p0 + g, lrx_chi_value(get, a->si));
+#endif
     }
 };
 
 struct ChiStore {                              // split arm: the pair's leading column accumulates
     const ChiArgs* a;
     __device__ void put(int k, long long col, lrx_c2 v) const {
+#if LRX_VTX
+        // Member m of this pencil pass carries channel vch0 + m.
+        const int ch = a->vch0 + (int)(col % GRP);
+        if (ch < a->vna * a->vnb) lrx_chi_acc_ch(*a, k, a->p0 + col / GRP, ch, v);
+#else
         if (col % GRP) return;
         lrx_chi_acc(*a, k, a->p0 + col / GRP, v);
+#endif
     }
 };
 
@@ -1623,16 +1678,24 @@ struct ChiCols {
 struct ChiPencilMid {
     static constexpr int kAux = 0;
     double si;
+    const ChiArgs* a;
     __device__ void stage_aux(lrx_c2*, long long, long long, int) const {}
     struct F {
         int member;
         double si;
+        const ChiArgs* a;
         __device__ lrx_c2 operator()(const lrx_c2* grp, const lrx_c2*) const {
+#if LRX_VTX
+            const int ch = a->vch0 + member;
+            if (ch >= a->vna * a->vnb) return grp[member * LRX_TY];
+            return lrx_chi_vertex([&](int q) { return grp[q * LRX_TY]; }, *a, ch);
+#else
             if (member != 0) return grp[member * LRX_TY];
             return lrx_chi_value([&](int q) { return grp[q * LRX_TY]; }, si);
+#endif
         }
     };
-    __device__ F bind(int member) const { return F{member, si}; }
+    __device__ F bind(int member) const { return F{member, si, a}; }
 };
 #endif
 
@@ -1690,7 +1753,7 @@ extern "C" __global__ void __launch_bounds__(LRX_THREADS, LRX_MINB) lrx_kconv(Ch
             sm, ncols, ld, lrx_kbox::Plain<lrx_c2>{a.y, ncols});
     } else {
         lrx_kbox::pencil_group_pass<NX, NY, NZ, LRX_SM, GRP, LRX_TY, false>(
-            a.y, sm, ncols, a.npairs, ChiCols{}, ChiPencilMid{a.si}, st);
+            a.y, sm, ncols, a.npairs, ChiCols{}, ChiPencilMid{a.si, &a}, st);
     }
 #endif
 }
@@ -2258,7 +2321,8 @@ static ffi::Error build(int mode, int nkx, int nky, int nkz, int ns, bool f32,
         defs.push_back("-DLRX_TR=" + std::to_string(chi_trc));
         defs.push_back("-DLRX_TY=" + std::to_string(chi_ty));
         defs.push_back("-DLRX_THREADS=" + std::to_string(chi_threads));
-        defs.push_back("-DLRX_COMPLETE=" + std::to_string(variant));
+        defs.push_back("-DLRX_COMPLETE=" + std::to_string(variant & 1));
+        defs.push_back("-DLRX_VTX=" + std::to_string((variant >> 1) & 1));
         defs.push_back("-DLRX_TT=" + std::to_string(chi_tt ? 1 : 0));
         defs.push_back("-DLRX_TP=" + std::to_string(chi_tt));
         defs.push_back("-DLRX_MINB=" + std::to_string(chi_minb));
@@ -3044,16 +3108,20 @@ struct ChiArgs {
     long long p0, npairs, pairs, my;
     int n_out;
     double si;
+    unsigned long long vperm_l, vphase_l, vperm_r, vphase_r;
+    int vna, vnb, vch0;
 };
 
-// Mode 11: chi_R accumulation from the raw-parent Green pair.  acc (n_out, nk, mx, my) in place.
-static ffi::Error KleadChiUnfold(
+// Mode 11: chi_R accumulation from the raw-parent Green pair.  acc (n_out, nk, mx, my) in place;
+// with vertices (na, nb > 0) acc (na*nb*n_out, nk, mx, my), channel-major.
+static ffi::Error KleadChiUnfoldImpl(
     cudaStream_t stream, ffi::ScratchAllocator scratch, ffi::AnyBuffer Gv, ffi::AnyBuffer Gvt,
     ffi::AnyBuffer Gc, ffi::AnyBuffer Gct, ffi::AnyBuffer row, ffi::AnyBuffer trs, ffi::AnyBuffer lsrc,
     ffi::AnyBuffer rsrc, ffi::AnyBuffer mph, ffi::AnyBuffer nph, ffi::AnyBuffer spin, ffi::AnyBuffer alpha,
     ffi::AnyBuffer acc_in, ffi::Result<ffi::AnyBuffer> acc, int64_t nkx, int64_t nky, int64_t nkz, double si,
     int64_t conj_trs, int64_t complete, int64_t scratch_bytes, std::string_view mathdx_root,
-    std::string_view cubin_dir) {
+    std::string_view cubin_dir, ffi::Span<const int64_t> perm_l, ffi::Span<const int64_t> phase_l,
+    ffi::Span<const int64_t> perm_r, ffi::Span<const int64_t> phase_r, int64_t na, int64_t nb) {
     auto bad = [](const std::string& why) {
         return fail("klead chi unfold", why, ffi::ErrorCode::kInvalidArgument);
     };
@@ -3071,23 +3139,53 @@ static ffi::Error KleadChiUnfold(
     const auto gd = Gv.dimensions(), sd = spin.dimensions(), ad = acc_in.dimensions();
     if (gd.size() != 3 || sd.size() != 3 || ad.size() != 4)
         return bad("want Gv (n_parent, ml, nl), spin (nk, ns, ns) and acc (n_out, nk, mx, my)");
-    const int64_t np = gd[0], ml = gd[1], nl = gd[2], ns = sd[1], n_out = ad[0];
+    // Vertices: na x nb channels, each n_out planes (channel-major); none: one channel.
+    const bool vtx = na > 0 || nb > 0;
+    if (vtx && (na < 1 || nb < 1 || na > 3 || nb > 3 || complete != 0))
+        return bad("want vertex counts na, nb in [1, 3] (or both 0) and no static completion with vertices");
+    const int64_t n_ch = vtx ? na * nb : 1;
+    if (ad.size() == 4 && ad[0] % n_ch)
+        return bad("want acc planes = na * nb * n_out");
+    const int64_t np = gd[0], ml = gd[1], nl = gd[2], ns = sd[1], n_out = ad.size() == 4 ? ad[0] / n_ch : 0;
     const auto C = ffi::DataType::C128, I = ffi::DataType::S32;
     if ((ns != 1 && ns != 2 && ns != 4) || ml % ns || nl % ns || np < 1 || n_out < 1 ||
         (conj_trs != 0 && conj_trs != 2) || (complete != 0 && complete != 1) ||
         !is(Gv, C, {np, ml, nl}) || !is(Gvt, C, {np, ml, nl}) || !is(Gc, C, {np, ml, nl}) ||
         !is(Gct, C, {np, ml, nl}) || !is(row, I, {nk}) || !is(trs, I, {nk}) || !is(lsrc, I, {nk, ml}) ||
         !is(rsrc, I, {nk, nl}) || !is(mph, C, {nk, ml}) || !is(nph, C, {nk, nl}) || !is(spin, C, {nk, ns, ns}) ||
-        !is(alpha, C, {n_out}) || !is(acc_in, C, {n_out, nk, ml / ns, nl / ns}) ||
-        !is(*acc, C, {n_out, nk, ml / ns, nl / ns}))
+        !is(alpha, C, {n_out}) || !is(acc_in, C, {n_ch * n_out, nk, ml / ns, nl / ns}) ||
+        !is(*acc, C, {n_ch * n_out, nk, ml / ns, nl / ns}))
         return bad("want c128 Gv=Gvt=Gc=Gct (np,ml,nl); s32 row,trs (nk), lsrc (nk,ml), rsrc (nk,nl); c128 "
                    "mph (nk,ml), nph (nk,nl), spin (nk,ns,ns), alpha (n_out,), acc (n_out,nk,ml/ns,nl/ns); "
                    "conj_trs 0 (partner tiles) | 2 (the partner is conj(G)); complete 0|1");
+    unsigned long long vpl = 0, vhl = 0, vpr = 0, vhr = 0;
+    if (vtx) {
+        std::string why;
+        auto pack = [&](ffi::Span<const int64_t> perm, ffi::Span<const int64_t> phase, int64_t count,
+                        const char* side, unsigned long long* pp, unsigned long long* hp) {
+            if (perm.size() != static_cast<size_t>(count * ns) || phase.size() != static_cast<size_t>(count * ns)) {
+                why = std::string(side) + " perm/phase lengths != (vertices * ns)"; return false;
+            }
+            for (int64_t i = 0; i < count; ++i) {
+                unsigned long long p1 = 0, h1 = 0;
+                if (!pack_attrs(ffi::Span<const int64_t>(perm.begin() + i * ns, ns),
+                                ffi::Span<const int64_t>(phase.begin() + i * ns, ns), ns, side, &p1, &h1, &why))
+                    return false;
+                *pp |= p1 << (16 * i);
+                *hp |= h1 << (8 * i);
+            }
+            return true;
+        };
+        if (!pack(perm_l, phase_l, na, "left", &vpl, &vhl) || !pack(perm_r, phase_r, nb, "right", &vpr, &vhr))
+            return bad(why);
+    }
     const int64_t my = nl / ns, pairs = (ml / ns) * my;
     if (pairs == 0) return ffi::Error::Success();
     const Built* k = nullptr;
+    // variant: bit 0 the static completion, bit 1 the four-current channels (LRX_VTX).
     ffi::Error e = build(11, static_cast<int>(nkx), static_cast<int>(nky), static_cast<int>(nkz),
-                         static_cast<int>(ns), false, mathdx_root, cubin_dir, &k, 0, static_cast<int>(complete));
+                         static_cast<int>(ns), false, mathdx_root, cubin_dir, &k, 0,
+                         static_cast<int>(complete) + (vtx ? 2 : 0));
     if (!e.success()) return e;
     UnfoldTab t{static_cast<const int*>(row.untyped_data()), static_cast<const int*>(trs.untyped_data()),
                 static_cast<const int*>(lsrc.untyped_data()), static_cast<const int*>(rsrc.untyped_data()),
@@ -3101,7 +3199,8 @@ static ffi::Error KleadChiUnfold(
     const long long grp = 2 * ns * ns;
     ChiArgs a{Gv.untyped_data(), Gvt.untyped_data(), Gc.untyped_data(), Gct.untyped_data(),
               acc->untyped_data(), alpha.untyped_data(), nullptr, 0, pairs, pairs, my,
-              static_cast<int>(n_out), si};
+              static_cast<int>(n_out), si, vpl, vhl, vpr, vhr, static_cast<int>(vtx ? na : 0),
+              static_cast<int>(vtx ? nb : 0), 0};
     auto launch = [&](int phase, long long blocks, int threads, int smem) -> ffi::Error {
         blocks = std::max(1LL, std::min(blocks, 2147483647LL));
         void* args[] = {(void*)&a, (void*)&t, (void*)&phase};
@@ -3134,9 +3233,44 @@ static ffi::Error KleadChiUnfold(
         const long long plane_items = nkx * ((ncols + k->tr - 1) / k->tr);
         const long long pencil_items = nky * nkz * ((a.npairs + k->ty - 1) / k->ty);
         if (auto e0 = launch(0, std::min(plane_items, cap), k->threads, k->smem); !e0.success()) return e0;
-        if (auto e1 = launch(1, std::min(pencil_items, cap), k->threads2, k->smem2); !e1.success()) return e1;
+        // One pencil pass per GRP channels (one pass without vertices): member m carries channel
+        // vch0 + m, re-reading the same intermediate.
+        for (int64_t c0 = 0; c0 < n_ch; c0 += grp) {
+            a.vch0 = static_cast<int>(c0);
+            if (auto e1 = launch(1, std::min(pencil_items, cap), k->threads2, k->smem2); !e1.success()) return e1;
+        }
     }
     return ffi::Error::Success();
+}
+
+static ffi::Error KleadChiUnfold(
+    cudaStream_t stream, ffi::ScratchAllocator scratch, ffi::AnyBuffer Gv, ffi::AnyBuffer Gvt,
+    ffi::AnyBuffer Gc, ffi::AnyBuffer Gct, ffi::AnyBuffer row, ffi::AnyBuffer trs, ffi::AnyBuffer lsrc,
+    ffi::AnyBuffer rsrc, ffi::AnyBuffer mph, ffi::AnyBuffer nph, ffi::AnyBuffer spin, ffi::AnyBuffer alpha,
+    ffi::AnyBuffer acc_in, ffi::Result<ffi::AnyBuffer> acc, int64_t nkx, int64_t nky, int64_t nkz, double si,
+    int64_t conj_trs, int64_t complete, int64_t scratch_bytes, std::string_view mathdx_root,
+    std::string_view cubin_dir) {
+    return KleadChiUnfoldImpl(stream, scratch, Gv, Gvt, Gc, Gct, row, trs, lsrc, rsrc, mph, nph, spin, alpha,
+                              acc_in, acc, nkx, nky, nkz, si, conj_trs, complete, scratch_bytes, mathdx_root,
+                              cubin_dir, {}, {}, {}, {}, 0, 0);
+}
+
+// Mode 11 with the four-current vertices: na x nb channels of (perm, phase) monomials on the Gc
+// operand's spin indices (mode 8's packing), acc (na*nb*n_out, nk, mx, my), channel-major.
+static ffi::Error KleadChiVertex(
+    cudaStream_t stream, ffi::ScratchAllocator scratch, ffi::AnyBuffer Gv, ffi::AnyBuffer Gvt,
+    ffi::AnyBuffer Gc, ffi::AnyBuffer Gct, ffi::AnyBuffer row, ffi::AnyBuffer trs, ffi::AnyBuffer lsrc,
+    ffi::AnyBuffer rsrc, ffi::AnyBuffer mph, ffi::AnyBuffer nph, ffi::AnyBuffer spin, ffi::AnyBuffer alpha,
+    ffi::AnyBuffer acc_in, ffi::Result<ffi::AnyBuffer> acc, int64_t nkx, int64_t nky, int64_t nkz, double si,
+    int64_t conj_trs, int64_t scratch_bytes, ffi::Span<const int64_t> perm_l, ffi::Span<const int64_t> phase_l,
+    ffi::Span<const int64_t> perm_r, ffi::Span<const int64_t> phase_r, int64_t na, int64_t nb,
+    std::string_view mathdx_root, std::string_view cubin_dir) {
+    if (na < 1 || nb < 1)
+        return fail("klead chi vertex", "want na, nb >= 1 (the plain pass is lorrax_mathdx_kconv_chi_unfold)",
+                    ffi::ErrorCode::kInvalidArgument);
+    return KleadChiUnfoldImpl(stream, scratch, Gv, Gvt, Gc, Gct, row, trs, lsrc, rsrc, mph, nph, spin, alpha,
+                              acc_in, acc, nkx, nky, nkz, si, conj_trs, 0, scratch_bytes, mathdx_root,
+                              cubin_dir, perm_l, phase_l, perm_r, phase_r, na, nb);
 }
 
 static ffi::Error KleadConv(cudaStream_t s, ffi::AnyBuffer T, ffi::AnyBuffer V, ffi::Result<ffi::AnyBuffer> U,
@@ -3592,6 +3726,40 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(
         .Attr<int64_t>("conj_trs")
         .Attr<int64_t>("complete")
         .Attr<int64_t>("scratch_bytes")
+        .Attr<std::string_view>("mathdx_root")
+        .Attr<std::string_view>("cubin_dir"));
+
+XLA_FFI_DEFINE_HANDLER_SYMBOL(
+    KConvMathdxChiVertexCudaFfi, lorrax_ffi::kconv_mathdx::KleadChiVertex,
+    xla::ffi::Ffi::Bind()
+        .Ctx<xla::ffi::PlatformStream<cudaStream_t>>()
+        .Ctx<xla::ffi::ScratchAllocator>()
+        .Arg<xla::ffi::AnyBuffer>()   // Gv (raw-parent lower Green quadrant)
+        .Arg<xla::ffi::AnyBuffer>()   // Gvt
+        .Arg<xla::ffi::AnyBuffer>()   // Gc (raw-parent upper Green quadrant; the vertices act on it)
+        .Arg<xla::ffi::AnyBuffer>()   // Gct
+        .Arg<xla::ffi::AnyBuffer>()   // row
+        .Arg<xla::ffi::AnyBuffer>()   // trs
+        .Arg<xla::ffi::AnyBuffer>()   // lsrc
+        .Arg<xla::ffi::AnyBuffer>()   // rsrc
+        .Arg<xla::ffi::AnyBuffer>()   // mph
+        .Arg<xla::ffi::AnyBuffer>()   // nph
+        .Arg<xla::ffi::AnyBuffer>()   // spin
+        .Arg<xla::ffi::AnyBuffer>()   // alpha (n_out,)
+        .Arg<xla::ffi::AnyBuffer>()   // acc (na*nb*n_out, nk, mx, my), aliased to the result
+        .Ret<xla::ffi::AnyBuffer>()
+        .Attr<int64_t>("nkx")
+        .Attr<int64_t>("nky")
+        .Attr<int64_t>("nkz")
+        .Attr<double>("si")
+        .Attr<int64_t>("conj_trs")
+        .Attr<int64_t>("scratch_bytes")
+        .Attr<xla::ffi::Span<const int64_t>>("perm_l")
+        .Attr<xla::ffi::Span<const int64_t>>("phase_l")
+        .Attr<xla::ffi::Span<const int64_t>>("perm_r")
+        .Attr<xla::ffi::Span<const int64_t>>("phase_r")
+        .Attr<int64_t>("na")
+        .Attr<int64_t>("nb")
         .Attr<std::string_view>("mathdx_root")
         .Attr<std::string_view>("cubin_dir"));
 
