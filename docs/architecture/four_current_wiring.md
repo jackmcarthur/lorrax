@@ -460,7 +460,7 @@ map rebuilds the sector bank and its Ward contact from the map's state.
 The direct Γ head follows `sc_head_update`: `parallel_transport` builds it
 on the map's state with the map's QSGW velocity
 $U^\dagger(v_{DFT} + D_k\Delta H)U$ (`qsgw_head.qp_velocity`, the scalar
-head's owner, with its link bound and per-map zeroing; the default where the
+head's owner, with its logged link bound; the default where the
 link artifact exists), `dft_velocity` with the QP-rotated dipole velocity,
 and `off` on the DFT state at the map's frequencies
 (`compute_photon_bank(photon_head_state=…)`).

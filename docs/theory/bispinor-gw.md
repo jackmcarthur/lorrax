@@ -312,8 +312,8 @@ On a `full_shared_pole` SC run the four-current bank rebuilds the direct Γ
 head every map, on the velocity `sc_head_update` names. An unnamed key
 resolves as on scalar decks: `parallel_transport` where the link artifact
 exists, else `dft_velocity`. `parallel_transport` hands the bank the map's
-$v_{\rm DFT}+D_k\Delta H$ from `qsgw_head.qp_velocity`, with the link bound
-and the per-map zeroing of the scalar head; `dft_velocity` rotates the
+$v_{\rm DFT}+D_k\Delta H$ from `qsgw_head.qp_velocity`, with the logged link
+bound of the scalar head; `dft_velocity` rotates the
 `dipole.h5` velocity by $U$; `off` keeps the DFT state. On a metal,
 `bare_transverse` refuses `parallel_transport`: its head has no link
 consumer. Rules: [self-consistency §7](../self_consistency.md#metals-direct-drude-head).

@@ -272,7 +272,7 @@ class ParallelTransportHeadData:
     velocity_kinetic_cart: object = None
     #: Why the links cannot serve ``D_k DeltaH`` on any map (stencil or
     #: window-hybridization gate); the links are then dropped and every map
-    #: runs ``U^dagger v_DFT U`` (:func:`sigma_term_zeroed`).  None: served.
+    #: runs ``U^dagger v_DFT U`` (:func:`qp_velocity`).  None: served.
     link_unserved: str | None = None
 
 
@@ -307,7 +307,7 @@ class DftVelocityHeadData:
     validation: None = None
     #: Set when ``sc_head_update = parallel_transport`` runs on this velocity
     #: because the artifact's links are incomplete: the reason its Sigma
-    #: term is zero on every map (:func:`sigma_term_zeroed`).
+    #: term is zero on every map (:func:`qp_velocity`).
     link_unserved: str | None = None
 
 
@@ -937,18 +937,9 @@ def _spectral_kernel(mesh: Mesh, kgrid: tuple[int, int, int]) -> Callable:
     return _kernel
 
 
-#: The head's link-error tolerance: 1 % of its velocity on the elements it
-#: reads (``link_correction_bound``), i.e. at most ~2 % of S_aa or of the
-#: Drude weight.  A map above it runs with ``D_k DeltaH = 0``
-#: (``sigma_term_zeroed``).  Coarse 4-point axes sit below it at their fixed
-#: points (Fe 4^3 3.9e-3, Si 4^3 6.2e-3).
-HEAD_LINK_RTOL = 1.0e-2
-
-
 def link_correction_bound(correction, velocity_dft, occupations_kn, *,
-                          link_error: float,
-                          rtol: float) -> tuple[float, float, float, float]:
-    r"""Judge the link error on what the head uses: ``D_k DeltaH``.
+                          link_error: float) -> tuple[float, float, float]:
+    r"""Measure the link error on what the head uses: ``D_k DeltaH``.
 
     The head's velocity is ``v_DFT + D_k DeltaH``; ``v_DFT`` is exact and
     only the correction goes through the finite links.  The artifact's
@@ -957,14 +948,13 @@ def link_correction_bound(correction, velocity_dft, occupations_kn, *,
     (``file_io.parallel_transport.head_velocity_set``: transitions and the
     Fermi-surface diagonal), so the head's error is bounded by
 
-        ``link_error * |D_k DeltaH| / |v_DFT|  <=  rtol``
+        ``bound = link_error * |D_k DeltaH| / |v_DFT|``
 
-    with both norms on that set (this map's occupations) and ``rtol`` =
-    :data:`HEAD_LINK_RTOL`.  Returns
-    ``(link_error, ratio, bound, rtol)``: every map logs it in its head block,
-    and a map whose bound exceeds ``rtol`` runs with ``D_k DeltaH = 0``
-    (:func:`sigma_term_zeroed`).  A DFT-start map 0 has ``DeltaH = 0`` and a
-    zero bound.
+    with both norms on that set (this map's occupations).  Returns
+    ``(link_error, ratio, bound)``: every map logs it in its head block as
+    information.  It is a k-convergence measure and gates nothing (owner
+    2026-09-30: a large link error means the k grid is underconverged).  A
+    DFT-start map 0 has ``DeltaH = 0`` and a zero bound.
     """
     from file_io.parallel_transport import head_velocity_set
     nb = int(velocity_dft.shape[-1])
@@ -974,29 +964,7 @@ def link_correction_bound(correction, velocity_dft, occupations_kn, *,
         / jnp.maximum(jnp.sum(jnp.where(head_set, jnp.abs(velocity_dft) ** 2,
                                         0.0)), 1.0e-60))))
     bound = float(link_error) * ratio
-    return float(link_error), ratio, bound, float(rtol)
-
-
-def sigma_term_zeroed(link_unserved: str | None, bound) -> str | None:
-    """The parallel_transport head's one rule: why ``D_k DeltaH`` is zero on this map.
-
-    Owner 2026-09-30: the head stays ``U^dagger (v_DFT + D_k DeltaH) U`` for
-    the whole run; on a map whose links cannot serve the Sigma term it is
-    set to zero, ``U^dagger v_DFT U``, and the next map checks again.  No
-    refusal and no other velocity mode.  The links cannot serve when they
-    are incomplete or fail the stencil or window-hybridization gate
-    (``link_unserved``, fixed for the run) or when this map's
-    :func:`link_correction_bound` exceeds :data:`HEAD_LINK_RTOL`.  Returns
-    the reason, or None when the term is served.
-    """
-    if link_unserved:
-        return str(link_unserved)
-    if bound is None:
-        return None
-    _, _, value, rtol = bound
-    if np.isfinite(value) and value <= rtol:
-        return None
-    return f"link bound above rtol {rtol:.1e}"
+    return float(link_error), ratio, bound
 
 
 def velocity_term_shares(v_qp, pieces, *, nb_logical, surface_weight_kn=None,
@@ -3214,8 +3182,8 @@ class IterationHeadResponse:
     fermi_surface: object | None = None
     #: ``(names, shares[n_terms, 3], link_bound, sigma_zeroed)`` from
     #: :func:`velocity_term_shares`, :func:`link_correction_bound` and
-    #: :func:`sigma_term_zeroed` (the reason, or None), for the per-map head
-    #: block (``sc_iteration._record_head_block``).
+    #: :func:`qp_velocity` (why the Sigma term is zero, or None), for the
+    #: per-map head block (``sc_iteration._record_head_block``).
     velocity_terms: tuple | None = None
 
 
@@ -3792,7 +3760,8 @@ class QPVelocity:
     ``dipole_qsgw.h5`` both take this array and the map's ``U``, so the SC
     screening and the BSE dipoles see one velocity.  ``base`` is ``v_DFT``;
     ``correction`` the Sigma term added (None when absent or zeroed);
-    ``bound`` the link bound; ``zeroed`` why the term is zero on this map;
+    ``bound`` the link bound (information); ``zeroed`` why the links
+    cannot serve the term on any map of this run (None: served);
     ``label`` the terms in words (the dipole file's ``velocity`` stamp).
     """
 
@@ -3817,7 +3786,7 @@ def qp_velocity(
     bvec_cart=None,
     collapsed_position=None,
     nb_links: int | None = None,
-    link_bound: tuple[float, float] | None = None,
+    link_error: float | None = None,
     velocity_base_cart=None,
     link_unserved: str | None = None,
 ) -> QPVelocity:
@@ -3826,10 +3795,14 @@ def qp_velocity(
     ``forward_links=None`` with no ``velocity_base_cart`` is
     ``sc_head_update = dft_velocity``: ``delta_h_dft`` is unused.  With
     ``velocity_base_cart`` (``interband_commutator``) ``velocity_dft_cart``
-    already holds ``v + [DeltaH, W]``.  ``parallel_transport`` drops the
-    covariant correction on a map whose links cannot serve it
-    (:func:`sigma_term_zeroed`; ``link_unserved`` is the run-long reason
-    when the source carries no links).
+    already holds ``v + [DeltaH, W]``.  ``parallel_transport`` adds
+    ``D_k DeltaH`` whenever the source carries links.  A source whose links
+    are incomplete or fail the stencil or window-hybridization gate carries
+    none and names the reason in ``link_unserved``: the term is then zero
+    on every map of the run, ``U^dagger v_DFT U``, with no refusal and no
+    other velocity mode (owner 2026-09-30).  The link error gates nothing;
+    ``link_error`` (the artifact's measured relative error) only feeds the
+    logged :func:`link_correction_bound`.
     """
     v_dft_basis = jnp.asarray(velocity_dft_cart, dtype=jnp.complex128)
     base, correction, bound = v_dft_basis, None, None
@@ -3838,7 +3811,7 @@ def qp_velocity(
         # difference from the DFT velocity p + i[r, V_NL].
         base = jnp.asarray(velocity_base_cart, dtype=jnp.complex128)
         correction = v_dft_basis - base
-    zeroed = sigma_term_zeroed(link_unserved, None)
+    zeroed = str(link_unserved) if link_unserved else None
     if forward_links is not None:
         if forward_neighbors is None:
             raise ValueError(
@@ -3856,20 +3829,15 @@ def qp_velocity(
             collapsed_position=collapsed_position,
         ), int(nb_logical), mesh=mesh,
             nb_outer=int(nb_links or nb_logical))
-        if link_bound is not None:
+        if link_error is not None:
             bound = link_correction_bound(
                 correction, v_dft_basis, occupations_qp_kn,
-                link_error=link_bound[0],
-                rtol=link_bound[1])
-        zeroed = sigma_term_zeroed(None, bound)
-        if zeroed is None:
-            v_dft_basis = v_dft_basis + correction
-        else:
-            correction = None
+                link_error=link_error)
+        v_dft_basis = v_dft_basis + correction
     if velocity_base_cart is not None:
         label = ("v_DFT + [DeltaH, W] (interband_commutator; intraband "
                  "connection omitted)")
-    elif forward_links is not None and zeroed is None:
+    elif forward_links is not None:
         label = "v_DFT + D_k DeltaH (parallel_transport links)"
     elif zeroed is not None:
         label = f"v_DFT (D_k DeltaH zeroed: {zeroed})"

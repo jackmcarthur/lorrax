@@ -1717,14 +1717,14 @@ def complete_velocity_validation(
                       f"{str(row['passed']):>5s}")
     write_velocity_validation(path, mesh=mesh, metrics=metrics)
     if not metrics["passed"] and jax.process_index() == 0:
-        # A diagnostic, not a refusal: the QSGW head judges the link error on
-        # what it uses, rel_err x |D_k DeltaH|/|v_DFT| at every map
-        # (gw.qsgw_head.link_correction_bound); a map above it runs with
-        # D_k DeltaH = 0 (gw.qsgw_head.sigma_term_zeroed).
+        # A warning, never a refusal or a drop: the link error is a
+        # k-convergence measure.  The QSGW head serves D_k DeltaH from these
+        # links and logs rel_err x |D_k DeltaH|/|v_DFT| at every map
+        # (gw.qsgw_head.link_correction_bound).
         print(
-            "  finite-link DFT velocity reconstruction above rtol "
-            "(diagnostic; the SC head bounds the link error on its Sigma "
-            "correction): "
+            "  WARNING: finite-link DFT velocity reconstruction above rtol "
+            "(the k grid is underconverged for the links; the artifact is "
+            "written and the SC head serves its Sigma term from it): "
             f"head_response_relative_frobenius="
             f"{metrics['head_response_relative_frobenius']:.6e}, "
             f"transition_overlap="
