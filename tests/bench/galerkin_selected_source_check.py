@@ -12,6 +12,7 @@ from jax.sharding import NamedSharding, PartitionSpec as P
 from common.collectives import device_put_process_local, gather_to_host, rank0_transaction
 from common.meta import Meta
 from common.psi_G_store import build_psi_G_store
+from common.gamma_matrices import dirac_spin_z, sigma_z
 from file_io import WFNReader
 from isdf.galerkin import GalerkinBasis, iter_galerkin_rchunks, project_galerkin_spin_operator
 
@@ -94,6 +95,24 @@ def main():
             assert error<5e-12,error
             assert norm_error<5e-12,norm_error
             assert np.max(np.abs(got-got.conj().T))<5e-12
+            # Physical spin includes both large and small Dirac blocks. Use
+            # an independent diagonal contraction on the actual WFN basis;
+            # a Pauli-only upper block must fail when small components exist.
+            physical_spin = dirac_spin_z if bispinor else 0.5*sigma_z
+            spin_weights = np.tile([0.5,-0.5], ns//2)
+            spin_reference=np.einsum('asr,s,bsr->ab',legacy.conj(),
+                                    spin_weights,legacy,optimize=True)
+            with mesh:
+                spin_projection=project_galerkin_spin_operator(source,basis,meta,mesh,
+                    spin_operator=np.asarray(physical_spin),q_tile_budget=4096)
+            spin_got=np.asarray(gather_to_host(spin_projection.operator))
+            spin_error=float(np.linalg.norm(spin_got-spin_reference)/
+                             np.linalg.norm(spin_reference))
+            assert spin_error<5e-12,spin_error
+            if bispinor:
+                pauli_only=np.einsum('asr,s,bsr->ab',legacy.conj(),
+                                    [0.5,-0.5,0,0],legacy,optimize=True)
+                assert np.linalg.norm(spin_got-pauli_only)>1e-8*np.linalg.norm(spin_reference)
             # Negative control: a changed physical operator must be detected.
             wrong=np.einsum('asr,st,btr->ab',legacy.conj(),op+.1*np.eye(ns),legacy,optimize=True)
             assert np.linalg.norm(got-wrong)>1e-4*np.linalg.norm(reference)
@@ -101,6 +120,7 @@ def main():
                 selected_states=selected.tolist(),ranges=ranges,
                 basis_relative_error=rel,operator_relative_error=error,
                 metric_relative_error=norm_error,source_calls=source_calls,
+                physical_spin_relative_error=spin_error,
                 wall_seconds=time.monotonic()-start)
             receipts.append(row)
             rank0_print(json.dumps(row),flush=True)
