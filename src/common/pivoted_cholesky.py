@@ -407,6 +407,7 @@ def make_sharded_pivoted_cholesky_select(
     *,
     mesh_axis: str | tuple[str, ...] = 'x',
     tol_rel: float | None = None,
+    tie_rel: float = 0.0,
 ):
     """Sharded pivoted-Cholesky select on a row-sharded Gram.  STOPS at the
     numerical-rank floor, exactly as ``pivoted_cholesky_select`` does, and
@@ -419,7 +420,14 @@ def make_sharded_pivoted_cholesky_select(
     two kernels agree on where to stop at any shard count.  That is the
     property ``tests/test_centroid_distribution.py`` gates at >1 shard on an
     emulated mesh; before 2026-08-07 that gate ran both sides at 1×1 and
-    every collective in here was satisfied vacuously."""
+    every collective in here was satisfied vacuously.
+
+    ``tie_rel > 0`` makes the pivot choice independent of the shard count:
+    every active row whose residual is within ``tie_rel`` (relative) of the
+    largest counts as tied, and the lowest global row among them wins.
+    Symmetry-equivalent candidates have equal residuals in exact arithmetic,
+    so without the band the reduction order (i.e. P) picks among them.  The
+    default 0 keeps the exact-tie rule."""
     n_dev = _mesh_axis_size(
         mesh, mesh_axis, "make_sharded_pivoted_cholesky_select"
     )
@@ -513,6 +521,23 @@ def make_sharded_pivoted_cholesky_select(
                     local_pv >= global_pv, local_global_p, jnp.int32(2**30),
                 )
                 global_p = -lax.pmax(-winner_p, mesh_axis)
+                if tie_rel > 0.0:
+                    # Lowest global row within tie_rel of the maximum; the
+                    # exact-tie winner above stays the choice when no row is
+                    # active (global_pv = -inf).
+                    near = active & (
+                        masked_d >= global_pv - tie_rel * jnp.abs(global_pv))
+                    first = jnp.min(jnp.where(
+                        near, col_ids_local.astype(jnp.int32),
+                        jnp.int32(2**30)))
+                    tied_p = -lax.pmax(-first, mesh_axis)
+                    global_p = jnp.where(tied_p < 2**30, tied_p, global_p)
+                    owns = global_p // M_slab == my_idx
+                    global_pv = lax.pmax(jnp.where(
+                        owns,
+                        masked_d[jnp.clip(global_p - my_idx * M_slab,
+                                          0, M_slab - 1)],
+                        minus_inf), mesh_axis)
                 # THE STOP.  Both operands are pmax results, so this bool is
                 # identical on every shard — no shard can run an iteration
                 # another one skipped, and no collective goes unmatched.

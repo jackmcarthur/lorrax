@@ -65,6 +65,10 @@ __all__ = [
 
 QRCP_RNG_VERSION = "jax-fold-in-global-r-rows-spin-v1"
 _BASIS_FORMAT = 2
+#: Candidates whose sketched residuals agree to this relative band are one
+#: tie, broken by the lowest candidate index, so the selected basis does not
+#: depend on P (symmetry-equivalent states tie in exact arithmetic).
+_PIVOT_TIE_REL = 1.0e-8
 _BASIS_ARRAYS = ("galerkin_ctilde", "galerkin_basis_at_nodes",
                  "galerkin_selection_factor")
 _BASIS_META = "galerkin_"
@@ -911,7 +915,8 @@ def fit_galerkin_basis(
             active_np, NamedSharding(mesh_xy, P(('x', 'y'))))
         select = make_sharded_pivoted_cholesky_select(
             mesh_xy, candidate_carrier, max_search,
-            mesh_axis=('x', 'y'), tol_rel=float(qr_eps) ** 2)
+            mesh_axis=('x', 'y'), tol_rel=float(qr_eps) ** 2,
+            tie_rel=_PIVOT_TIE_REL)
         (piv, _sketch_L, rank_qr_dev, d_final, d_taken,
          tr_residual, psd_info) = select(sketch_gram_row, None, active)
         jax.block_until_ready((piv, rank_qr_dev, psd_info))

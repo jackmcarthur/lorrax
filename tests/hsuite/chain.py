@@ -55,10 +55,9 @@ ATOL = {
     "h5": 1.0e-8,        # kin_ion / dipole members (relative + absolute)
     "w_bank": 1.0e-6,    # exported shared-pole W samples (relative)
     "eqp_ev": 5.0e-4,    # eqp0/eqp1 columns, GN-PPM and shared pole
-    "bse_ev": 2.0e-3,    # BSE and exciton-band eigenvalues.  BSE agrees
-                         # < 10 ueV P1 vs P4; exciton bands 1.2 meV at M,
-                         # because the fH basis pivots differ with P (not
-                         # the Krylov tolerance; KNOWN_LORRAX_ISSUES)
+    "bse_ev": 1.0e-4,    # BSE, exciton-band and htransform eigenvalues:
+                         # P1 vs P4 agree to 1 ueV (the fH basis pivots
+                         # break residual ties by index, galerkin.py)
 }
 
 # h5 members not compared.  line_charge_* are the W bank's selected
