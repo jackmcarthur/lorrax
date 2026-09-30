@@ -63,8 +63,8 @@ with SlabIO(path,mode='r',mesh=mesh) as io:
 expected=np.pad(reference[:,:,:physical],((0,0),(0,0),(0,rank-physical)))
 assert np.max(np.abs(gather_to_host(reread)-expected))<2e-15
 # Publication checks an unaligned all-P coefficient tail before SlabIO.
-nodes=np.zeros((rank,2,3),dtype=np.complex128)
-nodes[:physical]=rng.normal(size=(physical,2,3))
+nodes=np.zeros((rank,2,4),dtype=np.complex128)
+nodes[:physical]=rng.normal(size=(physical,2,4))
 factor=np.eye(rank,dtype=np.complex128)
 pivots=np.arange(physical,dtype='<i8')
 basis=GalerkinBasis(ctilde=reread,
@@ -75,7 +75,7 @@ basis=GalerkinBasis(ctilde=reread,
     qrcp_search_rank=rank,candidate_hash='a'*64,
     pivot_hash=hashlib.sha256(pivots.tobytes()).hexdigest())
 provenance=dict(band_range=(0,nb),nk=nk,nb=nb,nspinor=2,
-    centroid_shape=(3,),qrcp_seed=0,qrcp_eps=1e-3,qrcp_rng=QRCP_RNG_VERSION)
+    centroid_shape=(4,),qrcp_seed=0,qrcp_eps=1e-3,qrcp_rng=QRCP_RNG_VERSION)
 _basis_check(basis,provenance)
 corrupt=expected.copy();corrupt[-1,-1,-1]=1e-14
 corrupt=device_put_process_local(corrupt,sh)
