@@ -234,7 +234,7 @@ qp_solver = one_shot_dft
     "bisp_sc.in": _bisp_deck("bsc", """restart = true
 qp_solver = self_consistent
 sc_max_iter = 2
-sc_tol_ev = 1.5
+sc_tol_ev = 2.0
 sc_head_update = dft_velocity
 density_self_consistent = true
 """),
