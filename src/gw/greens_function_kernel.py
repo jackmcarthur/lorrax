@@ -85,6 +85,26 @@ def green_panel_bytes(*, n_rows, m, n, mesh, room=None):
     return int(max(column, tile if room is None else min(tile, int(room))))
 
 
+def _phases_on_face_carrier(phases, band_range, nb):
+    """A Σ-sum phase row on the faces' band carrier (the one band carrier of a build).
+
+    The faces carry every loaded band (max of the χ and Σ sums, padded); a Σ
+    consumer's phases stop at its own band sum (``BandSlices.sigma_sum``).  The
+    bands past that sum take exact-zero weight, and a given ``band_range`` ends
+    at the phase row, so those bands are neither weighted nor contracted.
+    """
+    n_w = int(phases.shape[-1])
+    if n_w > nb:
+        raise ValueError(
+            f"build_G: phases span {n_w} bands but the faces carry {nb}; a band "
+            "sum cannot exceed the loaded band carrier.")
+    phases = jnp.pad(phases, [(0, 0)] * (phases.ndim - 1) + [(0, nb - n_w)])
+    if band_range is not None:
+        lo, hi = band_range
+        band_range = (lo, jnp.minimum(jnp.asarray(hi, jnp.int32), n_w))
+    return phases, band_range
+
+
 def _build_G_face(psi_mun, psi_nmu, *, gemm, Gij=None, phases=None, mesh=None,
                   band_range=None, prepared_active_gemm=None, n_full=None, pair=False):
     """Contract band-replicated faces locally or band-distributed faces with their GEMM plan.
@@ -104,6 +124,8 @@ def _build_G_face(psi_mun, psi_nmu, *, gemm, Gij=None, phases=None, mesh=None,
             "build_G(layout='face'): left psi_mun and right psi_nmu must "
             "share (nk, nb, nspinor); got "
             f"{psi_mun.shape} and {psi_nmu.shape}.")
+    if phases is not None and int(phases.shape[-1]) != n_:
+        phases, band_range = _phases_on_face_carrier(phases, band_range, n_)
     A = merge_spin_centroid(psi_mun, 1, 2)          # (nk, mu*s, n) P(_,'x','y')
     face = getattr(gemm, "backend", "local") != "local"
     if (phases is not None and band_range is None
