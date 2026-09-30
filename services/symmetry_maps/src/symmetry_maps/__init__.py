@@ -248,6 +248,7 @@ from symmetry_maps.unfold_load import (
     unfold_load_tables,
     local_unfold_load_tables,
     apply_unfold_load_tables_local,
+    apply_unfold_load_spin_component_local,
 )
 # Pre-sweep spellings.  Imported from the modules that define them, so
 # the door and the module bind the SAME object and cannot drift apart.
