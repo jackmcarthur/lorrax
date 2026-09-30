@@ -1019,8 +1019,8 @@ def resolve_qp_hamiltonian_state(
         corrected_range = (fit0, fit1)
 
     # The Galerkin owner defines the compact state's global placement.  The
-    # energy table and both QP companions arrive as identical host arrays on
-    # every process, so place each process's incumbent shards without JAX's
+    # energy table and both QP companions have their own replicated layouts,
+    # independent of the rank-sharded C. Place these host arrays without JAX's
     # hidden cross-process equality/all-gather transport before entering the
     # one multi-host JIT.
     companion_sharding = NamedSharding(ctilde.sharding.mesh, P())
@@ -1353,18 +1353,15 @@ def resolve_local_vbm_index(nelec: int, band_start: int,
 def compact_galerkin_state(ctilde, mesh_xy: Mesh, *, log_fn=print):
     """ctilde on one rank-axis shard, ``P(None, None, 'x')``, synced.
 
-    QP rotations consume the immutable fit artifact in its replicated layout;
-    past that seam only the compact coefficients and the basis-at-nodes
-    table survive.  Placing ctilde here, and dropping the caller's
-    ``GalerkinBasis`` wrapper, frees the full replica before ``build_fH_R``
-    allocates either rank-by-rank operator (the builder consumes rank-sharded
-    views anyway).  ``ctilde`` is a committed device array, so this is a
-    reshard, not a host placement.
+    The immutable fit artifact and QP rotations retain all-P rank shards.
+    At this consumer seam the fH builder requests its established X-rank
+    panel view; only these coefficients and the basis-at-nodes table survive.
+    ``ctilde`` is a committed device array, so this is a reshard.
     """
     ctilde = jax.device_put(ctilde, NamedSharding(mesh_xy, P(None, None, 'x')))
     jax.block_until_ready(ctilde)
     log_fn("  [route] compact Galerkin state handed to htransform as "
-           "P(None,None,'x'); released immutable replicated fit carrier")
+           "P(None,None,'x'); released immutable fit wrapper")
     return ctilde
 
 

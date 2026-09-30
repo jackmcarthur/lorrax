@@ -249,7 +249,12 @@ the driver Fourier-interpolates $f(H)_q$, diagonalizes it, and inverts $f$ by
 Newton iteration. States above the window map to exactly zero, so no band
 crosses the window edge: $f(H)_k$ is smooth in k and $f(H)_R$ short-ranged. `isdf.galerkin` selects the basis from stacked full-Bloch
 states by deterministic randomized QRCP and projects every state into that one
-gauge; the WFN transforms stream the G→r work.
+gauge; the WFN transforms stream the G→r work. The coefficient table stays
+on all-P rank shards through projection, triangular solve, rank diagnostics
+and mesh-neutral basis persistence/restart. Bounded all-to-all exchanges
+trade rank shards for state-row shards during the solve; only the compact
+selected-state factor is replicated. Physical cache extents exclude exact-null
+rank carrier padding. QP rotation companions use their own layouts.
 
 Uniform spin operators use the same physical basis $B=L^{-1}X$, with $X$
 containing only the selected pivot states. Owner-balanced pivot groups use
