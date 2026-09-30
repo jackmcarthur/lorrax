@@ -113,14 +113,13 @@ def _require_packed_operator(name, packed, mesh_xy):
 
 
 def _make_photon_static_class_kernel(
-    mesh_xy, kgrid, nk_tot, wfns_left, wfns_right, keys, *, with_head=False, w_tables=None,
+    mesh_xy, kgrid, nk_tot, wfns_left, wfns_right, keys, *, w_tables, with_head=False,
 ):
     """Share the parent Green, its one transform and the projection across one Lorentz class.
 
     ``keys`` are the class's blocks, one ``A x B`` product; the interaction
-    operand is ``(nk, mx, nA, my, nB)`` (:func:`_make_photon_class_restore`),
-    or, with ``w_tables``, the pair ``(W, Wt)`` on the irreducible q that the
-    door unfolds on its load (``gw.mpa.sector_sigma.instantaneous_sector_sigma``).
+    is the pair ``(W, Wt)`` on the irreducible q (:func:`_class_parents`), which
+    the door unfolds on its load through ``w_tables`` (:func:`_class_w_tables`).
     """
     from ffi import ffi_dial_key
     from common.contract_bands import contract_bands_block_reshard
@@ -156,8 +155,7 @@ def _make_photon_static_class_kernel(
         green = build_G_parents(left.psi_mun, right.psi_nmu, phases=jnp.real(weights),
                                 layout=layout, gemm=g_plan, k_unfold_plan=plans[0])
         # The prefactor is -1/2 or 1: an exact power of two, applied after the door.
-        sigma = factor * (convolve(green, *interaction) if w_tables is not None
-                          else convolve(green, interaction))
+        sigma = factor * convolve(green, *interaction)
         result = project(left.projection_faces()[0], sigma, right.projection_faces()[1])
         if with_head:
             # The q -> 0 head is a pointwise product on the unfolded Green.
@@ -169,8 +167,7 @@ def _make_photon_static_class_kernel(
         return result
     # The entry keeps the W tables alive, so their id in the key cannot be reused.
     _photon_sigma_kernel_cache[key] = contract_class
-    if w_tables is not None:
-        _photon_sigma_kernel_cache[(key, 'w_tables')] = w_tables
+    _photon_sigma_kernel_cache[(key, 'w_tables')] = w_tables
     return contract_class
 
 
@@ -222,47 +219,62 @@ def band_sigma_finish(mesh_xy, nb, sym):
     return finish
 
 
-def _make_photon_class_restore(response, keys, mesh_xy, stream=False):
-    """Compile one canonical full-q producer per class without caching interaction arrays.
+_CLASS_TABLES = {}
 
-    Returns the class's blocks as the four-current door's ``(nk, mx, nA, my,
-    nB)`` operand and the stacked ``(perm, phase)`` vertices the q -> 0 head
-    product reads.
+
+def _class_w_tables(plans, policy, lefts, rights, mesh_xy):
+    """One photon class's q-unfold tables for the W-parent door, cached by content.
+
+    The full-q restore these replace (``gw.w_isdf.photon_blocks_full_q``)
+    unfolds each Lorentz block by the family plans' centroid maps on the TRS
+    policy's operation rows (the Hermitian ``conj`` rule) and then mixes the
+    blocks by the Lorentz action; these are the same tables with the Lorentz
+    action as the endpoint action.  The door reads them with the
+    pair-transpose rule and the partner conj(W), which is the conj rule.
     """
-    from .w_isdf import photon_blocks_full_q
-    from .cohsex_sigma import lorentz_class_vertices
-    from common.gamma_matrices import gamma_perm_phase
-    layout, plans, policy = response.layout, response.family_plans, response.qgrid_policy
-    # By value, not identity: every SC map builds a new (equal) layout and
-    # policy, and an id key recompiled this program in every map.
-    key = ("restore", layout, tuple(map(id, plans)), _policy_key(policy), keys, _mesh_key(mesh_xy),
-           stream)
-    if key not in _photon_sigma_kernel_cache:
-        lefts, rights = lorentz_class_vertices(keys)
-        spec = NamedSharding(mesh_xy, P(None, "x", None, "y", None))
+    from symmetry_maps import unfold_load_tables, bgw_integer_q_to_fractional
+    key = (tuple(map(id, plans)), _policy_key(policy), tuple(lefts), tuple(rights),
+           _mesh_key(mesh_xy))
+    hit = _CLASS_TABLES.get(key)
+    if hit is None:
+        left, right = plans
+        sym = left.sym
+        rows = np.asarray(policy.unfold_sym_idx, np.int32)
+        lorentz = np.asarray(sym.lorentz_action(rows), np.complex128)
+        act = lambda ids: np.ascontiguousarray(lorentz[:, list(ids)][:, :, list(ids)])
+        tables = unfold_load_tables(
+            irr_idx=np.asarray(sym.irr_idx_q, np.int32), sym_idx=rows, sym_perm=left.sym_perm,
+            L_table=left.L_table, k_irr_frac=bgw_integer_q_to_fractional(sym.q_irr_kgrid_int, policy.kgrid),
+            spin_action_full=act(lefts), n_sym_spatial=int(policy.n_sym_spatial), mesh_xy=mesh_xy,
+            logical_centroid_extent=left.n_centroid_packed, right_sym_perm=right.sym_perm,
+            right_L_table=right.L_table, trs_rule='pair_transpose', right_spin_action_full=act(rights),
+            right_logical_centroid_extent=right.n_centroid_packed)
+        hit = _CLASS_TABLES[key] = (plans, tables)
+    return hit[1]
 
-        @jax.jit
-        def restore(packed):
-            blocks = jnp.stack([value for _, value in photon_blocks_full_q(
-                packed, keys, layout=layout, family_plans=plans, qgrid_policy=policy,
-                stream=stream)])
-            nq, mx, my = (int(d) for d in blocks.shape[1:])
-            interactions = jax.lax.with_sharding_constraint(jnp.transpose(
-                blocks.reshape(len(lefts), len(rights), nq, mx, my), (2, 3, 0, 4, 1)), spec)
-            vertices = jax.tree.map(lambda *v: jnp.stack(v),
-                *((gamma_perm_phase(A), gamma_perm_phase(B)) for A, B in keys))
-            return interactions, vertices
-        _photon_sigma_kernel_cache[key] = restore
-    return _photon_sigma_kernel_cache[key]
+
+@lru_cache(maxsize=None)
+def _class_parents(mesh_xy, layout, lefts, rights):
+    """``jit(packed -> (W, conj W))``: one class of a packed operator as ``(nq, m, nA, n, nB)``."""
+    from .photon_layout import photon_block_view
+    spec = NamedSharding(mesh_xy, P(None, 'x', None, 'y', None))
+
+    @jax.jit
+    def parents(packed):
+        W = jnp.stack([jnp.stack([photon_block_view(packed, layout, A, B, mesh_xy) for B in rights], axis=-1)
+                       for A in lefts], axis=2)
+        W = jax.lax.with_sharding_constraint(W, spec)
+        return W, jnp.conj(W)
+    return parents
 
 
 def contract_lorentz_blocks(blocks, *, families, term, response, Gij, meta, mesh_xy,
-                            head_diagnostics=False, admit_kernel=None, panels=None):
+                            head_diagnostics=False, admit_kernel=None):
     """Yield one parent-band sum per endpoint class while retaining one resident Green.
 
-    ``panels(keys)`` splits a class's blocks into ``A x B`` sub-products whose
-    full-q interactions are restored and convolved one at a time (the
-    four-current door takes any sub-product); ``None`` keeps one panel.
+    Each class of the packed operator enters the four-current door as its
+    irreducible-q pair ``(W, conj W)`` (:func:`_class_parents`), unfolded on
+    the door's load (:func:`_class_w_tables`): no full-q class operand.
     """
     from .cohsex_sigma import _occ_diag_full
     from .photon_layout import photon_q0_low_rank_block
@@ -285,29 +297,29 @@ def contract_lorentz_blocks(blocks, *, families, term, response, Gij, meta, mesh
                    if term != _TERM_COH else left.band_mask(slices.sigma_sum).astype(jnp.complex128))
         weights = jax.lax.with_sharding_constraint(
             jnp.broadcast_to(weights, (meta.nk_tot, slices.nb_full)), NamedSharding(mesh_xy, P()))
-        result = head = None
-        schedule = (keys,) if panels is None else panels(keys)
-        for part in schedule:
-            interactions, vertices = _make_photon_class_restore(
-                response, part, mesh_xy, stream=len(schedule) > 1)(packed)
-            head_blocks = None
-            if with_head:
-                head_blocks = jnp.stack([photon_q0_low_rank_block(pairs, response.layout, A, B, mesh_xy)
-                    - (photon_q0_low_rank_block(bare, response.layout, A, B, mesh_xy) if bare else 0)
-                    for A, B in part])
-            kernel = _make_photon_static_class_kernel(mesh_xy, meta.kgrid, meta.nk_tot,
-                                                      left, right, part, with_head=with_head)
-            arguments = (left.green_parent, right.green_parent, weights, interactions,
-                         -0.5 if term == _TERM_COH else 1.0, head_blocks,
-                         vertices if with_head else None)
-            if admit_kernel is not None:
-                admit_kernel(kernel, arguments, part[0])
-            value = kernel(*arguments)
-            del interactions
-            value, part_head = value if with_head else (value, None)
-            result = value if result is None else result + value
-            if part_head is not None:
-                head = part_head if head is None else head + part_head
+        lefts = tuple(dict.fromkeys(A for A, _ in keys))
+        rights = tuple(dict.fromkeys(B for _, B in keys))
+        tables = _class_w_tables(response.family_plans[a:a + 1] + response.family_plans[b:b + 1],
+                                 response.qgrid_policy, lefts, rights, mesh_xy)
+        pair = _class_parents(mesh_xy, response.layout, lefts, rights)(packed)
+        head_blocks = vertices = None
+        if with_head:
+            from common.gamma_matrices import gamma_perm_phase
+            head_blocks = jnp.stack([photon_q0_low_rank_block(pairs, response.layout, A, B, mesh_xy)
+                - (photon_q0_low_rank_block(bare, response.layout, A, B, mesh_xy) if bare else 0)
+                for A, B in keys])
+            vertices = jax.tree.map(lambda *v: jnp.stack(v),
+                *((gamma_perm_phase(A), gamma_perm_phase(B)) for A, B in keys))
+        kernel = _make_photon_static_class_kernel(mesh_xy, meta.kgrid, meta.nk_tot,
+                                                  left, right, keys, with_head=with_head,
+                                                  w_tables=tables)
+        arguments = (left.green_parent, right.green_parent, weights, pair,
+                     -0.5 if term == _TERM_COH else 1.0, head_blocks, vertices)
+        if admit_kernel is not None:
+            admit_kernel(kernel, arguments, keys[0])
+        value = kernel(*arguments)
+        del pair
+        result, head = value if with_head else (value, None)
         yield keys[0], result, head
 
 
