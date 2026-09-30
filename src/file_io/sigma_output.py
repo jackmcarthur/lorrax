@@ -1047,12 +1047,20 @@ def sigma_star_spread_stats(values, rows_to_keep, compact_irr, sym_idx_k,
 	# the argument's default; the default is gone, because the other branch
 	# is wrong here by 183.61 eV on the off-diagonals with the real
 	# diagonal exactly intact, which nothing downstream would have seen.
-	unfolded = np.asarray(symmetry_maps.star_broadcast(
-		sel, np.asarray(compact_irr), np.asarray(sym_idx_k),
-		int(n_sym_spatial),
-		irr_labels=np.arange(len(rows_to_keep), dtype=np.int32),
-		trs_reference="star_row"))
-	raw = float(np.abs(M - unfolded).max()) if M.size else 0.0
+	# One bounded block of full-BZ rows at a time: the unfolded array and
+	# |M - unfolded| are never whole (3 x 0.59 GB at Fe 20^3, 68 bands).
+	# max is exact, so the number is the whole-array one.
+	raw = 0.0
+	if M.size:
+		step = max(1, (1 << 28) // max(1, M[0].nbytes))
+		for k0 in range(0, M.shape[0], step):
+			rows = np.arange(k0, min(M.shape[0], k0 + step))
+			unfolded = np.asarray(symmetry_maps.star_broadcast(
+				sel, np.asarray(compact_irr), np.asarray(sym_idx_k),
+				int(n_sym_spatial),
+				irr_labels=np.arange(len(rows_to_keep), dtype=np.int32),
+				trs_reference="star_row", rows=rows))
+			raw = max(raw, float(np.abs(M[rows[0]:rows[-1] + 1] - unfolded).max()))
 
 	diag = frob = trace = 0.0
 	compact = np.asarray(compact_irr)
