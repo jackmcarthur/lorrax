@@ -259,6 +259,12 @@ class ParallelTransportHeadData:
     #: grid has no collapsed axis.  The connection along a collapsed axis
     #: (``common.parallel_transport.link_stencil_orders``).
     collapsed_position: object = None
+    #: Outer band set of ``forward_links`` (and of ``singular_values`` and
+    #: ``collapsed_position``), at least ``nb_logical``.  The covariant
+    #: derivative of DeltaH runs there and is restricted to the head's
+    #: ``nb_logical`` bands; ``velocity_dft_cart`` is the head block.
+    #: 0 means the head's own set.
+    nb_links: int = 0
 
 
 @dataclass(frozen=True)
@@ -290,6 +296,36 @@ class DftVelocityHeadData:
     forward_links: None = None
     forward_neighbors: None = None
     validation: None = None
+
+
+def head_band_block(operator, nb_head: int, *, mesh: Mesh, nb_outer: int):
+    """The head block ``[..., :nb_head, :nb_head]`` of an outer-set band matrix.
+
+    ``operator`` is ``(..., S_o, S_o)`` at ``P(..., 'x', 'y')`` on the outer
+    band set; the result is ``(..., S_h, S_h)`` at the same spec, with
+    ``S_h = band_storage_extent(mesh, nb_head)`` and the rows and columns
+    past ``nb_head`` exactly zero (the head's padding).  Identity when the
+    two sets agree (``nb_outer == nb_head``).
+    """
+    from common.parallel_transport import band_storage_extent
+
+    storage = band_storage_extent(mesh, int(nb_head))
+    if int(nb_outer) == int(nb_head):
+        return operator
+    lead = (None,) * (operator.ndim - 2)
+    key = ("head_band_block", id(mesh), int(nb_head), tuple(operator.shape))
+    kernel = _KERNEL_CACHE.get(key)
+    if kernel is None:
+        keep = np.arange(storage) < int(nb_head)
+        mask = np.asarray(keep[:, None] & keep[None, :])
+
+        def block(x):
+            return jnp.where(mask, x[..., :storage, :storage],
+                             jnp.zeros((), x.dtype))
+        kernel = jax.jit(block, out_shardings=NamedSharding(
+            mesh, P(*lead, "x", "y")))
+        _KERNEL_CACHE[key] = kernel
+    return kernel(operator)
 
 
 def _ascii_stamp(io, path: str, name: str) -> str:
@@ -405,10 +441,23 @@ def load_parallel_transport_head(
                 "mandatory finite-link DFT head validation is not "
                 "complete/passing"
             )
-        if ints["band_start"] != 0 or ints["band_stop"] != expected_nb:
+        # The links may run on an outer band set that contains the head's
+        # (``get_dipole_mtxels --parallel-transport-bands``): the head reads
+        # its block and the velocity gate must have judged at least it.
+        try:
+            judged = int(io.read_small("velocity_validation_band_stop",
+                                       dtype=np.int64))
+        except (KeyError, RuntimeError, OSError, ValueError):
+            judged = ints["band_stop"]
+        if ints["band_start"] != 0 or ints["band_stop"] < expected_nb:
             refusals.append(
-                f"band manifold [{ints['band_start']},{ints['band_stop']}) != "
-                f"current full head manifold [0,{expected_nb})"
+                f"band manifold [{ints['band_start']},{ints['band_stop']}) "
+                f"does not contain the head manifold [0,{expected_nb})"
+            )
+        elif judged < expected_nb:
+            refusals.append(
+                f"the velocity gate judged bands [0,{judged}) only; the head "
+                f"needs [0,{expected_nb}) (regenerate with this deck)"
             )
         if ints["effective_nspinor"] != int(meta.nspinor):
             refusals.append(
@@ -467,24 +516,26 @@ def load_parallel_transport_head(
         }
 
         spec = P(None, None, "x", "y")
+        nb_outer = int(ints["band_stop"])
         nb_storage = band_storage_extent(mesh, expected_nb)
-        large_shape = (3, int(meta.nk_tot), nb_storage, nb_storage)
+        outer_storage = band_storage_extent(mesh, nb_outer)
+        large_shape = (3, int(meta.nk_tot), outer_storage, outer_storage)
         forward_neighbors = np.asarray(io.read_slab(
             "full_forward_neighbors", shape=(int(meta.nk_tot), 3),
             partition_spec=P(None, None), as_numpy=True), dtype=np.int64)
         links = load_full_bz_links(
-            io, mesh=mesh, nk=int(meta.nk_tot), nb_storage=nb_storage,
-            nb_logical=expected_nb,
+            io, mesh=mesh, nk=int(meta.nk_tot), nb_storage=outer_storage,
+            nb_logical=nb_outer,
         )
-        velocity = io.read_slab(
+        velocity = head_band_block(io.read_slab(
             VELOCITY_DFT_DATASET, shape=large_shape, partition_spec=spec
-        )
+        ), expected_nb, mesh=mesh, nb_outer=nb_outer)
         # Small (O(nk*nb) real) host-resident diagnostic, read in the SAME
         # handle as everything above -- one owner, one open, per this
         # loader's own docstring.  Not consulted here; the D3(a) window
         # preflight in ``sc_iteration.load_head_velocity_source`` reads it
         # off the returned object.
-        singular_values = load_link_singular_values(io, nb_logical=expected_nb)
+        singular_values = load_link_singular_values(io, nb_logical=nb_outer)
         collapsed_position = None
         if collapsed_axes(expected_kgrid):
             # A collapsed axis has no link stencil; its connection is the
@@ -519,9 +570,9 @@ def load_parallel_transport_head(
     expected_prefix = (3, int(meta.nk_tot))
     if (
         tuple(links.shape[:2]) != expected_prefix
-        or links.shape != velocity.shape
+        or tuple(velocity.shape) != expected_prefix + (nb_storage, nb_storage)
         or links.shape[-2] != links.shape[-1]
-        or int(links.shape[-1]) < expected_nb
+        or int(links.shape[-1]) < nb_outer
         or forward_neighbors.shape != (int(meta.nk_tot), 3)
     ):
         raise ValueError(
@@ -560,6 +611,7 @@ def load_parallel_transport_head(
         validation=validation,
         singular_values=singular_values,
         collapsed_position=collapsed_position,
+        nb_links=nb_outer,
     )
 
 
@@ -634,9 +686,10 @@ def load_dft_velocity_head(
         if schema not in (2, int(SCHEMA_VERSION)):
             refusals.append(
                 f"schema_version={schema}, expected 2 or {SCHEMA_VERSION}")
-        if (band_start, band_stop) != (0, nb):
+        if band_start != 0 or band_stop < nb:
             refusals.append(
-                f"band manifold [{band_start},{band_stop}) != [0,{nb})"
+                f"band manifold [{band_start},{band_stop}) does not contain "
+                f"[0,{nb})"
             )
         if not np.array_equal(kgrid, np.asarray(wfn.kgrid, dtype=np.int32)):
             refusals.append("k grid differs from the current WFN")
@@ -658,11 +711,12 @@ def load_dft_velocity_head(
                 f"{path}: refusing DFT velocity stage:\n  - "
                 + "\n  - ".join(refusals)
             )
-        velocity = io.read_slab(
+        outer_storage = band_storage_extent(mesh, band_stop)
+        velocity = head_band_block(io.read_slab(
             VELOCITY_DFT_DATASET,
-            shape=(3, int(meta.nk_tot), nb_storage, nb_storage),
+            shape=(3, int(meta.nk_tot), outer_storage, outer_storage),
             partition_spec=P(None, None, "x", "y"),
-        )
+        ), nb, mesh=mesh, nb_outer=band_stop)
     return DftVelocityHeadData(
         velocity_dft_cart=velocity,
         nb_logical=nb,
@@ -988,12 +1042,15 @@ def load_interband_commutator_head(
             vnl_included = None
             detail = f"{type(exc).__name__}: {exc}"
         if vnl_included == 1 and axes:
-            nb_storage = band_storage_extent(mesh, int(meta.b_id_4_user))
+            nb_head = int(meta.b_id_4_user)
+            nb_outer = max(nb_head, int(io.read_small("band_stop", dtype=np.int64)))
+            outer_storage = band_storage_extent(mesh, nb_outer)
             try:
-                position = io.read_slab(
+                position = head_band_block(io.read_slab(
                     COLLAPSED_POSITION_DATASET,
-                    shape=(3, int(meta.nk_tot), nb_storage, nb_storage),
-                    partition_spec=P(None, None, "x", "y"))
+                    shape=(3, int(meta.nk_tot), outer_storage, outer_storage),
+                    partition_spec=P(None, None, "x", "y")),
+                    nb_head, mesh=mesh, nb_outer=nb_outer)
             except (KeyError, RuntimeError, OSError, ValueError) as exc:
                 raise ValueError(
                     f"GATE pt_collapsed_axis_artifact: {path}: the k grid "
@@ -1315,10 +1372,28 @@ def assemble_delta_head_manifold(
     *,
     nb_storage: int,
     mesh: Mesh,
+    nb_logical: int | None = None,
+    nb_links: int | None = None,
 ):
-    """Embed active DeltaH and the current diagonal sum-band tail."""
+    """Embed active DeltaH and the current diagonal sum-band tail.
+
+    ``nb_links > nb_logical``: the links run on an outer band set
+    (``ParallelTransportHeadData.nb_links``), so DeltaH is embedded there.
+    Past the head's ``nb_logical`` bands it continues the diagonal scissor
+    tail: each k takes its highest head band's shift (the rigid tail law's
+    Delta_c when that band is in the tail).
+    """
     delta = jnp.asarray(delta_h_active)
     tail = jnp.asarray(tail_diagonal)
+    if nb_links is not None and nb_logical is not None and int(nb_links) > int(nb_logical):
+        from common.parallel_transport import band_storage_extent
+        top = int(nb_logical)
+        outer_storage = band_storage_extent(mesh, int(nb_links))
+        tail = jnp.concatenate([
+            tail[:, :top],
+            jnp.broadcast_to(tail[:, top - 1:top],
+                             (tail.shape[0], outer_storage - top))], axis=1)
+        nb_storage = outer_storage
     if delta.ndim != 3 or delta.shape[-2] != delta.shape[-1]:
         raise ValueError("delta_h_active must be (nk,na,na)")
     if tail.ndim != 2 or tail.shape[0] != delta.shape[0]:
@@ -3503,6 +3578,7 @@ def build_iteration_head_response(
     eta_ry: float | None = None,
     occupation_state=None,
     collapsed_position=None,
+    nb_links: int | None = None,
 ) -> IterationHeadResponse:
     """Build current-basis direct head and, when requested, its wings.
 
@@ -3523,7 +3599,9 @@ def build_iteration_head_response(
             raise ValueError(
                 "forward_neighbors are required when forward_links are present"
             )
-        v_dft_basis = v_dft_basis + covariant_link_derivative(
+        # On an outer link set the derivative is taken there and restricted
+        # to the head's bands (identity when the two sets agree).
+        v_dft_basis = v_dft_basis + head_band_block(covariant_link_derivative(
             delta_h_dft,
             forward_links,
             forward_neighbors,
@@ -3531,7 +3609,8 @@ def build_iteration_head_response(
             kgrid=kgrid,
             bvec_cart=bvec_cart,
             collapsed_position=collapsed_position,
-        )
+        ), int(nb_logical), mesh=mesh,
+            nb_outer=int(nb_links or nb_logical))
     v_qp = rotate_velocity_active_to_qp(v_dft_basis, U_dft_to_qp, mesh=mesh)
     resolved_eta_ry = (
         float(config.head.wcoul0_eta)

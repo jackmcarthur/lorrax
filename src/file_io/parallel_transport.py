@@ -1428,8 +1428,18 @@ def complete_velocity_validation(
     rtol: float,
     scope_blocks=(),
     collapsed_position=None,
+    head_nbands=None,
 ) -> dict[str, object]:
     """Run and stamp the finite-link DFT head-velocity gate.
+
+    ``head_nbands`` (default: every band of the artifact) is the head's
+    band set.  The links and the covariant derivative run on the whole
+    (outer) artifact manifold; the gate judges the reconstruction on
+    ``[0, head_nbands)`` only, which is the block the QSGW head consumes
+    (:func:`gw.qsgw_head.load_parallel_transport_head`).  Bands between the
+    head and the outer edge are a buffer: the outer edge's link collapse
+    stays out of the head block.  The judged extent is stamped as
+    ``velocity_validation_band_stop``.
 
     ``collapsed_position`` ``(3, nk, nb, nb)`` is required when ``kgrid``
     has a collapsed axis: there the reconstructed velocity is
@@ -1496,9 +1506,22 @@ def complete_velocity_validation(
         H, links, plus, spacing, band_matmul=band_matmul,
         stencil_orders=orders, collapsed_position=collapsed_position)
     reconstructed = reduced_covector_to_cartesian(reduced, reciprocal)
+    outer_reconstructed = reconstructed
+    judged = int(nb if head_nbands is None else head_nbands)
+    if not 0 < judged <= nb:
+        raise ValueError(f"head_nbands={judged} outside the artifact's {nb} bands")
+    if judged < nb:
+        # The head block only: rows and columns past the head are zeroed in
+        # both operands, so every metric below (entrywise, transition
+        # overlap, head response) is the head's.
+        keep = jnp.arange(nb) < judged
+        block = (keep[:, None] & keep[None, :])[None, None]
+        reconstructed = jnp.where(block, reconstructed, 0.0)
+        exact = jnp.where(block, exact, 0.0)
 
     metrics = _velocity_error_metrics(
         reconstructed, exact, atol=float(atol), rtol=float(rtol))
+    metrics["band_stop"] = judged
     metrics["entrywise_passed"] = bool(metrics["passed"])
     metrics["stencil_orders"] = tuple(int(o) for o in orders)
     # Per-Cartesian-axis reduction of the same error, so a slab's collapsed
@@ -1594,7 +1617,8 @@ def complete_velocity_validation(
                       metrics["head_response_ratio_by_axis"])))
     if blocks:
         metrics["blocks"] = _block_scoped_metrics(
-            reconstructed, exact, blocks, atol=float(atol), rtol=float(rtol))
+            outer_reconstructed, jnp.asarray(velocity_exact_cart), blocks,
+            atol=float(atol), rtol=float(rtol))
         if jax.process_index() == 0:
             print(f"  finite-link velocity diagnostics (nb={nb}, nk={nk})")
             print("   bands  max_abs      diag         offdiag      rel_l2 gate")
@@ -1736,6 +1760,7 @@ def validate_parallel_transport_artifact(
     atol: float,
     rtol: float,
     scope_blocks=None,
+    head_nbands=None,
 ) -> dict[str, object]:
     """Read the artifact through SlabIO and execute its mandatory gate."""
     nb = int(nbands)
@@ -1780,7 +1805,7 @@ def validate_parallel_transport_artifact(
         links_full=links,
         forward_neighbors=forward_neighbors,
         atol=float(atol), rtol=float(rtol), scope_blocks=scope_blocks,
-        collapsed_position=collapsed_position)
+        collapsed_position=collapsed_position, head_nbands=head_nbands)
 
 
 def _velocity_error_metrics(
@@ -1889,6 +1914,9 @@ def write_velocity_validation(
         io.write_attr("velocity_validation_complete", np.int32(1))
         io.write_attr(
             "velocity_validation_passed", np.int32(bool(metrics["passed"])))
+        if "band_stop" in metrics:
+            io.write_attr("velocity_validation_band_stop",
+                          np.int32(int(metrics["band_stop"])))
         for name in _VELOCITY_GATE_KEYS:
             io.write_attr(
                 f"velocity_validation_{name}", np.float64(metrics[name]))
@@ -2029,7 +2057,7 @@ def publish_dft_velocity(path, velocity_kmajor, psi_G, *, wfn, sym, geom,
 def complete_parallel_transport(path, *, wfn, sym, mesh, nbands, bispinor,
                                 rcond, velocity_only, w_av_first_neighbors,
                                 w_av_second_neighbors, atol, rtol,
-                                report) -> None:
+                                report, head_nbands=None) -> None:
     """The links, the fourth-order connection and the velocity-identity gate.
 
     ``velocity_only`` stops after the velocity stage: the link stream, the
@@ -2059,12 +2087,14 @@ def complete_parallel_transport(path, *, wfn, sym, mesh, nbands, bispinor,
         metrics = validate_parallel_transport_artifact(
             path, mesh=mesh, kgrid=wfn.kgrid, nbands=nbands,
             bvec_cart=np.asarray(wfn.bvec) * float(wfn.blat),
-            atol=atol, rtol=rtol)
+            atol=atol, rtol=rtol, head_nbands=head_nbands)
     print("  DFT covariant-velocity validation: PASS "
           f"max_abs={metrics['max_abs']:.6e}, "
           f"max_rel={metrics['max_rel']:.6e}")
     print(f"\nWrote parallel-transport data to {path}")
     report.heading("Parallel-transport validation")
+    report.emit(f"Links on bands 1-{int(nbands)}; velocity judged on "
+                f"bands 1-{int(metrics['band_stop'])} (the head)")
     report.emit("Covariant DFT velocity: PASS; "
                 f"max abs={float(metrics['max_abs']):.5e}; "
                 f"max rel={float(metrics['max_rel']):.5e}")

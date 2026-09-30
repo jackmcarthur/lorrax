@@ -742,6 +742,16 @@ def build_parser() -> argparse.ArgumentParser:
 		     "validation.  Requires --parallel-transport-out.",
 	)
 	parser.add_argument(
+		"--parallel-transport-bands",
+		type=int,
+		default=0,
+		help="Outer band set of the parallel-transport links (and of the "
+		     "velocity written with them): bands 1..N.  0 (default) takes "
+		     "every WFN band.  The mandatory velocity gate judges the deck's "
+		     "own band set (the head), so the outer edge's link collapse "
+		     "stays in the buffer above it.",
+	)
+	parser.add_argument(
 		"--parallel-transport-rcond",
 		type=float,
 		default=1.0e-10,
@@ -952,6 +962,20 @@ def main(argv=None):
 		# ψ is NOT loaded here — see the k sweep below.
 		nband_eff = _resolve_dipole_nb_written(
 			wfn, ncond=ncond, nband=nband)
+		# The head's band set; the links run on an outer set above it
+		# (--parallel-transport-bands, default every WFN band) and the
+		# velocity gate judges only the head block.
+		head_nbands = nband_eff
+		if (args.parallel_transport_out is not None
+				and not args.parallel_transport_velocity_only
+				and not args.w_av_only):
+			outer = int(args.parallel_transport_bands) or int(wfn.nbands)
+			if not head_nbands <= outer <= int(wfn.nbands):
+				parser.error(
+					f"--parallel-transport-bands={outer} must lie in "
+					f"[{head_nbands}, {int(wfn.nbands)}] (the deck's bands, "
+					"the WFN's bands)")
+			nband_eff = outer
 
 		if args.w_av_only:
 			report.environment(wfn=wfn, lines=(
@@ -1431,7 +1455,7 @@ def main(argv=None):
 					w_av_second_neighbors=w_av_second_neighbors,
 					atol=float(args.parallel_transport_validation_atol),
 					rtol=float(args.parallel_transport_validation_rtol),
-					report=report)
+					report=report, head_nbands=head_nbands)
 		dipole_progress.step()
 		dipole_progress.finish()
 
