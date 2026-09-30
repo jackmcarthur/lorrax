@@ -69,7 +69,12 @@ are `P(None,'x','y')` on the square X/Y mesh with `P = Px·Py`.
    a one-shot (restart member) and a refused admission write `model.h5`. A
    rerun of an interrupted SC run finds no committed model in a resident map's
    scratch: it resumes the constructor from a retained file bank, else
-   rebuilds that map; a committed `model.h5` still refuses a rebuild.
+   rebuilds that map; a committed `model.h5` still refuses a rebuild. A photon
+   map's published `sectors.json` is reused when it binds the current identity
+   (recipe_hash included) and every model and constant it names is a file in
+   that directory; sector models that were resident died with the run, so the
+   map rebuilds, and the report names every removed file in one WARNING line;
+   a manifest of another identity refuses (`GATE shared_pole_output`).
 5. **Σ** (§8) synthesizes $W_c(\tau)$ from the factors.
 
 Every map rebuilds samples, directions, poles and ranks from the current

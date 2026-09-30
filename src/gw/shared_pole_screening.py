@@ -78,6 +78,50 @@ def _authenticated_constructor_resume(root, identity, recipe, *, photon=False):
     return ('photon_layout' in header) == photon
 
 
+# What the sector constructor publishes into a map directory.
+_SECTOR_OUTPUTS = ('sectors.json', 'CC.h5', 'TT.h5', 'CT_C.h5', 'CT_T.h5')
+
+
+def _published_sector_handle(root, identity):
+    """The sector handle an interrupted run published for this map, or None.
+
+    A run killed after its constructor leaves ``sectors.json``. Its handle is
+    reused when the manifest binds this map's identity (label, WFN, energies,
+    occupations, centroids, recipe_hash) and every model and the constant it
+    names is a file in this directory; Sigma's manifest validation then
+    authenticates each digest on every rank. Models that were device-resident
+    died with the run, so that manifest gives None and the caller rebuilds. A
+    manifest of another identity refuses: it is not this map's private state.
+    """
+    manifest = root / 'sectors.json'
+    try:
+        header = json.loads(manifest.read_text())
+    except (OSError, ValueError):
+        return None
+    if header.get('identity') != identity:
+        raise ValueError(f'GATE shared_pole_output: sector manifest at {manifest} binds another '
+                         'map, recipe or WFN; use a fresh run directory')
+    paths = [row.get('path') for row in header.get('sectors', {}).values()]
+    paths.append(header.get('constant', {}).get('path'))
+    own = root.resolve()
+    if len(paths) != 5 or not all(isinstance(p, str) and Path(p).parent == own
+                                  and Path(p).is_file() for p in paths):
+        return None
+    return dict(path=str(manifest.resolve()), identity=header['identity'],
+                digest=header['digest'], representation=header['representation'],
+                sectors=header['sectors'], constant=header['constant'])
+
+
+def _mark_photon_head(handle, config):
+    """Name the direct four-current Γ head on a photon handle when heads are on."""
+    from .gw_config import HeadCorrection, uses_direct_bispinor_shared_pole_head
+    if config.head.correction is HeadCorrection.OFF:
+        return
+    if not uses_direct_bispinor_shared_pole_head(config):
+        raise ValueError("GATE shared_pole_photon_head: unsupported photon Γ policy")
+    handle["direct_photon_head"] = "first_order_cc_ct_tc_tt"
+
+
 def shared_pole_identity(wfns, meta, *, label, wfn, binding, centroid_indices):
     """Bind logical current energies/occupations and their wavefunction source.
 
@@ -498,10 +542,15 @@ def screen_shared_poles(wfns, V_q, meta, config, *, mesh_xy, sym,
         def prepare_output():
             # Only rank zero reads the small completion marker, on the compute
             # node. The transaction owner broadcasts any refusal to every rank.
+            # An interrupted run's directory keeps what authenticates for this
+            # map and loses the rest: a published sector handle is reused, a
+            # complete bank resumes the constructor, anything else is rebuilt.
             import h5py
             model = root / "model.h5"
-            if photon and (root/'sectors.json').exists():
-                raise ValueError(f'GATE shared_pole_output: immutable sector manifest exists at {root}; use a fresh run directory')
+            if photon and (root / 'sectors.json').exists():
+                if _published_sector_handle(root, identity) is not None:
+                    print_fn(f"shared-pole output: authenticated sector manifest retained at {root}; reusing it")
+                    return "published"
             complete = False
             if model.exists():
                 try:
@@ -515,9 +564,18 @@ def screen_shared_poles(wfns, V_q, meta, config, *, mesh_xy, sym,
                 raise ValueError(f"GATE shared_pole_output: complete model {model}; use its compatible restart member or a fresh run directory")
             if _authenticated_constructor_resume(root, identity, recipe, photon=photon):
                 print_fn(f"shared-pole output: authenticated complete bank retained at {root}; resuming constructor")
+                stale = [name for name in (_SECTOR_OUTPUTS if photon else ())
+                         if (root / name).exists()]
+                for name in stale:
+                    (root / name).unlink()
+                if stale:
+                    print_fn(f"WARNING shared-pole output: removed {' '.join(stale)} from {root}; "
+                             "rebuilding this map's constructor")
                 return True
             if root.exists():
-                print_fn(f"shared-pole output: removing partial directory {root} and rebuilding")
+                removed = ' '.join(sorted(path.name for path in root.iterdir()))
+                print_fn(f"WARNING shared-pole output: removed partial directory {root} "
+                         f"({removed}); rebuilding this map")
                 shutil.rmtree(root)
             else:
                 print_fn(f"shared-pole output: creating new directory {root}")
@@ -527,6 +585,18 @@ def screen_shared_poles(wfns, V_q, meta, config, *, mesh_xy, sym,
         resume_constructor = rank0_transaction(
             root, stage="shared_pole.prepare_output", write=prepare_output,
             return_value=True)
+        if resume_constructor == "published":
+            from common.collectives import agree_io_error
+            handle, error = None, None
+            try:
+                handle = _published_sector_handle(root, identity)
+                if handle is None:
+                    raise ValueError(f"GATE shared_pole_output: sector manifest at {root} changed during reuse")
+            except (OSError, ValueError) as exc:
+                error = exc
+            agree_io_error(error, path=root / 'sectors.json', stage='shared_pole.published_handle')
+            _mark_photon_head(handle, config)
+            return dict(shared_pole=handle)
         tables = _shared_pole_tables(meta, sym, centroid_indices)
     with timing.section("spole.coulomb_staging"):
         if resume_constructor:
@@ -647,20 +717,16 @@ def screen_shared_poles(wfns, V_q, meta, config, *, mesh_xy, sym,
         ledger.live_stages = (handle['model_stage'],) if handle.get('model_stage') else ()
         result = dict(shared_pole=handle)
         from .gw_config import HeadCorrection
-        if config.head.correction is not HeadCorrection.OFF:
-            if photon:
-                from .gw_config import uses_direct_bispinor_shared_pole_head
-                if not uses_direct_bispinor_shared_pole_head(config):
-                    raise ValueError("GATE shared_pole_photon_head: unsupported photon Γ policy")
-                handle["direct_photon_head"] = "first_order_cc_ct_tc_tt"
-            else:
-                from .shared_pole_head import build_shared_pole_head
-                head, iteration_head = build_shared_pole_head(
-                    handle, header, V_q, wfns, meta, config, mesh_xy=mesh_xy, wfn=wfn,
-                    response=iteration_head_response, head_resolver=head_resolver,
-                    plan=mpa_plan, material_class=material_class, occupation_state=occupation_state)
-                result.update(mpa_head=head, iteration_head=iteration_head)
-                record("head", head)
+        if photon:
+            _mark_photon_head(handle, config)
+        elif config.head.correction is not HeadCorrection.OFF:
+            from .shared_pole_head import build_shared_pole_head
+            head, iteration_head = build_shared_pole_head(
+                handle, header, V_q, wfns, meta, config, mesh_xy=mesh_xy, wfn=wfn,
+                response=iteration_head_response, head_resolver=head_resolver,
+                plan=mpa_plan, material_class=material_class, occupation_state=occupation_state)
+            result.update(mpa_head=head, iteration_head=iteration_head)
+            record("head", head)
         if (config.debug.write_w or config.write_poles) and not photon:
             from file_io.shared_pole_store import export_shared_pole_outputs
             with timing.section("spole.outputs"):
