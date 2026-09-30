@@ -366,7 +366,10 @@ def _report_band_extrapolation(
     omega_eval_ev = enk_ev - (float(wfn.efermi) if sigma_omega.efermi_ry is None
                               else float(sigma_omega.efermi_ry)) * RYD_TO_EV
     omega_grid_ev = np.asarray(config.omega_grid_ev, dtype=np.float64)
-    head = (None if head_sigma_diag_w_kn_ry is None
+    # The closed-form head is read at the slots; a host array as it is.
+    head = (head_sigma_diag_w_kn_ry
+            if head_sigma_diag_w_kn_ry is None
+            or hasattr(head_sigma_diag_w_kn_ry, "at_slots")
             else np.asarray(head_sigma_diag_w_kn_ry))
 
     points = []

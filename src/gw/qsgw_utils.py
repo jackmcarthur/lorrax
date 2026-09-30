@@ -142,7 +142,8 @@ def interp_sigma_diag_along_omega(
     """:func:`interp_along_omega` of the band diagonal of a Σ(ω) cube.
 
     The same numbers as extracting the (nω, nk, nb) diagonal, adding
-    ``add_w_kn`` (the host head diagonal), multiplying by ``scale`` and
+    ``add_w_kn`` (the head diagonal: a host array or the closed-form
+    ``HeadSigmaDiag``, read at the two slots), multiplying by ``scale`` and
     interpolating, element for element.  Only the two ω slots each (k, n)
     reads leave the cube (:func:`sigma_diag_at_omega_slots`), so no
     (nω, nk, nb) array is made on the host or replicated on the devices.
@@ -151,7 +152,12 @@ def interp_sigma_diag_along_omega(
         omega_grid, eval_kn, context=context, print_fn=print_fn)
     lo, hi = sigma_diag_at_omega_slots(
         sigma_w_kij, mesh_xy, np.stack([idx_lo, idx_hi]), band_axis=band_axis)
-    if add_w_kn is not None:
+    if add_w_kn is not None and hasattr(add_w_kn, "at_slots"):
+        # The closed-form head (head_correction.HeadSigmaDiag): its value at
+        # the two slots, the same cell arithmetic as its full array.
+        add_lo, add_hi = add_w_kn.at_slots(np.stack([idx_lo, idx_hi]))
+        lo, hi = lo + add_lo, hi + add_hi
+    elif add_w_kn is not None:
         k_idx = np.arange(idx_lo.shape[0])[:, None]
         n_idx = np.arange(idx_lo.shape[1])[None, :]
         lo = lo + add_w_kn[idx_lo, k_idx, n_idx]
@@ -305,6 +311,7 @@ _EXTRACT_DIAG_KERNEL_CACHE: dict[int, object] = {}
 _EXTRACT_DIAG_SHARDED_KERNEL_CACHE: dict[int, object] = {}
 _EXTRACT_DIAG_SLOTS_KERNEL_CACHE: dict[int, object] = {}
 _ADD_BAND_DIAG_KERNEL_CACHE: dict[tuple[int, bool], object] = {}
+_ADD_BAND_DIAG_ROWS_KERNEL_CACHE: dict[tuple[int, bool], object] = {}
 _SET_BAND_DIAG_KERNEL_CACHE: dict[int, object] = {}
 
 
@@ -483,6 +490,56 @@ def add_band_diag_sharded(sigma_w_kij: jax.Array, diag_w_kn, *,
         np.ascontiguousarray(np.asarray(diag_w_kn, dtype=np.complex128)),
         NamedSharding(mesh_xy, P(None, None, None)))
     return fn(sigma_w_kij, diag_rep)
+
+
+def add_band_diag_rows_sharded(sigma_w_kij: jax.Array, band_rows, *,
+                               donate: bool = False) -> jax.Array:
+    """:func:`add_band_diag_sharded` with the diagonal supplied by band rows.
+
+    ``band_rows(start, stop)`` returns the host (nω, nk, stop - start) slab
+    of carrier rows [start, stop), a pure function of replicated inputs.  Each
+    process evaluates the rows of its own tiles only and places them
+    P(None, None, 'x'): the (nω, nk, nb) diagonal is on no host and is not
+    replicated on the devices (1/p_x of it per device).  The add is the same
+    IEEE ``x + d`` on the same slots.
+    """
+    mesh_xy = sigma_w_kij.sharding.mesh
+    key = (id(mesh_xy), bool(donate))
+    fn = _ADD_BAND_DIAG_ROWS_KERNEL_CACHE.get(key)
+    if fn is None:
+        from functools import partial
+        from common.shard_map import shard_map
+
+        @partial(jax.jit, donate_argnums=(0,) if donate else ())
+        @partial(shard_map, mesh=mesh_xy,
+                 in_specs=(P(None, None, 'x', 'y'), P(None, None, 'x')),
+                 out_specs=P(None, None, 'x', 'y'),
+                 check_vma=False)
+        def _add_diag_rows(tile, diag):
+            # The elementwise select of ``add_band_diag_sharded``; ``diag``
+            # is already this tile's rows.
+            ix = jax.lax.axis_index('x')
+            iy = jax.lax.axis_index('y')
+            mb, nbl = tile.shape[2], tile.shape[3]
+            rows = ix * mb + jnp.arange(mb)
+            cols = iy * nbl + jnp.arange(nbl)
+            on_diagonal = rows[:, None] == cols[None, :]
+            return jnp.where(on_diagonal[None, None, :, :],
+                             tile + diag[..., :, None], tile)
+
+        fn = _add_diag_rows
+        _ADD_BAND_DIAG_ROWS_KERNEL_CACHE[key] = fn
+
+    shape = tuple(int(n) for n in sigma_w_kij.shape[:3])
+
+    def _rows(index):
+        start, stop, _ = index[2].indices(shape[2])
+        return np.ascontiguousarray(
+            np.asarray(band_rows(start, stop), dtype=np.complex128))
+
+    diag_x = jax.make_array_from_callback(
+        shape, NamedSharding(mesh_xy, P(None, None, 'x')), _rows)
+    return fn(sigma_w_kij, diag_x)
 
 
 def set_band_diag_sharded(sigma_w_kij: jax.Array, diag_w_kn) -> jax.Array:

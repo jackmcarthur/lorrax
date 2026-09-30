@@ -109,8 +109,9 @@ def add_head_sigma_diag(
     sigma_c_body_omega
         Body contribution with shape ``(n_omega, nk, nb, nb)`` in Ry.
     head_sigma_diag_w_kn_ry
-        Head-only diagonal with shape ``(n_omega, nk, nb)`` in Ry, or
-        ``None`` when the ansatz has no separate head contribution.
+        Head-only diagonal with shape ``(n_omega, nk, nb)`` in Ry: a host
+        array or the closed-form ``head_correction.HeadSigmaDiag``; ``None``
+        when the ansatz has no separate head contribution.
     donate_body
         On the band-sharded layout, write the head into the body's buffer
         and delete the body array.  Only a caller that reads the body no
@@ -119,7 +120,17 @@ def add_head_sigma_diag(
     if head_sigma_diag_w_kn_ry is None:
         return sigma_c_body_omega
 
-    head = np.asarray(head_sigma_diag_w_kn_ry)
+    from .qsgw_utils import (
+        add_band_diag_rows_sharded, add_band_diag_sharded,
+        is_band_sharded_sigma_omega)
+    # The closed-form head (head_correction.HeadSigmaDiag) on the band-sharded
+    # cube: each rank evaluates the rows of its own tile, so the
+    # (n_omega, nk, nb) diagonal is on no host.  Every other case takes the
+    # array (the replicated layouts hold the whole cube on each device).
+    by_rows = (hasattr(head_sigma_diag_w_kn_ry, "band_rows")
+               and is_band_sharded_sigma_omega(sigma_c_body_omega))
+    head = (head_sigma_diag_w_kn_ry if by_rows
+            else np.asarray(head_sigma_diag_w_kn_ry))
     expected_head = tuple(sigma_c_body_omega.shape[:2]) + (
         int(band_axis.logical) if band_axis is not None
         else int(sigma_c_body_omega.shape[2]),)
@@ -135,6 +146,20 @@ def add_head_sigma_diag(
         authenticate_axis(
             sigma_c_body_omega, band_axis, axis=-1,
             where="dynamic Sigma body producer")
+    if by_rows:
+        n_w, nk, n_logical = head.shape
+
+        def carrier_rows(start, stop):
+            # Carrier rows past the logical bands add exact zeros.
+            rows = np.zeros((n_w, nk, stop - start), dtype=np.complex128)
+            top = min(stop, n_logical)
+            if top > start:
+                rows[..., :top - start] = head.band_rows(start, top)
+            return rows
+
+        return add_band_diag_rows_sharded(
+            sigma_c_body_omega, carrier_rows, donate=donate_body)
+    if band_axis is not None:
         # Padded on the host, and only when the carrier is wider: a device
         # pad pulled back by the adder was a second (n_omega, nk, nb) host
         # copy and a device copy per call.
@@ -144,7 +169,6 @@ def add_head_sigma_diag(
             padded[..., :head.shape[-1]] = head
             head = padded
 
-    from .qsgw_utils import add_band_diag_sharded, is_band_sharded_sigma_omega
     if is_band_sharded_sigma_omega(sigma_c_body_omega):
         return add_band_diag_sharded(
             sigma_c_body_omega, head, donate=donate_body)

@@ -7317,7 +7317,7 @@ def run_sc_driver(
             weight_dft_qp=head_weight_dft_qp)
         if sigma_result.head_sigma_diag_w_kn_ry is not None:
             head_sigma_diag_dft = _rotate_head_diagonal_to_dft(
-                sigma_result.head_sigma_diag_w_kn_ry, U, mesh=mesh_xy,
+                np.asarray(sigma_result.head_sigma_diag_w_kn_ry), U, mesh=mesh_xy,
                 weight_dft_qp=head_weight_dft_qp)
     exact_hartree_dft = state_final.outputs.exact_hartree_dft
     if exact_hartree_dft is None:
