@@ -407,12 +407,28 @@ def sigma_result_on_kset(
 
         selected = value
         if select_rows is not None:
-            if k_axis:
-                moveaxis = (jnp.moveaxis if isinstance(value, jax.Array)
-                            else np.moveaxis)
-                selected = moveaxis(value, k_axis, 0)
+            if k_axis and isinstance(value, jax.Array):
+                # Leading-axis slabs: an eager moveaxis of the whole
+                # table is a transposed copy of it, and for the Sigma(omega)
+                # cube that copy set the SC run peak (Na 8^3 [-100,+150] eV:
+                # a second 15.2 GB/rank cube).  Axis 0 is not the k axis,
+                # so selecting k slab by slab is the same gather; each slab
+                # costs at most ~1 GiB per device.
+                n_lead = int(shape[0])
+                per_row = max(1, value.nbytes // max(1, n_lead))
+                per_dev = per_row / max(1, len(value.sharding.device_set))
+                step = max(1, min(n_lead, int(2**30 // max(1.0, per_dev))))
+                parts = []
+                for i0 in range(0, n_lead, step):
+                    part = jnp.moveaxis(value[i0:i0 + step], k_axis, 0)
+                    parts.append(jnp.moveaxis(select_rows(part), 0, k_axis))
+                selected = (parts[0] if len(parts) == 1 else jax.device_put(
+                    jnp.concatenate(parts, axis=0), parts[0].sharding))
+                del parts
+            elif k_axis:
+                selected = np.moveaxis(value, k_axis, 0)
                 selected = select_rows(selected)
-                selected = moveaxis(selected, 0, k_axis)
+                selected = np.moveaxis(selected, 0, k_axis)
             else:
                 selected = select_rows(value)
         if int(np.shape(selected)[k_axis]) != int(nk):
