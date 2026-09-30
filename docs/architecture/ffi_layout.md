@@ -1044,3 +1044,16 @@ right, and the kernel then runs mode 0 on `P^L`, `P^R`.
   (`isdf.core._parent_conv_vertices`, conjugating the phase because the load
   returns a conjugate). The kernel's `perm`/`phase` attributes therefore stay
   the identity, and every channel of one shape reuses one executable.
+
+
+### Pair convolution beyond shared-memory residency
+
+`ffi.fft` routes pair modes0/1/6 to bounded spin/spatial tiles when their
+`3*16*(nk|1)` resident row exceeds the device opt-in shared-memory limit.
+The existing native k-axis FFT door executes each component; parent loads
+retain typed symmetry/TR/phase coefficients and plane loads gather only the
+requested endpoints. The complete-P output remains unchanged, while each
+additional scalar-spin tile has at most2048 spatial columns (262144000B at20³).
+This is an execution schedule change at round-off precision. Native AOT
+capacity checks still account for the output, parent inputs and concurrent
+lifetimes; it does not claim that every μ/k/band combination fits a card.
