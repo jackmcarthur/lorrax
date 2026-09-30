@@ -2999,9 +2999,12 @@ static ffi::Error KleadLorentzImpl(
     // The k-box split arm, chunked over pairs through a (nk, chunk * ns^2) intermediate no
     // larger than U itself (the budget: the output this call writes, n_out >= 1 rows of nk).
     // From W parents the chunk's W_R rides beside it: (nk, chunk * nA*nB), the same bound over ns^2.
+    // The intermediate is also capped at 1 GiB (the mode-11 tile bound): a chunk only groups pairs
+    // into launches, so the values do not depend on it (Fe 20^3 P36 TT: 38 GB of scratch otherwise).
     const long long per_pair = nk * (ss + ws) * 16;
     const long long n_out = U->dimensions()[0];
-    const long long chunk = std::max(1LL, std::min<long long>(pairs, pairs * n_out / nk));
+    const long long chunk = std::max(1LL, std::min<long long>(std::min<long long>(pairs, pairs * n_out / nk),
+                                                             (1LL << 30) / per_pair));
     auto y = scratch.Allocate(static_cast<size_t>(chunk * per_pair));
     if (!y.has_value()) {
         std::ostringstream os;
