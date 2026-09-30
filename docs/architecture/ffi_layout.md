@@ -1058,3 +1058,9 @@ additional scalar-spin tile has at most2048 spatial columns (262144000B at20³).
 This is an execution schedule change at round-off precision. Native AOT
 capacity checks still account for the output, parent inputs and concurrent
 lifetimes; it does not claim that every μ/k/band combination fits a card.
+
+### Selected retarded and static parent correlations (2026-09-30)
+
+The selected charge retarded and KMS static streams share mode11 with the direct frequency stream. The parent Green owner retains complex energy-power weights and explicit antiunitary partners; only the finished scalar correlation is transformed. Incumbent forward/reverse rows are `FT[v](q), conj(FT[v](-q))`; physical rows are `conj(FT[v](-q)), FT[v](q)`, with the existing physical q gather. Retarded rows use `-i(ahead-behind)` and KMS rows `-(ahead+behind)`. Four-current and full-grid legacy factories retain their existing route. Foreign split-arm scratch is included in the same compiled-memory admission as direct frequency work.
+
+`tests/bench/response_parent_moments_check.py` checks native20³ Ns2/Ns4 phase, endpoint permutation, antiunitary partner, complex energy-power and real odd weights against the prior full-spin equation, then compiles Fe-equivalent 300×300 local endpoint shapes without allocating the large data. Equivalent local geometry is a workspace certificate, not a complete resident-state capacity certificate.

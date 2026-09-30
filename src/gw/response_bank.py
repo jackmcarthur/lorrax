@@ -335,7 +335,8 @@ def photon_static_contact(wfns, meta, *, mesh_xy, layout, vertex,
             q_ids=(0,), n_outputs=1, pair_mode="kms_static", vertex=vertex)
         live_rows = stream_weights(wfns, live, mesh_xy)
         raw = execute(kernel, (jnp.asarray(rule["t"]), jnp.asarray(rule["weights"]),
-            *fixed, live_rows, live_rows, jnp.asarray([beta, mu])), "static_reference")
+            *fixed, live_rows, live_rows, jnp.asarray([beta, mu])), "static_reference",
+            runtime_bytes=_stream_scratch(wfns, meta, mesh_xy, vertex))
         currents = photon_diagonal_current_faces(vertex, mesh_xy=mesh_xy,
             layout=layout, wfn_layout=wfns.layout)
         currents = (currents[0] * jnp.asarray(live)[:, None, :],
@@ -363,7 +364,8 @@ def photon_static_contact(wfns, meta, *, mesh_xy, layout, vertex,
         raw = execute(kernel, (jnp.asarray(quad.tau), jnp.asarray(projections, dtype=jnp.complex128), *fixed,
             stream_weights(wfns, np.stack((f, np.zeros_like(f))), mesh_xy),
             stream_weights(wfns, np.stack((u, np.zeros_like(u))), mesh_xy),
-            jnp.asarray([lo, hi])), "static_reference")
+            jnp.asarray([lo, hi])), "static_reference",
+            runtime_bytes=_stream_scratch(wfns, meta, mesh_xy, vertex))
         drude = _face_zeros(mesh_xy, (1, layout.packed_extent, layout.packed_extent))()
         receipt["static_rule"] = dict(provenance=quad.provenance, max_error=quad.max_error)
         count = len(quad.tau)
@@ -467,7 +469,8 @@ def exact_bare_moments(wfns, meta, *, mesh_xy, q_ids, execute, ordered=False,
             args = (jnp.asarray([0.]), jnp.asarray([[1. + 0j]]), *fixed,
                     weight_f.astype(jnp.complex128), weight_u,
                     jnp.asarray(reference))
-            raw = execute(kernel, args, "moment_correlation")[:, 0]
+            raw = execute(kernel, args, "moment_correlation",
+                          runtime_bytes=_stream_scratch(wfns, meta, mesh_xy, vertex))[:, 0]
             term = (_w_solve_pref_scalar(meta) * coefficient) * raw
             total = term if total is None else total + term
         totals.append(total)
@@ -484,7 +487,8 @@ def exact_bare_moments(wfns, meta, *, mesh_xy, q_ids, execute, ordered=False,
             args = (jnp.asarray([0.]), jnp.asarray([[1. + 0j]]), *fixed,
                     weight_f.astype(jnp.complex128), weight_u.astype(jnp.complex128),
                     jnp.asarray(reference))
-            raw = execute(kernel, args, "moment_correlation")[:, 0]
+            raw = execute(kernel, args, "moment_correlation",
+                          runtime_bytes=_stream_scratch(wfns, meta, mesh_xy, vertex))[:, 0]
             term = (1j * _w_solve_pref_scalar(meta) * coefficient) * raw
             total = term if total is None else total + term
         totals.append(total)
