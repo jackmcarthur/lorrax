@@ -526,6 +526,14 @@ def sector_static_wc(handle, meta, *, mesh_xy):
     (``gw.response_bank``).  CT/TC/TT are not in it: BSE screens with the
     charge sector only, as after the charge route.
 
+    The q = 0 body already carries the direct Gamma head: the bank adds the
+    head field W_h - V_h to every sample through the packed zeta(G = 0)
+    vectors (``photon_direct_head.add_direct_gamma_field``), so the CC poles
+    fit it.  The BSE loader adds the stored whead once as the same rank-one
+    field, so ``gw_output.persist_w0_and_head`` stores whead = v_h (the bare
+    head) beside this W0; storing the screened head would count W_h - V_h
+    twice.
+
     Returns ``(Q, m, m)`` complex128 at ``P(None,'x','y')`` in the run's
     packed charge-centroid order (``meta.mu_basis``, the CC endpoint basis).
     """
