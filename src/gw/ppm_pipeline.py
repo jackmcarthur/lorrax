@@ -21,7 +21,6 @@ from functools import lru_cache
 
 import jax
 import jax.numpy as jnp
-from jax.sharding import NamedSharding, PartitionSpec as P
 import numpy as np
 
 from common.units import RYD_TO_EV
@@ -221,63 +220,46 @@ def _compute_analytic_head_diag(
     return np.asarray(head_sigma_diag_ry)
 
 
-@lru_cache(maxsize=16)
-def _band_count_kernel(sharding):
-    """Reuse one dynamic bracket extraction per output layout."""
-    return jax.jit(
-        lambda a, i: jax.lax.dynamic_index_in_dim(a, i, keepdims=False),
-        out_shardings=sharding)
-
-
-def _combine_extrapolation(a, w):
-    """Apply symmetric per-state weights in bracket order."""
-    w = jnp.asarray(w, dtype=a.dtype)
+def _combine_extrapolation(first, rest, w):
+    """Apply symmetric per-state weights to the live points, in count order."""
+    w = jnp.asarray(w, dtype=first.dtype)
     # Form only one (nk, nb, nb) weight matrix at a time. The small static
-    # bracket loop preserves the established elementwise summation order.
+    # point loop preserves the established elementwise summation order.
     acc = None
-    for b in range(w.shape[0]):
+    for b, a in enumerate((first, *rest)):
         wb = w[b]
         wsym = 0.5 * (wb[:, :, None] + wb[:, None, :])
-        term = a[b] * wsym[None, ...]
+        term = a * wsym[None, ...]
         acc = term if acc is None else acc + term
     return acc
 
 
 @lru_cache(maxsize=16)
 def _extrapolation_kernel(sharding):
-    """Reuse the ordered affine combination with weights as operands."""
-    return jax.jit(_combine_extrapolation, out_shardings=sharding)
+    """The ordered affine combination, written into the first point's buffer."""
+    return jax.jit(_combine_extrapolation, out_shardings=sharding,
+                   donate_argnums=(0,))
 
 
 def band_count_point(cube, i: int):
-    """``cube[i]`` with the TRAILING (ω, k, m, n) sharding preserved.
+    """Count ``i`` of a ``BandCountCube`` on the full BZ, ``(ω, k, m, n)``.
 
-    The Σ cube's leading axis is the band count and is replicated, so
-    dropping it is shard-local — but ``sigma_omega_layout=sharded``'s whole
-    contract is that consumers read the layout off the array itself
-    (``qsgw_utils.is_band_sharded_sigma_omega``), and a bare ``cube[i]``
-    leaves that to XLA's propagation through a slice+reshape.  Restate it.
+    A fresh buffer at ``P(None, None, 'x', 'y')``: consumers read the layout
+    off the array (``qsgw_utils.is_band_sharded_sigma_omega``).
     """
-    sharding = getattr(cube, "sharding", None)
-    if not isinstance(sharding, NamedSharding):
-        return cube[i]
-    spec = tuple(sharding.spec)
-    if len(spec) != int(getattr(cube, "ndim", 0)):
-        return cube[i]
-    out = NamedSharding(sharding.mesh, P(*spec[1:]))
-    return _band_count_kernel(out)(cube, jnp.asarray(i, dtype=jnp.int32))
+    return cube.point(i)
 
 
-def _extrapolated_point(cube, weights):
-    """``S_extrap`` over the leading bracket axis: ``sum_b w_b * cube[b]``.
+def _extrapolated_point(cube, weights, top=None):
+    """``S_extrap = sum_b w_b * S(N_b)`` over the points that carry weight.
 
     THE OPERATION THAT MAKES THE EXTRAPOLATED Σ A LEGITIMATE HAMILTONIAN.
     ``weights`` are REAL and sum to 1, and both properties are load-bearing
     rather than incidental.
 
-    ``(3, nk, nb)`` — ``spectral_shell``.  The estimator solves one exponent
-    per EXTERNAL state, so its coefficients carry the state shape.  The Σ
-    element ``(i, j)`` has two external states, and the coefficient applied
+    ``(3, nk, nb)`` — ``spectral_shell``.  The estimator solves one tail
+    ratio per EXTERNAL state, so its coefficients carry the state shape.  The
+    Σ element ``(i, j)`` has two external states, and the coefficient applied
     there is the MEAN of the two, ``w_ij = ½(w_i + w_j)``.  That is forced,
     not chosen: it is the unique symmetric rule that is exact on the band
     diagonal (where the estimator is defined and where it was measured) and
@@ -287,44 +269,41 @@ def _extrapolated_point(cube, weights):
     cumulative bracket point is Hermitian in (i, j); a real scalar times a
     complex number commutes with conjugation bit-for-bit in IEEE arithmetic;
     ``½(w_i + w_j)`` equals ``½(w_j + w_i)`` to the last bit because IEEE
-    addition is commutative; and the three-term reduction is performed in the
+    addition is commutative; and the reduction is performed in the
     same order for element (i, j) and element (j, i).  So
     ``S[j, i] == conj(S[i, j])`` to the last bit, and the next SC iteration's
     eigenvectors stay consistent with its own eigenvalues.
-    ``tests/test_band_extrapolation_spectral.py::
-    test_extrapolated_sigma_is_hermitian_to_machine_precision_per_state`` is
-    the gate.
 
-    Sharding is restated on the way out for the same reason
-    :func:`band_count_point` restates it: the leading axis is dropped, and
-    ``sigma_omega_layout=sharded``'s contract is that consumers read the
-    layout off the array rather than trusting XLA to propagate it through a
-    reduction.
+    MEMORY.  The matrix of a point is needed only where its weight is not
+    zero: N₁ and N₃ (N₂ fixes Ω from its band diagonal and adds exact zeros
+    here).  The first live point is a fresh unfold and gives its buffer to
+    the result; ``top`` is the caller's N₃ cube (the raw twin), read and
+    kept.  Two full-BZ cubes are resident: the two this stage returns.
     """
     w = np.asarray(weights, dtype=np.float64)
-    if w.ndim != 3:
+    n_count, carrier = int(cube.shape[0]), int(cube.shape[-1])
+    if w.ndim != 3 or w.shape[0] != n_count:
         raise ValueError(
-            f"_extrapolated_point: weights must be the per-state (3, nk, nb) "
-            f"of spectral_shell, got shape {w.shape}")
-    if w.shape[-1] != int(cube.shape[-1]):
+            f"_extrapolated_point: weights must be the per-state "
+            f"({n_count}, nk, nb) of spectral_shell, got shape {w.shape}")
+    if w.shape[-1] != carrier:
         # Per-state weights are fitted on the LOGICAL bands; the cube keeps
         # its padded band carrier, whose extra rows/columns are zero.  Zero
         # weights there keep them zero without stripping the cube.
-        carrier = int(cube.shape[-1])
         if w.shape[-1] > carrier:
             raise ValueError(
                 f"_extrapolated_point: {w.shape[-1]} logical bands exceed the "
                 f"cube's band carrier {carrier}")
         w = np.pad(w, ((0, 0), (0, 0), (0, carrier - w.shape[-1])))
-
-    sharding = getattr(cube, "sharding", None)
-    if not isinstance(sharding, NamedSharding):
-        return _combine_extrapolation(cube, w)
-    spec = tuple(sharding.spec)
-    if len(spec) != int(getattr(cube, "ndim", 0)):
-        return _combine_extrapolation(cube, w)
-    out = NamedSharding(sharding.mesh, P(*spec[1:]))
-    return _extrapolation_kernel(out)(cube, w)
+    live = [b for b in range(n_count) if np.any(w[b])]
+    if not live:
+        raise ValueError(
+            "_extrapolated_point: every weight is zero; they must sum to 1")
+    first = cube.point(live[0])
+    rest = tuple(
+        top if (top is not None and b == n_count - 1) else cube.point(b)
+        for b in live[1:])
+    return _extrapolation_kernel(first.sharding)(first, rest, w[live])
 
 
 def _report_band_extrapolation(
@@ -545,7 +524,7 @@ def plan_sigma_band_brackets(config, wfns, meta, *, print_fn, where):
 
 def extrapolate_sigma_body(
     sigma_omega, head_sigma_diag_w_kn_ry, *,
-    e_state_ev, plan, config, band_slices, wfn, mesh_xy, print_fn,
+    e_state_ev, plan, config, band_slices, wfn, mesh_xy, print_fn, top=None,
 ):
     """``(extrapolated body, h5 payload)`` from a bracketed Σ_c cube.
 
@@ -555,14 +534,16 @@ def extrapolate_sigma_body(
     combine the three cumulative cubes (:func:`_extrapolated_point`).  The
     EXTRAPOLATED Σ_c drives E_nk; the caller keeps the un-extrapolated N₃
     cube (:func:`band_count_point`) beside it so the driver
-    diagonalizes both and reports the eqp-level correction.  Extrapolating Σ
+    diagonalizes both and reports the eqp-level correction, and passes it as
+    ``top`` so N₃ is unfolded once.  Extrapolating Σ
     and then diagonalizing is the only order that yields a Hermitian operator.
     """
     extrap_payload, extrap_weights = _report_band_extrapolation(
         sigma_omega, head_sigma_diag_w_kn_ry, e_state_ev=e_state_ev,
         plan=plan, config=config, band_slices=band_slices,
         wfn=wfn, mesh_xy=mesh_xy, print_fn=print_fn)
-    return (_extrapolated_point(sigma_omega.sigma_c_kij, extrap_weights),
+    return (_extrapolated_point(
+                sigma_omega.sigma_c_kij, extrap_weights, top=top),
             extrap_payload)
 
 
@@ -752,7 +733,7 @@ def compute_ppm_sigma_pipeline(
                 print_fn=print_fn,
             )
         # THE BLAST RADIUS STOPS HERE.  ``sigma_omega.sigma_c_kij`` carries
-        # the leading band-count axis; everything downstream of this line —
+        # the band-count points; everything downstream of this line —
         # the head injection, the eqp interpolation, sigma_mnk.h5, the QSGW
         # build — is shared with MPA and COHSEX and is deliberately left at
         # the shape it has always had.  The last element IS the ordinary
@@ -796,6 +777,7 @@ def compute_ppm_sigma_pipeline(
                 sigma_omega, head_sigma_diag_w_kn_ry, e_state_ev=e_qp_ev,
                 plan=plan, config=config, band_slices=band_slices,
                 wfn=wfn, mesh_xy=mesh_xy, print_fn=print_fn,
+                top=sigma_c_body_omega_n3,
             )
             sigma_c_body_omega_unextrap = sigma_c_body_omega_n3
 

@@ -10,9 +10,9 @@ remains outside that store because it is frequency independent.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from functools import lru_cache
-from typing import TYPE_CHECKING, NamedTuple
+from typing import TYPE_CHECKING, Callable, NamedTuple
 
 import jax
 import jax.numpy as jnp
@@ -104,22 +104,63 @@ def _residue_for_space(space: str, B_q, B_odd_q=None):
 
 
 @dataclass(frozen=True)
+class BandCountCube:
+    """The cumulative band-count points of Sigma_c(omega), unfolded one at a time.
+
+    ``wedge`` is ``(n_count, n_omega, n_wedge_k, nb, nb)`` on the FILE wedge,
+    cumulative over the band brackets.  :meth:`point` returns one count on the
+    full BZ, ``(n_omega, nk, nb, nb)`` at ``P(None, None, 'x', 'y')``, in a
+    fresh buffer.  The ``(n_count, n_omega, nk, nb, nb)`` cube is never made
+    (Na 8^3 at 1001 omega: 42.4 GiB per rank in one allocation at P4).  The
+    band extrapolation reads each point's band diagonal and drops it, and its
+    matrix combines N1 and N3 only: N2 carries weight zero
+    (``SpectralShellFit.weights``).  The unfold is a row gather and a
+    transpose, so it commutes with the cumulative sum bit for bit.
+    """
+    wedge: jax.Array
+    #: ``(wedge, i) -> point i`` on the full BZ (the executor's unfold).
+    unfold: Callable
+    nk: int
+    #: ``(nk, nb, nb)``, added to every point: the PPM static-limit term.
+    term: jax.Array | None = None
+
+    @property
+    def shape(self):
+        n_count, n_omega, _, nb_i, nb_j = self.wedge.shape
+        return (n_count, n_omega, int(self.nk), nb_i, nb_j)
+
+    def point(self, i: int):
+        value = self.unfold(self.wedge, jnp.asarray(i, dtype=jnp.int32))
+        if self.term is None:
+            return value
+        return _add_static_term_fn(value.sharding)(value, self.term)
+
+    def block_until_ready(self):
+        self.wedge.block_until_ready()
+        return self
+
+    def __sub__(self, other):
+        if self.term is not None or other.term is not None:
+            raise ValueError(
+                "BandCountCube: a difference is taken before the static term")
+        return replace(self, wedge=self.wedge - other.wedge)
+
+
+@dataclass(frozen=True)
 class SigmaOmegaResult:
     omega_ry: np.ndarray
     omega_ev: np.ndarray
-    # (n_bracket, n_omega, nk, nb, nb).  THE LEADING AXIS IS THE BAND-COUNT
-    # AXIS and it is CUMULATIVE: element ``i`` is Σ_c summed over bands
-    # ``[0, band_counts[i])``, so ``sigma_c_kij[-1]`` is the ordinary
-    # full-band Σ_c and is what every downstream consumer takes.  Length 1
-    # in the ordinary case (``band_counts == (nband,)``), 3 under
-    # ``sigma_band_extrapolation`` — one shape, one code path, no branch.
+    # A bracketed sum (every PPM run; MPA under band extrapolation) carries a
+    # :class:`BandCountCube`: point ``i`` is Σ_c summed over bands
+    # ``[0, band_counts[i])``, so the last point is the ordinary full-band
+    # Σ_c.  One point in the ordinary case (``band_counts == (nband,)``), 3
+    # under ``use_band_extrapolation``.  An unbracketed MPA sum carries the
+    # ``(n_omega, nk, nb, nb)`` array itself.
     #
-    # Layout of the TRAILING four axes is carried BY THE ARRAY'S OWN
-    # SHARDING (single source of truth): replicated/uncommitted under
-    # sigma_omega_layout=replicated (historical), or
-    # P(..., None, None, 'x', 'y') band-tiled under sigma_omega_layout=sharded —
+    # Layout of a point's four axes is carried BY THE ARRAY'S OWN SHARDING
+    # (single source of truth): P(None, None, 'x', 'y') band-tiled —
     # consumers branch via qsgw_utils.is_band_sharded_sigma_omega.
-    sigma_c_kij: jax.Array
+    sigma_c_kij: 'jax.Array | BandCountCube'
     #: Logical Sigma band window and its square mesh carrier.  Consumers keep
     #: the carrier while either band axis is sharded and derive every mask or
     #: slice from this receipt.
@@ -838,14 +879,14 @@ def _add_static_ppm_term(
         jnp.asarray(sigma_static_host, dtype=jnp.complex128), band_axis)
     static = device_put_process_local(
         np.asarray(sigma_static_host, dtype=np.complex128), static_sharding)
-    return _add_static_term_fn(sigma_c_kij.sharding)(sigma_c_kij, static)
+    return replace(sigma_c_kij, term=static)
 
 
 @lru_cache(maxsize=8)
 def _add_static_term_fn(sharding):
-    """``sigma + term`` broadcast over (bracket, omega); built once per layout."""
-    return jax.jit(lambda sigma, term: sigma + term[None, None, ...],
-                   out_shardings=sharding)
+    """``sigma + term`` broadcast over omega, in the point's own buffer."""
+    return jax.jit(lambda sigma, term: sigma + term[None, ...],
+                   out_shardings=sharding, donate_argnums=(0,))
 
 
 def compute_sigma_c_ppm_omega_grid(
