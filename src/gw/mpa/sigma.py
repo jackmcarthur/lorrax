@@ -1444,7 +1444,7 @@ def _integrate_sigma_batches(
             sym = k_unfold_plan.sym
             full = _wedge_is_full_bz(sym)
             sigma = BandCountCube(
-                matrices=matrices, diagonals=diagonals,
+                matrices=list(matrices), diagonals=list(diagonals),
                 unfold=((lambda value: value) if full else
                         _unfold_sigma_cube_fn(sym, 1, output_sharding)),
                 unfold_diagonal=_band_count_diagonal_fn(sym, mesh_xy),
@@ -1530,19 +1530,8 @@ def _band_count_reduce(mesh_xy, n_brackets):
     ``P(None, 'x', 'y')`` with one nonzero slot per band, so the fold is
     rank-local.
     """
-    from common.shard_map import shard_map
-    if n_brackets > 2 and int(mesh_xy.shape["x"]) != int(mesh_xy.shape["y"]):
-        raise ValueError(
-            "MPA Sigma band-count diagonals need a square processor mesh")
-
-    def slots(tile):
-        own = jax.lax.axis_index("x") == jax.lax.axis_index("y")
-        diag = jnp.diagonal(tile, axis1=-2, axis2=-1)
-        return jnp.where(own, diag, jnp.zeros((), tile.dtype))[..., None]
-
-    diag_slots = shard_map(
-        slots, mesh=mesh_xy, in_specs=P(None, "x", "y"),
-        out_specs=P(None, "x", "y"), check_vma=False)
+    from gw.ppm_sigma import band_diagonal_slots
+    diag_slots = band_diagonal_slots(mesh_xy, 3) if n_brackets > 2 else None
 
     def reduce(sigma):
         running = sigma[0]
