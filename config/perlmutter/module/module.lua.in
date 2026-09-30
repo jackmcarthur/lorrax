@@ -1,0 +1,67 @@
+help([[
+LORRAX @REV8@ on NERSC Perlmutter.
+Python: @VENV@ (JAX @JAX@, cuda13-local plugin).
+CUDA:   @TOOLKIT_MODULE@ (@CUDA@).
+FFI:    sealed bundle @BUNDLE12@, host + CUDA legs, one MPI (@MPICH_MODULE@).
+
+Run (one rank per GPU; select_gpu.sh keeps all four GPUs visible for NCCL):
+  srun -N 1 -n 4 --gpus-per-node=4 $LORRAX_ROOT/src/ffi/cpp/select_gpu.sh \
+    python -u -m gw.gw_jax -i deck.in
+
+Recipe: config/perlmutter/module/ in the LORRAX repository
+(docs/installation/perlmutter-module.md).
+]])
+whatis("Name: LORRAX")
+whatis("Version: @REV8@, bundle @BUNDLE12@")
+family("lorrax")
+depends_on("@TOOLKIT_MODULE@")
+
+local root = "@ROOT@"
+local venv = "@VENV@"
+local cuda = "@CUDA@"
+local ffi_cuda = "@FFI_CUDA@"
+local ffi_host = "@FFI_HOST@"
+local pythonpath = "@PYTHONPATH@"
+local ld_path = "@LD_PATH@"
+
+-- Prepend a colon list so that it ends up first, in its own order.
+local function prepend_list(var, list)
+    local items = {}
+    for path in string.gmatch(list, "([^:]+)") do table.insert(items, path) end
+    for i = #items, 1, -1 do prepend_path(var, items[i]) end
+end
+prepend_list("PATH", venv .. "/bin:" .. cuda .. "/bin")
+prepend_list("PYTHONPATH", pythonpath)
+prepend_list("LD_LIBRARY_PATH", ld_path)
+
+setenv("LORRAX_ROOT", root)
+setenv("LORRAX_FFI_SO", ffi_cuda)
+setenv("LORRAX_FFI_HOST_SO", ffi_host)
+setenv("CUDA_HOME", cuda)
+-- Neither leg links Cray's GTL; the site's craype-accel-nvidia80 exports 1,
+-- and MPI_Init then aborts.
+setenv("MPICH_GPU_SUPPORT_ENABLED", "0")
+setenv("JAX_PLATFORMS", "cuda,cpu")
+setenv("JAX_ENABLE_X64", "1")
+-- No XLA allocator, preallocation or memory-fraction variable: the GPU pool
+-- belongs to runtime.set_default_gpu_pool(), and an export would override it.
+
+-- Read by the m4598 `lx` launcher (sandbox tooling, not in this repository)
+-- and src/ffi/cpp/in_container.sh; srun ignores them.  LORRAX_SHIFTER is an
+-- argv prefix that re-applies this environment inside each rank.
+setenv("LORRAX_MPI_TYPE", "cray_shasta")
+setenv("LORRAX_MPICH_GPU_SUPPORT", "0")
+setenv("LORRAX_FFI_EXPECT_BACKENDS", "cusolvermp,cublasmp,cufft,phdf5")
+setenv("LORRAX_SHIFTER", table.concat({
+    "env",
+    "PATH=" .. venv .. "/bin:" .. cuda .. "/bin:/usr/bin:/bin",
+    "PYTHONPATH=" .. pythonpath,
+    "LD_LIBRARY_PATH=" .. ld_path,
+    "CUDA_HOME=" .. cuda,
+    "LORRAX_FFI_SO=" .. ffi_cuda,
+    "LORRAX_FFI_HOST_SO=" .. ffi_host,
+    "LORRAX_MPICH_GPU_SUPPORT=0",
+    "MPICH_GPU_SUPPORT_ENABLED=0",
+    "JAX_PLATFORMS=cuda,cpu",
+    "JAX_ENABLE_X64=1"
+}, " "))
