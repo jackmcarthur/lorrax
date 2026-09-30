@@ -161,7 +161,7 @@ def main():
         pt = load_parallel_transport_head(str(out/'pt.h5'), mesh=R.mesh,
                                          sym=sym,wfn=wfn,meta=meta)
         velocity = load_dft_velocity_head(str(out/'velocity.h5'),mesh=R.mesh,
-                                         sym=sym,wfn=wfn,meta=meta)
+                                         wfn=wfn,meta=meta)
         v_error = float(jax.device_get(jnp.max(jnp.abs(
             pt.velocity_dft_cart-velocity.velocity_dft_cart))))
         assert v_error < 5e-12, v_error
