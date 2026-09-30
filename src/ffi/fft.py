@@ -2037,15 +2037,18 @@ def chi_unfold_scratch_bytes(kgrid, ns: int, tile_bytes: int, optin: int | None 
 
     The split arm (a pair's ``2 ns^2`` columns do not fit the opt-in shared memory, the
     rule :func:`chi_unfold_refusal` reads) chunks its pairs through a ``(N_k, chunk·2ns²)``
-    intermediate bounded by ``scratch_bytes``, by default one local parent-Green tile
-    (``tile_bytes``, :func:`make_kconv_chi_unfold`); the single pass draws none.  A runtime
+    intermediate bounded by ``scratch_bytes``. The default is at most 1 GiB
+    or one local parent-Green tile, whichever is smaller, and at least one
+    pair's full-k transform. Pair chunks own disjoint output entries; their
+    size changes neither the transforms nor the accumulation order. The single pass draws none. A runtime
     allocation: compiled ``memory_analysis()`` does not count it, so callers price it.
     """
     nx, ny, nz = (int(v) for v in kgrid)
     have = _optin_smem_bytes() if optin is None else int(optin)
     grp = 2 * int(ns) * int(ns)
     single = have is not None and grp * (((nx * ny * (nz | 1)) | 1) * 16) <= have
-    return 0 if single else int(tile_bytes)
+    per_pair = nx * ny * nz * grp * 16
+    return 0 if single else max(per_pair, min(int(tile_bytes), 1 << 30))
 
 
 def make_kconv_chi_unfold(mesh: Mesh, kgrid, tables, *, n_out: int, complete: bool,
@@ -2093,7 +2096,7 @@ def make_kconv_chi_unfold(mesh: Mesh, kgrid, tables, *, n_out: int, complete: bo
         def local(acc, gv, gc, alpha, gvt, gct, conj_src):
             t = local_unfold_load_tables(tables)
             budget = (int(scratch_bytes) if scratch_bytes is not None
-                      else int(gv.size) * 16)       # one parent Green tile (chi_unfold_scratch_bytes)
+                      else chi_unfold_scratch_bytes(kg, ns, int(gv.size) * 16))
             call = jax.ffi.ffi_call(KCONV_CHI_UNFOLD_TARGET, jax.ShapeDtypeStruct(acc.shape, acc.dtype),
                                     input_output_aliases={12: 0})
             return call(flat(gv), flat(gvt), flat(gc), flat(gct), t.row, t.trs, t.lsrc, t.rsrc,
