@@ -1081,11 +1081,11 @@ def _get_unfold_isdf_operator_jit(
     L_arr, L_right_arr, q_irr_arr, trs_mask_arr, logical_left,
     logical_right, n_sym_spatial, mesh_xy, left_local_perm_arr=None,
     right_local_perm_arr=None,
-    trs_rule="conj",
+    trs_rule="conj", q_tile_bytes=256 << 20,
 ):
     """Cache the inner ``_do_unfold`` jit by (shape, sym table content); see docs/architecture/symmetry_register.md."""
     key = (
-        V_q_shape,
+        V_q_shape, int(q_tile_bytes),
         fwd_perm_arr.shape, fwd_perm_arr.tobytes(),
         fwd_perm_right_arr.shape, fwd_perm_right_arr.tobytes(),
         idx_arr.tobytes(),
@@ -1164,71 +1164,99 @@ def _get_unfold_isdf_operator_jit(
              out_specs=P(None, 'x', 'y'),
              check_vma=False)
     def _kernel(*operands):
-        # V_ibz_local: (n_q_ibz, μ/Px, ν/Py)
+        # Complete-P output, with the unchanged transport executed on bounded
+        # q tiles. Full-k parent gather + endpoint gather + phased output used
+        # to coexist (Fe20³/P16:78.8GB), although one output is only26.15GB.
         V_ibz_local = operands[0]
-        perm_left_q = fwd_perm_j[sym_j]
-        perm_right_q = fwd_perm_right_j[sym_j]
-        # Gather q axis (replicated → local selection via idx_j).
-        if pair_transpose:
-            # ONE source row per full-k row: the partner rows follow the
-            # forward rows, and an antiunitary k reads its parent's partner
-            # row.  A ``where`` over two gathered candidates is emitted
-            # elementwise and loads BOTH values for every output element;
-            # one row gather loads one (same values, pure data movement).
-            n_parent_rows = int(V_ibz_local.shape[0])
-            source_rows = np.where(
-                trs_mask_j, idx_j + n_parent_rows, idx_j).astype(np.int32)
-            V_at_irr = jnp.concatenate(
-                (V_ibz_local, operands[1]), axis=0)[source_rows]
-        else:
-            V_at_irr = V_ibz_local[idx_j]
+        n_full = int(idx_arr.size)
+        mu_local, nu_local = n_left_padded // Px, n_right_padded // Py
+        q_tile = min(n_full, max(1, int(q_tile_bytes) // (16 * mu_local * nu_local)))
 
-        mu_local = n_left_padded // Px
-        nu_local = n_right_padded // Py
-        x_idx = jax.lax.axis_index('x')
-        y_idx = jax.lax.axis_index('y')
-        left_local_q = (None if left_local_perm_j is None else
-                        left_local_perm_j[sym_j])
-        right_local_q = (None if right_local_perm_j is None else
-                         right_local_perm_j[sym_j])
-        V_full_local = _permute_isdf_operator_axes_local(
-            V_at_irr, perm_left_q, perm_right_q,
-            mesh_x=Px, mesh_y=Py,
-            left_local_source_map=left_local_q,
-            right_local_source_map=right_local_q)
+        def transport(idx_q, sym_q, trs_q):
+            perm_left_q = jnp.take(jnp.asarray(fwd_perm_j), sym_q, axis=0)
+            perm_right_q = jnp.take(jnp.asarray(fwd_perm_right_j), sym_q, axis=0)
+            # Gather q axis (replicated → local selection via idx_q).
+            if pair_transpose:
+                # ONE source row per full-k row: the partner rows follow the
+                # forward rows, and an antiunitary k reads its parent's partner
+                # row.  A ``where`` over two gathered candidates is emitted
+                # elementwise and loads BOTH values for every output element;
+                # one row gather loads one (same values, pure data movement).
+                n_parent_rows = int(V_ibz_local.shape[0])
+                source_rows = jnp.where(
+                    trs_q, idx_q + n_parent_rows, idx_q).astype(jnp.int32)
+                V_at_irr = jnp.concatenate(
+                    (V_ibz_local, operands[1]), axis=0)[source_rows]
+            else:
+                V_at_irr = V_ibz_local[idx_q]
 
-        # Umklapp phase: exp(2π i q_irr · (L_μ − L_ν)).  L_μ here
-        # is L_table[s(q), μ] — wrap of centroid μ under sym op
-        # s(q) (NOT permuted).  See
-        # ``reports/trs_sym_audit_2026-05-14/verify_umklapp_user_math.py``.
-        # Phase tables are small (~n_q · n_rmu c128 bytes); compute
-        # replicated and slice this rank's μ_local / ν_local extent.
-        L_left_per_q = L_j[sym_j]
-        L_right_per_q = L_right_j[sym_j]
-        q_per_q = q_irr_j[idx_j]                        # (n_q_full, 3)
-        qL_left = jnp.einsum(
-            'qi,qmi->qm', q_per_q, L_left_per_q)
-        qL_right = jnp.einsum(
-            'qi,qmi->qm', q_per_q, L_right_per_q)
-        phase_left = jnp.exp(
-            2j * jnp.pi * qL_left.astype(jnp.complex128))
-        phase_right = jnp.exp(
-            2j * jnp.pi * qL_right.astype(jnp.complex128))
-        phase_mu = jax.lax.dynamic_slice_in_dim(
-            phase_left, x_idx * mu_local, mu_local, axis=1)
-        phase_nu = jax.lax.dynamic_slice_in_dim(
-            phase_right, y_idx * nu_local, nu_local, axis=1)
-        V_full_local = _apply_unfold_phase_and_trs_local(
-            V_full_local, phase_mu, phase_nu, trs_mask_j,
-            pair_transpose=pair_transpose)
-        if (int(logical_left) != n_left_padded
-                or int(logical_right) != n_right_padded):
-            global_left = x_idx * mu_local + jnp.arange(mu_local)
-            global_right = y_idx * nu_local + jnp.arange(nu_local)
-            valid = ((global_left[:, None] < int(logical_left))
-                     & (global_right[None, :] < int(logical_right)))
-            V_full_local = jnp.where(valid[None], V_full_local, 0)
-        return V_full_local
+            mu_local = n_left_padded // Px
+            nu_local = n_right_padded // Py
+            x_idx = jax.lax.axis_index('x')
+            y_idx = jax.lax.axis_index('y')
+            left_local_q = (None if left_local_perm_j is None else
+                            jnp.take(jnp.asarray(left_local_perm_j), sym_q, axis=0))
+            right_local_q = (None if right_local_perm_j is None else
+                             jnp.take(jnp.asarray(right_local_perm_j), sym_q, axis=0))
+            V_full_local = _permute_isdf_operator_axes_local(
+                V_at_irr, perm_left_q, perm_right_q,
+                mesh_x=Px, mesh_y=Py,
+                left_local_source_map=left_local_q,
+                right_local_source_map=right_local_q)
+
+            # Umklapp phase: exp(2π i q_irr · (L_μ − L_ν)).  L_μ here
+            # is L_table[s(q), μ] — wrap of centroid μ under sym op
+            # s(q) (NOT permuted).  See
+            # ``reports/trs_sym_audit_2026-05-14/verify_umklapp_user_math.py``.
+            # Phase tables are small (~n_q · n_rmu c128 bytes); compute
+            # replicated and slice this rank's μ_local / ν_local extent.
+            L_left_per_q = jnp.take(jnp.asarray(L_j), sym_q, axis=0)
+            L_right_per_q = jnp.take(jnp.asarray(L_right_j), sym_q, axis=0)
+            q_per_q = jnp.take(jnp.asarray(q_irr_j), idx_q, axis=0)                        # (n_q_full, 3)
+            qL_left = jnp.einsum(
+                'qi,qmi->qm', q_per_q, L_left_per_q)
+            qL_right = jnp.einsum(
+                'qi,qmi->qm', q_per_q, L_right_per_q)
+            phase_left = jnp.exp(
+                2j * jnp.pi * qL_left.astype(jnp.complex128))
+            phase_right = jnp.exp(
+                2j * jnp.pi * qL_right.astype(jnp.complex128))
+            phase_mu = jax.lax.dynamic_slice_in_dim(
+                phase_left, x_idx * mu_local, mu_local, axis=1)
+            phase_nu = jax.lax.dynamic_slice_in_dim(
+                phase_right, y_idx * nu_local, nu_local, axis=1)
+            V_full_local = _apply_unfold_phase_and_trs_local(
+                V_full_local, phase_mu, phase_nu, trs_q,
+                pair_transpose=pair_transpose)
+            if (int(logical_left) != n_left_padded
+                    or int(logical_right) != n_right_padded):
+                global_left = x_idx * mu_local + jnp.arange(mu_local)
+                global_right = y_idx * nu_local + jnp.arange(nu_local)
+                valid = ((global_left[:, None] < int(logical_left))
+                         & (global_right[None, :] < int(logical_right)))
+                V_full_local = jnp.where(valid[None], V_full_local, 0)
+            return V_full_local
+
+        if q_tile == n_full:
+            return transport(jnp.asarray(idx_j), jnp.asarray(sym_j), jnp.asarray(trs_mask_j))
+
+        def chunk(out, i):
+            # A uniform overlapping final tile avoids padding the large output.
+            start = jax.lax.optimization_barrier(jnp.minimum(i * q_tile, n_full - q_tile))
+            rows = jax.lax.optimization_barrier(jax.lax.dynamic_slice_in_dim(
+                jnp.asarray(idx_j), start, q_tile, axis=0))
+            syms = jax.lax.optimization_barrier(jax.lax.dynamic_slice_in_dim(
+                jnp.asarray(sym_j), start, q_tile, axis=0))
+            anti = jax.lax.optimization_barrier(jax.lax.dynamic_slice_in_dim(
+                jnp.asarray(trs_mask_j), start, q_tile, axis=0))
+            value = transport(rows, syms, anti)
+            return jax.lax.dynamic_update_slice(out, value, (start, jnp.int32(0), jnp.int32(0))), None
+
+        n_tiles = (n_full + q_tile - 1) // q_tile
+        out, _ = jax.lax.scan(chunk,
+            jnp.zeros((n_full, mu_local, nu_local), V_ibz_local.dtype),
+            jnp.arange(n_tiles, dtype=jnp.int32), unroll=1)
+        return out
 
     if pair_transpose:
         # Preserve a producer's reversed-axis placement; transposing an
