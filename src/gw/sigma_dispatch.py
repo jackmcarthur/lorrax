@@ -108,7 +108,7 @@ class SigmaResult:
                                 ``eqp_bgw.assemble_eqp``.
     omega_grid_ev             : (nω,)     ω-grid in eV.
     omega_grid_ry             : (nω,)     ω-grid in Ry.
-    head_sigma_diag_w_kn_ry   : (nω, nk, nb)  Dynamic q→0 head diagonal.
+    head_sigma_diag_w_kn_ry   : (nω, nk, nb)  Dynamic q→0 head diagonal: a host array, or its closed form (``head_correction.HeadSigmaDiag``).
     sigma_omega_h5_path       : str       on-disk Σ_c(ω) HDF5 path.
 
     Basis
@@ -407,7 +407,10 @@ def sigma_result_on_kset(
 
         selected = value
         if select_rows is not None:
-            if k_axis and isinstance(value, jax.Array):
+            if hasattr(value, "select_k"):
+                # The closed-form head: select its E_nk and f_nk rows.
+                selected = value.select_k(select_rows)
+            elif k_axis and isinstance(value, jax.Array):
                 # Leading-axis slabs: an eager moveaxis of the whole
                 # table is a transposed copy of it, and for the Sigma(omega)
                 # cube that copy set the SC run peak (Na 8^3 [-100,+150] eV:
@@ -1258,7 +1261,7 @@ def _compute_mpa_sigma(
     """Produce the MPA Sigma result with authenticated head and body inputs."""
     from file_io import restart_bundle as _bundle_reader
     from file_io import mpa_store
-    from .head_correction import compute_complex_pole_head_sigma_diag
+    from .head_correction import HeadSigmaDiag
     from .mpa.sigma import compute_sigma_c_mpa_omega_grid
     from .efermi import resolve_sigma_efermi_ry
     from .ppm_pipeline import (
@@ -1395,7 +1398,9 @@ def _compute_mpa_sigma(
         # so it is measured from the body's reference (as ppm_pipeline's
         # body_efermi_ry).  The SC head's census mu displaced the head poles by
         # mu - E_F: +2.99 eV at CrI3 8x8 SC map 1, and map 0 != one-shot.
-        head_diag = compute_complex_pole_head_sigma_diag(
+        # The closed form, not its (n_omega, nk, nb) array: the finalize add
+        # and the band-extrapolation fit evaluate it where they read it.
+        head_diag = HeadSigmaDiag.build(
             omega_grid_ry=np.asarray(config.omega_grid_ry),
             enk_ry=head_enk,
             efermi_ry=sigma_efermi_ry,
