@@ -549,21 +549,19 @@ def sector_synthesis(readers, headers, bases, syms, layout, frequencies, meta, m
             # components, contracts and is written in place, so the GEMM's
             # operand copies are one q panel's.
             (a0,a1),(b0,b1)=panel
-            order=jnp.asarray(minus if hole else np.arange(nk,dtype=np.int32))
-            def body(c,w):
-                rows=jax.lax.dynamic_slice_in_dim(order,c*q_rows,q_rows)
+            order=jnp.asarray((minus if hole else np.arange(nk,dtype=np.int32)).reshape(-1,q_rows))
+            def body(carry,rows):
                 xc=jnp.take(x,rows,axis=0)
                 yc=(_other_face(mesh_xy,factor_spec[0],factor_spec[1])(xc[:,:,b0:b1])
                     if y is None else jnp.take(y,rows,axis=0)[:,:,b0:b1])
                 xc=xc[:,:,a0:a1]
                 if hole:
                     xc,yc=jnp.conj(xc),jnp.conj(yc)
-                part=row_kernel(xc,yc,jnp.take(omega,rows,axis=0),jnp.take(interval,rows,axis=0),
-                                ref,time,False)
-                return jax.lax.dynamic_update_slice_in_dim(w,part,c*q_rows,axis=0)
-            w=jax.lax.with_sharding_constraint(
-                jnp.zeros((nk,m*(a1-a0),n*(b1-b0)),jnp.complex128),NamedSharding(mesh_xy,P(None,'x','y')))
-            w=jax.lax.fori_loop(0,nk//q_rows,body,w)
+                return carry,row_kernel(xc,yc,jnp.take(omega,rows,axis=0),
+                                        jnp.take(interval,rows,axis=0),ref,time,False)
+            # Stacked scan outputs: the panel's W(t) exists only from its own
+            # loop on (no zero-filled buffer the scheduler could hoist).
+            _,w=jax.lax.scan(body,None,order,unroll=1)
             return w.reshape(nk,m,a1-a0,n,b1-b0)
         return LorentzPanels(panels,form,(x,y,omega,interval))
     def window_operands(space,indices,bounds):
