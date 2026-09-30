@@ -42,7 +42,6 @@ Spin stays explicit through the projector and vertex contraction owned by
 
 from __future__ import annotations
 
-import gc
 import math
 import os
 import threading
@@ -1386,6 +1385,20 @@ def prune_candidates_by_pivoted_cholesky(
 # metric and this exact Gram the same full-k quadrature table.
 
 
+def _left_band_slice(left, right):
+    """``(lo, hi)`` of a distinct left window inside the right one, else None.
+
+    The default ``v_x_vc`` feature pair (occupied + Σ conduction on the left,
+    every band on the right) is nested.  Its left faces are then the rows
+    ``[lo, hi)`` of the right faces: one load serves both windows.
+    """
+    l0, l1 = int(left[0]), int(left[1])
+    r0, r1 = int(right[0]), int(right[1])
+    if (l0, l1) == (r0, r1) or l0 < r0 or l1 > r1:
+        return None
+    return l0 - r0, l1 - r0
+
+
 def _gram_meta_band_counts(wfn_nelec: int, max_band: int,
                            n_val: int | None, n_cond: int | None):
     """Keep physical occupancy separate from an explicit feature window."""
@@ -1419,8 +1432,15 @@ def build_gram_q0_via_loadwfns(
     sampler returns X/Y faces for this batch alone. k weights retain their
     original full-zone normalization, so batching changes summation grouping,
     not the metric, band windows, spin vertices or physical k grid.
+
+    The batch size comes from the run's budget (the deck's
+    ``memory_per_device_gb``, else the card) and the face shapes, never from
+    live allocator room.  When more than one batch is needed, the batches hold
+    whole symmetry stars, so each batch reads each raw WFN parent once per
+    band tile instead of once per child; one batch keeps the canonical
+    full-BZ order.
     """
-    from common.gpu_utils import device_budget_bytes, device_room_bytes
+    from common.gpu_utils import device_budget_bytes
     from runtime.padding import padded_axis, padded_mu_extent
     if band_range_left is None or band_range_right is None:
         if n_val is None or n_cond is None:
@@ -1446,27 +1466,40 @@ def build_gram_q0_via_loadwfns(
               if memory_per_device_gb and memory_per_device_gb > 0
               else float(device_budget_bytes()))
     budget = minimum_process_budget_gb(budget/1e9)*1e9
-    room = min(budget, float(device_room_bytes()))
     px, py = int(mesh_xy.shape['x']), int(mesh_xy.shape['y'])
     mu = padded_mu_extent(int(cand_idx.shape[0]), mesh_xy)
     ns = 4 if bispinor else int(wfn.nspinor)
     # The current sampler's band accumulator rounds to its transfer tile.
-    # Price that padding, both returned faces, and both distinct windows.
+    # Price that padding, both returned faces, and both distinct windows;
+    # a left window inside the right one is a slice of the right faces.
     p_band = int(mesh_xy.size)
     def bands(width):
         tile = padded_axis(min(width, max(1, int(band_chunk_size))), p_band,
                            name="candidate WFN band tile").carrier
         return padded_axis(width, tile, name="candidate WFN band accumulator").carrier
-    nb_faces = bands(nb_l) + (0 if left == right else bands(nb_r))
+    nb_faces = bands(nb_r) + (
+        0 if _left_band_slice(left, right) is not None else bands(nb_l))
     per_k = 16*ns*mu*nb_faces*(1.0/px+1.0/py)
-    # Leave half the live room for loader/FFT and compiler-certified Gram work.
-    k_limit = max(1, int(0.5*room/max(per_k, 1)))
+    # Faces take at most half the budget; the rest is the loader's tile and
+    # FFT scan and the compiler-certified Gram tile work.
+    k_limit = max(1, int(0.5*budget/max(per_k, 1)))
     n_chunks = -(-nk // k_limit)
     k_batch = -(-nk // n_chunks)
+    if n_chunks > 1:
+        # Whole stars per batch: the loader reads a raw parent once per band
+        # tile of the batch that holds its children.
+        w_full = np.zeros(nk_full, dtype=np.float64)
+        w_full[selected_rows] = weights
+        selected_rows = np.concatenate([
+            children for _, children in wfn.full_k_parent_groups(selected_rows)
+        ]).astype(np.int64)
+        weights = w_full[selected_rows]
     if verbose:
         print(f"[candidate Gram k batches] nk={nk}, batch={k_batch}, "
               f"chunks={n_chunks}, WFN faces<= {per_k*k_batch/2**30:.2f} "
-              f"GiB/device; same full-zone weights and band windows")
+              f"GiB/device of budget {budget/2**30:.2f}; same full-zone "
+              f"weights and band windows"
+              f"{'; star-ordered batches' if n_chunks > 1 else ''}")
     result = None
     for k0 in range(0, nk, k_batch):
         k1 = min(nk, k0+k_batch)
@@ -1675,10 +1708,11 @@ def _build_gram_q0_kbatch(
     meta.memory_per_device_gb = minimum_process_budget_gb(memory_per_device_gb)
 
     # Prune must not retain the full-k G-flat WFN beside both final centroid
-    # faces.  A one-k fixed tile is the hard memory bound; the shared
-    # transform owner pads only the final tile and reuses one executable, so
-    # this changes transfer scheduling, not the Gram or selection semantics.
-    prune_k_tile = 1 if full_k_rows is None else min(64, len(full_k_rows))
+    # faces.  One batch streams one raw parent at a time (k tile 1).  A k
+    # batch of whole stars is one k tile: the loader's union read then takes
+    # each raw parent once per band tile, and the tile's G-flat and sampled
+    # faces are a band-tile fraction of the batch faces its planner priced.
+    prune_k_tile = 1 if full_k_rows is None else len(full_k_rows)
 
     # Optional pseudoband norms — same clamp recipe as isdf_fitting.
     if band_norms is not None:
@@ -1711,18 +1745,30 @@ def _build_gram_q0_kbatch(
               f"band_chunk_size={band_chunk_size}, "
               f"transfer_k_tile={prune_k_tile}")
 
-    # ---- Left window ----
+    # ---- Left window (the right window when the left is inside it) ----
+    left_slice = _left_band_slice(left_range, right_range)
+    first_range, first_norms = (
+        (right_range, norms_r_j) if left_slice is not None
+        else (left_range, norms_l_j))
     with timing.section("left.load"):
-        psi_l_rmu_Y, psi_l_rmuT_X = load_centroids_band_chunked(
-            wfn, sym, meta, cand_idx, bispinor, mesh_xy, left_range,
+        psi_a_rmu_Y, psi_a_rmuT_X = load_centroids_band_chunked(
+            wfn, sym, meta, cand_idx, bispinor, mesh_xy, first_range,
             band_chunk_size=band_chunk_size,
             k_chunk_size=prune_k_tile, full_k_rows=full_k_rows,
         )
-        if norms_l_j is not None:
+        if first_norms is not None:
             # Y shape (nk, nb, ns, n_rmu); X shape (nk, n_rmu, nb, ns)
-            psi_l_rmu_Y = psi_l_rmu_Y / norms_l_j[None, :, None, None]
-            psi_l_rmuT_X = psi_l_rmuT_X / norms_l_j[None, None, :, None]
-        psi_l_rmu_Y.block_until_ready()
+            psi_a_rmu_Y = psi_a_rmu_Y / first_norms[None, :, None, None]
+            psi_a_rmuT_X = psi_a_rmuT_X / first_norms[None, None, :, None]
+        psi_a_rmu_Y.block_until_ready()
+    if left_slice is not None:
+        # One load serves both windows: the left faces are the right faces'
+        # band rows [lo, hi), bit for bit what a separate load would give.
+        psi_r_rmu_Y, psi_r_rmuT_X = psi_a_rmu_Y, psi_a_rmuT_X
+        psi_l_rmu_Y = psi_l_rmuT_X = None
+    else:
+        psi_l_rmu_Y, psi_l_rmuT_X = psi_a_rmu_Y, psi_a_rmuT_X
+    del psi_a_rmuT_X
 
     # ---- 2-D tiled path (size-ladder wall fix) ----
     # The full open-spin pair tensors are (nk, ns, ns, M, M): 98 GB EACH at
@@ -1743,7 +1789,8 @@ def _build_gram_q0_kbatch(
     env_cb = os.environ.get("LORRAX_GRAM_COL_BLOCK", "").strip()
     if env_cb.lower() in ("", "0", "false", "no", "off"):
         env_cb = ""
-    nk_, _, ns_, M_cols = (int(x) for x in psi_l_rmu_Y.shape)
+    nk_, _, ns_, M_cols = (int(x) for x in psi_a_rmu_Y.shape)
+    del psi_a_rmu_Y
     seed_budget_bytes = int(
         float(meta.memory_per_device_gb) * 1e9
         * _GRAM_SEED_BUDGET_FRACTION
@@ -1788,7 +1835,7 @@ def _build_gram_q0_kbatch(
     if col_block:
         if same_window:
             psi_r_rmu_Y, psi_r_rmuT_X = psi_l_rmu_Y, psi_l_rmuT_X
-        else:
+        elif left_slice is None:
             with timing.section("right.load"):
                 psi_r_rmu_Y, psi_r_rmuT_X = load_centroids_band_chunked(
                     wfn, sym, meta, cand_idx, bispinor, mesh_xy,
@@ -1803,44 +1850,16 @@ def _build_gram_q0_kbatch(
                 psi_r_rmu_Y.block_until_ready()
 
         # Compiler-aware width selection happens only after BOTH canonical
-        # WFN windows exist.  The allocator reading is therefore the actual
-        # resident floor (including loader tables and any unrelated live
-        # arrays), not a second shape formula for the WFN service.
-        gc.collect()
-        from common.gpu_utils import _get_jax_gpu_memory_bytes
-        _, live_now, _ = _get_jax_gpu_memory_bytes()
-        if live_now is None and jax.default_backend() in ("gpu", "cuda"):
-            from common.gpu_utils import (
-                get_gpu_used_memory_bytes_nvidia_smi)
-            live_now = get_gpu_used_memory_bytes_nvidia_smi()
-            if live_now is not None:
-                from runtime.aot_memory import announce_once
-                announce_once(
-                    "gram-live-nvidia-smi",
-                    "allocator bytes_in_use unavailable for the Gram planner; "
-                    "using this rank's conservative nvidia-smi whole-device "
-                    "memory.used sample",
-                )
-        if live_now is None:
-            # CPU/fallback accounting: sum the returned WFN shards.  Announce
-            # that this is weaker because it cannot see service tables.
-            resident_local_bytes = 0
-            faces = {id(arr): arr for arr in (psi_l_rmu_Y, psi_l_rmuT_X,
-                                              psi_r_rmu_Y, psi_r_rmuT_X)}
-            for arr in faces.values():
-                resident_local_bytes += sum(
-                    int(np.asarray(sh.data).nbytes)
-                    for sh in arr.addressable_shards
-                )
-            from runtime.aot_memory import announce_once
-            announce_once(
-                "gram-live-allocator-unavailable",
-                "allocator bytes_in_use unavailable for the Gram planner; "
-                "using the canonical WFN output shards as a KNOWN-LOW "
-                "resident floor",
-            )
-        else:
-            resident_local_bytes = int(live_now)
+        # WFN windows exist.  The resident floor is priced from the shapes:
+        # the bytes of this rank's distinct face shards, never a live
+        # allocator reading (sizes come from the budget and the shapes).
+        faces = {id(arr): arr for arr in (psi_l_rmu_Y, psi_l_rmuT_X,
+                                          psi_r_rmu_Y, psi_r_rmuT_X)
+                 if arr is not None}
+        resident_local_bytes = sum(
+            int(sh.data.nbytes)
+            for arr in faces.values() for sh in arr.addressable_shards)
+        del faces
 
         # The selected width controls static executable shapes and loop counts
         # on every process.  Allocator residency itself is rank-local, so price
@@ -1863,6 +1882,7 @@ def _build_gram_q0_kbatch(
                     mesh_xy=mesh_xy, nk=nk_, n_points=M_cols,
                     nb_l=nb_left, nb_r=nb_right, nspinor=ns_,
                     tile_width=tile_width, gamma_mode=gamma_mode,
+                    left_bands=left_slice,
                 )
             )
             facts = gram_scan_live_set_bytes(
@@ -1908,7 +1928,7 @@ def _build_gram_q0_kbatch(
                 f"{n_dev_total}-device path; {block_source}; "
                 f"square-law={square_gib:.2f} GiB global, "
                 f"pair-workspace model={local_gib:.2f} GiB/device; "
-                f"resident({'one shared' if same_window else 'two'} "
+                f"resident({'one shared' if same_window or left_slice else 'two'} "
                 f"WFN window(s); worst rank)="
                 f"{resident_bytes / 2**30:.2f}, "
                 f"compiled scan increment="
@@ -1923,7 +1943,7 @@ def _build_gram_q0_kbatch(
                 G, psi_l_rmuT_X, psi_l_rmu_Y,
                 psi_r_rmuT_X, psi_r_rmu_Y, kw,
                 mesh_xy=mesh_xy, tile_width=col_block,
-                gamma_mode=gamma_mode,
+                gamma_mode=gamma_mode, left_bands=left_slice,
             )
             # Same Hermitian symmetrization the unblocked kernel applies,
             # once, on the assembled square matrix.
@@ -1933,7 +1953,12 @@ def _build_gram_q0_kbatch(
         return G
 
     with timing.section("left.pair"):
-        P_l_k = pair_density(psi_l_rmuT_X, psi_l_rmu_Y, mesh_xy)
+        if left_slice is not None:
+            lo, hi = left_slice
+            P_l_k = pair_density(psi_r_rmuT_X[:, :, lo:hi, :],
+                                 psi_r_rmu_Y[:, lo:hi], mesh_xy)
+        else:
+            P_l_k = pair_density(psi_l_rmuT_X, psi_l_rmu_Y, mesh_xy)
         P_l_k.block_until_ready()
     del psi_l_rmu_Y, psi_l_rmuT_X
 
@@ -1941,16 +1966,19 @@ def _build_gram_q0_kbatch(
     if same_window:
         P_r_k = P_l_k
     else:
-        with timing.section("right.load"):
-            psi_r_rmu_Y, psi_r_rmuT_X = load_centroids_band_chunked(
-                wfn, sym, meta, cand_idx, bispinor, mesh_xy, right_range,
-                band_chunk_size=band_chunk_size,
-                k_chunk_size=prune_k_tile, full_k_rows=full_k_rows,
-            )
-            if norms_r_j is not None:
-                psi_r_rmu_Y = psi_r_rmu_Y / norms_r_j[None, :, None, None]
-                psi_r_rmuT_X = psi_r_rmuT_X / norms_r_j[None, None, :, None]
-            psi_r_rmu_Y.block_until_ready()
+        if left_slice is None:
+            with timing.section("right.load"):
+                psi_r_rmu_Y, psi_r_rmuT_X = load_centroids_band_chunked(
+                    wfn, sym, meta, cand_idx, bispinor, mesh_xy, right_range,
+                    band_chunk_size=band_chunk_size,
+                    k_chunk_size=prune_k_tile, full_k_rows=full_k_rows,
+                )
+                if norms_r_j is not None:
+                    psi_r_rmu_Y = (
+                        psi_r_rmu_Y / norms_r_j[None, :, None, None])
+                    psi_r_rmuT_X = (
+                        psi_r_rmuT_X / norms_r_j[None, None, :, None])
+                psi_r_rmu_Y.block_until_ready()
         with timing.section("right.pair"):
             P_r_k = pair_density(psi_r_rmuT_X, psi_r_rmu_Y, mesh_xy)
             P_r_k.block_until_ready()

@@ -297,7 +297,15 @@ def _resolve_deck_sigma_ncond(args):
                 stacklevel=2)
         return None
     from gw.gw_config import read_lorrax_input
-    return int(read_lorrax_input(args.input)["ncond"])
+    deck = read_lorrax_input(args.input)
+    # Every planner of this run prices against the deck's device budget, as
+    # in gwjax; 0 (the default) keeps the card's collective auto-detection.
+    deck_gb = float(deck.get("memory_per_device_gb", 0.0) or 0.0)
+    if deck_gb > 0:
+        from common.gpu_utils import (minimum_process_budget_gb,
+                                      set_device_budget_gb)
+        set_device_budget_gb(minimum_process_budget_gb(deck_gb))
+    return int(deck["ncond"])
 
 
 # ─────────────────────────────────────────────────────────────────────────

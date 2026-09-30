@@ -623,9 +623,18 @@ def _gram_q0_tiled_from_psi_kernel(
 	tile_width: int,
 	*,
 	gamma_mode: str,
+	left_bands: tuple[int, int] | None = None,
 ):
-	"""Return one donated executable for a complete tiled q=0 Gram build; see docs/architecture/zeta_fit_face_psi_cct.md."""
+	"""Return one donated executable for a complete tiled q=0 Gram build; see docs/architecture/zeta_fit_face_psi_cct.md.
+
+	``left_bands=(lo, hi)``: the left window is the right faces' band rows
+	``[lo, hi)``; the executable takes no left faces and slices each right
+	tile instead, so one resident face serves both windows.
+	"""
 	transverse = gamma_mode == "transverse"
+	nested = left_bands is not None
+	if nested:
+		band_lo, band_hi = (int(v) for v in left_bands)
 	n_x = int(mesh_xy.shape['x'])
 	n_y = int(mesh_xy.shape['y'])
 	local_rows = int(n_points) // n_x
@@ -641,6 +650,7 @@ def _gram_q0_tiled_from_psi_kernel(
 	cache_key = (
 		'gram_q0_tiled_from_psi_sm', _mesh_key(mesh_xy), nk, n_points,
 		nb_l, nb_r, nspinor, tile_width, gamma_mode,
+		None if left_bands is None else tuple(int(v) for v in left_bands),
 	)
 	if cache_key not in _isdf_pipeline_cache:
 		x_spec = P(None, 'x', None, None)
@@ -678,14 +688,18 @@ def _gram_q0_tiled_from_psi_kernel(
 				r_start = r_idx * jnp.int32(local_tile_rows)
 				c_start = c_idx * jnp.int32(local_tile_cols)
 
-				row_l = _slice_pad_local(
-					psi_l_X_, r_start, axis=1, size=local_tile_rows)
-				col_l = _slice_pad_local(
-					psi_l_Y_, c_start, axis=3, size=local_tile_cols)
 				row_r = _slice_pad_local(
 					psi_r_X_, r_start, axis=1, size=local_tile_rows)
 				col_r = _slice_pad_local(
 					psi_r_Y_, c_start, axis=3, size=local_tile_cols)
+				if nested:
+					row_l = row_r[:, :, band_lo:band_hi, :]
+					col_l = col_r[:, band_lo:band_hi, :, :]
+				else:
+					row_l = _slice_pad_local(
+						psi_l_X_, r_start, axis=1, size=local_tile_rows)
+					col_l = _slice_pad_local(
+						psi_l_Y_, c_start, axis=3, size=local_tile_cols)
 				P_l = jnp.einsum(
 					'kmna,knbr->kabmr', row_l, col_l, optimize=True)
 				P_r = jnp.einsum(
@@ -747,15 +761,26 @@ def _gram_q0_tiled_from_psi_kernel(
 			)
 			return G_local
 
-		@partial(jax.jit,
-		         in_shardings=(out_sh, x_sh, y_sh, x_sh, y_sh,
-		                       rep, rep, rep, rep, rep),
-		         out_shardings=out_sh, donate_argnums=(0,))
-		def _tiled(G_xy, psi_l_X_, psi_l_Y_, psi_r_X_, psi_r_Y_, kw_,
-		           perm_L_, phase_L_, perm_R_, phase_R_):
-			return _local(
-				G_xy, psi_l_X_, psi_l_Y_, psi_r_X_, psi_r_Y_, kw_,
-				perm_L_, phase_L_, perm_R_, phase_R_)
+		if nested:
+			@partial(jax.jit,
+			         in_shardings=(out_sh, x_sh, y_sh,
+			                       rep, rep, rep, rep, rep),
+			         out_shardings=out_sh, donate_argnums=(0,))
+			def _tiled(G_xy, psi_r_X_, psi_r_Y_, kw_,
+			           perm_L_, phase_L_, perm_R_, phase_R_):
+				return _local(
+					G_xy, psi_r_X_, psi_r_Y_, psi_r_X_, psi_r_Y_, kw_,
+					perm_L_, phase_L_, perm_R_, phase_R_)
+		else:
+			@partial(jax.jit,
+			         in_shardings=(out_sh, x_sh, y_sh, x_sh, y_sh,
+			                       rep, rep, rep, rep, rep),
+			         out_shardings=out_sh, donate_argnums=(0,))
+			def _tiled(G_xy, psi_l_X_, psi_l_Y_, psi_r_X_, psi_r_Y_, kw_,
+			           perm_L_, phase_L_, perm_R_, phase_R_):
+				return _local(
+					G_xy, psi_l_X_, psi_l_Y_, psi_r_X_, psi_r_Y_, kw_,
+					perm_L_, phase_L_, perm_R_, phase_R_)
 
 		_isdf_pipeline_cache[cache_key] = _tiled
 	return _isdf_pipeline_cache[cache_key]
@@ -772,9 +797,30 @@ def gram_q0_tiled_from_psi_sm(
 	mesh_xy: Mesh,
 	tile_width: int,
 	gamma_mode: str = "charge",
+	left_bands: tuple[int, int] | None = None,
 ) -> jax.Array:
-	"""Assemble every q=0 candidate-Gram tile in one donated executable; see docs/architecture/zeta_fit_face_psi_cct.md."""
+	"""Assemble every q=0 candidate-Gram tile in one donated executable; see docs/architecture/zeta_fit_face_psi_cct.md.
+
+	``left_bands=(lo, hi)`` names the left window as the right faces' band
+	rows ``[lo, hi)``; ``psi_l_X``/``psi_l_Y`` are then ``None``.
+	"""
 	mode = _gram_gamma_mode(gamma_mode)
+	if left_bands is not None:
+		if psi_l_X is not None or psi_l_Y is not None:
+			raise ValueError(
+				"left_bands names the left window inside the right faces; "
+				"pass psi_l_X = psi_l_Y = None")
+		lo, hi = (int(v) for v in left_bands)
+		if not 0 <= lo < hi <= int(psi_r_X.shape[2]):
+			raise ValueError(
+				f"left_bands {left_bands} outside the right faces' "
+				f"{int(psi_r_X.shape[2])} bands")
+		left_bands = (lo, hi)
+		# Shape stand-ins for validation only; no left face is formed.
+		nk_r, m_r, _, ns_r = (int(v) for v in psi_r_X.shape)
+		psi_l_X = jax.ShapeDtypeStruct((nk_r, m_r, hi - lo, ns_r), psi_r_X.dtype)
+		psi_l_Y = jax.ShapeDtypeStruct(
+			(nk_r, hi - lo, ns_r, int(psi_r_Y.shape[3])), psi_r_Y.dtype)
 	if any(arr.ndim != 4 for arr in
 	       (psi_l_X, psi_l_Y, psi_r_X, psi_r_Y)):
 		raise ValueError(
@@ -806,11 +852,15 @@ def gram_q0_tiled_from_psi_sm(
 	else:
 		perm = jnp.arange(ns, dtype=jnp.int32)
 		phase = jnp.ones(ns, dtype=psi_l_X.dtype)
-	return _gram_q0_tiled_from_psi_kernel(
+	kernel = _gram_q0_tiled_from_psi_kernel(
 		mesh_xy, nk, n_points, nb_l, nb_r, ns, width,
-		gamma_mode=mode,
-	)(G_xy, psi_l_X, psi_l_Y, psi_r_X, psi_r_Y, k_weights,
-	  perm, phase, perm, phase)
+		gamma_mode=mode, left_bands=left_bands,
+	)
+	if left_bands is not None:
+		return kernel(G_xy, psi_r_X, psi_r_Y, k_weights,
+		              perm, phase, perm, phase)
+	return kernel(G_xy, psi_l_X, psi_l_Y, psi_r_X, psi_r_Y, k_weights,
+	              perm, phase, perm, phase)
 
 
 def gram_q0_tiled_from_psi_aot_resident_increment_bytes(
@@ -824,8 +874,13 @@ def gram_q0_tiled_from_psi_aot_resident_increment_bytes(
 	tile_width: int,
 	dtype=jnp.complex128,
 	gamma_mode: str = "charge",
+	left_bands: tuple[int, int] | None = None,
 ) -> int:
-	"""Compiled bytes above the already-resident WFN faces and donated G; see docs/architecture/zeta_fit_face_psi_cct.md."""
+	"""Compiled bytes above the already-resident WFN faces and donated G; see docs/architecture/zeta_fit_face_psi_cct.md.
+
+	``left_bands`` prices the nested executable of
+	:func:`gram_q0_tiled_from_psi_sm` (no left faces; ``nb_l`` is ignored).
+	"""
 	mode = _gram_planning_gamma_mode(gamma_mode, nspinor)
 	width = int(tile_width)
 	if int(n_points) <= 0 or width <= 0:
@@ -863,12 +918,21 @@ def gram_q0_tiled_from_psi_aot_resident_increment_bytes(
 	               else (int(nspinor),))
 	perm = jax.ShapeDtypeStruct(gamma_shape, jnp.int32, sharding=rep)
 	phase = jax.ShapeDtypeStruct(gamma_shape, dtype, sharding=rep)
-	compiled = _gram_q0_tiled_from_psi_kernel(
-		mesh_xy, int(nk), int(n_points), int(nb_l), int(nb_r),
-		int(nspinor), width, gamma_mode=mode,
-	).lower(
-		G, x_l, y_l, x_r, y_r, kw, perm, phase, perm, phase,
-	).compile()
+	if left_bands is not None:
+		lo, hi = (int(v) for v in left_bands)
+		compiled = _gram_q0_tiled_from_psi_kernel(
+			mesh_xy, int(nk), int(n_points), hi - lo, int(nb_r),
+			int(nspinor), width, gamma_mode=mode, left_bands=(lo, hi),
+		).lower(
+			G, x_r, y_r, kw, perm, phase, perm, phase,
+		).compile()
+	else:
+		compiled = _gram_q0_tiled_from_psi_kernel(
+			mesh_xy, int(nk), int(n_points), int(nb_l), int(nb_r),
+			int(nspinor), width, gamma_mode=mode,
+		).lower(
+			G, x_l, y_l, x_r, y_r, kw, perm, phase, perm, phase,
+		).compile()
 	from runtime.aot_memory import aot_kernel_peak_bytes
 	return int(aot_kernel_peak_bytes(compiled).resident_increment)
 
