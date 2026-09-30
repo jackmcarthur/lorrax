@@ -587,21 +587,37 @@ def _largest_fit(start: int, fits) -> int:
 
 
 def _plan_rows_pass(geom: dict, *, rows: int, omega_rows: int,
-                    resident: float, capacity: float, name: str):
-    """Fewest state groups, then fewest r chunks, then widest FFT batch."""
+                    resident: float, capacity: float, name: str,
+                    fixed_local_cols: int | None = None):
+    """Fewest state groups, then fewest r chunks, then widest FFT batch.
+
+    A continuation consumer may fix an already published r-slab width;
+    grouping and the FFT batch then adapt to that width through this same
+    live-set model rather than starting another planner.
+    """
     full_cols = -(-geom["n_rtot"] // geom["p"])
+    if fixed_local_cols is not None and int(fixed_local_cols) <= 0:
+        raise ValueError("fixed_local_cols must be positive")
     groups = 1
     while True:
         per = -(-int(rows) // groups)
-        cols = _largest_fit(full_cols, lambda c: _rows_pass_bytes(
-            geom, rows=per, fft_rows=1, local_cols=c,
-            omega_rows=omega_rows, resident=resident) <= capacity)
+        if fixed_local_cols is None:
+            cols = _largest_fit(full_cols, lambda c: _rows_pass_bytes(
+                geom, rows=per, fft_rows=1, local_cols=c,
+                omega_rows=omega_rows, resident=resident) <= capacity)
+        else:
+            width = int(fixed_local_cols)
+            cols = width if _rows_pass_bytes(
+                geom, rows=per, fft_rows=1, local_cols=width,
+                omega_rows=omega_rows, resident=resident) <= capacity else 0
         if cols >= 1:
             break
         if per <= 1:
+            required_cols = (1 if fixed_local_cols is None
+                             else int(fixed_local_cols))
             raise MemoryError(
                 f"fit_galerkin_basis: {name} does not fit even one state "
-                f"per device: {_rows_pass_bytes(geom, rows=1, fft_rows=1, local_cols=1, omega_rows=omega_rows, resident=resident)/2**30:.2f}"
+                f"per device: {_rows_pass_bytes(geom, rows=1, fft_rows=1, local_cols=required_cols, omega_rows=omega_rows, resident=resident)/2**30:.2f}"
                 f" GiB/device against {capacity/2**30:.2f} GiB/device")
         groups *= 2
     fft = _largest_fit(per, lambda f: f * geom["row_cufft"] <= geom[
@@ -1522,6 +1538,89 @@ def _make_basis_solve_kernel(
     return fn
 
 
+def _iter_selected_basis_rchunks(source, basis, meta, mesh_xy, *,
+                                 r_chunk_ranges):
+    """Continue the basis using only its pivots and bounded row transforms.
+
+    A uniform operator needs no retained band rows.  Transforming the whole
+    k/band table just to pick its pivots makes the upstream FFT box scale
+    with nk*nb, regardless of the requested r slab.  The shared row source
+    instead transforms owner-balanced pivot groups, with its live set priced
+    by the same measured FFT and row-stream model as basis construction.
+    """
+    from common.gpu_utils import device_room_bytes
+
+    rank, ns = int(basis.rank_carrier), int(meta.nspinor)
+    b0, b1 = map(int, basis.band_range)
+    selected = np.asarray(basis.selected_state_indices, dtype=np.int64)
+    owner, _, _ = source.state_row_owners(
+        selected, band_start=b0, band_count=b1 - b0)
+    ranges = tuple((int(r0), int(r1)) for r0, r1 in r_chunk_ranges)
+    if not ranges:
+        return
+    p = int(mesh_xy.size)
+    local_cols = max(-(-(r1 - r0) // p) for r0, r1 in ranges)
+    room = float(device_room_bytes())
+    if room <= 0:
+        raise MemoryError("iter_galerkin_rchunks: no device room for basis rows")
+    geom, capacity, _ = _whole_state_geometry(
+        meta=meta, mesh_xy=mesh_xy, nk=int(meta.nk_tot), nspinor=ns,
+        ngkmax=int(source.loader.ngkmax), band_divisor=p,
+        band_range=(b0, b1), device_pool_limit=room)
+    # The selected slab, its triangular-solve output, and pivot factor can
+    # coexist; the source model adds the row payload and FFT/reshard work.
+    resident = 2 * rank * ns * local_cols * _C16 + rank * rank * _C16
+    max_rows = int(np.bincount(owner, minlength=p).max())
+    groups, fft_rows, _, live = _plan_rows_pass(
+        geom, rows=max_rows, omega_rows=0, resident=resident,
+        capacity=capacity, name="the selected-basis continuation",
+        fixed_local_cols=local_cols)
+    if jax.process_index() == 0:
+        print(f"  [Galerkin selected basis stream] {len(selected)} pivots, "
+              f"{groups} owner-balanced groups, {fft_rows}-row FFT batches, "
+              f"{len(ranges)} r slabs; priced live {live / 2**30:.3f} GiB/device",
+              flush=True)
+    row_spec = P(None, None, ('y', 'x'))
+    row_layout = NamedSharding(mesh_xy, row_spec)
+    product_spec = P(None, None, None, ('y', 'x'))
+    rep = NamedSharding(mesh_xy, P())
+    position = {int(state): i for i, state in enumerate(selected)}
+    from runtime.padding import padded_axis
+
+    for r0, r1 in ranges:
+        if not 0 <= r0 < r1 <= int(meta.n_rtot):
+            raise ValueError(f"Galerkin selected r slab [{r0},{r1}) is invalid")
+        carrier = padded_axis(r1 - r0, p,
+                              name="Galerkin selected real-space carrier").carrier
+        x = _make_selected_zero_kernel(
+            mesh=mesh_xy, row_count=rank, nspinor=ns,
+            r_carrier=carrier, row_layout=row_layout)()
+        for group in _state_groups(owner, groups):
+            if group.size == 0:
+                continue
+            rows, row_k, row_state = source.gather_state_rows(
+                selected[group], band_start=b0, band_count=b1 - b0,
+                row_multiple=fft_rows)
+            dest = device_put_process_local(np.asarray(
+                [position.get(int(state), 0) for state in row_state],
+                dtype=np.int32), rep)
+            active = device_put_process_local(row_state >= 0, rep)
+            for _, slab in source.iter_rows_rchunks(
+                    rows, row_k, ((r0, r1),), product_r_spec=product_spec,
+                    fft_rows=fft_rows):
+                x = _make_rows_place_kernel(
+                    mesh=mesh_xy, rank=rank, n_rows=int(rows.shape[0]),
+                    nspinor=ns, r_carrier=carrier)(slab, dest, active, x)
+                jax.block_until_ready(x)
+                del slab
+            del rows, row_k, dest, active
+        solve = _make_basis_solve_kernel(
+            mesh=mesh_xy, rank=rank, nspinor=ns, r_carrier=carrier,
+            row_layout=row_layout)
+        basis_chunk = solve(basis.selection_factor, x)
+        yield r0, r1, basis_chunk, ()
+
+
 def iter_galerkin_rchunks(
         source, basis: GalerkinBasis, meta, mesh_xy: Mesh, *,
         r_chunk_ranges, retained_band_range: tuple[int, int] | None):
@@ -1536,7 +1635,8 @@ def iter_galerkin_rchunks(
     the same WFN/FFT pass, only the overlap with ``retained_band_range`` is
     retained for a consumer's pair-density contraction.  Pass
     ``retained_band_range=None`` when only the physical basis rows are needed;
-    the same WFN/FFT pass then builds no retained wavefunction payload.  The
+    this route transforms only the selected pivot states, with owner-balanced
+    row groups and the shared measured FFT planner.  The
     yielded shape is therefore bounded by one real-space carrier; no full-grid
     ``Psi`` or ``B`` exists, and no second WFN reader or FFT convention is
     introduced.
@@ -1565,6 +1665,11 @@ def iter_galerkin_rchunks(
         raise ValueError(
             "iter_galerkin_rchunks: PsiGStore must span the fitted basis "
             f"range [{b_start},{b_end}); got {source.band_chunk_ranges}")
+
+    if retained_band_range is None:
+        yield from _iter_selected_basis_rchunks(
+            source, basis, meta, mesh_xy, r_chunk_ranges=r_chunk_ranges)
+        return
 
     rank = int(basis.rank_carrier)
     nspinor = int(meta.nspinor)
