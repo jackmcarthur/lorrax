@@ -1412,6 +1412,75 @@ def _file_order_pieces(A, off, vshape, plan, mesh):
             yield take(A, starts), p_off, p_valid
 
 
+
+def _file_order_read_plan(shape, vshape, spec, itemsize, mesh, ds_shape):
+    """Bounded file rows for fully distributed payloads; no replicated gather.
+
+    Reuse the writer's row budget and rank-order proof. The split axis and
+    leading indices must be replicated in the destination; every mesh axis
+    must instead own a later dimension. Unsupported layouts retain the
+    ordinary collective read.
+    """
+    source = _spec_axes(spec, len(shape))
+    plan = _file_order_plan(shape, vshape, source, itemsize, int(mesh.size),
+                            tuple(mesh.axis_names), ds_shape)
+    if plan is None or plan == "as-is":
+        return None
+    k = plan[0]
+    used = tuple(a for e in source[k + 1:] if e for a in e)
+    if (any(source[:k + 1]) or len(used) != len(mesh.axis_names)
+            or set(used) != set(mesh.axis_names)
+            or not _file_order_move_supported(spec, shape, k, mesh)):
+        return None
+    return plan
+
+
+@functools.lru_cache(maxsize=None)
+def _file_order_read_insert(mesh, shape, dtype, spec, k, compact_shape,
+                            carrier_shape, real_rows):
+    """Pad one compact file piece, inverse-exchange it and donate its owner.
+
+    Staging scales as one bounded piece/P, independent of total k rows and
+    matrix extent. The resident output is global_bytes/P. Both CPU and GPU
+    use the existing FFI read and the same native XLA collectives.
+    """
+    n = len(shape)
+    axes = tuple(mesh.axis_names)
+    source = _spec_axes(spec, n)
+    file_spec = P(*([None] * k), axes, *([None] * (n - k - 1)))
+
+    def insert(dst, piece, starts):
+        pad = [(0, int(carrier_shape[d]) - int(compact_shape[d]))
+               for d in range(n)]
+        piece = jnp.pad(piece, pad)
+        combined = next((d for d in range(k + 1, n)
+                         if source[d] == axes and len(axes) > 1), None)
+        if combined is not None:
+            piece = jax.lax.all_to_all(piece, axes, split_axis=combined,
+                                      concat_axis=k, tiled=True)
+        else:
+            for ax in reversed(axes):
+                d = next(d for d in range(k + 1, n) if source[d] == (ax,))
+                piece = jax.lax.all_to_all(piece, ax, split_axis=d,
+                                          concat_axis=k, tiled=True)
+        piece = jax.lax.slice_in_dim(piece, 0, real_rows, axis=k)
+        return jax.lax.dynamic_update_slice(dst, piece,
+                                            [starts[d] for d in range(n)])
+
+    sm = shard_map(insert, mesh=mesh, in_specs=(spec, file_spec, P()),
+                   out_specs=spec, check_vma=False)
+    return jax.jit(sm, donate_argnums=(0,),
+                   in_shardings=(NamedSharding(mesh, spec),
+                                 NamedSharding(mesh, file_spec),
+                                 NamedSharding(mesh, P())),
+                   out_shardings=NamedSharding(mesh, spec))
+
+
+@functools.lru_cache(maxsize=None)
+def _read_zeros(mesh, shape, dtype, spec):
+    return jax.jit(lambda: jnp.zeros(shape, dtype),
+                   out_shardings=NamedSharding(mesh, spec))
+
 def _normalize_slab_request(
     *,
     op: str,
@@ -2913,6 +2982,12 @@ class _FfiBackend(_DatasetGeometry):
             axis_count_per_dim=axis_count_per_dim,
             axis_flat=axis_flat, mesh_shape=mesh_shape)
 
+        plan = _file_order_read_plan(read_shape, vshape, partition_spec,
+                                     jnp.dtype(dtype).itemsize, mesh, ds_shape)
+        if plan is not None:
+            return self._read_file_rows(name, read_shape, dtype, off, vshape,
+                                        mesh, partition_spec, plan)
+
         # Per-rank output shape: divide by the product of the mesh
         # sizes of all axes sharding that dim.
         local_shape = list(read_shape)
@@ -2951,6 +3026,50 @@ class _FfiBackend(_DatasetGeometry):
                 local_bytes=_local_bytes):
             result = sm(handle_arr, offset_arr, valid_shape_arr)
             result.block_until_ready()
+        return result
+
+    def _read_file_rows(self, name, shape, dtype, off, vshape, mesh, spec, plan):
+        """Existing read handler on compact file rows, bounded on both hosts.
+
+        No recursive public read: geometry/transaction admission happened at
+        the caller, and each native dispatch uses its already owned handle.
+        """
+        k, rows, lead = plan
+        p, n = int(mesh.size), len(shape)
+        lead_axis = max((a for a in range(k) if vshape[a] > 1), default=None)
+        steps = [lead if a == lead_axis else 1 for a in range(k)]
+        file_spec = P(*([None] * k), tuple(mesh.axis_names),
+                      *([None] * (n - k - 1)))
+        sh = NamedSharding(mesh, file_spec)
+        counts, flat = _sharding_to_axis_info(sh, n)
+        mesh_shape = tuple(mesh.shape[a] for a in mesh.axis_names)
+        handle = _replicated_i64_vector((self.fh, self._ds_id(name, readonly=True)), mesh)
+        result = _read_zeros(mesh, shape, jnp.dtype(dtype), spec)()
+        with _large_read_progress(self.path, name,
+                global_bytes=math.prod(shape) * jnp.dtype(dtype).itemsize,
+                local_bytes=math.prod(shape) * jnp.dtype(dtype).itemsize // p):
+            for idx in itertools.product(*(range(0, vshape[a], steps[a]) for a in range(k))):
+                idx = tuple(min(i, vshape[a] - steps[a]) for a, i in enumerate(idx))
+                for c0 in range(0, vshape[k], rows):
+                    real = min(rows, vshape[k] - c0)
+                    height = -(-real // p) * p
+                    compact = tuple(steps) + (height,) + tuple(vshape[k + 1:])
+                    carrier = tuple(steps) + (height,) + tuple(shape[k + 1:])
+                    local = list(compact); local[k] //= p
+                    read = _get_read_sm(mesh, file_spec, mesh_shape=mesh_shape,
+                        axis_count_per_dim=counts, axis_flat=flat,
+                        out_struct=jax.ShapeDtypeStruct(tuple(local), jnp.dtype(dtype)))
+                    p_off = tuple(off[a] + idx[a] for a in range(k)) + (off[k] + c0,) + tuple(off[k + 1:])
+                    valid = tuple(steps) + (real,) + tuple(vshape[k + 1:])
+                    piece = read(handle, _replicated_i64_vector(p_off, mesh),
+                                 _replicated_i64_vector(valid, mesh))
+                    starts = device_put_process_local(np.asarray(
+                        idx + (c0,) + (0,) * (n - k - 1), np.int32),
+                        NamedSharding(mesh, P()))
+                    insert = _file_order_read_insert(mesh, shape, jnp.dtype(dtype),
+                        spec, k, compact, carrier, real)
+                    result = insert(result, piece, starts)
+                    result.block_until_ready()
         return result
 
     # ------------------------------------------------------------------
