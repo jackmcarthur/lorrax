@@ -1,6 +1,7 @@
 """P4 parity and allocation-free production-shape Galerkin capacity proof."""
 from pathlib import Path
 import json
+import argparse
 import numpy as np
 from runtime import initialize_communicator_stack
 rt = initialize_communicator_stack(platform='gpu')
@@ -13,6 +14,9 @@ from isdf.galerkin import (_reduce_projection_partials, _assemble_coefficient_ch
     _galerkin_rank_metrics, _coefficients_from_projection)
 from bandstructure.fh_interp import _apply_qp_block_to_compact_state
 from file_io.slab_io import SlabIO
+parser=argparse.ArgumentParser();parser.add_argument("--output-dir",type=Path,required=True)
+out=parser.parse_args().output_dir
+out.mkdir(parents=True,exist_ok=True)
 mesh=rt.mesh
 assert mesh.size == 4
 sh = NamedSharding(mesh,P(None,None,('x','y')))
@@ -45,7 +49,7 @@ expected=reference.copy();expected[:,1:4]=np.einsum('kmn,kma->kna',U,reference[:
 assert np.max(np.abs(gather_to_host(cq)-expected))<2e-15
 assert np.array_equal(gather_to_host(eq),energy)
 physical=9
-path=Path(__file__).resolve().parents[2]/'runs'/'galerkin_rank_shards_roundtrip.h5'
+path=out/'roundtrip.h5'
 # Use the shared carrier>dataset contract: physical rank is deliberately not P-divisible.
 with SlabIO(path,mode='w',mesh=mesh) as io:
     io.create_dataset('C',shape=(nk,nb,physical),dtype=solved.dtype)
@@ -69,6 +73,6 @@ for bands in (184,198):
     assert m.temp_size_in_bytes<local+2*2520*2520*16,(bands,m)
     rows.append(dict(bands=bands,shape=shape,abstract_only=True,argument_bytes=mem.argument_size_in_bytes,output_bytes=mem.output_size_in_bytes,alias_bytes=mem.alias_size_in_bytes,temp_bytes=mem.temp_size_in_bytes,metrics_temp_bytes=m.temp_size_in_bytes,full_C_bytes=local*4,P36_C_bytes=local*4//36,no_solve_all_gather=True))
 if jax.process_index()==0:
-    target=Path(__file__).resolve().parent/'galerkin_rank_shards_result.json'
+    target=out/'result.json'
     target.write_text(json.dumps(dict(parity_max_abs=err,rows=rows),indent=2)+'\n')
     print('GALERKIN RANK SHARDS PASS',json.dumps(rows),flush=True)
