@@ -515,12 +515,12 @@ def load_parallel_transport_head(
                                      dtype=np.float64))
             for key in validation_names
         }
-        # The link error of link_correction_bound: the head block's relative
-        # Frobenius error (diagonal included).  An artifact that predates it
+        # The link error of link_correction_bound: the relative L2 on the
+        # head's elements (head_velocity_set).  An artifact that predates it
         # carries only the transition (off-diagonal) relative L2.
         try:
             validation["link_relative_error"] = float(io.read_small(
-                "velocity_validation_relative_frobenius", dtype=np.float64))
+                "velocity_validation_head_set_relative_l2", dtype=np.float64))
         except (KeyError, RuntimeError, OSError, ValueError):
             validation["link_relative_error"] = validation[
                 "transition_relative_l2"]
@@ -881,39 +881,36 @@ def _spectral_kernel(mesh: Mesh, kgrid: tuple[int, int, int]) -> Callable:
     return _kernel
 
 
-def link_correction_bound(correction, velocity_dft, *, link_error: float,
+def link_correction_bound(correction, velocity_dft, occupations_kn, *,
+                          link_error: float,
                           rtol: float) -> tuple[float, float, float, float]:
     r"""Judge the link error on what the head uses: ``D_k DeltaH``.
 
     The head's velocity is ``v_DFT + D_k DeltaH``; ``v_DFT`` is exact and
     only the correction goes through the finite links.  The artifact's
     reconstruction of ``v_DFT`` from ``D_k H_DFT`` measures the links'
-    relative error ``link_error`` (head-block relative Frobenius), so the
-    head's error is bounded by
+    relative error ``link_error`` on the elements the head reads
+    (``file_io.parallel_transport.head_velocity_set``: transitions and the
+    Fermi-surface diagonal), so the head's error is bounded by
 
-        ``link_error * |D_k DeltaH|_F / |v_DFT|_F  <=  rtol``
+        ``link_error * |D_k DeltaH| / |v_DFT|  <=  rtol``
 
-    (the artifact's stamped tolerance, default 5e-3).  Returns
-    ``(link_error, ratio, bound, rtol)`` for the per-map head block; above
-    ``rtol`` the map refuses (``GATE pt_head_link_bound``).  A DFT-start
-    map 0 has ``DeltaH = 0`` and a zero bound.
+    with both norms on that set (this map's occupations) and ``rtol`` the
+    artifact's stamped tolerance (default 5e-3).  Returns
+    ``(link_error, ratio, bound, rtol)``: every map logs it in its head block
+    and the SC run judges it at its fixed point
+    (``sc_iteration.refuse_head_link_bound``, ``GATE pt_head_link_bound``);
+    a transient map may exceed it.  A DFT-start map 0 has ``DeltaH = 0`` and
+    a zero bound.
     """
-    ratio = float(jax.device_get(
-        jnp.linalg.norm(correction)
-        / jnp.maximum(jnp.linalg.norm(velocity_dft), 1.0e-30)))
+    from file_io.parallel_transport import head_velocity_set
+    nb = int(velocity_dft.shape[-1])
+    head_set = head_velocity_set(jnp.asarray(occupations_kn)[:, :nb])[None]
+    ratio = float(jax.device_get(jnp.sqrt(
+        jnp.sum(jnp.where(head_set, jnp.abs(correction) ** 2, 0.0))
+        / jnp.maximum(jnp.sum(jnp.where(head_set, jnp.abs(velocity_dft) ** 2,
+                                        0.0)), 1.0e-60))))
     bound = float(link_error) * ratio
-    if not np.isfinite(bound) or bound > float(rtol):
-        raise ValueError(
-            "GATE pt_head_link_bound: the finite-link error on this map's "
-            "QSGW velocity correction exceeds the tolerance.\n"
-            f"  got:  rel_err(links) {float(link_error):.4e} x "
-            f"|D_k DeltaH|/|v_DFT| {ratio:.4e} = {bound:.4e}\n"
-            f"  want: <= {float(rtol):.1e} (the artifact's velocity rtol)\n"
-            "  fix:  a denser k grid (4th-order stencil from 5 points per "
-            "axis), or sc_head_update = dft_velocity\n"
-            "  why:  only D_k DeltaH goes through the links; their relative "
-            "error, measured on the DFT velocity, scales it\n"
-            "  doc:  docs/self_consistency.md, 'Metals: direct Drude head'")
     return float(link_error), ratio, bound, float(rtol)
 
 
@@ -3709,7 +3706,8 @@ def build_iteration_head_response(
             nb_outer=int(nb_links or nb_logical))
         if link_bound is not None:
             bound = link_correction_bound(
-                correction, v_dft_basis, link_error=link_bound[0],
+                correction, v_dft_basis, occupations_qp_kn,
+                link_error=link_bound[0],
                 rtol=link_bound[1])
         v_dft_basis = v_dft_basis + correction
     v_qp = rotate_velocity_active_to_qp(v_dft_basis, U_dft_to_qp, mesh=mesh)

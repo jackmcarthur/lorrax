@@ -107,8 +107,8 @@ Invoke: `python3 -m psp.get_dipole_mtxels -i deck.in [--out dipole.h5]`.
 | `--vnl-velocity-sign` | deck, else `+1` | relative sign of $i[r,V_\mathrm{NL}]$ |
 | `--pseudo-dir` | deck directory | where the `*.upf` live |
 | `--with-finite-q` / `--iq-list` | off / all | also write the `finite_q/` group (`rho_cvkq`, symmetrized `v_cvkq`, `kminq_idx`); its conduction axis is sized by the producer's `ncond` |
-| `--parallel-transport-out` | unset | write the SlabIO parallel-transport artifact read by `sc_head_update`; `--parallel-transport-velocity-only` writes only the DFT-velocity stage `dft_velocity` needs |
-| `--parallel-transport-bands` | `0` (every WFN band) | outer band set of the links (and of the velocity written with them). The velocity gate (`--parallel-transport-validation-rtol`) judges the deck's own bands, the head; the bands above are a buffer that holds the outer edge's link collapse |
+| `--parallel-transport-out` | `parallel_transport.h5` beside `--out` | the SlabIO parallel-transport artifact read by `sc_head_update` (links, the DFT velocity and `p` alone); dropped on a k grid without a link stencil. `--no-parallel-transport` skips it; `--parallel-transport-velocity-only` writes only the DFT-velocity stage `dft_velocity` needs |
+| `--parallel-transport-bands` | `0`: min(WFN bands, ⌈1.25 × deck bands⌉) | outer band set of the links (and of the velocity written with them). The reconstruction error is measured on the deck's own bands (the head) and stamped; the bands above are a buffer that holds the outer edge's link collapse. The SC head judges it on its Σ correction (`GATE pt_head_link_bound`) |
 
 ## kin-ion — `gw.kin_ion_io`
 

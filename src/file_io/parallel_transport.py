@@ -1431,6 +1431,21 @@ def transported_frame(
     return U, defect
 
 
+def head_velocity_set(occupations_kn, tol: float = 1.0e-10):
+    """``[k, m, n]`` mask of the velocity elements a q->0 head reads.
+
+    Transitions ``|f_m - f_n| > tol`` (off-diagonal) and, on a metal, the
+    diagonal of partly filled states (the Fermi velocities of the Drude
+    term).  Empty-empty and full-full blocks are not read.
+    """
+    f = jnp.asarray(occupations_kn)
+    nb = f.shape[-1]
+    diagonal = jnp.eye(nb, dtype=bool)[None]
+    transition = (jnp.abs(f[:, :, None] - f[:, None, :]) > tol) & ~diagonal
+    partial = (f > tol) & (f < 1.0 - tol)
+    return transition | (diagonal & partial[:, :, None])
+
+
 def complete_velocity_validation(
     path: str | Path,
     *,
@@ -1541,11 +1556,12 @@ def complete_velocity_validation(
         reconstructed, exact, atol=float(atol), rtol=float(rtol))
     metrics["band_stop"] = judged
     # The link error the QSGW head bound multiplies by its Sigma correction
-    # (gw.qsgw_head.link_correction_bound): the whole head block, diagonal
-    # (Fermi velocities) included.
-    metrics["relative_frobenius"] = float(jax.device_get(
-        jnp.linalg.norm(reconstructed - exact)
-        / jnp.maximum(jnp.linalg.norm(exact), 1.0e-30)))
+    # (gw.qsgw_head.link_correction_bound), on the elements the head reads.
+    head_set = head_velocity_set(occupations)[None]
+    metrics["head_set_relative_l2"] = float(jax.device_get(
+        jnp.sqrt(jnp.sum(jnp.where(head_set, jnp.abs(reconstructed - exact) ** 2, 0.0))
+                 / jnp.maximum(jnp.sum(jnp.where(head_set, jnp.abs(exact) ** 2, 0.0)),
+                               1.0e-60))))
     metrics["entrywise_passed"] = bool(metrics["passed"])
     metrics["stencil_orders"] = tuple(int(o) for o in orders)
     # Per-Cartesian-axis reduction of the same error, so a slab's collapsed
@@ -1677,8 +1693,8 @@ def complete_velocity_validation(
                     metrics["max_abs_by_axis"],
                     metrics["exact_max_abs_by_axis"],
                     metrics["head_response_ratio_by_axis"]))
-            + f"; head-block relative Frobenius "
-            f"{metrics['relative_frobenius']:.3e}", flush=True)
+            + f"; head-set relative L2 "
+            f"{metrics['head_set_relative_l2']:.3e}", flush=True)
     return metrics
 
 
@@ -1921,7 +1937,7 @@ _VELOCITY_GATE_KEYS = (
     "head_response_trace_ratio",
 )
 _VELOCITY_DIAGNOSTIC_KEYS = (
-    "entrywise_passed", "relative_frobenius",
+    "entrywise_passed", "head_set_relative_l2",
     "max_abs_axis_x", "max_abs_axis_y", "max_abs_axis_z",
 )
 
@@ -2126,9 +2142,10 @@ def complete_parallel_transport(path, *, wfn, sym, mesh, nbands, bispinor,
     report.heading("Parallel-transport validation")
     report.emit(f"Links on bands 1-{int(nbands)}; velocity judged on "
                 f"bands 1-{int(metrics['band_stop'])} (the head)")
-    report.emit(f"Covariant DFT velocity: {verdict}; head-block relative "
-                f"Frobenius={float(metrics['relative_frobenius']):.4e} (the "
-                "SC head's link error); "
+    report.emit(f"Covariant DFT velocity: {verdict}; relative L2 on the "
+                "head's elements (transitions, Fermi-surface diagonal)="
+                f"{float(metrics['head_set_relative_l2']):.4e} (the SC head's "
+                "link error); "
                 f"max abs={float(metrics['max_abs']):.5e}; "
                 f"max rel={float(metrics['max_rel']):.5e}")
     rule = {0: "position", 2: "order-2", 4: "order-4"}
