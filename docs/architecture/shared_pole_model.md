@@ -238,9 +238,9 @@ $$
 \tag{SP 3}
 $$
 
-a numerical treatment, not a bound on collective modes. The first SC map
-freezes it; later maps report the value a fresh map would choose but never
-widen it. Inactive modes have zero factors and the inert pole sentinel; CC and
+a numerical treatment, not a bound on collective modes. An SC run holds the
+first map's value while the current span stays inside it and re-plans it at
+twice the current span when the span exceeds it. Inactive modes have zero factors and the inert pole sentinel; CC and
 TT have independent masks, CT one common mask. Refusals:
 `GATE shared_pole_sector_treatment_{census,order,empty}`. Held rows score the
 untreated fit; accuracy of the treatment is a projected-Σ comparison.

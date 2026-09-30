@@ -521,7 +521,13 @@ only the invariant ISDF basis. Three things persist across maps:
   loop keeps the running maximum line endpoint and the extreme imaginary
   endpoints, so the DFT gap's extra imaginary support is never locked in. The
   enclosure fixes sampling geometry only; it is not an interpolation-error
-  certificate.
+  certificate. The line sites inside it are held while the support rule would
+  place every site within 3 meV of the held one for the current bands
+  (`LINE_SITE_HOLD_EV`), and re-placed from the current bands otherwise (one
+  `SC W line sites re-planned` line): held sites frozen at map 2 of a DFT start
+  moved the Fe 4³ bispinor end point 99 meV (REPLAN 2026-09-29). The bispinor
+  treatment ceiling is held while the current span stays inside it, else
+  re-planned at twice the current span.
 
 `head_correction = full` evaluates the current shared-pole Γ body on each map,
 one frequency at a time on both mesh axes, and folds the head wings through

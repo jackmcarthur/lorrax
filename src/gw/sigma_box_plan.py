@@ -1514,10 +1514,14 @@ def plan_sigma_windows(
                 "finite positive endpoint")
         previous = fixed_rule_session.setdefault(
             "pole_support_ry", fixed_pole_support)
-        if float(previous) != fixed_pole_support:
+        # The treatment ceiling only grows (a span past it re-plans it,
+        # shared_pole_recipe._sector_treatment_ceiling); every live pole is
+        # still box-checked against its held rule.
+        if fixed_pole_support < float(previous):
             raise ValueError(
-                "fixed SC pole support changed after initialization: "
+                "fixed SC pole support shrank after initialization: "
                 f"{previous!r}->{fixed_pole_support!r} Ry")
+        fixed_rule_session["pole_support_ry"] = fixed_pole_support
     branch_rows = list(branches)
     summaries = tuple(pole_summaries)
     if not summaries:

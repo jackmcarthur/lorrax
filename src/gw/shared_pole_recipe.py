@@ -939,13 +939,14 @@ def _support_envelope(required, key, session):
 
 
 def _sector_treatment_ceiling(response_span_ry, session):
-    """Freeze the bispinor pole treatment ceiling before the first SC map.
+    """Hold the bispinor pole treatment ceiling while the current span is inside it.
 
     Twice the current chi transition span is an explicit approximation
-    policy. It is not a collective-mode bound. A fixed-SC session retains the
-    map-0 value; later maps report the ceiling a fresh map would choose, but
-    never widen the model or Sigma domain after map 0. The constructor applies
-    the frozen ceiling to every current model, independently of span motion.
+    policy. It is not a collective-mode bound. A fixed-SC session holds the
+    ceiling of its plan while the current span stays within the held span
+    (current candidate <= held ceiling); a map whose span exceeds it re-plans
+    the ceiling at twice the current span and holds that (``replanned``).
+    The constructor applies the held ceiling to every current model.
     """
     required = 2.0 * float(response_span_ry)
     if not math.isfinite(required) or required <= 0.0:
@@ -963,6 +964,9 @@ def _sector_treatment_ceiling(response_span_ry, session):
     if previous is None:
         session["sector_treatment_ceiling_ry"] = required
         status = "initialized_map0"
+    elif required > float(previous):
+        session["sector_treatment_ceiling_ry"] = required
+        status = "replanned"
     else:
         status = "reused_map0"
     return dict(version="sector_twice_map_span_v1", status=status,
@@ -1030,6 +1034,15 @@ def imaginary_sample_count(kappa, tier, recipe=shared_real_pole_v1_r3b):
             math.log(16 * kappa**2) * math.log(4 / recipe['imaginary_count_epsilon'])
             / (2 * math.pi**2)))
     return recipe[tier]['imaginary_count']
+
+
+#: Held SC line sites are replaced when the support rule would move any site
+#: by more than this (eV) for the current bands.  The Fe 4^3 bispinor SC end
+#: point moves about 0.3 meV per meV of held-site offset (sites frozen at map 2
+#: of a DFT start sat 0.32 eV off the rule's sites at the fixed point and left
+#: E_F +- 10 eV states 99 meV from a fresh plan's end point; 0.003 eV gave
+#: 0.9 meV; REPLAN, runs/Fe/67-71, 2026-09-29), so 3 meV keeps it near 1 meV.
+LINE_SITE_HOLD_EV = 3.0e-3
 
 
 def support_rule_line_sites(energies_ev, mu_ev, eta_ev, height_ev, top_ev, count,
@@ -1177,11 +1190,24 @@ def resolve_shared_pole_recipe(config, wfns, meta, *, mesh_xy, print_fn,
         if support_receipt is not None and support_receipt['status'] != 'initial_reference':
             previous_line = support_session.get('line_ev')
             if support_receipt['status'] == 'hit' and previous_line is not None:
-                if line[-1] <= previous_line[-1]:
-                    line = np.asarray(previous_line, dtype=np.float64)
+                # The held sites stay valid while the support rule would place
+                # the same sites for the current bands (s(E_now) = s_held).
+                held = np.asarray(previous_line, dtype=np.float64)
+                drift = (float(np.max(np.abs(line - held))) if line.shape == held.shape
+                         else math.inf)
+                support_receipt['line_site_drift_ev'] = drift
+                if drift <= LINE_SITE_HOLD_EV:
+                    line = held
                 else:
                     support_session['epoch'] += 1
                     support_receipt.update(status='expanded', epoch=support_session['epoch'])
+                    worst = (int(np.argmax(np.abs(line - held)))
+                             if line.shape == held.shape else -1)
+                    print_fn(f"  SC W line sites re-planned: max site drift {drift:.4f} eV > "
+                             f"{LINE_SITE_HOLD_EV:.4f} eV (site {worst}: "
+                             f"{held[worst] if worst >= 0 else float('nan'):.4f} -> "
+                             f"{line[worst] if worst >= 0 else float('nan'):.4f} eV); "
+                             f"epoch {support_session['epoch']}")
             # This is the existing SC sampling geometry, never W samples or a model.
             support_session['line_ev'] = tuple(float(v) for v in line)
     if override is not None:
@@ -1314,7 +1340,7 @@ def resolve_shared_pole_recipe(config, wfns, meta, *, mesh_xy, print_fn,
         'multiplet': 'whole multiplets within relative 1e-6',
         'bank': 'fixed Hermite certificate tolerance 1e-8',
         'census': 'current full-band occupations, authenticated k weights/capacity; active band top >= mu-15 eV',
-        'sector_pole_treatment': 'bispinor-only numerical treatment at twice the map-0 chi transition span; not a physical pole bound',
+        'sector_pole_treatment': 'bispinor-only numerical treatment at twice the chi transition span, held while the current span stays inside it; not a physical pole bound',
         'U_bytes': '16*nk_full*(nspinor*nmu)^2/(Px*Py), logical bytes/rank',
         'metadata': 'sum of replicated metadata array nbytes',
     }
