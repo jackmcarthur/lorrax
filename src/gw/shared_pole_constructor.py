@@ -326,10 +326,11 @@ def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output, resi
                         raise ValueError(
                             f"GATE shared_pole_{name}: got: failed at q={q}, "
                             f"Gram min/max={round_reduction['gram_min_relative'][slot]}, "
+                            f"rounding floor/max={round_reduction['gram_floor_relative'][slot]}, "
                             f"paired Schur S min/max={round_reduction['paired_min_relative'][slot] if ordered else 'n/a'}, "
                             f"metric infinity norm={round_reduction['metric_initial_infinity_norm'][slot]}, "
                             f"inverse-root residual={round_reduction['metric_inverse_root_residual_relative'][slot]}; "
-                            f"want: Gram min/max >= {gates['normalized_gram_validity']['threshold']} "
+                            f"want: Gram min >= -floor (even route: propagated float64 floor, gram_rounding_validity; ordered: normalized_gram_validity) "
                             "and valid diagonal/retained metric; why: no PSD repair")
                 if not round_zero["zero_policy"][slot]:
                     raise ValueError(f"GATE shared_pole_zero_ritz: got: failed at q={q}; want: finite positive response within dropped-weight budget; why: no pole clipping")
