@@ -643,24 +643,9 @@ class PolarPlan:
         _validate_operand(A, self)
         return _kernel_for(self, jnp.dtype(A.dtype))(A)
 
-    def route_for(self, shape, dtype):
-        """Capacity route for a face-sharded stack, including polar lifetimes.
-
-        Five live dilation-size arrays conservatively cover the input,
-        dilation, eigenvectors, extracted vectors, output and exchanges.
-        The eigh workspace query adds the local solver's actual scratch.
-        A caller-supplied budget is identical on every rank.
-        """
-        requested = self.eigh_plan.requested_batched_route
-        budget = self.eigh_plan.budget_bytes
-        if budget is None:
-            return self.eigh_plan.batched_route
-        from distrib_la.workspace import fits_local
-        local = (-(-int(shape[0]) // int(self.mesh.size)), 2*self.n, 2*self.n)
-        if fits_local(self.eigh_plan, 'eigh', (local,)*5, dtype, budget):
-            return ROUTE_BATCH_RESHARD
-        if requested == ROUTE_BATCH_RESHARD:
-            raise ValueError("polar batch_reshard exceeds the supplied per-rank budget")
+    @property
+    def batched_route(self):
+        """The route :meth:`batched` takes: the plan's requested route."""
         return self.eigh_plan.batched_route
 
     def batched(self, A):
@@ -679,15 +664,13 @@ class PolarPlan:
         face = NamedSharding(self.mesh, P(None, 'x', 'y'))
         if not isinstance(A, jax.core.Tracer) and not _same_layout(getattr(A,'sharding',None), face):
             raise ValueError("polar batched requires A already at P(None,'x','y')")
-        if self.route_for(A.shape, A.dtype) == ROUTE_BATCH_RESHARD:
+        if self.batched_route == ROUTE_BATCH_RESHARD:
             from distrib_la._batch_reshard import batch_reshard_call
             rcond = self.rcond
             if rcond is None:
                 rcond = self.n * float(jnp.finfo(A.real.dtype).eps)
             s, link = batch_reshard_call('polar', self.mesh, (A,), rcond=rcond)
             return link, s
-        # Do not let the narrower eigh-only price admit a local route after
-        # the complete polar lifetime above refused it.
         key = ('polar_batch_scan', mesh_key(self.mesh), self.n, self.backend,
                self.rcond, tuple(A.shape), str(A.dtype))
         fn = _KERNEL_CACHE.get(key)
@@ -744,7 +727,6 @@ def plan_polar_factor(
     backend: str = "distributed",
     rcond: float | None = None,
     batched_route: str = 'auto',
-    budget_bytes: int | None = None,
 ) -> PolarPlan:
     """Eagerly resolve one reusable distributed polar-factor plan.
 
@@ -765,12 +747,9 @@ def plan_polar_factor(
     rcond
         Relative rank cutoff.  None uses n * eps(dtype).
     batched_route
-        ``'auto'`` keeps distributed calls unless ``budget_bytes`` admits
-        the local batch route; ``'batch_reshard'`` explicitly requests it.
-        This changes only :meth:`PolarPlan.batched`, never a single call.
-    budget_bytes
-        Optional shared per-rank room for the complete batched polar live
-        set plus local eigensolver workspace. Large matrices stay distributed.
+        ``'auto'`` keeps :meth:`PolarPlan.batched` on the distributed solve;
+        ``'batch_reshard'`` runs it rank-local, ``ceil(B/P)`` whole matrices
+        per rank. A single call is always distributed.
     """
     n = _as_extent(n)
     _mesh_contract(mesh, n)
@@ -779,7 +758,7 @@ def plan_polar_factor(
     # Single calls stay on the face route. Independent stacks have a separate
     # method on this same plan, using the existing batch movement owner.
     eig = plan("eigh", mesh, backend=backend, n=2 * n,
-               batched_route=batched_route, budget_bytes=budget_bytes)
+               batched_route=batched_route)
     return PolarPlan(
         mesh=mesh,
         n=n,
