@@ -142,8 +142,8 @@ def compare(raw, *, rcond=1e-10):
     n = int(raw.shape[-1])
     legacy = plan_polar_factor(R.mesh, n=n, backend='distributed', rcond=rcond)
     batch = plan_polar_factor(R.mesh, n=n, backend='distributed', rcond=rcond,
-                             budget_bytes=512*1024**2)
-    assert batch.route_for(raw.shape, raw.dtype) == ROUTE_BATCH_RESHARD
+                             batched_route=ROUTE_BATCH_RESHARD)
+    assert batch.batched_route == ROUTE_BATCH_RESHARD
     t0 = time.monotonic()
     reference = [legacy(raw[i]) for i in range(len(raw))]
     jax.block_until_ready(reference)
@@ -167,10 +167,9 @@ def compare(raw, *, rcond=1e-10):
     assert error < 5e-10, error
     assert sv_error < 5e-12, sv_error
     assert link.sharding.spec == P(None, 'x', 'y')
-    tiny = plan_polar_factor(R.mesh, n=n, backend='distributed', rcond=rcond,
-                            budget_bytes=1)
-    assert tiny.route_for(raw.shape, raw.dtype) != ROUTE_BATCH_RESHARD
-    fallback_l, fallback_s = tiny.batched(raw[:1])
+    # linalg = distributed decks: the same surface, one link on the mesh.
+    assert legacy.batched_route != ROUTE_BATCH_RESHARD
+    fallback_l, fallback_s = legacy.batched(raw[:1])
     assert np.linalg.norm(host(fallback_l)[0]-reference_link[0]) < 5e-10
     assert np.max(np.abs(host(fallback_s)[0]-reference_values[0])) < 5e-12
     return dict(n=n, edges=int(raw.shape[0]), relative_link_error=error,
