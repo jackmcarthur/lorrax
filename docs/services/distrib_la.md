@@ -329,7 +329,8 @@ default to move first-use cost ahead of a timed hot loop.
 ## Polar factor and spectral directions
 
 `polar_factor(A, mesh, *, backend='distributed', rcond=None) -> (L, s)` and
-`plan_polar_factor(mesh, *, n, backend='distributed', rcond=None) -> PolarPlan`
+`plan_polar_factor(mesh, *, n, backend='distributed', rcond=None,
+batched_route='auto', budget_bytes=None) -> PolarPlan`
 diagonalize the Hermitian dilation
 
 $$H = \begin{pmatrix} 0 & A \\ A^\dagger & 0 \end{pmatrix}, \qquad
@@ -363,6 +364,18 @@ diagnostic.
   O(n²/P) per process (the dilation and its eigenvectors hold 4n² elements).
 * **Comparison:** compare L and s across meshes; individual dilation
   eigenvectors are gauge-dependent.
+
+`PolarPlan.batched(A)` accepts independent `(B,n,n)` matrices already at
+`P(None,'x','y')`, and returns links in that layout and descending singular
+values `(B,n)` replicated. With a caller-supplied per-rank `budget_bytes`,
+the service admits five live dilation-size arrays plus the local eigh's
+workspace. Small matrices move by the existing face-to-batch exchanges,
+run the same dilation and cutoff on each rank's `ceil(B/P)` matrices, and
+return through the inverse exchanges. The batch is never replicated;
+ragged synthetic rows skip the solver. Matrices beyond that capacity stay
+on the distributed route. A single `PolarPlan(A)` keeps its original route.
+Transport preprocessing collects at most one raw overlap per rank before
+calling this surface; no wavefunction or full-k overlap table is buffered.
 
 `right_singular_vectors(W, tau, *, eigh_plan, column_extent, ...)` returns the
 right singular directions with σ/σ_max > `tau`, closing whole multiplets at
