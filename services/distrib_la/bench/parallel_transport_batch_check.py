@@ -179,6 +179,54 @@ def compare(raw, *, rcond=1e-10):
                 batch_warm_wall_s=warm), link_host, value_host
 
 
+def connection_placement_check():
+    """Exact native connection parity, with a real collapsed input surface."""
+    import ast
+    from file_io import parallel_transport as native
+    rng = np.random.default_rng(412)
+    tree = ast.parse(Path(native.__file__).read_text())
+    owner = next(n for n in tree.body if isinstance(n, ast.FunctionDef)
+                 and n.name == '_write_connection_stage')
+    node = next(n for n in ast.walk(owner) if isinstance(n, ast.FunctionDef)
+                and n.name == '_connection')
+    rows = []
+    for grid in ((5, 5, 5), (5, 5, 1)):
+        nk, nb = int(np.prod(grid)), 8
+        coords = np.indices(grid).reshape(3, -1).T
+        plus = native.build_forward_neighbor_table(coords, grid)
+        spacing = 1.0 / np.asarray(grid)
+        orders = native.link_stencil_orders(grid)
+        raw = rng.normal(size=(3, nk, nb, nb)) + 1j*rng.normal(size=(3, nk, nb, nb))
+        links = np.linalg.qr(raw)[0]
+        position = None
+        if grid[-1] == 1:
+            position = rng.normal(size=links.shape) + 1j*rng.normal(size=links.shape)
+            position = 0.5 * (position + position.swapaxes(-1, -2).conj())
+        shard = NamedSharding(R.mesh, P(None, None, 'x', 'y'))
+        ld = device_put_process_local(links, shard)
+        pd = None if position is None else device_put_process_local(position, shard)
+        closure = dict(vars(native))
+        closure.update(full_plus=plus, spacing=spacing, orders=orders,
+            band_matmul=native.make_distributed_band_matmul(R.mesh, n_batch_axes=1),
+            block_sharding=shard, position_sharding=None if pd is None else shard)
+        module = ast.Module(body=[node], type_ignores=[])
+        ast.fix_missing_locations(module)
+        exec(compile(module, str(native.__file__), 'exec'), closure)
+        got = closure['_connection'](ld, pd)
+        # Same owning stencil, independent ordinary dense matrix products.
+        reference = native.fourth_order_connection(
+            jnp.asarray(links), plus, spacing, band_matmul=lambda a,b: a@b,
+            stencil_orders=orders,
+            collapsed_position=None if position is None else jnp.asarray(position))
+        error = float(np.max(np.abs(host(got)-host(reference))))
+        assert error < 5e-12, error
+        assert got.sharding.spec == shard.spec
+        rows.append(dict(grid=grid, max_absolute_error=error,
+                         position_supplied=position is not None,
+                         output_all_P_faces=True))
+    return rows
+
+
 def main():
     out = Path(args.out)
     receipts = []
@@ -280,7 +328,8 @@ def main():
             assert int(io.read_small('links_symmetry_reduced',dtype=np.int32)) == 0
         row.update(kind='bcc_artifact',nk=int(meta.nk_tot),velocity_max_error=v_error,
                    outer_bands=14,head_bands=13,authenticated=True,
-                   validation_reductions=validation_reduction_check())
+                   validation_reductions=validation_reduction_check(),
+                   connection_placement=connection_placement_check())
         receipts.append(row)
 
         if args.perf_wfn:
