@@ -3,7 +3,7 @@
 # boxes: Vast.ai, RunPod, DataCrunch, Lambda — any Ubuntu box with an NVIDIA
 # datacenter driver).  Source this file; setup_env.sh and build_ffi.sh do so.
 #
-# This is the cloud twin of config/perlmutter/cuda13_module/stack.sh.  The
+# This is the cloud twin of config/perlmutter/module/stack.sh.  The
 # two are deliberately STRUCTURALLY PARALLEL so `diff` shows only values.
 # The load-bearing difference: Perlmutter takes the CUDA toolchain from
 # NERSC's Lmod modules and NVHPC; here EVERYTHING comes from pip wheels.

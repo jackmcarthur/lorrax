@@ -2,10 +2,10 @@
 
 **The production GW calculation is full-frequency QSGW with the shared-pole
 W, built from residues.** GN-PPM is not the production route
-([decisions, 2026-09-29](../architecture/decisions.md#production-gw-route)).
+([decisions](../architecture/decisions.md#production-gw-route)).
 
 This page owns the production recipe: the route, the options it sets, the
-owner's requirements, the error budget and which parts are on main. Key
+minimum settings, the error budget and which parts are on main. Key
 meanings are in the [input reference](../input_reference.md); the QSGW map and
 its stop rules in [self-consistency](../self_consistency.md); the W model in
 [shared-pole W](../theory/shared-pole-w-model.md); metal-only rules in
@@ -89,7 +89,7 @@ number_bands_protected = M  ; b3, the QP-matrix top; a convergence parameter
 number_bands = N        ; >= 2 n_occ, the one count for chi0 and Sigma
 ```
 
-## Owner requirements (2026-09-03)
+## Minimum settings
 
 - At least **20 conduction bands** in the Σ window (`ncond >= 20`).
 - **Centroids ≥ 10 × `number_bands`**, taking the nearest orbit-closed count.
@@ -97,8 +97,8 @@ number_bands = N        ; >= 2 n_occ, the one count for chi0 and Sigma
   exchange error follows N_μ/r of that pair set's rank r
   ([ISDF exchange accuracy](../theory/isdf-exchange-accuracy.md)).
 - The ζ fit is built on the Gram of **all bands that enter Σ**
-  (`zeta_nband = number_bands`). If the strict rank ceiling refuses, the owner
-  decides `zeta_rcond`; the run does not drop to a smaller basis.
+  (`zeta_nband = number_bands`). If the strict rank ceiling refuses, set `zeta_rcond`
+  explicitly; do not drop to a smaller basis.
 - Band extrapolation stays on. An explicit `use_band_extrapolation` on a
   stage that does not consume it refuses.
 - **Band structures** come from htransform fitted on the whole WFN band set,
@@ -157,7 +157,7 @@ Cost: Σ τ time +5 to +11 % per SC map (Na 8³).
 rigid shift per map
 ([self-consistency §2](../self_consistency.md#2-band-treatment)). Si 4³ SOC
 QSGW at its fixed point, P4, N = 100, 1100 centroids, ε 1e-4, extrapolation
-with a free exponent (code a17143cf9), against b3 = N (indirect / direct
+with a free exponent, against b3 = N (indirect / direct
 gap 1.4749 / 3.4925 eV):
 
 | b3 | 16 | 24 | 40 | 64 |
@@ -172,8 +172,7 @@ energy, exchange-anchored, or the reference's own tail energies), and a
 second-order fold of the matrix–tail coupling makes it worse (−118 meV at
 b3 = 16). Raise b3 toward N. Legs at b3 ≥ 32 stall at 5 meV to 0.12 eV on
 bands just below b3 while the ±10 eV states are stable; b3 = 48 refuses
-because it cuts a Γ multiplet. Source: sandbox TAILLIN report
-(runs/Si/120_taillin_20260930); TAILX and LOWDIN, same date.
+because it cuts a Γ multiplet.
 
 **4. k grid and the parallel-transport head.** The default SC head,
 `parallel_transport`, takes the Σ part of the velocity, D_kΔH, from finite

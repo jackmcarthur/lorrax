@@ -22,7 +22,7 @@ native library is built and reached.
 
 | platform | stack | launched by |
 |---|---|---|
-| Perlmutter GPU (A100 40/80 GB) | bare-host CUDA 13.2, a JAX/JAXLIB 0.9.1 venv, the sealed FFI bundle; all selected by the `lorrax_A` module | `lx run` ([Perlmutter §1](machines/perlmutter.md#1-entry-point-lx)) |
+| Perlmutter GPU (A100 40/80 GB) | bare-host CUDA 13.2, a JAX/JAXLIB 0.9.1 venv, the sealed FFI bundle; all selected by the `lorrax_A` module | `srun` ([Perlmutter §1](machines/perlmutter.md#1-entry-point)) |
 | Perlmutter CPU (Milan) | the same venv, CPU platform, MPI collectives | [Perlmutter §5](machines/perlmutter.md) |
 | Frontera CPU (CLX) | apptainer image + staged runtime bundle + Intel MPI (layers below) | `config/frontera/templates/gw_dev.sbatch` |
 | another SLURM cluster | `config/<cluster>/` | [`config/README.md`](../../config/README.md) §Porting |

@@ -11,34 +11,28 @@ JAX and the GPU memory pool are in the [overview](../overview.md#gpu-pool).
 two nodes) and P=16 (four nodes), and a P=4 GN-PPM GW run matching its
 reference Σ cell for cell. Larger CPU runs are not certified.
 
-## 1. Entry point: `srun`, or `lx` {#1-entry-point-lx}
+## 1. Entry point: `srun` {#1-entry-point}
 
-A plain `srun` with `src/ffi/cpp/select_gpu.sh` as the rank wrapper runs a
-step from a clone: the [install page](../../installation/perlmutter.md#suite)
-gives the line. The rest of this section is the maintainers' `lx` launcher,
-which is not in this repository.
-
-`lx` runs a step on a compute node. It joins an allocation (`--pool NAME` or
-`--jid N`), claims a free node per step, loads the base module (`lorrax_A` by
-default; `LX_BASE_MODULE` is an expert override) in a throwaway shell, and puts
-the resolved checkout's `src/` first on `PYTHONPATH`. It announces the source tree on every step:
-`LORRAX_CHECKOUT` if set, else the checkout containing `cwd`, else the
-module's snapshot. A run directory is not a checkout, so production runs set
-`LORRAX_CHECKOUT`.
+A step runs on a compute node through `srun` inside an allocation, with
+`src/ffi/cpp/select_gpu.sh` as the rank wrapper. From a clone
+([install page](../../installation/perlmutter.md)):
 
 ```bash
-export LORRAX_CHECKOUT=/path/to/checkout
-lx run --pool POOL --wait 3600 -N 1 -G 4 -n 4 -- python3 -u -m gw.gw_jax -i cohsex.in
-lx test                  # the default test gate on a compute node, in cwd
-lx status                # allocations and steps
-lx doctor                # site, module and helpers
-lx run --dry-run …       # print the srun line and exit
+source config/perlmutter/gpu_env.sh   # once per shell
+srun --jobid=$JOBID -N 1 -n 4 --gpus-per-node=4 src/ffi/cpp/select_gpu.sh \
+  .venv/bin/python -u -m gw.gw_jax -i cohsex.in
 ```
+
+With the module loaded the interpreter and the FFI pair are the module's and
+`gpu_env.sh` is not needed
+([Perlmutter module](../../installation/perlmutter-module.md#using-the-module)).
+`runtime.source_closure` refuses a run whose imported runtime is not the
+checkout `LORRAX_CHECKOUT` names ([env vars](../../dev/env_vars.md)).
 
 ### Required GPU task geometry {#required-gpu-task-geometry}
 
-One rank per GPU: `-N n -G 4 -n 4n` (`-G` is per node). `-G 4 -n 1` is a
-single process over four devices, not P=4 evidence. `src/ffi/cpp/select_gpu.sh`
+One rank per GPU: `-N n -n 4n --gpus-per-node=4`. `-n 1 --gpus-per-node=4`
+is a single process over four devices, not P=4 evidence. `src/ffi/cpp/select_gpu.sh`
 pins each rank's GPU through `CUDA_VISIBLE_DEVICES`; the runtime passes
 `local_device_ids` accordingly, so each rank sees `jax.local_devices() ==
 [cuda:0]` and `len(jax.devices())` equals the rank count.
@@ -62,8 +56,8 @@ from the step's node count (`SLURM_STEP_NUM_NODES` or the expanded
 | `NCCL_NET=Socket` on several nodes | **refuses** |
 | explicit `NCCL_NET` or `NCCL_NET_PLUGIN` | the caller's configuration, unchanged |
 
-`lx run` exports `SLURM_NETWORK=no_vni` for every multi-node GPU step; a raw
-`srun` passes `--network=no_vni` itself. The variable acts at step creation,
+A multi-node GPU `srun` passes `--network=no_vni` (or exports
+`SLURM_NETWORK=no_vni`). The setting acts at step creation,
 so setting it from Python is too late. `FI_CXI_RDZV_THRESHOLD=0` prevents a
 cross-node send/recv deadlock (XLA `all_to_all` / `collective_permute`) in
 which libfabric's NCCL proxy thread synchronizes the device while the NCCL
@@ -116,7 +110,7 @@ rank shell before Python:
 
 ```bash
 export LORRAX_CHECKOUT=/path/to/checkout
-lx run --cpu --pool POOL -N 2 -n 4 -- bash -c '
+srun --jobid=$JOBID -N 2 -n 4 -c 16 bash -c '
   set -euo pipefail
   export OMP_NUM_THREADS=14
   . "$LORRAX_CHECKOUT/config/perlmutter/cpu_mpi_env.sh"
@@ -133,9 +127,7 @@ lx run --cpu --pool POOL -N 2 -n 4 -- bash -c '
 | `MPICH_ASYNC_PROGRESS=1` | promotes XLA's FUNNELED request to `MPI_THREAD_MULTIPLE`, required when XLA threads and native MPI I/O or linear algebra coexist; the native FFI aborts the MPI world on a lower grant |
 | `MPICH_GPU_SUPPORT_ENABLED=0` | CPU steps |
 
-**Threads per rank.** `-c` sets one affinity mask per rank; for `lx run --cpu`
-it comes from `LORRAX_CPUS_PER_TASK`, a launcher variable `lx` reads (default
-8). The mask is shared by XLA's CPU worker pool (not capped by `OMP_NUM_THREADS`),
+**Threads per rank.** `srun -c` sets one affinity mask per rank. The mask is shared by XLA's CPU worker pool (not capped by `OMP_NUM_THREADS`),
 LibSci/SLATE OpenMP teams (capped by `OMP_NUM_THREADS` and the handler dials
 the startup report prints), the MPICH progress thread and Python's I/O
 threads. LORRAX binds none of them to a private CPU subset, so set

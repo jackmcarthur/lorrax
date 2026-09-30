@@ -1,37 +1,23 @@
 # Real-space (ISDF-free) GW
 
 Space-time GW with no ISDF: ψ_nk(G) stays on its plane-wave sphere, and χ₀ and Σ are
-one pair convolution through real space. This page owns what exists on main and on
-branches, how to run it, what it has been checked against, and which production owner
+one pair convolution through real space. This page owns what exists, how to run it, what it has been checked against, and which production owner
 each stage reuses. The path is opt-in; **`gw.gw_jax` does not import any of it.**
 
 ## Status
 
-**On main.** Every piece below is unwired: no driver imports it.
+Every piece below is on main and unwired: no driver imports it and no test
+drives the pipeline.
 
-| piece | module | release, claim |
-|---|---|---|
-| pair convolution, χ₀ product `'trace'` (K1) | `gw/mixed_basis_pair_convolution.py` | R30, claim 2787 |
-| r′-column space-group wedge, `ColumnWedge` (`wedge=`) (K1b) | same | R34, claim 2800 |
-| Σ product `'scalar'`, Σ = −G ⊙ W (K2) | same | R37b, claim 2809 |
-| p′→r′ expand at the k-parents, per-stage chunk law (K1d); final stage with no copy of T (K1e) | same | R41b, claims 2837, 2838 |
-| W_q(G, G′) on the q wedge: v_q(G), Γ cell, Dyson, W^c, MPA fit (K3) | `gw/plane_wave_screening.py` | R37b, claim 2811 |
-| one-shot stages ψ(G) → χ₀ → W → Σ_x (K4) | `gw/plane_wave_pipeline.py` | R49, 6506c97b0 + 35d115027, claim 2857 |
-| Σ_c(ω) through the Σ owner; χ at the MPA samples through the MPA owner (K4b) | same, plus the owner hooks in [one frequency integration](#one-frequency-integration) | R51, 3dff467d1, claim 2864 |
+| piece | module |
+|---|---|
+| the pair convolution: χ₀ product `'trace'`, Σ product `'scalar'` (Σ = −G ⊙ W), the r′-column space-group wedge `ColumnWedge` (`wedge=`), the p′→r′ expand at the k-parents with a per-stage chunk law | `gw/mixed_basis_pair_convolution.py` |
+| W_q(G, G′) on the q wedge: v_q(G), Γ cell, Dyson, W^c, MPA fit | `gw/plane_wave_screening.py` |
+| the one-shot stages ψ(G) → χ₀ → W → Σ_x, with Σ_c(ω) through the Σ owner and χ at the MPA samples through the MPA owner ([one frequency integration](#one-frequency-integration)) | `gw/plane_wave_pipeline.py` |
 
-**Wiring.** The only entry is `python -m gw.plane_wave_pipeline`. The deck key
+The only entry is `python -m gw.plane_wave_pipeline`. The deck key
 `screened_coulomb_cutoff` ([input reference](../input_reference.md)) is parsed, but no
-driver reads it; the pipeline takes the same value as `--screened-coulomb-cutoff`. No
-test drives the pipeline.
-
-**On branches, not main.**
-
-- K4c, shared-pole W on the plane-wave sphere with Σ_c through the shared-pole route:
-  `feat/rsgw-shared-pole-pw-2026-09-26-r2` @9ec68fb0f, on 33f7f35f7, claim 2868. It
-  does not land until `construct_shared_poles` takes a bank reader and a basis axis;
-  the branch repeats the constructor's round loop.
-- K5 (the bispinor pathway) and K6 (convergence against ISDF gwjax and BerkeleyGW)
-  have no code.
+driver reads it; the pipeline takes the same value as `--screened-coulomb-cutoff`.
 
 ## How to run
 
@@ -177,6 +163,9 @@ that partner path first.
 
 ## Not built
 
+- A shared-pole W on the plane-wave sphere with Σ_c through the shared-pole route:
+  `construct_shared_poles` must first take a bank reader and a basis axis.
+- The bispinor pathway, and a convergence study against ISDF gwjax and BerkeleyGW.
 - The Γ head and wings: the wing producer and the head owner's S(z)
   (`SphereScreening.gamma_head` exists; the pipeline does not call it).
 - Stage 9 as an owner call, eqp files, a deck key and `gw_jax` wiring.

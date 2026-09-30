@@ -396,7 +396,8 @@ def mesh_is_emulated(mesh) -> bool:
     nothing else, so it is equally true of a single-process multi-GPU mesh
     — ``resolve_mesh()`` on a 4-GPU box, or a test harness child handed all
     four GPUs.  That geometry is not an emulation; it is the arm deleted
-    with the cuSOLVERMg backend (``src/bse/STATUS.md``), and every FFI
+    with the cuSOLVERMg backend (``docs/architecture/slab_io.md``: one
+    process per device), and every FFI
     transport refuses it.  So a consumer that tiers down on this predicate
     must add its own platform guard, or it will serve a deleted geometry
     through a path nobody chose.  ``file_io._slab_io_serial`` does exactly

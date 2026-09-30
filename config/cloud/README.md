@@ -49,7 +49,7 @@ cheap 1-GPU instance first if iterating.
 ```bash
 apt-get update && apt-get install -y build-essential gfortran git curl \
     libopenmpi-dev pkg-config python3.12-venv
-git clone -b cloud/h100-cuda13-bootstrap https://github.com/jackmcarthur/lorrax
+git clone https://github.com/jackmcarthur/lorrax
 cd lorrax
 bash config/cloud/setup_env.sh     # venv + CUDA13 wheels + parallel HDF5 (~10 min)
 bash config/cloud/build_ffi.sh     # liblorrax_ffi.so + full acceptance gates

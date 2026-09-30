@@ -163,7 +163,7 @@ G(τ) is never materialized; it exists only as $\psi\psi^*$ phases inside the
 | file | content |
 |---|---|
 | `eqp0.dat` | BerkeleyGW format. $E_\mathrm{DFT} + \Delta(E_\mathrm{DFT})$, $\Delta = \langle T + V_\mathrm{ion} + V_H + \Sigma_{xc}\rangle - E_\mathrm{DFT}$ |
-| `eqp1.dat` | BerkeleyGW format. Linearized $E + Z\,\Delta(E)$, $Z = (1 - \partial_\omega \mathrm{Re}\,\Sigma_c)^{-1}$, raw for every $Z$ (a BerkeleyGW comparison column). In SC runs `eqp0.dat` and `eqp1.dat` both hold the SC eigenvalues, the accepted map's `eqp0_iterNNNN.dat` body ([self_consistency.md](self_consistency.md)) |
+| `eqp1.dat` | BerkeleyGW format. Linearized $E + Z\,\Delta(E)$, $Z = (1 - \partial_\omega \mathrm{Re}\,\Sigma_c)^{-1}$, raw for every $Z$ (a BerkeleyGW comparison column). The derivative is a central difference at ±0.5 eV on the sampled ω grid (BerkeleyGW's `finite_difference_spacing` default), one-sided within 0.5 eV of a grid edge. In SC runs `eqp0.dat` and `eqp1.dat` both hold the SC eigenvalues, the accepted map's `eqp0_iterNNNN.dat` body ([self_consistency.md](self_consistency.md)) |
 | `sigma_diag.dat` | Σ diagonals in eV. Dynamic one-shot runs add `Z`, the eqp1 residue at $E_\mathrm{DFT}$. Bispinor runs add `sigCC`, `sigTT`, `sigCT` (= CT + TC); ordered broken-TR GN runs add `sigC_odd`. One-shot runs with band extrapolation add `sigC_raw`, `eqp0_raw`, `eqp1_raw` last: Σ_c and eqp0/eqp1 from the band sum truncated at N with no `spectral_shell` tail, from the same Σ evaluation; compare these to BerkeleyGW at the same `number_bands`. SC runs have no raw columns: their Σ diagonals are in the QP basis, and a diagonal cannot be rotated back |
 | `eqp_g0w0.dat` | PPM one-shot only: Re/Im of $H_0 + \Sigma_{xc}(E_\mathrm{DFT})$ |
 | `qp_wfn_rotations.h5` | the QP eigensystem $U_{mnk}$, $E_\mathrm{QP}$ with the source-WFN fingerprint, read by htransform, BSE and SC seeding |
@@ -341,7 +341,7 @@ Lanczos-only.
 | `head_minibz_average` (deck) | false | read only under `bse_k_grid`: rebuilds the q = 0 exchange tile with the fine grid's mini-BZ head and takes the W head's Γ-cell reference from the analytic sphere ([LT head](theory/lt-exchange-head.md)); must match the GW run |
 
 Forgetting `--bse` gives RPA. Absorption comparisons with BerkeleyGW:
-`src/bse/BGW_COMPARE.md`; module status: `src/bse/STATUS.md`.
+`src/bse/BGW_COMPARE.md`.
 
 ## exciton bands — `bse.exciton_bands`
 

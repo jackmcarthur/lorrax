@@ -8,11 +8,10 @@ code; the register at the foot says which page owns what.
 
 | # | rule | why | tool |
 |---|---|---|---|
-| 1 | **Fan out independent legs.** Serial submission of independent legs is a planning defect. | A lane waiting on one leg at a time is idle between dispatches | several `lx run --pool` submits in one turn, or `lx batch <manifest>` |
-| 2 | **One combined P=4 leg per verification:** gates, driver and red twin in one dispatch. | Each extra dispatch repays the bring-up floor (`initialize_communicator_stack`) | `lx run --pool POOL -N 1 -G 4 -n 4`, `lx test` |
-| 3 | **Warm worker** when one geometry runs more than twice; landing evidence still comes from a cold leg. | A warm leg skips the bring-up and the compile | `lx warm start`, `lx warm submit`, `lx batch --mode auto` |
-| 4 | **Lane weight named in the report's first line.** Light (mechanical fix, one number): five one-sentence lines — changed, proof, evidence path, owed, branch. Heavy (design, investigation): a full report. | Readers triage by weight | — |
-| 5 | **Ledger as you go:** evidence path in every report; supersession recorded where the superseded result is indexed. | Hand-resolved ledger conflicts and orphaned workspaces | — |
+| 1 | **Fan out independent legs.** Serial submission of independent legs is a planning defect. | A lane waiting on one leg at a time is idle between dispatches | several `srun --jobid` steps in one turn |
+| 2 | **One combined P=4 leg per verification:** gates, driver and red twin in one dispatch. | Each extra dispatch repays the bring-up floor (`initialize_communicator_stack`) | the four-rank `srun` line of [contributing](docs/contributing.md#the-test-suite) |
+| 3 | **Lane weight named in the report's first line.** Light (mechanical fix, one number): five one-sentence lines — changed, proof, evidence path, owed, branch. Heavy (design, investigation): a full report. | Readers triage by weight | — |
+| 4 | **Ledger as you go:** evidence path in every report; supersession recorded where the superseded result is indexed. | Hand-resolved ledger conflicts and orphaned workspaces | — |
 
 Rules 1 and 2 are complements: fan out across independent work, combine
 within one verification.
@@ -24,7 +23,7 @@ prevents.
 
 | # | rule | failure it prevents |
 |---|---|---|
-| 1 | **Instrument check on every A/B arm:** the `[lx] source tree:` line, `git rev-parse HEAD` inside the leg, and a grep of the log for ignored or unknown deck keys | a worktree one commit behind the deck key ran both arms flag-off |
+| 1 | **Instrument check on every A/B arm:** the imported source path (`python -c "import gw; print(gw.__file__)"`) and `git rev-parse HEAD` inside the leg, and a grep of the log for ignored or unknown deck keys | a worktree one commit behind the deck key ran both arms flag-off |
 | 2 | **Both sides ran:** read passed/failed on both arms before publishing a set difference | an empty or killed base arm reported as an improvement |
 | 3 | **Tail is not total:** reconcile against the run's own summary line | "4 failures" that were 13 |
 | 4 | **Arm ancestry:** `git merge-base` a reused arm against every fix the current tree has | a stale arm carrying a fixed defect into a comparison |
@@ -41,7 +40,7 @@ class number.
 
 ## The four-GPU rule
 
-- **Every GPU verification leg runs at P=4** (`-N 1 -G 4 -n 4`, one rank per
+- **Every GPU verification leg runs at P=4** (`-N 1 -n 4 --gpus-per-node=4`, one rank per
   GPU). A P=1-only verification never lands; report it as unverified.
 - **Unit and CPU cells are exempt.** A lane claiming the exemption names it.
   Emulated CPU meshes (`--xla_force_host_platform_device_count`) serve
@@ -55,10 +54,9 @@ class number.
 
 | thing | what to know |
 |---|---|
-| runtime | `lx` selects the `lorrax_A` base module (`LX_BASE_MODULE` is an expert override). The module selects a `git archive` source snapshot and one **sealed FFI bundle** (CUDA and host legs, handler ABI `LORRAX_FFI_ABI_VERSION` in `src/ffi/common/ffi_loader.py`); a checkout needs no `.so` of its own. The loader refuses a pinned `LORRAX_FFI_SO` whose ABI is not the source's ([Perlmutter](docs/environment/machines/perlmutter.md)) |
-| allocations | agents never allocate: the coordinator runs shared pools and a leg joins one with `lx run --pool NAME` (or `--jid`). `lx` claims a free node per leg; a full pool makes the leg wait (`--wait`). `lx release` cancels only what the calling agent created |
-| exit codes | 0–89 are the command's; 90–98 mean the step never ran (`LX-WRONGSITE` 90, `NOSLURM` 91, `NESTED` 92, `ALLOCFAIL` 93, `LOCKHELD` 94, `TOOSMALL` 95, `POOLFULL` 96, `SITEENV` 97, `EXPIRED` 98). An `LX-*` code is an absence, never a measurement |
-| hung or working | `lx status` cannot tell; `lx status --verify` samples `sstat` twice, 6 s apart. `lx status` draws CPU allocations GPU-shaped: check `AllocTRES` in `scontrol show job <id>` for `gres/gpu` |
+| runtime | The `lorrax_A` module selects a `git archive` source snapshot and one **sealed FFI bundle** (CUDA and host legs, handler ABI `LORRAX_FFI_ABI_VERSION` in `src/ffi/common/ffi_loader.py`); under the module a checkout needs no `.so` of its own; a stock clone builds its pair ([install](docs/installation/perlmutter.md)). The loader refuses a pinned `LORRAX_FFI_SO` whose ABI is not the source's ([Perlmutter](docs/environment/machines/perlmutter.md)) |
+| allocations | agents never allocate: the coordinator holds the allocations and a leg joins one with `srun --jobid=<id>` |
+| hung or working | sample `sstat -j <jobid>.<step>` twice, a few seconds apart; check `AllocTRES` in `scontrol show job <id>` for `gres/gpu` |
 | certificate | 24 h; compute the minutes left from `ssh-keygen -L -f ~/.ssh/nersc-cert.pub`. A working `ssh` is no evidence (ControlPersist answers past expiry): probe with `ssh -o ControlPath=none perlmutter true`. Never `ssh -O exit`: it kills every backgrounded launcher |
 | GPU memory pool | owned by the runtime ([overview §2.1](docs/environment/overview.md#gpu-pool)); a leg script exports none of the pool variables. Timings are comparable only under the same pool |
 | artifacts, not rc | Judge a leg by its artifacts, not its rc. `$HOME` is 40 GiB; a full `$HOME` yields a 38-byte junitxml that parses as zero tests |

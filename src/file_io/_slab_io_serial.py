@@ -270,9 +270,9 @@ class _SerialBackend(_DatasetGeometry):
         # true of a single-process multi-GPU mesh — ``resolve_mesh()`` on a
         # 4-GPU box, or the mesh harness child that hands one process all
         # four devices.  That geometry is a deleted arm, not an emulation:
-        # `src/bse/STATUS.md` records "Single-process multi-GPU is not a
-        # supported geometry — the cuSOLVERMg backend built on it has been
-        # deleted", and on base ``ffi.io.open_file`` refused it at
+        # single-process multi-GPU is not a supported geometry (the
+        # cuSOLVERMg backend built on it is deleted;
+        # docs/architecture/slab_io.md, "One process per device"), and on base ``ffi.io.open_file`` refused it at
         # ``src/ffi/io.py:120`` like any other p*q != P mesh.  Without this
         # check, adding the tier would have re-opened it through a serial
         # h5py route nobody chose — a request for a deleted arm downgrading
@@ -290,7 +290,7 @@ class _SerialBackend(_DatasetGeometry):
                 "  want  : the serial tier is the CPU-emulation tier.  A "
                 "single-process multi-GPU mesh is not an emulation, it is "
                 "the geometry deleted with the cuSOLVERMg backend "
-                "(src/bse/STATUS.md), and phdf5 refuses it at "
+                "(docs/architecture/slab_io.md), and phdf5 refuses it at "
                 "src/ffi/io.py:120.  Serving it here would turn that "
                 "refusal into a silent serial-h5py downgrade.\n"
                 "  fix   : launch one process per GPU and let the phdf5 FFI "

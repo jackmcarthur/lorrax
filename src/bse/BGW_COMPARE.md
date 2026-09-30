@@ -123,5 +123,3 @@ bgw = np.loadtxt('<bgw_run>/absorption_eh.dat', comments='#')
 lor = np.loadtxt('absorption_haydock_b1_eh.dat', comments='#')
 print(f'peak ratio LORRAX/BGW = {lor[:,1].max()/bgw[:,1].max():.3f}')
 ```
-
-For history and project status, see [STATUS.md](STATUS.md).

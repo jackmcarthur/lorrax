@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Launch an N-process LORRAX GPU run on a single cloud box (no SLURM).
 #
-#   config/cloud/launch.sh -n 4 python -u config/perlmutter/cuda13_module/verify_runtime.py
+#   config/cloud/launch.sh -n 4 python -u config/perlmutter/module/verify_runtime.py
 #   config/cloud/launch.sh -n 4 python -u services/distrib_la/bench/cusolvermp_eigh_test.py -n128 --grid 2 2
 #   config/cloud/launch.sh -n 4 python -u -m gw.gw_jax -i cohsex.in
 #

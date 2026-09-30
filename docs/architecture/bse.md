@@ -197,8 +197,9 @@ runs 200 steps by default. Claim 2848 measured the solver on CrI3 8×8×1 SOC
 (with bare V as W) against a 500-state sum over states plus a
 deflated CGS2 tail: at 200 steps both the plain and the CGS2 recursion agree
 with it to ≤ 1e-5 of max ε₂; at 100 steps both are truncated, 0.2–0.5% of
-max ε₂ off. The ε₂ normalization and its BerkeleyGW match are in
-`src/bse/STATUS.md`.
+max ε₂ off. The ε₂ prefactor is $16\pi^2/(V N_k n_\mathrm{spin} n_\mathrm{spinor})$ and the
+continued fraction is scaled by $\lVert d\rVert^2$, as in BerkeleyGW
+(`BSE/absh.f90`, `BSE/haydock.f90`).
 
 Per-state dipoles: `bse_jax --lanczos --tda --bse --write-eigs N --dipole
 dipole.h5` contracts each written eigenvector with the dipole
@@ -215,8 +216,17 @@ eigenvector tile) and stores $\langle 0|\hat r_\alpha|S\rangle$ as
   (`src/bse/eigenvectors.h5.spec`) through `bse_window.write_eigenvectors_stream`:
   `exciton_data/eigenvalues` in eV; `exciton_data/eigenvectors`
   (1, N, N_k, n_c, n_v, 1, 2); full BSE adds `eigenvectors_coupling` (Y). The
-  index conventions against BerkeleyGW, including the reversed valence axis,
-  are in `src/bse/STATUS.md` ("Index ordering"). The writer refuses to trim
+  file follows BerkeleyGW's index conventions, which differ from LORRAX's
+  internal ones: the valence axis is reversed (BerkeleyGW `iv = 1` is the
+  highest valence band, LORRAX `v = 0` the lowest; the conduction axis is the
+  same), eigenvalues are in eV (Ry internally), and the Fortran shape
+  `[scalar, ns, nv, nc, nk, N, nq]` reads through h5py as
+  `(nq, N, nk, nc, nv, ns, 2)`. BerkeleyGW's `vmtxel` flat index is
+  `is + (iv−1 + (ic−1 + (ik−1)·nc)·nv)·nspin`, k slowest and v fastest.
+  Compare eigenvectors between codes only through gauge-invariant
+  quantities ($\sum|A_{cvk}|^2$ per state, manifold-summed
+  $|\langle 0|\hat r|S\rangle|^2$, ε₂): each code fixes its own phase per
+  $(c, v, k)$. The writer refuses to trim
   nonzero amplitude when the declared window is narrower than the solved one.
 - `absorption_haydock.h5` (ε₂, ε₁, JDOS, α, β, norms; with `--no-eps1` the
   ε₁ dataset is ones) and one `absorption_haydock_<pol>_eh.dat` per

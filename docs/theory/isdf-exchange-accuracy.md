@@ -13,8 +13,7 @@ exact, and how does that number grow with the band range a Σ sum reaches?
 This page measures it against an exact plane-wave Σ_x. How centroids are
 chosen is [centroid selection](centroid-selection.md). The ζ fit and V_q are
 [ISDF](isdf-zeta-vq.md). The rule "select against the window Σ consumes" is
-[basis adequacy](../dev/isdf_basis_adequacy_at_large_nband.md). This page
-gives that rule its numbers.
+[below](#selection-window), with its numbers.
 
 ## Definitions
 
@@ -145,6 +144,52 @@ The old sets came from a 128-band WFN. They were weighted on the density of band
 Entries are max / median / RMS in meV. At the same count, the right selection is 30× better on the valence max. The effect on Σ_c at 412 bands:
 - **Size.** The old set moves Σ_c by up to 1.2 eV, with band-edge medians of −55 meV (VB) and +171 meV (CB).
 - **Tail.** Its error decays slowly with \(N\): the tail \(S(412)-S(296)\) is −26.6 meV against −5.1 meV on the rank-saturated basis. That produced a spurious slow band tail (local exponent 1.5–2.7 above \(N\approx 236\), against 5.5–6.7 converged).
+
+## The selection window {#selection-window}
+
+**The ISDF basis must be selected against the band window that Σ_c and χ₀
+consume.** A basis selected for a smaller pair-density block is wrong by
+electron-volts while every upstream check (NSCF provenance, H₀ identity, W
+Dyson residual, TRS, bare Σ_x, the q→0 head fit) passes, because none of them
+reads Σ_c. MoS₂ 4×4×1, 30 Ry, 1024 bands, the same 897-point count
+re-selected on three pivoted-Cholesky prune windows (same WFN, candidate pool
+and `zeta_rcond = 1e-8`):
+
+| prune window | selection rank | eqp0 gap (eV) | eqp1 gap (eV) |
+|---|---|---|---|
+| `(0, 52)` | 630 / 897 | 0.364 | −0.364 |
+| `(0, 256)` | 897 / 897 | 3.135 | 3.071 |
+| `(0, 1024)` | 897 / 897 | 3.723 | 3.455 |
+
+Bare Σ_x is unchanged throughout and the ζ fit Gram's retained rank moves by
+1.4 %: which centroids are selected decides, not how many directions the fit
+keeps. The full window costs +13 % wall and +15 GB peak in the selection.
+
+- **Selector.** `centroid/kmeans_cli._resolve_sigma_window` defaults the
+  prune window to every conduction band in the WFN
+  (`n_cond = nbands − n_val`), a superset of any deck's band counts.
+  `--prune-n-cond` narrows it; keep it at or above
+  `max(number_bands_chi, number_bands_sigma)` of every deck the centroid file
+  serves ([flags](../drivers.md#centroids-centroidkmeans_cli)). `kmeans.out` prints
+  `After pruning: N centroids (rank=R)`. `centroid/pivoted_cholesky.py`
+  refuses a window whose top band exceeds half the plane-wave basis
+  (`max_band > 0.5·ngk_max·n_spinor`): raise the cutoff or lower the band
+  count.
+- **Fit window.** With `number_bands_chi` and `number_bands_sigma` set
+  independently, ζ is fitted to the higher of the two
+  (`gw_config.BandCounts.isdf`); `gw_init.assert_isdf_window_is_the_max`
+  refuses otherwise, and `BandCounts.describe()` logs which count won.
+  `zeta_nband` may narrow the fit below a band sum's top (the BSE Galerkin
+  capacity bound); the consumer above the fit edge then runs on an
+  extrapolated ζ basis, reported per consumer by name.
+- **Observables.** `[zeta rank_truncate]` prints `n_keep / n_pad` per q. It
+  does not measure basis quality. The restart tensor scales as N_μ² (about
+  57 GB at N_μ = 10⁴, 123 GB at 1.5·10⁴); `write_restart_tensors = false`
+  skips it.
+- **Reference point.** A Σ_c-only corruption shows only in Σ_c. MoS₂ 4×4×1
+  30 Ry, `nval 26 / ncond 230 / nband 256`, 2475 orbit-closed centroids:
+  indirect QP gaps eqp0 = 3.5819 eV and eqp1 = 3.2516 eV, deterministic to
+  about 1e-6 eV (3.9 node-hours at P = 64).
 
 ## Second system: Si scalar 4³ (lane RSK5)
 

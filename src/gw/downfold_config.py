@@ -21,7 +21,7 @@ rest of this initiative is built to prevent.
 
 WHY THE WINDOW IS THE MOST IMPORTANT KEY IN THIS FILE.  The retained band
 window is what the small basis is SELECTED against, and
-``docs/dev/isdf_basis_adequacy_at_large_nband.md`` records what happens when
+``docs/theory/isdf-exchange-accuracy.md`` records what happens when
 a basis is selected against one window and consumed on another: a GW run at
 nband=1024 whose centroids had been pruned on a 26x52 window produced a QP
 gap of 0.36 eV where the answer is ~3.1-3.7 eV, with a negative ``eqp1``, and
@@ -357,7 +357,7 @@ class DownfoldConfig:
                 "band_range_right ('lo:hi', absolute, half-open).  A basis "
                 "selected against one window and consumed on another is the "
                 "measured 2.8 eV failure recorded in "
-                "docs/dev/isdf_basis_adequacy_at_large_nband.md.")
+                "docs/theory/isdf-exchange-accuracy.md.")
         if by_counts:
             if n_val is None or n_cond is None:
                 raise ValueError(

@@ -434,7 +434,7 @@ def project_w_between_zeta_bases(
         m, n         →   μ_S, ν_S   (the SMALL basis, the output tile)
         ψ_left       →   conj(T) on 'x'
         ψ_right      →   T†        on 'y'
-        s, s'        →   size-1 (ζ's are spin-independent, manual §5.2)
+        s, s'        →   size-1 (ζ carries no spin index, docs/theory/isdf-zeta-vq.md §1)
 
     W_L enters as the primitive's ``O`` at spec
     ``P(None, None, 'x', None, 'y')`` — the size-1 spinor axes are free

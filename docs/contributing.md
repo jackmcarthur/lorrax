@@ -65,15 +65,12 @@ srun --jobid=$JOBID -N 1 -n 4 --gpus-per-node=4 src/ffi/cpp/select_gpu.sh \
   .venv/bin/python -m tests.hsuite.chain --out DIR --regenerate
 ```
 
-With `lx` (project m4598) the same two lines are
-`lx run -N 1 -G 4 -n 4 -- python -m pytest tests/hsuite` and
-`lx run -N 1 -G 4 -n 4 -- python -m tests.hsuite.chain --out DIR --regenerate`.
 pytest captures the per-stage walls; add `-s` to see them. The suite's compile
 cache is `.hsuite_jax_cache` in the clone (`HSUITE_CACHE_DIR` moves it).
 
-The P4 verdict is the four-rank `srun` line above (`lx run -n 4` with `lx`).
-A one-rank launch (`lx test`, or `srun -n 1 --gpus-per-node=1`) runs the same
-cell at P1, which is a smoke run, not the verdict.
+The P4 verdict is the four-rank `srun` line above. A one-rank launch
+(`srun -n 1 --gpus-per-node=1`) runs the same cell at P1, which is a smoke
+run, not the verdict.
 
 Beside the suite are the five static AST suites (`test_layering.py`,
 `test_crossfile_requests.py`, `test_env_registry.py`, `test_env_grammar.py`,
@@ -96,7 +93,6 @@ Benchmarks and backend checks for a standalone service live in that service's
   count, so it is green for reasons unrelated to your change.
 - Do not commit `__pycache__/`, `.venv/`, or cache directories.
 
-Certification scope — which platforms and process counts are currently
-green, and against which jobs — is not kept on this page, because a page that
-records it goes stale silently. It lives in the sandbox measurement ledger
-(`CLAIMS.md`), which is append-only and dated.
+The certified platforms and process counts are stated per machine
+([Perlmutter](environment/machines/perlmutter.md),
+[Frontera](environment/machines/frontera.md)).

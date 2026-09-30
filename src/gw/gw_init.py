@@ -926,7 +926,7 @@ clears-fh-and-the-tile-null-still-refuses.md`` §3).
 	The fit's right range tops out at ``b4``, and ``b4`` is the padded top of
 	``max(number_bands_chi, number_bands_sigma)``.  That ``max`` is not an
 	implementation convenience — it is the guard against a documented
-	eV-scale failure.  ``docs/dev/isdf_basis_adequacy_at_large_nband.md``
+	eV-scale failure.  ``docs/theory/isdf-exchange-accuracy.md``
 	records a run whose ISDF window was clamped to a SMALL band range and used
 	for a large one: QP gap **0.36 eV where the answer is 3.1–3.7 eV**, with a
 	NEGATIVE ``eqp1``, passing every gate in the suite (el_compare 1.9e-11, H0
@@ -1139,7 +1139,7 @@ def assert_isdf_window_is_the_max(band_slices, band_range_right, zeta_nband,
 	refactor away from being the ``min``.
 
 	WHAT IT COSTS TO GET WRONG, measured, not feared.
-	``docs/dev/isdf_basis_adequacy_at_large_nband.md``: a run whose ISDF
+	``docs/theory/isdf-exchange-accuracy.md``: a run whose ISDF
 	window was clamped to a small band range and then used for a large one
 	returned a QP gap of **0.36 eV** where the answer is **3.1–3.7 eV**, with
 	a NEGATIVE ``eqp1`` fundamental gap — and **passed every gate the project
@@ -1192,7 +1192,7 @@ def assert_isdf_window_is_the_max(band_slices, band_range_right, zeta_nband,
 			f"interpolation basis MUST span the pair densities of whichever "
 			f"consumer reaches higher; a basis fitted to the smaller window "
 			f"and used for the larger one is the 0.36 eV / negative-gap "
-			f"failure in docs/dev/isdf_basis_adequacy_at_large_nband.md, "
+			f"failure in docs/theory/isdf-exchange-accuracy.md, "
 			f"which passed every gate in the suite.  This is a code defect, "
 			f"not a deck error.")
 	if zeta_nband is not None and carrier_top > expected_logical:
@@ -1226,7 +1226,7 @@ def assert_isdf_window_is_the_max(band_slices, band_range_right, zeta_nband,
 				    f"sum are built on pair densities whose ζ basis was "
 				    f"never fitted to them — the basis is EXTRAPOLATED "
 				    f"there.  This is the mechanism behind the 0.36 eV gap "
-				    f"in docs/dev/isdf_basis_adequacy_at_large_nband.md; it "
+				    f"in docs/theory/isdf-exchange-accuracy.md; it "
 				    f"is permitted because you asked for it by name, and it "
 				    f"is not checked by any other gate. ***")
 

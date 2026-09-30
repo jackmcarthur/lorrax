@@ -795,7 +795,7 @@ def select_cur_centroids(
     REFUSES, loudly and before any of the expensive stages, when the
     requested μ_S exceeds the eigenvalue rank the window actually holds.
     That refusal is not a failure mode, it is the intended behaviour: it is
-    the ``isdf_basis_adequacy_at_large_nband.md`` rule ("the ISDF basis must
+    the ``docs/theory/isdf-exchange-accuracy.md`` rule ("the ISDF basis must
     be SELECTED against the band window actually consumed") applied on
     purpose instead of by accident, and the accident cost 2.8 eV.
 

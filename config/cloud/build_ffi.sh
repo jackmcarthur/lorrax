@@ -2,10 +2,8 @@
 # Build the CUDA-13 FFI (cusolvermp + cublasmp + cufft + phdf5) on a generic
 # cloud box, entirely against the pip toolkit staged by setup_env.sh.
 #
-# Cloud twin of config/perlmutter/cuda13_module/build_ffi.sh +
-# build_ffi_phdf5.sh, collapsed into one script: unlike Perlmutter there is
-# no CUDA-12 Shifter artifact to protect, so this lane has exactly one build
-# dir and it carries the phdf5 handlers (OpenMPI + own-built HDF5 1.14).
+# Cloud twin of config/perlmutter/build_ffi_cuda.sh: one build dir, which
+# carries the phdf5 handlers (OpenMPI + own-built HDF5 1.14).
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

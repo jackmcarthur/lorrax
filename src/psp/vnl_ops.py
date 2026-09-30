@@ -1214,7 +1214,7 @@ def _build_vnl_kdata_core(
     #    same math, static per-channel metadata.  Historically this branch
     #    ran EAGER — every call re-traced three jax.jvp's through the solid
     #    harmonics per channel, ~50 ms/k measured on the Si 4x4x4 SR deck
-    #    (PERFORMANCE.md item 3) — and is 1-ulp-equivalent jitted.
+    #    — and is 1-ulp-equivalent jitted.
     #
     # ``compute_dZ=True`` PROMISES AN ARRAY, and the empty-channel case
     # used to break that promise silently.  A setup with no channels

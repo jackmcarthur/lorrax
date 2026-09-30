@@ -1181,8 +1181,8 @@ def lr_design_blocks(zx, prep, degrees=None):
     # a degrees dict, asking here for a WIDER one would not raise anywhere: the
     # loop below iterates ``prep['gz_cols']``, so a channel the superset no
     # longer carries is simply never visited and the model quietly loses it.
-    # That is the "config key parsed and quietly ignored" failure mode
-    # src/bse/STATUS.md:167-170 records as having cost this project days.
+    # That is the "config key parsed and quietly ignored" failure mode; an
+    # unsupported request must refuse.
     _trim = prep.get("lr_gz_degrees")
     if _trim is not None:
         extra = sorted({abs(int(g)) for g in degrees}
