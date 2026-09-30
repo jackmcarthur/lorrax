@@ -138,11 +138,14 @@ def undersampled_link_axes(kgrid) -> list[str]:
 #: Wannier90's kmesh search uses the same order of reach; a lattice whose
 #: B1 condition is not met inside it refuses by name.
 _SHELL_SEARCH_REACH: int = 3
-#: Relative length tolerance that groups mesh vectors into one shell.
-_SHELL_LENGTH_RTOL: float = 1.0e-6
-#: Absolute tolerance on the B1 completeness residual
-#: ``sum_b w_b b b^T - P`` (P: projector on the sampled directions).
-_SHELL_B1_ATOL: float = 1.0e-9
+#: Relative length tolerance that groups mesh vectors into one shell, and
+#: the tolerance of the B1 residual ``sum_b w_b b b^T - P`` (P: projector
+#: on the sampled directions, so the residual is relative).  A DFT cell is
+#: symmetric only to its printed digits: the MoS2 fixture's hexagonal
+#: reciprocal vectors differ in length by 7e-7 and its 60 degree angle by
+#: 2e-6, which a 1e-6 grouping splits into a false second shell.
+_SHELL_LENGTH_RTOL: float = 1.0e-5
+_SHELL_B1_ATOL: float = 1.0e-5
 
 
 @dataclass(frozen=True)
@@ -250,7 +253,8 @@ def link_stencil(kgrid, bvec_cart) -> LinkStencil:
             continue
         col = (vecs.T @ vecs)[iu]
         trial = np.array(columns + [col]).T
-        if columns and np.linalg.matrix_rank(trial, tol=1e-10) <= len(columns):
+        if columns and np.linalg.matrix_rank(
+                trial, tol=1e-6 * float(np.max(np.abs(trial)))) <= len(columns):
             continue
         accepted.append(shell)
         columns.append(col)
@@ -290,7 +294,7 @@ def link_stencil(kgrid, bvec_cart) -> LinkStencil:
     check = coefficients.T @ (steps / np.asarray(grid, dtype=np.float64))
     want = np.zeros((3, 3))
     want[sampled, sampled] = 1.0
-    if not np.allclose(check, want, rtol=0.0, atol=1.0e-9):
+    if not np.allclose(check, want, rtol=0.0, atol=_SHELL_B1_ATOL):
         raise AssertionError(
             f"link shell is not exact on linear functions: {check}")
     return LinkStencil(steps=steps, orders=orders, coefficients=coefficients,

@@ -3294,15 +3294,26 @@ def plasma_frequencies_ev(drude_tensor):
                               0.0)) * RYD_TO_EV
 
 
+def drude_offdiagonal(drude_tensor) -> float:
+    """``max |Re D_ab| (a != b) / max |Re D_aa|``: zero on a cubic or
+    tetragonal (m || z) crystal, whose point group forbids every
+    off-diagonal; a link stencil not closed under that group shows here."""
+    D = np.real(np.asarray(drude_tensor))
+    off = np.abs(D - np.diag(np.diag(D)))
+    return float(np.max(off) / max(float(np.max(np.abs(np.diag(D)))), 1.0e-300))
+
+
 def drude_report(atoms) -> str:
     """Physical and cell-effective plasma frequencies of one metal head.
 
     Each prints the principal values (ascending eigenvalues) of the Drude
     tensor, not its x/y/z components; the head block prints the diagonal.
+    ``offdiag`` is :func:`drude_offdiagonal` of the physical tensor.
     """
     return ("omega_p physical principal (exact multiplets, phi -> 0) = "
-            + "/".join(f"{x:.4f}" for x in plasma_frequencies_ev(atoms.physical_drude))
-            + " eV; q=0-cell effective principal (Fermi-surface share phi of near pairs) = "
+            + "/".join(f"{x:.6f}" for x in plasma_frequencies_ev(atoms.physical_drude))
+            + f" eV (offdiag {drude_offdiagonal(atoms.physical_drude):.2e})"
+            + "; q=0-cell effective principal (Fermi-surface share phi of near pairs) = "
             + "/".join(f"{x:.4f}" for x in plasma_frequencies_ev(atoms.drude_tensor))
             + " eV")
 
