@@ -101,8 +101,9 @@ variable (decisions.md 2026-09-24, QUALITY #8):
 
 Pick the door whose k position matches the tile you already hold; a caller does
 not transpose to reach another.  A k-grid axis above ``KCONV_AXIS_MAX`` (40,
-the fp64 cuFFTDx thread-FFT limit) or a row that does not fit shared memory is
-refused by name on CUDA.
+the fp64 cuFFTDx thread-FFT limit) is refused by name on CUDA. Pair modes0/1/6
+whose three-bank row exceeds shared memory stream spin/spatial tiles through
+this same service's staged native k-axis transform door (no backend switch).
 
 The plain flat-k transform is the same router: ``common.fft_helpers.
 make_flat_k_fft`` calls :func:`make_kfft_klead` (mathdx mode 3 on CUDA,
@@ -731,6 +732,124 @@ def _parent_open_spin(D, tables, right: bool):
     return jnp.conj(jnp.einsum('kabce,kcmen->kamnb', coef, V))   # spin axes 1 and -1
 
 
+def pair_resident_refusal(kgrid, *, optin=None) -> str:
+    """Why modes 0/1/6 need the staged route; same three-bank rule as CUDA.
+
+    The decision changes execution only. The staged route uses the existing
+    k-axis transform door on each complete-P spatial tile, never a full-spin
+    unfolded bank. Both routes have O(nk log(nk) mu nu / P) work and O(nk mu nu / P)
+    scratch for bounded spin dimension (2/4); no new vendor or driver route.
+    """
+    kg = _check_kgrid(kgrid, "mathdx")
+    have = _optin_smem_bytes() if optin is None else int(optin)
+    need = 3 * 16 * (int(np.prod(kg)) | 1)
+    if have is None:
+        return "no CUDA driver to read the opt-in shared memory"
+    why = f"resident pair row needs {need} B > {have} B opt-in shared memory" if need > have else ""
+    if why:
+        from ffi.gate import announce_once
+        announce_once(("kconv", "pair-staged", kg, have),
+                      f"[kconv] pair convolution -> staged spin/spatial tiles through the native k-axis FFT door: {why}; "
+                      "scratch columns<=2048, no full-spin unfolded banks", scope="rank0")
+    return why
+
+
+def _stream_pair_components(kgrid, ns, perm_l, phase_l, perm_r, phase_r,
+                            scale, left, right, shape, fft, ifft):
+    """Sum open-spin components with only scalar-spin k tiles live.
+
+    ``left(a,b)``/``right(a,b)`` return (nk,mu,nu); their typed load owns
+    symmetry, conjugation and phases. A loop keeps XLA from constructing
+    the ns² full-k transform banks which the resident kernel avoids.
+    """
+    pl = jnp.asarray(_check_perm(perm_l, ns, "left"))
+    pr = jnp.asarray(_check_perm(perm_r, ns, "right"))
+    phl = jnp.asarray(np.asarray(phase_l, np.complex128).reshape(ns))
+    phr = jnp.asarray(np.asarray(phase_r, np.complex128).reshape(ns))
+
+    def add(i, total):
+        a, b = i // ns, i % ns
+        # Seal counter-indexed loads against post-loop-write rematerialization.
+        L = jax.lax.optimization_barrier(left(a, b))
+        R = jax.lax.optimization_barrier(right(pl[a], pr[b]))
+        weight = jax.lax.optimization_barrier(phl[a] * phr[b])
+        return total + weight * jnp.conj(ifft(L)) * ifft(R)
+
+    z = jax.lax.fori_loop(0, ns * ns, add, jnp.zeros(shape, jnp.complex128), unroll=False)
+    return fft(z) * scale
+
+
+def _staged_pair_ffts(mesh, kgrid):
+    """Existing NVIDIA k-box/CPU transform door, with unnormalized transforms."""
+    return (make_local_kfft_klead(mesh, kgrid, kind="fftn", norm="backward"),
+            make_local_kfft_klead(mesh, kgrid, kind="ifftn", norm="forward"))
+
+
+def _parent_spin_component(D, tables, right, a, b, mu_start=0, mu_size=None, nu_start=0, nu_size=None):
+    """One component of _parent_open_spin, without its ns² full-k bank."""
+    irr, sym, left, rightp, L, R, q, trs, coef_l, coef_r = tables
+    ns = int(D.shape[1])
+    coef = (coef_r if right else coef_l).reshape(-1, ns, ns, ns, ns)
+    mu_size = int(D.shape[2]) if mu_size is None else int(mu_size)
+    nu_size = int(D.shape[4]) if nu_size is None else int(nu_size)
+    lm = jax.lax.dynamic_slice_in_dim(jnp.take(left, sym, axis=0), mu_start, mu_size, axis=1)
+    rn = jax.lax.dynamic_slice_in_dim(jnp.take(rightp, sym, axis=0), nu_start, nu_size, axis=1)
+    Lv = jax.lax.dynamic_slice_in_dim(jnp.take(L, sym, axis=0), mu_start, mu_size, axis=1)
+    Rv = jax.lax.dynamic_slice_in_dim(jnp.take(R, sym, axis=0), nu_start, nu_size, axis=1)
+    qp = jnp.take(q, irr, axis=0)
+    pl = jnp.exp(2j * jnp.pi * jnp.einsum('ki,kmi->km', qp, Lv))
+    pr = jnp.exp(-2j * jnp.pi * jnp.einsum('ki,kni->kn', qp, Rv))
+
+    def add(i, total):
+        c, e = i // ns, i % ns
+        # One gather of the requested spatial tile. Taking all k rows before
+        # slicing endpoints would secretly rebuild the full scalar-spin bank.
+        G = D[irr[:, None, None], c, lm[:, :, None], e, rn[:, None, :]]
+        G = jax.lax.optimization_barrier(G)
+        V = pl[:, :, None] * G * pr[:, None, :]
+        V = jnp.where((trs != 0)[:, None, None], jnp.conj(V), V)
+        w = jax.lax.optimization_barrier(coef[:, a, b, c, e])
+        return total + w[:, None, None] * V
+
+    out = jax.lax.fori_loop(0, ns * ns, add,
+                           jnp.zeros((irr.shape[0], mu_size, nu_size), D.dtype),
+                           unroll=False)
+    return jnp.conj(out)
+
+
+def _stream_pair_tiles(kgrid, ns, perm_l, phase_l, perm_r, phase_r,
+                       scale, left, right, shape, fft, ifft):
+    """Complete-P output, with <=2048 spatial columns of scalar-spin scratch."""
+    nk, mu, nu = shape
+    mt, nt = min(mu, 32), min(nu, 64)
+    nm, nn = (mu + mt - 1) // mt, (nu + nt - 1) // nt
+
+    def tile(i, out):
+        m = jax.lax.optimization_barrier(jnp.minimum((i // nn) * mt, mu - mt))
+        n = jax.lax.optimization_barrier(jnp.minimum((i % nn) * nt, nu - nt))
+        value = _stream_pair_components(
+            kgrid, ns, perm_l, phase_l, perm_r, phase_r, scale,
+            lambda a, b: left(a, b, m, mt, n, nt),
+            lambda a, b: right(a, b, m, mt, n, nt),
+            (nk, mt, nt), fft, ifft)
+        return jax.lax.dynamic_update_slice(out, value, (0, m, n))
+
+    return jax.lax.fori_loop(0, nm * nn, tile, jnp.zeros(shape, jnp.complex128), unroll=False)
+
+
+def _staged_kparent(mesh, kgrid, ns, perm_l, phase_l, perm_r, phase_r, scale):
+    fft, ifft = _staged_pair_ffts(mesh, kgrid)
+
+    def apply(D_l, D_r, tables):
+        _check_parent_operands(D_l, D_r, ns)
+        return _stream_pair_tiles(
+            kgrid, ns, perm_l, phase_l, perm_r, phase_r, scale,
+            lambda a, b, m, mt, n, nt: _parent_spin_component(D_l, tables, False, a, b, m, mt, n, nt),
+            lambda a, b, m, mt, n, nt: _parent_spin_component(D_r, tables, True, a, b, m, mt, n, nt),
+            (int(np.prod(kgrid)), int(D_l.shape[2]), int(D_l.shape[4])), fft, ifft)
+    return apply
+
+
 # ---- the router's pair-convolution factories --------------------------------
 
 # Kernel lessons: the zeta-fit pair convolution and plane FFT, modes 0, 1, 6 and 10 (numbers:
@@ -772,6 +891,21 @@ def make_fused_conv_kpair(
     nk = nkx * nky * nkz
     scale = conv_kpair_scale(norm, nk, mult)
     backend = kconv_backend(mesh)
+    if backend == "mathdx" and pair_resident_refusal(kgrid):
+        fft, ifft = _staged_pair_ffts(mesh, kgrid)
+
+        def _staged(A, B):
+            _check_pair_operands(A, B, (nkx, nky, nkz), ns)
+            Af, Bf = A.reshape((nk,) + A.shape[3:]), B.reshape((nk,) + B.shape[3:])
+            def component(X, a, b, m, mt, n, nt):
+                return jax.lax.dynamic_slice(X, (0, a, m, n, b), (nk, 1, mt, nt, 1))[:, 0, :, :, 0]
+            U = _stream_pair_tiles(
+                kgrid, ns, perm_l, phase_l, perm_r, phase_r, scale,
+                lambda a, b, m, mt, n, nt: component(Af, a, b, m, mt, n, nt),
+                lambda a, b, m, mt, n, nt: component(Bf, a, b, m, mt, n, nt),
+                (nk,) + A.shape[4:6], fft, ifft)
+            return U.reshape(A.shape[:3] + A.shape[4:6])
+        return _staged
     if backend == "mathdx":
         _require_target(KCONV_PAIR_TARGET, "CUDA")
         attrs = _mathdx_attrs(kgrid, ns, perm_l, phase_l, perm_r, phase_r, scale)
@@ -803,6 +937,8 @@ def make_fused_conv_kparent(mesh, kgrid, ns, trailing_shape, *,
     nk = nkx * nky * nkz
     scale = conv_kpair_scale("forward", nk, 1.0)
     backend = kconv_backend(mesh)
+    if backend == "mathdx" and pair_resident_refusal(kgrid):
+        return _staged_kparent(mesh, kgrid, ns, perm_l, phase_l, perm_r, phase_r, scale)
     if backend == "mathdx":
         _require_target(KCONV_PARENT_TARGET, "CUDA")
         attrs = _mathdx_attrs(kgrid, ns, perm_l, phase_l, perm_r, phase_r, scale)
@@ -843,6 +979,28 @@ def make_fused_conv_kplane(mesh, kgrid, ns, *, perm_l, phase_l, perm_r, phase_r)
     nkx, nky, nkz = (int(v) for v in kgrid)
     nk = nkx * nky * nkz
     scale = conv_kpair_scale("forward", nk, 1.0)
+    if kconv_backend(mesh) == "mathdx" and pair_resident_refusal(kgrid):
+        fft, ifft = _staged_pair_ffts(mesh, kgrid)
+
+        def _staged(D, F):
+            c = _check_plane_operands(D, F, nk, ns)
+            def component(a, b, offset, m, mt, n, nt):
+                # Gather only this spatial tile, including flattened(g,p) columns.
+                # A moveaxis/reshape of all g planes before slicing could copy a
+                # complete scalar-spin bank, defeating the scratch bound.
+                cols = n + jnp.arange(nt)
+                gv, pv = cols // D.shape[5], cols % D.shape[5]
+                rows = offset + m + jnp.arange(mt)
+                X = D[jnp.arange(nk)[:, None, None], gv[None, None, :], a,
+                      rows[None, :, None], b, pv[None, None, :]]
+                phase = F[:, gv, pv]
+                return jnp.conj(X * phase[:, None, :])
+            return _stream_pair_tiles(
+                kgrid, ns, perm_l, phase_l, perm_r, phase_r, scale,
+                lambda a, b, m, mt, n, nt: component(a, b, 0, m, mt, n, nt),
+                lambda a, b, m, mt, n, nt: component(a, b, c, m, mt, n, nt),
+                (nk, c, D.shape[1] * D.shape[5]), fft, ifft)
+        return _staged
     if kconv_backend(mesh) == "mathdx":
         _require_target(KCONV_PLANE_TARGET, "CUDA")
         attrs = _mathdx_attrs(kgrid, ns, perm_l, phase_l, perm_r, phase_r, scale)
