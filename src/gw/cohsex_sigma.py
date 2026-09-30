@@ -336,17 +336,20 @@ def lorentz_class_vertices(keys):
 
 
 def make_lorentz_convolution(mesh_xy: Mesh, kgrid, nk_tot: int, keys, left_plan,
-                             right_plan=None):
-    """The four-current Σ door: ``fn(parent_green, V) -> Σ_k``, read from the raw parents.
+                             right_plan=None, *, w_tables):
+    """The four-current Σ door: ``fn(parent_green, W, Wt) -> Σ_k``, read from the raw parents.
 
-        Σ_k = -1/√N_k · fftn( Σ_AB γ̃_A ifftn(Ĝ) γ̃_B† · ifftn(V)[:, x, A, y, B] )
+        Σ_k = -1/√N_k · fftn( Σ_AB γ̃_A ifftn(Ĝ) γ̃_B† · ifftn(Ŵ)[:, x, A, y, B] )
 
     ``parent_green`` is the :class:`gw.greens_function_kernel.ParentGreen` of
     the class (left endpoint ``left_plan``, right ``right_plan``, default the
-    same) and ``V`` ``(nk, mx, nA, my, nB)`` the class's blocks in k space;
-    ``Ĝ`` is its typed unfold, done on the convolution's load
-    (``common.fft_helpers.make_kconv_lorentz_unfold``: nvidia-mathdx mode 8 on
-    CUDA).  Σ_k leaves spin-major ``(n_parent, s, mu, s', nu)`` on the left
+    same); ``W`` ``(nq_irr, mx, nA, my, nB)`` and ``Wt`` are the class's
+    interaction and its partner on the irreducible q (the same builder's
+    parent pair), and ``w_tables`` their unfold (``symmetry_maps.unfold_load_tables``,
+    pair_transpose).  ``Ĝ`` and ``Ŵ`` are their typed unfolds, done on the
+    convolution's load (``common.fft_helpers.make_kconv_lorentz_unfold``:
+    nvidia-mathdx mode 8 on CUDA), so no full-k Green, full-q W or full-grid
+    W_R exists.  Σ_k leaves spin-major ``(n_parent, s, mu, s', nu)`` on the left
     plan's parent rows (``parent_full_rows``), the face projector's order;
     the other full-k rows are never stored.
     """
@@ -356,22 +359,22 @@ def make_lorentz_convolution(mesh_xy: Mesh, kgrid, nk_tot: int, keys, left_plan,
     lefts, rights = lorentz_class_vertices(keys)
     right = left_plan if right_plan is None else right_plan
     key = (_mesh_key(mesh_xy), tuple(int(v) for v in kgrid), ffi_dial_key(), int(nk_tot),
-           lefts, rights, id(left_plan), id(right))
+           lefts, rights, id(left_plan), id(right), id(w_tables))
     if key not in _lorentz_convolution_cache:
         tables = left_plan.unfold_load_tables(
             right_plan=None if right is left_plan else right)
         door = make_kconv_lorentz_unfold(
-            mesh_xy, kgrid, tables,
+            mesh_xy, kgrid, tables, w_tables,
             left_vertices=[gamma_perm_phase_host(A) for A in lefts],
             right_vertices=[gamma_perm_phase_host(B) for B in rights],
             store_rows=left_plan.parent_full_rows,
             norm='ortho', mult=-1.0 / np.sqrt(float(nk_tot)))
 
-        def convolve(parent_green, interactions):
-            return door(parent_green.G, parent_green.transpose, interactions,
+        def convolve(parent_green, W, Wt):
+            return door(parent_green.G, parent_green.transpose, W, Wt,
                         conj_partner=parent_green.conj_partner)
-        # The entry keeps both plans alive, so their ids cannot be reused.
-        _lorentz_convolution_cache[key] = (convolve, left_plan, right)
+        # The entry keeps both plans and the W tables alive, so their ids cannot be reused.
+        _lorentz_convolution_cache[key] = (convolve, left_plan, right, w_tables)
     return _lorentz_convolution_cache[key][0]
 
 
