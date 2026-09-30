@@ -6,7 +6,8 @@ square the condition number.  Relative-cut direction selection
 (``right_singular_vectors``) does, on the m x m normal matrix: its cut
 squared stays far above round-off, and it costs an eighth of the 2m
 dilation eigensolve.  Only the length-n singular-value vector is replicated;
-all matrix-shaped work stays two-dimensionally sharded at P('x','y').
+single-matrix work stays two-dimensionally sharded at P('x','y'). Independent
+batches may use the service's capacity-bounded batch ownership on all ranks.
 """
 from __future__ import annotations
 
@@ -676,7 +677,7 @@ class PolarPlan:
             raise ValueError("polar batched requires a nonempty (B,n,n) stack")
         _validate_dtype(A.dtype)
         face = NamedSharding(self.mesh, P(None, 'x', 'y'))
-        if not isinstance(A, jax.core.Tracer) and not _same_layout(A.sharding, face):
+        if not isinstance(A, jax.core.Tracer) and not _same_layout(getattr(A,'sharding',None), face):
             raise ValueError("polar batched requires A already at P(None,'x','y')")
         if self.route_for(A.shape, A.dtype) == ROUTE_BATCH_RESHARD:
             from distrib_la._batch_reshard import batch_reshard_call
