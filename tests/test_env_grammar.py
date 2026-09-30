@@ -40,10 +40,16 @@ containing the defect and asserts the auditor reports it.  An auditor
 that has never been shown failing is not evidence.
 """
 import ast
+import contextlib
 import importlib.util
 import os
 import sys
 import types
+
+try:
+    import pytest
+except ImportError:                   # plain ``python3`` on the login node
+    pytest = None
 
 _REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 _SRC = os.path.join(_REPO, "src")
@@ -74,6 +80,14 @@ def _pkg(name, relpath):
     return p
 
 
+# The stub packages live in ``sys.modules`` only while this file runs.  Left
+# installed, they outlive collection in the pytest worker, and a later test in
+# that process (the hsuite chain under P1 ``lx test``) then imports ``common``
+# as the stub: "cannot import name 'Meta' from 'common' (unknown location)".
+_OWNED_PACKAGES = ("common", "gw", "ffi")
+_before = {n: m for n, m in sys.modules.items()
+           if n.split(".")[0] in _OWNED_PACKAGES}
+
 _common = _pkg("common", "common")
 _common.units = _load_isolated("common.units", "common/units.py")
 _pkg("gw", "gw")
@@ -82,6 +96,38 @@ _pkg("ffi.common", "ffi/common")
 
 gw_config = _load_isolated("gw.gw_config", "gw/gw_config.py")
 gate = _load_isolated("ffi.gate", "ffi/gate.py")
+
+_STUBS = {n: m for n, m in sys.modules.items()
+          if n.split(".")[0] in _OWNED_PACKAGES and _before.get(n) is not m}
+
+
+@contextlib.contextmanager
+def _stubs_installed():
+    """Install this file's stub packages; restore the prior entries after."""
+    saved = {n: sys.modules.get(n) for n in _STUBS}
+    sys.modules.update(_STUBS)
+    try:
+        yield
+    finally:
+        for n, m in saved.items():
+            if m is None:
+                sys.modules.pop(n, None)
+            else:
+                sys.modules[n] = m
+
+
+for _n in _STUBS:                     # collection leaves sys.modules as found
+    if _n in _before:
+        sys.modules[_n] = _before[_n]
+    else:
+        del sys.modules[_n]
+
+if pytest is not None:
+    @pytest.fixture(autouse=True, scope="module")
+    def _isolated_stub_packages():
+        with _stubs_installed():
+            yield
+
 import runtime as _runtime            # noqa: E402  (os + subprocess only)
 
 
@@ -1072,7 +1118,8 @@ def _main():
     failed = []
     for name, fn in fns:
         try:
-            fn()
+            with _stubs_installed():
+                fn()
         except Exception as exc:            # noqa: BLE001 — this IS the tally
             failed.append((name, exc))
             print("FAIL %s\n     %s: %s" % (name, type(exc).__name__, exc))
