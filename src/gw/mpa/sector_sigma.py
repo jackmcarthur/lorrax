@@ -394,17 +394,13 @@ def _sector_stream_synthesis(readers,headers,bases,syms,layout,frequencies,meta,
 
 def sector_synthesis(readers, headers, bases, syms, layout, frequencies, meta, mesh_xy,
                      *, weights_fn=None, stage='sigma', spatial_workspace=0):
-    """Retain full-q endpoint factors and form one W(t) tile per tau.
+    """Synthesize coupled interactions at the consumer's bounded native door.
 
-    The store and symmetry services are called once at setup.  The factors
-    are placed once, with pole columns replicated (axis orientation) whenever
-    the capacity ledger admits it, so each tau is a local GEMM; otherwise the
-    configured ``layout`` (the endpoint families' Green layout) is kept.
-    ``syms`` are the endpoint families' symmetry maps (a current endpoint's
-    Cartesian action; a charge endpoint reads none).  ``weights_fn`` is d:
-    the causal d(t) by default, the omega = 0 coefficient for
-    :func:`sector_static_wc`, whose ledger stages ``stage`` prefixes.
-    Occupied windows use conj(B_A(-q)) d(t) B_B(-q)^T; d is never conjugated.
+    Sigma retains all-P parent faces and produces one scalar Lorentz
+    component from parent-q and pole-column panels. Static W0 retains its
+    existing operator-array contract and all-P face factors. Endpoint
+    symmetry may mix current components before scalar selection. Occupied
+    windows use conj(B_A(-q)) d(t) B_B(-q)^T; d is never conjugated.
     """
     if stage=='sigma' and weights_fn is None:
         return _sector_stream_synthesis(readers,headers,bases,syms,layout,frequencies,meta,mesh_xy,
