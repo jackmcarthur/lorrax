@@ -94,6 +94,14 @@ _CANDIDATE_GAMMA_MODES = ("charge", "transverse")
 
 
 @partial(jax.jit, static_argnums=(1,))
+def _shard_bytes(*arrays) -> int:
+    """Per-rank bytes of the distinct live ``arrays``, priced from their shard shapes
+    (the same on every rank; never an allocator reading)."""
+    live = {id(a): a for a in arrays if a is not None}
+    return sum(int(np.prod(a.sharding.shard_shape(a.shape))) * a.dtype.itemsize
+               for a in live.values())
+
+
 def _logical_gram_diagonal_extrema(G, n_logical: int):
     """Return extrema of the logical diagonal of a distributed Gram matrix."""
     diagonal = jnp.real(jnp.diag(G))[:n_logical]
@@ -1837,11 +1845,13 @@ def _build_gram_q0_kbatch(
             psi_r_rmu_Y, psi_r_rmuT_X = psi_l_rmu_Y, psi_l_rmuT_X
         elif left_slice is None:
             with timing.section("right.load"):
+                # The left faces stay on device beside this load.
                 psi_r_rmu_Y, psi_r_rmuT_X = load_centroids_band_chunked(
                     wfn, sym, meta, cand_idx, bispinor, mesh_xy,
                     right_range,
                     band_chunk_size=band_chunk_size,
                     k_chunk_size=prune_k_tile, full_k_rows=full_k_rows,
+                    resident_bytes=_shard_bytes(psi_l_rmu_Y, psi_l_rmuT_X),
                 )
                 if norms_r_j is not None:
                     psi_r_rmu_Y = psi_r_rmu_Y / norms_r_j[None, :, None, None]
@@ -1968,10 +1978,12 @@ def _build_gram_q0_kbatch(
     else:
         if left_slice is None:
             with timing.section("right.load"):
+                # The left pair density stays on device beside this load.
                 psi_r_rmu_Y, psi_r_rmuT_X = load_centroids_band_chunked(
                     wfn, sym, meta, cand_idx, bispinor, mesh_xy, right_range,
                     band_chunk_size=band_chunk_size,
                     k_chunk_size=prune_k_tile, full_k_rows=full_k_rows,
+                    resident_bytes=_shard_bytes(P_l_k),
                 )
                 if norms_r_j is not None:
                     psi_r_rmu_Y = (

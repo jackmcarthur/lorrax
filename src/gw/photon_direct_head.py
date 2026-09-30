@@ -441,6 +441,15 @@ def _gamma_sample_stream(geometry, kgrid, chunk_size):
     return held
 
 
+def _gamma_resident_bytes(operands) -> float:
+    """The priced resident set beside a direct-Γ call: the shards of its fixed
+    operands (from their shapes) plus the measured runtime reserve."""
+    from runtime.aot_memory import runtime_reserve_bytes
+    return float(runtime_reserve_bytes() + sum(
+        int(np.prod(x.sharding.shard_shape(x.shape))) * x.dtype.itemsize
+        for x in jax.tree_util.tree_leaves(operands) if hasattr(x, "sharding")))
+
+
 def direct_gamma_chunk_plan(mesh, operands, *, nsamples):
     """(chunk, sharding) of the direct-Γ cubature calls.
 
@@ -450,10 +459,12 @@ def direct_gamma_chunk_plan(mesh, operands, *, nsamples):
     (``_GAMMA_MIN_LOCAL`` samples per rank, and at least the sphere rule's
     points) and doubles while it stays within ``nsamples`` (one call per
     replicate) and its compiled footprint, priced at the floor and scaled per
-    sample, fits ``_GAMMA_ROOM_FRACTION`` of the stage room
-    (``common.gpu_utils.device_room_bytes``).  Every process enters.
+    sample, fits ``_GAMMA_ROOM_FRACTION`` of the stage room: the run budget
+    (``memory_per_device_gb``) less the priced resident set
+    (:func:`_gamma_resident_bytes`), never live allocator bytes, so every rank
+    sizes the same chunk.
     """
-    from common.gpu_utils import device_budget_bytes, device_room_bytes, record_stage_price
+    from common.gpu_utils import device_budget_bytes, record_stage_price
     n_dev = int(mesh.devices.size)
     split = NamedSharding(mesh, P(tuple(mesh.axis_names)))
     probe = n_dev * _GAMMA_MIN_LOCAL
@@ -467,15 +478,15 @@ def direct_gamma_chunk_plan(mesh, operands, *, nsamples):
     # q, D and weight rows (the fixed operands and the 4x4 outputs do not scale).
     per_sample = max(float(getattr(memory, "temp_size_in_bytes", 0)) / probe, 0.0) \
         + 8.0 * (3 + 16 + 1) / n_dev
-    live_room = float(device_room_bytes())
-    room = _GAMMA_ROOM_FRACTION * live_room
+    live = _gamma_resident_bytes(operands)
+    room = _GAMMA_ROOM_FRACTION * max(0.0, device_budget_bytes() - live)
     floor = max(probe, _GAMMA_SPHERE_POINTS)
     chunk = floor
     while chunk * 2 <= int(nsamples) and chunk * 2 * per_sample <= room:
         chunk *= 2
     chunk = min(max(chunk, floor), max(int(nsamples), floor))
     record_stage_price(f"direct Gamma head, chunk {chunk} over {n_dev} ranks",
-                       device_budget_bytes() - live_room + chunk * per_sample)
+                       live + chunk * per_sample)
     return int(chunk), split
 
 
@@ -556,7 +567,7 @@ def _slab_gamma_cell_average(geometry, kgrid, operands, mesh, cell_volume):
     those of the scalar charge head and the bare TT Γ tile.
     """
     from common.collectives import device_put_process_local
-    from common.gpu_utils import device_budget_bytes, device_room_bytes, record_stage_price
+    from common.gpu_utils import record_stage_price
     from vcoul import get_kernel, slab_minibz_graded_photon_cubature
 
     receipt = slab_minibz_graded_photon_cubature(get_kernel(2), geometry, kgrid)
@@ -571,7 +582,7 @@ def _slab_gamma_cell_average(geometry, kgrid, operands, mesh, cell_volume):
         sds((rows,), jnp.float64, sharding=split), *operands).compile()
     temp = float(getattr(compiled.memory_analysis(), "temp_size_in_bytes", 0))
     record_stage_price(f"direct Gamma head, slab polygon {rows} nodes over {n_dev} ranks",
-                       device_budget_bytes() - device_room_bytes() + temp
+                       _gamma_resident_bytes(operands) + temp
                        + 8.0 * (3 + 16 + 1) * rows / n_dev)
     ladder = []
     for chunk in receipt.chunks:
