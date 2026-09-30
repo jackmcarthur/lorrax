@@ -109,10 +109,11 @@ The result is `1 passed` in about 5 min on cold caches.
 `LORRAX_FFI_HOST_SO` point into a single
 [sealed bundle](../architecture/ffi_layout.md#2c-the-deployable-unit-is-one-sealed-pair).
 The `lx` launcher (`lx run <cmd>`, `lx test`) loads it on a compute node.
-Neither `lx` nor the module is in this repository; both live in the
-maintainers' project space. The bundle's CUDA leg is built by
-`config/perlmutter/build_ffi_cuda.sh`, and its sealing and publication follow
-[machines/perlmutter.md §2](../environment/machines/perlmutter.md#2-the-lorrax_a-module-and-the-ffi-bundle).
+`lx` is m4598 tooling and is not in this repository. The module's recipe is
+`config/perlmutter/module/`: venv, build and seal, acceptance and
+publication, for any install prefix
+([Perlmutter module](perlmutter-module.md), which also shows the module used
+with plain `srun`).
 
 A private pair replaces the module's bundle only as a pair: pin both legs to
 one sealed bundle. Pinning one leg, or mixing a private leg with the module's,

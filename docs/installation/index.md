@@ -14,7 +14,7 @@ pins; [ffi_layout.md](../architecture/ffi_layout.md) owns the native design.
 
 | platform | route | page |
 |---|---|---|
-| NERSC Perlmutter (A100, CUDA 13.2, JAX 0.9.1) | `uv sync --extra cuda13`, build both legs with `config/perlmutter/build_ffi_{host,cuda}.sh`, launch with `srun`; project m4598 can use the `lorrax_A` module and `lx` instead | [Perlmutter](perlmutter.md) |
+| NERSC Perlmutter (A100, CUDA 13.2, JAX 0.9.1) | the default is a module: a venv, a source snapshot and a sealed pair, built by `config/perlmutter/module/`. A clone also works: `uv sync --extra cuda13`, build both legs with `config/perlmutter/build_ffi_{host,cuda}.sh`, launch with `srun` | [Perlmutter module](perlmutter-module.md) (maintainers); [Perlmutter](perlmutter.md) (clone) |
 | TACC Frontera (CPU) | build the host leg with `config/frontera/build_ffi_host.sh` | [Frontera](../environment/machines/frontera.md), `config/frontera/README.md` |
 | another site | build both legs from the stage scripts and seal them | [Building the FFI libraries](../building_ffi.md), [FFI native libraries](ffi-native-libs.md) |
 
