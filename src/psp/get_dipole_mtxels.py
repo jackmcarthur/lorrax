@@ -1372,7 +1372,10 @@ def main(argv=None):
 				                           item_shape=(3, nb, nb),
 				                           label="dipole", owner_only=False)
 		else:
-			if debug and jax.process_index() == 0:
+			# Every rank runs the debug block: its jit goes through compile
+			# agreement, so a rank-0-only call hangs P > 1 (INVARIANTS 21).
+			# debug_print already writes on rank 0 only.
+			if debug:
 				_dipole_block(debug_kindex)     # the table, nothing else
 			nk_file = int(sym.nk_red)
 			gtab_file = padded_gvectors(wfn, k="ibz")
