@@ -79,12 +79,12 @@ the dataset's extent.
 
 **Bounded compact-row reads.** When the requested layout uses every mesh
 axis on dimensions after a replicated split axis, the same file-order
-planner bounds each rank's read piece to64MiB. The native reader reads only
+planner bounds each rank's read piece to 64 MiB. The native reader reads only
 its compact logical rows; device code pads the later dimensions and reverses
 the writer's volume-preserving exchanges into the requested sharding. Each
 insertion donates the resident output, whose size is the carrier bytes/P.
-For the Ni link carrier8000×3×232² atP4, the compiled insertion adds129MB
-of device scratch beside its64MiB piece and5.17GB donated output. The
+For the Ni link carrier 8000×3×232² at P4, the compiled insertion adds 129 MB
+of device scratch beside its 64 MiB piece and 5.17 GB donated output. The
 memory bound applies to layouts accepted by the planner; tiny/short file
 runs, replicated or unsupported layouts, and rows larger than the piece
 budget retain the ordinary collective reader. No caller setting changes.
