@@ -252,6 +252,13 @@ crosses the window edge: $f(H)_k$ is smooth in k and $f(H)_R$ short-ranged. `isd
 states by deterministic randomized QRCP and projects every state into that one
 gauge; the WFN transforms stream the G→r work.
 
+Uniform spin operators use the same physical basis $B=L^{-1}X$, with $X$
+containing only the selected pivot states. Owner-balanced pivot groups use
+the shared WFN row transform, whose measured FFT workspace and live row
+payload bound each real-space slab; the unselected k/band table is not
+transformed for this projection. Consumers that retain band wavefunctions
+continue to stream those bands alongside the basis.
+
 The returned window is $(n_\mathrm{elec} - n_\mathrm{val}, n_\mathrm{elec} + n_\mathrm{cond})$.
 Standalone output requires `nval = nelec`: an omitted lower occupied boundary
 can reproduce the samples and still ring between them. `--guard-bands` extra
