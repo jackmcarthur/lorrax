@@ -693,6 +693,24 @@ def finalize_dynamic_sigma(
                 band_axis=sigma_band_axis, out_of_grid=config.sigma.out_of_grid)
             _qu._EXP_OCCTAIL_D = (np.asarray(_g2h(_sig_ef), dtype=np.complex128)
                                   - np.asarray(_g2h(sigma_xc_qsgw), dtype=np.complex128))
+            if os.environ.get("LORRAX_EXP_OCCTAIL_ROW", "0") == "1":
+                # Row-energy reading: D[v, t] = [Sigma_xc(E_v)]^h_vt - Sigma^QSGW_vt for QP rows
+                # v < nocc, t >= b3 (one build per v with the tail columns' energies set to E_v,
+                # so the half-sum is exact); Hermitian D, zero elsewhere.
+                _b3 = int(os.environ["LORRAX_EXP_LOWDIN"])
+                _nocc = int(os.environ.get("LORRAX_EXP_OCCTAIL_NOCC", "8"))
+                _E = np.asarray(e_qp_rel_ev, dtype=np.float64)
+                _S = np.asarray(_g2h(sigma_xc_qsgw), dtype=np.complex128)
+                _D = np.zeros_like(_S)
+                for _v in range(_nocc):
+                    _Ev = _E.copy(); _Ev[:, _b3:] = _E[:, _v][:, None]
+                    _sv, _ = build_qsgw_sigma_xc(
+                        sigma_c_omega, sig_x_rep, omega_grid_ev, _Ev, mesh_xy,
+                        band_axis=sigma_band_axis, out_of_grid=config.sigma.out_of_grid)
+                    _sv = np.asarray(_g2h(_sv), dtype=np.complex128)
+                    _D[:, _v, _b3:] = _sv[:, _v, _b3:] - _S[:, _v, _b3:]
+                    _D[:, _b3:, _v] = np.conj(_D[:, _v, _b3:])
+                _qu._EXP_OCCTAIL_D = _D
 
         sigma_lorentz = None
         if sigma_lorentz_static_skij_ry is not None:

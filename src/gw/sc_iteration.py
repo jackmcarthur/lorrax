@@ -4397,7 +4397,15 @@ def _exp_lowdin_fold(H, inputs, state, ks, partition, scissor_classes,
         if os.environ.get("LORRAX_EXP_OCCTAIL_MODEA", "0") == "1":
             H_ef = Hn  # diagnostic: today's 1/2[Sigma(E_v) + Sigma(E_t)] occupied-tail elements
         vmask = np.asarray(valence_kn, dtype=bool)
-    ot_max, ot_diffmax = 0.0, 0.0
+    # EXPERIMENT OCCTAIL window arm: couple only tail t with E_DFT(t) - mu_DFT < LORRAX_EXP_OCCTAIL_TWIN_EV.
+    twin = os.environ.get("LORRAX_EXP_OCCTAIL_TWIN_EV")
+    if occtail and twin is not None:
+        _vm = np.asarray(valence_kn, dtype=bool)
+        mu_dft_ev = 0.5 * (float(e_dft_ev[_vm].max()) + float(e_dft_ev[~_vm].min()))
+        tail_on = (e_dft_ev[:, b:nb] - mu_dft_ev) < float(twin)
+    else:
+        tail_on = np.ones((nk, nb - b), dtype=bool)
+    ot_max, ot_diffmax, ot_ncol = 0.0, 0.0, 0
     dmin, fmax = np.inf, 0.0
     for k in range(nk):
         e, V = np.linalg.eigh(Hpp[k])
@@ -4412,17 +4420,20 @@ def _exp_lowdin_fold(H, inputs, state, ks, partition, scissor_classes,
             v = np.nonzero(vmask[k, :b])[0]
             blk = 0.5 * (H_ef[k][np.ix_(v, np.arange(b, nb))]
                          + H_ef[k][np.ix_(np.arange(b, nb), v)].conj().T)
+            blk = blk * tail_on[k][None, :]
             out[k][np.ix_(v, np.arange(b, nb))] = blk
             out[k][np.ix_(np.arange(b, nb), v)] = blk.conj().T
             ot_max = max(ot_max, float(np.abs(blk).max()))
             ot_diffmax = max(ot_diffmax, float(np.abs(blk - Hn[k][np.ix_(v, np.arange(b, nb))]).max()))
+            ot_ncol = int(tail_on[k].sum()) if k == 0 else ot_ncol
     _record_sc(inputs, f"    LOWDIN EXPERIMENT b3={b} fold={'on' if fold_on else 'off'} map "
                f"{int(state.iteration)}: tail alpha={getattr(fit, 'alpha_c', 1.0):+.4f} "
                f"beta={getattr(fit, 'beta_c_ev', 0.0):+.4f} eV {note}; min|e_p-E_t| "
                f"{dmin * RYD_TO_EV:.4f} eV; max|fold_aa| {fmax * RYD_TO_EV * 1e3:.2f} meV; "
                f"max|H_pt| {np.abs(Hpt).max() * RYD_TO_EV * 1e3:.2f} meV"
                + (f"; OCCTAIL max|H_vt(E_F)| {ot_max * RYD_TO_EV * 1e3:.2f} meV, "
-                  f"max|H_vt(E_F) - H_vt(modeA)| {ot_diffmax * RYD_TO_EV * 1e3:.2f} meV"
+                  f"max|H_vt(E_F) - H_vt(modeA)| {ot_diffmax * RYD_TO_EV * 1e3:.2f} meV, "
+                  f"coupled tail cols at k0 {ot_ncol}"
                   if occtail else ""))
     return device_put_process_local(out.astype(np.asarray(Hn).dtype), H.sharding)
 
