@@ -2182,7 +2182,12 @@ def _load_static_photon_hall(
                 flush=True)
         return None
 
-    from file_io.static_gauge_head import load_static_gauge_hall_artifact
+    from file_io.static_gauge_head import (
+        hall_operator_stamps, load_static_gauge_hall_artifact)
+    from psp.get_dipole_mtxels import resolve_vnl_velocity_sign
+    from common.four_current_model import resolve_four_current_representation
+    representation = resolve_four_current_representation(
+        bool(config.bispinor), config.bispinor_gw)
     hall = load_static_gauge_hall_artifact(
         hall_path,
         mesh_xy=mesh_xy,
@@ -2190,6 +2195,11 @@ def _load_static_photon_hall(
         expected_band_start=int(meta.b_id_0),
         expected_band_stop=int(meta.b_id_4_chi_user),
         expected_nk_tot=int(meta.nk_tot),
+        expected_operator=hall_operator_stamps(
+            skip_vnl=False, vnl_mode="analytic",
+            vnl_velocity_sign=resolve_vnl_velocity_sign(
+                None, config.vnl_velocity_sign),
+            kinetic_balance_lift=representation.current_lift or "raw"),
         wfn_fingerprint_binding=wfn_fingerprint_binding,
     )
     sigma_h = np.asarray(jax.device_get(hall.sigma_H), dtype=np.float64)

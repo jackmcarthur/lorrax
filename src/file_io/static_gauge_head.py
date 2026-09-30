@@ -32,7 +32,24 @@ from common.parallel_transport import (
 from file_io.slab_io import SlabIO
 
 
-STATIC_GAUGE_HALL_SCHEMA_VERSION = 1
+STATIC_GAUGE_HALL_SCHEMA_VERSION = 2   # v2: velocity-operator stamps
+
+
+def hall_operator_stamps(*, skip_vnl, vnl_mode, vnl_velocity_sign,
+                         kinetic_balance_lift) -> dict:
+    """The velocity-operator stamps a Hall artifact is written and read with.
+
+    The same three names ``dipole.h5`` carries (``prov_skip_vnl``,
+    ``prov_vnl_mode``, ``prov_vnl_velocity_sign``) plus the kinetic-balance
+    lift provenance of the current.  One owner for the producer and the
+    consumer, so neither restates the grammar.
+    """
+    from common.bispinor_init import kinetic_balance_lift_provenance
+    return {"prov_skip_vnl": bool(skip_vnl),
+            "prov_vnl_mode": str(vnl_mode),
+            "prov_vnl_velocity_sign": float(vnl_velocity_sign),
+            "prov_kinetic_balance_lift": kinetic_balance_lift_provenance(
+                kinetic_balance_lift)}
 
 
 def _require_prefixed_sha256(value: str, *, field_name: str) -> str:
@@ -157,6 +174,7 @@ def write_static_gauge_hall_artifact(
     hall_transaction,
     *,
     mesh_xy: Mesh,
+    operator_stamps: dict,
 ) -> None:
     """Collectively persist the sealed three-number Hall transaction.
 
@@ -196,6 +214,14 @@ def write_static_gauge_hall_artifact(
         io.write_attr("band_stop", np.int32(stop))
         io.write_attr("nk_tot", np.int32(nk_tot))
         io.write_attr("sigma_H_cart", sigma_H)
+        io.write_attr("prov_skip_vnl",
+                      np.int32(bool(operator_stamps["prov_skip_vnl"])))
+        io.write_attr("prov_vnl_mode",
+                      _text_i32(operator_stamps["prov_vnl_mode"], encoding="ascii"))
+        io.write_attr("prov_vnl_velocity_sign",
+                      np.float64(operator_stamps["prov_vnl_velocity_sign"]))
+        io.write_attr("prov_kinetic_balance_lift",
+                      _text_i32(operator_stamps["prov_kinetic_balance_lift"]))
 
     _publish_completed_partial(
         partial_path, final_path, artifact_name="StaticGaugeHall",
@@ -210,6 +236,7 @@ def load_static_gauge_hall_artifact(
     expected_band_start: int,
     expected_band_stop: int,
     expected_nk_tot: int,
+    expected_operator: dict,
     wfn_fingerprint_binding=None,
 ):
     """Validate and load one immutable Hall transaction artifact.
@@ -269,6 +296,18 @@ def load_static_gauge_hall_artifact(
         nk_tot = int(np.asarray(_read_required_small(io, "nk_tot")))
         sigma_H = np.asarray(
             _read_required_small(io, "sigma_H_cart"), dtype=np.float64)
+        stamps = {
+            "prov_skip_vnl": bool(int(np.asarray(
+                _read_required_small(io, "prov_skip_vnl")))),
+            "prov_vnl_mode": _decode_i32_text(
+                _read_required_small(io, "prov_vnl_mode"),
+                field_name="prov_vnl_mode", encoding="ascii"),
+            "prov_vnl_velocity_sign": float(np.asarray(
+                _read_required_small(io, "prov_vnl_velocity_sign"))),
+            "prov_kinetic_balance_lift": _decode_i32_text(
+                _read_required_small(io, "prov_kinetic_balance_lift"),
+                field_name="prov_kinetic_balance_lift", encoding="utf-8"),
+        }
 
     if complete != 1:
         raise ValueError(
@@ -289,6 +328,23 @@ def load_static_gauge_hall_artifact(
     if sigma_H.shape != (3,) or not np.all(np.isfinite(sigma_H)):
         raise ValueError(
             "StaticGaugeHall sigma_H_cart must contain three finite values")
+    bad = [(k, stamps[k], v) for k, v in expected_operator.items()
+           if stamps.get(k) != v]
+    if bad:
+        detail = "; ".join(f"{k}: file={got!r} run={want!r}"
+                           for k, got, want in bad)
+        raise ValueError(
+            "GATE static_gauge_hall_operator: the Hall artifact was built "
+            "with a different velocity operator.\n"
+            f"  got:  static_gauge_hall_file = {str(artifact_path)!r}; {detail}\n"
+            "  want: the deck's operator (V_NL included, analytic arm, the "
+            "deck's vnl_velocity_sign, the run's kinetic-balance lift); "
+            "regenerate with python -m psp.get_dipole_mtxels -i <deck> "
+            "--static-gauge-hall-only --static-gauge-hall-out <file>\n"
+            "  why:  the charge response reads dipole.h5 under the deck's "
+            "operator; a Hall term from another operator would enter the "
+            "same head with no symptom\n"
+            "  doc:  docs/input_reference.md, static_gauge_hall_file.")
     operator_fingerprint = _require_prefixed_sha256(
         operator_fingerprint,
         field_name="Hall Hamiltonian/config/operator fingerprint")
@@ -306,6 +362,7 @@ def load_static_gauge_hall_artifact(
 
 __all__ = [
     "STATIC_GAUGE_HALL_SCHEMA_VERSION",
+    "hall_operator_stamps",
     "load_static_gauge_hall_artifact",
     "write_static_gauge_hall_artifact",
 ]
