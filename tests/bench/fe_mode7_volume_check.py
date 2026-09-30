@@ -19,7 +19,7 @@ ap=argparse.ArgumentParser();ap.add_argument('--wfn',required=True);ap.add_argum
 def main():
  w=WFNReader(a.wfn,mesh=R.mesh,qe_schema=a.schema);s=w.symmetry();kg=tuple(map(int,w.kgrid));np_=int(w.nkpts);m=600;ns=2;nk=int(np.prod(kg));nsp=int(w.ntran)
  assert kg==(20,20,20) and np_==1062 and not np.any(np.asarray(s.sym_idx_k)>=nsp)
- plan=CentroidKUnfoldPlan(R.mesh,identity_square_grouped_shard_layout(m,m,(2,2)),np.asarray(s.irr_idx_k),np.asarray(s.sym_idx_k),np.tile(np.arange(m),(2*nsp,1)),np.zeros((2*nsp,m,3)),np.asarray(s.unfolded_kpts)[np.asarray(s.kirr_fullids)],np.asarray(s.spinor_action(s.sym_idx_k,nspinor=ns)),nsp,ns)
+ plan=CentroidKUnfoldPlan(R.mesh,identity_square_grouped_shard_layout(m,m,(2,2)),np.asarray(s.irr_idx_k),np.asarray(s.sym_idx_k),np.tile(np.arange(m),(2*nsp,1)),np.zeros((2*nsp,m,3)),np.asarray(s.unfolded_kpts)[np.asarray(s.kirr_fullids)],np.asarray(s.spinor_action(s.sym_idx_k,nspinor=ns)),nsp,ns,parent_full_rows=np.asarray(s.kirr_fullids,dtype=np.int32))
  conv=make_kconv_klead_unfold(R.mesh,kg,plan.unfold_load_tables(),store_rows=plan.parent_full_rows,mult=-1/np.sqrt(nk))
  fn=jax.jit(lambda g,v:conv(g,None,v,conj_partner=True))
  gs=NamedSharding(R.mesh,P(None,'x',None,'y',None));vs=NamedSharding(R.mesh,P(None,'x','y'))
