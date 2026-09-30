@@ -522,13 +522,17 @@ def sector_synthesis(readers, headers, bases, syms, layout, frequencies, meta, m
                       ('w',mesh_xy,tuple(left['grid']),nk,m,nc,n,nt,kcarrier,layout),ordered=True)
 
 
-_CONSTANT_COMPONENT_CONTRACT = {}
+def _constant_component_contract(tau, rows, nk, m, n, contracts, slot):
+    """The constant panel's program; retains geometry/physics, never wavefunction buffers.
 
-
-def _constant_component_contract(tau, rows, nk, m, n):
-    """Stable immutable program; retains geometry/physics, never wavefunction buffers."""
+    ``contracts`` is the caller's store (the SC run's session), one entry per
+    ``slot``. An entry serves only the very plan objects it was built for;
+    any other configuration replaces it, so no plan outlives its run.
+    """
     key=(tau._key,tuple(map(int,rows)),int(nk),int(m),int(n))
-    if key not in _CONSTANT_COMPONENT_CONTRACT:
+    hit=contracts.get(slot)
+    if (hit is None or hit[0]!=key
+            or any(p is not q for p,q in zip(hit[1],tau._plans))):
         spatial=tau._spatial
         mesh=tau._plans[0].mesh_xy
         class ConstantComponents:
@@ -540,12 +544,12 @@ def _constant_component_contract(tau, rows, nk, m, n):
         @jax.jit
         def contract(xn,yr,xr,yn,energy,weight,data):
             return spatial(xn,yr,xr,yn,energy,weight,0.,0.,ConstantComponents(data))
-        _CONSTANT_COMPONENT_CONTRACT[key]=(tau._plans,contract)
-    return _CONSTANT_COMPONENT_CONTRACT[key][1]
+        contracts[slot]=hit=(key,tau._plans,contract)
+    return hit[2]
 
 
 def instantaneous_sector_sigma(handle, families, bases, meta, mesh_xy, *,
-                               occupation_state, return_components=False):
+                               occupation_state, return_components=False, contracts=None):
     """Equal-time W_infinity-V, from bounded native q panels and Dirac quarters.
 
     Read each packed parent panel once. Its Lorentz mixing remains coupled;
@@ -621,7 +625,8 @@ def instantaneous_sector_sigma(handle, families, bases, meta, mesh_xy, *,
                 synthesis=SimpleNamespace(native=0)
                 tau=factories[a,b](synthesis,axis)
                 m,n=bases[a].n_packed,bases[b].n_packed
-                contract=_constant_component_contract(tau,rows,meta.nk_tot,m,n)
+                contract=_constant_component_contract(tau,rows,meta.nk_tot,m,n,
+                    {} if contracts is None else contracts,(a,b,lo,hi))
                 args=(xn,tau._right[0],pad_to_axis(xr,axis,axis=1),tau._right[1],energy,weight,children)
                 _admit_compiled(contract,args,meta,f'sigma.sector.constant.{lo}.{keys[0]}',native=tau._native)
                 value=contract(*args)
@@ -730,9 +735,11 @@ def compute_sector_sigma(handle, families, bases, meta, mesh_xy, *,
         hold_resident_model(held,meta,ResidentSectorModel.payload_bytes(
             mesh_xy,cc['n_q_irr'],bases[0].n_canonical,cc['Kmax']),
             stage=f"{handle['model_stage']}.CC")
+    sessions=options.get('fixed_quadrature_session')
     constant=instantaneous_sector_sigma(handle['constant'],families,bases,meta,mesh_xy,
         occupation_state=options.get('occupation_state'),
-        return_components=on_shell is not None)
+        return_components=on_shell is not None,
+        contracts=None if sessions is None else sessions.setdefault('sector_constant_contracts',{}))
     if on_shell is not None:
         constant, ct_constant, tt_constant=constant
         for channel, part in enumerate((ct_constant, tt_constant)):
