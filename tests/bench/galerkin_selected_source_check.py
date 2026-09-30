@@ -138,8 +138,12 @@ def main():
                     spin_projection=project_galerkin_spin_operator(source,basis,meta,mesh,
                         spin_operator=np.asarray(physical_spin),q_tile_budget=4096)
             spin_got=np.asarray(gather_to_host(spin_projection.operator))
-            spin_error=float(np.linalg.norm(spin_got-spin_reference)/
-                             np.linalg.norm(spin_reference))
+            # Sz can cancel in this fixture's excited-state subset. Scale
+            # its absolute error by the complete positive carrier metric,
+            # the same physical scale used for normalized expectations.
+            spin_absolute=float(np.linalg.norm(spin_got-spin_reference))
+            spin_error=spin_absolute/float(np.linalg.norm(metric))
+            spin_reference_scale=float(np.linalg.norm(spin_reference)/np.linalg.norm(metric))
             assert spin_error<5e-12,spin_error
             if bispinor:
                 pauli_only=np.einsum('asr,s,bsr->ab',legacy.conj(),
@@ -153,6 +157,8 @@ def main():
                 basis_relative_error=rel,operator_relative_error=error,
                 metric_relative_error=norm_error,source_calls=source_calls,
                 physical_spin_relative_error=spin_error,
+                physical_spin_absolute_error=spin_absolute,
+                physical_spin_reference_metric_scale=spin_reference_scale,
                 qp_frame_delta_relative_error=qp_delta_error,
                 wall_seconds=time.monotonic()-start)
             receipts.append(row)
