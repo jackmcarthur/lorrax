@@ -102,6 +102,14 @@ try:
             assert not refuse
         except MemoryError as exc:
             assert refuse and 'GATE compiled_chunk_capacity' in str(exc)
+    # A conservative analytic estimate is never authorization to overflow.
+    aot_memory.compiled_new_bytes=lambda compiled,**kw:11
+    try:
+        aot_memory.check_chunk(2,build=lambda c:object(),compiled=object(),fixed=0,
+                              per_unit=6,room=10,stage='nonminimum-negative-control')
+        raise AssertionError('accepted an over-budget nonminimum executable')
+    except MemoryError as exc:
+        assert 'GATE compiled_chunk_capacity' in str(exc)
 finally:aot_memory.compiled_new_bytes=original
 if jax.process_index()==0:
     (out/'result.json').write_text(json.dumps(results,indent=2)+'\n')
