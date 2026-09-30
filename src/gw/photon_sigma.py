@@ -113,12 +113,14 @@ def _require_packed_operator(name, packed, mesh_xy):
 
 
 def _make_photon_static_class_kernel(
-    mesh_xy, kgrid, nk_tot, wfns_left, wfns_right, keys, *, with_head=False,
+    mesh_xy, kgrid, nk_tot, wfns_left, wfns_right, keys, *, with_head=False, w_tables=None,
 ):
     """Share the parent Green, its one transform and the projection across one Lorentz class.
 
     ``keys`` are the class's blocks, one ``A x B`` product; the interaction
-    operand is ``(nk, mx, nA, my, nB)`` (:func:`_make_photon_class_restore`).
+    operand is ``(nk, mx, nA, my, nB)`` (:func:`_make_photon_class_restore`),
+    or, with ``w_tables``, the pair ``(W, Wt)`` on the irreducible q that the
+    door unfolds on its load (``gw.mpa.sector_sigma.instantaneous_sector_sigma``).
     """
     from ffi import ffi_dial_key
     from common.contract_bands import contract_bands_block_reshard
@@ -132,7 +134,7 @@ def _make_photon_static_class_kernel(
     shapes = tuple((p.n_parent, c.psi_nmu.shape[1], p.n_centroid_packed, p.nspinor)
                    for c, p in zip((left, right), plans))
     key = (_mesh_key(mesh_xy), tuple(kgrid), tuple(map(id, plans)), shapes, layout, ffi_dial_key(),
-           keys, with_head)
+           keys, with_head, id(w_tables))
     if key in _photon_sigma_kernel_cache:
         return _photon_sigma_kernel_cache[key]
     plan_key = ("plans", _mesh_key(mesh_xy), tuple(kgrid), nk_tot, shapes, layout, ffi_dial_key())
@@ -143,7 +145,8 @@ def _make_photon_static_class_kernel(
             n=shapes[1][2]*shapes[1][3], nq=shapes[0][0], dtype=jnp.complex128, layout=layout)
         _photon_sigma_kernel_cache[plan_key] = project, g_plan
     project, g_plan = _photon_sigma_kernel_cache[plan_key]
-    convolve = make_lorentz_convolution(mesh_xy, kgrid, nk_tot, keys, plans[0], plans[1])
+    convolve = make_lorentz_convolution(mesh_xy, kgrid, nk_tot, keys, plans[0], plans[1],
+                                        w_tables=w_tables)
     head_product = make_lorentz_q0_product(nk_tot) if with_head else None
     rows = np.asarray(plans[0].parent_full_rows)
     @jax.jit
@@ -153,7 +156,8 @@ def _make_photon_static_class_kernel(
         green = build_G_parents(left.psi_mun, right.psi_nmu, phases=jnp.real(weights),
                                 layout=layout, gemm=g_plan, k_unfold_plan=plans[0])
         # The prefactor is -1/2 or 1: an exact power of two, applied after the door.
-        sigma = factor * convolve(green, interaction)
+        sigma = factor * (convolve(green, *interaction) if w_tables is not None
+                          else convolve(green, interaction))
         result = project(left.projection_faces()[0], sigma, right.projection_faces()[1])
         if with_head:
             # The q -> 0 head is a pointwise product on the unfolded Green.
@@ -163,7 +167,10 @@ def _make_photon_static_class_kernel(
             head = project(left.projection_faces()[0], jnp.take(head_sigma, jnp.asarray(rows), axis=0), right.projection_faces()[1])
             return result, head
         return result
+    # The entry keeps the W tables alive, so their id in the key cannot be reused.
     _photon_sigma_kernel_cache[key] = contract_class
+    if w_tables is not None:
+        _photon_sigma_kernel_cache[(key, 'w_tables')] = w_tables
     return contract_class
 
 
