@@ -99,17 +99,19 @@ def _other_face(mesh_xy, spec, other):
 
 
 @lru_cache(maxsize=None)
-def _w_contraction(mesh_xy, grid, nk, mc, nt_n, kcarrier, layout, weights_fn):
+def _w_contraction(mesh_xy, grid, nk, mc, nt_n, kcarrier, layout, weights_fn, rows=None):
     """W(t) = B_A d(t) B_B^T on the full-q grid; the valence branch reads -q.
 
     ``(nk, m*nc, n*nt)`` from ``(x, y, omega, interval, ref, time, hole)``
     with ``hole`` static.  One GEMM plan per configuration.  ``weights_fn``
     is d: the causal d(t) for Sigma, the omega = 0 coefficient for W0.
+    ``rows`` plans the GEMM for a q panel of that many rows (``hole`` False:
+    the caller has read the panel's rows).
     """
     from distrib_la import gemm_plan
     from symmetry_maps import q_negation_index
     from .sigma import _shared_pole_contract
-    gemm = gemm_plan(mesh_xy, m=mc, n=nt_n, k=kcarrier, nq=nk,
+    gemm = gemm_plan(mesh_xy, m=mc, n=nt_n, k=kcarrier, nq=rows or nk,
                      dtype=np.complex128, layout=layout)
     minus = jnp.asarray(q_negation_index(grid))
 
@@ -135,6 +137,8 @@ _TEST_CONSTANT_Q_SPAN = None
 #: Test hook: build the antiunitary partner by its GEMM even when the ledger
 #: holds lax.cond's copy of it.
 _TEST_DIRECT_PARTNER = False
+#: Test hook: form each W(t) panel in q panels of at most this many rows.
+_TEST_W_Q_ROWS = None
 
 
 class LorentzPanels:
@@ -503,6 +507,21 @@ def sector_synthesis(readers, headers, bases, syms, layout, frequencies, meta, m
         (a0,a1),(b0,b1)=panels[0]
         kernel=_w_contraction(mesh_xy,tuple(left['grid']),nk,m*(a1-a0),n*(b1-b0),kcarrier,
                               factor_layout,weights_fn or _shared_pole_weights)
+        # A streamed class (Lorentz panels or one factor face) also forms each
+        # panel's W(t) in q panels whose GEMM operand copies (the panel's
+        # factor columns, both faces) are at most one W(t) panel tile; a class
+        # that fits forms it in one call, as before.
+        q_rows=nk
+        if len(panels)>1 or mirror or _TEST_W_Q_ROWS is not None:
+            split=factor_layout=='face'
+            copies=2*16*nk*((m//px)*(a1-a0)+(n//py)*(b1-b0))*(kcarrier//px if split else kcarrier)
+            tile=16*nk*m*n*_blocks(panels[0])//mesh_xy.size
+            want=max(1,-(-copies//max(tile,1))) if _TEST_W_Q_ROWS is None else -(-nk//_TEST_W_Q_ROWS)
+            q_rows=max(d for d in range(1,nk+1) if nk%d==0 and d<=nk//want)
+        row_kernel=(kernel if q_rows>=nk else _w_contraction(mesh_xy,tuple(left['grid']),nk,
+            m*(a1-a0),n*(b1-b0),kcarrier,factor_layout,weights_fn or _shared_pole_weights,rows=q_rows))
+        from symmetry_maps import q_negation_index
+        minus=np.asarray(q_negation_index(tuple(left['grid'])),dtype=np.int32)
     except BaseException:
         capacity.live_stages=ambient
         b_x=b_y=poles=None
@@ -514,6 +533,8 @@ def sector_synthesis(readers, headers, bases, syms, layout, frequencies, meta, m
         # component axis of the factors is unsharded, so a panel is a local slice.
         def form(panel,x,y,omega,interval):
             (a0,a1),(b0,b1)=panel
+            if q_rows<nk:
+                return q_panels(panel,x,y,omega,interval)
             if y is None:
                 y=_other_face(mesh_xy,factor_spec[0],factor_spec[1])(
                     x if panels==whole else x[:,:,b0:b1])
@@ -522,6 +543,28 @@ def sector_synthesis(readers, headers, bases, syms, layout, frequencies, meta, m
             if panels!=whole:
                 x=x[:,:,a0:a1]
             return kernel(x,y,omega,interval,ref,time,hole).reshape(nk,m,a1-a0,n,b1-b0)
+        def q_panels(panel,x,y,omega,interval):
+            # W(t) of one Lorentz panel in q panels of q_rows rows: each reads
+            # its rows (at -q on the valence branch), slices the panel's
+            # components, contracts and is written in place, so the GEMM's
+            # operand copies are one q panel's.
+            (a0,a1),(b0,b1)=panel
+            order=jnp.asarray(minus if hole else np.arange(nk,dtype=np.int32))
+            def body(c,w):
+                rows=jax.lax.dynamic_slice_in_dim(order,c*q_rows,q_rows)
+                xc=jnp.take(x,rows,axis=0)
+                yc=(_other_face(mesh_xy,factor_spec[0],factor_spec[1])(xc[:,:,b0:b1])
+                    if y is None else jnp.take(y,rows,axis=0)[:,:,b0:b1])
+                xc=xc[:,:,a0:a1]
+                if hole:
+                    xc,yc=jnp.conj(xc),jnp.conj(yc)
+                part=row_kernel(xc,yc,jnp.take(omega,rows,axis=0),jnp.take(interval,rows,axis=0),
+                                ref,time,False)
+                return jax.lax.dynamic_update_slice_in_dim(w,part,c*q_rows,axis=0)
+            w=jax.lax.with_sharding_constraint(
+                jnp.zeros((nk,m*(a1-a0),n*(b1-b0)),jnp.complex128),NamedSharding(mesh_xy,P(None,'x','y')))
+            w=jax.lax.fori_loop(0,nk//q_rows,body,w)
+            return w.reshape(nk,m,a1-a0,n,b1-b0)
         return LorentzPanels(panels,form,(x,y,omega,interval))
     def window_operands(space,indices,bounds):
         # Host intervals once per window; every tau node of the window reuses them.
