@@ -12,7 +12,8 @@
    ecutwfc = 8.0
    ecutrho = 32.0
    nbnd = 9
-   tot_charge = 1.0
+   input_dft = 'pz'
+   tot_charge = -1.0
    noncolin = .true.
    lspinorb = .true.
    no_t_rev = .true.
@@ -23,7 +24,7 @@
 /
 &electrons
    electron_maxstep = 200
-   conv_thr = 1.0d-8
+   conv_thr = 1.0d-13
    mixing_mode = 'plain'
    mixing_beta = 0.2
    diagonalization = 'david'

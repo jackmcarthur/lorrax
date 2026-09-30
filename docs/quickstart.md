@@ -1,7 +1,7 @@
 # Quickstart
 
 This page runs LORRAX on the bundled test fixture, `tests/hsuite/fixture`: a
-tiny magnetic H2+ crystal (one electron, noncollinear with spin-orbit, 9
+tiny magnetic H2⁻ crystal (three electrons, noncollinear with spin-orbit, 9
 bands, 5×5×1 k). §2 is a first GW calculation, one step at a time. §3 runs
 every driver in one command and checks the answers. §4 is the same chain on
 your own crystal. LORRAX must be installed first
@@ -113,10 +113,12 @@ spin, band, the DFT energy, the quasiparticle energy. The first block of
 `eqp0.dat` from this run, which two runs reproduce to every digit:
 
 ```text
-  0.000000000  0.000000000  0.000000000       3
-       1       1   -8.139895274   -8.934017792
-       1       2   -7.306857400   -6.118318053
-       1       3    1.880246829    2.627445055
+  0.000000000  0.000000000  0.000000000       5
+       1       1   -6.677240544   -6.946319626
+       1       2   -5.778933971   -6.297506608
+       1       3   -4.885122491   -4.519243420
+       1       4   -3.479877316   -1.320867637
+       1       5    0.663657572    2.662949929
 ```
 
 Every output file is listed in [drivers](drivers.md#gw-gwgw_jax).
@@ -124,12 +126,6 @@ Every output file is listed in [drivers](drivers.md#gw-gwgw_jax).
 The fixture is magnetic, so each report lists `TIME-REVERSAL SYMMETRY IS
 BROKEN` notices under `WARNINGS`. Step 2 prints `parallel-transport artifact:
 not written`: the cell has too little vacuum for that optional artifact.
-`gwjax.out` also lists two `LORRAX SANITY FAILURE … q↔−q conjugate
-reciprocity` lines (about 5e-3), and the run completes. They are true of this
-fixture: its DFT wavefunctions do not have the symmetry operations of its own
-WFN header exactly ([the fixture](../tests/hsuite/README.md#fixture)), and
-the symmetry-reduced run measures that. On your own WFN, treat these lines as
-a defect to find.
 
 ## 3. Every driver, checked {#chain}
 
