@@ -2113,7 +2113,7 @@ class StaticPhotonResponse:
     family_plans: tuple = ()
 
 
-def photon_blocks_full_q(packed, keys, *, layout, family_plans, qgrid_policy):
+def photon_blocks_full_q(packed, keys, *, layout, family_plans, qgrid_policy, q_span=None):
     """Restore each source once and apply the canonical Lorentz mixing for one class."""
     from symmetry_maps import unfold_isdf_operator, mix_lorentz_blocks
     from symmetry_maps import bgw_integer_q_to_fractional
@@ -2124,6 +2124,15 @@ def photon_blocks_full_q(packed, keys, *, layout, family_plans, qgrid_policy):
     left, right = family_plans[a], family_plans[b]
     sym, mesh, policy = left.sym, left.mesh_xy, qgrid_policy
     qfrac = bgw_integer_q_to_fractional(sym.q_irr_kgrid_int, policy.kgrid)
+    parents=np.asarray(sym.irr_idx_q,np.int32)
+    operations=np.asarray(policy.unfold_sym_idx,np.int32)
+    if q_span is not None:
+        lo,hi=map(int,q_span)
+        if not 0<=lo<hi<=len(qfrac) or packed.shape[0]!=hi-lo:
+            raise ValueError('GATE photon_q_panel: parent span or packed rows differ')
+        rows=np.flatnonzero((parents>=lo)&(parents<hi))
+        parents,operations=parents[rows]-lo,operations[rows]
+        qfrac=qfrac[lo:hi]
     pairs = tuple((C, D) for C in ((1, 2, 3) if a else (0,))
                   for D in ((1, 2, 3) if b else (0,)))
     parent_blocks = jnp.stack([photon_block_view(packed, layout, C, D, mesh)
@@ -2131,7 +2140,7 @@ def photon_blocks_full_q(packed, keys, *, layout, family_plans, qgrid_policy):
 
     def restore(source):
         return unfold_isdf_operator(
-            source, irr_idx=sym.irr_idx_q, sym_idx=policy.unfold_sym_idx,
+            source, irr_idx=parents, sym_idx=operations,
             sym_perm=left.sym_perm, L_table=left.L_table,
             right_sym_perm=right.sym_perm, right_L_table=right.L_table,
             q_irr_frac=qfrac, mesh_xy=mesh, n_sym_spatial=policy.n_sym_spatial,
@@ -2140,7 +2149,7 @@ def photon_blocks_full_q(packed, keys, *, layout, family_plans, qgrid_policy):
 
     restored = jax.lax.map(restore, parent_blocks)
     sources = {pair: restored[i] for i, pair in enumerate(pairs)}
-    yield from mix_lorentz_blocks(sources, sym=sym, sym_idx=policy.unfold_sym_idx,
+    yield from mix_lorentz_blocks(sources, sym=sym, sym_idx=operations,
                                  mesh_xy=mesh, keys=keys).items()
 
 
