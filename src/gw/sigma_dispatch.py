@@ -422,8 +422,9 @@ def sigma_result_on_kset(
                 for i0 in range(0, n_lead, step):
                     part = jnp.moveaxis(value[i0:i0 + step], k_axis, 0)
                     parts.append(jnp.moveaxis(select_rows(part), 0, k_axis))
-                selected = (parts[0] if len(parts) == 1 else jax.device_put(
-                    jnp.concatenate(parts, axis=0), parts[0].sharding))
+                selected = (parts[0] if len(parts) == 1 else jax.jit(
+                    lambda *p: jnp.concatenate(p, axis=0),
+                    out_shardings=parts[0].sharding)(*parts))
                 del parts
             elif k_axis:
                 selected = np.moveaxis(value, k_axis, 0)

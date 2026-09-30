@@ -1586,7 +1586,6 @@ def _rotate_sigma_omega_cube(
                 cube_sh)
 
         def _in_place(cube, U):
-            cube = jax.device_put(cube, cube_sh, donate=True)
             for i in range(shape[0]):
                 cube = _row_in_place(cube, U, np.int32(i))
             return cube
