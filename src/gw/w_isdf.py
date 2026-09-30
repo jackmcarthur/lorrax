@@ -987,15 +987,56 @@ def _get_chi_fractional_contour_kernel_face(
 
         def photon_door_rows(ahead, behind, lower_weight, lower_time, lower_ref,
                              upper_weight, upper_time, upper_ref):
-            """:func:`photon_rows` through mathdx mode 11: quadrant parent Greens, unfold on load.
+            """:func:`photon_rows` through mathdx mode 11 (:func:`photon_door_blocks`)."""
+            from .photon_layout import _insert
+            layout_p = photon.packed_layout
+
+            def put(state, keys, value, c):
+                ahead, behind = state
+                A, B = keys[c]
+                ahead = _insert(ahead, jnp.conj(jnp.take(value, jnp.asarray(gather_q), axis=0)),
+                                layout_p, A, B, mesh_xy)
+                behind = _insert(behind, jnp.conj(jnp.take(value, jnp.asarray(reverse_q), axis=0)),
+                                 layout_p, A, B, mesh_xy)
+                return ahead, behind
+            return photon_door_blocks((ahead, behind), put, lower_weight, lower_time, lower_ref,
+                                      upper_weight, upper_time, upper_ref)
+
+        def photon_direct_carry(carry, time, forward, reverse):
+            """A direct node added straight into the packed-layout bank carry (no node rows).
+
+            Each channel plane's ``FT[A](q)`` rows weight ``forward`` and its
+            ``conj FT[A](-q)`` rows weight ``reverse``, added into the plane's
+            block in place (``photon_layout.accumulate_photon_block``) with the
+            contour accumulator's rounding: the carry's bytes equal the node-rows
+            route's once the stream converts it back to the canonical layout.
+            """
+            from .photon_layout import accumulate_photon_block
+            weights = jnp.stack((forward, reverse))
+
+            def put(carry, keys, value, c):
+                A, B = keys[c]
+                rows = jnp.stack((jnp.conj(jnp.take(value, jnp.asarray(gather_q), axis=0)),
+                                  jnp.take(value, jnp.asarray(reverse_q), axis=0)))
+                rows = jax.lax.with_sharding_constraint(rows, selected_shard)
+                return accumulate_photon_block(carry, rows, weights, photon.packed_layout,
+                                               A, B, mesh_xy)
+            return photon_door_blocks(carry, put, occ_f, -time, energy_reference[0],
+                                      occ_u, jnp.conj(time), energy_reference[1])
+
+        def photon_door_blocks(state, put, lower_weight, lower_time, lower_ref,
+                               upper_weight, upper_time, upper_ref):
+            """The four-current correlation through mathdx mode 11, one family pair at a time.
 
             Per family pair, each lower quadrant ``(h, g)`` and its upper quadrant
             are built on the raw parents only (``build_G_tau(unfold=False)``) and
-            the door accumulates every channel pair's R plane.  The door reads
+            the door accumulates every channel pair's R plane.  Each plane is then
+            transformed and ``state = put(state, keys, FT[v_c], c)`` keeps its
+            rows before the next plane and the next pair's Greens.  The door reads
             ``G' = ifftn_k`` of the unfolded Greens, so its plane is
             ``v(R) = conj(A(-R))`` and ``FT[A](q) = conj(FT[v](q))``.
             """
-            from .photon_layout import FAMILY_PAIRS, _insert
+            from .photon_layout import FAMILY_PAIRS
             layout_p = photon.packed_layout
 
             def parent(weight, t, ref, pair, halves, current):
@@ -1011,8 +1052,8 @@ def _get_chi_fractional_contour_kernel_face(
                 flip = tuple(int(f == 1) for f in pair)
                 keys = photon_doors[(pair, (0, 0))][1]
                 # The previous class's rows finish before this class's Greens.
-                ahead, behind, lower_w, upper_w = jax.lax.optimization_barrier(
-                    (ahead, behind, lower_weight, upper_weight))
+                state, lower_w, upper_w = jax.lax.optimization_barrier(
+                    (state, lower_weight, upper_weight))
                 acc = jax.lax.with_sharding_constraint(jnp.zeros(
                     (len(keys), nk, layout_p.carrier_extent(keys[0][0]),
                      layout_p.carrier_extent(keys[0][1])), jnp.complex128), selected_shard)
@@ -1026,15 +1067,11 @@ def _get_chi_fractional_contour_kernel_face(
                     partners = (() if lower.transpose is None and upper.transpose is None
                                 else (lower.partner(), upper.partner()))
                     acc = photon_doors[(pair, (h, g))][0](acc, lower.G, upper.G, *partners)
-                for c, (A, B) in enumerate(keys):
+                for c in range(len(keys)):
                     # One channel plane's transform is live at a time.
-                    acc, ahead, behind = jax.lax.optimization_barrier((acc, ahead, behind))
-                    value = chi_fftn(acc[c])
-                    ahead = _insert(ahead, jnp.conj(jnp.take(value, jnp.asarray(gather_q), axis=0)),
-                                    layout_p, A, B, mesh_xy)
-                    behind = _insert(behind, jnp.conj(jnp.take(value, jnp.asarray(reverse_q), axis=0)),
-                                     layout_p, A, B, mesh_xy)
-            return ahead, behind
+                    acc, state = jax.lax.optimization_barrier((acc, state))
+                    state = put(state, keys, chi_fftn(acc[c]), c)
+            return state
 
         def photon_order(value):
             from .photon_layout import photon_family_order
@@ -1179,6 +1216,8 @@ def _get_chi_fractional_contour_kernel_face(
                 jax.lax.dynamic_index_in_dim(projection_rows[1], index, axis=1, keepdims=False)))
             if chi_door is not None:
                 ahead, behind = direct_rows(time)
+            elif photon_doors is not None:
+                return photon_direct_carry(accumulators, time, forward, reverse)
             elif photon is not None:
                 ahead, behind = photon_rows(occ_f, -time, energy_reference[0],
                                             occ_u, jnp.conj(time), energy_reference[1])
@@ -1244,7 +1283,14 @@ def _get_chi_fractional_contour_kernel_face(
             )
             return updated, None
 
-        if pair_mode == "direct":
+        if pair_mode == "direct" and photon_doors is not None:
+            # The mode-11 photon stream adds each node into the carry in the
+            # families' packed layout; the carry crosses layouts once per call.
+            from .photon_layout import photon_carry_order
+            final_R = photon_carry_order(
+                direct_stream(photon_carry_order(initial, photon, mesh_xy, to_packed=True)),
+                photon, mesh_xy, to_packed=False)
+        elif pair_mode == "direct":
             final_R = direct_stream(initial)
         else:
             nodes = ((time_nodes[0], projection_rows.T, time_nodes[1])

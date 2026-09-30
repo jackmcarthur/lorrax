@@ -884,6 +884,15 @@ class PhotonFamilies:
         source[source < 0] = free
         return source.astype(np.int32), common, self.layout.packed_extent // side
 
+    def packed_order_map(self):
+        """The inverse of :meth:`order_map`: canonical to packed slots (``None`` when equal)."""
+        order = self.order_map()
+        if order is None:
+            return None
+        source, common, _ = order
+        return (np.argsort(source).astype(np.int32), common,
+                self.packed_layout.packed_extent // int(self.layout.mesh_side))
+
 
 def photon_family_order(value, families: PhotonFamilies, mesh_xy: Mesh, spec):
     """Both trailing photon axes of ``value`` from the packed to the canonical layout.
@@ -902,10 +911,63 @@ def photon_family_order(value, families: PhotonFamilies, mesh_xy: Mesh, spec):
     return value
 
 
+def photon_carry_order(carry, families: PhotonFamilies, mesh_xy: Mesh, *, to_packed: bool):
+    """A ``(n_out, q, N, N)`` stack between the canonical and packed layouts, one member at a time.
+
+    Traceable.  Each member's two photon axes cross as :func:`photon_family_order`
+    moves them (``to_packed`` the inverse), written into a new stack of the
+    target extent, so one member's transient is live beside the two stacks.
+    An identity when the orders coincide.
+    """
+    order = families.packed_order_map() if to_packed else families.order_map()
+    if order is None:
+        return carry
+    from common.staged_reshard import permute_sharded_axis
+    source, common, target = order
+    side = int(families.layout.mesh_side)
+    spec = P(None, 'x', 'y')
+    shard = NamedSharding(mesh_xy, P(None, None, 'x', 'y'))
+    out = jax.lax.with_sharding_constraint(
+        jnp.zeros(carry.shape[:2] + (side * target, side * target), carry.dtype), shard)
+
+    def member(o, out):
+        value = jax.lax.dynamic_index_in_dim(carry, o, axis=0, keepdims=False)
+        for axis in (-2, -1):
+            value = permute_sharded_axis(value, axis, source, mesh_xy, spec,
+                                         pad_to=common, crop_to=target)
+        return jax.lax.dynamic_update_index_in_dim(out, value, o, axis=0)
+    return jax.lax.fori_loop(0, carry.shape[0], member, out)
+
+
+def accumulate_photon_block(acc, rows, weights, layout, A, B, mesh_xy):
+    """``acc[o, :, A, B] += sum_s weights[s, o] rows[s]`` in ``layout``'s (A, B) block, in place.
+
+    ``acc`` ``(n_out, q, N, N)`` at ``P(None,None,'x','y')``; ``rows``
+    ``(n_s, q, c_A, c_B)`` at ``P(None,None,'x','y')``; ``weights``
+    ``(n_s, n_out)`` replicated.  Each device adds its own tile of the block
+    at the layout's local offsets (``ffi.contour``'s block form); pad rows and
+    columns are not touched.
+    """
+    from common.shard_map import shard_map
+    from ffi.contour import contour_block_accumulate_local
+    side = layout.mesh_side
+    wa, wb = layout.carrier_extent(A) // side, layout.carrier_extent(B) // side
+    la, lb = layout.logical_extent(A), layout.logical_extent(B)
+    m0, n0 = layout.local_offset(A), layout.local_offset(B)
+
+    def local(acc, rows, weights):
+        valid = jnp.stack((jnp.clip(la - jax.lax.axis_index('x') * wa, 0, wa),
+                           jnp.clip(lb - jax.lax.axis_index('y') * wb, 0, wb))).astype(jnp.int32)
+        return contour_block_accumulate_local(acc, rows, weights, valid, m0=m0, n0=n0)
+    spec = P(None, None, 'x', 'y')
+    return shard_map(local, mesh=mesh_xy, in_specs=(spec, spec, P()), out_specs=spec,
+                     check_vma=False)(acc, rows, weights)
+
+
 __all__ = [
     "CHARGE", "TRANSVERSE", "N_LORENTZ", "MAX_Q0_UPDATE_RANK",
     "FAMILY_OF_CHANNEL", "FAMILY_PAIRS", "PhotonFamilies", "family_channels",
-    "photon_family_order",
+    "photon_family_order", "photon_carry_order", "accumulate_photon_block",
     "PhotonBasisLayout", "pack_photon_operator", "photon_block_view",
     "pack_photon_response_tiles", "unpack_photon_response_tiles",
     "pack_photon_channel_vectors", "add_photon_q0_low_rank",
