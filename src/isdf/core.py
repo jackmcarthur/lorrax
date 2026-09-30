@@ -1093,6 +1093,87 @@ def c_q_downfold(
 
 
 
+def _c_q_dirac_quarters(psi_mun, psi_nmu, weight_l, weight_r, *, plan,
+                        kgrid, mesh_xy, gemm, gamma_L, gamma_R):
+	"""Exact four-spinor CCT, four Pauli-quarter pairs through the native owner.
+
+	What would the owner object to? A second convolution/vertex convention,
+	unfolded psi, or a replicated normal matrix. None is introduced: the
+	typed half action, monomial tables, SUMMA and parent convolution are the
+	existing owners. All 16 spin-pair terms survive. The quarter sum changes
+	reduction order (value parity), never the band contraction or fit metric.
+	For P=px*py, parent scratch is O(4*nparent*M²/P), not the full spin
+	16*nparent*M²/P; the scalar output stays 16*Nk*M²/P bytes. Band panels
+	keep their existing SUMMA bound on GPU and the service's CPU contract.
+	"""
+	from common.gamma_matrices import gamma_perm_phase_host
+	from distrib_la import gemm_plan
+	from ffi.fft import make_fused_conv_kparent
+
+	half, parity = plan.dirac_halves()  # authenticates diag(U, parity*U)
+	np_, _, mu, nb = map(int, psi_mun.shape)
+	pl, fl = gamma_perm_phase_host(gamma_L)
+	pr, fr = gamma_perm_phase_host(gamma_R)
+	px, py = int(mesh_xy.shape['x']), int(mesh_xy.shape['y'])
+	mu_loc, col_loc = mu // px, mu // py
+	key = ('c_q_dirac_quarters', mesh_xy, plan, gemm, tuple(kgrid),
+	       tuple(psi_mun.shape), str(psi_mun.dtype), gamma_L, gamma_R)
+	if key not in _isdf_pipeline_cache:
+		layout = 'face' if gemm.in_sharding_a.spec == P(None, 'x', 'y') else 'axis'
+		quarter_gemm = gemm_plan(mesh_xy, m=2*mu, n=2*mu, k=nb, nq=np_,
+		                         dtype=psi_mun.dtype, backend=gemm.backend,
+		                         layout=layout, reduction_axis=gemm.reduction_axis,
+		                         warmup=False)
+		mun = NamedSharding(mesh_xy, P(None, None, *quarter_gemm.in_sharding_a.spec[1:]))
+		nmu = NamedSharding(mesh_xy, P(None, quarter_gemm.in_sharding_b.spec[1],
+		                             None, quarter_gemm.in_sharding_b.spec[2]))
+		rep = NamedSharding(mesh_xy, P())
+		out = NamedSharding(mesh_xy, P(None, 'x', 'y'))
+		pair_spec = P(None, None, 'x', None, 'y')
+		pair = make_fused_conv_kparent(mesh_xy, kgrid, 2, (mu_loc, col_loc),
+		       perm_l=np.arange(2), phase_l=np.ones(2),
+		       perm_r=np.arange(2), phase_r=np.ones(2), centroid_major=True)
+
+		@partial(shard_map, mesh=mesh_xy,
+		         in_specs=(pair_spec, pair_spec, P(), P()),
+		         out_specs=P(None, 'x', 'y'), check_vma=False)
+		def tail(dl, dr, h, g):
+			tables = _parent_conv_tables(half, half.centroid_local_perm,
+			                              half.L_table, mu_loc, col_loc)
+			uh, ug = h ^ int(gamma_L != 0), g ^ int(gamma_R != 0)
+			# A quarter's parity belongs to its typed unfold, before vertices.
+			left_sign = jnp.where(h == g, 1., jnp.asarray(parity))
+			right_sign = jnp.where(uh == ug, 1., jnp.asarray(parity))
+			tables = (*tables[:-2], tables[-2]*left_sign[:, None, None],
+			          tables[-1]*right_sign[:, None, None])
+			vl = (jnp.asarray(pl[:2] % 2), jax.lax.dynamic_slice_in_dim(jnp.asarray(fl), 2*h, 2))
+			vr = (jnp.asarray(pr[:2] % 2), jax.lax.dynamic_slice_in_dim(jnp.asarray(fr), 2*g, 2))
+			return pair(dl, dr, _parent_conv_vertices(tables, vl, vr))
+
+		@partial(jax.jit, in_shardings=(mun, nmu, rep, rep), out_shardings=out)
+		def run(pm, pn, wl, wr):
+			def projector(w, h, g):
+				l = jax.lax.dynamic_slice_in_dim(pm, 2*h, 2, axis=1)
+				r = jax.lax.dynamic_slice_in_dim(pn, 2*g, 2, axis=2)
+				a = merge_spin_centroid(l, 1, 2) * w[None, None, :].astype(pm.dtype)
+				b = merge_spin_centroid(jnp.conj(r), 2, 3)
+				d = quarter_gemm(a, b).reshape(np_, mu, 2, mu, 2)
+				return jnp.transpose(d, (0, 2, 1, 4, 3))
+			def add(total, hg):
+				total, wl_ = jax.lax.optimization_barrier((total, wl))
+				h, g = hg
+				dl = projector(wl_, h, g)
+				dl, wr_ = jax.lax.optimization_barrier((dl, wr))
+				dr = projector(wr_, h ^ int(gamma_L != 0), g ^ int(gamma_R != 0))
+				return total + tail(dl, dr, h, g), None
+			nk = math.prod(kgrid)
+			zero = jax.lax.with_sharding_constraint(jnp.zeros((nk, mu, mu), pm.dtype), out)
+			return jax.lax.scan(add, zero, jnp.asarray(((0,0),(0,1),(1,0),(1,1)), jnp.int32), unroll=1)[0]
+		_isdf_pipeline_cache[key] = run
+	return _isdf_pipeline_cache[key](psi_mun, psi_nmu,
+	       jnp.asarray(weight_l, jnp.float64), jnp.asarray(weight_r, jnp.float64))
+
+
 def c_q_from_psi_sm(
 	psi_mun_parent: jax.Array,
 	psi_nmu_parent: jax.Array,
@@ -1125,6 +1206,10 @@ def c_q_from_psi_sm(
 		raise ValueError(
 			"_c_q_face_parent: psi_nmu_parent shape "
 			f"{tuple(psi_nmu_parent.shape)} != {(n_parent, nb, s_, mu_pk)}.")
+	if s_ == 4:
+		return _c_q_dirac_quarters(psi_mun_parent, psi_nmu_parent, weight_l, weight_r,
+		       plan=plan, kgrid=kgrid, mesh_xy=mesh_xy, gemm=gemm,
+		       gamma_L=gamma_L, gamma_R=gamma_R)
 	left_gamma = (None, None) if gamma_L == 0 else _gamma_perm_phase_mu(gamma_L)
 	right_gamma = (None, None) if gamma_R == 0 else _gamma_perm_phase_mu(gamma_R)
 	px = int(mesh_xy.shape['x'])
