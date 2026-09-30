@@ -746,11 +746,12 @@ def _get_chi_fractional_contour_kernel_face(
                            enable_active_range=band_ranges is not None)
     active_gemms = (tuple(g_plan.prepare_active_range(*bounds) for bounds in band_ranges)
                    if band_ranges is not None else (None, None))
-    # The charge direct stream on a raw-parent plan forms each node's correlation
+    # Selected charge streams on a raw-parent plan form each node's correlation
     # with mathdx mode 11 from the two parent Greens (``direct_rows``): no full-k
     # Green, no transform of either Green, no XLA spin trace.
     chi_door = None
-    if (pair_mode == "direct" and photon is None and k_unfold_plan is not None
+    if (pair_mode in ("direct", "retarded", "kms_static") and selected_q is not None
+            and photon is None and k_unfold_plan is not None
             and _chi_door_serves(mesh_xy, grid, ns)):
         from common.fft_helpers import make_kconv_chi_unfold
         chi_door = make_kconv_chi_unfold(mesh_xy, grid, k_unfold_plan.unfold_load_tables(),
@@ -921,7 +922,7 @@ def _get_chi_fractional_contour_kernel_face(
             return result
 
 
-        def kms_static_correlation(time):
+        def kms_weights(time):
             # The zero-Matsubara FD reference uses the SAME endpoint Green
             # builder and FFTs. Log weights are KMS-bounded even at a crossing;
             # no valence/conduction partition or gap enters this correlation.
@@ -931,6 +932,10 @@ def _get_chi_fractional_contour_kernel_face(
                 jnp.exp(eps*time-jnp.logaddexp(0., beta*eps)), 0.)
             upper = jnp.where(occ_u != 0,
                 jnp.exp(-eps*time-jnp.logaddexp(0., -beta*eps)), 0.)
+            return lower, upper, mu
+
+        def kms_static_correlation(time):
+            lower, upper, mu = kms_weights(time)
             return spin_correlation(lower, 0., mu, upper, 0., mu)
 
         def rows(value, q):
@@ -974,7 +979,8 @@ def _get_chi_fractional_contour_kernel_face(
 
             return jax.lax.cond(window == 0, crossing, remote, None), None
 
-        def direct_rows(time):
+        def correlation_rows(lower_weight, lower_time, lower_ref,
+                             upper_weight, upper_time, upper_ref):
             """One node's forward and reverse rows through mathdx mode 11.
 
             Mode 11 returns ``v = sum_ab conj(Gu'_ab) Gf'_ab`` from the raw
@@ -990,15 +996,20 @@ def _get_chi_fractional_contour_kernel_face(
                                    k_unfold_plan=k_unfold_plan, unfold=False,
                                    prepared_active_gemm=active_gemms[int(current)],
                                    real_weights=False)
-            lower = parent(occ_f, -time, energy_reference[0], False)
-            upper = parent(occ_u, jnp.conj(time), energy_reference[1], True)
-            partners = () if lower.conj_partner else (lower.transpose, upper.transpose)
+            lower = parent(lower_weight, lower_time, lower_ref, False)
+            upper = parent(upper_weight, upper_time, upper_ref, True)
+            partners = (() if lower.conj_partner and upper.conj_partner
+                        else (lower.partner(), upper.partner()))
             zero = jax.lax.with_sharding_constraint(
                 jnp.zeros((1, nk, n_mu, n_mu), jnp.complex128), selected_shard)
             value = chi_fftn(chi_door(zero, lower.G, upper.G,
                                       jnp.ones((1,), jnp.complex128), *partners)[0])
             ahead, behind = rows(value, gather_q), rows(value, reverse_q)
             return (jnp.conj(ahead), behind) if physical else (ahead, jnp.conj(behind))
+
+        def direct_rows(time):
+            return correlation_rows(occ_f, -time, energy_reference[0],
+                                    occ_u, jnp.conj(time), energy_reference[1])
 
         def direct_node(index, accumulators):
             # ONE Green pair A(t)=Gu(t) conj(Gf(conj(t))) per node serves
@@ -1044,6 +1055,17 @@ def _get_chi_fractional_contour_kernel_face(
 
         def body(accumulators, node):
             time, projection = node
+            if chi_door is not None:
+                if pair_mode == "retarded":
+                    tau = -jnp.asarray(1j, jnp.complex128) * time
+                    ahead, behind = correlation_rows(occ_f, tau, energy_reference,
+                                                    occ_u, tau, energy_reference)
+                    contribution = -1j * (ahead - behind)
+                else:
+                    lower, upper, mu = kms_weights(time)
+                    ahead, behind = correlation_rows(lower, 0., mu, upper, 0., mu)
+                    contribution = -(ahead + behind)
+                return accumulate_selected(accumulators, contribution, projection), None
             if pair_mode == "retarded":
                 A_R = retarded_correlation(time)
             elif pair_mode == "kms_static":
