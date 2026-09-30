@@ -216,25 +216,13 @@ Operating at thousands of centroids (the distributed plan, per-rank scalings):
 
 ## downfold — `gw.downfold_cli`
 
-Compresses a finished GW restart onto a subset of $\mu_S$ of its $\mu_L$
-centroids for the retained BSE band window. Pivoted Cholesky selects the rows;
-the transfer $T = S_{SS}^{-1} S_{SL}$ is the least-squares fit in the
-pair-density metric (Grams from `isdf.core.c_q_from_psi_sm` on the window), and
-every $(\mu,\nu)$ tensor transforms by the congruence $A_S = T A_L T^\dagger$
-(ζ by $\zeta_S = \bar T \zeta_L$). The output is a restart bundle in the
-unchanged format at the smaller μ, so both BSE drivers read it unmodified;
-every stored tensor shrinks by $(\mu_S/\mu_L)^2$.
-
-The fit is exact only on redundancy: run the GW stage at a generous $\mu_L$ if
-you intend to compress it. The driver prints the window Gram's eigenvalue rank
-(the ceiling for $\mu_S$, refused above), the Cholesky selection certificate,
-and the per-q projection error $\epsilon_W$; none of them is an accuracy gate.
-Size $\mu_S$ by comparing the lowest BSE eigenvalues of parent and child. Pole
-models (PPM, MPA) do not transform: refit them in the small basis.
-
-Invoke: `python3 -u -m gw.downfold_cli -i downfold.in`. It takes its own
-`[downfold]` input; [the downfold page](downfold.md) owns its keys and
-refusals.
+Compresses a finished GW restart onto $\mu_S$ of its $\mu_L$ centroids for the
+retained BSE band window and writes a restart bundle in the unchanged format,
+which both BSE drivers read unmodified. Invoke:
+`python3 -u -m gw.downfold_cli -i downfold.in`.
+[The downfold page](downfold.md) owns the equations, the procedure, the
+outputs and the refusals; the `[downfold]` keys are in the
+[input reference](input_reference.md#downfold-the-downfold-input-file).
 
 ## htransform — `bandstructure.htransform`
 

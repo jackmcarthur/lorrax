@@ -256,7 +256,8 @@ This is not a GW deck. `gw.downfold_cli` compresses a finished GW calculation
 onto a smaller ISDF basis for BSE and exciton-band work. The section header must
 be `[downfold]`; a `[cohsex]` section refuses, and an unknown key refuses. The
 keys are `downfold_config.DOWNFOLD_DEFAULTS`, and `--print-schema` prints them.
-[downfold.md](downfold.md) argues for each default.
+[downfold.md](downfold.md) owns the equations, the procedure and how to
+choose each value.
 
 | key | default | meaning |
 |---|---|---|

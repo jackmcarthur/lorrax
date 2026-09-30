@@ -501,9 +501,8 @@ def resolve_isdf_basis(restart_file, params, input_file, *, n_rmu_bundle,
     ON A DOWNFOLDED BUNDLE THE TWO ARE DIFFERENT OBJECTS, and conflating them
     is the second of the three ways this driver failed on one (measured
     2026-08-10, PIPELINE_HEALTH.md).  The small bundle's basis is a SUBSET of
-    the parent's centroid points — ``downfold.md``: "the new
-    wavefunction-at-centroid coefficients are a literal column slice of the
-    ones already on disk" — and the htransform leg must evaluate its fitted
+    the parent's centroid points (``docs/downfold.md``: ψ at the kept
+    centroids is the column slice of the parent's), and the htransform leg must evaluate its fitted
     whole-state basis at those same child points.  The basis itself is selected
     from full Bloch states by the one randomized-QRCP implementation in
     ``isdf.galerkin``; centroid rows are evaluation points, not a second
