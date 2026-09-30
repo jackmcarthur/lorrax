@@ -880,7 +880,8 @@ def make_eqp_bgw(
 	this function reads the stamp instead of guessing.  Three outcomes, and
 	they are deliberately distinguishable: a stamp saying ``at_e_dft``
 	keeps the historical E_DFT centring and says so; a stamp saying
-	``self_consistent_qp`` supplies the converged spectrum; and an
+	``self_consistent_qp`` refuses by name (GATE
+	``eqp_bgw_self_consistent_run``: use the run's eqp1.dat); and an
 	UNSTAMPED file — a cube written before the stamp existed — falls back
 	to E_DFT with a printed line saying that is what happened and why it
 	may be wrong.  "No stamp" and "stamped at E_DFT" used to look
@@ -932,6 +933,17 @@ def make_eqp_bgw(
 			f"band_range {(band_start, band_stop)} on {nk_irr} IBZ kpts"
 		)
 
+	# An SC run's eqp pair is the SC spectrum (sc_iteration._write_sc_result_eqp);
+	# its cube carries no receipt, and a diagonal reassembled here is not it.
+	from file_io.restart_bundle import read_eval_energies
+	from file_io.sigma_output import SIGMA_EVAL_SELF_CONSISTENT
+	if read_eval_energies(sigma_mnk_path)[1] == SIGMA_EVAL_SELF_CONSISTENT:
+		raise ValueError(
+			"GATE eqp_bgw_self_consistent_run: "
+			f"{os.path.basename(sigma_mnk_path)} is from a self-consistent run; "
+			"its eqp0.dat/eqp1.dat are the SC eigenvalues the run wrote, and "
+			"a fixed-state diagonal reassembled from this file is not them. "
+			"Use the run's eqp1.dat.")
 	# Post-hoc assembly consumes the completed live-driver receipt.  Older
 	# raw cubes cannot prove that their Hartree column came from G-space.
 	from file_io.restart_bundle import (read_eqp_assembly_receipt)

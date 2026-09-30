@@ -1797,7 +1797,9 @@ def write_results(
     # their diagonals in place would alter QSGW/SC semantics.  Persist only
     # the completed EqpAssembly through the format owner, never a parallel set
     # of pre-assembly operand arguments.
-    if results.sigma_omega_h5_path is not None:
+    # SC runs carry none: their eqp pair is the SC spectrum, not this
+    # fixed-DFT-state diagonal, so nothing may reassemble it from the file.
+    if results.sigma_omega_h5_path is not None and not results.self_consistent:
         from file_io import append_eqp_assembly_receipt_h5
         # The receipt's k rows are resolved here, not in the format owner.
         # The assembly is on the file wedge because ``_wedge`` put it there;

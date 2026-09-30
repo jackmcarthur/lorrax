@@ -51,8 +51,9 @@ An SC run's `eqp0.dat` and `eqp1.dat` hold the SC eigenvalues: the accepted
 map's output $\mathrm{eigvalsh}\,F(H_{\rm in})$, with its tail scissor and
 semicore pin, sorted per k. Both files equal the body of that map's
 `eqp0_iterNNNN.dat` bit for bit; the header says so. No fixed-DFT-state
-diagonal and no Z-linearization reach them. The gap report reads the same
-array. `WFN_qp.h5`, `qp_wfn_rotations.h5` and `dipole_qsgw.h5` carry the
+diagonal and no Z-linearization reach them, and `sigma_mnk.h5` carries no eqp
+receipt: `python -m gw.eqp_bgw` refuses an SC file by name
+(`eqp_bgw_self_consistent_run`). The gap report reads the same array. `WFN_qp.h5`, `qp_wfn_rotations.h5` and `dipole_qsgw.h5` carry the
 accepted map's input QP states, the basis its Σ, W and head were built in;
 they agree with the eqp files to `sc_tol_ev` on the non-scissored states.
 
