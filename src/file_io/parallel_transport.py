@@ -917,7 +917,11 @@ def _write_connection_stage(
                 shape=(3, int(sym.nk_tot), nb_storage, nb_storage),
                 partition_spec=block_spec)
 
-        @partial(jax.jit, in_shardings=(block_sharding, None),
+        # Bind the executable output itself: a constraint after dispatch
+        # cannot repair a replicated intermediate. A collapsed-axis position
+        # table, when present, retains these same all-P matrix faces.
+        position_sharding = block_sharding if position is not None else None
+        @partial(jax.jit, in_shardings=(block_sharding, position_sharding),
                  out_shardings=block_sharding)
         def _connection(links, position):
             return link_connection(
