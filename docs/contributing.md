@@ -93,6 +93,5 @@ Benchmarks and backend checks for a standalone service live in that service's
   count, so it is green for reasons unrelated to your change.
 - Do not commit `__pycache__/`, `.venv/`, or cache directories.
 
-The certified platforms and process counts are stated per machine
-([Perlmutter](environment/machines/perlmutter.md),
-[Frontera](environment/machines/frontera.md)).
+The certified platforms and process counts are on the machine page
+([Perlmutter](environment/machines/perlmutter.md)).
