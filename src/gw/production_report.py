@@ -591,6 +591,12 @@ class GWProductionReport:
             self.emit("Tail calculations: " + " / ".join(
                 f"N{i}={int(value)}" for i, value in enumerate(counts, start=1))
                 + " cumulative bands")
+        if getattr(sigma_result, "sigma_c_at_dft_diag_unextrap_ev",
+                   None) is not None:
+            from file_io.sigma_output import RAW_SIGMA_NOTE
+            self.emit("Raw Sigma_c    : sigC_raw, eqp0_raw, eqp1_raw "
+                      "columns in sigma_diag.dat")
+            self.emit("                 " + RAW_SIGMA_NOTE)
 
     def quadrature(self) -> None:
         """Every quadrature rule the run used: screening chi0, then Sigma."""

@@ -126,6 +126,12 @@ class GWResults:
     # full operator cube remains raw.  Shape (n_omega, nk, nb_sigma), eV; ω
     # is relative to the run's stamped reference.  None in static modes ⇒ Z=1.
     sigma_c_omega_diag_ev: np.ndarray | None = None
+    # The RAW twins of the two Σ_c diagonals above: the band sum truncated
+    # at N bands, no spectral_shell tail (``SigmaResult.sigma_c_*_unextrap``),
+    # same conditioning.  Present only on one-shot runs with band
+    # extrapolation on; they feed eqp{0,1}_raw.dat and sigC_raw.
+    sigma_c_omega_diag_raw_ev: np.ndarray | None = None
+    sigma_c_diag_at_dft_raw_ry: np.ndarray | None = None
     omega_rel_ev: np.ndarray | None = None
     # The energies Σ WAS EVALUATED AT this call (``SigmaResult.e_eval_ev``),
     # absolute eV, shape (nk_result, nb_sigma).  E_DFT for a one-shot run;
@@ -1719,6 +1725,40 @@ def write_results(
         print_fn=print_fn,
     )
 
+    # ── THE RAW (NO BAND TAIL) TWIN ───────────────────────────────────────
+    # One-shot runs with band extrapolation carry the raw Σ_c diagonals from
+    # the same Σ evaluation (the band sum at N, before the tail fit).  The
+    # SAME assembler on the SAME operands, only the C(ω) curve differs, so
+    # sigma_diag.dat's eqp0_raw/eqp1_raw columns equal an extrapolation-off
+    # run's eqp0.dat/eqp1.dat.  The eqp files themselves carry the tail.
+    raw_assembly = None
+    sigma_c_raw_kn_ev = None
+    if (results.sigma_c_omega_diag_raw_ev is not None
+            and sigma_c_omega_diag_ev_irr is not None):
+        raw_omega_irr = _wedge_sigma_c(np.asarray(
+            results.sigma_c_omega_diag_raw_ev, dtype=np.complex128
+        ).transpose(1, 0, 2)).transpose(1, 0, 2)
+        raw_assembly = assemble_eqp(
+            kpoints_irr_frac=kpts_irr,
+            band_offset=results.band_start,
+            e_dft_ev=e_dft_ev_irr,
+            kin_ion_diag_ev=kin_ion_diag_ev,
+            hartree_diag_ev=hartree_diag_ev,
+            hartree_scalar_diag_ev=hartree_scalar_diag_ev,
+            hartree_transverse_diag_ev=hartree_transverse_diag_ev,
+            sigma_x_diag_ev=sigma_x_diag_ev,
+            sigma_c_omega_diag_ev=raw_omega_irr,
+            omega_rel_ev=results.omega_rel_ev,
+            e_dft_rel_ev=e_dft_rel_ev_irr,
+            e_eval_ev=e_eval_ev_irr,
+            e_eval_rel_ev=e_eval_rel_ev_irr,
+            dE_ev=eqp_dE_ev,
+            nspin=1,
+            print_fn=lambda *args, **kwargs: None,
+        )
+        sigma_c_raw_kn_ev = (
+            _wedge_sigma_c(results.sigma_c_diag_at_dft_raw_ry) * r2e)
+
     write_sigma_to_file(
         _wedge(sx_out),
         sigma_diag_file,
@@ -1745,6 +1785,9 @@ def write_results(
         # Z, the eqp1 stencil, only where eqp1 was linearized at E_DFT.
         z_factor_kn=(None if assembly.e_eval_ev is not None
                      else assembly.z_factor),
+        sigma_c_raw_kn_eV=sigma_c_raw_kn_ev,
+        eqp_raw_kn_eV=(None if raw_assembly is None else
+                       (raw_assembly.eqp0_ev, raw_assembly.eqp1_ev)),
     )
 
     # ``sigma_mnk.h5``'s full operators intentionally remain raw: changing
@@ -1884,6 +1927,9 @@ def write_results(
     print_fn(f"\n  Sigma diag:   {sigma_diag_file}")
     print_fn(f"  BGW eqp0:     {eqp0_file}")
     print_fn(f"  BGW eqp1:     {eqp1_file}")
+    if raw_assembly is not None:
+        print_fn("  raw columns:  sigC_raw, eqp0_raw, eqp1_raw in "
+                 f"{sigma_diag_file} (no band tail; BGW-comparable)")
     if results.E_eqp2_ry is not None:
         print_fn(f"  BGW eqp2:     {eqp2_file}")
     if results.sigma_omega_h5_path:

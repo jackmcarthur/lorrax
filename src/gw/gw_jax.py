@@ -1169,6 +1169,32 @@ def _sigma_diagnostic_fields(
     return (h_transverse_diag_ry, head_sigma_split_skn_ry, omega_rel_ev, sig_coh_diag_ry, sig_h_diag_ry, sig_h_scalar_diag_ry, sig_sx_diag_ry, sigma_c_diag_at_dft_ry, sigma_c_odd_at_dft_ev, sigma_c_omega_diag_ev, sigma_lorentz_diag_skn_ry)
 
 
+def _attach_raw_sigma(results, config, enk_dft, sigma_result):
+    """Carry the raw (no band tail) Σ_c diagonals, conditioned as the main pair.
+
+    Same unit conversion and degenerate-set averaging as
+    ``_sigma_output_fields``/``_sigma_diagnostic_fields`` apply to the
+    extrapolated pair, so the raw columns equal an extrapolation-off run's.
+    """
+    raw_omega_ry = sigma_result.sigma_c_omega_diag_unextrap_ry
+    raw_at_dft_ev = sigma_result.sigma_c_at_dft_diag_unextrap_ev
+    if raw_omega_ry is None or raw_at_dft_ev is None:
+        return results
+    raw_omega_ev = np.asarray(raw_omega_ry) * RYD_TO_EV
+    raw_at_dft_ev = np.asarray(raw_at_dft_ev, dtype=np.complex128)
+    if not config.no_degen_averaging:
+        energies = np.asarray(enk_dft, dtype=np.float64)
+        tol = float(config.degen_avg_tol_ry)
+        raw_omega_ev = average_within_degenerate_sets(
+            raw_omega_ev, energies_kn_ry=energies, tol_ry=tol)
+        raw_at_dft_ev = average_within_degenerate_sets(
+            raw_at_dft_ev, energies_kn_ry=energies, tol_ry=tol)
+    import dataclasses
+    return dataclasses.replace(
+        results, sigma_c_omega_diag_raw_ev=raw_omega_ev,
+        sigma_c_diag_at_dft_raw_ry=raw_at_dft_ev / RYD_TO_EV)
+
+
 def _assemble_gw_results(
         E_full, U_full, band_slices, config, e_eval_ev, efermi_dft_ev, enk_dft, eqp2_result,
         h_transverse, h_transverse_diag_ry, kin_ion, mode, omega_rel_ev,
@@ -1224,7 +1250,7 @@ def _assemble_gw_results(
             None if sigma_c_odd_at_dft_ev is None
             else np.asarray(sigma_c_odd_at_dft_ev) / RYD_TO_EV),
     )
-    return (results)
+    return _attach_raw_sigma(results, config, enk_dft, sigma_result)
 
 
 def _write_gw_results(
@@ -1407,8 +1433,11 @@ def _published_artifacts(rows, *, print_fn):
     return ok
 
 
-def _report_file_rows(args, config, input_dir, report, sigma_omega_h5_path, tensors_filename):
+def _report_file_rows(args, config, input_dir, report, sigma_omega_h5_path, tensors_filename,
+                      sigma_result=None):
     """Produce the report rows for consumed and generated files."""
+    raw_columns = getattr(
+        sigma_result, "sigma_c_at_dft_diag_unextrap_ev", None) is not None
     _file_rows = [
         ("input deck", "read", args.input),
         ("DFT wavefunctions", "read", config.paths.wfn_file),
@@ -1422,7 +1451,9 @@ def _report_file_rows(args, config, input_dir, report, sigma_omega_h5_path, tens
          config.paths.parallel_transport_file),
         ("ISDF restart tensors", "present" if os.path.exists(tensors_filename)
          else "absent", tensors_filename),
-        ("self-energy table", "written" if os.path.exists(
+        ("self-energy table" + (
+            " (+ raw sigC_raw, eqp0_raw, eqp1_raw: no band tail)"
+            if raw_columns else ""), "written" if os.path.exists(
             config.paths.sigma_diag_file) else "absent",
          config.paths.sigma_diag_file),
         (EQP0_FILE_ROLE,
@@ -1597,7 +1628,8 @@ def _run_gw_stages(args, _t_main, _pre_main, opened):
 	    None if sc_result is None else sc_result.qp_energies_ry)
 	(
 	    _file_rows) = _report_file_rows(
-	    args, config, input_dir, report, sigma_omega_h5_path, tensors_filename)
+	    args, config, input_dir, report, sigma_omega_h5_path, tensors_filename,
+	    sigma_result)
 	report.timings(timing.records(), wall=_wall)
 	report.warnings()
 	report.files(_file_rows)

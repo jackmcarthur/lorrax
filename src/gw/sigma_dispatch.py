@@ -144,6 +144,16 @@ class SigmaResult:
     #: the correction at the eqp level.  None everywhere else, which is what
     #: keeps the default path's object graph unchanged.
     sigma_xc_kij_ry_unextrap: jax.Array | None = None
+    #: The RAW Σ_c: the band sum truncated at the run's N bands (the last
+    #: bracket, before the spectral_shell tail), head included.  Its band
+    #: diagonal on the ω grid (n_omega, nk, nb) in Ry, and its value at
+    #: E_DFT (nk, nb) in eV, interpolated exactly as ``sigma_c_at_dft_
+    #: diag_ev``.  Same Σ evaluation as the extrapolated cube, so it costs
+    #: one diagonal gather.  Present only when the band extrapolation drives
+    #: this stage; the writers put it in the raw columns, which are the
+    #: BerkeleyGW-comparable numbers (BGW truncates at number_bands).
+    sigma_c_omega_diag_unextrap_ry: np.ndarray | None = None
+    sigma_c_at_dft_diag_unextrap_ev: np.ndarray | None = None
     sigma_c_omega_kij_ry: jax.Array | None = None
     sigma_band_axis: PaddedAxis | None = None
     sigma_c_at_dft_diag_ev: np.ndarray | None = None
@@ -264,6 +274,10 @@ SIGMA_BASIS_FIELDS = (
     "sigma_c_odd_at_dft_diag_ev",
     "head_sigma_diag_w_kn_ry",
     "e_eval_ev",
+    # The raw (un-extrapolated) Σ_c diagonals.  A diagonal cannot be
+    # rotated, so the SC finalize drops them: raw columns are one-shot only.
+    "sigma_c_omega_diag_unextrap_ry",
+    "sigma_c_at_dft_diag_unextrap_ev",
 )
 
 #: Band-indexed but read from the WFN file, hence DFT basis on every
@@ -317,6 +331,8 @@ SIGMA_RESULT_K_AXES = {
     "sigma_c_omega_kij_ry": 1,
     "sigma_c_at_dft_diag_ev": 0,
     "sigma_c_odd_at_dft_diag_ev": 0,
+    "sigma_c_omega_diag_unextrap_ry": 1,
+    "sigma_c_at_dft_diag_unextrap_ev": 0,
     "omega_dft_rel_ev": 0,
     "e_eval_ev": 0,
     "head_sigma_diag_w_kn_ry": 1,
@@ -551,6 +567,7 @@ def finalize_dynamic_sigma(
     from .dynamic_sigma import (
         add_head_sigma_diag,
         eval_sigma_c_at_dft_energies,
+        extract_sigma_diag_logical,
         sigma_omega_output_path,
         write_sigma_omega,
     )
@@ -687,10 +704,22 @@ def finalize_dynamic_sigma(
         # Its only consumer is the driver's side-by-side eqp report; it is
         # never mixed into the carry.
         sigma_xc_qsgw_unextrap = None
+        raw_diag_ry = raw_at_dft_ev = None
         if sigma_c_body_omega_unextrap is not None:
             sigma_c_omega_unextrap = add_head_sigma_diag(
                 sigma_c_body_omega_unextrap, head_sigma_diag_w_kn_ry,
                 band_axis=sigma_band_axis)
+            # The raw columns: the same diagonal gather and the same E_DFT
+            # interpolation that ``eval_sigma_c_at_dft_energies`` applies to
+            # the extrapolated cube, so an extrapolation-off run reproduces
+            # them.
+            from .qsgw_utils import interp_along_omega
+            raw_diag_ry = extract_sigma_diag_logical(
+                sigma_c_omega_unextrap, mesh_xy, band_axis=sigma_band_axis)
+            raw_at_dft_ev = interp_along_omega(
+                raw_diag_ry * RYD_TO_EV, omega_grid_ev, omega_dft_rel_ev,
+                context="raw Sigma_c at E_DFT (eqp0_raw/eqp1_raw)",
+                print_fn=lambda *args, **kwargs: None)
             sigma_xc_qsgw_unextrap, _ = build_qsgw_sigma_xc(
                 sigma_c_omega_unextrap, sig_x_rep,
                 omega_grid_ev, e_qp_rel_ev, mesh_xy,
@@ -730,6 +759,8 @@ def finalize_dynamic_sigma(
         sigma_xc_kij_ry=sigma_xc_qsgw,
         sigma_lorentz_skij_ry=sigma_lorentz,
         sigma_xc_kij_ry_unextrap=sigma_xc_qsgw_unextrap,
+        sigma_c_omega_diag_unextrap_ry=raw_diag_ry,
+        sigma_c_at_dft_diag_unextrap_ev=raw_at_dft_ev,
         sigma_c_omega_kij_ry=sigma_c_omega,
         sigma_band_axis=sigma_band_axis,
         sigma_c_at_dft_diag_ev=sigma_c_at_dft_ev,
