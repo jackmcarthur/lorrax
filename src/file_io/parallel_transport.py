@@ -751,12 +751,17 @@ def _write_link_stage(
           f"polar route={route}, matrix={polar_plan.n}, "
           "raw overlaps and links at P(None,x,y)", flush=True)
     overlaps, edge_ids = [], []
+    # Bind the stack's layout in the executable: on a 1 x 1 mesh an eager
+    # stack of P('x','y') faces carries no named layout.
+    stack_faces = jax.jit(
+        lambda *faces: jnp.stack(faces),
+        out_shardings=NamedSharding(mesh, P(None, "x", "y")))
 
     with SlabIO(path, mode="a", mesh=mesh) as io:
         def flush():
             if not overlaps:
                 return
-            link, values = polar_plan.batched(jnp.stack(overlaps))
+            link, values = polar_plan.batched(stack_faces(*overlaps))
             for j, (ik, direction) in enumerate(edge_ids):
                 io.write_slab(
                     LINKS_DATASET, link[j:j+1, None, :, :],
