@@ -91,7 +91,7 @@ These are the norms that make the codebase legible to humans and one-shottable b
 They are enforced by review and the regression gate, not by ceremony. When a convention
 forces a bigger change than the task, flag it — don't silently violate it. The sandbox
 claims ledger (`lorrax_sandbox/CLAIMS.md`) records what has been verified about the
-pipeline; the old refactor-map reports directory was purged.
+pipeline.
 
 ### Structure & style
 - **Procedural on plain arrays, not new API layers.** LORRAX is scientific code read by
@@ -115,8 +115,7 @@ pipeline; the old refactor-map reports directory was purged.
   A raw `jnp.fft` in a kernel is a bug.
 - **k/q dimensions are FLAT axes, never folded into the FFT grid.** Store and shard k-points
   (and q-points) as an explicit leading flat axis; do the spatial FFT over the grid axes only.
-  This keeps the k-axis independent of the spatial transform so FFT→NUFFT and flat-k batching
-  (see `project_flat_k_chi0_pipeline`) stay drop-in. Do not reshape k into the FFT box.
+  This keeps the k-axis independent of the spatial transform so FFT→NUFFT and flat-k batching stay drop-in. Do not reshape k into the FFT box.
 - **Big read-only host caches go through `io_callback`, never jit args.** ψ(G) and other large
   read-only arrays live on host (`common/psi_G_store.py`) and are pulled per-slice inside the
   jit via `io_callback`. Passing them as jit arguments replicates them on every device — an OOM.
@@ -124,21 +123,20 @@ pipeline; the old refactor-map reports directory was purged.
   hard-code mesh shapes. Let XLA move data — no `np.concatenate`, no host-side gathers.
 - **No replicated large intermediates.** We are memory-constrained; most large arrays only fit
   tiled over the XY grid. Any op that rematerializes a large array on a subset of processors is
-  a defect to fix, not a budget to work around (`feedback_zero_replicated_intermediates_principle`).
+  a defect to fix, not a budget to work around.
   Python-unrolled inner loops inside jit pile up N× unsharded slots — use `scan` *inside*
-  `shard_map`, not a naive `fori_loop` (`feedback_path_d_scaffolding_pattern`).
+  `shard_map`, not a naive `fori_loop`.
 
 ### Symmetry
 - **One IBZ table + one sym-action helper.** ψ, ζ, V_q, W transform as the same kind of object
   under space-group + TRS. Route every unfold through the canonical `SymMaps` table and a single
   sym-action helper. Do not add per-object "rotate X at q" variants (there are historically ≥6;
-  they are being retired — `feedback_unified_sym_action`). TRS index handling must be explicit;
+  they are being retired). TRS index handling must be explicit;
   never silently clip or nearest-fallback an unmapped k (that was the TRS-blind bug).
 
 ### Physics reporting
 - **Don't blame residuals on "ISDF rank" without evidence.** Plateau-shaped LORRAX-vs-BGW
-  disagreement rules out basis error — chase an algorithm/convention difference instead
-  (`feedback_no_isdf_rank_excuse`).
+  disagreement rules out basis error — chase an algorithm/convention difference instead.
 
 ### JAX sharding rules (restated)
 - Never hard-code mesh shapes. Refer to mesh axes by name (`'x'`, `'y'`).

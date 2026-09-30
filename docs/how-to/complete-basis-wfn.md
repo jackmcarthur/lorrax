@@ -3,7 +3,7 @@
 `psp.run_dense_h` rebuilds the Kohn–Sham Hamiltonian of a QE run as a dense
 matrix on each k's whole plane-wave sphere, diagonalizes it completely, and
 writes every band as a `WFN.h5`. The result is a drop-in WFN whose band sum is
-complete. Landed at R52 (main 35468d92, claim 2865).
+complete.
 
 ## What it builds
 
@@ -40,7 +40,7 @@ with gradients kept on the density sphere $|G|^2 \le E_\mathrm{rho}$.
 ## Requirements
 
 - **Patched `jax_xc`.** `psp.xc` imports `jax_xc` for PBE. The sealed runtime
-  has no `jax_xc` (release R52), so `psp.run_dense_h` and `psp.run_nscf` need the
+  has no `jax_xc`, so `psp.run_dense_h` and `psp.run_nscf` need the
   patched install of [`config/xc/README.md`](../../config/xc/README.md) on the
   import path.
 - **Inputs.** The QE `.save` with `charge-density.hdf5`, the UPF files the QE
@@ -51,7 +51,7 @@ with gradients kept on the density sphere $|G|^2 \le E_\mathrm{rho}$.
 One rank per GPU:
 
 ```bash
-lx run ... -- python3 -u -m psp.run_dense_h --save QE.save \
+python3 -u -m psp.run_dense_h --save QE.save \
     --wfn WFN.h5 -o WFN_complete.h5 --sys-dim 3
 ```
 
@@ -108,7 +108,7 @@ itself was measured on MoS2 at Γ, claim 2229). On the Fe run, 1 − subspace
 weight is 1.14e-8 at one band (k 6), which fails the 1e-8 gate by 1.14×; the
 claim attributes it to QE's Davidson threshold, ethr 1e-10 (claim 2865).
 
-The R52 landing gate reran Si 4³ scalar (537 bands, 8 k): max |Δε| 2.92e-7 Ry, 1 − subspace weight 5.1e-12. A gwjax
+A rerun of Si 4³ scalar (537 bands, 8 k): max |Δε| 2.92e-7 Ry, 1 − subspace weight 5.1e-12. A gwjax
 `x_only` run on the dense Si scalar WFN (34 bands, 368 centroids) reproduces
 Σ_x of the QE-WFN run within 2 µeV per band (claim 2865).
 

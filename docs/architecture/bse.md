@@ -56,7 +56,7 @@ store it (`gw.screening.driver_persists_w0`, `restart_static_w`):
 | shared pole on a metal, or `head_correction = full` without an ω = 0 head sample | nothing; the log says why |
 
 **Rebuilt W0.** With `W0_ready = false`, the loader calls
-`gw.static_screening.build_static_w_from_restart` (R56, `2784de492`). It reads
+`gw.static_screening.build_static_w_from_restart`. It reads
 the WFN and centroids named in the deck, authenticates them against the bundle's
 receipt, reuses the bundle's ζ and V, and solves the static Dyson equation
 $W = (1 - V\chi_0)^{-1}V$ at one frequency through the response owner
@@ -145,8 +145,8 @@ serves and printed once (`[bse] W term:`, `[bse] W term decode:`):
 
 1. T is formed from its two legs, $T = \sum_K L\,R$ with $K = \min(n_c, n_v)$,
    on the convolution's load, and the decode's (t, μ) contraction runs in its
-   store: neither T nor U reaches HBM (R44, R45; two warp groups since R54).
-2. T is formed on the load; U is stored and decoded by XLA (R44).
+   store: neither T nor U reaches HBM (two warp groups in ping-pong).
+2. T is formed on the load; U is stored and decoded by XLA.
 3. XLA builds T; the k-leading convolution reads it and writes U.
 
 The kernels, their refusals and the `LORRAX_BSE_OUTER_KSUM` A/B switch are in
@@ -161,7 +161,7 @@ Jornada–Yang, Algorithm 4), serves only `bse_nontda`'s matrix-free solver,
 which the CLI does not select. The ring matvec is also the screening operator
 of `bse.w_ladder` (`w_bse`), `bse.bse_w_exact` and `bse.w_omega_chain`.
 
-Measured on `main` 05b2e4f7 (release R54 gate; kernel claim 2874): CrI3
+Measured (claim 2874): CrI3
 8×8×1 SOC, 8v × 14c, P4 A100-40GB. One Haydock step (D + V − W on three
 trials) takes 13.2–13.4 ms; 100 steps take 1.28 s; the solve peak is 2159 MiB
 per rank. The fused kernel runs at 2.27× the flop floor.
@@ -194,7 +194,7 @@ not the dipoles.
 least two devices. It seeds one Lanczos recursion per polarization; the three
 seeds are one trial block of the stack matvec. It does not reorthogonalize and
 runs 200 steps by default. Claim 2848 measured the solver on CrI3 8×8×1 SOC
-(with bare V as W, before R56) against a 500-state sum over states plus a
+(with bare V as W) against a 500-state sum over states plus a
 deflated CGS2 tail: at 200 steps both the plain and the CGS2 recursion agree
 with it to ≤ 1e-5 of max ε₂; at 100 steps both are truncated, 0.2–0.5% of
 max ε₂ off. The ε₂ normalization and its BerkeleyGW match are in

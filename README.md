@@ -16,19 +16,9 @@ Available as console commands: `gw_jax`, `lorrax-gw`, `lorrax-centroids` (= `cen
 
 [Try it](docs/index.md#try-it) runs every driver on the bundled test fixture, and the [Quickstart](docs/quickstart.md) walks through it and through a first calculation on your own `WFN.h5`. The native FFI pair is required at every process count ([Installation](docs/installation/index.md)).
 
-Which runtime is the default on which machine: [runtime defaults](docs/installation/index.md#defaults). A NERSC Perlmutter clone for development is [installation/perlmutter.md](docs/installation/perlmutter.md) (`uv sync --extra cuda13`, two build scripts, `srun`). On Frontera this differs; see [`docs/environment/machines/frontera.md`](docs/environment/machines/frontera.md) and the working examples below.
+Which runtime is the default on which machine: [runtime defaults](docs/installation/index.md#defaults). A NERSC Perlmutter clone for development is [installation/perlmutter.md](docs/installation/perlmutter.md) (`uv sync --extra cuda13`, two build scripts, `srun`). On Frontera this differs; see [`docs/environment/machines/frontera.md`](docs/environment/machines/frontera.md).
 
-On TACC Frontera (CPU, apptainer + srun), working invocations from the certified scripts (`config/frontera/templates/gw_dev.sbatch`, the mos2_4x4_test sbatch family):
-
-```bash
-# preprocessing, single node / single process (deck_b300.sbatch steps 3-4):
-python3 -u -m centroid.kmeans_cli 3000 --orbit --out-suffix _b300_c3000
-python3 -u -m gw.kin_ion_io -i deck_b300.in -o kin_ion_b300.h5 -n 300
-
-# multi-node GW via the certified launch block (gw_ht_b300.sbatch):
-export LORRAX_ROOT=... LORRAX_RUN_DIR=... LORRAX_INPUT=gw.in
-bash $LORRAX_ROOT/config/frontera/templates/gw_dev.sbatch
-```
+On TACC Frontera (CPU) the launch block is `config/frontera/templates/gw_dev.sbatch`; [`config/frontera/README.md`](config/frontera/README.md) owns its variables.
 
 ## Documentation
 

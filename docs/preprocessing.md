@@ -113,8 +113,8 @@ Neither tool is on `PATH` by default. Measured 2026-08-06:
 Since the spinor path needs a patched `pw2bgw.f90` (§2), the NERSC `espresso` modules will
 not supply it — that route requires your own QE build.
 
-Run all of this on a compute node with [`lx run`](environment/machines/perlmutter.md#1-entry-point-lx),
-not on a login node.
+Run all of this on a compute node (`srun`, as in
+[Installation › Perlmutter](installation/perlmutter.md#suite)), not on a login node.
 
 ## 4. `vxc.dat` and `kih.dat`
 

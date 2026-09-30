@@ -47,16 +47,6 @@ bands. The Na stages run in `run/na/`.
 | na_dipole | `psp.get_dipole_mtxels` | the default dipole: q→0 velocity plus the parallel-transport link artifact |
 | na_sc | `gw.gw_jax` | metal shared-pole QSGW, 2 maps to a 1.5 eV criterion, production defaults: Fermi-Dirac fixed-N occupations and metal head, `number_bands_protected = 8` (QP matrix 1–8, tail 9–13), 2s and 2p read on two coarse windows at η 5 eV, `sc_semicore = dft`, the rigid tail with min(Z, 1/Z) weights, spectral_shell extrapolation, held Σ windows re-planned on escape, `write_qsgw_datasets`, the unnamed `sc_head_update`, which resolves to `parallel_transport` (the 3³ links fail `GATE pt_head_window_hybridized`, so the map runs with the Σ term D_kΔH zeroed) with its per-map head block, distributed linalg |
 
-Cut from the suite (2026-09-30, suite wall), with what covers each path now:
-- `shared_pole_sc` (H2+ scalar shared-pole QSGW, 2 maps, about 20 s warm):
-  `na_sc` runs the scalar shared-pole SC driver at the production defaults,
-  with distributed linalg and `write_qsgw_datasets`; the ordered
-  (time-reversal-broken) scalar store with the direct head stays covered by
-  `sp_export` (one-shot), and an ordered store through the SC driver by
-  `bisp_sc`. `bse` and `exciton_bands` now read the GN-PPM W0 (the SC stage
-  used to overwrite it with its final map's); their references were
-  regenerated.
-
 All stages run in one Python process per rank (`chain.run_stage` calls each
 driver's `main` in sequence): one `jax.distributed` world, one FFI load, one
 compile cache. No driver code changes were needed for re-entry. Between
