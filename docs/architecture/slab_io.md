@@ -57,7 +57,7 @@ the dataset's extent.
 - **Row-block pieces, written independently.** The operand is cut into pieces of
   `lead` indices of the lead axis (the last axis before the split axis `k` with
   more than one valid index) by one index of each other leading axis by `rows`
-  rows of `k` by every later axis whole. Each piece is redistributed on the device so that rank r holds rows
+  rows of `k` by every later axis whole. Each piece is sliced inside a manual sharding region on the owned input shards, then redistributed by one volume-preserving exchange per mesh axis so that rank r holds rows
   `[r·rows/P, (r+1)·rows/P)`, then written with `lorrax_phdf5_write_independent`
   (independent `H5Dwrite`). Each rank then writes one contiguous file run per
   leading index. A piece is at most `_FILE_ORDER_PIECE_BYTES` (64 MiB) per rank,
@@ -69,7 +69,7 @@ the dataset's extent.
 - **As-is, collective.** Everything else keeps two-phase collective `H5Dwrite`
   (`lorrax_phdf5_write`): P = 1, a tiny slab, a layout that could only be cut by
   slicing a sharded axis (a face `(q, μ_X, ν_Y)` tile too large to take whole),
-  or pieces whose per-rank runs would be shorter than 1 MiB.
+  pieces whose per-rank runs would be shorter than 1 MiB, or compound source-axis layouts without an explicit file-row mover.
 - **Why:** at P16 on Lustre (A100-40GB nodes), the shared-pole bank write at
   production spread runs at 2.4 GB/s against 2.0 GB/s collective, a WFN_qp G
   window at 4.1 against 2.8, and the 66 GB CrI3 16×16 WFN_qp write at 30 s
