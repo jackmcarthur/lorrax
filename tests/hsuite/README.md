@@ -1,20 +1,35 @@
-# Driver suite on the magnetic H2+ spinor and bcc Na fixtures
+# Driver suite on the magnetic H2⁻ spinor and bcc Na fixtures
 
 The test suite is the production drivers run end to end on two tiny systems,
-a magnetic H2+ spinor cell and a bcc Na metal, at P4 on one node, checked
+a magnetic H2⁻ spinor cell and a bcc Na metal, at P4 on one node, checked
 against stored outputs.
 
 ## Fixture
 
-`fixture/`: two H atoms with one electron (`tot_charge = 1`), noncollinear
-with spin-orbit, magnetized along y (total moment 1.000 μB), in an 8 × 9 × 10
-bohr monoclinic cell with a y screw axis (rotation diag(−1, 1, −1),
-translation (0, ½, 0)). 8 Ry cutoff, 9 two-component bands, 5 × 5 × 1 k-grid
-(25 full, 9 stored). The gap is 0.048 eV between the exchange-split bonding
-states, so the occupied set is one band and time reversal is broken. Built
-2026-09-05 by QE 7.3.1 SCF → NSCF → pw2bgw → wfn2hdf; `scf_receipt.json` is
-the registered SCF parser's receipt. It is a software fixture, not a
-converged physical reference.
+`fixture/`: two H atoms with three electrons (`tot_charge = -1`),
+noncollinear with spin-orbit, magnetized along y (total moment 1.000 μB), in
+an 8 × 9 × 10 bohr monoclinic cell with a y screw axis (rotation
+diag(−1, 1, −1), translation (0, ½, 0)). LDA (`input_dft = 'pz'`) on the PBE
+`H.upf`, 8 Ry cutoff, 9 two-component bands, 5 × 5 × 1 k-grid (25 full, 9
+stored). The indirect gap is 0.072 eV, the occupied set is three bands and
+time reversal is broken. At Γ each band density of bands 1–7 is invariant
+under the header's four operations to 3e-10. Built 2026-09-30 by QE 7.4.1
+SCF → NSCF → pw2bgw with the SOC branch-selection patch, then wfn2hdf
+(`runs/H2/07_fixturefix_20260930` in the sandbox); `scf_receipt.json` is the
+registered SCF parser's receipt. It is a software fixture, not a converged
+physical reference.
+
+Why not H2⁺, and why not GGA: with one electron |m| = ρ at every grid point
+to round-off. QE's spin-polarized gradient correlation (`gcc_spin`,
+`XClib/qe_drivers_gga.f90:1078-1082`) skips a point where |ζ| > 1 and clamps
+ζ to 1 − 10⁻⁶ elsewhere, so round-off picks the points, and the potential
+does not have the cell's symmetry. QE's general noncollinear GGA branch takes
+the same path. The H2⁺ PBE fixture it replaces had Γ band densities that
+moved by 5e-3 to 9e-2 under the screw axis and the inversion, and a
+symmetry-reduced run printed two q↔−q reciprocity `SANITY FAILURE` lines.
+LDA on H2⁺ still leaves a (1 − ζ)^(1/3) round-off floor in the minority
+potential (5e-8 on bands 3–4). With three electrons the minority density is
+finite.
 
 `fixture_na/`: bcc Na, one atom, PseudoDojo nc-sr-04 PBE (9 electrons:
 2s at −64 eV and 2p at −22 eV lie 20 eV below the 3s band), 25 Ry cutoff,

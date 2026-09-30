@@ -126,7 +126,7 @@ zeta_loader = { workspace = true }
 members = ["services/*"]
 
 [tool.pytest.ini_options]
-# The suite is tests/hsuite (the driver chain on the magnetic H2+ fixture)
+# The suite is tests/hsuite (the driver chain on the magnetic H2⁻ fixture)
 # plus the static AST suites beside it; see tests/README.md.  `bench` holds
 # standalone benchmark drivers, not pytest suites.
 testpaths = ["tests"]

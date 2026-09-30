@@ -107,7 +107,7 @@ Run `pw2bgw.x` right after the NSCF: each `pw.x` run overwrites `<prefix>.save/`
 
 | QE version | `pw2bgw.x` |
 |---|---|
-| 7.3.1 | The stock tool exports a noncollinear magnetic WFN and keeps its symmetry operations. The bundled H2+ fixture was written this way, with NERSC's `espresso/7.3.1-libxc-6.2.2-cpu` module (4 operations, 2 with fractional translations). |
+| 7.3.1–7.5 | The stock tool exports a noncollinear magnetic WFN and keeps its symmetry operations (4 operations, 2 with fractional translations, on the bundled H2⁻ fixture). The fixture was written by the 7.4.1 tool; the 7.5 module writes the same header. |
 | 7.2 | BerkeleyGW ships a replacement source, `MeanField/ESPRESSO/version-7.2/pw2bgw_qe7.2_with_spinor_mag.f90` in the BerkeleyGW 4.0 tree. Copy it over `PP/src/pw2bgw.f90` in the QE 7.2 source and rebuild QE. Its README allows magnetization only in a run with no symmetries. LORRAX has not been run on its output. |
 
 No patch is kept in this repository.
@@ -121,8 +121,10 @@ Neither tool is on `PATH` by default:
 | `wfn2hdf.x`, `hdf2wfn.x`, `kgrid.x` | `module load berkeleygw/4.0-gcc-12.3` (or `4.0-nvhpc-23.9`), which prepends `/global/common/software/nersc9/berkeleygw/zen3/gcc-12/mpich/berkeleygw/BerkeleyGW-4.0/bin` |
 | `pw.x`, `pw2bgw.x` | `module load espresso/7.3.1-libxc-6.2.2-cpu` (or `espresso/7.5-libxc-7.0.0-cpu`). `pw2bgw.x` is a Quantum ESPRESSO tool and is not in the BerkeleyGW module. |
 
-The two bundled fixtures were built with these modules: the magnetic spinor H2+ cell with
-7.3.1, the scalar Na cell with 7.5. No private QE build is needed.
+The scalar Na fixture was built with the 7.5 module. The magnetic spinor H2⁻ fixture was built
+with a QE 7.4.1 `pw.x` carrying a two-line SOC branch-selection patch. Its SCF is LDA, which
+has no GGA branch, and the stock 7.5 module rebuilds it with Γ band densities symmetric to
+4e-9 (bands 1–7). No private QE build is needed.
 
 Run all of this on a compute node (`srun`, as in
 [Installation › Perlmutter](installation/perlmutter.md#suite)), not on a login node.

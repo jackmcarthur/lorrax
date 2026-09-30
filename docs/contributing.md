@@ -42,8 +42,8 @@ direction and the driver plumbing budgets ([Layers](architecture/layers.md)),
 > run something on one GPU and then learn it doesn't generalize later"*.
 
 The suite is `tests/hsuite`: the production drivers run end to end on two tiny
-fixtures, at P4 on one node, all in one process per rank. On a magnetic H2+
-cell (two H atoms, one electron, noncollinear with spin-orbit, time reversal
+fixtures, at P4 on one node, all in one process per rank. On a magnetic H2⁻
+cell (two H atoms, three electrons, noncollinear with spin-orbit, time reversal
 broken) the chain is kmeans → kin_ion → dipole → gwjax GN-PPM one-shot → BSE →
 htransform → exciton bands, then restarted COHSEX, a shared-pole one-shot with
 its W and pole exports, and the four-component chain (kin_ion, dipole, 2-map
