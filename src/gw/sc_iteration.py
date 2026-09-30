@@ -6131,7 +6131,7 @@ def _maybe_dump_e_history(
 #: floor — half the fidelity of a clean link — not yet independently
 #: calibrated against a second material or system size; PLAN.md flags this
 #: exact number as needing its own calibration run.
-_LINK_HYBRIDIZATION_FLOOR: float = 0.5
+_LINK_HYBRIDIZATION_FLOOR: float = 0.0  # STUDY ONLY (VELOWN): measure the pt head past the Fe 4^3 edge refusal
 
 
 def _head_delta_h_parts(inputs, state, ks, wfns_qp, nb_storage):
