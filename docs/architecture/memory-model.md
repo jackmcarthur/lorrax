@@ -243,7 +243,9 @@ assignment cannot see: a donated carry the caller allocated, a native
 handler's run-time scratch, a lookahead copy of the output. At or below the
 closed form, or within the room, the chunk runs unchanged. Above both, the
 slope is corrected from that one point, `per_unit = (compiled − fixed)/chunk`,
-the chunk solved directly, and compiled once more. There is no bisection; a second figure still over the room refuses.
+the chunk solved directly, and compiled once more. There is no bisection; a second figure still over the room refuses. An
+over-budget minimum chunk also refuses before dispatch, even when the
+closed-form price already predicted that excess.
 The direct stream's check compiles through the dispatch's own executable cache
 (`gw.response_bank._compiled`), so the checked executable is the one that runs.
 Reading a figure costs 0.01–0.07 s for the direct stream, 0.02–0.12 s for the
