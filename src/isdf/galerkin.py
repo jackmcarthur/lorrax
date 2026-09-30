@@ -197,27 +197,51 @@ def validate_rank_multiplier(value, *, name: str = "rank_multiplier") -> float:
     return multiplier
 
 
-@partial(jax.jit, static_argnames=("selected_rows", "physical"))
-def _galerkin_rank_metrics(ctilde, selection_factor, *,
-                           selected_rows: tuple[int, ...], physical: int):
-    """Reduce one fitted basis to the scalar numerical rank receipts."""
-    nk, nb, carrier = ctilde.shape
-    gram = jnp.einsum(
-        "kna,kma->knm", ctilde, jnp.conj(ctilde), optimize=True)
-    eye = jnp.eye(nb, dtype=ctilde.dtype)[None]
-    row_norm = jnp.real(jnp.diagonal(gram, axis1=1, axis2=2))
-    reference = selection_factor[:physical]
-    selected = jnp.asarray(selected_rows, dtype=jnp.int32)
-    picked = ctilde.reshape(nk * nb, carrier)[selected]
-    selected_scale = jnp.maximum(1.0, jnp.max(jnp.abs(reference)))
-    return (
-        jnp.min(jnp.real(jnp.diag(selection_factor))[:physical]),
-        jnp.max(jnp.abs(gram - eye)),
-        jnp.max(jnp.abs(row_norm - 1.0)),
-        jnp.sqrt(jnp.maximum(0.0, 1.0 - jnp.mean(row_norm))),
-        jnp.max(jnp.abs(picked - reference)),
-        selected_scale,
-    )
+def _galerkin_rank_metrics_kernel(mesh, shape, *, selected_rows, physical):
+    """Scalar receipts from all-P state slabs, with no full coefficient gather."""
+    nk, nb, rank = (int(v) for v in shape)
+    p = int(mesh.size)
+    if rank % p:
+        raise ValueError("Galerkin rank receipt needs an all-P rank carrier")
+    nk_carrier = -(-nk // p) * p
+    axes = ("x", "y")
+    spec = P(None, None, axes)
+    from jax.experimental.layout import Layout, with_layout_constraint
+
+    @partial(shard_map, mesh=mesh, in_specs=(spec, P()),
+             out_specs=(P(),) * 6, check_vma=False)
+    def _metrics(local, factor):
+        owner = jax.lax.axis_index("x") * int(mesh.shape["y"]) + jax.lax.axis_index("y")
+        selected = jnp.asarray(selected_rows, dtype=jnp.int32)
+        picked = local.reshape(nk * nb, rank // p)[selected]
+        reference = jax.lax.dynamic_slice_in_dim(
+            factor[:physical], owner * (rank // p), rank // p, axis=1)
+        selected_error = jax.lax.pmax(jnp.max(jnp.abs(picked - reference)), axes)
+        rows = jnp.pad(local, ((0, nk_carrier - nk), (0, 0), (0, 0)))
+        rows = with_layout_constraint(rows, Layout(major_to_minor=(0, 1, 2)))
+        rows = jax.lax.all_to_all(rows, axes, split_axis=0, concat_axis=2, tiled=True)
+        gram = jnp.einsum("kna,kma->knm", rows, jnp.conj(rows), optimize=True)
+        row_norm = jnp.real(jnp.diagonal(gram, axis1=1, axis2=2))
+        valid = (owner * (nk_carrier // p) + jnp.arange(nk_carrier // p)) < nk
+        orthogonality = jax.lax.pmax(jnp.max(jnp.where(
+            valid[:, None, None], jnp.abs(gram-jnp.eye(nb, dtype=gram.dtype)), 0.0)), axes)
+        missing_norm = jax.lax.pmax(jnp.max(jnp.where(
+            valid[:, None], jnp.abs(row_norm-1.0), 0.0)), axes)
+        norm_sum = jax.lax.psum(jnp.sum(jnp.where(valid[:, None], row_norm, 0.0)), axes)
+        return (jnp.min(jnp.real(jnp.diag(factor))[:physical]),
+                orthogonality, missing_norm,
+                jnp.sqrt(jnp.maximum(0.0, 1.0-norm_sum/(nk*nb))),
+                selected_error, jnp.maximum(1.0, jnp.max(jnp.abs(factor[:physical]))))
+
+    return jax.jit(_metrics,
+                   in_shardings=(NamedSharding(mesh, spec), NamedSharding(mesh, P())),
+                   out_shardings=(NamedSharding(mesh, P()),) * 6)
+
+
+def _galerkin_rank_metrics(ctilde, selection_factor, *, selected_rows, physical):
+    return _galerkin_rank_metrics_kernel(
+        ctilde.sharding.mesh, ctilde.shape, selected_rows=selected_rows,
+        physical=physical)(ctilde, selection_factor)
 
 
 def galerkin_rank_record(basis: GalerkinBasis, *, meta,
@@ -577,7 +601,7 @@ def _projection_bytes(geom: dict, *, band_carrier: int, rank: int,
     n_chunks = geom["n_band_chunks"](band_carrier)
     full_cols = -(-n_r // p)
     resident = (rank * ns * full_cols * _C16
-                + nk * (1 + n_chunks / p) * band_carrier * rank * _C16)
+                + nk * (1 + 2 * n_chunks / p) * band_carrier * rank * _C16)
     return (resident + geom["g_index"] + nk * bpd * ns * n_r * _C16
             + max(int(k_tile) * bpd * geom["row_fft"],
                   2 * nk * bpd * ns * local_cols * p * _C16))
