@@ -19,7 +19,7 @@ in this file, in execution order:
 Two orthogonal config axes pivot the flow: ``compute_mode`` — the
 self-energy ansatz (``x_only`` / ``cohsex`` / ``gn_ppm`` / ``hl_ppm`` /
 ``mpa``) — and ``qp_solver`` — how QP energies are extracted
-from Σ (``one_shot_dft`` / ``fixed_point`` / ``self_consistent``).  The
+from Σ (``one_shot_dft`` / ``self_consistent``).  The
 self-consistent path iterates the same ``compute_sigma_xc`` dispatch;
 iteration 1 reproduces the one-shot result exactly (gated by
 ``tests/test_invariance_gates.py::test_sc_iteration1_equals_one_shot``).

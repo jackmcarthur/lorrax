@@ -594,9 +594,10 @@ keys themselves are in the [input reference](../input_reference.md).
   `C_OMEGA`; `label` is the prose spelling. `explain_missing_channels` is the
   named-omission clause a writer appends when it declines a channel.
 - **`QPSolver`** is orthogonal to `compute_mode`: `one_shot_dft` (default;
-  QSGW-Hermitianized Σ_xc at E_DFT diagonalized once), `fixed_point` (diagonal
-  on-shell solve; dynamic modes only, a static mode refuses), and
-  `self_consistent` (the QSGW loop). `LorraxConfig.qp_solver`: `auto` resolves
+  QSGW-Hermitianized Σ_xc at E_DFT diagonalized once) and
+  `self_consistent` (the QSGW loop, Σ at each map's own energies). No QP
+  root is solved; `fixed_point` is retired and refuses by name (owner
+  2026-09-29). `LorraxConfig.qp_solver`: `auto` resolves
   to `self_consistent` on the deprecated `self_consistent = true`, else
   `one_shot_dft`. eqp0/eqp1 use the same at-DFT formula under every solver.
 - **`resolve_band_extrapolation`**: `use_band_extrapolation` is the key and

@@ -1,4 +1,4 @@
-"""Diagonal-Σ(E) fixed point, QSGW Σ_xc build, and SC-COHSEX diagnostics.
+"""QSGW Σ_xc build, the one-shot update_H seam, and SC-COHSEX diagnostics.
 
 The post-self-energy plumbing in ``gw_jax`` accepts replicated or
 band-sharded ``(nk, nb, nb)`` arrays.  The dynamic correlation
@@ -7,10 +7,8 @@ their band tiles; diagonal-only operations extract and return only the bounded
 ``(nk, nb)`` diagonal.  Everything in this module is structured around that
 seam:
 
-- :func:`solve_qp`'s ``fixed_point`` branch solves the diagonal on-shell
-  equation through ``eqp_bgw.solve_qp_root`` (the diagonal-root owner) on
-  host NumPy.  Its input ``Σ_diag(ω, k, n)`` is small enough to live
-  replicated.
+- :func:`solve_qp` is the one-shot pass-through ``Σ_xc + V_H``; no QP
+  equation is solved anywhere (Σ is read at the present energies).
 - :func:`build_qsgw_sigma_xc` is a JIT'd JAX kernel that takes the
   on-device sharded ``Σ_c(ω)`` and the QP energies ``E_kn`` (replicated)
   and returns the Hermitised QSGW Σ_xc in the selected replicated or
@@ -700,7 +698,7 @@ def build_qsgw_sigma_xc(
     # Numpy → replicated, placed PROCESS-LOCALLY: a bare ``jax.device_put``
     # of host numpy onto a multi-process replicated sharding silently runs
     # multihost ``assert_equal`` — four hidden P-linear all-gathers of
-    # (nk, nb) tables on every fixed_point solve (AO-sweep straggler class,
+    # (nk, nb) tables on every QSGW build (AO-sweep straggler class,
     # scorecard AA.1/Y.5; converted 2026-07-28).  The idx/w tables are pure
     # deterministic functions (np.searchsorted/clip) of the replicated E and
     # ω inputs — bit-identical on every rank by construction, which is
@@ -755,7 +753,7 @@ def write_qsgw_sigma_cube(
     ``gw_config._DEFAULTS`` for what the appendix is and why it is off by
     default).  Returns whether anything was written.
 
-    THREE CALL SITES, AND THEY ARE NOT INTERCHANGEABLE.  Each hands over
+    TWO CALL SITES, AND THEY ARE NOT INTERCHANGEABLE.  Each hands over
     a QSGW build — Σ_x + Σ_c^QSGW, already Hermitised by
     :func:`build_qsgw_sigma_xc`'s closing ``½(M + M†)`` — at the one
     moment its own path has the build that goes into H, in the basis the
@@ -767,10 +765,6 @@ def write_qsgw_sigma_cube(
       ``write_sigma_omega_h5`` flag that decided whether the file was
       written at all, so it cannot fire during an SC iteration (which
       passes False and writes nothing).
-    * :func:`solve_qp`'s ``fixed_point`` branch, which REBUILDS at the
-      solved on-shell energies and therefore supersedes the at-DFT cube
-      the dispatch just wrote.  The append replaces the dataset, so the
-      file ends up holding the Σ that actually built the Hamiltonian.
     * ``gw.sc_iteration.dump_sigma_omega_h5_final``, right after the
       converged single write, and BEFORE ``run_sc_driver`` rotates the
       matrix back to the DFT basis.
@@ -806,7 +800,7 @@ def write_qsgw_sigma_cube(
 
 
 # ---------------------------------------------------------------------------
-# update_H — the qp_solver dispatch (one-shot / fixed-point)
+# update_H — the one-shot qp_solver seam
 # ---------------------------------------------------------------------------
 
 def solve_qp(
@@ -818,162 +812,32 @@ def solve_qp(
     mesh_xy: Mesh,
     print_fn=print,
 ) -> jax.Array:
-    """``update_H[Σ; qp_solver]`` — turn a :class:`~gw.sigma_dispatch.SigmaResult`
-    into ``sigma_total = Σ_xc + V_H`` (Ry) whose eigh
-    yields the QP eigenstates.
+    """``update_H[Σ; one_shot_dft]`` — turn a :class:`~gw.sigma_dispatch.SigmaResult`
+    into ``sigma_total = Σ_xc + V_H`` (Ry) whose eigh yields the QP
+    eigenstates.
 
-    The three QP-energy definitions (see ``LorraxConfig.qp_solver``):
-
-    - ``one_shot_dft`` — the full-matrix QSGW-Hermitianised Σ_xc was
-      already evaluated at E_DFT inside ``compute_sigma_xc`` (the same
-      call the SC iteration map makes), so this is a pass-through.  Its
-      subsequent ``eigh`` result is distinct from the fixed-DFT-state
-      diagonal G0W0 result written to ``eqp0.dat``.
-      Static modes (X_ONLY / COHSEX) and the streamed-Σ_c stand-in land
-      here too: ``sigma_xc_kij_ry`` is the mode's total Σ_xc by
-      construction.
-    - ``fixed_point`` — the diagonal on-shell root E = h₀ + ReΣ(E) of
-      ``eqp_bgw.solve_qp_root`` followed by a QSGW rebuild at the solved
-      energies.  A band off the ω grid at any k keeps E_DFT; an in-grid
-      state with no root on its bracket refuses
-      (``GATE qp_fixed_point_no_root``); an off-grid evaluation in the rebuild reads
-      Σ(ω = 0) whatever ``sigma_out_of_grid`` says (``build_qsgw_sigma_xc``
-      is called with its default).  Dynamic, non-streamed only
-      (validated at config load).  The dispatch's internal at-DFT build
-      is superseded here — one redundant (cheap) QSGW contraction, the
-      price of keeping ``compute_sigma_xc``'s signature uniform.
-    - ``self_consistent`` is NOT handled here — the SC driver owns its
-      own loop and rotation-back seam (``sc_iteration``).
-
-    All quantities are in **Rydberg** until the eV seam of the QSGW build
-    kernel.  Σ_c(ω) lives natively in
-    Ry on the Ry ω-grid; mixing that with eV-converted h0/Σ_x is a
-    footgun.
+    The full-matrix QSGW-Hermitianised Σ_xc was already evaluated at E_DFT
+    inside ``compute_sigma_xc`` (the same call the SC iteration map makes),
+    so this is a pass-through: no QP equation is solved.  Its ``eigh``
+    result is distinct from the fixed-DFT-state diagonal G0W0 result written
+    to ``eqp0.dat``.  Static modes (X_ONLY / COHSEX) land here too:
+    ``sigma_xc_kij_ry`` is the mode's total Σ_xc by construction.
+    ``self_consistent`` is NOT handled here — the SC driver owns its own
+    loop, which evaluates Σ at each map's own energies (``sc_iteration``).
     """
     from .gw_config import QPSolver, qp_solver_semantics
 
-    # ONE BASIS ASSUMED across these two reads, and across the sig_x /
-    # omega_dft_rel_ev reads in the FIXED_POINT branch below.  SC owns its
-    # own loop and never reaches this function; the object here is the
-    # one-shot one, DFT basis throughout.
-    sig_h = sigma_result.v_h_kij_ry
-    sigma_c_omega = sigma_result.sigma_c_omega_kij_ry
-
-    if qp_solver is not QPSolver.FIXED_POINT or sigma_c_omega is None:
-        if config.compute_mode.is_dynamic and sigma_c_omega is not None:
-            print_fn(
-                "  QP solver: one_shot_dft — "
-                + qp_solver_semantics(QPSolver.ONE_SHOT_DFT).description)
-        return sigma_result.sigma_xc_kij_ry + sig_h
-
-    # QPSolver.FIXED_POINT: diagonal Σ(E) fixed point in Ry.
-    # Diagonal Σ_c(ω, k, n) and Σ_x(k, n) replicated on host, in Ry.
-    sig_x = sigma_result.sigma_x_kij_ry
-    omega_grid_ry = np.asarray(sigma_result.omega_grid_ry, dtype=np.float64)
-    E_dft_rel_ry = np.asarray(
-        sigma_result.omega_dft_rel_ev, dtype=np.float64) / RYD_TO_EV
-
-    sigma_c_diag_w_kn_ry = np.asarray(extract_sigma_diag_replicated(
-        sigma_c_omega, mesh_xy))
-    band_axis = sigma_result.sigma_band_axis
-    if band_axis is not None:
-        from runtime.padding import strip_axis
-        sigma_c_diag_w_kn_ry = np.asarray(strip_axis(
-            sigma_c_diag_w_kn_ry, band_axis, axis=-1))
-    sigma_x_diag_kn_ry = np.real(
-        static_sigma_diag_to_host(sig_x, mesh_xy))
-
-    h0_diag_ry = (
-        np.real(static_sigma_diag_to_host(kin_ion, mesh_xy))
-        + np.real(static_sigma_diag_to_host(sig_h, mesh_xy)))
-    efermi_ry = float(sigma_result.efermi_dft_ev) / RYD_TO_EV
-
-    # The diagonal on-shell root E = h₀ + Σ_x + ReΣ_c(E) has ONE owner,
-    # eqp_bgw.solve_qp_root (the root eqp_root.dat reports): bracketed from
-    # E_DFT toward eqp0 = h₀ + Σ_x + ReΣ_c(E_DFT), so its static part is
-    # exactly h₀ + Σ_x, and the first sign change of the piecewise-linear
-    # residual is solved in its cell.  It has no iteration to leave
-    # unconverged; a state with no root on the sampled bracket says so.
-    from .eqp_bgw import QP_RES_Z, QP_STATUS_NAMES, solve_qp_root
-    omega_grid_ev = omega_grid_ry * RYD_TO_EV
-    E_dft_rel_ev = E_dft_rel_ry * RYD_TO_EV
-    sigma_c_diag_w_kn_ev = sigma_c_diag_w_kn_ry * RYD_TO_EV
-    static_rel_ev = (h0_diag_ry - efermi_ry + sigma_x_diag_kn_ry) * RYD_TO_EV
-    eqp0_rel_ev = static_rel_ev + np.real(interp_along_omega(
-        sigma_c_diag_w_kn_ev, omega_grid_ev, E_dft_rel_ev))
-    root = solve_qp_root(
-        sigma_c_omega_diag_ev=sigma_c_diag_w_kn_ev,
-        omega_rel_ev=omega_grid_ev, e_in_rel_ev=E_dft_rel_ev,
-        eqp0_rel_ev=eqp0_rel_ev, reference_ev=0.0)
-    E_sc_rel_ry = root.e_ev / RYD_TO_EV
-
-    # A band is "in-grid" iff E_DFT[k, n] lies in [ω_min, ω_max] for every
-    # k; if any single k is outside, the band keeps E_DFT at every k, so
-    # one off-grid k cannot contaminate the band's k-dispersion.  E_DFT is
-    # the zeroth-order QP correction = 0 estimate.
-    from .scissor import classify_bands_in_grid
-    band_in_grid, in_grid_kn_band = classify_bands_in_grid(
-        E_dft_rel_ry, float(omega_grid_ry[0]), float(omega_grid_ry[-1]))
-    # QP and RES_Z rows are roots of the equation; RES_BRACKET (no root on
-    # the fully sampled bracket: a resonance) and OFF_GRID (the bracket
-    # leaves the grid before the residual changes sign) have none.
-    no_root = in_grid_kn_band & (root.status > QP_RES_Z)
-    if np.any(no_root):
-        k0, n0 = (int(i) for i in np.argwhere(no_root)[0])
-        counts = {name: int(np.count_nonzero(no_root & (root.status == code)))
-                  for code, name in enumerate(QP_STATUS_NAMES)
-                  if code > QP_RES_Z}
+    del kin_ion, mesh_xy
+    if qp_solver is not QPSolver.ONE_SHOT_DFT:
         raise ValueError(
-            "GATE qp_fixed_point_no_root: qp_solver = fixed_point found no "
-            "root of E = h0 + Sigma_x + Re Sigma_c(E) on the sampled "
-            f"bracket [E_DFT, eqp0] for {int(np.count_nonzero(no_root))} "
-            f"state(s) of bands on the Sigma(omega) grid ({counts}); e.g. "
-            f"k {k0}, Sigma band {n0}, E_DFT - E_F = "
-            f"{float(E_dft_rel_ev[k0, n0]):.4f} eV "
-            f"({QP_STATUS_NAMES[int(root.status[k0, n0])]}).  FALSE case: "
-            "every in-grid state has a root "
-            "(gw.eqp_bgw.solve_qp_root).  OFF_GRID: widen the Sigma(omega) "
-            "grid.  RES_BRACKET: the state is a resonance with no "
-            "quasiparticle near E_DFT; use qp_solver = one_shot_dft or "
-            "self_consistent.")
-    assert_omega_grid_covers(
-        E_sc_rel_ry, in_grid_kn_band, omega_grid_ry,
-        context="diagonal QSGW fixed point")
-    n_bands_in = int(band_in_grid.sum())
-    n_bands_total = int(band_in_grid.size)
-    counts = root.counts()
-    print_fn(
-        f"  Diagonal QP root (gw.eqp_bgw.solve_qp_root): {n_bands_in}/"
-        f"{n_bands_total} bands fully in grid; states QP={counts['QP']} "
-        f"RES_Z={counts['RES_Z']} (off-grid bands keep E_DFT)")
-    E_sc_rel_ry = np.where(in_grid_kn_band, E_sc_rel_ry, E_dft_rel_ry)
-    E_sc_rel_ev = E_sc_rel_ry * RYD_TO_EV
-
-    # QSGW Σ_xc^QSGW: preserve band sharding when the ω-tensor uses it.
-    # Build kernel takes ω-grid and evaluation energies in **eV**; we
-    # convert at the seam (kernel internals convert; result is Ry).
-    sigma_xc_qsgw_kij_ry, qsgw_diag = build_qsgw_sigma_xc(
-        sigma_c_omega, sig_x,
-        omega_grid_ry * RYD_TO_EV, E_sc_rel_ev, mesh_xy,
-        replicated_output=(
-            not is_band_sharded_sigma_omega(sigma_c_omega)
-            or (band_axis is not None and band_axis.pad > 0)),
-        band_axis=band_axis,
-    )
-    print_fn(f"  QSGW: {int(qsgw_diag['n_clipped'])} evaluations off the grid "
-        f"({100*qsgw_diag['frac_clipped']:.1f}%) read Sigma(omega=0)")
-    # THE REBUILD SUPERSEDES THE AT-DFT CUBE IN THE FILE TOO.  The Σ
-    # dispatch already appended its own QSGW build — evaluated at E_DFT,
-    # which is what ``one_shot_dft`` keeps — and on this branch that build
-    # is not the one that goes into H: this one is, at the solved
-    # energies.  A file holding the superseded cube would disagree with
-    # ``eqp0.dat`` by the whole on-shell correction with nothing to say so,
-    # and the append replaces the dataset, so the last writer on the path
-    # is the one whose Σ built the Hamiltonian.
-    write_qsgw_sigma_cube(
-        sigma_result.sigma_omega_h5_path, sigma_xc_qsgw_kij_ry,
-        config=config, print_fn=print_fn)
-    return sigma_xc_qsgw_kij_ry + sig_h
+            f"solve_qp: qp_solver = {qp_solver.value} is not a one-shot "
+            "solver; self_consistent runs through run_sc_driver.")
+    if (config.compute_mode.is_dynamic
+            and sigma_result.sigma_c_omega_kij_ry is not None):
+        print_fn(
+            "  QP solver: one_shot_dft — "
+            + qp_solver_semantics(QPSolver.ONE_SHOT_DFT).description)
+    return sigma_result.sigma_xc_kij_ry + sigma_result.v_h_kij_ry
 
 
 # ---------------------------------------------------------------------------
@@ -1069,6 +933,5 @@ __all__ = [
     "remove_managed",
     "sigma_grid_edge_ambiguity",
     "sigma_eval_omega",
-    "solve_diagonal_sigma_fixed_point",
     "write_qsgw_sigma_cube",
 ]

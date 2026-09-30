@@ -164,8 +164,7 @@ G(τ) is never materialized; it exists only as $\psi\psi^*$ phases inside the
 |---|---|
 | `eqp0.dat` | BerkeleyGW format. $E_\mathrm{DFT} + \Delta(E_\mathrm{DFT})$, $\Delta = \langle T + V_\mathrm{ion} + V_H + \Sigma_{xc}\rangle - E_\mathrm{DFT}$ |
 | `eqp1.dat` | BerkeleyGW format. Linearized $E + Z\,\Delta(E)$, $Z = (1 - \partial_\omega \mathrm{Re}\,\Sigma_c)^{-1}$, raw for every $Z$ (a BerkeleyGW comparison column) |
-| `eqp_root.dat` | dynamic one-shot only. BerkeleyGW rows with $E_\mathrm{QP} = E^*$, the root of $E = h + \mathrm{Re}\,\Sigma_c(E)$ on $[E_\mathrm{DFT}, \mathrm{eqp0}]$, then $Z^*$, $\Gamma^* = Z^*\lvert\mathrm{Im}\,\Sigma_c(E^*)\rvert$ and a status: `QP`, the resonances `RES_Z` ($Z^* \notin (0,1]$) and `RES_BRACKET` (no root in the bracket), or `OFF_GRID` (bracket not sampled; $E^*$ = eqp0) |
-| `sigma_diag.dat` | Σ diagonals in eV. Bispinor runs add `sigCC`, `sigTT`, `sigCT` (= CT + TC); ordered broken-TR GN runs add `sigC_odd` |
+| `sigma_diag.dat` | Σ diagonals in eV. Dynamic one-shot runs add `Z`, the eqp1 residue at $E_\mathrm{DFT}$. Bispinor runs add `sigCC`, `sigTT`, `sigCT` (= CT + TC); ordered broken-TR GN runs add `sigC_odd` |
 | `eqp_g0w0.dat` | PPM one-shot only: Re/Im of $H_0 + \Sigma_{xc}(E_\mathrm{DFT})$ |
 | `qp_wfn_rotations.h5` | the QP eigensystem $U_{mnk}$, $E_\mathrm{QP}$ with the source-WFN fingerprint, read by htransform, BSE and SC seeding |
 | `WFN_qp.h5` | ψ rotated by U with QP energies (`write_wfn_h5`, default true) |
@@ -193,7 +192,7 @@ Invoke: `python -m gw.gw_jax -i gw.in`.
 |---|---|---|
 | `number_bands` / `nval` / `ncond` | 100 / 5 / 5 | χ₀ and Σ band-sum top / interior valence edge / Σ conduction count. `number_bands_chi` and `number_bands_sigma` split the two sums |
 | `compute_mode` | `auto` | Σ ansatz: `x_only` \| `cohsex` \| `gn_ppm` \| `hl_ppm` \| `mpa`. `auto` infers from the legacy flags and never selects `mpa`. `gn_ppm` refuses metallic occupations ([input reference](input_reference.md)). Production: `mpa` with `sigma_w_model = shared_pole` ([production QSGW](how-to/production-qsgw.md)) |
-| `qp_solver` | `auto` → `one_shot_dft` | `one_shot_dft`: full-matrix effective H with Σ at $E_\mathrm{DFT}$, Hermitian-symmetrized; `fixed_point`: on-shell diagonal solve (dynamic modes); `self_consistent`: the QSGW loop ([self-consistency](self_consistency.md)) |
+| `qp_solver` | `auto` → `one_shot_dft` | `one_shot_dft`: full-matrix effective H with Σ at $E_\mathrm{DFT}$, Hermitian-symmetrized; `self_consistent`: the QSGW loop, Σ read at each map's own energies. No QP equation is solved; `fixed_point` is retired and refuses by name ([self-consistency](self_consistency.md)) |
 | `write_eqp2` | false | dynamic one-shot: iterate the fixed Σ(ω) matrix in the evolving QP basis and write `eqp2.dat`; screening and Σ are not rebuilt. Keys `eqp2_*` in the [input reference](input_reference.md) |
 | `restart` | false | `true` reuses `tmp/isdf_tensors_<N_mu>.h5` after authentication |
 | `linalg` | `local` | the one layout dial for dense solves ([input reference](input_reference.md)) |

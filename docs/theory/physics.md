@@ -255,8 +255,8 @@ $$
 
 A dynamic \(\Sigma_c(\omega)\) is interpolated on its real-frequency grid; an
 energy outside that grid takes \(\Sigma_c(\omega=0)\). `qp_solver` selects
-where the energies come from: `one_shot_dft` (at \(E_{\rm DFT}\)),
-`fixed_point` (after a diagonal on-shell solve) or `self_consistent` (QSGW,
+where the energies come from: `one_shot_dft` (at \(E_{\rm DFT}\)) or
+`self_consistent` (QSGW, at each map's own energies,
 which rebuilds χ₀, \(W\) and Σ from the rotated orbitals every map). In
 QSGW, bands outside the Σ window follow a scissor law, not a self-energy. Owner:
 [self-consistency](../self_consistency.md).

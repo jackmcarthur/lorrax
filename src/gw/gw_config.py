@@ -432,7 +432,7 @@ def coerce_screening_diagrams(value) -> ScreeningDiagrams:
 #: Predicates take the resolved :class:`LorraxConfig`.
 #:
 #: SUPPORTED, deliberately absent from this table: ``cohsex``, ``gn_ppm``,
-#: ``mpa`` and ``qp_solver = one_shot_dft`` / ``fixed_point``.
+#: ``mpa`` and ``qp_solver = one_shot_dft``.
 _W_BSE_REFUSALS: tuple[tuple[str, object, object, str, str, str], ...] = (
     (
         "w_bse_needs_a_screened_mode",
@@ -467,7 +467,7 @@ _W_BSE_REFUSALS: tuple[tuple[str, object, object, str, str, str], ...] = (
         "w_bse_self_consistency_unimplemented",
         lambda cfg: cfg.qp_solver is QPSolver.SELF_CONSISTENT,
         lambda cfg: f"qp_solver = {cfg.qp_solver.value}",
-        "qp_solver = one_shot_dft (the default) or fixed_point",
+        "qp_solver = one_shot_dft (the default)",
         "run w_bse single-shot; for a QSGW loop keep screening_diagrams = "
         "w_rpa until the per-iteration cycle lands",
         "the ladder reads its kernel W_R back out of the restart file the "
@@ -503,7 +503,7 @@ _W_BSE_REFUSALS: tuple[tuple[str, object, object, str, str, str], ...] = (
 #: survives the missing rung or only its INFRASTRUCTURE risk does.
 #:
 #: SUPPORTED, deliberately absent from this table: ``cohsex``, ``gn_ppm``
-#: and ``qp_solver = one_shot_dft`` / ``fixed_point``.  Unlike ``w_bse``,
+#: and ``qp_solver = one_shot_dft``.  Unlike ``w_bse``,
 #: ``mpa`` is NOT supported here (see its own row) -- ``w_bse``'s
 #: ``wc_source`` seam (``make_ladder_wc_source``) was extended and gated
 #: for the ladder; doing the same for the RPA-resolvent arm is a real port,
@@ -558,7 +558,7 @@ _W_RPA_RESOLVENT_REFUSALS: tuple[
         "w_rpa_resolvent_self_consistency_unimplemented",
         lambda cfg: cfg.qp_solver is QPSolver.SELF_CONSISTENT,
         lambda cfg: f"qp_solver = {cfg.qp_solver.value}",
-        "qp_solver = one_shot_dft (the default) or fixed_point",
+        "qp_solver = one_shot_dft (the default)",
         "run w_rpa_resolvent single-shot; for a QSGW loop keep "
         "screening_diagrams = w_rpa until the per-iteration cycle lands",
         "INFRASTRUCTURE RISK INHERITED, MECHANISM DOES NOT LITERALLY "
@@ -704,8 +704,18 @@ class QPSolver(str, enum.Enum):
     """How QP energies are extracted from Σ — orthogonal to ``compute_mode``; see docs/architecture/decisions.md."""
 
     ONE_SHOT_DFT = "one_shot_dft"
-    FIXED_POINT = "fixed_point"
     SELF_CONSISTENT = "self_consistent"
+
+
+#: Retired ``qp_solver`` values: {value: why}.
+_RETIRED_QP_SOLVERS: dict[str, str] = {
+    "fixed_point": (
+        "the diagonal on-shell root E = h0 + Re Sigma_c(E) was deleted by "
+        "owner ruling 2026-09-29 (\"just use the present iteration's "
+        "energies\"), with its eqp_root.dat writer.  one_shot_dft evaluates "
+        "Sigma at E_DFT; self_consistent evaluates it at each map's own "
+        "energies; eqp1 keeps the linearized BerkeleyGW column."),
+}
 
 
 @dataclass(frozen=True)
@@ -729,14 +739,6 @@ QP_SOLVER_SEMANTICS = {
             "fixed-DFT-state diagonal G0W0)"),
         energy_definition="full_matrix_effective_hamiltonian_sigma_at_e_dft",
         sigma_evaluation_provenance="at_e_dft",
-    ),
-    QPSolver.FIXED_POINT: QPSolverSemantics(
-        description=(
-            "one-shot full-matrix effective Hamiltonian after a diagonal "
-            "fixed-Sigma on-shell solve"),
-        energy_definition=(
-            "full_matrix_effective_hamiltonian_sigma_at_diagonal_fixed_point"),
-        sigma_evaluation_provenance="fixed_sigma_diagonal_fixed_point",
     ),
     QPSolver.SELF_CONSISTENT: QPSolverSemantics(
         description="self-consistent QSGW effective Hamiltonian",
@@ -1312,7 +1314,8 @@ _DEFAULTS = {
     # and otherwise defaults to "one_shot_dft" (the one-shot full-matrix
     # effective-Hamiltonian route).  New input
     # files should set it explicitly:
-    #   "one_shot_dft" | "fixed_point" | "self_consistent".
+    #   "one_shot_dft" | "self_consistent" (``fixed_point`` is retired and
+    #   refuses by name, see _RETIRED_QP_SOLVERS).
     "qp_solver": "auto",
     "do_screened": True,
     "bispinor": False,
@@ -3114,9 +3117,8 @@ def _report_remaining_retired_keys(
                 "buffer; widen nval/ncond instead.  Remove the key.")
     if section.get("sigma_at_dft_extrapolate", fallback=None) is not None:
         raise ValueError(
-            "Input key 'sigma_at_dft_extrapolate' is retired: under "
-            "qp_solver = fixed_point a band off the Sigma(omega) grid keeps "
-            "E_DFT; there is no scissor extrapolation.  Remove the key.")
+            "Input key 'sigma_at_dft_extrapolate' is retired: there is no "
+            "scissor extrapolation of Sigma(omega).  Remove the key.")
     if section.get("occupation_window_threshold", fallback=None) is not None:
         raise ValueError(
             "Input key 'occupation_window_threshold' is retired: a band "
@@ -4861,8 +4863,8 @@ class LorraxConfig:
                     "write_eqp2=true is an additional fixed-Sigma result "
                     "for qp_solver=one_shot_dft; it cannot be combined with "
                     f"qp_solver={self.qp_solver.value}.  Use one_shot_dft, "
-                    "or disable write_eqp2 and choose fixed_point / "
-                    "self_consistent as the primary QP treatment.")
+                    "or disable write_eqp2 and choose self_consistent as "
+                    "the primary QP treatment.")
             if not self.compute_mode.is_dynamic:
                 raise ValueError(
                     "write_eqp2=true requires a dynamic full-matrix "
@@ -4970,6 +4972,10 @@ class LorraxConfig:
         if raw == "auto":
             solver = (QPSolver.SELF_CONSISTENT if self.self_consistent
                       else QPSolver.ONE_SHOT_DFT)
+        elif raw in _RETIRED_QP_SOLVERS:
+            raise ValueError(
+                f"qp_solver = {raw} is retired: {_RETIRED_QP_SOLVERS[raw]}  "
+                f"Set qp_solver = one_shot_dft or self_consistent.")
         else:
             try:
                 solver = QPSolver(raw)
@@ -4978,20 +4984,6 @@ class LorraxConfig:
                     f"qp_solver={raw!r} invalid; expected one of: "
                     f"{', '.join(s.value for s in QPSolver)}, or 'auto'."
                 ) from exc
-        mode = self.compute_mode
-        if solver is QPSolver.FIXED_POINT and not mode.is_dynamic:
-            # The list of dynamic modes is read off the enum, not typed
-            # here: the day a mode joins them this message says so without
-            # anyone remembering to come back and edit it.  Modes that
-            # refuse to run are left out — advice has to be followable.
-            _dynamic = " / ".join(
-                m.value for m in ComputeMode
-                if m.is_dynamic and m not in UNIMPLEMENTED_MODES)
-            raise ValueError(
-                f"qp_solver=fixed_point requires a dynamic compute_mode "
-                f"({_dynamic}); static Σ ({mode.value}) has no ω-grid "
-                f"to solve E = h0 + ReΣ(E) on.  Use one_shot_dft (identical "
-                f"physics for static Σ) or self_consistent.")
         return solver
 
     @property

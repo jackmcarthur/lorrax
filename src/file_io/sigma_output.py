@@ -291,7 +291,6 @@ def write_sigma_to_file(
 	sigma_lorentz_skn_eV=None,
 	sigma_c_odd_kn_eV=None,
 	z_factor_kn=None,
-	qp_status_kn=None,
 ):
 	"""Write self-energy components to file.
 
@@ -322,9 +321,6 @@ def write_sigma_to_file(
 			shape (nk, band), written as ``sigC_odd``.  None omits the column.
 		z_factor_kn: Optional raw quasiparticle residue, shape ``(nk, band)``.
 			When present, every row records ``Z`` without clipping it.
-		qp_status_kn: Twin of ``z_factor_kn``: the QP-root status per state
-			(``gw.eqp_bgw.QP_STATUS_NAMES``); anything but ``QP`` is a
-			resonance or an unsampled bracket.
 
 	k-BASIS — WHY EVERY BLOCK CARRIES ITS COORDINATE
 	------------------------------------------------
@@ -450,17 +446,10 @@ def write_sigma_to_file(
 	odd_diag = _diag(sigma_c_odd_kn_eV)
 	z_diag = None if z_factor_kn is None else np.asarray(
 		z_factor_kn, dtype=np.float64)
-	z_bad = None if qp_status_kn is None else np.asarray(
-		qp_status_kn, dtype=str)
-	if (z_diag is None) != (z_bad is None):
+	if z_diag is not None and z_diag.shape != (nk, nbands):
 		raise ValueError(
-			"z_factor_kn and qp_status_kn are one diagnostic pair; pass "
-			"both or neither.")
-	if z_diag is not None and (z_diag.shape != (nk, nbands)
-			or z_bad.shape != (nk, nbands)):
-		raise ValueError(
-			"Z diagnostics must both have shape "
-			f"({nk},{nbands}); got {z_diag.shape} and {z_bad.shape}.")
+			f"z_factor_kn must have shape ({nk},{nbands}); got "
+			f"{z_diag.shape}.")
 
 	def _is_complex(d):
 		return d is not None and bool(np.any(np.abs(np.imag(d)) > _IM_TOL))
@@ -505,10 +494,7 @@ def write_sigma_to_file(
 			f.write("# sigC_odd = ordered broken-TR residue contribution "
 			        "Sigma_c[B,D] - Sigma_c[B,D=0]\n")
 		if z_diag is not None:
-			f.write("# Z is the eqp1 central difference at E_DFT; QP_status is "
-			        "the root of E = h + Re Sigma_c(E) on [E_DFT, eqp0] "
-			        "(QP, or RES_Z / RES_BRACKET resonances, or OFF_GRID); "
-			        "E*, Z*, Gamma* are in the eqp_root file\n")
+			f.write("# Z is the eqp1 central difference at E_DFT\n")
 		f.write(f"# k-basis: irreducible wedge, {nk} k-points; each block "
 		        f"states its crystal coordinate on a '# kcrys' line\n")
 		# The star-spread diagnostic, MEASURED ON THE FULL BZ upstream (see
@@ -624,7 +610,6 @@ def write_sigma_to_file(
 
 				if z_diag is not None:
 					line += f"  Z={float(z_diag[k, n]):>12.6f}"
-					line += f"  QP_status={z_bad[k, n]}"
 
 				f.write(line + "\n")
 
