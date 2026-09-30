@@ -65,8 +65,11 @@ srun --jobid=$JOBID -N 1 -n 4 --gpus-per-node=4 src/ffi/cpp/select_gpu.sh \
   .venv/bin/python -m tests.hsuite.chain --out DIR --regenerate
 ```
 
-pytest captures the per-stage walls; add `-s` to see them. The suite's compile
-cache is `.hsuite_jax_cache` in the clone (`HSUITE_CACHE_DIR` moves it).
+pytest captures the per-stage walls; add `-s` to see them. The suite writes
+nothing in the source tree, so it also runs from a read-only install. Its run
+directories (about 25 MB each, kept) and its compile cache are under
+`$SCRATCH/.cache/lorrax/hsuite`, or `~/.cache/lorrax/hsuite` where the site
+defines no `SCRATCH`; `HSUITE_CACHE_DIR` moves the compile cache.
 
 The P4 verdict is the four-rank `srun` line above. A one-rank launch
 (`srun -n 1 --gpus-per-node=1`) runs the same cell at P1, which is a smoke

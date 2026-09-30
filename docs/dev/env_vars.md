@@ -330,7 +330,7 @@ Read by `config/frontera/stage_runtime.sh`, `build_cpu_runtime_bundle.sh`,
 | `OPENBLAS_THREAD_TIMEOUT` | `setdefault` `1` by `LORRAX_BLAS_TUNE` (§2a) at import of `runtime`; read once by OpenBLAS at the first `import numpy`, which is why every entry point imports `runtime` first. |
 | `OMP_NUM_THREADS`, `OPENBLAS_NUM_THREADS`, `MKL_NUM_THREADS` | Read for the startup report's thread table and oversubscription warning; LORRAX sets none of them. On Frontera the XLA:CPU thread pool ignores OMP; `taskset` is the pinning mechanism. |
 | `XDG_CACHE_HOME` | Last-resort base for the JAX compile cache (§2e). |
-| `SCRATCH` | Base of the k-convolution mathdx image cache (§3b) and of the JAX compile cache (§2e); read, never set. No quadrature rule is stored there or anywhere else. |
+| `SCRATCH` | Base of the k-convolution mathdx image cache (§3b), of the JAX compile cache (§2e) and of the `tests/hsuite` run tree (`.cache/lorrax/hsuite`); read, never set. No quadrature rule is stored there or anywhere else. |
 | `HDF5_USE_FILE_LOCKING` | `runtime.set_default_env` `setdefault`s `FALSE` before any store opens, and `file_io/hdf5_owner` reports the value. It governs only the serial h5py paths (the MPI-IO VFD takes no POSIX locks); Frontera `/work2` mounts node-local `localflock`, where cross-node locking is incoherent. |
 | `MPLBACKEND` | `setdefault` `Agg` for headless plotting. |
 | `FI_PROVIDER` | Not read by LORRAX. On Frontera CLX leave it unset (`LORRAX_MPI_PROVIDER=auto`) so Intel MPI picks `mlx` (provider costs: [transports §3](../environment/transports.md#3-the-intel-mpi-provider-layer-frontera)). `fi_info` falsely reports `mlx` unavailable; trust the `libfabric provider:` line instead. In apptainer never `--bind /dev`. |

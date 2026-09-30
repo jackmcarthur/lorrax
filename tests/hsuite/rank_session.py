@@ -3,7 +3,10 @@
 Plain srun starts one pytest per rank; xdist starts independent workers. Only
 srun ranks share these rendezvous. Child drivers retain their launch environment
 and own the MPI/JAX runtime. Work directories live outside pytest's basetemp,
-which pytest is allowed to delete independently in each process.
+which pytest is allowed to delete independently in each process, and outside
+the source tree, which is read-only in a module install: ``ROOT`` is the
+per-user cache tree (``$SCRATCH/.cache/lorrax/hsuite``, or under ``~`` where
+the site defines no ``SCRATCH``), which every rank resolves alike.
 """
 from __future__ import annotations
 
@@ -16,9 +19,13 @@ import subprocess
 import tempfile
 import time
 
+from ffi import _services
 from runtime import _resolve_proc_count, _resolve_proc_id
 
-ROOT = Path(__file__).resolve().parents[2] / ".hsuite_runs"
+_services.ensure_on_path()
+from lxkit import user_cache_dir  # noqa: E402
+
+ROOT = user_cache_dir("hsuite")
 _SEQUENCE = 0
 
 
@@ -34,7 +41,7 @@ def exchange(value, *, timeout=240):
     _SEQUENCE += 1
     key = hashlib.sha256(
         f"{job}:{step}:{_SEQUENCE}".encode()).hexdigest()
-    ROOT.mkdir(exist_ok=True)
+    ROOT.mkdir(parents=True, exist_ok=True)
     address_file = ROOT / f"{key}.json"
     deadline = time.monotonic() + timeout
     if rank == 0:
@@ -91,7 +98,7 @@ def stage(source, prepare):
     result = None
     if _resolve_proc_id() == 0:
         try:
-            ROOT.mkdir(exist_ok=True)
+            ROOT.mkdir(parents=True, exist_ok=True)
             target = Path(tempfile.mkdtemp(prefix=source.name + "-", dir=ROOT)) / source.name
             result = {"path": str(prepare(source, target))}
         except Exception as exc:
