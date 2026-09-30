@@ -40,7 +40,7 @@ def main():
   spin=np.zeros((nk,4,4),complex);spin[:,:2,:2]=U;par=np.where(sym==0,1.,-1.);spin[:,2:,2:]=par[:,None,None]*U
   perm=np.stack([np.arange(mu),np.r_[np.arange(mu//2)[::-1],np.arange(mu//2,mu)[::-1]]])
   plan=CentroidKUnfoldPlan(R.mesh,identity_square_grouped_shard_layout(mu,mu,(2,2)),np.arange(nk,dtype=np.int32)%np_,sym,perm,rng.integers(-1,2,(2,mu,3)).astype(float),rng.uniform(-.4,.4,(np_,3)),spin,1 if anti else 2,4)
-  gemm=gemm_plan(R.mesh,m=mu*4,n=mu*4,k=nb,nq=np_,dtype=np.complex128,layout='face',warmup=False)
+  gemm=gemm_plan(R.mesh,m=mu*4,n=mu*4,k=nb,nq=np_,dtype=np.complex128,layout='face',alpha=.73 if not anti else 1.,warmup=False)
   z=lambda sh:rng.normal(size=sh)+1j*rng.normal(size=sh)
   pm=device_put_process_local(z((np_,4,mu,nb)),NamedSharding(R.mesh,P(None,None,'x','y')))
   pn=device_put_process_local(z((np_,nb,4,mu)),NamedSharding(R.mesh,P(None,'x',None,'y')))
@@ -51,7 +51,7 @@ def main():
    nv=c_q_from_psi_sm(pm,pn,wl,wr,**kw);ov=reference(pm,pn,wl,wr,plan,kg,gemm,l,r)
    n=np.asarray(gather_to_host(nv));o=np.asarray(gather_to_host(ov));err=float(np.max(abs(n-o))/max(np.max(abs(o)),1e-30))
    assert err<3e-12,(kg,anti,l,r,err)
-   rows.append(dict(grid=kg,antiunitary=anti,left=l,right=r,relative_error=err));rank0_print(json.dumps(rows[-1]),flush=True)
+   rows.append(dict(grid=kg,antiunitary=anti,left=l,right=r,relative_error=err,gemm_alpha=float(np.real(gemm.alpha))));rank0_print(json.dumps(rows[-1]),flush=True)
  # The typed action is mandatory, not silently approximated by quarters.
  import dataclasses
  broken=spin.copy();broken[:,0,2]=.01
