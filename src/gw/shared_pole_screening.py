@@ -142,11 +142,18 @@ def shared_pole_identity(wfns, meta, *, label, wfn, binding, centroid_indices):
         state = dict(wavefunctions=source, hamiltonian=hashlib.sha256(
             (source + census["energy_sha256"]).encode()).hexdigest())
     recipe = meta.shared_pole_recipe
-    return dict(iteration_id=str(label), hamiltonian=state["hamiltonian"],
+    identity = dict(iteration_id=str(label), hamiltonian=state["hamiltonian"],
         wavefunctions=state["wavefunctions"], energies=census["energy_sha256"],
         occupations=census["occupation_sha256"],
         centroids=hashlib.sha256(np.asarray(centroid_indices, np.int64).tobytes()).hexdigest(),
         recipe_hash=recipe["recipe_hash"], gate_hash=recipe["gate_hash"])
+    if str(label).startswith("sc_"):
+        # The SC state labels do not name the WFN (bind_shared_pole_sc_identity),
+        # so an SC map's bank, model and sector manifest bind the source WFN's
+        # fingerprint here (the dipole provenance's): a rerun reuses them only
+        # on the same WFN, never on energies alone.
+        identity["wfn"] = source
+    return identity
 
 
 @lru_cache(maxsize=8)
@@ -403,6 +410,26 @@ def _scalar_model_residence(meta, nq, width, *, mesh_xy, root, identity):
     return model, receipt
 
 
+def _release_bank_file(path):
+    """Unlink this run's link to a committed map's file-tier bank.
+
+    At production shape the bank is the run's largest file:
+    N_q (2 N_dense + N_moments) N_mu^2 16 B plus the line panels, 1.26e12 B at
+    Fe 20^3 (1062 parents, 1796 centroids). A resume directory's bank may be
+    hard-linked from another attempt; only this link goes, and the link count
+    is returned with the bytes so the receipt says whether space was freed.
+    """
+    import os
+    from common.collectives import rank0_transaction
+
+    def unlink():
+        stat = os.stat(path)
+        os.unlink(path)
+        return dict(bytes=int(stat.st_size), links=int(stat.st_nlink))
+    return rank0_transaction(path, stage="shared_pole.bank.release", write=unlink,
+                             return_value=True)
+
+
 #: The per-map scratch generation ``screen_shared_poles`` creates under an SC
 #: label (bank, Coulomb staging, constant and receipts).
 _MANAGED_SCRATCH = r"sc_[0-9]{4}_shared_pole"
@@ -551,14 +578,21 @@ def screen_shared_poles(wfns, V_q, meta, config, *, mesh_xy, sym,
                 if _published_sector_handle(root, identity) is not None:
                     print_fn(f"shared-pole output: authenticated sector manifest retained at {root}; reusing it")
                     return "published"
-            complete = False
+            complete, bound = False, None
             if model.exists():
                 try:
                     with h5py.File(model, "r") as h5:
                         assert_committed(h5, path=model)
                         complete = "final_commit" in h5
-                except (OSError, ValueError):
+                        raw = h5["header_json"][()] if complete else b"{}"
+                    bound = json.loads(raw.decode() if isinstance(raw, bytes) else str(raw)).get("identity")
+                except (OSError, ValueError, KeyError, AttributeError):
                     complete = False
+            if complete and sc_scratch and not photon and bound == identity:
+                # An SC map's committed model of this very map (the file tier
+                # persists it): Sigma reads it; nothing upstream is rebuilt.
+                print_fn(f"shared-pole output: committed model of this map retained at {model}; reusing it")
+                return "committed"
             if complete:
                 print_fn(f"shared-pole output: complete model retained at {model}; refusing rebuild")
                 raise ValueError(f"GATE shared_pole_output: complete model {model}; use its compatible restart member or a fresh run directory")
@@ -599,7 +633,9 @@ def screen_shared_poles(wfns, V_q, meta, config, *, mesh_xy, sym,
             return dict(shared_pole=handle)
         tables = _shared_pole_tables(meta, sym, centroid_indices)
     with timing.section("spole.coulomb_staging"):
-        if resume_constructor:
+        if resume_constructor == "committed":
+            coulomb = None
+        elif resume_constructor:
             saved_bank_receipt = json.loads((root / 'bank_receipt.json').read_text())
             coulomb = (None if photon else dict(saved_bank_receipt['coulomb_identity'],
                            path=str(root / 'coulomb.h5')))
@@ -610,7 +646,8 @@ def screen_shared_poles(wfns, V_q, meta, config, *, mesh_xy, sym,
             coulomb = (None if photon else
                        _coulomb_resource(V_q, meta, sym, mesh_xy, root / "coulomb.h5"))
     with timing.section("spole.bank_setup"):
-        resident, residence = (None, dict(residence="file", reason="authenticated resume"))
+        resident, residence = (None, dict(residence="file", reason=(
+            "committed model reused" if resume_constructor == "committed" else "authenticated resume")))
         if not resume_constructor:
             resident, residence = _bank_residence(meta, config, mesh_xy=mesh_xy, sym=sym,
                                                   root=root, label=label,
@@ -635,7 +672,7 @@ def screen_shared_poles(wfns, V_q, meta, config, *, mesh_xy, sym,
                 recipe=recipe, identity=identity, mesh_xy=mesh_xy,
                 **(dict(photon_layout=photon_layout, mu_bases=mu_bases) if photon else {}))
         receipts = dict(identity=identity)
-        if resume_constructor:
+        if resume_constructor is True:
             receipts['bank'] = json.loads((root / 'bank_receipt.json').read_text())
             if not photon:
                 receipts['moments'] = json.loads((root / 'moments_receipt.json').read_text())
@@ -657,7 +694,9 @@ def screen_shared_poles(wfns, V_q, meta, config, *, mesh_xy, sym,
                      f"seconds={receipt.get('seconds', {})}")
     with timing.section("spole.bank"):
         if resume_constructor:
-            print_fn('shared-pole bank: authenticated complete producer artifact reused')
+            print_fn('shared-pole bank: not produced; '
+                     + ('committed model reused' if resume_constructor == 'committed'
+                        else 'authenticated complete producer artifact reused'))
         elif photon:
             from .response_bank import compute_photon_bank
             record("bank", compute_photon_bank(wfns, wfns_transverse, meta, config,
@@ -677,16 +716,27 @@ def screen_shared_poles(wfns, V_q, meta, config, *, mesh_xy, sym,
     # The constructor owns scratch reads, actual pencil planning and the
     # final writer. It must query its own native workspace at the actual R.
     # W/dW and M1/M3 are distinct keyed datasets in the same scratch file.
-    if photon:
+    if resume_constructor == "committed":
+        from file_io.shared_pole_store import validate_shared_pole_model
+        model_path = root / "model.h5"
+        result = dict(model=str(model_path), status="COMMITTED_MODEL_REUSED",
+                      model_header=validate_shared_pole_model(
+                          model_path, expected_identity=identity, mesh_xy=mesh_xy,
+                          capacity=ledger),
+                      model_residence=dict(residence="file", reason="committed model reused"))
+    elif photon:
         from .shared_pole_sectors import construct_sector_poles
         result = construct_sector_poles(bank, meta, config,
             mesh_xy=mesh_xy, output=str(root / "model.h5"))
     else:
         # An SC map keeps its model on the devices when it fits; an export
         # (write_w, write_poles) reads model.h5 and a one-shot registers it
-        # as a restart member, so those write it.
+        # as a restart member, so those write it.  On the bank's file tier
+        # the model is persisted too: a rerun reuses it instead of the bank,
+        # which is released below.
         model_rule = None
-        if sc_scratch and not (config.debug.write_w or config.write_poles):
+        if (sc_scratch and resident is not None
+                and not (config.debug.write_w or config.write_poles)):
             model_rule = partial(_scalar_model_residence, meta, mesh_xy=mesh_xy,
                                  root=root, identity=identity)
         result = construct_shared_poles(bank, bank, meta, config,
@@ -695,6 +745,13 @@ def screen_shared_poles(wfns, V_q, meta, config, *, mesh_xy, sym,
         # The model is committed; the constructor was the bank's last reader.
         resident.release()
         ledger.live_stages = ()
+    elif not photon and not config.debug.write_w and (root / "bank.h5").exists():
+        # The file tier likewise: model.h5 is committed, and only a write_w
+        # export (and the photon Sigma's constant) would read the bank again.
+        residence = dict(residence, released=_release_bank_file(root / "bank.h5"))
+        print_fn(f"shared-pole bank: scratch file released after the constructor "
+                 f"({residence['released']['bytes'] / 2**30:.2f} GiB, "
+                 f"{residence['released']['links']} link(s))")
     receipts["bank_residence"] = residence
     with timing.section("spole.screening_finalize"):
         record("constructor", result)

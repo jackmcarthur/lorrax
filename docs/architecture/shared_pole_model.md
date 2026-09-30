@@ -56,7 +56,13 @@ are `P(None,'x','y')` on the square X/Y mesh with `P = Px·Py`.
    budget *and* the constructor route is unchanged with it live; otherwise it
    goes to pinned host memory if it fits half the host budget; otherwise it
    stays a scratch file. `write_w` and a distributed `linalg` always use the
-   file.
+   file. A scalar scratch file is unlinked once the constructor has committed
+   `model.h5` (kept for `write_w`; the photon Σ reads its constant), so a run
+   holds at most one bank on disk. Its size is
+   $N_q\,(2N_\text{dense}+N_\text{moments})\,N_\mu^2\cdot 16$ B plus the line
+   panels: 1.26e12 B at Fe 20³ (1062 parents, 1796 centroids, 8 dense
+   samples), about 17× the model at $K_\max$ 2400. Only this run's link goes;
+   the receipt records the bytes and the link count.
 4. **Constructor** (§3–§6) → `model.h5`, one parent round at a time. An SC
    map keeps the model on the devices instead (`ResidentSectorModel`, the
    photon sectors' carrier) when the model at its stored column bound and one
@@ -66,10 +72,15 @@ are `P(None,'x','y')` on the square X/Y mesh with `P = Px·Py`.
    the loop releases it. Reads are the file's bytes; Σ and W0 match the file
    route bit for bit where their panel schedule is unchanged (the resident
    stage narrows their budget by the model's bytes). `write_w`, `write_poles`,
-   a one-shot (restart member) and a refused admission write `model.h5`. A
-   rerun of an interrupted SC run finds no committed model in a resident map's
-   scratch: it resumes the constructor from a retained file bank, else
-   rebuilds that map; a committed `model.h5` still refuses a rebuild. A photon
+   a one-shot (restart member), a refused admission and an SC map whose bank
+   is on the file tier write `model.h5`. A rerun of an interrupted SC map
+   reuses a committed `model.h5` whose header binds the current identity
+   (validated collectively, payload digest included) and rebuilds nothing
+   upstream; with no committed model it resumes the constructor from a
+   retained file bank, else rebuilds that map. An SC identity binds the source
+   WFN's fingerprint (the dipole provenance's), since the SC state labels do
+   not name it, so no reuse authenticates on energies alone. A committed
+   `model.h5` of another identity, or at a one-shot label, still refuses. A photon
    map's published `sectors.json` is reused when it binds the current identity
    (recipe_hash included) and every model and constant it names is a file in
    that directory; sector models that were resident died with the run, so the
