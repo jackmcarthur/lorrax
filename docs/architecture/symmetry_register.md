@@ -73,10 +73,7 @@ Unwrapped q vectors use the lexicographic rectangular box of integer
 differences, and its direct mixed-radix labels replace sorting all `Nk²`
 triples. Incomplete integer grids retain the original `unique` route.
 Neither operation changes active symmetry rows, parent selection, TR
-policy or the k-star map. The CPU check
-`tests/bench/symgrid_integer_check.py` compares the unchanged old door on
-permuted, shifted and irregular fixtures and validates selected old-door
-columns and unwrapped labels on an actual WFN.
+policy or the k-star map.
 
 **Selection rules.** The k map (`map_full_kpoints_to_irreducible`) compares
 \(S\bar{\mathbf k}\) with each full-grid point in fractional coordinates, at
@@ -539,7 +536,7 @@ guarantees; the signatures are in the code.
 ### Bounded full-q operator unfolding
 
 The shared `unfold_isdf_operator` kernel executes the same endpoint
-redistributions, umklapp phases and TR rule on q tiles. A tile targets256MiB
+redistributions, umklapp phases and TR rule on q tiles. A tile targets 256 MiB
 for one scalar matrix carrier; the complete output remains `P(None,'x','y')`.
 Small outputs use the direct kernel. The final partial tile overlaps earlier
 rows, avoiding a padded copy of the large output. Work remains linear in
