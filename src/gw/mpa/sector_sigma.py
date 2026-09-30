@@ -107,7 +107,7 @@ def _w_tables(headers, bases, syms, mesh_xy):
     flipped and both phases conjugated): W_-(q) = partner(-q), no -q gather.
     """
     import hashlib
-    from symmetry_maps import unfold_load_tables, q_negation_index
+    from symmetry_maps import unfold_load_tables
     from gw.qgrid_symmetry import shared_pole_packed_action
     from gw.centroid_k_unfold import CentroidKUnfoldPlan
     qt = headers[0]['qirr']
@@ -146,18 +146,30 @@ def _w_tables(headers, bases, syms, mesh_xy):
         # The hole tables keep U unconjugated: W_-(k) = R partner R^T needs a real action.
         raise ValueError("GATE shared_pole_w_tables: an endpoint action is not real; the hole "
                          "branch's q-negated tables need real (Cartesian or scalar) actions")
-    qn = np.asarray(q_negation_index(tuple(int(v) for v in headers[0]['grid'])), np.int64)
-    hole = particle._replace(
-        row=particle.row[qn], trs=(1 - particle.trs[qn]).astype(np.int32),
-        lsrc=particle.lsrc[qn], rsrc=particle.rsrc[qn],
-        mph=np.conj(particle.mph[qn]), nph=np.conj(particle.nph[qn]),
-        spin=particle.spin[qn], spin_r=None if particle.spin_r is None else particle.spin_r[qn])
+    hole = hole_tables(particle, headers[0]['grid'])
     plan = CentroidKUnfoldPlan(
         mesh_xy=mesh_xy, layout=bases[0].layout, irr_idx=irr, sym_idx=ops, sym_perm=perm_l,
         L_table=wraps_l, k_parent_frac=q_frac, spin_action_full=act_l,
         n_sym_spatial=n_spatial, nspinor=int(act_l.shape[-1]))
     _W_TABLES[key] = (plan, particle, hole)
     return _W_TABLES[key]
+
+
+def hole_tables(particle, grid):
+    """The valence branch's load tables, W_-(q) = partner(-q): ``particle`` read at -q.
+
+    The flag is flipped (a row that read W reads its partner) and both phases
+    conjugated, so no -q gather of W is formed.  Needs a real endpoint action
+    (the caller's check); the scalar route (``gw.mpa.sigma``) reads its
+    ordered store's W_+(-q)^T through the same tables.
+    """
+    from symmetry_maps import q_negation_index
+    qn = np.asarray(q_negation_index(tuple(int(v) for v in grid)), np.int64)
+    return particle._replace(
+        row=particle.row[qn], trs=(1 - particle.trs[qn]).astype(np.int32),
+        lsrc=particle.lsrc[qn], rsrc=particle.rsrc[qn],
+        mph=np.conj(particle.mph[qn]), nph=np.conj(particle.nph[qn]),
+        spin=particle.spin[qn], spin_r=None if particle.spin_r is None else particle.spin_r[qn])
 
 
 _W_PARENTS = {}

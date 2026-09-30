@@ -241,165 +241,119 @@ def _shared_pole_panel_tables(meta, header, q_span, *, mesh_xy):
                 n_sym_spatial=int(qt["n_sym_spatial"]))
 
 
-def _shared_pole_hole_order(header, rows):
-    """Where an ordered store's valence branch puts each child's transpose.
+def _shared_pole_panel_realizer(meta, header, q_span, *, mesh_xy, tables=None):
+    """The physical parent pair of one panel: ``(plus, transposed) -> (W, Wt)`` on its parent rows.
 
-    The valence W at q is W_+(-q)^T (SP 5), so child row ``c`` lands on row
-    ``-c``.  Returns ``(order, targets)``: the children in ascending target
-    order and those sorted, unique targets.
-    """
-    from symmetry_maps import q_negation_index
-
-    minus_q = np.asarray(q_negation_index(tuple(int(v) for v in header["grid"])))
-    targets = minus_q[np.asarray(rows)]
-    order = np.argsort(targets, kind="stable").astype(np.int32)
-    return order, targets[order].astype(np.int32)
-
-
-def _shared_pole_panel_unfold(meta, header, q_span, *, mesh_xy, tables=None, hole=False):
-    """Realize each parent and apply its local child operation.
-
-    Returns explicit full-q row IDs and a compiled pair-transpose unfold.
-    Nonlocal maps refuse here; the caller routes bounded endpoint factors
-    through the symmetry service before contraction for those maps.
-
-    ``hole=True`` (an ordered store's valence branch) returns the rows ``-c``
-    and each child's transpose W_+(c)^T, formed on every rank's own tile from
-    the parent pair (``unfold_operator_local(transposed_output=True)``): no
-    full-q transpose exchange, bitwise the exchanged one.
+    The magnetic little-group realization, then the fixed-q TRS projection,
+    both on the parent tiles.  Nothing is unfolded: the Σ door reads the pair
+    through the store's q-wedge load tables (:func:`_shared_pole_q_wedge`),
+    ``Wt`` on the antiunitary rows.  Endpoint maps that cross a shard refuse
+    (the fused load reads only this rank's parent tile).
     """
     from common.shard_map import shard_map
     from gw.qgrid_symmetry import shared_pole_operator_realizer
-    from symmetry_maps import unfold_operator_local
 
     if tables is None:
         tables = _shared_pole_panel_tables(meta, header, q_span, mesh_xy=mesh_xy)
-    cert = tables["certificates"]
-    if not all(cert[axis]["is_local"] for axis in ("x", "y")):
-        raise ValueError("shared-pole nonlocal maps require routed endpoint panels")
-
+    _require_local_maps(tables["certificates"])
     policy = tables["policy"]
     qids = np.asarray(header["q_irr_full_idx"])[slice(*q_span)]
     realize = shared_pole_operator_realizer(
         meta, header, q_full_idx=qids, mesh_xy=mesh_xy)
-
-    rows, parent_rows, sym_rows = tables["rows"], tables["parent_rows"], tables["sym_rows"]
-    if hole:
-        order, rows = _shared_pole_hole_order(header, rows)
-        parent_rows, sym_rows = parent_rows[order], sym_rows[order]
 
     def body(plus, transposed):
         projected, _ = policy.project_fixed_q(
             plus, qids, transposed_partner=transposed, measure=False)
         transposed, _ = policy.project_fixed_q(
             transposed, qids, transposed_partner=plus, measure=False)
-        if hole:
-            projected, transposed = transposed, projected
+        return projected, transposed
+
+    spec = P(None, "x", "y")
+    project_local = jax.jit(shard_map(
+        body, mesh=mesh_xy, in_specs=(spec, spec), out_specs=(spec, spec), check_vma=False))
+
+    @jax.jit
+    def realize_pair(plus, transposed):
+        return project_local(*realize(plus, transposed))
+
+    return realize_pair
+
+
+def _require_local_maps(certificates):
+    if not all(certificates[axis]["is_local"] for axis in ("x", "y")):
+        raise ValueError(
+            "GATE shared_pole_w_parent_local: a packed endpoint map crosses a mesh shard; "
+            "W is built on the irreducible q and unfolded on the Sigma load, which reads "
+            "only this rank's parent tile (TASTE 97: no full-q W route)")
+
+
+_W_LOADS = {}
+
+
+def _shared_pole_q_wedge(meta, header, *, mesh_xy):
+    """The store's q wedge as the Σ door reads W: ``(wedge, (particle, hole) device loads)``.
+
+    ``wedge`` is a ``symmetry_maps.QirrOperator`` of tables (no values): the
+    store's parent rows ``irr_idx_q`` with the TRS policy's unfold operations,
+    the packed endpoint action (:func:`gw.qgrid_symmetry.shared_pole_packed_action`)
+    and the pair-transpose rule, so an antiunitary q reads ``Wt``.  mathdx
+    mode 9 (``_get_sigma_kij_kernel(q_wedge=)``) unfolds W on its load.  An
+    ordered store's valence branch W_+(-q)^T reads the same parent pair
+    through the q-negated tables (``sector_sigma.hole_tables``); a TRS store
+    has none.  The device tables are placed once per mesh and wedge.
+    """
+    from symmetry_maps import QirrOperator, device_load_tables
+    from gw.qgrid_symmetry import shared_pole_packed_action
+    from .sector_sigma import hole_tables
+
+    qt = header["qirr"]
+    packed, wraps, certificates = shared_pole_packed_action(meta, header, mesh_xy=mesh_xy)
+    _require_local_maps(certificates)
+    wedge = QirrOperator(
+        values=None, irr_idx=np.asarray(qt["irr_idx_q"], np.int32),
+        sym_idx=np.asarray(_shared_pole_fixed_q_policy(header).unfold_sym_idx, np.int32),
+        sym_perm=np.asarray(packed, np.int32), L_table=np.asarray(wraps),
+        q_irr_frac=np.asarray(qt["q_irr_frac"], np.float64),
+        n_sym_spatial=int(qt["n_sym_spatial"]),
+        full_rows=np.asarray(header["q_irr_full_idx"], np.int32), trs_rule="pair_transpose")
+    ordered = header.get("representation") == "scalar-ordered-ph"
+    key = (tuple(d.id for d in np.asarray(mesh_xy.devices).flat), wedge.wedge_key(),
+           tuple(int(v) for v in header["grid"]), ordered)
+    loads = _W_LOADS.get(key)
+    if loads is None:
+        particle = wedge.load_tables(mesh_xy)
+        loads = _W_LOADS[key] = (
+            device_load_tables(particle, mesh_xy),
+            device_load_tables(hole_tables(particle, header["grid"]), mesh_xy) if ordered else None)
+    return wedge, loads
+
+
+def _shared_pole_full_q(meta, header, *, mesh_xy):
+    """``(W, Wt) -> W_+`` on the full q grid, for the W0 restart member only.
+
+    The BSE restart stores ``W0 = V + Wc(0)`` on every q
+    (:func:`shared_pole_static_wc`); the Σ route never calls this.
+    """
+    from common.shard_map import shard_map
+    from symmetry_maps import unfold_operator_local
+
+    nq = int(header["n_q_irr"])
+    tables = _shared_pole_panel_tables(meta, header, (0, nq), mesh_xy=mesh_xy)
+    _require_local_maps(tables["certificates"])
+    cert = tables["certificates"]
+
+    def body(W, Wt):
         return unfold_operator_local(
-            projected, irr_idx=parent_rows, sym_idx=sym_rows,
+            W, irr_idx=tables["parent_rows"], sym_idx=tables["sym_rows"],
             q_irr_frac=tables["q_frac"],
             left_local_perm=cert["x"]["local_perm"], left_L_table=tables["wraps"],
             right_local_perm=cert["y"]["local_perm"], right_L_table=tables["wraps"],
             n_sym_spatial=tables["n_sym_spatial"],
-            trs_rule="pair_transpose", transposed_parent_local=transposed,
-            transposed_output=hole)
+            trs_rule="pair_transpose", transposed_parent_local=Wt)
 
-    unfold_local = jax.jit(shard_map(
-        body, mesh=mesh_xy,
-        in_specs=(P(None, "x", "y"), P(None, "x", "y")),
-        out_specs=P(None, "x", "y"), check_vma=False))
-
-    @jax.jit
-    def unfold(plus, transposed):
-        return unfold_local(*realize(plus, transposed))
-
-    return rows, unfold
-
-
-def _shared_pole_routed_children(meta, header, tables, *, endpoint_budgets, mesh_xy, layout):
-    """The τ-invariant half of the routed synthesis, as one program per panel.
-
-    Returns ``(route, count)`` with ``route(b_X, b_Y) -> factors``, a tuple of
-    ``count`` faces: each endpoint face routed to the
-    panel's child rows by the common wavefunction symmetry owner (antiunitary
-    children conjugate the factor, never the causal time weight), followed by
-    the conjugate-face partners when a child is self-negative, all placed in
-    the contraction's factor layout.  Only d(τ) depends on the node, so a
-    panel's factors are routed once per read — once per Σ call for a resident
-    panel — not once per τ node (P2-E hoist, claim 2726).  The retained child
-    faces replace the parent faces for the read's lifetime: 2(1+f)·16·N_child
-    ·μ·K/P bytes per rank on the face layout (f = 1 with a self-negative
-    child), inside the endpoint budgets ``_shared_pole_panel_cost`` prices.
-    """
-    from symmetry_maps import unfold_endpoint_panel
-
-    operations = header["operations"]
-    spin = (np.asarray(operations["spin_real"])
-            + 1j * np.asarray(operations["spin_imag"]))[tables["sym_rows"]]
-    fixed = tables["policy"].self_negative_q[_shared_pole_child_ids(header, tables)]
-    specs = _shared_pole_factor_specs(layout)
-    count = 4 if np.any(fixed) else 2
-
-    def route(b_X, b_Y):
-        children, partners = [], []
-        for axis, face in (("x", b_X), ("y", b_Y)):
-            kwargs = dict(
-                irr_idx=tables["parent_rows"], sym_idx=tables["sym_rows"],
-                q_irr_frac=tables["q_frac"], source_perm=tables["packed_perm"],
-                L_table=tables["wraps"], spin_action_full=spin,
-                n_sym_spatial=tables["n_sym_spatial"], active_mask=meta.mu_basis.active_mask,
-                mesh=mesh_xy, mesh_axis=axis, max_live_bytes=endpoint_budgets[axis])
-            children.append(unfold_endpoint_panel(face, **kwargs)[0])
-            if count == 4:
-                partners.append(unfold_endpoint_panel(face.conj(), **kwargs)[0])
-        return (*children, *partners)
-
-    return jax.jit(route, out_shardings=tuple(
-        NamedSharding(mesh_xy, specs[i % 2]) for i in range(count))), count
-
-
-def _shared_pole_child_ids(header, tables):
-    lo, hi = tables["parent_span"]
-    return np.asarray(header["q_irr_full_idx"])[lo:hi][tables["parent_rows"]]
-
-
-def _shared_pole_routed_synthesis(
-    factors, poles2, intervals, E_ref_B, t_node, *, header, tables,
-    realize, mesh_xy, gemm, layout="face", weights_fn=_shared_pole_weights,
-    active_range=False, hole=False,
-):
-    """Synthesize W from routed child factors, DESIGN §3.4 fallback.
-
-    ``factors`` is ``_shared_pole_routed_children``'s output: the two child
-    endpoint faces, then their conjugate partners when a child is
-    self-negative. No all-star factor cache is retained.  ``hole=True``
-    returns the realizer's transposed output, each child's W_+(c)^T, in the
-    ascending ``-c`` order of :func:`_shared_pole_hole_order`.
-    """
-    policy = tables["policy"]
-    child_ids = _shared_pole_child_ids(header, tables)
-    children, partners = factors[:2], factors[2:]
-    weights = weights_fn(poles2, intervals, E_ref_B, t_node)
-    child_weights = weights[tables["parent_rows"]]
-    child_intervals = intervals[tables["parent_rows"]] if active_range else None
-    plus = _shared_pole_contract(*children, child_weights, gemm=gemm, layout=layout,
-                                 intervals=child_intervals)
-    if partners:
-        transposed = _shared_pole_contract(*partners, child_weights, gemm=gemm, layout=layout,
-                                           intervals=child_intervals)
-        plus, _ = policy.project_fixed_q(
-            plus, child_ids, transposed_partner=transposed, measure=False)
-    # Conjugacy of stabilizers makes child-space averaging equivalent to
-    # averaging the parent before unfolding. This avoids enlarging the
-    # routed factors by a symmetry axis. Both operator orientations remain
-    # distributed over the complete mesh, including the transpose exchange.
-    from common.collectives import transpose_xy
-    transposed = jax.lax.with_sharding_constraint(
-        transpose_xy(plus, mesh_xy), NamedSharding(mesh_xy, P(None, "x", "y")))
-    if hole:
-        order, _targets = _shared_pole_hole_order(header, tables["rows"])
-        return realize(plus, transposed)[1][order]
-    return realize(plus, transposed)[0]
+    spec = P(None, "x", "y")
+    return jax.jit(shard_map(body, mesh=mesh_xy, in_specs=(spec, spec), out_specs=spec,
+                             check_vma=False))
 
 
 _SYNTHESIS_PROGRAMS = {}
@@ -439,19 +393,22 @@ def _shared_pole_static_key(meta, header, tables, *, mesh_xy, layout):
 
 def _shared_pole_w_synthesis(io, meta, header, frequencies, schedule, *, mesh_xy, layout="face",
                              weights_fn=_shared_pole_weights, stage="sigma"):
-    """Read the factors once and bind the complete full-q W(τ) for the window executable.
+    """Read the factors once and bind W(τ) on the irreducible q for the window executable.
 
-    Returns a :class:`WSynthesis`.  The parent faces are read once per Σ call
-    (a routed store's are routed to its children once, too) and held for the
-    sweep; ``w_kernel`` runs inside every window executable and, per τ node,
-    synthesizes each parent panel of ``schedule``'s admitted capacity —
-    W_parent = b d(τ) b† → fixed-q projection → little-group realization →
-    unfold to its children — and scatters the children into the full-q W.
-    Parent panels are a static loop, sequenced so that one panel's temporaries
-    live at a time; pole-column chunks of one static width are a device
-    ``fori_loop`` over chunk-major slices, and a single chunk when the budget
-    admits every column (TASTE 96).  The summation order is the panel-by-panel,
-    chunk-by-chunk order of the admitted schedule.
+    Returns a :class:`WSynthesis` whose ``q_wedge`` is the store's q wedge
+    (:func:`_shared_pole_q_wedge`).  The parent faces are read once per Σ
+    call and held for the sweep; ``w_kernel`` runs inside every window
+    executable and, per τ node, synthesizes each parent panel of
+    ``schedule``'s admitted capacity — W_parent = b d(τ) b† and its transpose
+    through G's builder, little-group realization, fixed-q projection
+    (:func:`_shared_pole_panel_realizer`) — into the parent pair ``(W, Wt)``
+    ``[n_q_irr, m, m]``.  It returns ``(W, Wt, load)``: the Σ door unfolds
+    the pair on its load through ``load`` (the particle tables, or on an
+    ordered store's valence branch the q-negated ones), so no full-q W is
+    formed (TASTE 97).  Parent panels are a static loop, sequenced so that
+    one panel's temporaries live at a time; pole-column chunks of one static
+    width are a device ``fori_loop`` over chunk-major slices, and a single
+    chunk when the budget admits every column (TASTE 96).
 
     ``weights_fn`` is the per-column coefficient: the causal d(τ) for Σ, or
     :func:`_shared_pole_omega0_weights` for :func:`shared_pole_static_wc`.
@@ -467,18 +424,21 @@ def _shared_pole_w_synthesis(io, meta, header, frequencies, schedule, *, mesh_xy
             raise ValueError("GATE shared_pole_capacity: an admitted schedule is required")
         nq = int(header["n_q_irr"])
         kmax = int(header["Kmax"])
-        Q, m = int(header["n_q_full"]), int(meta.mu_basis.n_packed)
+        m = int(meta.mu_basis.n_packed)
         bcap, ccap = int(schedule["parent_capacity"]), int(schedule["column_capacity"])
         if bcap < 1 or ccap < 1:
             raise ValueError("shared-pole panel capacities must be positive")
         # Ordered stores: conduction windows use W_+(q), valence windows W_+(-q)^T.
         ordered = header.get("representation") == "scalar-ordered-ph"
+        q_wedge, loads = _shared_pole_q_wedge(meta, header, mesh_xy=mesh_xy)
         if kmax == 0:
-            zero = _zeros(mesh_xy, (Q, m, m))
-            return WSynthesis(lambda _ref, _time, _hole: zero(),
-                              lambda _space, _indices, _bounds: (), lambda: (),
-                              lambda _result=None: None, 0, ("zero", mesh_xy, Q, m),
-                              ordered=ordered)
+            zero = _zeros(mesh_xy, (nq, m, m))
+            synthesis = WSynthesis(
+                lambda _f, _p, _i, load, _ref, _time, _hole: (zero(), zero(), load),
+                lambda _space, _indices, _bounds: ((), (), None, loads), lambda: (),
+                lambda _result=None: None, 0, ("zero", mesh_xy, nq, m), ordered=ordered)
+            synthesis.q_wedge = q_wedge
+            return synthesis
         factor_specs = _shared_pole_factor_specs(layout)
         # One static column width: the whole laddered K when every column fits
         # (one chunk), else the admitted chunk carrier, stepped by that width.
@@ -496,25 +456,13 @@ def _shared_pole_w_synthesis(io, meta, header, frequencies, schedule, *, mesh_xy
         for lo in range(0, nq, bcap):
             hi = min(lo + bcap, nq)
             tables = _shared_pole_panel_tables(meta, header, (lo, hi), mesh_xy=mesh_xy)
-            local = all(c["is_local"] for c in tables["certificates"].values())
             static = _shared_pole_static_key(meta, header, tables, mesh_xy=mesh_xy, layout=layout)
-            route = None
-            if not local:
-                # The panel's faces are routed to its child rows by one bound
-                # program: at the read for a single panel (τ-invariant), in
-                # the τ body for one panel at a time otherwise.
-                budgets = tuple(sorted(schedule["endpoint_budgets"].items()))
-                route, _n_faces = _synthesis_program((static, "route", budgets), lambda: (
-                    _shared_pole_routed_children(
-                        meta, header, tables, endpoint_budgets=schedule["endpoint_budgets"],
-                        mesh_xy=mesh_xy, layout=layout)))
-            count = hi - lo if local else len(tables["rows"])
+            count = hi - lo
             native_workspace = max(native_workspace, workspace_bytes_per_rank(
                 workspace_plan, "gemm", ((count, m, width), (count, width, m)),
                 np.complex128))
 
-
-            def program(span=(lo, hi), tables=tables, local=local, count=count):
+            def program(span=(lo, hi), tables=tables, count=count):
                 from distrib_la import gemm_plan
                 # As G's plan: pole columns outside a window's interval are
                 # never contracted, and no warm-up (the plan runs inside the
@@ -522,41 +470,19 @@ def _shared_pole_w_synthesis(io, meta, header, frequencies, schedule, *, mesh_xy
                 gemm = gemm_plan(mesh_xy, m=m, k=width, n=m, nq=count,
                                  dtype=np.complex128, layout=layout,
                                  enable_active_range=True, warmup=False)
-                kernels = {}
-                # An ordered store's valence branch unfolds each child's
-                # transpose on its own tile: no full-q transpose exchange.
-                for hole in ((False, True) if ordered else (False,)):
-                    if local:
-                        _rows, unfold = _shared_pole_panel_unfold(
-                            meta, header, span, mesh_xy=mesh_xy, tables=tables, hole=hole)
+                realize_pair = _shared_pole_panel_realizer(
+                    meta, header, span, mesh_xy=mesh_xy, tables=tables)
 
-                        def body(factors, poles2, ranges, e, t, unfold=unfold):
-                            plus, transposed = synthesize_shared_pole_parents(
-                                *factors, poles2, ranges, e, t, mesh_xy=mesh_xy, gemm=gemm,
-                                layout=layout, weights_fn=weights_fn, active_range=True)
-                            return unfold(plus, transposed)
-                    else:
-                        # The realization is the magnetic little-group average the
-                        # store's policy authenticates; on the local branch it is
-                        # already inside ``unfold``.
-                        from gw.qgrid_symmetry import shared_pole_operator_realizer
-                        body = partial(
-                            _shared_pole_routed_synthesis, header=header, tables=tables,
-                            realize=shared_pole_operator_realizer(
-                                meta, header, q_full_idx=tables["rows"], mesh_xy=mesh_xy),
-                            mesh_xy=mesh_xy, gemm=gemm, layout=layout, weights_fn=weights_fn,
-                            active_range=True, hole=hole)
-                    kernels[hole] = jax.jit(body)
-                return dict(kernel=kernels[False], hole=kernels.get(True))
+                def body(factors, poles2, ranges, e, t):
+                    plus, transposed = synthesize_shared_pole_parents(
+                        *factors, poles2, ranges, e, t, mesh_xy=mesh_xy, gemm=gemm,
+                        layout=layout, weights_fn=weights_fn, active_range=True)
+                    return realize_pair(plus, transposed)
+                return jax.jit(body)
             kind = ("synthesis" if weights_fn is _shared_pole_weights
                     else "synthesis." + weights_fn.__name__)
-            programs = _synthesis_program((static, kind, count, m, width, ordered), program)
-            rows = np.asarray(tables["rows"], np.int32)
-            panels.append(dict(span=(lo, hi), rows=rows,
-                               hole_rows=(_shared_pole_hole_order(header, rows)[1]
-                                          if ordered else None),
-                               kernel=programs["kernel"], hole=programs["hole"],
-                               route=route, static=static, count=count))
+            kernel = _synthesis_program((static, kind, count, m, width), program)
+            panels.append(dict(span=(lo, hi), kernel=kernel, static=static, count=count))
         schedule["native_gemm_workspace_bytes_per_rank"] = native_workspace
     _band_fence('tau.factor_read', sync_ranks=True)
     with timing.section('tau.factor_read'):
@@ -572,11 +498,6 @@ def _shared_pole_w_synthesis(io, meta, header, frequencies, schedule, *, mesh_xy
             lo, hi = panel["span"]
             whole = (lo, hi) == (0, nq)
             fx = (x, y) if whole else (x[lo:hi], y[lo:hi])
-            if panel["route"] is not None and whole:
-                # One panel: route its children once per Σ call (τ-invariant).
-                # Several panels route one panel at a time inside the τ body,
-                # so one panel's children are live, as the schedule priced.
-                fx = panel["route"](*fx)
             pp = poles if whole else poles[lo:hi]
             if chunked:
                 fx = tuple(_chunk_major(mesh_xy, factor_specs[i % 2], n_chunks, width)(f)
@@ -594,60 +515,52 @@ def _shared_pole_w_synthesis(io, meta, header, frequencies, schedule, *, mesh_xy
                              workspace_bytes_per_rank=0, concurrent_with=ambient)
             capacity.live_stages = (*ambient, f"{stage}.synthesis.resident")
 
-    spans = tuple((p["span"], p["rows"], p["kernel"], p["hole_rows"], p["hole"],
-                   None if p["span"] == (0, nq) else p["route"]) for p in panels)
+    spans = tuple((p["span"], p["kernel"]) for p in panels)
 
-    def w_kernel(factors_by_panel, poles_by_panel, intervals, e_ref, t_node, hole):
-        total = None
-        for ((lo, hi), rows, kernel, hole_rows, hole_program, route), factors, poles2 in zip(
-                spans, factors_by_panel, poles_by_panel):
-            if hole:
-                # The valence branch: each child's transpose, on the rows -c.
-                rows, kernel = hole_rows, hole_program
+    def w_kernel(factors_by_panel, poles_by_panel, intervals, load, e_ref, t_node, hole):
+        pair = None
+        for ((lo, hi), kernel), factors, poles2 in zip(spans, factors_by_panel, poles_by_panel):
             ranges = intervals[lo:hi]
-            if total is not None:
+            if pair is not None:
                 # One panel's temporaries at a time: the next panel's
-                # synthesis waits for the running total.
-                total, factors, poles2 = jax.lax.optimization_barrier((total, factors, poles2))
+                # synthesis waits for the running pair.
+                pair, factors, poles2 = jax.lax.optimization_barrier((pair, factors, poles2))
             if not chunked:
-                if route is not None:
-                    factors = route(*factors)
-                child = kernel(factors, poles2, jnp.clip(ranges, 0, width), e_ref, t_node)
-                if total is None and (lo, hi) == (0, nq):
-                    # All children are in canonical full-q order: the one
-                    # all-parent panel IS the full-q W.
-                    total = child
+                part = kernel(factors, poles2, jnp.clip(ranges, 0, width), e_ref, t_node)
+                if pair is None and (lo, hi) == (0, nq):
+                    # The one all-parent panel IS the parent pair.
+                    pair = part
                 else:
-                    base = _zeros(mesh_xy, (Q, m, m))() if total is None else total
-                    total = base.at[rows].add(child, indices_are_sorted=True,
-                                              unique_indices=True)
+                    base = (_zeros(mesh_xy, (nq, m, m))(),) * 2 if pair is None else pair
+                    pair = tuple(b.at[lo:hi].add(v) for b, v in zip(base, part))
                 continue
 
-            def chunk(j, acc, factors=factors, poles2=poles2, ranges=ranges,
-                      rows=rows, kernel=kernel, route=route):
+            def chunk(j, acc, factors=factors, poles2=poles2, ranges=ranges, lo=lo, hi=hi,
+                      kernel=kernel):
                 selected = jnp.clip(ranges - j*width, 0, width)
 
                 def add(acc):
                     faces = tuple(jax.lax.dynamic_index_in_dim(f, j, 0, keepdims=False)
                                   for f in factors)
-                    child = kernel(
-                        faces if route is None else route(*faces),
-                        jax.lax.dynamic_index_in_dim(poles2, j, 0, keepdims=False),
-                        selected, e_ref, t_node)
-                    return acc.at[rows].add(child, indices_are_sorted=True,
-                                            unique_indices=True)
+                    part = kernel(faces,
+                                  jax.lax.dynamic_index_in_dim(poles2, j, 0, keepdims=False),
+                                  selected, e_ref, t_node)
+                    return tuple(a.at[lo:hi].add(v) for a, v in zip(acc, part))
                 # A chunk with no active column in this window adds nothing.
                 return jax.lax.cond(jnp.any(selected[:, 1] > selected[:, 0]),
                                     add, lambda acc: acc, acc)
-            total = jax.lax.fori_loop(
-                0, n_chunks, chunk, _zeros(mesh_xy, (Q, m, m))() if total is None else total)
-        return total
+            pair = jax.lax.fori_loop(
+                0, n_chunks, chunk,
+                (_zeros(mesh_xy, (nq, m, m))(),) * 2 if pair is None else pair)
+        # The valence branch of an ordered store reads W_+(-q)^T through the
+        # q-negated tables: the same parent pair, another load.
+        return (*pair, load[1] if hole else load[0])
 
     def window_operands(_space, indices, bounds):
         # Host intervals once per window; every τ node of the window reuses them.
         intervals = shared_pole_intervals(frequencies, np.asarray(indices), np.asarray(bounds))
         return (panel_factors, panel_poles,
-                device_put_process_local(intervals, NamedSharding(mesh_xy, P())))
+                device_put_process_local(intervals, NamedSharding(mesh_xy, P())), loads)
 
     closed = False
 
@@ -664,12 +577,14 @@ def _shared_pole_w_synthesis(io, meta, header, frequencies, schedule, *, mesh_xy
                 capacity.live_stages = ambient
             closed = True
 
-    key = ("scalar", mesh_xy, Q, m, width, n_chunks, ordered,
+    key = ("scalar-parent", mesh_xy, nq, m, width, n_chunks, ordered, q_wedge.wedge_key(),
            tuple((p["span"], p["count"], p["static"]) for p in panels))
     if weights_fn is not _shared_pole_weights:
         key += (weights_fn.__name__,)
-    return WSynthesis(w_kernel, window_operands, lambda: (panel_factors, panel_poles),
-                      close, native_workspace, key, ordered=ordered)
+    synthesis = WSynthesis(w_kernel, window_operands, lambda: (panel_factors, panel_poles),
+                           close, native_workspace, key, ordered=ordered)
+    synthesis.q_wedge = q_wedge
+    return synthesis
 
 
 def shared_pole_static_wc(handle, meta, *, mesh_xy, layout="face"):
@@ -677,9 +592,11 @@ def shared_pole_static_wc(handle, meta, *, mesh_xy, layout="face"):
 
     The static screened correction the restart stores for BSE
     (``W0_qmunu = V + Wc(0)``). It is evaluated by the Σ synthesis above —
-    the same factor read, fixed-q projection, little-group realization and
-    unfold — with :func:`_shared_pole_omega0_weights` in place of d(τ), so
-    the store keeps one evaluator. The two branches of the time-ordered W
+    the same factor read, little-group realization and fixed-q projection
+    on the parents — with :func:`_shared_pole_omega0_weights` in place of
+    d(τ), so the store keeps one evaluator; the parent pair is then unfolded
+    to the full grid (:func:`_shared_pole_full_q`), because the restart
+    member is stored on every q. The two branches of the time-ordered W
     enter as the Σ consumer routes them: W_+(q) and, on an ordered store,
     W_+(-q)^T (SP 5); a TRS store's valence branch is W_+ itself, which
     gives ``-b Λ^-1 b†`` (docs/architecture/shared_pole_model.md §7).
@@ -729,11 +646,14 @@ def shared_pole_static_wc(handle, meta, *, mesh_xy, layout="face"):
                 layout=schedule.get("factor_layout", layout),
                 weights_fn=_shared_pole_omega0_weights, stage="w0")
         hole = shared_pole_hole_kernel(mesh_xy)
+        full_q = _shared_pole_full_q(meta, header, mesh_xy=mesh_xy)
         face = NamedSharding(mesh_xy, P(None, "x", "y"))
 
         @partial(jax.jit, out_shardings=face)
         def static(factors, poles, intervals):
-            plus = synthesis.w_kernel(factors, poles, intervals, 0.0, 0.0, False)
+            W, Wt, _ = synthesis.w_kernel(factors, poles, intervals, (None, None),
+                                          0.0, 0.0, False)
+            plus = full_q(W, Wt)
             return plus + (hole(plus, jnp.asarray(minus_q)) if ordered else plus)
         wc = None
         try:
@@ -762,78 +682,51 @@ def _chunk_major(mesh_xy, spec, n_chunks, width):
     return jax.jit(split, out_shardings=NamedSharding(mesh_xy, P(None, *spec)))
 
 
-def _shared_pole_panel_cost(meta, header, b, c, *, mesh_xy, local, layout="face"):
-    """Price actual new E buffers; the incumbent's one full W is inherited.
+def _shared_pole_panel_cost(meta, header, b, c, *, mesh_xy, layout="face"):
+    """Price the new buffers of one b-parent x c-column synthesis panel.
 
     Coordinator ruling12 separates unchanged spatial/ψ/Σ peak regression
-    from this three-U admission. A child W tile is priced as new even when
-    an all-parent first panel can reuse it as the inherited full W.
+    from this three-U admission.  W stays on the parent rows (the Σ door
+    unfolds it on its load), so no child W tile is priced.
     """
-    from symmetry_maps import endpoint_panel_cost
-
     # Factors and W tiles are mu x mu charge operators (factor spin axis 1)
     # on scalar and two-component decks; G alone carries the spinor axes.
     m, spin = int(meta.mu_basis.n_packed), 1
     nq = int(header["n_q_irr"])
     px, py = int(mesh_xy.shape["x"]), int(mesh_xy.shape["y"])
-    parents = np.asarray(header["qirr"]["irr_idx_q"], dtype=np.int32)
-    children = max(int(np.count_nonzero((parents >= lo)
-                   & (parents < min(lo+b, nq)))) for lo in range(0, nq, b))
     tile = 16 * (spin*m)**2 // (px*py)
     multiple = combined_divisor(px,py)
     c = padded_axis(c,multiple,name="shared_pole_K_chunk").carrier
     faces = 32 * b * spin*m*c / (px*py)
-    endpoint_budgets = {}
-    traffic = 0
-    if local:
-        # Parent, partner and fixed-size group accumulators coexist. The
-        # compiled reservation below measures actual aliases and exchange
-        # scratch; this bound also informs the panel-size search.
-        peak = ((6*b+children)*tile + 8*b
-                + 80*b*spin*m*c/(px*py) + 64*b*c)
-    else:
-        costs = {axis: endpoint_panel_cost((b,m,spin,c), children,
-                 mesh=mesh_xy, mesh_axis=axis, dtype=np.complex128)
-                 for axis in ("x", "y")}
-        endpoint_budgets = {axis: row["estimated_live_bytes_per_rank"]
-                            for axis, row in costs.items()}
-        traffic = sum(row["ring_bytes_per_rank"] for row in costs.values())
-        # The service bounds include input, output, rotating and phase
-        # scratch. Extra weighted child faces and child W coexist at GEMM.
-        peak = (sum(endpoint_budgets.values()) + 5*children*tile
-                + 16*children*spin*m*c/(px*py) + 64*(b+children)*c)
+    # Parent, partner and fixed-size group accumulators coexist. The
+    # compiled reservation below measures actual aliases and exchange
+    # scratch; this bound also informs the panel-size search.
+    peak = 6*b*tile + 8*b + 80*b*spin*m*c/(px*py) + 64*b*c
     if layout == "axis":
         axis_faces = 16*b*spin*m*c*(1/px+1/py)
         # Retained axis factors, the reader's face carrier, and weighted
-        # GEMM operands coexist; nonlocal routes also keep their child faces.
-        peak += axis_faces + 16*(b if local else children)*spin*m*c*(1/px+1/py)
+        # GEMM operands coexist.
+        peak += axis_faces + 16*b*spin*m*c*(1/px+1/py)
         faces = axis_faces
     return dict(resident_bytes_per_rank=int(np.ceil(faces)),
-                workspace_bytes_per_rank=int(np.ceil(peak-faces)),
-                endpoint_budgets=endpoint_budgets,
-                routed_bytes_per_panel_per_rank=int(traffic), children=children)
+                workspace_bytes_per_rank=int(np.ceil(peak-faces)))
 
 
-def _shared_pole_resident_bytes(meta, header, *, mesh_xy, local, layout, whole=True):
+def _shared_pole_resident_bytes(meta, header, *, mesh_xy, layout):
     """Per-rank bytes of the factors the synthesis holds for a whole Σ call.
 
     All n_q_irr parent faces at the store's whole-K carrier K̄, both
     orientations: 32·n·μ·K̄/P on the face layout, 16·n·μ·K̄·(1/Px+1/Py) with
     the pole columns replicated (axis layout), plus the replicated poles
-    8·n·K̄.  A nonlocal (routed) store scheduled as one ``whole`` panel also
-    keeps every child face and its conjugate partner (routed once per call),
-    the same pair bytes over all Q children; with several panels each
-    panel's children are routed inside the τ body and priced as workspace.
+    8·n·K̄.
     """
     from file_io.shared_pole_store import face_width
 
-    m, nq, Q = (int(meta.mu_basis.n_packed), int(header["n_q_irr"]),
-                int(header["n_q_full"]))
+    m, nq = int(meta.mu_basis.n_packed), int(header["n_q_irr"])
     px, py = int(mesh_xy.shape["x"]), int(mesh_xy.shape["y"])
     k = face_width(mesh_xy, int(header["Kmax"]))
     pair = (32*m*k/(px*py) if layout == "face" else 16*m*k*(1/px + 1/py))
-    rows = nq if local or not whole else nq + 2*Q
-    return int(np.ceil(rows*pair + 8*nq*k))
+    return int(np.ceil(nq*pair + 8*nq*k))
 
 
 def _shared_pole_memory_schedule(meta, header, *, mesh_xy, layout="face", stage="sigma"):
@@ -872,7 +765,7 @@ def _shared_pole_memory_schedule(meta, header, *, mesh_xy, layout="face", stage=
         return dict(status=receipt["status"],parent_capacity=nq,column_capacity=1,
                     capacity_receipt=receipt,route="empty")
     tables = _shared_pole_panel_tables(meta, header, (0,nq), mesh_xy=mesh_xy)
-    local = all(c["is_local"] for c in tables["certificates"].values())
+    _require_local_maps(tables["certificates"])
     # The ledger owns the hardware limit (ruling24); 3U is a scaling
     # receipt. A zero-byte planning reservation prices the existing ambient set.
     admission = capacity.reserve(
@@ -883,20 +776,18 @@ def _shared_pole_memory_schedule(meta, header, *, mesh_xy, layout="face", stage=
     multiple = combined_divisor(px,py)
 
     def workspace(b, c, layout):
-        return _shared_pole_panel_cost(meta,header,b,c,mesh_xy=mesh_xy,local=local,
+        return _shared_pole_panel_cost(meta,header,b,c,mesh_xy=mesh_xy,
                                        layout=layout)["workspace_bytes_per_rank"]
 
     def search(layout):
         best = None
         for b in range(1,nq+1):
             left = budget - _shared_pole_resident_bytes(
-                meta, header, mesh_xy=mesh_xy, local=local, layout=layout, whole=b >= nq)
-            projection_rows = b if local else _shared_pole_panel_cost(
-                meta,header,b,multiple,mesh_xy=mesh_xy,local=local,layout=layout)["children"]
+                meta, header, mesh_xy=mesh_xy, layout=layout)
             # The physical logical-U bound applies to every NEW projector
             # matrix, even when orbit packing pads the endpoint carrier. The
             # pre-existing full-q Sigma output is accounted separately above.
-            if 16*projection_rows*meta.mu_basis.n_packed**2/(px*py) > U:
+            if 16*b*meta.mu_basis.n_packed**2/(px*py) > U:
                 continue
             # workspace(j column multiples) = intercept + j*slope; both ends are
             # ceilinged byte counts, so a non-positive slope carries no width
@@ -926,11 +817,9 @@ def _shared_pole_memory_schedule(meta, header, *, mesh_xy, layout="face", stage=
         if replicated is not None and (best is None or replicated[0] <= best[0]):
             layout, best = "axis", replicated
     b,c = (1,multiple) if best is None else best[2:]
-    footprint = _shared_pole_panel_cost(meta,header,b,c,mesh_xy=mesh_xy,local=local,layout=layout)
-    resident = _shared_pole_resident_bytes(meta, header, mesh_xy=mesh_xy, local=local,
-                                           layout=layout, whole=b >= nq)
-    projection_rows = b if local else footprint["children"]
-    projection_bytes = 16*projection_rows*meta.mu_basis.n_packed**2/(px*py)
+    footprint = _shared_pole_panel_cost(meta,header,b,c,mesh_xy=mesh_xy,layout=layout)
+    resident = _shared_pole_resident_bytes(meta, header, mesh_xy=mesh_xy, layout=layout)
+    projection_bytes = 16*b*meta.mu_basis.n_packed**2/(px*py)
     if projection_bytes > U:
         raise ValueError("GATE shared_pole_capacity: one parent star exceeds the all-P logical matrix bound")
     try:
@@ -958,9 +847,7 @@ def _shared_pole_memory_schedule(meta, header, *, mesh_xy, layout="face", stage=
                 parent_capacity=b,column_capacity=c,
                 resident_factor_bytes_per_rank=resident,
                 caller_live_bytes_per_rank=caller_bytes,capacity_receipt=receipt,
-                route="local_parent" if local else "routed_child",
-                endpoint_budgets=footprint["endpoint_budgets"],
-                routed_bytes_per_panel_per_rank=footprint["routed_bytes_per_panel_per_rank"],
+                route="local_parent",
                 inherited_sigma_peak_status="NOT_MEASURED",
                 projection_matrix_bytes_per_rank=int(projection_bytes))
 
@@ -1282,15 +1169,23 @@ def _integrate_sigma_batches(
         if tau_kernel_factory is not None:
             tau_kernel = tau_kernel_factory(w_synthesis, sigma_axis)
         elif synthesis:
-            # The scalar shared-pole route: the shared sigma_kij consumes the
-            # full-q W its synthesis builds inside the same τ body.
+            # The scalar shared-pole route: the shared sigma_kij reads the
+            # parent pair its synthesis builds inside the same τ body, and
+            # unfolds it on the transform's load (mathdx mode 9, the q wedge).
+            from gw.ppm_tau_kernel import sigma_pass_price
             sigma_kij = _get_sigma_kij_kernel(
                 mesh_xy=mesh_xy, kgrid=kgrid, merged_x=True, brackets=brackets,
-                **face_kwargs)
-            spatial_key = ("scalar", mesh_xy, kgrid, brackets,
+                q_wedge=w_synthesis.q_wedge, **face_kwargs)
+
+            def scalar_spatial(xn, yr, xr, yn, energies, weight, e_ref, t, interactions,
+                               sigma_kij=sigma_kij):
+                return sigma_kij(xn, yr, xr, yn, energies, weight, e_ref, t, *interactions)
+            scalar_spatial.price = sigma_pass_price(sigma_kij)
+            spatial_key = ("scalar-parent", mesh_xy, kgrid, brackets,
+                           w_synthesis.q_wedge.wedge_key(),
                            tuple(sorted(face_kwargs.items(), key=lambda kv: kv[0])))
             tau_kernel = SynthesisTau(
-                sigma_kij, w_synthesis, psi_coh_yr, psi_proj_yn, w_synthesis.native,
+                scalar_spatial, w_synthesis, psi_coh_yr, psi_proj_yn, w_synthesis.native,
                 "sigma.synthesis.window", meta, spatial_key, (k_unfold_plan,))
         else:
             tau_kernel = get_shared_sigma_tau_kernel(

@@ -352,12 +352,17 @@ $$ W_{c,+}(q,\tau) = b\,\mathrm{diag}\big(d_j(\tau)\big)\,b^{\dagger}, \qquad
 d_j(\tau) = \frac{e^{-i(\Omega_j - E_{\rm ref})\tau}}{2\Omega_j} . \tag{SP 4} $$
 
 Synthesis uses the Green-function GEMM (`build_G`) at the irreducible parents,
-then the fixed-q projection, the little-group realization and the unfold to
-the full q grid. The factors are read once per Σ call and stay resident:
+then the little-group realization and the fixed-q projection, all on the
+parent rows. The result is the parent pair $(W_p, W_p^{\mathsf T})$,
+$[n_{q,\rm irr},\mu,\mu]$; no full-q $W$ is formed (TASTE 97). The Σ door
+unfolds the pair on its transform's load through the store's q-wedge tables
+(`_shared_pole_q_wedge`, pair-transpose rule, mathdx mode 9), as the GN-PPM
+wedge does. An endpoint map that crosses a mesh shard refuses
+(`GATE shared_pole_w_parent_local`). The factors are read once per Σ call and stay resident:
 $32\,n_{q,\rm irr}\,\mu\,\bar K/P$ bytes per rank face-sharded,
 `P(None,'x',None,'y')`, or $16\,n_{q,\rm irr}\,\mu\,\bar K(1/P_x+1/P_y)$ when the
 panel search admits the replicated pole columns ($\bar K$ the store's pole
-carrier); a nonlocal store also keeps its routed child faces. The budget left
+carrier). The budget left
 beside them sizes one parent panel × pole-column chunk of synthesis workspace:
 parent panels are a static loop inside the executable, chunks of one static
 width a device loop, one of each when everything fits. A store whose resident
@@ -370,20 +375,19 @@ valence windows to the particle–hole partner,
 $$ W_-(q,\tau) = W_+(-q,\tau)^{\mathsf T}, \tag{SP 5} $$
 
 TRS stores never take this branch.
-The valence synthesis never transposes the full-q $W$. Its unfold writes each
-child's $W_+(c)^{\mathsf T}$ straight onto row $-c$, working on every rank's own tile.
-It reads the same parent pair (projected $W_p$ and $W_p^{\mathsf T}$) with the
-swapped source and the transposed phase rule
-(`unfold_operator_local(transposed_output=True)`).
-The little-group projector always forms its transposed output the same way,
+The valence branch reads the same parent pair through the q-negated load
+tables (`sector_sigma.hole_tables`: the particle tables at $-q$, the partner
+flag flipped, both phases conjugated), so no $-q$ gather or transpose of $W$
+is formed. The little-group projector always forms its transposed output the same way,
 as the average of the swapped pair, in the same loop step; it does no transpose
 exchange, whatever the group order (large groups pay local work instead: Na 8³
 Σ τ +7 % at P4). One tile exchange per τ node remains: the synthesis
 $W_p^{\mathsf T}$. Both local forms equal the exchanged transposes bit for bit
 (claim 2958). An exchange lets the
 off-diagonal ranks move their tiles while the diagonal ranks copy theirs and
-wait; that cost 26 % of a P16 node. The full-q transpose
-(`shared_pole_hole_kernel`) remains only for the static $W(0)$ restart.
+wait; that cost 26 % of a P16 node. The full-q unfold
+(`_shared_pole_full_q`) and transpose (`shared_pole_hole_kernel`) remain only
+for the static $W(0)$ restart member, which is stored on every q.
 
 **Two-component decks.** $W$ is spin-scalar; $G$ carries the spinor axes and the
 τ kernel broadcasts $W_q$ over both (`ppm_tau_kernel` `prep_w`).
