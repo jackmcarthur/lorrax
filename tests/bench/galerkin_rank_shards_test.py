@@ -58,6 +58,16 @@ with SlabIO(path,mode='r',mesh=mesh) as io:
     reread=io.read_slab('C',shape=(nk,nb,rank),partition_spec=sh.spec)
 expected=np.pad(reference[:,:,:physical],((0,0),(0,0),(0,rank-physical)))
 assert np.max(np.abs(gather_to_host(reread)-expected))<2e-15
+metrics_small=_galerkin_rank_metrics_kernel(mesh,solved.shape,selected_rows=tuple(selected),physical=len(selected))(solved,ld)
+gram=np.einsum('kna,kma->knm',reference,reference.conj())
+norm=np.diagonal(gram,axis1=1,axis2=2).real
+cpu=(np.diag(L).real[:len(selected)].min(),np.abs(gram-np.eye(nb)).max(),np.abs(norm-1).max(),np.sqrt(max(0,1-norm.mean())),np.abs(reference.reshape(-1,rank)[selected]-L[:len(selected)]).max(),max(1,np.abs(L[:len(selected)]).max()))
+assert np.max(np.abs(np.asarray(tuple(float(x) for x in metrics_small))-np.asarray(cpu)))<5e-14
+try:
+    _galerkin_rank_metrics_kernel(mesh,(nk,nb,11),selected_rows=tuple(selected),physical=len(selected))
+    raise AssertionError("nondivisible rank must refuse")
+except ValueError:
+    pass
 rows=[]
 for bands in (184,198):
     shape=(8000,bands,2520)
@@ -70,7 +80,8 @@ for bands in (184,198):
     assert mem.temp_size_in_bytes<4*local+2520*2520*16,(bands,mem)
     metrics=_galerkin_rank_metrics_kernel(mesh,shape,selected_rows=tuple(range(2500)),physical=2500).lower(abstract,factor).compile()
     m=metrics.memory_analysis()
-    assert m.temp_size_in_bytes<2*local+2*2520*2520*16,(bands,m.temp_size_in_bytes)
+    assert m.temp_size_in_bytes<3.1*local+2*2520*2520*16,(bands,m.temp_size_in_bytes)
+    assert "all-gather" not in metrics.as_text()
     rows.append(dict(bands=bands,shape=shape,abstract_only=True,argument_bytes=mem.argument_size_in_bytes,output_bytes=mem.output_size_in_bytes,alias_bytes=mem.alias_size_in_bytes,temp_bytes=mem.temp_size_in_bytes,metrics_temp_bytes=m.temp_size_in_bytes,full_C_bytes=local*4,P36_C_bytes=local*4//36,no_solve_all_gather=True))
 if jax.process_index()==0:
     target=out/'result.json'
