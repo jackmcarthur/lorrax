@@ -818,7 +818,7 @@ def _parent_spin_component(D, tables, right, a, b, mu_start=0, mu_size=None, nu_
 
 
 def _stream_pair_tiles(kgrid, ns, perm_l, phase_l, perm_r, phase_r,
-                       scale, left, right, shape, fft, ifft):
+                       scale, left, right, shape, fft, ifft, selected_q=None):
     """Complete-P output, with <=2048 spatial columns of scalar-spin scratch."""
     nk, mu, nu = shape
     mt, nt = min(mu, 32), min(nu, 64)
@@ -832,9 +832,12 @@ def _stream_pair_tiles(kgrid, ns, perm_l, phase_l, perm_r, phase_r,
             lambda a, b: left(a, b, m, mt, n, nt),
             lambda a, b: right(a, b, m, mt, n, nt),
             (nk, mt, nt), fft, ifft)
+        if selected_q is not None:
+            value = jnp.take(value, jnp.asarray(selected_q), axis=0)
         return jax.lax.dynamic_update_slice(out, value, (0, m, n))
 
-    return jax.lax.fori_loop(0, nm * nn, tile, jnp.zeros(shape, jnp.complex128), unroll=False)
+    output_shape = shape if selected_q is None else (len(selected_q), mu, nu)
+    return jax.lax.fori_loop(0, nm * nn, tile, jnp.zeros(output_shape, jnp.complex128), unroll=False)
 
 
 def _staged_kparent(mesh, kgrid, ns, perm_l, phase_l, perm_r, phase_r, scale):
@@ -2307,3 +2310,68 @@ def fourier_plan_ffi(x, *, n, kin, kout, in_idx, out_idx, sup_in, sup_out, gemm,
         sup_in=i64(sup_in), sup_out=i64(sup_out), gemm=i64(gemm),
         scale=np.asarray(scale, dtype=np.float64), order=i64(order), sign=np.int64(sign),
         mathdx_root=mathdx_root, cubin_dir=cubin_dir)
+
+
+def make_selected_parent_pairs(mesh, kgrid, left_tables, right_tables, *,
+                               selected_q, vertex_terms, norm="ortho"):
+    """Selected rows of monomial traces, reusing each bounded spin FFT tile.
+
+    vertex_terms is (left permutation, left phase, right permutation, right
+    phase) per channel. The caller owns the vertices; this service holds two
+    <=2048-column open-spin tiles, never a full-k endpoint Green bank.
+    fn(left, right, left_partner, right_partner, left_sign, right_sign).
+    """
+    from symmetry_maps import local_unfold_load_tables, apply_unfold_load_spin_component_local
+    kg = _check_kgrid(kgrid, kconv_backend(mesh))
+    nk, ns = int(np.prod(kg)), int(left_tables.spin.shape[-1])
+    if right_tables.spin.shape[-1] != ns or left_tables.row.shape != right_tables.row.shape:
+        raise ValueError("selected parent pairs need compatible spin and k extents")
+    if left_tables.conj_trs or right_tables.conj_trs:
+        raise ValueError("selected parent pairs require typed partner transport")
+    q = tuple(int(v) for v in selected_q)
+    if not q or len(set(q)) != len(q) or min(q) < 0 or max(q) >= nk:
+        raise ValueError("selected parent pairs need unique valid q rows")
+    if any(tuple(t.mesh_shape) != (int(mesh.shape["x"]),int(mesh.shape["y"]))
+           for t in (left_tables,right_tables)):
+        raise ValueError("selected parent pairs: typed table mesh mismatch")
+    terms = tuple(tuple(np.asarray(v) for v in term) for term in vertex_terms)
+    if not terms or any(any(v.shape != (ns,) for v in term) for term in terms):
+        raise ValueError("selected parent pairs need spin-sized monomial vertices")
+    for pl,fl,pr,fr in terms:
+        _check_perm(pl,ns,"left"); _check_perm(pr,ns,"right")
+    fft, ifft = _staged_pair_ffts(mesh, kg)
+    scale = conv_kpair_scale(norm, nk, 1.)
+    def local(L, R, Lt, Rt, ls, rs):
+        tl, tr = local_unfold_load_tables(left_tables), local_unfold_load_tables(right_tables)
+        mu, nu = int(L.shape[1]), int(L.shape[3])
+        mt, nt = min(mu, 32), min(nu, 64)
+        nm, nn = (mu+mt-1)//mt, (nu+nt-1)//nt
+        def spin_bank(G, Gt, t, sign, m, n):
+            def component(i, bank):
+                value = apply_unfold_load_spin_component_local(G, Gt, t, i//ns, i%ns,
+                    mu_start=m, mu_size=mt, nu_start=n, nu_size=nt)
+                value = value * sign[:,None,None]
+                return jax.lax.dynamic_update_slice(bank, value[None], (i,0,0,0))
+            bank = jax.lax.fori_loop(0,ns*ns,component,
+                jnp.zeros((ns*ns,nk,mt,nt),G.dtype),unroll=False)
+            # The service transform sees k leading and every spin column once.
+            return ifft(jnp.moveaxis(bank,0,1).reshape(nk,-1)).reshape(nk,ns*ns,mt,nt).transpose(1,0,2,3)
+        def tile(i, out):
+            m = jax.lax.optimization_barrier(jnp.minimum((i//nn)*mt,mu-mt))
+            n = jax.lax.optimization_barrier(jnp.minimum((i%nn)*nt,nu-nt))
+            lb = spin_bank(L,Lt,tl,ls,m,n)
+            lb, Rbar = jax.lax.optimization_barrier((lb,R))
+            rb = spin_bank(Rbar,Rt,tr,rs,m,n)
+            for ch,(pl,fl,pr,fr) in enumerate(terms):
+                def trace(j, value):
+                    a,b=j//ns,j%ns
+                    return value + jnp.asarray(fl)[a]*jnp.asarray(fr)[b]*jnp.conj(lb[j])*rb[jnp.asarray(pl)[a]*ns+jnp.asarray(pr)[b]]
+                value=jax.lax.fori_loop(0,ns*ns,trace,jnp.zeros((nk,mt,nt),L.dtype),unroll=False)
+                value=fft(value.reshape(nk,-1)).reshape(nk,mt,nt)*scale
+                value=jnp.take(value,jnp.asarray(q),axis=0)
+                out=jax.lax.dynamic_update_slice(out,value[None],(ch,0,m,n))
+            return out
+        return jax.lax.fori_loop(0,nm*nn,tile,
+            jnp.zeros((len(terms),len(q),mu,nu),L.dtype),unroll=False)
+    spec=P(None,"x",None,"y",None)
+    return _sharded(local,mesh,(spec,spec,spec,spec,P(),P()),P(None,None,"x","y"))
