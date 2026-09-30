@@ -3,6 +3,15 @@
 User-visible changes, newest first. Binding rulings behind the breaking
 changes live in `docs/architecture/decisions.md`.
 
+## 2026-09-30 — the Hall current takes `vnl_velocity_sign`; regenerate −1 Hall artifacts
+
+`get_dipole_mtxels --static-gauge-hall-only` now builds the Hall current with
+the same V_NL sign it stamps (`prov_vnl_velocity_sign`), as `dipole.h5` does.
+Before, the current always used the +1 arm, so a `--vnl-velocity-sign -1`
+artifact carried the +1 σ_H under a −1 label. Artifacts built at +1 (the
+default) are bitwise. Regenerate any Hall artifact built at −1; its σ_H and
+operator fingerprint change.
+
 ## 2026-09-30 — `parallel_transport`: the Σ term is served whenever the links are usable
 
 The `parallel_transport` head no longer sets its Σ term D_kΔH to zero on a map
