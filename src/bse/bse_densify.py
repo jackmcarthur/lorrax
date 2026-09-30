@@ -712,7 +712,8 @@ def _interpolate_bse_data_to_grid(
         vqm = vq_interp.build_vq_evaluator(
             restart_file, mesh_xy, n_rmu_pad, input_file=input_file, head_minibz_average=True,
             distrib_la_batched_route=_distrib_la_batched_route,
-            log_fn=log_fn)
+            log_fn=log_fn,
+            run_diagnostics=bool(params["sigma_freq_debug_output"]))
         gstar, head_val = vq_interp.minibz_head_vlr(
             vqm.zx, vqm.prep, np.zeros(3), kgrid=fine_grid)
         V_q0 = vqm.eval_vq(jnp.zeros(3), vqm.prep["V_SRc"], vqm.pinvF,

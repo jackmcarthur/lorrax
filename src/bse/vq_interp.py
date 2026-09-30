@@ -1680,7 +1680,7 @@ def build_vq_evaluator(restart_file, mesh_xy: Mesh, n_rmu_pad: int | None = None
                        *, zeta_file=None, input_file=None, alpha=ALPHA, eps_tik=EPS_TIK,
                        eigh_backend="auto", head_minibz_average=False,
                        distrib_la_batched_route: str = "batch_reshard",
-                       run_diagnostics=True, log_fn=print, fit_ecut=None):
+                       run_diagnostics=False, log_fn=print, fit_ecut=None):
     """ONE arbitrary-Q exchange-tile model build (stages 1-3), packaged.
 
     This is the SINGLE orchestration of the ``vq_interp`` pipeline
@@ -1703,12 +1703,12 @@ def build_vq_evaluator(restart_file, mesh_xy: Mesh, n_rmu_pad: int | None = None
     ``minibz_head_vlr``).
     """
     from types import SimpleNamespace
-    # The reference gate battery (run_gates / run_nulls) materializes replicated
-    # tensors that OOM for large centroid counts (e.g. 1496 recovered-D3h on 16
-    # GPU → a 58 GB alloc).  Allow opting out via env; the coarse-fit still runs
-    # and the driver's physical on-grid htransform gate still validates.
-    if os.environ.get("LORRAX_SKIP_VQ_GATES", "0") == "1":
-        run_diagnostics = False
+    # ``run_diagnostics`` (the reference battery run_gates / run_nulls) is a
+    # debug opt-in: callers pass the deck's ``sigma_freq_debug_output``.  The
+    # battery materializes replicated tensors that OOM for large centroid
+    # counts (MoS2 8v+8c: a 56.58 GiB XHX; 1496 centroids on 16 GPU: 58 GB).
+    # Off, the coarse fit still runs and the driver's physical on-grid
+    # htransform gate still validates.
     if zeta_file is None:
         zeta_file = os.path.join(os.path.dirname(restart_file), "zeta_q.h5")
     # ``mesh_xy`` reaches the ζ reader so ``prepare_coarse``'s q-chunk
