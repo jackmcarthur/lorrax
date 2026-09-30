@@ -1187,10 +1187,14 @@ def main(argv=None):
 				sigma_H = np.asarray(jax.block_until_ready(hall.sigma_H))
 			if args.static_gauge_hall_out is not None:
 				from file_io.static_gauge_head import (
-					write_static_gauge_hall_artifact)
+					hall_operator_stamps, write_static_gauge_hall_artifact)
 				with timing.section("static_gauge_hall_write"):
 					write_static_gauge_hall_artifact(
-						args.static_gauge_hall_out, hall, mesh_xy=RUNTIME.mesh)
+						args.static_gauge_hall_out, hall, mesh_xy=RUNTIME.mesh,
+						operator_stamps=hall_operator_stamps(
+							skip_vnl=False, vnl_mode="analytic",
+							vnl_velocity_sign=vnl_velocity_sign,
+							kinetic_balance_lift="raw"))
 			if jax.process_index() == 0:
 				print(
 					"STATIC_GAUGE_HALL_TRANSACTION "
