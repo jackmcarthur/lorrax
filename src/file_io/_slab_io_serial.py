@@ -59,9 +59,9 @@ mesh — that is what makes this a second door rather than a relaxation of
 the first, and ``tests/test_slab_io_emulated_mesh.py`` observes it for the
 phdf5 one.  Where they are, at ``9681eda6``, from
 ``grep -rnE '!= *(int\\()?jax\\.process_count\\(\\)|!= *(int\\()?process_count\\(\\)|!= *world\\b'``
-over ``src/`` and ``services/*/src/`` — five modules, six sites:
+over ``src/`` and ``services/*/src/`` — four modules, five sites (``ffi/cublasmp`` since deleted):
 ``ffi/io.py:120`` (the phdf5 open, the one this tier stands beside),
-``ffi/cublasmp/batched.py:56``, ``distrib_la/_slate.py:112``,
+``distrib_la/_slate.py:112``,
 ``distrib_la/matmul.py:78`` and ``distrib_la/_cusolvermp.py:89``/``:205``.
 No numeral is load-bearing here and none is offered as a total: the
 pattern cannot see refusals spelled positively (``==`` then raise), the C++

@@ -1675,13 +1675,10 @@ _SERVICE_DOORS = {"lxkit": "lxkit", "distrib_la": "distrib_la",
 #: Every consumer imports the top-level ``distrib_la`` door now, which this
 #: rule does not count because it is not a violation.
 #:
-#: THE REMAINING SEVEN ARE NOT A REPLUMB LEFTOVER.  ``ffi.cusolvermp`` has a
-#: live in-``src/`` reacher that is out of distrib_la's scope entirely --
-#: ``ffi/cublasmp/batched.py:33`` takes ``get_or_init_context`` from it, and
-#: cuBLASMp is a future ``gemm`` service, not this one.  Converting that edge
-#: would mean lorrax importing ``distrib_la._cusolvermp`` directly, i.e.
-#: trading three counted exceptions for one uncounted violation.  It goes
-#: when gemm is extracted; until then the number is 7 and it is honest.
+#: THE LAST SEVEN ARE GONE.  ``ffi.cusolvermp`` (a re-export shim) and
+#: ``ffi.cublasmp`` (its one reacher) were deleted on 2026-09-30 once the
+#: distrib_la benches imported ``distrib_la._cusolvermp`` directly and no
+#: caller remained.
 #:
 #: 7 -> 10 AT THE symmetry_maps EXTRACTION.  Three forwarding shims, one
 #: past-the-door edge each: ``from symmetry_maps import <submodule> as
@@ -1708,11 +1705,7 @@ _SERVICE_DOORS = {"lxkit": "lxkit", "distrib_la": "distrib_la",
 #: delete the exception, and probably the module" the moment they went.
 #: An exception table that outlives its shims is how a replumb gets
 #: declared finished while the old paths are still there.
-_SERVICE_DOOR_EXCEPTIONS = {
-    "ffi.cusolvermp.batched": 5,
-    "ffi.cusolvermp.eigh":    1,
-    "ffi.cusolvermp.context": 1,
-}
+_SERVICE_DOOR_EXCEPTIONS: dict = {}
 
 
 def service_submodules(sources, service: str) -> set:
