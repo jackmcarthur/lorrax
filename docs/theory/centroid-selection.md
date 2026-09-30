@@ -13,6 +13,22 @@ implemented production routes or measured speedups.
 
 ## What is being optimized?
 
+The production CLI accepts `--k-stride S` (default `1`) for centroid training.
+It retains full-grid integer coordinates divisible by `S` along every axis,
+including the source grid's shift, and renormalizes their quadrature weights.
+`S` must be positive and divide every grid dimension. On a 20³ WFN,
+`--k-stride 2` trains on a uniform 10³ subset. Both the Lloyd feature weight
+and candidate-Gram pruning use this same subset, including with IBZ storage
+and the bispinor current metric. Band windows and real-space orbit closure
+are unchanged. The centroid header/report records the stride and training
+grid; downstream GW continues to use the original WFN grid.
+
+This is an approximation to the centroid training metric, not a reduction
+of the GW integration grid. Its effect on downstream fits and energies
+requires convergence checks. Independently of this option, the candidate
+Gram accumulates memory-sized k batches, with the original weights; batching
+changes floating-point summation grouping rather than the training metric.
+
 Write the feature at position r as
 
 \[

@@ -1972,7 +1972,7 @@ def _centroid_sampling_shardings(
 
 def _centroid_stream_geometry(
         band_chunk_size, domain, k_chunk_size, loader, nb_total, nk_tot, p_band, psi_G_flat,
-        return_parents):
+        return_parents, full_k_rows=None):
     """Produce fixed band and k tiles and the existing parent-star schedule."""
     # The shared GW memory plan already owns a positive Stage-A band chunk;
     # honor it here instead of bulk-loading the very tensor it prices.  Prune
@@ -2009,7 +2009,8 @@ def _centroid_stream_geometry(
     parent_groups = None
     parent_stream_active = False
     from wfn_loader import IBZRows
-    if domain == "full_bz" and stream_tiles and k_tile == 1:
+    if (domain == "full_bz" and stream_tiles and k_tile == 1
+            and full_k_rows is None):
         # The loader owns canonical parent/star membership and child order;
         # this consumer never reads or re-groups raw SymMaps tables.
         parent_groups = loader.full_k_parent_groups()
@@ -2183,16 +2184,17 @@ def _centroid_fft_scan_chunk(
 
 
 def _centroid_sampling_indices(
-        domain, loader, mesh_xy, parent_groups):
+        domain, loader, mesh_xy, parent_groups, full_k_rows=None):
     """Produce the loader-owned FFT indices and matched k representatives."""
     # The one-k parent schedule builds each current-star child index from the
     # resident parent G row. Other streaming/bulk schedules retain the
     # established complete cached table.
     g_index_full = None
+    request = domain if full_k_rows is None else full_k_rows
     if parent_groups is None:
-        g_index_full = loader.box_index_dev(k=domain, mesh=mesh_xy)
+        g_index_full = loader.box_index_dev(k=request, mesh=mesh_xy)
     # Use the k representatives paired with this loader's typed full-BZ map.
-    kvecs_frac_full = loader.kvecs(k=domain)
+    kvecs_frac_full = loader.kvecs(k=request)
     return g_index_full, kvecs_frac_full
 
 
@@ -2389,7 +2391,7 @@ def _sample_centroid_parent_groups(
 def _sample_centroid_domain_tiles(
         _insert_tile, b_start, band_tile, bispinor, bispinor_lift, centroid_idx_np, cs,
         domain, g_index_full, k_tile, kvecs_frac_full, loader, mesh_xy, meta, nb_total,
-        nk_tot, psi_rmuT_all, psi_rmu_all, sharding_load):
+        nk_tot, psi_rmuT_all, psi_rmu_all, sharding_load, full_k_rows=None):
     """Produce centroid faces by streaming the existing band and k tiles."""
     from common import timing
     from wfn_loader import IBZRows
@@ -2399,7 +2401,8 @@ def _sample_centroid_domain_tiles(
 
         for k0 in range(0, nk_tot, k_tile):
             k1 = min(k0 + k_tile, nk_tot)
-            k_ids = list(range(k0, k1))
+            k_ids = (list(range(k0, k1)) if full_k_rows is None
+                     else list(full_k_rows[k0:k1]))
             with timing.section("load_centroids.loader_load"):
                 psi_G_tile = load_psi_gflat_padded(
                     loader, band_window, mesh_xy=mesh_xy,
@@ -2444,7 +2447,7 @@ def _load_streamed_centroid_faces(
         _finish_faces, _reshard_centroid_tile, b_start, band_tile, bispinor, bispinor_lift,
         centroid_idx_np, cs, domain, g_index_full, k_tile, kvecs_frac_full, loader, mesh_xy,
         meta, n_rmu_padded, nb_accum, nb_total, nk_accum, nk_tot, nspinor, out_X, out_Y,
-        parent_groups, return_parents, sharding_load):
+        parent_groups, return_parents, sharding_load, full_k_rows=None):
     """Produce logical centroid faces through the existing streamed loader."""
     (_zero_faces, _zero_parent_faces, _insert_tile, _sample_and_insert_one) = _centroid_stream_kernels(
         _reshard_centroid_tile, centroid_idx_np, cs, loader, mesh_xy, meta, n_rmu_padded,
@@ -2464,7 +2467,7 @@ def _load_streamed_centroid_faces(
         (psi_rmu_all, psi_rmuT_all) = _sample_centroid_domain_tiles(
             _insert_tile, b_start, band_tile, bispinor, bispinor_lift, centroid_idx_np, cs, domain,
             g_index_full, k_tile, kvecs_frac_full, loader, mesh_xy, meta, nb_total, nk_tot,
-            psi_rmuT_all, psi_rmu_all, sharding_load)
+            psi_rmuT_all, psi_rmu_all, sharding_load, full_k_rows)
     gc.collect()
     full_faces = _finish_faces(psi_rmu_all, psi_rmuT_all, nk_tot)
     if not return_parents:
@@ -2593,15 +2596,29 @@ def load_centroids_band_chunked(
     bispinor_lift: str = "raw",
     k_domain: str = "full_bz",
     return_ibz_parents: bool = False,
+    full_k_rows=None,
 ) -> tuple[jax.Array, ...]:
     """Produce centroid faces from bounded WFN tiles; see docs/architecture/zeta_fit_face_psi_cct.md."""
     (b_start, b_end, nb_total, domain, return_parents, nk_tot, nspinor, mu_basis, mu_active_mask, n_rmu, centroid_idx_np, n_rtot) = _centroid_sampling_geometry(
         band_range, centroid_indices, k_domain, meta, psi_G_flat, return_ibz_parents, sym, wfn)
+    if full_k_rows is not None:
+        if domain != "full_bz" or return_parents or psi_G_flat is not None:
+            raise ValueError(
+                "full_k_rows requires the full-BZ loader stream without "
+                "a reused G carrier or retained IBZ parents")
+        # The loader owns row validity and duplicate detection. This is a
+        # selection of physical rows, never a changed lattice/k-grid proxy.
+        wfn.full_k_parent_groups(full_k_rows)
+        full_k_rows = tuple(int(k) for k in full_k_rows)
+        if not full_k_rows:
+            raise ValueError("full_k_rows cannot be empty")
+        nk_tot = len(full_k_rows)
+        k_chunk_size = min(nk_tot, max(1, int(k_chunk_size or nk_tot)))
     (sharding_load, p_band, peak_copies, gpu_mem_bytes, out_Y, out_X, stage_Y_4d, stage_X_4d, n_rmu_padded, loader) = _centroid_sampling_shardings(
         mesh_xy, meta, mu_basis, n_rmu, wfn)
     (stream_tiles, k_tile, band_tile, nk_accum, nb_accum, parent_groups, parent_stream_active, max_parent_star) = _centroid_stream_geometry(
         band_chunk_size, domain, k_chunk_size, loader, nb_total, nk_tot, p_band, psi_G_flat,
-        return_parents)
+        return_parents, full_k_rows)
     (nb_per_band_shard, nb_accum, persistent_bytes) = _centroid_resident_bytes(
         band_tile, bispinor, k_tile, loader, max_parent_star, mesh_xy, n_rmu, n_rmu_padded,
         n_rtot, nb_accum, nb_total, nk_accum, nk_tot, nspinor, p_band, parent_stream_active,
@@ -2610,7 +2627,7 @@ def load_centroids_band_chunked(
         band_tile, domain, gpu_mem_bytes, k_tile, n_rtot, nb_per_band_shard, nspinor,
         peak_copies, persistent_bytes, return_parents, stream_tiles)
     (g_index_full, kvecs_frac_full) = _centroid_sampling_indices(
-        domain, loader, mesh_xy, parent_groups)
+        domain, loader, mesh_xy, parent_groups, full_k_rows)
     (_reshard_centroid_tile, _finish_faces) = _centroid_face_kernels(
         b_start, meta, mu_active_mask, n_rmu, n_rmu_padded, nb_total, out_X, out_Y, stage_X_4d,
         stage_Y_4d)
@@ -2624,7 +2641,7 @@ def load_centroids_band_chunked(
             _finish_faces, _reshard_centroid_tile, b_start, band_tile, bispinor, bispinor_lift,
             centroid_idx_np, cs, domain, g_index_full, k_tile, kvecs_frac_full, loader, mesh_xy,
             meta, n_rmu_padded, nb_accum, nb_total, nk_accum, nk_tot, nspinor, out_X, out_Y,
-            parent_groups, return_parents, sharding_load)
+            parent_groups, return_parents, sharding_load, full_k_rows)
     return _load_bulk_centroid_faces(
         _finish_faces, _reshard_centroid_tile, b_end, b_start, bispinor, bispinor_lift,
         centroid_idx_np, cs, domain, g_index_full, kvecs_frac_full, loader, mesh_xy, meta,

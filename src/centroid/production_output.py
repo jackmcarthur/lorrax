@@ -87,7 +87,7 @@ def format_centroid_header(*, feature_fit: str, source_wfn: str,
                            candidates: int, written: int, pruning: str,
                            prune_rank: int | None, prune_left, prune_right,
                            prune_label: str, orbit_aware: bool, n_sym: int,
-                           density_mode: str) -> str:
+                           density_mode: str, k_stride: int = 1) -> str:
     """Centroid-table provenance, kept pure so the file contract is gated."""
     rank_note = ("" if prune_rank is None else
                  f"; achieved numerical rank={int(prune_rank)}")
@@ -102,6 +102,9 @@ def format_centroid_header(*, feature_fit: str, source_wfn: str,
         f"occupied-band boundary: {int(occupied_boundary)}\n"
         f"FFT grid: {tuple(fft_grid)}; k grid: {tuple(kgrid)}; "
         f"shift: {tuple(shift)}\n"
+        f"centroid k sampling: stride={int(k_stride)} on each axis; "
+        f"selection grid={tuple(int(n)//int(k_stride) for n in kgrid)}; "
+        "retained quadrature weights renormalized; downstream WFN grid unchanged\n"
         f"selection: weighted k-means; seed={int(seed)}; "
         f"rho_power={float(rho_power):g}; requested={int(requested)}; "
         f"candidates={int(candidates)}; written={int(written)}\n"

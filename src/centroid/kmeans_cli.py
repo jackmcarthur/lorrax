@@ -25,6 +25,12 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("N_c", type=int, nargs="?", default=400,
                    help="Number of centroids (default 400).")
     p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--k-stride", type=int, default=1,
+                   help="Use every S-th full-grid k point along each axis for "
+                        "both feature weights and Gram pruning (default 1). "
+                        "S must divide all three grid dimensions; 2 uses "
+                        "one eighth of the k points. Downstream GW stays on "
+                        "the original WFN grid.")
     p.add_argument("--plot", action="store_true",
                    help="Emit a 3D matplotlib plot of centroids over ρ "
                         "(default off — most prod runs don't want a popup).")
@@ -366,6 +372,7 @@ def _resolve_weight(args, wfn, sym, R, tau, dist_mesh=None):
     metric_diagonal = build_feature_metric_diagonal(
         wfn, sym, left_range, right_range, gamma_mode=mode,
         dist_mesh=dist_mesh,
+        k_stride=args.k_stride,
         verbose=(debug_print_enabled() and process_rank() == 0),
     )
     if R is not None:
@@ -447,7 +454,7 @@ def _prune(args, wfn, sym, mesh, cand_idx, orbit_id, n_unique, N_c):
         bispinor=(args.density_mode == "current"),
         gamma_mode=("transverse" if args.density_mode == "current"
                     else "charge"),
-        k_weights=full_k_quadrature_weights(wfn, sym),
+        k_weights=full_k_quadrature_weights(wfn, sym, k_stride=args.k_stride),
         verbose=(debug_print_enabled() and process_rank() == 0),
         progress_print_fn=rank0_print,
     )
@@ -650,7 +657,7 @@ def main():
         pruning=prune_state, prune_rank=prune_rank,
         prune_left=prune_left, prune_right=prune_right,
         prune_label=prune_label, orbit_aware=orbit_aware, n_sym=n_sym,
-        density_mode=args.density_mode)
+        density_mode=args.density_mode, k_stride=args.k_stride)
     # ONE writer.  Every rank used to reach this savetxt on the same shared
     # path.  It survived P=16 only because all ranks write identical bytes —
     # which is precisely the latent form of the bug that DID bite at P=64 in
