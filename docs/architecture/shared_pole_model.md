@@ -211,7 +211,9 @@ CT/TC actions. The Gram cut, the pole budget, the round extent and the CT
 joint span act only on these panels. So the producer selects while
 $W_q(z_a)$, $\partial_sW_q$ and $W_m$ are in hand (`LineSelection`, whole
 parents per rank when their blocks and the $n\times n$ eigensystem fit, else the
-face) and the bank stores the panels (§7). The constructor reads them
+face) and the bank stores the panels (§7). On the local route a chunk of line
+samples selects together: one batched eigh over every local parent at every
+sample of the chunk. The constructor reads them
 (`line_panel_states`) and selects the supports on the imaginary axis from their
 dense samples per round. On the local route both sides run the same one-parent
 eigensolve of $W^\dagger W$ on the same equations, so $Q$ and every count are the ones
@@ -473,4 +475,10 @@ $n\times n$ normal matrix $W^\dagger W$ with its eigenvectors, $n$ the largest
 family's rows (`line_selection_price`). On the local route that is
 $16\cdot 2\lceil N_q/P\rceil (d^2 + n^2)$ B per rank, the rank's parents in one
 batched eigh; on the face route $16\,(2N_q d^2 + 2N_q n^2)/P$, every parent
-of the stack at once. The eigh service's workspace comes on top.
+of the stack at once. The eigh service's workspace comes on top. Each further
+line sample of a local chunk adds the same selection bytes and one more $n^2$
+per parent for the flattened stack, and every sample's $W$ and $\partial_sW$
+faces ($16\cdot 2N_q d^2/P$) are reserved from its solve until the chunk
+selects. The chunk is the most samples that fit beside the chosen group's
+carry (`line_selection_chunk`), chosen once per map; the face route keeps one
+sample per call.

@@ -71,48 +71,87 @@ def selection_face_count(recipe, *, n, logical_n, states, rows, dense_fields, mo
     return int(dense_fields) * dense + int(moment_fields) + math.ceil(panel / int(n) ** 2)
 
 
-def line_selection_price(rows, *, mesh, nq, execution):
-    """Per-rank bytes of the producer's selection at one line sample: (resident, workspace).
+def line_selection_price(rows, *, mesh, nq, execution, samples=1):
+    """Per-rank bytes of the producer's selection over ``samples`` line samples: (resident, workspace, faces).
 
-    Live beside the caller's reservations: the selection copies of every
-    endpoint block of W and of dW/ds (16 * 2 * sum_fg n_f n_g per parent;
-    whole parents per rank, ceil(nq/P) of them, on the local route; tiles on
-    the face) and the largest family's n x n normal matrix W^H W with its
-    eigenvectors for every parent of the stack (the local route solves its
-    ceil(nq/P) parents in one batched eigh), plus the service's eigh
-    workspace. The panels are narrow and ride in the same bound.
+    ``resident`` is live beside the caller's reservations: the selection
+    copies of every endpoint block of W and of dW/ds (16 * 2 * sum_fg n_f n_g
+    per parent; whole parents per rank, ceil(nq/P) of them, on the local
+    route; tiles on the face) and the largest family's n x n normal matrix
+    W^H W with its eigenvectors, for every parent of every sample; each
+    sample past the first adds its row of the flattened W stack the eigh
+    reads. The local route solves every parent of every sample in one batched
+    eigh, so its ``workspace`` is that of the whole stack. ``faces`` is one
+    sample's W(z) and dW/ds, held from its solve until the chunk selects.
+    The panels are narrow and ride in the same bound.
     """
     import math
     import distrib_la
     from gw.shared_pole_capacity import constructor_eigenplan
-    ranks = int(mesh.size)
+    ranks, samples = int(mesh.size), int(samples)
     blocks = sum(int(a) * int(b) for a in rows for b in rows)
     largest = max(int(r) for r in rows)
     plan = constructor_eigenplan(mesh, largest, execution)
+    faces = math.ceil(16 * 2 * int(nq) * blocks / ranks)
     if execution == 'local':
-        resident = 16 * 2 * math.ceil(int(nq) / ranks) * (blocks + largest ** 2)
-        workspace = distrib_la.workspace_bytes_per_rank(plan, "eigh", ((int(nq), largest, largest),), np.complex128)
+        local = math.ceil(int(nq) / ranks)
+        one = 16 * 2 * local * (blocks + largest ** 2)
+        flat = 16 * local * largest ** 2
+        workspace = distrib_la.workspace_bytes_per_rank(
+            plan, "eigh", ((int(nq) * samples, largest, largest),), np.complex128)
     else:
         # The whole-mesh kernel forms G = W^H W and its vectors for every
         # parent of the stack at once: 2 nq largest^2 tiles.
-        resident = math.ceil(16 * (2 * int(nq) * blocks + 2 * int(nq) * largest ** 2) / ranks)
+        one = math.ceil(16 * (2 * int(nq) * blocks + 2 * int(nq) * largest ** 2) / ranks)
+        flat = math.ceil(16 * int(nq) * largest ** 2 / ranks)
         workspace = distrib_la.workspace_bytes_per_rank(plan, "eigh", ((1, largest, largest),), np.complex128)
-    return int(resident), int(workspace)
+    return int(samples * one + (samples - 1) * flat), int(workspace), int(faces)
 
 
 def line_selection_execution(rows, *, mesh, ledger, nq, carry=0):
     """'local' when the producer's line selection fits with whole parents per rank, else 'face'.
 
     ``carry`` is the resident group carry the selection runs beside. Returns
-    ``(execution, resident, workspace)``, the prices of the chosen route.
+    ``(execution, resident, workspace)``, the prices of the chosen route at
+    one sample.
     """
     for execution in ('local', 'face'):
-        resident, workspace = line_selection_price(rows, mesh=mesh, nq=nq, execution=execution)
+        resident, workspace, _ = line_selection_price(rows, mesh=mesh, nq=nq, execution=execution)
         row = ledger.preview(resident_bytes_per_rank=resident + int(carry), workspace_bytes_per_rank=workspace,
                              concurrent_with=ledger.live_stages)
         if row['device_budget_status'] == 'PASS':
             return execution, resident, workspace
     return 'face', resident, workspace
+
+
+def line_selection_chunk(rows, *, mesh, ledger, nq, execution, samples, carry, room):
+    """Line samples per batched selection: the most, up to ``samples``, whose price fits.
+
+    Chosen once per map beside the sample group's ``carry`` (already in
+    hand, not yet reserved) with the same ledger and device ``room`` test as
+    the group size (``response_group_size``): every sample's held faces, the
+    selection and its eigh workspace. At least one, which is the price
+    ``line_selection_execution`` admitted. The face route keeps one sample
+    per call (its eigh is the whole-mesh plan's, not a rank-local stack).
+    Returns ``(chunk, resident, workspace, faces)``, the prices at that chunk.
+    """
+    if execution != 'local':
+        samples = 1
+
+    def price(c):
+        return line_selection_price(rows, mesh=mesh, nq=nq, execution=execution, samples=c)
+
+    def fits(c):
+        resident, workspace, faces = price(c)
+        held = int(carry) + c * faces + resident
+        row = ledger.preview(resident_bytes_per_rank=held, workspace_bytes_per_rank=workspace,
+                             concurrent_with=ledger.live_stages)
+        return row['device_budget_status'] == 'PASS' and held + workspace <= room
+
+    chunk = 1
+    while chunk < int(samples) and fits(chunk + 1):
+        chunk += 1
+    return (chunk,) + price(chunk)
 
 
 def constructor_execution(meta, resolution, recipe, *, mesh, ledger, upstream,

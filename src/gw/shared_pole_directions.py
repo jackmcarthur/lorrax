@@ -131,6 +131,7 @@ def _round_kernels(mesh, layout="batch"):
         take=take, column=column, columns=columns, negative_hermitian=negative_hermitian,
         minus_q_partner=minus_q_partner, act=act, apply=apply,
         stack=program(lambda *a:jnp.stack(a,axis=1),batch,batch),
+        concat=program(lambda *a:jnp.concatenate(a,axis=1),batch,batch),
         dedupe=program(dedupe, (batch, batch), (batch, batch)))
 
 
@@ -204,7 +205,9 @@ def _select(k, W, entries, kind, index, recipe, *, real, eigh_plan, column_exten
     """
     spectral_rows = None if is_face_stack(W) else real
     tol = recipe["multiplet_relative_tolerance"]
-    stack = k.take(tuple(index[sid] for sid, _ in entries))(W)
+    indices = tuple(index[sid] for sid, _ in entries)
+    # A stack that already is the entries in order selects as it stands (no copy).
+    stack = W if indices == tuple(range(int(W.shape[1]))) else k.take(indices)(W)
     if kind == "line":
         return distrib_la.right_singular_vectors(
             stack, recipe["direction_cutoff"], eigh_plan=eigh_plan, column_extent=column_extent,
@@ -289,38 +292,49 @@ def _roles(entries, counts, ranks, column_extent, **extra):
     return rows
 
 
-def line_sample_states(W, dW, recipe, *, sid, ordered, real, mesh_xy, eigh_plan,
+def line_sample_states(W, dW, recipe, *, sids, ordered, real, mesh_xy, eigh_plan,
                        column_extent, logical_n):
-    """Directions and the states at z (and conj z) of one fitted line sample, Re z != 0.
+    """Directions and the states at z (and conj z) of fitted line samples, Re z != 0.
 
     The producer's half of the constructor's selection (``select_round_states``):
-    ``W``/``dW`` hold this one sample's value and s-derivative for a stack of
-    parents, ``[B,1,n,n]`` in batch layout (rows ``>= real`` synthetic) or
-    ``[B,1,n_X,n_Y]`` on the face. The directions are the right singular vectors
-    of W above the cutoff, at most the line cap, whole multiplets, each parent's
-    count read from its own spectrum; the states and actions follow
-    ``_sample_states``. Returns ``dict(states, flags, counts)`` with counts
-    int [B]; ordered mirrors follow from ``line_sample_mirrors`` once the minus-q
-    partner exists.
+    ``W``/``dW`` hold the value and s-derivative of the line samples ``sids``
+    for a stack of parents, ``[B,S,n,n]`` in batch layout (rows ``>= real``
+    synthetic) or ``[B,S,n_X,n_Y]`` on the face. The directions of every
+    parent at every sample come from ONE batched service call (the n x n
+    eigh of W^H W over the [parent x sample] stack): the right singular
+    vectors of W above the cutoff, at most the line cap, whole multiplets,
+    each (parent, sample) count read from its own spectrum; the states and
+    actions follow ``_sample_states``. Returns one ``dict(states, flags,
+    counts)`` per sample, counts int [B]; ordered mirrors follow from
+    ``line_sample_mirrors`` once the minus-q partner exists.
     """
     k = _round_kernels(eigh_plan.mesh, "face" if is_face_stack(W) else "batch")
-    entries = [(s, label) for s, label in _role_entries(recipe) if s == sid]
-    if not entries or any(not label.startswith("line:") for _, label in entries):
-        raise ValueError(f"GATE shared_pole_line_panel: sample {sid} is not a fitted line support")
-    z = _sample_point(recipe, sid)
-    if z.real == 0:
-        raise ValueError(f"GATE shared_pole_line_panel: sample {sid} lies on the imaginary axis; it stays dense")
+    sids = tuple(int(s) for s in sids)
+    if int(W.shape[1]) != len(sids):
+        raise ValueError(f"GATE shared_pole_line_panel: stack holds {int(W.shape[1])} samples for {len(sids)} ids")
+    roles = _role_entries(recipe)
+    entries = []
+    for sid in sids:
+        own = [(s, label) for s, label in roles if s == sid]
+        if not own or any(not label.startswith("line:") for _, label in own):
+            raise ValueError(f"GATE shared_pole_line_panel: sample {sid} is not a fitted line support")
+        if _sample_point(recipe, sid).real == 0:
+            raise ValueError(f"GATE shared_pole_line_panel: sample {sid} lies on the imaginary axis; it stays dense")
+        entries.append(own[0])
     put = replicated(mesh_xy)
-    q_all, values = _select(k, W, entries[:1], "line", {sid: 0}, recipe, real=real, eigh_plan=eigh_plan,
-                            column_extent=column_extent, logical_n=logical_n)
-    direction = k.column(q_all, put(np.int32(0)))
-    widths = tuple(int(row[0].size) for row in values)
-    if any(w < 1 or w > logical_n for w in widths[:real]):
-        raise ValueError(f"GATE shared_pole_directions: got: ranks {widths[:real]}; want: 1..{logical_n}; why: empty or padded physical direction set")
-    states, flags, counts = _sample_states(k, W, dW, put(np.int32(0)), z, "line", direction, widths, recipe,
-                                           ordered=ordered, real=real, eigh_plan=eigh_plan,
-                                           column_extent=column_extent, put=put)
-    return dict(states=states, flags=flags, counts=np.asarray(widths, np.int64))
+    q_all, values = _select(k, W, entries, "line", {sid: j for j, sid in enumerate(sids)}, recipe,
+                            real=real, eigh_plan=eigh_plan, column_extent=column_extent, logical_n=logical_n)
+    lines = []
+    for j, sid in enumerate(sids):
+        direction = k.column(q_all, put(np.int32(j)))
+        widths = tuple(int(row[j].size) for row in values)
+        if any(w < 1 or w > logical_n for w in widths[:real]):
+            raise ValueError(f"GATE shared_pole_directions: got: ranks {widths[:real]}; want: 1..{logical_n}; why: empty or padded physical direction set")
+        states, flags, _ = _sample_states(k, W, dW, put(np.int32(j)), _sample_point(recipe, sid), "line",
+                                          direction, widths, recipe, ordered=ordered, real=real,
+                                          eigh_plan=eigh_plan, column_extent=column_extent, put=put)
+        lines.append(dict(states=states, flags=flags, counts=np.asarray(widths, np.int64)))
+    return lines
 
 
 def line_sample_mirrors(line, partner, recipe, *, sid, mesh_xy):
@@ -359,7 +373,8 @@ class LineSelection:
     A line support's directions and every action the pencil reads from it
     depend on that one sample (``line_sample_states``), so the producer
     selects them while W(z), dW/ds and the minus-q partner are in hand and the
-    bank stores only the panels. ``families`` lists each endpoint family as
+    bank stores only the panels; it hands over a chunk of line samples at
+    once, so one batched eigh serves every parent at every sample of the chunk. ``families`` lists each endpoint family as
     ``dict(name, index, recipe, logical_n, rows, cross)``; ``block(value, (f, g))``
     returns the (f, g) endpoint block of a face-tiled operator [nq, d, d] as a
     selection stack [B, 1, n_f, n_g], in the order and with the padding the
@@ -375,6 +390,7 @@ class LineSelection:
         self.ordered, self.execution, self.nq = bool(ordered), execution, int(nq)
         self.extent = port_extent(mesh_xy)
         self.to_face = selection_layout(mesh_xy, execution, self.nq)[2]
+        self.kernels = _round_kernels(mesh_xy, "face" if execution == "face" else "batch")
         self.plans = {f["name"]: constructor_eigenplan(mesh_xy, f["rows"], execution)
                       for f in families}
 
@@ -403,27 +419,44 @@ class LineSelection:
             out.extend(program(panels, state[1], jnp.asarray(state[0]), sample))
         return out
 
-    def select(self, sid, value, slope):
-        """Directions and the states at z and conj z of every family, from W(z) and dW/ds."""
-        lines = {}
-        for family in self.families:
-            eig = self.plans[family["name"]]
+    def select(self, sids, values, slopes):
+        """Directions and the states at z and conj z of every family at the line samples ``sids``.
+
+        ``values``/``slopes`` list W(z) and dW/ds of each sample. Each family's
+        diagonal blocks of every sample stack as [B,S,n,n] and select in one
+        batched call (``line_sample_states``). Without cross actions the lists
+        are emptied as soon as the last family's blocks are cut, so the face
+        operators do not outlive their copies. Returns one ``lines`` dict per sample.
+        """
+        sids = tuple(int(s) for s in sids)
+        cross = any(family["cross"] for family in self.families)
+        stack = (lambda blocks: blocks[0] if len(blocks) == 1 else self.kernels.concat(*blocks))
+        selected = {}
+        for i, family in enumerate(self.families):
             f = family["index"]
-            W, dW = self.block(value, (f, f)), self.block(slope, (f, f))
-            lines[family["name"]] = line_sample_states(
-                W, dW, family["recipe"], sid=sid, ordered=self.ordered,
-                real=self.nq, mesh_xy=self.mesh, eigh_plan=eig,
+            release = not cross and i == len(self.families) - 1
+            W = stack([self.block(value, (f, f)) for value in values])
+            if release:
+                values.clear()
+            dW = stack([self.block(slope, (f, f)) for slope in slopes])
+            if release:
+                slopes.clear()
+            selected[family["name"]] = line_sample_states(
+                W, dW, family["recipe"], sids=sids, ordered=self.ordered,
+                real=self.nq, mesh_xy=self.mesh, eigh_plan=self.plans[family["name"]],
                 column_extent=self.extent, logical_n=family["logical_n"])
             del W, dW
+        lines = [{name: rows[j] for name, rows in selected.items()} for j in range(len(sids))]
         # The cross actions follow every diagonal selection, so the shared
-        # rectangles are live only while they act.
-        if any(family["cross"] for family in self.families):
-            rectangles = self._rectangles(value, slope)
-            for family in self.families:
-                if family["cross"]:
-                    line = lines[family["name"]]
-                    line["cross"] = self._cross(family, rectangles, line["states"], mirror=False)
-            del rectangles
+        # rectangles of one sample are live only while they act.
+        if cross:
+            for line, value, slope in zip(lines, values, slopes):
+                rectangles = self._rectangles(value, slope)
+                for family in self.families:
+                    if family["cross"]:
+                        entry = line[family["name"]]
+                        entry["cross"] = self._cross(family, rectangles, entry["states"], mirror=False)
+                del rectangles
         return lines
 
     def mirror(self, sid, lines, value, slope):

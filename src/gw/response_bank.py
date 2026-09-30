@@ -1420,7 +1420,7 @@ def produce_sample_bank(wfns, meta, config, *, mesh_xy, sym, sample_plan, bank_i
         ambient = ledger.live_stages
     from file_io.shared_pole_store import (dense_sample_rows, read_shared_pole_bank,
                                            shared_pole_bank_writer)
-    from .shared_pole_execution import line_selection_execution
+    from .shared_pole_execution import line_selection_chunk, line_selection_execution
     response_rows = panel_rows(0, len(qids))
     row_index = {q: i for i, q in enumerate(response_rows)}
     face_bytes = 16*n*n//mesh_xy.size
@@ -1491,6 +1491,14 @@ def produce_sample_bank(wfns, meta, config, *, mesh_xy, sym, sample_plan, bank_i
             compiled=check.compiled_bytes, price=check.price, live=live, room=room,
             recompiled=check.recompiled, seconds=check.seconds)
         del whole, check
+        if selection is not None:
+            # Line samples per batched selection, beside the chosen group's carry.
+            line_chunk, selection_resident, selection_workspace, line_faces = line_selection_chunk(
+                rows, mesh=mesh_xy, ledger=ledger, nq=len(qids), execution=execution,
+                samples=p1-p0, carry=group_size*carry_per_sample, room=room)
+            receipt["line_selection"].update(chunk=line_chunk, resident_bytes_per_rank=selection_resident,
+                                              workspace_bytes_per_rank=selection_workspace,
+                                              faces_bytes_per_rank=line_faces)
         rules = response_quadrature(meta, sample_plan, receipt, support,
                                     group_size=group_size, print_fn=print_fn)
     # The group accumulator is all-P sharded. Dense work and slab I/O batch
@@ -1563,6 +1571,49 @@ def produce_sample_bank(wfns, meta, config, *, mesh_xy, sym, sample_plan, bank_i
                         _tr_odd_census(receipt,solve_value,h[part],chi_value[part],value[part],z[sample:sample+1],int(qids[iq]))
         return value, slope
 
+    def select_lines(raw_group, chunk, bank_handle, write, members):
+        """Select, mirror and store the line samples ``chunk`` [(group row, sample)] in one batched selection.
+
+        Their directions come from W(z) itself; the minus-q partner acts on
+        the same directions; only the panels reach the bank.
+        """
+        live = ledger.live_stages
+        started_selection = time.monotonic()
+        values, slopes = [], []
+        for row, sample in chunk:
+            value, slope = solve(raw_group[2*row:2*row+2], 0, 0, len(qids), bank_handle, sample)
+            values.append(value)
+            slopes.append(slope)
+            del value, slope
+            # Held until the chunk selects: live beside the next solve's admission.
+            held, _ = _reserve(meta, "line_faces", line_faces)
+            ledger.live_stages = ledger.live_stages + (held,)
+        stage, _ = _reserve(meta, "line_selection", selection_resident, selection_workspace)
+        ledger.live_stages = ledger.live_stages + (stage,)
+        with timing.section('bank.line_select'):
+            lines = selection.select([sample for _, sample in chunk], values, slopes)
+        del values, slopes
+        for i, (row, sample) in enumerate(chunk):
+            if ordered:
+                value, slope = solve(raw_group[2*row:2*row+2], 1, 0, len(qids), bank_handle, sample)
+                with timing.section('bank.line_mirror'):
+                    selection.mirror(sample, lines[i], value, slope)
+                del value, slope
+            with timing.section('bank.line_panels'):
+                panels = selection.panels(sample, lines[i])
+            lines[i] = None
+            receipt["seconds"]["line_selection"] = (receipt["seconds"].get("line_selection", 0.)
+                                                     + time.monotonic() - started_selection)
+            io_started = time.monotonic()
+            with timing.section('bank.line_write'):
+                write(q_span=(0, len(qids)), line=panels)
+            receipt["seconds"]["io"] = receipt["seconds"].get("io",0.)+time.monotonic()-io_started
+            del panels
+            receipt["batches"].append(dict(sample=sample, group=members))
+            progress.step()
+            started_selection = time.monotonic()
+        ledger.live_stages = live
+
     for group in rules["plan"]["groups"]:
         members = [int(m) for m in group["members"]]
         if all(committed(m) for m in members):
@@ -1580,63 +1631,44 @@ def produce_sample_bank(wfns, meta, config, *, mesh_xy, sym, sample_plan, bank_i
         with shared_pole_bank_writer(bank_io["path"], meta=meta,
                 expected_identity=bank_io["identity"], mesh_xy=mesh_xy) as (bank_handle, header, write):
             receipt["seconds"]["io"] = receipt["seconds"].get("io",0.)+time.monotonic()-io_started
+            pending = []
             for row, sample in enumerate(members):
                 if committed(sample):
                     progress.step()
                     continue
-                raw = raw_group[2*row:2*row+2]
                 if p0 <= sample < p1:
-                    # Select from W(z) itself, then act with the minus-q partner on
-                    # the same directions; only the panels reach the bank.
                     if np.asarray(header["line_written"], bool)[:, sample-p0].any():
                         raise ValueError(f"GATE response_line_panel: sample {sample} is partly committed; "
                                          "a line sample commits every parent at once; fix: rebuild the bank")
-                    stage, _ = _reserve(meta, "line_selection", selection_resident, selection_workspace)
-                    live = ledger.live_stages
-                    ledger.live_stages = live + (stage,)
-                    started_selection = time.monotonic()
-                    value, slope = solve(raw, 0, 0, len(qids), bank_handle, sample)
-                    with timing.section('bank.line_select'):
-                        lines = selection.select(sample, value, slope)
-                    del value, slope
-                    if ordered:
-                        value, slope = solve(raw, 1, 0, len(qids), bank_handle, sample)
-                        with timing.section('bank.line_mirror'):
-                            selection.mirror(sample, lines, value, slope)
-                        del value, slope
-                    with timing.section('bank.line_panels'):
-                        panels = selection.panels(sample, lines)
-                    del lines
-                    receipt["seconds"]["line_selection"] = (receipt["seconds"].get("line_selection", 0.)
-                                                             + time.monotonic() - started_selection)
+                    pending.append((row, sample))
+                    if len(pending) == line_chunk:
+                        select_lines(raw_group, pending, bank_handle, write, members)
+                        pending = []
+                    continue
+                raw = raw_group[2*row:2*row+2]
+                dense_row = dense_sample_rows(header, (sample,))[0]
+                marked = np.asarray(header["sample_written"], bool)[:, dense_row]
+                # A fresh frequency is one q_irr slab. Partial restarts keep
+                # contiguous rows with identical value/slope masks together.
+                edges = np.r_[0, 1+np.flatnonzero(np.any(marked[1:] != marked[:-1], axis=1)), len(qids)]
+                for q0, q1 in zip(edges[:-1], edges[1:]):
+                    need_value, need_slope = ~marked[q0]
+                    if not (need_value or need_slope):
+                        continue
+                    span = (int(q0), int(q1))
+                    value, slope = solve(raw, 0, q0, q1, bank_handle, sample, need_value=need_value)
                     io_started = time.monotonic()
-                    with timing.section('bank.line_write'):
-                        write(q_span=(0, len(qids)), line=panels)
+                    if need_slope:
+                        write(q_span=span, sample_span=(sample,sample+1), dWc_ds=slope[:,None])
+                    if need_value:
+                        write(q_span=span, sample_span=(sample,sample+1), Wc=value[:,None])
                     receipt["seconds"]["io"] = receipt["seconds"].get("io",0.)+time.monotonic()-io_started
-                    ledger.live_stages = live
-                    del panels
-                else:
-                    dense_row = dense_sample_rows(header, (sample,))[0]
-                    marked = np.asarray(header["sample_written"], bool)[:, dense_row]
-                    # A fresh frequency is one q_irr slab. Partial restarts keep
-                    # contiguous rows with identical value/slope masks together.
-                    edges = np.r_[0, 1+np.flatnonzero(np.any(marked[1:] != marked[:-1], axis=1)), len(qids)]
-                    for q0, q1 in zip(edges[:-1], edges[1:]):
-                        need_value, need_slope = ~marked[q0]
-                        if not (need_value or need_slope):
-                            continue
-                        span = (int(q0), int(q1))
-                        value, slope = solve(raw, 0, q0, q1, bank_handle, sample, need_value=need_value)
-                        io_started = time.monotonic()
-                        if need_slope:
-                            write(q_span=span, sample_span=(sample,sample+1), dWc_ds=slope[:,None])
-                        if need_value:
-                            write(q_span=span, sample_span=(sample,sample+1), Wc=value[:,None])
-                        receipt["seconds"]["io"] = receipt["seconds"].get("io",0.)+time.monotonic()-io_started
-                        del value, slope
+                    del value, slope
                 receipt["batches"].append(dict(sample=sample, group=members))
                 del raw
                 progress.step()
+            if pending:
+                select_lines(raw_group, pending, bank_handle, write, members)
             io_started = time.monotonic()
         receipt["seconds"]["io"] += time.monotonic()-io_started
         del raw_group
