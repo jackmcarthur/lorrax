@@ -162,20 +162,24 @@ wins.  Then
     Ŝ_i = S(N₃) + (S(N₃) − S(N₁)) · G_i(N₃, N_T) / G_i(N₁, N₃).
 
 The pooled set is the states within ±10 eV of E_F (closed over multiplets,
-:func:`pooled_state_mask`) that lie below every band above N₁,
-``E_i < min_k E[N₁+1, k]``, so every one of them is in the model's domain at
-every grid point.  Every state of the QP window in the domain gets its tail.  The grid is searched, not optimised: a
+:func:`pooled_state_mask`); with Ω ≥ Ω_lo (below) every requested state is
+in the model's domain at every grid point and gets its tail.  The grid is searched, not optimised: a
 closed-form evaluation per point, no nonlinear solver.  The shell sums are
 evaluated on a composite Gauss compression of each shell's spectrum in
 ``log(E − E_ref)`` (:func:`_log_energy_rule`), exact to ~1e-16 relative, so
 the whole grid costs ~10 ms on Si 4³ (71 pooled states) and the N_T tail
 costs ~100 terms per state however many Weyl bands it spans.
 
-NO DOMAIN, NO TAIL.  A state with ``E_i − Ω ≥ min_k E[N₁+1, k]`` puts a pole
-of the model inside the band sum.  It keeps its computed sum, ``Ŝ = S(N₃)``
-(:data:`SHELL_FAIL_POLE`).  If no requested state can be pooled, every state
-keeps ``S(N₃)`` (:data:`SHELL_FAIL_NO_FIT`).  No other estimator is
-substituted, and the log names every such state.
+EVERY STATE KEEPS A TAIL.  A state with ``E_i − Ω ≥ min_k E[N₁+1, k]`` would
+put a pole of the model inside the band sum, so Ω is bounded below by
+``Ω_lo = max(0, max_i E_i − min_k E[N₁+1, k] + ΔΩ)`` over the requested
+states (ΔΩ the grid step), recomputed from the current energies on every
+call, and the grid starts at Ω_lo.  The law is continuous in the energies:
+there is no per-state switch to ``S(N₃)`` (until 2026-09-30 a state past
+the edge kept ``S(N₃)``, and in SC one state at the edge flipped by
+~190 meV from map to map).  If no requested state lies within the pooled
+±10 eV, every state keeps ``S(N₃)`` (:data:`SHELL_FAIL_NO_FIT`) and the log
+says so.
 
 MEASURED.  BANDEX (``sandbox:runs/Si_scalar/42_bandex_20260927``), Si 4³
 25 Ry scalar, shared-pole W, truth S(536) with the complete basis, 71
@@ -1183,19 +1187,13 @@ WEYL_N0_SCAN: tuple[float, float, float] = (0.0, 200.0, 1.0)
 
 #: Per-state codes.  Index into :data:`SHELL_FAILURE_REASONS`.
 SHELL_OK = 0
-SHELL_FAIL_POLE = 1
 SHELL_FAIL_NO_FIT = 2
 
 SHELL_FAILURE_REASONS = {
     SHELL_OK: "ok",
-    SHELL_FAIL_POLE: (
-        "the state sits at or above the lowest band of the extrapolated "
-        "range (E_i - Omega >= min_k E[N1+1, k]), so the denominator "
-        "(E_A - E_i + Omega) of the model changes sign inside the band sum "
-        "and the model has no tail to give"),
     SHELL_FAIL_NO_FIT: (
-        "no state lies below the lowest band of the extrapolated range, so "
-        "no pooled (beta, Omega) could be fitted"),
+        "no requested state lies in the pooled window, so no Omega could "
+        "be fitted"),
 }
 
 #: Composite Gauss compression of a shell's spectral measure.  Every shell
@@ -1357,8 +1355,9 @@ class BandLadder:
     def floor_ev(self, lo: int) -> float:
         """Lowest energy (eV) of any term in ABSOLUTE bands above ``lo``.
 
-        A state with ``E_i − Ω`` at or above it puts a pole of the
-        denominator model inside the band sum (:data:`SHELL_FAIL_POLE`).
+        A state with ``E_i − Ω`` at or above it would put a pole of the
+        denominator model inside the band sum; Ω is bounded below so that
+        none does (``fit_band_extrapolation_spectral``).
         """
         e, _ = self._terms(lo, self.n_target)
         return float(e.min()) if e.size else float("inf")
@@ -1643,20 +1642,20 @@ class SpectralShellFit:
 
 def _pooled_shell_grid(ladder: BandLadder, a1: int, a2: int, a3: int,
                        e_fit: np.ndarray, y1: np.ndarray, y2: np.ndarray,
-                       y3: np.ndarray):
+                       y3: np.ndarray, omega_lo: float = 0.0):
     """``(β, Ω, rms residual)``: β = :data:`SHELL_BETA`, Ω minimising the middle-point residual.
 
     For every Ω on the grid the amplitude of each pooled state comes from the
     widest shell, ``a_i = (S₃ − S₁)/G_i(N₁, N₃)``, and the model predicts
     ``S₂ = S₁ + a_i·G_i(N₁, N₂)``; the residual is summed over the pooled
-    states.  The first minimum in Ω order wins.
-    Every pooled state satisfies ``E_i < floor``, so ``c = E_ref − E_i + Ω``
-    is ≥ 0 at every Ω ≥ 0 with ``E_ref = max E_i``.
+    states.  The first minimum in Ω order wins.  The grid starts at
+    ``omega_lo`` (every pooled state then has ``E_i − Ω < floor``), so
+    ``c = E_ref − E_i + Ω`` is ≥ 0 with ``E_ref = max E_i − omega_lo``.
     """
-    omegas = np.arange(SHELL_OMEGA_GRID_EV[0],
-                       SHELL_OMEGA_GRID_EV[1] + 0.5 * SHELL_OMEGA_GRID_EV[2],
-                       SHELL_OMEGA_GRID_EV[2])
-    e_ref = float(e_fit.max())
+    first, last, step = SHELL_OMEGA_GRID_EV
+    start = max(float(first), float(omega_lo))
+    omegas = start + np.arange(0.0, max(last - start, 0.0) + 0.5 * step, step)
+    e_ref = float(e_fit.max()) - (start - float(first))
     de2, w2 = ladder.shell_rule(a1, a2, e_ref)
     de3, w3 = ladder.shell_rule(a2, a3, e_ref)
     de = np.concatenate([de2, de3])
@@ -1748,31 +1747,31 @@ def fit_band_extrapolation_spectral(
             np.broadcast_to(np.asarray(fit_mask, dtype=bool),
                             shape).reshape(-1))
     floor = ladder.floor_ev(a1)
-    # The pooled set: requested states below every band of the shells at
-    # Ω = 0, so each one is in the model's domain at every grid point.
-    fit = pool & (e < floor)
+    # Ω's lower bound: every requested state in the model's domain
+    # (E_i − Ω < floor) by one grid step, from the current energies.  No
+    # state is ever switched to S(N3); the law is continuous in E_i.
+    omega_lo = max(0.0, float(np.max(e)) - floor + SHELL_OMEGA_GRID_EV[2])
+    fit = pool
     if fit.any():
         beta, omega, rms = _pooled_shell_grid(
-            ladder, a1, a2, a3, e[fit], y1[fit], y2[fit], y3[fit])
+            ladder, a1, a2, a3, e[fit], y1[fit], y2[fit], y3[fit],
+            omega_lo=omega_lo)
     else:
         beta = omega = rms = float("nan")
 
     r = np.zeros(e.size)
     code = np.full(e.size, SHELL_FAIL_NO_FIT, dtype=np.int64)
     if np.isfinite(beta):
-        ok = (e - omega) < floor
-        code = np.where(ok, SHELL_OK, SHELL_FAIL_POLE)
-        if ok.any():
-            e_ok = e[ok]
-            e_ref = float(np.max(e_ok - omega))
-            c = e_ref - e_ok + omega
-            sums = []
-            for lo, hi in ((a1, a3), (a3, ladder.n_target)):
-                de, w = ladder.shell_rule(lo, hi, e_ref)
-                x = (de[None, :] + c[:, None]) / ladder.estar_ev
-                sums.append(np.exp(np.log(w)[None, :]
-                                   - beta * np.log(x)).sum(axis=1))
-            r[ok] = sums[1] / sums[0]
+        code[:] = SHELL_OK
+        e_ref = float(np.max(e - omega))
+        c = e_ref - e + omega
+        sums = []
+        for lo, hi in ((a1, a3), (a3, ladder.n_target)):
+            de, w = ladder.shell_rule(lo, hi, e_ref)
+            x = (de[None, :] + c[:, None]) / ladder.estar_ev
+            sums.append(np.exp(np.log(w)[None, :]
+                               - beta * np.log(x)).sum(axis=1))
+        r = sums[1] / sums[0]
     r = r.reshape(shape)
     code = code.reshape(shape)
 
@@ -2323,7 +2322,6 @@ __all__ = [
     "BAND_EXTRAPOLATION_ESTIMATOR_DEFAULT",
     "SHELL_FAILURE_REASONS",
     "SHELL_OK",
-    "SHELL_FAIL_POLE",
     "SHELL_FAIL_NO_FIT",
     "SHELL_BETA",
     "SHELL_OMEGA_GRID_EV",

@@ -58,11 +58,14 @@ sum to 1; an off-diagonal element uses (r_i + r_j)/2, so the extrapolated Σ
 stays Hermitian and is diagonalized after extrapolation.
 
 The pooled states are those within ±10 eV of E_F, closed over degenerate
-multiplets, that lie below every band above N₁ (E_i < min_k E_{N₁+1,k}).
-Semicore states in a wide QP window therefore do not set (β, Ω); every
-QP-window state in the model's domain still gets its tail. A state with
-E_i − Ω at or above that band has a pole of the model inside the sum and
-keeps S(N₃); the log names it.
+multiplets. A state with E_i − Ω at or above the lowest band above N₁ would
+put a pole of the model inside the sum, so Ω is bounded below by
+max_i E_i − min_k E_{N₁+1,k} plus one grid step over the requested states,
+recomputed from the current energies on every call, and the grid starts
+there. Every requested state keeps a tail and the law is continuous in the
+energies. Until 2026-09-30 a state past that edge kept S(N₃) instead; in a
+28-band Si QSGW run one state at the edge flipped by about 190 meV from map
+to map.
 
 ## Why pooled
 
