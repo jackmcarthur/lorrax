@@ -38,7 +38,6 @@ __all__ = [
     "inverse_neighbor_table",
     "make_cross_k_overlap",
     "make_distributed_band_matmul",
-    "make_cross_k_link",
     "MIN_STENCIL_POINTS",
     "collapsed_axes",
     "collapsed_axis_center",
@@ -713,8 +712,17 @@ def build_g_wrap_lookup(
     return index, valid
 
 
-def _make_cross_k_overlap_kernel(mesh, finish):
-    """One overlap contraction shared by raw-density and polar-link writers."""
+def make_cross_k_overlap(mesh):
+    """Return the sharded raw overlap used by finite-q density vertices.
+
+    The result is ``rho_nm(k,q)=<u_n,k|u_m,k+q>`` with both band axes
+    distributed as ``P('x','y')``. A rank-1 G lookup returns one band
+    matrix; a rank-3 lookup batches k-by-q and returns
+    ``P(None,None,'x','y')``. Spinor components and G are contraction axes,
+    so scalar, Pauli and four-component wavefunctions use the same path. The
+    batched form shares this contraction rather than introducing a second
+    density-vertex implementation.
+    """
     sphere_x = NamedSharding(mesh, P(None, "x", None, None))
     sphere_y = NamedSharding(mesh, P(None, "y", None, None))
     sphere_kqy = NamedSharding(mesh, P(None, None, "y", None, None))
@@ -756,32 +764,9 @@ def _make_cross_k_overlap_kernel(mesh, finish):
             raise ValueError(
                 "cross-k overlap G lookup must have rank 1 or 3; "
                 f"got rank {g_index.ndim}")
-        return raw if finish is None else finish(raw)
+        return raw
 
     return center_on_x, overlap
-
-
-def make_cross_k_overlap(mesh):
-    """Return the sharded raw overlap used by finite-q density vertices.
-
-    The result is ``rho_nm(k,q)=<u_n,k|u_m,k+q>`` with both band axes
-    distributed as ``P('x','y')``. A rank-1 G lookup returns one band
-    matrix; a rank-3 lookup batches k-by-q and returns
-    ``P(None,None,'x','y')``. Spinor components and G are contraction axes,
-    so scalar, Pauli and four-component wavefunctions use the same path. The
-    batched form shares this contraction rather than introducing a second
-    density-vertex implementation.
-    """
-    return _make_cross_k_overlap_kernel(mesh, None)
-
-
-def make_cross_k_link(mesh, polar_plan):
-    """Build the fixed-shape JITs used by the streamed link sweep.
-
-    ``polar_plan`` is resolved outside the stream. The raw overlap and
-    distributed polar factor remain in one compiled graph.
-    """
-    return _make_cross_k_overlap_kernel(mesh, polar_plan)
 
 
 def make_distributed_band_matmul(mesh, *, n_batch_axes: int):
