@@ -874,7 +874,8 @@ def _write_connection_stage(
                 shape=(3, int(sym.nk_tot), nb_storage, nb_storage),
                 partition_spec=block_spec)
 
-        @jax.jit
+        @partial(jax.jit, in_shardings=(block_sharding, None),
+                 out_shardings=block_sharding)
         def _connection(links, position):
             return fourth_order_connection(
                 links, full_plus, spacing, band_matmul=band_matmul,
