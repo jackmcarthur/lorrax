@@ -82,7 +82,8 @@ def validation_reduction_check(*, production_price=False):
         abstract = jax.ShapeDtypeStruct((3, 8000, 232, 232), jnp.complex128,
                                        sharding=shard)
         exe = _block_scoped_reductions.lower(abstract, abstract,
-            blocks=(18, 68, 92, 138, 184), atol=atol, rtol=rtol).compile()
+            blocks=tuple(range(8, 232, 8))+(232,),
+            atol=atol, rtol=rtol).compile()
         mem = exe.memory_analysis()
         assert mem.temp_size_in_bytes < 256*1024**2, mem
         assert 'all-gather' not in exe.as_text()
