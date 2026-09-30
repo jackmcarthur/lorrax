@@ -27,6 +27,7 @@ parser.add_argument('--out', required=True)
 parser.add_argument('--spinor-wfn', required=True)
 parser.add_argument('--perf-wfn')
 parser.add_argument('--perf-bands', type=int, default=225)
+parser.add_argument('--perf-only', action='store_true')
 args = parser.parse_args()
 
 
@@ -108,6 +109,17 @@ def main():
     out = Path(args.out)
     receipts = []
     with R.mesh:
+        if args.perf_only:
+            if not args.perf_wfn:
+                raise ValueError('--perf-only requires --perf-wfn')
+            wfn = WFNReader(args.perf_wfn,mesh=R.mesh)
+            raw,_ = raw_edges(wfn,args.perf_bands,7)
+            row,_,_ = compare(raw)
+            row.update(kind='production_size_actual_wfn',logical_bands=args.perf_bands)
+            receipts.append(row)
+            rank0_transaction(lambda:(out/'parity.json').write_text(json.dumps(receipts,indent=2)+'\n'))
+            print(json.dumps(receipts),flush=True)
+            return
         # Closed singular clusters, a small retained direction, rejected
         # nonzero directions and exact null padding; compare the invariant
         # polar matrix, never the gauge-dependent eigenvectors.
