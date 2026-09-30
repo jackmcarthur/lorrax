@@ -42,6 +42,10 @@ fermi_reference = mp1_fixed_n
     artifact = next(r for r in rows if r['kind']=='bcc_artifact')
     assert artifact['nk'] == 27 and artifact['authenticated']
     assert artifact['velocity_max_error'] < 5e-12
+    reduction = artifact['validation_reductions']
+    assert reduction['max_absolute_error'] < 2e-15
+    assert reduction['tile_one_exact'] and reduction['ragged_last_panel_detected']
+    assert reduction['failed_controls'] == [False, False, True, True]
     for row in rows:
         assert row['relative_link_error'] < 5e-10
         assert row['max_singular_value_error'] < 5e-12
