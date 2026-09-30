@@ -10,21 +10,23 @@ Laplace/KMS streams (``gw.w_isdf``) are its caller.
 from functools import partial, lru_cache
 
 import jax
+import numpy as np
 import jax.numpy as jnp
 from jax.sharding import PartitionSpec as P
 
 from ffi.common.ffi_loader import probe_target
 
 TARGET = "lorrax_contour_accumulate"
+BLOCK_TARGET = "lorrax_contour_accumulate_block"
 
 
 @lru_cache(maxsize=None)
-def _require():
+def _require(target=TARGET):
     """The loader registers the target from its CUDA table; refuse by name if unusable."""
-    ok, why = probe_target(TARGET, "CUDA")
+    ok, why = probe_target(target, "CUDA")
     if not ok:
         raise RuntimeError(
-            f"GATE ffi-handler: got no usable {TARGET} ({why}); want the CUDA contour "
+            f"GATE ffi-handler: got no usable {target} ({why}); want the CUDA contour "
             "accumulator; fix: use the sealed bundle, or rebuild both legs from this tree "
             "and pin them (LORRAX_FFI_SO, LORRAX_FFI_HOST_SO).")
 
@@ -71,3 +73,24 @@ def contour_accumulator(mesh):
         )(accumulator, contribution, projection)
 
     return accumulate
+
+
+def contour_block_accumulate_local(accumulator, contribution, projection, valid, *, m0, n0):
+    """One device tile: ``A[o, q, m0+m, n0+n] += sum_s projection[s,o] contribution[s,q,m,n]``.
+
+    For code already inside ``shard_map``.  ``accumulator`` ``[output,q,M,N]``
+    (updated in place: donate it), ``contribution`` ``[terms,q,bm,bn]``,
+    ``projection`` ``[terms,output]`` complex128, ``valid`` ``[2]`` int32: the
+    block's rows and columns that are not padding (the rest are not touched).
+    The terms add in order with the full accumulator's rounding, so terms
+    ``(a, b)`` give the bytes of two :func:`contour_accumulator` calls.
+    CUDA complex128 only; no collectives.
+    """
+    _require(BLOCK_TARGET)
+    if any(a.dtype != jnp.complex128 for a in (accumulator, contribution, projection)):
+        raise TypeError("contour block accumulator requires complex128 operands")
+    return jax.ffi.ffi_call(
+        BLOCK_TARGET, jax.ShapeDtypeStruct(accumulator.shape, accumulator.dtype),
+        input_output_aliases={0: 0}, vmap_method="sequential",
+    )(accumulator, contribution, projection, valid.astype(jnp.int32),
+      m0=np.int64(m0), n0=np.int64(n0))

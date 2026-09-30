@@ -144,6 +144,7 @@ _CUDA_TARGET_SYMBOLS = {
     # ffi.contour: A[o] += p[o]·c on the response-bank streams
     # (cpp/response/contour_accumulate*).
     "lorrax_contour_accumulate":    "ContourAccumulateFfi",
+    "lorrax_contour_accumulate_block": "ContourAccumulateBlockFfi",
     "lorrax_phdf5_write":           "PhdfWriteFfi",
     "lorrax_phdf5_write_independent": "PhdfWriteIndependentFfi",
     "lorrax_phdf5_read":            "PhdfReadFfi",

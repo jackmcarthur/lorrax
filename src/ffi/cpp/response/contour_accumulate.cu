@@ -27,6 +27,43 @@ __global__ void contour_accumulate_tiled(const cuDoubleComplex* input,
         }
     }
 }
+// Block form: A[o, q, m0+m, n0+n] += sum_s p[s,o] c[s, q, m, n] for m < mv, n < nv (in place;
+// entries past the valid counts are not touched).  The s terms add in order, each as the tiled
+// kernel's rounding, so two calls (s = 0, then 1) of the full form give the same bytes.
+__global__ void contour_accumulate_block(const cuDoubleComplex* contribution,
+    const cuDoubleComplex* projection, const int* valid, cuDoubleComplex* output,
+    int64_t outputs, int64_t nq, int64_t M, int64_t N, int64_t bm, int64_t bn,
+    int64_t m0, int64_t n0, int64_t terms) {
+    const int64_t block = nq * bm * bn;
+    const int64_t e = int64_t(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (e >= block) return;
+    const int64_t n = e % bn, m = (e / bn) % bm, q = e / (bm * bn);
+    if (m >= valid[0] || n >= valid[1]) return;
+    #pragma unroll
+    for (int j = 0; j < 4; ++j) {
+        const int64_t o = int64_t(blockIdx.y) * 4 + j;
+        if (o >= outputs) break;
+        const int64_t offset = ((o * nq + q) * M + (m0 + m)) * N + (n0 + n);
+        cuDoubleComplex a = output[offset];
+        for (int64_t s = 0; s < terms; ++s) {
+            const cuDoubleComplex c = contribution[s * block + e];
+            const cuDoubleComplex p = projection[s * outputs + o];
+            a = make_cuDoubleComplex(
+                __dadd_rn(a.x, __dsub_rn(__dmul_rn(p.x, c.x), __dmul_rn(p.y, c.y))),
+                __dadd_rn(a.y, __dadd_rn(__dmul_rn(p.x, c.y), __dmul_rn(p.y, c.x))));
+        }
+        output[offset] = a;
+    }
+}
+void launch_block(const void* c, const void* p, const void* valid, void* out, int64_t outputs,
+                  int64_t nq, int64_t M, int64_t N, int64_t bm, int64_t bn, int64_t m0, int64_t n0,
+                  int64_t terms, cudaStream_t stream) {
+    const dim3 grid((nq * bm * bn + 127) / 128, (outputs + 3) / 4);
+    contour_accumulate_block<<<grid, 128, 0, stream>>>(
+        static_cast<const cuDoubleComplex*>(c), static_cast<const cuDoubleComplex*>(p),
+        static_cast<const int*>(valid), static_cast<cuDoubleComplex*>(out),
+        outputs, nq, M, N, bm, bn, m0, n0, terms);
+}
 void launch(const void* a, const void* c, const void* p, void* out,
             int64_t elements, int64_t outputs, cudaStream_t stream) {
     const dim3 grid((elements + 127) / 128, (outputs + 3) / 4);
