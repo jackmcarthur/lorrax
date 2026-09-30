@@ -140,10 +140,9 @@ cd $LORRAX
 $RUN tests.hsuite.chain --out "$SCRATCH/lorrax_quickstart_$(date +%s)"
 ```
 
-It takes about 6 min at one process on cold caches. A four-process run writes
-a small exchange directory, `.hsuite_runs`, inside the source tree. The
-module's tree is read-only, so there launch one process: put
-`-n 1 --gpus-per-node=1` in `RUN`.
+It takes about 6 min at one process on cold caches. The chain writes nothing
+in the source tree, so it also runs from the module's read-only tree: its
+files go to `--out` and to `$SCRATCH/.cache/lorrax/hsuite`.
 
 Each stage is compared with the stored outputs in `tests/hsuite/reference/`.
 The run ends with one line per stage and its wall time, then `hsuite PASS`, or

@@ -3,8 +3,9 @@
 ``$SCRATCH/.cache/lorrax/<name>``, or ``~/.cache/lorrax/<name>`` where the
 site defines no ``SCRATCH``: on scratch, never beside an input, one tree per
 user.  The XLA compile cache (``common.jax_compile_cache``), the mathdx cubin
-cache (``ffi.fft.cubin_cache_dir``) and the WFN time-reversal stamps
-(``symmetry_maps.density_symmetry_check``) each take one subdirectory.  Each
+cache (``ffi.fft.cubin_cache_dir``), the WFN time-reversal stamps
+(``symmetry_maps.density_symmetry_check``) and the ``tests/hsuite`` run tree
+(``tests.hsuite.rank_session``) each take one subdirectory.  Each
 owner keeps its own key rule, format and pruning; this module owns only where
 the tree is.  Stdlib only.
 """
