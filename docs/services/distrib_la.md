@@ -524,9 +524,9 @@ admit.
 ## Performance
 
 For a matrix that fits one device, a distributed library's cost is its fixed
-per-call charge: warm cuSOLVERMp eigh costs a flat ~1.55 s per matrix,
-almost all of it inside `cusolverMpSyevd`, and `block_size` does not move it.
-That is why `auto` eigh resolves to native and route (c) is the default:
+per-call charge, almost all of it inside `cusolverMpSyevd`, and `block_size`
+does not move it. The provenance of the measurements is in the docstring of
+`resolve._announce_eigh_fixed_cost`. That is why `auto` eigh resolves to native and route (c) is the default:
 `distributed` eigh is a capacity route for a matrix that does not fit one
 device, not a speed route.
 
