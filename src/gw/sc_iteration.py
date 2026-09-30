@@ -522,9 +522,9 @@ class SCMapScreeningArtifacts:
     #: This map's shared-pole model handle (``W_by_role["shared_pole"]``);
     #: the accepted final map's is evaluated at omega = 0 for ``W0_qmunu``.
     shared_pole: object | None = None
-    #: ``(v + [DeltaH, W], U, E_QP, nb_logical)`` of this map's
-    #: interband-commutator head, the operands of ``dipole_qsgw.h5``
-    #: (``qsgw_head.write_qsgw_dipole``); ``None`` on every other head.
+    #: ``(qsgw_head.QPVelocity, U, E_QP, nb_logical)`` of this map's head,
+    #: the operands of ``dipole_qsgw.h5`` (``qsgw_head.write_qsgw_dipole``);
+    #: ``None`` on a run with no velocity head.
     qsgw_velocity: tuple | None = None
 
 
@@ -3762,6 +3762,7 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
             InterbandCommutatorHeadData,
             assemble_delta_head_manifold,
             build_iteration_head_response,
+            qp_velocity,
         )
 
         nb_storage = int(pt.velocity_dft_cart.shape[-1])
@@ -3787,8 +3788,6 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
         if isinstance(pt, InterbandCommutatorHeadData):
             head_velocity_dft = _interband_commutator_head_velocity(
                 inputs, state, ks, wfns_qp, U_full, pt, nb_storage)
-            qsgw_velocity = (head_velocity_dft, U_full,
-                             wfns_qp.enk[:, :nb_storage], int(pt.nb_logical))
 
         head_occ_kn = wfns_qp.occ[:, :nb_storage]
         head_efermi_ry = float(efermi_ry)
@@ -3805,11 +3804,29 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
             assert head_efermi_ry == float(entry_occ_state.mu_ry)
             head_surface_weight_kn = entry_surface_weight_kn
 
+        # THE SC VELOCITY: v_DFT + this map's Sigma term, one owner.  The
+        # head below and dipole_qsgw.h5 (written from the accepted map) both
+        # read U^H v U of this object.
+        velocity = qp_velocity(
+            head_velocity_dft, head_occ_kn, mesh=inputs.mesh_xy,
+            nb_logical=int(pt.nb_logical), delta_h_dft=delta_head,
+            forward_links=forward_links,
+            forward_neighbors=pt.forward_neighbors,
+            kgrid=tuple(int(n) for n in inputs.wfn.kgrid),
+            bvec_cart=pt.reciprocal_lattice_cart,
+            collapsed_position=getattr(pt, "collapsed_position", None),
+            nb_links=int(getattr(pt, "nb_links", 0) or pt.nb_logical),
+            link_bound=((float(pt.validation["link_relative_error"]),
+                         HEAD_LINK_RTOL)
+                        if forward_links is not None else None),
+            velocity_base_cart=(pt.velocity_dft_cart
+                                if isinstance(pt, InterbandCommutatorHeadData)
+                                else None),
+            link_unserved=getattr(pt, "link_unserved", None))
+        qsgw_velocity = (velocity, U_full, wfns_qp.enk[:, :nb_storage],
+                         int(pt.nb_logical))
         iteration_head_response = build_iteration_head_response(
-            delta_head,
-            forward_links,
-            pt.forward_neighbors,
-            head_velocity_dft,
+            velocity,
             U_full,
             wfns_qp.enk[:, :nb_storage],
             head_occ_kn,
@@ -3830,16 +3847,7 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
             wfns_qp=(None if direct_only_shared_pole else wfns_qp),
             eta_ry=(0.0 if mpa_mode else None),
             occupation_state=entry_occ_state,
-            collapsed_position=getattr(pt, "collapsed_position", None),
-            nb_links=int(getattr(pt, "nb_links", 0) or pt.nb_logical),
-            link_bound=((float(pt.validation["link_relative_error"]),
-                         HEAD_LINK_RTOL)
-                        if forward_links is not None else None),
             velocity_kinetic_cart=getattr(pt, "velocity_kinetic_cart", None),
-            velocity_base_cart=(pt.velocity_dft_cart
-                                if isinstance(pt, InterbandCommutatorHeadData)
-                                else None),
-            link_unserved=getattr(pt, "link_unserved", None),
         )
         velocity_kind = (
             "QSGW finite-link covariant velocity" if forward_links is not None

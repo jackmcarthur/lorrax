@@ -23,6 +23,7 @@ __all__ = [
     "IterationHeadResponse",
     "IterationHeadSamples",
     "ParallelTransportHeadData",
+    "QPVelocity",
     "StaticGaugeHallTransaction",
     "assemble_delta_head_manifold",
     "assemble_head_manifold",
@@ -46,6 +47,7 @@ __all__ = [
     "load_dft_dipole_head",
     "load_interband_commutator_head",
     "load_parallel_transport_head",
+    "qp_velocity",
     "reduced_covector_to_cartesian",
     "rotate_velocity_active_to_qp",
     "rotate_velocity_to_qp",
@@ -1397,32 +1399,25 @@ def interband_commutator_velocity(
 QSGW_DIPOLE_FILE = "dipole_qsgw.h5"
 
 
-def write_qsgw_dipole(path, velocity_dft_cart, U_active, energies_qp_kn_ry, *,
-                      nb_logical: int, mesh: Mesh, print_fn=print) -> None:
-    r"""Write one SC map's QSGW velocity as a ``dipole.h5`` in its QP basis.
+def write_qsgw_dipole(path, velocity: QPVelocity, U_active, energies_qp_kn_ry,
+                      *, nb_logical: int, mesh: Mesh, print_fn=print) -> None:
+    r"""Write one SC map's velocity as a ``dipole.h5`` in its QP basis.
 
-    ``velocity_dft_cart`` is :func:`interband_commutator_velocity`'s
-    ``v + [DeltaH, W]`` (DFT basis), ``U_active`` the map's rotation to its
-    input QP states and ``energies_qp_kn_ry`` their energies: the same three
-    operands the map's head consumed (:func:`build_iteration_head_response`).
-    The file holds ``U^dagger (v + [DeltaH, W]) U`` with ``band_energies =
-    E_QP`` in ``file_io.dipole``'s layout, so ``load_dipole_h5`` and every
-    absorption consumer read it unchanged; their ``d = v_cv/(E_c - E_v)`` is
-    then the position operator between QP states (``U^dagger r U``).
-
-    Term content (docs/self_consistency.md, 'Interband-commutator head'):
-    the full DFT velocity ``i[H_DFT, r]`` (``p + i[V_NL, r]``) plus the
-    QSGW correction ``i[DeltaH, r]`` with ``r`` replaced by its cross-gap
-    (valence-conduction) interband part, ``W = i r^VC``.  The intraband
-    connection term (the covariant k-derivative of ``DeltaH`` within an
-    occupation class) is omitted; on the valence-conduction block it holds
-    only ``DeltaH_VC``, so the error is first order in the cross-gap mixing.
-    Collapsed axes use the stored position operator exactly. COLLECTIVE.
+    ``velocity`` is the map's :func:`qp_velocity` (the one the head read),
+    ``U_active`` the map's rotation to its input QP states and
+    ``energies_qp_kn_ry`` their energies: the same three operands the map's
+    head consumed (:func:`build_iteration_head_response`).  The file holds
+    ``U^dagger v U`` with ``band_energies = E_QP`` in ``file_io.dipole``'s
+    layout, so ``load_dipole_h5`` and every absorption consumer read it
+    unchanged; their ``d = v_cv/(E_c - E_v)`` is then the position operator
+    between QP states.  ``velocity.label`` names the Sigma term and is
+    stamped as the ``velocity`` attribute (docs/self_consistency.md,
+    'QSGW dipoles').  COLLECTIVE.
     """
     from common.collectives import gather_to_host
     from file_io.dipole import write_dipole
 
-    v_qp = rotate_velocity_active_to_qp(velocity_dft_cart, U_active, mesh=mesh)
+    v_qp = rotate_velocity_active_to_qp(velocity.dft_cart, U_active, mesh=mesh)
     nb = int(nb_logical)
     energies = energies_qp_kn_ry
     energies = np.asarray(gather_to_host(energies) if isinstance(
@@ -1432,14 +1427,13 @@ def write_qsgw_dipole(path, velocity_dft_cart, U_active, energies_qp_kn_ry, *,
     del v_qp
     write_dipole(path, kmajor, energies, mesh=mesh, attrs={
         "nbands": nb, "nk": int(energies.shape[0]), "skip_vnl": 0,
-        "basis": "qp",
-        "note": ("QSGW velocity U^H (v + [DeltaH, W]) U between the SC "
-                 "final map's input QP states (gw.qsgw_head."
-                 "interband_commutator_velocity); band_energies are their "
-                 "QP energies; the intraband connection term is omitted")})
+        "basis": "qp", "velocity": velocity.label,
+        "note": ("QSGW velocity U^H v U between the SC final map's input QP "
+                 "states (gw.qsgw_head.qp_velocity); band_energies are "
+                 "their QP energies")})
     print_fn(f"  QSGW dipoles: {os.path.basename(str(path))} "
              f"({int(energies.shape[0])} k x {nb} bands, QP basis, "
-             "v + [DeltaH, W])")
+             f"{velocity.label})")
 
 
 def _assemble_kernel(mesh: Mesh, nb_storage: int) -> Callable:
@@ -3713,52 +3707,55 @@ def _metal_static_head(wfns, surface, occupation_state, omegas, *, mesh,
     return kappa2, static_Y_x, static_Z_y, static_chi_body_gamma
 
 
-def build_iteration_head_response(
-    delta_h_dft,
-    forward_links,
-    forward_neighbors,
+@dataclass(frozen=True)
+class QPVelocity:
+    r"""One SC map's velocity in the DFT band basis; consumers read U^H v U.
+
+    ``dft_cart`` is ``v_DFT`` plus this map's Sigma term: ``D_k DeltaH``
+    from the links (``parallel_transport``), ``[DeltaH, W]``
+    (``interband_commutator``), or none (``dft_velocity``, or a map whose
+    links cannot serve it).  The head (S, Drude, wings) and
+    ``dipole_qsgw.h5`` both take this array and the map's ``U``, so the SC
+    screening and the BSE dipoles see one velocity.  ``base`` is ``v_DFT``;
+    ``correction`` the Sigma term added (None when absent or zeroed);
+    ``bound`` the link bound; ``zeroed`` why the term is zero on this map;
+    ``label`` the terms in words (the dipole file's ``velocity`` stamp).
+    """
+
+    dft_cart: jax.Array
+    base: jax.Array
+    correction: jax.Array | None
+    bound: tuple | None
+    zeroed: str | None
+    label: str
+
+
+def qp_velocity(
     velocity_dft_cart,
-    U_dft_to_qp,
-    energies_qp_kn_ry,
     occupations_qp_kn,
-    omegas_ry,
     *,
-    surface_weight_qp_kn=None,
     mesh: Mesh,
-    kgrid: tuple[int, int, int],
-    bvec_cart,
     nb_logical: int,
-    sigma_energies_ry,
-    efermi_ry: float,
-    wfn,
-    meta,
-    config,
-    wfns_qp=None,
-    eta_ry: float | None = None,
-    occupation_state=None,
+    delta_h_dft=None,
+    forward_links=None,
+    forward_neighbors=None,
+    kgrid: tuple[int, int, int] | None = None,
+    bvec_cart=None,
     collapsed_position=None,
     nb_links: int | None = None,
     link_bound: tuple[float, float] | None = None,
-    velocity_kinetic_cart=None,
     velocity_base_cart=None,
     link_unserved: str | None = None,
-) -> IterationHeadResponse:
-    """Build current-basis direct head and, when requested, its wings.
+) -> QPVelocity:
+    """The owner of the SC velocity: ``v_DFT`` plus this map's Sigma term.
 
-    ``forward_links=None`` is ``sc_head_update = dft_velocity``: no link
-    manifold is resident, so the covariant ``DΔH`` correction is dropped
-    and the bare DFT p-matrix velocity enters.  ``delta_h_dft`` is then
-    unused and may be None.  Everything downstream of the velocity —
-    the per-iteration rotation into the QP basis, S(z), the Drude term, the
-    ISDF wings, the static κ² — is the SAME code on both routes.
-
-    ``occupation_state`` is the map's solved state (``occupations_qp_kn`` is
-    its ``f_kn``); the static Γ body is ``gw.w_isdf.compute_chi0_matsubara``
-    at ``n = 0`` on it, which refuses any family but Fermi-Dirac.
-
-    ``parallel_transport`` drops the covariant correction on a map whose
-    links cannot serve it (:func:`sigma_term_zeroed`; ``link_unserved`` is
-    the run-long reason when the source carries no links).
+    ``forward_links=None`` with no ``velocity_base_cart`` is
+    ``sc_head_update = dft_velocity``: ``delta_h_dft`` is unused.  With
+    ``velocity_base_cart`` (``interband_commutator``) ``velocity_dft_cart``
+    already holds ``v + [DeltaH, W]``.  ``parallel_transport`` drops the
+    covariant correction on a map whose links cannot serve it
+    (:func:`sigma_term_zeroed`; ``link_unserved`` is the run-long reason
+    when the source carries no links).
     """
     v_dft_basis = jnp.asarray(velocity_dft_cart, dtype=jnp.complex128)
     base, correction, bound = v_dft_basis, None, None
@@ -3795,6 +3792,55 @@ def build_iteration_head_response(
             v_dft_basis = v_dft_basis + correction
         else:
             correction = None
+    if velocity_base_cart is not None:
+        label = ("v_DFT + [DeltaH, W] (interband_commutator; intraband "
+                 "connection omitted)")
+    elif forward_links is not None and zeroed is None:
+        label = "v_DFT + D_k DeltaH (parallel_transport links)"
+    elif zeroed is not None:
+        label = f"v_DFT (D_k DeltaH zeroed: {zeroed})"
+    else:
+        label = "v_DFT (dft_velocity: no Sigma term)"
+    return QPVelocity(dft_cart=v_dft_basis, base=base, correction=correction,
+                      bound=bound, zeroed=zeroed, label=label)
+
+
+def build_iteration_head_response(
+    velocity: QPVelocity,
+    U_dft_to_qp,
+    energies_qp_kn_ry,
+    occupations_qp_kn,
+    omegas_ry,
+    *,
+    surface_weight_qp_kn=None,
+    mesh: Mesh,
+    kgrid: tuple[int, int, int],
+    bvec_cart,
+    nb_logical: int,
+    sigma_energies_ry,
+    efermi_ry: float,
+    wfn,
+    meta,
+    config,
+    wfns_qp=None,
+    eta_ry: float | None = None,
+    occupation_state=None,
+    velocity_kinetic_cart=None,
+) -> IterationHeadResponse:
+    """Build current-basis direct head and, when requested, its wings.
+
+    ``velocity`` is this map's :func:`qp_velocity`.  Everything downstream
+    of it -- the per-iteration rotation into the QP basis, S(z), the Drude
+    term, the ISDF wings, the static kappa^2 -- is the SAME code on every
+    head route.
+
+    ``occupation_state`` is the map's solved state (``occupations_qp_kn`` is
+    its ``f_kn``); the static Gamma body is ``gw.w_isdf.compute_chi0_matsubara``
+    at ``n = 0`` on it, which refuses any family but Fermi-Dirac.
+    """
+    v_dft_basis, base = velocity.dft_cart, velocity.base
+    correction, bound, zeroed = (velocity.correction, velocity.bound,
+                                 velocity.zeroed)
     v_qp = rotate_velocity_active_to_qp(v_dft_basis, U_dft_to_qp, mesh=mesh)
     # The per-map head block: p, V_NL and Sigma shares of this velocity.
     pieces = ([("p", velocity_kinetic_cart),
