@@ -1216,7 +1216,7 @@ def _warn_on_unphysical_h0(
     # dropped it from the CLI and never given it to the live driver.
     from common import sanity
     sanity.warn(
-        f"H0 = {_src} is UNPHYSICAL — "
+        "H0 = kin_ion + V_H[exact, live G-space] is UNPHYSICAL — "
         f"{n_bad} of {implied_vxc_ev.size} (k,n) have an implied Vxc outside "
         f"[{_VXC_IMPLIED_MIN_EV:.0f}, {_VXC_IMPLIED_MAX_EV:.0f}] eV "
         f"(worst: k={int(k_bad)} n={int(n_band_bad)}, "

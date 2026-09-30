@@ -810,6 +810,27 @@ def _build_block_tridiag(alpha_all, beta_all, max_iter: int, bs: int,
     return T if capacity is not None else (T + jnp.conj(T).T) * 0.5
 
 
+def _supported_start_block(n, bs, seed, support):
+    """The random complex ``(n, bs)`` start block and the supported count.
+
+    One spelling of ``support`` (see :func:`block_lanczos_eig_jit`) for
+    both block routes: the Gaussian draw covers the supported entries only,
+    in row-major order, and is scattered into zeros on the rest.
+    """
+    active = (None if support is None
+              else np.flatnonzero(np.asarray(support).reshape(-1)))
+    if active is not None and int(np.size(support)) != int(n):
+        raise ValueError('Lanczos support must have n entries')
+    n_active = int(n) if active is None else int(active.size)
+    key = jax.random.PRNGKey(seed)
+    k1, k2 = jax.random.split(key)
+    Q0 = (jax.random.normal(k1, (n_active, bs), dtype=jnp.float64)
+          + 1j * jax.random.normal(k2, (n_active, bs), dtype=jnp.float64))
+    if active is not None:
+        Q0 = jnp.zeros((int(n), bs), dtype=Q0.dtype).at[active].set(Q0)
+    return Q0, n_active
+
+
 def block_lanczos_eig_jit(
     matvec: Callable[[jax.Array], jax.Array],
     n: int,
@@ -884,11 +905,8 @@ def block_lanczos_eig_jit(
     whole space and the extremal Ritz values are dense-quality.
     """
     bs = int(block_size)
-    active = (None if support is None
-              else np.flatnonzero(np.asarray(support).reshape(-1)))
-    if active is not None and int(np.size(support)) != int(n):
-        raise ValueError('Lanczos support must have n entries')
-    n_active = int(n) if active is None else int(active.size)
+    # Initial orthonormal block via QR of random complex Gaussian.
+    Q0, n_active = _supported_start_block(n, bs, seed, support)
     max_iter = max(1, min(int(max_iter), n_active // bs))
     subspace_plan = _resolve_subspace_plan(
         subspace_plan, (max_iter + 1) * bs, n_eig,
@@ -900,13 +918,6 @@ def block_lanczos_eig_jit(
     T_size = bs * int(max_iter)
     _announce_reorth("block_lanczos_eig_jit", int(max_iter), n_reorth)
 
-    # Initial orthonormal block via QR of random complex Gaussian.
-    key = jax.random.PRNGKey(seed)
-    k1, k2 = jax.random.split(key)
-    Q0 = (jax.random.normal(k1, (n_active, bs), dtype=jnp.float64)
-          + 1j * jax.random.normal(k2, (n_active, bs), dtype=jnp.float64))
-    if active is not None:
-        Q0 = jnp.zeros((int(n), bs), dtype=Q0.dtype).at[active].set(Q0)
     Q0 = (subspace_plan.qr(Q0.T.reshape(bs, *vector_shape))[0]
           if subspace_plan is not None else jnp.linalg.qr(Q0)[0])
 
@@ -972,6 +983,7 @@ def block_lanczos_eig_jit_converged(
     subspace_plan=None,
     vector_shape=None,
     structured_vectors=False,
+    support=None,
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
     """Convergence-driven block Lanczos via ``lax.while_loop``.
 
@@ -989,7 +1001,7 @@ def block_lanczos_eig_jit_converged(
     the ``while_loop`` carry includes the running iteration count and
     the previous Ritz values for comparison.
 
-    ``n_reorth`` carries exactly the meaning
+    ``n_reorth`` and ``support`` carry exactly the meaning
     :func:`block_lanczos_eig_jit` documents.
 
     Returns (eigenvalues, eigenvectors, n_iter_done) — the third value
@@ -997,10 +1009,11 @@ def block_lanczos_eig_jit_converged(
     ``max_iter``).
     """
     bs = int(block_size)
+    Q0, n_active = _supported_start_block(n, bs, seed, support)
     # Krylov-exhaustion clamp — same rationale as block_lanczos_eig_jit:
     # past floor(n/bs) blocks the residual collapses and QR manufactures
     # junk directions with arbitrary (even sub-spectrum) Ritz values.
-    M = max(1, min(int(max_iter), int(n) // bs))
+    M = max(1, min(int(max_iter), n_active // bs))
     subspace_plan = _resolve_subspace_plan(
         subspace_plan, (M + 1) * bs, n_eig,
         max_block_size=max(bs, n_eig))
@@ -1014,10 +1027,6 @@ def block_lanczos_eig_jit_converged(
         min_iter = max(2 * check_every, max(1, n_eig // bs + 1))
     min_iter = int(min(min_iter, M))
 
-    key = jax.random.PRNGKey(seed)
-    k1, k2 = jax.random.split(key)
-    Q0 = (jax.random.normal(k1, (n, bs), dtype=jnp.float64)
-          + 1j * jax.random.normal(k2, (n, bs), dtype=jnp.float64))
     Q0 = (subspace_plan.qr(Q0.T.reshape(bs, *vector_shape))[0]
           if subspace_plan is not None else jnp.linalg.qr(Q0)[0])
 
