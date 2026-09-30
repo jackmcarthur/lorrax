@@ -477,7 +477,11 @@ def load_parallel_transport_head(
         if ints["schema_version"] != int(SCHEMA_VERSION):
             refusals.append(
                 f"schema_version={ints['schema_version']}, "
-                f"expected {int(SCHEMA_VERSION)}"
+                f"expected {int(SCHEMA_VERSION)} (schema 4 stores links on "
+                "the point-group-closed shell of common.parallel_transport."
+                "link_stencil; fix: rerun the dipole step, get_dipole_mtxels, "
+                "to rebuild the links; sc_head_update = dft_velocity still "
+                "reads the old file)"
             )
         if ints["connection_complete"] != 1:
             refusals.append("connection_complete is not 1")
