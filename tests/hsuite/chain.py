@@ -64,7 +64,14 @@ ATOL = {
                          # P1 vs P4 agree to 1 ueV (the fH basis pivots
                          # break residual ties by index, galerkin.py)
     "sc_residual_ev": 2.0e-3,  # per-map SC max|dE| read from the report
+    # Sigma members of the SC stages' sigma h5 (SC_SIGMA_H5): an SC map
+    # amplifies the P-dependent rule-set split, and the owner's target is
+    # <= 1 meV rule-set reproducibility.  Measured P1 vs P4 on na_sc map 1:
+    # 0.66 meV (main 8e33b82d3 and GRAMRP alike).  eqp files keep eqp_ev.
+    "sc_sigma_ev": 1.0e-3,
 }
+# The SC stages' sigma h5 files, compared at ATOL["sc_sigma_ev"].
+SC_SIGMA_H5 = ("bsc_sigma.h5:", "na_sigma.h5:")
 
 # h5 members not compared.  line_charge_* are the W bank's selected
 # direction states: a gauge per direction, and padded to the mesh (P1 6x1,
@@ -557,7 +564,8 @@ def _tol(label):
         return ATOL["w_bank"], True
     if "sigma" in label or "eqp" in label:
         # Sigma-derived: absolute, in the file's energy unit (eV).
-        return ATOL["eqp_ev"], False
+        return (ATOL["sc_sigma_ev"] if label.startswith(SC_SIGMA_H5)
+                else ATOL["eqp_ev"]), False
     if ".h5:" in label:
         return ATOL["h5"], True
     if label.endswith(":residuals"):
