@@ -667,7 +667,11 @@ def screen_shared_poles(wfns, V_q, meta, config, *, mesh_xy, sym,
                 receipts["outputs"] = export_shared_pole_outputs(handle, meta=meta,
                     config=config, mesh_xy=mesh_xy, source_wfn=source_wfn,
                     run_dir=run_dir, label=label, tables=tables, print_fn=print_fn)
-        if tensors_filename is not None and not sc_scratch and not photon:
+        # The member lives in the restart file, so it is registered exactly when
+        # that file is written (one owner: gw_output.restart_tensor_writes_enabled).
+        from .gw_output import restart_tensor_writes_enabled
+        if (tensors_filename is not None and not sc_scratch and not photon
+                and restart_tensor_writes_enabled(config, tensors_filename)):
             receipts["restart_member"] = register_shared_pole_restart_member(
                 tensors_filename, handle["path"], expected_identity=identity,
                 mesh_xy=mesh_xy, capacity=ledger)
