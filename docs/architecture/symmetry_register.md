@@ -60,6 +60,24 @@ Consumers read the typed accessors, never `R_cart` or a determinant:
 | `q_irr_kgrid_int`, `q_irr_full_idx` | \((N_q^{\rm irr},3)\), \((N_q^{\rm irr},)\) | q parents and their full rows |
 | `kq_map`, `kqfull_map` | \((N_k,\cdot)\) | full row of \(\mathbf k-\mathbf q\) |
 
+For a complete uniform coordinate grid, the k-minus-q owner reconstructs
+integer grid coordinates at the existing decimal-key precision, verifies
+the full Cartesian coverage and preserves scientific row order through an
+inverse lookup. It computes modular labels one coordinate axis at a time,
+without an `Nk × Nq × 3` temporary or Python lookup per pair. Shifted k
+grids are allowed when q lies on their unshifted difference grid; other
+coordinates retain the existing noisy-coordinate matching and refusal.
+The identity-grid arm uses the same integer lookup owner.
+
+Unwrapped q vectors use the lexicographic rectangular box of integer
+differences, and its direct mixed-radix labels replace sorting all `Nk²`
+triples. Incomplete integer grids retain the original `unique` route.
+Neither operation changes active symmetry rows, parent selection, TR
+policy or the k-star map. The CPU check
+`tests/bench/symgrid_integer_check.py` compares the unchanged old door on
+permuted, shifted and irregular fixtures and validates selected old-door
+columns and unwrapped labels on an actual WFN.
+
 **Selection rules.** The k map (`map_full_kpoints_to_irreducible`) compares
 \(S\bar{\mathbf k}\) with each full-grid point in fractional coordinates, at
 tolerance \(10^{-6}\), over the authorized rows. Among matches the highest
