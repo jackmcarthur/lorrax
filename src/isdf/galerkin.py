@@ -420,14 +420,16 @@ def write_galerkin_basis(path, basis: GalerkinBasis, *, wfn, meta,
             f"{destination} / {staging}")
     barrier("galerkin_basis.staging")
     physical = int(basis.rank_physical)
-    # These are incumbent shardings: ctilde and selection_factor are P();
-    # basis_at_nodes retains its node-axis P(None,None,'y').  SlabIO consumes
-    # them directly, so no bulk payload is materialized on a host/process.
-    values = (basis.ctilde[..., :physical], basis.basis_at_nodes[:physical],
-              basis.selection_factor[:physical, :physical])
+    # Coefficients retain their all-P rank shards; the compact factor is
+    # replicated and basis_at_nodes retains its node-axis sharding. SlabIO
+    # writes physical logical extents directly from these carrier shards.
+    values = (basis.ctilde, basis.basis_at_nodes, basis.selection_factor)
+    shapes = ((basis.ctilde.shape[0], basis.ctilde.shape[1], physical),
+              (physical, *basis.basis_at_nodes.shape[1:]),
+              (physical, physical))
     with SlabIO(staging, mode="w", mesh=mesh_xy) as io:
-        for name, value in zip(_BASIS_ARRAYS, values):
-            io.create_dataset(name, shape=value.shape, dtype=value.dtype)
+        for name, value, shape in zip(_BASIS_ARRAYS, values, shapes):
+            io.create_dataset(name, shape=shape, dtype=value.dtype)
             io.write_slab(name, value)
         _basis_write_meta(io, basis, provenance)
     if process_rank() == 0:
@@ -501,7 +503,8 @@ def read_galerkin_basis(path, *, wfn, meta, centroid_indices, band_range,
         from runtime.padding import padded_axis
         rank_axis = padded_axis(
             physical, mesh_xy, name="Galerkin restart rank carrier",
-            specs=((P("x", None), 0), (P(None, "y"), 1)),
+            specs=((P("x", None), 0), (P(None, "y"), 1),
+                   (P(None, None, ("x", "y")), 2)),
             extra=extra_rank_pad)
         carrier = rank_axis.carrier
         shapes = ((stored["nk"], stored["nb"], carrier),
@@ -513,7 +516,8 @@ def read_galerkin_basis(path, *, wfn, meta, centroid_indices, band_range,
         # logical datasets directly into these mesh-legal carrier shapes.
         arrays = [io.read_slab(name, shape=shape, partition_spec=spec)
                   for name, shape, spec in zip(
-                      _BASIS_ARRAYS, shapes, (P(), node_spec, P()))]
+                      _BASIS_ARRAYS, shapes,
+                      (P(None, None, ("x", "y")), node_spec, P()))]
     rep = NamedSharding(mesh_xy, P())
     arrays[2] = jax.jit(
         lambda factor: factor + jnp.diag(
@@ -573,7 +577,7 @@ def _projection_bytes(geom: dict, *, band_carrier: int, rank: int,
     n_chunks = geom["n_band_chunks"](band_carrier)
     full_cols = -(-n_r // p)
     resident = (rank * ns * full_cols * _C16
-                + nk * (n_chunks + 1) * band_carrier * rank * _C16)
+                + nk * (1 + n_chunks / p) * band_carrier * rank * _C16)
     return (resident + geom["g_index"] + nk * bpd * ns * n_r * _C16
             + max(int(k_tile) * bpd * geom["row_fft"],
                   2 * nk * bpd * ns * local_cols * p * _C16))
@@ -977,7 +981,8 @@ def fit_galerkin_basis(
             selected.astype("<i8", copy=False).tobytes()).hexdigest()
         rank = padded_axis(
             rank_phys, mesh_xy, name="Galerkin selected-rank carrier",
-            specs=((P("x", None), 0), (P(None, "y"), 1)),
+            specs=((P("x", None), 0), (P(None, "y"), 1),
+                   (P(None, None, ("x", "y")), 2)),
             extra=extra_rank_pad).carrier
         n_pad = rank - rank_phys
         log_fn(
@@ -1068,9 +1073,7 @@ def fit_galerkin_basis(
             f"  [qrcp] selected-state min diag(L)="
             f"{float(min_chol_diag):.6e}")
 
-        ctilde = jax.jit(_coefficients_from_projection,
-                         in_shardings=(rep, rep), out_shardings=rep)(
-                             projection, L)
+        ctilde = _solve_coefficient_projection(projection, L, mesh_xy)
         del projection
 
     # Centroids enter only here, as evaluation points of the already-fixed
@@ -1488,7 +1491,8 @@ def _selected_gram_from_projection(projection, *, selected_states,
             f"the carrier {rank_carrier}")
     face = NamedSharding(mesh_xy, P('x', 'y'))
 
-    @partial(jax.jit, in_shardings=NamedSharding(mesh_xy, P()),
+    @partial(jax.jit,
+             in_shardings=NamedSharding(mesh_xy, P(None, None, ("x", "y"))),
              out_shardings=face)
     def _pick(proj):
         rows = proj.reshape(nk * nb, rank)[jnp.asarray(selected)]
@@ -2002,10 +2006,10 @@ def _assemble_coefficient_chunks(
     key = (id(mesh_xy), widths, int(nk), int(rank))
     fn = _COEFFICIENT_ASSEMBLERS.get(key)
     if fn is None:
-        rep = NamedSharding(mesh_xy, P())
+        rank_shards = NamedSharding(mesh_xy, P(None, None, ("x", "y")))
 
-        @partial(jax.jit, in_shardings=tuple(rep for _ in widths),
-                 out_shardings=rep)
+        @partial(jax.jit, in_shardings=tuple(rank_shards for _ in widths),
+                 out_shardings=rank_shards)
         def _assemble(*values):
             return jnp.concatenate(
                 tuple(v[:, :w, :] for v, w in zip(values, widths)), axis=1)
@@ -2051,10 +2055,62 @@ def _coefficients_from_projection(projection, factor):
     return jnp.conj(c_h).T.reshape(nk, nb, rank)
 
 
+
+def _solve_coefficient_projection(projection, factor, mesh: Mesh):
+    """Solve C on all P ranks, trading rank shards for bounded state rows.
+
+    The replicated L is compact (rank squared). The bulk state table never
+    is: a tiled all-to-all gives each rank every alpha for just 1/P of the
+    padded states, then the inverse exchange restores the rank shards.
+    """
+    nk, nb, rank = (int(v) for v in projection.shape)
+    p = int(mesh.size)
+    if rank % p:
+        raise ValueError("Galerkin coefficient rank carrier must divide all P")
+    states = nk * nb
+    state_carrier = -(-states // p) * p
+    spec = P(None, None, ("x", "y"))
+    from jax.experimental.layout import Layout, with_layout_constraint
+    local_layout = Layout(major_to_minor=(0, 1))
+
+    @partial(shard_map, mesh=mesh, in_specs=(spec, P()),
+             out_specs=spec, check_vma=False)
+    def _solve(local, L):
+        rows = local.reshape(states, rank // p)
+        rows = jnp.pad(rows, ((0, state_carrier - states), (0, 0)))
+        rows = with_layout_constraint(rows, local_layout)
+        rows = jax.lax.all_to_all(rows, ("x", "y"),
+                                  split_axis=0, concat_axis=1, tiled=True)
+        rows = _coefficients_from_projection(rows[None], L)[0]
+        rows = with_layout_constraint(rows, local_layout)
+        rows = jax.lax.all_to_all(rows, ("x", "y"),
+                                  split_axis=1, concat_axis=0, tiled=True)
+        return rows[:states].reshape(nk, nb, rank // p)
+
+    sharding = NamedSharding(mesh, spec)
+    return jax.jit(_solve, donate_argnums=(0,),
+                   in_shardings=(sharding, NamedSharding(mesh, P())),
+                   out_shardings=sharding)(projection, factor)
+
+
+def _reduce_projection_partials(acc, mesh: Mesh):
+    """Sum the r-owned partials directly into all-P coefficient rank shards."""
+    source = P(("x", "y"), None, None)
+    target = P(None, None, ("x", "y"))
+
+    @partial(shard_map, mesh=mesh, in_specs=source, out_specs=target,
+             check_vma=False)
+    def _sum(local):
+        return jax.lax.psum_scatter(local, ("x", "y"),
+                                    scatter_dimension=2, tiled=True)
+
+    return jax.jit(_sum, in_shardings=NamedSharding(mesh, source),
+                   out_shardings=NamedSharding(mesh, target))(acc)
+
 def _build_physical_projection(
         *, source, meta, mesh_xy: Mesh, rank_carrier: int,
         x_chunks, stream, k_tile: int, log_fn):
-    """Stream every state once for the replicated ``Psi X^H``.
+    """Stream every state once for the all-P rank-sharded ``Psi X^H``.
 
     Band chunks outside, r chunks inside: each band chunk is transformed
     once over the whole grid and contracted chunk by chunk against the
@@ -2078,14 +2134,14 @@ def _build_physical_projection(
             product_r_spec=P(None, None, None, ('y', 'x')), k_tile=k_tile):
         if bc_range != current:
             if acc is not None:
-                chunks.append(_reduce_device_partials(acc, mesh_xy))
+                chunks.append(_reduce_projection_partials(acc, mesh_xy))
             acc, current = _zeros_partial(), bc_range
         acc = _make_projection_accum_kernel(
             mesh=mesh_xy, nk=nk, band_carrier=band_carrier,
             rank=rank_carrier, nspinor=nspinor,
             r_carrier=int(psi.shape[-1]))(psi, x_chunks[r_idx], acc)
         del psi
-    chunks.append(_reduce_device_partials(acc, mesh_xy))
+    chunks.append(_reduce_projection_partials(acc, mesh_xy))
     del acc
     widths = tuple(
         int(hi) - int(lo) for lo, hi in source.band_chunk_ranges)
