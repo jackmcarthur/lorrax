@@ -22,18 +22,18 @@ def main():
   from file_io import WFNReader
   from symmetry_maps import q_negation_index
   base=Path('/pscratch/sd/j/jackm/sandbox_v2_docs_consolidation_2026-08-14/runs/Fe/73_soc80_20nscf_closed_buffer_20260930/qe')
-  w=WFNReader(str(base/'WFN.h5'),mesh=R.mesh,qe_schema=str(base/'data-file-schema.xml'));s=w.symmetry();kg=tuple(map(int,w.kgrid));np_,m,nb=1062,904,180
+  w=WFNReader(str(base/'WFN.h5'),mesh=R.mesh,qe_schema=str(base/'data-file-schema.xml'));s=w.symmetry();kg=tuple(map(int,w.kgrid));np_,m,nb=1062,904,90
   pl=CentroidKUnfoldPlan(R.mesh,identity_square_grouped_shard_layout(m,m,(2,2)),np.asarray(s.irr_idx_k),np.asarray(s.sym_idx_k),np.tile(np.arange(m),(2*int(w.ntran),1)),np.zeros((2*int(w.ntran),m,3)),np.asarray(s.unfolded_kpts)[np.asarray(s.kirr_fullids)],np.asarray(s.spinor_action(s.sym_idx_k,nspinor=2)),int(w.ntran),2,parent_full_rows=np.asarray(s.kirr_fullids,dtype=np.int32))
   neg=np.asarray(q_negation_index(kg));parents=np.asarray(s.kirr_fullids);q=tuple(dict.fromkeys(parents.tolist()+neg[parents].tolist()));assert len(q)==2120,len(q)
-  fn=factory(R.mesh,kg,2,(np_,nb,m,2),k_unfold_plan=pl,layout='axis',selected_q=q,pair_mode='direct',ordered=True,bank_carry=True)
+  fn=factory(R.mesh,kg,2,(np_,nb,m,2),k_unfold_plan=pl,layout='face',selected_q=q,pair_mode='direct',ordered=True,bank_carry=True)
   sd=lambda sh,dt,sp:jax.ShapeDtypeStruct(sh,dt,sharding=NamedSharding(R.mesh,sp))
   import minimax
   cap=minimax.RESPONSE_NODE_CAPACITY
-  args=(sd((cap,),np.complex128,P()),sd((2,2,cap),np.complex128,P()),sd((np_,2,m,nb),np.complex128,P(None,None,'x',None)),sd((np_,nb,2,m),np.complex128,P(None,None,None,'y')),sd((np_,nb),np.float64,P()),sd((np_,nb),np.complex128,P()),sd((np_,nb),np.complex128,P()),sd((2,),np.float64,P()),sd((2,len(q),m,m),np.complex128,P(None,None,'x','y')))
+  args=(sd((cap,),np.complex128,P()),sd((2,2,cap),np.complex128,P()),sd((np_,2,m,nb),np.complex128,P(None,None,'x','y')),sd((np_,nb,2,m),np.complex128,P(None,'x',None,'y')),sd((np_,nb),np.float64,P()),sd((np_,nb),np.complex128,P()),sd((np_,nb),np.complex128,P()),sd((2,),np.float64,P()),sd((2,len(q),m,m),np.complex128,P(None,None,'x','y')))
   t=time.monotonic();exe=fn.lower(*args).compile();ma=exe.memory_analysis()
   from runtime.aot_memory import aot_kernel_peak_bytes
   priced=aot_kernel_peak_bytes(exe)
-  row=dict(scope='native Fe unitary metadata, identity proxy centroids, P4 local452 proxy P16 physical1808; no field allocation',parents=np_,grid=kg,selected_q=len(q),physical_m=1808,proxy_m=m,bands=nb,local_mu=452,argument_bytes=ma.argument_size_in_bytes,output_bytes=ma.output_size_in_bytes,temp_bytes=ma.temp_size_in_bytes,alias_bytes=ma.alias_size_in_bytes,resident_increment=int(priced.resident_increment),carry_bytes=2*len(q)*452**2*16,compile_s=time.monotonic()-t)
+  row=dict(scope='native Fe unitary metadata, identity proxy centroids, P4 local452/bandface45 proxy P16 physical1808/Nb180; no field allocation',parents=np_,grid=kg,selected_q=len(q),physical_m=1808,proxy_m=m,proxy_bands=nb,physical_bands=180,local_bandface=45,local_mu=452,argument_bytes=ma.argument_size_in_bytes,output_bytes=ma.output_size_in_bytes,temp_bytes=ma.temp_size_in_bytes,alias_bytes=ma.alias_size_in_bytes,resident_increment=int(priced.resident_increment),carry_bytes=2*len(q)*452**2*16,compile_s=time.monotonic()-t)
   rows.append(row);rank0_print(json.dumps(row),flush=True);rank0_transaction(a.output+'.hlo',stage='selected charge HLO',write=lambda:Path(a.output+'.hlo').write_text(exe.as_text()));w.close()
  else:
   kg=(4,4,4);np_,m,nb=3,8,6;rng=np.random.default_rng(84)

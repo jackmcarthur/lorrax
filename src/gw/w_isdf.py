@@ -1054,7 +1054,7 @@ def _get_chi_fractional_contour_kernel_face(
                              upper_weight, upper_time, upper_ref):
             """One node's forward and reverse rows through the parent-pair owner.
 
-            Mode 11 returns ``v = sum_ab conj(Gu'_ab) Gf'_ab`` from the raw
+            The scalar trace is ``v = sum_ab conj(Gu'_ab) Gf'_ab`` from the raw
             parents (``G' = ifftn_k`` of the typed unfold), which is the
             incumbent A(t) itself.  The physical A(R) = conj(v(-R)), since
             ``fftn(G)(R) = ifftn(G)(-R)``; its q transform is conj(FT[v](q)),
