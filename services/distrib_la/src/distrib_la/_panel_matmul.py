@@ -211,7 +211,10 @@ def _interleaved_kernel(mesh, q, m, k, n, width, active=False, weighted=False, p
     p = int(mesh.shape['x'])
     kl = k // p
     n_full, rest = divmod(kl, width)
-    contract = _panel_contraction(mesh) if active else None
+    # The native CUDA contraction owns C's input/output alias. In particular,
+    # the final panel must not become a fresh full product plus a separate
+    # full accumulator add when XLA no longer fuses the scan's beta=1 GEMM.
+    contract = _panel_contraction(mesh) if active or mesh_platform(mesh) == "CUDA" else None
     owner = np.arange(p, dtype=np.int32)[None, :]
 
     def body(a, b, bounds, weights):
@@ -245,8 +248,10 @@ def _interleaved_kernel(mesh, q, m, k, n, width, active=False, weighted=False, p
             outs = []
             for i, (lhs, rhs) in enumerate(pairs):
                 c = None if cs is None else cs[i]
-                if active:
-                    outs.append(contract(lhs, rhs, interval(off, wd), c))
+                if contract is not None and (active or lhs.dtype in (jnp.float64, jnp.complex128)):
+                    live = (interval(off, wd) if active else
+                            jnp.broadcast_to(jnp.asarray([0, p * wd], jnp.int32), (q, 2)))
+                    outs.append(contract(lhs, rhs, live, c))
                 else:
                     outs.append(lhs @ rhs if c is None else c + lhs @ rhs)
             return tuple(outs)
