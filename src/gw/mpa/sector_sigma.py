@@ -78,9 +78,24 @@ def _placer(mesh_xy, spec):
 
 
 @lru_cache(maxsize=None)
-def _zeros(mesh_xy, shape):
+def _zeros(mesh_xy, shape, spec=P(None, 'x', 'y')):
     return jax.jit(lambda: jnp.zeros(shape, jnp.complex128),
-                   out_shardings=NamedSharding(mesh_xy, P(None, 'x', 'y')))
+                   out_shardings=NamedSharding(mesh_xy, spec))
+
+
+@lru_cache(maxsize=None)
+def _other_face(mesh_xy, spec, other):
+    """A factor's face in the other orientation: rank (i, j)'s tile to rank (j, i).
+
+    One collective permute of one tile (``common.collectives.to_transpose_partner``);
+    a diagonal sector's right factor is its left factor, so only one
+    orientation is kept resident and this forms the other per Lorentz panel.
+    """
+    from common.collectives import to_transpose_partner
+    from common.shard_map import shard_map
+    p = int(mesh_xy.shape['x'])
+    return shard_map(lambda t: to_transpose_partner(t, p), mesh=mesh_xy,
+                     in_specs=spec, out_specs=other, check_vma=False)
 
 
 @lru_cache(maxsize=None)
@@ -230,7 +245,12 @@ def sector_tau_factory(left, right, keys, meta, mesh_xy):
 
 
 def _endpoint_route(header, basis, sym, span, rows, mesh_xy, axis, width):
-    """Bind the symmetry service's current/charge endpoint action, once per panel."""
+    """Bind the symmetry service's current/charge endpoint action, once per panel.
+
+    Returns ``(route, cost, kwargs)``: the bound unfold of every child row in
+    ``rows``, its analytical cost, and the tables it binds (a child-q panel
+    of the full grid reads their rows through the service's eager kernel).
+    """
     from symmetry_maps import endpoint_panel_cost
     from gw.qgrid_symmetry import shared_pole_packed_action
     proxy = SimpleNamespace(mu_basis=basis)
@@ -249,7 +269,43 @@ def _endpoint_route(header, basis, sym, span, rows, mesh_xy, axis, width):
         spin_action_full=action,n_sym_spatial=int(qt['n_sym_spatial']),
         active_mask=basis.active_mask,mesh=mesh_xy,mesh_axis=axis,
         max_live_bytes=cost['estimated_live_bytes_per_rank'])
-    return _endpoint_unfold(kwargs), cost
+    return _endpoint_unfold(kwargs), cost, kwargs
+
+
+#: Test hook: the largest child-q panel the full-grid factor unfold may take
+#: (``None``: the ledger decides; every child in one call when it fits).
+_TEST_UNFOLD_SPAN = None
+#: Test hook: a diagonal sector keeps one factor face even when both fit.
+_TEST_MIRROR = False
+
+
+def _unfold_full_grid(face, route, kwargs, span, mesh_xy, axis):
+    """The full-q factor from its parent face, ``span`` child rows per call.
+
+    ``span`` covering the grid is the bound route, one call.  Otherwise each
+    child-q panel is unfolded by the symmetry service's eager kernel (its
+    tables as operands, so equal panels share one executable) and written in
+    place into the full-q face, so the transients are one panel's.
+    """
+    from symmetry_maps import unfold_endpoint_panel, endpoint_panel_cost
+    nk=len(kwargs['irr_idx'])
+    if span>=nk:
+        return route(face)
+    spec=P(None,axis,None,'y' if axis=='x' else 'x')
+    if not face.sharding.is_equivalent_to(NamedSharding(mesh_xy,spec),face.ndim):
+        face=_placer(mesh_xy,spec)(face)
+    out=_zeros(mesh_xy,(nk,*face.shape[1:]),spec)()
+    write=_set_q_rows(mesh_xy,spec)
+    for lo in range(0,nk,span):
+        hi=min(lo+span,nk)
+        part,_=unfold_endpoint_panel(face,**{**kwargs,
+            'irr_idx':kwargs['irr_idx'][lo:hi],'sym_idx':kwargs['sym_idx'][lo:hi],
+            'spin_action_full':kwargs['spin_action_full'][lo:hi],
+            'max_live_bytes':endpoint_panel_cost(face.shape,hi-lo,mesh=mesh_xy,mesh_axis=axis,
+                dtype=face.dtype)['estimated_live_bytes_per_rank']})
+        out=write(out,part,lo)
+        del part
+    return out
 
 
 _PANELS_HELD = {}
@@ -305,26 +361,48 @@ def sector_synthesis(readers, headers, bases, syms, layout, frequencies, meta, m
     # remain physical, so the padded pole columns have identically zero weight.
     kcarrier=padded_axis(kmax,mesh_xy,name='sector_sigma_K',specs=(
         (P(None,'x',None,'y'),3),(P(None,'y',None,'x'),3))).carrier
+    # A diagonal sector (CC, TT, the W0 charge body) contracts one factor
+    # with itself: B_B is B_A on the other face.  When both faces do not fit,
+    # only B_A is read, unfolded and kept, and each Lorentz panel forms its
+    # B_B columns by one tile exchange per tau (_other_face).
+    same=readers[0] is readers[1] and headers[0] is headers[1]
+    diagonal=same and bases[0] is bases[1] and syms[0] is syms[1]
     rows=np.arange(nk,dtype=np.int32)
-    routes=[];costs=[]
+    routes=[];tables=[]
     for h,b,sym,axis in zip(headers,bases,syms,('x','y')):
-        route,cost=_endpoint_route(h,b,sym,(0,nq),rows,mesh_xy,axis,kcarrier)
-        routes.append(route);costs.append(cost)
+        route,_,kwargs=_endpoint_route(h,b,sym,(0,nq),rows,mesh_xy,axis,kcarrier)
+        routes.append(route);tables.append(kwargs)
     def place(value,spec):
         return _placer(mesh_xy,spec)(value)
     px,py=int(mesh_xy.shape['x']),int(mesh_xy.shape['y'])
-    face_bytes=16*nq*kcarrier*(m*nc+n*nt)//mesh_xy.size
+    def face_bytes(mirror):
+        return 16*nq*kcarrier*(m*nc+(0 if mirror else n*nt))//mesh_xy.size
 
-    def resident_for(factor_layout,blocks=nc*nt):
+    def resident_for(factor_layout,panel,mirror):
         # Each factor has one centroid axis. Pole columns divide over the
         # other mesh axis only in the face orientation. One W(t) panel of
-        # ``blocks`` Lorentz blocks is live at a time.
+        # |A| x |B| Lorentz blocks is live at a time; a mirrored right
+        # factor is the panel's |B| columns of the left one, moved.
         split=factor_layout=='face'
+        right_components=panel[1][1]-panel[1][0] if mirror else nt
         return (16*nk*((m//px)*nc*(kcarrier//py if split else kcarrier)
-                       +(n//py)*nt*(kcarrier//px if split else kcarrier))
-                +8*nk*kcarrier+16*nk*m*n*blocks//mesh_xy.size)
+                       +(n//py)*right_components*(kcarrier//px if split else kcarrier))
+                +8*nk*kcarrier+16*nk*m*n*_blocks(panel)//mesh_xy.size)
     native=_native_workspace(mesh_xy,(((nk,m*nc,kcarrier),(nk,kcarrier,n*nt)),))
-    workspace=sum(c['estimated_live_bytes_per_rank'] for c in costs)+native
+
+    def unfold_workspace(span,mirror):
+        # The full-grid unfold's transients for ``span`` child rows per call.
+        from symmetry_maps import endpoint_panel_cost
+        return sum(endpoint_panel_cost((nq,extent,comps,kcarrier),span,mesh=mesh_xy,
+                   mesh_axis=axis,dtype=np.complex128)['estimated_live_bytes_per_rank']
+                   for extent,comps,axis in ((m,nc,'x'),(n,nt,'y'))[:1 if mirror else 2])+native
+    spans=[nk]
+    while spans[-1]>1:spans.append(-(-spans[-1]//2))
+    if _TEST_UNFOLD_SPAN is not None:
+        spans=[s for s in spans if s<=_TEST_UNFOLD_SPAN] or spans[-1:]
+    mirrors=(False,True) if diagonal else (False,)
+    if diagonal and _TEST_MIRROR:
+        mirrors=(True,)
     # A face input is required by the established symmetry route. After it
     # completes the factors are placed once for every tau: they do not depend
     # on tau, only d(tau) does. With K replicated (axis orientation) each tau
@@ -336,7 +414,12 @@ def sector_synthesis(readers, headers, bases, syms, layout, frequencies, meta, m
     # 16 nk m n bytes each; Fe 20^3 at P36 is 103.7 GB/rank). When the class
     # tile does not fit, W(t) is formed in A x B panels (one component row,
     # then one block), each consumed by its own mode-8 door call. The first
-    # schedule that fits wins, so a deck that fits keeps one panel.
+    # schedule that fits wins, so a deck that fits keeps one panel.  Within a
+    # schedule, a diagonal sector keeps both faces when they fit, else one
+    # (Fe 20^3/P36 TT: 92.2 -> 46.1 GB/rank of factors).  The full-q factor
+    # is unfolded from its parent face at setup: every child in one call
+    # when its transients fit, else in child-q panels written in place
+    # (Fe 20^3/P36 TT: 276 GB/rank of transients in one call).
     ladder=[whole]
     if nc>1:ladder.append(tuple(((i,i+1),(0,nt)) for i in range(nc)))
     if nt>1:ladder.append(tuple(((i,i+1),(j,j+1)) for i in range(nc) for j in range(nt)))
@@ -349,27 +432,32 @@ def sector_synthesis(readers, headers, bases, syms, layout, frequencies, meta, m
     for schedule in ([held[1]] if held else [])+ladder:
         for candidate in ((held[0],) if held and schedule is held[1] else
                           ('axis','face') if layout=='face' else (layout,)):
-            if capacity.preview(
-                    resident_bytes_per_rank=resident_for(candidate,_blocks(schedule[0]))+2*face_bytes,
-                    workspace_bytes_per_rank=workspace,
-                    concurrent_with=ambient)['device_budget_status']=='PASS':
-                choice=candidate,schedule
-                break
+            for mirror in ((held[2],) if held and schedule is held[1] else mirrors):
+                for span in spans:
+                    if capacity.preview(
+                            resident_bytes_per_rank=resident_for(candidate,schedule[0],mirror)
+                            +2*face_bytes(mirror),
+                            workspace_bytes_per_rank=unfold_workspace(span,mirror),
+                            concurrent_with=ambient)['device_budget_status']=='PASS':
+                        choice=candidate,schedule,mirror,span
+                        break
+                if choice is not None:break
+            if choice is not None:break
         if choice is not None:break
-    factor_layout,panels=choice or (layout,ladder[-1])
-    if weights_fn is None and len(panels)>1:
-        _PANELS_HELD[(tag,nk,m,n,nc,nt,layout)]=factor_layout,panels
+    factor_layout,panels,mirror,span=choice or (layout,ladder[-1],mirrors[-1],spans[-1])
+    if weights_fn is None and (len(panels)>1 or mirror):
+        _PANELS_HELD[(tag,nk,m,n,nc,nt,layout)]=factor_layout,panels,mirror
     factor_spec=_shared_pole_factor_specs(factor_layout)
-    resident_bytes=resident_for(factor_layout,_blocks(panels[0]))
+    resident_bytes=resident_for(factor_layout,panels[0],mirror)
     setup=f'{stage}.sector.setup.{tag}'
     resident=f'{stage}.sector.resident.{tag}'
-    capacity.reserve(setup,resident_bytes_per_rank=resident_bytes+2*face_bytes,
-        workspace_bytes_per_rank=workspace,concurrent_with=ambient)
+    capacity.reserve(setup,resident_bytes_per_rank=resident_bytes+2*face_bytes(mirror),
+        workspace_bytes_per_rank=unfold_workspace(span,mirror),concurrent_with=ambient)
     capacity.live_stages=(*ambient,setup)
     try:
-        same=readers[0] is readers[1] and headers[0] is headers[1]
         if same:
-            lhs=read_shared_pole_faces(readers[0],(0,nq),meta=meta,header=left,basis=bases[0])
+            lhs=read_shared_pole_faces(readers[0],(0,nq),meta=meta,header=left,basis=bases[0],
+                                       orientations=('x',) if mirror else ('x','y'))
             rhs=lhs
         else:
             lhs=read_shared_pole_faces(readers[0],(0,nq),meta=meta,header=left,
@@ -378,8 +466,9 @@ def sector_synthesis(readers, headers, bases, syms, layout, frequencies, meta, m
                                        basis=bases[1],orientations=('y',))
             if not bool(jnp.all(lhs[2]==rhs[2])):
                 raise ValueError('GATE shared_pole_sector_census: unequal pole values')
-        b_x=place(routes[0](lhs[0]),factor_spec[0])
-        b_y=place(routes[1](rhs[1]),factor_spec[1])
+        b_x=place(_unfold_full_grid(lhs[0],routes[0],tables[0],span,mesh_xy,'x'),factor_spec[0])
+        b_y=None if mirror else place(_unfold_full_grid(
+            rhs[1],routes[1],tables[1],span,mesh_xy,'y'),factor_spec[1])
         parent=np.asarray(left['qirr']['irr_idx_q'],dtype=np.int32)
         poles=jnp.take(lhs[2],parent,axis=0)
         jax.block_until_ready((b_x,b_y,poles))
@@ -413,8 +502,13 @@ def sector_synthesis(readers, headers, bases, syms, layout, frequencies, meta, m
         # component axis of the factors is unsharded, so a panel is a local slice.
         def form(panel,x,y,omega,interval):
             (a0,a1),(b0,b1)=panel
+            if y is None:
+                y=_other_face(mesh_xy,factor_spec[0],factor_spec[1])(
+                    x if panels==whole else x[:,:,b0:b1])
+            elif panels!=whole:
+                y=y[:,:,b0:b1]
             if panels!=whole:
-                x,y=x[:,:,a0:a1],y[:,:,b0:b1]
+                x=x[:,:,a0:a1]
             return kernel(x,y,omega,interval,ref,time,hole).reshape(nk,m,a1-a0,n,b1-b0)
         return LorentzPanels(panels,form,(x,y,omega,interval))
     def window_operands(space,indices,bounds):
@@ -441,10 +535,10 @@ def sector_synthesis(readers, headers, bases, syms, layout, frequencies, meta, m
 
 
 @lru_cache(maxsize=None)
-def _set_q_rows(mesh_xy):
-    """Write a parent-q panel into the packed constant in place (q is unsharded)."""
+def _set_q_rows(mesh_xy, spec=P(None, 'x', 'y')):
+    """Write a q panel into a full-q operand in place (q is unsharded)."""
     return jax.jit(lambda full, part, lo: jax.lax.dynamic_update_slice_in_dim(full, part, lo, axis=0),
-                   donate_argnums=0, out_shardings=NamedSharding(mesh_xy, P(None, 'x', 'y')))
+                   donate_argnums=0, out_shardings=NamedSharding(mesh_xy, spec))
 
 
 def instantaneous_sector_sigma(handle, families, bases, meta, mesh_xy, *,
