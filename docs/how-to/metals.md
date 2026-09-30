@@ -48,7 +48,7 @@ the band energies from the NSCF output; a one-shot's `eqp0.dat` and the
 | band sums | `number_bands`: the bands the NSCF has, at least 2·`nelec` while band extrapolation is on (the default) | one count for the χ0 and Σ sums; Σ's is extrapolated, χ0's is not ([production QSGW](production-qsgw.md#error-budget)). Below 2·`nelec` the run refuses at startup; set `use_band_extrapolation = false` there |
 | centroids | select on the Σ pair set, `--fit-window 0:B,0:number_bands` with `B = nelec + ncond`. First run `python3 -m centroid.kmeans_cli` with a large request and read `achieved numerical rank=r` in `kmeans.out`; then select $N_\mu$ between $0.5r$ and $1.3r$. The rank line appears only when the snapped candidates outnumber the request (`pruning: not applied` otherwise), so keep the probe request below the FFT-grid point count | the ISDF exchange error falls with $N_\mu/r$: RMS ≤ 1 meV near $0.5r$, max ≤ 1 meV near $1.3r$ (CLAIMS 2860). See [drivers](../drivers.md) |
 | head | `head_correction = no_local_fields` (direct charge head: the interband $S(\omega)$ and the Fermi-surface Lindhard term, averaged over the q = 0 cell), or `full` on a scalar deck | [the metallic q→0 head](../theory/metal-q0-head.md) owns the head model |
-| SC head | `sc_head_update = off` (default: fixed DFT head on the DFT Fermi–Dirac state), or `dft_velocity` with `dipole.h5` | [self-consistency §7](../self_consistency.md#metals-direct-drude-head) |
+| SC head | `parallel_transport` (default when `parallel_transport.h5` from `get_dipole_mtxels --parallel-transport-out` exists: the QSGW Fermi velocity), `dft_velocity` with `dipole.h5`, or `off` (fixed DFT head on the DFT Fermi–Dirac state) | [self-consistency §7](../self_consistency.md#metals-direct-drude-head) |
 | stop rule | `sc_tol_ev = 1e-3` | 1 meV is the reproducibility the default `sigma_quadrature_eps` is chosen for; judge convergence by states near $E_F$ ([self-consistency §7](../self_consistency.md#7-metals)) |
 
 State `sys_dim = 3`; the metal q = 0 cell is three-dimensional only
@@ -74,7 +74,7 @@ fixed-N μ).
 | `compute_mode = gn_ppm`, `cohsex` or `hl_ppm` | `gn_ppm_refuses_metals`, `fractional_occupations_require_mpa` |
 | no `occ_smearing_width_ry`, or `occ_smearing_family` | required; `metal_occupations_fermi_dirac` |
 | `occ_broadening > 0` beside `occ_smearing_width_ry` (MP1 smeared head) | `metal_sc_head_update_disabled` |
-| `sc_head_update = parallel_transport`, or `dft_velocity` with `full` on a bispinor deck | `metal_sc_head_update_disabled` |
+| `sc_head_update = parallel_transport` on a bispinor deck, or `dft_velocity` with `full` on a bispinor deck | `metal_sc_head_update_disabled` |
 | `sc_head_update = interband_commutator` | `sc_head_interband_commutator_insulator_only` |
 | `head_correction = full` on a time-reversal-broken shared-pole store | `shared_pole_head_ordered` |
 | `sigma_w_model = mpa` on a time-reversal-broken metal | `mpa_ordered_metal` |

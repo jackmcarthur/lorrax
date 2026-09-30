@@ -6347,9 +6347,11 @@ def load_head_velocity_source(
 ):
     """Resolve ``sc_head_update`` to the head's velocity source, or None.
 
-    On an ordered shared-pole metal, ``dft_velocity`` uses the authenticated
-    dipole for the direct-only head. Other metal velocity-head routes retain
-    the named refusal in ``gw_config.validate_material_inputs``.
+    On a shared-pole metal, ``dft_velocity`` uses the authenticated dipole
+    for the direct head and ``parallel_transport`` (scalar decks) the
+    artifact below, so the Drude term sees ``U^dagger (v + D_k DeltaH) U``.
+    Other metal velocity-head routes retain the named refusal in
+    ``gw_config.validate_material_inputs``.
 
     The ONE place the mode string turns into an object.  Both metal modes
     read the artifact ``get_dipole_mtxels --parallel-transport`` writes;
@@ -6417,7 +6419,8 @@ def load_head_velocity_source(
     from file_io.paths import resolve_input_path
 
     from gw.gw_config import uses_metal_direct_drude_head
-    if material_class == "metal" and uses_metal_direct_drude_head(config):
+    if (mode == "dft_velocity" and material_class == "metal"
+            and uses_metal_direct_drude_head(config)):
         from .qsgw_head import load_dft_dipole_head
         source = load_dft_dipole_head(
             input_dir, mesh=mesh, wfn=wfn, meta=meta, config=config)
