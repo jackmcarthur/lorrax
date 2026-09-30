@@ -3,6 +3,7 @@ from runtime import initialize_communicator_stack, run_main_and_finalize, rank0_
 R = initialize_communicator_stack()
 import argparse
 from pathlib import Path
+from dataclasses import replace
 import json
 import time
 import numpy as np
@@ -13,8 +14,11 @@ from common.collectives import device_put_process_local, gather_to_host, rank0_t
 from common.meta import Meta
 from common.psi_G_store import build_psi_G_store
 from common.gamma_matrices import dirac_spin_z, sigma_z
+from common.wfn_transforms import get_enk_bandrange
+from gw.qsgw_head import qp_frame_delta_h_dft
 from file_io import WFNReader
-from isdf.galerkin import GalerkinBasis, iter_galerkin_rchunks, project_galerkin_spin_operator
+from isdf.galerkin import (GalerkinBasis, iter_galerkin_rchunks,
+    project_galerkin_spin_operator, project_lifted_galerkin_dirac_spin)
 
 p = argparse.ArgumentParser(description=__doc__)
 p.add_argument('--wfn', required=True)
@@ -26,6 +30,28 @@ def main():
     w = WFNReader(a.wfn, mesh=mesh)
     sym = w.symmetry()
     receipts = []
+    # The post-SC velocity receives the authenticated QP frame in the DFT
+    # state basis. Test its reconstruction against an independent dense
+    # reference, with complex mixing, real WFN energies and null padding.
+    dft,_=get_enk_bandrange(w,sym,(1,6),(1,6))
+    dft=np.asarray(dft)
+    rng=np.random.default_rng(90)
+    U=np.stack([np.linalg.qr(rng.normal(size=(5,5))+
+               1j*rng.normal(size=(5,5)))[0] for _ in range(len(dft))])
+    qp=dft+np.linspace(-.02,.03,5)
+    expected=(U*qp[:,None,:])@U.swapaxes(-1,-2).conj()
+    expected-=dft[:,:,None]*np.eye(5)[None]
+    with mesh:
+        U_dev=device_put_process_local(np.pad(U,((0,0),(0,3),(0,3))),
+                                       NamedSharding(mesh,P(None,'x','y')))
+        qp_dev=device_put_process_local(qp,NamedSharding(mesh,P()))
+        dft_dev=device_put_process_local(dft,NamedSharding(mesh,P()))
+        delta=qp_frame_delta_h_dft(U_dev,qp_dev,dft_dev,mesh=mesh)
+    delta=np.asarray(gather_to_host(delta))
+    qp_delta_error=float(np.linalg.norm(delta[:,:5,:5]-expected)/np.linalg.norm(expected))
+    assert qp_delta_error<5e-12,qp_delta_error
+    assert np.max(np.abs(delta[:,5:]))==0
+    assert np.max(np.abs(delta[:,:,5:]))==0
     for bispinor in (False, True):
         meta = Meta.from_system(w, sym, nval=1, ncond=6, nband=7,
                                 n_rmu=1, bispinor=bispinor)
@@ -103,8 +129,14 @@ def main():
             spin_reference=np.einsum('asr,s,bsr->ab',legacy.conj(),
                                     spin_weights,legacy,optimize=True)
             with mesh:
-                spin_projection=project_galerkin_spin_operator(source,basis,meta,mesh,
-                    spin_operator=np.asarray(physical_spin),q_tile_budget=4096)
+                if bispinor:
+                    pauli_meta=replace(meta,nspinor=2,npol=1)
+                    pauli_basis=replace(basis,basis_at_nodes=b[:,:2])
+                    spin_projection=project_lifted_galerkin_dirac_spin(
+                        source,pauli_basis,pauli_meta,mesh,component=2,q_tile_budget=4096)
+                else:
+                    spin_projection=project_galerkin_spin_operator(source,basis,meta,mesh,
+                        spin_operator=np.asarray(physical_spin),q_tile_budget=4096)
             spin_got=np.asarray(gather_to_host(spin_projection.operator))
             spin_error=float(np.linalg.norm(spin_got-spin_reference)/
                              np.linalg.norm(spin_reference))
@@ -121,6 +153,7 @@ def main():
                 basis_relative_error=rel,operator_relative_error=error,
                 metric_relative_error=norm_error,source_calls=source_calls,
                 physical_spin_relative_error=spin_error,
+                qp_frame_delta_relative_error=qp_delta_error,
                 wall_seconds=time.monotonic()-start)
             receipts.append(row)
             rank0_print(json.dumps(row),flush=True)

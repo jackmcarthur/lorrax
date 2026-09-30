@@ -55,6 +55,7 @@ __all__ = [
     "plan_galerkin_stream",
     "plan_galerkin_operator_stream",
     "project_galerkin_spin_operator",
+    "project_lifted_galerkin_dirac_spin",
     "project_galerkin_spin_z",
     "read_galerkin_basis",
     "rotate_galerkin_operator",
@@ -1860,6 +1861,36 @@ def project_galerkin_spin_z(
     return project_galerkin_spin_operator(
         source, basis, meta, mesh_xy,
         spin_operator=0.5 * sigma_z, q_tile_budget=q_tile_budget)
+
+
+def project_lifted_galerkin_dirac_spin(
+        source, basis: GalerkinBasis, meta, mesh_xy: Mesh, *,
+        component: int, q_tile_budget: int) -> GalerkinOperatorProjection:
+    """Project physical Dirac spin in an incumbent Pauli fit's coordinates.
+
+    Htransform keeps its canonical two-component one-particle basis ``B``.
+    The supplied four-component WFN source applies the native kinetic-balance
+    lift ``T`` to those same selected full-Bloch states. Linearity gives
+    ``T B = L^-1 T Psi_selected``, with the incumbent selection factor ``L``;
+    no second fit or QP rotation of the physical basis occurs. Return
+    ``(T B)^H S_i (T B)`` and ``(T B)^H (T B)`` through the existing stream.
+    Path states retain the incumbent coordinates and use the returned full
+    carrier metric, including the small components, for their expectation.
+    Every large slab and operator face remains distributed on all ranks.
+    """
+    if (int(meta.nspinor) != 2 or int(basis.basis_at_nodes.shape[1]) != 2
+            or not bool(source.bispinor) or int(source.meta.nspinor) != 4):
+        raise ValueError('Lifted Dirac spin requires a Pauli fit and a four-component source')
+    for field in ('nk_tot', 'n_rtot', 'fft_grid'):
+        if not np.array_equal(getattr(source.meta, field), getattr(meta, field)):
+            raise ValueError(f'Lifted source and Pauli fit disagree on {field}')
+    if int(component) not in (0, 1, 2):
+        raise ValueError('Dirac spin component must be 0, 1 or 2')
+    from common.gamma_matrices import dirac_spin_x, dirac_spin_y, dirac_spin_z
+    operator = (dirac_spin_x, dirac_spin_y, dirac_spin_z)[int(component)]
+    return project_galerkin_spin_operator(
+        source, basis, source.meta, mesh_xy,
+        spin_operator=np.asarray(operator), q_tile_budget=q_tile_budget)
 
 
 def rotate_galerkin_operator(
