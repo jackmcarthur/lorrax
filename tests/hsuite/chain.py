@@ -91,7 +91,29 @@ FAILURE_SIGNATURES = (
     "out of memory",
     "MPI_Abort",
     "TIMED OUT",
+    "[EXC] ",            # an exception passed a stage timer (caught or not)
 )
+# A refusal carried by an exception (``ValueError: GATE name: ...``), caught
+# or not.  A bare ``GATE name`` line is not a failure: several stages log
+# declined options by gate name (the dipole's parallel-transport artifact,
+# the na_sc head's zeroed Sigma term).
+REFUSAL = re.compile(r"\w+(?:Error|Exception): GATE \w+")
+# A GATE name logged on rank r > 0 that rank 0's log of the same stage does
+# not show is rank-divergent, and a failure.
+GATE_NAME = re.compile(r"GATE (\w+)")
+# How long a failed rank waits for the others at the stage-end join.  Ranks
+# that refuse together arrive within seconds; a rank that fails alone leaves
+# the others in a collective, and then reports its own record and exits.
+FAIL_JOIN_S = 60
+# Test-only hook, never read by src: HSUITE_INJECT_REFUSAL="stage:rank" makes
+# that rank raise a GATE refusal after the stage's driver returns (the others
+# join); "stage:rank:before" raises before the driver runs (the others are
+# left in a collective).  Gate for the harness itself.
+INJECT = os.environ.get("HSUITE_INJECT_REFUSAL", "")
+# Set when a failed rank could not join the others: the process must then
+# end with os._exit after pytest's report (conftest.pytest_unconfigure), since
+# a normal exit waits on peers blocked in a collective.
+LONE_FAILURE = False
 
 # nval = 3: every occupied band of the H2⁻ fixture, which htransform requires
 # (it refuses a window that omits one) and every restarted stage must share.
@@ -428,15 +450,27 @@ def _release_devices():
     gc.collect()
 
 
+def _injected(name, rank, when):
+    stage, _, rest = INJECT.partition(":")
+    target, _, moment = rest.partition(":")
+    if stage == name and target == str(rank) and (moment or "after") == when:
+        raise ValueError(f"GATE hsuite_injected_refusal: got: HSUITE_INJECT_REFUSAL="
+                         f"{INJECT!r} on rank {rank}; want: unset; why: harness test")
+
+
 def run_stage(run, name, module, argv, env, timeout):
     """Run one driver's entry point in this process on every rank.
 
     One runtime per rank for the whole chain: one jax.distributed world,
     one FFI load, one compile cache.  The driver's stdout/stderr (Python
-    and native) go to ``<name>.rank<r>.log``.  A driver that fails on one
-    rank would leave the others in a collective, so a failure exits the
-    process at once and srun ends the step.
+    and native) go to ``<name>.rank<r>.log``.  Every rank then scans its own
+    log and joins the others with a record (rc, failure signatures, GATE
+    names, and the log tail on a failure); the return value is every rank's
+    record, the same list on every rank.  A failed rank waits FAIL_JOIN_S at
+    most: if the others are left in a collective, it returns its own record
+    alone and sets LONE_FAILURE.
     """
+    global LONE_FAILURE
     import importlib
     import inspect
     import traceback
@@ -462,8 +496,10 @@ def run_stage(run, name, module, argv, env, timeout):
         sys.argv = [module, *argv]
         main = importlib.import_module(module).main
         try:
+            _injected(name, rank, "before")
             ret = main(argv) if inspect.signature(main).parameters else main()
             rc = int(ret or 0)
+            _injected(name, rank, "after")
         except SystemExit as exc:
             rc = exc.code if isinstance(exc.code, int) else int(exc.code is not None)
         except BaseException:                                  # noqa: BLE001
@@ -479,20 +515,55 @@ def run_stage(run, name, module, argv, env, timeout):
         stream.close()
         os.chdir(cwd)
         sys.argv = saved_argv
-    if rc != 0:
+    record = rank_record(log, name, rank, rc)
+    failed = bool(rc or record["hits"])
+    if failed:
+        # pytest's capture holds this until the report, which prints it.
         print(f"hsuite FAIL {name}: rc={rc} on rank {rank}; see {log}", flush=True)
-        os._exit(rc)
     _release_devices()
-    rcs = rank_session.exchange(rc)
-    return all(r == 0 for r in rcs), rcs, time.monotonic() - t0
+    try:
+        records = rank_session.exchange(
+            record, **({"timeout": FAIL_JOIN_S} if failed else {}))
+    except (TimeoutError, OSError) as exc:
+        if not failed:
+            raise
+        LONE_FAILURE = True
+        record["hits"].append(f"the other ranks did not join within {FAIL_JOIN_S} s "
+                              f"(left in a collective?): {exc!r}")
+        records = [record]
+    return records, time.monotonic() - t0
 
 
-def signatures(run, name):
-    hits = []
-    for log in sorted(run.glob(f"{name}.rank*.log")):
-        text = log.read_text(errors="replace")
-        hits += [f"{log.name}: {sig}" for sig in FAILURE_SIGNATURES if sig in text]
-    return hits
+def rank_record(log, name, rank, rc):
+    """One rank's verdict on its own stage log: signatures, GATE names, tail."""
+    text = log.read_text(errors="replace")
+    hits = [sig for sig in FAILURE_SIGNATURES if sig in text]
+    hits += sorted(set(REFUSAL.findall(text)))
+    tail = ""
+    if rc or hits:
+        tail = "\n".join(text.splitlines()[-60:])
+    return {"stage": name, "rank": rank, "rc": rc, "hits": hits,
+            "gates": sorted(set(GATE_NAME.findall(text))), "tail": tail}
+
+
+def stage_verdict(name, records):
+    """Problems from every rank's record of one stage (same on every rank)."""
+    problems = []
+    count = rank_session._resolve_proc_count()
+    joined = {rec["rank"] for rec in records}
+    if len(joined) < count:
+        problems.append(f"{name}: ranks {sorted(set(range(count)) - joined)} "
+                        "did not report")
+    lead_gates = set(next((rec["gates"] for rec in records if rec["rank"] == 0), ()))
+    for rec in records:
+        divergent = [g for g in rec["gates"] if g not in lead_gates]
+        if rec["rank"] and divergent and 0 in joined:
+            rec["hits"].append(f"GATE {divergent} absent from rank 0")
+        if rec["rc"] or rec["hits"]:
+            problems.append(f"{name}: rank {rec['rank']} failed: rc={rec['rc']} "
+                            f"{rec['hits'][:4]}\n--- {name}.rank{rec['rank']}.log "
+                            f"(tail) ---\n{rec['tail']}")
+    return problems
 
 
 def missing_lines(run, name):
@@ -638,7 +709,7 @@ def run_chain(out, *, regenerate=False, cache_dir=None, timeout=600,
         cache_dir.mkdir(parents=True, exist_ok=True)
     rank_session.exchange("staged")
     env = _env(cache_dir)
-    walls, problems = {}, []
+    walls, problems, ranks = {}, [], {}
     t_all = time.monotonic()
     for name, module, argv in STAGES:
         if only and name not in only:
@@ -652,11 +723,14 @@ def run_chain(out, *, regenerate=False, cache_dir=None, timeout=600,
             for rel in _CLEAR_BEFORE.get(name, ()):
                 shutil.rmtree(run / rel, ignore_errors=True)
         rank_session.exchange(name)
-        ok, rcs, walls[name] = run_stage(where, name, module, argv, env, timeout)
-        hits = signatures(where, name) if lead else []
-        # One verdict for every rank: a rank that walks on alone hangs.
-        if rank_session.exchange(not ok or bool(hits))[0]:
-            problems.append(f"{name}: rc={rcs} {hits[:4]}")
+        records, walls[name] = run_stage(where, name, module, argv, env, timeout)
+        ranks[name] = [{k: rec[k] for k in ("rank", "rc", "hits", "gates")}
+                       for rec in records]
+        # One verdict for every rank (every rank holds the same records): a
+        # rank that walks on alone hangs.
+        failed = stage_verdict(name, records)
+        if failed:
+            problems += failed
             break
         if not lead:
             continue
@@ -688,11 +762,16 @@ def run_chain(out, *, regenerate=False, cache_dir=None, timeout=600,
             continue
         problems += compare(name, got, ref)
     walls["total"] = time.monotonic() - t_all
+    summary = {"walls_s": walls, "problems": problems, "regenerate": regenerate,
+               "ranks": rank_session._resolve_proc_count(),
+               "rank_records": ranks, "cache_dir": str(cache_dir)}
+    if LONE_FAILURE:
+        # The others are blocked in a collective: no final join.
+        rank = rank_session._resolve_proc_id()
+        (out / f"summary.rank{rank}.json").write_text(json.dumps(summary, indent=1))
+        return walls, problems
     if lead:
-        (out / "summary.json").write_text(json.dumps(
-            {"walls_s": walls, "problems": problems, "regenerate": regenerate,
-             "ranks": rank_session._resolve_proc_count(),
-             "cache_dir": str(cache_dir)}, indent=1))
+        (out / "summary.json").write_text(json.dumps(summary, indent=1))
         if regenerate:
             (REFERENCE / "walls.json").write_text(json.dumps(walls, indent=1))
     return walls, rank_session.exchange(problems)[0]
@@ -711,7 +790,7 @@ def main(argv=None):
     args = parser.parse_args(argv)
     walls, problems = run_chain(args.out, regenerate=args.regenerate,
                                 cache_dir=args.cache_dir, only=args.only)
-    if rank_session._resolve_proc_id() != 0:
+    if rank_session._resolve_proc_id() != 0 and not LONE_FAILURE:
         return 0 if not problems else 1
     for name, wall in walls.items():
         print(f"hsuite {name:16s} {wall:7.1f} s")
@@ -721,5 +800,15 @@ def main(argv=None):
     return 0 if not problems else 1
 
 
+def _cli():
+    rc = main()
+    if LONE_FAILURE:
+        # Peers are blocked in a collective: a normal exit would wait on them.
+        sys.stdout.flush()
+        sys.stderr.flush()
+        os._exit(rc or 1)
+    return rc
+
+
 if __name__ == "__main__":
-    raise SystemExit(main())
+    raise SystemExit(_cli())

@@ -77,10 +77,22 @@ map-1 Σ window re-plan.
 
 Every stage is then checked on its outputs, not its exit code: the
 eqp0/eqp1 columns, every numeric member of the h5 files it writes, and its
-eigenvalue tables, against `reference/`. Every rank log is also scanned for
-failure signatures (`chain.FAILURE_SIGNATURES`). Tolerances are in
-`chain.ATOL`. A driver that fails on one rank exits its process, so srun
-ends the step instead of leaving the other ranks in a collective.
+eigenvalue tables, against `reference/`. Tolerances are in `chain.ATOL`.
+
+Every rank scans its own stage log for failure signatures
+(`chain.FAILURE_SIGNATURES`, and a GATE refusal carried by an exception,
+`chain.REFUSAL`) and joins the others with its exit status, hits, GATE
+names and, on a failure, the log's last 60 lines. A GATE name that a rank
+r > 0 logs and rank 0 does not is a failure too. Any failed rank fails the
+test on every rank; the assertion names the stage and rank and carries the
+log tail, which pytest prints. `summary.json` holds every rank's records
+(`rank_records`). A failed rank waits `chain.FAIL_JOIN_S` for the others;
+if they are blocked in a collective it writes `summary.rank<r>.json`, fails
+alone, and `conftest.py` ends the process with `os._exit` after pytest's
+report, so srun ends the step. The per-rank stage logs stay in
+`run/<stage>.rank<r>.log`. `HSUITE_INJECT_REFUSAL=stage:rank[:before]` (test
+only) makes one rank refuse after (or before) a stage's driver, to check
+this path.
 
 Not covered:
 - GN-PPM through the SC driver: the shared-pole stages are the SC runs;

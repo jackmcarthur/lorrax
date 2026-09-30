@@ -30,4 +30,9 @@ def test_driver_chain_matches_references():
                  or rank_session.ROOT / "jax-cache")
     walls, problems = chain.run_chain(out, cache_dir=cache)
     print("hsuite walls (s):", {k: round(v, 1) for k, v in walls.items()})
-    assert not problems, "\n".join(problems)
+    # Every rank holds every rank's problems (rank, stage, log tail); rank 0,
+    # or a rank that failed alone, prints them in full, the others one line
+    # each.
+    full = rank_session._resolve_proc_id() == 0 or chain.LONE_FAILURE
+    assert not problems, (f"hsuite failed, run {out}\n" + "\n".join(
+        problems if full else [p.splitlines()[0] for p in problems]))
