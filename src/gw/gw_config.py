@@ -1097,7 +1097,7 @@ _DEFAULTS = {
     # p-matrix velocity stage only, without the links.
     # ``interband_commutator`` (insulators) adds [DeltaH, W] to that
     # velocity, W_ml = v_ml/(E_m - E_l): no links, any k grid.
-    "sc_head_update": "off",       # off | parallel_transport | dft_velocity | interband_commutator
+    "sc_head_update": "off",       # off | parallel_transport | dft_velocity | interband_commutator; unnamed -> parallel_transport where links exist (_apply_input_envelope)
     "parallel_transport_file": "parallel_transport.h5",
     # Optional Hall (Chern-Simons) artifact for the packed static photon
     # Gamma-cell completion.  EMPTY BY DEFAULT (lane J section 2, item 9):
@@ -2871,6 +2871,27 @@ def _apply_input_envelope(
             "  [config provenance] WARNING density_self_consistent = false: "
             "V_H stays at the DFT density on every map (comparison mode, "
             "not production QSGW)")
+    # The QSGW head follows the owner's velocity rule wherever links exist
+    # (owner 2026-09-29): v = U^dagger (p + i[r, V_NL] + i[r, DeltaSigma]) U,
+    # the last term from the parallel-transport covariant derivative of this
+    # map's DeltaH.  An unnamed sc_head_update takes parallel_transport when
+    # the artifact is present on a route that consumes it; otherwise off.
+    if (resolved.qp_solver is QPSolver.SELF_CONSISTENT
+            and "sc_head_update" not in _named_keys
+            and resolved.sc.head_update == "off"
+            and not bool(resolved.bispinor) and bool(resolved.do_G0)
+            and resolved.sigma.w_model == "shared_pole"
+            and resolved.head.correction in (
+                HeadCorrection.NO_LOCAL_FIELDS, HeadCorrection.FULL)
+            and resolved.paths.parallel_transport_file
+            and os.path.isfile(resolved.paths.parallel_transport_file)):
+        resolved = _dc_replace(resolved, sc=_dc_replace(
+            resolved.sc, head_update="parallel_transport"))
+        print_fn(
+            "  [config provenance] sc_head_update was not named and "
+            f"{resolved.paths.parallel_transport_file} exists; using "
+            "parallel_transport (per-map QSGW velocity with the "
+            "covariant i[DeltaH, r])")
     if "restart" not in _named_keys:
         print_fn(
             "  [config provenance] restart was not named; using the "
@@ -4378,11 +4399,20 @@ def uses_metal_direct_drude_head(config) -> bool:
     2026-09-25: full on time-reversal-even metals on the frozen and the
     per-map routes); an ordered (time-reversal-broken) store still refuses
     it at the head (``GATE shared_pole_head_ordered``).
+
+    ``parallel_transport`` is admitted on scalar decks: the same head on
+    the QSGW velocity ``U^dagger (v_DFT + D_k DeltaH) U``, whose finite-link
+    covariant derivative carries ``i[DeltaH, r]`` at this map, so the Drude
+    term sees the QP Fermi velocity.  The four-current bank reads the dipole
+    only (``GATE full_shared_pole_head_update``).
     """
     if not (config.qp_solver is QPSolver.SELF_CONSISTENT
-            and config.sc.head_update == "dft_velocity"
+            and config.sc.head_update in METAL_HEAD_UPDATES
             and config.sigma.w_model == "shared_pole"):
         return False
+    if config.sc.head_update == "parallel_transport":
+        return not config.bispinor and config.head.correction in (
+            HeadCorrection.NO_LOCAL_FIELDS, HeadCorrection.FULL)
     if config.head.correction is HeadCorrection.NO_LOCAL_FIELDS:
         return (not config.bispinor or uses_bare_transverse_shared_pole(config)
                 or uses_full_bispinor_shared_pole(config))
@@ -4617,8 +4647,8 @@ def validate_material_inputs(config, material_class):
                 "  got:  fractional occupations with the interband-commutator "
                 "head\n"
                 "  want: an insulator, or sc_head_update = off / "
-                "dft_velocity (shared_pole + no_local_fields direct Drude "
-                "head) on a metal\n"
+                "dft_velocity / parallel_transport (shared_pole direct "
+                "Drude head) on a metal\n"
                 "  why:  the route builds the QSGW velocity from interband "
                 "position elements r_ml = -i v_ml/(E_m - E_l) only; the "
                 "intraband change d_k DeltaH_nn that the Fermi-surface "
@@ -4636,10 +4666,11 @@ def validate_material_inputs(config, material_class):
                 "static head)\n"
                 "  want: sc_head_update = off, or dft_velocity with "
                 "shared_pole and no_local_fields (direct Drude head) or full "
-                "(scalar decks)\n"
-                "  why:  parallel_transport links do not follow a Fermi "
-                "surface whose occupations change every map, and a folded "
-                "bispinor metal head has no derived completion\n"
+                "(scalar decks), or parallel_transport on a scalar "
+                "shared_pole deck\n"
+                "  why:  a folded bispinor metal head has no derived "
+                "completion, and the four-current head reads the dipole "
+                "velocity only\n"
                 "  doc:  docs/self_consistency.md, 'Metals: direct Drude head'")
         if width_ry is None:
             raise ValueError(
