@@ -264,6 +264,29 @@ class CentroidKUnfoldPlan:
         _DIRAC_HALVES[id(self)] = (self, out)
         return out
 
+    def dirac_quarter_load_tables(self, h, g, right_plan=None):
+        """Typed load of the Dirac Green quarter ``(h,g)``, with its parity.
+
+        The native bispinor action is diag(U,pU).  A two-spinor convolution
+        therefore loads quarter G_hg with p^(h+g) on both unitary and
+        antiunitary rows.  Absorb the real sign into the left endpoint phase;
+        it neither conjugates the causal Green nor changes its partner arm.
+        """
+        if h not in (0, 1) or g not in (0, 1):
+            raise ValueError('GATE dirac_quarter: half indices must be 0 or 1')
+        right = self if right_plan is None else right_plan
+        half, parity = self.dirac_halves()
+        right_half, right_parity = right.dirac_halves()
+        if (not np.array_equal(self.irr_idx, right.irr_idx)
+                or not np.array_equal(self.sym_idx, right.sym_idx)
+                or not np.array_equal(parity, right_parity)
+                or not np.allclose(half.spin_action_full, right_half.spin_action_full,
+                                   rtol=0, atol=1e-12)):
+            raise ValueError('GATE dirac_quarter: endpoints have different k/spin actions')
+        tables = half.unfold_load_tables(None if right is self else right_half)
+        return tables._replace(mph=_readonly(
+            tables.mph * (parity[:, None] if h != g else 1), np.complex128))
+
     @staticmethod
     def transport_classes(values, local_perm, *, class_axis, mu_axis,
                           mesh_axis, mix=None, mix_axis=None):

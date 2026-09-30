@@ -163,6 +163,25 @@ def gamma_perm_phase_host(mu_lorentz: int) -> tuple[_np.ndarray, _np.ndarray]:
     return perm.copy(), phase.copy()
 
 
+def gamma_projector_half(X, vertex: int, half: int, *, axis: int):
+    """Projector face for one input-spin half of ``gamma_A G gamma_B†``.
+
+    Gamma is fixed monomial.  Moving its action from G to either projector
+    reads output rows a=perm^-1(c) and multiplies psi[a] by conj(phase[a]).
+    Thus conj(left) G right retains every phase, including alpha_y's ±i,
+    without materializing a four-spinor operator or dropping cross halves.
+    """
+    if X.shape[axis] != 4 or (isinstance(half, int) and half not in (0, 1)):
+        raise ValueError('GATE gamma_projector_half: expected four spinors and half 0 or 1')
+    inverse = _np.stack([_np.argsort(perm) for perm, _ in _perm_phase])
+    phases = _np.stack([phase for _, phase in _perm_phase])
+    rows = jnp.take(jnp.asarray(inverse), vertex, axis=0)[2 * half + jnp.arange(2)]
+    phase = jnp.take(jnp.asarray(phases), vertex, axis=0)[rows]
+    shape = [1] * X.ndim
+    shape[axis] = 2
+    return jnp.take(X, rows, axis=axis) * jnp.conj(phase).reshape(shape)
+
+
 def current_fit_terms(channel: int, basis_rows) -> tuple:
     """Channel ``c``'s Gram and Z as Σ w·U(γ̃^i at μ, γ̃^j at r): ``((w, i, j), ...)``.
 
