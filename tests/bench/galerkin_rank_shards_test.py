@@ -2,9 +2,9 @@
 from pathlib import Path
 import json
 import argparse
-import numpy as np
 from runtime import initialize_communicator_stack
 rt = initialize_communicator_stack(platform='gpu')
+import numpy as np
 import jax
 import jax.numpy as jnp
 from jax.sharding import NamedSharding, PartitionSpec as P
@@ -83,7 +83,11 @@ for bands in (184,198):
     assert m.temp_size_in_bytes<3.1*local+2*2520*2520*16,(bands,m.temp_size_in_bytes)
     assert "all-gather" not in metrics.as_text()
     rows.append(dict(bands=bands,shape=shape,abstract_only=True,argument_bytes=mem.argument_size_in_bytes,output_bytes=mem.output_size_in_bytes,alias_bytes=mem.alias_size_in_bytes,temp_bytes=mem.temp_size_in_bytes,metrics_temp_bytes=m.temp_size_in_bytes,full_C_bytes=local*4,P36_C_bytes=local*4//36,no_solve_all_gather=True))
+legacy=jax.jit(lambda C:C,out_shardings=rep).lower(abstract).compile()
+legacy_mem=legacy.memory_analysis()
+assert legacy_mem.output_size_in_bytes==local*4
+assert "all-gather" in legacy.as_text()
 if jax.process_index()==0:
     target=out/'result.json'
-    target.write_text(json.dumps(dict(parity_max_abs=err,rows=rows),indent=2)+'\n')
+    target.write_text(json.dumps(dict(parity_max_abs=err,rows=rows,replicated_negative_output_bytes=legacy_mem.output_size_in_bytes),indent=2)+'\n')
     print('GALERKIN RANK SHARDS PASS',json.dumps(rows),flush=True)
