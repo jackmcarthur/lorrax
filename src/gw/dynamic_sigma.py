@@ -386,8 +386,10 @@ def write_sigma_omega(
         # them (file_io.sigma_output.DeferredArray): Na 8^3 at 1001 omega
         # held the Ry cube and both eV cubes at once, 3 x 14.12 GiB per rank.
         # With star tables the file keeps k_irr rows, so each eV cube is
-        # read as its star-spread ω slice and its retained rows only, made
-        # from the Ry cube's same elements; the full eV cube is never made.
+        # read as its star-spread ω slice and its retained rows only; a
+        # full-BZ file is converted and written ω slab by ω slab.  Either
+        # way the values come from the Ry cube's same elements and no full
+        # eV cube is made.
         from file_io.sigma_output import DeferredArray
         total_fn, c_fn = _ev_tensor_fns(shd)
         shape = tuple(sigma_c_omega.shape)
@@ -400,11 +402,11 @@ def write_sigma_omega(
 
         total_ev = DeferredArray(
             shape, lambda: total_fn(c_ry, x_ry, h_ev),
-            omega_slab=lambda i: total_fn(c_ry[i:i + 1], x_ry, h_ev)[0],
+            omega_range=lambda lo, hi: total_fn(c_ry[lo:hi], x_ry, h_ev),
             take_rows=lambda rows: total_fn(*_rows(rows)))
         sigma_c_ev = DeferredArray(
             shape, lambda: c_fn(c_ry),
-            omega_slab=lambda i: c_fn(c_ry[i:i + 1])[0],
+            omega_range=lambda lo, hi: c_fn(c_ry[lo:hi]),
             take_rows=lambda rows: c_fn(_rows(rows)[0]))
         write_sigma_omega_h5(
             out_path, config.omega_grid_ev, total_ev,

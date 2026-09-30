@@ -1093,35 +1093,60 @@ class DeferredArray:
 	"""A Σ(ω) dataset produced when it is read: ``shape`` now, values later.
 
 	``materialize()`` makes the whole array.  A producer that can also make
-	one ω slice (``omega_slab``) and the k rows the file keeps
-	(``take_rows``) serves :func:`extract_and_stamp_k_irr` without the whole
-	array ever existing: the star-spread measure reads ``values[omega_index]``
-	and the selection is ``values.take(rows, axis=1)``, each the same numbers
-	element for element as the whole array would give.
+	a range of ω (``omega_range(lo, hi)``) and the k rows the file keeps
+	(``take_rows``) is never made whole: :func:`extract_and_stamp_k_irr`
+	measures the star spread on ``values[omega_index]`` and selects
+	``values.take(rows, axis=1)``, and a full-BZ file (no star tables) is
+	written ω slab by ω slab (:func:`_write_omega_cube`).  Each read is the
+	same numbers, element for element, as the whole array would give.
 	"""
 
-	def __init__(self, shape, produce, *, omega_slab=None, take_rows=None):
+	def __init__(self, shape, produce, *, omega_range=None, take_rows=None):
 		self.shape = tuple(int(n) for n in shape)
 		self._produce = produce
-		self._omega_slab = omega_slab
+		self.omega_range = omega_range
 		self._take_rows = take_rows
 
 	def materialize(self):
 		return self._produce()
 
 	def __getitem__(self, index):
-		if self._omega_slab is not None and isinstance(index, (int, np.integer)):
-			return self._omega_slab(int(index))
+		if self.omega_range is not None and isinstance(index, (int, np.integer)):
+			return self.omega_range(int(index), int(index) + 1)[0]
 		return self.materialize()[index]
 
 	def take(self, rows, axis=0):
+		rows = np.asarray(rows)
+		if axis == 1 and np.array_equal(rows, np.arange(self.shape[1])):
+			# Every k row kept in order (a WFN without symmetry): the
+			# selection is the identity, so the array stays deferred and is
+			# written slab by slab.
+			return self
 		if self._take_rows is not None and axis == 1:
-			return self._take_rows(np.asarray(rows))
-		return self.materialize().take(np.asarray(rows), axis=axis)
+			return self._take_rows(rows)
+		return self.materialize().take(rows, axis=axis)
 
 
 def _materialize(arr):
 	return arr.materialize() if isinstance(arr, DeferredArray) else arr
+
+
+#: ω slabs per streamed cube write.  SlabIO keeps at most two queued writes
+#: and one in flight, so three slabs of a cube are ever resident.
+_OMEGA_WRITE_SLABS = 16
+
+
+def _write_omega_cube(io, name, arr):
+	"""Write a (n_omega, nk, nb, nb) dataset; a DeferredArray that can make an
+	ω range is converted and written slab by slab at its ω offset."""
+	if not (isinstance(arr, DeferredArray) and arr.omega_range is not None):
+		io.write_slab(name, _materialize(arr))
+		return
+	n_omega = int(arr.shape[0])
+	step = -(-n_omega // _OMEGA_WRITE_SLABS)
+	for lo in range(0, n_omega, step):
+		hi = min(n_omega, lo + step)
+		io.write_slab(name, arr.omega_range(lo, hi), offset=(lo, 0, 0, 0))
 
 
 def extract_and_stamp_k_irr(
@@ -1650,13 +1675,13 @@ def write_sigma_omega_h5(
 		io.create_dataset("sigma_total_kij_ev",
 			shape=storage_shape, dtype=np.complex128,
 			attrs=_operator_attrs("sigma_total_kij_ev"))
-		io.write_slab("sigma_total_kij_ev", _materialize(total))
+		_write_omega_cube(io, "sigma_total_kij_ev", total)
 		del total
 		if sigma_c_kij_ev is not None:
 			io.create_dataset("sigma_c_kij_ev",
 				shape=storage_shape, dtype=np.complex128,
 				attrs=_operator_attrs("sigma_c_kij_ev"))
-			io.write_slab("sigma_c_kij_ev", _materialize(sigma_c_kij_ev))
+			_write_omega_cube(io, "sigma_c_kij_ev", sigma_c_kij_ev)
 		if sigma_sx_kij_ev is not None:
 			io.create_dataset("sigma_sx_kij_ev",
 				shape=_operator_storage_shape(sigma_sx_kij_ev),
