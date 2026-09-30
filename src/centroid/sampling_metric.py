@@ -88,7 +88,7 @@ def _validated_range(band_range, nbands: int, name: str) -> tuple[int, int]:
     return lo, hi
 
 
-def _quadrature_tables(wfn, sym):
+def _quadrature_tables(wfn, sym, *, k_stride: int = 1):
     """Return authenticated star rows, their weights and the full-BZ quadrature.
 
     Two WFN k storages reach this function and they normalise DIFFERENTLY.
@@ -184,22 +184,42 @@ def _quadrature_tables(wfn, sym):
             "expanded full-BZ quadrature weights do not sum to one: "
             f"sum={full_weights.sum():.17g}")
 
+    stride = int(k_stride)
+    grid = np.asarray(wfn.kgrid, dtype=np.int64)
+    if stride < 1 or np.any(grid % stride):
+        raise ValueError("centroid k stride must be positive and divide every k-grid dimension")
+    if stride != 1:
+        # The symmetry owner authenticates these integer grid coordinates;
+        # select by coordinates, never by stored/IBZ row ordering.
+        coords = np.asarray(sym.kvecs_asints, dtype=np.int64)
+        if coords.shape != (nk_full, 3):
+            raise ValueError("centroid quadrature requires authenticated full-grid coordinates")
+        selected = np.all(coords % stride == 0, axis=1)
+        if int(selected.sum()) != int(np.prod(grid // stride)):
+            raise ValueError("centroid k stride does not select a complete uniform subgrid")
+        full_weights[~selected] = 0.0
+        selected_weight = float(full_weights.sum())
+        if selected_weight <= 0.0:
+            raise ValueError("centroid k subgrid has zero quadrature weight")
+        full_weights /= selected_weight
+        parents_used = np.unique(parent_for_k[full_weights > 0])
+
     star_plan = {}
     for parent in parents_used:
-        member_rows = np.flatnonzero(parent_for_k == parent)
+        member_rows = np.flatnonzero((parent_for_k == parent) & (full_weights > 0))
         star_plan[int(parent)] = (
             np.asarray(sym_row_for_k[member_rows], dtype=np.int32),
             np.asarray(full_weights[member_rows], dtype=np.float64))
     return parents_used, star_plan, full_weights
 
 
-def full_k_quadrature_weights(wfn, sym) -> np.ndarray:
+def full_k_quadrature_weights(wfn, sym, *, k_stride: int = 1) -> np.ndarray:
     """Normalised full-BZ quadrature weight of every unfolded k point.
 
     IBZ storage spreads each parent weight uniformly over its star; full-BZ
     storage passes the stored weights through.  See :func:`_quadrature_tables`.
     """
-    return _quadrature_tables(wfn, sym)[2].copy()
+    return _quadrature_tables(wfn, sym, k_stride=k_stride)[2].copy()
 
 
 def _metric_chunk_plan(
@@ -257,6 +277,7 @@ def build_feature_metric_diagonal(
     gamma_mode: str,
     dist_mesh=None,
     verbose: bool = True,
+    k_stride: int = 1,
 ):
     """Build the q=0 feature-Gram diagonal on the WFN FFT grid.
 
@@ -313,7 +334,7 @@ def build_feature_metric_diagonal(
             f"WFN cell volume must be finite and positive, got {cell_volume}")
     ns = 4 if mode == "transverse" else int(wfn.nspinor)
 
-    parents_used, star_plan, _ = _quadrature_tables(wfn, sym)
+    parents_used, star_plan, _ = _quadrature_tables(wfn, sym, k_stride=k_stride)
 
     rank, world = process_rank_world()
     if world > 1 and dist_mesh is None:
