@@ -49,6 +49,7 @@ __all__ = [
     "reduced_covector_to_cartesian",
     "rotate_velocity_active_to_qp",
     "rotate_velocity_to_qp",
+    "qp_frame_delta_h_dft",
     "report_trs_velocity_parity",
     "trs_velocity_parity_residual",
 ]
@@ -1093,6 +1094,48 @@ def _rotation_kernel(mesh: Mesh) -> Callable:
 def rotate_velocity_to_qp(velocity_cart, U_dft_to_qp, *, mesh: Mesh):
     """Return ``U^dagger v_i U`` for all Cartesian components in one jit."""
     return _rotation_kernel(mesh)(velocity_cart, U_dft_to_qp)
+
+
+def qp_frame_delta_h_dft(U_mnk, E_qp_kn, E_dft_kn, *, mesh: Mesh):
+    """Return ``U diag(E_QP) U^H - diag(E_DFT)`` in the DFT frame.
+
+    Authenticated full-BZ rotations have shape ``(nk, carrier, carrier)``
+    at ``P(None,'x','y')``. The two energy tables are ``(nk, logical)`` in
+    Rydberg; synthetic rotation rows/columns and energy padding are zero.
+    This is the active correction used by post-SC covariant velocities;
+    :func:`assemble_delta_head_manifold` supplies the diagonal SC tail.
+    The shared two-sided band contraction owns both products. Every
+    matrix remains distributed on all ranks; spectra cost ``O(nk*logical)``
+    and matrix work/storage cost ``O(nk*carrier^3/P)``/``O(nk*carrier^2/P)``.
+    """
+    if (U_mnk.ndim != 3 or U_mnk.shape[-1] != U_mnk.shape[-2]
+            or E_qp_kn.ndim != 2 or E_qp_kn.shape != E_dft_kn.shape
+            or E_qp_kn.shape[0] != U_mnk.shape[0]
+            or not 0 < E_qp_kn.shape[1] <= U_mnk.shape[-1]):
+        raise ValueError('QP rotations and active energy tables disagree')
+    face = NamedSharding(mesh, P(None, 'x', 'y'))
+    if not isinstance(U_mnk, jax.core.Tracer):
+        sharding = getattr(U_mnk, 'sharding', None)
+        if sharding is None or not sharding.is_equivalent_to(face, 3):
+            raise ValueError('QP rotations must be distributed at P(None,x,y)')
+    key = ('qp_frame_delta_h', id(mesh), tuple(U_mnk.shape), tuple(E_qp_kn.shape))
+    kernel = _KERNEL_CACHE.get(key)
+    if kernel is None:
+        from runtime.padding import pad_axis
+        carrier = int(U_mnk.shape[-1])
+
+        @jax.jit(out_shardings=face)
+        def kernel(U, qp, dft):
+            qp = pad_axis(qp, carrier, axis=1).array
+            dft = pad_axis(dft, carrier, axis=1).array
+            diagonal = jnp.eye(carrier, dtype=jnp.complex128)[None]
+            U_h = jnp.swapaxes(jnp.conj(U), -1, -2)
+            H = rotate_velocity_to_qp(
+                (qp[..., None] * diagonal)[None], U_h, mesh=mesh)[0]
+            return H - dft[..., None] * diagonal
+
+        _KERNEL_CACHE[key] = kernel
+    return kernel(U_mnk, E_qp_kn, E_dft_kn)
 
 
 def rotate_velocity_active_to_qp(velocity_cart, U_active, *, mesh: Mesh):
