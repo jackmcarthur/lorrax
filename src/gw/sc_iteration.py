@@ -4705,7 +4705,7 @@ def _refuse_empty_map_output(e_output_kn_ev: np.ndarray, *,
 
 def _record_sc_verdict(inputs, verdict):
     """Log a map's verdict and hand its max|dE| to the held W line sites,
-    which move only past the iterate's own error (shared_pole_recipe
+    which move only past a tenth of the iterate's own error (shared_pole_recipe
     LINE_SITE_HOLD_EV)."""
     _record_sc(inputs, f"    SC convergence: {verdict.summary()}")
     if inputs.fixed_quadrature_session is not None:
