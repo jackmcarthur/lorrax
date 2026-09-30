@@ -65,9 +65,6 @@ def _zeros(mesh_xy, shape, spec=P(None, 'x', 'y')):
                    out_shardings=NamedSharding(mesh_xy, spec))
 
 
-#: Test hook: the largest Lorentz-block panel the instantaneous constant's
-#: class restore may choose (``None``: the ledger decides).
-_TEST_MAX_PANEL_BLOCKS = None
 #: Test hook: the largest parent-q panel the instantaneous constant is read
 #: and packed in (``None``: the ledger decides).
 _TEST_CONSTANT_Q_SPAN = None
@@ -494,17 +491,69 @@ def _set_q_rows(mesh_xy, spec=P(None, 'x', 'y')):
                    donate_argnums=0, out_shardings=NamedSharding(mesh_xy, spec))
 
 
+_CONSTANT_TABLES = {}
+
+
+def _constant_w_tables(plans, policy, lefts, rights, mesh_xy):
+    """The (W_inf - V) constant's q-unfold tables for one class, cached by content.
+
+    The restore the constant replaced (``gw.w_isdf.photon_blocks_full_q``)
+    unfolds each Lorentz block by the family plans' centroid maps on the TRS
+    policy's operation rows (the Hermitian ``conj`` rule) and then mixes the
+    blocks by the Lorentz action; these are the same tables with the Lorentz
+    action as the endpoint spin action.  The door reads them with the
+    pair-transpose rule and the partner conj(W), which is the conj rule.
+    """
+    from gw.photon_sigma import _policy_key
+    from symmetry_maps import unfold_load_tables, bgw_integer_q_to_fractional
+    key = (tuple(map(id, plans)), _policy_key(policy), tuple(lefts), tuple(rights),
+           tuple(d.id for d in np.asarray(mesh_xy.devices).flat))
+    hit = _CONSTANT_TABLES.get(key)
+    if hit is None:
+        left, right = plans
+        sym = left.sym
+        rows = np.asarray(policy.unfold_sym_idx, np.int32)
+        lorentz = np.asarray(sym.lorentz_action(rows), np.complex128)
+        act = lambda ids: np.ascontiguousarray(lorentz[:, list(ids)][:, :, list(ids)])
+        tables = unfold_load_tables(
+            irr_idx=np.asarray(sym.irr_idx_q, np.int32), sym_idx=rows, sym_perm=left.sym_perm,
+            L_table=left.L_table, k_irr_frac=bgw_integer_q_to_fractional(sym.q_irr_kgrid_int, policy.kgrid),
+            spin_action_full=act(lefts), n_sym_spatial=int(policy.n_sym_spatial), mesh_xy=mesh_xy,
+            logical_centroid_extent=left.n_centroid_packed, right_sym_perm=right.sym_perm,
+            right_L_table=right.L_table, trs_rule='pair_transpose', right_spin_action_full=act(rights),
+            right_logical_centroid_extent=right.n_centroid_packed)
+        hit = _CONSTANT_TABLES[key] = (plans, tables)
+    return hit[1]
+
+
+@lru_cache(maxsize=None)
+def _constant_class_parents(mesh_xy, layout, lefts, rights):
+    """``jit(packed -> (W, conj W))``: one class of the packed constant as ``(nq, m, nA, n, nB)``."""
+    from gw.photon_layout import photon_block_view
+    spec = NamedSharding(mesh_xy, P(None, 'x', None, 'y', None))
+
+    @jax.jit
+    def parents(packed):
+        W = jnp.stack([jnp.stack([photon_block_view(packed, layout, A, B, mesh_xy) for B in rights], axis=-1)
+                       for A in lefts], axis=2)
+        W = jax.lax.with_sharding_constraint(W, spec)
+        return W, jnp.conj(W)
+    return parents
+
+
 def instantaneous_sector_sigma(handle, families, bases, meta, mesh_xy, *,
                                occupation_state, return_components=False):
     """Exchange-like equal-time contraction of W_infinity-V, exactly once.
 
-    The constant is read and packed in parent-q panels, and each class is
-    restored and convolved in Lorentz-block panels, only when the whole does
-    not fit the ledger; a deck that fits takes one read and one call per class.
+    The constant is read and packed on its irreducible q (in parent-q panels
+    only when raw + packed do not fit the ledger); each endpoint class is its
+    parent pair ``(W, conj W)``, which the four-current door unfolds on its
+    load with the occupied Green (d = 1, one branch).  No full-q class operand
+    is formed.
     """
-    from gw.photon_layout import PhotonBasisLayout, photon_block_view, pack_photon_operator
-    from gw.photon_sigma import contract_lorentz_blocks, _TERM_X
-    from gw.cohsex_sigma import _resolve_Gij
+    from gw.photon_layout import PhotonBasisLayout, pack_photon_operator
+    from gw.photon_sigma import _make_photon_static_class_kernel
+    from gw.cohsex_sigma import _resolve_Gij, _occ_diag_full
     from gw.qgrid_symmetry import qgrid_trs_policy_from_shared_pole_store
     from file_io.shared_pole_store import read_bank_constant_header, read_bank_constant
     header=read_bank_constant_header(handle,mesh_xy=mesh_xy)
@@ -527,6 +576,7 @@ def instantaneous_sector_sigma(handle, families, bases, meta, mesh_xy, *,
         concurrent_with=ledger.live_stages)
     def packer(raw):
         def block(A,B):
+            from gw.photon_layout import photon_block_view
             value=photon_block_view(raw,raw_layout,A,B,mesh_xy)
             value=bases[bool(A)].pack_axis(value,1,spec=P(None,'x','y'))
             return bases[bool(B)].pack_axis(value,2,spec=P(None,'x','y'))
@@ -544,52 +594,40 @@ def instantaneous_sector_sigma(handle, families, bases, meta, mesh_xy, *,
             packed=_set_q_rows(mesh_xy)(packed,pack_photon_operator(packer(raw),hi-lo,layout,mesh_xy),lo)
             packed.block_until_ready()
             del raw
-    response=SimpleNamespace(V_packed=packed,W_packed=packed,layout=layout,
-        family_plans=tuple(f.green_parent.plan for f in families),head_completion=None,
-        qgrid_policy=qgrid_trs_policy_from_shared_pole_store(header,announce=False))
+    policy=qgrid_trs_policy_from_shared_pole_store(header,announce=False)
     gij=_resolve_Gij(None,meta,mesh_xy,occupation_state)
-    keys=tuple((a,b) for a in range(4) for b in range(4))
-    def admit(kernel,args,key):
-        a,b=map(bool,key)
-        left,right=(families[i].green_parent for i in (a,b))
-        q=left.plan.n_parent;m=left.plan.n_centroid_packed*left.plan.nspinor
-        n=right.plan.n_centroid_packed*right.plan.nspinor;k=left.psi_nmu.shape[1]
+    total=None
+    currents=[None,None]
+    for a,b in ((0,0),(0,1),(1,0),(1,1)):
+        lefts=(1,2,3) if a else (0,)
+        rights=(1,2,3) if b else (0,)
+        keys=tuple((A,B) for A in lefts for B in rights)
+        left,right=families[a],families[b]
+        plans=(left.green_parent.plan,right.green_parent.plan)
+        tables=_constant_w_tables(plans,policy,lefts,rights,mesh_xy)
+        slices=left.slices
+        weights=jax.lax.with_sharding_constraint(
+            jnp.broadcast_to(_occ_diag_full(gij,slices.nb_sigma,slices.nb_full),(meta.nk_tot,slices.nb_full)),
+            NamedSharding(mesh_xy,P()))
+        kernel=_make_photon_static_class_kernel(mesh_xy,meta.kgrid,meta.nk_tot,left,right,keys,
+                                                w_tables=tables)
+        pair=_constant_class_parents(mesh_xy,layout,lefts,rights)(packed)
+        arguments=(left.green_parent,right.green_parent,weights,pair,1.0)
+        q=left.green_parent.plan.n_parent;m=left.green_parent.plan.n_centroid_packed*left.green_parent.plan.nspinor
+        n=right.green_parent.plan.n_centroid_packed*right.green_parent.plan.nspinor;k=left.green_parent.psi_nmu.shape[1]
         # The static face projector contracts O @ psi_right, then
         # psi_left† @ T, both over the padded carrier (k), before the
         # final logical-band slice. Query those actual GEMM shapes.
         native=_native_workspace(mesh_xy,(((q,m,k),(q,k,n)),
             ((q,m,n),(q,n,k)),((q,k,m),(q,m,k))))
-        _admit_compiled(kernel,args,meta,f'sigma.sector.constant.{key}',
+        _admit_compiled(kernel,arguments,meta,f'sigma.sector.constant.{keys[0]}',
                         native=native,resident=amount)
-    # The class restore is the full-q (nk, m, |A|, n, |B|) interaction (TT
-    # at Fe 20^3/P36: 103.7 GB/rank). Split a class into A x B panels (one
-    # component row, then one block) when its restore, the door's transform
-    # of it and one temporary do not fit beside the packed constant.
-    room=meta.shared_pole_capacity.room_bytes_per_rank(meta.shared_pole_capacity.live_stages)-amount
-    nk=int(meta.nk_tot)
-    def panels(class_keys):
-        lefts=tuple(dict.fromkeys(A for A,_ in class_keys))
-        rights=tuple(dict.fromkeys(B for _,B in class_keys))
-        m,n=(int(bases[bool(v[0])].n_packed) for v in (lefts,rights))
-        ladder=[(class_keys,)]
-        if len(lefts)>1:ladder.append(tuple(tuple((A,B) for B in rights) for A in lefts))
-        if len(rights)>1:ladder.append(tuple(((A,B),) for A in lefts for B in rights))
-        if _TEST_MAX_PANEL_BLOCKS is not None:
-            ladder=[p for p in ladder if len(p[0])<=_TEST_MAX_PANEL_BLOCKS] or ladder[-1:]
-        for schedule in ladder:
-            if 3*16*nk*m*n*len(schedule[0])//mesh_xy.size<=room:
-                return schedule
-        return ladder[-1]
-    total=None
-    currents=[None,None]
-    for key,value,_ in contract_lorentz_blocks(keys,families=families,term=_TERM_X,
-            response=response,Gij=gij,meta=meta,mesh_xy=mesh_xy,admit_kernel=admit,
-            panels=panels):
+        value=kernel(*arguments)
+        del pair
         total=value if total is None else total+value
-        if return_components and key != (0,0):
-            channel=int(key[0] != 0 and key[1] != 0)  # 0: CT+TC, 1: TT
-            currents[channel]=(value if currents[channel] is None
-                               else currents[channel]+value)
+        if return_components and (a or b):
+            channel=int(bool(a and b))  # 0: CT+TC, 1: TT
+            currents[channel]=value if currents[channel] is None else currents[channel]+value
     from gw.photon_sigma import band_sigma_finish
     finish=band_sigma_finish(mesh_xy,int(families[0].slices.nb_sigma),
                              families[0].green_parent.plan.sym)
