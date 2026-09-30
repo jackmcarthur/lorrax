@@ -71,6 +71,35 @@ def main():
     assert np.max(np.abs(logical[:,:5,:5]-expected))<5e-14
     assert np.max(np.abs(legacy[:,5:8,5:8]))==0
     assert np.max(np.abs(np.diagonal(legacy,axis1=-2,axis2=-1)[:,8:]-tail[:,-1:]))<5e-14
+    # An authenticated outer spectrum is authoritative. The SC sum ends
+    # before the logical eleven-band outer edge, so its last states are
+    # explicitly unshifted. Never infer their shift from the head edge.
+    outer=np.concatenate((tail,np.broadcast_to(tail[:,-1:],(len(dft),3))),axis=1)
+    outer[:,9:]=0
+    with mesh:
+        outer_dev=device_put_process_local(outer,NamedSharding(mesh,P()))
+        complete=assemble_delta_head_manifold(delta_dev,tail_dev,nb_storage=8,
+            mesh=mesh,nb_logical=8,nb_links=11,nb_active=5,
+            outer_tail_diagonal=outer_dev)
+    complete=np.asarray(gather_to_host(complete))
+    complete_reference=np.zeros_like(complete)
+    complete_reference[:,:5,:5]=expected
+    indices=np.arange(5,11)
+    complete_reference[:,indices,indices]=outer[:,5:]
+    outer_tail_error=float(np.max(np.abs(complete-complete_reference)))
+    assert outer_tail_error<5e-14,outer_tail_error
+    assert np.max(np.abs(complete[:,9:]))==0
+    assert np.max(np.abs(complete[:,:,9:]))==0
+    assert np.linalg.norm(complete-legacy)>1e-3
+    with mesh:
+        try:
+            assemble_delta_head_manifold(delta_dev,tail_dev,nb_storage=8,
+                mesh=mesh,nb_logical=8,nb_links=11,nb_active=5,
+                outer_tail_diagonal=outer_dev[:,:10])
+        except ValueError as exc:
+            assert 'outer_tail_diagonal' in str(exc)
+        else:
+            raise AssertionError('incomplete outer spectrum was accepted')
     for bispinor in (False, True):
         meta = Meta.from_system(w, sym, nval=1, ncond=6, nband=7,
                                 n_rmu=1, bispinor=bispinor)
@@ -179,6 +208,7 @@ def main():
                 physical_spin_absolute_error=spin_absolute,
                 physical_spin_reference_metric_scale=spin_reference_scale,
                 qp_frame_delta_relative_error=qp_delta_error,
+                qp_outer_tail_max_absolute_error=outer_tail_error,
                 wall_seconds=time.monotonic()-start)
             receipts.append(row)
             rank0_print(json.dumps(row),flush=True)
