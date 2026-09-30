@@ -1061,6 +1061,40 @@ lifetimes; it does not claim that every μ/k/band combination fits a card.
 
 ### Selected retarded and static parent correlations (2026-09-30)
 
-The selected charge retarded and KMS static streams share mode11 with the direct frequency stream. The parent Green owner retains complex energy-power weights and explicit antiunitary partners; only the finished scalar correlation is transformed. Incumbent forward/reverse rows are `FT[v](q), conj(FT[v](-q))`; physical rows are `conj(FT[v](-q)), FT[v](q)`, with the existing physical q gather. Retarded rows use `-i(ahead-behind)` and KMS rows `-(ahead+behind)`. Four-current and full-grid legacy factories retain their existing route. Foreign split-arm scratch is included in the same compiled-memory admission as direct frequency work.
+The selected charge retarded and KMS static streams share mode11 with the direct frequency stream. The parent Green owner retains complex energy-power weights and explicit antiunitary partners; only the finished scalar correlation is transformed. Incumbent forward/reverse rows are `FT[v](q), conj(FT[v](-q))`; physical rows are `conj(FT[v](-q)), FT[v](q)`, with the existing physical q gather. Retarded rows use `-i(ahead-behind)` and KMS rows `-(ahead+behind)`. Full-grid legacy factories retain their existing route. Foreign split-arm scratch is included in the same compiled-memory admission as direct frequency work.
 
 `tests/bench/response_parent_moments_check.py` checks native20³ Ns2/Ns4 phase, endpoint permutation, antiunitary partner, complex energy-power and real odd weights against the prior full-spin equation, then compiles Fe-equivalent 300×300 local endpoint shapes without allocating the large data. Equivalent local geometry is a workspace certificate, not a complete resident-state capacity certificate.
+
+
+### Selected photon correlations and q panels (2026-09-30)
+
+`ffi.fft.make_selected_parent_pairs` reads typed Pauli-half parent Greens
+into bounded spatial tiles (at most 32×64 columns). Each pair transforms
+its two open-spin tiles once and reuses them for all Lorentz channels of
+that centroid-family pair. The vertices and physical forward/reverse
+orientations remain in `gw.w_isdf`, derived from the shared gamma tables;
+the service stores only the requested q rows. Direct frequency, retarded
+moments and the KMS contact use this route. No full-q coupled photon or
+full-k open-spin Green is initialized. The existing native local k-axis
+FFT service owns every transform; no new backend or bundle is needed.
+
+`gw.response_bank` sizes authenticated parent q panels with each panel's
+exact q/−q closure. Dyson still solves the complete coupled C⊕T matrix per
+q and retains CT and TC. Frequency groups retain their existing shared-node
+planner and compiled-memory admission. Narrow line actions wait through
+`common.collectives.spill_to_host`, which preserves every rank's local
+shards bit for bit and explicitly deletes the GPU buffers. After all panels
+supply their actual multiplet widths, one panel is restored and zero-padded
+to the sample's largest carrier, then written through the existing line
+schema. Host memory is checked before spill. No second physics pass or
+partial-bank restart rule is introduced.
+
+Q panels repeat parent builds and FFTs; capacity alone is not a speed
+certificate. The byte hint prices two quarter parents for wholly unitary
+plans and four when typed antiunitary partners are needed. Actual compiled
+workspaces and the live device room remain the admission authority.
+`tests/bench/photon_selected_rows_check.py` compares the full-spin gamma
+equation with selected retarded/KMS/direct rows, including unequal endpoint
+families, umklapp phases, antiunitary partners and complex energy weights.
+`tests/bench/photon_qpanel_driver_check.py` runs the canonical driver suite
+with one q parent per panel, including coupled SC, final W0 and BSE.

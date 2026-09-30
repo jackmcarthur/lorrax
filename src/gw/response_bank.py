@@ -1352,21 +1352,36 @@ def response_group_size(meta, mesh_xy, *, n_samples, carry_per_sample, stream_wo
     return size, fixed, device_room, int(device_budget_bytes()) - device_room
 
 
-def photon_response_q_width(wfns,meta,mesh_xy,vertex,*,n_q,face_bytes):
-    """Native quarter-Green/FFT live-set hint; compiled admission remains authoritative."""
+def photon_parent_stream_workspace(wfns,meta,mesh_xy,vertex):
+    """Owner-local quarter-Green/FFT byte hint, including typed partner demand."""
     from .greens_function_kernel import _green_terms
-    from common.gpu_utils import device_room_bytes
+    plans = vertex.families.plans
     parent = int(vertex.families.n_parent or meta.nk_tot)
     mu = max(int(v) for v in vertex.families.packed_layout.carrier_extents)
     tile,panels = _green_terms(n_parent=parent,n_rmu=mu,ns=2,
                                n_band=int(wfns.slices.nb_full),mesh=mesh_xy)
+    antiunitary = any(plan is not None and np.any(
+        np.asarray(plan.sym_idx) >= int(plan.n_sym_spatial)) for plan in plans)
+    parent_tiles = 4 if antiunitary else 2
     nk = int(meta.nkx)*int(meta.nky)*int(meta.nkz)
     mt,nt = min(mu//int(mesh_xy.shape['x']),32),min(mu//int(mesh_xy.shape['y']),64)
     scalar_tile = 16*nk*mt*nt
-    fixed = int(4*tile + 4*panels + 18*scalar_tile)
+    # Each pair holds its two parents (plus actual antiunitary partners),
+    # bounded SUMMA panels and original/transformed spin FFT tiles. No
+    # complete full-k Green is part of this hint or the selected producer.
+    fixed = int(parent_tiles*tile + 4*panels + 18*scalar_tile)
+    return dict(fixed_bytes_per_rank=fixed,parent_green_tiles=parent_tiles,
+                antiunitary_partners=bool(antiunitary),parent_green_bytes=int(tile),
+                summa_panel_bytes=int(panels),scalar_fft_tile_bytes=scalar_tile)
+
+
+def photon_response_q_width(wfns,meta,mesh_xy,vertex,*,n_q,face_bytes):
+    """Native live-set hint; compiled admission remains authoritative."""
+    from common.gpu_utils import device_room_bytes
+    quote = photon_parent_stream_workspace(wfns,meta,mesh_xy,vertex)
     ledger = meta.shared_pole_capacity
     room = min(ledger.room_bytes_per_rank(ledger.live_stages),device_room_bytes())
-    return max(1,min(int(n_q),int(max(0,room-fixed)//(12*face_bytes))))
+    return max(1,min(int(n_q),int(max(0,room-quote["fixed_bytes_per_rank"])//(12*face_bytes))))
 
 
 def produce_sample_bank(wfns, meta, config, *, mesh_xy, sym, sample_plan, bank_io,

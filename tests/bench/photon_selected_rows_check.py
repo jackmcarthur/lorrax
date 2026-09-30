@@ -4,6 +4,7 @@ R=initialize_communicator_stack()
 import argparse,json,time
 from pathlib import Path
 from unittest.mock import patch
+from types import SimpleNamespace
 import numpy as np
 import jax,jax.numpy as jnp
 from jax.sharding import NamedSharding,PartitionSpec as P
@@ -12,23 +13,47 @@ from common.grouped_layout import identity_square_grouped_shard_layout
 from gw.centroid_k_unfold import CentroidKUnfoldPlan
 from gw.photon_layout import PhotonFamilies,PhotonBasisLayout
 from gw.w_isdf import _get_chi_fractional_contour_kernel_face as factory
-ap=argparse.ArgumentParser();ap.add_argument('--output',required=True);ap.add_argument('--aot-only',action='store_true');ap.add_argument('--donated-direct',action='store_true');a=ap.parse_args()
-def plan(kg,np_,m):
+ap=argparse.ArgumentParser();ap.add_argument('--output',required=True);ap.add_argument('--aot-only',action='store_true');ap.add_argument('--hint-only',action='store_true');ap.add_argument('--donated-direct',action='store_true');ap.add_argument('--unitary-only',action='store_true');ap.add_argument('--q-count',type=int,default=128);a=ap.parse_args()
+def plan(kg,np_,m,anti=True):
  nk=int(np.prod(kg));rng=np.random.default_rng(913+m);sym=(np.arange(nk)%2).astype(np.int32)
  perm=np.stack([np.arange(m),np.concatenate([np.arange(m//2)[::-1],np.arange(m//2,m)[::-1]])]).astype(np.int32)
  L=rng.integers(-1,2,(2,m,3)).astype(float)
  theta=.23;U=np.array([[np.cos(theta),np.sin(theta)],[-np.sin(theta),np.cos(theta)]],complex)
  spin=np.zeros((nk,4,4),complex);spin[:,:2,:2]=U;spin[:,2:,2:]=np.where(sym==0,1.,-1.)[:,None,None]*U
- return CentroidKUnfoldPlan(R.mesh,identity_square_grouped_shard_layout(m,m,(2,2)),np.arange(nk,dtype=np.int32)%np_,sym,perm,L,rng.uniform(-.4,.4,(np_,3)),spin,1,4)
+ return CentroidKUnfoldPlan(R.mesh,identity_square_grouped_shard_layout(m,m,(2,2)),np.arange(nk,dtype=np.int32)%np_,sym,perm,L,rng.uniform(-.4,.4,(np_,3)),spin,1 if anti else 2,4)
 def main():
  receipts=[];mesh=R.mesh;rep=lambda n:NamedSharding(mesh,P(*([None]*n)))
+ if a.hint_only:
+  from gw.response_bank import photon_parent_stream_workspace,photon_response_q_width
+  shape_mesh=SimpleNamespace(shape={'x':6,'y':6})
+  wfns=SimpleNamespace(slices=SimpleNamespace(nb_full=180))
+  ledger=SimpleNamespace(live_stages=(),room_bytes_per_rank=lambda stages:40_000_000_000)
+  meta=SimpleNamespace(nk_tot=8000,nkx=20,nky=20,nkz=20,shared_pole_capacity=ledger)
+  face=16*1200*1200
+  for anti in (False,True):
+   plans=(SimpleNamespace(sym_idx=np.array([0,1]),n_sym_spatial=2),
+          SimpleNamespace(sym_idx=np.array([0,1]),n_sym_spatial=1 if anti else 2))
+   vertex=SimpleNamespace(families=SimpleNamespace(plans=plans,n_parent=1062,
+       packed_layout=SimpleNamespace(carrier_extents=(1800,1800))))
+   quote=photon_parent_stream_workspace(wfns,meta,shape_mesh,vertex)
+   with patch('common.gpu_utils.device_room_bytes',return_value=40_000_000_000):
+    width=photon_response_q_width(wfns,meta,shape_mesh,vertex,n_q=1062,face_bytes=face)
+   assert quote['parent_green_tiles']==(4 if anti else 2)
+   assert quote['antiunitary_partners']==anti
+   assert quote['fixed_bytes_per_rank']+12*face*width<=40_000_000_000
+   assert quote['fixed_bytes_per_rank']+12*face*(width+1)>40_000_000_000
+   receipts.append(dict(**quote,q_parent_width=width,room_bytes=40_000_000_000))
+  assert receipts[1]['fixed_bytes_per_rank']-receipts[0]['fixed_bytes_per_rank']==2*receipts[0]['parent_green_bytes']
+  rank0_print(json.dumps(receipts),flush=True)
+  rank0_transaction(a.output,stage='selected photon metadata hint',write=lambda:Path(a.output).write_text(json.dumps(receipts,indent=2)+'\n'))
+  return 0
  if a.aot_only:
   kg=(20,20,20);np_,nb=1062,180;extents=(600,600)
-  plans=tuple(plan(kg,np_,m) for m in extents)
+  plans=tuple(plan(kg,np_,m,anti=not a.unitary_only) for m in extents)
   layout=PhotonBasisLayout.from_centroid_extents(*extents,mesh,packed=True)
   photon=PhotonFamilies(plans,layout,layout)
   sd=lambda shape,dtype,spec:jax.ShapeDtypeStruct(shape,dtype,sharding=NamedSharding(mesh,spec))
-  modes=[('direct',tuple(range(128)))] if a.donated_direct else [('retarded',tuple(range(128))),('kms_static',(0,)),('direct',tuple(range(128)))]
+  modes=[('direct',tuple(range(a.q_count)))] if a.donated_direct else [('retarded',tuple(range(128))),('kms_static',(0,)),('direct',tuple(range(128)))]
   for mode,q in modes:
    fn=factory(mesh,kg,1 if mode!='direct' else 2,(np_,nb,layout.packed_extent,4),layout='face',selected_q=q,pair_mode=mode,ordered=True,vertex=photon,bank_carry=a.donated_direct)
    shape=(2,2,1) if mode=='direct' else (1,1)
@@ -36,7 +61,7 @@ def main():
    args=(sd((1,),np.complex128 if mode=='direct' else np.float64,P()),sd(shape,np.complex128,P()),tuple(sd((np_,4,m,nb),np.complex128,P(None,None,'x','y')) for m in extents),tuple(sd((np_,nb,4,m),np.complex128,P(None,'x',None,'y')) for m in extents),sd((np_,nb),np.float64,P()),sd((np_,nb),np.complex128,P()),sd((np_,nb),np.complex128,P()),sd(refshape,np.float64,P()))
    if a.donated_direct:args+=(sd((2,len(q),layout.packed_extent,layout.packed_extent),np.complex128,P(None,None,'x','y')),)
    t=time.monotonic();exe=fn.lower(*args).compile();ma=exe.memory_analysis()
-   row=dict(mode=mode,aot_only=True,bank_carry=a.donated_direct,fe_equivalent_mesh=36,local_mu=300,selected_q=len(q),argument_bytes=ma.argument_size_in_bytes,output_bytes=ma.output_size_in_bytes,temp_bytes=ma.temp_size_in_bytes,alias_bytes=ma.alias_size_in_bytes,new_bytes=ma.output_size_in_bytes+ma.temp_size_in_bytes-ma.alias_size_in_bytes,wall_s=time.monotonic()-t);receipts.append(row);rank0_print(json.dumps(row),flush=True)
+   row=dict(mode=mode,aot_only=True,bank_carry=a.donated_direct,antiunitary=not a.unitary_only,fe_equivalent_mesh=36,local_mu=300,selected_q=len(q),argument_bytes=ma.argument_size_in_bytes,output_bytes=ma.output_size_in_bytes,temp_bytes=ma.temp_size_in_bytes,alias_bytes=ma.alias_size_in_bytes,new_bytes=ma.output_size_in_bytes+ma.temp_size_in_bytes-ma.alias_size_in_bytes,wall_s=time.monotonic()-t);receipts.append(row);rank0_print(json.dumps(row),flush=True)
   rank0_transaction(a.output,stage='selected photon AOT',write=lambda:Path(a.output).write_text(json.dumps(receipts,indent=2)+'\n'))
   return 0
  kg=(4,4,4);np_,nb=3,4;extents=(4,8);plans=tuple(plan(kg,np_,m) for m in extents)
