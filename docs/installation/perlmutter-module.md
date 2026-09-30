@@ -50,7 +50,7 @@ script refuses a checkout that has uncommitted changes.
    ```
 
 2. **Candidate**, once per revision, on a zero-GPU compute step. It takes
-   about 3 min, plus about 2 min for SLATE on the first build in a prefix.
+   about 1 min, plus about 2 min for SLATE on the first build in a prefix.
 
    ```bash
    srun --jobid=$JOBID -N 1 -n 1 -c 64 --gres=none \
