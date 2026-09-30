@@ -16,6 +16,19 @@ states, so the occupied set is one band and time reversal is broken. Built
 the registered SCF parser's receipt. It is a software fixture, not a
 converged physical reference.
 
+Its wavefunctions do not have the four operations of the WFN header exactly.
+At Γ, read straight from `WFN.h5` on the FFT grid, the band densities change
+under the screw axis and under the inversion by 5e-3 (bands 1 and 2), 2e-3
+(band 3) and 9e-2 (band 4) of their maximum, and under the mirror by 1e-4,
+7e-5, 6e-4 and 8e-2; band 1 of `fixture_na` reads 4e-11 on the same test. A
+symmetry-reduced GW run builds V(−q) from V(q) by the inversion, so it prints
+the two `q↔−q conjugate reciprocity` SANITY lines (V 5.2e-3, W 4.7e-3 at 70
+centroids with ζ legs 1–3 × 1–7; 4.0e-2 with legs 1–7 × 1–7). The same deck on
+69 of the 70 centroids (not orbit-closed, so the run is unreduced) reads 4e-12
+and 3e-12: the relation holds for the fit, and the lines report the input. The
+suite's stored references carry this. Evidence:
+`runs/DEV/660_firstrunfix_20260930` in the sandbox.
+
 `fixture_na/`: bcc Na, one atom, PseudoDojo nc-sr-04 PBE (9 electrons:
 2s at −64 eV and 2p at −22 eV lie 20 eV below the 3s band), 25 Ry cutoff,
 Fermi-Dirac k_BT = 0.01 Ry, 3 × 3 × 3 k-grid (27 full, 4 stored), 14 scalar
