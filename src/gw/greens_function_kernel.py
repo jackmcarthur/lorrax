@@ -507,7 +507,7 @@ def sigma_spin_block(*, n_parent, n_rmu, ns, n_full, n_band, mesh, partner_tiles
 
 def chi0_door_scratch(*, kgrid, n_parent, n_rmu, ns, mesh):
     """Per-rank run-time scratch of one mathdx mode-11 call: its split arm's intermediate,
-    at most one local parent-Green tile ``T_p`` (``ffi.fft.chi_unfold_scratch_bytes``);
+    the bound owned by ``ffi.fft.chi_unfold_scratch_bytes``;
     0 on the single pass and off the mathdx backend."""
     from ffi import fft as F
     if F.kconv_backend(mesh) != "mathdx":

@@ -526,7 +526,13 @@ def check_chunk(chunk: int, *, build, fixed: float, per_unit: float, room: float
     started = time.perf_counter()
     got = compiled_new_bytes(compiled, extra=int(extra(chunk, compiled)), platform=platform)
     seconds = time.perf_counter() - started
-    if got <= analytic or got <= room or chunk <= minimum:
+    if got > room and chunk <= minimum:
+        raise MemoryError(
+            f"GATE compiled_chunk_capacity: {stage}: got {got / 1e9:.2f} GB/rank "
+            f"at minimum chunk {chunk}; want <= the room {room / 1e9:.2f} GB; "
+            "fix: reduce native scratch through its owner, more ranks or a "
+            "larger memory_per_device_gb")
+    if got <= analytic or got <= room:
         return ChunkCheck(chunk, compiled, analytic, got, max(analytic, got),
                           float(per_unit), False, seconds)
     slope = max(float(per_unit), (got - float(fixed)) / chunk)

@@ -732,7 +732,8 @@ The modes of the one handler file. The target column is the string
   `(k_y, k_z)` on column tiles, then an R-space x-pencil pass for each spin
   group, chunked over pairs through an `(N_k, chunk·2ns²)` intermediate that
   XLA's scratch allocator grants (at most `scratch_bytes`; the door's default
-  is one parent-Green tile). Mode 7, single pass only: `tr` whole pairs (the
+  is the smaller of one parent-Green tile and 1 GiB, with a one-pair
+  minimum; `chi_unfold_scratch_bytes` owns the policy and its pricing). Mode 7, single pass only: `tr` whole pairs (the
   `d²` columns of a stored spin block) per block, `kbox_plan(group = d²,
   transforms = 2, min_tr = 1)`, gathered on load through the typed unfold,
   inverse transform, `W_R[k, x, y]` in the Mid, forward transform, the scaled
