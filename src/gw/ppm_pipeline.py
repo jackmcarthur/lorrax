@@ -235,10 +235,10 @@ def _combine_extrapolation(first, rest, w):
 
 
 @lru_cache(maxsize=16)
-def _extrapolation_kernel(sharding):
-    """The ordered affine combination, written into the first point's buffer."""
+def _extrapolation_kernel(sharding, donate):
+    """The ordered affine combination; ``donate``: into the first point's buffer."""
     return jax.jit(_combine_extrapolation, out_shardings=sharding,
-                   donate_argnums=(0,))
+                   donate_argnums=(0,) if donate else ())
 
 
 def band_count_point(cube, i: int):
@@ -275,10 +275,11 @@ def _extrapolated_point(cube, weights, top=None):
     eigenvectors stay consistent with its own eigenvalues.
 
     MEMORY.  The matrix of a point is needed only where its weight is not
-    zero: N₁ and N₃ (N₂ fixes Ω from its band diagonal and adds exact zeros
-    here).  The first live point is a fresh unfold and gives its buffer to
-    the result; ``top`` is the caller's N₃ cube (the raw twin), read and
-    kept.  Two full-BZ cubes are resident: the two this stage returns.
+    zero: N₁ and N₃ (N₂ fixes Ω from its band diagonal, which is all the
+    sweep keeps of it).  The first live point gives its buffer to the
+    result, so the cube no longer serves that point afterwards; ``top`` is
+    the caller's N₃ cube (the raw twin), read and kept.  Two full-BZ cubes
+    are resident: the two this stage returns.
     """
     w = np.asarray(weights, dtype=np.float64)
     n_count, carrier = int(cube.shape[0]), int(cube.shape[-1])
@@ -299,11 +300,19 @@ def _extrapolated_point(cube, weights, top=None):
     if not live:
         raise ValueError(
             "_extrapolated_point: every weight is zero; they must sum to 1")
+    between = [b for b in live if cube.diagonal_only(b)]
+    if between:
+        raise ValueError(
+            f"_extrapolated_point: band counts {between} carry weight, but "
+            f"the sweep keeps only their band diagonal (BandCountCube)")
     first = cube.point(live[0])
     rest = tuple(
         top if (top is not None and b == n_count - 1) else cube.point(b)
         for b in live[1:])
-    return _extrapolation_kernel(first.sharding)(first, rest, w[live])
+    # ``first`` is the caller's own N3 cube only where no state has a tail
+    # and the wedge is the full BZ; it is then read, not taken.
+    return _extrapolation_kernel(first.sharding, first is not top)(
+        first, rest, w[live])
 
 
 def _report_band_extrapolation(
