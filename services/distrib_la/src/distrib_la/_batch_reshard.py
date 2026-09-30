@@ -54,10 +54,10 @@ def validate_batch_reshard_operands(
     collective is entered.  The route accepts a ragged leading batch and
     pads it itself, but the matrix face must already tile the mesh.
     """
-    if op not in ("eigh", "checked_eigh", "normal_eigh", "cholesky", "solve_lu"):
+    if op not in ("eigh", "checked_eigh", "normal_eigh", "polar", "cholesky", "solve_lu"):
         raise ValueError(
             f"batch_reshard: unsupported op {op!r}; expected "
-            "eigh|checked_eigh|normal_eigh|cholesky|solve_lu")
+            "eigh|checked_eigh|normal_eigh|polar|cholesky|solve_lu")
     expected = 2 if op == "solve_lu" else 1
     if len(ops) != expected:
         raise ValueError(
@@ -473,6 +473,7 @@ def batch_reshard_call(
     op: str,
     mesh: Mesh,
     ops: Sequence,
+    *, rcond=None,
 ):
     """Run route (c): staged face→batch, local dense op, staged inverse.
 
@@ -491,11 +492,12 @@ def batch_reshard_call(
         op,
         mesh_key(mesh),
         tuple((tuple(int(s) for s in x.shape), str(x.dtype)) for x in ops),
+        rcond,
     )
     fn = _JIT_CACHE.get(key)
     if fn is None:
         in_specs = tuple(P(None, "x", "y") for _ in ops)
-        out_specs = ((P(), P(None, "x", "y")) if op in ("eigh", "checked_eigh", "normal_eigh")
+        out_specs = ((P(), P(None, "x", "y")) if op in ("eigh", "checked_eigh", "normal_eigh", "polar")
                      else P(None, "x", "y"))
 
         def _body(*local_faces):
@@ -503,6 +505,16 @@ def batch_reshard_call(
                 _face_to_batch(_pad_leading(a, batch_pad), px=px, py=py)
                 for a in local_faces)
             A = local[0]
+
+            if op == "polar":
+                from distrib_la.polar import _polar_from_matrix
+                def kernel(a):
+                    link, s = _polar_from_matrix(a, jnp.linalg.eigh, rcond)
+                    return s, link
+                W, Z = (_real_rows(kernel, (A,), nbatch=nbatch, py=py)
+                        if batch_pad else kernel(A))
+                return (_replicate_batch_vector(W, px=px, py=py)[:nbatch],
+                        _batch_to_face(Z, px=px, py=py)[:nbatch])
 
             if op == "normal_eigh":
                 from distrib_la.polar import _normal_matrix, _singular_values
