@@ -241,6 +241,12 @@ density_self_consistent = true
 })
 _P = ["--px", _SIDE, "--py", _SIDE]
 
+# Scratch the lead removes before a stage.  The four-current one-shot is a
+# fresh model in a run directory that already holds the scalar shared-pole
+# models (checked at sp_export), and a fresh run refuses to overwrite a
+# completed model (GATE shared_pole_output).
+_CLEAR_BEFORE = {"bisp_oneshot": ("tmp/mpa",)}
+
 # (name, module, argv, deck name -> template).  The decks are written into
 # the run directory after kmeans, which names the centroid file.
 STAGES = (
@@ -569,6 +575,9 @@ def run_chain(out, *, regenerate=False, cache_dir=None, timeout=600,
             continue
         if name == "kin_ion" and lead:
             write_decks(run)
+        if lead:
+            for rel in _CLEAR_BEFORE.get(name, ()):
+                shutil.rmtree(run / rel, ignore_errors=True)
         rank_session.exchange(name)
         ok, rcs, walls[name] = run_stage(run, name, module, argv, env, timeout)
         hits = signatures(run, name) if lead else []
