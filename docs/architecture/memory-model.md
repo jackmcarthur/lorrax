@@ -357,10 +357,12 @@ per batch against rule 1. All planners stay single-stage and generic.
    zeta-mubatch-capacity` names ψ(G) and the smallest batch. For V_q, more
    ranks, fewer centroids, or a smaller ζ sphere; `vq_g_chunk_size` shrinks
    only the panel workspace.
-5. **Compare with the run.** `gwjax.out` prints MAJOR-STAGE DEVICE MEMORY:
-   each stage's device peak (max and min over ranks), the planner's price and
-   `γ = peak / price`, or "no planner", and the section that set the peak.
-   `γ > 1` is an under-estimate to investigate.
+5. **Compare with the run.** `gwjax.out` prints MAJOR-STAGE DEVICE AND HOST
+   MEMORY: each stage's device peak (max and min over ranks), the planner's
+   price and `γ = peak / price`, or "no planner", the host columns, and the
+   section that set the device peak. `γ > 1` is an under-estimate to
+   investigate. No planner prices host memory: the `rise` column names the
+   stage that grew the process.
 
 ## The per-stage receipt
 
@@ -374,3 +376,11 @@ with `common.gpu_utils.record_stage_price(stage, bytes, section=...)`: the
 live bytes plus what it plans. What the pool cannot see: NCCL and library
 workspaces outside it (2–3 GB per rank on A100), and work dispatched but not
 yet allocated at a boundary, which counts in the next section.
+
+Host memory is read at the same boundaries from
+`resource.getrusage(RUSAGE_SELF).ru_maxrss`, the process's resident
+high-water mark. It never falls and cannot be reset, so the table prints two
+numbers per stage, each the max over ranks: `host GB`, the mark at the
+stage's last exit, and `rise`, the sum of what the stage's own intervals
+added to the mark. A stage that stays below an earlier host peak shows
+`rise +0.00`.
