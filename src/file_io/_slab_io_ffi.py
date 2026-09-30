@@ -1369,20 +1369,59 @@ def _file_order_plan(shape, vshape, spec, itemsize, p, mesh_axes, ds_shape,
 
 
 @functools.lru_cache(maxsize=None)
-def _file_order_take(mesh, shape, dtype, k, sizes, height):
-    """Jitted ``(A, starts) -> piece``: one ``sizes`` block, rows of ``k`` over all ranks."""
+def _file_order_take(mesh, shape, dtype, k, sizes, height, spec):
+    """Slice on owned shards, then exchange bounded pieces into file rows.
+
+    The dynamic slice must be inside the manual region: a global slice
+    with a file-row output constraint can replicate the entire input before
+    cutting the piece. Each explicit exchange preserves one piece per rank.
+    """
     n = len(shape)
     axes = tuple(mesh.axis_names)
     target = NamedSharding(mesh, P(*([None] * k), axes, *([None] * (n - k - 1))))
+    source = _spec_axes(spec, n)
+    local_sizes = tuple(int(sizes[d]) // math.prod(
+        int(mesh.shape[a]) for a in (source[d] or ())) for d in range(n))
+    present = source[k] or ()
 
     def piece(a, starts):
-        out = jax.lax.dynamic_slice(a, [starts[i] for i in range(n)], sizes)
+        out = jax.lax.dynamic_slice(a, [starts[i] for i in range(n)], local_sizes)
         if height > sizes[k]:
             pad = [(0, 0)] * n
             pad[k] = (0, height - sizes[k])
             out = jnp.pad(out, pad)
+        # Same volume-preserving axis order as face_to_batch_reshard, here
+        # with the file split dimension and arbitrary leading axes intact.
+        for ax in axes[len(present):]:
+            src = next((d for d in range(n) if source[d] == (ax,)), None)
+            if src is not None:
+                out = jax.lax.all_to_all(out, ax, split_axis=k,
+                                         concat_axis=src, tiled=True)
+            else:
+                # Replicated mesh axes already contain the same piece;
+                # each rank keeps its own disjoint file-row selection.
+                out = jax.lax.dynamic_slice_in_dim(
+                    out, jax.lax.axis_index(ax) * (out.shape[k] // mesh.shape[ax]),
+                    out.shape[k] // mesh.shape[ax], axis=k)
         return out
-    return jax.jit(piece, out_shardings=target)
+    sm = shard_map(piece, mesh=mesh, in_specs=(spec, P()),
+                   out_specs=target.spec, check_vma=False)
+    return jax.jit(sm, in_shardings=(NamedSharding(mesh, spec),
+                                   NamedSharding(mesh, P())), out_shardings=target)
+
+
+def _file_order_move_supported(spec, shape, k, mesh):
+    """Whether explicit row exchanges preserve this operand's global order."""
+    source = _spec_axes(spec, len(shape))
+    axes = tuple(mesh.axis_names)
+    present = source[k] or ()
+    if present != axes[:len(present)]:
+        return False
+    # Combined source axes need another ordering algorithm; keep the native
+    # collective hyperslab writer rather than an implicit global gather.
+    if any(len(e) != 1 for d, e in enumerate(source) if e and d != k):
+        return False
+    return not present or int(shape[k]) % int(mesh.size) == 0
 
 
 def _file_order_pieces(A, off, vshape, plan, mesh):
@@ -1403,7 +1442,7 @@ def _file_order_pieces(A, off, vshape, plan, mesh):
             take_k = int(A.shape[k]) if whole else real
             sizes = tuple(steps) + (take_k,) + tuple(int(d) for d in A.shape[k + 1:])
             take = _file_order_take(mesh, tuple(int(d) for d in A.shape), A.dtype, k,
-                                    sizes, -(-take_k // p) * p)
+                                    sizes, -(-take_k // p) * p, A.sharding.spec)
             starts = device_put_process_local(
                 np.asarray(idx + (c0,) + (0,) * (A.ndim - k - 1), dtype=np.int32), rep)
             p_off = (tuple(int(off[a]) + idx[a] for a in range(k))
@@ -2805,6 +2844,10 @@ class _FfiBackend(_DatasetGeometry):
                                 _spec_axes(A.sharding.spec, A.ndim),
                                 jnp.dtype(A.dtype).itemsize, int(self.mesh.size),
                                 tuple(self.mesh.axis_names), ds_shape)
+        if (plan not in (None, "as-is")
+                and not _file_order_move_supported(A.sharding.spec, A.shape,
+                                                   plan[0], self.mesh)):
+            plan = None
         if plan is None:
             self._dispatch_write(name, A, off, vshape, ds_shape, mesh_shape,
                                  independent=False)
