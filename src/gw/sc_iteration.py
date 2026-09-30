@@ -1628,26 +1628,18 @@ def _sigma_c_at_dft_diag_from_dft_cube(
         ``(n_k, n_band)`` complex correlation diagonal at ``E_DFT``, in eV
         and in the DFT output basis.
     """
-    from .qsgw_utils import (
-        extract_sigma_diag_replicated,
-        interp_along_omega,
-    )
+    from .qsgw_utils import interp_sigma_diag_along_omega
 
     if (sigma_result.omega_grid_ev is None
             or sigma_result.omega_dft_rel_ev is None):
         raise ValueError(
             "a dynamic SC output cube needs its omega grid and DFT-relative "
             "evaluation energies to rebuild Sigma_c(E_DFT)")
-    diagonal_ev = np.asarray(extract_sigma_diag_replicated(
-        sigma_c_omega_dft_ry, mesh)) * RYD_TO_EV
-    if sigma_result.sigma_band_axis is not None:
-        from runtime.padding import strip_axis
-        diagonal_ev = np.asarray(strip_axis(
-            diagonal_ev, sigma_result.sigma_band_axis, axis=-1))
-    return interp_along_omega(
-        diagonal_ev,
+    return interp_sigma_diag_along_omega(
+        sigma_c_omega_dft_ry, mesh,
         np.asarray(sigma_result.omega_grid_ev, dtype=np.float64),
         np.asarray(sigma_result.omega_dft_rel_ev, dtype=np.float64),
+        band_axis=sigma_result.sigma_band_axis, scale=RYD_TO_EV,
         context="DFT-basis Sigma_c at E_DFT after SC finalize",
         print_fn=print_fn,
     )
@@ -4903,20 +4895,18 @@ def _sc_z_factors(
     e_eval = np.asarray(sigma.e_eval_ev, dtype=np.float64)
 
     from .eqp_bgw import compute_z_factor_from_omega_grid
-    from .qsgw_utils import extract_sigma_diag_replicated
+    from .qsgw_utils import interp_sigma_diag_along_omega
 
-    sigma_c_diag_ev = np.asarray(
-        extract_sigma_diag_replicated(cube, inputs.mesh_xy),
-        dtype=np.complex128,
-    ) * RYD_TO_EV
-    if sigma.sigma_band_axis is not None:
-        from runtime.padding import strip_axis
-        sigma_c_diag_ev = np.asarray(strip_axis(
-            sigma_c_diag_ev, sigma.sigma_band_axis, axis=-1))
+    omega = np.asarray(omega, dtype=np.float64)
+    # The centre and the two probes each read two omega slots from the
+    # sharded cube: no (n_omega, nk, nb) diagonal on the host.
     _, z_factor = compute_z_factor_from_omega_grid(
-        sigma_c_omega_diag_ev=sigma_c_diag_ev,
-        omega_rel_ev=np.asarray(omega, dtype=np.float64),
+        sigma_c_omega_diag_ev=None,
+        omega_rel_ev=omega,
         e_dft_rel_ev=e_eval - float(sigma.efermi_dft_ev),
+        interp=lambda e_kn: interp_sigma_diag_along_omega(
+            cube, inputs.mesh_xy, omega, e_kn,
+            band_axis=sigma.sigma_band_axis, scale=RYD_TO_EV),
     )
     return np.asarray(z_factor, dtype=np.float64)
 

@@ -754,14 +754,15 @@ def finalize_dynamic_sigma(
             # The raw columns: the same diagonal read and the same E_DFT
             # interpolation that ``eval_sigma_c_at_dft_energies`` applies to
             # the extrapolated cube, so an extrapolation-off run reproduces
-            # them.  The (n_omega, nk, nb) raw diagonal is host memory on
-            # every rank and only the one-shot raw columns read it
-            # (SIGMA_BASIS_FIELDS: an SC run drops it), so it is extracted
-            # only by the call that writes its cube.
+            # them.  Only the one-shot raw columns read the (n_omega, nk, nb)
+            # raw diagonal (SIGMA_BASIS_FIELDS: an SC run drops it) and only
+            # the reporting rank writes them, so it is extracted only by the
+            # call that writes its cube and held on that rank alone.
             from .qsgw_utils import interp_sigma_diag_along_omega
             if write_sigma_omega_h5:
                 raw_diag_ry = extract_sigma_diag_logical(
-                    sigma_c_omega_unextrap, mesh_xy, band_axis=sigma_band_axis)
+                    sigma_c_omega_unextrap, mesh_xy, band_axis=sigma_band_axis,
+                    host=jax.process_index() == 0)
             raw_at_dft_ev = interp_sigma_diag_along_omega(
                 sigma_c_omega_unextrap, mesh_xy, omega_grid_ev, omega_dft_rel_ev,
                 band_axis=sigma_band_axis, scale=RYD_TO_EV,

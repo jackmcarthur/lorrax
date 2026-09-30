@@ -259,8 +259,28 @@ def sigma_table_to_file_wedge(
         # A time-reversed row copies its parent's diagonal; conjugating it
         # flipped Im Sigma_c on every such k (gnppm_debug k = 2, 6, 7, 8;
         # owner 2026-09-24: time-ordered, Im > 0 below mu).
-        values = (np.asarray(unfold_star_wedge_to_full_bz(sym, values.real))
-                  + 1j * np.asarray(unfold_star_wedge_to_full_bz(sym, values.imag)))
+        #
+        # One bounded tile of the omega axis at a time, unfolded and reduced
+        # to the file wedge before the next: the full-BZ image of the
+        # (nk, n_omega, nb) diagonal is never whole on the host (Fe 20^3:
+        # 3.7 GB, three more copies live in the sum).  Rows are copied, so
+        # a tile is the same elements through the same arithmetic.
+        file_wedge = sym if file_sym is None else file_sym
+
+        def on_file_wedge(tile):
+            full = (np.asarray(unfold_star_wedge_to_full_bz(sym, tile.real))
+                    + 1j * np.asarray(unfold_star_wedge_to_full_bz(sym, tile.imag)))
+            return np.asarray(reduce_full_bz_to_file_wedge(file_wedge, full))
+
+        if values.ndim == 3 and values.shape[1] > 1:
+            per_slot = int(sym.nk_tot) * int(values.shape[2]) * 16
+            step = max(1, (1 << 28) // max(1, per_slot))
+            values = np.concatenate(
+                [on_file_wedge(values[:, i:i + step])
+                 for i in range(0, values.shape[1], step)], axis=1)
+        else:
+            values = on_file_wedge(values)
+        return np.moveaxis(values, 0, k_axis) if k_axis else values
     elif source_kset == SIGMA_KSET_STAR_WEDGE:
         values = unfold_star_wedge_to_full_bz(sym, values)
     elif source_kset != SIGMA_KSET_FULL_BZ:

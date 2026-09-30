@@ -308,10 +308,11 @@ Z_FINITE_DIFFERENCE_EV = 0.5
 
 def compute_z_factor_from_omega_grid(
 	*,
-	sigma_c_omega_diag_ev: np.ndarray,  # (n_omega, nk, nb)
+	sigma_c_omega_diag_ev: np.ndarray | None,  # (n_omega, nk, nb)
 	omega_rel_ev: np.ndarray,           # (n_omega,)  — ω axis relative to E_F
 	e_dft_rel_ev: np.ndarray,           # (nk, nb)    — the CENTRE, E - E_F
 	dE_ev: float = Z_FINITE_DIFFERENCE_EV,
+	interp=None,
 ) -> tuple[np.ndarray, np.ndarray]:
 	"""Interpolate Σ_c at a centre energy and central-difference
 	Z = 1 / (1 − dRe[Σ_c]/dω) there.
@@ -329,13 +330,22 @@ def compute_z_factor_from_omega_grid(
 	``dE_ev`` plays the role of BGW's ``finite_difference_spacing``; 0.5 eV
 	matches the BGW default.  For the ω-grid spacing of 0.25 eV used by
 	gw_jax this falls cleanly on grid points.
+
+	``interp`` replaces the host diagonal: a callable ``e_kn -> Σ_c(e_kn)``
+	(eV, ``(nk, nb)``) that reads the cube itself
+	(``qsgw_utils.interp_sigma_diag_along_omega``), so a per-map caller
+	makes no ``(n_omega, nk, nb)`` host array.
 	"""
 	nk, nb = e_dft_rel_ev.shape
-	if sigma_c_omega_diag_ev.shape != (omega_rel_ev.size, nk, nb):
-		raise ValueError(
-			f"sigma_c_omega shape {sigma_c_omega_diag_ev.shape} mismatched against "
-			f"({omega_rel_ev.size}, {nk}, {nb})"
-		)
+	if interp is None:
+		if sigma_c_omega_diag_ev.shape != (omega_rel_ev.size, nk, nb):
+			raise ValueError(
+				f"sigma_c_omega shape {sigma_c_omega_diag_ev.shape} mismatched against "
+				f"({omega_rel_ev.size}, {nk}, {nb})"
+			)
+		from .qsgw_utils import interp_along_omega
+		interp = lambda e_kn: interp_along_omega(
+			sigma_c_omega_diag_ev, omega_rel_ev, e_kn)
 
 	# The +/- dE_ev probes are DESIGNED to leave the grid at its two
 	# outermost samples -- a central difference at the edge has nowhere else
@@ -346,16 +356,12 @@ def compute_z_factor_from_omega_grid(
 	# jump at the edge gave Z < 0 for every state within dE_ev of it
 	# (branch review sigma_omega_fallback_2026-09-23 B5, planted linear
 	# Sigma).  The value at E_DFT itself keeps the Sigma(0) rule.
-	from .qsgw_utils import interp_along_omega
-	sigma_c_at_dft = interp_along_omega(
-		sigma_c_omega_diag_ev, omega_rel_ev, e_dft_rel_ev)
+	sigma_c_at_dft = interp(e_dft_rel_ev)
 	lo, hi = float(omega_rel_ev[0]), float(omega_rel_ev[-1])
 	e_plus = np.clip(e_dft_rel_ev + dE_ev, lo, hi)
 	e_minus = np.clip(e_dft_rel_ev - dE_ev, lo, hi)
-	sigma_c_plus = interp_along_omega(
-		sigma_c_omega_diag_ev, omega_rel_ev, e_plus)
-	sigma_c_minus = interp_along_omega(
-		sigma_c_omega_diag_ev, omega_rel_ev, e_minus)
+	sigma_c_plus = interp(e_plus)
+	sigma_c_minus = interp(e_minus)
 
 	# Finite-difference dRe[Σ_c]/dω over the clamped probe span; an
 	# unclamped pair keeps the exact central 2*dE_ev denominator.
