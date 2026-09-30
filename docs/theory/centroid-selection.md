@@ -12,6 +12,10 @@ implemented production routes or measured speedups.
 
 ## What is being optimized?
 
+The candidate Gram accumulates memory-sized k batches, with the original
+weights; batching changes floating-point summation grouping rather than the
+training metric.
+
 Write the feature at position r as
 
 \[
