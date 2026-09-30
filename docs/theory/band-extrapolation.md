@@ -45,10 +45,14 @@ diagonal of all three. The extrapolated matrix combines S(N₁) and S(N₃)
 read. The Σ sweep therefore folds, at every τ node, the matrices S(N₁) and
 S(N₃) and the band diagonal of S(N₂), on the k wedge of the WFN file, and
 unfolds one sum to the full BZ when it is read (`gw.ppm_sigma.BandCountCube`).
-The extrapolated matrix is written into the buffer of S(N₁), beside S(N₃),
-which the run keeps as the raw twin. Two Σ(ω) cubes and one diagonal are
-stored, with or without symmetry; the three-sum cube is never made. S(N₃) is
-summed per τ node, so it differs from the sum of the three separately
+The extrapolated matrix is written into the buffer of S(N₁). The raw twin
+(the `sigC_raw`, `eqp0_raw` and `eqp1_raw` columns) reads only the band
+diagonal of S(N₃), which is taken before the combination; S(N₃) is then
+released, so one Σ(ω) cube leaves the stage. The sweep stores two cubes and
+one diagonal, with or without symmetry; the three-sum cube is never made.
+With `sigma_freq_debug_output` the full S(N₃) is kept, and each SC map also
+reports the extrapolation's effect on E_nk from a second QSGW matrix. S(N₃)
+is summed per τ node, so it differs from the sum of the three separately
 integrated brackets at round-off.
 
 ## The model

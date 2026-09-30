@@ -372,6 +372,9 @@ def sigma_diag_at_omega_slots(sigma_w_kij, mesh_xy: Mesh, slots_s_kn, *,
     (nω, nk, nb) diagonal on any device or host.  A cube that is not
     band-sharded keeps the full-diagonal read.
     """
+    if hasattr(sigma_w_kij, "at_omega_slots"):
+        # ppm_sigma.BandDiagonalSlots: the diagonal without its cube.
+        return sigma_w_kij.at_omega_slots(slots_s_kn)
     slots = np.asarray(slots_s_kn)
     n_logical = int(slots.shape[-1])
     k_idx = np.arange(slots.shape[1])[None, :, None]

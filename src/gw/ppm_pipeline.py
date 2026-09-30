@@ -535,7 +535,7 @@ def extrapolate_sigma_body(
     sigma_omega, head_sigma_diag_w_kn_ry, *,
     e_state_ev, plan, config, band_slices, wfn, mesh_xy, print_fn, top=None,
 ):
-    """``(extrapolated body, h5 payload)`` from a bracketed Σ_c cube.
+    """``(extrapolated body, h5 payload, raw twin)`` from a bracketed Σ_c cube.
 
     ``sigma_omega`` carries the cumulative band-count axis
     (``SigmaOmegaResult``).  The fit reads the band diagonal with the q→0
@@ -543,17 +543,31 @@ def extrapolate_sigma_body(
     combine the three cumulative cubes (:func:`_extrapolated_point`).  The
     EXTRAPOLATED Σ_c drives E_nk; the caller keeps the un-extrapolated N₃
     cube (:func:`band_count_point`) beside it so the driver
-    diagonalizes both and reports the eqp-level correction, and passes it as
-    ``top`` so N₃ is unfolded once.  Extrapolating Σ
+    diagonalizes both and reports the eqp-level correction.  ``top`` is that
+    N₃ cube when the caller already holds it.  Extrapolating Σ
     and then diagonalizing is the only order that yields a Hermitian operator.
+
+    THE RAW TWIN.  Its readers by default are the raw columns (sigC_raw,
+    eqp0_raw, eqp1_raw), which read its band diagonal, so the twin returned
+    is ``BandDiagonalSlots`` of N₃, taken before the combination and N₃'s
+    buffer is then free: one Σ(ω) cube leaves this stage.  The full N₃ cube
+    (the second QSGW matrix and the per-map "extrapolation effect on E_nk"
+    eigvalsh block) is kept only under ``sigma_freq_debug_output``.  The
+    caller drops its own ``top`` reference.
     """
+    from .ppm_sigma import BandDiagonalSlots
+    cube = sigma_omega.sigma_c_kij
+    if top is None:
+        top = band_count_point(cube, int(cube.shape[0]) - 1)
     extrap_payload, extrap_weights = _report_band_extrapolation(
         sigma_omega, head_sigma_diag_w_kn_ry, e_state_ev=e_state_ev,
         plan=plan, config=config, band_slices=band_slices,
         wfn=wfn, mesh_xy=mesh_xy, print_fn=print_fn)
-    return (_extrapolated_point(
-                sigma_omega.sigma_c_kij, extrap_weights, top=top),
-            extrap_payload)
+    twin = (top if bool(config.debug.sigma_freq_debug_output) else
+            BandDiagonalSlots.of(top, mesh_xy))
+    extrapolated = _extrapolated_point(cube, extrap_weights, top=top)
+    cube.release()
+    return extrapolated, extrap_payload, twin
 
 
 def refuse_hl_ppm_without_trs(config, sym) -> None:
@@ -782,13 +796,14 @@ def compute_ppm_sigma_pipeline(
         # return, because the cube's leading axis does not survive it.
         extrap_payload = None
         if plan.enabled:
-            sigma_c_body_omega, extrap_payload = extrapolate_sigma_body(
+            (sigma_c_body_omega, extrap_payload,
+             sigma_c_body_omega_unextrap) = extrapolate_sigma_body(
                 sigma_omega, head_sigma_diag_w_kn_ry, e_state_ev=e_qp_ev,
                 plan=plan, config=config, band_slices=band_slices,
                 wfn=wfn, mesh_xy=mesh_xy, print_fn=print_fn,
                 top=sigma_c_body_omega_n3,
             )
-            sigma_c_body_omega_unextrap = sigma_c_body_omega_n3
+        del sigma_c_body_omega_n3
 
     return PPMOutputs(
         sigma_c_body_omega=sigma_c_body_omega,

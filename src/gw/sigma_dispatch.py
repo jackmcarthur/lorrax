@@ -138,7 +138,8 @@ class SigmaResult:
     photon_head_sigma_diag_tskn_ry: jax.Array | None = None
     photon_head_sigma_basis: str | None = None
     #: The un-extrapolated (N₃, ordinary full-band) QSGW Σ_xc, populated only
-    #: when ``use_band_extrapolation`` is driving this stage.  ``sigma_xc_
+    #: when ``use_band_extrapolation`` is driving this stage under
+    #: ``sigma_freq_debug_output``.  ``sigma_xc_
     #: kij_ry`` is then the EXTRAPOLATED one and is what enters H; this twin
     #: exists so the driver can diagonalize both once per iteration and print
     #: the correction at the eqp level.  None everywhere else, which is what
@@ -738,7 +739,10 @@ def finalize_dynamic_sigma(
                 sigma_xc_qsgw - current[1] - current[2])
 
         # ── THE SECOND QSGW MATRIX: N₃, UN-EXTRAPOLATED ─────────────────
-        # Built only when the band extrapolation is driving, and built the
+        # Built only when the band extrapolation is driving and
+        # ``sigma_freq_debug_output`` keeps the full N₃ cube (by default the
+        # twin is its band diagonal, which is all the raw columns read), and
+        # built the
         # SAME way as the one above so the pair differs in exactly one thing:
         # whether Σ_c carries the extrapolated band tail.  Same head (the
         # q->0 head is band-diagonal with no unoccupied sum, hence
@@ -747,7 +751,26 @@ def finalize_dynamic_sigma(
         # never mixed into the carry.
         sigma_xc_qsgw_unextrap = None
         raw_diag_ry = raw_at_dft_ev = None
-        if sigma_c_body_omega_unextrap is not None:
+        if hasattr(sigma_c_body_omega_unextrap, "at_omega_slots"):
+            # The default twin: N3's band diagonal (ppm_pipeline.
+            # extrapolate_sigma_body).  The raw columns read the same
+            # numbers as from the head-added cube below; the head is added
+            # at the same element, on the host.
+            from .qsgw_utils import interp_sigma_diag_along_omega
+            head_logical = (None if head_sigma_diag_w_kn_ry is None else
+                            np.asarray(head_sigma_diag_w_kn_ry))
+            if write_sigma_omega_h5:
+                raw_diag_ry = sigma_c_body_omega_unextrap.logical(
+                    sigma_band_axis, host=jax.process_index() == 0)
+                if raw_diag_ry is not None and head_logical is not None:
+                    raw_diag_ry = raw_diag_ry + head_logical
+            raw_at_dft_ev = interp_sigma_diag_along_omega(
+                sigma_c_body_omega_unextrap, mesh_xy, omega_grid_ev,
+                omega_dft_rel_ev, band_axis=sigma_band_axis,
+                add_w_kn=head_logical, scale=RYD_TO_EV,
+                context="raw Sigma_c at E_DFT (eqp0_raw/eqp1_raw)",
+                print_fn=lambda *args, **kwargs: None)
+        elif sigma_c_body_omega_unextrap is not None:
             sigma_c_omega_unextrap = add_head_sigma_diag(
                 sigma_c_body_omega_unextrap, head_sigma_diag_w_kn_ry,
                 band_axis=sigma_band_axis, donate_body=donate_unextrap)
@@ -1406,14 +1429,12 @@ def _compute_mpa_sigma(
     body_unextrap = extrap_payload = None
     if plan is not None:
         # The fit reads Sigma in the body's own omega frame (sigma_efermi_ry).
-        last = plan.n_brackets - 1
-        body_unextrap = band_count_point(body_omega, last)
         if body_odd is not None:
-            body_odd = band_count_point(body_odd, last)
-        body_omega, extrap_payload = extrapolate_sigma_body(
+            body_odd = band_count_point(body_odd, plan.n_brackets - 1)
+        body_omega, extrap_payload, body_unextrap = extrapolate_sigma_body(
             replace(body, efermi_ry=sigma_efermi_ry), head_diag,
             e_state_ev=e_qp_ev, plan=plan, config=config, band_slices=band_slices,
-            wfn=wfn, mesh_xy=mesh_xy, print_fn=print_fn, top=body_unextrap)
+            wfn=wfn, mesh_xy=mesh_xy, print_fn=print_fn)
     return finalize_dynamic_sigma(
         body_omega, head_diag,
         sigma_band_axis=body.band_axis,

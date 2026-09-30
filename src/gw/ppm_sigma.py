@@ -103,6 +103,85 @@ def _residue_for_space(space: str, B_q, B_odd_q=None):
     return B_q + B_odd_q if space == "cond" else B_q - B_odd_q
 
 
+@lru_cache(maxsize=16)
+def band_diagonal_slots(mesh_xy, ndim: int):
+    """Band diagonal of a ``P(..., 'x', 'y')`` band-tiled array, kept in place.
+
+    ``(..., nb, nb) -> (..., nb, p_y)`` at the same spec: the tile that owns
+    element ``(n, n)`` writes it into its one slot, every other slot is an
+    exact zero, so the sum over the last axis is the diagonal bit for bit and
+    nothing moves between ranks.  Needs a square processor mesh.
+    """
+    from common.shard_map import shard_map
+    if int(mesh_xy.shape["x"]) != int(mesh_xy.shape["y"]):
+        raise ValueError("band-diagonal slots need a square processor mesh")
+    spec = P(*((None,) * (ndim - 2)), "x", "y")
+
+    def slots(tile):
+        own = jax.lax.axis_index("x") == jax.lax.axis_index("y")
+        diag = jnp.diagonal(tile, axis1=-2, axis2=-1)
+        return jnp.where(own, diag, jnp.zeros((), tile.dtype))[..., None]
+
+    return shard_map(slots, mesh=mesh_xy, in_specs=spec, out_specs=spec,
+                     check_vma=False)
+
+
+@lru_cache(maxsize=8)
+def _diagonal_of_cube_fn(mesh_xy):
+    return jax.jit(band_diagonal_slots(mesh_xy, 4))
+
+
+@lru_cache(maxsize=8)
+def _diagonal_sum_fn(mesh_xy):
+    return jax.jit(lambda values: jnp.sum(values, axis=-1),
+                   out_shardings=NamedSharding(mesh_xy, P()))
+
+
+@lru_cache(maxsize=8)
+def _diagonal_slots_read_fn(mesh_xy):
+    return jax.jit(lambda values, s, k, n: jnp.sum(values, axis=-1)[s, k, n],
+                   out_shardings=NamedSharding(mesh_xy, P()))
+
+
+@dataclass(frozen=True)
+class BandDiagonalSlots:
+    """The band diagonal of a Sigma(omega) cube without the cube.
+
+    ``values`` is ``(n_omega, nk, nb, p_y)`` at ``P(None, None, 'x', 'y')``
+    (:func:`band_diagonal_slots`).  The readers return what the same reads of
+    the cube return.
+    """
+    values: jax.Array
+    mesh_xy: Mesh
+
+    @classmethod
+    def of(cls, cube, mesh_xy):
+        return cls(_diagonal_of_cube_fn(mesh_xy)(cube), mesh_xy)
+
+    def logical(self, band_axis=None, *, host=True):
+        """``(n_omega, nk, nb_logical)`` on the host (None with ``host=False``)."""
+        diagonal = _diagonal_sum_fn(self.mesh_xy)(self.values)
+        if not host:
+            return None
+        diagonal = np.asarray(diagonal)
+        if band_axis is not None:
+            from runtime.padding import strip_axis
+            diagonal = np.asarray(strip_axis(diagonal, band_axis, axis=-1))
+        return diagonal
+
+    def at_omega_slots(self, slots_s_kn):
+        """``d[slots[s, k, n], k, n]`` on the host, (n_slot, nk, nb_logical)."""
+        slots = np.asarray(slots_s_kn)
+        k_idx = np.arange(slots.shape[1])[None, :, None]
+        n_idx = np.arange(slots.shape[-1])[None, None, :]
+        return np.asarray(_diagonal_slots_read_fn(self.mesh_xy)(
+            self.values, slots, k_idx, n_idx))
+
+    def block_until_ready(self):
+        self.values.block_until_ready()
+        return self
+
+
 @dataclass(frozen=True)
 class BandCountCube:
     """The cumulative band-count points of Sigma_c(omega), served one at a time.
@@ -122,8 +201,8 @@ class BandCountCube:
     BZ it is false and a matrix point IS the stored array, so the two cubes
     of the sweep are the two the extrapolation returns.
     """
-    matrices: tuple
-    diagonals: tuple
+    matrices: list
+    diagonals: list
     #: wedge matrix -> full BZ; wedge diagonal -> full-BZ cube holding it.
     unfold: Callable
     unfold_diagonal: Callable
@@ -155,15 +234,20 @@ class BandCountCube:
         jax.block_until_ready((self.matrices, self.diagonals))
         return self
 
+    def release(self):
+        """Drop the stored counts once the extrapolation has consumed them
+        (without symmetry they are the points themselves)."""
+        self.matrices.clear()
+        self.diagonals.clear()
+
     def __sub__(self, other):
         if self.term is not None or other.term is not None:
             raise ValueError(
                 "BandCountCube: a difference is taken before the static term")
         return replace(
             self,
-            matrices=tuple(a - b for a, b in zip(self.matrices, other.matrices)),
-            diagonals=tuple(
-                a - b for a, b in zip(self.diagonals, other.diagonals)))
+            matrices=[a - b for a, b in zip(self.matrices, other.matrices)],
+            diagonals=[a - b for a, b in zip(self.diagonals, other.diagonals)])
 
 
 @dataclass(frozen=True)
