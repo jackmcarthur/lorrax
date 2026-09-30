@@ -1541,6 +1541,7 @@ def assemble_delta_head_manifold(
     nb_logical: int | None = None,
     nb_links: int | None = None,
     nb_active: int | None = None,
+    outer_tail_diagonal=None,
 ):
     """Embed active DeltaH and the current diagonal sum-band tail.
 
@@ -1555,10 +1556,28 @@ def assemble_delta_head_manifold(
     the carrier width is the active width, preserving the historical route.
     The supplied active matrix must have exactly null padding outside this
     physical block (as ``qp_frame_delta_h_dft`` does for a zero-padded U).
+
+    ``outer_tail_diagonal`` supplies an authenticated complete outer-band
+    spectrum instead of continuing the highest head shift. Its shape is
+    ``(nk, nb_links)`` in Ry, including every physical outer band; only
+    synthetic carrier slots are zero-padded. Post-SC consumers use this to
+    preserve the published ladder even when its tail is piecewise (e.g.
+    unshifted WFN states above the SC sum). Defaults remain the SC route.
     """
     delta = jnp.asarray(delta_h_active)
     tail = jnp.asarray(tail_diagonal)
-    if nb_links is not None and nb_logical is not None:
+    if outer_tail_diagonal is not None:
+        from common.parallel_transport import band_storage_extent
+        from runtime.padding import pad_axis
+        if nb_links is None or nb_logical is None or int(nb_links) < int(nb_logical):
+            raise ValueError("full outer tail needs links containing the logical head")
+        tail = jnp.asarray(outer_tail_diagonal)
+        if (tail.ndim != 2 or tail.shape[0] != delta.shape[0]
+                or tail.shape[1] != int(nb_links)):
+            raise ValueError("outer_tail_diagonal must be (nk,nb_links) in Ry")
+        nb_storage = band_storage_extent(mesh, int(nb_links))
+        tail = pad_axis(tail, int(nb_storage), axis=1).array
+    elif nb_links is not None and nb_logical is not None:
         # The links' carrier (band_storage_extent, the whole mesh product)
         # can exceed the head's (head_storage_extent) with no outer set.
         from common.parallel_transport import band_storage_extent
