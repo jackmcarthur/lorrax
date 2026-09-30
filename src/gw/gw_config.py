@@ -3799,20 +3799,6 @@ def refuse_unsupported_bispinor_gw(config) -> None:
                 "ignored\n"
                 "  doc:  docs/architecture/four_current_wiring.md, "
                 "'Self-consistency and restart'.")
-        if (config.qp_solver is QPSolver.SELF_CONSISTENT
-                and config.sc.head_update == "dft_velocity"
-                and int(config.sc.max_iter) < 2):
-            raise ValueError(
-                "GATE full_shared_pole_dft_velocity_one_map: the "
-                "four-current dft_velocity head follows the maps after "
-                "map 0, so a one-map run has no accepted iteration head "
-                "and would refuse only at the end "
-                "(GATE sc_final_map_requires_iteration_head).\n"
-                f"  got:  sc_head_update = dft_velocity, sc_max_iter = "
-                f"{int(config.sc.max_iter)}\n"
-                "  want: sc_max_iter >= 2, or sc_head_update = off\n"
-                "  doc:  docs/architecture/four_current_wiring.md, "
-                "'Self-consistency and restart'.")
         return
     if not bool(config.bispinor):
         raise ValueError(
