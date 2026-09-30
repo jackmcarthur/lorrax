@@ -1086,7 +1086,6 @@ def main(argv=None):
 			pseudos,
 			nspinor=int(wfn.nspinor),
 			compute_contact=bool(args.static_gauge_hall_only),
-			compute_transfer_q2=False,
 		)
 		# ── DFT+U: i[r, V_U] joins the velocity, or the run refuses ─────────
 		# ``resolve_hubbard_input`` is the one owner of the rule: the QE schema

@@ -39,10 +39,11 @@ not at any point in the future be a nonlocal k/q dependent current vertex").
 
 **Why.** The owner's ruling.
 
-**Deleted.** Every to-do for that vertex. The unused finite-transfer remnants
-(`common.mtxel_sweep.FiniteTransferCurrentEndpoint`, the
-`include_transfer_q2` jet, `psp.vnl_ops.ICLVNLTransferJet`'s q² capability)
-may be deleted.
+**Deleted.** Every to-do for that vertex, and the unused finite-transfer
+code: `common.mtxel_sweep.FiniteTransferCurrentEndpoint`, the
+`include_transfer_q2` jet, `psp.vnl_ops.ICLVNLTransferJet` and its wrapper,
+the third-derivative (`Gppp`, l+3) radial family and the finite-q
+`q_cart_bohr_inv` gate.
 
 ## 2026-09-28 — No quadrature rule is stored across runs
 
