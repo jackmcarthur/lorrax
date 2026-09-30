@@ -77,6 +77,23 @@ the dataset's extent.
 - **Unchanged:** the bytes in the file, the dataset layout and every call
   signature.
 
+**Distributed reads arrive in the same row blocks.** A `read_slab` whose
+`partition_spec` leaves the split axis `k` and every axis before it
+replicated, and puts every mesh axis on a later axis (a face `(q, μ_X, ν_Y)`
+restart tensor), is read piece by piece with the writer's plan and 64 MiB
+budget (`_file_order_read_plan`).
+- Each rank reads its contiguous rows of one piece, at the valid extent.
+- The device pads the piece to the carrier and moves it into the requested
+  sharding by one volume-preserving exchange per mesh axis, the writer's
+  exchanges reversed.
+- The piece is inserted into the output, which is donated at every insertion.
+
+Host staging is one piece per rank instead of the rank's whole tile, and no
+rank holds more than its share of the output plus one piece. Every other
+layout keeps the one-call collective read: a sharded split or leading axis, a
+mesh axis left unused, runs shorter than 1 MiB, or a trailing axis read only
+in part. The array returned is the same.
+
 **One collective lane per process.** Every handle's asynchronous writes go
 through one queue and one worker (`_slab_io_ffi._CollectiveLane`), so
 collective HDF5 calls leave in program order, which is the same on every
