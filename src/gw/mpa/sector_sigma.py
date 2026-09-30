@@ -110,7 +110,7 @@ def _w_contraction(mesh_xy, grid, nk, mc, nt_n, kcarrier, layout, weights_fn):
     return kernel
 
 
-def sector_tau_factory(left, right, keys, meta, mesh_xy):
+def sector_tau_factory(left, right, keys, meta, mesh_xy, *, real_weights=False):
     """Stream exact Dirac quarters and Lorentz components through mode7.
 
     Fixed monomial vertices act on projector faces, so each convolution
@@ -165,6 +165,7 @@ def sector_tau_factory(left, right, keys, meta, mesh_xy):
 
         def spatial(xn, yr, xr, yn, energies, weight, reference, time, interactions):
             phases = _weighted_tau_phases(energies,1j*time,e_ref=reference,band_weight=weight)
+            if real_weights:phases=jnp.real(phases)
             band_shape=(q,band_axis.padded,band_axis.padded)
             result=jax.lax.with_sharding_constraint(jnp.zeros(band_shape,jnp.complex128),
                 NamedSharding(mesh_xy,P(None,'x','y')))
@@ -174,7 +175,7 @@ def sector_tau_factory(left, right, keys, meta, mesh_xy):
                 xhalf=jax.lax.dynamic_slice_in_dim(xn,2*h,2,axis=1)
                 yhalf=jax.lax.dynamic_slice_in_dim(yr,2*g,2,axis=2)
                 green=build_G_parents(xhalf,yhalf,phases=phases,layout='face',
-                                      gemm=gemm,k_unfold_plan=halves[0])
+                                      gemm=gemm,k_unfold_plan=halves[0],real_weights=real_weights)
                 # Both doors have the same typed two-spinor action; only the
                 # authenticated p^(h+g) endpoint sign differs.
                 def component(index,total):
@@ -195,7 +196,7 @@ def sector_tau_factory(left, right, keys, meta, mesh_xy):
 
         native=_native_workspace(mesh_xy,(((q,band_axis.padded,2*m),(q,2*m,2*n)),
             ((q,band_axis.padded,2*n),(q,2*n,band_axis.padded))))
-        key=('quarter-stream',mesh_xy,shapes,int(band_axis.padded),tuple(keys),grid,
+        key=('quarter-stream',mesh_xy,shapes,int(band_axis.padded),tuple(keys),grid,real_weights,
              int(meta.nk_tot),id(plans[0]),id(plans[1]))
         return SynthesisTau(spatial,synthesis,right_yr,right_proj,
             native+synthesis.native,f'sigma.sector.tau.{keys[0]}',meta,key,plans)
@@ -377,7 +378,7 @@ def _sector_stream_synthesis(readers,headers,bases,syms,layout,frequencies,meta,
         return _SectorComponents(kernel,(x,y,poles,intervals),ref,time,hole)
     return WSynthesis(w_kernel,window_operands,lambda:(x,y,poles),close,native,
         ('sector-components',mesh_xy,grid,nk,m,n,nc,nt,carrier,width,bcap,
-         tuple(_static_key((h,b.active_mask)) for h,b in zip(headers,bases))),ordered=True)
+         tuple((item['span'],tuple(map(int,item['rows'])),item['routes']) for item in panels)),ordered=True)
 
 
 def sector_synthesis(readers, headers, bases, syms, layout, frequencies, meta, mesh_xy,
@@ -524,62 +525,112 @@ def sector_synthesis(readers, headers, bases, syms, layout, frequencies, meta, m
                       ('w',mesh_xy,tuple(left['grid']),nk,m,nc,n,nt,kcarrier,layout),ordered=True)
 
 
+_CONSTANT_COMPONENT_CONTRACT = {}
+
+
+def _constant_component_contract(tau, rows, nk, m, n):
+    """Stable immutable program; retains geometry/physics, never wavefunction buffers."""
+    key=(tau._key,tuple(map(int,rows)),int(nk),int(m),int(n))
+    if key not in _CONSTANT_COMPONENT_CONTRACT:
+        spatial=tau._spatial
+        mesh=tau._plans[0].mesh_xy
+        class ConstantComponents:
+            def __init__(self,data):self.data=data
+            def component(self,A,B):
+                return jax.lax.with_sharding_constraint(
+                    jnp.zeros((nk,m,n),jnp.complex128).at[jnp.asarray(rows)].set(self.data[A,B]),
+                    NamedSharding(mesh,P(None,'x','y')))
+        @jax.jit
+        def contract(xn,yr,xr,yn,energy,weight,data):
+            return spatial(xn,yr,xr,yn,energy,weight,0.,0.,ConstantComponents(data))
+        _CONSTANT_COMPONENT_CONTRACT[key]=(tau._plans,contract)
+    return _CONSTANT_COMPONENT_CONTRACT[key][1]
+
+
 def instantaneous_sector_sigma(handle, families, bases, meta, mesh_xy, *,
                                occupation_state, return_components=False):
-    """Exchange-like equal-time contraction of W_infinity-V, exactly once."""
-    from gw.photon_layout import PhotonBasisLayout, photon_block_view, pack_photon_operator
-    from gw.photon_sigma import contract_lorentz_blocks, _TERM_X
-    from gw.cohsex_sigma import _resolve_Gij
+    """Equal-time W_infinity-V, from bounded native q panels and Dirac quarters.
+
+    Read each packed parent panel once. Its Lorentz mixing remains coupled;
+    restore one endpoint class on its child panel, then stream each scalar
+    component through the same exact quarter-spin Sigma owner as dynamic W.
+    No whole-bank photon matrix or full-q TT operator is materialized.
+    """
+    from gw.photon_layout import PhotonBasisLayout,photon_block_view,pack_photon_operator
+    from gw.cohsex_sigma import _resolve_Gij,_occ_diag_full
     from gw.qgrid_symmetry import qgrid_trs_policy_from_shared_pole_store
-    from file_io.shared_pole_store import read_bank_constant_header, read_bank_constant
+    from gw.w_isdf import photon_blocks_full_q
+    from gw.photon_sigma import band_sigma_finish
+    from file_io.shared_pole_store import read_bank_constant_header,read_bank_constant
+    from gw.ppm_sigma import sigma_band_axis
     header=read_bank_constant_header(handle,mesh_xy=mesh_xy)
     raw_layout=PhotonBasisLayout.from_centroid_extents(bases[0].n_logical,bases[1].n_logical,mesh_xy)
     layout=PhotonBasisLayout.from_centroid_extents(bases[0].n_packed,bases[1].n_packed,mesh_xy,packed=True)
-    nq=int(header['bank_shape']['nq'])
-    amount=16*nq*max(raw_layout.packed_extent,layout.packed_extent)**2//mesh_xy.size
-    meta.shared_pole_capacity.reserve('sigma.sector.constant.pack',
-        resident_bytes_per_rank=2*amount,workspace_bytes_per_rank=2*amount,
-        concurrent_with=meta.shared_pole_capacity.live_stages)
-    raw=read_bank_constant(handle,header,meta=meta,mesh_xy=mesh_xy)
-    def block(A,B):
-        value=photon_block_view(raw,raw_layout,A,B,mesh_xy)
-        value=bases[bool(A)].pack_axis(value,1,spec=P(None,'x','y'))
-        return bases[bool(B)].pack_axis(value,2,spec=P(None,'x','y'))
-    packed=pack_photon_operator(block,nq,layout,mesh_xy)
-    packed.block_until_ready()
-    del raw
-    response=SimpleNamespace(V_packed=packed,W_packed=packed,layout=layout,
-        family_plans=tuple(f.green_parent.plan for f in families),head_completion=None,
-        qgrid_policy=qgrid_trs_policy_from_shared_pole_store(header,announce=False))
+    nq=int(header['bank_shape']['nq']);d=max(raw_layout.packed_extent,layout.packed_extent)
+    plans=tuple(f.green_parent.plan for f in families)
+    parents=np.asarray(plans[0].sym.irr_idx_q,np.int32)
+    policy=qgrid_trs_policy_from_shared_pole_store(header,announce=False)
+    ledger=meta.shared_pole_capacity;ambient=ledger.live_stages
+    room=ledger.room_bytes_per_rank(ambient)
+    tile=16*meta.nk_tot*max(b.n_packed for b in bases)**2//mesh_xy.size
+    bcap=nq
+    while True:
+        child=max(np.count_nonzero((parents>=lo)&(parents<min(lo+bcap,nq))) for lo in range(0,nq,bcap))
+        # Raw + packed conversions, all coupled current-child components,
+        # one full-q scalar W and its FFT form. The compiled contraction
+        # admits the actual Green/projector workspace before dispatch.
+        amount=16*bcap*d*d//mesh_xy.size
+        stage_bytes=4*amount+16*child*9*max(b.n_packed for b in bases)**2//mesh_xy.size
+        if stage_bytes+2*tile<=room:break
+        if bcap==1:
+            raise MemoryError('GATE shared_pole_capacity: constant q-panel minimum exceeds room')
+        bcap=max(1,bcap//2)
     gij=_resolve_Gij(None,meta,mesh_xy,occupation_state)
-    keys=tuple((a,b) for a in range(4) for b in range(4))
-    def admit(kernel,args,key):
-        a,b=map(bool,key)
-        left,right=(families[i].green_parent for i in (a,b))
-        q=left.plan.n_parent;m=left.plan.n_centroid_packed*left.plan.nspinor
-        n=right.plan.n_centroid_packed*right.plan.nspinor;k=left.psi_nmu.shape[1]
-        # The static face projector contracts O @ psi_right, then
-        # psi_left† @ T, both over the padded carrier (k), before the
-        # final logical-band slice. Query those actual GEMM shapes.
-        native=_native_workspace(mesh_xy,(((q,m,k),(q,k,n)),
-            ((q,m,n),(q,n,k)),((q,k,m),(q,m,k))))
-        _admit_compiled(kernel,args,meta,f'sigma.sector.constant.{key}',
-                        native=native,resident=amount)
-    total=None
-    currents=[None,None]
-    for key,value,_ in contract_lorentz_blocks(keys,families=families,term=_TERM_X,
-            response=response,Gij=gij,meta=meta,mesh_xy=mesh_xy,admit_kernel=admit):
-        total=value if total is None else total+value
-        if return_components and key != (0,0):
-            channel=int(key[0] != 0 and key[1] != 0)  # 0: CT+TC, 1: TT
-            currents[channel]=(value if currents[channel] is None
-                               else currents[channel]+value)
-    from gw.photon_sigma import band_sigma_finish
-    finish=band_sigma_finish(mesh_xy,int(families[0].slices.nb_sigma),
-                             families[0].green_parent.plan.sym)
-    if return_components:
-        return finish(total), finish(currents[0]), finish(currents[1])
-    return finish(total)
+    total=None;currents=[None,None]
+    try:
+        for lo in range(0,nq,bcap):
+            hi=min(lo+bcap,nq);q_span=(lo,hi)
+            rows=np.flatnonzero((parents>=lo)&(parents<hi)).astype(np.int32)
+            panel_stage=f'sigma.sector.constant.q{lo}'
+            ledger.reserve(panel_stage,resident_bytes_per_rank=stage_bytes,
+                workspace_bytes_per_rank=0,concurrent_with=ambient)
+            ledger.live_stages=(*ambient,panel_stage)
+            raw=read_bank_constant(handle,header,meta=meta,mesh_xy=mesh_xy,q_span=q_span)
+            def block(A,B):
+                value=photon_block_view(raw,raw_layout,A,B,mesh_xy)
+                value=bases[bool(A)].pack_axis(value,1,spec=P(None,'x','y'))
+                return bases[bool(B)].pack_axis(value,2,spec=P(None,'x','y'))
+            packed=pack_photon_operator(block,hi-lo,layout,mesh_xy)
+            packed.block_until_ready();del raw
+            for a,b in ((0,0),(0,1),(1,0),(1,1)):
+                lefts=(1,2,3) if a else (0,);rights=(1,2,3) if b else (0,)
+                keys=tuple((A,B) for A in lefts for B in rights)
+                values=tuple(value for _,value in photon_blocks_full_q(packed,keys,
+                    layout=layout,family_plans=plans,qgrid_policy=policy,q_span=q_span))
+                children=jnp.stack(values).reshape(len(lefts),len(rights),len(rows),
+                    bases[a].n_packed,bases[b].n_packed)
+                children.block_until_ready();del values
+                family=families[a]
+                weight=plans[a].parent_rows(_occ_diag_full(gij,family.slices.nb_sigma,family.slices.nb_full))
+                energy=jnp.zeros_like(weight)
+                xn,_,xr,_,_,_=parent_sigma_operands(family)
+                axis=sigma_band_axis(int(family.slices.nb_sigma),mesh_xy,ansatz='dynamic')
+                synthesis=SimpleNamespace(native=0)
+                tau=sector_tau_factory(family,families[b],keys,meta,mesh_xy,real_weights=True)(synthesis,axis)
+                m,n=bases[a].n_packed,bases[b].n_packed
+                contract=_constant_component_contract(tau,rows,meta.nk_tot,m,n)
+                args=(xn,tau._right[0],pad_to_axis(xr,axis,axis=1),tau._right[1],energy,weight,children)
+                _admit_compiled(contract,args,meta,f'sigma.sector.constant.{lo}.{keys[0]}',native=tau._native)
+                value=contract(*args)
+                total=value if total is None else total+value
+                if return_components and (a or b):
+                    channel=int(bool(a and b))
+                    currents[channel]=value if currents[channel] is None else currents[channel]+value
+                total.block_until_ready();del children
+            del packed
+    finally:ledger.live_stages=ambient
+    finish=band_sigma_finish(mesh_xy,int(families[0].slices.nb_sigma),plans[0].sym)
+    return (finish(total),finish(currents[0]),finish(currents[1])) if return_components else finish(total)
 
 
 def compute_sector_sigma(handle, families, bases, meta, mesh_xy, *,
