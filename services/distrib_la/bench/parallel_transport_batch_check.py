@@ -117,7 +117,8 @@ def main():
             row,_,_ = compare(raw)
             row.update(kind='production_size_actual_wfn',logical_bands=args.perf_bands)
             receipts.append(row)
-            rank0_transaction(lambda:(out/'parity.json').write_text(json.dumps(receipts,indent=2)+'\n'))
+            rank0_transaction(out/'parity.json', stage='PT production-size polar parity',
+                              write=lambda:(out/'parity.json').write_text(json.dumps(receipts,indent=2)+'\n'))
             print(json.dumps(receipts),flush=True)
             return
         # Closed singular clusters, a small retained direction, rejected
@@ -207,7 +208,8 @@ def main():
             row,_,_ = compare(raw)
             row.update(kind='production_size_actual_wfn',logical_bands=args.perf_bands)
             receipts.append(row)
-    rank0_transaction(lambda:(out/'parity.json').write_text(json.dumps(receipts,indent=2)+'\n'))
+    rank0_transaction(out/'parity.json', stage='PT actual WFN and artifact parity',
+                      write=lambda:(out/'parity.json').write_text(json.dumps(receipts,indent=2)+'\n'))
     print(json.dumps(receipts),flush=True)
 
 
