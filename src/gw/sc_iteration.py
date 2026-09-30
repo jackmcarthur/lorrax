@@ -4203,7 +4203,7 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
     if os.environ.get("LORRAX_EXP_LOWDIN"):
         H_qp_dft_full = _exp_lowdin_fold(
             H_qp_dft_full, inputs, state, ks, partition, scissor_classes,
-            sigma0_kn, energies_loop)
+            sigma0_kn, energies_loop, U_qp)
 
     # ── THE UN-EXTRAPOLATED TWIN ────────────────────────────────────────
     # Present only when ``use_band_extrapolation`` drove this stage's Σ.
@@ -4344,7 +4344,7 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
 
 
 def _exp_lowdin_fold(H, inputs, state, ks, partition, scissor_classes,
-                     sigma0_kn, energies_loop):
+                     sigma0_kn, energies_loop, U_qp=None):
     """EXPERIMENT LOWDIN (not for landing).  Run at number_bands_protected = N;
     emulate b3 = LORRAX_EXP_LOWDIN: the output H is blockdiag(H_pp + fold,
     diag(E_t)), E_t the main tail scissor fitted on identities < b3 (same
@@ -4382,6 +4382,20 @@ def _exp_lowdin_fold(H, inputs, state, ks, partition, scissor_classes,
     Hpp = 0.5 * (Hn[:, :b, :b] + np.conj(np.swapaxes(Hn[:, :b, :b], 1, 2)))
     Hpt = Hn[:, :b, b:]
     out = np.zeros_like(Hn)
+    # EXPERIMENT OCCTAIL (not for landing): occupied DFT rows v couple to tail t >= b through
+    # H_vt = [kin_ion + V_H + Sigma_xc(E_F)]_vt (mode-B at E_F); rotating conduction-tail = 0.
+    occtail = os.environ.get("LORRAX_EXP_OCCTAIL", "0") == "1"
+    H_ef = None
+    if occtail:
+        from . import qsgw_utils as _qu
+        D = _qu._EXP_OCCTAIL_D
+        if D is None:
+            raise RuntimeError("OCCTAIL: Sigma(E_F) stash missing")
+        D = np.asarray(D) if ks.is_identity else np.asarray(ks.select(D))
+        Uh = np.array(gather_to_host(U_qp), dtype=np.complex128)
+        H_ef = Hn + np.einsum("kmp,kpq,knq->kmn", Uh, D, Uh.conj())
+        vmask = np.asarray(valence_kn, dtype=bool)
+    ot_max, ot_diffmax = 0.0, 0.0
     dmin, fmax = np.inf, 0.0
     for k in range(nk):
         e, V = np.linalg.eigh(Hpp[k])
@@ -4392,11 +4406,22 @@ def _exp_lowdin_fold(H, inputs, state, ks, partition, scissor_classes,
         fmax = max(fmax, float(np.abs(np.diag(F).real).max()))
         out[k, :b, :b] = Hpp[k] + (V @ F @ V.conj().T if fold_on else 0.0)
         out[k, b:, b:] = np.diag(e_t[k]).astype(np.complex128)
+        if occtail:
+            v = np.nonzero(vmask[k, :b])[0]
+            blk = 0.5 * (H_ef[k][np.ix_(v, np.arange(b, nb))]
+                         + H_ef[k][np.ix_(np.arange(b, nb), v)].conj().T)
+            out[k][np.ix_(v, np.arange(b, nb))] = blk
+            out[k][np.ix_(np.arange(b, nb), v)] = blk.conj().T
+            ot_max = max(ot_max, float(np.abs(blk).max()))
+            ot_diffmax = max(ot_diffmax, float(np.abs(blk - Hn[k][np.ix_(v, np.arange(b, nb))]).max()))
     _record_sc(inputs, f"    LOWDIN EXPERIMENT b3={b} fold={'on' if fold_on else 'off'} map "
                f"{int(state.iteration)}: tail alpha={getattr(fit, 'alpha_c', 1.0):+.4f} "
                f"beta={getattr(fit, 'beta_c_ev', 0.0):+.4f} eV {note}; min|e_p-E_t| "
                f"{dmin * RYD_TO_EV:.4f} eV; max|fold_aa| {fmax * RYD_TO_EV * 1e3:.2f} meV; "
-               f"max|H_pt| {np.abs(Hpt).max() * RYD_TO_EV * 1e3:.2f} meV")
+               f"max|H_pt| {np.abs(Hpt).max() * RYD_TO_EV * 1e3:.2f} meV"
+               + (f"; OCCTAIL max|H_vt(E_F)| {ot_max * RYD_TO_EV * 1e3:.2f} meV, "
+                  f"max|H_vt(E_F) - H_vt(modeA)| {ot_diffmax * RYD_TO_EV * 1e3:.2f} meV"
+                  if occtail else ""))
     return device_put_process_local(out.astype(np.asarray(Hn).dtype), H.sharding)
 
 

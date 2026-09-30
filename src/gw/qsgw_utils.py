@@ -535,6 +535,7 @@ def static_sigma_diag_to_host(sigma_knn, mesh_xy: Mesh) -> np.ndarray:
 # retraced+recompiled the full (nω, nk, nb, nb) gather every SC
 # iteration.
 _QSGW_BUILD_KERNEL_CACHE: dict[tuple[int, bool], object] = {}
+_EXP_OCCTAIL_D = None  # EXPERIMENT OCCTAIL (not for landing)
 
 
 def _qsgw_build_kernel(mesh_xy: Mesh, *, replicated_output: bool):

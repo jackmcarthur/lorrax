@@ -682,6 +682,17 @@ def finalize_dynamic_sigma(
         )
         print_fn(f"  QSGW: {int(qsgw_diag['n_clipped'])} clipped "
                  f"({100*qsgw_diag['frac_clipped']:.1f}%)")
+        if os.environ.get("LORRAX_EXP_OCCTAIL", "0") == "1":
+            # EXPERIMENT OCCTAIL (not for landing): stash D = [Sigma_xc(E_F)]^h - Sigma_xc^QSGW
+            # (QP basis, full BZ, host) for sc_iteration._exp_lowdin_fold's occupied-tail rows.
+            from common.collectives import gather_to_host as _g2h
+            from . import qsgw_utils as _qu
+            _sig_ef, _ = build_qsgw_sigma_xc(
+                sigma_c_omega, sig_x_rep, omega_grid_ev,
+                np.zeros_like(np.asarray(e_qp_rel_ev, dtype=np.float64)), mesh_xy,
+                band_axis=sigma_band_axis, out_of_grid=config.sigma.out_of_grid)
+            _qu._EXP_OCCTAIL_D = (np.asarray(_g2h(_sig_ef), dtype=np.complex128)
+                                  - np.asarray(_g2h(sigma_xc_qsgw), dtype=np.complex128))
 
         sigma_lorentz = None
         if sigma_lorentz_static_skij_ry is not None:
