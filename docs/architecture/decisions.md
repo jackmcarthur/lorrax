@@ -30,6 +30,20 @@ W is a pole sum with real poles and positive residues by construction
 ([shared-pole W §4.3](../theory/shared-pole-w-model.md)), the form a Green's
 function has; GN-PPM fits one pole per matrix element.
 
+## 2026-09-29 — The current vertex is the q = 0 velocity operator {#current-vertex-q0}
+
+**Rule (owner).** The current vertex uses the q = 0 (long-wavelength)
+velocity operator by design; no k/q-dependent nonlocal current vertex (the
+finite-transfer Ismail-Beigi–Chang–Louie Γ_NL(k, q)) is planned ("there will
+not at any point in the future be a nonlocal k/q dependent current vertex").
+
+**Why.** The owner's ruling.
+
+**Deleted.** Every to-do for that vertex. The unused finite-transfer remnants
+(`common.mtxel_sweep.FiniteTransferCurrentEndpoint`, the
+`include_transfer_q2` jet, `psp.vnl_ops.ICLVNLTransferJet`'s q² capability)
+may be deleted.
+
 ## 2026-09-28 — No quadrature rule is stored across runs
 
 **Rule (owner).** Every run places its own quadrature rules; nothing is

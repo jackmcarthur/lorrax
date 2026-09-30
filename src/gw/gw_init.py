@@ -3004,8 +3004,7 @@ def _restart_charge_basis(
     		f"qp_state_source_provenance record.  Legacy restart "
     		f"consumers remain available, but this bundle carries NO "
     		f"WavefunctionBasisReceipt because its stored psi/E source "
-    		f"cannot be authenticated; finite-transfer current "
-    		f"construction will refuse. ***")
+    		f"cannot be authenticated. ***")
     else:
     	charge_basis_receipt = (
     		WavefunctionBasisReceipt.from_bound_source(
@@ -3153,8 +3152,7 @@ def _restart_current_carrier(
     			f"  *** LORRAX SANITY: {tensors_filename} carries a "
     			f"matching transverse centroid stamp but no canonical "
     			f"qp_state_source_provenance record.  The transverse "
-    			f"bundle carries NO WavefunctionBasisReceipt; "
-    			f"finite-transfer current construction will refuse. ***")
+    			f"bundle carries NO WavefunctionBasisReceipt. ***")
     	else:
     		transverse_basis_receipt = (
     			WavefunctionBasisReceipt.from_bound_source(

@@ -980,9 +980,13 @@ class FiniteTransferCurrentEndpoint(NamedTuple):
     face would let the incumbent k-FFT silently apply the wrong operator at
     every other q.
 
+    No producer builds this record: the current vertex uses the q = 0
+    (long-wavelength) velocity operator by design, and no k/q-dependent
+    nonlocal current vertex is planned.
+
     The two fingerprints name different facts.  The Hamiltonian identity is
-    byte-identical to the uniform current/contact transaction so a future
-    head/body loader can require exact equality.  The path identity also
+    byte-identical to the uniform current/contact transaction, so the two
+    compare by exact equality.  The path identity also
     binds the finite-segment quadrature order and Ward tolerances; it is the
     numerical certificate for this realization, not a second body-only
     Hamiltonian identity.

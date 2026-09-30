@@ -1919,9 +1919,8 @@ def apply_uniform_vnl_derivatives_to_ket(
 ) -> VNLGaugeKetDerivatives:
     r"""Apply uniform VNL Gamma/Lambda through the shared bounded core.
 
-    Uniform response supplies the same source/target G carrier.  The exact
-    finite-transfer path below supplies two carriers to that same core; there
-    is no second projector, coefficient, or re-expansion implementation.
+    Uniform response supplies the same source/target G carrier; there is no
+    second projector, coefficient, or re-expansion implementation.
     """
     require_uniform_gauge_transfer(
         q_cart_bohr_inv, caller="apply_uniform_vnl_derivatives_to_ket")
