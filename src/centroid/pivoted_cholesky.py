@@ -87,7 +87,7 @@ import symmetry_maps                                            # noqa: E402
 
 _SELECT_HEARTBEAT_S = 60.0
 
-_GRAM_MIN_COL_BLOCK = 256
+_GRAM_MIN_COL_BLOCK = 1
 _GRAM_COMPLEX_BYTES = 16
 _GRAM_SEED_BUDGET_FRACTION = 0.25
 _GRAM_FINAL_FOLD_SLOTS = 3
@@ -366,6 +366,8 @@ def auto_gram_col_block_width(
     *,
     divisor: int = 1,
     min_width: int = _GRAM_MIN_COL_BLOCK,
+    x_shards: int = 1,
+    y_shards: int = 1,
 ) -> int:
     """Largest mesh-aligned Gram seed tile whose square-law price fits.
 
@@ -381,11 +383,17 @@ def auto_gram_col_block_width(
         raise MemoryError(
             f"Gram tile planner has no positive seed budget: {budget_i} B"
         )
-    coefficient = gram_col_block_bytes(nk, nspinor, 1)
-    max_unaligned = math.isqrt(budget_i // coefficient)
-    width = (max_unaligned // divisor_i) * divisor_i
+    # The seed is a per-device screen, as is the budget. Legal square
+    # tiles divide both mesh axes; price one aligned unit and scale its
+    # square, then let the actual executable certify the full live set.
+    coefficient = gram_col_block_device_bytes(
+        nk, nspinor, divisor_i, divisor_i,
+        x_shards=x_shards, y_shards=y_shards)
+    width = math.isqrt(budget_i // coefficient) * divisor_i
     if width < min_aligned:
-        required = gram_col_block_bytes(nk, nspinor, min_aligned)
+        required = gram_col_block_device_bytes(
+            nk, nspinor, min_aligned, min_aligned,
+            x_shards=x_shards, y_shards=y_shards)
         raise MemoryError(
             "Gram tile seed planner refuses before pair-density "
             f"allocation: nk={int(nk)}, nspinor={int(nspinor)}, minimum "
@@ -1405,6 +1413,106 @@ def build_gram_q0_via_loadwfns(
     band_chunk_size: int = 64,
     memory_per_device_gb: float | None = None,
 ) -> jnp.ndarray:
+    """Accumulate the exact q=0 Gram over memory-sized full-BZ k batches.
+
+    The only persistent result is the P(x,y) candidate Gram. The shared WFN
+    sampler returns X/Y faces for this batch alone. k weights retain their
+    original full-zone normalization, so batching changes summation grouping,
+    not the metric, band windows, spin vertices or physical k grid.
+    """
+    from common.gpu_utils import device_budget_bytes, device_room_bytes
+    from runtime.padding import padded_axis, padded_mu_extent
+    if band_range_left is None or band_range_right is None:
+        if n_val is None or n_cond is None:
+            raise ValueError("supply n_val/n_cond or both explicit band windows")
+        left = (0, int(n_val))
+        right = (0, int(n_val) + int(n_cond))
+    else:
+        left, right = band_range_left, band_range_right
+    nb_l, nb_r = int(left[1]-left[0]), int(right[1]-right[0])
+    if min(nb_l, nb_r) <= 0:
+        raise ValueError("candidate Gram band windows must be nonempty")
+    nk_full = int(sym.nk_tot)
+    weights = (np.full(nk_full, 1.0/nk_full) if k_weights is None
+               else np.asarray(k_weights, dtype=np.float64))
+    if (weights.shape != (nk_full,) or not np.isfinite(weights).all()
+            or np.any(weights < 0)
+            or not np.isclose(weights.sum(), 1.0, rtol=1e-12, atol=1e-14)):
+        raise ValueError("candidate Gram needs normalized nonnegative full-BZ k weights")
+    selected_rows = np.flatnonzero(weights > 0)
+    weights = weights[selected_rows]
+    nk = int(selected_rows.size)
+    budget = (float(memory_per_device_gb)*1e9
+              if memory_per_device_gb and memory_per_device_gb > 0
+              else float(device_budget_bytes()))
+    budget = minimum_process_budget_gb(budget/1e9)*1e9
+    room = min(budget, float(device_room_bytes()))
+    px, py = int(mesh_xy.shape['x']), int(mesh_xy.shape['y'])
+    mu = padded_mu_extent(int(cand_idx.shape[0]), mesh_xy)
+    ns = 4 if bispinor else int(wfn.nspinor)
+    # The current sampler's band accumulator rounds to its transfer tile.
+    # Price that padding, both returned faces, and both distinct windows.
+    p_band = int(mesh_xy.size)
+    def bands(width):
+        tile = padded_axis(min(width, max(1, int(band_chunk_size))), p_band,
+                           name="candidate WFN band tile").carrier
+        return padded_axis(width, tile, name="candidate WFN band accumulator").carrier
+    nb_faces = bands(nb_l) + (0 if left == right else bands(nb_r))
+    per_k = 16*ns*mu*nb_faces*(1.0/px+1.0/py)
+    # Leave half the live room for loader/FFT and compiler-certified Gram work.
+    k_limit = max(1, int(0.5*room/max(per_k, 1)))
+    n_chunks = -(-nk // k_limit)
+    k_batch = -(-nk // n_chunks)
+    if verbose:
+        print(f"[candidate Gram k batches] nk={nk}, batch={k_batch}, "
+              f"chunks={n_chunks}, WFN faces<= {per_k*k_batch/2**30:.2f} "
+              f"GiB/device; same full-zone weights and band windows")
+    result = None
+    for k0 in range(0, nk, k_batch):
+        k1 = min(nk, k0+k_batch)
+        rows = (None if n_chunks == 1 and nk == nk_full else
+                tuple(int(k) for k in selected_rows[k0:k1]))
+        block = _build_gram_q0_kbatch(
+            wfn, sym, cand_idx, n_val=n_val, n_cond=n_cond, mesh_xy=mesh_xy,
+            bispinor=bispinor, gamma_mode=gamma_mode, verbose=verbose,
+            band_range_left=left, band_range_right=right,
+            band_norms=band_norms, k_weights=weights[k0:k1],
+            band_chunk_size=band_chunk_size, memory_per_device_gb=budget/1e9,
+            full_k_rows=rows)
+        result = block if result is None else _candidate_gram_add_kernel(mesh_xy)(result, block)
+        jax.block_until_ready(result)
+    return result
+
+
+@lru_cache(maxsize=None)
+def _candidate_gram_add_kernel(mesh_xy):
+    xy = NamedSharding(mesh_xy, PartitionSpec('x', 'y'))
+    @partial(jax.jit, in_shardings=(xy, xy), out_shardings=xy,
+             donate_argnums=(0, 1))
+    def add(a, b):
+        return a + b
+    return add
+
+
+def _build_gram_q0_kbatch(
+    wfn: "WfnLoader",
+    sym: symmetry_maps.SymMaps,
+    cand_idx: jnp.ndarray,
+    n_val: int | None = None,
+    n_cond: int | None = None,
+    mesh_xy: Mesh | None = None,
+    *,
+    bispinor: bool = False,
+    gamma_mode: str = "charge",
+    verbose: bool = True,
+    band_range_left: tuple[int, int] | None = None,
+    band_range_right: tuple[int, int] | None = None,
+    band_norms: np.ndarray | None = None,
+    k_weights: np.ndarray | None = None,
+    band_chunk_size: int = 64,
+    memory_per_device_gb: float | None = None,
+    full_k_rows=None,
+) -> jnp.ndarray:
     """Build the q=0 candidate Gram on a 2-D mesh using gw_jax's data path.
 
     Two band-window call modes:
@@ -1540,17 +1648,17 @@ def build_gram_q0_via_loadwfns(
         bispinor=bispinor,
     )
 
+    nk_selected = int(sym.nk_tot) if full_k_rows is None else len(full_k_rows)
     if k_weights is None:
-        kw_np = np.full(int(sym.nk_tot), 1.0 / float(sym.nk_tot),
+        kw_np = np.full(nk_selected, 1.0 / float(sym.nk_tot),
                         dtype=np.float64)
     else:
         kw_np = np.asarray(k_weights, dtype=np.float64)
-        if kw_np.shape != (int(sym.nk_tot),):
+        if kw_np.shape != (nk_selected,):
             raise ValueError(
                 "k_weights must have one entry per unfolded full-BZ k point; "
-                f"got {kw_np.shape}, expected {(int(sym.nk_tot),)}")
-        if (not np.all(np.isfinite(kw_np)) or np.any(kw_np < 0.0)
-                or not np.isclose(kw_np.sum(), 1.0, rtol=1e-12, atol=1e-14)):
+                f"got {kw_np.shape}, expected {(nk_selected,)}")
+        if (not np.all(np.isfinite(kw_np)) or np.any(kw_np < 0.0)):
             raise ValueError(
                 "k_weights must be finite, nonnegative, and sum to one; "
                 f"got sum={kw_np.sum():.17g}")
@@ -1570,7 +1678,7 @@ def build_gram_q0_via_loadwfns(
     # faces.  A one-k fixed tile is the hard memory bound; the shared
     # transform owner pads only the final tile and reuses one executable, so
     # this changes transfer scheduling, not the Gram or selection semantics.
-    prune_k_tile = 1
+    prune_k_tile = 1 if full_k_rows is None else min(64, len(full_k_rows))
 
     # Optional pseudoband norms — same clamp recipe as isdf_fitting.
     if band_norms is not None:
@@ -1608,7 +1716,7 @@ def build_gram_q0_via_loadwfns(
         psi_l_rmu_Y, psi_l_rmuT_X = load_centroids_band_chunked(
             wfn, sym, meta, cand_idx, bispinor, mesh_xy, left_range,
             band_chunk_size=band_chunk_size,
-            k_chunk_size=prune_k_tile,
+            k_chunk_size=prune_k_tile, full_k_rows=full_k_rows,
         )
         if norms_l_j is not None:
             # Y shape (nk, nb, ns, n_rmu); X shape (nk, n_rmu, nb, ns)
@@ -1672,6 +1780,7 @@ def build_gram_q0_via_loadwfns(
         else:
             col_block = auto_gram_col_block_width(
                 nk_, ns_, seed_budget_bytes, divisor=tile_divisor,
+                x_shards=n_x, y_shards=n_y,
             )
     if col_block >= M_cols:
         col_block = 0  # one full block == the original computation
@@ -1685,7 +1794,7 @@ def build_gram_q0_via_loadwfns(
                     wfn, sym, meta, cand_idx, bispinor, mesh_xy,
                     right_range,
                     band_chunk_size=band_chunk_size,
-                    k_chunk_size=prune_k_tile,
+                    k_chunk_size=prune_k_tile, full_k_rows=full_k_rows,
                 )
                 if norms_r_j is not None:
                     psi_r_rmu_Y = psi_r_rmu_Y / norms_r_j[None, :, None, None]
@@ -1836,7 +1945,7 @@ def build_gram_q0_via_loadwfns(
             psi_r_rmu_Y, psi_r_rmuT_X = load_centroids_band_chunked(
                 wfn, sym, meta, cand_idx, bispinor, mesh_xy, right_range,
                 band_chunk_size=band_chunk_size,
-                k_chunk_size=prune_k_tile,
+                k_chunk_size=prune_k_tile, full_k_rows=full_k_rows,
             )
             if norms_r_j is not None:
                 psi_r_rmu_Y = psi_r_rmu_Y / norms_r_j[None, :, None, None]
