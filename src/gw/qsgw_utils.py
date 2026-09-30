@@ -537,20 +537,6 @@ def set_band_diag_sharded(sigma_w_kij: jax.Array, diag_w_kn) -> jax.Array:
     return fn(sigma_w_kij, diag_rep)
 
 
-def gather_sigma_omega_replicated_host(sigma_w_kij: jax.Array) -> np.ndarray:
-    """Explicit escape hatch: reconstruct the FULL Σ_c(ω,k,m,n) on every
-    rank's host from the sharded layout (the memo's ``.replicated()`` seam).
-
-    This is exactly the replication the sharded layout exists to avoid —
-    n_ω·nk·nb²·16 B per rank — so no in-tree consumer calls it; it is the
-    promise-contract fallback for tooling / future consumers not yet ported
-    (pattern #6: the fallback is explicit, never silent).
-    """
-    import jax.experimental.multihost_utils as mhu
-    return np.asarray(
-        mhu.process_allgather(sigma_w_kij, tiled=True), dtype=np.complex128)
-
-
 def _extract_diag_kernel(mesh_xy: Mesh):
     key = id(mesh_xy)
     fn = _EXTRACT_DIAG_KERNEL_CACHE.get(key)

@@ -1839,34 +1839,6 @@ def static_head_terms_to_kij(
     )
 
 
-def compute_ppm_head_sigma_kij(
-    head: HeadGNParams,
-    *,
-    omega_grid_ry: np.ndarray,
-    enk_ry: np.ndarray,
-    efermi_ry: float,
-    n_occ: int,
-    cell_volume: float,
-    nk_tot: int,
-    eta: float = 1.0e-6,
-) -> np.ndarray:
-    """q→0, G=G'=0 head contribution to PPM ``Σ^c_kij(ω)``; see docs/theory/four-current-head-corrections.md#ppm-head."""
-
-    omega = np.asarray(omega_grid_ry, dtype=np.float64).reshape(-1)
-    enk = np.asarray(enk_ry, dtype=np.float64)
-    if enk.ndim != 2:
-        raise ValueError("enk_ry must be 2D (nk, nb)")
-    n_omega = int(omega.size)
-    nk, nb = enk.shape
-    sigma_diag = compute_ppm_head_sigma_diag(
-        head, omega_grid_ry=omega, enk_ry=enk, efermi_ry=efermi_ry,
-        n_occ=n_occ, cell_volume=cell_volume, nk_tot=nk_tot, eta=eta)
-    out = np.zeros((n_omega, nk, nb, nb), dtype=np.complex128)
-    idx = np.arange(nb)
-    out[:, :, idx, idx] = sigma_diag
-    return out
-
-
 def compute_ppm_head_sigma_diag(
     head: HeadGNParams,
     *,
@@ -1879,7 +1851,7 @@ def compute_ppm_head_sigma_diag(
     nk_tot: int,
     eta: float = 1.0e-6,
 ) -> np.ndarray:
-    """Band-DIAGONAL of :func:`compute_ppm_head_sigma_kij` — ``(nω, nk, nb)``; see docs/theory/four-current-head-corrections.md#ppm-head."""
+    """Band diagonal ``(nω, nk, nb)`` of the q→0, G=G'=0 head contribution to PPM ``Σ^c(ω)``; see docs/theory/four-current-head-corrections.md#ppm-head."""
     omega = np.asarray(omega_grid_ry, dtype=np.float64).reshape(-1)
     enk = np.asarray(enk_ry, dtype=np.float64)
     if enk.ndim != 2:
