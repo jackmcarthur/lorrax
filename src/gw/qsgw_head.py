@@ -157,6 +157,11 @@ class StaticGaugeHallTransaction:
     nk_tot: int
     producer_id: str
     _producer_token: object
+    #: The velocity-operator stamps the artifact loader authenticated
+    #: (:func:`file_io.static_gauge_head.hall_operator_stamps`, sorted
+    #: items); empty on the producer's in-memory result, which no consumer
+    #: accepts.
+    operator_stamps: tuple = ()
 
     def __post_init__(self) -> None:
         if self._producer_token is not _STATIC_GAUGE_HALL_TOKEN:
@@ -3138,7 +3143,7 @@ def static_gauge_hall_transaction(
 def _static_gauge_hall_transaction_from_artifact(
     *, sigma_H, hamiltonian_config_operator_fingerprint: str,
     wfn_fingerprint: str, band_start: int, band_stop: int, nk_tot: int,
-    mesh: Mesh,
+    operator_stamps: dict, mesh: Mesh,
 ) -> StaticGaugeHallTransaction:
     """Place a loader-validated Hall vector on the run mesh."""
     sigma = device_put_process_local(
@@ -3154,6 +3159,7 @@ def _static_gauge_hall_transaction_from_artifact(
         nk_tot=int(nk_tot),
         producer_id=_STATIC_GAUGE_HALL_PRODUCER_ID,
         _producer_token=_STATIC_GAUGE_HALL_TOKEN,
+        operator_stamps=tuple(sorted(dict(operator_stamps).items())),
     )
 
 
@@ -4043,6 +4049,38 @@ def expected_hubbard_stamp(config, *, wfn, fallback_dir, caller) -> str:
         caller=caller)
 
 
+def _head_velocity_operator(config, meta):
+    """This deck's head velocity operator: its representation and V_NL arm.
+
+    The one resolver behind :func:`head_dipole_operator_stamps` (the charge
+    carrier ``dipole.h5``) and :func:`head_hall_operator_stamps` (the Hall
+    artifact), so the two cannot name different operators.
+    """
+    from psp.get_dipole_mtxels import resolve_vnl_velocity_sign
+    from common.four_current_model import resolve_four_current_representation
+    representation = resolve_four_current_representation(
+        bool(getattr(config, "bispinor", int(meta.nspinor) == 4)),
+        getattr(config, "bispinor_gw", "bare_transverse"))
+    return representation, dict(
+        skip_vnl=False, vnl_mode="analytic",
+        vnl_velocity_sign=resolve_vnl_velocity_sign(
+            None, config.vnl_velocity_sign))
+
+
+def head_hall_operator_stamps(config, *, meta) -> dict:
+    """The Hall-artifact stamps of this deck's live charge/current carrier.
+
+    The V_NL skip/mode/sign of the charge head's ``dipole.h5``
+    (:func:`_head_velocity_operator`) plus the current's kinetic-balance
+    lift, in :func:`file_io.static_gauge_head.hall_operator_stamps` form.
+    """
+    from file_io.static_gauge_head import hall_operator_stamps
+    representation, velocity = _head_velocity_operator(config, meta)
+    return hall_operator_stamps(
+        **velocity,
+        kinetic_balance_lift=representation.current_lift or "raw")
+
+
 def head_dipole_operator_stamps(config, *, wfn, meta, fallback_dir) -> dict:
     """The dipole stamps this deck's head needs, in ``check_dipole_provenance``'s keywords.
 
@@ -4051,18 +4089,12 @@ def head_dipole_operator_stamps(config, *, wfn, meta, fallback_dir) -> dict:
     analytic ``p + i[r, V_NL]`` operator with the resolved V_NL sign, the
     head representation and the DFT+U stamp.
     """
-    from psp.get_dipole_mtxels import resolve_vnl_velocity_sign
-    from common.four_current_model import resolve_four_current_representation
-    representation = resolve_four_current_representation(
-        bool(getattr(config, "bispinor", int(meta.nspinor) == 4)),
-        getattr(config, "bispinor_gw", "bare_transverse"))
+    representation, velocity = _head_velocity_operator(config, meta)
     return dict(
         nval=int(config.nval), ncond=int(config.ncond),
         nband=int(config.nband),
         bispinor=representation.scalar_head_bispinor,
-        skip_vnl=False, vnl_mode="analytic",
-        vnl_velocity_sign=resolve_vnl_velocity_sign(
-            None, config.vnl_velocity_sign),
+        **velocity,
         hubbard=expected_hubbard_stamp(
             config, wfn=wfn, fallback_dir=fallback_dir,
             caller="dft head dipole velocity"))

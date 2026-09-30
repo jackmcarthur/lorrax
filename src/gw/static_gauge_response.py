@@ -22,7 +22,8 @@ that this module assembles.  Its content, by declaration:
 The Hall term is optional.  ``sigma_H`` comes from the immutable artifact
 written by ``get_dipole_mtxels --static-gauge-hall-only`` when the deck's
 ``static_gauge_hall_file`` exists and authenticates against the run's WFN,
-band manifold and k-count; when the file is absent ``sigma_H = 0`` and
+band manifold, k-count and the charge carrier's velocity operator
+(``GATE static_gauge_hall_operator``); when the file is absent ``sigma_H = 0`` and
 ``hall_source`` says so.  For a Chern-trivial insulator the static Hall
 coefficient is exactly zero in the converged limit (it is the occupied
 Berry-curvature sum, i.e. a Chern number), so the absent-artifact default is
@@ -377,6 +378,15 @@ def build_static_photon_head_response(
         if _canonical_wfn_sha256(hall_transaction.wfn_fingerprint) != wfn_fp:
             raise ValueError(
                 "charge and Hall responses use different WFN identities")
+        # Bind the Hall operator to the live charge carrier: the stamps the
+        # loader authenticated must be this deck's dipole.h5 operator.
+        from file_io.static_gauge_head import require_hall_operator_stamps
+        from gw.qsgw_head import head_hall_operator_stamps
+        require_hall_operator_stamps(
+            hall_transaction.operator_stamps,
+            head_hall_operator_stamps(config, meta=meta),
+            source=("Hall transaction operator "
+                    f"{hall_transaction.hamiltonian_config_operator_fingerprint}"))
         sigma_host = np.asarray(
             jax.device_get(hall_transaction.sigma_H), dtype=np.float64)
         if sigma_host.shape != (3,) or not np.all(np.isfinite(sigma_host)):

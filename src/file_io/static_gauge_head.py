@@ -11,7 +11,8 @@ so that every rank reads the same completed inode collectively.
 
 The loader authenticates the artifact against the consuming run: the WFN
 identity (:func:`common.parallel_transport.wfn_fingerprint`), the band
-manifold ``[0, stop)`` and the full-BZ k-count.  A present-but-mismatched
+manifold ``[0, stop)``, the full-BZ k-count and the velocity-operator stamps
+of the live charge carrier (:func:`gw.qsgw_head.head_hall_operator_stamps`).  A present-but-mismatched
 file refuses; it never degrades to ``sigma_H = 0``.  The absent-file default
 (``sigma_H = 0``) is decided by the consumer, not here.
 """
@@ -50,6 +51,35 @@ def hall_operator_stamps(*, skip_vnl, vnl_mode, vnl_velocity_sign,
             "prov_vnl_velocity_sign": float(vnl_velocity_sign),
             "prov_kinetic_balance_lift": kinetic_balance_lift_provenance(
                 kinetic_balance_lift)}
+
+
+def require_hall_operator_stamps(stamps: dict, expected: dict, *,
+                                 source: str) -> None:
+    """Refuse a Hall operator whose stamps differ from the live carrier's.
+
+    ``expected`` is :func:`gw.qsgw_head.head_hall_operator_stamps` (the
+    resolver the charge head's ``dipole.h5`` is authenticated with); every
+    key must be present and equal.  One gate for the artifact loader and the
+    charge-Hall response builder.
+    """
+    stamps = dict(stamps)
+    bad = [(k, stamps.get(k, "<absent>"), v) for k, v in expected.items()
+           if stamps.get(k) != v]
+    if bad or not expected:
+        detail = "; ".join(f"{k}: file={got!r} run={want!r}"
+                           for k, got, want in bad) or "no stamps expected"
+        raise ValueError(
+            "GATE static_gauge_hall_operator: the Hall artifact was built "
+            "with a different velocity operator.\n"
+            f"  got:  {source}; {detail}\n"
+            "  want: the deck's operator (V_NL included, analytic arm, the "
+            "deck's vnl_velocity_sign, the run's kinetic-balance lift); "
+            "regenerate with python -m psp.get_dipole_mtxels -i <deck> "
+            "--static-gauge-hall-only --static-gauge-hall-out <file>\n"
+            "  why:  the charge response reads dipole.h5 under the deck's "
+            "operator; a Hall term from another operator would enter the "
+            "same head with no symptom\n"
+            "  doc:  docs/input_reference.md, static_gauge_hall_file.")
 
 
 def _require_prefixed_sha256(value: str, *, field_name: str) -> str:
@@ -328,23 +358,9 @@ def load_static_gauge_hall_artifact(
     if sigma_H.shape != (3,) or not np.all(np.isfinite(sigma_H)):
         raise ValueError(
             "StaticGaugeHall sigma_H_cart must contain three finite values")
-    bad = [(k, stamps[k], v) for k, v in expected_operator.items()
-           if stamps.get(k) != v]
-    if bad:
-        detail = "; ".join(f"{k}: file={got!r} run={want!r}"
-                           for k, got, want in bad)
-        raise ValueError(
-            "GATE static_gauge_hall_operator: the Hall artifact was built "
-            "with a different velocity operator.\n"
-            f"  got:  static_gauge_hall_file = {str(artifact_path)!r}; {detail}\n"
-            "  want: the deck's operator (V_NL included, analytic arm, the "
-            "deck's vnl_velocity_sign, the run's kinetic-balance lift); "
-            "regenerate with python -m psp.get_dipole_mtxels -i <deck> "
-            "--static-gauge-hall-only --static-gauge-hall-out <file>\n"
-            "  why:  the charge response reads dipole.h5 under the deck's "
-            "operator; a Hall term from another operator would enter the "
-            "same head with no symptom\n"
-            "  doc:  docs/input_reference.md, static_gauge_hall_file.")
+    require_hall_operator_stamps(
+        stamps, expected_operator,
+        source=f"static_gauge_hall_file = {str(artifact_path)!r}")
     operator_fingerprint = _require_prefixed_sha256(
         operator_fingerprint,
         field_name="Hall Hamiltonian/config/operator fingerprint")
@@ -356,6 +372,7 @@ def load_static_gauge_hall_artifact(
         band_start=expected_start,
         band_stop=stop,
         nk_tot=nk_tot,
+        operator_stamps=stamps,
         mesh=mesh_xy,
     )
 
@@ -364,5 +381,6 @@ __all__ = [
     "STATIC_GAUGE_HALL_SCHEMA_VERSION",
     "hall_operator_stamps",
     "load_static_gauge_hall_artifact",
+    "require_hall_operator_stamps",
     "write_static_gauge_hall_artifact",
 ]
