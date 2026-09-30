@@ -13,8 +13,8 @@ from jax.sharding import NamedSharding, PartitionSpec as P
 from common.collectives import device_put_process_local, gather_to_host, rank0_transaction
 from common.meta import Meta
 from common.parallel_transport import (
-    band_storage_extent, build_forward_neighbor_table, build_g_wrap_lookup,
-    g_wrap_for_forward_step, make_cross_k_overlap)
+    band_storage_extent, build_neighbor_table, build_g_wrap_lookup,
+    g_wrap_for_step, link_stencil, make_cross_k_overlap)
 from common.wfn_layout import band_sphere_spec
 from distrib_la import plan_polar_factor, ROUTE_BATCH_RESHARD
 from file_io import WFNReader
@@ -108,7 +108,8 @@ def validation_reduction_check(*, production_price=False):
 def raw_edges(wfn, nb, count, *, bispinor=False):
     """Use the canonical actual-WFN overlap and reciprocal-wrap owners."""
     sym = wfn.symmetry()
-    plus = build_forward_neighbor_table(sym.kvecs_asints, wfn.kgrid)
+    stencil = link_stencil(wfn.kgrid, np.asarray(wfn.bvec)*float(wfn.blat))
+    plus = build_neighbor_table(sym.kvecs_asints, wfn.kgrid, stencil.steps)
     center_on_x, overlap = make_cross_k_overlap(R.mesh)
     centers = (0, int(sym.nk_tot)//2, int(sym.nk_tot)-1)
     rows, ids = [], []
@@ -118,10 +119,10 @@ def raw_edges(wfn, nb, count, *, bispinor=False):
         cx = center_on_x(psi)
         gc = wfn.gvecs(k=[center])[0]
         nc = int(wfn.ngk_valid(k=[center])[0])
-        for direction in range(3):
+        for direction in range(stencil.ndir):
             neighbor = int(plus[center, direction])
-            wrap = g_wrap_for_forward_step(sym.unfolded_kpts, center,
-                                          neighbor, direction, wfn.kgrid)
+            wrap = g_wrap_for_step(sym.unfolded_kpts, center,
+                                   neighbor, stencil.steps[direction], wfn.kgrid)
             gi, valid = build_g_wrap_lookup(
                 wfn.gvecs(k=[neighbor])[0], gc, wrap,
                 ngk_neighbor=int(wfn.ngk_valid(k=[neighbor])[0]), ngk_center=nc)
@@ -191,23 +192,25 @@ def connection_placement_check():
     node = next(n for n in ast.walk(owner) if isinstance(n, ast.FunctionDef)
                 and n.name == '_connection')
     rows = []
-    for grid in ((5, 5, 5), (5, 5, 1)):
+    for grid, reciprocal in (
+            ((5, 5, 5), np.eye(3)),
+            ((5, 5, 1), np.eye(3)),
+            ((5, 5, 5), np.array([[1,0,1],[-1,1,0],[0,-1,1]]))):
         nk, nb = int(np.prod(grid)), 8
         coords = np.indices(grid).reshape(3, -1).T
-        plus = native.build_forward_neighbor_table(coords, grid)
-        spacing = 1.0 / np.asarray(grid)
-        orders = native.link_stencil_orders(grid)
-        raw = rng.normal(size=(3, nk, nb, nb)) + 1j*rng.normal(size=(3, nk, nb, nb))
+        stencil = native.link_stencil(grid, reciprocal)
+        plus = native.build_neighbor_table(coords, grid, stencil.steps)
+        raw = rng.normal(size=(stencil.ndir, nk, nb, nb)) + 1j*rng.normal(size=(stencil.ndir, nk, nb, nb))
         links = np.linalg.qr(raw)[0]
         position = None
         if grid[-1] == 1:
-            position = rng.normal(size=links.shape) + 1j*rng.normal(size=links.shape)
+            position = rng.normal(size=(3,nk,nb,nb)) + 1j*rng.normal(size=(3,nk,nb,nb))
             position = 0.5 * (position + position.swapaxes(-1, -2).conj())
         shard = NamedSharding(R.mesh, P(None, None, 'x', 'y'))
         ld = device_put_process_local(links, shard)
         pd = None if position is None else device_put_process_local(position, shard)
         closure = dict(vars(native))
-        closure.update(full_plus=plus, spacing=spacing, orders=orders,
+        closure.update(full_plus=plus, stencil=stencil,
             band_matmul=native.make_distributed_band_matmul(R.mesh, n_batch_axes=1),
             block_sharding=shard, position_sharding=None if pd is None else shard)
         module = ast.Module(body=[node], type_ignores=[])
@@ -216,9 +219,8 @@ def connection_placement_check():
         got = native._run_pt_kernel_with_live_admission(
             closure['_connection'], ld, pd, stage='fixture PT connection')
         # Same owning stencil, independent ordinary dense matrix products.
-        reference = native.fourth_order_connection(
-            jnp.asarray(links), plus, spacing, band_matmul=lambda a,b: a@b,
-            stencil_orders=orders,
+        reference = native.link_connection(
+            jnp.asarray(links), plus, stencil, band_matmul=lambda a,b: a@b,
             collapsed_position=None if position is None else jnp.asarray(position))
         error = float(np.max(np.abs(host(got)-host(reference))))
         assert error < 5e-12, error
@@ -236,7 +238,7 @@ def connection_placement_check():
                 raise AssertionError('zero live room was accepted')
         finally:
             gpu_utils.device_room_bytes = original_room
-        rows.append(dict(grid=grid, max_absolute_error=error,
+        rows.append(dict(grid=grid, link_directions=stencil.ndir, max_absolute_error=error,
                          position_supplied=position is not None,
                          output_all_P_faces=True,zero_live_room_refused=True))
     return rows
@@ -290,7 +292,7 @@ def main():
             row.update(kind='actual_spinor_wfn', nspinor=4 if bispinor else 2)
             receipts.append(row)
 
-        # Full genuine bcc fixture producer: 27 full-zone centers, 81 edges,
+        # Full genuine bcc fixture producer: 27 full-zone centers, 162 edges,
         # 14 logical / 16 carrier bands and a one-edge final batch at P4.
         from psp.get_dipole_mtxels import main as dipole_main
         dipole_main(['-i', str(out/'pt.in'), '--out', str(out/'dipole.h5'),
@@ -338,11 +340,13 @@ def main():
         else:
             raise AssertionError('PT reader accepted a different source WFN')
         with SlabIO(str(out/'pt.h5'),mode='r',mesh=R.mesh) as io:
+            assert int(io.read_small('schema_version',dtype=np.int32)) == 4
+            assert io.read_small('source_steps',dtype=np.int32).shape == (6,3)
             assert int(io.read_small('connection_complete',dtype=np.int32)) == 1
             assert int(io.read_small('velocity_validation_complete',dtype=np.int32)) == 1
             assert int(io.read_small('links_symmetry_reduced',dtype=np.int32)) == 0
         row.update(kind='bcc_artifact',nk=int(meta.nk_tot),velocity_max_error=v_error,
-                   outer_bands=14,head_bands=13,authenticated=True,
+                   outer_bands=14,head_bands=13,authenticated=True,schema_version=4,link_directions=6,
                    validation_reductions=validation_reduction_check(),
                    connection_placement=connection_placement_check())
         receipts.append(row)

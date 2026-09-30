@@ -41,6 +41,8 @@ fermi_reference = mp1_fixed_n
     assert [r['nspinor'] for r in rows if r['kind']=='actual_spinor_wfn'] == [2,4]
     artifact = next(r for r in rows if r['kind']=='bcc_artifact')
     assert artifact['nk'] == 27 and artifact['authenticated']
+    assert artifact['schema_version'] == 4 and artifact['link_directions'] == 6
+    assert [r['link_directions'] for r in artifact['connection_placement']] == [3,2,6]
     assert artifact['velocity_max_error'] < 5e-12
     reduction = artifact['validation_reductions']
     assert reduction['max_absolute_error'] < 2e-15
