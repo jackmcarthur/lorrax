@@ -96,11 +96,12 @@ antiunitary partner tiles, one node per call: mode 11 returns
 v = Σ_ab conj(G_u′) G_f′ with G′ = ifftn_k of the typed unfold, which is the
 default trace's A(t); the ordered A(R) = conj(v(−R)), whose transform is
 conj(𝓕_q[v]), so the conjugation moves from the reverse rows to the forward
-rows. One FFT per node and the selected-row carry are unchanged. With current
-vertices (`vertex=True`, photon carriers) the empty Green's function uses the
-vertex-applied endpoints and the occupied one the bare endpoints, and the
-spin pairs are scanned one at a time, so no full spin Green's function pair
-is resident.
+rows. One FFT per node and the selected-row carry are unchanged. The
+four-current stream (photon carriers) takes the same door with channel
+vertices (`ffi.fft.make_kconv_chi_vertex`): per family pair, each Dirac-half
+quadrant's two parent Greens are built on the raw parents and mode 11 forms
+every channel pair's plane, so no full-k Green quadrant exists; a CUDA grid
+mode 11 cannot hold refuses (`GATE response_vertex_grid`).
 
 **Cost per node** (P ranks, N_μ centroids, n_s spinor components):
 
@@ -113,7 +114,7 @@ is resident.
 The live set is the parent Greens (and partners) at
 `P(None, 'x', None, 'y', None)`, N_k^in (N_μn_s)² complex numbers over P
 each, A and its transform (N_k N_μ² over P each), plus the accumulator.
-Without a parent plan, with photon carriers, or on a grid mode 11 refuses,
+For the charge stream without a parent plan, or on a grid mode 11 refuses,
 each Green is unfolded to full k, transformed by mode 3 and traced in XLA:
 two full-k Green tiles, 2 N_k (N_μn_s)² complex numbers over P.
 

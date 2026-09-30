@@ -376,36 +376,6 @@ def gamma_double_contract(
         P_l_conj, P_r, perm_L, phase_L, perm_R, phase_R, spin_axes)
 
 
-def gamma_vertex_trace(G_lower, G_upper, left: int, right: int,
-                       spin_axes: tuple[int, int] = (2, 4), *,
-                       lower_offset=(0, 0), upper_offset=(0, 0)) -> jax.Array:
-    """``sum_ab (J_L G_upper J_R^dagger)_ab conj(G_lower)_ab`` for static vertices.
-
-    ``J = gamma~^{left}``, ``gamma~^{right}`` (monomial), so the trace is
-    ``sum_ab phase_L[a] conj(phase_R[b]) G_upper[.., perm_L a, .., perm_R b]
-    conj(G_lower[.., a, .., b])``: spin slices summed in one fusion, no
-    permuted copy of either Green.  The two spin axes are dropped.  A Green
-    may hold a contiguous block of spin indices: ``lower_offset`` /
-    ``upper_offset`` = ``(row, col)`` are the first spin index of each Green's
-    two spin axes (ints or traced scalars); the sum runs over the lower
-    Green's block, whose vertex images must lie in the upper Green's.
-    """
-    perm_l, phase_l = (jnp.asarray(t) for t in _perm_phase[int(left)])
-    perm_r, phase_r = (jnp.asarray(t) for t in _perm_phase[int(right)])
-    a_axis, b_axis = spin_axes
-    take = jax.lax.dynamic_index_in_dim
-    total = None
-    for i in range(int(G_lower.shape[a_axis])):
-        for j in range(int(G_lower.shape[b_axis])):
-            a, b = lower_offset[0] + i, lower_offset[1] + j
-            upper = take(take(G_upper, perm_r[b] - upper_offset[1], b_axis, keepdims=False),
-                         perm_l[a] - upper_offset[0], a_axis, keepdims=False)
-            lower = take(take(G_lower, j, b_axis, keepdims=False), i, a_axis, keepdims=False)
-            term = (phase_l[a] * jnp.conj(phase_r[b])) * upper * jnp.conj(lower)
-            total = term if total is None else total + term
-    return total
-
-
 # Module-level mode set at config-build time via
 # :func:`set_gamma_contract_mode`.  Default ``take`` matches the
 # historical path; cohsex.in ``gamma_contract_mode`` overrides it.
@@ -431,5 +401,5 @@ __all__ = [
     "gamma0", "gamma1", "gamma2", "gamma3", "gamma5",
     "gammas_perm", "gammas_phase",
     "gamma_perm_phase", "gamma_apply", "gamma_double_contract",
-    "gamma_vertex_trace", "current_fit_terms",
+    "current_fit_terms",
 ]
