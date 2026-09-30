@@ -17,7 +17,7 @@ the outputs and the refusals. Other owners: CLI flags and invocation,
 | `WFN.h5` and the centroid table named in the deck | QE → pw2bgw; `centroid.kmeans_cli` | authentication of the bundle, and the static-screening rebuild |
 | `eqp1.dat` (`--eqp`, optional) | `gw.gw_jax` | diagonal QP energies on the wedge, unfolded through the symmetry service |
 | `dipole.h5` (`--dipole`) | `psp.get_dipole_mtxels` | velocity matrix elements and `band_energies` for absorption and per-state dipoles |
-| `dipole_qsgw.h5` (`--dipole`) | a QSGW run with a velocity head ([QSGW dipoles](../self_consistency.md#interband-commutator-head)) | the same layout: $U^\dagger v\,U$ with the head's velocity $v$ (`qsgw_head.qp_velocity`) and `band_energies` = $E_{QP}$ |
+| `dipole_qsgw.h5` (`--dipole`) | a QSGW run with a velocity head ([QSGW dipoles](../self_consistency.md#interband-commutator-head)) | the same layout: $U^\dagger v\,U$ with the head's velocity $v$ (`qsgw_head.qp_velocity`) and `band_energies` = $E_{QP}$; stamped `basis = qp` and, when the run writes `WFN_qp.h5`, bound to that WFN's fingerprint. It pairs only with a restart built from `WFN_qp.h5` |
 
 Exactly one `isdf_tensors_*.h5` may sit in the run directory and its `tmp/`
 (`file_io.restart_bundle._find_restart_file`). Every read of the parent faces
@@ -264,7 +264,10 @@ Keys, supported modes and refusals: [input reference](../input_reference.md).
   resident CC model past Σ until the final-map persist.
 - The BSE reads ψ from the restart, which holds the deck WFN's states. `--eqp`
   replaces energies only (`bse/bse_window.py:569`), so a QSGW BSE with QP ψ
-  needs a GW restart generated from `WFN_qp.h5`.
+  needs a GW restart generated from `WFN_qp.h5`, with `dipole_qsgw.h5` as its
+  dipole. A `WFN_qp.h5` written before 2026-09-30 from a WFN that stores both
+  k and −k has broken rows; regenerate it
+  ([self-consistency §8](../self_consistency.md#8-seeding-restart-and-outputs)).
 - Full BSE through `--lanczos` is dense and stops at N = 4096
   (`bse/bse_nontda.py:95`); the matrix-free solver is not reachable from the
   CLI.

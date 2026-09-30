@@ -49,19 +49,30 @@ its stop rules in [self-consistency](../self_consistency.md); the W model in
 - **Heads.** The default `head_correction = full`; the metal head is in
   [metals](metals.md). An SC deck that does not name `sc_head_update` takes
   `parallel_transport` when the link artifact exists (the dipole step writes
-  it by default), else `dft_velocity` from `dipole.h5`, else `off`. The run
-  keeps that head on every map. On a map whose links cannot serve the Σ term
-  (links incomplete, a stencil or window gate fails, or the link bound
-  exceeds 1 %), D_kΔH is set to zero for that map and checked again on the
-  next. There is no switch to another head and no refusal
-  ([self-consistency §7](../self_consistency.md#metals-direct-drude-head)).
+  it by default), else `dft_velocity` from `dipole.h5`, else `off`. This holds
+  on scalar decks and on `bispinor_gw = full_shared_pole`, whose direct Γ head
+  reads the same velocity. On a metal, `bare_transverse` refuses
+  `parallel_transport`. The run keeps that head on every map. On a map whose
+  links cannot serve the Σ term (links incomplete, a stencil or window gate
+  fails, or the link bound exceeds 1 %), D_kΔH is set to zero for that map
+  and checked again on the next. There is no switch to another head and no
+  refusal ([self-consistency §7](../self_consistency.md#metals-direct-drude-head)).
+  The one-shot head and every SC velocity head take their velocity from one
+  owner, `qsgw_head.qp_velocity`. The links sit on a point-group-closed
+  shell ([input reference](../input_reference.md), `parallel_transport_file`).
+  A link artifact written before that shell (schema 3) refuses under
+  `parallel_transport`: rerun the dipole step.
 - **Outputs.** An SC run's `eqp0.dat` and `eqp1.dat` hold the SC eigenvalues
   of the accepted map, tail scissor and semicore pin included; both equal that
   map's `eqp0_iterNNNN.dat`. The fixed-DFT-state diagonal of the final H is
   only in `sigma_diag.dat`, and `python -m gw.eqp_bgw` refuses an SC
   `sigma_mnk.h5` ([self-consistency §1](../self_consistency.md#1-the-map)).
-  Every velocity head writes `dipole_qsgw.h5`
+  Every velocity head writes `dipole_qsgw.h5`. With `WFN_qp.h5` it is bound
+  to that WFN, so a GW run on `WFN_qp.h5` can use it as its `dipole.h5`
   ([QSGW dipoles](../self_consistency.md#interband-commutator-head)).
+  `WFN_qp.h5` files written before 2026-09-30 from a WFN that stores both k
+  and −k have broken rows; regenerate them
+  ([self-consistency §8](../self_consistency.md#8-seeding-restart-and-outputs)).
 
 The keys that differ from the defaults:
 
@@ -156,6 +167,9 @@ for an estimated +20–40 % per map (CHIEXT report).
   `sc_frozen_core_bands`: the frozen law fails on Fe 3s/3p and CrI3 I 5s
   (claim 2859).
 - The velocity heads and their per-map head block, as above.
+- W's line sites held across maps while they drift by at most
+  max(3 meV, 0.1 × the previous map's max|dE|)
+  ([self-consistency §6](../self_consistency.md#shared-pole-w-with-retained-quadrature)).
 
 ## Open
 
