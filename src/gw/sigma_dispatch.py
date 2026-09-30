@@ -881,6 +881,35 @@ def _mpa_sigma_model_resources(W_by_role, sigma_w_model, head_correction=None):
     return fit_path, head_fit_path, fit_identity, fit_digest
 
 
+def _sweep_checkpoint(config, input_dir, fit_identity, fit_digest, head, lorentz_output,
+                      *, e_qp_ev, body_options, band_slices, efermi_ry):
+    """Path and identity of a one-shot shared-pole sweep checkpoint, or None.
+
+    Only one-shots: an SC rerun starts at map 0, SC retention deletes later
+    map directories, and map 0's sweep plans the Σ windows later maps hold.
+    The identity binds the W model (its digest names its identity, the WFN
+    included), the energies Σ is read at, the ω grid and every sweep option.
+    """
+    from .gw_output import restart_tensor_writes_enabled
+    if (fit_digest is None or lorentz_output
+            or str((fit_identity or {}).get("iteration_id")) != "oneshot"):
+        return None
+    from pathlib import Path
+    path = Path(input_dir) / "tmp" / "sigma_checkpoint_oneshot.h5"
+    if not restart_tensor_writes_enabled(config, str(path)):
+        return None
+    from file_io.sigma_checkpoint import sweep_identity
+    options = {k: v for k, v in body_options.items()
+               if k not in ("print_fn", "occupation_state", "fixed_quadrature_session")}
+    return path, sweep_identity(
+        schema="sigma-sweep-checkpoint-v1", w_digest=fit_digest, w_identity=fit_identity,
+        head=None if head is None else (head.get("identity"), head.get("body_digest")),
+        e_qp_ev=np.asarray(e_qp_ev, np.float64), options=options,
+        sigma_bands=[int(band_slices.b0), int(band_slices.b3), str(band_slices.sigma_range)],
+        band_extrapolation=bool(config.sigma.band_extrapolation),
+        efermi_ry=float(efermi_ry))
+
+
 def _validate_sigma_stage(
         Gij, config, mode, print_fn):
     """Validate the Sigma stage; see docs/theory/bispinor-gw.md#dyson."""
@@ -1335,6 +1364,44 @@ def _compute_mpa_sigma(
     lorentz_output = bool(config.debug.sigma_lorentz_debug_output)
     if not lorentz_output:
         sigma_lorentz = None
+
+    def finalize(cubes, host):
+        from runtime.padding import PaddedAxis
+        axis = host["band_axis"]
+        return finalize_dynamic_sigma(
+            cubes["body"], host["head_diag"],
+            sigma_band_axis=PaddedAxis(**axis) if isinstance(axis, dict) else axis,
+            sig_x=sig_x, sig_h=sig_h,
+            v_h_scalar=v_h_scalar, h_transverse=h_transverse,
+            hartree_omitted=bool(omit_v_h),
+            e_qp_ev=e_qp_ev,
+            config=config, meta=meta, mesh_xy=mesh_xy,
+            sym=sym, wfn=wfn, band_slices=band_slices,
+            input_dir=input_dir,
+            write_sigma_omega_h5=write_sigma_omega_h5,
+            sigma_lorentz_static_skij_ry=sigma_lorentz,
+            sigma_c_odd_body_omega=cubes["odd"],
+            band_extrapolation=host["band_extrapolation"],
+            sigma_c_body_omega_unextrap=cubes["unextrap"],
+            ppm_odd_even_residue_ratio=host["odd_even_residue_ratio"],
+            print_fn=print_fn,
+            efermi_ry=sigma_efermi_ry,
+            efermi_provenance=sigma_efermi_provenance)
+
+    checkpoint = _sweep_checkpoint(
+        config, input_dir, fit_identity, fit_digest, head, lorentz_output,
+        e_qp_ev=e_qp_ev, body_options=body_options, band_slices=band_slices,
+        efermi_ry=sigma_efermi_ry)
+    if checkpoint is not None and bool(getattr(config, "restart", False)):
+        import common.timing as timing
+        from file_io.sigma_checkpoint import read_sigma_checkpoint
+        with timing.section("sigma.checkpoint_read", announce=True):
+            restored = read_sigma_checkpoint(checkpoint[0], identity=checkpoint[1],
+                                             mesh=mesh_xy, print_fn=print_fn)
+        if restored is not None:
+            return finalize(*restored)
+    import time
+    sweep_started = time.monotonic()
     plan = None
     if sector_handle.get("representation") == "sector-ordered-ph":
         from .mpa.sector_sigma import compute_sector_sigma
@@ -1414,25 +1481,42 @@ def _compute_mpa_sigma(
             replace(body, efermi_ry=sigma_efermi_ry), head_diag,
             e_state_ev=e_qp_ev, plan=plan, config=config, band_slices=band_slices,
             wfn=wfn, mesh_xy=mesh_xy, print_fn=print_fn)
-    return finalize_dynamic_sigma(
-        body_omega, head_diag,
-        sigma_band_axis=body.band_axis,
-        sig_x=sig_x, sig_h=sig_h,
-        v_h_scalar=v_h_scalar, h_transverse=h_transverse,
-        hartree_omitted=bool(omit_v_h),
-        e_qp_ev=e_qp_ev,
-        config=config, meta=meta, mesh_xy=mesh_xy,
-        sym=sym, wfn=wfn, band_slices=band_slices,
-        input_dir=input_dir,
-        write_sigma_omega_h5=write_sigma_omega_h5,
-        sigma_lorentz_static_skij_ry=sigma_lorentz,
-        sigma_c_odd_body_omega=body_odd,
-        band_extrapolation=extrap_payload,
-        sigma_c_body_omega_unextrap=body_unextrap,
-        ppm_odd_even_residue_ratio=body.odd_even_residue_ratio,
-        print_fn=print_fn,
-        efermi_ry=sigma_efermi_ry,
-        efermi_provenance=sigma_efermi_provenance)
+    cubes = dict(body=body_omega, unextrap=body_unextrap, odd=body_odd)
+    axis = body.band_axis
+    host = dict(head_diag=head_diag, band_extrapolation=extrap_payload,
+                odd_even_residue_ratio=body.odd_even_residue_ratio,
+                band_axis=(None if axis is None else dict(
+                    name=axis.name, logical=axis.logical, carrier=axis.carrier,
+                    divisor=axis.divisor)))
+    if checkpoint is not None:
+        from file_io.sigma_checkpoint import (
+            PAYOFF, checkpoint_pays, checkpointable, write_sigma_checkpoint)
+        # The write finishes before finalize: finalize donates the body cube
+        # to the head add, so nothing may still be reading it.
+        jax.block_until_ready(cubes["body"])
+        sweep_seconds = time.monotonic() - sweep_started
+        pays, predicted = checkpoint_pays(cubes, sweep_seconds)
+        print_fn(f"Sigma checkpoint: {'written' if pays else 'skipped'} (sweep "
+                 f"{sweep_seconds:.0f} s{' >= ' if pays else ' < '}{PAYOFF:g} x "
+                 f"write est {predicted:.0f} s)")
+        if pays and checkpointable(cubes):
+            import common.timing as timing
+            from file_io.sigma_checkpoint import discard_sigma_checkpoint
+            try:
+                with timing.section("sigma.checkpoint_write", announce=True):
+                    nbytes, seconds = write_sigma_checkpoint(
+                        checkpoint[0], identity=checkpoint[1], cubes=cubes, host=host,
+                        mesh=mesh_xy)
+                print_fn(f"Sigma checkpoint: {nbytes / 2**30:.2f} GiB of swept cubes "
+                         f"written in {seconds:.1f} s to {checkpoint[0]}")
+            except (OSError, RuntimeError, ValueError) as exc:
+                # A restart point never costs the sweep it protects; the
+                # collective writers raise the same refusal on every rank.
+                discard_sigma_checkpoint(checkpoint[0])
+                print_fn(f"WARNING Sigma checkpoint: write failed and {checkpoint[0]} was "
+                         f"removed; finalizing without it ({type(exc).__name__}: "
+                         f"{str(exc)[:300]})")
+    return finalize(cubes, host)
 
 
 def _compute_ppm_sigma(
@@ -1443,6 +1527,9 @@ def _compute_ppm_sigma(
         write_sigma_omega_h5):
     """Produce the two-point plasmon-pole Sigma result."""
     from .ppm_pipeline import compute_ppm_sigma_pipeline
+    if bool(getattr(config, "restart", False)):
+        print_fn("Sigma checkpoint: none on the PPM route (no W digest reaches this seam "
+                 "to authenticate one); the sweep is recomputed")
     if mode.ppm_model is None:
         raise NotImplementedError(
             f"compute_sigma_xc: compute_mode = "
