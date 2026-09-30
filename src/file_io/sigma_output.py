@@ -272,6 +272,14 @@ QSGW_PLOT_DATASETS = (
 )
 
 
+#: The one explanation stamped wherever the raw (un-extrapolated) Σ_c is
+#: written: the ``*_raw`` columns of sigma_diag.dat and the gwjax.out
+#: band-tail block.
+RAW_SIGMA_NOTE = (
+	"raw = band sum truncated at N bands, no spectral_shell tail; compare "
+	"to BerkeleyGW at the same number_bands")
+
+
 def write_sigma_to_file(
 	sigma_sx_kij_eV,
 	filename="eqp0.dat",
@@ -291,6 +299,8 @@ def write_sigma_to_file(
 	sigma_lorentz_skn_eV=None,
 	sigma_c_odd_kn_eV=None,
 	z_factor_kn=None,
+	sigma_c_raw_kn_eV=None,
+	eqp_raw_kn_eV=None,
 ):
 	"""Write self-energy components to file.
 
@@ -321,6 +331,14 @@ def write_sigma_to_file(
 			shape (nk, band), written as ``sigC_odd``.  None omits the column.
 		z_factor_kn: Optional raw quasiparticle residue, shape ``(nk, band)``.
 			When present, every row records ``Z`` without clipping it.
+		sigma_c_raw_kn_eV: Optional raw Sigma_c(E_DFT), shape ``(nk, band)``:
+			the band sum truncated at N bands with no spectral_shell tail,
+			written after ``Z`` as ``sigC_raw`` (see :data:`RAW_SIGMA_NOTE`).
+			None (every run without band extrapolation) omits the column.
+		eqp_raw_kn_eV: Optional ``(eqp0, eqp1)`` pair, each ``(nk, band)``,
+			assembled from the raw Sigma_c exactly as eqp0.dat/eqp1.dat are
+			from the extrapolated one; written LAST as ``eqp0_raw`` and
+			``eqp1_raw``.  Requires ``sigma_c_raw_kn_eV``.
 
 	k-BASIS — WHY EVERY BLOCK CARRIES ITS COORDINATE
 	------------------------------------------------
@@ -444,6 +462,15 @@ def write_sigma_to_file(
 				f"does not equal {total_label}: {_closure:.3e} eV > "
 				f"{_limit:.3e} eV")
 	odd_diag = _diag(sigma_c_odd_kn_eV)
+	raw_diag = _diag(sigma_c_raw_kn_eV)
+	eqp_raw = None
+	if eqp_raw_kn_eV is not None:
+		if raw_diag is None:
+			raise ValueError("eqp_raw_kn_eV requires sigma_c_raw_kn_eV")
+		eqp_raw = [np.asarray(a, dtype=np.float64) for a in eqp_raw_kn_eV]
+		if len(eqp_raw) != 2 or any(a.shape != (nk, nbands) for a in eqp_raw):
+			raise ValueError(
+				f"eqp_raw_kn_eV must be two ({nk},{nbands}) arrays")
 	z_diag = None if z_factor_kn is None else np.asarray(
 		z_factor_kn, dtype=np.float64)
 	if z_diag is not None and z_diag.shape != (nk, nbands):
@@ -461,6 +488,7 @@ def write_sigma_to_file(
 	lorentz_cplx = ([ _is_complex(lorentz_diag[s]) for s in range(3)]
 	                 if lorentz_diag is not None else None)
 	odd_cplx = _is_complex(odd_diag)
+	raw_cplx = _is_complex(raw_diag)
 
 	#: Width of the omitted "+x.xxxxxxi" field, so a real column occupies
 	#: exactly as many characters as a complex one would.
@@ -495,6 +523,9 @@ def write_sigma_to_file(
 			        "Sigma_c[B,D] - Sigma_c[B,D=0]\n")
 		if z_diag is not None:
 			f.write("# Z is the eqp1 central difference at E_DFT\n")
+		if raw_diag is not None:
+			names = "sigC_raw, eqp0_raw, eqp1_raw" if eqp_raw else "sigC_raw"
+			f.write(f"# {names}: {RAW_SIGMA_NOTE}\n")
 		f.write(f"# k-basis: irreducible wedge, {nk} k-points; each block "
 		        f"states its crystal coordinate on a '# kcrys' line\n")
 		# The star-spread diagnostic, MEASURED ON THE FULL BZ upstream (see
@@ -610,6 +641,16 @@ def write_sigma_to_file(
 
 				if z_diag is not None:
 					line += f"  Z={float(z_diag[k, n]):>12.6f}"
+
+				# Last, so every existing column keeps its position.
+				if raw_diag is not None:
+					value = raw_diag[k, n]
+					line += f"  sigC_raw={float(np.real(value)):>12.6f}"
+					line += _im(float(np.imag(value)), raw_cplx)
+				if eqp_raw is not None:
+					# eqp0.dat's precision, so the columns compare exactly.
+					line += (f"  eqp0_raw={eqp_raw[0][k, n]:>15.9f}"
+					         f"  eqp1_raw={eqp_raw[1][k, n]:>15.9f}")
 
 				f.write(line + "\n")
 

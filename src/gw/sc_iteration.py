@@ -7064,6 +7064,11 @@ def run_sc_driver(
         sigma_xc_kij_ry_unextrap=(
             _rotate_final(sigma_result.sigma_xc_kij_ry_unextrap)
             if sigma_result.sigma_xc_kij_ry_unextrap is not None else None),
+        # The raw Σ_c diagonals are QP-basis diagonals, which cannot be
+        # rotated; SC output has no raw columns (the band-extrapolation
+        # eqp report above is SC's raw-vs-tail record).
+        sigma_c_omega_diag_unextrap_ry=None,
+        sigma_c_at_dft_diag_unextrap_ev=None,
         sigma_omega_h5_path=sigma_omega_h5_path,
         # ONE omega reference, fifth site, ACTUALLY ON THE WRITER'S PATH.
         # This line used to read ``float(wfn.efermi) * RYD_TO_EV``

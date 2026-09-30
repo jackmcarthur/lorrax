@@ -32,6 +32,8 @@ its stop rules in [self-consistency](../self_consistency.md); the W model in
   is extrapolated past N by the pooled `spectral_shell` fit, on the shared-pole
   Σ as on GN/HL-PPM ([band extrapolation](../theory/band-extrapolation.md)).
   With extrapolation on, N ≥ 2·n_occ, or the run refuses at startup.
+  One-shot runs also write the raw Σ (no tail) as the `sigC_raw`, `eqp0_raw`,
+  `eqp1_raw` columns of `sigma_diag.dat`; compare those to BerkeleyGW at the same N.
 - **Heads.** The default `head_correction = full`; the metal head is in
   [metals](metals.md).
 
