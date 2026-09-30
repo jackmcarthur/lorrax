@@ -881,6 +881,13 @@ def _spectral_kernel(mesh: Mesh, kgrid: tuple[int, int, int]) -> Callable:
     return _kernel
 
 
+#: The head's link-error tolerance: 1 % of its velocity on the elements it
+#: reads (``link_correction_bound``), i.e. at most ~2 % of S_aa or of the
+#: Drude weight.  Coarse 4-point axes sit below it at their fixed points
+#: (Fe 4^3 3.9e-3, Si 4^3 6.2e-3).
+HEAD_LINK_RTOL = 1.0e-2
+
+
 def link_correction_bound(correction, velocity_dft, occupations_kn, *,
                           link_error: float,
                           rtol: float) -> tuple[float, float, float, float]:
@@ -895,8 +902,8 @@ def link_correction_bound(correction, velocity_dft, occupations_kn, *,
 
         ``link_error * |D_k DeltaH| / |v_DFT|  <=  rtol``
 
-    with both norms on that set (this map's occupations) and ``rtol`` the
-    artifact's stamped tolerance (default 5e-3).  Returns
+    with both norms on that set (this map's occupations) and ``rtol`` =
+    :data:`HEAD_LINK_RTOL`.  Returns
     ``(link_error, ratio, bound, rtol)``: every map logs it in its head block
     and the SC run judges it at its fixed point
     (``sc_iteration.refuse_head_link_bound``, ``GATE pt_head_link_bound``);

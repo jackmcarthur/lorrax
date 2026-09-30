@@ -591,6 +591,29 @@ def _kinetic_velocity(psi_G, *, geom, gtab_file, wfn, sym):
         kvecs=np.asarray(gtab_file.kvecs)))
 
 
+def _publish_dft_velocity(args, H_v, psi_G, **kwargs):
+    """The artifact's velocity stage; returns its path, or None when dropped.
+
+    A DEFAULTED artifact whose velocity stage refuses (a deterministic
+    ``ValueError`` on every rank, e.g. ``GATE pt_collapsed_axis_cut_density``)
+    is dropped with the reason in the report; an explicit one refuses.
+    """
+    import os
+    pt_path = Path(args.parallel_transport_out).resolve()
+    if not getattr(args, "parallel_transport_defaulted", False):
+        publish_dft_velocity(pt_path, H_v, psi_G, **kwargs)
+        return pt_path
+    try:
+        publish_dft_velocity(pt_path, H_v, psi_G, **kwargs)
+    except ValueError as exc:
+        if jax.process_index() == 0 and pt_path.exists():
+            os.remove(pt_path)
+        kwargs["emit"](f"parallel-transport artifact: not written ({exc})")
+        print(f"  parallel-transport artifact: not written ({exc})", flush=True)
+        return None
+    return pt_path
+
+
 def _complete_parallel_transport(args, pt_path, **kwargs):
     """The link stage; a DEFAULTED artifact that cannot complete is dropped.
 
@@ -609,7 +632,7 @@ def _complete_parallel_transport(args, pt_path, **kwargs):
     try:
         complete_parallel_transport(pt_path, **kwargs)
     except ValueError as exc:
-        if jax.process_index() == 0:
+        if jax.process_index() == 0 and Path(pt_path).exists():
             os.remove(pt_path)
         kwargs["report"].emit(f"parallel-transport artifact: not written ({exc})")
         print(f"  parallel-transport artifact: not written ({exc})", flush=True)
@@ -1514,9 +1537,8 @@ def main(argv=None):
 				H_v = unfold_file_wedge_polar_matrix(sym, H_v_file)
 				del H_v_file
 				if args.parallel_transport_out is not None:
-					pt_path = Path(args.parallel_transport_out).resolve()
-					publish_dft_velocity(
-						pt_path, H_v, psi_G, wfn=wfn, sym=sym, geom=geom,
+					pt_path = _publish_dft_velocity(
+						args, H_v, psi_G, wfn=wfn, sym=sym, geom=geom,
 						gtab_file=gtab_file, mesh=RUNTIME.mesh, nbands=nb,
 						effective_nspinor=int(meta.nspinor), bispinor=bispinor,
 						hubbard_provenance=hubbard_stamp, wfn_path=str(wfn_path),

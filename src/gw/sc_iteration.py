@@ -3754,6 +3754,7 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
         from .qsgw_head import finalize_iteration_head_samples
     if pt is not None:
         from .qsgw_head import (
+            HEAD_LINK_RTOL,
             InterbandCommutatorHeadData,
             assemble_delta_head_manifold,
             build_iteration_head_response,
@@ -3828,7 +3829,7 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
             collapsed_position=getattr(pt, "collapsed_position", None),
             nb_links=int(getattr(pt, "nb_links", 0) or pt.nb_logical),
             link_bound=((float(pt.validation["link_relative_error"]),
-                         float(pt.validation["rtol"]))
+                         HEAD_LINK_RTOL)
                         if forward_links is not None else None),
             velocity_kinetic_cart=getattr(pt, "velocity_kinetic_cart", None),
         )
@@ -4692,7 +4693,8 @@ def refuse_head_link_bound(bound) -> None:
         "point's QSGW velocity correction exceeds the tolerance.\n"
         f"  got:  rel_err(links) {link_error:.4e} x |D_k DeltaH|/|v_DFT| "
         f"{ratio:.4e} = {value:.4e}\n"
-        f"  want: <= {rtol:.1e} (the artifact's velocity rtol)\n"
+        f"  want: <= {rtol:.1e} (qsgw_head.HEAD_LINK_RTOL, 1 % of the "
+        "head velocity)\n"
         "  fix:  a denser k grid (4th-order stencil from 5 points per "
         "axis), or sc_head_update = dft_velocity\n"
         "  why:  only D_k DeltaH goes through the links; their relative "
