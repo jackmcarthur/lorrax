@@ -458,15 +458,22 @@ def sigma_row_blocks(*, n_rmu, ns, d, mesh):
     return face_row_blocks(mx, int(mesh.shape['y']), (int(ns) // int(d)) ** 2)
 
 
-def _green_stage_room(ns: int) -> tuple[float, float]:
-    """(live, room): the bytes already live, and what a Green-side stage may add, the
-    minimum over processes (every process must enter).  The room is the run's budget
-    (``memory_per_device_gb``, ``common.gpu_utils.device_room_bytes``) less the live
-    bytes, times the spinor's fragmentation utilization."""
-    from common.gpu_utils import (bfc_fragmentation_target_utilization, device_budget_bytes,
-                                  device_room_bytes)
-    free = float(device_room_bytes())
-    return device_budget_bytes() - free, free * bfc_fragmentation_target_utilization(int(ns))
+def _green_stage_room(*, n_parent, n_rmu, ns, n_band, mesh) -> tuple[float, float]:
+    """(live, room): the priced resident set and what a Green-side stage may add.
+
+    Sizes come from the deck budget and the shapes, never live allocator bytes, so
+    every rank computes the same room.  The resident set is the stage's ψ faces in
+    both orientations, ``2·16·n_parent·N_b·ns·μ/P`` per rank, plus the measured
+    runtime reserve (``runtime.aot_memory.runtime_reserve_bytes``); the room is the
+    run's budget (``memory_per_device_gb``) less it, times the spinor's
+    fragmentation utilization."""
+    from common.gpu_utils import bfc_fragmentation_target_utilization, device_budget_bytes
+    from runtime.aot_memory import runtime_reserve_bytes
+    faces = (32.0 * int(n_parent) * int(n_band) * int(ns) * int(n_rmu)
+             / (int(mesh.shape['x']) * int(mesh.shape['y'])))
+    live = faces + runtime_reserve_bytes()
+    free = max(0.0, device_budget_bytes() - live)
+    return live, free * bfc_fragmentation_target_utilization(int(ns))
 
 
 def _over_room(what, need, room):
@@ -507,7 +514,8 @@ def sigma_spin_block(*, n_parent, n_rmu, ns, n_full, n_band, mesh, partner_tiles
     tile, panels = _green_terms(n_parent=n_parent, n_rmu=n_rmu, ns=ns, n_band=n_band,
                                 mesh=mesh)
     w_tau = 16.0 * int(n_full) * int(n_rmu) ** 2 / (int(mesh.shape['x']) * int(mesh.shape['y']))
-    live, room = _green_stage_room(ns)
+    live, room = _green_stage_room(n_parent=n_parent, n_rmu=n_rmu, ns=ns, n_band=n_band,
+                                   mesh=mesh)
     mx = int(n_rmu) // int(mesh.shape['x'])
 
     def frac(d):
@@ -553,7 +561,8 @@ def price_chi0_node(*, n_parent, n_rmu, ns, n_full, n_out, n_band, mesh, partner
     acc = 16.0 * int(n_out) * int(n_full) * int(n_rmu) ** 2 / (
         int(mesh.shape['x']) * int(mesh.shape['y']))
     from common.gpu_utils import record_stage_price
-    live, room = _green_stage_room(ns)
+    live, room = _green_stage_room(n_parent=n_parent, n_rmu=n_rmu, ns=ns, n_band=n_band,
+                                   mesh=mesh)
     new = (2.0 * (1.0 + float(bool(partner))) * (tile + panels) + acc
            + chi0_door_scratch(kgrid=kgrid, n_parent=n_parent, n_rmu=n_rmu, ns=ns, mesh=mesh))
     if new > room:

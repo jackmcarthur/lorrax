@@ -99,23 +99,27 @@ _HEAD_WING_ROOM_FRACTION = 0.5
 _HEAD_WING_MU_MIN = 16
 
 
-def head_wing_mu_block(*, mu_local, nk, ns, nb_full, n_ends):
-    """Centroids per face head-wing step, from the run budget's room.
+def head_wing_mu_block(*, mu_local, nk, ns, nb_full, n_ends, resident_bytes):
+    """Centroids per face head-wing step, from the run budget and the shapes.
 
     One step holds ``n_ends`` gathered endpoint blocks of
     ``16·nk·ns·block·nb_full`` bytes per rank; the widest block whose set fits
-    ``_HEAD_WING_ROOM_FRACTION`` of the stage room
-    (``common.gpu_utils.device_room_bytes``) wins, at least
+    ``_HEAD_WING_ROOM_FRACTION`` of the stage room wins, at least
     ``_HEAD_WING_MU_MIN`` (or the whole tile when it is narrower) and at most
-    the rank's whole mu tile.  Every process enters.
+    the rank's whole mu tile.  The room is the run budget
+    (``memory_per_device_gb``) less the caller's priced ``resident_bytes`` and
+    the measured runtime reserve, never live allocator bytes, so every rank
+    sizes the same block.
     """
-    from common.gpu_utils import device_budget_bytes, device_room_bytes, record_stage_price
+    from common.gpu_utils import device_budget_bytes, record_stage_price
+    from runtime.aot_memory import runtime_reserve_bytes
     per_mu = 16.0 * int(nk) * int(ns) * int(nb_full) * int(n_ends)
-    room = float(device_room_bytes())
+    live = float(int(resident_bytes) + runtime_reserve_bytes())
+    room = max(0.0, device_budget_bytes() - live)
     fit = int(_HEAD_WING_ROOM_FRACTION * room // per_mu)
     block = int(min(int(mu_local), max(fit, _HEAD_WING_MU_MIN)))
     record_stage_price(f"head wings, mu block {block}/{int(mu_local)}",
-                       device_budget_bytes() - room + block * per_mu)
+                       live + block * per_mu)
     return block
 # Width three is the incumbent Rydberg velocity.  Width eight has the same
 # energy-denominator contract: for a literal long-wave transition derivative
@@ -2253,10 +2257,18 @@ def _head_wings_sharded_face(
             np.where(mask, _classes.counts, 0.0).astype(np.complex128), rep)
             for mask in (~anti, anti))
     with_anti = _classes is not None and bool(np.any(_classes.antiunitary))
+    # Resident beside the step: the distinct endpoint faces and the head
+    # manifold's v, e, f, priced from their shard shapes.
+    _live = {id(a): a for a in (wfns.psi_mun, wfns.psi_nmu, bra_wfns.psi_mun,
+                                bra_wfns.psi_nmu, ket_wfns.psi_mun, ket_wfns.psi_nmu,
+                                v, e, f, surface)}
     mu_block = head_wing_mu_block(
         mu_local=-(-int(bra_wfns.psi_mun.shape[2]) // int(mesh.shape[_mesh_xy(mesh)[0]])),
         nk=int(bra_wfns.psi_mun.shape[0]), ns=int(bra_wfns.psi_mun.shape[1]),
-        nb_full=nb_full, n_ends=4 if with_anti else 2)
+        nb_full=nb_full, n_ends=4 if with_anti else 2,
+        resident_bytes=sum(int(np.prod(a.sharding.shard_shape(a.shape)
+                                       if hasattr(a, "sharding") else a.shape))
+                           * a.dtype.itemsize for a in _live.values()))
     return _head_wing_kernel(
         mesh, nb_logical=int(nb_logical),
         include_surface=bool(include_surface), mu_block=mu_block, layout=wfns.layout,

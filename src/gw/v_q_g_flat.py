@@ -466,17 +466,28 @@ def _plan_vq_group(tiles, *, rows, n_q: int, ngkmax: int, mesh_xy: Mesh,
 _VQ_ROOM_FRACTION = 0.9
 
 
+def _vq_live_bytes() -> float:
+    """The priced resident set beside a V_q plan: the measured runtime reserve.
+
+    V_q is read from the ζ file, and the ζ q tiles, V tiles and Coulomb rows it
+    holds are the plan's own price (``_plan_vq_group``); the 0.9 fraction is the
+    margin for what that price omits.  Never live allocator bytes, so every rank
+    plans the same tiles."""
+    from runtime.aot_memory import runtime_reserve_bytes
+    return float(runtime_reserve_bytes())
+
+
 def _vq_budget_bytes(budget_bytes: float | None) -> float:
-    """The per-rank V_q device budget, agreed across processes (the minimum).
+    """The per-rank V_q device budget, the same on every rank.
 
     ``None`` is the stage room: 0.9 of the run's budget (``memory_per_device_gb``)
-    less the live bytes (``common.gpu_utils.device_room_bytes``, already the
-    minimum over processes).  The q-tile count sets how many collective reads
-    every rank issues, so the value must be the same on every rank.
+    less the priced resident set (:func:`_vq_live_bytes`).  The q-tile count sets
+    how many collective reads every rank issues, so the value must be the same on
+    every rank; a caller's explicit budget is agreed across processes (the minimum).
     """
-    from common.gpu_utils import device_room_bytes, minimum_process_budget_gb
+    from common.gpu_utils import device_budget_bytes, minimum_process_budget_gb
     if budget_bytes is None:
-        return _VQ_ROOM_FRACTION * float(device_room_bytes())
+        return _VQ_ROOM_FRACTION * max(0.0, device_budget_bytes() - _vq_live_bytes())
     return minimum_process_budget_gb(float(budget_bytes) / 1e9) * 1e9
 
 
@@ -767,8 +778,8 @@ def _compute_V_q_g_flat_tiles(
         s['v'] = v
 
     # ---- G panel and q-tile from the V_q budget ------------------------
-    from common.gpu_utils import device_budget_bytes, device_room_bytes, record_stage_price
-    live = device_budget_bytes() - float(device_room_bytes())
+    from common.gpu_utils import record_stage_price
+    live = _vq_live_bytes()
     budget = _vq_budget_bytes(budget_bytes)
     # A ζ q-tile read stages each rank's slab in its phdf5 file context's host
     # buffer (``ctx->read_buf``); the context retires a buffer above 32 MiB

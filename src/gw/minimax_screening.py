@@ -463,8 +463,8 @@ def fit_gn_ppm_from_wc_pair(
             raise ValueError(
                 "fit_gn_ppm_from_wc_pair: q_neg_index must be an involution "
                 f"over [0,{_nq}).")
-    # The q block from the device pool: one q's compiled footprint on the
-    # LOCAL (already-sharded) tile against the free bytes, the same on every
+    # The q block from the deck budget: one q's compiled footprint on the
+    # LOCAL (already-sharded) tile against the priced room, the same on every
     # process.  The chunking is movement-only (see the sizer), so the fitted
     # values are bit-identical at any q_block; one block when it all fits.
     # The (mu, nu) adjoints move tiles X<->Y by one permute (transpose_xy).
@@ -472,10 +472,16 @@ def fit_gn_ppm_from_wc_pair(
     kernel = _gn_ppm_fit_kernel_ordered if ordered else _gn_ppm_fit_kernel
     _kargs = (_z, _fb, n_log, _mask) + ((xy_mesh,) if ordered else ())
     _fit_bytes = _gn_ppm_fit_bytes_per_q(kernel, Wc0_qmunu, Wc_probe_qmunu, *_kargs)
-    _free = _gn_ppm_fit_free_bytes()
+    # The whole W inputs stay live beside every block: price their shards.
+    _resident = sum(int(np.prod(w.sharding.shard_shape(w.shape)
+                                if hasattr(w, "sharding") else w.shape))
+                    * w.dtype.itemsize for w in (Wc0_qmunu, Wc_probe_qmunu))
+    _free = _gn_ppm_fit_free_bytes(_resident)
     _qb = _gn_ppm_fit_q_block(_nq, *_fit_bytes, _free)
-    from common.gpu_utils import device_budget_bytes, record_stage_price
-    record_stage_price(f"GN-PPM fit, q block {_qb}/{_nq}", device_budget_bytes() - _free
+    from common.gpu_utils import record_stage_price
+    from runtime.aot_memory import runtime_reserve_bytes
+    record_stage_price(f"GN-PPM fit, q block {_qb}/{_nq}",
+                       _resident + runtime_reserve_bytes()
                        + _qb * _fit_bytes[0] + 2 * _nq * _fit_bytes[1])
 
     # The anti-Hermitian half of the probe, kept only on the ordered path
@@ -630,7 +636,7 @@ def fit_gn_ppm_from_wc_pair(
 # arena compiled to 50.9 GiB and the map ran out of memory).  The footprint of
 # one q is now XLA's own memory analysis of the kernel compiled at q = 1, so
 # whatever layout the kernel lowers to is priced.
-#: Fraction of the pool's free bytes a q block may claim (fragmentation).
+#: Fraction of the budget's room a q block may claim (fragmentation).
 _GN_PPM_FIT_POOL_FRACTION = 0.8
 
 
@@ -665,15 +671,18 @@ def _gn_ppm_fit_bytes_per_q(kernel, Wc0, Wprobe, *args) -> tuple[int, int]:
     return _GN_PPM_FIT_BYTES_PER_Q[key]
 
 
-def _gn_ppm_fit_free_bytes() -> int:
-    """The room the fit may claim: the run's budget (``memory_per_device_gb``) less the
-    live bytes, capped at the pool fraction of the allocator's free pool, the minimum
-    over processes (``common.gpu_utils.device_room_bytes``).
+def _gn_ppm_fit_free_bytes(resident_bytes: int) -> int:
+    """The room the fit may claim, from the deck budget and the shapes: the pool
+    fraction of the run's budget (``memory_per_device_gb``) less the priced resident
+    set (``resident_bytes``, the fit's whole W inputs) and the measured runtime
+    reserve.  Never live allocator bytes, so every rank sizes the same q block.
 
     ``LORRAX_PPM_FIT_ARENA_GIB`` caps it further (a resource cap).
     """
-    from common.gpu_utils import device_room_bytes
-    free = device_room_bytes(pool_fraction=_GN_PPM_FIT_POOL_FRACTION)
+    from common.gpu_utils import device_budget_bytes
+    from runtime.aot_memory import runtime_reserve_bytes
+    free = int(_GN_PPM_FIT_POOL_FRACTION * max(
+        0.0, device_budget_bytes() - int(resident_bytes) - runtime_reserve_bytes()))
     env = os.environ.get("LORRAX_PPM_FIT_ARENA_GIB", "").strip()
     if env:
         from common.collectives import all_gather_processes

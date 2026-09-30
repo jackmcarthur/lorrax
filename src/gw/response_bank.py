@@ -892,20 +892,18 @@ def _finish_receipt(receipt, meta, header, started):
 def moment_q_width(ledger, *, n_q, face_bytes, per_q):
     """q parents per moment batch, from the ledger's room beside the live stages.
 
-    The room is the smaller of the ledger's (its budget less the reserved live
-    stages) and the device's (``common.gpu_utils.device_room_bytes``: the run
-    budget less the bytes actually live, which counts residents no ledger row
-    names).  A batch's outputs, ``(per_q·w + 16)`` faces, take at most half of it;
-    the batch's correlations, Coulomb read and Dyson temporaries reserve their own
+    The room is the ledger's: the deck budget less the inherited peak, the
+    reserved live stages and the measured runtime reserve, all priced from
+    shapes, never live allocator bytes, so every rank sizes the same batch.  A
+    batch's outputs, ``(per_q·w + 16)`` faces, take at most half of it; the
+    batch's correlations, Coulomb read and Dyson temporaries reserve their own
     footprints against the other half.  At least one q, at most every parent.
-    Every process enters (the device room is the minimum over processes).
     """
-    from common.gpu_utils import device_budget_bytes, device_room_bytes, record_stage_price
-    device_room = device_room_bytes()
-    room = min(ledger.room_bytes_per_rank(ledger.live_stages), device_room)
+    from common.gpu_utils import device_budget_bytes, record_stage_price
+    room = ledger.room_bytes_per_rank(ledger.live_stages)
     width = max(1, min(int(n_q), int((0.5 * room / face_bytes - 16) // per_q)))
     record_stage_price(f"moment bank, q width {width}/{int(n_q)}",
-                       device_budget_bytes() - device_room + (per_q * width + 16) * face_bytes)
+                       device_budget_bytes() - room + (per_q * width + 16) * face_bytes)
     return width
 
 
@@ -1338,19 +1336,18 @@ def response_group_size(meta, mesh_xy, *, n_samples, carry_per_sample, stream_wo
     decks), otherwise the largest group that does (about four on a
     two-component deck without q symmetry, where the carry is G/2 Green tiles).
     ``selection`` is the line selection's (resident, workspace) bytes, which
-    run beside the group's carry after its stream.  The group must fit both
-    the ledger and the device room (``common.gpu_utils.device_room_bytes``:
-    the budget less the bytes actually live, which counts residents no ledger
-    row names), as :func:`moment_q_width` reads it; on the device the stream
-    and the selection are two phases, so a group's new bytes are its carry
-    plus the larger phase.  Returns ``(size, fixed, room, live)``: the group's
-    bytes beside its carry, the device room, and the live bytes (both with the
-    ledger's run-time reserve counted as live).  Every process enters.
+    run beside the group's carry after its stream.  The group must fit the
+    ledger (the deck budget less the inherited peak, the reserved live stages
+    and the runtime reserve, priced from shapes, never live allocator bytes),
+    as :func:`moment_q_width` reads it; on the device the stream and the
+    selection are two phases, so a group's new bytes are its carry plus the
+    larger phase.  Returns ``(size, fixed, room, live)``: the group's bytes
+    beside its carry, the ledger's room, and the priced live bytes (the budget
+    less the room).  Every rank computes the same group.
     """
-    from common.gpu_utils import device_budget_bytes, device_room_bytes
+    from common.gpu_utils import device_budget_bytes
     ledger = meta.shared_pole_capacity
-    reserve = ledger.reserve_bytes_per_rank
-    device_room = device_room_bytes() - reserve
+    device_room = ledger.room_bytes_per_rank(ledger.live_stages)
     fixed = max(int(stream_workspace), int(selection[0]) + int(selection[1]))
     fits = lambda g: (ledger.preview(resident_bytes_per_rank=g*carry_per_sample+int(selection[0]),
         workspace_bytes_per_rank=max(stream_workspace, int(selection[1])),
