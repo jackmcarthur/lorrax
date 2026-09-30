@@ -125,8 +125,11 @@ The fixture is magnetic, so each report lists `TIME-REVERSAL SYMMETRY IS
 BROKEN` notices under `WARNINGS`. Step 2 prints `parallel-transport artifact:
 not written`: the cell has too little vacuum for that optional artifact.
 `gwjax.out` also lists two `LORRAX SANITY FAILURE … q↔−q conjugate
-reciprocity` lines (about 5e-3). They appear on this fixture at 70, 158 and
-320 centroids, and the run completes.
+reciprocity` lines (about 5e-3), and the run completes. They are true of this
+fixture: its DFT wavefunctions do not have the symmetry operations of its own
+WFN header exactly ([the fixture](../tests/hsuite/README.md#fixture)), and
+the symmetry-reduced run measures that. On your own WFN, treat these lines as
+a defect to find.
 
 ## 3. Every driver, checked {#chain}
 
