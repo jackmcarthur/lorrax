@@ -976,7 +976,7 @@ def sigma_term_zeroed(link_unserved: str | None, bound) -> str | None:
     _, _, value, rtol = bound
     if np.isfinite(value) and value <= rtol:
         return None
-    return f"link bound {value:.3e} > rtol {rtol:.1e}"
+    return f"link bound above rtol {rtol:.1e}"
 
 
 def velocity_term_shares(v_qp, pieces, *, nb_logical, surface_weight_kn=None,
