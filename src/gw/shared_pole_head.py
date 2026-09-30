@@ -231,7 +231,13 @@ def build_shared_pole_head(handle, header, V_q, wfns, meta, config, *,
             b, poles, counts = read_shared_pole_matrix(io, (iq, iq+1), meta=meta, header=header)
         # The linalg service owns the distributed rectangular products and
         # workspace estimate. No q-local whole-matrix copy is introduced.
-        algebra = distrib_la.plan("solve_lu", mesh_xy, backend="distributed", n=b.shape[1])
+        # The deck's linalg layout picks the backend, as the bank's
+        # (response_bank.response_algebra): a 1x1 mesh has no 2-D LU.
+        from .gw_config import linalg_resolution
+        layout = linalg_resolution(
+            config if hasattr(config, "get") else {"linalg": config.backend.linalg}).layout
+        algebra = distrib_la.plan("solve_lu", mesh_xy, n=b.shape[1],
+                                  backend="off" if layout == "local" else "distributed")
         evaluate = _realized_gamma_body(mesh_xy, realize)
         from symmetry_maps import QirrOperator
         # q = 0 is its own orbit: its wedge row is the full-zone row.
