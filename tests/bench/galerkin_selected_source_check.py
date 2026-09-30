@@ -6,6 +6,7 @@ from pathlib import Path
 from dataclasses import replace
 import json
 import time
+from types import SimpleNamespace
 import numpy as np
 import jax
 import jax.numpy as jnp
@@ -14,11 +15,13 @@ from common.collectives import device_put_process_local, gather_to_host, rank0_t
 from common.meta import Meta
 from common.psi_G_store import build_psi_G_store
 from common.gamma_matrices import dirac_spin_z, sigma_z
-from common.wfn_transforms import get_enk_bandrange
+from common.wfn_transforms import get_enk_bandrange, load_centroids_band_chunked
 from gw.qsgw_head import qp_frame_delta_h_dft, assemble_delta_head_manifold
 from file_io import WFNReader
 from isdf.galerkin import (GalerkinBasis, iter_galerkin_rchunks,
-    project_galerkin_spin_operator, project_lifted_galerkin_dirac_spin)
+    project_galerkin_spin_operator, project_lifted_galerkin_dirac_spin,
+    _build_selected_rows, _basis_at_nodes_from_selected_chunks,
+    _basis_at_nodes_from_selected_states)
 
 p = argparse.ArgumentParser(description=__doc__)
 p.add_argument('--wfn', required=True)
@@ -153,6 +156,32 @@ def main():
             assert source_calls['selected'] > 0
             rel=float(np.linalg.norm(selected_basis-legacy)/np.linalg.norm(legacy))
             assert rel<5e-13,rel
+            # Centroid values come from the same already-transformed full-
+            # Bloch selected rows, with noncontiguous nodes across both slabs.
+            node_flat=np.asarray([0,cut-1,cut,nrt-1,1,cut+1,2,nrt-2])
+            nodes=np.asarray(np.unravel_index(node_flat,tuple(meta.fft_grid))).T
+            stream=SimpleNamespace(r_chunk_ranges=ranges)
+            x_chunks=_build_selected_rows(source=source,meta=meta,mesh_xy=mesh,
+                band_start=1,band_count=nb,selected_states=selected,
+                rank_carrier=rank,stream=stream,groups=1,fft_rows=2,
+                log_fn=rank0_print)
+            with mesh:
+                sampled=_basis_at_nodes_from_selected_chunks(
+                    x_chunks=x_chunks,stream=stream,factor=factor,
+                    centroid_indices=nodes,fft_grid=meta.fft_grid,
+                    rank_carrier=rank,nspinor=ns,mesh_xy=mesh)
+                faces,_=load_centroids_band_chunked(w,sym,meta,nodes,bispinor,
+                    mesh,(1,6),band_chunk_size=4)
+                original_nodes=_basis_at_nodes_from_selected_states(
+                    psi_rmu=faces,selected_states=selected,factor=factor,
+                    rank_carrier=rank,n_nodes=len(nodes),mesh_xy=mesh)
+            sampled=np.asarray(gather_to_host(sampled))
+            original_nodes=np.asarray(gather_to_host(original_nodes))
+            node_error=float(np.linalg.norm(sampled-original_nodes)/np.linalg.norm(original_nodes))
+            assert node_error<5e-12,node_error
+            assert np.max(np.abs(sampled-legacy[...,node_flat]))<5e-12
+            assert np.max(np.abs(sampled[physical:]))==0
+            del x_chunks,faces,original_nodes
             # Exact-null carrier rows must survive selection and the solve.
             assert np.max(np.abs(selected_basis[physical:]))==0
             op=rng.normal(size=(ns,ns))+1j*rng.normal(size=(ns,ns))
@@ -202,7 +231,7 @@ def main():
             assert np.linalg.norm(got-wrong)>1e-4*np.linalg.norm(reference)
             row=dict(bispinor=bispinor,nspinor=ns,nk=nk,rank=rank,
                 selected_states=selected.tolist(),ranges=ranges,
-                basis_relative_error=rel,operator_relative_error=error,
+                basis_relative_error=rel,basis_node_relative_error=node_error,operator_relative_error=error,
                 metric_relative_error=norm_error,source_calls=source_calls,
                 physical_spin_relative_error=spin_error,
                 physical_spin_absolute_error=spin_absolute,
