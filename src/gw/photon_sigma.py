@@ -215,7 +215,7 @@ def band_sigma_finish(mesh_xy, nb, sym):
     return finish
 
 
-def _make_photon_class_restore(response, keys, mesh_xy):
+def _make_photon_class_restore(response, keys, mesh_xy, stream=False):
     """Compile one canonical full-q producer per class without caching interaction arrays.
 
     Returns the class's blocks as the four-current door's ``(nk, mx, nA, my,
@@ -228,7 +228,8 @@ def _make_photon_class_restore(response, keys, mesh_xy):
     layout, plans, policy = response.layout, response.family_plans, response.qgrid_policy
     # By value, not identity: every SC map builds a new (equal) layout and
     # policy, and an id key recompiled this program in every map.
-    key = ("restore", layout, tuple(map(id, plans)), _policy_key(policy), keys, _mesh_key(mesh_xy))
+    key = ("restore", layout, tuple(map(id, plans)), _policy_key(policy), keys, _mesh_key(mesh_xy),
+           stream)
     if key not in _photon_sigma_kernel_cache:
         lefts, rights = lorentz_class_vertices(keys)
         spec = NamedSharding(mesh_xy, P(None, "x", None, "y", None))
@@ -236,7 +237,8 @@ def _make_photon_class_restore(response, keys, mesh_xy):
         @jax.jit
         def restore(packed):
             blocks = jnp.stack([value for _, value in photon_blocks_full_q(
-                packed, keys, layout=layout, family_plans=plans, qgrid_policy=policy)])
+                packed, keys, layout=layout, family_plans=plans, qgrid_policy=policy,
+                stream=stream)])
             nq, mx, my = (int(d) for d in blocks.shape[1:])
             interactions = jax.lax.with_sharding_constraint(jnp.transpose(
                 blocks.reshape(len(lefts), len(rights), nq, mx, my), (2, 3, 0, 4, 1)), spec)
@@ -248,8 +250,13 @@ def _make_photon_class_restore(response, keys, mesh_xy):
 
 
 def contract_lorentz_blocks(blocks, *, families, term, response, Gij, meta, mesh_xy,
-                            head_diagnostics=False, admit_kernel=None):
-    """Yield one parent-band sum per endpoint class while retaining one resident Green."""
+                            head_diagnostics=False, admit_kernel=None, panels=None):
+    """Yield one parent-band sum per endpoint class while retaining one resident Green.
+
+    ``panels(keys)`` splits a class's blocks into ``A x B`` sub-products whose
+    full-q interactions are restored and convolved one at a time (the
+    four-current door takes any sub-product); ``None`` keeps one panel.
+    """
     from .cohsex_sigma import _occ_diag_full
     from .photon_layout import photon_q0_low_rank_block
     if tuple(f.green_parent.plan for f in families) != response.family_plans:
@@ -271,21 +278,29 @@ def contract_lorentz_blocks(blocks, *, families, term, response, Gij, meta, mesh
                    if term != _TERM_COH else left.band_mask(slices.sigma_sum).astype(jnp.complex128))
         weights = jax.lax.with_sharding_constraint(
             jnp.broadcast_to(weights, (meta.nk_tot, slices.nb_full)), NamedSharding(mesh_xy, P()))
-        interactions, vertices = _make_photon_class_restore(response, keys, mesh_xy)(packed)
-        head_blocks = None
-        if with_head:
-            head_blocks = jnp.stack([photon_q0_low_rank_block(pairs, response.layout, A, B, mesh_xy)
-                - (photon_q0_low_rank_block(bare, response.layout, A, B, mesh_xy) if bare else 0)
-                for A, B in keys])
-        kernel = _make_photon_static_class_kernel(mesh_xy, meta.kgrid, meta.nk_tot,
-                                                  left, right, keys, with_head=with_head)
-        arguments = (left.green_parent, right.green_parent, weights, interactions,
-                     -0.5 if term == _TERM_COH else 1.0, head_blocks,
-                     vertices if with_head else None)
-        if admit_kernel is not None:
-            admit_kernel(kernel, arguments, keys[0])
-        value = kernel(*arguments)
-        result, head = value if with_head else (value, None)
+        result = head = None
+        schedule = (keys,) if panels is None else panels(keys)
+        for part in schedule:
+            interactions, vertices = _make_photon_class_restore(
+                response, part, mesh_xy, stream=len(schedule) > 1)(packed)
+            head_blocks = None
+            if with_head:
+                head_blocks = jnp.stack([photon_q0_low_rank_block(pairs, response.layout, A, B, mesh_xy)
+                    - (photon_q0_low_rank_block(bare, response.layout, A, B, mesh_xy) if bare else 0)
+                    for A, B in part])
+            kernel = _make_photon_static_class_kernel(mesh_xy, meta.kgrid, meta.nk_tot,
+                                                      left, right, part, with_head=with_head)
+            arguments = (left.green_parent, right.green_parent, weights, interactions,
+                         -0.5 if term == _TERM_COH else 1.0, head_blocks,
+                         vertices if with_head else None)
+            if admit_kernel is not None:
+                admit_kernel(kernel, arguments, part[0])
+            value = kernel(*arguments)
+            del interactions
+            value, part_head = value if with_head else (value, None)
+            result = value if result is None else result + value
+            if part_head is not None:
+                head = part_head if head is None else head + part_head
         yield keys[0], result, head
 
 

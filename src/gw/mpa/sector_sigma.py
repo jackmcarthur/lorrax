@@ -110,19 +110,48 @@ def _w_contraction(mesh_xy, grid, nk, mc, nt_n, kcarrier, layout, weights_fn):
     return kernel
 
 
+#: Test hook: the largest Lorentz-block panel the synthesis may choose
+#: (``None``: the ledger decides).  A forced small panel checks the streamed
+#: sum against the one-panel sum on a deck where one panel fits.
+_TEST_MAX_PANEL_BLOCKS = None
+#: Test hook: the largest parent-q panel the instantaneous constant is read
+#: and packed in (``None``: the ledger decides).
+_TEST_CONSTANT_Q_SPAN = None
+
+
+class LorentzPanels:
+    """W(t) of one endpoint class, formed one Lorentz-block panel at a time.
+
+    ``panels`` are ``((a0, a1), (b0, b1))`` component ranges of the class's
+    ``A x B`` blocks; ``block(i)`` is panel ``i`` as the four-current door's
+    ``(nk, m, |A|, n, |B|)`` operand.  Nothing is formed until a consumer asks,
+    so one panel's tile is live at a time.  ``operands`` may be passed back
+    through an optimization barrier to order the panels.
+    """
+
+    def __init__(self, panels, form, operands):
+        self.panels, self._form, self.operands = panels, form, operands
+
+    def block(self, index, operands=None):
+        return self._form(self.panels[index], *(self.operands if operands is None else operands))
+
+
 def sector_tau_factory(left, right, keys, meta, mesh_xy):
     """Bind Gamma_A G_AB(t) Gamma_B to the window executor.
 
     G[k,mu_X,s,nu_Y,s'] has rectangular centroid endpoints. The at-most-nine
     Lorentz blocks share one transform of the raw-parent Green in the
     four-current door (``gw.cohsex_sigma.make_lorentz_convolution``). Only
-    the small projected band operator survives the call.
+    the small projected band operator survives the call. When the synthesis
+    forms W(t) in Lorentz-block panels (its class tile does not fit), each
+    panel is one call of its sub-product's door and the projected Sigma
+    sums over panels; a class that fits is one call, as before.
     """
     from distrib_la import gemm_plan, panel_matmul
     from common.contract_bands import contract_bands_block_reshard
     from gw.greens_function_kernel import (build_G_parents, _weighted_tau_phases,
                                            green_panel_bytes)
-    from gw.cohsex_sigma import make_lorentz_convolution
+    from gw.cohsex_sigma import make_lorentz_convolution, lorentz_class_vertices
 
     a, b = left.green_parent, right.green_parent
     plans = a.plan, b.plan
@@ -153,6 +182,7 @@ def sector_tau_factory(left, right, keys, meta, mesh_xy):
                          dtype=jnp.complex128, layout=a.layout)
     convolve = make_lorentz_convolution(mesh_xy, meta.kgrid, meta.nk_tot, keys,
                                         plans[0], plans[1])
+    lefts, rights = lorentz_class_vertices(keys)
 
     def factory(synthesis, band_axis):
         project = contract_bands_block_reshard(mesh_xy, layout=a.layout,
@@ -160,13 +190,31 @@ def sector_tau_factory(left, right, keys, meta, mesh_xy):
             face_band_extent=band_axis.padded)
         _, right_yr, _, right_proj, _, _ = parent_sigma_operands(right)
         right_proj = pad_to_axis(right_proj, band_axis, axis=3)
+        # One mode-8 door per Lorentz-block panel of the synthesis; a class
+        # that fits is one panel, the class's own door, as before.
+        panels = synthesis.panels
+        doors = ((convolve,) if len(panels) == 1 else tuple(
+            make_lorentz_convolution(mesh_xy, meta.kgrid, meta.nk_tot,
+                tuple((lefts[i], rights[j]) for i in range(*ia) for j in range(*ib)),
+                plans[0], plans[1]) for ia, ib in panels))
 
         def spatial(xn, yr, xr, yn, energies, weight, reference, time, interactions):
+            whole = interactions.block(0) if len(doors) == 1 else None
             phases = _weighted_tau_phases(energies, 1j*time, e_ref=reference,
                                          band_weight=weight)
             green = build_G_parents(xn, yr, phases=phases, layout=a.layout,
                                     gemm=gemm, k_unfold_plan=plans[0])
-            return project(xr, convolve(green, interactions), yn)
+            if whole is not None:
+                return project(xr, doors[0](green, whole), yn)
+            # Panels in sequence: the barrier makes panel i+1's W(t) wait for
+            # panel i's projected Sigma, so one panel tile is live at a time.
+            total, operands = None, interactions.operands
+            for index, door in enumerate(doors):
+                value = project(xr, door(green, interactions.block(index, operands)), yn)
+                total = value if total is None else total + value
+                if index + 1 < len(doors):
+                    total, operands = jax.lax.optimization_barrier((total, operands))
+            return total
 
         b=band_axis.padded
         projector_shapes=(((q,b,m),(q,m,n)),((q,b,n),(q,n,b)))
@@ -175,7 +223,7 @@ def sector_tau_factory(left, right, keys, meta, mesh_xy):
         # Everything spatial() closes over is a function of this key; SC maps
         # keep the parent plans, so their identities are stable.
         key=(mesh_xy,a.layout,shapes,int(b),tuple(keys),tuple(int(v) for v in meta.kgrid),
-             int(meta.nk_tot),id(plans[0]),id(plans[1]))
+             int(meta.nk_tot),id(plans[0]),id(plans[1]),panels)
         return SynthesisTau(spatial, synthesis, right_yr, right_proj,
                          native+synthesis.native, f'sigma.sector.tau.{keys[0]}', meta, key, plans)
     return factory
@@ -204,9 +252,17 @@ def _endpoint_route(header, basis, sym, span, rows, mesh_xy, axis, width):
     return _endpoint_unfold(kwargs), cost
 
 
+_PANELS_HELD = {}
+
+
+def _blocks(panel):
+    (a0,a1),(b0,b1)=panel
+    return (a1-a0)*(b1-b0)
+
+
 def sector_synthesis(readers, headers, bases, syms, layout, frequencies, meta, mesh_xy,
                      *, weights_fn=None, stage='sigma'):
-    """Retain full-q endpoint factors and form one W(t) tile per tau.
+    """Retain full-q endpoint factors and form W(t) per tau, one Lorentz panel at a time.
 
     The store and symmetry services are called once at setup.  The factors
     are placed once, with pole columns replicated (axis orientation) whenever
@@ -217,6 +273,8 @@ def sector_synthesis(readers, headers, bases, syms, layout, frequencies, meta, m
     the causal d(t) by default, the omega = 0 coefficient for
     :func:`sector_static_wc`, whose ledger stages ``stage`` prefixes.
     Occupied windows use conj(B_A(-q)) d(t) B_B(-q)^T; d is never conjugated.
+    ``w_kernel`` returns :class:`LorentzPanels`; ``panels`` is the schedule
+    the ledger admitted (one panel when the class tile fits).
     """
     from file_io.shared_pole_store import read_shared_pole_faces
     from .sigma import _shared_pole_factor_specs, _shared_pole_weights
@@ -233,11 +291,15 @@ def sector_synthesis(readers, headers, bases, syms, layout, frequencies, meta, m
     ambient=capacity.live_stages
     tag=f'{left.get("sector")}.{right.get("sector")}'
     shape=(nk,m*nc,n*nt)
+    whole=(((0,nc),(0,nt)),)
     if not kmax:
         zero=_zeros(mesh_xy,shape)
-        return WSynthesis(lambda _ref,_time,_hole:zero().reshape(nk,m,nc,n,nt),
+        synthesis=WSynthesis(lambda _ref,_time,_hole:LorentzPanels(
+                              whole,lambda _panel:zero().reshape(nk,m,nc,n,nt),()),
                           lambda _space,_indices,_bounds:(),lambda:(),lambda _result=None:None,0,
                           ('zero',mesh_xy,shape,nc,nt),ordered=True)
+        synthesis.panels=whole
+        return synthesis
     # The store reader pads physical Kmax for both endpoint face shardings.
     # Keep that carrier through unfolding and GEMM; K and the interval bounds
     # remain physical, so the padded pole columns have identically zero weight.
@@ -253,13 +315,14 @@ def sector_synthesis(readers, headers, bases, syms, layout, frequencies, meta, m
     px,py=int(mesh_xy.shape['x']),int(mesh_xy.shape['y'])
     face_bytes=16*nq*kcarrier*(m*nc+n*nt)//mesh_xy.size
 
-    def resident_for(factor_layout):
+    def resident_for(factor_layout,blocks=nc*nt):
         # Each factor has one centroid axis. Pole columns divide over the
-        # other mesh axis only in the face orientation.
+        # other mesh axis only in the face orientation. One W(t) panel of
+        # ``blocks`` Lorentz blocks is live at a time.
         split=factor_layout=='face'
         return (16*nk*((m//px)*nc*(kcarrier//py if split else kcarrier)
                        +(n//py)*nt*(kcarrier//px if split else kcarrier))
-                +8*nk*kcarrier+16*nk*m*nc*n*nt//mesh_xy.size)
+                +8*nk*kcarrier+16*nk*m*n*blocks//mesh_xy.size)
     native=_native_workspace(mesh_xy,(((nk,m*nc,kcarrier),(nk,kcarrier,n*nt)),))
     workspace=sum(c['estimated_live_bytes_per_rank'] for c in costs)+native
     # A face input is required by the established symmetry route. After it
@@ -269,14 +332,35 @@ def sector_synthesis(readers, headers, bases, syms, layout, frequencies, meta, m
     # re-broadcast the same panels every call (Fe 4^3 bispinor: 158k NCCL
     # broadcasts, 9.9 s of the first sector sweep). Face stays the fallback
     # when the ledger cannot admit the replicated pole columns.
-    factor_layout=layout
-    if layout=='face' and capacity.preview(
-            resident_bytes_per_rank=resident_for('axis')+2*face_bytes,
-            workspace_bytes_per_rank=workspace,
-            concurrent_with=ambient)['device_budget_status']=='PASS':
-        factor_layout='axis'
+    # The full-q W(t) of a current class is nc*nt Lorentz blocks (TT: 9 at
+    # 16 nk m n bytes each; Fe 20^3 at P36 is 103.7 GB/rank). When the class
+    # tile does not fit, W(t) is formed in A x B panels (one component row,
+    # then one block), each consumed by its own mode-8 door call. The first
+    # schedule that fits wins, so a deck that fits keeps one panel.
+    ladder=[whole]
+    if nc>1:ladder.append(tuple(((i,i+1),(0,nt)) for i in range(nc)))
+    if nt>1:ladder.append(tuple(((i,i+1),(j,j+1)) for i in range(nc) for j in range(nt)))
+    if _TEST_MAX_PANEL_BLOCKS is not None:
+        ladder=[p for p in ladder if _blocks(p[0])<=_TEST_MAX_PANEL_BLOCKS] or ladder[-1:]
+    # An SC map first tries the previous map's streamed choice, so the
+    # window executables keep their shapes while it still fits.
+    held=_PANELS_HELD.get((tag,nk,m,n,nc,nt,layout))
+    choice=None
+    for schedule in ([held[1]] if held else [])+ladder:
+        for candidate in ((held[0],) if held and schedule is held[1] else
+                          ('axis','face') if layout=='face' else (layout,)):
+            if capacity.preview(
+                    resident_bytes_per_rank=resident_for(candidate,_blocks(schedule[0]))+2*face_bytes,
+                    workspace_bytes_per_rank=workspace,
+                    concurrent_with=ambient)['device_budget_status']=='PASS':
+                choice=candidate,schedule
+                break
+        if choice is not None:break
+    factor_layout,panels=choice or (layout,ladder[-1])
+    if weights_fn is None and len(panels)>1:
+        _PANELS_HELD[(tag,nk,m,n,nc,nt,layout)]=factor_layout,panels
     factor_spec=_shared_pole_factor_specs(factor_layout)
-    resident_bytes=resident_for(factor_layout)
+    resident_bytes=resident_for(factor_layout,_blocks(panels[0]))
     setup=f'{stage}.sector.setup.{tag}'
     resident=f'{stage}.sector.resident.{tag}'
     capacity.reserve(setup,resident_bytes_per_rank=resident_bytes+2*face_bytes,
@@ -315,17 +399,24 @@ def sector_synthesis(readers, headers, bases, syms, layout, frequencies, meta, m
         # The window runner inlines this contraction and SynthesisTau.admit
         # reserves the runner's peak plus this GEMM's native workspace; a
         # standalone AOT compile per hole would only repeat that work.
-        kernel=_w_contraction(mesh_xy,tuple(left['grid']),nk,m*nc,n*nt,kcarrier,factor_layout,
-                              weights_fn or _shared_pole_weights)
+        (a0,a1),(b0,b1)=panels[0]
+        kernel=_w_contraction(mesh_xy,tuple(left['grid']),nk,m*(a1-a0),n*(b1-b0),kcarrier,
+                              factor_layout,weights_fn or _shared_pole_weights)
     except BaseException:
         capacity.live_stages=ambient
         b_x=b_y=poles=None
         raise
     replicated=NamedSharding(mesh_xy,P())
     def w_kernel(x,y,omega,interval,ref,time,hole):
-        # (nk, m*nc, n*nt) is centroid-major per endpoint: the four-current
-        # door reads it as (nk, m, nc, n, nt) without a transpose.
-        return kernel(x,y,omega,interval,ref,time,hole).reshape(nk,m,nc,n,nt)
+        # (nk, m*|A|, n*|B|) is centroid-major per endpoint: the four-current
+        # door reads it as (nk, m, |A|, n, |B|) without a transpose. The
+        # component axis of the factors is unsharded, so a panel is a local slice.
+        def form(panel,x,y,omega,interval):
+            (a0,a1),(b0,b1)=panel
+            if panels!=whole:
+                x,y=x[:,:,a0:a1],y[:,:,b0:b1]
+            return kernel(x,y,omega,interval,ref,time,hole).reshape(nk,m,a1-a0,n,b1-b0)
+        return LorentzPanels(panels,form,(x,y,omega,interval))
     def window_operands(space,indices,bounds):
         # Host intervals once per window; every tau node of the window reuses them.
         intervals=shared_pole_intervals(frequencies,np.asarray(indices),np.asarray(bounds))
@@ -342,13 +433,28 @@ def sector_synthesis(readers, headers, bases, syms, layout, frequencies, meta, m
             b_x=b_y=poles=None
             capacity.live_stages=ambient
             closed=True
-    return WSynthesis(w_kernel,window_operands,lambda:(b_x,b_y,poles),close,native,
-                      ('w',mesh_xy,tuple(left['grid']),nk,m,nc,n,nt,kcarrier,layout),ordered=True)
+    synthesis=WSynthesis(w_kernel,window_operands,lambda:(b_x,b_y,poles),close,native,
+                      ('w',mesh_xy,tuple(left['grid']),nk,m,nc,n,nt,kcarrier,layout,
+                       factor_layout,panels),ordered=True)
+    synthesis.panels=panels
+    return synthesis
+
+
+@lru_cache(maxsize=None)
+def _set_q_rows(mesh_xy):
+    """Write a parent-q panel into the packed constant in place (q is unsharded)."""
+    return jax.jit(lambda full, part, lo: jax.lax.dynamic_update_slice_in_dim(full, part, lo, axis=0),
+                   donate_argnums=0, out_shardings=NamedSharding(mesh_xy, P(None, 'x', 'y')))
 
 
 def instantaneous_sector_sigma(handle, families, bases, meta, mesh_xy, *,
                                occupation_state, return_components=False):
-    """Exchange-like equal-time contraction of W_infinity-V, exactly once."""
+    """Exchange-like equal-time contraction of W_infinity-V, exactly once.
+
+    The constant is read and packed in parent-q panels, and each class is
+    restored and convolved in Lorentz-block panels, only when the whole does
+    not fit the ledger; a deck that fits takes one read and one call per class.
+    """
     from gw.photon_layout import PhotonBasisLayout, photon_block_view, pack_photon_operator
     from gw.photon_sigma import contract_lorentz_blocks, _TERM_X
     from gw.cohsex_sigma import _resolve_Gij
@@ -359,17 +465,38 @@ def instantaneous_sector_sigma(handle, families, bases, meta, mesh_xy, *,
     layout=PhotonBasisLayout.from_centroid_extents(bases[0].n_packed,bases[1].n_packed,mesh_xy,packed=True)
     nq=int(header['bank_shape']['nq'])
     amount=16*nq*max(raw_layout.packed_extent,layout.packed_extent)**2//mesh_xy.size
-    meta.shared_pole_capacity.reserve('sigma.sector.constant.pack',
-        resident_bytes_per_rank=2*amount,workspace_bytes_per_rank=2*amount,
-        concurrent_with=meta.shared_pole_capacity.live_stages)
-    raw=read_bank_constant(handle,header,meta=meta,mesh_xy=mesh_xy)
-    def block(A,B):
-        value=photon_block_view(raw,raw_layout,A,B,mesh_xy)
-        value=bases[bool(A)].pack_axis(value,1,spec=P(None,'x','y'))
-        return bases[bool(B)].pack_axis(value,2,spec=P(None,'x','y'))
-    packed=pack_photon_operator(block,nq,layout,mesh_xy)
-    packed.block_until_ready()
-    del raw
+    ledger=meta.shared_pole_capacity
+    # The raw constant is read and packed in parent-q panels beside the
+    # packed operator when raw + packed (with their workspace, 4x) do not
+    # fit (Fe 20^3/P36: 97.87 GB/rank); a deck that fits reads it once.
+    room=ledger.room_bytes_per_rank(ledger.live_stages)
+    span=nq if 4*amount<=room else max(1,min(nq,(room-amount)*nq//(4*amount)))
+    if _TEST_CONSTANT_Q_SPAN is not None:
+        span=min(span,_TEST_CONSTANT_Q_SPAN)
+    part=-(-amount*span//nq)
+    ledger.reserve('sigma.sector.constant.pack',
+        resident_bytes_per_rank=2*amount if span==nq else amount+2*part,
+        workspace_bytes_per_rank=2*amount if span==nq else 2*part,
+        concurrent_with=ledger.live_stages)
+    def packer(raw):
+        def block(A,B):
+            value=photon_block_view(raw,raw_layout,A,B,mesh_xy)
+            value=bases[bool(A)].pack_axis(value,1,spec=P(None,'x','y'))
+            return bases[bool(B)].pack_axis(value,2,spec=P(None,'x','y'))
+        return block
+    if span==nq:
+        raw=read_bank_constant(handle,header,meta=meta,mesh_xy=mesh_xy)
+        packed=pack_photon_operator(packer(raw),nq,layout,mesh_xy)
+        packed.block_until_ready()
+        del raw
+    else:
+        packed=_zeros(mesh_xy,(nq,layout.packed_extent,layout.packed_extent))()
+        for lo in range(0,nq,span):
+            hi=min(lo+span,nq)
+            raw=read_bank_constant(handle,header,meta=meta,mesh_xy=mesh_xy,q_span=(lo,hi))
+            packed=_set_q_rows(mesh_xy)(packed,pack_photon_operator(packer(raw),hi-lo,layout,mesh_xy),lo)
+            packed.block_until_ready()
+            del raw
     response=SimpleNamespace(V_packed=packed,W_packed=packed,layout=layout,
         family_plans=tuple(f.green_parent.plan for f in families),head_completion=None,
         qgrid_policy=qgrid_trs_policy_from_shared_pole_store(header,announce=False))
@@ -387,10 +514,30 @@ def instantaneous_sector_sigma(handle, families, bases, meta, mesh_xy, *,
             ((q,m,n),(q,n,k)),((q,k,m),(q,m,k))))
         _admit_compiled(kernel,args,meta,f'sigma.sector.constant.{key}',
                         native=native,resident=amount)
+    # The class restore is the full-q (nk, m, |A|, n, |B|) interaction (TT
+    # at Fe 20^3/P36: 103.7 GB/rank). Split a class into A x B panels (one
+    # component row, then one block) when its restore, the door's transform
+    # of it and one temporary do not fit beside the packed constant.
+    room=meta.shared_pole_capacity.room_bytes_per_rank(meta.shared_pole_capacity.live_stages)-amount
+    nk=int(meta.nk_tot)
+    def panels(class_keys):
+        lefts=tuple(dict.fromkeys(A for A,_ in class_keys))
+        rights=tuple(dict.fromkeys(B for _,B in class_keys))
+        m,n=(int(bases[bool(v[0])].n_packed) for v in (lefts,rights))
+        ladder=[(class_keys,)]
+        if len(lefts)>1:ladder.append(tuple(tuple((A,B) for B in rights) for A in lefts))
+        if len(rights)>1:ladder.append(tuple(((A,B),) for A in lefts for B in rights))
+        if _TEST_MAX_PANEL_BLOCKS is not None:
+            ladder=[p for p in ladder if len(p[0])<=_TEST_MAX_PANEL_BLOCKS] or ladder[-1:]
+        for schedule in ladder:
+            if 3*16*nk*m*n*len(schedule[0])//mesh_xy.size<=room:
+                return schedule
+        return ladder[-1]
     total=None
     currents=[None,None]
     for key,value,_ in contract_lorentz_blocks(keys,families=families,term=_TERM_X,
-            response=response,Gij=gij,meta=meta,mesh_xy=mesh_xy,admit_kernel=admit):
+            response=response,Gij=gij,meta=meta,mesh_xy=mesh_xy,admit_kernel=admit,
+            panels=panels):
         total=value if total is None else total+value
         if return_components and key != (0,0):
             channel=int(key[0] != 0 and key[1] != 0)  # 0: CT+TC, 1: TT
@@ -565,7 +712,7 @@ def sector_static_wc(handle, meta, *, mesh_xy):
             wc=None
             try:
                 x,y,poles=synthesis.resident_operands()
-                wc=sum(synthesis.w_kernel(x,y,poles,intervals,0.0,0.0,hole).reshape(Q,m,m)
+                wc=sum(synthesis.w_kernel(x,y,poles,intervals,0.0,0.0,hole).block(0).reshape(Q,m,m)
                        for hole in (False,True))
             finally:
                 synthesis.close(wc)

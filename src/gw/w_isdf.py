@@ -2113,8 +2113,13 @@ class StaticPhotonResponse:
     family_plans: tuple = ()
 
 
-def photon_blocks_full_q(packed, keys, *, layout, family_plans, qgrid_policy):
-    """Restore each source once and apply the canonical Lorentz mixing for one class."""
+def photon_blocks_full_q(packed, keys, *, layout, family_plans, qgrid_policy, stream=False):
+    """Restore each source once and apply the canonical Lorentz mixing for one class.
+
+    ``stream`` restores one source block at a time and mixes it into ``keys``
+    before the next, so the live full-q tiles are the keys' plus one source
+    (a one-block panel of TT: 2 tiles, not the class's 9 restored sources).
+    """
     from symmetry_maps import unfold_isdf_operator, mix_lorentz_blocks
     from symmetry_maps import bgw_integer_q_to_fractional
     from .photon_layout import photon_block_view
@@ -2138,6 +2143,16 @@ def photon_blocks_full_q(packed, keys, *, layout, family_plans, qgrid_policy):
             axis_local_sym_perm=left.centroid_local_perm,
             right_axis_local_sym_perm=right.centroid_local_perm)
 
+    if stream:
+        total = None
+        for i, pair in enumerate(pairs):
+            mixed = mix_lorentz_blocks({pair: restore(parent_blocks[i])}, sym=sym,
+                                       sym_idx=policy.unfold_sym_idx, mesh_xy=mesh, keys=keys)
+            total = mixed if total is None else {k: total[k] + mixed[k] for k in total}
+            # The next source is restored only after this one is mixed in.
+            total, parent_blocks = jax.lax.optimization_barrier((total, parent_blocks))
+        yield from total.items()
+        return
     restored = jax.lax.map(restore, parent_blocks)
     sources = {pair: restored[i] for i, pair in enumerate(pairs)}
     yield from mix_lorentz_blocks(sources, sym=sym, sym_idx=policy.unfold_sym_idx,

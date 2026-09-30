@@ -1812,15 +1812,19 @@ def read_bank_constant_header(resource, *, mesh_xy):
     return header
 
 
-def read_bank_constant(resource, header, *, meta, mesh_xy):
-    """The [nq,d,d] face-tiled W_infinity-V constant named by a manifest resource."""
+def read_bank_constant(resource, header, *, meta, mesh_xy, q_span=None):
+    """The [nq,d,d] face-tiled W_infinity-V constant named by a manifest resource.
+
+    ``q_span`` reads one contiguous parent-q panel ``[lo, hi)`` of it.
+    """
     nq, d = int(header["bank_shape"]["nq"]), int(header["bank_shape"]["d"])
+    lo, hi = _span(q_span or (0, nq), nq, "constant q_span")
     with SlabIO(resource["path"], mode="r", mesh=mesh_xy) as io:
         if resource.get("kind") != _CONSTANT_KIND:
-            return read_shared_pole_bank(io, (0, nq), meta=meta, header=header,
+            return read_shared_pole_bank(io, (lo, hi), meta=meta, header=header,
                                          fields=("constant",))["constant"]
-        return io.read_slab("constant", shape=(nq, d, d), valid_shape=(nq, d, d),
-                            offset=(0, 0, 0), dtype=np.complex128,
+        return io.read_slab("constant", shape=(hi - lo, d, d), valid_shape=(hi - lo, d, d),
+                            offset=(lo, 0, 0), dtype=np.complex128,
                             partition_spec=P(None, "x", "y"))
 
 
