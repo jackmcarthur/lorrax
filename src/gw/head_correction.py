@@ -1958,19 +1958,37 @@ def compute_complex_pole_head_sigma_diag(
     residues = np.asarray(residues_ry).reshape(-1)
     if residues.shape != poles.shape:
         raise ValueError("poles_ry and residues_ry must have the same length")
-    if poles.size == 0:
+    if poles.size == 0 or omega.size == 0 or nk == 0 or nb == 0:
         return np.zeros((omega.size, nk, nb), dtype=np.complex128)
 
-    eps_rel = enk - float(efermi_ry)
-    delta = omega[:, None, None] - eps_rel[None, :, :]              # (nω, nk, nb)
-    pole = poles[:, None, None, None]
-    f = occ[None, None, :, :]
-    occ_term = f / (delta[None, :, :, :] + pole)
-    emp_term = (1.0 - f) / (delta[None, :, :, :] - pole)
+    # The host API returns only the diagonal, O(nω*nk*nb). Never form its
+    # pole-expanded counterpart: on Fe20³ each of those temporaries was
+    # 29.87GB per process (four processes share one host). Tile independent
+    # (omega,k,band) cells, keeping ALL poles and their original np.sum order
+    # in every tile. Work remains O(npole*nω*nk*nb), extra space <=64MiB
+    # across both backends and any processor count; no production dial.
+    eps_rel = (enk - float(efermi_ry)).reshape(-1)
+    occupation = occ.reshape(-1)
     pref = residues / (float(cell_volume) * float(nk_tot))
-    sigma_diag = np.sum(
-        pref[:, None, None, None] * (occ_term + emp_term), axis=0)
-    return np.asarray(sigma_diag, dtype=np.complex128)
+    pole = poles[:, None, None]
+    # Conservative live price: six complex pole arrays plus three real
+    # cell arrays and one complex reduction. The output is priced separately.
+    bytes_per_cell = 6 * poles.size * np.dtype(np.complex128).itemsize + 40
+    cell_limit = max(1, (64 << 20) // bytes_per_cell)
+    state_step = min(nk * nb, cell_limit)
+    omega_step = max(1, min(omega.size, cell_limit // state_step))
+    sigma_diag = np.empty((omega.size, nk * nb), dtype=np.complex128)
+    for iw in range(0, omega.size, omega_step):
+        w = omega[iw:iw + omega_step]
+        for ib in range(0, nk * nb, state_step):
+            states = slice(ib, ib + state_step)
+            delta = w[:, None] - eps_rel[None, states]
+            f = occupation[None, None, states]
+            occ_term = f / (delta[None, :, :] + pole)
+            emp_term = (1.0 - f) / (delta[None, :, :] - pole)
+            sigma_diag[iw:iw + omega_step, states] = np.sum(
+                pref[:, None, None] * (occ_term + emp_term), axis=0)
+    return sigma_diag.reshape(omega.size, nk, nb)
 
 
 def format_head_diagnostics(head: HeadGNParams, cell_volume: float) -> str:
