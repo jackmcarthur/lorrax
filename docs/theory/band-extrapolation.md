@@ -6,6 +6,16 @@ from one Σ pass that is truncated at `number_bands_sigma`. The estimator is
 code, its constants and its refusals are in `gw/band_extrapolation.py`; the
 deck keys are in the [input reference](../input_reference.md).
 
+## Scope
+
+Only Σ's Green's-function band sum is extrapolated. The χ₀ band sum, and so
+W, stops at `number_bands` and is never extended past it. The ISDF basis is
+fitted on pair products of bands inside the band set, so a pair that involves
+a band above `number_bands` has no fitted representation, and a tail model
+for χ₀ would put screening on unfitted pairs. W's band truncation is
+converged by raising `number_bands`; its measured size is in
+[production QSGW](../how-to/production-qsgw.md#error-budget).
+
 ## Where it runs
 
 The plasmon-pole stages (`gn_ppm`, `hl_ppm`) and the scalar `mpa` stage
@@ -112,10 +122,9 @@ own band truncation.
 | GN-PPM, head off (claim 2942) | 34.4 / 107.1 / 36.8 / −96.4 | 19.9 / 72.0 / 20.5 / −53.3 (β 4.75, Ω 38 eV) |
 
 The shared-pole legs ran with a study Gram-validity dial (the stock gate
-refuses 78 bands on 2532 centroids). The extrapolation covers Σ's G sum only:
-most of the remainder is W's band truncation, which the study below
-separates (case c against case a). The error budget that carries both is
-[production QSGW](../how-to/production-qsgw.md#error-budget).
+refuses 78 bands on 2532 centroids). Most of the remainder is W's band
+truncation ([scope](#scope)), which the study below separates (case c
+against case a).
 
 **Study (shared-pole W, stored samples).** Si 4³, 25 Ry, scalar, complete
 basis (536 bands) as the truth;
