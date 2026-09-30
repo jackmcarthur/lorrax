@@ -427,11 +427,12 @@ def load_parallel_transport_head(
         VELOCITY_DFT_DATASET,
         load_full_bz_links,
         load_link_singular_values,
+        stored_link_steps,
     )
     from file_io.slab_io import SlabIO
     from common.parallel_transport import (
-        band_storage_extent, collapsed_axes, link_stencil_orders,
-        wfn_fingerprint)
+        band_storage_extent, collapsed_axes, link_stencil,
+        link_stencil_orders, wfn_fingerprint)
 
     int_names = (
         "schema_version",
@@ -574,8 +575,21 @@ def load_parallel_transport_head(
         nb_storage = head_storage_extent(mesh, expected_nb)
         outer_storage = band_storage_extent(mesh, nb_outer)
         large_shape = (3, int(meta.nk_tot), outer_storage, outer_storage)
+        # The stored link steps must be this lattice's link_stencil; an
+        # artifact from before the shell (three reduced axes only, schema
+        # 3) is refused above by its schema.
+        stored_steps = stored_link_steps(io)
+        want_steps = link_stencil(
+            tuple(int(n) for n in expected_kgrid), expected_reciprocal).steps
+        if not np.array_equal(stored_steps, want_steps):
+            raise ValueError(
+                f"GATE pt_link_stencil: {path}: stored link steps "
+                f"{stored_steps.tolist()} != link_stencil "
+                f"{want_steps.tolist()}; regenerate the artifact with "
+                "get_dipole_mtxels")
         forward_neighbors = np.asarray(io.read_slab(
-            "full_forward_neighbors", shape=(int(meta.nk_tot), 3),
+            "full_forward_neighbors",
+            shape=(int(meta.nk_tot), int(want_steps.shape[0])),
             partition_spec=P(None, None), as_numpy=True), dtype=np.int64)
         links = load_full_bz_links(
             io, mesh=mesh, nk=int(meta.nk_tot), nb_storage=outer_storage,
@@ -630,12 +644,12 @@ def load_parallel_transport_head(
                 partition_spec=spec)
 
     expected_prefix = (3, int(meta.nk_tot))
+    nd = int(forward_neighbors.shape[1])
     if (
-        tuple(links.shape[:2]) != expected_prefix
+        tuple(links.shape[:2]) != (nd, int(meta.nk_tot))
         or tuple(velocity.shape) != expected_prefix + (nb_storage, nb_storage)
         or links.shape[-2] != links.shape[-1]
         or int(links.shape[-1]) < nb_outer
-        or forward_neighbors.shape != (int(meta.nk_tot), 3)
     ):
         raise ValueError(
             f"{path}: large PT dataset shapes are inconsistent: "
@@ -742,12 +756,12 @@ def load_dft_velocity_head(
             np.asarray(wfn.bvec, dtype=np.float64) * float(wfn.blat)
         )
         refusals = []
-        # Schema 3 changes only the link-consumer validation contract.  The
-        # DFT velocity payload and all provenance fields are byte-for-byte
-        # schema-2 compatible, and this mode deliberately consumes no links.
-        if schema not in (2, int(SCHEMA_VERSION)):
+        # Schemas 3 and 4 change only the link-consumer contract (4: the
+        # link_stencil shell).  The DFT velocity payload and all provenance
+        # fields are schema-2 compatible, and this mode consumes no links.
+        if schema not in (2, 3, int(SCHEMA_VERSION)):
             refusals.append(
-                f"schema_version={schema}, expected 2 or {SCHEMA_VERSION}")
+                f"schema_version={schema}, expected 2, 3 or {SCHEMA_VERSION}")
         if band_start != 0 or band_stop < nb:
             refusals.append(
                 f"band manifold [{band_start},{band_stop}) does not contain "
@@ -1028,31 +1042,28 @@ def covariant_link_derivative(
     """Return the direct finite-link covariant derivative of ``Delta H``.
 
     Neighbouring operators are transported into the central DFT basis before
-    the reduced-coordinate stencil is applied (fourth order on >= 5-point
-    axes, second order on 3- or 4-point axes); a collapsed axis takes
-    ``-i[Z_a, Delta H]`` with the stored position operator
-    ``collapsed_position`` (``common.parallel_transport.link_stencil_orders``
-    owns the per-axis rule).  This is one gauge-covariant discrete object;
-    no separately differentiated Hamiltonian and connection commutator have
-    to cancel on a finite grid.
+    the stencil is applied on the point-group-closed link shell
+    (``common.parallel_transport.link_stencil`` owns the steps, weights and
+    orders); a collapsed axis takes ``-i[Z_a, Delta H]`` with the stored
+    position operator ``collapsed_position``.  This is one gauge-covariant
+    discrete object; no separately differentiated Hamiltonian and
+    connection commutator have to cancel on a finite grid.
     """
     from common.parallel_transport import (
-        fourth_order_covariant_derivative,
-        link_stencil_orders,
+        link_covariant_derivative,
+        link_stencil,
         make_distributed_band_matmul,
     )
 
     delta = jnp.asarray(delta_h_dft, dtype=jnp.complex128)
     links = jnp.asarray(forward_links, dtype=jnp.complex128)
     grid = tuple(int(n) for n in kgrid)
-    spacing = 1.0 / np.asarray(grid, dtype=np.float64)
-    reduced = fourth_order_covariant_derivative(
+    reduced = link_covariant_derivative(
         delta,
         links,
         np.asarray(forward_neighbors, dtype=np.int64),
-        spacing,
+        link_stencil(grid, bvec_cart),
         band_matmul=make_distributed_band_matmul(mesh, n_batch_axes=1),
-        stencil_orders=link_stencil_orders(grid),
         collapsed_position=collapsed_position,
     )
     return reduced_covector_to_cartesian(reduced, bvec_cart)

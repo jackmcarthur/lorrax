@@ -6553,23 +6553,6 @@ def _refuse_hybridized_window_edge(
         "pipeline step 3(a)")
 
 
-def _sampled_link_singular_values(singular_values, kgrid) -> np.ndarray:
-    """The link singular values with every collapsed axis set to 1.
-
-    A collapsed axis's stored "link" is the plane-wave overlap
-    <psi| e^{-i b.r} |psi> (the neighbour is the point itself through
-    b_i): its singular values are far below one by construction and say
-    nothing about window hybridization, which is a property of transport
-    along the sampled directions only.  The derivative kernels never read
-    that link (common.parallel_transport.link_stencil_orders).
-    """
-    from common.parallel_transport import collapsed_axes
-    values = np.array(singular_values, dtype=np.float64, copy=True)
-    for axis in collapsed_axes(kgrid):
-        values[:, axis, :] = 1.0
-    return values
-
-
 def load_head_velocity_source(
     config,
     input_dir: str,
@@ -6740,8 +6723,7 @@ def load_head_velocity_source(
             pt_path, mesh=mesh, sym=sym, wfn=wfn, meta=meta)
         try:
             _refuse_hybridized_window_edge(
-                _sampled_link_singular_values(
-                    source.singular_values, wfn.kgrid),
+                source.singular_values,
                 source.nb_logical, where=where)
         except ValueError as exc:
             unserved = str(exc).strip().splitlines()[0]

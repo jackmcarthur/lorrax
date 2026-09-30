@@ -18,12 +18,11 @@ from jax.sharding import NamedSharding, PartitionSpec as P
 
 from common.parallel_transport import (
     band_storage_extent,
-    build_forward_neighbor_table,
     build_g_wrap_lookup,
     build_neighbor_table,
-    fourth_order_connection,
-    fourth_order_covariant_derivative,
-    g_wrap_for_forward_step,
+    link_connection,
+    link_covariant_derivative,
+    link_stencil,
     g_wrap_for_step,
     make_cross_k_link,
     make_cross_k_overlap,
@@ -38,7 +37,7 @@ from common.wfn_layout import band_sphere_spec
 from file_io.slab_io import SlabIO
 
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 LINKS_DATASET = "links_ibz"
 SINGULAR_VALUES_DATASET = "singular_values_ibz"
 CONNECTION_REDUCED_DATASET = "berry_connection_reduced"
@@ -56,6 +55,13 @@ ENERGIES_DATASET = "dft_energies_ry_full"
 W_AV_DENSITY_DATASET = "w_av_density_mtxel"
 W_AV_SCHEMA_VERSION = 3
 OCCUPATIONS_DATASET = "dft_occupations_full"
+
+def wfn_link_stencil(wfn):
+    """:func:`common.parallel_transport.link_stencil` on this WFN's mesh."""
+    return link_stencil(
+        tuple(int(n) for n in np.asarray(wfn.kgrid).reshape(3)),
+        np.asarray(wfn.bvec, dtype=np.float64) * float(wfn.blat))
+
 
 def link_symmetry_reduction_applies(sym, kgrid, *, wfn=None) -> bool:
     """Whether the IBZ link stream + directed-edge unfold is DEFINED here.
@@ -81,6 +87,11 @@ def link_symmetry_reduction_applies(sym, kgrid, *, wfn=None) -> bool:
     has no stored image (``PT-EDGE-INCOMPLETE``; MoS2 3x3x1).  Then the
     links are streamed on the full BZ, as on bcc/fcc.
     """
+    if wfn is not None and not np.array_equal(
+            wfn_link_stencil(wfn).steps, np.eye(3, dtype=np.int32)):
+        # The IBZ edge stream stores the three elementary steps; a shell
+        # with other steps (bcc, fcc, hexagonal) streams the full BZ.
+        return False
     mats_all = np.asarray(sym.sym_mats_k, dtype=np.float64)
     active = np.asarray(
         getattr(sym, "active_symmetry_rows",
@@ -141,6 +152,8 @@ __all__ = [
     "WAvStencilReader",
     "line_index_table",
     "link_symmetry_reduction_applies",
+    "stored_link_steps",
+    "wfn_link_stencil",
     "initialize_parallel_transport_artifact",
     "load_full_bz_links",
     "load_link_singular_values",
@@ -499,6 +512,9 @@ def initialize_parallel_transport_artifact(
     reduced = link_symmetry_reduction_applies(sym, kgrid, wfn=wfn)
     nk = int(sym.nk_tot)
     nrk = int(np.asarray(sym.kirr_fullids).size) if reduced else nk
+    stencil = (None if undersampled_link_axes(kgrid)
+               else wfn_link_stencil(wfn))
+    nd = 3 if stencil is None else stencil.ndir
     energies, occupations = _full_band_tables(wfn, sym, nb)
     velocity = jnp.asarray(velocity_dft_kmajor)
     if velocity.ndim != 4 or velocity.shape[:2] != (nk, 3):
@@ -542,21 +558,22 @@ def initialize_parallel_transport_artifact(
 
     with SlabIO(str(path), mode="w", mesh=mesh) as io:
         io.create_dataset(
-            LINKS_DATASET, shape=(nrk, 3, nb, nb), dtype=np.complex128,
+            LINKS_DATASET, shape=(nrk, nd, nb, nb), dtype=np.complex128,
             attrs={
                 "k_storage": ("ibz_source_edges" if reduced
                               else "full_bz_source_edges"),
-                "orientation": "L_i(k) X(k+b_i) L_i(k)^H",
-                "source_steps": "positive reduced-grid unit steps",
+                "orientation": "L_d(k) X(k+b_d) L_d(k)^H",
+                "source_steps": ("link_stencil steps: one of each +/- pair "
+                                 "of a Marzari-Vanderbilt shell set"),
                 "band_layout": "P(None,None,x,y)",
                 "gauge": "WfnLoader generated full-BZ gauge",
             })
         io.create_dataset(
-            SINGULAR_VALUES_DATASET, shape=(nrk, 3, nb), dtype=np.float64,
+            SINGULAR_VALUES_DATASET, shape=(nrk, nd, nb), dtype=np.float64,
             attrs={
                 "k_storage": ("ibz_source_edges" if reduced
                               else "full_bz_source_edges"),
-                "source_steps": "positive reduced-grid unit steps",
+                "source_steps": "link_stencil steps",
                 "ordering": "descending",
                 "distribution": "replicated O(nband) diagnostic",
             })
@@ -605,11 +622,9 @@ def initialize_parallel_transport_artifact(
                 "components": "reduced reciprocal coordinates",
                 "band_layout": "P(None,None,x,y)",
                 "hermitian": True,
-                # 4 everywhere keeps a 3D artifact's metadata unchanged.
                 "finite_difference_order": (
-                    4 if orders in (None, (4, 4, 4)) else
-                    "per axis: 4 (>=5 points), 2 (3-4 points), "
-                    "position operator (collapsed)"),
+                    "per link_stencil shell: 4 (>=5 points per line), 2 "
+                    "(3-4); position operator on a collapsed axis"),
             })
         io.create_dataset(
             CONNECTION_CART_DATASET, shape=(3, nk, nb, nb),
@@ -638,6 +653,10 @@ def initialize_parallel_transport_artifact(
         if orders is not None:
             io.write_attr("link_stencil_orders",
                           np.asarray(orders, dtype=np.int32))
+        if stencil is not None:
+            io.write_attr("link_stencil_step_orders",
+                          np.asarray(stencil.orders, dtype=np.int32))
+            io.write_attr("link_stencil_coefficients", stencil.coefficients)
         io.write_attr("collapsed_axis_flags",
                       np.asarray([int(n == 1) for n in kgrid],
                                  dtype=np.int32))
@@ -712,12 +731,14 @@ def _write_link_stage(
     source_full = (np.asarray(sym.kirr_fullids, dtype=np.int32) if reduced
                    else np.arange(int(sym.nk_tot), dtype=np.int32))
     nrk = int(source_full.size)
-    full_plus = build_forward_neighbor_table(sym.kvecs_asints, wfn.kgrid)
+    source_steps = wfn_link_stencil(wfn).steps
+    nd = int(source_steps.shape[0])
+    full_plus = build_neighbor_table(
+        sym.kvecs_asints, wfn.kgrid, source_steps)
     source_plus = full_plus[source_full]
-    wraps = np.empty((nrk, 3, 3), dtype=np.int32)
+    wraps = np.empty((nrk, nd, 3), dtype=np.int32)
     singular_values = []
     center_on_x, link_kernel = make_cross_k_link(mesh, polar_plan)
-    source_steps = np.eye(3, dtype=np.int32)
 
     with SlabIO(path, mode="a", mesh=mesh) as io:
         for ik_irr, center_full in enumerate(source_full):
@@ -730,12 +751,12 @@ def _write_link_stage(
             g_center = wfn.gvecs(k=center_ids)[0]
             ngk_center = int(wfn.ngk_valid(k=center_ids)[0])
 
-            for idir in range(3):
+            for idir in range(nd):
                 neighbor_full = int(source_plus[ik_irr, idir])
                 neighbor_ids = [neighbor_full]
-                wrap = g_wrap_for_forward_step(
+                wrap = g_wrap_for_step(
                     sym.unfolded_kpts, int(center_full), neighbor_full,
-                    idir, wfn.kgrid)
+                    source_steps[idir], wfn.kgrid)
                 wraps[ik_irr, idir] = wrap
                 g_neighbor = wfn.gvecs(k=neighbor_ids)[0]
                 ngk_neighbor = int(wfn.ngk_valid(k=neighbor_ids)[0])
@@ -755,7 +776,7 @@ def _write_link_stage(
                 io.write_slab(
                     LINKS_DATASET, link[None, None, :, :],
                     offset=(ik_irr, idir, 0, 0),
-                    global_shape=(nrk, 3, nb, nb))
+                    global_shape=(nrk, nd, nb, nb))
                 # WfnLoader owns a second collective HDF5 handle.  Finish
                 # this asynchronous append before its next streamed read.
                 io.sync_writes()
@@ -767,12 +788,12 @@ def _write_link_stage(
             del center_xy, center_x
 
         singular_values_device = jnp.stack(singular_values).reshape(
-            nrk, 3, nb)
+            nrk, nd, nb)
         singular_values_device = jax.lax.with_sharding_constraint(
             singular_values_device, NamedSharding(mesh, P()))
         io.write_slab(
             SINGULAR_VALUES_DATASET, singular_values_device,
-            global_shape=(nrk, 3, nb))
+            global_shape=(nrk, nd, nb))
         io.write_attr("source_steps", source_steps)
         io.write_attr("source_full_ids", source_full)
         io.write_attr("source_neighbor_full_ids", source_plus)
@@ -828,14 +849,15 @@ def _write_connection_stage(
         # HDF5 handle is live, which the one-owner guard correctly refuses.
         # ``create_dataset`` is idempotent for an identical existing dataset
         # and leaves its contents untouched.
+        nd = int(np.asarray(source_steps).shape[0])
         io.create_dataset(
             LINKS_DATASET,
-            shape=(int(source_full.size), 3, nb, nb),
+            shape=(int(source_full.size), nd, nb, nb),
             dtype=np.complex128,
         )
         source_links = io.read_slab(
             LINKS_DATASET,
-            shape=(int(source_full.size), 3, nb_storage, nb_storage),
+            shape=(int(source_full.size), nd, nb_storage, nb_storage),
             partition_spec=block_spec)
         if table is None:
             # The source rows ARE the targets, in full-BZ id order, and each
@@ -856,11 +878,9 @@ def _write_connection_stage(
         full_links = jax.lax.with_sharding_constraint(
             full_links, block_sharding)
 
-        spacing = 1.0 / np.asarray(wfn.kgrid, dtype=np.float64)
-        kgrid = tuple(int(n) for n in np.asarray(wfn.kgrid).reshape(3))
-        orders = link_stencil_orders(kgrid)
+        stencil = wfn_link_stencil(wfn)
         position = None
-        if COLLAPSED_AXIS in orders:
+        if COLLAPSED_AXIS in stencil.axis_rules:
             # Same collective registration as ``links_ibz`` above: this
             # append handle did not create the dataset.
             io.create_dataset(
@@ -873,9 +893,9 @@ def _write_connection_stage(
 
         @jax.jit
         def _connection(links, position):
-            return fourth_order_connection(
-                links, full_plus, spacing, band_matmul=band_matmul,
-                stencil_orders=orders, collapsed_position=position)
+            return link_connection(
+                links, full_plus, stencil, band_matmul=band_matmul,
+                collapsed_position=position)
 
         connection_reduced = _connection(full_links, position)
         connection_reduced = jax.lax.with_sharding_constraint(
@@ -1505,7 +1525,7 @@ def complete_velocity_validation(
     ``p + i[r, V_NL]`` with no k stencil in the way.
 
     Both this producer-side gate and QSGW call
-    :func:`common.parallel_transport.fourth_order_covariant_derivative`.
+    :func:`common.parallel_transport.link_covariant_derivative`.
     The acceptance observable is the static occupied-to-empty head tensor,
     supplemented by the complex transition-velocity overlap so a conjugated
     link orientation cannot pass a phase-blind quadratic response.  Full
@@ -1540,17 +1560,18 @@ def complete_velocity_validation(
     if tuple(exact.shape) != (3, nk, nb, nb):
         raise ValueError(
             f"exact velocity must be (3,{nk},{nb},{nb}); got {exact.shape}")
-    if tuple(links.shape) != (3, nk, nb, nb):
+    stencil = link_stencil(grid, reciprocal)
+    nd = stencil.ndir
+    if tuple(links.shape) != (nd, nk, nb, nb):
         raise ValueError(
-            f"links_full must be (3, {nk}, {nb}, {nb}); got "
+            f"links_full must be ({nd}, {nk}, {nb}, {nb}); got "
             f"{tuple(links.shape)}")
     plus = np.asarray(forward_neighbors, dtype=np.int64)
-    if plus.shape != (nk, 3):
+    if plus.shape != (nk, nd):
         raise ValueError(
-            f"forward_neighbors must be ({nk}, 3); got {plus.shape}")
+            f"forward_neighbors must be ({nk}, {nd}); got {plus.shape}")
     h_sharding = NamedSharding(mesh, P(None, "x", "y"))
     band_matmul = make_distributed_band_matmul(mesh, n_batch_axes=1)
-    spacing = 1.0 / np.asarray(grid, dtype=np.float64)
 
     def _diagonal_hamiltonian(e):
         return jax.vmap(jnp.diag)(e).astype(links.dtype)
@@ -1559,9 +1580,9 @@ def complete_velocity_validation(
         _diagonal_hamiltonian, out_shardings=h_sharding)
     H = _diagonal_hamiltonian(energies.astype(links.real.dtype))
     orders = link_stencil_orders(grid)
-    reduced = fourth_order_covariant_derivative(
-        H, links, plus, spacing, band_matmul=band_matmul,
-        stencil_orders=orders, collapsed_position=collapsed_position)
+    reduced = link_covariant_derivative(
+        H, links, plus, stencil, band_matmul=band_matmul,
+        collapsed_position=collapsed_position)
     reconstructed = reduced_covector_to_cartesian(reduced, reciprocal)
     outer_reconstructed = reconstructed
     judged = int(nb if head_nbands is None else head_nbands)
@@ -1588,6 +1609,7 @@ def complete_velocity_validation(
                                1.0e-60))))
     metrics["entrywise_passed"] = bool(metrics["passed"])
     metrics["stencil_orders"] = tuple(int(o) for o in orders)
+    metrics["link_directions"] = int(stencil.ndir)
     # Per-Cartesian-axis reduction of the same error, so a slab's collapsed
     # axis (position operator) and its stencil axes are judged separately.
     axis_error = jnp.abs(reconstructed - exact)
@@ -1723,6 +1745,13 @@ def complete_velocity_validation(
     return metrics
 
 
+def stored_link_steps(io) -> np.ndarray:
+    """The ``(nd, 3)`` link steps an artifact stores (``source_steps``)."""
+    return np.asarray(io.read_slab(
+        "source_steps", partition_spec=P(None, None), as_numpy=True),
+        dtype=np.int32).reshape(-1, 3)
+
+
 def load_full_bz_links(
     io,
     *,
@@ -1731,7 +1760,10 @@ def load_full_bz_links(
     nb_storage: int,
     nb_logical: int,
 ):
-    """Read the stored links and return them as ``(3, nk, nb, nb)``.
+    """Read the stored links and return them as ``(nd, nk, nb, nb)``.
+
+    ``nd`` is the stored ``source_steps`` count (the artifact's
+    :func:`common.parallel_transport.link_stencil`).
 
     The link stage stores either one row per full-BZ point (bcc/fcc, where
     ``link_symmetry_reduction_applies`` is false) or one row per IBZ point
@@ -1743,8 +1775,9 @@ def load_full_bz_links(
     source_full = np.asarray(io.read_slab(
         "source_full_ids", partition_spec=P(None), as_numpy=True))
     n_source = int(source_full.size)
+    nd = stored_link_steps(io).shape[0]
     stored = io.read_slab(
-        LINKS_DATASET, shape=(n_source, 3, nb_storage, nb_storage),
+        LINKS_DATASET, shape=(n_source, nd, nb_storage, nb_storage),
         partition_spec=block_spec)
     if n_source == nk:
         links = jnp.moveaxis(stored, 1, 0)
@@ -1790,7 +1823,7 @@ def load_full_bz_links(
 def load_link_singular_values(io, *, nb_logical: int) -> np.ndarray:
     """Read the per-source-k, per-direction link overlap singular values.
 
-    Returns ``(n_source, 3, nb_logical)``, descending along the last axis
+    Returns ``(n_source, nd, nb_logical)``, descending along the last axis
     (the dataset's own ``ordering`` attribute; see
     :data:`SINGULAR_VALUES_DATASET`'s ``create_dataset`` call).  ``n_source``
     is the IBZ row count on a symmetry-reduced deck or ``nk_tot`` on an
@@ -1813,7 +1846,8 @@ def load_link_singular_values(io, *, nb_logical: int) -> np.ndarray:
         "source_full_ids", partition_spec=P(None), as_numpy=True))
     n_source = int(source_full.size)
     values = io.read_slab(
-        SINGULAR_VALUES_DATASET, shape=(n_source, 3, nb),
+        SINGULAR_VALUES_DATASET,
+        shape=(n_source, stored_link_steps(io).shape[0], nb),
         partition_spec=P(None, None, None), as_numpy=True)
     return np.asarray(values, dtype=np.float64)
 
@@ -1849,7 +1883,8 @@ def validate_parallel_transport_artifact(
             shape=(nk, nb_storage),
             partition_spec=P(None, ("x", "y")))
         forward_neighbors = np.asarray(io.read_slab(
-            "full_forward_neighbors", shape=(nk, 3),
+            "full_forward_neighbors",
+            shape=(nk, stored_link_steps(io).shape[0]),
             partition_spec=P(None, None), as_numpy=True), dtype=np.int64)
         links = load_full_bz_links(
             io, mesh=mesh, nk=nk, nb_storage=nb_storage,
