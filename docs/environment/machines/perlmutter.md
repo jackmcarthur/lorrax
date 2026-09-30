@@ -97,8 +97,9 @@ lib dirs on its RPATH, because `/opt/cray/pe/lib64` points
 site-default MPI. The legs build with `config/perlmutter/build_ffi_host.sh`
 and `config/perlmutter/build_ffi_cuda.sh`, and seal with
 `src/ffi/cpp/stage/seal_bundle.py` ([building_ffi.md](../../building_ffi.md#seal-the-deployable-pair)).
-The module's own venv, the bundle acceptance (Gate 10 and a P4 run) and the
-publication steps are still kept outside this repository, with the module.
+The module's venv, the build and seal, the acceptance (Gate 10 and a P4
+run) and the publication are `config/perlmutter/module/`
+([Perlmutter module](../../installation/perlmutter-module.md)).
 
 ## 3. CPU multi-process runs (Milan)
 

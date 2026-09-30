@@ -8,7 +8,7 @@
 #
 #   LORRAX_MODULE_PREFIX=/abs/prefix bash publish.sh <candidate dir>
 #
-# Refuses a candidate without accept/ok.{0,1,2,3} and an existing release of
+# Refuses a candidate without accept/{gate10.ok,ok.0,…,ok.3} and an existing release of
 # either name: releases are never replaced, and earlier ones stay for rollback
 # (re-render the module against them with install_module.sh).
 # ============================================================================
@@ -19,8 +19,8 @@ source "$HERE/stack.sh"
 CAND="$(realpath -e "${1:?usage: publish.sh <candidate dir>}")"
 # shellcheck disable=SC1091
 source "$CAND/CANDIDATE"
-for r in 0 1 2 3; do
-    [[ -e "$CAND/accept/ok.$r" ]] || lorrax_module_die "rank $r did not accept $CAND (run accept.sh)"
+for f in gate10.ok ok.0 ok.1 ok.2 ok.3; do
+    [[ -e "$CAND/accept/$f" ]] || lorrax_module_die "no accept/$f in $CAND (run accept.sh at -n 1 and -n 4)"
 done
 SRC_REL="$RELEASES/source-${REV:0:8}"
 BUN_REL="$RELEASES/${REV:0:8}-bundle-${BUNDLE_ID:0:12}"

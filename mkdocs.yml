@@ -65,6 +65,7 @@ nav:
       - FFI native libraries: installation/ffi-native-libs.md
       - Building the FFI libraries: building_ffi.md
       - Perlmutter (NERSC): installation/perlmutter.md
+      - Perlmutter module (maintainers): installation/perlmutter-module.md
   - Environment:
       - Overview: environment/overview.md
       - Collective transports: environment/transports.md
