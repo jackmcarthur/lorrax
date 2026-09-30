@@ -39,6 +39,17 @@ that reorders against DFT keeps one tail ratio, so Σ stays symmetric.
 Default cuts: 70 %, 85 % and 100 % of the total Σ band count, moved to the
 nearest degeneracy-clean boundary (`band_extrapolation_bracket_scheme`).
 
+What each sum is read for decides what is stored. The fit reads the band
+diagonal of all three. The extrapolated matrix combines S(N₁) and S(N₃)
+(weights −r and 1 + r, below); S(N₂) has weight zero and only its diagonal is
+read. The sweep therefore keeps the three sums on the k wedge of the WFN file
+and unfolds one to the full BZ at a time (`gw.ppm_sigma.BandCountCube`). The
+fit reads a sum's diagonal and drops it. The extrapolated matrix is written
+into the buffer of S(N₁), beside S(N₃), which the run keeps as the raw twin.
+Two full-BZ Σ(ω) cubes are resident, the two the stage returns; the
+three-sum full-BZ cube is never made. Without symmetry the wedge is the full
+BZ and the sweep still accumulates three cubes.
+
 ## The model
 
 A band A above N₁ adds to Σ_c of state i
