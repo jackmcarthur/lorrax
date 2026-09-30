@@ -274,7 +274,7 @@ STAGES = (
     ("cohsex", "gw.gw_jax", ["-i", "cohsex.in"]),
     ("gnppm_sc", "gw.gw_jax", ["-i", "gnppm_sc.in"]),
     ("sp_export", "gw.gw_jax", ["-i", "sp_export.in"]),
-    ("kin_ion_bisp", "gw.kin_ion_io", ["-i", "bisp_os.in"]),
+    ("kin_ion_bisp", "gw.kin_ion_io", ["-i", "bisp_os.in", "-o", "kin_ion_bisp.h5"]),
     # The direct head authenticates the dipole's representation stamp, so
     # the four-component route writes its own (over the scalar one).
     ("dipole_bisp", "psp.get_dipole_mtxels", ["-i", "bisp_os.in"]),
