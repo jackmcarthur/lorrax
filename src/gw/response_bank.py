@@ -1389,6 +1389,38 @@ def photon_response_q_width(wfns,meta,mesh_xy,vertex,*,n_q,face_bytes,retained_b
     return max(1,min(int(n_q),int(max(0,room-quote["fixed_bytes_per_rank"])//(12*face_bytes))))
 
 
+def _check_response_q_panel(wfns,meta,mesh_xy,support,*,width,rows_for_width,
+                            ordered,vertex,face_bytes,selection_bytes=None):
+    """Correct the native parent width from its compiled one-sample floor.
+
+    The argument carry is donated; price it separately. Exact q/negative-q
+    closure has at most two rows per parent, hence four matrix faces per
+    parent for value and derivative. The measured temporary floor is kept
+    fixed instead of treating it as a frequency- or parent-dependent slope.
+    One corrected compile, or a named refusal at the one-parent minimum.
+    """
+    from runtime.aot_memory import check_chunk,compiled_new_bytes
+    from common.gpu_utils import device_room_bytes
+    scratch=_stream_scratch(wfns,meta,mesh_xy,vertex)
+    def build(w):
+        return _stream_executable(wfns,meta,mesh_xy,support,
+            q_ids=rows_for_width(w),n_outputs=2,ordered=ordered,vertex=vertex)
+    whole=build(width)
+    floor=compiled_new_bytes(whole,extra=scratch)
+    ledger=meta.shared_pole_capacity
+    room=min(ledger.room_bytes_per_rank(ledger.live_stages),
+             device_room_bytes()-ledger.reserve_bytes_per_rank)
+    def extra(w,compiled):
+        # The stream and line selection are consecutive phases. Reprice
+        # the selector's exact parent extent after a width correction.
+        carry=2*len(rows_for_width(w))*int(face_bytes)
+        selected=0 if selection_bytes is None else int(selection_bytes(w,carry))
+        value=compiled_new_bytes(compiled,extra=scratch)
+        return carry+scratch+max(0,selected-value)
+    return check_chunk(width,stage="response q panel",build=build,compiled=whole,
+        fixed=floor,per_unit=4*int(face_bytes),room=room,extra=extra)
+
+
 def produce_sample_bank(wfns, meta, config, *, mesh_xy, sym, sample_plan, bank_io,
                         vertex=None, contact=None, direct_head=None, print_fn=print):
     """Stage A: integrate value and derivative together, one frequency at a time.
@@ -1510,6 +1542,40 @@ def produce_sample_bank(wfns, meta, config, *, mesh_xy, sym, sample_plan, bank_i
             mesh_xy=mesh_xy,n=n,photon=vertex is not None)
         support = response_support(wfns, meta, sample_plan, receipt, print_fn=print_fn)
         ledger.live_stages = ambient
+        if vertex is None:
+            def width_rows(w):
+                spans=((q0,min(q0+w,len(qids))) for q0 in range(0,len(qids),w))
+                return max((panel_rows(*span) for span in spans),key=len)
+            def selected_bytes(w,carry):
+                if selection is None:
+                    return 0
+                _,resident,workspace=line_selection_execution(rows,mesh=mesh_xy,
+                    ledger=ledger,nq=w,carry=carry)
+                return resident+workspace
+            with timing.section('bank.memcheck.q_panel'):
+                panel_check=_check_response_q_panel(wfns,meta,mesh_xy,support,
+                    width=q_width,rows_for_width=width_rows,ordered=ordered,
+                    vertex=vertex,face_bytes=face_bytes,selection_bytes=selected_bytes)
+            receipt["q_panel_check"]=dict(width_hint=q_width,width=panel_check.chunk,
+                compiled=panel_check.compiled_bytes,analytic=panel_check.analytic,
+                recompiled=panel_check.recompiled,seconds=panel_check.seconds)
+            if panel_check.chunk!=q_width:
+                q_width=panel_check.chunk
+                q_spans=tuple((q0,min(q0+q_width,len(qids))) for q0 in range(0,len(qids),q_width))
+                selection_nq=q_spans[0][1]-q_spans[0][0]
+                response_rows=width_rows(q_width)
+                row_index={q:i for i,q in enumerate(response_rows)}
+                carry_per_sample=2*len(response_rows)*face_bytes
+                receipt["q_panels"]["width"]=q_width
+                receipt["q_panels"]["spans"]=[list(span) for span in q_spans]
+                if selection is not None:
+                    execution,selection_resident,selection_workspace=line_selection_execution(
+                        rows,mesh=mesh_xy,ledger=ledger,nq=selection_nq,carry=carry_per_sample)
+                    selection=charge_line_selection(meta,mesh_xy=mesh_xy,ordered=ordered,
+                        execution=execution,nq=selection_nq)
+                    receipt["line_selection"].update(execution=execution,
+                        resident_bytes_per_rank=selection_resident,workspace_bytes_per_rank=selection_workspace)
+            del panel_check
         # Photon q panels price one sample first; the existing group planner
         # then prices its chosen shared-node carry with compiled admission.
         workspace, whole = _stream_workspace(wfns, meta, mesh_xy, support, q_ids=response_rows,
