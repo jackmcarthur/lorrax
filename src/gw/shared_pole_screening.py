@@ -359,6 +359,27 @@ def _scalar_model_residence(meta, nq, width, *, mesh_xy, root, identity):
     return model, receipt
 
 
+def _release_bank_file(path):
+    """Unlink a file-tier bank whose constructor has committed; returns its bytes.
+
+    The scalar constructor is the bank's last reader (only a ``write_w``
+    export re-reads it), and at production shape the file is the run's
+    largest: N_q [2 N_dense + N_moments] N_mu^2 16 B, 1.02 TiB at 1062
+    parents, 1796 centroids, 8 dense samples.  A rerun then finds no bank and
+    rebuilds the map; a bank whose constructor did not finish stays for
+    constructor resume.
+    """
+    import os
+    from common.collectives import rank0_transaction
+
+    def unlink():
+        size = os.path.getsize(path)
+        os.unlink(path)
+        return size
+    return rank0_transaction(path, stage="shared_pole.bank.release", write=unlink,
+                             return_value=True)
+
+
 #: The per-map scratch generation ``screen_shared_poles`` creates under an SC
 #: label (bank, Coulomb staging, constant and receipts).
 _MANAGED_SCRATCH = r"sc_[0-9]{4}_shared_pole"
@@ -371,8 +392,8 @@ def retain_iteration_scratch(run_dir, label, *, print_fn=print):
     bank there is the payload of ``shared_pole_bank_payload_bytes`` (about
     0.27 TB on Fe 8^3), so without this the scratch grows linearly in maps.  The caller invokes it
     only after the current map's model has been built, consumed by Sigma and
-    passed the Sigma gates, so a failure keeps the last usable generation, and
-    the current one survives convergence for constructor resume.  Only exact
+    passed the Sigma gates, so a failure keeps the last usable generation.
+    (A scalar file-tier bank is already gone: ``_release_bank_file``.)  Only exact
     managed names are eligible; scanning rather than removing only ``N-1``
     also clears stale later maps of a longer earlier run.  This is
     ``gw.mpa.model.retain_iteration_artifacts``'s rule, through the same
@@ -625,6 +646,13 @@ def screen_shared_poles(wfns, V_q, meta, config, *, mesh_xy, sym,
         # The model is committed; the constructor was the bank's last reader.
         resident.release()
         ledger.live_stages = ()
+    elif not photon and not config.debug.write_w:
+        # The file tier likewise.  (The photon Sigma still reads the bank's
+        # constant from the file, and write_w exports its samples.)
+        released = _release_bank_file(root / "bank.h5")
+        residence = dict(residence, released_bytes=released)
+        print_fn(f"shared-pole bank: scratch file released after the constructor "
+                 f"({released / 2**30:.2f} GiB)")
     receipts["bank_residence"] = residence
     with timing.section("spole.screening_finalize"):
         record("constructor", result)

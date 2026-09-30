@@ -56,7 +56,12 @@ are `P(None,'x','y')` on the square X/Y mesh with `P = Px·Py`.
    budget *and* the constructor route is unchanged with it live; otherwise it
    goes to pinned host memory if it fits half the host budget; otherwise it
    stays a scratch file. `write_w` and a distributed `linalg` always use the
-   file.
+   file. A scalar scratch file is deleted when its constructor has committed
+   the model (kept for `write_w`), so a run holds at most one bank on disk and
+   none after the constructor; a rerun rebuilds that map's bank. Its size is
+   $N_q\,(2N_\text{dense}+N_\text{moments})\,N_\mu^2\cdot 16$ B plus the line
+   panels: 1.02 TiB at 1062 parents, 1796 centroids, 8 dense samples and 4
+   moments.
 4. **Constructor** (§3–§6) → `model.h5`, one parent round at a time. An SC
    map keeps the model on the devices instead (`ResidentSectorModel`, the
    photon sectors' carrier) when the model at its stored column bound and one
