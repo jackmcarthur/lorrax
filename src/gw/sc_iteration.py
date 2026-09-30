@@ -6801,7 +6801,13 @@ def run_sc_driver(
             f"map calls; {verdict.summary()}")
     sigma_result = state_final.outputs.sigma_result
     screening = state_final.outputs.screening
-    requires_iteration_head = (
+    # A four-current (full_shared_pole) map carries its head inside the
+    # accepted map's sector poles (``direct_photon_head``, rebuilt each map
+    # from photon_head_state), never as iteration_head samples or static
+    # head terms, so that model is the accepted final-map head.
+    sector_head = (isinstance(screening.shared_pole, dict)
+                   and screening.shared_pole.get("direct_photon_head") is not None)
+    requires_iteration_head = not sector_head and (
         config.head.correction is HeadCorrection.FULL
         or str(config.sc.head_update) != "off")
     if requires_iteration_head and screening.iteration_head is None:
@@ -6813,7 +6819,7 @@ def run_sc_driver(
             f"sc_head_update={config.sc.head_update!r}; why: final QSGW "
             "artifacts must carry the response from the accepted map.")
     requires_static_head_terms = (
-        bool(config.do_G0)
+        not sector_head and bool(config.do_G0)
         and config.head.correction is not HeadCorrection.OFF)
     if requires_static_head_terms and screening.static_head_terms is None:
         raise RuntimeError(
