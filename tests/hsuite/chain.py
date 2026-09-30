@@ -58,6 +58,7 @@ ATOL = {
     "bse_ev": 1.0e-4,    # BSE, exciton-band and htransform eigenvalues:
                          # P1 vs P4 agree to 1 ueV (the fH basis pivots
                          # break residual ties by index, galerkin.py)
+    "sc_residual_ev": 2.0e-3,  # per-map SC max|dE| read from the report
 }
 
 # h5 members not compared.  line_charge_* are the W bank's selected
@@ -482,6 +483,8 @@ def _tol(label):
         return ATOL["eqp_ev"], False
     if ".h5:" in label:
         return ATOL["h5"], True
+    if label.endswith(":residuals"):
+        return ATOL["sc_residual_ev"], False
     return ATOL["bse_ev"], False
 
 
