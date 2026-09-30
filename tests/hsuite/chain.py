@@ -70,8 +70,10 @@ ATOL = {
     # 0.66 meV (main 8e33b82d3 and GRAMRP alike).  eqp files keep eqp_ev.
     "sc_sigma_ev": 1.0e-3,
 }
-# The SC stages' sigma h5 files, compared at ATOL["sc_sigma_ev"].
-SC_SIGMA_H5 = ("bsc_sigma.h5:", "na_sigma.h5:")
+# The SC stages' sigma h5 files, compared at ATOL["sc_sigma_ev"], and the
+# GN-PPM one: its output window holds the deep occupied bands 1-2 of the
+# H2- fixture, where P1 vs P4 reads 0.98 meV.
+SC_SIGMA_H5 = ("bsc_sigma.h5:", "na_sigma.h5:", "gnppm_sigma.h5:")
 
 # h5 members not compared.  line_charge_* are the W bank's selected
 # direction states: a gauge per direction, and padded to the mesh (P1 6x1,
