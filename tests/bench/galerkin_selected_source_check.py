@@ -15,7 +15,7 @@ from common.meta import Meta
 from common.psi_G_store import build_psi_G_store
 from common.gamma_matrices import dirac_spin_z, sigma_z
 from common.wfn_transforms import get_enk_bandrange
-from gw.qsgw_head import qp_frame_delta_h_dft
+from gw.qsgw_head import qp_frame_delta_h_dft, assemble_delta_head_manifold
 from file_io import WFNReader
 from isdf.galerkin import (GalerkinBasis, iter_galerkin_rchunks,
     project_galerkin_spin_operator, project_lifted_galerkin_dirac_spin)
@@ -47,11 +47,30 @@ def main():
         qp_dev=device_put_process_local(qp,NamedSharding(mesh,P()))
         dft_dev=device_put_process_local(dft,NamedSharding(mesh,P()))
         delta=qp_frame_delta_h_dft(U_dev,qp_dev,dft_dev,mesh=mesh)
-    delta=np.asarray(gather_to_host(delta))
+    delta_dev=delta
+    delta=np.asarray(gather_to_host(delta_dev))
     qp_delta_error=float(np.linalg.norm(delta[:,:5,:5]-expected)/np.linalg.norm(expected))
     assert qp_delta_error<5e-12,qp_delta_error
     assert np.max(np.abs(delta[:,5:]))==0
     assert np.max(np.abs(delta[:,:,5:]))==0
+    # A physical five-band protected block has an eight-band carrier here.
+    # The first three physical tail states must retain their scissor rather
+    # than inherit the null protected padding. Also exercise outer-link
+    # continuation and keep the historical no-logical-extent route intact.
+    tail=np.broadcast_to(np.linspace(.04,.11,8),(len(dft),8)).copy()
+    with mesh:
+        tail_dev=device_put_process_local(tail,NamedSharding(mesh,P()))
+        logical=assemble_delta_head_manifold(delta_dev,tail_dev,nb_storage=8,
+            mesh=mesh,nb_logical=8,nb_links=12,nb_active=5)
+        legacy=assemble_delta_head_manifold(delta_dev,tail_dev,nb_storage=8,
+            mesh=mesh,nb_logical=8,nb_links=12)
+    logical=np.asarray(gather_to_host(logical))
+    legacy=np.asarray(gather_to_host(legacy))
+    tail_expected=np.concatenate((tail[:,5:],np.broadcast_to(tail[:,-1:],(len(dft),4))),axis=1)
+    assert np.max(np.abs(np.diagonal(logical,axis1=-2,axis2=-1)[:,5:]-tail_expected))<5e-14
+    assert np.max(np.abs(logical[:,:5,:5]-expected))<5e-14
+    assert np.max(np.abs(legacy[:,5:8,5:8]))==0
+    assert np.max(np.abs(np.diagonal(legacy,axis1=-2,axis2=-1)[:,8:]-tail[:,-1:]))<5e-14
     for bispinor in (False, True):
         meta = Meta.from_system(w, sym, nval=1, ncond=6, nband=7,
                                 n_rmu=1, bispinor=bispinor)
