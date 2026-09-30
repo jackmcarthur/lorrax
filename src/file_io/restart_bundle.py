@@ -1777,6 +1777,55 @@ def read_photon_gamma(directory, mesh_xy, bases):
             for name,basis in zip(names,bases))
 
 
+def read_bispinor_v_receipt(path):
+    """The generation receipt a bispinor V file carries (JSON str), or None."""
+    from gw.v_q_bispinor import V_QMUNU_RECEIPT_DATASET
+    with h5py.File(path, "r") as f:
+        if V_QMUNU_RECEIPT_DATASET not in f:
+            return None
+        raw = f[V_QMUNU_RECEIPT_DATASET][()]
+    return raw.decode("utf-8") if isinstance(raw, bytes) else str(raw)
+
+
+def require_bispinor_v_pairing(tensors_filename, v_path, running_policy):
+    """Refuse a v_q_bispinor.h5 that is not the one this restart was written with.
+
+    The restart tensor copies the V file's generation receipt when both are
+    written (``write_restart_state_to_h5(bispinor_v_receipt=)``).  A restart
+    reuses both verbatim, so a same-shape V from another run (stale TT
+    tiles), an unstamped pair, or a receipt whose Coulomb policy or TT head
+    flag differs from the running deck is refused by name.
+    """
+    from .tagged_arrays import BISPINOR_V_RECEIPT_DATASET
+    v_receipt = read_bispinor_v_receipt(v_path)
+    with h5py.File(tensors_filename, "r") as f:
+        raw = (np.asarray(f[BISPINOR_V_RECEIPT_DATASET]).tolist()
+               if BISPINOR_V_RECEIPT_DATASET in f else None)
+    t_receipt = (None if raw is None else
+                 (raw[0].decode("utf-8") if isinstance(raw[0], bytes)
+                  else str(raw[0])))
+    fix = ("  Rerun with restart = false to regenerate both, or restore the "
+           "v_q_bispinor.h5 written with this restart tensor.")
+    if v_receipt is None or t_receipt is None:
+        raise ValueError(
+            f"GATE bispinor_v_pairing: {v_path if v_receipt is None else tensors_filename} "
+            "carries no bispinor-V generation receipt, so this restart cannot "
+            "show that the four-current V tiles belong to its tensors." + fix)
+    if v_receipt != t_receipt:
+        raise ValueError(
+            f"GATE bispinor_v_pairing: {v_path} (receipt {v_receipt}) was not "
+            f"written with {tensors_filename} (receipt {t_receipt}); a stale "
+            "same-shape V would pair another run's tiles with these tensors." + fix)
+    stored = json.loads(v_receipt)
+    diffs = [f"{key}: file={stored.get(key)!r} run={value!r}"
+             for key, value in sorted(running_policy.items())
+             if stored.get(key) != value]
+    if diffs:
+        raise ValueError(
+            f"GATE bispinor_v_pairing: {v_path} was built under another "
+            f"Coulomb policy than this deck: {'; '.join(diffs)}." + fix)
+
+
 def read_eqp_assembly_receipt(filepath):
 	"""Read and validate a v5 charge-only or v6 component-aware receipt.
 

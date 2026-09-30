@@ -2285,6 +2285,24 @@ def _bispinor_charge_tile(zeta_g, *, cfg, meta, wfn, sym, centroid_indices,
         zeta_g.close()
 
 
+def _bispinor_tt_head(cfg):
+    """Whether the four-current V's TT tiles carry the Γ mini-BZ head."""
+    return (uses_bare_tt_gamma_head(cfg)
+            or bool(cfg.head.bispinor_tt_head_correction)
+            or uses_direct_bispinor_shared_pole_head(cfg))
+
+
+def _bispinor_v_policy(cfg, meta):
+    """The deck policy a bispinor V file is stamped with and checked against."""
+    from file_io import coulomb_policy_from_config
+    from file_io.tagged_arrays import format_coulomb_policy
+    from .v_q_bispinor import V_QMUNU_HEAD_RULE
+    return {"coulomb_policy": format_coulomb_policy(
+                coulomb_policy_from_config(cfg, meta)),
+            "tt_head_correction": bool(_bispinor_tt_head(cfg)),
+            "head_rule": V_QMUNU_HEAD_RULE}
+
+
 def _bispinor_current_tiles(zetas_T, *, cfg, meta_T, wfn, sym, centroid_T_idx,
                             mesh_xy, print_fn=print):
     """The four-current V_q's six TT tiles from the current fit's live ζ."""
@@ -2304,9 +2322,7 @@ def _bispinor_current_tiles(zetas_T, *, cfg, meta_T, wfn, sym, centroid_T_idx,
             sym=sym,
             centroid_T_idx=np.asarray(jax.device_get(centroid_T_idx),
                                       dtype=np.int32),
-            tt_head_correction=(uses_bare_tt_gamma_head(cfg)
-                                or bool(cfg.head.bispinor_tt_head_correction)
-                                or uses_direct_bispinor_shared_pole_head(cfg)),
+            tt_head_correction=_bispinor_tt_head(cfg),
             current_basis_rows=meta_T.current_basis_rows,
             mc_average_vcoul_body=cfg.head.mc_average_vcoul_body,
             print_fn=print_fn)
@@ -2415,9 +2431,8 @@ def _compute_photon_vq(
                     centroid_C_idx=_cent_C_idx_for_orchestrator,
                     centroid_T_idx=_cent_T_idx_for_orchestrator,
                     use_ibz=True,
-                    tt_head_correction=(uses_bare_tt_gamma_head(cfg)
-                        or bool(cfg.head.bispinor_tt_head_correction)
-                        or uses_direct_bispinor_shared_pole_head(cfg)),
+                    tt_head_correction=_bispinor_tt_head(cfg),
+                    policy=_bispinor_v_policy(cfg, meta),
                     bispinor_gw_mode=None,
                     charge_representation=None,
                     spatial_current_representation=None,
@@ -2807,6 +2822,7 @@ def _write_fresh_restart(
     	from file_io import coulomb_policy_from_config
     	from file_io.qp_wfn import (
     		qp_state_source_provenance_from_binding)
+    	from file_io.restart_bundle import read_bispinor_v_receipt
     	write_restart_state_to_h5(
     		tensors_filename,
     		n_rmu_logical=int(meta.n_rmu),
@@ -2821,6 +2837,9 @@ def _write_fresh_restart(
     			wfn_fingerprint_binding=(
     				basis_wfn_fingerprint_binding))),
     		charge_zeta_identity=charge_zeta_identity_receipt,
+    		bispinor_v_receipt=(None if wfns_transverse is None else
+    			read_bispinor_v_receipt(os.path.join(
+    				os.path.dirname(tensors_filename), "v_q_bispinor.h5"))),
     		band_slices=band_slices,
     		zeta_fit_windows=zeta_fit_band_ranges(
     			band_slices,
@@ -3228,6 +3247,11 @@ def _prepare_restart_isdf(
             WavefunctionBasisReceipt, _basis_band_interval, _restart_wfn_provenance_complete,
             _stamped, _to_run_order, band_slices, basis_T, basis_wfn_fingerprint_binding, cfg,
             mesh_xy, meta, print0, rs, sym, tensors_filename, transverse_basis_receipt, wfn)
+    _v_path = os.path.join(tmp_dir, "v_q_bispinor.h5")
+    if cfg.bispinor and os.path.exists(_v_path):
+        from file_io.restart_bundle import require_bispinor_v_pairing
+        require_bispinor_v_pairing(tensors_filename, _v_path,
+                                   _bispinor_v_policy(cfg, meta))
     (photon_g0_vectors) = _restart_gamma_vectors(
         _to_run_order, basis_T, cfg, mesh_xy, meta, photon_g0_vectors, tmp_dir)
     return (V_qmunu, wfns, wfns_transverse, sigma_parent_carrier, green_parent_carrier, basis_T, head_channel, photon_g0_vectors, basis_wfn_fingerprint_binding, charge_basis_receipt, transverse_basis_receipt, charge_zeta_identity_receipt)
