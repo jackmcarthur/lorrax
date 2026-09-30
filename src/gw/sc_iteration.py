@@ -4200,6 +4200,10 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
             _record_sc(inputs, f"    SC semicore = dft: {int(semicore_pin.sum())} coarse "
                                "(k,label) hold their DFT block; H_ps reads Sigma_ps at "
                                "E_DFT_s (mixing kept)")
+    if os.environ.get("LORRAX_EXP_LOWDIN"):
+        H_qp_dft_full = _exp_lowdin_fold(
+            H_qp_dft_full, inputs, state, ks, partition, scissor_classes,
+            sigma0_kn, energies_loop)
 
     # ── THE UN-EXTRAPOLATED TWIN ────────────────────────────────────────
     # Present only when ``use_band_extrapolation`` drove this stage's Σ.
@@ -4337,6 +4341,63 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
     _record_sc_map_stages(inputs, state.iteration, _map_started,
                           _map_stages_before)
     return state_out
+
+
+def _exp_lowdin_fold(H, inputs, state, ks, partition, scissor_classes,
+                     sigma0_kn, energies_loop):
+    """EXPERIMENT LOWDIN (not for landing).  Run at number_bands_protected = N;
+    emulate b3 = LORRAX_EXP_LOWDIN: the output H is blockdiag(H_pp + fold,
+    diag(E_t)), E_t the main tail scissor fitted on identities < b3 (same
+    _fit_sum_band_tail rows), fold = sum_t 1/2 H_pt H_tp' [1/(e_p - E_t) +
+    1/(e_p' - E_t)] in the eigenbasis of H_pp.  LORRAX_EXP_LOWDIN_OFF=1 keeps
+    the block-diagonal H without the fold (the emulated-main control)."""
+    from common.collectives import gather_to_host
+
+    from .scissor import k_star_weights
+    b = int(os.environ["LORRAX_EXP_LOWDIN"])
+    fold_on = os.environ.get("LORRAX_EXP_LOWDIN_OFF", "0") != "1"
+    Hn = np.array(gather_to_host(H), dtype=np.complex128)
+    nk, nb, _ = Hn.shape
+    e_dft = inputs.e_dft_active_kn_ry
+    valence = inputs.valence_mask_active_kn
+    if not ks.is_identity:
+        e_dft, valence = ks.select(e_dft), ks.select(valence)
+    e_dft_ev = np.asarray(e_dft, dtype=np.float64) * RYD_TO_EV
+    fitp = _partition_on_loop(partition, inputs)
+    fit_mask = np.array(np.broadcast_to(np.asarray(
+        fitp.protected_mask | fitp.in_range_mask, dtype=bool), e_dft_ev.shape))
+    fit_mask[:, b:] = False
+    valence_kn = np.asarray(valence, dtype=bool)
+    if scissor_classes is not None:
+        valence_kn, crossing_kn = scissor_classes.masks(e_dft_ev.shape)
+        fit_mask = fit_mask & ~crossing_kn
+    fit, _nx, note = _fit_sum_band_tail(dict(
+        E_dft_kn_ev=e_dft_ev, E_qp_kn_ev=np.asarray(energies_loop, dtype=np.float64),
+        valence_mask_kn=valence_kn, k_weights=k_star_weights(ks)),
+        fit_mask, sigma0_kn, state.tail_z_kn)
+    e_t_ev = e_dft_ev[:, b:nb].copy()
+    if fit is not None and int(state.iteration) >= 1:
+        e_t_ev = fit.alpha_c * e_t_ev + fit.beta_c_ev
+    e_t = e_t_ev / RYD_TO_EV
+    Hpp = 0.5 * (Hn[:, :b, :b] + np.conj(np.swapaxes(Hn[:, :b, :b], 1, 2)))
+    Hpt = Hn[:, :b, b:]
+    out = np.zeros_like(Hn)
+    dmin, fmax = np.inf, 0.0
+    for k in range(nk):
+        e, V = np.linalg.eigh(Hpp[k])
+        C = V.conj().T @ Hpt[k]
+        D = 1.0 / (e[:, None] - e_t[k][None, :])
+        dmin = min(dmin, float(np.abs(e[:, None] - e_t[k][None, :]).min()))
+        F = 0.5 * ((C * D) @ C.conj().T + C @ (C * D).conj().T)
+        fmax = max(fmax, float(np.abs(np.diag(F).real).max()))
+        out[k, :b, :b] = Hpp[k] + (V @ F @ V.conj().T if fold_on else 0.0)
+        out[k, b:, b:] = np.diag(e_t[k]).astype(np.complex128)
+    _record_sc(inputs, f"    LOWDIN EXPERIMENT b3={b} fold={'on' if fold_on else 'off'} map "
+               f"{int(state.iteration)}: tail alpha={getattr(fit, 'alpha_c', 1.0):+.4f} "
+               f"beta={getattr(fit, 'beta_c_ev', 0.0):+.4f} eV {note}; min|e_p-E_t| "
+               f"{dmin * RYD_TO_EV:.4f} eV; max|fold_aa| {fmax * RYD_TO_EV * 1e3:.2f} meV; "
+               f"max|H_pt| {np.abs(Hpt).max() * RYD_TO_EV * 1e3:.2f} meV")
+    return device_put_process_local(out.astype(np.asarray(Hn).dtype), H.sharding)
 
 
 # ---------------------------------------------------------------------------

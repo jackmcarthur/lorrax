@@ -8,6 +8,7 @@ tables instead of copying the thresholds into bank/constructor/store/Sigma code.
 from __future__ import annotations
 
 import copy
+import os
 import hashlib
 import json
 import math
@@ -63,7 +64,7 @@ shared_real_pole_v1_r3b = {
 # and version. Composite checks retain their individual dimensional thresholds.
 _GATE_ROWS = {
     "normalized_gram_keep": ("retain gamma/gamma_max strictly above cut", 1.0e-8),
-    "normalized_gram_validity": ("gamma_min/gamma_max >= threshold", -1.0e-7),
+    "normalized_gram_validity": ("gamma_min/gamma_max >= threshold", float(os.environ.get("B3DEP_GRAM_VALIDITY", "-1.0e-7"))),  # EXPERIMENT LOWDIN: TAILLIN gate floor
     "zero_ritz_policy": ("drop lambda <= cutoff only within factor-weight budget",
                          {"lambda_cutoff_ry2": 1.0e-6, "max_dropped_weight_fraction": 1.0e-6}),
     # Legacy C denotes b: preserve this hashed predicate for stored identities.
