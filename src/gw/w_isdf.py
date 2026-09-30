@@ -171,11 +171,51 @@ def _chi_door_serves(mesh_xy, kgrid, ns) -> bool:
 _TEST_PHOTON_PASSES = None
 
 
-def photon_row_passes(n_pass, local_rows):
-    """``((x0, xr), ...)`` covering ``local_rows`` in ``n_pass`` near-equal row passes."""
-    n_pass = max(1, min(int(n_pass), int(local_rows)))
-    width = -(-int(local_rows) // n_pass)
-    return tuple((x0, min(width, int(local_rows) - x0)) for x0 in range(0, int(local_rows), width))
+def photon_orbit_cuts(lsrc, side, ns):
+    """The local centroid rows a row pass may start at: no row on one side reads the other.
+
+    ``lsrc`` ``(nk, side * rows * ns)`` are a plan's X-shard-local merged sources
+    (``symmetry_maps.unfold_load_tables``).  A cut ``b`` is admissible when, on
+    every k and every X shard, rows below ``b`` read only rows below ``b`` and
+    rows at or above it only rows at or above it: a union of whole centroid
+    orbits.  Returns the sorted admissible cuts in ``(0, rows)``.
+    """
+    src = np.asarray(lsrc).reshape(np.asarray(lsrc).shape[0], int(side), -1, int(ns))
+    rows = src.shape[2]
+    row = np.where(src >= 0, src // int(ns), -1)
+    hi = row.max(axis=(0, 1, 3))                                  # per local row
+    lo = np.where(row >= 0, row, rows).min(axis=(0, 1, 3))
+    below = np.maximum.accumulate(hi)                             # max source of rows < b+1
+    above = np.minimum.accumulate(lo[::-1])[::-1]                 # min source of rows >= b
+    return tuple(int(b) for b in range(1, rows) if below[b - 1] < b and above[b] >= b)
+
+
+def photon_row_passes(n_pass, local_rows, cuts):
+    """``((x0, xr), ...)``: ``n_pass`` near-equal row passes, each boundary the nearest orbit cut.
+
+    ``None`` when more than one pass is asked and no cut exists.
+    """
+    n_pass, local_rows = int(n_pass), int(local_rows)
+    if n_pass <= 1:
+        return ((0, local_rows),)
+    if not cuts:
+        return None
+    bounds = sorted({min(cuts, key=lambda c: abs(c - i * local_rows / n_pass))
+                     for i in range(1, n_pass)})
+    edges = [0, *bounds, local_rows]
+    return tuple((a, b - a) for a, b in zip(edges[:-1], edges[1:]))
+
+
+def _pass_tables(tables, x0, xr, side, ns):
+    """A plan's load tables cut to the local centroid rows ``[x0, x0 + xr)`` of every X shard."""
+    lsrc = np.asarray(tables.lsrc)
+    nk, width = lsrc.shape[0], lsrc.shape[1] // int(side)
+    cols = np.concatenate([s * width + np.arange(x0 * ns, (x0 + xr) * ns) for s in range(int(side))])
+    cut = lsrc[:, cols]
+    moved = np.where(cut >= 0, cut - x0 * ns, -1)
+    if np.any((cut >= 0) & ((moved < 0) | (moved >= xr * ns))):
+        raise ValueError("_pass_tables: a row pass reads outside its own rows (not an orbit cut)")
+    return tables._replace(lsrc=moved.astype(np.int32), mph=np.asarray(tables.mph)[:, cols])
 
 
 def photon_response_passes(ledger, mesh_xy, families, *, n_parent, nk, n_out, q_count,
@@ -204,8 +244,9 @@ def photon_response_passes(ledger, mesh_xy, families, *, n_parent, nk, n_out, q_
         parents = 4 * 16 * int(n_parent) * (2 * cl) * (2 * cr) // P
         planes = 16 * (n_ch + 1) * int(nk) * cl * cr // P
         local_rows = cl // int(families.layout.mesh_side)
+        # Parents, their builds and the planes all divide over the row passes.
         count = next((p for p in range(1, local_rows + 1)
-                      if 3 * parents // 2 + -(-planes // p) <= room), local_rows)
+                      if -(-(3 * parents // 2 + planes) // p) <= room), local_rows)
         passes.append(count)
     return tuple(passes)
 
@@ -224,8 +265,10 @@ def _photon_chi_doors(mesh_xy, kgrid, half_plans, parity, passes=None):
     ``(perm, phase)`` of every channel pair of the family pair
     (``common.gamma_matrices.gamma_vertex_trace``'s trace).  ``passes`` (one
     count per family pair, 1 by default) splits each pair's local centroid rows
-    into row passes (:func:`photon_row_passes`).  Returns
-    ``{(pair, (h, g), (x0, xr)): (door, keys)}``, ``(x0, xr) = None`` for one pass.
+    into row passes at orbit cuts (:func:`photon_row_passes`): a pass's door
+    reads only its own rows, so its parent Greens are built on those rows only.
+    Returns ``{(pair, (h, g), (x0, xr)): (door, keys)}``, ``(x0, xr) = None``
+    for one pass; refuses a pass count that no orbit cut admits.
     """
     from common.gamma_matrices import gamma_perm_phase_host
     from ffi.fft import make_kconv_chi_vertex
@@ -237,9 +280,18 @@ def _photon_chi_doors(mesh_xy, kgrid, half_plans, parity, passes=None):
         L, R = pair
         n_pass = 1 if passes is None else int(passes[i_pair])
         local_rows = int(half_plans[L].n_centroid_packed) // side
-        pass_rows = (None,) if n_pass == 1 else photon_row_passes(n_pass, local_rows)
         base = half_plans[L].unfold_load_tables(
             right_plan=None if half_plans[R] is half_plans[L] else half_plans[R])
+        pass_rows = (None,)
+        if n_pass > 1:
+            pass_rows = photon_row_passes(n_pass, local_rows,
+                                          photon_orbit_cuts(base.lsrc, side, 2))
+            if pass_rows is None:
+                raise ValueError(
+                    f"GATE response_photon_passes: got {n_pass} row passes for family pair "
+                    f"{pair}; want an orbit cut of the {local_rows} local centroid rows; why: "
+                    "one centroid orbit spans the rank's rows, and one pass does not fit "
+                    "memory_per_device_gb")
         flip = tuple(int(f == 1) for f in pair)
         keys = tuple((A, B) for A in family_channels(L) for B in family_channels(R))
         for h in (0, 1):
@@ -257,9 +309,9 @@ def _photon_chi_doors(mesh_xy, kgrid, half_plans, parity, passes=None):
                 left = tuple(local(A, 2 * h, hu) for A in family_channels(L))
                 right = tuple(local(B, 2 * g, gu) for B in family_channels(R))
                 for rows in pass_rows:
-                    door = make_kconv_chi_vertex(mesh_xy, kgrid, tables, left_vertices=left,
-                                                 right_vertices=right, sign_c=sign_c, rows=rows,
-                                                 norm="ortho")
+                    cut = tables if rows is None else _pass_tables(tables, *rows, side, 2)
+                    door = make_kconv_chi_vertex(mesh_xy, kgrid, cut, left_vertices=left,
+                                                 right_vertices=right, sign_c=sign_c, norm="ortho")
                     doors[(pair, (h, g), rows)] = (door, keys)
     return doors
 
@@ -1107,12 +1159,21 @@ def _get_chi_fractional_contour_kernel_face(
             ``G' = ifftn_k`` of the unfolded Greens, so its plane is
             ``v(R) = conj(A(-R))`` and ``FT[A](q) = conj(FT[v](q))``.
             """
+            from common.shard_map import shard_map as _shard_map
             from .photon_layout import FAMILY_PAIRS
             layout_p = photon.packed_layout
 
-            def parent(weight, t, ref, pair, halves, current):
+            def rows_of(face, x0, xr):
+                return _shard_map(lambda v: jax.lax.slice_in_dim(v, x0, x0 + xr, axis=2),
+                                  mesh=mesh_xy, in_specs=(PSI_MUN_SPEC,), out_specs=PSI_MUN_SPEC,
+                                  check_vma=False)(face)
+
+            def parent(weight, t, ref, pair, halves, current, x_rows=None):
                 L, R = pair
                 left = jax.lax.slice_in_dim(psi_mun[L], 2 * halves[0], 2 * halves[0] + 2, axis=1)
+                if x_rows is not None:
+                    # The pass's own local centroid rows: its parents cover only them.
+                    left = rows_of(left, *x_rows)
                 right = jax.lax.slice_in_dim(psi_nmu[R], 2 * halves[1], 2 * halves[1] + 2, axis=2)
                 weight, t = oriented(weight, t)
                 return build_G_tau(left, right, enk_full, t, e_ref=ref, band_weight=weight,
@@ -1140,9 +1201,9 @@ def _get_chi_fractional_contour_kernel_face(
                         # for the previous quadrant's door.
                         acc, lower_w, upper_w = jax.lax.optimization_barrier(
                             (acc, lower_w, upper_w))
-                        lower = parent(lower_w, lower_time, lower_ref, pair, (h, g), False)
+                        lower = parent(lower_w, lower_time, lower_ref, pair, (h, g), False, x_rows)
                         upper = parent(upper_w, upper_time, upper_ref, pair,
-                                       (h ^ flip[0], g ^ flip[1]), True)
+                                       (h ^ flip[0], g ^ flip[1]), True, x_rows)
                         partners = (() if lower.transpose is None and upper.transpose is None
                                     else (lower.partner(), upper.partner()))
                         acc = doors[(pair, (h, g), x_rows)][0](acc, lower.G, upper.G, *partners)
