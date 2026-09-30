@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import os
+import resource
+import sys
 import threading
 import time
 from collections import OrderedDict
@@ -170,13 +172,41 @@ def _device_high_water(section: "TimingSection") -> int | None:
 
 
 def instrument_cost() -> tuple[int, float]:
-	"""(boundary reads, seconds) the per-section device peak has cost this process."""
+	"""(boundary reads, seconds) the per-section device and host peaks have cost this process."""
 	return int(_MEM_COST[0]), float(_MEM_COST[1])
+
+
+# ---------------------------------------------------------------------------
+# HOST PEAK PER SECTION.  ``ru_maxrss`` is the process's resident high-water
+# mark: it never falls and cannot be reset.  It is read at the same boundaries
+# as the device pool; a rise over an interval belongs to the section on top of
+# the stack.  A node keeps the mark at its last exit (``host``) and the sum of
+# the rises in its own intervals (``host_rise``), so the stage that set a new
+# host peak is named on every rank.
+# ---------------------------------------------------------------------------
+_HOST_MARK = [-1]             # ru_maxrss at the previous boundary, bytes
+_RSS_UNIT = 1 if sys.platform == "darwin" else 1024       # ru_maxrss: bytes on macOS, kB on Linux
+
+
+def _host_high_water() -> tuple[int, int] | None:
+	"""(ru_maxrss in bytes, rise since the previous boundary); main thread only."""
+	if threading.current_thread() is not threading.main_thread():
+		return None
+	t0 = time.perf_counter()
+	try:
+		mark = int(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss) * _RSS_UNIT
+	except Exception:          # noqa: BLE001 — never take down the run
+		return None
+	rise = mark - _HOST_MARK[0] if _HOST_MARK[0] >= 0 else 0
+	_HOST_MARK[0] = mark
+	_MEM_COST[1] += time.perf_counter() - t0
+	return mark, max(rise, 0)
 
 
 class TimingNode:
 	__slots__ = ("name", "count", "inclusive", "exclusive", "children",
-	             "peak", "peak_self", "peak_ranks", "peak_self_ranks")
+	             "peak", "peak_self", "peak_ranks", "peak_self_ranks",
+	             "host", "host_rise", "host_ranks", "host_rise_ranks")
 
 	def __init__(self, name: str):
 		self.name = name
@@ -191,6 +221,13 @@ class TimingNode:
 		self.peak_self = -1
 		self.peak_ranks = None
 		self.peak_self_ranks = None
+		# Host resident memory in bytes (see HOST PEAK PER SECTION): the process
+		# high-water mark at the section's last exit (-1: never measured) and the
+		# rise its own intervals caused, summed over calls.
+		self.host = -1
+		self.host_rise = 0
+		self.host_ranks = None
+		self.host_rise_ranks = None
 
 	def child(self, name: str) -> "TimingNode":
 		node = self.children.get(name)
@@ -207,7 +244,8 @@ class TimingNode:
 
 class TimingSection:
 	__slots__ = ("collector", "node", "stack", "start", "child_elapsed",
-	             "_watchers", "announce", "label", "mem_own", "mem_self")
+	             "_watchers", "announce", "label", "mem_own", "mem_self",
+	             "host_rise")
 
 	def __init__(self, collector: "TimingCollector", node: TimingNode,
 	             stack: list["TimingSection"], *, announce: bool = False,
@@ -226,6 +264,7 @@ class TimingSection:
 		self.label = label
 		self.mem_own = -1
 		self.mem_self = -1
+		self.host_rise = 0
 
 	def _display_name(self) -> str:
 		return self.label if self.label else self.node.name
@@ -360,6 +399,10 @@ class TimingCollector:
 					parent.mem_own = max(parent.mem_own, high)
 					parent.mem_self = max(parent.mem_self, high)
 				section.mem_own = section.mem_self = -1
+				host = _host_high_water()
+				if host is not None and len(section.stack) > 1:
+					section.stack[-2].host_rise += host[1]
+				section.host_rise = 0
 				section.start = time.perf_counter()
 				section.child_elapsed = 0.0
 				section._watchers = []
@@ -396,6 +439,10 @@ class TimingCollector:
 				node = section.node
 				node.peak = max(node.peak, section.mem_own)
 				node.peak_self = max(node.peak_self, section.mem_self)
+			host = _host_high_water()
+			if host is not None:
+				section.node.host = max(section.node.host, host[0])
+				section.node.host_rise += section.host_rise + host[1]
 			section.stack.pop()
 			if section.stack:
 				section.stack[-1].child_elapsed += inclusive
@@ -557,11 +604,11 @@ class TimingCollector:
 		return tuple(section.node.name for section in self._stack())
 
 	def gather_peaks(self) -> None:
-		"""Share every section's device peaks across processes (every process enters).
+		"""Share every section's device and host peaks across processes (every process enters).
 
 		One all-gather of the section count and one of the (path hash, peak,
-		self peak) rows, at the end of a run.  Each node then holds every
-		rank's values (NaN where a rank never entered it).
+		self peak, host mark, host rise) rows, at the end of a run.  Each node
+		then holds every rank's values (NaN where a rank never entered it).
 		"""
 		import hashlib
 		import numpy as np
@@ -579,21 +626,24 @@ class TimingCollector:
 				visit(child, ())
 			key = lambda path: int.from_bytes(hashlib.blake2b(
 				"\x1f".join(path).encode(), digest_size=7).digest(), "little")
-			local = np.array([(key(p), n.peak, n.peak_self) for p, n in nodes],
-			                 dtype=np.int64).reshape(-1, 3)
+			local = np.array([(key(p), n.peak, n.peak_self, n.host,
+			                   n.host_rise if n.host >= 0 else -1) for p, n in nodes],
+			                 dtype=np.int64).reshape(-1, 5)
 		counts = np.asarray(all_gather_processes(
 			np.asarray(len(local), dtype=np.int64))).reshape(-1)
-		padded = np.full((max(1, int(counts.max(initial=0))), 3), -1, dtype=np.int64)
+		padded = np.full((max(1, int(counts.max(initial=0))), 5), -1, dtype=np.int64)
 		padded[:len(local)] = local
 		table = np.asarray(all_gather_processes(padded))
-		per_rank = [{int(k): (a, b) for k, a, b in table[r, :int(counts[r])]}
+		per_rank = [{int(row[0]): row[1:] for row in table[r, :int(counts[r])]}
 		            for r in range(len(counts))]
 		nan = lambda v: float(v) if v >= 0 else float("nan")
 		with self._lock:
 			for path, node in nodes:
-				hit = [rank.get(key(path), (-1, -1)) for rank in per_rank]
-				node.peak_ranks = [nan(a) for a, _ in hit]
-				node.peak_self_ranks = [nan(b) for _, b in hit]
+				hit = [rank.get(key(path), (-1, -1, -1, -1)) for rank in per_rank]
+				node.peak_ranks = [nan(row[0]) for row in hit]
+				node.peak_self_ranks = [nan(row[1]) for row in hit]
+				node.host_ranks = [nan(row[2]) for row in hit]
+				node.host_rise_ranks = [nan(row[3]) for row in hit]
 
 	def format(self, **kwargs) -> list[str]:
 		_, rows = self._rows(kwargs.get("min_percent"), kwargs.get("max_depth"))
@@ -622,6 +672,10 @@ class TimingCollector:
 				"peak_self": node.peak_self if node.peak_self >= 0 else None,
 				"peak_ranks": node.peak_ranks,
 				"peak_self_ranks": node.peak_self_ranks,
+				"host": node.host if node.host >= 0 else None,
+				"host_rise": node.host_rise if node.host >= 0 else None,
+				"host_ranks": node.host_ranks,
+				"host_rise_ranks": node.host_rise_ranks,
 			})
 			for child in node.children.values():
 				visit(child, path)

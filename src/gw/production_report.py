@@ -878,22 +878,28 @@ class GWProductionReport:
         self._stage_memory(rows, stages, width=width, wall=wall)
 
     def _stage_memory(self, rows, stages, *, width, wall) -> None:
-        """The device peak of every major stage against its planner's price.
+        """The device peak of every major stage against its planner's price, and its host peak.
 
         A row's peak is the pool high-water mark over the timing nodes it owns
         (``common.timing``; max and min over ranks).  A planner's price
         (``common.gpu_utils.record_stage_price``) is judged against the own peak
         of the section it names: an enclosing one, else the one sharing the
         longest path with the call, else the section open at the call.
+
+        The host columns are the process resident high-water mark (``ru_maxrss``,
+        which never falls) at the row's last exit and the rise the row's own
+        intervals caused, each the max over ranks.  No planner prices the host.
         """
         from common import timing
         from common.gpu_utils import stage_prices
         from runtime.xla_memory import pool_high_water_source
         paths = [tuple(r.get("path", (r["name"],))) for r in rows]
         selfs = [_rank_peaks(r, "peak_self") for r in rows]
-        if not any(np.any(np.isfinite(v)) for v in selfs):
+        hosts = [_rank_peaks(r, "host") for r in rows]
+        rises = [_rank_peaks(r, "host_rise") for r in rows]
+        if not any(np.any(np.isfinite(v)) for v in selfs + hosts):
             return
-        n_ranks = max(len(v) for v in selfs)
+        n_ranks = max(len(v) for v in selfs + hosts)
         pad = lambda v: v if len(v) == n_ranks else np.full(n_ranks, np.nan)
 
         def row_peak(band):
@@ -906,6 +912,16 @@ class GWProductionReport:
             peak = np.asarray([np.nanmax(col) if np.any(np.isfinite(col)) else np.nan
                                for col in stack.T])
             return peak, owned[int(np.nanargmax(np.nanmax(stack, axis=1)))][0]
+
+        def row_host(band):
+            """Max over ranks of the row's host mark and of the rise it caused (GB)."""
+            mine = [i for i, p in enumerate(paths)
+                    if band.owns(p) and np.any(np.isfinite(hosts[i]))]
+            if not mine:
+                return f"{'–':>7}  {'–':>6}"
+            mark = np.nanmax([np.nanmax(hosts[i]) for i in mine])
+            rise = np.nanmax(np.nansum([pad(rises[i]) for i in mine], axis=0))
+            return f"{mark / 1e9:7.2f}  {rise / 1e9:+6.2f}"
 
         priced = {}      # (stage, section path) -> the largest price, and the peak
         for price in stage_prices():
@@ -923,19 +939,27 @@ class GWProductionReport:
             if key not in priced or price["bytes"] > priced[key][0]["bytes"]:
                 priced[key] = (price, paths[node], _rank_peaks(rows[node], "peak"))
         priced = list(priced.values())
-        self.heading("Major-stage device memory")
+        self.heading("Major-stage device and host memory")
         from common import gpu_utils
         budget = gpu_utils._RUN_DEVICE_BUDGET_GB
         run_peak = max((np.nanmax(v) for v in selfs if np.any(np.isfinite(v))), default=0.0)
         self.emit(f"  per rank, pool high-water per stage; max / min over {n_ranks} "
                   f"rank(s); γ = peak / planner price")
+        host_run = [pad(v) for v in hosts if np.any(np.isfinite(v))]
+        if host_run:
+            host_run = np.nanmax(np.asarray(host_run), axis=0)
+            self.emit(f"  host = resident high-water (ru_maxrss) per rank at the stage's last "
+                      f"exit, max over ranks; rise = what the stage added to it; unpriced")
+            self.emit(f"  host run peak {_gb_pair(host_run, 0)} GB (max / min over ranks)")
         if budget:
             self.emit(f"  budget memory_per_device_gb = {budget:.2f} GB; run peak "
                       f"{run_peak / 1e9:.2f} GB ({'within' if run_peak <= budget * 1e9 else 'OVER'})")
-        self.emit(f"  {'stage':<{width}}  peak GB max / min   price GB           γ  set by")
+        self.emit(f"  {'stage':<{width}}  peak GB max / min   price GB           γ  "
+                  f"host GB    rise  set by")
         for name, band in stages:
             peak, setter = row_peak(band)
-            if peak is None:
+            host = row_host(band)
+            if peak is None and "–" in host:
                 continue
             mine = [pr for pr, node, _ in priced if band.owns(node)]
             if mine:
@@ -944,7 +968,7 @@ class GWProductionReport:
                 tail = f"{price / 1e9:9.2f}  {gamma}"
             else:
                 tail = f"{'–':>9}  no planner"
-            self.emit(f"  {name:<{width}}  {_gb_pair(peak):>17}  {tail}  "
+            self.emit(f"  {name:<{width}}  {_gb_pair(peak):>17}  {tail}  {host}  "
                       f"{' > '.join(setter[-2:])}")
         if priced:
             self.emit("  planner prices, each against the own peak of the section it names:")
