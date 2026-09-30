@@ -1091,14 +1091,20 @@ def _sigma_diagnostic_fields(
     """Produce the existing host diagnostic diagonals and head-sector split."""
     from gw.qsgw_utils import static_sigma_diag_to_host
     if sigma_c_omega is not None:
+        # The (n_omega, nk, nb) diagonal is read only by the writers, which
+        # run on the reporting rank: the other ranks keep no host copy.
         sigma_c_omega_diag_ev = extract_sigma_diag_logical(
             sigma_c_omega, mesh_xy,
-            band_axis=sigma_result.sigma_band_axis) * RYD_TO_EV
+            band_axis=sigma_result.sigma_band_axis,
+            host=jax.process_index() == 0)
+        if sigma_c_omega_diag_ev is not None:
+            sigma_c_omega_diag_ev = sigma_c_omega_diag_ev * RYD_TO_EV
         if not config.no_degen_averaging:
-            sigma_c_omega_diag_ev = average_within_degenerate_sets(
-                sigma_c_omega_diag_ev,
-                energies_kn_ry=np.asarray(enk_dft, dtype=np.float64),
-                tol_ry=float(config.degen_avg_tol_ry))
+            if sigma_c_omega_diag_ev is not None:
+                sigma_c_omega_diag_ev = average_within_degenerate_sets(
+                    sigma_c_omega_diag_ev,
+                    energies_kn_ry=np.asarray(enk_dft, dtype=np.float64),
+                    tol_ry=float(config.degen_avg_tol_ry))
             if sigma_c_odd_at_dft_ev is not None:
                 sigma_c_odd_at_dft_ev = average_within_degenerate_sets(
                     np.asarray(sigma_c_odd_at_dft_ev),

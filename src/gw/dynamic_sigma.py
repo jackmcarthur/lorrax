@@ -59,7 +59,8 @@ def extract_sigma_diag_logical(
     mesh_xy,
     *,
     band_axis=None,
-) -> np.ndarray:
+    host: bool = True,
+) -> np.ndarray | None:
     """Replicate the Sigma_c(omega) diagonal and restore its logical bands.
 
     Parameters
@@ -72,14 +73,22 @@ def extract_sigma_diag_logical(
     band_axis : runtime.padding.PaddedAxis or None
         Logical/carrier receipt published by the Sigma producer.
 
+    host
+        False on a rank that will not read the diagonal (only the reporting
+        rank writes it): the rank enters the collective, as every rank must,
+        and makes no host copy.
+
     Returns
     -------
-    np.ndarray
-        Replicated diagonal with shape (n_omega, nk, nb_logical).
+    np.ndarray or None
+        Replicated diagonal with shape (n_omega, nk, nb_logical); None
+        with ``host=False``.
     """
     from .qsgw_utils import extract_sigma_diag_replicated
-    diagonal = np.asarray(
-        extract_sigma_diag_replicated(sigma_c_omega, mesh_xy))
+    diagonal = extract_sigma_diag_replicated(sigma_c_omega, mesh_xy)
+    if not host:
+        return None
+    diagonal = np.asarray(diagonal)
     if band_axis is not None:
         from runtime.padding import strip_axis
         diagonal = np.asarray(strip_axis(diagonal, band_axis, axis=-1))
