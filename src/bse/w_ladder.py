@@ -1065,7 +1065,9 @@ def compute_wc_qwedge(
         from .head_resolvent import (
             build_head_dipole, build_head_operator, solve_head_tensor)
 
-        dipole_cart, delta_e, _ = load_dipole_h5(head_dipole_path)
+        from .bse_window import _parse_wfn_path
+        dipole_cart, delta_e, _ = load_dipole_h5(
+            head_dipole_path, wfn_path=_parse_wfn_path(input_file))
         n_val = int(data["n_val"])
         n_cond = int(data["n_cond"])
         d_alpha, delta_cv = slice_dipole_to_bse_window(

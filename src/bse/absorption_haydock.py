@@ -54,6 +54,7 @@ from common.fft_helpers import make_kfft_kminor
 
 from .absorption_common import (RYD2EV, build_dipole_vector_bse, jdos_from_transitions, kramers_kronig_eps1, slice_dipole_to_bse_window, write_absorption_dat, write_absorption_h5)
 from file_io.restart_bundle import (load_dipole_h5)
+from .bse_window import _parse_wfn_path
 from .bse_io import (load_bse_data_from_restart_sharded)
 from file_io.restart_bundle import (_find_restart_file)
 from .bse_ring_comm import create_mesh_2d, make_bse_shardings
@@ -196,7 +197,8 @@ def run_haydock(
           f"{nc_pad} cond × {nv_pad} val × {nk} k = {nc_pad * nv_pad * nk}")
 
     # Build the dipole seed vectors |d^α⟩ in BSE basis with proper padding.
-    dipole_cart, deltaE, _ = load_dipole_h5(dipole_file)
+    dipole_cart, deltaE, _ = load_dipole_h5(
+        dipole_file, wfn_path=_parse_wfn_path(input_file))
     d_alpha, de_cv = slice_dipole_to_bse_window(
         dipole_cart, deltaE, n_occ, n_val_eff, n_cond_eff)
     print(f"[haydock] dipole sliced → (3, nk={nk}, nc={n_cond_eff}, "

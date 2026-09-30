@@ -224,11 +224,13 @@ def _preview_lanczos(
                                             exciton_dipoles_distributed,
                                             slice_dipole_to_bse_window)
             from .bse_io import resolve_n_occ
+            from .bse_window import _parse_wfn_path
             n_occ_dip = (n_occ_eqp if eqp_file is not None else resolve_n_occ(
                 read_metadata(restart_file)["energies"], n_occ=n_occ,
                 input_file=input_file))
             with timing.section("bse.exciton_dipoles", announce=True):
-                dipole_cart, deltaE, _ = load_dipole_h5(dipole_file)
+                dipole_cart, deltaE, _ = load_dipole_h5(
+                    dipole_file, wfn_path=_parse_wfn_path(input_file))
                 d_alpha, _ = slice_dipole_to_bse_window(
                     dipole_cart, deltaE, n_occ_dip, n_val_eff, n_cond_eff)
                 del dipole_cart, deltaE

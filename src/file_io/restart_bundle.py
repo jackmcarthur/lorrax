@@ -937,8 +937,11 @@ def read_downfold_inputs(filename, input_file, mesh_xy):
     return geom, state, tensors
 
 
-def load_dipole_h5(path: str | Path):
+def load_dipole_h5(path: str | Path, *, wfn_path):
     """Load dipole.h5 (psp.get_dipole_mtxels output).
+
+    ``wfn_path`` is the WFN whose ψ the caller contracts the dipole against;
+    a basis mismatch refuses (``file_io.dipole.require_dipole_basis``).
 
     Returns
     -------
@@ -958,11 +961,12 @@ def load_dipole_h5(path: str | Path):
             f"``--skip-vnl`` writes the momentum operator only, which is the "
             f"arm that matches BerkeleyGW's ``use_momentum``; drop it to get "
             f"the full velocity including the nonlocal commutator.")
-    from .dipole import delta_e
+    from .dipole import delta_e, require_dipole_basis
     with h5py.File(str(path), "r") as f:
+        attrs = dict(f.attrs)
+        require_dipole_basis(attrs, dipole_path=path, wfn_path=wfn_path)
         dipole_cart = np.asarray(f["dipole_cart"][:], dtype=np.complex128)
         deltaE = delta_e(f)
-        attrs = dict(f.attrs)
         attrs["nbands"], attrs["nk"] = int(attrs["nbands"]), int(attrs["nk"])
     return dipole_cart, deltaE, attrs
 
