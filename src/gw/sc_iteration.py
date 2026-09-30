@@ -6531,7 +6531,6 @@ def _refuse_hybridized_window_edge(
         return
     ik, idir, rank0 = (int(x) for x in np.unravel_index(
         int(np.argmin(kept)), kept.shape))
-    direction = "xyz"[idir]
     raise ValueError(
         "GATE pt_head_window_hybridized: "
         f"{where}: the active window's retained link singular values dip "
@@ -6539,7 +6538,8 @@ def _refuse_hybridized_window_edge(
         "a manifold the link construction cannot resolve as separable "
         "bands.\n"
         f"  got:  min retained singular value {worst:.6e} at source-k row "
-        f"{ik}, direction {direction!r}, retained rank {rank0 + 1} of "
+        f"{ik}, link step {idir} (the artifact's source_steps row), "
+        f"retained rank {rank0 + 1} of "
         f"{int(nb_logical)}\n"
         f"  want: every retained link singular value > {float(floor):.3g}\n"
         "  fix:  snap the active window outward (more bands) until the cut "
