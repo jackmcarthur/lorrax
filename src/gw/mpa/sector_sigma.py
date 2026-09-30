@@ -110,7 +110,7 @@ def _w_contraction(mesh_xy, grid, nk, mc, nt_n, kcarrier, layout, weights_fn):
     return kernel
 
 
-def sector_tau_factory(left, right, keys, meta, mesh_xy, *, real_weights=False):
+def sector_tau_factory(left, right, keys, meta, mesh_xy, *, real_weights=False, stage='sigma.sector.tau'):
     """Stream exact Dirac quarters and Lorentz components through mode7.
 
     Fixed monomial vertices act on projector faces, so each convolution
@@ -150,7 +150,7 @@ def sector_tau_factory(left, right, keys, meta, mesh_xy, *, real_weights=False):
     warm = 2*16*q*(2*m*k+k*2*n+4*m*n)//mesh_xy.size
     panel = green_panel_bytes(n_rows=q,m=2*m,n=2*n,mesh=mesh_xy,
         room=ledger.room_bytes_per_rank(ledger.live_stages)-warm)
-    ledger.reserve(f'sigma.sector.tau.warm.{keys[0]}',resident_bytes_per_rank=0,
+    ledger.reserve(f'{stage}.warm.{keys[0]}',resident_bytes_per_rank=0,
         workspace_bytes_per_rank=warm+panel,concurrent_with=ledger.live_stages)
     gemm = partial(panel_matmul, mesh=mesh_xy, panel_bytes=panel)
     blocks = sigma_row_blocks(n_rmu=m, ns=2, d=1, mesh=mesh_xy)
@@ -199,7 +199,7 @@ def sector_tau_factory(left, right, keys, meta, mesh_xy, *, real_weights=False):
         key=('quarter-stream',mesh_xy,shapes,int(band_axis.padded),tuple(keys),grid,real_weights,
              int(meta.nk_tot),id(plans[0]),id(plans[1]))
         return SynthesisTau(spatial,synthesis,right_yr,right_proj,
-            native+synthesis.native,f'sigma.sector.tau.{keys[0]}',meta,key,plans)
+            native+synthesis.native,f'{stage}.{keys[0]}',meta,key,plans)
     return factory
 
 
@@ -235,7 +235,7 @@ class _SectorComponents:
         return self.kernel(*self.operands,self.ref,self.time,self.hole,left,right)
 
 
-def _sector_component_kernel(panels, mesh_xy, grid, nk, m, n, width, weights_fn):
+def _sector_component_kernel(panels, mesh_xy, grid, nk, m, n, width, weights_fn, *, column_starts=None):
     """One scalar W_AB, from bounded parent-q and pole-column panels.
 
     Endpoint routing retains every physical current component: the spatial
@@ -269,7 +269,9 @@ def _sector_component_kernel(panels, mesh_xy, grid, nk, m, n, width, weights_fn)
                 sx=jax.lax.dynamic_index_in_dim(x,chunk,axis=0,keepdims=False)[lo:hi]
                 sy=jax.lax.dynamic_index_in_dim(y,chunk,axis=0,keepdims=False)[lo:hi]
                 omega=jax.lax.dynamic_index_in_dim(poles,chunk,axis=0,keepdims=False)[lo:hi]
-                bounds=jnp.clip(intervals[lo:hi]-chunk*width,0,width)[parent]
+                offset=chunk*width if column_starts is None else jnp.asarray(column_starts)[chunk]
+                low=jnp.maximum(intervals[lo:hi,0],chunk*width)
+                bounds=jnp.clip(jnp.stack((low,intervals[lo:hi,1]),axis=1)-offset,0,width)[parent]
                 omega=omega[parent]
                 bx=routes[0](sx);by=routes[1](sy)
                 # Dynamic selection only touches the unsharded component
@@ -313,8 +315,6 @@ def _sector_stream_synthesis(readers,headers,bases,syms,layout,frequencies,meta,
     # The physical faces are read at their native two-axis placement and
     # then split into chunk-major carriers. Count both generations at setup.
     setup=f'sigma.sector.setup.{tag}';held=f'sigma.sector.resident.{tag}'
-    ledger.reserve(setup,resident_bytes_per_rank=2*resident,
-        workspace_bytes_per_rank=0,concurrent_with=ambient)
     room=ledger.room_bytes_per_rank(ambient)-resident
     tile=16*nk*m*n//mesh_xy.size
     parent_map=np.asarray(left['qirr']['irr_idx_q'],np.int32)
@@ -349,17 +349,27 @@ def _sector_stream_synthesis(readers,headers,bases,syms,layout,frequencies,meta,
         workspace_bytes_per_rank=0,concurrent_with=ambient)
     ledger.live_stages=(*ambient,setup)
     try:
-        lhs=read_shared_pole_faces(readers[0],(0,nq),meta=meta,header=left,basis=bases[0],orientations=('x',))
-        rhs=read_shared_pole_faces(readers[1],(0,nq),meta=meta,header=right,basis=bases[1],orientations=('y',))
-        if not bool(jnp.all(lhs[2]==rhs[2])):
-            raise ValueError('GATE shared_pole_sector_census: unequal pole values')
-        x=_chunk_major(mesh_xy,P(None,'x',None,'y'),n_chunks,width)(lhs[0])
-        y=_chunk_major(mesh_xy,P(None,'y',None,'x'),n_chunks,width)(rhs[1])
-        poles=_chunk_major(mesh_xy,P(),n_chunks,width)(lhs[2])
-        jax.block_until_ready((x,y,poles));del lhs,rhs
+        # Each pole chunk is read directly at its all-P native face
+        # placement. A global K reshape can all-gather its old K shard;
+        # no such whole-face staging is allowed here.
+        xs=[];ys=[];ps=[];column_starts=[]
+        for chunk in range(n_chunks):
+            offset=chunk*width
+            span=None if n_chunks==1 else (min(offset,kmax-width),min(offset,kmax-width)+width)
+            lhs=read_shared_pole_faces(readers[0],(0,nq),meta=meta,header=left,basis=bases[0],
+                                      column_span=span,orientations=('x',))
+            rhs=read_shared_pole_faces(readers[1],(0,nq),meta=meta,header=right,basis=bases[1],
+                                      column_span=span,orientations=('y',))
+            if not bool(jnp.all(lhs[2]==rhs[2])):
+                raise ValueError('GATE shared_pole_sector_census: unequal pole values')
+            xs.append(lhs[0]);ys.append(rhs[1]);ps.append(lhs[2])
+            column_starts.append(0 if span is None else span[0])
+        x=jnp.stack(xs);y=jnp.stack(ys);poles=jnp.stack(ps)
+        jax.block_until_ready((x,y,poles));del lhs,rhs,xs,ys,ps
         ledger.reserve(held,resident_bytes_per_rank=resident,workspace_bytes_per_rank=0,concurrent_with=ambient)
         ledger.live_stages=(*ambient,held)
-        kernel,native=_sector_component_kernel(panels,mesh_xy,grid,nk,m,n,width,_shared_pole_weights)
+        kernel,native=_sector_component_kernel(panels,mesh_xy,grid,nk,m,n,width,_shared_pole_weights,
+                                                column_starts=tuple(column_starts))
     except BaseException:
         ledger.live_stages=ambient
         raise
@@ -378,7 +388,7 @@ def _sector_stream_synthesis(readers,headers,bases,syms,layout,frequencies,meta,
         return _SectorComponents(kernel,(x,y,poles,intervals),ref,time,hole)
     return WSynthesis(w_kernel,window_operands,lambda:(x,y,poles),close,native,
         ('sector-components',mesh_xy,grid,nk,m,n,nc,nt,carrier,width,bcap,
-         tuple((item['span'],tuple(map(int,item['rows'])),item['routes']) for item in panels)),ordered=True)
+         tuple(column_starts),tuple((item['span'],tuple(map(int,item['rows'])),item['routes']) for item in panels)),ordered=True)
 
 
 def sector_synthesis(readers, headers, bases, syms, layout, frequencies, meta, mesh_xy,
@@ -616,7 +626,8 @@ def instantaneous_sector_sigma(handle, families, bases, meta, mesh_xy, *,
                 xn,_,xr,_,_,_=parent_sigma_operands(family)
                 axis=sigma_band_axis(int(family.slices.nb_sigma),mesh_xy,ansatz='dynamic')
                 synthesis=SimpleNamespace(native=0)
-                tau=sector_tau_factory(family,families[b],keys,meta,mesh_xy,real_weights=True)(synthesis,axis)
+                tau=sector_tau_factory(family,families[b],keys,meta,mesh_xy,real_weights=True,
+                    stage=f'sigma.sector.constant.q{lo}')(synthesis,axis)
                 m,n=bases[a].n_packed,bases[b].n_packed
                 contract=_constant_component_contract(tau,rows,meta.nk_tot,m,n)
                 args=(xn,tau._right[0],pad_to_axis(xr,axis,axis=1),tau._right[1],energy,weight,children)
