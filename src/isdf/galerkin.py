@@ -346,6 +346,18 @@ def _basis_provenance(*, wfn, meta, centroid_indices, band_range,
     }
 
 
+@partial(jax.jit, static_argnames=("physical",))
+def _coefficient_null_tail_max(ctilde, *, physical):
+    """Scalar exact-null receipt without slicing an unaligned rank tail.
+
+    A short global slice would replicate the full coefficient carrier when
+    its width cannot be split over all P ranks. Masking the incumbent rank
+    shards keeps the large input at its owner and only reduces one scalar.
+    """
+    null = jnp.arange(ctilde.shape[-1]) >= int(physical)
+    return jnp.max(jnp.where(null, jnp.abs(ctilde), 0.0))
+
+
 def _basis_check(basis: GalerkinBasis, provenance: dict) -> None:
     physical, carrier = int(basis.rank_physical), int(basis.rank_carrier)
     if tuple(basis.band_range) != provenance["band_range"] \
@@ -373,11 +385,11 @@ def _basis_check(basis: GalerkinBasis, provenance: dict) -> None:
         raise ValueError("Galerkin basis hashes are malformed")
     if physical == carrier:
         return
-    tails = (basis.ctilde[..., physical:],
-             basis.basis_at_nodes[physical:],
+    tails = (basis.basis_at_nodes[physical:],
              basis.selection_factor[physical:, :physical],
              basis.selection_factor[:physical, physical:])
-    errors = [float(jnp.max(jnp.abs(value))) for value in tails if value.size]
+    errors = [float(_coefficient_null_tail_max(basis.ctilde, physical=physical))]
+    errors.extend(float(jnp.max(jnp.abs(value))) for value in tails if value.size)
     factor_tail = basis.selection_factor[physical:, physical:]
     errors.append(float(jnp.max(jnp.abs(
         factor_tail - jnp.eye(carrier - physical, dtype=factor_tail.dtype)))))
