@@ -4394,6 +4394,8 @@ def _exp_lowdin_fold(H, inputs, state, ks, partition, scissor_classes,
         D = np.asarray(D) if ks.is_identity else np.asarray(ks.select(D))
         Uh = np.array(gather_to_host(U_qp), dtype=np.complex128)
         H_ef = Hn + np.einsum("kmp,kpq,knq->kmn", Uh, D, Uh.conj())
+        if os.environ.get("LORRAX_EXP_OCCTAIL_MODEA", "0") == "1":
+            H_ef = Hn  # diagnostic: today's 1/2[Sigma(E_v) + Sigma(E_t)] occupied-tail elements
         vmask = np.asarray(valence_kn, dtype=bool)
     ot_max, ot_diffmax = 0.0, 0.0
     dmin, fmax = np.inf, 0.0
