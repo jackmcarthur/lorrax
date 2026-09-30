@@ -510,9 +510,9 @@ def check_chunk(chunk: int, *, build, fixed: float, per_unit: float, room: float
     built for ``chunk``).  Its figure is :func:`compiled_new_bytes` plus
     ``extra(c, compiled)``: what the stage holds beside it (a donated carry
     the caller allocates, a native handler's run-time scratch, a lookahead
-    copy of its output).  At or below the analytic price, or within the room, the
-    chunk runs as planned: nothing is recompiled and results are unchanged.
-    Above both, the slope is corrected from this one point,
+    copy of its output).  Within the room, the chunk runs as planned: nothing is recompiled and
+    results are unchanged. Above the room, even below the analytic price,
+    the slope is corrected from this one point,
     ``per_unit = (compiled - fixed) / chunk``, the chunk solved directly,
     ``floor((room - fixed) / per_unit)``, and compiled once more.  No
     bisection: a second figure still over the room refuses by name
@@ -532,7 +532,7 @@ def check_chunk(chunk: int, *, build, fixed: float, per_unit: float, room: float
             f"at minimum chunk {chunk}; want <= the room {room / 1e9:.2f} GB; "
             "fix: reduce native scratch through its owner, more ranks or a "
             "larger memory_per_device_gb")
-    if got <= analytic or got <= room:
+    if got <= room:
         return ChunkCheck(chunk, compiled, analytic, got, max(analytic, got),
                           float(per_unit), False, seconds)
     slope = max(float(per_unit), (got - float(fixed)) / chunk)

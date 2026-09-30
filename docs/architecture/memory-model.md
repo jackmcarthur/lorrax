@@ -240,8 +240,8 @@ stage is priced as `fixed + chunk·per_unit` new bytes per rank beside what is
 live. The executable's figure is `temp + outputs − alias` plus cuFFT plan
 scratch (`compiled_new_bytes`), plus what the stage holds beside it that buffer
 assignment cannot see: a donated carry the caller allocated, a native
-handler's run-time scratch, a lookahead copy of the output. At or below the
-closed form, or within the room, the chunk runs unchanged. Above both, the
+handler's run-time scratch, a lookahead copy of the output. Within the room, the chunk runs unchanged. Above the room, even below
+the closed-form estimate, the
 slope is corrected from that one point, `per_unit = (compiled − fixed)/chunk`,
 the chunk solved directly, and compiled once more. There is no bisection; a second figure still over the room refuses. An
 over-budget minimum chunk also refuses before dispatch, even when the
