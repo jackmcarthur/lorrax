@@ -2037,6 +2037,84 @@ def unfold_psi(
     return cnk
 
 
+def _integer_grid_lookup(coords, grid):
+    """Complete Cartesian integer grid in an arbitrary scientific row order."""
+    grid = np.asarray(grid, dtype=np.int64)
+    coords = np.asarray(coords, dtype=np.int32)
+    if (grid.shape != (3,) or np.any(grid <= 0)
+            or coords.shape != (int(np.prod(grid)), 3)
+            or int(np.prod(grid)) > np.iinfo(np.int32).max
+            or np.any(coords < 0) or np.any(coords >= grid)):
+        return None
+    flat = (coords[:, 0].astype(np.int64) * grid[1] + coords[:, 1]) * grid[2] + coords[:, 2]
+    if np.unique(flat).size != coords.shape[0]:
+        return None
+    lookup = np.empty(coords.shape[0], dtype=np.int32)
+    lookup[flat] = np.arange(coords.shape[0], dtype=np.int32)
+    return lookup
+
+
+def _integer_kminusq_index_map(coords, qcoords, grid, lookup):
+    """The identity-grid modular lookup, without an Nk×Nq×3 carrier."""
+    grid = np.asarray(grid, dtype=np.int32)
+    coords, qcoords = np.asarray(coords, np.int32), np.asarray(qcoords, np.int32)
+    indices = (coords[:, None, 0] - qcoords[None, :, 0]) % grid[0]
+    for axis in (1, 2):
+        indices *= grid[axis]
+        indices += (coords[:, None, axis] - qcoords[None, :, axis]) % grid[axis]
+    return lookup[indices]
+
+
+def _uniform_kminusq_index_map(full, qarr):
+    """Exact-key uniform-grid arm; noisy/irregular coordinates keep the old door.
+
+    A shifted k grid is allowed, but q must lie on the unshifted difference
+    grid for k−q to remain on that k grid. Reconstruction is checked at the
+    existing decimal-key precision, so this arm never widens acceptance.
+    """
+    if not np.all(np.isfinite(full)) or not np.all(np.isfinite(qarr)):
+        return None
+    scale = np.int64(100_000_000)
+    def keys(points):
+        return np.mod(np.rint(np.mod(points, 1.0) * scale).astype(np.int64), scale)
+    full_keys = keys(full)
+    axes = [np.unique(full_keys[:, i]) for i in range(3)]
+    grid = np.array([len(a) for a in axes], dtype=np.int64)
+    if int(np.prod(grid)) != len(full) or np.any(grid == 0):
+        return None
+    wrapped = np.mod(full, 1.0)
+    offset = np.array([wrapped[np.argmin(full_keys[:, i]), i] for i in range(3)])
+    coords = np.mod(np.rint((np.mod(full, 1.0) - offset) * grid).astype(np.int32), grid)
+    if not np.array_equal(keys(offset + coords / grid), full_keys):
+        return None
+    lookup = _integer_grid_lookup(coords, grid)
+    if lookup is None:
+        return None
+    qcoords = np.mod(np.rint(np.mod(qarr, 1.0) * grid).astype(np.int32), grid)
+    if not np.array_equal(keys(qcoords / grid), keys(qarr)):
+        return None
+    return _integer_kminusq_index_map(coords, qcoords, grid, lookup)
+
+
+def _unwrapped_grid_q_tables(coords, grid):
+    """Native lexicographic q labels without sorting the Nk² pair triples."""
+    coords = np.asarray(coords, dtype=np.int32)
+    grid = np.asarray(grid, dtype=np.int32)
+    if _integer_grid_lookup(coords, grid) is None:
+        pairs = coords[:, None, :] - coords[None, :, :]
+        vectors, inverse = np.unique(pairs.reshape(-1, 3), axis=0, return_inverse=True)
+        return vectors, inverse.reshape(len(coords), len(coords)).astype(np.int32)
+    extent = 2 * grid - 1
+    if int(np.prod(extent.astype(np.int64))) > np.iinfo(np.int32).max:
+        raise ValueError('unwrapped q-grid label exceeds the int32 carrier')
+    vectors = np.indices(tuple(extent), dtype=np.int32).reshape(3, -1).T - (grid - 1)
+    labels = coords[:, None, 0] - coords[None, :, 0] + grid[0] - 1
+    for axis in (1, 2):
+        labels *= extent[axis]
+        labels += coords[:, None, axis] - coords[None, :, axis] + grid[axis] - 1
+    return vectors, labels
+
+
 class SymMaps:
     def trivial_view(self):
         """Restrict the computational group to identity over loader-unfolded full-k parents."""
@@ -2283,37 +2361,16 @@ class SymMaps:
             kgrid[None, :],
         )
 
-        lookup = -np.ones(tuple(int(x) for x in kgrid), dtype=np.int32)
-        lookup[
-            self.kvecs_asints[:, 0],
-            self.kvecs_asints[:, 1],
-            self.kvecs_asints[:, 2],
-        ] = np.arange(self.unfolded_kpts.shape[0], dtype=np.int32)
-
-        # k−q maps on the unfolded (which equals reduced) grid.
-        # Use direct modular arithmetic instead of the generic O(nk^3) search path.
-        kminusq_mod = np.mod(
-            self.kvecs_asints[:, None, :] - self.kvecs_asints[None, :, :],
-            kgrid[None, None, :],
-        )
-        self.kqfull_map = lookup[
-            kminusq_mod[:, :, 0],
-            kminusq_mod[:, :, 1],
-            kminusq_mod[:, :, 2],
-        ]
+        lookup = _integer_grid_lookup(self.kvecs_asints, kgrid)
+        if lookup is None:
+            raise ValueError('identity k-grid is not a complete integer grid')
+        self.kqfull_map = _integer_kminusq_index_map(
+            self.kvecs_asints, self.kvecs_asints, kgrid, lookup)
         self.kq_map = self.kqfull_map.copy()
 
         # Integer q enumerations for k' - k outside the first BZ.
-        qpt_vecs = self.kvecs_asints[:, None, :] - self.kvecs_asints[None, :, :]
-        self.all_unfolded_qpts, inverse = np.unique(
-            qpt_vecs.reshape(-1, 3),
-            axis=0,
-            return_inverse=True,
-        )
-        self.all_unfolded_qpt_ids = inverse.reshape(
-            self.kvecs_asints.shape[0],
-            self.kvecs_asints.shape[0],
-        ).astype(np.int32)
+        self.all_unfolded_qpts, self.all_unfolded_qpt_ids = _unwrapped_grid_q_tables(
+            self.kvecs_asints, kgrid)
 
         # Trivial-sym q-IBZ: each full-BZ q is its own IBZ partner under identity.
         n_full = int(self.kvecs_asints.shape[0])
@@ -2528,15 +2585,8 @@ class SymMaps:
                         indexing='ij')
         self.kvecs_asints = np.stack([kx.flatten(), ky.flatten(), kz.flatten()], axis=1) # kpoints * kgrid (kpoints as integers)
 
-        # Generate q-vectors using broadcasting
-        qpt_vecs = self.kvecs_asints[:, None, :] - self.kvecs_asints[None, :, :]  # Automatic broadcasting
-
-        # Find unique q-vectors (already vectorized)
-        self.all_unfolded_qpts, inverse = np.unique(
-            qpt_vecs.reshape(-1, 3), axis=0, return_inverse=True)
-        self.all_unfolded_qpt_ids = inverse.reshape(
-            len(self.kvecs_asints), len(self.kvecs_asints),
-        ).astype(np.int32)
+        self.all_unfolded_qpts, self.all_unfolded_qpt_ids = _unwrapped_grid_q_tables(
+            self.kvecs_asints, wfn.kgrid)
 
         # Eager q-IBZ reduction (was lazy in `find_irreducible_qpoints`; that
         # method is gone — all consumers read these instance attrs directly).
@@ -2952,6 +3002,10 @@ class SymMaps:
         if qarr.ndim != 2 or qarr.shape[1] != 3:
             raise ValueError(
                 f"qpts must have shape (Nq, 3); got {qarr.shape}")
+
+        uniform = _uniform_kminusq_index_map(full, qarr)
+        if uniform is not None:
+            return uniform
 
         key_scale = np.int64(100_000_000)
 
