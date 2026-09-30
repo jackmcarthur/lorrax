@@ -405,9 +405,8 @@ $\Sigma(E)$, not $\Sigma(0)$, for an active state outside the requested grid.
   lies inside it; when one is about to cross, only that edge grows, to
   $E \pm P$, the edge the plan would set for that state, and one
   `SC window extension` line names the band, k, $E - \mu$, the edge and the
-  run's extension count. A map-1 re-plan at 1 eV was deleted: it changed the
-  grid, so every Σ executable recompiled at map 1, while the held rules
-  already paid for the map-0 grid. A requested state with $Z \notin (0, 1]$ has no
+  run's extension count. There is no map-1 re-plan: a changed grid would
+  recompile every Σ executable. A requested state with $Z \notin (0, 1]$ has no
   quasiparticle: its energy never moves the grid, and off the grid it reads
   the out-of-grid rule and is named in an `SC window no-quasiparticle`
   line. A grid that reaches far above $E_F$ therefore means the deck
@@ -587,8 +586,7 @@ receipts certify the unprojected model only.
   $10^{-5}$ (`gw.efermi.band_in_occupation_window`; $|E-\mu|\le11.5\,k_BT$ for
   Fermi–Dirac), for the one-shot and every map alike. A state that crosses
   the cut between maps switches one term by about $10^{-5}$ of its size,
-  0.01 meV; the retired 0.005 floor switched it by 5.4 meV on Fe
-  (CLAIMS 2793).
+  0.01 meV (CLAIMS 2793).
 - The energy-only tail above the QP window has exact-zero occupations. It
   still enters G and the response at its current shifted energies, and the
   window alone sets μ. A tail state that enters the fractional manifold

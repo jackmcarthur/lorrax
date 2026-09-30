@@ -45,18 +45,12 @@ cross-checks its q = 0, G = 0 column against the independently transported
 `g0_S` on every run.
 
 !!! note "A ζ stored on the q-IBZ wedge transports too"
-    Until 2026-08-10 the downfold refused to transport a ζ that its parent had
-    written on the q-IBZ wedge, on the grounds that the transfer `T` is indexed
-    by the restart's flat-q axis while a wedge ζ is indexed by the irreducible
-    list. That refusal was wider than the problem. The downfold is q-diagonal:
-    `T[q]` is built from `S_SS[q]` and `S_cross[q]` and from nothing else, so
-    the transfer at a wedge q is the same matrix whether the run around it
-    enumerated the wedge or the whole star. A wedge ζ therefore does not need
-    unfolding — it needs the row of `T` that belongs to its own q, and the
-    downfold already had a function that finds that row by matching q labels
-    exactly. The child's ζ comes out on the parent's own q set, so a wedge
-    parent now yields a wedge child that is exactly as capable as its parent,
-    where before it yielded a child with no ζ at all.
+    The downfold is q-diagonal: `T[q]` is built from `S_SS[q]` and
+    `S_cross[q]` and from nothing else, so the transfer at a wedge q is the
+    same matrix whether the parent enumerated the wedge or the whole star.
+    A wedge ζ is not unfolded: it takes the row of `T` at its own q, found by
+    matching q labels exactly. The child's ζ comes out on the parent's q set,
+    so a wedge parent yields a wedge child.
 
     This does not make `--vq-mode interp` work on a wedge lineage. `vq_interp`
     still requires `nq == nk` and reads a wedge ζ as the IBZ cascade being
@@ -240,8 +234,8 @@ There is no default. This is a physics choice and the driver cannot guess it.
 
 How many centroids the small basis should have, or the word `auto`.
 
-**It is a budget in points, and since 2026-08-10 the selection spends it in
-whole symmetry orbits.** Whenever a symmetry map reaches the selection, the
+**It is a budget in points, and the selection spends it in whole symmetry
+orbits.** Whenever a symmetry map reaches the selection, the
 driver takes orbits in pivot order for as long as the running point total stays
 at or below the number you wrote, so the basis you get is the largest union of
 whole orbits that does not exceed your budget — `mu_small = 185` on the
@@ -252,13 +246,13 @@ is what makes the child's symmetry closure structural instead of something to be
 repaired afterwards, which the section on wedge storage below is about. If your
 budget is smaller than the first orbit the pivot order ranks, the driver refuses
 and lists the legal point counts under the ceiling rather than delivering an
-empty basis. Where no symmetry map reaches the selection the historical
-point-granularity path still runs, and there closure is simply not measured.
+empty basis. Where no symmetry map reaches the selection the point-granularity path
+runs, and there closure is not measured.
 
 **The recommendation is an explicit integer, validated against the parent by
-comparing the observable.** This page used to recommend `auto`, and that
-recommendation is withdrawn: it produced a 2.087 eV error in the lowest BSE
-eigenvalue on the standard silicon walk, with nothing refusing anywhere. Write
+comparing the observable.** Do not use `auto`: it produced a 2.087 eV error in
+the lowest BSE eigenvalue on the standard silicon walk, with nothing refusing.
+Write
 the number in the deck, and then check it — the check is *How to validate a
 μ_S* below, and it is one command.
 
@@ -451,9 +445,7 @@ Set the key when you want a specific table used — a parent with no `zeta_q.h5`
 at all, or a table you have curated yourself. It wins over everything else. If
 neither route produces a table, the run says so and names the consequence:
 `bse.bse_jax` is unaffected (the bundle format holds no coordinates, only their
-hash), and `bse.exciton_bands` will refuse with the same explanation rather
-than with the bare `FileNotFoundError: …/centroids_frac_936.txt not found.`
-out of `np.loadtxt` that this used to produce.
+hash), and `bse.exciton_bands` will refuse with the same explanation.
 
 ## What it prints, and what to read
 
@@ -562,10 +554,9 @@ restrictions of the parent's, and every run gates the result on its own tensors
 by unfolding the child's wedge block with those tables and comparing against the
 child on the full BZ. On the production deck that gate now reads 3.7e-08 against
 a tolerance scaled by the run's achieved conditioning, and passes with 5.4× of
-margin; it read 1.170 and REFUTED for two days because the Gram behind it was
-built at −q.
-`gw.downfold.orbit_complete_keep` survives as an offline instrument for a kept
-set that came from somewhere else, and is no longer on the selection path.
+margin.
+`gw.downfold.orbit_complete_keep` is an offline instrument for a kept set
+that came from somewhere else; it is not on the selection path.
 
 The child's tensors are nonetheless still written on the full BZ, and the
 remaining blocker is a different object from the one the gate above measures:
