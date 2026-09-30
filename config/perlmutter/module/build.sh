@@ -40,6 +40,9 @@ git clone --quiet --no-checkout --shared "$SRC" "$CAND/src"
 git -C "$CAND/src" checkout --quiet --detach "$REV"
 ln -s "$VENV" "$CAND/src/.venv"
 export LORRAX_BUILD_PREFIX="$PREFIX/build"
+# The module venv does not install lorrax; the legs' dynamic gates (GATE 8)
+# import it from the clone being built.
+export PYTHONPATH="$CAND/src/src"
 SLATE_LIB="$LORRAX_BUILD_PREFIX/slate/cpu/install/lib64"
 STAGE_LIB="$LORRAX_BUILD_PREFIX/cusolvermp-$CUSOLVERMP_VERSION/lib"
 
@@ -70,6 +73,7 @@ REV=$REV
 BUNDLE_ID=$BUNDLE_ID
 MODULE_NAME=$MODULE_NAME
 MODULE_VERSION=$MODULE_VERSION
+EXPECT='{"jax": "$JAX_VERSION", "jaxlib": "$JAX_VERSION", "jax-cuda13-plugin": "$JAX_VERSION", "jax-cuda13-pjrt": "$JAX_VERSION", "nvidia-cudnn-cu13": "$CUDNN_VERSION", "nvidia-mathdx": "$MATHDX_VERSION"}'
 EOF
 bash "$HERE/install_module.sh" "$CAND/source" "$CAND/bundle" \
     "$CAND/modulefiles/$MODULE_NAME/$MODULE_VERSION.lua"
