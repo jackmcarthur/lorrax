@@ -463,10 +463,12 @@ def build_head_dipole_operand(args, nk, nc_pad, nv_pad, n_val, n_cond,
     from .absorption_common import (build_dipole_vector_bse, slice_dipole_to_bse_window)
     from file_io.restart_bundle import (load_dipole_h5)
     from .bse_io import resolve_n_occ
+    from .bse_window import _parse_wfn_path
 
     path = args.dipole if getattr(args, "dipole", None) else \
         os.path.join(os.path.dirname(os.path.abspath(args.input)), "dipole.h5")
-    dipole_cart, deltaE, attrs = load_dipole_h5(path)
+    dipole_cart, deltaE, attrs = load_dipole_h5(
+        path, wfn_path=_parse_wfn_path(args.input))
     sign = attrs.get("prov_vnl_velocity_sign")
     skip_vnl = attrs.get("skip_vnl")
     if int(attrs["nk"]) != int(nk):

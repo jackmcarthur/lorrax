@@ -12,8 +12,10 @@ read it):
 * ``finite_q/`` — optional finite-q SOS block (``rho_cvkq``, ``v_cvkq``,
   ``kminq_idx``, ``iq_list``, and for bispinors ``alpha_cvkq`` and
   ``ward_residual_cvkq``).
-* root attributes — ``nbands``, ``nk``, ``skip_vnl``, ``note`` and the
-  ``prov_*`` provenance stamp (``psp.get_dipole_mtxels.dipole_provenance``).
+* root attributes — ``nbands``, ``nk``, ``skip_vnl``, ``note``, ``basis``
+  (``"dft"`` or ``"qp"``: whose states the band indices label; absent reads
+  ``"dft"``) and the ``prov_*`` provenance stamp
+  (``psp.get_dipole_mtxels.dipole_provenance``).
 
 ΔE IS DERIVED ON READ.  ``ΔE[k, m, n] = E_m(k) − E_n(k)`` carries no
 information beyond ``band_energies`` and was 14 % of every file.
@@ -36,13 +38,18 @@ BAND_ENERGIES_DATASET = "band_energies"
 #: Stored ΔE in files written before 2026-09-25; read, never written.
 LEGACY_DELTA_E_DATASET = "deltaE"
 FINITE_Q_GROUP = "finite_q"
+#: Root attribute: the one-particle basis the band indices label.
+DIPOLE_BASIS_ATTR = "basis"
 
 __all__ = [
     "BAND_ENERGIES_DATASET",
+    "DIPOLE_BASIS_ATTR",
     "DIPOLE_DATASET",
     "FINITE_Q_GROUP",
     "LEGACY_DELTA_E_DATASET",
     "band_energies_on_full_bz",
+    "require_dipole_basis",
+    "wfn_psi_basis",
     "delta_e",
     "delta_e_cv",
     "energy_extent",
@@ -119,6 +126,33 @@ def finite_q_payload(*, rho_cvkq, v_cvkq, kminq_idx, iq_list, n_occ, v_lo,
             "alpha_fs": float(ALPHA_FS),
         })
     return {"datasets": datasets, "attrs": attrs}
+
+
+def wfn_psi_basis(wfn_path) -> str:
+    """``"qp"`` when ``wfn_path`` carries the QP-WFN stamp, else ``"dft"``."""
+    from .restart_bundle import read_qp_wfn_stamp
+    return "qp" if read_qp_wfn_stamp(wfn_path) is not None else "dft"
+
+
+def require_dipole_basis(attrs, *, dipole_path, wfn_path) -> None:
+    """Refuse a dipole whose band basis is not the basis of ``wfn_path``'s ψ.
+
+    ``gw.qsgw_head.write_qsgw_dipole`` stamps ``basis = "qp"`` (U^H v U
+    between the SC map's QP states); ``psp.get_dipole_mtxels`` stamps the
+    basis of the WFN it read.  A file with no stamp reads ``"dft"``.
+    Contracting one basis's velocities with the other's exciton amplitudes
+    keeps every shape and is silently wrong absorption.
+    """
+    got = attrs.get(DIPOLE_BASIS_ATTR, "dft")
+    got = got.decode() if isinstance(got, bytes) else str(got)
+    want = wfn_psi_basis(wfn_path)
+    if got != want:
+        raise ValueError(
+            f"GATE dipole_basis: {dipole_path!s} holds velocities between "
+            f"{got!r}-basis states, but the wavefunctions ({wfn_path!s}) are "
+            f"{want!r}-basis states.  Build the dipole from the WFN the BSE "
+            f"runs on (python -m psp.get_dipole_mtxels -i <deck>); "
+            f"dipole_qsgw.h5 pairs only with a QP WFN.")
 
 
 def write_dipole(path, velocity_kmajor, band_energies, *, mesh, attrs,

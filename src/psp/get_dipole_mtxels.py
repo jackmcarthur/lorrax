@@ -63,8 +63,8 @@ from psp.pseudos import load_pseudopotentials, print_atomic_structure
 from psp.dft_operators import (padded_gvectors, gather_psi_G_from_crys,
                                momentum_matrix_k)
 import psp.vnl_ops as vnl_ops
-from file_io.dipole import (band_energies_on_full_bz, finite_q_payload,
-                            write_dipole)
+from file_io.dipole import (DIPOLE_BASIS_ATTR, band_energies_on_full_bz,
+                            finite_q_payload, wfn_psi_basis, write_dipole)
 from file_io.parallel_transport import (complete_parallel_transport,
                                         publish_dft_velocity)
 from runtime.run_session import RunSession
@@ -1616,6 +1616,7 @@ def main(argv=None):
 				out_path, velocity, band_energies, mesh=RUNTIME.mesh,
 				attrs={"nbands": int(wfn.nbands), "nk": int(sym.nk_tot),
 				       "skip_vnl": bool(args.skip_vnl), "note": note,
+				       DIPOLE_BASIS_ATTR: wfn_psi_basis(wfn_path),
 				       **dipole_provenance(
 				           wfn=wfn, wfn_path=str(wfn_path), nval=nval,
 				           ncond=ncond, nband=nband, nb_written=head_nbands,
