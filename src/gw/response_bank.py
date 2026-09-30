@@ -408,11 +408,22 @@ def response_stream(wfns, meta, *, mesh_xy, q_ids, n_outputs,
             raise ValueError("GATE response_vertex: photon Laplace cells must retain odd rows")
         n_input = (int(meta.nk_tot) if vertex.families.n_parent is None
                    else vertex.families.n_parent)
+        # The direct stream's row passes per family pair: from the ledger beside the
+        # smallest group's carry, 1 when everything fits (w_isdf.photon_response_passes).
+        passes = None
+        ledger = getattr(meta, "shared_pole_capacity", None)
+        if pair_mode == "direct" and ledger is not None and vertex.families.n_parent is not None:
+            from .w_isdf import photon_response_passes
+            passes = photon_response_passes(
+                ledger, mesh_xy, vertex.families, n_parent=n_input, nk=int(meta.nk_tot),
+                n_out=2, q_count=len(q_ids),
+                face_bytes=sum(int(a.nbytes) for a in (*vertex.mun, *vertex.nmu)) // int(mesh_xy.size))
         kernel = _response_stream_kernel(
             mesh_xy, (meta.nkx, meta.nky, meta.nkz), n_outputs,
             (n_input, int(wfns.slices.nb_full), vertex.n, 4),
             _ffi_key=ffi_dial_key(), layout=wfns.layout, selected_q=tuple(q_ids), pair_mode=pair_mode,
-            bank_carry=bank_carry, ordered=True, vertex=vertex.families, band_ranges=band_ranges)
+            bank_carry=bank_carry, ordered=True, vertex=vertex.families, band_ranges=band_ranges,
+            photon_passes=passes)
         return kernel, vertex.fixed
     if not charge_representation(meta):
         raise ValueError("GATE response_representation: want an authenticated "

@@ -2182,7 +2182,7 @@ def make_kconv_chi_unfold(mesh: Mesh, kgrid, tables, *, n_out: int, complete: bo
 
 
 def make_kconv_chi_vertex(mesh: Mesh, kgrid, tables, *, left_vertices, right_vertices,
-                          sign_c=None, norm: str | None = "ortho",
+                          sign_c=None, rows=None, norm: str | None = "ortho",
                           scratch_bytes: int | None = None) -> Callable:
     """Mode 11 with channel vertices: ``fn(acc, Gv, Gc, Gvt=None, Gct=None) -> acc``.
 
@@ -2196,8 +2196,10 @@ def make_kconv_chi_vertex(mesh: Mesh, kgrid, tables, *, left_vertices, right_ver
     reads it (the same ``tables``, one spin action, a single output weight of 1).
     ``sign_c`` ``(nk,)`` real +-1, when given, multiplies Gc's unfolded k rows
     (a Dirac-half quadrant's own sign relative to ``tables``).  ``acc``
-    ``(na*nb, nk, mu, nu)`` at ``P(None,None,'x','y')``, donated.  No full-k
-    Green exists.  CUDA: nvidia-mathdx mode 11 (LRX_VTX); cpu: the service's
+    ``(na*nb, nk, mu, nu)`` at ``P(None,None,'x','y')``, donated.  ``rows``
+    ``(x0, xr)``, when given, is a row pass: every device forms only its local
+    centroid rows ``[x0, x0 + xr)`` and ``acc`` is ``(na*nb, nk, p_x*xr, nu)``.
+    No full-k Green exists.  CUDA: nvidia-mathdx mode 11 (LRX_VTX); cpu: the service's
     reference composition.
     """
     from symmetry_maps import apply_unfold_load_tables_local, local_unfold_load_tables
@@ -2223,6 +2225,9 @@ def make_kconv_chi_vertex(mesh: Mesh, kgrid, tables, *, left_vertices, right_ver
     sign_host = (np.ones(nk) if sign_c is None else np.asarray(sign_c, dtype=np.float64).reshape(-1))
     if sign_host.shape != (nk,) or not np.all(np.abs(sign_host) == 1.0):
         raise ValueError("chi vertex: sign_c must be (nk,) of +-1")
+    x0, xr = (0, 0) if rows is None else (int(rows[0]), int(rows[1]))
+    if rows is not None and (x0 < 0 or xr < 1):
+        raise ValueError(f"chi vertex: row pass {rows} is not (x0 >= 0, xr >= 1)")
     si = ffi_fft_scale("ifftn", norm, nk)
     flat = lambda g: g.reshape(g.shape[0], g.shape[1] * ns, g.shape[3] * ns)
     if kconv_backend(mesh) == "mathdx":
@@ -2241,7 +2246,8 @@ def make_kconv_chi_vertex(mesh: Mesh, kgrid, tables, *, left_vertices, right_ver
                         si=np.float64(si), conj_trs=np.int64(2 if conj_src else 0),
                         scratch_bytes=np.int64(budget), signed_c=np.int64(signed),
                         perm_l=perm_l, phase_l=phase_l, perm_r=perm_r, phase_r=phase_r,
-                        na=np.int64(na), nb=np.int64(nb), **_mathdx_common())
+                        na=np.int64(na), nb=np.int64(nb), x0=np.int64(x0), xr=np.int64(xr),
+                        **_mathdx_common())
     else:
         _require_plan_route()
         ifft_local = make_local_kfft_klead(mesh, kg, kind="ifftn", norm=norm)
@@ -2260,6 +2266,8 @@ def make_kconv_chi_vertex(mesh: Mesh, kgrid, tables, *, left_vertices, right_ver
                 return ifft_local(O.reshape(nk, mx * ns, my * ns)).reshape(nk, mx, ns, my, ns)
             lower = unfolded(gv, gvt)
             upper = unfolded(gc, gct) * jnp.asarray(sign_host)[:, None, None, None, None]
+            if xr:
+                lower, upper = lower[:, x0:x0 + xr], upper[:, x0:x0 + xr]
             planes = []
             for i in range(na):
                 for j in range(nb):
@@ -2278,8 +2286,11 @@ def make_kconv_chi_vertex(mesh: Mesh, kgrid, tables, *, left_vertices, right_ver
         if Gv.ndim != 5 or int(Gv.shape[2]) != ns or int(Gv.shape[4]) != ns or Gc.shape != Gv.shape:
             raise ValueError(f"chi vertex expects Gv = Gc (n_parent, mu, {ns}, nu, {ns}); "
                              f"got {Gv.shape} / {Gc.shape}")
-        if tuple(acc.shape) != (n_ch, nk, int(Gv.shape[1]), int(Gv.shape[3])):
-            raise ValueError(f"chi vertex: acc {acc.shape} is not ({n_ch}, {nk}, mu, nu)")
+        mu = int(Gv.shape[1]) if not xr else int(mesh.shape["x"]) * xr
+        if x0 + xr > int(Gv.shape[1]) // int(mesh.shape["x"]):
+            raise ValueError(f"chi vertex: row pass ({x0}, {xr}) exceeds the local rows")
+        if tuple(acc.shape) != (n_ch, nk, mu, int(Gv.shape[3])):
+            raise ValueError(f"chi vertex: acc {acc.shape} is not ({n_ch}, {nk}, {mu}, nu)")
         if (Gvt is None) != (Gct is None):
             raise ValueError("chi vertex: pass both partners or neither")
         if Gvt is None:

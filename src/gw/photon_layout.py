@@ -939,24 +939,26 @@ def photon_carry_order(carry, families: PhotonFamilies, mesh_xy: Mesh, *, to_pac
     return jax.lax.fori_loop(0, carry.shape[0], member, out)
 
 
-def accumulate_photon_block(acc, rows, weights, layout, A, B, mesh_xy):
+def accumulate_photon_block(acc, rows, weights, layout, A, B, mesh_xy, x_rows=None):
     """``acc[o, :, A, B] += sum_s weights[s, o] rows[s]`` in ``layout``'s (A, B) block, in place.
 
     ``acc`` ``(n_out, q, N, N)`` at ``P(None,None,'x','y')``; ``rows``
     ``(n_s, q, c_A, c_B)`` at ``P(None,None,'x','y')``; ``weights``
     ``(n_s, n_out)`` replicated.  Each device adds its own tile of the block
     at the layout's local offsets (``ffi.contour``'s block form); pad rows and
-    columns are not touched.
+    columns are not touched.  ``x_rows = (x0, xr)``: ``rows`` holds only each
+    device's local block rows ``[x0, x0 + xr)`` (a row pass), ``(n_s, q, p*xr, c_B)``.
     """
     from common.shard_map import shard_map
     from ffi.contour import contour_block_accumulate_local
     side = layout.mesh_side
     wa, wb = layout.carrier_extent(A) // side, layout.carrier_extent(B) // side
     la, lb = layout.logical_extent(A), layout.logical_extent(B)
-    m0, n0 = layout.local_offset(A), layout.local_offset(B)
+    x0, xr = (0, wa) if x_rows is None else (int(x_rows[0]), int(x_rows[1]))
+    m0, n0 = layout.local_offset(A) + x0, layout.local_offset(B)
 
     def local(acc, rows, weights):
-        valid = jnp.stack((jnp.clip(la - jax.lax.axis_index('x') * wa, 0, wa),
+        valid = jnp.stack((jnp.clip(la - jax.lax.axis_index('x') * wa - x0, 0, xr),
                            jnp.clip(lb - jax.lax.axis_index('y') * wb, 0, wb))).astype(jnp.int32)
         return contour_block_accumulate_local(acc, rows, weights, valid, m0=m0, n0=n0)
     spec = P(None, None, 'x', 'y')
