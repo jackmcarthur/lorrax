@@ -91,6 +91,7 @@ def add_head_sigma_diag(
     head_sigma_diag_w_kn_ry: np.ndarray | None,
     *,
     band_axis=None,
+    donate_body: bool = False,
 ) -> jax.Array:
     """Add a band-diagonal dynamic q->0 head to a Sigma_c body cube.
 
@@ -101,6 +102,10 @@ def add_head_sigma_diag(
     head_sigma_diag_w_kn_ry
         Head-only diagonal with shape ``(n_omega, nk, nb)`` in Ry, or
         ``None`` when the ansatz has no separate head contribution.
+    donate_body
+        On the band-sharded layout, write the head into the body's buffer
+        and delete the body array.  Only a caller that reads the body no
+        further may pass True.
     """
     if head_sigma_diag_w_kn_ry is None:
         return sigma_c_body_omega
@@ -125,7 +130,8 @@ def add_head_sigma_diag(
 
     from .qsgw_utils import add_band_diag_sharded, is_band_sharded_sigma_omega
     if is_band_sharded_sigma_omega(sigma_c_body_omega):
-        return add_band_diag_sharded(sigma_c_body_omega, head)
+        return add_band_diag_sharded(
+            sigma_c_body_omega, head, donate=donate_body)
 
     n_w, nk, nb = head.shape
     dense = np.zeros((n_w, nk, nb, nb), dtype=np.complex128)

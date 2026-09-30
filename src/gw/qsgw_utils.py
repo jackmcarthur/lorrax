@@ -261,7 +261,7 @@ _EXTRACT_DIAG_KERNEL_CACHE: dict[int, object] = {}
 # Sharded-layout siblings (one per mesh): the diagonal-only extractor and
 # the band-diagonal adder used by the ``sigma_omega_layout=sharded`` path.
 _EXTRACT_DIAG_SHARDED_KERNEL_CACHE: dict[int, object] = {}
-_ADD_BAND_DIAG_KERNEL_CACHE: dict[int, object] = {}
+_ADD_BAND_DIAG_KERNEL_CACHE: dict[tuple[int, bool], object] = {}
 _SET_BAND_DIAG_KERNEL_CACHE: dict[int, object] = {}
 
 
@@ -317,7 +317,8 @@ def _extract_diag_sharded_kernel(mesh_xy: Mesh):
     return fn
 
 
-def add_band_diag_sharded(sigma_w_kij: jax.Array, diag_w_kn) -> jax.Array:
+def add_band_diag_sharded(sigma_w_kij: jax.Array, diag_w_kn, *,
+                          donate: bool = False) -> jax.Array:
     """``Σ += diag(d)`` on a P(None,None,'x','y')-sharded Σ_c — rank-local.
 
     The analytic q→0 head is band-diagonal; on the sharded layout it is
@@ -330,17 +331,23 @@ def add_band_diag_sharded(sigma_w_kij: jax.Array, diag_w_kn) -> jax.Array:
     ``diag_w_kn`` is host numpy (nω, nk, nb), bit-identical on every rank
     by construction (pure function of replicated inputs) — placed with
     ``device_put_process_local`` per the AA.1 rule.
+
+    ``donate=True`` hands ``sigma_w_kij``'s buffer to the result (the select
+    is elementwise, so XLA writes it in place) and deletes the input: the
+    caller must not read it again.  The Σ finalize uses this so the body
+    and the head-added cube are not both resident (Na 8^3 [-100,+150] eV:
+    2 x 14.12 GiB).
     """
     from common.collectives import device_put_process_local
 
     mesh_xy = sigma_w_kij.sharding.mesh
-    key = id(mesh_xy)
+    key = (id(mesh_xy), bool(donate))
     fn = _ADD_BAND_DIAG_KERNEL_CACHE.get(key)
     if fn is None:
         from functools import partial
         from common.shard_map import shard_map
 
-        @jax.jit
+        @partial(jax.jit, donate_argnums=(0,) if donate else ())
         @partial(shard_map, mesh=mesh_xy,
                  in_specs=(P(None, None, 'x', 'y'), P(None, None, None)),
                  out_specs=P(None, None, 'x', 'y'),

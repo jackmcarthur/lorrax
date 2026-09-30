@@ -514,6 +514,21 @@ def _compute_live_hartree(config, meta, band_slices, mesh_xy, *, wfn, sym,
 # Dynamic-Sigma finalization (shared by every frequency ansatz)
 # ---------------------------------------------------------------------------
 
+def _shares_buffer(cube, *others) -> bool:
+    """True when ``cube`` is absent or its first local shard's device buffer
+    is also one of ``others``' (a jit may forward an input unchanged)."""
+    if cube is None:
+        return True
+
+    def _ptr(a):
+        shards = getattr(a, "addressable_shards", None)
+        return shards[0].data.unsafe_buffer_pointer() if shards else None
+
+    mine = _ptr(cube)
+    return mine is None or any(
+        o is not None and (o is cube or _ptr(o) == mine) for o in others)
+
+
 def finalize_dynamic_sigma(
     sigma_c_body_omega: jax.Array,
     head_sigma_diag_w_kn_ry: np.ndarray | None,
@@ -582,10 +597,20 @@ def finalize_dynamic_sigma(
     with timing.section("sigma.finalize_input_wait"):
         jax.block_until_ready((sigma_c_body_omega, sigma_c_body_omega_unextrap,
                                sig_x, sig_h))
+    # The head add takes each body cube's buffer: nothing below reads a
+    # headless cube (the at-DFT read, sigma_omega write, QSGW build, raw
+    # columns and debug outputs all read the head-added one), so the body and
+    # the total are never both resident (Na 8^3 [-100,+150] eV: 14.12 GiB
+    # each).  A cube that shares a buffer with another input is not donated.
+    donate_body = not _shares_buffer(
+        sigma_c_body_omega, sigma_c_body_omega_unextrap, sigma_c_odd_body_omega)
+    donate_unextrap = not _shares_buffer(
+        sigma_c_body_omega_unextrap, sigma_c_body_omega, sigma_c_odd_body_omega)
     with timing.section("gw_jax.dynamic_sigma_finalize") as finalize_section:
         sigma_c_omega = add_head_sigma_diag(
             sigma_c_body_omega, head_sigma_diag_w_kn_ry,
-            band_axis=sigma_band_axis)
+            band_axis=sigma_band_axis, donate_body=donate_body)
+        del sigma_c_body_omega
 
         (sigma_c_at_dft_ev,
          omega_dft_rel_ev,
@@ -708,7 +733,7 @@ def finalize_dynamic_sigma(
         if sigma_c_body_omega_unextrap is not None:
             sigma_c_omega_unextrap = add_head_sigma_diag(
                 sigma_c_body_omega_unextrap, head_sigma_diag_w_kn_ry,
-                band_axis=sigma_band_axis)
+                band_axis=sigma_band_axis, donate_body=donate_unextrap)
             # The raw columns: the same diagonal gather and the same E_DFT
             # interpolation that ``eval_sigma_c_at_dft_energies`` applies to
             # the extrapolated cube, so an extrapolation-off run reproduces
