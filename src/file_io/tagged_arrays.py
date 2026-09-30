@@ -38,6 +38,8 @@ BAND_WINDOW_SCHEMA_VERSION = 2
 BAND_WINDOW_CARRIER_DATASET = "band_window_carrier"
 ZETA_FIT_WINDOWS_DATASET = "zeta_fit_windows"
 CHARGE_ZETA_IDENTITY_DATASET = "charge_zeta_identity"
+# Copy of the paired v_q_bispinor.h5 generation receipt (bispinor runs only).
+BISPINOR_V_RECEIPT_DATASET = "bispinor_v_receipt"
 SHARED_POLE_MEMBER_DATASET = "shared_pole_member"
 _SHARED_POLE_MEMBER_FIELDS = ("path", "schema", "digest", "iteration_id")
 
@@ -655,6 +657,7 @@ def write_restart_state_to_h5(
     qp_state_source_record: dict | None = None,
     charge_zeta_identity: dict | None = None,
     zeta_fit_windows=None,
+    bispinor_v_receipt: str | None = None,
 ):
     """Write (subset of) canonical restart state via SlabIO.
 
@@ -876,6 +879,10 @@ def write_restart_state_to_h5(
                 io.write_attr(
                     CHARGE_ZETA_IDENTITY_DATASET,
                     encoded_charge_zeta_identity)
+            if bispinor_v_receipt is not None:
+                io.write_attr(
+                    BISPINOR_V_RECEIPT_DATASET,
+                    np.asarray([bispinor_v_receipt], dtype="S"))
         # kgrid attr lets BSE recover the (nkx,nky,nkz) split from
         # flat-q V_qmunu / W0_qmunu without re-opening the WFN.  Stored
         # as a length-3 int64 dataset (the SlabIO ``write_attr`` path
