@@ -1,4 +1,4 @@
-"""The driver chain on the magnetic H2+ spinor fixture, at P4 on one node.
+"""The driver chain on the magnetic H2⁻ spinor fixture, at P4 on one node.
 
 Every stage is a production driver's entry point, called in sequence in one
 Python process on each of the four srun ranks (one GPU each, MPI world 4;
@@ -91,9 +91,11 @@ FAILURE_SIGNATURES = (
     "TIMED OUT",
 )
 
+# nval = 3: every occupied band of the H2⁻ fixture, which htransform requires
+# (it refuses a window that omits one) and every restarted stage must share.
 _DECK_COMMON = """[cohsex]
 centroids_file = {centroids}
-nval = 1
+nval = 3
 ncond = 2
 number_bands = 7
 sys_dim = 3
@@ -189,7 +191,10 @@ linalg = local
 
 
 def _bisp_deck(prefix, body):
+    # nval = 1: the fresh bispinor fit shares no restart window with the
+    # scalar stages, and three SC bands keep the stage wall.
     return (_DECK_COMMON.replace("bispinor = false\n", "")
+            .replace("nval = 3\n", "nval = 1\n")
             .replace("kin_ion_file = kin_ion.h5", "kin_ion_file = kin_ion_bisp.h5")
             + _BISP_COMMON + body + f"""\
 sigma_diag_file = {prefix}_sigma.dat
@@ -204,7 +209,7 @@ RESTART_DECKS.update({
     "bisp_sc.in": _bisp_deck("bsc", """restart = false
 qp_solver = self_consistent
 sc_max_iter = 2
-sc_tol_ev = 2.0
+sc_tol_ev = 3.0
 sc_head_update = dft_velocity
 density_self_consistent = true
 """),
@@ -212,7 +217,7 @@ density_self_consistent = true
 _P = ["--px", _SIDE, "--py", _SIDE]
 
 # The metal + semicore route on bcc Na (fixture_na/): the production
-# defaults the H2+ fixture cannot reach.  Fermi-Dirac occupations, the
+# defaults the H2⁻ fixture cannot reach.  Fermi-Dirac occupations, the
 # partition by number_bands_protected (2s and 2p lie below a 20 eV gap, so
 # they are the coarse class, read on held windows at eta_semi and pinned at
 # their DFT block by the default sc_semicore = dft), the rigid tail above the
@@ -259,17 +264,16 @@ _CLEAR_BEFORE = {"bisp_sc": ("tmp/mpa",)}
 STAGES = (
     ("kmeans", "centroid.kmeans_cli",
      ["6", "--seed", "42", "--force-shard", "--orbit", "--oversample", "1.5",
-      "--fit-window", "0:1,0:7", "--density-mode", "scalar"]),
+      "--fit-window", "0:3,0:7", "--density-mode", "scalar"]),
     ("kin_ion", "gw.kin_ion_io", ["-i", "gnppm.in"]),
     ("dipole", "psp.get_dipole_mtxels", ["-i", "gnppm.in"]),
     ("gnppm", "gw.gw_jax", ["-i", "gnppm.in"]),
-    # A regression check, not physics: the DFT gap is 48 meV between the
-    # exchange-split bonding states, far below the ~1 eV exciton binding of
-    # this unscreened one-electron molecule, so the TDA eigenvalues come out
-    # negative (-1.19, -0.81 eV).
+    # A regression check, not physics: the DFT gap is 72 meV, far below the
+    # ~1 eV exciton binding of this weakly screened molecule, so the TDA
+    # eigenvalues come out negative (-0.94, -0.78 eV).
     ("bse", "bse.bse_jax",
      ["-i", "gnppm.in", "--bse", "--lanczos", "--tda", "--solver", "davidson",
-      "--n-val", "1", "--n-cond", "2", "--n-occ", "1",
+      "--n-val", "1", "--n-cond", "2", "--n-occ", "3",
       "--band-degeneracy", "off", "--max-lanczos-iter", "40",
       "--n-eig", "2", "--block-size", "1", *_P,
       "--report-file", "bse.out"]),
@@ -294,7 +298,7 @@ STAGES = (
     # only; CT/TC/TT are not stored), on the four-component restart.
     ("bse_bisp", "bse.bse_jax",
      ["-i", "bisp_sc.in", "--bse", "--lanczos", "--tda", "--solver", "davidson",
-      "--n-val", "1", "--n-cond", "2", "--n-occ", "1",
+      "--n-val", "1", "--n-cond", "2", "--n-occ", "3",
       "--band-degeneracy", "off", "--max-lanczos-iter", "40",
       "--n-eig", "2", "--block-size", "1", *_P,
       "--report-file", "bse_bisp.out"]),
