@@ -194,20 +194,6 @@ def _shared_pole_contract(b_X, b_Y, weights, *, gemm, layout="face", intervals=N
     return value[:, :, 0, :, 0]
 
 
-@lru_cache(maxsize=None)
-def shared_pole_hole_kernel(mesh_xy):
-    """Compile the valence-branch W of an ordered (time-reversal-broken) store.
-
-    An ordered store keeps each parent's positive poles. The occupied branch
-    evolves R_-(q) = R_+(-q)^T, so its W at one tau is the complete full-q
-    W_+ gathered at -q on the replicated q axis and transposed in its endpoint
-    faces. No residue contraction is repeated; q = -q rows give W_+(q)^T.
-    """
-    from common.collectives import transpose_xy
-    return jax.jit(lambda w_full, minus_q: transpose_xy(w_full[minus_q], mesh_xy),
-                   out_shardings=NamedSharding(mesh_xy, P(None, "x", "y")))
-
-
 def _shared_pole_fixed_q_policy(header):
     """Resolve the policy from the store's authenticated TRS/grid metadata.
 
@@ -328,11 +314,12 @@ def _shared_pole_q_wedge(meta, header, *, mesh_xy):
     return wedge, loads
 
 
-def _shared_pole_full_q(meta, header, *, mesh_xy):
-    """``(W, Wt) -> W_+`` on the full q grid, for the W0 restart member only.
+def _shared_pole_at_rows(meta, header, rows, *, mesh_xy):
+    """``(W, Wt) -> W_+`` at the full-q rows ``rows`` only, for the W0 restart member.
 
-    The BSE restart stores ``W0 = V + Wc(0)`` on every q
-    (:func:`shared_pole_static_wc`); the Σ route never calls this.
+    The BSE restart stores ``W0 = V + Wc(0)`` on V's q parents
+    (:func:`shared_pole_static_wc`); the unfold tables are cut to ``rows``,
+    so no full-q W is formed.  The Σ route never calls this.
     """
     from common.shard_map import shard_map
     from symmetry_maps import unfold_operator_local
@@ -341,10 +328,14 @@ def _shared_pole_full_q(meta, header, *, mesh_xy):
     tables = _shared_pole_panel_tables(meta, header, (0, nq), mesh_xy=mesh_xy)
     _require_local_maps(tables["certificates"])
     cert = tables["certificates"]
+    rows = np.asarray(rows, np.int64).reshape(-1)
+    if not np.array_equal(tables["rows"], np.arange(tables["rows"].size)):
+        raise ValueError("GATE shared_pole_static_w: the whole parent span must "
+                         "cover every full q in order")
 
     def body(W, Wt):
         return unfold_operator_local(
-            W, irr_idx=tables["parent_rows"], sym_idx=tables["sym_rows"],
+            W, irr_idx=tables["parent_rows"][rows], sym_idx=tables["sym_rows"][rows],
             q_irr_frac=tables["q_frac"],
             left_local_perm=cert["x"]["local_perm"], left_L_table=tables["wraps"],
             right_local_perm=cert["y"]["local_perm"], right_L_table=tables["wraps"],
@@ -587,24 +578,26 @@ def _shared_pole_w_synthesis(io, meta, header, frequencies, schedule, *, mesh_xy
     return synthesis
 
 
-def shared_pole_static_wc(handle, meta, *, mesh_xy, layout="face"):
-    """Wc(q, omega = 0) of the current scalar shared-pole model, full q grid.
+def shared_pole_static_wc(handle, meta, *, mesh_xy, rows, layout="face"):
+    """Wc(q, omega = 0) of the current scalar shared-pole model at the full-q rows ``rows``.
 
     The static screened correction the restart stores for BSE
     (``W0_qmunu = V + Wc(0)``). It is evaluated by the Σ synthesis above —
     the same factor read, little-group realization and fixed-q projection
     on the parents — with :func:`_shared_pole_omega0_weights` in place of
     d(τ), so the store keeps one evaluator; the parent pair is then unfolded
-    to the full grid (:func:`_shared_pole_full_q`), because the restart
-    member is stored on every q. The two branches of the time-ordered W
+    at ``rows`` only (:func:`_shared_pole_at_rows`): the q parents of the
+    run's V wedge, which the restart stores (BSE unfolds on load), so no
+    full-q W is formed (TASTE 97). The two branches of the time-ordered W
     enter as the Σ consumer routes them: W_+(q) and, on an ordered store,
-    W_+(-q)^T (SP 5); a TRS store's valence branch is W_+ itself, which
-    gives ``-b Λ^-1 b†`` (docs/architecture/shared_pole_model.md §7).
+    W_+(-q)^T (SP 5), read at the rows -q; a TRS store's valence branch is
+    W_+ itself, which gives ``-b Λ^-1 b†``
+    (docs/architecture/shared_pole_model.md §7).
 
-    Returns ``(Q, m, m)`` complex128 at ``P(None,'x','y')`` in the run's
-    packed centroid order. Every array is an all-P tile. The synthesis
+    Returns ``(len(rows), m, m)`` complex128 at ``P(None,'x','y')`` in the
+    run's packed centroid order. Every array is an all-P tile. The synthesis
     admits its factors and panel workspace under ``w0.*`` ledger stages; the
-    two full-q outputs (W_+ and the sum) are one more reservation of 2U.
+    two outputs at ``rows`` (W_+ and the sum) are one more reservation of 2U.
 
     Validated (claim 2856, runs/CrI3/504_w0persist_20260926): on CrI3
     8x8x1 SOC (mu 1446, 10 IBZ q) ``V + Wc(0)`` matches the GN-PPM Dyson
@@ -627,8 +620,11 @@ def shared_pole_static_wc(handle, meta, *, mesh_xy, layout="face"):
                          f"got representation {header.get('representation')!r}")
     ordered = header["representation"] == "scalar-ordered-ph"
     Q, m = int(header["n_q_full"]), int(meta.mu_basis.n_packed)
+    rows = np.asarray(rows, np.int64).reshape(-1)
+    if rows.size == 0 or rows.min() < 0 or rows.max() >= Q:
+        raise ValueError(f"GATE shared_pole_static_w: rows must be full-q rows in [0, {Q})")
     ambient = capacity.live_stages
-    tile = -(-16 * Q * m * m // int(mesh_xy.size))
+    tile = -(-16 * rows.size * m * m // int(mesh_xy.size))
     capacity.reserve("w0.static_output", resident_bytes_per_rank=2 * tile,
                      workspace_bytes_per_rank=0, concurrent_with=ambient)
     capacity.live_stages = (*ambient, "w0.static_output")
@@ -645,16 +641,19 @@ def shared_pole_static_wc(handle, meta, *, mesh_xy, layout="face"):
                 reader, meta, header, None, schedule, mesh_xy=mesh_xy,
                 layout=schedule.get("factor_layout", layout),
                 weights_fn=_shared_pole_omega0_weights, stage="w0")
-        hole = shared_pole_hole_kernel(mesh_xy)
-        full_q = _shared_pole_full_q(meta, header, mesh_xy=mesh_xy)
+        from common.collectives import transpose_xy
+        plus_at = _shared_pole_at_rows(meta, header, rows, mesh_xy=mesh_xy)
+        # W_-(q) = W_+(-q)^T: W_+ at the rows -q, transposed in its endpoint faces.
+        minus_at = (_shared_pole_at_rows(meta, header, minus_q[rows], mesh_xy=mesh_xy)
+                    if ordered else None)
         face = NamedSharding(mesh_xy, P(None, "x", "y"))
 
         @partial(jax.jit, out_shardings=face)
         def static(factors, poles, intervals):
             W, Wt, _ = synthesis.w_kernel(factors, poles, intervals, (None, None),
                                           0.0, 0.0, False)
-            plus = full_q(W, Wt)
-            return plus + (hole(plus, jnp.asarray(minus_q)) if ordered else plus)
+            plus = plus_at(W, Wt)
+            return plus + (transpose_xy(minus_at(W, Wt), mesh_xy) if ordered else plus)
         wc = None
         try:
             wc = static(*synthesis.resident_operands(), intervals)

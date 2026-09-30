@@ -390,9 +390,9 @@ exchange, whatever the group order (large groups pay local work instead: Na 8³
 $W_p^{\mathsf T}$. Both local forms equal the exchanged transposes bit for bit
 (claim 2958). An exchange lets the
 off-diagonal ranks move their tiles while the diagonal ranks copy theirs and
-wait; that cost 26 % of a P16 node. The full-q unfold
-(`_shared_pole_full_q`) and transpose (`shared_pole_hole_kernel`) remain only
-for the static $W(0)$ restart member, which is stored on every q.
+wait; that cost 26 % of a P16 node. The static $W(0)$ restart member
+unfolds the parent pair only at V's q parents and at their $-q$ rows
+(`_shared_pole_at_rows`); no full-q W is formed.
 
 **Two-component decks.** $W$ is spin-scalar; $G$ carries the spinor axes and the
 τ kernel broadcasts $W_q$ over both (`ppm_tau_kernel` `prep_w`).
