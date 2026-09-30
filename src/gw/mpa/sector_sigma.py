@@ -153,24 +153,24 @@ def _w_tables(headers, bases, syms, mesh_xy):
 _W_PARENTS = {}
 
 
-def _w_parents(mesh_xy, plan, m, nc, n, nt, kcarrier, weights_fn):
+def _w_parents(mesh_xy, plan, m, nc, n, nt, kcarrier, weights_fn, panel_bytes):
     """``jit((b_x, b_y, poles, intervals, ref, time) -> (W, partner))`` on the irreducible q.
 
     The factors enter ``build_G_parents`` as the Green's faces do
     (``_shared_pole_contract``'s transpose-and-build, on the parent rows):
     components merged with their own centroid axis, the pole axis as the band
-    axis, ``d(t)`` as the phase row.  The partner is ``conj(B_A) d B_B^T`` at
-    the same d, from the same call when the q plan has antiunitary rows, else
-    from the conjugate faces.
+    axis, ``d(t)`` as the phase row.  The contraction is the face Green's
+    batched SUMMA (``distrib_la.panel_matmul``) with its two live pole panels
+    bounded by ``panel_bytes`` (the ledger's room; one W tile at most).  The
+    partner is ``conj(B_A) d B_B^T`` at the same d, from the conjugate faces.
     """
-    key = (mesh_xy, id(plan), m, nc, n, nt, kcarrier, weights_fn)
+    key = (mesh_xy, id(plan), m, nc, n, nt, kcarrier, weights_fn, int(panel_bytes))
     if key in _W_PARENTS:
         return _W_PARENTS[key][1]
-    from distrib_la import gemm_plan
+    from distrib_la import panel_matmul
     from gw.greens_function_kernel import build_G_parents
     nq = int(plan.n_parent)
-    gemm = gemm_plan(mesh_xy, m=m * nc, n=n * nt, k=kcarrier, nq=nq,
-                     dtype=np.complex128, layout='face')
+    gemm = partial(panel_matmul, mesh=mesh_xy, panel_bytes=int(panel_bytes))
     antiunitary = bool(np.any(np.asarray(plan.sym_idx) >= int(plan.n_sym_spatial)))
 
     @jax.jit
@@ -430,12 +430,17 @@ def sector_synthesis(readers, headers, bases, syms, layout, frequencies, meta, m
     same=readers[0] is readers[1] and headers[0] is headers[1]
     faces=16*nq*kcarrier*(m*nc+n*nt)//mesh_xy.size
     tile=16*nq*m*nc*n*nt//mesh_xy.size
-    native=_native_workspace(mesh_xy,(((nq,m*nc,kcarrier),(nq,kcarrier,n*nt)),))
+    from gw.greens_function_kernel import green_panel_bytes
+    native=0
+    # The W pair's pole panels (two live) take what the room leaves beside the
+    # faces and the pair, at most one W tile (green_panel_bytes).
+    panel=green_panel_bytes(n_rows=nq,m=m*nc,n=n*nt,mesh=mesh_xy,
+        room=capacity.room_bytes_per_rank(ambient)-faces-8*nq*kcarrier-2*tile)
     setup=f'{stage}.sector.resident.{tag}'
     # Resident: both parent faces and the parent poles.  The W pair (2 tiles)
     # is the window executable's, priced there with the Green.
     capacity.reserve(setup,resident_bytes_per_rank=faces+8*nq*kcarrier,
-        workspace_bytes_per_rank=2*tile+native,concurrent_with=ambient)
+        workspace_bytes_per_rank=2*tile+panel,concurrent_with=ambient)
     capacity.live_stages=(*ambient,setup)
     try:
         if same:
@@ -451,7 +456,7 @@ def sector_synthesis(readers, headers, bases, syms, layout, frequencies, meta, m
             b_x,b_y,poles=lhs[0],rhs[1],lhs[2]
         jax.block_until_ready((b_x,b_y,poles))
         del lhs
-        kernel=_w_parents(mesh_xy,w_plan,m,nc,n,nt,kcarrier,weights_fn or _shared_pole_weights)
+        kernel=_w_parents(mesh_xy,w_plan,m,nc,n,nt,kcarrier,weights_fn or _shared_pole_weights,panel)
     except BaseException:
         capacity.live_stages=ambient
         raise
