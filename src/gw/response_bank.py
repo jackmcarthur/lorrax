@@ -1490,12 +1490,15 @@ def produce_sample_bank(wfns, meta, config, *, mesh_xy, sym, sample_plan, bank_i
         receipt["group_check"] = dict(chunk=check.chunk, analytic=check.analytic,
             compiled=check.compiled_bytes, price=check.price, live=live, room=room,
             recompiled=check.recompiled, seconds=check.seconds)
+        stream_price = check.price
         del whole, check
         if selection is not None:
-            # Line samples per batched selection, beside the chosen group's carry.
+            # Line samples per batched selection, beside the chosen group's
+            # carry and within the stream's own price: the selection phase
+            # never raises the stage's peak above the stream's.
             line_chunk, selection_resident, selection_workspace, line_faces = line_selection_chunk(
                 rows, mesh=mesh_xy, ledger=ledger, nq=len(qids), execution=execution,
-                samples=p1-p0, carry=group_size*carry_per_sample, room=room)
+                samples=p1-p0, carry=group_size*carry_per_sample, room=min(room, stream_price))
             receipt["line_selection"].update(chunk=line_chunk, resident_bytes_per_rank=selection_resident,
                                               workspace_bytes_per_rank=selection_workspace,
                                               faces_bytes_per_rank=line_faces)

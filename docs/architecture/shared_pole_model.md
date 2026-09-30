@@ -480,5 +480,6 @@ line sample of a local chunk adds the same selection bytes and one more $n^2$
 per parent for the flattened stack, and every sample's $W$ and $\partial_sW$
 faces ($16\cdot 2N_q d^2/P$) are reserved from its solve until the chunk
 selects. The chunk is the most samples that fit beside the chosen group's
-carry (`line_selection_chunk`), chosen once per map; the face route keeps one
-sample per call.
+carry within the direct stream's compiled price (`line_selection_chunk`), so
+batching never raises the stage peak; it is chosen once per map, and the face
+route keeps one sample per call.

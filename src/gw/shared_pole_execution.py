@@ -128,10 +128,12 @@ def line_selection_chunk(rows, *, mesh, ledger, nq, execution, samples, carry, r
     """Line samples per batched selection: the most, up to ``samples``, whose price fits.
 
     Chosen once per map beside the sample group's ``carry`` (already in
-    hand, not yet reserved) with the same ledger and device ``room`` test as
-    the group size (``response_group_size``): every sample's held faces, the
-    selection and its eigh workspace. At least one, which is the price
-    ``line_selection_execution`` admitted. The face route keeps one sample
+    hand, not yet reserved) with the ledger test of the group size
+    (``response_group_size``) and within ``room``: every sample's held faces,
+    the selection and its eigh workspace. The producer passes the smaller of
+    the device room and the direct stream's compiled price, so batching never
+    raises the stage peak the stream already sets. At least one, which is
+    the price ``line_selection_execution`` admitted. The face route keeps one sample
     per call (its eigh is the whole-mesh plan's, not a rank-local stack).
     Returns ``(chunk, resident, workspace, faces)``, the prices at that chunk.
     """
