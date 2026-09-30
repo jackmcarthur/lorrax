@@ -336,7 +336,7 @@ def lorentz_class_vertices(keys):
 
 
 def make_lorentz_convolution(mesh_xy: Mesh, kgrid, nk_tot: int, keys, left_plan,
-                             right_plan=None, *, w_tables):
+                             right_plan=None, *, w_tables=None):
     """The four-current Σ door: ``fn(parent_green, W, Wt) -> Σ_k``, read from the raw parents.
 
         Σ_k = -1/√N_k · fftn( Σ_AB γ̃_A ifftn(Ĝ) γ̃_B† · ifftn(Ŵ)[:, x, A, y, B] )
@@ -351,7 +351,9 @@ def make_lorentz_convolution(mesh_xy: Mesh, kgrid, nk_tot: int, keys, left_plan,
     nvidia-mathdx mode 8 on CUDA), so no full-k Green, full-q W or full-grid
     W_R exists.  Σ_k leaves spin-major ``(n_parent, s, mu, s', nu)`` on the left
     plan's parent rows (``parent_full_rows``), the face projector's order;
-    the other full-k rows are never stored.
+    the other full-k rows are never stored.  Without ``w_tables`` the door is
+    ``fn(parent_green, V)`` with ``V`` ``(nk, mx, nA, my, nB)`` on the full q
+    grid (the static photon classes, ``gw.photon_sigma``).
     """
     from ffi import ffi_dial_key
     from common.fft_helpers import make_kconv_lorentz_unfold
@@ -364,14 +366,14 @@ def make_lorentz_convolution(mesh_xy: Mesh, kgrid, nk_tot: int, keys, left_plan,
         tables = left_plan.unfold_load_tables(
             right_plan=None if right is left_plan else right)
         door = make_kconv_lorentz_unfold(
-            mesh_xy, kgrid, tables, w_tables,
+            mesh_xy, kgrid, tables,
             left_vertices=[gamma_perm_phase_host(A) for A in lefts],
             right_vertices=[gamma_perm_phase_host(B) for B in rights],
             store_rows=left_plan.parent_full_rows,
-            norm='ortho', mult=-1.0 / np.sqrt(float(nk_tot)))
+            norm='ortho', mult=-1.0 / np.sqrt(float(nk_tot)), w_tables=w_tables)
 
-        def convolve(parent_green, W, Wt):
-            return door(parent_green.G, parent_green.transpose, W, Wt,
+        def convolve(parent_green, *interaction):
+            return door(parent_green.G, parent_green.transpose, *interaction,
                         conj_partner=parent_green.conj_partner)
         # The entry keeps both plans and the W tables alive, so their ids cannot be reused.
         _lorentz_convolution_cache[key] = (convolve, left_plan, right, w_tables)
