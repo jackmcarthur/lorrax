@@ -1287,7 +1287,7 @@ def main(argv=None):
 		report.bands((
 			f"Electrons      : {float(getattr(wfn, 'num_electrons', _nelec)):.5f}; "
 			f"occupied-band boundary = {_nelec}",
-			f"Matrix written : {band_range(0, nband_eff)}",
+			f"Matrix written : {band_range(0, head_nbands)}",
 			f"Deck valence   : {band_range(max(0, _nelec - nval), _nelec)}",
 			f"Deck conduction: {band_range(_nelec, min(nband_eff, _nelec + ncond))}",
 			f"Polarizability : {band_range(0, min(nband_eff, nband))}",
@@ -1350,8 +1350,9 @@ def main(argv=None):
 			return 0
 
 		# The eigenvalue each full-BZ k carries (its star parent's row).
-		# ΔE is derived from it on read (file_io.dipole).
-		band_energies = band_energies_on_full_bz(wfn, sym, nb)
+		# ΔE is derived from it on read (file_io.dipole).  dipole.h5 keeps
+		# the deck's own bands when the sweep runs on the PT outer set.
+		band_energies = band_energies_on_full_bz(wfn, sym, head_nbands)
 
 		def _print_debug_blocks(i, p_cart, vNL_cart):
 			"""Forensic 4x6 tables under the driver's one debug switch."""
@@ -1617,7 +1618,7 @@ def main(argv=None):
 				       "skip_vnl": bool(args.skip_vnl), "note": note,
 				       **dipole_provenance(
 				           wfn=wfn, wfn_path=str(wfn_path), nval=nval,
-				           ncond=ncond, nband=nband, nb_written=nb,
+				           ncond=ncond, nband=nband, nb_written=head_nbands,
 				           bispinor=bispinor, skip_vnl=bool(args.skip_vnl),
 				           vnl_mode=str(args.vnl_mode),
 				           vnl_velocity_sign=vnl_velocity_sign,
