@@ -192,6 +192,65 @@ def _w_parents(mesh_xy, plan, m, nc, n, nt, kcarrier, weights_fn):
     return kernel
 
 
+#: Test hook: force (True) or forbid (False) the spinor-quarter passes of the
+#: sector Sigma tau body (``None``: the ledger decides).
+_TEST_SIGMA_QUARTERS = None
+
+
+def _dirac_half_vertices(ids):
+    """``(halves, vertices)`` of one side's Lorentz vertices on the Dirac 2+2 split.
+
+    ``halves[h]`` is the Green spinor half that every vertex of the side reads
+    for output half ``h`` (gamma[a, perm[a]]: row ``a`` reads Green row
+    ``perm[a]``; a right vertex reads the column the same way), and
+    ``vertices[h]`` their ``(perm, phase)`` on that 2 x 2 block.  Refuses a
+    vertex set that is not block-monomial with one half map per side.
+    """
+    from common.gamma_matrices import gamma_perm_phase_host
+    halves, vertices = [], []
+    for h in (0, 1):
+        sources, verts = set(), []
+        for A in ids:
+            perm, phase = gamma_perm_phase_host(A)
+            src = {int(perm[2 * h]) // 2, int(perm[2 * h + 1]) // 2}
+            if len(src) != 1:
+                raise ValueError(f"GATE sigma_spinor_quarters: vertex {A} is not block-monomial on "
+                                 "the Dirac 2+2 split; the quarter passes need every vertex to map "
+                                 "one spinor half to one half")
+            c = src.pop()
+            sources.add(c)
+            verts.append((np.asarray(perm[2 * h:2 * h + 2]) - 2 * c, np.asarray(phase[2 * h:2 * h + 2])))
+        if len(sources) != 1:
+            raise ValueError(f"GATE sigma_spinor_quarters: the class vertices {tuple(ids)} read "
+                             f"different Green halves for output half {h}")
+        halves.append(sources.pop())
+        vertices.append(verts)
+    return halves, vertices
+
+
+_QUARTER_TABLES = {}
+
+
+def _quarter_tables(plans, c, d):
+    """The Green quarter (c, d)'s plan and load tables: the Pauli-half plan, sign p^(c+d).
+
+    The bispinor action is diag(U, pU) per full-k row
+    (``CentroidKUnfoldPlan.dirac_halves``), so a quarter transports with U on
+    both endpoints and the row sign p^(c+d), folded into the left phase.
+    """
+    key = (id(plans[0]), id(plans[1]), c, d)
+    hit = _QUARTER_TABLES.get(key)
+    if hit is None:
+        half, parity = plans[0].dirac_halves()
+        half_r, parity_r = (half, parity) if plans[1] is plans[0] else plans[1].dirac_halves()
+        if not np.array_equal(parity, parity_r):
+            raise ValueError("GATE sigma_spinor_quarters: the endpoint plans carry different parities")
+        tables = half.unfold_load_tables(right_plan=None if plans[1] is plans[0] else half_r)
+        sign = parity ** (c + d)
+        hit = _QUARTER_TABLES[key] = (plans, half, tables._replace(mph=tables.mph * sign[:, None]))
+    return hit[1], hit[2]
+
+
 def sector_tau_factory(left, right, keys, meta, mesh_xy):
     """Bind Gamma_A G_AB(t) Gamma_B to the window executor.
 
@@ -200,6 +259,12 @@ def sector_tau_factory(left, right, keys, meta, mesh_xy):
     four-current door (``gw.cohsex_sigma.make_lorentz_convolution``), which
     reads W(t) from its irreducible-q parent tile on the same load.  Only the
     small projected band operator survives the call.
+
+    When the ledger's room does not hold the Green pair and the door's output
+    in one pass (TASTE 96), the body runs four spinor-quarter passes: the
+    Dirac vertices are block-monomial on the 2+2 split, so each Sigma quarter
+    (a, b) reads one Green quarter, built alone from the halves of the faces
+    and transported by the Pauli-half tables.  One pass otherwise.
     """
     from distrib_la import gemm_plan, panel_matmul
     from common.contract_bands import contract_bands_block_reshard
@@ -236,22 +301,71 @@ def sector_tau_factory(left, right, keys, meta, mesh_xy):
                          dtype=jnp.complex128, layout=a.layout)
 
     def factory(synthesis, band_axis):
-        project = contract_bands_block_reshard(mesh_xy, layout=a.layout,
-            face_shape=shapes[0], right_face_shape=shapes[1],
-            face_band_extent=band_axis.padded)
         _, right_yr, _, right_proj, _, _ = parent_sigma_operands(right)
         right_proj = pad_to_axis(right_proj, band_axis, axis=3)
-        # One mode-8 door per branch: the particle and the hole tables of the class's W.
-        doors = {hole: make_lorentz_convolution(mesh_xy, meta.kgrid, meta.nk_tot, keys,
-                                                plans[0], plans[1], w_tables=tables)
-                 for hole, tables in ((False, synthesis.w_tables[0]), (True, synthesis.w_tables[1]))}
+        ns = int(shapes[0][3])
+        # One pass holds the Green, its partner and the door's output (each one
+        # parent Green tile) beside the W pair the synthesis stage holds.
+        tile = 16*q*m*n//mesh_xy.size
+        room = ledger.room_bytes_per_rank(ledger.live_stages) - warm - panel
+        quarters = (bool(_TEST_SIGMA_QUARTERS) if _TEST_SIGMA_QUARTERS is not None
+                    else ns == 4 and 3*tile > room)
+        if quarters and ns != 4:
+            raise ValueError("GATE sigma_spinor_quarters: quarter passes need four-spinor endpoints")
+        if not quarters:
+            project = contract_bands_block_reshard(mesh_xy, layout=a.layout,
+                face_shape=shapes[0], right_face_shape=shapes[1],
+                face_band_extent=band_axis.padded)
+            # One mode-8 door per branch: the particle and the hole tables of the class's W.
+            doors = {hole: make_lorentz_convolution(mesh_xy, meta.kgrid, meta.nk_tot, keys,
+                                                    plans[0], plans[1], w_tables=tables)
+                     for hole, tables in ((False, synthesis.w_tables[0]), (True, synthesis.w_tables[1]))}
 
-        def spatial(xn, yr, xr, yn, energies, weight, reference, time, interactions):
-            phases = _weighted_tau_phases(energies, 1j*time, e_ref=reference,
-                                         band_weight=weight)
-            green = build_G_parents(xn, yr, phases=phases, layout=a.layout,
-                                    gemm=gemm, k_unfold_plan=plans[0])
-            return project(xr, doors[interactions.hole](green, interactions.W, interactions.partner), yn)
+            def spatial(xn, yr, xr, yn, energies, weight, reference, time, interactions):
+                phases = _weighted_tau_phases(energies, 1j*time, e_ref=reference,
+                                             band_weight=weight)
+                green = build_G_parents(xn, yr, phases=phases, layout=a.layout,
+                                        gemm=gemm, k_unfold_plan=plans[0])
+                return project(xr, doors[interactions.hole](green, interactions.W, interactions.partner), yn)
+        else:
+            from common.fft_helpers import make_kconv_lorentz_unfold
+            from gw.cohsex_sigma import lorentz_class_vertices
+            lefts, rights = lorentz_class_vertices(keys)
+            (hl, vl), (hr, vr) = _dirac_half_vertices(lefts), _dirac_half_vertices(rights)
+            half_shapes = tuple((s[0], s[1], s[2], 2) for s in shapes)
+            project = contract_bands_block_reshard(mesh_xy, layout=a.layout,
+                face_shape=half_shapes[0], right_face_shape=half_shapes[1],
+                face_band_extent=band_axis.padded)
+            gemm_q = gemm if face_green else gemm_plan(mesh_xy, m=m//2, k=k, n=n//2, nq=q,
+                                                       dtype=jnp.complex128, layout=a.layout)
+            passes = []
+            for qa in (0, 1):
+                for qb in (0, 1):
+                    c, d = hl[qa], hr[qb]
+                    half, tables = _quarter_tables(plans, c, d)
+                    doors = {hole: make_kconv_lorentz_unfold(
+                        mesh_xy, meta.kgrid, tables, left_vertices=vl[qa], right_vertices=vr[qb],
+                        store_rows=plans[0].parent_full_rows, norm='ortho',
+                        mult=-1.0/np.sqrt(float(meta.nk_tot)), w_tables=w)
+                        for hole, w in ((False, synthesis.w_tables[0]), (True, synthesis.w_tables[1]))}
+                    passes.append((qa, qb, c, d, half, doors))
+
+            def spatial(xn, yr, xr, yn, energies, weight, reference, time, interactions):
+                phases = _weighted_tau_phases(energies, 1j*time, e_ref=reference,
+                                             band_weight=weight)
+                W, Wt = interactions.W, interactions.partner
+                total = None
+                for i, (qa, qb, c, d, half, doors) in enumerate(passes):
+                    green = build_G_parents(xn[:, 2*c:2*c+2], yr[:, :, 2*d:2*d+2], phases=phases,
+                                            layout=a.layout, gemm=gemm_q, k_unfold_plan=half)
+                    sigma = doors[interactions.hole](green.G, green.transpose, W, Wt,
+                                                     conj_partner=green.conj_partner)
+                    value = project(xr[:, :, 2*qa:2*qa+2], sigma, yn[:, 2*qb:2*qb+2])
+                    total = value if total is None else total + value
+                    if i + 1 < len(passes):
+                        # Pass i+1's Green waits for pass i's Sigma: one quarter live at a time.
+                        total, W, Wt, xn, yr = jax.lax.optimization_barrier((total, W, Wt, xn, yr))
+                return total
 
         b=band_axis.padded
         projector_shapes=(((q,b,m),(q,m,n)),((q,b,n),(q,n,b)))
@@ -262,7 +376,7 @@ def sector_tau_factory(left, right, keys, meta, mesh_xy):
         # identities are stable.
         key=(mesh_xy,a.layout,shapes,int(b),tuple(keys),tuple(int(v) for v in meta.kgrid),
              int(meta.nk_tot),id(plans[0]),id(plans[1]),
-             id(synthesis.w_tables[0]),id(synthesis.w_tables[1]))
+             id(synthesis.w_tables[0]),id(synthesis.w_tables[1]),quarters)
         return SynthesisTau(spatial, synthesis, right_yr, right_proj,
                          native+synthesis.native, f'sigma.sector.tau.{keys[0]}', meta, key,
                          (*plans, *synthesis.w_tables))
