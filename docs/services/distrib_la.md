@@ -202,8 +202,11 @@ Cholesky factors and LU solutions return at `P(None,'x','y')`. Nothing crosses
 the host.
 
 * **Ragged batches** are zero-padded before the first exchange. Synthetic
-  local slots never enter a dense kernel (scalar `fori_loop` + `lax.cond` on
-  the global q index) and are dropped after the inverse.
+  local slots never enter a Cholesky or LU (scalar `fori_loop` + `lax.cond` on
+  the global q index) and are dropped after the inverse. Eigh solves each
+  rank's whole local stack in one batched call; a synthetic slot enters as an
+  exact zero matrix and returns zeros. It costs no wall time, because rank 0
+  always holds a full stack of real rows.
 * **Matrix faces are not padded:** `N % Px == N % Py == 0`, and LU RHS columns
   `NRHS % Py == 0`. Shape, rank, dtype and extent violations refuse before
   placement or any collective. Pad the matrix yourself and slice afterwards.

@@ -601,7 +601,7 @@ def response_dense_workspace(mesh_xy, n, batch, layout, *, with_eigh):
         backend="off" if layout == "local" else "distributed",
         batched_route=resolution.batched_route)
     gemm = workspace_bytes_per_rank(policy,"gemm",((batch,n,n),(batch,n,n)),np.complex128)
-    eig = workspace_bytes_per_rank(policy,"eigh",((1,n,n),),np.complex128) if with_eigh else 0
+    eig = workspace_bytes_per_rank(policy,"eigh",((batch,n,n),),np.complex128) if with_eigh else 0
     return dict(gemm=gemm,eigh=eig,total=gemm+eig,scope="actual-shape ISERV query; GEMM persistent plus concurrent eigh scratch")
 
 

@@ -471,6 +471,6 @@ against 77 with dense line samples. The producer's selection adds, beside one
 group's carry, the endpoint blocks of $W$ and $\partial_sW$ and the
 $n\times n$ normal matrix $W^\dagger W$ with its eigenvectors, $n$ the largest
 family's rows (`line_selection_price`). On the local route that is
-$16\,(2\lceil N_q/P\rceil d^2 + 2n^2)$ B per rank, one parent at a time; on
-the face route $16\,(2N_q d^2 + 2N_q n^2)/P$, every parent of the stack at
-once. The eigh service's workspace comes on top.
+$16\cdot 2\lceil N_q/P\rceil (d^2 + n^2)$ B per rank, the rank's parents in one
+batched eigh; on the face route $16\,(2N_q d^2 + 2N_q n^2)/P$, every parent
+of the stack at once. The eigh service's workspace comes on top.

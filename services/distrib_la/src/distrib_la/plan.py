@@ -591,7 +591,7 @@ class Plan:
         if (self.op == "eigh" and _route is None and not isinstance(A, jax.core.Tracer)
                 and _is_batch_layout(A, self.mesh)):
             # Whole matrices already live on their ranks: only the local kernel can
-            # serve them, whatever the plan's route (no movement, one at a time).
+            # serve them, whatever the plan's route (no movement, one batched solve).
             from distrib_la._batch_reshard import batch_layout_eigh_call
             return batch_layout_eigh_call("eigh", self.mesh, A)
         route = self.route_for(A.shape, A.dtype) if _route is None else _route

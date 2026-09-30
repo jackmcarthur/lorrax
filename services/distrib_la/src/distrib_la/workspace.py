@@ -85,10 +85,12 @@ def _workspace_details(plan, op, shapes, dtype):
         device, host = _vendor_query(ctx, op, (n,), dtype.str)
         # Local kernels need an info integer in addition to vendor work.
         # Mp info is persistent context state, not per-operation scratch.
-        # A native auto route can execute a whole batch; reserve one
-        # vendor workspace/info per member rather than assume serial reuse.
-        copies = (shapes[0][0] if local and len(shapes[0]) == 3
-                  and plan.route_for(shapes[0], dtype) != ROUTE_BATCH_RESHARD else 1)
+        # A native auto route executes the whole batch, and route (c) its
+        # ceil(b/P) local rows, in one batched call; reserve one vendor
+        # workspace/info per member rather than assume serial reuse.
+        batch = int(shapes[0][0]) if local and len(shapes[0]) == 3 else 1
+        copies = (-(-batch // (px * py))
+                  if plan.route_for(shapes[0], dtype) == ROUTE_BATCH_RESHARD else batch)
         scratch = copies*(device + (4 if local else 0))
         return dict(device_bytes=scratch, host_bytes=host,
                     vendor_device_bytes=device if local else None,
@@ -180,17 +182,19 @@ def _local_kernel_workspace(mesh, op, shapes, dtype):
     LAPACK ``?heevd``/``?syevd`` optimal workspace, which is a closed formula
     (complex: lwork = 2n + n^2, lrwork = 1 + 5n + 2n^2, liwork = 3 + 5n; real:
     lwork = 1 + 6n + 2n^2, liwork = 3 + 5n). gemm: the compiled local batched
-    matmul temporary. One kernel at a time: route (c) solves its local rows in
-    turn when the batch is padded and a batch-layout operand always does.
+    matmul temporary. Route (c) solves a rank's local rows (the leading
+    extent of the first shape) in one batched eigh, so eigh reserves one
+    workspace per local row.
     """
     import jax
     if op == 'eigh':
         n = max(s[-1] for s in shapes)
+        rows = int(shapes[0][0]) if len(shapes[0]) == 3 else 1
         if any(d.platform == 'gpu' for d in mesh.devices.flat):
-            return _vendor_query(0, 'eigh', (n,), dtype.str)[0] + 4
+            return rows * (_vendor_query(0, 'eigh', (n,), dtype.str)[0] + 4)
         if dtype.kind == 'c':
-            return 16 * (2*n + n*n) + 8 * (1 + 5*n + 2*n*n) + 4 * (3 + 5*n)
-        return 8 * (1 + 6*n + 2*n*n) + 4 * (3 + 5*n)
+            return rows * (16 * (2*n + n*n) + 8 * (1 + 5*n + 2*n*n) + 4 * (3 + 5*n))
+        return rows * (8 * (1 + 6*n + 2*n*n) + 4 * (3 + 5*n))
     if op in ('gemm', 'matmul'):
         return _local_gemm_temp(tuple(shapes[:2]), dtype.str, jax.local_devices()[0])
     raise ValueError('fits_local op must be eigh or gemm')

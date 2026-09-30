@@ -78,9 +78,9 @@ def line_selection_price(rows, *, mesh, nq, execution):
     endpoint block of W and of dW/ds (16 * 2 * sum_fg n_f n_g per parent;
     whole parents per rank, ceil(nq/P) of them, on the local route; tiles on
     the face) and the largest family's n x n normal matrix W^H W with its
-    eigenvectors (one parent at a time on the local route, every parent of
-    the stack on the face), plus the service's native eigh workspace. The panels are narrow and ride in the
-    same bound.
+    eigenvectors for every parent of the stack (the local route solves its
+    ceil(nq/P) parents in one batched eigh), plus the service's eigh
+    workspace. The panels are narrow and ride in the same bound.
     """
     import math
     import distrib_la
@@ -90,8 +90,8 @@ def line_selection_price(rows, *, mesh, nq, execution):
     largest = max(int(r) for r in rows)
     plan = constructor_eigenplan(mesh, largest, execution)
     if execution == 'local':
-        resident = 16 * (2 * math.ceil(int(nq) / ranks) * blocks + 2 * largest ** 2)
-        workspace = distrib_la.workspace_bytes_per_rank(plan, "eigh", ((1, largest, largest),), np.complex128)
+        resident = 16 * 2 * math.ceil(int(nq) / ranks) * (blocks + largest ** 2)
+        workspace = distrib_la.workspace_bytes_per_rank(plan, "eigh", ((int(nq), largest, largest),), np.complex128)
     else:
         # The whole-mesh kernel forms G = W^H W and its vectors for every
         # parent of the stack at once: 2 nq largest^2 tiles.
