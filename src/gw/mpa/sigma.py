@@ -1263,16 +1263,20 @@ def _integrate_sigma_batches(
         spatial_shape = (
             int(k_unfold_plan.n_parent), sigma_axis.carrier, sigma_axis.carrier)
         face_kwargs["face_band_extent"] = sigma_axis.carrier
+        shape = (omega.size, *spatial_shape)
+        output_sharding = NamedSharding(mesh_xy, P(None, None, "x", "y"))
+        reduce = None
         if bracketed:
-            shape = (len(brackets), omega.size, *spatial_shape)
-            output_sharding = NamedSharding(
-                mesh_xy, P(None, None, None, "x", "y"))
-        else:
-            shape = (omega.size, *spatial_shape)
-            output_sharding = NamedSharding(mesh_xy, P(None, None, "x", "y"))
+            # The sweep folds only what the band counts keep: the matrix of
+            # the first and the last count and the diagonals between.
+            reduce = _band_count_reduce(mesh_xy, len(brackets))
+            n_between = max(len(brackets) - 2, 0)
+            shape = ((shape,) * (len(brackets) - n_between),
+                     ((omega.size, spatial_shape[0], sigma_axis.carrier,
+                       int(mesh_xy.shape["y"])),) * n_between)
         accumulator = DeviceOmegaAccumulator(
-            omega, shape=shape, sharding=output_sharding,
-            omega_axis=1 if bracketed else 0)
+            omega, shape=shape, sharding=output_sharding, omega_axis=0,
+            reduce=reduce)
         kgrid = (int(meta.nkx), int(meta.nky), int(meta.nkz))
 
         if tau_kernel_factory is not None:
@@ -1435,13 +1439,16 @@ def _integrate_sigma_batches(
     with timing.section('tau.finalize'):
         sigma = accumulator.finalize()
         if bracketed:
-            # Cumulate on the wedge; each count is unfolded when it is read.
+            # The counts stay on the wedge; each is unfolded when it is read.
+            matrices, diagonals = sigma
+            sym = k_unfold_plan.sym
+            full = _wedge_is_full_bz(sym)
             sigma = BandCountCube(
-                wedge=_bracket_cumsum_fn(output_sharding)(sigma),
-                unfold=_band_count_point_fn(
-                    k_unfold_plan.sym,
-                    NamedSharding(mesh_xy, P(None, None, "x", "y"))),
-                nk=int(k_unfold_plan.sym.nk_tot))
+                matrices=matrices, diagonals=diagonals,
+                unfold=((lambda value: value) if full else
+                        _unfold_sigma_cube_fn(sym, 1, output_sharding)),
+                unfold_diagonal=_band_count_diagonal_fn(sym, mesh_xy),
+                nk=int(sym.nk_tot), fresh=not full)
             if band_counts is None:
                 band_counts = tuple(
                     int(s.nb_sigma_sum) if hi is None else int(hi)
@@ -1504,20 +1511,65 @@ def _unfold_sigma_cube_fn(sym, k_axis, sharding):
         out_shardings=sharding)
 
 
-@lru_cache(maxsize=8)
-def _band_count_point_fn(sym, sharding):
-    """``(wedge, i) -> count i`` on the full BZ: :attr:`BandCountCube.unfold`."""
-    unfold = _unfold_sigma_cube_fn(sym, 1, sharding)
-    return jax.jit(lambda wedge, i: unfold(
-        jax.lax.dynamic_index_in_dim(wedge, i, 0, keepdims=False)),
-        out_shardings=sharding)
+def _wedge_is_full_bz(sym) -> bool:
+    """The FILE wedge is the full BZ in its own order (a WFN without symmetry)."""
+    from symmetry_maps import star_tables_of
+    irr, sidx, n_spatial = star_tables_of(sym)
+    return (int(sym.nk_red) == irr.size
+            and np.array_equal(irr, np.arange(irr.size))
+            and not np.any(np.asarray(sidx) >= int(n_spatial)))
 
 
 @lru_cache(maxsize=8)
-def _bracket_cumsum_fn(sharding):
-    """Cumulative band-count sum over the leading bracket axis."""
-    return jax.jit(lambda values: jnp.cumsum(values, axis=0),
-                   out_shardings=sharding)
+def _band_count_reduce(mesh_xy, n_brackets):
+    """``sigma(t)`` on the disjoint brackets -> what the band counts keep.
+
+    ``(matrices, diagonals)``: the cumulative matrix at the first and at the
+    last count, and the band diagonal of each count between them.  A diagonal
+    stays on the band tiles that own it, ``(k, nb, p_y)`` at
+    ``P(None, 'x', 'y')`` with one nonzero slot per band, so the fold is
+    rank-local.
+    """
+    from common.shard_map import shard_map
+    if n_brackets > 2 and int(mesh_xy.shape["x"]) != int(mesh_xy.shape["y"]):
+        raise ValueError(
+            "MPA Sigma band-count diagonals need a square processor mesh")
+
+    def slots(tile):
+        own = jax.lax.axis_index("x") == jax.lax.axis_index("y")
+        diag = jnp.diagonal(tile, axis1=-2, axis2=-1)
+        return jnp.where(own, diag, jnp.zeros((), tile.dtype))[..., None]
+
+    diag_slots = shard_map(
+        slots, mesh=mesh_xy, in_specs=P(None, "x", "y"),
+        out_specs=P(None, "x", "y"), check_vma=False)
+
+    def reduce(sigma):
+        running = sigma[0]
+        matrices, diagonals = [running], []
+        for b in range(1, n_brackets):
+            running = running + sigma[b]
+            if b < n_brackets - 1:
+                diagonals.append(diag_slots(running))
+        if n_brackets > 1:
+            matrices.append(running)
+        return tuple(matrices), tuple(diagonals)
+
+    return reduce
+
+
+@lru_cache(maxsize=8)
+def _band_count_diagonal_fn(sym, mesh_xy):
+    """Wedge diagonal slots -> a full-BZ cube holding only that diagonal."""
+    from common.shard_map import shard_map
+    from symmetry_maps import star_tables_of
+    rows = np.asarray(star_tables_of(sym)[0], dtype=np.int32)
+    embed = shard_map(
+        lambda tile: tile * jnp.eye(tile.shape[2], dtype=tile.dtype),
+        mesh=mesh_xy, in_specs=P(None, None, "x", "y"),
+        out_specs=P(None, None, "x", "y"), check_vma=False)
+    return jax.jit(lambda slots: embed(slots[:, jnp.asarray(rows)]),
+                   out_shardings=NamedSharding(mesh_xy, P(None, None, "x", "y")))
 
 
 def _attach_ordered_odd_sigma(total, even):
@@ -1659,9 +1711,10 @@ def integrate_sigma_store(
 
     ``brackets`` optionally partitions the intermediate-state band sum into
     disjoint slices.  The spatial kernel then returns a leading bracket axis;
-    this executor inserts omega behind it, cumulatively sums the brackets on
-    the FILE wedge and returns a ``BandCountCube``, which unfolds one count
-    at a time.  ``None`` preserves the ordinary MPA rank-4 result.
+    this executor folds the cumulative first and last counts and the
+    diagonals between (``_band_count_reduce``) on the FILE wedge and returns
+    a ``BandCountCube``, which unfolds one count at a time.  ``None``
+    preserves the ordinary MPA rank-4 result.
 
     ``tau_kernel_factory`` replaces the resident pole route's τ body (the
     plane-wave path's ``get_shared_sigma_tau_kernel(_sigma_kij=...)``); see

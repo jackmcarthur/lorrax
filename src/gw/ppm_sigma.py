@@ -105,45 +105,65 @@ def _residue_for_space(space: str, B_q, B_odd_q=None):
 
 @dataclass(frozen=True)
 class BandCountCube:
-    """The cumulative band-count points of Sigma_c(omega), unfolded one at a time.
+    """The cumulative band-count points of Sigma_c(omega), served one at a time.
 
-    ``wedge`` is ``(n_count, n_omega, n_wedge_k, nb, nb)`` on the FILE wedge,
-    cumulative over the band brackets.  :meth:`point` returns one count on the
-    full BZ, ``(n_omega, nk, nb, nb)`` at ``P(None, None, 'x', 'y')``, in a
-    fresh buffer.  The ``(n_count, n_omega, nk, nb, nb)`` cube is never made
-    (Na 8^3 at 1001 omega: 42.4 GiB per rank in one allocation at P4).  The
-    band extrapolation reads each point's band diagonal and drops it, and its
-    matrix combines N1 and N3 only: N2 carries weight zero
-    (``SpectralShellFit.weights``).  The unfold is a row gather and a
-    transpose, so it commutes with the cumulative sum bit for bit.
+    The sweep keeps, on the FILE wedge, the matrix of the first and of the
+    last count (``matrices``, each ``(n_omega, n_wedge_k, nb, nb)``) and the
+    band diagonal of every count between them (``diagonals``).  That is what
+    the band extrapolation reads: the fit takes the diagonal of every count,
+    and its matrix combines N1 and N3 only, N2 carrying weight zero
+    (``SpectralShellFit.weights``).  :meth:`point` returns one count on the
+    full BZ, ``(n_omega, nk, nb, nb)`` at ``P(None, None, 'x', 'y')``; a
+    middle count comes back with only its diagonal filled.  The
+    ``(n_count, n_omega, nk, nb, nb)`` cube is never made (Na 8^3 at 1001
+    omega: 42.4 GiB per rank in one allocation at P4).
+
+    ``fresh``: the unfold returns a new buffer.  Where the wedge is the full
+    BZ it is false and a matrix point IS the stored array, so the two cubes
+    of the sweep are the two the extrapolation returns.
     """
-    wedge: jax.Array
-    #: ``(wedge, i) -> point i`` on the full BZ (the executor's unfold).
+    matrices: tuple
+    diagonals: tuple
+    #: wedge matrix -> full BZ; wedge diagonal -> full-BZ cube holding it.
     unfold: Callable
+    unfold_diagonal: Callable
     nk: int
+    fresh: bool
     #: ``(nk, nb, nb)``, added to every point: the PPM static-limit term.
     term: jax.Array | None = None
 
     @property
     def shape(self):
-        n_count, n_omega, _, nb_i, nb_j = self.wedge.shape
-        return (n_count, n_omega, int(self.nk), nb_i, nb_j)
+        n_omega, _, nb_i, nb_j = self.matrices[0].shape
+        return (len(self.matrices) + len(self.diagonals), n_omega,
+                int(self.nk), nb_i, nb_j)
+
+    def diagonal_only(self, i: int) -> bool:
+        return 0 < int(i) < self.shape[0] - 1
 
     def point(self, i: int):
-        value = self.unfold(self.wedge, jnp.asarray(i, dtype=jnp.int32))
+        if self.diagonal_only(i):
+            value, fresh = self.unfold_diagonal(self.diagonals[int(i) - 1]), True
+        else:
+            value = self.unfold(self.matrices[0 if int(i) == 0 else -1])
+            fresh = self.fresh
         if self.term is None:
             return value
-        return _add_static_term_fn(value.sharding)(value, self.term)
+        return _add_static_term_fn(value.sharding, fresh)(value, self.term)
 
     def block_until_ready(self):
-        self.wedge.block_until_ready()
+        jax.block_until_ready((self.matrices, self.diagonals))
         return self
 
     def __sub__(self, other):
         if self.term is not None or other.term is not None:
             raise ValueError(
                 "BandCountCube: a difference is taken before the static term")
-        return replace(self, wedge=self.wedge - other.wedge)
+        return replace(
+            self,
+            matrices=tuple(a - b for a, b in zip(self.matrices, other.matrices)),
+            diagonals=tuple(
+                a - b for a, b in zip(self.diagonals, other.diagonals)))
 
 
 @dataclass(frozen=True)
@@ -883,10 +903,11 @@ def _add_static_ppm_term(
 
 
 @lru_cache(maxsize=8)
-def _add_static_term_fn(sharding):
-    """``sigma + term`` broadcast over omega, in the point's own buffer."""
+def _add_static_term_fn(sharding, donate):
+    """``sigma + term`` broadcast over omega; ``donate``: in the point's buffer."""
     return jax.jit(lambda sigma, term: sigma + term[None, ...],
-                   out_shardings=sharding, donate_argnums=(0,))
+                   out_shardings=sharding,
+                   donate_argnums=(0,) if donate else ())
 
 
 def compute_sigma_c_ppm_omega_grid(

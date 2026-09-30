@@ -42,13 +42,14 @@ nearest degeneracy-clean boundary (`band_extrapolation_bracket_scheme`).
 What each sum is read for decides what is stored. The fit reads the band
 diagonal of all three. The extrapolated matrix combines S(N₁) and S(N₃)
 (weights −r and 1 + r, below); S(N₂) has weight zero and only its diagonal is
-read. The sweep therefore keeps the three sums on the k wedge of the WFN file
-and unfolds one to the full BZ at a time (`gw.ppm_sigma.BandCountCube`). The
-fit reads a sum's diagonal and drops it. The extrapolated matrix is written
-into the buffer of S(N₁), beside S(N₃), which the run keeps as the raw twin.
-Two full-BZ Σ(ω) cubes are resident, the two the stage returns; the
-three-sum full-BZ cube is never made. Without symmetry the wedge is the full
-BZ and the sweep still accumulates three cubes.
+read. The Σ sweep therefore folds, at every τ node, the matrices S(N₁) and
+S(N₃) and the band diagonal of S(N₂), on the k wedge of the WFN file, and
+unfolds one sum to the full BZ when it is read (`gw.ppm_sigma.BandCountCube`).
+The extrapolated matrix is written into the buffer of S(N₁), beside S(N₃),
+which the run keeps as the raw twin. Two Σ(ω) cubes and one diagonal are
+stored, with or without symmetry; the three-sum cube is never made. S(N₃) is
+summed per τ node, so it differs from the sum of the three separately
+integrated brackets at round-off.
 
 ## The model
 

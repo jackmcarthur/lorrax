@@ -49,7 +49,8 @@ _WINDOW_COMPILED = {}
 
 
 @lru_cache(maxsize=16)
-def _device_window_runner(tau_kernel, sharding, omega_axis, antihermitian):
+def _device_window_runner(tau_kernel, sharding, omega_axis, antihermitian,
+                          reduce=None):
     """ONE executable for a whole quadrature window: loop the time nodes on device.
 
     ``coeff`` is ``(capacity, n_omega)`` over the COMPLETE output frequency
@@ -58,19 +59,43 @@ def _device_window_runner(tau_kernel, sharding, omega_axis, antihermitian):
     and one compile.  The node loop runs ``n_active`` iterations; nothing
     returns to the host between nodes.  An anti-Hermitian window sums its
     one-sided ``Z`` first and adds ``(Z - Z†)/(2i)`` once.
+
+    ``reduce`` maps each ``sigma(t)`` to ``(matrices, diagonals)``, two tuples
+    of arrays, before the fold; ``total`` has that structure, so only what is
+    folded is stored at every frequency.  A diagonal's dagger is its
+    conjugate.
     """
+    def pinned(tree):
+        return jax.tree.map(
+            lambda a: jax.lax.with_sharding_constraint(a, sharding), tree)
+
     def run(total, tau_arguments, t_nodes, coeff, n_active, active_count):
         def one(i, acc):
             sigma = tau_kernel(*tau_arguments, t_nodes[i], active_count)
-            return _omega_fold(acc, sigma, coeff[i], omega_axis)
+            if reduce is None:
+                return _omega_fold(acc, sigma, coeff[i], omega_axis)
+            return jax.tree.map(
+                lambda a, part: _omega_fold(a, part, coeff[i], omega_axis),
+                acc, reduce(sigma))
 
         if not antihermitian:
-            return jax.lax.fori_loop(0, n_active, one, total)
-        Z = jax.lax.with_sharding_constraint(jnp.zeros_like(total), sharding)
-        Z = jax.lax.fori_loop(0, n_active, one, Z)
-        return total + (Z - jnp.conj(jnp.swapaxes(Z, -1, -2))) / 2j
+            out = jax.lax.fori_loop(0, n_active, one, total)
+            return out if reduce is None else pinned(out)
+        if reduce is None:
+            Z = jax.lax.with_sharding_constraint(jnp.zeros_like(total), sharding)
+            Z = jax.lax.fori_loop(0, n_active, one, Z)
+            return total + (Z - jnp.conj(jnp.swapaxes(Z, -1, -2))) / 2j
+        matrices, diagonals = jax.lax.fori_loop(
+            0, n_active, one, pinned(jax.tree.map(jnp.zeros_like, total)))
+        return pinned((
+            tuple(a + (z - jnp.conj(jnp.swapaxes(z, -1, -2))) / 2j
+                  for a, z in zip(total[0], matrices)),
+            tuple(a + (z - jnp.conj(z)) / 2j
+                  for a, z in zip(total[1], diagonals))))
 
-    return jax.jit(run, donate_argnums=(0,), out_shardings=sharding)
+    if reduce is None:
+        return jax.jit(run, donate_argnums=(0,), out_shardings=sharding)
+    return jax.jit(run, donate_argnums=(0,))
 
 
 class DeviceOmegaAccumulator:
@@ -86,24 +111,31 @@ class DeviceOmegaAccumulator:
     two large factors whose product is well conditioned.
     """
 
-    def __init__(self, omega_vec, *, shape, sharding, omega_axis):
-        self._shape = tuple(int(n) for n in shape)
+    def __init__(self, omega_vec, *, shape, sharding, omega_axis, reduce=None):
+        """With ``reduce`` (:func:`_device_window_runner`), ``shape`` is the
+        ``(matrices, diagonals)`` pair of shape tuples it folds into, every
+        member at ``sharding``, and :meth:`finalize` returns that pair."""
         self._sharding = sharding
+        self._reduce = reduce
         self._replicated = NamedSharding(sharding.mesh, P())
         self._omega = np.asarray(jax.device_get(omega_vec), np.complex128)
         self._omega_axis = int(omega_axis)
-        if self._omega_axis < 0:
-            self._omega_axis += len(self._shape)
-        if not 0 <= self._omega_axis < len(self._shape):
-            raise ValueError(
-                "DeviceOmegaAccumulator: omega_axis outside output rank")
-        if self._shape[self._omega_axis] != self._omega.size:
-            raise ValueError(
-                "DeviceOmegaAccumulator: shape[omega_axis] must equal "
-                "n_omega")
+        shapes = ((shape,) if reduce is None else (*shape[0], *shape[1]))
+        shapes = tuple(tuple(int(n) for n in one) for one in shapes)
+        for one in shapes:
+            if not 0 <= self._omega_axis < len(one):
+                raise ValueError(
+                    "DeviceOmegaAccumulator: omega_axis outside output rank")
+            if one[self._omega_axis] != self._omega.size:
+                raise ValueError(
+                    "DeviceOmegaAccumulator: shape[omega_axis] must equal "
+                    "n_omega")
         # Each rank stores every output frequency and parent-k point for its
         # assigned block of the two band axes.
-        self._total = _device_output_zeros(self._shape, sharding)()
+        totals = tuple(_device_output_zeros(one, sharding)() for one in shapes)
+        n_matrix = 1 if reduce is None else len(shape[0])
+        self._total = (totals[0] if reduce is None else
+                       (totals[:n_matrix], totals[n_matrix:]))
 
     def integrate_window(self, tau_kernel, tau_arguments, t, alpha, *,
                          n_active, active_count, capacity, omega_sign,
@@ -148,7 +180,8 @@ class DeviceOmegaAccumulator:
             device_put_process_local(np.asarray(x), self._replicated)
             for x in (t_pad, coeff, np.int32(n_active)))
         run = _device_window_runner(
-            tau_kernel, self._sharding, self._omega_axis, bool(antihermitian))
+            tau_kernel, self._sharding, self._omega_axis, bool(antihermitian),
+            self._reduce)
         arguments = (self._total, tuple(tau_arguments), t_pad, coeff,
                      n_active, active_count)
         if compile_only:
