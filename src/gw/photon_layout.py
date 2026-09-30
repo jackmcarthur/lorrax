@@ -821,8 +821,8 @@ def family_channels(family: int) -> tuple[int, ...]:
 class PhotonFamilies:
     """Static description of a photon stream's endpoints; hashed by value.
 
-    ``plans`` are the charge and current families' raw-parent plans (both
-    ``None`` for full-k faces); ``packed_layout`` holds each family at its
+    ``plans`` are the charge and current families' raw-parent plans;
+    ``packed_layout`` holds each family at its
     in-memory carrier; ``layout`` is the canonical bank layout; ``bases``
     (``gw.centroid_basis.PackedCentroidBasis`` per family, or ``None`` when
     the two orders coincide) own the order conversion.  Plans and bases are
@@ -834,8 +834,8 @@ class PhotonFamilies:
     bases: tuple | None = None
 
     def __post_init__(self) -> None:
-        if len(self.plans) != 2 or (self.plans[0] is None) != (self.plans[1] is None):
-            raise ValueError("PhotonFamilies: want a (charge, current) plan pair or two Nones")
+        if len(self.plans) != 2 or any(plan is None for plan in self.plans):
+            raise ValueError("PhotonFamilies: want a (charge, current) raw-parent plan pair")
         if self.bases is None:
             if self.packed_layout != self.layout:
                 raise ValueError("PhotonFamilies: distinct layouts need the two family bases")
@@ -851,8 +851,8 @@ class PhotonFamilies:
                     f"packed/canonical extents {basis.n_packed}/{basis.n_canonical}")
 
     @property
-    def n_parent(self) -> int | None:
-        return None if self.plans[0] is None else int(self.plans[0].n_parent)
+    def n_parent(self) -> int:
+        return int(self.plans[0].n_parent)
 
     def order_map(self):
         """``(source, common, target)`` for ``permute_sharded_axis`` on one photon axis.

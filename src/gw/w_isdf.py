@@ -268,7 +268,8 @@ def _photon_chi_doors(mesh_xy, kgrid, half_plans, parity, passes=None):
     by ``p`` when ``h+g`` and ``h'+g'`` differ in parity, and the door applies
     that on the upper operand's load.  The vertices are the quadrant-local
     ``(perm, phase)`` of every channel pair of the family pair
-    (``common.gamma_matrices.gamma_vertex_trace``'s trace).  ``passes`` (one
+    (``common.gamma_matrices.gamma_perm_phase_host``), so the door forms
+    ``sum_ab (J_A G^> J_B^dagger)_ab conj(G^<)_ab``.  ``passes`` (one
     count per family pair, 1 by default) splits each pair's local centroid rows
     into row passes at orbit cuts (:func:`photon_row_passes`): a pass's door
     reads only its own rows, so its parent Greens are built on those rows only.
@@ -770,17 +771,16 @@ def _get_chi_fractional_contour_kernel_face(
 
     ``vertex`` (a :class:`gw.photon_layout.PhotonFamilies`) is the
     four-current stream: each psi argument is the ``(charge, current)``
-    family pair of raw-parent faces.  Every family pair's Green is contracted
-    on the parents and transported by the two families' plans (``build_G_tau``
-    with ``right_k_unfold_plan``, the route of the static current response);
-    the Dirac vertices act on its spin indices,
+    family pair of raw-parent faces.  Each Dirac-half quadrant of a family
+    pair's Green is built on the parents only and mathdx mode 11 unfolds it
+    on the load with the two families' plans; the Dirac vertices act on its
+    spin indices in the door's Mid,
     ``chi^AB = sum_ab (J_A G^> J_B^dagger)_ab conj(G^<)_ab``
-    (``common.gamma_matrices.gamma_vertex_trace``).  One family
-    pair's two Greens are live at a time.  Each family pair's R blocks are
-    transformed within the node and only their selected q and -q rows are
-    kept, in the families' packed photon layout; those rows cross into the
-    canonical layout before they accumulate.  The stream requires
-    ``selected_q``.  No psi face is unfolded.
+    (:func:`_photon_chi_doors`).  One quadrant's two Greens are live at a
+    time.  Each channel plane is transformed within the node and only its
+    selected q and -q rows are kept, in the families' packed photon layout;
+    those rows cross into the canonical layout once per call.  The stream
+    requires ``selected_q``.  No psi face and no Green is unfolded.
     """
     from common.fft_helpers import make_flat_k_fftn
     from distrib_la import gemm_plan
@@ -854,7 +854,7 @@ def _get_chi_fractional_contour_kernel_face(
     # restored to the canonical order at the end.
     expected_input_nk = (
         nk if k_unfold_plan is None else int(k_unfold_plan.n_parent))
-    if photon is not None and photon.n_parent is not None:
+    if photon is not None:
         expected_input_nk = photon.n_parent
     if nk_shape != expected_input_nk:
         raise ValueError(
@@ -893,9 +893,7 @@ def _get_chi_fractional_contour_kernel_face(
                 f"four-current stream: face_shape extent {n_rmu}, spin {ns}; want "
                 f"the canonical photon extent {photon.layout.packed_extent} and "
                 "four spinor components")
-    # The four-current stream transports Dirac-half quadrants (plan.dirac_halves).
-    half_plans, half_parity = (None, None), None
-    if photon is not None and photon.plans[0] is not None:
+        # The four-current stream transports Dirac-half quadrants (plan.dirac_halves).
         halves = tuple(plan.dirac_halves() for plan in photon.plans)
         if not np.array_equal(halves[0][1], halves[1][1]):
             raise ValueError("four-current stream: the family plans disagree on spatial parity")
@@ -910,7 +908,7 @@ def _get_chi_fractional_contour_kernel_face(
     # door cannot hold refuses (no full-k fallback on the GPU); a non-CUDA
     # backend takes the door's reference arm.
     photon_doors = None
-    if photon is not None and half_parity is not None:
+    if photon is not None:
         from ffi import fft as _F
         why = _F.chi_unfold_refusal(grid, 2) if _F.kconv_backend(mesh_xy) == "mathdx" else ""
         if why:
@@ -996,32 +994,15 @@ def _get_chi_fractional_contour_kernel_face(
             """The (weight, time) the Green is built at: conjugated for the physical orientation."""
             return (jnp.conj(weight), jnp.conj(t)) if physical else (weight, t)
 
-        def green_k(weight, t, ref, *, current=False, family_pair=None, halves=None):
-            left, right, plan, right_plan = psi_mun, psi_nmu, k_unfold_plan, None
-            sign = None
-            if family_pair is not None:
-                # One Dirac-half quadrant (h, g) of the family pair's Green:
-                # the typed bispinor action is diag(U, pU), so the quadrant
-                # transports with U and the sign p on h != g.
-                L, R = family_pair
-                h, g = halves
-                left = jax.lax.dynamic_slice_in_dim(psi_mun[L], 2 * h, 2, axis=1)
-                right = jax.lax.dynamic_slice_in_dim(psi_nmu[R], 2 * g, 2, axis=2)
-                plan, right_plan = half_plans[L], half_plans[R]
-                right_plan = None if right_plan is plan else right_plan
-                if half_parity is not None:
-                    sign = jnp.where(h == g, 1.0, jnp.asarray(half_parity))
+        def green_k(weight, t, ref, *, current=False):
             # Incumbent: conj(G(w, t)) = G(conj w, conj t)^T. Physical: G(conj w, conj t).
             weight, t = oriented(weight, t)
-            g = build_G_tau(left, right, enk_full, t, e_ref=ref,
+            g = build_G_tau(psi_mun, psi_nmu, enk_full, t, e_ref=ref,
                             band_weight=weight, layout=layout,
-                            gemm=g_plan, k_unfold_plan=plan,
-                            right_k_unfold_plan=right_plan,
+                            gemm=g_plan, k_unfold_plan=k_unfold_plan,
                             prepared_active_gemm=active_gemms[int(current)],
                             real_weights=False if direct else None)
             g = g if physical else jnp.conj(g)
-            if sign is not None:
-                g = g * sign[:, None, None, None, None]
             return jax.lax.with_sharding_constraint(g, G_shard)
 
         def spin_correlation(lower_weight, lower_time, lower_ref,
@@ -1054,67 +1035,16 @@ def _get_chi_fractional_contour_kernel_face(
             """One node's four-current correlation A as its transformed parent rows.
 
             Returns ``(FT[A](q), FT[A](-q))`` at ``q = gather_q``, both
-            ``(q_count, n_mu, n_mu)`` in the packed layout.  Every other row
-            the modes need follows from ``FT[conj A](q) = conj FT[A](-q)``
-            (:func:`photon_mix`).  One family pair at a time: its Lorentz
-            blocks accumulate in R over the four quadrants, each is
-            transformed, its two row sets are kept, and the class's R blocks
-            end before the next class's Greens are built.  The largest R
-            array is one class (TT: ``9 (nk, M_T, M_T)``), never the
-            ``(nk, n_mu, n_mu)`` packed total.
+            ``(q_count, n_mu, n_mu)`` in the packed layout, through mathdx
+            mode 11 (:func:`photon_door_blocks`).  Every other row the modes
+            need follows from ``FT[conj A](q) = conj FT[A](-q)``
+            (:func:`photon_mix`).
             """
-            from common.gamma_matrices import gamma_vertex_trace
-            from .photon_layout import FAMILY_PAIRS, _insert, family_channels
+            from .photon_layout import _insert
             layout_p = photon.packed_layout
             ahead, behind = (jax.lax.with_sharding_constraint(
                 jnp.zeros((q_count, n_mu, n_mu), jnp.complex128), chi_R_shard)
                 for _ in range(2))
-            if photon_doors is not None:
-                return photon_door_rows(ahead, behind, lower_weight, lower_time, lower_ref,
-                                        upper_weight, upper_time, upper_ref)
-            quadrants = jnp.asarray(((0, 0), (0, 1), (1, 0), (1, 1)), jnp.int32)
-            for pair in FAMILY_PAIRS:
-                # A current channel's vertex maps half h to 1 - h.
-                flip = jnp.asarray(tuple(int(f == 1) for f in pair), jnp.int32)
-                keys = tuple((A, B) for A in family_channels(pair[0])
-                             for B in family_channels(pair[1]))
-                # The previous class's rows finish before this class's Greens.
-                ahead, behind, lower_w = jax.lax.optimization_barrier(
-                    (ahead, behind, lower_weight))
-                blocks = tuple(jax.lax.with_sharding_constraint(
-                    jnp.zeros(layout_p.block_shape(nk, A, B), jnp.complex128), chi_R_shard)
-                    for A, B in keys)
-
-                def quadrant(blocks, hg, pair=pair, flip=flip, keys=keys, lower_w=lower_w):
-                    # The previous quadrant's blocks finish before these Greens.
-                    blocks, lower = jax.lax.optimization_barrier((blocks, lower_w))
-                    gf = G_fftn(green_k(lower, lower_time, lower_ref,
-                                        family_pair=pair, halves=(hg[0], hg[1])))
-                    gf, next_weight = jax.lax.optimization_barrier((gf, upper_weight))
-                    up = hg ^ flip
-                    gu = G_fftn(green_k(next_weight, upper_time, upper_ref, current=True,
-                                        family_pair=pair, halves=(up[0], up[1])))
-                    return tuple(
-                        block + jax.lax.with_sharding_constraint(gamma_vertex_trace(
-                            gf, gu, A, B, spin_axes=(2, 4),
-                            lower_offset=(2 * hg[0], 2 * hg[1]),
-                            upper_offset=(2 * up[0], 2 * up[1])), chi_R_shard)
-                        for block, (A, B) in zip(blocks, keys)), None
-
-                blocks, _ = jax.lax.scan(quadrant, blocks, quadrants, unroll=1)
-                for (A, B), block in zip(keys, blocks):
-                    value = chi_fftn(block)
-                    ahead = _insert(ahead, jnp.take(value, jnp.asarray(gather_q), axis=0),
-                                    layout_p, A, B, mesh_xy)
-                    behind = _insert(behind, jnp.take(value, jnp.asarray(reverse_q), axis=0),
-                                     layout_p, A, B, mesh_xy)
-            return ahead, behind
-
-        def photon_door_rows(ahead, behind, lower_weight, lower_time, lower_ref,
-                             upper_weight, upper_time, upper_ref):
-            """:func:`photon_rows` through mathdx mode 11 (:func:`photon_door_blocks`)."""
-            from .photon_layout import _insert
-            layout_p = photon.packed_layout
 
             def put(state, keys, value, c, x_rows):
                 ahead, behind = state
@@ -1361,12 +1291,8 @@ def _get_chi_fractional_contour_kernel_face(
                 jax.lax.dynamic_index_in_dim(projection_rows[1], index, axis=1, keepdims=False)))
             if chi_door is not None:
                 ahead, behind = direct_rows(time)
-            elif photon_doors is not None:
-                return photon_direct_carry(accumulators, time, forward, reverse)
             elif photon is not None:
-                ahead, behind = photon_rows(occ_f, -time, energy_reference[0],
-                                            occ_u, jnp.conj(time), energy_reference[1])
-                ahead, behind = photon_order(ahead), jnp.conj(photon_order(behind))
+                return photon_direct_carry(accumulators, time, forward, reverse)
             else:
                 value = chi_fftn(spin_correlation(occ_f, -time, energy_reference[0],
                     occ_u, jnp.conj(time), energy_reference[1]))
@@ -1428,7 +1354,7 @@ def _get_chi_fractional_contour_kernel_face(
             )
             return updated, None
 
-        if pair_mode == "direct" and photon_doors is not None:
+        if pair_mode == "direct" and photon is not None:
             # The mode-11 photon stream adds each node into the carry in the
             # families' packed layout; the carry crosses layouts once per call.
             from .photon_layout import photon_carry_order
