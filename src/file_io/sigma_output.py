@@ -1090,16 +1090,34 @@ def sigma_star_spread_stats(values, rows_to_keep, compact_irr, sym_idx_k,
 
 
 class DeferredArray:
-	"""A Σ(ω) dataset produced when it is read: ``shape`` now, values from
-	``materialize()``.  The writer reads the two ω cubes one at a time, so
-	each is made, measured, selected and written before the next exists."""
+	"""A Σ(ω) dataset produced when it is read: ``shape`` now, values later.
 
-	def __init__(self, shape, produce):
+	``materialize()`` makes the whole array.  A producer that can also make
+	one ω slice (``omega_slab``) and the k rows the file keeps
+	(``take_rows``) serves :func:`extract_and_stamp_k_irr` without the whole
+	array ever existing: the star-spread measure reads ``values[omega_index]``
+	and the selection is ``values.take(rows, axis=1)``, each the same numbers
+	element for element as the whole array would give.
+	"""
+
+	def __init__(self, shape, produce, *, omega_slab=None, take_rows=None):
 		self.shape = tuple(int(n) for n in shape)
 		self._produce = produce
+		self._omega_slab = omega_slab
+		self._take_rows = take_rows
 
 	def materialize(self):
 		return self._produce()
+
+	def __getitem__(self, index):
+		if self._omega_slab is not None and isinstance(index, (int, np.integer)):
+			return self._omega_slab(int(index))
+		return self.materialize()[index]
+
+	def take(self, rows, axis=0):
+		if self._take_rows is not None and axis == 1:
+			return self._take_rows(np.asarray(rows))
+		return self.materialize().take(np.asarray(rows), axis=axis)
 
 
 def _materialize(arr):
@@ -1205,9 +1223,9 @@ def extract_and_stamp_k_irr(
 			if arr is None:
 				selected[name] = None
 				continue
-			# One dataset at a time: a deferred cube is made, measured and
-			# selected here, and only its retained rows outlive the step.
-			arr = _materialize(arr)
+			# One dataset at a time; a DeferredArray is measured on its one ω
+			# slice and selected to its retained rows without being made
+			# whole, and only those rows outlive the step.
 			stats = sigma_star_spread_stats(
 				arr, rows_to_keep, compact_irr, sym_idx_k, n_sym_spatial,
 				k_axis=SIGMA_K_AXIS[name], omega_index=omega_index)
