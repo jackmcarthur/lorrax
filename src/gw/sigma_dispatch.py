@@ -1418,7 +1418,7 @@ def _compute_mpa_sigma(
         body_omega, extrap_payload = extrapolate_sigma_body(
             replace(body, efermi_ry=sigma_efermi_ry), head_diag,
             e_state_ev=e_qp_ev, plan=plan, config=config, band_slices=band_slices,
-            wfn=wfn, mesh_xy=mesh_xy, print_fn=print_fn)
+            wfn=wfn, mesh_xy=mesh_xy, print_fn=print_fn, top=body_unextrap)
     return finalize_dynamic_sigma(
         body_omega, head_diag,
         sigma_band_axis=body.band_axis,
