@@ -9,6 +9,7 @@ and every HDF5 payload or metadata item crosses the SlabIO service door.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from functools import partial
 from pathlib import Path
 
 import jax
@@ -1918,6 +1919,53 @@ def _velocity_error_metrics(
     }
 
 
+@partial(jax.jit, static_argnames=("blocks", "q_tile"))
+def _block_scoped_reductions(reconstructed, exact, *, blocks, atol, rtol,
+                             q_tile=64):
+    """Reduce leading-band diagnostics without a full error-array lifetime.
+
+    The two resident operators retain their all-P band-face layout. Only a
+    bounded q panel enters the elementwise arithmetic; band masks preserve
+    the carrier layout instead of slicing a smaller, potentially unaligned
+    band face. The final panel overlaps its predecessor when nk is ragged:
+    max/all are idempotent, so that overlap does not change any statistic.
+    """
+    nk, nb = int(exact.shape[1]), int(exact.shape[-1])
+    width = min(int(q_tile), nk)
+    n_panels = (nk + width - 1) // width
+    band = jnp.arange(nb)
+    diagonal = (band[:, None] == band[None, :])[None, None]
+    masks = tuple(((band[:, None] < m) & (band[None, :] < m))[None, None]
+                  for m in blocks)
+    zeros = jnp.zeros((len(blocks),), dtype=exact.real.dtype)
+    initial = (zeros, zeros, zeros, zeros,
+               jnp.ones((len(blocks),), dtype=jnp.bool_))
+
+    def panel(i, accumulated):
+        start = jnp.minimum(i * width, nk - width)
+        reference = jax.lax.dynamic_slice_in_dim(exact, start, width, axis=1)
+        estimate = jax.lax.dynamic_slice_in_dim(
+            reconstructed, start, width, axis=1)
+        error = jnp.abs(estimate - reference)
+        magnitude = jnp.abs(reference)
+        maximum, diag_maximum, off_maximum, relative, passed = [], [], [], [], []
+        for mask in masks:
+            maximum.append(jnp.max(jnp.where(mask, error, 0.0)))
+            diag_maximum.append(jnp.max(jnp.where(mask & diagonal, error, 0.0)))
+            off_maximum.append(jnp.max(jnp.where(mask & ~diagonal, error, 0.0)))
+            relative.append(jnp.max(jnp.where(
+                mask, error / jnp.maximum(magnitude, atol), 0.0)))
+            passed.append(jnp.all(jnp.where(
+                mask, error <= atol + rtol * magnitude, True)))
+        current = tuple(jnp.stack(v) for v in
+                        (maximum, diag_maximum, off_maximum, relative, passed))
+        return tuple(jnp.maximum(old, new) for old, new in
+                     zip(accumulated[:4], current[:4])) + (
+                         accumulated[4] & current[4],)
+
+    return jax.lax.fori_loop(0, n_panels, panel, initial)
+
+
 def _block_scoped_metrics(
     reconstructed,
     exact,
@@ -1934,27 +1982,20 @@ def _block_scoped_metrics(
     jumps at band 9 names a band-crossing defect and nothing else.  It is a
     DIAGNOSTIC — the stamped verdict stays the full-window one.
     """
-    error = jnp.abs(jnp.asarray(reconstructed) - jnp.asarray(exact))
-    magnitude = jnp.abs(jnp.asarray(exact))
-    rows = []
-    for extent in blocks:
-        m = int(extent)
-        block_error = error[:, :, :m, :m]
-        block_exact = magnitude[:, :, :m, :m]
-        diagonal = jnp.eye(m, dtype=bool)[None, None, :, :]
-        rows.append({
-            "bands": m,
-            "max_abs": float(jax.device_get(jnp.max(block_error))),
-            "max_abs_diagonal": float(jax.device_get(jnp.max(
-                jnp.where(diagonal, block_error, 0.0)))),
-            "max_abs_offdiagonal": float(jax.device_get(jnp.max(
-                jnp.where(~diagonal, block_error, 0.0)))),
-            "max_rel": float(jax.device_get(jnp.max(
-                block_error / jnp.maximum(block_exact, float(atol))))),
-            "passed": bool(jax.device_get(jnp.all(
-                block_error <= float(atol) + float(rtol) * block_exact))),
-        })
-    return rows
+    blocks = tuple(int(m) for m in blocks)
+    if not blocks:
+        return []
+    reduced = jax.device_get(_block_scoped_reductions(
+        jnp.asarray(reconstructed), jnp.asarray(exact), blocks=blocks,
+        atol=float(atol), rtol=float(rtol)))
+    return [{
+        "bands": m,
+        "max_abs": float(reduced[0][i]),
+        "max_abs_diagonal": float(reduced[1][i]),
+        "max_abs_offdiagonal": float(reduced[2][i]),
+        "max_rel": float(reduced[3][i]),
+        "passed": bool(reduced[4][i]),
+    } for i, m in enumerate(blocks)]
 
 
 _VELOCITY_GATE_KEYS = (
