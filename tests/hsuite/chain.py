@@ -9,7 +9,7 @@ in the order a user runs them:
            -> gwjax shared-pole QSGW (2 maps) -> BSE -> htransform
            -> exciton bands -> restarted: COHSEX, GN-PPM SC (1 map),
               shared-pole one-shot with W and pole exports
-           -> bispinor kin_ion -> four-current shared-pole one-shot
+           -> bispinor kin_ion, dipole -> four-current shared-pole one-shot
            -> restarted: four-current shared-pole QSGW (2 maps)
 
 Each stage is then checked against the stored outputs in ``reference/``
@@ -200,8 +200,11 @@ write_poles = true
 # four-current Gamma head) one-shot with its own kinetic-balance kin_ion,
 # then the same route through the SC driver for two maps, restarted from
 # the one-shot's zeta and V(q), with the per-map head (dft_velocity) and the
-# live four-current density (density_self_consistent, required).
+# live four-current density (density_self_consistent, required).  The
+# transverse zeta is fitted on the charge centroid set: one kmeans stage, and
+# any point set is a legal ISDF basis for the current rows.
 _BISP_COMMON = """bispinor = true
+centroids_file_current = {centroids}
 bispinor_gw = full_shared_pole
 compute_mode = mpa
 sigma_w_model = shared_pole
@@ -272,6 +275,9 @@ STAGES = (
     ("gnppm_sc", "gw.gw_jax", ["-i", "gnppm_sc.in"]),
     ("sp_export", "gw.gw_jax", ["-i", "sp_export.in"]),
     ("kin_ion_bisp", "gw.kin_ion_io", ["-i", "bisp_os.in"]),
+    # The direct head authenticates the dipole's representation stamp, so
+    # the four-component route writes its own (over the scalar one).
+    ("dipole_bisp", "psp.get_dipole_mtxels", ["-i", "bisp_os.in"]),
     ("bisp_oneshot", "gw.gw_jax", ["-i", "bisp_os.in"]),
     ("bisp_sc", "gw.gw_jax", ["-i", "bisp_sc.in"]),
 )
@@ -303,6 +309,7 @@ CHECKS = {
                   "h5": ["spx_sigma.h5", "tmp/mpa/oneshot_w.h5"],
                   "shapes": ["tmp/mpa/oneshot_poles.h5"]},
     "kin_ion_bisp": {"h5": ["kin_ion_bisp.h5"]},
+    "dipole_bisp": {"h5": ["dipole.h5"]},
     "bisp_oneshot": {"eqp": ["bos_eqp0.dat", "bos_eqp1.dat"],
                      "h5": ["bos_sigma.h5"]},
     "bisp_sc": {"eqp": ["bsc_eqp0.dat", "bsc_eqp1.dat"],

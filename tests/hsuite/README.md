@@ -31,7 +31,8 @@ converged physical reference.
 | gnppm_sc | `gw.gw_jax` | GN-PPM through the SC driver, one map (map 0; QP rotations and `WFN_qp.h5` written), restarted |
 | sp_export | `gw.gw_jax` | shared-pole one-shot with `write_w`/`write_poles` (the file-model path), restarted; the W bank is compared by value, the pole model by member shapes |
 | kin_ion_bisp | `gw.kin_ion_io` | four-component kinetic-balance kinetic + ionic matrix elements |
-| bisp_oneshot | `gw.gw_jax` | `bispinor_gw = full_shared_pole` one-shot: fresh charge + transverse ζ, ordered CC/CT/TC/TT sector poles, direct four-current Γ head |
+| dipole_bisp | `psp.get_dipole_mtxels` | the four-component dipole the direct head authenticates |
+| bisp_oneshot | `gw.gw_jax` | `bispinor_gw = full_shared_pole` one-shot: fresh charge + transverse ζ (both on the charge centroid set), ordered CC/CT/TC/TT sector poles, direct four-current Γ head |
 | bisp_sc | `gw.gw_jax` | the same route through the SC driver, 2 maps, restarted from the one-shot's ζ and V(q), `sc_head_update = dft_velocity`, live four-current density |
 
 All stages run in one Python process per rank (`chain.run_stage` calls each
