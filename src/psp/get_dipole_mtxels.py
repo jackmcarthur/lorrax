@@ -627,7 +627,7 @@ def _complete_parallel_transport(args, pt_path, **kwargs):
     import os
     if not getattr(args, "parallel_transport_defaulted", False):
         complete_parallel_transport(pt_path, **kwargs)
-        return
+        return pt_path
     final = Path(str(pt_path)[:-len(".partial")])
     try:
         complete_parallel_transport(pt_path, **kwargs)
@@ -636,9 +636,10 @@ def _complete_parallel_transport(args, pt_path, **kwargs):
             os.remove(pt_path)
         kwargs["report"].emit(f"parallel-transport artifact: not written ({exc})")
         print(f"  parallel-transport artifact: not written ({exc})", flush=True)
-        return
+        return None
     if jax.process_index() == 0:
         os.replace(pt_path, final)
+    return final
 
 
 def _parallel_transport_outer_bands(args, wfn, head_nbands, parser):
@@ -869,15 +870,17 @@ def build_parser() -> argparse.ArgumentParser:
 		"--parallel-transport-validation-atol",
 		type=float,
 		default=5.0e-4,
-		help="Absolute tolerance for the mandatory reconstructed-vs-exact "
-		     "DFT velocity gate (default: 5e-4).",
+		help="Absolute tolerance of the reconstructed-vs-exact DFT velocity "
+		     "diagnostic (default: 5e-4).  A warning level only.",
 	)
 	parser.add_argument(
 		"--parallel-transport-validation-rtol",
 		type=float,
 		default=5.0e-3,
-		help="Relative tolerance for the mandatory reconstructed-vs-exact "
-		     "DFT velocity gate (default: 5e-3).",
+		help="Relative tolerance of the reconstructed-vs-exact DFT velocity "
+		     "diagnostic (default: 5e-3).  Above it the dipole step warns "
+		     "that the k grid is underconverged for the links; the artifact "
+		     "is written either way and the SC head serves its Sigma term.",
 	)
 	parser.add_argument(
 		"--with-finite-q",
@@ -1558,7 +1561,7 @@ def main(argv=None):
 			if pt_path is not None:
 				# ψ is dead here (the velocity keeps its 1/P shard for
 				# dipole.h5), so the link stream never holds both.
-				_complete_parallel_transport(
+				pt_path = _complete_parallel_transport(
 					args, pt_path, wfn=wfn, sym=sym, mesh=RUNTIME.mesh, nbands=nb,
 					bispinor=bispinor,
 					rcond=float(args.parallel_transport_rcond),

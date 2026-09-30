@@ -3763,7 +3763,6 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
         from .qsgw_head import finalize_iteration_head_samples
     if pt is not None:
         from .qsgw_head import (
-            HEAD_LINK_RTOL,
             InterbandCommutatorHeadData,
             assemble_delta_head_manifold,
             build_iteration_head_response,
@@ -3821,8 +3820,7 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
             bvec_cart=pt.reciprocal_lattice_cart,
             collapsed_position=getattr(pt, "collapsed_position", None),
             nb_links=int(getattr(pt, "nb_links", 0) or pt.nb_logical),
-            link_bound=((float(pt.validation["link_relative_error"]),
-                         HEAD_LINK_RTOL)
+            link_error=(float(pt.validation["link_relative_error"])
                         if forward_links is not None else None),
             velocity_base_cart=(pt.velocity_dft_cart
                                 if isinstance(pt, InterbandCommutatorHeadData)
@@ -4730,21 +4728,21 @@ def _record_shared_pole_replans(inputs, iteration, recipe):
 
 
 def _record_head_sigma_summary(inputs) -> None:
-    """One line: on how many maps the parallel_transport Sigma term was zeroed.
+    """One line: whether the parallel_transport Sigma term was served.
 
-    ``qsgw_head.sigma_term_zeroed`` sets ``D_k DeltaH = 0`` on a map whose
-    links cannot serve it; the run neither refuses nor switches mode, so the
-    record says how often that happened and whether the last map was one.
+    ``qsgw_head.qp_velocity`` serves ``D_k DeltaH`` on every map when the
+    source carries links and on none when it does not (links incomplete, or
+    the stencil or window-hybridization gate); the run neither refuses nor
+    switches mode, so the record says which.
     """
     zeroed = (inputs.screening_seed_cache or {}).get("head_sigma_zeroed")
     if not zeroed:
         return
-    n = sum(1 for reason in zeroed.values() if reason)
-    last = max(zeroed)
+    reason = zeroed[max(zeroed)]
     _record_sc(
-        inputs, f"  SC head: parallel_transport Sigma term D_k dH zeroed on "
-        f"{n} of {len(zeroed)} maps; last map {last} "
-        + (f"zeroed ({zeroed[last]})" if zeroed[last] else "served"))
+        inputs, "  SC head: parallel_transport Sigma term D_k dH "
+        + (f"zeroed on all {len(zeroed)} maps ({reason})" if reason
+           else f"served on all {len(zeroed)} maps"))
 
 
 def _record_head_block(inputs, iteration, response, energies_qp_kn_ry) -> None:
@@ -4784,12 +4782,13 @@ def _record_head_block(inputs, iteration, response, energies_qp_kn_ry) -> None:
                      f"{np.sqrt(max(v, 0.0)):.4f}" for v in total) + " eV")
                     if metal else ""))
     if bound is not None:
-        link_error, ratio, value, rtol = bound
+        link_error, ratio, value = bound
         lines.append(
             f"      link bound: rel_err(links) {link_error:.3e} x "
-            f"|D_k dH|/|v_DFT| {ratio:.3e} = {value:.3e} (rtol {rtol:.1e})")
+            f"|D_k dH|/|v_DFT| {ratio:.3e} = {value:.3e} (information; "
+            "falls with the k grid)")
     if zeroed is not None:
-        lines.append(f"      Sigma term zeroed on this map: {zeroed}")
+        lines.append(f"      Sigma term zeroed: {zeroed}")
     if (bound is not None or zeroed is not None) and (
             inputs.screening_seed_cache is not None):
         inputs.screening_seed_cache.setdefault(
@@ -4804,9 +4803,7 @@ def _record_head_block(inputs, iteration, response, energies_qp_kn_ry) -> None:
     if zeroed is not None:
         _record_sc(
             inputs, f"  SC head: map {iteration}: parallel_transport Sigma "
-            f"term D_k dH set to 0 ({zeroed}; bound "
-            + (f"{bound[2]:.3e}" if bound is not None else "not evaluated")
-            + "); v = U^dagger v_DFT U, checked again next map")
+            f"term D_k dH set to 0 ({zeroed}); v = U^dagger v_DFT U")
     for line in lines:
         _record_sc(inputs, line)
 
@@ -6618,7 +6615,7 @@ def load_head_velocity_source(
 
     (c), (a) and incomplete links do not refuse: the source then carries
     ``link_unserved`` and every map runs with ``D_k DeltaH = 0``
-    (``qsgw_head.sigma_term_zeroed``).
+    (``qsgw_head.qp_velocity``).  The link error itself gates nothing.
     """
     from gw.gw_config import HEAD_UPDATES, uses_direct_bispinor_shared_pole_head
 
@@ -6708,8 +6705,10 @@ def load_head_velocity_source(
     # parallel_transport stays the head for the whole run (owner
     # 2026-09-30).  Links that cannot serve D_k DeltaH (a stencil the grid
     # cannot carry, an incomplete artifact, a hybridized window edge) set it
-    # to zero on every map through qsgw_head.sigma_term_zeroed; the velocity
-    # is then the artifact's U^dagger v_DFT U.  No refusal, no other mode.
+    # to zero on every map (qsgw_head.qp_velocity); the velocity is then the
+    # artifact's U^dagger v_DFT U.  No refusal, no other mode.  Complete,
+    # well-defined links always serve the term: their error is a k-convergence
+    # measure, logged per map and never a gate.
     from .qsgw_head import (load_dft_velocity_head,
                             load_parallel_transport_head,
                             parallel_transport_link_state)

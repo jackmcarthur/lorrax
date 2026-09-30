@@ -3,6 +3,21 @@
 User-visible changes, newest first. Binding rulings behind the breaking
 changes live in `docs/architecture/decisions.md`.
 
+## 2026-09-30 — `parallel_transport`: the Σ term is served whenever the links are usable
+
+The `parallel_transport` head no longer sets its Σ term D_kΔH to zero on a map
+whose link bound exceeds 1 %. Complete links serve it on every map. The link
+error is a k-convergence measure: the dipole step warns above
+`--parallel-transport-validation-rtol` and still writes the artifact, each SC
+map logs the error and its bound on the Σ term, and neither gates anything.
+Only links that are not usable (incomplete, or a stencil or
+window-hybridization gate fails) zero the term, on every map.
+
+SC decks whose links were above the bound move once: MoS2 3×3 SOC (link error
+9.2 %) converges to a 4.48 eV gap with the term served (5.17 eV with it
+zeroed). Decks that stayed below 1 % are bitwise (Fe 4³ scalar)
+([self-consistency §7](docs/self_consistency.md#metals-direct-drude-head)).
+
 ## 2026-09-30 — parallel-transport links: schema 4 on the link shell; rerun the dipole step
 
 `parallel_transport` now differentiates on the point-group-closed

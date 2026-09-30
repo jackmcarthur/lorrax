@@ -52,11 +52,13 @@ its stop rules in [self-consistency](../self_consistency.md); the W model in
   it by default), else `dft_velocity` from `dipole.h5`, else `off`. This holds
   on scalar decks and on `bispinor_gw = full_shared_pole`, whose direct Γ head
   reads the same velocity. On a metal, `bare_transverse` refuses
-  `parallel_transport`. The run keeps that head on every map. On a map whose
-  links cannot serve the Σ term (links incomplete, a stencil or window gate
-  fails, or the link bound exceeds 1 %), D_kΔH is set to zero for that map
-  and checked again on the next. There is no switch to another head and no
-  refusal ([self-consistency §7](../self_consistency.md#metals-direct-drude-head)).
+  `parallel_transport`. The run keeps that head on every map, and
+  complete links always serve the Σ term D_kΔH. The link error is a
+  k-convergence measure: each map logs it and its bound on the Σ term, and
+  it gates nothing (a large value means the k grid is underconverged). Only
+  links that are not usable (incomplete, or a stencil or window-hybridization
+  gate fails) set D_kΔH to zero, on every map. There is no switch to another
+  head and no refusal ([self-consistency §7](../self_consistency.md#metals-direct-drude-head)).
   The one-shot head and every SC velocity head take their velocity from one
   owner, `qsgw_head.qp_velocity`. The links sit on a point-group-closed
   shell ([input reference](../input_reference.md), `parallel_transport_file`).
