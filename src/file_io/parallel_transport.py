@@ -784,6 +784,32 @@ def _write_link_stage(
     return full_plus, source_full, source_steps
 
 
+def _run_pt_kernel_with_live_admission(kernel, *args, stage):
+    """Price one executable beside its actual live arguments and reuse it."""
+    from common.gpu_utils import device_room_bytes, device_budget_bytes, record_stage_price
+    from common.collectives import all_gather_processes
+    from runtime.aot_memory import compiled_new_bytes, runtime_reserve_bytes
+    from runtime import rank0_print
+
+    jax.block_until_ready(args)
+    compiled = kernel.lower(*args).compile()
+    reserve = runtime_reserve_bytes()
+    local = np.asarray(compiled_new_bytes(compiled, extra=reserve), dtype=np.int64)
+    required = int(np.max(all_gather_processes(local)))
+    room = int(device_room_bytes())
+    rank0_print(
+        f"  [PT live compiled admission] {stage}: new={required} B/device "
+        f"including reserve={reserve}; actual remaining room={room} B/device",
+        flush=True)
+    if required > room:
+        raise ValueError(
+            f"GATE parallel_transport_compiled_capacity: {stage} requires "
+            f"{required} new B/device beside its live arguments, room={room}; "
+            "increase the all-P geometry or reduce the physical band window")
+    record_stage_price(stage, device_budget_bytes() - room + required)
+    return compiled(*args)
+
+
 def _write_connection_stage(
     path: str,
     *,
@@ -885,7 +911,8 @@ def _write_connection_stage(
                 links, full_plus, spacing, band_matmul=band_matmul,
                 stencil_orders=orders, collapsed_position=position)
 
-        connection_reduced = _connection(full_links, position)
+        connection_reduced = _run_pt_kernel_with_live_admission(
+            _connection, full_links, position, stage="PT connection")
         connection_reduced = jax.lax.with_sharding_constraint(
             connection_reduced, block_sharding)
 
@@ -905,7 +932,8 @@ def _write_connection_stage(
             out = 0.5 * (out + jnp.swapaxes(jnp.conj(out), -1, -2))
             return jax.lax.with_sharding_constraint(out, block_sharding)
 
-        connection_cart = _to_cart(connection_reduced)
+        connection_cart = _run_pt_kernel_with_live_admission(
+            _to_cart, connection_reduced, stage="PT Cartesian connection")
         # NEVER STAMP ``connection_complete = 1`` OVER AN ALL-ZERO BLOCK.
         # The artifact is created with a zero ``berry_connection_cart`` and
         # ``connection_complete = 0``, and until 2026-08-15 a bcc/fcc deck

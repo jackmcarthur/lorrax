@@ -213,7 +213,8 @@ def connection_placement_check():
         module = ast.Module(body=[node], type_ignores=[])
         ast.fix_missing_locations(module)
         exec(compile(module, str(native.__file__), 'exec'), closure)
-        got = closure['_connection'](ld, pd)
+        got = native._run_pt_kernel_with_live_admission(
+            closure['_connection'], ld, pd, stage='fixture PT connection')
         # Same owning stencil, independent ordinary dense matrix products.
         reference = native.fourth_order_connection(
             jnp.asarray(links), plus, spacing, band_matmul=lambda a,b: a@b,
@@ -222,9 +223,22 @@ def connection_placement_check():
         error = float(np.max(np.abs(host(got)-host(reference))))
         assert error < 5e-12, error
         assert got.sharding.spec == shard.spec
+        from common import gpu_utils
+        original_room = gpu_utils.device_room_bytes
+        try:
+            gpu_utils.device_room_bytes = lambda: 0
+            try:
+                native._run_pt_kernel_with_live_admission(
+                    closure['_connection'], ld, pd, stage='negative fixture capacity')
+            except ValueError as exc:
+                assert 'parallel_transport_compiled_capacity' in str(exc)
+            else:
+                raise AssertionError('zero live room was accepted')
+        finally:
+            gpu_utils.device_room_bytes = original_room
         rows.append(dict(grid=grid, max_absolute_error=error,
                          position_supplied=position is not None,
-                         output_all_P_faces=True))
+                         output_all_P_faces=True,zero_live_room_refused=True))
     return rows
 
 
