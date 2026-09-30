@@ -85,6 +85,14 @@ try:
     raise AssertionError('nonzero synthetic coefficient was accepted')
 except ValueError as exc:
     assert 'exact-null/identity' in str(exc)
+nan_corrupt=expected.copy();nan_corrupt[-1,-1,-1]=np.nan
+nan_corrupt=device_put_process_local(nan_corrupt,sh)
+assert np.isnan(float(_coefficient_null_tail_max(nan_corrupt,physical=physical)))
+try:
+    _basis_check(replace(basis,ctilde=nan_corrupt),provenance)
+    raise AssertionError('NaN synthetic coefficient was accepted')
+except ValueError as exc:
+    assert 'exact-null/identity' in str(exc)
 tail_shape=(8000,184,2108)
 tail_abstract=jax.ShapeDtypeStruct(tail_shape,jnp.complex128,sharding=sh)
 tail_exe=_coefficient_null_tail_max.lower(tail_abstract,physical=2105).compile()
@@ -94,7 +102,7 @@ assert 'all-gather' not in tail_exe.as_text()
 tail_receipt=dict(shape=tail_shape,physical_rank=2105,carried_rank=2108,
     temp_bytes=tail_mem.temp_size_in_bytes,argument_bytes=tail_mem.argument_size_in_bytes,
     output_bytes=tail_mem.output_size_in_bytes,no_all_gather=True,
-    exact_zero_passed=True,nonzero_1e_minus14_refused=True)
+    exact_zero_passed=True,nonzero_1e_minus14_refused=True,nan_tail_refused=True)
 metrics_small=_galerkin_rank_metrics_kernel(mesh,solved.shape,selected_rows=tuple(selected),physical=len(selected))(solved,ld)
 gram=np.einsum('kna,kma->knm',reference,reference.conj())
 norm=np.diagonal(gram,axis1=1,axis2=2).real

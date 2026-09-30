@@ -1064,7 +1064,7 @@ def fit_galerkin_basis(
             source=source, meta=meta, mesh_xy=mesh_xy,
             rank_carrier=rank, x_chunks=x_chunks,
             stream=basis_stream, k_tile=k_tile, log_fn=log_fn)
-        del x_chunks
+        # Keep the already-transformed selected rows for centroid evaluation.
         # The pivots are states of Psi, so their rows of Psi X^H are X X^H:
         # the Gram needs no pass of its own.
         selected_gram = _selected_gram_from_projection(
@@ -1112,16 +1112,13 @@ def fit_galerkin_basis(
         ctilde = _solve_coefficient_projection(projection, L, mesh_xy)
         del projection
 
-    # Centroids enter only here, as evaluation points of the already-fixed
-    # global basis.  This is the canonical WFN centroid loader and therefore
-    # retains its FFT boxing, Bloch phase, padding and sharding conventions.
-    psi_rmu, _ = load_centroids_band_chunked(
-        wfn, None, meta, centroid_indices, bispinor, mesh_xy,
-        band_range=(b_start, b_end), band_chunk_size=bc_carrier)
-    B_at_mu = _basis_at_nodes_from_selected_states(
-        psi_rmu=psi_rmu, selected_states=selected,
-        factor=L, rank_carrier=rank, n_nodes=n_mu, mesh_xy=mesh_xy)
-    del psi_rmu
+    # Centroids evaluate the already-fixed global basis. Reuse precisely
+    # its selected full-Bloch rows instead of reloading every k/band state.
+    B_at_mu = _basis_at_nodes_from_selected_chunks(
+        x_chunks=x_chunks, stream=basis_stream, factor=L,
+        centroid_indices=centroid_indices, fft_grid=meta.fft_grid,
+        rank_carrier=rank, nspinor=int(meta.nspinor), mesh_xy=mesh_xy)
+    del x_chunks
 
     basis = GalerkinBasis(
         ctilde=ctilde,
@@ -2192,6 +2189,69 @@ def _build_physical_projection(
         f"{len(stream.r_chunk_ranges)} r chunk(s), k_tile={k_tile}: "
         f"{time.time()-t0:.2f}s")
     return projection
+
+
+def _basis_at_nodes_from_selected_chunks(
+        *, x_chunks, stream, factor, centroid_indices, fft_grid,
+        rank_carrier: int, nspinor: int, mesh_xy: Mesh):
+    """Sample resident full-Bloch pivots, then use the existing row solve.
+
+    Only a bounded node panel participates in each collective; the selected
+    real-space chunks retain their all-P column placement throughout. The
+    old evaluator remains the small-reference owner for parity controls.
+    """
+    indices = np.asarray(centroid_indices, dtype=np.int64)
+    grid = tuple(int(n) for n in fft_grid)
+    if indices.ndim != 2 or indices.shape[1] != len(grid):
+        raise ValueError("Galerkin centroid indices must have three FFT coordinates")
+    flat = np.ravel_multi_index(indices.T, grid)
+    n_nodes = len(flat)
+    rows_layout = _fit(mesh_xy, P(None, None, 'y'),
+                       (int(rank_carrier), int(nspinor), n_nodes),
+                       "galerkin.basis_at_nodes(mu-axis)")
+    rep = NamedSharding(mesh_xy, P())
+    r_spec = P(None, None, ('y', 'x'))
+    r_layout = NamedSharding(mesh_xy, r_spec)
+    p = int(mesh_xy.size)
+    panel = min(64, n_nodes)
+
+    @partial(shard_map, mesh=mesh_xy,
+             in_specs=(r_spec, P(), P()), out_specs=P(), check_vma=False)
+    def _sample(local, node_r, valid):
+        owner = (jax.lax.axis_index('y') * int(mesh_xy.shape['x'])
+                 + jax.lax.axis_index('x'))
+        local_start = owner * local.shape[-1]
+        take = node_r - local_start
+        owns = valid & (take >= 0) & (take < local.shape[-1])
+        values = local[..., jnp.clip(take, 0, local.shape[-1] - 1)]
+        return jax.lax.psum(jnp.where(owns, values, 0.0), ('x', 'y'))
+
+    sample = jax.jit(_sample, in_shardings=(r_layout, rep, rep), out_shardings=rep)
+
+    @partial(jax.jit, out_shardings=rows_layout)
+    def _zeros():
+        return jnp.zeros((rank_carrier, nspinor, n_nodes), dtype=jnp.complex128)
+
+    @partial(jax.jit, donate_argnums=(0,),
+             in_shardings=(rows_layout, rep, rep), out_shardings=rows_layout)
+    def _place(rows, values, destination):
+        return rows.at[..., destination].add(values)
+
+    rows = _zeros()
+    for chunk, (r0, r1) in zip(x_chunks, stream.r_chunk_ranges):
+        for start in range(0, n_nodes, panel):
+            count = min(panel, n_nodes - start)
+            take = np.pad(flat[start:start + count] - r0, (0, panel - count))
+            valid = np.arange(panel) < count
+            valid &= (take >= 0) & (take < r1 - r0)
+            values = sample(chunk, device_put_process_local(take, rep),
+                            device_put_process_local(valid, rep))
+            destination = np.minimum(start + np.arange(panel), n_nodes - 1)
+            rows = _place(rows, values, device_put_process_local(destination, rep))
+    solve = _make_basis_solve_kernel(
+        mesh=mesh_xy, rank=rank_carrier, nspinor=nspinor,
+        r_carrier=n_nodes, row_layout=rows_layout)
+    return solve(factor, rows)
 
 
 def _basis_at_nodes_from_selected_states(
