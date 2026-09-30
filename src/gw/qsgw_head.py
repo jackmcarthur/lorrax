@@ -433,13 +433,11 @@ def load_parallel_transport_head(
             )
         if ints["connection_complete"] != 1:
             refusals.append("connection_complete is not 1")
-        if (
-            ints["velocity_validation_complete"] != 1
-            or ints["velocity_validation_passed"] != 1
-        ):
+        # The reconstruction error is measured, not judged, here: the head
+        # judges it on its Sigma correction (link_correction_bound).
+        if ints["velocity_validation_complete"] != 1:
             refusals.append(
-                "mandatory finite-link DFT head validation is not "
-                "complete/passing"
+                "mandatory finite-link DFT head validation is not complete"
             )
         # The links may run on an outer band set that contains the head's
         # (``get_dipole_mtxels --parallel-transport-bands``): the head reads
@@ -514,6 +512,15 @@ def load_parallel_transport_head(
                                      dtype=np.float64))
             for key in validation_names
         }
+        # The link error of link_correction_bound: the head block's relative
+        # Frobenius error (diagonal included).  An artifact that predates it
+        # carries only the transition (off-diagonal) relative L2.
+        try:
+            validation["link_relative_error"] = float(io.read_small(
+                "velocity_validation_relative_frobenius", dtype=np.float64))
+        except (KeyError, RuntimeError, OSError, ValueError):
+            validation["link_relative_error"] = validation[
+                "transition_relative_l2"]
 
         spec = P(None, None, "x", "y")
         nb_outer = int(ints["band_stop"])
@@ -860,6 +867,45 @@ def _spectral_kernel(mesh: Mesh, kgrid: tuple[int, int, int]) -> Callable:
 
     _KERNEL_CACHE[key] = _kernel
     return _kernel
+
+
+def link_correction_bound(correction, velocity_dft, *, link_error: float,
+                          rtol: float, print_fn=print) -> float:
+    r"""Judge the link error on what the head uses: ``D_k DeltaH``.
+
+    The head's velocity is ``v_DFT + D_k DeltaH``; ``v_DFT`` is exact and
+    only the correction goes through the finite links.  The artifact's
+    reconstruction of ``v_DFT`` from ``D_k H_DFT`` measures the links'
+    relative error ``link_error`` (head-block relative Frobenius), so the
+    head's error is bounded by
+
+        ``link_error * |D_k DeltaH|_F / |v_DFT|_F  <=  rtol``
+
+    (the artifact's stamped tolerance, default 5e-3).  Logged at every map;
+    above ``rtol`` the map refuses (``GATE pt_head_link_bound``).  A
+    DFT-start map 0 has ``DeltaH = 0`` and a zero bound.
+    """
+    ratio = float(jax.device_get(
+        jnp.linalg.norm(correction)
+        / jnp.maximum(jnp.linalg.norm(velocity_dft), 1.0e-30)))
+    bound = float(link_error) * ratio
+    print_fn(
+        f"    SC head link bound: rel_err(links) {float(link_error):.3e} x "
+        f"|D_k DeltaH|/|v_DFT| {ratio:.3e} = {bound:.3e} "
+        f"(rtol {float(rtol):.1e})")
+    if not np.isfinite(bound) or bound > float(rtol):
+        raise ValueError(
+            "GATE pt_head_link_bound: the finite-link error on this map's "
+            "QSGW velocity correction exceeds the tolerance.\n"
+            f"  got:  rel_err(links) {float(link_error):.4e} x "
+            f"|D_k DeltaH|/|v_DFT| {ratio:.4e} = {bound:.4e}\n"
+            f"  want: <= {float(rtol):.1e} (the artifact's velocity rtol)\n"
+            "  fix:  a denser k grid (4th-order stencil from 5 points per "
+            "axis), or sc_head_update = dft_velocity\n"
+            "  why:  only D_k DeltaH goes through the links; their relative "
+            "error, measured on the DFT velocity, scales it\n"
+            "  doc:  docs/self_consistency.md, 'Metals: direct Drude head'")
+    return bound
 
 
 def covariant_link_derivative(
@@ -3579,6 +3625,7 @@ def build_iteration_head_response(
     occupation_state=None,
     collapsed_position=None,
     nb_links: int | None = None,
+    link_bound: tuple[float, float] | None = None,
 ) -> IterationHeadResponse:
     """Build current-basis direct head and, when requested, its wings.
 
@@ -3601,7 +3648,7 @@ def build_iteration_head_response(
             )
         # On an outer link set the derivative is taken there and restricted
         # to the head's bands (identity when the two sets agree).
-        v_dft_basis = v_dft_basis + head_band_block(covariant_link_derivative(
+        correction = head_band_block(covariant_link_derivative(
             delta_h_dft,
             forward_links,
             forward_neighbors,
@@ -3611,6 +3658,13 @@ def build_iteration_head_response(
             collapsed_position=collapsed_position,
         ), int(nb_logical), mesh=mesh,
             nb_outer=int(nb_links or nb_logical))
+        if link_bound is not None:
+            link_correction_bound(
+                correction, v_dft_basis, link_error=link_bound[0],
+                rtol=link_bound[1],
+                print_fn=(print if jax.process_index() == 0
+                          else (lambda *a, **k: None)))
+        v_dft_basis = v_dft_basis + correction
     v_qp = rotate_velocity_active_to_qp(v_dft_basis, U_dft_to_qp, mesh=mesh)
     resolved_eta_ry = (
         float(config.head.wcoul0_eta)

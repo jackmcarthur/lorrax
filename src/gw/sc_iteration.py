@@ -3827,6 +3827,9 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
             occupation_state=entry_occ_state,
             collapsed_position=getattr(pt, "collapsed_position", None),
             nb_links=int(getattr(pt, "nb_links", 0) or pt.nb_logical),
+            link_bound=((float(pt.validation["link_relative_error"]),
+                         float(pt.validation["rtol"]))
+                        if forward_links is not None else None),
         )
         velocity_kind = (
             "QSGW finite-link covariant velocity" if forward_links is not None
