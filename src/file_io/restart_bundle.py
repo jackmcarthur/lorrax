@@ -3851,8 +3851,8 @@ def read_vq_payload(restart_file: str, zeta_file: str, *,
     # and compares it against the stored ``V_qmunu[q]`` at 5e-6
     # (``makeVq_vs_disk_Vqmunu_allq_max``).  A permuted or mis-wrapped q list
     # cannot pass that: each q's ζ would be checked against a different q's
-    # stored tile.  Do not run this path with ``LORRAX_SKIP_VQ_GATES=1`` until
-    # it has passed once on a given deck.
+    # stored tile.  That battery is opt-in (``sigma_freq_debug_output``): run
+    # it once on a deck that takes this path.
     if qraw.shape[0] < zx["nq"]:
         _kg = np.asarray(zx["kgrid"], dtype=np.float64)
         _idx = np.stack(np.meshgrid(np.arange(_kg[0]), np.arange(_kg[1]),
@@ -3885,7 +3885,8 @@ def read_vq_payload(restart_file: str, zeta_file: str, *,
                   f"mf_header/kpoints/rk has only {qraw.shape[0]} (the WFN is "
                   f"symmetry-reduced).  q labels reconstructed as the BGW-"
                   f"wrapped C-order {tuple(int(v) for v in zx['kgrid'])} grid; "
-                  f"run_gates' per-q makeVq-vs-disk check verifies it.",
+                  f"run_gates' per-q makeVq-vs-disk check (sigma_freq_debug_output) "
+                  f"verifies it.",
                   flush=True)
         qraw = qfull
     zx["qfr_raw"] = qraw[: zx["nq"]]

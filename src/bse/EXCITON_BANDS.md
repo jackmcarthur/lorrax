@@ -142,12 +142,9 @@ no CLI.
 Allocator matters: the runtime's reserved `cuda_async` pool runs the full
 E_min-anchored window where a BFC arena at 0.95 OOMs on the same hardware.
 
-`LORRAX_SKIP_VQ_GATES=1` (read in `vq_interp.py`) drops the `run_gates` /
-`run_nulls` batteries *and* the `keep_host_mirrors` replicated host tensors —
-the latter is the real saving (a 58 GB alloc at 1496 centroids on 16 GPU).
-Note the sandbox `run_shifter.sh` wrappers pass this via an unquoted
-`${EXTRA_ENV:-}`, which word-splits into a command position and is silently
-dropped; the job runs fine without your env.
+The `run_gates` / `run_nulls` batteries and their `keep_host_mirrors`
+replicated host tensors run only with the deck's `sigma_freq_debug_output =
+true` (a 56.58 GiB XHX on MoS2 8v+8c; 58 GB at 1496 centroids on 16 GPU).
 
 ## Reference run
 

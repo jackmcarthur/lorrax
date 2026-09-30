@@ -1920,7 +1920,8 @@ def main(argv=None):
                     restart_file, mesh_xy, n_rmu_pad, input_file=args.input, alpha=args.alpha,
                     eps_tik=args.eps_tik, eigh_backend=args.eigh_backend,
                     distrib_la_batched_route=args.distrib_la_batched_route,
-                    head_minibz_average=head_mbz, log_fn=log)
+                    head_minibz_average=head_mbz, log_fn=log,
+                    run_diagnostics=bool(params["sigma_freq_debug_output"]))
                 zx, prep = vqm.zx, vqm.prep
                 eval_vq, pinvF, coeffs_packed = (vqm.eval_vq, vqm.pinvF,
                                                  vqm.coeffs_packed)
