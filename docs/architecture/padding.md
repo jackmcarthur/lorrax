@@ -56,6 +56,18 @@ consumers mask the pads with the basis's active-slot map.
 Files store canonical logical rows. Their suffix-padded staging carrier
 (`padded_mu_axis`) may be smaller or larger than the packed carrier, and only
 the basis's pack and unpack seam converts between them.
+
+The two operator axes convert together through
+`common.staged_reshard.permute_sharded_operator`. Replicated-q operators
+stream through tiles whose input carrier is at most 256 MiB per rank;
+input and output remain distributed over all processors. Both axis
+exchanges use the same local permutation owner as the single-axis seam.
+Each all-to-all operand is pinned row-major after its pad or gather so
+layout assignment cannot transpose the complete resident loop input.
+Small operators and q-sharded carriers retain the direct conversion.
+`tests/bench/vq_gate_memory_check.py` checks both extent directions, exact
+pack/unpack parity, nonfinite refusal, and compiled large-carrier scratch;
+the unbounded predecessor must fail that memory threshold.
 `LORRAX_EXTRA_MU_PAD`, which is test-only, enlarges the canonical staging
 carrier and never the packed layout. Channels without a basis keep the suffix
 contract. Transverse metadata never inherits a charge basis built for a
