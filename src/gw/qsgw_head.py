@@ -3284,10 +3284,14 @@ def plasma_frequencies_ev(drude_tensor):
 
 
 def drude_report(atoms) -> str:
-    """Physical and cell-effective plasma frequencies of one metal head."""
-    return ("omega_p physical (exact multiplets, phi -> 0) = "
+    """Physical and cell-effective plasma frequencies of one metal head.
+
+    Each prints the principal values (ascending eigenvalues) of the Drude
+    tensor, not its x/y/z components; the head block prints the diagonal.
+    """
+    return ("omega_p physical principal (exact multiplets, phi -> 0) = "
             + "/".join(f"{x:.4f}" for x in plasma_frequencies_ev(atoms.physical_drude))
-            + " eV; q=0-cell effective (Fermi-surface share phi of near pairs) = "
+            + " eV; q=0-cell effective principal (Fermi-surface share phi of near pairs) = "
             + "/".join(f"{x:.4f}" for x in plasma_frequencies_ev(atoms.drude_tensor))
             + " eV")
 
