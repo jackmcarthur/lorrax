@@ -376,6 +376,9 @@ ragged synthetic rows skip the solver. Matrices beyond that capacity stay
 on the distributed route. A single `PolarPlan(A)` keeps its original route.
 Transport preprocessing collects at most one raw overlap per rank before
 calling this surface; no wavefunction or full-k overlap table is buffered.
+The dipole step passes no budget: its route is the deck's `linalg` dial
+(`local` runs the batch route, `distributed` solves each link on the mesh),
+so the link digits do not depend on free device memory.
 
 `right_singular_vectors(W, tau, *, eigh_plan, column_extent, ...)` returns the
 right singular directions with σ/σ_max > `tau`, closing whole multiplets at
