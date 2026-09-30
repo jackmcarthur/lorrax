@@ -49,9 +49,11 @@ def main():
     assert builds[-1]<=2,builds
     row=dict(room=room,minimum_refused=True,compiled_q_rows=builds.copy(),refusal=str(e),wall_s=time.monotonic()-started)
    else:
-    assert room==60_000_000_000 and check.recompiled and 1<check.chunk<325 and check.compiled_bytes<=room
+    # ChunkCheck.compiled_bytes records the original executable; price is
+    # the corrected executable that passed the authoritative native gate.
+    assert room==60_000_000_000 and check.recompiled and 1<check.chunk<325 and check.price<=room
     ma=check.compiled.memory_analysis()
-    row=dict(room=room,parent_width=check.chunk,recompiled=check.recompiled,compiled_q_rows=builds.copy(),new_bytes=check.compiled_bytes,temp_bytes=ma.temp_size_in_bytes,output_bytes=ma.output_size_in_bytes,alias_bytes=ma.alias_size_in_bytes,wall_s=time.monotonic()-started)
+    row=dict(room=room,parent_width=check.chunk,recompiled=check.recompiled,compiled_q_rows=builds.copy(),new_bytes=check.price,original_new_bytes=check.compiled_bytes,temp_bytes=ma.temp_size_in_bytes,output_bytes=ma.output_size_in_bytes,alias_bytes=ma.alias_size_in_bytes,wall_s=time.monotonic()-started)
   results.append(row);rank0_print(json.dumps(row),flush=True)
  rank0_transaction(a.output,stage='native response q admission',write=lambda:Path(a.output).write_text(json.dumps(results,indent=2)+'\n'));w.close();return 0
 run_main_and_finalize(main)
