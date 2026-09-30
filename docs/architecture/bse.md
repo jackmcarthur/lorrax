@@ -52,8 +52,19 @@ store it (`gw.screening.driver_persists_w0`, `restart_static_w`):
 | the same, `qp_solver = self_consistent` | $V + W^c(0)$ of the accepted final map, evaluated once after the loop |
 | `w_bse`, `w_rpa_resolvent` | the RPA W(0), written by the ladder stage before the ladder runs |
 | bispinor `mpa`, shared pole, `bispinor_gw = bare_transverse`, one-shot or self-consistent | $V + W^c(0)$ of the four-component charge store on the charge V, the same evaluator (charge sector only) |
-| `x_only`; `mpa` with `sigma_w_model = mpa`; `bispinor_gw = full_shared_pole` | nothing |
+| bispinor `mpa`, `bispinor_gw = full_shared_pole` | $V + W^c_{CC}(0)$ of the CC sector (`gw.mpa.sector_sigma.sector_static_wc`) |
+| `x_only`; `mpa` with `sigma_w_model = mpa` | nothing |
 | shared pole on a metal, or `head_correction = full` without an ω = 0 head sample | nothing; the log says why |
+
+W0 is stored on the q parents of `V_qmunu`, with their unfold tables, whenever
+the run's q axis reduces (`restart_q_storage = auto` resolves `ibz`;
+[symmetry register](symmetry_register.md)); a deck whose q axis does not reduce
+stores every q. GW never forms a full-q W0 for the file: the shared-pole
+evaluators run at the parent rows and the writer stores the producer's parents
+(`gw_output.persist_w0_and_head`). The BSE reader restores the full q grid on
+load (`restart_bundle.read_interaction` → `symmetry_maps.unfold_isdf_operator`,
+bounded q tiles), which is the layout the kernels read. Files of either layout
+read.
 
 **Rebuilt W0.** With `W0_ready = false`, the loader calls
 `gw.static_screening.build_static_w_from_restart`. It reads

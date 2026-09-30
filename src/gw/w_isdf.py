@@ -2504,7 +2504,11 @@ def photon_blocks_full_q(packed, keys, *, layout, family_plans, qgrid_policy, st
 
 
 def photon_charge_for_restart(response, meta):
-    """Restore screened CC once and capture its producer q parents for I/O.
+    """Capture screened CC on its producer q parents for I/O.
+
+    Returns ``(restore, head)``: ``restore()`` is the whole-zone CC block,
+    called by the writer only when the file stores the full zone; a wedge
+    file stores the captured parents and nothing restores them here.
 
     The charge block is a scalar Lorentz component with packed centroid axes.
     Its Gamma completion is already in the operator; a consumer must not add
@@ -2543,7 +2547,7 @@ def photon_charge_for_restart(response, meta):
                 if completion is not None else "packed photon CC: head_correction=off"),
         response_kind=(HeadResponseKind.FULL_LOCAL_FIELDS
                        if completion is not None else HeadResponseKind.OFF))
-    return restore(response.W_packed), head
+    return (lambda: restore(response.W_packed)), head
 
 
 def _load_static_photon_hall(

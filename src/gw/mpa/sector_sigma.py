@@ -722,11 +722,17 @@ def compute_sector_sigma(handle, families, bases, meta, mesh_xy, *,
     return (result, tuple(currents)) if on_shell is not None else result
 
 
-def _unfold_w_full(W, Wt, tables, mesh_xy):
-    """``(nq_full, m*nA, n*nB)`` at ``P(None,'x','y')``: the parent pair through ``tables``
-    (the service's reference unfold, on each rank's tiles)."""
+def _unfold_w_rows(W, Wt, tables, rows, mesh_xy):
+    """``(len(rows), m*nA, n*nB)`` at ``P(None,'x','y')``: the parent pair through ``tables``
+    at the full-q rows ``rows`` only (the service's reference unfold, on each rank's
+    tiles).  Every per-q table is cut to those rows, so no full-q tile is formed."""
     from symmetry_maps import apply_unfold_load_tables_local, local_unfold_load_tables
     from common.shard_map import shard_map
+    rows = np.asarray(rows, np.int64)
+    tables = tables._replace(
+        row=tables.row[rows], trs=tables.trs[rows], lsrc=tables.lsrc[rows],
+        rsrc=tables.rsrc[rows], mph=tables.mph[rows], nph=tables.nph[rows],
+        spin=tables.spin[rows], spin_r=None if tables.spin_r is None else tables.spin_r[rows])
     na, nb = int(W.shape[2]), int(W.shape[4])
     spin_l = np.asarray(tables.spin)
     spin_r = None if tables.spin_r is None else np.asarray(tables.spin_r)
@@ -741,8 +747,8 @@ def _unfold_w_full(W, Wt, tables, mesh_xy):
                      check_vma=False)(W, Wt)
 
 
-def sector_static_wc(handle, meta, *, mesh_xy):
-    """Wc_CC(q, omega = 0) of a four-current sector model, full q grid.
+def sector_static_wc(handle, meta, *, mesh_xy, rows):
+    """Wc_CC(q, omega = 0) of a four-current sector model at the full-q rows ``rows``.
 
     The charge-sector body of the restart's ``W0_qmunu = V + Wc_CC(0)`` for
     ``bispinor_gw = full_shared_pole``, as :func:`gw.mpa.sigma.shared_pole_static_wc`
@@ -763,8 +769,15 @@ def sector_static_wc(handle, meta, *, mesh_xy):
     head) beside this W0; storing the screened head would count W_h - V_h
     twice.
 
-    Returns ``(Q, m, m)`` complex128 at ``P(None,'x','y')`` in the run's
-    packed charge-centroid order (``meta.mu_basis``, the CC endpoint basis).
+    ``rows`` are the full-q rows the restart stores: the q parents of the
+    run's V wedge (``QirrOperator.full_rows``), or every q on a deck whose q
+    axis does not reduce.  Both branches are unfolded at those rows only, so
+    no full-q W is formed (TASTE 97); BSE unfolds the stored parents on load
+    (``file_io.restart_bundle.read_interaction``).
+
+    Returns ``(len(rows), m, m)`` complex128 at ``P(None,'x','y')`` in the
+    run's packed charge-centroid order (``meta.mu_basis``, the CC endpoint
+    basis).
     """
     from file_io.shared_pole_store import open_shared_pole_model, validate_shared_pole_model
     from .sigma import _shared_pole_omega0_weights
@@ -774,14 +787,17 @@ def sector_static_wc(handle, meta, *, mesh_xy):
                                       mesh_xy=mesh_xy,capacity=capacity)
     if header.get('sector')!='CC' or header['digest']!=cc['digest']:
         raise ValueError('GATE shared_pole_identity: W0 handle is not the published CC model')
+    rows=np.asarray(rows,np.int64).reshape(-1)
     Q,m=int(header['n_q_full']),int(meta.mu_basis.n_packed)
+    if rows.size==0 or rows.min()<0 or rows.max()>=Q:
+        raise ValueError(f'GATE shared_pole_static_w: rows must be full-q rows in [0, {Q})')
     if not int(header['Kmax']):
-        return _zeros(mesh_xy,(Q,m,m))()
+        return _zeros(mesh_xy,(rows.size,m,m))()
     counts=np.asarray(header['K'],np.int64)
     intervals=device_put_process_local(np.ascontiguousarray(
         np.stack([np.zeros_like(counts),counts],axis=1)),NamedSharding(mesh_xy,P()))
     ambient=capacity.live_stages
-    tile=-(-16*Q*m*m//int(mesh_xy.size))
+    tile=-(-16*rows.size*m*m//int(mesh_xy.size))
     capacity.reserve('w0.static_output',resident_bytes_per_rank=2*tile,
                      workspace_bytes_per_rank=0,concurrent_with=ambient)
     capacity.live_stages=(*ambient,'w0.static_output')
@@ -792,11 +808,11 @@ def sector_static_wc(handle, meta, *, mesh_xy):
                 stage='w0')
             wc=None
             try:
-                # The restart file holds W0 on the full q grid (its contract): the
-                # parent pair is unfolded once here, at persist, both branches.
+                # Both branches at the stored rows only: W_+ through the particle
+                # tables and W_-(q) = partner(-q) through the hole tables.
                 x,y,poles=synthesis.resident_operands()
                 pair=synthesis.w_kernel(x,y,poles,intervals,0.0,0.0,False)
-                wc=sum(_unfold_w_full(pair.W,pair.partner,tables,mesh_xy)
+                wc=sum(_unfold_w_rows(pair.W,pair.partner,tables,rows,mesh_xy)
                        for tables in synthesis.w_tables)
             finally:
                 synthesis.close(wc)

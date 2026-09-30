@@ -1125,9 +1125,16 @@ def write_w0_qmunu_to_h5(
     whose V is a wedge (or the reverse) would be a file no reader can make
     sense of, and the two are kept together by passing one decision to both
     rather than by hoping.  ``None`` is today's behaviour exactly.
+
+    On the wedge arm the capture's parents ARE the data, so ``W0_qmunu`` is
+    ``None`` there: the producer never forms the full-q W0 (TASTE 97).
     """
     from .slab_io import SlabIO
 
+    if W0_qmunu is None and not (qirr is not None and qirr.store_wedge):
+        raise ValueError(
+            "write_w0_qmunu_to_h5: no W0 array and no q-parent capture; a "
+            "full-zone file needs the full-zone W0")
     if qirr is not None and qirr.store_wedge:
         if qirr.capture is None:
             raise ValueError(

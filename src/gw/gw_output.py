@@ -446,6 +446,12 @@ def persist_w0_and_head(
     an evaluation rather than a held array (the shared-pole model) runs it
     only when the file is written.
 
+    W0 is stored on the q parents whenever the run's q axis reduces
+    (``restart_q_storage`` resolves ``ibz``): the file holds the producer's
+    pre-unfold capture and its unfold tables, and nothing here forms a
+    full-q W0.  BSE unfolds on load.  A file whose q axis does not reduce
+    stores the whole zone, which is then the parent set.
+
     ``photon_response`` selects the produced screened charge block and its
     q-parent capture when the packed operator owns the whole static Sigma.
     Dynamic modes retain their existing charge body and probe-head receipt.
@@ -473,11 +479,17 @@ def persist_w0_and_head(
         return
     if callable(W_q):
         W_q = W_q()
+    # ``full_zone``: a zero-argument restore of the whole q zone, called only
+    # when the file stores the full zone (no wedge).  The packed photon's
+    # charge block is held on its q parents; the writer never restores it on
+    # the wedge arm.
+    full_zone = None
     from .gw_config import packed_photon_replaces_charge_sigma
     if (photon_response is not None
             and packed_photon_replaces_charge_sigma(config)):
         from .w_isdf import photon_charge_for_restart
-        W_q, static_head_sample = photon_charge_for_restart(photon_response, meta)
+        full_zone, static_head_sample = photon_charge_for_restart(photon_response, meta)
+        W_q = None
         static_head_only = True
     from .gw_config import uses_full_bispinor_shared_pole
     if uses_full_bispinor_shared_pole(config) and iteration_head is None:
@@ -564,13 +576,8 @@ def persist_w0_and_head(
         omega_grid = np.array([0.0], dtype=np.float64)
 
     from file_io import write_w0_qmunu_to_h5, write_head_scalars_to_h5
-    # W_q is already flat-q (nq, μ, μ).  The W0_qmunu placeholder
-    # created by ``write_restart_state_to_h5(init_W0=True)`` is
-    # rank-3 (sized from V_qmunu), so we write W_q at flat-q.
-    # Previously this reshaped to legacy 8-D and tripped
-    # ``phdf5 async write: dataset rank mismatch ds=/W0_qmunu
-    # file_rank=3 write_rank=8``.  Downstream (BSE) consumers
-    # of W0_qmunu were already updated to flat-q in commit a052a1c.
+    # W0_qmunu is rank 3, flat q: (q parents or full q, μ, μ), as the
+    # placeholder ``write_restart_state_to_h5(init_W0=True)`` sized from V.
     # THE SAME DECISION V TOOK, taken the same way, on W's OWN capture.
     # ``sym``/``centroid_indices`` reach here through the resolver rather
     # than through this function's signature because the head/W0 persist
@@ -592,25 +599,32 @@ def persist_w0_and_head(
             fft_grid=getattr(meta, "fft_grid", None), print_fn=print_fn,
             context="W0 restart tensor")
     with _tmg.section("persist_w0.write_w0"):
-        # Screening holds W on its q wedge; the writer takes the full zone
-        # (its wedge arm stores the producer's own pre-unfold capture).
+        # W is held on its q parents (screening's wedge, the shared-pole
+        # evaluation at V's parents, the packed photon's parents).  On the
+        # wedge arm the file stores exactly those parents with their unfold
+        # tables and no full-q W0 is formed here (TASTE 97); BSE unfolds on
+        # load.  Only a file that stores the whole zone (a q axis that does
+        # not reduce, or no wedge resolution) takes the unfold.
         from .cohsex_sigma import interaction_operator
-        W_op = interaction_operator(W_q)
+        W_op = None if W_q is None else interaction_operator(W_q)
         capture = take_pre_unfold("W0_qmunu")
-        if capture is not None and not W_op.is_whole_zone():
+        if capture is not None and W_op is not None and not W_op.is_whole_zone():
             # The captured block IS the wedge W's buffer.  A role spilled to
             # host while a later role screened was deleted and restored into a
             # new buffer, so the capture takes the live one (the same bits).
             import dataclasses as _dc
             capture = _dc.replace(capture, X_ibz=W_op.values)
-        W_q = W_op.unfold(mesh_xy)
-        if getattr(meta, "mu_basis", None) is not None:
-            # Files keep the canonical centroid order.
-            W_q = meta.mu_basis.unpack_operator(W_q)
-        write_w0_qmunu_to_h5(tensors_filename, W_q,
+        qirr = _qirr.with_capture(capture)
+        W_full = None
+        if not qirr.store_wedge:
+            W_full = full_zone() if W_op is None else W_op.unfold(mesh_xy)
+            if getattr(meta, "mu_basis", None) is not None:
+                # Files keep the canonical centroid order.
+                W_full = meta.mu_basis.unpack_operator(W_full)
+        del W_q, W_op
+        write_w0_qmunu_to_h5(tensors_filename, W_full,
                              n_rmu_logical=int(meta.n_rmu),
-                             mesh=mesh_xy,
-                             qirr=_qirr.with_capture(capture))
+                             mesh=mesh_xy, qirr=qirr)
     _stamp_screening_diagrams(tensors_filename, config)
     with _tmg.section("persist_w0.write_head"):
         write_head_scalars_to_h5(

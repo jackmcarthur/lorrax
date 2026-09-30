@@ -142,18 +142,24 @@ def _shared_pole_static_body(shared_pole, V_q, *, meta, mesh_xy, print_fn):
     from .restart_q_storage import deposit_pre_unfold
 
     V_op = QirrOperator.of(V_q)
-    # full_shared_pole: the CC sector (charge-sector W0; CT/TC/TT not stored).
-    evaluate = (sector_static_wc if shared_pole.get("representation") == "sector-ordered-ph"
-                else shared_pole_static_wc)
-    wc = evaluate(shared_pole, meta, mesh_xy=mesh_xy)
-    if tuple(wc.shape) != (V_op.n_full, *V_op.values.shape[1:]):
+    if shared_pole.get("representation") == "sector-ordered-ph":
+        # full_shared_pole: the CC sector (charge-sector W0; CT/TC/TT not
+        # stored), evaluated at V's q parents only: no full-q W is formed.
+        wc = sector_static_wc(shared_pole, meta, mesh_xy=mesh_xy,
+                              rows=V_op.full_rows)
+        expected = V_op.values.shape
+    else:
+        wc = shared_pole_static_wc(shared_pole, meta, mesh_xy=mesh_xy)
+        expected = (V_op.n_full, *V_op.values.shape[1:])
+    if tuple(wc.shape) != tuple(expected):
         raise ValueError(
             "GATE shared_pole_static_w: model Wc(0) has shape "
-            f"{tuple(wc.shape)}; V_q is {V_op.n_full} q x "
-            f"{tuple(V_op.values.shape[1:])}; the two must share one "
+            f"{tuple(wc.shape)}; want {tuple(expected)} (V_q is {V_op.n_full} q x "
+            f"{tuple(V_op.values.shape[1:])}); the two must share one "
             "packed centroid carrier")
-    W0 = V_op.with_values(
-        V_op.values + QirrOperator.whole_zone(wc).at_rows(V_op.full_rows))
+    if tuple(wc.shape) != tuple(V_op.values.shape):
+        wc = QirrOperator.whole_zone(wc).at_rows(V_op.full_rows)
+    W0 = V_op.with_values(V_op.values + wc)
     del wc
     if not V_op.is_whole_zone():
         deposit_pre_unfold(
