@@ -346,22 +346,21 @@ def add_band_diag_sharded(sigma_w_kij: jax.Array, diag_w_kn) -> jax.Array:
                  out_specs=P(None, None, 'x', 'y'),
                  check_vma=False)
         def _add_diag(tile, diag):
+            # One elementwise select, not a scatter-add: XLA:GPU lowers
+            # ``tile.at[:, :, a, b].add`` through a transposed copy of the
+            # whole tile, a third tile-sized buffer beside input and output
+            # (the Na 8^3 [-100,+150] eV OOM, 14.12 GiB).  Diagonal slots
+            # take the same IEEE ``x + d``; off-diagonal slots are returned
+            # untouched.
             ix = jax.lax.axis_index('x')
             iy = jax.lax.axis_index('y')
-            mb = tile.shape[2]
-            nbl = tile.shape[3]
-            nb = diag.shape[2]
-            i = jnp.arange(nb)
-            a = i - ix * mb
-            b = i - iy * nbl
-            own = (a >= 0) & (a < mb) & (b >= 0) & (b < nbl)
-            a_c = jnp.clip(a, 0, mb - 1)
-            b_c = jnp.clip(b, 0, nbl - 1)
-            contrib = jnp.where(own[None, None, :], diag,
-                                jnp.zeros((), dtype=diag.dtype))
-            # Non-owned i map to clipped duplicate (a, b) slots with exact-0
-            # contributions — scatter-add of zeros, value- and bit-neutral.
-            return tile.at[:, :, a_c, b_c].add(contrib)
+            mb, nbl = tile.shape[2], tile.shape[3]
+            rows = ix * mb + jnp.arange(mb)
+            cols = iy * nbl + jnp.arange(nbl)
+            on_diagonal = rows[:, None] == cols[None, :]
+            d_rows = jnp.take(diag, rows, axis=2)[..., :, None]
+            return jnp.where(on_diagonal[None, None, :, :],
+                             tile + d_rows, tile)
 
         fn = _add_diag
         _ADD_BAND_DIAG_KERNEL_CACHE[key] = fn
