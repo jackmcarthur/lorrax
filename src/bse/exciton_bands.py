@@ -134,7 +134,8 @@ import jax.numpy as jnp
 from jax import lax
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
-from solvers.lanczos import (alpha_herm_sink, block_lanczos_eig_jit,
+from solvers.lanczos import (ALPHA_HERM_RTOL, alpha_herm_sink,
+                             block_lanczos_eig_jit,
                              report_alpha_herm, split_alpha_sink)
 from common.band_degeneracy import DEFAULT_MODE, DEGENERACY_TOL_RY, MODES
 from common.fft_helpers import make_kfft_kminor
@@ -149,7 +150,8 @@ from .bse_ring_comm import create_mesh_xy_from_flags, make_bse_shardings
 from .bse_preconditioner import compute_pair_amplitude
 from .bse_stack_matvec import build_bse_stack_matvec
 from .exchange_path import exchange_tiles
-from .bse_window import apply_eqp_to_bse_window, require_valence_pad_guard
+from .bse_window import (apply_eqp_to_bse_window, pad_zone_mask_np,
+                         require_valence_pad_guard)
 from . import vq_interp
 
 RY2EV = 13.6056980659
@@ -272,7 +274,8 @@ def _gather_host(x):
 # the single-compile path solver: scan(per-Q block-Lanczos) over the Q list
 # ===========================================================================
 def build_path_solver(mesh_xy: Mesh, nkx: int, nky: int, nkz: int,
-                      nc_pad: int, nv_pad: int, *, n_eig: int,
+                      nc_pad: int, nv_pad: int, n_cond: int, n_val: int,
+                      *, n_eig: int,
                       block_size: int, max_iter: int, n_reorth: int | None = None,
                       head_tensor: bool = False):
     """One jitted ``solve_path`` for a whole Q list.
@@ -317,7 +320,14 @@ def build_path_solver(mesh_xy: Mesh, nkx: int, nky: int, nkz: int,
     matvec = build_bse_stack_matvec(mesh_xy, nkx, nky, nkz, kernel="bse",
                                     head_tensor=head_tensor)
     from distrib_la import plan_subspace
-    lanczos_depth = max(1, min(int(max_iter), n_flat // int(block_size)))
+    # The Krylov space lives on the physical transitions: the start block
+    # has no support on the mesh pad, which the operator keeps at exactly
+    # zero, so the recurrence and its α-Hermiticity scale are the same
+    # numbers at every P (the pad's PAD_EPS_GUARD_RY diagonal used to set
+    # the scale on a padded mesh).  The depth counts physical transitions.
+    support = pad_zone_mask_np(n_cond, n_val, nc_pad, nv_pad, nk)[0]
+    n_phys = int(n_cond) * int(n_val) * nk
+    lanczos_depth = max(1, min(int(max_iter), n_phys // int(block_size)))
     lanczos_plan = plan_subspace(
         capacity=(lanczos_depth + 1) * int(block_size), n_eig=n_eig,
         max_block_size=max(int(block_size), n_eig),
@@ -361,7 +371,8 @@ def build_path_solver(mesh_xy: Mesh, nkx: int, nky: int, nkz: int,
                     matvec_block, n_flat, n_eig=n_eig, block_size=block_size,
                     max_iter=max_iter, n_reorth=n_reorth,
                     subspace_plan=lanczos_plan,
-                    vector_shape=(nc_pad, nv_pad, nk), structured_vectors=True)
+                    vector_shape=(nc_pad, nv_pad, nk), structured_vectors=True,
+                    support=support)
             _labels, _payload = split_alpha_sink(_sink)
             alpha_labels[:] = _labels
             return carry, (evs[:n_eig].real, _payload)
@@ -385,18 +396,21 @@ def _report_alpha_over_path(labels, alpha_all, log=print):
     a stricter statement than any single Q, in one line instead of nQ lines.
     The Q index is named so a failure is locatable.
 
-    Returns True only if the worst Q on every label passes (and therefore, the
-    ratio being maximised, only if every Q passes).
+    Returns ``(ok, worst)``: ``ok`` is True only if the worst Q on every
+    label passes (and therefore, the ratio being maximised, only if every Q
+    passes); ``worst`` is the largest ``dev/scale`` over labels and Q, the
+    number the report's verdict line prints.
     """
     if not labels:
-        return True
-    ok = True
+        return True, 0.0
+    ok, worst_rel = True, 0.0
     for (name, form), (dev, scale, worst) in zip(labels, alpha_all):
         dev = np.asarray(dev)
         scale = np.asarray(scale)
         worst = np.asarray(worst)
         rel = dev / np.maximum(scale, np.finfo(dev.dtype).tiny)
         iq = int(np.argmax(rel))
+        worst_rel = max(worst_rel, float(rel[iq]))
         log(f"[alpha-herm] worst of {dev.size} Q is Q#{iq} "
             f"(dev/scale = {rel[iq]:.3e})")
         # ``form`` is a LOOKUP KEY into solvers.lanczos._ALPHA_FORMS, not free
@@ -404,7 +418,7 @@ def _report_alpha_over_path(labels, alpha_all, log=print):
         ok = report_alpha_herm(
             ((f"{name} (worst of {dev.size} Q, at Q#{iq})", form),),
             ((dev[iq], scale[iq], worst[iq]),)) and ok
-    return ok
+    return ok, worst_rel
 
 
 # ===========================================================================
@@ -2254,7 +2268,8 @@ def main(argv=None):
             head_args = (jnp.asarray(D_head),
                          jnp.asarray(M_stack, dtype=jnp.float64))
         solver = build_path_solver(
-            mesh_xy, nkx, nky, nkz, nc_pad, nv_pad, n_eig=args.n_eig,
+            mesh_xy, nkx, nky, nkz, nc_pad, nv_pad, n_cond, n_val,
+            n_eig=args.n_eig,
             block_size=args.block_size, max_iter=args.max_iter,
             head_tensor=head_mbz)
         tick("w_r_and_build", t0)
@@ -2273,7 +2288,7 @@ def main(argv=None):
         # The α-Hermiticity invariant, replayed on the host from scalars the scan
         # returned.  Same tolerance, same message, same LORRAX_SANITY=strict raise
         # as the in-jit callback it replaces — see _report_alpha_over_path.
-        alpha_ok = _report_alpha_over_path(
+        alpha_ok, alpha_rel = _report_alpha_over_path(
             solver.alpha_labels, jax.device_get(alpha_dev), log=log)
         t_first = time.time() - t_c0
         tick("solve_scan_cold", t_c0)
@@ -2348,7 +2363,9 @@ def main(argv=None):
         report.emit(f"Computed levels: {int(args.n_eig)} at {int(nQ_path)} path points")
         report.emit(f"Energy extent  : [{float(np.min(_path_ev)):.5f}, "
                     f"{float(np.max(_path_ev)):.5f}] eV")
-        report.emit("Hermiticity    : " + ("PASS" if alpha_ok else "FAILED"))
+        report.emit("Hermiticity    : " + ("PASS" if alpha_ok else "FAILED")
+                    + f" (worst max|alpha - alpha^H|/max|alpha| = "
+                    f"{alpha_rel:.2e}, tol {ALPHA_HERM_RTOL:.0e})")
         for inode, (idx, label) in enumerate(zip(node_idx, node_labels), start=1):
             levels = _path_ev[int(idx)]
             shown = "  ".join(f"{float(value):.5f}" for value in levels[:3])

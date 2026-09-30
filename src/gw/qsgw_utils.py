@@ -7,9 +7,10 @@ their band tiles; diagonal-only operations extract and return only the bounded
 ``(nk, nb)`` diagonal.  Everything in this module is structured around that
 seam:
 
-- :func:`solve_diagonal_sigma_fixed_point` runs on host NumPy with
-  vectorised linear interpolation over the (nk, nb) energy grid.  Its
-  input ``Σ_diag(ω, k, n)`` is small enough to live replicated.
+- :func:`solve_qp`'s ``fixed_point`` branch solves the diagonal on-shell
+  equation through ``eqp_bgw.solve_qp_root`` (the diagonal-root owner) on
+  host NumPy.  Its input ``Σ_diag(ω, k, n)`` is small enough to live
+  replicated.
 - :func:`build_qsgw_sigma_xc` is a JIT'd JAX kernel that takes the
   on-device sharded ``Σ_c(ω)`` and the QP energies ``E_kn`` (replicated)
   and returns the Hermitised QSGW Σ_xc in the selected replicated or
@@ -179,7 +180,7 @@ def sigma_grid_edge_ambiguity(
 
 
 # ---------------------------------------------------------------------------
-# Diagonal-Σ(E) fixed point  (host NumPy, vectorised)
+# ω-grid hole refusal for solved QP energies (host NumPy)
 # ---------------------------------------------------------------------------
 
 def assert_omega_grid_covers(E_kn_ry, in_grid_mask, omega_grid_ry, *,
@@ -222,72 +223,6 @@ def assert_omega_grid_covers(E_kn_ry, in_grid_mask, omega_grid_ry, *,
                 "QP energy lies on a grid patch.  Widen the nearest "
                 "sigma_omega_patches_ev patch (QP energies drift between "
                 "QSGW iterations; leave headroom).")
-
-
-def solve_diagonal_sigma_fixed_point(
-    h0_diag_ev: np.ndarray,
-    sigma_omega_diag_ev: np.ndarray,
-    omega_ev: np.ndarray,
-    *,
-    max_iter: int = 80,
-    tol_ev: float = 1.0e-6,
-    mixing: float = 0.6,
-) -> tuple[np.ndarray, np.ndarray, int]:
-    """Solve E = h0 + Re Σ(E) per (k, n) by linear mixing.
-
-    Vectorised over (k, n): each iteration performs one ``np.searchsorted``
-    + two fancy-index gathers over the ω-axis, no Python (k, n) loop.
-
-    Parameters
-    ----------
-    h0_diag_ev : (nk, nb)
-        Static one-body diagonal (typically ``diag(kin_ion + V_H)``) in eV.
-    sigma_omega_diag_ev : (nω, nk, nb), complex
-        Diagonal Σ_xc(ω) in eV.  Caller is responsible for adding the
-        static Σ_x diagonal to the dynamic Σ_c diagonal before invocation.
-    omega_ev : (nω,)
-        ω-grid in eV, monotonically increasing.
-
-    Returns
-    -------
-    E : (nk, nb)
-        Converged QP eigenvalues in eV.  An iterate outside
-        ``[ω_min, ω_max]`` reads Σ(ω = 0) (:func:`interp_along_omega`), not
-        the grid edge, whatever ``sigma_out_of_grid`` says; the caller
-        (:func:`solve_qp`) puts every band that is not on the grid at all k
-        back at E_DFT.
-    converged : (nk, nb), bool
-        Per-band convergence flag from the final iteration.
-    n_iter : int
-        Iterations performed (≤ ``max_iter``).
-    """
-    h0 = np.asarray(h0_diag_ev, dtype=np.float64)
-    sigma_w = np.asarray(sigma_omega_diag_ev, dtype=np.complex128)
-    omega = np.asarray(omega_ev, dtype=np.float64)
-    if sigma_w.ndim != 3:
-        raise ValueError("sigma_omega_diag_ev must have shape (nω, nk, nb).")
-    if h0.shape != sigma_w.shape[1:]:
-        raise ValueError(
-            f"shape mismatch: h0={h0.shape}, sigma_w={sigma_w.shape}")
-
-    i0 = int(np.argmin(np.abs(omega)))
-    E = h0 + np.real(sigma_w[i0])
-    mix = float(np.clip(mixing, 0.0, 1.0))
-
-    for it in range(max_iter):
-        # An off-grid iterate reads Sigma(omega = 0) (interp_along_omega):
-        # a refusal here would kill the solve on a band the caller replaces
-        # by E_DFT anyway (see the Returns section).  Unreported on purpose —
-        # it runs up to ``max_iter`` times and one line per iteration is
-        # noise, not evidence; the OUTPUT path reports the count.
-        sig_at_E = interp_along_omega(sigma_w, omega, E)
-        E_new = h0 + np.real(sig_at_E)
-        E_next = (1.0 - mix) * E + mix * E_new
-        diff = np.abs(E_next - E)
-        E = E_next
-        if bool(np.all(diff < tol_ev)):
-            return E, diff < tol_ev, it + 1
-    return E, np.abs(E_new - E) < tol_ev, max_iter
 
 
 # ---------------------------------------------------------------------------
@@ -897,9 +832,11 @@ def solve_qp(
       Static modes (X_ONLY / COHSEX) and the streamed-Σ_c stand-in land
       here too: ``sigma_xc_kij_ry`` is the mode's total Σ_xc by
       construction.
-    - ``fixed_point`` — diagonal on-shell solve E = h₀ + ReΣ(E) followed
-      by a QSGW rebuild at the solved energies.  A band off the ω grid at
-      any k keeps E_DFT, and an off-grid evaluation in the rebuild reads
+    - ``fixed_point`` — the diagonal on-shell root E = h₀ + ReΣ(E) of
+      ``eqp_bgw.solve_qp_root`` followed by a QSGW rebuild at the solved
+      energies.  A band off the ω grid at any k keeps E_DFT; an in-grid
+      state with no root on its bracket refuses
+      (``GATE qp_fixed_point_no_root``); an off-grid evaluation in the rebuild reads
       Σ(ω = 0) whatever ``sigma_out_of_grid`` says (``build_qsgw_sigma_xc``
       is called with its default).  Dynamic, non-streamed only
       (validated at config load).  The dispatch's internal at-DFT build
@@ -945,33 +882,70 @@ def solve_qp(
             sigma_c_diag_w_kn_ry, band_axis, axis=-1))
     sigma_x_diag_kn_ry = np.real(
         static_sigma_diag_to_host(sig_x, mesh_xy))
-    sigma_xc_diag_w_kn_ry = sigma_c_diag_w_kn_ry + sigma_x_diag_kn_ry[None, :, :]
 
     h0_diag_ry = (
         np.real(static_sigma_diag_to_host(kin_ion, mesh_xy))
         + np.real(static_sigma_diag_to_host(sig_h, mesh_xy)))
     efermi_ry = float(sigma_result.efermi_dft_ev) / RYD_TO_EV
-    E_sc_rel_ry, _, n_iter = solve_diagonal_sigma_fixed_point(
-        h0_diag_ry - efermi_ry, sigma_xc_diag_w_kn_ry, omega_grid_ry,
-        max_iter=120, tol_ev=1.0e-7 / RYD_TO_EV, mixing=0.6,
-    )
+
+    # The diagonal on-shell root E = h₀ + Σ_x + ReΣ_c(E) has ONE owner,
+    # eqp_bgw.solve_qp_root (the root eqp_root.dat reports): bracketed from
+    # E_DFT toward eqp0 = h₀ + Σ_x + ReΣ_c(E_DFT), so its static part is
+    # exactly h₀ + Σ_x, and the first sign change of the piecewise-linear
+    # residual is solved in its cell.  It has no iteration to leave
+    # unconverged; a state with no root on the sampled bracket says so.
+    from .eqp_bgw import QP_RES_Z, QP_STATUS_NAMES, solve_qp_root
+    omega_grid_ev = omega_grid_ry * RYD_TO_EV
+    E_dft_rel_ev = E_dft_rel_ry * RYD_TO_EV
+    sigma_c_diag_w_kn_ev = sigma_c_diag_w_kn_ry * RYD_TO_EV
+    static_rel_ev = (h0_diag_ry - efermi_ry + sigma_x_diag_kn_ry) * RYD_TO_EV
+    eqp0_rel_ev = static_rel_ev + np.real(interp_along_omega(
+        sigma_c_diag_w_kn_ev, omega_grid_ev, E_dft_rel_ev))
+    root = solve_qp_root(
+        sigma_c_omega_diag_ev=sigma_c_diag_w_kn_ev,
+        omega_rel_ev=omega_grid_ev, e_in_rel_ev=E_dft_rel_ev,
+        eqp0_rel_ev=eqp0_rel_ev, reference_ev=0.0)
+    E_sc_rel_ry = root.e_ev / RYD_TO_EV
 
     # A band is "in-grid" iff E_DFT[k, n] lies in [ω_min, ω_max] for every
-    # k; if any single k is outside, the band keeps E_DFT at every k (the
-    # diagonal solver read Σ(ω = 0) for the offending k, which would
-    # otherwise contaminate the band's k-dispersion).  E_DFT is the
-    # zeroth-order QP correction = 0 estimate.
+    # k; if any single k is outside, the band keeps E_DFT at every k, so
+    # one off-grid k cannot contaminate the band's k-dispersion.  E_DFT is
+    # the zeroth-order QP correction = 0 estimate.
     from .scissor import classify_bands_in_grid
     band_in_grid, in_grid_kn_band = classify_bands_in_grid(
         E_dft_rel_ry, float(omega_grid_ry[0]), float(omega_grid_ry[-1]))
+    # QP and RES_Z rows are roots of the equation; RES_BRACKET (no root on
+    # the fully sampled bracket: a resonance) and OFF_GRID (the bracket
+    # leaves the grid before the residual changes sign) have none.
+    no_root = in_grid_kn_band & (root.status > QP_RES_Z)
+    if np.any(no_root):
+        k0, n0 = (int(i) for i in np.argwhere(no_root)[0])
+        counts = {name: int(np.count_nonzero(no_root & (root.status == code)))
+                  for code, name in enumerate(QP_STATUS_NAMES)
+                  if code > QP_RES_Z}
+        raise ValueError(
+            "GATE qp_fixed_point_no_root: qp_solver = fixed_point found no "
+            "root of E = h0 + Sigma_x + Re Sigma_c(E) on the sampled "
+            f"bracket [E_DFT, eqp0] for {int(np.count_nonzero(no_root))} "
+            f"state(s) of bands on the Sigma(omega) grid ({counts}); e.g. "
+            f"k {k0}, Sigma band {n0}, E_DFT - E_F = "
+            f"{float(E_dft_rel_ev[k0, n0]):.4f} eV "
+            f"({QP_STATUS_NAMES[int(root.status[k0, n0])]}).  FALSE case: "
+            "every in-grid state has a root "
+            "(gw.eqp_bgw.solve_qp_root).  OFF_GRID: widen the Sigma(omega) "
+            "grid.  RES_BRACKET: the state is a resonance with no "
+            "quasiparticle near E_DFT; use qp_solver = one_shot_dft or "
+            "self_consistent.")
     assert_omega_grid_covers(
         E_sc_rel_ry, in_grid_kn_band, omega_grid_ry,
         context="diagonal QSGW fixed point")
     n_bands_in = int(band_in_grid.sum())
     n_bands_total = int(band_in_grid.size)
+    counts = root.counts()
     print_fn(
-        f"  Diagonal SC: {n_bands_in}/{n_bands_total} bands fully in grid, "
-        f"{n_iter} iterations")
+        f"  Diagonal QP root (gw.eqp_bgw.solve_qp_root): {n_bands_in}/"
+        f"{n_bands_total} bands fully in grid; states QP={counts['QP']} "
+        f"RES_Z={counts['RES_Z']} (off-grid bands keep E_DFT)")
     E_sc_rel_ry = np.where(in_grid_kn_band, E_sc_rel_ry, E_dft_rel_ry)
     E_sc_rel_ev = E_sc_rel_ry * RYD_TO_EV
 

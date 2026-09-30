@@ -821,6 +821,7 @@ def block_lanczos_eig_jit(
     subspace_plan=None,
     vector_shape=None,
     structured_vectors=False,
+    support=None,
 ) -> tuple[jax.Array, jax.Array]:
     """JIT-compiled block Lanczos using ``lax.fori_loop``.
 
@@ -862,6 +863,16 @@ def block_lanczos_eig_jit(
         section, "THE WINDOW INCLUDES THE CURRENT BLOCK Q_j".
         Default ``FULL_REORTH`` (-1) = the whole basis.
 
+    support : host array of ``vector_shape``, optional
+        1 on the entries the operator acts on, 0 on layout padding the
+        operator leaves invariant at exactly zero (the BSE mesh pad,
+        ``bse.bse_window.pad_zone_mask_np``).  The start block is drawn on
+        the supported entries only, in their row-major order, so it and
+        every Krylov block are the same numbers whatever pad the process
+        mesh adds, and the α-Hermiticity scale is the operator's own rather
+        than the pad sentinel's.  The exhaustion clamp counts supported
+        entries.  ``None``: every entry.
+
     Krylov-exhaustion clamp: the Krylov space cannot exceed the vector
     space, so ``max_iter`` is clamped to ``floor(n / block_size)``.
     Running past exhaustion is not benign — the residual block collapses,
@@ -873,7 +884,12 @@ def block_lanczos_eig_jit(
     whole space and the extremal Ritz values are dense-quality.
     """
     bs = int(block_size)
-    max_iter = max(1, min(int(max_iter), int(n) // bs))
+    active = (None if support is None
+              else np.flatnonzero(np.asarray(support).reshape(-1)))
+    if active is not None and int(np.size(support)) != int(n):
+        raise ValueError('Lanczos support must have n entries')
+    n_active = int(n) if active is None else int(active.size)
+    max_iter = max(1, min(int(max_iter), n_active // bs))
     subspace_plan = _resolve_subspace_plan(
         subspace_plan, (max_iter + 1) * bs, n_eig,
         max_block_size=max(bs, n_eig))
@@ -887,8 +903,10 @@ def block_lanczos_eig_jit(
     # Initial orthonormal block via QR of random complex Gaussian.
     key = jax.random.PRNGKey(seed)
     k1, k2 = jax.random.split(key)
-    Q0 = (jax.random.normal(k1, (n, bs), dtype=jnp.float64)
-          + 1j * jax.random.normal(k2, (n, bs), dtype=jnp.float64))
+    Q0 = (jax.random.normal(k1, (n_active, bs), dtype=jnp.float64)
+          + 1j * jax.random.normal(k2, (n_active, bs), dtype=jnp.float64))
+    if active is not None:
+        Q0 = jnp.zeros((int(n), bs), dtype=Q0.dtype).at[active].set(Q0)
     Q0 = (subspace_plan.qr(Q0.T.reshape(bs, *vector_shape))[0]
           if subspace_plan is not None else jnp.linalg.qr(Q0)[0])
 
