@@ -1314,7 +1314,8 @@ def main(argv=None):
 					bvec=wfn.bvec, blat=wfn.blat, vnl_setup=vnl_setup,
 					gvecs=gtab.gvecs, gmask=gtab.mask,
 					box_index=wfn.box_index(k="full_bz"),
-					kvecs=np.asarray(gtab.kvecs))
+					kvecs=np.asarray(gtab.kvecs),
+					vnl_velocity_sign=vnl_velocity_sign)
 			with timing.section("static_gauge_hall_reduce"):
 				hall = static_gauge_hall_transaction(
 					uniform_gauge, wfn=wfn, sym=sym, band_start=0,

@@ -754,6 +754,17 @@ def require_vnl_velocity_sign(value) -> float:
     return sign
 
 
+def _signed_vnl_term(term, sign: float):
+    """The nonlocal term on the resolved arm of :func:`require_vnl_velocity_sign`.
+
+    The one place the sign enters a velocity or current: ``+1`` adds the
+    term as is; the legacy ``-1`` adds its exact (IEEE) negation, i.e. the
+    subtraction it always was.  :func:`dipole_operator` (``dipole.h5``) and
+    :func:`uniform_gauge_operator` (the Hall current) both call it.
+    """
+    return term if sign > 0.0 else -term
+
+
 def dirac_current_operator(geom: SweepGeometry) -> Operator:
     """Uniform paramagnetic c alpha on the actual four-component carrier.
 
@@ -894,7 +905,7 @@ def dipole_operator(geom: SweepGeometry, *, bvec, blat,
                 bra[0], bra[1], ket[0], ket[1], vnl_setup.E_super)
             # The sweep ADDS this block to p's; the shipped arm's literal
             # subtraction is that add of an exactly negated block.
-            return v_nl if flipped else -v_nl
+            return _signed_vnl_term(v_nl, sign)
 
         separable = dict(coeffs=coeffs, couple=couple)
 
@@ -963,20 +974,23 @@ class UniformGaugeMatrixElements(NamedTuple):
 
 
 def uniform_gauge_operator(geom: SweepGeometry, *, bvec, blat,
-                           vnl_setup, include_contact: bool = True,
+                           vnl_setup, vnl_velocity_sign,
+                           include_contact: bool = True,
                            kinetic_balance_lift: str = "raw") -> Operator:
     r"""One apply-to-ket owner for current and exact uniform contact.
 
     The first three packed components are
 
-    ``Gamma_i = alpha_i + (alpha_FS/2) dV_NL/dK_i``
+    ``Gamma_i = alpha_i + s (alpha_FS/2) dV_NL/dK_i``
 
-    on the kinetic-balance bispinor.  Contracting the ``alpha_i`` term with
+    on the kinetic-balance bispinor, with ``s`` the resolved
+    ``vnl_velocity_sign`` entering through :func:`_signed_vnl_term`, the
+    same arm as ``dipole.h5``'s :func:`dipole_operator`.  Contracting the ``alpha_i`` term with
     that bispinor is identically ``(alpha_FS/2) dT/dK_i``; no second
     sigma.p spelling is introduced here.  With ``include_contact=True``
     (the default), the final nine components are
 
-    ``Lambda_ab = (alpha_FS/2) d2(T+V_NL)/dK_a dK_b``.
+    ``Lambda_ab = (alpha_FS/2) d2(T + s V_NL)/dK_a dK_b``.
 
     Kinetic contact comes from :mod:`psp.dft_operators`; the exact-origin,
     row/G-bounded VNL current and contact come from :mod:`psp.vnl_ops`.
@@ -1022,6 +1036,7 @@ def uniform_gauge_operator(geom: SweepGeometry, *, bvec, blat,
     from psp.dft_operators import apply_kinetic_contact_to_ket
     from psp import vnl_ops
 
+    sign = require_vnl_velocity_sign(vnl_velocity_sign)
     B_host = np.asarray(bvec, dtype=np.float64) * float(blat)
     if not np.array_equal(B_host, np.asarray(vnl_setup.B, dtype=np.float64)):
         raise ValueError(
@@ -1056,13 +1071,13 @@ def uniform_gauge_operator(geom: SweepGeometry, *, bvec, blat,
             halfalpha.astype(psi_4.real.dtype)
             * vnl.gamma_cart_ket,
             int(psi_4.shape[1]))
-        gamma = gamma_kin + gamma_vnl
+        gamma = gamma_kin + _signed_vnl_term(gamma_vnl, sign)
 
         fields = [gamma]
         if contact_enabled:
             lambda_kin = apply_kinetic_contact_to_ket(psi_L)
             lambda_large = halfalpha.astype(psi_4.real.dtype) * (
-                lambda_kin + vnl.lambda_cart_ket)
+                lambda_kin + _signed_vnl_term(vnl.lambda_cart_ket, sign))
             contact = _pad_spinor(lambda_large, int(psi_4.shape[1]))
             fields.append(contact.reshape(9, *contact.shape[2:]))
         packed = jnp.concatenate(tuple(fields), axis=0)
@@ -1071,7 +1086,7 @@ def uniform_gauge_operator(geom: SweepGeometry, *, bvec, blat,
     operator_key = (
         ("uniform_gauge_current_contact" if contact_enabled
          else "uniform_gauge_current"), geom.ngkmax, geom.ns,
-        float(blat), id(vnl_setup))
+        float(blat), id(vnl_setup), sign)
     if isometric_lift:
         operator_key += ("kinetic_balance", lift_provenance)
     return Operator(
@@ -1082,14 +1097,16 @@ def uniform_gauge_operator(geom: SweepGeometry, *, bvec, blat,
 
 def _gauge_hamiltonian_operator_fingerprint(
     *, wfn, vnl_setup, band_start: int, band_stop: int,
-    geom: SweepGeometry,
+    geom: SweepGeometry, vnl_velocity_sign,
     kinetic_balance_lift: str = "raw",
 ) -> str:
     """Compose the one uniform Hamiltonian operator identity.
 
     This is the exact grammar historically in the complete uniform-gauge
     sweep, moved without changing a byte; the one caller is
-    :func:`sweep_uniform_current_matrix_elements`.
+    :func:`sweep_uniform_current_matrix_elements`.  The ``+1`` V_NL arm
+    keeps that grammar byte for byte; the legacy ``-1`` arm appends its
+    sign, so the two operators never share an identity.
     """
     start, stop = int(band_start), int(band_stop)
     vnl_fingerprint = str(
@@ -1111,6 +1128,7 @@ def _gauge_hamiltonian_operator_fingerprint(
 
     lift_mode = str(kinetic_balance_lift).strip().lower()
     lift_provenance = kinetic_balance_lift_provenance(lift_mode)
+    sign = require_vnl_velocity_sign(vnl_velocity_sign)
 
     digest = hashlib.sha256()
     digest.update(b"lorrax.uniform_gauge_operator/v1\0")
@@ -1125,12 +1143,14 @@ def _gauge_hamiltonian_operator_fingerprint(
         ("cell_volume", float(geom.cell_volume).hex()),
     ):
         fingerprint_update_value(digest, label, value)
+    if sign < 0.0:
+        fingerprint_update_value(digest, "vnl_velocity_sign", sign.hex())
     return "sha256:" + digest.hexdigest()
 
 
 def _uniform_gauge_sweep_fingerprint(
     *, wfn, vnl_setup, band_start: int, band_stop: int,
-    geom: SweepGeometry,
+    geom: SweepGeometry, vnl_velocity_sign,
     kinetic_balance_lift: str = "raw",
 ) -> str:
     """Validate one uniform sweep manifold and return its sole identity."""
@@ -1145,7 +1165,8 @@ def _uniform_gauge_sweep_fingerprint(
             f"[{start},{stop}) vs nb_logical={int(geom.nb_logical)}")
     return _gauge_hamiltonian_operator_fingerprint(
         wfn=wfn, vnl_setup=vnl_setup, band_start=start, band_stop=stop,
-        geom=geom, kinetic_balance_lift=kinetic_balance_lift)
+        geom=geom, vnl_velocity_sign=vnl_velocity_sign,
+        kinetic_balance_lift=kinetic_balance_lift)
 
 
 def sweep_uniform_current_matrix_elements(
@@ -1162,6 +1183,7 @@ def sweep_uniform_current_matrix_elements(
     gmask,
     box_index,
     kvecs,
+    vnl_velocity_sign,
     use_scan: bool = True,
     kinetic_balance_lift: str = "raw",
 ) -> UniformGaugeCurrentMatrixElements:
@@ -1171,18 +1193,20 @@ def sweep_uniform_current_matrix_elements(
     are :func:`_uniform_gauge_operator_identity` and its siblings; this is
     now their ONLY caller (the complete sweep that produced the contact
     was deleted on 2026-09-02, unreachable from any production path).  A Hall-only producer does not retain contact/response
-    matrices that it cannot consume.
+    matrices that it cannot consume.  ``vnl_velocity_sign`` is the resolved
+    arm the producer also stamps (``prov_vnl_velocity_sign``), so the current
+    and its label are one operator.
     """
     fingerprint = _uniform_gauge_sweep_fingerprint(
         wfn=wfn, vnl_setup=vnl_setup, band_start=band_start,
-        band_stop=band_stop, geom=geom,
+        band_stop=band_stop, geom=geom, vnl_velocity_sign=vnl_velocity_sign,
         kinetic_balance_lift=kinetic_balance_lift)
     gamma_raw = sweep_matrix_elements(
         psi_G,
         geom=geom,
         operator=uniform_gauge_operator(
             geom, bvec=bvec, blat=blat, vnl_setup=vnl_setup,
-            include_contact=False,
+            vnl_velocity_sign=vnl_velocity_sign, include_contact=False,
             kinetic_balance_lift=kinetic_balance_lift),
         gvecs=gvecs,
         gmask=gmask,
