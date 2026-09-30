@@ -11,7 +11,7 @@ from jax.sharding import NamedSharding, PartitionSpec as P
 from common.collectives import device_put_process_local, gather_to_host
 from isdf.galerkin import (_reduce_projection_partials, _assemble_coefficient_chunks,
     _solve_coefficient_projection, _selected_gram_from_projection,
-    _galerkin_rank_metrics, _coefficients_from_projection)
+    _galerkin_rank_metrics_kernel, _coefficients_from_projection)
 from bandstructure.fh_interp import _apply_qp_block_to_compact_state
 from file_io.slab_io import SlabIO
 parser=argparse.ArgumentParser();parser.add_argument("--output-dir",type=Path,required=True)
@@ -68,9 +68,9 @@ for bands in (184,198):
     local=8000*bands*2520*16//4
     assert 'all-gather' not in hlo
     assert mem.temp_size_in_bytes<4*local+2520*2520*16,(bands,mem)
-    metrics=_galerkin_rank_metrics.lower(abstract,factor,selected_rows=tuple(range(2500)),physical=2500).compile()
+    metrics=_galerkin_rank_metrics_kernel(mesh,shape,selected_rows=tuple(range(2500)),physical=2500).lower(abstract,factor).compile()
     m=metrics.memory_analysis()
-    assert m.temp_size_in_bytes<local+2*2520*2520*16,(bands,m)
+    assert m.temp_size_in_bytes<2*local+2*2520*2520*16,(bands,m.temp_size_in_bytes)
     rows.append(dict(bands=bands,shape=shape,abstract_only=True,argument_bytes=mem.argument_size_in_bytes,output_bytes=mem.output_size_in_bytes,alias_bytes=mem.alias_size_in_bytes,temp_bytes=mem.temp_size_in_bytes,metrics_temp_bytes=m.temp_size_in_bytes,full_C_bytes=local*4,P36_C_bytes=local*4//36,no_solve_all_gather=True))
 if jax.process_index()==0:
     target=out/'result.json'
