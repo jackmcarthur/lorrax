@@ -892,7 +892,7 @@ def link_correction_bound(correction, velocity_dft, *, link_error: float,
     print_fn(
         f"    SC head link bound: rel_err(links) {float(link_error):.3e} x "
         f"|D_k DeltaH|/|v_DFT| {ratio:.3e} = {bound:.3e} "
-        f"(rtol {float(rtol):.1e})")
+        f"(rtol {float(rtol):.1e})", flush=True)
     if not np.isfinite(bound) or bound > float(rtol):
         raise ValueError(
             "GATE pt_head_link_bound: the finite-link error on this map's "
@@ -3663,7 +3663,7 @@ def build_iteration_head_response(
                 correction, v_dft_basis, link_error=link_bound[0],
                 rtol=link_bound[1],
                 print_fn=(print if jax.process_index() == 0
-                          else (lambda *a, **k: None)))
+                          else (lambda *a, **k: None)))  # flushed: a refusal exits without teardown
         v_dft_basis = v_dft_basis + correction
     v_qp = rotate_velocity_active_to_qp(v_dft_basis, U_dft_to_qp, mesh=mesh)
     resolved_eta_ry = (
