@@ -10,7 +10,7 @@ Usage::
 
     export LX_BASE_MODULE=lorrax_A LORRAX_CHECKOUT=$PWD
     lx run -N 1 -G 4 -n 4 -- env PYTHONPATH="$LORRAX_CHECKOUT/src" \\
-        python3 -u tests/bench/slate_cholesky_trsm_test.py -n 256 --dtype c128
+        python3 -u services/distrib_la/bench/slate_cholesky_trsm_test.py -n 256 --dtype c128
 """
 from __future__ import annotations
 

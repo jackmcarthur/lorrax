@@ -102,7 +102,7 @@ its sources, its build and its target strings.
 | parallel HDF5 | `phdf5/` | both; C++ (HDF5, MPI; CUDA-runtime staging on the CUDA leg) | `phdf5_{read, read_kchunk_union, write, write_independent}`; `phdf5_read_kchunk` has no caller |
 | contour accumulator | `response/contour_accumulate{.cu,_ffi.cc}` | CUDA; nvcc | `contour_accumulate` |
 | spin rotation | `symmetry/spin_rotate{.cu,_ffi.cc}` | CUDA; nvcc | `symmetry_spin_rotate_centroid` |
-| fused W-solve | `cublasmp/batched_w_solve_ffi.cc`, `cublasmp/w_solve_kernels.cu` | CUDA; C++ and nvcc | `cublasmp_batched_w_solve`; door `ffi.cublasmp.batched_fused_w_solve`, gated by `tests/bench/cublasmp_w_solve_test.py` |
+| fused W-solve | `cublasmp/batched_w_solve_ffi.cc`, `cublasmp/w_solve_kernels.cu` | CUDA; C++ and nvcc | `cublasmp_batched_w_solve`; door `ffi.cublasmp.batched_fused_w_solve`; no caller and no gate |
 
 **Architectures.** Every nvcc TU carries SASS for sm_80, 86, 89, 90, 100
 and 120 and compute_80/compute_120 PTX (§2); every NVRTC kernel compiles for

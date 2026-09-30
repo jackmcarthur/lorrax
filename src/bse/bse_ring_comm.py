@@ -993,12 +993,8 @@ def build_bse_ring_matvec_full(
         4 -> 2 applications is the single largest per-iteration saving on the
         path.  MEASURED (opt_integration, 2026-08-16) — see the arm's report.
 
-        THE DUPLICATION IS GATED, NOT ASSUMED.  ``bench_w_ladder_integration
-        --mode fuse`` applies both cores to the same random block and requires
-        agreement at 1e-12; ``fuse_ladder_rung=False`` selects the unfused core
-        for that A/B and for any bisection.  If the sign/convention forks move
-        ``_antiresonant_row``, that cell goes RED rather than the two rows
-        drifting silently.
+        ``fuse_ladder_rung=False`` selects the unfused core for an A/B and
+        for any bisection.
 
         TWO -> ONE WAS TRIED AND IS REFUTED.  The obvious next step is to stack
         the two surviving applications: they are INDEPENDENT operands of the

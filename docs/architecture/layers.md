@@ -248,14 +248,13 @@ These refusals are load-bearing; each was reached by measurement.
    mathdx kernel family with its cubin cache, the FFTW3-ABI advanced-layout
    plans with OpenMP chunking, and a scratch-free BLAS call share an FFI
    signature and nothing else.
-5. **Do not force the bench drivers in `tests/bench/` through
-   `resolve_mesh`.** They build meshes differently on purpose:
-   `tests/bench/profile_batched.py` parses `--mesh 2x2` and exits on a
-   mismatch, which is right for a benchmark that sweeps geometries.
+5. **Do not force the service bench drivers in `services/*/bench/` through
+   `resolve_mesh`.** They build meshes differently on purpose: a benchmark
+   that sweeps geometries parses its own mesh and exits on a mismatch.
 
-**Bench drivers live in `tests/bench/`**: argv-driven scripts that pytest does
-not collect, run as `python3 tests/bench/<name>.py` with `src/` on
-`PYTHONPATH`. A module under `src/` with a bench-shaped name (`test_*`,
+**Bench drivers live in `services/<svc>/bench/`**: argv-driven scripts that
+pytest does not collect, run as `python3 services/<svc>/bench/<name>.py` with
+`src/` on `PYTHONPATH`. A module under `src/` with a bench-shaped name (`test_*`,
 `*_test`, `*_bench`, `benchmark*`, `profile_*`, `.tests.`, `.archive.`) fails
 the gate.
 

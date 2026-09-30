@@ -3,8 +3,8 @@
 ``distrib_la._cusolvermp`` merged the former ``context.py``/``eigh.py``/
 ``batched.py`` into one backend module, the shape ``_slate`` and
 ``_scalapack`` already had.  ``distrib_la.backend_module('cusolvermp')``
-hands out that module; this package keeps the old import path working for
-the bench drivers under ``tests/bench/``.  It used to also serve
+hands out that module; this package keeps the old import path, which no
+caller uses since the benches moved to ``services/distrib_la/bench/``.  It used to also serve
 ``tests/test_ffi_linalg_contract.py``; that file migrated to
 ``services/distrib_la/tests/test_distrib_la_contract.py`` (marker
 ``distrib_la``) and no longer reaches this path.
