@@ -516,3 +516,15 @@ guarantees; the signatures are in the code.
   (`sigma_mnk.h5`, `kin_ion.h5`) stores `take` as its `irr_idx_k`.
 * `star_wedge_rows(sym)` → `(labels, take)`; `star_wedge_tables(sym)` →
   `(take, sym_idx_k, n_sym_spatial)`: an operator slab on the star wedge (§8).
+
+
+### Bounded full-q operator unfolding
+
+The shared `unfold_isdf_operator` kernel executes the same endpoint
+redistributions, umklapp phases and TR rule on q tiles. A tile targets256MiB
+for one scalar matrix carrier; the complete output remains `P(None,'x','y')`.
+Small outputs use the direct kernel. The final partial tile overlaps earlier
+rows, avoiding a padded copy of the large output. Work remains linear in
+q×μ×ν/P, with bounded extra tile scratch rather than additional full-q banks.
+The native AOT figure still includes the input and unavoidable full output;
+this schedule does not make an oversized physical output fit a card.
