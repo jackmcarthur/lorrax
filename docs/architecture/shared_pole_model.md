@@ -319,6 +319,26 @@ self-consistent run evaluates the accepted final map's model once, after the
 loop, from the devices (step 4) or that map's retained scratch generation, and
 stores the map's iteration head at $\omega=0$. Plain-MPA, bispinor and metal restarts carry no
 `W0_qmunu`, and a BSE on them refuses.
+
+The same key keeps a one-shot's swept Σ(ω) (`file_io.sigma_checkpoint`,
+`tmp/sigma_checkpoint_oneshot.h5`) when it pays for itself: only if the
+measured sweep took at least 5× the predicted write (cube bytes at 1.3 GB/s,
+measured on one node), logged as one `Sigma checkpoint: written|skipped` line
+(Na 8³ [−100, +150] eV skips: 101 s sweep, 61.4 GB, 47.7 s write). The write
+finishes before finalize, which donates the body cube. It holds the body
+cube (and, when present, the odd cube and the raw twin's N₃ band-diagonal
+slots) through SlabIO from their own shards, then the head
+diagonal, band-extrapolation payload and band axis, then a commit digest. A
+rerun with `restart = true` whose identity matches (the W model's digest and
+identity, the energies Σ is read at, the ω grid, every sweep option) goes
+straight to finalize; any other file is removed, named in one WARNING line,
+and the sweep recomputed. It covers one-shots only: an SC rerun starts at
+map 0, retention deletes later maps, and map 0's sweep plans the Σ windows
+the later maps hold, so SC maps, map 0 included, recompute. A failed write
+never costs the run: the partial file is removed with one WARNING line and
+finalize proceeds. The PPM route has no W digest at this seam and always
+recomputes.
+
 `write_w = true` dumps the bank as stored (line supports as panels) and is a
 debug output.
 
