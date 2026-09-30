@@ -75,9 +75,8 @@ the report is a defect.
 `distrib_la._scalapack`, `._slate` and `._cusolvermp` are backends of the
 `distrib_la` door. Call sites reach them through `distrib_la.backend_module()`
 or a plan; a `src/` import of one fails `tests/test_layering.py`.
-`ffi.cusolvermp` is a re-export shim over `distrib_la._cusolvermp`, and
-`ffi.cublasmp` has no caller; the distrib_la benches in
-`services/distrib_la/bench/` import `distrib_la._cusolvermp` directly.
+The distrib_la benches in `services/distrib_la/bench/` import
+`distrib_la._cusolvermp` directly.
 
 `ffi.gate` is the mechanism, not a service: the resolver behind the two
 environment dials, `LORRAX_FFT_FFI` (cpu flat-k FFT) and
