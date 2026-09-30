@@ -1041,8 +1041,16 @@ def _sigma_output_fields(
 
 
 def _diagonalize_qp_hamiltonian(
-        band_slices, config, input_dir, kin_ion, mesh_xy, print0, qp_solver, sigma_total, wfn):
-    """Produce the one-shot QP eigensystem and initialize output timing."""
+        band_slices, config, input_dir, kin_ion, mesh_xy, print0, qp_solver, sigma_total, wfn,
+        sc_result=None):
+    """Produce the QP eigensystem and initialize output timing.
+
+    SC: the accepted map's spectrum, as the SC driver wrote it to eqp0/eqp1
+    (WFN_qp and the rotations are the SC driver's too); no second,
+    unpartitioned eigh of kin_ion + Sigma_final, and no U.
+    """
+    if sc_result is not None:
+        return (sc_result.qp_energies_ry, None, time.perf_counter())
     from common import sanity
     sanity.refuse_nonfinite("kin_ion (from kin_ion.h5)", kin_ion,
                             print_fn=print0,
@@ -1596,14 +1604,10 @@ def _run_gw_stages(args, _t_main, _pre_main, opened):
 	    sigma_lorentz_skij_ry, sigma_omega_h5_path, sigma_total, sigma_xc_at_dft_ev) = _sigma_output_fields(
 	    config, enk_dft, final_static_head_terms, mesh_xy, qp_solver, sc_result, sigma_result,
 	    sigma_total)
-	if sc_result is None:
-	    (
-	        E_full, U_full, _t_out) = _diagonalize_qp_hamiltonian(
-	        band_slices, config, input_dir, kin_ion, mesh_xy, print0, qp_solver, sigma_total, wfn)
-	else:
-	    # SC: the accepted map's spectrum (eqp0/eqp1.dat, WFN_qp and the
-	    # rotations are the SC driver's); no second, unpartitioned eigh.
-	    E_full, U_full, _t_out = sc_result.qp_energies_ry, None, time.perf_counter()
+	(
+	    E_full, U_full, _t_out) = _diagonalize_qp_hamiltonian(
+	    band_slices, config, input_dir, kin_ion, mesh_xy, print0, qp_solver, sigma_total, wfn,
+	    sc_result)
 	(
 	    h_transverse_diag_ry, head_sigma_split_skn_ry, omega_rel_ev, sig_coh_diag_ry,
 	    sig_h_diag_ry, sig_h_scalar_diag_ry, sig_sx_diag_ry, sigma_c_diag_at_dft_ry,
