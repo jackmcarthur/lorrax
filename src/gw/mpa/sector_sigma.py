@@ -60,6 +60,12 @@ def _admit_compiled(kernel,args,meta,stage,*,native=0,resident=0):
 
 
 @lru_cache(maxsize=None)
+def _placer(mesh_xy, spec):
+    """Reshard to ``spec`` (identity values); the scalar route's synthesis places with it."""
+    return jax.jit(lambda x: x, out_shardings=NamedSharding(mesh_xy, spec))
+
+
+@lru_cache(maxsize=None)
 def _zeros(mesh_xy, shape, spec=P(None, 'x', 'y')):
     return jax.jit(lambda: jnp.zeros(shape, jnp.complex128),
                    out_shardings=NamedSharding(mesh_xy, spec))
