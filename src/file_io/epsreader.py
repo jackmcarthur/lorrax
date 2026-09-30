@@ -194,11 +194,7 @@ class EPSReader:
     #   * its own comment said "NO SUPPORT FOR TAU (FRAC TRANS) CURRENTLY",
     #     i.e. it was known-wrong on every non-symmorphic deck, and nothing
     #     outside this file said so;
-    #   * it had NO live caller.  The only references were in
-    #     ``misc/archived_tests/cohsex_noisdf.py``, which cannot be imported
-    #     at all — it does ``from wfnreader import WFNReader`` and
-    #     ``from gpu_utils import cp``, and neither module exists anywhere in
-    #     the tree.
+    #   * it had NO live caller.
     #
     # DELETED RATHER THAN FIXED because adding τ support to a method with no
     # caller is speculative and untestable, while leaving a τ-blind G-rotation

@@ -3,6 +3,56 @@
 User-visible changes, newest first. Binding rulings behind the breaking
 changes live in `docs/architecture/decisions.md`.
 
+## 2026-09-30 — `parallel_transport`: the Σ term is served whenever the links are usable
+
+The `parallel_transport` head no longer sets its Σ term D_kΔH to zero on a map
+whose link bound exceeds 1 %. Complete links serve it on every map. The link
+error is a k-convergence measure: the dipole step warns above
+`--parallel-transport-validation-rtol` and still writes the artifact, each SC
+map logs the error and its bound on the Σ term, and neither gates anything.
+Only links that are not usable (incomplete, or a stencil or
+window-hybridization gate fails) zero the term, on every map.
+
+SC decks whose links were above the bound move once: MoS2 3×3 SOC (link error
+9.2 %) converges to a 4.48 eV gap with the term served (5.17 eV with it
+zeroed). Decks that stayed below 1 % are bitwise (Fe 4³ scalar)
+([self-consistency §7](docs/self_consistency.md#metals-direct-drude-head)).
+
+## 2026-09-30 — parallel-transport links: schema 4 on the link shell; rerun the dipole step
+
+`parallel_transport` now differentiates on the point-group-closed
+Marzari–Vanderbilt link shell (`common.parallel_transport.link_stencil`).
+A link artifact written before this (schema 3, three reduced axes) refuses
+under `parallel_transport`; rerun the dipole step (`psp.get_dipole_mtxels`).
+`dft_velocity` still reads the old file. The bcc link stage takes about 2×
+longer. Orthogonal lattices keep the three axes. Fe 4³ bispinor eqp moves
+≤ 1.6 meV, Si SOC ≤ 16 µeV.
+
+`bispinor_gw = full_shared_pole` SC decks that do not name `sc_head_update`
+now run `parallel_transport` when a link artifact exists, as scalar decks
+do, and move once (Fe 4³ eqp0 within E_F ± 10 eV ≤ 9.7 meV). On a metal,
+`bare_transverse` refuses `parallel_transport`
+([self-consistency §7](docs/self_consistency.md#metals-direct-drude-head)).
+
+## 2026-09-30 — regenerate `WFN_qp.h5` from WFNs that store both k and −k
+
+`WFN_qp.h5` now keeps time reversal on a WFN that stores two k of one orbit
+(e.g. MoS2 3×3). A file written before this from such a WFN has broken rows,
+and the BSE and GW runs that read it used them. Regenerate it with
+`python -m postprocess.rotate_wfn_to_qp WFN.h5 qp_wfn_rotations.h5`; WFNs
+without such rows (Si) give the same file
+([self-consistency §8](docs/self_consistency.md#8-seeding-restart-and-outputs)).
+An SC run that writes `WFN_qp.h5` now binds `dipole_qsgw.h5` to it, so a GW
+run on `WFN_qp.h5` can take that file as its `dipole.h5`.
+
+## 2026-09-30 — SC W line sites held within max(3 meV, 0.1 × max|dE|)
+
+Held shared-pole W line sites are re-placed only when they would move by more
+than max(3 meV, a tenth of the previous map's max|dE|). SC runs that re-plan
+their sites move once; Fe 4³ scalar `parallel_transport` SC now converges
+(28 maps; it stalled at map 16)
+([self-consistency §6](docs/self_consistency.md#shared-pole-w-with-retained-quadrature)).
+
 ## 2026-09-29 — `qp_solver = fixed_point` and `eqp_root.dat` are retired
 
 `qp_solver = fixed_point` refuses by name; set `one_shot_dft` (Σ at E_DFT)

@@ -1860,10 +1860,12 @@ def compute_photon_bank(wfns, wfns_transverse, meta, config, *, mesh_xy, sym,
     memory planner, quadrature, transaction masks and reader are shared.
     Every call, every SC map included, builds its own static contact: the
     Ward proxy subtracts the static limit of this map's response.
-    ``photon_head_state = (rotation, wfns, occupation_state)`` sets the
-    direct head's state (``sc_head_update``): None entries are the bank's own
-    state and no rotation (one-shot); SC ``dft_velocity`` passes the map's
-    QP rotation, ``off`` the DFT bundle and its fixed-N state.
+    ``photon_head_state = (rotation, wfns, occupation_state, velocity)``
+    sets the direct head's state (``sc_head_update``): None entries are the
+    bank's own state, no rotation and the dipole velocity (one-shot); SC
+    ``dft_velocity`` passes the map's QP rotation, ``parallel_transport``
+    also this map's ``qsgw_head.qp_velocity`` (DFT basis, head storage), and
+    ``off`` the DFT bundle and its fixed-N state.
     """
     from file_io.shared_pole_store import validate_shared_pole_bank
 
@@ -1948,7 +1950,10 @@ def compute_photon_bank(wfns, wfns_transverse, meta, config, *, mesh_xy, sym,
             from .qsgw_head import read_authenticated_dipole_velocity, _pad_head_band_manifold
             from .photon_direct_head import build_direct_photon_head, packed_gamma_vectors
             cache = photon_head_cache if photon_head_cache is not None else {}
-            velocity = cache.get("direct_photon_velocity")
+            rotation, head_wfns, head_occupation, velocity = (
+                photon_head_state or (None, None, None, None))
+            if velocity is None:
+                velocity = cache.get("direct_photon_velocity")
             if velocity is None:
                 host = read_authenticated_dipole_velocity(
                     os.path.join(config.input_dir, "dipole.h5"), wfn=wfn,
@@ -1960,8 +1965,6 @@ def compute_photon_bank(wfns, wfns_transverse, meta, config, *, mesh_xy, sym,
                     host, empty, empty, empty, mesh=mesh_xy)
                 cache["direct_photon_velocity"] = velocity
                 del host
-            rotation, head_wfns, head_occupation = (
-                photon_head_state or (None, None, None))
             if rotation is not None:
                 from .qsgw_head import rotate_velocity_active_to_qp
                 velocity = rotate_velocity_active_to_qp(

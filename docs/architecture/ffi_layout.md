@@ -102,7 +102,7 @@ its sources, its build and its target strings.
 | parallel HDF5 | `phdf5/` | both; C++ (HDF5, MPI; CUDA-runtime staging on the CUDA leg) | `phdf5_{read, read_kchunk_union, write, write_independent}`; `phdf5_read_kchunk` has no caller |
 | contour accumulator | `response/contour_accumulate{.cu,_ffi.cc}` | CUDA; nvcc | `contour_accumulate` |
 | spin rotation | `symmetry/spin_rotate{.cu,_ffi.cc}` | CUDA; nvcc | `symmetry_spin_rotate_centroid` |
-| fused W-solve | `cublasmp/batched_w_solve_ffi.cc`, `cublasmp/w_solve_kernels.cu` | CUDA; C++ and nvcc | `cublasmp_batched_w_solve`; door `ffi.cublasmp.batched_fused_w_solve`, gated by `tests/bench/cublasmp_w_solve_test.py` |
+| fused W-solve | `cublasmp/batched_w_solve_ffi.cc`, `cublasmp/w_solve_kernels.cu` | CUDA; C++ and nvcc | `cublasmp_batched_w_solve`; no Python caller |
 
 **Architectures.** Every nvcc TU carries SASS for sm_80, 86, 89, 90, 100
 and 120 and compute_80/compute_120 PTX (§2); every NVRTC kernel compiles for
@@ -194,15 +194,13 @@ which entry it bound.
 * **Real modules:** `ffi/io.py` (parallel HDF5), `ffi/fft.py` (the host
   flat-k FFT gate, the [k-convolution router](#k-convolution-router-and-the-mathdx-family),
   the plane door and the Fourier-plan call), `ffi/gemm.py` (host batched
-  GEMM), `ffi/gate.py`, `ffi/common/ffi_loader.py`, and `ffi/cublasmp/`
-  (cuBLASMp GEMM and the fused W-solve; reached by the bench drivers and one
-  `distrib_la` contract cell, by no production path). Distributed dense
+  GEMM), `ffi/gate.py` and `ffi/common/ffi_loader.py`. Distributed dense
   linear algebra and the active subspace are `services/distrib_la`, which
   opens the same two libraries through its own `distrib_la.loader`.
 * **Target table only:** `ffi/cufft/` repeats the `lorrax_mathdx_*` rows of
   `ffi_loader._CUDA_TARGET_SYMBOLS`. Nothing imports it.
 * **Re-export shims:** `ffi.phdf5` → `ffi.io`, `ffi.mklfft` → `ffi.fft`,
-  `ffi.mklblas` → `ffi.gemm`, `ffi.cusolvermp` → `distrib_la._cusolvermp`.
+  `ffi.mklblas` → `ffi.gemm`.
   New code imports the real module. A shim is deleted when
   `git grep -nE "ffi\.<shim>" -- src services tests ':!src/ffi'` is empty.
 

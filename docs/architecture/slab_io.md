@@ -469,8 +469,7 @@ then `PROGRESS` every 60 s, then `COMPLETE`.
 - `LORRAX_SLAB_IO_TIMING=1` records API and native `H5D` wall times. It
   needs a library that exports `lrx_phdf5_close_timed`.
 - A read timed on the node set that wrote the file measures the page cache.
-  Write and read on disjoint node sets
-  (`tests/bench/slabio_scaling_bench.py --phase write|read`).
+  Write and read on disjoint node sets.
 
 ---
 

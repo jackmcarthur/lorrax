@@ -16,6 +16,7 @@ graph: the raw overlap never crosses a Python dispatch boundary.
 from __future__ import annotations
 
 from collections.abc import Sequence
+from dataclasses import dataclass
 
 import jax
 import jax.numpy as jnp
@@ -26,13 +27,13 @@ from common.wfn_layout import band_sphere_spec
 
 
 __all__ = [
-    "build_forward_neighbor_table",
     "build_neighbor_table",
     "build_g_wrap_lookup",
     "band_storage_extent",
-    "fourth_order_connection",
-    "fourth_order_covariant_derivative",
-    "g_wrap_for_forward_step",
+    "link_connection",
+    "link_covariant_derivative",
+    "LinkStencil",
+    "link_stencil",
     "g_wrap_for_step",
     "inverse_neighbor_table",
     "make_cross_k_overlap",
@@ -131,6 +132,173 @@ def undersampled_link_axes(kgrid) -> list[str]:
     """
     grid = tuple(int(n) for n in np.asarray(kgrid).reshape(3))
     return [axis for axis, n in zip("xyz", grid) if n == 2]
+
+
+#: Search box of the neighbour-shell enumeration, in mesh steps per axis.
+#: Wannier90's kmesh search uses the same order of reach; a lattice whose
+#: B1 condition is not met inside it refuses by name.
+_SHELL_SEARCH_REACH: int = 3
+#: Relative length tolerance that groups mesh vectors into one shell, and
+#: the tolerance of the B1 residual ``sum_b w_b b b^T - P`` (P: projector
+#: on the sampled directions, so the residual is relative).  A DFT cell is
+#: symmetric only to its printed digits: the MoS2 fixture's hexagonal
+#: reciprocal vectors differ in length by 7e-7 and its 60 degree angle by
+#: 2e-6, which a 1e-6 grouping splits into a false second shell.
+_SHELL_LENGTH_RTOL: float = 1.0e-5
+_SHELL_B1_ATOL: float = 1.0e-5
+
+
+@dataclass(frozen=True)
+class LinkStencil:
+    """The one neighbour set every finite-link derivative uses.
+
+    ``steps`` ``(nd, 3)`` are integer mesh steps, one of each +/- pair of a
+    Marzari-Vanderbilt shell set (Phys. Rev. B 56, 12847, App. B): whole
+    shells of equal-length mesh vectors, added shortest first until
+    ``sum_b w_b b b^T = P`` holds with one weight per shell (``P`` is the
+    projector on the sampled reciprocal directions; a collapsed axis has no
+    step).  A shell is closed under every isometry of the mesh lattice, so
+    under the crystal point group too: the O(h^2) error of the derivative is
+    covariant.  The search reads the lattice only; no symmetry is assumed.
+
+    ``coefficients`` ``(nd, 3)``: the reduced derivative is
+    ``d/dkappa_a O = sum_d coefficients[d, a] D_d O`` with ``D_d`` the
+    central difference per unit step ``d`` (``b_d . grad``): ``(T_+ - T_-)/2``
+    at ``orders[d] == 2``, the +/-2 Richardson form at 4.  ``axis_rules``
+    is :func:`link_stencil_orders` (``COLLAPSED_AXIS`` marks a position-
+    operator axis, whose coefficients column is zero).
+    """
+
+    steps: np.ndarray
+    orders: tuple
+    coefficients: np.ndarray
+    weights: np.ndarray
+    axis_rules: tuple
+
+    @property
+    def ndir(self) -> int:
+        return int(self.steps.shape[0])
+
+
+def _line_points(step, grid) -> int:
+    """Distinct mesh points on the line ``k + m*step`` (order in Z_N)."""
+    from math import gcd
+    order = 1
+    for n, N in zip(step, grid):
+        if n:
+            period = int(N) // gcd(abs(int(n)), int(N))
+            order = order * period // gcd(order, period)
+    return order
+
+
+def link_stencil(kgrid, bvec_cart) -> LinkStencil:
+    """THE ONE OWNER of the finite-link neighbour set and its weights.
+
+    ``bvec_cart`` are the reciprocal lattice vectors as ROWS (Cartesian,
+    ``k_cart = kappa @ B``).  Mesh vectors ``b = (n / N) @ B`` with integer
+    ``n`` (zero on a collapsed axis) are grouped into shells by length and
+    accepted shortest first; a shell is skipped when one of its vectors is
+    parallel to an accepted one, when it adds no rank to the B1 system, or
+    when a member has fewer than 3 distinct points on its mesh line (no
+    central difference).  On an orthogonal lattice the result is the three
+    reduced axes with the historical per-axis stencil; on bcc (fcc reciprocal
+    mesh) it is the 12-vector first shell, on fcc (bcc mesh) the 8-vector
+    one, on a hexagonal plane the 6-vector one.  A shell takes the fourth-
+    order +/-2 form when each of its lines has >= :data:`MIN_STENCIL_POINTS`
+    points, else the second-order +/-1 form.
+    """
+    from itertools import product
+
+    grid = tuple(int(n) for n in np.asarray(kgrid).reshape(3))
+    axis_rules = link_stencil_orders(grid)
+    B = np.asarray(bvec_cart, dtype=np.float64)
+    if B.shape != (3, 3) or abs(float(np.linalg.det(B))) < 1.0e-14:
+        raise ValueError(
+            f"bvec_cart must be a nonsingular (3, 3) matrix; got {B.shape}")
+    sampled = [a for a in range(3) if axis_rules[a] != COLLAPSED_AXIS]
+    if not sampled:
+        return LinkStencil(
+            steps=np.zeros((0, 3), dtype=np.int32), orders=(),
+            coefficients=np.zeros((0, 3)), weights=np.zeros((0,)),
+            axis_rules=axis_rules)
+    Bs = B[sampled]
+    # Projector on the sampled reciprocal span (the B1 target).
+    target = Bs.T @ np.linalg.solve(Bs @ Bs.T, Bs)
+    iu = np.triu_indices(3)
+    reach = [(_SHELL_SEARCH_REACH if a in sampled else 0) for a in range(3)]
+    cands = []
+    for n in product(*(range(-r, r + 1) for r in reach)):
+        if not any(n):
+            continue
+        cart = (np.asarray(n, dtype=np.float64) / np.asarray(grid)) @ B
+        cands.append((float(np.linalg.norm(cart)), n, cart))
+    cands.sort(key=lambda row: row[0])
+    shells, current = [], []
+    for row in cands:
+        if current and row[0] > current[0][0] * (1.0 + _SHELL_LENGTH_RTOL):
+            shells.append(current)
+            current = []
+        current.append(row)
+    if current:
+        shells.append(current)
+
+    accepted, columns, residual = [], [], None
+    for shell in shells:
+        vecs = np.array([c for _, _, c in shell])
+        units = vecs / np.linalg.norm(vecs, axis=1)[:, None]
+        if any(np.max(np.abs(units @ (c / np.linalg.norm(c)))) > 1.0 - 1e-8
+               for sh in accepted for _, _, c in sh):
+            continue
+        if min(_line_points(n, grid) for _, n, _ in shell) < 3:
+            continue
+        col = (vecs.T @ vecs)[iu]
+        trial = np.array(columns + [col]).T
+        if columns and np.linalg.matrix_rank(
+                trial, tol=1e-6 * float(np.max(np.abs(trial)))) <= len(columns):
+            continue
+        accepted.append(shell)
+        columns.append(col)
+        w, *_ = np.linalg.lstsq(trial, target[iu], rcond=None)
+        residual = float(np.max(np.abs(trial @ w - target[iu])))
+        if residual < _SHELL_B1_ATOL:
+            break
+    if residual is None or residual >= _SHELL_B1_ATOL:
+        raise ValueError(
+            "GATE pt_link_shell_incomplete: no Marzari-Vanderbilt shell set "
+            f"within +/-{_SHELL_SEARCH_REACH} mesh steps satisfies "
+            f"sum_b w_b b b^T = 1 (kgrid={grid}, residual={residual}).")
+
+    steps, orders, weights = [], [], []
+    for shell, weight in zip(accepted, w):
+        order = 4 if min(_line_points(n, grid) for _, n, _ in shell) \
+            >= MIN_STENCIL_POINTS else 2
+        for _, n, _ in shell:
+            first = next(x for x in n if x)
+            if first > 0:                      # one of each +/- pair
+                steps.append(n)
+                orders.append(order)
+                weights.append(float(weight))
+    rank = {tuple(n): i for i, n in enumerate(steps)}
+    order_idx = sorted(range(len(steps)), key=lambda i: (
+        sum(abs(x) for x in steps[i]) != 1, sum(abs(x) for x in steps[i]),
+        tuple(-x for x in steps[i]), rank[tuple(steps[i])]))
+    steps = np.asarray([steps[i] for i in order_idx], dtype=np.int32)
+    orders = tuple(int(orders[i]) for i in order_idx)
+    weights = np.asarray([weights[i] for i in order_idx], dtype=np.float64)
+    cart = (steps / np.asarray(grid, dtype=np.float64)) @ B
+    # d/dkappa_a = B[a] . grad, grad = sum_{+/-b} w_b b [f(k+b) - f(k)]
+    # = sum_d 2 w_d b_d D_d with D_d the per-step central difference.
+    coefficients = 2.0 * weights[:, None] * (cart @ B.T)
+    coefficients[:, [a for a in range(3) if a not in sampled]] = 0.0
+    # Exactness on linear functions of the sampled reduced coordinates.
+    check = coefficients.T @ (steps / np.asarray(grid, dtype=np.float64))
+    want = np.zeros((3, 3))
+    want[sampled, sampled] = 1.0
+    if not np.allclose(check, want, rtol=0.0, atol=_SHELL_B1_ATOL):
+        raise AssertionError(
+            f"link shell is not exact on linear functions: {check}")
+    return LinkStencil(steps=steps, orders=orders, coefficients=coefficients,
+                       weights=weights, axis_rules=axis_rules)
 
 
 #: Width of the density probe around a collapsed axis's branch cut, as a
@@ -452,25 +620,16 @@ def build_neighbor_table(
     return out
 
 
-def build_forward_neighbor_table(
-    kvecs_asints: np.ndarray,
-    kgrid: Sequence[int],
-) -> np.ndarray:
-    """Return full-BZ indices of the three positive mesh neighbours."""
-    return build_neighbor_table(
-        kvecs_asints, kgrid, np.eye(3, dtype=np.int32))
-
-
 def inverse_neighbor_table(forward: np.ndarray) -> np.ndarray:
-    """Invert a ``(nk, 3)`` forward-neighbour permutation table."""
+    """Invert a ``(nk, nd)`` forward-neighbour permutation table."""
     plus = np.asarray(forward, dtype=np.int64)
-    if plus.ndim != 2 or plus.shape[1] != 3:
+    if plus.ndim != 2:
         raise ValueError(
-            f"forward neighbour table must be (nk, 3); got {plus.shape}")
+            f"forward neighbour table must be (nk, nd); got {plus.shape}")
     nk = plus.shape[0]
     minus = np.empty_like(plus, dtype=np.int32)
     want = np.arange(nk, dtype=np.int64)
-    for idir in range(3):
+    for idir in range(plus.shape[1]):
         col = plus[:, idir]
         if np.any(col < 0) or np.any(col >= nk) \
                 or not np.array_equal(np.sort(col), want):
@@ -509,25 +668,6 @@ def g_wrap_for_step(
             f"neighbor={neighbor_full}, step={step_int.tolist()}, "
             f"delta={delta.tolist()}")
     return wrap
-
-
-def g_wrap_for_forward_step(
-    unfolded_kpts: np.ndarray,
-    center_full: int,
-    neighbor_full: int,
-    direction: int,
-    kgrid: Sequence[int],
-    *,
-    atol: float = 2.0e-7,
-) -> np.ndarray:
-    """Return the reciprocal-lattice wrap for ``k + b_i``."""
-    idir = int(direction)
-    if idir < 0 or idir >= 3:
-        raise ValueError(f"direction must be 0, 1 or 2; got {direction}")
-    step = np.zeros(3, dtype=np.int32)
-    step[idir] = 1
-    return g_wrap_for_step(
-        unfolded_kpts, center_full, neighbor_full, step, kgrid, atol=atol)
 
 
 def build_g_wrap_lookup(
@@ -679,199 +819,175 @@ def make_distributed_band_matmul(mesh, *, n_batch_axes: int):
     return matmul
 
 
-def _resolve_axis_rules(stencil_orders, collapsed_position, shape):
-    """Validate the per-axis rule set shared by the two stencil kernels."""
-    orders = ((4, 4, 4) if stencil_orders is None
-              else tuple(int(o) for o in stencil_orders))
-    if len(orders) != 3 or any(o not in (COLLAPSED_AXIS, 2, 4)
-                               for o in orders):
+def _check_stencil_inputs(links, plus, stencil, collapsed_position):
+    """Validate the link set against the stencil; return the position."""
+    nd = stencil.ndir
+    if links.ndim != 4 or links.shape[0] != nd \
+            or links.shape[-2] != links.shape[-1]:
         raise ValueError(
-            "stencil_orders must be three values from "
-            f"{{{COLLAPSED_AXIS}, 2, 4}}; got {stencil_orders!r}")
-    position = None
-    if COLLAPSED_AXIS in orders:
+            f"forward_links must be ({nd}, nk, nb, nb) for the "
+            f"{nd}-direction link stencil; got {tuple(links.shape)}")
+    if plus.shape != (links.shape[1], nd):
+        raise ValueError(
+            f"forward_neighbors must be ({links.shape[1]}, {nd}); "
+            f"got {plus.shape}")
+    shape = (3,) + tuple(links.shape[1:])
+    if COLLAPSED_AXIS in stencil.axis_rules:
         if collapsed_position is None:
             raise ValueError(
                 "GATE pt_collapsed_axis_needs_position: a collapsed axis "
-                f"(stencil_orders={orders}) needs the real-space position "
-                "operator Z_a (3, nk, nb, nb); none was supplied.  The "
-                "artifact's collapsed_position_reduced dataset carries it.")
+                f"(axis rules {stencil.axis_rules}) needs the real-space "
+                "position operator Z_a (3, nk, nb, nb); none was supplied.  "
+                "The artifact's collapsed_position_reduced dataset carries "
+                "it.")
         position = jnp.asarray(collapsed_position)
-        if tuple(position.shape) != tuple(shape):
+        if tuple(position.shape) != shape:
             raise ValueError(
-                f"collapsed_position must have shape {tuple(shape)}; got "
+                f"collapsed_position must have shape {shape}; got "
                 f"{tuple(position.shape)}")
-    elif collapsed_position is not None:
+        return position
+    if collapsed_position is not None:
         raise ValueError(
             "collapsed_position was supplied but no axis is collapsed "
-            f"(stencil_orders={orders})")
-    return orders, position
+            f"(axis rules {stencil.axis_rules})")
+    return None
 
 
-def fourth_order_connection(
+def _dagger(x):
+    return jnp.swapaxes(jnp.conj(x), -1, -2)
+
+
+def link_connection(
     forward_links: jax.Array,
     forward_neighbors: np.ndarray,
-    reduced_spacing: Sequence[float],
+    stencil: LinkStencil,
     *,
     band_matmul,
-    stencil_orders=None,
     collapsed_position=None,
 ) -> jax.Array:
-    """Construct the Hermitian reduced-coordinate connection, axis by axis.
+    """The Hermitian reduced-coordinate connection on the link stencil.
 
-    ``forward_links`` is ``(3, nk, nb, nb)`` and may be tiled
-    ``P(None,None,'x','y')``. The result has the same shape.  Per axis
-    (:func:`link_stencil_orders`): order 4 is the +/-2 finite-difference
-    connection (value-level fourth-order parity, not bit parity with a
-    continuum derivative); order 2 the +/-1 one; a collapsed axis takes
-    ``A_a = Z_a`` from ``collapsed_position`` ``(3, nk, nb, nb)``, the
-    band matrix of the position conjugate to that reduced coordinate.
-    ``stencil_orders=None`` is the historical all-fourth-order call.
+    ``forward_links`` ``(nd, nk, nb, nb)`` (tileable
+    ``P(None,None,'x','y')``) follow ``stencil.steps``.  Per step ``d`` the
+    directional connection is ``(i/2)(L_+ - L_-)`` (order 2) or the +/-2
+    Richardson form (order 4); the reduced components are
+    ``A_a = sum_d stencil.coefficients[d, a] A_d`` (:func:`link_stencil`).
+    A collapsed axis takes ``A_a = Z_a`` from ``collapsed_position``.
     """
     links = jnp.asarray(forward_links)
     plus = np.asarray(forward_neighbors, dtype=np.int32)
-    spacing = np.asarray(reduced_spacing, dtype=np.float64)
-    if links.ndim != 4 or links.shape[0] != 3 \
-            or links.shape[-2] != links.shape[-1]:
-        raise ValueError(
-            "forward_links must be (3, nk, nb, nb); "
-            f"got {tuple(links.shape)}")
-    if plus.shape != (links.shape[1], 3):
-        raise ValueError(
-            f"forward_neighbors must be ({links.shape[1]}, 3); got {plus.shape}")
-    if spacing.shape != (3,) or np.any(spacing <= 0.0):
-        raise ValueError(
-            f"reduced_spacing must be three positive values; got {spacing}")
-    orders, position = _resolve_axis_rules(
-        stencil_orders, collapsed_position, links.shape)
+    position = _check_stencil_inputs(links, plus, stencil, collapsed_position)
     minus = inverse_neighbor_table(plus)
-    components = []
-    for idir in range(3):
-        if orders[idir] == COLLAPSED_AXIS:
-            Z = position[idir]
-            components.append(0.5 * (Z + jnp.swapaxes(jnp.conj(Z), -1, -2)))
-            continue
-        lp1 = links[idir]
-        km1 = minus[:, idir]
-        lm1 = jnp.swapaxes(jnp.conj(lp1[km1]), -1, -2)
-        if orders[idir] == 2:
-            A = (1.0j / (2.0 * float(spacing[idir]))) * (lp1 - lm1)
+    coeff = np.asarray(stencil.coefficients, dtype=np.float64)
+    acc = [None, None, None]
+
+    def _add(a, term):
+        acc[a] = term if acc[a] is None else acc[a] + term
+
+    for d in range(stencil.ndir):
+        lp1 = links[d]
+        km1 = minus[:, d]
+        lm1 = _dagger(lp1[km1])
+        if stencil.orders[d] == 2:
+            Ad = 0.5j * (lp1 - lm1)
         else:
-            km2 = minus[km1, idir]
-            lp2 = band_matmul(lp1, lp1[plus[:, idir]])
-            lm2 = band_matmul(
-                lm1, jnp.swapaxes(jnp.conj(lp1[km2]), -1, -2))
-            A = (1.0j / (12.0 * float(spacing[idir]))) * (
-                -lp2 + 8.0 * lp1 - 8.0 * lm1 + lm2)
-        A = 0.5 * (A + jnp.swapaxes(jnp.conj(A), -1, -2))
-        components.append(A)
+            km2 = minus[km1, d]
+            lp2 = band_matmul(lp1, lp1[plus[:, d]])
+            lm2 = band_matmul(lm1, _dagger(lp1[km2]))
+            Ad = (1.0j / 12.0) * (-lp2 + 8.0 * lp1 - 8.0 * lm1 + lm2)
+        for a in range(3):
+            if coeff[d, a] != 0.0:
+                _add(a, float(coeff[d, a]) * Ad)
+    components = []
+    for a in range(3):
+        if stencil.axis_rules[a] == COLLAPSED_AXIS:
+            A = position[a]
+        else:
+            A = acc[a]
+        components.append(0.5 * (A + _dagger(A)))
     return jnp.stack(components, axis=0)
 
 
-def fourth_order_covariant_derivative(
+def link_covariant_derivative(
     operator_k: jax.Array,
     forward_links: jax.Array,
     forward_neighbors: np.ndarray,
-    reduced_spacing: Sequence[float],
+    stencil: LinkStencil,
     *,
     band_matmul,
-    stencil_orders=None,
     collapsed_position=None,
 ) -> jax.Array:
     r"""Differentiate a band operator after finite-link parallel transport.
 
     The stored forward link has the orientation
 
-    ``L_i(k) O(k+b_i) L_i(k)^H``.
+    ``L_d(k) O(k+b_d) L_d(k)^H``.
 
-    Each neighbour is therefore expressed in the central ``k`` basis before
-    the stencil is applied.  This is the discrete, structurally
-    gauge-covariant spelling of ``partial_i O - i[A_i,O]``; it avoids splitting
-    two large gauge-dependent terms whose finite-grid derivatives obey no
-    exact product rule.
+    Each neighbour is expressed in the central ``k`` basis before the
+    stencil is applied: the discrete, structurally gauge-covariant spelling
+    of ``partial O - i[A, O]`` (no two large gauge-dependent terms have to
+    cancel on a finite grid).  Per step ``d`` of :func:`link_stencil`,
+    ``D_d O = (T_+ O - T_- O)/2`` (order 2) or the +/-2 Richardson form
+    (order 4); the reduced components are
+    ``sum_d stencil.coefficients[d, a] D_d O``.  The step set is a
+    Marzari-Vanderbilt shell set, closed under the lattice point group, so
+    the O(h^2) error is covariant.  A COLLAPSED axis (one mesh point, a
+    vacuum direction) takes ``-i[Z_a, O]`` with ``Z_a`` from
+    ``collapsed_position`` ``(3, nk, nb, nb)``.
 
-    Per axis (:func:`link_stencil_orders`, ``stencil_orders``): order 4 is
-    the +/-2 stencil (the historical and default rule), order 2 the +/-1
-    stencil for 3- or 4-point axes, and a COLLAPSED axis (one mesh point,
-    a vacuum direction) takes ``-i[Z_a, O]`` with ``Z_a`` from
-    ``collapsed_position`` ``(3, nk, nb, nb)`` -- exact, since ``d_kappa_a``
-    of anything vanishes there and the connection IS the position matrix.
-
-    Parameters
-    ----------
-    operator_k
-        ``(nk, nb, nb)`` complex band operator at ``P(None,'x','y')``.
-    forward_links
-        ``(3, nk, nb, nb)`` polar links at
-        ``P(None,None,'x','y')``.
-    forward_neighbors
-        Host ``(nk,3)`` table of the positive mesh neighbours.
-    reduced_spacing
-        Three positive reduced-coordinate mesh spacings.
-    band_matmul
-        Distributed batched matrix product for one leading batch axis.
-
-    Returns
-    -------
-    jax.Array
-        ``(3,nk,nb,nb)`` reduced-coordinate covariant derivative, retaining
-        the input's two-dimensional band tiling.
+    ``operator_k`` is ``(nk, nb, nb)`` at ``P(None,'x','y')``;
+    ``forward_links`` ``(nd, nk, nb, nb)`` at ``P(None,None,'x','y')``;
+    ``forward_neighbors`` the host ``(nk, nd)`` table of ``k + steps[d]``;
+    ``band_matmul`` a distributed batched product over one batch axis.
+    Returns the ``(3, nk, nb, nb)`` reduced-coordinate derivative.
     """
     operator = jnp.asarray(operator_k)
     links = jnp.asarray(forward_links)
     plus = np.asarray(forward_neighbors, dtype=np.int32)
-    spacing = np.asarray(reduced_spacing, dtype=np.float64)
     if operator.ndim != 3 or operator.shape[-2] != operator.shape[-1]:
         raise ValueError(
             "operator_k must be (nk,nb,nb); "
             f"got {tuple(operator.shape)}")
-    expected_links = (3,) + tuple(operator.shape)
-    if tuple(links.shape) != expected_links:
+    if tuple(links.shape[1:]) != tuple(operator.shape):
         raise ValueError(
-            f"forward_links must have shape {expected_links}; "
+            f"forward_links must have shape (nd,) + {tuple(operator.shape)}; "
             f"got {tuple(links.shape)}")
-    if plus.shape != (operator.shape[0], 3):
-        raise ValueError(
-            f"forward_neighbors must be ({operator.shape[0]},3); "
-            f"got {plus.shape}")
-    if spacing.shape != (3,) or np.any(spacing <= 0.0):
-        raise ValueError(
-            f"reduced_spacing must be three positive values; got {spacing}")
-    orders, position = _resolve_axis_rules(
-        stencil_orders, collapsed_position, links.shape)
-
+    position = _check_stencil_inputs(links, plus, stencil, collapsed_position)
     minus = inverse_neighbor_table(plus)
+    coeff = np.asarray(stencil.coefficients, dtype=np.float64)
 
     def _transport(transport, neighbour_operator):
         return band_matmul(
-            band_matmul(transport, neighbour_operator),
-            jnp.swapaxes(jnp.conj(transport), -1, -2),
-        )
+            band_matmul(transport, neighbour_operator), _dagger(transport))
 
-    rows = []
-    for idir in range(3):
-        if orders[idir] == COLLAPSED_AXIS:
-            Z = position[idir]
-            rows.append((-1.0j) * (
-                band_matmul(Z, operator) - band_matmul(operator, Z)))
-            continue
-        lp1 = links[idir]
-        kp1 = plus[:, idir]
-        km1 = minus[:, idir]
-        lm1 = jnp.swapaxes(jnp.conj(lp1[km1]), -1, -2)
+    acc = [None, None, None]
+    for d in range(stencil.ndir):
+        lp1 = links[d]
+        kp1 = plus[:, d]
+        km1 = minus[:, d]
+        lm1 = _dagger(lp1[km1])
         tp1 = _transport(lp1, operator[kp1])
         tm1 = _transport(lm1, operator[km1])
-        if orders[idir] == 2:
-            rows.append((tp1 - tm1) / (2.0 * float(spacing[idir])))
-            continue
-        kp2 = plus[kp1, idir]
-        km2 = minus[km1, idir]
-        lp2 = band_matmul(lp1, lp1[kp1])
-        lm2 = band_matmul(
-            lm1, jnp.swapaxes(jnp.conj(lp1[km2]), -1, -2))
-        tp2 = _transport(lp2, operator[kp2])
-        tm2 = _transport(lm2, operator[km2])
-        rows.append(
-            (-tp2 + 8.0 * tp1 - 8.0 * tm1 + tm2)
-            / (12.0 * float(spacing[idir])))
+        if stencil.orders[d] == 2:
+            Dd = 0.5 * (tp1 - tm1)
+        else:
+            kp2 = plus[kp1, d]
+            km2 = minus[km1, d]
+            lp2 = band_matmul(lp1, lp1[kp1])
+            lm2 = band_matmul(lm1, _dagger(lp1[km2]))
+            tp2 = _transport(lp2, operator[kp2])
+            tm2 = _transport(lm2, operator[km2])
+            Dd = (-tp2 + 8.0 * tp1 - 8.0 * tm1 + tm2) / 12.0
+        for a in range(3):
+            if coeff[d, a] != 0.0:
+                term = float(coeff[d, a]) * Dd
+                acc[a] = term if acc[a] is None else acc[a] + term
+    rows = []
+    for a in range(3):
+        if stencil.axis_rules[a] == COLLAPSED_AXIS:
+            Z = position[a]
+            rows.append((-1.0j) * (
+                band_matmul(Z, operator) - band_matmul(operator, Z)))
+        else:
+            rows.append(acc[a])
     return jnp.stack(rows, axis=0)

@@ -115,19 +115,33 @@ The velocity artifact must stamp `vnl_included = 1`
 (`GATE sc_head_interband_commutator_velocity_operator`). The kernel is
 `qsgw_head.interband_commutator_velocity`.
 
-**QSGW dipoles.** On this head the driver writes the accepted final map's
-$U^\dagger(v + [\Delta H, W])\,U$, with the QP energies of the same states, to
+**QSGW dipoles.** On every velocity head the driver writes the accepted final
+map's $U^\dagger v\,U$, with the QP energies of the same states, to
 `dipole_qsgw.h5` beside the deck (`qsgw_head.write_qsgw_dipole`, the
-`dipole.h5` layout). Its states are the ones the map's $W$ and the final
-`WFN_qp.h5` are built from. The absorption consumers read it through
-`load_dipole_h5` and form $d_{cv} = v_{cv}/(E_c - E_v)$, which is then
-$(U^\dagger r^{VC} U)_{cv}$ with the collapsed-axis $Z_a$ in place of
+`dipole.h5` layout, `basis = "qp"`). $v$ is the head's own velocity from the
+one owner `qsgw_head.qp_velocity`: $v_{\rm DFT} + D_k\Delta H$ on
+`parallel_transport` (only $v_{\rm DFT}$ on a map whose links cannot serve the
+Σ term), $v + [\Delta H, W]$ on this head, $v_{\rm DFT}$ on `dft_velocity`.
+The file's `velocity` attribute names the term. Its states are the ones the
+map's $W$ and the final `WFN_qp.h5` are built from. The absorption consumers
+read it through `load_dipole_h5` and form $d_{cv} = v_{cv}/(E_c - E_v)$. On this
+head that is $(U^\dagger r^{VC} U)_{cv}$ with the collapsed-axis $Z_a$ in place of
 $r^{VC}$: the QSGW term $-i[r^{VC},\Delta H]$ is included; the intraband
 $D^{\rm class}\Delta H$ is not. With a band-diagonal $\Delta H$ the position
 form equals the DFT one, and the whole QSGW change of $|d|^2$ is the mixing
-$U$ (the velocity form scales by the QP-to-DFT transition-energy ratio). A
-BSE on the self-consistent restart uses its DFT parent $\psi$ with `--eqp`
-energies, so it takes these dipoles at the same diagonal approximation.
+$U$ (the velocity form scales by the QP-to-DFT transition-energy ratio).
+The file holds velocities between QP states, so it pairs only with a QP WFN:
+a BSE reads it only on a restart built from `WFN_qp.h5`, and refuses it
+beside a DFT WFN (`GATE dipole_basis`,
+[BSE inputs](architecture/bse.md)).
+When the run also writes `WFN_qp.h5`, the file carries the `dipole.h5`
+provenance stamps bound to that WFN (`qsgw_head.stamp_qsgw_dipole_provenance`):
+the WFN_qp fingerprint and this deck's window, V_NL mode and sign,
+representation and DFT+U stamps (`qsgw_head.head_dipole_operator_stamps`, the
+set the head reader checks). A GW run on `WFN_qp.h5` with the same deck,
+given the file as its `dipole.h5`, builds its head on the SC velocity; any
+other WFN refuses it by fingerprint. A run whose QP window starts above band 0
+logs that the file is not bound.
 
 ## 2 Band treatment
 
@@ -141,7 +155,9 @@ energies, so it takes these dipoles at the same diagonal approximation.
 **b3 counts bands** (owner 2026-09-29: "b3 will count bands as on main yes,
 and only bands between b0 and b3 will be rotated amongst each other"). b3 =
 nelec + `ncond` (`number_bands_protected` resolves to the same count); only
-[b0, b3) rotates, and the ζ fit is untouched. A `zeta_nband` below b3
+[b0, b3) rotates, and the ζ fit is untouched. b3 is a convergence
+parameter; its measured error is in
+[production QSGW](how-to/production-qsgw.md#error-budget). A `zeta_nband` below b3
 refuses on every route (`GATE qp_matrix_zeta_left`): a state outside the
 fit's left range would carry Σ on unfitted pairs. The classes below change
 only where each QP-matrix state's $\Sigma_c(\omega)$ is read
@@ -530,10 +546,13 @@ only the invariant ISDF basis. Three things persist across maps:
   endpoints, so the DFT gap's extra imaginary support is never locked in. The
   enclosure fixes sampling geometry only; it is not an interpolation-error
   certificate. The line sites inside it are held while the support rule would
-  place every site within 3 meV of the held one for the current bands
-  (`LINE_SITE_HOLD_EV`), and re-placed from the current bands otherwise (one
-  `SC W line sites re-planned` line): held sites frozen at map 2 of a DFT start
-  moved the Fe 4³ bispinor end point 99 meV (REPLAN 2026-09-29). The bispinor
+  place every site within max(3 meV, a tenth of the previous map's max|dE|)
+  of the held one for the current bands (`LINE_SITE_HOLD_EV`), and re-placed
+  from the current bands otherwise (one `SC W line sites re-planned` line): held sites
+  frozen at map 2 of a DFT start moved the Fe 4³ bispinor end point 99 meV
+  (REPLAN 2026-09-29), and a 3 meV hold alone re-planned on 10 of 15 maps of
+  the Fe 4³ scalar parallel_transport SC, so Anderson mixed residuals of
+  different maps and stalled (FESTALL 2026-09-30). The bispinor
   treatment ceiling is held while the current span stays inside it, else
   re-planned at twice the current span.
 
@@ -581,12 +600,24 @@ receipts certify the unprojected model only.
 
 ### Metals: direct Drude head {#metals-direct-drude-head}
 
+One owner forms the SC velocity on every map: `qsgw_head.qp_velocity` returns
+$v = v_{DFT}$ plus this map's Σ term ($D_k\Delta H$ on `parallel_transport`,
+$[\Delta H, W]$ on `interband_commutator`, none on `dft_velocity` or when the
+links are not usable). The head (S, Drude, wings) and `dipole_qsgw.h5` both read $U^\dagger v\,U$
+of that object ([QSGW dipoles](#interband-commutator-head)). The one-shot and
+fixed DFT head (`build_dft_head_response`) reads it at $\Delta H = 0$,
+$U = I$. On `bispinor_gw = full_shared_pole` the four-current bank's direct
+Γ head (`response_bank.compute_photon_bank`) takes this map's object on
+`parallel_transport` through `photon_head_state` and rotates it by $U$; on
+`dft_velocity` it rotates the authenticated `dipole.h5` velocity, which is
+the same object at $\Delta H = 0$.
+
 | status on a metal | what | where |
 |---|---|---|
-| default | `sc_head_update = off`: the fixed DFT response on the DFT fixed-N Fermi-Dirac state, with the tetrahedron Drude term and the Thomas–Fermi static slot | `qsgw_head.build_dft_head_response`, `sc_iteration._fixed_dft_head_occupation_state` |
-| admitted: shared-pole, `head_correction = no_local_fields`, or `full` on a scalar deck | `dft_velocity`: the `dipole.h5` velocity rotated into each map's QP basis, the current fixed-N μ and tetrahedron weights; the dynamic Drude tensor at $\omega \ne 0$, Thomas–Fermi at $\omega = 0$; `full` folds it through intraband wings and the static Γ body | `qsgw_head.build_iteration_head_response`, `sc_iteration._solve_head_occupations`, `gw_config.uses_metal_direct_drude_head` |
-| admitted: shared-pole scalar deck, `no_local_fields` or `full` | `parallel_transport`: the same head on $U^\dagger(v_{DFT} + D_k\Delta H)U$, where the finite-link covariant derivative of this map's $\Delta H$ is $i[\Delta H, r]$, so the Drude term sees the QP Fermi velocity. The default when `parallel_transport_file` exists and `sc_head_update` is not named (without it: `dft_velocity` from `dipole.h5`, else `off`). The links run on an outer band set (`get_dipole_mtxels --parallel-transport-bands`, default every WFN band); $D_k\Delta H$ is taken there, with the diagonal scissor tail continued past the head, and restricted to the head's bands, so `GATE pt_head_window_hybridized` judges the outer edge (the outer link's top head-count singular values). Only $D_k\Delta H$ goes through the links, so each map logs rel_err(links) × ‖$D_k\Delta H$‖/‖$v_{DFT}$‖ on the elements the head reads (transitions, Fermi-surface diagonal), and the fixed point must hold it below 1 % (`GATE pt_head_link_bound`; Fe 4³ 3.9e-3, Si 4³ 6.2e-3) and writes one block to the record: each term's (p, V_NL, Σ) contribution to $\omega_p^2$ (metals) or share of $S_{aa}(0)$ (insulators), the total, the link bound and the band gap | `qsgw_head.build_iteration_head_response`, `qsgw_head.covariant_link_derivative`, `gw_config._apply_input_envelope` |
-| refused (`GATE metal_sc_head_update_disabled`) | `parallel_transport` on a bispinor deck; `dft_velocity` with `full` on a bispinor deck | `gw_config.validate_material_inputs` |
+| unnamed with neither `parallel_transport_file` nor `dipole.h5`, or named | `sc_head_update = off`: the fixed DFT response on the DFT fixed-N Fermi-Dirac state, with the tetrahedron Drude term and the Thomas–Fermi static slot | `qsgw_head.build_dft_head_response`, `sc_iteration._fixed_dft_head_occupation_state` |
+| admitted: shared-pole, `head_correction = no_local_fields`, or `full` on a scalar deck | `dft_velocity`: the `dipole.h5` velocity rotated into each map's QP basis, the current fixed-N μ and tetrahedron weights; the dynamic Drude tensor at $\omega \ne 0$, Thomas–Fermi at $\omega = 0$; `full` folds it through intraband wings and the static Γ body | `qsgw_head.qp_velocity`, `qsgw_head.build_iteration_head_response`, `sc_iteration._solve_head_occupations`, `gw_config.uses_metal_direct_drude_head` |
+| admitted: shared-pole scalar deck, `no_local_fields` or `full`; `bispinor_gw = full_shared_pole` (`no_local_fields`), where the four-current bank builds its direct Γ head from the same velocity (`photon_head_state`) | `parallel_transport`: the same head on $U^\dagger(v_{DFT} + D_k\Delta H)U$, where the finite-link covariant derivative of this map's $\Delta H$ is $i[\Delta H, r]$, so the Drude term sees the QP Fermi velocity. The default when `parallel_transport_file` exists and `sc_head_update` is not named (without it: `dft_velocity` from `dipole.h5`, else `off`). The links are taken on the point-group-closed Marzari–Vanderbilt shell of `common.parallel_transport.link_stencil`, the one owner of the stencil (shell per lattice: [input reference](input_reference.md), `parallel_transport_file`). A link artifact from before the shell (schema 3) refuses under `parallel_transport`, and so does one whose steps differ from the shell (`GATE pt_link_stencil`); rerun the dipole step (`dft_velocity` still reads the old file). On Fe 4³ the shell brings the head's symmetry-forbidden off-diagonals to ≤ 1.6e-7 and the link error from 6.5 to 4.6 %; the bcc link stage takes about twice as long. The links run on an outer band set (`get_dipole_mtxels --parallel-transport-bands`, default min(WFN bands, ⌈1.25 × deck bands⌉)); $D_k\Delta H$ is taken there, with the diagonal scissor tail continued past the head, and restricted to the head's bands, so `GATE pt_head_window_hybridized` judges the outer edge (the outer link's top head-count singular values). Only $D_k\Delta H$ goes through the links, so each map logs rel_err(links) × ‖$D_k\Delta H$‖/‖$v_{DFT}$‖ on the elements the head reads (transitions, Fermi-surface diagonal); Fe 4³ 3.9e-3, Si 4³ 6.2e-3 at their fixed points. That bound is information: the link error falls with the k grid, a large value means the grid is underconverged, and it gates nothing. The head stays `parallel_transport` for the whole run and complete links serve $D_k\Delta H$ on every map. Only links that are not usable (incomplete, or the stencil or window-hybridization gate fails, which is a band-window defect and not k convergence) set $D_k\Delta H = 0$ for the run: the head then runs on $U^\dagger v_{DFT} U$ and each map logs one line with the reason; there is no refusal and no other mode, and the run ends with one line saying whether the term was served (`qsgw_head.qp_velocity`). Each map writes one block to the record: each term's (p, V_NL, Σ) contribution to $\omega_p^2$ (metals) or share of $S_{aa}(0)$ (insulators), the total, the link bound and the band gap | `qsgw_head.qp_velocity`, `qsgw_head.build_iteration_head_response`, `qsgw_head.covariant_link_derivative`, `gw_config._apply_input_envelope` |
+| refused (`GATE metal_sc_head_update_disabled`) | `parallel_transport` on a `bare_transverse` bispinor deck; `dft_velocity` with `full` on a bispinor deck | `gw_config.validate_material_inputs` |
 | refused (`GATE shared_pole_head_ordered`) | `full` on an ordered (time-reversal-broken) store, on every route | `shared_pole_head._refuse_head_representation` |
 | refused (`GATE metal_sc_head_update_disabled`) | `occ_broadening > 0` next to a metal width | `gw_config._validate_occupation_smearing` |
 
@@ -618,7 +649,18 @@ Insulators keep `parallel_transport` and `dft_velocity`.
   than $\approx 5\,N_b N_s \lceil N_G^{\max}/P\rceil \cdot 16$ B of ψ. Each
   file is written to a private sibling, validated through its format owner,
   and made visible by `os.replace`. The run-completion manifest requires both
-  names. `postprocess.rotate_wfn_to_qp` reapplies the stored ladder and table;
+  names. A WFN may store two k of one orbit (k and −k; MoS2 3×3 stores all
+  9). `SymMaps` then builds the full-BZ row of such a stored k from another
+  stored row, so the QP $U$ there is in the gauge of the unfolded parent, not
+  of the stored orbitals. `write_qp_wfn_h5` rotates each such row by
+  $D\cdot U$, $D = \langle\psi_{\rm stored}|\psi_{\rm unfolded}\rangle$ on
+  $[b_0, b_3)$; a non-unitary $D$ (the window cuts a multiplet) refuses
+  (`GATE qp_wfn_orphan_gauge`). Other rows are untouched, so a WFN without
+  such rows (Si) writes the same file as before. A `WFN_qp.h5` written before
+  2026-09-30 from a WFN with such rows breaks time reversal (MoS2 3×3 SOC
+  density residual 3e-2, now 3e-8). Regenerate it from its
+  `qp_wfn_rotations.h5` with `postprocess.rotate_wfn_to_qp` (the same
+  writer), and rerun the BSE and GW runs that read it. That tool reapplies the stored ladder and table;
   it neither rebuilds the tail nor re-solves occupations.
 - **Per-map files are diagnostics, not restart state.** `eqp0_iterNNNN.dat`
   holds the map output; at the fixed point it is the root of the QP equation,

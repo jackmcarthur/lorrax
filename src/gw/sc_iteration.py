@@ -522,9 +522,9 @@ class SCMapScreeningArtifacts:
     #: This map's shared-pole model handle (``W_by_role["shared_pole"]``);
     #: the accepted final map's is evaluated at omega = 0 for ``W0_qmunu``.
     shared_pole: object | None = None
-    #: ``(v + [DeltaH, W], U, E_QP, nb_logical)`` of this map's
-    #: interband-commutator head, the operands of ``dipole_qsgw.h5``
-    #: (``qsgw_head.write_qsgw_dipole``); ``None`` on every other head.
+    #: ``(qsgw_head.QPVelocity, U, E_QP, nb_logical)`` of this map's head,
+    #: the operands of ``dipole_qsgw.h5`` (``qsgw_head.write_qsgw_dipole``);
+    #: ``None`` on a run with no velocity head.
     qsgw_velocity: tuple | None = None
 
 
@@ -1510,7 +1510,7 @@ def _place(x, mesh: Mesh, spec: P | None = None) -> jax.Array:
 
 
 _SIGMA_OMEGA_ROTATE_CACHE: dict[
-    tuple[int, tuple[int, ...], bool, bool], Callable] = {}
+    tuple[int, tuple[int, ...], bool, bool, bool], Callable] = {}
 
 
 def _rotate_sigma_omega_cube(
@@ -1519,6 +1519,7 @@ def _rotate_sigma_omega_cube(
     *,
     mesh: Mesh,
     to_qp: bool,
+    donate: bool = False,
 ) -> jax.Array:
     """Rotate every frequency row of a correlation-operator cube.
 
@@ -1532,12 +1533,20 @@ def _rotate_sigma_omega_cube(
     This one helper serves both fixed-Sigma eigenvalue iteration and the
     final QP-to-DFT output rotation.  Keeping both directions here pins the
     index convention and the bounded-memory schedule in one place.
+
+    ``donate=True`` rotates the cube in place, one frequency row per
+    dispatch into the input's own buffer, and deletes the input: the
+    caller must not read it again.  Input and output are then one cube
+    instead of two (the scan's stacked output is a second cube; a donated
+    ``fori_loop`` carry still compiles a cube-sized copy, measured).  Rows
+    are rotated by the same per-row contraction as the scan, so the result
+    is bitwise the same.
     """
     from .qsgw_utils import is_band_sharded_sigma_omega
 
     shape = tuple(int(v) for v in sigma_c_omega_ry.shape)
     sharded = is_band_sharded_sigma_omega(sigma_c_omega_ry)
-    key = (id(mesh), shape, bool(to_qp), bool(sharded))
+    key = (id(mesh), shape, bool(to_qp), bool(sharded), bool(donate))
     fn = _SIGMA_OMEGA_ROTATE_CACHE.get(key)
     if fn is None:
         from .qsgw_density import rotate_band_matrix
@@ -1565,7 +1574,23 @@ def _rotate_sigma_omega_cube(
             _, out = jax.lax.scan(_one, None, cube, unroll=1)
             return jax.lax.with_sharding_constraint(out, cube_sh)
 
-        fn = _kernel
+        @_functools.partial(jax.jit, donate_argnums=(0,))
+        def _row_in_place(cube, U, i):
+            U = jax.lax.with_sharding_constraint(U, rotation_sh)
+            rotated = rotate_band_matrix(
+                jax.lax.dynamic_index_in_dim(cube, i, axis=0, keepdims=False),
+                U, mesh=mesh, to_qp=bool(to_qp))
+            rotated = jax.lax.with_sharding_constraint(rotated, row_sh)
+            return jax.lax.with_sharding_constraint(
+                jax.lax.dynamic_update_index_in_dim(cube, rotated, i, axis=0),
+                cube_sh)
+
+        def _in_place(cube, U):
+            for i in range(shape[0]):
+                cube = _row_in_place(cube, U, np.int32(i))
+            return cube
+
+        fn = _in_place if donate else _kernel
         _SIGMA_OMEGA_ROTATE_CACHE[key] = fn
     return fn(sigma_c_omega_ry, U_dft_to_qp)
 
@@ -3713,10 +3738,12 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
                         photon_g0_vectors=inputs.photon_g0_vectors,
                         photon_head_cache=inputs.screening_seed_cache,
                         photon_head_state=(
-                            (U_full, None, None)
-                            if inputs.config.sc.head_update == "dft_velocity"
+                            (U_full, None, None, photon_velocity)
+                            if inputs.config.sc.head_update in (
+                                "dft_velocity", "parallel_transport")
                             else (None, inputs.wfns_dft,
-                                  _fixed_dft_head_occupation_state(inputs))))
+                                  _fixed_dft_head_occupation_state(inputs),
+                                  None)))
                    if inputs.config.sigma.w_model == "shared_pole"
                    and wfns_transverse_qp is not None else {}),
                 print_fn=inputs.print_fn)
@@ -3740,6 +3767,9 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
     iteration_static_head_terms = inputs.static_head_terms
     head_occ_kn = None
     qsgw_velocity = None
+    # The four-current bank's velocity on this map (parallel_transport):
+    # this map's qp_velocity; None reads the dipole velocity (dft_velocity).
+    photon_velocity = None
     pt = getattr(inputs, "parallel_transport", None)
     # The shared-pole route also carries the direct-only head
     # (no_local_fields) through this frozen DFT response, with the wings
@@ -3758,10 +3788,10 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
         from .qsgw_head import finalize_iteration_head_samples
     if pt is not None:
         from .qsgw_head import (
-            HEAD_LINK_RTOL,
             InterbandCommutatorHeadData,
             assemble_delta_head_manifold,
             build_iteration_head_response,
+            qp_velocity,
         )
 
         nb_storage = int(pt.velocity_dft_cart.shape[-1])
@@ -3787,8 +3817,6 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
         if isinstance(pt, InterbandCommutatorHeadData):
             head_velocity_dft = _interband_commutator_head_velocity(
                 inputs, state, ks, wfns_qp, U_full, pt, nb_storage)
-            qsgw_velocity = (head_velocity_dft, U_full,
-                             wfns_qp.enk[:, :nb_storage], int(pt.nb_logical))
 
         head_occ_kn = wfns_qp.occ[:, :nb_storage]
         head_efermi_ry = float(efermi_ry)
@@ -3805,11 +3833,49 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
             assert head_efermi_ry == float(entry_occ_state.mu_ry)
             head_surface_weight_kn = entry_surface_weight_kn
 
+        # THE SC VELOCITY: v_DFT + this map's Sigma term, one owner.  The
+        # head below and dipole_qsgw.h5 (written from the accepted map) both
+        # read U^H v U of this object.
+        velocity = qp_velocity(
+            head_velocity_dft, head_occ_kn, mesh=inputs.mesh_xy,
+            nb_logical=int(pt.nb_logical), delta_h_dft=delta_head,
+            forward_links=forward_links,
+            forward_neighbors=pt.forward_neighbors,
+            kgrid=tuple(int(n) for n in inputs.wfn.kgrid),
+            bvec_cart=pt.reciprocal_lattice_cart,
+            collapsed_position=getattr(pt, "collapsed_position", None),
+            nb_links=int(getattr(pt, "nb_links", 0) or pt.nb_logical),
+            link_error=(float(pt.validation["link_relative_error"])
+                        if forward_links is not None else None),
+            velocity_base_cart=(pt.velocity_dft_cart
+                                if isinstance(pt, InterbandCommutatorHeadData)
+                                else None),
+            link_unserved=getattr(pt, "link_unserved", None))
+        # The dipole write reads only v and its label: the Sigma term and
+        # v_DFT are not carried past this map's head.
+        qsgw_velocity = (replace(velocity, base=None,
+                                 correction=None),
+                         U_full, wfns_qp.enk[:, :nb_storage],
+                         int(pt.nb_logical))
+    if pt is not None and uses_direct_bispinor_shared_pole_head(inputs.config):
+        # The four-current bank builds the direct Gamma head from U^H v U of
+        # this velocity (response_bank.compute_photon_bank); here only the
+        # per-map head block is formed from it.
+        from .qsgw_head import head_velocity_terms
+        photon_velocity = velocity.dft_cart
+        _record_sc(inputs, f"    SC head: four-current direct Gamma head on "
+                           f"{velocity.label} (nb={pt.nb_logical})")
+        _record_head_block(inputs, int(state.iteration), head_velocity_terms(
+            velocity, U_full, wfns_qp.enk[:, :nb_storage], head_occ_kn,
+            surface_weight_qp_kn=head_surface_weight_kn, mesh=inputs.mesh_xy,
+            kgrid=tuple(int(n) for n in inputs.wfn.kgrid),
+            bvec_cart=pt.reciprocal_lattice_cart,
+            nb_logical=int(pt.nb_logical), wfn=inputs.wfn, meta=inputs.meta,
+            velocity_kinetic_cart=getattr(pt, "velocity_kinetic_cart", None)),
+            np.asarray(jax.device_get(wfns_qp.enk[:, :nb_storage])))
+    elif pt is not None:
         iteration_head_response = build_iteration_head_response(
-            delta_head,
-            forward_links,
-            pt.forward_neighbors,
-            head_velocity_dft,
+            velocity,
             U_full,
             wfns_qp.enk[:, :nb_storage],
             head_occ_kn,
@@ -3830,11 +3896,6 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
             wfns_qp=(None if direct_only_shared_pole else wfns_qp),
             eta_ry=(0.0 if mpa_mode else None),
             occupation_state=entry_occ_state,
-            collapsed_position=getattr(pt, "collapsed_position", None),
-            nb_links=int(getattr(pt, "nb_links", 0) or pt.nb_logical),
-            link_bound=((float(pt.validation["link_relative_error"]),
-                         HEAD_LINK_RTOL)
-                        if forward_links is not None else None),
             velocity_kinetic_cart=getattr(pt, "velocity_kinetic_cart", None),
         )
         velocity_kind = (
@@ -4665,6 +4726,16 @@ def _refuse_empty_map_output(e_output_kn_ev: np.ndarray, *,
             f"downstream residual reads zero, i.e. FALSE converged.")
 
 
+def _record_sc_verdict(inputs, verdict):
+    """Log a map's verdict and hand its max|dE| to the held W line sites,
+    which move only past a tenth of the iterate's own error (shared_pole_recipe
+    LINE_SITE_HOLD_EV)."""
+    _record_sc(inputs, f"    SC convergence: {verdict.summary()}")
+    if inputs.fixed_quadrature_session is not None:
+        inputs.fixed_quadrature_session.setdefault(
+            "shared_pole_supports", {})["sc_residual_ev"] = float(verdict.max_abs_ev)
+
+
 def _record_shared_pole_replans(inputs, iteration, recipe):
     """One SC log line per held W sampling object re-planned on this map
     (``shared_pole_recipe``: line sites past LINE_SITE_HOLD_EV, a sector
@@ -4681,29 +4752,22 @@ def _record_shared_pole_replans(inputs, iteration, recipe):
                    f"{ceiling['current_response_span_ry']:.6f} Ry")
 
 
-def refuse_head_link_bound(bound) -> None:
-    """Judge the last map's link bound (``qsgw_head.link_correction_bound``).
+def _record_head_sigma_summary(inputs) -> None:
+    """One line: whether the parallel_transport Sigma term was served.
 
-    The fixed point's head is the one the results carry, so the bound
-    ``rel_err(links) x |D_k DeltaH|/|v_DFT|`` must hold there.
+    ``qsgw_head.qp_velocity`` serves ``D_k DeltaH`` on every map when the
+    source carries links and on none when it does not (links incomplete, or
+    the stencil or window-hybridization gate); the run neither refuses nor
+    switches mode, so the record says which.
     """
-    if bound is None:
+    zeroed = (inputs.screening_seed_cache or {}).get("head_sigma_zeroed")
+    if not zeroed:
         return
-    link_error, ratio, value, rtol = bound
-    if np.isfinite(value) and value <= rtol:
-        return
-    raise ValueError(
-        "GATE pt_head_link_bound: the finite-link error on the fixed "
-        "point's QSGW velocity correction exceeds the tolerance.\n"
-        f"  got:  rel_err(links) {link_error:.4e} x |D_k DeltaH|/|v_DFT| "
-        f"{ratio:.4e} = {value:.4e}\n"
-        f"  want: <= {rtol:.1e} (qsgw_head.HEAD_LINK_RTOL, 1 % of the "
-        "head velocity)\n"
-        "  fix:  a denser k grid (4th-order stencil from 5 points per "
-        "axis), or sc_head_update = dft_velocity\n"
-        "  why:  only D_k DeltaH goes through the links; their relative "
-        "error, measured on the DFT velocity, scales it\n"
-        "  doc:  docs/self_consistency.md, 'Metals: direct Drude head'")
+    reason = zeroed[max(zeroed)]
+    _record_sc(
+        inputs, "  SC head: parallel_transport Sigma term D_k dH "
+        + (f"zeroed on all {len(zeroed)} maps ({reason})" if reason
+           else f"served on all {len(zeroed)} maps"))
 
 
 def _record_head_block(inputs, iteration, response, energies_qp_kn_ry) -> None:
@@ -4720,7 +4784,7 @@ def _record_head_block(inputs, iteration, response, energies_qp_kn_ry) -> None:
     terms = response.velocity_terms
     if terms is None:
         return
-    names, shares, bound = terms
+    names, shares, bound, zeroed = terms
     metal = response.drude_tensor is not None
     if metal:
         total = 8.0 * np.pi * np.real(np.diagonal(
@@ -4743,12 +4807,17 @@ def _record_head_block(inputs, iteration, response, energies_qp_kn_ry) -> None:
                      f"{np.sqrt(max(v, 0.0)):.4f}" for v in total) + " eV")
                     if metal else ""))
     if bound is not None:
-        link_error, ratio, value, rtol = bound
-        if inputs.screening_seed_cache is not None:
-            inputs.screening_seed_cache["head_link_bound"] = bound
+        link_error, ratio, value = bound
         lines.append(
             f"      link bound: rel_err(links) {link_error:.3e} x "
-            f"|D_k dH|/|v_DFT| {ratio:.3e} = {value:.3e} (rtol {rtol:.1e})")
+            f"|D_k dH|/|v_DFT| {ratio:.3e} = {value:.3e} (information; "
+            "falls with the k grid)")
+    if zeroed is not None:
+        lines.append(f"      Sigma term zeroed: {zeroed}")
+    if (bound is not None or zeroed is not None) and (
+            inputs.screening_seed_cache is not None):
+        inputs.screening_seed_cache.setdefault(
+            "head_sigma_zeroed", {})[int(iteration)] = zeroed
     gap = 0.0
     if not metal:
         e = np.asarray(energies_qp_kn_ry, dtype=np.float64)
@@ -4756,6 +4825,10 @@ def _record_head_block(inputs, iteration, response, energies_qp_kn_ry) -> None:
             np.asarray(response.sigma_occupations)[0] > 0.5))
         gap = float(np.min(e[:, n_occ]) - np.max(e[:, n_occ - 1])) * RYD_TO_EV
     lines.append(f"      band gap: {gap:.4f} eV" + (" (metal)" if metal else ""))
+    if zeroed is not None:
+        _record_sc(
+            inputs, f"  SC head: map {iteration}: parallel_transport Sigma "
+            f"term D_k dH set to 0 ({zeroed}); v = U^dagger v_DFT U")
     for line in lines:
         _record_sc(inputs, line)
 
@@ -5619,7 +5692,7 @@ def run_self_consistency(
             map_gain=None,
             output_eigensystem=out_eig,
         )
-        _record_sc(inputs, f"    SC convergence: {verdict.summary()}")
+        _record_sc_verdict(inputs, verdict)
         return state_new, []
 
     if accelerator == "anderson":
@@ -5766,7 +5839,7 @@ def _run_linear_mixing(
             output_eigensystem=out_eig,
         )
         out_eig = None
-        _record_sc(inputs, f"    SC convergence: {verdict.summary()}")
+        _record_sc_verdict(inputs, verdict)
         last_evaluated = replace(
             last_evaluated, convergence_verdict=verdict,
             map_output_ev=E_candidate_ev)
@@ -6105,7 +6178,7 @@ def _run_anderson(
             output_eigensystem=_out_eig,
         )
         _out_eig = None
-        _record_sc(inputs, f"    SC convergence: {_verdict.summary()}")
+        _record_sc_verdict(inputs, _verdict)
         # LABEL-FREE MATRIX RESIDUAL.  The per-k spectral norm bounds every
         # sorted-eigenvalue residual (Weyl) and also sees eigenvector
         # (off-diagonal) error, so identity relabelling of hybridized pairs
@@ -6490,7 +6563,6 @@ def _refuse_hybridized_window_edge(
         return
     ik, idir, rank0 = (int(x) for x in np.unravel_index(
         int(np.argmin(kept)), kept.shape))
-    direction = "xyz"[idir]
     raise ValueError(
         "GATE pt_head_window_hybridized: "
         f"{where}: the active window's retained link singular values dip "
@@ -6498,7 +6570,8 @@ def _refuse_hybridized_window_edge(
         "a manifold the link construction cannot resolve as separable "
         "bands.\n"
         f"  got:  min retained singular value {worst:.6e} at source-k row "
-        f"{ik}, direction {direction!r}, retained rank {rank0 + 1} of "
+        f"{ik}, link step {idir} (the artifact's source_steps row), "
+        f"retained rank {rank0 + 1} of "
         f"{int(nb_logical)}\n"
         f"  want: every retained link singular value > {float(floor):.3g}\n"
         "  fix:  snap the active window outward (more bands) until the cut "
@@ -6510,69 +6583,6 @@ def _refuse_hybridized_window_edge(
         "the derivative of a well-defined single band\n"
         "  doc:  reports/metal_head_pt_pipelines_2026-08-23/PLAN.md, "
         "pipeline step 3(a)")
-
-
-def _sampled_link_singular_values(singular_values, kgrid) -> np.ndarray:
-    """The link singular values with every collapsed axis set to 1.
-
-    A collapsed axis's stored "link" is the plane-wave overlap
-    <psi| e^{-i b.r} |psi> (the neighbour is the point itself through
-    b_i): its singular values are far below one by construction and say
-    nothing about window hybridization, which is a property of transport
-    along the sampled directions only.  The derivative kernels never read
-    that link (common.parallel_transport.link_stencil_orders).
-    """
-    from common.parallel_transport import collapsed_axes
-    values = np.array(singular_values, dtype=np.float64, copy=True)
-    for axis in collapsed_axes(kgrid):
-        values[:, axis, :] = 1.0
-    return values
-
-
-def default_metal_head_update(config, input_dir: str, *, mesh, wfn, meta,
-                              material_class, print_fn=print):
-    """An unnamed ``sc_head_update`` on a metal: ``dft_velocity`` where links cannot serve.
-
-    Coordinator ruling 2026-09-30: when the deck does not name
-    ``sc_head_update`` and the default chose ``parallel_transport`` because
-    the link artifact exists, a metal whose artifact cannot serve that head
-    (links incomplete, as in a velocity-only artifact, or a link gate
-    refuses: the stencil or ``GATE pt_head_window_hybridized``) runs
-    ``dft_velocity`` instead and says why in one line.  A named mode, and an
-    insulator, keep the refusal (the owner is deciding the insulator case).
-    Returns the config the SC map runs.
-    """
-    if not (material_class == "metal"
-            and str(config.sc.head_update) == "parallel_transport"
-            and bool(config.sc.head_update_defaulted)):
-        return config
-    from file_io.paths import resolve_input_path
-    from .qsgw_head import parallel_transport_link_state
-
-    pt_path = resolve_input_path(
-        input_dir, config.paths.parallel_transport_file)
-    where = "sc_head_update=parallel_transport (not named)"
-    reason = None
-    try:
-        _refuse_unsupported_link_stencil(wfn.kgrid, where=where)
-        complete, singular_values = parallel_transport_link_state(
-            pt_path, mesh=mesh)
-        if not complete:
-            reason = ("its links are incomplete (connection or velocity "
-                      "validation not complete)")
-        else:
-            _refuse_hybridized_window_edge(
-                _sampled_link_singular_values(singular_values, wfn.kgrid),
-                int(meta.b_id_4_user), where=where)
-    except ValueError as exc:
-        reason = str(exc).strip().splitlines()[0]
-    if reason is None:
-        return config
-    print_fn(
-        f"  SC head: sc_head_update was not named and {pt_path} cannot serve "
-        f"the parallel_transport head ({reason}); this metal falls back to "
-        "dft_velocity")
-    return replace(config, sc=replace(config.sc, head_update="dft_velocity"))
 
 
 def load_head_velocity_source(
@@ -6617,25 +6627,32 @@ def load_head_velocity_source(
 
     Returns None for ``off``, which preserves the fixed-DFT head exactly.
 
-    THREE PREFLIGHT REFUSALS run here, before the expensive per-iteration
+    THREE PREFLIGHT CHECKS run here, before the expensive per-iteration
     head machinery ever sees this source (PLAN.md pipeline step 3 /
     ``reports/metal_head_pt_pipelines_2026-08-23/PLAN.md`` D3):
 
     (c) per-axis stencil support — ``parallel_transport`` only, before the
         artifact is even opened;
     (b) independent multiplet/TRIM degeneracy at the active window's top
-        edge — both modes, pure DFT energies;
+        edge — both modes, pure DFT energies; refuses;
     (a) link singular-value hybridization at the active window's top edge —
         ``parallel_transport`` only, needs the links this mode alone reads.
+
+    (c), (a) and incomplete links do not refuse: the source then carries
+    ``link_unserved`` and every map runs with ``D_k DeltaH = 0``
+    (``qsgw_head.qp_velocity``).  The link error itself gates nothing.
     """
     from gw.gw_config import HEAD_UPDATES, uses_direct_bispinor_shared_pole_head
 
     mode = str(config.sc.head_update)
     if mode not in HEAD_UPDATES:
         return None
-    if uses_direct_bispinor_shared_pole_head(config):
+    if (uses_direct_bispinor_shared_pole_head(config)
+            and mode != "parallel_transport"):
         # The four-current bank reads and rotates the dipole velocity itself
         # (``response_bank.compute_photon_bank``); no scalar head consumes one.
+        # parallel_transport loads the links below and hands the bank the
+        # map's QSGW velocity (``photon_head_state``).
         print_fn(
             "  SC head: four-current direct Gamma head follows every map "
             "(sc_head_update = dft_velocity): QP-rotated dipole velocity, "
@@ -6710,16 +6727,50 @@ def load_head_velocity_source(
             "with no links and no k stencil (insulators)")
         return source
 
-    _refuse_unsupported_link_stencil(
-        wfn.kgrid, where=f"sc_head_update={mode}")
+    # parallel_transport stays the head for the whole run (owner
+    # 2026-09-30).  Links that cannot serve D_k DeltaH (a stencil the grid
+    # cannot carry, an incomplete artifact, a hybridized window edge) set it
+    # to zero on every map (qsgw_head.qp_velocity); the velocity is then the
+    # artifact's U^dagger v_DFT U.  No refusal, no other mode.  Complete,
+    # well-defined links always serve the term: their error is a k-convergence
+    # measure, logged per map and never a gate.
+    from .qsgw_head import (load_dft_velocity_head,
+                            load_parallel_transport_head,
+                            parallel_transport_link_state)
 
-    from .qsgw_head import load_parallel_transport_head
-
-    source = load_parallel_transport_head(
-        pt_path, mesh=mesh, sym=sym, wfn=wfn, meta=meta)
-    _refuse_hybridized_window_edge(
-        _sampled_link_singular_values(source.singular_values, wfn.kgrid),
-        source.nb_logical, where=f"sc_head_update={mode}")
+    where = f"sc_head_update={mode}"
+    unserved = None
+    try:
+        _refuse_unsupported_link_stencil(wfn.kgrid, where=where)
+    except ValueError as exc:
+        unserved = str(exc).strip().splitlines()[0]
+    if unserved is None and not parallel_transport_link_state(
+            pt_path, mesh=mesh)[0]:
+        unserved = ("links incomplete (connection or velocity validation "
+                    "not complete)")
+    if unserved is not None:
+        source = replace(load_dft_velocity_head(
+            pt_path, mesh=mesh, wfn=wfn, meta=meta, config=config),
+            link_unserved=unserved)
+    else:
+        source = load_parallel_transport_head(
+            pt_path, mesh=mesh, sym=sym, wfn=wfn, meta=meta)
+        try:
+            _refuse_hybridized_window_edge(
+                source.singular_values,
+                source.nb_logical, where=where)
+        except ValueError as exc:
+            unserved = str(exc).strip().splitlines()[0]
+            source = replace(source, forward_links=None,
+                             forward_neighbors=None, collapsed_position=None,
+                             link_unserved=unserved)
+    if unserved is not None:
+        print_fn(
+            f"  SC head: parallel_transport from {pt_path} "
+            f"(nb={source.nb_logical}); its links cannot serve the Sigma "
+            f"term ({unserved}), so D_k dH = 0 on every map and the head "
+            "runs U^dagger v_DFT U")
+        return source
     vgate = source.validation
     print_fn(
         "  SC head: loaded validated parallel transport from "
@@ -6934,9 +6985,6 @@ def run_sc_driver(
             # sharded, and it is the same (nk, nb, nb) object as U.
             kin_ion = kstar.select(kin_ion)
 
-    config = default_metal_head_update(
-        config, input_dir, mesh=mesh_xy, wfn=wfn, meta=meta,
-        material_class=material_class, print_fn=record_fn or print_fn)
     parallel_transport = load_head_velocity_source(
         config, input_dir, mesh=mesh_xy, sym=sym, wfn=wfn, meta=meta,
         material_class=material_class, print_fn=print_fn)
@@ -7022,6 +7070,7 @@ def run_sc_driver(
         raise RuntimeError(
             "GATE sc_missing_convergence_verdict: the last evaluated SC map "
             "returned no fixed-point verdict")
+    _record_head_sigma_summary(inputs)
     if sc.max_iter == 1:
         _record_sc(
             inputs, "  SC verdict: ONE-MAP DIAGNOSTIC (convergence was not "
@@ -7044,8 +7093,6 @@ def run_sc_driver(
         _record_sc(
             inputs, f"  SC verdict: CONVERGED after {len(rms_history)} GW "
             f"map calls; {verdict.summary()}")
-    refuse_head_link_bound((inputs.screening_seed_cache or {}).get(
-        "head_link_bound"))
     sigma_result = state_final.outputs.sigma_result
     screening = state_final.outputs.screening
     # A four-current (full_shared_pole) map carries its head inside the
@@ -7135,12 +7182,14 @@ def run_sc_driver(
         # owns the large pre-unfold W wedge, so the final-map owner must tear
         # it down explicitly before post-SC artifacts are built.
         take_pre_unfold("W0_qmunu")
+    qsgw_dipole_path = None
     if screening.qsgw_velocity is not None:
         from .qsgw_head import QSGW_DIPOLE_FILE, write_qsgw_dipole
         v_qsgw, U_qsgw, e_qsgw, nb_qsgw = screening.qsgw_velocity
+        qsgw_dipole_path = os.path.join(input_dir, QSGW_DIPOLE_FILE)
         with timing.section("sc.write_qsgw_dipole"):
             write_qsgw_dipole(
-                os.path.join(input_dir, QSGW_DIPOLE_FILE), v_qsgw, U_qsgw,
+                qsgw_dipole_path, v_qsgw, U_qsgw,
                 e_qsgw, nb_logical=nb_qsgw, mesh=mesh_xy, print_fn=print_fn)
         del v_qsgw, U_qsgw, e_qsgw
     # W0 is the only large object in the final-map payload.  Drop it before
@@ -7183,6 +7232,13 @@ def run_sc_driver(
         clamp_tol=float(config.occupation_clamp_tol),
     )
     rotations_written = True
+    if qsgw_dipole_path is not None and bool(config.debug.write_wfn_h5):
+        # dipole_qsgw.h5 is WFN_qp's velocity: stamp it so a GW run on
+        # WFN_qp authenticates it as its dipole.h5.
+        from .qsgw_head import stamp_qsgw_dipole_provenance
+        stamp_qsgw_dipole_provenance(
+            qsgw_dipole_path, wfn_qp_path=os.path.join(input_dir, "WFN_qp.h5"),
+            config=config, wfn=wfn, meta=meta, print_fn=print_fn)
     # THE SC EIGENVALUES: the accepted map's output, as its eqp snapshot
     # wrote them.  The driver's generic writer writes no eqp pair for SC, and
     # the gap report reads this same array.
@@ -7246,9 +7302,13 @@ def run_sc_driver(
                 U, sigma_result.sigma_band_axis, pad_diagonal=1.0),
             mesh_xy, _band_rotation_spec())
     sigma_c_omega_dft = (
+        # Donated: the QP-basis cube has no reader past this line
+        # (dump_sigma_omega_h5_final wrote it above; the SC loop's cells and
+        # the edge/Z diagnostics ran before this frame; the driver reads
+        # only sigma_result_dft), so the two cubes are never both resident.
         _rotate_sigma_omega_cube(
             sigma_result.sigma_c_omega_kij_ry, U_sigma,
-            mesh=mesh_xy, to_qp=False)
+            mesh=mesh_xy, to_qp=False, donate=True)
         if sigma_result.sigma_c_omega_kij_ry is not None else None)
     sigma_c_at_dft_dft = (
         _sigma_c_at_dft_diag_from_dft_cube(

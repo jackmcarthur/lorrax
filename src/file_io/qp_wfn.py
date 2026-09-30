@@ -832,6 +832,15 @@ def write_qp_wfn_h5(
     from common import timing
     from .slab_io import SlabIO
 
+    # U is in the gauge of the canonical unfolded ψ; on a TR-orphan row that
+    # is not the stored ψ, so carry U into the stored gauge first.
+    gauge = _orphan_row_gauge(wfn, mesh=mesh, band_start=int(band_start),
+                              band_stop=int(band_stop))
+    if gauge:
+        U_kmn = np.array(U_kmn, dtype=np.complex128, copy=True)
+        for row, D in gauge.items():
+            U_kmn[row] = D @ U_kmn[row]
+
     # THE FILE SAYS WHAT IT IS.  ψ and E in here are a MATCHED PAIR: the
     # rotated orbitals carry the QP eigenvalues that produced the rotation,
     # and applying a second, DFT-band-labelled QP ladder on top of them
@@ -1054,6 +1063,109 @@ def _qp_rotation_kernel(mesh, band_start: int, band_stop: int):
 
     return jax.jit(shard_map(local, mesh=mesh, in_specs=(P(), spec),
                              out_specs=spec))
+
+
+#: Largest ``max|DᴴD − 1|`` accepted for an orphan row's gauge overlap.
+ORPHAN_GAUGE_UNITARITY_TOL = 1.0e-6
+
+
+def _orphan_row_gauge(wfn, *, mesh, band_start: int,
+                      band_stop: int) -> dict[int, np.ndarray]:
+    """``{row: D}`` for each TR-orphan file-wedge row; ``{}`` when there is none.
+
+    A WFN may store two k of one orbit (k and −k).  ``SymMaps`` then builds
+    the full-BZ row of stored ``c`` from another stored row ``p`` (its
+    highest-parent tie break), so every canonical band quantity at ``c``,
+    the QP ``U`` included, is in the gauge of ``ψ̃_c = g·ψ_p``, not of the
+    stored ``ψ_c``.  On the rotated bands ``D[m, n] = ⟨ψ_c,m | ψ̃_c,n⟩``, and
+    ``Σ_m (D·U)[m, n] ψ_c,m = Σ_m U[m, n] ψ̃_c,m``.  ``ψ̃_c`` is
+    ``WfnLoader.unfold_parent_to_full_k``, matched to the stored G order.
+    Refuses (GATE qp_wfn_orphan_gauge) when ``D`` is not unitary, i.e. the
+    band window cuts a multiplet.
+    """
+    sym = wfn.symmetry()
+    full_row = np.asarray(sym.kirr_fullids, dtype=np.int32)
+    parent = np.asarray(sym.irr_idx_k, dtype=np.int32)[full_row]
+    orphans = np.flatnonzero(parent != np.arange(full_row.size))
+    if orphans.size == 0:
+        return {}
+    from jax.sharding import NamedSharding, PartitionSpec as P
+    from common.collectives import device_put_process_local
+    from wfn_loader import IBZRows
+
+    wfn.adopt_mesh(mesh)
+    band_spec = P(None, ("x", "y"), None, None)
+    bands = (int(band_start), int(band_stop))
+    nb = bands[1] - bands[0]
+    out = {}
+    for c in (int(v) for v in orphans):
+        p, f = int(parent[c]), int(full_row[c])
+        parent_psi = wfn.load(bands=bands, k=IBZRows((p,)), sharding=band_spec)
+        child = wfn.unfold_parent_to_full_k(parent_psi, parent=p, full_k=f)
+        del parent_psi
+        stored = wfn.load(bands=bands, k=IBZRows((c,)), sharding=band_spec)
+        perm = _stored_g_order(
+            wfn.gvecs(k=IBZRows((c,)))[0], wfn.gvecs(k=[f])[0],
+            int(wfn.ngk_valid(k=IBZRows((c,)))[0]), row=c)
+        on = child.sharding.mesh
+        perm = device_put_process_local(perm, NamedSharding(on, P()))
+        D = _band_overlap_kernel(on)(stored, child, perm)
+        D = np.asarray(D.addressable_data(0))[:nb, :nb]
+        del stored, child
+        err = float(np.max(np.abs(D.conj().T @ D - np.eye(nb))))
+        if not err <= ORPHAN_GAUGE_UNITARITY_TOL:
+            raise ValueError(
+                "GATE qp_wfn_orphan_gauge: stored k row "
+                f"{c} is built by symmetry from row {p}, and the overlap of "
+                f"its stored bands [{bands[0]},{bands[1]}) with the unfolded "
+                f"ones is not unitary (max|DᴴD − 1| = {err:.2e} > "
+                f"{ORPHAN_GAUGE_UNITARITY_TOL:.0e}): the band window cuts a "
+                "multiplet.  Move band_start/band_stop off the degeneracy.")
+        out[c] = D
+    return out
+
+
+def _stored_g_order(g_stored, g_child, ngk, *, row) -> np.ndarray:
+    """``perm`` with ``g_child[perm[i]] == g_stored[i]`` for ``i < ngk``.
+
+    Pad slots map to themselves (their coefficients are zero)."""
+    keys = [np.asarray(g[:ngk], dtype=np.int64) for g in (g_stored, g_child)]
+    span = int(max(np.abs(k).max() for k in keys)) * 2 + 1
+    code = [((k[:, 0] * span) + k[:, 1]) * span + k[:, 2] for k in keys]
+    order_s, order_c = np.argsort(code[0]), np.argsort(code[1])
+    if not np.array_equal(code[0][order_s], code[1][order_c]):
+        raise ValueError(
+            f"GATE qp_wfn_orphan_gauge: stored k row {row} and its unfolded "
+            "full-BZ row carry different G spheres.")
+    perm = np.arange(g_stored.shape[0], dtype=np.int32)
+    perm[order_s] = order_c
+    return perm
+
+
+@functools.lru_cache(maxsize=None)
+def _band_overlap_kernel(mesh):
+    """``D[m, n] = Σ_{s,G} conj(a[m, s, G]) b[n, s, perm[G]]``, contracted G-sharded.
+
+    ``a`` and ``b`` are band-sharded one-k rows; ``b`` is put in ``a``'s G
+    order where it lies (each rank holds all G of its bands), one all-to-all
+    moves both to G slices, and ``D`` is one all-reduce.  No rank holds a
+    band-complete row.
+    """
+    import jax
+    import jax.numpy as jnp
+    from jax.sharding import NamedSharding, PartitionSpec as P
+
+    g_sharded = NamedSharding(mesh, P(None, None, None, tuple(mesh.axis_names)))
+    n_dev = int(mesh.devices.size)
+
+    def overlap(a, b, perm):
+        b = jnp.take(b, perm, axis=3)
+        pad = ((0, 0), (0, 0), (0, 0), (0, (-a.shape[3]) % n_dev))
+        a = jax.lax.with_sharding_constraint(jnp.pad(a, pad), g_sharded)
+        b = jax.lax.with_sharding_constraint(jnp.pad(b, pad), g_sharded)
+        return jnp.einsum("kmsg,knsg->mn", a.conj(), b)
+
+    return jax.jit(overlap, out_shardings=NamedSharding(mesh, P()))
 
 
 def validate_qp_wfn_h5(

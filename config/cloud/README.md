@@ -25,7 +25,7 @@ site-specific survives in the closure.
   `cusolvermp,cublasmp,cufft,phdf5`, `cal=0`.
 * `scripts/verify_ffi_build.sh --leg cuda` under `LORRAX_FFI_VERIFY_ENV=runtime`:
   **every gate ran and passed** (one-MPI, closure resolution, one-HDF5, ABI).
-* `launch.sh -n 1 python tests/bench/cusolvermp_eigh_test.py -n 128 --grid 1 1`:
+* `launch.sh -n 1 python services/distrib_la/bench/cusolvermp_eigh_test.py -n 128 --grid 1 1`:
   ALL PASSED, `max |eval − ref| = 5.7e-13` — a live cuSOLVERMp eigh through
   the artifact. (Falsification: the same run refuses loudly on a broken
   closure; that failure mode was observed, then fixed, during bring-up.)
@@ -54,7 +54,7 @@ cd lorrax
 bash config/cloud/setup_env.sh     # venv + CUDA13 wheels + parallel HDF5 (~10 min)
 bash config/cloud/build_ffi.sh     # liblorrax_ffi.so + full acceptance gates
 bash config/cloud/launch.sh -n 4 python -u config/perlmutter/cuda13_module/verify_runtime.py
-bash config/cloud/launch.sh -n 4 python -u tests/bench/cusolvermp_eigh_test.py -n 512 --grid 2 2
+bash config/cloud/launch.sh -n 4 python -u services/distrib_la/bench/cusolvermp_eigh_test.py -n 512 --grid 2 2
 ```
 
 Then real work, e.g.:

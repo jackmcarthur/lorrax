@@ -1,14 +1,17 @@
-"""Correctness test for ``cusolvermp.batched_distributed_solve_lu``.
+"""Correctness test: cuSOLVERMp.batched_distributed_cholesky + batched_distributed_potrs.
 
-Mirrors cusolvermp_batched_test.py but targets the general (non-Hermitian)
-distributed LU solve used by the W Dyson 'distributed' plan on CUDA meshes.
+4-GPU mesh (default 2x2). Build Nbatch random Hermitian PD matrices each
+of size N×N, plus a batched RHS of shape (Nbatch, N, Mrhs), sharded
+``P('x', None, 'y')``. Factor via batched_distributed_cholesky, solve
+via batched_distributed_potrs. Gather, compare per-slice against
+``np.linalg.cholesky`` / ``L_np @ L_np.conj().T @ X - B``.
 
 Usage::
 
     export LX_BASE_MODULE=lorrax_A LORRAX_CHECKOUT=$PWD
     lx run -N 1 -G 4 -n 4 -- env PYTHONPATH="$LORRAX_CHECKOUT/src" \\
-        python3 -u tests/bench/cusolvermp_solve_lu_test.py \\
-        --nbatch 8 -n 128 --nrhs 128 --mesh 2x2 --dtype c128
+        python3 -u services/distrib_la/bench/cusolvermp_batched_test.py \\
+        --nbatch 8 -n 128 --mrhs 256 --mesh 2x2 --dtype c128
 """
 from __future__ import annotations
 
@@ -42,7 +45,11 @@ _init()
 
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 from jax.experimental import multihost_utils
-from ffi.cusolvermp import batched_distributed_solve_lu
+from ffi import _services      # noqa: F401,E402  (path bootstrap for services/*/src)
+from distrib_la._cusolvermp import (
+    batched_distributed_cholesky,
+    batched_distributed_potrs,
+)
 
 
 def _log(s):
@@ -50,39 +57,33 @@ def _log(s):
         print(s, flush=True)
 
 
-def build_general_batch(nbatch, n, dtype, seed, mesh, identity_only=False):
-    """Build (nbatch, n, n) diagonally-dominant random matrix — non-Hermitian
-    but well-conditioned so LU is stable.  If ``identity_only``, return
-    A = I (sanity-check: X should equal B)."""
-    sh = NamedSharding(mesh, P(None, "x", "y"))
+def build_hpd_batch(nbatch, n, dtype, seed, mesh):
+    sh = NamedSharding(mesh, P("x", None, "y"))
 
     @jax.jit
     def _b():
-        if identity_only:
-            A = jnp.broadcast_to(jnp.eye(n, dtype=dtype)[None, :, :],
-                                 (nbatch, n, n)).astype(dtype)
-            return jax.lax.with_sharding_constraint(A, sh)
         k_r, k_i = jax.random.split(jax.random.key(seed), 2)
         a = jax.random.normal(k_r, (nbatch, n, n), dtype=jnp.float64)
         if jnp.issubdtype(dtype, jnp.complexfloating):
             b = jax.random.normal(k_i, (nbatch, n, n), dtype=jnp.float64)
-            A = (a + 1j * b).astype(dtype)
+            z = (a + 1j * b).astype(dtype)
+            H = 0.5 * (z + jnp.conj(jnp.swapaxes(z, -1, -2)))
         else:
-            A = a.astype(dtype)
-        A = A + (2.0 * n) * jnp.eye(n, dtype=dtype)[None, :, :]
-        return jax.lax.with_sharding_constraint(A, sh)
+            H = 0.5 * (a + jnp.swapaxes(a, -1, -2)).astype(dtype)
+        H = H + n * jnp.eye(n, dtype=dtype)[None, :, :]
+        return jax.lax.with_sharding_constraint(H, sh)
     return _b()
 
 
-def build_rhs_batch(nbatch, n, nrhs, dtype, seed, mesh):
-    sh = NamedSharding(mesh, P(None, "x", "y"))
+def build_rhs_batch(nbatch, n, mrhs, dtype, seed, mesh):
+    sh = NamedSharding(mesh, P("x", None, "y"))
 
     @jax.jit
     def _b():
         k_r, k_i = jax.random.split(jax.random.key(seed), 2)
-        a = jax.random.normal(k_r, (nbatch, n, nrhs), dtype=jnp.float64)
+        a = jax.random.normal(k_r, (nbatch, n, mrhs), dtype=jnp.float64)
         if jnp.issubdtype(dtype, jnp.complexfloating):
-            b = jax.random.normal(k_i, (nbatch, n, nrhs), dtype=jnp.float64)
+            b = jax.random.normal(k_i, (nbatch, n, mrhs), dtype=jnp.float64)
             B = (a + 1j * b).astype(dtype)
         else:
             B = a.astype(dtype)
@@ -99,12 +100,11 @@ def main():
     ap = argparse.ArgumentParser(allow_abbrev=False)
     ap.add_argument("--nbatch", type=int, default=8)
     ap.add_argument("-n", type=int, default=128)
-    ap.add_argument("--nrhs", type=int, default=0, help="rhs cols; default n")
+    ap.add_argument("--mrhs", type=int, default=0, help="rhs cols; default n")
     ap.add_argument("--mesh", type=str, default="2x2")
     ap.add_argument("--dtype", choices=["f64", "c128"], default="c128")
+    ap.add_argument("--nb", type=int, default=0)
     ap.add_argument("--seed", type=int, default=0)
-    ap.add_argument("--identity", action="store_true",
-                    help="use A=I — trivial LU; X should equal B exactly")
     args = ap.parse_args()
 
     Px, Py = _parse_mesh(args.mesh)
@@ -114,32 +114,40 @@ def main():
     mesh = Mesh(np.asarray(jax.devices()).reshape(Px, Py),
                 axis_names=("x", "y"))
     dtype = jnp.complex128 if args.dtype == "c128" else jnp.float64
-    nrhs = args.nrhs or args.n
+    mrhs = args.mrhs or args.n
 
-    if args.n % Px != 0 or args.n % Py != 0 or nrhs % Py != 0:
-        _log(f"divisibility fails: N={args.n}%Px={Px}, "
-             f"N={args.n}%Py={Py}, NRHS={nrhs}%Py={Py}")
+    if args.nbatch % Px != 0 or args.n % Py != 0 or mrhs % Py != 0:
+        _log(f"divisibility fails: Nbatch={args.nbatch}%Px={Px}, "
+             f"N={args.n}%Py={Py}, Mrhs={mrhs}%Py={Py}")
         return 2
 
-    _log(f"=== cusolvermp batched solve_lu: nbatch={args.nbatch} "
-         f"n={args.n} nrhs={nrhs} mesh={Px}x{Py} dtype={args.dtype} ===")
+    _log(f"=== cusolvermp batched potrf+potrs: nbatch={args.nbatch} "
+         f"n={args.n} mrhs={mrhs} mesh={Px}x{Py} dtype={args.dtype} ===")
 
-    A = build_general_batch(args.nbatch, args.n, dtype, args.seed, mesh,
-                             identity_only=args.identity)
-    B = build_rhs_batch(args.nbatch, args.n, nrhs, dtype, args.seed + 1, mesh)
+    A = build_hpd_batch(args.nbatch, args.n, dtype, args.seed, mesh)
+    B = build_rhs_batch(args.nbatch, args.n, mrhs, dtype, args.seed + 1, mesh)
     jax.block_until_ready(A); jax.block_until_ready(B)
     multihost_utils.sync_global_devices("inputs_built")
 
-    # Snapshot A before the solve — solve donates A's buffer.
-    A_full = multihost_utils.process_allgather(A)
-    B_full = multihost_utils.process_allgather(B)
+    kw = {"mesh": mesh}
+    if args.nb:
+        kw["block_size"] = args.nb
 
     t0 = time.perf_counter()
-    X = batched_distributed_solve_lu(A, B, mesh=mesh)
-    jax.block_until_ready(X)
-    dt = time.perf_counter() - t0
-    _log(f"  solve_lu wall: {dt*1000:.1f} ms")
+    L_handle = batched_distributed_cholesky(A, **kw)
+    jax.block_until_ready(L_handle.raw)
+    dt_potrf = time.perf_counter() - t0
+    _log(f"  potrf wall: {dt_potrf*1000:.1f} ms "
+         f"(nbatch_local={args.nbatch//Px})")
 
+    t0 = time.perf_counter()
+    X = batched_distributed_potrs(L_handle, B, mesh=mesh)
+    jax.block_until_ready(X)
+    dt_potrs = time.perf_counter() - t0
+    _log(f"  potrs wall: {dt_potrs*1000:.1f} ms")
+
+    A_full = multihost_utils.process_allgather(A)
+    B_full = multihost_utils.process_allgather(B)
     X_full = multihost_utils.process_allgather(X)
 
     if jax.process_index() == 0:
@@ -151,19 +159,10 @@ def main():
         for q in range(args.nbatch):
             Aq, Bq, Xq = A_np[q], B_np[q], X_np[q]
             Bnorm = max(np.linalg.norm(Bq), 1.0)
+            # Verify A X = B directly against the original A (not factored).
             res_ax = np.linalg.norm(Aq @ Xq - Bq) / Bnorm
             res_ax_max = max(res_ax_max, res_ax)
         _log(f"  max |A X - B|/|B| = {res_ax_max:.3e}")
-        # Debug: dump top-left 4x4 of X[0] and B[0] to see the pattern.
-        if os.environ.get("LORRAX_LU_DEBUG_DUMP"):
-            # Identity sanity: which cells of X match/don't match B?
-            # For A=I, expected X = B.  Show mask of zero cells in X.
-            diff = X_np[0] - B_np[0]
-            _log(f"  |X-B|[0] max = {np.abs(diff).max():.3e}")
-            zero_mask = (np.abs(X_np[0]) < 1e-15).astype(int)
-            _log(f"  X[0] zero-mask (1 = zero, 0 = nonzero):")
-            for row in zero_mask:
-                _log("    " + "".join(str(c) for c in row))
         tol = 1e-10
         _log(f"  {'PASS' if res_ax_max < tol else 'FAIL'} at tol {tol:.1e}")
         return 0 if res_ax_max < tol else 1

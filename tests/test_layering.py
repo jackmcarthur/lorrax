@@ -250,7 +250,7 @@ def _is_standalone_driver(mod: str) -> bool:
     (2026-07-31), where the exemption is structural instead of a rule
     carve-out.  The classifier stays so that
     :func:`test_the_src_tree_grows_no_new_bench_drivers` can keep the count
-    at 0 — a new driver shape under ``src/`` belongs in ``tests/bench/``.
+    at 0 — a new driver shape under ``src/`` belongs in ``services/<svc>/bench/``.
     """
     last = mod.split(".")[-1]
     return (last.endswith("_test") or last.startswith("test_")
@@ -1675,13 +1675,10 @@ _SERVICE_DOORS = {"lxkit": "lxkit", "distrib_la": "distrib_la",
 #: Every consumer imports the top-level ``distrib_la`` door now, which this
 #: rule does not count because it is not a violation.
 #:
-#: THE REMAINING SEVEN ARE NOT A REPLUMB LEFTOVER.  ``ffi.cusolvermp`` has a
-#: live in-``src/`` reacher that is out of distrib_la's scope entirely --
-#: ``ffi/cublasmp/batched.py:33`` takes ``get_or_init_context`` from it, and
-#: cuBLASMp is a future ``gemm`` service, not this one.  Converting that edge
-#: would mean lorrax importing ``distrib_la._cusolvermp`` directly, i.e.
-#: trading three counted exceptions for one uncounted violation.  It goes
-#: when gemm is extracted; until then the number is 7 and it is honest.
+#: THE LAST SEVEN ARE GONE.  ``ffi.cusolvermp`` (a re-export shim) and
+#: ``ffi.cublasmp`` (its one reacher) were deleted on 2026-09-30 once the
+#: distrib_la benches imported ``distrib_la._cusolvermp`` directly and no
+#: caller remained.
 #:
 #: 7 -> 10 AT THE symmetry_maps EXTRACTION.  Three forwarding shims, one
 #: past-the-door edge each: ``from symmetry_maps import <submodule> as
@@ -1708,11 +1705,7 @@ _SERVICE_DOORS = {"lxkit": "lxkit", "distrib_la": "distrib_la",
 #: delete the exception, and probably the module" the moment they went.
 #: An exception table that outlives its shims is how a replumb gets
 #: declared finished while the old paths are still there.
-_SERVICE_DOOR_EXCEPTIONS = {
-    "ffi.cusolvermp.batched": 5,
-    "ffi.cusolvermp.eigh":    1,
-    "ffi.cusolvermp.context": 1,
-}
+_SERVICE_DOOR_EXCEPTIONS: dict = {}
 
 
 def service_submodules(sources, service: str) -> set:
@@ -1984,7 +1977,7 @@ def test_the_src_tree_grows_no_new_bench_drivers(sources):
     found = sorted(m for m in sources if _is_standalone_driver(m))
     assert not found, (
         f"{len(found)} bench/test driver(s) under src/, must be 0: "
-        f"{found}.  Bench and smoke drivers live in tests/bench/.")
+        f"{found}.  Bench drivers live in services/<svc>/bench/.")
 
 
 def test_the_bench_driver_classifier_can_fail():

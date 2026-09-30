@@ -23,6 +23,7 @@ __all__ = [
     "IterationHeadResponse",
     "IterationHeadSamples",
     "ParallelTransportHeadData",
+    "QPVelocity",
     "StaticGaugeHallTransaction",
     "assemble_delta_head_manifold",
     "assemble_head_manifold",
@@ -46,6 +47,7 @@ __all__ = [
     "load_dft_dipole_head",
     "load_interband_commutator_head",
     "load_parallel_transport_head",
+    "qp_velocity",
     "reduced_covector_to_cartesian",
     "rotate_velocity_active_to_qp",
     "rotate_velocity_to_qp",
@@ -268,6 +270,10 @@ class ParallelTransportHeadData:
     #: ``p`` alone (head block, DFT basis) when the artifact carries it:
     #: the p / V_NL split of the per-map head block (velocity_term_shares).
     velocity_kinetic_cart: object = None
+    #: Why the links cannot serve ``D_k DeltaH`` on any map (stencil or
+    #: window-hybridization gate); the links are then dropped and every map
+    #: runs ``U^dagger v_DFT U`` (:func:`qp_velocity`).  None: served.
+    link_unserved: str | None = None
 
 
 @dataclass(frozen=True)
@@ -299,6 +305,10 @@ class DftVelocityHeadData:
     forward_links: None = None
     forward_neighbors: None = None
     validation: None = None
+    #: Set when ``sc_head_update = parallel_transport`` runs on this velocity
+    #: because the artifact's links are incomplete: the reason its Sigma
+    #: term is zero on every map (:func:`qp_velocity`).
+    link_unserved: str | None = None
 
 
 def head_storage_extent(mesh: Mesh, nb_head: int) -> int:
@@ -417,11 +427,12 @@ def load_parallel_transport_head(
         VELOCITY_DFT_DATASET,
         load_full_bz_links,
         load_link_singular_values,
+        stored_link_steps,
     )
     from file_io.slab_io import SlabIO
     from common.parallel_transport import (
-        band_storage_extent, collapsed_axes, link_stencil_orders,
-        wfn_fingerprint)
+        band_storage_extent, collapsed_axes, link_stencil,
+        link_stencil_orders, wfn_fingerprint)
 
     int_names = (
         "schema_version",
@@ -466,7 +477,11 @@ def load_parallel_transport_head(
         if ints["schema_version"] != int(SCHEMA_VERSION):
             refusals.append(
                 f"schema_version={ints['schema_version']}, "
-                f"expected {int(SCHEMA_VERSION)}"
+                f"expected {int(SCHEMA_VERSION)} (schema 4 stores links on "
+                "the point-group-closed shell of common.parallel_transport."
+                "link_stencil; fix: rerun the dipole step, get_dipole_mtxels, "
+                "to rebuild the links; sc_head_update = dft_velocity still "
+                "reads the old file)"
             )
         if ints["connection_complete"] != 1:
             refusals.append("connection_complete is not 1")
@@ -564,8 +579,21 @@ def load_parallel_transport_head(
         nb_storage = head_storage_extent(mesh, expected_nb)
         outer_storage = band_storage_extent(mesh, nb_outer)
         large_shape = (3, int(meta.nk_tot), outer_storage, outer_storage)
+        # The stored link steps must be this lattice's link_stencil; an
+        # artifact from before the shell (three reduced axes only, schema
+        # 3) is refused above by its schema.
+        stored_steps = stored_link_steps(io)
+        want_steps = link_stencil(
+            tuple(int(n) for n in expected_kgrid), expected_reciprocal).steps
+        if not np.array_equal(stored_steps, want_steps):
+            raise ValueError(
+                f"GATE pt_link_stencil: {path}: stored link steps "
+                f"{stored_steps.tolist()} != link_stencil "
+                f"{want_steps.tolist()}; regenerate the artifact with "
+                "get_dipole_mtxels")
         forward_neighbors = np.asarray(io.read_slab(
-            "full_forward_neighbors", shape=(int(meta.nk_tot), 3),
+            "full_forward_neighbors",
+            shape=(int(meta.nk_tot), int(want_steps.shape[0])),
             partition_spec=P(None, None), as_numpy=True), dtype=np.int64)
         links = load_full_bz_links(
             io, mesh=mesh, nk=int(meta.nk_tot), nb_storage=outer_storage,
@@ -620,12 +648,12 @@ def load_parallel_transport_head(
                 partition_spec=spec)
 
     expected_prefix = (3, int(meta.nk_tot))
+    nd = int(forward_neighbors.shape[1])
     if (
-        tuple(links.shape[:2]) != expected_prefix
+        tuple(links.shape[:2]) != (nd, int(meta.nk_tot))
         or tuple(velocity.shape) != expected_prefix + (nb_storage, nb_storage)
         or links.shape[-2] != links.shape[-1]
         or int(links.shape[-1]) < nb_outer
-        or forward_neighbors.shape != (int(meta.nk_tot), 3)
     ):
         raise ValueError(
             f"{path}: large PT dataset shapes are inconsistent: "
@@ -732,12 +760,12 @@ def load_dft_velocity_head(
             np.asarray(wfn.bvec, dtype=np.float64) * float(wfn.blat)
         )
         refusals = []
-        # Schema 3 changes only the link-consumer validation contract.  The
-        # DFT velocity payload and all provenance fields are byte-for-byte
-        # schema-2 compatible, and this mode deliberately consumes no links.
-        if schema not in (2, int(SCHEMA_VERSION)):
+        # Schemas 3 and 4 change only the link-consumer contract (4: the
+        # link_stencil shell).  The DFT velocity payload and all provenance
+        # fields are schema-2 compatible, and this mode consumes no links.
+        if schema not in (2, 3, int(SCHEMA_VERSION)):
             refusals.append(
-                f"schema_version={schema}, expected 2 or {SCHEMA_VERSION}")
+                f"schema_version={schema}, expected 2, 3 or {SCHEMA_VERSION}")
         if band_start != 0 or band_stop < nb:
             refusals.append(
                 f"band manifold [{band_start},{band_stop}) does not contain "
@@ -909,17 +937,9 @@ def _spectral_kernel(mesh: Mesh, kgrid: tuple[int, int, int]) -> Callable:
     return _kernel
 
 
-#: The head's link-error tolerance: 1 % of its velocity on the elements it
-#: reads (``link_correction_bound``), i.e. at most ~2 % of S_aa or of the
-#: Drude weight.  Coarse 4-point axes sit below it at their fixed points
-#: (Fe 4^3 3.9e-3, Si 4^3 6.2e-3).
-HEAD_LINK_RTOL = 1.0e-2
-
-
 def link_correction_bound(correction, velocity_dft, occupations_kn, *,
-                          link_error: float,
-                          rtol: float) -> tuple[float, float, float, float]:
-    r"""Judge the link error on what the head uses: ``D_k DeltaH``.
+                          link_error: float) -> tuple[float, float, float]:
+    r"""Measure the link error on what the head uses: ``D_k DeltaH``.
 
     The head's velocity is ``v_DFT + D_k DeltaH``; ``v_DFT`` is exact and
     only the correction goes through the finite links.  The artifact's
@@ -928,15 +948,13 @@ def link_correction_bound(correction, velocity_dft, occupations_kn, *,
     (``file_io.parallel_transport.head_velocity_set``: transitions and the
     Fermi-surface diagonal), so the head's error is bounded by
 
-        ``link_error * |D_k DeltaH| / |v_DFT|  <=  rtol``
+        ``bound = link_error * |D_k DeltaH| / |v_DFT|``
 
-    with both norms on that set (this map's occupations) and ``rtol`` =
-    :data:`HEAD_LINK_RTOL`.  Returns
-    ``(link_error, ratio, bound, rtol)``: every map logs it in its head block
-    and the SC run judges it at its fixed point
-    (``sc_iteration.refuse_head_link_bound``, ``GATE pt_head_link_bound``);
-    a transient map may exceed it.  A DFT-start map 0 has ``DeltaH = 0`` and
-    a zero bound.
+    with both norms on that set (this map's occupations).  Returns
+    ``(link_error, ratio, bound)``: every map logs it in its head block as
+    information.  It is a k-convergence measure and gates nothing (owner
+    2026-09-30: a large link error means the k grid is underconverged).  A
+    DFT-start map 0 has ``DeltaH = 0`` and a zero bound.
     """
     from file_io.parallel_transport import head_velocity_set
     nb = int(velocity_dft.shape[-1])
@@ -946,7 +964,7 @@ def link_correction_bound(correction, velocity_dft, occupations_kn, *,
         / jnp.maximum(jnp.sum(jnp.where(head_set, jnp.abs(velocity_dft) ** 2,
                                         0.0)), 1.0e-60))))
     bound = float(link_error) * ratio
-    return float(link_error), ratio, bound, float(rtol)
+    return float(link_error), ratio, bound
 
 
 def velocity_term_shares(v_qp, pieces, *, nb_logical, surface_weight_kn=None,
@@ -996,31 +1014,28 @@ def covariant_link_derivative(
     """Return the direct finite-link covariant derivative of ``Delta H``.
 
     Neighbouring operators are transported into the central DFT basis before
-    the reduced-coordinate stencil is applied (fourth order on >= 5-point
-    axes, second order on 3- or 4-point axes); a collapsed axis takes
-    ``-i[Z_a, Delta H]`` with the stored position operator
-    ``collapsed_position`` (``common.parallel_transport.link_stencil_orders``
-    owns the per-axis rule).  This is one gauge-covariant discrete object;
-    no separately differentiated Hamiltonian and connection commutator have
-    to cancel on a finite grid.
+    the stencil is applied on the point-group-closed link shell
+    (``common.parallel_transport.link_stencil`` owns the steps, weights and
+    orders); a collapsed axis takes ``-i[Z_a, Delta H]`` with the stored
+    position operator ``collapsed_position``.  This is one gauge-covariant
+    discrete object; no separately differentiated Hamiltonian and
+    connection commutator have to cancel on a finite grid.
     """
     from common.parallel_transport import (
-        fourth_order_covariant_derivative,
-        link_stencil_orders,
+        link_covariant_derivative,
+        link_stencil,
         make_distributed_band_matmul,
     )
 
     delta = jnp.asarray(delta_h_dft, dtype=jnp.complex128)
     links = jnp.asarray(forward_links, dtype=jnp.complex128)
     grid = tuple(int(n) for n in kgrid)
-    spacing = 1.0 / np.asarray(grid, dtype=np.float64)
-    reduced = fourth_order_covariant_derivative(
+    reduced = link_covariant_derivative(
         delta,
         links,
         np.asarray(forward_neighbors, dtype=np.int64),
-        spacing,
+        link_stencil(grid, bvec_cart),
         band_matmul=make_distributed_band_matmul(mesh, n_batch_axes=1),
-        stencil_orders=link_stencil_orders(grid),
         collapsed_position=collapsed_position,
     )
     return reduced_covector_to_cartesian(reduced, bvec_cart)
@@ -1367,32 +1382,25 @@ def interband_commutator_velocity(
 QSGW_DIPOLE_FILE = "dipole_qsgw.h5"
 
 
-def write_qsgw_dipole(path, velocity_dft_cart, U_active, energies_qp_kn_ry, *,
-                      nb_logical: int, mesh: Mesh, print_fn=print) -> None:
-    r"""Write one SC map's QSGW velocity as a ``dipole.h5`` in its QP basis.
+def write_qsgw_dipole(path, velocity: QPVelocity, U_active, energies_qp_kn_ry,
+                      *, nb_logical: int, mesh: Mesh, print_fn=print) -> None:
+    r"""Write one SC map's velocity as a ``dipole.h5`` in its QP basis.
 
-    ``velocity_dft_cart`` is :func:`interband_commutator_velocity`'s
-    ``v + [DeltaH, W]`` (DFT basis), ``U_active`` the map's rotation to its
-    input QP states and ``energies_qp_kn_ry`` their energies: the same three
-    operands the map's head consumed (:func:`build_iteration_head_response`).
-    The file holds ``U^dagger (v + [DeltaH, W]) U`` with ``band_energies =
-    E_QP`` in ``file_io.dipole``'s layout, so ``load_dipole_h5`` and every
-    absorption consumer read it unchanged; their ``d = v_cv/(E_c - E_v)`` is
-    then the position operator between QP states (``U^dagger r U``).
-
-    Term content (docs/self_consistency.md, 'Interband-commutator head'):
-    the full DFT velocity ``i[H_DFT, r]`` (``p + i[V_NL, r]``) plus the
-    QSGW correction ``i[DeltaH, r]`` with ``r`` replaced by its cross-gap
-    (valence-conduction) interband part, ``W = i r^VC``.  The intraband
-    connection term (the covariant k-derivative of ``DeltaH`` within an
-    occupation class) is omitted; on the valence-conduction block it holds
-    only ``DeltaH_VC``, so the error is first order in the cross-gap mixing.
-    Collapsed axes use the stored position operator exactly. COLLECTIVE.
+    ``velocity`` is the map's :func:`qp_velocity` (the one the head read),
+    ``U_active`` the map's rotation to its input QP states and
+    ``energies_qp_kn_ry`` their energies: the same three operands the map's
+    head consumed (:func:`build_iteration_head_response`).  The file holds
+    ``U^dagger v U`` with ``band_energies = E_QP`` in ``file_io.dipole``'s
+    layout, so ``load_dipole_h5`` and every absorption consumer read it
+    unchanged; their ``d = v_cv/(E_c - E_v)`` is then the position operator
+    between QP states.  ``velocity.label`` names the Sigma term and is
+    stamped as the ``velocity`` attribute (docs/self_consistency.md,
+    'QSGW dipoles').  COLLECTIVE.
     """
     from common.collectives import gather_to_host
     from file_io.dipole import write_dipole
 
-    v_qp = rotate_velocity_active_to_qp(velocity_dft_cart, U_active, mesh=mesh)
+    v_qp = rotate_velocity_active_to_qp(velocity.dft_cart, U_active, mesh=mesh)
     nb = int(nb_logical)
     energies = energies_qp_kn_ry
     energies = np.asarray(gather_to_host(energies) if isinstance(
@@ -1402,14 +1410,57 @@ def write_qsgw_dipole(path, velocity_dft_cart, U_active, energies_qp_kn_ry, *,
     del v_qp
     write_dipole(path, kmajor, energies, mesh=mesh, attrs={
         "nbands": nb, "nk": int(energies.shape[0]), "skip_vnl": 0,
-        "basis": "qp",
-        "note": ("QSGW velocity U^H (v + [DeltaH, W]) U between the SC "
-                 "final map's input QP states (gw.qsgw_head."
-                 "interband_commutator_velocity); band_energies are their "
-                 "QP energies; the intraband connection term is omitted")})
+        "basis": "qp", "velocity": velocity.label,
+        "note": ("QSGW velocity U^H v U between the SC final map's input QP "
+                 "states (gw.qsgw_head.qp_velocity); band_energies are "
+                 "their QP energies")})
     print_fn(f"  QSGW dipoles: {os.path.basename(str(path))} "
              f"({int(energies.shape[0])} k x {nb} bands, QP basis, "
-             "v + [DeltaH, W])")
+             f"{velocity.label})")
+
+
+def stamp_qsgw_dipole_provenance(path, *, wfn_qp_path, config, wfn, meta,
+                                  print_fn=print) -> None:
+    r"""Bind ``dipole_qsgw.h5`` to ``WFN_qp.h5`` with ``dipole.h5``'s stamps.
+
+    The file is ``U^\dagger v U`` between the states ``WFN_qp.h5`` stores,
+    so it is that WFN's velocity: the WFN identity stamped is WFN_qp's
+    fingerprint, and the window, V_NL mode and sign, representation and
+    DFT+U stamps are this deck's (:func:`head_dipole_operator_stamps`, the
+    set the SC head was authenticated against).  A GW run on WFN_qp with
+    the same deck then reads it as its ``dipole.h5`` through
+    :func:`read_authenticated_dipole_velocity`; any other WFN refuses it by
+    fingerprint.  The Sigma term stays named by the ``velocity`` stamp.
+    Rank-0 write; call once ``WFN_qp.h5`` is published.  COLLECTIVE.
+    """
+    from common.collectives import rank0_transaction
+    from psp.get_dipole_mtxels import dipole_provenance
+
+    if int(meta.b_id_0) != 0:
+        print_fn(f"  QSGW dipoles: {os.path.basename(str(path))} not bound "
+                 f"to WFN_qp (head bands start at {int(meta.b_id_0)}, the "
+                 "dipole reader indexes bands from 0)")
+        return
+    stamps = head_dipole_operator_stamps(
+        config, wfn=wfn, meta=meta,
+        fallback_dir=os.path.dirname(os.path.abspath(str(path))))
+
+    def _stamp():
+        import h5py
+        from wfn_loader import WfnLoader
+        with h5py.File(str(path), "r+") as h5:
+            nb_written = int(h5.attrs["nbands"])
+            wfn_qp = WfnLoader(str(wfn_qp_path))
+            for key, value in dipole_provenance(
+                    wfn=wfn_qp, wfn_path=str(wfn_qp_path),
+                    nb_written=nb_written, nspinor=int(wfn_qp.nspinor),
+                    **stamps).items():
+                h5.attrs[key] = value
+
+    rank0_transaction(path, stage="qsgw_dipole_provenance", write=_stamp)
+    print_fn(f"  QSGW dipoles: {os.path.basename(str(path))} bound to "
+             f"{os.path.basename(str(wfn_qp_path))} (dipole.h5 provenance "
+             "stamps; a GW run on WFN_qp reads it as its dipole.h5)")
 
 
 def _assemble_kernel(mesh: Mesh, nb_storage: int) -> Callable:
@@ -3129,9 +3180,10 @@ class IterationHeadResponse:
     #: (``fermi_surface.FermiSurfaceIntraband``), whose moments are ``N0``
     #: and ``drude_tensor``; the q = 0 cell evaluates it at every sample.
     fermi_surface: object | None = None
-    #: ``(names, shares[n_terms, 3], link_bound)`` from
-    #: :func:`velocity_term_shares` and :func:`link_correction_bound`, for
-    #: the per-map head block (``sc_iteration._record_head_block``).
+    #: ``(names, shares[n_terms, 3], link_bound, sigma_zeroed)`` from
+    #: :func:`velocity_term_shares`, :func:`link_correction_bound` and
+    #: :func:`qp_velocity` (why the Sigma term is zero, or None), for the
+    #: per-map head block (``sc_iteration._record_head_block``).
     velocity_terms: tuple | None = None
 
 
@@ -3214,11 +3266,26 @@ def plasma_frequencies_ev(drude_tensor):
                               0.0)) * RYD_TO_EV
 
 
+def drude_offdiagonal(drude_tensor) -> float:
+    """``max |Re D_ab| (a != b) / max |Re D_aa|``: zero on a cubic or
+    tetragonal (m || z) crystal, whose point group forbids every
+    off-diagonal; a link stencil not closed under that group shows here."""
+    D = np.real(np.asarray(drude_tensor))
+    off = np.abs(D - np.diag(np.diag(D)))
+    return float(np.max(off) / max(float(np.max(np.abs(np.diag(D)))), 1.0e-300))
+
+
 def drude_report(atoms) -> str:
-    """Physical and cell-effective plasma frequencies of one metal head."""
-    return ("omega_p physical (exact multiplets, phi -> 0) = "
-            + "/".join(f"{x:.4f}" for x in plasma_frequencies_ev(atoms.physical_drude))
-            + " eV; q=0-cell effective (Fermi-surface share phi of near pairs) = "
+    """Physical and cell-effective plasma frequencies of one metal head.
+
+    Each prints the principal values (ascending eigenvalues) of the Drude
+    tensor, not its x/y/z components; the head block prints the diagonal.
+    ``offdiag`` is :func:`drude_offdiagonal` of the physical tensor.
+    """
+    return ("omega_p physical principal (exact multiplets, phi -> 0) = "
+            + "/".join(f"{x:.6f}" for x in plasma_frequencies_ev(atoms.physical_drude))
+            + f" eV (offdiag {drude_offdiagonal(atoms.physical_drude):.2e})"
+            + "; q=0-cell effective principal (Fermi-surface share phi of near pairs) = "
             + "/".join(f"{x:.4f}" for x in plasma_frequencies_ev(atoms.drude_tensor))
             + " eV")
 
@@ -3682,11 +3749,179 @@ def _metal_static_head(wfns, surface, occupation_state, omegas, *, mesh,
     return kappa2, static_Y_x, static_Z_y, static_chi_body_gamma
 
 
-def build_iteration_head_response(
-    delta_h_dft,
-    forward_links,
-    forward_neighbors,
+@dataclass(frozen=True)
+class QPVelocity:
+    r"""One SC map's velocity in the DFT band basis; consumers read U^H v U.
+
+    ``dft_cart`` is ``v_DFT`` plus this map's Sigma term: ``D_k DeltaH``
+    from the links (``parallel_transport``), ``[DeltaH, W]``
+    (``interband_commutator``), or none (``dft_velocity``, or a map whose
+    links cannot serve it).  The head (S, Drude, wings) and
+    ``dipole_qsgw.h5`` both take this array and the map's ``U``, so the SC
+    screening and the BSE dipoles see one velocity.  ``base`` is ``v_DFT``;
+    ``correction`` the Sigma term added (None when absent or zeroed);
+    ``bound`` the link bound (information); ``zeroed`` why the links
+    cannot serve the term on any map of this run (None: served);
+    ``label`` the terms in words (the dipole file's ``velocity`` stamp).
+    """
+
+    dft_cart: jax.Array
+    base: jax.Array
+    correction: jax.Array | None
+    bound: tuple | None
+    zeroed: str | None
+    label: str
+
+
+def qp_velocity(
     velocity_dft_cart,
+    occupations_qp_kn,
+    *,
+    mesh: Mesh,
+    nb_logical: int,
+    delta_h_dft=None,
+    forward_links=None,
+    forward_neighbors=None,
+    kgrid: tuple[int, int, int] | None = None,
+    bvec_cart=None,
+    collapsed_position=None,
+    nb_links: int | None = None,
+    link_error: float | None = None,
+    velocity_base_cart=None,
+    link_unserved: str | None = None,
+) -> QPVelocity:
+    """The owner of the SC velocity: ``v_DFT`` plus this map's Sigma term.
+
+    ``forward_links=None`` with no ``velocity_base_cart`` is
+    ``sc_head_update = dft_velocity``: ``delta_h_dft`` is unused.  With
+    ``velocity_base_cart`` (``interband_commutator``) ``velocity_dft_cart``
+    already holds ``v + [DeltaH, W]``.  ``parallel_transport`` adds
+    ``D_k DeltaH`` whenever the source carries links.  A source whose links
+    are incomplete or fail the stencil or window-hybridization gate carries
+    none and names the reason in ``link_unserved``: the term is then zero
+    on every map of the run, ``U^dagger v_DFT U``, with no refusal and no
+    other velocity mode (owner 2026-09-30).  The link error gates nothing;
+    ``link_error`` (the artifact's measured relative error) only feeds the
+    logged :func:`link_correction_bound`.
+    """
+    v_dft_basis = jnp.asarray(velocity_dft_cart, dtype=jnp.complex128)
+    base, correction, bound = v_dft_basis, None, None
+    if velocity_base_cart is not None:
+        # interband_commutator hands v + [DeltaH, W]: its Sigma term is the
+        # difference from the DFT velocity p + i[r, V_NL].
+        base = jnp.asarray(velocity_base_cart, dtype=jnp.complex128)
+        correction = v_dft_basis - base
+    zeroed = str(link_unserved) if link_unserved else None
+    if forward_links is not None:
+        if forward_neighbors is None:
+            raise ValueError(
+                "forward_neighbors are required when forward_links are present"
+            )
+        # On an outer link set the derivative is taken there and restricted
+        # to the head's bands (identity when the two sets agree).
+        correction = head_band_block(covariant_link_derivative(
+            delta_h_dft,
+            forward_links,
+            forward_neighbors,
+            mesh=mesh,
+            kgrid=kgrid,
+            bvec_cart=bvec_cart,
+            collapsed_position=collapsed_position,
+        ), int(nb_logical), mesh=mesh,
+            nb_outer=int(nb_links or nb_logical))
+        if link_error is not None:
+            bound = link_correction_bound(
+                correction, v_dft_basis, occupations_qp_kn,
+                link_error=link_error)
+        v_dft_basis = v_dft_basis + correction
+    if velocity_base_cart is not None:
+        label = ("v_DFT + [DeltaH, W] (interband_commutator; intraband "
+                 "connection omitted)")
+    elif forward_links is not None:
+        label = "v_DFT + D_k DeltaH (parallel_transport links)"
+    elif zeroed is not None:
+        label = f"v_DFT (D_k DeltaH zeroed: {zeroed})"
+    else:
+        label = "v_DFT (dft_velocity: no Sigma term)"
+    return QPVelocity(dft_cart=v_dft_basis, base=base, correction=correction,
+                      bound=bound, zeroed=zeroed, label=label)
+
+
+@dataclass(frozen=True)
+class HeadVelocityTerms:
+    """One map's QP velocity, its p / V_NL / Sigma shares and Drude tensor.
+
+    ``velocity_terms = (names, shares, bound, zeroed)`` feeds the per-map
+    head block; ``drude_tensor`` (metals) is the q=0-cell Drude weight;
+    ``sigma_occupations`` the occupations the block's gap reads.
+    """
+
+    v_qp: jax.Array
+    velocity_terms: tuple
+    drude_tensor: object
+    fermi_surface: object
+    pair_split: object
+    sigma_occupations: np.ndarray
+
+
+def head_velocity_terms(
+    velocity: QPVelocity,
+    U_dft_to_qp,
+    energies_qp_kn_ry,
+    occupations_qp_kn,
+    *,
+    surface_weight_qp_kn=None,
+    mesh: Mesh,
+    kgrid: tuple[int, int, int],
+    bvec_cart,
+    nb_logical: int,
+    wfn,
+    meta,
+    velocity_kinetic_cart=None,
+) -> HeadVelocityTerms:
+    """The head block's operands, one owner for the scalar and four-current heads.
+
+    Rotates ``velocity`` into the QP basis, splits it into its p, V_NL and
+    Sigma shares (``velocity_term_shares``) and, on a metal, forms the
+    Fermi-surface Drude tensor (``metal_intraband_model``).
+    """
+    v_dft_basis, base = velocity.dft_cart, velocity.base
+    correction, bound, zeroed = (velocity.correction, velocity.bound,
+                                 velocity.zeroed)
+    v_qp = rotate_velocity_active_to_qp(v_dft_basis, U_dft_to_qp, mesh=mesh)
+    # The per-map head block: p, V_NL and Sigma shares of this velocity.
+    pieces = ([("p", velocity_kinetic_cart),
+               ("V_NL", base - velocity_kinetic_cart)]
+              if velocity_kinetic_cart is not None else [("p + V_NL", base)])
+    if correction is not None:
+        pieces.append(("Sigma", correction))
+    names, shares = velocity_term_shares(
+        v_qp, [(name, rotate_velocity_active_to_qp(
+            jnp.asarray(x, dtype=jnp.complex128), U_dft_to_qp, mesh=mesh))
+            for name, x in pieces],
+        nb_logical=nb_logical, surface_weight_kn=surface_weight_qp_kn,
+        energies_kn=energies_qp_kn_ry, occupations_kn=occupations_qp_kn)
+    if zeroed is not None:
+        names, shares = names + ("Sigma",), np.vstack([shares, np.zeros((1, 3))])
+    # Physical state multiplicity belongs to the source WFN.  A
+    # kinetic-balance lift changes only the stored spinor representation.
+    drude_tensor = fermi_surface = pair_split = None
+    if surface_weight_qp_kn is not None:
+        drude_tensor, fermi_surface, pair_split = metal_intraband_model(
+            v_qp, surface_weight_qp_kn, energies_qp_kn_ry, mesh=mesh,
+            nb_logical=nb_logical, cell_volume=float(meta.cell_volume),
+            nk_tot=int(meta.nk_tot), nspin=int(wfn.nspin),
+            nspinor=int(meta.nspinor_wfnfile), bvec_cart=bvec_cart,
+            kgrid=kgrid)
+    return HeadVelocityTerms(
+        v_qp=v_qp, velocity_terms=(names, shares, bound, zeroed),
+        drude_tensor=drude_tensor, fermi_surface=fermi_surface,
+        pair_split=pair_split,
+        sigma_occupations=np.asarray(occupations_qp_kn, dtype=np.float64))
+
+
+def build_iteration_head_response(
+    velocity: QPVelocity,
     U_dft_to_qp,
     energies_qp_kn_ry,
     occupations_qp_kn,
@@ -3705,77 +3940,32 @@ def build_iteration_head_response(
     wfns_qp=None,
     eta_ry: float | None = None,
     occupation_state=None,
-    collapsed_position=None,
-    nb_links: int | None = None,
-    link_bound: tuple[float, float] | None = None,
     velocity_kinetic_cart=None,
 ) -> IterationHeadResponse:
     """Build current-basis direct head and, when requested, its wings.
 
-    ``forward_links=None`` is ``sc_head_update = dft_velocity``: no link
-    manifold is resident, so the covariant ``DΔH`` correction is dropped
-    and the bare DFT p-matrix velocity enters.  ``delta_h_dft`` is then
-    unused and may be None.  Everything downstream of the velocity —
-    the per-iteration rotation into the QP basis, S(z), the Drude term, the
-    ISDF wings, the static κ² — is the SAME code on both routes.
+    ``velocity`` is this map's :func:`qp_velocity`.  Everything downstream
+    of it -- the per-iteration rotation into the QP basis, S(z), the Drude
+    term, the ISDF wings, the static kappa^2 -- is the SAME code on every
+    head route.
 
     ``occupation_state`` is the map's solved state (``occupations_qp_kn`` is
-    its ``f_kn``); the static Γ body is ``gw.w_isdf.compute_chi0_matsubara``
+    its ``f_kn``); the static Gamma body is ``gw.w_isdf.compute_chi0_matsubara``
     at ``n = 0`` on it, which refuses any family but Fermi-Dirac.
     """
-    v_dft_basis = jnp.asarray(velocity_dft_cart, dtype=jnp.complex128)
-    base, correction, bound = v_dft_basis, None, None
-    if forward_links is not None:
-        if forward_neighbors is None:
-            raise ValueError(
-                "forward_neighbors are required when forward_links are present"
-            )
-        # On an outer link set the derivative is taken there and restricted
-        # to the head's bands (identity when the two sets agree).
-        correction = head_band_block(covariant_link_derivative(
-            delta_h_dft,
-            forward_links,
-            forward_neighbors,
-            mesh=mesh,
-            kgrid=kgrid,
-            bvec_cart=bvec_cart,
-            collapsed_position=collapsed_position,
-        ), int(nb_logical), mesh=mesh,
-            nb_outer=int(nb_links or nb_logical))
-        if link_bound is not None:
-            bound = link_correction_bound(
-                correction, v_dft_basis, occupations_qp_kn,
-                link_error=link_bound[0],
-                rtol=link_bound[1])
-        v_dft_basis = v_dft_basis + correction
-    v_qp = rotate_velocity_active_to_qp(v_dft_basis, U_dft_to_qp, mesh=mesh)
-    # The per-map head block: p, V_NL and Sigma shares of this velocity.
-    pieces = ([("p", velocity_kinetic_cart),
-               ("V_NL", base - velocity_kinetic_cart)]
-              if velocity_kinetic_cart is not None else [("p + V_NL", base)])
-    if correction is not None:
-        pieces.append(("Sigma", correction))
-    velocity_terms = velocity_term_shares(
-        v_qp, [(name, rotate_velocity_active_to_qp(
-            jnp.asarray(x, dtype=jnp.complex128), U_dft_to_qp, mesh=mesh))
-            for name, x in pieces],
-        nb_logical=nb_logical, surface_weight_kn=surface_weight_qp_kn,
-        energies_kn=energies_qp_kn_ry, occupations_kn=occupations_qp_kn
-    ) + (bound,)
+    terms = head_velocity_terms(
+        velocity, U_dft_to_qp, energies_qp_kn_ry, occupations_qp_kn,
+        surface_weight_qp_kn=surface_weight_qp_kn, mesh=mesh, kgrid=kgrid,
+        bvec_cart=bvec_cart, nb_logical=nb_logical, wfn=wfn, meta=meta,
+        velocity_kinetic_cart=velocity_kinetic_cart)
+    v_qp, velocity_terms = terms.v_qp, terms.velocity_terms
+    drude_tensor, fermi_surface, pair_split = (
+        terms.drude_tensor, terms.fermi_surface, terms.pair_split)
     resolved_eta_ry = (
         float(config.head.wcoul0_eta)
         if eta_ry is None else float(eta_ry)
     )
-    # Physical state multiplicity belongs to the source WFN.  A
-    # kinetic-balance lift changes only the stored spinor representation.
     normalization_nspinor = int(meta.nspinor_wfnfile)
-    drude_tensor = fermi_surface = pair_split = None
-    if surface_weight_qp_kn is not None:
-        drude_tensor, fermi_surface, pair_split = metal_intraband_model(
-            v_qp, surface_weight_qp_kn, energies_qp_kn_ry, mesh=mesh,
-            nb_logical=nb_logical, cell_volume=float(meta.cell_volume),
-            nk_tot=int(meta.nk_tot), nspin=int(wfn.nspin),
-            nspinor=normalization_nspinor, bvec_cart=bvec_cart, kgrid=kgrid)
     S = head_s_tensor_sharded(
         v_qp,
         energies_qp_kn_ry,
@@ -3853,6 +4043,31 @@ def expected_hubbard_stamp(config, *, wfn, fallback_dir, caller) -> str:
         caller=caller)
 
 
+def head_dipole_operator_stamps(config, *, wfn, meta, fallback_dir) -> dict:
+    """The dipole stamps this deck's head needs, in ``check_dipole_provenance``'s keywords.
+
+    One resolver for the head reader and for the SC's ``dipole_qsgw.h5``
+    stamp (:func:`stamp_qsgw_dipole_provenance`): the window, the full
+    analytic ``p + i[r, V_NL]`` operator with the resolved V_NL sign, the
+    head representation and the DFT+U stamp.
+    """
+    from psp.get_dipole_mtxels import resolve_vnl_velocity_sign
+    from common.four_current_model import resolve_four_current_representation
+    representation = resolve_four_current_representation(
+        bool(getattr(config, "bispinor", int(meta.nspinor) == 4)),
+        getattr(config, "bispinor_gw", "bare_transverse"))
+    return dict(
+        nval=int(config.nval), ncond=int(config.ncond),
+        nband=int(config.nband),
+        bispinor=representation.scalar_head_bispinor,
+        skip_vnl=False, vnl_mode="analytic",
+        vnl_velocity_sign=resolve_vnl_velocity_sign(
+            None, config.vnl_velocity_sign),
+        hubbard=expected_hubbard_stamp(
+            config, wfn=wfn, fallback_dir=fallback_dir,
+            caller="dft head dipole velocity"))
+
+
 def read_authenticated_dipole_velocity(
     dipole_path, *, wfn, meta, config, mesh: Mesh, wfn_fingerprint_binding=None,
 ):
@@ -3868,33 +4083,16 @@ def read_authenticated_dipole_velocity(
     # a kinetic-balance four-spinor dipole have the same (3,nk,nb,nb) shape.
     # The producer owns both the stamp grammar and sign resolution; consume
     # those owners directly rather than mirroring either convention here.
-    from psp.get_dipole_mtxels import (
-        resolve_vnl_velocity_sign,
-    )
     from file_io.restart_bundle import (
         check_dipole_provenance,
     )
-    expected_vnl_sign = resolve_vnl_velocity_sign(
-        None, config.vnl_velocity_sign)
-    expected_hubbard = expected_hubbard_stamp(
-        config, wfn=wfn, fallback_dir=os.path.dirname(os.path.abspath(dipole_path)),
-        caller="dft head dipole velocity")
-    from common.four_current_model import resolve_four_current_representation
-    representation = resolve_four_current_representation(
-        bool(getattr(config, "bispinor", int(meta.nspinor) == 4)),
-        getattr(config, "bispinor_gw", "bare_transverse"))
     if not check_dipole_provenance(
             dipole_path,
             wfn=wfn,
-            nval=int(config.nval),
-            ncond=int(config.ncond),
-            nband=int(config.nband),
-            bispinor=representation.scalar_head_bispinor,
-            skip_vnl=False,
-            vnl_mode="analytic",
-            vnl_velocity_sign=expected_vnl_sign,
             wfn_fingerprint_binding=wfn_fingerprint_binding,
-            hubbard=expected_hubbard):
+            **head_dipole_operator_stamps(
+                config, wfn=wfn, meta=meta,
+                fallback_dir=os.path.dirname(os.path.abspath(dipole_path)))):
         raise ValueError(
             "GATE dft_head_dipole_provenance: the full head received an "
             "unauthenticated dipole artifact.\n"
@@ -3967,21 +4165,26 @@ def build_dft_head_response(
                  (float(occupation_state.mu_ry), occupation_state.occ_hash))
     parts = None if frozen_parts is None else frozen_parts.get(parts_key)
     dipole_path = os.path.join(input_dir, "dipole.h5")
-    if parts is None:
-        if not os.path.exists(dipole_path):
-            raise FileNotFoundError(
-                "head_correction=full requires dipole.h5 to build the direct "
-                f"head and wings; missing {dipole_path}.")
-        velocity_cart = read_authenticated_dipole_velocity(
-            dipole_path, wfn=wfn, meta=meta, config=config, mesh=mesh,
-            wfn_fingerprint_binding=wfn_fingerprint_binding)
-    else:
-        velocity_cart = parts["velocity_cart"]
     b0 = int(meta.b_id_0)
     b4 = int(meta.b_id_4_chi_user)
     nb_logical = b4 - b0
     energies = jnp.asarray(wfns.enk[:, :nb_logical])
     occupations = jnp.asarray(wfns.occ[:, :nb_logical])
+    if parts is None:
+        if not os.path.exists(dipole_path):
+            raise FileNotFoundError(
+                "head_correction=full requires dipole.h5 to build the direct "
+                f"head and wings; missing {dipole_path}.")
+        # The one velocity owner at DeltaH = 0 and U = I: v_DFT, no Sigma
+        # term (the SC dft_velocity head on the DFT states).  Held on the
+        # host, as the frozen part it is.
+        velocity_cart = np.asarray(qp_velocity(
+            read_authenticated_dipole_velocity(
+                dipole_path, wfn=wfn, meta=meta, config=config, mesh=mesh,
+                wfn_fingerprint_binding=wfn_fingerprint_binding),
+            occupations, mesh=mesh, nb_logical=nb_logical).dft_cart)
+    else:
+        velocity_cart = parts["velocity_cart"]
     if velocity_cart.shape[1:] != (
             int(meta.nk_tot), nb_logical, nb_logical):
         raise ValueError(
