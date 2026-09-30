@@ -1522,6 +1522,12 @@ def complete_velocity_validation(
     metrics = _velocity_error_metrics(
         reconstructed, exact, atol=float(atol), rtol=float(rtol))
     metrics["band_stop"] = judged
+    # The link error the QSGW head bound multiplies by its Sigma correction
+    # (gw.qsgw_head.link_correction_bound): the whole head block, diagonal
+    # (Fermi velocities) included.
+    metrics["relative_frobenius"] = float(jax.device_get(
+        jnp.linalg.norm(reconstructed - exact)
+        / jnp.maximum(jnp.linalg.norm(exact), 1.0e-30)))
     metrics["entrywise_passed"] = bool(metrics["passed"])
     metrics["stencil_orders"] = tuple(int(o) for o in orders)
     # Per-Cartesian-axis reduction of the same error, so a slab's collapsed
@@ -1628,9 +1634,14 @@ def complete_velocity_validation(
                       f"{row['max_abs_offdiagonal']:.4e}  "
                       f"{str(row['passed']):>5s}")
     write_velocity_validation(path, mesh=mesh, metrics=metrics)
-    if not metrics["passed"]:
-        refusal = RuntimeError(
-            "parallel-transport finite-link DFT head validation failed: "
+    if not metrics["passed"] and jax.process_index() == 0:
+        # A diagnostic, not a refusal: the QSGW head judges the link error on
+        # what it uses, rel_err x |D_k DeltaH|/|v_DFT| at every map
+        # (gw.qsgw_head.link_correction_bound, GATE pt_head_link_bound).
+        print(
+            "  finite-link DFT velocity reconstruction above rtol "
+            "(diagnostic; the SC head bounds the link error on its Sigma "
+            "correction): "
             f"head_response_relative_frobenius="
             f"{metrics['head_response_relative_frobenius']:.6e}, "
             f"transition_overlap="
@@ -1647,11 +1658,9 @@ def complete_velocity_validation(
                     "xyz", metrics["stencil_orders"],
                     metrics["max_abs_by_axis"],
                     metrics["exact_max_abs_by_axis"],
-                    metrics["head_response_ratio_by_axis"])))
-        # A refusal that carries its own numbers: a caller scanning band
-        # windows or tolerances should never have to re-run to read them.
-        refusal.metrics = metrics
-        raise refusal
+                    metrics["head_response_ratio_by_axis"]))
+            + f"; head-block relative Frobenius "
+            f"{metrics['relative_frobenius']:.3e}", flush=True)
     return metrics
 
 
@@ -1894,7 +1903,7 @@ _VELOCITY_GATE_KEYS = (
     "head_response_trace_ratio",
 )
 _VELOCITY_DIAGNOSTIC_KEYS = (
-    "entrywise_passed",
+    "entrywise_passed", "relative_frobenius",
     "max_abs_axis_x", "max_abs_axis_y", "max_abs_axis_z",
 )
 
@@ -2065,9 +2074,10 @@ def complete_parallel_transport(path, *, wfn, sym, mesh, nbands, bispinor,
     ``sc_head_update = dft_velocity`` consumer
     (``gw.qsgw_head.load_dft_velocity_head``) reads, on decks whose mesh
     cannot support the link stencil (a collapsed or undersampled axis).
-    Otherwise the reconstructed covariant velocity must match the exact one
-    within ``atol``/``rtol`` or the artifact refuses; the per-axis receipt
-    goes to ``report``.
+    Otherwise the reconstructed covariant velocity is measured against the
+    exact one on the head's bands and stamped; the per-axis receipt goes to
+    ``report``.  The error is a diagnostic here: the QSGW head judges it on
+    its own Sigma correction (``gw.qsgw_head.link_correction_bound``).
     """
     import common.timing as timing
 
@@ -2088,14 +2098,17 @@ def complete_parallel_transport(path, *, wfn, sym, mesh, nbands, bispinor,
             path, mesh=mesh, kgrid=wfn.kgrid, nbands=nbands,
             bvec_cart=np.asarray(wfn.bvec) * float(wfn.blat),
             atol=atol, rtol=rtol, head_nbands=head_nbands)
-    print("  DFT covariant-velocity validation: PASS "
+    verdict = "within rtol" if metrics["passed"] else "above rtol (diagnostic)"
+    print(f"  DFT covariant-velocity reconstruction: {verdict}; "
           f"max_abs={metrics['max_abs']:.6e}, "
           f"max_rel={metrics['max_rel']:.6e}")
     print(f"\nWrote parallel-transport data to {path}")
     report.heading("Parallel-transport validation")
     report.emit(f"Links on bands 1-{int(nbands)}; velocity judged on "
                 f"bands 1-{int(metrics['band_stop'])} (the head)")
-    report.emit("Covariant DFT velocity: PASS; "
+    report.emit(f"Covariant DFT velocity: {verdict}; head-block relative "
+                f"Frobenius={float(metrics['relative_frobenius']):.4e} (the "
+                "SC head's link error); "
                 f"max abs={float(metrics['max_abs']):.5e}; "
                 f"max rel={float(metrics['max_rel']):.5e}")
     rule = {0: "position", 2: "order-2", 4: "order-4"}
