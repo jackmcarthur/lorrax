@@ -2964,16 +2964,26 @@ def _locate_input_blocks(
 
 
 def _read_input_section(
-        end, kp_end, kp_idx, lines, start):
+        end, kp_end, kp_idx, lines, start, filename):
     """Produce the INI section after removing its K_POINTS block."""
     for j in range(start + 1, len(lines)):
         if re.match(r"\s*\[.*\]", lines[j]):
             end = j
             break
     if kp_idx is not None and start <= kp_idx < end:
-        section_lines = lines[start:kp_idx] + lines[(kp_end or kp_idx + 1):end]
+        kept = [*range(start, kp_idx), *range(kp_end or kp_idx + 1, end)]
     else:
-        section_lines = lines[start:end]
+        kept = list(range(start, end))
+    for i in kept:
+        # No deck value holds ';', so a ';' after the value is a comment
+        # written in the wrong style; configparser would keep it in the value.
+        body = lines[i].split('#', 1)[0]
+        if not body.lstrip().startswith(';') and re.search(r"=.*\s;", body):
+            raise ValueError(
+                f"{filename}, line {i + 1}: ';' does not start a comment "
+                f"after a value ({lines[i].strip()!r}).  A comment starts "
+                f"with '#'.")
+    section_lines = [lines[i] for i in kept]
     parser = configparser.ConfigParser(inline_comment_prefixes=('#',))
     parser.read_string(''.join(section_lines))
     section = parser["cohsex"] if "cohsex" in parser else parser[parser.sections()[0]]
@@ -3316,7 +3326,7 @@ def read_lorrax_input(filename: str) -> dict:
         lines)
     if start is not None:
         (section, end) = _read_input_section(
-            end, kp_end, kp_idx, lines, start)
+            end, kp_end, kp_idx, lines, start, filename)
         (retired) = _report_early_retired_keys(
             section)
         _report_remaining_retired_keys(

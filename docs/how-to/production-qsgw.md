@@ -80,13 +80,13 @@ The keys that differ from the defaults:
 
 ```ini
 [cohsex]
-sys_dim = 3             ; 2 for a slab
+sys_dim = 3             # 2 for a slab
 compute_mode = mpa
 sigma_w_model = shared_pole
 qp_solver = self_consistent
 sc_tol_ev = 1e-3
-number_bands_protected = M  ; b3, the QP-matrix top; a convergence parameter
-number_bands = N        ; >= 2 n_occ, the one count for chi0 and Sigma
+number_bands_protected = M  # b3, the QP-matrix top; a convergence parameter
+number_bands = N        # >= 2 n_occ, the one count for chi0 and Sigma
 ```
 
 ## Minimum settings
