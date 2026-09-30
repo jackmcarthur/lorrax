@@ -154,10 +154,6 @@ class BandDiagonalSlots:
     values: jax.Array
     mesh_xy: Mesh
 
-    @classmethod
-    def of(cls, cube, mesh_xy):
-        return cls(_diagonal_of_cube_fn(mesh_xy)(cube), mesh_xy)
-
     def logical(self, band_axis=None, *, host=True):
         """``(n_omega, nk, nb_logical)`` on the host (None with ``host=False``)."""
         diagonal = _diagonal_sum_fn(self.mesh_xy)(self.values)
@@ -189,25 +185,25 @@ class BandCountCube:
     The sweep keeps, on the FILE wedge, the matrix of the first and of the
     last count (``matrices``, each ``(n_omega, n_wedge_k, nb, nb)``) and the
     band diagonal of every count between them (``diagonals``).  That is what
-    the band extrapolation reads: the fit takes the diagonal of every count,
-    and its matrix combines N1 and N3 only, N2 carrying weight zero
-    (``SpectralShellFit.weights``).  :meth:`point` returns one count on the
-    full BZ, ``(n_omega, nk, nb, nb)`` at ``P(None, None, 'x', 'y')``; a
-    middle count comes back with only its diagonal filled.  The
+    the band extrapolation reads: the fit takes the diagonal of every count
+    (:meth:`diagonal`, no full-BZ cube), and its matrix combines N1 and N3
+    only, N2 carrying weight zero (``SpectralShellFit.weights``).
+    :meth:`point` returns a matrix count on the full BZ,
+    ``(n_omega, nk, nb, nb)`` at ``P(None, None, 'x', 'y')``.  The
     ``(n_count, n_omega, nk, nb, nb)`` cube is never made (Na 8^3 at 1001
     omega: 42.4 GiB per rank in one allocation at P4).
 
-    ``fresh``: the unfold returns a new buffer.  Where the wedge is the full
-    BZ it is false and a matrix point IS the stored array, so the two cubes
-    of the sweep are the two the extrapolation returns.
+    ``fresh``: ``unfold`` returns a new buffer.  Where the wedge is the full
+    BZ it is false and a matrix point IS the stored array.
     """
     matrices: list
     diagonals: list
-    #: wedge matrix -> full BZ; wedge diagonal -> full-BZ cube holding it.
+    #: wedge matrix -> full BZ; wedge diagonal slots -> full BZ.
     unfold: Callable
-    unfold_diagonal: Callable
+    unfold_rows: Callable
     nk: int
     fresh: bool
+    mesh_xy: Mesh
     #: ``(nk, nb, nb)``, added to every point: the PPM static-limit term.
     term: jax.Array | None = None
 
@@ -220,15 +216,27 @@ class BandCountCube:
     def diagonal_only(self, i: int) -> bool:
         return 0 < int(i) < self.shape[0] - 1
 
+    def _matrix(self, i: int):
+        return self.matrices[0 if int(i) == 0 else -1]
+
     def point(self, i: int):
         if self.diagonal_only(i):
-            value, fresh = self.unfold_diagonal(self.diagonals[int(i) - 1]), True
-        else:
-            value = self.unfold(self.matrices[0 if int(i) == 0 else -1])
-            fresh = self.fresh
+            raise ValueError(
+                f"BandCountCube: count {i} is kept on its band diagonal "
+                f"only; read it with diagonal({i})")
+        value = self.unfold(self._matrix(i))
         if self.term is None:
             return value
-        return _add_static_term_fn(value.sharding, fresh)(value, self.term)
+        return _add_static_term_fn(value.sharding, self.fresh)(value, self.term)
+
+    def diagonal(self, i: int) -> "BandDiagonalSlots":
+        """The band diagonal of count ``i`` on the full BZ, without its cube."""
+        slots = (self.diagonals[int(i) - 1] if self.diagonal_only(i) else
+                 _diagonal_of_cube_fn(self.mesh_xy)(self._matrix(i)))
+        slots = self.unfold_rows(slots)
+        if self.term is not None:
+            slots = _add_term_slots_fn(self.mesh_xy)(slots, self.term)
+        return BandDiagonalSlots(slots, self.mesh_xy)
 
     def block_until_ready(self):
         jax.block_until_ready((self.matrices, self.diagonals))
@@ -248,6 +256,15 @@ class BandCountCube:
             self,
             matrices=[a - b for a, b in zip(self.matrices, other.matrices)],
             diagonals=[a - b for a, b in zip(self.diagonals, other.diagonals)])
+
+
+@lru_cache(maxsize=8)
+def _add_term_slots_fn(mesh_xy):
+    """Diagonal slots of ``sigma + term`` from those of ``sigma``: the owning
+    slot adds the term's diagonal, the zero slots add zero."""
+    term_slots = band_diagonal_slots(mesh_xy, 3)
+    return jax.jit(lambda slots, term: slots + term_slots(term)[None, ...],
+                   out_shardings=NamedSharding(mesh_xy, P(None, None, "x", "y")))
 
 
 @dataclass(frozen=True)

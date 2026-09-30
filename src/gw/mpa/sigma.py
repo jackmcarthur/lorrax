@@ -1447,8 +1447,9 @@ def _integrate_sigma_batches(
                 matrices=list(matrices), diagonals=list(diagonals),
                 unfold=((lambda value: value) if full else
                         _unfold_sigma_cube_fn(sym, 1, output_sharding)),
-                unfold_diagonal=_band_count_diagonal_fn(sym, mesh_xy),
-                nk=int(sym.nk_tot), fresh=not full)
+                unfold_rows=((lambda slots: slots) if full else
+                             _band_count_rows_fn(sym, mesh_xy)),
+                nk=int(sym.nk_tot), fresh=not full, mesh_xy=mesh_xy)
             if band_counts is None:
                 band_counts = tuple(
                     int(s.nb_sigma_sum) if hi is None else int(hi)
@@ -1548,16 +1549,12 @@ def _band_count_reduce(mesh_xy, n_brackets):
 
 
 @lru_cache(maxsize=8)
-def _band_count_diagonal_fn(sym, mesh_xy):
-    """Wedge diagonal slots -> a full-BZ cube holding only that diagonal."""
-    from common.shard_map import shard_map
+def _band_count_rows_fn(sym, mesh_xy):
+    """Diagonal slots on the FILE wedge -> full BZ (a row gather; the
+    antiunitary transpose leaves a diagonal unchanged)."""
     from symmetry_maps import star_tables_of
     rows = np.asarray(star_tables_of(sym)[0], dtype=np.int32)
-    embed = shard_map(
-        lambda tile: tile * jnp.eye(tile.shape[2], dtype=tile.dtype),
-        mesh=mesh_xy, in_specs=P(None, None, "x", "y"),
-        out_specs=P(None, None, "x", "y"), check_vma=False)
-    return jax.jit(lambda slots: embed(slots[:, jnp.asarray(rows)]),
+    return jax.jit(lambda slots: slots[:, jnp.asarray(rows)],
                    out_shardings=NamedSharding(mesh_xy, P(None, None, "x", "y")))
 
 

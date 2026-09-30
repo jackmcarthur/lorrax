@@ -1089,6 +1089,23 @@ def sigma_star_spread_stats(values, rows_to_keep, compact_irr, sym_idx_k,
 	}
 
 
+class DeferredArray:
+	"""A Σ(ω) dataset produced when it is read: ``shape`` now, values from
+	``materialize()``.  The writer reads the two ω cubes one at a time, so
+	each is made, measured, selected and written before the next exists."""
+
+	def __init__(self, shape, produce):
+		self.shape = tuple(int(n) for n in shape)
+		self._produce = produce
+
+	def materialize(self):
+		return self._produce()
+
+
+def _materialize(arr):
+	return arr.materialize() if isinstance(arr, DeferredArray) else arr
+
+
 def extract_and_stamp_k_irr(
 	payload, star, *, omega_ev=None, nk_full=None,
 	star_already_selected=False, print_fn=None,
@@ -1182,13 +1199,21 @@ def extract_and_stamp_k_irr(
 	omega_index = (int(np.argmin(np.abs(np.asarray(omega_ev))))
 	               if omega_ev is not None else None)
 	stamps: dict[str, dict] = {}
+	selected = {}
 	if not star_already_selected:
 		for name, arr in payload.items():
 			if arr is None:
+				selected[name] = None
 				continue
+			# One dataset at a time: a deferred cube is made, measured and
+			# selected here, and only its retained rows outlive the step.
+			arr = _materialize(arr)
 			stats = sigma_star_spread_stats(
 				arr, rows_to_keep, compact_irr, sym_idx_k, n_sym_spatial,
 				k_axis=SIGMA_K_AXIS[name], omega_index=omega_index)
+			selected[name] = star_select_k_irr(
+				arr, rows_to_keep, k_axis=SIGMA_K_AXIS[name])
+			del arr
 			stamps[name] = stats
 			if print_fn is not None:
 				print_fn(
@@ -1207,11 +1232,8 @@ def extract_and_stamp_k_irr(
 				f"{len(rows_to_keep)} rows (selection, not reconstruction).")
 
 	# ...and only now are they dropped.
-	out = (dict(payload) if star_already_selected else {
-		name: (None if arr is None else star_select_k_irr(
-			arr, rows_to_keep, k_axis=SIGMA_K_AXIS[name]))
-		for name, arr in payload.items()
-	})
+	out = ({name: _materialize(arr) for name, arr in payload.items()}
+	       if star_already_selected else selected)
 
 	def attrs_for(name):
 		a = {
@@ -1610,12 +1632,13 @@ def write_sigma_omega_h5(
 		io.create_dataset("sigma_total_kij_ev",
 			shape=storage_shape, dtype=np.complex128,
 			attrs=_operator_attrs("sigma_total_kij_ev"))
-		io.write_slab("sigma_total_kij_ev", total)
+		io.write_slab("sigma_total_kij_ev", _materialize(total))
+		del total
 		if sigma_c_kij_ev is not None:
 			io.create_dataset("sigma_c_kij_ev",
 				shape=storage_shape, dtype=np.complex128,
 				attrs=_operator_attrs("sigma_c_kij_ev"))
-			io.write_slab("sigma_c_kij_ev", sigma_c_kij_ev)
+			io.write_slab("sigma_c_kij_ev", _materialize(sigma_c_kij_ev))
 		if sigma_sx_kij_ev is not None:
 			io.create_dataset("sigma_sx_kij_ev",
 				shape=_operator_storage_shape(sigma_sx_kij_ev),

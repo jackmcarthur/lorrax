@@ -21,6 +21,7 @@ from functools import lru_cache
 
 import jax
 import jax.numpy as jnp
+from jax.sharding import NamedSharding, PartitionSpec as P
 import numpy as np
 
 from common.units import RYD_TO_EV
@@ -305,14 +306,62 @@ def _extrapolated_point(cube, weights, top=None):
         raise ValueError(
             f"_extrapolated_point: band counts {between} carry weight, but "
             f"the sweep keeps only their band diagonal (BandCountCube)")
+    if cube.fresh:
+        return _streamed_combination(cube, live, w[live])
     first = cube.point(live[0])
     rest = tuple(
         top if (top is not None and b == n_count - 1) else cube.point(b)
         for b in live[1:])
-    # ``first`` is the caller's own N3 cube only where no state has a tail
-    # and the wedge is the full BZ; it is then read, not taken.
+    # ``first`` is the caller's own N3 cube only where no state has a tail;
+    # it is then read, not taken.
     return _extrapolation_kernel(first.sharding, first is not top)(
         first, rest, w[live])
+
+
+#: omega slabs of one streamed combination (a slab's unfolded counts are
+#: its only temporaries).
+_COMBINE_SLABS = 8
+
+
+def _streamed_combination(cube, live, w):
+    """``sum_b w_b * S(N_b)`` written omega slab by omega slab from the wedge.
+
+    Each slab unfolds its live counts, combines them in count order
+    (:func:`_combine_extrapolation`, the same elementwise arithmetic) and is
+    written into the one output cube, so no full-BZ count is ever resident.
+    """
+    members = tuple(cube._matrix(b) for b in live)
+    n_omega = int(members[0].shape[0])
+    step = -(-n_omega // _COMBINE_SLABS)
+    shape = (n_omega, int(cube.nk), *members[0].shape[2:])
+    sharding = NamedSharding(cube.mesh_xy, P(None, None, "x", "y"))
+    out = _zeros_cube_fn(shape, sharding)()
+    run = _combination_slab_fn(cube.unfold, step, cube.term is not None,
+                               sharding)
+    for lo in range(0, n_omega, step):
+        out = run(out, members, cube.term, w, jnp.asarray(
+            min(lo, n_omega - step), dtype=jnp.int32))
+    return out
+
+
+@lru_cache(maxsize=8)
+def _zeros_cube_fn(shape, sharding):
+    return jax.jit(lambda: jnp.zeros(shape, dtype=jnp.complex128),
+                   out_shardings=sharding)
+
+
+@lru_cache(maxsize=16)
+def _combination_slab_fn(unfold, step, with_term, sharding):
+    def slab(out, members, term, w, lo):
+        parts = []
+        for m in members:
+            part = unfold(jax.lax.dynamic_slice_in_dim(m, lo, step, axis=0))
+            if with_term:
+                part = part + term[None, ...]
+            parts.append(part)
+        value = _combine_extrapolation(parts[0], tuple(parts[1:]), w)
+        return jax.lax.dynamic_update_slice_in_dim(out, value, lo, axis=0)
+    return jax.jit(slab, donate_argnums=(0,), out_shardings=sharding)
 
 
 def _report_band_extrapolation(
@@ -375,7 +424,7 @@ def _report_band_extrapolation(
         # ones through the same least squares.  The count is reported once
         # at the output path, on the same grid and the same eval energies.
         points.append(interp_sigma_diag_along_omega(
-            band_count_point(cube, i), mesh_xy, omega_grid_ev, omega_eval_ev,
+            cube.diagonal(i), mesh_xy, omega_grid_ev, omega_eval_ev,
             band_axis=sigma_omega.band_axis, add_w_kn=head, scale=RYD_TO_EV))
     s_at_counts = np.stack(points)
 
@@ -552,22 +601,22 @@ def extrapolate_sigma_body(
 
     THE RAW TWIN.  Its readers by default are the raw columns (sigC_raw,
     eqp0_raw, eqp1_raw), which read its band diagonal, so the twin returned
-    is ``BandDiagonalSlots`` of N₃, taken before the combination and N₃'s
-    buffer is then free: one Σ(ω) cube leaves this stage.  The full N₃ cube
+    is ``BandDiagonalSlots`` of N₃ and no full N₃ cube is made: one Σ(ω)
+    cube leaves this stage.  The full N₃ cube
     (the second QSGW matrix and the per-map "extrapolation effect on E_nk"
     eigvalsh block) is kept only under ``sigma_freq_debug_output``.  The
     caller drops its own ``top`` reference.
     """
-    from .ppm_sigma import BandDiagonalSlots
     cube = sigma_omega.sigma_c_kij
-    if top is None:
-        top = band_count_point(cube, int(cube.shape[0]) - 1)
+    last = int(cube.shape[0]) - 1
     extrap_payload, extrap_weights = _report_band_extrapolation(
         sigma_omega, head_sigma_diag_w_kn_ry, e_state_ev=e_state_ev,
         plan=plan, config=config, band_slices=band_slices,
         wfn=wfn, mesh_xy=mesh_xy, print_fn=print_fn)
-    twin = (top if bool(config.debug.sigma_freq_debug_output) else
-            BandDiagonalSlots.of(top, mesh_xy))
+    if bool(config.debug.sigma_freq_debug_output):
+        twin = top if top is not None else band_count_point(cube, last)
+    else:
+        twin, top = cube.diagonal(last), None
     extrapolated = _extrapolated_point(cube, extrap_weights, top=top)
     cube.release()
     return extrapolated, extrap_payload, twin
@@ -765,8 +814,11 @@ def compute_ppm_sigma_pipeline(
         # the shape it has always had.  The last element IS the ordinary
         # full-band Σ_c (the cumulative sum's final term), so at
         # n_bracket = 1 this index is the identity.
-        sigma_c_body_omega_n3 = band_count_point(
-            sigma_omega.sigma_c_kij, sigma_omega.sigma_c_kij.shape[0] - 1)
+        sigma_c_body_omega_n3 = (
+            None if plan.enabled and not bool(
+                config.debug.sigma_freq_debug_output) else
+            band_count_point(sigma_omega.sigma_c_kij,
+                             sigma_omega.sigma_c_kij.shape[0] - 1))
         # OFF: ``sigma_c_body_omega`` IS the N₃ point and the second cube is
         # None, so the object graph below is exactly what it always was.
         # ON: both are replaced at the report seam below.

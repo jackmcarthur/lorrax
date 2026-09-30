@@ -11,6 +11,8 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass
 
+from functools import lru_cache
+
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -272,6 +274,18 @@ def sigma_omega_output_path(config, input_dir: str) -> str:
     return out_path
 
 
+@lru_cache(maxsize=8)
+def _ev_tensor_fns(sharding):
+    """Σ_total and Σ_c in eV from the Ry cube, as two executables."""
+    from file_io.sigma_output import derive_sigma_total
+
+    def total(c_ry, x_ry, h_ev):
+        return derive_sigma_total(RYD_TO_EV * c_ry, RYD_TO_EV * x_ry, h_ev)
+
+    return (jax.jit(total, out_shardings=sharding),
+            jax.jit(lambda c_ry: RYD_TO_EV * c_ry, out_shardings=sharding))
+
+
 def write_sigma_omega(
     sigma_c_omega: jax.Array, *,
     sig_x: jax.Array,
@@ -368,16 +382,15 @@ def write_sigma_omega(
     if is_band_sharded_sigma_omega(sigma_c_omega):
         shd = sigma_c_omega.sharding
 
-        def _ev_tensors(c_ry, x_ry, h_ev):
-            from file_io.sigma_output import derive_sigma_total
-            c_ev = RYD_TO_EV * c_ry
-            total = derive_sigma_total(
-                c_ev, RYD_TO_EV * x_ry, h_ev)
-            return total, c_ev
-
-        total_ev, sigma_c_ev = jax.jit(
-            _ev_tensors, out_shardings=(shd, shd))(
-                sigma_c_omega, sig_x, hartree_ev)
+        # The two eV cubes are made one at a time, when the writer reads
+        # them (file_io.sigma_output.DeferredArray): Na 8^3 at 1001 omega
+        # held the Ry cube and both eV cubes at once, 3 x 14.12 GiB per rank.
+        from file_io.sigma_output import DeferredArray
+        total_fn, c_fn = _ev_tensor_fns(shd)
+        shape = tuple(sigma_c_omega.shape)
+        total_ev = DeferredArray(
+            shape, lambda: total_fn(sigma_c_omega, sig_x, hartree_ev))
+        sigma_c_ev = DeferredArray(shape, lambda: c_fn(sigma_c_omega))
         write_sigma_omega_h5(
             out_path, config.omega_grid_ev, total_ev,
             sigma_c_kij_ev=sigma_c_ev,
