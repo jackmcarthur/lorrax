@@ -24,7 +24,6 @@ from common.parallel_transport import (
     link_covariant_derivative,
     link_stencil,
     g_wrap_for_step,
-    make_cross_k_link,
     make_cross_k_overlap,
     make_distributed_band_matmul,
     MIN_STENCIL_POINTS,
@@ -739,9 +738,37 @@ def _write_link_stage(
     source_plus = full_plus[source_full]
     wraps = np.empty((nrk, nd, 3), dtype=np.int32)
     singular_values = []
-    center_on_x, link_kernel = make_cross_k_link(mesh, polar_plan)
+    center_on_x, overlap_kernel = make_cross_k_overlap(mesh)
+    # Independent small overlap faces pass through the native bounded polar
+    # service; the physical Marzari-Vanderbilt direction set stays unchanged.
+    group_size = int(mesh.size)
+    from distrib_la import ROUTE_BATCH_RESHARD
+    route = polar_plan.route_for((group_size, polar_plan.n, polar_plan.n),
+                                jnp.complex128)
+    if route != ROUTE_BATCH_RESHARD:
+        group_size = 1
+    print(f"  parallel-transport links: {nd*nrk} edges, group={group_size}, "
+          f"polar route={route}, matrix={polar_plan.n}, "
+          "raw overlaps and links at P(None,x,y)", flush=True)
+    overlaps, edge_ids = [], []
 
     with SlabIO(path, mode="a", mesh=mesh) as io:
+        def flush():
+            if not overlaps:
+                return
+            link, values = polar_plan.batched(jnp.stack(overlaps))
+            for j, (ik, direction) in enumerate(edge_ids):
+                io.write_slab(
+                    LINKS_DATASET, link[j:j+1, None, :, :],
+                    offset=(ik, direction, 0, 0),
+                    global_shape=(nrk, nd, nb, nb))
+                singular_values.append(values[j, :nb])
+            # Complete the whole group's writes before WfnLoader enters
+            # its next collective HDF5 read. No wavefunction is buffered.
+            io.sync_writes()
+            overlaps.clear()
+            edge_ids.clear()
+
         for ik_irr, center_full in enumerate(source_full):
             center_ids = (IBZRows((int(ik_irr),)) if reduced
                           else [int(center_full)])
@@ -772,22 +799,18 @@ def _write_link_stage(
                 # polar contract returns the canonical partial isometry for
                 # those null directions; slicing the physical leading block
                 # is therefore well-defined and does not perturb the link.
-                link, values = link_kernel(
-                    center_x, neighbor_xy, g_index, g_valid)
-                io.write_slab(
-                    LINKS_DATASET, link[None, None, :, :],
-                    offset=(ik_irr, idir, 0, 0),
-                    global_shape=(nrk, nd, nb, nb))
-                # WfnLoader owns a second collective HDF5 handle.  Finish
-                # this asynchronous append before its next streamed read.
-                io.sync_writes()
-                # Retain only the replicated O(nb) diagnostic. Stacking and
-                # writing once after the stream avoids both a per-link host
-                # synchronization and a second HDF5 transaction per link.
-                singular_values.append(values[:nb])
-                del neighbor_xy, link, values
+                raw = overlap_kernel(center_x, neighbor_xy, g_index, g_valid)
+                # Finish the contraction before releasing its spheres. Only
+                # small overlap faces survive into the bounded solve group.
+                raw.block_until_ready()
+                overlaps.append(raw)
+                edge_ids.append((ik_irr, idir))
+                del neighbor_xy
+                if len(overlaps) == group_size:
+                    flush()
             del center_xy, center_x
 
+        flush()
         singular_values_device = (
             jnp.stack(singular_values).reshape(nrk, nd, nb) if nd
             else jnp.zeros((nrk, 0, nb), dtype=jnp.float64))
@@ -1317,8 +1340,10 @@ def write_parallel_transport_artifact(
     plan_polar, edge_table, apply_symmetry, q_stencil_table = (
         _require_service_apis())
     nb_padded = band_storage_extent(mesh, int(nbands))
+    from common.gpu_utils import device_room_bytes
     polar_plan = plan_polar(
-        mesh, n=nb_padded, backend="distributed", rcond=float(rcond))
+        mesh, n=nb_padded, backend="distributed", rcond=float(rcond),
+        budget_bytes=device_room_bytes(pool_fraction=0.8))
     full_plus, source_full, source_steps = _write_link_stage(
         str(path), wfn=wfn, sym=sym, mesh=mesh, nbands=int(nbands),
         bispinor=bool(bispinor), polar_plan=polar_plan)
