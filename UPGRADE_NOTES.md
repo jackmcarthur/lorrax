@@ -3,6 +3,17 @@
 User-visible changes, newest first. Binding rulings behind the breaking
 changes live in `docs/architecture/decisions.md`.
 
+## 2026-09-30 — the restart W0 is formed only on the q parents
+
+GW no longer forms a full-q static W0 when it writes `W0_qmunu` for BSE. The
+shared-pole evaluators (`sector_static_wc` for `bispinor_gw =
+full_shared_pole`) compute V + W_c(0) at V's q parents only, and the writer
+stores the producer's parents with their unfold tables. The file layout is
+unchanged: a deck whose q axis reduces already stored W0 on the q parents, and
+one whose q axis does not reduce stores every q. Both layouts still read; BSE
+unfolds the parents on load in bounded q tiles, into the full-q layout its
+kernels use. Nothing to regenerate; results are bitwise.
+
 ## 2026-09-30 — the Hall current takes `vnl_velocity_sign`; regenerate −1 Hall artifacts
 
 `get_dipole_mtxels --static-gauge-hall-only` now builds the Hall current with

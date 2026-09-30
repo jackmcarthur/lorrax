@@ -317,8 +317,13 @@ $W_+(-q,0)^{\mathsf T}$ (ordered) or $W_+$ (TRS), i.e. $-b\Lambda^{-1}b^\dagger$
 on a TRS store. A one-shot stores the resolver's $\omega=0$ head; a
 self-consistent run evaluates the accepted final map's model once, after the
 loop, from the devices (step 4) or that map's retained scratch generation, and
-stores the map's iteration head at $\omega=0$. Plain-MPA, bispinor and metal restarts carry no
-`W0_qmunu`, and a BSE on them refuses.
+stores the map's iteration head at $\omega=0$. The four-current sector bank
+stores $V+W_{c,CC}(0)$ of its CC sector (`sector_sigma.sector_static_wc`,
+both branches of the parent pair through the W tables). Both evaluators run at
+the q parents of the run's V wedge, and the restart stores those parents with
+their unfold tables: no full-q W is formed for the file, and BSE unfolds on
+load ([BSE](bse.md)). Plain-MPA and metal restarts carry no `W0_qmunu`
+([BSE](bse.md) says what a BSE on them does).
 
 The same key keeps a one-shot's swept Σ(ω) (`file_io.sigma_checkpoint`,
 `tmp/sigma_checkpoint_oneshot.h5`) when it pays for itself: only if the
