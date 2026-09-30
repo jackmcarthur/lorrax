@@ -231,10 +231,26 @@ class PackedCentroidBasis:
             crop_to=target))
 
     @lru_cache(maxsize=None)
-    def _operator_kernel(self, spec, unpack):
+    def _operator_kernel(self, spec, unpack, q_tile_bytes=256 << 20):
         convert = self.unpack_axis if unpack else self.pack_axis
-        return jax.jit(lambda op: convert(
-            convert(op, -2, spec=spec), -1, spec=spec))
+        @jax.jit
+        def kernel(op):
+            if (op.ndim < 3 or (len(spec) and spec[0] is not None)
+                    or len(spec) < op.ndim
+                    or any(spec[op.ndim-i] is None for i in (1, 2))):
+                return convert(convert(op, -2, spec=spec), -1, spec=spec)
+            from common.staged_reshard import permute_sharded_operator
+            conversions = []
+            for axis in (op.ndim - 2, op.ndim - 1):
+                shards = self._shards(spec, axis)
+                inverse, forward = self._maps(shards)
+                source = inverse if unpack else forward
+                common = max(self.n_canonical, self.n_packed) // shards
+                target = (self.n_canonical if unpack else self.n_packed) // shards
+                conversions.append((axis, source, common, target))
+            return permute_sharded_operator(op, conversions, self.mesh_xy, spec,
+                                             q_tile_bytes=q_tile_bytes)
+        return kernel
 
     def pack_axis(self, arr, axis: int, *, spec=None):
         """Canonical suffix-padded carrier → packed, on one sharded axis."""

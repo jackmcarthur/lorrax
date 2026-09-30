@@ -569,6 +569,83 @@ def concatenate_sharded_axis(arrays, axis, mesh, spec):
     return _reindex_sharded_axis(tuple(arrays), axis, None, mesh, spec)
 
 
+def _permute_axis_local(x, axis, indices, axis_name, n_shards, *,
+                        pad_to=None, crop_to=None):
+    """The vector-index two-all-to-all arm on an already manual shard."""
+    ndim = x.ndim
+    split = max((i for i in range(ndim) if i != axis),
+                key=lambda i: x.shape[i])
+    n_split = int(x.shape[split])
+    n_split_pad = -(-n_split // n_shards) * n_shards
+    widths = [(0, 0)] * ndim
+    if pad_to is not None:
+        widths[axis] = (0, int(pad_to) - int(x.shape[axis]))
+    widths[split] = (0, n_split_pad - n_split)
+    x = jnp.pad(x, widths)
+    from jax.experimental.layout import Layout, with_layout_constraint
+    x = with_layout_constraint(x, Layout(major_to_minor=tuple(range(ndim))))
+    x = jax.lax.all_to_all(x, axis_name, split_axis=split,
+                          concat_axis=axis, tiled=True)
+    x = jnp.take(x, indices, axis=axis)
+    x = with_layout_constraint(x, Layout(major_to_minor=tuple(range(ndim))))
+    x = jax.lax.all_to_all(x, axis_name, split_axis=axis,
+                          concat_axis=split, tiled=True)
+    if n_split_pad != n_split:
+        x = jax.lax.slice_in_dim(x, 0, n_split, axis=split)
+    if crop_to is not None:
+        x = jax.lax.slice_in_dim(x, 0, int(crop_to), axis=axis)
+    return x
+
+
+def permute_sharded_operator(arr, conversions, mesh, spec, *,
+                             q_tile_bytes=256 << 20):
+    """Two centroid conversions with only bounded replicated-q scratch.
+
+    Each conversion is (axis, source_map, local_pad, local_crop).
+    All collectives and the loop remain in one manual-axis region.
+    """
+    from common.shard_map import shard_map
+    from jax.experimental.layout import Layout, with_layout_constraint
+    local = tuple(int(n) // int(spec_divisor(mesh, spec, i))
+                  for i, n in enumerate(arr.shape))
+    rows = min(local[0], max(1, int(q_tile_bytes) //
+               (int(arr.dtype.itemsize) * int(np.prod(local[1:])))))
+    recipes = []
+    for axis, source, pad, crop in conversions:
+        names = spec[axis]
+        names = (names,) if isinstance(names, str) else tuple(names)
+        count = int(np.prod([mesh.shape[n] for n in names]))
+        recipes.append((axis, jnp.asarray(source, jnp.int32),
+                        names[0] if len(names) == 1 else names,
+                        count, pad, crop))
+    def body(x):
+        # Prevent layout assignment from hoisting an all-to-all's preferred
+        # split-axis-major layout onto the complete resident loop operand.
+        x = with_layout_constraint(x, Layout(major_to_minor=tuple(range(x.ndim))))
+        def convert(tile):
+            for axis, source, name, count, pad, crop in recipes:
+                tile = _permute_axis_local(tile, axis, source, name, count,
+                                           pad_to=pad, crop_to=crop)
+            return tile
+        if rows == local[0]:
+            return convert(x)
+        shape = list(x.shape)
+        for axis, _, _, _, _, crop in recipes:
+            shape[axis] = crop
+        def chunk(out, i):
+            start = jax.lax.optimization_barrier(jnp.minimum(i*rows,local[0]-rows))
+            tile = jax.lax.optimization_barrier(jax.lax.dynamic_slice_in_dim(
+                x,start,rows,axis=0))
+            value = convert(tile)
+            return jax.lax.dynamic_update_slice(out,value,
+                (start,) + (jnp.int32(0),)*(x.ndim-1)),None
+        out,_ = jax.lax.scan(chunk,jnp.zeros(tuple(shape),x.dtype),
+            jnp.arange((local[0]+rows-1)//rows,dtype=jnp.int32),unroll=1)
+        return out
+    return shard_map(body,mesh=mesh,in_specs=spec,out_specs=spec,
+                     check_vma=False)(arr)
+
+
 def _reindex_sharded_axis(arrays, axis, source_map, mesh, spec, *,
                           pad_to=None, crop_to=None):
     """Exchange to all-P slabs, join/select locally, and restore the face.
@@ -621,6 +698,9 @@ def _reindex_sharded_axis(arrays, axis, source_map, mesh, spec, *,
         (i for i in range(ndim) if i != axis), key=lambda i: local[i])
 
     def body(xs, indices):
+        if len(xs) == 1 and source_map is not None and not per_parent:
+            return _permute_axis_local(xs[0], axis, indices, axis_name,
+                n_shards, pad_to=pad_to, crop_to=crop_to)
         n_split = int(xs[0].shape[split])
         n_split_pad = -(-n_split // n_shards) * n_shards
         def exchange(x):
