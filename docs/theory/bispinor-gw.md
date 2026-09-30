@@ -31,6 +31,13 @@ $\mathbf k+\mathbf G$ Cartesian in bohr⁻¹ (`common.bispinor_init.lift_to_4spi
 The lift is raw: $\langle\Psi|\Psi\rangle=1+(\alpha_{\rm FS}^2/4)\langle p^2\rangle$.
 Negative-energy states are absent (no-pair).
 
+The physical spin operators are
+$S_i/\hbar=\operatorname{diag}(\sigma_i,\sigma_i)/2$
+(`common.gamma_matrices.dirac_spin_x`, `dirac_spin_y`, `dirac_spin_z`).
+Both large and small components contribute. A projected expectation uses
+the complete carrier metric, $c^\dagger S_i c/(c^\dagger M c)$, including
+the norm of the small components for a raw kinetic-balance lift.
+
 The stored vertices are $\tilde\gamma^I=\gamma^0\gamma^I$:
 $\tilde\gamma^0=1_4$, $\tilde\gamma^i=\alpha^i=\bigl(\begin{smallmatrix}0&\sigma^i\\\sigma^i&0\end{smallmatrix}\bigr)$
 (`common.gamma_matrices`). $I=0$ is the charge channel C; $I=1,2,3$ are the
