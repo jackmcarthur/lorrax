@@ -171,7 +171,12 @@ def main():
         links = host(pt.forward_links)
         sv = np.asarray(pt.singular_values)
         for i,(center,direction) in enumerate(ids):
-            assert np.linalg.norm(links[direction,center]-reference_link[i]) < 5e-10
+            # The reader makes synthetic carrier bands exactly inert by
+            # adding identity there; the physical stored polar is unchanged.
+            assert np.linalg.norm(links[direction,center,:14,:14]-reference_link[i,:14,:14]) < 5e-10
+            assert np.array_equal(links[direction,center,14:,14:],np.eye(2))
+            assert np.max(np.abs(links[direction,center,:14,14:])) == 0
+            assert np.max(np.abs(links[direction,center,14:,:14])) == 0
             assert np.max(np.abs(sv[center,direction]-reference_values[i,:14])) < 5e-12
         # A consumer needing an unjudged manifold must still refuse.
         try:
