@@ -179,21 +179,23 @@ def streaming_galerkin_solve(wfn, sym, meta, centroid_indices, mesh_xy: Mesh,
                     basis, meta=meta, rank_multiplier=rank_multiplier))
             return basis
 
-    # The whole-state ledger describes allocations made *after this point*:
-    # the fit may claim the run's budget less the bytes already live (the
-    # driver, WFN metadata and symmetry service), the minimum over processes,
-    # so every rank plans the same static carrier and r-chunk extents.
-    from common.gpu_utils import device_budget_bytes, device_room_bytes
-    device_fit_budget = float(device_room_bytes())
+    # The whole-state ledger prices every allocation the fit makes.  Beside it
+    # the driver holds only WFN metadata and the symmetry service (no priced
+    # device array), so the fit may claim the run's budget
+    # (``memory_per_device_gb``) less the measured runtime reserve: a number
+    # from the deck alone, the same on every rank, never allocator readings.
+    from common.gpu_utils import device_budget_bytes
+    from runtime.aot_memory import runtime_reserve_bytes
+    device_fit_budget = device_budget_bytes() - float(runtime_reserve_bytes())
     if device_fit_budget <= 0:
         raise RuntimeError(
             "htransform: no room left in the run budget "
-            f"({device_budget_bytes() / 1e9:.2f} GB/device) beside the live bytes")
+            f"({device_budget_bytes() / 1e9:.2f} GB/device) beside the runtime reserve")
     if log_fn is not None:
         log_fn(
-            "  Whole-state live fit budget: "
+            "  Whole-state fit budget: "
             f"{device_fit_budget/2**30:.2f} GiB/device (the run budget "
-            f"{device_budget_bytes()/2**30:.2f} GiB less the live bytes, worst rank)")
+            f"{device_budget_bytes()/2**30:.2f} GiB less the runtime reserve)")
     basis = fit_galerkin_basis(
         wfn, sym, meta, centroid_indices, mesh_xy, band_range,
         log_fn=log_fn,

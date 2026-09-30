@@ -1579,7 +1579,7 @@ def _make_basis_solve_kernel(
 
 
 def _iter_selected_basis_rchunks(source, basis, meta, mesh_xy, *,
-                                 r_chunk_ranges):
+                                 r_chunk_ranges, resident_bytes=0):
     """Continue the basis using only its pivots and bounded row transforms.
 
     A uniform operator needs no retained band rows.  Transforming the whole
@@ -1588,7 +1588,8 @@ def _iter_selected_basis_rchunks(source, basis, meta, mesh_xy, *,
     instead transforms owner-balanced pivot groups, with its live set priced
     by the same measured FFT and row-stream model as basis construction.
     """
-    from common.gpu_utils import device_room_bytes
+    from common.gpu_utils import device_budget_bytes
+    from runtime.aot_memory import runtime_reserve_bytes
 
     rank, ns = int(basis.rank_carrier), int(meta.nspinor)
     b0, b1 = map(int, basis.band_range)
@@ -1600,9 +1601,15 @@ def _iter_selected_basis_rchunks(source, basis, meta, mesh_xy, *,
         return
     p = int(mesh_xy.size)
     local_cols = max(-(-(r1 - r0) // p) for r0, r1 in ranges)
-    room = float(device_room_bytes())
+    # The deck budget less the caller's priced resident set and the measured
+    # runtime reserve: shapes only, so every rank plans the same groups.
+    room = (device_budget_bytes() - float(resident_bytes)
+            - float(runtime_reserve_bytes()))
     if room <= 0:
-        raise MemoryError("iter_galerkin_rchunks: no device room for basis rows")
+        raise MemoryError(
+            "iter_galerkin_rchunks: no room for basis rows in the run budget "
+            f"({device_budget_bytes() / 1e9:.2f} GB/device) beside the priced "
+            f"resident {resident_bytes / 1e9:.2f} GB/device")
     geom, capacity, _ = _whole_state_geometry(
         meta=meta, mesh_xy=mesh_xy, nk=int(meta.nk_tot), nspinor=ns,
         ngkmax=int(source.loader.ngkmax), band_divisor=p,
@@ -1663,7 +1670,8 @@ def _iter_selected_basis_rchunks(source, basis, meta, mesh_xy, *,
 
 def iter_galerkin_rchunks(
         source, basis: GalerkinBasis, meta, mesh_xy: Mesh, *,
-        r_chunk_ranges, retained_band_range: tuple[int, int] | None):
+        r_chunk_ranges, retained_band_range: tuple[int, int] | None,
+        resident_bytes: int = 0):
     """Yield bounded physical basis rows and requested WFN rows together.
 
     This is the public continuation of a fitted :class:`GalerkinBasis` away
@@ -1688,6 +1696,8 @@ def iter_galerkin_rchunks(
     ``(nk, band_hi-band_lo, nspinor, r_carrier)``; the terminal carrier tail
     is exact zero.  The caller must finish a yield before advancing the
     iterator so the bounded slabs can be released promptly.
+    ``resident_bytes`` is the caller's priced per-device live set beside the
+    selected-state route (from shapes, never allocator readings).
     """
     b_start, b_end = (int(v) for v in basis.band_range)
     if retained_band_range is None:
@@ -1708,7 +1718,8 @@ def iter_galerkin_rchunks(
 
     if retained_band_range is None:
         yield from _iter_selected_basis_rchunks(
-            source, basis, meta, mesh_xy, r_chunk_ranges=r_chunk_ranges)
+            source, basis, meta, mesh_xy, r_chunk_ranges=r_chunk_ranges,
+            resident_bytes=resident_bytes)
         return
 
     rank = int(basis.rank_carrier)
@@ -1869,9 +1880,13 @@ def project_galerkin_spin_operator(
                 jnp.zeros(shape, dtype=jnp.complex128))
 
     operator, metric = _zeros()
+    # The two face accumulators are live beside the row stream: price them.
+    face_bytes = 2 * int(np.prod(operator.sharding.shard_shape(
+        operator.shape))) * operator.dtype.itemsize
     for _, _, basis_chunk, retained in iter_galerkin_rchunks(
             source, basis, meta, mesh_xy,
-            r_chunk_ranges=plan.r_chunk_ranges, retained_band_range=None):
+            r_chunk_ranges=plan.r_chunk_ranges, retained_band_range=None,
+            resident_bytes=face_bytes):
         if retained:
             raise RuntimeError(
                 "operator-only Galerkin stream unexpectedly retained WFN rows")
