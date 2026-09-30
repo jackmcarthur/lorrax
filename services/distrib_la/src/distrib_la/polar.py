@@ -64,6 +64,17 @@ def _dilation_svd(A, eigh):
     return jnp.maximum(evals[..., A.shape[-1]:], 0), u, v
 
 
+def _polar_from_matrix(A, eigh, rcond):
+    """One polar equation for local batches and distributed single tiles."""
+    s, u, v = _dilation_svd(A, eigh)
+    cutoff = jnp.asarray(rcond, dtype=s.dtype) * jnp.max(s, axis=-1, keepdims=True)
+    # Zero dilation modes mix independent left/right null spaces. Dropping
+    # them gives the unique partial isometry, without inventing an extension.
+    keep = (s > cutoff).astype(A.dtype)
+    link = (u * keep[..., None, :]) @ jnp.conj(jnp.swapaxes(v, -1, -2))
+    return link, s[..., ::-1]
+
+
 def _close_spectral_cut(values, count, tolerance):
     """Keep the entire adjacent relative-gap multiplet at a descending cut."""
     if not math.isfinite(tolerance) or tolerance < 0:
@@ -631,6 +642,64 @@ class PolarPlan:
         _validate_operand(A, self)
         return _kernel_for(self, jnp.dtype(A.dtype))(A)
 
+    def route_for(self, shape, dtype):
+        """Capacity route for a face-sharded stack, including polar lifetimes.
+
+        Five live dilation-size arrays conservatively cover the input,
+        dilation, eigenvectors, extracted vectors, output and exchanges.
+        The eigh workspace query adds the local solver's actual scratch.
+        A caller-supplied budget is identical on every rank.
+        """
+        requested = self.eigh_plan.requested_batched_route
+        budget = self.eigh_plan.budget_bytes
+        if budget is None:
+            return self.eigh_plan.batched_route
+        from distrib_la.workspace import fits_local
+        local = (-(-int(shape[0]) // int(self.mesh.size)), 2*self.n, 2*self.n)
+        if fits_local(self.eigh_plan, 'eigh', (local,)*5, dtype, budget):
+            return ROUTE_BATCH_RESHARD
+        if requested == ROUTE_BATCH_RESHARD:
+            raise ValueError("polar batch_reshard exceeds the supplied per-rank budget")
+        return self.eigh_plan.batched_route
+
+    def batched(self, A):
+        """Return (L[B,n,n], s[B,n]) from A at P(None,'x','y').
+
+        Route batch_reshard exchanges independent matrices across all ranks,
+        runs the SAME dilation/cutoff locally, then returns face-sharded L.
+        Only the O(B*n) singular values are replicated. Ragged batches skip
+        synthetic rows. The distributed route retains the single-tile solve.
+        Local work is O(B*n^3/P), with O(ceil(B/P)*n^2) matrices per rank
+        and one solver workspace; the distributed capacity path is O(n^2/P).
+        """
+        if A.ndim != 3 or A.shape[-2:] != (self.n, self.n) or A.shape[0] < 1:
+            raise ValueError("polar batched requires a nonempty (B,n,n) stack")
+        _validate_dtype(A.dtype)
+        face = NamedSharding(self.mesh, P(None, 'x', 'y'))
+        if not isinstance(A, jax.core.Tracer) and not _same_layout(A.sharding, face):
+            raise ValueError("polar batched requires A already at P(None,'x','y')")
+        if self.route_for(A.shape, A.dtype) == ROUTE_BATCH_RESHARD:
+            from distrib_la._batch_reshard import batch_reshard_call
+            rcond = self.rcond
+            if rcond is None:
+                rcond = self.n * float(jnp.finfo(A.real.dtype).eps)
+            s, link = batch_reshard_call('polar', self.mesh, (A,), rcond=rcond)
+            return link, s
+        # Do not let the narrower eigh-only price admit a local route after
+        # the complete polar lifetime above refused it.
+        key = ('polar_batch_scan', mesh_key(self.mesh), self.n, self.backend,
+               self.rcond, tuple(A.shape), str(A.dtype))
+        fn = _KERNEL_CACHE.get(key)
+        if fn is None:
+            def solve(_carry, a):
+                link, s = self(a)
+                return None, (link, s)
+            fn = jax.jit(lambda a: jax.lax.scan(solve, None, a, unroll=1)[1],
+                         in_shardings=face,
+                         out_shardings=(face, NamedSharding(self.mesh, P())))
+            _KERNEL_CACHE[key] = fn
+        return fn(A)
+
 
 def _kernel_for(polar_plan: PolarPlan, dtype) -> Callable:
     """Build/cache the fused dilation-eigh-polar executable."""
@@ -653,22 +722,11 @@ def _kernel_for(polar_plan: PolarPlan, dtype) -> Callable:
 
     def _polar(A):
         A = jax.lax.with_sharding_constraint(A, tile)
-
-        s_ascending, U, V = _dilation_svd(A, eigh)
-
-        # Dilation zero modes mix the independent left/right null spaces.
-        # Mask before GEMM to produce the unique partial isometry rather than
-        # a backend-dependent null-space pairing.
-        cutoff = (jnp.asarray(rcond, dtype=s_ascending.dtype)
-                  * jnp.max(s_ascending))
-        keep = (s_ascending > cutoff).astype(dtype)
-        L = (U * keep[None, :]) @ jnp.conj(jnp.swapaxes(V, -1, -2))
-
+        L, s = _polar_from_matrix(A, eigh, rcond)
         L = jax.lax.with_sharding_constraint(L, tile)
         # Reverse only the replicated O(n) vector.  Reversing the distributed
         # eigenvector columns would add a whole-matrix cross-device permutation
         # even though the order cancels from U @ V.H.
-        s = s_ascending[::-1]
         s = jax.lax.with_sharding_constraint(s, replicated)
         return L, s
 
@@ -684,6 +742,8 @@ def plan_polar_factor(
     n: int,
     backend: str = "distributed",
     rcond: float | None = None,
+    batched_route: str = 'auto',
+    budget_bytes: int | None = None,
 ) -> PolarPlan:
     """Eagerly resolve one reusable distributed polar-factor plan.
 
@@ -703,16 +763,22 @@ def plan_polar_factor(
         Eigh backend request; 'distributed' by default.
     rcond
         Relative rank cutoff.  None uses n * eps(dtype).
+    batched_route
+        ``'auto'`` keeps distributed calls unless ``budget_bytes`` admits
+        the local batch route; ``'batch_reshard'`` explicitly requests it.
+        This changes only :meth:`PolarPlan.batched`, never a single call.
+    budget_bytes
+        Optional shared per-rank room for the complete batched polar live
+        set plus local eigensolver workspace. Large matrices stay distributed.
     """
     n = _as_extent(n)
     _mesh_contract(mesh, n)
     rcond = _as_rcond(rcond)
     requested = str(backend)
-    # Polar is a single distributed dilation, not a batched operation. Keep
-    # it on the provider/native face route when the public batched default is
-    # ``batch_reshard``.
+    # Single calls stay on the face route. Independent stacks have a separate
+    # method on this same plan, using the existing batch movement owner.
     eig = plan("eigh", mesh, backend=backend, n=2 * n,
-               batched_route="auto")
+               batched_route=batched_route, budget_bytes=budget_bytes)
     return PolarPlan(
         mesh=mesh,
         n=n,
