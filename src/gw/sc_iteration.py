@@ -4658,6 +4658,30 @@ def _refuse_empty_map_output(e_output_kn_ev: np.ndarray, *,
             f"downstream residual reads zero, i.e. FALSE converged.")
 
 
+def refuse_head_link_bound(bound) -> None:
+    """Judge the last map's link bound (``qsgw_head.link_correction_bound``).
+
+    The fixed point's head is the one the results carry, so the bound
+    ``rel_err(links) x |D_k DeltaH|/|v_DFT|`` must hold there.
+    """
+    if bound is None:
+        return
+    link_error, ratio, value, rtol = bound
+    if np.isfinite(value) and value <= rtol:
+        return
+    raise ValueError(
+        "GATE pt_head_link_bound: the finite-link error on the fixed "
+        "point's QSGW velocity correction exceeds the tolerance.\n"
+        f"  got:  rel_err(links) {link_error:.4e} x |D_k DeltaH|/|v_DFT| "
+        f"{ratio:.4e} = {value:.4e}\n"
+        f"  want: <= {rtol:.1e} (the artifact's velocity rtol)\n"
+        "  fix:  a denser k grid (4th-order stencil from 5 points per "
+        "axis), or sc_head_update = dft_velocity\n"
+        "  why:  only D_k DeltaH goes through the links; their relative "
+        "error, measured on the DFT velocity, scales it\n"
+        "  doc:  docs/self_consistency.md, 'Metals: direct Drude head'")
+
+
 def _record_head_block(inputs, iteration, response, energies_qp_kn_ry) -> None:
     """The per-map head block: the p, V_NL and Sigma shares of the head velocity.
 
@@ -4678,15 +4702,17 @@ def _record_head_block(inputs, iteration, response, energies_qp_kn_ry) -> None:
         total = 8.0 * np.pi * np.real(np.diagonal(
             np.asarray(response.drude_tensor))) * RYD_TO_EV ** 2
         values, unit = shares * total[None], "eV^2"
-        what = "omega_p^2 by term (Fermi-surface Drude weight)"
+        what = ("omega_p^2 by term (the head's q=0-cell Drude weight; "
+                "each term projected on the total velocity)")
     else:
         total = np.ones(3)
         values, unit = 100.0 * shares, "%"
-        what = "share of the q->0 head S_aa(0) by term"
+        what = ("share of the q->0 head S_aa(0) by term (each term "
+                "projected on the total velocity)")
     lines = [f"    SC head velocity, map {iteration}: {what}",
              f"      {'term':<10}{'x':>12}{'y':>12}{'z':>12}  [{unit}]"]
     for name, row in zip(names, values):
-        lines.append(f"      {name:<10}" + "".join(f"{v:12.4f}" for v in row))
+        lines.append(f"      {name:<10}" + "".join(f"{v + 0.0:12.4f}" for v in row))
     tot = total if metal else 100.0 * shares.sum(axis=0)
     lines.append(f"      {'total':<10}" + "".join(f"{v:12.4f}" for v in tot)
                  + (("   omega_p = " + "/".join(
@@ -4694,6 +4720,8 @@ def _record_head_block(inputs, iteration, response, energies_qp_kn_ry) -> None:
                     if metal else ""))
     if bound is not None:
         link_error, ratio, value, rtol = bound
+        if inputs.screening_seed_cache is not None:
+            inputs.screening_seed_cache["head_link_bound"] = bound
         lines.append(
             f"      link bound: rel_err(links) {link_error:.3e} x "
             f"|D_k dH|/|v_DFT| {ratio:.3e} = {value:.3e} (rtol {rtol:.1e})")
@@ -6865,6 +6893,8 @@ def run_sc_driver(
         _record_sc(
             inputs, f"  SC verdict: CONVERGED after {len(rms_history)} GW "
             f"map calls; {verdict.summary()}")
+    refuse_head_link_bound((inputs.screening_seed_cache or {}).get(
+        "head_link_bound"))
     sigma_result = state_final.outputs.sigma_result
     screening = state_final.outputs.screening
     # A four-current (full_shared_pole) map carries its head inside the
