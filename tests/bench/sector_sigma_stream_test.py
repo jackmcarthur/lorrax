@@ -63,20 +63,24 @@ class Interactions:
 class DummySynthesis:
     native=0
 results=[]
-for ls,rs in [((0,),(0,)),((1,2,3),(1,2,3)),((0,),(1,2,3)),((1,2,3),(0,))]:
+for real_weights,ls,rs in [(real,ls,rs) for real in (False,True) for ls,rs in
+        [((0,),(0,)),((1,2,3),(1,2,3)),((0,),(1,2,3)),((1,2,3),(0,))]]:
     keys=tuple((A,B) for A in ls for B in rs)
-    tau=sector_tau_factory(left,right,keys,meta,mesh)(DummySynthesis(),axis)
+    tau=sector_tau_factory(left,right,keys,meta,mesh,real_weights=real_weights,
+        stage=f'test.real.{real_weights}')(DummySynthesis(),axis)
+    time_value=0.0 if real_weights else .23-.11j
     @jax.jit
     def bounded(x,y,r,z,energy,weight,w):
-        return tau._spatial(x,y,r,z,energy,weight,.17,.23-.11j,Interactions(w,ls,rs))
+        return tau._spatial(x,y,r,z,energy,weight,.17,time_value,Interactions(w,ls,rs))
     conv=make_lorentz_convolution(mesh,kg,nk,keys,*plans)
     project=contract_bands_block_reshard(mesh,layout='face',face_shape=(q,nb,m,4),
         right_face_shape=(q,nb,n,4),face_band_extent=nb)
     @jax.jit
     def full(x,y,r,z,energy,weight,w):
-        phases=_weighted_tau_phases(energy,1j*(.23-.11j),e_ref=.17,band_weight=weight)
+        phases=_weighted_tau_phases(energy,1j*time_value,e_ref=.17,band_weight=weight)
+        if real_weights:phases=jnp.real(phases)
         green=build_G_parents(x,y,phases=phases,layout='face',
-            gemm=partial(panel_matmul,mesh=mesh,panel_bytes=1<<20),k_unfold_plan=plans[0])
+            gemm=partial(panel_matmul,mesh=mesh,panel_bytes=1<<20),k_unfold_plan=plans[0],real_weights=real_weights)
         selected=jnp.take(jnp.take(w,jnp.asarray(ls),axis=2),jnp.asarray(rs),axis=4)
         return project(r,conv(green,selected),z)
     t=time.perf_counter();got=bounded(x,y,r,z,energy,weight,w);got.block_until_ready();elapsed=time.perf_counter()-t
@@ -96,8 +100,11 @@ for ls,rs in [((0,),(0,)),((1,2,3),(1,2,3)),((0,),(1,2,3)),((1,2,3),(0,))]:
                 split+=np.conj(l)@small[2*h:2*h+2,2*g:2*g+2]@r_
     independent=float(np.max(np.abs(direct-split)));assert independent<1e-12
     mem=bounded.lower(x,y,r,z,energy,weight,w).compile().memory_analysis()
-    results.append(dict(keys=keys,relative_error=error,independent_gamma_max_abs=independent,
-        cold_seconds=elapsed,temp_bytes=mem.temp_size_in_bytes))
+    t=time.perf_counter();bounded(x,y,r,z,energy,weight,w).block_until_ready();warm_bounded=time.perf_counter()-t
+    t=time.perf_counter();full(x,y,r,z,energy,weight,w).block_until_ready();warm_full=time.perf_counter()-t
+    results.append(dict(keys=keys,real_weights=real_weights,relative_error=error,independent_gamma_max_abs=independent,
+        cold_seconds=elapsed,warm_bounded_seconds=warm_bounded,warm_full_seconds=warm_full,
+        temp_bytes=mem.temp_size_in_bytes))
     if jax.process_index()==0:print('SECTOR_QUARTER_PASS',results[-1],flush=True)
 # q/pole panel seams, mixed widths and ordered hole phase.
 qg=(2,2,2);Q=8;qp=3;M=6;N=10;nc=3;nt=1;K=6;width=2
@@ -125,6 +132,42 @@ for hole in (False,True):
         reference=np.einsum('qmk,qk,qnk->qmn',xx,ww,np.conj(yy))
         error=float(np.max(np.abs(vh-reference))/max(np.max(np.abs(reference)),1e-30));assert error<2e-12,error
         results.append(dict(panel_hole=hole,component=A,relative_error=error))
+# Native final pole reads use an overlapping full-width window: [3,5),
+# but the third logical chunk owns only column 4. Its masked overlap must
+# not double-count column 3, for either ordered hole or conduction phases.
+Ktail=5;starts=(0,2,3)
+xt=jnp.stack([x0[...,lo:lo+width] for lo in starts])
+yt=jnp.stack([y0[...,lo:lo+width] for lo in starts])
+pt=jnp.stack([po[...,lo:lo+width] for lo in starts])
+intervaltail=np.array([[1,5],[0,3],[3,5]],np.int32);it=put(intervaltail,P())
+kt,_=_sector_component_kernel(panels,mesh,qg,Q,M,N,width,_shared_pole_weights,column_starts=starts)
+for hole in (False,True):
+    vh=gather_to_host(kt(xt,yt,pt,it,.19,.22-.13j,hole,2,0))
+    weights=gather_to_host(jax.jit(_shared_pole_weights)(po[...,:Ktail],it,.19,.22-.13j))
+    xx=bxh[parent,:,2,:Ktail];yy=byh[parent,:,0,:Ktail];ww=weights[parent]
+    if hole:xx,yy,ww=np.conj(xx[minus]),np.conj(yy[minus]),ww[minus]
+    ref=np.einsum('qmk,qk,qnk->qmn',xx,ww,np.conj(yy))
+    error=float(np.max(np.abs(vh-ref))/max(np.max(np.abs(ref)),1e-30));assert error<2e-12,error
+    results.append(dict(overlapping_pole_tail_hole=hole,relative_error=error))
+# Native authenticated constant-q reads preserve the published schema.
+from file_io.slab_io import SlabIO
+from file_io.shared_pole_store import write_bank_constant,read_bank_constant_header,read_bank_constant
+meta.mu_basis=NS(n_logical=m,mesh_xy=mesh)
+constant_h=random((3,16,16));constant=put(constant_h,P(None,'x','y'))
+identity={key:'fixture-'+key for key in ('iteration_id','hamiltonian','energies','occupations','wavefunctions','centroids')}
+source=out/'constant_source.h5';dest=out/'constant_published.h5'
+with SlabIO(str(source),mode='w',mesh=mesh) as io:
+    io.write_slab('constant',constant,offset=(0,0,0),global_shape=constant.shape)
+with SlabIO(str(source),mode='r',mesh=mesh) as io:
+    resource=write_bank_constant(io,dest,header={'identity':identity,'bank_shape':{'nq':3,'d':16}},mesh_xy=mesh)
+header=read_bank_constant_header(resource,mesh_xy=mesh)
+for span in ((0,2),(2,3)):
+    value=gather_to_host(read_bank_constant(resource,header,meta=meta,mesh_xy=mesh,q_span=span))
+    assert np.array_equal(value,constant_h[slice(*span)])
+for broken in (dict(resource,commit='wrong'),dict(resource,identity=dict(identity,hamiltonian='wrong'))):
+    try:read_bank_constant_header(broken,mesh_xy=mesh);raise AssertionError('stale constant accepted')
+    except ValueError as exc:assert 'GATE shared_pole_store' in str(exc)
+results.append(dict(native_constant_q_spans='bit-exact',stale_constant_controls='PASS'))
 # Named quarter guards, including mismatched endpoint actions.
 for h,g,right in [(2,0,None),(0,-1,None)]:
     try:plans[0].dirac_quarter_load_tables(h,g,right);raise AssertionError('quarter accepted')
