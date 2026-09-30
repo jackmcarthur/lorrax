@@ -1811,7 +1811,7 @@ def compute_photon_bank(wfns, wfns_transverse, meta, config, *, mesh_xy, sym,
     direct_head = None
     with timing.section("bank.direct_head"):
         if uses_direct_bispinor_shared_pole_head(config):
-            from .qsgw_head import read_authenticated_dipole_velocity, _pad_head_band_manifold
+            from .qsgw_head import read_authenticated_dipole_velocity
             from .photon_direct_head import build_direct_photon_head, packed_gamma_vectors
             cache = photon_head_cache if photon_head_cache is not None else {}
             rotation, head_wfns, head_occupation, velocity = (
@@ -1819,16 +1819,11 @@ def compute_photon_bank(wfns, wfns_transverse, meta, config, *, mesh_xy, sym,
             if velocity is None:
                 velocity = cache.get("direct_photon_velocity")
             if velocity is None:
-                host = read_authenticated_dipole_velocity(
+                velocity = read_authenticated_dipole_velocity(
                     os.path.join(config.input_dir, "dipole.h5"), wfn=wfn,
                     meta=meta, config=config, mesh=mesh_xy,
                     wfn_fingerprint_binding=wfn_fingerprint_binding)
-                nk, nb = int(host.shape[1]), int(host.shape[-1])
-                empty = np.zeros((nk, nb), np.float64)
-                velocity, _, _, _ = _pad_head_band_manifold(
-                    host, empty, empty, empty, mesh=mesh_xy)
                 cache["direct_photon_velocity"] = velocity
-                del host
             if rotation is not None:
                 from .qsgw_head import rotate_velocity_active_to_qp
                 velocity = rotate_velocity_active_to_qp(

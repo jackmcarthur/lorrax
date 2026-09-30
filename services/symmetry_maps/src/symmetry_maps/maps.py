@@ -3354,8 +3354,13 @@ def star_select(A_full, irr_idx_k):
 
 
 def star_broadcast(A_irr, irr_idx_k, sym_idx_k, n_sym_spatial,
-                   irr_labels=None, *, trs_reference, trs_rule="conj"):
-    """Spread an IBZ band-index quantity over the full BZ; see docs/architecture/symmetry_register.md."""
+                   irr_labels=None, *, trs_reference, trs_rule="conj",
+                   rows=None):
+    """Spread an IBZ band-index quantity over the full BZ; see docs/architecture/symmetry_register.md.
+
+    ``rows`` (full-BZ indices) returns only those rows of the result, the
+    same elements by the same operations: a caller can stream the unfold.
+    """
     irr = np.asarray(irr_idx_k)
     sidx = np.asarray(sym_idx_k)
     # THE SAME ROW ORDER ``star_select`` USES, not ``np.unique``.  Deriving
@@ -3390,6 +3395,9 @@ def star_broadcast(A_irr, irr_idx_k, sym_idx_k, n_sym_spatial,
         raise ValueError(
             "star_broadcast: trs_rule must be 'conj' or 'transpose'; "
             f"got {trs_rule!r}.")
+    if rows is not None:
+        rows = np.asarray(rows, dtype=np.int64)
+        take, conj = take[rows], np.asarray(conj)[rows]
     return _broadcast_rows(A_irr, take, conj,
                            transpose=(trs_rule == "transpose"))
 
@@ -3441,8 +3449,8 @@ def star_wedge_tables(sym):
     return KStarMap(irr, sidx, nss).take, sidx, nss
 
 
-def unfold_file_wedge_to_full_bz(sym, data):
-    """FILE wedge → full BZ; see docs/architecture/symmetry_register.md."""
+def unfold_file_wedge_to_full_bz(sym, data, *, rows=None):
+    """FILE wedge → full BZ (``rows``: only those full-BZ rows); see docs/architecture/symmetry_register.md."""
     irr, sidx, nss = _star_tables_of(sym)
     n_rows = int(np.shape(data)[0])
     if n_rows != int(sym.nk_red):
@@ -3454,7 +3462,7 @@ def unfold_file_wedge_to_full_bz(sym, data):
             f"two are different functions wherever the two wedges differ.")
     return star_broadcast(data, irr, sidx, nss,
                           irr_labels=np.arange(n_rows, dtype=np.int32),
-                          trs_reference="ibz_slab")
+                          trs_reference="ibz_slab", rows=rows)
 
 
 def unfold_file_wedge_band_operator(sym, data, *, trs_rule):
@@ -3471,9 +3479,9 @@ def unfold_file_wedge_band_operator(sym, data, *, trs_rule):
 
 
 def unfold_file_wedge_polar_matrix(sym, data, *, component_axis=-3,
-                                   time_odd=True):
-    """FILE-wedge polar band matrix → full BZ, on the input's backend; ``time_odd=False`` for a time-even vector (position); see docs/architecture/symmetry_register.md."""
-    out = unfold_file_wedge_to_full_bz(sym, data)
+                                   time_odd=True, rows=None):
+    """FILE-wedge polar band matrix → full BZ, on the input's backend; ``time_odd=False`` for a time-even vector (position); ``rows`` returns only those full-BZ rows; see docs/architecture/symmetry_register.md."""
+    out = unfold_file_wedge_to_full_bz(sym, data, rows=rows)
     sym_rows = np.asarray(sym.sym_idx_k, dtype=np.int32)
     rotations = np.asarray(sym.cartesian_action(
         sym_rows, axial=False, time_odd=bool(time_odd)), dtype=np.float64)
@@ -3487,6 +3495,8 @@ def unfold_file_wedge_polar_matrix(sym, data, *, component_axis=-3,
         raise ValueError(
             "unfold_file_wedge_polar_matrix: invalid canonical symmetry-row "
             f"map {sym_rows.shape} for Cartesian actions {rotations.shape}.")
+    if rows is not None:
+        rotations = rotations[np.asarray(rows, dtype=np.int64)]
     return apply_band_matrix_symmetry(
         out,
         component_mix=rotations,

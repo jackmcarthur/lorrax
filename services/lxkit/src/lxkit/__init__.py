@@ -55,7 +55,7 @@ from lxkit.jax_compat import (
 )
 from lxkit import native_provider
 from lxkit.cache import user_cache_dir
-from lxkit.placement import device_put_process_local
+from lxkit.placement import device_put_process_local, device_put_process_tiles
 from lxkit.probe import (
     AVAILABLE,
     LibraryNotBuilt,
@@ -75,7 +75,7 @@ __all__ = [
     "ProbeResult", "AVAILABLE", "LibraryNotBuilt", "LibraryUnusable",
     "unknown_target", "not_loadable", "missing_symbol",
     # JAX utilities
-    "device_put_process_local", "mark_varying", "vma_mode", "select_mode",
+    "device_put_process_local", "device_put_process_tiles", "mark_varying", "vma_mode", "select_mode",
     "VMA_TRACKING_SINCE", "VmaSupportError",
     # native-provider policy (the tables remain with each caller)
     "native_provider",

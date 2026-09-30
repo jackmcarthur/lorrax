@@ -84,7 +84,7 @@ from typing import Any, Callable, NamedTuple
 from ffi import _services
 
 _services.ensure_on_path()
-from lxkit import device_put_process_local
+from lxkit import device_put_process_local, device_put_process_tiles
 
 
 __all__ = [
@@ -106,6 +106,7 @@ __all__ = [
     "prepare_mesh",
     # staging a host table onto a mesh, without a collective
     "device_put_process_local",
+    "device_put_process_tiles",
     "replicate_to_mesh",
     "shard_over_k",
     # reductions and gathers

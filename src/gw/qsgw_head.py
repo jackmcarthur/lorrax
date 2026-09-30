@@ -815,15 +815,11 @@ def load_dft_dipole_head(input_dir, *, mesh: Mesh, wfn, meta, config):
 
     if int(meta.b_id_0) != 0:
         raise ValueError("metal direct head requires a band manifold starting at 0")
-    velocity = read_authenticated_dipole_velocity(
-        os.path.join(input_dir, "dipole.h5"), wfn=wfn, meta=meta,
-        config=config, mesh=mesh)
     nb = int(meta.b_id_4_chi_user)
-    pad = head_storage_extent(mesh, nb) - nb
-    velocity = np.pad(velocity, ((0, 0), (0, 0), (0, pad), (0, pad)))
     return DftVelocityHeadData(
-        velocity_dft_cart=device_put_process_local(
-            velocity, NamedSharding(mesh, P(None, None, "x", "y"))),
+        velocity_dft_cart=read_authenticated_dipole_velocity(
+            os.path.join(input_dir, "dipole.h5"), wfn=wfn, meta=meta,
+            config=config, mesh=mesh),
         nb_logical=nb,
         reciprocal_lattice_cart=np.asarray(wfn.bvec) * float(wfn.blat),
     )
@@ -4105,10 +4101,18 @@ def read_authenticated_dipole_velocity(
 ):
     """Read file-wedge velocities and restore their polar time-odd full-k action.
 
+    Returns ``(3, nk, S, S)`` at ``P(None, None, 'x', 'y')`` on the head
+    carrier ``S = head_storage_extent(mesh, nb)``, zero past ``nb``: the
+    array ``_pad_head_band_manifold`` placed from the whole host table.  Each
+    process unfolds the parent rows one bounded block of full-BZ k at a
+    time and keeps only its own band tile, so no ``(3, nk, nb, nb)`` table
+    (48 nk nb^2 B: 13 GB at Fe 20^3 with 184 bands) is on any host.
+
     COLLECTIVE over ``mesh``: the parent rows are read through SlabIO, each
     rank its band tile (``file_io.restart_bundle.read_dipole_parent_window``).
     """
     from symmetry_maps import unfold_file_wedge_polar_matrix
+    from common.collectives import device_put_process_tiles
 
     # Fail before the host read and every sharded head allocation.  Shape does
     # not identify a velocity artifact: in particular, a two-spinor dipole and
@@ -4138,7 +4142,28 @@ def read_authenticated_dipole_velocity(
     from file_io.restart_bundle import read_dipole_parent_window
     parents = read_dipole_parent_window(
         dipole_path, sym.kirr_fullids, b0, b4, nk_full=sym.nk_tot, mesh=mesh)
-    return np.moveaxis(unfold_file_wedge_polar_matrix(sym, parents), 1, 0)
+    nk, nb = int(sym.nk_tot), b4 - b0
+    carrier = head_storage_extent(mesh, nb)
+    step = max(1, (1 << 28) // (48 * nb * nb))
+
+    def tile(index):
+        """This device's band tile over every k; rows and columns past nb are zero."""
+        r0, r1, _ = index[2].indices(carrier)
+        c0, c1, _ = index[3].indices(carrier)
+        out = np.zeros((3, nk, r1 - r0, c1 - c0), dtype=np.complex128)
+        rn, cn = max(0, min(r1, nb) - r0), max(0, min(c1, nb) - c0)
+        if rn and cn:
+            for k0 in range(0, nk, step):
+                k1 = min(nk, k0 + step)
+                block = unfold_file_wedge_polar_matrix(
+                    sym, parents, rows=np.arange(k0, k1))
+                out[:, k0:k1, :rn, :cn] = np.moveaxis(block, 1, 0)[
+                    :, :, r0:r0 + rn, c0:c0 + cn]
+        return out
+
+    return device_put_process_tiles(
+        (3, nk, carrier, carrier),
+        NamedSharding(mesh, P(None, None, "x", "y")), tile)
 
 
 def build_dft_head_response(
@@ -4209,21 +4234,29 @@ def build_dft_head_response(
                 f"head and wings; missing {dipole_path}.")
         # The one velocity owner at DeltaH = 0 and U = I: v_DFT, no Sigma
         # term (the SC dft_velocity head on the DFT states).  Held on the
-        # host, as the frozen part it is.
-        velocity_cart = np.asarray(qp_velocity(
+        # devices, band-sharded on the head carrier, as the frozen part it is.
+        velocity_cart = qp_velocity(
             read_authenticated_dipole_velocity(
                 dipole_path, wfn=wfn, meta=meta, config=config, mesh=mesh,
                 wfn_fingerprint_binding=wfn_fingerprint_binding),
-            occupations, mesh=mesh, nb_logical=nb_logical).dft_cart)
+            occupations, mesh=mesh, nb_logical=nb_logical).dft_cart
     else:
         velocity_cart = parts["velocity_cart"]
-    if velocity_cart.shape[1:] != (
-            int(meta.nk_tot), nb_logical, nb_logical):
+    carrier = head_storage_extent(mesh, nb_logical)
+    if velocity_cart.shape[1:] != (int(meta.nk_tot), carrier, carrier):
         raise ValueError(
             "dipole/chi head manifold mismatch: sliced velocity has "
             f"{velocity_cart.shape}, expected "
-            f"(3,{int(meta.nk_tot)},{nb_logical},{nb_logical}) for global "
-            f"bands [{b0},{b4}).")
+            f"(3,{int(meta.nk_tot)},{carrier},{carrier}) for global "
+            f"bands [{b0},{b4}) on the head carrier.")
+
+    def on_carrier(a):
+        """A logical (nk, nb) table on the velocity's carrier: the zero pad the
+        head kernels' ``_pad_head_band_manifold`` gives it."""
+        a = jnp.asarray(a, dtype=jnp.float64)
+        pad = carrier - int(a.shape[-1])
+        return jnp.pad(a, ((0, 0), (0, pad))) if pad else a
+
     # ``meta.nspinor`` is four for the bispinor representation, whereas
     # response normalization counts the source-WFN states.
     normalization_nspinor = int(meta.nspinor_wfnfile)
@@ -4251,7 +4284,7 @@ def build_dft_head_response(
                 kgrid=wfn.kgrid, bvec_cart=_head_bvec(wfn))
             surface = jnp.asarray(surface_host)
             drude_tensor, fermi_surface, pair_split = metal_intraband_model(
-                jnp.asarray(velocity_cart), surface, energies, mesh=mesh,
+                velocity_cart, on_carrier(surface), on_carrier(energies), mesh=mesh,
                 nb_logical=nb_logical, cell_volume=float(meta.cell_volume),
                 nk_tot=int(meta.nk_tot), nspin=int(wfn.nspin),
                 nspinor=normalization_nspinor, bvec_cart=_head_bvec(wfn),
@@ -4271,20 +4304,21 @@ def build_dft_head_response(
             metal=(surface, drude_tensor, fermi_surface, pair_split,
                    static_kappa2, static_Y_x, static_Z_y,
                    static_chi_body_gamma))
+    surface_c = None if surface is None else on_carrier(surface)
     S = head_s_tensor_sharded(
-        jnp.asarray(velocity_cart), energies, occupations, z,
+        velocity_cart, on_carrier(energies), on_carrier(occupations), z,
         mesh=mesh, nb_logical=nb_logical,
         cell_volume=float(meta.cell_volume), nk_tot=int(meta.nk_tot),
         nspin=int(wfn.nspin), nspinor=normalization_nspinor,
-        eta_ry=float(config.head.wcoul0_eta), surface_weight_kn=surface,
+        eta_ry=float(config.head.wcoul0_eta), surface_weight_kn=surface_c,
         pair_split=pair_split)
     Y_x = Z_y = None
     if wings:
         Y_x, Z_y = head_wings_sharded(
-            jnp.asarray(velocity_cart), wfns, energies, occupations, z,
+            velocity_cart, wfns, on_carrier(energies), on_carrier(occupations), z,
             mesh=mesh, nb_logical=nb_logical, nk_tot=int(meta.nk_tot),
             nspin=int(wfn.nspin), nspinor=normalization_nspinor,
-            eta_ry=float(config.head.wcoul0_eta), surface_weight_kn=surface)
+            eta_ry=float(config.head.wcoul0_eta), surface_weight_kn=surface_c)
     # Hard lifetime boundary: this module previously had zero
     # ``block_until_ready`` calls (unlike ``screening.py``'s per-stage
     # discipline), so the direct head/wings built here stayed queued,

@@ -11,7 +11,7 @@ remains stdlib-only and cannot initialize a backend before distributed JAX.
 
 from __future__ import annotations
 
-__all__ = ["device_put_process_local"]
+__all__ = ["device_put_process_local", "device_put_process_tiles"]
 
 
 def device_put_process_local(host_array, sharding, *, check: bool | None = None):
@@ -62,6 +62,29 @@ def device_put_process_local(host_array, sharding, *, check: bool | None = None)
         # ``np.ascontiguousarray`` promotes a 0-D scalar to shape ``(1,)``.
         # Preserve the scalar shard shape required by a replicated P() value;
         # higher-rank shards still take the contiguous host-staging route.
+        if piece.ndim:
+            piece = np.ascontiguousarray(piece)
+        shards.append(jax.device_put(piece, dev))
+    return jax.make_array_from_single_device_arrays(shape, sharding, shards)
+
+
+def device_put_process_tiles(shape, sharding, tile):
+    """Place a global array from its addressable shards, built on demand.
+
+    ``tile(index)`` returns the host value of the global array at ``index``
+    (a tuple of slices from ``sharding.addressable_devices_indices_map``).
+    The same placement as :func:`device_put_process_local` of the whole host
+    array, without the whole host array on any process: each process builds
+    only its own shards.  ``tile`` must be a pure function of rank-invariant
+    inputs.
+    """
+    import jax
+    import numpy as np
+
+    shape = tuple(int(s) for s in shape)
+    shards = []
+    for dev, idx in sharding.addressable_devices_indices_map(shape).items():
+        piece = np.asarray(tile(idx))
         if piece.ndim:
             piece = np.ascontiguousarray(piece)
         shards.append(jax.device_put(piece, dev))
