@@ -1510,7 +1510,7 @@ def _place(x, mesh: Mesh, spec: P | None = None) -> jax.Array:
 
 
 _SIGMA_OMEGA_ROTATE_CACHE: dict[
-    tuple[int, tuple[int, ...], bool, bool], Callable] = {}
+    tuple[int, tuple[int, ...], bool, bool, bool], Callable] = {}
 
 
 def _rotate_sigma_omega_cube(
@@ -1519,6 +1519,7 @@ def _rotate_sigma_omega_cube(
     *,
     mesh: Mesh,
     to_qp: bool,
+    donate: bool = False,
 ) -> jax.Array:
     """Rotate every frequency row of a correlation-operator cube.
 
@@ -1532,12 +1533,20 @@ def _rotate_sigma_omega_cube(
     This one helper serves both fixed-Sigma eigenvalue iteration and the
     final QP-to-DFT output rotation.  Keeping both directions here pins the
     index convention and the bounded-memory schedule in one place.
+
+    ``donate=True`` rotates the cube in place, one frequency row per
+    dispatch into the input's own buffer, and deletes the input: the
+    caller must not read it again.  Input and output are then one cube
+    instead of two (the scan's stacked output is a second cube; a donated
+    ``fori_loop`` carry still compiles a cube-sized copy, measured).  Rows
+    are rotated by the same per-row contraction as the scan, so the result
+    is bitwise the same.
     """
     from .qsgw_utils import is_band_sharded_sigma_omega
 
     shape = tuple(int(v) for v in sigma_c_omega_ry.shape)
     sharded = is_band_sharded_sigma_omega(sigma_c_omega_ry)
-    key = (id(mesh), shape, bool(to_qp), bool(sharded))
+    key = (id(mesh), shape, bool(to_qp), bool(sharded), bool(donate))
     fn = _SIGMA_OMEGA_ROTATE_CACHE.get(key)
     if fn is None:
         from .qsgw_density import rotate_band_matrix
@@ -1565,7 +1574,24 @@ def _rotate_sigma_omega_cube(
             _, out = jax.lax.scan(_one, None, cube, unroll=1)
             return jax.lax.with_sharding_constraint(out, cube_sh)
 
-        fn = _kernel
+        @_functools.partial(jax.jit, donate_argnums=(0,))
+        def _row_in_place(cube, U, i):
+            U = jax.lax.with_sharding_constraint(U, rotation_sh)
+            rotated = rotate_band_matrix(
+                jax.lax.dynamic_index_in_dim(cube, i, axis=0, keepdims=False),
+                U, mesh=mesh, to_qp=bool(to_qp))
+            rotated = jax.lax.with_sharding_constraint(rotated, row_sh)
+            return jax.lax.with_sharding_constraint(
+                jax.lax.dynamic_update_index_in_dim(cube, rotated, i, axis=0),
+                cube_sh)
+
+        def _in_place(cube, U):
+            cube = jax.device_put(cube, cube_sh, donate=True)
+            for i in range(shape[0]):
+                cube = _row_in_place(cube, U, np.int32(i))
+            return cube
+
+        fn = _in_place if donate else _kernel
         _SIGMA_OMEGA_ROTATE_CACHE[key] = fn
     return fn(sigma_c_omega_ry, U_dft_to_qp)
 
@@ -7278,9 +7304,13 @@ def run_sc_driver(
                 U, sigma_result.sigma_band_axis, pad_diagonal=1.0),
             mesh_xy, _band_rotation_spec())
     sigma_c_omega_dft = (
+        # Donated: the QP-basis cube has no reader past this line
+        # (dump_sigma_omega_h5_final wrote it above; the SC loop's cells and
+        # the edge/Z diagnostics ran before this frame; the driver reads
+        # only sigma_result_dft), so the two cubes are never both resident.
         _rotate_sigma_omega_cube(
             sigma_result.sigma_c_omega_kij_ry, U_sigma,
-            mesh=mesh_xy, to_qp=False)
+            mesh=mesh_xy, to_qp=False, donate=True)
         if sigma_result.sigma_c_omega_kij_ry is not None else None)
     sigma_c_at_dft_dft = (
         _sigma_c_at_dft_diag_from_dft_cube(
