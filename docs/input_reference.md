@@ -163,7 +163,7 @@ at its default, `false`.
 
 | key | type | default | meaning |
 |---|---|---|---|
-| `qp_solver` | str | `auto` | `one_shot_dft` (the `auto` default): one full-matrix effective Hamiltonian with Σ evaluated at E_DFT under QSGW Hermitian symmetrization. `fixed_point`: a diagonal on-shell solve, then the full-matrix Hamiltonian. `self_consistent`: the QSGW loop, which writes one energy table and one Z table per map ([self-consistency](self_consistency.md)). `fixed_point` with a static `compute_mode` refuses. |
+| `qp_solver` | str | `auto` | `one_shot_dft` (the `auto` default): one full-matrix effective Hamiltonian with Σ evaluated at E_DFT under QSGW Hermitian symmetrization. `fixed_point`: the diagonal on-shell root E = h₀ + Σ_x + ReΣ_c(E) of `gw.eqp_bgw.solve_qp_root` (the root `eqp_root.dat` reports, bracketed from E_DFT), then the full-matrix Hamiltonian at those energies; a band off the Σ(ω) grid at any k keeps E_DFT, and an in-grid state with no root on its bracket refuses (`GATE qp_fixed_point_no_root`). `self_consistent`: the QSGW loop, which writes one energy table and one Z table per map ([self-consistency](self_consistency.md)). `fixed_point` with a static `compute_mode` refuses. |
 | `sc_max_iter` | int | `30` | SC map cap, ≥ 1. Reaching it without meeting `sc_tol_ev` refuses (`GATE sc_fixed_point_not_converged`) and keeps the per-map tables. `1` runs a labelled one-map diagnostic. |
 | `sc_tol_ev` | float | `1e-4` | SC convergence tolerance (eV), > 0. |
 | `sc_accelerator` | str | `anderson` | `anderson` is the only value: one-evaluation Anderson type II with history `sc_history_depth`. Any other value refuses (`GATE sc_accelerator_anderson_only`); the fix is to delete the key. |
