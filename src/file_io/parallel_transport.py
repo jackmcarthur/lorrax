@@ -744,8 +744,7 @@ def _write_link_stage(
     # service; the physical Marzari-Vanderbilt direction set stays unchanged.
     group_size = int(mesh.size)
     from distrib_la import ROUTE_BATCH_RESHARD
-    route = polar_plan.route_for((group_size, polar_plan.n, polar_plan.n),
-                                jnp.complex128)
+    route = polar_plan.batched_route
     if route != ROUTE_BATCH_RESHARD:
         group_size = 1
     print(f"  parallel-transport links: {nd*nrk} edges, group={group_size}, "
