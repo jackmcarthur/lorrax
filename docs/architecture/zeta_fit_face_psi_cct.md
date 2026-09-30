@@ -52,6 +52,17 @@ action and antiunitary conjugation, all read from `symmetry_maps` through the
 plan. It then evaluates the k correlation and writes C_q for all N_k q at
 `P(None,'x','y')`.
 
+For four spinors, the same metric is accumulated from the four Dirac-half
+pairs `(h,g)`. `CentroidKUnfoldPlan.dirac_halves` authenticates the action
+`diag(U,pU)`; each raw-parent quarter has two spin components per endpoint
+and transports with `p^(h+g)`. A monomial vertex selects the matching right
+quarter. The existing service GEMM and parent convolution process each pair
+in order; all 16 spin-pair terms remain, including cross halves. This changes
+only the spin reduction order, so parity is at floating-point roundoff.
+Each parent quarter occupies `16*n_parent*4*mu²/P` bytes; the scalar output
+remains `16*N_k*mu²/P`. No four-spinor parent matrix or unfolded wavefunction
+is held by this route.
+
 A current channel applies its vertex γ̃^i on the output spin indices after
 transport. The stored faces are never vertex-folded. The four-spinor action is
 on the [symmetry register](symmetry_register.md), and the Lorentz convention

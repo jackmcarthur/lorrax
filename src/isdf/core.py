@@ -1122,6 +1122,7 @@ def _c_q_dirac_quarters(psi_mun, psi_nmu, weight_l, weight_r, *, plan,
 		layout = 'face' if gemm.in_sharding_a.spec == P(None, 'x', 'y') else 'axis'
 		quarter_gemm = gemm_plan(mesh_xy, m=2*mu, n=2*mu, k=nb, nq=np_,
 		                         dtype=psi_mun.dtype, backend=gemm.backend,
+		                         alpha=gemm.alpha, beta=gemm.beta,
 		                         layout=layout, reduction_axis=gemm.reduction_axis,
 		                         warmup=False)
 		mun = NamedSharding(mesh_xy, P(None, None, *quarter_gemm.in_sharding_a.spec[1:]))
