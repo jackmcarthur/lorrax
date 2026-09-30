@@ -256,17 +256,31 @@ def map_full_kpoints_to_irreducible(
     full_wrapped = np.mod(full, 1.0)
     full_wrapped[full_wrapped > 0.99999] = 0.0
 
-    parent = np.zeros(full.shape[0], dtype=np.int32)
-    op = np.zeros(full.shape[0], dtype=np.int32)
-    matched = np.zeros(full.shape[0], dtype=bool)
-    for ifull, target in enumerate(full_wrapped):
-        for ikbar in range(stored.shape[0]):
-            diffs = np.abs(images[ikbar] - target)
-            hits = np.where(np.all(diffs < tol, axis=1))[0]
-            if hits.size:
-                parent[ifull] = ikbar
-                op[ifull] = int(hits[0])
-                matched[ifull] = True
+    # The same elementwise test |S k_bar - k| < tol on every (full row,
+    # stored row, operation), evaluated over bounded blocks of full rows
+    # (at most 2**24 compared coordinates per block) instead of one Python
+    # iteration per (full row, stored row): 8.5M iterations and 61 s at
+    # Fe 20^3 (8000 x 1062 x 16).  The registered tie break is kept: the
+    # HIGHEST stored row with any hit wins, then its LOWEST operation.
+    n_full, n_stored, n_sym = full.shape[0], stored.shape[0], sym.shape[0]
+    parent = np.zeros(n_full, dtype=np.int32)
+    op = np.zeros(n_full, dtype=np.int32)
+    matched = np.zeros(n_full, dtype=bool)
+    block = max(1, (1 << 24) // (n_stored * n_sym * 3))
+    for f0 in range(0, n_full, block):
+        target = full_wrapped[f0:f0 + block]
+        hit = np.all(
+            np.abs(images[None, :, :, :] - target[:, None, None, :]) < tol,
+            axis=3)                                   # (block, stored, sym)
+        row_hit = hit.any(axis=2)
+        any_hit = row_hit.any(axis=1)
+        last = (n_stored - 1
+                - np.argmax(row_hit[:, ::-1], axis=1)).astype(np.int32)
+        first_op = np.argmax(
+            hit[np.arange(hit.shape[0]), last], axis=1).astype(np.int32)
+        parent[f0:f0 + block] = np.where(any_hit, last, 0)
+        op[f0:f0 + block] = np.where(any_hit, first_op, 0)
+        matched[f0:f0 + block] = any_hit
     return parent, op, matched
 
 
