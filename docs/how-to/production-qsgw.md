@@ -71,7 +71,7 @@ its stop rules in [self-consistency](../self_consistency.md); the W model in
   `sigma_mnk.h5` ([self-consistency §1](../self_consistency.md#1-the-map)).
   Every velocity head writes `dipole_qsgw.h5`. With `WFN_qp.h5` it is bound
   to that WFN, so a GW run on `WFN_qp.h5` can use it as its `dipole.h5`
-  ([QSGW dipoles](../self_consistency.md#interband-commutator-head)).
+  ([QSGW dipoles](../self_consistency.md#qsgw-dipoles)).
   `WFN_qp.h5` files written before 2026-09-30 from a WFN that stores both k
   and −k have broken rows; regenerate them
   ([self-consistency §8](../self_consistency.md#8-seeding-restart-and-outputs)).

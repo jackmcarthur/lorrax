@@ -19,7 +19,6 @@ from gw.degen_average import TOL_DEGENERACY_RY
 
 __all__ = [
     "DftVelocityHeadData",
-    "InterbandCommutatorHeadData",
     "IterationHeadResponse",
     "IterationHeadSamples",
     "ParallelTransportHeadData",
@@ -38,14 +37,12 @@ __all__ = [
     "static_head_wings_sharded",
     "head_samples_from_s",
     "metal_head_summary",
-    "interband_commutator_velocity",
     "finalize_iteration_head_sample",
     "finalize_iteration_head_rows",
     "finalize_iteration_head_samples",
     "iteration_head_sample_terms",
     "load_dft_velocity_head",
     "load_dft_dipole_head",
-    "load_interband_commutator_head",
     "load_parallel_transport_head",
     "qp_velocity",
     "reduced_covector_to_cartesian",
@@ -1120,262 +1117,6 @@ def rotate_velocity_active_to_qp(velocity_cart, U_active, *, mesh: Mesh):
     if U_active.shape[-2] != na:
         raise ValueError("U_active must be square on its band axes")
     return _active_rotation_kernel(mesh, na)(velocity_cart, U_active)
-
-
-# ---------------------------------------------------------------------------
-# sc_head_update = interband_commutator: the QSGW head velocity without links
-# ---------------------------------------------------------------------------
-
-
-@dataclass(frozen=True)
-class InterbandCommutatorHeadData:
-    r"""Head inputs of ``sc_head_update = interband_commutator``.
-
-    The exact DFT velocity stage of the ``get_dipole_mtxels
-    --parallel-transport-out`` artifact (the same read as
-    :class:`DftVelocityHeadData`), authenticated to carry the nonlocal
-    commutator.  Each map adds :func:`interband_commutator_velocity` to it.
-    No links are read, so no k axis needs a stencil.  ``forward_links`` is
-    pinned at ``None`` so the shared head builder takes its no-link path.
-    """
-
-    velocity_dft_cart: jax.Array
-    nb_logical: int
-    reciprocal_lattice_cart: np.ndarray
-    #: ``(3, nk, nb_s, nb_s)`` reduced position operator ``Z_a = <m|b_a.r|n>``
-    #: of the collapsed (one-point) k axes, zero elsewhere; ``None`` on a
-    #: grid with no collapsed axis.  Along such an axis the head uses it
-    #: exactly (``-i[Z_a, DeltaH]``) instead of the cross-gap commutator.
-    collapsed_position: object = None
-    collapsed_axes: tuple = ()
-    forward_links: None = None
-    forward_neighbors: None = None
-    validation: None = None
-
-
-def load_interband_commutator_head(
-    path: str, *, mesh: Mesh, wfn, meta, config,
-) -> InterbandCommutatorHeadData:
-    """Load the DFT velocity stage and refuse a velocity without V_NL.
-
-    ``W = v/(E_m - E_l)`` is the interband position operator only when
-    ``v = i[H, r]`` for the SAME ``H`` whose energies divide it, so the
-    velocity must carry ``i[V_NL, r]``.  The producer stamps that as
-    ``vnl_included``; a p-only artifact (``--skip-vnl``) or one that predates
-    the stamp refuses here.  Every other provenance check is
-    :func:`load_dft_velocity_head`'s.
-    """
-    from common.parallel_transport import band_storage_extent, collapsed_axes
-    from file_io.parallel_transport import COLLAPSED_POSITION_DATASET
-    from file_io.slab_io import SlabIO
-
-    axes = tuple(int(a) for a in collapsed_axes(wfn.kgrid)) if wfn is not None else ()
-    position = None
-    with SlabIO(path, mode="r", mesh=mesh) as io:
-        try:
-            vnl_included = int(io.read_small("vnl_included", dtype=np.int32))
-        except (KeyError, RuntimeError, OSError, ValueError) as exc:
-            vnl_included = None
-            detail = f"{type(exc).__name__}: {exc}"
-        if vnl_included == 1 and axes:
-            nb_head = int(meta.b_id_4_user)
-            nb_outer = max(nb_head, int(io.read_small("band_stop", dtype=np.int64)))
-            outer_storage = band_storage_extent(mesh, nb_outer)
-            try:
-                position = head_band_block(io.read_slab(
-                    COLLAPSED_POSITION_DATASET,
-                    shape=(3, int(meta.nk_tot), outer_storage, outer_storage),
-                    partition_spec=P(None, None, "x", "y")),
-                    nb_head, mesh=mesh, nb_outer=nb_outer)
-            except (KeyError, RuntimeError, OSError, ValueError) as exc:
-                raise ValueError(
-                    f"GATE pt_collapsed_axis_artifact: {path}: the k grid "
-                    f"{tuple(int(n) for n in wfn.kgrid)} has a collapsed axis "
-                    f"but {COLLAPSED_POSITION_DATASET} could not be read "
-                    f"({type(exc).__name__}: {exc}); regenerate with "
-                    "get_dipole_mtxels --parallel-transport-out "
-                    "--parallel-transport-velocity-only") from exc
-    if vnl_included != 1:
-        got = ("no vnl_included stamp (" + detail + ")"
-               if vnl_included is None else f"vnl_included = {vnl_included}")
-        raise ValueError(
-            "GATE sc_head_interband_commutator_velocity_operator: "
-            f"{path}: {got}.\n"
-            "  want: the full DFT velocity v = p + i[V_NL, r] (+ SOC), "
-            "stamped vnl_included = 1\n"
-            "  fix:  regenerate with get_dipole_mtxels "
-            "--parallel-transport-out <file> --parallel-transport-velocity-only "
-            "(without --skip-vnl)\n"
-            "  why:  r_ml = -i v_ml/(E_m - E_l) holds only for the velocity of "
-            "the Hamiltonian whose energies divide it; p alone is off by the "
-            "nonlocal commutator\n"
-            "  doc:  docs/self_consistency.md, 'Interband-commutator head'")
-    base = load_dft_velocity_head(
-        path, mesh=mesh, wfn=wfn, meta=meta, config=config)
-    return InterbandCommutatorHeadData(
-        velocity_dft_cart=base.velocity_dft_cart,
-        nb_logical=int(base.nb_logical),
-        reciprocal_lattice_cart=base.reciprocal_lattice_cart,
-        collapsed_position=position,
-        collapsed_axes=axes,
-    )
-
-
-def _interband_commutator_kernel(
-    mesh: Mesh, *, nb_logical: int, nb_active: int, n_occ: int,
-) -> Callable:
-    from common.parallel_transport import make_distributed_band_matmul
-    from gw.degen_average import TOL_DEGENERACY_RY
-
-    key = ("interband_commutator", id(mesh), int(nb_logical),
-           int(nb_active), int(n_occ))
-    hit = _KERNEL_CACHE.get(key)
-    if hit is not None:
-        return hit
-    _mesh_xy(mesh)
-    multiply = make_distributed_band_matmul(mesh, n_batch_axes=2)
-    out_sharding = NamedSharding(mesh, P(None, None, "x", "y"))
-    tile_sharding = NamedSharding(mesh, P(None, "x", "y"))
-    na, nbl, nv = int(nb_active), int(nb_logical), int(n_occ)
-    tol = float(TOL_DEGENERACY_RY)
-
-    @jax.jit
-    def _kernel(v, delta_active, tail_diagonal, e_dft, mix_w, mix_z, z_pos):
-        nbs = int(v.shape[-1])
-        band = jnp.arange(nbs)
-        live = band < nbl
-        de = jax.lax.with_sharding_constraint(
-            e_dft[:, :, None] - e_dft[:, None, :], tile_sharding)
-        # Cross-gap pairs only: valence-conduction and conduction-valence.
-        occupied = band < nv
-        pair = (live[:, None] & live[None, :]
-                & (occupied[:, None] != occupied[None, :]))
-        keep = pair[None] & (jnp.abs(de) > tol)
-        W = jnp.where(keep[None], v / jnp.where(keep, de, 1.0)[None],
-                      jnp.zeros((), dtype=v.dtype))
-        # Collapsed reduced axes take the exact position operator:
-        # W_red = B W_cart, W_red[a] = i Z_a there, W_cart = B^-1 W_red.
-        W = (jnp.einsum("ij,j...->i...", mix_w, W)
-             + jnp.einsum("ij,j...->i...", mix_z, 1j * z_pos))
-        W = jax.lax.with_sharding_constraint(W, out_sharding)
-        # [DeltaH, W] with DeltaH = active block (+) diagonal tail.
-        t = jnp.where(band[None, :] >= na, tail_diagonal, 0.0)
-        C = (t[None, :, :, None] - t[None, :, None, :]) * W
-        A = jnp.broadcast_to(delta_active[None], (3,) + delta_active.shape)
-        C = C.at[:, :, :na, :].add(multiply(A, W[:, :, :na, :]))
-        C = C.at[:, :, :, :na].add(-multiply(W[:, :, :, :na], A))
-        C = jax.lax.with_sharding_constraint(C, out_sharding)
-        vc = (band[:, None] < nv) & (band[None, :] >= nv) & live[None, :]
-        vc = vc[None, None]
-        num = jnp.sum(jnp.where(vc, jnp.abs(C) ** 2, 0.0), axis=(1, 2, 3))
-        den = jnp.sum(jnp.where(vc, jnp.abs(v) ** 2, 0.0), axis=(1, 2, 3))
-        excluded = jnp.sum(pair[None] & ~keep)
-        min_kept = jnp.min(jnp.where(keep, jnp.abs(de), jnp.inf))
-        return (jax.lax.with_sharding_constraint(v + C, out_sharding),
-                (num, den, excluded, min_kept))
-
-    _KERNEL_CACHE[key] = _kernel
-    return _kernel
-
-
-def interband_commutator_velocity(
-    velocity_dft_cart,
-    delta_h_active,
-    tail_diagonal,
-    energies_dft_kn_ry,
-    *,
-    nb_logical: int,
-    n_occ: int,
-    mesh: Mesh,
-    collapsed_position=None,
-    collapsed_axes=(),
-    reciprocal_lattice_cart=None,
-):
-    r"""QSGW head velocity ``v + [DeltaH, W]`` in the DFT basis, no links.
-
-    ``W_vc = v_vc/(E_v - E_c)`` is ``i r_vc``, the cross-gap position
-    operator of the DFT Hamiltonian (valence ``v < n_occ <= c``), so
-    ``[H_DFT, W] = v`` on the valence-conduction blocks and
-    ``-i[r^VC, DeltaH] = [DeltaH, W]``.  Split the covariant derivative by
-    occupation class, ``D DeltaH = -i[A^VC, DeltaH] + D^class DeltaH``.  The
-    valence-conduction block of ``D^class DeltaH`` holds only the cross-gap
-    block ``DeltaH_VC``, so the head is exact for any ``DeltaH`` that does
-    not mix valence and conduction (a band-diagonal ``DeltaH`` gives
-    ``v_vc (E^QP_v - E^QP_c)/(E_v - E_c)``), and its error is first order in
-    the cross-gap mixing.  No sum over states is truncated: ``DeltaH`` is
-    the active block plus a diagonal tail, so every ``W`` element it meets
-    is inside the head manifold.
-
-    Degenerate and near-degenerate manifolds: every same-class pair is
-    EXCLUDED, not only exact multiplets.  Inside a class the interband
-    ``W`` has no gap below it: near-degenerate pairs make it arbitrarily
-    large, and the k derivative of ``DeltaH`` that would cancel it has no
-    stencil-free form.  Excluding pairs within ``TOL_DEGENERACY_RY`` alone
-    left Si 6x6x6 SOC with a head 8.8x the link head (pairs at 0.19 meV);
-    the class rule has no tolerance and every denominator is at least the
-    direct gap.  A cross-gap pair within ``TOL_DEGENERACY_RY``
-    (``gw.degen_average``) is a closed gap; it is excluded and counted, and
-    the SC caller refuses it.
-
-    Collapsed axes (a slab normal, a wire's transverse axes): there the
-    cell is not periodic and the connection is the stored position operator
-    ``Z_a`` (``common.parallel_transport.link_stencil_orders``), so the
-    reduced component ``a`` of ``W`` is ``i Z_a``, full and exact, and the
-    cross-gap rule is used only along the periodic axes:
-    ``W_cart = B^-1 [B W^VC with rows a replaced by i Z_a]``.
-
-    Shapes: ``velocity_dft_cart`` (3, nk, nb_s, nb_s) ``P(None, None, x, y)``;
-    ``delta_h_active`` (nk, na, na); ``tail_diagonal`` and
-    ``energies_dft_kn_ry`` (nk, nb_s), Ry.  Work O(3 nk na^2 nb_s); peak
-    transients three velocity-sized arrays (v, W, the correction), each
-    ``3 nk nb_s^2 16 B / P`` per rank.
-
-    Returns ``(velocity, stats)``; ``stats`` holds, per Cartesian axis, the
-    valence-conduction sums ``|[DeltaH, W]_vc|^2`` and ``|v_vc|^2``, the count
-    of cross-gap pairs within ``TOL_DEGENERACY_RY``, and the smallest kept
-    ``|E_c - E_v|`` (the direct DFT gap of the manifold).
-    """
-    v = jnp.asarray(velocity_dft_cart, dtype=jnp.complex128)
-    delta = jnp.asarray(delta_h_active, dtype=jnp.complex128)
-    tail = jnp.asarray(tail_diagonal, dtype=jnp.float64)
-    e = jnp.asarray(energies_dft_kn_ry, dtype=jnp.float64)
-    if v.ndim != 4 or int(v.shape[0]) != 3 or v.shape[-1] != v.shape[-2]:
-        raise ValueError(f"velocity must be (3,nk,nb,nb); got {v.shape}")
-    nk, nbs = int(v.shape[1]), int(v.shape[-1])
-    if delta.ndim != 3 or delta.shape[0] != nk or delta.shape[1] != delta.shape[2]:
-        raise ValueError(f"delta_h_active must be (nk,na,na); got {delta.shape}")
-    na = int(delta.shape[-1])
-    if tail.shape != (nk, nbs) or e.shape != (nk, nbs):
-        raise ValueError(
-            f"tail/energies must be ({nk},{nbs}); got {tail.shape}/{e.shape}")
-    if not (0 < int(n_occ) < int(nb_logical) <= nbs and na <= nbs):
-        raise ValueError(
-            "interband commutator head needs 0 < n_occ < nb_logical <= "
-            f"nb_storage and na <= nb_storage; got n_occ={n_occ}, "
-            f"nb_logical={nb_logical}, nb_storage={nbs}, na={na}")
-    axes = tuple(int(a) for a in collapsed_axes)
-    if axes:
-        if collapsed_position is None or reciprocal_lattice_cart is None:
-            raise ValueError(
-                "collapsed axes need the stored position operator and the "
-                "reciprocal lattice")
-        B = np.asarray(reciprocal_lattice_cart, dtype=np.float64)
-        Binv = np.linalg.inv(B)
-        sel = np.zeros((3, 3))
-        sel[axes, axes] = 1.0
-        mix_w = Binv @ (np.eye(3) - sel) @ B
-        mix_z = Binv @ sel
-        z_pos = jnp.asarray(collapsed_position, dtype=jnp.complex128)
-        if z_pos.shape != v.shape:
-            raise ValueError(
-                f"collapsed position {z_pos.shape} != velocity {v.shape}")
-    else:
-        mix_w, mix_z = np.eye(3), np.zeros((3, 3))
-        z_pos = jnp.zeros((3, 1, 1, 1), dtype=jnp.complex128)
-    return _interband_commutator_kernel(
-        mesh, nb_logical=int(nb_logical), nb_active=na, n_occ=int(n_occ),
-    )(v, delta, tail, e, jnp.asarray(mix_w, dtype=jnp.complex128),
-      jnp.asarray(mix_z, dtype=jnp.complex128), z_pos)
 
 
 #: The QSGW velocity file the SC driver writes beside ``dipole.h5``.
@@ -3754,9 +3495,8 @@ class QPVelocity:
     r"""One SC map's velocity in the DFT band basis; consumers read U^H v U.
 
     ``dft_cart`` is ``v_DFT`` plus this map's Sigma term: ``D_k DeltaH``
-    from the links (``parallel_transport``), ``[DeltaH, W]``
-    (``interband_commutator``), or none (``dft_velocity``, or a map whose
-    links cannot serve it).  The head (S, Drude, wings) and
+    from the links (``parallel_transport``), or none (``dft_velocity``, or
+    links that cannot serve it).  The head (S, Drude, wings) and
     ``dipole_qsgw.h5`` both take this array and the map's ``U``, so the SC
     screening and the BSE dipoles see one velocity.  ``base`` is ``v_DFT``;
     ``correction`` the Sigma term added (None when absent or zeroed);
@@ -3787,15 +3527,12 @@ def qp_velocity(
     collapsed_position=None,
     nb_links: int | None = None,
     link_error: float | None = None,
-    velocity_base_cart=None,
     link_unserved: str | None = None,
 ) -> QPVelocity:
     """The owner of the SC velocity: ``v_DFT`` plus this map's Sigma term.
 
-    ``forward_links=None`` with no ``velocity_base_cart`` is
-    ``sc_head_update = dft_velocity``: ``delta_h_dft`` is unused.  With
-    ``velocity_base_cart`` (``interband_commutator``) ``velocity_dft_cart``
-    already holds ``v + [DeltaH, W]``.  ``parallel_transport`` adds
+    ``forward_links=None`` is ``sc_head_update = dft_velocity``:
+    ``delta_h_dft`` is unused.  ``parallel_transport`` adds
     ``D_k DeltaH`` whenever the source carries links.  A source whose links
     are incomplete or fail the stencil or window-hybridization gate carries
     none and names the reason in ``link_unserved``: the term is then zero
@@ -3806,11 +3543,6 @@ def qp_velocity(
     """
     v_dft_basis = jnp.asarray(velocity_dft_cart, dtype=jnp.complex128)
     base, correction, bound = v_dft_basis, None, None
-    if velocity_base_cart is not None:
-        # interband_commutator hands v + [DeltaH, W]: its Sigma term is the
-        # difference from the DFT velocity p + i[r, V_NL].
-        base = jnp.asarray(velocity_base_cart, dtype=jnp.complex128)
-        correction = v_dft_basis - base
     zeroed = str(link_unserved) if link_unserved else None
     if forward_links is not None:
         if forward_neighbors is None:
@@ -3834,10 +3566,7 @@ def qp_velocity(
                 correction, v_dft_basis, occupations_qp_kn,
                 link_error=link_error)
         v_dft_basis = v_dft_basis + correction
-    if velocity_base_cart is not None:
-        label = ("v_DFT + [DeltaH, W] (interband_commutator; intraband "
-                 "connection omitted)")
-    elif forward_links is not None:
+    if forward_links is not None:
         label = "v_DFT + D_k DeltaH (parallel_transport links)"
     elif zeroed is not None:
         label = f"v_DFT (D_k DeltaH zeroed: {zeroed})"

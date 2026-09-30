@@ -63,73 +63,30 @@ wedge. The full BZ exists only inside a map, while the k-grid FFT builds Σ.
 One seam at the map boundary selects the retained result together with its
 defining $U$.
 
-### Interband-commutator head {#interband-commutator-head}
+### QSGW velocity and dipoles {#qsgw-dipoles}
 
 A head update (`sc_head_update`) rebuilds the $q \to 0$ head each map from the
 QP velocity $v^{\rm QP} = U^\dagger (v + D\Delta H)\,U$. Here $v$ is the DFT
 velocity $p + i[V_{\rm NL}, r]$ (plus SOC), $\Delta H = H - \mathrm{diag}(E^{\rm DFT})$,
-and $D$ is the covariant $k$ derivative. `parallel_transport` forms $D\Delta H$
-from finite links and needs a derivative rule on every $k$ axis.
-`interband_commutator` forms it without links, on any grid:
-
-$$
-D\Delta H \approx [\Delta H, W], \qquad
-W_{vc} = \frac{v_{vc}}{E_v - E_c}, \quad W_{cv} = W_{vc}^*,
-$$
-
-with $v < n_{\rm occ} \le c$, and $W = 0$ inside each occupation class.
-$W = i\,r^{VC}$, so $[H^{\rm DFT}, W] = v$ on the valence–conduction blocks.
-Split the covariant derivative by class, $D\Delta H = -i[A^{VC}, \Delta H] + D^{\rm class}\Delta H$.
-The valence–conduction block of $D^{\rm class}\Delta H$ holds only the cross-gap
-block $\Delta H_{VC}$. So the head is exact for any $\Delta H$ that does not mix
-valence and conduction; a band-diagonal $\Delta H$ gives
-$v_{vc}(E^{\rm QP}_v - E^{\rm QP}_c)/(E_v - E_c)$. Its error is first order in the
-cross-gap mixing, and each map prints $\max_k \lVert U_{VC} \rVert_F$.
-$\Delta H$ is the active block plus a diagonal tail inside the head manifold, so
-no sum over states is truncated.
-
-On a collapsed (one-point) $k$ axis the cell is not periodic, and the
-connection is the stored position operator $Z_a$ of the velocity artifact
-(`sc_head_update = parallel_transport` uses the same operator there). There
-the reduced component of $W$ is $i Z_a$, full and exact, and the class rule
-applies to the periodic axes only: $W_{\rm cart} = B^{-1}\,[B\,W^{VC}$ with row
-$a$ replaced by $i Z_a]$.
-
-**Accuracy.** On MoS2 bispinor at $\theta_{\max} \approx 0.055$ the class rule
-alone put $S_{zz}$ 1.3 % from the exact position-operator head, so the
-periodic-axis error is about $\theta/4$ in $S_{aa}$. A $5\times10^{-3}$ head
-tolerance is out of reach at $\theta \approx 0.05$ without within-class $k$
-information (links). The per-map line prints $\theta$; there is no refusal
-threshold. Measurements: sandbox claim 2815.
-
-Every same-class pair is excluded, degenerate or not. Inside a class, $W$ has
-no gap in its denominator. Near-degenerate pairs make it arbitrarily large, and
-the $\partial_k \Delta H$ that would cancel it has no stencil-free form.
-Excluding only exact multiplets (BerkeleyGW's $10^{-6}$ Ry) left a Si SOC head
-8.8 times the link head. The class rule has no tolerance, and every
-denominator is at least the direct gap.
-
-A metal refuses (`GATE sc_head_interband_commutator_insulator_only`), and so does
-a cross-gap pair within $10^{-6}$ Ry (`GATE sc_head_interband_commutator_gap`).
-The velocity artifact must stamp `vnl_included = 1`
-(`GATE sc_head_interband_commutator_velocity_operator`). The kernel is
-`qsgw_head.interband_commutator_velocity`.
+and $D$ is the covariant $k$ derivative, so $D\Delta H = i[\Delta H, r]$ is
+the Σ commutator. `parallel_transport` forms $D\Delta H$ from finite links on
+every periodic $k$ axis. On a collapsed (one-point) axis the cell is not
+periodic, and the connection is the stored position operator $Z_a$ of the
+velocity artifact. `dft_velocity` drops the Σ term. The link-free
+`interband_commutator` mode is retired and refuses by name: the links serve
+the Σ term on every grid, and their error is a k-convergence measure that each
+map logs ([§7](#metals-direct-drude-head)).
 
 **QSGW dipoles.** On every velocity head the driver writes the accepted final
 map's $U^\dagger v\,U$, with the QP energies of the same states, to
 `dipole_qsgw.h5` beside the deck (`qsgw_head.write_qsgw_dipole`, the
 `dipole.h5` layout, `basis = "qp"`). $v$ is the head's own velocity from the
 one owner `qsgw_head.qp_velocity`: $v_{\rm DFT} + D_k\Delta H$ on
-`parallel_transport` (only $v_{\rm DFT}$ on a map whose links cannot serve the
-Σ term), $v + [\Delta H, W]$ on this head, $v_{\rm DFT}$ on `dft_velocity`.
+`parallel_transport` (only $v_{\rm DFT}$ when the links are not usable),
+$v_{\rm DFT}$ on `dft_velocity`.
 The file's `velocity` attribute names the term. Its states are the ones the
 map's $W$ and the final `WFN_qp.h5` are built from. The absorption consumers
-read it through `load_dipole_h5` and form $d_{cv} = v_{cv}/(E_c - E_v)$. On this
-head that is $(U^\dagger r^{VC} U)_{cv}$ with the collapsed-axis $Z_a$ in place of
-$r^{VC}$: the QSGW term $-i[r^{VC},\Delta H]$ is included; the intraband
-$D^{\rm class}\Delta H$ is not. With a band-diagonal $\Delta H$ the position
-form equals the DFT one, and the whole QSGW change of $|d|^2$ is the mixing
-$U$ (the velocity form scales by the QP-to-DFT transition-energy ratio).
+read it through `load_dipole_h5` and form $d_{cv} = v_{cv}/(E_c - E_v)$.
 The file holds velocities between QP states, so it pairs only with a QP WFN:
 a BSE reads it only on a restart built from `WFN_qp.h5`, and refuses it
 beside a DFT WFN (`GATE dipole_basis`,
@@ -601,10 +558,9 @@ receipts certify the unprojected model only.
 ### Metals: direct Drude head {#metals-direct-drude-head}
 
 One owner forms the SC velocity on every map: `qsgw_head.qp_velocity` returns
-$v = v_{DFT}$ plus this map's Σ term ($D_k\Delta H$ on `parallel_transport`,
-$[\Delta H, W]$ on `interband_commutator`, none on `dft_velocity` or when the
+$v = v_{DFT}$ plus this map's Σ term ($D_k\Delta H$ on `parallel_transport`, none on `dft_velocity` or when the
 links are not usable). The head (S, Drude, wings) and `dipole_qsgw.h5` both read $U^\dagger v\,U$
-of that object ([QSGW dipoles](#interband-commutator-head)). The one-shot and
+of that object ([QSGW dipoles](#qsgw-dipoles)). The one-shot and
 fixed DFT head (`build_dft_head_response`) reads it at $\Delta H = 0$,
 $U = I$. On `bispinor_gw = full_shared_pole` the four-current bank's direct
 Γ head (`response_bank.compute_photon_bank`) takes this map's object on

@@ -1097,9 +1097,9 @@ _DEFAULTS = {
     # every historical deck and makes a missing/stale artifact a refusal.
     # ``dft_velocity`` runs the same head chain on the artifact's exact DFT
     # p-matrix velocity stage only, without the links.
-    # ``interband_commutator`` (insulators) adds [DeltaH, W] to that
-    # velocity, W_ml = v_ml/(E_m - E_l): no links, any k grid.
-    "sc_head_update": "off",       # off | parallel_transport | dft_velocity | interband_commutator; unnamed -> parallel_transport where links exist (_apply_input_envelope)
+    # ``interband_commutator`` is retired and refuses by name
+    # (_RETIRED_SC_HEAD_UPDATES).
+    "sc_head_update": "off",       # off | parallel_transport | dft_velocity; unnamed -> parallel_transport where links exist (_apply_input_envelope)
     "parallel_transport_file": "parallel_transport.h5",
     # Optional Hall (Chern-Simons) artifact for the packed static photon
     # Gamma-cell completion.  EMPTY BY DEFAULT (lane J section 2, item 9):
@@ -3825,20 +3825,6 @@ def refuse_unsupported_bispinor_gw(config) -> None:
                 "bank has a direct Gamma head under "
                 "head_correction=no_local_fields; full wing/body folding is "
                 "unavailable")
-        if (config.qp_solver is QPSolver.SELF_CONSISTENT
-                and config.sc.head_update not in PHOTON_DIRECT_HEAD_UPDATES):
-            raise ValueError(
-                "GATE full_shared_pole_head_update: the four-current direct "
-                "Gamma head has three SC modes.\n"
-                f"  got:  sc_head_update = {config.sc.head_update}\n"
-                "  want: parallel_transport (the map's QSGW velocity "
-                "v_DFT + D_k DeltaH from the links), dft_velocity (the "
-                "QP-rotated dipole velocity) or off (the DFT head, rebuilt "
-                "at each map's frequencies)\n"
-                "  why:  the interband-commutator velocity is defined only "
-                "across a gap and has no four-current consumer\n"
-                "  doc:  docs/architecture/four_current_wiring.md, "
-                "'Self-consistency and restart'.")
         return
     if not bool(config.bispinor):
         raise ValueError(
@@ -4391,24 +4377,22 @@ class MPAConfig:
 
 
 #: The ``sc_head_update`` values that rebuild the q->0 head every QSGW
-#: iteration. The metal direct-only exception is narrowed below. One
-#: tuple, so the vocabulary, the mandatory-metal rule and the driver's
-#: dispatch cannot disagree about what "a metal head mode" is.
-METAL_HEAD_UPDATES = ("parallel_transport", "dft_velocity")
+#: iteration, on insulators and metals, scalar and four-current
+#: (``bispinor_gw = full_shared_pole``): ``parallel_transport`` with the
+#: map's QSGW velocity (``qsgw_head.qp_velocity``), ``dft_velocity`` with the
+#: QP-rotated DFT velocity.  ``off`` keeps the DFT head.  The metal
+#: direct-only exception is narrowed below.  One tuple, so the vocabulary,
+#: the mandatory-metal rule and the driver's dispatch cannot disagree.
+HEAD_UPDATES = ("parallel_transport", "dft_velocity")
 
-#: Head rebuilds that are defined only across a gap.  ``interband_commutator``
-#: forms the QSGW velocity from interband position elements alone and has no
-#: intraband (Drude) term; ``validate_material_inputs`` refuses it on a metal.
-INSULATOR_HEAD_UPDATES = ("interband_commutator",)
-
-#: Every ``sc_head_update`` value that rebuilds the head each map.
-HEAD_UPDATES = METAL_HEAD_UPDATES + INSULATOR_HEAD_UPDATES
-
-#: The SC head modes of the four-current direct Γ head
-#: (``bispinor_gw = full_shared_pole``): ``off`` builds it on the DFT state,
-#: ``dft_velocity`` on each map's state with the QP-rotated velocity, and
-#: ``parallel_transport`` with the map's QSGW velocity (``qsgw_head.qp_velocity``).
-PHOTON_DIRECT_HEAD_UPDATES = ("off", "dft_velocity", "parallel_transport")
+#: Retired ``sc_head_update`` values: {value: why}.
+_RETIRED_SC_HEAD_UPDATES: dict[str, str] = {
+    "interband_commutator": (
+        "the link-free [DeltaH, W] velocity (cross-gap position elements "
+        "only, insulators only) was deleted 2026-09-30: parallel_transport "
+        "serves the Sigma term v = p + i[r, V_NL + Sigma] from the links "
+        "on every k grid, coarse ones included, on insulators and metals."),
+}
 
 
 def uses_metal_direct_drude_head(config) -> bool:
@@ -4430,7 +4414,7 @@ def uses_metal_direct_drude_head(config) -> bool:
     bank takes that velocity from the SC (``photon_head_state``).
     """
     if not (config.qp_solver is QPSolver.SELF_CONSISTENT
-            and config.sc.head_update in METAL_HEAD_UPDATES
+            and config.sc.head_update in HEAD_UPDATES
             and config.sigma.w_model == "shared_pole"):
         return False
     if config.sc.head_update == "parallel_transport":
@@ -4458,11 +4442,9 @@ class SCConfig:
     #: its DFT-basis block stays DFT and it reads Sigma at E_DFT (mixing kept).
     semicore: str = "dft"
     eigh: str = "auto"    # "auto" | "native" | "distributed"
-    #: "off" | "parallel_transport" | "dft_velocity" | "interband_commutator".
-    #: Every non-off mode rebuilds the head. Only ``dft_velocity`` with an
-    #: ordered shared-pole direct head is admitted on a metal; see
-    #: ``uses_metal_direct_drude_head``.  ``interband_commutator`` is
-    #: insulator-only.
+    #: "off" | "parallel_transport" | "dft_velocity".  Every non-off mode
+    #: rebuilds the head; a metal admits them on the shared-pole direct
+    #: head, see ``uses_metal_direct_drude_head``.
     head_update: str = "off"
     #: Explicit seed-only ``qp_wfn_rotations.h5`` for a new SC run.  Empty
     #: means the canonical diagonal DFT seed.  This is not nonlinear restart.
@@ -4517,6 +4499,13 @@ class SCConfig:
             raise ValueError(
                 f"sc_eigh must be 'auto', 'native' or 'distributed'; "
                 f"got {self.eigh!r}.")
+        if self.head_update in _RETIRED_SC_HEAD_UPDATES:
+            raise ValueError(
+                f"sc_head_update = {self.head_update} is retired: "
+                f"{_RETIRED_SC_HEAD_UPDATES[self.head_update]}  "
+                "Set sc_head_update = parallel_transport (rerun the dipole "
+                "step, get_dipole_mtxels, if parallel_transport_file is "
+                "missing), or leave the key out.")
         if self.head_update not in ("off",) + HEAD_UPDATES:
             raise ValueError(
                 "sc_head_update must be 'off', "
@@ -4663,23 +4652,7 @@ def validate_material_inputs(config, material_class):
                 f"identify a metal, but compute_mode={config.compute_mode.value}; "
                 "use compute_mode=mpa for screened GW or "
                 "compute_mode=x_only for bare exchange.")
-        if config.sc.head_update in INSULATOR_HEAD_UPDATES:
-            raise ValueError(
-                "GATE sc_head_interband_commutator_insulator_only: WFN "
-                "occupations identify a metal, and sc_head_update = "
-                f"{config.sc.head_update} is defined only across a gap.\n"
-                "  got:  fractional occupations with the interband-commutator "
-                "head\n"
-                "  want: an insulator, or sc_head_update = off / "
-                "dft_velocity / parallel_transport (shared_pole direct "
-                "Drude head) on a metal\n"
-                "  why:  the route builds the QSGW velocity from interband "
-                "position elements r_ml = -i v_ml/(E_m - E_l) only; the "
-                "intraband change d_k DeltaH_nn that the Fermi-surface "
-                "(Drude) term needs has no stencil-free form\n"
-                "  doc:  docs/self_consistency.md, 'Interband-commutator "
-                "head'")
-        if (config.sc.head_update in METAL_HEAD_UPDATES
+        if (config.sc.head_update in HEAD_UPDATES
                 and not uses_metal_direct_drude_head(config)):
             raise ValueError(
                 "GATE metal_sc_head_update_disabled: WFN occupations identify "
@@ -4937,11 +4910,11 @@ class LorraxConfig:
             raise ValueError(
                 "occ_broadening > 0 is currently implemented only for "
                 "qp_solver=self_consistent.")
-        if self.sc.head_update not in METAL_HEAD_UPDATES:
+        if self.sc.head_update not in HEAD_UPDATES:
             raise ValueError(
                 "occ_broadening > 0 currently updates only the QSGW head; "
                 "set sc_head_update to one of "
-                + ", ".join(METAL_HEAD_UPDATES)
+                + ", ".join(HEAD_UPDATES)
                 + ". A metal takes its width from "
                 "occ_smearing_width_ry alone.")
         # Any accelerator is legal on metallic decks since the ENTRY-solve

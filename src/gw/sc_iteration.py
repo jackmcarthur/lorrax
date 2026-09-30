@@ -3788,7 +3788,6 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
         from .qsgw_head import finalize_iteration_head_samples
     if pt is not None:
         from .qsgw_head import (
-            InterbandCommutatorHeadData,
             assemble_delta_head_manifold,
             build_iteration_head_response,
             qp_velocity,
@@ -3814,9 +3813,6 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
                 mesh=inputs.mesh_xy, nb_logical=int(pt.nb_logical),
                 nb_links=int(getattr(pt, "nb_links", 0) or pt.nb_logical))
         head_velocity_dft = pt.velocity_dft_cart
-        if isinstance(pt, InterbandCommutatorHeadData):
-            head_velocity_dft = _interband_commutator_head_velocity(
-                inputs, state, ks, wfns_qp, U_full, pt, nb_storage)
 
         head_occ_kn = wfns_qp.occ[:, :nb_storage]
         head_efermi_ry = float(efermi_ry)
@@ -3847,9 +3843,6 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
             nb_links=int(getattr(pt, "nb_links", 0) or pt.nb_logical),
             link_error=(float(pt.validation["link_relative_error"])
                         if forward_links is not None else None),
-            velocity_base_cart=(pt.velocity_dft_cart
-                                if isinstance(pt, InterbandCommutatorHeadData)
-                                else None),
             link_unserved=getattr(pt, "link_unserved", None))
         # The dipole write reads only v and its label: the Sigma term and
         # v_DFT are not carried past this map's head.
@@ -3900,8 +3893,6 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
         )
         velocity_kind = (
             "QSGW finite-link covariant velocity" if forward_links is not None
-            else "QSGW interband-commutator velocity"
-            if isinstance(pt, InterbandCommutatorHeadData)
             else "QP-rotated DFT p-matrix velocity")
         if elementwise_mpa:
             # The fit-sample count comes from the RETURNED plan --
@@ -6400,57 +6391,6 @@ def _head_delta_h_parts(inputs, state, ks, wfns_qp, nb_storage):
     return H_active_full - h_dft_active, tail_diagonal
 
 
-def _interband_commutator_head_velocity(
-        inputs, state, ks, wfns_qp, U_full, pt, nb_storage):
-    """``sc_head_update = interband_commutator``: this map's DFT-basis velocity.
-
-    ``v + [DeltaH, W]`` (``qsgw_head.interband_commutator_velocity``), plus
-    one record line: the valence-conduction share of the correction per
-    axis, the largest cross-gap mixing ``max_k ||U_VC||_F`` (the head's
-    error is first order in it) and the direct DFT gap.  A closed gap
-    refuses (``GATE sc_head_interband_commutator_gap``).
-    """
-    from .qsgw_head import interband_commutator_velocity
-
-    n_occ = int(inputs.meta.nelec)
-    delta_active, tail_diagonal = _head_delta_h_parts(
-        inputs, state, ks, wfns_qp, nb_storage)
-    velocity, (num, den, excluded, min_kept) = interband_commutator_velocity(
-        pt.velocity_dft_cart, delta_active, tail_diagonal,
-        inputs.wfns_dft.enk[:, :nb_storage],
-        nb_logical=int(pt.nb_logical), n_occ=n_occ, mesh=inputs.mesh_xy,
-        collapsed_position=pt.collapsed_position,
-        collapsed_axes=pt.collapsed_axes,
-        reciprocal_lattice_cart=pt.reciprocal_lattice_cart)
-    na = int(U_full.shape[-1])
-    mixing = (float(jnp.max(jnp.sqrt(jnp.sum(
-        jnp.abs(U_full[:, :n_occ, n_occ:]) ** 2, axis=(1, 2)))))
-        if n_occ < na else 0.0)
-    if int(excluded) != 0:
-        raise ValueError(
-            "GATE sc_head_interband_commutator_gap: "
-            f"{int(excluded)} valence-conduction DFT pairs are degenerate "
-            "within gw.degen_average.TOL_DEGENERACY_RY.\n"
-            f"  got:  n_occ = {n_occ}; the direct DFT gap closes at some k\n"
-            "  want: E_c - E_v > 1e-6 Ry at every k of the head manifold\n"
-            "  why:  W_vc = v_vc/(E_v - E_c) is the cross-gap position "
-            "operator; a closed gap is a metal, which this head does not "
-            "describe\n"
-            "  doc:  docs/self_consistency.md, 'Interband-commutator head'")
-    ratio = np.sqrt(np.asarray(num) / np.maximum(np.asarray(den), 1e-300))
-    exact_axes = ",".join(f"b{a + 1}" for a in pt.collapsed_axes)
-    _record_sc(
-        inputs,
-        "    SC head: interband commutator |[dH,W]_vc|/|v_vc| x/y/z = "
-        + "/".join(f"{r:.4e}" for r in ratio)
-        + f"; cross-gap mixing theta = max_k|U_VC|_F = {mixing:.3e} "
-        "(periodic-axis head error O(theta), ~theta/4 in S_aa on MoS2)"
-        + (f"; collapsed axis {exact_axes} exact (position operator)"
-           if exact_axes else "")
-        + f"; direct DFT gap {float(min_kept) * 13.6056980659:.4f} eV")
-    return velocity
-
-
 def _refuse_unsupported_link_stencil(kgrid, *, where: str) -> None:
     """D3(c): per-axis stencil support, checked before ANY artifact read.
 
@@ -6619,12 +6559,6 @@ def load_head_velocity_source(
         shared-pole direct head reads the same authenticated operator from
         ``dipole.h5``. Neither route has a finite-link derivative of Delta H.
 
-    ``interband_commutator``
-        the same velocity stage, authenticated to carry i[V_NL, r], through
-        ``load_interband_commutator_head``; each map adds [Delta H, W]
-        (``qsgw_head.interband_commutator_velocity``).  Insulators only
-        (``gw_config.validate_material_inputs``).
-
     Returns None for ``off``, which preserves the fixed-DFT head exactly.
 
     THREE PREFLIGHT CHECKS run here, before the expensive per-iteration
@@ -6713,18 +6647,6 @@ def load_head_velocity_source(
             "the ΔH covariant velocity correction is OFF and the head runs "
             "on DFT velocities rotated into each iteration's QP basis "
             "(claim 0183 parks the covariant upgrade)")
-        return source
-
-    if mode == "interband_commutator":
-        from .qsgw_head import load_interband_commutator_head
-
-        source = load_interband_commutator_head(
-            pt_path, mesh=mesh, wfn=wfn, meta=meta, config=config)
-        print_fn(
-            "  SC head: interband commutator on the exact DFT velocity from "
-            f"{pt_path} (nb={source.nb_logical}); each map adds "
-            "[DeltaH, W], W_vc = v_vc/(E_v - E_c) across the gap only, "
-            "with no links and no k stencil (insulators)")
         return source
 
     # parallel_transport stays the head for the whole run (owner

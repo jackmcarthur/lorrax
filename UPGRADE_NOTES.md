@@ -3,6 +3,20 @@
 User-visible changes, newest first. Binding rulings behind the breaking
 changes live in `docs/architecture/decisions.md`.
 
+## 2026-09-30 — `sc_head_update = interband_commutator` is retired
+
+`sc_head_update = interband_commutator` refuses by name. Set
+`parallel_transport` (or leave the key out: it is the default where the link
+artifact exists), and rerun the dipole step if `parallel_transport.h5` is
+missing. The links now serve the Σ term of the velocity
+$p + i[r, V_{\rm NL} + \Sigma]$ on every k grid, so the link-free cross-gap
+form has no remaining role
+([self-consistency §1](docs/self_consistency.md#qsgw-dipoles)).
+Decks that named it move once. On record, coarse grids: MoS2 3×3 SOC
+converged gap 4.48 eV with `parallel_transport` (link error 9.2 %) against
+3.96 eV (and 5.17 eV with `dft_velocity`); Si 4³ SOC min direct gap 3.288 eV
+against 3.251 eV, first BSE peak +40 meV, ‖d_cv‖ 0.90 of the old value.
+
 ## 2026-09-30 — `parallel_transport`: the Σ term is served whenever the links are usable
 
 The `parallel_transport` head no longer sets its Σ term D_kΔH to zero on a map
