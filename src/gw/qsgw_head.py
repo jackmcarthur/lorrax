@@ -1436,6 +1436,50 @@ def write_qsgw_dipole(path, velocity: QPVelocity, U_active, energies_qp_kn_ry,
              f"{velocity.label})")
 
 
+def stamp_qsgw_dipole_provenance(path, *, wfn_qp_path, config, wfn, meta,
+                                  print_fn=print) -> None:
+    r"""Bind ``dipole_qsgw.h5`` to ``WFN_qp.h5`` with ``dipole.h5``'s stamps.
+
+    The file is ``U^\dagger v U`` between the states ``WFN_qp.h5`` stores,
+    so it is that WFN's velocity: the WFN identity stamped is WFN_qp's
+    fingerprint, and the window, V_NL mode and sign, representation and
+    DFT+U stamps are this deck's (:func:`head_dipole_operator_stamps`, the
+    set the SC head was authenticated against).  A GW run on WFN_qp with
+    the same deck then reads it as its ``dipole.h5`` through
+    :func:`read_authenticated_dipole_velocity`; any other WFN refuses it by
+    fingerprint.  The Sigma term stays named by the ``velocity`` stamp.
+    Rank-0 write; call once ``WFN_qp.h5`` is published.  COLLECTIVE.
+    """
+    from common.collectives import rank0_transaction
+    from psp.get_dipole_mtxels import dipole_provenance
+
+    if int(meta.b_id_0) != 0:
+        print_fn(f"  QSGW dipoles: {os.path.basename(str(path))} not bound "
+                 f"to WFN_qp (head bands start at {int(meta.b_id_0)}, the "
+                 "dipole reader indexes bands from 0)")
+        return
+    stamps = head_dipole_operator_stamps(
+        config, wfn=wfn, meta=meta,
+        fallback_dir=os.path.dirname(os.path.abspath(str(path))))
+
+    def _stamp():
+        import h5py
+        from wfn_loader import WfnLoader
+        with h5py.File(str(path), "r+") as h5:
+            nb_written = int(h5.attrs["nbands"])
+            wfn_qp = WfnLoader(str(wfn_qp_path))
+            for key, value in dipole_provenance(
+                    wfn=wfn_qp, wfn_path=str(wfn_qp_path),
+                    nb_written=nb_written, nspinor=int(wfn_qp.nspinor),
+                    **stamps).items():
+                h5.attrs[key] = value
+
+    rank0_transaction(path, stage="qsgw_dipole_provenance", write=_stamp)
+    print_fn(f"  QSGW dipoles: {os.path.basename(str(path))} bound to "
+             f"{os.path.basename(str(wfn_qp_path))} (dipole.h5 provenance "
+             "stamps; a GW run on WFN_qp reads it as its dipole.h5)")
+
+
 def _assemble_kernel(mesh: Mesh, nb_storage: int) -> Callable:
     key = ("assemble_head_manifold", id(mesh), int(nb_storage))
     hit = _KERNEL_CACHE.get(key)
@@ -3948,6 +3992,31 @@ def expected_hubbard_stamp(config, *, wfn, fallback_dir, caller) -> str:
         caller=caller)
 
 
+def head_dipole_operator_stamps(config, *, wfn, meta, fallback_dir) -> dict:
+    """The dipole stamps this deck's head needs, in ``check_dipole_provenance``'s keywords.
+
+    One resolver for the head reader and for the SC's ``dipole_qsgw.h5``
+    stamp (:func:`stamp_qsgw_dipole_provenance`): the window, the full
+    analytic ``p + i[r, V_NL]`` operator with the resolved V_NL sign, the
+    head representation and the DFT+U stamp.
+    """
+    from psp.get_dipole_mtxels import resolve_vnl_velocity_sign
+    from common.four_current_model import resolve_four_current_representation
+    representation = resolve_four_current_representation(
+        bool(getattr(config, "bispinor", int(meta.nspinor) == 4)),
+        getattr(config, "bispinor_gw", "bare_transverse"))
+    return dict(
+        nval=int(config.nval), ncond=int(config.ncond),
+        nband=int(config.nband),
+        bispinor=representation.scalar_head_bispinor,
+        skip_vnl=False, vnl_mode="analytic",
+        vnl_velocity_sign=resolve_vnl_velocity_sign(
+            None, config.vnl_velocity_sign),
+        hubbard=expected_hubbard_stamp(
+            config, wfn=wfn, fallback_dir=fallback_dir,
+            caller="dft head dipole velocity"))
+
+
 def read_authenticated_dipole_velocity(
     dipole_path, *, wfn, meta, config, mesh: Mesh, wfn_fingerprint_binding=None,
 ):
@@ -3963,33 +4032,16 @@ def read_authenticated_dipole_velocity(
     # a kinetic-balance four-spinor dipole have the same (3,nk,nb,nb) shape.
     # The producer owns both the stamp grammar and sign resolution; consume
     # those owners directly rather than mirroring either convention here.
-    from psp.get_dipole_mtxels import (
-        resolve_vnl_velocity_sign,
-    )
     from file_io.restart_bundle import (
         check_dipole_provenance,
     )
-    expected_vnl_sign = resolve_vnl_velocity_sign(
-        None, config.vnl_velocity_sign)
-    expected_hubbard = expected_hubbard_stamp(
-        config, wfn=wfn, fallback_dir=os.path.dirname(os.path.abspath(dipole_path)),
-        caller="dft head dipole velocity")
-    from common.four_current_model import resolve_four_current_representation
-    representation = resolve_four_current_representation(
-        bool(getattr(config, "bispinor", int(meta.nspinor) == 4)),
-        getattr(config, "bispinor_gw", "bare_transverse"))
     if not check_dipole_provenance(
             dipole_path,
             wfn=wfn,
-            nval=int(config.nval),
-            ncond=int(config.ncond),
-            nband=int(config.nband),
-            bispinor=representation.scalar_head_bispinor,
-            skip_vnl=False,
-            vnl_mode="analytic",
-            vnl_velocity_sign=expected_vnl_sign,
             wfn_fingerprint_binding=wfn_fingerprint_binding,
-            hubbard=expected_hubbard):
+            **head_dipole_operator_stamps(
+                config, wfn=wfn, meta=meta,
+                fallback_dir=os.path.dirname(os.path.abspath(dipole_path)))):
         raise ValueError(
             "GATE dft_head_dipole_provenance: the full head received an "
             "unauthenticated dipole artifact.\n"
@@ -4062,21 +4114,26 @@ def build_dft_head_response(
                  (float(occupation_state.mu_ry), occupation_state.occ_hash))
     parts = None if frozen_parts is None else frozen_parts.get(parts_key)
     dipole_path = os.path.join(input_dir, "dipole.h5")
-    if parts is None:
-        if not os.path.exists(dipole_path):
-            raise FileNotFoundError(
-                "head_correction=full requires dipole.h5 to build the direct "
-                f"head and wings; missing {dipole_path}.")
-        velocity_cart = read_authenticated_dipole_velocity(
-            dipole_path, wfn=wfn, meta=meta, config=config, mesh=mesh,
-            wfn_fingerprint_binding=wfn_fingerprint_binding)
-    else:
-        velocity_cart = parts["velocity_cart"]
     b0 = int(meta.b_id_0)
     b4 = int(meta.b_id_4_chi_user)
     nb_logical = b4 - b0
     energies = jnp.asarray(wfns.enk[:, :nb_logical])
     occupations = jnp.asarray(wfns.occ[:, :nb_logical])
+    if parts is None:
+        if not os.path.exists(dipole_path):
+            raise FileNotFoundError(
+                "head_correction=full requires dipole.h5 to build the direct "
+                f"head and wings; missing {dipole_path}.")
+        # The one velocity owner at DeltaH = 0 and U = I: v_DFT, no Sigma
+        # term (the SC dft_velocity head on the DFT states).  Held on the
+        # host, as the frozen part it is.
+        velocity_cart = np.asarray(qp_velocity(
+            read_authenticated_dipole_velocity(
+                dipole_path, wfn=wfn, meta=meta, config=config, mesh=mesh,
+                wfn_fingerprint_binding=wfn_fingerprint_binding),
+            occupations, mesh=mesh, nb_logical=nb_logical).dft_cart)
+    else:
+        velocity_cart = parts["velocity_cart"]
     if velocity_cart.shape[1:] != (
             int(meta.nk_tot), nb_logical, nb_logical):
         raise ValueError(

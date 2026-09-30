@@ -7141,12 +7141,14 @@ def run_sc_driver(
         # owns the large pre-unfold W wedge, so the final-map owner must tear
         # it down explicitly before post-SC artifacts are built.
         take_pre_unfold("W0_qmunu")
+    qsgw_dipole_path = None
     if screening.qsgw_velocity is not None:
         from .qsgw_head import QSGW_DIPOLE_FILE, write_qsgw_dipole
         v_qsgw, U_qsgw, e_qsgw, nb_qsgw = screening.qsgw_velocity
+        qsgw_dipole_path = os.path.join(input_dir, QSGW_DIPOLE_FILE)
         with timing.section("sc.write_qsgw_dipole"):
             write_qsgw_dipole(
-                os.path.join(input_dir, QSGW_DIPOLE_FILE), v_qsgw, U_qsgw,
+                qsgw_dipole_path, v_qsgw, U_qsgw,
                 e_qsgw, nb_logical=nb_qsgw, mesh=mesh_xy, print_fn=print_fn)
         del v_qsgw, U_qsgw, e_qsgw
     # W0 is the only large object in the final-map payload.  Drop it before
@@ -7189,6 +7191,13 @@ def run_sc_driver(
         clamp_tol=float(config.occupation_clamp_tol),
     )
     rotations_written = True
+    if qsgw_dipole_path is not None and bool(config.debug.write_wfn_h5):
+        # dipole_qsgw.h5 is WFN_qp's velocity: stamp it so a GW run on
+        # WFN_qp authenticates it as its dipole.h5.
+        from .qsgw_head import stamp_qsgw_dipole_provenance
+        stamp_qsgw_dipole_provenance(
+            qsgw_dipole_path, wfn_qp_path=os.path.join(input_dir, "WFN_qp.h5"),
+            config=config, wfn=wfn, meta=meta, print_fn=print_fn)
     # THE SC EIGENVALUES: the accepted map's output, as its eqp snapshot
     # wrote them.  The driver's generic writer writes no eqp pair for SC, and
     # the gap report reads this same array.

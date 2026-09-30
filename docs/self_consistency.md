@@ -132,6 +132,13 @@ form equals the DFT one, and the whole QSGW change of $|d|^2$ is the mixing
 $U$ (the velocity form scales by the QP-to-DFT transition-energy ratio). A
 BSE on the self-consistent restart uses its DFT parent $\psi$ with `--eqp`
 energies, so it takes these dipoles at the same diagonal approximation.
+When the run also writes `WFN_qp.h5`, the file carries the `dipole.h5`
+provenance stamps bound to that WFN (`qsgw_head.stamp_qsgw_dipole_provenance`):
+the WFN_qp fingerprint and this deck's window, V_NL mode and sign,
+representation and DFT+U stamps (`qsgw_head.head_dipole_operator_stamps`, the
+set the head reader checks). A GW run on `WFN_qp.h5` with the same deck then
+reads it as its `dipole.h5` and builds its head on the SC velocity; any other
+WFN refuses it by fingerprint.
 
 ## 2 Band treatment
 
@@ -591,7 +598,10 @@ One owner forms the SC velocity on every map: `qsgw_head.qp_velocity` returns
 $v = v_{DFT}$ plus this map's Σ term ($D_k\Delta H$ on `parallel_transport`,
 $[\Delta H, W]$ on `interband_commutator`, none on `dft_velocity` or a zeroed
 map). The head (S, Drude, wings) and `dipole_qsgw.h5` both read $U^\dagger v\,U$
-of that object ([QSGW dipoles](#interband-commutator-head)).
+of that object ([QSGW dipoles](#interband-commutator-head)). The one-shot and
+fixed DFT head (`build_dft_head_response`) reads it at $\Delta H = 0$,
+$U = I$. The four-current direct photon head still reads `dipole.h5` itself
+(`response_bank`), rotated by $U$ on `dft_velocity`.
 
 | status on a metal | what | where |
 |---|---|---|
