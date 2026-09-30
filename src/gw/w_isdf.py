@@ -222,11 +222,16 @@ def photon_response_passes(ledger, mesh_xy, families, *, n_parent, nk, n_out, q_
                            face_bytes):
     """Row passes per family pair of the direct photon stream, from the ledger: 1 when it fits.
 
-    A pair's per-rank door phase holds its four quadrant parent Greens (and
-    their builds, about half again) beside its channel planes and one plane's
-    transform; the planes and the transform divide over the row passes.  The
-    carry (``n_out`` members over ``q_count`` rows) and the faces stay.  Only
-    ``memory_per_device_gb`` and the shapes enter (``CapacityLedger``).
+    A pair's per-rank door phase holds its four quadrant parent Greens, their
+    builds' band panels and face copies (priced as the parents again) beside
+    its channel planes and one plane's transform (priced at 1.5x: the
+    neighbouring pairs' buffers overlap in the compiled schedule); all of them
+    divide over the orbit-cut row passes, whose total GEMM flops do not
+    change.  The carry (``n_out`` members over ``q_count`` rows) and the
+    faces stay.  Calibrated on the P36-local AOT (runs/DEV/673_photonresp_20260930/
+    aot/i): Fe 20^3 at M_T 900 prices 2 passes on every pair, 64.7 GB/rank
+    compiled.  Only ``memory_per_device_gb`` and the shapes enter
+    (``CapacityLedger``).
     """
     from .photon_layout import FAMILY_PAIRS, family_channels
     if _TEST_PHOTON_PASSES is not None:
@@ -246,7 +251,7 @@ def photon_response_passes(ledger, mesh_xy, families, *, n_parent, nk, n_out, q_
         local_rows = cl // int(families.layout.mesh_side)
         # Parents, their builds and the planes all divide over the row passes.
         count = next((p for p in range(1, local_rows + 1)
-                      if -(-(3 * parents // 2 + planes) // p) <= room), local_rows)
+                      if -(-(2 * parents + 3 * planes // 2) // p) <= room), local_rows)
         passes.append(count)
     return tuple(passes)
 
