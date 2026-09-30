@@ -591,6 +591,33 @@ def _kinetic_velocity(psi_G, *, geom, gtab_file, wfn, sym):
         kvecs=np.asarray(gtab_file.kvecs)))
 
 
+def _complete_parallel_transport(args, pt_path, **kwargs):
+    """The link stage; a DEFAULTED artifact that cannot complete is dropped.
+
+    An explicitly requested artifact refuses as before.  The default one
+    (``args.parallel_transport_defaulted``) was written under
+    ``parallel_transport.h5.partial``: on success it is renamed to
+    ``parallel_transport.h5``; a ``ValueError`` of the link stage (a
+    deterministic table or stencil refusal, raised on every rank) removes it,
+    says why, and the dipole step continues.
+    """
+    import os
+    if not getattr(args, "parallel_transport_defaulted", False):
+        complete_parallel_transport(pt_path, **kwargs)
+        return
+    final = Path(str(pt_path)[:-len(".partial")])
+    try:
+        complete_parallel_transport(pt_path, **kwargs)
+    except ValueError as exc:
+        if jax.process_index() == 0:
+            os.remove(pt_path)
+        kwargs["report"].emit(f"parallel-transport artifact: not written ({exc})")
+        print(f"  parallel-transport artifact: not written ({exc})", flush=True)
+        return
+    if jax.process_index() == 0:
+        os.replace(pt_path, final)
+
+
 def _parallel_transport_outer_bands(args, wfn, head_nbands, parser):
     """``(sweep extent, head extent)``: the outer set when links are written.
 
@@ -878,8 +905,11 @@ def parse_args(argv=None):
 		         or args.with_finite_q or args.skip_vnl)
 		and args.vnl_mode == "analytic")
 	if args.parallel_transport_defaulted:
+		# Written under a partial name and renamed once its links complete
+		# (_complete_parallel_transport), so a failed default link stage
+		# leaves no artifact for the SC default to pick up.
 		args.parallel_transport_out = str(
-			Path(args.out).resolve().with_name("parallel_transport.h5"))
+			Path(args.out).resolve().with_name("parallel_transport.h5.partial"))
 	if args.parallel_transport_velocity_only and args.parallel_transport_out is None:
 		parser.error(
 			"--parallel-transport-velocity-only requires "
@@ -1505,8 +1535,8 @@ def main(argv=None):
 			if pt_path is not None:
 				# ψ is dead here (the velocity keeps its 1/P shard for
 				# dipole.h5), so the link stream never holds both.
-				complete_parallel_transport(
-					pt_path, wfn=wfn, sym=sym, mesh=RUNTIME.mesh, nbands=nb,
+				_complete_parallel_transport(
+					args, pt_path, wfn=wfn, sym=sym, mesh=RUNTIME.mesh, nbands=nb,
 					bispinor=bispinor,
 					rcond=float(args.parallel_transport_rcond),
 					velocity_only=bool(args.parallel_transport_velocity_only),
