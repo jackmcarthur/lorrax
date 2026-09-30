@@ -63,12 +63,12 @@ shared_real_pole_v1_r3b = {
 # and version. Composite checks retain their individual dimensional thresholds.
 _GATE_ROWS = {
     "normalized_gram_keep": ("retain gamma/gamma_max strictly above cut", 1.0e-8),
-    "normalized_gram_validity": ("gamma_min/gamma_max >= threshold; the ordered route, the sector CT round, the paired H_r and direct unit calls (the even parent Gram uses gram_rounding_validity)", -1.0e-7),
+    "normalized_gram_validity": ("gamma_min/gamma_max >= threshold; every route (the even parent Gram takes the larger of this and gram_rounding_validity)", -1.0e-7),
     # The exact Gram is PSD, so a negative computed eigenvalue is rounding.
     # Weyl: gamma_min >= -||E||_2 >= -gamma_n ||D^-1/2 Sigma D^-1/2||_F with
     # Sigma the uncancelled magnitude of each divided-difference entry
     # (shared_pole_reduction.gram_rounding_floor), plus R u gamma_max for the solver.
-    "gram_rounding_validity": ("equilibrated gamma_min >= -(bound_factor * gamma_n ||D^-1/2 Sigma D^-1/2||_F + R u gamma_max); gamma_n = n u/(1-n u), Sigma the uncancelled divided-difference magnitudes",
+    "gram_rounding_validity": ("even route: equilibrated gamma_min >= -max(-normalized_gram_validity * gamma_max, bound_factor * gamma_n ||D^-1/2 Sigma D^-1/2||_F + R u gamma_max); gamma_n = n u/(1-n u), Sigma the uncancelled divided-difference magnitudes; sample error not bounded",
                                {"bound_factor": 1.0, "unit_roundoff": 2.0 ** -53}),
     "zero_ritz_policy": ("drop lambda <= cutoff only within factor-weight budget",
                          {"lambda_cutoff_ry2": 1.0e-6, "max_dropped_weight_fraction": 1.0e-6}),

@@ -140,19 +140,21 @@ def _within_budget(gamma, budget):
 def _validity_floor(scale, rounding, output_norm, largest, *, gates):
     """Absolute floor [b] on the equilibrated Gram's smallest eigenvalue.
 
-    With the support geometry (``rounding``) the floor is the propagated
-    float64 bound of ``gram_rounding_floor`` plus the eigensolver's
-    R u gamma_max (gate row ``gram_rounding_validity``); without it (the
-    ordered route and direct unit calls), the fixed relative row
-    ``normalized_gram_validity``. The ordered H'_vv bound of 452596180 read
-    1.6e-14 against a -7.4e-13 computed minimum on the magnetic hsuite
-    fixture, so it is not a floor there and is not used.
+    Every route has the fixed relative row ``normalized_gram_validity``. With
+    the support geometry (``rounding``, the even route) the floor is the larger
+    of that and the propagated float64 bound of ``gram_rounding_floor`` plus
+    the eigensolver's R u gamma_max (gate row ``gram_rounding_validity``).
+    The bound covers forming G from the samples, not the samples' own error:
+    it read 8e-13 against a -8.7e-10 computed minimum on the hsuite Na SC
+    stage, which the fixed row admits.
     """
+    fixed = -gates["normalized_gram_validity"]["threshold"] * jnp.maximum(largest, 0)
     if rounding is None:
-        return -gates["normalized_gram_validity"]["threshold"] * jnp.maximum(largest, 0)
+        return fixed
     bound = gram_rounding_floor(scale, rounding, output_norm, finite=int(rounding["points"].shape[-1]))
     factor = float(gates["gram_rounding_validity"]["threshold"]["bound_factor"])
-    return factor * bound + scale.shape[-1] * _UNIT_ROUNDOFF * jnp.maximum(largest, 0)
+    # The larger of the fixed floor and the computed float64 bound; sample error is not bounded (future work).
+    return jnp.maximum(fixed, factor * bound + scale.shape[-1] * _UNIT_ROUNDOFF * jnp.maximum(largest, 0))
 
 
 def reduce_shared_pole_pencil(pencil, active_columns, *, eigh, matmul, gates, keep_budget=None,
