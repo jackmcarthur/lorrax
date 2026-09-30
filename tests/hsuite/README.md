@@ -85,9 +85,10 @@ Not covered:
   (`GATE gn_ppm_fit_capacity` at 0.05 GB);
 - the `parallel_transport` head itself: the 3³ Na links fail the window
   gate, so the unnamed default runs `dft_velocity`;
-- the W line-site re-plan: it fires at Na map 2, where the re-planned W
-  refuses at `GATE shared_pole_gram_valid` (q = 0 Gram −1.9e-6 against
-  −1e-7), so `na_sc` stops after map 1;
+- the W line-site re-plan: it first fires at Na map 2 (and runs there,
+  with every multiplet degenerate), but `na_sc` converges at its 1.5 eV
+  criterion after map 1, and the two more maps a tighter criterion needs
+  would take the suite past its wall budget;
 - the bispinor charge route (`bare_transverse`), `full_static_cohsex`,
   and the 2-D slab head.
 
