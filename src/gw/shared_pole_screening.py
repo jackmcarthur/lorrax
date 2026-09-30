@@ -308,9 +308,24 @@ _RESIDENT_MODEL: list = []
 
 
 def release_resident_model():
-    """Release the latest SC map's device-resident scalar model, if any."""
+    """Release the latest SC map's device-resident scalar or CC sector model, if any."""
     while _RESIDENT_MODEL:
         _RESIDENT_MODEL.pop().release()
+
+
+def hold_resident_model(model, meta, nbytes, *, stage):
+    """Keep an SC map's resident CC sector model live, as the scalar model is.
+
+    ``mpa.sector_sigma.compute_sector_sigma`` releases TT and CT after Sigma
+    and hands CC here: the accepted final map's W0 persist reads it
+    (``mpa.sector_sigma.sector_static_wc``).  Its ``nbytes`` stay reserved
+    as ``stage``; :func:`release_resident_model` releases it.
+    """
+    ledger = meta.shared_pole_capacity
+    ledger.reserve(stage, resident_bytes_per_rank=int(nbytes),
+                   workspace_bytes_per_rank=0, concurrent_with=ledger.live_stages)
+    ledger.live_stages = (*ledger.live_stages, stage)
+    _RESIDENT_MODEL.append(model)
 
 
 def _scalar_model_residence(meta, nq, width, *, mesh_xy, root, identity):
@@ -625,6 +640,9 @@ def screen_shared_poles(wfns, V_q, meta, config, *, mesh_xy, sym,
         if not photon and models.get("stage"):
             # Sigma and the final-map W0 persist read it; the next map releases it.
             handle["model_stage"] = models["stage"]
+        if photon and sc_scratch and handle.get("model_stage"):
+            # Sigma releases TT and CT; CC stays for the final-map W0 persist.
+            handle["hold_charge_model"] = True
         # Device-resident sector models stay live until Sigma releases them.
         ledger.live_stages = (handle['model_stage'],) if handle.get('model_stage') else ()
         result = dict(shared_pole=handle)

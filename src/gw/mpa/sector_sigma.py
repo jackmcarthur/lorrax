@@ -84,15 +84,16 @@ def _zeros(mesh_xy, shape):
 
 
 @lru_cache(maxsize=None)
-def _w_contraction(mesh_xy, grid, nk, mc, nt_n, kcarrier, layout):
+def _w_contraction(mesh_xy, grid, nk, mc, nt_n, kcarrier, layout, weights_fn):
     """W(t) = B_A d(t) B_B^T on the full-q grid; the valence branch reads -q.
 
     ``(nk, m*nc, n*nt)`` from ``(x, y, omega, interval, ref, time, hole)``
-    with ``hole`` static.  One GEMM plan per configuration.
+    with ``hole`` static.  One GEMM plan per configuration.  ``weights_fn``
+    is d: the causal d(t) for Sigma, the omega = 0 coefficient for W0.
     """
     from distrib_la import gemm_plan
     from symmetry_maps import q_negation_index
-    from .sigma import _shared_pole_weights, _shared_pole_contract
+    from .sigma import _shared_pole_contract
     gemm = gemm_plan(mesh_xy, m=mc, n=nt_n, k=kcarrier, nq=nk,
                      dtype=np.complex128, layout=layout)
     minus = jnp.asarray(q_negation_index(grid))
@@ -104,7 +105,7 @@ def _w_contraction(mesh_xy, grid, nk, mc, nt_n, kcarrier, layout):
             y = jnp.conj(jnp.take(y, minus, axis=0))
             omega = jnp.take(omega, minus, axis=0)
             interval = jnp.take(interval, minus, axis=0)
-        weights = _shared_pole_weights(omega, interval, ref, time)
+        weights = weights_fn(omega, interval, ref, time)
         return _shared_pole_contract(x, y, weights, gemm=gemm, layout=layout)
     return kernel
 
@@ -203,17 +204,22 @@ def _endpoint_route(header, basis, sym, span, rows, mesh_xy, axis, width):
     return _endpoint_unfold(kwargs), cost
 
 
-def sector_synthesis(readers, headers, bases, families, frequencies, meta, mesh_xy):
+def sector_synthesis(readers, headers, bases, syms, layout, frequencies, meta, mesh_xy,
+                     *, weights_fn=None, stage='sigma'):
     """Retain full-q endpoint factors and form one W(t) tile per tau.
 
     The store and symmetry services are called once at setup.  The factors
     are placed once, with pole columns replicated (axis orientation) whenever
     the capacity ledger admits it, so each tau is a local GEMM; otherwise the
-    configured face placement is kept.
+    configured ``layout`` (the endpoint families' Green layout) is kept.
+    ``syms`` are the endpoint families' symmetry maps (a current endpoint's
+    Cartesian action; a charge endpoint reads none).  ``weights_fn`` is d:
+    the causal d(t) by default, the omega = 0 coefficient for
+    :func:`sector_static_wc`, whose ledger stages ``stage`` prefixes.
     Occupied windows use conj(B_A(-q)) d(t) B_B(-q)^T; d is never conjugated.
     """
     from file_io.shared_pole_store import read_shared_pole_faces
-    from .sigma import _shared_pole_factor_specs
+    from .sigma import _shared_pole_factor_specs, _shared_pole_weights
     from .sigma_windows import shared_pole_intervals
 
     left,right=headers
@@ -223,9 +229,6 @@ def sector_synthesis(readers, headers, bases, families, frequencies, meta, mesh_
     kmax=int(left['Kmax'])
     if any(left[k]!=right[k] for k in ('K','Kmax','q_irr_full_idx','identity')):
         raise ValueError('GATE shared_pole_sector_census: endpoint identities differ')
-    layout=families[0].layout
-    if layout!=families[1].layout:
-        raise ValueError('GATE shared_pole_sectors: endpoint wavefunction layouts differ')
     capacity=meta.shared_pole_capacity
     ambient=capacity.live_stages
     tag=f'{left.get("sector")}.{right.get("sector")}'
@@ -242,9 +245,8 @@ def sector_synthesis(readers, headers, bases, families, frequencies, meta, mesh_
         (P(None,'x',None,'y'),3),(P(None,'y',None,'x'),3))).carrier
     rows=np.arange(nk,dtype=np.int32)
     routes=[];costs=[]
-    for h,b,f,axis in zip(headers,bases,families,('x','y')):
-        route,cost=_endpoint_route(h,b,f.green_parent.plan.sym,(0,nq),rows,
-                                   mesh_xy,axis,kcarrier)
+    for h,b,sym,axis in zip(headers,bases,syms,('x','y')):
+        route,cost=_endpoint_route(h,b,sym,(0,nq),rows,mesh_xy,axis,kcarrier)
         routes.append(route);costs.append(cost)
     def place(value,spec):
         return _placer(mesh_xy,spec)(value)
@@ -275,8 +277,8 @@ def sector_synthesis(readers, headers, bases, families, frequencies, meta, mesh_
         factor_layout='axis'
     factor_spec=_shared_pole_factor_specs(factor_layout)
     resident_bytes=resident_for(factor_layout)
-    setup=f'sigma.sector.setup.{tag}'
-    resident=f'sigma.sector.resident.{tag}'
+    setup=f'{stage}.sector.setup.{tag}'
+    resident=f'{stage}.sector.resident.{tag}'
     capacity.reserve(setup,resident_bytes_per_rank=resident_bytes+2*face_bytes,
         workspace_bytes_per_rank=workspace,concurrent_with=ambient)
     capacity.live_stages=(*ambient,setup)
@@ -313,7 +315,8 @@ def sector_synthesis(readers, headers, bases, families, frequencies, meta, mesh_
         # The window runner inlines this contraction and SynthesisTau.admit
         # reserves the runner's peak plus this GEMM's native workspace; a
         # standalone AOT compile per hole would only repeat that work.
-        kernel=_w_contraction(mesh_xy,tuple(left['grid']),nk,m*nc,n*nt,kcarrier,factor_layout)
+        kernel=_w_contraction(mesh_xy,tuple(left['grid']),nk,m*nc,n*nt,kcarrier,factor_layout,
+                              weights_fn or _shared_pole_weights)
     except BaseException:
         capacity.live_stages=ambient
         b_x=b_y=poles=None
@@ -454,8 +457,11 @@ def compute_sector_sigma(handle, families, bases, meta, mesh_xy, *,
                 # opens. Diagonal sectors share the already-open first reader.
                 other=(reader if names[0]==names[1] else stack.enter_context(
                     open_shared_pole_model(sectors[names[1]]['path'],mesh_xy=mesh_xy)))
+                if families[a].layout!=families[b].layout:
+                    raise ValueError('GATE shared_pole_sectors: endpoint wavefunction layouts differ')
                 builder=sector_synthesis((reader,other),pair,(bases[a],bases[b]),
-                    (families[a],families[b]),freq,meta,mesh_xy)
+                    tuple(f.green_parent.plan.sym for f in (families[a],families[b])),
+                    families[a].layout,freq,meta,mesh_xy)
                 bound.append(builder)
                 stack.callback(builder.close)
                 return builder
@@ -476,11 +482,20 @@ def compute_sector_sigma(handle, families, bases, meta, mesh_xy, *,
                                    else currents[channel]+shell)
             total=value if total is None else replace(total,sigma_c_kij=total.sigma_c_kij+value.sigma_c_kij)
     # Resident models are read once per map: release them and their stage.
+    # An SC map holds CC for the accepted final map's W0 persist
+    # (sector_static_wc); the next map's entry or the SC end releases it.
+    held=resident.pop('CC',None) if handle.get('hold_charge_model') else None
     for model in resident.values():
         model.release()
     if handle.get('model_stage'):
         ledger=meta.shared_pole_capacity
         ledger.live_stages=tuple(s for s in ledger.live_stages if s!=handle['model_stage'])
+    if held is not None:
+        from gw.shared_pole_screening import hold_resident_model
+        cc=headers['CC']
+        hold_resident_model(held,meta,ResidentSectorModel.payload_bytes(
+            mesh_xy,cc['n_q_irr'],bases[0].n_canonical,cc['Kmax']),
+            stage=f"{handle['model_stage']}.CC")
     constant=instantaneous_sector_sigma(handle['constant'],families,bases,meta,mesh_xy,
         occupation_state=options.get('occupation_state'),
         return_components=on_shell is not None)
@@ -495,3 +510,57 @@ def compute_sector_sigma(handle, families, bases, meta, mesh_xy, *,
     constant=pad_to_axis(pad_to_axis(constant,total.band_axis,axis=1),total.band_axis,axis=2)
     result=replace(total,sigma_c_kij=total.sigma_c_kij+constant[None])
     return (result, tuple(currents)) if on_shell is not None else result
+
+
+def sector_static_wc(handle, meta, *, mesh_xy):
+    """Wc_CC(q, omega = 0) of a four-current sector model, full q grid.
+
+    The charge-sector body of the restart's ``W0_qmunu = V + Wc_CC(0)`` for
+    ``bispinor_gw = full_shared_pole``, as :func:`gw.mpa.sigma.shared_pole_static_wc`
+    is for a scalar store.  It is the Sigma sector synthesis
+    (:func:`sector_synthesis`: one factor read, endpoint unfold, contraction)
+    with ``_shared_pole_omega0_weights`` in place of d(t), summing W_+(q)
+    and the valence branch from the -q factors as the Sigma consumer reads
+    them.  No ``W_inf - V`` term enters: the Ward contact is TT-only and V is
+    block diagonal, so the CC block of ``(I + V c)^-1 V - V`` is zero
+    (``gw.response_bank``).  CT/TC/TT are not in it: BSE screens with the
+    charge sector only, as after the charge route.
+
+    Returns ``(Q, m, m)`` complex128 at ``P(None,'x','y')`` in the run's
+    packed charge-centroid order (``meta.mu_basis``, the CC endpoint basis).
+    """
+    from file_io.shared_pole_store import open_shared_pole_model, validate_shared_pole_model
+    from .sigma import _shared_pole_omega0_weights
+    cc=handle['sectors']['CC']
+    capacity=meta.shared_pole_capacity
+    header=validate_shared_pole_model(cc['path'],expected_identity=cc['identity'],
+                                      mesh_xy=mesh_xy,capacity=capacity)
+    if header.get('sector')!='CC' or header['digest']!=cc['digest']:
+        raise ValueError('GATE shared_pole_identity: W0 handle is not the published CC model')
+    Q,m=int(header['n_q_full']),int(meta.mu_basis.n_packed)
+    if not int(header['Kmax']):
+        return _zeros(mesh_xy,(Q,m,m))()
+    counts=np.asarray(header['K'],np.int64)
+    parent=np.asarray(header['qirr']['irr_idx_q'],dtype=np.int32)
+    intervals=device_put_process_local(np.ascontiguousarray(
+        np.stack([np.zeros_like(counts),counts],axis=1)[parent]),NamedSharding(mesh_xy,P()))
+    ambient=capacity.live_stages
+    tile=-(-16*Q*m*m//int(mesh_xy.size))
+    capacity.reserve('w0.static_output',resident_bytes_per_rank=2*tile,
+                     workspace_bytes_per_rank=0,concurrent_with=ambient)
+    capacity.live_stages=(*ambient,'w0.static_output')
+    try:
+        with open_shared_pole_model(cc['path'],mesh_xy=mesh_xy) as reader:
+            synthesis=sector_synthesis((reader,reader),(header,header),(meta.mu_basis,)*2,
+                (None,None),'face',None,meta,mesh_xy,weights_fn=_shared_pole_omega0_weights,
+                stage='w0')
+            wc=None
+            try:
+                x,y,poles=synthesis.resident_operands()
+                wc=sum(synthesis.w_kernel(x,y,poles,intervals,0.0,0.0,hole).reshape(Q,m,m)
+                       for hole in (False,True))
+            finally:
+                synthesis.close(wc)
+    finally:
+        capacity.live_stages=ambient
+    return wc

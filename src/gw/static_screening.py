@@ -88,9 +88,9 @@ def build_static_w_from_restart(filename, input_file, mesh_xy, *, print_fn=print
             "GATE bse_static_w_bispinor_sectors: missing screened W0 on a "
             "four-current restart; the BSE direct kernel has no packed "
             "CC/CT/TC/TT response handoff. Supply an authenticated stored "
-            "charge W0 (a bispinor_gw = bare_transverse shared-pole run "
-            "stores one; full_shared_pole does not); a scalar rebuild would "
-            "omit the coupled sectors.")
+            "charge W0 (a bispinor_gw = bare_transverse or full_shared_pole "
+            "shared-pole run stores one); a scalar rebuild would omit the "
+            "coupled sectors.")
     if config.qp_solver is QPSolver.SELF_CONSISTENT:
         raise ValueError(
             "GATE bse_static_w_sc_state: missing final-map W0 on a QSGW "
@@ -137,11 +137,15 @@ def build_static_w_from_restart(filename, input_file, mesh_xy, *, print_fn=print
 def _shared_pole_static_body(shared_pole, V_q, *, meta, mesh_xy, print_fn):
     """Evaluate the retained map at zero, using the sole pole synthesis owner."""
     from symmetry_maps import QirrOperator
+    from .mpa.sector_sigma import sector_static_wc
     from .mpa.sigma import shared_pole_static_wc
     from .restart_q_storage import deposit_pre_unfold
 
     V_op = QirrOperator.of(V_q)
-    wc = shared_pole_static_wc(shared_pole, meta, mesh_xy=mesh_xy)
+    # full_shared_pole: the CC sector (charge-sector W0; CT/TC/TT not stored).
+    evaluate = (sector_static_wc if shared_pole.get("representation") == "sector-ordered-ph"
+                else shared_pole_static_wc)
+    wc = evaluate(shared_pole, meta, mesh_xy=mesh_xy)
     if tuple(wc.shape) != (V_op.n_full, *V_op.values.shape[1:]):
         raise ValueError(
             "GATE shared_pole_static_w: model Wc(0) has shape "

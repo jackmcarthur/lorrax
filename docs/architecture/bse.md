@@ -255,9 +255,12 @@ Keys, supported modes and refusals: [input reference](../input_reference.md).
   no packed CC/CT/TC/TT handoff (`gw/static_screening.py:86`). The stored W0
   is the charge sector: the direct term screens with $W_{CC}(0)$ and the
   exchange term uses the charge V; the CT/TC/TT blocks, screened or bare,
-  never enter the BSE kernel. On `bispinor_gw = full_shared_pole` no W0 is
-  stored (its CC sector lives on raw-sector endpoints with no ω = 0
-  evaluator), so BSE refuses there.
+  never enter the BSE kernel. On `bispinor_gw = bare_transverse` it is
+  V + W_c(0) of the charge store; on `bispinor_gw = full_shared_pole` it is
+  V + W_c,CC(0) of the CC sector (`gw/mpa/sector_sigma.py:sector_static_wc`,
+  the sector Σ synthesis at the ω = 0 coefficient; the CC block of
+  W_∞ − V is zero because the Ward contact is TT-only). An SC run keeps its
+  resident CC model past Σ until the final-map persist.
 - The BSE reads ψ from the restart, which holds the deck WFN's states. `--eqp`
   replaces energies only (`bse/bse_window.py:569`), so a QSGW BSE with QP ψ
   needs a GW restart generated from `WFN_qp.h5`.
