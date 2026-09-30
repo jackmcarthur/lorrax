@@ -228,7 +228,7 @@ hooks; skip-honesty profile rows for h5py (always), slab_io/FFI presence
      ψ[k,:,:,j] == 0 AND gvecs[k,j] == sentinel, on the SHARDED multi-rank
      load, both backends, hostile bands. "Mask detectable ≠ mask optional"
      — this is the cell 22049c3 lacked (survey §7.4).
-  3. Parity harness graduation: `tests/bench/wfn_loader_backend_parity_test.py`
+  3. Parity harness graduation: `wfn_loader_backend_parity_test.py` (since deleted)
      repointed at the in-repo gnppm fixture (byte-size-identical to the
      dead-machine /pscratch file — survey §6.4; `--wfn` override kept,
      restage question registered as Q7), defaults flipped to non-divisible

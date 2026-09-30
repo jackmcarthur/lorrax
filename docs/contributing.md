@@ -78,9 +78,8 @@ Beside the suite are the five static AST suites (`test_layering.py`,
 `test_fft_shardmap_context.py`). They run as scripts on a login node and also
 collect under pytest.
 
-`tests/bench` holds performance tools: standalone benchmark and profiling
-drivers used to measure kernels and stages. They are not tests, and pytest does
-not collect them.
+Benchmarks and backend checks for a standalone service live in that service's
+`services/<svc>/bench/`. They are not tests, and pytest does not collect them.
 
 ## Before committing
 

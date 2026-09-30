@@ -94,7 +94,7 @@ def _rank0() -> bool:
 # tuning.
 #
 # MEASURED (job 56389339 + 16/25-node steps, /pscratch, GiB/s aggregate
-# write, phase-separated harness ``tests/bench/slabio_scaling_bench.py``):
+# write, phase-separated harness, since deleted):
 #
 #   ranks  payload      stripe=16 x 1M   stripe=nranks         gain
 #      4     2.00 GiB      0.813            0.906  (4 x 1M)    +11%

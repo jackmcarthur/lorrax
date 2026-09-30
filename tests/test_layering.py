@@ -250,7 +250,7 @@ def _is_standalone_driver(mod: str) -> bool:
     (2026-07-31), where the exemption is structural instead of a rule
     carve-out.  The classifier stays so that
     :func:`test_the_src_tree_grows_no_new_bench_drivers` can keep the count
-    at 0 — a new driver shape under ``src/`` belongs in ``tests/bench/``.
+    at 0 — a new driver shape under ``src/`` belongs in ``services/<svc>/bench/``.
     """
     last = mod.split(".")[-1]
     return (last.endswith("_test") or last.startswith("test_")
@@ -1984,7 +1984,7 @@ def test_the_src_tree_grows_no_new_bench_drivers(sources):
     found = sorted(m for m in sources if _is_standalone_driver(m))
     assert not found, (
         f"{len(found)} bench/test driver(s) under src/, must be 0: "
-        f"{found}.  Bench and smoke drivers live in tests/bench/.")
+        f"{found}.  Bench drivers live in services/<svc>/bench/.")
 
 
 def test_the_bench_driver_classifier_can_fail():

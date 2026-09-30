@@ -1,8 +1,7 @@
 """Re-export shim — implementation moved to ``distrib_la._cusolvermp``.
 
-Deletion is the replumb-complete gate.  The surviving reachers are the five
-bench drivers under ``tests/bench/`` — the count ``ffi.cusolvermp.batched: 5``
-in ``tests/test_layering.py`` is exactly those.  ``tests/test_ffi_linalg_contract.py``,
+Deletion is the replumb-complete gate.  No caller remains: the distrib_la
+benches in ``services/distrib_la/bench/`` import ``distrib_la._cusolvermp``.  ``tests/test_ffi_linalg_contract.py``,
 also named here once, migrated to
 ``services/distrib_la/tests/test_distrib_la_contract.py`` and reaches
 ``distrib_la`` directly.

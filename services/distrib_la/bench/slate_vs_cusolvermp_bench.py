@@ -6,12 +6,12 @@ Runs one backend per invocation, always with one process per GPU:
 
     # cuSOLVERMp
     lx run -N 1 -G 4 -n 4 -- env PYTHONPATH="$LORRAX_CHECKOUT/src" \\
-        python3 -u tests/bench/slate_vs_cusolvermp_bench.py \\
+        python3 -u services/distrib_la/bench/slate_vs_cusolvermp_bench.py \\
         --backend cusolvermp -n 2048 --repeats 5
 
     # SLATE
     lx run -N 1 -G 4 -n 4 -- env PYTHONPATH="$LORRAX_CHECKOUT/src" \\
-        python3 -u tests/bench/slate_vs_cusolvermp_bench.py \\
+        python3 -u services/distrib_la/bench/slate_vs_cusolvermp_bench.py \\
         --backend slate -n 2048 --repeats 5
 
 Warms up once, then reports per-call wall-clock for `repeats` iterations.
