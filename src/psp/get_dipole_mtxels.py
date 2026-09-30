@@ -57,6 +57,7 @@ from common import Meta
 from gw.gw_config import (
 	BispinorGWMode, coerce_bispinor_gw_mode,
 	read_lorrax_input as read_cohsex_input,
+	resolve_distrib_la_batched_route,
 )
 from common.four_current_model import resolve_four_current_representation
 from psp.pseudos import load_pseudopotentials, print_atomic_structure
@@ -1565,6 +1566,7 @@ def main(argv=None):
 				pt_path = _complete_parallel_transport(
 					args, pt_path, wfn=wfn, sym=sym, mesh=RUNTIME.mesh, nbands=nb,
 					bispinor=bispinor,
+					batched_route=resolve_distrib_la_batched_route(params),
 					rcond=float(args.parallel_transport_rcond),
 					velocity_only=bool(args.parallel_transport_velocity_only),
 					w_av_first_neighbors=w_av_first_neighbors,

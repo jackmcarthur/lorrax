@@ -1310,11 +1310,17 @@ def write_parallel_transport_artifact(
     mesh,
     nbands: int,
     bispinor: bool,
+    batched_route: str,
     rcond: float = 1.0e-10,
     w_av_first_neighbors: bool = False,
     w_av_second_neighbors: bool = False,
 ) -> None:
     """Append streamed links and the full-BZ connection to an initialized file.
+
+    ``batched_route`` is the deck's ``linalg`` resolution
+    (``gw_config.resolve_distrib_la_batched_route``): ``batch_reshard``
+    (``linalg = local``) solves P link polars at a time, one per rank;
+    ``auto`` (``linalg = distributed``) solves each link on the mesh.
 
     THE STENCIL GATE LIVES HERE, per axis, not in the artifact initializer
     -- this is the ONLY stage that differentiates along k.  Since 2026-09-05
@@ -1346,10 +1352,9 @@ def write_parallel_transport_artifact(
     plan_polar, edge_table, apply_symmetry, q_stencil_table = (
         _require_service_apis())
     nb_padded = band_storage_extent(mesh, int(nbands))
-    from common.gpu_utils import device_room_bytes
     polar_plan = plan_polar(
         mesh, n=nb_padded, backend="distributed", rcond=float(rcond),
-        budget_bytes=device_room_bytes(pool_fraction=0.8))
+        batched_route=str(batched_route))
     full_plus, source_full, source_steps = _write_link_stage(
         str(path), wfn=wfn, sym=sym, mesh=mesh, nbands=int(nbands),
         bispinor=bool(bispinor), polar_plan=polar_plan)
@@ -2233,6 +2238,7 @@ def publish_dft_velocity(path, velocity_kmajor, psi_G, *, wfn, sym, geom,
 
 
 def complete_parallel_transport(path, *, wfn, sym, mesh, nbands, bispinor,
+                                batched_route,
                                 rcond, velocity_only, w_av_first_neighbors,
                                 w_av_second_neighbors, atol, rtol,
                                 report, head_nbands=None) -> None:
@@ -2259,7 +2265,7 @@ def complete_parallel_transport(path, *, wfn, sym, mesh, nbands, bispinor,
     with timing.section("parallel_transport_links"):
         write_parallel_transport_artifact(
             path, wfn=wfn, sym=sym, mesh=mesh, nbands=nbands,
-            bispinor=bispinor, rcond=rcond,
+            bispinor=bispinor, batched_route=batched_route, rcond=rcond,
             w_av_first_neighbors=w_av_first_neighbors,
             w_av_second_neighbors=w_av_second_neighbors)
     with timing.section("parallel_transport_validation"):
