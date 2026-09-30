@@ -197,17 +197,17 @@ def eval_sigma_c_at_dft_energies(
         f"({provenance}; VBM={vbm_ev:.6f}, CBM={cbm_ev:.6f})"
     )
 
-    from .qsgw_utils import interp_along_omega, omega_coverage
-    sig_c_diag = extract_sigma_diag_logical(
-        sigma_c_omega, mesh_xy, band_axis=band_axis)
-    sig_c_diag = sig_c_diag * RYD_TO_EV
+    from .qsgw_utils import interp_sigma_diag_along_omega, omega_coverage
     grid_ev = np.asarray(config.omega_grid_ev, dtype=np.float64)
     # Uncovered states take Sigma(omega=0), counted and reported (owner rule 2026-09-22).
     policy = "static_omega0"
     covered, n_uncovered, frac_uncovered = omega_coverage(
         grid_ev, omega_dft_rel_ev)
-    sigma_c_at_dft_ev = interp_along_omega(
-        sig_c_diag, grid_ev, omega_dft_rel_ev,
+    # Two omega slots per (k, n) leave the cube; the (n_omega, nk, nb)
+    # diagonal is not made on any host (full BZ: 3.7 GB per rank at Fe 20^3).
+    sigma_c_at_dft_ev = interp_sigma_diag_along_omega(
+        sigma_c_omega, mesh_xy, grid_ev, omega_dft_rel_ev,
+        band_axis=band_axis, scale=RYD_TO_EV,
         context="Sigma_c at E_DFT (eqp0/eqp1)",
         print_fn=print_fn)
 

@@ -27,7 +27,6 @@ import numpy as np
 from common.units import RYD_TO_EV
 from common.wfn_transforms import get_enk_bandrange
 import common.timing as timing
-from runtime.padding import strip_axis
 
 from .band_extrapolation import (
     BAND_EXTRAPOLATION_ESTIMATOR_DEFAULT,
@@ -353,7 +352,7 @@ def _report_band_extrapolation(
     twice, and the two copies could disagree.  The caller applies them to the
     Σ cube.
     """
-    from .qsgw_utils import extract_sigma_diag_replicated, interp_along_omega
+    from .qsgw_utils import interp_sigma_diag_along_omega
 
     cube = sigma_omega.sigma_c_kij
     # THE ROW'S OWN ENERGY, NOT THE DFT ENERGY OF ITS SORTED INDEX.  The
@@ -373,14 +372,9 @@ def _report_band_extrapolation(
     points = []
     for i in range(cube.shape[0]):
         # The cube lives on the padded band carrier; the head, the DFT
-        # energies and the fit are logical.  Strip at this consumer boundary.
-        diag_w_kn = np.asarray(
-            extract_sigma_diag_replicated(band_count_point(cube, i), mesh_xy))
-        if sigma_omega.band_axis is not None:
-            diag_w_kn = np.asarray(strip_axis(
-                diag_w_kn, sigma_omega.band_axis, axis=-1))
-        if head is not None:
-            diag_w_kn = diag_w_kn + head
+        # energies and the fit are logical.  The reader strips at this
+        # consumer boundary and adds the head at the two omega slots each
+        # (k, n) reads: no (n_omega, nk, nb) diagonal is made on the host.
         # Ry -> eV here, exactly where ``eval_sigma_c_at_dft_energies`` does
         # it, so the reported numbers are in the same unit as every other Σ
         # line in the log and the formatter needs no scale of its own.
@@ -389,8 +383,9 @@ def _report_band_extrapolation(
         # uncovered state to nan here would poison the fit for the covered
         # ones through the same least squares.  The count is reported once
         # at the output path, on the same grid and the same eval energies.
-        points.append(interp_along_omega(
-            diag_w_kn * RYD_TO_EV, omega_grid_ev, omega_eval_ev))
+        points.append(interp_sigma_diag_along_omega(
+            band_count_point(cube, i), mesh_xy, omega_grid_ev, omega_eval_ev,
+            band_axis=sigma_omega.band_axis, add_w_kn=head, scale=RYD_TO_EV))
     s_at_counts = np.stack(points)
 
     # ── THE ESTIMATOR ───────────────────────────────────────────────────

@@ -751,15 +751,20 @@ def finalize_dynamic_sigma(
             sigma_c_omega_unextrap = add_head_sigma_diag(
                 sigma_c_body_omega_unextrap, head_sigma_diag_w_kn_ry,
                 band_axis=sigma_band_axis, donate_body=donate_unextrap)
-            # The raw columns: the same diagonal gather and the same E_DFT
+            # The raw columns: the same diagonal read and the same E_DFT
             # interpolation that ``eval_sigma_c_at_dft_energies`` applies to
             # the extrapolated cube, so an extrapolation-off run reproduces
-            # them.
-            from .qsgw_utils import interp_along_omega
-            raw_diag_ry = extract_sigma_diag_logical(
-                sigma_c_omega_unextrap, mesh_xy, band_axis=sigma_band_axis)
-            raw_at_dft_ev = interp_along_omega(
-                raw_diag_ry * RYD_TO_EV, omega_grid_ev, omega_dft_rel_ev,
+            # them.  The (n_omega, nk, nb) raw diagonal is host memory on
+            # every rank and only the one-shot raw columns read it
+            # (SIGMA_BASIS_FIELDS: an SC run drops it), so it is extracted
+            # only by the call that writes its cube.
+            from .qsgw_utils import interp_sigma_diag_along_omega
+            if write_sigma_omega_h5:
+                raw_diag_ry = extract_sigma_diag_logical(
+                    sigma_c_omega_unextrap, mesh_xy, band_axis=sigma_band_axis)
+            raw_at_dft_ev = interp_sigma_diag_along_omega(
+                sigma_c_omega_unextrap, mesh_xy, omega_grid_ev, omega_dft_rel_ev,
+                band_axis=sigma_band_axis, scale=RYD_TO_EV,
                 context="raw Sigma_c at E_DFT (eqp0_raw/eqp1_raw)",
                 print_fn=lambda *args, **kwargs: None)
             sigma_xc_qsgw_unextrap, _ = build_qsgw_sigma_xc(
