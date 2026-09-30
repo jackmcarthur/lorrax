@@ -1,0 +1,31 @@
+! hsuite metal+semicore fixture: bcc Na, PseudoDojo nc-sr-04 PBE (2s2p semicore, 9 e), 25 Ry, 3x3x3, FD kBT 0.01 Ry.
+&control
+   prefix = 'na'
+   pseudo_dir = './'
+   outdir = './'
+   calculation = 'nscf'
+   disk_io = 'low'
+/
+&system
+   ibrav = 3
+   celldm(1) = 7.984096
+   nat = 1
+   ntyp = 1
+   ecutwfc = 25.0
+   nbnd = 14
+   occupations = 'smearing'
+   smearing = 'fermi-dirac'
+   degauss = 0.01
+/
+&electrons
+   conv_thr = 1.0d-10
+   diago_full_acc = .true.
+   mixing_beta = 0.7
+   diagonalization = 'david'
+/
+ATOMIC_SPECIES
+   Na 22.990 'Na.upf'
+ATOMIC_POSITIONS crystal
+   Na 0.0 0.0 0.0
+K_POINTS automatic
+ 3 3 3 0 0 0

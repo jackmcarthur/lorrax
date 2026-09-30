@@ -45,6 +45,9 @@ sys.path.insert(0, str(REPO / "src"))
 from tests.hsuite import rank_session  # noqa: E402
 
 FIXTURE = HERE / "fixture"
+# The metal + semicore fixture, staged in its own subdirectory of the run.
+FIXTURE_NA = HERE / "fixture_na"
+NA_DIR = "na"
 REFERENCE = HERE / "reference"
 
 # Tolerances.  Static objects (centroid-free preprocessing, ISDF fits) are
@@ -227,6 +230,42 @@ density_self_consistent = true
 })
 _P = ["--px", _SIDE, "--py", _SIDE]
 
+# The metal + semicore route on bcc Na (fixture_na/): the production
+# defaults the H2+ fixture cannot reach.  Fermi-Dirac occupations, the
+# partition by number_bands_protected (2s and 2p lie below a 20 eV gap, so
+# they are the coarse class, read on held windows at eta_semi and pinned at
+# their DFT block by the default sc_semicore = dft), the rigid tail above the
+# QP window with its min(Z, 1/Z) law, the default head update and its
+# per-map head block (gap 0 on a metal), spectral_shell band extrapolation,
+# and the held SC windows, all at their defaults.  Scalar WFN, fresh zeta.
+NA_DECK = """[cohsex]
+centroids_file = {centroids}
+number_bands_protected = 8
+number_bands = 13
+sys_dim = 3
+bispinor = false
+wfn_file = WFN.h5
+kin_ion_file = kin_ion.h5
+restart = false
+compute_mode = mpa
+sigma_w_model = shared_pole
+occ_smearing_width_ry = 0.01
+fermi_reference = mp1_fixed_n
+qp_solver = self_consistent
+sc_max_iter = 2
+sc_tol_ev = {sc_tol}
+sc_head_update = dft_velocity
+linalg = {linalg}
+sigma_freq_debug_output = false
+sigma_diag_file = na_sigma.dat
+eqp0_file = na_eqp0.dat
+eqp1_file = na_eqp1.dat
+report_file = na.out
+sigma_omega_h5_file = na_sigma.h5
+"""
+# Map 1 moves 1.04 eV: the 1.5 eV criterion stops after two maps, converged.
+NA_SC_TOL_EV = "1.5"
+
 # Scratch the lead removes before a stage.  The four-current QSGW is a
 # fresh model in a run directory that already holds the scalar shared-pole
 # models (checked at sp_export), and a fresh run refuses to overwrite a
@@ -278,7 +317,17 @@ STAGES = (
       "--band-degeneracy", "off", "--max-lanczos-iter", "40",
       "--n-eig", "2", "--block-size", "1", *_P,
       "--report-file", "bse_bisp.out"]),
+    # bcc Na in run/na/.  Its centroids are stored in fixture_na/ (kmeans
+    # is covered above): 56 orbit-closed points from `centroid.kmeans_cli 64
+    # --seed 42 --orbit --oversample 1.5 --fit-window 0:8,0:13` (the zeta legs).
+    ("na_kin_ion", "gw.kin_ion_io", ["-i", "na.in"]),
+    ("na_dipole", "psp.get_dipole_mtxels",
+     ["-i", "na.in", "--parallel-transport-velocity-only"]),
+    ("na_sc", "gw.gw_jax", ["-i", "na.in"]),
 )
+
+# Stages that run in a subdirectory of the run (their own fixture).
+_STAGE_DIR = {name: NA_DIR for name in ("na_kin_ion", "na_dipole", "na_sc")}
 
 # What each stage leaves behind and how it is compared.
 #   eqp: eqp files (column compare); h5: numeric members; rows: whitespace
@@ -309,6 +358,34 @@ CHECKS = {
                 "report_floats": ("bsc.out",
                                   r"SC iteration: call=\d+ .*?max\|dE\|=([0-9.e+-]+)")},
     "bse_bisp": {"stdout_floats": r"^\s*S\d+\s+([0-9.+-]+)\s*$"},
+    "na_kin_ion": {"h5": ["kin_ion.h5"]},
+    "na_dipole": {"h5": ["dipole.h5"]},
+    "na_sc": {"eqp": ["na_eqp0.dat", "na_eqp1.dat"],
+              "h5": ["na_sigma.h5"],
+              "report_floats": ("na.out",
+                                r"SC iteration: call=\d+ .*?max\|dE\|=([0-9.e+-]+)")},
+}
+
+# Lines a stage's rank-0 log must show: the production defaults the stage is
+# there to cover, by name, so a default that silently changes fails here.
+REQUIRED_LINES = {
+    "na_sc": (
+        ("partition by number_bands_protected",
+         r"QP matrix: bands 1-8 counted \(nval=5, ncond=3\).*coarse \(semicore\) "
+         r"Sigma read: 16 \(k,state\).*\(number_bands_protected\)"),
+        ("2s and 2p coarse windows at eta_semi 5 eV",
+         r"SC coarse windows \(plan, map 0\): \[[^\]]+\]@5, \[[^\]]+\]@5 eV"),
+        ("sc_semicore = dft pin",
+         r"SC semicore = dft: 16 coarse \(k,label\) hold their DFT block"),
+        ("tail law with min(Z, 1/Z) weights at map 1",
+         r"SC sum-band tail: scissored \[8, 13\) .*Z-weighted\)"),
+        ("Fermi-Dirac fixed-N metal head",
+         r"SC metal head: fixed-N fd occupations"),
+        ("per-map head block at map 1, metal gap",
+         r"SC head velocity, map 1:(?:.*\n){1,8}?\s+band gap: 0\.0000 eV \(metal\)"),
+        ("held Sigma windows re-planned on escape at map 1",
+         r"SC map event at call 1: sampled grid or Sigma rule set changed"),
+    ),
 }
 
 
@@ -329,15 +406,27 @@ def _env(cache_dir):
 
 def stage_fixture(run):
     run.mkdir(parents=True, exist_ok=False)
-    for path in FIXTURE.iterdir():
-        shutil.copy2(path, run / path.name)
-        os.chmod(run / path.name, 0o644)
+    (run / NA_DIR).mkdir()
+    for src, dst in ((FIXTURE, run), (FIXTURE_NA, run / NA_DIR)):
+        for path in src.iterdir():
+            shutil.copy2(path, dst / path.name)
+            os.chmod(dst / path.name, 0o644)
+
+
+def _centroid_file(run):
+    found = sorted(p.name for p in run.glob("centroids_frac_*.txt"))
+    assert len(found) == 1, f"kmeans left {found} in {run}"
+    return found[0]
+
+
+def write_na_deck(run_na):
+    (run_na / "na.in").write_text(NA_DECK.format(
+        centroids=_centroid_file(run_na), sc_tol=NA_SC_TOL_EV,
+        linalg="distributed" if _SIDE == "2" else "local"))
 
 
 def write_decks(run):
-    found = sorted(p.name for p in run.glob("centroids_frac_*.txt"))
-    assert len(found) == 1, f"kmeans left {found}"
-    centroids = found[0]
+    centroids = _centroid_file(run)
     (run / "gnppm.in").write_text(GNPPM_DECK.format(centroids=centroids))
     (run / "sp_sc.in").write_text(SP_SC_DECK.format(
         centroids=centroids, linalg="distributed" if _SIDE == "2" else "local"))
@@ -421,6 +510,14 @@ def signatures(run, name):
         text = log.read_text(errors="replace")
         hits += [f"{log.name}: {sig}" for sig in FAILURE_SIGNATURES if sig in text]
     return hits
+
+
+def missing_lines(run, name):
+    """The REQUIRED_LINES a stage's rank-0 log does not show."""
+    text = (run / f"{name}.rank0.log").read_text(errors="replace")
+    return [f"{name}: log lacks {label!r} ({pattern})"
+            for label, pattern in REQUIRED_LINES.get(name, ())
+            if not re.search(pattern, text, re.MULTILINE)]
 
 
 def _eqp(path):
@@ -562,14 +659,17 @@ def run_chain(out, *, regenerate=False, cache_dir=None, timeout=600,
     for name, module, argv in STAGES:
         if only and name not in only:
             continue
+        where = run / _STAGE_DIR.get(name, "")
         if name == "kin_ion" and lead:
             write_decks(run)
+        if name == "na_kin_ion" and lead:
+            write_na_deck(where)
         if lead:
             for rel in _CLEAR_BEFORE.get(name, ()):
                 shutil.rmtree(run / rel, ignore_errors=True)
         rank_session.exchange(name)
-        ok, rcs, walls[name] = run_stage(run, name, module, argv, env, timeout)
-        hits = signatures(run, name) if lead else []
+        ok, rcs, walls[name] = run_stage(where, name, module, argv, env, timeout)
+        hits = signatures(where, name) if lead else []
         # One verdict for every rank: a rank that walks on alone hangs.
         if rank_session.exchange(not ok or bool(hits))[0]:
             problems.append(f"{name}: rc={rcs} {hits[:4]}")
@@ -577,14 +677,15 @@ def run_chain(out, *, regenerate=False, cache_dir=None, timeout=600,
         if not lead:
             continue
         rule = CHECKS.get(name, {})
+        problems += missing_lines(where, name)
         if name == "kmeans":
-            found = list(run.glob("centroids_frac_*.txt"))
+            found = list(where.glob("centroids_frac_*.txt"))
             pts = np.loadtxt(found[0]) if len(found) == 1 else np.zeros((0, 3))
             if pts.ndim != 2 or pts.shape[1] != 3 or not np.isfinite(pts).all():
                 problems.append("kmeans: centroid file malformed")
             got = {"centroids": pts}
         else:
-            got = captured(run, name, rule)
+            got = captured(where, name, rule)
         if regenerate == "all" or (regenerate == "missing" and _load(name) is None):
             REFERENCE.mkdir(exist_ok=True)
             _save(name, got)

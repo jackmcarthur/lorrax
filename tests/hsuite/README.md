@@ -15,6 +15,16 @@ states, so the occupied set is one band and time reversal is broken. Built
 the registered SCF parser's receipt. It is a software fixture, not a
 converged physical reference.
 
+`fixture_na/`: bcc Na, one atom, PseudoDojo nc-sr-04 PBE (9 electrons:
+2s at −64 eV and 2p at −22 eV lie 20 eV below the 3s band), 25 Ry cutoff,
+Fermi-Dirac k_BT = 0.01 Ry, 3 × 3 × 3 k-grid (27 full, 4 stored), 14 scalar
+bands, E_F = 1.99 eV. Built 2026-09-29 by QE 7.5 SCF → NSCF → pw2bgw →
+wfn2hdf (`runs/Na/31_hsuite_fixture_20260929` in the sandbox). It is the
+smallest metal with a ≥ 4 eV-gapped semicore manifold. The WFN has one band
+above the deck's 13: the ζ fit's right window must have a measured upper gap,
+and the SC energy ladder (13 padded to 14 at P4) must hold the velocity's
+bands. The Na stages run in `run/na/`.
+
 ## The chain (`chain.py`)
 
 | stage | driver | option covered |
@@ -33,12 +43,21 @@ converged physical reference.
 | dipole_bisp | `psp.get_dipole_mtxels` | the four-component dipole the direct head authenticates |
 | bisp_sc | `gw.gw_jax` | `bispinor_gw = full_shared_pole` through the SC driver, 2 maps: fresh charge + transverse ζ (both on the charge centroid set), ordered CC/CT/TC/TT sector poles, direct four-current Γ head, `sc_head_update = dft_velocity`, live four-current density; map 0 is the one-shot |
 | bse_bisp | `bse.bse_jax` | TDA Davidson after `bisp_sc` on the four-component restart: the final map's W0 = V + W_c,CC(0) (charge sector only) |
+| na_kin_ion | `gw.kin_ion_io` | bcc Na kinetic + ionic matrix elements; the 56 orbit-closed centroids (fitted on the ζ legs, 8 × 13) are stored in `fixture_na/` |
+| na_dipole | `psp.get_dipole_mtxels` | the velocity stage alone (`--parallel-transport-velocity-only`): a 3³ metal grid cannot resolve the links |
+| na_sc | `gw.gw_jax` | metal shared-pole QSGW, 2 maps to a 1.5 eV criterion, production defaults: Fermi-Dirac fixed-N occupations and metal head, `number_bands_protected = 8` (QP matrix 1–8, tail 9–13), 2s and 2p read on two coarse windows at η 5 eV, `sc_semicore = dft`, the rigid tail with min(Z, 1/Z) weights, spectral_shell extrapolation, held Σ windows re-planned on escape, `sc_head_update = dft_velocity` with its per-map head block, distributed linalg |
 
 All stages run in one Python process per rank (`chain.run_stage` calls each
 driver's `main` in sequence): one `jax.distributed` world, one FFI load, one
 compile cache. No driver code changes were needed for re-entry. Between
 drivers the runner runs `gc.collect()` and `jax.clear_caches()`. The
 restarted steps read the `tmp/` state (ζ, V(q), W0) the chain has written.
+
+The `na_sc` rank-0 log must also show, by name, each default the stage
+covers (`chain.REQUIRED_LINES`): the partition line, the two coarse windows
+at η 5 eV, the `sc_semicore = dft` pin, the Z-weighted tail at map 1, the
+Fermi-Dirac metal head, the map-1 head block with a 0.0000 eV gap, and the
+map-1 Σ window re-plan.
 
 Every stage is then checked on its outputs, not its exit code: the
 eqp0/eqp1 columns, every numeric member of the h5 files it writes, and its
@@ -54,10 +73,12 @@ Not covered:
 - the planners' chunked paths: at μ = 6 every object is KB-sized, and a
   `memory_per_device_gb` small enough to chunk leaves the live set no room
   (`GATE gn_ppm_fit_capacity` at 0.05 GB);
-- semicore (none in H2+: no semicore window, η_semi read or semicore pin);
-- the SC partition beyond "all Σ bands protected" (three Σ bands, one
-  occupied, so no rotating class);
-- metals, the bispinor charge route (`bare_transverse`), `full_static_cohsex`,
+- the default `parallel_transport` head: on the 3³ Na grid the links refuse
+  (`GATE pt_head_window_hybridized`), so `na_sc` names `dft_velocity`;
+- the W line-site re-plan: it fires at Na map 2, where the re-planned W
+  refuses at `GATE shared_pole_gram_valid` (q = 0 Gram −1.9e-6 against
+  −1e-7), so `na_sc` stops after map 1;
+- the bispinor charge route (`bare_transverse`), `full_static_cohsex`,
   and the 2-D slab head.
 
 The bispinor stages run last: their fresh ζ fit rewrites the `tmp/` restart
