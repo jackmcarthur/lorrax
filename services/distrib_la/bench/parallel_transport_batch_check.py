@@ -77,6 +77,10 @@ def compare(raw, *, rcond=1e-10):
     t0 = time.monotonic()
     reference = [legacy(raw[i]) for i in range(len(raw))]
     jax.block_until_ready(reference)
+    distributed_cold = time.monotonic()-t0
+    t0 = time.monotonic()
+    reference = [legacy(raw[i]) for i in range(len(raw))]
+    jax.block_until_ready(reference)
     distributed_wall = time.monotonic()-t0
     t0 = time.monotonic()
     link, values = batch.batched(raw)
@@ -101,6 +105,7 @@ def compare(raw, *, rcond=1e-10):
     assert np.max(np.abs(host(fallback_s)[0]-reference_values[0])) < 5e-12
     return dict(n=n, edges=int(raw.shape[0]), relative_link_error=error,
                 max_singular_value_error=sv_error,
+                distributed_cold_wall_s=distributed_cold,
                 distributed_wall_s=distributed_wall, batch_cold_wall_s=cold,
                 batch_warm_wall_s=warm), link_host, value_host
 
