@@ -1,4 +1,4 @@
-"""The q=0, G=G'=0 (Gamma-cell) head of the Coulomb / photon interaction; see docs/architecture/four_current_wiring.md."""
+"""The q=0, G=G'=0 (Gamma-cell) head of the Coulomb / photon interaction; see docs/theory/bispinor-gw.md#head."""
 
 from __future__ import annotations
 
@@ -27,7 +27,7 @@ def _analytic_q0_sphere(params) -> bool:
 
 
 class HeadResponseKind(str, enum.Enum):
-    """Reduction state of the response that produced a scalar head; see docs/architecture/four_current_wiring.md."""
+    """Reduction state of the response that produced a scalar head; see docs/theory/bispinor-gw.md#head."""
 
     DIRECT_IRREDUCIBLE = "direct_irreducible"
     FULL_LOCAL_FIELDS = "full_local_fields"
@@ -73,7 +73,7 @@ class HeadGNParams:
 
 @dataclass(frozen=True)
 class StaticHeadTerms:
-    """Exact static q=0 head terms for bare X / SX / COHSEX; see docs/architecture/four_current_wiring.md."""
+    """Exact static q=0 head terms for bare X / SX / COHSEX; see docs/theory/four-current-head-corrections.md#static-head."""
 
     sigma_x_diag: jnp.ndarray
     sigma_sx_diag: jnp.ndarray
@@ -90,7 +90,7 @@ _STATIC_GAUGE_HERMITICITY_RESIDUAL_MAX = 1.0e-10
 
 
 def static_hall_linear_response(sigma_H) -> jax.Array:
-    """Return the unique static Hall-only linear CT/TC tensor; see docs/architecture/four_current_wiring.md."""
+    """Return the unique static Hall-only linear CT/TC tensor; see docs/theory/bispinor-gw.md#hall."""
     sigma_raw = np.asarray(sigma_H)
     if sigma_raw.shape != (3,):
         raise ValueError(
@@ -120,7 +120,7 @@ def static_hall_linear_response(sigma_H) -> jax.Array:
 
 
 def canonicalize_static_gauge_q2_tensor(S_direct) -> jax.Array:
-    """Return the unique coordinate-symmetric representative of ``q S q``; see docs/architecture/four_current_wiring.md."""
+    """Return the unique coordinate-symmetric representative of ``q S q``; see docs/theory/bispinor-gw.md#head."""
     S = jnp.asarray(S_direct)
     if tuple(S.shape) != (2, 2, 4, 4):
         raise ValueError(f"S_direct must be (2,2,4,4); got {S.shape}")
@@ -128,7 +128,7 @@ def canonicalize_static_gauge_q2_tensor(S_direct) -> jax.Array:
 
 
 def static_gauge_tensor_residuals(S_direct) -> tuple[float, float]:
-    """Return algebraic in-plane Ward and Hermiticity residuals of ``S``; see docs/architecture/four_current_wiring.md."""
+    """Return algebraic in-plane Ward and Hermiticity residuals of ``S``; see docs/theory/bispinor-gw.md#head."""
     S = np.asarray(jax.device_get(S_direct), dtype=np.complex128)
     if S.shape != (2, 2, 4, 4):
         raise ValueError(f"S_direct must be (2,2,4,4); got {S.shape}")
@@ -175,7 +175,7 @@ class BGWQ0Channel:
 def resolve_bgw_q0_channel(
     config, sym, q_wedge_full_indices, head_channel, *, kgrid,
 ):
-    """Bind the deck's reduced q0 vector to one stored W-wedge row; see docs/architecture/four_current_wiring.md."""
+    """Bind the deck's reduced q0 vector to one stored W-wedge row; see docs/theory/bispinor-gw.md#head."""
     if not bool(config.head.uses_bgw_metal_q0shift):
         return None
     if head_channel is None:
@@ -241,7 +241,7 @@ def finite_q0_epsinv_head(
     *,
     mesh_xy: Mesh,
 ):
-    """Return the full finite-q ``epsilon^{-1}_{00}``, including wings; see docs/architecture/four_current_wiring.md."""
+    """Return the full finite-q ``epsilon^{-1}_{00}``, including wings; see docs/theory/bispinor-gw.md#head."""
     chi = jnp.asarray(chi_q0) * jnp.asarray(
         chi_prefactor, dtype=jnp.asarray(chi_q0).dtype)
     W = jnp.asarray(W_q0)
@@ -324,7 +324,7 @@ def resolve_head_override(params, omega) -> HeadSample | None:
 def _check_dipole_coverage(
     dipole_path, *, nb_file, nk_file, nk_run, nb_run, nelec, print_fn,
 ):
-    """Loud coverage check on ``dipole.h5`` at the point of use; see docs/architecture/four_current_wiring.md."""
+    """Loud coverage check on ``dipole.h5`` at the point of use; see docs/theory/bispinor-gw.md#head."""
     from common import sanity
 
     if not sanity.sanity_enabled():
@@ -365,7 +365,7 @@ def _check_dipole_coverage(
 
 
 def _dipole_window_from_params(params, wfn) -> tuple[int, int, int]:
-    """``(nval, ncond, nband)`` — the RUN's resolved band window, or a refusal; see docs/architecture/four_current_wiring.md."""
+    """``(nval, ncond, nband)`` — the RUN's resolved band window, or a refusal; see docs/theory/bispinor-gw.md#head."""
     missing = [k for k in ("nval", "ncond", "nband")
                if params.get(k) is None]
     if missing:
@@ -385,7 +385,7 @@ def _dipole_window_from_params(params, wfn) -> tuple[int, int, int]:
 
 
 def _check_dipole_provenance(dipole_path, *, params, wfn, print_fn) -> None:
-    """Was ``dipole.h5`` built from THIS DFT solution, THIS band window and THIS velocity operator?; see docs/architecture/four_current_wiring.md.
+    """Was ``dipole.h5`` built from THIS DFT solution, THIS band window and THIS velocity operator?; see docs/theory/bispinor-gw.md#head.
 
     The velocity operator (V_NL included, the analytic arm, the deck's
     resolved ``vnl_velocity_sign``) is REFUSED by name on a mismatch, whatever
@@ -547,7 +547,7 @@ def resolve_head_sample(params, input_dir, wfn, sym, meta, print_fn, omega) -> H
 
 def build_S_cart_omega(wfn, sym, meta, params, dipole_path, omega,
                        *, eta: float = 0.0, print_fn=print) -> np.ndarray:
-    """``S(ω)``, the Cartesian q²-coefficient tensor, from ``dipole.h5``; see docs/architecture/four_current_wiring.md."""
+    """``S(ω)``, the Cartesian q²-coefficient tensor, from ``dipole.h5``; see docs/theory/bispinor-gw.md#head."""
     from common.chi_from_dipole import compute_S_omega_cv
     from common import timing as _tmg
     from file_io.restart_bundle import read_dipole_cv_block
@@ -592,7 +592,7 @@ def fold_small_head_wings_sharded(
     *,
     mesh_xy: Mesh,
 ) -> jax.Array:
-    """Fold a bounded small-field response through the screened body; see docs/architecture/four_current_wiring.md."""
+    """Fold a bounded small-field response through the screened body; see docs/theory/bispinor-gw.md#head."""
     n_lead = W_body_xy.ndim - 2
     arrays = (R_direct, Y_x, W_body_xy, Z_y)
     if n_lead < 0 or any(a.ndim != n_lead + 2 for a in arrays):
@@ -656,7 +656,7 @@ def fold_cartesian_head_wings_sharded(
     *,
     mesh_xy: Mesh,
 ) -> jax.Array:
-    """Charge-head adapter to :func:`fold_small_head_wings_sharded`; see docs/architecture/four_current_wiring.md."""
+    """Charge-head adapter to :func:`fold_small_head_wings_sharded`; see docs/theory/bispinor-gw.md#head."""
     return fold_small_head_wings_sharded(
         S_direct, Y_x, W_body_xy, Z_y, cell_volume, mesh_xy=mesh_xy)
 
@@ -690,7 +690,7 @@ def small_head_wing_halves_sharded(
     *,
     mesh_xy: Mesh,
 ) -> tuple[jax.Array, jax.Array]:
-    """Contract each small photon wing through one resident body ``W``; see docs/architecture/four_current_wiring.md."""
+    """Contract each small photon wing through one resident body ``W``; see docs/theory/bispinor-gw.md#head."""
     if Y_x.ndim != 3 or W_body_xy.ndim != 2 or Z_y.ndim != 3:
         raise ValueError(
             "small photon-head halves require Y=(2,4,N), W=(N,N), "
@@ -734,7 +734,7 @@ def _static_slab_photon_head_moment_chunk(
     valid_count: jax.Array,
     sample_weight: jax.Array,
 ):
-    """Accumulate one fixed-size chunk of the coupled small-head solve; see docs/architecture/four_current_wiring.md."""
+    """Accumulate one fixed-size chunk of the coupled small-head solve; see docs/architecture/four_current_wiring.md (Stage 3b)."""
     q = jnp.asarray(q_cart, dtype=jnp.float64)
     D = jnp.asarray(D_raw, dtype=jnp.complex128)
     H = jnp.asarray(H_hall, dtype=jnp.complex128)
@@ -795,7 +795,7 @@ def static_slab_photon_head_moment_chunk(
     valid_count,
     sample_weight,
 ):
-    """Validated entry to the fixed-size static slab photon-head graph; see docs/architecture/four_current_wiring.md."""
+    """Validated entry to the fixed-size static slab photon-head graph; see docs/architecture/four_current_wiring.md (Stage 3b)."""
     q_shape = tuple(np.shape(q_cart))
     d_shape = tuple(np.shape(D_raw))
     sigma_shape = tuple(np.shape(sigma_H))
@@ -835,7 +835,7 @@ def static_slab_photon_head_moment_chunk(
 
 @dataclass(frozen=True)
 class StaticPhotonQ0FactorCarrier:
-    """Bounded factors for the exact q=0 updates inserted into V and W; see docs/architecture/four_current_wiring.md."""
+    """Bounded factors for the exact q=0 updates inserted into V and W; see docs/architecture/four_current_wiring.md (Stage 3b)."""
 
     bare_pair: tuple[jax.Array, jax.Array]
     screened_pairs: tuple[tuple[jax.Array, jax.Array], ...]
@@ -1119,7 +1119,7 @@ def complete_static_slab_photon_q0(
     mesh_xy: Mesh,
     family_plans: tuple = (),
 ) -> tuple[jax.Array, jax.Array, StaticSlabPhotonHeadCompletion]:
-    """Complete bare and screened packed photon operators in the Γ cell; see docs/architecture/four_current_wiring.md."""
+    """Complete bare and screened packed photon operators in the Γ cell; see docs/architecture/four_current_wiring.md (Stage 3b)."""
     from .photon_layout import (
         MAX_Q0_UPDATE_RANK, add_photon_q0_low_rank)
     from .static_gauge_response import require_static_photon_head_response
@@ -1332,7 +1332,7 @@ def complete_static_slab_photon_q0(
 
 def resolve_head_S_cart(restart_file=None, *, input_file=None, wfn=None,
                         sym=None, meta=None, params=None, print_fn=print):
-    """The ``S`` tensor behind the restart's ``whead`` — read it, or rebuild it; see docs/architecture/four_current_wiring.md."""
+    """The ``S`` tensor behind the restart's ``whead`` — read it, or rebuild it; see docs/theory/bispinor-gw.md#head."""
     if restart_file is not None:
         try:
             from file_io.restart_bundle import read_metadata
@@ -1362,7 +1362,7 @@ def resolve_head_S_cart(restart_file=None, *, input_file=None, wfn=None,
 
 
 class HeadResolver:
-    """Memoized q=0 head-sample resolver for a single GW run; see docs/architecture/four_current_wiring.md."""
+    """Memoized q=0 head-sample resolver for a single GW run; see docs/theory/bispinor-gw.md#head."""
 
     __slots__ = ("_params", "_input_dir", "_wfn", "_sym", "_meta",
                  "_print_fn", "_cache", "_direct_cache", "_policy",
@@ -1512,7 +1512,7 @@ def fit_head_ppm(
     wcoul0_probe: float,
     probe_omega: complex,
 ) -> HeadGNParams:
-    """Fit a scalar PPM pole from two W^c head samples; see docs/architecture/four_current_wiring.md."""
+    """Fit a scalar PPM pole from two W^c head samples; see docs/theory/four-current-head-corrections.md#ppm-head."""
 
     z = complex(probe_omega)
     omega_2_sq = float((z * z).real)
@@ -1579,7 +1579,7 @@ def fit_head_ppm_from_samples(
     *,
     probe_omega: complex,
 ) -> HeadGNParams:
-    """Fit the scalar PPM head from resolved static and probe-frequency samples; see docs/architecture/four_current_wiring.md."""
+    """Fit the scalar PPM head from resolved static and probe-frequency samples; see docs/theory/four-current-head-corrections.md#ppm-head."""
     return fit_head_ppm(
         vc0=float(head_static.vc0.real),
         wcoul0_static=float(head_static.wcoul0.real),
@@ -1593,7 +1593,7 @@ def fit_head_hl_analytic(
     wcoul0_static: float,
     omega_p_sq_ry: float,
 ) -> HeadGNParams:
-    """Set the HL-PPM head pole analytically from the bulk plasmon, BGW-style; see docs/architecture/four_current_wiring.md."""
+    """Set the HL-PPM head pole analytically from the bulk plasmon, BGW-style; see docs/theory/four-current-head-corrections.md#ppm-head."""
     w1 = wcoul0_static - vc0  # W^c(0) head, in a.u.
     if abs(w1) < 1.0e-30 or abs(vc0) < 1.0e-30:
         return HeadGNParams(
@@ -1641,7 +1641,7 @@ def fit_head_with_fixed_omega(
     wcoul0_static: float,
     omega_h_ry: float,
 ) -> HeadGNParams:
-    """Build head params with a user-supplied pole frequency Ω_h; see docs/architecture/four_current_wiring.md."""
+    """Build head params with a user-supplied pole frequency Ω_h; see docs/theory/four-current-head-corrections.md#ppm-head."""
     w1 = wcoul0_static - vc0
     omega_h = float(omega_h_ry)
     omega_h_sq = omega_h ** 2
@@ -1685,7 +1685,7 @@ def compute_static_head_terms(
     nk_tot: int,
     source: str = "unknown",
 ) -> StaticHeadTerms:
-    """Build exact static COHSEX head terms (Σ^X, Σ^SX, Σ^{SX-X}, Σ^COH) in band space; see docs/architecture/four_current_wiring.md."""
+    """Build exact static COHSEX head terms (Σ^X, Σ^SX, Σ^{SX-X}, Σ^COH) in band space; see docs/theory/four-current-head-corrections.md#static-head."""
 
     occ_arr = jnp.asarray(occ, dtype=jnp.complex128)
     ones = jnp.ones_like(occ_arr, dtype=jnp.complex128)
@@ -1809,7 +1809,7 @@ def _expand_band_diagonal_to_kij_jit(diag, *, nk_tot: int, nb: int):
 
 
 def expand_band_diagonal_to_kij(diag: jnp.ndarray, nk_tot: int) -> jnp.ndarray:
-    """Broadcast a band-diagonal shift to a dense ``(nk, nb, nb)`` matrix; see docs/architecture/four_current_wiring.md."""
+    """Broadcast a band-diagonal shift to a dense ``(nk, nb, nb)`` matrix; see docs/theory/four-current-head-corrections.md#static-head."""
     diag_arr = jnp.asarray(diag, dtype=jnp.complex128)
     if diag_arr.ndim == 1:
         nb = int(diag_arr.shape[0])
@@ -1830,7 +1830,7 @@ def static_head_terms_to_kij(
     nk_tot: int,
     do_screened: bool,
 ) -> tuple[jnp.ndarray, jnp.ndarray]:
-    """Expand exact static head shifts to dense ``(k, i, j)`` matrices; see docs/architecture/four_current_wiring.md."""
+    """Expand exact static head shifts to dense ``(k, i, j)`` matrices; see docs/theory/four-current-head-corrections.md#static-head."""
 
     sx_diag = head.sigma_sx_diag if do_screened else head.sigma_x_diag
     return (
@@ -1850,7 +1850,7 @@ def compute_ppm_head_sigma_kij(
     nk_tot: int,
     eta: float = 1.0e-6,
 ) -> np.ndarray:
-    """q→0, G=G'=0 head contribution to PPM ``Σ^c_kij(ω)``; see docs/architecture/four_current_wiring.md."""
+    """q→0, G=G'=0 head contribution to PPM ``Σ^c_kij(ω)``; see docs/theory/four-current-head-corrections.md#ppm-head."""
 
     omega = np.asarray(omega_grid_ry, dtype=np.float64).reshape(-1)
     enk = np.asarray(enk_ry, dtype=np.float64)
@@ -1879,7 +1879,7 @@ def compute_ppm_head_sigma_diag(
     nk_tot: int,
     eta: float = 1.0e-6,
 ) -> np.ndarray:
-    """Band-DIAGONAL of :func:`compute_ppm_head_sigma_kij` — ``(nω, nk, nb)``; see docs/architecture/four_current_wiring.md."""
+    """Band-DIAGONAL of :func:`compute_ppm_head_sigma_kij` — ``(nω, nk, nb)``; see docs/theory/four-current-head-corrections.md#ppm-head."""
     omega = np.asarray(omega_grid_ry, dtype=np.float64).reshape(-1)
     enk = np.asarray(enk_ry, dtype=np.float64)
     if enk.ndim != 2:
@@ -1913,7 +1913,7 @@ def on_shell_occupied_head_sigma_ry(
     nk_tot: int,
     eta: float = 1.0e-6,
 ) -> float:
-    """Re(Σ^head) for an OCCUPIED band evaluated ON SHELL (ω = ε_nk − E_F); see docs/architecture/four_current_wiring.md."""
+    """Re(Σ^head) for an OCCUPIED band evaluated ON SHELL (ω = ε_nk − E_F); see docs/theory/four-current-head-corrections.md#ppm-head."""
     val = compute_ppm_head_sigma_diag(
         head,
         omega_grid_ry=np.zeros(1, dtype=np.float64),
@@ -1938,7 +1938,7 @@ def compute_complex_pole_head_sigma_diag(
     cell_volume: float,
     nk_tot: int,
 ) -> np.ndarray:
-    """Band-diagonal head self-energy for generic retarded complex poles; see docs/architecture/four_current_wiring.md."""
+    """Band-diagonal head self-energy for generic retarded complex poles; see docs/theory/bispinor-gw.md#head."""
     omega = np.asarray(omega_grid_ry, dtype=np.float64).reshape(-1)
     enk = np.asarray(enk_ry, dtype=np.float64)
     if enk.ndim != 2:
@@ -2037,7 +2037,7 @@ def apply_q0_head_rank1(
     *,
     omega_index: int = 0,
 ):
-    """Inject the q=0 Coulomb head as a rank-1 update in the centroid basis; see docs/architecture/four_current_wiring.md."""
+    """Inject the q=0 Coulomb head as a rank-1 update in the centroid basis; see docs/theory/bispinor-gw.md#head."""
     g0g0 = jnp.einsum('m,n->mn', jnp.conj(G0_mu_nu), G0_mu_nu)
     v_scalar, w_scalar = _head_rank1_scalars(
         vhead, whead, cell_volume, omega_index,
@@ -2062,7 +2062,7 @@ def apply_q0_head_rank1_sharded(
     *,
     omega_index: int = 0,
 ):
-    """Sharded q=0 head injection — local on every proc; see docs/architecture/four_current_wiring.md."""
+    """Sharded q=0 head injection — local on every proc; see docs/theory/bispinor-gw.md#head."""
     g0g0 = jnp.conj(g0_X)[:, None] * g0_Y[None, :]
     v_scalar, w_scalar = _head_rank1_scalars(
         vhead, whead, cell_volume, omega_index,

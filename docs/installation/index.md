@@ -10,13 +10,22 @@ because the JAX fallbacks were deleted
 refuses at startup, before the first `jit`. `pyproject.toml` owns the Python
 pins; [ffi_layout.md](../architecture/ffi_layout.md) owns the native design.
 
-## One route per platform
+## Runtime defaults {#defaults}
 
-| platform | route | page |
+On NERSC Perlmutter the default runtime is the module stack: the HPC SDK
+toolchain and math libraries, one sealed FFI bundle, and NCCL over OFI
+([Perlmutter module](perlmutter-module.md)). Everywhere else the default is
+the pip clone route: a clone, `uv sync` with the platform's JAX extra, and
+both FFI legs built from the stage scripts. A site with a tuned stack keeps
+it in a `config/<machine>/` directory (`config/perlmutter/`,
+`config/frontera/`); `config/cloud/` is the all-wheel CUDA route for a
+machine with only a driver.
+
+| platform | default | page |
 |---|---|---|
-| NERSC Perlmutter (A100, CUDA 13.2, JAX 0.9.1) | the default is a module: a venv, a source snapshot and a sealed pair, built by `config/perlmutter/module/`. A clone also works: `uv sync --extra cuda13`, build both legs with `config/perlmutter/build_ffi_{host,cuda}.sh`, launch with `srun` | [Perlmutter module](perlmutter-module.md) (maintainers); [Perlmutter](perlmutter.md) (clone) |
-| TACC Frontera (CPU) | build the host leg with `config/frontera/build_ffi_host.sh` | [Frontera](../environment/machines/frontera.md), `config/frontera/README.md` |
-| another site | build both legs from the stage scripts and seal them | [Building the FFI libraries](../building_ffi.md), [FFI native libraries](ffi-native-libs.md) |
+| NERSC Perlmutter (A100, CUDA 13.2, JAX 0.9.1) | the module stack, built by `config/perlmutter/module/`; a clone also runs there (`uv sync --extra cuda13`, `config/perlmutter/build_ffi_{host,cuda}.sh`, plain `srun`) | [Perlmutter module](perlmutter-module.md); [Perlmutter clone](perlmutter.md) |
+| TACC Frontera (CPU) | the clone route with the host leg from `config/frontera/build_ffi_host.sh` | [Frontera](../environment/machines/frontera.md), `config/frontera/README.md` |
+| any other machine | the clone route; build both legs from the stage scripts and seal them | [Building the FFI libraries](../building_ffi.md), [FFI native libraries](ffi-native-libs.md), `config/cloud/README.md` |
 
 ## Startup refusals and their fix
 

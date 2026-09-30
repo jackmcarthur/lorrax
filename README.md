@@ -16,7 +16,7 @@ Available as console commands: `gw_jax`, `lorrax-gw`, `lorrax-centroids` (= `cen
 
 [Try it](docs/index.md#try-it) runs the bundled COHSEX fixture, and the [Quickstart](docs/quickstart.md) walks through it. The native FFI pair is required at every process count ([Installation](docs/installation/index.md)).
 
-On NERSC Perlmutter, [installation/perlmutter.md](docs/installation/perlmutter.md) installs a clone on any account (`uv sync --extra cuda13`, two build scripts) and runs the suite with `srun`; project m4598 can use the `lorrax_A` module and its `lx` launcher instead ([`docs/environment/machines/perlmutter.md`](docs/environment/machines/perlmutter.md)). On Frontera this differs; see [`docs/environment/machines/frontera.md`](docs/environment/machines/frontera.md) and the working examples below.
+Which runtime is the default on which machine: [runtime defaults](docs/installation/index.md#defaults). A NERSC Perlmutter clone for development is [installation/perlmutter.md](docs/installation/perlmutter.md) (`uv sync --extra cuda13`, two build scripts, `srun`). On Frontera this differs; see [`docs/environment/machines/frontera.md`](docs/environment/machines/frontera.md) and the working examples below.
 
 On TACC Frontera (CPU, apptainer + srun), working invocations from the certified scripts (`config/frontera/templates/gw_dev.sbatch`, the mos2_4x4_test sbatch family):
 

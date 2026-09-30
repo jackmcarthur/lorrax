@@ -835,7 +835,7 @@ def _mpa_sigma_model_resources(W_by_role, sigma_w_model, head_correction=None):
 
 def _validate_sigma_stage(
         Gij, config, mode, print_fn):
-    """Validate the Sigma stage; see docs/architecture/four_current_wiring.md."""
+    """Validate the Sigma stage; see docs/theory/bispinor-gw.md#dyson."""
     refuse_unimplemented_compute_mode(mode, context="compute_sigma_xc")
     refuse_explicit_gij(Gij)
     validate_band_extrapolation(config, mode, print_fn=print_fn)
@@ -1487,7 +1487,7 @@ def compute_sigma_xc(
     fixed_quadrature_session=None,
     print_fn: Callable = print,
 ) -> SigmaResult:
-    """Produce Sigma and Hartree fields; see docs/architecture/four_current_wiring.md.
+    """Produce Sigma and Hartree fields; see docs/theory/bispinor-gw.md#dyson.
 
     ``photon_response`` is consumed: its packed V and W are deleted once the
     static channels have read them.

@@ -1,10 +1,10 @@
 # Perlmutter module (maintainers)
 
-The module is Perlmutter's default runtime. One module is one venv, one
+The module stack is Perlmutter's default runtime
+([runtime defaults](index.md#defaults)). One module is one venv, one
 `git archive` source snapshot and one sealed FFI bundle, under an install
-prefix. The recipe is `config/perlmutter/module/`. The clone route
-([Perlmutter](perlmutter.md)) is the portable default on other machines and
-for development.
+prefix. The recipe is `config/perlmutter/module/`. A clone for development
+is [Perlmutter](perlmutter.md).
 
 | what | pinned in |
 |---|---|

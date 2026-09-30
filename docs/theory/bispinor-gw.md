@@ -1,7 +1,9 @@
 # Bispinor (four-current) GW
 
 This page owns the theory of bispinor GW: the carrier, the interaction, the
-$1/c$ order of every term, and which terms each `bispinor_gw` route keeps.
+$1/c$ order of every term, which terms each `bispinor_gw` route keeps, the
+static Hall term, and the code contracts of the Γ head, Dyson solve and Σ
+entry.
 The Γ-cell heads and the frequency model per channel:
 [Four-current heads and frequency](four-current-head-corrections.md).
 Producers, shapes, sharding, refusals:
@@ -252,7 +254,83 @@ and the charge weight has $1$ for $\alpha^i$. Current fit matrices are
 Hermitian indefinite (ridged pivoted LU); the charge one is semidefinite
 ([ζ fit by μ-batches](../architecture/zeta_fit_mubatch.md)).
 
-## 8. Which route
+## 8. The static Hall term {#hall}
+
+The packed static head ([heads §4.2](four-current-head-corrections.md#coupled-gamma-solve))
+admits one $q$-linear structure, $\Pi^{0i}=-i\epsilon_{bai}\sigma_H^bq_a$,
+TC $=$ CT$^\dagger$, CC and TT zero at this order
+(`gw.head_correction.static_hall_linear_response`). For a gapped system it
+is the Chern–Simons term, quantized (TKNN):
+$\sigma_{xy}(\mathbf q\to0,0)=Ce^2/h$,
+$C=(2\pi)^{-1}\sum_{n\in\rm occ}\int_{\rm BZ}\Omega^z_n\,d^2k\in\mathbb Z$.
+The producer evaluates this occupied Berry sum,
+$\sigma_H^b=-(\alpha_{\rm FS}C_s/2\Omega)\operatorname{Im}c_B^b$ with state
+capacity $C_s$ (`gw.qsgw_head.raw_hall_pseudovector_sharded`). Its
+transaction accepts only 0/1 occupations, and degenerate, differently
+occupied states refuse (`GATE static_gauge_raw_hall_degenerate`). Hence $\sigma_H=0$ for a
+Chern-trivial insulator in the complete-basis, converged-$k$ limit (the
+absent-artifact default is exact), $\sigma_H\in(\alpha_{\rm FS}C_s/8\pi L_z)\mathbb Z$
+for a Chern insulator, and a static Hall term would carry new information
+only in a metal, which the producer refuses. The next CT moment,
+$\langle W^{0i}q_a\rangle$ with $W^{0i}\approx D_{00}R^{0i}D_{ii}$, has the
+static magnetoelectric response as its $q^2$ coefficient and needs $P$ and
+$T$ broken: with inversion CT starts at $O(q^3)$ and the moment is
+$O(1/N_k)$; without it the moment survives averaging, reduced by
+$(Z\alpha_{\rm FS})^2$ and $\alpha_{\rm ME}\le\alpha_{\rm FS}/2$. The
+finite-frequency Hall/Kerr and antisymmetric TT responses ($\omega\ne0$,
+$O(q^2)$) lie outside the static head; the Goldstone-enhanced transverse
+spin susceptibility of a ferromagnet is a ladder effect outside RPA
+(`w_bse` is charge-only).
+
+## 9. Code contracts {#contracts}
+
+Source docstrings point here; the head physics is
+[heads §3](four-current-head-corrections.md#charge-head).
+
+### 9.1 Γ head {#head}
+
+`gw.head_correction` fills the $\mathbf q\to0$, $\mathbf G=0$ slot of the
+scalar charge channel and the packed photon operator. $S(\omega)$ has one
+`dipole.h5` build, `build_S_cart_omega` [`(3,3)` c128,
+$1/({\rm Ry\,bohr^2})$, [convention](s-tensor-convention.md)], also used
+when a restart lacks `S_cart_head`; the file's coverage and provenance (WFN
+sha256, band window, $V_{\rm NL}$, arm, `vnl_velocity_sign`) go through
+`common.sanity`. The fold $R^{\rm eff}=R^0+YWZ/\Omega$ takes $Y$ on `x`,
+$W$ on `(x,y)`, $Z$ on `y` and never gathers the body; `HeadResponseKind`
+`MICRO_REDUCIBLE` already contains it and is never folded again. The packed
+$S$ is the symmetric representative of $qSq$, certified by
+$q_iq_aq_bS^{ab}_{iJ}=0$, $q_aq_bS^{ab}_{Ii}q_i=0$ and Hermiticity over
+$\max|S|$. At a finite $q_0$ on the WFN grid,
+$\epsilon^{-1}_{00}=1+v_0\langle g|\chi(1+W\chi)|\bar g\rangle$ comes from
+the solved tile. The complex-pole head is
+$\Sigma^{\rm head}_n(\omega)=(\Omega N_k)^{-1}\sum_pR_p[f/(\delta+\Omega_p)+(1-f)/(\delta-\Omega_p)]$,
+$\delta=\omega-(\epsilon-E_F)$. The rank-1 insertion
+$(W_h/\Omega)\,\bar g_0\otimes g_0$ is local with $g_0$ at `P('x')` and
+`P('y')`.
+
+### 9.2 Response, Dyson solve and Σ entry {#dyson}
+
+Vertex orientations are completed in R space as forward $+$
+reverse$^\dagger$; $2\times$forward holds only in a real gauge. Without
+time reversal, $\chi_0(z)=F_q(z)+\overline{F_{-q}(-\bar z)}$ from one node
+sweep. `solve_w` forms $W=(1-C\,V\chi_0)^{-1}V$ on flat $q$
+`(n_q, μ, μ)` at `P(None,'x','y')`, $V$ and $\chi_0$ on one square carrier,
+with $C=2/(\sqrt{N_k}\,n_{\rm spin}n_{\rm spinor})$ and $n_{\rm spinor}$
+from `meta.nspinor_wfnfile`, never the bispinor width (that halves every
+block); the `linalg` plan refuses rather than downgrades, and the gapped
+Laplace $\chi_0$ refuses $c_{\min}\le v_{\max}$
+(`GATE chi0_laplace_needs_gap`). No-pair current
+blocks carry no Ward contact; the packed response requires
+`current_contact = ward_subtracted_no_pair`. On bispinor decks the CC tile
+of `compute_V_q` is the scalar $V$, checked for $V_q=\overline{V_{-q}}$
+(blind at $q=-q$; `sanity.report_parent_covariance` discriminates).
+`compute_sigma_xc` takes $W$ by role (`static`, `probe`, `mpa_fit`,
+`shared_pole`); a new mode needs its roles in
+`screening.screening_requests_for`, a `gw_config.MODE_SIGMA_CHANNELS` row and
+a branch, else it refuses by name. `wfns_transverse` and
+`bispinor_v_q_path` are both-or-neither.
+
+## 10. Which route
 
 | material | route |
 |---|---|
@@ -264,7 +342,7 @@ Hermitian indefinite (ridged pivoted LU); the charge one is semidefinite
 
 Production keys: [Production QSGW](../how-to/production-qsgw.md).
 
-## 9. Open
+## 11. Open
 
 1. No Dirac–Coulomb–Breit reference certifies the absolute $\Sigma^B$.
 2. The dynamical mixed terms on a time-reversal-invariant material are unmeasured.

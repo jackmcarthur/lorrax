@@ -1,10 +1,9 @@
 # Perlmutter (NERSC)
 
 The GPU reference platform: A100 40/80 GB nodes, bare-host CUDA 13.2, JAX and
-JAXLIB 0.9.1. A clone installs with `uv sync --extra cuda13` and builds its own
-FFI pair ([install page](../../installation/perlmutter.md)); project m4598 can
-instead use one sealed bundle selected by the `lorrax_A` module and launched
-by `lx`. Porting knobs are in [`config/README.md`](../../../config/README.md);
+JAXLIB 0.9.1. The default runtime is the module
+([runtime defaults](../../installation/index.md#defaults)); a development
+clone builds its own FFI pair ([install page](../../installation/perlmutter.md)). Porting knobs are in [`config/README.md`](../../../config/README.md);
 JAX and the GPU memory pool are in the [overview](../overview.md#gpu-pool).
 
 **Certified scope.** GPU: 1–4 nodes × 4 A100 at P=4 and P=16. CPU

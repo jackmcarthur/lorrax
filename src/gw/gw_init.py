@@ -2552,7 +2552,7 @@ def _finalize_vq_views(
 
 
 def compute_V_q(zeta_h5_path, wfn, meta, mesh_xy, cfg, mem_est=None, print_fn=print, bgw_v_grid_fn=None, sym=None, centroid_indices=None):
-	"""Produce bare Coulomb and head views; see docs/architecture/four_current_wiring.md."""
+	"""Produce bare Coulomb and head views; see docs/theory/bispinor-gw.md#dyson."""
 	from .compute_vcoul import compute_all_V_q
 	photon_g0_vectors = None
 

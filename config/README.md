@@ -3,9 +3,11 @@
 This directory describes site capabilities. It does not own allocation,
 launcher, JAX, HDF5, compile-cache, or profiling policy.
 
-On Perlmutter, a clone installs and runs with plain `srun`
-([docs/installation/perlmutter.md](../docs/installation/perlmutter.md));
-`config/perlmutter/build_ffi_{host,cuda}.sh` build its FFI pair. Project m4598
+Which runtime is the default on which machine:
+[runtime defaults](../docs/installation/index.md#defaults). A Perlmutter
+development clone builds its FFI pair with
+`config/perlmutter/build_ffi_{host,cuda}.sh`
+([docs/installation/perlmutter.md](../docs/installation/perlmutter.md)). Project m4598
 can use the maintainers' `lx` launcher, which selects the `lorrax_A` base
 module by default (`LX_BASE_MODULE` is an expert override):
 

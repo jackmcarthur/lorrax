@@ -45,7 +45,7 @@ _FRACTIONAL_PAIR_TILE = 32
 
 
 def _complete_static_vertex_orientations(forward_R, reverse_R=None):
-    """Return both ordered Hermitian-vertex orientations in R space; see docs/architecture/four_current_wiring.md."""
+    """Return both ordered Hermitian-vertex orientations in R space; see docs/theory/bispinor-gw.md#dyson."""
     if reverse_R is None:
         # Preserve the incumbent scalar graph and arithmetic order exactly.
         return forward_R + jnp.conj(forward_R)
@@ -1093,7 +1093,7 @@ def _get_chi_fractional_contour_kernel_face(
 
 def _get_w_solve_fn_local(mesh_xy: Mesh, nq: int, n_rmu: int,
                           n_rmu_logical: int | None = None):
-    """W = (I - V χ)⁻¹ V via q-parallel shard_map; see docs/architecture/four_current_wiring.md."""
+    """W = (I - V χ)⁻¹ V via q-parallel shard_map; see docs/theory/bispinor-gw.md#dyson."""
     from common.shard_map import shard_map
 
     n_log = int(n_rmu_logical) if n_rmu_logical is not None else int(n_rmu)
@@ -1223,7 +1223,7 @@ def _get_w_solve_fn_local(mesh_xy: Mesh, nq: int, n_rmu: int,
 def _get_w_solve_fn_distributed(mesh_xy: Mesh, nq: int, n_rmu: int,
                                 n_rmu_logical: int,
                                 distrib_la_batched_route: str = "batch_reshard"):
-    """W = solve(A, V), A = (1 − pref·V·χ₀), everything 2-D sharded; see docs/architecture/four_current_wiring.md."""
+    """W = solve(A, V), A = (1 − pref·V·χ₀), everything 2-D sharded; see docs/theory/bispinor-gw.md#dyson."""
     n_ext = int(n_rmu)
     n_log = int(n_rmu_logical)
     if n_log > n_ext:
@@ -1410,7 +1410,7 @@ def response_coulomb_powers(meta, config, *, mesh_xy, bank_io, q_span):
 
 
 def _w_solve_pref_scalar(meta) -> float:
-    """The physical-state prefactor in front of χ₀ in the Dyson solve; see docs/architecture/four_current_wiring.md."""
+    """The physical-state prefactor in front of χ₀ in the Dyson solve; see docs/theory/bispinor-gw.md#dyson."""
     nq = int(meta.nk_tot)
     nspin = max(1, int(getattr(meta, 'nspin', 1)))
     nspinor_wfnfile = max(1, int(meta.nspinor_wfnfile))
@@ -1424,7 +1424,7 @@ def _resolve_w_solve_fn(meta, mesh_xy, *, n_rmu, n_rmu_logical=None,
                         dyson_solver=None,
                         distrib_la_batched_route: str = "batch_reshard",
                         pref=None, nq=None):
-    """Return ``(solve_fn, pref)`` for the requested W plan; see docs/architecture/four_current_wiring.md.
+    """Return ``(solve_fn, pref)`` for the requested W plan; see docs/theory/bispinor-gw.md#dyson.
 
     ``pref``/``nq`` given (a caller with no ISDF ``meta``, e.g. the plane-wave
     response sphere): χ₀'s prefactor and the q count come from the caller."""
@@ -1453,7 +1453,7 @@ def _resolve_w_solve_fn(meta, mesh_xy, *, n_rmu, n_rmu_logical=None,
 
 def _require_w_operand_geometry(V_q, chi0_q, meta, mesh_xy, *,
                                 n_rmu_logical=None, axis=None):
-    """Authenticate the public Dyson carrier without owning its q set; see docs/architecture/four_current_wiring.md.
+    """Authenticate the public Dyson carrier without owning its q set; see docs/theory/bispinor-gw.md#dyson.
 
     ``axis`` (a ``runtime.padding.PaddedAxis``) is the carrier of a caller with
     no ISDF ``meta``; its logical prefix is the solve extent."""
@@ -1494,7 +1494,7 @@ def solve_w(V_q, chi0_q, meta, mesh_xy, *, dyson_solver=None,
             n_rmu_logical=None,
             distrib_la_batched_route: str = "batch_reshard",
             pref=None, axis=None):
-    """W(q) = (I − pref·V χ₀)⁻¹ V via a Dyson solve; see docs/architecture/four_current_wiring.md.
+    """W(q) = (I − pref·V χ₀)⁻¹ V via a Dyson solve; see docs/theory/bispinor-gw.md#dyson.
 
     ISDF callers pass ``meta`` (the prefactor 2/(√N_k·n_spin·n_spinor) and the
     centroid carrier).  A caller with no ISDF ``meta`` (the plane-wave response
@@ -1564,7 +1564,7 @@ def _gap_edges(wfns, energy_reference):
             "pair grow with tau; the sum diverges instead of converging\n"
             "  fix:  a gapless system takes the fractional-occupation routes "
             "(compute_mode = mpa on a WFN whose occupations make it a metal)\n"
-            "  doc:  docs/architecture/four_current_wiring.md")
+            "  doc:  docs/theory/bispinor-gw.md#dyson")
     return eref, vmax, cmin
 
 
@@ -1601,7 +1601,7 @@ def _run_minimax_chi(wfns, meta, mesh_xy, args, *, n_out=1,
 
 
 def _laplace_chi_args(wfns, quad, energy_reference):
-    """Real-node operands with the one-orientation prefold in the weights; see docs/architecture/four_current_wiring.md."""
+    """Real-node operands with the one-orientation prefold in the weights; see docs/theory/bispinor-gw.md#dyson."""
     eref, vmax, cmin = _gap_edges(wfns, energy_reference)
     E_gap = cmin - vmax
     tau = np.asarray(quad.tau, dtype=np.float64)
@@ -1613,13 +1613,13 @@ def _laplace_chi_args(wfns, quad, energy_reference):
 
 
 def compute_chi0(wfns, quad, meta, mesh_xy, *, energy_reference=0.0):
-    """Compute χ₀(q) from a wavefunction bundle and minimax quadrature; see docs/architecture/four_current_wiring.md."""
+    """Compute χ₀(q) from a wavefunction bundle and minimax quadrature; see docs/theory/bispinor-gw.md#dyson."""
     return _run_minimax_chi(
         wfns, meta, mesh_xy, _laplace_chi_args(wfns, quad, energy_reference))
 
 
 def precompile_chi0(wfns, quad, meta, mesh_xy, *, energy_reference=None):
-    """AOT lower+compile of the χ₀ minimax kernel at the real input shapes/shardings — warms the JAX in-process cache so the first ``compute_chi0`` call is execution-only; see docs/architecture/four_current_wiring.md."""
+    """AOT lower+compile of the χ₀ minimax kernel at the real input shapes/shardings — warms the JAX in-process cache so the first ``compute_chi0`` call is execution-only; see docs/theory/bispinor-gw.md#dyson."""
     if len(np.asarray(quad.tau)) == 0:
         return  # compute_chi0 falls through to a static-zeros path — nothing to compile
     _run_minimax_chi(wfns, meta, mesh_xy,
@@ -1657,7 +1657,7 @@ def _chi0_imag_ordered_kernel_args(wfns, quad, energy_reference):
 
 def compute_chi0_imag_ordered(wfns, quad, meta, mesh_xy, *, q_neg_index,
                               energy_reference=0.0):
-    """χ₀(q; iω_p) with BOTH particle-hole orientations carrying their own frequency weight — the route for a deck whose measured time-reversal verdict is false; see docs/architecture/four_current_wiring.md."""
+    """χ₀(q; iω_p) with BOTH particle-hole orientations carrying their own frequency weight — the route for a deck whose measured time-reversal verdict is false; see docs/theory/bispinor-gw.md#dyson."""
     args = _chi0_imag_ordered_kernel_args(wfns, quad, energy_reference)
     F_q = _run_minimax_chi(wfns, meta, mesh_xy, args, complex_contour=True)
     # On the imaginary axis -conj(z) = z: the partner is the same sweep.
@@ -1697,7 +1697,7 @@ def _complete_ordered(F_q_z, F_q_reflected, q_neg):
 
 def _chi0_contour_alpha_rows(tau, weight_rows, frequency_sign, z_values,
                              E_gap):
-    """Complete contour weights for both independent-particle resolvents; see docs/architecture/four_current_wiring.md."""
+    """Complete contour weights for both independent-particle resolvents; see docs/theory/bispinor-gw.md#dyson."""
     tau = np.asarray(tau, dtype=np.complex128)
     weight_rows = np.asarray(weight_rows, dtype=np.complex128)
     frequency_sign = np.asarray(frequency_sign)
@@ -1730,7 +1730,7 @@ def _chi0_contour_kernel_args(wfns, tau, weight_rows, frequency_sign,
 
 def compute_chi0_contour(wfns, tau, weight_rows, frequency_sign, z_values,
                          meta, mesh_xy, *, energy_reference=0.0):
-    """Evaluate several complex-frequency chi0 values in one node sweep; see docs/architecture/four_current_wiring.md."""
+    """Evaluate several complex-frequency chi0 values in one node sweep; see docs/theory/bispinor-gw.md#dyson."""
     args, n_out = _chi0_contour_kernel_args(
         wfns, tau, weight_rows, frequency_sign, z_values, energy_reference)
     return _run_minimax_chi(wfns, meta, mesh_xy, args, n_out=n_out,
@@ -1749,7 +1749,7 @@ def compute_chi0_contour_ordered(
     energy_reference=0.0,
     return_reflected=False,
 ):
-    """Evaluate magnetic contour samples with both ordered orientations; see docs/architecture/four_current_wiring.md."""
+    """Evaluate magnetic contour samples with both ordered orientations; see docs/theory/bispinor-gw.md#dyson."""
     time = np.asarray(time, dtype=np.float64)
     weights = np.asarray(weights, dtype=np.float64)
     z = np.asarray(z_values, dtype=np.complex128)
@@ -1842,7 +1842,7 @@ def matsubara_rule(wfns, occupation_state, nu_indices, *, rel_tol):
             "  want: 'fd' (beta = 1 / occ_smearing_width_ry)\n"
             "  why:  KMS bounds every tau factor only for Fermi-Dirac occupations; "
             "Methfessel-Paxton breaks it, and a step table is the gapped producer's beta -> infinity case\n"
-            "  doc:  docs/architecture/four_current_wiring.md")
+            "  doc:  docs/architecture/fractional_chi0_response_face.md")
     beta = 1.0 / float(occupation_state.smearing_width_ry)
     mu = float(occupation_state.mu_ry)
     live_stop = int(wfns.slices.cond.stop)
@@ -1873,7 +1873,7 @@ def matsubara_rule(wfns, occupation_state, nu_indices, *, rel_tol):
 
 def compute_chi0_matsubara(wfns, meta, mesh_xy, *, occupation_state, nu_indices,
                            rel_tol, vertex="charge", ordered=False):
-    """chi0(q; i nu_n) at bosonic Matsubara frequencies from one finite-temperature tau sweep; see docs/architecture/four_current_wiring.md.
+    """chi0(q; i nu_n) at bosonic Matsubara frequencies from one finite-temperature tau sweep; see docs/architecture/fractional_chi0_response_face.md.
 
     ``nu_n = 2 pi n / beta`` with ``beta = 1 / smearing_width_ry`` of a Fermi-Dirac
     occupation state.  Every Green factor is KMS-bounded, ``f e^{(e-mu)tau}`` and
@@ -2016,7 +2016,7 @@ def compute_experimental_no_pair_photon_chi0(
     current_contact: str = _WARD_SUBTRACTED_NO_PAIR,
     energy_reference=0.0,
 ):
-    """Build all sixteen no-pair blocks with an experimental TT proxy; see docs/architecture/four_current_wiring.md."""
+    """Build all sixteen no-pair blocks with an experimental TT proxy; see docs/architecture/four_current_wiring.md (Stage 3a)."""
     from .photon_layout import pack_photon_operator
 
     layout.assert_mesh(mesh_xy)
@@ -2169,7 +2169,7 @@ def _load_static_photon_hall(
     config, meta, mesh_xy, wfn, wfn_fingerprint_binding, *,
     screen_current: bool, print_fn=print,
 ):
-    """Load/authenticate the optional Hall artifact and gate its model; see docs/architecture/four_current_wiring.md."""
+    """Load/authenticate the optional Hall artifact and gate its model; see docs/architecture/four_current_wiring.md (Stage 3b)."""
     hall_path = str(config.paths.static_gauge_hall_file).strip()
     if not hall_path:
         if jax.process_index() == 0:
@@ -2553,7 +2553,7 @@ def compute_static_photon_response(
     distrib_la_batched_route: str = "batch_reshard",
     print_fn=print,
 ) -> StaticPhotonResponse:
-    """Produce the static photon response; see docs/architecture/four_current_wiring.md."""
+    """Produce the static photon response; see docs/architecture/four_current_wiring.md (Stage 3a)."""
     (coupled_head, screen_current, hall, head_policy) = _resolve_static_photon_policy(
         config, screen_current, dyson_solver, W_charge, wfn, photon_g0_vectors,
         wf_binding_charge, wf_binding_transverse, wfn_fingerprint_binding, wfns_charge,
@@ -2607,7 +2607,7 @@ def chi_band_stop(meta, wfns):
 
 
 def _occupation_support_slices(occupations, band_stop=None):
-    """Smallest contiguous f and (1-f) band supports inside the chi band window; see docs/architecture/four_current_wiring.md.
+    """Smallest contiguous f and (1-f) band supports inside the chi band window; see docs/architecture/fractional_chi0_response_face.md.
 
     ``band_stop`` (:func:`chi_band_stop`) ends both supports at the chi band
     sum's top; None reads every band of the table.
@@ -2731,7 +2731,7 @@ def compute_chi0_contour_fractional(
     energy_reference=0.0,
     ordered=False,
 ):
-    """Evaluate retarded finite-occupation chi0 at complex frequencies; see docs/architecture/four_current_wiring.md.
+    """Evaluate retarded finite-occupation chi0 at complex frequencies; see docs/architecture/fractional_chi0_response_face.md.
 
     ``ordered=True`` (time reversal measured broken) returns the physical
     orientation ``FT_q[chi]`` on every full-grid row; the incumbent trace,
@@ -2814,7 +2814,7 @@ def _fractional_pair_scan_face(
     x_idx = jax.lax.axis_index('x')
 
     def _gather_mun(psi_mun_local, g_lo):
-        """(nk, s, mu_X_loc, tile) un-conjugated, present on every rank — masked-gather + psum('y') from psi_mun's local shard (bands on 'y'); see docs/architecture/four_current_wiring.md."""
+        """(nk, s, mu_X_loc, tile) un-conjugated, present on every rank — masked-gather + psum('y') from psi_mun's local shard (bands on 'y'); see docs/architecture/fractional_chi0_response_face.md."""
         p = jnp.arange(tile, dtype=jnp.int32)
         global_band = g_lo + p
         if shard_w_y == nb_full:
@@ -2828,7 +2828,7 @@ def _fractional_pair_scan_face(
         return jax.lax.psum(gathered, 'y')
 
     def _gather_nmu(psi_nmu_local, g_lo):
-        """(nk, s, mu_Y_loc, tile) un-conjugated, present on every rank — masked-gather + psum('x') from psi_nmu's local shard (bands on 'x'), then a LOCAL (no-comm, bounded-size — this tile is `tile` bands wide, not nb_full) axis reorder: psi_nmu stores (nk, n, s, mu), band axis SECOND, so the post-gather (nk, tile, s, mu_Y_loc) needs one transpose to match the band-last endpoint (nk, s, mu, n) order; see docs/architecture/four_current_wiring.md."""
+        """(nk, s, mu_Y_loc, tile) un-conjugated, present on every rank — masked-gather + psum('x') from psi_nmu's local shard (bands on 'x'), then a LOCAL (no-comm, bounded-size — this tile is `tile` bands wide, not nb_full) axis reorder: psi_nmu stores (nk, n, s, mu), band axis SECOND, so the post-gather (nk, tile, s, mu_Y_loc) needs one transpose to match the band-last endpoint (nk, s, mu, n) order; see docs/architecture/fractional_chi0_response_face.md."""
         p = jnp.arange(tile, dtype=jnp.int32)
         global_band = g_lo + p
         if shard_w_x == nb_full:
@@ -3021,7 +3021,7 @@ def _get_chi_fractional_q_kernel_face(
 
 
 def occupation_support_bandwidth(energies_kn_ry, occupations_kn, band_stop=None):
-    """Largest transition energy over the occupation supports inside the chi band window, Ry; see docs/architecture/four_current_wiring.md."""
+    """Largest transition energy over the occupation supports inside the chi band window, Ry; see docs/architecture/fractional_chi0_response_face.md."""
     e = np.asarray(jax.device_get(energies_kn_ry), dtype=np.float64)
     f_slice, u_slice = _occupation_support_slices(occupations_kn, band_stop)
     return float(np.max(e[:, u_slice]) - np.min(e[:, f_slice]))
@@ -3039,7 +3039,7 @@ def compute_chi0_direct_fractional(
     progress_fn=None,
     ordered=False,
 ):
-    """Exact finite-occupation chi0 at selected nonzero complex frequencies; see docs/architecture/four_current_wiring.md.
+    """Exact finite-occupation chi0 at selected nonzero complex frequencies; see docs/architecture/fractional_chi0_response_face.md.
 
     The MPA metal near-origin sample's producer.  ``z = 0`` refuses: static
     chi0 is :func:`compute_chi0_matsubara` at ``n = 0``.  ``ordered=True``
@@ -3093,7 +3093,7 @@ def compute_chi0_direct_fractional(
             "  why:  static chi0 has one producer, compute_chi0_matsubara at "
             "nu_indices=(0,) (Fermi-Dirac), whose tau factors carry the "
             "Fermi-surface -df/dE without a divided difference\n"
-            "  doc:  docs/architecture/four_current_wiring.md")
+            "  doc:  docs/architecture/fractional_chi0_response_face.md")
     # face: wfns.enk is already (nk, nb_full) -- e/f above are ALREADY at
     # the full loaded extent for this call site (wfns.enk and
     # occupation_state.f_kn, not a caller-narrowed sub-window), but pad
@@ -3136,7 +3136,7 @@ def precompile_solve_w(V_q, chi0_q, meta, mesh_xy, *, dyson_solver=None,
                        n_rmu_logical=None,
                        distrib_la_batched_route: str = "batch_reshard",
                        pref=None, axis=None):
-    """AOT lower+compile of the W-solve jit (``solve_w``'s arguments); see docs/architecture/four_current_wiring.md."""
+    """AOT lower+compile of the W-solve jit (``solve_w``'s arguments); see docs/theory/bispinor-gw.md#dyson."""
     ensure_jax_compile_cache()
     n_logical = _require_w_operand_geometry(
         V_q, chi0_q, meta, mesh_xy, n_rmu_logical=n_rmu_logical, axis=axis)

@@ -1,8 +1,9 @@
 # Perlmutter (NERSC)
 
-Perlmutter (4×A100 GPU nodes) is the reference platform. This page installs
-LORRAX from a clone on any NERSC account and runs the test suite with plain
-`srun`. It needs no `lx`, no `lorrax_A` module and no file outside the clone
+Perlmutter (4×A100 GPU nodes) is the reference platform. Its default
+runtime is the module stack ([runtime defaults](index.md#defaults)). This
+page installs LORRAX from a clone on any NERSC account instead, for
+development, and runs the test suite with plain `srun`. It needs no `lx`, no `lorrax_A` module and no file outside the clone
 and your own directories. Launch geometry and machine behaviour are owned by
 [machines/perlmutter.md](../environment/machines/perlmutter.md).
 

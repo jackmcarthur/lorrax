@@ -8,14 +8,9 @@ producer, shape, sharding and refusal) is
 in the [input reference](../input_reference.md). The $S$ convention is
 [its own page](s-tensor-convention.md).
 
-Rydberg units throughout. The Lorentz index $I,J\in\{0,1,2,3\}$ labels the
-charge channel C ($0$) and the Cartesian current channels T ($1..3$). The
-stored vertices are $\tilde\gamma^0=1$ and $\tilde\gamma^i=\alpha^i$
-(`common.gamma_matrices`), so every channel density is
-$\rho^I=\psi^\dagger\tilde\gamma^I\psi$. The carrier is the raw
-kinetic-balance lift $\psi=(\psi_L,\ (\alpha_{FS}/2)\,\boldsymbol\sigma\cdot\mathbf p\,\psi_L)$.
-Because $\alpha^i$ couples the large and small components, every current
-vertex carries one factor of $\alpha_{FS}/2$.
+Rydberg units throughout. The carrier, the vertices $\tilde\gamma^I$ and the
+channels C ($I=0$) and T ($I=1..3$) are [Bispinor GW §1](bispinor-gw.md#lift);
+every current vertex carries one factor of $\alpha_{FS}/2$.
 
 ## 1. Routes, and what each channel carries {#four-current-phase-status}
 
@@ -189,7 +184,7 @@ $(W_h/\Omega)\,\overline{g_0}\otimes g_0$ with
 $g_0(\mu)=\zeta_\Gamma(\mu,\mathbf G=0)$
 (`gw.head_correction.apply_q0_head_rank1`).
 
-### 3.2 Static COHSEX
+### 3.2 Static COHSEX {#static-head}
 
 These band-diagonal shifts are exact:
 
@@ -270,7 +265,7 @@ $W=(1-D\chi_0)^{-1}D$ in one distributed Dyson solve. `gw.photon_sigma`
 contracts the $W^{IJ}$ blocks with the Lorentz vertices applied to the
 wavefunction faces. The body lacks the $\mathbf K=0$ slot in every block.
 
-### 4.2 The coupled Γ-cell solve
+### 4.2 The coupled Γ-cell solve {#coupled-gamma-solve}
 
 The completion fills the Γ slot of both $V$ and $W$. It solves the 4×4
 Lorentz Dyson equation at every node of the exact Wigner–Seitz cubature of
@@ -289,7 +284,8 @@ pseudovector $\sigma_H$ is never fitted. It is a separately produced input
 the only admitted $q$-linear CT/TC structure. The persisted $\sigma_H$ is the
 occupied-bra Berry sum, while the live Adler–Wiser response is energy-ordered
 ($P=-\Delta D$); that is the minus above. An unnamed
-`static_gauge_hall_file` means $\sigma_H=0$, announced; by §4.4 that is
+`static_gauge_hall_file` means $\sigma_H=0$, announced; by
+[bispinor GW §8](bispinor-gw.md#hall) that is
 exact for the insulators this mode admits. A named but mismatched artifact
 refuses in the loader. On the bare route only an exact-zero artifact is
 accepted, because with the currents unscreened $W_{CT}=0$ at every finite
@@ -344,51 +340,7 @@ response $\chi_{TT}(q=0)$ is zero by gauge invariance for an insulator. No
 omitted term is stored as an accidental zero of a larger schema:
 `S_direct` has charge support only.
 
-### 4.4 The Hall coefficient is a topological invariant
-
-For a gapped system the static long-wavelength charge–current response is
-the Chern–Simons term, and its coefficient is quantized (TKNN):
-
-$$
-\sigma_{xy}(\mathbf q\to0,\omega=0)=C\,\frac{e^2}{h},\qquad
-C=\frac{1}{2\pi}\sum_{n\in{\rm occ}}\int_{\rm BZ}\Omega_n^z\,d^2k\in\mathbb Z .
-$$
-
-The producer computes exactly this occupied Berry-curvature sum
-(`gw.qsgw_head.raw_hall_pseudovector_sharded`,
-$\sigma_H^b=-(\alpha_{FS}C_s/2\Omega)\,\operatorname{Im}c_B^b$ with state
-capacity $C_s$). It refuses metals, and it refuses degenerate
-differently-occupied states. Consequently:
-
-* For a Chern-trivial insulator, $\sigma_H=0$ in the complete-basis,
-  converged-k limit. The packed head then reduces to the charge head of §3
-  with its wings carried, and the absent-artifact default is exact.
-* For a Chern insulator, $\sigma_H$ is an integer multiple of
-  $\alpha_{FS}C_s/(8\pi L_z)$ ($L_z$ the periodic cell height), known before
-  the calculation.
-* A static Hall response carries new information only in a metal, and the
-  producer refuses metals.
-
-The CT sector of a Chern-trivial insulator is bounded by symmetry and by
-the current vertices. The surviving CT moment is
-$\langle W^{0i}q_a\rangle$ with $W^{0i}\approx D_{00}R^{0i}D_{ii}$ and
-$R^{0i}=i\epsilon\,\sigma_Hq+q_aq_bS^{0i,ab}+O(q^3)$. The quadratic
-coefficient is the static linear magnetoelectric response, which needs
-both inversion and time reversal broken. In a centrosymmetric crystal CT
-starts at $O(q^3)$, so $W^{0i}=O(q)$ and the moment is $O(1/N_k)$: body
-discretization order. Without inversion, $W^{0i}=O(1)$ survives averaging
-like the CC screening correction, reduced by $(Z\alpha_{FS})^2$ for two
-current vertices and by $\alpha_{ME}$, whose axion-strength ceiling is
-$\alpha_{FS}/2$.
-
-Two time-reversal-odd channels lie outside the static head. The
-finite-frequency Hall/Kerr response $\sigma_{xy}(\omega)$ and the
-antisymmetric TT response live at $\omega\ne0$ and $O(q^2)$. In a
-ferromagnet the largest transverse screening channel is the
-Goldstone-enhanced transverse spin susceptibility. It is a ladder (vertex)
-effect outside RPA, and the ladder screening (`w_bse`) is charge-only.
-
-### 4.5 Scalar versus packed insertion of the charge head
+### 4.4 Scalar versus packed insertion of the charge head
 
 Both routes evaluate the same cell integral (§3.1). They insert it
 differently. The scalar route uses the band-diagonal shift of §3.2, which
