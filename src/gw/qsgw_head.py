@@ -2798,12 +2798,6 @@ def static_gauge_hall_transaction(
             "static gauge Hall production requires the canonical "
             "uniform-gauge current transaction")
     complete = isinstance(uniform_gauge, UniformGaugeMatrixElements)
-    if (complete
-            and ((uniform_gauge.dgamma_dq_raw is None)
-                 != (uniform_gauge.d2gamma_dq2_raw is None))):
-        raise ValueError(
-            "uniform-gauge Hall transaction has only one of its optional "
-            "first/second transfer-jet fields")
 
     start, stop = int(band_start), int(band_stop)
     logical = stop - start
@@ -2833,18 +2827,6 @@ def static_gauge_hall_transaction(
         raise ValueError(
             "uniform-gauge Hall transaction has an invalid exact-contact "
             f"shape {uniform_gauge.lambda_raw.shape}")
-    if (complete and uniform_gauge.dgamma_dq_raw is not None
-            and tuple(uniform_gauge.dgamma_dq_raw.shape) != (
-                nk_tot, 3, 3, storage, storage)):
-        raise ValueError(
-            "uniform-gauge Hall transaction has an invalid first transfer "
-            f"jet shape {uniform_gauge.dgamma_dq_raw.shape}")
-    if (complete and uniform_gauge.d2gamma_dq2_raw is not None
-            and tuple(uniform_gauge.d2gamma_dq2_raw.shape) != (
-                nk_tot, 3, 3, 3, storage, storage)):
-        raise ValueError(
-            "uniform-gauge Hall transaction has an invalid second transfer "
-            f"jet shape {uniform_gauge.d2gamma_dq2_raw.shape}")
 
     fingerprint = str(
         uniform_gauge.hamiltonian_config_operator_fingerprint).strip()

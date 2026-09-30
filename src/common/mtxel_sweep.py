@@ -154,7 +154,6 @@ __all__ = [
     "sweep_uniform_current_matrix_elements",
     "UniformGaugeMatrixElements",
     "UniformGaugeCurrentMatrixElements",
-    "FiniteTransferCurrentEndpoint",
     "blocks_to_host",
 ]
 
@@ -937,7 +936,7 @@ class UniformGaugeCurrentMatrixElements(NamedTuple):
     This is a component-selection view of :func:`uniform_gauge_operator`, not
     a second current implementation.  It exists for Hall consumers, which
     need only ``Gamma_raw`` and the exact Hamiltonian/operator fingerprint;
-    retaining contact and transfer jets for that terminal three-number
+    retaining the contact for that terminal three-number
     reduction is prohibitive on a production band manifold.
     """
 
@@ -946,16 +945,14 @@ class UniformGaugeCurrentMatrixElements(NamedTuple):
 
 
 class UniformGaugeMatrixElements(NamedTuple):
-    r"""Band-sharded uniform gauge action and optional transfer jet.
+    r"""Band-sharded uniform gauge current and contact.
 
     ``gamma_raw`` is the dimensionless no-pair vertex
     ``(alpha_FS/2) dH_Pauli_Ry/dk``. ``lambda_raw`` is its exact uniform
     derivative ``(alpha_FS/2) d2H_Pauli_Ry/dkdk``.  Their shapes are
     ``(nk,3,nb,nb)`` and ``(nk,3,3,nb,nb)`` and both retain the sweep's
-    two-dimensional band sharding.  With the separately priced transfer-q2
-    capability, ``dgamma_dq_raw`` and ``d2gamma_dq2_raw`` have shapes
-    ``(nk,3,3,nb,nb)`` and ``(nk,3,3,3,nb,nb)``.  They are deliberately one
-    transaction: response-jet and contact consumers must not reopen the WFN
+    two-dimensional band sharding.  They are deliberately one
+    transaction: contact consumers must not reopen the WFN
     or rebuild projectors.  Hall's current-only component selection is the
     smaller sibling above and calls the same operator/sweep owners.
     """
@@ -963,73 +960,10 @@ class UniformGaugeMatrixElements(NamedTuple):
     gamma_raw: jax.Array
     lambda_raw: jax.Array
     hamiltonian_config_operator_fingerprint: str
-    dgamma_dq_raw: jax.Array | None = None
-    d2gamma_dq2_raw: jax.Array | None = None
-
-
-class FiniteTransferCurrentEndpoint(NamedTuple):
-    r"""One exact finite-q current endpoint sampled at current centroids.
-
-    ``current_nmu`` and ``current_mun`` are the two face orientations of
-    ``Gamma_i(k,q)|Psi_nk>``.  Their shapes are ``(nk,nb,3,4,n_rmu)`` and
-    ``(nk,3,4,n_rmu,nb)``; after flattening the replicated ``(cart,spin)``
-    pair, they use the canonical :data:`common.wfn_layout.PSI_NMU_SPEC` and
-    :data:`common.wfn_layout.PSI_MUN_SPEC`.  They are deliberately not a
-    :class:`gw.wavefunction_bundle.Wavefunctions`: the endpoint depends
-    jointly on ``(k,q)`` and pretending it were a q-independent wavefunction
-    face would let the incumbent k-FFT silently apply the wrong operator at
-    every other q.
-
-    No producer builds this record: the current vertex uses the q = 0
-    (long-wavelength) velocity operator by design, and no k/q-dependent
-    nonlocal current vertex is planned.
-
-    The two fingerprints name different facts.  The Hamiltonian identity is
-    byte-identical to the uniform current/contact transaction, so the two
-    compare by exact equality.  The path identity also
-    binds the finite-segment quadrature order and Ward tolerances; it is the
-    numerical certificate for this realization, not a second body-only
-    Hamiltonian identity.
-
-    ``iq_irr`` and ``q_irr_kgrid_int`` retain the symmetry service's IBZ row
-    identity; ``q_crys`` is its BGW signed fractional representative.  The
-    response consumer can therefore keep a one-row block attached to its
-    storage label without rebuilding a q grid.
-
-    ``basis_receipt`` is the exact immutable object supplied by the target
-    wavefunction bundle.  The producer authenticates it against the WFN,
-    physical band interval, FFT grid, ordered centroid table and live padded
-    extent, then propagates that same object rather than inferring provenance
-    from the two face shapes.
-
-    This NamedTuple is an orchestration record, not a compiled operand: its
-    q labels and fingerprints are host strings/NumPy arrays.  The producer
-    compiles only numerical inputs and constructs this record afterward;
-    the private response oracle validates it and extracts its arrays before
-    calling the cached Green kernel.
-    """
-
-    current_nmu: jax.Array
-    current_mun: jax.Array
-    n_rmu_logical: int
-    iq_irr: int
-    q_irr_kgrid_int: np.ndarray
-    q_crys: np.ndarray
-    kminq_idx: np.ndarray
-    g_wrap: np.ndarray
-    vnl_ward_residual_abs: jax.Array
-    vnl_ward_residual_rel: jax.Array
-    vnl_ward_reference_norm: jax.Array
-    hamiltonian_config_operator_fingerprint: str
-    vnl_path_operator_fingerprint: str
-    # Appended with a default so both pre-receipt positions AND constructor
-    # arity remain compatible for readers treating this as a positional row.
-    basis_receipt: object = None
 
 
 def uniform_gauge_operator(geom: SweepGeometry, *, bvec, blat,
                            vnl_setup, include_contact: bool = True,
-                           include_transfer_q2: bool = False,
                            kinetic_balance_lift: str = "raw") -> Operator:
     r"""One apply-to-ket owner for current and exact uniform contact.
 
@@ -1052,21 +986,9 @@ def uniform_gauge_operator(geom: SweepGeometry, *, bvec, blat,
 
     ``kinetic_balance_lift`` names the representation already carried by
     ``psi_n``.  The historical default is raw and remains on its old exact
-    operations and cache key.  ``include_transfer_q2=True`` extends the SAME
-    transaction with the explicit ICL transfer derivatives.  For the raw
-    representation and repository's bra ``k-q`` orientation,
-
-    ``Q_raw[i,a] = -(alpha/2) sigma_a sigma_i
-                    -(alpha/4) V_NL,ia``
-
-    and ``Q2_raw[i,a,b] = (alpha/6) V_NL,iab``.  For the isometric
-    representation the same product rule additionally contains the analytic
-    first/second derivatives of the normalized bra endpoint, including their
-    cross terms with the ICL path derivative.  Derivative families are
-    consumed one Cartesian row at a time inside this operator; no three- or
-    nine-WFN jet escapes it.  Both branches reuse
-    :func:`common.bispinor_init.kinetic_balance_lift_jet` rather than spelling
-    a second sigma-product or normalization derivative.
+    operations and cache key.  The vertex is the q = 0 (long-wavelength)
+    velocity operator by design; no k/q-dependent nonlocal current vertex
+    is planned.
 
     These are explicit vertex derivatives only.  They do not include
     eigenstate, energy, occupation, or response-weight derivatives and are
@@ -1084,22 +1006,16 @@ def uniform_gauge_operator(geom: SweepGeometry, *, bvec, blat,
         raise ValueError(
             "uniform_gauge_operator requires a two-component Pauli VNLSetup; "
             f"got nspinor={int(vnl_setup.nspinor)}")
-    transfer_q2 = bool(include_transfer_q2)
-    contact_enabled = bool(include_contact or transfer_q2)
+    contact_enabled = bool(include_contact)
     if contact_enabled and vnl_setup.Gpp_table is None:
         raise ValueError(
             "uniform_gauge_operator requires VNLSetup built with "
             "compute_contact=True")
-    if transfer_q2 and vnl_setup.Gppp_table is None:
-        raise ValueError(
-            "uniform_gauge_operator transfer q2 requires VNLSetup built "
-            "with compute_transfer_q2=True")
 
     from common.bispinor_init import (
         HALFALPHA,
         ISOMETRIC_KINETIC_BALANCE_LIFT,
         RAW_KINETIC_BALANCE_LIFT,
-        kinetic_balance_lift_jet,
         kinetic_balance_lift_provenance,
     )
     from common.gamma_matrices import gamma_apply, gamma_perm_phase
@@ -1119,7 +1035,6 @@ def uniform_gauge_operator(geom: SweepGeometry, *, bvec, blat,
     if lift_mode not in (
             RAW_KINETIC_BALANCE_LIFT, ISOMETRIC_KINETIC_BALANCE_LIFT):
         raise AssertionError("kinetic-balance lift owner admitted a bad mode")
-    B = jnp.asarray(B_host, dtype=jnp.float64)
 
     def op(psi_n, gvec, gmask, bidx, kvec):
         del bidx
@@ -1134,12 +1049,12 @@ def uniform_gauge_operator(geom: SweepGeometry, *, bvec, blat,
             for perm, phase in alpha_vertices
         ], axis=0)
 
-        vnl = vnl_ops.apply_icl_vnl_transfer_jet_to_ket(
+        vnl = vnl_ops.apply_uniform_vnl_derivatives_to_ket(
             psi_L, gvec, kvec, vnl_setup, gmask,
-            include_contact=contact_enabled, include_q2=transfer_q2)
+            compute_contact=contact_enabled)
         gamma_vnl = _pad_spinor(
             halfalpha.astype(psi_4.real.dtype)
-            * vnl.gamma0_cart_ket,
+            * vnl.gamma_cart_ket,
             int(psi_4.shape[1]))
         gamma = gamma_kin + gamma_vnl
 
@@ -1147,111 +1062,9 @@ def uniform_gauge_operator(geom: SweepGeometry, *, bvec, blat,
         if contact_enabled:
             lambda_kin = apply_kinetic_contact_to_ket(psi_L)
             lambda_large = halfalpha.astype(psi_4.real.dtype) * (
-                lambda_kin + vnl.lambda0_cart_ket)
+                lambda_kin + vnl.lambda_cart_ket)
             contact = _pad_spinor(lambda_large, int(psi_4.shape[1]))
             fields.append(contact.reshape(9, *contact.shape[2:]))
-        if transfer_q2:
-            if not isometric_lift:
-                # Historical raw action, byte-for-byte: dPsi/dK is
-                # independent of K, so the zero endpoint avoids another
-                # reciprocal-lattice operand.  q2 is now named uniformly as
-                # an adjoint source; Hermiticity makes its physical value
-                # unchanged at the sole post-sweep orientation boundary.
-                _lifted_zero, dpsi_dK = kinetic_balance_lift_jet(
-                    psi_L,
-                    jnp.zeros((int(psi_L.shape[-1]), 3),
-                              dtype=psi_4.real.dtype))
-                del _lifted_zero
-                kinetic_q1_source = jnp.stack([
-                    gamma_apply(dpsi_dK, perm, phase, axis=2)
-                    for perm, phase in alpha_vertices
-                ], axis=0)
-                vnl_q1 = _pad_spinor(
-                    halfalpha.astype(psi_4.real.dtype)
-                    * vnl.dgamma_dq_cart_ket,
-                    int(psi_4.shape[1]))
-                q1_adjoint_source = kinetic_q1_source - vnl_q1
-                q2_sweep_source = _pad_spinor(
-                    halfalpha.astype(psi_4.real.dtype)
-                    * vnl.d2gamma_dq2_cart_ket,
-                    int(psi_4.shape[1]))
-            else:
-                # The input already carries r(K).  Build each analytic
-                # endpoint family from that carrier, consume it immediately,
-                # and retain only the incumbent packed vertex action.
-                K_cart = (
-                    gvec.astype(jnp.float64) + kvec[None, :]) @ B
-                dpsi_vnl_qderivative = []
-                q1_rows = []
-                for a in range(3):
-                    dpsi_a = kinetic_balance_lift_jet(
-                        psi_L, K_cart, representation=lift_mode,
-                        cartesian_K_derivative_axes=(a,))
-                    vnl_a = vnl_ops.apply_icl_vnl_transfer_jet_to_ket(
-                        dpsi_a[:, :2], gvec, kvec, vnl_setup, gmask,
-                        include_contact=True, include_q2=False)
-                    alpha_a = jnp.stack([
-                        gamma_apply(dpsi_a, perm, phase, axis=1)
-                        for perm, phase in alpha_vertices
-                    ], axis=0)
-                    endpoint_vnl_a = _pad_spinor(
-                        halfalpha.astype(psi_4.real.dtype)
-                        * vnl_a.gamma0_cart_ket,
-                        int(psi_4.shape[1]))
-                    q1_rows.append(alpha_a + endpoint_vnl_a)
-                    # Only this q-derivative is needed by the symmetric q2
-                    # cross terms.  Do not retain the full VNL result (or the
-                    # consumed derivative WFN) across families.
-                    dpsi_vnl_qderivative.append(
-                        vnl_a.dgamma_dq_cart_ket)
-                kinetic_q1_source = jnp.stack(q1_rows, axis=1)
-                vnl_q1 = _pad_spinor(
-                    halfalpha.astype(psi_4.real.dtype)
-                    * vnl.dgamma_dq_cart_ket,
-                    int(psi_4.shape[1]))
-                q1_adjoint_source = kinetic_q1_source - vnl_q1
-
-                q2_families = {}
-                for a in range(3):
-                    for b in range(a, 3):
-                        d2psi_ab = kinetic_balance_lift_jet(
-                            psi_L, K_cart, representation=lift_mode,
-                            cartesian_K_derivative_axes=(a, b))
-                        vnl_ab = (
-                            vnl_ops.apply_icl_vnl_transfer_jet_to_ket(
-                                d2psi_ab[:, :2], gvec, kvec, vnl_setup,
-                                gmask, include_contact=False,
-                                include_q2=False))
-                        alpha_ab = jnp.stack([
-                            gamma_apply(
-                                d2psi_ab, perm, phase, axis=1)
-                            for perm, phase in alpha_vertices
-                        ], axis=0)
-                        endpoint_vnl_ab = _pad_spinor(
-                            halfalpha.astype(psi_4.real.dtype)
-                            * (vnl_ab.gamma0_cart_ket
-                               - dpsi_vnl_qderivative[a][:, b]
-                               - dpsi_vnl_qderivative[b][:, a]
-                               + vnl.d2gamma_dq2_cart_ket[:, a, b]),
-                            int(psi_4.shape[1]))
-                        q2_families[a, b] = alpha_ab + endpoint_vnl_ab
-                q2_sweep_source = jnp.stack(tuple(
-                    jnp.stack(tuple(
-                        q2_families[min(a, b), max(a, b)]
-                        for b in range(3)), axis=1)
-                    for a in range(3)), axis=1)
-                # This is an adjoint source: the physical bra-endpoint q2 is
-                # its band-space adjoint after the sole m/n contraction,
-                # exactly as q1 is minus the adjoint of its source.  That
-                # orientation cannot be performed here without materializing
-                # an nb-by-nb object inside the apply-to-ket operator.
-            fields.extend((
-                q1_adjoint_source.reshape(
-                    9, *q1_adjoint_source.shape[2:]),
-                q2_sweep_source.reshape(
-                    27, *q2_sweep_source.shape[3:]),
-            ))
-
         packed = jnp.concatenate(tuple(fields), axis=0)
         return jnp.moveaxis(packed, 0, -1)[None]
 
@@ -1259,31 +1072,24 @@ def uniform_gauge_operator(geom: SweepGeometry, *, bvec, blat,
         ("uniform_gauge_current_contact" if contact_enabled
          else "uniform_gauge_current"), geom.ngkmax, geom.ns,
         float(blat), id(vnl_setup))
-    if transfer_q2:
-        operator_key += ("explicit_transfer_q2",)
     if isometric_lift:
         operator_key += ("kinetic_balance", lift_provenance)
     return Operator(
         apply=op, post=1.0,
-        ncomp=(48 if transfer_q2 else (12 if contact_enabled else 3)),
+        ncomp=(12 if contact_enabled else 3),
         key=operator_key)
 
 
 def _gauge_hamiltonian_operator_fingerprint(
     *, wfn, vnl_setup, band_start: int, band_stop: int,
-    geom: SweepGeometry, include_transfer_q2: bool,
+    geom: SweepGeometry,
     kinetic_balance_lift: str = "raw",
 ) -> str:
-    """Compose the one uniform/finite-q Hamiltonian operator identity.
+    """Compose the one uniform Hamiltonian operator identity.
 
     This is the exact grammar historically in the complete uniform-gauge
-    sweep, moved without changing a byte so the arbitrary-transfer endpoint
-    could not invent a near-duplicate body fingerprint.  (Both of those
-    consumers -- ``sweep_uniform_gauge_matrix_elements`` and
-    ``finite_transfer_current_to_centroids`` -- were deleted on 2026-09-02;
-    the one surviving caller is
-    :func:`sweep_uniform_current_matrix_elements`.)  The finite-path quadrature/tolerance identity stays a
-    separate certificate owned by :mod:`psp.vnl_ops`.
+    sweep, moved without changing a byte; the one caller is
+    :func:`sweep_uniform_current_matrix_elements`.
     """
     start, stop = int(band_start), int(band_stop)
     vnl_fingerprint = str(
@@ -1298,10 +1104,7 @@ def _gauge_hamiltonian_operator_fingerprint(
             "compute_contact=True)")
 
     import hashlib
-    from common.bispinor_init import (
-        ISOMETRIC_KINETIC_BALANCE_LIFT,
-        kinetic_balance_lift_provenance,
-    )
+    from common.bispinor_init import kinetic_balance_lift_provenance
     from common.parallel_transport import (
         WFN_FINGERPRINT_SCHEME, fingerprint_update_value, wfn_fingerprint)
     from psp import vnl_ops
@@ -1322,18 +1125,12 @@ def _gauge_hamiltonian_operator_fingerprint(
         ("cell_volume", float(geom.cell_volume).hex()),
     ):
         fingerprint_update_value(digest, label, value)
-    if bool(include_transfer_q2):
-        fingerprint_update_value(
-            digest, "transfer_jet",
-            ("explicit_q2_isometric_endpoint_v1"
-             if lift_mode == ISOMETRIC_KINETIC_BALANCE_LIFT
-             else "explicit_q2_fixed_large_component_v1"))
     return "sha256:" + digest.hexdigest()
 
 
 def _uniform_gauge_sweep_fingerprint(
     *, wfn, vnl_setup, band_start: int, band_stop: int,
-    geom: SweepGeometry, include_transfer_q2: bool,
+    geom: SweepGeometry,
     kinetic_balance_lift: str = "raw",
 ) -> str:
     """Validate one uniform sweep manifold and return its sole identity."""
@@ -1348,8 +1145,7 @@ def _uniform_gauge_sweep_fingerprint(
             f"[{start},{stop}) vs nb_logical={int(geom.nb_logical)}")
     return _gauge_hamiltonian_operator_fingerprint(
         wfn=wfn, vnl_setup=vnl_setup, band_start=start, band_stop=stop,
-        geom=geom, include_transfer_q2=bool(include_transfer_q2),
-        kinetic_balance_lift=kinetic_balance_lift)
+        geom=geom, kinetic_balance_lift=kinetic_balance_lift)
 
 
 def sweep_uniform_current_matrix_elements(
@@ -1373,21 +1169,20 @@ def sweep_uniform_current_matrix_elements(
 
     The operator closure, band-layout VNL action and fingerprint owner
     are :func:`_uniform_gauge_operator_identity` and its siblings; this is
-    now their ONLY caller (the complete sweep that produced contact and
-    transfer components was deleted on 2026-09-02, unreachable from any
-    production path).  A Hall-only producer does not retain contact/response
+    now their ONLY caller (the complete sweep that produced the contact
+    was deleted on 2026-09-02, unreachable from any production path).  A Hall-only producer does not retain contact/response
     matrices that it cannot consume.
     """
     fingerprint = _uniform_gauge_sweep_fingerprint(
         wfn=wfn, vnl_setup=vnl_setup, band_start=band_start,
-        band_stop=band_stop, geom=geom, include_transfer_q2=False,
+        band_stop=band_stop, geom=geom,
         kinetic_balance_lift=kinetic_balance_lift)
     gamma_raw = sweep_matrix_elements(
         psi_G,
         geom=geom,
         operator=uniform_gauge_operator(
             geom, bvec=bvec, blat=blat, vnl_setup=vnl_setup,
-            include_contact=False, include_transfer_q2=False,
+            include_contact=False,
             kinetic_balance_lift=kinetic_balance_lift),
         gvecs=gvecs,
         gmask=gmask,
