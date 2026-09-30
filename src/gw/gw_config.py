@@ -2874,27 +2874,34 @@ def _apply_input_envelope(
             "  [config provenance] WARNING density_self_consistent = false: "
             "V_H stays at the DFT density on every map (comparison mode, "
             "not production QSGW)")
-    # The QSGW head follows the owner's velocity rule wherever links exist
-    # (owner 2026-09-29): v = U^dagger (p + i[r, V_NL] + i[r, DeltaSigma]) U,
-    # the last term from the parallel-transport covariant derivative of this
-    # map's DeltaH.  An unnamed sc_head_update takes parallel_transport when
-    # the artifact is present on a route that consumes it; otherwise off.
+    # The QSGW head follows the owner's velocity rule (2026-09-29): an unnamed
+    # sc_head_update takes the best head this scalar deck can build.
+    # parallel_transport, v = U^dagger (p + i[r, V_NL] + i[r, DeltaSigma]) U
+    # with the Sigma term from this map's DeltaH, where the link artifact
+    # exists; else dft_velocity, U^dagger (p + i[r, V_NL]) U from dipole.h5;
+    # else off.
     if (resolved.qp_solver is QPSolver.SELF_CONSISTENT
             and "sc_head_update" not in _named_keys
             and resolved.sc.head_update == "off"
             and not bool(resolved.bispinor) and bool(resolved.do_G0)
             and resolved.sigma.w_model == "shared_pole"
             and resolved.head.correction in (
-                HeadCorrection.NO_LOCAL_FIELDS, HeadCorrection.FULL)
-            and resolved.paths.parallel_transport_file
-            and os.path.isfile(resolved.paths.parallel_transport_file)):
-        resolved = _dc_replace(resolved, sc=_dc_replace(
-            resolved.sc, head_update="parallel_transport"))
+                HeadCorrection.NO_LOCAL_FIELDS, HeadCorrection.FULL)):
+        links = resolved.paths.parallel_transport_file
+        dipole = os.path.join(resolved.input_dir or ".", "dipole.h5")
+        if links and os.path.isfile(links):
+            mode, why = "parallel_transport", f"{links} exists"
+        elif os.path.isfile(dipole):
+            mode, why = "dft_velocity", (
+                f"no link artifact {links}; {dipole} exists")
+        else:
+            mode, why = "off", "no link artifact and no dipole.h5"
+        if mode != "off":
+            resolved = _dc_replace(resolved, sc=_dc_replace(
+                resolved.sc, head_update=mode))
         print_fn(
-            "  [config provenance] sc_head_update was not named and "
-            f"{resolved.paths.parallel_transport_file} exists; using "
-            "parallel_transport (per-map QSGW velocity with the "
-            "covariant i[DeltaH, r])")
+            f"  [config provenance] sc_head_update was not named: {mode} "
+            f"({why})")
     # The four-current direct Gamma head has no link consumer; its best head
     # follows every map on the QP-rotated dipole velocity.
     if (resolved.qp_solver is QPSolver.SELF_CONSISTENT

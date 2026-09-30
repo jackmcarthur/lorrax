@@ -6546,6 +6546,15 @@ def load_head_velocity_source(
 
     pt_path = resolve_input_path(
         input_dir, config.paths.parallel_transport_file)
+    if mode == "dft_velocity" and not os.path.isfile(pt_path):
+        # No link artifact: the same velocity p + i[r, V_NL] from dipole.h5.
+        from .qsgw_head import load_dft_dipole_head
+        source = load_dft_dipole_head(
+            input_dir, mesh=mesh, wfn=wfn, meta=meta, config=config)
+        print_fn(
+            "  SC head: authenticated DFT dipole velocity (no "
+            f"{pt_path}), rotated into each map's QP basis; no Sigma term")
+        return source
     if mode == "dft_velocity":
         from .qsgw_head import load_dft_velocity_head
 
