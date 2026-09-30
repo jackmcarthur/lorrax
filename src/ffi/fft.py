@@ -165,7 +165,7 @@ __all__ = [
     "make_kconv_lorentz_unfold", "KCONV_KLEAD_LORENTZ_TARGET",
     "make_kfft_klead_unfold", "KFFT_KLEAD_UNFOLD_TARGET",
     "make_kconv_chi_unfold", "KCONV_CHI_UNFOLD_TARGET", "chi_unfold_refusal",
-    "chi_unfold_scratch_bytes",
+    "chi_unfold_scratch_bytes", "make_kconv_chi_vertex", "KCONV_CHI_VERTEX_TARGET",
     "make_kconv_kminor", "kconv_kminor_out_shape",
     "make_kfft_klead", "make_kfft_kminor",
     "make_local_kfft_klead", "make_local_kfft_kminor", "make_local_kconv_kminor",
@@ -200,6 +200,8 @@ KCONV_KLEAD_LORENTZ_TARGET = "lorrax_mathdx_kconv_klead_lorentz_wparent"
 KFFT_KLEAD_UNFOLD_TARGET = "lorrax_mathdx_kfft_klead_unfold"
 #: Mode 11, the chi0 pass read from the raw-parent Green pair (:func:`make_kconv_chi_unfold`).
 KCONV_CHI_UNFOLD_TARGET = "lorrax_mathdx_kconv_chi_unfold"
+#: Mode 11 with the four-current channel vertices (:func:`make_kconv_chi_vertex`).
+KCONV_CHI_VERTEX_TARGET = "lorrax_mathdx_kconv_chi_vertex"
 KFFT_KLEAD_TARGET = "lorrax_mathdx_kfft_klead"
 KCONV_KMINOR_TARGET = "lorrax_mathdx_kconv_kminor"
 KFFT_KMINOR_TARGET = "lorrax_mathdx_kfft_kminor"
@@ -2176,6 +2178,115 @@ def make_kconv_chi_unfold(mesh: Mesh, kgrid, tables, *, n_out: int, complete: bo
         if Gvt.shape != Gv.shape or Gct.shape != Gv.shape:
             raise ValueError("k-leading chi unfold: the partners must match the Greens' shape")
         return sm[False](acc, Gv, Gc, alpha, Gvt, Gct)
+    return fn
+
+
+def make_kconv_chi_vertex(mesh: Mesh, kgrid, tables, *, left_vertices, right_vertices,
+                          sign_c=None, norm: str | None = "ortho",
+                          scratch_bytes: int | None = None) -> Callable:
+    """Mode 11 with channel vertices: ``fn(acc, Gv, Gc, Gvt=None, Gct=None) -> acc``.
+
+    For channel ``ch = i*nb + j`` of the ``na = len(left_vertices)`` x
+    ``nb = len(right_vertices)`` monomial vertices ``(perm, phase)``
+    (``γ[α,β] = phase[α] δ_{β,perm[α]}``, ``common.gamma_matrices``)::
+
+        acc[ch, k] += sum_ab conj(phase_i[a]) phase_j[b] conj(Gc'[perm_i a, perm_j b]) Gv'_ab
+
+    with ``G'`` the unfolded Green in R space exactly as :func:`make_kconv_chi_unfold`
+    reads it (the same ``tables``, one spin action, a single output weight of 1).
+    ``sign_c`` ``(nk,)`` real +-1, when given, multiplies Gc's unfolded k rows
+    (a Dirac-half quadrant's own sign relative to ``tables``).  ``acc``
+    ``(na*nb, nk, mu, nu)`` at ``P(None,None,'x','y')``, donated.  No full-k
+    Green exists.  CUDA: nvidia-mathdx mode 11 (LRX_VTX); cpu: the service's
+    reference composition.
+    """
+    from symmetry_maps import apply_unfold_load_tables_local, local_unfold_load_tables
+    kg = _check_kgrid(kgrid, kconv_backend(mesh))
+    nk = kg[0] * kg[1] * kg[2]
+    if int(tables.row.shape[0]) != nk:
+        raise ValueError(f"chi vertex: tables cover {tables.row.shape[0]} k, grid has {nk}")
+    if int(tables.conj_trs) != 0 or tables.spin_r is not None:
+        raise ValueError("chi vertex: a Green pair's tables use the pair-transpose rule and one spin action")
+    ns = int(tables.spin.shape[-1])
+    spin_host = np.asarray(tables.spin)
+    mesh_shape = (int(mesh.shape["x"]), int(mesh.shape["y"]))
+    if tuple(tables.mesh_shape) != mesh_shape:
+        raise ValueError(f"chi vertex: tables were cut for a {tuple(tables.mesh_shape)} mesh; "
+                         f"this mesh is {mesh_shape}")
+    perm_l, phase_l = _vertex_tables(left_vertices, ns, "chi left")
+    perm_r, phase_r = _vertex_tables(right_vertices, ns, "chi right")
+    na, nb = len(left_vertices), len(right_vertices)
+    if na > 3 or nb > 3:
+        raise ValueError("chi vertex: at most three vertices per side")
+    n_ch = na * nb
+    signed = sign_c is not None
+    sign_host = (np.ones(nk) if sign_c is None else np.asarray(sign_c, dtype=np.float64).reshape(-1))
+    if sign_host.shape != (nk,) or not np.all(np.abs(sign_host) == 1.0):
+        raise ValueError("chi vertex: sign_c must be (nk,) of +-1")
+    si = ffi_fft_scale("ifftn", norm, nk)
+    flat = lambda g: g.reshape(g.shape[0], g.shape[1] * ns, g.shape[3] * ns)
+    if kconv_backend(mesh) == "mathdx":
+        _require_target(KCONV_CHI_VERTEX_TARGET, "CUDA")
+
+        def local(acc, gv, gc, gvt, gct, conj_src):
+            t = local_unfold_load_tables(tables)
+            budget = (int(scratch_bytes) if scratch_bytes is not None
+                      else chi_unfold_scratch_bytes(kg, ns, int(gv.size) * 16))
+            call = jax.ffi.ffi_call(KCONV_CHI_VERTEX_TARGET, jax.ShapeDtypeStruct(acc.shape, acc.dtype),
+                                    input_output_aliases={13: 0})
+            return call(flat(gv), flat(gvt), flat(gc), flat(gct), t.row, t.trs, t.lsrc, t.rsrc,
+                        t.mph, t.nph, t.spin, jnp.ones((1,), jnp.complex128),
+                        jnp.asarray(sign_host), acc,
+                        nkx=np.int64(kg[0]), nky=np.int64(kg[1]), nkz=np.int64(kg[2]),
+                        si=np.float64(si), conj_trs=np.int64(2 if conj_src else 0),
+                        scratch_bytes=np.int64(budget), signed_c=np.int64(signed),
+                        perm_l=perm_l, phase_l=phase_l, perm_r=perm_r, phase_r=phase_r,
+                        na=np.int64(na), nb=np.int64(nb), **_mathdx_common())
+    else:
+        _require_plan_route()
+        ifft_local = make_local_kfft_klead(mesh, kg, kind="ifftn", norm=norm)
+        codes = np.asarray([1, 1j, -1, -1j])
+        pl, hl = perm_l.reshape(na, ns), codes[phase_l.reshape(na, ns)]
+        pr, hr = perm_r.reshape(nb, ns), codes[phase_r.reshape(nb, ns)]
+
+        def local(acc, gv, gc, gvt, gct, conj_src):
+            t = local_unfold_load_tables(tables)
+            if conj_src:
+                gvt, gct = jnp.conj(gv), jnp.conj(gc)
+            n_par, mx, _, my, _ = (int(v) for v in gv.shape)
+
+            def unfolded(g, gt):
+                O = apply_unfold_load_tables_local(flat(g), flat(gt), t, spin_host)
+                return ifft_local(O.reshape(nk, mx * ns, my * ns)).reshape(nk, mx, ns, my, ns)
+            lower = unfolded(gv, gvt)
+            upper = unfolded(gc, gct) * jnp.asarray(sign_host)[:, None, None, None, None]
+            planes = []
+            for i in range(na):
+                for j in range(nb):
+                    up = upper[:, :, pl[i]][:, :, :, :, pr[j]]
+                    w = np.conj(hl[i])[:, None] * hr[j][None, :]
+                    planes.append(jnp.einsum("kxayb,ab,kxayb->kxy", jnp.conj(up), w, lower))
+            return acc + jnp.stack(planes)
+
+    g_spec, acc_spec = P(None, "x", None, "y", None), P(None, None, "x", "y")
+    sm = {conj_src: _sharded(lambda a, gv, gc, gvt, gct, _c=conj_src: local(a, gv, gc, gvt, gct, _c),
+                             mesh, (acc_spec, g_spec, g_spec, g_spec, g_spec), acc_spec)
+          for conj_src in (False, True)}
+
+    def fn(acc, Gv, Gc, Gvt=None, Gct=None):
+        _check_complex(acc, Gv, Gc)
+        if Gv.ndim != 5 or int(Gv.shape[2]) != ns or int(Gv.shape[4]) != ns or Gc.shape != Gv.shape:
+            raise ValueError(f"chi vertex expects Gv = Gc (n_parent, mu, {ns}, nu, {ns}); "
+                             f"got {Gv.shape} / {Gc.shape}")
+        if tuple(acc.shape) != (n_ch, nk, int(Gv.shape[1]), int(Gv.shape[3])):
+            raise ValueError(f"chi vertex: acc {acc.shape} is not ({n_ch}, {nk}, mu, nu)")
+        if (Gvt is None) != (Gct is None):
+            raise ValueError("chi vertex: pass both partners or neither")
+        if Gvt is None:
+            return sm[True](acc, Gv, Gc, Gv, Gc)
+        if Gvt.shape != Gv.shape or Gct.shape != Gv.shape:
+            raise ValueError("chi vertex: the partners must match the Greens' shape")
+        return sm[False](acc, Gv, Gc, Gvt, Gct)
     return fn
 
 

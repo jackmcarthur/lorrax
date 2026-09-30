@@ -166,6 +166,52 @@ def _chi_door_serves(mesh_xy, kgrid, ns) -> bool:
     return not why
 
 
+def _photon_chi_doors(mesh_xy, kgrid, half_plans, parity):
+    """Mode-11 vertex doors of the four-current stream, one per family pair and lower quadrant.
+
+    ``half_plans`` are the two families' Dirac-half plans and ``parity`` the
+    per-full-k-row sign ``p`` of the bispinor action ``diag(U, pU)``
+    (``CentroidKUnfoldPlan.dirac_halves``).  The lower Green's quadrant
+    ``(h, g)`` meets the upper quadrant ``(h', g') = (h, g) ^ flip`` (a current
+    vertex exchanges the halves).  Its tables carry the lower quadrant's sign
+    ``p^(h+g)`` in the right phases; the upper quadrant's own sign differs
+    by ``p`` when ``h+g`` and ``h'+g'`` differ in parity, and the door applies
+    that on the upper operand's load.  The vertices are the quadrant-local
+    ``(perm, phase)`` of every channel pair of the family pair
+    (``common.gamma_matrices.gamma_vertex_trace``'s trace).  Returns
+    ``{(pair, (h, g)): (door, keys)}``.
+    """
+    from common.gamma_matrices import gamma_perm_phase_host
+    from ffi.fft import make_kconv_chi_vertex
+    from .photon_layout import FAMILY_PAIRS, family_channels
+    p = np.asarray(parity, dtype=np.float64)
+    doors = {}
+    for pair in FAMILY_PAIRS:
+        L, R = pair
+        base = half_plans[L].unfold_load_tables(
+            right_plan=None if half_plans[R] is half_plans[L] else half_plans[R])
+        flip = tuple(int(f == 1) for f in pair)
+        keys = tuple((A, B) for A in family_channels(L) for B in family_channels(R))
+        for h in (0, 1):
+            for g in (0, 1):
+                hu, gu = h ^ flip[0], g ^ flip[1]
+                tables = base if (h + g) % 2 == 0 else base._replace(
+                    nph=np.asarray(base.nph) * p[:, None])
+                sign_c = None if (h + g) % 2 == (hu + gu) % 2 else p
+
+                def local(channel, first, other):
+                    perm, phase = gamma_perm_phase_host(channel)
+                    rows = [first + i for i in range(2)]
+                    return (tuple(int(perm[a]) - 2 * other for a in rows),
+                            tuple(complex(phase[a]) for a in rows))
+                left = tuple(local(A, 2 * h, hu) for A in family_channels(L))
+                right = tuple(local(B, 2 * g, gu) for B in family_channels(R))
+                door = make_kconv_chi_vertex(mesh_xy, kgrid, tables, left_vertices=left,
+                                             right_vertices=right, sign_c=sign_c, norm="ortho")
+                doors[(pair, (h, g))] = (door, keys)
+    return doors
+
+
 def _contract_chi_vertices(Gv_R, Gc_R, operands, identities, complex_contour):
     """Contract Hermitian endpoint vertices and complete their ordered orientations."""
     forward, reverse = _contract_chi_orientations(Gv_R, Gc_R, operands, identities)
@@ -749,6 +795,13 @@ def _get_chi_fractional_contour_kernel_face(
         g_plan = gemm_plan(mesh_xy, m=n_rmu * ns, k=nb_full, n=n_rmu * ns,
                            nq=nk_shape, dtype=jnp.complex128, layout=layout,
                            enable_active_range=band_ranges is not None)
+    # Four-current stream on raw-parent plans: each quadrant's parent Green pair
+    # goes straight into mathdx mode 11 with the channel vertices (unfold on the
+    # load, the traces in its Mid); no full-k Green exists.
+    photon_doors = None
+    if (photon is not None and half_parity is not None
+            and _chi_door_serves(mesh_xy, grid, 2)):
+        photon_doors = _photon_chi_doors(mesh_xy, grid, half_plans, half_parity)
     active_gemms = (tuple(g_plan.prepare_active_range(*bounds) for bounds in band_ranges)
                    if band_ranges is not None else (None, None))
     # Selected charge streams on a raw-parent plan form each node's correlation
@@ -891,6 +944,9 @@ def _get_chi_fractional_contour_kernel_face(
             ahead, behind = (jax.lax.with_sharding_constraint(
                 jnp.zeros((q_count, n_mu, n_mu), jnp.complex128), chi_R_shard)
                 for _ in range(2))
+            if photon_doors is not None:
+                return photon_door_rows(ahead, behind, lower_weight, lower_time, lower_ref,
+                                        upper_weight, upper_time, upper_ref)
             quadrants = jnp.asarray(((0, 0), (0, 1), (1, 0), (1, 1)), jnp.int32)
             for pair in FAMILY_PAIRS:
                 # A current channel's vertex maps half h to 1 - h.
@@ -926,6 +982,57 @@ def _get_chi_fractional_contour_kernel_face(
                     ahead = _insert(ahead, jnp.take(value, jnp.asarray(gather_q), axis=0),
                                     layout_p, A, B, mesh_xy)
                     behind = _insert(behind, jnp.take(value, jnp.asarray(reverse_q), axis=0),
+                                     layout_p, A, B, mesh_xy)
+            return ahead, behind
+
+        def photon_door_rows(ahead, behind, lower_weight, lower_time, lower_ref,
+                             upper_weight, upper_time, upper_ref):
+            """:func:`photon_rows` through mathdx mode 11: quadrant parent Greens, unfold on load.
+
+            Per family pair, each lower quadrant ``(h, g)`` and its upper quadrant
+            are built on the raw parents only (``build_G_tau(unfold=False)``) and
+            the door accumulates every channel pair's R plane.  The door reads
+            ``G' = ifftn_k`` of the unfolded Greens, so its plane is
+            ``v(R) = conj(A(-R))`` and ``FT[A](q) = conj(FT[v](q))``.
+            """
+            from .photon_layout import FAMILY_PAIRS, _insert
+            layout_p = photon.packed_layout
+
+            def parent(weight, t, ref, pair, halves, current):
+                L, R = pair
+                left = jax.lax.slice_in_dim(psi_mun[L], 2 * halves[0], 2 * halves[0] + 2, axis=1)
+                right = jax.lax.slice_in_dim(psi_nmu[R], 2 * halves[1], 2 * halves[1] + 2, axis=2)
+                weight, t = oriented(weight, t)
+                return build_G_tau(left, right, enk_full, t, e_ref=ref, band_weight=weight,
+                                   layout=layout, gemm=g_plan, k_unfold_plan=half_plans[L],
+                                   unfold=False, real_weights=False if direct else None)
+
+            for pair in FAMILY_PAIRS:
+                flip = tuple(int(f == 1) for f in pair)
+                keys = photon_doors[(pair, (0, 0))][1]
+                # The previous class's rows finish before this class's Greens.
+                ahead, behind, lower_w, upper_w = jax.lax.optimization_barrier(
+                    (ahead, behind, lower_weight, upper_weight))
+                acc = jax.lax.with_sharding_constraint(jnp.zeros(
+                    (len(keys), nk, layout_p.carrier_extent(keys[0][0]),
+                     layout_p.carrier_extent(keys[0][1])), jnp.complex128), selected_shard)
+                for h, g in ((0, 0), (0, 1), (1, 0), (1, 1)):
+                    # One quadrant's Green pair is live at a time: both builds wait
+                    # for the previous quadrant's door.
+                    acc, lower_w, upper_w = jax.lax.optimization_barrier((acc, lower_w, upper_w))
+                    lower = parent(lower_w, lower_time, lower_ref, pair, (h, g), False)
+                    upper = parent(upper_w, upper_time, upper_ref, pair,
+                                   (h ^ flip[0], g ^ flip[1]), True)
+                    partners = (() if lower.transpose is None and upper.transpose is None
+                                else (lower.partner(), upper.partner()))
+                    acc = photon_doors[(pair, (h, g))][0](acc, lower.G, upper.G, *partners)
+                for c, (A, B) in enumerate(keys):
+                    # One channel plane's transform is live at a time.
+                    acc, ahead, behind = jax.lax.optimization_barrier((acc, ahead, behind))
+                    value = chi_fftn(acc[c])
+                    ahead = _insert(ahead, jnp.conj(jnp.take(value, jnp.asarray(gather_q), axis=0)),
+                                    layout_p, A, B, mesh_xy)
+                    behind = _insert(behind, jnp.conj(jnp.take(value, jnp.asarray(reverse_q), axis=0)),
                                      layout_p, A, B, mesh_xy)
             return ahead, behind
 
