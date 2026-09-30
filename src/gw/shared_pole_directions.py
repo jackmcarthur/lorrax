@@ -457,6 +457,43 @@ class LineSelection:
         return out
 
 
+def spill_line_q_panel(panels):
+    """Park narrow all-P actions with the shared bit-exact local-shard owner."""
+    from common.collectives import spill_to_host
+    from common.gpu_utils import host_bytes_per_process
+    arrays = [a for field in ("panels","cross") for a in panels.get(field,{}).values()]
+    need = sum(sum(int(sh.data.nbytes) for sh in a.addressable_shards) for a in arrays)
+    if need > host_bytes_per_process():
+        raise ValueError("GATE response_line_host_capacity: local narrow actions exceed host share")
+    out = dict(sample=panels["sample"],counts=panels["counts"],shapes={field:{name:tuple(a.shape) for name,a in panels.get(field,{}).items()} for field in ("panels","cross")},widths={
+        name:int(a.shape[-1]) for name,a in panels["panels"].items()})
+    for field in ("panels","cross"):
+        if field in panels:
+            out[field] = {name:spill_to_host(a) for name,a in panels[field].items()}
+    return out
+
+
+def line_q_restore_bytes(piece,widths,ranks):
+    return sum(int(np.prod(shape[:-1]))*int(widths[name])*16//int(ranks)
+               for field in piece["shapes"].values() for name,shape in field.items())
+
+
+def restore_line_q_panel(piece, widths):
+    """Restore one q panel at the sample's actual maximum multiplet carriers."""
+    from common.collectives import restore_from_host
+    from gw.shared_pole_local import _pad_columns
+    out = dict(sample=piece["sample"],counts=piece["counts"])
+    for field in ("panels","cross"):
+        if field in piece:
+            out[field] = {}
+            for name,spill in piece[field].items():
+                a = restore_from_host(spill)
+                width = int(widths[name])
+                out[field][name] = a if int(a.shape[-1]) == width else _pad_columns(
+                    a.sharding,a.shape,width)(a)
+    return out
+
+
 def charge_line_selection(meta, *, mesh_xy, ordered, execution, nq):
     """The charge bank's one family: the packed centroid operator, its padding zeroed.
 

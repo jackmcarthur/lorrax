@@ -220,6 +220,46 @@ def device_load_tables(t: UnfoldLoadTables, mesh_xy) -> DeviceLoadTables:
                               for a, spec in zip(host, DEVICE_LOAD_SPECS)))
 
 
+def apply_unfold_load_spin_component_local(G, Gt, t, a, b, *,
+                                            mu_start, mu_size, nu_start, nu_size):
+    """One typed open-spin component on a bounded owner-local spatial tile.
+
+    Same transport as apply_unfold_load_tables_local, with direct parent
+    gathers before spin contraction; neither a full-k nor a full-spin bank
+    exists. G/Gt are centroid-major parent Greens inside a shard_map.
+    """
+    if t.conj_trs:
+        raise ValueError("spin-component load requires typed Green partner transport")
+    ns, nr = int(G.shape[2]), int(G.shape[4])
+    nk = int(t.row.shape[0])
+    left = jax.lax.dynamic_slice_in_dim(t.lsrc.reshape(nk, -1, ns),
+                                      mu_start, int(mu_size), axis=1)
+    right = jax.lax.dynamic_slice_in_dim(t.rsrc.reshape(nk, -1, nr),
+                                       nu_start, int(nu_size), axis=1)
+    mph = jax.lax.dynamic_slice_in_dim(t.mph.reshape(nk, -1, ns),
+                                     mu_start, int(mu_size), axis=1)
+    nph = jax.lax.dynamic_slice_in_dim(t.nph.reshape(nk, -1, nr),
+                                     nu_start, int(nu_size), axis=1)
+    flat = G.reshape(G.shape[0], G.shape[1]*ns, G.shape[3]*nr)
+    partner = None if Gt is None else Gt.reshape(flat.shape)
+    def add(i, total):
+        c, d = i // nr, i % nr
+        l, r = left[:, :, c], right[:, :, d]
+        field = flat[t.row[:, None, None], jnp.maximum(l, 0)[:, :, None],
+                     jnp.maximum(r, 0)[:, None, :]]
+        if partner is not None:
+            other = partner[t.row[:, None, None], jnp.maximum(l, 0)[:, :, None],
+                            jnp.maximum(r, 0)[:, None, :]]
+            field = jnp.where(t.trs[:, None, None] != 0, other, field)
+        field = field * mph[:, :, c, None] * nph[:, None, :, d]
+        field = jnp.where((l >= 0)[:, :, None] & (r >= 0)[:, None, :], field, 0)
+        weight = t.spin[:, a, c] * jnp.conj(t.spin_r[:, b, d])
+        field, weight = jax.lax.optimization_barrier((field, weight))
+        return total + weight[:, None, None] * field
+    return jax.lax.fori_loop(0, ns*nr, add,
+        jnp.zeros((nk, int(mu_size), int(nu_size)), G.dtype), unroll=False)
+
+
 def apply_unfold_load_tables_local(G, Gt, t: UnfoldLoadTables, spin_host, spin_r_host=None):
     """The tables applied in XLA on one rank's tiles: ``O`` ``(nk, mx, ns, my, nr)`` centroid-major.
 

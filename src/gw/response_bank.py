@@ -1352,6 +1352,23 @@ def response_group_size(meta, mesh_xy, *, n_samples, carry_per_sample, stream_wo
     return size, fixed, device_room, int(device_budget_bytes()) - device_room
 
 
+def photon_response_q_width(wfns,meta,mesh_xy,vertex,*,n_q,face_bytes):
+    """Native quarter-Green/FFT live-set hint; compiled admission remains authoritative."""
+    from .greens_function_kernel import _green_terms
+    from common.gpu_utils import device_room_bytes
+    parent = int(vertex.families.n_parent or meta.nk_tot)
+    mu = max(int(v) for v in vertex.families.packed_layout.carrier_extents)
+    tile,panels = _green_terms(n_parent=parent,n_rmu=mu,ns=2,
+                               n_band=int(wfns.slices.nb_full),mesh=mesh_xy)
+    nk = int(meta.nkx)*int(meta.nky)*int(meta.nkz)
+    mt,nt = min(mu//int(mesh_xy.shape['x']),32),min(mu//int(mesh_xy.shape['y']),64)
+    scalar_tile = 16*nk*mt*nt
+    fixed = int(4*tile + 4*panels + 18*scalar_tile)
+    ledger = meta.shared_pole_capacity
+    room = min(ledger.room_bytes_per_rank(ledger.live_stages),device_room_bytes())
+    return max(1,min(int(n_q),int(max(0,room-fixed)//(12*face_bytes))))
+
+
 def produce_sample_bank(wfns, meta, config, *, mesh_xy, sym, sample_plan, bank_io,
                         vertex=None, contact=None, direct_head=None, print_fn=print):
     """Stage A: integrate value and derivative together, one frequency at a time.
@@ -1421,7 +1438,19 @@ def produce_sample_bank(wfns, meta, config, *, mesh_xy, sym, sample_plan, bank_i
     from file_io.shared_pole_store import (dense_sample_rows, read_shared_pole_bank,
                                            shared_pole_bank_writer)
     from .shared_pole_execution import line_selection_execution
-    response_rows = panel_rows(0, len(qids))
+    # The coupled photon solve is independent per q. Keep its 4-current
+    # matrix intact and bound the response carry by authenticated q panels.
+    q_width = len(qids)
+    if vertex is not None:
+        ledger.live_stages = ambient
+        q_width = photon_response_q_width(wfns,meta,mesh_xy,vertex,n_q=len(qids),
+            face_bytes=16*n*n//mesh_xy.size)
+    q_spans = tuple((q0,min(q0+q_width,len(qids))) for q0 in range(0,len(qids),q_width))
+    selection_nq = q_spans[0][1] - q_spans[0][0]
+    response_rows = max((panel_rows(*span) for span in q_spans), key=len)
+    receipt["q_panels"] = dict(width=q_width,spans=[list(span) for span in q_spans],
+        parent_count=len(qids),coupled_extent=n,
+        closure="exact parent q union minus-q per panel; original V/contact for both")
     row_index = {q: i for i, q in enumerate(response_rows)}
     face_bytes = 16*n*n//mesh_xy.size
     caller_live = ambient
@@ -1444,15 +1473,15 @@ def produce_sample_bank(wfns, meta, config, *, mesh_xy, sym, sample_plan, bank_i
         rows = ([int(meta.mu_basis.n_packed)] if vertex is None else
                 [int(b.n_packed) * (3 if f else 1) for f, b in enumerate(bank_io["mu_bases"])])
         execution, selection_resident, selection_workspace = line_selection_execution(
-            rows, mesh=mesh_xy, ledger=ledger, nq=len(qids), carry=carry_per_sample)
+            rows, mesh=mesh_xy, ledger=ledger, nq=selection_nq, carry=carry_per_sample)
         if vertex is None:
             from .shared_pole_directions import charge_line_selection
             selection = charge_line_selection(meta, mesh_xy=mesh_xy, ordered=ordered,
-                                              execution=execution, nq=len(qids))
+                                              execution=execution, nq=selection_nq)
         else:
             from .shared_pole_sectors import sector_line_selection
             selection = sector_line_selection(bank_io, meta, mesh_xy=mesh_xy, execution=execution,
-                                              nq=len(qids))
+                                              nq=selection_nq)
         receipt["line_selection"] = dict(execution=execution, samples=[p0, p1],
             resident_bytes_per_rank=selection_resident, workspace_bytes_per_rank=selection_workspace)
     with timing.section('bank.window_geometry', announce=True,
@@ -1461,10 +1490,11 @@ def produce_sample_bank(wfns, meta, config, *, mesh_xy, sym, sample_plan, bank_i
             mesh_xy=mesh_xy,n=n,photon=vertex is not None)
         support = response_support(wfns, meta, sample_plan, receipt, print_fn=print_fn)
         ledger.live_stages = ambient
-        # Price the stream once at "every sample in one group"; the compiled
-        # temporaries do not grow with the group, only the donated carry does.
+        # Photon q panels price one sample first; the existing group planner
+        # then prices its chosen shared-node carry with compiled admission.
         workspace, whole = _stream_workspace(wfns, meta, mesh_xy, support, q_ids=response_rows,
-            n_outputs=2*len(z), ordered=ordered, vertex=vertex)
+            n_outputs=2 if vertex is not None and len(q_spans)>1 else 2*len(z),
+            ordered=ordered, vertex=vertex)
         chosen = (0, 0) if selection is None else (selection_resident, selection_workspace)
         with timing.section('bank.plan.direct'):
             group_size, fixed, room, live = response_group_size(meta, mesh_xy, n_samples=len(z),
@@ -1481,7 +1511,8 @@ def produce_sample_bank(wfns, meta, config, *, mesh_xy, sym, sample_plan, bank_i
                 group_size, stage="response direct stream",
                 build=lambda g: _stream_executable(wfns, meta, mesh_xy, support,
                     q_ids=response_rows, n_outputs=2*g, ordered=ordered, vertex=vertex),
-                compiled=whole if group_size == len(z) else None,
+                compiled=whole if (group_size == 1 if vertex is not None and len(q_spans)>1
+                                   else group_size == len(z)) else None,
                 fixed=fixed, per_unit=carry_per_sample, room=room,
                 extra=lambda g, _: g*carry_per_sample + scratch)
         group_size = check.chunk
@@ -1563,83 +1594,173 @@ def produce_sample_bank(wfns, meta, config, *, mesh_xy, sym, sample_plan, bank_i
                         _tr_odd_census(receipt,solve_value,h[part],chi_value[part],value[part],z[sample:sample+1],int(qids[iq]))
         return value, slope
 
-    for group in rules["plan"]["groups"]:
-        members = [int(m) for m in group["members"]]
-        if all(committed(m) for m in members):
-            for _ in members:
-                progress.step()
-            continue
-        ledger.live_stages = ambient
-        name, _ = _reserve(meta, "bank_outputs", len(members)*carry_per_sample)
-        ledger.live_stages = ambient+(name,)
-        raw_group = integrate_response_group(wfns, meta, mesh_xy, rules, group,
-            q_ids=response_rows, execute=execute, receipt=receipt,
-            ordered=ordered, vertex=vertex)
-        io_started = time.monotonic()
-        # One collective writer transaction per group, not per sample.
-        with shared_pole_bank_writer(bank_io["path"], meta=meta,
-                expected_identity=bank_io["identity"], mesh_xy=mesh_xy) as (bank_handle, header, write):
-            receipt["seconds"]["io"] = receipt["seconds"].get("io",0.)+time.monotonic()-io_started
-            for row, sample in enumerate(members):
-                if committed(sample):
+    if vertex is not None and len(q_spans) > 1:
+        from .shared_pole_sectors import sector_line_selection
+        from .shared_pole_directions import spill_line_q_panel,restore_line_q_panel,line_q_restore_bytes
+        for group in rules["plan"]["groups"]:
+            members = [int(m) for m in group["members"]]
+            pending = [m for m in members if not committed(m)]
+            if not pending:
+                for _ in members:
                     progress.step()
-                    continue
-                raw = raw_group[2*row:2*row+2]
-                if p0 <= sample < p1:
-                    # Select from W(z) itself, then act with the minus-q partner on
-                    # the same directions; only the panels reach the bank.
-                    if np.asarray(header["line_written"], bool)[:, sample-p0].any():
-                        raise ValueError(f"GATE response_line_panel: sample {sample} is partly committed; "
-                                         "a line sample commits every parent at once; fix: rebuild the bank")
-                    stage, _ = _reserve(meta, "line_selection", selection_resident, selection_workspace)
-                    live = ledger.live_stages
-                    ledger.live_stages = live + (stage,)
-                    started_selection = time.monotonic()
-                    value, slope = solve(raw, 0, 0, len(qids), bank_handle, sample)
-                    with timing.section('bank.line_select'):
-                        lines = selection.select(sample, value, slope)
-                    del value, slope
-                    if ordered:
-                        value, slope = solve(raw, 1, 0, len(qids), bank_handle, sample)
-                        with timing.section('bank.line_mirror'):
-                            selection.mirror(sample, lines, value, slope)
-                        del value, slope
-                    with timing.section('bank.line_panels'):
-                        panels = selection.panels(sample, lines)
-                    del lines
-                    receipt["seconds"]["line_selection"] = (receipt["seconds"].get("line_selection", 0.)
-                                                             + time.monotonic() - started_selection)
-                    io_started = time.monotonic()
-                    with timing.section('bank.line_write'):
-                        write(q_span=(0, len(qids)), line=panels)
-                    receipt["seconds"]["io"] = receipt["seconds"].get("io",0.)+time.monotonic()-io_started
-                    ledger.live_stages = live
-                    del panels
-                else:
-                    dense_row = dense_sample_rows(header, (sample,))[0]
-                    marked = np.asarray(header["sample_written"], bool)[:, dense_row]
-                    # A fresh frequency is one q_irr slab. Partial restarts keep
-                    # contiguous rows with identical value/slope masks together.
-                    edges = np.r_[0, 1+np.flatnonzero(np.any(marked[1:] != marked[:-1], axis=1)), len(qids)]
-                    for q0, q1 in zip(edges[:-1], edges[1:]):
-                        need_value, need_slope = ~marked[q0]
-                        if not (need_value or need_slope):
+                continue
+            held = {sample: [] for sample in pending if p0 <= sample < p1}
+            with shared_pole_bank_writer(bank_io["path"],meta=meta,
+                    expected_identity=bank_io["identity"],mesh_xy=mesh_xy) as (bank_handle,header,write):
+                for q0,q1 in q_spans:
+                    response_rows = panel_rows(q0,q1)
+                    row_index = {q:i for i,q in enumerate(response_rows)}
+                    carry_bytes = 2*len(members)*len(response_rows)*face_bytes
+                    ledger.live_stages = ambient
+                    name,_ = _reserve(meta,"bank_q_outputs",carry_bytes)
+                    ledger.live_stages += (name,)
+                    raw_group = integrate_response_group(wfns,meta,mesh_xy,rules,group,
+                        q_ids=response_rows,execute=execute,receipt=receipt,ordered=ordered,vertex=vertex)
+                    nq = q1-q0
+                    if held:
+                        execution,selection_resident,selection_workspace = line_selection_execution(
+                            rows,mesh=mesh_xy,ledger=ledger,nq=nq,carry=0)
+                        selection = sector_line_selection(bank_io,meta,mesh_xy=mesh_xy,
+                                                           execution=execution,nq=nq)
+                    for row,sample in enumerate(members):
+                        if sample not in pending:
                             continue
-                        span = (int(q0), int(q1))
-                        value, slope = solve(raw, 0, q0, q1, bank_handle, sample, need_value=need_value)
-                        io_started = time.monotonic()
-                        if need_slope:
-                            write(q_span=span, sample_span=(sample,sample+1), dWc_ds=slope[:,None])
-                        if need_value:
-                            write(q_span=span, sample_span=(sample,sample+1), Wc=value[:,None])
-                        receipt["seconds"]["io"] = receipt["seconds"].get("io",0.)+time.monotonic()-io_started
-                        del value, slope
-                receipt["batches"].append(dict(sample=sample, group=members))
-                del raw
-                progress.step()
+                        raw = raw_group[2*row:2*row+2]
+                        if sample in held:
+                            if np.asarray(header["line_written"],bool)[:,sample-p0].any():
+                                raise ValueError("GATE response_line_panel: partly committed line sample; rebuild bank")
+                            live = ledger.live_stages
+                            stage,_ = _reserve(meta,"line_q_selection",selection_resident,selection_workspace)
+                            ledger.live_stages += (stage,)
+                            value,slope = solve(raw,0,q0,q1,bank_handle,sample)
+                            lines = selection.select(sample,value,slope)
+                            del value,slope
+                            if ordered:
+                                value,slope = solve(raw,1,q0,q1,bank_handle,sample)
+                                selection.mirror(sample,lines,value,slope)
+                                del value,slope
+                            panels = selection.panels(sample,lines)
+                            del lines
+                            held[sample].append(spill_line_q_panel(panels))
+                            ledger.live_stages = live
+                            del panels
+                        else:
+                            dense_row = dense_sample_rows(header,(sample,))[0]
+                            marked = np.asarray(header["sample_written"],bool)[q0:q1,dense_row]
+                            edges = np.r_[0,1+np.flatnonzero(np.any(marked[1:] != marked[:-1],axis=1)),nq]
+                            for lo,hi in zip(edges[:-1],edges[1:]):
+                                need_value,need_slope = ~marked[lo]
+                                if not (need_value or need_slope):
+                                    continue
+                                span = (q0+int(lo),q0+int(hi))
+                                value,slope = solve(raw,0,*span,bank_handle,sample,need_value=need_value)
+                                if need_slope:
+                                    write(q_span=span,sample_span=(sample,sample+1),dWc_ds=slope[:,None])
+                                if need_value:
+                                    write(q_span=span,sample_span=(sample,sample+1),Wc=value[:,None])
+                                del value,slope
+                        del raw
+                    del raw_group
+                    ledger.live_stages = ambient
+                for sample,pieces in held.items():
+                    widths = {name:max(p["widths"][name] for p in pieces)
+                              for name in pieces[0]["widths"]}
+                    for span,piece in zip(q_spans,pieces):
+                        # Restore only this parent's narrow actions. The
+                        # maximum width metadata closes all multiplets; the
+                        # existing file schema and q-order remain unchanged.
+                        ledger.live_stages = ambient
+                        size = line_q_restore_bytes(piece,widths,mesh_xy.size)
+                        restore_stage,_ = _reserve(meta,"line_q_restore",size,size)
+                        ledger.live_stages += (restore_stage,)
+                        panels = restore_line_q_panel(piece,widths)
+                        write(q_span=span,line=panels)
+                        del panels
+                    held[sample].clear()
+                    ledger.live_stages = ambient
+                for sample in members:
+                    receipt["batches"].append(dict(sample=sample,group=members,q_spans=[list(v) for v in q_spans]))
+                    progress.step()
+            del held
+            ledger.live_stages = ambient
+    else:
+        for group in rules["plan"]["groups"]:
+            members = [int(m) for m in group["members"]]
+            if all(committed(m) for m in members):
+                for _ in members:
+                    progress.step()
+                continue
+            ledger.live_stages = ambient
+            name, _ = _reserve(meta, "bank_outputs", len(members)*carry_per_sample)
+            ledger.live_stages = ambient+(name,)
+            raw_group = integrate_response_group(wfns, meta, mesh_xy, rules, group,
+                q_ids=response_rows, execute=execute, receipt=receipt,
+                ordered=ordered, vertex=vertex)
             io_started = time.monotonic()
-        receipt["seconds"]["io"] += time.monotonic()-io_started
-        del raw_group
+            # One collective writer transaction per group, not per sample.
+            with shared_pole_bank_writer(bank_io["path"], meta=meta,
+                    expected_identity=bank_io["identity"], mesh_xy=mesh_xy) as (bank_handle, header, write):
+                receipt["seconds"]["io"] = receipt["seconds"].get("io",0.)+time.monotonic()-io_started
+                for row, sample in enumerate(members):
+                    if committed(sample):
+                        progress.step()
+                        continue
+                    raw = raw_group[2*row:2*row+2]
+                    if p0 <= sample < p1:
+                        # Select from W(z) itself, then act with the minus-q partner on
+                        # the same directions; only the panels reach the bank.
+                        if np.asarray(header["line_written"], bool)[:, sample-p0].any():
+                            raise ValueError(f"GATE response_line_panel: sample {sample} is partly committed; "
+                                             "a line sample commits every parent at once; fix: rebuild the bank")
+                        stage, _ = _reserve(meta, "line_selection", selection_resident, selection_workspace)
+                        live = ledger.live_stages
+                        ledger.live_stages = live + (stage,)
+                        started_selection = time.monotonic()
+                        value, slope = solve(raw, 0, 0, len(qids), bank_handle, sample)
+                        with timing.section('bank.line_select'):
+                            lines = selection.select(sample, value, slope)
+                        del value, slope
+                        if ordered:
+                            value, slope = solve(raw, 1, 0, len(qids), bank_handle, sample)
+                            with timing.section('bank.line_mirror'):
+                                selection.mirror(sample, lines, value, slope)
+                            del value, slope
+                        with timing.section('bank.line_panels'):
+                            panels = selection.panels(sample, lines)
+                        del lines
+                        receipt["seconds"]["line_selection"] = (receipt["seconds"].get("line_selection", 0.)
+                                                                 + time.monotonic() - started_selection)
+                        io_started = time.monotonic()
+                        with timing.section('bank.line_write'):
+                            write(q_span=(0, len(qids)), line=panels)
+                        receipt["seconds"]["io"] = receipt["seconds"].get("io",0.)+time.monotonic()-io_started
+                        ledger.live_stages = live
+                        del panels
+                    else:
+                        dense_row = dense_sample_rows(header, (sample,))[0]
+                        marked = np.asarray(header["sample_written"], bool)[:, dense_row]
+                        # A fresh frequency is one q_irr slab. Partial restarts keep
+                        # contiguous rows with identical value/slope masks together.
+                        edges = np.r_[0, 1+np.flatnonzero(np.any(marked[1:] != marked[:-1], axis=1)), len(qids)]
+                        for q0, q1 in zip(edges[:-1], edges[1:]):
+                            need_value, need_slope = ~marked[q0]
+                            if not (need_value or need_slope):
+                                continue
+                            span = (int(q0), int(q1))
+                            value, slope = solve(raw, 0, q0, q1, bank_handle, sample, need_value=need_value)
+                            io_started = time.monotonic()
+                            if need_slope:
+                                write(q_span=span, sample_span=(sample,sample+1), dWc_ds=slope[:,None])
+                            if need_value:
+                                write(q_span=span, sample_span=(sample,sample+1), Wc=value[:,None])
+                            receipt["seconds"]["io"] = receipt["seconds"].get("io",0.)+time.monotonic()-io_started
+                            del value, slope
+                    receipt["batches"].append(dict(sample=sample, group=members))
+                    del raw
+                    progress.step()
+                io_started = time.monotonic()
+            receipt["seconds"]["io"] += time.monotonic()-io_started
+            del raw_group
     progress.finish()
     if jax.process_index() == 0:
         print_fn("Response quadrature: seconds " + " ".join(

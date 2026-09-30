@@ -149,6 +149,11 @@ def _get_chi_minimax_kernel(mesh_xy: Mesh, kgrid: tuple[int, int, int],
     return kernel
 
 
+def _photon_selected_rows_serve(photon, selected_q, pair_mode):
+    return (photon is not None and photon.plans[0] is not None and selected_q is not None
+            and pair_mode in ("direct", "retarded", "kms_static"))
+
+
 def _chi_door_serves(mesh_xy, kgrid, ns) -> bool:
     """Whether mathdx mode 11 (``ffi.fft.make_kconv_chi_unfold``) holds this grid.
 
@@ -756,6 +761,29 @@ def _get_chi_fractional_contour_kernel_face(
         from common.fft_helpers import make_kconv_chi_unfold
         chi_door = make_kconv_chi_unfold(mesh_xy, grid, k_unfold_plan.unfold_load_tables(),
                                          n_out=1, complete=False, norm="ortho")
+    photon_doors = None
+    if _photon_selected_rows_serve(photon, selected_q, pair_mode):
+        from common.fft_helpers import make_selected_parent_pairs
+        from common.gamma_matrices import gamma_perm_phase_host
+        from .photon_layout import FAMILY_PAIRS, family_channels
+        photon_rows = tuple(dict.fromkeys(tuple(gather_q) + tuple(reverse_q)))
+        photon_ahead = np.asarray([photon_rows.index(int(q)) for q in gather_q])
+        photon_behind = np.asarray([photon_rows.index(int(q)) for q in reverse_q])
+        photon_doors = {}
+        for pair in FAMILY_PAIRS:
+            channels = tuple((A,B) for A in family_channels(pair[0])
+                             for B in family_channels(pair[1]))
+            terms = []
+            for A,B in channels:
+                pa,fa = gamma_perm_phase_host(A); pb,fb = gamma_perm_phase_host(B)
+                ia,ib = np.argsort(pa[:2] % 2),np.argsort(pb[:2] % 2)
+                fl,fr = fa[:2][ia],np.conj(fb[:2][ib])
+                if physical:
+                    fl,fr = np.conj(fl),np.conj(fr)
+                terms.append((ia,fl,ib,fr))
+            tables = half_plans[pair[0]].unfold_load_tables(half_plans[pair[1]])
+            photon_doors[pair] = (channels,make_selected_parent_pairs(mesh_xy,grid,tables,tables,
+                selected_q=photon_rows,vertex_terms=terms,norm="ortho"))
     def _finish(value):
         value = chi_fftn(value)
         if negate_full_q is None:
@@ -979,6 +1007,43 @@ def _get_chi_fractional_contour_kernel_face(
 
             return jax.lax.cond(window == 0, crossing, remote, None), None
 
+        def photon_correlation_rows(lower_weight, lower_time, lower_ref,
+                                    upper_weight, upper_time, upper_ref):
+            from .photon_layout import FAMILY_PAIRS, _insert, photon_family_order
+            total = jax.lax.with_sharding_constraint(jnp.zeros(
+                (len(photon_rows),n_mu,n_mu),jnp.complex128),chi_R_shard)
+            quadrants = jnp.asarray(((0,0),(0,1),(1,0),(1,1)),jnp.int32)
+            def parent(weight,t,ref,pair,hg):
+                L,R = pair; weight,t = oriented(weight,t)
+                left = jax.lax.dynamic_slice_in_dim(psi_mun[L],2*hg[0],2,axis=1)
+                right = jax.lax.dynamic_slice_in_dim(psi_nmu[R],2*hg[1],2,axis=2)
+                return build_G_tau(left,right,enk_full,t,e_ref=ref,band_weight=weight,
+                    layout=layout,gemm=g_plan,k_unfold_plan=half_plans[L],
+                    right_k_unfold_plan=half_plans[R],unfold=False,real_weights=False)
+            for pair in FAMILY_PAIRS:
+                channels,door = photon_doors[pair]
+                flip = jnp.asarray(pair,jnp.int32)
+                def quadrant(total,hg):
+                    total,lo = jax.lax.optimization_barrier((total,lower_weight))
+                    lower = parent(lo,lower_time,lower_ref,pair,hg)
+                    upper = parent(upper_weight,upper_time,upper_ref,pair,hg^flip)
+                    lp,up = lower.partner(),upper.partner()
+                    lp = lower.G if lp is None else lp
+                    up = upper.G if up is None else up
+                    ls = jnp.where(hg[0] == hg[1],1.,jnp.asarray(half_parity))
+                    uhg = hg^flip
+                    us = jnp.where(uhg[0] == uhg[1],1.,jnp.asarray(half_parity))
+                    blocks = door(upper.G,lower.G,up,lp,us,ls)
+                    for ch,(A,B) in enumerate(channels):
+                        total = _insert(total,blocks[ch],photon.packed_layout,A,B,mesh_xy,add=True)
+                    return total,None
+                total,_ = jax.lax.scan(quadrant,total,quadrants,unroll=1)
+            ahead = photon_family_order(jnp.take(total,jnp.asarray(photon_ahead),axis=0),
+                photon,mesh_xy,P(None,"x","y"))
+            behind = photon_family_order(jnp.take(total,jnp.asarray(photon_behind),axis=0),
+                photon,mesh_xy,P(None,"x","y"))
+            return (jnp.conj(ahead),behind) if physical else (ahead,jnp.conj(behind))
+
         def correlation_rows(lower_weight, lower_time, lower_ref,
                              upper_weight, upper_time, upper_ref):
             """One node's forward and reverse rows through mathdx mode 11.
@@ -989,6 +1054,9 @@ def _get_chi_fractional_contour_kernel_face(
             ``fftn(G)(R) = ifftn(G)(-R)``; its q transform is conj(FT[v](q)),
             so the conjugation moves from the reverse rows to the forward rows.
             """
+            if photon_doors is not None:
+                return photon_correlation_rows(lower_weight,lower_time,lower_ref,
+                    upper_weight,upper_time,upper_ref)
             def parent(weight, t, ref, current):
                 weight, t = oriented(weight, t)
                 return build_G_tau(psi_mun, psi_nmu, enk_full, t, e_ref=ref,
@@ -1027,7 +1095,7 @@ def _get_chi_fractional_contour_kernel_face(
                 time_nodes[index],
                 jax.lax.dynamic_index_in_dim(projection_rows[0], index, axis=1, keepdims=False),
                 jax.lax.dynamic_index_in_dim(projection_rows[1], index, axis=1, keepdims=False)))
-            if chi_door is not None:
+            if chi_door is not None or photon_doors is not None:
                 ahead, behind = direct_rows(time)
             else:
                 value = chi_fftn(spin_correlation(occ_f, -time, energy_reference[0],
@@ -1055,7 +1123,7 @@ def _get_chi_fractional_contour_kernel_face(
 
         def body(accumulators, node):
             time, projection = node
-            if chi_door is not None:
+            if chi_door is not None or photon_doors is not None:
                 if pair_mode == "retarded":
                     tau = -jnp.asarray(1j, jnp.complex128) * time
                     ahead, behind = correlation_rows(occ_f, tau, energy_reference,
