@@ -177,7 +177,8 @@ def _w_parents(mesh_xy, plan, m, nc, n, nt, kcarrier, weights_fn, panel_bytes):
     and the partner comes from the same exchange, so no scaled or conjugated
     copy of a face is formed.  The route bounds its two live panels by one
     Green tile of ``n_full`` rows; the builder's plan here says ``n_full`` =
-    the rows whose tile is ``panel_bytes``.
+    the rows whose tile is ``panel_bytes`` (both whole faces when they fit:
+    one panel step).
     """
     key = (mesh_xy, id(plan), m, nc, n, nt, kcarrier, weights_fn, int(panel_bytes))
     if key in _W_PARENTS:
@@ -185,7 +186,7 @@ def _w_parents(mesh_xy, plan, m, nc, n, nt, kcarrier, weights_fn, panel_bytes):
     from gw.greens_function_kernel import build_G_parents
     nq = int(plan.n_parent)
     px, py = int(mesh_xy.shape['x']), int(mesh_xy.shape['y'])
-    rows = int(min(nq, max(1, int(panel_bytes) // (16 * (m * nc // px) * (n * nt // py)))))
+    rows = int(max(1, int(panel_bytes) // (16 * (m * nc // px) * (n * nt // py))))
     gemm = SimpleNamespace(backend='face', mesh=mesh_xy)
     face_plan = SimpleNamespace(sym_idx=plan.sym_idx, n_sym_spatial=plan.n_sym_spatial,
                                 mesh_xy=mesh_xy, n_full=rows)
@@ -448,12 +449,12 @@ def sector_synthesis(readers, headers, bases, syms, layout, frequencies, meta, m
     same=readers[0] is readers[1] and headers[0] is headers[1]
     faces=16*nq*kcarrier*(m*nc+n*nt)//mesh_xy.size
     tile=16*nq*m*nc*n*nt//mesh_xy.size
-    from gw.greens_function_kernel import green_panel_bytes
     native=0
-    # The W pair's pole panels (two live) take what the room leaves beside the
-    # faces and the pair, at most one W tile (green_panel_bytes).
-    panel=green_panel_bytes(n_rows=nq,m=m*nc,n=n*nt,mesh=mesh_xy,
-        room=capacity.room_bytes_per_rank(ambient)-faces-8*nq*kcarrier-2*tile)
+    # The W pair's two live pole panels hold at most both whole faces (one
+    # step, the fastest), bounded by what the room leaves beside the faces
+    # and the pair; never below one pole column.
+    column=16*nq*(m*nc//int(mesh_xy.shape['x'])+n*nt//int(mesh_xy.shape['y']))
+    panel=max(column,min(faces,capacity.room_bytes_per_rank(ambient)-faces-8*nq*kcarrier-2*tile))
     setup=f'{stage}.sector.resident.{tag}'
     # Resident: both parent faces and the parent poles.  The W pair (2 tiles)
     # is the window executable's, priced there with the Green.
