@@ -1392,7 +1392,19 @@ def _file_order_take(mesh, shape, dtype, k, sizes, height, spec):
             out = jnp.pad(out, pad)
         # Same volume-preserving axis order as face_to_batch_reshard, here
         # with the file split dimension and arbitrary leading axes intact.
-        for ax in axes[len(present):]:
+        remaining = axes[len(present):]
+        combined_src = next((d for d in range(n)
+                             if d != k and source[d] == remaining
+                             and len(remaining) > 1), None)
+        if combined_src is not None:
+            # The tuple collective uses exactly the declared linear rank
+            # order on both axes. Splitting the same source dimension one
+            # mesh axis at a time would permute that order. Only the owned
+            # bounded piece participates, never the full resident operand.
+            return jax.lax.all_to_all(
+                out, remaining, split_axis=k, concat_axis=combined_src,
+                tiled=True)
+        for ax in remaining:
             src = next((d for d in range(n) if source[d] == (ax,)), None)
             if src is not None:
                 out = jax.lax.all_to_all(out, ax, split_axis=k,
@@ -1417,9 +1429,12 @@ def _file_order_move_supported(spec, shape, k, mesh):
     present = source[k] or ()
     if present != axes[:len(present)]:
         return False
-    # Combined source axes need another ordering algorithm; keep the native
-    # collective hyperslab writer rather than an implicit global gather.
-    if any(len(e) != 1 for d, e in enumerate(source) if e and d != k):
+    # A combined source group can move as one tuple collective only when its
+    # rank order equals the target's remaining mesh order. Other combined
+    # orders retain the collective hyperslab writer without a global gather.
+    remaining = axes[len(present):]
+    if any(len(e) != 1 and e != remaining
+           for d, e in enumerate(source) if e and d != k):
         return False
     return not present or int(shape[k]) % int(mesh.size) == 0
 
