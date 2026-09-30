@@ -96,6 +96,17 @@ def interp_along_omega(
     values_w_kn : (nω, nk, nb); omega_grid : (nω,) increasing, the same
     reference as ``eval_kn`` (E_F-relative); returns (nk, nb).
     """
+    idx_lo, idx_hi, w_hi = _omega_interp_slots(
+        omega_grid, eval_kn, context=context, print_fn=print_fn)
+    k_idx = np.arange(idx_lo.shape[0])[:, None]
+    n_idx = np.arange(idx_lo.shape[1])[None, :]
+    return ((1.0 - w_hi) * values_w_kn[idx_lo, k_idx, n_idx]
+            + w_hi * values_w_kn[idx_hi, k_idx, n_idx])
+
+
+def _omega_interp_slots(omega_grid, eval_kn, *, context="", print_fn=None):
+    """``(idx_lo, idx_hi, w_hi)``, each (nk, nb): the two grid slots every
+    (k, n) reads and the upper slot's weight (:func:`interp_along_omega`)."""
     omega = np.asarray(omega_grid, dtype=np.float64)
     eval_arr = np.asarray(eval_kn, dtype=np.float64)
     if not float(omega[0]) <= 0.0 <= float(omega[-1]):
@@ -113,10 +124,41 @@ def interp_along_omega(
     idx_lo = idx_hi - 1
     denom = np.where(omega[idx_hi] > omega[idx_lo], omega[idx_hi] - omega[idx_lo], 1.0)
     w_hi = (e - omega[idx_lo]) / denom
-    k_idx = np.arange(e.shape[0])[:, None]
-    n_idx = np.arange(e.shape[1])[None, :]
-    return ((1.0 - w_hi) * values_w_kn[idx_lo, k_idx, n_idx]
-            + w_hi * values_w_kn[idx_hi, k_idx, n_idx])
+    return idx_lo, idx_hi, w_hi
+
+
+def interp_sigma_diag_along_omega(
+    sigma_w_kij,
+    mesh_xy,
+    omega_grid: np.ndarray,
+    eval_kn: np.ndarray,
+    *,
+    band_axis=None,
+    add_w_kn: np.ndarray | None = None,
+    scale: float | None = None,
+    context: str = "",
+    print_fn=None,
+) -> np.ndarray:
+    """:func:`interp_along_omega` of the band diagonal of a Σ(ω) cube.
+
+    The same numbers as extracting the (nω, nk, nb) diagonal, adding
+    ``add_w_kn`` (the host head diagonal), multiplying by ``scale`` and
+    interpolating, element for element.  Only the two ω slots each (k, n)
+    reads leave the cube (:func:`sigma_diag_at_omega_slots`), so no
+    (nω, nk, nb) array is made on the host or replicated on the devices.
+    """
+    idx_lo, idx_hi, w_hi = _omega_interp_slots(
+        omega_grid, eval_kn, context=context, print_fn=print_fn)
+    lo, hi = sigma_diag_at_omega_slots(
+        sigma_w_kij, mesh_xy, np.stack([idx_lo, idx_hi]), band_axis=band_axis)
+    if add_w_kn is not None:
+        k_idx = np.arange(idx_lo.shape[0])[:, None]
+        n_idx = np.arange(idx_lo.shape[1])[None, :]
+        lo = lo + add_w_kn[idx_lo, k_idx, n_idx]
+        hi = hi + add_w_kn[idx_hi, k_idx, n_idx]
+    if scale is not None:
+        lo, hi = lo * scale, hi * scale
+    return (1.0 - w_hi) * lo + w_hi * hi
 
 
 def sigma_grid_edge_ambiguity(
@@ -261,6 +303,7 @@ _EXTRACT_DIAG_KERNEL_CACHE: dict[int, object] = {}
 # Sharded-layout siblings (one per mesh): the diagonal-only extractor and
 # the band-diagonal adder used by the ``sigma_omega_layout=sharded`` path.
 _EXTRACT_DIAG_SHARDED_KERNEL_CACHE: dict[int, object] = {}
+_EXTRACT_DIAG_SLOTS_KERNEL_CACHE: dict[int, object] = {}
 _ADD_BAND_DIAG_KERNEL_CACHE: dict[tuple[int, bool], object] = {}
 _SET_BAND_DIAG_KERNEL_CACHE: dict[int, object] = {}
 
@@ -315,6 +358,70 @@ def _extract_diag_sharded_kernel(mesh_xy: Mesh):
         fn = _diag_sharded
         _EXTRACT_DIAG_SHARDED_KERNEL_CACHE[key] = fn
     return fn
+
+
+def sigma_diag_at_omega_slots(sigma_w_kij, mesh_xy: Mesh, slots_s_kn, *,
+                              band_axis=None) -> np.ndarray:
+    """``Σ[slots[s, k, n], k, n, n]`` on the host, shape (n_slot, nk, nb_logical).
+
+    ``slots_s_kn`` is a host integer table (n_slot, nk, nb_logical) of ω
+    indices, the same on every rank.  On the band-sharded cube each shard
+    gathers the diagonal elements it owns at those slots and one psum
+    replicates (n_slot, nk, nb): the values :func:`extract_sigma_diag_replicated`
+    would return at those slots (one owner plus exact zeros), without the
+    (nω, nk, nb) diagonal on any device or host.  A cube that is not
+    band-sharded keeps the full-diagonal read.
+    """
+    slots = np.asarray(slots_s_kn)
+    n_logical = int(slots.shape[-1])
+    k_idx = np.arange(slots.shape[1])[None, :, None]
+    n_idx = np.arange(n_logical)[None, None, :]
+    if not is_band_sharded_sigma_omega(sigma_w_kij):
+        diagonal = np.asarray(extract_sigma_diag_replicated(sigma_w_kij, mesh_xy))
+        return diagonal[slots, k_idx, n_idx]
+
+    from common.collectives import device_put_process_local
+    key = id(mesh_xy)
+    fn = _EXTRACT_DIAG_SLOTS_KERNEL_CACHE.get(key)
+    if fn is None:
+        from functools import partial
+        from common.shard_map import shard_map
+
+        p_x = int(mesh_xy.shape['x'])
+
+        @jax.jit
+        @partial(shard_map, mesh=mesh_xy,
+                 in_specs=(P(None, None, 'x', 'y'), P(None, None, None)),
+                 out_specs=P(None, None, None),
+                 check_vma=False)
+        def _diag_slots(tile, slot):
+            # The ownership rule of ``_extract_diag_sharded_kernel``.
+            ix = jax.lax.axis_index('x')
+            iy = jax.lax.axis_index('y')
+            mb = tile.shape[2]
+            nbl = tile.shape[3]
+            i = jnp.arange(mb * p_x)            # square global extent
+            a = i - ix * mb
+            b = i - iy * nbl
+            own = (a >= 0) & (a < mb) & (b >= 0) & (b < nbl)
+            a_c = jnp.clip(a, 0, mb - 1)[None, None, :]
+            b_c = jnp.clip(b, 0, nbl - 1)[None, None, :]
+            k = jnp.arange(tile.shape[1])[None, :, None]
+            vals = tile[slot, k, a_c, b_c]      # (n_slot, nk, nb) local gather
+            vals = jnp.where(own[None, None, :], vals,
+                             jnp.zeros((), dtype=tile.dtype))
+            return jax.lax.psum(vals, axis_name=('x', 'y'))
+
+        fn = _diag_slots
+        _EXTRACT_DIAG_SLOTS_KERNEL_CACHE[key] = fn
+
+    # Padded carrier bands read slot 0 and are dropped below.
+    carrier = int(sigma_w_kij.shape[-1])
+    on_carrier = np.zeros(slots.shape[:-1] + (carrier,), dtype=np.int32)
+    on_carrier[..., :n_logical] = slots
+    slot_rep = device_put_process_local(
+        on_carrier, NamedSharding(mesh_xy, P(None, None, None)))
+    return np.asarray(fn(sigma_w_kij, slot_rep))[..., :n_logical]
 
 
 def add_band_diag_sharded(sigma_w_kij: jax.Array, diag_w_kn, *,
@@ -934,6 +1041,8 @@ __all__ = [
     "extract_sigma_diag_replicated",
     "static_sigma_diag_to_host",
     "interp_along_omega",
+    "interp_sigma_diag_along_omega",
+    "sigma_diag_at_omega_slots",
     "omega_coverage",
     "plot_qp_energy_comparison",
     "remove_managed",
