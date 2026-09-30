@@ -694,10 +694,13 @@ constexpr int SSO = (NA == NS) ? SS : NA * NA;   // rows per pair
 // conj_trs selects the rule: 0 reads the partner tile; 1 conjugates the phased
 // product (a Hermitian interaction); 2 reads conj(G) from G itself (a Green of
 // real weights, whose partner IS conj(G): no partner tile exists).
+// SL, SR: the left and right endpoint widths of the operand (template parameters, so one
+// program loads a Green (NS, NS) and an interaction's Lorentz block (nA, nB) side by side).
+template <int SL, int SR>
 __device__ __forceinline__ void lrx_unfold_pair(
     const lrx_c2* __restrict__ gp, const lrx_c2* __restrict__ gt, const UnfoldTab& t,
-    int k, long long xx, long long yy, lrx_c2 (&g)[NS][NR], lrx_c2 (&u)[NS][NS],
-    lrx_c2 (&ur)[NR][NR]) {
+    int k, long long xx, long long yy, lrx_c2 (&g)[SL][SR], lrx_c2 (&u)[SL][SL],
+    lrx_c2 (&ur)[SR][SR]) {
     const lrx_c2* __restrict__ mph = reinterpret_cast<const lrx_c2*>(t.mph);
     const lrx_c2* __restrict__ nph = reinterpret_cast<const lrx_c2*>(t.nph);
     const lrx_c2* __restrict__ spin = reinterpret_cast<const lrx_c2*>(t.spin);
@@ -707,13 +710,13 @@ __device__ __forceinline__ void lrx_unfold_pair(
     const bool conj_src = anti && t.conj_trs == 2;
     const lrx_c2* src = ((anti && t.conj_trs == 0) ? gt : gp) + (long long)t.row[k] * t.ml * t.nl;
 #pragma unroll
-    for (int c = 0; c < NS; ++c) {
-        const long long li = (long long)k * t.ml + xx * NS + c;
+    for (int c = 0; c < SL; ++c) {
+        const long long li = (long long)k * t.ml + xx * SL + c;
         const int ls = t.lsrc[li];
         const lrx_c2 mp = mph[li];
 #pragma unroll
-        for (int d = 0; d < NR; ++d) {
-            const long long rj = (long long)k * t.nl + yy * NR + d;
+        for (int d = 0; d < SR; ++d) {
+            const long long rj = (long long)k * t.nl + yy * SR + d;
             const int rs = t.rsrc[rj];
             lrx_c2 v = {0.0, 0.0};
             if (ls >= 0 && rs >= 0) {
@@ -726,32 +729,33 @@ __device__ __forceinline__ void lrx_unfold_pair(
         }
     }
 #pragma unroll
-    for (int a = 0; a < NS; ++a)
+    for (int a = 0; a < SL; ++a)
 #pragma unroll
-        for (int b = 0; b < NS; ++b) u[a][b] = spin[((long long)k * NS + a) * NS + b];
+        for (int b = 0; b < SL; ++b) u[a][b] = spin[((long long)k * SL + a) * SL + b];
 #pragma unroll
-    for (int a = 0; a < NR; ++a)
+    for (int a = 0; a < SR; ++a)
 #pragma unroll
-        for (int b = 0; b < NR; ++b) ur[a][b] = spin_r[((long long)k * NR + a) * NR + b];
+        for (int b = 0; b < SR; ++b) ur[a][b] = spin_r[((long long)k * SR + a) * SR + b];
 }
 
 // Row a of U G Ur^dagger, accumulated exactly as the spin-rotate FFI does
 // (Ur = U for a Green).
-__device__ __forceinline__ void lrx_spin_row(const lrx_c2 (&u)[NS][NS], const lrx_c2 (&ur)[NR][NR],
-                                             const lrx_c2 (&g)[NS][NR], int a, lrx_c2 (&out)[NR]) {
-    lrx_c2 left[NR];
+template <int SL, int SR>
+__device__ __forceinline__ void lrx_spin_row(const lrx_c2 (&u)[SL][SL], const lrx_c2 (&ur)[SR][SR],
+                                             const lrx_c2 (&g)[SL][SR], int a, lrx_c2 (&out)[SR]) {
+    lrx_c2 left[SR];
 #pragma unroll
-    for (int d = 0; d < NR; ++d) {
+    for (int d = 0; d < SR; ++d) {
         lrx_c2 v = {0.0, 0.0};
 #pragma unroll
-        for (int c = 0; c < NS; ++c) lrx_cmac(v, u[a][c], g[c][d]);
+        for (int c = 0; c < SL; ++c) lrx_cmac(v, u[a][c], g[c][d]);
         left[d] = v;
     }
 #pragma unroll
-    for (int b = 0; b < NR; ++b) {
+    for (int b = 0; b < SR; ++b) {
         lrx_c2 v = {0.0, 0.0};
 #pragma unroll
-        for (int d = 0; d < NR; ++d) lrx_cmac_conj(v, left[d], ur[b][d]);
+        for (int d = 0; d < SR; ++d) lrx_cmac_conj(v, left[d], ur[b][d]);
         out[b] = v;
     }
 }
@@ -760,8 +764,9 @@ __device__ __forceinline__ void lrx_spin_row(const lrx_c2 (&u)[NS][NS], const lr
 // x = (r / bx)*xs + x0 + r % bx, xn pieces of bx rows at stride xs, so a pass reads only its own
 // pairs' sources; x >= mx is a padding row, loaded and stored as zero.
 struct XBlock { long long x0, bx, xs, rows, mx; };
+template <int SL = NS>
 __device__ __forceinline__ XBlock lrx_x_block(const UnfoldTab& t) {
-    const long long mx = t.ml / NS;
+    const long long mx = t.ml / SL;
     return t.bx > 0 ? XBlock{t.x0, t.bx, t.xs, t.xn * t.bx, mx} : XBlock{0, mx, mx, mx, mx};
 }
 __device__ __forceinline__ long long lrx_x_of(const XBlock& b, long long r) {
@@ -775,50 +780,55 @@ __device__ __forceinline__ long long lrx_x_of(const XBlock& b, long long r) {
 // sources once and forms its elements in registers; else one thread per (k, column) forms its own
 // element with the same arithmetic.  A pair past `pairs` or a padding row loads as zero.  Modes 7,
 // 8 and 9 load through it.
-template <bool GROUPS, class View>
+// SL, SR: the operand's endpoint widths and SA its stored spin block (SA == SL: the whole group);
+// the defaults are the program's Green (NS, NR) and mode 7's block (NA).  Mode 8 also loads an
+// interaction's Lorentz block through <true, nA, nB, nA> (WedgeLoad beside LorLoad).
+template <bool GROUPS, int SL = NS, int SR = NR, int SA = NA, class View>
 __device__ __forceinline__ void lrx_unfold_direct(
     const View& view, const lrx_c2* __restrict__ gp, const lrx_c2* __restrict__ gt, const UnfoldTab& t,
     long long p0, long long my, long long pairs, int k0, int k1, long long col0, int width, long long ncols) {
-    const XBlock xb = lrx_x_block(t);
+    constexpr int SSO_ = (SA == SL) ? SL * SR : SA * SA;   // columns per pair
+    constexpr int SS_ = SL * SR;
+    const XBlock xb = lrx_x_block<SL>(t);
     if constexpr (GROUPS) {
-        const int groups = width / SSO;
+        const int groups = width / SSO_;
         for (int i = threadIdx.x; i < (k1 - k0) * groups; i += blockDim.x) {
             const int k = k0 + i / groups, j = i % groups;
-            const long long pr = p0 + col0 / SSO + j;
+            const long long pr = p0 + col0 / SSO_ + j;
             const long long rx = pr / my, yy = pr - rx * my, xx = lrx_x_of(xb, rx);
             if (pr < pairs && xx < xb.mx) {
-                lrx_c2 g[NS][NR], u[NS][NS], ur[NR][NR];
+                lrx_c2 g[SL][SR], u[SL][SL], ur[SR][SR];
                 lrx_unfold_pair(gp, gt, t, k, xx, yy, g, u, ur);
 #pragma unroll
-                for (int a = 0; a < NS; ++a) {
-                    if constexpr (NA != NS) { if (a < t.a0 || a >= t.a0 + NA) continue; }
-                    lrx_c2 out[NR];
+                for (int a = 0; a < SL; ++a) {
+                    if constexpr (SA != SL) { if (a < t.a0 || a >= t.a0 + SA) continue; }
+                    lrx_c2 out[SR];
                     lrx_spin_row(u, ur, g, a, out);
 #pragma unroll
-                    for (int b = 0; b < NR; ++b) {
-                        if constexpr (NA != NS) {
-                            if (b < t.b0 || b >= t.b0 + NA) continue;
-                            view(k, j * SSO + (a - t.a0) * NA + (b - t.b0)) = out[b];
+                    for (int b = 0; b < SR; ++b) {
+                        if constexpr (SA != SL) {
+                            if (b < t.b0 || b >= t.b0 + SA) continue;
+                            view(k, j * SSO_ + (a - t.a0) * SA + (b - t.b0)) = out[b];
                         } else {
-                            view(k, j * SSO + a * NR + b) = out[b];
+                            view(k, j * SSO_ + a * SR + b) = out[b];
                         }
                     }
                 }
             } else {
 #pragma unroll
-                for (int ab = 0; ab < SSO; ++ab) view(k, j * SSO + ab) = {0.0, 0.0};
+                for (int ab = 0; ab < SSO_; ++ab) view(k, j * SSO_ + ab) = {0.0, 0.0};
             }
         }
     } else {
         for (int i = threadIdx.x; i < (k1 - k0) * width; i += blockDim.x) {
             const int k = k0 + i / width, j = i % width;
-            const long long c = col0 + j, pr = p0 + c / SSO;
+            const long long c = col0 + j, pr = p0 + c / SSO_;
             const long long rx = pr / my, yy = pr - rx * my, xx = lrx_x_of(xb, rx);
             lrx_c2 v = {0.0, 0.0};
             if (c < ncols && pr < pairs && xx < xb.mx) {
-                const int a = (NA == NS) ? (int)((c % SS) / NR) : t.a0 + (int)((c % SSO) / NA);
-                const int b = (NA == NS) ? (int)(c % NR) : t.b0 + (int)((c % SSO) % NA);
-                lrx_c2 g[NS][NR], u[NS][NS], ur[NR][NR], out[NR];
+                const int a = (SA == SL) ? (int)((c % SS_) / SR) : t.a0 + (int)((c % SSO_) / SA);
+                const int b = (SA == SL) ? (int)(c % SR) : t.b0 + (int)((c % SSO_) % SA);
+                lrx_c2 g[SL][SR], u[SL][SL], ur[SR][SR], out[SR];
                 lrx_unfold_pair(gp, gt, t, k, xx, yy, g, u, ur);
                 lrx_spin_row(u, ur, g, a, out);
                 v = out[b];
@@ -1155,7 +1165,37 @@ struct LorArgs {
     lrx_c2* u;                                 // (n_out, NS, mx, NS, my)
     lrx_c2* y;                                 // split arm: the (NK, npairs * SS) intermediate
     long long p0, npairs, mx, my;              // this launch's pairs [p0, p0 + npairs)
+    const lrx_c2 *wp, *wt;                     // LRX_WA: the interaction's parent tile and partner
+    lrx_c2* yw;                                // LRX_WA split arm: the (NK, npairs * WS) W_R chunk
+    double sw;                                 // LRX_WA: the interaction's inverse-transform scale
 };
+
+// LRX_WA > 0: the interaction is read from its irreducible-q parent tile (nA = LRX_WA, nB = LRX_WB
+// Lorentz components per endpoint) through its own unfold tables tw, on the load of its inverse
+// transform (mode 9's WedgeLoad): no full-q W and no full-grid W_R.  A pair's nA*nB W columns sit
+// beside its NS*NS Green columns in the tile; the vertex Mid reads W_R = sw * IFFT(unfolded W)
+// from the bank, the value mode 9 stores, so the result is the two-door chain's bit for bit.
+#ifndef LRX_WA
+#define LRX_WA 0
+#define LRX_WB 0
+#endif
+#ifndef LRX_WGROUPED
+#define LRX_WGROUPED 1                         // the W tile holds whole Lorentz groups (single arm)
+#endif
+#if LRX_WA > 0
+constexpr int WA = LRX_WA, WB = LRX_WB, WS = WA * WB;
+struct LorWLoad {                              // W column c: pair p0 + c / WS, block (c % WS) / WB, c % WB
+    static constexpr bool kDirect = true, kFinish = false;
+    const LorArgs* a;
+    const UnfoldTab* t;
+    template <class View>
+    __device__ void direct(const View& view, int k0, int k1, long long col0, int width,
+                           long long ncols) const {
+        lrx_unfold_direct<LRX_WGROUPED != 0, WA, WB, WA>(view, a->wp, a->wt, *t, a->p0, a->my, a->p0 + ncols / WS,
+                                                        k0, k1, col0, width, ncols);
+    }
+};
+#endif
 
 struct LorLoad {                               // tile column c: pair p0 + c / SS, member c % SS
     static constexpr bool kDirect = true, kFinish = false;
@@ -1228,20 +1268,35 @@ struct LorGroupMid {
     const lrx_c2* kern;
     long long p0, mx, my;
     LorentzTab v;
+#if LRX_WA > 0
+    const lrx_c2* wbank;                       // the tile's W columns, transformed, unscaled
+    long long g0;                              // the tile's first pair (group) index
+    double sw;
+#endif
     template <class Get>
     __device__ void group(int k, long long grp, const Get& get) const {
-        const long long pr = p0 + grp, xx = pr / my, yy = pr - xx * my;
-        const long long wy = my * v.nb, wx = (long long)v.na * wy;
         lrx_c2 acc[SS];
 #pragma unroll
         for (int ab = 0; ab < SS; ++ab) {
             acc[ab].x = 0.0;
             acc[ab].y = 0.0;
         }
+#if LRX_WA > 0
+        constexpr int RSW = lrx_kbox::Geo<NX, NY, NZ>::RS;
+        const lrx_c2* __restrict__ w = wbank + (grp - g0) * WS * RSW + lrx_kbox::Geo<NX, NY, NZ>::at(k);
+#else
+        const long long pr = p0 + grp, xx = pr / my, yy = pr - xx * my;
+        const long long wy = my * v.nb, wx = (long long)v.na * wy;
         const lrx_c2* __restrict__ w = kern + ((long long)k * mx + xx) * wx + yy * v.nb;
+#endif
         for (int ia = 0; ia < v.na; ++ia) {
             for (int ib = 0; ib < v.nb; ++ib) {
+#if LRX_WA > 0
+                const lrx_c2 wz = w[(ia * WB + ib) * RSW];
+                const lrx_c2 wv = {__dmul_rn(wz.x, sw), __dmul_rn(wz.y, sw)};
+#else
                 const lrx_c2 wv = w[ia * wy + ib];
+#endif
 #pragma unroll
                 for (int aa = 0; aa < NS; ++aa) {
                     const int pa = (int)((v.perm_l >> (16 * ia + 4 * aa)) & 15);
@@ -1272,20 +1327,36 @@ struct LorScaledStore {
     __device__ void put(int k, long long col, lrx_c2 z) const { st.put(k, col, fin(k, col, z)); }
 };
 
-extern "C" __global__ void __launch_bounds__(LRX_THREADS) lrx_kconv(LorArgs a, UnfoldTab t, LorentzTab v, int phase) {
+extern "C" __global__ void __launch_bounds__(LRX_THREADS) lrx_kconv(LorArgs a, UnfoldTab t, LorentzTab v, int phase,
+                                                                  UnfoldTab tw) {
     extern __shared__ lrx_c2 sm[];
     using namespace cufftdx;
     (void)phase;
+    (void)tw;
     const long long ncols = a.npairs * SS;
     const LorLoad ld{&a, &t};
     const LorScaledStore st{LorStore(a, t), LorFinal{v.s_f, v.mult}};
+#if LRX_WA > 0
+    // The W columns of the tile's pairs follow its Green columns in the bank (same padded row
+    // stride), so one inverse transform of TRC + TRW rows serves both.
+    constexpr int TRW = (TRC / SS) * WS;
+    lrx_c2* smw = sm + (long long)TRC * lrx_kbox::Geo<NX, NY, NZ>::RS;
+    const long long nw = a.npairs * WS;
+    const LorWLoad wld{&a, &tw};
+#endif
     for (long long c0 = (long long)blockIdx.x * TRC; c0 < ncols; c0 += (long long)gridDim.x * TRC) {
         lrx_kbox::stage_tile<NX, NY, NZ, TRC>(sm, c0, ncols, ld);
+#if LRX_WA > 0
+        lrx_kbox::stage_tile<NX, NY, NZ, TRW>(smw, (c0 / SS) * WS, nw, wld);
+        lrx_kbox::transform3<NX, NY, NZ, TRC + TRW, LRX_SM, fft_direction::inverse>(sm);
+        const LorGroupMid mid{a.kern, a.p0, a.mx, a.my, v, smw, c0 / SS, a.sw};
+#else
         lrx_kbox::transform3<NX, NY, NZ, TRC, LRX_SM, fft_direction::inverse>(sm);
+        const LorGroupMid mid{a.kern, a.p0, a.mx, a.my, v};
+#endif
         // k fastest across threads: consecutive threads read one group's column at consecutive k,
         // distinct banks (pairs fastest put a phase's 8 threads 16 padded columns apart, one bank).
-        lrx_kbox::mid_group_tile<NX, NY, NZ, TRC, SS, true, true>(sm, c0, ncols,
-                                                                  LorGroupMid{a.kern, a.p0, a.mx, a.my, v});
+        lrx_kbox::mid_group_tile<NX, NY, NZ, TRC, SS, true, true>(sm, c0, ncols, mid);
         lrx_kbox::transform3<NX, NY, NZ, TRC, LRX_SM, fft_direction::forward>(sm);
         lrx_kbox::store_tile<NX, NY, NZ, TRC>(sm, c0, ncols, st);
     }
@@ -1308,11 +1379,15 @@ struct LorMid {                                // the vertex sum; V staged per (
             if (e >= ne) continue;
             long long inst = inst0 + t;
             if (inst >= a->npairs) inst = inst0;
-            const long long pr = a->p0 + inst, xx = pr / a->my, yy = pr - xx * a->my;
             const long long k = (long long)kx * NY * NZ + p;
+#if LRX_WA > 0
+            lrx_kbox::cp_async<16>(saux + (kx * TY + t) * ld + e, a->yw + (k * a->npairs + inst) * WS + e);
+#else
+            const long long pr = a->p0 + inst, xx = pr / a->my, yy = pr - xx * a->my;
             const int A = e / v.nb, B = e % v.nb;
             lrx_kbox::cp_async<16>(saux + (kx * TY + t) * ld + e,
                                    a->kern + (((k * a->mx + xx) * v.na + A) * a->my + yy) * v.nb + B);
+#endif
         }
     }
     struct F {
@@ -1343,11 +1418,37 @@ struct LorYLoad {                              // the intermediate, staged by cp
     __device__ const lrx_c2* stage(int k, long long c) const { return y + (long long)k * n + c; }
 };
 
-extern "C" __global__ void __launch_bounds__(256) lrx_kconv(LorArgs a, UnfoldTab t, LorentzTab v, int phase) {
+#if LRX_WA > 0
+struct LorWStore {                             // the chunk's W_R, scaled as mode 9 stores it
+    lrx_c2* yw;
+    long long nw;
+    double sw;
+    __device__ void put(int k, long long c, lrx_c2 v) const { yw[(long long)k * nw + c] = {v.x * sw, v.y * sw}; }
+};
+#endif
+
+extern "C" __global__ void __launch_bounds__(256) lrx_kconv(LorArgs a, UnfoldTab t, LorentzTab v, int phase,
+                                                           UnfoldTab tw) {
     extern __shared__ lrx_c2 sm[];
     using namespace cufftdx;
+    (void)tw;
     const long long ncols = a.npairs * SS;
     const lrx_kbox::Plain<lrx_c2> yy{a.y, ncols};
+#if LRX_WA > 0
+    // phase 4 (before phase 1 of each chunk): the chunk's W_R from the parent tile, a tile of
+    // LRX_TRW whole k-box columns per block (mode 9's single arm), scaled, into yw (NK, npairs*WS).
+    if (phase == 4) {
+        const long long nw = a.npairs * WS;
+        const LorWLoad wld{&a, &tw};
+        const LorWStore ws{a.yw, nw, a.sw};
+        for (long long c0 = (long long)blockIdx.x * LRX_TRW; c0 < nw; c0 += (long long)gridDim.x * LRX_TRW) {
+            lrx_kbox::stage_tile<NX, NY, NZ, LRX_TRW>(sm, c0, nw, wld);
+            lrx_kbox::transform3<NX, NY, NZ, LRX_TRW, LRX_SM, fft_direction::inverse>(sm);
+            lrx_kbox::store_tile<NX, NY, NZ, LRX_TRW>(sm, c0, nw, ws);
+        }
+        return;
+    }
+#endif
     if (phase == 0) {
         lrx_kbox::plane_pass<NX, NY, NZ, LRX_SM, fft_direction::inverse, TRC>(sm, ncols, LorLoad{&a, &t}, yy);
     } else if (phase == 1) {
@@ -1776,8 +1877,12 @@ struct Built { CUfunction fn = nullptr; int rb = 1; int smem = 0; double compile
                long long grid_cap = 0;     // grid_cap: mode 10's resident blocks (0 = none)
                // Mode 11 (k-box stage): arm 0 single pass (tr tile columns, smem), arm 1 split:
                // the plane pass (tr = its tile columns, smem) and the group pencil (threads2, smem2).
-               int arm = 0, tr = 0, ty = 0, threads2 = 0, smem2 = 0, sms = 0; };
-// ctx, mode, nkx, nky, nkz, ns, nsr, f32, variant (mode 11: the static completion; mode 7: its output spin block)
+               int arm = 0, tr = 0, ty = 0, threads2 = 0, smem2 = 0, sms = 0;
+               // Mode 8 with the interaction read from its parents (variant wa*8 + wb), split arm: the
+               // W_R chunk pass (phase 4), tiles of trw columns at threads3 / smem3.
+               int trw = 0, threads3 = 0, smem3 = 0; };
+// ctx, mode, nkx, nky, nkz, ns, nsr, f32, variant (mode 11: the static completion; mode 7: its output spin
+// block; mode 8: wa*8 + wb, the interaction's Lorentz widths when it is read from its parents, 0 = V_R)
 using Key = std::tuple<CUcontext, int, int, int, int, int, int, int, int>;
 static std::mutex g_mu;
 static std::map<Key, Built> g_cache;
@@ -1865,9 +1970,12 @@ static ffi::Error build(int mode, int nkx, int nky, int nkz, int ns, bool f32,
         if (rb < 1) rb = std::min<long long>(kRowsMax, smem_optin / row_bytes);
     }
     // Mode 8 runs on the k-box stage: the single arm when a tile of whole spin groups (ns^2 padded
-    // columns each) fits the opt-in memory, else the split arm.
+    // columns each, plus the pair's wa*wb W columns when W is read from its parents) fits the
+    // opt-in memory, else the split arm.
+    const int lor_wa = mode == 8 ? variant / 8 : 0, lor_wb = mode == 8 ? variant % 8 : 0;
+    const int lor_ws = lor_wa * lor_wb;
     const lrx_kbox::Plan lor_plan = mode == 8
-        ? lrx_kbox::kbox_plan(nkx, nky, nkz, ns * ns, 1, 16, smem_optin, 2, 1) : lrx_kbox::Plan{};
+        ? lrx_kbox::kbox_plan(nkx, nky, nkz, ns * ns + lor_ws, 1, 16, smem_optin, 2, 1) : lrx_kbox::Plan{};
     const bool lor_split = mode == 8 && lor_plan.arm == 1;
     // Mode 11 runs on the k-box stage: its launch rule (kbox_plan) decides the arm, the tile and
     // the shared memory from the grid and this device's opt-in budget; RB is unused.
@@ -1923,6 +2031,8 @@ static ffi::Error build(int mode, int nkx, int nky, int nkz, int ns, bool f32,
     const bool kbox_single_only = mode == 4 || mode == 5 || mode == 9;
     int kb_arm = 0, kb_tr = 0, kb_ty = 0, kb_threads = 0, kb_threads2 = 0, kb_grouped = 0;
     long long kb_smem = 0, kb_smem2 = 0;
+    int lor_trw = 0, kb_threads3 = 0;                  // mode 8 from W parents, split arm
+    long long kb_smem3 = 0;
     if (kbox_rows || mode == 8) {
         const lrx_kbox::Geometry g{nkx, nky, nkz};
         rb = 1;
@@ -1965,12 +2075,25 @@ static ffi::Error build(int mode, int nkx, int nky, int nkz, int ns, bool f32,
             kb_threads2 = ss * kb_ty;
             kb_smem = static_cast<long long>(kb_tr) * g.pr() * 16;
             kb_smem2 = (static_cast<long long>(nkx) * ss * kb_ty + static_cast<long long>(nkx) * kb_ty * 17) * 16;
+            if (lor_ws > 0) {                          // the W_R chunk pass: mode 9's single arm
+                lrx_kbox::Plan wp = lrx_kbox::kbox_plan(nkx, nky, nkz, lor_ws, 1, 16, smem_optin, 1, 1);
+                if (wp.arm == 0) {
+                    lor_trw = wp.tr * lor_ws;          // whole Lorentz groups
+                } else {
+                    wp = lrx_kbox::kbox_plan(nkx, nky, nkz, 1, 1, 16, smem_optin, 1, 1);
+                    lor_trw = wp.tr;
+                }
+                if (wp.arm != 0) kb_smem3 = smem_optin + 1;   // refused below: one column must fit
+                else { kb_smem3 = wp.smem; kb_threads3 = wp.threads; }
+            }
         }
-        if (kb_smem > smem_optin || kb_smem2 > smem_optin || (kbox_single_only && kb_arm != 0)) {
+        if (kb_smem > smem_optin || kb_smem2 > smem_optin || kb_smem3 > smem_optin ||
+            (kbox_single_only && kb_arm != 0)) {
             std::ostringstream os;
             os << "GATE mathdx-kconv-kbox-residency: got k-grid (" << nkx << "," << nky << "," << nkz << ") with ns="
                << ns << " (mode " << mode << "), whose k-box " << (kb_arm ? "plane/pencil" : "tile") << " needs "
-               << kb_smem << " / " << kb_smem2 << " B; want <= " << smem_optin << " B of opt-in shared memory on "
+               << kb_smem << " / " << kb_smem2 << " / " << kb_smem3 << " B; want <= " << smem_optin
+               << " B of opt-in shared memory on "
                   "this device" << (kbox_single_only ? " for one whole column (modes 4, 5 and 9 have no split arm)" : "")
                << "; why: the stage keeps a (ky, kz) plane of its tile columns resident; fix: a smaller k-grid";
             return sticky("residency", os.str(), ffi::ErrorCode::kInvalidArgument);
@@ -2127,6 +2250,12 @@ static ffi::Error build(int mode, int nkx, int nky, int nkz, int ns, bool f32,
         defs.push_back("-DLRX_TY=" + std::to_string(kb_ty));
         defs.push_back("-DLRX_THREADS=" + std::to_string(kb_threads));
         if (mode == 9) defs.push_back("-DLRX_GROUPED=" + std::to_string(kb_grouped));
+        if (mode == 8 && lor_ws > 0) {
+            defs.push_back("-DLRX_WA=" + std::to_string(lor_wa));
+            defs.push_back("-DLRX_WB=" + std::to_string(lor_wb));
+            defs.push_back("-DLRX_TRW=" + std::to_string(lor_trw));
+            defs.push_back("-DLRX_WGROUPED=" + std::to_string(kb_arm == 0 || lor_trw % lor_ws == 0 ? 1 : 0));
+        }
     }
     if (mode == 11) {
         defs.push_back("-DLRX_ARM=" + std::to_string(kplan.arm));
@@ -2166,7 +2295,8 @@ static ffi::Error build(int mode, int nkx, int nky, int nkz, int ns, bool f32,
     std::string path;
     if (!dir.empty()) {
         std::ostringstream name;
-        name << dir << "/kconv_m" << mode << "_" << nkx << "x" << nky << "x" << nkz << "_ns" << ns
+        name << dir << "/kconv_m" << mode << (mode == 8 && variant ? "w" + std::to_string(variant) : std::string())
+             << "_" << nkx << "x" << nky << "x" << nkz << "_ns" << ns
              << (nsr != ns ? "x" + std::to_string(nsr) : std::string()) << (f32 ? "_c64" : "") << "_sm" << cc_major << cc_minor << "_" << key_hex << ".cubin";
         path = name.str();
     }
@@ -2192,6 +2322,9 @@ static ffi::Error build(int mode, int nkx, int nky, int nkz, int ns, bool f32,
         b.threads2 = kb_threads2;
         b.smem2 = static_cast<int>(kb_smem2);
         b.sms = sms;
+        b.trw = lor_trw;
+        b.threads3 = kb_threads3;
+        b.smem3 = static_cast<int>(kb_smem3);
     }
     if (mode == 11) {
         int sms = 0;
@@ -2224,8 +2357,9 @@ static ffi::Error build(int mode, int nkx, int nky, int nkz, int ns, bool f32,
     b.compile_ms = ms;
     // Mode 10 always sets the dynamic limit: its static tables count against the
     // 48 KiB default too, so a plane just under 48 KiB would fail at launch.
-    if (b.smem > 49152 || b.smem2 > 49152 || mode == 10) {
-        cr = api.FuncSetAttribute(b.fn, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, std::max(b.smem, b.smem2));
+    if (b.smem > 49152 || b.smem2 > 49152 || b.smem3 > 49152 || mode == 10) {
+        cr = api.FuncSetAttribute(b.fn, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+                                  std::max(b.smem, std::max(b.smem2, b.smem3)));
         if (cr != CUDA_SUCCESS && mode == 10) {
             std::ostringstream os;
             os << "GATE mathdx-plane-residency: got plane (" << nkx << "," << nky << "), " << b.smem
@@ -2621,6 +2755,16 @@ struct LorentzArgs {
     void* u;
     void* y;
     long long p0, npairs, mx, my;
+    const void *wp, *wt;
+    void* yw;
+    double sw;
+};
+
+// The interaction read from its irreducible-q parent tiles (the `_wparent` target): the tile, its
+// partner and its unfold tables, as mode 9 takes them (conj_trs 0: the partner tile).
+struct WParent {
+    ffi::AnyBuffer Wp, Wt, row, trs, lsrc, rsrc, mph, nph, spin_l, spin_r;
+    double scale;
 };
 
 static ffi::Error KleadLorentzImpl(
@@ -2630,7 +2774,7 @@ static ffi::Error KleadLorentzImpl(
     int64_t nky, int64_t nkz, double scale_g, double scale_f, double mult,
     ffi::Span<const int64_t> perm_l, ffi::Span<const int64_t> phase_l, ffi::Span<const int64_t> perm_r,
     ffi::Span<const int64_t> phase_r, std::string_view mathdx_root, std::string_view cubin_dir,
-    int64_t conj_src = 0) {
+    int64_t conj_src = 0, const WParent* W = nullptr) {
     auto bad = [](const std::string& why) {
         return fail("klead lorentz conv", why, ffi::ErrorCode::kInvalidArgument);
     };
@@ -2645,15 +2789,42 @@ static ffi::Error KleadLorentzImpl(
         auto d = x.dimensions();
         return x.element_type() == t && d.size() == dims.size() && std::equal(d.begin(), d.end(), dims.begin());
     };
-    const auto gd = Gp.dimensions(), sd = spin.dimensions(), vd = V.dimensions();
-    if (gd.size() != 3 || sd.size() != 3 || vd.size() != 5)
-        return bad("want Gp (n_parent, ml, nl), spin (nk, ns, ns) and V (nk, mx, nA, my, nB)");
-    const int64_t np = gd[0], ml = gd[1], nl = gd[2], ns = sd[1], na = vd[2], nb = vd[4];
+    const auto gd = Gp.dimensions(), sd = spin.dimensions();
+    if (gd.size() != 3 || sd.size() != 3)
+        return bad("want Gp (n_parent, ml, nl) and spin (nk, ns, ns)");
+    const int64_t np = gd[0], ml = gd[1], nl = gd[2], ns = sd[1];
+    // The interaction: V (nk, mx, nA, my, nB) in R space, or (W != nullptr) its parent tile
+    // Wp (nq_irr, mx*nA, my*nB) with spin_l (nk, nA, nA) and spin_r (nk, nB, nB).
+    int64_t na = 0, nb = 0, nwq = 0;
+    if (W == nullptr) {
+        const auto vd = V.dimensions();
+        if (vd.size() != 5) return bad("want V (nk, mx, nA, my, nB)");
+        na = vd[2];
+        nb = vd[4];
+    } else {
+        const auto wd = W->Wp.dimensions(), ld = W->spin_l.dimensions(), rd = W->spin_r.dimensions();
+        if (wd.size() != 3 || ld.size() != 3 || rd.size() != 3)
+            return bad("want Wp (nq_irr, mx*nA, my*nB), spin_l (nk, nA, nA), spin_r (nk, nB, nB)");
+        na = ld[1];
+        nb = rd[1];
+        nwq = wd[0];
+    }
     const auto C = ffi::DataType::C128, I = ffi::DataType::S32;
+    if (W != nullptr) {
+        const int64_t wl = (ml / std::max<int64_t>(ns, 1)) * na, wr = (nl / std::max<int64_t>(ns, 1)) * nb;
+        if (na < 1 || na > 4 || nb < 1 || nb > 4 || nwq < 1 || !is(W->Wp, C, {nwq, wl, wr}) ||
+            !is(W->Wt, C, {nwq, wl, wr}) || !is(W->row, I, {nk}) || !is(W->trs, I, {nk}) ||
+            !is(W->lsrc, I, {nk, wl}) || !is(W->rsrc, I, {nk, wr}) || !is(W->mph, C, {nk, wl}) ||
+            !is(W->nph, C, {nk, wr}) || !is(W->spin_l, C, {nk, na, na}) || !is(W->spin_r, C, {nk, nb, nb}))
+            return bad("want c128 Wp=Wt (nq_irr, mx*nA, my*nB) on the Green's pair grid; s32 wrow, wtrs (nk), "
+                       "wlsrc (nk, mx*nA), wrsrc (nk, my*nB); c128 wmph, wnph, spin_l (nk,nA,nA), "
+                       "spin_r (nk,nB,nB) with nA, nB in [1,4]");
+    }
     if ((ns != 1 && ns != 2 && ns != 4) || ml % ns || nl % ns || np < 1 || na < 1 || na > 4 || nb < 1 ||
         nb > 4 || !is(Gp, C, {np, ml, nl}) || !is(Gt, C, {np, ml, nl}) || !is(row, I, {nk}) ||
         !is(trs, I, {nk}) || !is(lsrc, I, {nk, ml}) || !is(rsrc, I, {nk, nl}) || !is(mph, C, {nk, ml}) ||
-        !is(nph, C, {nk, nl}) || !is(spin, C, {nk, ns, ns}) || !is(V, C, {nk, ml / ns, na, nl / ns, nb}) ||
+        !is(nph, C, {nk, nl}) || !is(spin, C, {nk, ns, ns}) ||
+        (W == nullptr && !is(V, C, {nk, ml / ns, na, nl / ns, nb})) ||
         (kout != nullptr && !is(*kout, I, {nk})) ||
         !(U->element_type() == C && U->dimensions().size() == 5 && U->dimensions()[0] >= 1 &&
           (kout != nullptr || U->dimensions()[0] == nk) &&
@@ -2688,19 +2859,28 @@ static ffi::Error KleadLorentzImpl(
     if (pairs == 0) return ffi::Error::Success();
     const Built* k = nullptr;
     ffi::Error e = build(8, static_cast<int>(nkx), static_cast<int>(nky), static_cast<int>(nkz),
-                         static_cast<int>(ns), false, mathdx_root, cubin_dir, &k);
+                         static_cast<int>(ns), false, mathdx_root, cubin_dir, &k, 0,
+                         W ? static_cast<int>(na * 8 + nb) : 0);
     if (!e.success()) return e;
     UnfoldTab t{static_cast<const int*>(row.untyped_data()), static_cast<const int*>(trs.untyped_data()),
                 static_cast<const int*>(lsrc.untyped_data()), static_cast<const int*>(rsrc.untyped_data()),
                 static_cast<const double*>(mph.untyped_data()), static_cast<const double*>(nph.untyped_data()),
                 static_cast<const double*>(spin.untyped_data()), ml, nl,
                 kout ? static_cast<const int*>(kout->untyped_data()) : nullptr, conj_src ? 2 : 0, nullptr, 0, 0};
-    const long long ss = ns * ns;
-    LorentzArgs a{Gp.untyped_data(), Gt.untyped_data(), V.untyped_data(), U->untyped_data(), nullptr,
-                  0, pairs, ml / ns, nl / ns};
+    UnfoldTab tw{};
+    if (W != nullptr)
+        tw = UnfoldTab{static_cast<const int*>(W->row.untyped_data()), static_cast<const int*>(W->trs.untyped_data()),
+                       static_cast<const int*>(W->lsrc.untyped_data()), static_cast<const int*>(W->rsrc.untyped_data()),
+                       static_cast<const double*>(W->mph.untyped_data()), static_cast<const double*>(W->nph.untyped_data()),
+                       static_cast<const double*>(W->spin_l.untyped_data()), (ml / ns) * na, (nl / ns) * nb, nullptr, 0,
+                       static_cast<const double*>(W->spin_r.untyped_data()), 0, 0};
+    const long long ss = ns * ns, ws = W ? na * nb : 0;
+    LorentzArgs a{Gp.untyped_data(), Gt.untyped_data(), W ? nullptr : V.untyped_data(), U->untyped_data(), nullptr,
+                  0, pairs, ml / ns, nl / ns, W ? W->Wp.untyped_data() : nullptr,
+                  W ? W->Wt.untyped_data() : nullptr, nullptr, W ? W->scale : 0.0};
     auto launch = [&](int phase, long long blocks, int threads, int smem) -> ffi::Error {
         blocks = std::max(1LL, std::min(blocks, 2147483647LL));
-        void* args[] = {(void*)&a, (void*)&t, (void*)&v, (void*)&phase};
+        void* args[] = {(void*)&a, (void*)&t, (void*)&v, (void*)&phase, (void*)&tw};
         CUresult cr = driver_api().LaunchKernel(k->fn, static_cast<unsigned>(blocks), 1, 1, threads, 1, 1,
                                                 static_cast<unsigned>(smem),
                                                 reinterpret_cast<CUstream>(stream), args, nullptr);
@@ -2711,7 +2891,8 @@ static ffi::Error KleadLorentzImpl(
         return launch(0, (pairs * ss + k->tr - 1) / k->tr, k->threads, k->smem);
     // The k-box split arm, chunked over pairs through a (nk, chunk * ns^2) intermediate no
     // larger than U itself (the budget: the output this call writes, n_out >= 1 rows of nk).
-    const long long per_pair = nk * ss * 16;
+    // From W parents the chunk's W_R rides beside it: (nk, chunk * nA*nB), the same bound over ns^2.
+    const long long per_pair = nk * (ss + ws) * 16;
     const long long n_out = U->dimensions()[0];
     const long long chunk = std::max(1LL, std::min<long long>(pairs, pairs * n_out / nk));
     auto y = scratch.Allocate(static_cast<size_t>(chunk * per_pair));
@@ -2722,6 +2903,7 @@ static ffi::Error KleadLorentzImpl(
         return fail("scratch", os.str(), ffi::ErrorCode::kResourceExhausted);
     }
     a.y = *y;
+    if (W != nullptr) a.yw = reinterpret_cast<char*>(*y) + chunk * nk * ss * 16;
     const long long cap = static_cast<long long>(k->sms) * 8;
     for (long long p0 = 0; p0 < pairs; p0 += chunk) {
         a.p0 = p0;
@@ -2731,6 +2913,10 @@ static ffi::Error KleadLorentzImpl(
         const long long group = nky * nkz * ((a.npairs + k->ty - 1) / k->ty);
         const long long pencil = (nky * nkz * ncols + kThreads - 1) / kThreads;
         if (auto e = launch(0, std::min(plane, cap), k->threads, k->smem); !e.success()) return e;
+        if (W != nullptr) {
+            const long long wtiles = (a.npairs * ws + k->trw - 1) / k->trw;
+            if (auto e = launch(4, std::min(wtiles, cap), k->threads3, k->smem3); !e.success()) return e;
+        }
         if (auto e = launch(1, std::min(group, cap), k->threads2, k->smem2); !e.success()) return e;
         if (auto e = launch(2, std::min(plane, cap), k->threads, k->smem); !e.success()) return e;
         if (auto e = launch(3, std::min(pencil, cap), kThreads, 0); !e.success()) return e;
@@ -2758,6 +2944,22 @@ static ffi::Error KleadLorentzConjConv(
     return KleadLorentzImpl(stream, scratch, Gp, Gt, row, trs, lsrc, rsrc, mph, nph, spin, &kout, V, U, nkx, nky, nkz,
                             scale_g, scale_f, mult, perm_l, phase_l, perm_r, phase_r, mathdx_root, cubin_dir,
                             conj_src);
+}
+// `_wparent`: the interaction read from its irreducible-q parent tiles (W never full-q, W_R never
+// full-grid); the V operand of the other targets is absent.
+static ffi::Error KleadLorentzWParentConv(
+    cudaStream_t stream, ffi::ScratchAllocator scratch, ffi::AnyBuffer Gp, ffi::AnyBuffer Gt, ffi::AnyBuffer row,
+    ffi::AnyBuffer trs, ffi::AnyBuffer lsrc, ffi::AnyBuffer rsrc, ffi::AnyBuffer mph, ffi::AnyBuffer nph,
+    ffi::AnyBuffer spin, ffi::AnyBuffer kout, ffi::AnyBuffer Wp, ffi::AnyBuffer Wt, ffi::AnyBuffer wrow,
+    ffi::AnyBuffer wtrs, ffi::AnyBuffer wlsrc, ffi::AnyBuffer wrsrc, ffi::AnyBuffer wmph, ffi::AnyBuffer wnph,
+    ffi::AnyBuffer wspin_l, ffi::AnyBuffer wspin_r, ffi::Result<ffi::AnyBuffer> U, int64_t nkx, int64_t nky,
+    int64_t nkz, double scale_g, double scale_f, double mult, double scale_w, ffi::Span<const int64_t> perm_l,
+    ffi::Span<const int64_t> phase_l, ffi::Span<const int64_t> perm_r, ffi::Span<const int64_t> phase_r,
+    int64_t conj_src, std::string_view mathdx_root, std::string_view cubin_dir) {
+    const WParent w{Wp, Wt, wrow, wtrs, wlsrc, wrsrc, wmph, wnph, wspin_l, wspin_r, scale_w};
+    return KleadLorentzImpl(stream, scratch, Gp, Gt, row, trs, lsrc, rsrc, mph, nph, spin, &kout, Wp, U, nkx, nky,
+                            nkz, scale_g, scale_f, mult, perm_l, phase_l, perm_r, phase_r, mathdx_root, cubin_dir,
+                            conj_src, &w);
 }
 static ffi::Error KleadLorentzConv(
     cudaStream_t stream, ffi::ScratchAllocator scratch, ffi::AnyBuffer Gp, ffi::AnyBuffer Gt, ffi::AnyBuffer row, ffi::AnyBuffer trs,
@@ -3290,6 +3492,47 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(
         .Attr<double>("scale_g")
         .Attr<double>("scale_f")
         .Attr<double>("mult")
+        .Attr<xla::ffi::Span<const int64_t>>("perm_l")
+        .Attr<xla::ffi::Span<const int64_t>>("phase_l")
+        .Attr<xla::ffi::Span<const int64_t>>("perm_r")
+        .Attr<xla::ffi::Span<const int64_t>>("phase_r")
+        .Attr<int64_t>("conj_src")
+        .Attr<std::string_view>("mathdx_root")
+        .Attr<std::string_view>("cubin_dir"));
+
+XLA_FFI_DEFINE_HANDLER_SYMBOL(
+    KConvMathdxKleadLorentzWParentCudaFfi, lorrax_ffi::kconv_mathdx::KleadLorentzWParentConv,
+    xla::ffi::Ffi::Bind()
+        .Ctx<xla::ffi::PlatformStream<cudaStream_t>>()
+        .Ctx<xla::ffi::ScratchAllocator>()
+        .Arg<xla::ffi::AnyBuffer>()   // Gp
+        .Arg<xla::ffi::AnyBuffer>()   // Gt
+        .Arg<xla::ffi::AnyBuffer>()   // row
+        .Arg<xla::ffi::AnyBuffer>()   // trs
+        .Arg<xla::ffi::AnyBuffer>()   // lsrc
+        .Arg<xla::ffi::AnyBuffer>()   // rsrc
+        .Arg<xla::ffi::AnyBuffer>()   // mph
+        .Arg<xla::ffi::AnyBuffer>()   // nph
+        .Arg<xla::ffi::AnyBuffer>()   // spin
+        .Arg<xla::ffi::AnyBuffer>()   // kout
+        .Arg<xla::ffi::AnyBuffer>()   // Wp (nq_irr, mx*nA, my*nB): the interaction's parent tile
+        .Arg<xla::ffi::AnyBuffer>()   // Wt (its partner tile, pair_transpose)
+        .Arg<xla::ffi::AnyBuffer>()   // wrow
+        .Arg<xla::ffi::AnyBuffer>()   // wtrs
+        .Arg<xla::ffi::AnyBuffer>()   // wlsrc
+        .Arg<xla::ffi::AnyBuffer>()   // wrsrc
+        .Arg<xla::ffi::AnyBuffer>()   // wmph
+        .Arg<xla::ffi::AnyBuffer>()   // wnph
+        .Arg<xla::ffi::AnyBuffer>()   // wspin_l (nk, nA, nA)
+        .Arg<xla::ffi::AnyBuffer>()   // wspin_r (nk, nB, nB)
+        .Ret<xla::ffi::AnyBuffer>()
+        .Attr<int64_t>("nkx")
+        .Attr<int64_t>("nky")
+        .Attr<int64_t>("nkz")
+        .Attr<double>("scale_g")
+        .Attr<double>("scale_f")
+        .Attr<double>("mult")
+        .Attr<double>("scale_w")
         .Attr<xla::ffi::Span<const int64_t>>("perm_l")
         .Attr<xla::ffi::Span<const int64_t>>("phase_l")
         .Attr<xla::ffi::Span<const int64_t>>("perm_r")
