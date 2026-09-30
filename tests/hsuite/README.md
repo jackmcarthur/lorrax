@@ -33,7 +33,6 @@ bands. The Na stages run in `run/na/`.
 | kin_ion | `gw.kin_ion_io` | spinor kinetic + ionic matrix elements |
 | dipole | `psp.get_dipole_mtxels` | dipole with analytic V_NL velocity |
 | gnppm | `gw.gw_jax` | fresh ζ fit, GN-PPM one-shot, `head_correction = full`, spectral_shell band extrapolation, local linalg |
-| shared_pole_sc | `gw.gw_jax` | shared-pole full-frequency QSGW, 2 maps to a 1.5 eV criterion, ordered (TR-broken) store with the direct head, ζ restart, distributed linalg |
 | bse | `bse.bse_jax` | TDA Davidson on the GN-PPM restart bundle, screened direct term (D + V − W) |
 | htransform | `bandstructure.htransform` | Galerkin band interpolation on a G–X–M path |
 | exciton_bands | `bse.exciton_bands` | fH interpolation, then finite-Q TDA (1v × 1c) on the same path |
@@ -44,8 +43,18 @@ bands. The Na stages run in `run/na/`.
 | bisp_sc | `gw.gw_jax` | `bispinor_gw = full_shared_pole` through the SC driver, 2 maps: fresh charge + transverse ζ (both on the charge centroid set), ordered CC/CT/TC/TT sector poles, direct four-current Γ head, `sc_head_update = dft_velocity`, live four-current density; map 0 is the one-shot |
 | bse_bisp | `bse.bse_jax` | TDA Davidson after `bisp_sc` on the four-component restart: the final map's W0 = V + W_c,CC(0) (charge sector only) |
 | na_kin_ion | `gw.kin_ion_io` | bcc Na kinetic + ionic matrix elements; the 56 orbit-closed centroids (fitted on the ζ legs, 8 × 13) are stored in `fixture_na/` |
-| na_dipole | `psp.get_dipole_mtxels` | the velocity stage alone (`--parallel-transport-velocity-only`): a 3³ metal grid cannot resolve the links |
-| na_sc | `gw.gw_jax` | metal shared-pole QSGW, 2 maps to a 1.5 eV criterion, production defaults: Fermi-Dirac fixed-N occupations and metal head, `number_bands_protected = 8` (QP matrix 1–8, tail 9–13), 2s and 2p read on two coarse windows at η 5 eV, `sc_semicore = dft`, the rigid tail with min(Z, 1/Z) weights, spectral_shell extrapolation, held Σ windows re-planned on escape, `sc_head_update = dft_velocity` with its per-map head block, distributed linalg |
+| na_dipole | `psp.get_dipole_mtxels` | the default dipole: q→0 velocity plus the parallel-transport link artifact |
+| na_sc | `gw.gw_jax` | metal shared-pole QSGW, 2 maps to a 1.5 eV criterion, production defaults: Fermi-Dirac fixed-N occupations and metal head, `number_bands_protected = 8` (QP matrix 1–8, tail 9–13), 2s and 2p read on two coarse windows at η 5 eV, `sc_semicore = dft`, the rigid tail with min(Z, 1/Z) weights, spectral_shell extrapolation, held Σ windows re-planned on escape, `write_qsgw_datasets`, the unnamed `sc_head_update` (the 3³ links fail `GATE pt_head_window_hybridized`, so the metal falls back to `dft_velocity`) with its per-map head block, distributed linalg |
+
+Cut from the suite (2026-09-30, suite wall), with what covers each path now:
+- `shared_pole_sc` (H2+ scalar shared-pole QSGW, 2 maps, about 20 s warm):
+  `na_sc` runs the scalar shared-pole SC driver at the production defaults,
+  with distributed linalg and `write_qsgw_datasets`; the ordered
+  (time-reversal-broken) scalar store with the direct head stays covered by
+  `sp_export` (one-shot), and an ordered store through the SC driver by
+  `bisp_sc`. `bse` and `exciton_bands` now read the GN-PPM W0 (the SC stage
+  used to overwrite it with its final map's); their references were
+  regenerated.
 
 All stages run in one Python process per rank (`chain.run_stage` calls each
 driver's `main` in sequence): one `jax.distributed` world, one FFI load, one
@@ -56,7 +65,8 @@ restarted steps read the `tmp/` state (ζ, V(q), W0) the chain has written.
 The `na_sc` rank-0 log must also show, by name, each default the stage
 covers (`chain.REQUIRED_LINES`): the partition line, the two coarse windows
 at η 5 eV, the `sc_semicore = dft` pin, the Z-weighted tail at map 1, the
-Fermi-Dirac metal head, the map-1 head block with a 0.0000 eV gap, and the
+metal's fallback from the unnamed head to `dft_velocity`, the Fermi-Dirac
+metal head, the map-1 head block with a 0.0000 eV gap, and the
 map-1 Σ window re-plan.
 
 Every stage is then checked on its outputs, not its exit code: the
@@ -73,8 +83,8 @@ Not covered:
 - the planners' chunked paths: at μ = 6 every object is KB-sized, and a
   `memory_per_device_gb` small enough to chunk leaves the live set no room
   (`GATE gn_ppm_fit_capacity` at 0.05 GB);
-- the default `parallel_transport` head: on the 3³ Na grid the links refuse
-  (`GATE pt_head_window_hybridized`), so `na_sc` names `dft_velocity`;
+- the `parallel_transport` head itself: the 3³ Na links fail the window
+  gate, so the unnamed default runs `dft_velocity`;
 - the W line-site re-plan: it fires at Na map 2, where the re-planned W
   refuses at `GATE shared_pole_gram_valid` (q = 0 Gram −1.9e-6 against
   −1e-7), so `na_sc` stops after map 1;

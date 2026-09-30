@@ -301,19 +301,32 @@ class DftVelocityHeadData:
     validation: None = None
 
 
+def head_storage_extent(mesh: Mesh, nb_head: int) -> int:
+    """The head's band carrier: ``nb_head`` padded for ``P(..., 'x', 'y')``.
+
+    The SC map's band ladder (energies, occupations, U) has this carrier,
+    so every head operator is stored at it.  The link artifact's carrier
+    (``common.parallel_transport.band_storage_extent``, the whole mesh
+    product) can be wider: 13 bands are 16 there and 14 here at P4.
+    """
+    from runtime.padding import padded_axis
+    return padded_axis(
+        int(nb_head), mesh, name="head band carrier",
+        specs=((P(None, None, "x", None), 2),
+               (P(None, None, None, "y"), 3))).carrier
+
+
 def head_band_block(operator, nb_head: int, *, mesh: Mesh, nb_outer: int):
     """The head block ``[..., :nb_head, :nb_head]`` of an outer-set band matrix.
 
     ``operator`` is ``(..., S_o, S_o)`` at ``P(..., 'x', 'y')`` on the outer
     band set; the result is ``(..., S_h, S_h)`` at the same spec, with
-    ``S_h = band_storage_extent(mesh, nb_head)`` and the rows and columns
+    ``S_h = head_storage_extent(mesh, nb_head)`` and the rows and columns
     past ``nb_head`` exactly zero (the head's padding).  Identity when the
-    two sets agree (``nb_outer == nb_head``).
+    two sets and their carriers agree.
     """
-    from common.parallel_transport import band_storage_extent
-
-    storage = band_storage_extent(mesh, int(nb_head))
-    if int(nb_outer) == int(nb_head):
+    storage = head_storage_extent(mesh, int(nb_head))
+    if int(nb_outer) == int(nb_head) and int(operator.shape[-1]) == storage:
         return operator
     lead = (None,) * (operator.ndim - 2)
     key = ("head_band_block", id(mesh), int(nb_head), tuple(operator.shape))
@@ -345,6 +358,27 @@ def _ascii_stamp(io, path: str, name: str) -> str:
             f"{path}: {name} is not an ASCII SHA-256 stamp; regenerate with "
             "get_dipole_mtxels"
         ) from exc
+
+
+def parallel_transport_link_state(path: str, *, mesh: Mesh):
+    """``(links_complete, singular_values)`` of a link artifact, read cheaply.
+
+    Complete means ``connection_complete`` and ``velocity_validation_complete``
+    are both 1 (a velocity-only or interrupted artifact is not).
+    ``singular_values`` is ``load_link_singular_values`` on the artifact's
+    outer band set, or None when the links are incomplete.  Nothing
+    O(nk*nb^2) is read.
+    """
+    from file_io.parallel_transport import load_link_singular_values
+    from file_io.slab_io import SlabIO
+
+    with SlabIO(path, mode="r", mesh=mesh) as io:
+        flags = [int(io.read_small(name, dtype=np.int64)) for name in (
+            "connection_complete", "velocity_validation_complete")]
+        if flags != [1, 1]:
+            return False, None
+        nb_outer = int(io.read_small("band_stop", dtype=np.int64))
+        return True, load_link_singular_values(io, nb_logical=nb_outer)
 
 
 def load_parallel_transport_head(
@@ -527,7 +561,7 @@ def load_parallel_transport_head(
 
         spec = P(None, None, "x", "y")
         nb_outer = int(ints["band_stop"])
-        nb_storage = band_storage_extent(mesh, expected_nb)
+        nb_storage = head_storage_extent(mesh, expected_nb)
         outer_storage = band_storage_extent(mesh, nb_outer)
         large_shape = (3, int(meta.nk_tot), outer_storage, outer_storage)
         forward_neighbors = np.asarray(io.read_slab(
@@ -671,7 +705,6 @@ def load_dft_velocity_head(
     from file_io.slab_io import SlabIO
 
     nb = int(meta.b_id_4_user)
-    nb_storage = band_storage_extent(mesh, nb)
     with SlabIO(path, mode="r", mesh=mesh) as io:
         schema = int(io.read_small("schema_version", dtype=np.int64))
         band_start = int(io.read_small("band_start", dtype=np.int64))
@@ -746,7 +779,6 @@ def load_dft_velocity_head(
 def load_dft_dipole_head(input_dir, *, mesh: Mesh, wfn, meta, config):
     """Use the authenticated charge dipole for a direct-only metallic head."""
     import os
-    from runtime.padding import padded_axis
 
     if int(meta.b_id_0) != 0:
         raise ValueError("metal direct head requires a band manifold starting at 0")
@@ -754,12 +786,8 @@ def load_dft_dipole_head(input_dir, *, mesh: Mesh, wfn, meta, config):
         os.path.join(input_dir, "dipole.h5"), wfn=wfn, meta=meta,
         config=config, mesh=mesh)
     nb = int(meta.b_id_4_chi_user)
-    axis = padded_axis(
-        nb, mesh, name="metal direct-head band carrier",
-        specs=((P(None, None, "x", None), 2),
-               (P(None, None, None, "y"), 3)))
-    velocity = np.pad(velocity,
-                      ((0, 0), (0, 0), (0, axis.pad), (0, axis.pad)))
+    pad = head_storage_extent(mesh, nb) - nb
+    velocity = np.pad(velocity, ((0, 0), (0, 0), (0, pad), (0, pad)))
     return DftVelocityHeadData(
         velocity_dft_cart=device_put_process_local(
             velocity, NamedSharding(mesh, P(None, None, "x", "y"))),
@@ -1478,15 +1506,18 @@ def assemble_delta_head_manifold(
     """
     delta = jnp.asarray(delta_h_active)
     tail = jnp.asarray(tail_diagonal)
-    if nb_links is not None and nb_logical is not None and int(nb_links) > int(nb_logical):
+    if nb_links is not None and nb_logical is not None:
+        # The links' carrier (band_storage_extent, the whole mesh product)
+        # can exceed the head's (head_storage_extent) with no outer set.
         from common.parallel_transport import band_storage_extent
         top = int(nb_logical)
         outer_storage = band_storage_extent(mesh, int(nb_links))
-        tail = jnp.concatenate([
-            tail[:, :top],
-            jnp.broadcast_to(tail[:, top - 1:top],
-                             (tail.shape[0], outer_storage - top))], axis=1)
-        nb_storage = outer_storage
+        if int(nb_links) > top or outer_storage > int(nb_storage):
+            tail = jnp.concatenate([
+                tail[:, :top],
+                jnp.broadcast_to(tail[:, top - 1:top],
+                                 (tail.shape[0], outer_storage - top))], axis=1)
+            nb_storage = outer_storage
     if delta.ndim != 3 or delta.shape[-2] != delta.shape[-1]:
         raise ValueError("delta_h_active must be (nk,na,na)")
     if tail.ndim != 2 or tail.shape[0] != delta.shape[0]:

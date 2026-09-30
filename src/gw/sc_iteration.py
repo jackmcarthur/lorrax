@@ -6445,6 +6445,69 @@ def _refuse_hybridized_window_edge(
         "pipeline step 3(a)")
 
 
+def _sampled_link_singular_values(singular_values, kgrid) -> np.ndarray:
+    """The link singular values with every collapsed axis set to 1.
+
+    A collapsed axis's stored "link" is the plane-wave overlap
+    <psi| e^{-i b.r} |psi> (the neighbour is the point itself through
+    b_i): its singular values are far below one by construction and say
+    nothing about window hybridization, which is a property of transport
+    along the sampled directions only.  The derivative kernels never read
+    that link (common.parallel_transport.link_stencil_orders).
+    """
+    from common.parallel_transport import collapsed_axes
+    values = np.array(singular_values, dtype=np.float64, copy=True)
+    for axis in collapsed_axes(kgrid):
+        values[:, axis, :] = 1.0
+    return values
+
+
+def default_metal_head_update(config, input_dir: str, *, mesh, wfn, meta,
+                              material_class, print_fn=print):
+    """An unnamed ``sc_head_update`` on a metal: ``dft_velocity`` where links cannot serve.
+
+    Coordinator ruling 2026-09-30: when the deck does not name
+    ``sc_head_update`` and the default chose ``parallel_transport`` because
+    the link artifact exists, a metal whose artifact cannot serve that head
+    (links incomplete, as in a velocity-only artifact, or a link gate
+    refuses: the stencil or ``GATE pt_head_window_hybridized``) runs
+    ``dft_velocity`` instead and says why in one line.  A named mode, and an
+    insulator, keep the refusal (the owner is deciding the insulator case).
+    Returns the config the SC map runs.
+    """
+    if not (material_class == "metal"
+            and str(config.sc.head_update) == "parallel_transport"
+            and bool(config.sc.head_update_defaulted)):
+        return config
+    from file_io.paths import resolve_input_path
+    from .qsgw_head import parallel_transport_link_state
+
+    pt_path = resolve_input_path(
+        input_dir, config.paths.parallel_transport_file)
+    where = "sc_head_update=parallel_transport (not named)"
+    reason = None
+    try:
+        _refuse_unsupported_link_stencil(wfn.kgrid, where=where)
+        complete, singular_values = parallel_transport_link_state(
+            pt_path, mesh=mesh)
+        if not complete:
+            reason = ("its links are incomplete (connection or velocity "
+                      "validation not complete)")
+        else:
+            _refuse_hybridized_window_edge(
+                _sampled_link_singular_values(singular_values, wfn.kgrid),
+                int(meta.b_id_4_user), where=where)
+    except ValueError as exc:
+        reason = str(exc).strip().splitlines()[0]
+    if reason is None:
+        return config
+    print_fn(
+        f"  SC head: sc_head_update was not named and {pt_path} cannot serve "
+        f"the parallel_transport head ({reason}); this metal falls back to "
+        "dft_velocity")
+    return replace(config, sc=replace(config.sc, head_update="dft_velocity"))
+
+
 def load_head_velocity_source(
     config,
     input_dir: str,
@@ -6587,20 +6650,9 @@ def load_head_velocity_source(
 
     source = load_parallel_transport_head(
         pt_path, mesh=mesh, sym=sym, wfn=wfn, meta=meta)
-    # A collapsed axis's stored "link" is the plane-wave overlap
-    # <psi| e^{-i b.r} |psi> (the neighbour is the point itself through
-    # b_i): its singular values are far below one by construction and say
-    # nothing about window hybridization, which is a property of transport
-    # along the sampled directions only.  The derivative kernels never read
-    # that link (common.parallel_transport.link_stencil_orders).
-    from common.parallel_transport import collapsed_axes
-    singular_values = np.array(
-        source.singular_values, dtype=np.float64, copy=True)
-    for axis in collapsed_axes(wfn.kgrid):
-        singular_values[:, axis, :] = 1.0
     _refuse_hybridized_window_edge(
-        singular_values, source.nb_logical,
-        where=f"sc_head_update={mode}")
+        _sampled_link_singular_values(source.singular_values, wfn.kgrid),
+        source.nb_logical, where=f"sc_head_update={mode}")
     vgate = source.validation
     print_fn(
         "  SC head: loaded validated parallel transport from "
@@ -6815,6 +6867,9 @@ def run_sc_driver(
             # sharded, and it is the same (nk, nb, nb) object as U.
             kin_ion = kstar.select(kin_ion)
 
+    config = default_metal_head_update(
+        config, input_dir, mesh=mesh_xy, wfn=wfn, meta=meta,
+        material_class=material_class, print_fn=record_fn or print_fn)
     parallel_transport = load_head_velocity_source(
         config, input_dir, mesh=mesh_xy, sym=sym, wfn=wfn, meta=meta,
         material_class=material_class, print_fn=print_fn)

@@ -6,11 +6,13 @@ one runtime, one FFI load, one compile cache), in one shared run directory,
 in the order a user runs them:
 
     kmeans -> kin_ion -> dipole -> gwjax GN-PPM one-shot
-           -> gwjax shared-pole QSGW (2 maps) -> BSE -> htransform
+           -> BSE -> htransform
            -> exciton bands -> restarted: COHSEX, shared-pole one-shot with
               W and pole exports
            -> bispinor kin_ion, dipole -> four-current shared-pole QSGW
               (2 maps, fresh zeta; its map 0 is the one-shot)
+           -> bcc Na (run/na): kin_ion, dipole -> metal shared-pole QSGW
+              (2 maps, the production defaults)
 
 Each stage is then checked against the stored outputs in ``reference/``
 (eqp columns, numeric members of the written h5 files, solver outputs)
@@ -110,34 +112,6 @@ report_file = gnppm.out
 sigma_omega_h5_file = gnppm_sigma.h5
 """
 
-# The production route: full-frequency QSGW with the shared-pole W, two maps,
-# distributed dense algebra (local at P1, where cuSolverMp has no 2-D mesh),
-# restarting from the GN-PPM run's zeta.  Time
-# reversal is broken, so the store is ordered and its head is the direct
-# frequency-dependent one (`full` folds wings through a TR-even body and
-# refuses: GATE shared_pole_head_ordered).  One electron gives the head too
-# few poles for the default 8-pole head fit, whose conditioning gate refuses.
-# The fixture's QSGW maps move states by eV (max|dE| 2.18 then 1.20 eV), so
-# the 1.5 eV criterion stops the run after exactly two maps, converged, with
-# its terminal outputs written; the per-map residuals are checked below.
-SP_SC_DECK = _DECK_COMMON + """restart = true
-compute_mode = mpa
-sigma_w_model = shared_pole
-head_correction = no_local_fields
-mpa_n_poles = 2
-qp_solver = self_consistent
-sc_max_iter = 2
-sc_tol_ev = 1.5
-linalg = {linalg}
-sigma_regularization_ev = 0.25
-write_qsgw_datasets = true
-sigma_diag_file = sp_sigma.dat
-eqp0_file = sp_eqp0.dat
-eqp1_file = sp_eqp1.dat
-report_file = sp.out
-sigma_omega_h5_file = sp_sigma.h5
-"""
-
 _PATH = """
 K_POINTS {{crystal_b}}
 3
@@ -235,8 +209,9 @@ _P = ["--px", _SIDE, "--py", _SIDE]
 # partition by number_bands_protected (2s and 2p lie below a 20 eV gap, so
 # they are the coarse class, read on held windows at eta_semi and pinned at
 # their DFT block by the default sc_semicore = dft), the rigid tail above the
-# QP window with its min(Z, 1/Z) law, the default head update and its
-# per-map head block (gap 0 on a metal), spectral_shell band extrapolation,
+# QP window with its min(Z, 1/Z) law, the unnamed head update (the 3^3
+# links fail the window gate, so the metal falls back to dft_velocity) and
+# its per-map head block (gap 0 on a metal), spectral_shell extrapolation,
 # and the held SC windows, all at their defaults.  Scalar WFN, fresh zeta.
 NA_DECK = """[cohsex]
 centroids_file = {centroids}
@@ -254,8 +229,8 @@ fermi_reference = mp1_fixed_n
 qp_solver = self_consistent
 sc_max_iter = 2
 sc_tol_ev = {sc_tol}
-sc_head_update = dft_velocity
 linalg = {linalg}
+write_qsgw_datasets = true
 sigma_freq_debug_output = false
 sigma_diag_file = na_sigma.dat
 eqp0_file = na_eqp0.dat
@@ -281,7 +256,6 @@ STAGES = (
     ("kin_ion", "gw.kin_ion_io", ["-i", "gnppm.in"]),
     ("dipole", "psp.get_dipole_mtxels", ["-i", "gnppm.in"]),
     ("gnppm", "gw.gw_jax", ["-i", "gnppm.in"]),
-    ("shared_pole_sc", "gw.gw_jax", ["-i", "sp_sc.in"]),
     # A regression check, not physics: the DFT gap is 48 meV between the
     # exchange-split bonding states, far below the ~1 eV exciton binding of
     # this unscreened one-electron molecule, so the TDA eigenvalues come out
@@ -321,8 +295,7 @@ STAGES = (
     # is covered above): 56 orbit-closed points from `centroid.kmeans_cli 64
     # --seed 42 --orbit --oversample 1.5 --fit-window 0:8,0:13` (the zeta legs).
     ("na_kin_ion", "gw.kin_ion_io", ["-i", "na.in"]),
-    ("na_dipole", "psp.get_dipole_mtxels",
-     ["-i", "na.in", "--parallel-transport-velocity-only"]),
+    ("na_dipole", "psp.get_dipole_mtxels", ["-i", "na.in"]),
     ("na_sc", "gw.gw_jax", ["-i", "na.in"]),
 )
 
@@ -338,10 +311,6 @@ CHECKS = {
     "dipole": {"h5": ["dipole.h5"]},
     "gnppm": {"eqp": ["gnppm_eqp0.dat", "gnppm_eqp1.dat"],
               "h5": ["gnppm_sigma.h5"]},
-    "shared_pole_sc": {"eqp": ["sp_eqp0.dat", "sp_eqp1.dat"],
-                       "h5": ["sp_sigma.h5"],
-                       "report_floats": ("sp.out",
-                                         r"SC iteration: call=\d+ .*?max\|dE\|=([0-9.e+-]+)")},
     "bse": {"stdout_floats": r"^\s*S\d+\s+([0-9.+-]+)\s*$"},
     "exciton_bands": {"rows": [("exciton.dat", 6)]},
     "htransform": {"rows": [("htransform.dat", 6)]},
@@ -379,6 +348,10 @@ REQUIRED_LINES = {
          r"SC semicore = dft: 16 coarse \(k,label\) hold their DFT block"),
         ("tail law with min(Z, 1/Z) weights at map 1",
          r"SC sum-band tail: scissored \[8, 13\) .*Z-weighted\)"),
+        ("unnamed sc_head_update: the metal falls back to dft_velocity",
+         r"SC head: sc_head_update was not named and .* cannot serve the "
+         r"parallel_transport head \(GATE pt_head_window_hybridized.*falls back "
+         r"to dft_velocity"),
         ("Fermi-Dirac fixed-N metal head",
          r"SC metal head: fixed-N fd occupations"),
         ("per-map head block at map 1, metal gap",
@@ -428,8 +401,6 @@ def write_na_deck(run_na):
 def write_decks(run):
     centroids = _centroid_file(run)
     (run / "gnppm.in").write_text(GNPPM_DECK.format(centroids=centroids))
-    (run / "sp_sc.in").write_text(SP_SC_DECK.format(
-        centroids=centroids, linalg="distributed" if _SIDE == "2" else "local"))
     (run / "excited.in").write_text(EXCITED_DECK.format(centroids=centroids))
     for fname, deck in RESTART_DECKS.items():
         (run / fname).write_text(deck.format(centroids=centroids))

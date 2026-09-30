@@ -2898,7 +2898,7 @@ def _apply_input_envelope(
             mode, why = "off", "no link artifact and no dipole.h5"
         if mode != "off":
             resolved = _dc_replace(resolved, sc=_dc_replace(
-                resolved.sc, head_update=mode))
+                resolved.sc, head_update=mode, head_update_defaulted=True))
         print_fn(
             f"  [config provenance] sc_head_update was not named: {mode} "
             f"({why})")
@@ -4461,6 +4461,10 @@ class SCConfig:
     #: ``uses_metal_direct_drude_head``.  ``interband_commutator`` is
     #: insulator-only.
     head_update: str = "off"
+    #: True when ``head_update`` came from the unnamed default (not the deck):
+    #: a metal whose link artifact cannot serve ``parallel_transport`` then
+    #: falls back to ``dft_velocity`` (``sc_iteration.default_metal_head_update``).
+    head_update_defaulted: bool = False
     #: Explicit seed-only ``qp_wfn_rotations.h5`` for a new SC run.  Empty
     #: means the canonical diagonal DFT seed.  This is not nonlinear restart.
     initial_qp_rotations_file: str | None = None
