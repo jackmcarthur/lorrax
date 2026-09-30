@@ -3823,7 +3823,11 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
                                 if isinstance(pt, InterbandCommutatorHeadData)
                                 else None),
             link_unserved=getattr(pt, "link_unserved", None))
-        qsgw_velocity = (velocity, U_full, wfns_qp.enk[:, :nb_storage],
+        # The dipole write reads only v and its label: the Sigma term and
+        # v_DFT are not carried past this map's head.
+        qsgw_velocity = (replace(velocity, base=None,
+                                 correction=None),
+                         U_full, wfns_qp.enk[:, :nb_storage],
                          int(pt.nb_logical))
         iteration_head_response = build_iteration_head_response(
             velocity,
