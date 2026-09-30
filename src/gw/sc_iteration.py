@@ -3839,6 +3839,7 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
             velocity_base_cart=(pt.velocity_dft_cart
                                 if isinstance(pt, InterbandCommutatorHeadData)
                                 else None),
+            link_unserved=getattr(pt, "link_unserved", None),
         )
         velocity_kind = (
             "QSGW finite-link covariant velocity" if forward_links is not None
@@ -4684,29 +4685,22 @@ def _record_shared_pole_replans(inputs, iteration, recipe):
                    f"{ceiling['current_response_span_ry']:.6f} Ry")
 
 
-def refuse_head_link_bound(bound) -> None:
-    """Judge the last map's link bound (``qsgw_head.link_correction_bound``).
+def _record_head_sigma_summary(inputs) -> None:
+    """One line: on how many maps the parallel_transport Sigma term was zeroed.
 
-    The fixed point's head is the one the results carry, so the bound
-    ``rel_err(links) x |D_k DeltaH|/|v_DFT|`` must hold there.
+    ``qsgw_head.sigma_term_zeroed`` sets ``D_k DeltaH = 0`` on a map whose
+    links cannot serve it; the run neither refuses nor switches mode, so the
+    record says how often that happened and whether the last map was one.
     """
-    if bound is None:
+    zeroed = (inputs.screening_seed_cache or {}).get("head_sigma_zeroed")
+    if not zeroed:
         return
-    link_error, ratio, value, rtol = bound
-    if np.isfinite(value) and value <= rtol:
-        return
-    raise ValueError(
-        "GATE pt_head_link_bound: the finite-link error on the fixed "
-        "point's QSGW velocity correction exceeds the tolerance.\n"
-        f"  got:  rel_err(links) {link_error:.4e} x |D_k DeltaH|/|v_DFT| "
-        f"{ratio:.4e} = {value:.4e}\n"
-        f"  want: <= {rtol:.1e} (qsgw_head.HEAD_LINK_RTOL, 1 % of the "
-        "head velocity)\n"
-        "  fix:  a denser k grid (4th-order stencil from 5 points per "
-        "axis), or sc_head_update = dft_velocity\n"
-        "  why:  only D_k DeltaH goes through the links; their relative "
-        "error, measured on the DFT velocity, scales it\n"
-        "  doc:  docs/self_consistency.md, 'Metals: direct Drude head'")
+    n = sum(1 for reason in zeroed.values() if reason)
+    last = max(zeroed)
+    _record_sc(
+        inputs, f"  SC head: parallel_transport Sigma term D_k dH zeroed on "
+        f"{n} of {len(zeroed)} maps; last map {last} "
+        + (f"zeroed ({zeroed[last]})" if zeroed[last] else "served"))
 
 
 def _record_head_block(inputs, iteration, response, energies_qp_kn_ry) -> None:
@@ -4723,7 +4717,7 @@ def _record_head_block(inputs, iteration, response, energies_qp_kn_ry) -> None:
     terms = response.velocity_terms
     if terms is None:
         return
-    names, shares, bound = terms
+    names, shares, bound, zeroed = terms
     metal = response.drude_tensor is not None
     if metal:
         total = 8.0 * np.pi * np.real(np.diagonal(
@@ -4747,11 +4741,15 @@ def _record_head_block(inputs, iteration, response, energies_qp_kn_ry) -> None:
                     if metal else ""))
     if bound is not None:
         link_error, ratio, value, rtol = bound
-        if inputs.screening_seed_cache is not None:
-            inputs.screening_seed_cache["head_link_bound"] = bound
         lines.append(
             f"      link bound: rel_err(links) {link_error:.3e} x "
             f"|D_k dH|/|v_DFT| {ratio:.3e} = {value:.3e} (rtol {rtol:.1e})")
+    if zeroed is not None:
+        lines.append(f"      Sigma term zeroed on this map: {zeroed}")
+    if (bound is not None or zeroed is not None) and (
+            inputs.screening_seed_cache is not None):
+        inputs.screening_seed_cache.setdefault(
+            "head_sigma_zeroed", {})[int(iteration)] = zeroed
     gap = 0.0
     if not metal:
         e = np.asarray(energies_qp_kn_ry, dtype=np.float64)
@@ -4759,6 +4757,12 @@ def _record_head_block(inputs, iteration, response, energies_qp_kn_ry) -> None:
             np.asarray(response.sigma_occupations)[0] > 0.5))
         gap = float(np.min(e[:, n_occ]) - np.max(e[:, n_occ - 1])) * RYD_TO_EV
     lines.append(f"      band gap: {gap:.4f} eV" + (" (metal)" if metal else ""))
+    if zeroed is not None:
+        _record_sc(
+            inputs, f"  SC head: map {iteration}: parallel_transport Sigma "
+            f"term D_k dH set to 0 ({zeroed}; bound "
+            + (f"{bound[2]:.3e}" if bound is not None else "not evaluated")
+            + "); v = U^dagger v_DFT U, checked again next map")
     for line in lines:
         _record_sc(inputs, line)
 
@@ -6532,52 +6536,6 @@ def _sampled_link_singular_values(singular_values, kgrid) -> np.ndarray:
     return values
 
 
-def default_metal_head_update(config, input_dir: str, *, mesh, wfn, meta,
-                              material_class, print_fn=print):
-    """An unnamed ``sc_head_update`` on a metal: ``dft_velocity`` where links cannot serve.
-
-    Coordinator ruling 2026-09-30: when the deck does not name
-    ``sc_head_update`` and the default chose ``parallel_transport`` because
-    the link artifact exists, a metal whose artifact cannot serve that head
-    (links incomplete, as in a velocity-only artifact, or a link gate
-    refuses: the stencil or ``GATE pt_head_window_hybridized``) runs
-    ``dft_velocity`` instead and says why in one line.  A named mode, and an
-    insulator, keep the refusal (the owner is deciding the insulator case).
-    Returns the config the SC map runs.
-    """
-    if not (material_class == "metal"
-            and str(config.sc.head_update) == "parallel_transport"
-            and bool(config.sc.head_update_defaulted)):
-        return config
-    from file_io.paths import resolve_input_path
-    from .qsgw_head import parallel_transport_link_state
-
-    pt_path = resolve_input_path(
-        input_dir, config.paths.parallel_transport_file)
-    where = "sc_head_update=parallel_transport (not named)"
-    reason = None
-    try:
-        _refuse_unsupported_link_stencil(wfn.kgrid, where=where)
-        complete, singular_values = parallel_transport_link_state(
-            pt_path, mesh=mesh)
-        if not complete:
-            reason = ("its links are incomplete (connection or velocity "
-                      "validation not complete)")
-        else:
-            _refuse_hybridized_window_edge(
-                _sampled_link_singular_values(singular_values, wfn.kgrid),
-                int(meta.b_id_4_user), where=where)
-    except ValueError as exc:
-        reason = str(exc).strip().splitlines()[0]
-    if reason is None:
-        return config
-    print_fn(
-        f"  SC head: sc_head_update was not named and {pt_path} cannot serve "
-        f"the parallel_transport head ({reason}); this metal falls back to "
-        "dft_velocity")
-    return replace(config, sc=replace(config.sc, head_update="dft_velocity"))
-
-
 def load_head_velocity_source(
     config,
     input_dir: str,
@@ -6620,16 +6578,20 @@ def load_head_velocity_source(
 
     Returns None for ``off``, which preserves the fixed-DFT head exactly.
 
-    THREE PREFLIGHT REFUSALS run here, before the expensive per-iteration
+    THREE PREFLIGHT CHECKS run here, before the expensive per-iteration
     head machinery ever sees this source (PLAN.md pipeline step 3 /
     ``reports/metal_head_pt_pipelines_2026-08-23/PLAN.md`` D3):
 
     (c) per-axis stencil support — ``parallel_transport`` only, before the
         artifact is even opened;
     (b) independent multiplet/TRIM degeneracy at the active window's top
-        edge — both modes, pure DFT energies;
+        edge — both modes, pure DFT energies; refuses;
     (a) link singular-value hybridization at the active window's top edge —
         ``parallel_transport`` only, needs the links this mode alone reads.
+
+    (c), (a) and incomplete links do not refuse: the source then carries
+    ``link_unserved`` and every map runs with ``D_k DeltaH = 0``
+    (``qsgw_head.sigma_term_zeroed``).
     """
     from gw.gw_config import HEAD_UPDATES, uses_direct_bispinor_shared_pole_head
 
@@ -6713,16 +6675,49 @@ def load_head_velocity_source(
             "with no links and no k stencil (insulators)")
         return source
 
-    _refuse_unsupported_link_stencil(
-        wfn.kgrid, where=f"sc_head_update={mode}")
+    # parallel_transport stays the head for the whole run (owner
+    # 2026-09-30).  Links that cannot serve D_k DeltaH (a stencil the grid
+    # cannot carry, an incomplete artifact, a hybridized window edge) set it
+    # to zero on every map through qsgw_head.sigma_term_zeroed; the velocity
+    # is then the artifact's U^dagger v_DFT U.  No refusal, no other mode.
+    from .qsgw_head import (load_dft_velocity_head,
+                            load_parallel_transport_head,
+                            parallel_transport_link_state)
 
-    from .qsgw_head import load_parallel_transport_head
-
-    source = load_parallel_transport_head(
-        pt_path, mesh=mesh, sym=sym, wfn=wfn, meta=meta)
-    _refuse_hybridized_window_edge(
-        _sampled_link_singular_values(source.singular_values, wfn.kgrid),
-        source.nb_logical, where=f"sc_head_update={mode}")
+    where = f"sc_head_update={mode}"
+    unserved = None
+    try:
+        _refuse_unsupported_link_stencil(wfn.kgrid, where=where)
+    except ValueError as exc:
+        unserved = str(exc).strip().splitlines()[0]
+    if unserved is None and not parallel_transport_link_state(
+            pt_path, mesh=mesh)[0]:
+        unserved = ("links incomplete (connection or velocity validation "
+                    "not complete)")
+    if unserved is not None:
+        source = replace(load_dft_velocity_head(
+            pt_path, mesh=mesh, wfn=wfn, meta=meta, config=config),
+            link_unserved=unserved)
+    else:
+        source = load_parallel_transport_head(
+            pt_path, mesh=mesh, sym=sym, wfn=wfn, meta=meta)
+        try:
+            _refuse_hybridized_window_edge(
+                _sampled_link_singular_values(
+                    source.singular_values, wfn.kgrid),
+                source.nb_logical, where=where)
+        except ValueError as exc:
+            unserved = str(exc).strip().splitlines()[0]
+            source = replace(source, forward_links=None,
+                             forward_neighbors=None, collapsed_position=None,
+                             link_unserved=unserved)
+    if unserved is not None:
+        print_fn(
+            f"  SC head: parallel_transport from {pt_path} "
+            f"(nb={source.nb_logical}); its links cannot serve the Sigma "
+            f"term ({unserved}), so D_k dH = 0 on every map and the head "
+            "runs U^dagger v_DFT U")
+        return source
     vgate = source.validation
     print_fn(
         "  SC head: loaded validated parallel transport from "
@@ -6937,9 +6932,6 @@ def run_sc_driver(
             # sharded, and it is the same (nk, nb, nb) object as U.
             kin_ion = kstar.select(kin_ion)
 
-    config = default_metal_head_update(
-        config, input_dir, mesh=mesh_xy, wfn=wfn, meta=meta,
-        material_class=material_class, print_fn=record_fn or print_fn)
     parallel_transport = load_head_velocity_source(
         config, input_dir, mesh=mesh_xy, sym=sym, wfn=wfn, meta=meta,
         material_class=material_class, print_fn=print_fn)
@@ -7025,6 +7017,7 @@ def run_sc_driver(
         raise RuntimeError(
             "GATE sc_missing_convergence_verdict: the last evaluated SC map "
             "returned no fixed-point verdict")
+    _record_head_sigma_summary(inputs)
     if sc.max_iter == 1:
         _record_sc(
             inputs, "  SC verdict: ONE-MAP DIAGNOSTIC (convergence was not "
@@ -7047,8 +7040,6 @@ def run_sc_driver(
         _record_sc(
             inputs, f"  SC verdict: CONVERGED after {len(rms_history)} GW "
             f"map calls; {verdict.summary()}")
-    refuse_head_link_bound((inputs.screening_seed_cache or {}).get(
-        "head_link_bound"))
     sigma_result = state_final.outputs.sigma_result
     screening = state_final.outputs.screening
     # A four-current (full_shared_pole) map carries its head inside the

@@ -1695,7 +1695,8 @@ def complete_velocity_validation(
     if not metrics["passed"] and jax.process_index() == 0:
         # A diagnostic, not a refusal: the QSGW head judges the link error on
         # what it uses, rel_err x |D_k DeltaH|/|v_DFT| at every map
-        # (gw.qsgw_head.link_correction_bound, GATE pt_head_link_bound).
+        # (gw.qsgw_head.link_correction_bound); a map above it runs with
+        # D_k DeltaH = 0 (gw.qsgw_head.sigma_term_zeroed).
         print(
             "  finite-link DFT velocity reconstruction above rtol "
             "(diagnostic; the SC head bounds the link error on its Sigma "

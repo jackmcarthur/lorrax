@@ -268,6 +268,10 @@ class ParallelTransportHeadData:
     #: ``p`` alone (head block, DFT basis) when the artifact carries it:
     #: the p / V_NL split of the per-map head block (velocity_term_shares).
     velocity_kinetic_cart: object = None
+    #: Why the links cannot serve ``D_k DeltaH`` on any map (stencil or
+    #: window-hybridization gate); the links are then dropped and every map
+    #: runs ``U^dagger v_DFT U`` (:func:`sigma_term_zeroed`).  None: served.
+    link_unserved: str | None = None
 
 
 @dataclass(frozen=True)
@@ -299,6 +303,10 @@ class DftVelocityHeadData:
     forward_links: None = None
     forward_neighbors: None = None
     validation: None = None
+    #: Set when ``sc_head_update = parallel_transport`` runs on this velocity
+    #: because the artifact's links are incomplete: the reason its Sigma
+    #: term is zero on every map (:func:`sigma_term_zeroed`).
+    link_unserved: str | None = None
 
 
 def head_storage_extent(mesh: Mesh, nb_head: int) -> int:
@@ -911,8 +919,9 @@ def _spectral_kernel(mesh: Mesh, kgrid: tuple[int, int, int]) -> Callable:
 
 #: The head's link-error tolerance: 1 % of its velocity on the elements it
 #: reads (``link_correction_bound``), i.e. at most ~2 % of S_aa or of the
-#: Drude weight.  Coarse 4-point axes sit below it at their fixed points
-#: (Fe 4^3 3.9e-3, Si 4^3 6.2e-3).
+#: Drude weight.  A map above it runs with ``D_k DeltaH = 0``
+#: (``sigma_term_zeroed``).  Coarse 4-point axes sit below it at their fixed
+#: points (Fe 4^3 3.9e-3, Si 4^3 6.2e-3).
 HEAD_LINK_RTOL = 1.0e-2
 
 
@@ -932,11 +941,10 @@ def link_correction_bound(correction, velocity_dft, occupations_kn, *,
 
     with both norms on that set (this map's occupations) and ``rtol`` =
     :data:`HEAD_LINK_RTOL`.  Returns
-    ``(link_error, ratio, bound, rtol)``: every map logs it in its head block
-    and the SC run judges it at its fixed point
-    (``sc_iteration.refuse_head_link_bound``, ``GATE pt_head_link_bound``);
-    a transient map may exceed it.  A DFT-start map 0 has ``DeltaH = 0`` and
-    a zero bound.
+    ``(link_error, ratio, bound, rtol)``: every map logs it in its head block,
+    and a map whose bound exceeds ``rtol`` runs with ``D_k DeltaH = 0``
+    (:func:`sigma_term_zeroed`).  A DFT-start map 0 has ``DeltaH = 0`` and a
+    zero bound.
     """
     from file_io.parallel_transport import head_velocity_set
     nb = int(velocity_dft.shape[-1])
@@ -947,6 +955,28 @@ def link_correction_bound(correction, velocity_dft, occupations_kn, *,
                                         0.0)), 1.0e-60))))
     bound = float(link_error) * ratio
     return float(link_error), ratio, bound, float(rtol)
+
+
+def sigma_term_zeroed(link_unserved: str | None, bound) -> str | None:
+    """The parallel_transport head's one rule: why ``D_k DeltaH`` is zero on this map.
+
+    Owner 2026-09-30: the head stays ``U^dagger (v_DFT + D_k DeltaH) U`` for
+    the whole run; on a map whose links cannot serve the Sigma term it is
+    set to zero, ``U^dagger v_DFT U``, and the next map checks again.  No
+    refusal and no other velocity mode.  The links cannot serve when they
+    are incomplete or fail the stencil or window-hybridization gate
+    (``link_unserved``, fixed for the run) or when this map's
+    :func:`link_correction_bound` exceeds :data:`HEAD_LINK_RTOL`.  Returns
+    the reason, or None when the term is served.
+    """
+    if link_unserved:
+        return str(link_unserved)
+    if bound is None:
+        return None
+    _, _, value, rtol = bound
+    if np.isfinite(value) and value <= rtol:
+        return None
+    return f"link bound {value:.3e} > rtol {rtol:.1e}"
 
 
 def velocity_term_shares(v_qp, pieces, *, nb_logical, surface_weight_kn=None,
@@ -3129,9 +3159,10 @@ class IterationHeadResponse:
     #: (``fermi_surface.FermiSurfaceIntraband``), whose moments are ``N0``
     #: and ``drude_tensor``; the q = 0 cell evaluates it at every sample.
     fermi_surface: object | None = None
-    #: ``(names, shares[n_terms, 3], link_bound)`` from
-    #: :func:`velocity_term_shares` and :func:`link_correction_bound`, for
-    #: the per-map head block (``sc_iteration._record_head_block``).
+    #: ``(names, shares[n_terms, 3], link_bound, sigma_zeroed)`` from
+    #: :func:`velocity_term_shares`, :func:`link_correction_bound` and
+    #: :func:`sigma_term_zeroed` (the reason, or None), for the per-map head
+    #: block (``sc_iteration._record_head_block``).
     velocity_terms: tuple | None = None
 
 
@@ -3710,6 +3741,7 @@ def build_iteration_head_response(
     link_bound: tuple[float, float] | None = None,
     velocity_kinetic_cart=None,
     velocity_base_cart=None,
+    link_unserved: str | None = None,
 ) -> IterationHeadResponse:
     """Build current-basis direct head and, when requested, its wings.
 
@@ -3723,6 +3755,10 @@ def build_iteration_head_response(
     ``occupation_state`` is the map's solved state (``occupations_qp_kn`` is
     its ``f_kn``); the static Γ body is ``gw.w_isdf.compute_chi0_matsubara``
     at ``n = 0`` on it, which refuses any family but Fermi-Dirac.
+
+    ``parallel_transport`` drops the covariant correction on a map whose
+    links cannot serve it (:func:`sigma_term_zeroed`; ``link_unserved`` is
+    the run-long reason when the source carries no links).
     """
     v_dft_basis = jnp.asarray(velocity_dft_cart, dtype=jnp.complex128)
     base, correction, bound = v_dft_basis, None, None
@@ -3731,6 +3767,7 @@ def build_iteration_head_response(
         # difference from the DFT velocity p + i[r, V_NL].
         base = jnp.asarray(velocity_base_cart, dtype=jnp.complex128)
         correction = v_dft_basis - base
+    zeroed = sigma_term_zeroed(link_unserved, None)
     if forward_links is not None:
         if forward_neighbors is None:
             raise ValueError(
@@ -3753,7 +3790,11 @@ def build_iteration_head_response(
                 correction, v_dft_basis, occupations_qp_kn,
                 link_error=link_bound[0],
                 rtol=link_bound[1])
-        v_dft_basis = v_dft_basis + correction
+        zeroed = sigma_term_zeroed(None, bound)
+        if zeroed is None:
+            v_dft_basis = v_dft_basis + correction
+        else:
+            correction = None
     v_qp = rotate_velocity_active_to_qp(v_dft_basis, U_dft_to_qp, mesh=mesh)
     # The per-map head block: p, V_NL and Sigma shares of this velocity.
     pieces = ([("p", velocity_kinetic_cart),
@@ -3761,13 +3802,15 @@ def build_iteration_head_response(
               if velocity_kinetic_cart is not None else [("p + V_NL", base)])
     if correction is not None:
         pieces.append(("Sigma", correction))
-    velocity_terms = velocity_term_shares(
+    names, shares = velocity_term_shares(
         v_qp, [(name, rotate_velocity_active_to_qp(
             jnp.asarray(x, dtype=jnp.complex128), U_dft_to_qp, mesh=mesh))
             for name, x in pieces],
         nb_logical=nb_logical, surface_weight_kn=surface_weight_qp_kn,
-        energies_kn=energies_qp_kn_ry, occupations_kn=occupations_qp_kn
-    ) + (bound,)
+        energies_kn=energies_qp_kn_ry, occupations_kn=occupations_qp_kn)
+    if zeroed is not None:
+        names, shares = names + ("Sigma",), np.vstack([shares, np.zeros((1, 3))])
+    velocity_terms = (names, shares, bound, zeroed)
     resolved_eta_ry = (
         float(config.head.wcoul0_eta)
         if eta_ry is None else float(eta_ry)
