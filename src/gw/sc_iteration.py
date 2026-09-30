@@ -3774,7 +3774,8 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
                 inputs, state, ks, wfns_qp, nb_storage)
             delta_head = assemble_delta_head_manifold(
                 delta_active, tail_diagonal, nb_storage=nb_storage,
-                mesh=inputs.mesh_xy)
+                mesh=inputs.mesh_xy, nb_logical=int(pt.nb_logical),
+                nb_links=int(getattr(pt, "nb_links", 0) or pt.nb_logical))
         head_velocity_dft = pt.velocity_dft_cart
         if isinstance(pt, InterbandCommutatorHeadData):
             head_velocity_dft = _interband_commutator_head_velocity(
@@ -3823,6 +3824,7 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
             eta_ry=(0.0 if mpa_mode else None),
             occupation_state=entry_occ_state,
             collapsed_position=getattr(pt, "collapsed_position", None),
+            nb_links=int(getattr(pt, "nb_links", 0) or pt.nb_logical),
         )
         velocity_kind = (
             "QSGW finite-link covariant velocity" if forward_links is not None
@@ -6298,10 +6300,14 @@ def _refuse_hybridized_window_edge(
     means WITHIN the window: with ``nb_logical`` bands kept and the array
     descending along its last axis (the dataset's own ``ordering``
     attribute), the minimum retained singular value is exactly the LAST
-    kept one, ``singular_values[..., :nb_logical].min()`` — no comparison to
-    bands outside the window is needed or available (the artifact carries
-    no bands beyond ``nb_logical``; see ``load_parallel_transport_head``'s
-    ``band_stop == expected_nb`` gate).
+    kept one, ``singular_values[..., :nb_logical].min()``.
+
+    On an outer link set (``ParallelTransportHeadData.nb_links``, links on
+    more bands than the head's ``nb_logical``) the values are the outer
+    link's, so this judges the OUTER edge: the outer set's k and k+b spans
+    must share a well-conditioned subspace of the head's dimension.  A
+    collapse confined to the ranks above it (the buffer between the head
+    and the outer edge) passes.
     """
     sv = np.asarray(singular_values, dtype=np.float64)
     kept = sv[..., :int(nb_logical)]
