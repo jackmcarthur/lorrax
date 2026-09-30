@@ -1023,15 +1023,15 @@ def resolve_qp_hamiltonian_state(
     # every process, so place each process's incumbent shards without JAX's
     # hidden cross-process equality/all-gather transport before entering the
     # one multi-host JIT.
-    state_sharding = ctilde.sharding
+    companion_sharding = NamedSharding(ctilde.sharding.mesh, P())
     enk_dev = device_put_process_local(
         np.asarray(enk_sigma, dtype=np.dtype(enk_sigma.dtype)),
-        state_sharding)
+        companion_sharding)
     U_dev = device_put_process_local(
-        np.asarray(U, dtype=np.dtype(ctilde.dtype)), state_sharding)
+        np.asarray(U, dtype=np.dtype(ctilde.dtype)), companion_sharding)
     E_dev = device_put_process_local(
         np.asarray(E, dtype=np.dtype(enk_sigma.dtype)),
-        state_sharding)
+        companion_sharding)
     ctilde_qp, enk_qp = _apply_qp_block_to_compact_state(
         ctilde, enk_dev, U_dev, E_dev, band_offset=q0 - fit0)
     say(
