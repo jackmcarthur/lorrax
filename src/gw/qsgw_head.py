@@ -1566,8 +1566,9 @@ def assemble_head_manifold(
     return _assemble_kernel(mesh, int(nb_storage))(delta_h_active, U_active)
 
 
-def _assemble_delta_kernel(mesh: Mesh, nb_storage: int) -> Callable:
-    key = ("assemble_delta_head", id(mesh), int(nb_storage))
+def _assemble_delta_kernel(mesh: Mesh, nb_storage: int,
+                           nb_active: int | None = None) -> Callable:
+    key = ("assemble_delta_head", id(mesh), int(nb_storage), nb_active)
     hit = _KERNEL_CACHE.get(key)
     if hit is not None:
         return hit
@@ -1578,8 +1579,9 @@ def _assemble_delta_kernel(mesh: Mesh, nb_storage: int) -> Callable:
         nk, na, _ = delta_active.shape
         delta = jnp.zeros((nk, nb_storage, nb_storage), dtype=jnp.complex128)
         delta = delta.at[:, :na, :na].set(delta_active)
-        idx = jnp.arange(na, nb_storage)
-        delta = delta.at[:, idx, idx].set(tail_diagonal[:, na:nb_storage])
+        active = na if nb_active is None else int(nb_active)
+        idx = jnp.arange(active, nb_storage)
+        delta = delta.at[:, idx, idx].set(tail_diagonal[:, active:nb_storage])
         return jax.lax.with_sharding_constraint(delta, out_sharding)
 
     _KERNEL_CACHE[key] = _kernel
@@ -1594,6 +1596,7 @@ def assemble_delta_head_manifold(
     mesh: Mesh,
     nb_logical: int | None = None,
     nb_links: int | None = None,
+    nb_active: int | None = None,
 ):
     """Embed active DeltaH and the current diagonal sum-band tail.
 
@@ -1602,6 +1605,12 @@ def assemble_delta_head_manifold(
     Past the head's ``nb_logical`` bands it continues the diagonal scissor
     tail: each k takes its highest head band's shift (the rigid tail law's
     Delta_c when that band is in the tail).
+
+    ``nb_active`` distinguishes a physical protected block from its padded
+    carrier. Its null carrier rows receive the diagonal tail too; otherwise
+    the carrier width is the active width, preserving the historical route.
+    The supplied active matrix must have exactly null padding outside this
+    physical block (as ``qp_frame_delta_h_dft`` does for a zero-padded U).
     """
     delta = jnp.asarray(delta_h_active)
     tail = jnp.asarray(tail_diagonal)
@@ -1625,7 +1634,9 @@ def assemble_delta_head_manifold(
         raise ValueError(f"tail diagonal extent {tail.shape[1]} < storage {nb_storage}")
     if int(delta.shape[-1]) > int(nb_storage):
         raise ValueError("active DeltaH exceeds the head manifold")
-    return _assemble_delta_kernel(mesh, int(nb_storage))(delta, tail)
+    if nb_active is not None and not 0 < int(nb_active) <= int(delta.shape[-1]):
+        raise ValueError("physical active extent must lie inside its carrier")
+    return _assemble_delta_kernel(mesh, int(nb_storage), nb_active)(delta, tail)
 
 
 def _interband_weight(dE, f_diff, z, prefactor):
