@@ -330,14 +330,16 @@ def _extrapolated_point(cube, weights):
 
 def _report_band_extrapolation(
     sigma_omega, head_sigma_diag_w_kn_ry, *,
-    plan, config, band_slices, wfn, sym, meta, mesh_xy, print_fn,
+    e_state_ev, plan, config, band_slices, wfn, mesh_xy, print_fn,
 ) -> dict:
     """Log the three band-count Σ_c's, the fit and its diagnostics.
 
-    Reads the band DIAGONAL of each cumulative point at the SAME external
-    evaluation energy — E_DFT − E_F, on the SAME ω grid — so nothing but the
-    band count differs between the three.  The analytic q→0 head is added to
-    every point identically (it is a band-diagonal ω-dependent term with no
+    ``e_state_ev`` [k, n] (eV, absolute) is the energy each row of the cube
+    is read at: the caller's ``e_qp_ev``, E_DFT in a one-shot and the map's
+    read energies in SC.  Reads the band DIAGONAL of each cumulative point at
+    that SAME external evaluation energy − E_F, on the SAME ω grid — so
+    nothing but the band count differs between the three.  The analytic q→0
+    head is added to every point identically (it is a band-diagonal ω-dependent term with no
     unoccupied-state sum, hence bracket-independent), so the reported values
     are the physical Σ_c rather than the body alone; being a common offset it
     shifts S_∞ and S₃ together and leaves ``Δ_tail`` unchanged.
@@ -354,10 +356,14 @@ def _report_band_extrapolation(
     from .qsgw_utils import extract_sigma_diag_replicated, interp_along_omega
 
     cube = sigma_omega.sigma_c_kij
-    enk_dft, _ = get_enk_bandrange(
-        wfn, sym, band_slices.sigma_range, band_slices.sigma_range,
-        nspinor=meta.nspinor)
-    enk_ev = np.asarray(enk_dft) * RYD_TO_EV
+    # THE ROW'S OWN ENERGY, NOT THE DFT ENERGY OF ITS SORTED INDEX.  The
+    # cube's rows are the states of the bundle Sigma was built in; in SC they
+    # are the input's sorted QP states.  Where a QP singlet and doublet swap
+    # order against DFT, the DFT energy by index gave the two members of one
+    # doublet two tail ratios and split it (bcc Na 3^3, map 1: 2.5 meV at
+    # k = (1/3,1/3,1/3)), and the next W broke the crystal symmetry
+    # (GATE shared_pole_gram_valid at map 2).  One-shot and SC map 0 read E_DFT.
+    enk_ev = np.asarray(e_state_ev, dtype=np.float64)
     omega_eval_ev = enk_ev - (float(wfn.efermi) if sigma_omega.efermi_ry is None
                               else float(sigma_omega.efermi_ry)) * RYD_TO_EV
     omega_grid_ev = np.asarray(config.omega_grid_ev, dtype=np.float64)
@@ -544,7 +550,7 @@ def plan_sigma_band_brackets(config, wfns, meta, *, print_fn, where):
 
 def extrapolate_sigma_body(
     sigma_omega, head_sigma_diag_w_kn_ry, *,
-    plan, config, band_slices, wfn, sym, meta, mesh_xy, print_fn,
+    e_state_ev, plan, config, band_slices, wfn, mesh_xy, print_fn,
 ):
     """``(extrapolated body, h5 payload)`` from a bracketed Σ_c cube.
 
@@ -558,10 +564,9 @@ def extrapolate_sigma_body(
     and then diagonalizing is the only order that yields a Hermitian operator.
     """
     extrap_payload, extrap_weights = _report_band_extrapolation(
-        sigma_omega, head_sigma_diag_w_kn_ry,
+        sigma_omega, head_sigma_diag_w_kn_ry, e_state_ev=e_state_ev,
         plan=plan, config=config, band_slices=band_slices,
-        wfn=wfn, sym=sym, meta=meta, mesh_xy=mesh_xy,
-        print_fn=print_fn)
+        wfn=wfn, mesh_xy=mesh_xy, print_fn=print_fn)
     return (_extrapolated_point(sigma_omega.sigma_c_kij, extrap_weights),
             extrap_payload)
 
@@ -603,6 +608,7 @@ def compute_ppm_sigma_pipeline(
     iteration_head=None,
     occupation_state=None,
     fixed_quadrature_session=None,
+    e_qp_ev=None,
     print_fn=print,
 ) -> PPMOutputs:
     """Run the GN/HL-PPM dynamic Σ^c(ω) pipeline given pre-computed W's.
@@ -623,6 +629,9 @@ def compute_ppm_sigma_pipeline(
 
     The ansatz-neutral finalizer injects that head, interpolates, writes and
     builds the QSGW matrix.
+
+    ``e_qp_ev`` [k, n] (eV) is the energy each Σ row is read at, which the
+    band extrapolation reads its states at too.
 
     ``occupation_state`` is the iteration's
     :class:`gw.efermi.OccupationState`, carried through to the one
@@ -789,10 +798,9 @@ def compute_ppm_sigma_pipeline(
         extrap_payload = None
         if plan.enabled:
             sigma_c_body_omega, extrap_payload = extrapolate_sigma_body(
-                sigma_omega, head_sigma_diag_w_kn_ry,
+                sigma_omega, head_sigma_diag_w_kn_ry, e_state_ev=e_qp_ev,
                 plan=plan, config=config, band_slices=band_slices,
-                wfn=wfn, sym=sym, meta=meta, mesh_xy=mesh_xy,
-                print_fn=print_fn,
+                wfn=wfn, mesh_xy=mesh_xy, print_fn=print_fn,
             )
             sigma_c_body_omega_unextrap = sigma_c_body_omega_n3
 

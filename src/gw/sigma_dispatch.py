@@ -1364,8 +1364,8 @@ def _compute_mpa_sigma(
             body_odd = band_count_point(body_odd, last)
         body_omega, extrap_payload = extrapolate_sigma_body(
             replace(body, efermi_ry=sigma_efermi_ry), head_diag,
-            plan=plan, config=config, band_slices=band_slices,
-            wfn=wfn, sym=sym, meta=meta, mesh_xy=mesh_xy, print_fn=print_fn)
+            e_state_ev=e_qp_ev, plan=plan, config=config, band_slices=band_slices,
+            wfn=wfn, mesh_xy=mesh_xy, print_fn=print_fn)
     return finalize_dynamic_sigma(
         body_omega, head_diag,
         sigma_band_axis=body.band_axis,
@@ -1423,6 +1423,7 @@ def _compute_ppm_sigma(
         fixed_quadrature_session=(
             None if fixed_quadrature_session is None else
             fixed_quadrature_session.setdefault("ppm", {})),
+        e_qp_ev=e_qp_ev,
         print_fn=print_fn,
     )
     return finalize_dynamic_sigma(
