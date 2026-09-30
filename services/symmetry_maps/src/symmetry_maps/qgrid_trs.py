@@ -591,6 +591,15 @@ def project_little_group_operator(
             x, y = jax.lax.axis_index("x"), jax.lax.axis_index("y")
             ml, nl = plus.shape[1:]
             totals = (jnp.zeros_like(plus),)*2
+            # Up to 8 steps per loop trip.  One trip per step made every step
+            # its own pass over the accumulators and its own dispatch (Na 8^3
+            # at P4: 96 trips, ~10 ms of a ~30 ms Sigma tau node); unrolled,
+            # XLA fuses consecutive steps.  Each parent still adds its
+            # operations in the same order; the fused multiply-adds round
+            # differently (Na SC maps 1-2 move <= 0.13 meV, Fe 4^3 bitwise).
+            def unroll(lo, hi):
+                return max(1, min(8, hi - lo))
+
             for lo, hi, members in segments:
                 whole = len(members) == b
                 sel = None if whole else jnp.asarray(members, dtype=jnp.int32)
@@ -630,10 +639,15 @@ def project_little_group_operator(
                         out.append(acc + weight[:, None, None]*transformed)
                     return tuple(out)
                 if whole:
-                    totals = jax.lax.fori_loop(lo, hi, step, totals)
+                    totals = jax.lax.fori_loop(lo, hi, step, totals, unroll=unroll(lo, hi))
                 else:
-                    parts = jax.lax.fori_loop(lo, hi, step, tuple(t[sel] for t in totals))
-                    totals = tuple(t.at[sel].set(v) for t, v in zip(totals, parts))
+                    parts = jax.lax.fori_loop(lo, hi, step, tuple(t[sel] for t in totals),
+                                              unroll=unroll(lo, hi))
+                    # Members are sorted and unique (flatnonzero).  Unmarked,
+                    # XLA GPU expanded this overwrite into a loop of one tile
+                    # copy per member.
+                    totals = tuple(t.at[sel].set(v, indices_are_sorted=True, unique_indices=True)
+                                   for t, v in zip(totals, parts))
             return totals
 
         # The average's transpose is the average of the swapped pair,
