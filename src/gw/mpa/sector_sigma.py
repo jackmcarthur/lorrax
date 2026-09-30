@@ -136,6 +136,10 @@ def _w_tables(headers, bases, syms, mesh_xy):
         spin_action_full=act_l, n_sym_spatial=n_spatial, mesh_xy=mesh_xy,
         right_sym_perm=perm_r, right_L_table=wraps_r, trs_rule='pair_transpose',
         right_spin_action_full=act_r)
+    if any(np.any(np.imag(a) != 0) for a in (act_l, act_r)):
+        # The hole tables keep U unconjugated: W_-(k) = R partner R^T needs a real action.
+        raise ValueError("GATE shared_pole_w_tables: an endpoint action is not real; the hole "
+                         "branch's q-negated tables need real (Cartesian or scalar) actions")
     qn = np.asarray(q_negation_index(tuple(int(v) for v in headers[0]['grid'])), np.int64)
     hole = particle._replace(
         row=particle.row[qn], trs=(1 - particle.trs[qn]).astype(np.int32),
@@ -162,15 +166,23 @@ def _w_parents(mesh_xy, plan, m, nc, n, nt, kcarrier, weights_fn, panel_bytes):
     axis, ``d(t)`` as the phase row.  The contraction is the face Green's
     batched SUMMA (``distrib_la.panel_matmul``) with its two live pole panels
     bounded by ``panel_bytes`` (the ledger's room; one W tile at most).  The
-    partner is ``conj(B_A) d B_B^T`` at the same d, from the conjugate faces.
+    partner is ``conj(B_A) d B_B^T`` at the same d: on the face route
+    (``face_green_product(partner=True)``) d scales each gathered panel slice
+    and the partner comes from the same exchange, so no scaled or conjugated
+    copy of a face is formed.  The route bounds its two live panels by one
+    Green tile of ``n_full`` rows; the builder's plan here says ``n_full`` =
+    the rows whose tile is ``panel_bytes``.
     """
     key = (mesh_xy, id(plan), m, nc, n, nt, kcarrier, weights_fn, int(panel_bytes))
     if key in _W_PARENTS:
         return _W_PARENTS[key][1]
-    from distrib_la import panel_matmul
     from gw.greens_function_kernel import build_G_parents
     nq = int(plan.n_parent)
-    gemm = partial(panel_matmul, mesh=mesh_xy, panel_bytes=int(panel_bytes))
+    px, py = int(mesh_xy.shape['x']), int(mesh_xy.shape['y'])
+    rows = int(min(nq, max(1, int(panel_bytes) // (16 * (m * nc // px) * (n * nt // py)))))
+    gemm = SimpleNamespace(backend='face', mesh=mesh_xy)
+    face_plan = SimpleNamespace(sym_idx=plan.sym_idx, n_sym_spatial=plan.n_sym_spatial,
+                                mesh_xy=mesh_xy, n_full=rows)
     antiunitary = bool(np.any(np.asarray(plan.sym_idx) >= int(plan.n_sym_spatial)))
 
     @jax.jit
@@ -178,11 +190,11 @@ def _w_parents(mesh_xy, plan, m, nc, n, nt, kcarrier, weights_fn, panel_bytes):
         d = weights_fn(poles, intervals, ref, time)
         x = b_x.reshape(nq, m * nc, 1, kcarrier).transpose(0, 2, 1, 3)
         y = b_y.reshape(nq, n * nt, 1, kcarrier).transpose(0, 3, 2, 1)
-        pg = build_G_parents(x, y, phases=d, layout='face', gemm=gemm, k_unfold_plan=plan,
+        pg = build_G_parents(x, y, phases=d, layout='face', gemm=gemm, k_unfold_plan=face_plan,
                              real_weights=False)
         partner = pg.partner() if antiunitary else build_G_parents(
             jnp.conj(x), jnp.conj(y), phases=d, layout='face', gemm=gemm,
-            k_unfold_plan=plan, real_weights=False).G
+            k_unfold_plan=face_plan, real_weights=False).G
         shape = (nq, m, nc, n, nt)
         return pg.G.reshape(shape), partner.reshape(shape)
     _W_PARENTS[key] = (plan, kernel)
