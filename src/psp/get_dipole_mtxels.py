@@ -576,6 +576,27 @@ def stamp_dipole_provenance(h5, **kwargs) -> None:
         h5.attrs[key] = value
 
 
+def _parallel_transport_outer_bands(args, wfn, head_nbands, parser):
+    """``(sweep extent, head extent)``: the outer set when links are written.
+
+    The head is the deck's band set (``head_nbands``); the links run on an
+    outer set above it (``--parallel-transport-bands``, default every WFN
+    band) and the velocity gate judges only the head block
+    (:func:`file_io.parallel_transport.complete_velocity_validation`).
+    Without links the extent is the head's.
+    """
+    if (args.parallel_transport_out is None
+            or args.parallel_transport_velocity_only or args.w_av_only):
+        return int(head_nbands), int(head_nbands)
+    outer = int(args.parallel_transport_bands) or int(wfn.nbands)
+    if not int(head_nbands) <= outer <= int(wfn.nbands):
+        parser.error(
+            f"--parallel-transport-bands={outer} must lie in "
+            f"[{int(head_nbands)}, {int(wfn.nbands)}] (the deck's bands, "
+            "the WFN's bands)")
+    return outer, int(head_nbands)
+
+
 def _resolve_dipole_nb_written(wfn, *, ncond, nband) -> int:
     """Band extent of the ordinary q→0 matrix written by this driver.
 
@@ -960,22 +981,9 @@ def main(argv=None):
 
 		# Ensure we load enough conduction bands for debug/output comparisons.
 		# ψ is NOT loaded here — see the k sweep below.
-		nband_eff = _resolve_dipole_nb_written(
-			wfn, ncond=ncond, nband=nband)
-		# The head's band set; the links run on an outer set above it
-		# (--parallel-transport-bands, default every WFN band) and the
-		# velocity gate judges only the head block.
-		head_nbands = nband_eff
-		if (args.parallel_transport_out is not None
-				and not args.parallel_transport_velocity_only
-				and not args.w_av_only):
-			outer = int(args.parallel_transport_bands) or int(wfn.nbands)
-			if not head_nbands <= outer <= int(wfn.nbands):
-				parser.error(
-					f"--parallel-transport-bands={outer} must lie in "
-					f"[{head_nbands}, {int(wfn.nbands)}] (the deck's bands, "
-					"the WFN's bands)")
-			nband_eff = outer
+		nband_eff, head_nbands = _parallel_transport_outer_bands(
+			args, wfn, _resolve_dipole_nb_written(wfn, ncond=ncond, nband=nband),
+			parser)
 
 		if args.w_av_only:
 			report.environment(wfn=wfn, lines=(
