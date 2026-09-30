@@ -2200,8 +2200,10 @@ def complete_parallel_transport(path, *, wfn, sym, mesh, nbands, bispinor,
           f"max_rel={metrics['max_rel']:.6e}")
     print(f"\nWrote parallel-transport data to {path}")
     report.heading("Parallel-transport validation")
-    report.emit(f"Links on bands 1-{int(nbands)}; velocity judged on "
-                f"bands 1-{int(metrics['band_stop'])} (the head)")
+    report.emit(f"Links on bands 1-{int(nbands)} along "
+                f"{int(metrics['link_directions'])} +/- step pairs "
+                "(common.parallel_transport.link_stencil); velocity judged "
+                f"on bands 1-{int(metrics['band_stop'])} (the head)")
     report.emit(f"Covariant DFT velocity: {verdict}; relative L2 on the "
                 "head's elements (transitions, Fermi-surface diagonal)="
                 f"{float(metrics['head_set_relative_l2']):.4e} (the SC head's "
