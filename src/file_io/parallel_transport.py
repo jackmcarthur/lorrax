@@ -87,8 +87,9 @@ def link_symmetry_reduction_applies(sym, kgrid, *, wfn=None) -> bool:
     has no stored image (``PT-EDGE-INCOMPLETE``; MoS2 3x3x1).  Then the
     links are streamed on the full BZ, as on bcc/fcc.
     """
-    if wfn is not None and not np.array_equal(
-            wfn_link_stencil(wfn).steps, np.eye(3, dtype=np.int32)):
+    if wfn is not None and not undersampled_link_axes(kgrid) \
+            and not np.array_equal(
+                wfn_link_stencil(wfn).steps, np.eye(3, dtype=np.int32)):
         # The IBZ edge stream stores the three elementary steps; a shell
         # with other steps (bcc, fcc, hexagonal) streams the full BZ.
         return False
@@ -787,8 +788,9 @@ def _write_link_stage(
                 del neighbor_xy, link, values
             del center_xy, center_x
 
-        singular_values_device = jnp.stack(singular_values).reshape(
-            nrk, nd, nb)
+        singular_values_device = (
+            jnp.stack(singular_values).reshape(nrk, nd, nb) if nd
+            else jnp.zeros((nrk, 0, nb), dtype=jnp.float64))
         singular_values_device = jax.lax.with_sharding_constraint(
             singular_values_device, NamedSharding(mesh, P()))
         io.write_slab(
