@@ -139,7 +139,7 @@ def sector_tau_factory(left, right, keys, meta, mesh_xy):
         raise ValueError('GATE sector_sigma_stream: parent/band extents differ')
     lefts, rights = lorentz_class_vertices(keys)
     grid = tuple(int(v) for v in meta.kgrid)
-    prep = make_kfft_klead(mesh_xy, grid, P(None, 'x', 'y'), kind='ifftn', norm='ortho')
+    prep = make_kfft_klead(mesh_xy, grid, P(None, None, None, 'x', 'y'), kind='ifftn', norm='ortho')
     doors = tuple(make_kconv_klead_unfold(mesh_xy, grid,
         plans[0].dirac_quarter_load_tables(0, g, None if plans[1] is plans[0] else plans[1]),
         store_rows=plans[0].parent_full_rows, norm='ortho',
@@ -166,7 +166,8 @@ def sector_tau_factory(left, right, keys, meta, mesh_xy):
         def spatial(xn, yr, xr, yn, energies, weight, reference, time, interactions):
             phases = _weighted_tau_phases(energies,1j*time,e_ref=reference,band_weight=weight)
             band_shape=(q,band_axis.padded,band_axis.padded)
-            result=jnp.zeros(band_shape,jnp.complex128)
+            result=jax.lax.with_sharding_constraint(jnp.zeros(band_shape,jnp.complex128),
+                NamedSharding(mesh_xy,P(None,'x','y')))
 
             def quarter(index,total):
                 h,g=index//2,index%2
