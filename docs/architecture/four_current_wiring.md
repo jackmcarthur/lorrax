@@ -276,7 +276,7 @@ returns the updated $V$, $W$ and a `StaticSlabPhotonHeadCompletion`
 |---|---|---|---|
 | cubature receipt | `vcoul.slab_minibz_photon_cubature` (exact Wigner–Seitz polygon, fixed 16/24/32 Duffy–Gauss ladder) | per order: `q_cart (n,3)`, `D_raw (n,4,4)` without $1/\Omega$, `sample_weight (n,)` f64 | host, write-locked |
 | `StaticPhotonHeadResponse` (sealed: only its producer can build one) | `static_gauge_response.build_static_photon_head_response`; validated by `require_static_photon_head_response` | `S_direct (2,2,4,4)`, `sigma_H (3,)` f64, `hall_source` str, `Y_x (2,4,N_packed)`, `Z_y (2,N_packed,4)` | `P()`, `P()`, –, `P(None,None,'x')`, `P(None,'y',None)` |
-| Hall artifact (optional) | `file_io.static_gauge_head.load_static_gauge_hall_artifact`; sole writer `write_static_gauge_hall_artifact`, run by `psp.get_dipole_mtxels --static-gauge-hall-only` | `sigma_H_cart (3,)` f64, schema 1 | replicated |
+| Hall artifact (optional) | `file_io.static_gauge_head.load_static_gauge_hall_artifact`; sole writer `write_static_gauge_hall_artifact`, run by `psp.get_dipole_mtxels --static-gauge-hall-only` | `sigma_H_cart (3,)` f64, schema 2 (velocity-operator stamps, checked against `gw.qsgw_head.head_hall_operator_stamps` by the loader and the response builder) | replicated |
 | literal-Γ vectors | `photon_layout.pack_photon_channel_vectors` | `(4, N_packed)` each | `g0_X` at `P(None,'x')`, `g0_Y` at `P(None,'y')` |
 
 Steps: fold $S$ through the body's $W[q=0]$ (`_fold_photon_q0_response`),
