@@ -334,6 +334,8 @@ def _coefficient_null_tail_max(ctilde, *, physical):
 
 def _basis_check(basis: GalerkinBasis, provenance: dict) -> None:
     physical, carrier = int(basis.rank_physical), int(basis.rank_carrier)
+    if physical != int(basis.qrcp_raw_rank):
+        raise ValueError("Galerkin physical rank must retain the complete QRCP result")
     if tuple(basis.band_range) != provenance["band_range"] \
             or tuple(basis.ctilde.shape[:2]) != (
                 provenance["nk"], provenance["nb"]) \
@@ -509,6 +511,9 @@ def read_galerkin_basis(path, *, wfn, meta, centroid_indices, band_range,
             raise GalerkinBasisMismatch(
                 "Galerkin basis provenance mismatch: " + ", ".join(mismatches))
         physical = stored["rank"]
+        if physical != stored["qrcp_raw_rank"]:
+            raise GalerkinBasisMismatch(
+                "Galerkin basis clipped the QRCP result; refit with the complete rank")
         from runtime.padding import padded_axis
         rank_axis = padded_axis(
             physical, mesh_xy, name="Galerkin restart rank carrier",
@@ -976,7 +981,7 @@ def fit_galerkin_basis(
                 f"minimum residual {psd_host[0]:.6e} at candidate "
                 f"{psd_host[1]}, step {psd_host[2]}, below "
                 f"-{pc_floor:.6e}")
-        rank_phys = min(rank_qr, 2500)
+        rank_phys = rank_qr
         structural_search = max_search >= min(state_dim, m_states)
         if rank_phys > 0.9 * max_search and not structural_search:
             raise ValueError(
@@ -996,8 +1001,7 @@ def fit_galerkin_basis(
         n_pad = rank - rank_phys
         log_fn(
             f"  [qrcp] raw rank={rank_qr}, delivered physical rank="
-            f"{rank_phys}" + (" (upstream safety cap 2500)"
-                              if rank_qr > 2500 else "")
+            f"{rank_phys}"
             + (f", +{n_pad} exact-null mesh pad -> {rank}" if n_pad else ""))
         log_fn(
             f"  [qrcp] pivot SHA256={pivot_hash}; first/last picked "
@@ -1912,4 +1916,3 @@ def plan_galerkin_stream(*, rank: int, nspinor: int, n_rtot: int,
         max_r_carrier=max_r_carrier,
         q_tile_local_bytes=q_tile_local_bytes,
     )
-
