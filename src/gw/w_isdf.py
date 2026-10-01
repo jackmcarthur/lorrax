@@ -226,13 +226,16 @@ def photon_response_passes(ledger, mesh_xy, families, *, n_parent, kgrid, n_band
     beside what stays whatever the pass count: the bank carry (``n_out``
     members over ``q_count`` rows), the faces, and their band-major copies
     the Green builds read (a second ``face_bytes``).  A pass's own bytes are
-    counted from its shapes (``greens_function_kernel.price_photon_pass``);
+    counted from its shapes (``greens_function_kernel.price_photon_pass``),
+    beside the face slices other pairs keep live across it
+    (``greens_function_kernel.photon_held_faces``);
     its rows are the pair's left-family local rows split evenly, the largest
     share priced.  Only ``memory_per_device_gb`` (``CapacityLedger``) and the
     shapes enter; no coefficient is fitted.  The counts and the counted peak
     (carry, faces and the largest pass) go to the stage-memory table.
     """
-    from .greens_function_kernel import has_antiunitary_rows, price_photon_pass
+    from .greens_function_kernel import (has_antiunitary_rows, photon_held_faces,
+                                         price_photon_pass)
     from .photon_layout import FAMILY_PAIRS, family_channels
     if _TEST_PHOTON_PASSES is not None:
         return tuple(int(n) for n in _TEST_PHOTON_PASSES)
@@ -243,13 +246,17 @@ def photon_response_passes(ledger, mesh_xy, families, *, n_parent, kgrid, n_band
     fixed = 16 * int(n_out) * int(q_count) * n * n // P + 2 * int(face_bytes)
     room = int(ledger.room_bytes_per_rank(())) - fixed
     passes, peaks = [], []
-    for L, R in FAMILY_PAIRS:
+    held = photon_held_faces(
+        FAMILY_PAIRS, {f: layout.carrier_extent(family_channels(f)[0]) for f in (0, 1)},
+        n_parent=n_parent, n_band=n_band, mesh=mesh_xy,
+        partner=any(has_antiunitary_rows(plan) for plan in families.plans))
+    for (L, R), kept in zip(FAMILY_PAIRS, held):
         cl = layout.carrier_extent(family_channels(L)[0])
         cr = layout.carrier_extent(family_channels(R)[0])
         local_rows = cl // side
 
-        def price(p, L=L, R=R, cr=cr, local_rows=local_rows):
-            return price_photon_pass(
+        def price(p, L=L, R=R, cr=cr, local_rows=local_rows, kept=kept):
+            return kept + price_photon_pass(
                 n_parent=n_parent, n_full=int(np.prod(kgrid)), n_band=n_band, q_count=q_count,
                 rows=side * -(-local_rows // p), right=cr,
                 n_ch=len(family_channels(L)) * len(family_channels(R)),

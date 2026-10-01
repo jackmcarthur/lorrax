@@ -101,10 +101,7 @@ def panel_matmul(a, b, *, mesh, panel_bytes, bounds=None, weights=None, partner=
         # live panels (the one multiplied and the one prefetched) never hold
         # a band-complete row or column.  A kl with no such divisor ends in
         # one narrower panel.
-        kl = k // px
-        cap = max(1, min(limit // (2 * px), kl // px if px > 1 else kl))
-        n_panel = -(-kl // cap)
-        width = -(-kl // n_panel)
+        width = _interleaved_width(k, px, limit)
         kernel = _interleaved_kernel(mesh, q, m, k, n, width, bounds is not None,
                                      weights is not None, bool(partner))
         args = (a, b)
@@ -122,6 +119,30 @@ def panel_matmul(a, b, *, mesh, panel_bytes, bounds=None, weights=None, partner=
     while common % width:
         width -= 1
     return _kernel(mesh, q, m, k, n, width, sample_axis)(a, b)
+
+
+def _interleaved_width(k, p, limit):
+    """Local columns per interleaved panel: p·width <= K/p, and two live panels within ``limit`` columns."""
+    kl = k // p
+    cap = max(1, min(limit // (2 * p), kl // p if p > 1 else kl))
+    n_panel = -(-kl // cap)
+    return -(-kl // n_panel)
+
+
+def panel_matmul_extra_tiles(q, m, k, n, *, mesh, panel_bytes, itemsize=16):
+    """Output tiles a square-mesh :func:`panel_matmul` holds beside its running sum, per product.
+
+    Two (the panel product and the new sum) when its interleaved loop runs at
+    least three full panels: the loop is a ``lax.scan`` that carries the sum,
+    and XLA does not fold ``c + a @ b`` into the GEMM there.  Zero otherwise:
+    the straight-line panels' adds fold into the GEMM's accumulate (the XLA
+    buffer assignments of runs/DEV/700_photpass_20260930/aot).
+    """
+    px = int(mesh.shape['x'])
+    limit = int(panel_bytes) // (int(itemsize) * int(q) * (int(m) // px + int(n) // int(mesh.shape['y'])))
+    if limit < 1:
+        raise MemoryError('panel_matmul panel budget cannot hold one contraction column')
+    return 2 if (int(k) // px) // _interleaved_width(int(k), px, limit) >= 3 else 0
 
 
 def _panel_contraction(mesh):

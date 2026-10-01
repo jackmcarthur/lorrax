@@ -565,10 +565,13 @@ def price_photon_pass(*, n_parent, n_full, n_band, q_count, rows, right, n_ch, p
     - mode 11's run-time scratch (:func:`chi0_door_scratch`; not in ``memory_analysis``);
     - and the larger of the door phase: the quadrant's lower and upper parent Greens with
       their partners ``2(1+a)·T`` (:func:`_green_terms`, ns = 2 per Dirac half), and the
-      build in flight: its panel product beside the running sum (``T``), the Green and
-      partner builds' SUMMA panels ``(1+a)·M``, and its weighted half-spinor faces
-      ``16·n_parent·2·N_b·(r + c)/P``; or the transform phase: one plane's transform and
-      its two selected-row blocks, ``16·(N_k + 2q)·r·c/P``.
+      build in flight: the tiles its SUMMA holds beside the running sum
+      (``distrib_la.panel_matmul_extra_tiles``: 2 when its panel loop is a scan, else 0),
+      the Green and partner builds' panels ``(1+a)·M``, and the half-spinor faces the
+      quadrants read, both Dirac halves of the left rows and the right carrier
+      ``2·16·n_parent·2·N_b·(r + c)/P`` (sliced from ψ alone, so one copy of each serves
+      all four quadrants); or the transform phase: one plane's transform and its two
+      selected-row blocks, ``16·(N_k + 2q)·r·c/P``.
 
     The bank carry and the faces stay whatever the pass count, so they are not here.
     """
@@ -578,9 +581,41 @@ def price_photon_pass(*, n_parent, n_full, n_band, q_count, rows, right, n_ch, p
     a = float(bool(partner))
     plane = 16.0 * int(rows) * int(right) / P
     planes = (2 if int(passes) > 1 else 1) * int(n_ch) * int(n_full) * plane
-    faces = 16.0 * int(n_parent) * 2 * int(n_band) * (int(rows) + int(right)) / P
-    door = (2.0 * (1.0 + a) + 1.0) * tile + (1.0 + a) * panels + faces
+    faces = 2 * 16.0 * int(n_parent) * 2 * int(n_band) * (int(rows) + int(right)) / P
+    from distrib_la import panel_matmul_extra_tiles
+    m, n = 2 * int(rows), 2 * int(right)
+    extra = panel_matmul_extra_tiles(
+        int(n_parent), m, int(n_band), n, mesh=mesh,
+        panel_bytes=green_panel_bytes(n_rows=int(n_parent), m=m, n=n, mesh=mesh))
+    door = (2.0 * (1.0 + a) + extra) * tile + (1.0 + a) * panels + faces
     transform = (int(n_full) + 2 * int(q_count)) * plane
     scratch = chi0_door_scratch(kgrid=kgrid, n_parent=n_parent, n_rmu=rows, ns=2,
                                 mesh=mesh, n_right=right)
     return planes + scratch + max(door, transform)
+
+
+def photon_held_faces(pairs, carriers, *, n_parent, n_band, partner, mesh):
+    """Per family pair, the face operands other pairs hold live across it, bytes per rank.
+
+    ``pairs`` are the stream's family pairs in order, ``carriers[f]`` family ``f``'s
+    centroid carrier, ``partner`` whether the plans have an antiunitary row.  The
+    Green builds' operands are cut from ψ alone (both Dirac halves of a family's left
+    or right face, ``F_f = 16·n_parent·4·N_b·c_f/P``: the slices, the Green builds'
+    conjugated copies and, with an antiunitary row, the partner builds' copies,
+    ``(2 + a)·F_f``), and one copy serves every pair that reads them, so operands read
+    by an earlier and a later pair stay live through the pairs between them.  A pair
+    that reads them itself already counts its own (:func:`price_photon_pass`).
+    Buffer assignment: the CT pass of CC(2 passes), CT, TC holds six
+    ``c128[1062,90,600]`` charge right operands (runs/DEV/700_photpass_20260930/aot).
+    """
+    P = int(mesh.shape['x']) * int(mesh.shape['y'])
+    copies = 2.0 + float(bool(partner))
+    held = []
+    for i, own in enumerate(pairs):
+        extra = 0.0
+        for side in (0, 1):
+            fams = {p[side] for p in pairs[:i]} & {p[side] for p in pairs[i + 1:]}
+            extra += sum(copies * 16.0 * int(n_parent) * 4 * int(n_band) * int(carriers[f]) / P
+                         for f in fams if f != own[side])
+        held.append(extra)
+    return held
