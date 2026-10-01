@@ -1344,6 +1344,20 @@ def _stream_executable(wfns, meta, mesh_xy, support, *, q_ids, n_outputs, ordere
     return compiled
 
 
+def _direct_passes(wfns, meta, mesh_xy, q_count):
+    """The charge direct stream's row passes (``w_isdf._direct_pass_plan``), or ``None``
+    when it does not run on mathdx mode 11 from raw parents."""
+    from .w_isdf import _chi_door_serves, _direct_pass_plan
+    import minimax
+    parent = wfns.green_parent
+    kgrid, ns = (meta.nkx, meta.nky, meta.nkz), int(meta.nspinor)
+    if parent is None or not _chi_door_serves(mesh_xy, kgrid, ns):
+        return None
+    return _direct_pass_plan(mesh_xy, kgrid, parent.plan, n_rmu=meta.mu_basis.n_packed, ns=ns,
+                             n_band=int(wfns.slices.nb_full), q_count=q_count,
+                             n_nodes=minimax.RESPONSE_NODE_CAPACITY)
+
+
 def _stream_scratch(wfns, meta, mesh_xy, vertex):
     """Run-time scratch of the charge stream outside its compiled temporaries:
     mathdx mode 11's split arm on a raw-parent plan (w_isdf direct stream)."""
@@ -1693,6 +1707,13 @@ def produce_sample_bank(wfns, meta, config, *, mesh_xy, sym, sample_plan, bank_i
         del raw_group
     progress.finish()
     if jax.process_index() == 0:
+        passes = _direct_passes(wfns, meta, mesh_xy, len(response_rows)) if vertex is None else None
+        layout = ("" if passes is None else
+                  f", {len(passes.passes)} row pass(es) of <= {max(r for _, r in passes.passes)} "
+                  f"local rows, {passes.chunk} node(s) per accumulate")
+        print_fn(f"Response quadrature: chi build {receipt['seconds'].get('direct_dispatch', 0.):.2f} s "
+                 f"({len(rules['groups'])} group(s), {receipt['correlation_count']} node evaluations"
+                 f"{layout}); bank write {receipt['seconds'].get('io', 0.):.2f} s", flush=True)
         print_fn("Response quadrature: seconds " + " ".join(
             f"{key}={value:.3f}" for key, value in receipt["seconds"].items()), flush=True)
     del roots
