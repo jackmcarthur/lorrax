@@ -182,25 +182,58 @@ def _charge_pass_doors(mesh_xy, kgrid, plan, passes):
 
     One pass covering every row reads the plan's own tables; a pass of fewer
     rows reads them cut to its orbit-closed rows (``subtile_stream.pass_tables``).
-    Returns ``(doors, tables)``, one per pass, cached per (mesh, grid, plan, passes).
+    Only the left tables (``lsrc``, ``mph``) differ between passes: the per-k and
+    right tables are placed once and shared, so the passes together hold one
+    plan's tables.  Returns ``(doors, arrays)``: the doors, one per pass, and
+    the placed arrays ``(row, trs, rsrc, nph, spin, spin_r, lsrc_0, mph_0,
+    lsrc_1, mph_1, ...)`` (:func:`_pass_load`), cached per (mesh, grid, plan,
+    passes).
     """
     key = ("passes", mesh_xy, tuple(int(v) for v in kgrid), plan, tuple(passes))
     hit = _CHARGE_DOORS.get(key)
     if hit is None:
         from common.fft_helpers import make_kconv_chi_unfold
-        from symmetry_maps import device_load_tables
+        from symmetry_maps import DEVICE_LOAD_SPECS
         base = plan.unfold_load_tables()
         side, ns = int(mesh_xy.shape["x"]), int(np.asarray(base.spin).shape[-1])
         local_rows = int(np.asarray(base.lsrc).shape[1]) // (side * ns)
         cut = [base if (x0, xr) == (0, local_rows) else pass_tables(base, x0, xr, side, ns)
                for x0, xr in passes]
+
+        def put(a, field):
+            return device_put_process_local(np.asarray(a), NamedSharding(mesh_xy, DEVICE_LOAD_SPECS[field]))
+        spin_r = base.spin if base.spin_r is None else base.spin_r
+        shared = (put(base.row, 0), put(base.trs, 1), put(base.rsrc, 3), put(base.nph, 5),
+                  put(base.spin, 6), put(spin_r, 7))
+        left = tuple(a for t in cut for a in (put(t.lsrc, 2), put(t.mph, 4)))
         hit = (tuple(make_kconv_chi_unfold(mesh_xy, kgrid, t, n_out=1, complete=False, norm="ortho")
-                     for t in cut),
-               tuple(tuple(device_load_tables(t, mesh_xy)) for t in cut))
+                     for t in cut), shared + left)
         while len(_CHARGE_DOORS) >= 2:
             _CHARGE_DOORS.pop(next(iter(_CHARGE_DOORS)))
         _CHARGE_DOORS[key] = hit
     return hit
+
+
+def _pass_load(arrays, p):
+    """Pass ``p``'s ``symmetry_maps.DeviceLoadTables`` from :func:`_charge_pass_doors`' arrays."""
+    from symmetry_maps import DeviceLoadTables
+    row, trs, rsrc, nph, spin, spin_r = arrays[:6]
+    return DeviceLoadTables(row, trs, arrays[6 + 2 * p], rsrc, arrays[7 + 2 * p], nph, spin, spin_r)
+
+
+def charge_door_table_bytes():
+    """Per-rank bytes of every placed charge door table held for reuse (``_CHARGE_DOORS``).
+
+    They stay on the devices between dispatches, outside any executable's
+    buffers, so the response bank reserves them as a live stage.
+    """
+    seen, total = set(), 0
+    for _, arrays in _CHARGE_DOORS.values():
+        for a in arrays:
+            if id(a) not in seen:
+                seen.add(id(a))
+                total += int(a.addressable_shards[0].data.nbytes)
+    return total
 
 
 _PASS_PLANS: dict = {}
@@ -1102,14 +1135,14 @@ def _get_chi_fractional_contour_kernel_face(
         subtile = _direct_pass_plan(mesh_xy, grid, k_unfold_plan, n_rmu=n_rmu, ns=ns,
                                     n_band=nb_full, q_count=len(selected_q),
                                     n_nodes=minimax.RESPONSE_NODE_CAPACITY)
-        pass_doors, pass_loads = _charge_pass_doors(mesh_xy, grid, k_unfold_plan, subtile.passes)
+        pass_doors, pass_arrays = _charge_pass_doors(mesh_xy, grid, k_unfold_plan, subtile.passes)
         pass_gemms = tuple(gemm_plan(mesh_xy, m=px * xr * ns, k=nb_full, n=n_rmu * ns,
                                      nq=nk_shape, dtype=jnp.complex128, layout="axis",
                                      enable_active_range=band_ranges is not None)
                            for _, xr in subtile.passes)
         pass_active = tuple((tuple(g.prepare_active_range(*bounds) for bounds in band_ranges)
                              if band_ranges is not None else (None, None)) for g in pass_gemms)
-        chi_tables = tuple(a for load in pass_loads for a in load)
+        chi_tables = pass_arrays
         if jax.process_index() == 0:
             print(f"Response direct stream: {len(subtile.passes)} row pass(es) of "
                   f"{max(xr for _, xr in subtile.passes)} local rows, {subtile.chunk} node(s) "
@@ -1176,9 +1209,7 @@ def _get_chi_fractional_contour_kernel_face(
             door_loads = {key: DeviceLoadTables(*(tables[i] for i in slots))
                           for key, slots in door_index.items()}
         elif subtile is not None:
-            n_t = len(tables) // len(subtile.passes)
-            chi_load = tuple(DeviceLoadTables(*tables[n_t * p:n_t * (p + 1)])
-                             for p in range(len(subtile.passes)))
+            chi_load = tuple(_pass_load(tables, p) for p in range(len(subtile.passes)))
         elif chi_tables is not None:
             chi_load = tables
         if bank_carry:
