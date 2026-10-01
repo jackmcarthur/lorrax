@@ -1108,12 +1108,15 @@ def _get_chi_fractional_contour_kernel_face(
                                     n_band=nb_full, q_count=len(selected_q),
                                     n_nodes=minimax.RESPONSE_NODE_CAPACITY)
         pass_doors, pass_loads = _charge_pass_doors(mesh_xy, grid, k_unfold_plan, subtile.passes)
+        # A one-pass program (``stream_pass``) plans only its own pass's GEMMs.
         pass_gemms = tuple(gemm_plan(mesh_xy, m=px * xr * ns, k=nb_full, n=n_rmu * ns,
                                      nq=nk_shape, dtype=jnp.complex128, layout="axis",
                                      enable_active_range=band_ranges is not None)
-                           for _, xr in subtile.passes)
+                           if stream_pass is None or p == int(stream_pass) else None
+                           for p, (_, xr) in enumerate(subtile.passes))
         pass_active = tuple((tuple(g.prepare_active_range(*bounds) for bounds in band_ranges)
-                             if band_ranges is not None else (None, None)) for g in pass_gemms)
+                             if band_ranges is not None and g is not None else (None, None))
+                            for g in pass_gemms)
         chi_tables = tuple(a for load in pass_loads for a in load)
         if jax.process_index() == 0 and not stream_pass:
             print(f"Response direct stream: {len(subtile.passes)} row pass(es) of "
