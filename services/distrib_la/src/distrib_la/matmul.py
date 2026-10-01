@@ -5,7 +5,9 @@ operation: cuBLASMp next to
 cuSOLVERMp, PBLAS ``pdgemm``/``pzgemm`` next to ScaLAPACK, or
 ``slate::multiply`` next to SLATE.  Unlike :func:`distrib_la.plan`,
 ``backend='auto'`` here selects that platform provider; it does not select a
-native JAX floor.
+native JAX floor.  On a CPU mesh that provider is XLA's dot on gathered
+faces (:func:`distrib_la.gemm_plan`'s CPU face plan); no ScaLAPACK GEMM
+handler is built.
 
 The default ``batched_route='batch_reshard'`` route performs x-then-y staged
 face-to-batch exchanges for A, B, and C, runs local ``jnp.matmul``, then
@@ -46,6 +48,10 @@ _TARGETS = {
 _OP_CODE = {"N": 0, "T": 1, "C": 2}
 _CUBLASMP_CACHE: dict = {}
 _RESHARD_CACHE: dict = {}
+_XLA_CACHE: dict = {}
+#: The provider ``auto``/``distributed`` resolve to on a CPU mesh: XLA's dot
+#: on gathered faces, no handler.
+CPU_XLA = "xla"
 
 
 def contract_faces(b_X, b_Y, weights, start, stop, *, mesh: Mesh,
@@ -185,8 +191,9 @@ def resolve_matmul_backend(requested: str, mesh: Mesh, *,
     """Resolve a public request to an actual GEMM provider.
 
     ``cusolvermp`` maps to its matrix-multiply sibling ``cublasmp``.
-    ``auto`` and ``distributed`` select cuBLASMp on CUDA and ScaLAPACK on
-    CPU, and SLATE on ROCm.  Explicit requests never demote.  ``off`` is
+    ``auto`` and ``distributed`` select cuBLASMp on CUDA, XLA's dot on
+    gathered faces (:data:`CPU_XLA`, no handler to probe) on CPU, and SLATE
+    on ROCm.  Explicit requests never demote.  ``off`` is
     legal only with the local ``batch_reshard`` route, where no provider call
     is made. Every other result has already passed platform,
     provider-specific mesh geometry (including cuBLASMp/SLATE square grids),
@@ -218,7 +225,7 @@ def resolve_matmul_backend(requested: str, mesh: Mesh, *,
         if platform == "CUDA":
             provider = "cublasmp"
         elif platform == "cpu":
-            provider = "scalapack"
+            return CPU_XLA
         elif platform == "rocm":
             provider = "slate"
         else:
@@ -340,8 +347,33 @@ def _cublasmp(mesh, A, B, C, *, alpha: complex, beta: complex,
     return fn(A, B, C)
 
 
+def _xla_gathered(mesh, A, B, C, *, alpha, beta, transa, transb):
+    """The CPU provider: XLA's dot on gathered faces, gemm_plan's CPU face plan.
+
+    Transposes move as on cuBLASMp (a distributed endpoint transpose), then
+    each rank gathers A over 'y' and B over 'x' and contracts its D tile."""
+    from distrib_la.matmul_plan import _axis_matmul, _face_gathered
+    tile = NamedSharding(mesh, P(None, 'x', 'y'))
+    if transa != 'N':
+        A = _transpose_kernel(transa, tile)(A)
+    if transb != 'N':
+        B = _transpose_kernel(transb, tile)(B)
+    key = (mesh_key(mesh), alpha, beta)
+    fn = _XLA_CACHE.get(key)
+    if fn is None:
+        body = _face_gathered(partial(_axis_matmul, alpha=complex(alpha), beta=complex(beta)))
+        fn = _XLA_CACHE[key] = jax.jit(shard_map(
+            body, mesh=mesh, in_specs=(P(None, 'x', 'y'),) * 3,
+            out_specs=P(None, 'x', 'y'), check_vma=False))
+    return fn(A, B, C)
+
+
 def _provider_matmul(provider, mesh, A, B, C, *, alpha, beta,
                      transa, transb):
+    if provider == CPU_XLA:
+        return _xla_gathered(
+            mesh, A, B, C, alpha=alpha, beta=beta,
+            transa=transa, transb=transb)
     if provider == "cublasmp":
         return _cublasmp(
             mesh, A, B, C, alpha=alpha, beta=beta,
@@ -457,8 +489,8 @@ def matmul(
         transpose).
     backend
         A name in :data:`MATMUL_BACKEND_CHOICES`. ``'auto'`` and
-        ``'distributed'`` choose cuBLASMp on CUDA, ScaLAPACK/PBLAS on CPU,
-        and SLATE on ROCm. ``'cusolvermp'`` is an alias for its cuBLASMp
+        ``'distributed'`` choose cuBLASMp on CUDA, XLA's dot on gathered
+        faces on CPU, and SLATE on ROCm. ``'cusolvermp'`` is an alias for its cuBLASMp
         sibling. ``'off'`` is provider-free and requires the staged route.
     batched_route
         ``'batch_reshard'`` (the default) pads a ragged leading batch with
@@ -537,7 +569,7 @@ def matmul(
         if int(x.shape[-2]) % px or int(x.shape[-1]) % py:
             raise ValueError(
                 f"matmul {name} face must tile {px}x{py}; got {x.shape[-2:]}")
-    if route == ROUTE_BATCH_RESHARD:
+    if route == ROUTE_BATCH_RESHARD or provider == CPU_XLA:
         # CPU/MPI may only create first-use collective communicators from
         # MPI's main thread, never from the XLA worker that runs shard_map.
         from distrib_la._collectives import warm_mesh_cliques

@@ -978,8 +978,9 @@ def gemm_plan(
         handler compiles for.
     backend
         A name from ``distrib_la.MATMUL_BACKEND_CHOICES`` other than
-        ``'off'``.  On a CPU mesh ``'auto'``/``'distributed'`` build the
-        gathered face plan (module docstring); elsewhere they resolve to the
+        ``'off'``.  On a CPU mesh ``'auto'``/``'distributed'`` (and
+        ``'local'``, the backend that plan reports) build the gathered face
+        plan (module docstring); elsewhere they resolve to the
         platform's provider exactly as ``distrib_la.matmul`` does.  Only
         ``cublasmp``/``cusolvermp`` have a warmed provider kernel here; an
         explicit ``scalapack``/``slate`` refuses BY NAME.
@@ -1030,7 +1031,9 @@ def gemm_plan(
                 f"gemm_plan: {label}={extent} does not tile the "
                 f"{px}x{py} mesh (needs divisor {divisor})")
 
-    if requested.strip().lower() in ("auto", "distributed") and mesh_platform(mesh) == "cpu":
+    # "local" is the backend a CPU face plan reports, so a plan re-planned from
+    # another plan's backend (the Dirac quarters from the scalar Gram's) is the same plan.
+    if requested.strip().lower() in ("auto", "distributed", "local") and mesh_platform(mesh) == "cpu":
         return _local_plan(mesh, m=m, k=k, n=n, nq=nq, dtype=dtype,
                            alpha=alpha_c, beta=beta_c, reduction_axis=None,
                            out_spec=None,

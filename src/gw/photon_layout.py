@@ -960,7 +960,8 @@ def accumulate_photon_block(acc, rows, weights, layout, A, B, mesh_xy, x_rows=No
     def local(acc, rows, weights):
         valid = jnp.stack((jnp.clip(la - jax.lax.axis_index('x') * wa - x0, 0, xr),
                            jnp.clip(lb - jax.lax.axis_index('y') * wb, 0, wb))).astype(jnp.int32)
-        return contour_block_accumulate_local(acc, rows, weights, valid, m0=m0, n0=n0)
+        return contour_block_accumulate_local(acc, rows, weights, valid, m0=m0, n0=n0,
+                                              mesh=mesh_xy)
     spec = P(None, None, 'x', 'y')
     return shard_map(local, mesh=mesh_xy, in_specs=(spec, spec, P()), out_specs=spec,
                      check_vma=False)(acc, rows, weights)

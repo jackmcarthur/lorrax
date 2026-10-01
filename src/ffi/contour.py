@@ -2,10 +2,11 @@
 
 The CUDA handler ``lorrax_contour_accumulate`` (``cpp/response/
 contour_accumulate*``) accumulates one shared contour correlation into many
-outputs on each device's tile.  CUDA complex128 only, with no host arm and no
-fallback: a provider without the handler refuses here (``GATE ffi-handler``)
-and at startup (``ffi_loader.require_cuda_handlers``).  The response bank's
-Laplace/KMS streams (``gw.w_isdf``) are its caller.
+outputs on each device's tile.  On CUDA a provider without the handler refuses
+here (``GATE ffi-handler``) and at startup (``ffi_loader.require_cuda_handlers``).
+On a host mesh both forms are the same sum written in XLA (no host handler is
+built).  The response bank's Laplace/KMS streams (``gw.w_isdf``) and the
+four-current packed carry (``gw.photon_layout``) are its callers.
 """
 from functools import partial, lru_cache
 
@@ -15,6 +16,7 @@ import jax.numpy as jnp
 from jax.sharding import PartitionSpec as P
 
 from ffi.common.ffi_loader import probe_target
+from ffi.gate import mesh_ffi_platform
 
 TARGET = "lorrax_contour_accumulate"
 BLOCK_TARGET = "lorrax_contour_accumulate_block"
@@ -29,6 +31,11 @@ def _require(target=TARGET):
             f"GATE ffi-handler: got no usable {target} ({why}); want the CUDA contour "
             "accumulator; fix: use the sealed bundle, or rebuild both legs from this tree "
             "and pin them (LORRAX_FFI_SO, LORRAX_FFI_HOST_SO).")
+
+
+def _host(mesh):
+    """True off CUDA, where the accumulators are XLA."""
+    return mesh_ffi_platform(mesh) != "CUDA"
 
 
 def contour_accumulator(mesh):
@@ -49,9 +56,12 @@ def contour_accumulator(mesh):
         the Keldysh difference -i(A-conj(A)) once, before any output loop.
         The native handler allocates zero workspace and aliases its output
         to the accumulator. XLA may copy a non-donated input; account for
-        that in compiled memory. CUDA complex128 only; no collectives.
+        that in compiled memory. complex128 only; no collectives. On a host
+        mesh the same sum in XLA.
     """
-    _require()
+    host = _host(mesh)
+    if not host:
+        _require()
 
     @partial(jax.shard_map, mesh=mesh,
              in_specs=(P(None, None, 'x', 'y'), P(None, 'x', 'y'), P()),
@@ -65,6 +75,8 @@ def contour_accumulator(mesh):
                 or accumulator.shape != (projection.shape[0], *contribution.shape)
                 or any(n < 1 for n in accumulator.shape)):
             raise ValueError("contour accumulator shape mismatch")
+        if host:
+            return accumulator + projection[:, None, None, None] * contribution[None]
         return jax.ffi.ffi_call(
             TARGET,
             jax.ShapeDtypeStruct(accumulator.shape, accumulator.dtype),
@@ -75,7 +87,8 @@ def contour_accumulator(mesh):
     return accumulate
 
 
-def contour_block_accumulate_local(accumulator, contribution, projection, valid, *, m0, n0):
+def contour_block_accumulate_local(accumulator, contribution, projection, valid, *, m0, n0,
+                                   mesh):
     """One device tile: ``A[o, q, m0+m, n0+n] += sum_s projection[s,o] contribution[s,q,m,n]``.
 
     For code already inside ``shard_map``.  ``accumulator`` ``[output,q,M,N]``
@@ -84,11 +97,23 @@ def contour_block_accumulate_local(accumulator, contribution, projection, valid,
     block's rows and columns that are not padding (the rest are not touched).
     The terms add in order with the full accumulator's rounding, so terms
     ``(a, b)`` give the bytes of two :func:`contour_accumulator` calls.
-    CUDA complex128 only; no collectives.
+    ``mesh`` (the enclosing ``shard_map``'s) picks the CUDA handler or, on a
+    host mesh, the same sum in XLA.  complex128 only; no collectives.
     """
-    _require(BLOCK_TARGET)
     if any(a.dtype != jnp.complex128 for a in (accumulator, contribution, projection)):
         raise TypeError("contour block accumulator requires complex128 operands")
+    if _host(mesh):
+        bm, bn = contribution.shape[2:]
+        block = jax.lax.dynamic_slice(accumulator, (0, 0, m0, n0),
+                                      (*accumulator.shape[:2], bm, bn))
+        new = block
+        for s in range(contribution.shape[0]):
+            new = new + projection[s][:, None, None, None] * contribution[s][None]
+        live = ((jnp.arange(bm)[:, None] < valid[0])
+                & (jnp.arange(bn)[None, :] < valid[1]))
+        return jax.lax.dynamic_update_slice(
+            accumulator, jnp.where(live, new, block), (0, 0, m0, n0))
+    _require(BLOCK_TARGET)
     return jax.ffi.ffi_call(
         BLOCK_TARGET, jax.ShapeDtypeStruct(accumulator.shape, accumulator.dtype),
         input_output_aliases={0: 0}, vmap_method="sequential",

@@ -66,8 +66,9 @@ caller shares its Z build but retains three ordered solve calls, not a fused
 three-channel cuSOLVERMp operation.
 
 Top-level `matmul` has deliberately different default routing from `plan`.
-`matmul(..., backend='auto')` selects cuBLASMp on CUDA, PBLAS
-`pdgemm`/`pzgemm` on CPU, or `slate::multiply` on ROCm; `cusolvermp` is an
+`matmul(..., backend='auto')` selects cuBLASMp on CUDA, XLA's dot on
+gathered faces on CPU (no PBLAS GEMM handler is built), or `slate::multiply`
+on ROCm; `cusolvermp` is an
 accepted alias for its cuBLASMp sibling. Rank-2 inputs and outputs use
 `P('x','y')`, while rank-3 stacks use `P(None,'x','y')`. The explicit staged
 route pads only a ragged leading batch with zero GEMM rows. It refuses matrix

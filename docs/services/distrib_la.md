@@ -238,21 +238,22 @@ Every physical input face and the output face must tile the mesh
 (rows % Px, columns % Py); these checks run before placement.
 
 **Provider route** (`batched_route='auto'`): `auto`/`distributed` resolve to
-cuBLASMp on CUDA, PBLAS on CPU, SLATE on ROCm; `cusolvermp` is an alias for
-`cublasmp`; explicit names never demote.
+cuBLASMp on CUDA, XLA's dot on gathered faces on CPU (`gemm_plan`'s CPU face
+plan: A gathered over `'y'`, B over `'x'`), SLATE on ROCm; `cusolvermp` is an
+alias for `cublasmp`; explicit names never demote.
 
 | request | CUDA | CPU | ROCm |
 |---|---|---|---|
-| `auto`, `distributed` | cuBLASMp | PBLAS | SLATE |
+| `auto`, `distributed` | cuBLASMp | XLA gathered dot | SLATE |
 | `cublasmp`, `cusolvermp` | cuBLASMp | refuse | refuse |
 | `scalapack` | refuse | PBLAS | refuse |
 | `slate` | SLATE | SLATE | SLATE |
 | `off` | staged route only | staged route only | staged route only |
 
 Only `lorrax_cublasmp_batched_gemm` has a C++ handler. The PBLAS and SLATE
-GEMM targets are declared in the loader but not built, so on CPU any provider
-matmul refuses at the capability probe; use `backend='off'` with the staged
-route there. Provider calls need float64 or complex128, an exact 2-D
+GEMM targets are declared in the loader but not built, so an explicit
+`scalapack` or `slate` matmul refuses at the capability probe; on CPU
+`auto`/`distributed` need no handler. Provider calls need float64 or complex128, an exact 2-D
 `('x','y')` mesh with y-minor process order, one JAX process per cell, and
 exact face tiling; cuBLASMp and SLATE also need a square mesh. The provider
 aliases `C` to the output. On cuBLASMp, `T`/`C` operation codes are served by

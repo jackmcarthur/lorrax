@@ -46,8 +46,8 @@ polar_factor(A, mesh, ...) -> (L, s)
 backend='auto', batched_route='batch_reshard')``
     Distributed rank-2 or batched rank-3 GEMM in the same face layout as a
     plan. The default performs x/y face-to-batch exchanges, local GEMM, then
-    y/x inverse exchanges; explicit ``auto`` dispatches to cuBLASMp, PBLAS or
-    SLATE. ``backend='off'`` makes the staged route provider-free.
+    y/x inverse exchanges; explicit ``auto`` dispatches to cuBLASMp, XLA's
+    dot on gathered faces (CPU) or SLATE. ``backend='off'`` makes the staged route provider-free.
 ``gemm_plan(mesh, *, m, k, n, nq, dtype, backend='auto', alpha=1, beta=0,
 layout='face', enable_active_range=False) -> GemmPlan``
     Resolve, probe, warm and COMPILE one N,N GEMM shape ONCE, for a caller

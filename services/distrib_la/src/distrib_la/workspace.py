@@ -5,6 +5,8 @@ import operator
 
 import numpy as np
 
+from distrib_la.resolve import mesh_platform
+
 
 def _shapes(shapes):
     try:
@@ -50,6 +52,14 @@ def _local_gemm_temp(shapes, dtype, device):
     return int(memory.temp_size_in_bytes)
 
 
+# Off CUDA every dense route is an XLA program (host LAPACK eigh, XLA dot),
+# whose scratch the compiler allocates and counts; no vendor workspace sits
+# outside it, so the query answers zero device bytes.
+_XLA_MANAGED = dict(device_bytes=0, host_bytes=0, vendor_device_bytes=None,
+                    dynamic_xla_scratch_bytes=0, local=True,
+                    formula='non-CUDA mesh: XLA-managed scratch', provider='XLA')
+
+
 def _workspace_details(plan, op, shapes, dtype):
     """Internal receipt producer; the public contract returns device bytes."""
     import jax
@@ -62,8 +72,8 @@ def _workspace_details(plan, op, shapes, dtype):
     dtype = np.dtype(dtype)
     if dtype not in (np.dtype('float64'), np.dtype('complex128')):
         raise TypeError('workspace query supports float64 and complex128')
-    if any(d.platform != 'gpu' for d in plan.mesh.devices.flat):
-        raise ValueError('workspace query currently supports CUDA plans only')
+    if mesh_platform(plan.mesh) != 'CUDA':
+        return _XLA_MANAGED
     px, py = int(plan.mesh.shape['x']), int(plan.mesh.shape['y'])
     local = isinstance(plan, Plan) and (plan.is_native or (
         (op != 'eigh' or len(shapes[0]) == 3)
@@ -149,7 +159,7 @@ def matmul_workspace_bytes_per_rank(mesh, shapes, dtype, *, backend='auto',
 
     ``shapes`` are effective N,N rank-2/3 operand shapes after any endpoint
     transpose; ``dtype`` is float64/complex128. Returns device workspace
-    bytes per rank. Operand transpose staging and output storage are not
+    bytes per rank (0 on a non-CUDA mesh: XLA-managed). Operand transpose staging and output storage are not
     workspace and must be admitted separately by the caller.
     """
     from distrib_la.matmul import resolve_matmul_backend
@@ -158,8 +168,8 @@ def matmul_workspace_bytes_per_rank(mesh, shapes, dtype, *, backend='auto',
     dtype = np.dtype(dtype)
     if dtype not in (np.dtype('float64'), np.dtype('complex128')):
         raise TypeError('workspace query supports float64 and complex128')
-    if any(d.platform != 'gpu' for d in mesh.devices.flat):
-        raise ValueError('workspace query currently supports CUDA plans only')
+    if mesh_platform(mesh) != 'CUDA':
+        return 0
     if (len(shapes) != 2 or len(shapes[0]) not in (2, 3)
             or len(shapes[1]) != len(shapes[0])
             or shapes[0][:-2] != shapes[1][:-2]
@@ -236,7 +246,7 @@ def fits_local(plan, op, shapes, dtype, budget_bytes) -> bool:
 
 
 def workspace_bytes_per_rank(plan, op, shapes, dtype) -> int:
-    """Return a CUDA dense-plan device workspace bound without solving.
+    """Return a dense-plan device workspace bound without solving (0 off CUDA).
 
     Parameters
     ----------

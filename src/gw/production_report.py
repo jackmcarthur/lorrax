@@ -965,7 +965,8 @@ class GWProductionReport:
             mine = [pr for pr, node, _ in priced if band.owns(node)]
             if mine:
                 price = max(pr["bytes"] for pr in mine)
-                gamma = f"{np.nanmax(peak) / price:10.2f}" if price > 0 else f"{'–':>10}"
+                gamma = (f"{np.nanmax(peak) / price:10.2f}" if price > 0 and peak is not None
+                         else f"{'–':>10}")
                 tail = f"{price / 1e9:9.2f}  {gamma}"
             else:
                 tail = f"{'–':>9}  no planner"
