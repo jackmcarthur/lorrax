@@ -1162,6 +1162,12 @@ def _gather_group_rules(requests, build):
     return [rule for _, rules, _ in rows for rule in rules]
 
 
+#: The energy pad (eV) of a held SC response plan: the rule interval and the
+#: compiled band bounds of the direct stream are rebuilt only when the support
+#: moves past it.
+RESPONSE_HOLD_PAD_EV = 4.0
+
+
 def response_support(wfns, meta, sample_plan, receipt, *, print_fn=print):
     """Occupation weights, transition interval, envelope and band support."""
     energy, f, u, _, _ = response_weights(wfns, meta)
@@ -1176,15 +1182,23 @@ def response_support(wfns, meta, sample_plan, receipt, *, print_fn=print):
     # batched GEMM on the direct stream's band-complete ψ rows and remain safe
     # when a complex-time phase underflows.
     band_ranges = tuple((int(lo.min()), int(hi.max())) for lo, hi in zip(lo_band, hi_band))
-    # Held across SC maps and widened only when the support leaves them: the
-    # bounds are compiled into the stream, and the bands outside the support
-    # carry exact-zero weight, so a held wider interval is the same product.
+    # SC: the bounds are compiled into the stream, so they are held across maps
+    # with the response rule's own energy pad and widened only when the support
+    # leaves them. Bands outside the support carry exact-zero weight, so a held
+    # wider interval is the same product.
     session = getattr(meta, "shared_pole_response_rules", None)
     if session is not None:
         held = session.get("band_ranges")
-        if held is not None:
-            band_ranges = tuple((min(a, c), max(b, d)) for (a, b), (c, d) in zip(band_ranges, held))
-        session["band_ranges"] = band_ranges
+        if held is None or any(a < c or b > d for (a, b), (c, d) in zip(band_ranges, held)):
+            pad = RESPONSE_HOLD_PAD_EV / RYD_TO_EV
+            hi_f = int(np.flatnonzero(energy.min(axis=0) <= energy[f != 0].max() + pad).max()) + 1
+            lo_u = int(np.flatnonzero(energy.max(axis=0) >= energy[u != 0].min() - pad).min())
+            padded = ((band_ranges[0][0], max(band_ranges[0][1], hi_f)),
+                      (min(band_ranges[1][0], lo_u), band_ranges[1][1]))
+            if held is not None:
+                padded = tuple((min(a, c), max(b, d)) for (a, b), (c, d) in zip(padded, held))
+            session["band_ranges"] = padded
+        band_ranges = session["band_ranges"]
     if jax.process_index() == 0:
         print_fn(f"Response occupied/empty band intervals: {band_ranges} of {f.shape[-1]}")
     return dict(f=f, u=u, refs=refs, lo=lo, hi=hi, mu=mu, decay_rate=decay_rate,
@@ -1232,7 +1246,7 @@ def response_quadrature(meta, sample_plan, receipt, support, *, group_size, prin
         if failed and jax.process_index() == 0:
             print_fn("Response rule rebuilt at a held map; failed reuse test: "
                      + "; ".join(failed), flush=True)
-        pad = 4./RYD_TO_EV if session is not None else 0.
+        pad = RESPONSE_HOLD_PAD_EV/RYD_TO_EV if session is not None else 0.
         plan = dict(lo=snap_outward(support["lo"]-pad, 1., -1),
                     hi=snap_outward(support["hi"]+pad, 1., +1), z=z, metallic=metallic,
                     decay_rate=decay_rate, amplitude=amplitude)
