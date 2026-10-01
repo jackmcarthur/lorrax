@@ -1420,6 +1420,17 @@ def _stream_workspace(wfns, meta, mesh_xy, support, *, q_ids, n_outputs, ordered
             + _stream_scratch(wfns, meta, mesh_xy, vertex)), compiled
 
 
+class _MemberRows:
+    """``raw[i, rows]`` of one group member, read from the group carry ``[2m, q, μ, ν]``."""
+
+    def __init__(self, carry, first):
+        self.carry, self.first = carry, int(first)
+
+    def __getitem__(self, key):
+        i, rows = key
+        return self.carry[self.first + int(i), rows]
+
+
 def _dyson_phase(solve_value, solve_slope, roots, mesh_xy, config, *, nq, n, extra=()):
     """(resident, workspace) bytes per rank of the sample Dyson phase beside a group's carry.
 
@@ -1727,7 +1738,9 @@ def produce_sample_bank(wfns, meta, config, *, mesh_xy, sym, sample_plan, bank_i
                 if committed(sample):
                     progress.step()
                     continue
-                raw = raw_group[2*row:2*row+2]
+                # Read the member's value and slope rows from the group carry at
+                # each solve; no copy of its whole carry is made.
+                raw = _MemberRows(raw_group, 2*row)
                 if p0 <= sample < p1:
                     # Select from W(z) itself, then act with the minus-q partner on
                     # the same directions; only the panels reach the bank.
