@@ -1453,9 +1453,9 @@ def response_group_size(meta, mesh_xy, *, n_samples, carry_per_sample, stream_wo
     One route and no dial: every sample in one group when it fits (symmetric
     decks), otherwise the largest group that does (about four on a
     two-component deck without q symmetry, where the carry is G/2 Green tiles).
-    ``selection`` is the larger (resident, workspace) bytes of the phases that
-    run beside the group's carry after its stream: the line selection and the
-    sample Dyson value and slope solves (:func:`_dyson_phase`).  The group must fit the
+    ``selection`` is the (resident, workspace) bytes that run beside the
+    group's carry after its stream: the line selection's reservation plus the
+    sample Dyson value and slope solves admitted inside it (:func:`_dyson_phase`).  The group must fit the
     capacity ledger (the deck budget ``memory_per_device_gb`` less the inherited
     peak, the reserved live stages and the runtime reserve): the one size that
     follows the budget, because a larger group buys more than 10 % per map and
@@ -1592,12 +1592,19 @@ def produce_sample_bank(wfns, meta, config, *, mesh_xy, sym, sample_plan, bank_i
         # temporaries do not grow with the group, only the donated carry does.
         workspace, whole = _stream_workspace(wfns, meta, mesh_xy, support, q_ids=response_rows,
             n_outputs=2*len(z), ordered=ordered, vertex=vertex)
+        # The door tables the stream placed stay on the devices beside every
+        # later phase: a live stage, counted once.
+        if vertex is None:
+            from .w_isdf import charge_door_table_bytes
+            tables, _ = _reserve(meta, "door_tables", charge_door_table_bytes())
+            ambient += (tables,)
+            ledger.live_stages = ambient
+        # After its stream, a group's carry holds while each sample's Dyson
+        # value and slope solve run at every parent at once; a line sample's
+        # solves run inside its line-selection reservation. Count both as the
+        # admissions will (their compiled executables), summed.
         chosen = (0, 0) if selection is None else (selection_resident, selection_workspace)
-        # The per-sample Dyson value and slope solves run beside the group's
-        # carry after its stream, at every parent at once: count their
-        # admitted bytes from their compiled executables, as their admission
-        # will, so the group leaves room for them.
-        chosen = tuple(max(a, b) for a, b in zip(chosen, _dyson_phase(
+        chosen = tuple(a + b for a, b in zip(chosen, _dyson_phase(
             solve_value, solve_slope, roots, mesh_xy, config, nq=len(qids), n=n,
             extra=() if vertex is None else (contact,))))
         with timing.section('bank.plan.direct'):
