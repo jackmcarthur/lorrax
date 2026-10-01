@@ -3,6 +3,31 @@
 User-visible changes, newest first. Binding rulings behind the breaking
 changes live in `docs/architecture/decisions.md`.
 
+## 2026-09-30 — four-current row passes are counted, not fitted
+
+`photon_response_passes` used a fitted price (2·parents + 1.5·planes). It now
+counts each pass's live buffers from their shapes (`greens_function_kernel.price_photon_pass`).
+The terms are the ones the XLA buffer assignments show:
+- the channel planes, counted twice at 2 or more passes;
+- the quadrant Greens and their partners;
+- the SUMMA panels, plus the two extra output tiles a scanned panel loop holds
+  (`distrib_la.panel_matmul_extra_tiles`);
+- both Dirac halves of the operand faces;
+- the operands that other family pairs keep live (`photon_held_faces`);
+- the placed door tables and mode 11's run-time scratch.
+The ledger door (`memory_per_device_gb`) and `GATE response_photon_passes` are
+unchanged. The stage-memory table gets one row, "photon direct stream, row passes
+(…)". Across 20 AOT programs at the Fe 20³ P36-local shape, the count is within
+−3.1 % to +4.9 % of the compiled peak.
+
+Fe 20³ P36 at M_T 900 and 70 or 75 GB moves from 2,2,2,2 passes (CC, CT, TC, TT)
+to 2,1,1,1. One pass on CC is counted at 76.6 GB. At p_x = 6 every Green build's panel loop is a
+scan that holds two more Green tiles, 12.2 GB on CC (KLI). The 2×2 proxy of the
+P36 tile runs a 2-panel loop and compiles one pass on every pair at
+64.49 + 1.07 GB scratch = 65.56 GB, so it does not show those tiles. M_T 1800 has
+no AOT (production is M_T 900). Its count is 4,7,7,15 at 75 GB. Fe 4³ prices 1
+pass before and after, and its results are bitwise.
+
 ## 2026-09-30 — the four-current response compiles without baked symmetry tables
 
 The bispinor four-current χ₀ (mathdx mode 11) now reads its unfold load

@@ -224,8 +224,9 @@ def photon_response_passes(ledger, mesh_xy, families, *, n_parent, kgrid, n_band
 
     The fewest passes whose counted live set fits ``ledger.room_bytes_per_rank``
     beside what stays whatever the pass count: the bank carry (``n_out``
-    members over ``q_count`` rows), the faces, and their band-major copies
-    the Green builds read (a second ``face_bytes``).  A pass's own bytes are
+    members over ``q_count`` rows), the faces, their band-major copies the
+    Green builds read (a second ``face_bytes``) and the placed mode-11 door
+    tables (:func:`photon_door_table_bytes`).  A pass's own bytes are
     counted from its shapes (``greens_function_kernel.price_photon_pass``),
     beside the face slices other pairs keep live across it
     (``greens_function_kernel.photon_held_faces``);
@@ -243,11 +244,14 @@ def photon_response_passes(ledger, mesh_xy, families, *, n_parent, kgrid, n_band
     layout = families.packed_layout
     side = int(families.layout.mesh_side)
     n = int(families.layout.packed_extent)
-    fixed = 16 * int(n_out) * int(q_count) * n * n // P + 2 * int(face_bytes)
+    carriers = {f: layout.carrier_extent(family_channels(f)[0]) for f in (0, 1)}
+    fixed = (16 * int(n_out) * int(q_count) * n * n // P + 2 * int(face_bytes)
+             + photon_door_table_bytes(FAMILY_PAIRS, carriers, nk=int(np.prod(kgrid)),
+                                       mesh_xy=mesh_xy))
     room = int(ledger.room_bytes_per_rank(())) - fixed
     passes, peaks = [], []
     held = photon_held_faces(
-        FAMILY_PAIRS, {f: layout.carrier_extent(family_channels(f)[0]) for f in (0, 1)},
+        FAMILY_PAIRS, carriers,
         n_parent=n_parent, n_band=n_band, mesh=mesh_xy,
         partner=any(has_antiunitary_rows(plan) for plan in families.plans))
     for (L, R), kept in zip(FAMILY_PAIRS, held):
@@ -338,6 +342,23 @@ def _photon_chi_doors(mesh_xy, kgrid, half_plans, parity, passes=None):
                                                  right_vertices=right, sign_c=sign_c, norm="ortho")
                     doors[(pair, (h, g), rows)] = (door, keys, cut)
     return doors
+
+
+def photon_door_table_bytes(pairs, carriers, *, nk, mesh_xy):
+    """Per-rank bytes of the placed door tables (:func:`_place_photon_door_tables`), from shapes.
+
+    Per family pair ``(L, R)``: the left tables ``lsrc`` (int32) and ``mph`` (c128) over
+    ``2·c_L`` columns on X, the right tables ``rsrc``, ``nph`` and the odd quadrants'
+    ``nph`` over ``2·c_R`` on Y, and the per-k ``row``, ``trs``, ``spin``, ``spin_r``.
+    Row passes cut the left tables into column blocks that sum to the same bytes and
+    share the right tables, so the count does not depend on the pass count.
+    """
+    px, py = int(mesh_xy.shape['x']), int(mesh_xy.shape['y'])
+    nk = int(nk)
+    return sum((4 + 16) * nk * 2 * int(carriers[L]) // px
+               + (4 + 16 + 16) * nk * 2 * int(carriers[R]) // py
+               + 2 * 4 * nk + 2 * 16 * nk * 4
+               for L, R in pairs)
 
 
 def _place_photon_door_tables(doors, mesh_xy):
