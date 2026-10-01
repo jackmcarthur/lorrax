@@ -1097,9 +1097,12 @@ def _get_chi_fractional_contour_kernel_face(
         from .photon_layout import FAMILY_PAIRS, family_channels
         px = int(mesh_xy.shape["x"])
         photon_sets = 4 if pair_mode == "laplace_ordered" else 2
+        # The direct rule pads its nodes to the capacity; the other modes'
+        # rules are a few nodes, accumulated one at a time.
         photon_plans = _photon_pass_plans(
             mesh_xy, grid, photon, half_plans, n_band=nb_full, q_count=len(selected_q),
-            n_nodes=minimax.RESPONSE_NODE_CAPACITY, n_sets=photon_sets)
+            n_nodes=minimax.RESPONSE_NODE_CAPACITY if pair_mode == "direct" else 1,
+            n_sets=photon_sets)
         photon_gemms = tuple(
             tuple(gemm_plan(mesh_xy, m=px * xr * 2, k=nb_full,
                             n=photon.packed_layout.carrier_extent(family_channels(R)[0]) * 2,
@@ -1349,17 +1352,16 @@ def _get_chi_fractional_contour_kernel_face(
             carry crosses to the canonical layout once.
             """
             from .photon_layout import photon_carry_order
-            n_nodes = jnp.asarray(time_nodes.shape[0], jnp.int32)
             if pair_mode == "direct":
-                weights, count = projection_rows, live_count()
+                weights = projection_rows
                 orientations = lambda t: ((occ_f, -t, energy_reference[0],
                                            occ_u, jnp.conj(t), energy_reference[1]),)
             elif pair_mode == "retarded":
-                weights, count = jnp.stack((-1j * projection_rows, 1j * projection_rows)), n_nodes
+                weights = jnp.stack((-1j * projection_rows, 1j * projection_rows))
                 orientations = lambda t: ((occ_f, -1j * t, energy_reference,
                                            occ_u, -1j * t, energy_reference),)
             elif pair_mode == "kms_static":
-                weights, count = jnp.stack((-projection_rows, -projection_rows)), n_nodes
+                weights = jnp.stack((-projection_rows, -projection_rows))
 
                 def orientations(t):
                     lower, upper, mu = kms_weights(t)
@@ -1368,9 +1370,13 @@ def _get_chi_fractional_contour_kernel_face(
                 half = projection_rows.shape[0] // 2
                 even, odd = projection_rows[:half], projection_rows[half:]
                 weights = jnp.stack((even + odd, even - odd, odd - even, -even - odd))
-                count = n_nodes
                 orientations = lambda t: tuple((occ_f[i], -t, energy_reference[0],
                                                 occ_u[i], t, energy_reference[1]) for i in (0, 1))
+            # The live node prefix read from the weights, as the direct rule's:
+            # a traced count keeps every pass a loop, so XLA cannot inline
+            # all passes of a short rule and hold their live sets at once.
+            live = jnp.any(weights != 0, axis=(0, 1))
+            count = jnp.max(jnp.where(live, jnp.arange(live.shape[0]) + 1, 0))
             packed = photon_subtiles(photon_carry_order(carry, photon, mesh_xy, to_packed=True),
                                      weights.astype(jnp.complex128), count, orientations)
             return photon_carry_order(packed, photon, mesh_xy, to_packed=False)
