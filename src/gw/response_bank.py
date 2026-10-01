@@ -2498,9 +2498,9 @@ def _photon_sample_norms(receipt, value, parent, first, layout, mesh_xy):
 
 
 #: The packed photon V of the run's V file, held on the host as each process's
-#: device shards (one entry): V does not change across SC maps, so every map
-#: after the first rebuilds it on the devices instead of re-reading the file,
-#: and no device memory is held between banks.
+#: device shards (one entry, a ``common.collectives.HostSpill``): V does not
+#: change across SC maps, so every map places it on the devices from this copy
+#: instead of re-reading the file, and no device memory is held between banks.
 _PHOTON_V_HOST: dict = {}
 
 
@@ -2511,8 +2511,11 @@ def photon_bare_operator(wfns, wfns_transverse, meta, *, path, mu_bases, layout,
     before the photon owner inserts canonical channel chunks, exactly as for
     the endpoint carriers. All operators stay at P(None,x,y).  The packed V
     is read once per V file (path, size, modification time), endpoint bases
-    and q parents; later calls rebuild it from its host copy (:data:`_PHOTON_V_HOST`).
+    and q parents, and moved to its host copy (:data:`_PHOTON_V_HOST`); every
+    call places that copy (``common.collectives.restore_from_host``: each
+    process its own shards, no collective).
     """
+    from common.collectives import restore_from_host, spill_to_host
     plans = (wfns.green_parent.plan, wfns_transverse.green_parent.plan)
     stat = os.stat(path)
     # By content, so a later map's endpoint objects of the same bases hit.
@@ -2521,19 +2524,15 @@ def photon_bare_operator(wfns, wfns_transverse, meta, *, path, mu_bases, layout,
         for b in mu_bases)).hexdigest()
     key = (str(path), int(stat.st_size), int(stat.st_mtime_ns), layout, mesh_xy, bases,
            tuple(int(q) for q in plans[0].sym.q_irr_full_idx))
-    hit = _PHOTON_V_HOST.get(key)
-    if hit is not None:
-        shape, sharding, shards = hit
-        return jax.make_array_from_single_device_arrays(
-            shape, sharding, [jax.device_put(host, device) for device, host in shards])
-    value = _read_photon_bare_operator(path, plans, mu_bases, layout, mesh_xy)
-    _PHOTON_V_HOST.clear()
-    shards = [(s.device, np.asarray(s.data)) for s in value.addressable_shards]
-    _PHOTON_V_HOST[key] = (value.shape, value.sharding, shards)
-    from common.gpu_utils import record_host_hold
-    record_host_hold("packed photon V (photon_bare_operator)",
-                     sum(host.nbytes for _, host in shards))
-    return value
+    held = _PHOTON_V_HOST.get(key)
+    if held is None:
+        from common.gpu_utils import record_host_hold
+        value = _read_photon_bare_operator(path, plans, mu_bases, layout, mesh_xy)
+        _PHOTON_V_HOST.clear()
+        record_host_hold("packed photon V (photon_bare_operator)",
+                         sum(s.data.nbytes for s in value.addressable_shards))
+        held = _PHOTON_V_HOST[key] = spill_to_host(value)
+    return restore_from_host(held)
 
 
 def _read_photon_bare_operator(path, plans, mu_bases, layout, mesh_xy):
