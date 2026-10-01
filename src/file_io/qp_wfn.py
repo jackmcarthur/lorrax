@@ -1027,22 +1027,18 @@ def _write_rotated_coefficients(src, dst, *, mesh, U_kmn, band_start,
 
 
 def _coefficient_window(mesh, *, nbands, nspinor, ngkmax) -> int:
-    """G columns per coefficient window, ``P·w``, from the deck budget.
+    """G columns per coefficient window, ``P·w``, from the device budget.
 
     ``w = ⌈ngkmax/P⌉`` (one window per k) whenever
-    ``5·nbands·nspinor·w·16 B`` fits the per-rank budget — the read
+    ``5·nbands·nspinor·w·16 B`` fits the agreed per-rank budget — the read
     slab, the active block as complex, its rotation, the output slab and the
-    one queued write — and the largest ``w`` that fits otherwise.  The budget
-    is ``memory_per_device_gb`` less the measured runtime reserve (the writer's
-    other inputs are host arrays), never allocator readings, so every rank
-    computes the same window.
+    one queued write — and the largest ``w`` that fits otherwise.
     """
-    from common.gpu_utils import bfc_fragmentation_target_utilization, device_budget_bytes
-    from runtime.aot_memory import runtime_reserve_bytes
+    from common.gpu_utils import bfc_fragmentation_target_utilization, device_room_bytes
 
     p = int(mesh.devices.size)
     whole_k = -(-int(ngkmax) // p)
-    budget = device_budget_bytes() - float(runtime_reserve_bytes())
+    budget = float(device_room_bytes())
     per_column = 5 * int(nbands) * int(nspinor) * 16
     w = int(budget * bfc_fragmentation_target_utilization(4) // per_column)
     return p * max(1, min(whole_k, w))

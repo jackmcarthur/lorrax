@@ -1364,39 +1364,31 @@ def plan_sweep(geom: SweepGeometry, operator) -> SweepPlan:
     peer_block = nb_rank * geom.ns * g_carrier * c128 / n_ranks
     k_tile = next((k for k in range(1, k_mem + 1) if geom.nk % k == 0
                    and k * peer_block >= A2A_BANDWIDTH_BLOCK_BYTES), k_mem)
-    return SweepPlan(k_tile, g_carrier,
-                     _band_chunk(geom, ops, nb_rank, k_tile * step, sphere))
+    return SweepPlan(k_tile, g_carrier, _band_chunk(geom, ops, nb_rank, k_tile * step))
 
 
 #: The share of the stage room the band-layout FFT boxes may fill.
 _BOX_ROOM_FRACTION = 0.9
 
 
-def _band_chunk(geom, ops, nb_rank: int, step_bytes: float,
-                sphere_bytes: float) -> int:
+def _band_chunk(geom, ops, nb_rank: int, step_bytes: float) -> int:
     """Bands per application of the band-layout operators, from the run's budget.
 
     A band operator holds FFT boxes of ``ns·N_r·16`` bytes per band: ψ(r), one
     product and one forward transform per component, ``2 + 2·max(ncomp, 1)``
     boxes (the four-current potential: six).  Its bands are independent, so
     the fewest equal chunks whose boxes fit beside the step's live set in the
-    stage room are applied one after another; one chunk, this rank's ``nb/P``,
-    when they fit.  The room is the deck budget (``memory_per_device_gb``) less
-    the priced resident set — this rank's ψ sphere (``sphere_bytes``) and the
-    replicated ``nk·N_r`` int32 box index — and the measured runtime reserve:
-    shapes only, never allocator readings, so every process computes the same
-    chunk.
+    stage room (``common.gpu_utils.device_room_bytes``) are applied one after
+    another; one chunk, this rank's ``nb/P``, when they fit.  Every process
+    computes the same chunk.
     """
     copies = max((2 + 2 * max(int(o.ncomp), 1) for o in ops if o.apply is not None),
                  default=0)
     if not copies:
         return nb_rank
-    from common.gpu_utils import device_budget_bytes, record_stage_price
-    from runtime.aot_memory import runtime_reserve_bytes
-    n_r = float(np.prod(geom.fft_grid))
-    box = copies * float(geom.ns) * n_r * 16.0
-    resident = float(sphere_bytes) + float(geom.nk) * n_r * 4.0
-    room = device_budget_bytes() - resident - float(runtime_reserve_bytes())
+    from common.gpu_utils import device_budget_bytes, device_room_bytes, record_stage_price
+    box = copies * float(geom.ns) * float(np.prod(geom.fft_grid)) * 16.0
+    room = float(device_room_bytes())
     fit = max(1, int((_BOX_ROOM_FRACTION * room - step_bytes) // box))
     n_chunks = -(-nb_rank // min(fit, nb_rank))
     chunk = -(-nb_rank // n_chunks)

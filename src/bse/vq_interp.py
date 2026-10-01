@@ -493,25 +493,22 @@ def _batched_vq_relF(ZG, v_all, V_ref, q_chunk=48):
     return np.concatenate(out)
 
 
-def build_cq_q_chunk(*, nq, nb, ns, n_mu, n_r, mesh_xy, resident_bytes=0):
+def build_cq_q_chunk(*, nq, nb, ns, n_mu, n_r, mesh_xy):
     """q rows per :func:`build_cq` pass, from the run budget's room.
 
-    The room is the deck budget (``memory_per_device_gb``) less the caller's
-    priced resident set (``resident_bytes``, from shapes) and the measured
-    runtime reserve, so every rank takes the same chunk.  In it a pass holds
-    the sharded accumulator P_R and its update (2·nR·ns²·n_μ²·16/P), then per
-    q the replicated ψ row and its conjugate transpose (2·nb·ns·n_μ·16) and
-    the face-sharded Pk row (ns²·n_μ²·16/P).  The largest q count that fits,
-    at least 1 and at most nq.
+    Beside the live bytes (``common.gpu_utils.device_room_bytes``, the minimum
+    over processes) a pass holds the sharded accumulator P_R and its update
+    (2·nR·ns²·n_μ²·16/P), then per q the replicated ψ row and its conjugate
+    transpose (2·nb·ns·n_μ·16) and the face-sharded Pk row (ns²·n_μ²·16/P).  The largest q count that fits,
+    at least 1 and at most nq.  Every process enters.
     """
-    from common.gpu_utils import device_budget_bytes, record_stage_price
-    from runtime.aot_memory import runtime_reserve_bytes
+    from common.gpu_utils import device_room_bytes
     n_dev = int(mesh_xy.devices.size)
     face = 16.0 * int(ns) ** 2 * int(n_mu) ** 2 / n_dev
     fixed = 2.0 * int(n_r) * face
     per_q = 2.0 * 16.0 * int(nb) * int(ns) * int(n_mu) + face
-    device_room = (device_budget_bytes() - float(resident_bytes)
-                   - float(runtime_reserve_bytes()))
+    from common.gpu_utils import device_budget_bytes, record_stage_price
+    device_room = float(device_room_bytes())
     chunk = int(max(1, min(int(nq), (device_room - fixed) // per_q)))
     record_stage_price(f"exciton_bands build_cq, q chunk {chunk}/{int(nq)}",
                        device_budget_bytes() - device_room + fixed + chunk * per_q)
@@ -546,12 +543,8 @@ def build_cq(zx, mesh_xy: Mesh, q_chunk=None):
     Rw = ((Rall + kg // 2) % kg) - (kg // 2)
     nR = len(Rw)
     if q_chunk is None:
-        # The payload's device arrays are live beside the pass: price their shards.
-        resident = sum(
-            int(np.prod(a.sharding.shard_shape(a.shape))) * a.dtype.itemsize
-            for a in zx.values() if isinstance(a, jax.Array))
         q_chunk = build_cq_q_chunk(nq=nq, nb=nb, ns=ns, n_mu=n_mu, n_r=nR,
-                                   mesh_xy=mesh_xy, resident_bytes=resident)
+                                   mesh_xy=mesh_xy)
     EqR_np = np.exp(2j * np.pi * (zx["qfr"] @ Rw.T))
     rep = NamedSharding(mesh_xy, P())
     # (μ, ν) face.  n_mu is the raw k-means centroid count, so the face is
