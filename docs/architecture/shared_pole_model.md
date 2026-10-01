@@ -379,7 +379,7 @@ constants. An endpoint map that crosses a mesh shard refuses
 $32\,n_{q,\rm irr}\,\mu\,\bar K/P$ bytes per rank face-sharded,
 `P(None,'x',None,'y')`, or $16\,n_{q,\rm irr}\,\mu\,\bar K(1/P_x+1/P_y)$ when the
 panel search admits the replicated pole columns ($\bar K$ the store's pole
-carrier). On a `linalg = local` deck whose whole parents fit per rank
+carrier). Where those do not fit, on a `linalg = local` deck whose whole parents fit per rank
 (`shared_pole_execution.whole_parent_execution`, the bank's rule), one copy is
 held instead, whole parents per rank in `distrib_la`'s batch layout
 ($16\lceil n_{q,\rm irr}/P\rceil\mu\bar K$ bytes): each rank contracts its own

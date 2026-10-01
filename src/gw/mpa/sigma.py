@@ -806,11 +806,12 @@ def _shared_pole_memory_schedule(meta, header, *, mesh_xy, layout="face", stage=
     ruling12, the unchanged spatial/ψ/Σ footprint and its one full-q W are
     reported separately against the incumbent (<=1.05x).
 
-    ``linalg`` (the deck's resolved dense layout): on a ``local`` deck whose
-    whole parents fit per rank (``shared_pole_execution.whole_parent_execution``,
-    the bank's rule), the synthesis contracts whole parents locally
-    (``factor_layout='local'``, :func:`_shared_pole_contract_local`) and only
-    W(τ) moves; otherwise the face or axis panels below.
+    Placement, in order: the replicated pole columns (``axis``) when the panel
+    search admits them (no exchange per node); else, on a ``linalg = local``
+    deck (the resolved ``linalg``) whose whole parents fit per rank
+    (``shared_pole_execution.whole_parent_execution``, the bank's rule), whole
+    parents (``factor_layout='local'``, :func:`_shared_pole_contract_local`:
+    only W(τ) moves); else the face SUMMA panels.
     """
     capacity = getattr(meta, "shared_pole_capacity", None)
     if capacity is None:
@@ -838,28 +839,6 @@ def _shared_pole_memory_schedule(meta, header, *, mesh_xy, layout="face", stage=
                     capacity_receipt=receipt,route="empty")
     tables = _shared_pole_panel_tables(meta, header, (0,nq), mesh_xy=mesh_xy)
     _require_local_maps(tables["certificates"])
-    if linalg == "local" and int(header.get("factor_components", 1)) == 1:
-        from gw.shared_pole_execution import whole_parent_execution
-        execution, resident, workspace = whole_parent_execution(
-            lambda e: (_shared_pole_local_price(meta, header, mesh_xy=mesh_xy) if e == "local"
-                       else (_shared_pole_resident_bytes(meta, header, mesh_xy=mesh_xy,
-                                                         layout=layout), 0)),
-            ledger=capacity)
-        if execution == "local":
-            receipt = capacity.reserve(
-                f"{stage}.synthesis", resident_bytes_per_rank=resident,
-                workspace_bytes_per_rank=workspace, concurrent_with=concurrent)
-            return dict(status=receipt["device_budget_status"], unit_bytes=U,
-                        factor_layout="local",
-                        peak_live_bytes_per_rank=receipt["aggregate_bytes_per_rank"],
-                        peak_in_U=receipt["aggregate_bytes_per_rank"]/U,
-                        parent_capacity=nq, column_capacity=kmax,
-                        resident_factor_bytes_per_rank=resident,
-                        caller_live_bytes_per_rank=caller_bytes, capacity_receipt=receipt,
-                        route="local_parent",
-                        inherited_sigma_peak_status="NOT_MEASURED",
-                        projection_matrix_bytes_per_rank=int(16*nq*meta.mu_basis.n_packed**2
-                                                             / (px*py)))
     # The ledger owns the hardware limit (ruling24); 3U is a scaling
     # receipt. A zero-byte planning reservation prices the existing ambient set.
     admission = capacity.reserve(
@@ -910,6 +889,31 @@ def _shared_pole_memory_schedule(meta, header, *, mesh_xy, layout="face", stage=
         replicated = search("axis")
         if replicated is not None and (best is None or replicated[0] <= best[0]):
             layout, best = "axis", replicated
+    # Where the replicated columns do not fit, whole parents per rank keep
+    # the contraction local and move only W (one tile per node), against the
+    # face SUMMA's per-node re-gather of every factor panel.
+    if layout != "axis" and linalg == "local" and int(header.get("factor_components", 1)) == 1:
+        from gw.shared_pole_execution import whole_parent_execution
+        execution, whole_resident, whole_workspace = whole_parent_execution(
+            lambda e: (_shared_pole_local_price(meta, header, mesh_xy=mesh_xy) if e == "local"
+                       else (_shared_pole_resident_bytes(meta, header, mesh_xy=mesh_xy,
+                                                         layout=layout), 0)),
+            ledger=capacity)
+        if execution == "local":
+            receipt = capacity.reserve(
+                f"{stage}.synthesis", resident_bytes_per_rank=whole_resident,
+                workspace_bytes_per_rank=whole_workspace, concurrent_with=concurrent)
+            return dict(status=receipt["device_budget_status"], unit_bytes=U,
+                        factor_layout="local",
+                        peak_live_bytes_per_rank=receipt["aggregate_bytes_per_rank"],
+                        peak_in_U=receipt["aggregate_bytes_per_rank"]/U,
+                        parent_capacity=nq, column_capacity=kmax,
+                        resident_factor_bytes_per_rank=whole_resident,
+                        caller_live_bytes_per_rank=caller_bytes, capacity_receipt=receipt,
+                        route="local_parent",
+                        inherited_sigma_peak_status="NOT_MEASURED",
+                        projection_matrix_bytes_per_rank=int(16*nq*meta.mu_basis.n_packed**2
+                                                             / (px*py)))
     b,c = (1,multiple) if best is None else best[2:]
     footprint = _shared_pole_panel_cost(meta,header,b,c,mesh_xy=mesh_xy,layout=layout)
     resident = _shared_pole_resident_bytes(meta, header, mesh_xy=mesh_xy, layout=layout)
