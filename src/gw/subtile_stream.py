@@ -17,11 +17,16 @@ rows go straight into the carry.  So
   own rows;
 - the node-to-output weights act in chunks of nodes through the in-place
   block accumulator (``ffi.contour.contour_block_accumulate_local``); its
-  terms add in order, so a chunk gives the bytes of one accumulate per node.
+  terms add in order, so a chunk gives the bytes of one accumulate per node;
+- a node may return several planes, each landing in its own block of the
+  carry (:class:`Block`): the four-current stream's channel planes of one
+  family pair go to their blocks of the packed photon layout.
 
 Sizes come from :data:`runtime.tiles.TILE_BYTES` and the shapes alone
 (:func:`plan_passes`); the budget never enters, so no result depends on it.
-The χ₀ operands and door are ``gw.w_isdf``'s (the response owner); a Σ
+The χ₀ operands and doors are ``gw.w_isdf``'s (the response owner), for the
+charge stream and for the four-current stream (Dirac-half quadrant Greens and
+the mode-11 vertex door per family pair); a Σ
 consumer would supply its own pair (G and the W pole factors) and the
 mode-7/8 door through the same :func:`stream_passes`.
 """
@@ -83,13 +88,30 @@ def pass_tables(tables, x0, xr, side, ns):
 
 
 @dataclass(frozen=True)
+class Block:
+    """Where one plane of a node's pass rows lands in each rank's carry tile.
+
+    ``m0``/``n0`` are the plane's local row and column offsets (a pass adds
+    its ``x0`` to ``m0``).  ``extents`` ``(la, wa, lb, wb)`` are the block's
+    logical row/column extents and per-shard widths, so its pad rows and
+    columns are not touched; ``None``: every row of the pass and every column
+    of the carry tile is live.
+    """
+    m0: int = 0
+    n0: int = 0
+    extents: tuple | None = None
+
+
+@dataclass(frozen=True)
 class PassPlan:
-    """Row passes ``((x0, xr), ...)`` of every X shard's local rows and nodes per accumulate."""
+    """Row passes ``((x0, xr), ...)`` of every X shard's local rows, nodes per accumulate,
+    and the carry blocks of a node's planes (one whole-tile block by default)."""
     passes: tuple
     chunk: int
+    blocks: tuple = (Block(),)
 
 
-def plan_passes(tables, mesh, *, ns, row_bytes, chunk_bytes, n_nodes):
+def plan_passes(tables, mesh, *, ns, row_bytes, chunk_bytes, n_nodes, blocks=(Block(),)):
     """Row passes and the node chunk from :data:`runtime.tiles.TILE_BYTES` and shapes.
 
     ``chunk_bytes`` are one node's kept rows on the whole local tile, so a
@@ -97,7 +119,8 @@ def plan_passes(tables, mesh, *, ns, row_bytes, chunk_bytes, n_nodes):
     live set at that chunk (the two operands, the door's R-space output and
     its transform, the chunk's kept rows), so a pass fits one tile.  Passes
     split at the nearest orbit cuts (:func:`row_passes`); a rank whose rows
-    are one orbit keeps one pass.
+    are one orbit keeps one pass.  ``blocks`` (:class:`Block`) place a
+    node's planes in the carry.
     """
     from runtime.tiles import tile_units
     side = int(mesh.shape["x"])
@@ -108,7 +131,7 @@ def plan_passes(tables, mesh, *, ns, row_bytes, chunk_bytes, n_nodes):
     passes = row_passes(n_pass, local_rows, orbit_cuts(tables.lsrc, side, ns) if n_pass > 1 else ())
     if passes is None:
         passes = ((0, local_rows),)
-    return PassPlan(passes=passes, chunk=int(chunk))
+    return PassPlan(passes=passes, chunk=int(chunk), blocks=tuple(blocks))
 
 
 def band_complete(psi_mun, psi_nmu, mesh):
@@ -136,10 +159,11 @@ def stream_passes(carry, *, mesh, plan, weights, count, node_rows):
 
     ``carry`` ``[n_out, q, μ, ν]`` at ``P(None, None, 'x', 'y')`` is updated in
     place; ``weights`` ``[2, n_out, n_cap]``; ``count`` the live node prefix
-    (traced).  ``node_rows(p, n)`` returns pass ``p``'s ``[2, q, px*xr, ν]``
-    rows of node ``n`` at ``P(None, None, 'x', 'y')``.  Nodes run in chunks
-    of ``plan.chunk``; a chunk's nodes past ``count`` are not evaluated and
-    add exact zeros.
+    (traced).  ``node_rows(p, n)`` returns pass ``p``'s ``[n_blocks, 2, q,
+    px*xr, ν_b]`` rows of node ``n`` at ``P(None, None, None, 'x', 'y')``,
+    plane ``b`` landing in ``plan.blocks[b]``.  Nodes run in chunks of
+    ``plan.chunk``; a chunk's nodes past ``count`` are not evaluated and add
+    exact zeros.
     """
     from ffi.contour import contour_block_accumulate_local
     chunk = int(plan.chunk)
@@ -153,12 +177,19 @@ def stream_passes(carry, *, mesh, plan, weights, count, node_rows):
 
         def skipped(shape=shape):
             return jax.lax.with_sharding_constraint(jnp.zeros(shape.shape, shape.dtype),
-                                                    NamedSharding(mesh, P(None, None, "x", "y")))
+                                                    NamedSharding(mesh, P(None, None, None, "x", "y")))
 
-        def block_add(acc, rows, projection, x0=x0, xr=xr):
+        def block_add(acc, rows, projection, block, x0=x0, xr=xr):
             def local(a, r, w):
-                valid = jnp.asarray([xr, a.shape[3]], jnp.int32)
-                return contour_block_accumulate_local(a, r, w, valid, m0=x0, n0=0, mesh=mesh)
+                if block.extents is None:
+                    valid = jnp.asarray([xr, a.shape[3]], jnp.int32)
+                else:
+                    la, wa, lb, wb = block.extents
+                    valid = jnp.stack((
+                        jnp.clip(la - jax.lax.axis_index("x") * wa - x0, 0, xr),
+                        jnp.clip(lb - jax.lax.axis_index("y") * wb, 0, wb))).astype(jnp.int32)
+                return contour_block_accumulate_local(a, r, w, valid, m0=block.m0 + x0,
+                                                      n0=block.n0, mesh=mesh)
             return jax.shard_map(local, mesh=mesh, in_specs=(spec_c, spec_c, P()),
                                  out_specs=spec_c, check_vma=False)(acc, rows, projection)
 
@@ -169,14 +200,16 @@ def stream_passes(carry, *, mesh, plan, weights, count, node_rows):
                 n = c * chunk + j
                 return None, jax.lax.cond(n < count, lambda: node_rows(p, n), skipped)
             _, rows = jax.lax.scan(one, None, jnp.arange(chunk, dtype=jnp.int32), unroll=1)
-            # [chunk, 2, q, m, n] -> terms in node order, forward then reverse.
-            rows = rows.reshape((2 * chunk,) + rows.shape[2:])
             # Read behind a barrier: a counter-indexed slice must not be
             # rematerialized after the counter's in-place increment.
             w = jax.lax.optimization_barrier(
                 jax.lax.dynamic_slice_in_dim(weights, c * chunk, chunk, axis=2))
             projection = jnp.transpose(w, (2, 0, 1)).reshape(2 * chunk, -1)
-            return c + 1, block_add(acc, rows, projection)
+            for b, block in enumerate(plan.blocks):
+                # [chunk, b, 2, q, m, n] -> terms in node order, forward then reverse.
+                plane = rows[:, b].reshape((2 * chunk,) + rows.shape[3:])
+                acc = block_add(acc, plane, projection, block)
+            return c + 1, acc
 
         _, carry = jax.lax.while_loop(lambda s: s[0] < n_chunks, chunk_body,
                                       (jnp.zeros((), jnp.int32), carry))

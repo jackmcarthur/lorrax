@@ -407,22 +407,14 @@ def response_stream(wfns, meta, *, mesh_xy, q_ids, n_outputs,
         if pair_mode == "laplace":
             raise ValueError("GATE response_vertex: photon Laplace cells must retain odd rows")
         n_input = vertex.families.n_parent
-        # The direct stream's row passes per family pair: from the ledger beside the
-        # smallest group's carry, 1 when everything fits (w_isdf.photon_response_passes).
-        passes = None
-        ledger = getattr(meta, "shared_pole_capacity", None)
-        if pair_mode == "direct" and ledger is not None:
-            from .w_isdf import photon_response_passes
-            passes = photon_response_passes(
-                ledger, mesh_xy, vertex.families, n_parent=n_input,
-                kgrid=(meta.nkx, meta.nky, meta.nkz), n_band=int(wfns.slices.nb_full),
-                n_out=2, q_count=len(q_ids),
-                face_bytes=sum(int(a.nbytes) for a in (*vertex.mun, *vertex.nmu)) // int(mesh_xy.size))
+        # The direct stream's row passes per family pair come from runtime.tiles
+        # and the shapes (w_isdf._photon_pass_plans); its Greens read the active bands.
         kernel = _response_stream_kernel(
             mesh_xy, (meta.nkx, meta.nky, meta.nkz), n_outputs,
             (n_input, int(wfns.slices.nb_full), vertex.n, 4),
             _ffi_key=ffi_dial_key(), layout=wfns.layout, selected_q=tuple(q_ids), pair_mode=pair_mode,
-            bank_carry=bank_carry, ordered=True, vertex=vertex.families, photon_passes=passes)
+            bank_carry=bank_carry, ordered=True, vertex=vertex.families,
+            band_ranges=band_ranges if pair_mode == "direct" else None)
         return kernel, vertex.fixed
     if not charge_representation(meta):
         raise ValueError("GATE response_representation: want an authenticated "
@@ -1392,14 +1384,24 @@ def _direct_passes(wfns, meta, mesh_xy, q_count):
 
 
 def _stream_scratch(wfns, meta, mesh_xy, vertex):
-    """Run-time scratch of the charge stream outside its compiled temporaries:
-    mathdx mode 11's split arm on a raw-parent plan (w_isdf direct stream)."""
-    parent = wfns.green_parent
-    if vertex is not None or parent is None:
-        return 0
+    """Run-time scratch of the stream outside its compiled temporaries:
+    mathdx mode 11's split arm on a raw-parent plan (w_isdf direct stream); for
+    the four-current stream, the largest family pair's door on its whole tile
+    (a bound on every row pass's)."""
     from .greens_function_kernel import chi0_door_scratch
+    kgrid = (meta.nkx, meta.nky, meta.nkz)
+    if vertex is not None:
+        from .photon_layout import FAMILY_PAIRS, family_channels
+        carrier = vertex.families.packed_layout.carrier_extent
+        return max(int(chi0_door_scratch(
+            kgrid=kgrid, n_parent=int(vertex.families.n_parent),
+            n_rmu=carrier(family_channels(L)[0]), ns=2, mesh=mesh_xy,
+            n_right=carrier(family_channels(R)[0]))) for L, R in FAMILY_PAIRS)
+    parent = wfns.green_parent
+    if parent is None:
+        return 0
     from .w_isdf import _chi_door_serves
-    kgrid, ns = (meta.nkx, meta.nky, meta.nkz), int(meta.nspinor)
+    ns = int(meta.nspinor)
     if not _chi_door_serves(mesh_xy, kgrid, ns):
         return 0
     return int(chi0_door_scratch(kgrid=kgrid, n_parent=int(parent.plan.n_parent),
