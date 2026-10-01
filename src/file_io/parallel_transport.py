@@ -1109,12 +1109,10 @@ def _write_w_av_stage(
     # input and the gathered/aligned neighbor while the overlap is live.
     working_bytes_per_k = fixed_bytes + 2 * streamed_q_bytes
     if working_bytes_per_k > tile_budget_bytes:
-        raise MemoryError(
-            "W_AV-QSTREAM-TILE refusal: the smallest k=1, q=1 raw-density "
-            f"tile needs an estimated {working_bytes_per_k / 2**30:.2f} "
-            f"GiB/device, above the {tile_budget_bytes / 2**30:.2f} GiB "
-            "W-av budget. Fix: use a band-pair-streamed or fused screening "
-            "consumer; reducing the k or q batch cannot make this path fit.")
+        # The smallest k=1, q=1 raw-density tile runs.
+        from common.gpu_utils import warn_over_budget
+        warn_over_budget("W-av raw-density tile (k=1, q=1)", working_bytes_per_k,
+                         tile_budget_bytes)
     k_batch = max(1, min(
         nk, int(tile_budget_bytes // max(1, working_bytes_per_k))))
     if jax.process_index() == 0:

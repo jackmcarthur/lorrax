@@ -2143,18 +2143,12 @@ def _centroid_fft_scan_chunk(
     scan_budget_bytes = (int(gpu_mem_bytes) - existing_live_bytes
                          - persistent_bytes)
     if scan_budget_bytes < min_scan_bytes:
-        min_live_bytes = (existing_live_bytes + persistent_bytes
-                          + min_scan_bytes)
-        raise MemoryError(
-            "load_centroids_band_chunked planner refuses before WFN "
-            f"allocation: the minimum per-device live set is "
-            f"{min_live_bytes / 2**30:.2f} GiB (runtime reserve + G-flat "
-            f"{'tile' if stream_tiles else 'input'} + X/Y centroid "
-            f"outputs + one FFT scan row), but the budget "
-            f"(memory_per_device_gb) is {gpu_mem_bytes / 2**30:.2f} GiB. "
-            "A smaller scan chunk cannot reduce this floor; use more "
-            "devices, larger-HBM devices, or a narrower prune band window."
-        )
+        # Runtime reserve + G-flat tile or input + X/Y centroid outputs + one
+        # FFT scan row: a smaller scan chunk cannot reduce this floor.
+        from common.gpu_utils import warn_over_budget
+        warn_over_budget("centroid load (one FFT scan row)",
+                         existing_live_bytes + persistent_bytes + min_scan_bytes,
+                         gpu_mem_bytes)
 
     # Translate legacy hints (band_chunk_size, k_chunk_size) into the new
     # flat-row count.  In either arm the tile bound applies last.

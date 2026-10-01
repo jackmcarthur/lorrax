@@ -3,6 +3,23 @@
 User-visible changes, newest first. Binding rulings behind the breaking
 changes live in `docs/architecture/decisions.md`.
 
+## 2026-10-01 — a price over the memory budget warns, never refuses
+
+No planner stops a run because a priced or compiled memory figure exceeds
+`memory_per_device_gb` (or its tile). The shared-pole capacity ledger, the
+compiled chunk check, the shared-pole sector batch and local pencil rounds,
+the ζ μ-batch, V_q, pair-convolution, GN-PPM fit, Galerkin, kmeans Gram,
+centroid-load, W-av and dense-H planners each raise one `RuntimeWarning:
+memory over budget at <stage>: needs X GB/rank, budget Y GB/rank, over by Z GB;
+continuing (an OOM is possible)` (gwjax.out lists it under WARNINGS), take
+their smallest size and run; a device that truly lacks the room OOMs. The gates `shared_pole_capacity`
+(budget), `compiled_chunk_capacity`, `shared_pole_round_capacity`,
+`zeta-mubatch-capacity`, `zeta-mubatch-orbit-capacity`, `vq_tile_budget`,
+`pairconv-capacity`, `gn_ppm_fit_capacity`, `bispinor-v-host-park`,
+`pw-screening-budget` and the Γ-projection logical bound are gone. Decks that
+fit are bitwise. Kernel shape limits (`GATE response_vertex_grid`) and
+correctness gates still refuse.
+
 ## 2026-09-30 — shared-pole V staging: q tiles, one sync, a chunked digest
 
 At map 0 the shared-pole W staged the bare V wedge one parent at a time, each
@@ -360,7 +377,7 @@ self_consistent`, scalar MPA/shared-pole route) moves once. See
   before it runs (`runtime.aot_memory.check_chunk`; the response direct
   stream's sample group, the ζ μ batch, and the Σ τ window's price). When a
   chunk is over its room, it is recompiled once at a corrected size. If it is
-  still over, the run refuses (`GATE compiled_chunk_capacity`).
+  still over, the run warns and continues (since 2026-10-01; it refused before).
 - The shared-pole response group must also fit the device room, which counts
   resident bytes the capacity ledger does not own. A deck whose group was
   sized into that gap gets a smaller group and moves once. Fe 8³ charge P4 at

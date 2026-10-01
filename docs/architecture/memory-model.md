@@ -4,8 +4,12 @@ A LORRAX calculation is feasible on `P` ranks exactly when every stage's
 per-rank live set fits the device budget. Every large object is tiled over
 the whole `x × y` mesh, so its per-rank bytes fall as `1/P`; nothing large is
 materialised on fewer than all `P` ranks. This page states, stage by stage,
-what is resident per rank, how it scales, which planner prices it, and what
-it refuses before dispatch.
+what is resident per rank, how it scales, and which planner prices it.
+No planner refuses on a price (owner 2026-10-01): a stage over its budget
+raises one `RuntimeWarning: memory over budget at <stage>` (needed, budget, by
+how much; `common.gpu_utils.warn_over_budget`; gwjax.out lists it under
+WARNINGS), runs at its smallest size, and OOMs if the device truly lacks the
+room.
 
 | symbol | meaning |
 |---|---|
@@ -145,20 +149,20 @@ the static Σ channels read it, before Hartree and the τ sweep.
 
 ## Stage inventory
 
-| stage | resident per rank (leading terms) | priced by | refuses |
+| stage | resident per rank (leading terms) | priced by | over budget |
 |---|---|---|---|
 | ψ(G) and centroid faces | charge fit: conj ψ(G) on the rank's G slots, `16·N_k·N_b·n_s·N_Gψ/P`. Centroid carrier `ψ(r_μ)`: `M_face` resident; each band contraction adds its transient panels, at most one `G_tile` ([§ ψ carriers](#psi-carriers)) | `plan_zeta_route_g` | with the fit |
-| ζ fit, charge channel (route G) | C factor, one μ-batch working set, the ψ(G) slice; the Z store `16·Q·μ·N_G/P` lives on host or disk | `plan_zeta_route_g` ([§ route G](#route-g-zeta-fit)) | `GATE zeta-mubatch-capacity` |
-| ζ fit, current channels (bispinor) | the same, at μ_T, with three factors, accumulators and Z stores | `plan_zeta_route_g(n_vertex=3)` ([§ route G](#route-g-zeta-fit)) | `GATE zeta-mubatch-capacity` |
-| V_q | `V_acc` `16·Q·μ_L·μ_R/P`, one q-tile of ζ rows, G panels | `vq_tile_bytes` ([§ V_q](#vq-g-panels-and-q-tiles)) | `GATE vq_tile_budget` |
+| ζ fit, charge channel (route G) | C factor, one μ-batch working set, the ψ(G) slice; the Z store `16·Q·μ·N_G/P` lives on host or disk | `plan_zeta_route_g` ([§ route G](#route-g-zeta-fit)) | warns; smallest μ-batch |
+| ζ fit, current channels (bispinor) | the same, at μ_T, with three factors, accumulators and Z stores | `plan_zeta_route_g(n_vertex=3)` ([§ route G](#route-g-zeta-fit)) | warns; smallest μ-batch |
+| V_q | `V_acc` `16·Q·μ_L·μ_R/P`, one q-tile of ζ rows, G panels | `vq_tile_bytes` ([§ V_q](#vq-g-panels-and-q-tiles)) | warns; one q |
 | V_q unfold | `16·N_k·μ²/P`, sharded `P(None,'x','y')` | — | — |
-| shared-pole screening and Σ | response-bank faces, pencils, eigh workspace, then G and W tiles | the capacity ledger ([shared-pole model](shared_pole_model.md), byte model) | before allocating, when a stage and its named concurrent stages exceed the budget |
-| static / GN-PPM screening | the χ₀ node ([§ Green-side](#the-green-side-stages)); the GN fit's q block (XLA's compiled footprint of one q) | `price_chi0_node` (a price, no choice); `_gn_ppm_fit_q_block`: the fixed tile, at least one q | `GATE gn_ppm_fit_capacity` (only under `LORRAX_PPM_FIT_ARENA_GIB`) |
+| shared-pole screening and Σ | response-bank faces, pencils, eigh workspace, then G and W tiles | the capacity ledger ([shared-pole model](shared_pole_model.md), byte model) | warns and admits, when a stage and its named concurrent stages exceed the budget |
+| static / GN-PPM screening | the χ₀ node ([§ Green-side](#the-green-side-stages)); the GN fit's q block (XLA's compiled footprint of one q) | `price_chi0_node` (a price, no choice); `_gn_ppm_fit_q_block`: the fixed tile, at least one q | warns; one q (only under `LORRAX_PPM_FIT_ARENA_GIB`) |
 | Σ(τ) sweep | the resident pole fields, band-complete ψ, then one row pass ([§ Green-side](#the-green-side-stages)) | `subtile_stream.plan_rows`: the rows within the fixed tile | — |
 | matrix-element sweep (V_H, four-current) | the step's slabs, and FFT boxes `(2 + 2·n_comp)·n_s·N_r·16` per band of a band-layout operator | `mtxel_sweep.plan_sweep`: bands in the fewest chunks whose boxes fit the fixed tile | — |
-| ψ loader off the fit plan (ζ reuse, current faces) | one band tile of G-flat rows, samples and faces | `gflat_memory_model.loader_band_chunk`: the fixed tile, at least the automatic 16 | the loader, when one scan row cannot fit |
-| moment bank | `(per_q·w + 16)` faces for a batch of `w` q parents | `response_bank.moment_q_width`: the outputs within the fixed tile | the ledger |
-| sector Σ face Green panel | one parent Green tile of band panels, at most the ledger's room | `greens_function_kernel.green_panel_bytes` | the ledger |
+| ψ loader off the fit plan (ζ reuse, current faces) | one band tile of G-flat rows, samples and faces | `gflat_memory_model.loader_band_chunk`: the fixed tile, at least the automatic 16 | warns; one scan row |
+| moment bank | `(per_q·w + 16)` faces for a batch of `w` q parents | `response_bank.moment_q_width`: the outputs within the fixed tile | the ledger warns |
+| sector Σ face Green panel | one parent Green tile of band panels, at most the ledger's room | `greens_function_kernel.green_panel_bytes` | the ledger warns |
 | direct Γ head (bulk metals) | the compiled per-sample footprint × samples per call, split over every rank | `photon_direct_head.direct_gamma_chunk_plan`: the fixed tile, at least 2¹⁰ samples per rank, at most one 2¹⁷ replicate per call | — |
 | head wings | `n_ends` gathered endpoint blocks `16·N_k·n_s·block·N_b` | `qsgw_head.head_wing_mu_block`: the fixed tile, at least 16 centroids | — |
 | exciton_bands C_q | P_R and its update, one ψ chunk and its Pk | `vq_interp.build_cq_q_chunk`: q rows within the fixed tile | — |
@@ -201,9 +205,10 @@ stays on host when it fits 0.8 of the node's `MemAvailable` over the processes
 on the node (minimum over processes); otherwise it is a slab_io scratch
 dataset. The finalize streams it in G tiles sized to a quarter of the target.
 
-- **`GATE zeta-mubatch-capacity`**: the smallest configuration (ψ(G)
-  resident, `b = P`, one plane per group) exceeds the target. ψ(G) streaming
-  is not implemented. Fix: more ranks or more memory per device.
+- **Over the target**: when the smallest configuration (ψ(G) resident,
+  `b = P`, one plane per group) exceeds the target, it runs with one warning
+  line. ψ(G) streaming is not implemented. Fix: more ranks or more memory
+  per device.
 
 The receipt (`ISDF μ-batch plan`) prints the route, batch, collectives per
 batch against the minimum efficient payload, the Z-store placement, every
@@ -234,9 +239,8 @@ otherwise the largest width ≤ 4096 whose panel all-gather fits
 leaves), then `q_tile` as every q whose rows fit the fixed tile and the
 host staging budget, balanced across tiles. Both come from the shapes, so every
 rank issues the same collective reads; the accumulators are priced, not capped.
-`GATE vq_tile_budget` refuses only under an explicit `budget_bytes`, when
-`resident + work + per_q` alone exceeds it, or when one q's host staging does
-not fit.
+When `resident + work + per_q` alone exceeds an explicit `budget_bytes`, or
+one q's host staging does not fit, the planner warns and runs one q per tile.
 
 For the charge channel, `ZetaG.contract_v` accumulates `V_q` tile by tile as
 it forms ζ from the Z store, keeping ζ only at the columns the head consumers
@@ -259,7 +263,7 @@ assignment cannot see: a donated carry the caller allocated, a native
 handler's run-time scratch, a lookahead copy of the output. At or below the
 closed form, or within the room, the chunk runs unchanged. Above both, the
 slope is corrected from that one point, `per_unit = (compiled − fixed)/chunk`,
-the chunk solved directly, and compiled once more. There is no bisection; a second figure still over the room refuses.
+the chunk solved directly, and compiled once more. There is no bisection; a second figure still over the room warns and runs.
 The direct stream's check compiles through the dispatch's own executable cache
 (`gw.response_bank._compiled`), so the checked executable is the one that runs.
 Reading a figure costs 0.01–0.07 s for the direct stream, 0.02–0.12 s for the
@@ -315,9 +319,9 @@ Two reserves follow from this.
   40 GB A100 (42.9 GB) a budget of 36 leaves 6.9 GB. Never set the budget to
   the card size.
 
-When a recompiled chunk is still over its room, `check_chunk` refuses by name
-(`GATE compiled_chunk_capacity`) before the stage runs; it does not leave the
-stage to fail at allocation.
+When a recompiled chunk is still over its room, `check_chunk` prints one
+warning line and the stage runs at that chunk; if the room is really
+missing, it fails at allocation.
 
 ### Native handlers
 
@@ -370,10 +374,10 @@ per batch against rule 1. All planners stay single-stage and generic.
 3. **Read the receipts** in `gwjax.out`: `ISDF μ-batch plan` for each ζ
    fit (the charge channel, and the current channels with `channels = 3`),
    which names its binder, and `Resident ψ` for the GW carriers.
-4. **On a refusal**, add ranks or memory per device: `GATE
-   zeta-mubatch-capacity` names ψ(G) and the smallest batch. For V_q, more
-   ranks, fewer centroids, or a smaller ζ sphere; `vq_g_chunk_size` shrinks
-   only the panel workspace.
+4. **On a `memory over budget` warning** (or an OOM after one), add ranks
+   or memory per device. For the ζ fit the smallest batch keeps ψ(G)
+   resident; for V_q, more ranks, fewer centroids, or a smaller ζ sphere;
+   `vq_g_chunk_size` shrinks only the panel workspace.
 5. **Compare with the run.** `gwjax.out` prints MAJOR-STAGE DEVICE AND HOST
    MEMORY: each stage's device peak (max and min over ranks), the planner's
    price and `γ = peak / price`, or "no planner", the host columns, and the

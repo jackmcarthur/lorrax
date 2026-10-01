@@ -283,12 +283,10 @@ def plan_zeta_route_g(*, meta, mesh_xy, n_q_selected: int, ngkmax: int,
     floor_ws = sum(ws(P_, 1, 1, n_a).values())
     need_min = base_total + psi_bytes + floor_ws
     if M_f - psi_bytes < floor_ws:
-        raise ValueError(
-            f"GATE zeta-mubatch-capacity: got {need_min / 1e9:.2f} GB/dev for the "
-            f"smallest route-G configuration (ψ(G) resident {psi_bytes / 1e9:.2f}, "
-            f"b = P = {P_}, one plane per block), want <= {target / 1e9:.2f} GB/dev; why: "
-            "ψ(G) streaming in two band-chunk buffers is not implemented.  Fix: "
-            "more ranks or more memory per device.")
+        # The smallest route-G configuration (ψ(G) resident, b = P, one plane
+        # per block) runs; ψ(G) streaming in band-chunk buffers is not implemented.
+        from common.gpu_utils import warn_over_budget
+        warn_over_budget("zeta mu-batch (b = P, one plane per block)", need_min, target)
     b_top = math.ceil(mu / P_) * P_
     cands = []
     n_pg = 1
@@ -372,8 +370,8 @@ def route_g_plane_chunk(plan: MuBatchPlan, c_src: int, n_ranks: int) -> tuple[in
     are re-priced at ``P·c_src``.  ``c_out`` is the widest balanced chunk that
     fits the plan's target with the whole plane axis in one block; when even
     one row does not fit, the plane axis is cut into the fewest blocks that
-    do (each block redoes the unfold).  Refuses by name when one plane group
-    per block does not fit.
+    do (each block redoes the unfold).  When one plane group per block does
+    not fit, that smallest split runs and one warning line is printed.
     """
     P_ = int(n_ranks)
     c_plan = max(1, int(plan.b) // P_)
@@ -388,10 +386,9 @@ def route_g_plane_chunk(plan: MuBatchPlan, c_src: int, n_ranks: int) -> tuple[in
     for n_blk in range(2, n_grp + 1):
         if fits(1, n_blk):
             return 1, n_blk
-    need = plan.working_set(P_ * c_src, n_pg, 1, n_grp)
-    raise ValueError(
-        f"GATE zeta-mubatch-orbit-capacity: whole-orbit bins of {c_src} centroids "
-        f"per owner (planned {c_plan}; the widest orbit sets the floor) need "
-        f"{need / 1e9:.2f} GB/dev with one row and one plane group per block, want "
-        f"<= {plan.target_bytes / 1e9:.2f} GB/dev.  Fix: more memory per device "
-        "(the source rows scale with the orbit width, not with P).")
+    # Whole-orbit bins of c_src centroids per owner (the widest orbit sets
+    # the floor; the source rows scale with the orbit width, not with P).
+    from common.gpu_utils import warn_over_budget
+    warn_over_budget(f"zeta mu-batch orbit bins ({c_src} centroids per owner)",
+                     plan.working_set(P_ * c_src, n_pg, 1, n_grp), plan.target_bytes)
+    return 1, n_grp

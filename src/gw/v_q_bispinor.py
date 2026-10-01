@@ -578,7 +578,7 @@ class ParkedVTiles:
     while they are live and wait on host across the rest of the ISDF stage,
     so the device budget the next fit was planned with is untouched.  The
     host bytes are committed before the next fit measures MemAvailable for
-    its own Z stores, and refused here by name if this rank's share cannot
+    its own Z stores, and warned here (one line) if this rank's share cannot
     hold them (the CC tile is Q·μ²·16/P per rank: 1.5 GB/rank at VI3 12×12
     P16, μ 3200).  ``capture`` names the restart pre-unfold offer the tile's
     producer made (``restart_q_storage``); :meth:`restore` re-offers it, so
@@ -608,12 +608,8 @@ class ParkedVTiles:
             0 if cap is None or any(same) else local_bytes(cap.X_ibz))
         have = host_bytes_per_process()
         if need > have:
-            raise RuntimeError(
-                f"GATE bispinor-v-host-park: got {what} of {need / 1e9:.2f} "
-                f"GB/rank, want at most this rank's host share "
-                f"{have / 1e9:.2f} GB; why: the four-current V_q parks its "
-                "tiles on host between the fits and V_q.  Run on more ranks, "
-                "or with more host memory per rank.")
+            from common.gpu_utils import warn_over_budget
+            warn_over_budget(f"four-current V_q host park ({what})", need, have, local=True)
         if jax.process_index() == 0:
             print_fn(f"  μ-batch V_q: {what} parked on host, {need / 1e9:.2f} "
                      f"GB/rank of a {have / 1e9:.1f} GB host share")

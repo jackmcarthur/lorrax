@@ -222,7 +222,7 @@ def _metric_chunk_plan(
     ``psi(G)`` band shard plus the replicated per-k density matrices and their
     psum buffer.  The k chunk divides the parent count, so one executable
     serves every chunk.  A single k whose replicated matrices exceed the
-    budget refuses: this route does not spatially shard ``D_k(r)``.
+    budget runs alone with one warning: this route does not spatially shard ``D_k(r)``.
     """
     from runtime.padding import bounded_partition_tile
 
@@ -237,12 +237,10 @@ def _metric_chunk_plan(
     per_k = (local_chunk * int(ns) * int(ngkmax) * c128
              + 2 * int(n_windows) * int(ns) ** 2 * int(n_grid) * c128)
     if per_k > budget // 2:
-        raise MemoryError(
-            "centroid feature metric: one k point's replicated "
-            f"{ns}x{ns} density matrices need {per_k / 2**30:.2f} GiB/rank, "
-            f"above the {budget / 2 / 2**30:.2f} GiB/rank chunk budget. "
-            "This route band-shards psi but does not spatially shard D_k(r); "
-            "reduce the FFT grid or add ranks.")
+        # One k runs: this route band-shards psi but does not spatially
+        # shard the replicated D_k(r).
+        from common.gpu_utils import warn_over_budget
+        warn_over_budget("centroid feature metric (one k)", per_k, budget // 2)
     k_chunk = bounded_partition_tile(
         int(n_parents), max(1, (budget // 2) // per_k), 1)
     return max(1, k_chunk), band_chunk, budget

@@ -627,12 +627,14 @@ def _plan_rows_pass(geom: dict, *, rows: int, omega_rows: int,
         if cols >= 1:
             break
         if per <= 1:
-            required_cols = (1 if fixed_local_cols is None
-                             else int(fixed_local_cols))
-            raise MemoryError(
-                f"fit_galerkin_basis: {name} does not fit even one state "
-                f"per device: {_rows_pass_bytes(geom, rows=1, fft_rows=1, local_cols=required_cols, omega_rows=omega_rows, resident=resident)/2**30:.2f}"
-                f" GiB/device against {capacity/2**30:.2f} GiB/device")
+            # Not even one state per device fits: run one state at the
+            # narrowest r slab and warn.
+            cols = 1 if fixed_local_cols is None else int(fixed_local_cols)
+            from common.gpu_utils import warn_over_budget
+            warn_over_budget(f"Galerkin fit {name} (one state)", _rows_pass_bytes(
+                geom, rows=1, fft_rows=1, local_cols=cols, omega_rows=omega_rows,
+                resident=resident), capacity)
+            break
         groups *= 2
     fft = _largest_fit(per, lambda f: f * geom["row_cufft"] <= geom[
         "reserve"] and _rows_pass_bytes(
@@ -661,11 +663,11 @@ def _plan_basis_passes(geom: dict, *, band_carrier: int, rank: int,
         geom, band_carrier=band_carrier, rank=rank, local_cols=c,
         k_tile=1) <= capacity)
     if cols < 1:
-        raise MemoryError(
-            "fit_galerkin_basis: the all-states projection does not fit at "
-            f"band carrier {band_carrier}, rank {rank}: "
-            f"{_projection_bytes(geom, band_carrier=band_carrier, rank=rank, local_cols=1, k_tile=1)/2**30:.2f}"
-            f" GiB/device against {capacity/2**30:.2f} GiB/device")
+        cols = 1
+        from common.gpu_utils import warn_over_budget
+        warn_over_budget(f"Galerkin all-states projection (band carrier {band_carrier})",
+                         _projection_bytes(geom, band_carrier=band_carrier, rank=rank,
+                                           local_cols=1, k_tile=1), capacity)
     groups = 1
     while True:
         per = -(-int(rows) // groups)
@@ -676,10 +678,11 @@ def _plan_basis_passes(geom: dict, *, band_carrier: int, rank: int,
             break
         groups *= 2
     if x_cols < 1:
-        raise MemoryError(
-            "fit_galerkin_basis: the selected-row pass does not fit beside "
-            f"its resident rows ({x_resident/2**30:.2f} GiB/device) against "
-            f"{capacity/2**30:.2f} GiB/device")
+        x_cols = 1
+        from common.gpu_utils import warn_over_budget
+        warn_over_budget("Galerkin selected-row pass", _rows_pass_bytes(
+            geom, rows=per, fft_rows=1, local_cols=1, omega_rows=0,
+            resident=x_resident), capacity)
     cols = x_cols
     bpd = int(band_carrier) // p
     k_tile = max(d for d in range(1, nk + 1) if nk % d == 0 and (
@@ -707,21 +710,27 @@ def _fit_band_carrier(geom: dict, *, carrier: int, divisor: int, rank: int,
     """Largest band carrier (a ``divisor`` multiple, at most ``carrier``)
     whose projection stream fits beside ``rank`` resident selected rows."""
     carrier = int(carrier)
-    while True:
-        try:
-            _plan_basis_passes(geom, band_carrier=carrier, rank=rank,
-                               rows=1, capacity=capacity)
-            return carrier
-        except MemoryError as exc:
-            if carrier <= divisor:
-                raise
-            nxt = max(divisor, (carrier // (2 * divisor)) * divisor)
-            if nxt >= carrier:
-                nxt = carrier - divisor
-            log_fn(
-                f"  Whole-state planner reduces the canonical WFN band "
-                f"carrier {carrier} -> {nxt} at rank {rank}: {exc}")
-            carrier = nxt
+
+    def fits(carrier):
+        # _plan_basis_passes at rows=1 runs at one r column per device for
+        # the projection and the selected-row pass beside its resident rows.
+        full_cols = -(-geom["n_rtot"] // geom["p"])
+        x_resident = rank * geom["ns"] * full_cols * _C16 + rank * rank * _C16
+        return (_projection_bytes(geom, band_carrier=carrier, rank=rank,
+                                  local_cols=1, k_tile=1) <= capacity
+                and _rows_pass_bytes(geom, rows=1, fft_rows=1, local_cols=1,
+                                     omega_rows=0, resident=x_resident) <= capacity)
+
+    while carrier > divisor and not fits(carrier):
+        nxt = max(divisor, (carrier // (2 * divisor)) * divisor)
+        if nxt >= carrier:
+            nxt = carrier - divisor
+        log_fn(
+            f"  Whole-state planner reduces the canonical WFN band "
+            f"carrier {carrier} -> {nxt} at rank {rank}: its one-column "
+            f"projection does not fit {capacity/2**30:.2f} GiB/device")
+        carrier = nxt
+    return carrier
 
 
 def _whole_state_geometry(*, meta, mesh_xy: Mesh, nk: int, nspinor: int,
@@ -754,11 +763,9 @@ def _whole_state_geometry(*, meta, mesh_xy: Mesh, nk: int, nspinor: int,
                 * bfc_fragmentation_target_utilization(nspinor))
     reserve = geom["reserve"] = float(device_pool_limit) - capacity
     if float(memory.cufft_scratch) > reserve:
-        raise MemoryError(
-            "fit_galerkin_basis: the canonical one-row full-grid transform "
-            f"needs a {memory.cufft_scratch/2**30:.2f} GiB/device cuFFT "
-            f"workspace, above the contiguous BFC reserve "
-            f"{reserve/2**30:.2f} GiB/device")
+        from common.gpu_utils import warn_over_budget
+        warn_over_budget("Galerkin one-row full-grid transform cuFFT workspace",
+                         memory.cufft_scratch, reserve)
     return geom, capacity, memory
 
 
@@ -1880,13 +1887,7 @@ def plan_galerkin_stream(*, rank: int, nspinor: int, n_rtot: int,
     """Choose the incumbent Q-budget-bounded, mesh-aligned r schedule."""
     q_bytes_per_local_r = (
         rank * nspinor * np.dtype(np.complex128).itemsize)
-    if q_bytes_per_local_r > q_tile_budget:
-        raise ValueError(
-            "plan_galerkin_stream: one local r column of Q needs "
-            f"{q_bytes_per_local_r / 1024**3:.6f} GiB/device, exceeding "
-            f"q_tile_budget={q_tile_budget / 1024**3:.6f} GiB/device. "
-            "Increase that budget or reduce the retained rank.")
-    r_local_cap = q_tile_budget // q_bytes_per_local_r
+    r_local_cap = max(1, q_tile_budget // q_bytes_per_local_r)
     r_chunk = min(n_rtot, r_local_cap * r_mesh_divisor)
     if r_chunk < n_rtot:
         r_chunk = max(

@@ -344,7 +344,7 @@ def gram_col_block_bytes(nk: int, nspinor: int, block_width: int) -> int:
 
     Both left and right pair-density intermediates are complex128 and have
     ``nk * nspinor**2 * block_width**2`` elements.  Keep this formula here as
-    the single source used by the auto planner, its refusal, and unit gates.
+    the single source used by the auto planner, its warning, and unit gates.
     """
     nk_i = int(nk)
     ns_i = int(nspinor)
@@ -371,17 +371,13 @@ def auto_gram_col_block_width(
     """Largest mesh-aligned Gram seed tile whose square-law price fits.
 
     Auto widths align *down* so rounding for a mesh can never invalidate the
-    memory bound.  Refuse before the pair-density allocation when even the
-    supported minimum block cannot fit.
+    memory bound.  When even the supported minimum block does not fit, that
+    block is returned with one warning line.
     """
-    budget_i = int(budget_bytes)
+    budget_i = max(0, int(budget_bytes))
     divisor_i = max(1, int(divisor))
     min_aligned = ((max(1, int(min_width)) + divisor_i - 1)
                    // divisor_i) * divisor_i
-    if budget_i < 1:
-        raise MemoryError(
-            f"Gram tile planner has no positive seed budget: {budget_i} B"
-        )
     # The seed is a per-device screen, as is the budget. Legal square
     # tiles divide both mesh axes; price one aligned unit and scale its
     # square, then let the actual executable certify the full live set.
@@ -390,17 +386,12 @@ def auto_gram_col_block_width(
         x_shards=x_shards, y_shards=y_shards)
     width = math.isqrt(budget_i // coefficient) * divisor_i
     if width < min_aligned:
-        required = gram_col_block_device_bytes(
-            nk, nspinor, min_aligned, min_aligned,
-            x_shards=x_shards, y_shards=y_shards)
-        raise MemoryError(
-            "Gram tile seed planner refuses before pair-density "
-            f"allocation: nk={int(nk)}, nspinor={int(nspinor)}, minimum "
-            f"mesh-aligned block={min_aligned} prices {required / 2**30:.2f} "
-            f"GiB but the Gram transient budget is {budget_i / 2**30:.2f} "
-            "GiB. Lower the candidate count/band window or raise the "
-            "device-memory budget."
-        )
+        from common.gpu_utils import warn_over_budget
+        warn_over_budget(f"kmeans Gram seed tile (block {min_aligned})",
+                         gram_col_block_device_bytes(nk, nspinor, min_aligned, min_aligned,
+                                                     x_shards=x_shards, y_shards=y_shards),
+                         budget_i)
+        return min_aligned
     return width
 
 
@@ -508,12 +499,9 @@ def _auto_gram_width_from_compiled_peaks(
         width = max(floor, ((width // 2) // d) * d)
         facts = check(width)
     if facts["peak"] > int(budget_bytes):
-        raise MemoryError(
-            "Gram tile planner refuses before pair-density allocation: "
-            f"the minimum mesh-aligned tile={floor} has a compiled full "
-            f"live set of {facts['peak'] / 2**30:.2f} GiB/device, above "
-            f"the {int(budget_bytes) / 2**30:.2f}-GiB/device target."
-        )
+        from common.gpu_utils import warn_over_budget
+        warn_over_budget(f"kmeans Gram tile (minimum {floor}, compiled)",
+                         facts["peak"], int(budget_bytes))
 
     while width < ceiling:
         wider = min(ceiling, ((2 * width) // d) * d)

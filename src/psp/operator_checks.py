@@ -319,8 +319,8 @@ def validate_dense_h_inputs(
     files.  Every refusal is a :class:`DenseHRefusal` whose ``rule`` names
     the class: ``upf_missing``, ``functional``, ``xc_extension``,
     ``pseudo_type``, ``magnetism``, ``nc_gga_branch``, ``charge_density``,
-    ``truncation_2d``, ``memory``.  On success the validated operator
-    context comes back.
+    ``truncation_2d``.  Dense matrices over ``budget_bytes`` warn, not
+    refuse.  On success the validated operator context comes back.
 
     Magnetism: a noncollinear magnetic run (``do_magnetization``) is
     rebuilt with V_xc = v δ + B·σ from ρ and m (``psp.xc``), in QE's general
@@ -413,15 +413,11 @@ def validate_dense_h_inputs(
             f"assume_isolated={crystal.assume_isolated!r}; V_H must use the "
             f"truncation the SCF used (sys_dim 2 <-> '2D').")
 
-    # ---- the dense matrices fit the one device budget ----
+    # ---- the dense matrices against the one device budget (warn only) ----
     need = dense_h_bytes(n_basis_max)
     if need > float(budget_bytes):
-        raise DenseHRefusal(
-            "memory",
-            f"one k needs {need / 1e9:.2f} GB (N = nspinor·ngk = "
-            f"{int(n_basis_max)}, {DENSE_H_MATRICES_PER_K}·N²·16 B) but the "
-            f"device budget is {float(budget_bytes) / 1e9:.2f} GB "
-            f"(memory_per_device_gb).  The dense route is for small cells.")
+        from common.gpu_utils import warn_over_budget
+        warn_over_budget(f"dense H_k (N = {int(n_basis_max)})", need, budget_bytes)
 
     return validate_operator_inputs(pseudos, crystal, sys_dim=int(sys_dim),
                                     caller="dense_h")

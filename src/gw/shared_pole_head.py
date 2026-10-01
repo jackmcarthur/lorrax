@@ -210,10 +210,9 @@ def build_shared_pole_head(handle, header, V_q, wfns, meta, config, *,
         parents = np.flatnonzero(np.asarray(header["q_irr_full_idx"]) == 0)
         if len(parents) != 1:
             raise ValueError("GATE shared_pole_head: expected one Gamma parent")
-        # The hardware ledger can admit a scaling WARN above 3U. That
-        # does not waive the individual matrix bound for the new projector.
-        # Refuse before reading factors or compiling its numerical work.
-        # The ledger's unit is U = 16 Q (N_spinor N_mu)^2 / P, so the store's
+        # The hardware ledger can admit a scaling WARN above 3U; the new
+        # projector's individual matrix bound warns the same way (owner
+        # 2026-10-01: no refusal on a memory figure).  The ledger's unit is U = 16 Q (N_spinor N_mu)^2 / P, so the store's
         # (Q, N_spinor, N_mu) must reproduce it; the body matrix the
         # projector bounds is the spin-traced n_mu x n_mu charge operator on
         # every admitted store, hence the spin-free logical bound.
@@ -224,9 +223,9 @@ def build_shared_pole_head(handle, header, V_q, wfns, meta, config, *,
         if ledger.U_bytes_per_rank != unit:
             raise ValueError("GATE shared_pole_head_capacity: store/current-map geometry mismatch")
         if projection_bytes > logical:
-            raise ValueError(
-                "GATE shared_pole_head_capacity: Gamma projection exceeds the all-P "
-                f"logical matrix bound ({projection_bytes} > {logical} bytes per rank)")
+            from common.gpu_utils import warn_over_budget
+            warn_over_budget("shared-pole head Gamma projection (all-P logical bound)",
+                             projection_bytes, logical)
         iq = int(parents[0])
         realize = shared_pole_operator_realizer(meta, header,
             q_full_idx=np.asarray([0]), mesh_xy=mesh_xy)

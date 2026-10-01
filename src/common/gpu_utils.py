@@ -146,6 +146,48 @@ def stage_prices() -> list[dict]:
     return [dict(row) for row in _STAGE_PRICES]
 
 
+_OVER_BUDGET_WARNED: dict[str, float] = {}
+
+
+def warn_over_budget(stage: str, need_bytes: float, budget_bytes: float, *,
+                     local: bool = False) -> None:
+    """The one line a planner prints when its price exceeds its budget; the run goes on.
+
+    Owner ruling 2026-10-01: a price over ``memory_per_device_gb`` (or a
+    planner's tile) never stops a run.  The planner takes its smallest
+    size, this warns once per stage kind and process (``stage`` less a
+    trailing ``.N`` or ``:N`` counter; again only when a later call of that
+    kind needs more), and the stage runs; if the device really lacks the
+    room, the allocator OOMs.  Rank 0 warns for a rank-invariant
+    price; ``local=True`` (a rank-local price) warns on the rank it is on.
+
+    Rank 0's line is a :class:`RuntimeWarning`, so a production driver's
+    report keeps it in its WARNINGS block (``runtime.production_stream``
+    discards incidental stdout); another rank's local line goes to stderr,
+    which production leaves untouched.
+    """
+    import re
+    import sys
+    import warnings
+    from runtime import _resolve_proc_id
+    kind = re.sub(r"([.:]\d+)+$", "", str(stage))
+    need, have = float(need_bytes), float(budget_bytes)
+    if need <= _OVER_BUDGET_WARNED.get(kind, -1.0):
+        return
+    _OVER_BUDGET_WARNED[kind] = need
+    rank = _resolve_proc_id()
+    if rank != 0 and not local:
+        return
+    where = f" (rank {rank})" if local else ""
+    message = (f"memory over budget at {stage}{where}: needs {need / 1e9:.2f} GB/rank, "
+               f"budget {have / 1e9:.2f} GB/rank, over by {(need - have) / 1e9:.2f} GB; "
+               "continuing (an OOM is possible)")
+    if rank == 0:
+        warnings.warn(message, RuntimeWarning, stacklevel=2)
+    else:
+        print("WARNING: " + message, file=sys.stderr, flush=True)
+
+
 def _query_nvidia_smi_memory(field: str) -> int | None:
     """Query this rank's visible GPU memory field, returned in bytes."""
     try:

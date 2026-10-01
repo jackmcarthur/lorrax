@@ -383,8 +383,8 @@ carrier). The budget left
 beside them sizes one parent panel × pole-column chunk of synthesis workspace:
 parent panels are a static loop inside the executable, chunks of one static
 width a device loop, one of each when everything fits. A store whose resident
-factors do not fit refuses (`GATE shared_pole_capacity`) with the smallest
-square mesh that fits them. The synthesized $W$ always uses both mesh axes.
+factors do not fit runs at one parent and one column multiple, with one
+`memory over budget` warning line. The synthesized $W$ always uses both mesh axes.
 
 **Hole routing.** Conduction windows take $W_+(q)$. An ordered store routes
 valence windows to the particle–hole partner,
@@ -473,9 +473,10 @@ checks $D=8n^2+4nR$, $s_f=2a$; CT cross reduction
 $D=10\,CT+14R^2+12n(C+T)$. A local round has $b=P$. The native cuSOLVERMp `eigh`
 adds a private $n^2/P$ operand tile beside its workspace, which
 `distrib_la.workspace_bytes_per_rank` includes. The ledger
-(`CapacityLedger`) owns admission: a stage refuses before it allocates when its
-aggregate with the named concurrent stages exceeds the device budget
-(`memory.per_device_gb`) less the inherited stream/Σ peaks.
+(`CapacityLedger`) owns admission: when a stage's aggregate with the named
+concurrent stages exceeds the device budget (`memory.per_device_gb`) less the
+runtime reserve, the row is recorded FAIL, one warning line is printed, and
+the stage is admitted and runs (owner 2026-10-01: no refusal on a price).
 
 **Bank payload** (`shared_pole_bank_payload_bytes`, the residence admission):
 

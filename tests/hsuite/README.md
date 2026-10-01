@@ -100,7 +100,7 @@ Not covered:
   reference (`GATE w_bse_requires_measured_trs`);
 - the planners' chunked paths: at μ = 6 every object is KB-sized, and a
   `memory_per_device_gb` small enough to chunk leaves the live set no room
-  (`GATE gn_ppm_fit_capacity` at 0.05 GB);
+  (at 0.05 GB the planners warn over budget and take their smallest sizes);
 - the `parallel_transport` head itself: the 3³ Na links fail the window
   gate, so the unnamed default runs `dft_velocity`;
 - the W line-site re-plan: it first fires at Na map 2 (and runs there,

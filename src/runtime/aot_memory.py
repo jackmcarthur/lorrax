@@ -515,8 +515,8 @@ def check_chunk(chunk: int, *, build, fixed: float, per_unit: float, room: float
     Above both, the slope is corrected from this one point,
     ``per_unit = (compiled - fixed) / chunk``, the chunk solved directly,
     ``floor((room - fixed) / per_unit)``, and compiled once more.  No
-    bisection: a second figure still over the room refuses by name
-    (``GATE compiled_chunk_capacity``) before the stage runs.
+    bisection: a second figure still over the room prints one warning line
+    (``common.gpu_utils.warn_over_budget``) and the stage runs at that chunk.
     """
     import time
     chunk = int(chunk)
@@ -541,9 +541,6 @@ def check_chunk(chunk: int, *, build, fixed: float, per_unit: float, room: float
     again = compiled_new_bytes(compiled, extra=int(extra(solved, compiled)), platform=platform)
     seconds += time.perf_counter() - started
     if again > room:
-        raise MemoryError(
-            f"GATE compiled_chunk_capacity: {stage}: got {again / 1e9:.2f} GB/rank at chunk "
-            f"{solved} after one corrected recompile (chunk {chunk}: {got / 1e9:.2f} GB, "
-            f"analytic {analytic / 1e9:.2f} GB); want <= the room {room / 1e9:.2f} GB; "
-            "fix: more ranks or a larger memory_per_device_gb")
+        from common.gpu_utils import warn_over_budget
+        warn_over_budget(f"{stage or 'compiled chunk'} (chunk {solved}, compiled)", again, room)
     return ChunkCheck(solved, compiled, analytic, got, again, slope, True, seconds)

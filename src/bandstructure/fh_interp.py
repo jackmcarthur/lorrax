@@ -189,9 +189,12 @@ def streaming_galerkin_solve(wfn, sym, meta, centroid_indices, mesh_xy: Mesh,
     from runtime.aot_memory import runtime_reserve_bytes
     device_fit_budget = device_budget_bytes() - float(runtime_reserve_bytes())
     if device_fit_budget <= 0:
-        raise RuntimeError(
-            "htransform: no room left in the run budget "
-            f"({device_budget_bytes() / 1e9:.2f} GB/device) beside the runtime reserve")
+        # No room beside the runtime reserve: the fit plans its smallest
+        # passes (each warns) and runs.
+        from common.gpu_utils import warn_over_budget
+        warn_over_budget("htransform runtime reserve", runtime_reserve_bytes(),
+                         device_budget_bytes())
+        device_fit_budget = 1.0
     if log_fn is not None:
         log_fn(
             "  Whole-state fit budget: "
