@@ -367,7 +367,10 @@ parent rows. The result is the parent pair $(W_p, W_p^{\mathsf T})$,
 $[n_{q,\rm irr},\mu,\mu]$; no full-q $W$ is formed (TASTE 97). The Σ door
 unfolds the pair on its transform's load through the store's q-wedge tables
 (`_shared_pole_q_wedge`, pair-transpose rule, mathdx mode 9), as the GN-PPM
-wedge does. An endpoint map that crosses a mesh shard refuses
+wedge does, one row pass of whole centroid orbits at a time: the pass's rows of
+the pair enter mode 9 with the load tables cut to the pass
+(`subtile_stream.pass_load`), and the pass's parent Green comes from
+band-complete ψ by one local GEMM (`ppm_tau_kernel._sigma_subtile_kernel`). An endpoint map that crosses a mesh shard refuses
 (`GATE shared_pole_w_parent_local`). The factors are read once per Σ call and stay resident:
 $32\,n_{q,\rm irr}\,\mu\,\bar K/P$ bytes per rank face-sharded,
 `P(None,'x',None,'y')`, or $16\,n_{q,\rm irr}\,\mu\,\bar K(1/P_x+1/P_y)$ when the
