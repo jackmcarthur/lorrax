@@ -422,8 +422,7 @@ def response_stream(wfns, meta, *, mesh_xy, q_ids, n_outputs,
             mesh_xy, (meta.nkx, meta.nky, meta.nkz), n_outputs,
             (n_input, int(wfns.slices.nb_full), vertex.n, 4),
             _ffi_key=ffi_dial_key(), layout=wfns.layout, selected_q=tuple(q_ids), pair_mode=pair_mode,
-            bank_carry=bank_carry, ordered=True, vertex=vertex.families, band_ranges=band_ranges,
-            photon_passes=passes)
+            bank_carry=bank_carry, ordered=True, vertex=vertex.families, photon_passes=passes)
         return kernel, vertex.fixed
     if not charge_representation(meta):
         raise ValueError("GATE response_representation: want an authenticated "
@@ -1146,15 +1145,14 @@ def response_support(wfns, meta, sample_plan, receipt, *, print_fn=print):
     lo, hi = refs[1]-refs[0], float(energy[u != 0].max()-energy[f != 0].min())
     mu = sample_plan["census"]["mu_ry"]
     decay_rate, amplitude = response_occupation_envelope(energy, f, u, mu)
-    band_ranges = None
-    if wfns.layout == "axis":
-        from .greens_function_kernel import _phase_band_interval
-        lo_band, hi_band = jax.device_get(_phase_band_interval(jnp.asarray(np.stack((f, u)))))
-        # Enclose every parent's exact weight support. Fixed bounds share one
-        # batched GEMM and remain safe when a complex-time phase underflows.
-        band_ranges = tuple((int(lo.min()), int(hi.max())) for lo, hi in zip(lo_band, hi_band))
-        if jax.process_index() == 0:
-            print_fn(f"Response occupied/empty band intervals: {band_ranges} of {f.shape[-1]}")
+    from .greens_function_kernel import _phase_band_interval
+    lo_band, hi_band = jax.device_get(_phase_band_interval(jnp.asarray(np.stack((f, u)))))
+    # Enclose every parent's exact weight support. Fixed bounds share one
+    # batched GEMM on the direct stream's band-complete ψ rows and remain safe
+    # when a complex-time phase underflows.
+    band_ranges = tuple((int(lo.min()), int(hi.max())) for lo, hi in zip(lo_band, hi_band))
+    if jax.process_index() == 0:
+        print_fn(f"Response occupied/empty band intervals: {band_ranges} of {f.shape[-1]}")
     return dict(f=f, u=u, refs=refs, lo=lo, hi=hi, mu=mu, decay_rate=decay_rate,
                 amplitude=amplitude, band_ranges=band_ranges)
 

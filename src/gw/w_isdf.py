@@ -27,6 +27,7 @@ from runtime.padding import (
 )
 from .efermi import band_in_occupation_window
 from .minimax_screening import MinimaxNodes
+from .subtile_stream import orbit_cuts, pass_tables, row_passes
 
 
 # ============================================================================
@@ -176,6 +177,65 @@ def _charge_stream_door(mesh_xy, kgrid, plan):
     return hit
 
 
+def _charge_pass_doors(mesh_xy, kgrid, plan, passes):
+    """Mode-11 doors and placed tables of the direct stream's row passes (``gw.subtile_stream``).
+
+    One pass covering every row reads the plan's own tables; a pass of fewer
+    rows reads them cut to its orbit-closed rows (``subtile_stream.pass_tables``).
+    Returns ``(doors, tables)``, one per pass, cached per (mesh, grid, plan, passes).
+    """
+    key = ("passes", mesh_xy, tuple(int(v) for v in kgrid), plan, tuple(passes))
+    hit = _CHARGE_DOORS.get(key)
+    if hit is None:
+        from common.fft_helpers import make_kconv_chi_unfold
+        from symmetry_maps import device_load_tables
+        base = plan.unfold_load_tables()
+        side, ns = int(mesh_xy.shape["x"]), int(np.asarray(base.spin).shape[-1])
+        local_rows = int(np.asarray(base.lsrc).shape[1]) // (side * ns)
+        cut = [base if (x0, xr) == (0, local_rows) else pass_tables(base, x0, xr, side, ns)
+               for x0, xr in passes]
+        hit = (tuple(make_kconv_chi_unfold(mesh_xy, kgrid, t, n_out=1, complete=False, norm="ortho")
+                     for t in cut),
+               tuple(tuple(device_load_tables(t, mesh_xy)) for t in cut))
+        while len(_CHARGE_DOORS) >= 2:
+            _CHARGE_DOORS.pop(next(iter(_CHARGE_DOORS)))
+        _CHARGE_DOORS[key] = hit
+    return hit
+
+
+_PASS_PLANS: dict = {}
+
+
+def _direct_pass_plan(mesh_xy, kgrid, plan, *, n_rmu, ns, n_band, q_count, n_nodes):
+    """The direct stream's row passes and node chunk (``gw.subtile_stream.plan_passes``).
+
+    Per local row: the two parent Greens and their antiunitary partners
+    ``16·n_parent·ns·(ν·ns)`` each, the door's R-space output and its
+    transform ``2·16·nk·ν``, the pass's ψ rows ``16·n_parent·ns·n_band``, and
+    the chunk's kept rows ``2·16·chunk·q·ν``; per node on the whole tile,
+    ``2·16·q·μ·ν``.  ``ν = n_rmu/p_y``, ``μ = n_rmu/p_x``.
+    """
+    from .greens_function_kernel import has_antiunitary_rows
+    from .subtile_stream import plan_passes
+    key = (mesh_xy, tuple(int(v) for v in kgrid), plan, int(n_rmu), int(ns), int(n_band),
+           int(q_count), int(n_nodes))
+    if key in _PASS_PLANS:
+        return _PASS_PLANS[key]
+    px, py = int(mesh_xy.shape["x"]), int(mesh_xy.shape["y"])
+    nk, n_parent = int(np.prod(kgrid)), int(plan.n_parent)
+    nu, mu = int(n_rmu) // py, int(n_rmu) // px
+    greens = 4 if has_antiunitary_rows(plan) else 2
+
+    def row_bytes(chunk):
+        return 16 * (greens * n_parent * ns * nu * ns + 2 * nk * nu
+                     + n_parent * ns * int(n_band) + 2 * chunk * int(q_count) * nu)
+    while len(_PASS_PLANS) >= 4:
+        _PASS_PLANS.pop(next(iter(_PASS_PLANS)))
+    _PASS_PLANS[key] = plan_passes(plan.unfold_load_tables(), mesh_xy, ns=ns, row_bytes=row_bytes,
+                                   chunk_bytes=2 * 16 * int(q_count) * mu * nu, n_nodes=n_nodes)
+    return _PASS_PLANS[key]
+
+
 def _chi_door_serves(mesh_xy, kgrid, ns) -> bool:
     """Whether mathdx mode 11 (``ffi.fft.make_kconv_chi_unfold``) holds this grid.
 
@@ -196,53 +256,6 @@ def _chi_door_serves(mesh_xy, kgrid, ns) -> bool:
 #: Test override of the direct photon stream's row passes per family pair (the
 #: ledger's count otherwise); ``None`` in production.
 _TEST_PHOTON_PASSES = None
-
-
-def photon_orbit_cuts(lsrc, side, ns):
-    """The local centroid rows a row pass may start at: no row on one side reads the other.
-
-    ``lsrc`` ``(nk, side * rows * ns)`` are a plan's X-shard-local merged sources
-    (``symmetry_maps.unfold_load_tables``).  A cut ``b`` is admissible when, on
-    every k and every X shard, rows below ``b`` read only rows below ``b`` and
-    rows at or above it only rows at or above it: a union of whole centroid
-    orbits.  Returns the sorted admissible cuts in ``(0, rows)``.
-    """
-    src = np.asarray(lsrc).reshape(np.asarray(lsrc).shape[0], int(side), -1, int(ns))
-    rows = src.shape[2]
-    row = np.where(src >= 0, src // int(ns), -1)
-    hi = row.max(axis=(0, 1, 3))                                  # per local row
-    lo = np.where(row >= 0, row, rows).min(axis=(0, 1, 3))
-    below = np.maximum.accumulate(hi)                             # max source of rows < b+1
-    above = np.minimum.accumulate(lo[::-1])[::-1]                 # min source of rows >= b
-    return tuple(int(b) for b in range(1, rows) if below[b - 1] < b and above[b] >= b)
-
-
-def photon_row_passes(n_pass, local_rows, cuts):
-    """``((x0, xr), ...)``: ``n_pass`` near-equal row passes, each boundary the nearest orbit cut.
-
-    ``None`` when more than one pass is asked and no cut exists.
-    """
-    n_pass, local_rows = int(n_pass), int(local_rows)
-    if n_pass <= 1:
-        return ((0, local_rows),)
-    if not cuts:
-        return None
-    bounds = sorted({min(cuts, key=lambda c: abs(c - i * local_rows / n_pass))
-                     for i in range(1, n_pass)})
-    edges = [0, *bounds, local_rows]
-    return tuple((a, b - a) for a, b in zip(edges[:-1], edges[1:]))
-
-
-def _pass_tables(tables, x0, xr, side, ns):
-    """A plan's load tables cut to the local centroid rows ``[x0, x0 + xr)`` of every X shard."""
-    lsrc = np.asarray(tables.lsrc)
-    nk, width = lsrc.shape[0], lsrc.shape[1] // int(side)
-    cols = np.concatenate([s * width + np.arange(x0 * ns, (x0 + xr) * ns) for s in range(int(side))])
-    cut = lsrc[:, cols]
-    moved = np.where(cut >= 0, cut - x0 * ns, -1)
-    if np.any((cut >= 0) & ((moved < 0) | (moved >= xr * ns))):
-        raise ValueError("_pass_tables: a row pass reads outside its own rows (not an orbit cut)")
-    return tables._replace(lsrc=moved.astype(np.int32), mph=np.asarray(tables.mph)[:, cols])
 
 
 def photon_response_passes(ledger, mesh_xy, families, *, n_parent, kgrid, n_band, n_out,
@@ -317,7 +330,7 @@ def _photon_chi_doors(mesh_xy, kgrid, half_plans, parity, passes=None):
     (``common.gamma_matrices.gamma_perm_phase_host``), so the door forms
     ``sum_ab (J_A G^> J_B^dagger)_ab conj(G^<)_ab``.  ``passes`` (one
     count per family pair, 1 by default) splits each pair's local centroid rows
-    into row passes at orbit cuts (:func:`photon_row_passes`): a pass's door
+    into row passes at orbit cuts (:func:`row_passes`): a pass's door
     reads only its own rows, so its parent Greens are built on those rows only.
     Returns ``{(pair, (h, g), (x0, xr)): (door, keys, tables)}``, ``(x0, xr) =
     None`` for one pass; quadrants and passes share every table array they
@@ -338,8 +351,7 @@ def _photon_chi_doors(mesh_xy, kgrid, half_plans, parity, passes=None):
             right_plan=None if half_plans[R] is half_plans[L] else half_plans[R])
         pass_rows = (None,)
         if n_pass > 1:
-            pass_rows = photon_row_passes(n_pass, local_rows,
-                                          photon_orbit_cuts(base.lsrc, side, 2))
+            pass_rows = row_passes(n_pass, local_rows, orbit_cuts(base.lsrc, side, 2))
             if pass_rows is None:
                 raise ValueError(
                     f"GATE response_photon_passes: got {n_pass} row passes for family pair "
@@ -349,7 +361,7 @@ def _photon_chi_doors(mesh_xy, kgrid, half_plans, parity, passes=None):
         flip = tuple(int(f == 1) for f in pair)
         keys = tuple((A, B) for A in family_channels(L) for B in family_channels(R))
         odd_nph = np.asarray(base.nph) * p[:, None]
-        cuts = {rows: base if rows is None else _pass_tables(base, *rows, side, 2)
+        cuts = {rows: base if rows is None else pass_tables(base, *rows, side, 2)
                 for rows in pass_rows}
         for h in (0, 1):
             for g in (0, 1):
@@ -1030,8 +1042,8 @@ def _get_chi_fractional_contour_kernel_face(
     # Face photon families exchange bounded band panels (one route for every
     # family pair's shape); axis carriers already replicate bands and use the
     # service's local contraction.
-    if band_ranges is not None and (layout != "axis" or pair_mode != "direct"):
-        raise ValueError("prepared response band ranges require the axis direct stream")
+    if band_ranges is not None and pair_mode != "direct":
+        raise ValueError("prepared response band ranges require the direct stream")
     if photon is not None:
         g_plan = partial(face_green_product, mesh=mesh_xy, phases=None, band_range=None)
         if n_rmu != photon.layout.packed_extent or ns != 4:
@@ -1047,7 +1059,7 @@ def _get_chi_fractional_contour_kernel_face(
     else:
         g_plan = gemm_plan(mesh_xy, m=n_rmu * ns, k=nb_full, n=n_rmu * ns,
                            nq=nk_shape, dtype=jnp.complex128, layout=layout,
-                           enable_active_range=band_ranges is not None)
+                           enable_active_range=band_ranges is not None and layout == "axis")
     # Four-current stream on raw-parent plans: each quadrant's parent Green pair
     # goes straight into mathdx mode 11 with the channel vertices (unfold on the
     # load, the traces in its Mid); no full-k Green exists.  A CUDA grid the
@@ -1072,14 +1084,36 @@ def _get_chi_fractional_contour_kernel_face(
         photon_doors, (door_index, door_arrays, door_specs) = _photon_stream_doors(
             mesh_xy, grid, half_plans, half_parity, passes)
     active_gemms = (tuple(g_plan.prepare_active_range(*bounds) for bounds in band_ranges)
-                   if band_ranges is not None else (None, None))
+                   if band_ranges is not None and layout == "axis" else (None, None))
     # Selected charge streams on a raw-parent plan form each node's correlation
-    # with mathdx mode 11 from the two parent Greens (``direct_rows``): no full-k
-    # Green, no transform of either Green, no XLA spin trace.
-    chi_door = chi_tables = None
-    if (pair_mode in ("direct", "retarded", "kms_static") and selected_q is not None
-            and photon is None and k_unfold_plan is not None
-            and _chi_door_serves(mesh_xy, grid, ns)):
+    # with mathdx mode 11 from the two parent Greens (``correlation_rows``): no
+    # full-k Green, no transform of either Green, no XLA spin trace.  The direct
+    # stream runs its rule sub-tile by sub-tile (``gw.subtile_stream``): row
+    # passes of orbit-closed rows, each node's parent Greens from the
+    # band-complete ψ rows by one local GEMM, its door on the pass only.
+    chi_door = chi_tables = subtile = None
+    door_serves = (selected_q is not None and photon is None and k_unfold_plan is not None
+                   and pair_mode in ("direct", "retarded", "kms_static")
+                   and _chi_door_serves(mesh_xy, grid, ns))
+    if door_serves and pair_mode == "direct":
+        import minimax
+        px = int(mesh_xy.shape["x"])
+        subtile = _direct_pass_plan(mesh_xy, grid, k_unfold_plan, n_rmu=n_rmu, ns=ns,
+                                    n_band=nb_full, q_count=len(selected_q),
+                                    n_nodes=minimax.RESPONSE_NODE_CAPACITY)
+        pass_doors, pass_loads = _charge_pass_doors(mesh_xy, grid, k_unfold_plan, subtile.passes)
+        pass_gemms = tuple(gemm_plan(mesh_xy, m=px * xr * ns, k=nb_full, n=n_rmu * ns,
+                                     nq=nk_shape, dtype=jnp.complex128, layout="axis",
+                                     enable_active_range=band_ranges is not None)
+                           for _, xr in subtile.passes)
+        pass_active = tuple((tuple(g.prepare_active_range(*bounds) for bounds in band_ranges)
+                             if band_ranges is not None else (None, None)) for g in pass_gemms)
+        chi_tables = tuple(a for load in pass_loads for a in load)
+        if jax.process_index() == 0:
+            print(f"Response direct stream: {len(subtile.passes)} row pass(es) of "
+                  f"{max(xr for _, xr in subtile.passes)} local rows, {subtile.chunk} node(s) "
+                  "per accumulate", flush=True)
+    elif door_serves:
         chi_door, chi_tables = _charge_stream_door(mesh_xy, grid, k_unfold_plan)
     # Trailing operands bound to the program (``_BoundTail``): the door tables.
     tail = (door_arrays if photon_doors is not None else chi_tables)
@@ -1140,6 +1174,11 @@ def _get_chi_fractional_contour_kernel_face(
         if photon_doors is not None:
             door_loads = {key: DeviceLoadTables(*(tables[i] for i in slots))
                           for key, slots in door_index.items()}
+        elif subtile is not None:
+            from symmetry_maps import DeviceLoadTables
+            n_t = len(tables) // len(subtile.passes)
+            chi_load = tuple(DeviceLoadTables(*tables[n_t * p:n_t * (p + 1)])
+                             for p in range(len(subtile.passes)))
         elif chi_tables is not None:
             chi_load = tables
         if bank_carry:
@@ -1431,10 +1470,6 @@ def _get_chi_fractional_contour_kernel_face(
             ahead, behind = rows(value, gather_q), rows(value, reverse_q)
             return (jnp.conj(ahead), behind) if physical else (ahead, jnp.conj(behind))
 
-        def direct_rows(time):
-            return correlation_rows(occ_f, -time, energy_reference[0],
-                                    occ_u, jnp.conj(time), energy_reference[1])
-
         def direct_node(index, accumulators):
             # ONE Green pair A(t)=Gu(t) conj(Gf(conj(t))) per node serves
             # both orientations: the reverse product at time conj(t) is
@@ -1451,9 +1486,7 @@ def _get_chi_fractional_contour_kernel_face(
                 time_nodes[index],
                 jax.lax.dynamic_index_in_dim(projection_rows[0], index, axis=1, keepdims=False),
                 jax.lax.dynamic_index_in_dim(projection_rows[1], index, axis=1, keepdims=False)))
-            if chi_door is not None:
-                ahead, behind = direct_rows(time)
-            elif photon is not None:
+            if photon is not None:
                 return photon_direct_carry(accumulators, time, forward, reverse)
             else:
                 value = chi_fftn(spin_correlation(occ_f, -time, energy_reference[0],
@@ -1461,6 +1494,51 @@ def _get_chi_fractional_contour_kernel_face(
                 ahead, behind = rows(value, gather_q), jnp.conj(rows(value, reverse_q))
             accumulators = accumulate_selected(accumulators, ahead, forward)
             return accumulate_selected(accumulators, behind, reverse)
+
+        def live_count():
+            live = (jnp.any(projection_rows[0] != 0, axis=0)
+                    | jnp.any(projection_rows[1] != 0, axis=0))
+            return jnp.max(jnp.where(live, jnp.arange(live.shape[0]) + 1, 0))
+
+        def direct_subtiles(accumulators):
+            """The rule on every row pass (``gw.subtile_stream.stream_passes``).
+
+            A node's pass rows: the parent Green pair on the pass's ψ rows
+            (one local GEMM each, plus the antiunitary partners), mode 11 on
+            the pass, the transform and its q and -q rows, oriented as
+            :func:`correlation_rows`.
+            """
+            from .subtile_stream import band_complete, pass_rows, stream_passes
+            rows_all, cols_all = band_complete(psi_mun, psi_nmu, mesh_xy)
+            px = int(mesh_xy.shape["x"])
+
+            def node_rows(p, index):
+                x0, xr = subtile.passes[p]
+                time = jax.lax.optimization_barrier(time_nodes[index])
+                psi_p = pass_rows(rows_all, mesh_xy, x0, xr, axis=2)
+
+                def parent(weight, t, ref, current):
+                    weight, t = oriented(weight, t)
+                    return build_G_tau(psi_p, cols_all, enk_full, t, e_ref=ref,
+                                       band_weight=weight, layout="axis", gemm=pass_gemms[p],
+                                       k_unfold_plan=k_unfold_plan, unfold=False,
+                                       prepared_active_gemm=pass_active[p][int(current)],
+                                       real_weights=False)
+                lower = parent(occ_f, -time, energy_reference[0], False)
+                upper = parent(occ_u, jnp.conj(time), energy_reference[1], True)
+                partners = (() if lower.conj_partner and upper.conj_partner
+                            else (lower.partner(), upper.partner()))
+                zero = jax.lax.with_sharding_constraint(
+                    jnp.zeros((1, nk, px * xr, n_mu), jnp.complex128), selected_shard)
+                value = chi_fftn(pass_doors[p](zero, lower.G, upper.G,
+                                               jnp.ones((1,), jnp.complex128), *partners,
+                                               load=chi_load[p])[0])
+                ahead, behind = rows(value, gather_q), rows(value, reverse_q)
+                ahead, behind = ((jnp.conj(ahead), behind) if physical
+                                 else (ahead, jnp.conj(behind)))
+                return jax.lax.with_sharding_constraint(jnp.stack([ahead, behind]), selected_shard)
+            return stream_passes(accumulators, mesh=mesh_xy, plan=subtile, weights=projection_rows,
+                                 count=live_count(), node_rows=node_rows)
 
         def direct_stream(accumulators):
             # The rule is padded to RESPONSE_NODE_CAPACITY slots with zero
@@ -1470,9 +1548,7 @@ def _get_chi_fractional_contour_kernel_face(
             # padded slots included (Fe 4^3 bispinor: 768 copies of 2.89
             # GB/rank, 3.2 s per bank; lane MAUD, 2026-09-25). A zero-weight
             # node inside the prefix adds exact zeros.
-            live = (jnp.any(projection_rows[0] != 0, axis=0)
-                    | jnp.any(projection_rows[1] != 0, axis=0))
-            count = jnp.max(jnp.where(live, jnp.arange(live.shape[0]) + 1, 0))
+            count = live_count()
             _, accumulators = jax.lax.while_loop(
                 lambda state: state[0] < count,
                 lambda state: (state[0] + 1, direct_node(state[0], state[1])),
@@ -1523,6 +1599,8 @@ def _get_chi_fractional_contour_kernel_face(
             final_R = photon_carry_order(
                 direct_stream(photon_carry_order(initial, photon, mesh_xy, to_packed=True)),
                 photon, mesh_xy, to_packed=False)
+        elif pair_mode == "direct" and subtile is not None:
+            final_R = direct_subtiles(initial)
         elif pair_mode == "direct":
             final_R = direct_stream(initial)
         else:
