@@ -189,6 +189,8 @@ KCONV_KLEAD_TARGET = "lorrax_mathdx_kconv_klead"
 #: Mode 2 with its T formed on the load as a rank-K outer-product sum (the BSE W term's encode):
 #: :func:`make_local_kconv_klead_outer`, cpp/cufft/kconv_outer_cuda_ffi.cc.
 KCONV_KLEAD_OUTER_TARGET = "lorrax_mathdx_kconv_klead_outer"
+#: The outer load with its K-sum pipe chosen (``LORRAX_BSE_OUTER_KSUM=fma``, A/B; additive).
+KCONV_KLEAD_OUTER_KSUM_TARGET = "lorrax_mathdx_kconv_klead_outer_ksum"
 #: The same load with the BSE decode's (t, μ) contraction fused into the store (U never stored):
 #: :func:`make_local_kconv_klead_outer_decode`.
 KCONV_KLEAD_OUTER_DECODE_TARGET = "lorrax_mathdx_kconv_klead_outer_decode"
@@ -1495,9 +1497,11 @@ def make_local_kconv_klead_outer(mesh: Mesh, kgrid, *, norm: str | None = "ortho
     nk = kg[0] * kg[1] * kg[2]
     scale = ffi_fft_scale("ifftn", norm, nk) * ffi_fft_scale("fftn", norm, nk) * float(mult)
     if kconv_backend(mesh) == "mathdx":
-        _require_target(KCONV_KLEAD_OUTER_TARGET, "CUDA")
+        fma = _outer_ksum_fma()
+        target = KCONV_KLEAD_OUTER_KSUM_TARGET if fma else KCONV_KLEAD_OUTER_TARGET
+        _require_target(target, "CUDA")
         attrs = dict(nkx=np.int64(kg[0]), nky=np.int64(kg[1]), nkz=np.int64(kg[2]),
-                     scale=np.float64(scale))
+                     scale=np.float64(scale), **(dict(ksum=np.int64(1)) if fma else {}))
 
         def _mathdx(l, r, v_r, conj_r=False):
             shape = (l.shape[0], l.shape[1], l.shape[2], r.shape[2], r.shape[3])
@@ -1505,7 +1509,7 @@ def make_local_kconv_klead_outer(mesh: Mesh, kgrid, *, norm: str | None = "ortho
             if pad:
                 l = jnp.pad(l, ((0, 0), (0, 0), (0, 0), (0, pad)))
                 r = jnp.pad(r, ((0, 0), (0, pad), (0, 0), (0, 0)))
-            return jax.ffi.ffi_call(KCONV_KLEAD_OUTER_TARGET, jax.ShapeDtypeStruct(shape, l.dtype))(
+            return jax.ffi.ffi_call(target, jax.ShapeDtypeStruct(shape, l.dtype))(
                 l, r, v_r, conj_r=np.int64(bool(conj_r)), **attrs, **_mathdx_common())
         return _mathdx
     apply = make_local_kconv_klead(mesh, kg, norm=norm, mult=mult)
@@ -1545,16 +1549,17 @@ def klead_outer_decode_refusal(mesh: Mesh, kgrid, n_c: int, optin: int | None = 
 
 
 def _outer_ksum_fma() -> int:
-    """``LORRAX_BSE_OUTER_KSUM`` (A/B, docs/dev/env_vars.md): ``dmma`` (default) runs the fused decode's
-    K sums on the fp64 tensor cores, ``fma`` on the fp64 FMA pipe (the same fragment contract; round-off
-    class), for comparing the two where their rates differ (H100, B200).  Anything else refuses."""
+    """``LORRAX_BSE_OUTER_KSUM`` (A/B, docs/dev/env_vars.md): ``dmma`` (default) runs the outer load's
+    and the fused decode's K sums on the fp64 tensor cores, ``fma`` on the fp64 FMA pipe (the same
+    fragment contract; round-off class), for comparing the two where their rates differ (H100, B200).
+    Anything else refuses."""
     import os
     v = os.environ.get("LORRAX_BSE_OUTER_KSUM", "dmma").strip().lower()
     if v not in ("dmma", "fma"):
         raise ValueError(f"LORRAX_BSE_OUTER_KSUM={v!r}: want 'dmma' (default) or 'fma'")
     if v == "fma":
         from ffi.gate import announce_once
-        announce_once(("bse", "outer_ksum", v), "[kconv_outer] decode K sums on the fp64 FMA pipe "
+        announce_once(("bse", "outer_ksum", v), "[kconv_outer] K sums on the fp64 FMA pipe "
                       "(LORRAX_BSE_OUTER_KSUM=fma; A/B only)")
     return int(v == "fma")
 
