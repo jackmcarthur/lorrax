@@ -258,7 +258,8 @@ def build_shared_pole_head(handle, header, V_q, wfns, meta, config, *,
     # the mini-BZ cell averages of all points then share one draw
     # (finalize_iteration_head_rows), bit-identical to one call per point.
     terms = []
-    with timing.section("head.sample_terms"):
+    with timing.section("head.sample_terms", announce=True,
+                        label="shared-pole head sample terms"):
         for index, point in enumerate(points):
             total = None
             if full:
@@ -276,7 +277,8 @@ def build_shared_pole_head(handle, header, V_q, wfns, meta, config, *,
             del args, b, poles, counts
     if terms:
         rows = [t for t in terms if isinstance(t, dict)]
-        with timing.section("head.cell_average"):
+        with timing.section("head.cell_average", announce=True,
+                        label="shared-pole head mini-BZ average"):
             averaged = iter(finalize_iteration_head_rows(
                 response, rows, wfn=wfn, meta=meta, config=config))
             samples = [next(averaged) if isinstance(t, dict) else t for t in terms]
@@ -292,7 +294,8 @@ def build_shared_pole_head(handle, header, V_q, wfns, meta, config, *,
             print("  shared-pole head: origin interband 8 pi qhat.S.qhat principal = "
                   + "/".join(f"{x:.6g}" for x in 8.0 * np.pi * np.linalg.eigvalsh(0.5 * (_S + _S.T))),
                   file=sys.stderr, flush=True)
-    with timing.section("head.mpa_fit"):
+    with timing.section("head.mpa_fit", announce=True,
+                        label="shared-pole head pole fit"):
         head = fit_head_samples(samples[:len(z)], z, int(config.mpa.n_poles),
             model="qsgw_schur_"+config.mpa.pole_solver if full else "dft_direct_"+config.mpa.pole_solver,
             solve=config.mpa.pole_solver, occupation_state=occupation_state)

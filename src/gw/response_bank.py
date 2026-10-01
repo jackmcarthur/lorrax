@@ -5,6 +5,7 @@ Photon operators use ``PhotonBasisLayout`` for charge and current endpoints.
 Disk conversion belongs to the scratch writer. Dense products and solves
 enter through ``distrib_la``.
 """
+from contextlib import contextmanager
 from dataclasses import dataclass
 from functools import partial
 from functools import lru_cache
@@ -924,6 +925,15 @@ def moment_q_width(ledger, *, n_q, face_bytes, per_q):
     return width
 
 
+@contextmanager
+def _moment_phase(receipt, name):
+    """One stage of a moment batch: a timing section, its wall summed in ``receipt["seconds"]``."""
+    started = time.monotonic()
+    with timing.section("bank.moment_" + name):
+        yield
+    receipt["seconds"][name] = receipt["seconds"].get(name, 0.0) + time.monotonic() - started
+
+
 def compute_moment_bank(wfns, meta, config, *, mesh_xy, sym, bank_io,
                         vertex=None, contact=None, direct_head=None):
     """Stage B: six exact correlations, physical recurrence, scratch write."""
@@ -954,17 +964,23 @@ def compute_moment_bank(wfns, meta, config, *, mesh_xy, sym, bank_io,
         name,_ = _reserve(meta,"bank_outputs_moments",(per_q*(q1-q0)+16)*face_bytes)
         ledger.live_stages = ambient+(name,)
         if not np.asarray(header["moment_written"])[q0:q1].all():
-            if ordered:
-                a0, a1, o0, o1, _ = exact_bare_moments(wfns, meta, mesh_xy=mesh_xy,
-                    q_ids=tuple(qids[q0:q1]), execute=execute, ordered=True, vertex=vertex)
-            else:
-                a0, a1, _ = exact_bare_moments(wfns, meta, mesh_xy=mesh_xy,
-                                          q_ids=tuple(qids[q0:q1]), execute=execute)
-            h, hi, ranks = _coulomb_batch(meta, config, bank_io, mesh_xy, (q0,q1), execute)
-            del hi
+            with _moment_phase(receipt, "correlations"):
+                if ordered:
+                    a0, a1, o0, o1, _ = exact_bare_moments(wfns, meta, mesh_xy=mesh_xy,
+                        q_ids=tuple(qids[q0:q1]), execute=execute, ordered=True, vertex=vertex)
+                else:
+                    a0, a1, _ = exact_bare_moments(wfns, meta, mesh_xy=mesh_xy,
+                                              q_ids=tuple(qids[q0:q1]), execute=execute)
+                # The batch's correlations finish here, so their device time is theirs.
+                jax.block_until_ready((a0, a1) + ((o0, o1) if ordered else ()))
+            with _moment_phase(receipt, "coulomb"):
+                h, hi, ranks = _coulomb_batch(meta, config, bank_io, mesh_xy, (q0,q1), execute)
+                del hi
             operands = (h,a0,a1,o0,o1) if ordered else (h,a0,a1)
-            result = execute(moments, operands + (() if vertex is None else (contact,)),
-                             "moment_dyson")
+            with _moment_phase(receipt, "dyson"):
+                result = execute(moments, operands + (() if vertex is None else (contact,)),
+                                 "moment_dyson")
+                jax.block_until_ready(result)
             names = (("constant", "M0", "M1", "M2", "M3") if vertex is not None else
                      (("M0", "M1", "M2", "M3") if ordered else ("M1", "M3")))
             values = dict(zip(names,result))
@@ -978,8 +994,9 @@ def compute_moment_bank(wfns, meta, config, *, mesh_xy, sym, bank_io,
                         gamma_vectors=direct_head["gamma_vectors"],
                         layout=bank_io["photon_layout"], mesh=mesh_xy)
             if ordered:
-                _record_odd_moments(q0, *(values[name] for name in ("M0", "M1", "M2", "M3")),
-                                    receipt)
+                with _moment_phase(receipt, "diagnostics"):
+                    _record_odd_moments(q0, *(values[name] for name in ("M0", "M1", "M2", "M3")),
+                                        receipt)
             # One write for a fresh batch; partial restarts group identical
             # commit masks so no already committed field is overwritten.
             marked = np.asarray(header["moment_written"], bool)[q0:q1]

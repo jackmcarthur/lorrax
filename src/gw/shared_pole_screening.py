@@ -736,7 +736,10 @@ def screen_shared_poles(wfns, V_q, meta, config, *, mesh_xy, sym,
         print_fn(f"Response quadrature: moments {receipts['moments'].get('correlation_count', 0)} "
                  f"correlations in {len(receipts['moments'].get('q_batches', ()))} q batch(es) "
                  f"of <= {receipts['moments'].get('q_width', 0)} parents; "
-                 f"{moments_seconds.get('total', 0.0):.2f} s")
+                 f"{moments_seconds.get('total', 0.0):.2f} s ("
+                 + " ".join(f"{name}={moments_seconds[name]:.2f}" for name in
+                            ("correlations", "coulomb", "dyson", "diagnostics", "io")
+                            if name in moments_seconds) + ")")
     # The constructor owns scratch reads, actual pencil planning and the
     # final writer. It must query its own native workspace at the actual R.
     # W/dW and M1/M3 are distinct keyed datasets in the same scratch file.
