@@ -1067,7 +1067,11 @@ def _get_chi_fractional_contour_kernel_face(
     # One fixed contraction route is shared by every Gf and Gu build.
     # Face photon families exchange bounded band panels (one route for every
     # family pair's shape); axis carriers already replicate bands and use the
-    # service's local contraction.
+    # service's local contraction.  Every GEMM plan here is traced into
+    # ``integrate`` only, so none is warmed: a warmed face plan ran two
+    # cuBLASMp GEMMs on dummy operands at each program build (2.2 s of NCCL
+    # broadcasts per row-pass program at Ni 20³ P64), and the face Green
+    # route never calls that kernel (``face_green_product``).
     if band_ranges is not None and pair_mode != "direct":
         raise ValueError("prepared response band ranges require the direct stream")
     if photon is not None:
@@ -1091,7 +1095,8 @@ def _get_chi_fractional_contour_kernel_face(
     else:
         g_plan = gemm_plan(mesh_xy, m=n_rmu * ns, k=nb_full, n=n_rmu * ns,
                            nq=nk_shape, dtype=jnp.complex128, layout=layout,
-                           enable_active_range=band_ranges is not None and layout == "axis")
+                           enable_active_range=band_ranges is not None and layout == "axis",
+                           warmup=False)
     # Four-current stream on raw-parent plans: each quadrant's parent Green pair
     # goes straight into mathdx mode 11 with the channel vertices (unfold on the
     # load, the traces in its Mid); no full-k Green exists.  A CUDA grid the
@@ -1133,7 +1138,7 @@ def _get_chi_fractional_contour_kernel_face(
             tuple(gemm_plan(mesh_xy, m=px * xr * 2, k=nb_full,
                             n=photon.packed_layout.carrier_extent(family_channels(R)[0]) * 2,
                             nq=nk_shape, dtype=jnp.complex128, layout="axis",
-                            enable_active_range=band_ranges is not None)
+                            enable_active_range=band_ranges is not None, warmup=False)
                   if wanted is None or wanted == (i_pair, p) else None
                   for p, (_, xr) in enumerate(plan.passes))
             for i_pair, ((_, R), plan) in enumerate(zip(FAMILY_PAIRS, photon_plans)))
@@ -1171,7 +1176,7 @@ def _get_chi_fractional_contour_kernel_face(
         # A one-pass program (``stream_pass``) plans only its own pass's GEMMs.
         pass_gemms = tuple(gemm_plan(mesh_xy, m=px * xr * ns, k=nb_full, n=n_rmu * ns,
                                      nq=nk_shape, dtype=jnp.complex128, layout="axis",
-                                     enable_active_range=band_ranges is not None)
+                                     enable_active_range=band_ranges is not None, warmup=False)
                            if stream_pass is None or p == int(stream_pass) else None
                            for p, (_, xr) in enumerate(subtile.passes))
         pass_active = tuple((tuple(g.prepare_active_range(*bounds) for bounds in band_ranges)
