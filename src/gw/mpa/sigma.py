@@ -100,7 +100,9 @@ def _shared_pole_omega0_weights(poles2, intervals, E_ref_B, t_node):
 # Over plain JAX: none; it runs on G's GEMM route.  What paid was placement and communication:
 #   tau-invariant factors placed once, Sigma tau -30% scalar Fe 4^3 (2732), -40% bispinor sectors
 #   (2726); only each window's live pole columns contracted, Fe 8^3 map-0 Sigma tau -5.0% (2955);
-#   transposes formed on the rank that needs them, Fe 8^3 Sigma tau -9.3% at P4, -24.5% at P16 (2958).
+#   transposes formed on the rank that needs them, Fe 8^3 Sigma tau -9.3% at P4, -24.5% at P16 (2958);
+#   whole parents per rank on a local deck (only W moves, no per-node factor re-gather), Ni 20^3
+#   P64-local tile synthesis 0.427 -> 0.134 s per tau node at P4, 0.81 -> 0.18 s at P16 (SIGPROF).
 # Did not pay: W^T by a second GEMM, +10% at P4, +2% at P16 (2958), +5.7% on Fe 8^3 (2955); the 2-D
 #   face layout for the Sigma residues, Sigma tau +25% Na 8^3, +160% Fe 4^3 (2955); the local
 #   projector transpose costs Na 8^3 (group order 14.8) +6.4%, accepted (2958); a sync-free tau
@@ -120,8 +122,12 @@ def synthesize_shared_pole_parents(
         Complex128 physical factors ``[parent,mu,spin,column]`` with
         face layouts, or replicated columns for the configured axis layout.
         The component axis is 1 for charge and 3 for current endpoints.
+        ``layout='local'``: ``b_X`` is the one factor ``[Bp,mu,column]`` in
+        ``distrib_la``'s batch layout (whole parents per rank, Bp the parents
+        padded to the mesh) and ``b_Y`` is ``None`` (:func:`_shared_pole_contract_local`).
     poles2 : jax.Array
-        Replicated float64 ``[parent,column]`` squared frequencies in Ry².
+        Replicated float64 ``[parent,column]`` squared frequencies in Ry²
+        (``layout='local'``: ``[Bp,column]`` in the batch layout).
     intervals : jax.Array
         Replicated integer ``[parent,2]`` active half-open column ranges,
         prepared from the sorted census for this window/panel.
@@ -142,13 +148,23 @@ def synthesize_shared_pole_parents(
         ``(conj(b_X) d) b_Yᵀ`` at the SAME τ (DESIGN §3.4). Never conjugate
         Wplus to obtain its antiunitary partner: d must retain its phase.
     """
-    if b_X.ndim != 4 or b_Y.ndim != 4:
-        raise ValueError("shared-pole faces require [parent,mu,spin,column]")
-    if b_X.shape[2] not in (1, 3) or b_Y.shape[2] not in (1, 3):
-        raise ValueError("GATE shared_pole_components: expected charge=1 or current=3")
-    weights = weights_fn(poles2, intervals, E_ref_B, t_node)
-    plus = _shared_pole_contract(b_X, b_Y, weights, gemm=gemm, layout=layout,
-                                 intervals=intervals if active_range else None)
+    if layout == "local":
+        # The replicated intervals take the factor's padded batch rows (an
+        # empty interval: zero weight) and its batch placement, a local slice.
+        n_parent, rows = int(intervals.shape[0]), int(b_X.shape[0])
+        intervals = jax.lax.with_sharding_constraint(
+            jnp.pad(intervals, ((0, rows - n_parent), (0, 0))),
+            NamedSharding(mesh_xy, P(("x", "y"), None)))
+        weights = weights_fn(poles2, intervals, E_ref_B, t_node)
+        plus = _shared_pole_contract_local(b_X, weights, mesh_xy=mesh_xy, n_parent=n_parent)
+    else:
+        if b_X.ndim != 4 or b_Y.ndim != 4:
+            raise ValueError("shared-pole faces require [parent,mu,spin,column]")
+        if b_X.shape[2] not in (1, 3) or b_Y.shape[2] not in (1, 3):
+            raise ValueError("GATE shared_pole_components: expected charge=1 or current=3")
+        weights = weights_fn(poles2, intervals, E_ref_B, t_node)
+        plus = _shared_pole_contract(b_X, b_Y, weights, gemm=gemm, layout=layout,
+                                     intervals=intervals if active_range else None)
     # Both faces store the same physical b. Thus (b d b†)^T = b* d b^T
     # even for complex d: transpose the all-mesh operator, never conjugate
     # its causal phase or contract the same pole columns a second time.
@@ -192,6 +208,25 @@ def _shared_pole_contract(b_X, b_Y, weights, *, gemm, layout="face", intervals=N
                     phases=weights, layout=layout, gemm=gemm, band_range=band_range)
     # build_G is centroid-major (q, mu, s, nu, s'); the unit spin axes are 2, 4.
     return value[:, :, 0, :, 0]
+
+
+def _shared_pole_contract_local(b, weights, *, mesh_xy, n_parent):
+    """W(τ) = b d b† with whole parents per rank: one local GEMM each, one exchange out.
+
+    ``b`` ``[Bp,mu,K]`` and ``weights`` ``[Bp,K]`` are in ``distrib_la``'s
+    batch layout (``Bp``: the ``n_parent`` parents padded to the mesh; their
+    weights are zero).  Each rank contracts its own parents over every pole
+    column and only W moves, batch to face (``distrib_la.local_batch``): per
+    τ node a rank sends its W rows, not the K-complete factor panels that a
+    face SUMMA re-gathers at every node (2·(μ/p)·K per parent; at Ni 20³ P64,
+    18.6 GB per rank per node across nodes, against 0.85 GB).  The factor is
+    held once, not as two faces.
+    """
+    from distrib_la import local_batch
+
+    def one(b, w):
+        return (b * w[:, None, :]) @ jnp.swapaxes(jnp.conj(b), -1, -2)
+    return local_batch(one, mesh_xy, resident=(0, 1), nbatch=n_parent)(b, weights)
 
 
 def _shared_pole_fixed_q_policy(header):
@@ -430,7 +465,10 @@ def _shared_pole_w_synthesis(io, meta, header, frequencies, schedule, *, mesh_xy
                 lambda _result=None: None, 0, ("zero", mesh_xy, nq, m), ordered=ordered)
             synthesis.q_wedge = q_wedge
             return synthesis
-        factor_specs = _shared_pole_factor_specs(layout)
+        local = layout == "local"
+        if local and (bcap < nq or ccap < kmax):
+            raise ValueError("shared-pole synthesis: whole parents per rank take one panel")
+        factor_specs = None if local else _shared_pole_factor_specs(layout)
         # One static column width: the whole laddered K when every column fits
         # (one chunk), else the admitted chunk carrier, stepped by that width.
         chunked = ccap < kmax
@@ -449,18 +487,19 @@ def _shared_pole_w_synthesis(io, meta, header, frequencies, schedule, *, mesh_xy
             tables = _shared_pole_panel_tables(meta, header, (lo, hi), mesh_xy=mesh_xy)
             static = _shared_pole_static_key(meta, header, tables, mesh_xy=mesh_xy, layout=layout)
             count = hi - lo
-            native_workspace = max(native_workspace, workspace_bytes_per_rank(
-                workspace_plan, "gemm", ((count, m, width), (count, width, m)),
-                np.complex128))
+            if not local:
+                native_workspace = max(native_workspace, workspace_bytes_per_rank(
+                    workspace_plan, "gemm", ((count, m, width), (count, width, m)),
+                    np.complex128))
 
             def program(span=(lo, hi), tables=tables, count=count):
                 from distrib_la import gemm_plan
                 # As G's plan: pole columns outside a window's interval are
                 # never contracted, and no warm-up (the plan runs inside the
-                # window executable).
-                gemm = gemm_plan(mesh_xy, m=m, k=width, n=m, nq=count,
-                                 dtype=np.complex128, layout=layout,
-                                 enable_active_range=True, warmup=False)
+                # window executable).  Whole parents per rank contract locally.
+                gemm = None if local else gemm_plan(
+                    mesh_xy, m=m, k=width, n=m, nq=count, dtype=np.complex128, layout=layout,
+                    enable_active_range=True, warmup=False)
                 realize_pair = _shared_pole_panel_realizer(
                     meta, header, span, mesh_xy=mesh_xy, tables=tables)
 
@@ -482,8 +521,17 @@ def _shared_pole_w_synthesis(io, meta, header, frequencies, schedule, *, mesh_xy
         ambient = (tuple(schedule["capacity_receipt"]["concurrent_with"])
                    if "capacity_receipt" in schedule else None)
         x, y, poles, _counts = read_shared_pole_faces(
-            io, (0, nq), meta=meta, header=header, column_span=(0, kmax) if chunked else None)
-        x, y = (_placer(mesh_xy, spec)(a) for spec, a in zip(factor_specs, (x, y)))
+            io, (0, nq), meta=meta, header=header, column_span=(0, kmax) if chunked else None,
+            orientations=("x",) if local else ("x", "y"))
+        if local:
+            # Both faces store the same physical b: one copy, whole parents
+            # per rank (distrib_la.batch_layout), placed once per Σ call.
+            from distrib_la import batch_layout
+            x = jax.jit(lambda a: a[:, :, 0, :],
+                        out_shardings=NamedSharding(mesh_xy, P(None, "x", "y")))(x)
+            x, y, poles = batch_layout(x, mesh_xy), None, batch_layout(poles, mesh_xy)
+        else:
+            x, y = (_placer(mesh_xy, spec)(a) for spec, a in zip(factor_specs, (x, y)))
         panel_factors, panel_poles = [], []
         for panel in panels:
             lo, hi = panel["span"]
@@ -728,7 +776,27 @@ def _shared_pole_resident_bytes(meta, header, *, mesh_xy, layout):
     return int(np.ceil(nq*pair + 8*nq*k))
 
 
-def _shared_pole_memory_schedule(meta, header, *, mesh_xy, layout="face", stage="sigma"):
+def _shared_pole_local_price(meta, header, *, mesh_xy):
+    """Per-rank ``(resident, workspace)`` bytes of the synthesis with whole parents per rank.
+
+    Resident: the one factor ``[ceil(nq/P), μ, K̄]`` and its poles.  Workspace:
+    one parent's weighted factor, the rank's W rows before the exchange, and
+    the parent pair on the face with its realization temporaries (as
+    :func:`_shared_pole_panel_cost`'s ``6·tile``).
+    """
+    from file_io.shared_pole_store import face_width
+
+    m, nq = int(meta.mu_basis.n_packed), int(header["n_q_irr"])
+    ranks = int(mesh_xy.size)
+    k = face_width(mesh_xy, int(header["Kmax"]))
+    rows = -(-nq // ranks)
+    resident = 16 * rows * m * k + 8 * rows * k
+    workspace = 16 * m * k + 2 * 16 * rows * m * m + 6 * -(-16 * nq * m * m // ranks)
+    return int(resident), int(workspace)
+
+
+def _shared_pole_memory_schedule(meta, header, *, mesh_xy, layout="face", stage="sigma",
+                                 linalg=None):
     """Price the resident factors, size the τ panels from what is left, admit.
 
     The factors are read once per Σ call and stay resident
@@ -738,6 +806,12 @@ def _shared_pole_memory_schedule(meta, header, *, mesh_xy, layout="face", stage=
     live_stages charge other NEW shared-pole objects. Per coordinator
     ruling12, the unchanged spatial/ψ/Σ footprint and its one full-q W are
     reported separately against the incumbent (<=1.05x).
+
+    ``linalg`` (the deck's resolved dense layout): on a ``local`` deck whose
+    whole parents fit per rank (``shared_pole_execution.whole_parent_execution``,
+    the bank's rule), the synthesis contracts whole parents locally
+    (``factor_layout='local'``, :func:`_shared_pole_contract_local`) and only
+    W(τ) moves; otherwise the face or axis panels below.
     """
     capacity = getattr(meta, "shared_pole_capacity", None)
     if capacity is None:
@@ -765,6 +839,28 @@ def _shared_pole_memory_schedule(meta, header, *, mesh_xy, layout="face", stage=
                     capacity_receipt=receipt,route="empty")
     tables = _shared_pole_panel_tables(meta, header, (0,nq), mesh_xy=mesh_xy)
     _require_local_maps(tables["certificates"])
+    if linalg == "local" and int(header.get("factor_components", 1)) == 1:
+        from gw.shared_pole_execution import whole_parent_execution
+        execution, resident, workspace = whole_parent_execution(
+            lambda e: (_shared_pole_local_price(meta, header, mesh_xy=mesh_xy) if e == "local"
+                       else (_shared_pole_resident_bytes(meta, header, mesh_xy=mesh_xy,
+                                                         layout=layout), 0)),
+            ledger=capacity)
+        if execution == "local":
+            receipt = capacity.reserve(
+                f"{stage}.synthesis", resident_bytes_per_rank=resident,
+                workspace_bytes_per_rank=workspace, concurrent_with=concurrent)
+            return dict(status=receipt["device_budget_status"], unit_bytes=U,
+                        factor_layout="local",
+                        peak_live_bytes_per_rank=receipt["aggregate_bytes_per_rank"],
+                        peak_in_U=receipt["aggregate_bytes_per_rank"]/U,
+                        parent_capacity=nq, column_capacity=kmax,
+                        resident_factor_bytes_per_rank=resident,
+                        caller_live_bytes_per_rank=caller_bytes, capacity_receipt=receipt,
+                        route="local_parent",
+                        inherited_sigma_peak_status="NOT_MEASURED",
+                        projection_matrix_bytes_per_rank=int(16*nq*meta.mu_basis.n_packed**2
+                                                             / (px*py)))
     # The ledger owns the hardware limit (ruling24); 3U is a scaling
     # receipt. A zero-byte planning reservation prices the existing ambient set.
     admission = capacity.reserve(
@@ -1731,12 +1827,15 @@ def compute_sigma_c_mpa_omega_grid(
     omega_eta_ry=None,
     omega_group=None,
     group_fixed=None,
+    linalg=None,
     print_fn=print,
 ):
     """Read a fitted MPA store, derive its windows, and compute Sigma_c.
 
     ``omega_eta_ry``/``omega_group``/``group_fixed``: the SC coarse windows'
     per-frequency broadening and window labels (``sigma_box_plan.plan_sigma_windows``).
+    ``linalg``: the deck's resolved dense layout, which places a shared-pole
+    model's W(τ) synthesis (:func:`_shared_pole_memory_schedule`).
 
     ``occupation_state`` (duck-typed ``gw.efermi.OccupationState``): None is
     the incumbent insulating semantics, bit-exact.  With a state, the causal
@@ -1791,7 +1890,8 @@ def compute_sigma_c_mpa_omega_grid(
         n_poles = int(ledger["n_q_irr"])
         ordered_residues = False
         with timing.section("sigma.capacity"):
-            schedule = (_shared_pole_memory_schedule(meta, ledger, mesh_xy=mesh_xy, layout=wfns.layout)
+            schedule = (_shared_pole_memory_schedule(meta, ledger, mesh_xy=mesh_xy, layout=wfns.layout,
+                                                     linalg=linalg)
                         if sector_context is None else sector_context["schedule"](ledger))
         print_fn(f"  shared-pole Sigma capacity: {schedule}")
     elif isinstance(fit_src, MemoryPoleSource):
