@@ -2192,19 +2192,28 @@ def produce_sample_bank(wfns, meta, config, *, mesh_xy, sym, sample_plan, bank_i
         stream_bank = None
         if residence != "device":
             from file_io.slab_io import StreamedBank
-            # The store reserves every byte at creation: a bank the disk or the
-            # quota cannot hold refuses on every rank before any compute, and
-            # the samples then run in groups on the devices.
-            stream_bank = StreamedBank(mesh_xy, root=bank_io["root"], label="chi",
-                kind=residence, n_out=2*len(z), q=len(response_rows), segments=segments[0],
-                tile=segments[1])
-            if not stream_bank.fits:
+            # The store reserves every byte at creation, so a bank the disk or
+            # the quota cannot hold is refused on every rank before any compute.
+            # Then the samples stream in disk groups, each try half the last,
+            # one bank reused group after group; once a disk group would be no
+            # larger than the device group, the samples run in groups on the
+            # devices (a smaller group, never a refusal).
+            disk_group = len(z)
+            while True:
+                stream_bank = StreamedBank(mesh_xy, root=bank_io["root"], label="chi",
+                    kind=residence, n_out=2*disk_group, q=len(response_rows),
+                    segments=segments[0], tile=segments[1])
+                if stream_bank.fits:
+                    break
                 stream_bank = None
-                residence = "device"
-                residence_receipt = dict(residence_receipt, reason="streamed bank refused by the "
-                                         "filesystem (capacity); sample groups on the devices")
                 if check is None:
                     check, group_size, live, room = device_groups()
+                if -(-disk_group // 2) <= group_size:
+                    residence = "device"
+                    residence_receipt = dict(residence_receipt, reason="streamed bank refused by "
+                        "the filesystem (capacity); sample groups on the devices")
+                    break
+                disk_group = -(-disk_group // 2)
         if residence == "device":
             record_stage_price(f"response direct stream, group {group_size}/{len(z)}",
                                live + check.price, section="bank.dispatch.direct")
@@ -2212,10 +2221,13 @@ def produce_sample_bank(wfns, meta, config, *, mesh_xy, sym, sample_plan, bank_i
                 compiled=check.compiled_bytes, price=check.price, live=live, room=room,
                 recompiled=check.recompiled, seconds=check.seconds)
         else:
-            # Streamed: one group of every sample; the devices hold one segment
-            # carry being computed and one being drained, then one sample's
-            # value and slope being read, unpacked and prefetched.
-            group_size = len(z)
+            # Streamed: one group of every sample the disk holds; the devices
+            # hold one segment carry being computed and one being drained, then
+            # one sample's value and slope being read, unpacked and prefetched.
+            group_size = disk_group
+            if disk_group < len(z):
+                residence_receipt = dict(residence_receipt, reason=residence_receipt["reason"]
+                                         + f"; disk groups of {disk_group} samples")
         del check
         receipt["bank_residence"] = dict(residence_receipt, residence=residence)
         rules = response_quadrature(meta, sample_plan, receipt, support,
@@ -2349,10 +2361,10 @@ def produce_sample_bank(wfns, meta, config, *, mesh_xy, sym, sample_plan, bank_i
             fresh = [(row, sample) for row, sample in enumerate(members) if not committed(sample)]
             integrate_response_group(wfns, meta, mesh_xy, rules, group, q_ids=response_rows,
                 execute=execute, receipt=receipt, ordered=ordered, vertex=vertex, bank=stream_bank,
-                outputs=[(2*row+k, 2*sample+k) for row, sample in fresh for k in (0, 1)])
+                outputs=[(2*row+k, 2*row+k) for row, _ in fresh for k in (0, 1)])
             with timing.section('bank.stream_commit'):
                 stream_bank.commit()
-            raw_group = stream_bank.reader([(2*sample, 2*sample+2) for _, sample in fresh])
+            raw_group = stream_bank.reader([(2*row, 2*row+2) for row, _ in fresh])
             take = ((lambda row: next(raw_group)) if finish is None
                     else (lambda row: finish(next(raw_group))))
         io_started = time.monotonic()
