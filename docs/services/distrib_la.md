@@ -531,11 +531,18 @@ admit.
 ## Performance
 
 For a matrix that fits one device, a distributed library's cost is its fixed
-per-call charge, almost all of it inside `cusolverMpSyevd`, and `block_size`
-does not move it. The provenance of the measurements is in the docstring of
+per-call charge, almost all of it inside `cusolverMpSyevd`. The provenance of
+the measurements is in the docstring of
 `resolve._announce_eigh_fixed_cost`. That is why `auto` eigh resolves to native and route (c) is the default:
 `distributed` eigh is a capacity route for a matrix that does not fit one
 device, not a speed route.
+
+cuSOLVERMp eigh runs block-cyclic on the operand's own `P('x','y')` tiles:
+the same local buffers described with a block `mb | n/p` of at most 256 are
+`Π A Πᵀ`, and one `all_to_all` over `x` returns the eigenvectors in
+ascending order (`_cusolvermp._block_size`, measurements beside it). It pays
+from `n/p ≈ 2000` (P16 n = 16000: 1.65×; P64: 1.28×). LU and Cholesky keep
+one tile per rank, because their block-cyclic triangular solves are slower.
 
 Route (c)'s exchanges and the scan route compile once per signature. A Python
 loop over the batch recompiles SLATE's eager `shard_map` wrappers per matrix;

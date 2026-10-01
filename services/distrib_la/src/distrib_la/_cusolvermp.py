@@ -224,6 +224,65 @@ _JIT_CACHE: dict = {}
 _mesh_key = mesh_key
 
 
+# Block-cyclic eigh by relabeling.  A P('x','y') operand is one (n/p, n/p)
+# tile per rank.  Handing cuSOLVERMp the SAME local buffers with a smaller
+# square block mb (mb | n/p) makes it read them as Pi A Pi^T, Pi sending rank
+# r's local block c to global block c*p + r.  Rows and columns get the same
+# Pi (square grid), so the eigenvalues are A's and the eigenvector components
+# read back in A's order with no data movement.  The eigenvalue index is laid
+# out the same way, so _cyclic_rows_to_block puts Q's rows back in ascending
+# order (one all_to_all over 'x', n^2/P per rank).  The tridiagonalization
+# then keeps every rank busy as the trailing matrix shrinks.  Measured (c128,
+# median s, one tile per rank -> mb 250, the un-permute included):
+#   P16  n 16000: 17.50 -> 10.59   8000: 4.46 -> 3.56   4000: 1.43 -> 1.38
+#   P64  n 16000: 20.05 -> 15.65   8000: 7.13 -> 6.47   4000: 2.91 -> 2.80
+# mb 125 matches 250 at P16; 500 is slower at P64; n/p <= 256 is unchanged.
+# LU and Cholesky keep one tile per rank: there block-cyclic getrs/potrs are
+# 2-3x slower and getrf gains nothing (same bench).
+_BLOCK_MAX = 256
+
+
+def _block_size(n: int, p: int) -> int:
+    """The eigh block edge for an ``n x n`` operand on a ``p x p`` grid.
+
+    The largest divisor of ``n/p`` that is at most :data:`_BLOCK_MAX`, so
+    every rank keeps its ``(n/p, n/p)`` buffer; ``n/p`` itself when it is
+    that small.
+    """
+    local = n // p
+    return max(d for d in range(1, min(local, _BLOCK_MAX) + 1)
+               if local % d == 0)
+
+
+def _cyclic_rows_to_block(Q, *, n: int, p: int, mb: int):
+    """Inside a shard_map: put rows held block-cyclically over 'x' in order.
+
+    Local row ``c*mb + t`` of 'x' rank ``a`` is global row
+    ``(c*p + a)*mb + t``; it moves to rank ``g // C``, slot ``g % C`` of
+    the contiguous layout (``g = c*p + a``, ``C = n/(p*mb)``).  Each pair of
+    ranks exchanges a contiguous run of at most ``J`` blocks, padded to
+    ``J`` for one ``all_to_all``.
+    """
+    C = n // (p * mb)
+    runs = [[(max(0, -(-(t * C - a) // p)),
+              min(C, -(-((t + 1) * C - a) // p))) for t in range(p)]
+            for a in range(p)]
+    J = max(hi - lo for row in runs for lo, hi in row)
+    send = np.zeros((p, p * J), np.int32)       # [a, t*J + j] -> local block
+    recv = np.zeros((p, C), np.int32)           # [t, slot] -> s*J + j
+    for a in range(p):
+        for t, (lo, hi) in enumerate(runs[a]):
+            for j, c in enumerate(range(lo, hi)):
+                send[a, t * J + j] = c
+                recv[t, (c * p + a) - t * C] = a * J + j
+    a = jax.lax.axis_index("x")
+    blocks = Q.reshape(C, mb, Q.shape[-1])
+    out = jnp.take(blocks, jnp.asarray(send)[a], axis=0)
+    out = jax.lax.all_to_all(out, "x", 0, 0, tiled=True)
+    out = jnp.take(out, jnp.asarray(recv)[a], axis=0)
+    return out.reshape(Q.shape)
+
+
 def _validate_mesh(mesh: Mesh):
     if "x" not in mesh.axis_names or "y" not in mesh.axis_names:
         raise ValueError(
@@ -241,7 +300,6 @@ def distributed_eigh(
     *,
     mesh: Mesh,
     compute_evecs: bool = True,
-    block_size: int | None = None,
 ) -> Tuple[jax.Array, jax.Array]:
     """Distributed Hermitian eigendecomposition via cuSOLVERMp.
 
@@ -257,12 +315,9 @@ def distributed_eigh(
     compute_evecs
         Must be True.  ``False`` (jobz='N') is REFUSED — see the guard
         below and ``resolve.resolve_backend`` guard 2c (bug L-3).
-    block_size
-        Override the 2-D block-cyclic tile size.  Default ``n/p`` (one
-        tile per rank — matches JAX's block sharding, eigenvectors come
-        out in-place).  Smaller blocks speed up the solve at larger n
-        (block=256 gives 2.4× at n=16k) but return eigenvectors in a
-        block-cyclic permutation of the input basis.
+
+    The solve runs block-cyclic at :func:`_block_size` on the operand's own
+    tiles (the relabeling note above :data:`_BLOCK_MAX`).
 
     Returns
     -------
@@ -310,8 +365,7 @@ def distributed_eigh(
     loader.get_lib("CUDA")                  # load the .so, register targets
     ctx_key = context_key(mesh)  # NCCL + cal_comm + cusolverMp
 
-    mb = n // p if block_size is None else block_size
-    nb = n // q if block_size is None else block_size
+    mb = nb = _block_size(n, p)
 
     # jit(shard_map(...)) with a per-signature cache — the shape EVERY other
     # FFI wrapper in this package has.  This one was the exception: it
@@ -343,8 +397,14 @@ def distributed_eigh(
                  out_specs=(P(), P("x", "y")),
                  check_vma=False)
         def _call(local_A):
-            return jax.ffi.ffi_call(
+            W, Q = jax.ffi.ffi_call(
                 _EIGH_TARGET, (W_local, Q_local))(local_A, **attrs)
+            # Q's rows (axis 0, over 'x') are the eigenvalue index, which
+            # cuSOLVERMp lays out block-cyclically like A's; put them back
+            # in W's ascending order.
+            if mb != n // p:
+                Q = _cyclic_rows_to_block(Q, n=n, p=p, mb=mb)
+            return W, Q
 
         # NO donate_argnums / input_output_aliases, deliberately: this
         # wrapper never donated its operand and distrib_la.plan.DONATES
@@ -468,7 +528,7 @@ def batched_distributed_getrf(
            int(ctx_key))
     jit_getrf = _JIT_CACHE.get(key)
     if jit_getrf is None:
-        LU_local_T = jax.ShapeDtypeStruct((nq, nb, mb), A.dtype)
+        LU_local_T = jax.ShapeDtypeStruct((nq, n // Py, n // Px), A.dtype)
         ipiv_local = jax.ShapeDtypeStruct((nq, ipiv_len), jnp.int64)
         attrs = dict(nq=nq, n=n, mb=mb, nb=nb,
                      ipiv_len=ipiv_len, ctx_key=int(ctx_key))
