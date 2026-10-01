@@ -1689,7 +1689,7 @@ def x_block_rows(rows) -> np.ndarray:
 #   unfold gather's L2 latency (long_scoreboard 49%; 2956).
 def make_kconv_klead_unfold(mesh: Mesh, kgrid, tables, *, store_rows, norm: str | None = "ortho",
                             mult: float = 1.0) -> Callable:
-    """The Σ k-leading convolution read from the RAW-PARENT Green: ``fn(G, Gt, W_prep) -> U``.
+    """The Σ k-leading convolution read from the RAW-PARENT Green: ``fn(G, Gt, W_prep, load=None) -> U``.
 
     ``G`` ``(n_parent, mu, ns, nu, ns)`` c128 at ``P(None,'x',None,'y',None)``
     is the centroid-major parent Green (``gw.greens_function_kernel.
@@ -1703,8 +1703,11 @@ def make_kconv_klead_unfold(mesh: Mesh, kgrid, tables, *, store_rows, norm: str 
     equal to ``apply(sigma_conv_operand(unfold_spin_centroid_operator(G, Gt)),
     W_prep)[store_rows]``: the typed unfold, the spin action and the
     spin-major reorder happen on the convolution's load, and every other k
-    row is transformed but never stored.  CUDA: nvidia-mathdx mode 7; cpu:
-    the service's reference composition, then the plan route and the row
+    row is transformed but never stored.  ``load``, when given, is the same
+    tables on the devices (``symmetry_maps.device_load_tables``, or a pass's
+    cut of them, ``gw.subtile_stream.pass_load``), read as operands so the
+    consumer's program holds no table constants.  CUDA: nvidia-mathdx mode 7;
+    cpu: the service's reference composition, then the plan route and the row
     selection.
 
     ``apply(..., rows=(x0, bx, xs, xn))`` stores one x block with the whole spin group: block
@@ -1716,7 +1719,8 @@ def make_kconv_klead_unfold(mesh: Mesh, kgrid, tables, *, store_rows, norm: str 
     rejected alternative, reads every source of each pair per block: the spin action mixes
     them.)
     """
-    from symmetry_maps import apply_unfold_load_tables_local, local_unfold_load_tables
+    from symmetry_maps import (DEVICE_LOAD_SPECS, DeviceLoadTables,
+                               apply_unfold_load_tables_local, local_unfold_load_tables)
     kg = _check_kgrid(kgrid, kconv_backend(mesh))
     nk = kg[0] * kg[1] * kg[2]
     if int(tables.row.shape[0]) != nk:
@@ -1736,8 +1740,7 @@ def make_kconv_klead_unfold(mesh: Mesh, kgrid, tables, *, store_rows, norm: str 
         attrs = dict(nkx=np.int64(kg[0]), nky=np.int64(kg[1]), nkz=np.int64(kg[2]),
                      scale=np.float64(si * sf * float(mult)), **_mathdx_common())
 
-        def local(g, gt, v_r, conj_src=False, block=None):
-            t = local_unfold_load_tables(tables)
+        def apply_tables(g, gt, v_r, t, conj_src, block):
             n_par, mx, _, my, _ = (int(v) for v in g.shape)
             x0, bx, xs, xn = (0, 0, 0, 0) if block is None else block
             flat = lambda a: a.reshape(n_par, mx * ns, my * ns)
@@ -1749,8 +1752,7 @@ def make_kconv_klead_unfold(mesh: Mesh, kgrid, tables, *, store_rows, norm: str 
     else:
         _, conv_local = _klead_locals(mesh, kg, norm, mult)
 
-        def local(g, gt, v_r, conj_src=False, block=None):
-            t = local_unfold_load_tables(tables)
+        def apply_tables(g, gt, v_r, t, conj_src, block):
             n_par, mx, _, my, _ = (int(v) for v in g.shape)
             flat = lambda a: a.reshape(n_par, mx * ns, my * ns)
             gt = jnp.conj(g) if conj_src else gt
@@ -1763,17 +1765,26 @@ def make_kconv_klead_unfold(mesh: Mesh, kgrid, tables, *, store_rows, norm: str 
             keep = jnp.asarray(idx < mx)[None, None, :, None, None]
             return jnp.where(keep, jnp.take(U, jnp.asarray(np.minimum(idx, mx - 1)), axis=2), 0)
 
+    def local(g, gt, v_r, *load, conj_src=False, block=None):
+        # ``load``: this rank's slices of the placed tables (DeviceLoadTables
+        # fields); without it, the host tables are cut here (baked).
+        t = (tables._replace(**dict(zip(DeviceLoadTables._fields, load))) if load
+             else local_unfold_load_tables(tables))
+        return apply_tables(g, gt, v_r, t, conj_src, block)
+
     g_spec = P(None, "x", None, "y", None)
     sm = {}
 
-    def sharded(conj_src, block):
-        key = (conj_src, block)
+    def sharded(conj_src, block, placed):
+        key = (conj_src, block, placed)
         if key not in sm:
             sm[key] = _sharded(partial(local, conj_src=conj_src, block=block), mesh,
-                               (g_spec, g_spec, P(None, "x", "y")), P(None, None, "x", None, "y"))
+                               (g_spec, g_spec, P(None, "x", "y"))
+                               + (DEVICE_LOAD_SPECS if placed else ()),
+                               P(None, None, "x", None, "y"))
         return sm[key]
 
-    def apply(G, Gt, W_prep, *, conj_partner=False, rows=None):
+    def apply(G, Gt, W_prep, *, conj_partner=False, rows=None, load=None):
         """``conj_partner``: the antiunitary partner is ``conj(G)`` (a Green of real weights),
         read from ``G`` on the load, so no partner tile exists (``Gt`` must be ``None``)."""
         _check_complex(G, W_prep)
@@ -1808,7 +1819,8 @@ def make_kconv_klead_unfold(mesh: Mesh, kgrid, tables, *, store_rows, norm: str 
                                  f"at stride xs >= x0+bx starting inside the local extent {mx}")
             if rows == (0, mx, mx, 1):
                 rows = None
-        return sharded(bool(conj_partner and needs_partner), rows)(G, Gt, W_prep)
+        return sharded(bool(conj_partner and needs_partner), rows, load is not None)(
+            G, Gt, W_prep, *(() if load is None else tuple(load)))
     return apply
 
 
