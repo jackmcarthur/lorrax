@@ -1151,6 +1151,15 @@ def response_support(wfns, meta, sample_plan, receipt, *, print_fn=print):
     # batched GEMM on the direct stream's band-complete ψ rows and remain safe
     # when a complex-time phase underflows.
     band_ranges = tuple((int(lo.min()), int(hi.max())) for lo, hi in zip(lo_band, hi_band))
+    # Held across SC maps and widened only when the support leaves them: the
+    # bounds are compiled into the stream, and the bands outside the support
+    # carry exact-zero weight, so a held wider interval is the same product.
+    session = getattr(meta, "shared_pole_response_rules", None)
+    if session is not None:
+        held = session.get("band_ranges")
+        if held is not None:
+            band_ranges = tuple((min(a, c), max(b, d)) for (a, b), (c, d) in zip(band_ranges, held))
+        session["band_ranges"] = band_ranges
     if jax.process_index() == 0:
         print_fn(f"Response occupied/empty band intervals: {band_ranges} of {f.shape[-1]}")
     return dict(f=f, u=u, refs=refs, lo=lo, hi=hi, mu=mu, decay_rate=decay_rate,
