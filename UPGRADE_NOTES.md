@@ -3,6 +3,24 @@
 User-visible changes, newest first. Binding rulings behind the breaking
 changes live in `docs/architecture/decisions.md`.
 
+## 2026-09-30 — the scalar χ₀ mode-11 door reads its tables as operands
+
+The charge response stream on a raw-parent plan (the shared-pole direct
+stream, the moment correlations and the retarded stream) baked its plan's
+global unfold tables (row, trs, lsrc, rsrc, mph, nph, spin) into every
+program as HLO constants. The tables now enter as device operands, placed
+once per run and plan (`ffi.fft.make_kconv_chi_unfold(load=)`, the R189
+four-current route), and the stream binds them as a trailing argument.
+At the Fe 20³ table size (8000 k, 1792 centroids, one node): compile
+7.08 → 0.57 s per program, generated code 115 → 0.1 MB, and each held
+executable no longer adds host memory (+1.54 GB → +0.00 GB RSS per rank for
+the second program). The Fe/Ni 20³ P64 runs compiled this program three times
+at map 0 (34–48 s each), and the Ni run died of host memory during the
+third. At the P64-local shape the stream's temporaries are 13.74 → 13.60 GB
+and its dispatch is unchanged (0.439 s per Green pair). Results are bitwise
+(Fe 4³ scalar and Na 8³ SC, three maps). The Σ τ mode-7 and mode-8 doors
+still bake their tables.
+
 ## 2026-09-30 — one MPI per process; CPU runs no longer hang in MPI_Init
 
 Before it loads a sealed bundle's private SLATE closure, the native loader

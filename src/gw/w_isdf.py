@@ -149,6 +149,33 @@ def _get_chi_minimax_kernel(mesh_xy: Mesh, kgrid: tuple[int, int, int],
     return kernel
 
 
+#: The charge stream's mode-11 door and its placed load tables per (mesh, grid,
+#: plan): every q batch and output count of one run reads the same device tables.
+_CHARGE_DOORS: dict = {}
+
+
+def _charge_stream_door(mesh_xy, kgrid, plan):
+    """``ffi.fft.make_kconv_chi_unfold`` on ``plan`` and its tables placed once.
+
+    The stream passes the tables to its jit as arguments, so its program holds
+    no table constants: baked, the global row/phase tables were ~0.57 GB of HLO
+    literal per program at Fe 20^3 (8000 k, 1792 centroids), compiled into every
+    direct, moment and retarded stream of the run.
+    """
+    key = (mesh_xy, tuple(int(v) for v in kgrid), plan)
+    hit = _CHARGE_DOORS.get(key)
+    if hit is None:
+        from common.fft_helpers import make_kconv_chi_unfold
+        from symmetry_maps import device_load_tables
+        tables = plan.unfold_load_tables()
+        hit = (make_kconv_chi_unfold(mesh_xy, kgrid, tables, n_out=1, complete=False, norm="ortho"),
+               tuple(device_load_tables(tables, mesh_xy)))
+        while len(_CHARGE_DOORS) >= 2:
+            _CHARGE_DOORS.pop(next(iter(_CHARGE_DOORS)))
+        _CHARGE_DOORS[key] = hit
+    return hit
+
+
 def _chi_door_serves(mesh_xy, kgrid, ns) -> bool:
     """Whether mathdx mode 11 (``ffi.fft.make_kconv_chi_unfold``) holds this grid.
 
@@ -1049,13 +1076,16 @@ def _get_chi_fractional_contour_kernel_face(
     # Selected charge streams on a raw-parent plan form each node's correlation
     # with mathdx mode 11 from the two parent Greens (``direct_rows``): no full-k
     # Green, no transform of either Green, no XLA spin trace.
-    chi_door = None
+    chi_door = chi_tables = None
     if (pair_mode in ("direct", "retarded", "kms_static") and selected_q is not None
             and photon is None and k_unfold_plan is not None
             and _chi_door_serves(mesh_xy, grid, ns)):
-        from common.fft_helpers import make_kconv_chi_unfold
-        chi_door = make_kconv_chi_unfold(mesh_xy, grid, k_unfold_plan.unfold_load_tables(),
-                                         n_out=1, complete=False, norm="ortho")
+        chi_door, chi_tables = _charge_stream_door(mesh_xy, grid, k_unfold_plan)
+    # Trailing operands bound to the program (``_BoundTail``): the door tables.
+    tail = (door_arrays if photon_doors is not None else chi_tables)
+    tail_specs = (door_specs if photon_doors is not None else
+                  None if chi_tables is None else
+                  tuple(a.sharding.spec for a in chi_tables))
     def _finish(value):
         value = chi_fftn(value)
         if negate_full_q is None:
@@ -1071,8 +1101,8 @@ def _get_chi_fractional_contour_kernel_face(
             mun_input, nmu_input,
             rep2, rep2, rep2, rep0,
         ) + ((selected_shard,) if bank_carry else ()) + (
-            () if photon_doors is None else
-            (tuple(NamedSharding(mesh_xy, spec) for spec in door_specs),)),
+            () if tail is None else
+            (tuple(NamedSharding(mesh_xy, spec) for spec in tail_specs),)),
         donate_argnums=(8,) if bank_carry else (),
         out_shardings=(tuple(chi_R_shard for _ in range(n_out))
                        if selected_q is None else selected_shard),
@@ -1104,11 +1134,14 @@ def _get_chi_fractional_contour_kernel_face(
                        jnp.broadcast_to(zero, (n_out,) + zero.shape),
                        selected_shard))
         # The placed door tables are the last operand (``_BoundTail``).
-        door_loads = None
-        if photon_doors is not None:
+        door_loads = chi_load = None
+        if tail is not None:
             carry, tables = carry[:-1], carry[-1]
+        if photon_doors is not None:
             door_loads = {key: DeviceLoadTables(*(tables[i] for i in slots))
                           for key, slots in door_index.items()}
+        elif chi_tables is not None:
+            chi_load = tables
         if bank_carry:
             initial = carry[0]
 
@@ -1393,7 +1426,8 @@ def _get_chi_fractional_contour_kernel_face(
             zero = jax.lax.with_sharding_constraint(
                 jnp.zeros((1, nk, n_mu, n_mu), jnp.complex128), selected_shard)
             value = chi_fftn(chi_door(zero, lower.G, upper.G,
-                                      jnp.ones((1,), jnp.complex128), *partners)[0])
+                                      jnp.ones((1,), jnp.complex128), *partners,
+                                      load=chi_load)[0])
             ahead, behind = rows(value, gather_q), rows(value, reverse_q)
             return (jnp.conj(ahead), behind) if physical else (ahead, jnp.conj(behind))
 
@@ -1504,9 +1538,9 @@ def _get_chi_fractional_contour_kernel_face(
         # Public bank order [parent, sample, mu_x, mu_y].
         return jnp.swapaxes(final_R, 0, 1)
 
-    if photon_doors is None:
+    if tail is None:
         return integrate
-    return _BoundTail(integrate, (door_arrays,))
+    return _BoundTail(integrate, (tail,))
 
 
 # ============================================================================
