@@ -2046,8 +2046,8 @@ def chi_unfold_refusal(kgrid, ns: int, optin: int | None = None) -> str:
     The handler's build() refuses the same cases (GATE mathdx-kconv-chi-residency): the
     single pass needs one pair's ``2 ns^2`` columns of ``16·((nx·ny·(nz|1))|1)`` B within
     the opt-in shared memory per block; the split arm needs a 16-column plane tile of
-    ``16·((ny·(nz|1))|1)`` B each and a group pencil of ``16·nx·(2 ns^2 + 1)·TY`` B,
-    ``TY = 256 / (2 ns^2)``.  ``optin`` defaults to the device's attribute.
+    ``16·((ny·(nz|1))|1)`` B each (its warp pencil stages nothing).  ``optin`` defaults to
+    the device's attribute.
     """
     nx, ny, nz = (int(v) for v in kgrid)
     ns = int(ns)
@@ -2059,12 +2059,11 @@ def chi_unfold_refusal(kgrid, ns: int, optin: int | None = None) -> str:
     grp = 2 * ns * ns
     if grp * rs * 16 <= have:
         return ""
-    ty = max(1, 256 // grp)
-    plane, pencil = 16 * pr * 16, 16 * nx * (grp + 1) * ty
-    if plane <= have and pencil <= have:
+    plane = 16 * pr * 16
+    if plane <= have:
         return ""
     return (f"a pair's {grp} columns need {grp * rs * 16} B resident, and the split arm's plane tile "
-            f"{plane} B / group pencil {pencil} B; the device has {have} B of opt-in shared memory")
+            f"{plane} B; the device has {have} B of opt-in shared memory")
 
 
 def chi_unfold_scratch_bytes(kgrid, ns: int, tile_bytes: int, optin: int | None = None) -> int:

@@ -424,7 +424,7 @@ __device__ void pencil_pass(C* y, long long ncols, const Mid& mid) {
 // operand stride keeps the TY instances of a warp on different banks.
 // kForward = false skips the forward x transform and hands the R-space value to
 // st.put(k, col, v) (k = kx*NY*NZ + p) instead of writing y: a pass that ends in R space
-// (mode 11 accumulates chi_R and transforms once after the tau sum).
+// (mode 8's vertex pencil hands its R-space values to a plane pass).
 template <int NX, int NY, int NZ, int Arch, int GROUP, int TY, bool kForward, class C, class Cols, class Mid,
           class Store>
 __device__ void pencil_group_pass(C* y, C* smem, long long ncols, long long n_inst, const Cols& cols,

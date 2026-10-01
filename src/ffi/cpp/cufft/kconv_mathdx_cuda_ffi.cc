@@ -97,7 +97,8 @@
 //             v = sum_ab conj(si Gc'_ab) (si Gv'_ab) (+ conj(v) on a real contour)
 //             and acc[o, k, x, y] += alpha[o] v in place.  The forward transform
 //             follows the tau sum.  Single pass when a pair's 2*ns^2 columns fit,
-//             else the plane pass and an R-space group pencil, chunked over pairs.
+//             else the plane pass and an R-space warp pencil (a pair's columns on one warp,
+//             reduced by shuffles), chunked over pairs.
 // A new mode adds (1) an entry under its LRX_MODE value in kSrc, (2) a mode
 // code and a handler below, (3) a router factory in ffi/fft.py.
 //
@@ -1666,47 +1667,87 @@ struct ChiMid {
     }
 };
 
-struct ChiStore {                              // split arm: the pair's leading column accumulates
-    const ChiArgs* a;
-    __device__ void put(int k, long long col, lrx_c2 v) const {
+#if LRX_ARM == 1
+// Split arm, pencil pass (phase 1).  A pair's GRP columns are GRP consecutive lanes of one warp
+// (GRP | 32), so its transformed values meet by warp shuffles and nothing is staged in shared
+// memory.  Work item: one (ky, kz) plane point p and the block's LRX_THREADS / GRP consecutive pairs;
+// consecutive lanes read consecutive columns of y.  Each lane inverse-transforms its column's x-line
+// in registers; then, per kx, every lane of the pair reads the pair's GRP values (the shuffles are
+// warp-uniform) and forms the value lrx_chi_value / lrx_chi_vertex forms on the single arm, from the
+// same operands in the same order, into its own v[kx] (that slot is dead once read).  The plain pass
+// spreads the accumulation over the pair's lanes (lane m takes kx = m, m + GRP, ...); a vertex pass
+// accumulates channel vch0 + m on lane m (all kx).  Each lane issues its acc loads before its stores:
+// one lane updating 20 kx serially (the stores may alias the next load) was the pass's latency.
+static_assert(32 % GRP == 0, "a pair's columns share one warp");
+__device__ __forceinline__ lrx_c2 lrx_shfl(lrx_c2 v, int src) {
+    return {__shfl_sync(0xffffffffu, v.x, src), __shfl_sync(0xffffffffu, v.y, src)};
+}
+__device__ void chi_pencil_warp(const ChiArgs& a, long long ncols) {
+    using namespace cufftdx;
+    constexpr int CPB = LRX_THREADS / GRP;            // pairs per work item
+    constexpr long long PL = (long long)NY * NZ;
+    const int member = (int)(threadIdx.x % GRP), base = (int)(threadIdx.x & 31) - member;
+    const long long nit = (a.npairs + CPB - 1) / CPB;
+    for (long long w = blockIdx.x; w < PL * nit; w += gridDim.x) {
+        const long long p = w / nit, inst = (w % nit) * CPB + threadIdx.x / GRP;
+        const bool live = inst < a.npairs;
+        const long long col = inst * GRP + member, pr = a.p0 + inst;
+        lrx_c2 v[NX];
+#pragma unroll
+        for (int kx = 0; kx < NX; ++kx) {
+            if (live) v[kx] = a.y[((long long)kx * PL + p) * ncols + col];
+            else { v[kx].x = 0; v[kx].y = 0; }
+        }
+        if constexpr (NX > 1) lrx_kbox::line_fft<NX, LRX_SM, fft_direction::inverse>(v, 1);
 #if LRX_VTX
-        // Member m of this pencil pass carries channel vch0 + m.
-        const int ch = a->vch0 + (int)(col % GRP);
-        if (ch < a->vna * a->vnb) lrx_chi_acc_ch(*a, k, a->p0 + col / GRP, ch, v);
+        const int nch = a.vna * a.vnb, ch = a.vch0 + member;
+        const int chv = ch < nch ? ch : nch - 1;     // every lane shuffles; a lane past the channels discards
+#pragma unroll
+        for (int kx = 0; kx < NX; ++kx) {
+            const lrx_c2 own = v[kx];
+            v[kx] = lrx_chi_vertex([&](int q) { return lrx_shfl(own, base + q); }, a, chv);
+        }
+        if (!live || ch >= nch) continue;
+        constexpr int CH = 4;                         // acc loads in flight per lane
+        for (int o = 0; o < a.n_out; ++o) {
+            lrx_c2* e = a.acc + ((long long)(ch * a.n_out + o) * NK + p) * a.pairs + pr;
+#pragma unroll
+            for (int k0 = 0; k0 < NX; k0 += CH) {
+                lrx_c2 w4[CH];
+#pragma unroll
+                for (int i = 0; i < CH; ++i)
+                    if (k0 + i < NX) w4[i] = e[(long long)(k0 + i) * PL * a.pairs];
+#pragma unroll
+                for (int i = 0; i < CH; ++i)
+                    if (k0 + i < NX) { lrx_cmac(w4[i], a.alpha[o], v[k0 + i]); e[(long long)(k0 + i) * PL * a.pairs] = w4[i]; }
+            }
+        }
 #else
-        if (col % GRP) return;
-        lrx_chi_acc(*a, k, a->p0 + col / GRP, v);
+        constexpr int J = (NX + GRP - 1) / GRP;       // kx rows per lane
+        lrx_c2 mine[J];
+#pragma unroll
+        for (int kx = 0; kx < NX; ++kx) {
+            const lrx_c2 own = v[kx];
+            const lrx_c2 val = lrx_chi_value([&](int q) { return lrx_shfl(own, base + q); }, a.si);
+            if (kx % GRP == member) mine[kx / GRP] = val;
+        }
+        if (!live) continue;
+        for (int o = 0; o < a.n_out; ++o) {
+            lrx_c2* e = a.acc + ((long long)o * NK + p) * a.pairs + pr;
+            lrx_c2 w3[J];
+#pragma unroll
+            for (int j = 0; j < J; ++j)
+                if (member + j * GRP < NX) w3[j] = e[(long long)(member + j * GRP) * PL * a.pairs];
+#pragma unroll
+            for (int j = 0; j < J; ++j)
+                if (member + j * GRP < NX) {
+                    lrx_cmac(w3[j], a.alpha[o], mine[j]);
+                    e[(long long)(member + j * GRP) * PL * a.pairs] = w3[j];
+                }
+        }
 #endif
     }
-};
-
-#if LRX_ARM == 1
-// Split arm, pencil pass: the x-line inverse of every member, then member 0 forms the pair.
-struct ChiCols {
-    __device__ long long col(long long inst, int member) const { return inst * GRP + member; }
-};
-struct ChiPencilMid {
-    static constexpr int kAux = 0;
-    double si;
-    const ChiArgs* a;
-    __device__ void stage_aux(lrx_c2*, long long, long long, int) const {}
-    struct F {
-        int member;
-        double si;
-        const ChiArgs* a;
-        __device__ lrx_c2 operator()(const lrx_c2* grp, const lrx_c2*) const {
-#if LRX_VTX
-            const int ch = a->vch0 + member;
-            if (ch >= a->vna * a->vnb) return grp[member * LRX_TY];
-            return lrx_chi_vertex([&](int q) { return grp[q * LRX_TY]; }, *a, ch);
-#else
-            if (member != 0) return grp[member * LRX_TY];
-            return lrx_chi_value([&](int q) { return grp[q * LRX_TY]; }, si);
-#endif
-        }
-    };
-    __device__ F bind(int member) const { return F{member, si, a}; }
-};
+}
 #endif
 
 // LRX_MINB: blocks per SM the plan's shared memory admits (2 with the tile tables); the register
@@ -1757,13 +1798,11 @@ extern "C" __global__ void __launch_bounds__(LRX_THREADS, LRX_MINB) lrx_kconv(Ch
         lrx_kbox::mid_group_tile<NX, NY, NZ, TRC, GRP>(sm, col0, ncols, mid);
     }
 #else
-    const ChiStore st{&a};
     if (phase == 0) {
         lrx_kbox::plane_pass<NX, NY, NZ, LRX_SM, fft_direction::inverse, TRC>(
             sm, ncols, ld, lrx_kbox::Plain<lrx_c2>{a.y, ncols});
     } else {
-        lrx_kbox::pencil_group_pass<NX, NY, NZ, LRX_SM, GRP, LRX_TY, false>(
-            a.y, sm, ncols, a.npairs, ChiCols{}, ChiPencilMid{a.si, &a}, st);
+        chi_pencil_warp(a, ncols);
     }
 #endif
 }
@@ -2052,7 +2091,7 @@ static ffi::Error build(int mode, int nkx, int nky, int nkz, int ns, bool f32,
     // the shared memory from the grid and this device's opt-in budget; RB is unused.
     const int chi_grp = 2 * ns * ns;
     lrx_kbox::Plan kplan{};
-    int chi_trc = 0, chi_ty = 0, chi_threads = 0, chi_tt = 0, chi_minb = 1;
+    int chi_trc = 0, chi_ty = 0, chi_threads = 0, chi_tt = 0, chi_minb = 1, chi_carve = 100;
     long long chi_smem = 0, chi_smem2 = 0;
     if (mode == 11) {
         kplan = lrx_kbox::kbox_plan(nkx, nky, nkz, ns * ns, 2, 16, smem_optin, 1, 1);  // min_tr 1: a gathered group load
@@ -2078,10 +2117,32 @@ static ffi::Error build(int mode, int nkx, int nky, int nkz, int ns, bool f32,
                 }
             }
         } else {
-            chi_trc = kplan.tr;                            // plane tiles of tr columns (whole spin groups)
-            chi_threads = kThreads;
+            // Split arm: plane tiles of kplan.tr (16) columns, whole spin groups; the group pencil
+            // reduces by warp shuffles and stages nothing.  Both passes run 16 warps per SM under a
+            // 128-register bound when the pencil's x-line (4*nkx registers) leaves room: nkx <= 20,
+            // or <= 12 with vertices (ptxas sm_80 at the bound: 20^3 ns 2 and the vertex pencil at
+            // 12^3 no spill; 30^3 464 B, the vertex pencil 60 B at 14^3 and 444 B at 20^3; past them
+            // one 256-thread block per SM).  Two 256-thread blocks where two tiles fit the SM's
+            // shared memory, with the carveout that holds them and the rest left to L1; else one
+            // 512-thread block (one 16-column tile per SM: two 8-column tiles ran the plane pass
+            // 1.17x slower, and a carveout of 100 cost 1.10x, ncu at 20^3: a tile's pairs share
+            // their tables in L1).  At 256 threads and one block the 108 KB tile (20^3) and the
+            // 92 KB pencil stage held 8 warps per SM, both passes latency-bound at ~0.5 TB/s.
+            int smem_sm = 0, smem_rsv = 0;
+            LRX_CUDA_CHECK(cudaDeviceGetAttribute(&smem_sm, cudaDevAttrMaxSharedMemoryPerMultiprocessor, dev),
+                           "shared memory per SM");
+            LRX_CUDA_CHECK(cudaDeviceGetAttribute(&smem_rsv, cudaDevAttrReservedSharedMemoryPerBlock, dev),
+                           "reserved shared memory per block");
+            const bool wide = nkx <= ((variant & 2) ? 12 : 20);
+            chi_trc = kplan.tr;
             chi_smem = static_cast<long long>(chi_trc) * g.pr() * 16;
-            chi_smem2 = (static_cast<long long>(nkx) * chi_grp * chi_ty + static_cast<long long>(nkx) * chi_ty) * 16;
+            chi_smem2 = 0;
+            const bool two = wide && 2 * (chi_smem + smem_rsv) <= smem_sm;
+            chi_threads = wide && !two ? 2 * kThreads : kThreads;
+            chi_ty = chi_threads / chi_grp;
+            chi_minb = two ? 2 : 1;
+            chi_carve = static_cast<int>(std::min<long long>(
+                100, (100LL * chi_minb * (chi_smem + smem_rsv) + smem_sm - 1) / smem_sm));
         }
     }
     // Modes 2-5, 8 and 9 run on the k-box stage: kbox_plan decides the arm, the tile and the shared
@@ -2441,10 +2502,13 @@ static ffi::Error build(int mode, int nkx, int nky, int nkz, int ns, bool f32,
         }
         if (cr != CUDA_SUCCESS) return sticky("cuFuncSetAttribute", cu_err(cr));
     }
-    // Modes 11 (two blocks per SM) and 7: the largest shared-memory carveout, so the driver does
-    // not pick a split that holds one block fewer (a hint; residency is unchanged if it declines).
+    // Modes 11 (two blocks per SM) and 7: a shared-memory carveout that holds every planned block,
+    // so the driver does not pick a split that holds one block fewer (a hint; residency is
+    // unchanged if it declines): the largest for the tile tables and mode 7, the smallest that
+    // holds them for mode 11's split arm (chi_carve; the rest is L1).
     if ((mode == 11 && chi_minb > 1) || mode == 7) {
-        cr = api.FuncSetAttribute(b.fn, CU_FUNC_ATTRIBUTE_PREFERRED_SHARED_MEMORY_CARVEOUT, 100);
+        cr = api.FuncSetAttribute(b.fn, CU_FUNC_ATTRIBUTE_PREFERRED_SHARED_MEMORY_CARVEOUT,
+                                  mode == 11 && kplan.arm == 1 ? chi_carve : 100);
         if (cr != CUDA_SUCCESS) return sticky("cuFuncSetAttribute(carveout)", cu_err(cr));
     }
     if (mklpin::announce_here() || log_enabled()) {
