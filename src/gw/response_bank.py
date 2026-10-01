@@ -1420,6 +1420,34 @@ def _stream_workspace(wfns, meta, mesh_xy, support, *, q_ids, n_outputs, ordered
             + _stream_scratch(wfns, meta, mesh_xy, vertex)), compiled
 
 
+def _dyson_phase(solve_value, solve_slope, roots, mesh_xy, config, *, nq, n, extra=()):
+    """(resident, workspace) bytes per rank of the sample Dyson phase beside a group's carry.
+
+    Counted as :func:`_bank_execution` admits them: the compiled arguments
+    resident, the outputs, temporaries and native solver workspace on top.
+    ``sample_dyson`` takes ``(H, chi)``; ``sample_slope`` takes ``(H, Wc, dchi)``
+    while the value's chi rows are still held (one more face stack).  Both at
+    the full parent span ``nq``, the largest a sample solves.
+    """
+    sharding = getattr(roots, "sharding", None)
+    if sharding is None or not hasattr(roots, "shape"):
+        return 0, 0
+    face = jax.ShapeDtypeStruct((int(nq), int(n), int(n)), jnp.complex128, sharding=sharding)
+    h = jax.ShapeDtypeStruct((int(nq),) + tuple(roots.shape[1:]), roots.dtype, sharding=sharding)
+    layout = config.get("linalg", "local") if hasattr(config, "get") else config.backend.linalg
+    native = response_dense_workspace(mesh_xy, int(n), int(nq), layout, with_eigh=False)["total"]
+    held = 16 * int(nq) * int(n) * int(n) // int(mesh_xy.size)
+    phases = []
+    for kernel, args, kept in ((solve_value, (h, face) + tuple(extra), 0),
+                               (solve_slope, (h, face, face), held)):
+        memory = _compiled(kernel, args).memory_analysis()
+        if memory is None:
+            raise ValueError("GATE response_capacity: compiled memory unavailable")
+        phases.append((int(memory.argument_size_in_bytes) + kept,
+                       int(memory.output_size_in_bytes + memory.temp_size_in_bytes) + int(native)))
+    return tuple(max(p[i] for p in phases) for i in (0, 1))
+
+
 def response_group_size(meta, mesh_xy, *, n_samples, carry_per_sample, stream_workspace,
                         selection=(0, 0)):
     """Largest sample group whose carry and stream workspace fit, and its room.
@@ -1427,8 +1455,9 @@ def response_group_size(meta, mesh_xy, *, n_samples, carry_per_sample, stream_wo
     One route and no dial: every sample in one group when it fits (symmetric
     decks), otherwise the largest group that does (about four on a
     two-component deck without q symmetry, where the carry is G/2 Green tiles).
-    ``selection`` is the line selection's (resident, workspace) bytes, which
-    run beside the group's carry after its stream.  The group must fit the
+    ``selection`` is the larger (resident, workspace) bytes of the phases that
+    run beside the group's carry after its stream: the line selection and the
+    sample Dyson value and slope solves (:func:`_dyson_phase`).  The group must fit the
     capacity ledger (the deck budget ``memory_per_device_gb`` less the inherited
     peak, the reserved live stages and the runtime reserve): the one size that
     follows the budget, because a larger group buys more than 10 % per map and
@@ -1566,6 +1595,13 @@ def produce_sample_bank(wfns, meta, config, *, mesh_xy, sym, sample_plan, bank_i
         workspace, whole = _stream_workspace(wfns, meta, mesh_xy, support, q_ids=response_rows,
             n_outputs=2*len(z), ordered=ordered, vertex=vertex)
         chosen = (0, 0) if selection is None else (selection_resident, selection_workspace)
+        # The per-sample Dyson value and slope solves run beside the group's
+        # carry after its stream, at every parent at once: count their
+        # admitted bytes from their compiled executables, as their admission
+        # will, so the group leaves room for them.
+        chosen = tuple(max(a, b) for a, b in zip(chosen, _dyson_phase(
+            solve_value, solve_slope, roots, mesh_xy, config, nq=len(qids), n=n,
+            extra=() if vertex is None else (contact,))))
         with timing.section('bank.plan.direct'):
             group_size, fixed, room, live = response_group_size(meta, mesh_xy, n_samples=len(z),
                 carry_per_sample=carry_per_sample, stream_workspace=workspace,
