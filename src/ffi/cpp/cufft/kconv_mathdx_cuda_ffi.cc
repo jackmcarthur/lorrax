@@ -2203,11 +2203,19 @@ static ffi::Error build(int mode, int nkx, int nky, int nkz, int ns, bool f32,
                    2LL * ss * (2 * grp) * g.pr() * 16 <= smem_optin)
                 grp *= 2;
             kb_tr = ss * grp;
+            // The group pencil stages nkx * ty * (ss + 17) elements (the group's values and V); ty
+            // halves until the stage fits the opt-in memory.  At ty 128/ss = 32 the two-spinor doors
+            // (the sector Sigma's Dirac quarters) staged 172 KB at 16^3 and 215 KB at 20^3 and refused;
+            // the instances a block holds change no value.
+            auto pencil_stage = [&](int ty) {
+                return (static_cast<long long>(nkx) * ss * ty + static_cast<long long>(nkx) * ty * 17) * 16;
+            };
             kb_ty = std::max(1, 128 / ss);
+            while (kb_ty > 1 && pencil_stage(kb_ty) > smem_optin) kb_ty /= 2;
             kb_threads = kThreads;
             kb_threads2 = ss * kb_ty;
             kb_smem = static_cast<long long>(kb_tr) * g.pr() * 16;
-            kb_smem2 = (static_cast<long long>(nkx) * ss * kb_ty + static_cast<long long>(nkx) * kb_ty * 17) * 16;
+            kb_smem2 = pencil_stage(kb_ty);
             if (lor_ws > 0) {                          // the W_R chunk: plane tiles of whole Lorentz groups
                 int wgrp = 1;                          // (as the Green's plane tiles above)
                 while (static_cast<long long>(nky) * nkz * wgrp < kThreads &&
