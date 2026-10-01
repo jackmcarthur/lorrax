@@ -131,7 +131,7 @@ def pass_rows(a, mesh, x0, xr, axis):
                          mesh=mesh, in_specs=spec, out_specs=spec, check_vma=False)(a)
 
 
-def stream_passes(carry, *, mesh, plan, weights, count, node_rows):
+def stream_passes(carry, *, mesh, plan, weights, count, node_rows, only=None):
     """``carry[o, q, μ, ν] += Σ_n Σ_s weights[s, o, n] node_rows(p, n)[s]`` over every pass ``p``.
 
     ``carry`` ``[n_out, q, μ, ν]`` at ``P(None, None, 'x', 'y')`` is updated in
@@ -139,7 +139,10 @@ def stream_passes(carry, *, mesh, plan, weights, count, node_rows):
     (traced).  ``node_rows(p, n)`` returns pass ``p``'s ``[2, q, px*xr, ν]``
     rows of node ``n`` at ``P(None, None, 'x', 'y')``.  Nodes run in chunks
     of ``plan.chunk``; a chunk's nodes past ``count`` are not evaluated and
-    add exact zeros.
+    add exact zeros.  ``only`` names one pass: ``carry`` is then that pass's
+    ``[n_out, q, px*xr, ν]`` sub-tile (its rows from 0) and its elements get
+    the same terms in the same order, so its bytes are the whole tile's
+    (the streamed bank, ``file_io.streamed_bank``).
     """
     from ffi.contour import contour_block_accumulate_local
     chunk = int(plan.chunk)
@@ -149,6 +152,10 @@ def stream_passes(carry, *, mesh, plan, weights, count, node_rows):
     n_chunks = ((count + chunk - 1) // chunk).astype(jnp.int32)
     spec_c = P(None, None, "x", "y")
     for p, (x0, xr) in enumerate(plan.passes):
+        if only is not None and p != int(only):
+            continue
+        if only is not None:
+            x0 = 0
         shape = jax.eval_shape(lambda n, p=p: node_rows(p, n), jnp.zeros((), jnp.int32))
 
         def skipped(shape=shape):

@@ -905,6 +905,7 @@ def _get_chi_fractional_contour_kernel_face(
     mesh_xy: Mesh, kgrid: tuple[int, int, int], n_out: int, face_shape,
     *, k_unfold_plan=None, layout="face", selected_q=None, pair_mode="retarded",
     bank_carry=False, ordered=False, vertex=False, band_ranges=None, photon_passes=None,
+    stream_pass=None,
 ):
     """Integrate the retarded response using final occupied and unoccupied band weights.
 
@@ -939,6 +940,10 @@ def _get_chi_fractional_contour_kernel_face(
     selected q and -q rows are kept, in the families' packed photon layout;
     those rows cross into the canonical layout once per call.  The stream
     requires ``selected_q``.  No psi face and no Green is unfolded.
+
+    ``stream_pass`` (direct bank carry on the row-pass engine only) runs one
+    row pass: the donated carry is that pass's ``[n_out, q, px*xr, mu]``
+    sub-tile (``gw.subtile_stream.stream_passes``'s ``only``).
     """
     from common.fft_helpers import make_flat_k_fftn
     from distrib_la import gemm_plan
@@ -1109,12 +1114,16 @@ def _get_chi_fractional_contour_kernel_face(
         pass_active = tuple((tuple(g.prepare_active_range(*bounds) for bounds in band_ranges)
                              if band_ranges is not None else (None, None)) for g in pass_gemms)
         chi_tables = tuple(a for load in pass_loads for a in load)
-        if jax.process_index() == 0:
+        if jax.process_index() == 0 and not stream_pass:
             print(f"Response direct stream: {len(subtile.passes)} row pass(es) of "
                   f"{max(xr for _, xr in subtile.passes)} local rows, {subtile.chunk} node(s) "
                   "per accumulate", flush=True)
     elif door_serves:
         chi_door, chi_tables = _charge_stream_door(mesh_xy, grid, k_unfold_plan)
+    if stream_pass is not None and (subtile is None or not bank_carry
+                                    or not 0 <= int(stream_pass) < len(subtile.passes)):
+        raise ValueError(f"GATE response_stream_pass: pass {stream_pass} needs the direct bank "
+                         "carry on the row-pass engine (mathdx mode 11 from raw parents)")
     # Trailing operands bound to the program (``_BoundTail``): the door tables.
     tail = (door_arrays if photon_doors is not None else chi_tables)
     tail_specs = (door_specs if photon_doors is not None else
@@ -1537,7 +1546,7 @@ def _get_chi_fractional_contour_kernel_face(
                                  else (ahead, jnp.conj(behind)))
                 return jax.lax.with_sharding_constraint(jnp.stack([ahead, behind]), selected_shard)
             return stream_passes(accumulators, mesh=mesh_xy, plan=subtile, weights=projection_rows,
-                                 count=live_count(), node_rows=node_rows)
+                                 count=live_count(), node_rows=node_rows, only=stream_pass)
 
         def direct_stream(accumulators):
             # The rule is padded to RESPONSE_NODE_CAPACITY slots with zero
