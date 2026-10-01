@@ -1003,6 +1003,68 @@ class WfnLoader:
                 )
         return child
 
+    def little_group_rows(self, parent: int) -> np.ndarray:
+        """The permitted operation rows that map raw parent ``parent`` onto itself.
+
+        ``SymMaps.active_symmetry_rows`` whose k action takes the parent's k to
+        itself modulo a reciprocal lattice vector, unitary and antiunitary
+        rows alike (the identity row included).
+        """
+        sym = self._ensure_sym()
+        k = np.asarray(self.kpoints[int(parent)], dtype=np.float64)
+        rows = np.asarray(sym.active_symmetry_rows, dtype=np.int32)
+        image = np.einsum("rij,j->ri", np.asarray(sym.sym_mats_k)[rows], k)
+        delta = image - k[None, :]
+        return rows[np.all(np.abs(delta - np.rint(delta)) < 1e-6, axis=1)]
+
+    def unfold_parent_by_row(self, parent_psi: jax.Array, *, parent: int, row: int):
+        """``R ψ`` of one raw parent under one row of its little group, and that row's G list.
+
+        The same typed action as :meth:`unfold_parent_to_full_k` (rotation,
+        nonsymmorphic phase, antiunitary conjugation, spinor action), for an
+        operation row ``row`` of :meth:`little_group_rows` instead of the
+        full-k row's stored operation.  Returns ``(child, gvecs)``: the
+        one-k carrier in the parent's G slot order, and the ``(ngk, 3)``
+        Miller indices each slot carries after the action (the parent's
+        sphere, permuted).
+        """
+        from symmetry_maps import unfold_reciprocal_carriers
+        if self._mesh is None:
+            raise ValueError("WfnLoader.unfold_parent_by_row requires the loader's mesh.")
+        parent, row = int(parent), int(row)
+        if row not in set(int(r) for r in self.little_group_rows(parent)):
+            raise ValueError(
+                f"WfnLoader.unfold_parent_by_row: row {row} is not a permitted "
+                f"operation that maps parent {parent} onto itself.")
+        sym = self._ensure_sym()
+        reciprocal_rows, translation, antiunitary = sym.operation_rows(np.asarray([row]))
+        reciprocal = np.asarray(reciprocal_rows[0], dtype=np.int32)
+        # The image lands on the parent's own stored representative: the
+        # umklapp is taken against the parent's k, not its full-grid row, so
+        # the image carries the parent's G sphere.
+        k = np.asarray(self.kpoints[parent], dtype=np.float64)
+        shift = k - reciprocal @ k
+        umklapp = np.rint(shift).astype(np.int32)
+        if not np.allclose(shift, umklapp, atol=1e-6):
+            raise ValueError(
+                f"WfnLoader.unfold_parent_by_row: row {row} does not map parent "
+                f"{parent} onto itself (k - R k = {shift.tolist()}).")
+        U = np.asarray(sym.spinor_action(np.asarray([row]), nspinor=int(self.nspinor))[0])
+        rep = lambda a, spec: device_put_process_local(np.asarray(a), NamedSharding(self._mesh, spec))
+        tr = rep(np.asarray(bool(antiunitary[0])), P())
+        U_dev = rep(U, P(None, None))
+        if np.any(np.abs(np.asarray(translation[0], dtype=np.float64)) > 1e-12):
+            phase = _parent_phase_kernel(self._mesh)(
+                rep(np.asarray(reciprocal_rows[0]), P(None, None)),
+                rep(np.asarray(translation[0]), P(None)),
+                self._parent_g_row_device(parent))
+            child = _parent_to_full_k_unfold_kernel(self._mesh, True)(parent_psi, U_dev, phase, tr)
+        else:
+            child = _parent_to_full_k_unfold_kernel(self._mesh, False)(parent_psi, U_dev, tr)
+        ngk = int(self.ngk[parent])
+        g = self._host_parent_g_row(parent)[:ngk]
+        return child, np.asarray(unfold_reciprocal_carriers(reciprocal, g, umklapp), dtype=np.int64)
+
     # ------------------------------------------------------------------
     # G-vector and ngk_valid accessors
     # ------------------------------------------------------------------
