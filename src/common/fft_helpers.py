@@ -204,7 +204,7 @@ from ffi.fft import (  # noqa: E402  (re-export: see the block above)
 # so no caller branches on a backend and no environment variable picks one.
 #
 #     make_kconv_klead        Σ / COHSEX: KConvStored(prep(W), apply(T, W_prep))
-#     make_kconv_klead_unfold Σ from the raw-parent Green: fn(G, Gt, W_prep), same prep
+#     make_kconv_klead_unfold Σ from the raw-parent Green: fn(G, Gt, W_prep, load=None), same prep
 #     make_kfft_klead_unfold  that prep read from the q wedge: fn(W_wedge, Wt=None)
 #     make_kconv_chi_unfold   chi0 from the raw-parent Green pair: fn(acc, Gv, Gc, alpha)
 #     make_kconv_kminor       BSE rung:   fn(X, K_R), out_layout 0 | 1
