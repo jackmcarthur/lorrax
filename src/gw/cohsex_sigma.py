@@ -340,7 +340,7 @@ def lorentz_class_vertices(keys):
 
 def make_lorentz_convolution(mesh_xy: Mesh, kgrid, nk_tot: int, keys, left_plan,
                              right_plan=None, *, w_tables):
-    """The four-current Σ door: ``fn(parent_green, W, Wt) -> Σ_k``, read from the raw parents.
+    """The four-current Σ door: ``fn(parent_green, W, Wt, loads) -> Σ_k``, read from the raw parents.
 
         Σ_k = -1/√N_k · fftn( Σ_AB γ̃_A ifftn(Ĝ) γ̃_B† · ifftn(Ŵ)[:, x, A, y, B] )
 
@@ -354,11 +354,14 @@ def make_lorentz_convolution(mesh_xy: Mesh, kgrid, nk_tot: int, keys, left_plan,
     nvidia-mathdx mode 8 on CUDA), so no full-k Green, full-q W or full-grid
     W_R exists.  Σ_k leaves spin-major ``(n_parent, s, mu, s', nu)`` on the left
     plan's parent rows (``parent_full_rows``), the face projector's order;
-    the other full-k rows are never stored.
+    the other full-k rows are never stored.  ``loads`` (``fn.loads``) are the
+    Green's and W's tables placed on the devices once: the caller's jit takes
+    them as arguments, so its program holds no table constants.
     """
     from ffi import ffi_dial_key
     from common.fft_helpers import make_kconv_lorentz_unfold
     from common.gamma_matrices import gamma_perm_phase_host
+    from symmetry_maps import device_load_tables
     lefts, rights = lorentz_class_vertices(keys)
     right = left_plan if right_plan is None else right_plan
     key = (_mesh_key(mesh_xy), tuple(int(v) for v in kgrid), ffi_dial_key(), int(nk_tot),
@@ -373,9 +376,11 @@ def make_lorentz_convolution(mesh_xy: Mesh, kgrid, nk_tot: int, keys, left_plan,
             store_rows=left_plan.parent_full_rows,
             norm='ortho', mult=-1.0 / np.sqrt(float(nk_tot)), w_tables=w_tables)
 
-        def convolve(parent_green, W, Wt):
+        def convolve(parent_green, W, Wt, loads):
             return door(parent_green.G, parent_green.transpose, W, Wt,
-                        conj_partner=parent_green.conj_partner)
+                        conj_partner=parent_green.conj_partner, load=loads[0], w_load=loads[1])
+        convolve.loads = (device_load_tables(tables, mesh_xy),
+                          device_load_tables(w_tables, mesh_xy))
         # The entry keeps both plans and the W tables alive, so their ids cannot be reused.
         _lorentz_convolution_cache[key] = (convolve, left_plan, right, w_tables)
     return _lorentz_convolution_cache[key][0]
@@ -474,7 +479,7 @@ def _make_cohsex_kernels_face(mesh_xy: Mesh, face_shape, _convolve,
         # The Σ τ node's own kernel (ppm_tau_kernel._sigma_subtile_kernel) at τ = 0
         # with the static interaction in place of W(τ): the parent Green on each
         # row pass's band-complete ψ rows (one local GEMM), the interaction read
-        # from its q wedge by mathdx mode 9 and the Green by mode 7, both doors
+        # from its q wedge by mathdx mode 9 and the Green by mode 7, both k-convolution calls
         # with device load tables (no table constants in the program), and the
         # band projection summed over the passes.  Static weights are real, so
         # the antiunitary partner is conj(G), read on the load: no partner tile.
@@ -502,9 +507,9 @@ def _make_cohsex_kernels_face(mesh_xy: Mesh, face_shape, _convolve,
             # route's operator rule (unfold_file_wedge_band_operator) is one spelling.
             return unfold_file_wedge_band_operator(_sym, parent_rows, trs_rule="transpose")
 
-        def _door(op):
+        def _with_tables(op):
             """The interaction with its conj-rule load tables on the devices, and the
-            Green door's (both jit arguments, placed once per run)."""
+            Green's mode-7 tables (both jit arguments, placed once per run)."""
             if op.trs_rule != "conj":
                 raise ValueError(f"static Sigma reads a Hermitian interaction by the conj "
                                  f"rule; got trs_rule={op.trs_rule!r}")
@@ -527,10 +532,10 @@ def _make_cohsex_kernels_face(mesh_xy: Mesh, face_shape, _convolve,
 
         # W - V unfolds by W's tables, so W's load serves COH.
         def warmed_sx(wfns, Gij, W_q):
-            return sigma_sx(wfns, Gij, *_door(interaction_operator(W_q)))
+            return sigma_sx(wfns, Gij, *_with_tables(interaction_operator(W_q)))
 
         def warmed_coh(wfns, W_q, V_q, *, ri_bands=None):
-            W, g_load = _door(interaction_operator(W_q))
+            W, g_load = _with_tables(interaction_operator(W_q))
             return sigma_coh(wfns, W, V_q, g_load, ri_bands=ri_bands)
 
         return warmed_sx, warmed_coh

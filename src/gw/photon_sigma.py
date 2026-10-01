@@ -120,6 +120,9 @@ def _make_photon_static_class_kernel(
     ``keys`` are the class's blocks, one ``A x B`` product; the interaction
     is the pair ``(W, Wt)`` on the irreducible q (:func:`_class_parents`), which
     the door unfolds on its load through ``w_tables`` (:func:`_class_w_tables`).
+    Returns ``(contract_class, loads)``: the k-convolution's unfold tables placed
+    once, which ``contract_class`` takes as an argument (no table constants in its
+    program).
     """
     from ffi import ffi_dial_key
     from common.contract_bands import contract_bands_block_reshard
@@ -149,13 +152,13 @@ def _make_photon_static_class_kernel(
     head_product = make_lorentz_q0_product(nk_tot) if with_head else None
     rows = np.asarray(plans[0].parent_full_rows)
     @jax.jit
-    def contract_class(left, right, weights, interaction, factor, head_interaction=None,
+    def contract_class(left, right, weights, interaction, factor, loads, head_interaction=None,
                        head_vertices=None):
         weights = plans[0].parent_rows(weights)
         green = build_G_parents(left.psi_mun, right.psi_nmu, phases=jnp.real(weights),
                                 layout=layout, gemm=g_plan, k_unfold_plan=plans[0])
         # The prefactor is -1/2 or 1: an exact power of two, applied after the door.
-        sigma = factor * convolve(green, *interaction)
+        sigma = factor * convolve(green, *interaction, loads)
         result = project(left.projection_faces()[0], sigma, right.projection_faces()[1])
         if with_head:
             # The q -> 0 head is a pointwise product on the unfolded Green.
@@ -166,9 +169,9 @@ def _make_photon_static_class_kernel(
             return result, head
         return result
     # The entry keeps the W tables alive, so their id in the key cannot be reused.
-    _photon_sigma_kernel_cache[key] = contract_class
+    _photon_sigma_kernel_cache[key] = (contract_class, convolve.loads)
     _photon_sigma_kernel_cache[(key, 'w_tables')] = w_tables
-    return contract_class
+    return _photon_sigma_kernel_cache[key]
 
 
 def _photon_head_pairs(response, term, mesh_xy):
@@ -310,11 +313,11 @@ def contract_lorentz_blocks(blocks, *, families, term, response, Gij, meta, mesh
                 for A, B in keys])
             vertices = jax.tree.map(lambda *v: jnp.stack(v),
                 *((gamma_perm_phase(A), gamma_perm_phase(B)) for A, B in keys))
-        kernel = _make_photon_static_class_kernel(mesh_xy, meta.kgrid, meta.nk_tot,
-                                                  left, right, keys, with_head=with_head,
-                                                  w_tables=tables)
+        kernel, loads = _make_photon_static_class_kernel(mesh_xy, meta.kgrid, meta.nk_tot,
+                                                         left, right, keys, with_head=with_head,
+                                                         w_tables=tables)
         arguments = (left.green_parent, right.green_parent, weights, pair,
-                     -0.5 if term == _TERM_COH else 1.0, head_blocks, vertices)
+                     -0.5 if term == _TERM_COH else 1.0, loads, head_blocks, vertices)
         if admit_kernel is not None:
             admit_kernel(kernel, arguments, keys[0])
         value = kernel(*arguments)
