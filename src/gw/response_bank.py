@@ -1923,7 +1923,11 @@ def produce_sample_bank(wfns, meta, config, *, mesh_xy, sym, sample_plan, bank_i
                     stage, _ = _reserve(meta, "line_selection", selection_resident, selection_workspace)
                     live = ledger.live_stages
                     ledger.live_stages = live + (stage,)
-                    started_selection = time.monotonic()
+                    # line_selection times the selection alone: this sample's Dyson
+                    # solves stay under their own dispatch keys, so the keys partition.
+                    solved = lambda: sum(receipt["seconds"].get(k + "_dispatch", 0.)
+                                         for k in ("sample_dyson", "sample_slope"))
+                    started_selection = time.monotonic() - solved()
                     value, slope = solve(raw, 0, 0, len(qids), bank_handle, sample, layout=line_layout)
                     with timing.section('bank.line_select'):
                         lines = selection.select(sample, value, slope)
@@ -1937,7 +1941,7 @@ def produce_sample_bank(wfns, meta, config, *, mesh_xy, sym, sample_plan, bank_i
                         panels = selection.panels(sample, lines)
                     del lines
                     receipt["seconds"]["line_selection"] = (receipt["seconds"].get("line_selection", 0.)
-                                                             + time.monotonic() - started_selection)
+                        + time.monotonic() - solved() - started_selection)
                     io_started = time.monotonic()
                     with timing.section('bank.line_write'):
                         write(q_span=(0, len(qids)), line=panels)
