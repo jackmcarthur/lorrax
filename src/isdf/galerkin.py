@@ -44,19 +44,13 @@ from runtime.padding import spec_divisor
 __all__ = [
     "GalerkinBasis",
     "GalerkinBasisMismatch",
-    "GalerkinOperatorProjection",
-    "GalerkinStateExpectation",
     "GalerkinStreamPlan",
     "QRCP_RNG_VERSION",
     "fit_galerkin_basis",
     "galerkin_rank_record",
     "iter_galerkin_rchunks",
     "plan_galerkin_stream",
-    "plan_galerkin_operator_stream",
-    "project_galerkin_spin_operator",
-    "project_galerkin_spin_z",
     "read_galerkin_basis",
-    "rotate_galerkin_operator",
     "validate_rank_multiplier",
     "write_galerkin_basis",
 ]
@@ -147,29 +141,6 @@ class GalerkinBasis:
     @property
     def rank_carrier(self) -> int:
         return int(self.ctilde.shape[2])
-
-
-@dataclass(frozen=True)
-class GalerkinOperatorProjection:
-    """One spatially uniform spin operator in the fitted alpha basis.
-
-    Both matrices have shape ``(rank_carrier, rank_carrier)`` and remain on
-    the all-mesh ``P('x','y')`` face.  ``metric`` includes the physical
-    full-grid overlap rather than assuming identity; exact-null carrier rows
-    therefore remain exact zero.
-    """
-
-    operator: jax.Array
-    metric: jax.Array
-
-
-@dataclass(frozen=True)
-class GalerkinStateExpectation:
-    """A projected operator evaluated in selected htransform states."""
-
-    value: jax.Array
-    numerator: jax.Array
-    norm: jax.Array
 
 
 def validate_rank_multiplier(value, *, name: str = "rank_multiplier") -> float:
@@ -1165,8 +1136,6 @@ _PARTIAL_REDUCE_KERNELS: dict = {}
 _BASIS_SOLVE_KERNELS: dict = {}
 _PHYSICAL_PROJECT_KERNELS: dict = {}
 _COEFFICIENT_ASSEMBLERS: dict = {}
-_SPIN_OPERATOR_FOLD_KERNELS: dict = {}
-_OPERATOR_ROTATION_KERNELS: dict = {}
 
 
 def _state_rows_for_band_chunk(
@@ -1578,100 +1547,9 @@ def _make_basis_solve_kernel(
     return fn
 
 
-def _iter_selected_basis_rchunks(source, basis, meta, mesh_xy, *,
-                                 r_chunk_ranges, resident_bytes=0):
-    """Continue the basis using only its pivots and bounded row transforms.
-
-    A uniform operator needs no retained band rows.  Transforming the whole
-    k/band table just to pick its pivots makes the upstream FFT box scale
-    with nk*nb, regardless of the requested r slab.  The shared row source
-    instead transforms owner-balanced pivot groups, with its live set priced
-    by the same measured FFT and row-stream model as basis construction.
-    """
-    from common.gpu_utils import device_budget_bytes
-    from runtime.aot_memory import runtime_reserve_bytes
-
-    rank, ns = int(basis.rank_carrier), int(meta.nspinor)
-    b0, b1 = map(int, basis.band_range)
-    selected = np.asarray(basis.selected_state_indices, dtype=np.int64)
-    owner, _, _ = source.state_row_owners(
-        selected, band_start=b0, band_count=b1 - b0)
-    ranges = tuple((int(r0), int(r1)) for r0, r1 in r_chunk_ranges)
-    if not ranges:
-        return
-    p = int(mesh_xy.size)
-    local_cols = max(-(-(r1 - r0) // p) for r0, r1 in ranges)
-    # The deck budget less the caller's priced resident set and the measured
-    # runtime reserve: shapes only, so every rank plans the same groups.
-    room = (device_budget_bytes() - float(resident_bytes)
-            - float(runtime_reserve_bytes()))
-    if room <= 0:
-        raise MemoryError(
-            "iter_galerkin_rchunks: no room for basis rows in the run budget "
-            f"({device_budget_bytes() / 1e9:.2f} GB/device) beside the priced "
-            f"resident {resident_bytes / 1e9:.2f} GB/device")
-    geom, capacity, _ = _whole_state_geometry(
-        meta=meta, mesh_xy=mesh_xy, nk=int(meta.nk_tot), nspinor=ns,
-        ngkmax=int(source.loader.ngkmax), band_divisor=p,
-        band_range=(b0, b1), device_pool_limit=room)
-    # The selected slab, its triangular-solve output, and pivot factor can
-    # coexist; the source model adds the row payload and FFT/reshard work.
-    resident = 2 * rank * ns * local_cols * _C16 + rank * rank * _C16
-    max_rows = int(np.bincount(owner, minlength=p).max())
-    groups, fft_rows, _, live = _plan_rows_pass(
-        geom, rows=max_rows, omega_rows=0, resident=resident,
-        capacity=capacity, name="the selected-basis continuation",
-        fixed_local_cols=local_cols)
-    if jax.process_index() == 0:
-        print(f"  [Galerkin selected basis stream] {len(selected)} pivots, "
-              f"{groups} owner-balanced groups, {fft_rows}-row FFT batches, "
-              f"{len(ranges)} r slabs; priced live {live / 2**30:.3f} GiB/device",
-              flush=True)
-    row_spec = P(None, None, ('y', 'x'))
-    row_layout = NamedSharding(mesh_xy, row_spec)
-    product_spec = P(None, None, None, ('y', 'x'))
-    rep = NamedSharding(mesh_xy, P())
-    position = {int(state): i for i, state in enumerate(selected)}
-    from runtime.padding import padded_axis
-
-    for r0, r1 in ranges:
-        if not 0 <= r0 < r1 <= int(meta.n_rtot):
-            raise ValueError(f"Galerkin selected r slab [{r0},{r1}) is invalid")
-        carrier = padded_axis(r1 - r0, p,
-                              name="Galerkin selected real-space carrier").carrier
-        x = _make_selected_zero_kernel(
-            mesh=mesh_xy, row_count=rank, nspinor=ns,
-            r_carrier=carrier, row_layout=row_layout)()
-        for group in _state_groups(owner, groups):
-            if group.size == 0:
-                continue
-            rows, row_k, row_state = source.gather_state_rows(
-                selected[group], band_start=b0, band_count=b1 - b0,
-                row_multiple=fft_rows)
-            dest = device_put_process_local(np.asarray(
-                [position.get(int(state), 0) for state in row_state],
-                dtype=np.int32), rep)
-            active = device_put_process_local(row_state >= 0, rep)
-            for _, slab in source.iter_rows_rchunks(
-                    rows, row_k, ((r0, r1),), product_r_spec=product_spec,
-                    fft_rows=fft_rows):
-                x = _make_rows_place_kernel(
-                    mesh=mesh_xy, rank=rank, n_rows=int(rows.shape[0]),
-                    nspinor=ns, r_carrier=carrier)(slab, dest, active, x)
-                jax.block_until_ready(x)
-                del slab
-            del rows, row_k, dest, active
-        solve = _make_basis_solve_kernel(
-            mesh=mesh_xy, rank=rank, nspinor=ns, r_carrier=carrier,
-            row_layout=row_layout)
-        basis_chunk = solve(basis.selection_factor, x)
-        yield r0, r1, basis_chunk, ()
-
-
 def iter_galerkin_rchunks(
         source, basis: GalerkinBasis, meta, mesh_xy: Mesh, *,
-        r_chunk_ranges, retained_band_range: tuple[int, int] | None,
-        resident_bytes: int = 0):
+        r_chunk_ranges, retained_band_range: tuple[int, int]):
     """Yield bounded physical basis rows and requested WFN rows together.
 
     This is the public continuation of a fitted :class:`GalerkinBasis` away
@@ -1681,10 +1559,7 @@ def iter_galerkin_rchunks(
 
     is evaluated from the caller-owned canonical :class:`PsiGStore`.  During
     the same WFN/FFT pass, only the overlap with ``retained_band_range`` is
-    retained for a consumer's pair-density contraction.  Pass
-    ``retained_band_range=None`` when only the physical basis rows are needed;
-    this route transforms only the selected pivot states, with owner-balanced
-    row groups and the shared measured FFT planner.  The
+    retained for a consumer's pair-density contraction.  The
     yielded shape is therefore bounded by one real-space carrier; no full-grid
     ``Psi`` or ``B`` exists, and no second WFN reader or FFT convention is
     introduced.
@@ -1692,35 +1567,24 @@ def iter_galerkin_rchunks(
     Yields ``(r0, r1, B_chunk, psi_parts)``.  ``B_chunk`` has shape
     ``(rank, nspinor, r_carrier)`` and ``psi_parts`` is an ordered tuple of
     ``((band_lo, band_hi), psi_chunk)`` pairs covering exactly the retained
-    band range (or is empty when none was requested).  Its arrays have shape
+    band range.  Its arrays have shape
     ``(nk, band_hi-band_lo, nspinor, r_carrier)``; the terminal carrier tail
     is exact zero.  The caller must finish a yield before advancing the
     iterator so the bounded slabs can be released promptly.
-    ``resident_bytes`` is the caller's priced per-device live set beside the
-    selected-state route (from shapes, never allocator readings).
     """
     b_start, b_end = (int(v) for v in basis.band_range)
-    if retained_band_range is None:
-        keep_start = keep_end = None
-    else:
-        keep_start, keep_end = (int(v) for v in retained_band_range)
-        if not b_start <= keep_start < keep_end <= b_end:
-            raise ValueError(
-                "iter_galerkin_rchunks: retained band range "
-                f"[{keep_start},{keep_end}) escapes basis range "
-                f"[{b_start},{b_end})")
+    keep_start, keep_end = (int(v) for v in retained_band_range)
+    if not b_start <= keep_start < keep_end <= b_end:
+        raise ValueError(
+            "iter_galerkin_rchunks: retained band range "
+            f"[{keep_start},{keep_end}) escapes basis range "
+            f"[{b_start},{b_end})")
     if (not source.band_chunk_ranges
             or int(source.band_chunk_ranges[0][0]) != b_start
             or int(source.band_chunk_ranges[-1][1]) != b_end):
         raise ValueError(
             "iter_galerkin_rchunks: PsiGStore must span the fitted basis "
             f"range [{b_start},{b_end}); got {source.band_chunk_ranges}")
-
-    if retained_band_range is None:
-        yield from _iter_selected_basis_rchunks(
-            source, basis, meta, mesh_xy, r_chunk_ranges=r_chunk_ranges,
-            resident_bytes=resident_bytes)
-        return
 
     rank = int(basis.rank_carrier)
     nspinor = int(meta.nspinor)
@@ -1760,11 +1624,9 @@ def iter_galerkin_rchunks(
                     r0, r1, product_r_spec=psi_layout.spec)):
             take, active = maps[bc_idx]
             selected_rows = fill(psi_bc, take, active, selected_rows)
-            lo = (None if keep_start is None else
-                  max(int(bc_range[0]), keep_start))
-            hi = (None if keep_end is None else
-                  min(int(bc_range[1]), keep_end))
-            if lo is not None and lo < hi:
+            lo = max(int(bc_range[0]), keep_start)
+            hi = min(int(bc_range[1]), keep_end)
+            if lo < hi:
                 offset = lo - int(bc_range[0])
                 retained.append(
                     ((lo, hi), psi_bc[:, offset:offset + (hi - lo)]))
@@ -1775,249 +1637,11 @@ def iter_galerkin_rchunks(
             r_carrier=r_carrier, row_layout=row_layout)
         basis_chunk = solve(basis.selection_factor, selected_rows)
         del selected_rows
-        if (keep_start is not None
-                and sum(hi - lo for (lo, hi), _ in retained)
-                != keep_end - keep_start):
+        if sum(hi - lo for (lo, hi), _ in retained) != keep_end - keep_start:
             raise RuntimeError(
                 "iter_galerkin_rchunks: retained WFN pieces do not cover "
                 f"[{keep_start},{keep_end})")
         yield r0, r1, basis_chunk, tuple(retained)
-
-
-def _make_spin_operator_fold_kernel(
-        *, rank: int, nspinor: int, r_carrier: int,
-        mesh: Mesh, basis_left_layout, basis_right_layout, face_layout):
-    """Fold one local-r basis slab into distributed operator and metric faces."""
-    key = (id(mesh), int(rank), int(nspinor), int(r_carrier),
-           tuple(basis_left_layout.spec), tuple(basis_right_layout.spec),
-           tuple(face_layout.spec))
-    fn = _SPIN_OPERATOR_FOLD_KERNELS.get(key)
-    if fn is not None:
-        return fn
-    rep = NamedSharding(mesh, P())
-
-    @partial(
-        shard_map,
-        mesh=mesh,
-        in_specs=(basis_left_layout.spec, basis_right_layout.spec,
-                  P(), P('x', 'y'), P('x', 'y')),
-        out_specs=(P('x', 'y'), P('x', 'y')),
-        check_vma=False,
-    )
-    def _fold_local(basis_left, basis_right, spin_operator,
-                    operator_local, metric_local):
-        # Each operand carries only one output-rank panel and one r shard.
-        # Gather r within the orthogonal mesh axis, leaving rank/a on x and
-        # rank/b on y.  The contraction therefore creates exactly the local
-        # output face tile; no rank-by-rank intermediate exists on any device.
-        basis_left = jax.lax.all_gather(
-            basis_left, 'y', axis=2, tiled=True)
-        basis_right = jax.lax.all_gather(
-            basis_right, 'x', axis=2, tiled=True)
-        # B[a,s,r] is the ket value phi_a,s(r).  Keep this bra/ket order
-        # explicit because the selected-state Gram builder uses the transposed
-        # row-Gram convention, which is harmless for I but wrong for a complex
-        # operator matrix.
-        metric_partial = jnp.einsum(
-            'asr,bsr->ab', jnp.conj(basis_left), basis_right,
-            optimize=True)
-        operator_partial = jnp.einsum(
-            'asr,st,btr->ab', jnp.conj(basis_left), spin_operator,
-            basis_right, optimize=True)
-        return (operator_local + operator_partial,
-                metric_local + metric_partial)
-
-    fn = jax.jit(
-        _fold_local,
-        donate_argnums=(3, 4),
-        in_shardings=(basis_left_layout, basis_right_layout,
-                      rep, face_layout, face_layout),
-        out_shardings=(face_layout, face_layout),
-    )
-    _SPIN_OPERATOR_FOLD_KERNELS[key] = fn
-    return fn
-
-
-def project_galerkin_spin_operator(
-        source, basis: GalerkinBasis, meta, mesh_xy: Mesh, *,
-        spin_operator, q_tile_budget: int) -> GalerkinOperatorProjection:
-    """Project a uniform Hermitian spin operator through the full-grid basis.
-
-    The operator acts only on the spinor index and is constant in real space.
-    Physical basis slabs come from :func:`iter_galerkin_rchunks`; each slab is
-    contracted over its local real-space shard and reduced directly onto the
-    all-mesh rank face.  No full spatial basis or rank-by-rank result is
-    gathered.  The returned metric supports ``c^H O c / c^H M c`` even for a
-    basis with exact-null carrier padding.
-    """
-    ns = int(meta.nspinor)
-    op_np = np.asarray(spin_operator, dtype=np.complex128)
-    if op_np.shape != (ns, ns):
-        raise ValueError(
-            "project_galerkin_spin_operator: spin_operator must have shape "
-            f"({ns},{ns}); got {op_np.shape}")
-    if not np.all(np.isfinite(op_np)):
-        raise ValueError(
-            "project_galerkin_spin_operator: spin_operator must be finite")
-    if not np.allclose(op_np, op_np.conj().T, rtol=0.0, atol=1.0e-14):
-        raise ValueError(
-            "project_galerkin_spin_operator: spin_operator must be Hermitian")
-
-    rank = int(basis.rank_carrier)
-    plan = plan_galerkin_operator_stream(
-        rank=rank, nspinor=ns, n_rtot=int(meta.n_rtot),
-        mesh_xy=mesh_xy, q_tile_budget=int(q_tile_budget))
-    basis_left_layout = NamedSharding(mesh_xy, P('x', None, 'y'))
-    basis_right_layout = NamedSharding(mesh_xy, P('y', None, 'x'))
-    face_layout = NamedSharding(mesh_xy, P('x', 'y'))
-    rep = NamedSharding(mesh_xy, P())
-    op = jax.device_put(op_np, rep)
-
-    @partial(jax.jit, out_shardings=(face_layout, face_layout))
-    def _zeros():
-        shape = (rank, rank)
-        return (jnp.zeros(shape, dtype=jnp.complex128),
-                jnp.zeros(shape, dtype=jnp.complex128))
-
-    operator, metric = _zeros()
-    # The two face accumulators are live beside the row stream: price them.
-    face_bytes = 2 * int(np.prod(operator.sharding.shard_shape(
-        operator.shape))) * operator.dtype.itemsize
-    for _, _, basis_chunk, retained in iter_galerkin_rchunks(
-            source, basis, meta, mesh_xy,
-            r_chunk_ranges=plan.r_chunk_ranges, retained_band_range=None,
-            resident_bytes=face_bytes):
-        if retained:
-            raise RuntimeError(
-                "operator-only Galerkin stream unexpectedly retained WFN rows")
-        fold = _make_spin_operator_fold_kernel(
-            rank=rank, nspinor=ns, r_carrier=int(basis_chunk.shape[2]),
-            mesh=mesh_xy, basis_left_layout=basis_left_layout,
-            basis_right_layout=basis_right_layout, face_layout=face_layout)
-        basis_left = jax.device_put(basis_chunk, basis_left_layout)
-        basis_right = jax.device_put(basis_chunk, basis_right_layout)
-        operator, metric = fold(
-            basis_left, basis_right, op, operator, metric)
-        jax.block_until_ready((operator, metric))
-        del basis_chunk, basis_left, basis_right
-    return GalerkinOperatorProjection(operator=operator, metric=metric)
-
-
-def project_galerkin_spin_z(
-        source, basis: GalerkinBasis, meta, mesh_xy: Mesh, *,
-        q_tile_budget: int) -> GalerkinOperatorProjection:
-    """Project ``S_z/hbar = sigma_z/2`` for a two-component Pauli basis."""
-    if int(meta.nspinor) != 2:
-        raise ValueError(
-            "project_galerkin_spin_z requires two-component Pauli spinors; "
-            f"got nspinor={int(meta.nspinor)}")
-    from common.gamma_matrices import sigma_z
-    return project_galerkin_spin_operator(
-        source, basis, meta, mesh_xy,
-        spin_operator=0.5 * sigma_z, q_tile_budget=q_tile_budget)
-
-
-def rotate_galerkin_operator(
-        coefficients, projection: GalerkinOperatorProjection,
-        mesh_xy: Mesh, *,
-        logical_q_count: int | None = None) -> GalerkinStateExpectation:
-    """Evaluate ``c^H O c / c^H M c`` for selected htransform states.
-
-    ``coefficients`` has shape ``(q_carrier, rank_carrier, nband)`` and must
-    come from
-    the solve whose states are being published: ``h_transform(return_coeffs=True)``
-    for a standalone path, including its active/guard selection, or
-    ``compute_wfns_fi(return_coeffs=True).coeffs_fi`` for that consumer's
-    energy-ordered window.  ``logical_q_count`` removes inert q padding from
-    the returned small arrays.  One all-mesh q batch at a time is reshaped
-    into the two rank-sharded views that meet the face-sharded operator; the
-    full path coefficient carrier never exists in either replicated view.
-    """
-    if coefficients.ndim != 3:
-        raise ValueError(
-            "rotate_galerkin_operator: coefficients must have shape "
-            f"(nq,rank,nband); got {tuple(coefficients.shape)}")
-    q_input, rank, nb = (int(v) for v in coefficients.shape)
-    nq = q_input if logical_q_count is None else int(logical_q_count)
-    if not (0 < nq <= q_input):
-        raise ValueError(
-            "rotate_galerkin_operator: logical_q_count must lie in "
-            f"[1,{q_input}]; got {nq}")
-    expected = (rank, rank)
-    if tuple(projection.operator.shape) != expected:
-        raise ValueError(
-            "rotate_galerkin_operator: operator shape "
-            f"{tuple(projection.operator.shape)} != {expected}")
-    if tuple(projection.metric.shape) != expected:
-        raise ValueError(
-            "rotate_galerkin_operator: metric shape "
-            f"{tuple(projection.metric.shape)} != {expected}")
-
-    q_layout = NamedSharding(mesh_xy, P(('x', 'y'), None, None))
-    coeff_x = NamedSharding(mesh_xy, P(None, 'x', None))
-    coeff_y = NamedSharding(mesh_xy, P(None, 'y', None))
-    face = NamedSharding(mesh_xy, P('x', 'y'))
-    rep = NamedSharding(mesh_xy, P())
-    from runtime.padding import padded_axis
-    q_batch = padded_axis(
-        1, mesh_xy, name="Galerkin operator q batch",
-        spec=q_layout.spec, axis=0).carrier
-    q_carrier = padded_axis(
-        q_input, q_batch, name="Galerkin operator q carrier").carrier
-    if q_carrier != q_input:
-        coefficients = jnp.pad(
-            coefficients, ((0, q_carrier - q_input), (0, 0), (0, 0)))
-    coefficients = jax.device_put(coefficients, q_layout)
-
-    key = (id(mesh_xy), q_batch, rank, nb)
-    fn = _OPERATOR_ROTATION_KERNELS.get(key)
-    if fn is None:
-        @partial(
-            shard_map,
-            mesh=mesh_xy,
-            in_specs=(P(None, 'x', None), P('x', 'y'),
-                      P(None, 'y', None), P('x', 'y')),
-            out_specs=(P(), P(), P()),
-            check_vma=False,
-        )
-        def _rotate_local(c_left, operator_local, c_right, metric_local):
-            numerator = jnp.einsum(
-                'qan,ab,qbn->qn', jnp.conj(c_left), operator_local,
-                c_right, optimize=True)
-            norm = jnp.einsum(
-                'qan,ab,qbn->qn', jnp.conj(c_left), metric_local,
-                c_right, optimize=True)
-            for axis in ('x', 'y'):
-                numerator = jax.lax.psum(numerator, axis)
-                norm = jax.lax.psum(norm, axis)
-            value = jnp.real(numerator) / jnp.where(
-                jnp.abs(norm) > 0.0, jnp.real(norm), jnp.nan)
-            return value, numerator, norm
-
-        fn = jax.jit(
-            _rotate_local,
-            in_shardings=(coeff_x, face, coeff_y, face),
-            out_shardings=(rep, rep, rep),
-        )
-        _OPERATOR_ROTATION_KERNELS[key] = fn
-    values = []
-    numerators = []
-    norms = []
-    for q0 in range(0, q_carrier, q_batch):
-        q_chunk = coefficients[q0:q0 + q_batch]
-        c_left = jax.device_put(q_chunk, coeff_x)
-        c_right = jax.device_put(q_chunk, coeff_y)
-        value, numerator, norm = fn(
-            c_left, projection.operator, c_right, projection.metric)
-        jax.block_until_ready((value, numerator, norm))
-        values.append(value)
-        numerators.append(numerator)
-        norms.append(norm)
-        del q_chunk, c_left, c_right
-    return GalerkinStateExpectation(
-        value=jnp.concatenate(values, axis=0)[:nq],
-        numerator=jnp.concatenate(numerators, axis=0)[:nq],
-        norm=jnp.concatenate(norms, axis=0)[:nq])
 
 
 def _assemble_coefficient_chunks(
@@ -2289,42 +1913,3 @@ def plan_galerkin_stream(*, rank: int, nspinor: int, n_rtot: int,
         q_tile_local_bytes=q_tile_local_bytes,
     )
 
-
-def plan_galerkin_operator_stream(
-        *, rank: int, nspinor: int, n_rtot: int, mesh_xy: Mesh,
-        q_tile_budget: int) -> GalerkinStreamPlan:
-    """Bound the two operator-projection rank panels by one tile budget.
-
-    The canonical basis stream initially splits r over all P ranks.  The
-    operator fold reshards that tile into an x-rank/y-r left panel and the
-    transposed y-rank/x-r right panel, then gathers r only within the panel's
-    orthogonal mesh axis.  Relative to the product-r source tile those two
-    live panels cost ``mesh_y + mesh_x`` times as much, while the original
-    product-r basis tile remains live through both reshard dependencies.  Price
-    the conservative ``1 + mesh_y + mesh_x`` live set here while retaining
-    product-mesh alignment for the source transform.
-    """
-    axis_sizes = {
-        str(name): int(size)
-        for name, size in zip(mesh_xy.axis_names, mesh_xy.devices.shape)
-    }
-    if "x" not in axis_sizes or "y" not in axis_sizes:
-        raise ValueError(
-            "plan_galerkin_operator_stream requires mesh axes ('x','y')")
-    expansion = 1 + axis_sizes["x"] + axis_sizes["y"]
-    budget = int(q_tile_budget)
-    source_budget = budget // expansion
-    if source_budget <= 0:
-        raise ValueError(
-            "plan_galerkin_operator_stream: q_tile_budget is too small for "
-            f"the two rank panels on a {axis_sizes['x']}x{axis_sizes['y']} "
-            "mesh")
-    plan = plan_galerkin_stream(
-        rank=int(rank), nspinor=int(nspinor), n_rtot=int(n_rtot),
-        r_mesh_divisor=int(mesh_xy.size), q_tile_budget=source_budget)
-    return GalerkinStreamPlan(
-        r_chunk_ranges=plan.r_chunk_ranges,
-        max_r_logical=plan.max_r_logical,
-        max_r_carrier=plan.max_r_carrier,
-        q_tile_local_bytes=plan.q_tile_local_bytes * expansion,
-    )
