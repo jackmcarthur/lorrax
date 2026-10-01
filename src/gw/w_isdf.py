@@ -1065,9 +1065,9 @@ def _get_chi_fractional_contour_kernel_face(
     # load, the traces in its Mid); no full-k Green exists.  A CUDA grid the
     # door cannot hold refuses (no full-k fallback on the GPU); a non-CUDA
     # backend takes the door's reference arm.
+    from symmetry_maps import DeviceLoadTables
     photon_doors = None
     if photon is not None:
-        from symmetry_maps import DeviceLoadTables
         from ffi import fft as _F
         why = _F.chi_unfold_refusal(grid, 2) if _F.kconv_backend(mesh_xy) == "mathdx" else ""
         if why:
@@ -1175,7 +1175,6 @@ def _get_chi_fractional_contour_kernel_face(
             door_loads = {key: DeviceLoadTables(*(tables[i] for i in slots))
                           for key, slots in door_index.items()}
         elif subtile is not None:
-            from symmetry_maps import DeviceLoadTables
             n_t = len(tables) // len(subtile.passes)
             chi_load = tuple(DeviceLoadTables(*tables[n_t * p:n_t * (p + 1)])
                              for p in range(len(subtile.passes)))
