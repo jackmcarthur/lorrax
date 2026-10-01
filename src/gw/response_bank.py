@@ -499,19 +499,22 @@ def exact_bare_moments(wfns, meta, *, mesh_xy, q_ids, execute, ordered=False,
 
 @jax.jit
 def _odd_moment_ratios(M0, M1, M2, M3):
-    # Ratios of the 1/z and 1/z^3 coefficients, m0 = 2 M0 and m2 = 2 M2.
-    return jnp.stack([2 * jnp.linalg.norm(M0) / jnp.linalg.norm(M1),
-                      2 * jnp.linalg.norm(M2) / jnp.linalg.norm(M3)])
+    # Per parent of a [b, n, n] batch: ratios of the 1/z and 1/z^3 coefficients,
+    # m0 = 2 M0 and m2 = 2 M2.
+    norm = lambda a: jnp.linalg.norm(a, axis=(-2, -1))
+    return jnp.stack([2 * norm(M0) / norm(M1), 2 * norm(M2) / norm(M3)], axis=-1)
 
 
-def _record_odd_moments(iq, M0, M1, M2, M3, receipt):
-    """Record one parent's band-truncation diagnostic ||m0||/||M1||, ||m2||/||M3||."""
+def _record_odd_moments(q0, M0, M1, M2, M3, receipt):
+    """Record a q batch's band-truncation diagnostic ||m0||/||M1||, ||m2||/||M3||.
+
+    One program and one host read per batch (it was one of each per parent:
+    1062 synchronous reads per SC map at Ni 20^3).
+    """
     ratios = np.asarray(_odd_moment_ratios(M0, M1, M2, M3), dtype=np.float64)
-    row = dict(q_parent=int(iq), m0_over_M1_fro=float(ratios[0]),
-               m2_over_M3_fro=float(ratios[1]))
-    receipt.setdefault("odd_moments", []).append(row)
-    if jax.process_index() == 0:
-        print("TRBANK odd_moments " + " ".join(f"{k}={row[k]}" for k in row), flush=True)
+    rows = [dict(q_parent=int(q0 + i), m0_over_M1_fro=float(r[0]), m2_over_M3_fro=float(r[1]))
+            for i, r in enumerate(ratios)]
+    receipt.setdefault("odd_moments", []).extend(rows)
 
 
 def _bank_context(wfns, meta, sym, bank_io, mesh_xy):
@@ -943,6 +946,8 @@ def compute_moment_bank(wfns, meta, config, *, mesh_xy, sym, bank_io,
         mesh_xy=mesh_xy, n=n, ordered=ordered, photon=vertex is not None)
     per_q = 12 if ordered else 8
     qwidth = moment_q_width(ledger, n_q=len(qids), face_bytes=face_bytes, per_q=per_q)
+    receipt["q_width"] = int(qwidth)
+    receipt["q_batches"] = [[q0, min(q0 + qwidth, len(qids))] for q0 in range(0, len(qids), qwidth)]
     for q0 in range(0,len(qids),qwidth):
         q1 = min(q0+qwidth,len(qids))
         ledger.live_stages = ambient
@@ -973,10 +978,8 @@ def compute_moment_bank(wfns, meta, config, *, mesh_xy, sym, bank_io,
                         gamma_vectors=direct_head["gamma_vectors"],
                         layout=bank_io["photon_layout"], mesh=mesh_xy)
             if ordered:
-                for iq in range(q0,q1):
-                    part = slice(iq-q0,iq-q0+1)
-                    _record_odd_moments(iq, *(values[name][part] for name in
-                        ("M0", "M1", "M2", "M3")), receipt)
+                _record_odd_moments(q0, *(values[name] for name in ("M0", "M1", "M2", "M3")),
+                                    receipt)
             # One write for a fresh batch; partial restarts group identical
             # commit masks so no already committed field is overwritten.
             marked = np.asarray(header["moment_written"], bool)[q0:q1]

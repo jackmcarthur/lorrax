@@ -693,6 +693,8 @@ def screen_shared_poles(wfns, V_q, meta, config, *, mesh_xy, sym,
                 receipts['moments'] = json.loads((root / 'moments_receipt.json').read_text())
             receipts['constructor_resume'] = dict(
                 status='AUTHENTICATED_COMPLETE_BANK', source=str(root / 'bank.h5'))
+        recorded = set()
+
         def record(stage, receipt):
             # EVERY RANK LEAVES THIS CALL THE SAME WAY.  A bare
             # ``process_index() == 0`` write raises on rank 0 alone (quota,
@@ -701,6 +703,7 @@ def screen_shared_poles(wfns, V_q, meta, config, *, mesh_xy, sym,
             # ``rank0_transaction`` does the same serial write and
             # broadcasts its verdict, exactly as the sibling write above.
             receipts[stage] = receipt
+            recorded.add(stage)
             path = root / (stage + "_receipt.json")
             rank0_transaction(
                 path, stage=f"shared_pole.receipt.{stage}",
@@ -725,9 +728,15 @@ def screen_shared_poles(wfns, V_q, meta, config, *, mesh_xy, sym,
             record("bank", produce_w_bank(wfns, meta, config, mesh_xy=mesh_xy,
                 sym=sym, sample_plan=recipe, bank_io=bank, print_fn=print_fn))
     if not photon and not resume_constructor:
-        with timing.section("spole.moments"):
+        with timing.section("spole.moments", announce=True,
+                            label="shared-pole response moments"):
             record("moments", compute_response_moments(wfns, meta, config,
                 mesh_xy=mesh_xy, sym=sym, bank_io=bank))
+        moments_seconds = receipts["moments"].get("seconds", {})
+        print_fn(f"Response quadrature: moments {receipts['moments'].get('correlation_count', 0)} "
+                 f"correlations in {len(receipts['moments'].get('q_batches', ()))} q batch(es) "
+                 f"of <= {receipts['moments'].get('q_width', 0)} parents; "
+                 f"{moments_seconds.get('total', 0.0):.2f} s")
     # The constructor owns scratch reads, actual pencil planning and the
     # final writer. It must query its own native workspace at the actual R.
     # W/dW and M1/M3 are distinct keyed datasets in the same scratch file.
@@ -754,8 +763,15 @@ def screen_shared_poles(wfns, V_q, meta, config, *, mesh_xy, sym,
                 and not (config.debug.write_w or config.write_poles)):
             model_rule = partial(_scalar_model_residence, meta, mesh_xy=mesh_xy,
                                  root=root, identity=identity)
-        result = construct_shared_poles(bank, bank, meta, config,
-            mesh_xy=mesh_xy, output=str(root / "model.h5"), residence=model_rule)
+        with timing.section("spole.constructor", announce=True,
+                            label="shared-pole constructor"):
+            result = construct_shared_poles(bank, bank, meta, config,
+                mesh_xy=mesh_xy, output=str(root / "model.h5"), residence=model_rule)
+        walls = dict(result.get("seconds", {}))
+        rounds = walls.pop("rounds", 0)
+        print_fn(f"Shared-pole constructor: {rounds} round(s); seconds "
+                 + " ".join(f"{name}={value:.2f}" for name, value in
+                            sorted(walls.items(), key=lambda item: -item[1])))
     if resident is not None:
         # The model is committed; the constructor was the bank's last reader.
         resident.release()
@@ -768,7 +784,8 @@ def screen_shared_poles(wfns, V_q, meta, config, *, mesh_xy, sym,
                  f"({residence['released']['bytes'] / 2**30:.2f} GiB, "
                  f"{residence['released']['links']} link(s))")
     receipts["bank_residence"] = residence
-    with timing.section("spole.screening_finalize"):
+    with timing.section("spole.screening_finalize", announce=True,
+                        label="shared-pole receipts and head"):
         record("constructor", result)
         models = result["model_residence"]
         if "payload_bytes_per_rank" in models:
@@ -816,7 +833,11 @@ def screen_shared_poles(wfns, V_q, meta, config, *, mesh_xy, sym,
         receipts["seconds"] = time.monotonic() - started
         receipts["handle"] = handle
         summary = root / "construction_receipt.json"
+        # A recorded stage is already in its own ``<stage>_receipt.json``; the
+        # summary names that file instead of encoding the stage a second time.
+        compact = {key: (dict(file=key + "_receipt.json") if key in recorded else value)
+                   for key, value in receipts.items()}
         rank0_transaction(
             summary, stage="shared_pole.construction_receipt",
-            write=lambda: summary.write_text(_json(receipts) + "\n"))
+            write=lambda: summary.write_text(_json(compact) + "\n"))
         return result

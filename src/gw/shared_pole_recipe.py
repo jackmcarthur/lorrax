@@ -588,7 +588,12 @@ def construction_receipt(measurements=None, *, capacity=None, capacity_entry_sta
     if capacity is not None:
         if not isinstance(capacity, CapacityLedger):
             raise TypeError("construction receipt capacity must be the map's CapacityLedger")
-        result['capacity'] = capacity.receipt(entry_start=capacity_entry_start)
+        # The segment is named by its ledger indices, not copied: every parent
+        # of a round shares it, and the map's ledger receipt (the constructor's
+        # ``capacity``) holds each row once.  A copy per parent was 35 MB of
+        # the 484 MB constructor receipt at Ni 20^3 (1062 parents, 874 rows).
+        result['capacity'] = capacity.receipt(entry_start=len(capacity.entries))
+        result['capacity']['entry_span'] = [int(capacity_entry_start or 0), len(capacity.entries)]
         result['gates'] = [result['capacity'][r['name']] if r['name'] in ('stream_peak', 'sigma_peak')
                            else r for r in result['gates']]
         # The verdict always covers the full prefix, even for a compact segment.
@@ -613,7 +618,7 @@ def construction_receipt(measurements=None, *, capacity=None, capacity_entry_sta
 
 def build_construction_row(model, counts, diagnostics, *, span, roles, price,
                            coulomb, native_queries, identity, gates, nspinor,
-                           logical_n, ordered, odd_moments):
+                           logical_n, ordered, odd_moments, detail=False):
     """Host view of one constructed parent, and the gate rows it measures.
 
     The constructor has finished q: it holds the model, the device diagnostics
@@ -643,6 +648,11 @@ def build_construction_row(model, counts, diagnostics, *, span, roles, price,
         Deck spin count and logical centroid count.
     ordered, odd_moments : bool
         The route and whether its bank carried the odd z-moments.
+    detail : bool
+        ``sigma_freq_debug_output``: keep the whole normalized Gram spectrum
+        and the column sort permutation.  Otherwise the spectrum is its size,
+        ends and exact-zero count, and the permutation is omitted; at Ni 20^3
+        the two were 140 MB of the per-parent rows, encoded on every map.
 
     Returns
     -------
@@ -653,19 +663,25 @@ def build_construction_row(model, counts, diagnostics, *, span, roles, price,
     zero, passive = diagnostics["zero"], diagnostics["passive"]
     retained, moment_defects = diagnostics["retained"], diagnostics["moment_defects"]
     held, reciprocity = diagnostics["held"], diagnostics["reciprocity"]
+    spectrum = np.asarray(reduction["gram_spectrum_relative"])
+    if not detail:
+        spectrum = {"size": int(spectrum.shape[-1]), "zeros": int(np.sum(spectrum == 0)),
+                    "min": float(spectrum.min(initial=np.inf)),
+                    "max": float(spectrum.max(initial=-np.inf))}
     row = {"q_span": list(span), "roles": roles,
            "diagnostic_operator": "raw-latent-pole-model",
            "K": np.asarray(counts).tolist(), "J": int(np.unique(np.asarray(poles)[np.asarray(mask)]).size),
            "damping_fraction": 0.0, "capacity": price, "coulomb": coulomb,
            "condition": np.asarray(reduction["gram_condition"]).tolist(),
-           "normalized_gram_spectrum": np.asarray(reduction["gram_spectrum_relative"]).tolist(),
+           "normalized_gram_spectrum": spectrum.tolist() if detail else spectrum,
            "native_workspace_queries": [dict(op=op, shapes=shapes, bytes_per_rank=value)
                                          for (op, shapes), value in native_queries.items()],
            "retained_moment_relative": {k: np.asarray(v).tolist() for k, v in retained.items()},
            "moment_defects": {k: {a: np.asarray(value).tolist() for a, value in v.items()}
                               for k, v in moment_defects.items()},
-           "held_W": held, "permutation": np.asarray(diagnostics["permutation"]).tolist(),
-           "storage_bytes": int(counts[0]) * (16*logical_n + 8)}
+           "held_W": held, "storage_bytes": int(counts[0]) * (16*logical_n + 8)}
+    if detail:
+        row["permutation"] = np.asarray(diagnostics["permutation"]).tolist()
     if ordered:
         row["ordered"] = {key: np.asarray(reduction[key]).tolist() for key in (
             "positive_count", "negative_count", "infinite_weight_fraction",
