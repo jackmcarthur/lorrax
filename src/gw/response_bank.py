@@ -547,36 +547,61 @@ def _bank_context(wfns, meta, sym, bank_io, mesh_xy):
     return header, qids, census
 
 
-@lru_cache(maxsize=16)
-def _resource_hash(path, size, mtime_ns):
-    """Hash one immutable resource generation on the designated root."""
-    with open(path, "rb") as handle:
-        return hashlib.file_digest(handle, "sha256").hexdigest()
+#: Bytes per digest chunk.  Each chunk is read and hashed by one process (round
+#: robin), so a production resource (the Fe 20^3 V wedge, 54.6 GB) costs size / P
+#: of reading per rank, not one rank reading all of it (~90 s at P64).
+DIGEST_CHUNK_BYTES = 256 << 20
+
+
+def _chunk_digests(path, size, rank, world):
+    """This process's rows of the per-chunk SHA256 table (other rows zero)."""
+    rows = np.zeros((max(1, -(-int(size) // DIGEST_CHUNK_BYTES)), 32), dtype=np.uint8)
+    fd = os.open(path, os.O_RDONLY)
+    try:
+        for c in range(rank, rows.shape[0], world):
+            chunk = os.pread(fd, DIGEST_CHUNK_BYTES, c * DIGEST_CHUNK_BYTES)
+            rows[c] = np.frombuffer(hashlib.sha256(chunk).digest(), dtype=np.uint8)
+    finally:
+        os.close(fd)
+    return rows
 
 
 def resource_digest(path):
-    """SHA256 of one immutable resource: read on rank 0, broadcast to all.
+    """Content digest of one immutable resource, the same string on every rank.
 
-    The producer stamps a resource with this and every consumer checks it with
-    the same call, so the two cannot drift. Every rank leaves it with the same
-    string, which is what keeps a refusal from being rank-conditional
-    (INVARIANTS 21).
+    SHA256 of the file's per-chunk SHA256s (:data:`DIGEST_CHUNK_BYTES`, read
+    round robin by the processes) and its size, so the value does not depend
+    on the process count.  The producer stamps a resource with this and every
+    consumer checks it with the same call, so the two cannot drift.  Rank 0
+    decides whether this file generation was already hashed (a hard link of an
+    SC map's re-staged V is not read again) and broadcasts the decision and
+    the size, so every rank takes the same branch and leaves with the same
+    string, which keeps a refusal from being rank-conditional (INVARIANTS 21).
     """
     from jax.experimental import multihost_utils
+    from common.collectives import all_gather_processes
 
     path = Path(path)
-    stat = path.stat()
-    digest = np.zeros(32, dtype=np.uint8)
+    head = np.zeros(41, dtype=np.uint8)
     if jax.process_index() == 0:
-        # One hash per file generation: a hard link of an already hashed
-        # generation (an SC map's re-staged V) is not read again.
+        stat = path.stat()
         generation = (stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns)
+        head[1:9] = np.frombuffer(int(stat.st_size).to_bytes(8, "little"), dtype=np.uint8)
         hexdigest = _HASH_BY_GENERATION.get(generation)
-        if hexdigest is None:
-            hexdigest = _HASH_BY_GENERATION[generation] = _resource_hash(
-                str(path), stat.st_size, stat.st_mtime_ns)
-        digest[:] = np.frombuffer(bytes.fromhex(hexdigest), dtype=np.uint8)
-    return bytes(np.asarray(multihost_utils.broadcast_one_to_all(digest))).hex()
+        if hexdigest is not None:
+            head[0] = 1
+            head[9:] = np.frombuffer(bytes.fromhex(hexdigest), dtype=np.uint8)
+    head = np.asarray(multihost_utils.broadcast_one_to_all(head), dtype=np.uint8)
+    if head[0]:
+        return bytes(head[9:]).hex()
+    size = int.from_bytes(bytes(head[1:9]), "little")
+    rows = _chunk_digests(str(path), size, int(jax.process_index()), int(jax.process_count()))
+    rows = np.asarray(all_gather_processes(rows), dtype=np.uint8).max(axis=0)
+    hexdigest = hashlib.sha256(rows.tobytes() + bytes(head[1:9])).hexdigest()
+    if jax.process_index() == 0:
+        stat = path.stat()
+        _HASH_BY_GENERATION[(stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns)] = hexdigest
+    return hexdigest
 
 
 _HASH_BY_GENERATION: dict = {}

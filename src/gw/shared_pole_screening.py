@@ -157,6 +157,12 @@ def shared_pole_identity(wfns, meta, *, label, wfn, binding, centroid_indices):
 
 
 @lru_cache(maxsize=8)
+def _coulomb_rows(sharding, q0, q1):
+    """Parents [q0, q1) of the packed V wedge, kept on its own sharding."""
+    return jax.jit(lambda v: v[q0:q1], out_shardings=sharding)
+
+
+@lru_cache(maxsize=8)
 def _coulomb_unpack(basis):
     """One packed-to-canonical V conversion per basis, so an SC map reuses its executable."""
     return jax.jit(lambda v: basis.unpack_operator(v, spec=P(None, "x", "y")))
@@ -171,6 +177,7 @@ def _coulomb_resource(value, meta, sym, mesh_xy, path):
     Only one parent is unpacked at a time; no full-q canonical copy exists.
     """
     from file_io.slab_io import SlabIO
+    from runtime.tiles import tile_units
     from symmetry_maps import QirrOperator
     from .response_bank import _compiled, _reserve, resource_digest
     basis = meta.mu_basis
@@ -184,22 +191,30 @@ def _coulomb_resource(value, meta, sym, mesh_xy, path):
         return linked
     value = op.at_rows(qids)
     kernel = _coulomb_unpack(basis)
-    shape = (1, basis.n_packed, basis.n_packed)
-    operand = jax.ShapeDtypeStruct(shape, value.dtype, sharding=value.sharding)
-    executable = _compiled(kernel, (operand,))
-    stats = executable.memory_analysis()
+    nq = len(qids)
+    # Parents stream in q tiles (runtime.tiles) into one collective write
+    # transaction, synced once: a per-parent write and sync was 1062 collective
+    # round trips at Fe 20^3.  The file's values are the same.
+    tile = tile_units(16 * (basis.n_packed ** 2 + basis.n_canonical ** 2) / mesh_xy.size, nq)
+
+    def executable(rows):
+        operand = jax.ShapeDtypeStruct((rows, basis.n_packed, basis.n_packed), value.dtype,
+                                       sharding=value.sharding)
+        return _compiled(kernel, (operand,))
+    stats = executable(tile).memory_analysis()
     if stats is None:
         raise ValueError("GATE shared_pole_coulomb: conversion memory unavailable")
     _reserve(meta, "coulomb_staging", stats.argument_size_in_bytes,
              stats.output_size_in_bytes + stats.temp_size_in_bytes)
     with SlabIO(path, mode="w", mesh=mesh_xy) as io:
-        for iq, q in enumerate(qids):
-            canonical = executable(value[iq:iq + 1])
-            io.write_slab("V_canonical_qwedge", canonical, offset=(iq, 0, 0),
-                          global_shape=(len(qids), basis.n_canonical, basis.n_canonical),
-                          valid_shape=(1, basis.n_logical, basis.n_logical))
-            io.sync_writes()
+        for q0 in range(0, nq, tile):
+            q1 = min(nq, q0 + tile)
+            canonical = executable(q1 - q0)(_coulomb_rows(value.sharding, q0, q1)(value))
+            io.write_slab("V_canonical_qwedge", canonical, offset=(q0, 0, 0),
+                          global_shape=(nq, basis.n_canonical, basis.n_canonical),
+                          valid_shape=(q1 - q0, basis.n_logical, basis.n_logical))
             del canonical
+        io.sync_writes()
     resource = dict(path=str(path), dataset="V_canonical_qwedge", basis="canonical",
                     q_irr_full_idx=qids.tolist(), sha256=resource_digest(path),
                     operator=token)

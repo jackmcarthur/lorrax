@@ -3,6 +3,24 @@
 User-visible changes, newest first. Binding rulings behind the breaking
 changes live in `docs/architecture/decisions.md`.
 
+## 2026-09-30 — shared-pole V staging: q tiles, one sync, a chunked digest
+
+At map 0 the shared-pole W staged the bare V wedge one parent at a time, each
+write synced, and then rank 0 alone SHA256-ed the whole file: 141.6 s (Fe 20³)
+and 147.2 s (Ni 20³) on 64 GPUs, for a 54.6 GB `coulomb.h5`. The wedge now
+streams in `runtime.tiles` q tiles into one write transaction that is synced
+once, and `response_bank.resource_digest` (the one owner; it also authenticates
+`v_q_bispinor.h5`) is SHA256 over the SHA256s of 256 MiB chunks that the ranks
+read round robin, so each rank reads size/P. On one node (P4) with that 54.6 GB
+file the rank-0 hash took 54.5 s and the chunked one 24.5 s (2.2 GB/s per node;
+about 1.6 s over 16 nodes); the per-parent write and sync took 39.4 s and the
+tiled write 36.7 s (one node is bandwidth-bound; at P64 the 1062 collective
+syncs set the remaining ~87 s). The digest does not depend on the process
+count. It differs from the old flat SHA256, so resuming a shared-pole
+constructor from a directory staged before this release refuses with
+`GATE response_coulomb_identity: content hash differs`; delete that map
+directory and rerun. V and every result are unchanged.
+
 ## 2026-09-30 — every response sample group runs one program
 
 When the response sample group is smaller than the sample count (memory-bound
