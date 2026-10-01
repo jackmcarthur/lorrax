@@ -777,64 +777,44 @@ __device__ __forceinline__ long long lrx_x_of(const XBlock& b, long long r) {
 // The typed unfold of a tile of columns into a direct Load's view (kbox_stage.cuh stage_tile):
 // column c is (pair, a, b), pair = p0 + c / SSO = (block row, y) of the stored x block
 // (lrx_x_block), and (a, b) its element of U O Ur^dagger (mode 7's NA < NS: of the stored spin
-// block).  GROUPS (the tile holds whole spin groups): one thread per (k, pair) reads the pair's
-// sources once and forms its elements in registers; else one thread per (k, column) forms its own
-// element with the same arithmetic.  A pair past `pairs` or a padding row loads as zero.  Modes 7,
+// block).  The tile holds whole spin groups: one thread per (k, pair) reads the pair's sources once
+// and forms its elements in registers.  A pair past `pairs` or a padding row loads as zero.  Modes 7,
 // 8 and 9 load through it.
 // SL, SR: the operand's endpoint widths and SA its stored spin block (SA == SL: the whole group);
 // the defaults are the program's Green (NS, NR) and mode 7's block (NA).  Mode 8 also loads an
-// interaction's Lorentz block through <true, nA, nB, nA> (WedgeLoad beside LorLoad).
-template <bool GROUPS, int SL = NS, int SR = NR, int SA = NA, class View>
+// interaction's Lorentz block through <nA, nB, nA> (WedgeLoad beside LorLoad).
+template <int SL = NS, int SR = NR, int SA = NA, class View>
 __device__ __forceinline__ void lrx_unfold_direct(
     const View& view, const lrx_c2* __restrict__ gp, const lrx_c2* __restrict__ gt, const UnfoldTab& t,
     long long p0, long long my, long long pairs, int k0, int k1, long long col0, int width, long long ncols) {
     constexpr int SSO_ = (SA == SL) ? SL * SR : SA * SA;   // columns per pair
-    constexpr int SS_ = SL * SR;
     const XBlock xb = lrx_x_block<SL>(t);
-    if constexpr (GROUPS) {
-        const int groups = width / SSO_;
-        for (int i = threadIdx.x; i < (k1 - k0) * groups; i += blockDim.x) {
-            const int k = k0 + i / groups, j = i % groups;
-            const long long pr = p0 + col0 / SSO_ + j;
-            const long long rx = pr / my, yy = pr - rx * my, xx = lrx_x_of(xb, rx);
-            if (pr < pairs && xx < xb.mx) {
-                lrx_c2 g[SL][SR], u[SL][SL], ur[SR][SR];
-                lrx_unfold_pair(gp, gt, t, k, xx, yy, g, u, ur);
+    const int groups = width / SSO_;
+    for (int i = threadIdx.x; i < (k1 - k0) * groups; i += blockDim.x) {
+        const int k = k0 + i / groups, j = i % groups;
+        const long long pr = p0 + col0 / SSO_ + j;
+        const long long rx = pr / my, yy = pr - rx * my, xx = lrx_x_of(xb, rx);
+        if (pr < pairs && xx < xb.mx) {
+            lrx_c2 g[SL][SR], u[SL][SL], ur[SR][SR];
+            lrx_unfold_pair(gp, gt, t, k, xx, yy, g, u, ur);
 #pragma unroll
-                for (int a = 0; a < SL; ++a) {
-                    if constexpr (SA != SL) { if (a < t.a0 || a >= t.a0 + SA) continue; }
-                    lrx_c2 out[SR];
-                    lrx_spin_row(u, ur, g, a, out);
+            for (int a = 0; a < SL; ++a) {
+                if constexpr (SA != SL) { if (a < t.a0 || a >= t.a0 + SA) continue; }
+                lrx_c2 out[SR];
+                lrx_spin_row(u, ur, g, a, out);
 #pragma unroll
-                    for (int b = 0; b < SR; ++b) {
-                        if constexpr (SA != SL) {
-                            if (b < t.b0 || b >= t.b0 + SA) continue;
-                            view(k, j * SSO_ + (a - t.a0) * SA + (b - t.b0)) = out[b];
-                        } else {
-                            view(k, j * SSO_ + a * SR + b) = out[b];
-                        }
+                for (int b = 0; b < SR; ++b) {
+                    if constexpr (SA != SL) {
+                        if (b < t.b0 || b >= t.b0 + SA) continue;
+                        view(k, j * SSO_ + (a - t.a0) * SA + (b - t.b0)) = out[b];
+                    } else {
+                        view(k, j * SSO_ + a * SR + b) = out[b];
                     }
                 }
-            } else {
+            }
+        } else {
 #pragma unroll
-                for (int ab = 0; ab < SSO_; ++ab) view(k, j * SSO_ + ab) = {0.0, 0.0};
-            }
-        }
-    } else {
-        for (int i = threadIdx.x; i < (k1 - k0) * width; i += blockDim.x) {
-            const int k = k0 + i / width, j = i % width;
-            const long long c = col0 + j, pr = p0 + c / SSO_;
-            const long long rx = pr / my, yy = pr - rx * my, xx = lrx_x_of(xb, rx);
-            lrx_c2 v = {0.0, 0.0};
-            if (c < ncols && pr < pairs && xx < xb.mx) {
-                const int a = (SA == SL) ? (int)((c % SS_) / SR) : t.a0 + (int)((c % SSO_) / SA);
-                const int b = (SA == SL) ? (int)(c % SR) : t.b0 + (int)((c % SSO_) % SA);
-                lrx_c2 g[SL][SR], u[SL][SL], ur[SR][SR], out[SR];
-                lrx_unfold_pair(gp, gt, t, k, xx, yy, g, u, ur);
-                lrx_spin_row(u, ur, g, a, out);
-                v = out[b];
-            }
-            view(k, j) = v;
+            for (int ab = 0; ab < SSO_; ++ab) view(k, j * SSO_ + ab) = {0.0, 0.0};
         }
     }
 }
@@ -1043,11 +1023,12 @@ struct M7Store {                               // U[(ko, a, rx, b, y)], full-k r
     const UnfoldTab* t;
     long long rows, my;
     double scale;
+    long long c0;                              // the split arm's chunk: its first column
     __device__ void put(int k, long long col, lrx_c2 v) const {
         const long long ko = lrx_out_row(*t, k);
         if (ko < 0) return;
-        const long long pr = col / SSO, rx = pr / my, yy = pr - rx * my;
-        const int m = int(col % SSO), a = m / NA, b = m % NA;
+        const long long pr = (c0 + col) / SSO, rx = pr / my, yy = pr - rx * my;
+        const int m = int((c0 + col) % SSO), a = m / NA, b = m % NA;
         y[((ko * NA + a) * rows + rx) * (my * NA) + b * my + yy] = {v.x * scale, v.y * scale};
     }
 };
@@ -1055,26 +1036,27 @@ struct M7Store {                               // U[(ko, a, rx, b, y)], full-k r
 #if LRX_TT
 static_assert(TRC == TT_ROWS, "the host passes the tile's pairs and columns together");
 #else
-struct M7Load {                                // the register load of the typed unfold
+static_assert(TRC % SSO == 0, "tiles hold whole spin groups");
+struct M7Load {                                // the register load of the typed unfold, whole groups
     static constexpr bool kDirect = true, kFinish = false;
     const lrx_c2 *gp, *gt;
     const UnfoldTab* t;
-    long long my, pairs;
+    long long my, pairs, p0;                   // p0: the split arm's chunk, its first pair
     template <class View>
     __device__ void direct(const View& view, int k0, int k1, long long col0, int width, long long ncols) const {
-        lrx_unfold_direct<TRC % SSO == 0>(view, gp, gt, *t, 0, my, pairs, k0, k1, col0, width, ncols);
+        lrx_unfold_direct(view, gp, gt, *t, p0, my, pairs, k0, k1, col0, width, ncols);
     }
 };
 
 struct M7Mid {                                 // the kernel V[k, x, y] of a pair, times its columns
     const lrx_c2* __restrict__ kern;
     XBlock xb;
-    long long my;
+    long long my, p0;
     __device__ lrx_c2 w(int k, long long pr) const {
         const long long rx = pr / my, yy = pr - rx * my;
         return kern[((long long)k * xb.mx + min(lrx_x_of(xb, rx), xb.mx - 1)) * my + yy];
     }
-    __device__ lrx_c2 operator()(int k, long long col, lrx_c2 v) const { return lrx_mul(v, w(k, col / SSO)); }
+    __device__ lrx_c2 operator()(int k, long long col, lrx_c2 v) const { return lrx_mul(v, w(k, p0 + col / SSO)); }
     template <class Get>                       // whole groups: one thread per (k, pair) reads V once
     __device__ void group(int k, long long pr, const Get& get) const {
         const lrx_c2 wv = w(k, pr);
@@ -1087,14 +1069,37 @@ struct M7Mid {                                 // the kernel V[k, x, y] of a pai
 #ifndef LRX_MINB
 #define LRX_MINB 1
 #endif
+// yb, pb0, npairs, phase: the split arm (LRX_ARM 1, a k-box that holds fewer than two spin groups a
+// block), as modes 2/3 through the (nk, npairs * SSO) chunk yb: phase 0 the plane (z, y) pass from
+// the load, 1 the x pencil and the Mid, 2 the plane (z, y) forward, 3 the x pencil forward and the
+// store.  The same lines in the same axis order as the single arm: bitwise.
+struct M7Id {
+    __device__ lrx_c2 operator()(int, long long, lrx_c2 v) const { return v; }
+};
 extern "C" __global__ void __launch_bounds__(LRX_THREADS, LRX_MINB) lrx_kconv(
     const lrx_c2* __restrict__ gp, const lrx_c2* __restrict__ gt,
-    const lrx_c2* __restrict__ kern, lrx_c2* __restrict__ y, UnfoldTab t, double scale) {
+    const lrx_c2* __restrict__ kern, lrx_c2* __restrict__ y, UnfoldTab t, double scale,
+    lrx_c2* yb, long long pb0, long long npairs, int phase) {
     extern __shared__ lrx_c2 sm[];
     using namespace cufftdx;
     const XBlock xb = lrx_x_block(t);
     const long long my = t.nl / NR, pairs = xb.rows * my, ncols = pairs * SSO;
-    const M7Store st{y, &t, xb.rows, my, scale};
+#if LRX_ARM == 1
+    const long long nc = npairs * SSO;
+    const lrx_kbox::Plain<lrx_c2> yy{yb, nc};
+    if (phase == 0)
+        lrx_kbox::plane_pass<NX, NY, NZ, LRX_SM, fft_direction::inverse, TRC>(sm, nc, M7Load{gp, gt, &t, my, pairs, pb0}, yy);
+    else if (phase == 1)
+        lrx_kbox::pencil_pass<NX, NY, NZ, LRX_SM, false, fft_direction::inverse>(yb, nc, M7Mid{kern, xb, my, pb0});
+    else if (phase == 2)
+        lrx_kbox::plane_pass<NX, NY, NZ, LRX_SM, fft_direction::forward, TRC>(sm, nc, yy, yy);
+    else
+        lrx_kbox::pencil_pass<NX, NY, NZ, LRX_SM, false, fft_direction::forward>(
+            yb, nc, M7Id{}, M7Store{y, &t, xb.rows, my, scale, pb0 * SSO});
+    (void)ncols;
+#else
+    (void)yb; (void)pb0; (void)npairs; (void)phase;
+    const M7Store st{y, &t, xb.rows, my, scale, 0};
 #if LRX_TT
     const TileTabs s{reinterpret_cast<char*>(sm + TRC * KG::RS)};
     const long long stride = (long long)gridDim.x * TP;
@@ -1125,16 +1130,16 @@ extern "C" __global__ void __launch_bounds__(LRX_THREADS, LRX_MINB) lrx_kconv(
         lrx_kbox::store_tile<NX, NY, NZ, TRC>(sm, p0 * SS, ncols, st);   // the loop top syncs
     }
 #else
-    const M7Load ld{gp, gt, &t, my, pairs};
-    const M7Mid mid{kern, xb, my};
+    const M7Load ld{gp, gt, &t, my, pairs, 0};
+    const M7Mid mid{kern, xb, my, 0};
     for (long long col0 = (long long)blockIdx.x * TRC; col0 < ncols; col0 += (long long)gridDim.x * TRC) {
         lrx_kbox::stage_tile<NX, NY, NZ, TRC>(sm, col0, ncols, ld);
         lrx_kbox::transform3<NX, NY, NZ, TRC, LRX_SM, fft_direction::inverse>(sm);
-        if constexpr (TRC % SSO == 0) lrx_kbox::mid_group_tile<NX, NY, NZ, TRC, SSO>(sm, col0, ncols, mid);
-        else lrx_kbox::mid_tile<NX, NY, NZ, TRC>(sm, col0, ncols, mid);
+        lrx_kbox::mid_group_tile<NX, NY, NZ, TRC, SSO>(sm, col0, ncols, mid);
         lrx_kbox::transform3<NX, NY, NZ, TRC, LRX_SM, fft_direction::forward>(sm);
         lrx_kbox::store_tile<NX, NY, NZ, TRC>(sm, col0, ncols, st);
     }
+#endif
 #endif
 }
 #elif LRX_MODE == 8
@@ -1180,9 +1185,6 @@ struct LorArgs {
 #define LRX_WA 0
 #define LRX_WB 0
 #endif
-#ifndef LRX_WGROUPED
-#define LRX_WGROUPED 1                         // the W tile holds whole Lorentz groups (single arm)
-#endif
 #if LRX_WA > 0
 constexpr int WA = LRX_WA, WB = LRX_WB, WS = WA * WB;
 struct LorWLoad {                              // W column c: pair p0 + c / WS, block (c % WS) / WB, c % WB
@@ -1192,7 +1194,7 @@ struct LorWLoad {                              // W column c: pair p0 + c / WS, 
     template <class View>
     __device__ void direct(const View& view, int k0, int k1, long long col0, int width,
                            long long ncols) const {
-        lrx_unfold_direct<LRX_WGROUPED != 0, WA, WB, WA>(view, a->wp, a->wt, *t, a->p0, a->my, a->p0 + ncols / WS,
+        lrx_unfold_direct<WA, WB, WA>(view, a->wp, a->wt, *t, a->p0, a->my, a->p0 + ncols / WS,
                                                         k0, k1, col0, width, ncols);
     }
 };
@@ -1205,7 +1207,7 @@ struct LorLoad {                               // tile column c: pair p0 + c / S
     template <class View>
     __device__ void direct(const View& view, int k0, int k1, long long col0, int width,
                            long long ncols) const {
-        lrx_unfold_direct<true>(view, a->gp, a->gt, *t, a->p0, a->my, a->p0 + ncols / SS, k0, k1, col0, width,
+        lrx_unfold_direct(view, a->gp, a->gt, *t, a->p0, a->my, a->p0 + ncols / SS, k0, k1, col0, width,
                                 ncols);
     }
 };
@@ -1456,15 +1458,16 @@ extern "C" __global__ void __launch_bounds__(LRX_THREADS) lrx_kconv(LorArgs a, U
 }
 #endif
 #elif LRX_MODE == 9
-// Mode 9: mode 3's inverse transform of the interaction unfolded on its load from the wedge tiles,
-// on the k-box stage's single arm.  Tile column c is row (pair, A, B) = (c / SS, (c % SS) / NR,
-// c % NR); Y k-LEADING (nk, ml, nl) at merged endpoints (x*NS + A, y*NR + B), scaled as mode 3
-// scales.  LRX_GROUPED (a spin group fits the plan's tile): one thread per (k, pair) reads the
-// pair's sources once and forms every (A, B) of U O Ur^dagger in registers; else one thread per
-// (k, column) forms its own element with the same arithmetic.  The values, the thread FFTs and their
-// axis order are the resident kernel's, so the result is too, bit for bit.
+// Mode 9: mode 3's inverse transform of the interaction unfolded on its load from the wedge tiles.
+// Tile column c is row (pair, A, B) = (c / SS, (c % SS) / NR, c % NR); Y k-LEADING (nk, ml, nl) at
+// merged endpoints (x*NS + A, y*NR + B), scaled as mode 3 scales.  The tiles hold whole spin groups:
+// one thread per (k, pair) reads the pair's sources once and forms every (A, B) of U O Ur^dagger.
+// Single arm (two groups fit a block): one HBM pass.  Split arm (as modes 2/3): phase 0 the plane
+// (z, y) pass from the load into Y unscaled, phase 1 the x pencil and the scale in place on Y (a
+// pure transform: Y's own columns serve).  The values, the thread FFTs and their axis order are
+// the resident kernel's either way, so the result is too, bit for bit.
 #include "kbox_stage.cuh"
-constexpr int TRC = LRX_TR;                    // tile columns (whole spin groups when LRX_GROUPED)
+constexpr int TRC = LRX_TR;                    // tile columns (whole spin groups)
 
 struct WedgeLoad {
     static constexpr bool kDirect = true, kFinish = false;
@@ -1474,7 +1477,7 @@ struct WedgeLoad {
     template <class View>
     __device__ void direct(const View& view, int k0, int k1, long long col0, int width,
                            long long ncols) const {
-        lrx_unfold_direct<LRX_GROUPED != 0>(view, gp, gt, *t, 0, my, ncols / SS, k0, k1, col0, width, ncols);
+        lrx_unfold_direct(view, gp, gt, *t, 0, my, ncols / SS, k0, k1, col0, width, ncols);
     }
 };
 
@@ -1490,19 +1493,32 @@ struct WedgeStore {
     }
 };
 
+struct WedgeScale {                            // the split arm's last axis: the store's scale
+    double scale;
+    __device__ lrx_c2 operator()(int, long long, lrx_c2 v) const { return {v.x * scale, v.y * scale}; }
+};
+
 extern "C" __global__ void __launch_bounds__(LRX_THREADS) lrx_kconv(
     const lrx_c2* __restrict__ gp, const lrx_c2* __restrict__ gt, lrx_c2* __restrict__ y,
-    UnfoldTab t, double scale) {
+    UnfoldTab t, double scale, int phase) {
     extern __shared__ lrx_c2 sm[];
     using namespace cufftdx;
     const long long my = t.nl / NR, ncols = (t.ml / NS) * my * SS;
     const WedgeLoad ld{gp, gt, &t, my};
+#if LRX_ARM == 0
+    (void)phase;
     const WedgeStore st{y, &t, my, scale};
     for (long long c0 = (long long)blockIdx.x * TRC; c0 < ncols; c0 += (long long)gridDim.x * TRC) {
         lrx_kbox::stage_tile<NX, NY, NZ, TRC>(sm, c0, ncols, ld);
         lrx_kbox::transform3<NX, NY, NZ, TRC, LRX_SM, fft_direction::inverse>(sm);
         lrx_kbox::store_tile<NX, NY, NZ, TRC>(sm, c0, ncols, st);
     }
+#else
+    if (phase == 0)
+        lrx_kbox::plane_pass<NX, NY, NZ, LRX_SM, fft_direction::inverse, TRC>(sm, ncols, ld, WedgeStore{y, &t, my, 1.0});
+    else
+        lrx_kbox::pencil_pass<NX, NY, NZ, LRX_SM, false, fft_direction::inverse>(y, ncols, WedgeScale{scale});
+#endif
 }
 #else
 // Mode 11: the chi0 two-operand pass on the k-box stage (kbox_stage.cuh).
@@ -1966,6 +1982,22 @@ struct Built { CUfunction fn = nullptr; int rb = 1; int smem = 0; double compile
                // Mode 8 with the interaction read from its parents (variant wa*8 + wb), split arm: the
                // W_R chunk pass (phase 4), tiles of trw columns at threads3 / smem3.
                int trw = 0, threads3 = 0, smem3 = 0; };
+// A split arm's plane tile of whole groups of ss columns.  Mode 8: enough groups for a unit of the
+// gathered load per thread (256 per plane) within two blocks per SM.  Modes 7 and 9 store the plane
+// to a k-leading intermediate (or their output): 16 columns as modes 2/3, 256-byte runs per k,
+// halved while the tile exceeds the opt-in memory (one column per plane at 20^3 wrote 16-byte runs
+// and ran mode 9 no faster than its single arm, KCOLRES).
+static int split_plane_tile(int nky, int nkz, long long pr, int ss, long long smem_optin, bool wide = false) {
+    if (wide) {
+        int t = std::max(ss, 16);
+        while (t > ss && static_cast<long long>(t) * pr * 16 > smem_optin) t /= 2;
+        return t;
+    }
+    int grp = 1;
+    while (static_cast<long long>(nky) * nkz * grp < kThreads && 2LL * ss * (2 * grp) * pr * 16 <= smem_optin)
+        grp *= 2;
+    return ss * grp;
+}
 // ctx, mode, nkx, nky, nkz, ns, nsr, f32, variant (mode 11: the static completion; mode 7: its output spin
 // block; mode 8: wa*8 + wb, the interaction's Lorentz widths when it is read from its parents, 0 = V_R)
 using Key = std::tuple<CUcontext, int, int, int, int, int, int, int, int>;
@@ -2136,8 +2168,8 @@ static ffi::Error build(int mode, int nkx, int nky, int nkz, int ns, bool f32,
     // FFT-family time of an Fe 8^3 shared-pole SC map, and the stage is 1.14-1.23x at its door
     // (claim 2779); mode 8's split arm serves 10^3-16^3 at ns 4.
     const bool kbox_rows = (mode >= 2 && mode <= 5) || mode == 9;
-    const bool kbox_single_only = mode == 4 || mode == 5 || mode == 9;
-    int kb_arm = 0, kb_tr = 0, kb_ty = 0, kb_threads = 0, kb_threads2 = 0, kb_grouped = 0;
+    const bool kbox_single_only = mode == 4 || mode == 5;
+    int kb_arm = 0, kb_tr = 0, kb_ty = 0, kb_threads = 0, kb_threads2 = 0;
     long long kb_smem = 0, kb_smem2 = 0;
     int lor_trw = 0, kb_threads3 = 0;                  // mode 8 from W parents, split arm
     long long kb_smem3 = 0;
@@ -2145,15 +2177,18 @@ static ffi::Error build(int mode, int nkx, int nky, int nkz, int ns, bool f32,
         const lrx_kbox::Geometry g{nkx, nky, nkz};
         rb = 1;
         if (mode == 9) {
+            // Whole spin groups per tile: the single arm when a block holds a group of two or more
+            // columns (the plan counts groups), else the split arm on plane tiles of whole groups.
+            // One column per block (the single arm's floor before) wrote 20^3 W_R at ~85 GB/s, 8
+            // warps per SM; split, 64.9 -> 32.0 ms (20^3), 1.48x at 16^3 (KCOLRES).
             const int ss = ns * nsr;
-            lrx_kbox::Plan kp = lrx_kbox::kbox_plan(nkx, nky, nkz, ss, 1, 16, smem_optin, 1, 1);
-            kb_grouped = kp.arm == 0 ? 1 : 0;
-            if (kp.arm == 0) kp.tr *= ss;              // the plan counts whole spin groups
-            else kp = lrx_kbox::kbox_plan(nkx, nky, nkz, 1, 1, 16, smem_optin, 1, 1);
-            kb_arm = kp.arm;
-            kb_tr = kp.tr;
-            kb_threads = kp.threads;
-            kb_smem = kp.smem;
+            const lrx_kbox::Plan kp = lrx_kbox::kbox_plan(nkx, nky, nkz, ss, 1, 16, smem_optin, 1, 1);
+            kb_arm = kp.arm != 0 || kp.tr * ss < 2 ? 1 : 0;
+            kb_tr = kb_arm == 0 ? kp.tr * ss : split_plane_tile(nky, nkz, g.pr(), ss, smem_optin, true);
+            // Split: 512 threads (16 warps a block, one block a SM by the tile) where the x-line
+            // leaves the 128-register bound room (nkx <= 20), as mode 11's split arm.
+            kb_threads = kb_arm == 0 ? kp.threads : (nkx <= 20 ? 2 * kThreads : kThreads);
+            kb_smem = kb_arm == 0 ? kp.smem : static_cast<long long>(kb_tr) * g.pr() * 16;
         } else if (kbox_rows) {
             const lrx_kbox::Plan kp = lrx_kbox::kbox_plan(nkx, nky, nkz, 1, 1, f32 ? 8 : 16, smem_optin,
                                                           mode == 2 || mode == 4 ? 2 : 1,
@@ -2173,11 +2208,7 @@ static ffi::Error build(int mode, int nkx, int nky, int nkz, int ns, bool f32,
             // Plane tiles of whole spin groups: the gathered load runs one thread per (k, group)
             // of a (ky, kz) plane, so a tile holds enough groups for a unit per thread (256),
             // within two blocks per SM.
-            int grp = 1;
-            while (static_cast<long long>(nky) * nkz * grp < kThreads &&
-                   2LL * ss * (2 * grp) * g.pr() * 16 <= smem_optin)
-                grp *= 2;
-            kb_tr = ss * grp;
+            kb_tr = split_plane_tile(nky, nkz, g.pr(), ss, smem_optin);
             // The vertex pencil holds a pair's ss columns on one warp and stages nothing (its block
             // stage of nkx * ty * (ss + 17) elements refused the two-spinor Dirac-quarter doors at
             // 16^3-20^3 and held 2-4 warps per SM where it fit).
@@ -2187,11 +2218,7 @@ static ffi::Error build(int mode, int nkx, int nky, int nkz, int ns, bool f32,
             kb_smem = static_cast<long long>(kb_tr) * g.pr() * 16;
             kb_smem2 = 0;
             if (lor_ws > 0) {                          // the W_R chunk: plane tiles of whole Lorentz groups
-                int wgrp = 1;                          // (as the Green's plane tiles above)
-                while (static_cast<long long>(nky) * nkz * wgrp < kThreads &&
-                       2LL * lor_ws * (2 * wgrp) * g.pr() * 16 <= smem_optin)
-                    wgrp *= 2;
-                lor_trw = lor_ws * wgrp;
+                lor_trw = split_plane_tile(nky, nkz, g.pr(), lor_ws, smem_optin);   // as the Green's tiles
                 kb_smem3 = static_cast<long long>(lor_trw) * g.pr() * 16;
                 kb_threads3 = kThreads;
             }
@@ -2203,7 +2230,7 @@ static ffi::Error build(int mode, int nkx, int nky, int nkz, int ns, bool f32,
                << ns << " (mode " << mode << "), whose k-box " << (kb_arm ? "plane/pencil" : "tile") << " needs "
                << kb_smem << " / " << kb_smem2 << " / " << kb_smem3 << " B; want <= " << smem_optin
                << " B of opt-in shared memory on "
-                  "this device" << (kbox_single_only ? " for one whole column (modes 4, 5 and 9 have no split arm)" : "")
+                  "this device" << (kbox_single_only ? " for one whole column (modes 4 and 5 have no split arm)" : "")
                << "; why: the stage keeps a (ky, kz) plane of its tile columns resident; fix: a smaller k-grid";
             return sticky("residency", os.str(), ffi::ErrorCode::kInvalidArgument);
         }
@@ -2219,45 +2246,45 @@ static ffi::Error build(int mode, int nkx, int nky, int nkz, int ns, bool f32,
     // admits, at most two (Fe 8^3: 2 x 512 threads at <= 64 registers; unbounded, NVCC took 95 and
     // held one block per SM).
     const int blk = (mode == 7 && variant > 0) ? variant : ns;    // mode 7's output spin block
-    int m7_tp = 0, m7_blocks = 0, m7_tr = 0, m7_threads = 0;
+    int m7_tp = 0, m7_blocks = 0, m7_tr = 0, m7_threads = 0, m7_arm = 0;
     long long m7_smem = 0;
     if (mode == 7) {
+        // Whole spin groups per tile: the single arm when a block holds a group of two or more
+        // columns, else the split arm (as modes 2/3) on plane tiles of whole groups.  One column per
+        // block (the single arm's floor before) re-gathered a pair's group for each column: 20^3
+        // ns 2, 1.3 TB of L2 per P64-tile call at 25% warps; split, 555 -> 237 ms (KCOLRES).  One
+        // group of 4 columns per block (12^3 ns 2) stays single: the split ran it 0.84x.
         const lrx_kbox::Geometry g{nkx, nky, nkz};
         const int sso = blk * blk;
-        lrx_kbox::Plan kp = lrx_kbox::kbox_plan(nkx, nky, nkz, sso, 1, 16, smem_optin, 2, 1);
-        int group = sso;
-        if (kp.arm != 0) {
-            kp = lrx_kbox::kbox_plan(nkx, nky, nkz, 1, 1, 16, smem_optin, 2, 1);
-            group = 1;
-        }
-        if (kp.arm != 0) {
-            std::ostringstream os;
-            os << "GATE mathdx-kconv-kbox-residency: got k-grid (" << nkx << "," << nky << "," << nkz
-               << ") with ns=" << ns << ", whose padded k-box column needs " << g.rs() * 16 << " B; want <= "
-               << smem_optin << " B of opt-in shared memory on this device; why: the Sigma unfold convolution "
-                  "keeps whole k-box columns resident; fix: a smaller k-grid";
-            return sticky("residency", os.str(), ffi::ErrorCode::kInvalidArgument);
-        }
-        m7_tr = kp.tr * group;
-        m7_threads = tile_tables_pay(ns) ? kThreads : kp.threads;
-        m7_smem = kp.smem;
-        if (!tile_tables_pay(ns)) {
-            int smem_sm = 0, smem_rsv = 0;
-            LRX_CUDA_CHECK(cudaDeviceGetAttribute(&smem_sm, cudaDevAttrMaxSharedMemoryPerMultiprocessor, dev),
-                           "shared memory per SM");
-            LRX_CUDA_CHECK(cudaDeviceGetAttribute(&smem_rsv, cudaDevAttrReservedSharedMemoryPerBlock, dev),
-                           "reserved shared memory per block");
-            m7_blocks = static_cast<int>(std::max(1LL, std::min(2LL, smem_sm / (m7_smem + smem_rsv))));
-        }
-        if (group == sso && blk == ns && nsr == ns && cc_major >= 8 && tile_tables_pay(ns)) {
-            const TilePlan tt = tile_table_plan(dev, kp.tr, static_cast<long long>(sso) * g.rs() * 16, nk, ns, 1,
-                                                false);
-            if (!tt.err.empty()) return fail("device attributes", tt.err);
-            if (tt.tp > 0) {
-                m7_tp = tt.tp;
-                m7_blocks = tt.blocks;
-                m7_smem = tt.smem;
-                m7_tr = tt.tp * sso;
+        const lrx_kbox::Plan kp = lrx_kbox::kbox_plan(nkx, nky, nkz, sso, 1, 16, smem_optin, 2, 1);
+        m7_arm = kp.arm != 0 || kp.tr * sso < 2 ? 1 : 0;
+        if (m7_arm != 0) {
+            m7_tr = split_plane_tile(nky, nkz, g.pr(), sso, smem_optin, true);
+            m7_threads = kThreads;
+            m7_smem = static_cast<long long>(m7_tr) * g.pr() * 16;
+            m7_blocks = 1;
+        } else {
+            m7_tr = kp.tr * sso;                       // the plan counts whole spin groups
+            m7_threads = tile_tables_pay(ns) ? kThreads : kp.threads;
+            m7_smem = kp.smem;
+            if (!tile_tables_pay(ns)) {
+                int smem_sm = 0, smem_rsv = 0;
+                LRX_CUDA_CHECK(cudaDeviceGetAttribute(&smem_sm, cudaDevAttrMaxSharedMemoryPerMultiprocessor, dev),
+                               "shared memory per SM");
+                LRX_CUDA_CHECK(cudaDeviceGetAttribute(&smem_rsv, cudaDevAttrReservedSharedMemoryPerBlock, dev),
+                               "reserved shared memory per block");
+                m7_blocks = static_cast<int>(std::max(1LL, std::min(2LL, smem_sm / (m7_smem + smem_rsv))));
+            }
+            if (blk == ns && nsr == ns && cc_major >= 8 && tile_tables_pay(ns)) {
+                const TilePlan tt = tile_table_plan(dev, kp.tr, static_cast<long long>(sso) * g.rs() * 16, nk, ns, 1,
+                                                    false);
+                if (!tt.err.empty()) return fail("device attributes", tt.err);
+                if (tt.tp > 0) {
+                    m7_tp = tt.tp;
+                    m7_blocks = tt.blocks;
+                    m7_smem = tt.smem;
+                    m7_tr = tt.tp * sso;
+                }
             }
         }
         rb = m7_tr;
@@ -2347,6 +2374,7 @@ static ffi::Error build(int mode, int nkx, int nky, int nkz, int ns, bool f32,
     const int plane_threads = mode == 10 && plane_minb == 1 ? 512 : kThreads;
     if (mode == 7 && blk != ns) defs.push_back("-DLRX_NA=" + std::to_string(blk));
     if (mode == 7) {
+        defs.push_back("-DLRX_ARM=" + std::to_string(m7_arm));
         defs.push_back("-DLRX_TT=" + std::string(m7_tp ? "1" : "0"));
         defs.push_back("-DLRX_TP=" + std::to_string(m7_tp));
         defs.push_back("-DLRX_MINB=" + std::to_string(std::max(1, m7_blocks)));
@@ -2358,12 +2386,10 @@ static ffi::Error build(int mode, int nkx, int nky, int nkz, int ns, bool f32,
         defs.push_back("-DLRX_TR=" + std::to_string(kb_tr));
         defs.push_back("-DLRX_TY=" + std::to_string(kb_ty));
         defs.push_back("-DLRX_THREADS=" + std::to_string(kb_threads));
-        if (mode == 9) defs.push_back("-DLRX_GROUPED=" + std::to_string(kb_grouped));
         if (mode == 8 && lor_ws > 0) {
             defs.push_back("-DLRX_WA=" + std::to_string(lor_wa));
             defs.push_back("-DLRX_WB=" + std::to_string(lor_wb));
             defs.push_back("-DLRX_TRW=" + std::to_string(lor_trw));
-            defs.push_back("-DLRX_WGROUPED=1");
         }
     }
     if (mode == 11) {
@@ -2457,6 +2483,8 @@ static ffi::Error build(int mode, int nkx, int nky, int nkz, int ns, bool f32,
         b.rb = m7_tr;                                  // logged as the tile's columns
         b.threads = m7_threads;
         b.smem = static_cast<int>(m7_smem);
+        b.arm = m7_arm;
+        b.sms = sms;
         if (m7_tp) b.grid_cap = static_cast<long long>(sms) * m7_blocks;
     }
     if (mode == 10) {                                  // persistent blocks: the resident count
@@ -2745,7 +2773,7 @@ static ffi::Error LaunchRows(cudaStream_t stream, int mode, ffi::AnyBuffer X, co
 // sources, so a caller that bounds the output tile by x blocks reads the Green
 // and W once in all (output spin blocks re-read them per block).
 static ffi::Error KleadUnfoldImpl(
-    cudaStream_t stream, ffi::AnyBuffer Gp, ffi::AnyBuffer Gt, ffi::AnyBuffer row, ffi::AnyBuffer trs,
+    cudaStream_t stream, ffi::ScratchAllocator& scratch, ffi::AnyBuffer Gp, ffi::AnyBuffer Gt, ffi::AnyBuffer row, ffi::AnyBuffer trs,
     ffi::AnyBuffer lsrc, ffi::AnyBuffer rsrc, ffi::AnyBuffer mph, ffi::AnyBuffer nph, ffi::AnyBuffer spin,
     const ffi::AnyBuffer* kout, ffi::AnyBuffer V, ffi::Result<ffi::AnyBuffer> U, int64_t nkx,
     int64_t nky, int64_t nkz, double scale, std::string_view mathdx_root, std::string_view cubin_dir,
@@ -2809,53 +2837,84 @@ static ffi::Error KleadUnfoldImpl(
     const void* vp = V.untyped_data();
     void* up = U->untyped_data();
     double sc = scale;
-    void* args[] = {(void*)&gpp, (void*)&gtp, (void*)&vp, (void*)&up, (void*)&t, (void*)&sc};
+    void* yb = nullptr;
+    long long p0 = 0, npairs = pairs;
+    int phase = 0;
+    void* args[] = {(void*)&gpp, (void*)&gtp, (void*)&vp, (void*)&up, (void*)&t, (void*)&sc,
+                    (void*)&yb, (void*)&p0, (void*)&npairs, (void*)&phase};
     const long long ncols = pairs * d * d;
-    long long blocks = (ncols + k->tr - 1) / k->tr;                 // one block per tile
-    if (k->grid_cap > 0) blocks = std::min(blocks, k->grid_cap);   // the tile tables' persistent grid
-    if (blocks > 2147483647LL) return bad("grid.x overflow");
-    CUresult cr = driver_api().LaunchKernel(k->fn, static_cast<unsigned>(blocks), 1, 1, k->threads, 1, 1,
-                                            static_cast<unsigned>(k->smem),
-                                            reinterpret_cast<CUstream>(stream), args, nullptr);
-    if (cr != CUDA_SUCCESS) return fail("cuLaunchKernel", cu_err(cr));
+    auto launch = [&](long long blocks, int threads, int smem) -> ffi::Error {
+        if (blocks > 2147483647LL) return bad("grid.x overflow");
+        CUresult cr = driver_api().LaunchKernel(k->fn, static_cast<unsigned>(blocks), 1, 1, threads, 1, 1,
+                                                static_cast<unsigned>(smem), reinterpret_cast<CUstream>(stream),
+                                                args, nullptr);
+        return cr == CUDA_SUCCESS ? ffi::Error::Success() : fail("cuLaunchKernel", cu_err(cr));
+    };
+    if (k->arm == 0) {
+        long long blocks = (ncols + k->tr - 1) / k->tr;                 // one block per tile
+        if (k->grid_cap > 0) blocks = std::min(blocks, k->grid_cap);   // the tile tables' persistent grid
+        return launch(blocks, k->threads, k->smem);
+    }
+    // Split arm: chunks of pairs through a (nk, chunk * d^2) intermediate of at most 1 GiB (the
+    // mode-11 and mode-8 bound); a chunk only groups pairs into launches.
+    const long long per_pair = nk * d * d * 16, cap = static_cast<long long>(k->sms) * 8;
+    const long long chunk = std::max(1LL, std::min<long long>(pairs, (1LL << 30) / per_pair));
+    auto ybuf = scratch.Allocate(static_cast<size_t>(chunk * per_pair));
+    if (!ybuf.has_value()) {
+        std::ostringstream os;
+        os << "GATE mathdx-kconv-unfold-scratch: got a refused " << chunk * per_pair << " B intermediate ("
+           << chunk << " pairs); want the XLA scratch allocator to grant it";
+        return fail("scratch", os.str(), ffi::ErrorCode::kResourceExhausted);
+    }
+    yb = *ybuf;
+    for (p0 = 0; p0 < pairs; p0 += chunk) {
+        npairs = std::min(chunk, pairs - p0);
+        const long long nc = npairs * d * d;
+        const long long plane = std::min(nkx * ((nc + k->tr - 1) / k->tr), cap);
+        const long long pencil = std::min((nky * nkz * nc + kThreads - 1) / kThreads, cap);
+        for (phase = 0; phase < 4; ++phase) {
+            const bool pl = phase % 2 == 0;
+            if (auto e1 = launch(pl ? plane : pencil, kThreads, pl ? k->smem : 0); !e1.success()) return e1;
+        }
+    }
     return ffi::Error::Success();
 }
 
 // The parent-row targets.  `_rows` keeps its historical signature (every older source tree calls
 // it); `_block` adds the conj-on-load partner and the output spin block (U2).
 static ffi::Error KleadUnfoldRowsConv(
-    cudaStream_t stream, ffi::AnyBuffer Gp, ffi::AnyBuffer Gt, ffi::AnyBuffer row, ffi::AnyBuffer trs,
+    cudaStream_t stream, ffi::ScratchAllocator scratch, ffi::AnyBuffer Gp, ffi::AnyBuffer Gt, ffi::AnyBuffer row, ffi::AnyBuffer trs,
     ffi::AnyBuffer lsrc, ffi::AnyBuffer rsrc, ffi::AnyBuffer mph, ffi::AnyBuffer nph, ffi::AnyBuffer spin,
     ffi::AnyBuffer kout, ffi::AnyBuffer V, ffi::Result<ffi::AnyBuffer> U, int64_t nkx, int64_t nky,
     int64_t nkz, double scale, std::string_view mathdx_root, std::string_view cubin_dir) {
-    return KleadUnfoldImpl(stream, Gp, Gt, row, trs, lsrc, rsrc, mph, nph, spin, &kout, V, U, nkx, nky,
+    return KleadUnfoldImpl(stream, scratch, Gp, Gt, row, trs, lsrc, rsrc, mph, nph, spin, &kout, V, U, nkx, nky,
                            nkz, scale, mathdx_root, cubin_dir);
 }
 static ffi::Error KleadUnfoldBlockConv(
-    cudaStream_t stream, ffi::AnyBuffer Gp, ffi::AnyBuffer Gt, ffi::AnyBuffer row, ffi::AnyBuffer trs,
+    cudaStream_t stream, ffi::ScratchAllocator scratch, ffi::AnyBuffer Gp, ffi::AnyBuffer Gt, ffi::AnyBuffer row, ffi::AnyBuffer trs,
     ffi::AnyBuffer lsrc, ffi::AnyBuffer rsrc, ffi::AnyBuffer mph, ffi::AnyBuffer nph, ffi::AnyBuffer spin,
     ffi::AnyBuffer kout, ffi::AnyBuffer V, ffi::Result<ffi::AnyBuffer> U, int64_t nkx, int64_t nky,
     int64_t nkz, double scale, int64_t conj_src, int64_t spin_block, int64_t a0, int64_t b0,
     std::string_view mathdx_root, std::string_view cubin_dir) {
-    return KleadUnfoldImpl(stream, Gp, Gt, row, trs, lsrc, rsrc, mph, nph, spin, &kout, V, U, nkx, nky,
+    return KleadUnfoldImpl(stream, scratch, Gp, Gt, row, trs, lsrc, rsrc, mph, nph, spin, &kout, V, U, nkx, nky,
                            nkz, scale, mathdx_root, cubin_dir, conj_src, spin_block, a0, b0);
 }
 // `_xblock`: the conj-on-load partner and the stored x block (whole spin group).
 static ffi::Error KleadUnfoldXBlockConv(
-    cudaStream_t stream, ffi::AnyBuffer Gp, ffi::AnyBuffer Gt, ffi::AnyBuffer row, ffi::AnyBuffer trs,
+    cudaStream_t stream, ffi::ScratchAllocator scratch, ffi::AnyBuffer Gp, ffi::AnyBuffer Gt, ffi::AnyBuffer row, ffi::AnyBuffer trs,
     ffi::AnyBuffer lsrc, ffi::AnyBuffer rsrc, ffi::AnyBuffer mph, ffi::AnyBuffer nph, ffi::AnyBuffer spin,
     ffi::AnyBuffer kout, ffi::AnyBuffer V, ffi::Result<ffi::AnyBuffer> U, int64_t nkx, int64_t nky,
     int64_t nkz, double scale, int64_t conj_src, int64_t x0, int64_t bx, int64_t xs, int64_t xn,
     std::string_view mathdx_root, std::string_view cubin_dir) {
-    return KleadUnfoldImpl(stream, Gp, Gt, row, trs, lsrc, rsrc, mph, nph, spin, &kout, V, U, nkx, nky,
+    return KleadUnfoldImpl(stream, scratch, Gp, Gt, row, trs, lsrc, rsrc, mph, nph, spin, &kout, V, U, nkx, nky,
                            nkz, scale, mathdx_root, cubin_dir, conj_src, 0, 0, 0, x0, bx, xs, xn);
 }
 static ffi::Error KleadUnfoldConv(
-    cudaStream_t stream, ffi::AnyBuffer Gp, ffi::AnyBuffer Gt, ffi::AnyBuffer row, ffi::AnyBuffer trs,
+    cudaStream_t stream, ffi::ScratchAllocator scratch, ffi::AnyBuffer Gp, ffi::AnyBuffer Gt, ffi::AnyBuffer row, ffi::AnyBuffer trs,
     ffi::AnyBuffer lsrc, ffi::AnyBuffer rsrc, ffi::AnyBuffer mph, ffi::AnyBuffer nph, ffi::AnyBuffer spin,
     ffi::AnyBuffer V, ffi::Result<ffi::AnyBuffer> U, int64_t nkx, int64_t nky, int64_t nkz, double scale,
     std::string_view mathdx_root, std::string_view cubin_dir) {
-    return KleadUnfoldImpl(stream, Gp, Gt, row, trs, lsrc, rsrc, mph, nph, spin, nullptr, V, U, nkx, nky,
+    return KleadUnfoldImpl(stream, scratch, Gp, Gt, row, trs, lsrc, rsrc, mph, nph, spin, nullptr, V, U, nkx, nky,
                            nkz, scale, mathdx_root, cubin_dir);
 }
 
@@ -3142,14 +3201,20 @@ static ffi::Error KleadUnfoldFft(
     const void* wtp = Wt.untyped_data();
     void* yp = Y->untyped_data();
     double sc = scale;
-    void* args[] = {(void*)&wpp, (void*)&wtp, (void*)&yp, (void*)&t, (void*)&sc};
-    const long long rows = pairs * nsl * nsr;
-    const long long blocks = std::min((rows + k->tr - 1) / k->tr, 2147483647LL);   // one block per tile
-    CUresult cr = driver_api().LaunchKernel(k->fn, static_cast<unsigned>(blocks), 1, 1, k->threads, 1, 1,
-                                            static_cast<unsigned>(k->smem),
-                                            reinterpret_cast<CUstream>(stream), args, nullptr);
-    if (cr != CUDA_SUCCESS) return fail("cuLaunchKernel", cu_err(cr));
-    return ffi::Error::Success();
+    int phase = 0;
+    void* args[] = {(void*)&wpp, (void*)&wtp, (void*)&yp, (void*)&t, (void*)&sc, (void*)&phase};
+    const long long rows = pairs * nsl * nsr, cap = static_cast<long long>(k->sms) * 8;
+    auto launch = [&](long long blocks, int threads, int smem) -> ffi::Error {
+        CUresult cr = driver_api().LaunchKernel(k->fn, static_cast<unsigned>(std::min(blocks, 2147483647LL)), 1, 1,
+                                                threads, 1, 1, static_cast<unsigned>(smem),
+                                                reinterpret_cast<CUstream>(stream), args, nullptr);
+        return cr == CUDA_SUCCESS ? ffi::Error::Success() : fail("cuLaunchKernel", cu_err(cr));
+    };
+    if (k->arm == 0) return launch((rows + k->tr - 1) / k->tr, k->threads, k->smem);   // one block per tile
+    if (auto e0 = launch(std::min(nkx * ((rows + k->tr - 1) / k->tr), cap), k->threads, k->smem); !e0.success())
+        return e0;
+    phase = 1;
+    return launch(std::min((nky * nkz * rows + k->threads - 1) / k->threads, cap), k->threads, 0);
 }
 
 // Mode 11 geometry, as the embedded source declares it (ChiArgs).
@@ -3517,6 +3582,7 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(
     KConvMathdxKleadUnfoldCudaFfi, lorrax_ffi::kconv_mathdx::KleadUnfoldConv,
     xla::ffi::Ffi::Bind()
         .Ctx<xla::ffi::PlatformStream<cudaStream_t>>()
+        .Ctx<xla::ffi::ScratchAllocator>()
         .Arg<xla::ffi::AnyBuffer>()   // Gp
         .Arg<xla::ffi::AnyBuffer>()   // Gt
         .Arg<xla::ffi::AnyBuffer>()   // row
@@ -3568,6 +3634,7 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(
     KConvMathdxKleadUnfoldRowsCudaFfi, lorrax_ffi::kconv_mathdx::KleadUnfoldRowsConv,
     xla::ffi::Ffi::Bind()
         .Ctx<xla::ffi::PlatformStream<cudaStream_t>>()
+        .Ctx<xla::ffi::ScratchAllocator>()
         .Arg<xla::ffi::AnyBuffer>()   // Gp
         .Arg<xla::ffi::AnyBuffer>()   // Gt
         .Arg<xla::ffi::AnyBuffer>()   // row
@@ -3588,6 +3655,7 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(
     KConvMathdxKleadUnfoldBlockCudaFfi, lorrax_ffi::kconv_mathdx::KleadUnfoldBlockConv,
     xla::ffi::Ffi::Bind()
         .Ctx<xla::ffi::PlatformStream<cudaStream_t>>()
+        .Ctx<xla::ffi::ScratchAllocator>()
         .Arg<xla::ffi::AnyBuffer>()   // Gp
         .Arg<xla::ffi::AnyBuffer>()   // Gt (unread when conj_src)
         .Arg<xla::ffi::AnyBuffer>()   // row
@@ -3612,6 +3680,7 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(
     KConvMathdxKleadUnfoldXBlockCudaFfi, lorrax_ffi::kconv_mathdx::KleadUnfoldXBlockConv,
     xla::ffi::Ffi::Bind()
         .Ctx<xla::ffi::PlatformStream<cudaStream_t>>()
+        .Ctx<xla::ffi::ScratchAllocator>()
         .Arg<xla::ffi::AnyBuffer>()   // Gp
         .Arg<xla::ffi::AnyBuffer>()   // Gt (unread when conj_src)
         .Arg<xla::ffi::AnyBuffer>()   // row
