@@ -399,19 +399,41 @@ def photon_static_contact(wfns, meta, *, mesh_xy, layout, vertex,
     return pi_grid, drude, contact
 
 
-@lru_cache(maxsize=None)
+#: The run's stream programs by factory arguments (:func:`_response_stream_kernel`).
+_STREAM_KERNELS: dict = {}
+
+
 def _response_stream_kernel(mesh_xy, kgrid, n_outputs, shape, *, _ffi_key, **options):
     """Cache programs, never state arrays; window data remain dynamic inputs.
 
-    Unbounded: a map's stream programs are one fixed set (a program per row
-    pass of the streamed χ bank and of the moment stream, about 60 at 20³ P64),
-    met again at every SC map, and their executables stay in ``_COMPILED`` for
-    the run anyway.  A bounded cache smaller than the set rebuilt every factory
-    (0.4 s each at the P64-local shape) and re-lowered every program on every map.
+    A map's stream programs are one fixed set (a program per row pass of the
+    streamed χ bank and of the moment stream, about 60 at 20³ P64) met again at
+    every SC map, so every program is kept: a cache smaller than the set rebuilt
+    every factory (0.4 s each at the P64-local shape) and re-lowered every program
+    on every map.  A program binds its plan's placed door tables, which the door
+    caches (``w_isdf._CHARGE_DOORS``, ``_PHOTON_DOORS``) hold and the ledger
+    reserves; when a cache evicts a plan, its programs and their executables are
+    dropped with it (:func:`_release_evicted_programs`), so no table outlives
+    its reservation.
     """
     from .w_isdf import _get_chi_fractional_contour_kernel_face
-    return _get_chi_fractional_contour_kernel_face(
-        mesh_xy, kgrid, n_outputs, shape, **options)
+    key = (mesh_xy, kgrid, n_outputs, shape, _ffi_key, tuple(sorted(options.items())))
+    kernel = _STREAM_KERNELS.get(key)
+    if kernel is None:
+        kernel = _STREAM_KERNELS[key] = _get_chi_fractional_contour_kernel_face(
+            mesh_xy, kgrid, n_outputs, shape, **options)
+        _release_evicted_programs()
+    return kernel
+
+
+def _release_evicted_programs():
+    """Drop the stream programs, and their executables, that bind an evicted plan's door tables."""
+    from .w_isdf import placed_door_tables_live
+    for key in [k for k, kernel in _STREAM_KERNELS.items()
+                if not placed_door_tables_live(getattr(kernel, "tail", ()))]:
+        dead = _STREAM_KERNELS.pop(key)
+        for entry in [entry for entry in _COMPILED if entry[0] is dead]:
+            del _COMPILED[entry]
 
 
 def response_stream(wfns, meta, *, mesh_xy, q_ids, n_outputs,

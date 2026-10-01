@@ -465,6 +465,14 @@ def _photon_stream_doors(mesh_xy, kgrid, half_plans, parity, passes):
     return hit
 
 
+def placed_door_tables_live(tail) -> bool:
+    """Whether every placed door table a bound program reads (``tail``) is still held
+    by its door cache (``_CHARGE_DOORS``, ``_PHOTON_DOORS``); an evicted plan's are not."""
+    held = {id(a) for cache in (_CHARGE_DOORS, _PHOTON_DOORS) for value in cache.values()
+            for a in jax.tree.leaves(value) if isinstance(a, jax.Array)}
+    return all(id(a) in held for a in jax.tree.leaves(tail) if isinstance(a, jax.Array))
+
+
 class _BoundTail:
     """A jitted program with trailing operands bound (the placed door tables).
 
