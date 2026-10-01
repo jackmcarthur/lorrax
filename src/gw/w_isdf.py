@@ -256,6 +256,11 @@ def _chi_door_serves(mesh_xy, kgrid, ns) -> bool:
 _PHOTON_PASS_PLANS: dict = {}
 
 
+def photon_segments(plans):
+    """``((family pair index, pass), ...)``: the four-current stream's segments in stream order."""
+    return tuple((i, p) for i, plan in enumerate(plans) for p in range(len(plan.passes)))
+
+
 def _photon_pass_plans(mesh_xy, kgrid, families, half_plans, *, n_band, q_count, n_nodes):
     """Per family pair, the four-current direct stream's row passes, node chunk and blocks.
 
@@ -1069,18 +1074,25 @@ def _get_chi_fractional_contour_kernel_face(
             photon_plans = _photon_pass_plans(
                 mesh_xy, grid, photon, half_plans, n_band=nb_full, q_count=len(selected_q),
                 n_nodes=minimax.RESPONSE_NODE_CAPACITY)
+            # A one-segment program (``stream_pass``) plans only its own pass's GEMMs.
+            segments = photon_segments(photon_plans)
+            if stream_pass is not None and not 0 <= int(stream_pass) < len(segments):
+                raise ValueError(f"GATE response_stream_pass: segment {stream_pass} of "
+                                 f"{len(segments)} four-current row passes")
+            wanted = None if stream_pass is None else segments[int(stream_pass)]
             photon_gemms = tuple(
                 tuple(gemm_plan(mesh_xy, m=px * xr * 2, k=nb_full,
                                 n=photon.packed_layout.carrier_extent(family_channels(R)[0]) * 2,
                                 nq=nk_shape, dtype=jnp.complex128, layout="axis",
                                 enable_active_range=band_ranges is not None)
-                      for _, xr in plan.passes)
-                for (_, R), plan in zip(FAMILY_PAIRS, photon_plans))
+                      if wanted is None or wanted == (i_pair, p) else None
+                      for p, (_, xr) in enumerate(plan.passes))
+                for i_pair, ((_, R), plan) in enumerate(zip(FAMILY_PAIRS, photon_plans)))
             photon_active = tuple(
                 tuple((tuple(g.prepare_active_range(*bounds) for bounds in band_ranges)
-                       if band_ranges is not None else (None, None)) for g in gemms)
+                       if band_ranges is not None and g is not None else (None, None)) for g in gemms)
                 for gemms in photon_gemms)
-            if jax.process_index() == 0:
+            if jax.process_index() == 0 and stream_pass is None:
                 print("Response four-current direct stream: row passes (CC, CT, TC, TT) "
                       f"{tuple(len(plan.passes) for plan in photon_plans)} of "
                       f"{tuple(max(xr for _, xr in plan.passes) for plan in photon_plans)} "
@@ -1124,8 +1136,8 @@ def _get_chi_fractional_contour_kernel_face(
                   "per accumulate", flush=True)
     elif door_serves:
         chi_door, chi_tables = _charge_stream_door(mesh_xy, grid, k_unfold_plan)
-    if stream_pass is not None and (subtile is None or not bank_carry
-                                    or not 0 <= int(stream_pass) < len(subtile.passes)):
+    if stream_pass is not None and not bank_carry or stream_pass is not None and photon is None and (
+            subtile is None or not 0 <= int(stream_pass) < len(subtile.passes)):
         raise ValueError(f"GATE response_stream_pass: pass {stream_pass} needs the direct bank "
                          "carry on the row-pass engine (mathdx mode 11 from raw parents)")
     # Trailing operands bound to the program (``_BoundTail``): the door tables.
@@ -1355,6 +1367,11 @@ def _get_chi_fractional_contour_kernel_face(
             count = live_count()
             for i_pair, (pair, plan) in enumerate(zip(FAMILY_PAIRS, photon_plans)):
                 L, R = pair
+                only = None
+                if stream_pass is not None:
+                    only_pair, only = photon_segments(photon_plans)[int(stream_pass)]
+                    if only_pair != i_pair:
+                        continue
                 keys = photon_doors[(pair, (0, 0), plan.passes[0])][1]
                 right_extent = photon.packed_layout.carrier_extent(keys[0][1])
 
@@ -1389,7 +1406,7 @@ def _get_chi_fractional_contour_kernel_face(
                             jnp.take(value, jnp.asarray(reverse_q), axis=0))))
                     return jax.lax.with_sharding_constraint(jnp.stack(planes), plane_shard)
                 carry = stream_passes(carry, mesh=mesh_xy, plan=plan, weights=projection_rows,
-                                      count=count, node_rows=node_rows)
+                                      count=count, node_rows=node_rows, only=only)
             return carry
 
         def photon_order(value):
@@ -1637,7 +1654,10 @@ def _get_chi_fractional_contour_kernel_face(
             )
             return updated, None
 
-        if pair_mode == "direct" and photon is not None:
+        if pair_mode == "direct" and photon is not None and stream_pass is not None:
+            # One segment of the packed carry; the streamed bank reorders on read.
+            final_R = photon_subtiles(initial)
+        elif pair_mode == "direct" and photon is not None:
             # The four-current stream adds each node's planes into the carry in
             # the families' packed layout; the carry crosses layouts once per call.
             from .photon_layout import photon_carry_order

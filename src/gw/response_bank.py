@@ -398,8 +398,8 @@ def response_stream(wfns, meta, *, mesh_xy, q_ids, n_outputs,
     ``[len(q_ids), n_outputs, mu_p, mu_p]`` with both endpoints sharded.
     ``ordered`` (time reversal measured broken) returns the physical
     orientation ``chi_q = FT_q[chi]`` that Sigma's contraction assumes.
-    ``stream_pass`` runs one row pass of the charge direct stream into that
-    pass's carry (the streamed bank, :func:`integrate_response_group`).
+    ``stream_pass`` runs one segment of the direct stream's row-pass engine
+    into that segment's carry (the streamed bank, :func:`stream_segments`).
     """
     from ffi import ffi_dial_key
 
@@ -416,7 +416,8 @@ def response_stream(wfns, meta, *, mesh_xy, q_ids, n_outputs,
             (n_input, int(wfns.slices.nb_full), vertex.n, 4),
             _ffi_key=ffi_dial_key(), layout=wfns.layout, selected_q=tuple(q_ids), pair_mode=pair_mode,
             bank_carry=bank_carry, ordered=True, vertex=vertex.families,
-            band_ranges=band_ranges if pair_mode == "direct" else None)
+            band_ranges=band_ranges if pair_mode == "direct" else None,
+            **({} if stream_pass is None else dict(stream_pass=int(stream_pass))))
         return kernel, vertex.fixed
     if not charge_representation(meta):
         raise ValueError("GATE response_representation: want an authenticated "
@@ -1321,7 +1322,7 @@ def _group_stream_arguments(rules, group):
     return times, weights
 
 
-@lru_cache(maxsize=16)
+@lru_cache(maxsize=64)
 def _group_zeros(mesh_xy, shape):
     """The donated group carry [member, q, mu_X, nu_Y], one program per shape."""
     return jax.jit(lambda: jnp.zeros(shape, jnp.complex128),
@@ -1345,12 +1346,12 @@ def integrate_response_group(wfns, meta, mesh_xy, rules, group, *, q_ids,
     scratch = _stream_scratch(wfns, meta, mesh_xy, vertex)
     receipt["correlation_count"] += int(group["count"])
     if bank is not None:
-        px = int(mesh_xy.shape["x"])
-        for p, (_, xr) in enumerate(bank.passes):
+        px, py = int(mesh_xy.shape["x"]), int(mesh_xy.shape["y"])
+        for p, (rows, cols) in enumerate(bank.shapes):
             kernel, fixed = response_stream(wfns, meta, mesh_xy=mesh_xy, q_ids=q_ids,
                 n_outputs=weights.shape[1], pair_mode="direct", bank_carry=True, ordered=ordered,
-                band_ranges=rules["band_ranges"], stream_pass=p)
-            raw = _group_zeros(mesh_xy, (weights.shape[1], len(q_ids), px * xr, n))()
+                vertex=vertex, band_ranges=rules["band_ranges"], stream_pass=p)
+            raw = _group_zeros(mesh_xy, (weights.shape[1], len(q_ids), px * rows, py * cols))()
             raw = execute(kernel, common + tuple(fixed) + tail + (raw,), "direct", runtime_bytes=scratch)
             bank.put(p, raw, outputs)
             del raw
@@ -1400,6 +1401,44 @@ def _direct_passes(wfns, meta, mesh_xy, q_count):
     return _direct_pass_plan(mesh_xy, kgrid, parent.plan, n_rmu=meta.mu_basis.n_packed, ns=ns,
                              n_band=int(wfns.slices.nb_full), q_count=q_count,
                              n_nodes=minimax.RESPONSE_NODE_CAPACITY)
+
+
+def stream_segments(wfns, meta, mesh_xy, q_count, vertex):
+    """The direct stream's segments on the row-pass engine, or ``None`` without the engine.
+
+    Returns ``(segments, tile, finish)``: per segment its local ``(rows, cols,
+    rects)`` (``gw.subtile_stream.segment_blocks``: a charge row pass, or one
+    family pair's row pass of the four-current stream), the local carry tile,
+    and the program taking an assembled carry to the bank's layout (the
+    four-current packed → canonical order; ``None`` for charge).
+    """
+    from .subtile_stream import segment_blocks
+    px, py = int(mesh_xy.shape["x"]), int(mesh_xy.shape["y"])
+    if vertex is None:
+        plan = _direct_passes(wfns, meta, mesh_xy, q_count)
+        if plan is None:
+            return None
+        n = int(meta.mu_basis.n_packed)
+        segments = tuple(segment_blocks(plan, p, n // py)[1:] for p in range(len(plan.passes)))
+        return segments, (n // px, n // py), None
+    import minimax
+    from .w_isdf import _photon_pass_plans, photon_segments
+    families = vertex.families
+    half_plans = tuple(plan.dirac_halves()[0] for plan in families.plans)
+    plans = _photon_pass_plans(mesh_xy, (meta.nkx, meta.nky, meta.nkz), families, half_plans,
+                               n_band=int(wfns.slices.nb_full), q_count=q_count,
+                               n_nodes=minimax.RESPONSE_NODE_CAPACITY)
+    segments = tuple(segment_blocks(plans[i], p, 0)[1:] for i, p in photon_segments(plans))
+    packed = int(families.packed_layout.packed_extent) // int(families.layout.mesh_side)
+    return segments, (packed, packed), _photon_canonical(families, mesh_xy)
+
+
+@lru_cache(maxsize=4)
+def _photon_canonical(families, mesh_xy):
+    """The packed → canonical photon order of a ``[n, q, N, N]`` carry (one program)."""
+    from .photon_layout import photon_carry_order
+    return jax.jit(lambda value: photon_carry_order(value, families, mesh_xy, to_packed=False),
+                   out_shardings=NamedSharding(mesh_xy, P(None, None, "x", "y")))
 
 
 def _stream_scratch(wfns, meta, mesh_xy, vertex):
@@ -1471,7 +1510,7 @@ def response_group_size(meta, mesh_xy, *, n_samples, carry_per_sample, stream_wo
     return size, fixed, device_room, int(device_budget_bytes()) - device_room
 
 
-def response_bank_residence(meta, *, passes, n_samples, carry_per_sample, group_size, host_reserved=0):
+def response_bank_residence(meta, *, segments, n_samples, carry_per_sample, group_size, host_reserved=0):
     """Where this map's χ bank (value and slope of every sample) lives.
 
     The rule of the shared-pole bank (``shared_pole_screening._bank_residence``):
@@ -1481,8 +1520,8 @@ def response_bank_residence(meta, *, passes, n_samples, carry_per_sample, group_
     (``file_io.streamed_bank``): to host memory when the bank takes at most
     half of this process's host budget beside ``host_reserved`` (a host-tier
     W bank), else to per-rank files.  A stream without the row-pass engine
-    (``passes`` ``None``: the photon stream, the full-k Green route) keeps
-    sample groups on the devices.  Every rank computes the same answer.
+    (``segments`` ``None``: the full-k Green route) keeps sample groups on
+    the devices.  Every rank computes the same answer.
     Returns ``(residence, receipt)``.
     """
     from common.gpu_utils import host_bytes_per_process
@@ -1490,7 +1529,7 @@ def response_bank_residence(meta, *, passes, n_samples, carry_per_sample, group_
     receipt = dict(bytes_per_rank=total, group_size=int(group_size))
     if int(group_size) >= int(n_samples):
         return "device", dict(receipt, reason="every sample fits one group on the devices")
-    if passes is None:
+    if segments is None:
         return "device", dict(receipt, reason="no row-pass engine on this stream; sample groups")
     receipt["half_host_budget_bytes_per_rank"] = int(host_bytes_per_process()) // 2 - int(host_reserved)
     if total <= receipt["half_host_budget_bytes_per_rank"]:
@@ -1607,9 +1646,9 @@ def produce_sample_bank(wfns, meta, config, *, mesh_xy, sym, sample_plan, bank_i
             mesh_xy=mesh_xy,n=n,photon=vertex is not None)
         support = response_support(wfns, meta, sample_plan, receipt, print_fn=print_fn)
         ledger.live_stages = ambient
-        passes = _direct_passes(wfns, meta, mesh_xy, len(response_rows)) if vertex is None else None
+        segments = stream_segments(wfns, meta, mesh_xy, len(response_rows), vertex)
         chosen = (0, 0) if selection is None else (selection_resident, selection_workspace)
-        if passes is not None and len(z)*carry_per_sample > ledger.room_bytes_per_rank(ambient):
+        if segments is not None and len(z)*carry_per_sample > ledger.room_bytes_per_rank(ambient):
             # Every sample's carry alone exceeds the room: no group of all of
             # them can fit, so the stream is not compiled whole to learn it.
             group_size = 0
@@ -1625,7 +1664,7 @@ def produce_sample_bank(wfns, meta, config, *, mesh_xy, sym, sample_plan, bank_i
         host_reserved = (bank_io["path"].payload_bytes_per_rank()
                          if getattr(bank_io["path"], "memory_kind", None) == "host" else 0)
         residence, residence_receipt = response_bank_residence(
-            meta, passes=passes, n_samples=len(z), carry_per_sample=carry_per_sample,
+            meta, segments=segments, n_samples=len(z), carry_per_sample=carry_per_sample,
             group_size=group_size, host_reserved=host_reserved)
         if residence == "device":
             # The chosen group's executable, checked before it runs
@@ -1642,9 +1681,9 @@ def produce_sample_bank(wfns, meta, config, *, mesh_xy, sym, sample_plan, bank_i
                     compiled=whole if group_size == len(z) else None,
                     fixed=fixed, per_unit=carry_per_sample, room=room,
                     extra=lambda g, _: g*carry_per_sample + scratch)
-            if check.chunk < len(z) and passes is not None:
+            if check.chunk < len(z) and segments is not None:
                 residence, residence_receipt = response_bank_residence(
-                    meta, passes=passes, n_samples=len(z), carry_per_sample=carry_per_sample,
+                    meta, segments=segments, n_samples=len(z), carry_per_sample=carry_per_sample,
                     group_size=check.chunk, host_reserved=host_reserved)
         if residence == "device":
             group_size = check.chunk
@@ -1668,11 +1707,11 @@ def produce_sample_bank(wfns, meta, config, *, mesh_xy, sym, sample_plan, bank_i
             from file_io.streamed_bank import IN_FLIGHT, StreamedBank
             # Slots: the largest rule group's members (empty slots add zeros nobody reads).
             rules["slots"] = max(len(g["members"]) for g in rules["groups"])
-            py = int(mesh_xy.shape["y"])
-            pass_carry = 2*rules["slots"]*len(response_rows)*max(xr for _, xr in passes.passes)*(n//py)*16
+            pass_carry = 2*rules["slots"]*len(response_rows)*16*max(r*c for r, c, _ in segments[0])
             stream_bank = StreamedBank(mesh_xy, root=bank_io["root"], label="chi",
-                kind=residence, n_out=2*len(z), q=len(response_rows), passes=passes.passes,
-                cols=n//py)
+                kind=residence, n_out=2*len(z), q=len(response_rows), segments=segments[0],
+                tile=segments[1])
+            finish = segments[2]
             receipt["bank_residence"].update(stream_bank.receipt(),
                 device_bytes_per_rank=max(IN_FLIGHT*pass_carry, 3*carry_per_sample))
     # The group accumulator is all-P sharded. Dense work and slab I/O batch
@@ -1770,7 +1809,8 @@ def produce_sample_bank(wfns, meta, config, *, mesh_xy, sym, sample_plan, bank_i
             with timing.section('bank.stream_commit'):
                 stream_bank.commit()
             raw_group = stream_bank.reader([(2*sample, 2*sample+2) for _, sample in fresh])
-            take = lambda row: next(raw_group)
+            take = ((lambda row: next(raw_group)) if finish is None
+                    else (lambda row: finish(next(raw_group))))
         io_started = time.monotonic()
         # One collective writer transaction per group, not per sample.
         with shared_pole_bank_writer(bank_io["path"], meta=meta,

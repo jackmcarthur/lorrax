@@ -14,11 +14,14 @@ every rank calls at the same point, so a failure on one rank is raised on all
 of them (INVARIANTS 21).  Nothing that depends on a rank's filesystem decides
 whether a collective runs.
 
-**Layout (per device).**  A record is the pass ``p`` tile ``[q, rows_p,
-cols]`` of output ``o``, ``16·q·rows_p·cols`` bytes padded to 4 KiB.  Records
-are output-major, at ``o·S + start_p`` with ``S = Σ_p padded_p``, so one
-consumer's read of outputs ``[o0, o1)`` is the one contiguous run
-``[o0·S, o1·S)``.
+**Layout (per device).**  A record is segment ``s``'s local tile ``[q, rows_s,
+cols_s]`` of output ``o`` (a row pass of the charge stream, or one family
+pair's row pass of the four-current stream with its channel blocks packed;
+``gw.subtile_stream.segment_blocks``), ``16·q·rows_s·cols_s`` bytes padded to
+4 KiB.  Records are output-major, at ``o·S + start_s`` with ``S = Σ_s
+padded_s``, so one consumer's read of outputs ``[o0, o1)`` is the one
+contiguous run ``[o0·S, o1·S)``; each segment's rectangles go back to their
+places in the local carry tile on the device.
 
 **Write.**  One program per pass shape packs the pass carry into padded
 records and lands them in pinned host memory (4 KiB aligned, so the numpy
@@ -98,20 +101,24 @@ def _pack(mesh, shape, record16):
 
 
 @lru_cache(maxsize=None)
-def _unpack(mesh, n_out, q, rows, cols, records16):
-    """Records ``(px, py, n_out·S16)`` → ``[n_out, q, px·Σrows, py·cols]`` at
-    ``P(None, None, 'x', 'y')`` and the record digests ``(px, py, n_out, n_pass)``."""
+def _unpack(mesh, n_out, q, shapes, rects, tile, records16):
+    """Records ``(px, py, n_out·S16)`` → the tile ``[n_out, q, px·tile_r, py·tile_c]`` at
+    ``P(None, None, 'x', 'y')`` (zero outside every rectangle) and the record digests
+    ``(px, py, n_out, n_segment)``."""
     starts = np.concatenate([[0], np.cumsum(records16)[:-1]]).astype(int)
     total = int(sum(records16))
 
     def local(flat):
         flat = flat.reshape(n_out, total)
-        parts, digests = [], []
-        for start, xr in zip(starts, rows):
-            record = flat[:, start:start + q * xr * cols]
+        out = jnp.zeros((n_out, q) + tuple(tile), flat.dtype)
+        digests = []
+        for start, (rows, cols), places in zip(starts, shapes, rects):
+            record = flat[:, start:start + q * rows * cols]
             digests.append(_digest(record))
-            parts.append(record.reshape(n_out, q, xr, cols))
-        return jnp.concatenate(parts, axis=2), jnp.stack(digests, axis=-1)[None, None]
+            record = record.reshape(n_out, q, rows, cols)
+            for r0, c0, R0, C0, nr, nc in places:
+                out = out.at[:, :, R0:R0 + nr, C0:C0 + nc].set(record[:, :, r0:r0 + nr, c0:c0 + nc])
+        return out, jnp.stack(digests, axis=-1)[None, None]
     body = jax.shard_map(local, mesh=mesh, in_specs=P("x", "y", None),
                          out_specs=(P(None, None, "x", "y"), P("x", "y", None, None)),
                          check_vma=False)
@@ -199,24 +206,25 @@ class _Store:
 
 
 class StreamedBank:
-    """``n_out`` outputs of a ``[q, rows, cols]``-per-device operator, stored per device.
+    """``n_out`` outputs of a ``[q, tile_r, tile_c]``-per-device operator, stored per device.
 
-    ``passes`` are the row passes ``((x0, xr), ...)`` of every X shard's local
-    rows (``gw.subtile_stream.PassPlan.passes``) and ``cols`` the local
-    columns.  :meth:`put` takes one pass's carry for some outputs,
+    ``segments`` are ``((rows, cols, rects), ...)``: each segment's local shape
+    and the rectangles ``(r0, c0, R0, C0, nr, nc)`` that place it in the local
+    ``tile`` (``gw.subtile_stream.segment_blocks``).  :meth:`put` takes one segment's carry for some outputs,
     :meth:`commit` makes every put durable, and :meth:`reader` returns the
     outputs back as ``[o1-o0, q, rows_X, cols_Y]`` arrays.  Every rank calls
     every method in the same order.
     """
 
-    def __init__(self, mesh, *, root, label, kind, n_out, q, passes, cols):
+    def __init__(self, mesh, *, root, label, kind, n_out, q, segments, tile):
         if kind not in ("host", "file"):
             raise ValueError(f"GATE streamed_bank: kind {kind!r}; want 'host' or 'file'")
         self.mesh, self.kind, self.label = mesh, kind, str(label)
-        self.n_out, self.q, self.cols = int(n_out), int(q), int(cols)
-        self.passes = tuple((int(x0), int(xr)) for x0, xr in passes)
-        self.rows = tuple(xr for _, xr in self.passes)
-        self.records = tuple(padded(16 * self.q * xr * self.cols) for xr in self.rows)
+        self.n_out, self.q = int(n_out), int(q)
+        self.shapes = tuple((int(r), int(c)) for r, c, _ in segments)
+        self.rects = tuple(tuple(tuple(int(v) for v in rect) for rect in places) for _, _, places in segments)
+        self.tile = tuple(int(v) for v in tile)
+        self.records = tuple(padded(16 * self.q * r * c) for r, c in self.shapes)
         self.starts = tuple(int(s) for s in np.concatenate([[0], np.cumsum(self.records)[:-1]]))
         self.S = int(sum(self.records))
         self.nbytes = self.n_out * self.S
@@ -227,8 +235,8 @@ class StreamedBank:
         self._cell = {(index[0].start or 0, index[1].start or 0): d for d, index in cells.items()}
         self.seconds = dict(write=0., read=0., wait=0.)
         self.bounced = 0
-        self.digests = {d: np.zeros((self.n_out, len(self.passes)), np.uint64) for d in self.devices}
-        self.written = np.zeros((self.n_out, len(self.passes)), bool)
+        self.digests = {d: np.zeros((self.n_out, len(self.shapes)), np.uint64) for d in self.devices}
+        self.written = np.zeros((self.n_out, len(self.shapes)), bool)
         self.stores, self._inflight, self._error = {}, deque(), None
         self._pool = ThreadPoolExecutor(IO_THREADS, thread_name_prefix="bank-io")
         self._drain = ThreadPoolExecutor(1, thread_name_prefix="bank-drain")
@@ -246,13 +254,13 @@ class StreamedBank:
         """Description of the tier: shapes (rank-identical) and this rank's file layout."""
         first = next(iter(self.stores.values()), None)
         return dict(tier=self.kind, bytes_per_rank=self.nbytes, outputs=self.n_out,
-                    passes=len(self.passes), record_bytes=list(self.records),
-                    layout="output-major [o][pass] records of [q, rows, cols], 4 KiB padded",
+                    segments=len(self.shapes), record_bytes=list(self.records),
+                    layout="output-major [o][segment] records of [q, rows, cols], 4 KiB padded",
                     lustre=None if first is None or self.kind == "host" else first.layout)
 
     # -- write -------------------------------------------------------------------------
     def put(self, p, carry, outputs):
-        """Store pass ``p`` of ``carry`` ``[n, q, px·rows_p, py·cols]``: carry row ``r``
+        """Store segment ``p`` of ``carry`` ``[n, q, px·rows_p, py·cols_p]``: carry row ``r``
         becomes bank output ``o`` for every ``(r, o)`` in ``outputs``.  Returns at once;
         an I/O failure is held for :meth:`commit`, never raised here."""
         outputs = tuple((int(r), int(o)) for r, o in outputs)
@@ -313,7 +321,7 @@ class StreamedBank:
     # -- read --------------------------------------------------------------------------
     def reader(self, spans):
         """Iterator over ``spans`` ``[(o0, o1), ...]``: each output run as one device array
-        ``[o1-o0, q, px·Σrows, py·cols]`` at ``P(None, None, 'x', 'y')``, read one ahead."""
+        ``[o1-o0, q, px·tile_r, py·tile_c]`` at ``P(None, None, 'x', 'y')``, read one ahead."""
         return _Reader(self, [(int(a), int(b)) for a, b in spans])
 
     def _load(self, o0, o1, staging):
@@ -393,7 +401,7 @@ class _Reader:
         self._next = self._submit(self.at)
         bank.seconds["wait"] += time.monotonic() - started
         agree_io_error(error, path=bank.dir, stage="streamed_bank.read")
-        value, digest = _unpack(bank.mesh, o1 - o0, bank.q, bank.rows, bank.cols,
+        value, digest = _unpack(bank.mesh, o1 - o0, bank.q, bank.shapes, bank.rects, bank.tile,
                                 tuple(r // 16 for r in bank.records))(flat)
         del flat
         try:
