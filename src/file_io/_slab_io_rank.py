@@ -32,6 +32,7 @@ import mmap
 import os
 import shutil
 import subprocess
+import threading
 import time
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
@@ -43,17 +44,28 @@ import jax.numpy as jnp
 import numpy as np
 from jax.sharding import NamedSharding, PartitionSpec as P
 
-from common.collectives import agree_io_error
+from common.collectives import agree_io_error, all_gather_processes
 
-ALIGN = 4096            # direct-I/O alignment of buffers, offsets and lengths
+# PIECE and IO_THREADS were measured on Perlmutter Lustre (4 x 4 MiB stripes):
+# 64 MiB calls from four threads reach 13-14 GB/s per rank; unpacked ~53 MB calls
+# from one thread drop to about 3 GB/s.
 PIECE = 64 << 20        # bytes per write/read call
-IO_THREADS = 4          # four reach 13-14 GB/s per rank on a 4-stripe Lustre file
+IO_THREADS = 4
 IN_FLIGHT = 2           # segment carries alive (one computing, one draining)
 PIECES_IN_FLIGHT = 4    # pieces staged per rank before the next is moved
 
 
-def padded(nbytes: int) -> int:
-    return -(-int(nbytes) // ALIGN) * ALIGN
+def padded(nbytes: int, align: int) -> int:
+    return -(-int(nbytes) // int(align)) * int(align)
+
+
+def _alignment(directory):
+    """Direct-I/O alignment here: the larger of the page size and the filesystem block."""
+    page = os.sysconf("SC_PAGE_SIZE") if hasattr(os, "sysconf") else 4096
+    try:
+        return max(int(page), int(os.statvfs(directory).f_bsize))
+    except OSError:
+        return int(page)
 
 
 def _digest(flat):
@@ -114,7 +126,7 @@ def _unpack(mesh, n_out, q, shapes, rects, tile, records16):
 
 def _aligned(nbytes):
     flags = mmap.MAP_PRIVATE | mmap.MAP_ANONYMOUS | getattr(mmap, "MAP_POPULATE", 0)
-    return mmap.mmap(-1, max(int(nbytes), ALIGN), flags=flags)
+    return mmap.mmap(-1, max(int(nbytes), mmap.PAGESIZE), flags=flags)
 
 
 def _reserve(fd, nbytes):
@@ -132,10 +144,15 @@ def _reserve(fd, nbytes):
 
 
 class _Store:
-    """One device's records: a file (direct I/O where accepted) or a host buffer."""
+    """One device's records: a file (direct I/O where accepted) or a host buffer.
+
+    A direct-I/O call the filesystem rejects (EINVAL) moves this file to plain
+    buffered I/O for every later call; the bytes and offsets are unchanged.
+    """
 
     def __init__(self, path, nbytes, kind):
         self.path, self.fd, self.host, self.direct = Path(path), None, None, False
+        self._lock = threading.Lock()
         if kind == "host":
             self.host = _aligned(nbytes)
             self.view = np.frombuffer(self.host, dtype=np.uint8)
@@ -143,8 +160,11 @@ class _Store:
         if os.path.lexists(self.path):
             os.unlink(self.path)
         if shutil.which("lfs"):
-            subprocess.run(["lfs", "setstripe", "-c", "4", "-S", "4M", str(self.path)],
-                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+            done = subprocess.run(["lfs", "setstripe", "-c", "4", "-S", "4M", str(self.path)],
+                                  stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, check=False)
+            if done.returncode:
+                print(f"[slab_io] lfs setstripe failed for {self.path} (rc {done.returncode}): "
+                      f"{done.stderr.decode(errors='replace').strip()[:200]}; default layout", flush=True)
         flags = os.O_RDWR | os.O_CREAT
         try:
             self.fd = os.open(self.path, flags | os.O_DIRECT, 0o600)
@@ -157,23 +177,44 @@ class _Store:
             self.close()
             raise
 
+    def _buffered(self, fd):
+        """After a rejected direct call on ``fd``: the buffered descriptor every later call uses."""
+        with self._lock:
+            if self.direct and fd == self.fd:
+                os.fsync(self.fd)
+                buffered = os.open(self.path, os.O_RDWR)
+                os.close(self.fd)
+                self.fd, self.direct = buffered, False
+            return self.fd
+
+    def _call(self, op):
+        fd = self.fd
+        try:
+            return op(fd)
+        except OSError as exc:
+            if exc.errno != errno.EINVAL or not self.direct:
+                raise
+            return op(self._buffered(fd))
+
     def write(self, source, offset):
         if self.host is not None:
             np.copyto(self.view[offset:offset + len(source)], np.frombuffer(source, np.uint8))
             return
         done = 0
         while done < len(source):
-            done += os.pwrite(self.fd, source[done:], offset + done)
+            done += self._call(lambda fd: os.pwrite(fd, source[done:], offset + done))
+
+    def _read_once(self, fd, target, offset):
+        if hasattr(os, "preadv"):
+            return os.preadv(fd, [target], offset)
+        data = os.pread(fd, len(target), offset)
+        target[:len(data)] = data
+        return len(data)
 
     def read(self, target, offset):
         done = 0
         while done < len(target):
-            if hasattr(os, "preadv"):
-                got = os.preadv(self.fd, [target[done:]], offset + done)
-            else:
-                data = os.pread(self.fd, len(target) - done, offset + done)
-                got = len(data)
-                target[done:done + got] = data
+            got = self._call(lambda fd: self._read_once(fd, target[done:], offset + done))
             if got <= 0:
                 raise OSError(f"GATE streamed_bank: short read of {self.path} at {offset + done}")
             done += got
@@ -208,11 +249,16 @@ class StreamedBank:
         self.shapes = tuple((int(r), int(c)) for r, c, _ in segments)
         self.rects = tuple(tuple(tuple(int(v) for v in r) for r in places) for _, _, places in segments)
         self.tile = tuple(int(v) for v in tile)
-        self.records = tuple(padded(16 * self.q * r * c) for r, c in self.shapes)
+        self.dir = Path(root) / "streamed_bank"
+        # One alignment on every rank (the largest page or filesystem block), so the
+        # record offsets are the same everywhere.
+        local = _alignment(root) if kind == "file" else mmap.PAGESIZE
+        self.align = int(np.max(np.asarray(all_gather_processes(np.asarray(local, np.int64)))))
+        self.piece = padded(PIECE, self.align)
+        self.records = tuple(padded(16 * self.q * r * c, self.align) for r, c in self.shapes)
         self.starts = tuple(int(s) for s in np.cumsum((0,) + self.records[:-1]))
         self.S = int(sum(self.records))
         self.nbytes = self.n_out * self.S
-        self.dir = Path(root) / "streamed_bank"
         cells = NamedSharding(mesh, P("x", "y")).addressable_devices_indices_map(
             (int(mesh.shape["x"]), int(mesh.shape["y"])))
         self.devices = tuple(cells)
@@ -255,13 +301,13 @@ class StreamedBank:
     def _drain_segment(self, p, carry, digest, outputs):
         started = time.monotonic()
         length16 = self.q * self.shapes[p][0] * self.shapes[p][1]
-        step16, staged = PIECE // 16, deque()
+        step16, staged = self.piece // 16, deque()
 
         def land(host, o, a):
             for shard in host.addressable_shards:
                 store = self.stores[shard.device]
                 source = np.asarray(shard.data).reshape(-1).view(np.uint8)
-                if store.direct and source.ctypes.data % ALIGN:
+                if store.direct and source.ctypes.data % self.align:
                     aligned = _aligned(len(source))       # a sub-allocated host buffer
                     np.copyto(np.frombuffer(aligned, np.uint8, count=len(source)), source)
                     source = np.frombuffer(aligned, np.uint8, count=len(source))
@@ -271,7 +317,7 @@ class StreamedBank:
         for row, o in outputs:
             for a in range(0, length16, step16):
                 n16 = min(step16, length16 - a)
-                program = _piece(self.mesh, tuple(carry.shape), n16, padded(16 * n16) // 16)
+                program = _piece(self.mesh, tuple(carry.shape), n16, padded(16 * n16, self.align) // 16)
                 host = program(carry, np.int64(row), np.int64(a))
                 while len(staged) >= PIECES_IN_FLIGHT:
                     staged.popleft().result()
@@ -324,8 +370,8 @@ class StreamedBank:
             if staging.get(d) is None or len(staging[d]) < n:
                 staging[d] = _aligned(n)
             target = memoryview(staging[d])[:n]
-            for piece in [self._pool.submit(store.read, target[a:a + PIECE], o0 * self.S + a)
-                          for a in range(0, n, PIECE)]:
+            for piece in [self._pool.submit(store.read, target[a:a + self.piece], o0 * self.S + a)
+                          for a in range(0, n, self.piece)]:
                 piece.result()
             local[d] = np.frombuffer(staging[d], dtype=np.uint8, count=n)
         flat = jax.make_array_from_callback(
