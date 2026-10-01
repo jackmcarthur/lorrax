@@ -603,13 +603,78 @@ _HASH_BY_GENERATION: dict = {}
 
 
 def authenticate_coulomb(bank_io, qids):
-    """Authenticate bounded-read Coulomb resource against its fixed identity."""
+    """Authenticate the Coulomb resource against its fixed identity.
+
+    A file resource (the photon V) by its content hash; the scalar on-device
+    operator (``path`` None) by its live token and device digest.
+    """
     resource = bank_io["coulomb"]
     if resource["basis"] not in ("canonical", "photon") or not np.array_equal(
             resource["q_irr_full_idx"], qids):
         raise ValueError("GATE response_coulomb_identity: wrong basis/q order")
-    if resource_digest(resource["path"]) != resource["sha256"]:
+    if resource.get("path") is None:
+        values = _COULOMB_OPERATORS.get(resource.get("operator"))
+        if values is None or operator_digest(values, None) != resource["sha256"]:
+            raise ValueError("GATE response_coulomb_identity: the bare V operator is not "
+                             "held or its values differ")
+    elif resource_digest(resource["path"]) != resource["sha256"]:
         raise ValueError("GATE response_coulomb_identity: content hash differs")
+
+
+#: The one bare-V operator of this process, by token.  The strong reference
+#: keeps the token (an object id) unique for the operator's lifetime, which is
+#: the run's: every SC map screens with the same V_q.
+_COULOMB_OPERATORS: dict = {}
+_OPERATOR_DIGESTS: dict = {}
+
+
+def _operator_token(values):
+    """Process-local identity of the bare V operator, stable across SC maps.
+
+    :func:`_coulomb_batch` keys its held Coulomb roots on it, so a map that
+    names the same V again reuses the first map's roots.
+    """
+    token = f"V@{id(values):x}"
+    if _COULOMB_OPERATORS.get(token) is not values:
+        _COULOMB_OPERATORS.clear()
+        _OPERATOR_DIGESTS.clear()
+        _COULOMB_OPERATORS[token] = values
+    return token
+
+
+@lru_cache(maxsize=4)
+def _operator_digest_program(mesh_xy, shape):
+    """Σ bits·(2g+1) mod 2^64 over the real and imaginary words at global flat index g."""
+    from common.shard_map import shard_map
+    nq, n, m = shape
+    px, py = int(mesh_xy.shape["x"]), int(mesh_xy.shape["y"])
+
+    def local(v):
+        r0 = jax.lax.axis_index("x") * (n // px)
+        c0 = jax.lax.axis_index("y") * (m // py)
+        q = jnp.arange(v.shape[0], dtype=jnp.uint64)[:, None, None]
+        r = (r0 + jnp.arange(v.shape[1])).astype(jnp.uint64)[None, :, None]
+        c = (c0 + jnp.arange(v.shape[2])).astype(jnp.uint64)[None, None, :]
+        g = 2 * ((q * jnp.uint64(n) + r) * jnp.uint64(m) + c)
+        bits = jax.lax.bitcast_convert_type(jnp.stack([v.real, v.imag], -1), jnp.uint64)
+        total = jnp.sum(bits[..., 0] * (2 * g + 1) + bits[..., 1] * (2 * g + 3), dtype=jnp.uint64)
+        return jax.lax.psum(total, ("x", "y"))
+    return jax.jit(shard_map(local, mesh=mesh_xy, in_specs=P(None, "x", "y"), out_specs=P(),
+                             check_vma=False))
+
+
+def operator_digest(values, mesh_xy):
+    """A device digest of a face-tiled operator ``[nq, n, m]``: one 64-bit word per
+    value position, summed with its global index, the same at every P.  Kept per
+    operator object (the bare V is one object for the run)."""
+    hit = _OPERATOR_DIGESTS.get(id(values))
+    if hit is not None and hit[0] is values:
+        return hit[1]
+    mesh = values.sharding.mesh if mesh_xy is None else mesh_xy
+    word = int(np.asarray(_operator_digest_program(mesh, tuple(values.shape))(values)))
+    digest = hashlib.sha256(f"{tuple(values.shape)}:{word:016x}".encode()).hexdigest()
+    _OPERATOR_DIGESTS[id(values)] = (values, digest)
+    return digest
 
 
 def _reserve(meta, stage, resident, workspace=0):
@@ -786,22 +851,43 @@ def _span_rows(mesh_xy, a, b):
     return jax.jit(lambda x: x[a:b], out_shardings=NamedSharding(mesh_xy, P(None, "x", "y")))
 
 
+@lru_cache(maxsize=8)
+def _coulomb_canonical_pack(basis, mesh_xy, q0, q1):
+    """Parents [q0, q1) of the packed V through the canonical order and back (the
+    carrier's padding zeroed exactly as a canonical copy would hold it)."""
+    face = NamedSharding(mesh_xy, P(None, "x", "y"))
+    return jax.jit(lambda v: basis.pack_operator(basis.unpack_operator(v[q0:q1], spec=P(None, "x", "y")),
+                                                 spec=P(None, "x", "y")), out_shardings=face)
+
+
 def _coulomb_roots(meta, basis, resource, layout, mesh_xy, q_span, execute):
-    """Read the q span of V and return its PSD roots through the service plan."""
+    """The PSD roots of the q span of V through the service plan.
+
+    The scalar operator is held on the devices (``path`` None) and its parents
+    are taken from it; a file resource is read in its canonical order.
+    """
     from file_io.slab_io import SlabIO
     shape = (q_span[1]-q_span[0], basis.n_canonical, basis.n_canonical)
     spec = P(None, "x", "y")
-    abstract = jax.ShapeDtypeStruct(shape, jnp.complex128,
-                                   sharding=NamedSharding(mesh_xy, spec))
-    compiled = _compiled(_coulomb_pack(basis,mesh_xy), (abstract,))
-    memory = compiled.memory_analysis()
-    _reserve(meta, "coulomb_read_pack", memory.argument_size_in_bytes,
-             memory.output_size_in_bytes + memory.temp_size_in_bytes)
-    with SlabIO(resource["path"], mode="r", mesh=mesh_xy) as io:
-        canonical = io.read_slab(resource["dataset"], shape=shape,
-            offset=(q_span[0], 0, 0), partition_spec=spec)
-        v = compiled(canonical)
-    del canonical
+    if resource.get("path") is None:
+        values = _COULOMB_OPERATORS[resource["operator"]]
+        program = _coulomb_canonical_pack(basis, mesh_xy, int(q_span[0]), int(q_span[1]))
+        memory = _compiled(program, (values,)).memory_analysis()
+        _reserve(meta, "coulomb_read_pack", memory.argument_size_in_bytes,
+                 memory.output_size_in_bytes + memory.temp_size_in_bytes)
+        v = _compiled(program, (values,))(values)
+    else:
+        abstract = jax.ShapeDtypeStruct(shape, jnp.complex128,
+                                       sharding=NamedSharding(mesh_xy, spec))
+        compiled = _compiled(_coulomb_pack(basis,mesh_xy), (abstract,))
+        memory = compiled.memory_analysis()
+        _reserve(meta, "coulomb_read_pack", memory.argument_size_in_bytes,
+                 memory.output_size_in_bytes + memory.temp_size_in_bytes)
+        with SlabIO(resource["path"], mode="r", mesh=mesh_xy) as io:
+            canonical = io.read_slab(resource["dataset"], shape=shape,
+                offset=(q_span[0], 0, 0), partition_spec=spec)
+            v = compiled(canonical)
+        del canonical
     kernel = _coulomb_algebra(mesh_xy, basis.n_packed, basis.n_logical, layout)
     h, hi, negative, ranks = execute(kernel, (v,), "coulomb_sqrt")
     if bool(negative):
