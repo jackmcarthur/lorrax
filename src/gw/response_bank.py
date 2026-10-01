@@ -399,9 +399,16 @@ def photon_static_contact(wfns, meta, *, mesh_xy, layout, vertex,
     return pi_grid, drude, contact
 
 
-@lru_cache(maxsize=64)
+@lru_cache(maxsize=None)
 def _response_stream_kernel(mesh_xy, kgrid, n_outputs, shape, *, _ffi_key, **options):
-    """Cache programs, never state arrays; window data remain dynamic inputs."""
+    """Cache programs, never state arrays; window data remain dynamic inputs.
+
+    Unbounded: a map's stream programs are one fixed set (a program per row
+    pass of the streamed χ bank and of the moment stream, about 60 at 20³ P64),
+    met again at every SC map, and their executables stay in ``_COMPILED`` for
+    the run anyway.  A bounded cache smaller than the set rebuilt every factory
+    (0.4 s each at the P64-local shape) and re-lowered every program on every map.
+    """
     from .w_isdf import _get_chi_fractional_contour_kernel_face
     return _get_chi_fractional_contour_kernel_face(
         mesh_xy, kgrid, n_outputs, shape, **options)
