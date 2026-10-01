@@ -1124,6 +1124,55 @@ def _orphan_row_gauge(wfn, *, mesh, band_start: int,
     return out
 
 
+def little_group_band_representations(wfn, *, mesh, parent: int, band_start: int,
+                                     band_stop: int) -> list[tuple[int, np.ndarray, bool]]:
+    """``[(row, D, antiunitary)]`` of one raw parent's little group on bands ``[band_start, band_stop)``.
+
+    For every permitted operation row that maps the parent's k onto itself
+    (``WfnLoader.little_group_rows``, the identity included), ``D[m, n] =
+    ⟨ψ_m | R ψ_n⟩`` over the window, with ``R ψ`` from
+    ``WfnLoader.unfold_parent_by_row`` matched to the stored G order and
+    contracted by the band-overlap owner (:func:`_band_overlap_kernel`).
+    Refuses (GATE little_group_band_representation) when a ``D`` is not
+    unitary: the band window cuts a multiplet.
+    """
+    from jax.sharding import NamedSharding, PartitionSpec as P
+    from common.collectives import device_put_process_local
+    from wfn_loader import IBZRows
+
+    wfn.adopt_mesh(mesh)
+    sym = wfn.symmetry()
+    n_spatial = int(np.asarray(sym.sym_matrices).shape[0])
+    band_spec = P(None, ("x", "y"), None, None)
+    bands = (int(band_start), int(band_stop))
+    nb = bands[1] - bands[0]
+    p = int(parent)
+    psi = wfn.load(bands=bands, k=IBZRows((p,)), sharding=band_spec)
+    g_parent = np.asarray(wfn.gvecs(k=IBZRows((p,)))[0])
+    ngk = int(wfn.ngk_valid(k=IBZRows((p,)))[0])
+    out = []
+    for row in (int(r) for r in wfn.little_group_rows(p)):
+        child, g_child = wfn.unfold_parent_by_row(psi, parent=p, row=row)
+        padded = g_parent.copy()
+        padded[:ngk] = g_child
+        perm = _stored_g_order(g_parent, padded, ngk, row=p)
+        on = child.sharding.mesh
+        perm = device_put_process_local(perm, NamedSharding(on, P()))
+        D = np.asarray(_band_overlap_kernel(on)(psi, child, perm).addressable_data(0))[:nb, :nb]
+        del child
+        err = float(np.max(np.abs(D.conj().T @ D - np.eye(nb))))
+        if not err <= ORPHAN_GAUGE_UNITARITY_TOL:
+            raise ValueError(
+                "GATE little_group_band_representation: parent "
+                f"{p}, operation row {row}: the overlap of bands "
+                f"[{bands[0]},{bands[1]}) with their image is not unitary "
+                f"(max|DᴴD − 1| = {err:.2e} > {ORPHAN_GAUGE_UNITARITY_TOL:.0e}): "
+                "the band window cuts a multiplet.")
+        out.append((row, D, row >= n_spatial))
+    del psi
+    return out
+
+
 def _stored_g_order(g_stored, g_child, ngk, *, row) -> np.ndarray:
     """``perm`` with ``g_child[perm[i]] == g_stored[i]`` for ``i < ngk``.
 
