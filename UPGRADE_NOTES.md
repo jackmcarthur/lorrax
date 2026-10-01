@@ -3,6 +3,27 @@
 User-visible changes, newest first. Binding rulings behind the breaking
 changes live in `docs/architecture/decisions.md`.
 
+## 2026-09-30 — the four-current response compiles without baked symmetry tables
+
+The bispinor four-current χ₀ (mathdx mode 11) now reads its unfold load
+tables as device operands. Each door used to bake its plan's global tables
+into the program as constants. Each distinct table array is placed once per
+run (stage `response.door_tables`), and every q batch and SC map reads it.
+No kernel or bundle change.
+
+Fe 20³ P36-local AOT (M_T 900, 2 row passes per family pair, cold cache, 4 ranks per node):
+
+| | before | after |
+|---|---|---|
+| compile per rank | 136.7 s | 5.7 s |
+| host max RSS per rank | 48.1 GB | 3.1 GB |
+| node host peak | 175 of 251 GiB | 42 GiB |
+| device args / temp / code | 24.63 / 40.03 GB / 644 MB | 25.44 / 39.80 GB / 0.45 MB |
+
+What moves: nothing. Fe 4³ bispinor SP-full SC is bitwise, and its warm
+per-map W response wall is unchanged. Two concurrent compiles at M_T 1800 no
+longer run the host out of memory on table copies.
+
 ## 2026-09-30 — streamed loops take a fixed 1 GiB tile; `device_room_bytes` is gone
 
 Every planner that streams over k, q, bands, centroids, samples or rows now
