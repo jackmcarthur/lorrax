@@ -44,6 +44,20 @@ sample group (`response_bank.response_group_size`, the capacity ledger; a
 larger group buys more than 10 % per map) and the Galerkin whole-state
 planner (`isdf.galerkin`, whose capacity also bounds its resident rows).
 
+**The χ bank streams instead of splitting into sample groups.** When every
+sample's χ carry does not fit one group on the devices and the stream runs on
+the row-pass engine (`gw.subtile_stream`; charge and four-current), the
+stream runs once with every sample, one program per segment (a row pass, or
+one family pair's row pass), and each finished segment goes to SlabIO's
+per-rank streamed tier (`file_io.slab_io.StreamedBank`;
+`response_bank.response_bank_residence`, the shared-pole bank's device /
+host / file rule): host memory when it takes at most half the host budget,
+else one O_DIRECT file per rank. The devices hold two segment carries, then
+three sample reads; the host stages at most four 64 MiB pinned pieces per
+rank. Measured on one node at the P64-local volume (75.6 GB per rank,
+4-stripe files): 30 GB/s write, 25 GB/s read per node, every read
+digest-checked.
+
 A planner fills `target = budget × utilization`. Utilization defaults to
 0.90, 0.85 and 0.78 for `n_s` = 1, 2 and ≥4
 (`bfc_fragmentation_target_utilization`): a wider spinor axis makes one larger

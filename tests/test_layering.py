@@ -172,7 +172,7 @@ _L3_MODULES = frozenset({
     # them holds — process/device/file facts, the same ones
     # ``_slab_io_ffi`` is made of — so it sits beside it and not above it.
     "file_io.slab_io", "file_io._slab_io_ffi",
-    "file_io.commit_state", "file_io._slab_io_serial",
+    "file_io.commit_state", "file_io._slab_io_serial", "file_io._slab_io_rank",
     "file_io.paths", "file_io.hdf5_owner", "file_io.h5_journal",
     "file_io.io_timing",
 })
