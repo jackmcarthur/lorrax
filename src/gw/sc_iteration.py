@@ -3667,11 +3667,12 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
         inputs.meta.shared_pole_response_rules = (
             None if inputs.fixed_quadrature_session is None else
             inputs.fixed_quadrature_session.setdefault("chi", {}))
-        # Map 1 records the model's Kmax and later maps keep at least it, so
-        # the store and its readers keep one column extent
-        # (shared_pole_store._k_extent); map 0 is the one-shot's exact Kmax.
+        # Map 0 records the model's Kmax with headroom and later maps keep at
+        # least it, so the store, its readers and the Sigma window runners
+        # keep one column extent (shared_pole_store._k_extent); the columns
+        # past a parent's K are zero factors.
         inputs.meta.shared_pole_k_capacity = (
-            None if inputs.fixed_quadrature_session is None or int(state.iteration) == 0
+            None if inputs.fixed_quadrature_session is None
             else inputs.fixed_quadrature_session.setdefault("shared_pole_k_capacity", {}))
         # The same for the CT round's retained CC/TT span widths
         # (shared_pole_sectors.cross_span_widths).

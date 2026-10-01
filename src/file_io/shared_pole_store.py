@@ -571,20 +571,24 @@ def finalize_shared_pole_model(path, *, meta, expected_identity, basis=None):
 #: that drift for several maps and pads less than the eighth-octave ladder it
 #: replaces (up to 12.5%).
 _K_HEADROOM = 0.03
+#: Headroom of the extent map 0 sets. The first QSGW update moves Kmax more
+#: than later maps do (Fe 4^3 charge 660 -> 682, +3.3%), so a 3% map-0
+#: extent recompiled every map-1 Sigma window runner (2 x 2.1 s per rank).
+_K_FIRST_HEADROOM = 0.125
 
 
 def _k_extent(meta, header, live, *, record):
     """The model's pole-column extent: the live Kmax, or the SC run's held one.
 
-    An SC map past map 0 binds ``meta.shared_pole_k_capacity`` (a dict the
-    quadrature session keeps). Map 1 sets the extent to its live Kmax plus
-    :data:`_K_HEADROOM`; later maps keep it while the live Kmax fits and grow
-    it (again with headroom) only when it does not, noting the growth in
-    ``held["_events"]`` for the SC log. So a drifting Kmax keeps one dataset
+    An SC map binds ``meta.shared_pole_k_capacity`` (a dict the quadrature
+    session keeps). Map 0 sets the extent to its live Kmax plus
+    :data:`_K_FIRST_HEADROOM`; later maps keep it while the live Kmax fits and
+    grow it (by :data:`_K_HEADROOM`) only when it does not, noting the growth
+    in ``held["_events"]`` for the SC log. So a drifting Kmax keeps one dataset
     shape and every store, read and Sigma program is reused (Fe 4^3 charge:
     746 -> 736 -> 734 recompiled finalize, SlabIO and census programs at map
     2). Columns past each parent's K are zero factors and unit poles, as
-    before. No binding (a one-shot, map 0): the live Kmax.
+    before. No binding (a one-shot): the live Kmax.
     """
     held = getattr(meta, "shared_pole_k_capacity", None)
     if held is None:
@@ -596,7 +600,7 @@ def _k_extent(meta, header, live, *, record):
         return before
     if not record:
         return int(live)
-    extent = int(np.ceil(int(live) * (1.0 + _K_HEADROOM)))
+    extent = int(np.ceil(int(live) * (1.0 + (_K_HEADROOM if before else _K_FIRST_HEADROOM))))
     if before:
         held.setdefault("_events", []).append(
             f"shared-pole K extent ({key}): live Kmax {int(live)} exceeds the held "
@@ -609,10 +613,10 @@ def model_column_bound(meta, width):
     """An upper bound of the K extent finalization stores for a writer width.
 
     The SC run's held extent when the width fits it, else the width plus
-    :data:`_K_HEADROOM` (``_k_extent`` grows a held extent by that much).
+    :data:`_K_FIRST_HEADROOM` (the most ``_k_extent`` adds to a live Kmax).
     """
     return max(_k_extent(meta, dict(sector=None), int(width), record=False),
-               int(np.ceil(int(width) * (1.0 + _K_HEADROOM))))
+               int(np.ceil(int(width) * (1.0 + _K_FIRST_HEADROOM))))
 
 
 @lru_cache(maxsize=None)
