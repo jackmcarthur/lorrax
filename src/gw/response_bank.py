@@ -1788,6 +1788,55 @@ def _unitary_inversion(plan):
     return rows[0] if rows else None
 
 
+def _minus_q_mirror_photon(families, meta, mesh_xy):
+    """The four-current ``chi_{-q}`` rows from ``chi_q`` rows by a unitary inversion, or ``None``.
+
+    As :func:`_minus_q_mirror` on each Lorentz block, with the two families' plans on its endpoints and the inversion's
+    Lorentz action (``symmetry_maps.mix_lorentz_blocks``), one source block
+    at a time (``w_isdf.photon_blocks_full_q``'s restore), on the families'
+    packed layout (the plans' centroid order).
+    """
+    from symmetry_maps import bgw_integer_q_to_fractional, mix_lorentz_blocks, unfold_isdf_operator
+    from .photon_layout import _empty, _insert, photon_block_view, photon_carry_order
+    plans, layout = tuple(families.plans), families.packed_layout
+    rows = {_unitary_inversion(plan) for plan in plans}
+    if len(rows) != 1 or None in rows:
+        return None
+    inversion = rows.pop()
+    sym = plans[0].sym
+    kgrid = (int(meta.nkx), int(meta.nky), int(meta.nkz))
+    q_frac = np.asarray(bgw_integer_q_to_fractional(sym.q_irr_kgrid_int, kgrid))
+    classes = tuple(tuple((C, D) for C in ((1, 2, 3) if a else (0,))
+                          for D in ((1, 2, 3) if b else (0,))) for a in (0, 1) for b in (0, 1))
+
+    def mirror(rows, q0, q1):
+        n = int(q1) - int(q0)
+        irr, ops = np.arange(n, dtype=np.int32), np.full(n, inversion, dtype=np.int32)
+        # The plans act on each family's packed centroid order; the bank rows
+        # are canonical, so the rows cross to the packed layout and back.
+        rows = photon_carry_order(rows[None], families, mesh_xy, to_packed=True)[0]
+        out = _empty(n, layout, mesh_xy, rows.dtype)
+        for keys in classes:
+            left, right = plans[int(keys[0][0] != 0)], plans[int(keys[0][1] != 0)]
+            total = None
+            for C, D in keys:
+                source = unfold_isdf_operator(
+                    photon_block_view(rows, layout, C, D, mesh_xy), irr_idx=irr, sym_idx=ops,
+                    sym_perm=left.sym_perm, L_table=left.L_table,
+                    right_sym_perm=right.sym_perm, right_L_table=right.L_table,
+                    q_irr_frac=q_frac[q0:q1], mesh_xy=mesh_xy,
+                    n_sym_spatial=int(left.n_sym_spatial),
+                    axis_local_sym_perm=left.centroid_local_perm,
+                    right_axis_local_sym_perm=right.centroid_local_perm)
+                mixed = mix_lorentz_blocks({(C, D): source}, sym=sym, sym_idx=ops,
+                                           mesh_xy=mesh_xy, keys=keys)
+                total = mixed if total is None else {k: total[k] + mixed[k] for k in total}
+            for (C, D), block in total.items():
+                out = _insert(out, block, layout, C, D, mesh_xy)
+        return photon_carry_order(out[None], families, mesh_xy, to_packed=False)[0]
+    return mirror
+
+
 def _minus_q_mirror(plan, sym, meta, mesh_xy):
     """``chi_{-q}`` rows from ``chi_q`` rows by a unitary inversion, or ``None``.
 
@@ -1828,9 +1877,10 @@ class _MemberRows:
 
 
 #: Face-sized arrays one parent's partner unfold holds at once (the tile's
-#: gathered rows, the unfolded rows and their transient), the bound the
-#: partner tile is sized from.
-MIRROR_TILE_STACKS = 3
+#: gathered rows, their packed copy, the unfolded block, the mixed block and
+#: the output on the four-current route), the bound the partner tile is
+#: sized from.
+MIRROR_TILE_STACKS = 5
 
 
 def _dyson_phase(dyson, solve_slope, roots, held_roots, mesh_xy, layout, *, nq, n, extra=(),
@@ -1989,11 +2039,11 @@ def produce_sample_bank(wfns, meta, config, *, mesh_xy, sym, sample_plan, bank_i
         # A unitary operation that maps every q to -q (inversion) gives the
         # partner rows from the parent rows on load (TASTE 97), so the stream
         # carries no -q rows; otherwise they are streamed.
-        # The four-current route keeps streaming its -q rows: its inputs'
-        # inversion residual (<= 2e-5 relative per Lorentz block on Fe 4^3)
-        # moves eqp by up to 5.4 meV through the line selection.
-        mirror = (_minus_q_mirror(wfns.green_parent.plan, sym, meta, mesh_xy)
-                  if partnered and vertex is None and wfns.green_parent is not None else None)
+        mirror = None
+        if partnered and vertex is not None:
+            mirror = _minus_q_mirror_photon(vertex.families, meta, mesh_xy)
+        elif partnered and wfns.green_parent is not None:
+            mirror = _minus_q_mirror(wfns.green_parent.plan, sym, meta, mesh_xy)
         if mirror is not None:
             receipt["minus_q_partner"]["green_stream"] = (
                 "parent q rows only; -q rows by the unitary inversion's unfold of the parent rows")
