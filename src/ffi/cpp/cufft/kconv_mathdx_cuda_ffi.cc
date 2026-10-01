@@ -1363,53 +1363,46 @@ extern "C" __global__ void __launch_bounds__(LRX_THREADS) lrx_kconv(LorArgs a, U
     }
 }
 #else
-constexpr int TY = LRX_TY;                     // pair instances per group-pencil block
-
-struct LorCols {
-    __device__ long long col(long long inst, int member) const { return inst * SS + member; }
-};
-
-struct LorMid {                                // the vertex sum; V staged per (kx, instance)
-    static constexpr int kAux = 16;            // na * nb <= 16
-    const LorArgs* a;
+// Split arm, phase 1 (the vertex pencil, kbox_stage.cuh pencil_group_warp_pass with a pair's SS
+// columns on one warp): a member's vertex sum from the group's values and V, in the staged
+// pencil's order (bitwise), V read through L1; the R-space line goes back to y.
+struct LorWarpMid {                            // held by value: a store through y must not reload them
+    lrx_c2* y;
+    const lrx_c2 *kern, *yw;
+    long long ncols, npairs, p0, mx, my;
     LorentzTab v;
-    __device__ void stage_aux(lrx_c2* saux, long long p, long long inst0, int ld) const {
-        const int ne = v.na * v.nb;
-        for (int i = threadIdx.x; i < NX * 16 * TY; i += blockDim.x) {
-            const int e = i % 16, t = (i / 16) % TY, kx = i / (16 * TY);
-            if (e >= ne) continue;
-            long long inst = inst0 + t;
-            if (inst >= a->npairs) inst = inst0;
-            const long long k = (long long)kx * NY * NZ + p;
+    LorMember mem;
+    template <class Get>
+    __device__ lrx_c2 value(int k, long long inst, int, const Get& get) const {
 #if LRX_WA > 0
-            lrx_kbox::cp_async<16>(saux + (kx * TY + t) * ld + e, a->yw + (k * a->npairs + inst) * WS + e);
+        const lrx_c2* __restrict__ aux = yw + ((long long)k * npairs + inst) * WS;
 #else
-            const long long pr = a->p0 + inst, xx = pr / a->my, yy = pr - xx * a->my;
-            const int A = e / v.nb, B = e % v.nb;
-            lrx_kbox::cp_async<16>(saux + (kx * TY + t) * ld + e,
-                                   a->kern + (((k * a->mx + xx) * v.na + A) * a->my + yy) * v.nb + B);
+        const long long pr = p0 + inst, xx = pr / my, yy = pr - xx * my, sa = my * v.nb;   // sa: V's A stride
+        const lrx_c2* __restrict__ aux = kern + (((long long)k * mx + xx) * v.na * my + yy) * v.nb;
 #endif
-        }
-    }
-    struct F {
-        LorMember m;
-        double s_g;
-        __device__ lrx_c2 operator()(const lrx_c2* grp, const lrx_c2* aux) const {
-            lrx_c2 acc = {0.0, 0.0};
+        lrx_c2 acc = {0.0, 0.0};
 #pragma unroll
-            for (int e = 0; e < 16; ++e) {
-                if (e < m.ne) {
-                    const lrx_c2 z = grp[m.src[e] * TY];
-                    const lrx_c2 g = {__dmul_rn(z.x, s_g), __dmul_rn(z.y, s_g)};
-                    const lrx_c2 q = lrx_mul_xla(lrx_phase(g, m.code[e]), aux[e]);
-                    acc.x = __dadd_rn(acc.x, q.x);
-                    acc.y = __dadd_rn(acc.y, q.y);
-                }
+        for (int e = 0; e < 16; ++e) {
+            if (e < mem.ne) {                          // the same on every lane: get stays warp-wide
+                const lrx_c2 z = get(mem.src[e]);
+                const lrx_c2 g = {__dmul_rn(z.x, v.s_g), __dmul_rn(z.y, v.s_g)};
+#if LRX_WA > 0
+                const lrx_c2 ve = aux[e];
+#else
+                const lrx_c2 ve = aux[(e / v.nb) * sa + e % v.nb];
+#endif
+                const lrx_c2 q = lrx_mul_xla(lrx_phase(g, mem.code[e]), ve);
+                acc.x = __dadd_rn(acc.x, q.x);
+                acc.y = __dadd_rn(acc.y, q.y);
             }
-            return acc;
         }
-    };
-    __device__ F bind(int member) const { return F{lor_member(v, member), v.s_g}; }
+        return acc;
+    }
+    __device__ void finish(long long p, long long inst, int member, bool live, const lrx_c2 (&g)[NX]) const {
+        if (!live) return;
+#pragma unroll
+        for (int kx = 0; kx < NX; ++kx) y[((long long)kx * NY * NZ + p) * ncols + inst * SS + member] = g[kx];
+    }
 };
 
 struct LorYLoad {                              // the intermediate, staged by cp.async
@@ -1426,8 +1419,8 @@ struct LorWScale {                             // the chunk's W_R scale, as mode
 };
 #endif
 
-extern "C" __global__ void __launch_bounds__(256) lrx_kconv(LorArgs a, UnfoldTab t, LorentzTab v, int phase,
-                                                           UnfoldTab tw) {
+extern "C" __global__ void __launch_bounds__(LRX_THREADS) lrx_kconv(LorArgs a, UnfoldTab t, LorentzTab v, int phase,
+                                                                  UnfoldTab tw) {
     extern __shared__ lrx_c2 sm[];
     using namespace cufftdx;
     (void)tw;
@@ -1451,8 +1444,9 @@ extern "C" __global__ void __launch_bounds__(256) lrx_kconv(LorArgs a, UnfoldTab
     if (phase == 0) {
         lrx_kbox::plane_pass<NX, NY, NZ, LRX_SM, fft_direction::inverse, TRC>(sm, ncols, LorLoad{&a, &t}, yy);
     } else if (phase == 1) {
-        lrx_kbox::pencil_group_pass<NX, NY, NZ, LRX_SM, SS, TY, false>(
-            a.y, sm, ncols, a.npairs, LorCols{}, LorMid{&a, v}, yy);
+        const LorWarpMid mid{a.y, a.kern, a.yw, ncols, a.npairs, a.p0, a.mx, a.my, v,
+                             lor_member(v, (int)(threadIdx.x % SS))};
+        lrx_kbox::pencil_group_warp_pass<NX, NY, NZ, LRX_SM, SS, LRX_THREADS>(a.y, ncols, a.npairs, mid);
     } else if (phase == 2) {
         lrx_kbox::plane_pass<NX, NY, NZ, LRX_SM, fft_direction::forward, TRC>(sm, ncols, LorYLoad{a.y, ncols}, yy);
     } else {
@@ -1668,86 +1662,65 @@ struct ChiMid {
 };
 
 #if LRX_ARM == 1
-// Split arm, pencil pass (phase 1).  A pair's GRP columns are GRP consecutive lanes of one warp
-// (GRP | 32), so its transformed values meet by warp shuffles and nothing is staged in shared
-// memory.  Work item: one (ky, kz) plane point p and the block's LRX_THREADS / GRP consecutive pairs;
-// consecutive lanes read consecutive columns of y.  Each lane inverse-transforms its column's x-line
-// in registers; then, per kx, every lane of the pair reads the pair's GRP values (the shuffles are
-// warp-uniform) and forms the value lrx_chi_value / lrx_chi_vertex forms on the single arm, from the
-// same operands in the same order, into its own v[kx] (that slot is dead once read).  The plain pass
-// spreads the accumulation over the pair's lanes (lane m takes kx = m, m + GRP, ...); a vertex pass
-// accumulates channel vch0 + m on lane m (all kx).  Each lane issues its acc loads before its stores:
-// one lane updating 20 kx serially (the stores may alias the next load) was the pass's latency.
-static_assert(32 % GRP == 0, "a pair's columns share one warp");
-__device__ __forceinline__ lrx_c2 lrx_shfl(lrx_c2 v, int src) {
-    return {__shfl_sync(0xffffffffu, v.x, src), __shfl_sync(0xffffffffu, v.y, src)};
-}
-__device__ void chi_pencil_warp(const ChiArgs& a, long long ncols) {
-    using namespace cufftdx;
-    constexpr int CPB = LRX_THREADS / GRP;            // pairs per work item
-    constexpr long long PL = (long long)NY * NZ;
-    const int member = (int)(threadIdx.x % GRP), base = (int)(threadIdx.x & 31) - member;
-    const long long nit = (a.npairs + CPB - 1) / CPB;
-    for (long long w = blockIdx.x; w < PL * nit; w += gridDim.x) {
-        const long long p = w / nit, inst = (w % nit) * CPB + threadIdx.x / GRP;
-        const bool live = inst < a.npairs;
-        const long long col = inst * GRP + member, pr = a.p0 + inst;
-        lrx_c2 v[NX];
-#pragma unroll
-        for (int kx = 0; kx < NX; ++kx) {
-            if (live) v[kx] = a.y[((long long)kx * PL + p) * ncols + col];
-            else { v[kx].x = 0; v[kx].y = 0; }
-        }
-        if constexpr (NX > 1) lrx_kbox::line_fft<NX, LRX_SM, fft_direction::inverse>(v, 1);
+// Split arm, pencil pass (phase 1; kbox_stage.cuh pencil_group_warp_pass with a pair's GRP columns
+// on one warp).  Per kx every lane of the pair forms the value lrx_chi_value / lrx_chi_vertex forms on
+// the single arm, from the same operands in the same order.  The plain pass spreads the accumulation
+// over the pair's lanes (lane m takes kx = m, m + GRP, ...); a vertex pass accumulates channel
+// vch0 + m on lane m (all kx).  Each lane issues its acc loads before its stores: one lane updating
+// 20 kx serially (the stores may alias the next load) was the pass's latency.
+struct ChiWarpMid {
+    const ChiArgs* a;
+    int ch, chv;                                  // vertex pass: this lane's channel; chv < channels
+    template <class Get>
+    __device__ lrx_c2 value(int, long long, int, const Get& get) const {
 #if LRX_VTX
-        const int nch = a.vna * a.vnb, ch = a.vch0 + member;
-        const int chv = ch < nch ? ch : nch - 1;     // every lane shuffles; a lane past the channels discards
-#pragma unroll
-        for (int kx = 0; kx < NX; ++kx) {
-            const lrx_c2 own = v[kx];
-            v[kx] = lrx_chi_vertex([&](int q) { return lrx_shfl(own, base + q); }, a, chv);
-        }
-        if (!live || ch >= nch) continue;
+        return lrx_chi_vertex(get, *a, chv);      // a lane past the channels computes chv and discards
+#else
+        return lrx_chi_value(get, a->si);
+#endif
+    }
+    __device__ void finish(long long p, long long inst, int member, bool live, const lrx_c2 (&v)[NX]) const {
+        constexpr long long PL = (long long)NY * NZ;
+        const long long pr = a->p0 + inst;
+#if LRX_VTX
+        if (!live || ch >= a->vna * a->vnb) return;
         constexpr int CH = 4;                         // acc loads in flight per lane
-        for (int o = 0; o < a.n_out; ++o) {
-            lrx_c2* e = a.acc + ((long long)(ch * a.n_out + o) * NK + p) * a.pairs + pr;
+        for (int o = 0; o < a->n_out; ++o) {
+            lrx_c2* e = a->acc + ((long long)(ch * a->n_out + o) * NK + p) * a->pairs + pr;
 #pragma unroll
             for (int k0 = 0; k0 < NX; k0 += CH) {
                 lrx_c2 w4[CH];
 #pragma unroll
                 for (int i = 0; i < CH; ++i)
-                    if (k0 + i < NX) w4[i] = e[(long long)(k0 + i) * PL * a.pairs];
+                    if (k0 + i < NX) w4[i] = e[(long long)(k0 + i) * PL * a->pairs];
 #pragma unroll
                 for (int i = 0; i < CH; ++i)
-                    if (k0 + i < NX) { lrx_cmac(w4[i], a.alpha[o], v[k0 + i]); e[(long long)(k0 + i) * PL * a.pairs] = w4[i]; }
+                    if (k0 + i < NX) { lrx_cmac(w4[i], a->alpha[o], v[k0 + i]); e[(long long)(k0 + i) * PL * a->pairs] = w4[i]; }
             }
         }
 #else
         constexpr int J = (NX + GRP - 1) / GRP;       // kx rows per lane
         lrx_c2 mine[J];
 #pragma unroll
-        for (int kx = 0; kx < NX; ++kx) {
-            const lrx_c2 own = v[kx];
-            const lrx_c2 val = lrx_chi_value([&](int q) { return lrx_shfl(own, base + q); }, a.si);
-            if (kx % GRP == member) mine[kx / GRP] = val;
-        }
-        if (!live) continue;
-        for (int o = 0; o < a.n_out; ++o) {
-            lrx_c2* e = a.acc + ((long long)o * NK + p) * a.pairs + pr;
+        for (int kx = 0; kx < NX; ++kx)
+            if (kx % GRP == member) mine[kx / GRP] = v[kx];
+        if (!live) return;
+        for (int o = 0; o < a->n_out; ++o) {
+            lrx_c2* e = a->acc + ((long long)o * NK + p) * a->pairs + pr;
             lrx_c2 w3[J];
 #pragma unroll
             for (int j = 0; j < J; ++j)
-                if (member + j * GRP < NX) w3[j] = e[(long long)(member + j * GRP) * PL * a.pairs];
+                if (member + j * GRP < NX) w3[j] = e[(long long)(member + j * GRP) * PL * a->pairs];
 #pragma unroll
             for (int j = 0; j < J; ++j)
                 if (member + j * GRP < NX) {
-                    lrx_cmac(w3[j], a.alpha[o], mine[j]);
-                    e[(long long)(member + j * GRP) * PL * a.pairs] = w3[j];
+                    lrx_cmac(w3[j], a->alpha[o], mine[j]);
+                    e[(long long)(member + j * GRP) * PL * a->pairs] = w3[j];
                 }
         }
 #endif
     }
-}
+};
 #endif
 
 // LRX_MINB: blocks per SM the plan's shared memory admits (2 with the tile tables); the register
@@ -1802,7 +1775,9 @@ extern "C" __global__ void __launch_bounds__(LRX_THREADS, LRX_MINB) lrx_kconv(Ch
         lrx_kbox::plane_pass<NX, NY, NZ, LRX_SM, fft_direction::inverse, TRC>(
             sm, ncols, ld, lrx_kbox::Plain<lrx_c2>{a.y, ncols});
     } else {
-        chi_pencil_warp(a, ncols);
+        const int ch = a.vch0 + (int)(threadIdx.x % GRP), nch = a.vna * a.vnb;
+        lrx_kbox::pencil_group_warp_pass<NX, NY, NZ, LRX_SM, GRP, LRX_THREADS>(
+            a.y, ncols, a.npairs, ChiWarpMid{&a, ch, ch < nch ? ch : nch - 1});
     }
 #endif
 }
@@ -2203,19 +2178,14 @@ static ffi::Error build(int mode, int nkx, int nky, int nkz, int ns, bool f32,
                    2LL * ss * (2 * grp) * g.pr() * 16 <= smem_optin)
                 grp *= 2;
             kb_tr = ss * grp;
-            // The group pencil stages nkx * ty * (ss + 17) elements (the group's values and V); ty
-            // halves until the stage fits the opt-in memory.  At ty 128/ss = 32 the two-spinor doors
-            // (the sector Sigma's Dirac quarters) staged 172 KB at 16^3 and 215 KB at 20^3 and refused;
-            // the instances a block holds change no value.
-            auto pencil_stage = [&](int ty) {
-                return (static_cast<long long>(nkx) * ss * ty + static_cast<long long>(nkx) * ty * 17) * 16;
-            };
-            kb_ty = std::max(1, 128 / ss);
-            while (kb_ty > 1 && pencil_stage(kb_ty) > smem_optin) kb_ty /= 2;
+            // The vertex pencil holds a pair's ss columns on one warp and stages nothing (its block
+            // stage of nkx * ty * (ss + 17) elements refused the two-spinor Dirac-quarter doors at
+            // 16^3-20^3 and held 2-4 warps per SM where it fit).
+            kb_ty = kThreads / ss;                     // pairs per pencil block
             kb_threads = kThreads;
-            kb_threads2 = ss * kb_ty;
+            kb_threads2 = kThreads;
             kb_smem = static_cast<long long>(kb_tr) * g.pr() * 16;
-            kb_smem2 = pencil_stage(kb_ty);
+            kb_smem2 = 0;
             if (lor_ws > 0) {                          // the W_R chunk: plane tiles of whole Lorentz groups
                 int wgrp = 1;                          // (as the Green's plane tiles above)
                 while (static_cast<long long>(nky) * nkz * wgrp < kThreads &&

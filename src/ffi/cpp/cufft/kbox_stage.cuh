@@ -408,68 +408,46 @@ __device__ void pencil_pass(C* y, long long ncols, const Mid& mid) {
     pencil_pass<NX, NY, NZ, Arch, CONV, Dir>(y, ncols, mid, Plain<C>{y, ncols});
 }
 
-// Group pencil pass (a Mid that mixes GROUP columns, e.g. the Lorentz vertex sum over a spin
-// group): block work item (p = (ky,kz), TY consecutive group instances); thread (member, t).
-// Each thread loads and inverse-transforms its column's x-line into shared memory, then forms
-// its own member's output from the group's values at every kx, forward-transforms and stores.
-//   cols.col(inst, member)            the column of a member;
-//   Mid::kAux                         per-(k, instance) operand elements (the 16 V[k,x,A,y,B] of a
-//                                     Lorentz block), 0 for none;
-//   mid.stage_aux(saux, p, inst0, ld) block-cooperative cp.async of those operands for every kx
-//                                     into saux[(kx*TY + t)*ld + e] (the header commits and waits);
-//   mid.bind(member)                  a per-thread functor holding the member's vertex tables in
-//                                     registers; f(grp, aux) returns the member's value from the
-//                                     group's values grp[q*TY] (q < GROUP) and the operands aux[e].
-// Shared memory (the caller's dynamic smem): NX*GROUP*TY + NX*TY*(kAux|1) elements; the odd
-// operand stride keeps the TY instances of a warp on different banks.
-// kForward = false skips the forward x transform and hands the R-space value to
-// st.put(k, col, v) (k = kx*NY*NZ + p) instead of writing y: a pass that ends in R space
-// (mode 8's vertex pencil hands its R-space values to a plane pass).
-template <int NX, int NY, int NZ, int Arch, int GROUP, int TY, bool kForward, class C, class Cols, class Mid,
-          class Store>
-__device__ void pencil_group_pass(C* y, C* smem, long long ncols, long long n_inst, const Cols& cols,
-                                  const Mid& mid, const Store& st) {
-    constexpr int LD = Mid::kAux | 1;
-    C* sg = smem;
-    C* saux = smem + NX * GROUP * TY;
-    const int member = threadIdx.x / TY, t = threadIdx.x % TY;
-    const auto f = mid.bind(member);
-    const long long nit = (n_inst + TY - 1) / TY;
-    for (long long w = blockIdx.x; w < (long long)NY * NZ * nit; w += gridDim.x) {
-        const long long p = w / nit, inst0 = (w % nit) * TY, inst = inst0 + t;
+// Group pencil pass (a Mid that mixes GROUP columns, e.g. the Lorentz vertex sum over a spin group,
+// or a pair's trace): the group's GROUP columns are consecutive lanes of one warp (GROUP | 32), so
+// they meet by warp shuffles and nothing is staged.  Block work item: one (ky, kz) plane point p and
+// the block's NT / GROUP consecutive instances; lane (instance, member) reads its column's x-line
+// (consecutive lanes on consecutive columns of y), inverse-transforms it in registers, and per kx
+// sets v[kx] = mid.value(k, inst, member, get), get(q) being member q's value at that kx (every lane
+// calls it: the shuffles stay warp-wide; inst is clamped to a live instance).  Then
+// mid.finish(p, inst, member, live, v) stores the line.  A block-wide stage of the group's values
+// held one block of 2-8 warps per SM on 16^3-20^3 grids (sandbox claims 3077, 3080).
+template <int NX, int NY, int NZ, int Arch, int GROUP, int NT, class C, class Mid>
+__device__ void pencil_group_warp_pass(const C* y, long long ncols, long long n_inst, const Mid& mid) {
+    static_assert(32 % GROUP == 0 && NT % 32 == 0, "a group's columns share one warp");
+    constexpr int CPB = NT / GROUP;
+    constexpr long long PL = (long long)NY * NZ;
+    const int member = (int)(threadIdx.x % GROUP), base = (int)(threadIdx.x & 31) - member;
+    const long long nit = (n_inst + CPB - 1) / CPB;
+    for (long long w = blockIdx.x; w < PL * nit; w += gridDim.x) {
+        const long long p = w / nit, inst = (w % nit) * CPB + threadIdx.x / GROUP;
         const bool live = inst < n_inst;
-        const long long col = live ? cols.col(inst, member) : 0;
-        __syncthreads();                                  // the previous item's smem reads are done
-        if constexpr (Mid::kAux > 0) {
-            mid.stage_aux(saux, p, inst0, LD);
-            cp_async_commit();
-        }
+        const long long col = inst * GROUP + member;
         C v[NX];
 #pragma unroll
         for (int kx = 0; kx < NX; ++kx) {
-            if (live) v[kx] = y[((long long)kx * NY * NZ + p) * ncols + col];
+            if (live) v[kx] = y[((long long)kx * PL + p) * ncols + col];
             else { v[kx].x = 0; v[kx].y = 0; }
         }
         if constexpr (NX > 1) line_fft<NX, Arch, cufftdx::fft_direction::inverse>(v, 1);
 #pragma unroll
-        for (int kx = 0; kx < NX; ++kx) sg[(kx * GROUP + member) * TY + t] = v[kx];
-        if constexpr (Mid::kAux > 0) cp_async_wait_all();
-        __syncthreads();
-#pragma unroll
-        for (int kx = 0; kx < NX; ++kx) v[kx] = f(sg + kx * GROUP * TY + t, saux + (kx * TY + t) * LD);
-        if constexpr (kForward && NX > 1) line_fft<NX, Arch, cufftdx::fft_direction::forward>(v, 1);
-        if (live) {
-#pragma unroll
-            for (int kx = 0; kx < NX; ++kx) st.put(kx * NY * NZ + int(p), col, v[kx]);
+        for (int kx = 0; kx < NX; ++kx) {
+            const C own = v[kx];
+            const auto get = [&](int q) {
+                C r;
+                r.x = __shfl_sync(0xffffffffu, own.x, base + q);
+                r.y = __shfl_sync(0xffffffffu, own.y, base + q);
+                return r;
+            };
+            v[kx] = mid.value(int(kx * PL + p), live ? inst : 0, member, get);   // this kx's shuffles are done
         }
+        mid.finish(p, inst, member, live, v);
     }
-}
-
-// The in-place form: forward-transform and write back to y (the mode-8 vertex pencil).
-template <int NX, int NY, int NZ, int Arch, int GROUP, int TY, class C, class Cols, class Mid>
-__device__ void pencil_group_pass(C* y, C* smem, long long ncols, long long n_inst, const Cols& cols,
-                                  const Mid& mid) {
-    pencil_group_pass<NX, NY, NZ, Arch, GROUP, TY, true>(y, smem, ncols, n_inst, cols, mid, Plain<C>{y, ncols});
 }
 
 }  // namespace lrx_kbox
