@@ -305,9 +305,16 @@ def _sigma_subtile_kernel(*, mesh_xy, kgrid, brackets, face_shape, face_band_ext
     w_spec = P(None, "x", "y")
 
     def green(psi_p, cols, E, sel, E_min, E_max, ref, t, gemm, band_range):
-        """The parent Green on the pass's rows: identity masks or signed weights, no clipping."""
+        """The parent Green on the pass's rows: identity masks or signed weights, no clipping.
+
+        An antiunitary row reads the conjugate-face partner, built by its own
+        local GEMM at every node (``real_weights=False``): no device predicate
+        stops the node loop, and the partner is the one the face route's
+        single exchange formed.
+        """
         options = dict(e_ref=ref, layout="axis", gemm=gemm, k_unfold_plan=k_unfold_plan,
-                       band_range=band_range, trim_zero_bands=True, unfold=False)
+                       band_range=band_range, trim_zero_bands=True, unfold=False,
+                       real_weights=False)
         options["mask" if sel.dtype == jnp.bool_ else "band_weight"] = sel
         if energy_windows:
             options.update(E_min=E_min, E_max=E_max)
