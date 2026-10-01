@@ -1669,14 +1669,21 @@ def x_block_rows(rows) -> np.ndarray:
 #   conflict-free lines and 2 blocks/SM, Fe 8^3 1.68x (2943); mode 11 accumulating on every thread,
 #   1.44x (2789); x blocks instead of d x d spin blocks, mu3088 d=1 201.8 -> 58.5 s (2841); tile
 #   super-order, Fe 8^3 1.28x (2956, branch); mode 11 on the metal direct stream: the freed memory,
-#   not the kernel, cut Green pairs 344 -> 100 per Fe 8^3 map (2950).
+#   not the kernel, cut Green pairs 344 -> 100 per Fe 8^3 map (2950); mode 11's split arm (a pair
+#   above the opt-in memory, 20^3 ns 2) with a warp-shuffle pencil and 16 warps per SM, P64 tile
+#   316 -> 204 ms per tau node, bitwise (3077): both passes had held one block of 8 warps.
+# Residency: mode 8's split vertex pencil staged nkx*ty*(ns^2+17) elements at ty 128/ns^2 and
+#   refused the two-spinor Dirac quarters at >= 16^3; ty now comes from the opt-in budget (3080).
 # Did not pay: phase-balanced thread counts 1.014-1.029x (2827); cp.async double buffering -21%
 #   (2799); a staged load reading its tables per cell, 1.63x slower on mode 11, 1.10x on mode 7
 #   (2789); padded shared rows +7% on mode 11, +19% on mode 7 (2845); a per-member vertex Mid
 #   0.76-0.94x (2947); tile tables at n_s 2, CrI3 8x8 Sigma tau 5.58 -> 6.24 s (2799); small-grid
 #   butterflies, kernel -28%, tau sweep flat (2320); tau batching, Sigma_mn projection fusion and
 #   W-prep fusion have no mechanism, FP32 adds an error source (I); ping-pong: HIP has no named
-#   barriers and mode 7 already keeps 3-4 blocks per SM (I).
+#   barriers and mode 7 already keeps 3-4 blocks per SM (I); mode 11's split plane pass as two
+#   8-column tiles per SM, 1.17x slower than one 16-column tile (a tile's pairs share their tables
+#   in L1), and at a carveout of 100, 1.10x slower (3077); a column-resident mode 11 cannot fit an
+#   A100: the pair's two transformed columns and its accumulator are 384 KB against 163 KB (I).
 # Decides it: blocks resident per SM (<= 64 registers, >= 2 blocks) and odd, conflict-free shared
 #   strides, not HBM or FP64 (Fe 8^3 mode 7 at ~50 GB/s and 0.8 TF/s; 2935); after that the
 #   unfold gather's L2 latency (long_scoreboard 49%; 2956).
