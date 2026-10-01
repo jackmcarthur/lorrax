@@ -219,7 +219,29 @@ def pass_rows(a, mesh, x0, xr, axis, spec=None):
                          mesh=mesh, in_specs=spec, out_specs=spec, check_vma=False)(a)
 
 
-def stream_passes(carry, *, mesh, plan, weights, count, node_rows):
+def segment_blocks(plan, p, cols):
+    """Pass ``p`` of ``plan`` as one compact segment of the carry tile (the streamed bank).
+
+    The pass's planes keep their order: each distinct block row offset gets a
+    band of the pass's ``xr`` rows, each distinct column offset a band of its
+    block's width (``cols``, the tile's local columns, for a whole-tile block).
+    Returns ``(blocks, rows, width, rects)``: the planes' :class:`Block`
+    placements in the ``[rows, width]`` local segment, and the rectangles
+    ``(r0, c0, R0, C0, nr, nc)`` that put segment ``[r0:r0+nr, c0:c0+nc]`` back
+    at ``[R0:R0+nr, C0:C0+nc]`` of the local tile.
+    """
+    x0, xr = plan.passes[p]
+    width = {b.n0: int(cols) if b.extents is None else int(b.extents[3]) for b in plan.blocks}
+    row = {m: i * xr for i, m in enumerate(sorted({b.m0 for b in plan.blocks}))}
+    col, c = {}, 0
+    for n0 in sorted(width):
+        col[n0], c = c, c + width[n0]
+    blocks = tuple(Block(m0=row[b.m0], n0=col[b.n0], extents=b.extents) for b in plan.blocks)
+    rects = tuple((row[b.m0], col[b.n0], b.m0 + x0, b.n0, xr, width[b.n0]) for b in plan.blocks)
+    return blocks, len(row) * xr, c, rects
+
+
+def stream_passes(carry, *, mesh, plan, weights, count, node_rows, only=None):
     """``carry[o, q, μ, ν] += Σ_n Σ_s weights[s, o, n] node_rows(p, n)[s]`` over every pass ``p``.
 
     ``carry`` ``[n_out, q, μ, ν]`` at ``P(None, None, 'x', 'y')`` is updated in
@@ -228,7 +250,10 @@ def stream_passes(carry, *, mesh, plan, weights, count, node_rows):
     px*xr, ν_b]`` rows of node ``n`` at ``P(None, None, None, 'x', 'y')``,
     plane ``b`` landing in ``plan.blocks[b]``.  Nodes run in chunks of
     ``plan.chunk``; a chunk's nodes past ``count`` are not evaluated and add
-    exact zeros.
+    exact zeros.  ``only`` names one pass: ``carry`` is then that pass's
+    segment (:func:`segment_blocks`), its planes at their segment offsets;
+    every element gets the same terms in the same order, so its bytes are the
+    whole tile's (the streamed bank, ``file_io.slab_io.StreamedBank``).
     """
     from ffi.contour import contour_block_accumulate_local
     chunk = int(plan.chunk)
@@ -238,13 +263,17 @@ def stream_passes(carry, *, mesh, plan, weights, count, node_rows):
     n_chunks = ((count + chunk - 1) // chunk).astype(jnp.int32)
     spec_c = P(None, None, "x", "y")
     for p, (x0, xr) in enumerate(plan.passes):
+        if only is not None and p != int(only):
+            continue
+        # A segment's planes sit at their segment offsets; the clip keeps the pass's x0.
+        blocks, shift = (plan.blocks, x0) if only is None else (segment_blocks(plan, p, 0)[0], 0)
         shape = jax.eval_shape(lambda n, p=p: node_rows(p, n), jnp.zeros((), jnp.int32))
 
         def skipped(shape=shape):
             return jax.lax.with_sharding_constraint(jnp.zeros(shape.shape, shape.dtype),
                                                     NamedSharding(mesh, P(None, None, None, "x", "y")))
 
-        def block_add(acc, rows, projection, block, x0=x0, xr=xr):
+        def block_add(acc, rows, projection, block, x0=x0, xr=xr, shift=shift):
             def local(a, r, w):
                 if block.extents is None:
                     valid = jnp.asarray([xr, a.shape[3]], jnp.int32)
@@ -253,7 +282,7 @@ def stream_passes(carry, *, mesh, plan, weights, count, node_rows):
                     valid = jnp.stack((
                         jnp.clip(la - jax.lax.axis_index("x") * wa - x0, 0, xr),
                         jnp.clip(lb - jax.lax.axis_index("y") * wb, 0, wb))).astype(jnp.int32)
-                return contour_block_accumulate_local(a, r, w, valid, m0=block.m0 + x0,
+                return contour_block_accumulate_local(a, r, w, valid, m0=block.m0 + shift,
                                                       n0=block.n0, mesh=mesh)
             return jax.shard_map(local, mesh=mesh, in_specs=(spec_c, spec_c, P()),
                                  out_specs=spec_c, check_vma=False)(acc, rows, projection)
@@ -270,7 +299,7 @@ def stream_passes(carry, *, mesh, plan, weights, count, node_rows):
             w = jax.lax.optimization_barrier(
                 jax.lax.dynamic_slice_in_dim(weights, c * chunk, chunk, axis=2))
             projection = jnp.transpose(w, (2, 0, 1)).reshape(2 * chunk, -1)
-            for b, block in enumerate(plan.blocks):
+            for b, block in enumerate(blocks):
                 # [chunk, b, 2, q, m, n] -> terms in node order, forward then reverse.
                 plane = rows[:, b].reshape((2 * chunk,) + rows.shape[3:])
                 acc = block_add(acc, plane, projection, block)
