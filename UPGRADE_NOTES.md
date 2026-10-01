@@ -3,6 +3,23 @@
 User-visible changes, newest first. Binding rulings behind the breaking
 changes live in `docs/architecture/decisions.md`.
 
+## 2026-09-30 — the shared-pole response rule no longer depends on the memory budget
+
+The response bank fits its complex-time rule on all samples at once
+(`response_bank.response_quadrature`). The response group that
+`memory_per_device_gb` picks now only batches the evaluation: each group streams
+the whole rule for its own samples. Before, each group got its own rule, so eqp
+depended on the budget. Smaller groups were also less accurate: against a rule
+tightened 100×, the error reached 14.6 meV on Na 8³ at group 1 and 7.6 meV on
+Fe 4³ at group 8.
+
+What moves: runs whose ledger picked a response group smaller than the sample
+count (gwjax.out: "Response quadrature: N samples in M shared-node groups" with
+M > 1). They move once, to the default's accuracy. Runs with every sample in one
+group (all default-budget symmetric decks) are bitwise. A smaller group now
+costs about 1.5–2× more Green pairs than before at the same group size; its
+memory is unchanged.
+
 ## 2026-09-30 — the restart W0 is formed only on the q parents
 
 GW no longer forms a full-q static W0 when it writes `W0_qmunu` for BSE. The

@@ -1164,10 +1164,13 @@ def response_support(wfns, meta, sample_plan, receipt, *, print_fn=print):
 
 
 def response_quadrature(meta, sample_plan, receipt, support, *, group_size, print_fn=print):
-    """Plan shared complex-time rules for sample groups; replicate small rules.
+    """Plan the shared complex-time rule on every sample; replicate small rules.
 
-    Each node of a group is ONE Green-pair evaluation that serves every
-    member's forward and reverse orientation (see ``minimax.response_group_rules``).
+    Each node is ONE Green-pair evaluation that serves every member's forward
+    and reverse orientation (see ``minimax.response_group_rules``).  The rule
+    is fitted on all samples at once, so its nodes and eqp do not depend on
+    ``group_size``; the evaluation streams the rule's nodes for at most
+    ``group_size`` members per pass (``groups``).
     """
     import minimax
     from .sigma_box_plan import snap_outward
@@ -1184,18 +1187,20 @@ def response_quadrature(meta, sample_plan, receipt, support, *, group_size, prin
     metallic = sample_plan["census"]["partial_at_mu"]
     reuse = (old is not None and old["lo"] <= lo and hi <= old["hi"]
              and old["decay_rate"] <= decay_rate and old["amplitude"] >= amplitude
-             and old["metallic"] == metallic and np.array_equal(old["z"], z)
-             and old["group_size"] == group_size)
+             and old["metallic"] == metallic and np.array_equal(old["z"], z))
     if reuse:
         plan = old
     else:
         pad = 4./RYD_TO_EV if session is not None else 0.
         plan = dict(lo=snap_outward(support["lo"]-pad, 1., -1),
                     hi=snap_outward(support["hi"]+pad, 1., +1), z=z, metallic=metallic,
-                    group_size=group_size, decay_rate=decay_rate, amplitude=amplitude)
+                    decay_rate=decay_rate, amplitude=amplitude)
         plan["reference"] = 0. if decay_rate else plan["lo"]
-        requests = response_groups(z, group_size)
-        previous = [] if old is None else old["groups"]
+        # One rule on every sample, whatever the evaluation group: the node set
+        # (and so eqp) never depends on the memory budget; the group only
+        # batches the evaluation below.
+        requests = response_groups(z, len(z))
+        previous = [] if old is None else old["rule_groups"]
 
         def build(members):
             local = {m: i for i, m in enumerate(members)}
@@ -1208,12 +1213,18 @@ def response_quadrature(meta, sample_plan, receipt, support, *, group_size, prin
             return [dict(rule, members=[members[m] for m in rule["members"]]) for rule in rules]
 
         with timing.section("bank.rule_construction", announce=True):
-            plan["groups"] = _gather_group_rules(requests, build)
+            plan["rule_groups"] = _gather_group_rules(requests, build)
         if session is not None:
             session["frequency"] = plan
     if plan["decay_rate"]:
         refs[:] = mu
-    groups = plan["groups"]
+    # Each evaluation pass streams its rule's whole node set for at most
+    # group_size members (their own value and derivative rows).
+    groups = [dict(rule, **{key: rule[key][a:a+group_size] for key in
+                            ("members", "value", "derivative",
+                             "sampled_error", "coefficient_mass")})
+              for rule in plan["rule_groups"]
+              for a in range(0, len(rule["members"]), group_size)]
     receipt["rule_provider"] = ("minimax shared-node group fit (forward t, reverse conj t from "
                                 "one Green pair); sampled scalar accuracy")
     receipt["rule"] = dict(interval_ry=[plan["lo"], plan["hi"]], group_size=group_size,
@@ -1233,7 +1244,7 @@ def response_quadrature(meta, sample_plan, receipt, support, *, group_size, prin
                      f"kappa {g['coefficient_mass'].max():.2e}  z(eV) {points}", flush=True)
         print_fn(f"Response quadrature: {receipt['nodes']} total Green-pair evaluations "
                  f"(value + derivative, forward + reverse)", flush=True)
-    return dict(plan=plan, f=f, u=u, refs=refs, band_ranges=support["band_ranges"])
+    return dict(plan=plan, groups=groups, f=f, u=u, refs=refs, band_ranges=support["band_ranges"])
 
 
 def _group_stream_arguments(rules, group):
@@ -1573,7 +1584,7 @@ def produce_sample_bank(wfns, meta, config, *, mesh_xy, sym, sample_plan, bank_i
                         _tr_odd_census(receipt,solve_value,h[part],chi_value[part],value[part],z[sample:sample+1],int(qids[iq]))
         return value, slope
 
-    for group in rules["plan"]["groups"]:
+    for group in rules["groups"]:
         members = [int(m) for m in group["members"]]
         if all(committed(m) for m in members):
             for _ in members:
@@ -1656,7 +1667,7 @@ def produce_sample_bank(wfns, meta, config, *, mesh_xy, sym, sample_plan, bank_i
             f"{key}={value:.3f}" for key, value in receipt["seconds"].items()), flush=True)
     del roots
     ledger.live_stages = caller_live
-    receipt["stream_passes"] = len(rules["plan"]["groups"])
+    receipt["stream_passes"] = len(rules["groups"])
     receipt["batch_reason"] = ("one stream per sample group; each Green pair serves every member's value, "
                                "derivative and both orientations")
     receipt["io_scope"] = "I/O envelope includes device readiness, packing, and finite checks; not pure storage time"

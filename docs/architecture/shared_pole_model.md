@@ -97,11 +97,11 @@ state; only quadrature rules and support geometry are retained across SC maps.
 solved once for all irreducible parents with the batched solver and held
 through the frequency loop.
 
-**Shared-node groups.** Samples are grouped (imaginary axis by $\operatorname{Im}z$,
-then the line by $\operatorname{Re}z$), and each group gets one set of complex
-times $t$ from `minimax.response_group_rules`. Every node is **one Green-pair
-evaluation** $A(t)$ that serves every member's value and $\partial_s$ derivative
-in both orientations:
+**Shared-node rule.** All samples (imaginary axis by $\operatorname{Im}z$, then
+the line by $\operatorname{Re}z$) get one set of complex times $t$ from
+`minimax.response_group_rules`, fitted on every sample at once. Every node is
+**one Green-pair evaluation** $A(t)$ that serves every member's value and
+$\partial_s$ derivative in both orientations:
 
 $$
 \frac1{d-z}\simeq\sum_j c^F_j e^{-(d-r)t_j},\qquad
@@ -115,12 +115,16 @@ $\overline{A(\bar t)}$ — the same damping with the orbital product reversed, n
 $\overline{A(t)}$. On a raw-parent plan the charge stream forms $A(t)$ with
 mathdx mode 11 from the two parent Greens, metals included
 ([fractional χ₀ response face](fractional_chi0_response_face.md)).
-The nodes come from a stacked Hankel shift pencil; a group
-whose shared fit fails is split in halves down to single samples, so no sample
-uses more nodes than its own rule needs. The group size is the largest whose
-donated carry `[2·members, q, μ_X, ν_Y]` and compiled stream temporaries fit the
-map ledger and the device room (the budget less the bytes actually live):
-every sample in one group on symmetric decks. The chosen group's executable is
+The nodes come from a stacked Hankel shift pencil; a sample set
+whose shared fit fails is split in halves down to single samples. The rule never
+depends on the memory budget: the evaluation runs in groups of at most the group
+size, and each group streams its rule's whole node set for its own members. The
+group size is the largest whose donated carry `[2·members, q, μ_X, ν_Y]` and
+compiled stream temporaries fit the map ledger and the device room (the budget
+less the bytes actually live): every sample in one group on symmetric decks. A
+smaller group costs ⌈members/group⌉ passes over the same nodes and gives the same
+eqp. (Rules fitted per group gave eqp up to 14.6 meV off a 100× tighter
+reference on Na 8³ at group 1, against 0.21 meV for the all-sample rule.) The chosen group's executable is
 then checked before it runs ([memory model](memory-model.md#the-compiled-check)). The accuracies are
 sampled, not continuum certificates; a matched QP comparison is the acceptance
 check.
@@ -175,7 +179,7 @@ the constant separate.
 ordered bank $M_0,M_2$. The Coulomb prefactor and orthonormal FFT together
 scale them by $1/N_k$.
 
-**Cost.** Green-pair evaluations $\approx\sum_{\rm groups}(\text{nodes})$, each
+**Cost.** Green-pair evaluations $\approx\sum_{\rm passes}(\text{rule nodes})$, each
 one flat-k FFT convolution producing all members; Dyson is one batched solve per
 sample and parent span.
 
