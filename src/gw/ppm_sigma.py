@@ -30,32 +30,10 @@ from .ppm_windows import (
     branches_for_omega_grid,
     resolve_sigma_regularization,
 )
-from .ppm_tau_kernel import get_sigma_spatial_kernel
-from .wavefunction_bundle import (
-    parent_sigma_operands, sigma_face_kernel_kwargs)
 from runtime.padding import PaddedAxis
 
 if TYPE_CHECKING:
     from .band_extrapolation import BandBracketPlan
-
-
-def _face_g_plan(mesh_xy: Mesh, face_shape, layout="face"):
-    """One ``distrib_la.gemm_plan`` for a face-layout G build, at the shape
-    ``greens_function_kernel._build_G_face`` requires — mirrors
-    ``cohsex_sigma._make_cohsex_kernels_face``'s identical construction
-    (single source of truth: same GEMM shape, same convention, both
-    named as "built ONCE by the caller" in ``build_G``'s own docstring).
-    Used only by the invalid-pole static-limit term below
-    (:func:`_compute_invalid_static_sigma` /
-    :func:`_invalid_static_coh_by_bracket`), which runs O(1) times per
-    Σ_c(ω) evaluation — NOT per τ — so building this plan inline here
-    (rather than caching it, the way ``ppm_tau_kernel``'s per-τ hot-loop
-    factories do) is proportionate to its call frequency."""
-    from distrib_la import gemm_plan
-    nk, nb_full, n_rmu, ns = (int(v) for v in face_shape)
-    mu_s = n_rmu * ns
-    return gemm_plan(mesh_xy, m=mu_s, k=nb_full, n=mu_s, nq=nk,
-                     dtype=jnp.complex128, layout=layout, warmup=False)
 
 
 @dataclass(frozen=True)
@@ -713,33 +691,6 @@ def sigma_band_axis(nb_proj: int, mesh_xy, *, ansatz: str):
         ))
 
 
-def strip_sigma_window(
-        sigma_kij, band_axis: PaddedAxis, *, mesh_xy: Mesh | None = None):
-    """Strip the square carrier at a consumer that requires logical bands."""
-    del mesh_xy  # layout is carried by the array; extent is carried by the tag
-    if sigma_kij is None:
-        return sigma_kij
-    from runtime.padding import strip_axis
-    return strip_axis(
-        strip_axis(sigma_kij, band_axis, axis=-2), band_axis, axis=-1)
-
-
-
-
-
-
-def _static_interaction_prep(spatial, W_static, q_wedge, meta, mesh_xy):
-    """The static screening operand's R-space prep: read from the q wedge when the
-    fit ran there (mathdx mode 9; the masked ``W^c(0)`` is Hermitian, the
-    conj rule), else the full-zone prep."""
-    if q_wedge is None:
-        return spatial.prep_w(W_static)
-    import dataclasses as _dc
-    from .cohsex_sigma import wedge_prep
-    op = _dc.replace(q_wedge, values=W_static, trs_rule="conj").with_load(mesh_xy)
-    return wedge_prep(mesh_xy, meta.kgrid, op)
-
-
 def _compute_invalid_static_sigma(
     wfns,
     Wc0_q: jax.Array,
@@ -766,8 +717,8 @@ def _compute_invalid_static_sigma(
     occ → −½·W^c(0) (= B/Ω), unocc → +½·W^c(0) — the exact Ω→∞ limit of
     the two-branch pole sum ``B/(ω−E_l∓Ω)``.
 
-    Reuses the canonical Sigma spatial kernel with the masked static
-    ``W^c(0)`` as the screening operand:
+    The static Σ kernels (``gw.cohsex_sigma``: the Σ τ node at τ = 0) with the
+    masked static ``W^c(0)`` as the interaction:
 
         Σ_static = sigma_sx(G_occ, W_static) + sigma_coh(W_static − 0)
                  = −⟨G_occ·W_static⟩ + ½·⟨G_RI·W_static⟩
@@ -786,68 +737,39 @@ def _compute_invalid_static_sigma(
     term runs over the OCCUPIED manifold, so on a metal the Fermi-shell
     bands must enter with their fractional weights.
     """
-    from common.collectives import gather_to_host
-    from symmetry_maps import unfold_file_wedge_band_operator
-    from .cohsex_sigma import build_Gij, _occ_diag_full
-    from .greens_function_kernel import build_G_parents
-
+    from .cohsex_sigma import build_Gij
     Gij = build_Gij(meta, mesh_xy, occupation_state)
-    face_kwargs = sigma_face_kernel_kwargs(wfns)
-    k_unfold_plan = wfns.green_parent.plan
-    spatial = get_sigma_spatial_kernel(
-        mesh_xy=mesh_xy, kgrid=meta.kgrid, merged_x=True, **face_kwargs)
-    s = wfns.slices
-    g_plan = _face_g_plan(
-        mesh_xy, (k_unfold_plan.n_parent, *face_kwargs["face_shape"][1:]), layout=wfns.layout)
-    (g_mun, g_nmu, proj_xr, proj_yn, _, _) = parent_sigma_operands(wfns)
-    g_carrier = wfns.green_parent
+    sigma_sx, sigma_coh, W_static = _invalid_static_kernels(
+        wfns, Wc0_q, invalid_mask, meta, mesh_xy, q_wedge)
+    with mesh_xy:
+        sx = _band_sigma_host(sigma_sx(wfns, Gij, W_static), wfns)
+        coh = _band_sigma_host(sigma_coh(wfns, W_static, None), wfns)
+    return sx + coh
 
+
+def _invalid_static_kernels(wfns, Wc0_q, invalid_mask, meta, mesh_xy, q_wedge):
+    """The static Σ kernels (``cohsex_sigma``'s SX and COH) and the masked ``W^c(0)``
+    as a Hermitian interaction on the fit's q wedge (conj rule), or the full zone."""
+    import dataclasses as _dc
+    from .cohsex_sigma import _face_kwargs, _make_cohsex_kernels
+    sigma_sx, sigma_coh = _make_cohsex_kernels(
+        mesh_xy, meta.kgrid, int(meta.nk_tot), **_face_kwargs(wfns))
     with mesh_xy:
         W_static = jnp.where(
             jnp.asarray(invalid_mask, dtype=bool),
             jnp.asarray(Wc0_q, dtype=jnp.complex128),
             jnp.asarray(0.0 + 0.0j, dtype=jnp.complex128),
         )
-        W_prep = _static_interaction_prep(spatial, W_static, q_wedge, meta, mesh_xy)
+    if q_wedge is not None:
+        W_static = _dc.replace(q_wedge, values=W_static, trs_rule="conj")
+    return sigma_sx, sigma_coh, W_static
 
-        psi_xr, psi_yn = proj_xr, proj_yn
-        nb_real = sigma_band_axis(
-            int(s.nb_sigma), mesh_xy, ansatz="static face")
 
-        # The shared spatial kernel returns -<G.W>.  Gather each tiny sharded
-        # band tensor before building the next centroid-square G: this makes
-        # the one-G-at-a-time memory bound structural instead of leaving XLA
-        # free to overlap the occupied and RI contractions.  The production
-        # fused-FFI route additionally keeps the R-space G tile inside its
-        # bounded handler rather than materialising the decomposed FFT chain.
-        nb_full = int(s.nb_full)
-        phases = _occ_diag_full(Gij, s.nb_sigma, nb_full)
-        phases = k_unfold_plan.parent_rows(phases)
-        G_occ = build_G_parents(g_mun, g_nmu, phases=phases,
-                        real_weights=not jnp.issubdtype(phases.dtype, jnp.complexfloating),
-                        layout=wfns.layout, gemm=g_plan,
-                        k_unfold_plan=k_unfold_plan)
-        sig_sx = spatial.conv_project(psi_xr, psi_yn, G_occ, W_prep)
-        sx_host = np.asarray(strip_sigma_window(
-            unfold_file_wedge_band_operator(
-                k_unfold_plan.sym, gather_to_host(sig_sx),
-                trs_rule="transpose"), nb_real), dtype=np.complex128)
-        del G_occ, sig_sx
-
-        mask = g_carrier.band_mask(s.sigma_sum)
-        G_ri = build_G_parents(g_mun, g_nmu, phases=mask, real_weights=True,
-                       layout=wfns.layout, gemm=g_plan,
-                       k_unfold_plan=k_unfold_plan)
-        sig_ri = spatial.conv_project(psi_xr, psi_yn, G_ri, W_prep)
-        ri_host = np.asarray(strip_sigma_window(
-            unfold_file_wedge_band_operator(
-                k_unfold_plan.sym, gather_to_host(sig_ri),
-                trs_rule="transpose"), nb_real), dtype=np.complex128)
-        del G_ri, sig_ri
-
-    # shared_conv(G_RI, W_static) = -<G_RI.W_static>, while static COH is
-    # +1/2<G_RI.W_static>; hence the minus one-half below.
-    return sx_host - 0.5 * ri_host
+def _band_sigma_host(sigma_kij, wfns):
+    """A static Σ ``(nk, carrier, carrier)`` on the host, cut to the QP window."""
+    from common.collectives import gather_to_host
+    nb = int(wfns.slices.nb_sigma)
+    return np.asarray(gather_to_host(sigma_kij), dtype=np.complex128)[:, :nb, :nb]
 
 
 def _invalid_static_coh_by_bracket(
@@ -895,44 +817,12 @@ def _invalid_static_coh_by_bracket(
     them to get Σ_COH at each of the plan's band counts, in the same order and
     by the same rule that turns the Σ_c brackets into band counts.
     """
-    from common.collectives import gather_to_host
-    from symmetry_maps import unfold_file_wedge_band_operator
-    from .greens_function_kernel import build_G_parents
-
-    face_kwargs = sigma_face_kernel_kwargs(wfns)
-    k_unfold_plan = wfns.green_parent.plan
-    spatial = get_sigma_spatial_kernel(
-        mesh_xy=mesh_xy, kgrid=meta.kgrid, merged_x=True, **face_kwargs)
-    s = wfns.slices
-    g_plan = _face_g_plan(
-        mesh_xy, (k_unfold_plan.n_parent, *face_kwargs["face_shape"][1:]), layout=wfns.layout)
-    (g_mun, g_nmu, proj_xr, proj_yn, _, _) = parent_sigma_operands(wfns)
-    g_carrier = wfns.green_parent
-
-    out = []
+    _, sigma_coh, W_static = _invalid_static_kernels(
+        wfns, Wc0_q, invalid_mask, meta, mesh_xy, q_wedge)
     with mesh_xy:
-        W_static = jnp.where(
-            jnp.asarray(invalid_mask, dtype=bool),
-            jnp.asarray(Wc0_q, dtype=jnp.complex128),
-            jnp.asarray(0.0 + 0.0j, dtype=jnp.complex128),
-        )
-        W_prep = _static_interaction_prep(spatial, W_static, q_wedge, meta, mesh_xy)
-        psi_xr, psi_yn = proj_xr, proj_yn
-        nb_real = sigma_band_axis(
-            int(s.nb_sigma), mesh_xy, ansatz="static face")
-        for lo, hi in brackets:
-            mask = g_carrier.band_mask(
-                slice(int(lo), int(hi)))
-            G_ri = build_G_parents(g_mun, g_nmu, phases=mask, real_weights=True,
-                           layout=wfns.layout, gemm=g_plan,
-                           k_unfold_plan=k_unfold_plan)
-            sig_ri = spatial.conv_project(psi_xr, psi_yn, G_ri, W_prep)
-            ri_host = np.asarray(strip_sigma_window(
-                unfold_file_wedge_band_operator(
-                    k_unfold_plan.sym, gather_to_host(sig_ri),
-                    trs_rule="transpose"), nb_real), dtype=np.complex128)
-            out.append(-0.5 * ri_host)
-            del G_ri, sig_ri
+        out = [_band_sigma_host(sigma_coh(wfns, W_static, None,
+                                          ri_bands=(int(lo), int(hi))), wfns)
+               for lo, hi in brackets]
     return np.stack(out, axis=0)
 
 

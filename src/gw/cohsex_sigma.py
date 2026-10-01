@@ -181,11 +181,8 @@ def _occ_diag_full(Gij, nb_sigma, nb_full):
     :func:`greens_function_kernel.build_G` already refuses by name for
     face layout before this is reached.
 
-    Module-level (not a closure) since 2026-08-22: shared by this
-    module's own static kernels (below) AND ``gw.ppm_sigma``'s
-    invalid-pole static-limit term, which builds the identical face-G
-    occupation weight for the SAME reason (single-source-of-truth
-    microservice rule) — see ``gw.ppm_sigma._compute_invalid_static_sigma``.
+    ``gw.ppm_sigma``'s invalid-pole static-limit term runs these same static
+    kernels, so it reads the same weight.
     """
     if nb_sigma > nb_full:
         raise ValueError(
@@ -233,6 +230,12 @@ def screened_minus_bare(W_q, V_q):
     W = interaction_operator(W_q)
     V = interaction_operator(V_q).restrict(W)
     return W.with_values(W.values - V.values)
+
+
+def _hole_interaction(W_q, V_q):
+    """The Coulomb hole's interaction: ``W - V``, or ``W`` itself when ``V_q`` is None
+    (GN-PPM's invalid-pole static limit, whose ``W^c(0)`` is already ``W - V``)."""
+    return W_q if V_q is None else screened_minus_bare(W_q, V_q)
 
 
 def interaction_operator(interaction):
@@ -520,7 +523,7 @@ def _make_cohsex_kernels_face(mesh_xy: Mesh, face_shape, _convolve,
             bands = (s.sigma_sum if ri_bands is None
                      else slice(int(ri_bands[0]), int(ri_bands[1])))
             mask = wfns.green_parent.band_mask(bands)
-            return _parent_sigma(wfns, mask, screened_minus_bare(W_q, V_q), -0.5, g_load)
+            return _parent_sigma(wfns, mask, _hole_interaction(W_q, V_q), -0.5, g_load)
 
         # W - V unfolds by W's tables, so W's load serves COH.
         def warmed_sx(wfns, Gij, W_q):
@@ -560,7 +563,7 @@ def _make_cohsex_kernels_face(mesh_xy: Mesh, face_shape, _convolve,
                  else slice(int(ri_bands[0]), int(ri_bands[1])))
         G_ri = build_G(wfns.psi_mun, wfns.psi_nmu, phases=wfns.band_mask(bands),
                        real_weights=True, layout=layout, gemm=g_plan)
-        return _project_bands(wfns, _convolve(G_ri, screened_minus_bare(W_q, V_q), -0.5))
+        return _project_bands(wfns, _convolve(G_ri, _hole_interaction(W_q, V_q), -0.5))
 
     # The interaction's wedge door is built before the jit traces (see
     # StaticConvolution.warmed); W - V unfolds by W's tables, so one door

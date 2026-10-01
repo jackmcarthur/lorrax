@@ -51,27 +51,47 @@ import numpy as np
 from common import timing
 
 
+def _gamma_gemm_route(mesh, b_shape, budget_bytes):
+    """The Gamma body GEMM's ``(backend, batched_route)`` for ``distrib_la.matmul``.
+
+    The staged batch route (each rank's ``ceil(Q/P)`` whole matrices, one local
+    GEMM) when one rank holds that A, B and D beside the ledger's live stages
+    (``distrib_la.fits_local``, the test ``matmul(batched_route='auto',
+    budget_bytes=)`` makes); otherwise the distributed provider on the faces.
+    Q is one Gamma parent, so the staged route puts whole N_mu x N_mu matrices
+    on every rank (zero pads past the first): 66 GB/rank at N_mu 30k.
+    ``budget_bytes`` is the same on every rank, so is the route."""
+    import distrib_la
+    q, n, k = (int(v) for v in b_shape)
+    local = -(-q // int(mesh.size))
+    shapes = ((local, n, k), (local, k, n), (local, n, n))
+    if distrib_la.fits_local(SimpleNamespace(mesh=mesh), "gemm", shapes, np.complex128,
+                             int(budget_bytes)):
+        return "off", distrib_la.ROUTE_BATCH_RESHARD
+    return "auto", "auto"
+
+
 @lru_cache(maxsize=None)
-def _gamma_body(mesh, backend):
+def _gamma_body(mesh, route):
     """Raw latent body; current factors are operands of one retained callable.
 
-    ``backend`` is the deck's linalg layout as a ``distrib_la.matmul`` request
-    (``off`` local, ``distributed`` otherwise), on the default staged route."""
+    ``route`` is the GEMM's ``(backend, batched_route)`` (:func:`_gamma_gemm_route`)."""
     from distrib_la import matmul
     from jax.sharding import NamedSharding, PartitionSpec as P
     face = NamedSharding(mesh, P(None, "x", "y"))
+    backend, batched_route = route
 
     @jax.jit(out_shardings=face)
     def evaluate(s, b, poles, counts, v):
         active = jnp.arange(b.shape[-1])[None, :] < counts[:, None]
         weights = jnp.where(active, 1/(s-poles), 0)
-        return v+matmul(b*weights[:, None, :], b, mesh=mesh,
-                        backend=backend, transb="C")
+        return v+matmul(b*weights[:, None, :], b, mesh=mesh, backend=backend,
+                        batched_route=batched_route, transb="C")
     return evaluate
 
 
 @lru_cache(maxsize=None)
-def _realized_gamma_body(mesh, realize, backend):
+def _realized_gamma_body(mesh, realize, route):
     """One admitted all-P executable for V + Pi_G Wc at complex z².
 
     Only residue endpoints transform under antiunitary operations. Taking
@@ -81,7 +101,7 @@ def _realized_gamma_body(mesh, realize, backend):
     from jax.sharding import NamedSharding, PartitionSpec as P
     from common.collectives import transpose_xy
     face = NamedSharding(mesh, P(None, "x", "y"))
-    raw = _gamma_body(mesh, backend)
+    raw = _gamma_body(mesh, route)
 
     @jax.jit(out_shardings=face)
     def evaluate(s, b, poles, counts, v):
@@ -232,24 +252,22 @@ def build_shared_pole_head(handle, header, V_q, wfns, meta, config, *,
         with open_shared_pole_model(handle["path"], mesh_xy=mesh_xy) as io:
             b, poles, counts = read_shared_pole_matrix(io, (iq, iq+1), meta=meta, header=header)
         # The linalg service owns the distributed rectangular products and
-        # workspace estimate. No q-local whole-matrix copy is introduced.
-        # The deck's linalg layout picks the backend, as the bank's
-        # (response_bank.response_algebra): a 1x1 mesh has no 2-D LU.
-        from .gw_config import linalg_resolution
-        layout = linalg_resolution(
-            config if hasattr(config, "get") else {"linalg": config.backend.linalg}).layout
-        backend = "off" if layout == "local" else "distributed"
-        algebra = distrib_la.plan("solve_lu", mesh_xy, n=b.shape[1], backend=backend)
-        evaluate = _realized_gamma_body(mesh_xy, realize, backend)
+        # workspace estimate. The GEMM route is a capacity decision against
+        # the ledger's room (_gamma_gemm_route), and the reservation prices
+        # that route's workspace.
+        resident = int(b.size*b.dtype.itemsize//mesh_xy.size + poles.size*8)
+        route = _gamma_gemm_route(mesh_xy, b.shape,
+                                  ledger.room_bytes_per_rank(ambient) - resident)
+        evaluate = _realized_gamma_body(mesh_xy, realize, route)
         from symmetry_maps import QirrOperator
         # q = 0 is its own orbit: its wedge row is the full-zone row.
         args = (b, poles, counts, QirrOperator.of(V_q).representative_row(0)[None])
         stats = evaluate.lower(jnp.asarray(1j, jnp.complex128), *args).compile().memory_analysis()
         if stats is None:
             raise ValueError("GATE shared_pole_head: matrix evaluation memory unavailable")
-        resident = int(b.size*b.dtype.itemsize//mesh_xy.size + poles.size*8)
-        native = distrib_la.workspace_bytes_per_rank(algebra, "gemm",
-            (b.shape, (b.shape[0], b.shape[2], b.shape[1])), np.complex128)
+        native = distrib_la.matmul_workspace_bytes_per_rank(
+            mesh_xy, (b.shape, (b.shape[0], b.shape[2], b.shape[1])), np.complex128,
+            backend=route[0], batched_route=route[1])
         name, _ = _reserve(meta, "head", resident,
             3*stats.output_size_in_bytes+stats.temp_size_in_bytes+native)
         ledger.live_stages = ambient+(name,)
