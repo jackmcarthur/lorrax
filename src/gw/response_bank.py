@@ -1333,7 +1333,7 @@ def integrate_response_group(wfns, meta, mesh_xy, rules, group, *, q_ids,
                              execute, receipt, ordered=False, vertex=None, bank=None, outputs=()):
     """Donated [value/ds per member, q, mu_X, nu_Y]; one Green/FFT scan per group.
 
-    With a streamed ``bank`` (``file_io.streamed_bank``) the scan runs one row
+    With a streamed ``bank`` (``file_io.slab_io.StreamedBank``) the scan runs one row
     pass at a time into that pass's carry, and each finished pass goes to the
     bank (carry row ``r`` as bank output ``o`` for ``(r, o)`` in ``outputs``)
     while the next pass computes; nothing is returned.
@@ -1517,7 +1517,7 @@ def response_bank_residence(meta, *, segments, n_samples, carry_per_sample, grou
     on the devices when every sample fits one group (``group_size``, from the
     capacity ledger and the compiled stream); otherwise streamed, the stream
     running once with every sample and each row pass written out
-    (``file_io.streamed_bank``): to host memory when the bank takes at most
+    (``file_io.slab_io.StreamedBank``): to host memory when the bank takes at most
     half of this process's host budget beside ``host_reserved`` (a host-tier
     W bank), else to per-rank files.  A stream without the row-pass engine
     (``segments`` ``None``: the full-k Green route) keeps sample groups on
@@ -1704,7 +1704,7 @@ def produce_sample_bank(wfns, meta, config, *, mesh_xy, sym, sample_plan, bank_i
                                     group_size=group_size, print_fn=print_fn)
         stream_bank = None
         if residence != "device":
-            from file_io.streamed_bank import IN_FLIGHT, StreamedBank
+            from file_io.slab_io import StreamedBank
             # Slots: the largest rule group's members (empty slots add zeros nobody reads).
             rules["slots"] = max(len(g["members"]) for g in rules["groups"])
             pass_carry = 2*rules["slots"]*len(response_rows)*16*max(r*c for r, c, _ in segments[0])
@@ -1713,7 +1713,7 @@ def produce_sample_bank(wfns, meta, config, *, mesh_xy, sym, sample_plan, bank_i
                 tile=segments[1])
             finish = segments[2]
             receipt["bank_residence"].update(stream_bank.receipt(),
-                device_bytes_per_rank=max(IN_FLIGHT*pass_carry, 3*carry_per_sample))
+                device_bytes_per_rank=max(StreamedBank.in_flight*pass_carry, 3*carry_per_sample))
     # The group accumulator is all-P sharded. Dense work and slab I/O batch
     # the irreducible parents of one frequency, with their own admission.
     progress = LoopProgress(len(z), print_fn, title="response frequency integration",
@@ -1804,7 +1804,7 @@ def produce_sample_bank(wfns, meta, config, *, mesh_xy, sym, sample_plan, bank_i
             # each member's value and slope come back one ahead of its solve.
             fresh = [(row, sample) for row, sample in enumerate(members) if not committed(sample)]
             integrate_response_group(wfns, meta, mesh_xy, rules, group, q_ids=response_rows,
-                execute=execute, receipt=receipt, ordered=ordered, bank=stream_bank,
+                execute=execute, receipt=receipt, ordered=ordered, vertex=vertex, bank=stream_bank,
                 outputs=[(2*row+k, 2*sample+k) for row, sample in fresh for k in (0, 1)])
             with timing.section('bank.stream_commit'):
                 stream_bank.commit()

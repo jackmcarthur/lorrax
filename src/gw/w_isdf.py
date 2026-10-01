@@ -925,7 +925,7 @@ def _get_chi_fractional_contour_kernel_face(
     ``stream_pass`` (direct bank carry on the row-pass engine only) runs one
     segment of that engine (:func:`stream_segments`): the donated carry is
     that segment's ``[n_out, q, px*rows, py*cols]`` sub-tile and nothing
-    crosses layouts (the streamed bank, ``file_io.streamed_bank``).
+    crosses layouts (the streamed bank, ``file_io.slab_io.StreamedBank``).
     """
     from common.fft_helpers import make_flat_k_fftn
     from distrib_la import gemm_plan

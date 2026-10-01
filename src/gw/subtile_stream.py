@@ -188,7 +188,7 @@ def stream_passes(carry, *, mesh, plan, weights, count, node_rows, only=None):
     exact zeros.  ``only`` names one pass: ``carry`` is then that pass's
     segment (:func:`segment_blocks`), its planes at their segment offsets;
     every element gets the same terms in the same order, so its bytes are the
-    whole tile's (the streamed bank, ``file_io.streamed_bank``).
+    whole tile's (the streamed bank, ``file_io.slab_io.StreamedBank``).
     """
     from ffi.contour import contour_block_accumulate_local
     chunk = int(plan.chunk)

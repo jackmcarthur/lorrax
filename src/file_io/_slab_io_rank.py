@@ -1,4 +1,4 @@
-"""The streamed bank tier: a sharded operator written row pass by row pass and read back output by output.
+"""SlabIO's per-rank streamed tier: a sharded operator written segment by segment and read back output by output.
 
 The direct response stream (``gw.response_bank``, ``gw.subtile_stream``) finishes
 the rows of one row pass for every output at once (the value and the slope of
@@ -23,12 +23,15 @@ padded_s``, so one consumer's read of outputs ``[o0, o1)`` is the one
 contiguous run ``[o0·S, o1·S)``; each segment's rectangles go back to their
 places in the local carry tile on the device.
 
-**Write.**  One program per pass shape packs the pass carry into padded
-records and lands them in pinned host memory (4 KiB aligned, so the numpy
-view is the O_DIRECT source with no copy), with one position-weighted digest
-per record.  A drain thread hands 64 MiB O_DIRECT pieces to a pool of I/O
-threads while the devices compute the next pass; at most :data:`IN_FLIGHT`
-passes are in flight.
+**Write.**  A drain thread moves each finished segment's records off the
+device in 64 MiB pieces (one program per piece shape lands a piece, padded
+to 4 KiB, in pinned host memory: 4 KiB aligned, so its numpy view is the
+O_DIRECT source with no copy) and hands them to a pool of I/O threads.  At
+most :data:`PIECES_IN_FLIGHT` pieces are staged per rank (256 MiB pinned):
+a piece is moved only after an earlier one is written (backpressure), and
+the devices compute the next segment meanwhile; at most :data:`IN_FLIGHT`
+segment carries are alive.  One program per segment digests its records
+(position-weighted, per record).
 
 **Read.**  One run is read one ahead of the consumer by the I/O threads into
 an aligned staging buffer (a file) or taken in place (host), copied to the
@@ -65,8 +68,10 @@ ALIGN = 4096
 PIECE = 64 << 20
 #: I/O threads per process (four reach 13-14 GB/s per rank on a 4-stripe file).
 IO_THREADS = 4
-#: Passes whose records may be in flight to the store at once.
+#: Segment carries alive at once (one computing, one draining).
 IN_FLIGHT = 2
+#: Pinned pieces staged per rank (backpressure: a piece moves only after an earlier one is written).
+PIECES_IN_FLIGHT = 4
 #: Lustre layout of every file: stripe count and stripe size.
 STRIPES, STRIPE_BYTES = 4, 4 << 20
 
@@ -85,19 +90,26 @@ def _digest(flat):
 
 
 @lru_cache(maxsize=None)
-def _pack(mesh, shape, record16):
-    """Pass carry ``[n_out, q, rows, cols]`` at ``P(None, None, 'x', 'y')`` → its padded
-    records ``(px, py, n_out, record16)`` in pinned host memory and their digests."""
+def _record_digests(mesh, shape):
+    """Segment carry ``[n_out, q, rows, cols]`` at ``P(None, None, 'x', 'y')`` → each local
+    record's digest ``(px, py, n_out)``."""
     def local(carry):
+        return _digest(carry.reshape(carry.shape[0], -1))[None, None]
+    return jax.jit(jax.shard_map(local, mesh=mesh, in_specs=P(None, None, "x", "y"),
+                                 out_specs=P("x", "y", None), check_vma=False))
+
+
+@lru_cache(maxsize=None)
+def _piece(mesh, shape, length16, padded16):
+    """``(carry, o, a)`` → elements ``[a, a + length16)`` of every rank's local record ``o``,
+    zero-padded to ``padded16``, as ``(px, py, padded16)`` in pinned host memory."""
+    def local(carry, o, a):
         flat = carry.reshape(carry.shape[0], -1)
-        digest = _digest(flat)
-        flat = jnp.pad(flat, ((0, 0), (0, record16 - flat.shape[1])))
-        return flat[None, None], digest[None, None]
-    body = jax.shard_map(local, mesh=mesh, in_specs=P(None, None, "x", "y"),
-                         out_specs=(P("x", "y", None, None), P("x", "y", None)), check_vma=False)
-    return jax.jit(body, out_shardings=(
-        NamedSharding(mesh, P("x", "y", None, None), memory_kind="pinned_host"),
-        NamedSharding(mesh, P("x", "y", None))))
+        piece = jax.lax.dynamic_slice(flat, (o, a), (1, length16))[0]
+        return jnp.pad(piece, (0, padded16 - length16))[None, None]
+    body = jax.shard_map(local, mesh=mesh, in_specs=(P(None, None, "x", "y"), P(), P()),
+                         out_specs=P("x", "y", None), check_vma=False)
+    return jax.jit(body, out_shardings=NamedSharding(mesh, P("x", "y", None), memory_kind="pinned_host"))
 
 
 @lru_cache(maxsize=None)
@@ -216,6 +228,9 @@ class StreamedBank:
     every method in the same order.
     """
 
+    #: Segment carries a caller keeps alive on the devices (one computing, one draining).
+    in_flight = IN_FLIGHT
+
     def __init__(self, mesh, *, root, label, kind, n_out, q, segments, tile):
         if kind not in ("host", "file"):
             raise ValueError(f"GATE streamed_bank: kind {kind!r}; want 'host' or 'file'")
@@ -264,35 +279,53 @@ class StreamedBank:
         becomes bank output ``o`` for every ``(r, o)`` in ``outputs``.  Returns at once;
         an I/O failure is held for :meth:`commit`, never raised here."""
         outputs = tuple((int(r), int(o)) for r, o in outputs)
-        host, digest = _pack(self.mesh, tuple(carry.shape), self.records[p] // 16)(carry)
+        digest = _record_digests(self.mesh, tuple(carry.shape))(carry)
         while len(self._inflight) >= IN_FLIGHT:
             self._retire()
-        self._inflight.append(self._drain.submit(self._write_pass, p, host, digest, outputs))
+        self._inflight.append(self._drain.submit(self._write_pass, p, carry, digest, outputs))
 
-    def _write_pass(self, p, host, digest, outputs):
+    def _write_pass(self, p, carry, digest, outputs):
+        """Drain one segment: its records' pieces, at most PIECES_IN_FLIGHT staged (drain thread)."""
         started = time.monotonic()
         record = self.records[p]
-        digests = {s.device: np.asarray(s.data)[0, 0] for s in digest.addressable_shards}
-        pieces, bounce = [], []
-        for shard in host.addressable_shards:
-            store = self.stores[shard.device]
-            source = np.asarray(shard.data).reshape(-1).view(np.uint8)
-            for row, o in outputs:
-                self.digests[shard.device][o, p] = digests[shard.device][row]
-                part = source[row * record:(row + 1) * record]
-                if part.ctypes.data % ALIGN:
+        length16 = self.q * self.shapes[p][0] * self.shapes[p][1]
+        step16 = PIECE // 16
+        cuts = [(a, min(step16, length16 - a)) for a in range(0, length16, step16)]
+        shape = tuple(carry.shape)
+        staged = deque()
+
+        def land(staging):
+            host, o, a = staging
+            for shard in host.addressable_shards:
+                source = np.asarray(shard.data).reshape(-1).view(np.uint8)
+                if source.ctypes.data % ALIGN:
                     # The pinned pool hands out 4 KiB-aligned buffers (measured); a
                     # sub-allocated one is copied once into an aligned buffer.
-                    bounce.append(_aligned(record))
-                    np.copyto(np.frombuffer(bounce[-1], np.uint8, count=record), part)
-                    part = np.frombuffer(bounce[-1], np.uint8, count=record)
+                    bounce = _aligned(len(source))
+                    np.copyto(np.frombuffer(bounce, np.uint8, count=len(source)), source)
+                    source = np.frombuffer(bounce, np.uint8, count=len(source))
                     self.bounced += 1
-                part = memoryview(part)
-                for a in range(0, record, PIECE):
-                    pieces.append(self._pool.submit(store.write, part[a:min(record, a + PIECE)],
-                                                    o * self.S + self.starts[p] + a))
-        for piece in pieces:
-            piece.result()
+                self.stores[shard.device].write(memoryview(source),
+                                                o * self.S + self.starts[p] + 16 * a)
+
+        def retire_one():
+            staged.popleft().result()
+
+        for row, o in outputs:
+            for a, n16 in cuts:
+                padded16 = n16 if n16 == step16 else (min(record, 16 * a + padded(16 * n16)) - 16 * a) // 16
+                host = _piece(self.mesh, shape, n16, padded16)(carry, np.int64(row), np.int64(a))
+                while len(staged) >= PIECES_IN_FLIGHT:
+                    retire_one()
+                staged.append(self._pool.submit(land, (host, o, a)))
+                del host
+        del carry
+        while staged:
+            retire_one()
+        digests = {s.device: np.asarray(s.data)[0, 0] for s in digest.addressable_shards}
+        for d in self.devices:
+            for row, o in outputs:
+                self.digests[d][o, p] = digests[d][row]
         for _, o in outputs:
             self.written[o, p] = True
         return time.monotonic() - started
