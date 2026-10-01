@@ -1440,6 +1440,115 @@ def _stream_workspace(wfns, meta, mesh_xy, support, *, q_ids, n_outputs, ordered
             + _stream_scratch(wfns, meta, mesh_xy, vertex)), compiled
 
 
+_DIAG_MAP = [-1]
+_diag_mirror_fn = [None]
+
+
+def _diag_out(line):
+    """DIAG BISPSYM2: append one line to bispsym2_mirror.txt in the run directory (rank 0)."""
+    if jax.process_index() == 0:
+        with open("bispsym2_mirror.txt", "a") as fh:
+            fh.write(line + "\n")
+
+
+def _diag_unitary_inversion(plans):
+    """DIAG BISPSYM2: the spatial row equal to -1 with a complete centroid map in every plan."""
+    rows = None
+    for plan in plans:
+        ops, perm = np.asarray(plan.spatial_ops), np.asarray(plan.sym_perm)
+        found = {r for r in range(int(plan.n_sym_spatial))
+                 if np.array_equal(ops[r], -np.eye(3, dtype=ops.dtype)) and np.all(perm[r] >= 0)}
+        rows = found if rows is None else rows & found
+    return min(rows) if rows else None
+
+
+def _diag_mirror(wfns, vertex, sym, meta, mesh_xy):
+    """DIAG BISPSYM2: ``rows -> U_I rows U_I^dagger`` on the bank's canonical layout, or ``None``."""
+    from symmetry_maps import bgw_integer_q_to_fractional, mix_lorentz_blocks, unfold_isdf_operator
+    kgrid = (int(meta.nkx), int(meta.nky), int(meta.nkz))
+    q_frac = np.asarray(bgw_integer_q_to_fractional(sym.q_irr_kgrid_int, kgrid))
+    if vertex is None:
+        plan = wfns.green_parent.plan
+        inversion = _diag_unitary_inversion((plan,))
+        if inversion is None:
+            return None, None
+
+        def mirror(rows, q0, q1):
+            n = int(q1) - int(q0)
+            return unfold_isdf_operator(
+                rows, irr_idx=np.arange(n, dtype=np.int32),
+                sym_idx=np.full(n, inversion, dtype=np.int32),
+                sym_perm=plan.sym_perm, L_table=plan.L_table, q_irr_frac=q_frac[q0:q1],
+                mesh_xy=mesh_xy, n_sym_spatial=int(plan.n_sym_spatial),
+                axis_local_sym_perm=plan.centroid_local_perm)
+        return mirror, inversion
+    from .photon_layout import _empty, _insert, photon_block_view, photon_carry_order
+    families = vertex.families
+    plans, layout = tuple(families.plans), families.packed_layout
+    inversion = _diag_unitary_inversion(plans)
+    if inversion is None:
+        return None, None
+    psym = plans[0].sym
+    classes = tuple(tuple((C, D) for C in ((1, 2, 3) if a else (0,))
+                          for D in ((1, 2, 3) if b else (0,))) for a in (0, 1) for b in (0, 1))
+
+    def mirror(rows, q0, q1):
+        n = int(q1) - int(q0)
+        irr, ops = np.arange(n, dtype=np.int32), np.full(n, inversion, dtype=np.int32)
+        rows = photon_carry_order(rows[None], families, mesh_xy, to_packed=True)[0]
+        out = _empty(n, layout, mesh_xy, rows.dtype)
+        for keys in classes:
+            left, right = plans[int(keys[0][0] != 0)], plans[int(keys[0][1] != 0)]
+            total = None
+            for C, D in keys:
+                source = unfold_isdf_operator(
+                    photon_block_view(rows, layout, C, D, mesh_xy), irr_idx=irr, sym_idx=ops,
+                    sym_perm=left.sym_perm, L_table=left.L_table,
+                    right_sym_perm=right.sym_perm, right_L_table=right.L_table,
+                    q_irr_frac=q_frac[q0:q1], mesh_xy=mesh_xy,
+                    n_sym_spatial=int(left.n_sym_spatial),
+                    axis_local_sym_perm=left.centroid_local_perm,
+                    right_axis_local_sym_perm=right.centroid_local_perm)
+                mixed = mix_lorentz_blocks({(C, D): source}, sym=psym, sym_idx=ops,
+                                           mesh_xy=mesh_xy, keys=keys)
+                total = mixed if total is None else {k: total[k] + mixed[k] for k in total}
+            for (C, D), block in total.items():
+                out = _insert(out, block, layout, C, D, mesh_xy)
+        return photon_carry_order(out[None], families, mesh_xy, to_packed=False)[0]
+    return mirror, inversion
+
+
+def _diag_mirror_report(tag, got, want, vertex, mesh_xy, print_fn):
+    """DIAG BISPSYM2: max|got - want| / max|want| per Lorentz block (or whole), rank 0 prints."""
+    if vertex is None:
+        parts = {"all": (got, want)}
+    else:
+        from .photon_layout import photon_block_view
+        lay = vertex.families.layout
+        parts = {f"{C}{D}": (photon_block_view(got, lay, C, D, mesh_xy),
+                             photon_block_view(want, lay, C, D, mesh_xy))
+                 for C in range(4) for D in range(4)}
+    for name, (g, w_) in parts.items():
+        err = float(jnp.max(jnp.abs(g - w_)))
+        ref = float(jnp.max(jnp.abs(w_)))
+        if jax.process_index() == 0:
+            _diag_out(f"BISPSYM2 MIRROR {tag} block {name} max|diff| {err:.3e} "
+                      f"max|ref| {ref:.3e} rel {err/max(ref,1e-300):.3e}")
+
+
+class _DiagMirrorRows:
+    """DIAG BISPSYM2: ``raw`` with the -q partner rows replaced by the inversion image of the q rows."""
+
+    def __init__(self, raw, partner_rows, mirrored):
+        self.raw, self.partner_rows, self.mirrored = raw, np.asarray(partner_rows), mirrored
+
+    def __getitem__(self, key):
+        i, rows = key
+        if np.array_equal(np.asarray(rows), self.partner_rows):
+            return self.mirrored[int(i)]
+        return self.raw[i, rows]
+
+
 class _MemberRows:
     """``raw[i, rows]`` of one group member, read from the group carry ``[2m, q, μ, ν]``."""
 
@@ -1671,6 +1780,13 @@ def produce_sample_bank(wfns, meta, config, *, mesh_xy, sym, sample_plan, bank_i
     # the irreducible parents of one frequency, with their own admission.
     progress = LoopProgress(len(z), print_fn, title="response frequency integration",
                             item_name="frequency", max_updates=len(z)).start()
+    _DIAG_MAP[0] += 1
+    _diag_mirror_fn[0] = None
+    _diag_out(f"BISPSYM2 gate: partnered={partnered} env={os.environ.get('BISPSYM2_MIRROR')} "
+              f"file={os.path.exists('BISPSYM2_MIRROR')} cwd={os.getcwd()}")
+    if partnered and (os.environ.get("BISPSYM2_MIRROR", "0") == "1" or os.path.exists("BISPSYM2_MIRROR")):
+        _diag_mirror_fn[0], inv_row = _diag_mirror(wfns, vertex, sym, meta, mesh_xy)
+        _diag_out(f"BISPSYM2 mirror check: inversion row {inv_row} (photon={vertex is not None})")
 
     def solve(raw, partner, q0, q1, bank_handle, sample, need_value=True):
         """W and dW/ds of parents [q0, q1) at one sample, as the bank stores them."""
@@ -1772,11 +1888,59 @@ def produce_sample_bank(wfns, meta, config, *, mesh_xy, sym, sample_plan, bank_i
                     ledger.live_stages = live + (stage,)
                     started_selection = time.monotonic()
                     value, slope = solve(raw, 0, 0, len(qids), bank_handle, sample)
+                    diag_w = None
+                    raw_partner = raw
+                    if partnered and _diag_mirror_fn[0] is not None:
+                        mfn = _diag_mirror_fn[0]
+                        r_q = np.asarray([row_index[int(q)] for q in qids])
+                        r_m = np.asarray([row_index[int(q)] for q in partner_qids])
+                        for i in (0, 1):
+                            _diag_mirror_report(f"map{_DIAG_MAP[0]} sample {sample} chi{i}",
+                                                mfn(raw[i, r_q], 0, len(qids)), raw[i, r_m],
+                                                vertex, mesh_xy, print_fn)
+                        nq_ = len(qids)
+                        diag_c = 0.
+                        if vertex is not None:
+                            diag_c = read_shared_pole_bank(bank_handle, (0, nq_), meta=meta, header=header,
+                                                           fields=("constant",))["constant"]
+                        if sample == p0:
+                            _diag_mirror_report(f"map{_DIAG_MAP[0]} V", mfn(roots[0:nq_], 0, nq_),
+                                                jnp.conj(roots[0:nq_]), vertex, mesh_xy, print_fn)
+                            _diag_mirror_report(f"map{_DIAG_MAP[0]} V_noGamma", mfn(roots[0:nq_], 0, nq_)[1:],
+                                                jnp.conj(roots[1:nq_]), vertex, mesh_xy, print_fn)
+                            if vertex is not None:
+                                _diag_mirror_report(f"map{_DIAG_MAP[0]} const", mfn(diag_c, 0, nq_),
+                                                    jnp.conj(diag_c), vertex, mesh_xy, print_fn)
+                                _diag_out(f"contact {type(contact).__name__} {getattr(contact, 'shape', None)}")
+                                mc = mfn(diag_c, 0, nq_)
+                                for iq in range(nq_):
+                                    _diag_mirror_report(f"map{_DIAG_MAP[0]} constq{iq}:{int(qids[iq])}",
+                                                        mc[iq:iq+1], jnp.conj(diag_c[iq:iq+1]), vertex, mesh_xy, print_fn)
+                                    _diag_mirror_report(f"map{_DIAG_MAP[0]} Vq{iq}:{int(qids[iq])}",
+                                                        mfn(roots[iq:iq+1], iq, iq+1), jnp.conj(roots[iq:iq+1]),
+                                                        vertex, mesh_xy, print_fn)
+                                if contact is not None and getattr(contact, "ndim", 0) == 3:
+                                    _diag_mirror_report(f"map{_DIAG_MAP[0]} contact_q0", mfn(contact, 0, 1),
+                                                        jnp.conj(contact), vertex, mesh_xy, print_fn)
+                                del mc
+                        diag_w = mfn(value + diag_c, 0, nq_)
+                        if os.path.exists("BISPSYM2_USE_MIRROR"):
+                            raw_partner = _DiagMirrorRows(raw, r_m, {i: mfn(raw[i, r_q], 0, nq_) for i in (0, 1)})
+                            if sample == p0:
+                                _diag_out(f"map{_DIAG_MAP[0]} USING MIRRORED -q PARTNER ROWS")
                     with timing.section('bank.line_select'):
                         lines = selection.select(sample, value, slope)
                     del value, slope
                     if ordered:
-                        value, slope = solve(raw, 1, 0, len(qids), bank_handle, sample)
+                        value, slope = solve(raw_partner, 1, 0, len(qids), bank_handle, sample)
+                        del raw_partner
+                        if diag_w is not None:
+                            w_p = jnp.conj(value + diag_c)
+                            _diag_mirror_report(f"map{_DIAG_MAP[0]} sample {sample} W",
+                                                diag_w, w_p, vertex, mesh_xy, print_fn)
+                            _diag_mirror_report(f"map{_DIAG_MAP[0]} sample {sample} W_noGamma",
+                                                diag_w[1:], w_p[1:], vertex, mesh_xy, print_fn)
+                            del diag_w, w_p
                         with timing.section('bank.line_mirror'):
                             selection.mirror(sample, lines, value, slope)
                         del value, slope
