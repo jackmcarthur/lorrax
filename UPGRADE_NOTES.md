@@ -3,6 +3,21 @@
 User-visible changes, newest first. Binding rulings behind the breaking
 changes live in `docs/architecture/decisions.md`.
 
+## 2026-10-01 — QP seeds are projected on each k's little group; the four-current χ bank carries no −q rows
+
+An external SC seed (`sc_initial_qp_rotations_file`) is now averaged over each
+kept k's little group at import (H ← |G_k|⁻¹ Σ_L A_L(H), with the band
+representations of the little-group operations from the WFN), so a seed written
+by another run or code version cannot break this run's symmetry; gwjax.out's
+"SC initial Hamiltonian" line prints the largest change (the Fe 4³ bispinor
+2026-09-19 seed: 7.2e-5 eV). A seed whose Σ window cuts a multiplet refuses
+(`GATE little_group_band_representation`). Seeded SC runs move once (Fe 4³
+bispinor ≤ 0.16 meV); runs without a seed are unchanged. The four-current bank
+on inversion-symmetric magnets now also forms χ_{−q} from the parent rows by
+the inversion (Lorentz blocks mixed by the inversion's action), halving it
+(Fe/Ni 20³: 21.4 → ~10.7 GB per sample per rank); bispinor SC eqp moves by
+≤ 32 µeV.
+
 ## 2026-10-01 — the χ bank carries no −q rows on inversion-symmetric magnets
 
 On the ordered (time-reversal-broken) scalar route, every response sample's
