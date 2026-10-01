@@ -1680,9 +1680,16 @@ def x_block_rows(rows) -> np.ndarray:
 # Decides it: blocks resident per SM (<= 64 registers, >= 2 blocks) and odd, conflict-free shared
 #   strides, not HBM or FP64 (Fe 8^3 mode 7 at ~50 GB/s and 0.8 TF/s; 2935); after that the
 #   unfold gather's L2 latency (long_scoreboard 49%; 2956).
+def _placed_tables(tables, row, trs, lsrc, rsrc, mph, nph, spin, spin_r):
+    """``tables`` with this rank's placed device slices (``symmetry_maps.DeviceLoadTables``
+    fields inside a ``shard_map``) in place of its host arrays."""
+    return tables._replace(row=row, trs=trs, lsrc=lsrc, rsrc=rsrc, mph=mph, nph=nph,
+                           spin=spin, spin_r=spin_r)
+
+
 def make_kconv_klead_unfold(mesh: Mesh, kgrid, tables, *, store_rows, norm: str | None = "ortho",
                             mult: float = 1.0) -> Callable:
-    """The Σ k-leading convolution read from the RAW-PARENT Green: ``fn(G, Gt, W_prep) -> U``.
+    """The Σ k-leading convolution read from the RAW-PARENT Green: ``fn(G, Gt, W_prep, load=None) -> U``.
 
     ``G`` ``(n_parent, mu, ns, nu, ns)`` c128 at ``P(None,'x',None,'y',None)``
     is the centroid-major parent Green (``gw.greens_function_kernel.
@@ -1696,9 +1703,11 @@ def make_kconv_klead_unfold(mesh: Mesh, kgrid, tables, *, store_rows, norm: str 
     equal to ``apply(sigma_conv_operand(unfold_spin_centroid_operator(G, Gt)),
     W_prep)[store_rows]``: the typed unfold, the spin action and the
     spin-major reorder happen on the convolution's load, and every other k
-    row is transformed but never stored.  CUDA: nvidia-mathdx mode 7; cpu:
-    the service's reference composition, then the plan route and the row
-    selection.
+    row is transformed but never stored.  ``load``, when given, is the same
+    tables on the devices (``symmetry_maps.place_load_tables``), read as
+    operands so the consumer's program holds no table constants.  CUDA:
+    nvidia-mathdx mode 7; cpu: the service's reference composition, then the
+    plan route and the row selection.
 
     ``apply(..., rows=(x0, bx, xs, xn))`` stores one x block with the whole spin group: block
     row ``r`` in ``[0, xn*bx)`` of every rank's ``mu`` tile is the local left centroid
@@ -1729,8 +1738,7 @@ def make_kconv_klead_unfold(mesh: Mesh, kgrid, tables, *, store_rows, norm: str 
         attrs = dict(nkx=np.int64(kg[0]), nky=np.int64(kg[1]), nkz=np.int64(kg[2]),
                      scale=np.float64(si * sf * float(mult)), **_mathdx_common())
 
-        def local(g, gt, v_r, conj_src=False, block=None):
-            t = local_unfold_load_tables(tables)
+        def apply_tables(g, gt, v_r, t, conj_src, block):
             n_par, mx, _, my, _ = (int(v) for v in g.shape)
             x0, bx, xs, xn = (0, 0, 0, 0) if block is None else block
             flat = lambda a: a.reshape(n_par, mx * ns, my * ns)
@@ -1742,8 +1750,7 @@ def make_kconv_klead_unfold(mesh: Mesh, kgrid, tables, *, store_rows, norm: str 
     else:
         _, conv_local = _klead_locals(mesh, kg, norm, mult)
 
-        def local(g, gt, v_r, conj_src=False, block=None):
-            t = local_unfold_load_tables(tables)
+        def apply_tables(g, gt, v_r, t, conj_src, block):
             n_par, mx, _, my, _ = (int(v) for v in g.shape)
             flat = lambda a: a.reshape(n_par, mx * ns, my * ns)
             gt = jnp.conj(g) if conj_src else gt
@@ -1756,17 +1763,25 @@ def make_kconv_klead_unfold(mesh: Mesh, kgrid, tables, *, store_rows, norm: str 
             keep = jnp.asarray(idx < mx)[None, None, :, None, None]
             return jnp.where(keep, jnp.take(U, jnp.asarray(np.minimum(idx, mx - 1)), axis=2), 0)
 
+    def local(g, gt, v_r, *load, conj_src=False, block=None):
+        t = (local_unfold_load_tables(tables) if not load else
+             _placed_tables(tables, *load))
+        return apply_tables(g, gt, v_r, t, conj_src, block)
+
+    from symmetry_maps import DEVICE_LOAD_SPECS
     g_spec = P(None, "x", None, "y", None)
     sm = {}
 
-    def sharded(conj_src, block):
-        key = (conj_src, block)
+    def sharded(conj_src, block, placed):
+        key = (conj_src, block, placed)
         if key not in sm:
             sm[key] = _sharded(partial(local, conj_src=conj_src, block=block), mesh,
-                               (g_spec, g_spec, P(None, "x", "y")), P(None, None, "x", None, "y"))
+                               (g_spec, g_spec, P(None, "x", "y"))
+                               + (DEVICE_LOAD_SPECS if placed else ()),
+                               P(None, None, "x", None, "y"))
         return sm[key]
 
-    def apply(G, Gt, W_prep, *, conj_partner=False, rows=None):
+    def apply(G, Gt, W_prep, *, conj_partner=False, rows=None, load=None):
         """``conj_partner``: the antiunitary partner is ``conj(G)`` (a Green of real weights),
         read from ``G`` on the load, so no partner tile exists (``Gt`` must be ``None``)."""
         _check_complex(G, W_prep)
@@ -1801,7 +1816,8 @@ def make_kconv_klead_unfold(mesh: Mesh, kgrid, tables, *, store_rows, norm: str 
                                  f"at stride xs >= x0+bx starting inside the local extent {mx}")
             if rows == (0, mx, mx, 1):
                 rows = None
-        return sharded(bool(conj_partner and needs_partner), rows)(G, Gt, W_prep)
+        return sharded(bool(conj_partner and needs_partner), rows, load is not None)(
+            G, Gt, W_prep, *(() if load is None else load))
     return apply
 
 
@@ -1818,7 +1834,8 @@ def _vertex_tables(vertices, ns: int, label: str) -> tuple[np.ndarray, np.ndarra
 def make_kconv_lorentz_unfold(mesh: Mesh, kgrid, tables, *, w_tables, left_vertices, right_vertices,
                               store_rows, norm: str | None = "ortho",
                               mult: float = 1.0) -> Callable:
-    """The four-current Σ convolution read from the RAW-PARENT Green and W: ``fn(G, Gt, W, Wt) -> U``.
+    """The four-current Σ convolution read from the RAW-PARENT Green and W:
+    ``fn(G, Gt, W, Wt, load=None, w_load=None) -> U``.
 
     ``U[k,a,x,b,y] = mult · fftn( Σ_ij (γ_i ifftn(Ĝ) γ_j†)[a,x,b,y] · ifftn(Ŵ)[k,x,i,y,j] )``
 
@@ -1837,6 +1854,10 @@ def make_kconv_lorentz_unfold(mesh: Mesh, kgrid, tables, *, w_tables, left_verti
     rows ``store_rows`` of the full-k result.  Neither a full-q W nor a
     full-grid W_R exists: each tile's W columns are unfolded and transformed on
     the kernel's load.
+
+    ``load`` / ``w_load``, when given, are ``tables`` / ``w_tables`` on the
+    devices (``symmetry_maps.place_load_tables``), read as operands so the
+    consumer's program holds no table constants.
 
     CUDA: nvidia-mathdx mode 8 with the second (W) load; it rounds as mode 9
     on ``W`` then the V_R door (bit for bit).  cpu: the service's reference
@@ -1875,9 +1896,7 @@ def make_kconv_lorentz_unfold(mesh: Mesh, kgrid, tables, *, w_tables, left_verti
                      scale_w=np.float64(si), perm_l=perm_l, phase_l=phase_l, perm_r=perm_r,
                      phase_r=phase_r, **_mathdx_common())
 
-        def local(g, gt, w, wt, conj_src=False):
-            t = local_unfold_load_tables(tables)
-            tw = local_unfold_load_tables(w_tables)
+        def apply_tables(g, gt, w, wt, t, tw, conj_src):
             n_par, mx, _, my, _ = (int(d) for d in g.shape)
             n_w = int(w.shape[0])
             flat = lambda a: a.reshape(n_par, mx * ns, my * ns)
@@ -1894,9 +1913,7 @@ def make_kconv_lorentz_unfold(mesh: Mesh, kgrid, tables, *, w_tables, left_verti
         left = [(perm_l[i * ns:(i + 1) * ns], quarter[phase_l[i * ns:(i + 1) * ns]]) for i in range(na)]
         right = [(perm_r[j * ns:(j + 1) * ns], quarter[phase_r[j * ns:(j + 1) * ns]]) for j in range(nb)]
 
-        def local(g, gt, w, wt, conj_src=False):
-            t = local_unfold_load_tables(tables)
-            tw = local_unfold_load_tables(w_tables)
+        def apply_tables(g, gt, w, wt, t, tw, conj_src):
             n_par, mx, _, my, _ = (int(d) for d in g.shape)
             n_w = int(w.shape[0])
             flat = lambda a: a.reshape(n_par, mx * ns, my * ns)
@@ -1917,12 +1934,23 @@ def make_kconv_lorentz_unfold(mesh: Mesh, kgrid, tables, *, w_tables, left_verti
                     total = total + value * v_r[:, None, :, i, None, :, j]
             return jnp.take(forward_local(total) * mult, jnp.asarray(rows), axis=0)
 
+    def local(g, gt, w, wt, *load, conj_src=False):
+        if load:
+            t, tw = _placed_tables(tables, *load[:8]), _placed_tables(w_tables, *load[8:])
+        else:
+            t, tw = local_unfold_load_tables(tables), local_unfold_load_tables(w_tables)
+        return apply_tables(g, gt, w, wt, t, tw, conj_src)
+
+    from symmetry_maps import DEVICE_LOAD_SPECS
     g_spec = P(None, "x", None, "y", None)
-    sm = {c: _sharded(partial(local, conj_src=c), mesh, (g_spec, g_spec, g_spec, g_spec),
-                      P(None, None, "x", None, "y")) for c in (False, True)}
+    sm = {(c, placed): _sharded(partial(local, conj_src=c), mesh,
+                                (g_spec, g_spec, g_spec, g_spec)
+                                + (2 * DEVICE_LOAD_SPECS if placed else ()),
+                                P(None, None, "x", None, "y"))
+          for c in (False, True) for placed in (False, True)}
     w_partner = bool(np.any(np.asarray(w_tables.trs)))
 
-    def apply(G, Gt, W, Wt, *, conj_partner=False):
+    def apply(G, Gt, W, Wt, *, conj_partner=False, load=None, w_load=None):
         """``conj_partner``: as :func:`make_kconv_klead_unfold`'s.  ``Wt`` may be ``None``
         only when no q row of ``w_tables`` is antiunitary."""
         _check_complex(G, W)
@@ -1956,7 +1984,11 @@ def make_kconv_lorentz_unfold(mesh: Mesh, kgrid, tables, *, w_tables, left_verti
                 f"k-leading lorentz conv: G {G.shape} / W {W.shape} do not match their tables "
                 f"(n_parent={tables.n_parent}, endpoints {tables.lsrc.shape[1]}/{tables.rsrc.shape[1]} "
                 f"merged over ns={ns}; W endpoints {w_tables.lsrc.shape[1]}/{w_tables.rsrc.shape[1]})")
-        return sm[bool(conj_partner and needs_partner)](G, Gt, W, Wt)
+        if (load is None) != (w_load is None):
+            raise ValueError("k-leading lorentz conv: pass both placed tables or neither")
+        placed = load is not None
+        return sm[(bool(conj_partner and needs_partner), placed)](
+            G, Gt, W, Wt, *((*load, *w_load) if placed else ()))
     return apply
 
 

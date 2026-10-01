@@ -1022,13 +1022,18 @@ class SynthesisTau:
     an ordered model; ``window_arguments`` swaps in the right endpoint's
     operands and the synthesis's per-window operands.  Neither closes over a
     device buffer, so the accumulator's runner cache retains no factors.
+    ``door`` (the Σ door's placed load tables, ``symmetry_maps.place_load_tables``
+    ``.arrays``) rides the window arguments too, and ``spatial`` receives it
+    as its last argument, so no window program holds table constants.
     """
 
-    def __init__(self, spatial, synthesis, right_yr, right_proj, native, stage, meta, key, plans):
+    def __init__(self, spatial, synthesis, right_yr, right_proj, native, stage, meta, key, plans,
+                 door=None):
         self._spatial, self._synthesis = spatial, synthesis
         self._right = (right_yr, right_proj)
         self._native, self._stage, self._meta = native, stage, meta
         self._key, self._plans = key, plans
+        self._door = door
         self._admitted = False
 
     def window_kernel(self, space):
@@ -1044,9 +1049,12 @@ class SynthesisTau:
         if key not in _SYNTHESIS_TAU:
             spatial, w_kernel = self._spatial, self._synthesis.w_kernel
 
-            def tau(xn, yr, xr, yn, energies, weight, w_operands, e_ref_a, e_ref_b, t, _active):
+            def tau(xn, yr, xr, yn, energies, weight, w_operands, e_ref_a, e_ref_b, door, t,
+                    _active):
                 interactions = w_kernel(*w_operands, e_ref_b, t, hole)
-                return spatial(xn, yr, xr, yn, energies, weight, e_ref_a, t, interactions)
+                if door is None:
+                    return spatial(xn, yr, xr, yn, energies, weight, e_ref_a, t, interactions)
+                return spatial(xn, yr, xr, yn, energies, weight, e_ref_a, t, interactions, door)
             # The plans ride along so the ids in the key cannot be reused.
             _SYNTHESIS_TAU[key] = (self._plans, tau)
         return _SYNTHESIS_TAU[key][1]
@@ -1054,7 +1062,7 @@ class SynthesisTau:
     def window_arguments(self, xn, xr, energies, weight, e_ref_a, e_ref_b, space, indices, bounds):
         w_operands = self._synthesis.window_operands(space, indices, bounds)
         return (xn, self._right[0], xr, self._right[1], energies, weight, w_operands,
-                e_ref_a, e_ref_b)
+                e_ref_a, e_ref_b, self._door)
 
     def admit(self, compiled, arguments):
         """Reserve the first window executable; the resident factors are the synthesis's stage."""
@@ -1165,21 +1173,24 @@ def _integrate_sigma_batches(
             # The scalar shared-pole route: the shared sigma_kij reads the
             # parent pair its synthesis builds inside the same τ body, and
             # unfolds it on the transform's load (mathdx mode 9, the q wedge).
-            from gw.ppm_tau_kernel import sigma_pass_price
+            from gw.ppm_tau_kernel import sigma_door_tables, sigma_pass_price
             sigma_kij = _get_sigma_kij_kernel(
                 mesh_xy=mesh_xy, kgrid=kgrid, merged_x=True, brackets=brackets,
                 q_wedge=w_synthesis.q_wedge, **face_kwargs)
 
             def scalar_spatial(xn, yr, xr, yn, energies, weight, e_ref, t, interactions,
-                               sigma_kij=sigma_kij):
-                return sigma_kij(xn, yr, xr, yn, energies, weight, e_ref, t, *interactions)
+                               door, sigma_kij=sigma_kij):
+                return sigma_kij(xn, yr, xr, yn, energies, weight, e_ref, t, *interactions,
+                                 g_tables=door)
             scalar_spatial.price = sigma_pass_price(sigma_kij)
             spatial_key = ("scalar-parent", mesh_xy, kgrid, brackets,
                            w_synthesis.q_wedge.wedge_key(),
                            tuple(sorted(face_kwargs.items(), key=lambda kv: kv[0])))
+            # The Green door's tables, placed once per run and plan: window arguments.
             tau_kernel = SynthesisTau(
                 scalar_spatial, w_synthesis, psi_coh_yr, psi_proj_yn, w_synthesis.native,
-                "sigma.synthesis.window", meta, spatial_key, (k_unfold_plan,))
+                "sigma.synthesis.window", meta, spatial_key, (k_unfold_plan,),
+                door=sigma_door_tables(mesh_xy, k_unfold_plan).arrays)
         else:
             tau_kernel = get_shared_sigma_tau_kernel(
                 mesh_xy=mesh_xy, kgrid=kgrid, brackets=brackets,

@@ -47,6 +47,34 @@ _sigma_shared_tau_kernel_cache: dict[
     tuple[object, ...], Callable[..., jax.Array]
 ] = {}
 
+#: The Σ door's placed load tables per (mesh, parent plan); bounded.  Plans are
+#: identity-keyed run objects, stable across SC maps, so a run places them once.
+_SIGMA_DOOR_TABLES: dict = {}
+
+
+def sigma_door_tables(mesh_xy: Mesh, k_unfold_plan):
+    """The Σ mode-7 door's load tables on the devices, placed once per mesh and plan.
+
+    ``symmetry_maps.place_load_tables`` of ``k_unfold_plan.unfold_load_tables()``
+    under the key ``"g"``.  A Σ program that passes ``.arrays`` as its
+    ``g_tables`` argument holds no table constants: baked, the global row and
+    phase tables were HLO literals in every window program (~1.1 GB at Fe 20^3,
+    8000 k, 1792 centroids, two spinor components), and XLA's copies of them
+    set the compile's host peak.
+    """
+    key = (mesh_xy, k_unfold_plan)
+    hit = _SIGMA_DOOR_TABLES.get(key)
+    if hit is None:
+        from common import timing
+        from symmetry_maps import place_load_tables
+        with timing.section('sigma.door_tables', announce=True):
+            placed = place_load_tables({"g": k_unfold_plan.unfold_load_tables()}, mesh_xy)
+        while len(_SIGMA_DOOR_TABLES) >= 2:
+            _SIGMA_DOOR_TABLES.pop(next(iter(_SIGMA_DOOR_TABLES)))
+        # The plan rides along so its id in the key cannot be reused.
+        hit = _SIGMA_DOOR_TABLES[key] = (k_unfold_plan, placed)
+    return hit[1]
+
 
 def _make_project_ri_reduce_scatter(
     mesh_xy: Mesh, *, merged_x: bool = True,
@@ -78,7 +106,7 @@ class SpatialKernel(NamedTuple):
         the identity on the cpu handler, which transforms W itself).  Hoisting
         it is the saving available to a caller that contracts SEVERAL G(τ)
         against the same W(τ) (the band brackets).
-    ``conv_project(psi_xr, psi_yn, G_parents, W_prep) -> Sigma``
+    ``conv_project(psi_xr, psi_yn, G_parents, W_prep, g_tables=None) -> Sigma``
         The G-dependent remainder: the router's fused unfold convolution
         (``make_kconv_klead_unfold``: the typed unfold of the raw-parent
         Green, its spin action and the spin-major reorder on the load, then
@@ -156,8 +184,11 @@ def get_sigma_spatial_kernel(
         face_band_extent=face_band_extent, k_unfold_plan=k_unfold_plan,
         row_block=None if d == ns else blocks[0][1] * blocks[0][3])
 
-    def convolve_project(psi_proj_xr, psi_proj_yn, G_parents, W_prep):
+    def convolve_project(psi_proj_xr, psi_proj_yn, G_parents, W_prep, g_tables=None):
         """Σ on the parent rows, one stored output x block at a time (one pass at d = ns).
+
+        ``g_tables``: the door's placed tables (:func:`sigma_door_tables` ``.arrays``),
+        read as operands; ``None`` bakes the host tables into the program.
 
         ψ is oriented once and every block adds into one rank-local band
         partial, so the band-block reduce-scatter runs once per call.  The
@@ -168,10 +199,13 @@ def get_sigma_spatial_kernel(
         price ``sigma_spin_block`` admits)."""
         faces = acc = None
         G, Gt, W = G_parents.G, G_parents.transpose, W_prep
+        load = (None if g_tables is None else
+                sigma_door_tables(mesh_xy, k_unfold_plan).loads(g_tables)["g"])
         for rows in blocks:
             if acc is not None:
                 acc, G, Gt, W = jax.lax.optimization_barrier((acc, G, Gt, W))
-            sigma_parent = unfold_conv(G, Gt, W, conj_partner=G_parents.conj_partner, rows=rows)
+            sigma_parent = unfold_conv(G, Gt, W, conj_partner=G_parents.conj_partner, rows=rows,
+                                       load=load)
             if faces is None:
                 sigma_parent, left, right = jax.lax.optimization_barrier(
                     (sigma_parent, psi_proj_xr, psi_proj_yn))
@@ -185,11 +219,11 @@ def get_sigma_spatial_kernel(
         return kconv.prep(W_q)
 
     @partial(jax.jit, donate_argnums=(2,))
-    def conv_project(psi_proj_xr, psi_proj_yn, G_parents, W_prep):
+    def conv_project(psi_proj_xr, psi_proj_yn, G_parents, W_prep, g_tables=None):
         # Raw-parent Green in, spin-major Σ_k out on the parent rows only: the
         # typed unfold, spin action and reorder are the convolution's load,
         # and the other full-k rows are never stored.
-        return convolve_project(psi_proj_xr, psi_proj_yn, G_parents, W_prep)
+        return convolve_project(psi_proj_xr, psi_proj_yn, G_parents, W_prep, g_tables)
     pair = SpatialKernel(prep_w=prep_w, conv_project=conv_project, price=price or None)
     _sigma_spatial_kernel_cache[key] = pair
     return pair
@@ -215,7 +249,9 @@ def _get_sigma_kij_kernel(
     the q wedge and is prepared by mathdx mode 9 on the pair-transpose rule,
     its partner tile ``W_pt`` (the tile built from the conjugated residues)
     read on antiunitary rows and the device load tables ``load`` passed as
-    arguments; the kernel then takes ``(..., W_q, W_pt, load)``."""
+    arguments; the kernel then takes ``(..., W_q, W_pt, load)``.  ``g_tables``
+    (keyword) are the Green door's placed tables (:func:`sigma_door_tables`
+    ``.arrays``), read as operands; ``None`` bakes them into the program."""
     if layout not in ("face", "axis") or face_shape is None or k_unfold_plan is None:
         raise ValueError("Sigma tau requires canonical face shapes and a typed parent unfold plan.")
     from ffi import ffi_dial_key
@@ -264,7 +300,7 @@ def _get_sigma_kij_kernel(
 
     def _bracketed_face(psi_coh_xn, psi_coh_yr, psi_proj_xr, psi_proj_yn,
                         E_A, mask_A, E_min, E_max, E_ref_A, t_node,
-                        W_prep, build_g, conv):
+                        W_prep, build_g, conv, g_tables=None):
         """Mask each bracket on the last band axis while retaining one Green tile at a time.
 
         A bracket whose selector has no nonzero band builds an identically zero
@@ -288,7 +324,7 @@ def _get_sigma_kij_kernel(
                 G_k = build_g(psi_coh_xn, psi_coh_yr, E_A, mask_bracket,
                              E_min, E_max, E_ref_A, t_node,
                              band_range=(lo, hi))
-                return conv(psi_proj_xr, psi_proj_yn, G_k, W_prep)
+                return conv(psi_proj_xr, psi_proj_yn, G_k, W_prep, g_tables)
 
             shape = jax.eval_shape(live, None)
             projected = jax.lax.cond(
@@ -308,6 +344,7 @@ def _get_sigma_kij_kernel(
     def _kernel_impl(
         psi_coh_xn, psi_coh_yr, psi_proj_xr, psi_proj_yn,
         E_A, mask_A, E_min, E_max, E_ref_A, t_node, W_q, W_pt=None, load=None,
+        g_tables=None,
     ):
         # ONE W preparation per τ, ABOVE the bracket loop.  Explicit, not
         # left to CSE: on the decomposed chain this is ``ifftn(W)``, the
@@ -317,11 +354,11 @@ def _get_sigma_kij_kernel(
             G_k = _g_from_selector(psi_coh_xn, psi_coh_yr, E_A, mask_A,
                                    E_min, E_max, E_ref_A, t_node)
             return spatial.conv_project(
-                psi_proj_xr, psi_proj_yn, G_k, W_prep)
+                psi_proj_xr, psi_proj_yn, G_k, W_prep, g_tables)
         return _bracketed_face(
             psi_coh_xn, psi_coh_yr, psi_proj_xr, psi_proj_yn,
             E_A, mask_A, E_min, E_max, E_ref_A, t_node, W_prep,
-            _g_from_selector, spatial.conv_project)
+            _g_from_selector, spatial.conv_project, g_tables)
 
     if energy_windows:
         kernel = partial(jax.jit, donate_argnums=(10,))(_kernel_impl)
@@ -329,11 +366,11 @@ def _get_sigma_kij_kernel(
         @partial(jax.jit, donate_argnums=(8,))
         def kernel(
             psi_coh_xn, psi_coh_yr, psi_proj_xr, psi_proj_yn,
-            E_A, mask_A, E_ref_A, t_node, W_q, W_pt=None, load=None,
+            E_A, mask_A, E_ref_A, t_node, W_q, W_pt=None, load=None, g_tables=None,
         ):
             return _kernel_impl(
                 psi_coh_xn, psi_coh_yr, psi_proj_xr, psi_proj_yn,
-                E_A, mask_A, None, None, E_ref_A, t_node, W_q, W_pt, load)
+                E_A, mask_A, None, None, E_ref_A, t_node, W_q, W_pt, load, g_tables)
 
     _sigma_kij_kernel_cache[key] = kernel
     _SIGMA_PASS_PRICE[id(kernel)] = spatial.price

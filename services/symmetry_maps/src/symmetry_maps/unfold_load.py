@@ -38,7 +38,7 @@ from symmetry_maps.maps import certify_endpoint_locality
 
 __all__ = ["QirrOperator", "DeviceLoadTables", "DEVICE_LOAD_SPECS", "device_load_tables",
            "UnfoldLoadTables", "unfold_load_tables", "local_unfold_load_tables", "umklapp_phase",
-           "apply_unfold_load_tables_local"]
+           "apply_unfold_load_tables_local", "PlacedLoadTables", "place_load_tables"]
 
 
 class UnfoldLoadTables(NamedTuple):
@@ -218,6 +218,61 @@ def device_load_tables(t: UnfoldLoadTables, mesh_xy) -> DeviceLoadTables:
     host = (t.row, t.trs, t.lsrc, t.rsrc, t.mph, t.nph, t.spin, spin_r)
     return DeviceLoadTables(*(device_put_process_local(np.asarray(a), _NS(mesh_xy, spec))
                               for a, spec in zip(host, DEVICE_LOAD_SPECS)))
+
+
+class PlacedLoadTables(NamedTuple):
+    """Load tables of several doors on the devices, every distinct host array once.
+
+    ``arrays`` are the distinct device arrays: a consumer passes them to its
+    jit as ONE argument (``in_shardings`` from ``specs``), so its program holds
+    no table constants and the compiled argument bytes count each array once.
+    ``index[key]`` lists the positions in ``arrays`` of door ``key``'s
+    :class:`DeviceLoadTables` fields; :meth:`loads` rebuilds them from the
+    argument inside the trace.
+    """
+    index: dict
+    arrays: tuple
+    specs: tuple
+    bytes_per_rank: int
+
+    def loads(self, arrays=None) -> dict:
+        """``{key: DeviceLoadTables}`` over ``arrays`` (default: the placed ones)."""
+        arrays = self.arrays if arrays is None else arrays
+        return {key: DeviceLoadTables(*(arrays[i] for i in slots))
+                for key, slots in self.index.items()}
+
+
+def place_load_tables(tables, mesh_xy) -> PlacedLoadTables:
+    """``tables`` (``{door key: UnfoldLoadTables}``) on the devices, each distinct host array once.
+
+    The one owner of door-table placement: a door built from host tables
+    bakes them as HLO literals into every program that traces it (megabytes
+    to gigabytes per door at production k grids; XLA's copies of them set
+    the compile's host peak), while placed tables are read as operands.
+    Arrays are deduplicated by identity, so doors that share a table array
+    (quadrants, row passes, the particle and hole W tables of one plan) share
+    one device copy.  Per-k tables are replicated, left tables on X, right
+    tables on Y (:data:`DEVICE_LOAD_SPECS`).
+    """
+    from lxkit import device_put_process_local
+    slot, arrays, specs, held = {}, [], [], []
+
+    def put(a, spec):
+        if id(a) not in slot:
+            # The host array stays held beside its copy, so its id is not reused.
+            slot[id(a)] = len(arrays)
+            held.append(a)
+            arrays.append(device_put_process_local(np.asarray(a), _NS(mesh_xy, spec)))
+            specs.append(spec)
+        return slot[id(a)]
+
+    index = {}
+    for key, t in tables.items():
+        host = (t.row, t.trs, t.lsrc, t.rsrc, t.mph, t.nph, t.spin,
+                t.spin if t.spin_r is None else t.spin_r)
+        index[key] = tuple(put(a, s) for a, s in zip(host, DEVICE_LOAD_SPECS))
+    per_rank = sum(int(d.addressable_shards[0].data.nbytes) for d in arrays)
+    return PlacedLoadTables(index, tuple(arrays), tuple(specs), per_rank)
 
 
 def apply_unfold_load_tables_local(G, Gt, t: UnfoldLoadTables, spin_host, spin_r_host=None):

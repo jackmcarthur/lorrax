@@ -319,6 +319,19 @@ def _make_static_convolution(mesh_xy: Mesh, kgrid: tuple[int, int, int],
 
 
 _lorentz_convolution_cache: dict[tuple[object, ...], object] = {}
+_LORENTZ_GREEN_TABLES: dict[tuple[int, int], object] = {}
+
+
+def _lorentz_green_tables(left_plan, right_plan):
+    """The Green's load tables of a plan pair, one object per pair: the particle and
+    hole doors of a class share it, so a placement copies it once."""
+    key = (id(left_plan), id(right_plan))
+    if key not in _LORENTZ_GREEN_TABLES:
+        tables = left_plan.unfold_load_tables(
+            right_plan=None if right_plan is left_plan else right_plan)
+        # The plans ride along so their ids cannot be reused.
+        _LORENTZ_GREEN_TABLES[key] = (left_plan, right_plan, tables)
+    return _LORENTZ_GREEN_TABLES[key][2]
 
 
 def lorentz_class_vertices(keys):
@@ -337,7 +350,7 @@ def lorentz_class_vertices(keys):
 
 def make_lorentz_convolution(mesh_xy: Mesh, kgrid, nk_tot: int, keys, left_plan,
                              right_plan=None, *, w_tables):
-    """The four-current Σ door: ``fn(parent_green, W, Wt) -> Σ_k``, read from the raw parents.
+    """The four-current Σ door: ``fn(parent_green, W, Wt, load=None, w_load=None) -> Σ_k``.
 
         Σ_k = -1/√N_k · fftn( Σ_AB γ̃_A ifftn(Ĝ) γ̃_B† · ifftn(Ŵ)[:, x, A, y, B] )
 
@@ -351,7 +364,11 @@ def make_lorentz_convolution(mesh_xy: Mesh, kgrid, nk_tot: int, keys, left_plan,
     nvidia-mathdx mode 8 on CUDA), so no full-k Green, full-q W or full-grid
     W_R exists.  Σ_k leaves spin-major ``(n_parent, s, mu, s', nu)`` on the left
     plan's parent rows (``parent_full_rows``), the face projector's order;
-    the other full-k rows are never stored.
+    the other full-k rows are never stored.  ``fn.tables`` are the Green's
+    host load tables, one object per plan pair (shared by every W table), and
+    ``load`` / ``w_load`` the placed copies of ``fn.tables`` / ``w_tables``
+    (``symmetry_maps.place_load_tables``), read as operands; ``None`` bakes the
+    host tables into the program.
     """
     from ffi import ffi_dial_key
     from common.fft_helpers import make_kconv_lorentz_unfold
@@ -361,8 +378,7 @@ def make_lorentz_convolution(mesh_xy: Mesh, kgrid, nk_tot: int, keys, left_plan,
     key = (_mesh_key(mesh_xy), tuple(int(v) for v in kgrid), ffi_dial_key(), int(nk_tot),
            lefts, rights, id(left_plan), id(right), id(w_tables))
     if key not in _lorentz_convolution_cache:
-        tables = left_plan.unfold_load_tables(
-            right_plan=None if right is left_plan else right)
+        tables = _lorentz_green_tables(left_plan, right)
         door = make_kconv_lorentz_unfold(
             mesh_xy, kgrid, tables,
             left_vertices=[gamma_perm_phase_host(A) for A in lefts],
@@ -370,9 +386,10 @@ def make_lorentz_convolution(mesh_xy: Mesh, kgrid, nk_tot: int, keys, left_plan,
             store_rows=left_plan.parent_full_rows,
             norm='ortho', mult=-1.0 / np.sqrt(float(nk_tot)), w_tables=w_tables)
 
-        def convolve(parent_green, W, Wt):
+        def convolve(parent_green, W, Wt, load=None, w_load=None):
             return door(parent_green.G, parent_green.transpose, W, Wt,
-                        conj_partner=parent_green.conj_partner)
+                        conj_partner=parent_green.conj_partner, load=load, w_load=w_load)
+        convolve.tables = tables
         # The entry keeps both plans and the W tables alive, so their ids cannot be reused.
         _lorentz_convolution_cache[key] = (convolve, left_plan, right, w_tables)
     return _lorentz_convolution_cache[key][0]

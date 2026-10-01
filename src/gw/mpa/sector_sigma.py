@@ -279,6 +279,28 @@ def _quarter_tables(plans, c, d):
     return hit[1], hit[2]
 
 
+#: Placed door tables per (mesh, table objects); the plans and the W tables keep
+#: their identities across SC maps (cached by content), so a run places each
+#: class's tables once.  Bounded.
+_SECTOR_DOOR_TABLES: dict = {}
+
+
+def _sector_door_tables(mesh_xy, tables):
+    """``symmetry_maps.place_load_tables(tables)``, once per mesh and table objects."""
+    key = (mesh_xy, tuple((k, id(t)) for k, t in tables.items()))
+    hit = _SECTOR_DOOR_TABLES.get(key)
+    if hit is None:
+        from common import timing
+        from symmetry_maps import place_load_tables
+        with timing.section('sigma.door_tables', announce=True):
+            placed = place_load_tables(tables, mesh_xy)
+        while len(_SECTOR_DOOR_TABLES) >= 8:
+            _SECTOR_DOOR_TABLES.pop(next(iter(_SECTOR_DOOR_TABLES)))
+        # The table objects ride along so their ids in the key cannot be reused.
+        hit = _SECTOR_DOOR_TABLES[key] = (tuple(tables.values()), placed)
+    return hit[1]
+
+
 def sector_tau_factory(left, right, keys, meta, mesh_xy):
     """Bind Gamma_A G_AB(t) Gamma_B to the window executor.
 
@@ -348,13 +370,19 @@ def sector_tau_factory(left, right, keys, meta, mesh_xy):
             doors = {hole: make_lorentz_convolution(mesh_xy, meta.kgrid, meta.nk_tot, keys,
                                                     plans[0], plans[1], w_tables=tables)
                      for hole, tables in ((False, synthesis.w_tables[0]), (True, synthesis.w_tables[1]))}
+            placed = _sector_door_tables(mesh_xy, {
+                "g": doors[False].tables,
+                ("w", False): synthesis.w_tables[0], ("w", True): synthesis.w_tables[1]})
 
-            def spatial(xn, yr, xr, yn, energies, weight, reference, time, interactions):
+            def spatial(xn, yr, xr, yn, energies, weight, reference, time, interactions, door):
+                loads = placed.loads(door)
                 phases = _weighted_tau_phases(energies, 1j*time, e_ref=reference,
                                              band_weight=weight)
                 green = build_G_parents(xn, yr, phases=phases, layout=a.layout,
                                         gemm=gemm, k_unfold_plan=plans[0])
-                return project(xr, doors[interactions.hole](green, interactions.W, interactions.partner), yn)
+                hole = interactions.hole
+                return project(xr, doors[hole](green, interactions.W, interactions.partner,
+                                               load=loads["g"], w_load=loads[("w", hole)]), yn)
         else:
             from common.fft_helpers import make_kconv_lorentz_unfold
             from gw.cohsex_sigma import lorentz_class_vertices
@@ -366,28 +394,34 @@ def sector_tau_factory(left, right, keys, meta, mesh_xy):
                 face_band_extent=band_axis.padded)
             gemm_q = gemm if face_green else gemm_plan(mesh_xy, m=m//2, k=k, n=n//2, nq=q,
                                                        dtype=jnp.complex128, layout=a.layout)
-            passes = []
+            passes, door_tables = [], {
+                ("w", False): synthesis.w_tables[0], ("w", True): synthesis.w_tables[1]}
             for qa in (0, 1):
                 for qb in (0, 1):
                     c, d = hl[qa], hr[qb]
                     half, tables = _quarter_tables(plans, c, d)
+                    door_tables[("g", qa, qb)] = tables
                     doors = {hole: make_kconv_lorentz_unfold(
                         mesh_xy, meta.kgrid, tables, left_vertices=vl[qa], right_vertices=vr[qb],
                         store_rows=plans[0].parent_full_rows, norm='ortho',
                         mult=-1.0/np.sqrt(float(meta.nk_tot)), w_tables=w)
                         for hole, w in ((False, synthesis.w_tables[0]), (True, synthesis.w_tables[1]))}
                     passes.append((qa, qb, c, d, half, doors))
+            placed = _sector_door_tables(mesh_xy, door_tables)
 
-            def spatial(xn, yr, xr, yn, energies, weight, reference, time, interactions):
+            def spatial(xn, yr, xr, yn, energies, weight, reference, time, interactions, door):
+                loads = placed.loads(door)
                 phases = _weighted_tau_phases(energies, 1j*time, e_ref=reference,
                                              band_weight=weight)
                 W, Wt = interactions.W, interactions.partner
+                hole = interactions.hole
                 total = None
                 for i, (qa, qb, c, d, half, doors) in enumerate(passes):
                     green = build_G_parents(xn[:, 2*c:2*c+2], yr[:, :, 2*d:2*d+2], phases=phases,
                                             layout=a.layout, gemm=gemm_q, k_unfold_plan=half)
-                    sigma = doors[interactions.hole](green.G, green.transpose, W, Wt,
-                                                     conj_partner=green.conj_partner)
+                    sigma = doors[hole](green.G, green.transpose, W, Wt,
+                                        conj_partner=green.conj_partner,
+                                        load=loads[("g", qa, qb)], w_load=loads[("w", hole)])
                     value = project(xr[:, :, 2*qa:2*qa+2], sigma, yn[:, 2*qb:2*qb+2])
                     total = value if total is None else total + value
                     if i + 1 < len(passes):
@@ -407,7 +441,7 @@ def sector_tau_factory(left, right, keys, meta, mesh_xy):
              id(synthesis.w_tables[0]),id(synthesis.w_tables[1]),quarters)
         return SynthesisTau(spatial, synthesis, right_yr, right_proj,
                          native+synthesis.native, f'sigma.sector.tau.{keys[0]}', meta, key,
-                         (*plans, *synthesis.w_tables))
+                         (*plans, *synthesis.w_tables), door=placed.arrays)
     return factory
 
 
