@@ -366,8 +366,10 @@ def _photon_stream_doors(mesh_xy, kgrid, half_plans, parity, passes):
     key = (mesh_xy, tuple(int(v) for v in kgrid), tuple(half_plans), passes)
     hit = _PHOTON_DOORS.get(key)
     if hit is None:
-        doors = _photon_chi_doors(mesh_xy, kgrid, half_plans, parity, passes=passes)
-        loads, n_arrays, per_rank = _place_photon_door_tables(doors, mesh_xy)
+        from common import timing
+        with timing.section('response.door_tables', announce=True):
+            doors = _photon_chi_doors(mesh_xy, kgrid, half_plans, parity, passes=passes)
+            loads, n_arrays, per_rank = _place_photon_door_tables(doors, mesh_xy)
         if jax.process_index() == 0:
             print(f"  [response] four-current mode-11 doors: {len(doors)} doors, {n_arrays} "
                   f"table arrays placed once, {per_rank / 1e9:.3f} GB/rank", flush=True)
