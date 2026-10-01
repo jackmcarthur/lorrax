@@ -3,6 +3,20 @@
 User-visible changes, newest first. Binding rulings behind the breaking
 changes live in `docs/architecture/decisions.md`.
 
+## 2026-09-30 — a held SC map refits the response rule warm when line sites move
+
+When the shared-pole line sites move at a held SC map, the χ response rule is
+refitted. The refit now tries the held rule's complex times first
+(`minimax.response_group_rules` looks up the previous rule by its member
+set; before, it looked them up by member order, which changes when sites
+move, so every refit started cold). If the held times pass the same sampled
+tolerance at the new samples, they are kept. Fe 4³ charge SC: rule build
+3.4 → 0.7 s at maps 1 and 3, the W stage 7.2 → 4.6 s, 79 nodes as before.
+
+What moves: SC runs whose line sites move. From the first warm refit on, they
+move once, within the rule tolerance (Fe 4³ ≤ 0.002 meV within E_F ± 10 eV).
+Runs whose sample order did not change, which includes Na 8³, are bitwise.
+
 ## 2026-09-30 — the shared-pole response rule no longer depends on the memory budget
 
 The response bank fits its complex-time rule on all samples at once

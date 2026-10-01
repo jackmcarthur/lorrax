@@ -232,7 +232,7 @@ def response_group_rules(lo_ry, hi_ry, z_ry, *, rel_tol=1e-8, previous=None,
     ``[members, 2 (forward, reverse), RESPONSE_NODE_CAPACITY]`` (value and
     d/d(z^2)), ``count``, ``sampled_error`` and ``coefficient_mass``
     ``[members, 2, 2]``, and ``reference_ry``. ``previous`` is a list of
-    earlier rules; one whose members match is tried first. A positive
+    earlier rules; one with the same member set (any order) is tried first. A positive
     decay_rate bounds occupation products by min(1,exp(decay_rate*d)); errors
     then use that envelope and 0<=Re(t)<=decay_rate. Bounds are sampled, not
     proven.
@@ -244,12 +244,12 @@ def response_group_rules(lo_ry, hi_ry, z_ry, *, rel_tol=1e-8, previous=None,
             or np.any(z.imag <= 0) or not 1e-13 <= rel_tol < .1):
         raise ValueError('invalid response frequency/domain/tolerance')
     reference = 0. if decay_rate else lo
-    old = {tuple(rule["members"]): rule["t"][:rule["count"]]
+    old = {frozenset(rule["members"]): rule["t"][:rule["count"]]
            for rule in (previous or ())}
 
     def build(members):
         poles = _poles(z[members])
-        got = _shared_times(lo, hi, poles, rel_tol/2, old.get(tuple(members)), decay_rate,
+        got = _shared_times(lo, hi, poles, rel_tol/2, old.get(frozenset(members)), decay_rate,
                             patience=None if len(members) == 1 else _STAGNATION_NODES)
         if got is not None:
             rule = _rule(z[members], [(*got[:1], poles, got[1])])
