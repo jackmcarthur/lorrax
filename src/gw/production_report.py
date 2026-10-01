@@ -952,6 +952,10 @@ class GWProductionReport:
             self.emit(f"  host = resident high-water (ru_maxrss) per rank at the stage's last "
                       f"exit, max over ranks; rise = what the stage added to it; unpriced")
             self.emit(f"  host run peak {_gb_pair(host_run, 0)} GB (max / min over ranks)")
+        holds = gpu_utils.host_holds()
+        if holds:
+            self.emit("  held on the host across stages, per rank: " + "; ".join(
+                f"{name} {nbytes / 1e9:.2f} GB" for name, nbytes in holds.items()))
         if budget:
             self.emit(f"  budget memory_per_device_gb = {budget:.2f} GB; run peak "
                       f"{run_peak / 1e9:.2f} GB ({'within' if run_peak <= budget * 1e9 else 'OVER'})")
