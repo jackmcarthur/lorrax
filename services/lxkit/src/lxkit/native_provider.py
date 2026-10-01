@@ -466,7 +466,11 @@ def _actual_symbol_origin(lib: ctypes.CDLL, symbol: str) -> Path:
     return Path(os.fsdecode(info.dli_fname)).resolve()
 
 
-_MPI_RUNTIME_BASENAME = re.compile(r"^libmpi(?:_gnu_[0-9]+)?[.]so(?:[.]|$)")
+# libmpi.so, libmpi_gnu.so (cray-mpich >= 9.1) or libmpi_gnu_<N>.so: the
+# pattern of src/ffi/cpp/gate_one_mpi.sh.  Without the bare libmpi_gnu form a
+# LibSci 26.03 pulled in beside cray-mpich 9.0.1 mapped a second MPI unseen,
+# and a CPU run hung in its second MPI_Init.
+_MPI_RUNTIME_BASENAME = re.compile(r"^libmpi(?:_gnu(?:_[0-9]+)?)?[.]so(?:[.]|$)")
 
 
 def _mapped_paths() -> set[Path]:

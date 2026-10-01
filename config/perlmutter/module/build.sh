@@ -48,6 +48,12 @@ STAGE_LIB="$LORRAX_BUILD_PREFIX/cusolvermp-$CUSOLVERMP_VERSION/lib"
 
 [[ -e "$SLATE_LIB/libslate.so.2" ]] \
     || bash "$CAND/src/src/ffi/cpp/stage/slate_build_perlmutter.sh" cpu
+# The SLATE closure is preloaded by absolute path, so a stage built before its
+# RPATH pinned LibSci maps a second MPI at run time (ffi_mpi.sh).
+for lib in libblaspp.so.2 liblapackpp.so.2 libslate.so.2; do
+    lorrax_pm_gate_private_lib "$SLATE_LIB/$lib" \
+        || lorrax_module_die "$SLATE_LIB/$lib fails GATE 1; rebuild it: slate_build_perlmutter.sh cpu --fresh"
+done
 bash "$CAND/src/config/perlmutter/build_ffi_host.sh" --fresh
 bash "$CAND/src/config/perlmutter/build_ffi_cuda.sh" --fresh
 

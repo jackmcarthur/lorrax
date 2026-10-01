@@ -84,6 +84,14 @@ source "$LORRAX_ROOT/config/perlmutter/ffi_mpi.sh"
 lorrax_pm_pin_mpi
 module load "$LORRAX_PM_LIBSCI_MODULE"   # BLAS/LAPACK/ScaLAPACK (wrapper links it implicitly)
 module load cmake
+# The sealed bundle preloads this SLATE by absolute path before either FFI
+# leg, so its own DT_RPATH is all that pins the LibSci and MPI it finds: the
+# wrapper adds no rpath for cray-libsci, and LD_LIBRARY_PATH's
+# /opt/cray/pe/lib64 holds the site-default LibSci (26.03 links cray-mpich
+# 9.1.0).  $ORIGIN first keeps blaspp/lapackpp inside the bundle; DT_RPATH
+# (--disable-new-dtags) is read before LD_LIBRARY_PATH.  GATE 1 below checks it.
+: "${CRAY_LIBSCI_PREFIX_DIR:?$LORRAX_PM_LIBSCI_MODULE did not set CRAY_LIBSCI_PREFIX_DIR}"
+SLATE_RPATH="\$ORIGIN;$CRAY_LIBSCI_PREFIX_DIR/lib;$LORRAX_PM_MPICH_ROOT/lib"
 if [[ "${VARIANT}" == gpu ]]; then
     module load "cudatoolkit/${CTK_VER}"
     module load craype-accel-nvidia80
@@ -151,6 +159,8 @@ cmake -S "${SRC}" -B "${BUILD}" \
     -DCMAKE_C_COMPILER=cc \
     -DCMAKE_Fortran_COMPILER=ftn \
     -DCMAKE_INSTALL_PREFIX="${PREFIX}" \
+    -DCMAKE_INSTALL_RPATH="${SLATE_RPATH}" \
+    -DCMAKE_SHARED_LINKER_FLAGS="-Wl,--disable-new-dtags" \
     -Dblas=libsci \
     -Dgpu_backend="${BACKEND}" \
     -DSCALAPACK_LIBRARIES="" \
@@ -159,6 +169,11 @@ cmake -S "${SRC}" -B "${BUILD}" \
 
 cmake --build "${BUILD}" --parallel "${JOBS}"
 cmake --install "${BUILD}"
+if [[ "${VARIANT}" == cpu ]]; then
+    for lib in libblaspp.so.2 liblapackpp.so.2 libslate.so.2; do
+        lorrax_pm_gate_private_lib "${PREFIX}/lib64/${lib}"
+    done
+fi
 
 echo
 echo "[slate-build] ${VARIANT} done."

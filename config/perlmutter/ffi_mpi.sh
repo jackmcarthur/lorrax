@@ -38,3 +38,19 @@ lorrax_pm_pin_mpi() {
     module load "$LORRAX_PM_MPICH_MODULE"
     module unload darshan 2>/dev/null || true
 }
+
+# GATE 1 for a library the sealed bundle preloads by absolute path (the private
+# SLATE closure).  It resolves its machine libraries through its own DT_RPATH,
+# then LD_LIBRARY_PATH, where a run has /opt/cray/pe/lib64: the site-default
+# LibSci, whose 26.03 links cray-mpich 9.1.0.  So the gate runs under that
+# search path and must find only the pinned MPI.  Measured 2026-09-30: B3's
+# SLATE (RPATH = its install prefix and darshan) failed this gate, mapped 9.1.0
+# beside 9.0.1 in every process, and every CPU run hung in its second MPI_Init.
+lorrax_pm_gate_private_lib() {
+    local so="$1" fabric
+    fabric="$(ldd "$LORRAX_PM_MPI_LIBRARY" | awk '/libfabric/ {print $3; exit}')"
+    [[ -n "$fabric" ]] || { echo "cannot resolve libfabric from $LORRAX_PM_MPI_LIBRARY" >&2; return 1; }
+    LD_LIBRARY_PATH="/opt/cray/pe/lib64:$(dirname "$fabric")" GATE_TAG="private $(basename "$so")" \
+        bash "$(dirname "${BASH_SOURCE[0]}")/../../src/ffi/cpp/gate_one_mpi.sh" \
+        "$so" "$LORRAX_PM_MPI_SONAME"
+}
