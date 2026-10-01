@@ -2091,7 +2091,7 @@ static ffi::Error build(int mode, int nkx, int nky, int nkz, int ns, bool f32,
     // the shared memory from the grid and this device's opt-in budget; RB is unused.
     const int chi_grp = 2 * ns * ns;
     lrx_kbox::Plan kplan{};
-    int chi_trc = 0, chi_ty = 0, chi_threads = 0, chi_tt = 0, chi_minb = 1;
+    int chi_trc = 0, chi_ty = 0, chi_threads = 0, chi_tt = 0, chi_minb = 1, chi_carve = 100;
     long long chi_smem = 0, chi_smem2 = 0;
     if (mode == 11) {
         kplan = lrx_kbox::kbox_plan(nkx, nky, nkz, ns * ns, 2, 16, smem_optin, 1, 1);  // min_tr 1: a gathered group load
@@ -2118,19 +2118,30 @@ static ffi::Error build(int mode, int nkx, int nky, int nkz, int ns, bool f32,
             }
         } else {
             // Split arm: plane tiles of kplan.tr (16) columns, whole spin groups; the group pencil
-            // reduces by warp shuffles and stages nothing.  Both passes run 512 threads (16 warps per
-            // SM; a 128-register bound) when the pencil's x-line (4*nkx registers) leaves room:
-            // nkx <= 20 and no vertices (ptxas sm_80 at the bound: 20^3 ns 2 no spill; 30^3 464 B and
-            // the vertex pencil 444 B of spill); else 256.  At 256 threads the 108 KB tile (20^3)
-            // and the 92 KB pencil stage held 8 warps per SM, both passes latency-bound at ~0.5 TB/s
-            // (P64 trace).  Two 8-column tiles per SM instead ran the plane pass 1.17x slower than
-            // one 16-column tile (ncu, KCOLRES): a tile's pairs share their tables in L1.
+            // reduces by warp shuffles and stages nothing.  Both passes run 16 warps per SM under a
+            // 128-register bound when the pencil's x-line (4*nkx registers) leaves room (nkx <= 20,
+            // no vertices; ptxas sm_80 at the bound: 20^3 ns 2 no spill, 30^3 464 B and the vertex
+            // pencil 444 B of spill): two 256-thread blocks where two tiles fit the SM's shared
+            // memory, with the carveout that holds them and the rest left to L1; else one
+            // 512-thread block (one 16-column tile per SM: two 8-column tiles ran the plane pass
+            // 1.17x slower, and a carveout of 100 cost 1.10x, ncu at 20^3: a tile's pairs share
+            // their tables in L1).  At 256 threads and one block the 108 KB tile (20^3) and the
+            // 92 KB pencil stage held 8 warps per SM, both passes latency-bound at ~0.5 TB/s.
+            int smem_sm = 0, smem_rsv = 0;
+            LRX_CUDA_CHECK(cudaDeviceGetAttribute(&smem_sm, cudaDevAttrMaxSharedMemoryPerMultiprocessor, dev),
+                           "shared memory per SM");
+            LRX_CUDA_CHECK(cudaDeviceGetAttribute(&smem_rsv, cudaDevAttrReservedSharedMemoryPerBlock, dev),
+                           "reserved shared memory per block");
             const bool wide = nkx <= 20 && !(variant & 2);
             chi_trc = kplan.tr;
-            chi_threads = wide ? 2 * kThreads : kThreads;
-            chi_ty = chi_threads / chi_grp;
             chi_smem = static_cast<long long>(chi_trc) * g.pr() * 16;
             chi_smem2 = 0;
+            const bool two = wide && 2 * (chi_smem + smem_rsv) <= smem_sm;
+            chi_threads = wide && !two ? 2 * kThreads : kThreads;
+            chi_ty = chi_threads / chi_grp;
+            chi_minb = two ? 2 : 1;
+            chi_carve = static_cast<int>(std::min<long long>(
+                100, (100LL * chi_minb * (chi_smem + smem_rsv) + smem_sm - 1) / smem_sm));
         }
     }
     // Modes 2-5, 8 and 9 run on the k-box stage: kbox_plan decides the arm, the tile and the shared
@@ -2490,10 +2501,13 @@ static ffi::Error build(int mode, int nkx, int nky, int nkz, int ns, bool f32,
         }
         if (cr != CUDA_SUCCESS) return sticky("cuFuncSetAttribute", cu_err(cr));
     }
-    // Modes 11 (two blocks per SM) and 7: the largest shared-memory carveout, so the driver does
-    // not pick a split that holds one block fewer (a hint; residency is unchanged if it declines).
+    // Modes 11 (two blocks per SM) and 7: a shared-memory carveout that holds every planned block,
+    // so the driver does not pick a split that holds one block fewer (a hint; residency is
+    // unchanged if it declines): the largest for the tile tables and mode 7, the smallest that
+    // holds them for mode 11's split arm (chi_carve; the rest is L1).
     if ((mode == 11 && chi_minb > 1) || mode == 7) {
-        cr = api.FuncSetAttribute(b.fn, CU_FUNC_ATTRIBUTE_PREFERRED_SHARED_MEMORY_CARVEOUT, 100);
+        cr = api.FuncSetAttribute(b.fn, CU_FUNC_ATTRIBUTE_PREFERRED_SHARED_MEMORY_CARVEOUT,
+                                  mode == 11 && kplan.arm == 1 ? chi_carve : 100);
         if (cr != CUDA_SUCCESS) return sticky("cuFuncSetAttribute(carveout)", cu_err(cr));
     }
     if (mklpin::announce_here() || log_enabled()) {
