@@ -52,8 +52,11 @@ from common import timing
 
 
 @lru_cache(maxsize=None)
-def _gamma_body(mesh):
-    """Raw latent body; current factors are operands of one retained callable."""
+def _gamma_body(mesh, backend):
+    """Raw latent body; current factors are operands of one retained callable.
+
+    ``backend`` is the deck's linalg layout as a ``distrib_la.matmul`` request
+    (``off`` local, ``distributed`` otherwise), on the default staged route."""
     from distrib_la import matmul
     from jax.sharding import NamedSharding, PartitionSpec as P
     face = NamedSharding(mesh, P(None, "x", "y"))
@@ -63,12 +66,12 @@ def _gamma_body(mesh):
         active = jnp.arange(b.shape[-1])[None, :] < counts[:, None]
         weights = jnp.where(active, 1/(s-poles), 0)
         return v+matmul(b*weights[:, None, :], b, mesh=mesh,
-                        backend="distributed", transb="C")
+                        backend=backend, transb="C")
     return evaluate
 
 
 @lru_cache(maxsize=None)
-def _realized_gamma_body(mesh, realize):
+def _realized_gamma_body(mesh, realize, backend):
     """One admitted all-P executable for V + Pi_G Wc at complex z².
 
     Only residue endpoints transform under antiunitary operations. Taking
@@ -78,7 +81,7 @@ def _realized_gamma_body(mesh, realize):
     from jax.sharding import NamedSharding, PartitionSpec as P
     from common.collectives import transpose_xy
     face = NamedSharding(mesh, P(None, "x", "y"))
-    raw = _gamma_body(mesh)
+    raw = _gamma_body(mesh, backend)
 
     @jax.jit(out_shardings=face)
     def evaluate(s, b, poles, counts, v):
@@ -236,9 +239,9 @@ def build_shared_pole_head(handle, header, V_q, wfns, meta, config, *,
         from .gw_config import linalg_resolution
         layout = linalg_resolution(
             config if hasattr(config, "get") else {"linalg": config.backend.linalg}).layout
-        algebra = distrib_la.plan("solve_lu", mesh_xy, n=b.shape[1],
-                                  backend="off" if layout == "local" else "distributed")
-        evaluate = _realized_gamma_body(mesh_xy, realize)
+        backend = "off" if layout == "local" else "distributed"
+        algebra = distrib_la.plan("solve_lu", mesh_xy, n=b.shape[1], backend=backend)
+        evaluate = _realized_gamma_body(mesh_xy, realize, backend)
         from symmetry_maps import QirrOperator
         # q = 0 is its own orbit: its wedge row is the full-zone row.
         args = (b, poles, counts, QirrOperator.of(V_q).representative_row(0)[None])
