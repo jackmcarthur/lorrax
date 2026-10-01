@@ -45,6 +45,13 @@ def _omega_fold(acc, sigma, coeff, omega_axis):
         sigma, axis=omega_axis)
 
 
+@lru_cache(maxsize=16)
+def _omega_slice(n_omega, omega_axis, sharding):
+    return jax.jit(
+        lambda a: jax.lax.slice_in_dim(a, 0, n_omega, axis=omega_axis),
+        out_shardings=sharding)
+
+
 _WINDOW_COMPILED = {}
 
 
@@ -111,10 +118,17 @@ class DeviceOmegaAccumulator:
     two large factors whose product is well conditioned.
     """
 
-    def __init__(self, omega_vec, *, shape, sharding, omega_axis, reduce=None):
+    def __init__(self, omega_vec, *, shape, sharding, omega_axis, reduce=None,
+                 omega_capacity=None):
         """With ``reduce`` (:func:`_device_window_runner`), ``shape`` is the
         ``(matrices, diagonals)`` pair of shape tuples it folds into, every
-        member at ``sharding``, and :meth:`finalize` returns that pair."""
+        member at ``sharding``, and :meth:`finalize` returns that pair.
+
+        ``omega_capacity`` (a held SC run's, never below ``n_omega``) is the
+        stored frequency extent: the frequencies past ``n_omega`` get zero
+        coefficients, so the window executables keep one signature while a
+        ``cover`` grid grows, and :meth:`finalize` returns the first
+        ``n_omega``."""
         self._sharding = sharding
         self._reduce = reduce
         self._replicated = NamedSharding(sharding.mesh, P())
@@ -132,6 +146,9 @@ class DeviceOmegaAccumulator:
                     "n_omega")
         # Each rank stores every output frequency and parent-k point for its
         # assigned block of the two band axes.
+        self._capacity = max(int(omega_capacity or 0), self._omega.size)
+        shapes = tuple(one[:self._omega_axis] + (self._capacity,)
+                       + one[self._omega_axis + 1:] for one in shapes)
         totals = tuple(_device_output_zeros(one, sharding)() for one in shapes)
         n_matrix = 1 if reduce is None else len(shape[0])
         self._total = (totals[0] if reduce is None else
@@ -170,7 +187,7 @@ class DeviceOmegaAccumulator:
                     or np.any(columns < 0) or np.any(columns >= self._omega.size)
                     or np.unique(columns).size != columns.size):
                 raise ValueError("invalid active frequency indices/values")
-        coeff = np.zeros((int(capacity), self._omega.size), np.complex128)
+        coeff = np.zeros((int(capacity), self._capacity), np.complex128)
         coeff[:t.size, columns] = _omega_coefficient(
             np, omega[None, :], t[:, None], alpha[:, None],
             float(omega_sign), float(prefactor), float(e_ref_sum))
@@ -197,4 +214,8 @@ class DeviceOmegaAccumulator:
         return self._total
 
     def finalize(self):
-        return self._total
+        if self._capacity == self._omega.size:
+            return self._total
+        cut = _omega_slice(self._omega.size, self._omega_axis, self._sharding)
+        total, self._total = self._total, None
+        return jax.tree.map(cut, total)

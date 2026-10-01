@@ -1103,6 +1103,7 @@ def _integrate_sigma_batches(
     tau_kernel_factory=None,
     q_wedge=None,
     tau_capacity=None,
+    omega_capacity=None,
     print_fn,
 ):
     """One spatial executor for streamed fit slabs: one executable per window.
@@ -1162,7 +1163,7 @@ def _integrate_sigma_batches(
                        int(mesh_xy.shape["y"])),) * n_between)
         accumulator = DeviceOmegaAccumulator(
             omega, shape=shape, sharding=output_sharding, omega_axis=0,
-            reduce=reduce)
+            reduce=reduce, omega_capacity=omega_capacity)
         kgrid = (int(meta.nkx), int(meta.nky), int(meta.nkz))
 
         if tau_kernel_factory is not None:
@@ -1576,6 +1577,7 @@ def integrate_sigma_store(
     band_counts=None,
     odd_residue_off=False,
     tau_capacity=None,
+    omega_capacity=None,
     tau_kernel_factory=None,
     print_fn=print,
 ):
@@ -1620,6 +1622,7 @@ def integrate_sigma_store(
             mesh_xy, pole_batch_size=batch_size, brackets=brackets,
             band_counts=band_counts, odd_residue_off=odd_residue_off,
             q_wedge=q_wedge, tau_capacity=tau_capacity,
+            omega_capacity=omega_capacity,
             tau_kernel_factory=tau_kernel_factory, print_fn=print_fn)
 
     if isinstance(fit_src, (PoleReader, MemoryPoleSource)):
@@ -1949,6 +1952,16 @@ def compute_sigma_c_mpa_omega_grid(
                     f"kappa_max={window['kappa_max']:.6g}, "
                     f"noise={window['runtime_noise_bound']:.6g}/"
                     f"{window['runtime_noise_budget']:.6g}")
+        # A held SC run's window executables also keep one frequency
+        # extent: the first map's grid plus 1/8 headroom, raised (never
+        # lowered) only when a cover grid outgrows it, so a growing grid
+        # recompiles them rarely (the accumulator slices at finalize).
+        omega_capacity = None
+        if fixed_quadrature_session is not None:
+            n_omega = len(np.asarray(omega_grid_ry))
+            if n_omega > int(fixed_quadrature_session.get("omega_capacity", 0)):
+                fixed_quadrature_session["omega_capacity"] = n_omega + -(-n_omega // 8)
+            omega_capacity = int(fixed_quadrature_session["omega_capacity"])
         with timing.section("sigma.tau_sweep"):
             if shared_pole:
                 _band_fence('tau.synthesis_setup', sync_ranks=True)
@@ -1969,7 +1982,8 @@ def compute_sigma_c_mpa_omega_grid(
                         w_synthesis=synthesis,
                         tau_kernel_factory=(None if owned else
                                             sector_context["tau_kernel"]),
-                        tau_capacity=geometry.get("sc_tau_capacity"), print_fn=print_fn)
+                        tau_capacity=geometry.get("sc_tau_capacity"),
+                        omega_capacity=omega_capacity, print_fn=print_fn)
                 except BaseException:
                     if owned:
                         synthesis.close()
@@ -1983,6 +1997,7 @@ def compute_sigma_c_mpa_omega_grid(
                     pole_batch_size=pole_batch_size, brackets=band_brackets,
                     band_counts=band_counts,
                     tau_capacity=geometry.get("sc_tau_capacity"),
+                    omega_capacity=omega_capacity,
                     tau_kernel_factory=tau_kernel_factory,
                     print_fn=print_fn)
         # odd_reference=False: the caller builds its own D=0 reference (the GN
