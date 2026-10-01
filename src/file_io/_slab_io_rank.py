@@ -47,6 +47,7 @@ from __future__ import annotations
 
 import ctypes
 import ctypes.util
+import errno
 import mmap
 import os
 import time
@@ -152,6 +153,15 @@ def _lustre_create():
     return create
 
 
+def _fallocate(fd, nbytes):
+    """``fallocate(fd, 0, 0, nbytes)``: 0, or ``errno.EOPNOTSUPP`` (never emulated by writing), or -1."""
+    libc = ctypes.CDLL(None, use_errno=True)
+    libc.fallocate.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_longlong, ctypes.c_longlong]
+    if libc.fallocate(int(fd), 0, 0, int(nbytes)) == 0:
+        return 0
+    return errno.EOPNOTSUPP if ctypes.get_errno() in (errno.EOPNOTSUPP, errno.ENOSYS) else -1
+
+
 def _aligned(nbytes):
     """An anonymous, pre-faulted, page-aligned host buffer."""
     flags = mmap.MAP_PRIVATE | mmap.MAP_ANONYMOUS | getattr(mmap, "MAP_POPULATE", 0)
@@ -184,6 +194,15 @@ class _Store:
         except OSError as exc:
             raise OSError(f"GATE streamed_bank: cannot open {self.path} with O_DIRECT ({exc}); "
                           "the streamed bank needs a filesystem with direct I/O") from exc
+        # Reserve every byte now, so a bank the disk (or the quota) cannot hold
+        # refuses before any compute; a filesystem without fallocate reserves nothing.
+        if _fallocate(self.fd, int(nbytes)) not in (0, errno.EOPNOTSUPP):
+            err = ctypes.get_errno()
+            os.close(self.fd)
+            self.fd = None
+            os.unlink(self.path)
+            raise OSError(err, f"GATE streamed_bank_capacity: cannot reserve {int(nbytes)} bytes "
+                          f"for {self.path}: {os.strerror(err)}")
 
     def write(self, source, offset):
         """``source`` an aligned memoryview whose length is a multiple of :data:`ALIGN`."""
@@ -263,7 +282,14 @@ class StreamedBank:
                 self.stores[d] = _Store(self.dir / f"{self.label}.{d.id:05d}", self.nbytes, kind)
         except BaseException as exc:
             error = exc
-        agree_io_error(error, path=self.dir, stage="streamed_bank.create")
+        self.fits = True
+        try:
+            agree_io_error(error, path=self.dir, stage="streamed_bank.create")
+        except RuntimeError:
+            # Every rank leaves the same way: its own stores closed and deleted.
+            # The caller decides (``fits``); the device sample groups need no disk.
+            self._close_stores()
+            self.fits = False
 
     def receipt(self):
         """Description of the tier: shapes (rank-identical) and this rank's file layout."""
@@ -392,12 +418,15 @@ class StreamedBank:
                 self._retire()
             self._pool.shutdown(wait=True)
             self._drain.shutdown(wait=True)
-            for store in self.stores.values():
-                store.close()
+            self._close_stores()
         except BaseException as exc:
             error = exc
-        self.stores = {}
         agree_io_error(error, path=self.dir, stage="streamed_bank.release")
+
+    def _close_stores(self):
+        stores, self.stores = self.stores, {}
+        for store in stores.values():
+            store.close()
 
 
 class _Reader:

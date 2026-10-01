@@ -1648,43 +1648,61 @@ def produce_sample_bank(wfns, meta, config, *, mesh_xy, sym, sample_plan, bank_i
         ledger.live_stages = ambient
         segments = stream_segments(wfns, meta, mesh_xy, len(response_rows), vertex)
         chosen = (0, 0) if selection is None else (selection_resident, selection_workspace)
-        if segments is not None and len(z)*carry_per_sample > ledger.room_bytes_per_rank(ambient):
-            # Every sample's carry alone exceeds the room: no group of all of
-            # them can fit, so the stream is not compiled whole to learn it.
-            group_size = 0
-        else:
+        from runtime.aot_memory import check_chunk
+        from common.gpu_utils import record_stage_price
+        scratch = _stream_scratch(wfns, meta, mesh_xy, vertex)
+
+        def device_groups():
+            """The largest sample group on the devices: the ledger's, then the compiled check
+            (runtime.aot_memory.check_chunk: the carry a donated argument the caller
+            allocates, the mode-11 scratch a run-time draw)."""
             # Price the stream once at "every sample in one group"; the compiled
             # temporaries do not grow with the group, only the donated carry does.
             workspace, whole = _stream_workspace(wfns, meta, mesh_xy, support, q_ids=response_rows,
                 n_outputs=2*len(z), ordered=ordered, vertex=vertex)
             with timing.section('bank.plan.direct'):
-                group_size, fixed, room, live = response_group_size(meta, mesh_xy, n_samples=len(z),
+                size, fixed, room, live = response_group_size(meta, mesh_xy, n_samples=len(z),
                     carry_per_sample=carry_per_sample, stream_workspace=workspace,
                     selection=chosen)
+            with timing.section('bank.memcheck.direct'):
+                check = check_chunk(
+                    size, stage="response direct stream",
+                    build=lambda g: _stream_executable(wfns, meta, mesh_xy, support,
+                        q_ids=response_rows, n_outputs=2*g, ordered=ordered, vertex=vertex),
+                    compiled=whole if size == len(z) else None,
+                    fixed=fixed, per_unit=carry_per_sample, room=room,
+                    extra=lambda g, _: g*carry_per_sample + scratch)
+            return check, live, room
+
+        check = None
+        if segments is not None and len(z)*carry_per_sample > ledger.room_bytes_per_rank(ambient):
+            # Every sample's carry alone exceeds the room: no group of all of
+            # them can fit, so the stream is not compiled whole to learn it.
+            group_size = 0
+        else:
+            check, live, room = device_groups()
+            group_size = check.chunk
         host_reserved = (bank_io["path"].payload_bytes_per_rank()
                          if getattr(bank_io["path"], "memory_kind", None) == "host" else 0)
         residence, residence_receipt = response_bank_residence(
             meta, segments=segments, n_samples=len(z), carry_per_sample=carry_per_sample,
             group_size=group_size, host_reserved=host_reserved)
-        if residence == "device":
-            # The chosen group's executable, checked before it runs
-            # (runtime.aot_memory.check_chunk): the carry is a donated argument
-            # the caller allocates, the mode-11 scratch a run-time draw.
-            from runtime.aot_memory import check_chunk
-            from common.gpu_utils import record_stage_price
-            scratch = _stream_scratch(wfns, meta, mesh_xy, vertex)
-            with timing.section('bank.memcheck.direct'):
-                check = check_chunk(
-                    group_size, stage="response direct stream",
-                    build=lambda g: _stream_executable(wfns, meta, mesh_xy, support,
-                        q_ids=response_rows, n_outputs=2*g, ordered=ordered, vertex=vertex),
-                    compiled=whole if group_size == len(z) else None,
-                    fixed=fixed, per_unit=carry_per_sample, room=room,
-                    extra=lambda g, _: g*carry_per_sample + scratch)
-            if check.chunk < len(z) and segments is not None:
-                residence, residence_receipt = response_bank_residence(
-                    meta, segments=segments, n_samples=len(z), carry_per_sample=carry_per_sample,
-                    group_size=check.chunk, host_reserved=host_reserved)
+        stream_bank = None
+        if residence != "device":
+            from file_io.slab_io import StreamedBank
+            # The store reserves every byte at creation: a bank the disk or the
+            # quota cannot hold refuses on every rank before any compute, and
+            # the samples then run in groups on the devices.
+            stream_bank = StreamedBank(mesh_xy, root=bank_io["root"], label="chi",
+                kind=residence, n_out=2*len(z), q=len(response_rows), segments=segments[0],
+                tile=segments[1])
+            if not stream_bank.fits:
+                stream_bank = None
+                residence = "device"
+                residence_receipt = dict(residence_receipt, reason="streamed bank refused by the "
+                                         "filesystem (capacity); sample groups on the devices")
+                if check is None:
+                    check, live, room = device_groups()
         if residence == "device":
             group_size = check.chunk
             record_stage_price(f"response direct stream, group {group_size}/{len(z)}",
@@ -1692,28 +1710,22 @@ def produce_sample_bank(wfns, meta, config, *, mesh_xy, sym, sample_plan, bank_i
             receipt["group_check"] = dict(chunk=check.chunk, analytic=check.analytic,
                 compiled=check.compiled_bytes, price=check.price, live=live, room=room,
                 recompiled=check.recompiled, seconds=check.seconds)
-            del check
         else:
-            # Streamed: one group of every sample; the devices hold one row
-            # pass's carry being computed and one being written, then one
-            # sample's value and slope being read, unpacked and prefetched.
+            # Streamed: one group of every sample; the devices hold one segment
+            # carry being computed and one being drained, then one sample's
+            # value and slope being read, unpacked and prefetched.
             group_size = len(z)
-        whole = None
+        del check
         receipt["bank_residence"] = dict(residence_receipt, residence=residence)
         rules = response_quadrature(meta, sample_plan, receipt, support,
                                     group_size=group_size, print_fn=print_fn)
-        stream_bank = None
-        if residence != "device":
-            from file_io.slab_io import StreamedBank
+        if stream_bank is not None:
             # Slots: the largest rule group's members (empty slots add zeros nobody reads).
             rules["slots"] = max(len(g["members"]) for g in rules["groups"])
             pass_carry = 2*rules["slots"]*len(response_rows)*16*max(r*c for r, c, _ in segments[0])
-            stream_bank = StreamedBank(mesh_xy, root=bank_io["root"], label="chi",
-                kind=residence, n_out=2*len(z), q=len(response_rows), segments=segments[0],
-                tile=segments[1])
             finish = segments[2]
             receipt["bank_residence"].update(stream_bank.receipt(),
-                device_bytes_per_rank=max(StreamedBank.in_flight*pass_carry, 3*carry_per_sample))
+                device_bytes_per_rank=max(stream_bank.in_flight*pass_carry, 3*carry_per_sample))
     # The group accumulator is all-P sharded. Dense work and slab I/O batch
     # the irreducible parents of one frequency, with their own admission.
     progress = LoopProgress(len(z), print_fn, title="response frequency integration",
