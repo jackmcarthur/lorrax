@@ -104,6 +104,19 @@ def _piece(mesh, shape, length16, padded16):
 
 
 @lru_cache(maxsize=None)
+def _record_run(mesh, shape, rows, padded16):
+    """``(carry, r)`` → carry rows ``[r, r + rows)``, each zero-padded to ``padded16``, as one
+    contiguous ``(px, py, rows·padded16)`` run in host memory (consecutive small records)."""
+    def local(carry, r):
+        flat = carry.reshape(carry.shape[0], -1)
+        run = jax.lax.dynamic_slice_in_dim(flat, r, rows, axis=0)
+        return jnp.pad(run, ((0, 0), (0, padded16 - run.shape[1]))).reshape(-1)[None, None]
+    body = jax.shard_map(local, mesh=mesh, in_specs=(P(None, None, "x", "y"), P()),
+                         out_specs=P("x", "y", None), check_vma=False)
+    return jax.jit(body, out_shardings=NamedSharding(mesh, P("x", "y", None), memory_kind=_host_kind(mesh)))
+
+
+@lru_cache(maxsize=None)
 def _unpack(mesh, n_out, q, shapes, rects, tile, records16):
     """Records ``(px, py, n_out·S/16)`` → the tile ``[n_out, q, px·tile_r, py·tile_c]``
     (zeros outside every rectangle) and the digests ``(px, py, n_out, n_segment)``."""
@@ -244,12 +257,15 @@ class StreamedBank:
 
     in_flight = IN_FLIGHT
 
-    def __init__(self, mesh, *, root, label, kind, n_out, q, segments, tile):
+    def __init__(self, mesh, *, root, label, kind, n_out, q, segments, tile, unwritten_zero=False):
         self.mesh, self.kind, self.n_out, self.q = mesh, kind, int(n_out), int(q)
         self.shapes = tuple((int(r), int(c)) for r, c, _ in segments)
         self.rects = tuple(tuple(tuple(int(v) for v in r) for r in places) for _, _, places in segments)
         self.tile = tuple(int(v) for v in tile)
-        self.dir = Path(root) / "streamed_bank"
+        self.dir = Path(root or ".") / "streamed_bank"
+        # A store that is read before every record is written (the W bank) reads
+        # unwritten records as the zeros the reservation holds (digest 0).
+        self.unwritten_zero = bool(unwritten_zero)
         # One alignment on every rank (the largest page or filesystem block), so the
         # record offsets are the same everywhere.
         local = _alignment(root) if kind == "file" else mmap.PAGESIZE
@@ -303,6 +319,11 @@ class StreamedBank:
         length16 = self.q * self.shapes[p][0] * self.shapes[p][1]
         step16, staged = self.piece // 16, deque()
 
+        def stage(host, o, a):
+            while len(staged) >= PIECES_IN_FLIGHT:
+                staged.popleft().result()
+            staged.append(self._pool.submit(land, host, o, a))
+
         def land(host, o, a):
             for shard in host.addressable_shards:
                 store = self.stores[shard.device]
@@ -314,15 +335,26 @@ class StreamedBank:
                     self.bounced += 1
                 store.write(memoryview(source), o * self.S + self.starts[p] + 16 * a)
 
-        for row, o in outputs:
-            for a in range(0, length16, step16):
-                n16 = min(step16, length16 - a)
-                program = _piece(self.mesh, tuple(carry.shape), n16, padded(16 * n16, self.align) // 16)
-                host = program(carry, np.int64(row), np.int64(a))
-                while len(staged) >= PIECES_IN_FLIGHT:
-                    staged.popleft().result()
-                staged.append(self._pool.submit(land, host, o, a))
-                del host
+        record16 = self.records[p] // 16
+        if len(self.shapes) == 1 and 16 * record16 <= self.piece // 2:
+            # Small records of a one-segment store: consecutive outputs are
+            # consecutive in the file, so runs of them move as one piece.
+            per, runs, i = max(1, self.piece // (16 * record16)), [], 0
+            while i < len(outputs):
+                j = i + 1
+                while (j < len(outputs) and j - i < per and outputs[j][0] == outputs[j - 1][0] + 1
+                       and outputs[j][1] == outputs[j - 1][1] + 1):
+                    j += 1
+                runs.append((outputs[i][0], outputs[i][1], j - i))
+                i = j
+            for row, o, m in runs:
+                stage(_record_run(self.mesh, tuple(carry.shape), m, record16)(carry, np.int64(row)), o, 0)
+        else:
+            for row, o in outputs:
+                for a in range(0, length16, step16):
+                    n16 = min(step16, length16 - a)
+                    program = _piece(self.mesh, tuple(carry.shape), n16, padded(16 * n16, self.align) // 16)
+                    stage(program(carry, np.int64(row), np.int64(a)), o, a)
         del carry
         while staged:
             staged.popleft().result()
@@ -432,7 +464,7 @@ class _Reader:
         value, digest = _unpack(bank.mesh, o1 - o0, bank.q, bank.shapes, bank.rects, bank.tile,
                                 tuple(r // 16 for r in bank.records))(flat)
         try:
-            if not bank.written[o0:o1].all():
+            if not bank.unwritten_zero and not bank.written[o0:o1].all():
                 raise OSError(f"GATE streamed_bank: outputs [{o0}, {o1}) were not all written")
             for shard in digest.addressable_shards:
                 if not np.array_equal(np.asarray(shard.data)[0, 0], bank.digests[shard.device][o0:o1]):

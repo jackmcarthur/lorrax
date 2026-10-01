@@ -198,10 +198,11 @@ def _bank_residence(meta, config, *, mesh_xy, sym, root, label, photon, mu_bases
     ``photon`` is the photon layout of a full bispinor bank (else None); its
     sector constructor route must likewise be unchanged. Otherwise the payload
     goes to the host tier when it takes at most half of this process's
-    host budget (``host_bytes_per_process``); the devices then hold only the
-    span being read, as on the file route. The scratch file is left for a
-    payload host memory cannot hold, a W export (``write_w`` re-reads the
-    bank after the constructor) and a requested distributed layout.
+    host budget (``host_bytes_per_process``), else to one file per rank
+    (both SlabIO's streamed tier); the devices then hold only the span being
+    read. The shared scratch file is left for a W export (``write_w`` re-reads
+    the bank after the constructor), a requested distributed layout, and a
+    per-rank file the disk or quota refuses on any rank.
     Returns ``(payload or None, receipt)``; a device payload's R is reserved
     (``receipt["stage"]``) and the caller keeps it in ``ledger.live_stages``
     until it is released.
@@ -233,11 +234,15 @@ def _bank_residence(meta, config, *, mesh_xy, sym, root, label, photon, mu_bases
     def host(reason):
         receipt["half_host_budget_bytes_per_rank"] = int(host_bytes_per_process()) // 2
         if R > receipt["half_host_budget_bytes_per_rank"]:
-            receipt["reason"] = reason + "; payload exceeds half the host budget"
-            return None, receipt
+            # Read once by the same ranks in the same layout: one file per rank
+            # (SlabIO's streamed tier), not the shared bank.h5.
+            receipt.update(residence="rank_file", reason=reason + "; payload exceeds half the "
+                           "host budget; per-rank files")
+            return ResidentBankPayload(mesh_xy, carrier=carrier, label=bank_label,
+                                       memory_kind="file", root=root), receipt
         receipt.update(residence="host", reason=reason + "; host tier")
         return ResidentBankPayload(mesh_xy, carrier=carrier, label=bank_label,
-                                   memory_kind="host"), receipt
+                                   memory_kind="host", root=root), receipt
 
     both = ledger.preview(resident_bytes_per_rank=2 * R, workspace_bytes_per_rank=0,
                           concurrent_with=())
@@ -587,6 +592,17 @@ def screen_shared_poles(wfns, V_q, meta, config, *, mesh_xy, sym,
             initialize_shared_pole_bank(bank["path"], meta=meta, tables=tables,
                 recipe=recipe, identity=identity, mesh_xy=mesh_xy,
                 **(dict(photon_layout=photon_layout, mu_bases=mu_bases) if photon else {}))
+            if not getattr(bank["path"], "fits", True):
+                # The per-rank files could not reserve their bytes on some rank
+                # (agreed on every rank): the shared scratch file, as before.
+                bank["path"].release()
+                bank["path"], resident = str(root / "bank.h5"), None
+                residence = dict(residence, residence="file", reason="per-rank files refused "
+                                 "by the filesystem (capacity); shared scratch file")
+                print_fn(f"shared-pole bank residence: file; {residence['reason']}")
+                initialize_shared_pole_bank(bank["path"], meta=meta, tables=tables,
+                    recipe=recipe, identity=identity, mesh_xy=mesh_xy,
+                    **(dict(photon_layout=photon_layout, mu_bases=mu_bases) if photon else {}))
         receipts = dict(identity=identity)
         if resume_constructor is True:
             receipts['bank'] = json.loads((root / 'bank_receipt.json').read_text())

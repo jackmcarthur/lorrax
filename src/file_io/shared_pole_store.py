@@ -1360,30 +1360,35 @@ class ResidentBankPayload:
     Reads return exactly the file read's values: one sliced face copy, moved
     to batch layout by the same staged exchange as a permuted file read.
 
-    ``memory_kind="host"`` is the tier for a payload the devices cannot hold:
-    each local device's face shard of every field is one host array
-    ``[nq, (nsample,) rows_X, cols_Y]``. A write is one device-to-host copy
-    per local shard into its lead span, a read one host-to-device copy of the
-    requested span, so the Python cost of either is independent of the number
-    of (parent, sample) tiles (the per-tile pinned transfers cost about 1.3 ms
-    each: 14 s per line sample at 1062 parents x 9 fields). The devices hold
-    only the span being read.
+    ``memory_kind="host"`` and ``"file"`` are the tiers for a payload the
+    devices cannot hold: every field is SlabIO's per-rank streamed store
+    (``file_io.slab_io.StreamedBank``) in host memory or in one file per
+    rank, a record per (lead index, q) tile, q-major within a lead index, so
+    a q span of one sample is one contiguous run. A write returns once its
+    tiles are queued (they leave the device in pinned pieces behind it); the
+    first read of a field waits for its writes. ``fits`` is False on every
+    rank when a file store cannot reserve its bytes. The devices hold only the
+    span being read.
     """
 
-    def __init__(self, mesh, *, carrier, label, memory_kind="device"):
-        if memory_kind not in ("device", "host"):
+    def __init__(self, mesh, *, carrier, label, memory_kind="device", root=None):
+        if memory_kind not in ("device", "host", "file"):
             _refuse(f"resident bank memory kind {memory_kind!r}")
         self.mesh = mesh
         self.carrier = int(carrier)
         self.label = str(label)
         self.memory_kind = memory_kind
+        self.root = root
         self.header_json = None
+        self.fits = True
         self._fields = {}
         self._logical = {}
         self._stored = {}
+        self._pending = set()
 
     def __str__(self):
-        tier = "device-resident" if self.memory_kind == "device" else "host-resident"
+        tier = {"device": "device-resident", "host": "host-resident",
+                "file": "per-rank file"}[self.memory_kind]
         return f"{tier} shared-pole bank ({self.label})"
 
     def __enter__(self):
@@ -1397,7 +1402,10 @@ class ResidentBankPayload:
                    for shape in self._stored.values())
 
     def release(self):
-        """Drop every device payload; the handle cannot be read afterwards."""
+        """Drop every payload (the streamed stores on every rank); the handle cannot be read afterwards."""
+        if self.memory_kind != "device":
+            for store in self._fields.values():
+                store.release()
         self._fields.clear()
         self.header_json = None
 
@@ -1408,10 +1416,6 @@ class ResidentBankPayload:
         # Rank-identical host offsets, placed without a cross-process assertion.
         return device_put_process_local(np.asarray(offset[:-2], np.int32),
                                         NamedSharding(self.mesh, P()))
-
-    def _faces(self, shape):
-        """{local device: its face-shard index} of a ``shape`` field (host tier)."""
-        return NamedSharding(self.mesh, self._spec(len(shape))).addressable_devices_indices_map(shape)
 
     def create_dataset(self, name, *, shape, dtype):
         shape = tuple(int(s) for s in shape)
@@ -1428,15 +1432,26 @@ class ResidentBankPayload:
             _refuse(f"resident bank {name} logical extent exceeds canonical carrier")
         else:
             stored = shape[:-2] + (self.carrier, self.carrier)
-        # Host tier: one zero-filled array per local device holding its face
-        # shard of the whole field; an unwritten span reads as the file's zero
-        # fill, and untouched pages are never committed.
+        # Host and file tiers: SlabIO's per-rank streamed store, one record per
+        # (lead index, q) tile, q-major within each lead index so a q span of
+        # one sample is one contiguous run; an unwritten tile reads as zeros.
         self._fields[name] = (_resident_zeros(self.mesh, stored)()
-                              if self.memory_kind == "device" else
-                              {device: np.zeros(_shard_shape(index, stored), np.complex128)
-                               for device, index in self._faces(stored).items()})
+                              if self.memory_kind == "device" else self._tier_store(name, stored))
+        if self.memory_kind != "device" and not self._fields[name].fits:
+            self.fits = False
         self._logical[name] = shape
         self._stored[name] = stored
+
+    def _tier_store(self, name, stored):
+        from file_io.slab_io import StreamedBank
+        px, py = int(self.mesh.shape["x"]), int(self.mesh.shape["y"])
+        if stored[-2] % px or stored[-1] % py:
+            _refuse(f"resident bank {name} face {stored[-2:]} is not mesh-divisible")
+        r, c = stored[-2] // px, stored[-1] // py
+        return StreamedBank(self.mesh, root=self.root, label=f"bank_{name}", kind=self.memory_kind,
+                            n_out=int(np.prod(stored[:-2])), q=1,
+                            segments=((r, c, ((0, 0, 0, 0, r, c),)),), tile=(r, c),
+                            unwritten_zero=True)
 
     def write_attr(self, name, value):
         # Masks and typed tables are authenticated by the JSON header alone.
@@ -1465,9 +1480,13 @@ class ResidentBankPayload:
             return
         if logical is not None:
             A = _resident_mask(self.mesh, A.ndim, logical)(A)
-        lead = tuple(slice(o, o + s) for o, s in zip(offset[:-2], A.shape[:-2]))
-        for shard in A.addressable_shards:
-            store[shard.device][lead] = np.asarray(shard.data)
+        nq, q0, span = stored[0], offset[0], A.shape[0]
+        for k in range(A.shape[1] if A.ndim == 4 else 1):
+            lead = offset[1] + k if A.ndim == 4 else 0
+            # Returns at once: the store moves the tiles off the device behind it.
+            store.put(0, _tier_tiles(self.mesh, A.shape, k if A.ndim == 4 else None)(A),
+                      [(i, lead * nq + q0 + i) for i in range(span)])
+        self._pending.add(name)
 
     def read_slab(self, name, *, shape, offset, dtype, partition_spec, valid_shape=None):
         if name not in self._fields:
@@ -1486,12 +1505,32 @@ class ResidentBankPayload:
         if self.memory_kind == "device":
             value = _resident_slice(self.mesh, len(stored), shape[:-2])(store, self._lead(offset))
         else:
-            lead = tuple(slice(o, o + s) for o, s in zip(offset[:-2], shape[:-2]))
-            value = jax.make_array_from_single_device_arrays(
-                shape, NamedSharding(self.mesh, face),
-                [jax.device_put(store[device][lead], device) for device in self._faces(shape)])
+            if name in self._pending:
+                store.commit()
+                self._pending.discard(name)
+            nq, q0, span = stored[0], offset[0], shape[0]
+            leads = range(offset[1], offset[1] + shape[1]) if len(shape) == 4 else (0,)
+            runs = list(store.reader([(s * nq + q0, s * nq + q0 + span) for s in leads]))
+            value = _tier_stack(self.mesh, len(shape))(*runs)
         layout = _bank_layout(None if tuple(partition_spec) == tuple(face) else partition_spec)
         return value if layout == "face" else _bank_face_to_batch(self.mesh, value.ndim)(value)
+
+
+@lru_cache(maxsize=None)
+def _tier_tiles(mesh, shape, k):
+    """A face-tiled field span → its tiles ``[q, 1, R, C]`` for lead index ``k`` (``None``: 3-D)."""
+    spec = NamedSharding(mesh, P(None, None, "x", "y"))
+    take = (lambda a: a[:, None]) if k is None else (lambda a: a[:, k][:, None])
+    return jax.jit(take, out_shardings=spec)
+
+
+@lru_cache(maxsize=None)
+def _tier_stack(mesh, ndim):
+    """Tier reads ``[q, 1, R, C]`` per lead index → the face span ``[q, (n,), R, C]``."""
+    spec = NamedSharding(mesh, P(*((None,) * (ndim - 2)), "x", "y"))
+    if ndim == 3:
+        return jax.jit(lambda run: run[:, 0], out_shardings=spec)
+    return jax.jit(lambda *runs: jnp.concatenate(runs, axis=1), out_shardings=spec)
 
 
 def _resident_zeros(mesh, shape):
@@ -1509,10 +1548,6 @@ def _resident_mask(mesh, ndim, logical):
     """Zero past the logical extent as the file stores it (host-tier writes)."""
     spec = NamedSharding(mesh, P(*((None,) * (ndim - 2)), "x", "y"))
     return jax.jit(lambda value: _logical_mask(value, logical), out_shardings=spec)
-
-
-def _shard_shape(index, shape):
-    return tuple(len(range(*s.indices(n))) for s, n in zip(index, shape))
 
 
 @lru_cache(maxsize=None)
