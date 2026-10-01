@@ -1998,6 +1998,20 @@ static int split_plane_tile(int nky, int nkz, long long pr, int ss, long long sm
         grp *= 2;
     return ss * grp;
 }
+// GATE mathdx-kconv-kbox-residency for mode 7's split arm when its plane tile (whole groups of ss
+// columns) exceeds the opt-in memory even at one group: "" when it fits (e.g. ns 4 at >= 26^3 on an
+// A100).  Mode 9's split tile is checked with the k-box family's other tiles.
+static std::string split_tile_refusal(int mode, int nkx, int nky, int nkz, int ns, long long pr, int tile,
+                                      long long smem_optin) {
+    const long long need = static_cast<long long>(tile) * pr * 16;
+    if (need <= smem_optin) return "";
+    std::ostringstream os;
+    os << "GATE mathdx-kconv-kbox-residency: got k-grid (" << nkx << "," << nky << "," << nkz << ") with ns=" << ns
+       << " (mode " << mode << "), whose split plane tile of one spin group needs " << need << " B; want <= "
+       << smem_optin << " B of opt-in shared memory on this device; why: the plane pass keeps a (ky, kz) plane "
+          "of whole spin groups resident; fix: a smaller k-grid";
+    return os.str();
+}
 // ctx, mode, nkx, nky, nkz, ns, nsr, f32, variant (mode 11: the static completion; mode 7: its output spin
 // block; mode 8: wa*8 + wb, the interaction's Lorentz widths when it is read from its parents, 0 = V_R)
 using Key = std::tuple<CUcontext, int, int, int, int, int, int, int, int>;
@@ -2260,6 +2274,8 @@ static ffi::Error build(int mode, int nkx, int nky, int nkz, int ns, bool f32,
         m7_arm = kp.arm != 0 || kp.tr * sso < 2 ? 1 : 0;
         if (m7_arm != 0) {
             m7_tr = split_plane_tile(nky, nkz, g.pr(), sso, smem_optin, true);
+            const std::string why = split_tile_refusal(7, nkx, nky, nkz, ns, g.pr(), m7_tr, smem_optin);
+            if (!why.empty()) return sticky("residency", why, ffi::ErrorCode::kInvalidArgument);
             m7_threads = kThreads;
             m7_smem = static_cast<long long>(m7_tr) * g.pr() * 16;
             m7_blocks = 1;
