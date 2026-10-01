@@ -1674,6 +1674,11 @@ def x_block_rows(rows) -> np.ndarray:
 #   316 -> 204 ms per tau node, bitwise (3077): both passes had held one block of 8 warps.
 # Residency: mode 8's split vertex pencil staged nkx*ty*(ns^2+17) elements at ty 128/ns^2 and
 #   refused the two-spinor Dirac quarters at >= 16^3; ty now comes from the opt-in budget (3080).
+# Paid (one warp group pencil, kbox_stage.cuh pencil_group_warp_pass): mode 8's vertex pencil on one
+#   warp per pair, 20^3 ns-2 Dirac-quarter door 848 -> 646 ms (pencil 2.3x), ns 4 1.14x (3080);
+#   modes 7/9 on the modes 2/3 split arm where a block cannot hold a group of two or more columns,
+#   P64 tile mode 7 555 -> 237 ms (the 11-row sub-tile pass 22.6 -> 11.6 ms), mode 9 64.9 -> 32.0 ms
+#   (3086): one column per block had re-gathered the pair's group per column (1.3 TB of L2).
 # Did not pay: phase-balanced thread counts 1.014-1.029x (2827); cp.async double buffering -21%
 #   (2799); a staged load reading its tables per cell, 1.63x slower on mode 11, 1.10x on mode 7
 #   (2789); padded shared rows +7% on mode 11, +19% on mode 7 (2845); a per-member vertex Mid
@@ -1683,7 +1688,9 @@ def x_block_rows(rows) -> np.ndarray:
 #   barriers and mode 7 already keeps 3-4 blocks per SM (I); mode 11's split plane pass as two
 #   8-column tiles per SM, 1.17x slower than one 16-column tile (a tile's pairs share their tables
 #   in L1), and at a carveout of 100, 1.10x slower (3077); a column-resident mode 11 cannot fit an
-#   A100: the pair's two transformed columns and its accumulator are 384 KB against 163 KB (I).
+#   A100: the pair's two transformed columns and its accumulator are 384 KB against 163 KB (I);
+#   modes 7/9 split at one 4-column group per block (12^3 ns 2) 0.84x, and 1-column plane tiles
+#   (16-byte runs) left mode 9 at its single-arm wall (3086).
 # Decides it: blocks resident per SM (<= 64 registers, >= 2 blocks) and odd, conflict-free shared
 #   strides, not HBM or FP64 (Fe 8^3 mode 7 at ~50 GB/s and 0.8 TF/s; 2935); after that the
 #   unfold gather's L2 latency (long_scoreboard 49%; 2956).
