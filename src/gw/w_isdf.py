@@ -229,7 +229,8 @@ def photon_response_passes(ledger, mesh_xy, families, *, n_parent, kgrid, n_band
     counted from its shapes (``greens_function_kernel.price_photon_pass``);
     its rows are the pair's left-family local rows split evenly, the largest
     share priced.  Only ``memory_per_device_gb`` (``CapacityLedger``) and the
-    shapes enter; no coefficient is fitted.
+    shapes enter; no coefficient is fitted.  The counts and the counted peak
+    (carry, faces and the largest pass) go to the stage-memory table.
     """
     from .greens_function_kernel import has_antiunitary_rows, price_photon_pass
     from .photon_layout import FAMILY_PAIRS, family_channels
@@ -257,12 +258,9 @@ def photon_response_passes(ledger, mesh_xy, families, *, n_parent, kgrid, n_band
         count = next((p for p in range(1, local_rows + 1) if price(p) <= room), local_rows)
         passes.append(count)
         peaks.append(price(count))
-    from ffi.gate import announce_once
-    announce_once(("photon_passes", tuple(passes), int(room)),
-                  f"[chi0] four-current row passes per family pair {tuple(FAMILY_PAIRS)}: "
-                  f"{tuple(passes)}; counted pass peak {max(peaks) / 1e9:.2f} GB of "
-                  f"{room / 1e9:.2f} GB room beside carry and faces {fixed / 1e9:.2f} GB",
-                  scope="rank0")
+    from common.gpu_utils import record_stage_price
+    record_stage_price(f"photon direct stream, row passes {tuple(passes)} (CC, CT, TC, TT)",
+                       fixed + max(peaks), section="bank.dispatch.direct")
     return tuple(passes)
 
 
