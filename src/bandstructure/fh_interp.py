@@ -1147,6 +1147,14 @@ def initialize_wfns(input_path: str, params: dict, log_fn, eqp_file: str | None 
     """
     from file_io.centroids import load_centroid_basis
 
+    # The whole-state fit prices against this run budget, as in gwjax
+    # and kmeans; zero retains collective device auto-detection.
+    deck_gb = float(params.get("memory_per_device_gb", 0.0) or 0.0)
+    if deck_gb > 0:
+        from common.gpu_utils import (minimum_process_budget_gb,
+                                     set_device_budget_gb)
+        set_device_budget_gb(minimum_process_budget_gb(deck_gb))
+
     input_dir = os.path.dirname(os.path.abspath(input_path))
 
     def _resolve(path: str) -> str:
