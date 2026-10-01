@@ -819,6 +819,45 @@ def make_initial_state_from_dft(inputs: SCInputs) -> SCState:
     )
 
 
+def _project_on_little_groups(inputs, H_loop, ks):
+    """``H`` at each kept k averaged over that k's little group; ``(H, max |ΔH|)`` in Ry.
+
+    ``H ← |G_k|⁻¹ Σ_L A_L(H)`` with ``A_L(H) = Dᴴ H D`` for a unitary and
+    ``conj(Dᴴ H D)`` for an antiunitary row, ``D`` the band representation of
+    ``L`` on the Σ window (``file_io.qp_wfn.little_group_band_representations``,
+    from the raw parent).  A kept row that is its parent's image under an
+    antiunitary operation reads the conjugate representations.  A k whose
+    little group is the identity is unchanged.
+    """
+    from file_io.qp_wfn import little_group_band_representations
+    sym = inputs.sym
+    n_spatial = int(np.asarray(sym.sym_matrices).shape[0])
+    if ks is not None and not ks.is_identity:
+        rows, parents = np.asarray(ks.rows), np.asarray(ks.labels)
+    else:
+        rows = np.arange(H_loop.shape[0])
+        parents = np.asarray(sym.irr_idx_k, dtype=np.int32)[rows]
+    frame = np.asarray(sym.sym_idx_k, dtype=np.int32)[rows] >= n_spatial
+    b0, b1 = (int(v) for v in inputs.band_slices.sigma_range)
+    reps, out, moved = {}, H_loop.copy(), 0.0
+    for i, (p, conj_frame) in enumerate(zip(parents.tolist(), frame.tolist())):
+        if p not in reps:
+            reps[p] = little_group_band_representations(
+                inputs.wfn, mesh=inputs.mesh_xy, parent=p, band_start=b0, band_stop=b1)
+        group = reps[p]
+        if len(group) == 1:
+            continue
+        H = H_loop[i]
+        total = np.zeros_like(H)
+        for _, D, antiunitary in group:
+            D = np.conj(D) if conj_frame else D
+            term = D.conj().T @ H @ D
+            total += np.conj(term) if antiunitary else term
+        out[i] = total / len(group)
+        moved = max(moved, float(np.max(np.abs(out[i] - H))))
+    return out, moved
+
+
 def make_initial_state_from_qp_rotations(
     inputs: SCInputs,
     artifact_path: str,
@@ -861,6 +900,12 @@ def make_initial_state_from_qp_rotations(
         H_loop = np.asarray(ks.select(H_full), dtype=np.complex128)
         U_loop = np.asarray(ks.select(U_full), dtype=np.complex128)
         E_loop = np.asarray(ks.select(E_full), dtype=np.float64)
+    # A seed written by another run (or another code version) need not respect
+    # this run's symmetry; its H is averaged over each kept k's little group, so
+    # the run never starts from a symmetry-broken state.
+    H_loop, moved = _project_on_little_groups(inputs, np.asarray(H_loop, dtype=np.complex128), ks)
+    if moved > 0:
+        E_loop, U_loop = np.linalg.eigh(H_loop)
     rep3 = NamedSharding(inputs.mesh_xy, P(None, None, None))
 
     # Seed the SAME occupation owner the first map calls, on the new run's
@@ -893,7 +938,8 @@ def make_initial_state_from_qp_rotations(
         inputs,
         "  SC initial Hamiltonian: external compact QP seed "
         f"{artifact_path}; authenticated original DFT basis; "
-        "seed-only U diag(E) U^H. Occupations, DFT tail, reference "
+        "seed-only U diag(E) U^H, averaged over each k's little group "
+        f"(max |ΔH| {moved * RYD_TO_EV:.3e} eV). Occupations, DFT tail, reference "
         "operators, quadrature and Anderson history belong to this new run.")
     return SCState(
         H_qp_dft=device_put_process_local(H_loop, rep3),
