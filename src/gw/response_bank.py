@@ -465,6 +465,15 @@ def stream_weights(wfns, weights, mesh_xy):
     return result
 
 
+#: The exact moments' correlations ``(c, a, b)``: sum c * Corr(f E^a, u E^b) with
+#: E = energy - reference, the binomial expansions of (E_u - E_f)^1 and ^3 (the
+#: even totals A0, A1; imaginary particle weights) and of ^0 and ^2 (the odd
+#: totals O0, O1 of an ordered bank; real particle weights).
+EVEN_MOMENT_TERMS = (((-1., 1, 0), (1., 0, 1)),
+                     ((-1., 3, 0), (3., 2, 1), (-3., 1, 2), (1., 0, 3)))
+ODD_MOMENT_TERMS = (((1., 0, 0),), ((1., 2, 0), (-2., 1, 1), (1., 0, 2)))
+
+
 def exact_bare_moments(wfns, meta, *, mesh_xy, q_ids, execute, ordered=False,
                        vertex=None):
     """Compute A0/A1 of scaled chi=A0/s+A1/s² by six correlations.
@@ -483,10 +492,8 @@ def exact_bare_moments(wfns, meta, *, mesh_xy, q_ids, execute, ordered=False,
     kernel, fixed = response_stream(wfns, meta, mesh_xy=mesh_xy,
                                     q_ids=q_ids, n_outputs=1, ordered=ordered,
                                     vertex=vertex)
-    terms = (((-1., 1, 0), (1., 0, 1)),
-             ((-1., 3, 0), (3., 2, 1), (-3., 1, 2), (1., 0, 3)))
     totals = []
-    for moment_terms in terms:
+    for moment_terms in EVEN_MOMENT_TERMS:
         total = None
         for coefficient, a, b in moment_terms:
             weight_f = stream_weights(wfns, f * erel**a, mesh_xy)
@@ -504,7 +511,7 @@ def exact_bare_moments(wfns, meta, *, mesh_xy, q_ids, execute, ordered=False,
     # Odd coefficients of 1/z and 1/z^3: sum (P - conj P_{-q}) Delta^m, m=0,2.
     # Real particle weights keep the retarded difference -i(X - conj X), so
     # the chi coefficient is i*raw. Four more correlations, same kernel.
-    for moment_terms in (((1., 0, 0),), ((1., 2, 0), (-2., 1, 1), (1., 0, 2))):
+    for moment_terms in ODD_MOMENT_TERMS:
         total = None
         for coefficient, a, b in moment_terms:
             weight_f = stream_weights(wfns, f * erel**a, mesh_xy)
@@ -1066,6 +1073,94 @@ def _moment_phase(receipt, name):
     receipt["seconds"][name] = receipt["seconds"].get(name, 0.0) + time.monotonic() - started
 
 
+@lru_cache(maxsize=8)
+def _moment_batch_major(mesh_xy, n_out, width, n_batch):
+    """Pass carry ``[n_out, q, m, n]`` → ``[n_batch * n_out, width, m, n]``, batch-major
+    (q padded with zeros to ``n_batch * width``), so a q batch's totals are one bank run."""
+    spec = NamedSharding(mesh_xy, P(None, None, "x", "y"))
+
+    def order(carry):
+        pad = n_batch * width - carry.shape[1]
+        carry = jnp.pad(carry, ((0, 0), (0, pad), (0, 0), (0, 0)))
+        carry = carry.reshape((n_out, n_batch, width) + carry.shape[2:])
+        return jnp.swapaxes(carry, 0, 1).reshape((n_batch * n_out, width) + carry.shape[3:])
+    return jax.jit(order, out_shardings=spec)
+
+
+@lru_cache(maxsize=8)
+def _moment_batch_split(mesh_xy, n_out, rows):
+    """One q batch's bank run ``[n_out, width, m, n]`` → its ``n_out`` totals ``[rows, m, n]``."""
+    face = NamedSharding(mesh_xy, P(None, "x", "y"))
+    return jax.jit(lambda run: tuple(run[o, :rows] for o in range(n_out)),
+                   out_shardings=(face,) * n_out)
+
+
+def streamed_moment_totals(wfns, meta, *, mesh_xy, qids, width, execute, ordered, receipt, root):
+    """Every parent's exact-moment totals from one pass of the row-pass engine, or ``None``.
+
+    Each correlation of :data:`EVEN_MOMENT_TERMS` (and :data:`ODD_MOMENT_TERMS`
+    on an ordered bank) is one direct node at t = 0 with its own band weights
+    ``f E^a`` and ``u E^b``; the node-to-output weights add ``-1j (ahead -
+    behind) pref c`` (even) or ``(ahead - behind) pref c`` (odd) to its total,
+    the bare correlation :func:`exact_bare_moments` forms one q batch at a
+    time.  Row passes run outer and every parent inner, so each door and
+    transform runs once per map instead of once per q batch.  Each finished
+    pass goes to a :class:`file_io.slab_io.StreamedBank` whose outputs are the
+    totals of one q batch of ``width`` parents, so a batch's totals are read
+    back as one run.  Returns that bank, or ``None`` without the engine
+    (mathdx mode 11 from raw parents) or when the store cannot be reserved.
+    """
+    from common.gpu_utils import host_bytes_per_process
+    from file_io.slab_io import StreamedBank
+    from .w_isdf import _w_solve_pref_scalar
+    segments = stream_segments(wfns, meta, mesh_xy, len(qids), None)
+    if segments is None:
+        return None
+    energy, f, u, reference, _ = response_weights(wfns, meta)
+    erel, pref = energy - reference, _w_solve_pref_scalar(meta)
+    totals = ([(terms, -1j) for terms in EVEN_MOMENT_TERMS]
+              + ([(terms, 1.) for terms in ODD_MOMENT_TERMS] if ordered else []))
+    lower, upper, columns = [], [], []
+    for o, (terms, scale) in enumerate(totals):
+        for c, a, b in terms:
+            lower.append(f * erel ** a)
+            upper.append((-1j if scale == -1j else 1.) * u * erel ** b)
+            column = np.zeros((2, len(totals)), np.complex128)
+            column[:, o] = scale * pref * c * np.asarray([1., -1.])
+            columns.append(column)
+    n_out, nq, n_nodes = len(totals), len(qids), len(columns)
+    n_batch = -(-nq // int(width))
+    px, py = int(mesh_xy.shape["x"]), int(mesh_xy.shape["y"])
+    nbytes = n_batch * n_out * 16 * int(width) * sum(r * c for r, c, _ in segments[0])
+    bank = StreamedBank(mesh_xy, root=root, label="moments",
+                        kind="host" if nbytes <= host_bytes_per_process() // 2 else "file",
+                        n_out=n_batch * n_out, q=int(width), segments=segments[0], tile=segments[1])
+    if not bank.fits:
+        return None
+    common = (jnp.zeros(n_nodes, jnp.complex128), jnp.asarray(np.stack(columns, axis=-1)))
+    tail = (stream_weights(wfns, np.stack(lower), mesh_xy).astype(jnp.complex128),
+            stream_weights(wfns, np.stack(upper), mesh_xy).astype(jnp.complex128),
+            jnp.asarray([reference, reference]))
+    scratch = _stream_scratch(wfns, meta, mesh_xy, None)
+    order = _moment_batch_major(mesh_xy, n_out, int(width), n_batch)
+    outputs = [(r, r) for r in range(n_batch * n_out)]
+    _reserve(meta, "moment_pass_carry", 0, bank.in_flight * 2 * n_batch * int(width) * n_out
+             * 16 * max(r * c for r, c, _ in segments[0]))
+    for p, (rows, cols) in enumerate(bank.shapes):
+        kernel, fixed = response_stream(wfns, meta, mesh_xy=mesh_xy, q_ids=tuple(qids),
+            n_outputs=n_out, pair_mode="direct", bank_carry=True, ordered=ordered, stream_pass=p)
+        carry = _group_zeros(mesh_xy, (n_out, nq, px * rows, py * cols))()
+        carry = execute(kernel, common + tuple(fixed) + tail + (carry,), "moment_correlation",
+                        runtime_bytes=scratch)
+        bank.put(p, order(carry), outputs)
+        del carry
+    bank.commit()
+    receipt["correlation_count"] += n_nodes
+    receipt["moment_stream"] = dict(bank.receipt(), passes=len(bank.shapes), nodes=n_nodes,
+                                    q_batches=n_batch, width=int(width))
+    return bank
+
+
 def compute_moment_bank(wfns, meta, config, *, mesh_xy, sym, bank_io,
                         vertex=None, contact=None, direct_head=None):
     """Stage B: six exact correlations, physical recurrence, scratch write."""
@@ -1086,10 +1181,27 @@ def compute_moment_bank(wfns, meta, config, *, mesh_xy, sym, bank_io,
     ordered = vertex is not None or not bool(sym.trs_allowed)
     _, _, moments, receipt["algebra"] = response_algebra(meta, config,
         mesh_xy=mesh_xy, n=n, ordered=ordered, photon=vertex is not None)
-    per_q = 12 if ordered else 8
+    # A batch holds its totals and the next batch's (read ahead), H, the Dyson
+    # outputs and its temporaries: 3 per total plus 4 faces per parent.
+    n_total = 4 if ordered else 2
+    per_q = 3 * n_total + 4
     qwidth = moment_q_width(ledger, n_q=len(qids), face_bytes=face_bytes, per_q=per_q)
     receipt["q_width"] = int(qwidth)
     receipt["q_batches"] = [[q0, min(q0 + qwidth, len(qids))] for q0 in range(0, len(qids), qwidth)]
+    # Every parent's totals in one stream (correlations outer would repeat each
+    # door per q batch); a bank partly written by an earlier attempt, the
+    # four-current bank and a backend without the row-pass engine take the
+    # per-batch correlations.
+    streamed = None
+    if vertex is None and not np.asarray(header["moment_written"]).any():
+        with timing.section("bank.moment_stream"):
+            stream_started = time.monotonic()
+            streamed = streamed_moment_totals(wfns, meta, mesh_xy=mesh_xy, qids=qids,
+                width=qwidth, execute=execute, ordered=ordered, receipt=receipt,
+                root=bank_io["root"])
+            receipt["seconds"]["moment_stream"] = time.monotonic() - stream_started
+    runs = None if streamed is None else streamed.reader(
+        [(j * n_total, (j + 1) * n_total) for j in range(len(receipt["q_batches"]))])
     for q0 in range(0,len(qids),qwidth):
         q1 = min(q0+qwidth,len(qids))
         ledger.live_stages = ambient
@@ -1097,13 +1209,17 @@ def compute_moment_bank(wfns, meta, config, *, mesh_xy, sym, bank_io,
         ledger.live_stages = ambient+(name,)
         if not np.asarray(header["moment_written"])[q0:q1].all():
             with _moment_phase(receipt, "correlations"):
-                if ordered:
+                if runs is not None:
+                    totals = _moment_batch_split(mesh_xy, n_total, q1 - q0)(next(runs))
+                    a0, a1, o0, o1 = totals if ordered else (*totals, None, None)
+                    del totals
+                elif ordered:
                     a0, a1, o0, o1, _ = exact_bare_moments(wfns, meta, mesh_xy=mesh_xy,
                         q_ids=tuple(qids[q0:q1]), execute=execute, ordered=True, vertex=vertex)
                 else:
                     a0, a1, _ = exact_bare_moments(wfns, meta, mesh_xy=mesh_xy,
                                               q_ids=tuple(qids[q0:q1]), execute=execute)
-                # The batch's correlations finish here, so their device time is theirs.
+                # The batch's totals finish here, so their device time is theirs.
                 jax.block_until_ready((a0, a1) + ((o0, o1) if ordered else ()))
             with _moment_phase(receipt, "coulomb"):
                 h, hi, ranks = _coulomb_batch(meta, config, bank_io, mesh_xy, (q0,q1), execute)
@@ -1147,7 +1263,12 @@ def compute_moment_bank(wfns, meta, config, *, mesh_xy, sym, bank_io,
             del h,a0,a1,operands,result,values
             if ordered:
                 del o0,o1
-            receipt["correlation_count"] += 10 if ordered else 6
+            if runs is None:
+                receipt["correlation_count"] += 10 if ordered else 6
+    if streamed is not None:
+        for key, value in streamed.seconds.items():
+            receipt["seconds"]["moment_stream_" + key] = value
+        streamed.release()
     ledger.live_stages = ambient
     receipt["completion"] = bool(np.asarray(header["moment_written"]).all())
     return _finish_receipt(receipt,meta,header,started)

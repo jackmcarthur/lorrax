@@ -922,7 +922,9 @@ def _get_chi_fractional_contour_kernel_face(
     ``pair_mode="direct"`` takes shared complex times ``t[n]`` and weights
     ``projection_rows[2, n_out, n]``: each node is ONE Green pair A(t); row 0
     weights A(t) at q, row 1 weights conj(A(t)) at -q, which is the reverse
-    orientation at time conj(t).
+    orientation at time conj(t).  Its band weights ``occ_f``/``occ_u`` are
+    shared ``[nk, nb]`` or one ``[n, nk, nb]`` row per node (the exact moments,
+    ``gw.response_bank.compute_moment_bank``: t = 0 and powers of the energy).
 
     Orientation. With ``FT_q[f](mu,nu) = sum_R f(r_mu, r_nu+R) e^{iq.R}`` (the
     transform under which Sigma's ``G_{k-q} W_q`` contraction is exact), the
@@ -1531,15 +1533,23 @@ def _get_chi_fractional_contour_kernel_face(
             # index+1: under the latency-hiding schedule the reverse weights
             # did (Fe 8^3 P4, Gram min -16.1). A barrier output is an indirect
             # use, which remat does not clone.
-            time, forward, reverse = jax.lax.optimization_barrier((
+            time, forward, reverse, lower_w, upper_w = jax.lax.optimization_barrier((
                 time_nodes[index],
                 jax.lax.dynamic_index_in_dim(projection_rows[0], index, axis=1, keepdims=False),
-                jax.lax.dynamic_index_in_dim(projection_rows[1], index, axis=1, keepdims=False)))
-            value = chi_fftn(spin_correlation(occ_f, -time, energy_reference[0],
-                occ_u, jnp.conj(time), energy_reference[1]))
+                jax.lax.dynamic_index_in_dim(projection_rows[1], index, axis=1, keepdims=False),
+                *node_band_weights(index)))
+            value = chi_fftn(spin_correlation(lower_w, -time, energy_reference[0],
+                upper_w, jnp.conj(time), energy_reference[1]))
             ahead, behind = rows(value, gather_q), jnp.conj(rows(value, reverse_q))
             accumulators = accumulate_selected(accumulators, ahead, forward)
             return accumulate_selected(accumulators, behind, reverse)
+
+        def node_band_weights(index):
+            """A direct node's (lower, upper) band weights: shared ``[nk, nb]``, or the
+            node's row of a per-node ``[n, nk, nb]`` stack (the exact moments)."""
+            return tuple(w if w.ndim == 2 else
+                         jax.lax.dynamic_index_in_dim(w, index, axis=0, keepdims=False)
+                         for w in (occ_f, occ_u))
 
         def live_count():
             live = (jnp.any(projection_rows[0] != 0, axis=0)
@@ -1563,7 +1573,8 @@ def _get_chi_fractional_contour_kernel_face(
 
             def node_rows(p, index):
                 x0, xr = subtile.passes[p]
-                time = jax.lax.optimization_barrier(time_nodes[index])
+                time, lower_w, upper_w = jax.lax.optimization_barrier(
+                    (time_nodes[index], *node_band_weights(index)))
                 psi_p = pass_rows(rows_all, mesh_xy, x0, xr, axis=2)
 
                 def parent(weight, t, ref, current):
@@ -1573,8 +1584,8 @@ def _get_chi_fractional_contour_kernel_face(
                                        k_unfold_plan=k_unfold_plan, unfold=False,
                                        prepared_active_gemm=pass_active[p][int(current)],
                                        real_weights=False, right=right)
-                lower = parent(occ_f, -time, energy_reference[0], False)
-                upper = parent(occ_u, jnp.conj(time), energy_reference[1], True)
+                lower = parent(lower_w, -time, energy_reference[0], False)
+                upper = parent(upper_w, jnp.conj(time), energy_reference[1], True)
                 partners = (() if lower.conj_partner and upper.conj_partner
                             else (lower.partner(), upper.partner()))
                 zero = jax.lax.with_sharding_constraint(
