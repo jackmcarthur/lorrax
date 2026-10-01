@@ -14,13 +14,16 @@ follows the full panels. Those Green builds now hold two fewer output tiles. On
 the Fe 20³ P36-local CC stream (P4 proxy), a 3-panel loop compiles at 61.3 GB
 instead of 73.1 GB, and the 360-band loop at 90.3 GB instead of 99.5 GB.
 Loops of four or more full panels with no tail were already folded and compile
-the same; P36 runs six. Two-panel loops (P4) keep XLA's GEMM and are bitwise.
-Builds with three or more panels move at round-off.
+the same; P36 runs six. Two-panel loops (P4) keep XLA's GEMM. Results are
+bitwise: with the panel loop forced to six panels, Fe 4³ scalar and bispinor
+SP-full, Na 8³ and MoS2 SC + BSE match main, beside a 4e-16 control that moves.
 
 `distrib_la.panel_matmul_extra_tiles` is deleted, and the photon row-pass count
 no longer adds two Green tiles at p_x ≥ 3. Fe 20³ P36 at M_T 900 now prices
-1,1,1,1 row passes at 70 or 75 GB (was 2,1,1,1), counted at 64.3 GB. M_T 1800
-prices 3,7,7,14 at 75 GB (was 4,7,7,15).
+1,1,1,1 row passes at 70 or 75 GB (was 2,1,1,1), counted at 64.33 GB. M_T 1800
+prices 3,7,7,14 at 75 GB (was 4,7,7,15). The 2,1,1,1 that the counted-passes
+release (R190) gave P36 was an over-count. P36's 6-panel loop never held the two
+extra tiles: its CC stream compiles at 60.68 GB before and after this change.
 
 ## 2026-09-30 — four-current row passes are counted, not fitted
 
