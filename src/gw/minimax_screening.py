@@ -463,8 +463,8 @@ def fit_gn_ppm_from_wc_pair(
             raise ValueError(
                 "fit_gn_ppm_from_wc_pair: q_neg_index must be an involution "
                 f"over [0,{_nq}).")
-    # The q block from the device pool: one q's compiled footprint on the
-    # LOCAL (already-sharded) tile against the free bytes, the same on every
+    # The q block from the fixed tile: one q's compiled footprint on the
+    # LOCAL (already-sharded) tile against the tile, the same on every
     # process.  The chunking is movement-only (see the sizer), so the fitted
     # values are bit-identical at any q_block; one block when it all fits.
     # The (mu, nu) adjoints move tiles X<->Y by one permute (transpose_xy).
@@ -472,11 +472,11 @@ def fit_gn_ppm_from_wc_pair(
     kernel = _gn_ppm_fit_kernel_ordered if ordered else _gn_ppm_fit_kernel
     _kargs = (_z, _fb, n_log, _mask) + ((xy_mesh,) if ordered else ())
     _fit_bytes = _gn_ppm_fit_bytes_per_q(kernel, Wc0_qmunu, Wc_probe_qmunu, *_kargs)
-    _free = _gn_ppm_fit_free_bytes()
+    _free = _gn_ppm_fit_free_bytes(_nq, *_fit_bytes)
     _qb = _gn_ppm_fit_q_block(_nq, *_fit_bytes, _free)
-    from common.gpu_utils import device_budget_bytes, record_stage_price
-    record_stage_price(f"GN-PPM fit, q block {_qb}/{_nq}", device_budget_bytes() - _free
-                       + _qb * _fit_bytes[0] + 2 * _nq * _fit_bytes[1])
+    from common.gpu_utils import record_stage_price
+    record_stage_price(f"GN-PPM fit, q block {_qb}/{_nq}",
+                       _qb * _fit_bytes[0] + 2 * _nq * _fit_bytes[1])
 
     # The anti-Hermitian half of the probe, kept only on the ordered path
     # (one extra (nq, mu, nu) c128 tile, needed again after the tail policy
@@ -630,10 +630,6 @@ def fit_gn_ppm_from_wc_pair(
 # arena compiled to 50.9 GiB and the map ran out of memory).  The footprint of
 # one q is now XLA's own memory analysis of the kernel compiled at q = 1, so
 # whatever layout the kernel lowers to is priced.
-#: Fraction of the pool's free bytes a q block may claim (fragmentation).
-_GN_PPM_FIT_POOL_FRACTION = 0.8
-
-
 _GN_PPM_FIT_BYTES_PER_Q: dict = {}
 
 
@@ -665,15 +661,15 @@ def _gn_ppm_fit_bytes_per_q(kernel, Wc0, Wprobe, *args) -> tuple[int, int]:
     return _GN_PPM_FIT_BYTES_PER_Q[key]
 
 
-def _gn_ppm_fit_free_bytes() -> int:
-    """The room the fit may claim: the run's budget (``memory_per_device_gb``) less the
-    live bytes, capped at the pool fraction of the allocator's free pool, the minimum
-    over processes (``common.gpu_utils.device_room_bytes``).
+def _gn_ppm_fit_free_bytes(nq: int, block_bytes_per_q: int, out_bytes_per_q: int) -> int:
+    """The room the fit's q blocks may claim: the fixed tile (``runtime.tiles``),
+    or one q when one q is larger, beside the ``2·nq`` q of outputs every block
+    keeps live, from the shapes alone.
 
     ``LORRAX_PPM_FIT_ARENA_GIB`` caps it further (a resource cap).
     """
-    from common.gpu_utils import device_room_bytes
-    free = device_room_bytes(pool_fraction=_GN_PPM_FIT_POOL_FRACTION)
+    from runtime.tiles import TILE_BYTES
+    free = max(TILE_BYTES, int(block_bytes_per_q)) + 2 * int(nq) * int(out_bytes_per_q)
     env = os.environ.get("LORRAX_PPM_FIT_ARENA_GIB", "").strip()
     if env:
         from common.collectives import all_gather_processes
@@ -695,9 +691,9 @@ def _gn_ppm_fit_q_block(nq: int, block_bytes_per_q: int, out_bytes_per_q: int,
         raise ValueError(
             "GATE gn_ppm_fit_capacity: one q of the GN-PPM fit needs "
             f"{block_bytes_per_q / 1e9:.2f} GB/dev beside {nq} q of outputs "
-            f"({2 * nq * out_bytes_per_q / 1e9:.2f} GB/dev), the pool has "
-            f"{free_bytes / 1e9:.2f} GB/dev free.  Fix: more memory per "
-            "device or more ranks (the (mu, nu) tile shrinks as 1/P).")
+            f"({2 * nq * out_bytes_per_q / 1e9:.2f} GB/dev) within the "
+            f"LORRAX_PPM_FIT_ARENA_GIB cap of {free_bytes / 1e9:.2f} GB/dev.  Fix: "
+            "raise the cap, or more ranks (the (mu, nu) tile shrinks as 1/P).")
     return min(int(nq), int(qb))
 
 

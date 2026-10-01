@@ -1367,33 +1367,28 @@ def plan_sweep(geom: SweepGeometry, operator) -> SweepPlan:
     return SweepPlan(k_tile, g_carrier, _band_chunk(geom, ops, nb_rank, k_tile * step))
 
 
-#: The share of the stage room the band-layout FFT boxes may fill.
-_BOX_ROOM_FRACTION = 0.9
-
-
 def _band_chunk(geom, ops, nb_rank: int, step_bytes: float) -> int:
     """Bands per application of the band-layout operators, from the run's budget.
 
     A band operator holds FFT boxes of ``ns·N_r·16`` bytes per band: ψ(r), one
     product and one forward transform per component, ``2 + 2·max(ncomp, 1)``
     boxes (the four-current potential: six).  Its bands are independent, so
-    the fewest equal chunks whose boxes fit beside the step's live set in the
-    stage room (``common.gpu_utils.device_room_bytes``) are applied one after
-    another; one chunk, this rank's ``nb/P``, when they fit.  Every process
-    computes the same chunk.
+    the fewest equal chunks whose boxes fit the fixed tile (``runtime.tiles``)
+    are applied one after another; one chunk, this rank's ``nb/P``, when they
+    fit.  From the shapes alone, so every process computes the same chunk.
     """
     copies = max((2 + 2 * max(int(o.ncomp), 1) for o in ops if o.apply is not None),
                  default=0)
     if not copies:
         return nb_rank
-    from common.gpu_utils import device_budget_bytes, device_room_bytes, record_stage_price
+    from common.gpu_utils import record_stage_price
+    from runtime.tiles import tile_units
     box = copies * float(geom.ns) * float(np.prod(geom.fft_grid)) * 16.0
-    room = float(device_room_bytes())
-    fit = max(1, int((_BOX_ROOM_FRACTION * room - step_bytes) // box))
-    n_chunks = -(-nb_rank // min(fit, nb_rank))
+    fit = tile_units(box, nb_rank)
+    n_chunks = -(-nb_rank // fit)
     chunk = -(-nb_rank // n_chunks)
     record_stage_price(f"matrix-element sweep, plan_sweep {chunk}/{nb_rank} bands",
-                       device_budget_bytes() - room + step_bytes + chunk * box)
+                       step_bytes + chunk * box)
     return chunk
 
 

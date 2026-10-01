@@ -2106,9 +2106,8 @@ def _centroid_resident_bytes(
             k_tile * band_tile * nspinor * 16
             * (mu_x_local + mu_y_local)
         )
-    # A caller-provided G-flat tensor is priced once, as resident, by the
-    # caller of ``_centroid_fft_scan_chunk``; only price it here when this
-    # call will allocate it.
+    # A caller-provided G-flat tensor is already allocated; only price it
+    # here when this call will allocate it.
     # Every loader unfold has a request-local c128 nonsymmorphic phase
     # temporary.  Parent streaming generates it inside the device action from
     # the one cached integer G row above; other routes stage the same logical
@@ -2128,18 +2127,19 @@ def _centroid_resident_bytes(
 
 def _centroid_fft_scan_chunk(
         band_tile, domain, gpu_mem_bytes, k_tile, n_rtot, nb_per_band_shard, nspinor,
-        peak_copies, persistent_bytes, resident_bytes, return_parents, stream_tiles):
-    """Size the FFT scan chunk from the deck budget and shapes, never live room.
+        peak_copies, persistent_bytes, return_parents, stream_tiles):
+    """Size the FFT scan chunk from the fixed tile and the shapes.
 
-    ``cs`` is a static scan shape and cache-key component, so every input is
-    deterministic from the deck and the array shapes and the chunk is the same
-    on every rank (INVARIANTS 21): the budget (``memory_per_device_gb``), what
-    this call allocates (``persistent_bytes``), what the caller prices as live
-    beside it (``resident_bytes``) and the measured per-platform reserve.
+    ``cs`` is a static scan shape and cache-key component, so it comes from the
+    shapes alone and is the same on every rank (INVARIANTS 21): the scan rows
+    whose transient fits the fixed tile (``runtime.tiles``).  The deck budget
+    (``memory_per_device_gb``) only guards the floor: this call's allocations
+    (``persistent_bytes``) and one scan row beside the measured reserve.
     """
     from runtime.aot_memory import runtime_reserve_bytes
+    from runtime.tiles import tile_units
     min_scan_bytes = nspinor * n_rtot * 16 * peak_copies
-    existing_live_bytes = int(resident_bytes) + runtime_reserve_bytes()
+    existing_live_bytes = runtime_reserve_bytes()
     scan_budget_bytes = (int(gpu_mem_bytes) - existing_live_bytes
                          - persistent_bytes)
     if scan_budget_bytes < min_scan_bytes:
@@ -2148,7 +2148,7 @@ def _centroid_fft_scan_chunk(
         raise MemoryError(
             "load_centroids_band_chunked planner refuses before WFN "
             f"allocation: the minimum per-device live set is "
-            f"{min_live_bytes / 2**30:.2f} GiB (priced resident + G-flat "
+            f"{min_live_bytes / 2**30:.2f} GiB (runtime reserve + G-flat "
             f"{'tile' if stream_tiles else 'input'} + X/Y centroid "
             f"outputs + one FFT scan row), but the budget "
             f"(memory_per_device_gb) is {gpu_mem_bytes / 2**30:.2f} GiB. "
@@ -2157,11 +2157,8 @@ def _centroid_fft_scan_chunk(
         )
 
     # Translate legacy hints (band_chunk_size, k_chunk_size) into the new
-    # flat-row count.  Only the budget LEFT AFTER persistent arrays may size
-    # the scan transient.  In either arm the bound applies last.
-    cs_budget = max(1, int(
-        scan_budget_bytes // (nspinor * n_rtot * 16 * peak_copies)
-    ))
+    # flat-row count.  In either arm the tile bound applies last.
+    cs_budget = tile_units(min_scan_bytes, 1 << 62)
     if stream_tiles:
         cs_hint = k_tile * nb_per_band_shard
         cs = max(1, min(cs_hint, cs_budget))
@@ -2169,9 +2166,8 @@ def _centroid_fft_scan_chunk(
         cs = cs_budget
     print(
         "[load_centroids planner] "
-        f"resident={existing_live_bytes / 2**30:.2f}, "
         f"persistent={persistent_bytes / 2**30:.2f}, "
-        f"scan_budget={scan_budget_bytes / 2**30:.2f} GiB/device, "
+        f"scan_tile_rows={cs_budget}, "
         f"peak_copies={peak_copies}, cs={cs}, "
         f"stream={'on' if stream_tiles else 'off'}, "
         f"k_domain={domain}, retain_parents={'yes' if return_parents else 'no'}, "
@@ -2594,14 +2590,8 @@ def load_centroids_band_chunked(
     k_domain: str = "full_bz",
     return_ibz_parents: bool = False,
     full_k_rows=None,
-    resident_bytes: int = 0,
 ) -> tuple[jax.Array, ...]:
-    """Produce centroid faces from bounded WFN tiles; see docs/architecture/zeta_fit_face_psi_cct.md.
-
-    ``resident_bytes`` is the caller's priced per-device live set beside this
-    call (from its shapes, never allocator readings); the FFT scan chunk is
-    sized from the deck budget less it (:func:`_centroid_fft_scan_chunk`).
-    """
+    """Produce centroid faces from bounded WFN tiles; see docs/architecture/zeta_fit_face_psi_cct.md."""
     (b_start, b_end, nb_total, domain, return_parents, nk_tot, nspinor, mu_basis, mu_active_mask, n_rmu, centroid_idx_np, n_rtot) = _centroid_sampling_geometry(
         band_range, centroid_indices, k_domain, meta, psi_G_flat, return_ibz_parents, sym, wfn)
     if full_k_rows is not None:
@@ -2626,14 +2616,9 @@ def load_centroids_band_chunked(
         band_tile, bispinor, k_tile, loader, max_parent_star, mesh_xy, n_rmu, n_rmu_padded,
         n_rtot, nb_accum, nb_total, nk_accum, nk_tot, nspinor, p_band, parent_stream_active,
         psi_G_flat, return_parents, stream_tiles)
-    if psi_G_flat is not None:
-        # A reused G-flat carrier is live beside this call: price its shard.
-        resident_bytes = int(resident_bytes) + int(np.prod(
-            psi_G_flat.sharding.shard_shape(psi_G_flat.shape))
-        ) * psi_G_flat.dtype.itemsize
     (cs) = _centroid_fft_scan_chunk(
         band_tile, domain, gpu_mem_bytes, k_tile, n_rtot, nb_per_band_shard, nspinor,
-        peak_copies, persistent_bytes, resident_bytes, return_parents, stream_tiles)
+        peak_copies, persistent_bytes, return_parents, stream_tiles)
     (g_index_full, kvecs_frac_full) = _centroid_sampling_indices(
         domain, loader, mesh_xy, parent_groups, full_k_rows)
     (_reshard_centroid_tile, _finish_faces) = _centroid_face_kernels(

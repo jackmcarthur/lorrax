@@ -91,10 +91,8 @@ _HEAD_WING_FREQUENCY_BLOCK = 2
 # The face-layout wing kernel's per-step psi gather: each step gathers one
 # block of every rank's mu tile with the rank's own band tile, a
 # (nk, ns, block*sqrt(P), nb_full/sqrt(P)) buffer per endpoint, independent of
-# how many centroids a rank owns (``head_wing_mu_block`` sizes it from the run
-# budget; ``_head_wing_kernel_face``'s docstring has the residency algebra).
-#: Share of the stage room the gathered endpoint blocks may take.
-_HEAD_WING_ROOM_FRACTION = 0.5
+# how many centroids a rank owns (``head_wing_mu_block`` sizes it from the fixed
+# tile; ``_head_wing_kernel_face``'s docstring has the residency algebra).
 #: Narrowest block: below it the per-step gathers and GEMMs are latency-bound.
 _HEAD_WING_MU_MIN = 16
 
@@ -104,18 +102,14 @@ def head_wing_mu_block(*, mu_local, nk, ns, nb_full, n_ends):
 
     One step holds ``n_ends`` gathered endpoint blocks of
     ``16·nk·ns·block·nb_full`` bytes per rank; the widest block whose set fits
-    ``_HEAD_WING_ROOM_FRACTION`` of the stage room
-    (``common.gpu_utils.device_room_bytes``) wins, at least
-    ``_HEAD_WING_MU_MIN`` (or the whole tile when it is narrower) and at most
-    the rank's whole mu tile.  Every process enters.
+    the fixed tile (``runtime.tiles``) wins, at least ``_HEAD_WING_MU_MIN`` (or
+    the whole tile when it is narrower) and at most the rank's whole mu tile.
     """
-    from common.gpu_utils import device_budget_bytes, device_room_bytes, record_stage_price
+    from common.gpu_utils import record_stage_price
+    from runtime.tiles import tile_units
     per_mu = 16.0 * int(nk) * int(ns) * int(nb_full) * int(n_ends)
-    room = float(device_room_bytes())
-    fit = int(_HEAD_WING_ROOM_FRACTION * room // per_mu)
-    block = int(min(int(mu_local), max(fit, _HEAD_WING_MU_MIN)))
-    record_stage_price(f"head wings, mu block {block}/{int(mu_local)}",
-                       device_budget_bytes() - room + block * per_mu)
+    block = tile_units(per_mu, int(mu_local), floor=_HEAD_WING_MU_MIN)
+    record_stage_price(f"head wings, mu block {block}/{int(mu_local)}", block * per_mu)
     return block
 # Width three is the incumbent Rydberg velocity.  Width eight has the same
 # energy-denominator contract: for a literal long-wave transition derivative

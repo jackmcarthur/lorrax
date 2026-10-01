@@ -3,6 +3,29 @@
 User-visible changes, newest first. Binding rulings behind the breaking
 changes live in `docs/architecture/decisions.md`.
 
+## 2026-09-30 — streamed loops take a fixed 1 GiB tile; `device_room_bytes` is gone
+
+Every planner that streams over k, q, bands, centroids, samples or rows now
+takes the most units whose per-rank bytes fit one fixed tile,
+`runtime.tiles.TILE_BYTES` (1 GiB). The tile comes from the loop's shapes
+alone. It never reads free device memory or `memory_per_device_gb`, so every
+rank computes it without a collective, and no result depends on the budget.
+`common.gpu_utils.device_room_bytes` (the allocator read gathered over
+processes) is deleted.
+
+Two sizes still follow `memory_per_device_gb`, through a ledger: the
+shared-pole response sample group (more samples per group is more than 10 %
+faster per map, and the group moves no number since the all-sample response
+rule) and the Galerkin whole-state fit in htransform.
+
+What moves: nothing on decks whose loops already fit one tile (Fe 4³ scalar
+and bispinor SC, Na 8³ SC, MoS2 SC + BSE and the hsuite are bitwise). On
+larger decks a loop that used to take more than 1 GiB per rank now runs in
+more passes of at most 1 GiB. Most of these loops are independent per unit,
+so their numbers are unchanged. Three split a sum: the exciton_bands C_q q
+chunk, the V_q G panel and the Σ output spin block. A deck whose tile shrinks
+there moves at round-off. Per-map wall can move either way.
+
 ## 2026-09-30 — a held SC map refits the response rule warm when line sites move
 
 When the shared-pole line sites move at a held SC map, the χ response rule is

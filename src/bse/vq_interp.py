@@ -494,24 +494,23 @@ def _batched_vq_relF(ZG, v_all, V_ref, q_chunk=48):
 
 
 def build_cq_q_chunk(*, nq, nb, ns, n_mu, n_r, mesh_xy):
-    """q rows per :func:`build_cq` pass, from the run budget's room.
+    """q rows per :func:`build_cq` pass, from the fixed tile.
 
-    Beside the live bytes (``common.gpu_utils.device_room_bytes``, the minimum
-    over processes) a pass holds the sharded accumulator P_R and its update
-    (2·nR·ns²·n_μ²·16/P), then per q the replicated ψ row and its conjugate
-    transpose (2·nb·ns·n_μ·16) and the face-sharded Pk row (ns²·n_μ²·16/P).  The largest q count that fits,
-    at least 1 and at most nq.  Every process enters.
+    A pass holds the sharded accumulator P_R and its update (2·nR·ns²·n_μ²·16/P),
+    then per q the replicated ψ row and its conjugate transpose (2·nb·ns·n_μ·16)
+    and the face-sharded Pk row (ns²·n_μ²·16/P).  The q rows are the tiled part:
+    the most whose bytes fit the fixed tile (``runtime.tiles``), at least 1 and
+    at most nq, from the shapes alone.
     """
-    from common.gpu_utils import device_room_bytes
+    from runtime.tiles import tile_units
     n_dev = int(mesh_xy.devices.size)
     face = 16.0 * int(ns) ** 2 * int(n_mu) ** 2 / n_dev
     fixed = 2.0 * int(n_r) * face
     per_q = 2.0 * 16.0 * int(nb) * int(ns) * int(n_mu) + face
-    from common.gpu_utils import device_budget_bytes, record_stage_price
-    device_room = float(device_room_bytes())
-    chunk = int(max(1, min(int(nq), (device_room - fixed) // per_q)))
+    from common.gpu_utils import record_stage_price
+    chunk = tile_units(per_q, int(nq))
     record_stage_price(f"exciton_bands build_cq, q chunk {chunk}/{int(nq)}",
-                       device_budget_bytes() - device_room + fixed + chunk * per_q)
+                       fixed + chunk * per_q)
     return chunk
 
 

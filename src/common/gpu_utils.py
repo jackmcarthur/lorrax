@@ -120,29 +120,6 @@ def device_budget_bytes() -> float:
     return _RUN_DEVICE_BUDGET_GB * 1e9
 
 
-def device_room_bytes(*, pool_fraction: float = 1.0) -> int:
-    """What a stage may still claim: the budget less the live bytes, and at most
-    ``pool_fraction`` of the allocator's free pool; the minimum over processes
-    (every process must enter).  A backend without pool statistics reports the budget.
-    """
-    import numpy as np
-    from common.collectives import all_gather_processes
-    import jax
-
-    room = device_budget_bytes()
-    try:
-        stats = jax.local_devices()[0].memory_stats() or {}
-    except Exception:                                          # noqa: BLE001
-        stats = {}
-    in_use = float(stats.get("bytes_in_use", 0))
-    room -= in_use
-    limit = stats.get("bytes_limit")
-    if limit:
-        room = min(room, float(pool_fraction) * (float(limit) - in_use))
-    local = np.asarray(int(max(room, 0.0)), dtype=np.int64)
-    return int(np.min(all_gather_processes(local)))
-
-
 # ============================================================================
 # Planner prices: what each planner said its stage would hold, per rank
 # ============================================================================

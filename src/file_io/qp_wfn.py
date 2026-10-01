@@ -1027,21 +1027,20 @@ def _write_rotated_coefficients(src, dst, *, mesh, U_kmn, band_start,
 
 
 def _coefficient_window(mesh, *, nbands, nspinor, ngkmax) -> int:
-    """G columns per coefficient window, ``P·w``, from the device budget.
+    """G columns per coefficient window, ``P·w``, from the fixed tile.
 
     ``w = ⌈ngkmax/P⌉`` (one window per k) whenever
-    ``5·nbands·nspinor·w·16 B`` fits the agreed per-rank budget — the read
-    slab, the active block as complex, its rotation, the output slab and the
-    one queued write — and the largest ``w`` that fits otherwise.
+    ``5·nbands·nspinor·w·16 B`` fits the fixed tile (``runtime.tiles``) — the
+    read slab, the active block as complex, its rotation, the output slab and
+    the one queued write — and the largest ``w`` that fits otherwise.  The
+    columns are independent, so the window moves no number.
     """
-    from common.gpu_utils import bfc_fragmentation_target_utilization, device_room_bytes
+    from runtime.tiles import tile_units
 
     p = int(mesh.devices.size)
     whole_k = -(-int(ngkmax) // p)
-    budget = float(device_room_bytes())
     per_column = 5 * int(nbands) * int(nspinor) * 16
-    w = int(budget * bfc_fragmentation_target_utilization(4) // per_column)
-    return p * max(1, min(whole_k, w))
+    return p * tile_units(per_column, whole_k)
 
 
 @functools.lru_cache(maxsize=None)

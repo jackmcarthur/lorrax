@@ -458,26 +458,6 @@ def sigma_row_blocks(*, n_rmu, ns, d, mesh):
     return face_row_blocks(mx, int(mesh.shape['y']), (int(ns) // int(d)) ** 2)
 
 
-def _green_stage_room(ns: int) -> tuple[float, float]:
-    """(live, room): the bytes already live, and what a Green-side stage may add, the
-    minimum over processes (every process must enter).  The room is the run's budget
-    (``memory_per_device_gb``, ``common.gpu_utils.device_room_bytes``) less the live
-    bytes, times the spinor's fragmentation utilization."""
-    from common.gpu_utils import (bfc_fragmentation_target_utilization, device_budget_bytes,
-                                  device_room_bytes)
-    free = float(device_room_bytes())
-    return device_budget_bytes() - free, free * bfc_fragmentation_target_utilization(int(ns))
-
-
-def _over_room(what, need, room):
-    """Warn that a Green-side stage cannot hold the run's budget at its smallest setting."""
-    import warnings
-    warnings.warn(f"memory_per_device_gb: {what} needs {need / 1e9:.2f} GB beside the live "
-                  f"bytes, over its room of {room / 1e9:.2f} GB; it runs anyway and the "
-                  "stage-memory table shows the peak.  Fix: more ranks or a larger budget.",
-                  RuntimeWarning)
-
-
 def _green_terms(*, n_parent, n_rmu, ns, n_band, mesh):
     """(T_p, M_axis): one parent Green tile ``16·n_parent·ns²·μ²/P``, and one Green build's
     two live SUMMA panels of both ψ orientations, at most ``N_b/p_x`` bands each,
@@ -497,17 +477,18 @@ def sigma_spin_block(*, n_parent, n_rmu, ns, n_full, n_band, mesh, partner_tiles
     the widest stored x block ``T_p·xn·bx/μ_x`` (``(d/ns)²`` of it up to a row per slab
     piece, :func:`sigma_row_blocks`), the full-k W(τ) out of the k-convolution
     ``16·N_k·μ²/P``, and the panels of the Green and partner builds ``2·M_axis``.  The
-    largest ``d`` whose set fits the stage room (:func:`_green_stage_room`) wins, else 1.
-    Every process computes the same ``d``.  ``plan`` (a dict) receives ``d``, the
-    live bytes, the pass's new bytes and the room, for the compiled check of the
-    window executable (``gw.mpa.sigma.SynthesisTau.admit``).
+    stored x block is the tiled part: the largest ``d`` whose block fits the fixed tile
+    (``runtime.tiles.TILE_BYTES``) wins, else 1, so every process computes the same
+    ``d`` from the shapes alone.  ``plan`` (a dict) receives ``d``, the pass's new
+    bytes and the tile, for the compiled check of the window executable
+    (``gw.mpa.sigma.SynthesisTau.admit``).
     """
     if int(ns) <= 1:
         return 1
     tile, panels = _green_terms(n_parent=n_parent, n_rmu=n_rmu, ns=ns, n_band=n_band,
                                 mesh=mesh)
     w_tau = 16.0 * int(n_full) * int(n_rmu) ** 2 / (int(mesh.shape['x']) * int(mesh.shape['y']))
-    live, room = _green_stage_room(ns)
+    from runtime.tiles import TILE_BYTES
     mx = int(n_rmu) // int(mesh.shape['x'])
 
     def frac(d):
@@ -516,14 +497,12 @@ def sigma_spin_block(*, n_parent, n_rmu, ns, n_full, n_band, mesh, partner_tiles
     new = lambda d: ((1.0 + float(partner_tiles) + frac(d)) * tile + w_tau
                      + (1.0 + float(partner_tiles)) * panels)
     divisors = sorted((d for d in range(1, int(ns) + 1) if int(ns) % d == 0), reverse=True)
-    d = next((d for d in divisors if new(d) <= room), 1)
-    if new(d) > room:
-        _over_room("the Sigma tau pass at d = 1", new(d), room)
+    d = next((d for d in divisors if frac(d) * tile <= TILE_BYTES), 1)
     from common.gpu_utils import record_stage_price
-    record_stage_price(f"Sigma tau, sigma_spin_block d={d}/{int(ns)}", live + new(d),
+    record_stage_price(f"Sigma tau, sigma_spin_block d={d}/{int(ns)}", new(d),
                        section="sigma.tau_sweep")
     if plan is not None:
-        plan.update(d=int(d), ns=int(ns), live=float(live), new=float(new(d)), room=float(room))
+        plan.update(d=int(d), ns=int(ns), new=float(new(d)), tile=float(TILE_BYTES))
     return d
 
 
@@ -553,10 +532,7 @@ def price_chi0_node(*, n_parent, n_rmu, ns, n_full, n_out, n_band, mesh, partner
     acc = 16.0 * int(n_out) * int(n_full) * int(n_rmu) ** 2 / (
         int(mesh.shape['x']) * int(mesh.shape['y']))
     from common.gpu_utils import record_stage_price
-    live, room = _green_stage_room(ns)
     new = (2.0 * (1.0 + float(bool(partner))) * (tile + panels) + acc
            + chi0_door_scratch(kgrid=kgrid, n_parent=n_parent, n_rmu=n_rmu, ns=ns, mesh=mesh))
-    if new > room:
-        _over_room("the chi0 node", new, room)
-    record_stage_price("chi0 node, price_chi0_node", live + new, section="chi.exec")
+    record_stage_price("chi0 node, price_chi0_node", new, section="chi.exec")
 

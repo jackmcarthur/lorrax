@@ -1072,18 +1072,12 @@ class SynthesisTau:
         plan = sigma_pass_price(self._spatial)
         if plan is not None:
             # The pass sigma_spin_block priced, from the window executable
-            # (runtime.aot_memory): its new bytes beside the live arguments plus
-            # the synthesis GEMM's native workspace.
-            from runtime.aot_memory import announce_once
+            # (runtime.aot_memory): its new bytes beside the synthesis's resident
+            # operands plus the synthesis GEMM's native workspace.
             from common.gpu_utils import record_stage_price
             got = int(peak.resident_increment) + int(self._native)
             record_stage_price(f"Sigma tau, compiled window d={plan['d']}/{plan['ns']}",
-                               plan["live"] + max(plan["new"], got), section="sigma.tau_sweep")
-            if got > max(plan["new"], plan["room"]) and plan["d"] > 1:
-                announce_once(f"sigma-pass-over-room:{plan['d']}",
-                              f"Sigma tau pass d={plan['d']}: compiled {got/1e9:.2f} GB over "
-                              f"the room {plan['room']/1e9:.2f} GB; the stage-memory table "
-                              "shows the peak")
+                               counted + max(plan["new"], got), section="sigma.tau_sweep")
 
 
 def _integrate_sigma_batches(

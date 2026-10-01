@@ -29,12 +29,20 @@ client reports no limit), and 0.90 of host RAM per device on CPU. The minimum
 is taken because static tile shapes must agree on every process.
 
 Every planner reads this one number, `common.gpu_utils.device_budget_bytes()`,
-which the config sets when the deck resolves. A stage planned while earlier
-objects are live prices against its room, `device_room_bytes()`: the budget
-less the bytes in use, the minimum over processes. kmeans, htransform, bse and
+which the config sets when the deck resolves. kmeans, htransform, bse and
 exciton_bands have no deck key; their planners read the same owner, whose
 default is the collective auto-detection above, recorded on the first call.
-No planner reads `bytes_limit`, free memory or the card total directly.
+No planner reads `bytes_limit`, free memory or the card total.
+
+**Streamed loops take a fixed tile, not the budget.** A loop that streams over
+k, q, bands, centroids, samples or rows takes the most units whose per-rank
+scaling bytes fit `runtime.tiles.TILE_BYTES` (1 GiB; `tile_units`). The tile
+comes from the loop's shapes alone, so every rank computes it without a
+collective, and no result depends on how much memory a run was given. Two
+sizes still follow the budget, through a ledger: the shared-pole response
+sample group (`response_bank.response_group_size`, the capacity ledger; a
+larger group buys more than 10 % per map) and the Galerkin whole-state
+planner (`isdf.galerkin`, whose capacity also bounds its resident rows).
 
 A planner fills `target = budget × utilization`. Utilization defaults to
 0.90, 0.85 and 0.78 for `n_s` = 1, 2 and ≥4
@@ -121,7 +129,7 @@ rank beside what is live:
 (`greens_function_kernel.chi0_door_scratch`); it is 0 on the single pass.
 
 `sigma_spin_block` picks the largest output spin block `d` (a divisor of
-`n_s`) whose pass fits the room times the spinor's utilization, else 1.
+`n_s`) whose stored x block fits the fixed tile, else 1.
 `price_chi0_node` only prices the χ₀ node: a band chunk of Gv would still
 be a whole `(μ, ν)` tile. On the packed bispinor route the static photon
 response (`V_packed`, `W_packed`, `2·16·Q·(μ + 3μ_T)²/P`) is deleted after
@@ -137,15 +145,15 @@ the static Σ channels read it, before Hartree and the τ sweep.
 | V_q | `V_acc` `16·Q·μ_L·μ_R/P`, one q-tile of ζ rows, G panels | `vq_tile_bytes` ([§ V_q](#vq-g-panels-and-q-tiles)) | `GATE vq_tile_budget` |
 | V_q unfold | `16·N_k·μ²/P`, sharded `P(None,'x','y')` | — | — |
 | shared-pole screening and Σ | response-bank faces, pencils, eigh workspace, then G and W tiles | the capacity ledger ([shared-pole model](shared_pole_model.md), byte model) | before allocating, when a stage and its named concurrent stages exceed the budget |
-| static / GN-PPM screening | the χ₀ node ([§ Green-side](#the-green-side-stages)); the GN fit's q block (XLA's compiled footprint of one q) | `price_chi0_node` (a price, no choice); `_gn_ppm_fit_q_block` against the room | `GATE gn_ppm_fit_capacity` |
-| Σ(τ) sweep | the resident pole fields and W prep, then one pass ([§ Green-side](#the-green-side-stages)) | `sigma_spin_block` against the room | — |
-| matrix-element sweep (V_H, four-current) | the step's slabs, and FFT boxes `(2 + 2·n_comp)·n_s·N_r·16` per band of a band-layout operator | `mtxel_sweep.plan_sweep`: bands in the fewest chunks that fit the room | — |
-| ψ loader off the fit plan (ζ reuse, current faces) | one band tile of G-flat rows, samples and faces | `gflat_memory_model.loader_band_chunk`: ¼ of the room, at least the automatic 16 | the loader, when one scan row cannot fit |
-| moment bank | `(per_q·w + 16)` faces for a batch of `w` q parents | `response_bank.moment_q_width`: half the smaller of the ledger's and the device's room | the ledger |
+| static / GN-PPM screening | the χ₀ node ([§ Green-side](#the-green-side-stages)); the GN fit's q block (XLA's compiled footprint of one q) | `price_chi0_node` (a price, no choice); `_gn_ppm_fit_q_block`: the fixed tile, at least one q | `GATE gn_ppm_fit_capacity` (only under `LORRAX_PPM_FIT_ARENA_GIB`) |
+| Σ(τ) sweep | the resident pole fields and W prep, then one pass ([§ Green-side](#the-green-side-stages)) | `sigma_spin_block`: the output block within the fixed tile | — |
+| matrix-element sweep (V_H, four-current) | the step's slabs, and FFT boxes `(2 + 2·n_comp)·n_s·N_r·16` per band of a band-layout operator | `mtxel_sweep.plan_sweep`: bands in the fewest chunks whose boxes fit the fixed tile | — |
+| ψ loader off the fit plan (ζ reuse, current faces) | one band tile of G-flat rows, samples and faces | `gflat_memory_model.loader_band_chunk`: the fixed tile, at least the automatic 16 | the loader, when one scan row cannot fit |
+| moment bank | `(per_q·w + 16)` faces for a batch of `w` q parents | `response_bank.moment_q_width`: the outputs within the fixed tile | the ledger |
 | sector Σ face Green panel | one parent Green tile of band panels, at most the ledger's room | `greens_function_kernel.green_panel_bytes` | the ledger |
-| direct Γ head (bulk metals) | the compiled per-sample footprint × samples per call, split over every rank | `photon_direct_head.direct_gamma_chunk_plan`: half the room, at least 2¹⁰ samples per rank, at most one 2¹⁷ replicate per call | — |
-| head wings | `n_ends` gathered endpoint blocks `16·N_k·n_s·block·N_b` | `qsgw_head.head_wing_mu_block`: half the room, at least 16 centroids | — |
-| exciton_bands C_q | P_R and its update, one ψ chunk and its Pk | `vq_interp.build_cq_q_chunk` | — |
+| direct Γ head (bulk metals) | the compiled per-sample footprint × samples per call, split over every rank | `photon_direct_head.direct_gamma_chunk_plan`: the fixed tile, at least 2¹⁰ samples per rank, at most one 2¹⁷ replicate per call | — |
+| head wings | `n_ends` gathered endpoint blocks `16·N_k·n_s·block·N_b` | `qsgw_head.head_wing_mu_block`: the fixed tile, at least 16 centroids | — |
+| exciton_bands C_q | P_R and its update, one ψ chunk and its Pk | `vq_interp.build_cq_q_chunk`: q rows within the fixed tile | — |
 | restart write | one sharded tile, `max(16·Q·μ²/P, 16·Q·μ·N_G/P)` (SlabIO writes per-rank hyperslabs) | — | — |
 
 Replicated per-process metadata (the TRS-augmented centroid permutation and
@@ -215,12 +223,12 @@ host     = 16·(μ_L [+ μ_R])·N_G/P per q                       phdf5 read sta
 `_plan_vq_tiles` picks the panel width `g` (`vq_g_chunk_size` if positive,
 otherwise the largest width ≤ 4096 whose panel all-gather fits
 `LORRAX_COLLECTIVE_CHUNK_MB` and whose panels take at most half of what one q
-leaves), then `q_tile` as every q that fits both the device budget and the
-host staging budget, balanced across tiles. The budget is 0.9 of the stage
-room (`memory_per_device_gb` less the live bytes), agreed as the minimum
-across processes because the tile count fixes the collective reads every rank
-issues. `GATE vq_tile_budget`
-refuses when `resident + work + per_q` alone exceeds it.
+leaves), then `q_tile` as every q whose rows fit the fixed tile and the
+host staging budget, balanced across tiles. Both come from the shapes, so every
+rank issues the same collective reads; the accumulators are priced, not capped.
+`GATE vq_tile_budget` refuses only under an explicit `budget_bytes`, when
+`resident + work + per_q` alone exceeds it, or when one q's host staging does
+not fit.
 
 For the charge channel, `ZetaG.contract_v` accumulates `V_q` tile by tile as
 it forms ζ from the Z store, keeping ζ only at the columns the head consumers
@@ -254,15 +262,16 @@ temporaries is compiled once at map 0 and never runs (Fe 8³: 2.3 s cold,
 
 | stage | chunk | compiled figure available | what it misses (priced elsewhere) |
 |---|---|---|---|
-| response direct stream (`gw.response_bank`) | samples per group | yes: temporaries | the donated carry (an argument), mode 11's split-arm scratch (`chi0_door_scratch`), residents no ledger row names (the device room) |
-| Σ τ window (`gw.mpa.sigma.SynthesisTau.admit`) | spin block `d` | yes: the first window executable | the synthesis GEMM's native workspace (added); `d` is not re-solved, a `d` over its room is announced |
+| response direct stream (`gw.response_bank`) | samples per group | yes: temporaries | the donated carry (an argument), mode 11's split-arm scratch (`chi0_door_scratch`) |
+| Σ τ window (`gw.mpa.sigma.SynthesisTau.admit`) | spin block `d` | yes: the first window executable | the synthesis GEMM's native workspace (added); `d` is not re-solved |
 | ζ μ batch (`gw.isdf_fitting`, route G) | centroids per owner | yes: the batch executable, which the loop then runs | the lookahead batch's rows (its output, added) |
 
-The direct stream's group must also fit the device room
-(`device_room_bytes`, the budget less the bytes actually live), as the
-moment bank's width does: the shared-pole ledger does not own the ψ carriers
-and other residents live when W is built. On a device the stream and the line
-selection are two phases, so a group costs its carry plus the larger phase.
+The direct stream's group is the one shared-pole size that follows the
+budget: it fits the capacity ledger, then the compiled check above. The ledger
+does not own the ψ carriers and other residents live when W is built, so leave
+headroom between `memory_per_device_gb` and the card. On a device the stream
+and the line selection are two phases, so a group costs its carry plus the
+larger phase.
 
 ### What compiled statistics miss
 

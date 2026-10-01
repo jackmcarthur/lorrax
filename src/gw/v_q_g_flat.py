@@ -392,7 +392,7 @@ def _plan_vq_tiles(*, n_q: int, n_rmu_L: int, n_rmu_R: int, ngkmax: int,
 
 
 def _plan_vq_group(tiles, *, rows, n_q: int, ngkmax: int, mesh_xy: Mesh,
-                   g_chunk: int | None, budget_bytes: float,
+                   g_chunk: int | None, budget_bytes: float | None,
                    host_budget_bytes: float = float('inf')):
     """Size the G panel and the ζ q-tile of V tiles contracted together.
 
@@ -414,9 +414,16 @@ def _plan_vq_group(tiles, *, rows, n_q: int, ngkmax: int, mesh_xy: Mesh,
     the budget across processes), so every rank issues the same collective
     reads.
 
-    Returns ``(q_tile, g_chunk, priced)``; refuses when the accumulators
-    plus one q do not fit, the only case no tile or panel choice can rescue.
+    ``budget_bytes = None`` (production) sizes from the fixed tile
+    (``runtime.tiles``) instead of a budget: the panels take at most half a
+    tile and the q-tile's scaling rows at most one tile; the accumulators are
+    priced, not capped, and nothing refuses.
+
+    Returns ``(q_tile, g_chunk, priced)``; with a budget, refuses when the
+    accumulators plus one q do not fit, the only case no tile or panel choice
+    can rescue.
     """
+    from runtime.tiles import TILE_BYTES
     from common.collectives import _owner_gather_chunk_bytes
 
     p_x, p_y = int(mesh_xy.shape['x']), int(mesh_xy.shape['y'])
@@ -435,18 +442,20 @@ def _plan_vq_group(tiles, *, rows, n_q: int, ngkmax: int, mesh_xy: Mesh,
                              for t in tiles)
         g = min(int(ngkmax), _VQ_G_CHUNK_TARGET,
                 max(1, int(_owner_gather_chunk_bytes() // widest_row)))
-        free = (budget_bytes - resident - per_q
+        free = (TILE_BYTES if budget_bytes is None else budget_bytes - resident - per_q
                 - max(x['fixed_work'] for x in b))
         g = max(1, min(g, int(0.5 * free // max(x['panel_col'] for x in b))))
     work = max(vq_tile_bytes(**sh, g_chunk=g)['work'] for sh in shapes)
-    q_fit = int(min((budget_bytes - resident - work) // per_q,
+    q_fit = int(min(max(1, TILE_BYTES // per_q) if budget_bytes is None
+                    else (budget_bytes - resident - work) // per_q,
                     host_budget_bytes // host_per_q, n_q))
     if q_fit < 1:
         raise ValueError(
             "GATE vq_tile_budget: "
             f"got V_acc/g0/one-leg {resident / 1e9:.2f} GB + one q "
             f"{per_q / 1e9:.2f} GB + faces/panels {work / 1e9:.2f} GB per rank; "
-            f"want <= the V_q budget {budget_bytes / 1e9:.2f} GB, and one q's "
+            f"want <= the V_q budget "
+            f"{(TILE_BYTES if budget_bytes is None else budget_bytes) / 1e9:.2f} GB, and one q's "
             f"host read staging {host_per_q / 1e9:.2f} GB <= "
             f"{host_budget_bytes / 1e9:.2f} GB; "
             "why: the output accumulator and one q's ζ face cannot both be "
@@ -462,21 +471,15 @@ def _plan_vq_group(tiles, *, rows, n_q: int, ngkmax: int, mesh_xy: Mesh,
                            host_staged=q_tile * host_per_q)
 
 
-#: The share of the stage room a V_q plan fills (the margin for what the price omits).
-_VQ_ROOM_FRACTION = 0.9
-
-
-def _vq_budget_bytes(budget_bytes: float | None) -> float:
-    """The per-rank V_q device budget, agreed across processes (the minimum).
-
-    ``None`` is the stage room: 0.9 of the run's budget (``memory_per_device_gb``)
-    less the live bytes (``common.gpu_utils.device_room_bytes``, already the
-    minimum over processes).  The q-tile count sets how many collective reads
-    every rank issues, so the value must be the same on every rank.
+def _vq_budget_bytes(budget_bytes: float | None) -> float | None:
+    """An explicit per-rank V_q budget, agreed across processes (the minimum), or
+    ``None``: the plan then tiles q and G by the fixed tile (``runtime.tiles``),
+    from the shapes alone.  The q-tile count sets how many collective reads every
+    rank issues, so the value must be the same on every rank.
     """
-    from common.gpu_utils import device_room_bytes, minimum_process_budget_gb
+    from common.gpu_utils import minimum_process_budget_gb
     if budget_bytes is None:
-        return _VQ_ROOM_FRACTION * float(device_room_bytes())
+        return None
     return minimum_process_budget_gb(float(budget_bytes) / 1e9) * 1e9
 
 
@@ -639,8 +642,8 @@ def _compute_V_q_g_flat_one_tile(
 
     One tile of :func:`_compute_V_q_g_flat_tiles`.  ``budget_bytes`` is the
     per-rank V_q memory allowance that sizes the ζ q-tile and the G panel
-    (``_plan_vq_tiles``); ``None`` measures it live (``_vq_budget_bytes``).
-    Either way it is agreed across processes.  ``head_slots`` names the ζ
+    (``_plan_vq_tiles``); ``None`` tiles by the fixed tile (``runtime.tiles``).
+    Either way every rank plans the same tiles.  ``head_slots`` names the ζ
     columns the head channel reads; route G keeps them (:func:`_head_shell`).
     """
     return _compute_V_q_g_flat_tiles(
@@ -767,8 +770,7 @@ def _compute_V_q_g_flat_tiles(
         s['v'] = v
 
     # ---- G panel and q-tile from the V_q budget ------------------------
-    from common.gpu_utils import device_budget_bytes, device_room_bytes, record_stage_price
-    live = device_budget_bytes() - float(device_room_bytes())
+    from common.gpu_utils import record_stage_price
     budget = _vq_budget_bytes(budget_bytes)
     # A ζ q-tile read stages each rank's slab in its phdf5 file context's host
     # buffer (``ctx->read_buf``); the context retires a buffer above 32 MiB
@@ -780,7 +782,7 @@ def _compute_V_q_g_flat_tiles(
               n_sub=n_sub if s['one_leg'] else 0) for s in specs],
         rows=mu_pad, n_q=n_q_ibz, ngkmax=ngkmax, mesh_xy=mesh_xy,
         g_chunk=g_chunk, budget_bytes=budget, host_budget_bytes=host_budget)
-    record_stage_price(f"V_q, vq_tile_bytes q_tile={q_tile}", live + priced['priced'])
+    record_stage_price(f"V_q, vq_tile_bytes q_tile={q_tile}", priced['priced'])
     n_chunks = -(-ngkmax // g_chunk)
     n_tiles = int(priced['n_tiles'])
     if verbose and jax.process_index() == 0:
@@ -794,8 +796,10 @@ def _compute_V_q_g_flat_tiles(
               f"({n_tiles} tile(s)), priced {priced['priced'] / 1e9:.2f} GB/rank "
               f"= resident {priced['resident'] / 1e9:.2f} + "
               f"{q_tile}×{priced['per_q'] / 1e9:.3f} ζ/q + faces/panels "
-              f"{priced['work'] / 1e9:.2f}, budget {budget / 1e9:.2f} GB; "
-              f"host read staging {priced['host_staged'] / 1e9:.2f} of "
+              f"{priced['work'] / 1e9:.2f}, "
+              + (f"budget {budget / 1e9:.2f} GB; " if budget is not None else
+                 "q rows and panels within the fixed tile; ")
+              + f"host read staging {priced['host_staged'] / 1e9:.2f} of "
               f"{host_budget / 1e9:.2f} GB/rank",
               flush=True)
 
