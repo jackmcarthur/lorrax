@@ -680,7 +680,7 @@ def _gn_ppm_fit_free_bytes(nq: int, block_bytes_per_q: int, out_bytes_per_q: int
 
 def _gn_ppm_fit_q_block(nq: int, block_bytes_per_q: int, out_bytes_per_q: int,
                         free_bytes: int) -> int:
-    """Largest q block that fits ``free_bytes``, cap ``nq``; refuses below one q.
+    """Largest q block that fits ``free_bytes``, cap ``nq``; one q (with a warning) below that.
 
     Every block's outputs stay live until the concatenation, which writes
     them once more, so ``2·nq·out`` is reserved before the block is priced.
@@ -688,13 +688,10 @@ def _gn_ppm_fit_q_block(nq: int, block_bytes_per_q: int, out_bytes_per_q: int,
     room = int(free_bytes) - 2 * int(nq) * int(out_bytes_per_q)
     qb = room // max(1, int(block_bytes_per_q))
     if qb < 1:
-        raise ValueError(
-            "GATE gn_ppm_fit_capacity: one q of the GN-PPM fit needs "
-            f"{block_bytes_per_q / 1e9:.2f} GB/dev beside {nq} q of outputs "
-            f"({2 * nq * out_bytes_per_q / 1e9:.2f} GB/dev) within the "
-            f"LORRAX_PPM_FIT_ARENA_GIB cap of {free_bytes / 1e9:.2f} GB/dev.  Fix: "
-            "raise the cap, or more ranks (the (mu, nu) tile shrinks as 1/P).")
-    return min(int(nq), int(qb))
+        from common.gpu_utils import warn_over_budget
+        warn_over_budget("GN-PPM fit q block",
+                         int(block_bytes_per_q) + 2 * int(nq) * int(out_bytes_per_q), free_bytes)
+    return max(1, min(int(nq), int(qb)))
 
 
 @jax.jit

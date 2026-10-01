@@ -268,7 +268,8 @@ against a planned 2 at P64). `route_g_plane_chunk` then re-prices the batch:
 the source rows (X_B, pair projectors, Z rows, and the owner's D̃ kept live
 across chunks) at b = P·c, the plane stage at the widest balanced
 c_out ≤ b/P that fits the target with one plane block, down to one row, then
-at one row with the fewest plane blocks that fit; if none fits, it refuses.
+at one row with the fewest plane blocks that fit; if none fits, it warns and
+runs one row with one plane group per block.
 CrI3 8×8 charge, P4: packed c = 12 streamed at c_out = 3 put the route-G
 module's temp at 8.9 GB, where the unchunked all-plane cylinder alone was
 24.8 GB.
@@ -284,8 +285,8 @@ per rank host Z store.
 
 | refusal | condition | way out |
 |---|---|---|
-| `GATE zeta-mubatch-capacity` | ψ(G) plus the smallest batch exceed the device target (ψ(G) streaming is not implemented) | more ranks or more memory per device |
-| `GATE zeta-mubatch-orbit-capacity` | the whole-orbit bins' source rows plus one row and one plane group per block exceed the target | more memory per device (the bin width is set by the widest orbit, not by P) |
+| warning, not a refusal: `memory over budget at zeta mu-batch` | ψ(G) plus the smallest batch exceed the device target (ψ(G) streaming is not implemented); the smallest batch runs | more ranks or more memory per device |
+| warning, not a refusal: `memory over budget at zeta mu-batch orbit bins` | the whole-orbit bins' source rows plus one row and one plane group per block exceed the target; that split runs | more memory per device (the bin width is set by the widest orbit, not by P) |
 | `GATE zeta-mubatch-shell` | a head consumer reads a ζ column that the V_q pass did not keep | name the slot in `_head_shell`'s lists |
 | `_fit_mubatch` | the loader's full-BZ rows are not the C-order k grid | none |
 | `typed_child_G_tables` | a child k is not an image of its parent, or needs a G outside the parent's sphere | none |

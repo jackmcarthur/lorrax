@@ -314,8 +314,9 @@ class CapacityLedger:
     each named footprint is counted once. Historical concurrency is not carried
     forward: callers name all allocations live in the current phase.
     Sequential stages omit predecessors. Stage names must be unique (include
-    batch/phase identifiers when necessary). A refusal is recorded but does not
-    create a usable reservation. The ledger owns no arrays or memory allocator.
+    batch/phase identifiers when necessary). A reservation over the budget is
+    recorded as FAIL, warned once and admitted: the run never refuses on a
+    price (owner 2026-10-01). The ledger owns no arrays or memory allocator.
     Host I/O staging is reported separately by the store, which refuses a host
     copy larger than its device panel (coordinator ruling 11).
     """
@@ -392,28 +393,28 @@ class CapacityLedger:
 
     def reserve(self, stage, *, resident_bytes_per_rank,
                 workspace_bytes_per_rank, concurrent_with=()):
-        """Admit actual-batch bytes before allocation, or record FAIL and refuse.
+        """Admit actual-batch bytes before allocation; over the budget, warn and admit.
 
         Returns a detached JSON row. ``concurrent_with`` is an iterable of
         accepted stage names, not their byte totals. Caller-live allocations
         must be charged here OR in a named concurrent reservation, never both.
         No runtime peak is inferred from a successful analytical admission.
+        A row over the available budget keeps ``device_budget_status`` FAIL
+        and prints one line (``common.gpu_utils.warn_over_budget``).
         """
         if not isinstance(stage, str) or not stage.strip() or stage in self._accepted:
             raise ValueError(f"capacity stage must be a new nonempty name; got {stage!r}")
         row = self.preview(resident_bytes_per_rank=resident_bytes_per_rank,
                            workspace_bytes_per_rank=workspace_bytes_per_rank,
                            concurrent_with=concurrent_with)
-        passed = row['device_budget_status'] == 'PASS'
-        reason = row['reason']
         row['stage'] = stage
         row['live_stages'] = sorted(set(row['concurrent_with']) | {stage})
         self.entries.append(row)
-        if not passed:
-            raise MemoryError(f"GATE shared_pole_capacity: stage={stage}; got: {reason}; "
-                              "why: aggregate live allocation must not exceed the remaining device budget")
+        from common.gpu_utils import record_stage_price, warn_over_budget
+        if row['device_budget_status'] != 'PASS':
+            warn_over_budget(f"shared-pole ledger {stage}", row['aggregate_bytes_per_rank'],
+                             row['available_device_bytes_per_rank'])
         self._accepted[stage] = row
-        from common.gpu_utils import record_stage_price
         record_stage_price("shared-pole ledger", row['aggregate_bytes_per_rank'])
         return copy.deepcopy(row)
 
@@ -492,50 +493,6 @@ class CapacityLedger:
             passed=peak <= self.limit_bytes_per_rank, reason=reason)
         self.measured_peak['bytes_per_rank'] = peak
         return self.receipt()['measured_peak']
-
-    def record_stream_peak(self, shared_bytes_per_rank, incumbent_bytes_per_rank, *, reason):
-        """Record the inherited stream comparison (coordinator ruling 9).
-
-        Both byte counts must use the same deck, mesh and measurement method;
-        ``reason`` names that scope and both evidence paths/job.steps. Missing
-        counts stay NOT_MEASURED. The inherited stream is not a reservation and
-        cannot be named in ``concurrent_with``. New bank outputs/batches still
-        enter ``reserve('bank_outputs', ...)`` and obey 3U.
-        """
-        return self._record_inherited_peak('stream_peak', shared_bytes_per_rank,
-                                           incumbent_bytes_per_rank, reason=reason)
-
-    def record_sigma_peak(self, shared_bytes_per_rank, incumbent_bytes_per_rank, *, reason):
-        """Record matched inherited Sigma footprint (coordinator ruling 12).
-
-        ``reason`` names the same deck, mesh, window plan and compile-only
-        measurement method with both evidence paths/job.steps. One W replacing
-        the incumbent W is inherited. Faces, weights, reader/routed panels,
-        unfold scratch and any simultaneous second W remain new reservations.
-        """
-        return self._record_inherited_peak('sigma_peak', shared_bytes_per_rank,
-                                           incumbent_bytes_per_rank, reason=reason)
-
-    def _record_inherited_peak(self, name, shared_bytes_per_rank, incumbent_bytes_per_rank, *, reason):
-        if getattr(self, name)['status'] != 'NOT_MEASURED':
-            raise ValueError(f"inherited {name} comparison already recorded for this map")
-        shared = None if shared_bytes_per_rank is None else self._bytes(shared_bytes_per_rank)
-        incumbent = None if incumbent_bytes_per_rank is None else self._bytes(incumbent_bytes_per_rank)
-        if incumbent == 0:
-            raise ValueError("incumbent peak must be positive")
-        threshold = shared_real_pole_gates_v1_r3b[name]['threshold']
-        passed = None if shared is None or incumbent is None else shared <= threshold * incumbent
-        row = gate_receipt(
-            name, {'shared_bytes_per_rank': shared,
-                   'incumbent_bytes_per_rank': incumbent},
-            passed=passed, reason=reason)
-        row.update(stage=name, geometry=dict(self.geometry))
-        setattr(self, name, row)
-        if passed is False:
-            raise MemoryError(f"GATE shared_pole_{name}: shared={shared} B/rank; "
-                              f"incumbent={incumbent} B/rank; limit={threshold} * incumbent; "
-                              f"geometry={self.geometry}; why: inherited {name} regressed")
-        return self.receipt()[name]
 
     def receipt(self, *, entry_start=None):
         """Snapshot stage rows and peaks, optionally as an indexed ledger segment.

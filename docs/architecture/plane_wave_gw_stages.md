@@ -56,9 +56,8 @@ not wired.
   comparison decks also set `bare_coulomb_cutoff = 25` (claims 2864, 2868).
 - No band-tail extrapolation.
 - Other refusals come from the owners: `GATE screened-coulomb-cutoff` (the cutoff at or
-  above the box's alias cap) and `GATE pairconv-capacity`. The W stage has no budget
-  check: `GATE pw-screening-budget` is raised only by `SphereScreening.plan_q_chunks`,
-  which the pipeline does not call.
+  above the box's alias cap). The pair convolution and `SphereScreening.plan_q_chunks`
+  (which the pipeline does not call) warn over budget and run their smallest schedule.
 
 ## Validation
 

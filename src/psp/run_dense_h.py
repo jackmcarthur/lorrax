@@ -18,8 +18,8 @@ WFN whose band sum is complete.
 Each process takes whole k-points (k ≡ rank mod P) and solves them with a
 local eigh; nothing is distributed inside one k.  Peak device bytes per k
 are ``psp.operator_checks.dense_h_bytes`` = 5·N²·16 with N = nspinor·ngk,
-refused against the device budget before any heavy work, so this is a
-small-cell route.  The operator is ``psp.dft_operators``' (the Davidson
+checked against the device budget before any heavy work (one warning
+line when over), so this is a small-cell route.  The operator is ``psp.dft_operators``' (the Davidson
 route's), applied to the unit basis; it is not assembled a second time.
 
 Usage (one rank per GPU):

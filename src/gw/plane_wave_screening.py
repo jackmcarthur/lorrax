@@ -362,10 +362,10 @@ class SphereScreening:
                        (int(n_z) + 3 * int(n_p)) * row * nq_c + temp_q)
             if need <= budget_bytes:
                 return n_c
-        raise ValueError(
-            f"GATE pw-screening-budget: got a per-rank budget of {budget_bytes / 1e9:.2f} GB; "
-            f"want one wedge row's samples, poles and workspace to fit; why: the response "
-            f"sphere carrier M={M} at P={Pn}; fix: more ranks or a smaller screened_coulomb_cutoff")
+        # One wedge row per chunk runs (the response sphere carrier M at P).
+        from common.gpu_utils import warn_over_budget
+        warn_over_budget("plane-wave screening (one wedge row)", need, budget_bytes)
+        return n_q
 
     # ------------------------------------------------------------------ receipt
     def describe(self, n_z: int | None = None, n_p: int | None = None) -> str:

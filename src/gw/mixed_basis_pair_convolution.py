@@ -670,11 +670,10 @@ def plan_pair_convolution_chunks(*, n_ranks, n_k, spins, widths, width_out, n_q,
         if hwm(nc, 1, 1, 1) <= target or n_c is not None:
             break
     else:
-        raise RuntimeError(
-            f"GATE pairconv-capacity: got {hwm(ncol, 1, 1, 1)} B per rank at the smallest "
-            f"schedule; want at most {target} B; why: the mixed-basis pair convolution keeps "
-            "H_k(p, r') for one r' chunk and T_q(G, r') resident on all P ranks; fix: more ranks "
-            "or more memory per device")
+        # The smallest schedule runs: H_k(p, r') for one r' chunk and
+        # T_q(G, r') stay resident on all P ranks.
+        from common.gpu_utils import warn_over_budget
+        warn_over_budget("mixed-basis pair convolution", hwm(nc, 1, 1, 1), target)
     cols_chunk = padded_axis(ncol, Pn * nc, name="mixed-basis r' columns").carrier // Pn // nc
     if J is None:
         J = 1

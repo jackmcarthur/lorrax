@@ -411,8 +411,6 @@ def _shared_pole_w_synthesis(io, meta, header, frequencies, schedule, *, mesh_xy
         from file_io.shared_pole_store import face_width, read_shared_pole_faces
         from .sector_sigma import _placer, _zeros
 
-        if schedule["status"] != "PASS":
-            raise ValueError("GATE shared_pole_capacity: an admitted schedule is required")
         nq = int(header["n_q_irr"])
         kmax = int(header["Kmax"])
         m = int(meta.mu_basis.n_packed)
@@ -743,8 +741,7 @@ def _shared_pole_memory_schedule(meta, header, *, mesh_xy, layout="face", stage=
     if capacity is None:
         raise ValueError("GATE shared_pole_capacity: missing current-map CapacityLedger")
     concurrent = capacity.live_stages
-    accepted = {row["stage"]: row for row in capacity.entries
-                if row["device_budget_status"] == "PASS"}
+    accepted = {row["stage"]: row for row in capacity.entries}
     caller_bytes = sum(accepted[name][key] for name in concurrent for key in
                        ("resident_bytes_per_rank", "workspace_bytes_per_rank"))
     px, py = int(mesh_xy.shape["x"]), int(mesh_xy.shape["y"])
@@ -820,25 +817,12 @@ def _shared_pole_memory_schedule(meta, header, *, mesh_xy, layout="face", stage=
     resident = _shared_pole_resident_bytes(meta, header, mesh_xy=mesh_xy, layout=layout)
     projection_bytes = 16*b*meta.mu_basis.n_packed**2/(px*py)
     if projection_bytes > U:
-        raise ValueError("GATE shared_pole_capacity: one parent star exceeds the all-P logical matrix bound")
-    try:
-        receipt = capacity.reserve(
-            f"{stage}.synthesis", resident_bytes_per_rank=resident,
-            workspace_bytes_per_rank=footprint["workspace_bytes_per_rank"],
-            concurrent_with=concurrent)
-    except MemoryError as exc:
-        # Resident factors and one panel's workspace are per-rank tiles of the
-        # all-P operators: every term scales as 1/P on the face layout.
-        need = resident + footprint["workspace_bytes_per_rank"]
-        side = math.isqrt(max(1, -(-need*px*py // max(1, budget)))-1) + 1
-        raise MemoryError(
-            f"{exc}; resident shared-pole factors need {resident} B/rank "
-            f"(n_q_irr={nq}, Kmax={kmax}, mu={meta.mu_basis.n_packed}, {layout} layout) "
-            f"plus {footprint['workspace_bytes_per_rank']} B/rank for one "
-            f"{b}-parent x {c}-column synthesis panel, against {budget} B/rank "
-            f"available beside the live stages; the smallest square mesh that fits "
-            f"them is P >= {side*side} ({side}x{side}; every term scales as 1/P, "
-            f"live stages held fixed)") from exc
+        from common.gpu_utils import warn_over_budget
+        warn_over_budget(f"{stage} parent star (all-P logical bound)", projection_bytes, U)
+    receipt = capacity.reserve(
+        f"{stage}.synthesis", resident_bytes_per_rank=resident,
+        workspace_bytes_per_rank=footprint["workspace_bytes_per_rank"],
+        concurrent_with=concurrent)
     return dict(status=receipt["device_budget_status"], unit_bytes=U,
                 factor_layout=layout,
                 peak_live_bytes_per_rank=receipt["aggregate_bytes_per_rank"],

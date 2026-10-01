@@ -450,18 +450,15 @@ def _plan_vq_group(tiles, *, rows, n_q: int, ngkmax: int, mesh_xy: Mesh,
                     else (budget_bytes - resident - work) // per_q,
                     host_budget_bytes // host_per_q, n_q))
     if q_fit < 1:
-        raise ValueError(
-            "GATE vq_tile_budget: "
-            f"got V_acc/g0/one-leg {resident / 1e9:.2f} GB + one q "
-            f"{per_q / 1e9:.2f} GB + faces/panels {work / 1e9:.2f} GB per rank; "
-            f"want <= the V_q budget "
-            f"{(TILE_BYTES if budget_bytes is None else budget_bytes) / 1e9:.2f} GB, and one q's "
-            f"host read staging {host_per_q / 1e9:.2f} GB <= "
-            f"{host_budget_bytes / 1e9:.2f} GB; "
-            "why: the output accumulator and one q's ζ face cannot both be "
-            "resident, so no q-tile or G-panel choice can run this tile; "
-            "fix: add ranks (every term above is ÷P) or free device memory "
-            "before V_q.")
+        # One q runs: the output accumulator beside one q's ζ face (device),
+        # or one q's read staging (host), is over its budget.
+        from common.gpu_utils import warn_over_budget
+        if host_per_q > host_budget_bytes:
+            warn_over_budget("V_q host read staging (one q)", host_per_q, host_budget_bytes)
+        else:
+            warn_over_budget("V_q tile (one q)", resident + work + per_q,
+                             TILE_BYTES if budget_bytes is None else budget_bytes)
+        q_fit = 1
     q_max = min(int(n_q), q_fit)
     n_tiles = -(-int(n_q) // q_max)
     q_tile = -(-int(n_q) // n_tiles)

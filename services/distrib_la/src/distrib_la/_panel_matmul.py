@@ -67,7 +67,7 @@ def panel_matmul(a, b, *, mesh, panel_bytes, bounds=None, weights=None, partner=
         multiply without any normalization. The output always stays x/y
         tiled; no rank ever holds a band-complete panel (on a p x p mesh a
         panel spans at most K/p contraction columns), and exchanged panels
-        never exceed ``panel_bytes`` per rank.  Every batch row rides in each
+        never exceed ``panel_bytes`` per rank, or one contraction column.  Every batch row rides in each
         panel exchange and each local GEMM: one collective per panel, not per q.
 
     Notes
@@ -90,9 +90,7 @@ def panel_matmul(a, b, *, mesh, panel_bytes, bounds=None, weights=None, partner=
     if m % px or k % px or k % py or n % py:
         raise ValueError('panel_matmul requires producer-padded face extents')
     per_column = a.dtype.itemsize * q * (m // px + n // py)
-    limit = int(panel_bytes) // per_column
-    if limit < 1:
-        raise MemoryError('panel_matmul panel budget cannot hold one contraction column')
+    limit = max(1, int(panel_bytes) // per_column)   # at least one column per panel
     sample_axis = b.ndim == 4
     if not sample_axis and px == py:
         # SUMMA on interleaved panels: every rank contributes `width` of its

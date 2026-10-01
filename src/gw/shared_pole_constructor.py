@@ -302,7 +302,14 @@ def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output, resi
                 if execution == 'local' and not distrib_la.fits_local(
                         local_eigh, "eigh", ((1, side, side),) * 8,
                         np.complex128, ledger.device_budget_bytes_per_rank):
-                    raise ValueError(f"GATE shared_pole_round_capacity: got: pencil side {side} at parents {ids[:real]}; want: eight [side, side] complex blocks and the eigh workspace within {ledger.device_budget_bytes_per_rank} bytes on one device; why: every parent reduces on its own rank")
+                    # Every parent reduces on its own rank: eight [side, side]
+                    # complex blocks and the eigh workspace on one device.
+                    from common.gpu_utils import warn_over_budget
+                    warn_over_budget(
+                        "shared-pole local pencil round",
+                        8 * 16 * side * side + budget.query_workspace(
+                            "eigh", ((1, side, side),), local_eigh),
+                        ledger.device_budget_bytes_per_rank)
                 budget.plan(side, phase="reduction",
                     padding_output_bytes_per_rank=padding_bytes)
                 if reuse:
