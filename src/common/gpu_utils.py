@@ -146,6 +146,23 @@ def stage_prices() -> list[dict]:
     return [dict(row) for row in _STAGE_PRICES]
 
 
+_HOST_HOLDS: dict[str, float] = {}
+
+
+def record_host_hold(name: str, nbytes: float) -> None:
+    """Name host memory a stage keeps across stages, bytes per process.
+
+    The stage-memory table lists every hold beside the host run peak, so a
+    resident host copy is not read as a stage's own rise.
+    """
+    _HOST_HOLDS[str(name)] = float(nbytes)
+
+
+def host_holds() -> dict[str, float]:
+    """Every host hold recorded this run (:func:`record_host_hold`)."""
+    return dict(_HOST_HOLDS)
+
+
 _OVER_BUDGET_WARNED: dict[str, float] = {}
 
 

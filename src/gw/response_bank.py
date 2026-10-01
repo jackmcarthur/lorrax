@@ -2360,17 +2360,50 @@ def _photon_sample_norms(receipt, value, parent, first, layout, mesh_xy):
         for i, row in enumerate(values))
 
 
+#: The packed photon V of the run's V file, held on the host as each process's
+#: device shards (one entry): V does not change across SC maps, so every map
+#: after the first rebuilds it on the devices instead of re-reading the file,
+#: and no device memory is held between banks.
+_PHOTON_V_HOST: dict = {}
+
+
 def photon_bare_operator(wfns, wfns_transverse, meta, *, path, mu_bases, layout, mesh_xy):
     """Read authenticated raw-parent photon V through its sole packing owner.
 
     The reader returns MuBasis-packed family tiles. Undo that family packing
     before the photon owner inserts canonical channel chunks, exactly as for
-    the endpoint carriers. All operators stay at P(None,x,y).
+    the endpoint carriers. All operators stay at P(None,x,y).  The packed V
+    is read once per V file (path, size, modification time), endpoint bases
+    and q parents; later calls rebuild it from its host copy (:data:`_PHOTON_V_HOST`).
     """
+    plans = (wfns.green_parent.plan, wfns_transverse.green_parent.plan)
+    stat = os.stat(path)
+    # By content, so a later map's endpoint objects of the same bases hit.
+    bases = hashlib.sha256(b"".join(
+        np.asarray(b.canonical_indices, dtype="<i4").tobytes() + str(int(b.n_packed)).encode()
+        for b in mu_bases)).hexdigest()
+    key = (str(path), int(stat.st_size), int(stat.st_mtime_ns), layout, mesh_xy, bases,
+           tuple(int(q) for q in plans[0].sym.q_irr_full_idx))
+    hit = _PHOTON_V_HOST.get(key)
+    if hit is not None:
+        shape, sharding, shards = hit
+        return jax.make_array_from_single_device_arrays(
+            shape, sharding, [jax.device_put(host, device) for device, host in shards])
+    value = _read_photon_bare_operator(path, plans, mu_bases, layout, mesh_xy)
+    _PHOTON_V_HOST.clear()
+    shards = [(s.device, np.asarray(s.data)) for s in value.addressable_shards]
+    _PHOTON_V_HOST[key] = (value.shape, value.sharding, shards)
+    from common.gpu_utils import record_host_hold
+    record_host_hold("packed photon V (photon_bare_operator)",
+                     sum(host.nbytes for _, host in shards))
+    return value
+
+
+def _read_photon_bare_operator(path, plans, mu_bases, layout, mesh_xy):
+    """The packed photon V read from the V file (:func:`photon_bare_operator`)."""
     from file_io.restart_bundle import BispinorVqReader
     from .photon_layout import pack_photon_operator
     from .v_q_bispinor import ZERO_TILES
-    plans = (wfns.green_parent.plan, wfns_transverse.green_parent.plan)
     nq = len(plans[0].sym.q_irr_full_idx)
     with BispinorVqReader(path, mesh_xy, mu_bases=mu_bases, family_plans=plans) as reader:
         if reader.n_q_total != nq:
