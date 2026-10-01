@@ -1360,15 +1360,18 @@ class ResidentBankPayload:
     Reads return exactly the file read's values: one sliced face copy, moved
     to batch layout by the same staged exchange as a permuted file read.
 
-    ``memory_kind="pinned_host"`` is the tier for a payload the devices cannot
-    hold: each [d_c, d_c] face tile (one q, one sample) is a pinned-host array
-    with the face sharding, written by the frequency-major producer and moved
-    back whole by the parent-major reader, so every move is one contiguous
-    per-rank DMA and the devices hold only the span being read.
+    ``memory_kind="host"`` is the tier for a payload the devices cannot hold:
+    each local device's face shard of every field is one host array
+    ``[nq, (nsample,) rows_X, cols_Y]``. A write is one device-to-host copy
+    per local shard into its lead span, a read one host-to-device copy of the
+    requested span, so the Python cost of either is independent of the number
+    of (parent, sample) tiles (the per-tile pinned transfers cost about 1.3 ms
+    each: 14 s per line sample at 1062 parents x 9 fields). The devices hold
+    only the span being read.
     """
 
     def __init__(self, mesh, *, carrier, label, memory_kind="device"):
-        if memory_kind not in ("device", "pinned_host"):
+        if memory_kind not in ("device", "host"):
             _refuse(f"resident bank memory kind {memory_kind!r}")
         self.mesh = mesh
         self.carrier = int(carrier)
@@ -1380,7 +1383,7 @@ class ResidentBankPayload:
         self._stored = {}
 
     def __str__(self):
-        tier = "device-resident" if self.memory_kind == "device" else "pinned-host"
+        tier = "device-resident" if self.memory_kind == "device" else "host-resident"
         return f"{tier} shared-pole bank ({self.label})"
 
     def __enter__(self):
@@ -1406,6 +1409,10 @@ class ResidentBankPayload:
         return device_put_process_local(np.asarray(offset[:-2], np.int32),
                                         NamedSharding(self.mesh, P()))
 
+    def _faces(self, shape):
+        """{local device: its face-shard index} of a ``shape`` field (host tier)."""
+        return NamedSharding(self.mesh, self._spec(len(shape))).addressable_devices_indices_map(shape)
+
     def create_dataset(self, name, *, shape, dtype):
         shape = tuple(int(s) for s in shape)
         if np.dtype(dtype) != np.dtype(np.complex128) or len(shape) not in (3, 4):
@@ -1421,10 +1428,13 @@ class ResidentBankPayload:
             _refuse(f"resident bank {name} logical extent exceeds canonical carrier")
         else:
             stored = shape[:-2] + (self.carrier, self.carrier)
-        # Host tiles are keyed by their lead index; an unwritten one reads as
-        # the file's zero fill.
+        # Host tier: one zero-filled array per local device holding its face
+        # shard of the whole field; an unwritten span reads as the file's zero
+        # fill, and untouched pages are never committed.
         self._fields[name] = (_resident_zeros(self.mesh, stored)()
-                              if self.memory_kind == "device" else {})
+                              if self.memory_kind == "device" else
+                              {device: np.zeros(_shard_shape(index, stored), np.complex128)
+                               for device, index in self._faces(stored).items()})
         self._logical[name] = shape
         self._stored[name] = stored
 
@@ -1455,9 +1465,9 @@ class ResidentBankPayload:
             return
         if logical is not None:
             A = _resident_mask(self.mesh, A.ndim, logical)(A)
-        host = NamedSharding(self.mesh, P("x", "y"), memory_kind=self.memory_kind)
-        for index in np.ndindex(A.shape[:-2]):
-            store[tuple(o + i for o, i in zip(offset, index))] = jax.device_put(A[index], host)
+        lead = tuple(slice(o, o + s) for o, s in zip(offset[:-2], A.shape[:-2]))
+        for shard in A.addressable_shards:
+            store[shard.device][lead] = np.asarray(shard.data)
 
     def read_slab(self, name, *, shape, offset, dtype, partition_spec, valid_shape=None):
         if name not in self._fields:
@@ -1476,12 +1486,10 @@ class ResidentBankPayload:
         if self.memory_kind == "device":
             value = _resident_slice(self.mesh, len(stored), shape[:-2])(store, self._lead(offset))
         else:
-            device = NamedSharding(self.mesh, P("x", "y"))
-            tiles = [store.get(tuple(o + i for o, i in zip(offset, index)))
-                     for index in np.ndindex(shape[:-2])]
-            tiles = [_resident_zeros(self.mesh, shape[-2:])() if t is None
-                     else jax.device_put(t, device) for t in tiles]
-            value = _resident_stack(self.mesh, shape[:-2])(*tiles)
+            lead = tuple(slice(o, o + s) for o, s in zip(offset[:-2], shape[:-2]))
+            value = jax.make_array_from_single_device_arrays(
+                shape, NamedSharding(self.mesh, face),
+                [jax.device_put(store[device][lead], device) for device in self._faces(shape)])
         layout = _bank_layout(None if tuple(partition_spec) == tuple(face) else partition_spec)
         return value if layout == "face" else _bank_face_to_batch(self.mesh, value.ndim)(value)
 
@@ -1503,12 +1511,8 @@ def _resident_mask(mesh, ndim, logical):
     return jax.jit(lambda value: _logical_mask(value, logical), out_shardings=spec)
 
 
-@lru_cache(maxsize=None)
-def _resident_stack(mesh, lead_shape):
-    """Host-tier read: device face tiles stacked into one face-tiled span."""
-    spec = NamedSharding(mesh, P(*((None,) * len(lead_shape)), "x", "y"))
-    return jax.jit(lambda *tiles: jnp.stack(tiles).reshape(tuple(lead_shape) + tiles[0].shape),
-                   out_shardings=spec)
+def _shard_shape(index, shape):
+    return tuple(len(range(*s.indices(n))) for s, n in zip(index, shape))
 
 
 @lru_cache(maxsize=None)

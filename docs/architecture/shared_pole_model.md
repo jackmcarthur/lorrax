@@ -54,7 +54,8 @@ are `P(None,'x','y')` on the square X/Y mesh with `P = Px·Py`.
 3. **Residence.** The bank is written frequency-major and read parent-major. It
    stays on the devices when the payload and one read copy fit half the device
    budget *and* the constructor route is unchanged with it live; otherwise it
-   goes to pinned host memory if it fits half the host budget; otherwise it
+   goes to host memory (one array per local face shard, written and read one
+   span per copy) if it fits half the host budget; otherwise it
    stays a scratch file. `write_w` and a distributed `linalg` always use the
    file. A scalar scratch file is unlinked once the constructor has committed
    `model.h5` (kept for `write_w`; the photon Σ reads its constant), so a run

@@ -284,7 +284,7 @@ def _operator_token(values):
 
 
 def _bank_residence(meta, config, *, mesh_xy, sym, root, label, photon, mu_bases=None):
-    """Keep this map's bank on the devices when it fits, else in pinned host memory.
+    """Keep this map's bank on the devices when it fits, else in host memory.
 
     The bank is written once and read back once by the constructor; the file
     exists only because the producer is frequency-major and the constructor
@@ -294,7 +294,7 @@ def _bank_residence(meta, config, *, mesh_xy, sym, root, label, photon, mu_bases
     live, still selects local parents, so residency never changes the route.
     ``photon`` is the photon layout of a full bispinor bank (else None); its
     sector constructor route must likewise be unchanged. Otherwise the payload
-    goes to the pinned host tier when it takes at most half of this process's
+    goes to the host tier when it takes at most half of this process's
     host budget (``host_bytes_per_process``); the devices then hold only the
     span being read, as on the file route. The scratch file is left for a
     payload host memory cannot hold, a W export (``write_w`` re-reads the
@@ -327,20 +327,20 @@ def _bank_residence(meta, config, *, mesh_xy, sym, root, label, photon, mu_bases
     carrier = meta.mu_basis.n_canonical if photon is None else photon.packed_extent
     bank_label = str(root / "bank.h5")
 
-    def pinned(reason):
+    def host(reason):
         receipt["half_host_budget_bytes_per_rank"] = int(host_bytes_per_process()) // 2
         if R > receipt["half_host_budget_bytes_per_rank"]:
             receipt["reason"] = reason + "; payload exceeds half the host budget"
             return None, receipt
-        receipt.update(residence="pinned_host", reason=reason + "; pinned host tier")
+        receipt.update(residence="host", reason=reason + "; host tier")
         return ResidentBankPayload(mesh_xy, carrier=carrier, label=bank_label,
-                                   memory_kind="pinned_host"), receipt
+                                   memory_kind="host"), receipt
 
     both = ledger.preview(resident_bytes_per_rank=2 * R, workspace_bytes_per_rank=0,
                           concurrent_with=())
     receipt["half_budget_bytes_per_rank"] = both["available_device_bytes_per_rank"] // 2
     if both["aggregate_bytes_per_rank"] > receipt["half_budget_bytes_per_rank"]:
-        return pinned("payload and one read copy exceed half the device budget")
+        return host("payload and one read copy exceed half the device budget")
     if photon is not None:
         from .shared_pole_sectors import sector_execution
         route = lambda upstream: sector_execution(meta, config, mu_bases, nq,
@@ -358,7 +358,7 @@ def _bank_residence(meta, config, *, mesh_xy, sym, root, label, photon, mu_bases
             meta, config, meta.shared_pole_recipe, mesh_xy=mesh_xy, ledger=ledger,
             upstream=(stage,), ordered=ordered, odd_moments=ordered, nq=nq)[0], "local"
     if execution != wanted:
-        return pinned("constructor would change route with the payload live")
+        return host("constructor would change route with the payload live")
     receipt.update(residence="device", stage=stage,
                    reason="payload, one read copy and the unchanged constructor route fit")
     return ResidentBankPayload(mesh_xy, carrier=carrier, label=bank_label), receipt
