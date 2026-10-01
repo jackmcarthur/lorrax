@@ -122,14 +122,22 @@ rank beside what is live:
 
 ```text
 χ₀ node   = 2·(1 + partner)·(T_p + M_panel) + 16·n_out·N_k·μ²/P + S_11   nothing chunks
-Σ(τ) pass = (1 + partner + (d/n_s)²)·T_p + 16·N_k·μ²/P + (1 + partner)·M_panel
+Σ(τ) row  = 16·[(2 + partner)·n_par·n_s²·ν + N_k·ν + 2·n_q,irr·ν + n_par·n_s·(N_b + 2·N_bΣ)]
 ```
 
 `S_11` is mode 11's split-arm scratch, at most one `T_p`
 (`greens_function_kernel.chi0_door_scratch`); it is 0 on the single pass.
 
-`sigma_spin_block` picks the largest output spin block `d` (a divisor of
-`n_s`) whose stored x block fits the fixed tile, else 1.
+The q-wedge Σ(τ) kernel (`ppm_tau_kernel._sigma_subtile_kernel`) runs each
+rank's tile in row passes of whole centroid orbits (`gw.subtile_stream`):
+`Σ(τ) row` is one local μ row's live set (`ν = μ/P_y`: the parent Green and
+its partner, mode 7's output, `W_prep`, the pass's rows of `W` and its
+partner on the q parents, the pass's ψ rows), and a pass holds the most rows
+whose bytes fit the fixed tile. ψ is band-complete once per Σ call,
+`16·n_par·n_s·(N_b + N_bΣ)·(μ/P_x + μ/P_y)`. No full-tile Green or `W_prep`
+exists. `sigma_spin_block` (the output spin block `d`, a divisor of `n_s`,
+whose stored x block fits the fixed tile) still sizes the full-zone Σ kernels
+and the static (COHSEX) and PPM spatial kernels.
 `price_chi0_node` only prices the χ₀ node: a band chunk of Gv would still
 be a whole `(μ, ν)` tile. On the packed bispinor route the static photon
 response (`V_packed`, `W_packed`, `2·16·Q·(μ + 3μ_T)²/P`) is deleted after
@@ -146,7 +154,7 @@ the static Σ channels read it, before Hartree and the τ sweep.
 | V_q unfold | `16·N_k·μ²/P`, sharded `P(None,'x','y')` | — | — |
 | shared-pole screening and Σ | response-bank faces, pencils, eigh workspace, then G and W tiles | the capacity ledger ([shared-pole model](shared_pole_model.md), byte model) | before allocating, when a stage and its named concurrent stages exceed the budget |
 | static / GN-PPM screening | the χ₀ node ([§ Green-side](#the-green-side-stages)); the GN fit's q block (XLA's compiled footprint of one q) | `price_chi0_node` (a price, no choice); `_gn_ppm_fit_q_block`: the fixed tile, at least one q | `GATE gn_ppm_fit_capacity` (only under `LORRAX_PPM_FIT_ARENA_GIB`) |
-| Σ(τ) sweep | the resident pole fields and W prep, then one pass ([§ Green-side](#the-green-side-stages)) | `sigma_spin_block`: the output block within the fixed tile | — |
+| Σ(τ) sweep | the resident pole fields, band-complete ψ, then one row pass ([§ Green-side](#the-green-side-stages)) | `subtile_stream.plan_rows`: the rows within the fixed tile | — |
 | matrix-element sweep (V_H, four-current) | the step's slabs, and FFT boxes `(2 + 2·n_comp)·n_s·N_r·16` per band of a band-layout operator | `mtxel_sweep.plan_sweep`: bands in the fewest chunks whose boxes fit the fixed tile | — |
 | ψ loader off the fit plan (ζ reuse, current faces) | one band tile of G-flat rows, samples and faces | `gflat_memory_model.loader_band_chunk`: the fixed tile, at least the automatic 16 | the loader, when one scan row cannot fit |
 | moment bank | `(per_q·w + 16)` faces for a batch of `w` q parents | `response_bank.moment_q_width`: the outputs within the fixed tile | the ledger |
@@ -263,7 +271,7 @@ temporaries is compiled once at map 0 and never runs (Fe 8³: 2.3 s cold,
 | stage | chunk | compiled figure available | what it misses (priced elsewhere) |
 |---|---|---|---|
 | response direct stream (`gw.response_bank`) | samples per group | yes: temporaries | the donated carry (an argument), mode 11's split-arm scratch (`chi0_door_scratch`) |
-| Σ τ window (`gw.mpa.sigma.SynthesisTau.admit`) | spin block `d` | yes: the first window executable | the synthesis GEMM's native workspace (added); `d` is not re-solved |
+| Σ τ window (`gw.mpa.sigma.SynthesisTau.admit`) | row pass | yes: the first window executable | the synthesis GEMM's native workspace (added); the passes are not re-solved |
 | ζ μ batch (`gw.isdf_fitting`, route G) | centroids per owner | yes: the batch executable, which the loop then runs | the lookahead batch's rows (its output, added) |
 
 The direct stream's group is the one shared-pole size that follows the

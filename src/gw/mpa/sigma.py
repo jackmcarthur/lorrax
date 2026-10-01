@@ -1071,12 +1071,15 @@ class SynthesisTau:
         from gw.ppm_tau_kernel import sigma_pass_price
         plan = sigma_pass_price(self._spatial)
         if plan is not None:
-            # The pass sigma_spin_block priced, from the window executable
+            # The priced pass (sigma_spin_block's x blocks, or the sub-tile
+            # kernel's row passes), from the window executable
             # (runtime.aot_memory): its new bytes beside the synthesis's resident
             # operands plus the synthesis GEMM's native workspace.
             from common.gpu_utils import record_stage_price
             got = int(peak.resident_increment) + int(self._native)
-            record_stage_price(f"Sigma tau, compiled window d={plan['d']}/{plan['ns']}",
+            shape = (f"{plan['passes']} row pass(es)" if "passes" in plan
+                     else f"d={plan['d']}/{plan['ns']}")
+            record_stage_price(f"Sigma tau, compiled window {shape}",
                                counted + max(plan["new"], got), section="sigma.tau_sweep")
 
 
@@ -1140,6 +1143,13 @@ def _integrate_sigma_batches(
             psi_proj_xr, sigma_axis, axis=1)
         psi_proj_yn = pad_to_axis(
             psi_proj_yn, sigma_axis, axis=3)
+        if tau_kernel_factory is None and (synthesis or q_wedge is not None):
+            # The q-wedge Σ kernel runs row passes from band-complete ψ
+            # (gw.ppm_tau_kernel._sigma_subtile_kernel): placed here, once
+            # per Σ call, so no τ node exchanges ψ.
+            from gw.ppm_tau_kernel import sigma_subtile_operands
+            psi_coh_xn, psi_coh_yr, psi_proj_xr, psi_proj_yn = sigma_subtile_operands(
+                psi_coh_xn, psi_coh_yr, psi_proj_xr, psi_proj_yn, mesh_xy=mesh_xy)
         spatial_shape = (
             int(k_unfold_plan.n_parent), sigma_axis.carrier, sigma_axis.carrier)
         face_kwargs["face_band_extent"] = sigma_axis.carrier

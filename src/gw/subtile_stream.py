@@ -23,12 +23,16 @@ rows go straight into the carry.  So
   family pair go to their blocks of the packed photon layout.
 
 Sizes come from :data:`runtime.tiles.TILE_BYTES` and the shapes alone
-(:func:`plan_passes`); the budget never enters, so no result depends on it.
-The χ₀ operands and doors are ``gw.w_isdf``'s (the response owner), for the
-charge stream and for the four-current stream (Dirac-half quadrant Greens and
-the mode-11 vertex door per family pair); a Σ
-consumer would supply its own pair (G and the W pole factors) and the
-mode-7/8 door through the same :func:`stream_passes`.
+(:func:`plan_rows`, :func:`plan_passes`); the budget never enters, so no
+result depends on it.  The χ₀ operands and doors are ``gw.w_isdf``'s (the
+response owner), for the charge stream and for the four-current stream
+(Dirac-half quadrant Greens and the mode-11 vertex door per family pair):
+nodes in chunks into a carry (:func:`stream_passes`).  The Σ G⋆W convolution
+(``gw.ppm_tau_kernel``, the Σ owner) runs the same passes inside each τ
+node: G(τ) on the pass's ψ rows, W(τ) on the pass's rows of its q parents
+through the mode-9 load (:func:`pass_load`) and mode 7, and the band
+projection, which is linear in the rows, summed over the passes
+(:func:`fold_passes`).
 """
 from __future__ import annotations
 
@@ -111,6 +115,21 @@ class PassPlan:
     blocks: tuple = (Block(),)
 
 
+def plan_rows(local_rows, row_bytes, cuts):
+    """Row passes of ``local_rows`` whose per-row live set ``row_bytes`` fits one tile.
+
+    ``cuts()`` gives the admissible orbit cuts (:func:`orbit_cuts`; the
+    intersection over every table the passes' doors read); it is called only
+    when more than one pass is needed.  No cut: one pass.
+    """
+    from runtime.tiles import tile_units
+    local_rows = int(local_rows)
+    rows = tile_units(row_bytes, local_rows)
+    n_pass = -(-local_rows // rows)
+    passes = row_passes(n_pass, local_rows, tuple(cuts()) if n_pass > 1 else ())
+    return ((0, local_rows),) if passes is None else passes
+
+
 def plan_passes(tables, mesh, *, ns, row_bytes, chunk_bytes, n_nodes, blocks=(Block(),)):
     """Row passes and the node chunk from :data:`runtime.tiles.TILE_BYTES` and shapes.
 
@@ -126,12 +145,41 @@ def plan_passes(tables, mesh, *, ns, row_bytes, chunk_bytes, n_nodes, blocks=(Bl
     side = int(mesh.shape["x"])
     local_rows = int(np.asarray(tables.lsrc).shape[1]) // (side * int(ns))
     chunk = tile_units(chunk_bytes, n_nodes)
-    rows = tile_units(row_bytes(chunk), local_rows)
-    n_pass = -(-local_rows // rows)
-    passes = row_passes(n_pass, local_rows, orbit_cuts(tables.lsrc, side, ns) if n_pass > 1 else ())
-    if passes is None:
-        passes = ((0, local_rows),)
+    passes = plan_rows(local_rows, row_bytes(chunk), lambda: orbit_cuts(tables.lsrc, side, ns))
     return PassPlan(passes=passes, chunk=int(chunk), blocks=tuple(blocks))
+
+
+def pass_load(load, mesh, x0, xr, ns=1):
+    """Device load tables (``symmetry_maps.DeviceLoadTables``) cut to every X shard's rows ``[x0, x0 + xr)``.
+
+    The device twin of :func:`pass_tables` for a door that reads its tables as
+    operands (mathdx mode 9): the left sources and phases are cut and moved
+    to the pass's own rows.  The caller cuts at an orbit cut of the host
+    tables, so no source leaves the pass.
+    """
+    c0, c1 = int(x0) * int(ns), (int(x0) + int(xr)) * int(ns)
+
+    def cut(lsrc, mph):
+        rows = lsrc[:, c0:c1]
+        return jnp.where(rows >= 0, rows - c0, -1).astype(lsrc.dtype), mph[:, c0:c1]
+    spec = P(None, "x")
+    lsrc, mph = jax.shard_map(cut, mesh=mesh, in_specs=(spec, spec), out_specs=(spec, spec),
+                              check_vma=False)(load.lsrc, load.mph)
+    return load._replace(lsrc=lsrc, mph=mph)
+
+
+def fold_passes(passes, step, carry, operands):
+    """``carry = step(p, x0, xr, carry, operands)`` over every pass, one pass's temporaries at a time.
+
+    Each later pass reads ``operands`` (the whole-tile inputs it slices)
+    from behind an optimization barrier with the running carry, so its
+    work cannot be scheduled beside the previous pass's.
+    """
+    for p, (x0, xr) in enumerate(passes):
+        if p:
+            carry, operands = jax.lax.optimization_barrier((carry, operands))
+        carry = step(p, x0, xr, carry, operands)
+    return carry
 
 
 def band_complete(psi_mun, psi_nmu, mesh):
@@ -145,11 +193,28 @@ def band_complete(psi_mun, psi_nmu, mesh):
     return rows, cols
 
 
-def pass_rows(a, mesh, x0, xr, axis):
-    """Every X shard's local rows ``[x0, x0 + xr)`` of ``a`` on ``axis`` (its X-sharded axis)."""
-    spec = [None] * a.ndim
-    spec[axis] = "x"
-    spec = P(*spec)
+def projection_complete(psi_left, psi_right, mesh):
+    """The band projection's ``axis`` operands (``common.contract_bands``'s axis projector).
+
+    ``psi_left`` ``(nk, m, s, μ)`` with every band and μ on X, ``psi_right``
+    ``(nk, s', ν, n)`` with every band and ν on Y: a pass projects its own μ
+    rows with no exchange, and one band-block reduce-scatter ends the sum.
+    """
+    left = jax.lax.with_sharding_constraint(psi_left, NamedSharding(mesh, P(None, None, None, "x")))
+    right = jax.lax.with_sharding_constraint(psi_right, NamedSharding(mesh, P(None, None, "y", None)))
+    return left, right
+
+
+def pass_rows(a, mesh, x0, xr, axis, spec=None):
+    """Every X shard's local rows ``[x0, x0 + xr)`` of ``a`` on ``axis`` (its X-sharded axis).
+
+    ``spec`` is ``a``'s placement (default: ``axis`` on X, the rest whole), so
+    no axis is gathered by the slice.
+    """
+    if spec is None:
+        spec = [None] * a.ndim
+        spec[axis] = "x"
+        spec = P(*spec)
     return jax.shard_map(lambda t: jax.lax.slice_in_dim(t, x0, x0 + xr, axis=axis),
                          mesh=mesh, in_specs=spec, out_specs=spec, check_vma=False)(a)
 
