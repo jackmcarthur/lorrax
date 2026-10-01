@@ -56,8 +56,7 @@ def response_algebra(meta, config, *, mesh_xy, n, ordered=False, photon=False):
     from .gw_config import linalg_resolution
     from .w_isdf import _w_solve_pref_scalar
 
-    resolution = linalg_resolution(
-        config if hasattr(config, "get") else {"linalg": config.backend.linalg})
+    resolution = linalg_resolution({"linalg": dense_layout(meta, config, mesh_xy, n)})
     route = resolution.batched_route
     backend = "off" if resolution.layout == "local" else "distributed"
     pref = _w_solve_pref_scalar(meta)
@@ -696,6 +695,30 @@ def operator_digest(values, mesh_xy):
     return digest
 
 
+#: Whole n x n matrices a rank holds when it owns one parent of the dense
+#: Dyson algebra: the operand rows (H, chi, dchi, Wc, dWc/ds) and the kernel's
+#: working set (products, the LU factor and its inverse, W).
+_WHOLE_PARENT_MATRICES = 13
+
+
+def dense_layout(meta, config, mesh_xy, n):
+    """The bank's dense algebra layout: the deck's ``linalg``, except that on a
+    local deck a parent whose whole matrices do not fit takes the full mesh,
+    one parent after another (``whole_parent_execution``, the line selection's
+    rule). Every rank decides from the shapes and the shared ledger."""
+    from .gw_config import linalg_resolution
+    from .shared_pole_execution import whole_parent_execution
+    layout = linalg_resolution(
+        config if hasattr(config, "get") else {"linalg": config.backend.linalg}).layout
+    if layout != "local":
+        return layout
+    whole = _WHOLE_PARENT_MATRICES * 16 * int(n) * int(n)
+    execution, _, _ = whole_parent_execution(
+        lambda e: (0, whole if e == "local" else -(-whole // int(mesh_xy.size))),
+        ledger=meta.shared_pole_capacity)
+    return "local" if execution == "local" else "distributed"
+
+
 def _reserve(meta, stage, resident, workspace=0):
     """Reserve a uniquely named actual-batch footprint in the shared ledger."""
     ledger = meta.shared_pole_capacity
@@ -763,7 +786,7 @@ def _bank_execution(meta, mesh_xy, receipt, config, *, photon=False):
                                   memory.temp_size_in_bytes + int(runtime_bytes))
                 receipt["memory"].append(row)
             elif not stream:
-                layout = config.get("linalg", "local") if hasattr(config,"get") else config.backend.linalg
+                layout = dense_layout(meta, config, mesh_xy, args[0].shape[-1])
                 native = response_dense_workspace(mesh_xy,args[0].shape[-1],args[0].shape[0],layout,
                     with_eigh=stage=="coulomb_sqrt")
                 receipt.setdefault("native_queries",[]).append(dict(stage=stage,**native))
@@ -839,7 +862,7 @@ def _coulomb_batch(meta, config, bank_io, mesh_xy, q_span, execute):
         return value, None, [value.shape[-1]] * (q_span[1]-q_span[0])
     basis = meta.mu_basis
     resource = bank_io["coulomb"]
-    layout = config.get("linalg", "local") if hasattr(config, "get") else config.backend.linalg
+    layout = dense_layout(meta, config, mesh_xy, basis.n_packed)
     token = resource.get("operator")
     key = None if token is None else (token, (int(q_span[0]), int(q_span[1])),
                                       basis.n_packed, basis.n_logical, layout, mesh_xy)
@@ -1556,7 +1579,7 @@ class _MemberRows:
         return self.carry[self.first + int(i), rows]
 
 
-def _dyson_phase(dyson, solve_slope, roots, held_roots, mesh_xy, config, *, nq, n, extra=()):
+def _dyson_phase(dyson, solve_slope, roots, held_roots, mesh_xy, layout, *, nq, n, extra=()):
     """(resident, workspace) bytes per rank of the sample Dyson phase beside a group's carry.
 
     Counted as :func:`_bank_execution` admits them: the compiled arguments
@@ -1571,7 +1594,6 @@ def _dyson_phase(dyson, solve_slope, roots, held_roots, mesh_xy, config, *, nq, 
         return 0, 0
     face = jax.ShapeDtypeStruct((int(nq), int(n), int(n)), jnp.complex128, sharding=sharding)
     h = jax.ShapeDtypeStruct((int(nq),) + tuple(roots.shape[1:]), roots.dtype, sharding=sharding)
-    layout = config.get("linalg", "local") if hasattr(config, "get") else config.backend.linalg
     native = response_dense_workspace(mesh_xy, int(n), int(nq), layout, with_eigh=False)["total"]
     held = 16 * int(nq) * int(n) * int(n) // int(mesh_xy.size)
     phases = []
@@ -1757,7 +1779,7 @@ def produce_sample_bank(wfns, meta, config, *, mesh_xy, sym, sample_plan, bank_i
         # admissions will (their compiled executables), summed.
         chosen = (0, 0) if selection is None else (selection_resident, selection_workspace)
         chosen = tuple(a + b for a, b in zip(chosen, _dyson_phase(
-            dyson, solve_slope, roots, held, mesh_xy, config, nq=len(qids), n=n,
+            dyson, solve_slope, roots, held, mesh_xy, receipt["algebra"]["linalg"], nq=len(qids), n=n,
             extra=() if vertex is None else (contact,))))
         with timing.section('bank.plan.direct'):
             group_size, fixed, room, live = response_group_size(meta, mesh_xy, n_samples=len(z),

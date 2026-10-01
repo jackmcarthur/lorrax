@@ -100,19 +100,28 @@ def line_selection_price(rows, *, mesh, nq, execution):
     return int(resident), int(workspace)
 
 
-def line_selection_execution(rows, *, mesh, ledger, nq, carry=0):
-    """'local' when the producer's line selection fits with whole parents per rank, else 'face'.
+def whole_parent_execution(price, *, ledger, carry=0):
+    """'local' when whole parents per rank fit the ledger beside its live stages, else 'face'.
 
-    ``carry`` is the resident group carry the selection runs beside. Returns
+    ``price(execution)`` returns the route's ``(resident, workspace)`` bytes per
+    rank; ``carry`` is a resident the work runs beside. The face is the full
+    mesh, one parent after another, and is never refused. Returns
     ``(execution, resident, workspace)``, the prices of the chosen route.
     """
     for execution in ('local', 'face'):
-        resident, workspace = line_selection_price(rows, mesh=mesh, nq=nq, execution=execution)
+        resident, workspace = price(execution)
         row = ledger.preview(resident_bytes_per_rank=resident + int(carry), workspace_bytes_per_rank=workspace,
                              concurrent_with=ledger.live_stages)
         if row['device_budget_status'] == 'PASS':
             return execution, resident, workspace
     return 'face', resident, workspace
+
+
+def line_selection_execution(rows, *, mesh, ledger, nq, carry=0):
+    """'local' when the producer's line selection fits with whole parents per rank, else 'face'."""
+    return whole_parent_execution(
+        lambda execution: line_selection_price(rows, mesh=mesh, nq=nq, execution=execution),
+        ledger=ledger, carry=carry)
 
 
 def constructor_execution(meta, resolution, recipe, *, mesh, ledger, upstream,
