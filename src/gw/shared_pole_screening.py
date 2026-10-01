@@ -341,11 +341,16 @@ def _release_bank_file(path):
     Fe 20^3 (1062 parents, 1796 centroids). A resume directory's bank may be
     hard-linked from another attempt; only this link goes, and the link count
     is returned with the bytes so the receipt says whether space was freed.
+    Returns ``None`` when there is no file.  Rank 0 alone looks: a per-rank
+    ``exists()`` raced its unlink, and a late rank skipped the release while
+    the others waited in it (the Na SC hang on a cold cache, CPU P4).
     """
     import os
     from common.collectives import rank0_transaction
 
     def unlink():
+        if not os.path.exists(path):
+            return None
         stat = os.stat(path)
         os.unlink(path)
         return dict(bytes=int(stat.st_size), links=int(stat.st_nlink))
@@ -696,13 +701,14 @@ def screen_shared_poles(wfns, V_q, meta, config, *, mesh_xy, sym,
         # The model is committed; the constructor was the bank's last reader.
         resident.release()
         ledger.live_stages = ()
-    elif not photon and not config.debug.write_w and (root / "bank.h5").exists():
+    elif not photon and not config.debug.write_w:
         # The file tier likewise: model.h5 is committed, and only a write_w
         # export (and the photon Sigma's constant) would read the bank again.
-        residence = dict(residence, released=_release_bank_file(root / "bank.h5"))
-        print_fn(f"shared-pole bank: scratch file released after the constructor "
-                 f"({residence['released']['bytes'] / 2**30:.2f} GiB, "
-                 f"{residence['released']['links']} link(s))")
+        released = _release_bank_file(root / "bank.h5")
+        if released is not None:
+            residence = dict(residence, released=released)
+            print_fn(f"shared-pole bank: scratch file released after the constructor "
+                     f"({released['bytes'] / 2**30:.2f} GiB, {released['links']} link(s))")
     receipts["bank_residence"] = residence
     with timing.section("spole.screening_finalize", announce=True,
                         label="shared-pole receipts and head"):
