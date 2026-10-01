@@ -1420,6 +1420,42 @@ def _stream_workspace(wfns, meta, mesh_xy, support, *, q_ids, n_outputs, ordered
             + _stream_scratch(wfns, meta, mesh_xy, vertex)), compiled
 
 
+def _unitary_inversion(plan):
+    """The plan's spatial row equal to -1 with a complete centroid map, or ``None``."""
+    ops, perm = np.asarray(plan.spatial_ops), np.asarray(plan.sym_perm)
+    rows = [r for r in range(int(plan.n_sym_spatial))
+            if np.array_equal(ops[r], -np.eye(3, dtype=ops.dtype)) and np.all(perm[r] >= 0)]
+    return rows[0] if rows else None
+
+
+def _minus_q_mirror(plan, sym, meta, mesh_xy):
+    """``chi_{-q}`` rows from ``chi_q`` rows by a unitary inversion, or ``None``.
+
+    Inversion maps every q to -q, so ``chi_{-q} = U_I chi_q U_I^dagger`` is the
+    parent row unfolded by that operation (``symmetry_maps.unfold_isdf_operator``
+    with the plan's packed centroid tables, as V and W are restored).  Taken
+    when the plan holds a unitary (spatial) operation equal to -1 whose centroid
+    map is complete.  Returns ``mirror(rows, q0, q1)`` for the parents ``[q0, q1)``.
+    """
+    from symmetry_maps import bgw_integer_q_to_fractional, unfold_isdf_operator
+    n_spatial = int(plan.n_sym_spatial)
+    inversion = _unitary_inversion(plan)
+    if inversion is None:
+        return None
+    kgrid = (int(meta.nkx), int(meta.nky), int(meta.nkz))
+    q_frac = np.asarray(bgw_integer_q_to_fractional(sym.q_irr_kgrid_int, kgrid))
+
+    def mirror(rows, q0, q1):
+        n = int(q1) - int(q0)
+        return unfold_isdf_operator(
+            rows, irr_idx=np.arange(n, dtype=np.int32),
+            sym_idx=np.full(n, inversion, dtype=np.int32),
+            sym_perm=plan.sym_perm, L_table=plan.L_table, q_irr_frac=q_frac[q0:q1],
+            mesh_xy=mesh_xy, n_sym_spatial=n_spatial,
+            axis_local_sym_perm=plan.centroid_local_perm)
+    return mirror
+
+
 class _MemberRows:
     """``raw[i, rows]`` of one group member, read from the group carry ``[2m, q, μ, ν]``."""
 
@@ -1431,14 +1467,23 @@ class _MemberRows:
         return self.carry[self.first + int(i), rows]
 
 
-def _dyson_phase(solve_value, solve_slope, roots, mesh_xy, config, *, nq, n, extra=()):
+#: Face-sized arrays one parent's partner unfold holds at once (the tile's
+#: gathered rows, the unfolded rows and their transient), the bound the
+#: partner tile is sized from.
+MIRROR_TILE_STACKS = 3
+
+
+def _dyson_phase(solve_value, solve_slope, roots, mesh_xy, config, *, nq, n, extra=(),
+                 mirrored=False):
     """(resident, workspace) bytes per rank of the sample Dyson phase beside a group's carry.
 
     Counted as :func:`_bank_execution` admits them: the compiled arguments
     resident, the outputs, temporaries and native solver workspace on top.
     ``sample_dyson`` takes ``(H, chi)``; ``sample_slope`` takes ``(H, Wc, dchi)``
     while the value's chi rows are still held (one more face stack).  Both at
-    the full parent span ``nq``, the largest a sample solves.
+    the full parent span ``nq``, the largest a sample solves.  ``mirrored``:
+    a partner's rows are collected from unfolded tiles before they are
+    concatenated (one more stack, plus one tile's unfold).
     """
     sharding = getattr(roots, "sharding", None)
     if sharding is None or not hasattr(roots, "shape"):
@@ -1448,9 +1493,14 @@ def _dyson_phase(solve_value, solve_slope, roots, mesh_xy, config, *, nq, n, ext
     layout = config.get("linalg", "local") if hasattr(config, "get") else config.backend.linalg
     native = response_dense_workspace(mesh_xy, int(n), int(nq), layout, with_eigh=False)["total"]
     held = 16 * int(nq) * int(n) * int(n) // int(mesh_xy.size)
+    if mirrored:
+        from runtime.tiles import TILE_BYTES
+        extra_bytes = held + min(int(TILE_BYTES), MIRROR_TILE_STACKS * held)
+    else:
+        extra_bytes = 0
     phases = []
-    for kernel, args, kept in ((solve_value, (h, face) + tuple(extra), 0),
-                               (solve_slope, (h, face, face), held)):
+    for kernel, args, kept in ((solve_value, (h, face) + tuple(extra), extra_bytes),
+                               (solve_slope, (h, face, face), held + extra_bytes)):
         memory = _compiled(kernel, args).memory_analysis()
         if memory is None:
             raise ValueError("GATE response_capacity: compiled memory unavailable")
@@ -1539,9 +1589,21 @@ def produce_sample_bank(wfns, meta, config, *, mesh_xy, sym, sample_plan, bank_i
                 green_stream="union of exact q and minus-q output rows in the same response panel",
                 dyson="original parent V/contact for both; consumed by the line selection, never stored")
 
+        # A unitary operation that maps every q to -q (inversion) gives the
+        # partner rows from the parent rows on load (TASTE 97), so the stream
+        # carries no -q rows; otherwise they are streamed.
+        # The four-current route keeps streaming its -q rows: its inputs'
+        # inversion residual (<= 2e-5 relative per Lorentz block on Fe 4^3)
+        # moves eqp by up to 5.4 meV through the line selection.
+        mirror = (_minus_q_mirror(wfns.green_parent.plan, sym, meta, mesh_xy)
+                  if partnered and vertex is None and wfns.green_parent is not None else None)
+        if mirror is not None:
+            receipt["minus_q_partner"]["green_stream"] = (
+                "parent q rows only; -q rows by the unitary inversion's unfold of the parent rows")
+
         def panel_rows(first, last):
             rows = qids[first:last].tolist()
-            if partnered:
+            if partnered and mirror is None:
                 rows = list(dict.fromkeys(rows+partner_qids[first:last].tolist()))
             return tuple(rows)
 
@@ -1619,7 +1681,7 @@ def produce_sample_bank(wfns, meta, config, *, mesh_xy, sym, sample_plan, bank_i
         chosen = (0, 0) if selection is None else (selection_resident, selection_workspace)
         chosen = tuple(a + b for a, b in zip(chosen, _dyson_phase(
             solve_value, solve_slope, roots, mesh_xy, config, nq=len(qids), n=n,
-            extra=() if vertex is None else (contact,))))
+            extra=() if vertex is None else (contact,), mirrored=mirror is not None)))
         with timing.section('bank.plan.direct'):
             group_size, fixed, room, live = response_group_size(meta, mesh_xy, n_samples=len(z),
                 carry_per_sample=carry_per_sample, stream_workspace=workspace,
@@ -1654,8 +1716,20 @@ def produce_sample_bank(wfns, meta, config, *, mesh_xy, sym, sample_plan, bank_i
 
     def solve(raw, partner, q0, q1, bank_handle, sample, need_value=True):
         """W and dW/ds of parents [q0, q1) at one sample, as the bank stores them."""
-        selected = (partner_qids if partner else qids)[q0:q1]
+        mirrored = partner and mirror is not None
+        selected = (partner_qids if partner and not mirrored else qids)[q0:q1]
         rows = np.asarray([row_index[int(q)] for q in selected])
+
+        def chi_rows(i):
+            if not mirrored:
+                return raw[i, rows]
+            # The partner rows are formed in parent tiles (runtime.tiles): one
+            # tile's unfold transients beside the collected stack.
+            from runtime.tiles import tile_units
+            step = tile_units(MIRROR_TILE_STACKS * face_bytes, len(rows))
+            parts = [mirror(raw[i, rows[a:a+step]], q0+a, q0+min(a+step, len(rows)))
+                     for a in range(0, len(rows), step)]
+            return parts[0] if len(parts) == 1 else jnp.concatenate(parts, axis=0)
         span = (int(q0), int(q1))
         h = roots[q0:q1]
         constant = 0.
@@ -1675,7 +1749,7 @@ def produce_sample_bank(wfns, meta, config, *, mesh_xy, sym, sample_plan, bank_i
                     gamma_vectors=direct_head["gamma_vectors"],
                     layout=bank_io["photon_layout"], mesh=mesh_xy)
         if need_value:
-            chi_value = raw[0,rows]
+            chi_value = chi_rows(0)
             if partner:
                 chi_value = jnp.conj(chi_value)
             value = execute(solve_value, (h,chi_value)+(() if vertex is None else (contact,)),
@@ -1689,7 +1763,7 @@ def produce_sample_bank(wfns, meta, config, *, mesh_xy, sym, sample_plan, bank_i
             del saved
             if head_update is not None:
                 value = gamma_add(value, -head_update)
-        chi = raw[1,rows]
+        chi = chi_rows(1)
         if partner:
             chi = jnp.conj(chi)
         w = value if vertex is None else value+constant
