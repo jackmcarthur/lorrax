@@ -211,6 +211,13 @@ def main(argv=None):
         report.architecture()
 
         params = read_cohsex_input(args.input)
+        # The whole-state fit prices against this run budget, as in gwjax
+        # and kmeans; zero retains collective device auto-detection.
+        deck_gb = float(params.get("memory_per_device_gb", 0.0) or 0.0)
+        if deck_gb > 0:
+            from common.gpu_utils import (minimum_process_budget_gb,
+                                         set_device_budget_gb)
+            set_device_budget_gb(minimum_process_budget_gb(deck_gb))
         # Input file is the source of truth; CLI backend flags remain debug
         # overrides of the implementation selected by the resolved layout.
         eigh_backend = resolve_eigh_backend(params, override=args.eigh_backend)
