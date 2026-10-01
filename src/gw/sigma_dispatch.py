@@ -51,7 +51,7 @@ from common.units import RYD_TO_EV
 from runtime.padding import PaddedAxis
 from .gw_config import (
     BRACKET_SCHEME_DEFAULT, ComputeMode, SigmaChannel,
-    band_extrapolation_is_consumable,
+    band_extrapolation_is_consumable, linalg_resolution,
     mpa_sigma_runs_scalar_executor,
     mode_builds_channels, refuse_explicit_gij,
     refuse_unimplemented_compute_mode,
@@ -1473,7 +1473,8 @@ def _compute_mpa_sigma(
             body_options.update(band_brackets=plan.bounds, band_counts=plan.counts)
         body = compute_sigma_c_mpa_omega_grid(
             wfns, fit_path, meta, mesh_xy, sigma_w_model=sigma_w_model,
-            fit_identity=fit_identity, fit_digest=fit_digest, **body_options)
+            fit_identity=fit_identity, fit_digest=fit_digest,
+            linalg=linalg_resolution({"linalg": config.backend.linalg}).layout, **body_options)
     head_diag = None
     if head is not None:
         if iteration_head is None:
