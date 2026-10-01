@@ -101,8 +101,10 @@ def _shared_pole_omega0_weights(poles2, intervals, E_ref_B, t_node):
 #   tau-invariant factors placed once, Sigma tau -30% scalar Fe 4^3 (2732), -40% bispinor sectors
 #   (2726); only each window's live pole columns contracted, Fe 8^3 map-0 Sigma tau -5.0% (2955);
 #   transposes formed on the rank that needs them, Fe 8^3 Sigma tau -9.3% at P4, -24.5% at P16 (2958);
-#   whole parents per rank on a local deck (only W moves, no per-node factor re-gather), Ni 20^3
-#   P64-local tile synthesis 0.427 -> 0.134 s per tau node at P4, 0.81 -> 0.18 s at P16 (SIGPROF).
+#   where the replicated columns do not fit, whole parents per rank (only W moves, no per-node
+#   factor re-gather): Ni 20^3 P64-local tile synthesis 0.427 -> 0.131 s per tau node at P4,
+#   0.81 -> 0.18 s at P16 (3100).  Where the replicated columns fit (Fe 4^3, Na 8^3 P4) they win:
+#   the same local GEMM with no W exchange (whole parents there: +10-13% Sigma tau, 3100).
 # Did not pay: W^T by a second GEMM, +10% at P4, +2% at P16 (2958), +5.7% on Fe 8^3 (2955); the 2-D
 #   face layout for the Sigma residues, Sigma tau +25% Na 8^3, +160% Fe 4^3 (2955); the local
 #   projector transpose costs Na 8^3 (group order 14.8) +6.4%, accepted (2958); a sync-free tau
