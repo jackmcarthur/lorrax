@@ -3,6 +3,19 @@
 User-visible changes, newest first. Binding rulings behind the breaking
 changes live in `docs/architecture/decisions.md`.
 
+## 2026-09-30 — every response sample group runs one program
+
+When the response sample group is smaller than the sample count (memory-bound
+decks: Fe/Ni 20³ on 64 40 GB GPUs take groups of 4 for 22 samples), the last
+group was short (2 samples), a new carry shape, so `bank.compile.direct`
+compiled a third stream program in the middle of map 0 (47.8 s on the Ni 20³
+P64 run, which then died of host memory in that dispatch). A short group now
+fills its empty slots with zero weights and runs the planned group's program;
+it reserves the slots it allocates. Results are unchanged: with the group
+forced to 5 on Fe 4³ (groups 5,5,5,5,2), eqp0 at maps 0–2 is bitwise to main
+at group 5 and at the default single group, and map 0 compiles two direct
+programs instead of three. Decks whose samples fit one group are unaffected.
+
 ## 2026-09-30 — the scalar χ₀ mode-11 door reads its tables as operands
 
 The charge response stream on a raw-parent plan (the shared-pole direct

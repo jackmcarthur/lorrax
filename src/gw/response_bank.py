@@ -1253,11 +1253,19 @@ def response_quadrature(meta, sample_plan, receipt, support, *, group_size, prin
                      f"kappa {g['coefficient_mass'].max():.2e}  z(eV) {points}", flush=True)
         print_fn(f"Response quadrature: {receipt['nodes']} total Green-pair evaluations "
                  f"(value + derivative, forward + reverse)", flush=True)
-    return dict(plan=plan, groups=groups, f=f, u=u, refs=refs, band_ranges=support["band_ranges"])
+    return dict(plan=plan, groups=groups, slots=group_size, f=f, u=u, refs=refs,
+                band_ranges=support["band_ranges"])
 
 
 def _group_stream_arguments(rules, group):
-    """Shared times and [forward/reverse, value/ds per member, node] weights."""
+    """Shared times and [forward/reverse, value/ds per slot, node] weights.
+
+    Every group has ``rules["slots"]`` member slots, the planned group size: a
+    short last group's empty slots carry zero weights, so every group runs the
+    one executable the planner checked (a ragged last group compiled a third
+    stream program at Fe/Ni 20^3).  An empty slot adds exact zeros to its own
+    carry rows, which nothing reads; the members' rows are unchanged.
+    """
     plan, refs = rules["plan"], rules["refs"]
     times = group["t"]
     # Translate the scalar gauge to the physical endpoint references; the
@@ -1265,10 +1273,10 @@ def _group_stream_arguments(rules, group):
     shift = -(refs[1]-refs[0]-plan["reference"])
     gauge = (np.exp(shift*times), np.exp(shift*np.conj(times)))
     members = len(group["members"])
-    weights = np.zeros((2, 2*members, times.size), np.complex128)
+    weights = np.zeros((2, 2*max(members, int(rules["slots"])), times.size), np.complex128)
     for side in (0, 1):
-        weights[side, 0::2] = -group["value"][:, side]*gauge[side]
-        weights[side, 1::2] = -group["derivative"][:, side]*gauge[side]
+        weights[side, 0:2*members:2] = -group["value"][:, side]*gauge[side]
+        weights[side, 1:2*members:2] = -group["derivative"][:, side]*gauge[side]
     return times, weights
 
 
@@ -1600,7 +1608,7 @@ def produce_sample_bank(wfns, meta, config, *, mesh_xy, sym, sample_plan, bank_i
                 progress.step()
             continue
         ledger.live_stages = ambient
-        name, _ = _reserve(meta, "bank_outputs", len(members)*carry_per_sample)
+        name, _ = _reserve(meta, "bank_outputs", rules["slots"]*carry_per_sample)
         ledger.live_stages = ambient+(name,)
         raw_group = integrate_response_group(wfns, meta, mesh_xy, rules, group,
             q_ids=response_rows, execute=execute, receipt=receipt,
