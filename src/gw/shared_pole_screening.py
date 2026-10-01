@@ -577,7 +577,7 @@ def screen_shared_poles(wfns, V_q, meta, config, *, mesh_xy, sym,
         if "stage" in residence:
             ledger.live_stages = (residence["stage"],)
         bank = dict(path=str(root / "bank.h5") if resident is None else resident,
-                    identity=identity, tables=tables, coulomb=coulomb)
+                    identity=identity, tables=tables, coulomb=coulomb, root=str(root))
         if photon:
             bank.update(photon_layout=photon_layout, mu_bases=mu_bases,
                         bispinor_v_q_path=bispinor_v_q_path,
