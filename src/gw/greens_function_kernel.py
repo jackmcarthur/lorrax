@@ -565,10 +565,9 @@ def price_photon_pass(*, n_parent, n_full, n_band, q_count, rows, right, n_ch, p
     - mode 11's run-time scratch (:func:`chi0_door_scratch`; not in ``memory_analysis``);
     - and the larger of the door phase: the quadrant's lower and upper parent Greens with
       their partners ``2(1+a)·T`` (:func:`_green_terms`, ns = 2 per Dirac half), and the
-      build in flight: the tiles its SUMMA holds beside the running sum
-      (``distrib_la.panel_matmul_extra_tiles``: 2 when its panel loop is a scan, else 0),
-      the Green and partner builds' panels ``(1+a)·M``, and the half-spinor faces the
-      quadrants read, both Dirac halves of the left rows and the right carrier
+      build in flight: the Green and partner builds' panels ``(1+a)·M`` (the SUMMA
+      accumulates each panel into the running sum in place: no further output tile), and
+      the half-spinor faces the quadrants read, both Dirac halves of the left rows and the right carrier
       ``2·16·n_parent·2·N_b·(r + c)/P`` (sliced from ψ alone, so one copy of each serves
       all four quadrants); or the transform phase: one plane's transform and its two
       selected-row blocks, ``16·(N_k + 2q)·r·c/P``.
@@ -582,12 +581,7 @@ def price_photon_pass(*, n_parent, n_full, n_band, q_count, rows, right, n_ch, p
     plane = 16.0 * int(rows) * int(right) / P
     planes = (2 if int(passes) > 1 else 1) * int(n_ch) * int(n_full) * plane
     faces = 2 * 16.0 * int(n_parent) * 2 * int(n_band) * (int(rows) + int(right)) / P
-    from distrib_la import panel_matmul_extra_tiles
-    m, n = 2 * int(rows), 2 * int(right)
-    extra = panel_matmul_extra_tiles(
-        int(n_parent), m, int(n_band), n, mesh=mesh,
-        panel_bytes=green_panel_bytes(n_rows=int(n_parent), m=m, n=n, mesh=mesh))
-    door = (2.0 * (1.0 + a) + extra) * tile + (1.0 + a) * panels + faces
+    door = 2.0 * (1.0 + a) * tile + (1.0 + a) * panels + faces
     transform = (int(n_full) + 2 * int(q_count)) * plane
     scratch = chi0_door_scratch(kgrid=kgrid, n_parent=n_parent, n_rmu=rows, ns=2,
                                 mesh=mesh, n_right=right)

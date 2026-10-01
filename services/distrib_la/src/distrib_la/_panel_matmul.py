@@ -129,32 +129,24 @@ def _interleaved_width(k, p, limit):
     return -(-kl // n_panel)
 
 
-def panel_matmul_extra_tiles(q, m, k, n, *, mesh, panel_bytes, itemsize=16):
-    """Output tiles a square-mesh :func:`panel_matmul` holds beside its running sum, per product.
-
-    Two (the panel product and the new sum) when its interleaved loop runs at
-    least three full panels: the loop is a ``lax.scan`` that carries the sum,
-    and XLA does not fold ``c + a @ b`` into the GEMM there.  Zero otherwise:
-    the straight-line panels' adds fold into the GEMM's accumulate (the XLA
-    buffer assignments of runs/DEV/700_photpass_20260930/aot).
-    """
-    px = int(mesh.shape['x'])
-    limit = int(panel_bytes) // (int(itemsize) * int(q) * (int(m) // px + int(n) // int(mesh.shape['y'])))
-    if limit < 1:
-        raise MemoryError('panel_matmul panel budget cannot hold one contraction column')
-    return 2 if (int(k) // px) // _interleaved_width(int(k), px, limit) >= 3 else 0
-
-
-def _panel_contraction(mesh):
+def _panel_contraction(mesh, active=True):
     """``(left, right, bounds, c)``: ``c + left[:, :, lo:hi] @ right[:, lo:hi]`` per row
-    (``c=None``: a fresh product), the local active-range GEMM of this mesh's platform.
+    (``c=None``: a fresh product), the local active-range GEMM of this mesh's platform,
+    accumulating in place (beta = 1, ``c`` aliased to the result).  ``bounds=None``
+    (``active=False``): every column into a given ``c``, through the prepared target,
+    whose interval is an attribute, so no bounds are read and the stream does not wait.
     The bounds are valid by construction (``_interleaved_kernel``), so no guard runs."""
     one = np.complex128(1.0)
     if mesh_platform(mesh) == "CUDA":
-        from ._active_local_cuda import _native, _native_out, require_active_local_cuda
-        require_active_local_cuda()
+        from ._active_local_cuda import (_native, _native_out, _prepared_native,
+                                         require_active_local_cuda,
+                                         require_prepared_active_local_cuda)
+        (require_active_local_cuda if active else require_prepared_active_local_cuda)()
 
         def contract(left, right, bounds, c):
+            if bounds is None:
+                every = np.array([0, left.shape[2]], np.int64)
+                return _prepared_native(left, right, c, active_bounds=every, alpha=one, beta=one)
             if c is None:
                 return _native_out(left, right, bounds, alpha=one)
             return _native(left, right, bounds, c, alpha=one, beta=one)
@@ -162,6 +154,8 @@ def _panel_contraction(mesh):
         from ._active_local import active_local_matmul
 
         def contract(left, right, bounds, c):
+            if bounds is None:
+                return c + left @ right
             weights = jnp.ones(left.shape[::2], left.dtype)
             return active_local_matmul(left, right, bounds, weights, c, alpha=one,
                                        beta=np.complex128(0.0) if c is None else one)
@@ -232,7 +226,13 @@ def _interleaved_kernel(mesh, q, m, k, n, width, active=False, weighted=False, p
     p = int(mesh.shape['x'])
     kl = k // p
     n_full, rest = divmod(kl, width)
-    contract = _panel_contraction(mesh) if active else None
+    # Three or more panels: every panel after the first accumulates in place through the
+    # beta = 1 GEMM.  XLA folds one straight-line ``c + a @ b`` into its GEMM, but of two
+    # adjacent ones (a one-trip scan is inlined; a tail follows the last full panel) it
+    # leaves one as an add that holds the product and the new sum beside the running sum,
+    # two output tiles (runs/DEV/701_scanacc_20260930/aot).  Two panels stay on XLA.
+    in_place = active or n_full + bool(rest) >= 3
+    contract = _panel_contraction(mesh, active) if in_place else None
     owner = np.arange(p, dtype=np.int32)[None, :]
 
     def body(a, b, bounds, weights):
@@ -268,8 +268,10 @@ def _interleaved_kernel(mesh, q, m, k, n, width, active=False, weighted=False, p
                 c = None if cs is None else cs[i]
                 if active:
                     outs.append(contract(lhs, rhs, interval(off, wd), c))
+                elif c is None:
+                    outs.append(lhs @ rhs)
                 else:
-                    outs.append(lhs @ rhs if c is None else c + lhs @ rhs)
+                    outs.append(c + lhs @ rhs if contract is None else contract(lhs, rhs, None, c))
             return tuple(outs)
 
         cur = gather(0, width)

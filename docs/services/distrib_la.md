@@ -443,7 +443,13 @@ largest even split of `k/p` into panels of at most `k/p²` columns with
 narrower panel. Optional replicated `bounds` `(q,2)` name each row's live
 contraction interval (the caller has zeroed the rest): each panel's local
 product runs over that interval's one contiguous run of panel columns (the
-local active-range GEMM), so dead bands cost no flops. `weights` `(q,k)`
+local active-range GEMM), so dead bands cost no flops. With three or more
+panels, every panel after the first adds into the output tile in place through
+the local beta = 1 GEMM (without `bounds`, its prepared target over every
+column: no bounds read), so a build holds no output-sized temporary beside its
+tile. XLA folds one `c + a @ b` into its GEMM but leaves one of two adjacent
+ones as an add, which holds two more output tiles; a two-panel loop stays on
+XLA. `weights` `(q,k)`
 scale each panel slice of `A` on its way into the gather. `partner=True`
 also returns `conj(A)·diag(w)·conj(B)` from the same exchange, each gathered
 panel conjugated before its own GEMM (the face Green and its antiunitary

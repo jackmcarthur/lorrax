@@ -3,6 +3,25 @@
 User-visible changes, newest first. Binding rulings behind the breaking
 changes live in `docs/architecture/decisions.md`.
 
+## 2026-09-30 — SUMMA panel loops accumulate in place
+
+When its loop has three or more band panels, `distrib_la.panel_matmul` now adds
+each panel after the first into the output tile in place, through the local
+beta = 1 GEMM. XLA folds one `c + a @ b` into its GEMM. Of two adjacent ones it
+left one as an add, which holds two more output tiles. That happened in a
+3-panel loop (XLA inlines its one-trip scan) and when a narrower tail panel
+follows the full panels. Those Green builds now hold two fewer output tiles. On
+the Fe 20³ P36-local CC stream (P4 proxy), a 3-panel loop compiles at 61.3 GB
+instead of 73.1 GB, and the 360-band loop at 90.3 GB instead of 99.5 GB.
+Loops of four or more full panels with no tail were already folded and compile
+the same; P36 runs six. Two-panel loops (P4) keep XLA's GEMM and are bitwise.
+Builds with three or more panels move at round-off.
+
+`distrib_la.panel_matmul_extra_tiles` is deleted, and the photon row-pass count
+no longer adds two Green tiles at p_x ≥ 3. Fe 20³ P36 at M_T 900 now prices
+1,1,1,1 row passes at 70 or 75 GB (was 2,1,1,1), counted at 64.3 GB. M_T 1800
+prices 3,7,7,14 at 75 GB (was 4,7,7,15).
+
 ## 2026-09-30 — four-current row passes are counted, not fitted
 
 `photon_response_passes` used a fitted price (2·parents + 1.5·planes). It now
@@ -10,8 +29,7 @@ counts each pass's live buffers from their shapes (`greens_function_kernel.price
 The terms are the ones the XLA buffer assignments show:
 - the channel planes, counted twice at 2 or more passes;
 - the quadrant Greens and their partners;
-- the SUMMA panels, plus the two extra output tiles a scanned panel loop holds
-  (`distrib_la.panel_matmul_extra_tiles`);
+- the SUMMA panels;
 - both Dirac halves of the operand faces;
 - the operands that other family pairs keep live (`photon_held_faces`);
 - the placed door tables and mode 11's run-time scratch.
@@ -21,12 +39,10 @@ unchanged. The stage-memory table gets one row, "photon direct stream, row passe
 −3.1 % to +4.9 % of the compiled peak.
 
 Fe 20³ P36 at M_T 900 and 70 or 75 GB moves from 2,2,2,2 passes (CC, CT, TC, TT)
-to 2,1,1,1. One pass on CC is counted at 76.6 GB. At p_x = 6 every Green build's panel loop is a
-scan that holds two more Green tiles, 12.2 GB on CC (KLI). The 2×2 proxy of the
-P36 tile runs a 2-panel loop and compiles one pass on every pair at
-64.49 + 1.07 GB scratch = 65.56 GB, so it does not show those tiles. M_T 1800 has
-no AOT (production is M_T 900). Its count is 4,7,7,15 at 75 GB. Fe 4³ prices 1
-pass before and after, and its results are bitwise.
+to 1,1,1,1 with the in-place SUMMA accumulate above. The 2×2 proxy of the P36
+tile compiles one pass on every pair at 64.49 + 1.07 GB scratch = 65.56 GB.
+M_T 1800 has no AOT (production is M_T 900). Fe 4³ prices 1 pass before and
+after, and its results are bitwise.
 
 ## 2026-09-30 — the four-current response compiles without baked symmetry tables
 
