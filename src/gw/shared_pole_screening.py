@@ -8,16 +8,14 @@ time nodes after current-domain certification.
 """
 from pathlib import Path
 import dataclasses
-from functools import lru_cache, partial
+from functools import partial
 import hashlib
 import json
 import shutil
 import time
 
-import jax
 import numpy as np
 from common import timing
-from jax.sharding import PartitionSpec as P
 
 
 def _json(value):
@@ -49,8 +47,7 @@ def _authenticated_constructor_resume(root, identity, recipe, *, photon=False):
     receipt_paths = ((root / 'bank_receipt.json',) if photon else
                      (root / 'bank_receipt.json', root / 'moments_receipt.json'))
     bank_path = root / 'bank.h5'
-    coulomb_path = root / 'coulomb.h5'
-    required = (*receipt_paths, bank_path) if photon else (*receipt_paths, bank_path, coulomb_path)
+    required = (*receipt_paths, bank_path)
     if not all(path.is_file() for path in required):
         return False
     try:
@@ -156,131 +153,37 @@ def shared_pole_identity(wfns, meta, *, label, wfn, binding, centroid_indices):
     return identity
 
 
-@lru_cache(maxsize=8)
-def _coulomb_rows(sharding, q0, q1):
-    """Parents [q0, q1) of the packed V wedge, kept on its own sharding."""
-    return jax.jit(lambda v: v[q0:q1], out_shardings=sharding)
-
-
-@lru_cache(maxsize=8)
-def _coulomb_unpack(basis):
-    """One packed-to-canonical V conversion per basis, so an SC map reuses its executable."""
-    return jax.jit(lambda v: basis.unpack_operator(v, spec=P(None, "x", "y")))
-
-
-def _coulomb_resource(value, meta, sym, mesh_xy, path):
-    """Stage bounded canonical V parents via centroid and SlabIO owners.
+def _coulomb_resource(value, meta, sym, mesh_xy):
+    """The bare V parents' resource: the on-device operator, named by its token and digest.
 
     ``value`` is the packed bare V (a ``QirrOperator`` on the run's q wedge,
-    or a full-q face [Q,mu_p,mu_p]), Ry; its wedge rows are the parents.
-    New conversion/transport buffers are reserved before each allocation.
-    Only one parent is unpacked at a time; no full-q canonical copy exists.
+    or a full-q face [Q,mu_p,mu_p]), Ry; its wedge rows are the parents.  The
+    response owner roots the parents straight from this operator
+    (``response_bank._coulomb_roots``); no copy is staged on disk (54.6 GB and
+    41 s at Ni 20^3 when it was).  The identity is a device digest of the
+    parents, the same on every rank and at every P, so a bank's receipts and a
+    constructor resume bind the operator's values.
     """
-    from file_io.slab_io import SlabIO
-    from runtime.tiles import tile_units
     from symmetry_maps import QirrOperator
-    from .response_bank import _compiled, _reserve, resource_digest
+    from .response_bank import _operator_token, operator_digest
     basis = meta.mu_basis
     qids = np.asarray(sym.q_irr_full_idx, np.int64)
     op = QirrOperator.of(value)
     if op.n_full != meta.nk_tot or tuple(op.values.shape[1:]) != (basis.n_packed, basis.n_packed):
         raise ValueError("GATE shared_pole_coulomb: expected the packed bare V")
-    token = _operator_token(op.values)
-    linked = _link_staged_coulomb(token, qids, basis, path)
-    if linked is not None:
-        return linked
-    value = op.at_rows(qids)
-    kernel = _coulomb_unpack(basis)
-    nq = len(qids)
-    # Parents stream in q tiles (runtime.tiles) into one collective write
-    # transaction, synced once: a per-parent write and sync was 1062 collective
-    # round trips at Fe 20^3.  The file's values are the same.
-    tile = tile_units(16 * (basis.n_packed ** 2 + basis.n_canonical ** 2) / mesh_xy.size, nq)
-
-    def executable(rows):
-        operand = jax.ShapeDtypeStruct((rows, basis.n_packed, basis.n_packed), value.dtype,
-                                       sharding=value.sharding)
-        return _compiled(kernel, (operand,))
-    stats = executable(tile).memory_analysis()
-    if stats is None:
-        raise ValueError("GATE shared_pole_coulomb: conversion memory unavailable")
-    _reserve(meta, "coulomb_staging", stats.argument_size_in_bytes,
-             stats.output_size_in_bytes + stats.temp_size_in_bytes)
-    with SlabIO(path, mode="w", mesh=mesh_xy) as io:
-        for q0 in range(0, nq, tile):
-            q1 = min(nq, q0 + tile)
-            canonical = executable(q1 - q0)(_coulomb_rows(value.sharding, q0, q1)(value))
-            io.write_slab("V_canonical_qwedge", canonical, offset=(q0, 0, 0),
-                          global_shape=(nq, basis.n_canonical, basis.n_canonical),
-                          valid_shape=(q1 - q0, basis.n_logical, basis.n_logical))
-            del canonical
-        io.sync_writes()
-    resource = dict(path=str(path), dataset="V_canonical_qwedge", basis="canonical",
-                    q_irr_full_idx=qids.tolist(), sha256=resource_digest(path),
-                    operator=token)
-    _STAGED_COULOMB.clear()
-    _STAGED_COULOMB[token] = (resource, int(basis.n_canonical))
-    return resource
+    # The parents' rows are one array for the run (the wedge's own values, or
+    # one gather of a whole-zone operator), so the held roots and the digest
+    # are reused by every SC map.
+    held = _PARENT_ROWS.get("V")
+    if held is None or held[0] is not op.values or held[1] != tuple(qids.tolist()):
+        held = _PARENT_ROWS["V"] = (op.values, tuple(qids.tolist()), op.at_rows(qids))
+    rows = held[2]
+    return dict(path=None, dataset=None, basis="canonical", q_irr_full_idx=qids.tolist(),
+                sha256=operator_digest(rows, mesh_xy), operator=_operator_token(rows))
 
 
-#: The last staged canonical V resource of this process, by operator token.
-_STAGED_COULOMB: dict = {}
-
-
-def _link_staged_coulomb(token, qids, basis, path):
-    """Hard-link this operator's previously staged V into ``path``; None if unavailable.
-
-    Every SC map stages the same V_q into its own scratch generation; the
-    previous map's file (still retained while this map screens) has the same
-    bytes, so a hard link replaces the canonical conversion, the write and the
-    content hash (``response_bank.resource_digest`` keys its hash on the inode
-    generation).  Rank 0 links and broadcasts the verdict, so every rank
-    either returns the linked resource or stages as before.
-    """
-    import os
-    from common.collectives import rank0_transaction
-    held = _STAGED_COULOMB.get(token)
-    if (held is None or held[1] != int(basis.n_canonical)
-            or held[0]["q_irr_full_idx"] != qids.tolist()):
-        return None
-    source = held[0]["path"]
-    if os.path.abspath(source) == os.path.abspath(os.fspath(path)):
-        return None
-
-    def link():
-        try:
-            os.link(source, path)
-            return True
-        except OSError:
-            return False
-    if not rank0_transaction(path, stage="shared_pole.coulomb_link", write=link,
-                             return_value=True):
-        return None
-    # Consumers re-authenticate the link (authenticate_coulomb): same inode
-    # generation, same recorded hash, no read.  The next map links from this
-    # generation's name, which outlives the previous map's scratch.
-    resource = dict(held[0], path=str(path))
-    _STAGED_COULOMB[token] = (resource, held[1])
-    return resource
-
-
-#: The one bare-V operator of this process, by token.  The strong reference
-#: keeps the token (an object id) unique for the operator's lifetime, which is
-#: the run's: every SC map screens with the same V_q.
-_COULOMB_OPERATORS: dict = {}
-
-
-def _operator_token(values):
-    """Process-local identity of the bare V operator, stable across SC maps.
-
-    ``gw.response_bank._coulomb_batch`` keys its held Coulomb roots on it, so
-    a map that stages the same V again reuses the first map's roots.
-    """
-    token = f"V@{id(values):x}"
-    if _COULOMB_OPERATORS.get(token) is not values:
-        _COULOMB_OPERATORS.clear()
-        _COULOMB_OPERATORS[token] = values
-    return token
+#: The bare V of this run and its parent rows (one entry).
+_PARENT_ROWS: dict = {}
 
 
 def _bank_residence(meta, config, *, mesh_xy, sym, root, label, photon, mu_bases=None):
@@ -650,16 +553,14 @@ def screen_shared_poles(wfns, V_q, meta, config, *, mesh_xy, sym,
     with timing.section("spole.coulomb_staging"):
         if resume_constructor == "committed":
             coulomb = None
-        elif resume_constructor:
-            saved_bank_receipt = json.loads((root / 'bank_receipt.json').read_text())
-            coulomb = (None if photon else dict(saved_bank_receipt['coulomb_identity'],
-                           path=str(root / 'coulomb.h5')))
-            if coulomb is not None:
-                # A saved token names another process's operator: no held roots.
-                coulomb.pop('operator', None)
         else:
-            coulomb = (None if photon else
-                       _coulomb_resource(V_q, meta, sym, mesh_xy, root / "coulomb.h5"))
+            coulomb = None if photon else _coulomb_resource(V_q, meta, sym, mesh_xy)
+            if coulomb is not None and resume_constructor:
+                # The resumed bank was produced against these V values (its receipt's digest).
+                saved = json.loads((root / 'bank_receipt.json').read_text())['coulomb_identity']
+                if saved.get('sha256') != coulomb['sha256']:
+                    raise ValueError(f"GATE shared_pole_output: the bank at {root} was built "
+                                     "with another bare V; use a fresh run directory")
     with timing.section("spole.bank_setup"):
         resident, residence = (None, dict(residence="file", reason=(
             "committed model reused" if resume_constructor == "committed" else "authenticated resume")))
