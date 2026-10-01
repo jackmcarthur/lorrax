@@ -243,7 +243,7 @@ class StreamedBank:
         agree_io_error(error, path=self.dir, stage="streamed_bank.create")
 
     def receipt(self):
-        """Rank-identical description of the tier (a function of the shapes only)."""
+        """Description of the tier: shapes (rank-identical) and this rank's file layout."""
         first = next(iter(self.stores.values()), None)
         return dict(tier=self.kind, bytes_per_rank=self.nbytes, outputs=self.n_out,
                     passes=len(self.passes), record_bytes=list(self.records),
