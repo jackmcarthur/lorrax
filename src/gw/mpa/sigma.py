@@ -1135,10 +1135,11 @@ def _integrate_sigma_batches(
             psi_proj_xr, sigma_axis, axis=1)
         psi_proj_yn = pad_to_axis(
             psi_proj_yn, sigma_axis, axis=3)
-        if tau_kernel_factory is None and (synthesis or q_wedge is not None):
-            # The q-wedge Σ kernel runs row passes from band-complete ψ
-            # (gw.ppm_tau_kernel._sigma_subtile_kernel): placed here, once
-            # per Σ call, so no τ node exchanges ψ.
+        if synthesis or (tau_kernel_factory is None and q_wedge is not None):
+            # The q-wedge Σ kernel and the photon sectors' τ body run row passes
+            # from band-complete ψ (gw.ppm_tau_kernel._sigma_subtile_kernel,
+            # gw.mpa.sector_sigma.sector_tau_factory): placed here, once per Σ
+            # call, so no τ node exchanges ψ.
             from gw.ppm_tau_kernel import sigma_subtile_operands
             psi_coh_xn, psi_coh_yr, psi_proj_xr, psi_proj_yn = sigma_subtile_operands(
                 psi_coh_xn, psi_coh_yr, psi_proj_xr, psi_proj_yn, mesh_xy=mesh_xy)
