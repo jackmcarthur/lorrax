@@ -65,8 +65,10 @@ def _digest(flat):
 
 
 def _host_kind(mesh):
-    kinds = {m.kind for m in mesh.devices.flat[0].addressable_memories()}
-    return "pinned_host" if "pinned_host" in kinds else None
+    """Pinned host memory for an accelerator's pieces; a CPU device's own memory is host memory."""
+    device = mesh.devices.flat[0]
+    kinds = {m.kind for m in device.addressable_memories()}
+    return "pinned_host" if device.platform != "cpu" and "pinned_host" in kinds else None
 
 
 @lru_cache(maxsize=None)
