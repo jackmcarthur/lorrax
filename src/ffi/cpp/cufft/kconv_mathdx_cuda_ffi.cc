@@ -2091,7 +2091,7 @@ static ffi::Error build(int mode, int nkx, int nky, int nkz, int ns, bool f32,
     // the shared memory from the grid and this device's opt-in budget; RB is unused.
     const int chi_grp = 2 * ns * ns;
     lrx_kbox::Plan kplan{};
-    int chi_trc = 0, chi_ty = 0, chi_threads = 0, chi_tt = 0, chi_minb = 1;
+    int chi_trc = 0, chi_ty = 0, chi_threads = 0, chi_tt = 0, chi_minb = 1, chi_carve = 100;
     long long chi_smem = 0, chi_smem2 = 0;
     if (mode == 11) {
         kplan = lrx_kbox::kbox_plan(nkx, nky, nkz, ns * ns, 2, 16, smem_optin, 1, 1);  // min_tr 1: a gathered group load
@@ -2134,6 +2134,10 @@ static ffi::Error build(int mode, int nkx, int nky, int nkz, int ns, bool f32,
             chi_smem = static_cast<long long>(chi_trc) * g.pr() * 16;
             chi_smem2 = 0;
             chi_minb = 2 * (chi_smem + smem_rsv) <= smem_sm && nkx <= 20 && !(variant & 2) ? 2 : 1;
+            // The carveout that holds those blocks and no more: the rest stays L1, which the gathered
+            // load's tables hit (at 100 the plane pass lost L1 and ran 1.29x slower, ncu, KCOLRES).
+            chi_carve = static_cast<int>(std::min<long long>(
+                100, (100LL * chi_minb * (chi_smem + smem_rsv) + smem_sm - 1) / smem_sm));
         }
     }
     // Modes 2-5, 8 and 9 run on the k-box stage: kbox_plan decides the arm, the tile and the shared
@@ -2493,10 +2497,13 @@ static ffi::Error build(int mode, int nkx, int nky, int nkz, int ns, bool f32,
         }
         if (cr != CUDA_SUCCESS) return sticky("cuFuncSetAttribute", cu_err(cr));
     }
-    // Modes 11 (two blocks per SM) and 7: the largest shared-memory carveout, so the driver does
-    // not pick a split that holds one block fewer (a hint; residency is unchanged if it declines).
+    // Modes 11 (two blocks per SM) and 7: a shared-memory carveout that holds every planned block,
+    // so the driver does not pick a split that holds one block fewer (a hint; residency is
+    // unchanged if it declines).  The single arm's tile tables and mode 7 take the largest; the
+    // split arm's plane pass the smallest that holds its blocks (chi_carve).
     if ((mode == 11 && chi_minb > 1) || mode == 7) {
-        cr = api.FuncSetAttribute(b.fn, CU_FUNC_ATTRIBUTE_PREFERRED_SHARED_MEMORY_CARVEOUT, 100);
+        cr = api.FuncSetAttribute(b.fn, CU_FUNC_ATTRIBUTE_PREFERRED_SHARED_MEMORY_CARVEOUT,
+                                  mode == 11 ? chi_carve : 100);
         if (cr != CUDA_SUCCESS) return sticky("cuFuncSetAttribute(carveout)", cu_err(cr));
     }
     if (mklpin::announce_here() || log_enabled()) {
