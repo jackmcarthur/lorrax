@@ -1181,25 +1181,29 @@ def compute_moment_bank(wfns, meta, config, *, mesh_xy, sym, bank_io,
     ordered = vertex is not None or not bool(sym.trs_allowed)
     _, _, moments, receipt["algebra"] = response_algebra(meta, config,
         mesh_xy=mesh_xy, n=n, ordered=ordered, photon=vertex is not None)
-    # A batch holds its totals and the next batch's (read ahead), H, the Dyson
-    # outputs and its temporaries: 3 per total plus 4 faces per parent.
-    n_total = 4 if ordered else 2
-    per_q = 3 * n_total + 4
-    qwidth = moment_q_width(ledger, n_q=len(qids), face_bytes=face_bytes, per_q=per_q)
-    receipt["q_width"] = int(qwidth)
-    receipt["q_batches"] = [[q0, min(q0 + qwidth, len(qids))] for q0 in range(0, len(qids), qwidth)]
     # Every parent's totals in one stream (correlations outer would repeat each
     # door per q batch); a bank partly written by an earlier attempt, the
     # four-current bank and a backend without the row-pass engine take the
-    # per-batch correlations.
+    # per-batch correlations.  A streamed batch holds its totals and the next
+    # batch's (read ahead), H, the Dyson outputs and its temporaries (3 faces
+    # per total plus 4 per parent); a correlated batch two totals, the next
+    # correlation, arithmetic temporaries and bounded H/solve.
+    n_total = 4 if ordered else 2
     streamed = None
     if vertex is None and not np.asarray(header["moment_written"]).any():
         with timing.section("bank.moment_stream"):
             stream_started = time.monotonic()
+            qwidth = moment_q_width(ledger, n_q=len(qids), face_bytes=face_bytes,
+                                    per_q=3 * n_total + 4)
             streamed = streamed_moment_totals(wfns, meta, mesh_xy=mesh_xy, qids=qids,
                 width=qwidth, execute=execute, ordered=ordered, receipt=receipt,
                 root=bank_io["root"])
             receipt["seconds"]["moment_stream"] = time.monotonic() - stream_started
+    per_q = 3 * n_total + 4 if streamed is not None else (12 if ordered else 8)
+    if streamed is None:
+        qwidth = moment_q_width(ledger, n_q=len(qids), face_bytes=face_bytes, per_q=per_q)
+    receipt["q_width"] = int(qwidth)
+    receipt["q_batches"] = [[q0, min(q0 + qwidth, len(qids))] for q0 in range(0, len(qids), qwidth)]
     runs = None if streamed is None else streamed.reader(
         [(j * n_total, (j + 1) * n_total) for j in range(len(receipt["q_batches"]))])
     for q0 in range(0,len(qids),qwidth):
