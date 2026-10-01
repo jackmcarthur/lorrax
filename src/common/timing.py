@@ -40,6 +40,9 @@ from typing import Any, Callable
 # Same formatting path, same rank-0 gate, no depth cap — ONE cadence mechanism,
 # not two.  Driver-owned announced sections begin after runtime/bootstrap; raw
 # process forks after runtime startup are unsupported throughout LORRAX.
+# A driver that installs ``set_trace_sink`` (gwjax) writes the cadence and the
+# heartbeats to its side log; its main report keeps only the wall of each
+# top-level announced stage and any stage that closed on an exception.
 # ---------------------------------------------------------------------------
 # The knob is read at USE time, not import time: common.timing is
 # imported by essentially every LORRAX CLI.  Use-time reads also let tests
@@ -110,12 +113,20 @@ def _trace_enabled(depth: int) -> bool:
 
 
 _TRACE_SINK = None
+_MILESTONE_SINK = None
 
 
-def set_trace_sink(sink=None) -> None:
-    """Route stage cadence through the active driver's scientific report."""
-    global _TRACE_SINK
+def set_trace_sink(sink=None, *, milestone=None) -> None:
+    """Route stage cadence to the active driver's report.
+
+    ``sink`` takes every ``[stage …]`` enter/exit line and heartbeat (a
+    driver's side log).  ``milestone`` takes one prefix-free line when a
+    top-level announced stage closes (its wall) and when a traced stage
+    closes on an exception (``[EXC]``): the lines its main report keeps.
+    """
+    global _TRACE_SINK, _MILESTONE_SINK
     _TRACE_SINK = sink
+    _MILESTONE_SINK = milestone
 
 
 def _trace(msg: str) -> None:
@@ -124,6 +135,16 @@ def _trace(msg: str) -> None:
         print(text, flush=True)
     else:
         _TRACE_SINK(text)
+
+
+def _safe_milestone(msg: str) -> None:
+	"""Best-effort main-report line; no sink means the cadence line already printed it."""
+	if _MILESTONE_SINK is None:
+		return
+	try:
+		_MILESTONE_SINK(msg)
+	except Exception:
+		pass
 
 
 def _safe_trace(msg: str) -> None:
@@ -452,9 +473,13 @@ class TimingCollector:
 			# State is already clean if the ordinary foreground print sink fails.
 			# Holding the same lock as the scheduler preserves exit ordering.
 			if cadence:
+				failure = f"  [EXC] {_exc_text(error)}" if failed else ""
 				_safe_trace("  " * depth
 				            + f"<- {section._display_name()}  {inclusive:.1f} s"
-				            + (f"  [EXC] {_exc_text(error)}" if failed else ""))
+				            + failure)
+				if failed or (depth == 0 and section.announce):
+					_safe_milestone(f"Stage {section._display_name()}: "
+					                f"{inclusive:.1f} s" + failure)
 
 	def reset(self) -> None:
 		stack = getattr(self._local, "stack", None)

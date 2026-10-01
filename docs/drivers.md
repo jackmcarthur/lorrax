@@ -171,7 +171,8 @@ G(τ) is never materialized; it exists only as $\psi\psi^*$ phases inside the
 | `sigma_mnk.h5` | the dynamic Σ cube (PPM/MPA only) |
 | `tmp/zeta_q.h5` | ζ, plus `zeta_q_mu{1,2,3}.h5` on bispinor runs |
 | `tmp/isdf_tensors_<N_mu>.h5` | the restart bundle: `V_qmunu`, `W0_qmunu` (`W0_ready`), `psi_parent_y`, `enk_full`, head scalars, band window; the BSE input |
-| `gwjax.out` | the run report: every resolved pathway |
+| `gwjax.out` | the run report: every resolved pathway, each top-level stage's wall, the per-map SC block, the stage time and memory tables, warnings |
+| `gwjax.trace.log` | the side log beside the report: `[stage …]` enter/exit lines and 60 s heartbeats, the ζ-fit plan and store receipts, quadrature receipts, per-(k, state) window growth, loop progress bars, and IBZ tables over 100 k points. `sigma_freq_debug_output = true` also copies the receipts into `gwjax.out` |
 
 All energy files are on the irreducible wedge. `eqp0.dat`/`eqp1.dat` carry
 the BerkeleyGW `(3f13.9,i8)` block header, `sigma_diag.dat` and `eqp_g0w0.dat` a

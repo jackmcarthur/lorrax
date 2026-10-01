@@ -4,6 +4,9 @@ This is the scientific output of ``gwjax``.  It intentionally does not echo
 library inventories, per-rank messages, HDF5 implementation details or the
 driver's historical diagnostic prose.  Those remain available behind the one
 driver-wide ``LORRAX_DEBUG_PRINT`` switch and in the launcher's own log.
+Stage cadence, heartbeats and planner receipts go to the side log beside the
+report (``gwjax.trace.log`` for ``gwjax.out``); ``sigma_freq_debug_output``
+also brings the receipts into the report.
 """
 
 from __future__ import annotations
@@ -204,6 +207,32 @@ def _gb_pair(values, width=6):
     return f"{np.nanmax(values) / 1e9:{width}.2f} / {np.nanmin(values) / 1e9:{width}.2f}"
 
 
+# Report-file lines that are diagnosis, not physics: they go to the side log
+# (``GWProductionReport.detail``), and to the report only under
+# sigma_freq_debug_output.  Matched on the line with its indent removed.
+_DETAIL_PREFIXES = (
+    # ζ-fit plan, executable, store and timing receipts; the ladder resolvent's per-z receipts
+    "ISDF μ-batch plan", "μ-batch ", "Z store: ", "[host mem] ", "Zeta output: ",
+    "Ladder W(z) ", "Resident ψ ",
+    # quadrature planner receipts (rule JSON, response nodes, fixed-SC node sets)
+    "Sigma quadrature receipt: ", "Response quadrature: ",
+    "SC fixed quadrature: ", "SC fixed quadrature recompute: ", "SC fixed window: ",
+    # per-(k, state) window growth; the map's summary line stays in the report
+    "SC sampled-support growth: ", "SC window extension (map ",
+    # process memory per map
+    "SC memory: ",
+    # LoopProgress cadence (Started / Finished / bars)
+    "Started ", "Finished ",
+)
+_IBZ_TABLE_MAX_K = 100      # QE's verbosity rule: longer k lists go to the side log
+
+
+def _is_detail(text: str) -> bool:
+    body = text.lstrip()
+    return (body.startswith(_DETAIL_PREFIXES)
+            or (body.startswith("[ ") and " | " in body and " / " in body))
+
+
 class GWProductionReport:
     """One clean GW report, owned and written only by process zero."""
 
@@ -217,14 +246,26 @@ class GWProductionReport:
         self._warnings_emitted = False
         self._timings_emitted = False
         self._stream = None
+        # The side log beside the report (gwjax.out -> gwjax.trace.log): stage
+        # cadence, heartbeats and the planner/compile receipts.  Nothing is lost
+        # for debugging and the report stays a physics and run summary.
+        self.trace_path = str(Path(self.path).with_suffix(".trace.log"))
+        self._trace_stream = None
+        # sigma_freq_debug_output also brings the diagnostic lines into the
+        # report; set from the deck in begin().
+        self.details_in_report = False
         if self.rank == 0:
             Path(self.path).parent.mkdir(parents=True, exist_ok=True)
             self._stream = open(self.path, "w", encoding="utf-8", buffering=1)
+            self._trace_stream = open(
+                self.trace_path, "w", encoding="utf-8", buffering=1)
 
     def close(self) -> None:
-        if self._stream is not None:
-            self._stream.close()
-            self._stream = None
+        for name in ("_stream", "_trace_stream"):
+            stream = getattr(self, name)
+            if stream is not None:
+                stream.close()
+                setattr(self, name, None)
 
     def emit(self, line: str = "") -> None:
         """Write one rank-zero line to both the report and live stdout."""
@@ -242,36 +283,10 @@ class GWProductionReport:
         end.  Exceptions still use stderr through the shared fail-fast path.
         """
         text = sep.join(str(v) for v in args)
-        if text.startswith("  Resident ψ "):
-            self.emit(text)
+        if _is_detail(text):
+            self.detail(text)
             return
-        # The μ-batch ζ fit's plan and its measured store/timing receipts are
-        # the run's record of where Z lived and what the transfers cost; the
-        # ladder resolvent's per-z receipts (wall, iterations, residual,
-        # high-water, fingerprints) are the same kind of record.
-        if text.startswith(("  ISDF μ-batch plan", "  μ-batch ", "  Z store: ", "  [host mem] ",
-                            "  Zeta output: ", "  Ladder W(z) ")):
-            self.emit(text)
-            return
-        # Every box plan carries a durable policy and accepted-rule receipt,
-        # including ordinary shared-pole runs with debug disabled.
-        if text.startswith(("Sigma quadrature receipt: ", "Response quadrature: ",
-                            "Sigma checkpoint: ")):
-            self.progress(text)
-            return
-        # Fixed-SC quadrature identity is a physics invariant, not backend
-        # chatter: retain its compact receipt so every map's exact node set
-        # and zero-rebuild claim remain auditable after live stdout is gone.
-        if text.startswith(("  SC fixed quadrature: ",
-                            "    SC fixed quadrature recompute: ",
-                            "    SC fixed window: ")):
-            self.progress(text)
-            return
-        # The long-loop cadence is part of the scientific run record, not
-        # component chatter.  LoopProgress owns these three stable shapes.
-        if (text.startswith("Started ") or text.startswith("Finished ")
-                or (text.startswith("[ ") and " | " in text
-                    and " / " in text)):
+        if text.startswith("Sigma checkpoint: "):
             self.progress(text)
             return
         if self.debug:
@@ -294,6 +309,32 @@ class GWProductionReport:
 
     def progress(self, line: str) -> None:
         """Write one deliberately selected rank-zero progress line."""
+        if _is_detail(str(line)):
+            self.detail(line)
+            return
+        self.emit(line)
+
+    def trace(self, line: str) -> None:
+        """One side-log line (stage cadence, heartbeats); never the report.
+
+        Under ``LORRAX_DEBUG_PRINT`` the line also reaches live stdout, which
+        is then the forensic stream."""
+        if self.rank != 0:
+            return
+        text = str(line)
+        if self._trace_stream is not None:
+            self._trace_stream.write(text + "\n")
+        if self.debug:
+            self.stdout(text)
+
+    def detail(self, line: str) -> None:
+        """A diagnostic receipt: the side log, and the report too when the
+        deck sets ``sigma_freq_debug_output``."""
+        if not self.details_in_report:
+            self.trace(line)
+            return
+        if self.rank == 0 and self._trace_stream is not None:
+            self._trace_stream.write(str(line) + "\n")
         self.emit(line)
 
     def layout_dials(
@@ -305,6 +346,7 @@ class GWProductionReport:
             self.progress(line)
 
     def begin(self, *, input_file: str, config) -> None:
+        self.details_in_report = bool(config.debug.sigma_freq_debug_output)
         self.emit("=" * 78)
         self.emit("LORRAX GW CALCULATION")
         self.emit("=" * 78)
@@ -439,8 +481,19 @@ class GWProductionReport:
 
     def sampling(self, *, wfn, sym, centroids=None) -> None:
         self.heading("Crystal symmetry and Brillouin-zone sampling")
-        for line in symmetry_sampling_lines(wfn, sym, digits=FLOAT_DIGITS):
+        lines = symmetry_sampling_lines(wfn, sym, digits=FLOAT_DIGITS)
+        listed = int(sym.nk_red) <= _IBZ_TABLE_MAX_K
+        if not listed:
+            short = symmetry_sampling_lines(
+                wfn, sym, digits=FLOAT_DIGITS, enumerate_ibz=False)
+            lines, table = short, lines[len(short):]
+        for line in lines:
             self.emit(line)
+        if not listed:
+            self.emit(f"  (more than {_IBZ_TABLE_MAX_K} k points: the IBZ "
+                      f"table is in {self.trace_path})")
+            for line in table:
+                self.detail(line)
         if centroids is not None:
             self.emit(centroid_orbit_line(centroids))
 
@@ -1037,6 +1090,7 @@ class GWProductionReport:
         self.emit()
         self.emit(f"LORRAX GW calculation {status}.")
         self.emit(f"Report written to {self.path}")
+        self.emit(f"Stage trace written to {self.trace_path}")
         self.close()
 
 

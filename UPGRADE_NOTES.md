@@ -3,6 +3,21 @@
 User-visible changes, newest first. Binding rulings behind the breaking
 changes live in `docs/architecture/decisions.md`.
 
+## 2026-09-30 — gwjax.out is a run summary; the stage trace has its own log
+
+`gwjax.out` no longer carries `[stage …]` lines. Stage enter/exit lines and the
+60 s heartbeats go to a side log beside the report, named after it
+(`gwjax.out` → `gwjax.trace.log`). The ζ-fit plan, executable, store and timing
+receipts, the response and Σ quadrature receipts, the fixed-SC node sets,
+per-(k, state) window growth, `SC memory`, loop progress bars and IBZ tables
+over 100 k points go there too. The report keeps the header, inputs, each
+top-level stage's wall (`Stage <name>: <s> s`), the per-map SC block, the
+stage time and memory tables, warnings and the summary. A stage that closes on
+an exception still prints its `[EXC]` line in the report. Set
+`sigma_freq_debug_output = true` to copy the receipts into the report as well;
+`LORRAX_DEBUG_PRINT=1` still prints everything to stdout. Parsers that read a
+moved line take the trace log. No numbers change.
+
 ## 2026-09-30 — SUMMA panel loops accumulate in place
 
 When its loop has three or more band panels, `distrib_la.panel_matmul` now adds
