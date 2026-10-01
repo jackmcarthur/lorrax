@@ -2045,9 +2045,9 @@ def chi_unfold_refusal(kgrid, ns: int, optin: int | None = None) -> str:
 
     The handler's build() refuses the same cases (GATE mathdx-kconv-chi-residency): the
     single pass needs one pair's ``2 ns^2`` columns of ``16·((nx·ny·(nz|1))|1)`` B within
-    the opt-in shared memory per block; the split arm needs a plane tile of ``max(8, ns^2)``
-    columns of ``16·((ny·(nz|1))|1)`` B each (its warp pencil stages nothing).  ``optin``
-    defaults to the device's attribute.
+    the opt-in shared memory per block; the split arm needs a 16-column plane tile of
+    ``16·((ny·(nz|1))|1)`` B each (its warp pencil stages nothing).  ``optin`` defaults to
+    the device's attribute.
     """
     nx, ny, nz = (int(v) for v in kgrid)
     ns = int(ns)
@@ -2059,7 +2059,7 @@ def chi_unfold_refusal(kgrid, ns: int, optin: int | None = None) -> str:
     grp = 2 * ns * ns
     if grp * rs * 16 <= have:
         return ""
-    plane = max(8, ns * ns) * pr * 16
+    plane = 16 * pr * 16
     if plane <= have:
         return ""
     return (f"a pair's {grp} columns need {grp * rs * 16} B resident, and the split arm's plane tile "
