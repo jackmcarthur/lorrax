@@ -39,12 +39,17 @@ def response_algebra(meta, config, *, mesh_xy, n, ordered=False, photon=False):
 
     Returns
     -------
-    value, slope, moments, receipt
+    dyson, slope, moments, receipt
         Jitted functions accepting complex128 ``[b,n,n]`` operators at
         ``P(None,'x','y')``, and the resolved backend/prefactor description.
-        ``value(H, chi_raw)`` returns Wc (Ry); ``slope(H, Wc, dchi_raw)``
+        ``dyson.value(H, chi_raw)`` returns Wc (Ry); ``slope(H, Wc, dchi_raw)``
         returns its s derivative (Ry^-1), restoring the bare operator internally (photon input is W-V). ``moments(H, A0, A1)`` takes already scaled
         bare-response expansion coefficients and returns M1/M3 (Ry^3/Ry^5).
+        Charge only: ``dyson.pair(layout)(dyson.place(H), chi_raw, dchi_raw)``
+        returns (Wc, dWc/ds) of one sample in one program, the same equations
+        and bits as value then slope; ``place`` lays the roots out once for
+        every sample, and ``layout='batch'`` leaves both outputs in the batch
+        layout (local linalg) for a consumer of whole matrices per rank.
         Neither routine Hermitizes its inputs or outputs.
     """
     from .gw_config import linalg_resolution
@@ -55,7 +60,7 @@ def response_algebra(meta, config, *, mesh_xy, n, ordered=False, photon=False):
     route = resolution.batched_route
     backend = "off" if resolution.layout == "local" else "distributed"
     pref = _w_solve_pref_scalar(meta)
-    value, slope, moments, lu = _response_programs(
+    dyson, slope, moments, lu = _response_programs(
         mesh_xy, n, backend, route, pref, ordered,
         float(meta.cell_volume) if photon else None)
     algebra = {
@@ -76,22 +81,23 @@ def response_algebra(meta, config, *, mesh_xy, n, ordered=False, photon=False):
         algebra["constant"] = "W_infinity-V, retained separately from M0..M3"
         algebra["moment_convention"] = "M_k=C_(k+1)/2 about W_infinity"
         algebra["units"].update(M0="Ry^2", M2="Ry^4", constant="Ry")
-    return value, slope, moments, algebra
+    return dyson, slope, moments, algebra
 
 
 @lru_cache(maxsize=None)
 def _response_programs(mesh_xy, n, backend, route, pref, ordered, volume):
     """Reuse compiled algebra across SC maps without retaining state arrays."""
-    from distrib_la import local_batch, matmul, plan
+    from types import SimpleNamespace
+    from distrib_la import batch_layout, local_batch, matmul, plan
 
     lu = plan("solve_lu", mesh_xy, backend=backend, n=n,
               batched_route=route)
     face = NamedSharding(mesh_xy, P(None, "x", "y"))
 
-    def program(inputs, outputs=1):
+    def program(inputs, outputs=1, resident=(), layout="face"):
         def wrap(fn):
             if backend == "off":
-                return local_batch(fn, mesh_xy)
+                return local_batch(fn, mesh_xy, resident=resident, out_layout=layout)
             return jax.jit(fn, in_shardings=(face,) * inputs,
                 out_shardings=face if outputs == 1 else (face,) * outputs)
         return wrap
@@ -107,8 +113,7 @@ def _response_programs(mesh_xy, n, backend, route, pref, ordered, volume):
     def congruence(h, a):
         return mm(mm(h, a), h)
 
-    @program(2)
-    def value(h, chi_raw):
+    def wc(h, chi_raw):
         x = pref * congruence(h, chi_raw)
         identity = jnp.broadcast_to(jnp.eye(n, dtype=h.dtype), x.shape)
         e = solve(identity - x, identity.copy())
@@ -121,6 +126,19 @@ def _response_programs(mesh_xy, n, backend, route, pref, ordered, volume):
     @program(3)
     def slope(h, wc, dchi_raw):
         return derivative(wc + mm(h, h), dchi_raw)
+
+    def pair(h, chi_raw, dchi_raw):
+        value = wc(h, chi_raw)
+        return value, derivative(value + mm(h, h), dchi_raw)
+
+    # One sample's value and slope in one program: the roots H stay laid out
+    # for every sample (no exchange), only the two chi stacks move in, and a
+    # 'batch' consumer takes both outputs without the exchange back.
+    resident = (0,) if backend == "off" else ()
+    pairs = {layout: program(3, 2, resident, layout)(pair)
+             for layout in (("face", "batch") if backend == "off" else ("face",))}
+    dyson = SimpleNamespace(value=program(2)(wc), pair=pairs.get,
+                            place=(lambda h: batch_layout(h, mesh_xy)) if resident else (lambda h: h))
 
     @program(3, 2)
     def moments(h, a0, a1):
@@ -161,6 +179,7 @@ def _response_programs(mesh_xy, n, backend, route, pref, ordered, volume):
             chi = pref * chi_raw - volume * contact
             identity = jnp.broadcast_to(jnp.eye(n, dtype=v.dtype), chi.shape)
             return solve(identity - mm(v, chi), v.copy()) - v
+        dyson = SimpleNamespace(value=value, pair=lambda layout: None, place=lambda v: v)
 
         @program(3)
         def slope(v, wc, dchi_raw):
@@ -181,7 +200,7 @@ def _response_programs(mesh_xy, n, backend, route, pref, ordered, volume):
                 result.append(mm(winf, rhs))
             return (winf - v, *(0.5 * c for c in result))
 
-    return value, slope, moments, lu
+    return dyson, slope, moments, lu
 
 
 def response_weights(wfns, meta):
@@ -1434,12 +1453,13 @@ class _MemberRows:
         return self.carry[self.first + int(i), rows]
 
 
-def _dyson_phase(solve_value, solve_slope, roots, mesh_xy, config, *, nq, n, extra=()):
+def _dyson_phase(dyson, solve_slope, roots, held_roots, mesh_xy, config, *, nq, n, extra=()):
     """(resident, workspace) bytes per rank of the sample Dyson phase beside a group's carry.
 
     Counted as :func:`_bank_execution` admits them: the compiled arguments
     resident, the outputs, temporaries and native solver workspace on top.
-    ``sample_dyson`` takes ``(H, chi)``; ``sample_slope`` takes ``(H, Wc, dchi)``
+    Charge: one ``sample_dyson`` pair ``(H held, chi, dchi) -> (Wc, dWc/ds)``.
+    Photon: ``sample_dyson`` takes ``(H, chi)``; ``sample_slope`` takes ``(H, Wc, dchi)``
     while the value's chi rows are still held (one more face stack).  Both at
     the full parent span ``nq``, the largest a sample solves.
     """
@@ -1452,8 +1472,11 @@ def _dyson_phase(solve_value, solve_slope, roots, mesh_xy, config, *, nq, n, ext
     native = response_dense_workspace(mesh_xy, int(n), int(nq), layout, with_eigh=False)["total"]
     held = 16 * int(nq) * int(n) * int(n) // int(mesh_xy.size)
     phases = []
-    for kernel, args, kept in ((solve_value, (h, face) + tuple(extra), 0),
-                               (solve_slope, (h, face, face), held)):
+    pair = dyson.pair("face")
+    stages = (((pair, (jax.ShapeDtypeStruct(held_roots.shape, held_roots.dtype, sharding=held_roots.sharding),
+                       face, face), 0),) if pair is not None else
+              ((dyson.value, (h, face) + tuple(extra), 0), (solve_slope, (h, face, face), held)))
+    for kernel, args, kept in stages:
         memory = _compiled(kernel, args).memory_analysis()
         if memory is None:
             raise ValueError("GATE response_capacity: compiled memory unavailable")
@@ -1568,6 +1591,8 @@ def produce_sample_bank(wfns, meta, config, *, mesh_xy, sym, sample_plan, bank_i
     row_index = {q: i for i, q in enumerate(response_rows)}
     face_bytes = 16*n*n//mesh_xy.size
     caller_live = ambient
+    dyson, solve_slope, _, receipt["algebra"] = response_algebra(meta, config,
+        mesh_xy=mesh_xy, n=n, photon=vertex is not None)
     if vertex is None:
         # V is frequency independent. Its all-P root bank is small compared
         # with either full-zone Green and reuses the existing batched solver.
@@ -1576,8 +1601,14 @@ def produce_sample_bank(wfns, meta, config, *, mesh_xy, sym, sample_plan, bank_i
         del inverse
         root_stage, _ = _reserve(meta, "coulomb_roots", len(qids)*face_bytes)
         ambient += (root_stage,)
+        # The roots in the layout of every sample's Dyson pair, laid out once.
+        held = dyson.place(roots)
+        if held is not roots:
+            root_stage, _ = _reserve(meta, "coulomb_roots_batch",
+                16*n*n*int(np.prod(held.sharding.shard_shape(held.shape)[:-2])))
+            ambient += (root_stage,)
     else:
-        roots = bank_io["photon_v"]
+        roots = held = bank_io["photon_v"]
     carry_per_sample = 2*len(response_rows)*face_bytes
     selection = None
     if p1 > p0:
@@ -1598,10 +1629,12 @@ def produce_sample_bank(wfns, meta, config, *, mesh_xy, sym, sample_plan, bank_i
                                               nq=len(qids))
         receipt["line_selection"] = dict(execution=execution, samples=[p0, p1],
             resident_bytes_per_rank=selection_resident, workspace_bytes_per_rank=selection_workspace)
+    # A q-local selection reads whole matrices per rank: its line samples leave
+    # the Dyson pair in the batch layout, with no exchange to the face and back.
+    line_layout = ("batch" if selection is not None and selection.execution == "local"
+                   and dyson.pair("batch") is not None else "face")
     with timing.section('bank.window_geometry', announce=True,
                               label="shared-pole frequency rule construction"):
-        solve_value, solve_slope, _, receipt["algebra"] = response_algebra(meta,config,
-            mesh_xy=mesh_xy,n=n,photon=vertex is not None)
         support = response_support(wfns, meta, sample_plan, receipt, print_fn=print_fn)
         ledger.live_stages = ambient
         # Price the stream once at "every sample in one group"; the compiled
@@ -1621,7 +1654,7 @@ def produce_sample_bank(wfns, meta, config, *, mesh_xy, sym, sample_plan, bank_i
         # admissions will (their compiled executables), summed.
         chosen = (0, 0) if selection is None else (selection_resident, selection_workspace)
         chosen = tuple(a + b for a, b in zip(chosen, _dyson_phase(
-            solve_value, solve_slope, roots, mesh_xy, config, nq=len(qids), n=n,
+            dyson, solve_slope, roots, held, mesh_xy, config, nq=len(qids), n=n,
             extra=() if vertex is None else (contact,))))
         with timing.section('bank.plan.direct'):
             group_size, fixed, room, live = response_group_size(meta, mesh_xy, n_samples=len(z),
@@ -1655,8 +1688,12 @@ def produce_sample_bank(wfns, meta, config, *, mesh_xy, sym, sample_plan, bank_i
     progress = LoopProgress(len(z), print_fn, title="response frequency integration",
                             item_name="frequency", max_updates=len(z)).start()
 
-    def solve(raw, partner, q0, q1, bank_handle, sample, need_value=True):
-        """W and dW/ds of parents [q0, q1) at one sample, as the bank stores them."""
+    def solve(raw, partner, q0, q1, bank_handle, sample, need_value=True, layout="face"):
+        """W and dW/ds of parents [q0, q1) at one sample, as the bank stores them.
+
+        ``layout='batch'`` (a charge line sample beside a q-local selection)
+        returns both in the batch layout.
+        """
         selected = (partner_qids if partner else qids)[q0:q1]
         rows = np.asarray([row_index[int(q)] for q in selected])
         span = (int(q0), int(q1))
@@ -1677,27 +1714,34 @@ def produce_sample_bank(wfns, meta, config, *, mesh_xy, sym, sample_plan, bank_i
                 return add_direct_gamma_field(packed, coefficient,
                     gamma_vectors=direct_head["gamma_vectors"],
                     layout=bank_io["photon_layout"], mesh=mesh_xy)
+        chi = raw[1,rows]
+        if partner:
+            chi = jnp.conj(chi)
         if need_value:
             chi_value = raw[0,rows]
             if partner:
                 chi_value = jnp.conj(chi_value)
-            value = execute(solve_value, (h,chi_value)+(() if vertex is None else (contact,)),
-                            "sample_dyson") - constant
+        if need_value and dyson.pair(layout) is not None:
+            # Charge: Wc and dWc/ds in one program on the held roots.
+            value, slope = execute(dyson.pair(layout), (held if span == (0, len(qids))
+                                   else dyson.place(h), chi_value, chi), "sample_dyson")
         else:
-            io_started = time.monotonic()
-            saved = read_shared_pole_bank(bank_handle, span, meta=meta, header=header,
-                sample_span=(sample,sample+1), fields=("Wc",))
-            receipt["seconds"]["io"] = receipt["seconds"].get("io",0.)+time.monotonic()-io_started
-            value = saved["Wc"][:,0]
-            del saved
-            if head_update is not None:
-                value = gamma_add(value, -head_update)
-        chi = raw[1,rows]
-        if partner:
-            chi = jnp.conj(chi)
-        w = value if vertex is None else value+constant
-        slope = execute(solve_slope, (h, w, chi), "sample_slope")
-        del chi, w
+            if need_value:
+                value = execute(dyson.value, (h,chi_value)+(() if vertex is None else (contact,)),
+                                "sample_dyson") - constant
+            else:
+                io_started = time.monotonic()
+                saved = read_shared_pole_bank(bank_handle, span, meta=meta, header=header,
+                    sample_span=(sample,sample+1), fields=("Wc",))
+                receipt["seconds"]["io"] = receipt["seconds"].get("io",0.)+time.monotonic()-io_started
+                value = saved["Wc"][:,0]
+                del saved
+                if head_update is not None:
+                    value = gamma_add(value, -head_update)
+            w = value if vertex is None else value+constant
+            slope = execute(solve_slope, (h, w, chi), "sample_slope")
+            del w
+        del chi
         if head_update is not None:
             coefficient = (direct_head["dWc_minus_q_ds"][sample]
                            if partner else direct_head["dWc_ds"][sample])
@@ -1707,17 +1751,18 @@ def produce_sample_bank(wfns, meta, config, *, mesh_xy, sym, sample_plan, bank_i
             if vertex is not None:
                 _photon_sample_norms(receipt,value,q0,sample,bank_io["photon_layout"],mesh_xy)
             for iq in range(q0,q1):
-                # Both censuses read only self-negative (TRIM) parents; test
-                # that on the host first, so no other parent dispatches a
-                # device slice per sample (0.2 s per map on Fe 4^3 charge).
-                if vertex is None and _self_negative(int(qids[iq]),meta):
+                # Both censuses read only self-negative (TRIM) parents at real
+                # supports (Re z = 0); test that on the host first, so no other
+                # parent or sample dispatches a device slice (0.2 s per map on
+                # Fe 4^3 charge), and a batch-layout line pair is never sliced.
+                if vertex is None and z[sample].real == 0 and _self_negative(int(qids[iq]),meta):
                     part = slice(iq-q0,iq-q0+1)
                     _reciprocity_census(receipt,value[part],z[sample:sample+1],int(qids[iq]),iq,meta)
                     # Diagnostic only (nothing reads it): an extra Dyson solve per
                     # imaginary sample at every TRIM parent, so it runs under the
                     # debug-output dial, never in the production prefactor.
                     if ordered and tr_odd_census:
-                        _tr_odd_census(receipt,solve_value,h[part],chi_value[part],value[part],z[sample:sample+1],int(qids[iq]))
+                        _tr_odd_census(receipt,dyson.value,h[part],chi_value[part],value[part],z[sample:sample+1],int(qids[iq]))
         return value, slope
 
     for group in rules["groups"]:
@@ -1754,12 +1799,12 @@ def produce_sample_bank(wfns, meta, config, *, mesh_xy, sym, sample_plan, bank_i
                     live = ledger.live_stages
                     ledger.live_stages = live + (stage,)
                     started_selection = time.monotonic()
-                    value, slope = solve(raw, 0, 0, len(qids), bank_handle, sample)
+                    value, slope = solve(raw, 0, 0, len(qids), bank_handle, sample, layout=line_layout)
                     with timing.section('bank.line_select'):
                         lines = selection.select(sample, value, slope)
                     del value, slope
                     if ordered:
-                        value, slope = solve(raw, 1, 0, len(qids), bank_handle, sample)
+                        value, slope = solve(raw, 1, 0, len(qids), bank_handle, sample, layout=line_layout)
                         with timing.section('bank.line_mirror'):
                             selection.mirror(sample, lines, value, slope)
                         del value, slope
@@ -1810,7 +1855,7 @@ def produce_sample_bank(wfns, meta, config, *, mesh_xy, sym, sample_plan, bank_i
                  f"{layout}); bank write {receipt['seconds'].get('io', 0.):.2f} s", flush=True)
         print_fn("Response quadrature: seconds " + " ".join(
             f"{key}={value:.3f}" for key, value in receipt["seconds"].items()), flush=True)
-    del roots
+    del roots, held
     ledger.live_stages = caller_live
     receipt["stream_passes"] = len(rules["groups"])
     receipt["batch_reason"] = ("one stream per sample group; each Green pair serves every member's value, "

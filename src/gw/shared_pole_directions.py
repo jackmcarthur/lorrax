@@ -337,7 +337,8 @@ def selection_layout(mesh, execution, nq):
 
     ``move`` takes a face stack [nq, m, n] to the selection layout: whole
     parents per rank in batch layout [B, m, n] (B = nq padded to P, the
-    padding rows synthetic), or leaves the face; ``axis`` adds the one-sample
+    padding rows synthetic; a stack already there stays), or leaves the
+    face; ``axis`` adds the one-sample
     axis [B, 1, m, n]. ``to_face`` takes panel fields [B, m, r] back to the
     face and stacks them [nq, F, m_X, r_Y].
     """
@@ -350,7 +351,8 @@ def selection_layout(mesh, execution, nq):
         return (lambda a: a), axis, stack
     # One exchange for the whole panel set: the fields are stacked in batch
     # layout and moved together, not one batch_to_face per field.
-    return ((lambda a: distrib_la.batch_layout(a, mesh)), axis, batch_stack_to_face(mesh, nq))
+    return ((lambda a: a if distrib_la.is_batch_layout(a, mesh) else distrib_la.batch_layout(a, mesh)),
+            axis, batch_stack_to_face(mesh, nq))
 
 
 class LineSelection:
@@ -474,9 +476,10 @@ def charge_line_selection(meta, *, mesh_xy, ordered, execution, nq):
 
 @lru_cache(maxsize=None)
 def _padding_mask(mesh, active):
+    # Elementwise, so the output keeps the input's layout: a face stack, or
+    # a stack the Dyson pair left in the batch layout.
     keep = np.asarray(active)
-    return jax.jit(lambda a: jnp.where(jnp.asarray(keep)[:, None] & jnp.asarray(keep)[None, :], a, 0),
-                   out_shardings=NamedSharding(mesh, P(None, "x", "y")))
+    return jax.jit(lambda a: jnp.where(jnp.asarray(keep)[:, None] & jnp.asarray(keep)[None, :], a, 0))
 
 
 def line_panel_states(panels, counts, recipe, *, sid, ordered, mesh_xy):

@@ -427,6 +427,9 @@ A `resident` position whose operand is not in batch layout refuses before
 tracing. Per call the RHS costs `2·ceil(B/P)` whole blocks of exchange; the
 resident operand costs nothing after placement. Capacity is the route (c)
 boundary: `ceil(B/P)` whole matrices plus their RHS blocks per rank.
+`out_layout="batch"` leaves the outputs in the batch layout (`Bp` rows, pad
+rows zero) for a consumer that reads whole matrices per rank, such as a
+batch-layout eigh: the call then costs only the inbound exchange.
 
 ## Bounded face products
 

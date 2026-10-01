@@ -331,12 +331,15 @@ def batch_layout(a, mesh):
     return fn(a)
 
 
-def local_batch(kernel, mesh, *, resident=()):
+def local_batch(kernel, mesh, *, resident=(), out_layout="face"):
     """Run a composition of dense equations q-locally with one exchange each way.
 
     Inputs/outputs are face-sharded matrix batches (outputs may be a pytree).
     A singleton input batch is broadcast; padded q rows never enter the kernel.
     Reuses the same movement and real-row schedule as the individual plans.
+    ``out_layout="batch"`` returns the outputs in the batch layout instead
+    (``Bp`` rows, the padded rows exact zeros), for a consumer that works on
+    whole matrices per rank: no exchange back to the face.
 
     ``resident`` names operand positions that are already in the batch layout
     (:func:`batch_layout`, padded to ``Bp`` rows): those are not exchanged.
@@ -351,6 +354,9 @@ def local_batch(kernel, mesh, *, resident=()):
     px, py = int(mesh.shape['x']), int(mesh.shape['y'])
     face = P(None, 'x', 'y')
     resident = frozenset(int(i) for i in resident)
+    if out_layout not in ("face", "batch"):
+        raise ValueError(f"local_batch: out_layout {out_layout!r}; expected 'face' or 'batch'")
+    on_face = out_layout == "face"
 
     @jax.jit
     def _run(*operands):
@@ -375,14 +381,16 @@ def local_batch(kernel, mesh, *, resident=()):
                          for i, a in enumerate(inputs))
 
         @partial(shard_map, mesh=mesh, in_specs=in_specs,
-                   out_specs=face, check_vma=False)
+                   out_specs=face if on_face else _batch_spec(3), check_vma=False)
         def work(*tiles):
             local = tuple(t if i in resident else _face_to_batch(t, px=px, py=py)
                           for i, t in enumerate(tiles))
             result = _real_rows(kernel, local, nbatch=nb, py=py)
+            if not on_face:
+                return result
             return jax.tree.map(lambda a: _batch_to_face(a, px=px, py=py), result)
 
-        return jax.tree.map(lambda a: a[:nb], work(*inputs))
+        return jax.tree.map(lambda a: a[:nb], work(*inputs)) if on_face else work(*inputs)
 
     def run(*operands):
         for i in resident:
