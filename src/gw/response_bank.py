@@ -1185,12 +1185,25 @@ def response_quadrature(meta, sample_plan, receipt, support, *, group_size, prin
     session = getattr(meta, "shared_pole_response_rules", None)
     old = None if session is None else session.get("frequency")
     metallic = sample_plan["census"]["partial_at_mu"]
-    reuse = (old is not None and old["lo"] <= lo and hi <= old["hi"]
-             and old["decay_rate"] <= decay_rate and old["amplitude"] >= amplitude
-             and old["metallic"] == metallic and np.array_equal(old["z"], z))
+    failed = [] if old is None else [
+        text for text, held in (
+            (f"lo {old['lo']:.6g} -> {lo:.6g} Ry", old["lo"] <= lo),
+            (f"hi {old['hi']:.6g} -> {hi:.6g} Ry", hi <= old["hi"]),
+            (f"decay_rate {old['decay_rate']:.6g} -> {decay_rate:.6g} /Ry",
+             old["decay_rate"] <= decay_rate),
+            (f"amplitude {old['amplitude']:.6g} -> {amplitude:.6g}", old["amplitude"] >= amplitude),
+            (f"metallic {old['metallic']} -> {metallic}", old["metallic"] == metallic),
+            (f"z moved (max {np.max(np.abs(old['z']-z))*RYD_TO_EV:.3g} eV)"
+             if np.shape(old["z"]) == np.shape(z) else "z sample count changed",
+             np.array_equal(old["z"], z)))
+        if not held]
+    reuse = old is not None and not failed
     if reuse:
         plan = old
     else:
+        if failed and jax.process_index() == 0:
+            print_fn("Response rule rebuilt at a held map; failed reuse test: "
+                     + "; ".join(failed), flush=True)
         pad = 4./RYD_TO_EV if session is not None else 0.
         plan = dict(lo=snap_outward(support["lo"]-pad, 1., -1),
                     hi=snap_outward(support["hi"]+pad, 1., +1), z=z, metallic=metallic,
