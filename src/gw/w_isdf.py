@@ -218,41 +218,51 @@ def _pass_tables(tables, x0, xr, side, ns):
     return tables._replace(lsrc=moved.astype(np.int32), mph=np.asarray(tables.mph)[:, cols])
 
 
-def photon_response_passes(ledger, mesh_xy, families, *, n_parent, nk, n_out, q_count,
-                           face_bytes):
+def photon_response_passes(ledger, mesh_xy, families, *, n_parent, kgrid, n_band, n_out,
+                           q_count, face_bytes):
     """Row passes per family pair of the direct photon stream, from the ledger: 1 when it fits.
 
-    A pair's per-rank door phase holds its four quadrant parent Greens, their
-    builds' band panels and face copies (priced as the parents again) beside
-    its channel planes and one plane's transform (priced at 1.5x: the
-    neighbouring pairs' buffers overlap in the compiled schedule); all of them
-    divide over the orbit-cut row passes, whose total GEMM flops do not
-    change.  The carry (``n_out`` members over ``q_count`` rows) and the
-    faces stay.  Calibrated on the P36-local AOT (runs/DEV/673_photonresp_20260930/
-    aot/i): Fe 20^3 at M_T 900 prices 2 passes on every pair, 64.7 GB/rank
-    compiled.  Only ``memory_per_device_gb`` and the shapes enter
-    (``CapacityLedger``).
+    The fewest passes whose counted live set fits ``ledger.room_bytes_per_rank``
+    beside what stays whatever the pass count: the bank carry (``n_out``
+    members over ``q_count`` rows), the faces, and their band-major copies
+    the Green builds read (a second ``face_bytes``).  A pass's own bytes are
+    counted from its shapes (``greens_function_kernel.price_photon_pass``);
+    its rows are the pair's left-family local rows split evenly, the largest
+    share priced.  Only ``memory_per_device_gb`` (``CapacityLedger``) and the
+    shapes enter; no coefficient is fitted.
     """
+    from .greens_function_kernel import has_antiunitary_rows, price_photon_pass
     from .photon_layout import FAMILY_PAIRS, family_channels
     if _TEST_PHOTON_PASSES is not None:
         return tuple(int(n) for n in _TEST_PHOTON_PASSES)
     P = int(mesh_xy.size)
     layout = families.packed_layout
+    side = int(families.layout.mesh_side)
     n = int(families.layout.packed_extent)
-    fixed = 16 * int(n_out) * int(q_count) * n * n // P + int(face_bytes)
+    fixed = 16 * int(n_out) * int(q_count) * n * n // P + 2 * int(face_bytes)
     room = int(ledger.room_bytes_per_rank(())) - fixed
-    passes = []
+    passes, peaks = [], []
     for L, R in FAMILY_PAIRS:
         cl = layout.carrier_extent(family_channels(L)[0])
         cr = layout.carrier_extent(family_channels(R)[0])
-        n_ch = len(family_channels(L)) * len(family_channels(R))
-        parents = 4 * 16 * int(n_parent) * (2 * cl) * (2 * cr) // P
-        planes = 16 * (n_ch + 1) * int(nk) * cl * cr // P
-        local_rows = cl // int(families.layout.mesh_side)
-        # Parents, their builds and the planes all divide over the row passes.
-        count = next((p for p in range(1, local_rows + 1)
-                      if -(-(2 * parents + 3 * planes // 2) // p) <= room), local_rows)
+        local_rows = cl // side
+
+        def price(p, L=L, R=R, cr=cr, local_rows=local_rows):
+            return price_photon_pass(
+                n_parent=n_parent, n_full=int(np.prod(kgrid)), n_band=n_band, q_count=q_count,
+                rows=side * -(-local_rows // p), right=cr,
+                n_ch=len(family_channels(L)) * len(family_channels(R)),
+                partner=has_antiunitary_rows(families.plans[L]), passes=p, kgrid=kgrid,
+                mesh=mesh_xy)
+        count = next((p for p in range(1, local_rows + 1) if price(p) <= room), local_rows)
         passes.append(count)
+        peaks.append(price(count))
+    from ffi.gate import announce_once
+    announce_once(("photon_passes", tuple(passes), int(room)),
+                  f"[chi0] four-current row passes per family pair {tuple(FAMILY_PAIRS)}: "
+                  f"{tuple(passes)}; counted pass peak {max(peaks) / 1e9:.2f} GB of "
+                  f"{room / 1e9:.2f} GB room beside carry and faces {fixed / 1e9:.2f} GB",
+                  scope="rank0")
     return tuple(passes)
 
 

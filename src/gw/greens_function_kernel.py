@@ -194,6 +194,12 @@ jax.tree_util.register_pytree_node(
     lambda conj, leaves: ParentGreen(leaves[0], leaves[1], conj))
 
 
+def has_antiunitary_rows(k_unfold_plan) -> bool:
+    """Whether a raw-parent plan unfolds some full-k row antiunitarily (its Green then
+    needs a partner, :class:`ParentGreen`)."""
+    return bool(np.any(np.asarray(k_unfold_plan.sym_idx) >= k_unfold_plan.n_sym_spatial))
+
+
 def build_G_parents(psi_xn, psi_yr, *, Gij=None, phases=None, layout='face', gemm=None,
                     k_unfold_plan, real_weights=None, band_range=None,
                     prepared_active_gemm=None) -> ParentGreen:
@@ -202,7 +208,7 @@ def build_G_parents(psi_xn, psi_yr, *, Gij=None, phases=None, layout='face', gem
         raise ValueError("build_G requires canonical faces with layout=face or axis.")
     if gemm is None:
         raise ValueError("build_G requires a GEMM plan or typed parent plan-provided GEMM callable.")
-    antiunitary = bool(np.any(np.asarray(k_unfold_plan.sym_idx) >= k_unfold_plan.n_sym_spatial))
+    antiunitary = has_antiunitary_rows(k_unfold_plan)
     if (antiunitary and getattr(gemm, "backend", "local") != "local"
             and prepared_active_gemm is None and Gij is None and phases is not None
             and real_weights is not True
@@ -458,14 +464,16 @@ def sigma_row_blocks(*, n_rmu, ns, d, mesh):
     return face_row_blocks(mx, int(mesh.shape['y']), (int(ns) // int(d)) ** 2)
 
 
-def _green_terms(*, n_parent, n_rmu, ns, n_band, mesh):
-    """(T_p, M_axis): one parent Green tile ``16·n_parent·ns²·μ²/P``, and one Green build's
+def _green_terms(*, n_parent, n_rmu, ns, n_band, mesh, n_right=None):
+    """(T_p, M_axis): one parent Green tile ``16·n_parent·ns²·μ·ν/P``, and one Green build's
     two live SUMMA panels of both ψ orientations, at most ``N_b/p_x`` bands each,
-    ``2·16·n_parent·ns·μ·(N_b/p_x)·(1/p_x + 1/p_y)`` (``face_green_product``), per rank."""
+    ``2·16·n_parent·ns·(N_b/p_x)·(μ/p_x + ν/p_y)`` (``face_green_product``), per rank.
+    ``ν`` is ``n_right`` for a two-family Green, ``μ`` otherwise."""
     px, py = int(mesh.shape['x']), int(mesh.shape['y'])
-    tile = 16.0 * int(n_parent) * int(ns) ** 2 * int(n_rmu) ** 2 / (px * py)
-    panels = (32.0 * int(n_parent) * int(ns) * int(n_rmu) * (int(n_band) / px)
-              * (1.0 / px + 1.0 / py))
+    nu = int(n_rmu) if n_right is None else int(n_right)
+    tile = 16.0 * int(n_parent) * int(ns) ** 2 * (int(n_rmu) * nu) / (px * py)
+    panels = (32.0 * int(n_parent) * int(ns) * (int(n_band) / px)
+              * (int(n_rmu) / px + nu / py))
     return tile, panels
 
 
@@ -506,14 +514,15 @@ def sigma_spin_block(*, n_parent, n_rmu, ns, n_full, n_band, mesh, partner_tiles
     return d
 
 
-def chi0_door_scratch(*, kgrid, n_parent, n_rmu, ns, mesh):
+def chi0_door_scratch(*, kgrid, n_parent, n_rmu, ns, mesh, n_right=None):
     """Per-rank run-time scratch of one mathdx mode-11 call: its split arm's intermediate,
     the bound owned by ``ffi.fft.chi_unfold_scratch_bytes``;
     0 on the single pass and off the mathdx backend."""
     from ffi import fft as F
     if F.kconv_backend(mesh) != "mathdx":
         return 0
-    tile, _ = _green_terms(n_parent=n_parent, n_rmu=n_rmu, ns=ns, n_band=0, mesh=mesh)
+    tile, _ = _green_terms(n_parent=n_parent, n_rmu=n_rmu, ns=ns, n_band=0, mesh=mesh,
+                           n_right=n_right)
     return F.chi_unfold_scratch_bytes(kgrid, ns, int(tile))
 
 
@@ -536,3 +545,42 @@ def price_chi0_node(*, n_parent, n_rmu, ns, n_full, n_out, n_band, mesh, partner
            + chi0_door_scratch(kgrid=kgrid, n_parent=n_parent, n_rmu=n_rmu, ns=ns, mesh=mesh))
     record_stage_price("chi0 node, price_chi0_node", new, section="chi.exec")
 
+
+
+def price_photon_pass(*, n_parent, n_full, n_band, q_count, rows, right, n_ch, partner,
+                      passes, kgrid, mesh):
+    """Per-rank live bytes of one row pass of one family pair of the four-current direct stream.
+
+    ``w_isdf._get_chi_fractional_contour_kernel_face`` (``photon_door_blocks``): ``rows``
+    is the pass's share of the left family's centroid carrier, ``right`` the right
+    family's carrier, ``n_ch`` the pair's channel planes, ``partner`` whether the left
+    plan has an antiunitary row (each quadrant Green then has a partner tile, its own
+    GEMM on this route), ``passes`` the pair's pass count.  Each term is a buffer the
+    compiled program holds (XLA buffer assignments at the Fe 20^3 P36-local shape,
+    runs/DEV/700_photpass_20260930/aot):
+
+    - the channel planes the doors accumulate in R, ``n_ch·16·N_k·r·c/P``; twice over
+      when ``passes > 1``: XLA folds the passes' zero accumulators into one buffer, so
+      each pass's doors update a copy of it;
+    - mode 11's run-time scratch (:func:`chi0_door_scratch`; not in ``memory_analysis``);
+    - and the larger of the door phase: the quadrant's lower and upper parent Greens with
+      their partners ``2(1+a)·T`` (:func:`_green_terms`, ns = 2 per Dirac half), and the
+      build in flight: its panel product beside the running sum (``T``), the Green and
+      partner builds' SUMMA panels ``(1+a)·M``, and its weighted half-spinor faces
+      ``16·n_parent·2·N_b·(r + c)/P``; or the transform phase: one plane's transform and
+      its two selected-row blocks, ``16·(N_k + 2q)·r·c/P``.
+
+    The bank carry and the faces stay whatever the pass count, so they are not here.
+    """
+    P = int(mesh.shape['x']) * int(mesh.shape['y'])
+    tile, panels = _green_terms(n_parent=n_parent, n_rmu=rows, ns=2, n_band=n_band,
+                                mesh=mesh, n_right=right)
+    a = float(bool(partner))
+    plane = 16.0 * int(rows) * int(right) / P
+    planes = (2 if int(passes) > 1 else 1) * int(n_ch) * int(n_full) * plane
+    faces = 16.0 * int(n_parent) * 2 * int(n_band) * (int(rows) + int(right)) / P
+    door = (2.0 * (1.0 + a) + 1.0) * tile + (1.0 + a) * panels + faces
+    transform = (int(n_full) + 2 * int(q_count)) * plane
+    scratch = chi0_door_scratch(kgrid=kgrid, n_parent=n_parent, n_rmu=rows, ns=2,
+                                mesh=mesh, n_right=right)
+    return planes + scratch + max(door, transform)

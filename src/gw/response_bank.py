@@ -414,7 +414,8 @@ def response_stream(wfns, meta, *, mesh_xy, q_ids, n_outputs,
         if pair_mode == "direct" and ledger is not None:
             from .w_isdf import photon_response_passes
             passes = photon_response_passes(
-                ledger, mesh_xy, vertex.families, n_parent=n_input, nk=int(meta.nk_tot),
+                ledger, mesh_xy, vertex.families, n_parent=n_input,
+                kgrid=(meta.nkx, meta.nky, meta.nkz), n_band=int(wfns.slices.nb_full),
                 n_out=2, q_count=len(q_ids),
                 face_bytes=sum(int(a.nbytes) for a in (*vertex.mun, *vertex.nmu)) // int(mesh_xy.size))
         kernel = _response_stream_kernel(
