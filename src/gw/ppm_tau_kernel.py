@@ -47,6 +47,33 @@ _sigma_shared_tau_kernel_cache: dict[
     tuple[object, ...], Callable[..., jax.Array]
 ] = {}
 
+#: The Σ Green door's placed load tables per (mesh, parent plan); bounded.
+#: Plans are run objects, stable across SC maps, so a run places them once.
+_SIGMA_DOOR_TABLES: dict = {}
+
+
+def sigma_door_tables(mesh_xy: Mesh, k_unfold_plan):
+    """The mode-7 Green door's load tables on the devices, placed once per mesh and plan.
+
+    ``symmetry_maps.device_load_tables`` of ``k_unfold_plan.unfold_load_tables()``.
+    The q-wedge Σ kernel (:func:`_sigma_subtile_kernel`) reads them as its
+    ``g_load`` argument and cuts them to each row pass on the device
+    (``subtile_stream.pass_load``), so no Σ program holds table constants:
+    baked, every row pass's door carried its own copy of the row/phase tables
+    as HLO literals (21 passes at the Fe 20^3 P64-local tile: compile
+    24 -> 68.6 s).
+    """
+    key = (mesh_xy, k_unfold_plan)
+    hit = _SIGMA_DOOR_TABLES.get(key)
+    if hit is None:
+        from symmetry_maps import device_load_tables
+        placed = device_load_tables(k_unfold_plan.unfold_load_tables(), mesh_xy)
+        while len(_SIGMA_DOOR_TABLES) >= 2:
+            _SIGMA_DOOR_TABLES.pop(next(iter(_SIGMA_DOOR_TABLES)))
+        # The plan rides along so its id in the key cannot be reused.
+        hit = _SIGMA_DOOR_TABLES[key] = (k_unfold_plan, placed)
+    return hit[1]
+
 
 def _make_project_ri_reduce_scatter(
     mesh_xy: Mesh, *, merged_x: bool = True,
@@ -233,13 +260,16 @@ def _sigma_subtile_kernel(*, mesh_xy, kgrid, brackets, face_shape, face_band_ext
       (``subtile_stream.pass_load``): ``W_prep`` exists for the pass's rows only;
     - the parent Green on the pass's ψ rows: one local GEMM over the active
       bands of the band-complete ψ (``layout='axis'``), no exchange;
-    - mode 7 with the Green's unfold tables cut to the pass, and the axis
-      band projection of the pass's rows into a rank-local partial;
+    - mode 7 with the Green's device load ``g_load`` (:func:`sigma_door_tables`)
+      cut to the pass, and the axis band projection of the pass's rows into a
+      rank-local partial;
 
-    and one band-block reduce-scatter per bracket ends the node.  Pass sizes
-    come from :data:`runtime.tiles.TILE_BYTES` and the shapes
-    (:func:`subtile_stream.plan_rows`).  Brackets run inside each pass, so a
-    pass's ``W_prep`` serves every bracket.  Returns ``(kernel, price)``.
+    and one band-block reduce-scatter per bracket ends the node.  Both doors
+    read their tables as operands, so no pass's program holds table
+    constants.  Pass sizes come from :data:`runtime.tiles.TILE_BYTES` and the
+    shapes (:func:`subtile_stream.plan_rows`).  Brackets run inside each pass,
+    so a pass's ``W_prep`` serves every bracket.  Returns ``(kernel, price)``;
+    the kernel takes ``(..., W_q, W_pt, load, g_load)``.
     """
     from common.contract_bands import contract_bands_block_reshard
     from common.fft_helpers import make_kconv_klead_unfold, make_kfft_klead_unfold
@@ -277,6 +307,7 @@ def _sigma_subtile_kernel(*, mesh_xy, kgrid, brackets, face_shape, face_band_ext
     stages = []
     for x0, xr in passes:
         whole = (x0, xr) == (0, local_rows)
+        # The host tables give the door its shapes; the pass reads g_load's cut.
         tables = g_tables if whole else pass_tables(g_tables, x0, xr, px, ns)
         # Not warmed: the plan runs inside the window executable.
         gemm = gemm_plan(mesh_xy, m=px * xr * ns, k=nb, n=n_rmu * ns, nq=n_parent,
@@ -321,9 +352,11 @@ def _sigma_subtile_kernel(*, mesh_xy, kgrid, brackets, face_shape, face_band_ext
         return build_G_tau(psi_p, cols, E, 1j * t, **options)
 
     def _kernel_impl(psi_coh_xn, psi_coh_yr, psi_proj_xr, psi_proj_yn,
-                     E_A, mask_A, E_min, E_max, E_ref_A, t_node, W_q, W_pt=None, load=None):
-        if load is None:
-            raise ValueError("Sigma tau: W on the q wedge needs its device load tables")
+                     E_A, mask_A, E_min, E_max, E_ref_A, t_node, W_q, W_pt=None, load=None,
+                     g_load=None):
+        if load is None or g_load is None:
+            raise ValueError("Sigma tau: W on the q wedge and the Green door need their device "
+                             "load tables (load, g_load = sigma_door_tables)")
         rows_all, cols_all = band_complete(psi_coh_xn, psi_coh_yr, mesh_xy)
         left_all, right_all = projection_complete(psi_proj_xr, psi_proj_yn, mesh_xy)
         n_mask = int(mask_A.shape[-1])
@@ -356,6 +389,7 @@ def _sigma_subtile_kernel(*, mesh_xy, kgrid, brackets, face_shape, face_band_ext
                 rows = pass_rows(rows, mesh_xy, x0, xr, axis=2)
                 left = pass_rows(left, mesh_xy, x0, xr, axis=3)
             w_prep = door9(W, Wt, load if whole else pass_load(load, mesh_xy, x0, xr))
+            g_pass = g_load if whole else pass_load(g_load, mesh_xy, x0, xr, ns)
             faces = (jnp.conj(left), right)
             out = []
             for b, (sel, band_range) in enumerate(zip(bracket_masks, bracket_ranges)):
@@ -367,7 +401,8 @@ def _sigma_subtile_kernel(*, mesh_xy, kgrid, brackets, face_shape, face_band_ext
                 def add(acc, sel=sel, band_range=band_range, w_prep=w_prep, rows=rows):
                     G = green(rows, cols, E_A, sel, E_min, E_max, E_ref_A, t_node, gemm,
                               band_range)
-                    sigma = conv(G.G, G.transpose, w_prep, conj_partner=G.conj_partner)
+                    sigma = conv(G.G, G.transpose, w_prep, conj_partner=G.conj_partner,
+                                 load=g_pass)
                     return project.accumulate(faces, sigma, acc=acc)
                 out.append(add(accs[b]) if live[b] is None
                            else jax.lax.cond(live[b], add, lambda a: a, accs[b]))
@@ -386,9 +421,10 @@ def _sigma_subtile_kernel(*, mesh_xy, kgrid, brackets, face_shape, face_band_ext
     else:
         @partial(jax.jit, donate_argnums=(8,))
         def kernel(psi_coh_xn, psi_coh_yr, psi_proj_xr, psi_proj_yn,
-                   E_A, mask_A, E_ref_A, t_node, W_q, W_pt=None, load=None):
+                   E_A, mask_A, E_ref_A, t_node, W_q, W_pt=None, load=None, g_load=None):
             return _kernel_impl(psi_coh_xn, psi_coh_yr, psi_proj_xr, psi_proj_yn,
-                                E_A, mask_A, None, None, E_ref_A, t_node, W_q, W_pt, load)
+                                E_A, mask_A, None, None, E_ref_A, t_node, W_q, W_pt, load,
+                                g_load)
     return kernel, price
 
 
@@ -405,8 +441,10 @@ def _get_sigma_kij_kernel(
     ``q_wedge`` (a ``symmetry_maps.QirrOperator`` of tables): W(τ) arrives on
     the q wedge, its partner tile ``W_pt`` (the tile built from the conjugated
     residues) read on antiunitary rows and the device load tables ``load``
-    passed as arguments; the kernel then takes ``(..., W_q, W_pt, load)`` and
-    runs row pass by row pass (:func:`_sigma_subtile_kernel`).  Without it
+    passed as arguments, with the Green door's ``g_load``
+    (:func:`sigma_door_tables`); the kernel then takes
+    ``(..., W_q, W_pt, load, g_load)`` and runs row pass by row pass
+    (:func:`_sigma_subtile_kernel`).  Without it
     (full-zone residues) W is prepared whole by the k-convolution router."""
     if layout not in ("face", "axis") or face_shape is None or k_unfold_plan is None:
         raise ValueError("Sigma tau requires canonical face shapes and a typed parent unfold plan.")
@@ -646,8 +684,10 @@ def get_shared_sigma_tau_kernel(
     def _tau(
         psi_coh_xn, psi_coh_yr, psi_proj_xr, psi_proj_yn,
         E_A, mask_A, B_poles, Omega_poles, pole_indices, bounds,
-        phase_real, E_ref_A, E_ref_B, t_node, active_count=None,
+        phase_real, E_ref_A, E_ref_B, g_load, t_node, active_count=None,
     ):
+        # ``g_load``: the Green door's placed tables on the q wedge
+        # (:func:`sigma_door_tables`), ``None`` otherwise.
         B_poles, load = _wedge_residues(B_poles)
         W_t = _build(B_poles, Omega_poles, pole_indices, bounds,
                      phase_real, E_ref_B, t_node, active_count)
@@ -656,7 +696,8 @@ def get_shared_sigma_tau_kernel(
                 if partner_needed else None)
         return sigma_kij(
             psi_coh_xn, psi_coh_yr, psi_proj_xr, psi_proj_yn,
-            E_A, mask_A, E_ref_A, t_node, W_t, W_pt, load)
+            E_A, mask_A, E_ref_A, t_node, W_t, W_pt, load,
+            *(() if g_load is None else (g_load,)))
 
     # Never publish a kernel built around a caller's spatial kernel.
     if _sigma_kij is None:
