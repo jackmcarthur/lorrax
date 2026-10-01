@@ -246,7 +246,7 @@ def sigma_subtile_operands(psi_coh_xn, psi_coh_yr, psi_proj_xr, psi_proj_yn, *, 
 
 
 def _sigma_subtile_kernel(*, mesh_xy, kgrid, brackets, face_shape, face_band_extent,
-                          energy_windows, k_unfold_plan, q_wedge):
+                          energy_windows, k_unfold_plan, q_wedge, static=False):
     """Σ_k(τ) for W(τ) on the q wedge, row pass by row pass (``gw.subtile_stream``).
 
         Σ_mn(k) = Σ_{μ ∈ passes} Σ_ν ψ*_m(μ) [G ⋆ W](k)_{μν} ψ_n(ν)
@@ -270,6 +270,12 @@ def _sigma_subtile_kernel(*, mesh_xy, kgrid, brackets, face_shape, face_band_ext
     shapes (:func:`subtile_stream.plan_rows`).  Brackets run inside each pass,
     so a pass's ``W_prep`` serves every bracket.  Returns ``(kernel, price)``;
     the kernel takes ``(..., W_q, W_pt, load, g_load)``.
+
+    ``static``: the same node at τ = 0 for a Hermitian static interaction (V,
+    W(0), W − V; ``gw.cohsex_sigma``'s Σ_x, SX and COH).  Its antiunitary rows
+    read the interaction by the wedge's conj rule (no partner tile, ``W_pt``
+    None) and the Green's real weights give its partner as conj(G) on the
+    mode-7 load (no partner GEMM).
     """
     from common.contract_bands import contract_bands_block_reshard
     from common.fft_helpers import make_kconv_klead_unfold, make_kfft_klead_unfold
@@ -287,19 +293,20 @@ def _sigma_subtile_kernel(*, mesh_xy, kgrid, brackets, face_shape, face_band_ext
     px, py = int(mesh_xy.shape["x"]), int(mesh_xy.shape["y"])
     local_rows, nu = n_rmu // px, n_rmu // py
     g_tables = k_unfold_plan.unfold_load_tables()
-    pair = dataclasses.replace(q_wedge, values=None, load=None, trs_rule="pair_transpose")
+    pair = dataclasses.replace(q_wedge, values=None, load=None,
+                               trs_rule="conj" if static else "pair_transpose")
     w_tables = pair.load_tables(mesh_xy)
     if int(w_tables.lsrc.shape[1]) != n_rmu or int(g_tables.lsrc.shape[1]) != n_rmu * ns:
         raise ValueError(
             f"Sigma tau: W's q-wedge tables carry {w_tables.lsrc.shape[1]} left endpoints and "
             f"the Green's {g_tables.lsrc.shape[1]}; the faces carry {n_rmu} centroids x {ns}")
-    partner = int(has_antiunitary_rows(k_unfold_plan))
+    partner = int(has_antiunitary_rows(k_unfold_plan) and not static)
     n_w = int(w_tables.n_parent)
     # One local row's live set: the parent Green and its partner, mode 7's
     # output, W_prep, the pass's slices of W and its partner, the pass's ψ
     # rows (Green and projection) and the projector's ν-contracted rows.
-    row_bytes = 16 * ((2 + partner) * n_parent * ns * ns * nu + nk * nu + 2 * n_w * nu
-                      + n_parent * ns * (nb + 2 * nb_sig))
+    row_bytes = 16 * ((2 + partner) * n_parent * ns * ns * nu + nk * nu
+                      + (1 + int(not static)) * n_w * nu + n_parent * ns * (nb + 2 * nb_sig))
     passes = plan_rows(local_rows, row_bytes, lambda: sorted(
         set(orbit_cuts(g_tables.lsrc, px, ns)) & set(orbit_cuts(w_tables.lsrc, px, 1))))
     door9 = make_kfft_klead_unfold(mesh_xy, kgrid, w_tables, norm="ortho")
@@ -325,10 +332,12 @@ def _sigma_subtile_kernel(*, mesh_xy, kgrid, brackets, face_shape, face_band_ext
     price = dict(d=ns, ns=ns, passes=len(passes), tile=float(TILE_BYTES),
                  new=float(max(xr for _, xr in passes) * row_bytes + psi_bytes))
     from common.gpu_utils import record_stage_price
-    record_stage_price(f"Sigma tau, {len(passes)} row pass(es)", price["new"],
-                       section="sigma.tau_sweep")
+    # A static node is priced in its caller's section (Σ exchange, static COHSEX).
+    label = "Sigma static" if static else "Sigma tau"
+    record_stage_price(f"{label}, {len(passes)} row pass(es)", price["new"],
+                       section=None if static else "sigma.tau_sweep")
     if jax.process_index() == 0:
-        print(f"Sigma tau stream: {len(passes)} row pass(es) of {max(xr for _, xr in passes)} "
+        print(f"{label} stream: {len(passes)} row pass(es) of {max(xr for _, xr in passes)} "
               f"local rows ({local_rows} per rank)", flush=True)
     selectors = (None,) if brackets is None else tuple(
         (int(lo), None if hi is None else int(hi)) for lo, hi in brackets)
@@ -341,11 +350,12 @@ def _sigma_subtile_kernel(*, mesh_xy, kgrid, brackets, face_shape, face_band_ext
         An antiunitary row reads the conjugate-face partner, built by its own
         local GEMM at every node (``real_weights=False``): no device predicate
         stops the node loop, and the partner is the one the face route's
-        single exchange formed.
+        single exchange formed.  A static node's weights are real, so its
+        partner is conj(G), read on the mode-7 load.
         """
         options = dict(e_ref=ref, layout="axis", gemm=gemm, k_unfold_plan=k_unfold_plan,
                        band_range=band_range, trim_zero_bands=True, unfold=False,
-                       real_weights=False)
+                       real_weights=bool(static))
         options["mask" if sel.dtype == jnp.bool_ else "band_weight"] = sel
         if energy_windows:
             options.update(E_min=E_min, E_max=E_max)
@@ -435,6 +445,7 @@ def _get_sigma_kij_kernel(
     energy_windows: bool = False,
     k_unfold_plan=None,
     q_wedge=None,
+    static: bool = False,
 ) -> Callable[..., jax.Array]:
     """Build Green functions with band-range masks and contract each bracket against one prepared W.
 
@@ -444,22 +455,26 @@ def _get_sigma_kij_kernel(
     passed as arguments, with the Green door's ``g_load``
     (:func:`sigma_door_tables`); the kernel then takes
     ``(..., W_q, W_pt, load, g_load)`` and runs row pass by row pass
-    (:func:`_sigma_subtile_kernel`).  Without it
+    (:func:`_sigma_subtile_kernel`).  ``static``: one τ = 0 node of a
+    Hermitian static interaction on the wedge (its conj-rule ``load``, no
+    ``W_pt``), the static Σ of ``gw.cohsex_sigma``.  Without ``q_wedge``
     (full-zone residues) W is prepared whole by the k-convolution router."""
     if layout not in ("face", "axis") or face_shape is None or k_unfold_plan is None:
         raise ValueError("Sigma tau requires canonical face shapes and a typed parent unfold plan.")
+    if static and q_wedge is None:
+        raise ValueError("Sigma static node: the interaction's q wedge is required")
     from ffi import ffi_dial_key
     key = (id(mesh_xy), tuple(map(int, kgrid)),
            ffi_dial_key(), bool(merged_x), brackets, layout, face_shape,
            face_band_extent, bool(energy_windows),
-           k_unfold_plan, None if q_wedge is None else q_wedge.wedge_key())
+           k_unfold_plan, None if q_wedge is None else q_wedge.wedge_key(), bool(static))
     if key in _sigma_kij_kernel_cache:
         return _sigma_kij_kernel_cache[key]
     if q_wedge is not None:
         kernel, price = _sigma_subtile_kernel(
             mesh_xy=mesh_xy, kgrid=kgrid, brackets=brackets, face_shape=face_shape,
             face_band_extent=face_band_extent, energy_windows=energy_windows,
-            k_unfold_plan=k_unfold_plan, q_wedge=q_wedge)
+            k_unfold_plan=k_unfold_plan, q_wedge=q_wedge, static=static)
         _sigma_kij_kernel_cache[key] = kernel
         _SIGMA_PASS_PRICE[id(kernel)] = price
         return kernel

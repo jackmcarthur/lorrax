@@ -32,7 +32,8 @@ nodes in chunks into a carry (:func:`stream_passes`).  The Σ G⋆W convolution
 node: G(τ) on the pass's ψ rows, W(τ) on the pass's rows of its q parents
 through the mode-9 load (:func:`pass_load`) and mode 7, and the band
 projection, which is linear in the rows, summed over the passes
-(:func:`fold_passes`).
+(:func:`fold_passes`).  The static Σ (exchange G(0⁻)⋆V, static SX and COH)
+is the same node at τ = 0 with the static interaction in place of W(τ).
 """
 from __future__ import annotations
 
