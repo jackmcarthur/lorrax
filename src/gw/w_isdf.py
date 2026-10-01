@@ -256,7 +256,8 @@ def _chi_door_serves(mesh_xy, kgrid, ns) -> bool:
 _PHOTON_PASS_PLANS: dict = {}
 
 
-def _photon_pass_plans(mesh_xy, kgrid, families, half_plans, *, n_band, q_count, n_nodes):
+def _photon_pass_plans(mesh_xy, kgrid, families, half_plans, *, n_band, q_count, n_nodes,
+                       n_sets=2):
     """Per family pair, the four-current direct stream's row passes, node chunk and blocks.
 
     ``gw.subtile_stream.plan_passes`` on the pair's own door tables (its
@@ -266,7 +267,8 @@ def _photon_pass_plans(mesh_xy, kgrid, families, half_plans, *, n_band, q_count,
     partners ``16·n_parent·2·(ν·2)`` each, the door's channel planes in R and
     one plane's transform ``16·(n_ch + 1)·nk·ν``, the pass's ψ rows
     ``16·n_parent·4·n_band``, and the chunk's kept rows
-    ``2·16·chunk·q·ν·n_ch``; per node on the whole tile, ``2·16·q·μ·ν·n_ch``.
+    ``n_sets·16·chunk·q·ν·n_ch`` (``n_sets`` rows per plane and node: two per
+    Green pair); per node on the whole tile, ``n_sets·16·q·μ·ν·n_ch``.
     ``ν = c_R/p_y``, ``μ = c_L/p_x``.  The blocks place each channel plane
     ``(A, B)`` in the packed photon layout.
     """
@@ -274,7 +276,7 @@ def _photon_pass_plans(mesh_xy, kgrid, families, half_plans, *, n_band, q_count,
     from .photon_layout import FAMILY_PAIRS, family_channels
     from .subtile_stream import Block, plan_passes
     key = (mesh_xy, tuple(int(v) for v in kgrid), families, tuple(half_plans), int(n_band),
-           int(q_count), int(n_nodes))
+           int(q_count), int(n_nodes), int(n_sets))
     if key in _PHOTON_PASS_PLANS:
         return _PHOTON_PASS_PLANS[key]
     layout = families.packed_layout
@@ -290,7 +292,7 @@ def _photon_pass_plans(mesh_xy, kgrid, families, half_plans, *, n_band, q_count,
 
         def row_bytes(chunk, nu=nu, n_ch=n_ch, greens=greens):
             return 16 * (greens * n_parent * 2 * nu * 2 + (n_ch + 1) * nk * nu
-                         + n_parent * 4 * int(n_band) + 2 * chunk * int(q_count) * nu * n_ch)
+                         + n_parent * 4 * int(n_band) + int(n_sets) * chunk * int(q_count) * nu * n_ch)
         blocks = tuple(Block(m0=layout.local_offset(A), n0=layout.local_offset(B),
                              extents=(layout.logical_extent(A), layout.carrier_extent(A) // px,
                                       layout.logical_extent(B), layout.carrier_extent(B) // py))
@@ -298,7 +300,7 @@ def _photon_pass_plans(mesh_xy, kgrid, families, half_plans, *, n_band, q_count,
         tables = half_plans[L].unfold_load_tables(
             right_plan=None if half_plans[R] is half_plans[L] else half_plans[R])
         plans.append(plan_passes(tables, mesh_xy, ns=2, row_bytes=row_bytes,
-                                 chunk_bytes=2 * 16 * int(q_count) * mu * nu * n_ch,
+                                 chunk_bytes=int(n_sets) * 16 * int(q_count) * mu * nu * n_ch,
                                  n_nodes=n_nodes, blocks=blocks))
     while len(_PHOTON_PASS_PLANS) >= 4:
         _PHOTON_PASS_PLANS.pop(next(iter(_PHOTON_PASS_PLANS)))
@@ -306,7 +308,7 @@ def _photon_pass_plans(mesh_xy, kgrid, families, half_plans, *, n_band, q_count,
     return _PHOTON_PASS_PLANS[key]
 
 
-def _photon_chi_doors(mesh_xy, kgrid, half_plans, parity, passes=None):
+def _photon_chi_doors(mesh_xy, kgrid, half_plans, parity, passes):
     """Mode-11 vertex doors of the four-current stream, one per family pair and lower quadrant.
 
     ``half_plans`` are the two families' Dirac-half plans and ``parity`` the
@@ -321,7 +323,7 @@ def _photon_chi_doors(mesh_xy, kgrid, half_plans, parity, passes=None):
     (``common.gamma_matrices.gamma_perm_phase_host``), so the door forms
     ``sum_ab (J_A G^> J_B^dagger)_ab conj(G^<)_ab``.  ``passes`` (per family
     pair, its row passes ``((x0, xr), ...)`` at orbit cuts,
-    :func:`_photon_pass_plans`; one whole pass by default): a pass's door
+    :func:`_photon_pass_plans`): a pass's door
     reads only its own rows, so its parent Greens are built on those rows only.
     Returns ``{(pair, (h, g), (x0, xr)): (door, keys, tables)}``; quadrants and
     passes share every table array they have in common
@@ -338,7 +340,7 @@ def _photon_chi_doors(mesh_xy, kgrid, half_plans, parity, passes=None):
         local_rows = int(half_plans[L].n_centroid_packed) // side
         base = half_plans[L].unfold_load_tables(
             right_plan=None if half_plans[R] is half_plans[L] else half_plans[R])
-        pass_rows = ((0, local_rows),) if passes is None else tuple(passes[i_pair])
+        pass_rows = tuple(passes[i_pair])
         flip = tuple(int(f == 1) for f in pair)
         keys = tuple((A, B) for A in family_channels(L) for B in family_channels(R))
         odd_nph = np.asarray(base.nph) * p[:, None]
@@ -402,16 +404,11 @@ def _place_photon_door_tables(doors, mesh_xy):
 _PHOTON_DOORS: dict = {}
 
 
-def _photon_stream_doors(mesh_xy, kgrid, half_plans, parity, passes=None):
+def _photon_stream_doors(mesh_xy, kgrid, half_plans, parity, passes):
     """:func:`_photon_chi_doors` and their placed tables, built once per run and pass plan.
 
-    ``passes`` ``None`` is one whole pass per family pair (the same doors as a
-    plan whose pairs each take one pass).
+    Calls whose plans give the same passes share one set of doors and tables.
     """
-    from .photon_layout import FAMILY_PAIRS
-    side = int(mesh_xy.shape["x"])
-    if passes is None:
-        passes = tuple(((0, int(half_plans[L].n_centroid_packed) // side),) for L, _ in FAMILY_PAIRS)
     passes = tuple(tuple((int(x0), int(xr)) for x0, xr in rows) for rows in passes)
     key = (mesh_xy, tuple(int(v) for v in kgrid), tuple(half_plans), passes)
     hit = _PHOTON_DOORS.get(key)
@@ -919,7 +916,7 @@ def _get_chi_fractional_contour_kernel_face(
     """
     from common.fft_helpers import make_flat_k_fftn
     from distrib_la import gemm_plan
-    from .greens_function_kernel import build_G_tau, face_green_product
+    from .greens_function_kernel import build_G_tau
     from .wavefunction_bundle import (
         G_FFT7D_SPEC,
         G_FLATK_SPEC,
@@ -1021,7 +1018,13 @@ def _get_chi_fractional_contour_kernel_face(
     if band_ranges is not None and pair_mode != "direct":
         raise ValueError("prepared response band ranges require the direct stream")
     if photon is not None:
-        g_plan = partial(face_green_product, mesh=mesh_xy, phases=None, band_range=None)
+        g_plan = None
+        if pair_mode == "windowed":
+            raise ValueError(
+                "GATE response_vertex: got pair_mode='windowed' for the four-current "
+                "stream; want direct, retarded, kms_static or laplace_ordered; why: the "
+                "four-current correlations run on the sub-tile engine, which has no "
+                "window branch")
         if n_rmu != photon.layout.packed_extent or ns != 4:
             raise ValueError(
                 f"four-current stream: face_shape extent {n_rmu}, spin {ns}; want "
@@ -1052,38 +1055,37 @@ def _get_chi_fractional_contour_kernel_face(
                 f"response; want a grid mathdx mode 11 holds at ns=2; why: {why}, and "
                 "the stream builds its Greens only on the raw parents (no full-k "
                 "Green quadrant on the GPU)")
-        photon_plans = None
-        if pair_mode == "direct":
-            # The direct stream on the sub-tile engine: per family pair, row
-            # passes, node chunk and channel blocks from runtime.tiles and the
-            # shapes; each pass's quadrant Greens are local GEMMs on the
-            # pass's band-complete ψ rows.
-            import minimax
-            from .photon_layout import FAMILY_PAIRS, family_channels
-            px = int(mesh_xy.shape["x"])
-            photon_plans = _photon_pass_plans(
-                mesh_xy, grid, photon, half_plans, n_band=nb_full, q_count=len(selected_q),
-                n_nodes=minimax.RESPONSE_NODE_CAPACITY)
-            photon_gemms = tuple(
-                tuple(gemm_plan(mesh_xy, m=px * xr * 2, k=nb_full,
-                                n=photon.packed_layout.carrier_extent(family_channels(R)[0]) * 2,
-                                nq=nk_shape, dtype=jnp.complex128, layout="axis",
-                                enable_active_range=band_ranges is not None)
-                      for _, xr in plan.passes)
-                for (_, R), plan in zip(FAMILY_PAIRS, photon_plans))
-            photon_active = tuple(
-                tuple((tuple(g.prepare_active_range(*bounds) for bounds in band_ranges)
-                       if band_ranges is not None else (None, None)) for g in gemms)
-                for gemms in photon_gemms)
-            if jax.process_index() == 0:
-                print("Response four-current direct stream: row passes (CC, CT, TC, TT) "
-                      f"{tuple(len(plan.passes) for plan in photon_plans)} of "
-                      f"{tuple(max(xr for _, xr in plan.passes) for plan in photon_plans)} "
-                      f"local rows, {tuple(plan.chunk for plan in photon_plans)} node(s) "
-                      "per accumulate", flush=True)
+        # Every four-current mode runs on the sub-tile engine: per family pair,
+        # row passes, node chunk and channel blocks from runtime.tiles and the
+        # shapes; each pass's quadrant Greens are local GEMMs on the pass's
+        # band-complete ψ rows.  A Laplace node keeps both occupation
+        # orientations' rows (four row sets), every other mode two.
+        import minimax
+        from .photon_layout import FAMILY_PAIRS, family_channels
+        px = int(mesh_xy.shape["x"])
+        photon_sets = 4 if pair_mode == "laplace_ordered" else 2
+        photon_plans = _photon_pass_plans(
+            mesh_xy, grid, photon, half_plans, n_band=nb_full, q_count=len(selected_q),
+            n_nodes=minimax.RESPONSE_NODE_CAPACITY, n_sets=photon_sets)
+        photon_gemms = tuple(
+            tuple(gemm_plan(mesh_xy, m=px * xr * 2, k=nb_full,
+                            n=photon.packed_layout.carrier_extent(family_channels(R)[0]) * 2,
+                            nq=nk_shape, dtype=jnp.complex128, layout="axis",
+                            enable_active_range=band_ranges is not None)
+                  for _, xr in plan.passes)
+            for (_, R), plan in zip(FAMILY_PAIRS, photon_plans))
+        photon_active = tuple(
+            tuple((tuple(g.prepare_active_range(*bounds) for bounds in band_ranges)
+                   if band_ranges is not None else (None, None)) for g in gemms)
+            for gemms in photon_gemms)
+        if jax.process_index() == 0:
+            print(f"Response four-current {pair_mode} stream: row passes (CC, CT, TC, TT) "
+                  f"{tuple(len(plan.passes) for plan in photon_plans)} of "
+                  f"{tuple(max(xr for _, xr in plan.passes) for plan in photon_plans)} "
+                  f"local rows, {tuple(plan.chunk for plan in photon_plans)} node(s) "
+                  "per accumulate", flush=True)
         photon_doors, (door_index, door_arrays, door_specs) = _photon_stream_doors(
-            mesh_xy, grid, half_plans, half_parity,
-            None if photon_plans is None else tuple(plan.passes for plan in photon_plans))
+            mesh_xy, grid, half_plans, half_parity, tuple(plan.passes for plan in photon_plans))
     active_gemms = (tuple(g_plan.prepare_active_range(*bounds) for bounds in band_ranges)
                    if band_ranges is not None and layout == "axis" else (None, None))
     # Selected charge streams on a raw-parent plan form each node's correlation
@@ -1206,55 +1208,15 @@ def _get_chi_fractional_contour_kernel_face(
 
         def spin_correlation(lower_weight, lower_time, lower_ref,
                              upper_weight, upper_time, upper_ref):
-            """Exact spin trace of one Green pair; the four-current trace is per family pair.
-
-            Four-current: per family pair, a scan over the four Dirac-half
-            quadrants (h, g) of the lower Green; the vertices of a current
-            channel exchange the halves, so each quadrant meets exactly one
-            upper quadrant.  Two quarter Greens are live at a time; each
-            Lorentz block accumulates its quadrant's share of
-            ``(J_A G^> J_B^dagger) conj(G^<)`` in R.  Then the family pair's
-            blocks are transformed and only their parent rows are kept
-            (:func:`photon_rows`); no R-space array spans the packed basis.
-            """
-            if photon is None:
-                gf = G_fftn(green_k(lower_weight, lower_time, lower_ref))
-                # Finish the lower Green before building upper parent buffers.
-                gf, next_weight = jax.lax.optimization_barrier((gf, upper_weight))
-                gu = G_fftn(green_k(next_weight, upper_time, upper_ref, current=True))
-                # Centroid-major Greens (R, mu, a, nu, b): trace the spin
-                # pairs elementwise in mu, nu.
-                return jax.lax.with_sharding_constraint(
-                    jnp.einsum("Rmanb,Rmanb->Rmn", gu, gf.conj()), chi_R_shard)
-            return photon_rows(lower_weight, lower_time, lower_ref,
-                               upper_weight, upper_time, upper_ref)
-
-        def photon_rows(lower_weight, lower_time, lower_ref,
-                        upper_weight, upper_time, upper_ref):
-            """One node's four-current correlation A as its transformed parent rows.
-
-            Returns ``(FT[A](q), FT[A](-q))`` at ``q = gather_q``, both
-            ``(q_count, n_mu, n_mu)`` in the packed layout, through mathdx
-            mode 11 (:func:`photon_door_blocks`).  Every other row the modes
-            need follows from ``FT[conj A](q) = conj FT[A](-q)``
-            (:func:`photon_mix`).
-            """
-            from .photon_layout import _insert
-            layout_p = photon.packed_layout
-            ahead, behind = (jax.lax.with_sharding_constraint(
-                jnp.zeros((q_count, n_mu, n_mu), jnp.complex128), chi_R_shard)
-                for _ in range(2))
-
-            def put(state, keys, value, c):
-                ahead, behind = state
-                A, B = keys[c]
-                ahead = _insert(ahead, jnp.conj(jnp.take(value, jnp.asarray(gather_q), axis=0)),
-                                layout_p, A, B, mesh_xy)
-                behind = _insert(behind, jnp.conj(jnp.take(value, jnp.asarray(reverse_q), axis=0)),
-                                 layout_p, A, B, mesh_xy)
-                return ahead, behind
-            return photon_door_blocks((ahead, behind), put, lower_weight, lower_time, lower_ref,
-                                      upper_weight, upper_time, upper_ref)
+            """Exact spin trace of one charge Green pair (four-current: :func:`photon_subtiles`)."""
+            gf = G_fftn(green_k(lower_weight, lower_time, lower_ref))
+            # Finish the lower Green before building upper parent buffers.
+            gf, next_weight = jax.lax.optimization_barrier((gf, upper_weight))
+            gu = G_fftn(green_k(next_weight, upper_time, upper_ref, current=True))
+            # Centroid-major Greens (R, mu, a, nu, b): trace the spin
+            # pairs elementwise in mu, nu.
+            return jax.lax.with_sharding_constraint(
+                jnp.einsum("Rmanb,Rmanb->Rmn", gu, gf.conj()), chi_R_shard)
 
         def photon_planes(acc, pair, rows, parent, lower_w, upper_w, lower_time, lower_ref,
                           upper_time, upper_ref):
@@ -1280,56 +1242,20 @@ def _get_chi_fractional_contour_kernel_face(
                                                 load=door_loads[door_key])
             return acc
 
-        def photon_door_blocks(state, put, lower_weight, lower_time, lower_ref,
-                               upper_weight, upper_time, upper_ref):
-            """The four-current correlation through mathdx mode 11, one family pair at a time.
+        def photon_subtiles(carry, weights, count, orientations):
+            """A four-current node rule on every family pair's row passes (``gw.subtile_stream``).
 
-            Per family pair, its quadrant Greens are built on the raw parents
-            only (``build_G_tau(unfold=False)``) from the faces and the door
-            accumulates every channel pair's R plane (:func:`photon_planes`).
-            Each plane is then transformed and ``state = put(state, keys,
-            FT[v_c], c)`` keeps its rows before the next plane and the next
-            pair's Greens.
-            """
-            from .photon_layout import FAMILY_PAIRS
-            layout_p = photon.packed_layout
-            side = int(mesh_xy.shape["x"])
-            for pair in FAMILY_PAIRS:
-                L, R = pair
-                rows = (0, int(half_plans[L].n_centroid_packed) // side)
-                keys = photon_doors[(pair, (0, 0), rows)][1]
-
-                def parent(weight, t, ref, halves, current, L=L, R=R):
-                    left = jax.lax.slice_in_dim(psi_mun[L], 2 * halves[0], 2 * halves[0] + 2, axis=1)
-                    right = jax.lax.slice_in_dim(psi_nmu[R], 2 * halves[1], 2 * halves[1] + 2, axis=2)
-                    weight, t = oriented(weight, t)
-                    return build_G_tau(left, right, enk_full, t, e_ref=ref, band_weight=weight,
-                                       layout=layout, gemm=g_plan, k_unfold_plan=half_plans[L],
-                                       unfold=False, real_weights=False if direct else None)
-                # The previous pair's rows finish before this pair's Greens.
-                state, lower_w, upper_w = jax.lax.optimization_barrier(
-                    (state, lower_weight, upper_weight))
-                acc = jax.lax.with_sharding_constraint(jnp.zeros(
-                    (len(keys), nk, layout_p.carrier_extent(keys[0][0]),
-                     layout_p.carrier_extent(keys[0][1])), jnp.complex128), selected_shard)
-                acc = photon_planes(acc, pair, rows, parent, lower_w, upper_w, lower_time,
-                                    lower_ref, upper_time, upper_ref)
-                for c in range(len(keys)):
-                    # One channel plane's transform is live at a time.
-                    acc, state = jax.lax.optimization_barrier((acc, state))
-                    state = put(state, keys, chi_fftn(acc[c]), c)
-            return state
-
-        def photon_subtiles(carry):
-            """The four-current rule on every family pair's row passes (``gw.subtile_stream``).
-
+            ``orientations(time)`` lists a node's Green pairs ``(lower weight,
+            lower time, lower reference, upper weight, upper time, upper
+            reference)``; ``weights`` ``[2·len(orientations), n_out, n]`` weight
+            each pair's ``conj FT[A](q)`` and ``FT[A](-q)`` rows, in that order.
             Per family pair and pass, a node's planes: the pair's quadrant
             Greens on the pass's band-complete ψ rows of the left family and
             the right family's band-complete columns (one local GEMM each over
             the active bands, plus the antiunitary partners), the doors on
             the pass (:func:`photon_planes`), each channel plane's transform
-            and its ``conj FT[A](q)`` and ``FT[A](-q)`` rows.  The engine adds
-            them into their blocks of the packed carry.
+            and its two kept rows.  The engine adds them into their blocks of
+            the packed carry.
             """
             from .greens_function_kernel import green_right_operand
             from .photon_layout import FAMILY_PAIRS
@@ -1340,7 +1266,6 @@ def _get_chi_fractional_contour_kernel_face(
             rights = tuple(tuple(green_right_operand(jax.lax.slice_in_dim(
                 faces[f][1], 2 * g, 2 * g + 2, axis=2)) for g in (0, 1)) for f in (0, 1))
             px = int(mesh_xy.shape["x"])
-            count = live_count()
             for i_pair, (pair, plan) in enumerate(zip(FAMILY_PAIRS, photon_plans)):
                 L, R = pair
                 keys = photon_doors[(pair, (0, 0), plan.passes[0])][1]
@@ -1362,32 +1287,62 @@ def _get_chi_fractional_contour_kernel_face(
                                            k_unfold_plan=half_plans[L], unfold=False,
                                            prepared_active_gemm=photon_active[i_pair][p][int(current)],
                                            real_weights=False, right=rights[R][halves[1]])
-                    acc = jax.lax.with_sharding_constraint(
-                        jnp.zeros((len(keys), nk, px * xr, right_extent), jnp.complex128),
-                        selected_shard)
-                    acc = photon_planes(acc, pair, (x0, xr), parent, occ_f, occ_u, -time,
-                                        energy_reference[0], jnp.conj(time), energy_reference[1])
-                    planes = []
-                    for c in range(len(keys)):
-                        # One channel plane's transform is live at a time.
-                        acc, planes = jax.lax.optimization_barrier((acc, planes))
-                        value = chi_fftn(acc[c])
-                        planes.append(jnp.stack((
-                            jnp.conj(jnp.take(value, jnp.asarray(gather_q), axis=0)),
-                            jnp.take(value, jnp.asarray(reverse_q), axis=0))))
-                    return jax.lax.with_sharding_constraint(jnp.stack(planes), plane_shard)
-                carry = stream_passes(carry, mesh=mesh_xy, plan=plan, weights=projection_rows,
+                    planes = [[] for _ in keys]
+                    for lw, lt, lref, uw, ut, uref in orientations(time):
+                        # One orientation's planes are live at a time.
+                        planes, lw, uw = jax.lax.optimization_barrier((planes, lw, uw))
+                        acc = jax.lax.with_sharding_constraint(
+                            jnp.zeros((len(keys), nk, px * xr, right_extent), jnp.complex128),
+                            selected_shard)
+                        acc = photon_planes(acc, pair, (x0, xr), parent, lw, uw, lt, lref, ut, uref)
+                        for c in range(len(keys)):
+                            # One channel plane's transform is live at a time.
+                            acc, planes = jax.lax.optimization_barrier((acc, planes))
+                            value = chi_fftn(acc[c])
+                            planes[c] += [jnp.conj(jnp.take(value, jnp.asarray(gather_q), axis=0)),
+                                          jnp.take(value, jnp.asarray(reverse_q), axis=0)]
+                    return jax.lax.with_sharding_constraint(
+                        jnp.stack([jnp.stack(rows) for rows in planes]), plane_shard)
+                carry = stream_passes(carry, mesh=mesh_xy, plan=plan, weights=weights,
                                       count=count, node_rows=node_rows)
             return carry
 
-        def photon_order(value):
-            from .photon_layout import photon_family_order
-            return photon_family_order(value, photon, mesh_xy, P(None, "x", "y"))
+        def photon_stream(carry):
+            """This call's four-current rule (``pair_mode``) on the sub-tile engine, packed carry.
 
-        def photon_mix(value, sign):
-            """Canonical rows of ``FT[A + sign conj(A)]`` at ``gather_q`` from :func:`photon_rows`."""
-            ahead, behind = value
-            return photon_order(ahead + sign * jnp.conj(behind))
+            Each mode's contribution is a fixed combination of a Green pair's
+            rows ``r0 = conj FT[A](q)`` and ``r1 = FT[A](-q)``: direct ``w_f r0 +
+            w_r r1``; retarded ``-i P (r0 - r1)``; KMS static ``-P (r0 + r1)``;
+            Laplace, over the two occupation orientations ``i`` with ``s_0 = 1,
+            s_1 = -1``, ``sum_i [P_even s_i (r0 + r1) + P_odd (r0 - r1)]``.  The
+            carry crosses to the canonical layout once.
+            """
+            from .photon_layout import photon_carry_order
+            n_nodes = jnp.asarray(time_nodes.shape[0], jnp.int32)
+            if pair_mode == "direct":
+                weights, count = projection_rows, live_count()
+                orientations = lambda t: ((occ_f, -t, energy_reference[0],
+                                           occ_u, jnp.conj(t), energy_reference[1]),)
+            elif pair_mode == "retarded":
+                weights, count = jnp.stack((-1j * projection_rows, 1j * projection_rows)), n_nodes
+                orientations = lambda t: ((occ_f, -1j * t, energy_reference,
+                                           occ_u, -1j * t, energy_reference),)
+            elif pair_mode == "kms_static":
+                weights, count = jnp.stack((-projection_rows, -projection_rows)), n_nodes
+
+                def orientations(t):
+                    lower, upper, mu = kms_weights(t)
+                    return ((lower, 0., mu, upper, 0., mu),)
+            else:
+                half = projection_rows.shape[0] // 2
+                even, odd = projection_rows[:half], projection_rows[half:]
+                weights = jnp.stack((even + odd, even - odd, odd - even, -even - odd))
+                count = n_nodes
+                orientations = lambda t: tuple((occ_f[i], -t, energy_reference[0],
+                                                occ_u[i], t, energy_reference[1]) for i in (0, 1))
+            packed = photon_subtiles(photon_carry_order(carry, photon, mesh_xy, to_packed=True),
+                                     weights.astype(jnp.complex128), count, orientations)
+            return photon_carry_order(packed, photon, mesh_xy, to_packed=False)
 
         def retarded_correlation(time, lower=occ_f, upper=occ_u, reference=energy_reference):
             tau = jnp.asarray(1j, dtype=jnp.complex128) * time
@@ -1407,17 +1362,13 @@ def _get_chi_fractional_contour_kernel_face(
             # the metallic photon bank. This loop performs the same four
             # Green builds/FFTs and keeps only one pair plus two scalar-spin
             # contractions alive; it adds no nodes or transforms.
-            # A four-current correlation is its (q, -q) parent-row pair (photon_rows).
             initial = jax.lax.with_sharding_constraint(
-                jnp.zeros((nk if photon is None else q_count, n_mu, n_mu), jnp.complex128),
-                chi_R_shard)
-            initial = initial if photon is None else (initial, initial)
+                jnp.zeros((nk, n_mu, n_mu), jnp.complex128), chi_R_shard)
             def orientation(carry, index):
                 value = spin_correlation(occ_f[index], -time, energy_reference[0],
                                          occ_u[index], time, energy_reference[1])
                 even, odd = carry
-                return (jax.tree.map(lambda e, v: e + jnp.where(index == 0, v, -v), even, value),
-                        jax.tree.map(jnp.add, odd, value)), None
+                return (even + jnp.where(index == 0, value, -value), odd + value), None
             result, _ = jax.lax.scan(orientation, (initial, initial), jnp.arange(2), unroll=1)
             return result
 
@@ -1439,21 +1390,19 @@ def _get_chi_fractional_contour_kernel_face(
             return spin_correlation(lower, 0., mu, upper, 0., mu)
 
         def rows(value, q):
-            """The q rows of a transformed charge correlation (photon rows: :func:`photon_rows`)."""
+            """The q rows of a transformed charge correlation."""
             return jnp.take(value, jnp.asarray(q), axis=0)
 
         def selected(value):
             return rows(chi_fftn(value), gather_q)
 
         def add_laplace(accumulators, even, odd, projection):
-            contribution = (selected(even + jnp.conj(even)) if photon is None
-                            else photon_mix(even, 1))
+            contribution = selected(even + jnp.conj(even))
             if pair_mode == "laplace_ordered" or (pair_mode == "windowed" and physical):
                 half = projection.shape[0] // 2
                 return accumulate_selected(
                     accumulate_selected(accumulators, contribution, projection[:half]),
-                    selected(odd - jnp.conj(odd)) if photon is None else photon_mix(odd, -1),
-                    projection[half:])
+                    selected(odd - jnp.conj(odd)), projection[half:])
             return accumulate_selected(accumulators, contribution, projection)
 
         def window_body(accumulators, node):
@@ -1465,8 +1414,7 @@ def _get_chi_fractional_contour_kernel_face(
 
             def crossing(_):
                 return accumulate_selected(accumulators,
-                    selected(-1j * (value - jnp.conj(value))) if photon is None
-                    else -1j * photon_mix(value, -1), projection[:n_out])
+                    selected(-1j * (value - jnp.conj(value))), projection[:n_out])
 
             def remote(_):
                 return add_laplace(accumulators, value, value, projection)
@@ -1608,10 +1556,6 @@ def _get_chi_fractional_contour_kernel_face(
             else:
                 even, odd = laplace_correlation(time, occ_f, occ_u, energy_reference)
                 return add_laplace(accumulators, even, odd, projection), None
-            if photon is not None:
-                contribution = (-1j * photon_mix(A_R, -1) if pair_mode == "retarded"
-                                else -photon_mix(A_R, 1))
-                return accumulate_selected(accumulators, contribution, projection), None
             if selected_q is not None:
                 contribution = selected(-1j * (A_R - jnp.conj(A_R))
                     if pair_mode == "retarded" else -(A_R + jnp.conj(A_R)))
@@ -1625,13 +1569,8 @@ def _get_chi_fractional_contour_kernel_face(
             )
             return updated, None
 
-        if pair_mode == "direct" and photon is not None:
-            # The four-current stream adds each node's planes into the carry in
-            # the families' packed layout; the carry crosses layouts once per call.
-            from .photon_layout import photon_carry_order
-            final_R = photon_carry_order(
-                photon_subtiles(photon_carry_order(initial, photon, mesh_xy, to_packed=True)),
-                photon, mesh_xy, to_packed=False)
+        if photon is not None:
+            final_R = photon_stream(initial)
         elif pair_mode == "direct" and subtile is not None:
             final_R = direct_subtiles(initial)
         elif pair_mode == "direct":

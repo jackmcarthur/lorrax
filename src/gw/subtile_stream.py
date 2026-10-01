@@ -158,16 +158,17 @@ def stream_passes(carry, *, mesh, plan, weights, count, node_rows):
     """``carry[o, q, μ, ν] += Σ_n Σ_s weights[s, o, n] node_rows(p, n)[s]`` over every pass ``p``.
 
     ``carry`` ``[n_out, q, μ, ν]`` at ``P(None, None, 'x', 'y')`` is updated in
-    place; ``weights`` ``[2, n_out, n_cap]``; ``count`` the live node prefix
-    (traced).  ``node_rows(p, n)`` returns pass ``p``'s ``[n_blocks, 2, q,
-    px*xr, ν_b]`` rows of node ``n`` at ``P(None, None, None, 'x', 'y')``,
+    place; ``weights`` ``[n_sets, n_out, n_cap]`` (the direct stream's two
+    orientations, or any fixed set of rows per node); ``count`` the live node
+    prefix (traced).  ``node_rows(p, n)`` returns pass ``p``'s ``[n_blocks,
+    n_sets, q, px*xr, ν_b]`` rows of node ``n`` at ``P(None, None, None, 'x', 'y')``,
     plane ``b`` landing in ``plan.blocks[b]``.  Nodes run in chunks of
     ``plan.chunk``; a chunk's nodes past ``count`` are not evaluated and add
     exact zeros.
     """
     from ffi.contour import contour_block_accumulate_local
     chunk = int(plan.chunk)
-    n_cap = int(weights.shape[-1])
+    n_sets, n_cap = int(weights.shape[0]), int(weights.shape[-1])
     n_chunks_cap = -(-n_cap // chunk)
     weights = jnp.pad(weights, ((0, 0), (0, 0), (0, n_chunks_cap * chunk - n_cap)))
     n_chunks = ((count + chunk - 1) // chunk).astype(jnp.int32)
@@ -204,10 +205,10 @@ def stream_passes(carry, *, mesh, plan, weights, count, node_rows):
             # rematerialized after the counter's in-place increment.
             w = jax.lax.optimization_barrier(
                 jax.lax.dynamic_slice_in_dim(weights, c * chunk, chunk, axis=2))
-            projection = jnp.transpose(w, (2, 0, 1)).reshape(2 * chunk, -1)
+            projection = jnp.transpose(w, (2, 0, 1)).reshape(n_sets * chunk, -1)
             for b, block in enumerate(plan.blocks):
-                # [chunk, b, 2, q, m, n] -> terms in node order, forward then reverse.
-                plane = rows[:, b].reshape((2 * chunk,) + rows.shape[3:])
+                # [chunk, b, s, q, m, n] -> terms in node order, then row-set order.
+                plane = rows[:, b].reshape((n_sets * chunk,) + rows.shape[3:])
                 acc = block_add(acc, plane, projection, block)
             return c + 1, acc
 
