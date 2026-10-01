@@ -212,8 +212,7 @@ def _direct_pass_plan(mesh_xy, kgrid, plan, *, n_rmu, ns, n_band, q_count, n_nod
     Per local row: the two parent Greens and their antiunitary partners
     ``16·n_parent·ns·(ν·ns)`` each, the door's R-space output and its
     transform ``2·16·nk·ν``, the pass's ψ rows ``16·n_parent·ns·n_band``, and
-    the chunk's kept rows ``2·16·chunk·q·ν``; per node on the whole tile,
-    ``2·16·q·μ·ν``.  ``ν = n_rmu/p_y``, ``μ = n_rmu/p_x``.
+    the chunk's kept rows ``2·16·chunk·q·ν``.  ``ν = n_rmu/p_y``.
     """
     from .greens_function_kernel import has_antiunitary_rows
     from .subtile_stream import plan_passes
@@ -221,9 +220,9 @@ def _direct_pass_plan(mesh_xy, kgrid, plan, *, n_rmu, ns, n_band, q_count, n_nod
            int(q_count), int(n_nodes))
     if key in _PASS_PLANS:
         return _PASS_PLANS[key]
-    px, py = int(mesh_xy.shape["x"]), int(mesh_xy.shape["y"])
+    py = int(mesh_xy.shape["y"])
     nk, n_parent = int(np.prod(kgrid)), int(plan.n_parent)
-    nu, mu = int(n_rmu) // py, int(n_rmu) // px
+    nu = int(n_rmu) // py
     greens = 4 if has_antiunitary_rows(plan) else 2
 
     def row_bytes(chunk):
@@ -232,7 +231,7 @@ def _direct_pass_plan(mesh_xy, kgrid, plan, *, n_rmu, ns, n_band, q_count, n_nod
     while len(_PASS_PLANS) >= 4:
         _PASS_PLANS.pop(next(iter(_PASS_PLANS)))
     _PASS_PLANS[key] = plan_passes(plan.unfold_load_tables(), mesh_xy, ns=ns, row_bytes=row_bytes,
-                                   chunk_bytes=2 * 16 * int(q_count) * mu * nu, n_nodes=n_nodes)
+                                   n_nodes=n_nodes)
     return _PASS_PLANS[key]
 
 
@@ -266,8 +265,7 @@ def _photon_pass_plans(mesh_xy, kgrid, families, half_plans, *, n_band, q_count,
     partners ``16·n_parent·2·(ν·2)`` each, the door's channel planes in R and
     one plane's transform ``16·(n_ch + 1)·nk·ν``, the pass's ψ rows
     ``16·n_parent·4·n_band``, and the chunk's kept rows
-    ``2·16·chunk·q·ν·n_ch``; per node on the whole tile, ``2·16·q·μ·ν·n_ch``.
-    ``ν = c_R/p_y``, ``μ = c_L/p_x``.  The blocks place each channel plane
+    ``2·16·chunk·q·ν·n_ch``.  ``ν = c_R/p_y``.  The blocks place each channel plane
     ``(A, B)`` in the packed photon layout.
     """
     from .greens_function_kernel import has_antiunitary_rows
@@ -284,7 +282,6 @@ def _photon_pass_plans(mesh_xy, kgrid, families, half_plans, *, n_band, q_count,
     for L, R in FAMILY_PAIRS:
         keys = tuple((A, B) for A in family_channels(L) for B in family_channels(R))
         n_ch = len(keys)
-        mu = layout.carrier_extent(keys[0][0]) // px
         nu = layout.carrier_extent(keys[0][1]) // py
         greens = 4 if has_antiunitary_rows(half_plans[L]) else 2
 
@@ -297,9 +294,8 @@ def _photon_pass_plans(mesh_xy, kgrid, families, half_plans, *, n_band, q_count,
                        for A, B in keys)
         tables = half_plans[L].unfold_load_tables(
             right_plan=None if half_plans[R] is half_plans[L] else half_plans[R])
-        plans.append(plan_passes(tables, mesh_xy, ns=2, row_bytes=row_bytes,
-                                 chunk_bytes=2 * 16 * int(q_count) * mu * nu * n_ch,
-                                 n_nodes=n_nodes, blocks=blocks))
+        plans.append(plan_passes(tables, mesh_xy, ns=2, row_bytes=row_bytes, n_nodes=n_nodes,
+                                 blocks=blocks))
     while len(_PHOTON_PASS_PLANS) >= 4:
         _PHOTON_PASS_PLANS.pop(next(iter(_PHOTON_PASS_PLANS)))
     _PHOTON_PASS_PLANS[key] = tuple(plans)

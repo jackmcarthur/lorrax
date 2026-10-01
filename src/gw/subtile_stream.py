@@ -111,26 +111,28 @@ class PassPlan:
     blocks: tuple = (Block(),)
 
 
-def plan_passes(tables, mesh, *, ns, row_bytes, chunk_bytes, n_nodes, blocks=(Block(),)):
+def plan_passes(tables, mesh, *, ns, row_bytes, n_nodes, blocks=(Block(),)):
     """Row passes and the node chunk from :data:`runtime.tiles.TILE_BYTES` and shapes.
 
-    ``chunk_bytes`` are one node's kept rows on the whole local tile, so a
-    chunk of nodes fits one tile; ``row_bytes(chunk)`` is one local row's
-    live set at that chunk (the two operands, the door's R-space output and
-    its transform, the chunk's kept rows), so a pass fits one tile.  Passes
-    split at the nearest orbit cuts (:func:`row_passes`); a rank whose rows
-    are one orbit keeps one pass.  ``blocks`` (:class:`Block`) place a
-    node's planes in the carry.
+    ``row_bytes(chunk)`` is one local row's live set at a node chunk (the two
+    operands, the door's R-space output and its transform, the chunk's kept
+    rows), affine in the chunk.  The rows are sized at a chunk of one node, so
+    a tile that holds every row at one node is one pass; the chunk then takes
+    what the widest pass leaves of the tile.  Passes split at the nearest
+    orbit cuts (:func:`row_passes`); a rank whose rows are one orbit keeps one
+    pass.  ``blocks`` (:class:`Block`) place a node's planes in the carry.
     """
-    from runtime.tiles import tile_units
+    from runtime.tiles import TILE_BYTES, tile_units
     side = int(mesh.shape["x"])
     local_rows = int(np.asarray(tables.lsrc).shape[1]) // (side * int(ns))
-    chunk = tile_units(chunk_bytes, n_nodes)
-    rows = tile_units(row_bytes(chunk), local_rows)
+    rows = tile_units(row_bytes(1), local_rows)
     n_pass = -(-local_rows // rows)
     passes = row_passes(n_pass, local_rows, orbit_cuts(tables.lsrc, side, ns) if n_pass > 1 else ())
     if passes is None:
         passes = ((0, local_rows),)
+    widest = max(xr for _, xr in passes)
+    fixed, per_node = row_bytes(0), row_bytes(1) - row_bytes(0)
+    chunk = max(1, min(int(n_nodes), int((TILE_BYTES - widest * fixed) // max(widest * per_node, 1))))
     return PassPlan(passes=passes, chunk=int(chunk), blocks=tuple(blocks))
 
 
