@@ -3,6 +3,22 @@
 User-visible changes, newest first. Binding rulings behind the breaking
 changes live in `docs/architecture/decisions.md`.
 
+## 2026-09-30 — one MPI per process; CPU runs no longer hang in MPI_Init
+
+Before it loads a sealed bundle's private SLATE closure, the native loader
+(`lxkit.native_provider`) now loads the machine libraries that closure needs
+from the directories the FFI leg's own DT_RPATH names: on Perlmutter, LibSci
+25.09 and cray-mpich 9.0.1. Before, the private `libblaspp.so.2`, opened by
+path, found the site-default LibSci 26.03 through `/opt/cray/pe/lib64`, and that
+LibSci links cray-mpich 9.1.0. Every process then mapped two MPIs. A CPU run,
+whose JAX MPI collectives had already started 9.0.1, hung in phdf5's
+`MPI_Init`. GPU runs did all FFI and HDF5 MPI on 9.1.0; they now use 9.0.1, the
+MPI the legs were built against, and results are bitwise (hsuite P4, Fe 4³
+scalar SC maps 0–2). The one-MPI check now also sees `libmpi_gnu.so`
+(cray-mpich ≥ 9.1) and refuses two MPIs by name. Each process prints one line,
+`[lorrax native] rank=<r> mpi=<path>`. No deck or environment change is needed.
+Remove any `LD_LIBRARY_PATH` LibSci 25.09 workaround.
+
 ## 2026-09-30 — SUMMA panel loops accumulate in place
 
 When its loop has three or more band panels, `distrib_la.panel_matmul` now adds

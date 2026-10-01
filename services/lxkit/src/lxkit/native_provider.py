@@ -27,8 +27,10 @@ from __future__ import annotations
 import ctypes
 import hashlib
 import json
+import mmap
 import os
 import re
+import struct
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -466,7 +468,11 @@ def _actual_symbol_origin(lib: ctypes.CDLL, symbol: str) -> Path:
     return Path(os.fsdecode(info.dli_fname)).resolve()
 
 
-_MPI_RUNTIME_BASENAME = re.compile(r"^libmpi(?:_gnu_[0-9]+)?[.]so(?:[.]|$)")
+# libmpi.so, libmpi_gnu.so (cray-mpich >= 9.1) or libmpi_gnu_<N>.so: the
+# pattern of src/ffi/cpp/gate_one_mpi.sh.  Without the bare libmpi_gnu form a
+# LibSci 26.03 pulled in beside cray-mpich 9.0.1 mapped a second MPI unseen,
+# and a CPU run hung in its second MPI_Init.
+_MPI_RUNTIME_BASENAME = re.compile(r"^libmpi(?:_gnu(?:_[0-9]+)?)?[.]so(?:[.]|$)")
 
 
 def _mapped_paths() -> set[Path]:
@@ -491,6 +497,12 @@ def assert_one_mapped_mpi_runtime(*,
             "more than one MPI runtime is mapped after loading the native "
             "provider; MPI communicators from different runtimes are "
             f"incompatible: {sorted(str(p) for p in paths)}")
+    if ("mpi", "") not in _ANNOUNCED:
+        _ANNOUNCED.add(("mpi", ""))
+        rank = os.environ.get("SLURM_PROCID", os.environ.get("PMI_RANK", "?"))
+        print(f"[lorrax native] rank={rank} mpi="
+              f"{next(iter(paths)) if paths else 'none'}",
+              file=sys.stderr, flush=True)
 
 
 def _attest_private_mapping(att: BundleAttestation,
@@ -527,6 +539,89 @@ def _attest_private_mapping(att: BundleAttestation,
         _refuse_runtime_owned(path, unusable_cls)
 
 
+_DT_NEEDED, _DT_RPATH, _DT_RUNPATH = 1, 15, 29
+
+
+def _elf_dynamic(path: Path) -> dict[int, list[str]]:
+    """DT_NEEDED / DT_RPATH / DT_RUNPATH strings of an ELF64 little-endian
+    shared object; empty for anything else (the pin below is then a no-op)."""
+    tags: dict[int, list[str]] = {}
+    with open(path, "rb") as fh, mmap.mmap(fh.fileno(), 0,
+                                           access=mmap.ACCESS_READ) as m:
+        if m[:4] != b"\x7fELF" or m[4] != 2 or m[5] != 1:
+            return tags
+        shoff, = struct.unpack_from("<Q", m, 0x28)
+        shentsize, shnum = struct.unpack_from("<HH", m, 0x3A)
+        sections = [struct.unpack_from("<4xI16xQQI", m, shoff + i * shentsize)
+                    for i in range(shnum)]          # (type, offset, size, link)
+        for sh_type, offset, size, link in sections:
+            if sh_type != 6:                        # SHT_DYNAMIC
+                continue
+            strtab = sections[link][1]
+            for j in range(size // 16):
+                tag, val = struct.unpack_from("<qQ", m, offset + 16 * j)
+                if tag == 0:
+                    break
+                if tag in (_DT_NEEDED, _DT_RPATH, _DT_RUNPATH):
+                    end = m.find(b"\0", strtab + val)
+                    tags.setdefault(tag, []).append(
+                        m[strtab + val:end].decode("utf-8", "replace"))
+    return tags
+
+
+def _leg_pinned_machine_libraries(att: BundleAttestation) -> list[Path]:
+    """The machine libraries of the private closure, as its leg resolves them.
+
+    A private provider loaded by absolute path resolves its own machine
+    dependencies (LibSci, MPI) through ITS DT_RPATH and then LD_LIBRARY_PATH,
+    not through the leg that needs it.  B3's SLATE carries no LibSci path, so
+    ``libsci_gnu_mpi_mp.so.6`` came from /opt/cray/pe/lib64 (the site-default
+    LibSci 26.03, linking cray-mpich 9.1.0) while the host leg's DT_RPATH
+    names LibSci 25.09 and cray-mpich 9.0.1: two MPIs in one process, and a
+    CPU run hung in its second MPI_Init.  So every machine library reachable
+    from a leg's private closure that the leg's DT_RPATH resolves is loaded
+    first, from that path, dependencies first: what ld.so would map had the
+    leg been opened before its providers.  A leg with DT_RUNPATH pins nothing
+    (LD_LIBRARY_PATH precedes it).
+    """
+    private = {p.name: p for p in att.private_libraries}
+    order: list[Path] = []
+    pinned: set[str] = set()
+    for leg in att.libraries.values():
+        leg_tags = _elf_dynamic(leg)
+        if _DT_RUNPATH in leg_tags:
+            continue
+        dirs = [Path(d.replace("${ORIGIN}", str(leg.parent))
+                     .replace("$ORIGIN", str(leg.parent)))
+                for entry in leg_tags.get(_DT_RPATH, []) for d in entry.split(":") if d]
+        dirs = [d for d in dirs if not d.is_relative_to(att.bundle_root)]
+        tried: set[str] = set()
+
+        def visit(name: str) -> None:
+            if name in tried or name in pinned or name in private:
+                return
+            tried.add(name)
+            hit = next((d / name for d in dirs if (d / name).is_file()), None)
+            if hit is None:
+                return
+            for dep in _elf_dynamic(hit).get(_DT_NEEDED, []):
+                visit(dep)
+            pinned.add(name)
+            order.append(hit)
+
+        closure, todo = set(), list(leg_tags.get(_DT_NEEDED, []))
+        while todo:
+            name = todo.pop()
+            if name in private and name not in closure:
+                closure.add(name)
+                todo.extend(_elf_dynamic(private[name]).get(_DT_NEEDED, []))
+        for path in att.private_libraries:
+            if path.name in closure:
+                for dep in _elf_dynamic(path).get(_DT_NEEDED, []):
+                    visit(dep)
+    return order
+
+
 def _preload_private_closure(att: BundleAttestation,
                              unusable_cls: Type[OSError]) -> None:
     """Load exact private providers in manifest order, once per bundle.
@@ -534,12 +629,20 @@ def _preload_private_closure(att: BundleAttestation,
     This is what makes the bundle self-localizing without teaching a module or
     run script an ``LD_LIBRARY_PATH``.  The sealer's ``--private-lib`` order is
     dependency-first; each absolute load publishes that provider's SONAME for
-    the next library and, finally, the FFI leg.  Handles stay alive for the
-    process lifetime.
+    the next library and, finally, the FFI leg.  The machine libraries the
+    legs pin on their DT_RPATH go first (``_leg_pinned_machine_libraries``).
+    Handles stay alive for the process lifetime.
     """
     if att.bundle_id in _PRIVATE_HANDLES:
         return
     handles: list[ctypes.CDLL] = []
+    for path in _leg_pinned_machine_libraries(att):
+        try:
+            handles.append(ctypes.CDLL(str(path), mode=ctypes.RTLD_GLOBAL))
+        except OSError as exc:
+            raise unusable_cls(
+                f"machine library {path}, pinned on a sealed leg's DT_RPATH, "
+                f"could not be loaded: {exc}") from exc
     for path in att.private_libraries:
         try:
             handles.append(ctypes.CDLL(str(path), mode=ctypes.RTLD_GLOBAL))
