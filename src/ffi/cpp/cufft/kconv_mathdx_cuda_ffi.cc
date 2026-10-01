@@ -2119,10 +2119,11 @@ static ffi::Error build(int mode, int nkx, int nky, int nkz, int ns, bool f32,
         } else {
             // Split arm: plane tiles of kplan.tr (16) columns, whole spin groups; the group pencil
             // reduces by warp shuffles and stages nothing.  Both passes run 16 warps per SM under a
-            // 128-register bound when the pencil's x-line (4*nkx registers) leaves room (nkx <= 20,
-            // no vertices; ptxas sm_80 at the bound: 20^3 ns 2 no spill, 30^3 464 B and the vertex
-            // pencil 444 B of spill): two 256-thread blocks where two tiles fit the SM's shared
-            // memory, with the carveout that holds them and the rest left to L1; else one
+            // 128-register bound when the pencil's x-line (4*nkx registers) leaves room: nkx <= 20,
+            // or <= 12 with vertices (ptxas sm_80 at the bound: 20^3 ns 2 and the vertex pencil at
+            // 12^3 no spill; 30^3 464 B, the vertex pencil 60 B at 14^3 and 444 B at 20^3; past them
+            // one 256-thread block per SM).  Two 256-thread blocks where two tiles fit the SM's
+            // shared memory, with the carveout that holds them and the rest left to L1; else one
             // 512-thread block (one 16-column tile per SM: two 8-column tiles ran the plane pass
             // 1.17x slower, and a carveout of 100 cost 1.10x, ncu at 20^3: a tile's pairs share
             // their tables in L1).  At 256 threads and one block the 108 KB tile (20^3) and the
@@ -2132,7 +2133,7 @@ static ffi::Error build(int mode, int nkx, int nky, int nkz, int ns, bool f32,
                            "shared memory per SM");
             LRX_CUDA_CHECK(cudaDeviceGetAttribute(&smem_rsv, cudaDevAttrReservedSharedMemoryPerBlock, dev),
                            "reserved shared memory per block");
-            const bool wide = nkx <= 20 && !(variant & 2);
+            const bool wide = nkx <= ((variant & 2) ? 12 : 20);
             chi_trc = kplan.tr;
             chi_smem = static_cast<long long>(chi_trc) * g.pr() * 16;
             chi_smem2 = 0;
