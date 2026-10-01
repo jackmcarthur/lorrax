@@ -83,7 +83,7 @@ assumes. Under time reversal the two are equal and the default trace is kept.
 | `pair_mode` | caller | output |
 |---|---|---|
 | `retarded` | `compute_chi0_contour_fractional` (MPA metal samples on damped lines) | n_z arrays (N_k, N_μ, N_μ) at `P(None, 'x', 'y')` |
-| `direct` | the shared-pole response bank | selected q rows at `P(None, None, 'x', 'y')`; the donated accumulator [sample, q, μ_X, μ_Y] is carried across sample groups |
+| `direct` | the shared-pole response bank | selected q rows at `P(None, None, 'x', 'y')`; the donated accumulator [sample, q, μ_X, μ_Y] is carried across sample groups, or (streamed bank) one row pass's [sample, q, rows, μ_Y] per program, written to `file_io.streamed_bank` |
 | `laplace_ordered`, `kms_static` | the photon bank's static contact, rebuilt every map | one selected q row |
 
 In `direct` mode each complex node t is one Green pair

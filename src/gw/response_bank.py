@@ -380,7 +380,7 @@ def photon_static_contact(wfns, meta, *, mesh_xy, layout, vertex,
     return pi_grid, drude, contact
 
 
-@lru_cache(maxsize=16)
+@lru_cache(maxsize=64)
 def _response_stream_kernel(mesh_xy, kgrid, n_outputs, shape, *, _ffi_key, **options):
     """Cache programs, never state arrays; window data remain dynamic inputs."""
     from .w_isdf import _get_chi_fractional_contour_kernel_face
@@ -390,7 +390,7 @@ def _response_stream_kernel(mesh_xy, kgrid, n_outputs, shape, *, _ffi_key, **opt
 
 def response_stream(wfns, meta, *, mesh_xy, q_ids, n_outputs,
                     pair_mode="retarded", bank_carry=False, ordered=False,
-                    vertex=None, band_ranges=None):
+                    vertex=None, band_ranges=None, stream_pass=None):
     """Bind the existing one-particle Green/FFT primitive to a q batch.
 
     Returns a jitted kernel and its fixed ψ/energy arguments. Caller supplies
@@ -398,6 +398,8 @@ def response_stream(wfns, meta, *, mesh_xy, q_ids, n_outputs,
     ``[len(q_ids), n_outputs, mu_p, mu_p]`` with both endpoints sharded.
     ``ordered`` (time reversal measured broken) returns the physical
     orientation ``chi_q = FT_q[chi]`` that Sigma's contraction assumes.
+    ``stream_pass`` runs one row pass of the charge direct stream into that
+    pass's carry (the streamed bank, :func:`integrate_response_group`).
     """
     from ffi import ffi_dial_key
 
@@ -428,7 +430,8 @@ def response_stream(wfns, meta, *, mesh_xy, q_ids, n_outputs,
         mesh_xy, (meta.nkx, meta.nky, meta.nkz), n_outputs,
         (nk, int(wfns.slices.nb_full), n, int(meta.nspinor)),
         k_unfold_plan=parent, _ffi_key=ffi_dial_key(), layout=wfns.layout, selected_q=tuple(q_ids),
-        pair_mode=pair_mode, bank_carry=bank_carry, ordered=ordered, band_ranges=band_ranges)
+        pair_mode=pair_mode, bank_carry=bank_carry, ordered=ordered, band_ranges=band_ranges,
+        **({} if stream_pass is None else dict(stream_pass=int(stream_pass))))
     return kernel, (source.psi_mun, source.psi_nmu, source.enk)
 
 
@@ -1326,21 +1329,37 @@ def _group_zeros(mesh_xy, shape):
 
 
 def integrate_response_group(wfns, meta, mesh_xy, rules, group, *, q_ids,
-                             execute, receipt, ordered=False, vertex=None):
-    """Donated [value/ds per member, q, mu_X, nu_Y]; one Green/FFT scan per group."""
+                             execute, receipt, ordered=False, vertex=None, bank=None, outputs=()):
+    """Donated [value/ds per member, q, mu_X, nu_Y]; one Green/FFT scan per group.
+
+    With a streamed ``bank`` (``file_io.streamed_bank``) the scan runs one row
+    pass at a time into that pass's carry, and each finished pass goes to the
+    bank (carry row ``r`` as bank output ``o`` for ``(r, o)`` in ``outputs``)
+    while the next pass computes; nothing is returned.
+    """
     times, weights = _group_stream_arguments(rules, group)
     n = meta.mu_basis.n_packed if vertex is None else vertex.n
+    common = (jnp.asarray(times), jnp.asarray(weights))
+    tail = (stream_weights(wfns, rules["f"], mesh_xy), stream_weights(wfns, rules["u"], mesh_xy),
+            jnp.asarray(rules["refs"]))
+    scratch = _stream_scratch(wfns, meta, mesh_xy, vertex)
+    receipt["correlation_count"] += int(group["count"])
+    if bank is not None:
+        px = int(mesh_xy.shape["x"])
+        for p, (_, xr) in enumerate(bank.passes):
+            kernel, fixed = response_stream(wfns, meta, mesh_xy=mesh_xy, q_ids=q_ids,
+                n_outputs=weights.shape[1], pair_mode="direct", bank_carry=True, ordered=ordered,
+                band_ranges=rules["band_ranges"], stream_pass=p)
+            raw = _group_zeros(mesh_xy, (weights.shape[1], len(q_ids), px * xr, n))()
+            raw = execute(kernel, common + tuple(fixed) + tail + (raw,), "direct", runtime_bytes=scratch)
+            bank.put(p, raw, outputs)
+            del raw
+        return None
     kernel, fixed = response_stream(wfns, meta, mesh_xy=mesh_xy,
         q_ids=q_ids, n_outputs=weights.shape[1], pair_mode="direct", bank_carry=True,
         ordered=ordered, vertex=vertex, band_ranges=rules["band_ranges"])
     raw = _group_zeros(mesh_xy, (weights.shape[1],len(q_ids),n,n))()
-    args = (jnp.asarray(times), jnp.asarray(weights), *fixed,
-        stream_weights(wfns, rules["f"], mesh_xy), stream_weights(wfns, rules["u"], mesh_xy),
-        jnp.asarray(rules["refs"]), raw)
-    raw = execute(kernel, args, "direct",
-                  runtime_bytes=_stream_scratch(wfns, meta, mesh_xy, vertex))
-    receipt["correlation_count"] += int(group["count"])
-    return raw
+    return execute(kernel, common + tuple(fixed) + tail + (raw,), "direct", runtime_bytes=scratch)
 
 
 def _stream_executable(wfns, meta, mesh_xy, support, *, q_ids, n_outputs, ordered, vertex):
@@ -1452,6 +1471,33 @@ def response_group_size(meta, mesh_xy, *, n_samples, carry_per_sample, stream_wo
     return size, fixed, device_room, int(device_budget_bytes()) - device_room
 
 
+def response_bank_residence(meta, *, passes, n_samples, carry_per_sample, group_size, host_reserved=0):
+    """Where this map's χ bank (value and slope of every sample) lives.
+
+    The rule of the shared-pole bank (``shared_pole_screening._bank_residence``):
+    on the devices when every sample fits one group (``group_size``, from the
+    capacity ledger and the compiled stream); otherwise streamed, the stream
+    running once with every sample and each row pass written out
+    (``file_io.streamed_bank``): to host memory when the bank takes at most
+    half of this process's host budget beside ``host_reserved`` (a host-tier
+    W bank), else to per-rank files.  A stream without the row-pass engine
+    (``passes`` ``None``: the photon stream, the full-k Green route) keeps
+    sample groups on the devices.  Every rank computes the same answer.
+    Returns ``(residence, receipt)``.
+    """
+    from common.gpu_utils import host_bytes_per_process
+    total = int(n_samples) * int(carry_per_sample)
+    receipt = dict(bytes_per_rank=total, group_size=int(group_size))
+    if int(group_size) >= int(n_samples):
+        return "device", dict(receipt, reason="every sample fits one group on the devices")
+    if passes is None:
+        return "device", dict(receipt, reason="no row-pass engine on this stream; sample groups")
+    receipt["half_host_budget_bytes_per_rank"] = int(host_bytes_per_process()) // 2 - int(host_reserved)
+    if total <= receipt["half_host_budget_bytes_per_rank"]:
+        return "host", dict(receipt, reason="streamed; fits half the host budget")
+    return "file", dict(receipt, reason="streamed; exceeds half the host budget")
+
+
 def produce_sample_bank(wfns, meta, config, *, mesh_xy, sym, sample_plan, bank_io,
                         vertex=None, contact=None, direct_head=None, print_fn=print):
     """Stage A: integrate value and derivative together, one frequency at a time.
@@ -1561,38 +1607,74 @@ def produce_sample_bank(wfns, meta, config, *, mesh_xy, sym, sample_plan, bank_i
             mesh_xy=mesh_xy,n=n,photon=vertex is not None)
         support = response_support(wfns, meta, sample_plan, receipt, print_fn=print_fn)
         ledger.live_stages = ambient
-        # Price the stream once at "every sample in one group"; the compiled
-        # temporaries do not grow with the group, only the donated carry does.
-        workspace, whole = _stream_workspace(wfns, meta, mesh_xy, support, q_ids=response_rows,
-            n_outputs=2*len(z), ordered=ordered, vertex=vertex)
+        passes = _direct_passes(wfns, meta, mesh_xy, len(response_rows)) if vertex is None else None
         chosen = (0, 0) if selection is None else (selection_resident, selection_workspace)
-        with timing.section('bank.plan.direct'):
-            group_size, fixed, room, live = response_group_size(meta, mesh_xy, n_samples=len(z),
-                carry_per_sample=carry_per_sample, stream_workspace=workspace,
-                selection=chosen)
-        # The chosen group's executable, checked before it runs
-        # (runtime.aot_memory.check_chunk): the carry is a donated argument
-        # the caller allocates, the mode-11 scratch a run-time draw.
-        from runtime.aot_memory import check_chunk
-        from common.gpu_utils import record_stage_price
-        scratch = _stream_scratch(wfns, meta, mesh_xy, vertex)
-        with timing.section('bank.memcheck.direct'):
-            check = check_chunk(
-                group_size, stage="response direct stream",
-                build=lambda g: _stream_executable(wfns, meta, mesh_xy, support,
-                    q_ids=response_rows, n_outputs=2*g, ordered=ordered, vertex=vertex),
-                compiled=whole if group_size == len(z) else None,
-                fixed=fixed, per_unit=carry_per_sample, room=room,
-                extra=lambda g, _: g*carry_per_sample + scratch)
-        group_size = check.chunk
-        record_stage_price(f"response direct stream, group {group_size}/{len(z)}",
-                           live + check.price, section="bank.dispatch.direct")
-        receipt["group_check"] = dict(chunk=check.chunk, analytic=check.analytic,
-            compiled=check.compiled_bytes, price=check.price, live=live, room=room,
-            recompiled=check.recompiled, seconds=check.seconds)
-        del whole, check
+        if passes is not None and len(z)*carry_per_sample > ledger.room_bytes_per_rank(ambient):
+            # Every sample's carry alone exceeds the room: no group of all of
+            # them can fit, so the stream is not compiled whole to learn it.
+            group_size = 0
+        else:
+            # Price the stream once at "every sample in one group"; the compiled
+            # temporaries do not grow with the group, only the donated carry does.
+            workspace, whole = _stream_workspace(wfns, meta, mesh_xy, support, q_ids=response_rows,
+                n_outputs=2*len(z), ordered=ordered, vertex=vertex)
+            with timing.section('bank.plan.direct'):
+                group_size, fixed, room, live = response_group_size(meta, mesh_xy, n_samples=len(z),
+                    carry_per_sample=carry_per_sample, stream_workspace=workspace,
+                    selection=chosen)
+        host_reserved = (bank_io["path"].payload_bytes_per_rank()
+                         if getattr(bank_io["path"], "memory_kind", None) == "host" else 0)
+        residence, residence_receipt = response_bank_residence(
+            meta, passes=passes, n_samples=len(z), carry_per_sample=carry_per_sample,
+            group_size=group_size, host_reserved=host_reserved)
+        if residence == "device":
+            # The chosen group's executable, checked before it runs
+            # (runtime.aot_memory.check_chunk): the carry is a donated argument
+            # the caller allocates, the mode-11 scratch a run-time draw.
+            from runtime.aot_memory import check_chunk
+            from common.gpu_utils import record_stage_price
+            scratch = _stream_scratch(wfns, meta, mesh_xy, vertex)
+            with timing.section('bank.memcheck.direct'):
+                check = check_chunk(
+                    group_size, stage="response direct stream",
+                    build=lambda g: _stream_executable(wfns, meta, mesh_xy, support,
+                        q_ids=response_rows, n_outputs=2*g, ordered=ordered, vertex=vertex),
+                    compiled=whole if group_size == len(z) else None,
+                    fixed=fixed, per_unit=carry_per_sample, room=room,
+                    extra=lambda g, _: g*carry_per_sample + scratch)
+            if check.chunk < len(z) and passes is not None:
+                residence, residence_receipt = response_bank_residence(
+                    meta, passes=passes, n_samples=len(z), carry_per_sample=carry_per_sample,
+                    group_size=check.chunk, host_reserved=host_reserved)
+        if residence == "device":
+            group_size = check.chunk
+            record_stage_price(f"response direct stream, group {group_size}/{len(z)}",
+                               live + check.price, section="bank.dispatch.direct")
+            receipt["group_check"] = dict(chunk=check.chunk, analytic=check.analytic,
+                compiled=check.compiled_bytes, price=check.price, live=live, room=room,
+                recompiled=check.recompiled, seconds=check.seconds)
+            del check
+        else:
+            # Streamed: one group of every sample; the devices hold one row
+            # pass's carry being computed and one being written, then one
+            # sample's value and slope being read, unpacked and prefetched.
+            group_size = len(z)
+        whole = None
+        receipt["bank_residence"] = dict(residence_receipt, residence=residence)
         rules = response_quadrature(meta, sample_plan, receipt, support,
                                     group_size=group_size, print_fn=print_fn)
+        stream_bank = None
+        if residence != "device":
+            from file_io.streamed_bank import IN_FLIGHT, StreamedBank
+            # Slots: the largest rule group's members (empty slots add zeros nobody reads).
+            rules["slots"] = max(len(g["members"]) for g in rules["groups"])
+            py = int(mesh_xy.shape["y"])
+            pass_carry = 2*rules["slots"]*len(response_rows)*max(xr for _, xr in passes.passes)*(n//py)*16
+            stream_bank = StreamedBank(mesh_xy, root=bank_io["root"], label="chi",
+                kind=residence, n_out=2*len(z), q=len(response_rows), passes=passes.passes,
+                cols=n//py)
+            receipt["bank_residence"].update(stream_bank.receipt(),
+                device_bytes_per_rank=max(IN_FLIGHT*pass_carry, 3*carry_per_sample))
     # The group accumulator is all-P sharded. Dense work and slab I/O batch
     # the irreducible parents of one frequency, with their own admission.
     progress = LoopProgress(len(z), print_fn, title="response frequency integration",
@@ -1670,11 +1752,25 @@ def produce_sample_bank(wfns, meta, config, *, mesh_xy, sym, sample_plan, bank_i
                 progress.step()
             continue
         ledger.live_stages = ambient
-        name, _ = _reserve(meta, "bank_outputs", rules["slots"]*carry_per_sample)
+        name, _ = _reserve(meta, "bank_outputs", rules["slots"]*carry_per_sample if stream_bank is None
+                           else receipt["bank_residence"]["device_bytes_per_rank"])
         ledger.live_stages = ambient+(name,)
-        raw_group = integrate_response_group(wfns, meta, mesh_xy, rules, group,
-            q_ids=response_rows, execute=execute, receipt=receipt,
-            ordered=ordered, vertex=vertex)
+        if stream_bank is None:
+            raw_group = integrate_response_group(wfns, meta, mesh_xy, rules, group,
+                q_ids=response_rows, execute=execute, receipt=receipt,
+                ordered=ordered, vertex=vertex)
+            take = lambda row: raw_group[2*row:2*row+2]
+        else:
+            # Each pass's rows of every member go to the bank as they finish;
+            # each member's value and slope come back one ahead of its solve.
+            fresh = [(row, sample) for row, sample in enumerate(members) if not committed(sample)]
+            integrate_response_group(wfns, meta, mesh_xy, rules, group, q_ids=response_rows,
+                execute=execute, receipt=receipt, ordered=ordered, bank=stream_bank,
+                outputs=[(2*row+k, 2*sample+k) for row, sample in fresh for k in (0, 1)])
+            with timing.section('bank.stream_commit'):
+                stream_bank.commit()
+            raw_group = stream_bank.reader([(2*sample, 2*sample+2) for _, sample in fresh])
+            take = lambda row: next(raw_group)
         io_started = time.monotonic()
         # One collective writer transaction per group, not per sample.
         with shared_pole_bank_writer(bank_io["path"], meta=meta,
@@ -1684,7 +1780,7 @@ def produce_sample_bank(wfns, meta, config, *, mesh_xy, sym, sample_plan, bank_i
                 if committed(sample):
                     progress.step()
                     continue
-                raw = raw_group[2*row:2*row+2]
+                raw = take(row)
                 if p0 <= sample < p1:
                     # Select from W(z) itself, then act with the minus-q partner on
                     # the same directions; only the panels reach the bank.
@@ -1739,8 +1835,13 @@ def produce_sample_bank(wfns, meta, config, *, mesh_xy, sym, sample_plan, bank_i
                 progress.step()
             io_started = time.monotonic()
         receipt["seconds"]["io"] += time.monotonic()-io_started
-        del raw_group
+        del raw_group, take
     progress.finish()
+    if stream_bank is not None:
+        for key, value in stream_bank.seconds.items():
+            receipt["seconds"]["bank_" + key] = value
+        receipt["bank_residence"]["bounced_records"] = stream_bank.bounced
+        stream_bank.release()
     if jax.process_index() == 0:
         passes = _direct_passes(wfns, meta, mesh_xy, len(response_rows)) if vertex is None else None
         layout = ("" if passes is None else
@@ -1749,6 +1850,13 @@ def produce_sample_bank(wfns, meta, config, *, mesh_xy, sym, sample_plan, bank_i
         print_fn(f"Response quadrature: chi build {receipt['seconds'].get('direct_dispatch', 0.):.2f} s "
                  f"({len(rules['groups'])} group(s), {receipt['correlation_count']} node evaluations"
                  f"{layout}); bank write {receipt['seconds'].get('io', 0.):.2f} s", flush=True)
+        residence = receipt["bank_residence"]
+        print_fn(f"Response quadrature: chi bank {residence['residence']}, "
+                 f"{residence['bytes_per_rank'] / 2**30:.2f} GiB/rank; {residence['reason']}"
+                 + ("" if residence["residence"] == "device" else
+                    f"; write {receipt['seconds']['bank_write']:.2f} s, read "
+                    f"{receipt['seconds']['bank_read']:.2f} s, waited {receipt['seconds']['bank_wait']:.2f} s"),
+                 flush=True)
         print_fn("Response quadrature: seconds " + " ".join(
             f"{key}={value:.3f}" for key, value in receipt["seconds"].items()), flush=True)
     del roots
