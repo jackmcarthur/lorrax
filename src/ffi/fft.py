@@ -2184,7 +2184,7 @@ def make_kconv_chi_unfold(mesh: Mesh, kgrid, tables, *, n_out: int, complete: bo
 def make_kconv_chi_vertex(mesh: Mesh, kgrid, tables, *, left_vertices, right_vertices,
                           sign_c=None, norm: str | None = "ortho",
                           scratch_bytes: int | None = None) -> Callable:
-    """Mode 11 with channel vertices: ``fn(acc, Gv, Gc, Gvt=None, Gct=None) -> acc``.
+    """Mode 11 with channel vertices: ``fn(acc, Gv, Gc, Gvt=None, Gct=None, load=None) -> acc``.
 
     For channel ``ch = i*nb + j`` of the ``na = len(left_vertices)`` x
     ``nb = len(right_vertices)`` monomial vertices ``(perm, phase)``
@@ -2197,8 +2197,10 @@ def make_kconv_chi_vertex(mesh: Mesh, kgrid, tables, *, left_vertices, right_ver
     ``sign_c`` ``(nk,)`` real +-1, when given, multiplies Gc's unfolded k rows
     (a Dirac-half quadrant's own sign relative to ``tables``).  ``acc``
     ``(na*nb, nk, mu, nu)`` at ``P(None,None,'x','y')``, donated.  No full-k
-    Green exists.  CUDA: nvidia-mathdx mode 11 (LRX_VTX); cpu: the service's
-    reference composition.
+    Green exists.  ``load``, when given, is the same tables on the devices
+    (``symmetry_maps.device_load_tables``), read as operands so a consumer's
+    jit holds no table constants.  CUDA: nvidia-mathdx mode 11 (LRX_VTX); cpu:
+    the service's reference composition.
     """
     from symmetry_maps import apply_unfold_load_tables_local, local_unfold_load_tables
     kg = _check_kgrid(kgrid, kconv_backend(mesh))
@@ -2228,8 +2230,7 @@ def make_kconv_chi_vertex(mesh: Mesh, kgrid, tables, *, left_vertices, right_ver
     if kconv_backend(mesh) == "mathdx":
         _require_target(KCONV_CHI_VERTEX_TARGET, "CUDA")
 
-        def local(acc, gv, gc, gvt, gct, conj_src):
-            t = local_unfold_load_tables(tables)
+        def apply_tables(acc, gv, gc, gvt, gct, conj_src, t):
             budget = (int(scratch_bytes) if scratch_bytes is not None
                       else chi_unfold_scratch_bytes(kg, ns, int(gv.size) * 16))
             call = jax.ffi.ffi_call(KCONV_CHI_VERTEX_TARGET, jax.ShapeDtypeStruct(acc.shape, acc.dtype),
@@ -2249,8 +2250,7 @@ def make_kconv_chi_vertex(mesh: Mesh, kgrid, tables, *, left_vertices, right_ver
         pl, hl = perm_l.reshape(na, ns), codes[phase_l.reshape(na, ns)]
         pr, hr = perm_r.reshape(nb, ns), codes[phase_r.reshape(nb, ns)]
 
-        def local(acc, gv, gc, gvt, gct, conj_src):
-            t = local_unfold_load_tables(tables)
+        def apply_tables(acc, gv, gc, gvt, gct, conj_src, t):
             if conj_src:
                 gvt, gct = jnp.conj(gv), jnp.conj(gc)
             n_par, mx, _, my, _ = (int(v) for v in gv.shape)
@@ -2268,12 +2268,23 @@ def make_kconv_chi_vertex(mesh: Mesh, kgrid, tables, *, left_vertices, right_ver
                     planes.append(jnp.einsum("kxayb,ab,kxayb->kxy", jnp.conj(up), w, lower))
             return acc + jnp.stack(planes)
 
+    def local(acc, gv, gc, gvt, gct, conj_src):
+        return apply_tables(acc, gv, gc, gvt, gct, conj_src, local_unfold_load_tables(tables))
+
+    def local_dev(acc, gv, gc, gvt, gct, row, trs, lsrc, rsrc, mph, nph, spin, spin_r, conj_src):
+        return apply_tables(acc, gv, gc, gvt, gct, conj_src, tables._replace(
+            row=row, trs=trs, lsrc=lsrc, rsrc=rsrc, mph=mph, nph=nph, spin=spin, spin_r=spin_r))
+
+    from symmetry_maps import DEVICE_LOAD_SPECS
     g_spec, acc_spec = P(None, "x", None, "y", None), P(None, None, "x", "y")
     sm = {conj_src: _sharded(lambda a, gv, gc, gvt, gct, _c=conj_src: local(a, gv, gc, gvt, gct, _c),
                              mesh, (acc_spec, g_spec, g_spec, g_spec, g_spec), acc_spec)
           for conj_src in (False, True)}
+    sm_dev = {conj_src: _sharded(lambda a, gv, gc, gvt, gct, *t, _c=conj_src: local_dev(a, gv, gc, gvt, gct, *t, _c),
+                                 mesh, (acc_spec, g_spec, g_spec, g_spec, g_spec, *DEVICE_LOAD_SPECS), acc_spec)
+              for conj_src in (False, True)}
 
-    def fn(acc, Gv, Gc, Gvt=None, Gct=None):
+    def fn(acc, Gv, Gc, Gvt=None, Gct=None, load=None):
         _check_complex(acc, Gv, Gc)
         if Gv.ndim != 5 or int(Gv.shape[2]) != ns or int(Gv.shape[4]) != ns or Gc.shape != Gv.shape:
             raise ValueError(f"chi vertex expects Gv = Gc (n_parent, mu, {ns}, nu, {ns}); "
@@ -2282,11 +2293,14 @@ def make_kconv_chi_vertex(mesh: Mesh, kgrid, tables, *, left_vertices, right_ver
             raise ValueError(f"chi vertex: acc {acc.shape} is not ({n_ch}, {nk}, mu, nu)")
         if (Gvt is None) != (Gct is None):
             raise ValueError("chi vertex: pass both partners or neither")
-        if Gvt is None:
-            return sm[True](acc, Gv, Gc, Gv, Gc)
-        if Gvt.shape != Gv.shape or Gct.shape != Gv.shape:
+        conj_src = Gvt is None
+        if conj_src:
+            Gvt, Gct = Gv, Gc
+        elif Gvt.shape != Gv.shape or Gct.shape != Gv.shape:
             raise ValueError("chi vertex: the partners must match the Greens' shape")
-        return sm[False](acc, Gv, Gc, Gvt, Gct)
+        if load is None:
+            return sm[conj_src](acc, Gv, Gc, Gvt, Gct)
+        return sm_dev[conj_src](acc, Gv, Gc, Gvt, Gct, *load)
     return fn
 
 

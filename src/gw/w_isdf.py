@@ -273,8 +273,10 @@ def _photon_chi_doors(mesh_xy, kgrid, half_plans, parity, passes=None):
     count per family pair, 1 by default) splits each pair's local centroid rows
     into row passes at orbit cuts (:func:`photon_row_passes`): a pass's door
     reads only its own rows, so its parent Greens are built on those rows only.
-    Returns ``{(pair, (h, g), (x0, xr)): (door, keys)}``, ``(x0, xr) = None``
-    for one pass; refuses a pass count that no orbit cut admits.
+    Returns ``{(pair, (h, g), (x0, xr)): (door, keys, tables)}``, ``(x0, xr) =
+    None`` for one pass; quadrants and passes share every table array they
+    have in common (:func:`_place_photon_door_tables` places each once).
+    Refuses a pass count that no orbit cut admits.
     """
     from common.gamma_matrices import gamma_perm_phase_host
     from ffi.fft import make_kconv_chi_vertex
@@ -300,11 +302,12 @@ def _photon_chi_doors(mesh_xy, kgrid, half_plans, parity, passes=None):
                     "memory_per_device_gb")
         flip = tuple(int(f == 1) for f in pair)
         keys = tuple((A, B) for A in family_channels(L) for B in family_channels(R))
+        odd_nph = np.asarray(base.nph) * p[:, None]
+        cuts = {rows: base if rows is None else _pass_tables(base, *rows, side, 2)
+                for rows in pass_rows}
         for h in (0, 1):
             for g in (0, 1):
                 hu, gu = h ^ flip[0], g ^ flip[1]
-                tables = base if (h + g) % 2 == 0 else base._replace(
-                    nph=np.asarray(base.nph) * p[:, None])
                 sign_c = None if (h + g) % 2 == (hu + gu) % 2 else p
 
                 def local(channel, first, other):
@@ -315,11 +318,86 @@ def _photon_chi_doors(mesh_xy, kgrid, half_plans, parity, passes=None):
                 left = tuple(local(A, 2 * h, hu) for A in family_channels(L))
                 right = tuple(local(B, 2 * g, gu) for B in family_channels(R))
                 for rows in pass_rows:
-                    cut = tables if rows is None else _pass_tables(tables, *rows, side, 2)
+                    cut = cuts[rows] if (h + g) % 2 == 0 else cuts[rows]._replace(nph=odd_nph)
                     door = make_kconv_chi_vertex(mesh_xy, kgrid, cut, left_vertices=left,
                                                  right_vertices=right, sign_c=sign_c, norm="ortho")
-                    doors[(pair, (h, g), rows)] = (door, keys)
+                    doors[(pair, (h, g), rows)] = (door, keys, cut)
     return doors
+
+
+def _place_photon_door_tables(doors, mesh_xy):
+    """Each door's load tables on the devices, every distinct host array placed once.
+
+    The stream passes them to its jit as arguments
+    (``symmetry_maps.DeviceLoadTables``), so its program holds no table
+    constants: baked, each door's global tables were HLO literals (6.9 GB per
+    rank at the Fe 20^3 P36-local shape, 32 doors), and XLA's copies of them
+    set the compile's host peak.  Returns ``({door key: DeviceLoadTables},
+    n_arrays, bytes_per_rank)``.
+    """
+    from symmetry_maps import DEVICE_LOAD_SPECS, DeviceLoadTables
+    placed = {}
+
+    def put(a, spec):
+        hit = placed.get(id(a))
+        if hit is None:
+            # The host array stays referenced beside its copy, so its id is not reused.
+            hit = placed[id(a)] = (a, device_put_process_local(np.asarray(a),
+                                                               NamedSharding(mesh_xy, spec)))
+        return hit[1]
+
+    loads = {}
+    for key, (_, _, t) in doors.items():
+        host = (t.row, t.trs, t.lsrc, t.rsrc, t.mph, t.nph, t.spin,
+                t.spin if t.spin_r is None else t.spin_r)
+        loads[key] = DeviceLoadTables(*(put(a, s) for a, s in zip(host, DEVICE_LOAD_SPECS)))
+    per_rank = sum(int(d.addressable_shards[0].data.nbytes) for _, d in placed.values())
+    return loads, len(placed), per_rank
+
+
+#: Placed door tables per (mesh, grid, half plans, passes): every q batch's
+#: program of one run reads the same device tables.  Bounded; plans are
+#: identity-keyed run objects (``CentroidKUnfoldPlan.dirac_halves``).
+_PHOTON_DOORS: dict = {}
+
+
+def _photon_stream_doors(mesh_xy, kgrid, half_plans, parity, passes):
+    """:func:`_photon_chi_doors` and their placed tables, built once per run and pass count."""
+    key = (mesh_xy, tuple(int(v) for v in kgrid), tuple(half_plans), passes)
+    hit = _PHOTON_DOORS.get(key)
+    if hit is None:
+        doors = _photon_chi_doors(mesh_xy, kgrid, half_plans, parity, passes=passes)
+        loads, n_arrays, per_rank = _place_photon_door_tables(doors, mesh_xy)
+        if jax.process_index() == 0:
+            print(f"  [response] four-current mode-11 doors: {len(doors)} doors, {n_arrays} "
+                  f"table arrays placed once, {per_rank / 1e9:.3f} GB/rank", flush=True)
+        while len(_PHOTON_DOORS) >= 2:
+            _PHOTON_DOORS.pop(next(iter(_PHOTON_DOORS)))
+        hit = _PHOTON_DOORS[key] = (doors, loads)
+    return hit
+
+
+class _BoundTail:
+    """A jitted program with trailing operands bound (the placed door tables).
+
+    ``lower`` / ``compile`` / the executable's call append them, so callers
+    keep the program's public signature; every other attribute passes through.
+    """
+
+    def __init__(self, program, tail):
+        self.program, self.tail = program, tuple(tail)
+
+    def __call__(self, *args):
+        return self.program(*args, *self.tail)
+
+    def lower(self, *args):
+        return _BoundTail(self.program.lower(*args, *self.tail), self.tail)
+
+    def compile(self):
+        return _BoundTail(self.program.compile(), self.tail)
+
+    def __getattr__(self, name):
+        return getattr(self.program, name)
 
 
 def _contract_chi_vertices(Gv_R, Gc_R, operands, identities, complex_contour):
@@ -909,6 +987,7 @@ def _get_chi_fractional_contour_kernel_face(
     # backend takes the door's reference arm.
     photon_doors = None
     if photon is not None:
+        from symmetry_maps import DEVICE_LOAD_SPECS, DeviceLoadTables
         from ffi import fft as _F
         why = _F.chi_unfold_refusal(grid, 2) if _F.kconv_backend(mesh_xy) == "mathdx" else ""
         if why:
@@ -917,14 +996,14 @@ def _get_chi_fractional_contour_kernel_face(
                 f"response; want a grid mathdx mode 11 holds at ns=2; why: {why}, and "
                 "the stream builds its Greens only on the raw parents (no full-k "
                 "Green quadrant on the GPU)")
-        photon_doors = _photon_chi_doors(mesh_xy, grid, half_plans, half_parity)
-    # The direct stream's row passes per family pair (the ledger's count,
-    # photon_response_passes; 1 when everything fits, the one-pass doors).
-    photon_pass_doors = photon_doors
-    if (photon_doors is not None and pair_mode == "direct" and photon_passes is not None
-            and any(int(n) > 1 for n in photon_passes)):
-        photon_pass_doors = _photon_chi_doors(mesh_xy, grid, half_plans, half_parity,
-                                              passes=tuple(int(n) for n in photon_passes))
+        # The direct stream's row passes per family pair (the ledger's count,
+        # photon_response_passes; 1 when everything fits, the one-pass doors).
+        passes = (tuple(int(n) for n in photon_passes)
+                  if pair_mode == "direct" and photon_passes is not None
+                  and any(int(n) > 1 for n in photon_passes) else None)
+        photon_doors, photon_loads = _photon_stream_doors(mesh_xy, grid, half_plans,
+                                                          half_parity, passes)
+        door_order = tuple(photon_doors)
     active_gemms = (tuple(g_plan.prepare_active_range(*bounds) for bounds in band_ranges)
                    if band_ranges is not None else (None, None))
     # Selected charge streams on a raw-parent plan form each node's correlation
@@ -951,7 +1030,10 @@ def _get_chi_fractional_contour_kernel_face(
             rep1, rep0,
             mun_input, nmu_input,
             rep2, rep2, rep2, rep0,
-        ) + ((selected_shard,) if bank_carry else ()),
+        ) + ((selected_shard,) if bank_carry else ()) + (
+            () if photon_doors is None else
+            (tuple(DeviceLoadTables(*(NamedSharding(mesh_xy, spec) for spec in DEVICE_LOAD_SPECS))
+                   for _ in door_order),)),
         donate_argnums=(8,) if bank_carry else (),
         out_shardings=(tuple(chi_R_shard for _ in range(n_out))
                        if selected_q is None else selected_shard),
@@ -982,6 +1064,10 @@ def _get_chi_fractional_contour_kernel_face(
                    else jax.lax.with_sharding_constraint(
                        jnp.broadcast_to(zero, (n_out,) + zero.shape),
                        selected_shard))
+        # The placed door tables are the last operand (``_BoundTail``).
+        door_loads = None
+        if photon_doors is not None:
+            carry, door_loads = carry[:-1], dict(zip(door_order, carry[-1]))
         if bank_carry:
             initial = carry[0]
 
@@ -1077,11 +1163,10 @@ def _get_chi_fractional_contour_kernel_face(
                 return accumulate_photon_block(carry, rows, weights, photon.packed_layout,
                                                A, B, mesh_xy, x_rows=x_rows)
             return photon_door_blocks(carry, put, occ_f, -time, energy_reference[0],
-                                      occ_u, jnp.conj(time), energy_reference[1],
-                                      doors=photon_pass_doors)
+                                      occ_u, jnp.conj(time), energy_reference[1])
 
         def photon_door_blocks(state, put, lower_weight, lower_time, lower_ref,
-                               upper_weight, upper_time, upper_ref, doors=None):
+                               upper_weight, upper_time, upper_ref):
             """The four-current correlation through mathdx mode 11, one family pair at a time.
 
             Per family pair, each lower quadrant ``(h, g)`` and its upper quadrant
@@ -1115,7 +1200,7 @@ def _get_chi_fractional_contour_kernel_face(
                                    layout=layout, gemm=g_plan, k_unfold_plan=half_plans[L],
                                    unfold=False, real_weights=False if direct else None)
 
-            doors = photon_doors if doors is None else doors
+            doors = photon_doors
             side = int(mesh_xy.shape["x"])
             for pair in FAMILY_PAIRS:
                 flip = tuple(int(f == 1) for f in pair)
@@ -1141,7 +1226,9 @@ def _get_chi_fractional_contour_kernel_face(
                                        (h ^ flip[0], g ^ flip[1]), True, x_rows)
                         partners = (() if lower.transpose is None and upper.transpose is None
                                     else (lower.partner(), upper.partner()))
-                        acc = doors[(pair, (h, g), x_rows)][0](acc, lower.G, upper.G, *partners)
+                        door_key = (pair, (h, g), x_rows)
+                        acc = doors[door_key][0](acc, lower.G, upper.G, *partners,
+                                                 load=door_loads[door_key])
                     for c in range(len(keys)):
                         # One channel plane's transform is live at a time.
                         acc, state = jax.lax.optimization_barrier((acc, state))
@@ -1376,7 +1463,9 @@ def _get_chi_fractional_contour_kernel_face(
         # Public bank order [parent, sample, mu_x, mu_y].
         return jnp.swapaxes(final_R, 0, 1)
 
-    return integrate
+    if photon_doors is None:
+        return integrate
+    return _BoundTail(integrate, (tuple(photon_loads[k] for k in door_order),))
 
 
 # ============================================================================
