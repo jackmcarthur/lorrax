@@ -331,7 +331,7 @@ def batch_layout(a, mesh):
     return fn(a)
 
 
-def local_batch(kernel, mesh, *, resident=(), out_layout="face"):
+def local_batch(kernel, mesh, *, resident=(), out_layout="face", nbatch=None):
     """Run a composition of dense equations q-locally with one exchange each way.
 
     Inputs/outputs are face-sharded matrix batches (outputs may be a pytree).
@@ -346,10 +346,11 @@ def local_batch(kernel, mesh, *, resident=(), out_layout="face"):
     A factor laid out once therefore serves every later right-hand side while
     only the right-hand side moves (face -> batch -> face), i.e. per rank
     ``2*ceil(B/P)`` RHS blocks cross the network per call instead of whole
-    matrices. A position declared resident whose operand is not in that
+    matrices. A concrete operand declared resident that is not in that
     layout refuses before tracing, because the implicit reshard it would
     otherwise get is exactly the per-call matrix movement this exists to
-    remove.
+    remove.  When every operand is resident, ``nbatch`` names the real rows
+    (the batch the face output carries); only the output moves.
     """
     px, py = int(mesh.shape['x']), int(mesh.shape['y'])
     face = P(None, 'x', 'y')
@@ -361,9 +362,9 @@ def local_batch(kernel, mesh, *, resident=(), out_layout="face"):
     @jax.jit
     def _run(*operands):
         moving = [a for i, a in enumerate(operands) if i not in resident]
-        if not moving:
-            raise ValueError('local_batch needs at least one face operand to set the batch')
-        nb = max(a.shape[0] for a in moving)
+        if not moving and nbatch is None:
+            raise ValueError('local_batch needs a face operand or nbatch to set the batch')
+        nb = int(nbatch) if not moving else max(a.shape[0] for a in moving)
         if any(a.ndim != 3 or a.shape[0] not in (1, nb)
                or a.shape[1] % px or a.shape[2] % py for a in moving):
             raise ValueError('local_batch requires matching matrix batches tiling the mesh')
@@ -394,7 +395,10 @@ def local_batch(kernel, mesh, *, resident=(), out_layout="face"):
 
     def run(*operands):
         for i in resident:
-            if not is_batch_layout(operands[i], mesh):
+            # A traced operand (a caller's own program) gets the batch spec at
+            # the shard_map boundary; a concrete one must already carry it.
+            if not isinstance(operands[i], jax.core.Tracer) and not is_batch_layout(
+                    operands[i], mesh):
                 raise ValueError(
                     f'local_batch: operand {i} was declared resident but is not in the '
                     f'batch layout P((x,y),None,...) on this mesh; place it once with '

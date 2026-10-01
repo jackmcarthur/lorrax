@@ -122,7 +122,7 @@ from distrib_la.matmul import (
     resolve_matmul_backend,
 )
 from distrib_la.matmul_plan import GemmPlan, gemm_plan, local_gemm_plan
-from distrib_la._panel_matmul import panel_matmul
+from distrib_la._panel_matmul import batch_gram, panel_matmul
 from distrib_la.plan import (
     BATCHED_ROUTE_CHOICES,
     BATCHED_ROUTE_DEFAULT,
@@ -174,7 +174,7 @@ __all__ = [
     # distributed matrix multiplication
     "matmul", "resolve_matmul_backend", "MATMUL_BACKEND_CHOICES", "contract_faces",
     # planned N,N GEMM (trace-safe, for hot loops)
-    "GemmPlan", "gemm_plan", "local_gemm_plan", "panel_matmul",
+    "GemmPlan", "gemm_plan", "local_gemm_plan", "panel_matmul", "batch_gram",
     # the batched route toggle and its dial
     "BATCHED_ROUTES", "ROUTE_SCAN", "ROUTE_BACKEND_BATCHED",
     "ROUTE_BATCH_RESHARD", "BATCHED_ROUTE_CHOICES", "BATCHED_ROUTE_DEFAULT",
