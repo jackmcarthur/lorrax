@@ -105,25 +105,42 @@ def _phases_on_face_carrier(phases, band_range, nb):
     return phases, band_range
 
 
+def green_right_operand(psi_nmu):
+    """The Green GEMM's right operand ``conj(ψ_nmu)``, merged centroid-major ``(nk, n, ν·s)``.
+
+    Every build forms it from its ``ψ_nmu`` (a transposed copy of the whole
+    face); a caller that builds many Greens from one band-complete face forms
+    it once and passes it as ``right`` (:func:`build_G_tau`).
+    """
+    return merge_spin_centroid(jnp.conj(psi_nmu), 2, 3)
+
+
 def _build_G_face(psi_mun, psi_nmu, *, gemm, Gij=None, phases=None, mesh=None,
-                  band_range=None, prepared_active_gemm=None, n_full=None, pair=False):
+                  band_range=None, prepared_active_gemm=None, n_full=None, pair=False,
+                  right=None):
     """Contract band-replicated faces locally or band-distributed faces with their GEMM plan.
 
     Returns the Green ``(nk, mu_X, s, nu_Y, s')``: centroid-major, the
     GEMM's own merged endpoint order split by a reshape.  ``pair`` (face
     route only): also the conjugate-face partner ``conj(A)·diag(w)·conj(B)``
     from the SAME panel exchange (each gathered panel conjugated before its
-    own local GEMM; no conjugated tile).
+    own local GEMM; no conjugated tile).  ``right`` (local GEMMs): the right
+    operand already formed (:func:`green_right_operand`); ``psi_nmu`` is then
+    not read.
     """
     if Gij is not None:
         raise NotImplementedError("Green faces support diagonal band weights, not dense Gij.")
     nk_, s_, mu_l_, n_ = psi_mun.shape
-    nk_r_, n_r_, s_r_, mu_r_ = psi_nmu.shape
+    if right is not None:
+        nk_r_, n_r_, merged_r_ = right.shape
+        s_r_, mu_r_ = s_, merged_r_ // s_
+    else:
+        nk_r_, n_r_, s_r_, mu_r_ = psi_nmu.shape
     if nk_r_ != nk_ or n_r_ != n_ or s_r_ != s_:
         raise ValueError(
             "build_G(layout='face'): left psi_mun and right psi_nmu must "
             "share (nk, nb, nspinor); got "
-            f"{psi_mun.shape} and {psi_nmu.shape}.")
+            f"{psi_mun.shape} and {(nk_r_, n_r_, s_r_, mu_r_)}.")
     if phases is not None and int(phases.shape[-1]) != n_:
         phases, band_range = _phases_on_face_carrier(phases, band_range, n_)
     A = merge_spin_centroid(psi_mun, 1, 2)          # (nk, mu*s, n) P(_,'x','y')
@@ -132,7 +149,8 @@ def _build_G_face(psi_mun, psi_nmu, *, gemm, Gij=None, phases=None, mesh=None,
             and prepared_active_gemm is None and not face):
         w = phases.astype(A.dtype)                  # (nk, n)
         A = A * w[:, None, :]
-    B = merge_spin_centroid(jnp.conj(psi_nmu), 2, 3)  # (nk, n, mu*s) P(_,'x','y')
+    # (nk, n, mu*s) P(_,'x','y')
+    B = green_right_operand(psi_nmu) if right is None else right
     # Eager operations may erase singleton mesh axes before the GEMM boundary.
     from jax import lax
     in_sharding_a = getattr(gemm, "in_sharding_a", None)
@@ -202,8 +220,31 @@ def has_antiunitary_rows(k_unfold_plan) -> bool:
 
 def build_G_parents(psi_xn, psi_yr, *, Gij=None, phases=None, layout='face', gemm=None,
                     k_unfold_plan, real_weights=None, band_range=None,
-                    prepared_active_gemm=None) -> ParentGreen:
-    """The parent Green and its antiunitary partner, before the typed unfold (see :class:`ParentGreen`)."""
+                    prepared_active_gemm=None, right=None) -> ParentGreen:
+    """The parent Green and its antiunitary partner, before the typed unfold (see :class:`ParentGreen`).
+
+    ``right`` (a local GEMM): the right operand formed once by the caller
+    (:func:`green_right_operand`).  The partner ``conj(A)·diag(w)·conj(B)``
+    is then ``conj(A·diag(conj w)·B)``, the same two operands at conjugate
+    weights, so no conjugated face is formed.
+    """
+    if right is not None:
+        if getattr(gemm, "backend", "local") != "local" or Gij is not None or phases is None:
+            raise ValueError("build_G_parents(right=...) takes a local GEMM and band phases")
+
+        def build(w):
+            return _build_G_face(psi_xn, None, gemm=gemm, phases=w, mesh=k_unfold_plan.mesh_xy,
+                                 band_range=band_range, prepared_active_gemm=prepared_active_gemm,
+                                 n_full=k_unfold_plan.n_full, right=right)
+        G = build(phases)
+        if not has_antiunitary_rows(k_unfold_plan):
+            return ParentGreen(G, None)
+        if (real_weights is True
+                or not jnp.issubdtype(phases.dtype, jnp.complexfloating)):
+            return ParentGreen(G, None, conj_partner=True)
+        if real_weights is not False:
+            raise ValueError("build_G_parents(right=...) states real_weights")
+        return ParentGreen(G, jnp.conj(build(jnp.conj(phases))))
     if layout not in ('face', 'axis'):
         raise ValueError("build_G requires canonical faces with layout=face or axis.")
     if gemm is None:
@@ -387,7 +428,7 @@ def build_G_tau(psi_xn, psi_yr, enk, t, *, e_ref=0.0, mask=None,
                 layout='face', gemm=None, k_unfold_plan=None, band_range=None,
                 trim_zero_bands=False, prepared_active_gemm=None,
                 conjugate=False, unfold=True, right_k_unfold_plan=None,
-                real_weights=None):
+                real_weights=None, right=None):
     """Contract phases exp(-t*(energy-reference)) with energy windows, identity masks and signed weights.
 
     ``unfold=False`` returns the :class:`ParentGreen` pair instead of the
@@ -401,6 +442,8 @@ def build_G_tau(psi_xn, psi_yr, enk, t, *, e_ref=0.0, mask=None,
     builds an antiunitary partner as the conjugate-face GEMM with no device
     predicate, so a node loop does not stop on a host-read conditional; at a
     node whose phases are real that GEMM equals ``conj(G)``.
+    ``right`` (``unfold=False``, a local GEMM): the right operand formed once
+    from ``psi_yr`` (:func:`green_right_operand`); ``psi_yr`` is then not read.
     """
     if real_weights is None:
         real_weights = not jnp.issubdtype(jnp.result_type(t), jnp.complexfloating)
@@ -426,6 +469,8 @@ def build_G_tau(psi_xn, psi_yr, enk, t, *, e_ref=0.0, mask=None,
             lo = jnp.maximum(lo, band_range[0])
             hi = jnp.minimum(hi, band_range[1])
         band_range = (jnp.minimum(lo, hi), hi)
+    if right is not None and unfold:
+        raise ValueError("build_G_tau(right=...) returns the parent pair (unfold=False)")
     if not unfold:
         if conjugate:
             raise ValueError("build_G_tau(unfold=False) returns the parent pair; conjugate "
@@ -433,7 +478,7 @@ def build_G_tau(psi_xn, psi_yr, enk, t, *, e_ref=0.0, mask=None,
         return build_G_parents(
             psi_xn, psi_yr, phases=phases, layout=layout, gemm=gemm,
             k_unfold_plan=k_unfold_plan, real_weights=real_weights,
-            band_range=band_range, prepared_active_gemm=prepared_active_gemm)
+            band_range=band_range, prepared_active_gemm=prepared_active_gemm, right=right)
     return build_G(
         psi_xn, psi_yr, phases=phases, layout=layout, gemm=gemm,
         k_unfold_plan=k_unfold_plan, right_k_unfold_plan=right_k_unfold_plan,

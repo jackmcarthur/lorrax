@@ -1331,9 +1331,14 @@ def _get_chi_fractional_contour_kernel_face(
             and its ``conj FT[A](q)`` and ``FT[A](-q)`` rows.  The engine adds
             them into their blocks of the packed carry.
             """
+            from .greens_function_kernel import green_right_operand
             from .photon_layout import FAMILY_PAIRS
             from .subtile_stream import band_complete, pass_rows, stream_passes
             faces = tuple(band_complete(psi_mun[f], psi_nmu[f], mesh_xy) for f in (0, 1))
+            # Each family's right operands, one per Dirac half, formed once
+            # per dispatch: every quadrant Green of every node and pass reads them.
+            rights = tuple(tuple(green_right_operand(jax.lax.slice_in_dim(
+                faces[f][1], 2 * g, 2 * g + 2, axis=2)) for g in (0, 1)) for f in (0, 1))
             px = int(mesh_xy.shape["x"])
             count = live_count()
             for i_pair, (pair, plan) in enumerate(zip(FAMILY_PAIRS, photon_plans)):
@@ -1350,15 +1355,13 @@ def _get_chi_fractional_contour_kernel_face(
                     def parent(weight, t, ref, halves, current):
                         left = jax.lax.slice_in_dim(left_rows, 2 * halves[0], 2 * halves[0] + 2,
                                                     axis=1)
-                        right = jax.lax.slice_in_dim(faces[R][1], 2 * halves[1],
-                                                     2 * halves[1] + 2, axis=2)
                         weight, t = oriented(weight, t)
-                        return build_G_tau(left, right, enk_full, t, e_ref=ref,
+                        return build_G_tau(left, None, enk_full, t, e_ref=ref,
                                            band_weight=weight, layout="axis",
                                            gemm=photon_gemms[i_pair][p],
                                            k_unfold_plan=half_plans[L], unfold=False,
                                            prepared_active_gemm=photon_active[i_pair][p][int(current)],
-                                           real_weights=False)
+                                           real_weights=False, right=rights[R][halves[1]])
                     acc = jax.lax.with_sharding_constraint(
                         jnp.zeros((len(keys), nk, px * xr, right_extent), jnp.complex128),
                         selected_shard)
@@ -1534,8 +1537,11 @@ def _get_chi_fractional_contour_kernel_face(
             the pass, the transform and its q and -q rows, oriented as
             :func:`correlation_rows`.
             """
+            from .greens_function_kernel import green_right_operand
             from .subtile_stream import band_complete, pass_rows, stream_passes
             rows_all, cols_all = band_complete(psi_mun, psi_nmu, mesh_xy)
+            # The right operand of every Green build, formed once per dispatch.
+            right = green_right_operand(cols_all)
             px = int(mesh_xy.shape["x"])
 
             def node_rows(p, index):
@@ -1545,11 +1551,11 @@ def _get_chi_fractional_contour_kernel_face(
 
                 def parent(weight, t, ref, current):
                     weight, t = oriented(weight, t)
-                    return build_G_tau(psi_p, cols_all, enk_full, t, e_ref=ref,
+                    return build_G_tau(psi_p, None, enk_full, t, e_ref=ref,
                                        band_weight=weight, layout="axis", gemm=pass_gemms[p],
                                        k_unfold_plan=k_unfold_plan, unfold=False,
                                        prepared_active_gemm=pass_active[p][int(current)],
-                                       real_weights=False)
+                                       real_weights=False, right=right)
                 lower = parent(occ_f, -time, energy_reference[0], False)
                 upper = parent(occ_u, jnp.conj(time), energy_reference[1], True)
                 partners = (() if lower.conj_partner and upper.conj_partner
