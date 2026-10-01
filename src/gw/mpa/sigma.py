@@ -156,7 +156,8 @@ def synthesize_shared_pole_parents(
             jnp.pad(intervals, ((0, rows - n_parent), (0, 0))),
             NamedSharding(mesh_xy, P(("x", "y"), None)))
         weights = weights_fn(poles2, intervals, E_ref_B, t_node)
-        plus = _shared_pole_contract_local(b_X, weights, mesh_xy=mesh_xy, n_parent=n_parent)
+        plus = _shared_pole_contract_local(b_X, weights, intervals, mesh_xy=mesh_xy,
+                                           n_parent=n_parent)
     else:
         if b_X.ndim != 4 or b_Y.ndim != 4:
             raise ValueError("shared-pole faces require [parent,mu,spin,column]")
@@ -210,23 +211,21 @@ def _shared_pole_contract(b_X, b_Y, weights, *, gemm, layout="face", intervals=N
     return value[:, :, 0, :, 0]
 
 
-def _shared_pole_contract_local(b, weights, *, mesh_xy, n_parent):
+def _shared_pole_contract_local(b, weights, intervals, *, mesh_xy, n_parent):
     """W(τ) = b d b† with whole parents per rank: one local GEMM each, one exchange out.
 
-    ``b`` ``[Bp,mu,K]`` and ``weights`` ``[Bp,K]`` are in ``distrib_la``'s
-    batch layout (``Bp``: the ``n_parent`` parents padded to the mesh; their
-    weights are zero).  Each rank contracts its own parents over every pole
-    column and only W moves, batch to face (``distrib_la.local_batch``): per
-    τ node a rank sends its W rows, not the K-complete factor panels that a
-    face SUMMA re-gathers at every node (2·(μ/p)·K per parent; at Ni 20³ P64,
-    18.6 GB per rank per node across nodes, against 0.85 GB).  The factor is
-    held once, not as two faces.
+    ``b`` ``[Bp,mu,K]``, ``weights`` ``[Bp,K]`` and ``intervals`` ``[Bp,2]`` are
+    in ``distrib_la``'s batch layout (``Bp``: the ``n_parent`` parents padded
+    to the mesh, empty intervals).  Each rank contracts its own parents over
+    their live pole columns (``distrib_la.batch_gram``, the local active-range
+    GEMM of G's face panels) and only W moves, batch to face: per τ node a
+    rank sends its W rows, not the K-complete factor panels that a face SUMMA
+    re-gathers at every node (2·(μ/p)·K per parent; at Ni 20³ P64, 18.6 GB per
+    rank per node across nodes, against 0.85 GB).  The factor is held once,
+    not as two faces.
     """
-    from distrib_la import local_batch
-
-    def one(b, w):
-        return (b * w[:, None, :]) @ jnp.swapaxes(jnp.conj(b), -1, -2)
-    return local_batch(one, mesh_xy, resident=(0, 1), nbatch=n_parent)(b, weights)
+    from distrib_la import batch_gram
+    return batch_gram(b, weights, intervals, mesh=mesh_xy, nbatch=n_parent)
 
 
 def _shared_pole_fixed_q_policy(header):
@@ -780,7 +779,7 @@ def _shared_pole_local_price(meta, header, *, mesh_xy):
     """Per-rank ``(resident, workspace)`` bytes of the synthesis with whole parents per rank.
 
     Resident: the one factor ``[ceil(nq/P), μ, K̄]`` and its poles.  Workspace:
-    one parent's weighted factor, the rank's W rows before the exchange, and
+    one parent's two GEMM operands, the rank's W rows before the exchange, and
     the parent pair on the face with its realization temporaries (as
     :func:`_shared_pole_panel_cost`'s ``6·tile``).
     """
@@ -791,7 +790,7 @@ def _shared_pole_local_price(meta, header, *, mesh_xy):
     k = face_width(mesh_xy, int(header["Kmax"]))
     rows = -(-nq // ranks)
     resident = 16 * rows * m * k + 8 * rows * k
-    workspace = 16 * m * k + 2 * 16 * rows * m * m + 6 * -(-16 * nq * m * m // ranks)
+    workspace = 2 * 16 * m * k + 2 * 16 * rows * m * m + 6 * -(-16 * nq * m * m // ranks)
     return int(resident), int(workspace)
 
 

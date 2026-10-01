@@ -383,8 +383,8 @@ carrier). On a `linalg = local` deck whose whole parents fit per rank
 (`shared_pole_execution.whole_parent_execution`, the bank's rule), one copy is
 held instead, whole parents per rank in `distrib_la`'s batch layout
 ($16\lceil n_{q,\rm irr}/P\rceil\mu\bar K$ bytes): each rank contracts its own
-parents over every pole column and only $W(\tau)$ moves, batch to face
-(`distrib_la.local_batch`). The face SUMMA re-gathers $2(\mu/p)\bar K$ per
+parents over their live pole columns and only $W(\tau)$ moves, batch to face
+(`distrib_la.batch_gram`). The face SUMMA re-gathers $2(\mu/p)\bar K$ per
 parent at every τ node: 18.6 GB per rank per node at Ni 20³ P64, against
 the 0.85 GB tile. The budget left
 beside them sizes one parent panel × pole-column chunk of synthesis workspace:

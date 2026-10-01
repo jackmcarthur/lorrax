@@ -162,6 +162,26 @@ def _panel_contraction(mesh, active=True):
     return contract
 
 
+
+def batch_gram(b, weights, bounds, *, mesh, nbatch):
+    """``W[q] = b[q][:, lo:hi]·diag(w[q])·b[q][:, lo:hi]†`` with whole parents per rank, out on the face.
+
+    ``b`` ``(Bp,m,K)``, ``weights`` ``(Bp,K)`` and int32 ``bounds`` ``(Bp,2)`` are
+    in the batch layout (:func:`distrib_la.batch_layout`; ``nbatch`` real rows of
+    ``Bp``).  Each rank contracts its own rows over their intervals with the
+    same local active-range GEMM a :func:`panel_matmul` panel uses, and only
+    ``W`` moves, batch to face (:func:`distrib_la.local_batch`): per call a rank
+    sends its ``W`` rows, never the factor, which stays resident.  Returns
+    ``(nbatch,m,m)`` at ``P(None,'x','y')``.
+    """
+    from ._batch_reshard import local_batch
+    contract = _panel_contraction(mesh)
+
+    def one(b, w, limits):
+        return contract(b * w[:, None, :], jnp.swapaxes(jnp.conj(b), -1, -2), limits, None)
+    return local_batch(one, mesh, resident=(0, 1, 2), nbatch=nbatch)(
+        b, weights, bounds.astype(jnp.int32))
+
 @lru_cache(maxsize=64)
 def _kernel(mesh, q, m, k, n, width, sample_axis):
     px, py = int(mesh.shape['x']), int(mesh.shape['y'])
