@@ -3,6 +3,22 @@
 User-visible changes, newest first. Binding rulings behind the breaking
 changes live in `docs/architecture/decisions.md`.
 
+## 2026-10-01 — the χ bank carries no −q rows on inversion-symmetric magnets
+
+On the ordered (time-reversal-broken) scalar route, every response sample's
+bank carried the parent q rows and their −q partners (2120 rows at Fe/Ni 20³),
+although only the line samples' partner solve reads the −q rows. When the
+magnetic group holds a unitary inversion (Fe, Co, Ni, CrI3), the partner
+χ_{−q} = U_I χ_q U_Iᴴ is now formed from the parent row by the inversion unfold
+(`symmetry_maps.unfold_isdf_operator`) at that solve, so the stream and the bank
+carry only the parent rows: half the bank per sample (Fe/Ni 20³ P64: 3.4 → 1.7
+GB/rank). Scalar SC results on inversion-symmetric magnets move once, by up
+to 0.75 meV (Fe 4³, maps 0–2). The unfolded partner differs from the streamed
+one by ≤ 4e-9 relative, and the line selection amplifies it (a 1+4e-9 scaling
+of the partner moves Fe 4³ by 1.77 meV); this is inside the 2 meV gate for the
+ill-conditioned fit and selection. Time-reversal-symmetric decks (Na), groups
+without a unitary inversion, and the four-current route are unchanged (bitwise).
+
 ## 2026-10-01 — a price over the memory budget warns, never refuses
 
 No planner stops a run because a priced or compiled memory figure exceeds
