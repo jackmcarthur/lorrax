@@ -23,15 +23,6 @@ from gw.wavefunction_bundle import parent_sigma_operands
 from .sigma import SynthesisTau, WSynthesis, _admit, _static_key
 
 
-def _native_workspace(mesh_xy, shapes):
-    """Query distributed GEMM scratch for the supplied contraction shapes."""
-    from distrib_la import plan, workspace_bytes_per_rank
-    context=plan('eigh',mesh_xy,n=max(max(a[-2:]+b[-2:]) for a,b in shapes),
-                 backend='distributed',batched_route='auto')
-    return max(workspace_bytes_per_rank(context,'gemm',(a,b),np.complex128)
-               for a,b in shapes)
-
-
 _ADMIT_COMPILED = {}
 
 
@@ -222,25 +213,25 @@ def _w_parents(mesh_xy, plan, m, nc, n, nt, kcarrier, weights_fn, panel_bytes):
 
 #: The sector Σ doors' placed load tables (Green, W particle/hole) per mesh, plans and
 #: W tables: every SC map's τ programs read the same device tables.  Bounded.
-_SECTOR_DOOR_LOADS = {}
+_SECTOR_NODES = {}
 
 
-def sector_tau_factory(left, right, keys, meta, mesh_xy):
-    """Bind Gamma_A G_AB(t) Gamma_B to the window executor, row pass by row pass (``gw.subtile_stream``).
+def sector_node(left, right, keys, meta, mesh_xy, w_tables, band_axis, *, static=False):
+    """One endpoint class's Σ node on the sub-tile engine (``gw.subtile_stream``), row pass by row pass.
 
         Σ_mn(k) = Σ_{μ ∈ passes} Σ_ν ψ*_m(μ) [Σ_AB γ̃_A G γ̃_B† ⋆ W_AB](k)_{μν} ψ_n(ν)
 
     is linear in the μ rows, so each rank's ``(μ_X, ν_Y)`` tile of the class
     runs in row passes of whole centroid orbits (cuts admissible for the
-    Green's tables and for both branches' W tables).  Per pass:
+    Green's tables and for every branch's W tables).  Per pass:
 
     - the four-spinor parent Green on the pass's band-complete ψ rows: one
       local GEMM against the right operand formed once per Σ call
       (``greens_function_kernel.green_right_operand``), its antiunitary
       partner from the same operands at conjugate weights;
-    - one ns = 4 mode-8 Lorentz door (``common.fft_helpers.make_kconv_lorentz_unfold``,
-      every vertex of the class in its Mid) reading the pass's rows of W(t)
-      on the irreducible q, with the Green's and W's tables placed once on the
+    - one ns = 4 mode-8 Lorentz k-convolution (``common.fft_helpers.make_kconv_lorentz_unfold``,
+      every vertex of the class in its Mid) reading the pass's rows of W on
+      the irreducible q, with the Green's and W's tables placed once on the
       devices and cut to the pass there (``subtile_stream.pass_load``), so no
       program holds table constants;
     - the axis band projection of the pass's rows into a rank-local partial;
@@ -249,8 +240,16 @@ def sector_tau_factory(left, right, keys, meta, mesh_xy):
     four-spinor Green exists.  Pass sizes come from
     :data:`runtime.tiles.TILE_BYTES` and the shapes
     (``subtile_stream.plan_rows``), the rule the scalar Σ τ engine uses.
-    The caller places the left operands band-complete once per Σ call
-    (``ppm_tau_kernel.sigma_subtile_operands``); the right ones are placed here.
+
+    ``w_tables`` are W's q tables, one per branch ``ParentW.hole`` selects: the
+    particle and hole tables of an ordered W(t) (:func:`sector_tau_factory`),
+    or the one table of a static class (``static``: the photon static classes,
+    ``gw.photon_sigma.contract_lorentz_blocks``, the τ = 0 node).  Built once
+    per configuration; returns ``SimpleNamespace(spatial, loads, key, plans)``
+    with ``spatial(xn, yr, xr, yn, energies, weight, reference, time,
+    interactions, loads)``: the left operands placed by
+    :func:`sector_left_operands`, the right by :func:`sector_right_operands`,
+    ``interactions`` a :class:`ParentW` and ``loads`` the node's placed tables.
     """
     from distrib_la import gemm_plan
     from common.contract_bands import contract_bands_block_reshard
@@ -258,7 +257,7 @@ def sector_tau_factory(left, right, keys, meta, mesh_xy):
     from common.gamma_matrices import gamma_perm_phase_host
     from gw.cohsex_sigma import lorentz_class_vertices
     from gw.greens_function_kernel import (build_G_parents, _weighted_tau_phases,
-                                           green_right_operand, has_antiunitary_rows)
+                                           has_antiunitary_rows)
     from symmetry_maps import device_load_tables
     from gw.subtile_stream import (fold_passes, orbit_cuts, pass_load, pass_rows, pass_tables,
                                    plan_rows)
@@ -268,111 +267,147 @@ def sector_tau_factory(left, right, keys, meta, mesh_xy):
     n_parent, nb = int(plans[0].n_parent), int(a.psi_nmu.shape[1])
     m, n = int(plans[0].n_centroid_packed), int(plans[1].n_centroid_packed)
     ns = int(plans[0].nspinor)
+    nb_sig = int(band_axis.padded)
+    kgrid = tuple(int(v) for v in meta.kgrid)
+    w_tables = tuple(w_tables)
+    key = (mesh_xy, id(plans[0]), id(plans[1]), (n_parent, nb, m, n, ns), nb_sig, tuple(keys),
+           kgrid, int(meta.nk_tot), tuple(map(id, w_tables)), bool(static))
+    hit = _SECTOR_NODES.get(key)
+    if hit is not None:
+        return hit[1]
     px, py = int(mesh_xy.shape['x']), int(mesh_xy.shape['y'])
     local_rows, nu = m // px, n // py
-    kgrid = tuple(int(v) for v in meta.kgrid)
     lefts, rights = lorentz_class_vertices(keys)
     vertices = ([gamma_perm_phase_host(A) for A in lefts], [gamma_perm_phase_host(B) for B in rights])
     n_a, n_b = (1 if lefts == (0,) else 3), (1 if rights == (0,) else 3)
     g_tables = plans[0].unfold_load_tables(right_plan=None if plans[1] is plans[0] else plans[1])
     partner = int(has_antiunitary_rows(plans[0]))
     mult = -1.0 / np.sqrt(float(meta.nk_tot))
+    n_w = int(np.max(np.asarray(w_tables[0].row))) + 1     # the W parents (irreducible q)
+    # One local row's live set: the parent Green and its partner, the
+    # k-convolution's Σ rows, the pass's rows of W and its partner, the pass's
+    # ψ rows (Green and projection).
+    row_bytes = 16 * ((1 + partner) * n_parent * ns * ns * nu + n_parent * ns * ns * nu
+                      + 2 * n_w * n_a * n_b * nu + n_parent * ns * (nb + nb_sig))
+    passes = plan_rows(local_rows, row_bytes, lambda: sorted(
+        set(orbit_cuts(g_tables.lsrc, px, ns))
+        & set.intersection(*(set(orbit_cuts(t.lsrc, px, n_a)) for t in w_tables))))
+    stages = []
+    for x0, xr in passes:
+        whole = (x0, xr) == (0, local_rows)
+        cut = (lambda t, k: t) if whole else (lambda t, k: pass_tables(t, x0, xr, px, k))
+        gemm = gemm_plan(mesh_xy, m=px * xr * ns, k=nb, n=n * ns, nq=n_parent,
+                         dtype=jnp.complex128, layout='axis', warmup=False)
+        kconv = tuple(make_kconv_lorentz_unfold(
+            mesh_xy, kgrid, cut(g_tables, ns), left_vertices=vertices[0],
+            right_vertices=vertices[1], store_rows=plans[0].parent_full_rows,
+            norm='ortho', mult=mult, w_tables=cut(w, n_a)) for w in w_tables)
+        project = contract_bands_block_reshard(
+            mesh_xy, channels="none", layout="axis", face_shape=(n_parent, nb, px * xr, ns),
+            right_face_shape=(n_parent, nb, n, ns), face_band_extent=nb_sig)
+        stages.append((whole, gemm, kconv, project))
+    finish = stages[0][3].finish
+    loads = (device_load_tables(g_tables, mesh_xy),
+             tuple(device_load_tables(t, mesh_xy) for t in w_tables))
+    psi_bytes = 16 * n_parent * ns * (nb + nb_sig) * (local_rows + nu)
+    price = dict(d=ns, ns=ns, passes=len(passes),
+                 new=float(max(xr for _, xr in passes) * row_bytes + psi_bytes))
+    from common.gpu_utils import record_stage_price
+    # A static node is priced in its caller's section (exchange, static COHSEX, W∞ − V).
+    label = "Sigma static" if static else "Sigma tau"
+    record_stage_price(f"{label} {keys[0]}, {len(passes)} row pass(es)", price["new"],
+                       section=None if static else "sigma.tau_sweep")
+    if jax.process_index() == 0:
+        print(f"{label} stream {''.join('CT'[f] for f in (int(lefts != (0,)), int(rights != (0,))))}: "
+              f"{len(passes)} row pass(es) of {max(xr for _, xr in passes)} local rows "
+              f"({local_rows} per rank)", flush=True)
+    partial_spec = NamedSharding(mesh_xy, P(None, ('x', 'y')))
+    w_spec = P(None, 'x', None, 'y', None)
 
+    def spatial(xn, yr, xr, yn, energies, weight, reference, time, interactions, loads):
+        # xn, xr: the left band-complete ψ rows and projection rows; yr, yn: the
+        # right Green operand and projection operand; ``loads`` the placed tables.
+        phases = _weighted_tau_phases(energies, 1j*time, e_ref=reference, band_weight=weight)
+        hole = int(interactions.hole)
+        g_load, w_load = loads[0], loads[1][hole]
+        zero = jax.lax.with_sharding_constraint(
+            jnp.zeros((1, px * py * n_parent, nb_sig, nb_sig), jnp.complex128), partial_spec)
+
+        def step(p, x0, xr_, acc, operands):
+            whole, gemm, kconv, project = stages[p]
+            W, Wt, rows, left_p = operands
+            if not whole:
+                W, Wt = (pass_rows(w, mesh_xy, x0, xr_, axis=1, spec=w_spec) for w in (W, Wt))
+                rows = pass_rows(rows, mesh_xy, x0, xr_, axis=2)
+                left_p = pass_rows(left_p, mesh_xy, x0, xr_, axis=3)
+            green = build_G_parents(rows, None, phases=phases, layout='axis', gemm=gemm,
+                                    k_unfold_plan=plans[0], real_weights=False, right=yr)
+            sigma = kconv[hole](green.G, green.transpose, W, Wt,
+                                conj_partner=green.conj_partner,
+                                load=g_load if whole else pass_load(g_load, mesh_xy, x0, xr_, ns),
+                                w_load=(w_load if whole else
+                                        pass_load(w_load, mesh_xy, x0, xr_, n_a)))
+            return project.accumulate((jnp.conj(left_p), yn), sigma, acc=acc)
+        return finish(fold_passes(passes, step, zero,
+                                  (interactions.W, interactions.partner, xn, xr)))
+    spatial.price = price
+    node = SimpleNamespace(spatial=spatial, loads=loads, key=key + (tuple(passes),), plans=plans)
+    while len(_SECTOR_NODES) >= 16:
+        _SECTOR_NODES.pop(next(iter(_SECTOR_NODES)))
+    # The plans and tables ride along so their ids in the key cannot be reused.
+    _SECTOR_NODES[key] = ((plans, w_tables), node)
+    return node
+
+
+@lru_cache(maxsize=None)
+def _place_left(mesh_xy):
+    """``subtile_stream.band_complete``'s rows and ``projection_complete``'s left operand."""
+    @jax.jit
+    def place(xn, xr):
+        return (jax.lax.with_sharding_constraint(xn, NamedSharding(mesh_xy, P(None, None, 'x', None))),
+                jax.lax.with_sharding_constraint(xr, NamedSharding(mesh_xy, P(None, None, None, 'x'))))
+    return place
+
+
+@lru_cache(maxsize=None)
+def _place_right(mesh_xy):
+    """``band_complete``'s columns as the Green's right operand, and ``projection_complete``'s right."""
+    from gw.greens_function_kernel import green_right_operand
+
+    @jax.jit
+    def place(yr, yn):
+        cols = jax.lax.with_sharding_constraint(yr, NamedSharding(mesh_xy, P(None, None, None, 'y')))
+        right_p = jax.lax.with_sharding_constraint(yn, NamedSharding(mesh_xy, P(None, None, 'y', None)))
+        return green_right_operand(cols), right_p
+    return place
+
+
+def sector_left_operands(family, band_axis, mesh_xy):
+    """A node's left operands ``(xn, xr)``, placed once per Σ call: band-complete ψ rows and
+    the projector's left face, padded to ``band_axis``."""
+    xn, _, xr, _, _, _ = parent_sigma_operands(family)
+    return _place_left(mesh_xy)(xn, pad_to_axis(xr, band_axis, axis=1))
+
+
+def sector_right_operands(family, band_axis, mesh_xy):
+    """A node's right operands ``(yr, yn)``, placed once per Σ call: the Green's right
+    operand (conj ψ_nmu with every band, merged) and the projector's right face."""
+    _, yr, _, yn, _, _ = parent_sigma_operands(family)
+    return _place_right(mesh_xy)(yr, pad_to_axis(yn, band_axis, axis=3))
+
+
+def sector_tau_factory(left, right, keys, meta, mesh_xy):
+    """Bind Gamma_A G_AB(t) Gamma_B to the window executor: the class's :func:`sector_node`
+    reading W(t)'s particle and hole branches.  The caller places the left operands
+    band-complete once per Σ call (``ppm_tau_kernel.sigma_subtile_operands``); the right
+    ones are placed here."""
     def factory(synthesis, band_axis):
-        _, right_yr, _, right_proj, _, _ = parent_sigma_operands(right)
-        right_proj = pad_to_axis(right_proj, band_axis, axis=3)
-        nb_sig = int(band_axis.padded)
-        # The right operands, placed once per Σ call: the Green's right
-        # operand (conj ψ_nmu with every band, merged) and the projector's.
-        @jax.jit
-        def place(yr, yn):
-            # subtile_stream.band_complete's columns and projection_complete's right operand.
-            cols = jax.lax.with_sharding_constraint(yr, NamedSharding(mesh_xy, P(None, None, None, 'y')))
-            right_p = jax.lax.with_sharding_constraint(yn, NamedSharding(mesh_xy, P(None, None, 'y', None)))
-            return green_right_operand(cols), right_p
-        right_g, right_p = place(right_yr, right_proj)
         w_tables = tuple(synthesis.w_tables)
-        n_w = int(np.max(np.asarray(w_tables[0].row))) + 1     # the W parents (irreducible q)
-        # One local row's live set: the parent Green and its partner, the
-        # door's Σ rows, the pass's rows of W(t) and its partner, the pass's
-        # ψ rows (Green and projection).
-        row_bytes = 16 * ((1 + partner) * n_parent * ns * ns * nu + n_parent * ns * ns * nu
-                          + 2 * n_w * n_a * n_b * nu + n_parent * ns * (nb + nb_sig))
-        passes = plan_rows(local_rows, row_bytes, lambda: sorted(
-            set(orbit_cuts(g_tables.lsrc, px, ns))
-            & set.intersection(*(set(orbit_cuts(t.lsrc, px, n_a)) for t in w_tables))))
-        stages = []
-        for x0, xr in passes:
-            whole = (x0, xr) == (0, local_rows)
-            cut = (lambda t, k: t) if whole else (lambda t, k: pass_tables(t, x0, xr, px, k))
-            gemm = gemm_plan(mesh_xy, m=px * xr * ns, k=nb, n=n * ns, nq=n_parent,
-                             dtype=jnp.complex128, layout='axis', warmup=False)
-            doors = {hole: make_kconv_lorentz_unfold(
-                mesh_xy, kgrid, cut(g_tables, ns), left_vertices=vertices[0],
-                right_vertices=vertices[1], store_rows=plans[0].parent_full_rows,
-                norm='ortho', mult=mult, w_tables=cut(w, n_a))
-                for hole, w in ((False, w_tables[0]), (True, w_tables[1]))}
-            project = contract_bands_block_reshard(
-                mesh_xy, channels="none", layout="axis", face_shape=(n_parent, nb, px * xr, ns),
-                right_face_shape=(n_parent, nb, n, ns), face_band_extent=nb_sig)
-            stages.append((whole, gemm, doors, project))
-        finish = stages[0][3].finish
-        key_t = (mesh_xy, id(plans[0]), id(plans[1]), id(w_tables[0]), id(w_tables[1]))
-        if key_t not in _SECTOR_DOOR_LOADS:
-            while len(_SECTOR_DOOR_LOADS) >= 8:
-                _SECTOR_DOOR_LOADS.pop(next(iter(_SECTOR_DOOR_LOADS)))
-            # The plans and tables ride along so their ids in the key cannot be reused.
-            _SECTOR_DOOR_LOADS[key_t] = ((plans, w_tables), (
-                device_load_tables(g_tables, mesh_xy),
-                tuple(device_load_tables(t, mesh_xy) for t in w_tables)))
-        door_loads = _SECTOR_DOOR_LOADS[key_t][1]
-        psi_bytes = 16 * n_parent * ns * (nb + nb_sig) * (local_rows + nu)
-        price = dict(d=ns, ns=ns, passes=len(passes),
-                     new=float(max(xr for _, xr in passes) * row_bytes + psi_bytes))
-        from common.gpu_utils import record_stage_price
-        record_stage_price(f"Sigma tau {keys[0]}, {len(passes)} row pass(es)", price["new"],
-                           section="sigma.tau_sweep")
-        if jax.process_index() == 0:
-            print(f"Sigma tau stream {''.join('CT'[f] for f in (int(lefts != (0,)), int(rights != (0,))))}: "
-                  f"{len(passes)} row pass(es) of {max(xr for _, xr in passes)} local rows "
-                  f"({local_rows} per rank)", flush=True)
-        partial_spec = NamedSharding(mesh_xy, P(None, ('x', 'y')))
-        w_spec = P(None, 'x', None, 'y', None)
-
-        def spatial(xn, yr, xr, yn, energies, weight, reference, time, interactions, loads):
-            # xn, xr: the left band-complete ψ rows and projection rows (placed
-            # by the caller); yr, yn: the right Green operand and projection
-            # operand, and ``loads`` the doors' placed tables (window arguments).
-            phases = _weighted_tau_phases(energies, 1j*time, e_ref=reference, band_weight=weight)
-            hole = interactions.hole
-            g_load, w_load = loads[0], loads[1][int(hole)]
-            zero = jax.lax.with_sharding_constraint(
-                jnp.zeros((1, px * py * n_parent, nb_sig, nb_sig), jnp.complex128), partial_spec)
-
-            def step(p, x0, xr_, acc, operands):
-                whole, gemm, doors, project = stages[p]
-                W, Wt, rows, left_p = operands
-                if not whole:
-                    W, Wt = (pass_rows(w, mesh_xy, x0, xr_, axis=1, spec=w_spec) for w in (W, Wt))
-                    rows = pass_rows(rows, mesh_xy, x0, xr_, axis=2)
-                    left_p = pass_rows(left_p, mesh_xy, x0, xr_, axis=3)
-                green = build_G_parents(rows, None, phases=phases, layout='axis', gemm=gemm,
-                                        k_unfold_plan=plans[0], real_weights=False, right=yr)
-                sigma = doors[hole](green.G, green.transpose, W, Wt,
-                                    conj_partner=green.conj_partner,
-                                    load=g_load if whole else pass_load(g_load, mesh_xy, x0, xr_, ns),
-                                    w_load=(w_load if whole else
-                                            pass_load(w_load, mesh_xy, x0, xr_, n_a)))
-                return project.accumulate((jnp.conj(left_p), yn), sigma, acc=acc)
-            return finish(fold_passes(passes, step, zero,
-                                      (interactions.W, interactions.partner, xn, xr)))
-        spatial.price = price
-        key = (mesh_xy, shapes_key, int(nb_sig), tuple(keys), kgrid, int(meta.nk_tot),
-               id(plans[0]), id(plans[1]), id(w_tables[0]), id(w_tables[1]), tuple(passes))
-        return SynthesisTau(spatial, synthesis, right_g, right_p, synthesis.native,
-                            f'sigma.sector.tau.{keys[0]}', meta, key, (*plans, *w_tables),
-                            door=door_loads)
-    shapes_key = (n_parent, nb, m, n, ns)
+        node = sector_node(left, right, keys, meta, mesh_xy, w_tables, band_axis)
+        right_g, right_p = sector_right_operands(right, band_axis, mesh_xy)
+        return SynthesisTau(node.spatial, synthesis, right_g, right_p, synthesis.native,
+                            f'sigma.sector.tau.{keys[0]}', meta, node.key, (*node.plans, *w_tables),
+                            door=node.loads)
     return factory
 
 
@@ -498,9 +533,9 @@ def instantaneous_sector_sigma(handle, families, bases, meta, mesh_xy, *,
 
     The constant is read and packed on its irreducible q (in parent-q panels
     only when raw + packed do not fit the ledger); each endpoint class is its
-    parent pair ``(W, conj W)``, which the four-current door unfolds on its
-    load with the occupied Green (``gw.photon_sigma.contract_lorentz_blocks``,
-    d = 1, one branch).  No full-q class operand is formed.
+    parent pair ``(W, conj W)``, read with the occupied Green by the class's
+    :func:`sector_node` at τ = 0 on one branch (``gw.photon_sigma.contract_lorentz_blocks``).
+    No full-q class operand is formed.
     """
     from gw.photon_layout import PhotonBasisLayout, pack_photon_operator
     from gw.photon_sigma import contract_lorentz_blocks, _TERM_X
@@ -551,17 +586,8 @@ def instantaneous_sector_sigma(handle, families, bases, meta, mesh_xy, *,
     gij=_resolve_Gij(None,meta,mesh_xy,occupation_state)
     keys=tuple((a,b) for a in range(4) for b in range(4))
     def admit(kernel,args,key):
-        a,b=map(bool,key)
-        left,right=(families[i].green_parent for i in (a,b))
-        q=left.plan.n_parent;m=left.plan.n_centroid_packed*left.plan.nspinor
-        n=right.plan.n_centroid_packed*right.plan.nspinor;k=left.psi_nmu.shape[1]
-        # The static face projector contracts O @ psi_right, then
-        # psi_left† @ T, both over the padded carrier (k), before the
-        # final logical-band slice. Query those actual GEMM shapes.
-        native=_native_workspace(mesh_xy,(((q,m,k),(q,k,n)),
-            ((q,m,n),(q,n,k)),((q,k,m),(q,m,k))))
-        _admit_compiled(kernel,args,meta,f'sigma.sector.constant.{key}',
-                        native=native,resident=amount)
+        # The sector node's GEMMs are local XLA programs: the compiled figure is the peak.
+        _admit_compiled(kernel,args,meta,f'sigma.sector.constant.{key}',resident=amount)
     total=None
     currents=[None,None]
     for key,value,_ in contract_lorentz_blocks(keys,families=families,term=_TERM_X,
