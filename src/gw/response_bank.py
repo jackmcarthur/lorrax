@@ -1085,12 +1085,8 @@ def moment_q_width(ledger, *, n_q, face_bytes, per_q):
     batch's correlations, Coulomb read and Dyson temporaries reserve their own
     footprints in the ledger.
     """
-    from common.gpu_utils import record_stage_price
     from runtime.tiles import TILE_BYTES
-    width = max(1, min(int(n_q), int((TILE_BYTES / face_bytes - 16) // per_q)))
-    record_stage_price(f"moment bank, q width {width}/{int(n_q)}",
-                       (per_q * width + 16) * face_bytes)
-    return width
+    return max(1, min(int(n_q), int((TILE_BYTES / face_bytes - 16) // per_q)))
 
 
 @contextmanager
@@ -1220,10 +1216,9 @@ def compute_moment_bank(wfns, meta, config, *, mesh_xy, sym, bank_io,
     n_total = 4 if ordered else 2
     streamed = None
     if vertex is None and not np.asarray(header["moment_written"]).any():
+        qwidth = moment_q_width(ledger, n_q=len(qids), face_bytes=face_bytes, per_q=3 * n_total + 4)
         with timing.section("bank.moment_stream"):
             stream_started = time.monotonic()
-            qwidth = moment_q_width(ledger, n_q=len(qids), face_bytes=face_bytes,
-                                    per_q=3 * n_total + 4)
             streamed = streamed_moment_totals(wfns, meta, mesh_xy=mesh_xy, qids=qids,
                 width=qwidth, execute=execute, ordered=ordered, receipt=receipt,
                 root=bank_io["root"])
@@ -1235,69 +1230,76 @@ def compute_moment_bank(wfns, meta, config, *, mesh_xy, sym, bank_io,
     receipt["q_batches"] = [[q0, min(q0 + qwidth, len(qids))] for q0 in range(0, len(qids), qwidth)]
     runs = None if streamed is None else streamed.reader(
         [(j * n_total, (j + 1) * n_total) for j in range(len(receipt["q_batches"]))])
-    for q0 in range(0,len(qids),qwidth):
-        q1 = min(q0+qwidth,len(qids))
-        ledger.live_stages = ambient
-        name,_ = _reserve(meta,"bank_outputs_moments",(per_q*(q1-q0)+16)*face_bytes)
-        ledger.live_stages = ambient+(name,)
-        if not np.asarray(header["moment_written"])[q0:q1].all():
-            with _moment_phase(receipt, "correlations"):
-                if runs is not None:
-                    totals = _moment_batch_split(mesh_xy, n_total, q1 - q0)(next(runs))
-                    a0, a1, o0, o1 = totals if ordered else (*totals, None, None)
-                    del totals
-                elif ordered:
-                    a0, a1, o0, o1, _ = exact_bare_moments(wfns, meta, mesh_xy=mesh_xy,
-                        q_ids=tuple(qids[q0:q1]), execute=execute, ordered=True, vertex=vertex)
-                else:
-                    a0, a1, _ = exact_bare_moments(wfns, meta, mesh_xy=mesh_xy,
-                                              q_ids=tuple(qids[q0:q1]), execute=execute)
-                # The batch's totals finish here, so their device time is theirs.
-                jax.block_until_ready((a0, a1) + ((o0, o1) if ordered else ()))
-            with _moment_phase(receipt, "coulomb"):
-                h, hi, ranks = _coulomb_batch(meta, config, bank_io, mesh_xy, (q0,q1), execute)
-                del hi
-            operands = (h,a0,a1,o0,o1) if ordered else (h,a0,a1)
-            with _moment_phase(receipt, "dyson"):
-                result = execute(moments, operands + (() if vertex is None else (contact,)),
-                                 "moment_dyson")
-                jax.block_until_ready(result)
-            names = (("constant", "M0", "M1", "M2", "M3") if vertex is not None else
-                     (("M0", "M1", "M2", "M3") if ordered else ("M1", "M3")))
-            values = dict(zip(names,result))
-            if direct_head is not None and q0 == 0:
-                if int(qids[0]) != 0:
-                    raise ValueError("GATE photon_direct_gamma_parent: Γ is not the first q parent")
-                from .photon_direct_head import add_direct_gamma_field
-                for name, coefficient in (("constant", direct_head["constant"]),
-                        *((f"M{i}", direct_head["moments"][i]) for i in range(4))):
-                    values[name] = add_direct_gamma_field(values[name], coefficient,
-                        gamma_vectors=direct_head["gamma_vectors"],
-                        layout=bank_io["photon_layout"], mesh=mesh_xy)
-            if ordered:
-                with _moment_phase(receipt, "diagnostics"):
-                    _record_odd_moments(q0, *(values[name] for name in ("M0", "M1", "M2", "M3")),
-                                        receipt)
-            # One write for a fresh batch; partial restarts group identical
-            # commit masks so no already committed field is overwritten.
-            marked = np.asarray(header["moment_written"], bool)[q0:q1]
-            edges = np.r_[0, 1+np.flatnonzero(np.any(marked[1:] != marked[:-1],axis=1)), q1-q0]
-            fields = ("M1", "M3", "M0", "M2", "constant")[:marked.shape[1]]
-            for lo,hi in zip(edges[:-1],edges[1:]):
-                if marked[lo].all():
-                    continue
-                span = (int(q0+lo),int(q0+hi))
-                io_started = time.monotonic()
-                header = write_shared_pole_bank(bank_io["path"], q_span=span,
-                    **{name: values[name][lo:hi] for i,name in enumerate(fields) if not marked[lo,i]},
-                    meta=meta, expected_identity=bank_io["identity"], mesh_xy=mesh_xy)
-                receipt["seconds"]["io"] = receipt["seconds"].get("io",0.)+time.monotonic()-io_started
-                receipt["batches"].append(dict(q_span=span,support_ranks=ranks[lo:hi]))
-            del h,a0,a1,operands,result,values
-            if ordered:
-                del o0,o1
-            if runs is None:
-                receipt["correlation_count"] += 10 if ordered else 6
+    # The q batches in their own section: the price judged against their peak is the
+    # ledger's live set plus one batch's tile (the stream's peak is the stream's).
+    from common.gpu_utils import record_stage_price
+    with timing.section("bank.moment_batches"):
+        record_stage_price(f"moment bank, q width {qwidth}/{len(qids)}", ledger.preview(
+            resident_bytes_per_rank=(per_q * qwidth + 16) * face_bytes, workspace_bytes_per_rank=0,
+            concurrent_with=ambient)["aggregate_bytes_per_rank"])
+        for q0 in range(0,len(qids),qwidth):
+            q1 = min(q0+qwidth,len(qids))
+            ledger.live_stages = ambient
+            name,_ = _reserve(meta,"bank_outputs_moments",(per_q*(q1-q0)+16)*face_bytes)
+            ledger.live_stages = ambient+(name,)
+            if not np.asarray(header["moment_written"])[q0:q1].all():
+                with _moment_phase(receipt, "correlations"):
+                    if runs is not None:
+                        totals = _moment_batch_split(mesh_xy, n_total, q1 - q0)(next(runs))
+                        a0, a1, o0, o1 = totals if ordered else (*totals, None, None)
+                        del totals
+                    elif ordered:
+                        a0, a1, o0, o1, _ = exact_bare_moments(wfns, meta, mesh_xy=mesh_xy,
+                            q_ids=tuple(qids[q0:q1]), execute=execute, ordered=True, vertex=vertex)
+                    else:
+                        a0, a1, _ = exact_bare_moments(wfns, meta, mesh_xy=mesh_xy,
+                                                  q_ids=tuple(qids[q0:q1]), execute=execute)
+                    # The batch's totals finish here, so their device time is theirs.
+                    jax.block_until_ready((a0, a1) + ((o0, o1) if ordered else ()))
+                with _moment_phase(receipt, "coulomb"):
+                    h, hi, ranks = _coulomb_batch(meta, config, bank_io, mesh_xy, (q0,q1), execute)
+                    del hi
+                operands = (h,a0,a1,o0,o1) if ordered else (h,a0,a1)
+                with _moment_phase(receipt, "dyson"):
+                    result = execute(moments, operands + (() if vertex is None else (contact,)),
+                                     "moment_dyson")
+                    jax.block_until_ready(result)
+                names = (("constant", "M0", "M1", "M2", "M3") if vertex is not None else
+                         (("M0", "M1", "M2", "M3") if ordered else ("M1", "M3")))
+                values = dict(zip(names,result))
+                if direct_head is not None and q0 == 0:
+                    if int(qids[0]) != 0:
+                        raise ValueError("GATE photon_direct_gamma_parent: Γ is not the first q parent")
+                    from .photon_direct_head import add_direct_gamma_field
+                    for name, coefficient in (("constant", direct_head["constant"]),
+                            *((f"M{i}", direct_head["moments"][i]) for i in range(4))):
+                        values[name] = add_direct_gamma_field(values[name], coefficient,
+                            gamma_vectors=direct_head["gamma_vectors"],
+                            layout=bank_io["photon_layout"], mesh=mesh_xy)
+                if ordered:
+                    with _moment_phase(receipt, "diagnostics"):
+                        _record_odd_moments(q0, *(values[name] for name in ("M0", "M1", "M2", "M3")),
+                                            receipt)
+                # One write for a fresh batch; partial restarts group identical
+                # commit masks so no already committed field is overwritten.
+                marked = np.asarray(header["moment_written"], bool)[q0:q1]
+                edges = np.r_[0, 1+np.flatnonzero(np.any(marked[1:] != marked[:-1],axis=1)), q1-q0]
+                fields = ("M1", "M3", "M0", "M2", "constant")[:marked.shape[1]]
+                for lo,hi in zip(edges[:-1],edges[1:]):
+                    if marked[lo].all():
+                        continue
+                    span = (int(q0+lo),int(q0+hi))
+                    io_started = time.monotonic()
+                    header = write_shared_pole_bank(bank_io["path"], q_span=span,
+                        **{name: values[name][lo:hi] for i,name in enumerate(fields) if not marked[lo,i]},
+                        meta=meta, expected_identity=bank_io["identity"], mesh_xy=mesh_xy)
+                    receipt["seconds"]["io"] = receipt["seconds"].get("io",0.)+time.monotonic()-io_started
+                    receipt["batches"].append(dict(q_span=span,support_ranks=ranks[lo:hi]))
+                del h,a0,a1,operands,result,values
+                if ordered:
+                    del o0,o1
+                if runs is None:
+                    receipt["correlation_count"] += 10 if ordered else 6
     if streamed is not None:
         for key, value in streamed.seconds.items():
             receipt["seconds"]["moment_stream_" + key] = value
