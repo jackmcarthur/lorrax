@@ -583,6 +583,40 @@ def _odd_moment_ratios(M0, M1, M2, M3):
     return jnp.stack([2 * norm(M0) / norm(M1), 2 * norm(M2) / norm(M3)], axis=-1)
 
 
+@lru_cache(maxsize=8)
+def _anti_hermitian_ratios(mesh_xy):
+    """Per-parent max|A - A^H| / max|A| of face-tiled [b, n, n] stacks, replicated."""
+    def ratio(a):
+        defect = jnp.max(jnp.abs(a - jnp.conj(jnp.swapaxes(a, -1, -2))), axis=(-2, -1))
+        scale = jnp.max(jnp.abs(a), axis=(-2, -1))
+        return jnp.where(scale > 0, defect / jnp.where(scale > 0, scale, 1), 0)
+    return jax.jit(lambda *stacks: jnp.stack([ratio(a) for a in stacks]),
+                   out_shardings=NamedSharding(mesh_xy, P()))
+
+
+def _check_bare_hermitian(mesh_xy, q0, receipt, **moments):
+    """GATE response_moment_hermiticity on one q batch's even bare moments.
+
+    The constructor selects its infinity directions from the Hermitian part of
+    M1 (``shared_pole_directions.infinity_directions``), so the Hermiticity of
+    what M1 is formed from is checked here, at the checked eigh's 1e-12. GPU
+    streams give <= 4e-16 (CrI3 24x24, n = 3328); the replicated ratios make
+    every rank refuse alike.
+    """
+    ratios = np.asarray(_anti_hermitian_ratios(mesh_xy)(*moments.values()), dtype=np.float64)
+    receipt["bare_anti_hermitian_max"] = max(float(np.nanmax(ratios, initial=0.0)),
+                                             receipt.get("bare_anti_hermitian_max", 0.0))
+    bad = ~(ratios <= 1e-12)
+    if bad.any():
+        f, i = (int(v) for v in np.argwhere(bad)[0])
+        raise ValueError(
+            f"GATE response_moment_hermiticity: got: bare moment {list(moments)[f]} of q parent "
+            f"{q0 + i} has max|A-A^H|/max|A| = {ratios[f, i]:.3e} ({int(bad.sum())} of {bad.size} "
+            "(moment, parent) rows above 1e-12); want: <= 1e-12 (GPU streams give <= 4e-16); "
+            "why: the exact moments are Hermitian and the constructor reads M1's Hermitian part, "
+            "so an anti-Hermitian input would be dropped unseen")
+
+
 def _record_odd_moments(q0, M0, M1, M2, M3, receipt):
     """Record a q batch's band-truncation diagnostic ||m0||/||M1||, ||m2||/||M3||.
 
@@ -1292,6 +1326,8 @@ def compute_moment_bank(wfns, meta, config, *, mesh_xy, sym, bank_io,
                                                   q_ids=tuple(qids[q0:q1]), execute=execute)
                     # The batch's totals finish here, so their device time is theirs.
                     jax.block_until_ready((a0, a1) + ((o0, o1) if ordered else ()))
+                with _moment_phase(receipt, "diagnostics"):
+                    _check_bare_hermitian(mesh_xy, q0, receipt, A0=a0, A1=a1)
                 with _moment_phase(receipt, "coulomb"):
                     h, hi, ranks = _coulomb_batch(meta, config, bank_io, mesh_xy, (q0,q1), execute)
                     del hi
