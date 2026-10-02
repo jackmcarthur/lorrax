@@ -480,8 +480,15 @@ def response_stream(wfns, meta, *, mesh_xy, q_ids, n_outputs,
         (nk, int(wfns.slices.nb_full), n, int(meta.nspinor)),
         k_unfold_plan=parent, _ffi_key=ffi_dial_key(), layout=wfns.layout, selected_q=tuple(q_ids),
         pair_mode=pair_mode, bank_carry=bank_carry, ordered=ordered, band_ranges=band_ranges,
-        **({} if stream_pass is None else dict(stream_pass=int(stream_pass))))
+        # One segment program for every pass; the caller passes the pass index (stream_pass_index).
+        **({} if stream_pass is None else dict(stream_pass=0)))
     return kernel, (source.psi_mun, source.psi_nmu, source.enk)
+
+
+def stream_pass_index(p, vertex):
+    """The trailing argument of a direct segment program: the charge stream's one program
+    takes its pass index at run time; the four-current stream compiles each segment."""
+    return () if vertex is not None else (jnp.int32(p),)
 
 
 def stream_weights(wfns, weights, mesh_xy):
@@ -1179,8 +1186,8 @@ def streamed_moment_totals(wfns, meta, *, mesh_xy, qids, width, execute, ordered
         kernel, fixed = response_stream(wfns, meta, mesh_xy=mesh_xy, q_ids=tuple(qids),
             n_outputs=n_out, pair_mode="direct", bank_carry=True, ordered=ordered, stream_pass=p)
         carry = _group_zeros(mesh_xy, (n_out, nq, px * rows, py * cols))()
-        carry = execute(kernel, common + tuple(fixed) + tail + (carry,), "moment_correlation",
-                        runtime_bytes=scratch)
+        carry = execute(kernel, common + tuple(fixed) + tail + (carry,) + stream_pass_index(p, None),
+                        "moment_correlation", runtime_bytes=scratch)
         bank.put(p, order(carry), outputs)
         del carry
     bank.commit()
@@ -1654,7 +1661,8 @@ def integrate_response_group(wfns, meta, mesh_xy, rules, group, *, q_ids,
                 n_outputs=weights.shape[1], pair_mode="direct", bank_carry=True, ordered=ordered,
                 vertex=vertex, band_ranges=rules["band_ranges"], stream_pass=p)
             raw = _group_zeros(mesh_xy, (weights.shape[1], len(q_ids), px * rows, py * cols))()
-            raw = execute(kernel, common + tuple(fixed) + tail + (raw,), "direct", runtime_bytes=scratch)
+            raw = execute(kernel, common + tuple(fixed) + tail + (raw,) + stream_pass_index(p, vertex),
+                          "direct", runtime_bytes=scratch)
             bank.put(p, raw, outputs)
             del raw
         return None
