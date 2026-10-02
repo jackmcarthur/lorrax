@@ -1367,12 +1367,13 @@ def sector_execution(meta, config, mu_bases, nq, *, mesh_xy, upstream):
         upstream=upstream,ordered=True,odd_moments=True,
         selection_faces=joint_faces,sample_batch=len(recipe['fit_ids'])-lines,parent_count=nq,
         retained_output_families=2,column_extent=extent,
-        defer_reduction=True,
         cross_original_sides=tuple(row['conservative_pencil_side'] for row in execution_rows),
         cross_retained_side=sum(min(row['signed_side_bound'],row['conservative_pencil_side'])
                                 for row in execution_rows))
     resolved_execution=('face' if joint_mode=='face' or
                         any(row['mode']=='face' for row in execution_rows)
                         else 'local')
+    for row in execution_rows:
+        row['joint']=dict(mode=joint_mode,**joint_route)
     return resolved_execution,execution_rows
 
