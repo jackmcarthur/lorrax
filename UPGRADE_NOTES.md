@@ -1,7 +1,9 @@
 # Upgrade notes
 
-User-visible changes, newest first. Binding rulings behind the breaking
-changes live in `docs/architecture/decisions.md`.
+User-visible changes, newest first. Each entry says what changed, which
+results move, and what a user must change in decks, environment or files.
+The binding rulings behind breaking changes are in
+`docs/architecture/decisions.md`; older history is in git.
 
 ## 2026-10-02 — band extrapolation on the four-current Σ (`full_shared_pole`)
 
@@ -40,7 +42,7 @@ the host budget, else in one file per rank under
 `<run dir>/<label>_shared_pole/streamed_bank/`. gwjax.out names the choice, for
 example `Response quadrature: chi bank file, 34.94 GiB/rank; streamed; exceeds
 half the host budget`. Results are bitwise (Fe 4³, Na 8³ and Fe 4³ bispinor
-SC maps 0–2; claims 3082, 3111). The Fe 8³ P4 χ build takes 35 → 19 s per map.
+SC maps 0–2). The Fe 8³ P4 χ build takes 35 → 19 s per map.
 
 - **Scratch.** A large deck needs the χ bank's bytes free on scratch, and
   under the quota, during every map: 2.4 TB for Ni 20³ charge and 15.3 TB for
@@ -64,7 +66,8 @@ SC maps 0–2; claims 3082, 3111). The Fe 8³ P4 χ build takes 35 → 19 s per 
   a store created after others had been written counted their bytes twice
   against the quota, was refused, and was then written: the map failed with
   `GATE io_global_commit … streamed_bank.commit` and a `KeyError` (Ni 20³ P64,
-  map 1). The `lorrax_A` module on source-4dd37249 predates the fix.
+  map 1). A source tree before 6bc09936c, and a module built from one, still
+  fails this way.
 
 ## 2026-10-01 — row passes run as one scan; compile no longer grows with the pass count
 
@@ -80,9 +83,9 @@ stream, whose peak falls by 3.6 GB per rank. Walls are within ±1 %. A rank whos
 tile runs one pass and is bitwise (Fe 4³ scalar, Na 8³ and Fe 4³ bispinor
 SP-full, maps 0–2). With several Σ passes per rank the sums group
 differently and move at round-off, the size of a 4e-16 control (≤ 1e-7 eV on
-Fe 4³ forced to many passes); the χ streams stay bitwise (claims 3114,
-3122). The k-convolutions' `live` operand needs bundle B9r or later; the
-`lorrax_A` module has it.
+Fe 4³ forced to many passes); the χ streams stay bitwise. The
+k-convolutions' `live` operand needs a native bundle built from this source
+or later.
 
 ## 2026-10-01 — the photon bank solves a sample's Dyson value and slope in one program
 
@@ -154,7 +157,7 @@ Cholesky keep one tile per rank (block-cyclic solves measured 2–3× slower).
 Eigenpairs move at round-off (eigenvalues ≤ 1e-15 relative). Fe 4³
 `linalg = distributed` eqp0 at maps 0–2 is bitwise at its natural block and
 moves ≤ 1.8e-4 meV at a forced block of 72, the size of a 4e-16 control
-(1.4e-4 meV; claim 3093).
+(1.4e-4 meV).
 
 ## 2026-10-01 — the static Σ runs the Σ τ kernel at τ = 0; the map-0 exchange compile is gone
 
@@ -167,7 +170,7 @@ which now takes about 10 s. At the P64-local tile a cold call takes 28.7 →
 6.7 s (compile 25.0 → 2.4 s), a warm call 0.720 → 0.672 s, and the peak
 14.0 → 8.9 GB per rank. Results move at round-off: Σ_x by 4.1e-16 relative
 at most; map 0 is bitwise, and Fe 4³ and Na 8³ SC maps 1–2 move by the size
-of a 4e-16 Σ_x control (claim 3095).
+of a 4e-16 Σ_x control.
 
 ## 2026-10-01 — no `coulomb.h5`; an older bank's constructor resume refuses
 
@@ -241,8 +244,8 @@ compiled a third stream program in the middle of map 0 (47.8 s on the Ni 20³
 P64 run, which then died of host memory in that dispatch). A short group now
 fills its empty slots with zero weights and runs the planned group's program;
 it reserves the slots it allocates. Results are unchanged: with the group
-forced to 5 on Fe 4³ (groups 5,5,5,5,2), eqp0 at maps 0–2 is bitwise to main
-at group 5 and at the default single group, and map 0 compiles two direct
+forced to 5 on Fe 4³ (groups 5,5,5,5,2), eqp0 at maps 0–2 is bitwise to the
+previous code at group 5 and at the default single group, and map 0 compiles two direct
 programs instead of three. Decks whose samples fit one group are unaffected.
 
 ## 2026-09-30 — the scalar χ₀ mode-11 kconv call reads its tables as operands
@@ -251,8 +254,8 @@ The charge response stream on a raw-parent plan (the shared-pole direct
 stream, the moment correlations and the retarded stream) baked its plan's
 global unfold tables (row, trs, lsrc, rsrc, mph, nph, spin) into every
 program as HLO constants. The tables now enter as device operands, placed
-once per run and plan (`ffi.fft.make_kconv_chi_unfold(load=)`, the R189
-four-current route), and the stream binds them as a trailing argument.
+once per run and plan (`ffi.fft.make_kconv_chi_unfold(load=)`, as the
+four-current route does), and the stream binds them as a trailing argument.
 At the Fe 20³ table size (8000 k, 1792 centroids, one node): compile
 7.08 → 0.57 s per program, generated code 115 → 0.1 MB, and each held
 executable no longer adds host memory (+1.54 GB → +0.00 GB RSS per rank for
@@ -292,13 +295,14 @@ instead of 73.1 GB, and the 360-band loop at 90.3 GB instead of 99.5 GB.
 Loops of four or more full panels with no tail were already folded and compile
 the same; P36 runs six. Two-panel loops (P4) keep XLA's GEMM. Results are
 bitwise: with the panel loop forced to six panels, Fe 4³ scalar and bispinor
-SP-full, Na 8³ and MoS2 SC + BSE match main, beside a 4e-16 control that moves.
+SP-full, Na 8³ and MoS2 SC + BSE match the previous code, beside a 4e-16
+control that moves.
 
 `distrib_la.panel_matmul_extra_tiles` is deleted, and the photon row-pass count
 no longer adds two Green tiles at p_x ≥ 3. Fe 20³ P36 at M_T 900 now prices
 1,1,1,1 row passes at 70 or 75 GB (was 2,1,1,1), counted at 64.33 GB. M_T 1800
 prices 3,7,7,14 at 75 GB (was 4,7,7,15). The 2,1,1,1 that the counted-passes
-release (R190) gave P36 was an over-count. P36's 6-panel loop never held the two
+entry below gave P36 was an over-count. P36's 6-panel loop never held the two
 extra tiles: its CC stream compiles at 60.68 GB before and after this change.
 
 ## 2026-09-30 — four-current row passes are counted, not fitted
@@ -431,7 +435,7 @@ window-hybridization gate fails) zero the term, on every map.
 SC decks whose links were above the bound move once: MoS2 3×3 SOC (link error
 9.2 %) converges to a 4.48 eV gap with the term served (5.17 eV with it
 zeroed). Decks that stayed below 1 % are bitwise (Fe 4³ scalar)
-([self-consistency §7](docs/self_consistency.md#metals-direct-drude-head)).
+([self-consistency](docs/self_consistency.md#metals-direct-drude-head)).
 
 ## 2026-09-30 — parallel-transport links: schema 4 on the link shell; rerun the dipole step
 
@@ -447,7 +451,7 @@ longer. Orthogonal lattices keep the three axes. Fe 4³ bispinor eqp moves
 now run `parallel_transport` when a link artifact exists, as scalar decks
 do, and move once (Fe 4³ eqp0 within E_F ± 10 eV ≤ 9.7 meV). On a metal,
 `bare_transverse` refuses `parallel_transport`
-([self-consistency §7](docs/self_consistency.md#metals-direct-drude-head)).
+([self-consistency](docs/self_consistency.md#metals-direct-drude-head)).
 
 ## 2026-09-30 — regenerate `WFN_qp.h5` from WFNs that store both k and −k
 
@@ -456,7 +460,7 @@ do, and move once (Fe 4³ eqp0 within E_F ± 10 eV ≤ 9.7 meV). On a metal,
 and the BSE and GW runs that read it used them. Regenerate it with
 `python -m postprocess.rotate_wfn_to_qp WFN.h5 qp_wfn_rotations.h5`; WFNs
 without such rows (Si) give the same file
-([self-consistency §8](docs/self_consistency.md#8-seeding-restart-and-outputs)).
+([self-consistency](docs/self_consistency.md#8-seeding-restart-and-outputs)).
 An SC run that writes `WFN_qp.h5` now binds `dipole_qsgw.h5` to it, so a GW
 run on `WFN_qp.h5` can take that file as its `dipole.h5`.
 
@@ -466,7 +470,7 @@ Held shared-pole W line sites are re-placed only when they would move by more
 than max(3 meV, a tenth of the previous map's max|dE|). SC runs that re-plan
 their sites move once; Fe 4³ scalar `parallel_transport` SC now converges
 (28 maps; it stalled at map 16)
-([self-consistency §6](docs/self_consistency.md#shared-pole-w-with-retained-quadrature)).
+([self-consistency](docs/self_consistency.md#shared-pole-w-with-retained-quadrature)).
 
 ## 2026-09-29 — `qp_solver = fixed_point` and `eqp_root.dat` are retired
 
@@ -508,38 +512,38 @@ metals too.
 
 ## 2026-09-29 — `sc_semicore = dft`: semicore pinned at its DFT block, mixing kept
 
-New SC key, default `dft` (owner 2026-09-29: "sure we can keep DFT the default"); `qp` is the previous behaviour. Every dynamic SC deck with a coarse class moves once.
+New SC key, default `dft`; `qp` is the previous behaviour. Every dynamic SC
+deck with a coarse class moves once.
 Under `dft` the coarse (semicore) class keeps its DFT block of H in the DFT
 basis and its end of every protected–semicore element reads Σ at E_DFT on the
-held coarse windows ([self-consistency §2](docs/self_consistency.md#2-band-treatment)).
+held coarse windows ([self-consistency](docs/self_consistency.md#2-band-treatment)).
 Fe 4³ and MoS2 3×3 prot at η_semi 5 and 8 eV: same maps to converge (14, 8),
 equal or fewer τ pairs (MoS2 333 → 321), semicore QP within 27 meV of DFT
 (qp: 0.1–6 eV deeper), and the protected states' η_semi 8 − 5 spread falls
 3–6× (E_F ± 10 eV std Fe 5.1 → 1.4, MoS2 5.0 → 0.8 meV). The default is a
 no-op on a run without a coarse class (static modes, an `nval`
-that covers every occupied band). Sandbox claim 2964.
+that covers every occupied band).
 
 ## 2026-09-29 — coarse (semicore) windows certified at max(ε, 3e-3)
 
 Self-consistent decks with a coarse class move once. The coarse windows are
-certified at max(`sigma_quadrature_eps`, 3e-3) (`qp_support.SEMICORE_EPS`,
-owner 2026-09-29), so at the default ε 1e-4 they take 3e-3; every other Σ
+certified at max(`sigma_quadrature_eps`, 3e-3) (`qp_support.SEMICORE_EPS`),
+so at the default ε 1e-4 they take 3e-3; every other Σ
 window keeps `sigma_quadrature_eps`. At
 η_semi 1 eV against ε 1e-4: map-2 τ pairs MoS2 3×3 530 → 465, Fe 4³ charge
 1087 → 982; states within E_F ± 10 eV move ≤ 0.06 meV at maps 0–1 (≤ 1.9 meV
 at map 2 of the unconverged Fe run); semicore QP ≤ 4.3 meV at map 0. The
 planner's node law for grouping coarse windows is now evaluated on the box
-each run is built on, so it equals the certified count (claim 2960).
+each run is built on, so it equals the certified count.
 
 ## 2026-09-29 — the production QSGW partition: counted b3, semicore Σ read class
 
 Every dynamic self-consistent deck with a coarse class (`qp_solver =
 self_consistent`, scalar MPA/shared-pole route) moves once. See
-[self-consistency §2](docs/self_consistency.md#2-band-treatment).
+[self-consistency](docs/self_consistency.md#2-band-treatment).
 
-- **b3 counts bands, as before.** b3 = nelec + `ncond` (owner 2026-09-29: "b3
-  will count bands as on main yes, and only bands between b0 and b3 will be
-  rotated amongst each other"). The QP matrix [b0, b3) rotates among itself;
+- **b3 counts bands, as before.** b3 = nelec + `ncond`. The QP matrix
+  [b0, b3) rotates among itself;
   [b3, number_bands) is the scissored tail (DFT ψ, rigid shift, no Σ, no
   mixing). The ζ fit is unchanged. The classes below change only where
   Σ_c(ω) is read.
@@ -594,6 +598,16 @@ self_consistent`, scalar MPA/shared-pole route) moves once. See
   100, the held map from 335 to 276 s, and eqp0 within E_F ± 10 eV by at most
   1.28 meV (median ≤ 13 µeV).
 
+## 2026-09-28 — no quadrature rule is stored across runs; `sigma_quadrature_cache_dir` is retired
+
+Every run places its own Σ(ω) and χ quadrature rules and reuses them only
+inside the run. The deck key `sigma_quadrature_cache_dir` refuses by name:
+remove it. `LORRAX_MINIMAX_CACHE_DIR` and `LORRAX_DISABLE_MINIMAX_DISK_CACHE`
+are no longer read: unset them. The directories
+`$SCRATCH/.cache/lorrax/sigma_box_rules` and
+`~/.cache/lorrax/minimax_quadratures` are no longer used and can be deleted.
+Results equal those of a run that started with an empty cache.
+
 ## 2026-09-28 — band extrapolation on the shared-pole Σ
 
 - Scalar `compute_mode = mpa` (shared pole or MPA fit) now extrapolates the Σ_c
@@ -619,7 +633,43 @@ self_consistent`, scalar MPA/shared-pole route) moves once. See
   without a tail); new attributes `pooled_beta`, `pooled_omega_ev`,
   `pooled_residual_rms_ev`, `pooled_state_count`.
 
-## 2026-09-24 — k-axis convolutions on nvidia-mathdx (branch, not yet main)
+## 2026-09-26 — `occupation_window_threshold` is retired; one occupation support for χ and Σ
+
+The deck key `occupation_window_threshold` refuses by name: remove it. A band
+belongs to a Green's-function branch of χ or Σ if and only if its weight
+(f on the occupied branch, 1 − f on the empty one) is at least 1e-5 in
+magnitude, which for Fermi–Dirac occupations is 11.5 k_BT from μ
+(`gw.efermi.band_in_occupation_window`). The one-shot and every SC map use
+this one support; the previous floor was 0.005 (5.3 k_BT), which dropped
+states that still carry weight. Metal decks move once; insulators, whose
+weights are 0 or 1, are unchanged.
+
+## 2026-09-26 — `band_extrapolation_estimator = band_index_only` is retired
+
+The value `band_index_only` refuses by name. Remove the key, or set
+`band_extrapolation_estimator = spectral_shell`, the default and only accepted
+value ([band extrapolation](docs/theory/band-extrapolation.md)). The
+band-index fit S(N) = S_∞ + A/N ignores where the omitted bands lie in
+energy, and it was the least accurate estimator measured against a
+converged band-sum reference. Decks that did not name the value are unchanged.
+
+## 2026-09-24 — FFI handler ABI 6; a native library of another ABI refuses
+
+The Python tree and its native FFI handlers agree on handler ABI 6
+(`src/ffi/cpp/common/lorrax_ffi_abi.h`, mirrored by
+`ffi.common.ffi_loader.LORRAX_FFI_ABI_VERSION`). A sealed native bundle whose
+manifest records another `ffi_abi`, or a loose `liblorrax_ffi*.so` that stamps
+another ABI, refuses at startup before any handler is called ("native bundle
+ABI mismatch" or "HANDLER ABI MISMATCH"), because a mismatched handler
+otherwise fails later with an argument-count error that names neither
+library. A bundle's CUDA and host legs are used together:
+`LORRAX_FFI_SO` and `LORRAX_FFI_HOST_SO` must both be unset or both select
+one bundle, and a partial or mixed override refuses. What to change: on
+Perlmutter load the current `lorrax_A` module; elsewhere rebuild and reseal
+both legs from this source tree ([installation](docs/installation/index.md)).
+Do not point either variable at a library built from older source.
+
+## 2026-09-24 — k-axis convolutions on nvidia-mathdx
 
 - **NVIDIA GPUs now require the `nvidia-mathdx` wheel** (pinned in the
   `cuda12`/`cuda13` extras; header-only).  Without it a CUDA run refuses at
@@ -628,13 +678,11 @@ self_consistent`, scalar MPA/shared-pole route) moves once. See
   are gone: Σ, COHSEX and the BSE ladder/stack convolutions have one route
   per platform (nvidia-mathdx on CUDA, the host FFTW plans on cpu).  A leftover
   setting is ignored.
-- The FFI handler ABI is 4; a `liblorrax_ffi.so` built before this change is
-  refused by name.
 - The kernels compile on first use (about 6 s per k-grid) and are kept in
   `$SCRATCH/.cache/lorrax/kconv_mathdx` (else `~/.cache/lorrax/kconv_mathdx`);
   the second run of a deck loads them in ~10 ms.
-- The flat-k transform (χ0, head, htransform) also runs on nvidia-mathdx on
-  CUDA; `LORRAX_FFT_FFI` now governs the cpu leg only.
+- The flat-k transform (χ₀, head, htransform) also runs on nvidia-mathdx on
+  CUDA.
 
 ## 2026-08-28 — startup ownership, BSE mesh flags, emulated CPU meshes
 
@@ -658,8 +706,6 @@ self_consistent`, scalar MPA/shared-pole route) moves once. See
   end: `SlabIO` serves them through an announced serial tier
   (`file_io._slab_io_serial`, CPU only). The `p*q == process_count`
   refusals stand everywhere else.
-- `qp_solver = self_consistent` beside a dynamic `compute_mode`
-  (`gn_ppm`/`hl_ppm`/`mpa`) refuses at driver entry; pair it with `cohsex`.
 
 ## 2026-08-18 — retired HDF5 controls now refuse or are absent
 
@@ -670,209 +716,3 @@ self_consistent`, scalar MPA/shared-pole route) moves once. See
 - SlabIO no longer accepts `chunks=`. The argument was ignored and every
   collective dataset was already contiguous. The sigma and zeta writers no
   longer request a layout the native create cannot produce.
-- `LORRAX_PHDF5_CLOSE_VERBOSE` defaults to compact logging: empty/fast closes
-  are quiet, while queued or slow I/O still emits one summary. Set it to `1`
-  for the former per-phase diagnostics or `0` for silence.
-
-## Changes through 2026-08-01
-
-The remaining entries describe the earlier origin/main-to-HEAD upgrade.
-
-## What breaks (refusals and hard errors)
-
-**The FFI layer is REQUIRED** (`decisions.md` 2026-08-01). Where origin/main
-ran everything through native XLA, GW and htransform now route their flat-k
-FFTs and the large band contraction through vendor FFI handlers, and a
-missing or unloadable FFI library is a **startup refusal**
-(`ffi.gate.Gate.enforce`, wired into `runtime.initialize_communicator_stack`
-step 6b), naming the `.so`, the env var, and `docs/environment/overview.md`
-— never a silent demotion. Practical consequence: you must build the FFI
-library before running — `src/ffi/cpp/build_host.sh` (generic host) or
-`config/frontera/build_ffi_host.sh` (Frontera MKL/ScaLAPACK), pointed at by
-`LORRAX_FFI_HOST_SO`; the CUDA library from the complete CUDA 13 stack
-(`docs/building_ffi.md`), pointed at by `LORRAX_FFI_SO`. Per-knob semantics:
-
-- `LORRAX_FFT_FFI=0` **refuses**: the XLA flat-k twin inside
-  `make_flat_k_fft` was deleted, there is nothing to opt out to (recover the
-  arm from git history for a debugging build). Handlers are c128-only.
-- `LORRAX_FFT_FFI_FUSED=0` was a real, announced opt-out onto the decomposed
-  three-transform chain (deleted 2026-09-24, see above).
-- `LORRAX_BANDS_GEMM_FFI=0` is an announced **UNCERTIFIED** opt-out onto the
-  retained XLA einsum arm (retained because `extra="minor"` structurally
-  cannot ride a batched GEMM and quietly keeps the XLA plan under every mode).
-- CUDA differences: the FFT dial resolves to the cuFFT strided handlers
-  (same target names, both flat-k and gw_conv); the GEMM dial does not exist
-  on CUDA (host symbol table only — XLA:GPU's cuBLAS dot lowering IS the
-  required path there, and the startup report says so); an absent CUDA
-  library refuses identically (verified rtx job 7885151). BSE is out of
-  scope on both platforms: its FFTs are `local_*fftn3` = `jnp.fft` aliases
-  with no FFI route, kept by the ruling.
-
-**Square process meshes only.** `resolve_mesh` refuses a device count that
-is not a perfect square, naming s² and (s+1)² to request;
-`create_mesh_2d` / `create_mesh_xy` / `RuntimeStack.reshape` refuse
-px ≠ py; the rectangular-mesh accommodation was deleted. Note the ruling's
-letter in `decisions.md` prescribes idle-rank truncation; the implementation
-deliberately refuses instead, because idle ranks deadlock under the
-`impl=mpi` transport (communicator creation is collective over
-MPI_COMM_WORLD — full argument in the `resolve_mesh` docstring; sandbox
-CLAIMS row 33 records the deviation, owner may re-open). Launch square
-counts: 4, 16, 64, ...
-
-**`sigma_omega_accumulation = kij_stream`** raises ValueError: the
-single-process streamed-h5 accumulator was removed 2026-07-31. Use `kij` or
-`auto`; for cubes that do not fit, `sigma_omega_layout = sharded` (below).
-
-**`w_dyson_solver = lstsq`** raises (two-plan W cleanup): the SVD min-norm
-inner solve masked a rank-deficient A = 1 − V·χ0 — reduce n_mu or raise
-`zeta_rcond` instead. `lu` deprecation-warns and resolves to `local`.
-
-**`use_low_mem_eigh = true` with `eigh_backend = off`** refuses at parse
-time (a contradiction; see the new-keys section).
-
-**`strict_keys = true`** (new, default false) upgrades the unknown-deck-key
-warning to a ValueError naming every unknown key — set it in CI decks.
-
-## What warns (deprecations and behavior you should notice)
-
-**Unknown deck keys now warn.** Any key not in `gw_config._DEFAULTS` and not
-covered by a legacy branch is reported in ONE aggregated rank-0 warning
-(key + line number) and ignored. On origin/main such keys were dropped
-silently. Consequence for removed keys:
-
-- `cusolvermp_charge` / `cusolvermp_lu` (deprecated aliases on origin/main)
-  were **removed** — they now warn-and-ignore, i.e. they stop steering
-  anything. Use `distributed_cholesky` / `distributed_lu`.
-- `isdf_memory_mode` (auto | high_mem | low_mem) was removed with the W
-  cleanup — warn-and-ignore. The W Dyson solve is selected by
-  `w_dyson_solver = local | distributed`.
-
-**Env-twin deprecations**: `LORRAX_ZETA_RCOND` and the
-`LORRAX_SC_*` family still win over the deck keys when non-empty, printing a
-rank-0 deprecation notice; ζ-fit provenance records the EFFECTIVE
-(post-override) values so dropping the env cannot silently reuse a ζ at a
-different conditioning cutoff.
-
-**FFT-FFI knob renames** (P1 wave, 2026-07-31): the C++ knobs are spelled
-`LORRAX_FFT_FFI_THREADS`, `LORRAX_FFT_FFI_CHUNK`, `LORRAX_FFT_FFI_LOG` (one
-spelling on both platforms; `_LOG` is rank-0-scoped, `=all` for every rank).
-The old spellings `LORRAX_MKLFFT_THREADS` / `LORRAX_MKLFFT_CHUNK` /
-`LORRAX_MKLFFT_LOG` / `LORRAX_CUFFT_LOG` are honored as deprecated aliases
-with a one-time announcement; the new spelling wins when both are set.
-
-**Env grammar hardening**: unrecognized values of the C++/py knobs announce
-loudly and resolve to the default (grammar errors must not kill a run, and a
-typo must not silently pick a known-bad policy — e.g.
-`LORRAX_SCALAPACK_MKL_THREADS` garbage used to fall through `atoi()` to the
-24×-slower configuration). Off-dials may refuse; typos never do.
-
-## What changed silently-but-safely
-
-**New deck keys** (full list: `docs/input_reference.md`, generated from
-`_DEFAULTS`; load-bearing discussion in `docs/drivers.md`):
-
-- `hartree_source = auto | stored | isdf | gspace` — the G-space vs ISDF
-  V_H switch; auto resolves stored → folded → isdf.
-- `distributed_zeta_solve = auto | replicated | per_q | distributed` — ζ
-  back-solve tier; auto = replicated under the 4 GiB gather cap, else
-  per_q; `distributed` (ScaLAPACK pzheevd factor + 2-D-sharded back-solve,
-  nothing O(μ²) replicated) is a different, equally valid GAUGE (~κ·ε).
-  ζ-fit provenance now records the gauge tier ('replicated' |
-  'distributed'; per_q collapses to replicated — same factor bits). The
-  schema was NOT bumped: a legacy `tmp/zeta_q.h5` whose stamp lacks the
-  tier key is treated as a replicated-gauge fit — replicated-tier reruns
-  reuse it with a one-line notice; a distributed-tier rerun refits, with
-  the mismatch named. No forced refit of existing ζ files.
-- `w_dyson_solver = local | distributed` — the exactly-two W Dyson plans
-  (`auto` is a permanent alias of `local`); `distributed` refuses loudly
-  when unavailable, never downgrades.
-- `sigma_omega_layout = replicated | sharded` — Σ_c(ω,k,m,n) cube stays
-  mesh-tiled end-to-end under `sharded`, for every `qp_solver`; refuses an
-  indivisible window or `h5py_allgather` at P>1.  The `self_consistent`
-  refusal shipped with this key was REMOVED 2026-08-05: the SC loop never
-  rotates the cube, so the "rotation seam" it named does not exist, and the
-  two layouts measure bit-identical under SC (jobs 7889782/7889789).
-- `eigh_backend = auto | off | distributed | cusolvermp | slate |
-  scalapack` — BSE/htransform distributed-eigh sites; `use_low_mem_eigh =
-  true` + `auto` resolves to `distributed`.
-- `strict_keys` — see above.
-
-**Startup entry point.** All seven chain drivers (kmeans_cli,
-get_dipole_mtxels, kin_ion_io, gw_jax, htransform, bse_jax, exciton_bands)
-now start through ONE module-top call, `runtime.initialize_communicator_stack()`
-— failfast hook, env defaults, jax.distributed, backend init, canonical
-square mesh + communicator-clique warm-up (`warm_mesh_cliques`, required
-under `impl=mpi`), FFI gate enforcement, and one rank-0 startup report
-stating every resolved dial and demotion. Drivers no longer call
-`prepare_mesh`/`bootstrap` themselves.
-
-**Process teardown.** `gw.gw_jax`'s `__main__` ends via
-`runtime.finalize_process(rc)`: ordered explicit teardown (effects barrier,
-unregister jax's `clean_up` atexit, `jax.distributed.shutdown()`, run the
-remaining atexit hooks, announced `os._exit`). This cures a deterministic
-interpreter-teardown deadlock after fully-cold in-process compile storms
-(XLA:CPU client destructor pool shutdown; jobs 7884928/7884989). If you
-wrapped gw_jax in your own post-main `os._exit` harness, drop it. Note the
-process does not run interpreter finalization after `main()` — atexit
-duties are executed explicitly, nothing is silently skipped.
-
-**`slab_io = auto` demotes instead of aborting on bare launches**: it now
-probes MPI bootstrapability (launcher PMI env, else a throwaway-subprocess
-singleton-init probe) before selecting either MPI tier, and demotes to
-`h5py_allgather` with a full announcement when MPI cannot bootstrap — a
-bare `python -m gw.gw_jax` no longer dies in MPI_Init_thread.
-
-**Transport.** Production CPU collectives are
-`JAX_CPU_COLLECTIVES_IMPLEMENTATION=mpi` (MPItrampoline → patched
-MPIwrapper → Intel MPI/mlx; recipe `docs/dev/mpi_collectives.md`,
-env block `config/frontera/mpi_transport_env.sh`). gloo is banned at
-distributed tiers: reproducible ReduceScatter timeouts at P=64 and ~5%
-silent reduce-scatter corruption (sandbox CLAIMS rows 3-4). The startup
-report warns when a multi-process CPU run lands on gloo.
-`LORRAX_MPI_FINALIZE_FIX=skip_atexit` (overlay sitecustomize) is mandatory
-for impl=mpi runs.
-
-**Two behaviour changes from the distrib_la replumb, ACCEPTED as correct
-rather than fixed** (2026-08-07; adjudication item 7 — recorded here because
-neither is a bug and both would otherwise read as one to the next person who
-finds them).
-
-1. **`solve_zeta`'s `mu_pad` divisibility net is now UNREACHABLE for
-   ScaLAPACK factors, and that is the fix, not a regression.** The net
-   (`isdf/core.solve_zeta`) demoted `scalapack_lu`/`cusolvermp_lu` to the
-   per-q `jnp.linalg.solve` when `n_rmu_logical` did not divide both mesh
-   axes. A ScaLAPACK factor now arrives as a `distrib_la.FactorToken` and
-   the token branch returns before the net, because `distrib_la.factor`
-   REFUSES a non-dividing extent at FACTOR time — earlier, with the failed
-   guard named, and before any collective. The supersession is strictly an
-   improvement: the old solve-time demote kept the ScaLAPACK factor's own
-   `ipiv` and handed it to `lax.linalg.lu_solve`, whose pivot convention is
-   not ScaLAPACK's, so the "safe fallback" computed a wrong answer
-   successfully. The net stays in place for the array-factor routes it is
-   still correct for; its `print` (not `warnings.warn`) is deliberate —
-   warning dedupe is what made the original demotion invisible in
-   production logs.
-
-2. **`use_low_mem_eigh` now threads into `compute_wfns_fi` on the two
-   raw-params drivers** (`bandstructure.htransform`, `bse.exciton_bands`).
-   Both used to spell the CLI-over-deck precedence inline and never call
-   `gw_config.resolve_eigh_backend`, so the key parsed, defaulted, validated
-   and was read by nobody on those two paths. It is live now: with
-   `use_low_mem_eigh = true` and `eigh_backend = auto`, htransform's Gram-eigh
-   line changes from the native description to the distributed one. Intended
-   — and the consequence is that a machine which cannot serve the
-   distributed eigh now REFUSES those runs where it used to run native
-   silently. That refusal is armed on purpose; it is the whole point of the
-   key.
-
-**Where the docs live now**: `docs/drivers.md` (the seven drivers: flags,
-outputs, failure modes), `docs/input_reference.md` (every deck key —
-regenerate with `tools/gen_input_reference.py`), `docs/environment/`
-(overview, transports, per-machine pages incl. `machines/frontera.md`),
-`docs/dev/large_nmu_operation.md` (two-plans-per-family map, keys,
-thresholds), `docs/dev/env_vars.md` (the env registry — gated by
-`tests/test_env_registry.py`), `docs/architecture/decisions.md` (binding
-rulings). Which page owns which fact is stated once, in the register at the
-top of `docs/index.md`; certification scope lives in the sandbox `CLAIMS.md`
-ledger rather than in a doc page, because a page recording it goes stale
-silently.
