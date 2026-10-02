@@ -46,6 +46,11 @@ SC maps 0–2; claims 3082, 3111). The Fe 8³ P4 χ build takes 35 → 19 s per 
   removed streamed stores left by an earlier process`. Delete those
   directories of finished runs by hand
   ([SlabIO](docs/architecture/slab_io.md#streamed-tier)).
+- **Map-1 failure, fixed in 6bc09936c.** With the W bank on per-rank files,
+  a store created after others had been written counted their bytes twice
+  against the quota, was refused, and was then written: the map failed with
+  `GATE io_global_commit … streamed_bank.commit` and a `KeyError` (Ni 20³ P64,
+  map 1). The `lorrax_A` module on source-4dd37249 has this defect.
 
 ## 2026-10-01 — row passes run as one scan; compile no longer grows with the pass count
 
