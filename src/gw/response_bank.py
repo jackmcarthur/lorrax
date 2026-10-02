@@ -2113,23 +2113,30 @@ def produce_sample_bank(wfns, meta, config, *, mesh_xy, sym, sample_plan, bank_i
         roots = held = bank_io["photon_v"]
     carry_per_sample = 2*len(response_rows)*face_bytes
     selection = None
-    if p1 > p0:
-        # The line selection runs beside one sample's carry; its route is
-        # admitted here so the group size below leaves room for it.
+
+    def line_route(width, carry):
+        """The line selection of ``width`` parents beside ``carry`` bytes: (selection,
+        resident, workspace), its route admitted at ``width`` (local or face)."""
         ledger.live_stages = ambient
         rows = ([int(meta.mu_basis.n_packed)] if vertex is None else
                 [int(b.n_packed) * (3 if f else 1) for f, b in enumerate(bank_io["mu_bases"])])
-        execution, selection_resident, selection_workspace = line_selection_execution(
-            rows, mesh=mesh_xy, ledger=ledger, nq=len(qids), carry=carry_per_sample)
+        execution, resident, workspace = line_selection_execution(
+            rows, mesh=mesh_xy, ledger=ledger, nq=width, carry=carry)
+        return line_selector(execution, width), resident, workspace
+
+    def line_selector(execution, width):
         if vertex is None:
             from .shared_pole_directions import charge_line_selection
-            selection = charge_line_selection(meta, mesh_xy=mesh_xy, ordered=ordered,
-                                              execution=execution, nq=len(qids))
-        else:
-            from .shared_pole_sectors import sector_line_selection
-            selection = sector_line_selection(bank_io, meta, mesh_xy=mesh_xy, execution=execution,
-                                              nq=len(qids))
-        receipt["line_selection"] = dict(execution=execution, samples=[p0, p1],
+            return charge_line_selection(meta, mesh_xy=mesh_xy, ordered=ordered,
+                                         execution=execution, nq=width)
+        from .shared_pole_sectors import sector_line_selection
+        return sector_line_selection(bank_io, meta, mesh_xy=mesh_xy, execution=execution, nq=width)
+
+    if p1 > p0:
+        # The line selection runs beside one sample's carry; its route is
+        # admitted here so the group size below leaves room for it.
+        selection, selection_resident, selection_workspace = line_route(len(qids), carry_per_sample)
+        receipt["line_selection"] = dict(execution=selection.execution, samples=[p0, p1],
             resident_bytes_per_rank=selection_resident, workspace_bytes_per_rank=selection_workspace)
     # A q-local selection reads whole matrices per rank: its line samples leave
     # the Dyson pair in the batch layout, with no exchange to the face and back.
@@ -2373,6 +2380,28 @@ def produce_sample_bank(wfns, meta, config, *, mesh_xy, sym, sample_plan, bank_i
     if stream_bank is not None:
         q_width = sample_q_width(face_bytes, len(qids))
         receipt["bank_residence"]["q_width"] = q_width or len(qids)
+    # A line sample selects span by span too when each parent's minus-q partner
+    # comes from its own rows (no partner, or the inversion mirror); each span's
+    # route is admitted at its width and the panels written per span.
+    line_width, line_selections = None, {}
+
+    def line_spans():
+        width = line_width or len(qids)
+        return [(a, min(len(qids), a + width)) for a in range(0, len(qids), width)]
+    if q_width is not None and p1 > p0 and (not partnered or mirror is not None):
+        line_width = q_width
+        selection, selection_resident, selection_workspace = line_route(line_width, 3*2*line_width*face_bytes)
+        line_selections = {line_width: selection}
+        if len(qids) % line_width:
+            line_selections[len(qids) % line_width] = line_selector(selection.execution, len(qids) % line_width)
+        receipt["line_selection"].update(execution=selection.execution, q_width=line_width,
+            resident_bytes_per_rank=selection_resident, workspace_bytes_per_rank=selection_workspace)
+        line_layout = ("batch" if selection.execution == "local" and dyson.pair("batch") is not None
+                       else "face")
+    if q_width is not None and (line_width is not None or p1 == p0):
+        # Every read is one q span: its value and slope rows, the unpack and the prefetch.
+        receipt["bank_residence"]["device_bytes_per_rank"] = max(stream_bank.in_flight*pass_carry,
+                                                                 3*2*q_width*face_bytes)
 
     for group in rules["groups"]:
         members = [int(m) for m in group["members"]]
@@ -2400,11 +2429,12 @@ def produce_sample_bank(wfns, meta, config, *, mesh_xy, sym, sample_plan, bank_i
                 outputs=[(2*row+k, 2*row+k) for row, _ in fresh for k in (0, 1)])
             with timing.section('bank.stream_commit'):
                 stream_bank.commit()
-            # A line sample reads every parent at once; a dense sample larger
-            # than its q width reads one q span per solve (the loop's own order).
+            # A sample larger than its q width reads one q span per solve (the
+            # loop's own order); a line sample without line spans reads every parent.
             raw_group = stream_bank.reader([
                 (2*row, 2*row+2, span) for row, sample in fresh
-                for span in ([None] if q_width is None or p0 <= sample < p1 else
+                for span in ([None] if q_width is None or (p0 <= sample < p1 and line_width is None) else
+                             line_spans() if p0 <= sample < p1 else
                              [(a, min(q1, a+q_width)) for q0, q1, _, _ in dense_spans(sample)
                               for a in range(q0, q1, q_width)])])
             take = ((lambda row: next(raw_group)) if finish is None
@@ -2418,7 +2448,7 @@ def produce_sample_bank(wfns, meta, config, *, mesh_xy, sym, sample_plan, bank_i
                 if committed(sample):
                     progress.step()
                     continue
-                raw = take(row) if q_width is None or p0 <= sample < p1 else None
+                raw = take(row) if q_width is None or (p0 <= sample < p1 and line_width is None) else None
                 if p0 <= sample < p1:
                     # Select from W(z) itself, then act with the minus-q partner on
                     # the same directions; only the panels reach the bank.
@@ -2433,26 +2463,31 @@ def produce_sample_bank(wfns, meta, config, *, mesh_xy, sym, sample_plan, bank_i
                     solved = lambda: sum(receipt["seconds"].get(k + "_dispatch", 0.)
                                          for k in ("sample_dyson", "sample_slope"))
                     started_selection = time.monotonic() - solved()
-                    value, slope = solve(raw, 0, 0, len(qids), bank_handle, sample, layout=line_layout)
-                    with timing.section('bank.line_select'):
-                        lines = selection.select(sample, value, slope)
-                    del value, slope
-                    if ordered:
-                        value, slope = solve(raw, 1, 0, len(qids), bank_handle, sample, layout=line_layout)
-                        with timing.section('bank.line_mirror'):
-                            selection.mirror(sample, lines, value, slope)
+                    for span in line_spans():
+                        sel = line_selections.get(span[1] - span[0], selection)
+                        rows = raw if line_width is None else _RowWindow(take(row), span[0])
+                        value, slope = solve(rows, 0, *span, bank_handle, sample, layout=line_layout)
+                        with timing.section('bank.line_select'):
+                            lines = sel.select(sample, value, slope)
                         del value, slope
-                    with timing.section('bank.line_panels'):
-                        panels = selection.panels(sample, lines)
-                    del lines
+                        if ordered:
+                            value, slope = solve(rows, 1, *span, bank_handle, sample, layout=line_layout)
+                            with timing.section('bank.line_mirror'):
+                                sel.mirror(sample, lines, value, slope)
+                            del value, slope
+                        with timing.section('bank.line_panels'):
+                            panels = sel.panels(sample, lines)
+                        del lines, rows
+                        io_started = time.monotonic()
+                        with timing.section('bank.line_write'):
+                            write(q_span=span, line=panels)
+                        del panels
+                        spent = time.monotonic() - io_started
+                        receipt["seconds"]["io"] = receipt["seconds"].get("io", 0.) + spent
+                        started_selection += spent
                     receipt["seconds"]["line_selection"] = (receipt["seconds"].get("line_selection", 0.)
                         + time.monotonic() - solved() - started_selection)
-                    io_started = time.monotonic()
-                    with timing.section('bank.line_write'):
-                        write(q_span=(0, len(qids)), line=panels)
-                    receipt["seconds"]["io"] = receipt["seconds"].get("io",0.)+time.monotonic()-io_started
                     ledger.live_stages = live
-                    del panels
                 else:
                     for q0, q1, need_value, need_slope in dense_spans(sample):
                         width = q_width or (q1 - q0)
