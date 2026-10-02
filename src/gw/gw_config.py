@@ -1,4 +1,4 @@
-"""Unified configuration for LORRAX GW calculations; see docs/architecture/decisions.md."""
+"""Unified configuration for LORRAX GW calculations; see docs/dev/gw_config_contracts.md."""
 
 from __future__ import annotations
 
@@ -81,7 +81,7 @@ from runtime.env_flags import (  # noqa: E402
 
 def env_float(name: str, default: float, *, print_fn=print,
               refuse: bool = False) -> float:
-    """Canonical numeric env parse: unset/blank → default, bad → ANNOUNCE (or, with ``refuse=True``, RAISE); see docs/architecture/decisions.md."""
+    """Canonical numeric env parse: unset/blank → default, bad → ANNOUNCE (or, with ``refuse=True``, RAISE); see docs/dev/gw_config_contracts.md."""
     raw = os.environ.get(name)
     if raw is None or not raw.strip():
         return default
@@ -118,7 +118,7 @@ ZETA_TRUNCATING_ENV_KNOBS = ("LORRAX_MAX_RCHUNKS",)
 
 
 def active_zeta_truncating_knobs() -> list[tuple[str, str]]:
-    """``[(name, raw), ...]`` for every truncating knob currently in force; see docs/architecture/decisions.md."""
+    """``[(name, raw), ...]`` for every truncating knob currently in force; see docs/dev/gw_config_contracts.md."""
     out = []
     for name in ZETA_TRUNCATING_ENV_KNOBS:
         raw = os.environ.get(name)
@@ -161,7 +161,7 @@ from runtime.xla_memory import (       # noqa: F401
 # ---------------------------------------------------------------------------
 
 class ComputeMode(str, enum.Enum):
-    """The single axis describing what self-energy is computed; see docs/architecture/decisions.md."""
+    """The single axis describing what self-energy is computed; see docs/dev/gw_config_contracts.md."""
 
     X_ONLY = "x_only"
     COHSEX = "cohsex"
@@ -176,13 +176,13 @@ class ComputeMode(str, enum.Enum):
 
     @property
     def is_dynamic(self) -> bool:
-        """True when the mode builds a Σ_c(ω) grid: GN/HL-PPM and MPA; see docs/architecture/decisions.md."""
+        """True when the mode builds a Σ_c(ω) grid: GN/HL-PPM and MPA; see docs/dev/gw_config_contracts.md."""
         return self in (ComputeMode.GN_PPM, ComputeMode.HL_PPM,
                         ComputeMode.MPA)
 
     @property
     def ppm_model(self) -> str | None:
-        """``'gn'`` for GN-PPM, ``'hl'`` for HL-PPM, else None; see docs/architecture/decisions.md."""
+        """``'gn'`` for GN-PPM, ``'hl'`` for HL-PPM, else None; see docs/dev/gw_config_contracts.md."""
         return {
             ComputeMode.GN_PPM: "gn",
             ComputeMode.HL_PPM: "hl",
@@ -190,7 +190,7 @@ class ComputeMode(str, enum.Enum):
 
 
 class BispinorGWMode(str, enum.Enum):
-    """How the four-current photon channels enter the GW self-energy; see docs/architecture/decisions.md."""
+    """How the four-current photon channels enter the GW self-energy; see docs/dev/gw_config_contracts.md."""
 
     BARE_TRANSVERSE = "bare_transverse"
     FULL_SHARED_POLE = "full_shared_pole"
@@ -296,7 +296,7 @@ LEGACY_SIGMA_AXIS_KEYS: dict[str, str] = {
 
 def announce_legacy_sigma_axis_keys(named_keys, resolved_mode, resolved_solver,
                                     *, print_fn=print) -> tuple[str, ...]:
-    """Print one deprecation note per LEGACY self-energy-axis key the deck named; see docs/architecture/decisions.md."""
+    """Print one deprecation note per LEGACY self-energy-axis key the deck named; see docs/dev/gw_config_contracts.md."""
     named = frozenset(str(k).strip().lower() for k in (named_keys or ()))
     hit = tuple(k for k in LEGACY_SIGMA_AXIS_KEYS if k in named)
     if not hit:
@@ -313,7 +313,7 @@ def announce_legacy_sigma_axis_keys(named_keys, resolved_mode, resolved_solver,
 
 
 class SigmaChannel(str, enum.Enum):
-    """One term of Σ that a compute mode either builds or does not; see docs/architecture/decisions.md."""
+    """One term of Σ that a compute mode either builds or does not; see docs/dev/gw_config_contracts.md."""
 
     X = "x"
     SX = "sx"
@@ -322,7 +322,7 @@ class SigmaChannel(str, enum.Enum):
 
     @property
     def label(self) -> str:
-        """How the channel is spelled in prose and in operator messages; see docs/architecture/decisions.md."""
+        """How the channel is spelled in prose and in operator messages; see docs/dev/gw_config_contracts.md."""
         return {
             SigmaChannel.X: "Σ_X",
             SigmaChannel.SX: "Σ_SX",
@@ -366,7 +366,7 @@ MODE_SIGMA_CHANNELS: dict[ComputeMode, frozenset[SigmaChannel]] = {
 
 
 def coerce_compute_mode(mode) -> ComputeMode:
-    """Accept a :class:`ComputeMode`, its ``.value``, or a bare string; see docs/architecture/decisions.md."""
+    """Accept a :class:`ComputeMode`, its ``.value``, or a bare string; see docs/dev/gw_config_contracts.md."""
     if isinstance(mode, ComputeMode):
         return mode
     raw = getattr(mode, "value", mode)
@@ -380,7 +380,7 @@ def coerce_compute_mode(mode) -> ComputeMode:
 
 
 class HeadCorrection(str, enum.Enum):
-    """Finite-grid treatment of the singular macroscopic ``q -> 0`` head; see docs/architecture/decisions.md."""
+    """Finite-grid treatment of the singular macroscopic ``q -> 0`` head; see docs/dev/gw_config_contracts.md."""
 
     FULL = "full"
     NO_LOCAL_FIELDS = "no_local_fields"
@@ -402,7 +402,7 @@ def coerce_head_correction(value) -> HeadCorrection:
 
 
 class ScreeningDiagrams(str, enum.Enum):
-    """WHICH DIAGRAMS build the W that Σ consumes — the screening axis; see docs/architecture/decisions.md."""
+    """WHICH DIAGRAMS build the W that Σ consumes — the screening axis; see docs/dev/gw_config_contracts.md."""
 
     W_RPA = "w_rpa"
     W_BSE = "w_bse"
@@ -410,7 +410,7 @@ class ScreeningDiagrams(str, enum.Enum):
 
 
 def coerce_screening_diagrams(value) -> ScreeningDiagrams:
-    """Accept a :class:`ScreeningDiagrams`, its ``.value``, or a string; see docs/architecture/decisions.md."""
+    """Accept a :class:`ScreeningDiagrams`, its ``.value``, or a string; see docs/dev/gw_config_contracts.md."""
     if isinstance(value, ScreeningDiagrams):
         return value
     raw = getattr(value, "value", value)
@@ -454,13 +454,10 @@ _W_BSE_REFUSALS: tuple[tuple[str, object, object, str, str, str], ...] = (
         "use gn_ppm, whose probe sits on the imaginary axis where the "
         "resolvent needs no broadening policy, or keep w_rpa for hl_ppm",
         "the HL probe is a REAL-axis frequency, and (z - H)^-1 on the real "
-        "axis needs a broadening (eta / xi) policy that this tree does not "
-        "have a single answer for: GN-PPM and MPA already evaluate Sigma at "
-        "silently different broadenings on the same deck "
-        "(KNOWN_LORRAX_ISSUES.md:131 and :134 -- a 5.7x gap, floor applied "
-        "by one side only).  Improvising a third convention for the ladder "
-        "on top of that is how the discrepancy would become permanent, so "
-        "v1 refuses instead.  Same shape as the wired-but-refused "
+        "axis needs a broadening (eta / xi) policy that the ladder does "
+        "not define, and improvising one would give the ladder its own "
+        "broadening convention, so v1 refuses instead.  Same shape as the "
+        "wired-but-refused "
         "schur_avg placement (src/gw/head_channel.py:153)",
     ),
     (
@@ -614,7 +611,7 @@ _RESOLVENT_REFUSAL_TABLES: dict[
 
 
 def refuse_unsupported_screening_diagrams(config) -> None:
-    """Refuse the resolvent-diagram combinations v1 does not serve, at PARSE time; see docs/architecture/decisions.md."""
+    """Refuse the resolvent-diagram combinations v1 does not serve, at PARSE time; see docs/dev/gw_config_contracts.md."""
     diagrams = coerce_screening_diagrams(
         getattr(config.screening, "diagrams", ScreeningDiagrams.W_RPA))
     table = _RESOLVENT_REFUSAL_TABLES.get(diagrams)
@@ -655,7 +652,7 @@ def mode_builds_channels(mode, *channels: SigmaChannel) -> bool:
 
 
 def explain_missing_channels(mode, *channels: SigmaChannel) -> str:
-    """The named-omission clause for channels ``mode`` does not build; see docs/architecture/decisions.md."""
+    """The named-omission clause for channels ``mode`` does not build; see docs/dev/gw_config_contracts.md."""
     resolved = coerce_compute_mode(mode)
     built = sigma_channels_for(resolved)
     absent = [c for c in channels if c not in built]
@@ -689,7 +686,7 @@ UNIMPLEMENTED_MODES: dict[ComputeMode, str] = {}
 
 
 def refuse_unimplemented_compute_mode(mode, *, context: str = "this run"):
-    """Refuse a declared-but-not-yet-built compute mode, by name; see docs/architecture/decisions.md."""
+    """Refuse a declared-but-not-yet-built compute mode, by name; see docs/dev/gw_config_contracts.md."""
     resolved = coerce_compute_mode(mode)
     reason = UNIMPLEMENTED_MODES.get(resolved)
     if reason is None:
@@ -701,7 +698,7 @@ def refuse_unimplemented_compute_mode(mode, *, context: str = "this run"):
 
 
 class QPSolver(str, enum.Enum):
-    """How QP energies are extracted from Σ — orthogonal to ``compute_mode``; see docs/architecture/decisions.md."""
+    """How QP energies are extracted from Σ — orthogonal to ``compute_mode``; see docs/dev/gw_config_contracts.md."""
 
     ONE_SHOT_DFT = "one_shot_dft"
     SELF_CONSISTENT = "self_consistent"
@@ -762,7 +759,7 @@ _W_DYSON_PLANS = ("local", "distributed")
 
 
 def normalize_w_dyson_solver(value) -> str:
-    """Normalise a ``w_dyson_solver`` spelling to one of the TWO plans; see docs/architecture/decisions.md."""
+    """Normalise a ``w_dyson_solver`` spelling to one of the TWO plans; see docs/dev/gw_config_contracts.md."""
     s = ("auto" if value is None else str(value)).strip().lower()
     if s == "lu":
         import warnings
@@ -800,7 +797,7 @@ EIGH_CHOICES_SOURCE = "not called"
 
 
 def eigh_backend_choices() -> tuple:
-    """The legal ``eigh_backend`` spellings — the RESOLVER's own list; see docs/architecture/decisions.md."""
+    """The legal ``eigh_backend`` spellings — the RESOLVER's own list; see docs/dev/gw_config_contracts.md."""
     global EIGH_CHOICES_SOURCE
     try:
         from ffi import _services
@@ -853,7 +850,7 @@ _LINALG_RESOLUTION = "_linalg_resolution"
 
 
 def resolve_linalg(params) -> LinalgResolution:
-    """Interpret ``linalg = local | distributed`` exactly once; see docs/architecture/decisions.md."""
+    """Interpret ``linalg = local | distributed`` exactly once; see docs/dev/gw_config_contracts.md."""
     raw = params.get("linalg", "local") if hasattr(params, "get") else "local"
     layout = str("local" if raw is None else raw).strip().lower()
     if layout not in ("local", "distributed"):
@@ -901,7 +898,7 @@ def linalg_resolution(params) -> LinalgResolution:
 
 
 def distrib_la_batched_route_choices() -> tuple[str, ...]:
-    """User-facing batch-route vocabulary from the ``distrib_la`` public API; see docs/architecture/decisions.md."""
+    """User-facing batch-route vocabulary from the ``distrib_la`` public API; see docs/dev/gw_config_contracts.md."""
     try:
         from ffi import _services
         _services.ensure_on_path()
@@ -1965,12 +1962,12 @@ _BAND_COUNTS = "_band_counts"
 # ---------------------------------------------------------------------------
 
 class BandCountConflict(ValueError):
-    """Two band-count keys were set and they disagree; see docs/architecture/decisions.md."""
+    """Two band-count keys were set and they disagree; see docs/dev/gw_config_contracts.md."""
 
 
 @dataclass(frozen=True)
 class BandCounts:
-    """The resolved χ and Σ band counts, and what the ISDF fit is sized by; see docs/architecture/decisions.md."""
+    """The resolved χ and Σ band counts, and what the ISDF fit is sized by; see docs/dev/gw_config_contracts.md."""
 
     chi: int
     sigma: int
@@ -1996,7 +1993,7 @@ class BandCounts:
         return self.chi != self.sigma
 
     def describe(self, zeta_fit_edge: int | None = None) -> str:
-        """The one line a run logs so the ``max`` is never silent; see docs/architecture/decisions.md."""
+        """The one line a run logs so the ``max`` is never silent; see docs/dev/gw_config_contracts.md."""
         if zeta_fit_edge is not None and int(zeta_fit_edge) != int(self.isdf):
             fit = (f"ISDF zeta fit sized for {int(zeta_fit_edge)} bands, "
                    f"NARROWED from {self.isdf} by deck key zeta_nband")
@@ -2019,7 +2016,7 @@ _SPECIFIC_KEYS = {"number_bands_chi": "chi", "number_bands_sigma": "sigma"}
 
 
 def resolve_band_counts(params: dict, deck_named=None) -> BandCounts:
-    """Resolve the four band-count keys into one :class:`BandCounts`; see docs/architecture/decisions.md."""
+    """Resolve the four band-count keys into one :class:`BandCounts`; see docs/dev/gw_config_contracts.md."""
     if deck_named is None:
         deck_named = params.get(_DECK_NAMED_KEYS)
     if deck_named is None:
@@ -2107,7 +2104,7 @@ _BAND_EXTRAP_KEYS = ("use_band_extrapolation", "sigma_band_extrapolation")
 
 
 def resolve_band_extrapolation(use_val, alias_val, *, print_fn=None) -> tuple:
-    """Resolve the two spellings into ``(enabled, explicit)``; see docs/architecture/decisions.md."""
+    """Resolve the two spellings into ``(enabled, explicit)``; see docs/dev/gw_config_contracts.md."""
     named = {k: v for k, v in zip(_BAND_EXTRAP_KEYS, (use_val, alias_val))
              if v is not None}
     if len(named) == 2 and bool(use_val) != bool(alias_val):
@@ -2135,7 +2132,7 @@ def resolve_band_extrapolation(use_val, alias_val, *, print_fn=None) -> tuple:
 
 
 def sigma_stage_modes(config, fallback=None) -> tuple:
-    """Every :class:`ComputeMode` this RUN will dispatch a Σ under, in order; see docs/architecture/decisions.md."""
+    """Every :class:`ComputeMode` this RUN will dispatch a Σ under, in order; see docs/dev/gw_config_contracts.md."""
     stages = getattr(getattr(config, "sc", None), "stages", None) or ()
     modes = []
     for stage in stages:
@@ -2165,7 +2162,7 @@ def sigma_stage_modes(config, fallback=None) -> tuple:
 
 
 def band_extrapolation_is_consumable(modes, *, scalar_mpa: bool = True) -> bool:
-    """Does ANY stage of this run reach a kernel that reads the key?; see docs/architecture/decisions.md.
+    """Does ANY stage of this run reach a kernel that reads the key?; see docs/dev/gw_config_contracts.md.
 
     The GN/HL-PPM stages and an MPA stage whose Σ_c runs the scalar pole-sum
     executor bracket the Green band sum in that one executor.  ``scalar_mpa``
@@ -2176,7 +2173,7 @@ def band_extrapolation_is_consumable(modes, *, scalar_mpa: bool = True) -> bool:
 
 
 def mpa_sigma_runs_scalar_executor(config) -> bool:
-    """Does this run's MPA Σ_c run the scalar pole-sum executor?; see docs/architecture/decisions.md.
+    """Does this run's MPA Σ_c run the scalar pole-sum executor?; see docs/dev/gw_config_contracts.md.
 
     Scalar decks do, and so does the bispinor charge route
     (``bispinor_gw = bare_transverse`` with the shared pole): its store is
@@ -2197,7 +2194,7 @@ def mpa_sigma_runs_scalar_executor(config) -> bool:
 # ---------------------------------------------------------------------------
 
 def _deck_key_line(lines, start, end, key) -> str:
-    """Locate ``key`` in the ``[cohsex]`` section; return ``"line N"``; see docs/architecture/decisions.md."""
+    """Locate ``key`` in the ``[cohsex]`` section; return ``"line N"``; see docs/dev/gw_config_contracts.md."""
     lineno = next(
         (i + 1 for i in range(start, end)
          if re.match(rf"\s*{re.escape(key)}\s*[=:]", lines[i], re.IGNORECASE)),
@@ -2206,7 +2203,7 @@ def _deck_key_line(lines, start, end, key) -> str:
 
 
 def _print_deck_report(msg: str) -> None:
-    """Print one deck-hygiene report on rank 0; see docs/architecture/decisions.md."""
+    """Print one deck-hygiene report on rank 0; see docs/dev/gw_config_contracts.md."""
     try:
         from common.collectives import process_rank
         rank = process_rank()
@@ -3321,7 +3318,7 @@ def _require_sys_dim(params, filename) -> None:
 
 
 def read_lorrax_input(filename: str) -> dict:
-    """Produce typed deck values and resolved band counts; see docs/architecture/decisions.md."""
+    """Produce typed deck values and resolved band counts; see docs/dev/gw_config_contracts.md."""
     with open(filename, 'r') as f:
         lines = f.readlines()
     (start, end, kp_idx, kp_end) = _locate_input_blocks(
@@ -3385,7 +3382,7 @@ class FilePaths:
 
 
 def _normalize_placement(value):
-    """Canonicalise ``mc_average_placement`` at deck-parse time; see docs/architecture/decisions.md."""
+    """Canonicalise ``mc_average_placement`` at deck-parse time; see docs/dev/gw_config_contracts.md."""
     from .head_channel import normalize_placement
     return normalize_placement(value)
 
@@ -3492,7 +3489,7 @@ PACKED_PHOTON_COMPUTE_MODES: tuple[ComputeMode, ...] = (
 )
 
 def scalar_head_overrides_named(config) -> tuple[str, ...]:
-    """Which scalar-head overrides this deck names, formatted for a message; see docs/architecture/decisions.md."""
+    """Which scalar-head overrides this deck names, formatted for a message; see docs/dev/gw_config_contracts.md."""
     named = []
     for template, probe in _SCALAR_HEAD_OVERRIDES:
         value = probe(config)
@@ -3503,7 +3500,7 @@ def scalar_head_overrides_named(config) -> tuple[str, ...]:
 
 
 def packed_static_envelope(config, *, screened: bool):
-    """THE envelope of the packed static photon operator, as ONE table; see docs/architecture/decisions.md."""
+    """THE envelope of the packed static photon operator, as ONE table; see docs/dev/gw_config_contracts.md."""
     yield (config.compute_mode in PACKED_PHOTON_COMPUTE_MODES,
            f"compute_mode = {config.compute_mode.value}",
            "compute_mode in {"
@@ -3549,7 +3546,7 @@ def packed_static_envelope(config, *, screened: bool):
 
 
 def packed_bare_transverse_route(config) -> tuple[bool, str]:
-    """Is the bare-transverse family served by the packed photon path?; see docs/architecture/decisions.md."""
+    """Is the bare-transverse family served by the packed photon path?; see docs/dev/gw_config_contracts.md."""
     mode = coerce_bispinor_gw_mode(getattr(
         config, "bispinor_gw", BispinorGWMode.BARE_TRANSVERSE))
     if mode is not BispinorGWMode.BARE_TRANSVERSE:
@@ -3577,14 +3574,14 @@ def packed_bare_transverse_route(config) -> tuple[bool, str]:
 
 
 def packed_photon_screens_current(config) -> bool:
-    """Whether the packed response builds and screens the current blocks; see docs/architecture/decisions.md."""
+    """Whether the packed response builds and screens the current blocks; see docs/dev/gw_config_contracts.md."""
     mode = coerce_bispinor_gw_mode(getattr(
         config, "bispinor_gw", BispinorGWMode.BARE_TRANSVERSE))
     return mode is BispinorGWMode.FULL_STATIC_COHSEX
 
 
 def uses_static_photon_response(config) -> bool:
-    """Whether screening and Sigma use the packed 4x4 photon response; see docs/architecture/decisions.md."""
+    """Whether screening and Sigma use the packed 4x4 photon response; see docs/dev/gw_config_contracts.md."""
     mode = coerce_bispinor_gw_mode(getattr(
         config, "bispinor_gw", BispinorGWMode.BARE_TRANSVERSE))
     if mode is BispinorGWMode.FULL_STATIC_COHSEX:
@@ -3593,19 +3590,19 @@ def uses_static_photon_response(config) -> bool:
 
 
 def packed_photon_replaces_charge_sigma(config) -> bool:
-    """Does the packed operator own the WHOLE Sigma, charge channel included?; see docs/architecture/decisions.md."""
+    """Does the packed operator own the WHOLE Sigma, charge channel included?; see docs/dev/gw_config_contracts.md."""
     return (uses_static_photon_response(config)
             and config.compute_mode is ComputeMode.COHSEX)
 
 
 def uses_dynamic_packed_photon_route(config) -> bool:
-    """The packed four-current operator on a frequency-dependent Sigma; see docs/architecture/decisions.md."""
+    """The packed four-current operator on a frequency-dependent Sigma; see docs/dev/gw_config_contracts.md."""
     return (uses_static_photon_response(config)
             and config.compute_mode.ppm_model is not None)
 
 
 def uses_coupled_photon_head(config) -> bool:
-    """Whether the packed photon response runs its Gamma-cell completion; see docs/architecture/decisions.md."""
+    """Whether the packed photon response runs its Gamma-cell completion; see docs/dev/gw_config_contracts.md."""
     return (uses_static_photon_response(config)
             and config.head.correction is HeadCorrection.FULL)
 
@@ -3657,7 +3654,7 @@ def uses_direct_bispinor_shared_pole_head(config) -> bool:
 
 
 def incumbent_bispinor_head_record(config) -> tuple[str, str]:
-    """``(banner, run_record_line)`` for a bispinor deck on the INCUMBENT route; see docs/architecture/decisions.md."""
+    """``(banner, run_record_line)`` for a bispinor deck on the INCUMBENT route; see docs/dev/gw_config_contracts.md."""
     if config.head.correction is HeadCorrection.OFF:
         return (
             "\n  ==========================================================\n"
@@ -3736,11 +3733,12 @@ def warn_headless_shared_pole_self_consistency(config, print_fn=print) -> None:
         "the Gram gate is unchanged and the run may still refuse "
         "numerically.  The dense-k limit is the intended convergence limit; "
         "the signed Gamma head remains the production path for ordered "
-        "stores.  See docs/input_reference.md and KNOWN_LORRAX_ISSUES.md.")
+        "stores.  See docs/input_reference.md and "
+        "docs/architecture/decisions.md (2026-09-18).")
 
 
 def refuse_unsupported_bispinor_gw(config) -> None:
-    """Validate four-current modes and require live direct fields for QSGW; see docs/architecture/decisions.md."""
+    """Validate four-current modes and require live direct fields for QSGW; see docs/dev/gw_config_contracts.md."""
     mode = coerce_bispinor_gw_mode(
         getattr(config, "bispinor_gw", BispinorGWMode.BARE_TRANSVERSE))
     if (config.compute_mode is ComputeMode.X_ONLY
@@ -3901,7 +3899,7 @@ def refuse_unsupported_bispinor_gw(config) -> None:
 
 
 def refuse_unsupported_bispinor_tt_head_correction(config) -> None:
-    """Refuse ``bispinor_tt_head_correction = true`` outside its envelope; see docs/architecture/decisions.md."""
+    """Refuse ``bispinor_tt_head_correction = true`` outside its envelope; see docs/dev/gw_config_contracts.md."""
     if not bool(config.head.bispinor_tt_head_correction):
         return
     if not bool(config.bispinor):
@@ -3978,7 +3976,7 @@ def _parse_bgw_metal_q0_vector(value) -> tuple[float, float, float]:
 
 @dataclass(frozen=True)
 class HeadConfig:
-    """q→0 Coulomb-head sources, BGW vcoul override, bare-cutoff knobs; see docs/architecture/decisions.md."""
+    """q→0 Coulomb-head sources, BGW vcoul override, bare-cutoff knobs; see docs/dev/gw_config_contracts.md."""
     correction: HeadCorrection    # full | no_local_fields | off
     wcoul0_source: str            # "s_tensor" | "epshead"
     wcoul0_eta: float
@@ -4012,7 +4010,7 @@ class HeadConfig:
 
 @dataclass(frozen=True)
 class ScreeningConfig:
-    """χ₀ / W screening: method choice + minimax-quadrature knobs; see docs/architecture/decisions.md."""
+    """χ₀ / W screening: method choice + minimax-quadrature knobs; see docs/dev/gw_config_contracts.md."""
     method: str                   # "minimax" -- the only supported value
     occ_broadening_ev: float      # BGW MP1 width; 0 keeps step occupations
     minimax_target_error: float
@@ -4224,7 +4222,7 @@ class DynamicSigmaConfig:
         return sigma_classification_window_ev(self)
 
     def parsed_omega_patches_ev(self):
-        """The validated ``[(lo, hi), ...]`` patch list, or ``[]``; see docs/architecture/decisions.md."""
+        """The validated ``[(lo, hi), ...]`` patch list, or ``[]``; see docs/dev/gw_config_contracts.md."""
         return self.parse_omega_patches_ev(self.omega_patches_ev, self.omega_step_ev)
 
     def coarse_windows_ev(self):
@@ -4382,7 +4380,7 @@ class MPAConfig:
                     "default 1e-5 Ha = 2e-5 Ry).")
 
     def sample_plan(self, omega_m_ry, *, material_class):
-        """Return the configured double-parallel frequency plan in Ry; see docs/architecture/decisions.md."""
+        """Return the configured double-parallel frequency plan in Ry; see docs/dev/gw_config_contracts.md."""
         if self.sampling_alpha is None:
             raise RuntimeError(
                 "mpa_sampling_alpha is unresolved; infer the material class "
@@ -4457,7 +4455,7 @@ def uses_metal_direct_drude_head(config) -> bool:
 
 @dataclass(frozen=True)
 class SCConfig:
-    """Self-consistency loop knobs (read only when qp_solver=self_consistent); see docs/architecture/decisions.md."""
+    """Self-consistency loop knobs (read only when qp_solver=self_consistent); see docs/dev/gw_config_contracts.md."""
     max_iter: int
     tol_ev: float
     accelerator: str      # "anderson" — the only supported value
@@ -4538,7 +4536,7 @@ class SCConfig:
 
 @dataclass(frozen=True)
 class EQP2Config:
-    """Fixed-Sigma eigenvalue self-consistency for the opt-in eqp2 file; see docs/architecture/decisions.md."""
+    """Fixed-Sigma eigenvalue self-consistency for the opt-in eqp2 file; see docs/dev/gw_config_contracts.md."""
 
     enabled: bool = False
     tol_ev: float = 1.0e-3
@@ -4561,7 +4559,7 @@ class EQP2Config:
 
 @dataclass(frozen=True)
 class MemoryConfig:
-    """Per-device memory budget + chunk sizing + AOT chunk-chooser flag; see docs/architecture/decisions.md."""
+    """Per-device memory budget + chunk sizing + AOT chunk-chooser flag; see docs/dev/gw_config_contracts.md."""
     per_device_gb: float
     chunk_target_utilization: float
     band_chunk_size: int
@@ -4606,7 +4604,7 @@ class DebugConfig:
 
 @dataclass(frozen=True)
 class BSEConfig:
-    """BSE interpolation setup (htransform-driven fine-k wfn recovery); see docs/architecture/decisions.md."""
+    """BSE interpolation setup (htransform-driven fine-k wfn recovery); see docs/dev/gw_config_contracts.md."""
     get_centroids_fi: bool
     wfn_fi_min: int
     wfn_fi_max: int
@@ -4615,7 +4613,7 @@ class BSEConfig:
 
 
 def _validate_occupation_smearing(screening, width_ry):
-    """Validate the metal occupation width without classifying the WFN; see docs/architecture/decisions.md."""
+    """Validate the metal occupation width without classifying the WFN; see docs/dev/gw_config_contracts.md."""
     if width_ry is not None and not (np.isfinite(width_ry) and width_ry > 0.0):
         raise ValueError(
             "occ_smearing_width_ry (Fermi-Dirac kBT, Ry) must be > 0 for a "
@@ -4739,7 +4737,7 @@ def validate_material_inputs(config, material_class):
 
 
 def resolve_mpa_sampling_alpha(config, material_class, *, print_fn=print):
-    """Resolve and report the MPA sampling exponent from WFN material class; see docs/architecture/decisions.md."""
+    """Resolve and report the MPA sampling exponent from WFN material class; see docs/dev/gw_config_contracts.md."""
     if material_class not in ("insulator", "metal"):
         raise ValueError(f"unknown inferred material class {material_class!r}")
     named = "mpa_sampling_alpha" in config.raw_input_keys
@@ -4766,7 +4764,7 @@ def resolve_mpa_sampling_alpha(config, material_class, *, print_fn=print):
 
 @dataclass(frozen=True)
 class LorraxConfig:
-    """Unified, immutable configuration for a LORRAX GW calculation; see docs/architecture/decisions.md."""
+    """Unified, immutable configuration for a LORRAX GW calculation; see docs/dev/gw_config_contracts.md."""
 
     # --- System geometry (top-level; hot path) ---
     nval: int
@@ -4991,14 +4989,14 @@ class LorraxConfig:
 
     @property
     def occ_broadening_ry(self) -> float:
-        """THE occupation-smearing width consumed at runtime, in Ry; see docs/architecture/decisions.md."""
+        """THE occupation-smearing width consumed at runtime, in Ry; see docs/dev/gw_config_contracts.md."""
         if self.occ_smearing_width_ry is not None:
             return float(self.occ_smearing_width_ry)
         return float(self.screening.occ_broadening_ev) / RYD_TO_EV
 
     @property
     def compute_mode(self) -> ComputeMode:
-        """Resolve ``compute_mode`` from explicit input or legacy flags; see docs/architecture/decisions.md."""
+        """Resolve ``compute_mode`` from explicit input or legacy flags; see docs/dev/gw_config_contracts.md."""
         raw = (self.compute_mode_raw or "auto").strip().lower()
         if raw == "auto":
             if self.use_ppm_sigma:
@@ -5032,7 +5030,7 @@ class LorraxConfig:
 
     @property
     def qp_solver(self) -> QPSolver:
-        """Resolve ``qp_solver`` from explicit input or legacy flags; see docs/architecture/decisions.md."""
+        """Resolve ``qp_solver`` from explicit input or legacy flags; see docs/dev/gw_config_contracts.md."""
         raw = (self.qp_solver_raw or "auto").strip().lower()
         if raw == "auto":
             solver = (QPSolver.SELF_CONSISTENT if self.self_consistent
@@ -5063,7 +5061,7 @@ class LorraxConfig:
 
     @property
     def omega_grid_ev(self):
-        """Σ_c(ω) frequency grid in eV (length-stable single formula); see docs/architecture/decisions.md."""
+        """Σ_c(ω) frequency grid in eV (length-stable single formula); see docs/dev/gw_config_contracts.md."""
         if getattr(self, "sc_omega_grid_ev", None) is not None:
             # The sampled support of ``gw.qp_support``: by the one-shot, and
             # by every SC map, under one rule.
@@ -5108,7 +5106,7 @@ class LorraxConfig:
         runtime_platform: str | None = None,
         resolve_hardware: bool = True,
     ) -> LorraxConfig:
-        """Produce resolved input settings; see docs/architecture/decisions.md."""
+        """Produce resolved input settings; see docs/dev/gw_config_contracts.md."""
         from file_io import resolve_input_paths
         params = read_lorrax_input(filename)
         _linalg = params[_LINALG_RESOLUTION]

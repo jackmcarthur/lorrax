@@ -5,11 +5,187 @@ rule, the reason, and what it licenses deleting. **These override older prose
 anywhere in the tree**, including every page the
 [register](../index.md#register) names as an owner. Only rulings in force are
 listed; a superseded ruling is removed, and git history is the archive. Every
-entry is implemented on main.
+entry is implemented on main, except the code an entry names as not yet
+conforming.
 
-The last two sections are agent-tier: the GW driver's binding invariants and
-the per-function contracts of `gw.gw_config`, whose one-line docstrings point
-here.
+The GW driver's phase invariants and the per-function contracts of
+`gw.gw_config` are developer reference, not rulings:
+[GW driver and configuration contracts](../dev/gw_config_contracts.md).
+
+## 2026-10-01 — Per-pass loops are scans over device tables {#scan-pass-loops}
+
+**Rule (owner).** A loop over row passes or tiles runs as one `jax.lax.scan`
+whose scanned operand is the per-pass table (window index, first row, last
+row). Every per-pass lookup table enters the program as a device operand,
+never as an HLO constant. One compiled body serves every pass, so compile
+time and program size do not grow with the pass count.
+
+* `gw.subtile_stream.plan_windows` cuts a rank's rows into equal windows
+  aligned to whole symmetry orbits; `scan_passes` and `stream_passes` run
+  them in one scan; `window_load` cuts the placed unfold tables on the
+  device; the mathdx k-convolutions take a `live` rows operand, so the padded
+  rows of a short window cost nothing.
+* Users: the scalar Σ τ node and the static τ = 0 node
+  (`gw.ppm_tau_kernel`), the four-current sector node
+  (`gw.mpa.sector_sigma.sector_node`), the charge and four-current χ₀ streams
+  (`stream_passes`), and the SUMMA panel loop of
+  `distrib_la.panel_matmul`.
+
+**Why.** An unrolled Python loop emits one body, one k-convolution object
+and one copy of its tables per pass. Compile time and host memory then grow
+linearly with the pass count, which reaches hundreds per rank on
+production decks.
+
+**Not yet conforming.** The parent panels of the scalar shared-pole W
+synthesis (`gw.mpa.sigma._shared_pole_w_synthesis`) are a static Python loop
+inside the window executable; its pole-column chunks are a `fori_loop`.
+
+## 2026-10-01 — Dense per-q linear algebra runs local or on the full mesh, never on a sub-mesh {#no-sub-mesh}
+
+**Rule (owner).** A dense factorization, eigensolve or product over a batch
+of per-q (or per-parent) matrices has exactly two plans. **Local:** each rank
+solves whole matrices of its own batch slice (for example `distrib_la`'s
+batch-layout route, one batched cuSolverDn call per local stack).
+**Distributed:** each matrix is distributed over all P ranks
+(cuSOLVERMp, ScaLAPACK or SLATE on the world communicator), one matrix after
+another. No route splits the mesh into sub-meshes or sub-communicators. The
+deck dial `linalg = local | distributed` (`gw.gw_config.resolve_linalg`)
+selects the plan. Under `local`, a shared-pole parent whose matrices do not
+fit beside the live stages takes the distributed plan
+(`gw.shared_pole_execution.whole_parent_execution`).
+
+**Why.** At one q and a large centroid count N_μ the distributed plan is the
+only one that holds a matrix, so it must exist; a sub-mesh plan would be a
+third plan with its own communicator creation (a world-collective
+`MPI_Comm_split`, see the square-mesh ruling below), its own divisibility
+contract and its own failure modes, and it gains nothing at that limit.
+
+**Licenses deleting** the SLATE per-row sub-communicator context
+(`distrib_la._slate._subrow_context_key`, no caller) and the batched SLATE
+potrf/trsm handlers that need it (`src/ffi/cpp/slate/batched_{potrf,trsm}_ffi.cc`,
+registered but never called).
+
+## 2026-10-01 — LORRAX uses every symmetry operation QE reports {#all-qe-symmetries}
+
+**Rule (owner).** The WFN keeps every operation QE found, including those
+composed with time reversal; a deck never needs `no_t_rev` or `nosym`.
+LORRAX takes the operations from the WFN header and each one's type
+(unitary, or composed with time reversal) from the NSCF's
+`data-file-schema.xml` beside `WFN.h5` (`symmetry_maps.qe_schema`), bound only
+when the schema's operations and k rows match the WFN's. A full-zone k that
+no authorized operation reaches refuses; LORRAX never adds an operation QE
+did not record. Time reversal alone (k ↔ −k pairing for every operation) is
+used only when the DFT reference's occupied-subspace check measures it to
+hold (`wfn.trs_holds`; `symmetry_maps.SymMaps._initialize_active_operations`).
+Recipe: [inputs from DFT](../preprocessing.md#magnetic).
+
+**Why.** A magnet's time-reversal-composed operations are true symmetries;
+dropping them enlarges the stored k set (Fe and Ni 20³: 1062 stored k
+instead of 641) and the cost of every k sum with it. `WFN.h5` does not record
+which operations are composed with time reversal, and applying such an
+operation as unitary maps a state onto the wrong partner, so the schema is
+the one source of that bit.
+
+**Without a schema** the run prints `SYMMETRY PROVENANCE WARNING` and treats
+every header operation as unitary, which is wrong for a magnet whose QE
+operations include a time-reversal-composed one.
+
+## 2026-10-01 — A memory price over the budget warns; it never refuses {#warn-not-refuse}
+
+**Rule (owner).** No planner stops a run because a priced or compiled memory
+figure exceeds `memory_per_device_gb` or its tile. It prints one
+`RuntimeWarning` per stage kind (`common.gpu_utils.warn_over_budget`:
+`memory over budget at <stage>: needs X GB/rank, budget Y GB/rank, over by
+Z GB; continuing (an OOM is possible)`), takes its smallest size and runs. The
+shared-pole capacity ledger records an over-budget row as `FAIL` and admits it
+(`gw.shared_pole_recipe.CapacityLedger.reserve`). Two classes still refuse:
+
+* **kernel shape limits**, where no size of the operation exists: a k grid
+  that mathdx mode 11 cannot hold (`GATE response_vertex_grid`,
+  `gw.w_isdf`), a k axis above `ffi.fft.KCONV_AXIS_MAX` = 40;
+* **correctness gates**, for example `GATE shared_pole_gram_valid`
+  (`gw.shared_pole_constructor`).
+
+**Why.** A price is a model of the allocator and the budget is a user
+setting; neither proves that a stage does not fit, so a refusal on them
+stops runs the device would hold. The allocator decides exactly, at the
+cost of an OOM where the device truly lacks the room.
+
+**Deleted.** Every capacity refusal: `compiled_chunk_capacity`,
+`shared_pole_round_capacity`, `zeta-mubatch-capacity`, `vq_tile_budget`,
+`gn_ppm_fit_capacity`, the budget arm of `shared_pole_capacity` and the
+others the planners carried.
+
+## 2026-09-30 — Streamed loops take one fixed tile sized from their shapes {#fixed-tile}
+
+**Rule (owner).** A loop that streams over k, q, bands, centroids, samples or
+rows takes the most units whose per-rank bytes fit one fixed tile,
+`runtime.tiles.TILE_BYTES` = 1 GiB (`runtime.tiles.tile_units`). The count
+comes from the loop's own shapes. It never reads free device memory and
+never reads `memory_per_device_gb`. Mechanics:
+[memory model](memory-model.md#budget).
+
+**Why.** Allocator state is rank-local, so a size read from free device
+memory differs across ranks; the ranks then compile different loop shapes,
+issue different numbers of collectives and deadlock. A size read from the
+budget is the same on every rank, but it ties compiled shapes and summation
+grouping, and so results at round-off, to a user setting. One GiB per rank
+saturates the streaming kernels: on Fe 4³ and Na 8³ only the response sample
+group lost more than 10 % per map at 256 MiB.
+
+**Two sizes follow the budget by design**, through the capacity ledger,
+because a larger size is faster and moves no number: the shared-pole
+response sample group (`gw.response_bank.response_group_size`) and the
+htransform Galerkin whole-state fit (`bandstructure.fh_interp`,
+`isdf.galerkin`).
+
+**Not yet conforming.** These planners still size from
+`memory_per_device_gb` (the same value on every rank, so they do not
+deadlock): the ζ μ-batch planner (`gw.gflat_memory_model.plan_zeta_route_g`),
+the scalar shared-pole W-synthesis panel schedule (`gw.mpa.sigma`, parent and
+pole-column capacities from the ledger), the pair-convolution chunks
+(`gw.mixed_basis_pair_convolution._budget_target`), the kmeans candidate-Gram
+k batches and feature metric (`centroid.pivoted_cholesky`,
+`centroid.sampling_metric.build_feature_metric_diagonal`), the W-av stage
+(`file_io.parallel_transport._write_w_av_stage`), the non-TDA BSE column
+chunk (`bse.bse_nontda.dense_col_chunk`), the head Γ GEMM route
+(`gw.shared_pole_head`) and the plane-wave screening route
+(`gw.plane_wave_screening`). The ruling licenses converting each to
+`tile_units`.
+
+**Deleted.** `common.gpu_utils.device_room_bytes`, the allocator read
+gathered over processes.
+
+## 2026-09-30 — W is built on the irreducible q and unfolded on the kernel's load {#w-parents}
+
+**Rule (owner).** The screened interaction is formed the way the Green's
+function is: only on the irreducible q, by the Green builder's contraction,
+and unfolded to the full q grid only on the load of the k-convolution that
+reads it. No W(τ), W factor or pole table exists on the full q grid.
+
+* **Scalar shared-pole Σ.** `gw.mpa.sigma._shared_pole_w_synthesis` forms
+  $W(q,\tau) = b\,d(\tau)\,b^\dagger$ and its transpose on the irreducible q
+  through `gw.greens_function_kernel.build_G` (little-group realization,
+  fixed-q projection); `ffi.fft.make_kfft_klead_unfold` (mathdx mode 9)
+  unfolds it on the transform's load, and `make_kconv_klead_unfold`
+  (mode 7) convolves it with the parent Green.
+* **Four-current sector Σ.** `gw.mpa.sector_sigma.ParentW` holds
+  $B_A\,d(t)\,B_B^\dagger$ and its antiunitary partner from
+  `build_G_parents`; `ffi.fft.make_kconv_lorentz_unfold` (mathdx mode 8,
+  target `lorrax_mathdx_kconv_klead_lorentz_wparent`) reads it on its second
+  load. The constant $W_\infty - V$ and the photon static classes use the
+  same entry.
+* **Restart.** The stored $W_0 = V + W_c(0)$
+  (`gw.mpa.sigma.shared_pole_static_wc`) holds the q parents with their
+  unfold tables; BSE unfolds on load.
+
+**Why.** W has the symmetry of the crystal, as G does. A full-q copy costs
+n_q/n_q,irr times the parent bytes per τ node and a scatter to form it,
+while the unfold costs nothing extra on a kernel load that already reads
+the tile through an index map and phases.
+
+**Licenses deleting** the V_R Lorentz k-convolution targets the native
+library still exports for older trees (nothing in `ffi.fft` calls them).
 
 ## 2026-09-29 — Production GW is full-frequency QSGW with the shared-pole W {#production-gw-route}
 
@@ -82,31 +258,35 @@ a full axis never wins there). Full-axis DFT-as-matmul remains a scaling
 hazard, `O(N²)` per axis; the table keeps the GEMM to measured, bounded `N`, so
 transforms keep their `O(N log N)` scaling.
 
-## 2026-09-24 — One memory path per stage; chunk counts come from the budget
+## 2026-09-24 — One memory path per stage {#one-memory-path}
 
-A stage that can exceed the device budget derives its chunk count from the
-budget and runs one chunk when everything fits. It never branches into a
-second layout or a low/high-memory mode, and a modest cost is accepted for
-that (owner; sandbox `TASTE.md` 96).
+**Rule (owner).** A stage has one memory layout. It never branches into a
+second layout or a low/high-memory mode; a stage that may not fit runs the
+same layout in more passes, sized as the
+[fixed-tile ruling](#fixed-tile) says. A modest cost is accepted for that.
 
-* **ψ is band-distributed.** One `ParentGreenCarrier` holds two packed
-  raw-parent copies with bands on one mesh axis and centroids on the other,
-  `2·16·n_par·n_s·μ·N_b/P` per rank, for every spinor extent and both
-  centroid families. Canonical files are processor-grid independent and read
-  into these faces. `low_mem_bands` refuses by name. An explicit dense `Gij`
-  operand refuses (`GATE explicit_gij_unported`).
-* **Band contractions gather panels per call.** No band-complete ψ copy
-  outlives one contraction. A Green build is a batched 2-D SUMMA
-  (`distrib_la.panel_matmul`): interleaved band panels of at most `N_b/p`
-  columns, two live, every k in one exchange per panel, bounded by one
-  reserved full-k Green tile; no rank ever holds a band-complete panel. The Σ
-  projector reshards its projected bands for the call. The post-fit band-complete view and its
-  `4·G_tile` admission are gone, so no resident copy competes with the GN
-  fit, the GN tail or a second (SC) ψ bundle.
+**Why.** Every second layout is a second code path whose results must agree
+with the first and which only the decks that select it ever test.
+
+* **ψ is band-distributed.** One `ParentGreenCarrier`
+  (`gw.wavefunction_bundle`) holds two packed raw-parent copies with bands on
+  one mesh axis and centroids on the other (`common.wfn_layout.psi_specs`,
+  `face`), `2·16·n_par·n_s·μ·N_b/P` bytes per rank, for every spinor extent
+  and both centroid families. Canonical files are processor-grid independent
+  and read into these faces. The deck key `low_mem_bands` refuses by name. An
+  explicit dense `Gij` operand refuses (`GATE explicit_gij_unported`).
+* **Band contractions gather panels per call.** A Green build is a batched
+  2-D SUMMA (`distrib_la.panel_matmul`): interleaved band panels of at most
+  `N_b/p` columns, bounded by one full-k Green tile
+  (`gw.greens_function_kernel.green_panel_bytes`), two live, every k in one
+  exchange per panel. Inside a sub-tile stream (the Σ τ and χ₀ row passes) a
+  rank holds band-complete ψ rows of its own centroid blocks for one dispatch
+  (`gw.subtile_stream.band_complete`), because G and χ₀ there exist only as
+  streamed sub-tiles of those blocks (owner, 2026-09-30). No band-complete ψ
+  copy outlives one dispatch.
 * **The ζ back-solve is q-local.** Each whole-tile factor stays on its q
-  owners (`16·⌈Q/P⌉·μ²` per rank) and only the right-hand side moves; with
-  `Q < P` the ranks past `Q` idle in the solve. The replicated `16·Q·μ²`
-  tier and `LORRAX_ZETA_GATHER_CAP_GIB` are gone.
+  owners (`16·⌈Q/P⌉·μ²` bytes per rank) and only the right-hand side moves;
+  with `Q < P` the ranks past `Q` idle in the solve.
 
 ## 2026-09-24 — NVIDIA k-convolutions run on nvidia-mathdx, behind one platform router
 
@@ -495,255 +675,3 @@ cite an entry here.
   object may be required to fit on one rank in the large-P limit. Each solve
   family has two plans, a local whole-tile plan and a distributed plan;
   execution schedules of a plan are not new plans.
-- **Evidence.** Every performance claim carries a CLAIMS row with its job id
-  and on-disk artifact.
-
-## GW driver invariants (`gw.gw_jax`)
-
-Binding rules of the driver's phases that no docstring carries.
-
-* **One timing table that sums to the wall.** `timing.reset()` runs at `main()`
-  entry, and `timing.report(wall=...)` closes the table, so printed rows plus
-  `(untimed)` equal the process wall. The pre-`main()` span
-  (`initialize_communicator_stack`, imports) is decomposed from
-  `RUNTIME.facts['elapsed']`, not added as extra rows.
-- **Refuse before compute.** The `compute_mode × qp_solver` axes and every
-  cross-key envelope are resolved and validated at parse time, before the WFN
-  read and the ζ fit.
-- **The mesh is built once**, above `main()`, with every communicator warmed
-  (`nccl_warmup` on GPU, `warm_mesh_cliques` on CPU/MPI). Never call
-  `prepare_mesh()` again: a second `Mesh` is a second set of communicators and
-  jit caches.
-- **HDF5 library instances** are measured from `/proc/self/maps`
-  (`file_io.hdf5_owner`), and probed again after each SC store cycle; an
-  unsafe inventory (two libhdf5 instances touching one file) always prints.
-- **Route and head provenance in the run record.** Which bispinor route ran
-  (`packed_bare_transverse_route` returns the first unmet condition), the Γ
-  head status, and the resolved ζ-fit edge
-  (`gw_init.resolve_zeta_fit_edge`, never the deck value) are printed into
-  `gwjax.out`, not left to component chatter.
-- **One head resolver.** Every q→0 head sample of a run (COHSEX static head,
-  W0 restart head, PPM dynamic head) comes from `head_correction.HeadResolver`.
-- **SC iteration 1 is the one-shot.** SC runs skip the one-shot Σ; the first
-  map reproduces it.
-- **Σ_x gate.** Every Σ_x diagonal entry must be negative
-  (`sanity.check_sign`); a positive one is a sign, conjugation or band-index
-  slip.
-- **Non-finite refusals.** Σ and `kin_ion` are checked before the QP eigh, which
-  both one-shot and SC cross; a non-finite value refuses
-  (`common.sanity`). `LORRAX_ALLOW_NONFINITE_RESULT=1` is the forensic escape.
-- **No gathers for printing.** Rank-0 writers consume bounded `(nk, nb)`
-  diagonals extracted collectively; a band-sharded `(nk, nb, nb)` operator is
-  never host-converted.
-- **Degenerate-set averaging once**, at the H-build seam (BerkeleyGW
-  `shiftenergy.f90` convention, off with `no_degen_averaging`). Head-only debug
-  columns take the same averaging; `eqp_g0w0` is formed after it.
-- **`write_eqp2` never recomputes GW.** It iterates only the built
-  full-matrix Σ(ω), rotated into each updated QP basis.
-
-## Configuration contracts (`gw.gw_config`)
-
-Contracts of the functions and classes whose docstrings point here. The deck
-keys themselves are in the [input reference](../input_reference.md).
-
-### Parsing
-
-- **`read_lorrax_input`** parses the `[cohsex]` section and strips the QE
-  `K_POINTS` block. Parsing is always strict: every unknown key refuses in one
-  aggregated error with line numbers (`_deck_key_line`); a retired key gets its
-  own report naming the replacement. Inline `#` comments are stripped. Key
-  names are case-folded on both sides of the unknown-key check. It records
-  which keys the deck named, so an explicit default and an absent key are
-  distinguishable where that matters and serialize to the same
-  `LorraxConfig` otherwise (`raw_input_keys`). `_print_deck_report` prints the
-  hygiene report on rank 0 and stays importable without jax.
-- **`LorraxConfig.from_input_file`** resolves the typed record once.
-  `runtime_platform` injects `cpu`/`gpu` for a preflight with no device;
-  `resolve_hardware=False` leaves an auto memory budget at its zero sentinel
-  and makes no device probe. Production callers use the defaults. Only
-  `restart = true` enters the restart loader; a file in `tmp/` is not
-  permission to reuse it.
-- **`env_float`**: unset or blank → default; unparseable → announced, or with
-  `refuse=True` (for knobs that gate correctness) a refusal naming the
-  variable. Never a silent default.
-- **`active_zeta_truncating_knobs`** lists the ζ-fit truncating env knobs in
-  force, so the run record says the fit was truncated.
-- **Normalizers** (`coerce_compute_mode`, `coerce_screening_diagrams`,
-  `_normalize_placement`) accept an enum, its `.value` or a string, in one
-  place; a typo raises naming the legal set and never resolves to a default.
-
-### Self-energy and solver axes
-
-- **`ComputeMode`** is the single axis naming the ansatz for W's frequency
-  dependence: `x_only`, `cohsex`, `gn_ppm`, `hl_ppm`, `mpa`. The value names
-  the ansatz, not the numerics. `full_freq` was rejected. It names a family
-  (contour deformation, real-axis quadrature and MPA are all full-frequency),
-  so a deck would still need a second axis to pick one. It also reserves the
-  name for a future pole-free numerical Σ.
-  `is_dynamic` means "this run has an ω axis" (GN/HL-PPM and MPA);
-  `ppm_model` is `'gn'`/`'hl'` and None for MPA and the static modes, so a site
-  that means "which two-point PPM fit" asks `ppm_model`, never `is_dynamic`.
-- **`LorraxConfig.compute_mode`**: `auto` (default) infers from the legacy
-  `do_screened`/`use_ppm_sigma`/`ppm_model`; an explicit value overrides.
-  Resolving is not permitting: `refuse_unimplemented_compute_mode` runs at
-  driver entry and raises `NotImplementedError` (distinct from a typo's
-  `ValueError`); `UNIMPLEMENTED_MODES` is empty today.
-- **`announce_legacy_sigma_axis_keys`** prints one deprecation note per legacy
-  key in `LEGACY_SIGMA_AXIS_KEYS` the deck named and returns them; nothing is
-  refused and nothing resolves differently.
-- **`SigmaChannel`**: the terms outputs are written from, `X`, `SX`, `COH`,
-  `C_OMEGA`; `label` is the prose spelling. `explain_missing_channels` is the
-  named-omission clause a writer appends when it declines a channel.
-- **`QPSolver`** is orthogonal to `compute_mode`: `one_shot_dft` (default;
-  QSGW-Hermitianized Σ_xc at E_DFT diagonalized once) and
-  `self_consistent` (the QSGW loop, Σ at each map's own energies). No QP
-  root is solved; `fixed_point` is retired and refuses by name (owner
-  2026-09-29). `LorraxConfig.qp_solver`: `auto` resolves
-  to `self_consistent` on the deprecated `self_consistent = true`, else
-  `one_shot_dft`. eqp0/eqp1 use the same at-DFT formula under every solver.
-- **`resolve_band_extrapolation`**: `use_band_extrapolation` is the key and
-  `sigma_band_extrapolation` a deprecated alias; both named and disagreeing
-  refuses. `explicit` selects the behaviour on a non-consuming stage: a defaulted-on
-  key auto-disables with a note, an explicitly named one refuses.
-  `band_extrapolation_is_consumable` is true when any stage is GN/HL-PPM or an
-  MPA stage whose Σ_c runs the scalar executor
-  (`mpa_sigma_runs_scalar_executor`: scalar decks and both bispinor
-  shared-pole routes, `bare_transverse` and `full_shared_pole`; the latter
-  brackets its CC class only).
-- **`sigma_stage_modes`** returns every mode the run dispatches Σ under, in
-  order: the staged ladder when `config.sc.stages` exists, else the one
-  `compute_mode`. A run-level refusal asks this, never the current stage.
-- **`LorraxConfig.omega_grid_ev`**: `n = floor((max − min)/step + 0.5) + 1`;
-  the Ry grid is derived by division. With `sigma_omega_patches_ev` the grid is
-  the union of patches built by the same formula, and `sigma_omega_min/max_ev`
-  become the patch hull. `DynamicSigmaConfig.parsed_omega_patches_ev` refuses
-  malformed, unsorted, overlapping or touching patches.
-
-### Screening
-
-- **`HeadCorrection`**: `full` (default; an irreducible direct response is
-  completed with its microscopic head/wings exactly once, a micro-reducible
-  response is used as is), `no_local_fields` (diagnostic ε head), `off` (no
-  special Γ-cell term, for brute-force k convergence).
-- **`ScreeningConfig`**: `method` exists only to refuse anything but
-  `minimax` (2026-08-06). `diagrams` (`ScreeningDiagrams`) chooses which
-  series W sums: `w_rpa` (default, `W = (1 − Vχ₀)⁻¹V`), `w_bse` (ladder W with
-  the statically screened direct rung, two-stage: the RPA W(0) is the ladder's
-  `W_R`), and `w_rpa_resolvent` (the same resolvent identity with the RPA
-  operator, the ladder's `include_w=False` limit, a gate of the resolvent
-  machinery against the Dyson route). The fork lives only in
-  `gw.screening.compute_screening_model`. It is an enum because the resolvent
-  formalism admits more diagram sets.
-- **`refuse_unsupported_screening_diagrams`** runs at parse time on resolved
-  axes and is a no-op for `w_rpa`. Each non-RPA value has its own table
-  (`_W_BSE_REFUSALS`, `_W_RPA_RESOLVENT_REFUSALS`): `x_only`, `hl_ppm`,
-  self-consistency and `mc_average_placement != off` refuse for both, and
-  `compute_mode = mpa` for `w_rpa_resolvent`. A metallic WFN refuses at the
-  stage on its occupations (`{value}_insulators_only`, `gw.screening_bse`);
-  `w_bse` also requires a measured time-reversal verdict.
-- **`normalize_w_dyson_solver`**: `local`/`auto`/unset → the q-parallel
-  per-q dense LU; `distributed` → the 2-D-sharded backsolve through
-  `distrib_la`; `lu` → `local` with a deprecation warning; `lstsq` refuses.
-  The parser and `w_isdf` share this one vocabulary.
-
-### Layout and linear algebra
-
-- **`resolve_linalg`** interprets `linalg = local | distributed` exactly once
-  into `LinalgResolution`; no stage reinterprets the dial. `distributed`
-  distributes the W Dyson solve, the transverse LU and the eigensolvers; the ζ
-  back-solve is always a whole-tile factor applied on its q owners. The internal
-  `distributed_lu = 'distributed'` sentinel lowers to cuSolverMp on CUDA and
-  ScaLAPACK on CPU.
-- **`eigh_backend_choices`** reads `distrib_la.BACKEND_CHOICES`, importable
-  without any `.so`; a literal fallback covers a tree without `services/`, and
-  `EIGH_CHOICES_SOURCE` records which answered.
-  `distrib_la_batched_route_choices` likewise reads distrib_la's batch-route
-  vocabulary; `batch_reshard` is the default and `auto` restores the backend's
-  scan/stacked route.
-- **`MemoryConfig`**: `memory_per_device_gb = 0` auto-detects the GPU;
-  `chunk_target_utilization = 0` is the auto sentinel, and a positive
-  `ISDF_CHUNK_TARGET_UTILIZATION` overrides the planner's spin-aware default
-  after clamping to [0.85, 1.0].
-
-### Band counts
-
-- **`resolve_band_counts`** is the only place band-count precedence exists,
-  called once per deck: `nband` is an alias of `number_bands` (both set and
-  different → `BandCountConflict`); the umbrella supplies both consumers;
-  `number_bands_chi`/`number_bands_sigma` override their own consumer; the
-  umbrella and a specific key named with different values refuse, the same
-  value is accepted.
-- **`BandCounts`** holds `chi`, `sigma` and `isdf = max(chi, sigma)`, the top
-  of the loaded ψ window and the ζ-fit window, plus `named`, the keys the deck
-  wrote. Nothing downstream re-reads a deck key for a band count;
-  `params["nband"]` mirrors `isdf` for tools that read the dict.
-  `BandCounts.describe` logs which count won the `max` against the resolved
-  ζ-fit edge from `gw_init.resolve_zeta_fit_edge`, never the deck value.
-  `zeta_nband` is stored verbatim; its collapse to the default happens only
-  in `resolve_zeta_fit_edge`, where the padded edge is known.
-
-### Four-current (bispinor) envelope
-
-- **`BispinorGWMode`** is orthogonal to `ComputeMode`: it selects which Lorentz
-  blocks are screened and contracted. Values: `bare_transverse` (default),
-  `full_shared_pole`, `full_static_cohsex`. Retired spellings refuse by name in
-  `coerce_bispinor_gw_mode`, never aliased.
-- **`packed_static_envelope`** is the one table of the packed static photon
-  operator's conditions, yielding `(accepted, got, want, klass, why,
-  derived_key)`; the key promotion in `from_input_file` and the refusals read
-  the same rows. Material class is inferred from WFN occupations, not a row.
-- **`packed_bare_transverse_route`** returns `(taken, reason)`:
-  `bare_transverse` is the packed static mode with the fifteen current χ
-  blocks zero, so the packed Dyson solve is block diagonal and returns
-  screened charge COHSEX in CC, bare Breit exchange in TT and zero in CT/TC.
-  It is taken exactly inside the envelope its Γ completion is derived for.
-- **Route predicates.** `packed_photon_screens_current`: true for
-  `full_static_cohsex` (sixteen χ blocks, one packed Dyson solve), false for
-  the bare family. `uses_static_photon_response`: both packed static modes.
-  `packed_photon_replaces_charge_sigma`: true only for `compute_mode = cohsex`;
-  every driver seam asking "may I skip the scalar charge machinery?" asks this.
-  `uses_dynamic_packed_photon_route`: charge block on the run's frequency
-  model, current blocks at ω = 0. `uses_coupled_photon_head`: the packed
-  modes under `head_correction = full`.
-- **`incumbent_bispinor_head_record`** returns `(banner, run_record_line)` for
-  a bispinor deck off the packed route, so a headless incumbent run carries a
-  DEBUG token in `gwjax.out`.
-- **`refuse_unsupported_bispinor_gw`** validates the four-current modes and
-  requires live direct fields for bispinor QSGW
-  (`GATE bispinor_self_consistency_requires_live_four_current`).
-  `refuse_unsupported_bispinor_tt_head_correction` guards hand-built configs
-  only: `bispinor_tt_head_correction` is not a deck key.
-- **`scalar_head_overrides_named`** formats only the scalar-head overrides the
-  deck named, for envelope messages.
-
-### Heads, occupations and loop settings
-
-- **`HeadConfig`** holds the q→0 Coulomb-head sources and overrides, consumed
-  by `head_correction.HeadResolver`; the BGW vcoul override is diagnostic
-  only.
-- **`LorraxConfig.occ_broadening_ry`** is the one smearing width every
-  occupation solve reads: `occ_smearing_width_ry` (a metal's Fermi-Dirac kBT)
-  when declared, else `occ_broadening` converted from eV. `occ_broadening` uses
-  BerkeleyGW's MP1 convention, argument `(E − μ)/(2·width)`, half of QE's
-  `degauss`. `occ_broadening = 0` selects step occupations; it answers
-  whether, not how wide.
-- **`_validate_occupation_smearing`**: the metal width must be finite and
-  positive; `occ_broadening > 0` beside a metal width refuses
-  (`GATE metal_sc_head_update_disabled`).
-- **`resolve_mpa_sampling_alpha`** runs after occupations load: fractional
-  occupations select 2, integer ones 1; a deck value (1 or 2) wins.
-- **`MPAConfig.sample_plan`** returns the double-parallel frequency plan in Ry;
-  it is sampling geometry only.
-- **`SCConfig`** holds the loop settings read under `qp_solver =
-  self_consistent`: `sc_accelerator` accepts only `anderson`
-  (`GATE sc_accelerator_anderson_only`), and `eigh` is a layout choice
-  (`native` k-sharded batch, `distributed`, or `auto`). The `LORRAX_SC_*` env
-  overrides are deprecated and print a note when active. The loop:
-  [Self-consistency](../self_consistency.md).
-- **`EQP2Config`** is fixed-Σ eigenvalue self-consistency for the opt-in eqp2
-  file; it never rebuilds G, χ₀, W or Σ.
-- **`BSEConfig`**: `get_centroids_fi` gates the htransform-driven fine-k
-  wavefunction recovery (`bandstructure.bse_setup.compute_wfns_fi`).
-- **`LorraxConfig`** is the immutable record built once and threaded through
-  the driver: top-level system geometry and mode axes, grouped sub-configs
-  for the rest.

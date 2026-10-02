@@ -84,7 +84,12 @@ whole-orbit D̃ the all-to-all delivered. One row's all-plane cylinder can
 itself exceed the device (CrI3 16×16 bispinor: N_k·n_a'·ns²·2·n_col·16 =
 33 GB); the plane axis is then cut into n_blk blocks, each block's axis DFT a
 GEMM onto its own planes, and the unfold and cylinder gather are redone per
-block. Both counts come from the budget and are 1 when everything fits.
+block. Both counts are 1 when everything fits. They come from the ζ
+planner's device target (`memory_per_device_gb` times the fragmentation
+target; `gflat_memory_model.route_g_plane_chunk`, see
+[Memory per rank and the planner](#memory-per-rank-and-the-planner)), not
+from the fixed tile; this planner is one of those the
+[fixed-tile ruling](decisions.md#fixed-tile) names as not yet conforming.
 
 The k-convolution in step 5 is the pair convolution on the identity plan,
 where every k is its own parent: `ffi.fft.make_fused_conv_kplane(D, F)`. It
@@ -244,7 +249,9 @@ The planner decides in this order:
 
 1. **Resident ψ(G).** Let M_f be the device target minus the fixed terms.
    ψ(G) stays resident when M_f − Ψ holds the smallest batch (b = P,
-   one plane per group and per block); otherwise the plan refuses.
+   one plane per group and per block); otherwise that smallest configuration
+   runs and one `memory over budget at zeta mu-batch` warning is printed
+   ([decisions](decisions.md#warn-not-refuse)).
 2. **Batch width.** For each n_pg = 1, 2, 4, …, n_a, b is the largest
    multiple of P whose working set, with the whole plane axis in one block,
    fits M_f − Ψ, capped at ceil(μ/P)·P and balanced across batches; with no

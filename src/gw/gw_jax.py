@@ -1500,7 +1500,7 @@ def _report_file_rows(args, config, input_dir, report, sigma_omega_h5_path, tens
 
 
 def main(argv=None):
-	"""Run the GW stages; see docs/architecture/decisions.md."""
+	"""Run the GW stages; see docs/dev/gw_config_contracts.md."""
 	args = build_parser().parse_args(argv)
 	_t_main = time.perf_counter()
 	_pre_main = timing.process_elapsed_s()
