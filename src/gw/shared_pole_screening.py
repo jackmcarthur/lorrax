@@ -361,6 +361,8 @@ def _release_bank_file(path):
 #: The per-map scratch generation ``screen_shared_poles`` creates under an SC
 #: label (bank, Coulomb staging, constant and receipts).
 _MANAGED_SCRATCH = r"sc_[0-9]{4}_shared_pole"
+#: Set once this process has swept earlier processes' streamed stores (prepare_output).
+_SWEPT: list = []
 
 
 def retain_iteration_scratch(run_dir, label, *, print_fn=print):
@@ -501,6 +503,17 @@ def screen_shared_poles(wfns, V_q, meta, config, *, mesh_xy, sym,
             # map and loses the rest: a published sector handle is reused, a
             # complete bank resumes the constructor, anything else is rebuilt.
             import h5py
+            from file_io.slab_io import remove_stale_streamed_banks
+            # Per-rank streamed stores never outlive their process (SlabIO unlinks them
+            # on every exit it sees); a SIGKILL leaves them, so the first map of a
+            # process removes every generation's leftovers before it creates any.
+            stale = remove_stale_streamed_banks(
+                [root / "streamed_bank"] if _SWEPT else
+                [p / "streamed_bank" for p in Path(run_dir).resolve().glob("*_shared_pole")])
+            _SWEPT.append(True)
+            if stale:
+                print_fn("WARNING shared-pole output: removed streamed stores left by an earlier "
+                         "process: " + " ".join(stale))
             model = root / "model.h5"
             if photon and (root / 'sectors.json').exists():
                 if _published_sector_handle(root, identity) is not None:

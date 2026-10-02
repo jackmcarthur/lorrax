@@ -118,9 +118,9 @@ from .io_timing import DISABLED, SlabIOTiming, enabled as _timing_enabled, timed
 from ._slab_io_ffi import (_FfiBackend, assert_available, mesh_divisible_shape,
                            probe_availability, probe_read_availability)
 
-from ._slab_io_rank import StreamedBank  # noqa: E402  (the per-rank streamed tier)
+from ._slab_io_rank import StreamedBank, remove_stale_streamed_banks  # noqa: E402  (the per-rank streamed tier)
 
-__all__ = ["SlabIO", "StreamedBank", "assert_available", "mesh_divisible_shape",
+__all__ = ["SlabIO", "StreamedBank", "remove_stale_streamed_banks", "assert_available", "mesh_divisible_shape",
            "probe_availability", "probe_read_availability"]
 
 #: With ``LORRAX_H5_JOURNAL=1``, every op through this class is one line in
