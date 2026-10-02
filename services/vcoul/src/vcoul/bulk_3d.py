@@ -20,18 +20,28 @@ def _isotropic_vq(qcart):
     return 8.0 * jnp.pi / denom
 
 
-@jax.jit
-def _screened_rows(rq, S, extra):
-    """``<v / (1 - v (q.S_z.q + chi_z(q)))>`` over one draw batch for every row z: [Z].
+def _screened_terms(rq, S, extra):
+    """``v / (1 - v (q.S_z.q + chi_z(q)))`` at every point of ``rq`` for every row z: [Z, n].
 
-    ``S`` [Z,3,3]; ``extra`` [Z,n] (the rows' ``chi_extra`` on this batch) or
-    None. One program per batch replaces one eager chain per row and batch.
+    ``S`` [Z,3,3]; ``extra`` [Z,n] (the rows' ``chi_extra`` at these points) or None.
     """
     vq = _isotropic_vq(rq).astype(jnp.complex128)[None]
     qSq = jnp.einsum("qi,zij,qj->zq", rq, S, rq)
     if extra is not None:
         qSq = qSq + extra
-    return jnp.mean(vq / (1.0 - vq * qSq), axis=-1)
+    return vq / (1.0 - vq * qSq)
+
+
+@jax.jit
+def _screened_rows(rq, S, extra):
+    """The rows' mean over one draw batch: [Z]. One program per batch serves all rows."""
+    return jnp.mean(_screened_terms(rq, S, extra), axis=-1)
+
+
+@jax.jit
+def _screened_sums(rq, S, extra):
+    """The rows' sum over one process's share of a draw batch: [Z]."""
+    return jnp.sum(_screened_terms(rq, S, extra), axis=-1)
 
 
 class Bulk3D:
@@ -142,18 +152,37 @@ class Bulk3D:
         means = [jnp.mean(self._vq_isotropic(rq)) for rq in batches]
         return jnp.mean(jnp.stack(means))
 
-    def _screened_means(self, batches, S_carts, extra_chi_rows):
+    def _screened_means(self, batches, S_carts, extra_chi_rows, *, shared=False):
         """Anisotropic screened ``w0 = <v / (1 - v (q.S.q + chi_extra(q)))>`` of every row, mean of batch means: [Z].
 
-        ``extra_chi_rows(rq)`` returns every row's ``chi_extra`` [Z, n] on one
-        batch, or is None. One program per batch serves all rows.
+        ``extra_chi_rows(rq)`` returns every row's ``chi_extra`` [Z, n] on a
+        set of points, or is None. One program per set of points serves all
+        rows. ``shared`` (every process calls, as the head rows' average does):
+        each process evaluates its own share of each batch's points on its
+        device and the shares' sums are gathered once, in process order, so
+        each process gets the same result for 1/P of the work; the metal
+        head's Fermi-surface Lindhard term (velocity atoms x 2^18 points x
+        rows x draws) was 13 s per map, repeated on every rank, at Ni 20^3.
         """
         S = jnp.asarray(np.stack([np.asarray(S, np.complex128) for S in S_carts]))
-        means = []
+        if not shared or jax.process_count() == 1:
+            means = []
+            for rq in batches:
+                rq = jnp.asarray(rq)
+                means.append(_screened_rows(rq, S, None if extra_chi_rows is None else extra_chi_rows(rq)))
+            return jnp.mean(jnp.stack(means), axis=0)
+        from jax.experimental import multihost_utils
+        rank, ranks = jax.process_index(), jax.process_count()
+        sums, counts = [], []
         for rq in batches:
-            rq = jnp.asarray(rq)
-            means.append(_screened_rows(rq, S, None if extra_chi_rows is None else extra_chi_rows(rq)))
-        return jnp.mean(jnp.stack(means), axis=0)
+            n = int(rq.shape[0])
+            share = jnp.asarray(rq)[n * rank // ranks:n * (rank + 1) // ranks]
+            sums.append(_screened_sums(
+                share, S, None if extra_chi_rows is None else extra_chi_rows(share)))
+            counts.append(n)
+        total = np.asarray(multihost_utils.process_allgather(
+            np.asarray(jnp.stack(sums), dtype=np.complex128), tiled=False)).sum(axis=0)
+        return jnp.asarray(np.mean(total / np.asarray(counts, np.float64)[:, None], axis=0))
 
     def q0_average_screened(
         self, geometry: CoulombGeometry, kgrid, *,
@@ -181,7 +210,7 @@ class Bulk3D:
         )
         vc0_mean = self._vc0_mean(geometry, (nkx, nky, nkz), batches,
                                   analytic_sphere).astype(jnp.complex128)
-        wcoul0 = self._screened_means(batches, list(S_carts), extra_chi_rows)
+        wcoul0 = self._screened_means(batches, list(S_carts), extra_chi_rows, shared=True)
         return vc0_mean, list(np.asarray(wcoul0, dtype=np.complex128))
 
     def q0_average_transverse_tensor(
