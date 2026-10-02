@@ -98,7 +98,9 @@ def contour_block_accumulate_local(accumulator, contribution, projection, valid,
     The terms add in order with the full accumulator's rounding, so terms
     ``(a, b)`` give the bytes of two :func:`contour_accumulator` calls.
     ``mesh`` (the enclosing ``shard_map``'s) picks the CUDA handler or, on a
-    host mesh, the same sum in XLA.  complex128 only; no collectives.
+    host mesh, the same sum in XLA.  complex128 only; no collectives.  ``m0``/``n0``
+    are Python ints (FFI attributes) or traced ints, e.g. a scanned pass's row offset (the
+    handler's optional ``origin`` operand; the same sum, bit for bit).
     """
     if any(a.dtype != jnp.complex128 for a in (accumulator, contribution, projection)):
         raise TypeError("contour block accumulator requires complex128 operands")
@@ -114,8 +116,10 @@ def contour_block_accumulate_local(accumulator, contribution, projection, valid,
         return jax.lax.dynamic_update_slice(
             accumulator, jnp.where(live, new, block), (0, 0, m0, n0))
     _require(BLOCK_TARGET)
+    static = all(isinstance(v, (int, np.integer)) for v in (m0, n0))
+    origin = () if static else (jnp.stack([jnp.asarray(m0, jnp.int32), jnp.asarray(n0, jnp.int32)]),)
     return jax.ffi.ffi_call(
         BLOCK_TARGET, jax.ShapeDtypeStruct(accumulator.shape, accumulator.dtype),
         input_output_aliases={0: 0}, vmap_method="sequential",
-    )(accumulator, contribution, projection, valid.astype(jnp.int32),
-      m0=np.int64(m0), n0=np.int64(n0))
+    )(accumulator, contribution, projection, valid.astype(jnp.int32), *origin,
+      m0=np.int64(m0 if static else 0), n0=np.int64(n0 if static else 0))
