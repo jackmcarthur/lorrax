@@ -330,11 +330,13 @@ def sector_node(left, right, keys, meta, mesh_xy, w_tables, band_axis, *, static
         zero = jax.lax.with_sharding_constraint(
             jnp.zeros((1, px * py * n_parent, nb_sig, nb_sig), jnp.complex128), partial_spec)
 
-        def one_pass(acc, W, Wt, rows, left_p, g_pass, w_pass):
+        def one_pass(acc, W, Wt, rows, left_p, g_pass, w_pass, rows_live=None):
             green = build_G_parents(rows, None, phases=phases, layout='axis', gemm=gemm,
                                     k_unfold_plan=plans[0], real_weights=False, right=yr)
+            # ``rows_live``: a padded window's live rows [lo, hi), skipped outside.
             sigma = kconv[hole](green.G, green.transpose, W, Wt,
-                                conj_partner=green.conj_partner, load=g_pass, w_load=w_pass)
+                                conj_partner=green.conj_partner, load=g_pass, w_load=w_pass,
+                                live=rows_live)
             return project.accumulate((jnp.conj(left_p), yn), sigma, acc=acc)
         W, Wt = interactions.W, interactions.partner
         if whole:
@@ -347,7 +349,8 @@ def sector_node(left, right, keys, meta, mesh_xy, w_tables, band_axis, *, static
                             window_green_rows(xn, mesh_xy, s, R),
                             window_rows(xr, mesh_xy, s, R, axis=3, live=(lo, hi)),
                             window_load(g_load, mesh_xy, s, lo, hi, R, ns),
-                            window_load(w_load, mesh_xy, s, lo, hi, R, n_a))
+                            window_load(w_load, mesh_xy, s, lo, hi, R, n_a),
+                            jnp.stack([lo, hi]).astype(jnp.int32))
         return finish(scan_passes(windows, step, zero))
     spatial.price = price
     node = SimpleNamespace(spatial=spatial, loads=loads, key=key + (tuple(windows),), plans=plans)
