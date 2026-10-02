@@ -1247,6 +1247,8 @@ def _get_chi_fractional_contour_kernel_face(
         # conjugate-face GEMM at every node, decided at trace time, so no
         # Green build waits on a host-read predicate inside the node loop.
         direct = pair_mode == "direct"
+        # Direct band weights as one [n, nk, nb] row per node (the exact moments).
+        per_node = direct and occ_f.ndim == 3
 
         def oriented(weight, t):
             """The (weight, time) the Green is built at: conjugated for the physical orientation."""
@@ -1306,10 +1308,12 @@ def _get_chi_fractional_contour_kernel_face(
         def photon_subtiles(carry, weights, count, orientations):
             """A four-current node rule on every family pair's row passes (``gw.subtile_stream``).
 
-            ``orientations(time)`` lists a node's Green pairs ``(lower weight,
-            lower time, lower reference, upper weight, upper time, upper
-            reference)``; ``weights`` ``[2·len(orientations), n_out, n]`` weight
-            each pair's ``conj FT[A](q)`` and ``FT[A](-q)`` rows, in that order.
+            ``orientations(time, *band)`` lists a node's Green pairs ``(lower
+            weight, lower time, lower reference, upper weight, upper time,
+            upper reference)`` (``band``: the node's own band weights when
+            they are per node, the exact moments); ``weights``
+            ``[2·len(orientations), n_out, n]`` weight each pair's
+            ``conj FT[A](q)`` and ``FT[A](-q)`` rows, in that order.
             Per family pair and pass, a node's planes: the pair's quadrant
             Greens on the pass's band-complete ψ rows of the left family and
             the right family's band-complete columns (one local GEMM each over
@@ -1352,7 +1356,12 @@ def _get_chi_fractional_contour_kernel_face(
                 def node_rows(ops, index, i_pair=i_pair, pair=pair, keys=keys,
                               right_extent=right_extent, L=L, R=R, rows_w=rows_w):
                     left_rows, loads, live = ops
-                    time = jax.lax.optimization_barrier(time_nodes[index])
+                    if per_node:
+                        # A per-node band weight row, read behind the barrier as the charge stream's.
+                        time, *band = jax.lax.optimization_barrier(
+                            (time_nodes[index], *node_band_weights(index)))
+                    else:
+                        time, band = jax.lax.optimization_barrier(time_nodes[index]), ()
 
                     def parent(weight, t, ref, halves, current):
                         left = jax.lax.slice_in_dim(left_rows, 2 * halves[0], 2 * halves[0] + 2,
@@ -1365,7 +1374,7 @@ def _get_chi_fractional_contour_kernel_face(
                                            prepared_active_gemm=photon_active[i_pair][int(current)],
                                            real_weights=False, right=rights[R][halves[1]])
                     planes = [[] for _ in keys]
-                    for lw, lt, lref, uw, ut, uref in orientations(time):
+                    for lw, lt, lref, uw, ut, uref in orientations(time, *band):
                         # One orientation's planes are live at a time.
                         planes, lw, uw = jax.lax.optimization_barrier((planes, lw, uw))
                         acc = jax.lax.with_sharding_constraint(
@@ -1398,9 +1407,10 @@ def _get_chi_fractional_contour_kernel_face(
             """
             from .photon_layout import photon_carry_order
             if pair_mode == "direct":
+                # Shared band weights, or the node's row of a per-node stack (the exact moments).
                 weights = projection_rows
-                orientations = lambda t: ((occ_f, -t, energy_reference[0],
-                                           occ_u, jnp.conj(t), energy_reference[1]),)
+                orientations = lambda t, lower=occ_f, upper=occ_u: ((
+                    lower, -t, energy_reference[0], upper, jnp.conj(t), energy_reference[1]),)
             elif pair_mode == "retarded":
                 weights = jnp.stack((-1j * projection_rows, 1j * projection_rows))
                 orientations = lambda t: ((occ_f, -1j * t, energy_reference,

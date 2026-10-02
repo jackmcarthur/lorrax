@@ -1139,7 +1139,8 @@ def _moment_batch_split(mesh_xy, n_out, rows):
                    out_shardings=(face,) * n_out)
 
 
-def streamed_moment_totals(wfns, meta, *, mesh_xy, qids, width, execute, ordered, receipt, root):
+def streamed_moment_totals(wfns, meta, *, mesh_xy, qids, width, execute, ordered, receipt, root,
+                           vertex=None):
     """Every parent's exact-moment totals from one pass of the row-pass engine, or ``None``.
 
     Each correlation of :data:`EVEN_MOMENT_TERMS` (and :data:`ODD_MOMENT_TERMS`
@@ -1147,17 +1148,20 @@ def streamed_moment_totals(wfns, meta, *, mesh_xy, qids, width, execute, ordered
     ``f E^a`` and ``u E^b``; the node-to-output weights add ``-1j (ahead -
     behind) pref c`` (even) or ``(ahead - behind) pref c`` (odd) to its total,
     the bare correlation :func:`exact_bare_moments` forms one q batch at a
-    time.  Row passes run outer and every parent inner, so each kconv call and
-    transform runs once per map instead of once per q batch.  Each finished
-    pass goes to a :class:`file_io.slab_io.StreamedBank` whose outputs are the
-    totals of one q batch of ``width`` parents, so a batch's totals are read
-    back as one run.  Returns that bank, or ``None`` without the engine
-    (mathdx mode 11 from raw parents) or when the store cannot be reserved.
+    time.  Row passes run outer and every parent inner, so each correlation's
+    Greens, kconv calls and transforms run once per map instead of once per q
+    batch; the four-current stream (``vertex``) runs its family pairs' passes
+    in turn.  Each finished pass goes to a :class:`file_io.slab_io.StreamedBank`
+    whose outputs are the totals of one q batch of ``width`` parents, so a
+    batch's totals are read back as one run.  Returns ``(bank, finish)``
+    (``finish`` takes a read run to the canonical photon order; ``None`` for
+    charge), or ``None`` without the engine (mathdx mode 11 from raw parents)
+    or when the store cannot be reserved.
     """
     from common.gpu_utils import host_bytes_per_process
     from file_io.slab_io import StreamedBank
     from .w_isdf import _w_solve_pref_scalar
-    segments = stream_segments(wfns, meta, mesh_xy, len(qids), None)
+    segments = stream_segments(wfns, meta, mesh_xy, len(qids), vertex)
     if segments is None:
         return None
     energy, f, u, reference, _ = response_weights(wfns, meta)
@@ -1185,7 +1189,7 @@ def streamed_moment_totals(wfns, meta, *, mesh_xy, qids, width, execute, ordered
     tail = (stream_weights(wfns, np.stack(lower), mesh_xy).astype(jnp.complex128),
             stream_weights(wfns, np.stack(upper), mesh_xy).astype(jnp.complex128),
             jnp.asarray([reference, reference]))
-    scratch = _stream_scratch(wfns, meta, mesh_xy, None)
+    scratch = _stream_scratch(wfns, meta, mesh_xy, vertex)
     order = _moment_batch_major(mesh_xy, n_out, int(width), n_batch)
     outputs = [(r, r) for r in range(n_batch * n_out)]
     # The passes being drained stay live beside every correlation's admission.
@@ -1196,7 +1200,8 @@ def streamed_moment_totals(wfns, meta, *, mesh_xy, qids, width, execute, ordered
     ledger.live_stages = live + (carries,)
     for p, (rows, cols) in enumerate(bank.shapes):
         kernel, fixed = response_stream(wfns, meta, mesh_xy=mesh_xy, q_ids=tuple(qids),
-            n_outputs=n_out, pair_mode="direct", bank_carry=True, ordered=ordered, stream_pass=p)
+            n_outputs=n_out, pair_mode="direct", bank_carry=True, ordered=ordered,
+            vertex=vertex, stream_pass=p)
         carry = _group_zeros(mesh_xy, (n_out, nq, px * rows, py * cols))()
         carry = execute(kernel, common + tuple(fixed) + tail + (carry, jnp.int32(p)),
                         "moment_correlation", runtime_bytes=scratch)
@@ -1207,7 +1212,7 @@ def streamed_moment_totals(wfns, meta, *, mesh_xy, qids, width, execute, ordered
     receipt["correlation_count"] += n_nodes
     receipt["moment_stream"] = dict(bank.receipt(), passes=len(bank.shapes), nodes=n_nodes,
                                     q_batches=n_batch, width=int(width))
-    return bank
+    return bank, segments[2]
 
 
 def compute_moment_bank(wfns, meta, config, *, mesh_xy, sym, bank_io,
@@ -1231,23 +1236,27 @@ def compute_moment_bank(wfns, meta, config, *, mesh_xy, sym, bank_io,
     _, _, moments, receipt["algebra"] = response_algebra(meta, config,
         mesh_xy=mesh_xy, n=n, ordered=ordered, photon=vertex is not None)
     # Every parent's totals in one stream (correlations outer would repeat each
-    # kconv call per q batch); a bank partly written by an earlier attempt, the
-    # four-current bank and a backend without the row-pass engine take the
+    # correlation's Greens and kconv calls per q batch); a bank partly written
+    # by an earlier attempt and a backend without the row-pass engine take the
     # per-batch correlations.  A streamed batch holds its totals and the next
     # batch's (read ahead), H, the Dyson outputs and its temporaries (3 faces
-    # per total plus 4 per parent); a correlated batch two totals, the next
-    # correlation, arithmetic temporaries and bounded H/solve.
+    # per total plus 4 per parent; the four-current read's canonical copy one
+    # more per total); a correlated batch two totals, the next correlation,
+    # arithmetic temporaries and bounded H/solve.
     n_total = 4 if ordered else 2
-    streamed = None
-    if vertex is None and not np.asarray(header["moment_written"]).any():
-        qwidth = moment_q_width(ledger, n_q=len(qids), face_bytes=face_bytes, per_q=3 * n_total + 4)
+    streamed = finish = None
+    streamed_per_q = (3 if vertex is None else 4) * n_total + 4
+    if not np.asarray(header["moment_written"]).any():
+        qwidth = moment_q_width(ledger, n_q=len(qids), face_bytes=face_bytes, per_q=streamed_per_q)
         with timing.section("bank.moment_stream"):
             stream_started = time.monotonic()
             streamed = streamed_moment_totals(wfns, meta, mesh_xy=mesh_xy, qids=qids,
                 width=qwidth, execute=execute, ordered=ordered, receipt=receipt,
-                root=bank_io["root"])
+                root=bank_io["root"], vertex=vertex)
+            if streamed is not None:
+                streamed, finish = streamed
             receipt["seconds"]["moment_stream"] = time.monotonic() - stream_started
-    per_q = 3 * n_total + 4 if streamed is not None else (12 if ordered else 8)
+    per_q = streamed_per_q if streamed is not None else (12 if ordered else 8)
     if streamed is None:
         qwidth = moment_q_width(ledger, n_q=len(qids), face_bytes=face_bytes, per_q=per_q)
     receipt["q_width"] = int(qwidth)
@@ -1269,7 +1278,10 @@ def compute_moment_bank(wfns, meta, config, *, mesh_xy, sym, bank_io,
             if not np.asarray(header["moment_written"])[q0:q1].all():
                 with _moment_phase(receipt, "correlations"):
                     if runs is not None:
-                        totals = _moment_batch_split(mesh_xy, n_total, q1 - q0)(next(runs))
+                        run = next(runs)
+                        totals = _moment_batch_split(mesh_xy, n_total, q1 - q0)(
+                            run if finish is None else finish(run))
+                        del run
                         a0, a1, o0, o1 = totals if ordered else (*totals, None, None)
                         del totals
                     elif ordered:
