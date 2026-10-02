@@ -176,7 +176,7 @@ def make_w_densifier(
         reproduces the padded ``W_R``.
 
     SHARDING / SCALING ENVELOPE.  Both transforms are the k-convolution
-    router's sharded k-minor door (:func:`common.fft_helpers.make_kfft_kminor`:
+    router's sharded k-minor factory (:func:`common.fft_helpers.make_kfft_kminor`:
     nvidia-mathdx on CUDA, the plan route on cpu) and the R-axis zero-pad is traced INSIDE one ``jax.jit`` whose
     ``out_shardings`` pins ``w_spec``, so the (μ,ν) sharding survives end to
     end: per-rank peak stays at the local ``(μ_loc, ν_loc, nk_fine)`` tile.

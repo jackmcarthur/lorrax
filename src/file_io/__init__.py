@@ -12,7 +12,7 @@ This module contains:
 - dipole: dipole.h5 over SlabIO; ΔE derived from band energies on read
 """
 
-# THE TWO LOADERS ARE SERVICES NOW, and this package reaches their doors
+# THE TWO LOADERS ARE SERVICES NOW, and this package reaches their public APIs
 # like any other consumer.  ``file_io/wfn_loader.py`` and
 # ``file_io/zeta_loader.py`` were transitional re-export shims and were
 # deleted by the phase-wide cleanup commit (wave-1 ruling 2); these two
@@ -22,7 +22,7 @@ This module contains:
 # EPSReader, resolve_input_paths`` is how this package has always been
 # spelled, and a caller wanting a loader alongside those is asking
 # ``file_io`` for a name it can legitimately provide.  What changed is
-# where the object comes from: the door, once, with no second module
+# where the object comes from: the public API, once, with no second module
 # object in between.
 from ffi import _services      # noqa: F401  (path bootstrap; dies with the
                                # owner's workspace fix -- see _services.py)

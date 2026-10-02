@@ -71,12 +71,12 @@ or a ctypes C entry point. From a target string:
 1. **Symbol.** Its row in `ffi_loader._CUDA_TARGET_SYMBOLS` /
    `_HOST_TARGET_SYMBOLS`, or in `distrib_la.loader`'s tables of the same
    names (the distributed linear algebra and the active subspace), gives the
-   handler symbol. The spin rotation is the one target its door registers
+   handler symbol. The spin rotation is the one target its Python caller registers
    itself (`symmetry_maps._spin_rotation`).
 2. **File.** `git grep -n 'XLA_FFI_DEFINE_HANDLER_SYMBOL' -- src/ffi/cpp`
    lists every handler with its file; the phdf5 handlers are spelled
    `LRX_PHDF_HANDLER(<X>)` (`<X>Ffi` on CUDA, `<X>HostFfi` on host).
-3. **Door.** `git grep -n <target>` finds the Python constant and its
+3. **Python caller.** `git grep -n <target>` finds the Python constant and its
    `ffi_call`.
 
 Startup refuses a provider without a target the run needs: the router's and
@@ -129,7 +129,7 @@ included (`common/nvrtc_build.h`).
 
 ### Dense linear algebra targets
 
-`distrib_la` owns these doors, their selection and their refusals
+`distrib_la` owns the calls into these targets, their selection and their refusals
 ([`distrib_la`](../services/distrib_la.md)); the handlers are here.
 
 | target (`lorrax_…`) | symbol, file | `distrib_la` entry | selected by |
@@ -193,7 +193,7 @@ which entry it bound.
 
 * **Real modules:** `ffi/io.py` (parallel HDF5), `ffi/fft.py` (the host
   flat-k FFT gate, the [k-convolution router](#k-convolution-router-and-the-mathdx-family),
-  the plane door and the Fourier-plan call), `ffi/gemm.py` (host batched
+  the plane factory and the Fourier-plan call), `ffi/gemm.py` (host batched
   GEMM), `ffi/gate.py` and `ffi/common/ffi_loader.py`. Distributed dense
   linear algebra and the active subspace are `services/distrib_la`, which
   opens the same two libraries through its own `distrib_la.loader`.
@@ -624,16 +624,16 @@ specialised per grid when NVRTC compiles the kernel.
 
 | Layer | What |
 |---|---|
-| 1 consumer | ζ fit (`isdf.core`, `isdf.zeta_mubatch`, `isdf.pair_kernels`, `gw.centroid_k_unfold`), Σ and COHSEX (`gw.ppm_tau_kernel`, `gw.cohsex_sigma`, `gw.screening`), χ₀ (`gw.w_isdf`), BSE (`bse.*`), the real-space pair convolution (`gw.mixed_basis_pair_convolution`, mode 6 for χ₀ and for Σ, whose plain product is the conjugated one on W's time-reversed transport; unwired), the flat-k transform (`common.fft_helpers.make_flat_k_fft` and its `make_flat_k_ifftn` / `make_flat_k_fftn` / `make_local_flat_k_fftn` wrappers: `gw.w_isdf`, `gw.qsgw_head`, `gw.wavefunction_bundle`, `bandstructure.htransform`, `bandstructure.orbital`). Every door name is unique: `git grep -n <door>` lists its call sites |
-| 2 router | `ffi/fft.py`: the doors below. `common.fft_helpers` re-exports them; its `get_donated_kfft_kminor` is `make_kfft_kminor` jitted with its input donated, memoised per `(mesh, kgrid, spec, kind, norm)`, and the caller drops its own reference after the call |
+| 1 consumer | ζ fit (`isdf.core`, `isdf.zeta_mubatch`, `isdf.pair_kernels`, `gw.centroid_k_unfold`), Σ and COHSEX (`gw.ppm_tau_kernel`, `gw.cohsex_sigma`, `gw.screening`), χ₀ (`gw.w_isdf`), BSE (`bse.*`), the real-space pair convolution (`gw.mixed_basis_pair_convolution`, mode 6 for χ₀ and for Σ, whose plain product is the conjugated one on W's time-reversed transport; unwired), the flat-k transform (`common.fft_helpers.make_flat_k_fft` and its `make_flat_k_ifftn` / `make_flat_k_fftn` / `make_local_flat_k_fftn` wrappers: `gw.w_isdf`, `gw.qsgw_head`, `gw.wavefunction_bundle`, `bandstructure.htransform`, `bandstructure.orbital`). Every factory name is unique: `git grep -n <factory>` lists its call sites |
+| 2 router | `ffi/fft.py`: the factories below. `common.fft_helpers` re-exports them; its `get_donated_kfft_kminor` is `make_kfft_kminor` jitted with its input donated, memoised per `(mesh, kgrid, spec, kind, norm)`, and the caller drops its own reference after the call |
 | 3 gate | `require_kconv`, then `require_fourier_plan`, called by `runtime.initialize_communicator_stack` after the FFT and GEMM gates. `require_kconv` on CUDA: the wheel's headers, every `ffi.fft.KCONV_TARGETS` target, and one probe compile (mode 3, k-grid 2×1×1, disk-cached), so a device the installed cuFFTDx cannot compile for refuses at startup (`GATE mathdx-probe`, naming its compute capability and the wheel); cpu: `lorrax_mklfft_flat_k`. `require_fourier_plan` on CUDA: `lorrax_fourier_plan_mathdx` only, since no wheel version is checked at startup (the fused pair checks its wheel at plan build); cpu: nothing (XLA ops). Each factory re-probes its own target (a `LocalFourierPlan` that CUDA can lower probes `lorrax_fourier_plan_mathdx` at construction); operand shapes and dtypes are checked at trace time |
 | 4 target | CUDA, in `liblorrax_ffi.so`: the `lorrax_mathdx_*` target of each mode in the mode table below, and five kept for older source trees (`_kconv_klead_unfold_block`: mode 7's `d × d` output spin block; `_kconv_klead_unfold_rows`, `_kconv_klead_lorentz_rows`: modes 7 and 8 without the conj-on-load partner and the stored block; `_kconv_klead_unfold`, `_kconv_klead_lorentz`: every k row stored). `lorrax_fourier_plan_mathdx` and, for older trees, `lorrax_fourier_plan` ([§ Local Fourier plan](#local-fourier-plan-localfourierplan)). cpu, in `liblorrax_ffi_host.so`: `lorrax_mklfft_flat_k`, `lorrax_mklfft_gw_conv` (§3c) |
 | 5 handler | CUDA: `cpp/cufft/kconv_mathdx_cuda_ffi.cc`; the two BSE outer targets are `cpp/cufft/kconv_outer_cuda_ffi.cc`, which embeds the same `kbox_stage.cuh` in its own NVRTC programs. Modes 0–9 and 11 share one embedded cuFFTDx source (`kSrc`); mode 10 has its own (`kPlaneSrc`); every k-box mode (2, 3, 4, 5, 7, 8, 9 and 11) also embeds `cufft/kbox_stage.cuh` as the named header `kbox_stage.cuh`, turned into text at configure time (`kbox_stage_src.h.in`). NVRTC compiles an image for the device's own `sm_<cc>` per (CUDA context, mode, `nkx`, `nky`, `nkz`, `ns`, right width, precision, variant) into an in-process cache, backed by the disk cubin cache below. cpu: `cpp/fftw/fft_flat_k_ffi.cc` (`MklFftFlatKHostFfi`, `MklFftGwConvHostFfi`) |
 
-**Doors.** Pick the door whose k position matches the tile you hold. A caller
-never transposes to reach another door.
+**Factories.** Pick the factory whose k position matches the tile you hold. A caller
+never transposes to reach another factory.
 
-| door | k axis of the operand | CUDA mode | cpu leg |
+| factory | k axis of the operand | CUDA mode | cpu leg |
 |---|---|---|---|
 | `make_fused_conv_kpair` | 3-D leading `(nkx, nky, nkz, …)` | 0 | two host flat-k inverse transforms, the spin contraction in XLA, one host forward transform |
 | `make_fused_conv_kparent` | parent tables | 1 | the typed parent load in XLA, which materialises `(N_k, ns, μ, ν, ns)` per side, then the pair tail |
@@ -646,20 +646,20 @@ never transposes to reach another door.
 | `make_kfft_klead` | flat leading `(N_k, …)` | 3 | `lorrax_mklfft_flat_k` |
 | `make_kconv_kminor` | flat trailing `(…, N_k)` | 4 | XLA moves k to the front, then host inverse transform, product, host forward transform, and k moves back |
 | `make_local_kconv_klead_outer` | the BSE legs `L (N_k, a, m_x, K)`, `R (N_k, K, b, m_y)` and `W_R (m_x, m_y, N_k)` k-minor; output `U (N_k, a, m_x, b, m_y)`. `conj_r` reads `conj(R)` | `lorrax_mathdx_kconv_klead_outer` (`cufft/kconv_outer_cuda_ffi.cc`): mode 2 with `T = Σ_K L R` formed in the k-box bank by `mma.m8n8k4.f64`, K zero-padded to a multiple of 4. Refused (`klead_outer_refusal`) when the 64-column bank, `64·16·((n_kx·n_ky·(n_kz|1))|1)` B, exceeds the opt-in shared memory | the einsum for T, then the `make_kconv_klead` plan route |
-| `make_local_kconv_klead_outer_decode` | `(prep, apply)`: the same, with `A = Σ_{t,μ} conj(ψ_c)·U` `(N_k, n_c, b, m_y)` returned and U never stored | `lorrax_mathdx_kconv_klead_outer_decode`: one resident block per SM, two 8-warp groups on two banks, deterministic phase-ordered partial sums. Refused (`klead_outer_decode_refusal`) when the two banks exceed the opt-in shared memory or the accumulator needs more than 8 m8n8 blocks per lane, `⌈N_k/16⌉·⌈n_c/8⌉ > 8`; the caller then takes the outer door with the XLA decode | the outer door's plan route and the decode einsum |
+| `make_local_kconv_klead_outer_decode` | `(prep, apply)`: the same, with `A = Σ_{t,μ} conj(ψ_c)·U` `(N_k, n_c, b, m_y)` returned and U never stored | `lorrax_mathdx_kconv_klead_outer_decode`: one resident block per SM, two 8-warp groups on two banks, deterministic phase-ordered partial sums. Refused (`klead_outer_decode_refusal`) when the two banks exceed the opt-in shared memory or the accumulator needs more than 8 m8n8 blocks per lane, `⌈N_k/16⌉·⌈n_c/8⌉ > 8`; the caller then takes the outer factory with the XLA decode | the outer factory's plan route and the decode einsum |
 | `make_kfft_kminor` | 3-D trailing `(…, nkx, nky, nkz)` | 5 | the same transpose around one host transform |
 | `common.fourier_plan.LocalFourierPlan` | none: ≤ 3 spatial axes with per-axis supports; the entry point for sphere↔box and plane transforms (§ Local Fourier plan) | `lorrax_fourier_plan_mathdx`; its `in_gather` form is mode 10 | XLA ops: `dot_general` GEMM axes and one `jnp.fft` group |
 | `make_plane_fft_gather` | the backend of `LocalFourierPlan(in_gather=…)`: the route-G cylinder `(…, n_col)` → the transformed plane `(…, n_b, n_c)` | 10 | the XLA route: static-run concatenate, then `jnp.fft.fftn` |
 
-- **Sharding.** The pair, parent, plane and `make_local_*` doors are rank-local
+- **Sharding.** The pair, parent, plane and `make_local_*` factories are rank-local
   callables for use inside the caller's `shard_map`; the others wrap their own
-  `shard_map`. The k axes are replicated. Specs of the k-leading doors are
+  `shard_map`. The k axes are replicated. Specs of the k-leading factories are
   given in the 3-D form, with the three leading axes `None`. For
   `make_kconv_kminor`, `K_R`'s `(d1, d2)` must sit on the same mesh axes as
   X's.
 - **Scale.** Every handler takes one total scale `s`, computed in Python from
   `jnp.fft`'s norm conventions (`ffi_fft_scale`, `conv_kpair_scale`). The
-  handlers implement no norm of their own. The parent door fixes
+  handlers implement no norm of their own. The parent factory fixes
   `norm="forward"`, so `s = 1/N_k`.
 - **`KConvStored`.** `prep(W)` does everything that depends on W alone, once
   per W. `apply(T, W_prep)` does the rest, once per T. `W_prep` is in the
@@ -719,7 +719,7 @@ The modes of the one handler file. The target column is the string
   takes the single arm when a tile of whole `ns²` spin groups of padded columns fits: the
   unfolded Green as a direct Load, the vertex sum as a group Mid (one thread
   per `(k, pair)`, the resident kernel's; a per-member Mid measured
-  0.76–0.94× at the CrI3 6×6 and Fe 4³ `ns = 4` doors), the scaled `kout`
+  0.76–0.94× at the CrI3 6×6 and Fe 4³ `ns = 4` kconv calls), the scaled `kout`
   Store; its load holds a spin group per thread, so it runs 256 threads. Otherwise the
   split arm runs the plane and group-pencil passes chunked over pairs through
   an `(N_k, chunk·ns²)` intermediate no larger than its output, as two entry
@@ -735,7 +735,7 @@ The modes of the one handler file. The target column is the string
   `(k_y, k_z)` on column tiles (tile-major), then an R-space x-pencil pass for
   each spin group (its own entry point: 512 threads, or 256 for the vertex
   pencil past `nkx = 12`), chunked over pairs through an `(N_k, chunk·2ns²)` intermediate that
-  XLA's scratch allocator grants (at most `scratch_bytes`; the door's default
+  XLA's scratch allocator grants (at most `scratch_bytes`; the factory's default
   is the smaller of one parent-Green tile and 1 GiB, with a one-pair
   minimum; `chi_unfold_scratch_bytes` owns the policy and its pricing). Mode 7, single pass: `tr` whole pairs (the
   `d²` columns of a stored spin block) per block, `kbox_plan(group = d²,
@@ -810,7 +810,7 @@ The modes of the one handler file. The target column is the string
 | `GATE mathdx-kconv-axis` | factory; handler | on CUDA, a k-grid axis above 40 (`KCONV_AXIS_MAX`, the fp64 cuFFTDx thread-FFT limit); the cpu leg (FFTW) has no cap | a smaller k-grid |
 | `GATE mathdx-kconv-residency` | first call (kernel build) | one resident row of modes 0/1/6, `3·16·(N_k|1)` bytes, exceeds the device's opt-in shared memory per block (on an A100, 166 912 B: `N_k > 3477`) | a smaller k-grid; modes 0, 1 and 6 have no out-of-core arm |
 | `GATE mathdx-kconv-kbox-residency` | first call | modes 2 and 3, and mode 8's split arm: the k-box tile, or its `(k_y, k_z)` plane or pencil, exceeds the opt-in maximum; modes 4, 5, 7 and 9: one whole column `16·((n_kx·n_ky·(n_kz|1))|1)` B (8 per element for complex64) exceeds it | a smaller k-grid |
-| `GATE mathdx-kconv-lorentz-scratch` | apply | mode 8's split arm: XLA's scratch allocator refuses the chunk intermediate | none on the door: the chunk is already at most the output's size |
+| `GATE mathdx-kconv-lorentz-scratch` | apply | mode 8's split arm: XLA's scratch allocator refuses the chunk intermediate | none at the factory: the chunk is already at most the output's size |
 | `GATE mathdx-kconv-chi-residency` | first call | mode 11: the k-box arm `kbox_plan` picked does not fit the opt-in maximum, or its plane tile splits a spin group | a smaller k-grid; the χ₀ route has no fallback for this grid |
 | `GATE mathdx-kconv-chi-scratch` | apply | mode 11's split arm: XLA's scratch allocator refuses the `(N_k, chunk·2ns²)` intermediate | a smaller `scratch_bytes` |
 | `k-leading unfold conv: …` | factory; apply | tables cut for another mesh shape; `G` whose parent count or endpoint widths differ from the tables; `Gt=None` on a plan with antiunitary rows | build the tables from the same plan and mesh as `G` (`plan.unfold_load_tables()`); pass `ParentGreen.transpose` |
@@ -905,7 +905,7 @@ A new mode is added in three steps:
 
 Route G transforms planes whose occupied cells arrive as a compact cylinder
 `F (…, n_col)`; `plane_from_col (n_b·n_c,)` names each flat cell's column
-(`n_col` = empty). The door returns
+(`n_col` = empty). The call returns
 
 ```text
 Y[…, k_b, k_c] = Σ_{b,c} P[…, b, c] e^{-2πi (b k_b/n_b + c k_c/n_c)},   P = F scattered by plane_from_col, 0 elsewhere
@@ -928,7 +928,7 @@ opt-in budget, the next group's cells are gathered asynchronously
 current group's passes run, and the first row pass reads them from the
 staging block. This gives 1.11–1.37× at 25²–80² on A100. The table stays a run-time
 argument. Its row count is compiled in, so every index divisor is a constant
-(one image per door, like the shape key before it; a cold build is about
+(one image per kconv call, like the shape key before it; a cold build is about
 6.6 s).
 
 Every line FFT is a cuFFTDx thread FFT (`n ≤ 40`). An axis `n = n1·n2` with
@@ -941,7 +941,7 @@ power `≤ 40`. Block FFTs are not used because cuFFTDx's fp64 database lacks
 45, 54, 75, 90, 150 and 250, which would take Bluestein and a host-built
 workspace.
 
-The door decides once, at build, and announces the route by name. Mode 10
+The factory decides once, at build, and announces the route by name. Mode 10
 serves a plane iff both axes split and the block fits:
 `16·n_b·(n_c|1) + 5·n_b + 8·PB + 16 ≤` the device's opt-in shared memory per
 block (`ffi.fft.plane_resident_bytes`; the second term is the kernel's static
@@ -1070,7 +1070,7 @@ right, and the kernel then runs mode 0 on `P^L`, `P^R`.
 
 `ffi.fft` routes pair modes0/1/6 to bounded spin/spatial tiles when their
 `3*16*(nk|1)` resident row exceeds the device opt-in shared-memory limit.
-The existing native k-axis FFT door executes each component; parent loads
+The existing native k-axis FFT factory executes each component; parent loads
 retain typed symmetry/TR/phase coefficients and plane loads gather only the
 requested endpoints. The complete-P output remains unchanged, while each
 additional scalar-spin tile has at most2048 spatial columns (262144000B at20³).

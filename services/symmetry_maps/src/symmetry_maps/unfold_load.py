@@ -194,7 +194,7 @@ class DeviceLoadTables(NamedTuple):
 
     A consumer passes them to its jit as ARGUMENTS (a ``QirrOperator`` carries
     them as pytree leaves), so its program holds no table constants: baked
-    host tables are megabytes of HLO literal per door and cost compile time."""
+    host tables are megabytes of HLO literal per kconv call and cost compile time."""
     row: object
     trs: object
     lsrc: object
@@ -435,7 +435,7 @@ class QirrOperator:
         """:meth:`unfold` as load tables (scalar endpoints), for ``make_kfft_klead_unfold``.
 
         Host tables (numpy, no program), built once per mesh and wedge: the
-        door and the device copy (:meth:`with_load`) share them."""
+        kconv call and the device copy (:meth:`with_load`) share them."""
         key = (tuple(d.id for d in np.asarray(mesh_xy.devices).flat), self.wedge_key())
         tables = _host_load_cache.get(key)
         if tables is None:

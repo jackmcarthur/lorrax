@@ -124,7 +124,7 @@ def _pad_width(g, width):
 
 
 def open_plane_wave_system(wfn_path: str, mesh, *, nb: int) -> PlaneWaveSystem:
-    """Read ψ(G), E and the symmetry tables once (the loader's own doors)."""
+    """Read ψ(G), E and the symmetry tables once (the loader's own entry points)."""
     from jax.sharding import PartitionSpec as P
     from file_io import WfnLoader
     from vcoul import CoulombGeometry

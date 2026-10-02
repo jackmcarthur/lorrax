@@ -8,7 +8,7 @@
 // row-major in and out: x (B…, K_0, …, K_{d-1}) → y (B…, K'_0, …, K'_{d-1}).
 // Each axis is a GEMM with a Fourier matrix stored in the plan (built once per
 // device and plan key, in float64 with exact integer phase reduction) or part
-// of one cuFFT group.  The Python door chooses the backend per axis and the
+// of one cuFFT group.  The Python entry point chooses the backend per axis and the
 // stage order; this handler executes it:
 //
 //   * GEMM axis a, current shape (L, K, R): R = 1 is one cublasZgemm (op T on

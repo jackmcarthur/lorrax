@@ -174,7 +174,7 @@ def serve(*, family: str, target: str, range_value: float,
     _resolve(family, target)                      # refuses an unknown request
     unknown = sorted(set(family_kw) - {"eps_q", "omega_hat"})
     if unknown:
-        # A selector this door does not understand is refused, never dropped
+        # A selector this module does not understand is refused, never dropped
         # (TASTE 13); the retired `use_shipped` selector refuses by name.
         raise UnknownTarget(
             f"minimax: serve() takes no {unknown} selector; `use_shipped` is "

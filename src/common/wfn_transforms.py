@@ -2310,7 +2310,7 @@ def _sample_centroid_parent_groups(
     # band tiles and children.  This avoids rebuilding or transferring
     # an ngk-sized phase row per child while retaining the established
     # one-full-k transform/IFFT workspace. Every group, including a
-    # singleton, uses the same raw-parent door. Its star of child
+    # singleton, uses the same raw-parent path. Its star of child
     # indices is reused across band tiles, then released before the
     # next parent, so neither G vectors nor indices accumulate with nk.
     for parent, full_children in parent_groups:

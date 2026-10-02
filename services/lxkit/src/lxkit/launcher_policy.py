@@ -1,6 +1,6 @@
 """Pure policy shared by the source-tested and deployed ``lx`` launcher.
 
-The deployed front door runs before the LORRAX environment exists, so this
+The deployed launcher runs before the LORRAX environment exists, so this
 module is standard-library-only.  It owns decisions that otherwise drift
 between ``lx``, its pool helper, and deck-doctor tests: allocation pin
 spelling, newest-first ordering, per-node GPU geometry and checkout

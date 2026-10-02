@@ -1063,7 +1063,7 @@ def setup_wfn_and_sym(wfn_file: str, mesh_xy: Mesh | None = None):
     # (the collective phdf5 FFI read, on GPU or the CUDA-free host lib),
     # band-sharding ψ instead of replicating the whole WFN on every rank.
     # Single-process / no-mesh transparently stays eager.
-    from wfn_loader import WfnLoader     # the door; the caller's startup sealed the path
+    from wfn_loader import WfnLoader     # the public API; the caller's startup sealed the path
     wfn = WfnLoader(wfn_file, mesh=mesh_xy)
     sym = wfn.symmetry()
     return wfn, sym

@@ -22,7 +22,7 @@ WHY THE SHIM STAYS.  Deleting it is the REPLUMB's gate (step 3), not the
 extraction's.  Post-replumb the remaining consumers of this path are
 ``gw.vcoul``'s (wfn, meta) translation and sibling-branch files; the
 identity of every re-export is pinned by tests/test_vcoul_shim_identity.py.
-The shim reaches the service through its TOP-LEVEL door only
+The shim reaches the service through its TOP-LEVEL package only
 (``import vcoul``, never ``vcoul.base``), which ``tests/test_layering.py``
 rule 6 measures.
 """

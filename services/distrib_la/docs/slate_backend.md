@@ -50,7 +50,7 @@ B = jax.device_put(B_stack, NamedSharding(mesh, P(None, 'x', 'y')))
 token = factor('cholesky', A, mesh, backend='slate', n=A.shape[-1])
 X = solve(token, B)  # solves A[q] @ X[q] == B[q]
 
-# The public door lifts rank-2 operands or accepts the rank-3 face stacks
+# The public entry point lifts rank-2 operands or accepts the rank-3 face stacks
 # above. backend='auto' also selects SLATE on a ROCm mesh.
 D = matmul(A, B, mesh=mesh, backend='slate')
 ```
@@ -99,7 +99,7 @@ sides, no opaque-handle gymnastics inside the user's mental model.
 
 ## Distributed GEMM
 
-The public `distrib_la.matmul` door maps `backend='slate'` to
+The public `distrib_la.matmul` entry point maps `backend='slate'` to
 `slate::multiply`. It accepts rank-2 `P('x','y')` matrices or rank-3
 `P(None,'x','y')` stacks and returns the same-rank face layout. Rank 2 is
 lifted to a one-element stack before the private wrapper; the handler loops

@@ -14,7 +14,7 @@ quadrature is built on (:func:`real_space_action_tables`,
 the 2c DFT-reference check (:func:`check_spinor_reference_trs`) that decides
 whether the flags in the file may be believed at all.
 
-THE PACKAGE IS THE DOOR.  There is no separate facade module: everything a
+THE PACKAGE IS THE PUBLIC API.  There is no separate facade module: everything a
 consumer needs is a top-level name here, and importing
 ``symmetry_maps.<submodule>`` from outside is a layering violation the
 monorepo's ``tests/test_layering.py`` fails on.  The private names
@@ -149,7 +149,7 @@ The surface
     not to a table library.
 ``DensitySymmetryReport`` / ``check_density_symmetries`` /
 ``cached_density_symmetry_check`` / ``trs_check_mode``
-    The automatic measurement, its cached front door, and the
+    The automatic measurement, its cached entry point, and the
     ``LORRAX_TRS_CHECK`` strictness control. Historical ``0/off`` values
     refuse because they asserted TR by skipping the verdict.
 ``QgridTrsPolicy`` / ``build_qgrid_trs_policy`` /
@@ -250,7 +250,7 @@ from symmetry_maps.unfold_load import (
     apply_unfold_load_tables_local,
 )
 # Pre-sweep spellings.  Imported from the modules that define them, so
-# the door and the module bind the SAME object and cannot drift apart.
+# the public API and the module bind the SAME object and cannot drift apart.
 from symmetry_maps.maps import (              # noqa: F401  (compat surface)
     trs_augment_U,
     unfold_v_q,
@@ -384,16 +384,16 @@ __all__ = [
     "dataset_q_storage", "stamp_qirr_tensor",
     "allocate_qirr_placeholder", "QirrTables", "QirrHeader",
     "QIRR_FORMAT_VERSION", "QIRR_RANK_BY_VERSION",
-    # ...and the format's own PLUMBING, on the door rather than reached
+    # ...and the format's own PLUMBING, on the public API rather than reached
     # for through ``symmetry_maps.qirr_store``.  A second store writing
     # this layout — the frequency-resolved W — opens the same handles,
     # reads the same attrs, stamps the same provenance and owes the
     # tables the same validation; underscoring these would not keep it
     # out, it would only make it copy them, and a copied validator is a
     # second answer to "do these tables describe this tensor".  Same
-    # reason ``vcoul`` puts ``_minibz_kernel_bare`` on its door: a
+    # reason ``vcoul`` puts ``_minibz_kernel_bare`` on its public API: a
     # consumer reaching the submodule for one of these is a
-    # past-the-door edge and ``tests/test_layering.py`` rule 6 counts it.
+    # past-the-API edge and ``tests/test_layering.py`` rule 6 counts it.
     "QIRR_VERSION_ATTR", "QIRR_TABLE_SUFFIX", "QirrDest", "qirr_attr_str",
     "qirr_generator_commit", "validate_qirr_tables",
     # the 2c TRS reference check

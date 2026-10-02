@@ -10,7 +10,7 @@ the fit and the solver tiers belong to the producer (`isdf`,
 The file is written once by `gw.isdf_fitting.fit_zeta_to_h5` and read by V_q
 (`gw.v_q_g_flat`, `gw.v_q_bispinor`), BSE interpolation (`bse.vq_interp`),
 basis projection (`common.zeta_projection`) and the fit-reuse gates
-(`gw.gw_init`). All of them read through this door.
+(`gw.gw_init`). All of them read through this public API.
 
 ## API
 

@@ -81,7 +81,7 @@ The ground-truth alternative (``--vq-mode=refit`` in ``bse.exciton_bands``)
 module too (``refit_vq``): both are V_Q sources with one calling contract.
 NOTHING IN THE REFIT IS 2-D: it contracts with whatever kernel
 :func:`make_v_on_set` hands it, which on a ``sys_dim=3`` deck is the
-PRODUCER's own Coulomb door, so it is the arbitrary-Q exchange a bulk crystal
+PRODUCER's own Coulomb entry point, so it is the arbitrary-Q exchange a bulk crystal
 runs and not merely a checking mode.  Which band window it fits ζ' on is the
 caller's ``--refit-window`` choice, and that choice picks the gate —
 :func:`refit_window_view` is where both are written down.
@@ -139,8 +139,8 @@ def relF(a, b):
 from common.sharding_fit import fit_sharding as _ns              # noqa: E402
 from common.sharding_fit import legal_spec as _legal_spec        # noqa: E402
 
-# The ζ file's DOOR.  TOP-LEVEL name only: ``zeta_loader.loader`` would be
-# a past-the-door edge and ``tests/test_layering.py`` fails on those.  The
+# The ζ file's PUBLIC API.  TOP-LEVEL name only: ``zeta_loader.loader`` would be
+# a past-the-API edge and ``tests/test_layering.py`` fails on those.  The
 # ``ensure_on_path()`` above is what makes it resolvable in a bare launch.
 from file_io.restart_bundle import read_vq_payload
 
@@ -263,7 +263,7 @@ def assert_slab_scope(bvec, qfr=None, policy=None, *, source="") -> None:
           "fit reaches them.  On a bulk deck use `--vq-mode ongrid` (exact, "
           "but only at Q on the BSE grid) or `--vq-mode refit` (the per-Q "
           "zeta refit, exact at ANY Q: it takes the producer's own Coulomb "
-          "door on a sys_dim=3 deck -- make_v_on_set -- and the driver refits "
+          "entry point on a sys_dim=3 deck -- make_v_on_set -- and the driver refits "
           "every path Q behind an on-grid null).  See the module docstring's "
           "SCOPE note and PIPELINE_HEALTH.md punch row 23, which is this "
           "refusal's measured history.")
@@ -350,7 +350,7 @@ def v_slab_on_set(zx, qfrac, GS, kind="slab", alpha=None):
     the two differ in the last ulp — not a free swap under a 5e-6
     ``makeVq_vs_disk`` gate.  The ``slab_sr``/``slab_lr`` split has no service
     equivalent on an explicit Miller set at all.  The refit's BULK kernel does
-    go through the door (:func:`make_v_on_set`).
+    go through the entry point (:func:`make_v_on_set`).
     """
     K = zx["bvec"].T @ (np.asarray(qfrac)[:, None] + GS.astype(np.float64))
     K2 = np.sum(K * K, axis=0)
@@ -388,7 +388,7 @@ def make_v_on_set(zx, policy, log_fn=print):
     |---|---|---|
     | ``v_slab_on_set`` (this module's) | 5.8e-3 / 3.8e-2 / 5.1e-1 | 0 of 64 |
     | bulk 8π/K²/Ω, **no** mini-BZ head | 1.4e-14 / 9.2e-3 / 4.8e-2 | 1 of 64 |
-    | the door below (bulk + mini-BZ head) | 3.7e-15 / 9.2e-15 / **3.3e-14** | **64 of 64** |
+    | the entry point below (bulk + mini-BZ head) | 3.7e-15 / 9.2e-15 / **3.3e-14** | **64 of 64** |
 
     The middle row is the one the module docstring already predicted and left
     open ("the remainder attributable to the deck's own
@@ -421,7 +421,7 @@ def make_v_on_set(zx, policy, log_fn=print):
     head_fn = (build_v_head_miniBZ_fn_3d(
         np.asarray(zx["kgrid"], dtype=int), zx["bvec"], zx["celvol"])
         if mc in ("true", "1", "yes") else None)
-    log_fn(f"  [refit] bulk kernel via the producer's own door: sys_dim=3, "
+    log_fn(f"  [refit] bulk kernel via the producer's own entry point: sys_dim=3, "
            f"bare_coulomb_cutoff={cutoff}, mini-BZ head slot="
            f"{head_fn is not None} (mc_average_vcoul_body={mc!r}).  The "
            f"on-grid null below is what certifies this pairing.")
@@ -1352,7 +1352,7 @@ def _mbz_dq(bvec, kgrid, *, n_q, nsamples, qmc_reps, seed_offset, lo, chunk):
     loc = slots % np.uint32(n_q)                        # in-batch draw
     gidx = rep * np.uint32(int(nsamples)) + loc         # global draw index
     U = np.asarray(_mbz_draw_u(gidx, base_key), dtype=np.float64)
-    # δq mapping THROUGH THE DOOR, not a local re-spelling of it: all three
+    # δq mapping THROUGH THE PUBLIC API, not a local re-spelling of it: all three
     # steps are ``vcoul.minibz``'s, which is what makes the convention
     # decidable in one place.  It is a convention with a history — the
     # transposed frac→cart spelling ``U @ bvec.T`` is NOT a fundamental domain
@@ -1417,7 +1417,7 @@ def minibz_head_vlr(zx, prep, Qfrac, *, alpha=None, nsamples=2**18,
     ``8π·f2d·e^{−K²/4α²}/|K|²`` GW's Coulomb head uses), the mini-BZ affine
     wrap is :func:`vcoul.wrap_points_to_voronoi` + the same
     ``randlims`` map as :func:`vcoul.minibz_voronoi_batches` (all through
-    the service door since the 2026-08-07 replumb), and
+    the service's public API since the 2026-08-07 replumb), and
     the inscribed-sphere / adaptive-``n_q`` rule matches
     :func:`vcoul.minibz_average` (``minibzaverage.f90:63-75``).
 
@@ -1445,7 +1445,7 @@ def minibz_head_vlr(zx, prep, Qfrac, *, alpha=None, nsamples=2**18,
     never calls here (bse_io._interpolate_bse_data_to_grid).  Default None uses
     the stored coarse grid (the exciton_bands Q-path convention, unchanged).
     """
-    # The DOOR is the true dependency; the ``gw.coulomb`` / ``gw.vcoul``
+    # The PUBLIC API is the true dependency; the ``gw.coulomb`` / ``gw.vcoul``
     # spellings of these are compat shims.  Everything Q-INDEPENDENT (the
     # draws, the Voronoi wrap, the mini-BZ affine) lives in :func:`_mbz_dq`.
     from vcoul import _minibz_kernel_bare, minibz_inscribed_sphere_r2
@@ -2499,7 +2499,7 @@ def refit_ongrid_null(zx, rst, V_stored, kgrid_vq, mesh_xy, log_fn=print,
     refit-vs-stored ratio, not an accuracy claim — the number that matters is
     printed next to it, and a lane reading this should compare it against the
     Galerkin residual, not against zero.  (The kernel itself is separately
-    exact: rebuilding the stored tiles from the STORED ζ with the same door
+    exact: rebuilding the stored tiles from the STORED ζ with the same entry point
     lands at 3.3e-14, so anything above that is the ψ representation, not the
     Coulomb.)
 

@@ -324,7 +324,7 @@ def assert_gapped_occupations_for_ppm(occ_full, *, print_fn=print) -> int:
     a caller or a test reads a NUMBER rather than the absence of an
     exception.
 
-    WHAT IS MEASURED, AND WHY THE MATERIAL DOOR DOES NOT ANSWER IT.
+    WHAT IS MEASURED, AND WHY THE MATERIAL CHECK DOES NOT ANSWER IT.
     ``gw_config.validate_material_inputs`` already refuses GN-PPM on a WFN
     whose occupations are fractional (``GATE gn_ppm_refuses_metals``, owner
     ruling 2026-09-17: GN-PPM is never allowed for metals).  A WFN written

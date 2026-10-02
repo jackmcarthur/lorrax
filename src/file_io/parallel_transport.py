@@ -4,7 +4,7 @@ This module owns the whole preprocessing transaction. It streams one raw IBZ
 centre and one positive neighbour at a time, writes compact links, then
 re-reads those links through SlabIO for symmetry unfolding and fourth-order
 connection construction. No wavefunction survives the streamed link stage,
-and every HDF5 payload or metadata item crosses the SlabIO service door.
+and every HDF5 payload or metadata item crosses the SlabIO public API.
 """
 from __future__ import annotations
 
@@ -1178,7 +1178,7 @@ def _write_w_av_stage(
             # SlabIO's collective reader deliberately supports the numeric
             # compute dtypes, not uint8.  Keep the historical uint8 spelling
             # for external HDF5 tools and add an int32 byte view for every
-            # production consumer that must remain behind the SlabIO door.
+            # production consumer that must remain behind the SlabIO public API.
             io.write_attr(
                 "wfn_path_bytes_i32",
                 np.frombuffer(str(wfn_path).encode("utf-8"),

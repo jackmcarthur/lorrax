@@ -233,13 +233,13 @@ _CLASS_TABLES = {}
 
 
 def _class_w_tables(plans, policy, lefts, rights, mesh_xy):
-    """One photon class's q-unfold tables for the W-parent door, cached by content.
+    """One photon class's q-unfold tables for the W-parent kconv call, cached by content.
 
     The full-q restore these replace (``gw.w_isdf.photon_blocks_full_q``)
     unfolds each Lorentz block by the family plans' centroid maps on the TRS
     policy's operation rows (the Hermitian ``conj`` rule) and then mixes the
     blocks by the Lorentz action; these are the same tables with the Lorentz
-    action as the endpoint action.  The door reads them with the
+    action as the endpoint action.  The kconv call reads them with the
     pair-transpose rule and the partner conj(W), which is the conj rule.
     """
     from symmetry_maps import unfold_load_tables, bgw_integer_q_to_fractional

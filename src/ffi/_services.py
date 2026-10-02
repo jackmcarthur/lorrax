@@ -4,7 +4,7 @@ Core drivers seal the declared LORRAX/service package set through
 ``runtime.initialize_communicator_stack()`` before importing JAX or physics.
 Some library modules are also imported directly from a checkout whose only
 path entry is ``<checkout>/src``.  Keep that supported without retaining a
-second service roster or path-precedence policy here: this compatibility door
+second service roster or path-precedence policy here: this compatibility module
 delegates to the same metadata-derived, stale-source-refusing closure as the
 drivers.
 

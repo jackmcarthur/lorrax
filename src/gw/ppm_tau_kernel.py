@@ -47,31 +47,31 @@ _sigma_shared_tau_kernel_cache: dict[
     tuple[object, ...], Callable[..., jax.Array]
 ] = {}
 
-#: The Σ Green door's placed load tables per (mesh, parent plan); bounded.
+#: The Σ Green kconv call's placed load tables per (mesh, parent plan); bounded.
 #: Plans are run objects, stable across SC maps, so a run places them once.
-_SIGMA_DOOR_TABLES: dict = {}
+_SIGMA_KCONV_TABLES: dict = {}
 
 
-def sigma_door_tables(mesh_xy: Mesh, k_unfold_plan):
-    """The mode-7 Green door's load tables on the devices, placed once per mesh and plan.
+def sigma_kconv_tables(mesh_xy: Mesh, k_unfold_plan):
+    """The mode-7 Green kconv call's load tables on the devices, placed once per mesh and plan.
 
     ``symmetry_maps.device_load_tables`` of ``k_unfold_plan.unfold_load_tables()``.
     The q-wedge Σ kernel (:func:`_sigma_subtile_kernel`) reads them as its
     ``g_load`` argument and cuts them to each row pass on the device
     (``subtile_stream.window_load``), so no Σ program holds table constants:
-    baked, every row pass's door carried its own copy of the row/phase tables
+    baked, every row pass's kconv call carried its own copy of the row/phase tables
     as HLO literals (21 passes at the Fe 20^3 P64-local tile: compile
     24 -> 68.6 s).
     """
     key = (mesh_xy, k_unfold_plan)
-    hit = _SIGMA_DOOR_TABLES.get(key)
+    hit = _SIGMA_KCONV_TABLES.get(key)
     if hit is None:
         from symmetry_maps import device_load_tables
         placed = device_load_tables(k_unfold_plan.unfold_load_tables(), mesh_xy)
-        while len(_SIGMA_DOOR_TABLES) >= 2:
-            _SIGMA_DOOR_TABLES.pop(next(iter(_SIGMA_DOOR_TABLES)))
+        while len(_SIGMA_KCONV_TABLES) >= 2:
+            _SIGMA_KCONV_TABLES.pop(next(iter(_SIGMA_KCONV_TABLES)))
         # The plan rides along so its id in the key cannot be reused.
-        hit = _SIGMA_DOOR_TABLES[key] = (k_unfold_plan, placed)
+        hit = _SIGMA_KCONV_TABLES[key] = (k_unfold_plan, placed)
     return hit[1]
 
 
@@ -268,7 +268,7 @@ def _sigma_subtile_kernel(*, mesh_xy, kgrid, brackets, face_shape, face_band_ext
       (``subtile_stream.window_load``): ``W_prep`` exists for the window only;
     - the parent Green on the window's ψ rows: one local GEMM over the active
       bands of the band-complete ψ (``layout='axis'``), no exchange;
-    - mode 7 with the Green's device load ``g_load`` (:func:`sigma_door_tables`)
+    - mode 7 with the Green's device load ``g_load`` (:func:`sigma_kconv_tables`)
       cut to the window, its sources -1 outside the pass's live rows, and the
       axis band projection of the window's rows (zero outside the live rows)
       into a rank-local partial;
@@ -320,7 +320,7 @@ def _sigma_subtile_kernel(*, mesh_xy, kgrid, brackets, face_shape, face_band_ext
     R, windows = plan_windows(local_rows, row_bytes, lambda: sorted(
         set(orbit_cuts(g_tables.lsrc, px, ns)) & set(orbit_cuts(w_tables.lsrc, px, 1))))
     whole = len(windows) == 1
-    door9 = make_kfft_klead_unfold(mesh_xy, kgrid, w_tables, norm="ortho")
+    kconv9 = make_kfft_klead_unfold(mesh_xy, kgrid, w_tables, norm="ortho")
     mult = -1.0 / np.sqrt(float(nk))
     # One window shape for every pass: the host tables give the k-convolution
     # its shapes, and each pass reads g_load's cut (subtile_stream.window_load).
@@ -379,8 +379,8 @@ def _sigma_subtile_kernel(*, mesh_xy, kgrid, brackets, face_shape, face_band_ext
                      E_A, mask_A, E_min, E_max, E_ref_A, t_node, W_q, W_pt=None, load=None,
                      g_load=None):
         if load is None or g_load is None:
-            raise ValueError("Sigma tau: W on the q wedge and the Green door need their device "
-                             "load tables (load, g_load = sigma_door_tables)")
+            raise ValueError("Sigma tau: W on the q wedge and the Green kconv call need their device "
+                             "load tables (load, g_load = sigma_kconv_tables)")
         # The left Green rows arrive μ-major and the right ones as the Green's right
         # operand (sigma_subtile_operands, once per Σ call).
         rows_all = jax.lax.with_sharding_constraint(psi_coh_xn, NamedSharding(mesh_xy, GREEN_ROWS_SPEC))
@@ -413,7 +413,7 @@ def _sigma_subtile_kernel(*, mesh_xy, kgrid, brackets, face_shape, face_band_ext
         def one_pass(accs, W, Wt, rows, left, w_load, g_pass, rows_live=None):
             # ``rows_live``: a padded window's live rows [lo, hi); the
             # k-convolutions skip the rest and return them zero.
-            w_prep = door9(W, Wt, w_load, live=rows_live)
+            w_prep = kconv9(W, Wt, w_load, live=rows_live)
             faces = (jnp.conj(left), faces_right)
             out = []
             for b, (sel, band_range) in enumerate(zip(bracket_masks, bracket_ranges)):
@@ -479,8 +479,8 @@ def _get_sigma_kij_kernel(
     ``q_wedge`` (a ``symmetry_maps.QirrOperator`` of tables): W(τ) arrives on
     the q wedge, its partner tile ``W_pt`` (the tile built from the conjugated
     residues) read on antiunitary rows and the device load tables ``load``
-    passed as arguments, with the Green door's ``g_load``
-    (:func:`sigma_door_tables`); the kernel then takes
+    passed as arguments, with the Green kconv call's ``g_load``
+    (:func:`sigma_kconv_tables`); the kernel then takes
     ``(..., W_q, W_pt, load, g_load)`` and runs row pass by row pass
     (:func:`_sigma_subtile_kernel`).  ``static``: one τ = 0 node of a
     Hermitian static interaction on the wedge (its conj-rule ``load``, no
@@ -727,8 +727,8 @@ def get_shared_sigma_tau_kernel(
         E_A, mask_A, B_poles, Omega_poles, pole_indices, bounds,
         phase_real, E_ref_A, E_ref_B, g_load, t_node, active_count=None,
     ):
-        # ``g_load``: the Green door's placed tables on the q wedge
-        # (:func:`sigma_door_tables`), ``None`` otherwise.
+        # ``g_load``: the Green kconv call's placed tables on the q wedge
+        # (:func:`sigma_kconv_tables`), ``None`` otherwise.
         B_poles, load = _wedge_residues(B_poles)
         W_t = _build(B_poles, Omega_poles, pole_indices, bounds,
                      phase_real, E_ref_B, t_node, active_count)

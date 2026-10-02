@@ -250,7 +250,7 @@ def qgrid_trs_policy_from_shared_pole_store(header, *, announce=True):
     The shared-pole store validator binds ``scalar-trs-even-s`` to the
     measured scalar-TRS reference and authenticates its operation tables.
     Its consumer has no live SymMaps object; adapt that sealed metadata at
-    the same door as live references, never infer symmetry from fitted b.
+    the same entry point as live references, never infer symmetry from fitted b.
     """
     from types import SimpleNamespace
 
@@ -278,7 +278,7 @@ def qgrid_trs_policy_for(
 ):
     """The q-axis time-reversal policy for this deck, announced once.
 
-    THE ONLY DOOR.  ``symmetry_maps.qgrid_trs`` holds the policy (it holds
+    THE ONLY ENTRY POINT.  ``symmetry_maps.qgrid_trs`` holds the policy (it holds
     the tables and the arithmetic); this adapter holds rank 0, the
     once-per-run memory, and — the whole point — the MEASURED verdict.
 

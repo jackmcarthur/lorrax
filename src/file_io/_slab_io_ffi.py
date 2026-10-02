@@ -609,7 +609,7 @@ def _replace_inode_for_write(path: str) -> None:
 # CALLED ON EVERY PATH THAT OPENS A FILE COLLECTIVELY.  Both of them:
 # ``_FfiBackend.__init__`` (tier 1) and ``_MpiHostBackend.__init__``
 # (tier 2).  Tier 2 had no guard until 2026-08-06 even though it is a
-# routine multi-process route — a guard installed on one of two doors is
+# routine multi-process route — a guard installed on one of two routes is
 # a guard on neither.  The remaining ``h5py.File`` opens in this package
 # are rank-0-only serial handles (``_introspect_dataset``, the deferred
 # attribute write in ``close``); they derive no per-rank hyperslab and
@@ -984,14 +984,14 @@ def probe_read_availability(platform: str | None = None) -> tuple[bool, str]:
 
     NOT cached, and deliberately NOT sharing :func:`probe_availability`'s
     ``_AVAILABILITY``.  That one memoises a single verdict with no platform
-    key, which is fine for the write door (it asks once, about here) and
+    key, which is fine for the write entry point (it asks once, about here) and
     wrong for this one: the only way a caller uses this is a
     ("CUDA", "cpu") ladder, and a platform-blind cache would hand the FIRST
     platform's answer back for the second — reporting a host library that
     exports the handler on a node where only the CUDA one does.  The probe
     is a symbol lookup on an already-loaded library, so there is nothing to
     memoise anyway; ``probe_availability``'s cache is there for the MPI
-    bootstrap subprocess, which this door does not run.
+    bootstrap subprocess, which this entry point does not run.
 
     Never raises: a broken ``ffi_loader`` import is a reason, not a crash,
     because the caller is choosing between transports.
@@ -2149,9 +2149,9 @@ class _CollectiveLane:
     reached MPI-IO concurrently and each rank matched them in its own order:
     three ``SlabIO(mode="w")`` handles with queued writes deadlocked a CrI3
     run (26 min at 0 B/s).  HDF5 is also not thread-safe across files, so a
-    handle's synchronous door must not run beside another handle's writer.
+    handle's synchronous entry point must not run beside another handle's writer.
 
-    The rule, at every door that touches HDF5 (they all drain first, through
+    The rule, at every entry point that touches HDF5 (they all drain first, through
     :meth:`_LaneSlot.drain`): every handle's queued writes and in-flight
     async union reads finish before this handle's HDF5 call.  The native read
     worker can still be inside HDF5 after ``read_slabs`` returns.  Writer
@@ -2196,7 +2196,7 @@ class _CollectiveLane:
         return self._worker().pending if self._owner is slot else 0
 
     def track_read(self, slot, result) -> None:
-        """Remember an async union read until the next HDF5 door waits.
+        """Remember an async union read until the next HDF5 entry point waits.
 
         What is kept is one element per local shard, sliced from the result:
         it becomes ready only when the read has landed, and it does not keep
@@ -2218,7 +2218,7 @@ _LANE = _CollectiveLane()
 
 
 class _LaneSlot:
-    """One handle's door to the lane, with the old per-handle dispatcher API.
+    """One handle's entry point to the lane, with the old per-handle dispatcher API.
 
     ``submit``/``drain``/``pending``/``close`` go through :data:`_LANE`;
     ``error`` is this handle's first writer error, STICKY and never raised
@@ -2258,7 +2258,7 @@ class _FfiBackend(_DatasetGeometry):
     #: Which HDF5 library instance this backend's operations go through, in
     #: the vocabulary ``file_io.hdf5_owner`` and ``file_io.h5_journal``
     #: share.  ``file_io.slab_io`` stamps its own journal lines with this
-    #: rather than with a module constant of its own — a door that names a
+    #: rather than with a module constant of its own — an entry point that names a
     #: library its backend does not use defeats the instrument whose entire
     #: subject is which library touched the file.
     journal_stack = _J_FFI
@@ -2268,8 +2268,8 @@ class _FfiBackend(_DatasetGeometry):
         # ``ffi.io.open_file`` carry none: a default of ``"w"`` sends a
         # caller that forgot the keyword down the replace path (rank-0
         # unlink + H5Fcreate TRUNC) and destroys the file it meant to read
-        # (KNOWN_LORRAX_ISSUES 2026-09-15 TRREF).  The public door was
-        # closed on 2026-09-15 (f6709333); this is the same door one layer
+        # (KNOWN_LORRAX_ISSUES 2026-09-15 TRREF).  The public entry point was
+        # closed on 2026-09-15 (f6709333); this is the same entry point one layer
         # down, where a future direct constructor would walk into it again.
         # Lazy import — keeps file_io importable without the FFI built.
         from ffi.io import open_file as _open_file, close_file as _close_file
@@ -2683,7 +2683,7 @@ class _FfiBackend(_DatasetGeometry):
     def read_whole(self, name: str, *, dtype=None):
         """Read a WHOLE small dataset into a host ``np.ndarray``, every rank.
 
-        The rank-0 / scalar door.  ``read_slab`` cannot serve a scalar: a
+        The rank-0 / scalar entry point.  ``read_slab`` cannot serve a scalar: a
         rank-0 dataspace has no hyperslab to select, and the request is
         refused before it reaches HDF5 ("slab shape must be non-empty").
         Every stamp ``write_attr`` publishes is such a dataset, which is
@@ -2743,7 +2743,7 @@ class _FfiBackend(_DatasetGeometry):
                 with h5py.File(self.path, "r") as f:
                     out = np.asarray(f[name][()])
             return out.astype(want, copy=False) if dtype is not None else out
-        # Journaled by ``SlabIO.read_small``, the public door — one line
+        # Journaled by ``SlabIO.read_small``, the public entry point — one line
         # per op, as for every other method here.
         return self._loader.phdf5_read_whole(
             self.fh, name, shape=shape, dtype_name=str(want.name),
@@ -3133,7 +3133,7 @@ class _FfiBackend(_DatasetGeometry):
     # ------------------------------------------------------------------
     # n windows, ONE H5Dread.  Same padding contract as read_slab, one
     # valid extent per window; see SlabIO.read_slabs for the measurement
-    # that put this behind the door instead of folding it into n read_slab
+    # that put this behind one entry point instead of folding it into n read_slab
     # calls.
     def read_slabs(
         self,

@@ -2108,7 +2108,7 @@ def _integer_kminusq_index_map(coords, qcoords, grid, lookup):
 
 
 def _uniform_kminusq_index_map(full, qarr):
-    """Exact-key uniform-grid arm; noisy/irregular coordinates keep the old door.
+    """Exact-key uniform-grid arm; noisy/irregular coordinates keep the old route.
 
     A shifted k grid is allowed, but q must lie on the unshifted difference
     grid for k−q to remain on that k grid. Reconstruction is checked at the
@@ -3633,10 +3633,10 @@ class KStarMap:
 # ─────────────────────────────────────────────────────────────────────────
 # Pre-sweep spellings — MODULE-LEVEL half of the compat layer
 # ─────────────────────────────────────────────────────────────────────────
-# The package door binds these too (``symmetry_maps/__init__.py``).  Both
+# The public API binds these too (``symmetry_maps/__init__.py``).  Both
 # levels are bound on purpose: a consumer that reaches this module
 # directly (the wave-1 shims did, and the sibling stamp branch still
-# calls the old names) must not care which door it came through.
+# calls the old names) must not care which binding it came through.
 # Retirement: see :mod:`symmetry_maps._compat`.
 
 #: DEPRECATED — :func:`unfold_isdf_operator`.

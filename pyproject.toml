@@ -95,7 +95,7 @@ lorrax-downfold = "gw.downfold_cli:main"
 # entry once `bse.bse_jax` (or a successor) gains a module-level `main()`.
 
 # The installed-form source-closure manifest.  Names are distributions and
-# values are their public import doors.  The bare-source form cross-checks this
+# values are their public import packages.  The bare-source form cross-checks this
 # table against the workspace members, their own project names, root runtime
 # requirements, and uv workspace sources before putting any path on sys.path.
 [project.entry-points."lorrax.services"]

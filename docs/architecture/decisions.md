@@ -656,7 +656,7 @@ keys themselves are in the [input reference](../input_reference.md).
 - **`eigh_backend_choices`** reads `distrib_la.BACKEND_CHOICES`, importable
   without any `.so`; a literal fallback covers a tree without `services/`, and
   `EIGH_CHOICES_SOURCE` records which answered.
-  `distrib_la_batched_route_choices` likewise reads the door's batch-route
+  `distrib_la_batched_route_choices` likewise reads distrib_la's batch-route
   vocabulary; `batch_reshard` is the default and `auto` restores the backend's
   scan/stacked route.
 - **`MemoryConfig`**: `memory_per_device_gb = 0` auto-detects the GPU;

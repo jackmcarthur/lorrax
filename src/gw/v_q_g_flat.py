@@ -43,7 +43,7 @@ from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
 
 if TYPE_CHECKING:                       # pragma: no cover — typing only
-    # The DOOR, top-level name only.  No ``ensure_on_path()`` bootstrap is
+    # The PUBLIC API, top-level name only.  No ``ensure_on_path()`` bootstrap is
     # needed here and none is added: this import never executes (the
     # module has ``from __future__ import annotations``, so the annotation
     # it feeds is a string), and a runtime path edit smuggled into a
@@ -568,7 +568,7 @@ def v_head_fn_in_V(*, mc_average_vcoul_body, sys_dim, kgrid, bvec,
     if not (mc_average_vcoul_body and int(sys_dim) == 3):
         return None
     # ORDER IS LOAD-BEARING: .compute_vcoul runs the service path bootstrap
-    # at its module scope, so it must be imported BEFORE the door.
+    # at its module scope, so it must be imported BEFORE the public API.
     from .compute_vcoul import compute_v_q_per_G
     from vcoul import build_v_head_miniBZ_fn_3d
     del compute_v_q_per_G
@@ -1031,7 +1031,7 @@ def q_wedge(*, sym, centroid_indices, meta, context: str):
     unfold ``unfold_isdf_operator`` makes of them, with the measured-TRS
     policy's rows), ``policy`` the ``qgrid_trs_policy_for`` object that chose
     them.  One resolution: screening's W and the bare V are held on the SAME
-    wedge, so ``W - V`` and every door keyed by the tables are shared.
+    wedge, so ``W - V`` and every kconv call keyed by the tables are shared.
     """
     if getattr(sym, 'q_irr_full_idx', None) is None:
         return None
@@ -1086,7 +1086,7 @@ def compute_all_V_q_g_flat(
         raise NotImplementedError(
             f"compute_all_V_q_g_flat: sys_dim must be 2 or 3 "
             f"(0-D box per-q v(G) not wired); got {sys_dim}.")
-    # compute_v_q_per_G is gw's wfn-facing translation over the vcoul door
+    # compute_v_q_per_G is gw's wfn-facing translation over the vcoul public API
     # (old bvec/cell_volume/sys_dim signature) and correctly stays a gw
     # import; the head function comes from ``v_head_fn_in_V``.
     from .compute_vcoul import compute_v_q_per_G

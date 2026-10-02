@@ -97,7 +97,7 @@ v = Σ_ab conj(G_u′) G_f′ with G′ = ifftn_k of the typed unfold, which is 
 default trace's A(t); the ordered A(R) = conj(v(−R)), whose transform is
 conj(𝓕_q[v]), so the conjugation moves from the reverse rows to the forward
 rows. One FFT per node and the selected-row carry are unchanged. The
-four-current stream (photon carriers) takes the same door with channel
+four-current stream (photon carriers) takes the same kconv call with channel
 vertices (`ffi.fft.make_kconv_chi_vertex`): per family pair, each Dirac-half
 quadrant's two parent Greens are built on the raw parents and mode 11 forms
 every channel pair's plane, so no full-k Green quadrant exists; a CUDA grid

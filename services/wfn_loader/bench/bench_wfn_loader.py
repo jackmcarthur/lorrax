@@ -23,7 +23,7 @@ fails on somebody else's contention.
 
 THE THREE PATHS, and why all three have rows.
 
-``door``      -- ``SlabIO.read_slabs``: n windows of one slab shape in ONE
+``read_slabs`` -- ``SlabIO.read_slabs``: n windows of one slab shape in ONE
                  collective H5Dread.  This is what the loader does.
 ``n_read_slab`` -- the SAME windows as n separate ``SlabIO.read_slab``
                  calls.  **This shape is REJECTED** (DESIGN DECISION 1),
@@ -152,7 +152,7 @@ def _window_tables(loader, b_lo, b_hi, *, unfold=False):
     Derived by asking the loader for its own k-plan rather than
     re-deriving it here: a bench that re-implements the request measures a
     request nothing makes.  This is the ONE place the bench reaches past
-    the public door, and it does so to stay honest about what it is
+    the public API, and it does so to stay honest about what it is
     timing -- flagged, not hidden.
     """
     k_idxs, _unfold_from_spec = loader._resolve_k("ibz")
@@ -176,7 +176,7 @@ def _bytes_named(valid_shapes, itemsize=8):
 
 def _read_rows(WfnLoader, path, mesh, common, b_lo, b_hi, *, paths,
                warmup, reps):
-    """The ``door`` and ``n_read_slab`` rows for one window.
+    """The ``read_slabs`` and ``n_read_slab`` rows for one window.
 
     Both go through ONE open handle, so a difference between them is the
     request SHAPE and nothing else -- not two opens, not two contexts, not
@@ -188,7 +188,7 @@ def _read_rows(WfnLoader, path, mesh, common, b_lo, b_hi, *, paths,
     rows = []
     # A machine with no phdf5-capable .so REFUSES -- at the constructor if
     # the auto-pick got there, at the collective OPEN otherwise, because
-    # the door probes when it opens and not before.  Either way it is a
+    # SlabIO probes when it opens and not before.  Either way it is a
     # fact about the machine, so it is a ROW: a crash here would cost the
     # run its `load` rows too and leave a silent gap in the baseline file
     # exactly where the interesting platform was.
@@ -202,14 +202,14 @@ def _read_rows(WfnLoader, path, mesh, common, b_lo, b_hi, *, paths,
         mb = _bytes_named(vs) / 1e6
         spec = P(("x", "y"), None, None, None)
 
-        if "door" in paths:
-            def _door():
+        if "read_slabs" in paths:
+            def _read_slabs():
                 return io.read_slabs(
                     "wfns/coeffs", shape=(nb, ns, ngkmax, 2),
                     offsets=off, valid_shapes=vs, partition_spec=spec,
                     window_axis=2, dtype=np.float64)
-            rows.append(_row(common, "door", "SlabIO.read_slabs",
-                             n_reads, mb, _door, warmup=warmup, reps=reps))
+            rows.append(_row(common, "read_slabs", "SlabIO.read_slabs",
+                             n_reads, mb, _read_slabs, warmup=warmup, reps=reps))
 
         if "n_read_slab" in paths:
             import jax
@@ -229,7 +229,7 @@ def _read_rows(WfnLoader, path, mesh, common, b_lo, b_hi, *, paths,
                 rejected="DESIGN DECISION 1: measured slower on every deck; "
                          "kept as the ruling's evidence"))
     except Exception as exc:                                   # noqa: BLE001
-        rows.append(dict(common, path="door",
+        rows.append(dict(common, path="read_slabs",
                          refused=" ".join(str(exc).split())[:240]))
     finally:
         if loader is not None:
@@ -251,7 +251,7 @@ def run(path, deck, mesh, *, windows, paths, backends, warmup, reps):
 
         # ---- the two READ paths, both through the SAME open handle, so a
         # difference between them is the request shape and nothing else.
-        if {"door", "n_read_slab"} & set(paths):
+        if {"read_slabs", "n_read_slab"} & set(paths):
             rows.extend(_read_rows(WfnLoader, path, mesh, common, b_lo, b_hi,
                                    paths=paths, warmup=warmup, reps=reps))
 
@@ -316,7 +316,7 @@ def main():
     ap.add_argument("--wfn", default="",
                     help="override the deck's path (required for decks that "
                          "are not checked in)")
-    ap.add_argument("--paths", default="door,n_read_slab,load")
+    ap.add_argument("--paths", default="read_slabs,n_read_slab,load")
     ap.add_argument("--backends", default="phdf5,eager")
     ap.add_argument("--reps", type=int, default=3)
     ap.add_argument("--warmup", type=int, default=1)

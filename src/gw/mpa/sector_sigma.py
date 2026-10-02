@@ -74,7 +74,7 @@ class ParentW:
     is ``B_A d(t) B_B^dagger`` and ``partner`` ``conj(B_A) d(t) B_B^T`` (the
     antiunitary rows' tile), both from ``gw.greens_function_kernel.build_G_parents``.
     ``hole`` (static) selects the valence branch, W_-(q) = partner(-q): the
-    same pair read through the q-negated tables.  The Sigma door unfolds W on
+    same pair read through the q-negated tables.  The Sigma kconv call unfolds W on
     its load; no full-q W or full-grid W_R exists.
     """
 
@@ -203,7 +203,7 @@ def _w_program(mesh_xy, route, same, m, nc, n, nt, nq, kcarrier, weights_fn):
     return kernel
 
 
-#: The sector Σ doors' placed load tables (Green, W particle/hole) per mesh, plans and
+#: The sector Σ kconv calls' placed load tables (Green, W particle/hole) per mesh, plans and
 #: W tables: every SC map's τ programs read the same device tables.  Bounded.
 _SECTOR_NODES = {}
 
@@ -404,7 +404,7 @@ def sector_tau_factory(left, right, keys, meta, mesh_xy):
         right_g, right_p = sector_right_operands(right, band_axis, mesh_xy)
         return SynthesisTau(node.spatial, synthesis, right_g, right_p, synthesis.native,
                             f'sigma.sector.tau.{keys[0]}', meta, node.key, (*node.plans, *w_tables),
-                            door=node.loads)
+                            kconv_tables=node.loads)
     return factory
 
 
@@ -774,7 +774,7 @@ def sector_static_wc(handle, meta, *, mesh_xy, rows):
     (:func:`sector_synthesis`: one factor read, the parent contraction) with
     ``_shared_pole_omega0_weights`` in place of d(t), summing W_+(q) and the
     valence branch W_-(q) = partner(-q), unfolded through the same tables the
-    Sigma door reads.  No ``W_inf - V`` term enters: the Ward contact is TT-only and V is
+    Sigma kconv call reads.  No ``W_inf - V`` term enters: the Ward contact is TT-only and V is
     block diagonal, so the CC block of ``(I + V c)^-1 V - V`` is zero
     (``gw.response_bank``).  CT/TC/TT are not in it: BSE screens with the
     charge sector only, as after the charge route.

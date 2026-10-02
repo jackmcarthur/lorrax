@@ -1,11 +1,11 @@
-# wfn_loader — ψ(G) loading behind one door
+# wfn_loader — ψ(G) loading behind one public API
 
 `services/wfn_loader/` is the single entry point for reading a BerkeleyGW
 `WFN.h5`: the header, G-vector and FFT-box index tables, and ψ(G) itself,
 band-sharded (`load`), per rank (`load_process_local`) or band-chunked
 (`bands`). It is independently installable (src-layout) and depends on
 `lxkit`, JAX, NumPy and h5py. Collective I/O is reached only through the
-`slab_io` door at load time; the loader holds no FFI target name, context
+`slab_io` public API at load time; the loader holds no FFI target name, context
 handle or phdf5 call.
 
 There are two supported spellings: `import wfn_loader` and top-level names
@@ -14,7 +14,7 @@ direct-library caller, has selected the service set), or
 `from file_io import WfnLoader` / `WFNReader` (an alias of the same class
 object). `from wfn_loader.loader import …` fails `tests/test_layering.py`, and
 `src/file_io/wfn_loader.py` must not exist. Every module-scope importer of
-the door in `src/` carries a runtime or compatibility seal on a line above the
+the public API in `src/` carries a runtime or compatibility seal on a line above the
 import.
 
 ## API

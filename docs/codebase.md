@@ -50,7 +50,7 @@ contracts, equations, shapes, and run policy remain on the owner pages in the
 | `mixed_basis_pair_convolution.py` | Pair convolution of two plane-wave-sphere operators onto a response sphere (not wired). |
 | `mpa/__init__.py` | Package for the MPA screening model: fit, schedule, driver and Σ. |
 | `mpa/diagnostics.py` | MPA-fit instruments: conditioning, held-out residuals, perturbation refits, residue widths. |
-| `mpa/evaluator.py` | MPA scalar oracle and the door to the minimax quadrature service. |
+| `mpa/evaluator.py` | MPA scalar oracle and the entry point to the minimax quadrature service. |
 | `mpa/fit_driver.py` | Runs the MPA fit stage: read a column block, fit, write, finalize. |
 | `mpa/model.py` | Builds one disk-bounded MPA screening model. |
 | `mpa/pade_fit.py` | Fits n_p complex poles to 2·n_p complex samples of W_c. |

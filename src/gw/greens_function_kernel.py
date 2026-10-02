@@ -192,7 +192,7 @@ class ParentGreen:
     ``G`` ``(n_parent, mu, s, nu, s')`` centroid-major; ``transpose`` the
     partner an antiunitary row reads (the conjugate-face Green), ``None`` when
     the plan has no antiunitary row or when ``conj_partner``: weights known
-    real, so the partner is ``conj(G)`` and the fused doors read it from ``G``
+    real, so the partner is ``conj(G)`` and the fused kconv calls read it from ``G``
     on their load (``conj_partner=True``) instead of storing a second tile.
     ``k_unfold_plan.unfold_operator(G, operator_transpose=partner())`` is the
     full-k Green; ``ffi.fft.make_kconv_klead_unfold`` reads the pair directly.
@@ -559,7 +559,7 @@ def sigma_spin_block(*, n_parent, n_rmu, ns, n_full, n_band, mesh, partner_tiles
     return d
 
 
-def chi0_door_scratch(*, kgrid, n_parent, n_rmu, ns, mesh, n_right=None):
+def chi0_kconv_scratch(*, kgrid, n_parent, n_rmu, ns, mesh, n_right=None):
     """Per-rank run-time scratch of one mathdx mode-11 call: its split arm's intermediate,
     the bound owned by ``ffi.fft.chi_unfold_scratch_bytes``;
     0 on the single pass and off the mathdx backend."""
@@ -578,7 +578,7 @@ def price_chi0_node(*, n_parent, n_rmu, ns, n_full, n_out, n_band, mesh, partner
     ``2·(1 + partner)·T_p`` (``partner`` when an antiunitary row reads a conjugate-face
     tile), the accumulator ``16·n_out·N_k·μ²/P``, the builds' panels
     ``2·(1 + partner)·M_axis`` (:func:`_green_terms`) and mode 11's run-time scratch
-    (:func:`chi0_door_scratch`).  Nothing here is chunked: every term is a whole (μ, ν)
+    (:func:`chi0_kconv_scratch`).  Nothing here is chunked: every term is a whole (μ, ν)
     tile, and ``distrib_la.panel_matmul`` bounds the panels itself.
     """
     tile, panels = _green_terms(n_parent=n_parent, n_rmu=n_rmu, ns=ns, n_band=n_band,
@@ -587,5 +587,5 @@ def price_chi0_node(*, n_parent, n_rmu, ns, n_full, n_out, n_band, mesh, partner
         int(mesh.shape['x']) * int(mesh.shape['y']))
     from common.gpu_utils import record_stage_price
     new = (2.0 * (1.0 + float(bool(partner))) * (tile + panels) + acc
-           + chi0_door_scratch(kgrid=kgrid, n_parent=n_parent, n_rmu=n_rmu, ns=ns, mesh=mesh))
+           + chi0_kconv_scratch(kgrid=kgrid, n_parent=n_parent, n_rmu=n_rmu, ns=ns, mesh=mesh))
     record_stage_price("chi0 node, price_chi0_node", new, section="chi.exec")

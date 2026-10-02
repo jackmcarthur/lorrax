@@ -5,12 +5,12 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "wfn_loader"
 version = "0.1.0"
-description = "ψ(G) loading from a BerkeleyGW WFN.h5: symmetry unfold, τ-phase, bispinor lift and padding, over a JAX device mesh — one door over the host h5py read and the collective phdf5 read"
+description = "ψ(G) loading from a BerkeleyGW WFN.h5: symmetry unfold, τ-phase, bispinor lift and padding, over a JAX device mesh — one public API over the host h5py read and the collective phdf5 read"
 requires-python = ">=3.12"
 
 # THE QUARANTINE, DECLARED.  phdf5 and the LORRAX FFI layer appear nowhere
 # in this list because nothing here links them: the collective MPI-IO read
-# is reached ONLY through the slab_io door, and an installed wfn_loader on
+# is reached ONLY through the slab_io public API, and an installed wfn_loader on
 # a machine with no `.so` imports fine, constructs, reads its header and
 # serves every eager-backend call — `backend='phdf5'` is the one thing it
 # then refuses, by name, at startup rather than by demoting.

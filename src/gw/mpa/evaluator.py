@@ -1,4 +1,4 @@
-"""MPA scalar oracle and physical door to the minimax quadrature service.
+"""MPA scalar oracle and physical entry point to the minimax quadrature service.
 
 The four positive-time rule builders are exposed through the public ``minimax``
 API. The names below remain as import-compatible aliases for existing callers

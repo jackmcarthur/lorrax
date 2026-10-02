@@ -50,12 +50,12 @@ three deck/window pairs, including the hostile window (per-rank clamped band
 counts [3,3,3,1] summing to nb_logical=10; pad rows exactly zero in both
 arms; anti-tautology guards asserted: ragged ngk, (b_hi−b_lo)%4≠0).
 
-**RULING: option (A) — promote the union read INTO the slab_io door as a
+**RULING: option (A) — promote the union read INTO the slab_io public API as a
 multi-window read primitive; fold-down (B) is REJECTED on the measurement;
 (C) is dominated by (A) on both concept count and quarantine.**
 
 Shape of (A), as taken:
-- `SlabIO` gains ONE door method (`read_slabs`: n windows of a common slab
+- `SlabIO` gains ONE public method (`read_slabs`: n windows of a common slab
   shape, per-window valid shapes, a window axis in the output — the packed
   union-read semantics), implemented in `_FfiBackend` over the EXISTING
   `ffi.io.read_kchunk_union_sharded` machinery. The per-rank clamped-counts
@@ -67,10 +67,10 @@ Shape of (A), as taken:
 - wfn_loader DELETES: `_ensure_phdf5_ctx` (42 lines — the hand-copied
   `_FfiBackend.__init__` guard block; SlabIO's constructor runs the real
   guards), `_build_phdf5_clamped_counts` (73+docstring — moves behind the
-  door), the FFI half of `_phdf5_build` (~60 of 122), every `ffi.phdf5`
+  slab_io public API), the FFI half of `_phdf5_build` (~60 of 122), every `ffi.phdf5`
   import and FFI target name. Net ≈ −170 lines in the loader; survey
   concepts 11, 12, 13, 18 dissolve from it (the union read becomes a
-  documented door primitive); concept 14 (the unfold kernel) stays.
+  documented public primitive); concept 14 (the unfold kernel) stays.
   The charter's "only slab_io sees phdf5" becomes STRUCTURAL for this
   service. The file that grows is `_slab_io_ffi.py` — the file that already
   owns the C++ seam (the survey's §0.4 question, answered).
@@ -108,7 +108,7 @@ change, survey §5.2 edit table, Future-fail nuance included) is JUSTIFIED but
 not urgent. It requires this branch's OWN .so pair. Decision gate: taken as
 the final optional commit after step 6 IF the schedule (shared GPU pool, cert
 window) permits; otherwise REGISTERED with this measurement, the HLO quotes,
-and the recipe attached — the leak exists in production today and the door
+and the recipe attached — the leak exists in production today and the read_slabs
 promotion neither worsens nor masks it.
 
 **EXECUTED 2026-08-08** on `fix/kchunk-cache-identity-2026-08-08` (owner
@@ -151,7 +151,7 @@ is the same.
   (own service vs file_formats) goes to the main Fable.
 - OUT: `mf_header.py` (wave 1b file_formats), `kin_ion` (owner ruling: core;
   `gw/kin_ion_io.py` is already a clean client — survey §9.2 — its needs are
-  exactly the public door: load / load_process_local / box_index /
+  exactly the public API: load / load_process_local / box_index /
   adopt_mesh / header fields).
 - Sibling seams (ruling 1/2): `common/symmetry_maps.py`,
   `common/density_symmetry_check.py` belong to the symmetry_maps
@@ -159,7 +159,7 @@ is the same.
   in `_ensure_sym` and `_run_density_symmetry_check`.
   REGISTERED to symmetry_maps: `density_symmetry_check` reads loader
   privates `._file`/`._kpt_starts`/`.ngk` (survey §2.1); `kpt_starts`
-  becomes a public property on the door now, the `._file` read is theirs.
+  becomes a public property on the public API now, the `._file` read is theirs.
 - `_shard_map.py` remains service-local. `_collectives.py` retains only the
   loader-specific `_local_shard_and_global_offset`; `device_put_process_local`
   has one implementation in `lxkit.placement` and is re-exported here for API
@@ -168,7 +168,7 @@ is the same.
   `common.gvec_fft_box` (the sentinel contract is SHARED with zeta_loader —
   a private copy would fork the single source of truth),
   `runtime.padding.spec_divisor` (its own docstring forbids a second copy),
-  `file_io.slab_io` (the door this service is a client of).
+  `file_io.slab_io` (the public API this service is a client of).
 - Import-time property: stdlib + jax only; every lorrax import is inside a
   method. The import-isolation test (SERVICE_FORM) asserts exactly this.
 
@@ -197,7 +197,7 @@ Public surface unchanged in name and semantics: `WfnLoader`, `load`,
   monkey-patches `grid_rho` onto the instance (survey §2.4.3). Documented in
   Antipatterns.
 - Backend vocabulary unchanged: `auto`/`eager`/`phdf5`; both phdf5_host
-  refusal doors and their tests survive VERBATIM (deleted-spelling-must-
+  refusal entry points and their tests survive VERBATIM (deleted-spelling-must-
   refuse doctrine); the four docstring history passages compress to one
   sentence + a docs pointer (~30 lines, survey §4's recommended ruling —
   the doctrine stays, the prose pointer moves to the service docs).
@@ -235,7 +235,7 @@ hooks; skip-honesty profile rows for h5py (always), slab_io/FFI presence
      bands + atol=0.0, rebuilt on shared `check_*(mesh, ...)` bodies +
      `_CLI_CELLS` so the same functions are the pytest cells and the
      cluster legs.
-- Import isolation + layering door rule cells land WITH the extraction
+- Import isolation + layering public-API rule cells land WITH the extraction
   commit (coverage never gaps).
 - Red twins for every new refusal/guard (falsification doctrine).
 - Step-1a adjudications (Fable, recorded): (i) `file_io.wfn_loader` is now a
@@ -256,18 +256,18 @@ Consumer sites in files owned by NO wave-1 sibling: `common/wfn_transforms.py`
 `gw/sc_iteration.py`, etc. (survey §2 census is the site list). Sites inside
 sibling-owned files (symmetry consumers in zeta_loader.py etc.) are
 REGISTERED, not edited (ruling 1). Old import paths keep working via the
-shims (ruling 2) — the replumb moves lorrax onto the door WITHOUT deleting
+shims (ruling 2) — the replumb moves lorrax onto the public API WITHOUT deleting
 the shims; the shim-deletion gate is the phase-wide cleanup commit.
 Verification floor mirrors REPLUMB_BRIEF: full-suite set-diff empty both
 directions vs the step-0 baseline; Si COHSEX eqp BIT-IDENTICAL before/after
 (pure plumbing); layering green; the L-c legs re-run post-replumb.
 
 CENSUS CONVENTION (step-3 adjudication ruling 5, so the two arms stop
-publishing different door numbers): a door edge is an **AST import node**
-parsed from source, so `test_wfn_loader_import_isolation.py`'s door imports
+publishing different public-API numbers): a public-API edge is an **AST import node**
+parsed from source, so `test_wfn_loader_import_isolation.py`'s public-API imports
 — spelled inside subprocess code STRINGS, never parsed as this tree's
 source — are counted SEPARATELY, a constant **+3 edges / +1 file**. That
-offset is the whole difference between the two arms' door-edge counts
+offset is the whole difference between the two arms' public-API-edge counts
 (7 → 49 without it, 10 → 52 with it); the OLD-PATH census both arms
 publish, 45/36 → 3/3 with converted delta 42, is unaffected either way.
 

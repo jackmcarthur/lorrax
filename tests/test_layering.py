@@ -30,7 +30,7 @@ names are root-RELATIVE, so ``services/lxkit/src/lxkit/gate.py`` is
 
 Services get one extra rule of their own (§8): lorrax may import a service's
 TOP-LEVEL package and nothing else.  That is the charter's measurable
-criterion — "direct-dependency import edges from lorrax → 0 outside doors" —
+criterion — "direct-dependency import edges from lorrax → 0 outside public APIs" —
 and until this edit nothing counted them.
 
 WHY A TEST AND NOT A CONVENTION.  Every finding this file pins was found by
@@ -200,8 +200,8 @@ _L3_MODULES = frozenset({
 #: vcoul's whole subject is q-points, reciprocal lattices and the Coulomb
 #: interaction — physics, so L1 by the default, which is a decision and not
 #: an oversight.  It owns no ``.so``, probes no device and counts no
-#: processes; there is nothing at L3 for it to be.  It gets the §8 door rule
-#: (``_SERVICE_DOORS``) like every service, and no level entry.
+#: processes; there is nothing at L3 for it to be.  It gets the §8 public-API rule
+#: (``_SERVICE_APIS``) like every service, and no level entry.
 _L3_PACKAGES = ("ffi", "lxkit", "distrib_la")
 
 #: Physics-facing service entry points which deliberately sit above their
@@ -232,7 +232,7 @@ _L2_MODULES = frozenset({
 # pinned them gone; re-creating ``src/common/minimax.py`` to green a branch
 # would be that decision silently un-happening.  The module had exactly ONE
 # production importer — ``gw.minimax_screening`` — and it is repointed at the
-# door in the same commit, so there was nothing for a shim to bridge.
+# public API in the same commit, so there was nothing for a shim to bridge.
 # ``common.cholesky_2d`` was here.  It is ``distrib_la``'s ``native2d``
 # backend now, so the L2-vs-L3 conflict layers.md once recorded
 # (blocked Cholesky is mathematics, but it is distributed mathematics)
@@ -1043,9 +1043,9 @@ _L2_UPWARD_EXCEPTIONS = {
 # R3 -- ``centroid.kmeans_isdf`` -> ``centroid.orbit_syms``, 1 lazy site --
 # was the second entry.  DELETED, not moved: ``centroid/orbit_syms.py`` left
 # ``src/`` for ``services/symmetry_maps/``, and ``kmeans_isdf.py:583`` now
-# takes ``canonicalize_orbit`` from the ``symmetry_maps`` DOOR, where §8's
+# takes ``canonicalize_orbit`` from the ``symmetry_maps`` PUBLIC API, where §8's
 # rule 6 governs it.  See :func:`upward_edges` for why an edge into a
-# service door is not ranked, and ``docs/architecture/layers.md`` §5.
+# service API is not ranked, and ``docs/architecture/layers.md`` §5.
 # The prescribed fix (inject the orbit map; a signature change) is
 # unaffected and stays registered -- extraction changed the module's
 # address, not its argument list.
@@ -1054,10 +1054,10 @@ _L2_UPWARD_EXCEPTIONS = {
 def upward_edges(sources):
     """Every import that goes UP a level. ``[(from_layer, to_layer, mod, target, line, lazy)]``.
 
-    A SERVICE DOOR IS NOT RANKED, and that carve-out is measured, not
+    A SERVICE API IS NOT RANKED, and that carve-out is measured, not
     assumed.  Levels order modules within ONE distribution unit; a service
     under ``services/`` is a separate installable package reached through a
-    declared door, and §8's rule 6 is what governs an edge into it.
+    declared public API, and §8's rule 6 is what governs an edge into it.
     Ranking one anyway forces a false choice, which ``symmetry_maps`` is
     the first service to expose because it is the first that is not
     substrate.  MEASURED at the extraction commit, both ways::
@@ -1066,12 +1066,12 @@ def upward_edges(sources):
             L2->L1 centroid.kmeans_isdf:583 (lazy) imports symmetry_maps
 
     The package stays at the L1 default, which is what it is, and an edge
-    INTO its public door is not a within-distribution level question.  The
+    INTO its public API is not a within-distribution level question.  The
     former symmetry-service edge back to ``psp.get_DFT_mtxels`` disappeared
     when the 2c reference check moved from FFT densities to G-space occupied
     subspaces.
 
-    NOTHING IS LEFT UNWATCHED BY THIS.  Reaching past a door still counts
+    NOTHING IS LEFT UNWATCHED BY THIS.  Reaching past a public API still counts
     (rule 6, and the shims' budgets below are the checklist).  A service
     reaching back into ``src/`` still ranks -- the psp edges above are
     real, they are ``symmetry_maps``'s one remaining lorrax dependency,
@@ -1097,7 +1097,7 @@ def upward_edges(sources):
                     break
             if resolved is None or resolved == mod:
                 continue
-            if resolved in _SERVICE_DOORS and mod.split(".")[0] != resolved:
+            if resolved in _SERVICE_APIS and mod.split(".")[0] != resolved:
                 continue                      # rule 6's business; see above
             there = layer_of(resolved)
             if there == "X" or _RANK[there] < _RANK[here]:
@@ -1186,23 +1186,23 @@ def test_the_upward_edge_scan_can_fail(sources):
         f"one from inside a function: {edges}")
 
 
-def test_the_service_door_carve_out_is_narrow(sources):
+def test_the_service_api_carve_out_is_narrow(sources):
     """RED TWIN for the carve-out in :func:`upward_edges`.
 
     A skip is a hole until something proves where its edges are.  Three
     facts, on the REAL modules the extraction created:
 
-    1. ``centroid.kmeans_isdf`` (L2) importing the ``symmetry_maps`` DOOR
+    1. ``centroid.kmeans_isdf`` (L2) importing the ``symmetry_maps`` PUBLIC API
        (L1 by the default, and correctly so) is not an upward edge.
     2. The SUBMODULE spelling of the same import IS still seen — by rule 6,
        which is the rule that owns it.  So the carve-out forgives reaching
-       the door, never reaching past it.
+       the public API, never reaching past it.
     3. An in-tree L2->L1 edge in the same file is still flagged, so the
-       carve-out is a service-door exemption and not a kmeans_isdf one.
+       carve-out is a service-API exemption and not a kmeans_isdf one.
     """
     assert layer_of("symmetry_maps") == "L1"       # physics, not substrate
     assert layer_of("centroid.kmeans_isdf") == "L2"
-    assert "symmetry_maps" in _SERVICE_DOORS
+    assert "symmetry_maps" in _SERVICE_APIS
 
     live = [(m, t) for _, _, m, t, _, _ in upward_edges(sources)]
     assert ("centroid.kmeans_isdf", "symmetry_maps") not in live
@@ -1213,12 +1213,12 @@ def test_the_service_door_carve_out_is_narrow(sources):
     # names a live export.  It is recorded here because the name appears
     # as SOURCE TEXT the ratchet parses, where a rename tool would not
     # have seen it — the next sweep should re-check it rather than assume.
-    past = scan_service_door(
+    past = scan_service_api(
         "def f():\n    from symmetry_maps.orbit_syms import "
         "canonicalize_orbit\n",
         "centroid.kmeans_isdf", "symmetry_maps",
         service_submodules(sources, "symmetry_maps"),
-        door_names(sources, "symmetry_maps"))
+        api_names(sources, "symmetry_maps"))
     assert past == [("symmetry_maps.orbit_syms", 2)], past
 
     fake = dict(sources)
@@ -1613,18 +1613,18 @@ def test_every_package_in_the_map_exists(sources):
 
 
 # ===========================================================================
-# 8.  RULE 6 — lorrax imports a service through its DOOR, and nothing else
+# 8.  RULE 6 — lorrax imports a service through its PUBLIC API (its top-level package), and nothing else
 # ===========================================================================
 #
 # The charter's standalone criterion, made measurable: "Lorrax imports a
-# service ONLY through its door module.  Measurable criterion per service:
-# direct-dependency import edges from lorrax -> 0 outside doors."  Nothing
+# service ONLY through its public API module.  Measurable criterion per service:
+# direct-dependency import edges from lorrax -> 0 outside public APIs."  Nothing
 # counted them before this rule.
 #
-# The door of a service is its TOP-LEVEL package.  ``import distrib_la`` and
+# The public API of a service is its TOP-LEVEL package.  ``import distrib_la`` and
 # ``from distrib_la import plan`` are the contract; ``import
 # distrib_la.plan``, ``from distrib_la.plan import plan`` and ``from
-# distrib_la import loader`` reach past it — and a reach past the door is
+# distrib_la import loader`` reach past it — and a reach past the public API is
 # how a service stops being replaceable, because the thing on the other side
 # is no longer the API anybody agreed to.
 #
@@ -1632,22 +1632,22 @@ def test_every_package_in_the_map_exists(sources):
 # exists only to be deleted; the count can go down and the ratchet below
 # fails if an entry stops describing something real.
 
-#: Service top-level package -> the name its door is spelled.  (Identity
-#: today; a service whose door is a submodule would say so here.)
+#: Service top-level package -> the name its public API is spelled.  (Identity
+#: today; a service whose public API is a submodule would say so here.)
 #:
 #: ``zeta_loader`` joined on 2026-08-07 with its extraction.  Its shim,
 #: ``src/file_io/zeta_loader.py``, does NOT appear in the exception table
 #: below and must not: it re-exports ``ZetaLoader`` off the top-level
-#: package, which is the door, so it is not a past-the-door edge and
-#: ``test_the_service_door_exceptions_are_all_still_needed`` would fail on
+#: package, which is the public API, so it is not a past-the-API edge and
+#: ``test_the_service_api_exceptions_are_all_still_needed`` would fail on
 #: an entry claiming otherwise.
 #:
 #: ``vcoul`` joined 2026-08-07.  Its shims — ``gw.compute_vcoul``,
 #: ``gw.coulomb.*``, ``gw.vcoul``,
 #: ``file_io.read_bgw_vcoul``, ``common.coulomb_sphere`` — all say ``import
 #: vcoul`` / ``from vcoul import <public name>`` and none reaches a
-#: submodule, so vcoul needs NO row in ``_SERVICE_DOOR_EXCEPTIONS`` below.
-#: That is the point of putting ``_minibz_kernel_bare`` on the door despite
+#: submodule, so vcoul needs NO row in ``_SERVICE_API_EXCEPTIONS`` below.
+#: That is the point of putting ``_minibz_kernel_bare`` on the public API despite
 #: the underscore: it has real cross-package consumers, and a shim reaching ``vcoul.minibz`` for one of
 #: them would have been this rule's first new violation since the replumb.
 #: ``minimax`` joined 2026-08-08 with the sixth extraction, and it joined
@@ -1655,24 +1655,24 @@ def test_every_package_in_the_map_exists(sources):
 #: one production importer, then and now — says ``import minimax as _mm``
 #: and reaches only ``serve`` / ``Quadrature`` / the refusal types, all of
 #: which are top-level names.  The offline solver half (``G_hgl``,
-#: ``crossing_grids``, …) is on the door too, behind a PEP-562 lazy
+#: ``crossing_grids``, …) is on the public API too, behind a PEP-562 lazy
 #: ``__getattr__``, precisely so that the generator tool and the
 #: certification tier can have those names without anybody writing
 #: ``from minimax.solver import ...`` — which would have been this rule's
 #: first new violation since the replumb.
-_SERVICE_DOORS = {"lxkit": "lxkit", "distrib_la": "distrib_la",
+_SERVICE_APIS = {"lxkit": "lxkit", "distrib_la": "distrib_la",
                   "wfn_loader": "wfn_loader", "zeta_loader": "zeta_loader",
                   "symmetry_maps": "symmetry_maps", "vcoul": "vcoul",
                   "minimax": "minimax"}
 
-#: ``src/`` module -> how many past-the-door edges it is allowed.  These are
+#: ``src/`` module -> how many past-the-API edges it is allowed.  These are
 #: the transitional re-export shims.
 #:
 #: WAS 45 EDGES ACROSS 9 MODULES before the replumb (step 3).  Six of the
 #: nine are deleted: ``ffi.linalg.{plan,resolve,dispatch,_slate,_scalapack}``
 #: (3 + 12 + 2 + 12 + 6) and ``common.cholesky_2d`` (3), with the
 #: ``ffi.slate`` and ``ffi.scalapack`` re-export PACKAGES that reached them.
-#: Every consumer imports the top-level ``distrib_la`` door now, which this
+#: Every consumer imports the top-level ``distrib_la`` public API now, which this
 #: rule does not count because it is not a violation.
 #:
 #: THE LAST SEVEN ARE GONE.  ``ffi.cusolvermp`` (a re-export shim) and
@@ -1681,12 +1681,12 @@ _SERVICE_DOORS = {"lxkit": "lxkit", "distrib_la": "distrib_la",
 #: caller remained.
 #:
 #: 7 -> 10 AT THE symmetry_maps EXTRACTION.  Three forwarding shims, one
-#: past-the-door edge each: ``from symmetry_maps import <submodule> as
+#: past-the-API edge each: ``from symmetry_maps import <submodule> as
 #: _impl``, which is what makes their PEP 562 ``__getattr__`` able to
 #: forward the PRIVATE names (``_I_SIGMA_Y``, ``_star_conj_flags``,
 #: ``TOL_TRS``, ``_CACHE``, …) that tests, ``misc/`` and uncollected gates
 #: still take from the old paths.  Their public re-exports come through the
-#: door and are not counted, because they are not violations.
+#: public API and are not counted, because they are not violations.
 #:
 #: THE GATE, NAMED: all three are deleted by the phase-wide cleanup commit
 #: after all four wave-1 branches land (WAVE1_BRIEF ruling 2).  Unlike
@@ -1698,23 +1698,23 @@ _SERVICE_DOORS = {"lxkit": "lxkit", "distrib_la": "distrib_la",
 #: THE THREE symmetry_maps ROWS ARE GONE, and their absence is the record
 #: that the phase-wide shim deletion actually happened.  ``common.symmetry_maps``,
 #: ``common.density_symmetry_check`` and ``centroid.orbit_syms`` were
-#: ``__getattr__``-forwarding shims that reached past the door to keep the
+#: ``__getattr__``-forwarding shims that reached past the public API to keep the
 #: service's private names resolving at the old paths; all three were
 #: deleted at the 2026-08-08 landing and this ratchet is what noticed --
-#: it failed with "these modules no longer reach past a service door --
+#: it failed with "these modules no longer reach past a service API --
 #: delete the exception, and probably the module" the moment they went.
 #: An exception table that outlives its shims is how a replumb gets
 #: declared finished while the old paths are still there.
-_SERVICE_DOOR_EXCEPTIONS: dict = {}
+_SERVICE_API_EXCEPTIONS: dict = {}
 
 
 def service_submodules(sources, service: str) -> set:
     """Leaf names directly under ``service`` that are MODULES.
 
     Needed because ``from distrib_la import plan`` is ambiguous in the AST:
-    ``plan`` is both a submodule and a name the door re-exports, and the
-    door's binding is what an importer actually gets.  So a name is a
-    past-the-door reach only if it is a submodule the door does NOT
+    ``plan`` is both a submodule and a name the public API re-exports, and the
+    public API's binding is what an importer actually gets.  So a name is a
+    past-the-API reach only if it is a submodule the public API does NOT
     re-export.
     """
     n = len(service) + 1
@@ -1722,8 +1722,8 @@ def service_submodules(sources, service: str) -> set:
             if m.startswith(service + ".") and "." not in m[n:]}
 
 
-def door_names(sources, service: str) -> set:
-    """The strings in the service door's ``__all__``.
+def api_names(sources, service: str) -> set:
+    """The strings in the service API's ``__all__``.
 
     Read from the AST, not by importing: this suite must keep running on
     any interpreter that can parse the tree, with no jax and no service
@@ -1743,9 +1743,9 @@ def door_names(sources, service: str) -> set:
     return set()
 
 
-def scan_service_door(source: str, mod: str, service: str,
-                      submodules, doors, is_pkg: bool = False):
-    """Imports of ``service`` that go PAST its door. ``[(spelling, line)]``.
+def scan_service_api(source: str, mod: str, service: str,
+                      submodules, api, is_pkg: bool = False):
+    """Imports of ``service`` that go PAST its public API. ``[(spelling, line)]``.
 
     Three spellings, because the tree can write three:
     ``import svc.sub`` / ``from svc.sub import x`` / ``from svc import
@@ -1763,55 +1763,55 @@ def scan_service_door(source: str, mod: str, service: str,
                 hits.append((tgt, node.lineno))
             elif tgt == service:
                 for a in node.names:
-                    if a.name in submodules and a.name not in doors:
+                    if a.name in submodules and a.name not in api:
                         hits.append((service + "." + a.name, node.lineno))
     return sorted(hits, key=lambda h: h[1])
 
 
-def _door_violations(sources):
-    """``{src module: [(spelling, line), …]}`` for every past-the-door edge."""
+def _api_violations(sources):
+    """``{src module: [(spelling, line), …]}`` for every past-the-API edge."""
     pkgs = packages_in(sources)
     lorrax = modules_under_src(sources)
     per_service = {svc: (service_submodules(sources, svc),
-                         door_names(sources, door))
-                   for svc, door in _SERVICE_DOORS.items()}
+                         api_names(sources, api))
+                   for svc, api in _SERVICE_APIS.items()}
     out = {}
     for mod in sorted(lorrax):
         hits = []
-        for svc, (subs, doors) in per_service.items():
-            hits += scan_service_door(sources[mod], mod, svc, subs, doors,
+        for svc, (subs, api) in per_service.items():
+            hits += scan_service_api(sources[mod], mod, svc, subs, api,
                                       mod in pkgs)
         if hits:
             out[mod] = sorted(hits, key=lambda h: h[1])
     return out
 
 
-def test_lorrax_reaches_a_service_only_through_its_door(sources):
-    bad = {m: h for m, h in _door_violations(sources).items()
-           if m not in _SERVICE_DOOR_EXCEPTIONS}
+def test_lorrax_reaches_a_service_only_through_its_api(sources):
+    bad = {m: h for m, h in _api_violations(sources).items()
+           if m not in _SERVICE_API_EXCEPTIONS}
     assert not bad, (
-        f"these src/ modules import past a service's door: {bad}.  A service "
+        f"these src/ modules import past a service's public API: {bad}.  A service "
         f"is imported by its TOP-LEVEL package only ("
-        f"{', '.join(sorted(_SERVICE_DOORS))}); reaching a submodule is what "
+        f"{', '.join(sorted(_SERVICE_APIS))}); reaching a submodule is what "
         f"stops it being replaceable.")
-    over = {m: (len(h), _SERVICE_DOOR_EXCEPTIONS[m])
-            for m, h in _door_violations(sources).items()
-            if m in _SERVICE_DOOR_EXCEPTIONS
-            and len(h) > _SERVICE_DOOR_EXCEPTIONS[m]}
+    over = {m: (len(h), _SERVICE_API_EXCEPTIONS[m])
+            for m, h in _api_violations(sources).items()
+            if m in _SERVICE_API_EXCEPTIONS
+            and len(h) > _SERVICE_API_EXCEPTIONS[m]}
     assert not over, (
-        f"a transitional shim grew new past-the-door edges — the exception "
+        f"a transitional shim grew new past-the-API edges — the exception "
         f"was for the count on the left, not for the direction: {over}")
 
 
-def test_the_service_door_exceptions_are_all_still_needed(sources):
-    """The ratchet.  A shim that stopped reaching past the door is a shim
+def test_the_service_api_exceptions_are_all_still_needed(sources):
+    """The ratchet.  A shim that stopped reaching past the public API is a shim
     that can be deleted, and this is where that is noticed."""
-    live = _door_violations(sources)
-    stale = sorted(set(_SERVICE_DOOR_EXCEPTIONS) - set(live))
+    live = _api_violations(sources)
+    stale = sorted(set(_SERVICE_API_EXCEPTIONS) - set(live))
     assert not stale, (
-        f"these modules no longer reach past a service door — delete the "
+        f"these modules no longer reach past a service API — delete the "
         f"exception, and probably the module: {stale}")
-    loose = {m: (len(live[m]), n) for m, n in _SERVICE_DOOR_EXCEPTIONS.items()
+    loose = {m: (len(live[m]), n) for m, n in _SERVICE_API_EXCEPTIONS.items()
              if m in live and len(live[m]) < n}
     assert not loose, (
         f"budgets above the real count are a licence to regress; lower them "
@@ -1825,15 +1825,15 @@ def test_the_retired_shim_modules_are_gone(sources):
     of these modules carried "DELETING THIS PACKAGE IS THE REPLUMB-COMPLETE
     GATE" or "Deletion is the replumb-complete gate" in its docstring.  A
     re-export shim that nothing imports is not harmless -- it is a second
-    spelling of the door that still works, so the next call site can be
+    spelling of the public API that still works, so the next call site can be
     written against it and the layering rule above will not fire, because
-    a shim importing past the door is exactly what the exception list
+    a shim importing past the public API is exactly what the exception list
     forgives.  The only enforceable end state is absence.
 
     Checked against the AST source map rather than by importing, so this
     stays runnable with no jax and no service installed.
 
-    RED ARM: ``test_the_service_door_exceptions_are_all_still_needed`` is
+    RED ARM: ``test_the_service_api_exceptions_are_all_still_needed`` is
     the other direction -- it fails if one of the three SURVIVING
     exceptions stops describing something real.  Between them a module
     cannot be quietly resurrected or quietly abandoned.
@@ -1849,20 +1849,20 @@ def test_the_retired_shim_modules_are_gone(sources):
     alive = sorted(m for m in retired if m in sources)
     assert not alive, (
         f"these re-export shims were deleted by the replumb and are back: "
-        f"{alive}.  Each one is a second spelling of a service door; the "
-        f"door is the package (import distrib_la), and nothing else.")
+        f"{alive}.  Each one is a second spelling of a service API; the "
+        f"public API is the package (import distrib_la), and nothing else.")
 
 
-def test_the_service_door_scan_can_fail(sources):
+def test_the_service_api_scan_can_fail(sources):
     """RED TWIN for rule 6, over all three spellings the tree can write —
     seeded with REAL names, so it cannot pass by testing a fiction."""
     subs = service_submodules(sources, "distrib_la")
-    doors = door_names(sources, "distrib_la")
-    assert "loader" in subs and "loader" not in doors, (
-        "this twin needs a real distrib_la submodule that the door does NOT "
+    api = api_names(sources, "distrib_la")
+    assert "loader" in subs and "loader" not in api, (
+        "this twin needs a real distrib_la submodule that the public API does NOT "
         "re-export; 'loader' stopped being one")
-    assert "plan" in subs and "plan" in doors, (
-        "this twin needs a name that is BOTH a submodule and a door export, "
+    assert "plan" in subs and "plan" in api, (
+        "this twin needs a name that is BOTH a submodule and a public API export, "
         "or the third spelling's carve-out is untested")
     cases = [
         ("import distrib_la.loader\n",                "distrib_la.loader"),
@@ -1871,47 +1871,47 @@ def test_the_service_door_scan_can_fail(sources):
         ("def f():\n    from distrib_la import _slate\n", "distrib_la._slate"),
     ]
     for src, expected in cases:
-        hits = scan_service_door(src, "m", "distrib_la", subs, doors)
+        hits = scan_service_api(src, "m", "distrib_la", subs, api)
         assert hits and hits[0][0] == expected, (
-            f"the service-door scan does not detect {expected!r} in {src!r} "
+            f"the service-API scan does not detect {expected!r} in {src!r} "
             f"— it found {hits}")
 
 
-def test_the_service_door_scan_does_not_cry_wolf(sources):
-    """...and the DOOR itself must stay quiet, or the rule is unusable."""
+def test_the_service_api_scan_does_not_cry_wolf(sources):
+    """...and the PUBLIC API itself must stay quiet, or the rule is unusable."""
     subs = service_submodules(sources, "distrib_la")
-    doors = door_names(sources, "distrib_la")
+    api = api_names(sources, "distrib_la")
     ok = ("import distrib_la\n"
           "from distrib_la import plan, Plan, factor, solve, BACKEND_CHOICES\n"
           "p = plan('eigh', mesh)\n")
-    assert scan_service_door(ok, "m", "distrib_la", subs, doors) == [], (
-        "the service-door scan flags the door itself; the gate would be "
+    assert scan_service_api(ok, "m", "distrib_la", subs, api) == [], (
+        "the service-API scan flags the public API itself; the gate would be "
         "turned off")
 
 
-def test_the_wfn_loader_door_scan_can_fail(sources):
+def test_the_wfn_loader_api_scan_can_fail(sources):
     """RED TWIN for rule 6 over the SECOND extracted service.
 
     A per-service twin, not a second copy of the same one: the rule is
-    parameterized by ``_SERVICE_DOORS`` and each service supplies its own
+    parameterized by ``_SERVICE_APIS`` and each service supplies its own
     real submodule names, so a twin seeded from distrib_la says nothing
     about whether ``wfn_loader`` was wired into the map at all.  The
     ``subs`` assertion below is what makes that concrete — it fails if the
     service is absent, renamed, or reduced to a single-module package with
-    nothing behind its door.
+    nothing behind its public API.
 
-    ``wfn_loader`` has no name that is BOTH a submodule and a door export
+    ``wfn_loader`` has no name that is BOTH a submodule and a public API export
     (distrib_la's ``plan`` is), so the third spelling is seeded with a
     plain submodule and the ambiguous case stays covered by the
     distrib_la twin above, which is the one that has it.
     """
     subs = service_submodules(sources, "wfn_loader")
-    doors = door_names(sources, "wfn_loader")
-    assert "loader" in subs and "loader" not in doors, (
-        "this twin needs a real wfn_loader submodule that the door does "
+    api = api_names(sources, "wfn_loader")
+    assert "loader" in subs and "loader" not in api, (
+        "this twin needs a real wfn_loader submodule that the public API does "
         "NOT re-export; 'loader' stopped being one")
-    assert "WfnLoader" in doors, (
-        "the wfn_loader door exports no WfnLoader — either the service is "
+    assert "WfnLoader" in api, (
+        "the wfn_loader public API exports no WfnLoader — either the service is "
         "gone or its __all__ stopped being readable from the AST, and in "
         "both cases the carve-out below tests nothing")
     cases = [
@@ -1922,30 +1922,30 @@ def test_the_wfn_loader_door_scan_can_fail(sources):
          "wfn_loader._collectives"),
     ]
     for src, expected in cases:
-        hits = scan_service_door(src, "m", "wfn_loader", subs, doors)
+        hits = scan_service_api(src, "m", "wfn_loader", subs, api)
         assert hits and hits[0][0] == expected, (
-            f"the service-door scan does not detect {expected!r} in {src!r} "
+            f"the service-API scan does not detect {expected!r} in {src!r} "
             f"— it found {hits}")
 
 
-def test_the_wfn_loader_door_scan_does_not_cry_wolf(sources):
+def test_the_wfn_loader_api_scan_does_not_cry_wolf(sources):
     """...and the shim that KEEPS the old spelling alive must stay quiet.
 
     ``src/file_io/wfn_loader.py`` is a transitional re-export shim whose
     whole body is the second line below, underscored helper names
-    included.  If those read as past-the-door reaches the rule fires on
+    included.  If those read as past-the-API reaches the rule fires on
     the one module written specifically to obey it, and the gate gets an
-    exception entry it does not need — which is how ``_SERVICE_DOOR_
+    exception entry it does not need — which is how ``_SERVICE_API_
     EXCEPTIONS`` stops being a replumb checklist.
     """
     subs = service_submodules(sources, "wfn_loader")
-    doors = door_names(sources, "wfn_loader")
+    api = api_names(sources, "wfn_loader")
     ok = ("import wfn_loader\n"
           "from wfn_loader import WfnLoader, KSpec, "
           "_phdf5_unfold_kernel\n"
           "w = WfnLoader(path)\n")
-    assert scan_service_door(ok, "m", "wfn_loader", subs, doors) == [], (
-        "the service-door scan flags the door itself; the gate would be "
+    assert scan_service_api(ok, "m", "wfn_loader", subs, api) == [], (
+        "the service-API scan flags the public API itself; the gate would be "
         "turned off")
 
 

@@ -34,7 +34,7 @@ a LIVE consumer (``gw/compute_vcoul.py:228`` imports it by name),
 Deleting it before the owner rules would remove a working code path to
 tidy a docstring.  When the ruling lands: delete this module, drop the
 three names from ``file_io/__init__``, and repoint
-``gw/compute_vcoul.py`` at ``vcoul``'s door — that last repoint also
+``gw/compute_vcoul.py`` at ``vcoul``'s public API — that last repoint also
 resolves audit disagreement 4 (the facade import, declined-and-registered
 at 23f83780).
 """

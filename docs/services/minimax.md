@@ -164,5 +164,5 @@ finite-height rectangles use `analytic_box_rule`.
 
 ## Verification
 
-The monorepo layering test enforces the top-level door. `import minimax` and a
+The monorepo layering test enforces the top-level public API. `import minimax` and a
 `noncrossing` solve load neither JAX nor SciPy.

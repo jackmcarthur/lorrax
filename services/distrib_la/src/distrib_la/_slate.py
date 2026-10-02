@@ -668,7 +668,7 @@ def batched_distributed_matmul(
 
     A, B, and C are rank-3 ``P(None,'x','y')`` arrays; the result has C's
     shape and returns at the same sharding.  The public
-    :func:`distrib_la.matmul` door supplies rank-2 lifting, placement,
+    :func:`distrib_la.matmul` entry point supplies rank-2 lifting, placement,
     provider resolution, and the optional zero C.  This backend requires a
     process grid, float64 or complex128, N/T/C operation codes, exact
     one-face-per-rank tiling, and one JAX process per mesh cell. CUDA uses

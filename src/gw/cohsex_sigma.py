@@ -47,7 +47,7 @@ def _spin_capacity(meta) -> float:
                 f"nspin/nspinor.")
     # Computed from meta's own declared file-spin structure.  NOT delegated
     # to psp.get_DFT_mtxels.spin_degeneracy_factor: that helper is now the
-    # loader's occupation-capacity door (wfn.occupation_state_capacity) and
+    # loader's occupation-capacity entry point (wfn.occupation_state_capacity) and
     # takes a WfnLoader, not a Meta.  nspinor_wfnfile keeps bispinor
     # (meta.nspinor=4, file 2) at exactly 1.0.
     return 2.0 if (int(meta.nspin) == 1
@@ -215,7 +215,7 @@ class StaticConvolution(NamedTuple):
         return self.apply(G_k, self.prep(interaction), prefactor)
 
     def warmed(self, interaction):
-        """``interaction`` as an operator whose wedge door is built and whose load
+        """``interaction`` as an operator whose wedge kconv call is built and whose load
         tables are on the devices: call OUTSIDE a jit, so the consumer's jit
         takes the tables as arguments rather than as embedded constants."""
         op = interaction_operator(interaction)
@@ -247,23 +247,23 @@ def interaction_operator(interaction):
 _wedge_prep_cache: dict[tuple[object, ...], object] = {}
 
 
-def wedge_door(mesh_xy: Mesh, kgrid, op, *, norm="ortho"):
-    """The mode-9 door for ``op``'s wedge, built once per (mesh, grid, tables)."""
+def wedge_kconv(mesh_xy: Mesh, kgrid, op, *, norm="ortho"):
+    """The mode-9 kconv call for ``op``'s wedge, built once per (mesh, grid, tables)."""
     from ffi import ffi_dial_key
     from common.fft_helpers import make_kfft_klead_unfold
     key = (_mesh_key(mesh_xy), tuple(int(v) for v in kgrid), ffi_dial_key(), norm,
            op.wedge_key())
-    door = _wedge_prep_cache.get(key)
-    if door is None:
-        door = _wedge_prep_cache[key] = make_kfft_klead_unfold(
+    kconv = _wedge_prep_cache.get(key)
+    if kconv is None:
+        kconv = _wedge_prep_cache[key] = make_kfft_klead_unfold(
             mesh_xy, kgrid, op.load_tables(mesh_xy), norm=norm)
-    return door
+    return kconv
 
 
 def wedge_prep(mesh_xy: Mesh, kgrid, op, *, norm="ortho"):
     """``make_kconv_klead``'s prep of ``op``'s full-zone interaction, read from its wedge
-    (inside a consumer's jit: the door is normally built already, see ``warmed``)."""
-    return wedge_door(mesh_xy, kgrid, op, norm=norm)(op.values, None, op.load)
+    (inside a consumer's jit: the kconv call is normally built already, see ``warmed``)."""
+    return wedge_kconv(mesh_xy, kgrid, op, norm=norm)(op.values, None, op.load)
 
 
 def _make_static_convolution(mesh_xy: Mesh, kgrid: tuple[int, int, int],
@@ -305,9 +305,9 @@ def _make_static_convolution(mesh_xy: Mesh, kgrid: tuple[int, int, int],
             return wedge_prep(mesh_xy, kgrid, interaction_operator(interaction))
 
         def warm(op):
-            # The door, and the operator carrying its tables on the devices:
+            # The kconv call, and the operator carrying its tables on the devices:
             # the static-Sigma jits then take them as arguments.
-            wedge_door(mesh_xy, kgrid, op)
+            wedge_kconv(mesh_xy, kgrid, op)
             return op.with_load(mesh_xy)
 
         @jax.jit
@@ -435,7 +435,7 @@ def _make_cohsex_kernels_face(mesh_xy: Mesh, face_shape, _convolve,
         from ffi import _services
         _services.ensure_on_path()
         from symmetry_maps import unfold_file_wedge_band_operator
-        from .ppm_tau_kernel import (_get_sigma_kij_kernel, sigma_door_tables,
+        from .ppm_tau_kernel import (_get_sigma_kij_kernel, sigma_kconv_tables,
                                      sigma_subtile_operands)
         _sym = k_unfold_plan.sym
         _face_shape = tuple(int(v) for v in face_shape)
@@ -465,7 +465,7 @@ def _make_cohsex_kernels_face(mesh_xy: Mesh, face_shape, _convolve,
             if op.trs_rule != "conj":
                 raise ValueError(f"static Sigma reads a Hermitian interaction by the conj "
                                  f"rule; got trs_rule={op.trs_rule!r}")
-            return op.with_load(mesh_xy), sigma_door_tables(mesh_xy, k_unfold_plan)
+            return op.with_load(mesh_xy), sigma_kconv_tables(mesh_xy, k_unfold_plan)
 
         @jax.jit
         def sigma_sx(wfns, Gij, W_q, g_load):
@@ -522,8 +522,8 @@ def _make_cohsex_kernels_face(mesh_xy: Mesh, face_shape, _convolve,
                        real_weights=True, layout=layout, gemm=g_plan)
         return _project_bands(wfns, _convolve(G_ri, _hole_interaction(W_q, V_q), -0.5))
 
-    # The interaction's wedge door is built before the jit traces (see
-    # StaticConvolution.warmed); W - V unfolds by W's tables, so one door
+    # The interaction's wedge kconv call is built before the jit traces (see
+    # StaticConvolution.warmed); W - V unfolds by W's tables, so one kconv call
     # serves COH.
     def warmed_sx(wfns, Gij, W_q):
         return sigma_sx(wfns, Gij, _convolve.warmed(W_q))

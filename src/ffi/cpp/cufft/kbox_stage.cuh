@@ -4,7 +4,7 @@
 // (kz fastest).  Every mode transforms nk-long columns over the (NX, NY, NZ) k-grid, applies an
 // R-space step (Mid) and transforms back.  This header owns that stage and its launch rule; the
 // modes own their Load (stage/finish), Mid and Store.  One code path per shape, chosen once when
-// the door builds (kbox_plan below), from the k-grid and device attributes:
+// the kconv call builds (kbox_plan below), from the k-grid and device attributes:
 //
 //   single pass  tr adjacent columns resident per block in a padded bank, cp.async straight into
 //                shared memory, transform3 (z, y, x cuFFTDx thread FFTs, the family's order), Mid,
@@ -127,9 +127,9 @@ __device__ __forceinline__ C lane_read(C v, int src) {
     return r;
 }
 
-// The live columns [lo, hi) of a pass padded to a scan's largest pass (a door's live rows times its
+// The live columns [lo, hi) of a pass padded to a scan's largest pass (a kconv call's live rows times its
 // columns per row, so whole groups): a pass runs over [b, e) = [lo, hi) within [0, ncols) only, as
-// it would over [0, ncols); with zero set (the pass that stores the door's output) zero_dead
+// it would over [0, ncols); with zero set (the pass that stores the kconv call's output) zero_dead
 // writes the other columns as zeros.  The default is every column live.
 #ifndef LRX_LIVE
 #define LRX_LIVE 1
@@ -143,7 +143,7 @@ struct Live {
         const long long c = hi < ncols ? hi : ncols;
         return c > b() ? c : b();
     }
-    // A door's live rows [live[0], live[1]) of per_row columns each, as columns from c0 (null live:
+    // A kconv call's live rows [live[0], live[1]) of per_row columns each, as columns from c0 (null live:
     // every row).  LRX_LIVE 0 (a program built for calls without live): every column, folded at
     // compile time, so the plain program keeps no bounds in registers.
     __device__ static Live rows(const int* live, long long per_row, long long c0, bool zero) {

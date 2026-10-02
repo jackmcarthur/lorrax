@@ -1,7 +1,7 @@
 """Frequency-resolved W restart tensors and the B/Omega fit store.
 
 This module owns MPA sample and pole bytes.  It remains dependency-light:
-nothing here imports from ``gw``, the ``symmetry_maps`` door is imported
+nothing here imports from ``gw``, the ``symmetry_maps`` public API is imported
 lazily through :func:`_qs`, and every ``jax`` import is inside the function
 that needs it — so importing THIS MODULE costs no jax.  (Importing the
 ``file_io`` PACKAGE does, and has since the wfn_loader extraction:
@@ -99,7 +99,7 @@ tables, one file — undefined the moment they overlap with a writer
 * **every** h5py open in this module goes through :func:`_h5`, which
   declares to :mod:`file_io.hdf5_owner` and is refused BY NAME if the
   FFI holds a live handle on the same path.  A new h5py open added
-  outside that door is a defect, not a shortcut;
+  outside that entry point is a defect, not a shortcut;
 * the collective readers do their h5py work BEFORE the collective
   handle opens and none after — :class:`PoleReader` holds ONE
   ``SlabIO`` across an iteration's pole batches for exactly that
@@ -155,7 +155,7 @@ QIRR_FORMAT_VERSIONS_READABLE = (1, 2)
 #: extenders in as many words to compose (``{**QIRR_RANK_BY_VERSION, 2:
 #: 4}``) rather than to restate — a second copy of "version 1 is rank 3"
 #: is a second thing to update on the day it is not.  Composed through
-#: :func:`_rank_by_version` because the door is imported lazily.
+#: :func:`_rank_by_version` because the public API is imported lazily.
 _MPA_RANK = 4
 
 
@@ -371,9 +371,9 @@ _QS_CACHE: list = []
 
 
 def _qs():
-    """The ``symmetry_maps`` DOOR, imported lazily and once.
+    """The ``symmetry_maps`` public API, imported lazily and once.
 
-    THE DOOR, NOT THE SUBMODULE.  Everything this module needs from the
+    THE PUBLIC API, NOT THE SUBMODULE.  Everything this module needs from the
     q_irr format layer — :class:`~symmetry_maps.QirrDest`,
     :func:`~symmetry_maps.qirr_attr_str`,
     :data:`~symmetry_maps.QIRR_VERSION_ATTR`,
@@ -385,11 +385,11 @@ def _qs():
     always: this module was written while the q_irr checkpoint was still
     landing, when the format's plumbing was private to
     ``symmetry_maps.qirr_store``, and it reached into that submodule for
-    thirty-four of them.  ``tests/test_layering.py``'s door rule counted
+    thirty-four of them.  ``tests/test_layering.py``'s public-API rule counted
     that reach, correctly — a consumer that imports a service's submodule
     is a consumer that stops the service being replaceable — and the
     checkpoint answered it by PUBLISHING the plumbing rather than by
-    letting a second store copy it.  The door's own docstring gives the
+    letting a second store copy it.  The public API's own docstring gives the
     reason in the format layer's words.
 
     STILL LAZY, for the reason that outlived the other one.
@@ -420,12 +420,12 @@ def _qs():
 
 @contextlib.contextmanager
 def _h5(target, mode, *, where=None):
-    """THE serial-h5py door onto a store the FFI transport also drives.
+    """THE serial-h5py entry point onto a store the FFI transport also drives.
 
     Every h5py open in this module goes through here, with no exception,
     because every file this module writes is ALSO written by ``SlabIO``
     through a different HDF5 library instance (audit A1; sandbox
-    claims/0110).  What the door adds over a bare ``QirrDest``:
+    claims/0110).  What the entry point adds over a bare ``QirrDest``:
 
     * it DECLARES the open to :mod:`file_io.hdf5_owner`, which refuses by
       name if the FFI currently holds a live handle on the same path and
@@ -437,13 +437,13 @@ def _h5(target, mode, *, where=None):
       a handle is live after an exception, or it would refuse every later
       legitimate open on the path.
 
-    ``target`` is a path (this door owns the handle) or an already-open
-    h5py File/Group (the caller owns it; the door still declares it, since
+    ``target`` is a path (this entry point owns the handle) or an already-open
+    h5py File/Group (the caller owns it; the entry point still declares it, since
     a live foreign handle is exactly what the registry needs to know
     about).  ``where`` defaults to the calling function's name.
 
     THE FLUSH IS OWNED-ONLY.  A caller-supplied File/Group is never
-    flushed by this door, on any mode — the caller owns the handle and
+    flushed by this entry point, on any mode — the caller owns the handle and
     therefore owns its durability.  Only the path form gets the flush.
 
     THE ONE OPEN THAT USED TO BYPASS IT was :func:`read_w_tables`, which
@@ -519,7 +519,7 @@ def _superblock_flag_diagnosis(exc, path, mode, where):
 
     WHAT IT IS NOT.  Not a POSIX lock: ``HDF5_USE_FILE_LOCKING=FALSE`` is
     injected into every ``lx`` step and was FALSE for the passing runs too.
-    Not this door's bookkeeping: ``file_io.hdf5_owner`` is per-process by
+    Not this entry point's bookkeeping: ``file_io.hdf5_owner`` is per-process by
     construction and at the failing open no FFI handle is live in THAT
     rank's process.  Not caused by the A1 work: a detached worktree at
     ``bf57701b`` — before ``hdf5_owner``, ``_h5`` and ``PoleReader``
@@ -559,7 +559,7 @@ def _superblock_flag_diagnosis(exc, path, mode, where):
         f"  NOT   : file_io.hdf5_owner — it is per-process and no FFI "
         f"handle is live in THIS process at this open;\n"
         f"  NOT   : a regression from the A1 work — an A/B at bf57701b, "
-        f"before this door existed, fails identically.\n"
+        f"before this entry point existed, fails identically.\n"
         f"  what  : the FFI cleared that bit at H5Fclose and the clear had "
         f"not become visible to this Lustre client.  Off-node ranks lose "
         f"this race far more often, which is why 12 of 16 ranks on 4 nodes "
@@ -2368,7 +2368,7 @@ def fit_completion_ledger(src, *, mode="r"):
 
     Rank-local and serial, but invoked on every rank by three collective
     functions — a collective caller must invoke it uniformly.  ``src`` is a
-    path or an already-open group; this is the door in this module most
+    path or an already-open group; this is the entry point in this module most
     often passed both ways.
     """
     qs = _qs()

@@ -20,7 +20,7 @@ across a fleet.  Every renamed operation is therefore published twice:
 the new name is PRIMARY (it is what the definition is called, what the
 error messages say, and what every consumer in this tree calls), and the
 old name is a call-through alias bound both at module level and on the
-package door.  An importer that has not moved keeps working, byte for
+public API.  An importer that has not moved keeps working, byte for
 byte, and gets no warning — a warning that fires on a sibling branch's
 every run is noise about a decision that sibling did not make.
 
@@ -40,7 +40,7 @@ recorded mechanism of a silent 4 eV gap on hex systems.  The new names
 carry the direction, which is the whole point.
 
 :data:`RENAMES` is also the gate: ``test_symmetry_maps_rename_compat``
-walks it and asserts that every old key still resolves on the door and
+walks it and asserts that every old key still resolves on the public API and
 on its defining module, that every value is the PRIMARY definition, and
 that the two are not the same object.
 """
@@ -52,7 +52,7 @@ import functools
 __all__ = ["deprecated_alias", "RENAMES", "RETIREMENT_GATE"]
 
 #: The sweep, as data: pre-sweep spelling → primary spelling.  Every key
-#: is bound as an alias on its defining module AND on the package door;
+#: is bound as an alias on its defining module AND on the public API;
 #: every value is where the definition actually lives.
 #:
 #: DO NOT let a regex sweep rewrite the KEYS of this dict.  They are the

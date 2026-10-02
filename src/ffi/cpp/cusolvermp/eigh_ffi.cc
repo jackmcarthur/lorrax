@@ -41,7 +41,7 @@ namespace lorrax_ffi::cusolvermp {
 namespace ffi = ::xla::ffi;
 
 // Keep the destructive vendor operand in the same XLA scratch allocation as
-// its workspace. Both the execution and query doors use this byte layout.
+// its workspace. Both the execution and query entry points use this byte layout.
 static size_t operand_offset(size_t workspace_bytes) {
     return (workspace_bytes + 255) & ~size_t(255);
 }
@@ -301,7 +301,7 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(
         .Attr<int64_t>("ctx_key")
         .Attr<bool>("compute_evecs"));
 
-// Query-only planning door. No matrix or workspace allocation and no solve.
+// Query-only planning entry point. No matrix or workspace allocation and no solve.
 // ctx_handle==0 selects the device-local cuSOLVER route; otherwise the live
 // cuSOLVERMp grid supplies precisely the descriptors used by EighImpl.
 #include <cusolverDn.h>

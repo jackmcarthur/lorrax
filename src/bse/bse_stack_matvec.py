@@ -274,7 +274,7 @@ def _conv_decode(T_b, psi_c_X, psi_v_Y, W_Rk, kconv, sqrt_nk):
 
     conv: ``U_b = (1/Nk) fft_k(W_R · ifft_k-unnormalised(T_b))``, i.e.
     ``fftn_ortho(ifftn_ortho(T_b) · W_R)``, as ONE in-place call of the
-    k-convolution router's local k-LEADING door ``kconv``
+    k-convolution router's local k-LEADING factory, ``kconv``
     (``make_local_kconv_klead``: nvidia-mathdx mode 2 on CUDA, the pass Σ's τ
     kernel runs; the plan route on cpu).  Both norm factors are one folded
     constant inside it; ``W_Rk`` is ``W_R`` already in R space
@@ -327,7 +327,7 @@ def _decode_v(A, psi_v_Y, sqrt_nk):
 #
 # T[k,t,μ,s,ν] = Σ_c ψ^X_c Σ_v conj(ψ^Y_v) X is a rank-K sum per k with K = min(n_c, n_v), and
 # it is the largest object of the matvec (2.15 GB per rank per trial on CrI3 8x8 at P4) while
-# its encode does ~7 flop per byte of T written.  The router's outer door
+# its encode does ~7 flop per byte of T written.  The router's outer factory
 # (``make_local_kconv_klead_outer``) forms T in shared memory on the convolution's load from
 # its two legs, ``T = Σ_K L[k,t,μ,K] R[k,K,s,ν]``, so T is never written or read: the encode
 # ZGEMM and one of the convolution's two T-sized HBM passes are gone.  The legs contract over
@@ -365,13 +365,13 @@ def _outer_legs_B(Xb_b, psi_c_Y, psi_v_X):
 
 
 def _make_outer_router(mesh_xy, kgrid):
-    """``route(rank) -> conv | None``: the outer door when it serves this mesh and grid, else None.
+    """``route(rank) -> conv | None``: the outer kconv call when it serves this mesh and grid, else None.
 
     Decided at trace time and announced once per (route, K); K is the leg rank the call
     will pass (min(n_c, n_v), doubled for the fused coupling pair).
     """
     from ffi.gate import announce_once
-    doors = {}
+    built = {}
 
     def route(rank):
         why = klead_outer_refusal(mesh_xy, kgrid)
@@ -381,16 +381,16 @@ def _make_outer_router(mesh_xy, kgrid):
                       + f", K = {rank}")
         if why is not None:
             return None
-        if "conv" not in doors:
-            doors["conv"] = make_local_kconv_klead_outer(mesh_xy, kgrid, norm="ortho")
-        return doors["conv"]
+        if "conv" not in built:
+            built["conv"] = make_local_kconv_klead_outer(mesh_xy, kgrid, norm="ortho")
+        return built["conv"]
     return route
 
 
 def _outer_w_term(route, rank, psi_c_X, psi_v_Y, W_R, sqrt_nk, mesh_xy, kgrid):
     """``wterm(L, R, conj_r=False) -> (WX)_b`` on the outer load, or None when the router keeps T.
 
-    With the decode door (``make_local_kconv_klead_outer_decode``; announced once) the load's store
+    With the decode factory (``make_local_kconv_klead_outer_decode``; announced once) the load's store
     contracts U with conj(ψ^X_c) over (t, μ) and U never reaches HBM; ψ^X_c is tiled once here,
     outside the trial scan.  Else the outer conv writes U and ``_decode`` reads it.  Either way
     ``_decode_v`` runs the (s, ν) einsum, so the (t, μ)-first order of ``_decode`` holds.
@@ -413,7 +413,7 @@ def _outer_w_term(route, rank, psi_c_X, psi_v_Y, W_R, sqrt_nk, mesh_xy, kgrid):
 
 
 def _rank_partial(A):
-    """The fused door's ``A`` is this rank's (μ_loc, ν_loc) partial: varying over 'x' and 'y'.
+    """The fused kconv call's ``A`` is this rank's (μ_loc, ν_loc) partial: varying over 'x' and 'y'.
 
     The custom call's result carries only the varying axes jax infers for it (the XLA route
     gets 'x' from the einsum with ψ^X_c), so the missing ones are declared here.
@@ -522,9 +522,9 @@ def build_bse_stack_matvec(
 
     sh = make_bse_shardings(mesh_xy)
     nk = nkx * nky * nkz
-    # The W-term k-convolution: the router's outer-product door when it serves
+    # The W-term k-convolution: the router's outer-product factory when it serves
     # the band rank K = min(n_c, n_v) (decided at trace time, announced once),
-    # else the local k-leading door on an XLA-built T; one call per trial.
+    # else the local k-leading factory on an XLA-built T; one call per trial.
     kconv = make_local_kconv_klead(mesh_xy, (nkx, nky, nkz), norm="ortho")
     outer_route = _make_outer_router(mesh_xy, (nkx, nky, nkz))
 

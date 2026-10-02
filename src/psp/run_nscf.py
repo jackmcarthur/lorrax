@@ -128,7 +128,7 @@ def _load_deterministic_bands(wfn_path, crystal, kgrid, nosym, nspinor,
     calling it k-point 0 is only ever right at nk=1; for nk>1 it is a
     ``ValueError`` on the assignment, because Σ_k ngk[k] always exceeds
     the ``ngkmax`` buffer it was being poured into.  ``WFNReader`` (the
-    ``wfn_loader`` door) carries the per-k offsets, so it is what reads.
+    ``wfn_loader`` public API) carries the per-k offsets, so it is what reads.
 
     Two details of that adoption are load-bearing:
 

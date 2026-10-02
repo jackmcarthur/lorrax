@@ -8,7 +8,7 @@ NVIDIA stack) and `liblorrax_ffi_host.so` (the CUDA-free host leg).
   table lists every core operation with its engine per hardware class, gate
   and code; the [kernel catalog](../../docs/architecture/ffi_layout.md#kernel-catalog)
   maps each family to its sources and target strings.
-- **Python:** `fft.py` (the k-convolution router, the plane door, the
+- **Python:** `fft.py` (the k-convolution router, the plane factory, the
   Fourier-plan call and the host FFT gate), `io.py` (parallel HDF5),
   `gemm.py` (host CBLAS GEMM), `gate.py` (env dials), `common/ffi_loader.py`
   (locate, attest and register the libraries), `cublasmp/` (the fused

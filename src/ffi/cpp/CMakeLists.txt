@@ -1463,7 +1463,7 @@ set_target_properties(lorrax_ffi_host PROPERTIES
     OUTPUT_NAME "lorrax_ffi_host"
     PREFIX "lib"
     BUILD_WITH_INSTALL_RPATH ON
-    # Same relocatable private-provider door as the CUDA leg.  Keep every
+    # Same $ORIGIN-first private-provider RPATH as the CUDA leg.  Keep every
     # existing site path after it for unsealed developer builds.
     INSTALL_RPATH "$ORIGIN;${_host_rpaths}"
 )

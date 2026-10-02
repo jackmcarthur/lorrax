@@ -569,7 +569,7 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(
         .Attr<double>("beta_im")
         .Attr<int64_t>("ctx_key"));
 
-// Query-only N,N planning door; all batches reuse one workspace in the
+// Query-only N,N planning entry point; all batches reuse one workspace in the
 // execution handler. Sizing never reads the supplied device address token.
 extern "C" int lrx_gemm_workspace_bytes(
     int64_t ctx_handle, int64_t m, int64_t n, int64_t k, int complex128,

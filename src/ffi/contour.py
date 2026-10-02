@@ -1,4 +1,4 @@
-"""The contour accumulator's door: ``A[o,q,m,n] += p[o] · c[q,m,n]``.
+"""The contour accumulator's entry point: ``A[o,q,m,n] += p[o] · c[q,m,n]``.
 
 The CUDA handler ``lorrax_contour_accumulate`` (``cpp/response/
 contour_accumulate*``) accumulates one shared contour correlation into many

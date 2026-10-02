@@ -1,13 +1,13 @@
 """``zeta_loader`` — the reader and format-contract owner of ``zeta_q.h5``.
 
-One door for the ISDF ζ tensor a GW run writes once and reads many times
+One public API for the ISDF ζ tensor a GW run writes once and reads many times
 (and for its bispinor siblings ``zeta_q_mu{1,2,3}.h5``): the header
 surface, the collective slab read that feeds V_q, the sanctioned local
 plan, and the never-raising probe.  It owns no
 mathematics — ``zeta_rcond``, the fit and the solver tiers are
 producer-side (``isdf`` / ``gw.isdf_fitting``) and stay there.
 
-THE PACKAGE IS THE DOOR.  Everything a consumer needs is a top-level name
+THE PACKAGE IS THE PUBLIC API.  Everything a consumer needs is a top-level name
 here; importing ``zeta_loader.<submodule>`` from lorrax is a layering
 violation the monorepo's ``tests/test_layering.py`` fails on.
 
@@ -94,7 +94,7 @@ __all__ = [
 
 
 def __getattr__(name: str):
-    """Lazy door for the reader: ``ZetaLoader`` imports jax; the format
+    """Lazy loader for the reader: ``ZetaLoader`` imports jax; the format
     surface does not, and a jax-free stack must be able to use it.
 
     Measured, not hypothetical: the first login-node diagnostic against a

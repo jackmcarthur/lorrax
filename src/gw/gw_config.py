@@ -809,10 +809,10 @@ def eigh_backend_choices() -> tuple:
     except ImportError as exc:
         # NARROW, and only around the two IMPORTS.  This used to be a bare
         # ``except Exception`` wrapped around three failure points AND the
-        # dict subscript, so a KeyError from a door that renamed the op --
+        # dict subscript, so a KeyError from a public API that renamed the op --
         # a CONTRACT break -- was indistinguishable from "this tree has no
         # services/ directory" and was answered with a frozen literal.  The
-        # subscript is outside the guard now: if the door stops publishing
+        # subscript is outside the guard now: if the public API stops publishing
         # an ``eigh`` row, that raises here rather than being papered over.
         EIGH_CHOICES_SOURCE = f"fallback ({type(exc).__name__}: {exc})"
         return ("auto", "off", "distributed", "cusolvermp", "slate",
@@ -901,7 +901,7 @@ def linalg_resolution(params) -> LinalgResolution:
 
 
 def distrib_la_batched_route_choices() -> tuple[str, ...]:
-    """User-facing batch-route vocabulary from the ``distrib_la`` door; see docs/architecture/decisions.md."""
+    """User-facing batch-route vocabulary from the ``distrib_la`` public API; see docs/architecture/decisions.md."""
     try:
         from ffi import _services
         _services.ensure_on_path()
@@ -1475,7 +1475,7 @@ _DEFAULTS = {
     #   local (default; auto is an alias)
     #                per-q pivoted LU inside the q-parallel shard_map.
     #   distributed  2-D-sharded stacked-GEMM backsolve through the
-    #                distrib_la plan door (ScaLAPACK on CPU meshes,
+    #                distrib_la plan entry point (ScaLAPACK on CPU meshes,
     #                cuSOLVERMp on CUDA); no rank ever materialises a
     #                full (μ, μ) tile.  Refuses loudly at resolve time
     #                on an unsupported mesh/build — never silently

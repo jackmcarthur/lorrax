@@ -1,6 +1,6 @@
 # distrib_la — distributed dense linear algebra over a JAX device mesh
 
-`services/distrib_la/` is the one door for `eigh`, `cholesky`, `solve_lu`,
+`services/distrib_la/` is the one entry point for `eigh`, `cholesky`, `solve_lu`,
 `matmul` and the polar factor on an `('x','y')` device mesh. A caller says
 what to compute and where; which library runs is a resolved fact it can read
 but never branches on. The package is independently installable
@@ -526,7 +526,7 @@ All three are allocation-free and accept float64 or complex128 only.
   compiled local GEMM temporary. Pass a budget every rank agrees on (a deck
   value, never a per-rank measurement): the answer selects collectives.
 
-The native doors are `lrx_eigh_workspace_bytes` and
+The native entry points are `lrx_eigh_workspace_bytes` and
 `lrx_gemm_workspace_bytes`. Operand and output carriers, transpose staging,
 communication buffers and persistent context resources are the caller's to
 admit.

@@ -676,7 +676,7 @@ def fit_zeta_to_h5(
             "fit_zeta_to_h5.")
     # The per-q WFN.h5-style sphere {G : |q+G|² ≤ zeta_cutoff}; ``zeta_cutoff_ry``
     # (≥ the bare-Coulomb cutoff, checked in gw_init.fit_zeta) defines it on disk.
-    # The Cartesian reciprocal rows come off the vcoul door's geometry.
+    # The Cartesian reciprocal rows come off the vcoul public API's geometry.
     from common.coulomb_sphere import compute_per_q_bare_coulomb_components
     from vcoul import CoulombGeometry
     _sphere_pkg = compute_per_q_bare_coulomb_components(
