@@ -392,14 +392,16 @@ def sector_tau_factory(left, right, keys, meta, mesh_xy):
     """Bind Gamma_A G_AB(t) Gamma_B to the window executor: the class's :func:`sector_node`
     reading W(t)'s particle and hole branches.  The caller places the left operands
     band-complete once per Σ call (``ppm_tau_kernel.sigma_subtile_operands``); the right
-    ones are placed here."""
+    ones are placed here.  The window runs two τ nodes per loop trip, as the scalar
+    model's, when the paired window fits (``gw.mpa.sigma.SynthesisTau.fits``, at the
+    first compile): one node's W(τ) synthesis and exchange beside the other's kconv."""
     def factory(synthesis, band_axis):
         w_tables = tuple(synthesis.w_tables)
         node = sector_node(left, right, keys, meta, mesh_xy, w_tables, band_axis)
         right_g, right_p = sector_right_operands(right, band_axis, mesh_xy)
         return SynthesisTau(node.spatial, synthesis, right_g, right_p, synthesis.native,
                             f'sigma.sector.tau.{keys[0]}', meta, node.key, (*node.plans, *w_tables),
-                            door=node.loads)
+                            door=node.loads, overlap=True)
     return factory
 
 
