@@ -1873,6 +1873,26 @@ def sample_q_width(face_bytes, nq):
     return None if width >= int(nq) else width
 
 
+def _widest(mesh, held):
+    """``[(span, panels)]`` of one line sample with every family's panels (and cross
+    panels) zero-padded to the sample's widest span: the store holds one width."""
+    widths = {(key, f): max(p[key][f].shape[-1] for _, p in held)
+              for key in ("panels", "cross") for f in held[0][1].get(key, {})}
+    for span, panels in held:
+        out = dict(panels, **{key: dict(panels[key]) for key in ("panels", "cross") if key in panels})
+        for (key, f), width in widths.items():
+            if out[key][f].shape[-1] < width:
+                out[key][f] = _pad_columns(mesh, out[key][f].ndim, width)(out[key][f])
+        yield span, out
+
+
+@lru_cache(maxsize=None)
+def _pad_columns(mesh, ndim, width):
+    spec = NamedSharding(mesh, P(*((None,) * (ndim - 2)), "x", "y"))
+    return jax.jit(lambda a: jnp.pad(a, [(0, 0)] * (ndim - 1) + [(0, width - a.shape[-1])]),
+                   out_shardings=spec)
+
+
 class _RowWindow:
     """``raw[i, rows]`` of a q-span read: absolute response rows mapped to the span's own."""
 
@@ -2463,6 +2483,9 @@ def produce_sample_bank(wfns, meta, config, *, mesh_xy, sym, sample_plan, bank_i
                     solved = lambda: sum(receipt["seconds"].get(k + "_dispatch", 0.)
                                          for k in ("sample_dyson", "sample_slope"))
                     started_selection = time.monotonic() - solved()
+                    # A span's panels are as wide as its own widest parent; they are
+                    # held (narrow, [q, F, rows, r]) and written at the sample's widest.
+                    span_panels = []
                     for span in line_spans():
                         sel = line_selections.get(span[1] - span[0], selection)
                         rows = raw if line_width is None else _RowWindow(take(row), span[0])
@@ -2476,17 +2499,16 @@ def produce_sample_bank(wfns, meta, config, *, mesh_xy, sym, sample_plan, bank_i
                                 sel.mirror(sample, lines, value, slope)
                             del value, slope
                         with timing.section('bank.line_panels'):
-                            panels = sel.panels(sample, lines)
+                            span_panels.append((span, sel.panels(sample, lines)))
                         del lines, rows
-                        io_started = time.monotonic()
-                        with timing.section('bank.line_write'):
-                            write(q_span=span, line=panels)
-                        del panels
-                        spent = time.monotonic() - io_started
-                        receipt["seconds"]["io"] = receipt["seconds"].get("io", 0.) + spent
-                        started_selection += spent
                     receipt["seconds"]["line_selection"] = (receipt["seconds"].get("line_selection", 0.)
                         + time.monotonic() - solved() - started_selection)
+                    io_started = time.monotonic()
+                    with timing.section('bank.line_write'):
+                        for span, panels in _widest(mesh_xy, span_panels):
+                            write(q_span=span, line=panels)
+                    del span_panels, panels
+                    receipt["seconds"]["io"] = receipt["seconds"].get("io", 0.) + time.monotonic() - io_started
                     ledger.live_stages = live
                 else:
                     for q0, q1, need_value, need_slope in dense_spans(sample):
