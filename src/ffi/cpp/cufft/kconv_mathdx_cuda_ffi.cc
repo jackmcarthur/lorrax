@@ -132,6 +132,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <map>
+#include <optional>
 #include <mutex>
 #include <sstream>
 #include <string>
@@ -1079,7 +1080,9 @@ struct M7Mid {                                 // the kernel V[k, x, y] of a pai
 // order as the single arm: bitwise.
 #define M7_ARGS const lrx_c2* __restrict__ gp, const lrx_c2* __restrict__ gt, \
     const lrx_c2* __restrict__ kern, lrx_c2* __restrict__ y, UnfoldTab t, double scale, \
-    lrx_c2* yb, long long pb0, long long npairs, int phase
+    lrx_c2* yb, long long pb0, long long npairs, int phase, const int* __restrict__ live
+// live: the window rows [live[0], live[1]) of a padded pass (kbox_stage.cuh Live; null: all).
+#define M7_LIVE(zero) lrx_kbox::Live::rows(live, (t.nl / NR) * SSO, pb0 * SSO, zero)
 #if LRX_ARM >= 1
 extern "C" __global__ void __launch_bounds__(LRX_THREADS) lrx_kconv(M7_ARGS) {
     extern __shared__ lrx_c2 sm[];
@@ -1089,9 +1092,10 @@ extern "C" __global__ void __launch_bounds__(LRX_THREADS) lrx_kconv(M7_ARGS) {
     const M7Load ld{gp, gt, &t, my, xb.rows * my, pb0};
 #if LRX_ARM == 2
     lrx_kbox::plane_pass<NX, NY, NZ, LRX_SM, cufftdx::fft_direction::inverse, TRC, true>(
-        sm, nc, ld, lrx_kbox::PlainK<lrx_c2>{yb, (long long)KG::NK});
+        sm, nc, ld, lrx_kbox::PlainK<lrx_c2>{yb, (long long)KG::NK}, M7_LIVE(false));
 #else
-    lrx_kbox::plane_pass<NX, NY, NZ, LRX_SM, cufftdx::fft_direction::inverse, TRC>(sm, nc, ld, lrx_kbox::Plain<lrx_c2>{yb, nc});
+    lrx_kbox::plane_pass<NX, NY, NZ, LRX_SM, cufftdx::fft_direction::inverse, TRC>(
+        sm, nc, ld, lrx_kbox::Plain<lrx_c2>{yb, nc}, M7_LIVE(false));
 #endif
 }
 #if LRX_ARM == 2
@@ -1101,7 +1105,7 @@ extern "C" __global__ void __launch_bounds__(LRX_THREADS2) lrx_kconv_col(M7_ARGS
     const XBlock xb = lrx_x_block(t);
     const long long my = t.nl / NR;
     lrx_kbox::column_pass<NX, NY, NZ, LRX_SM>(sm, yb, npairs * SSO, M7Mid{kern, xb, my, pb0},
-                                              M7Store{y, &t, xb.rows, my, scale, pb0 * SSO});
+                                              M7Store{y, &t, xb.rows, my, scale, pb0 * SSO}, M7_LIVE(true));
 }
 #else
 struct M7Id {
@@ -1111,7 +1115,7 @@ extern "C" __global__ void __launch_bounds__(LRX_THREADS2) lrx_kconv_mid(M7_ARGS
     (void)gp; (void)gt; (void)y; (void)scale; (void)phase;
     const XBlock xb = lrx_x_block(t);
     lrx_kbox::pencil_pass<NX, NY, NZ, LRX_SM, false, cufftdx::fft_direction::inverse>(
-        yb, npairs * SSO, M7Mid{kern, xb, t.nl / NR, pb0});
+        yb, npairs * SSO, M7Mid{kern, xb, t.nl / NR, pb0}, M7_LIVE(false));
 }
 extern "C" __global__ void __launch_bounds__(LRX_THREADS3) lrx_kconv_pass(M7_ARGS) {
     extern __shared__ lrx_c2 sm[];
@@ -1121,10 +1125,10 @@ extern "C" __global__ void __launch_bounds__(LRX_THREADS3) lrx_kconv_pass(M7_ARG
     const long long my = t.nl / NR, nc = npairs * SSO;
     const lrx_kbox::Plain<lrx_c2> yy{yb, nc};
     if (phase == 2)
-        lrx_kbox::plane_pass<NX, NY, NZ, LRX_SM, fft_direction::forward, TRC>(sm, nc, yy, yy);
+        lrx_kbox::plane_pass<NX, NY, NZ, LRX_SM, fft_direction::forward, TRC>(sm, nc, yy, yy, M7_LIVE(false));
     else
         lrx_kbox::pencil_pass<NX, NY, NZ, LRX_SM, false, fft_direction::forward>(
-            yb, nc, M7Id{}, M7Store{y, &t, xb.rows, my, scale, pb0 * SSO});
+            yb, nc, M7Id{}, M7Store{y, &t, xb.rows, my, scale, pb0 * SSO}, M7_LIVE(true));
 }
 #endif
 #else
@@ -1135,21 +1139,23 @@ extern "C" __global__ void __launch_bounds__(LRX_THREADS, LRX_MINB) lrx_kconv(M7
     const XBlock xb = lrx_x_block(t);
     const long long my = t.nl / NR, pairs = xb.rows * my, ncols = pairs * SSO;
     const M7Store st{y, &t, xb.rows, my, scale, 0};
+    const lrx_kbox::Live lv = M7_LIVE(true);           // the live columns [cb, ce), whole pairs
+    const long long cb = lv.b(), ce = lv.e(ncols);
 #if LRX_TT
     const TileTabs s{reinterpret_cast<char*>(sm + TRC * KG::RS)};
-    const long long stride = (long long)gridDim.x * TP;
-    auto npr_of = [&](long long q) { return (int)min((long long)TP, pairs - q); };
-    long long p0 = (long long)blockIdx.x * TP;
+    const long long stride = (long long)gridDim.x * TP, pe = ce / SS;
+    auto npr_of = [&](long long q) { return (int)min((long long)TP, pe - q); };
+    long long p0 = cb / SS + (long long)blockIdx.x * TP;
     tt_fixed(t, s);
-    if (p0 < pairs) tt_tile(t, s, 0, p0, npr_of(p0), my, kern, xb.mx);
+    if (p0 < pe) tt_tile(t, s, 0, p0, npr_of(p0), my, kern, xb.mx);
     lrx_async::commit();
-    for (int b = 0; p0 < pairs; p0 += stride, b ^= 1) {
+    for (int b = 0; p0 < pe; p0 += stride, b ^= 1) {
         lrx_async::wait_all();
         __syncthreads();                               // tables b in; the previous tile's bank reads done
         const int npr = npr_of(p0);
         tt_gather(gp, gt, gp, gt, t, s, b, npr, sm);
         lrx_async::commit();
-        if (p0 + stride < pairs) tt_tile(t, s, b ^ 1, p0 + stride, npr_of(p0 + stride), my, kern, xb.mx);
+        if (p0 + stride < pe) tt_tile(t, s, b ^ 1, p0 + stride, npr_of(p0 + stride), my, kern, xb.mx);
         lrx_async::commit();
         lrx_async::wait_prior<1>();                     // this tile's cells (not the next tables)
         __syncthreads();
@@ -1162,19 +1168,20 @@ extern "C" __global__ void __launch_bounds__(LRX_THREADS, LRX_MINB) lrx_kconv(M7
         }
         __syncthreads();
         lrx_kbox::transform3<NX, NY, NZ, TRC, LRX_SM, fft_direction::forward>(sm);
-        lrx_kbox::store_tile<NX, NY, NZ, TRC>(sm, p0 * SS, ncols, st);   // the loop top syncs
+        lrx_kbox::store_tile<NX, NY, NZ, TRC>(sm, p0 * SS, ce, st);   // the loop top syncs
     }
 #else
     const M7Load ld{gp, gt, &t, my, pairs, 0};
     const M7Mid mid{kern, xb, my, 0};
-    for (long long col0 = (long long)blockIdx.x * TRC; col0 < ncols; col0 += (long long)gridDim.x * TRC) {
-        lrx_kbox::stage_tile<NX, NY, NZ, TRC>(sm, col0, ncols, ld);
+    for (long long col0 = cb + (long long)blockIdx.x * TRC; col0 < ce; col0 += (long long)gridDim.x * TRC) {
+        lrx_kbox::stage_tile<NX, NY, NZ, TRC>(sm, col0, ce, ld);
         lrx_kbox::transform3<NX, NY, NZ, TRC, LRX_SM, fft_direction::inverse>(sm);
-        lrx_kbox::mid_group_tile<NX, NY, NZ, TRC, SSO>(sm, col0, ncols, mid);
+        lrx_kbox::mid_group_tile<NX, NY, NZ, TRC, SSO>(sm, col0, ce, mid);
         lrx_kbox::transform3<NX, NY, NZ, TRC, LRX_SM, fft_direction::forward>(sm);
-        lrx_kbox::store_tile<NX, NY, NZ, TRC>(sm, col0, ncols, st);
+        lrx_kbox::store_tile<NX, NY, NZ, TRC>(sm, col0, ce, st);
     }
 #endif
+    lrx_kbox::zero_dead<KG::NK, lrx_c2>(ncols, lv, st);
 }
 #endif
 #elif LRX_MODE == 8
@@ -1209,6 +1216,7 @@ struct LorArgs {
     const lrx_c2 *wp, *wt;                     // LRX_WA: the interaction's parent tile and partner
     lrx_c2* yw;                                // LRX_WA split arm: the (NK, npairs * WS) W_R chunk
     double sw;                                 // LRX_WA: the interaction's inverse-transform scale
+    const int* live;                           // the window rows [live[0], live[1]) of a padded pass; null: all
 };
 
 // LRX_WA > 0: the interaction is read from its irreducible-q parent tile (nA = LRX_WA, nB = LRX_WB
@@ -1382,10 +1390,12 @@ extern "C" __global__ void __launch_bounds__(LRX_THREADS) lrx_kconv(LorArgs a, U
     const long long nw = a.npairs * WS;
     const LorWLoad wld{&a, &tw};
 #endif
-    for (long long c0 = (long long)blockIdx.x * TRC; c0 < ncols; c0 += (long long)gridDim.x * TRC) {
-        lrx_kbox::stage_tile<NX, NY, NZ, TRC>(sm, c0, ncols, ld);
+    const lrx_kbox::Live lv = lrx_kbox::Live::rows(a.live, a.my * SS, a.p0 * SS, true);
+    const long long ce = lv.e(ncols);
+    for (long long c0 = lv.b() + (long long)blockIdx.x * TRC; c0 < ce; c0 += (long long)gridDim.x * TRC) {
+        lrx_kbox::stage_tile<NX, NY, NZ, TRC>(sm, c0, ce, ld);
 #if LRX_WA > 0
-        lrx_kbox::stage_tile<NX, NY, NZ, TRW>(smw, (c0 / SS) * WS, nw, wld);
+        lrx_kbox::stage_tile<NX, NY, NZ, TRW>(smw, (c0 / SS) * WS, (ce / SS) * WS, wld);
         lrx_kbox::transform3<NX, NY, NZ, TRC + TRW, LRX_SM, fft_direction::inverse>(sm);
         const LorGroupMid mid{a.kern, a.p0, a.mx, a.my, v, smw, c0 / SS, a.sw};
 #else
@@ -1394,10 +1404,11 @@ extern "C" __global__ void __launch_bounds__(LRX_THREADS) lrx_kconv(LorArgs a, U
 #endif
         // k fastest across threads: consecutive threads read one group's column at consecutive k,
         // distinct banks (pairs fastest put a phase's 8 threads 16 padded columns apart, one bank).
-        lrx_kbox::mid_group_tile<NX, NY, NZ, TRC, SS, true, true>(sm, c0, ncols, mid);
+        lrx_kbox::mid_group_tile<NX, NY, NZ, TRC, SS, true, true>(sm, c0, ce, mid);
         lrx_kbox::transform3<NX, NY, NZ, TRC, LRX_SM, fft_direction::forward>(sm);
-        lrx_kbox::store_tile<NX, NY, NZ, TRC>(sm, c0, ncols, st);
+        lrx_kbox::store_tile<NX, NY, NZ, TRC>(sm, c0, ce, st);
     }
+    lrx_kbox::zero_dead<lrx_kbox::Geo<NX, NY, NZ>::NK, lrx_c2>(ncols, lv, st);
 }
 #else
 // Split arm, phase 1 (the vertex pencil, kbox_stage.cuh pencil_group_warp_pass with a pair's SS
@@ -1470,25 +1481,28 @@ extern "C" __global__ void __launch_bounds__(LRX_THREADS) lrx_kconv(LorArgs a, U
     // with mode 9's scale in place.  Same lines, same axis order: mode 9's single arm bit for bit.
     if (phase == 4 || phase == 5) {
         const long long nw = a.npairs * WS;
+        const lrx_kbox::Live lw = lrx_kbox::Live::rows(a.live, a.my * WS, a.p0 * WS, false);
         if (phase == 4)
             lrx_kbox::plane_pass<NX, NY, NZ, LRX_SM, fft_direction::inverse, LRX_TRW>(
-                sm, nw, LorWLoad{&a, &tw}, lrx_kbox::Plain<lrx_c2>{a.yw, nw});
+                sm, nw, LorWLoad{&a, &tw}, lrx_kbox::Plain<lrx_c2>{a.yw, nw}, lw);
         else
-            lrx_kbox::pencil_pass<NX, NY, NZ, LRX_SM, false, fft_direction::inverse>(a.yw, nw, LorWScale{a.sw});
+            lrx_kbox::pencil_pass<NX, NY, NZ, LRX_SM, false, fft_direction::inverse>(a.yw, nw, LorWScale{a.sw}, lw);
         return;
     }
 #endif
+    const lrx_kbox::Live lv = lrx_kbox::Live::rows(a.live, a.my * SS, a.p0 * SS, phase == 3);
     if (phase == 0) {
-        lrx_kbox::plane_pass<NX, NY, NZ, LRX_SM, fft_direction::inverse, TRC>(sm, ncols, LorLoad{&a, &t}, yy);
+        lrx_kbox::plane_pass<NX, NY, NZ, LRX_SM, fft_direction::inverse, TRC>(sm, ncols, LorLoad{&a, &t}, yy, lv);
     } else if (phase == 1) {
         const LorWarpMid mid{a.y, a.kern, a.yw, ncols, a.npairs, a.p0, a.mx, a.my, v,
                              lor_member(v, (int)(threadIdx.x % SS))};
-        lrx_kbox::pencil_group_warp_pass<NX, NY, NZ, LRX_SM, SS, LRX_THREADS>(a.y, ncols, a.npairs, mid);
+        lrx_kbox::pencil_group_warp_pass<NX, NY, NZ, LRX_SM, SS, LRX_THREADS>(
+            a.y, ncols, a.npairs, mid, lrx_kbox::Live::rows(a.live, a.my, a.p0, false));
     } else if (phase == 2) {
-        lrx_kbox::plane_pass<NX, NY, NZ, LRX_SM, fft_direction::forward, TRC>(sm, ncols, LorYLoad{a.y, ncols}, yy);
+        lrx_kbox::plane_pass<NX, NY, NZ, LRX_SM, fft_direction::forward, TRC>(sm, ncols, LorYLoad{a.y, ncols}, yy, lv);
     } else {
         lrx_kbox::pencil_pass<NX, NY, NZ, LRX_SM, false, fft_direction::forward>(
-            a.y, ncols, LorFinal{v.s_f, v.mult}, LorStore(a, t));
+            a.y, ncols, LorFinal{v.s_f, v.mult}, LorStore(a, t), lv);
     }
 }
 #endif
@@ -1533,9 +1547,11 @@ struct WedgeScale {                            // the split arm's last axis: the
     __device__ lrx_c2 operator()(int, long long, lrx_c2 v) const { return {v.x * scale, v.y * scale}; }
 };
 
+// live: the window rows [live[0], live[1]) of a padded pass (null: all); a row is my * SS tile
+// columns, and as many of Y's own columns (the split arm's pencil).
 extern "C" __global__ void __launch_bounds__(LRX_THREADS) lrx_kconv(
     const lrx_c2* __restrict__ gp, const lrx_c2* __restrict__ gt, lrx_c2* __restrict__ y,
-    UnfoldTab t, double scale, int phase) {
+    UnfoldTab t, double scale, int phase, const int* __restrict__ live) {
     extern __shared__ lrx_c2 sm[];
     using namespace cufftdx;
     const long long my = t.nl / NR, ncols = (t.ml / NS) * my * SS;
@@ -1543,16 +1559,21 @@ extern "C" __global__ void __launch_bounds__(LRX_THREADS) lrx_kconv(
 #if LRX_ARM == 0
     (void)phase;
     const WedgeStore st{y, &t, my, scale};
-    for (long long c0 = (long long)blockIdx.x * TRC; c0 < ncols; c0 += (long long)gridDim.x * TRC) {
-        lrx_kbox::stage_tile<NX, NY, NZ, TRC>(sm, c0, ncols, ld);
+    const lrx_kbox::Live lv = lrx_kbox::Live::rows(live, my * SS, 0, true);
+    const long long ce = lv.e(ncols);
+    for (long long c0 = lv.b() + (long long)blockIdx.x * TRC; c0 < ce; c0 += (long long)gridDim.x * TRC) {
+        lrx_kbox::stage_tile<NX, NY, NZ, TRC>(sm, c0, ce, ld);
         lrx_kbox::transform3<NX, NY, NZ, TRC, LRX_SM, fft_direction::inverse>(sm);
-        lrx_kbox::store_tile<NX, NY, NZ, TRC>(sm, c0, ncols, st);
+        lrx_kbox::store_tile<NX, NY, NZ, TRC>(sm, c0, ce, st);
     }
+    lrx_kbox::zero_dead<lrx_kbox::Geo<NX, NY, NZ>::NK, lrx_c2>(ncols, lv, st);
 #else
     if (phase == 0)
-        lrx_kbox::plane_pass<NX, NY, NZ, LRX_SM, fft_direction::inverse, TRC>(sm, ncols, ld, WedgeStore{y, &t, my, 1.0});
+        lrx_kbox::plane_pass<NX, NY, NZ, LRX_SM, fft_direction::inverse, TRC>(
+            sm, ncols, ld, WedgeStore{y, &t, my, 1.0}, lrx_kbox::Live::rows(live, my * SS, 0, false));
     else
-        lrx_kbox::pencil_pass<NX, NY, NZ, LRX_SM, false, fft_direction::inverse>(y, ncols, WedgeScale{scale});
+        lrx_kbox::pencil_pass<NX, NY, NZ, LRX_SM, false, fft_direction::inverse>(
+            y, ncols, WedgeScale{scale}, lrx_kbox::Live::rows(live, my * SS, 0, true));
 #endif
 }
 #else
@@ -1585,6 +1606,7 @@ struct ChiArgs {
     unsigned long long vperm_l, vphase_l, vperm_r, vphase_r;
     int vna, vnb, vch0;
     const double* sgn_c;                       // LRX_VTX: (nk) real +-1 on the Gc operand's load; null: none
+    const int* live;                           // the window rows [live[0], live[1]) of a padded pass; null: all
 };
 
 struct ChiLoad {
@@ -1784,6 +1806,9 @@ extern "C" __global__ void __launch_bounds__(LRX_THREADS, LRX_MINB) lrx_kconv(Ch
     using namespace cufftdx;
     const long long ncols = a.npairs * GRP;
     const ChiLoad ld{&a, &t};
+    // The live columns [cb, ce) (whole pairs); dead pairs add nothing to the accumulator.
+    const lrx_kbox::Live lv = lrx_kbox::Live::rows(a.live, a.my * GRP, a.p0 * GRP, false);
+    const long long cb = lv.b(), ce = lv.e(ncols);
 #if LRX_ARM == 0 && LRX_TT
     (void)phase;
     (void)ld;
@@ -1793,42 +1818,43 @@ extern "C" __global__ void __launch_bounds__(LRX_THREADS, LRX_MINB) lrx_kconv(Ch
     static_assert(TRC == TT_ROWS, "the host passes the tile's pairs and columns together");
     const TileTabs s{reinterpret_cast<char*>(sm + TRC * lrx_kbox::Geo<NX, NY, NZ>::RS)};
     const long long stride = (long long)gridDim.x * TRC;
-    auto npr_of = [&](long long c0) { return (int)min((long long)TP, a.npairs - c0 / GRP); };
-    long long col0 = (long long)blockIdx.x * TRC;
+    auto npr_of = [&](long long c0) { return (int)min((long long)TP, (ce - c0) / GRP); };
+    long long col0 = cb + (long long)blockIdx.x * TRC;
     tt_fixed(t, s);
-    if (col0 < ncols) tt_tile(t, s, 0, a.p0 + col0 / GRP, npr_of(col0), a.my, nullptr, 0);
+    if (col0 < ce) tt_tile(t, s, 0, a.p0 + col0 / GRP, npr_of(col0), a.my, nullptr, 0);
     lrx_async::commit();
-    for (int b = 0; col0 < ncols; col0 += stride, b ^= 1) {
+    for (int b = 0; col0 < ce; col0 += stride, b ^= 1) {
         lrx_async::wait_all();
         __syncthreads();                               // tables b in; the previous tile's bank reads done
         const int npr = npr_of(col0);
         tt_gather(a.gv, a.gvt, a.gc, a.gct, t, s, b, npr, sm);
         lrx_async::commit();
-        if (col0 + stride < ncols)
+        if (col0 + stride < ce)
             tt_tile(t, s, b ^ 1, a.p0 + (col0 + stride) / GRP, npr_of(col0 + stride), a.my, nullptr, 0);
         lrx_async::commit();
         lrx_async::wait_prior<1>();                     // this tile's cells (not the next tables)
         __syncthreads();
         tt_finish(s, b, npr, sm);
         lrx_kbox::transform3<NX, NY, NZ, TRC, LRX_SM, fft_direction::inverse>(sm);
-        lrx_kbox::mid_group_tile<NX, NY, NZ, TRC, GRP, false>(sm, col0, ncols, mid);   // the loop top syncs
+        lrx_kbox::mid_group_tile<NX, NY, NZ, TRC, GRP, false>(sm, col0, ce, mid);   // the loop top syncs
     }
 #elif LRX_ARM == 0
     (void)phase;
     const ChiMid mid{&a};
-    for (long long col0 = (long long)blockIdx.x * TRC; col0 < ncols; col0 += (long long)gridDim.x * TRC) {
-        lrx_kbox::stage_tile<NX, NY, NZ, TRC>(sm, col0, ncols, ld);
+    for (long long col0 = cb + (long long)blockIdx.x * TRC; col0 < ce; col0 += (long long)gridDim.x * TRC) {
+        lrx_kbox::stage_tile<NX, NY, NZ, TRC>(sm, col0, ce, ld);
         lrx_kbox::transform3<NX, NY, NZ, TRC, LRX_SM, fft_direction::inverse>(sm);
-        lrx_kbox::mid_group_tile<NX, NY, NZ, TRC, GRP>(sm, col0, ncols, mid);
+        lrx_kbox::mid_group_tile<NX, NY, NZ, TRC, GRP>(sm, col0, ce, mid);
     }
 #else
     if (phase == 0) {
         lrx_kbox::plane_pass<NX, NY, NZ, LRX_SM, fft_direction::inverse, TRC>(
-            sm, ncols, ld, lrx_kbox::Plain<lrx_c2>{a.y, ncols});
+            sm, ncols, ld, lrx_kbox::Plain<lrx_c2>{a.y, ncols}, lv);
     } else {
         const int ch = a.vch0 + (int)(threadIdx.x % GRP), nch = a.vna * a.vnb;
         lrx_kbox::pencil_group_warp_pass<NX, NY, NZ, LRX_SM, GRP, LRX_THREADS>(
-            a.y, ncols, a.npairs, ChiWarpMid{&a, ch, ch < nch ? ch : nch - 1});
+            a.y, ncols, a.npairs, ChiWarpMid{&a, ch, ch < nch ? ch : nch - 1},
+            lrx_kbox::Live::rows(a.live, a.my, a.p0, false));
     }
 #endif
 }
@@ -2048,6 +2074,7 @@ static std::string split_tile_refusal(int mode, int nkx, int nky, int nkz, int n
 // ctx, mode, nkx, nky, nkz, ns, nsr, f32, variant (mode 11: the static completion; mode 7: its output spin
 // block; mode 8: wa*8 + wb, the interaction's Lorentz widths when it is read from its parents, 0 = V_R)
 using Key = std::tuple<CUcontext, int, int, int, int, int, int, int, int>;
+constexpr int kLiveBit = 1 << 16;                  // build(variant | kLiveBit): the door's live program
 static std::mutex g_mu;
 static std::map<Key, Built> g_cache;
 static std::map<Key, std::string> g_fail;
@@ -2107,6 +2134,10 @@ static ffi::Error build(int mode, int nkx, int nky, int nkz, int ns, bool f32,
         if (cr != CUDA_SUCCESS || ctx == nullptr) return fail("cuCtxGetCurrent", cu_err(cr));
     }
     const Key key{ctx, mode, nkx, nky, nkz, ns, nsr, f32 ? 1 : 0, variant};
+    // kLiveBit: a padded pass's program (the door's live operand present), built apart so the plain
+    // program keeps no live bounds in registers (kbox_stage.cuh Live, LRX_LIVE).
+    const int live_prog = (variant & kLiveBit) ? 1 : 0;
+    variant &= ~kLiveBit;
     std::lock_guard<std::mutex> lock(g_mu);
     if (auto it = g_cache.find(key); it != g_cache.end()) { *out = &it->second; return ffi::Error::Success(); }
     if (auto it = g_fail.find(key); it != g_fail.end()) return fail("kernel build (cached failure)", it->second);
@@ -2430,6 +2461,7 @@ static ffi::Error build(int mode, int nkx, int nky, int nkz, int ns, bool f32,
         "-DLRX_RB=" + std::to_string(mode == 10 ? plane_minb : rb),
         "-DLRX_F32=" + std::string(f32 ? "1" : "0"),
         "-DLRX_SM=" + std::to_string(cc_major * 100 + cc_minor * 10)};
+    if (mode == 7 || mode == 8 || mode == 9 || mode == 11) defs.push_back("-DLRX_LIVE=" + std::to_string(live_prog));
     // Mode 10: planes per block; a block that has its SM alone runs 512 threads (A100 80^2:
     // 3.26 -> 2.60 ms; kept 2026-09-25, FP: the 80^2 production planes).
     const int plane_threads = mode == 10 && plane_minb == 1 ? 512 : kThreads;
@@ -2859,10 +2891,12 @@ static ffi::Error KleadUnfoldImpl(
     const ffi::AnyBuffer* kout, ffi::AnyBuffer V, ffi::Result<ffi::AnyBuffer> U, int64_t nkx,
     int64_t nky, int64_t nkz, double scale, std::string_view mathdx_root, std::string_view cubin_dir,
     int64_t conj_src = 0, int64_t spin_block = 0, int64_t a0 = 0, int64_t b0 = 0, int64_t x0 = 0,
-    int64_t bx = 0, int64_t xs = 0, int64_t xn = 0) {
+    int64_t bx = 0, int64_t xs = 0, int64_t xn = 0, const ffi::AnyBuffer* live = nullptr) {
     auto bad = [](const std::string& why) {
         return fail("klead unfold conv", why, ffi::ErrorCode::kInvalidArgument);
     };
+    if (live && (live->element_type() != ffi::DataType::S32 || live->element_count() != 2))
+        return bad("want live s32 [2]: the window rows [lo, hi) of a padded pass");
     if (nkx < 1 || nky < 1 || nkz < 1 || nkx > kAxisMax || nky > kAxisMax || nkz > kAxisMax) {
         std::ostringstream os;
         os << "GATE mathdx-kconv-axis: got k-grid (" << nkx << "," << nky << "," << nkz
@@ -2904,7 +2938,7 @@ static ffi::Error KleadUnfoldImpl(
     const Built* k = nullptr;
     ffi::Error e = build(7, static_cast<int>(nkx), static_cast<int>(nky), static_cast<int>(nkz),
                          static_cast<int>(ns), false, mathdx_root, cubin_dir, &k, 0,
-                         d == ns ? 0 : static_cast<int>(d));
+                         (d == ns ? 0 : static_cast<int>(d)) | (live ? kLiveBit : 0));
     if (!e.success()) return e;
     UnfoldTab t{static_cast<const int*>(row.untyped_data()), static_cast<const int*>(trs.untyped_data()),
                 static_cast<const int*>(lsrc.untyped_data()), static_cast<const int*>(rsrc.untyped_data()),
@@ -2921,8 +2955,9 @@ static ffi::Error KleadUnfoldImpl(
     void* yb = nullptr;
     long long p0 = 0, npairs = pairs;
     int phase = 0;
+    const void* livep = live ? live->untyped_data() : nullptr;
     void* args[] = {(void*)&gpp, (void*)&gtp, (void*)&vp, (void*)&up, (void*)&t, (void*)&sc,
-                    (void*)&yb, (void*)&p0, (void*)&npairs, (void*)&phase};
+                    (void*)&yb, (void*)&p0, (void*)&npairs, (void*)&phase, (void*)&livep};
     const long long ncols = pairs * d * d;
     auto launch = [&](long long blocks, int threads, int smem, CUfunction fn) -> ffi::Error {
         if (blocks > 2147483647LL) return bad("grid.x overflow");
@@ -2989,15 +3024,18 @@ static ffi::Error KleadUnfoldBlockConv(
     return KleadUnfoldImpl(stream, scratch, Gp, Gt, row, trs, lsrc, rsrc, mph, nph, spin, &kout, V, U, nkx, nky,
                            nkz, scale, mathdx_root, cubin_dir, conj_src, spin_block, a0, b0);
 }
-// `_xblock`: the conj-on-load partner and the stored x block (whole spin group).
+// `_xblock`: the conj-on-load partner and the stored x block (whole spin group); live, when
+// given (a pass padded to a scan's largest pass): its live window rows [lo, hi), the rest no
+// gather or transform and stored as zeros.
 static ffi::Error KleadUnfoldXBlockConv(
     cudaStream_t stream, ffi::ScratchAllocator scratch, ffi::AnyBuffer Gp, ffi::AnyBuffer Gt, ffi::AnyBuffer row, ffi::AnyBuffer trs,
     ffi::AnyBuffer lsrc, ffi::AnyBuffer rsrc, ffi::AnyBuffer mph, ffi::AnyBuffer nph, ffi::AnyBuffer spin,
-    ffi::AnyBuffer kout, ffi::AnyBuffer V, ffi::Result<ffi::AnyBuffer> U, int64_t nkx, int64_t nky,
-    int64_t nkz, double scale, int64_t conj_src, int64_t x0, int64_t bx, int64_t xs, int64_t xn,
-    std::string_view mathdx_root, std::string_view cubin_dir) {
+    ffi::AnyBuffer kout, ffi::AnyBuffer V, std::optional<ffi::AnyBuffer> live, ffi::Result<ffi::AnyBuffer> U,
+    int64_t nkx, int64_t nky, int64_t nkz, double scale, int64_t conj_src, int64_t x0, int64_t bx, int64_t xs,
+    int64_t xn, std::string_view mathdx_root, std::string_view cubin_dir) {
     return KleadUnfoldImpl(stream, scratch, Gp, Gt, row, trs, lsrc, rsrc, mph, nph, spin, &kout, V, U, nkx, nky,
-                           nkz, scale, mathdx_root, cubin_dir, conj_src, 0, 0, 0, x0, bx, xs, xn);
+                           nkz, scale, mathdx_root, cubin_dir, conj_src, 0, 0, 0, x0, bx, xs, xn,
+                           live ? &*live : nullptr);
 }
 static ffi::Error KleadUnfoldConv(
     cudaStream_t stream, ffi::ScratchAllocator scratch, ffi::AnyBuffer Gp, ffi::AnyBuffer Gt, ffi::AnyBuffer row, ffi::AnyBuffer trs,
@@ -3020,6 +3058,7 @@ struct LorentzArgs {
     const void *wp, *wt;
     void* yw;
     double sw;
+    const void* live;
 };
 
 // The interaction read from its irreducible-q parent tiles (the `_wparent` target): the tile, its
@@ -3036,10 +3075,12 @@ static ffi::Error KleadLorentzImpl(
     int64_t nky, int64_t nkz, double scale_g, double scale_f, double mult,
     ffi::Span<const int64_t> perm_l, ffi::Span<const int64_t> phase_l, ffi::Span<const int64_t> perm_r,
     ffi::Span<const int64_t> phase_r, std::string_view mathdx_root, std::string_view cubin_dir,
-    int64_t conj_src = 0, const WParent* W = nullptr) {
+    int64_t conj_src = 0, const WParent* W = nullptr, const ffi::AnyBuffer* live = nullptr) {
     auto bad = [](const std::string& why) {
         return fail("klead lorentz conv", why, ffi::ErrorCode::kInvalidArgument);
     };
+    if (live && (live->element_type() != ffi::DataType::S32 || live->element_count() != 2))
+        return bad("want live s32 [2]: the window rows [lo, hi) of a padded pass");
     if (nkx < 1 || nky < 1 || nkz < 1 || nkx > kAxisMax || nky > kAxisMax || nkz > kAxisMax) {
         std::ostringstream os;
         os << "GATE mathdx-kconv-axis: got k-grid (" << nkx << "," << nky << "," << nkz
@@ -3122,7 +3163,7 @@ static ffi::Error KleadLorentzImpl(
     const Built* k = nullptr;
     ffi::Error e = build(8, static_cast<int>(nkx), static_cast<int>(nky), static_cast<int>(nkz),
                          static_cast<int>(ns), false, mathdx_root, cubin_dir, &k, 0,
-                         W ? static_cast<int>(na * 8 + nb) : 0);
+                         (W ? static_cast<int>(na * 8 + nb) : 0) | (live ? kLiveBit : 0));
     if (!e.success()) return e;
     UnfoldTab t{static_cast<const int*>(row.untyped_data()), static_cast<const int*>(trs.untyped_data()),
                 static_cast<const int*>(lsrc.untyped_data()), static_cast<const int*>(rsrc.untyped_data()),
@@ -3139,7 +3180,8 @@ static ffi::Error KleadLorentzImpl(
     const long long ss = ns * ns, ws = W ? na * nb : 0;
     LorentzArgs a{Gp.untyped_data(), Gt.untyped_data(), W ? nullptr : V.untyped_data(), U->untyped_data(), nullptr,
                   0, pairs, ml / ns, nl / ns, W ? W->Wp.untyped_data() : nullptr,
-                  W ? W->Wt.untyped_data() : nullptr, nullptr, W ? W->scale : 0.0};
+                  W ? W->Wt.untyped_data() : nullptr, nullptr, W ? W->scale : 0.0,
+                  live ? live->untyped_data() : nullptr};
     auto launch = [&](int phase, long long blocks, int threads, int smem) -> ffi::Error {
         blocks = std::max(1LL, std::min(blocks, 2147483647LL));
         void* args[] = {(void*)&a, (void*)&t, (void*)&v, (void*)&phase, (void*)&tw};
@@ -3220,14 +3262,15 @@ static ffi::Error KleadLorentzWParentConv(
     ffi::AnyBuffer trs, ffi::AnyBuffer lsrc, ffi::AnyBuffer rsrc, ffi::AnyBuffer mph, ffi::AnyBuffer nph,
     ffi::AnyBuffer spin, ffi::AnyBuffer kout, ffi::AnyBuffer Wp, ffi::AnyBuffer Wt, ffi::AnyBuffer wrow,
     ffi::AnyBuffer wtrs, ffi::AnyBuffer wlsrc, ffi::AnyBuffer wrsrc, ffi::AnyBuffer wmph, ffi::AnyBuffer wnph,
-    ffi::AnyBuffer wspin_l, ffi::AnyBuffer wspin_r, ffi::Result<ffi::AnyBuffer> U, int64_t nkx, int64_t nky,
-    int64_t nkz, double scale_g, double scale_f, double mult, double scale_w, ffi::Span<const int64_t> perm_l,
-    ffi::Span<const int64_t> phase_l, ffi::Span<const int64_t> perm_r, ffi::Span<const int64_t> phase_r,
-    int64_t conj_src, std::string_view mathdx_root, std::string_view cubin_dir) {
+    ffi::AnyBuffer wspin_l, ffi::AnyBuffer wspin_r, std::optional<ffi::AnyBuffer> live,
+    ffi::Result<ffi::AnyBuffer> U, int64_t nkx, int64_t nky, int64_t nkz, double scale_g, double scale_f,
+    double mult, double scale_w, ffi::Span<const int64_t> perm_l, ffi::Span<const int64_t> phase_l,
+    ffi::Span<const int64_t> perm_r, ffi::Span<const int64_t> phase_r, int64_t conj_src,
+    std::string_view mathdx_root, std::string_view cubin_dir) {
     const WParent w{Wp, Wt, wrow, wtrs, wlsrc, wrsrc, wmph, wnph, wspin_l, wspin_r, scale_w};
     return KleadLorentzImpl(stream, scratch, Gp, Gt, row, trs, lsrc, rsrc, mph, nph, spin, &kout, Wp, U, nkx, nky,
                             nkz, scale_g, scale_f, mult, perm_l, phase_l, perm_r, phase_r, mathdx_root, cubin_dir,
-                            conj_src, &w);
+                            conj_src, &w, live ? &*live : nullptr);
 }
 static ffi::Error KleadLorentzConv(
     cudaStream_t stream, ffi::ScratchAllocator scratch, ffi::AnyBuffer Gp, ffi::AnyBuffer Gt, ffi::AnyBuffer row, ffi::AnyBuffer trs,
@@ -3244,14 +3287,16 @@ static ffi::Error KleadLorentzConv(
 // Mode 9: an interaction's inverse k-transform read from its wedge tiles
 // through the unfold tables; Y (nk, ml, nl) k-leading R space.  Wt is the
 // partner tile (pair_transpose) and is not read when conj_trs = 1.
-static ffi::Error KleadUnfoldFft(
+static ffi::Error KleadUnfoldFftImpl(
     cudaStream_t stream, ffi::AnyBuffer Wp, ffi::AnyBuffer Wt, ffi::AnyBuffer row, ffi::AnyBuffer trs,
     ffi::AnyBuffer lsrc, ffi::AnyBuffer rsrc, ffi::AnyBuffer mph, ffi::AnyBuffer nph, ffi::AnyBuffer spin_l,
-    ffi::AnyBuffer spin_r, ffi::Result<ffi::AnyBuffer> Y, int64_t nkx, int64_t nky, int64_t nkz,
-    double scale, int64_t conj_trs, std::string_view mathdx_root, std::string_view cubin_dir) {
+    ffi::AnyBuffer spin_r, const ffi::AnyBuffer* live, ffi::Result<ffi::AnyBuffer> Y, int64_t nkx, int64_t nky,
+    int64_t nkz, double scale, int64_t conj_trs, std::string_view mathdx_root, std::string_view cubin_dir) {
     auto bad = [](const std::string& why) {
         return fail("klead unfold fft", why, ffi::ErrorCode::kInvalidArgument);
     };
+    if (live && (live->element_type() != ffi::DataType::S32 || live->element_count() != 2))
+        return bad("want live s32 [2]: the window rows [lo, hi) of a padded pass");
     if (nkx < 1 || nky < 1 || nkz < 1 || nkx > kAxisMax || nky > kAxisMax || nkz > kAxisMax) {
         std::ostringstream os;
         os << "GATE mathdx-kconv-axis: got k-grid (" << nkx << "," << nky << "," << nkz
@@ -3280,7 +3325,8 @@ static ffi::Error KleadUnfoldFft(
     if (pairs == 0) return ffi::Error::Success();
     const Built* k = nullptr;
     ffi::Error e = build(9, static_cast<int>(nkx), static_cast<int>(nky), static_cast<int>(nkz),
-                         static_cast<int>(nsl), false, mathdx_root, cubin_dir, &k, static_cast<int>(nsr));
+                         static_cast<int>(nsl), false, mathdx_root, cubin_dir, &k, static_cast<int>(nsr),
+                         live ? kLiveBit : 0);
     if (!e.success()) return e;
     UnfoldTab t{static_cast<const int*>(row.untyped_data()), static_cast<const int*>(trs.untyped_data()),
                 static_cast<const int*>(lsrc.untyped_data()), static_cast<const int*>(rsrc.untyped_data()),
@@ -3292,7 +3338,8 @@ static ffi::Error KleadUnfoldFft(
     void* yp = Y->untyped_data();
     double sc = scale;
     int phase = 0;
-    void* args[] = {(void*)&wpp, (void*)&wtp, (void*)&yp, (void*)&t, (void*)&sc, (void*)&phase};
+    const void* livep = live ? live->untyped_data() : nullptr;
+    void* args[] = {(void*)&wpp, (void*)&wtp, (void*)&yp, (void*)&t, (void*)&sc, (void*)&phase, (void*)&livep};
     const long long rows = pairs * nsl * nsr, cap = static_cast<long long>(k->sms) * 8;
     auto launch = [&](long long blocks, int threads, int smem) -> ffi::Error {
         CUresult cr = driver_api().LaunchKernel(k->fn, static_cast<unsigned>(std::min(blocks, 2147483647LL)), 1, 1,
@@ -3305,6 +3352,15 @@ static ffi::Error KleadUnfoldFft(
         return e0;
     phase = 1;
     return launch(std::min((nky * nkz * rows + k->threads - 1) / k->threads, cap), k->threads, 0);
+}
+static ffi::Error KleadUnfoldFft(
+    cudaStream_t stream, ffi::AnyBuffer Wp, ffi::AnyBuffer Wt, ffi::AnyBuffer row, ffi::AnyBuffer trs,
+    ffi::AnyBuffer lsrc, ffi::AnyBuffer rsrc, ffi::AnyBuffer mph, ffi::AnyBuffer nph, ffi::AnyBuffer spin_l,
+    ffi::AnyBuffer spin_r, std::optional<ffi::AnyBuffer> live, ffi::Result<ffi::AnyBuffer> Y, int64_t nkx,
+    int64_t nky, int64_t nkz, double scale, int64_t conj_trs, std::string_view mathdx_root,
+    std::string_view cubin_dir) {
+    return KleadUnfoldFftImpl(stream, Wp, Wt, row, trs, lsrc, rsrc, mph, nph, spin_l, spin_r, live ? &*live : nullptr,
+                              Y, nkx, nky, nkz, scale, conj_trs, mathdx_root, cubin_dir);
 }
 
 // Mode 11 geometry, as the embedded source declares it (ChiArgs).
@@ -3319,6 +3375,7 @@ struct ChiArgs {
     unsigned long long vperm_l, vphase_l, vperm_r, vphase_r;
     int vna, vnb, vch0;
     const void* sgn_c;
+    const void* live;
 };
 
 // Mode 11: chi_R accumulation from the raw-parent Green pair.  acc (n_out, nk, mx, my) in place;
@@ -3331,10 +3388,12 @@ static ffi::Error KleadChiUnfoldImpl(
     int64_t conj_trs, int64_t complete, int64_t scratch_bytes, std::string_view mathdx_root,
     std::string_view cubin_dir, ffi::Span<const int64_t> perm_l, ffi::Span<const int64_t> phase_l,
     ffi::Span<const int64_t> perm_r, ffi::Span<const int64_t> phase_r, int64_t na, int64_t nb,
-    const ffi::AnyBuffer* sgn_c = nullptr) {
+    const ffi::AnyBuffer* sgn_c = nullptr, const ffi::AnyBuffer* live = nullptr) {
     auto bad = [](const std::string& why) {
         return fail("klead chi unfold", why, ffi::ErrorCode::kInvalidArgument);
     };
+    if (live && (live->element_type() != ffi::DataType::S32 || live->element_count() != 2))
+        return bad("want live s32 [2]: the window rows [lo, hi) of a padded pass");
     if (nkx < 1 || nky < 1 || nkz < 1 || nkx > kAxisMax || nky > kAxisMax || nkz > kAxisMax) {
         std::ostringstream os;
         os << "GATE mathdx-kconv-axis: got k-grid (" << nkx << "," << nky << "," << nkz
@@ -3397,7 +3456,7 @@ static ffi::Error KleadChiUnfoldImpl(
     // variant: bit 0 the static completion, bit 1 the four-current channels (LRX_VTX).
     ffi::Error e = build(11, static_cast<int>(nkx), static_cast<int>(nky), static_cast<int>(nkz),
                          static_cast<int>(ns), false, mathdx_root, cubin_dir, &k, 0,
-                         static_cast<int>(complete) + (vtx ? 2 : 0));
+                         (static_cast<int>(complete) + (vtx ? 2 : 0)) | (live ? kLiveBit : 0));
     if (!e.success()) return e;
     UnfoldTab t{static_cast<const int*>(row.untyped_data()), static_cast<const int*>(trs.untyped_data()),
                 static_cast<const int*>(lsrc.untyped_data()), static_cast<const int*>(rsrc.untyped_data()),
@@ -3412,7 +3471,8 @@ static ffi::Error KleadChiUnfoldImpl(
     ChiArgs a{Gv.untyped_data(), Gvt.untyped_data(), Gc.untyped_data(), Gct.untyped_data(),
               acc->untyped_data(), alpha.untyped_data(), nullptr, 0, pairs, pairs, my,
               static_cast<int>(n_out), si, vpl, vhl, vpr, vhr, static_cast<int>(vtx ? na : 0),
-              static_cast<int>(vtx ? nb : 0), 0, sgn_c ? sgn_c->untyped_data() : nullptr};
+              static_cast<int>(vtx ? nb : 0), 0, sgn_c ? sgn_c->untyped_data() : nullptr,
+              live ? live->untyped_data() : nullptr};
     auto launch = [&](int phase, long long blocks, int threads, int smem) -> ffi::Error {
         blocks = std::max(1LL, std::min(blocks, 2147483647LL));
         void* args[] = {(void*)&a, (void*)&t, (void*)&phase};
@@ -3459,12 +3519,12 @@ static ffi::Error KleadChiUnfold(
     cudaStream_t stream, ffi::ScratchAllocator scratch, ffi::AnyBuffer Gv, ffi::AnyBuffer Gvt,
     ffi::AnyBuffer Gc, ffi::AnyBuffer Gct, ffi::AnyBuffer row, ffi::AnyBuffer trs, ffi::AnyBuffer lsrc,
     ffi::AnyBuffer rsrc, ffi::AnyBuffer mph, ffi::AnyBuffer nph, ffi::AnyBuffer spin, ffi::AnyBuffer alpha,
-    ffi::AnyBuffer acc_in, ffi::Result<ffi::AnyBuffer> acc, int64_t nkx, int64_t nky, int64_t nkz, double si,
-    int64_t conj_trs, int64_t complete, int64_t scratch_bytes, std::string_view mathdx_root,
-    std::string_view cubin_dir) {
+    ffi::AnyBuffer acc_in, std::optional<ffi::AnyBuffer> live, ffi::Result<ffi::AnyBuffer> acc, int64_t nkx,
+    int64_t nky, int64_t nkz, double si, int64_t conj_trs, int64_t complete, int64_t scratch_bytes,
+    std::string_view mathdx_root, std::string_view cubin_dir) {
     return KleadChiUnfoldImpl(stream, scratch, Gv, Gvt, Gc, Gct, row, trs, lsrc, rsrc, mph, nph, spin, alpha,
                               acc_in, acc, nkx, nky, nkz, si, conj_trs, complete, scratch_bytes, mathdx_root,
-                              cubin_dir, {}, {}, {}, {}, 0, 0);
+                              cubin_dir, {}, {}, {}, {}, 0, 0, nullptr, live ? &*live : nullptr);
 }
 
 // Mode 11 with the four-current vertices: na x nb channels of (perm, phase) monomials on the Gc
@@ -3473,8 +3533,8 @@ static ffi::Error KleadChiVertex(
     cudaStream_t stream, ffi::ScratchAllocator scratch, ffi::AnyBuffer Gv, ffi::AnyBuffer Gvt,
     ffi::AnyBuffer Gc, ffi::AnyBuffer Gct, ffi::AnyBuffer row, ffi::AnyBuffer trs, ffi::AnyBuffer lsrc,
     ffi::AnyBuffer rsrc, ffi::AnyBuffer mph, ffi::AnyBuffer nph, ffi::AnyBuffer spin, ffi::AnyBuffer alpha,
-    ffi::AnyBuffer sgn_c, ffi::AnyBuffer acc_in, ffi::Result<ffi::AnyBuffer> acc, int64_t nkx, int64_t nky,
-    int64_t nkz, double si, int64_t conj_trs, int64_t scratch_bytes, int64_t signed_c,
+    ffi::AnyBuffer sgn_c, ffi::AnyBuffer acc_in, std::optional<ffi::AnyBuffer> live, ffi::Result<ffi::AnyBuffer> acc,
+    int64_t nkx, int64_t nky, int64_t nkz, double si, int64_t conj_trs, int64_t scratch_bytes, int64_t signed_c,
     ffi::Span<const int64_t> perm_l, ffi::Span<const int64_t> phase_l,
     ffi::Span<const int64_t> perm_r, ffi::Span<const int64_t> phase_r, int64_t na, int64_t nb,
     std::string_view mathdx_root, std::string_view cubin_dir) {
@@ -3483,7 +3543,8 @@ static ffi::Error KleadChiVertex(
                     ffi::ErrorCode::kInvalidArgument);
     return KleadChiUnfoldImpl(stream, scratch, Gv, Gvt, Gc, Gct, row, trs, lsrc, rsrc, mph, nph, spin, alpha,
                               acc_in, acc, nkx, nky, nkz, si, conj_trs, 0, scratch_bytes, mathdx_root,
-                              cubin_dir, perm_l, phase_l, perm_r, phase_r, na, nb, signed_c ? &sgn_c : nullptr);
+                              cubin_dir, perm_l, phase_l, perm_r, phase_r, na, nb, signed_c ? &sgn_c : nullptr,
+                              live ? &*live : nullptr);
 }
 
 static ffi::Error KleadConv(cudaStream_t s, ffi::AnyBuffer T, ffi::AnyBuffer V, ffi::Result<ffi::AnyBuffer> U,
@@ -3782,6 +3843,7 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(
         .Arg<xla::ffi::AnyBuffer>()   // spin
         .Arg<xla::ffi::AnyBuffer>()   // kout
         .Arg<xla::ffi::AnyBuffer>()   // V (R space)
+        .OptionalArg<xla::ffi::AnyBuffer>()   // live (s32 [2]): a padded pass's live window rows [lo, hi)
         .Ret<xla::ffi::AnyBuffer>()
         LRX_KCONV_GRID_ATTRS
         .Attr<int64_t>("conj_src")    // 1: the antiunitary partner is conj(Gp); Gt unread
@@ -3878,6 +3940,7 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(
         .Arg<xla::ffi::AnyBuffer>()   // wnph
         .Arg<xla::ffi::AnyBuffer>()   // wspin_l (nk, nA, nA)
         .Arg<xla::ffi::AnyBuffer>()   // wspin_r (nk, nB, nB)
+        .OptionalArg<xla::ffi::AnyBuffer>()   // live (s32 [2]): a padded pass's live window rows [lo, hi)
         .Ret<xla::ffi::AnyBuffer>()
         .Attr<int64_t>("nkx")
         .Attr<int64_t>("nky")
@@ -3908,6 +3971,7 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(
         .Arg<xla::ffi::AnyBuffer>()   // nph
         .Arg<xla::ffi::AnyBuffer>()   // spin_l
         .Arg<xla::ffi::AnyBuffer>()   // spin_r
+        .OptionalArg<xla::ffi::AnyBuffer>()   // live (s32 [2]): a padded pass's live window rows [lo, hi)
         .Ret<xla::ffi::AnyBuffer>()
         .Attr<int64_t>("nkx")
         .Attr<int64_t>("nky")
@@ -3935,6 +3999,7 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(
         .Arg<xla::ffi::AnyBuffer>()   // spin
         .Arg<xla::ffi::AnyBuffer>()   // alpha (n_out,)
         .Arg<xla::ffi::AnyBuffer>()   // acc (n_out, nk, mx, my), aliased to the result
+        .OptionalArg<xla::ffi::AnyBuffer>()   // live (s32 [2]): a padded pass's live window rows [lo, hi)
         .Ret<xla::ffi::AnyBuffer>()
         .Attr<int64_t>("nkx")
         .Attr<int64_t>("nky")
@@ -3965,6 +4030,7 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(
         .Arg<xla::ffi::AnyBuffer>()   // alpha (n_out,)
         .Arg<xla::ffi::AnyBuffer>()   // sgn_c (nk,) f64: the Gc operand's per-k sign (read when signed_c)
         .Arg<xla::ffi::AnyBuffer>()   // acc (na*nb*n_out, nk, mx, my), aliased to the result
+        .OptionalArg<xla::ffi::AnyBuffer>()   // live (s32 [2]): a padded pass's live window rows [lo, hi)
         .Ret<xla::ffi::AnyBuffer>()
         .Attr<int64_t>("nkx")
         .Attr<int64_t>("nky")

@@ -163,7 +163,7 @@ __all__ = [
     "KCONV_PLANE_TARGET",
     "KConvStored", "make_kconv_klead", "make_kconv_klead_unfold", "KCONV_KLEAD_UNFOLD_TARGET",
     "make_kconv_lorentz_unfold", "KCONV_KLEAD_LORENTZ_TARGET",
-    "make_kfft_klead_unfold", "KFFT_KLEAD_UNFOLD_TARGET",
+    "make_kfft_klead_unfold", "KFFT_KLEAD_UNFOLD_TARGET", "live_row_mask",
     "make_kconv_chi_unfold", "KCONV_CHI_UNFOLD_TARGET", "chi_unfold_refusal",
     "chi_unfold_scratch_bytes", "make_kconv_chi_vertex", "KCONV_CHI_VERTEX_TARGET",
     "make_kconv_kminor", "kconv_kminor_out_shape",
@@ -1204,6 +1204,15 @@ def make_local_kfft_kminor(mesh: Mesh, kgrid, *, kind: str, norm: str | None) ->
     return _kfft
 
 
+def live_row_mask(live, n_rows: int, per_row: int = 1):
+    """The mask of a padded pass's live rows: ``live`` (int32 [2]) is ``[lo, hi)`` in rows of
+    ``per_row`` entries; an axis of ``n_rows * per_row`` entries.  The mathdx doors take ``live``
+    as an optional last operand, skip the rest and store them as zeros (mode 11: add nothing);
+    the cpu compositions zero them with this."""
+    r = jnp.arange(n_rows * per_row) // per_row
+    return (r >= live[0]) & (r < live[1])
+
+
 def _sharded(local, mesh, in_specs, out_spec):
     from common.shard_map import shard_map     # see the import-cycle note
     return shard_map(local, mesh=mesh, in_specs=in_specs, out_specs=out_spec,
@@ -1684,6 +1693,12 @@ def x_block_rows(rows) -> np.ndarray:
 #   modes 7/9 on the modes 2/3 split arm where a block cannot hold a group of two or more columns,
 #   P64 tile mode 7 555 -> 237 ms (the 11-row sub-tile pass 22.6 -> 11.6 ms), mode 9 64.9 -> 32.0 ms
 #   (3086): one column per block had re-gathered the pair's group per column (1.3 TB of L2).
+# Paid (B9, 3107): mode 7's split passes as separate entry points (one kernel held every pass at
+#   the x-pencil Mid's 240 registers, 8 warps per SM; the gather alone needs 104, so 16 warps),
+#   plane tiles of the most whole groups the opt-in memory holds (16 -> 24 columns at 20^3 ns 2),
+#   and where one column's padded box fits a block (20^3: 134 of 163 KB) the x pencil + Mid, the
+#   forward plane and the pencil + store as one column-resident pass (the intermediate read once,
+#   not three reads and writes): pass shape 11.66 -> 8.23 ms, P64 tile 237 -> 179 ms, bitwise.
 # Did not pay: phase-balanced thread counts 1.014-1.029x (2827); cp.async double buffering -21%
 #   (2799); a staged load reading its tables per cell, 1.63x slower on mode 11, 1.10x on mode 7
 #   (2789); padded shared rows +7% on mode 11, +19% on mode 7 (2845); a per-member vertex Mid
@@ -1695,7 +1710,10 @@ def x_block_rows(rows) -> np.ndarray:
 #   in L1), and at a carveout of 100, 1.10x slower (3077); a column-resident mode 11 cannot fit an
 #   A100: the pair's two transformed columns and its accumulator are 384 KB against 163 KB (I);
 #   modes 7/9 split at one 4-column group per block (12^3 ns 2) 0.84x, and 1-column plane tiles
-#   (16-byte runs) left mode 9 at its single-arm wall (3086).
+#   (16-byte runs) left mode 9 at its single-arm wall (3086); mode 7's entries at 512 threads each
+#   (the Mid spills at 128 registers) 0.92x of 512/256/512, two 12-column plane blocks per SM 0.94x
+#   of one 24-column block; B bracket Greens per W load: 2-4 % at most, W_prep is already formed
+#   once per pass for every bracket (not built, 3107).
 # Decides it: blocks resident per SM (<= 64 registers, >= 2 blocks) and odd, conflict-free shared
 #   strides, not HBM or FP64 (Fe 8^3 mode 7 at ~50 GB/s and 0.8 TF/s; 2935); after that the
 #   unfold gather's L2 latency (long_scoreboard 49%; 2956).
@@ -1730,6 +1748,10 @@ def make_kconv_klead_unfold(mesh: Mesh, kgrid, tables, *, store_rows, norm: str 
     tile by x blocks reads the Green once over all of them.  (An output spin block, the
     rejected alternative, reads every source of each pair per block: the spin action mixes
     them.)
+
+    ``apply(..., live=...)``: the pass is padded to a scan's largest pass and ``live`` (int32
+    ``[2]``, replicated) is its live stored rows ``[lo, hi)`` (the ``x``-block rows, or ``mu``):
+    the rest do no gather or transform and come back zero.
     """
     from symmetry_maps import (DEVICE_LOAD_SPECS, DeviceLoadTables,
                                apply_unfold_load_tables_local, local_unfold_load_tables)
@@ -1752,51 +1774,55 @@ def make_kconv_klead_unfold(mesh: Mesh, kgrid, tables, *, store_rows, norm: str 
         attrs = dict(nkx=np.int64(kg[0]), nky=np.int64(kg[1]), nkz=np.int64(kg[2]),
                      scale=np.float64(si * sf * float(mult)), **_mathdx_common())
 
-        def apply_tables(g, gt, v_r, t, conj_src, block):
+        def apply_tables(g, gt, v_r, t, conj_src, block, live):
             n_par, mx, _, my, _ = (int(v) for v in g.shape)
             x0, bx, xs, xn = (0, 0, 0, 0) if block is None else block
             flat = lambda a: a.reshape(n_par, mx * ns, my * ns)
             out = jax.ShapeDtypeStruct((n_out, ns, xn * bx if bx else mx, ns, my), g.dtype)
             return jax.ffi.ffi_call(KCONV_KLEAD_UNFOLD_TARGET, out)(
                 flat(g), flat(gt), t.row, t.trs, t.lsrc, t.rsrc, t.mph, t.nph, t.spin,
-                jnp.asarray(kout), v_r, conj_src=np.int64(bool(conj_src)),
+                jnp.asarray(kout), v_r, *(() if live is None else (live,)),
+                conj_src=np.int64(bool(conj_src)),
                 x0=np.int64(x0), bx=np.int64(bx), xs=np.int64(xs), xn=np.int64(xn), **attrs)
     else:
         _, conv_local = _klead_locals(mesh, kg, norm, mult)
 
-        def apply_tables(g, gt, v_r, t, conj_src, block):
+        def apply_tables(g, gt, v_r, t, conj_src, block, live):
             n_par, mx, _, my, _ = (int(v) for v in g.shape)
             flat = lambda a: a.reshape(n_par, mx * ns, my * ns)
             gt = jnp.conj(g) if conj_src else gt
             O = apply_unfold_load_tables_local(flat(g), flat(gt), t, spin_host)
             U = jnp.take(conv_local(jnp.transpose(O, (0, 2, 1, 4, 3)), v_r),
                          jnp.asarray(rows), axis=0)
-            if block is None:
-                return U
-            idx = x_block_rows(block)
-            keep = jnp.asarray(idx < mx)[None, None, :, None, None]
-            return jnp.where(keep, jnp.take(U, jnp.asarray(np.minimum(idx, mx - 1)), axis=2), 0)
+            if block is not None:
+                idx = x_block_rows(block)
+                keep = jnp.asarray(idx < mx)[None, None, :, None, None]
+                U = jnp.where(keep, jnp.take(U, jnp.asarray(np.minimum(idx, mx - 1)), axis=2), 0)
+            if live is not None:
+                U = jnp.where(live_row_mask(live, int(U.shape[2]))[None, None, :, None, None], U, 0)
+            return U
 
-    def local(g, gt, v_r, *load, conj_src=False, block=None):
-        # ``load``: this rank's slices of the placed tables (DeviceLoadTables
-        # fields); without it, the host tables are cut here (baked).
+    def local(g, gt, v_r, *rest, conj_src=False, block=None, has_live=False):
+        # ``rest``: live (with has_live), then this rank's slices of the placed tables
+        # (DeviceLoadTables fields); without them, the host tables are cut here (baked).
+        live, load = (rest[0], rest[1:]) if has_live else (None, rest)
         t = (tables._replace(**dict(zip(DeviceLoadTables._fields, load))) if load
              else local_unfold_load_tables(tables))
-        return apply_tables(g, gt, v_r, t, conj_src, block)
+        return apply_tables(g, gt, v_r, t, conj_src, block, live)
 
     g_spec = P(None, "x", None, "y", None)
     sm = {}
 
-    def sharded(conj_src, block, placed):
-        key = (conj_src, block, placed)
+    def sharded(conj_src, block, placed, has_live):
+        key = (conj_src, block, placed, has_live)
         if key not in sm:
-            sm[key] = _sharded(partial(local, conj_src=conj_src, block=block), mesh,
-                               (g_spec, g_spec, P(None, "x", "y"))
+            sm[key] = _sharded(partial(local, conj_src=conj_src, block=block, has_live=has_live), mesh,
+                               (g_spec, g_spec, P(None, "x", "y")) + ((P(None),) if has_live else ())
                                + (DEVICE_LOAD_SPECS if placed else ()),
                                P(None, None, "x", None, "y"))
         return sm[key]
 
-    def apply(G, Gt, W_prep, *, conj_partner=False, rows=None, load=None):
+    def apply(G, Gt, W_prep, *, conj_partner=False, rows=None, load=None, live=None):
         """``conj_partner``: the antiunitary partner is ``conj(G)`` (a Green of real weights),
         read from ``G`` on the load, so no partner tile exists (``Gt`` must be ``None``)."""
         _check_complex(G, W_prep)
@@ -1831,8 +1857,8 @@ def make_kconv_klead_unfold(mesh: Mesh, kgrid, tables, *, store_rows, norm: str 
                                  f"at stride xs >= x0+bx starting inside the local extent {mx}")
             if rows == (0, mx, mx, 1):
                 rows = None
-        return sharded(bool(conj_partner and needs_partner), rows, load is not None)(
-            G, Gt, W_prep, *(() if load is None else tuple(load)))
+        return sharded(bool(conj_partner and needs_partner), rows, load is not None, live is not None)(
+            G, Gt, W_prep, *(() if live is None else (live,)), *(() if load is None else tuple(load)))
     return apply
 
 
@@ -1919,7 +1945,8 @@ def make_kconv_lorentz_unfold(mesh: Mesh, kgrid, tables, *, w_tables, left_verti
                      scale_w=np.float64(si), perm_l=perm_l, phase_l=phase_l, perm_r=perm_r,
                      phase_r=phase_r, **_mathdx_common())
 
-        def local(g, gt, w, wt, *loads, conj_src=False):
+        def local(g, gt, w, wt, *rest, conj_src=False, has_live=False):
+            live, loads = (rest[0], rest[1:]) if has_live else (None, rest)
             t, tw = local_tables(loads)
             n_par, mx, _, my, _ = (int(d) for d in g.shape)
             n_w = int(w.shape[0])
@@ -1929,7 +1956,8 @@ def make_kconv_lorentz_unfold(mesh: Mesh, kgrid, tables, *, w_tables, left_verti
             return jax.ffi.ffi_call(KCONV_KLEAD_LORENTZ_TARGET, out)(
                 flat(g), flat(gt), t.row, t.trs, t.lsrc, t.rsrc, t.mph, t.nph, t.spin,
                 jnp.asarray(kout), wflat(w), wflat(wt), tw.row, tw.trs, tw.lsrc, tw.rsrc,
-                tw.mph, tw.nph, tw.spin, tw.spin_r, conj_src=np.int64(bool(conj_src)), **attrs)
+                tw.mph, tw.nph, tw.spin, tw.spin_r, *(() if live is None else (live,)),
+                conj_src=np.int64(bool(conj_src)), **attrs)
     else:
         prep_local = make_local_kfft_klead(mesh, kg, kind="ifftn", norm=norm)
         forward_local = make_local_kfft_klead(mesh, kg, kind="fftn", norm=norm)
@@ -1937,7 +1965,8 @@ def make_kconv_lorentz_unfold(mesh: Mesh, kgrid, tables, *, w_tables, left_verti
         left = [(perm_l[i * ns:(i + 1) * ns], quarter[phase_l[i * ns:(i + 1) * ns]]) for i in range(na)]
         right = [(perm_r[j * ns:(j + 1) * ns], quarter[phase_r[j * ns:(j + 1) * ns]]) for j in range(nb)]
 
-        def local(g, gt, w, wt, *loads, conj_src=False):
+        def local(g, gt, w, wt, *rest, conj_src=False, has_live=False):
+            live, loads = (rest[0], rest[1:]) if has_live else (None, rest)
             t, tw = local_tables(loads)
             n_par, mx, _, my, _ = (int(d) for d in g.shape)
             n_w = int(w.shape[0])
@@ -1957,20 +1986,29 @@ def make_kconv_lorentz_unfold(mesh: Mesh, kgrid, tables, *, w_tables, left_verti
                     value = (jnp.take(value, jnp.asarray(pr), axis=3)
                              * jnp.asarray(np.conj(hr)).reshape(1, 1, 1, ns, 1))
                     total = total + value * v_r[:, None, :, i, None, :, j]
-            return jnp.take(forward_local(total) * mult, jnp.asarray(rows), axis=0)
+            U = jnp.take(forward_local(total) * mult, jnp.asarray(rows), axis=0)
+            if live is None:
+                return U
+            return jnp.where(live_row_mask(live, mx)[None, None, :, None, None], U, 0)
 
     g_spec = P(None, "x", None, "y", None)
-    sm = {(c, placed): _sharded(partial(local, conj_src=c), mesh,
-                                (g_spec, g_spec, g_spec, g_spec)
-                                + ((*DEVICE_LOAD_SPECS, *DEVICE_LOAD_SPECS) if placed else ()),
-                                P(None, None, "x", None, "y"))
-          for c in (False, True) for placed in (False, True)}
+    sm = {}
+
+    def sharded(c, placed, has_live):
+        if (c, placed, has_live) not in sm:
+            sm[c, placed, has_live] = _sharded(
+                partial(local, conj_src=c, has_live=has_live), mesh,
+                (g_spec, g_spec, g_spec, g_spec) + ((P(None),) if has_live else ())
+                + ((*DEVICE_LOAD_SPECS, *DEVICE_LOAD_SPECS) if placed else ()),
+                P(None, None, "x", None, "y"))
+        return sm[c, placed, has_live]
     w_partner = bool(np.any(np.asarray(w_tables.trs)))
 
-    def apply(G, Gt, W, Wt, *, conj_partner=False, load=None, w_load=None):
+    def apply(G, Gt, W, Wt, *, conj_partner=False, load=None, w_load=None, live=None):
         """``conj_partner``: as :func:`make_kconv_klead_unfold`'s.  ``Wt`` may be ``None``
         only when no q row of ``w_tables`` is antiunitary.  ``load``/``w_load``: the
-        placed tables (both or neither)."""
+        placed tables (both or neither).  ``live``: as :func:`make_kconv_klead_unfold`'s
+        (the Green's and W's shared left rows)."""
         if (load is None) != (w_load is None):
             raise ValueError("k-leading lorentz conv: pass both placed loads or neither")
         _check_complex(G, W)
@@ -2005,8 +2043,8 @@ def make_kconv_lorentz_unfold(mesh: Mesh, kgrid, tables, *, w_tables, left_verti
                 f"(n_parent={tables.n_parent}, endpoints {tables.lsrc.shape[1]}/{tables.rsrc.shape[1]} "
                 f"merged over ns={ns}; W endpoints {w_tables.lsrc.shape[1]}/{w_tables.rsrc.shape[1]})")
         placed = load is not None
-        return sm[(bool(conj_partner and needs_partner), placed)](
-            G, Gt, W, Wt, *((*load, *w_load) if placed else ()))
+        return sharded(bool(conj_partner and needs_partner), placed, live is not None)(
+            G, Gt, W, Wt, *(() if live is None else (live,)), *((*load, *w_load) if placed else ()))
     return apply
 
 
@@ -2028,7 +2066,8 @@ def make_kfft_klead_unfold(mesh: Mesh, kgrid, tables, *, norm: str | None = "ort
     transform's load, so the full-zone interaction is never stored.  CUDA:
     nvidia-mathdx mode 9; cpu: the service's reference composition, then the
     prep of the plan route (``ifftn``; the identity on the host-conv arm,
-    whose apply transforms W itself).
+    whose apply transforms W itself).  ``live`` (int32 ``[2]``, replicated): the pass is padded
+    to a scan's largest pass and ``[lo, hi)`` its live left centroid rows; the rest come back zero.
     """
     from symmetry_maps import apply_unfold_load_tables_local, local_unfold_load_tables
     kg = _check_kgrid(kgrid, kconv_backend(mesh))
@@ -2046,34 +2085,43 @@ def make_kfft_klead_unfold(mesh: Mesh, kgrid, tables, *, norm: str | None = "ort
                      scale=np.float64(ffi_fft_scale("ifftn", norm, nk)), conj_trs=np.int64(conj),
                      **_mathdx_common())
 
-        def apply_tables(w, wt, t):
+        def apply_tables(w, wt, t, live):
             out = jax.ShapeDtypeStruct((nk, int(w.shape[1]), int(w.shape[2])), w.dtype)
             return jax.ffi.ffi_call(KFFT_KLEAD_UNFOLD_TARGET, out)(
-                w, wt, t.row, t.trs, t.lsrc, t.rsrc, t.mph, t.nph, t.spin, t.spin_r, **attrs)
+                w, wt, t.row, t.trs, t.lsrc, t.rsrc, t.mph, t.nph, t.spin, t.spin_r,
+                *(() if live is None else (live,)), **attrs)
     else:
         _require_plan_route()
         prep_local = (make_local_kfft_klead(mesh, kg, kind="ifftn", norm=norm)
                       if _cpu_test_arm() else (lambda o: o))
 
-        def apply_tables(w, wt, t):
+        def apply_tables(w, wt, t, live):
             O = apply_unfold_load_tables_local(w, wt, t, spin_l,
                                                None if tables.spin_r is None else spin_r)
-            return prep_local(O.reshape(nk, int(w.shape[1]), int(w.shape[2])))
+            Y = prep_local(O.reshape(nk, int(w.shape[1]), int(w.shape[2])))
+            if live is None:
+                return Y
+            return jnp.where(live_row_mask(live, int(w.shape[1]) // n_l, n_l)[None, :, None], Y, 0)
 
-    def local(w, wt):
-        return apply_tables(w, wt, local_unfold_load_tables(tables))
+    def local(w, wt, *rest, has_live=False, placed=False):
+        live, load = (rest[0], rest[1:]) if has_live else (None, rest)
+        t = (tables._replace(**dict(zip(DeviceLoadTables._fields, load))) if placed
+             else local_unfold_load_tables(tables))
+        return apply_tables(w, wt, t, live)
 
-    def local_dev(w, wt, row, trs, lsrc, rsrc, mph, nph, spin, spin_r_dev):
-        return apply_tables(w, wt, tables._replace(
-            row=row, trs=trs, lsrc=lsrc, rsrc=rsrc, mph=mph, nph=nph, spin=spin,
-            spin_r=spin_r_dev))
-
-    from symmetry_maps import DEVICE_LOAD_SPECS
+    from symmetry_maps import DEVICE_LOAD_SPECS, DeviceLoadTables
     spec = P(None, "x", "y")
-    sm = _sharded(local, mesh, (spec, spec), spec)
-    sm_dev = _sharded(local_dev, mesh, (spec, spec, *DEVICE_LOAD_SPECS), spec)
+    sm = {}
 
-    def fn(Wp, Wt=None, load=None):
+    def sharded(placed, has_live):
+        if (placed, has_live) not in sm:
+            sm[placed, has_live] = _sharded(
+                partial(local, has_live=has_live, placed=placed), mesh,
+                (spec, spec) + ((P(None),) if has_live else ()) + (DEVICE_LOAD_SPECS if placed else ()),
+                spec)
+        return sm[placed, has_live]
+
+    def fn(Wp, Wt=None, load=None, live=None):
         _check_complex(Wp)
         if Wp.ndim != 3 or int(Wp.shape[1]) % n_l or int(Wp.shape[2]) % n_r:
             raise ValueError(f"k-leading unfold fft expects Wp (n_wedge, mx*{n_l}, my*{n_r}); "
@@ -2086,7 +2134,8 @@ def make_kfft_klead_unfold(mesh: Mesh, kgrid, tables, *, norm: str | None = "ort
                 raise ValueError("k-leading unfold fft: the tables read the transposed partner on "
                                  "antiunitary rows (pair_transpose), so Wt is required")
             Wt = Wp
-        return sm(Wp, Wt) if load is None else sm_dev(Wp, Wt, *load)
+        return sharded(load is not None, live is not None)(
+            Wp, Wt, *(() if live is None else (live,)), *(() if load is None else tuple(load)))
     return fn
 
 
@@ -2181,13 +2230,13 @@ def make_kconv_chi_unfold(mesh: Mesh, kgrid, tables, *, n_out: int, complete: bo
     if kconv_backend(mesh) == "mathdx":
         _require_target(KCONV_CHI_UNFOLD_TARGET, "CUDA")
 
-        def apply_tables(acc, gv, gc, alpha, gvt, gct, conj_src, t):
+        def apply_tables(acc, gv, gc, alpha, gvt, gct, conj_src, t, live):
             budget = (int(scratch_bytes) if scratch_bytes is not None
                       else chi_unfold_scratch_bytes(kg, ns, int(gv.size) * 16))
             call = jax.ffi.ffi_call(KCONV_CHI_UNFOLD_TARGET, jax.ShapeDtypeStruct(acc.shape, acc.dtype),
                                     input_output_aliases={12: 0})
             return call(flat(gv), flat(gvt), flat(gc), flat(gct), t.row, t.trs, t.lsrc, t.rsrc,
-                        t.mph, t.nph, t.spin, alpha, acc,
+                        t.mph, t.nph, t.spin, alpha, acc, *(() if live is None else (live,)),
                         nkx=np.int64(kg[0]), nky=np.int64(kg[1]), nkz=np.int64(kg[2]),
                         si=np.float64(si), conj_trs=np.int64(2 if conj_src else 0),
                         complete=np.int64(complete), scratch_bytes=np.int64(budget),
@@ -2196,7 +2245,7 @@ def make_kconv_chi_unfold(mesh: Mesh, kgrid, tables, *, n_out: int, complete: bo
         _require_plan_route()
         ifft_local = make_local_kfft_klead(mesh, kg, kind="ifftn", norm=norm)
 
-        def apply_tables(acc, gv, gc, alpha, gvt, gct, conj_src, t):
+        def apply_tables(acc, gv, gc, alpha, gvt, gct, conj_src, t, live):
             if conj_src:
                 gvt, gct = jnp.conj(gv), jnp.conj(gc)
             n_par, mx, _, my, _ = (int(v) for v in gv.shape)
@@ -2207,26 +2256,29 @@ def make_kconv_chi_unfold(mesh: Mesh, kgrid, tables, *, n_out: int, complete: bo
             chi = jnp.einsum("kxayb,kxayb->kxy", jnp.conj(unfolded(gc, gct)), unfolded(gv, gvt))
             if complete:
                 chi = chi + jnp.conj(chi)
+            if live is not None:
+                chi = jnp.where(live_row_mask(live, mx)[None, :, None], chi, 0)
             return acc + alpha[:, None, None, None] * chi[None]
 
-    def local(acc, gv, gc, alpha, gvt, gct, conj_src):
-        return apply_tables(acc, gv, gc, alpha, gvt, gct, conj_src, local_unfold_load_tables(tables))
+    def local(acc, gv, gc, alpha, gvt, gct, *rest, conj_src=False, placed=False, has_live=False):
+        live, load = (rest[0], rest[1:]) if has_live else (None, rest)
+        t = (tables._replace(**dict(zip(DeviceLoadTables._fields, load))) if placed
+             else local_unfold_load_tables(tables))
+        return apply_tables(acc, gv, gc, alpha, gvt, gct, conj_src, t, live)
 
-    def local_dev(acc, gv, gc, alpha, gvt, gct, row, trs, lsrc, rsrc, mph, nph, spin, spin_r, conj_src):
-        return apply_tables(acc, gv, gc, alpha, gvt, gct, conj_src, tables._replace(
-            row=row, trs=trs, lsrc=lsrc, rsrc=rsrc, mph=mph, nph=nph, spin=spin, spin_r=spin_r))
-
+    from symmetry_maps import DeviceLoadTables
     g_spec, acc_spec = P(None, "x", None, "y", None), P(None, None, "x", "y")
-    sm = {conj_src: _sharded(lambda a, gv, gc, al, gvt, gct, _c=conj_src: local(a, gv, gc, al, gvt, gct, _c),
-                             mesh, (acc_spec, g_spec, g_spec, P(None), g_spec, g_spec), acc_spec)
-          for conj_src in (False, True)}
-    sm_dev = {conj_src: _sharded(lambda a, gv, gc, al, gvt, gct, *t, _c=conj_src:
-                                 local_dev(a, gv, gc, al, gvt, gct, *t, _c), mesh,
-                                 (acc_spec, g_spec, g_spec, P(None), g_spec, g_spec, *DEVICE_LOAD_SPECS),
-                                 acc_spec)
-              for conj_src in (False, True)}
+    sm = {}
 
-    def fn(acc, Gv, Gc, alpha, Gvt=None, Gct=None, load=None):
+    def sharded(conj_src, placed, has_live):
+        if (conj_src, placed, has_live) not in sm:
+            sm[conj_src, placed, has_live] = _sharded(
+                partial(local, conj_src=conj_src, placed=placed, has_live=has_live), mesh,
+                (acc_spec, g_spec, g_spec, P(None), g_spec, g_spec) + ((P(None),) if has_live else ())
+                + (DEVICE_LOAD_SPECS if placed else ()), acc_spec)
+        return sm[conj_src, placed, has_live]
+
+    def fn(acc, Gv, Gc, alpha, Gvt=None, Gct=None, load=None, live=None):
         _check_complex(acc, Gv, Gc, alpha)
         if Gv.ndim != 5 or int(Gv.shape[2]) != ns or int(Gv.shape[4]) != ns or Gc.shape != Gv.shape:
             raise ValueError(f"k-leading chi unfold expects Gv = Gc (n_parent, mu, {ns}, nu, {ns}); "
@@ -2241,9 +2293,9 @@ def make_kconv_chi_unfold(mesh: Mesh, kgrid, tables, *, n_out: int, complete: bo
             Gvt, Gct = Gv, Gc
         elif Gvt.shape != Gv.shape or Gct.shape != Gv.shape:
             raise ValueError("k-leading chi unfold: the partners must match the Greens' shape")
-        if load is None:
-            return sm[conj_src](acc, Gv, Gc, alpha, Gvt, Gct)
-        return sm_dev[conj_src](acc, Gv, Gc, alpha, Gvt, Gct, *load)
+        return sharded(conj_src, load is not None, live is not None)(
+            acc, Gv, Gc, alpha, Gvt, Gct, *(() if live is None else (live,)),
+            *(() if load is None else tuple(load)))
     return fn
 
 
@@ -2296,14 +2348,14 @@ def make_kconv_chi_vertex(mesh: Mesh, kgrid, tables, *, left_vertices, right_ver
     if kconv_backend(mesh) == "mathdx":
         _require_target(KCONV_CHI_VERTEX_TARGET, "CUDA")
 
-        def apply_tables(acc, gv, gc, gvt, gct, conj_src, t):
+        def apply_tables(acc, gv, gc, gvt, gct, conj_src, t, live):
             budget = (int(scratch_bytes) if scratch_bytes is not None
                       else chi_unfold_scratch_bytes(kg, ns, int(gv.size) * 16))
             call = jax.ffi.ffi_call(KCONV_CHI_VERTEX_TARGET, jax.ShapeDtypeStruct(acc.shape, acc.dtype),
                                     input_output_aliases={13: 0})
             return call(flat(gv), flat(gvt), flat(gc), flat(gct), t.row, t.trs, t.lsrc, t.rsrc,
                         t.mph, t.nph, t.spin, jnp.ones((1,), jnp.complex128),
-                        jnp.asarray(sign_host), acc,
+                        jnp.asarray(sign_host), acc, *(() if live is None else (live,)),
                         nkx=np.int64(kg[0]), nky=np.int64(kg[1]), nkz=np.int64(kg[2]),
                         si=np.float64(si), conj_trs=np.int64(2 if conj_src else 0),
                         scratch_bytes=np.int64(budget), signed_c=np.int64(signed),
@@ -2316,7 +2368,7 @@ def make_kconv_chi_vertex(mesh: Mesh, kgrid, tables, *, left_vertices, right_ver
         pl, hl = perm_l.reshape(na, ns), codes[phase_l.reshape(na, ns)]
         pr, hr = perm_r.reshape(nb, ns), codes[phase_r.reshape(nb, ns)]
 
-        def apply_tables(acc, gv, gc, gvt, gct, conj_src, t):
+        def apply_tables(acc, gv, gc, gvt, gct, conj_src, t, live):
             if conj_src:
                 gvt, gct = jnp.conj(gv), jnp.conj(gc)
             n_par, mx, _, my, _ = (int(v) for v in gv.shape)
@@ -2332,25 +2384,30 @@ def make_kconv_chi_vertex(mesh: Mesh, kgrid, tables, *, left_vertices, right_ver
                     up = upper[:, :, pl[i]][:, :, :, :, pr[j]]
                     w = np.conj(hl[i])[:, None] * hr[j][None, :]
                     planes.append(jnp.einsum("kxayb,ab,kxayb->kxy", jnp.conj(up), w, lower))
-            return acc + jnp.stack(planes)
+            planes = jnp.stack(planes)
+            if live is not None:
+                planes = jnp.where(live_row_mask(live, mx)[None, None, :, None], planes, 0)
+            return acc + planes
 
-    def local(acc, gv, gc, gvt, gct, conj_src):
-        return apply_tables(acc, gv, gc, gvt, gct, conj_src, local_unfold_load_tables(tables))
+    def local(acc, gv, gc, gvt, gct, *rest, conj_src=False, placed=False, has_live=False):
+        live, load = (rest[0], rest[1:]) if has_live else (None, rest)
+        t = (tables._replace(**dict(zip(DeviceLoadTables._fields, load))) if placed
+             else local_unfold_load_tables(tables))
+        return apply_tables(acc, gv, gc, gvt, gct, conj_src, t, live)
 
-    def local_dev(acc, gv, gc, gvt, gct, row, trs, lsrc, rsrc, mph, nph, spin, spin_r, conj_src):
-        return apply_tables(acc, gv, gc, gvt, gct, conj_src, tables._replace(
-            row=row, trs=trs, lsrc=lsrc, rsrc=rsrc, mph=mph, nph=nph, spin=spin, spin_r=spin_r))
-
-    from symmetry_maps import DEVICE_LOAD_SPECS
+    from symmetry_maps import DEVICE_LOAD_SPECS, DeviceLoadTables
     g_spec, acc_spec = P(None, "x", None, "y", None), P(None, None, "x", "y")
-    sm = {conj_src: _sharded(lambda a, gv, gc, gvt, gct, _c=conj_src: local(a, gv, gc, gvt, gct, _c),
-                             mesh, (acc_spec, g_spec, g_spec, g_spec, g_spec), acc_spec)
-          for conj_src in (False, True)}
-    sm_dev = {conj_src: _sharded(lambda a, gv, gc, gvt, gct, *t, _c=conj_src: local_dev(a, gv, gc, gvt, gct, *t, _c),
-                                 mesh, (acc_spec, g_spec, g_spec, g_spec, g_spec, *DEVICE_LOAD_SPECS), acc_spec)
-              for conj_src in (False, True)}
+    sm = {}
 
-    def fn(acc, Gv, Gc, Gvt=None, Gct=None, load=None):
+    def sharded(conj_src, placed, has_live):
+        if (conj_src, placed, has_live) not in sm:
+            sm[conj_src, placed, has_live] = _sharded(
+                partial(local, conj_src=conj_src, placed=placed, has_live=has_live), mesh,
+                (acc_spec, g_spec, g_spec, g_spec, g_spec) + ((P(None),) if has_live else ())
+                + (DEVICE_LOAD_SPECS if placed else ()), acc_spec)
+        return sm[conj_src, placed, has_live]
+
+    def fn(acc, Gv, Gc, Gvt=None, Gct=None, load=None, live=None):
         _check_complex(acc, Gv, Gc)
         if Gv.ndim != 5 or int(Gv.shape[2]) != ns or int(Gv.shape[4]) != ns or Gc.shape != Gv.shape:
             raise ValueError(f"chi vertex expects Gv = Gc (n_parent, mu, {ns}, nu, {ns}); "
@@ -2364,9 +2421,8 @@ def make_kconv_chi_vertex(mesh: Mesh, kgrid, tables, *, left_vertices, right_ver
             Gvt, Gct = Gv, Gc
         elif Gvt.shape != Gv.shape or Gct.shape != Gv.shape:
             raise ValueError("chi vertex: the partners must match the Greens' shape")
-        if load is None:
-            return sm[conj_src](acc, Gv, Gc, Gvt, Gct)
-        return sm_dev[conj_src](acc, Gv, Gc, Gvt, Gct, *load)
+        return sharded(conj_src, load is not None, live is not None)(
+            acc, Gv, Gc, Gvt, Gct, *(() if live is None else (live,)), *(() if load is None else tuple(load)))
     return fn
 
 
