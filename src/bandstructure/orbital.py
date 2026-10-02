@@ -68,6 +68,46 @@ def angular_momentum_matrices(l: int) -> np.ndarray:
     return L
 
 
+def magnetization_axis(wfn):
+    """``(n, source)``: the unit magnetization direction of the WFN's QE run.
+
+    The schema that authenticates the WFN (``wfn.qe_symmetry_binding``) is
+    read: ``output/magnetization/total_vec`` when nonzero (an SCF schema);
+    otherwise, as in an NSCF schema, the input moment direction of the
+    magnetic species (``spin_teta``/``spin_phi``, QE's angle1/angle2 in
+    radians; absent means along z).  Without a schema or a magnetic
+    species the axis is z, and the source says so.
+    """
+    import xml.etree.ElementTree as ET
+    z = np.array([0.0, 0.0, 1.0])
+    binding = getattr(wfn, "qe_symmetry_binding", None)
+    if binding is None:
+        return z, "default z (no QE schema authenticates this WFN)"
+    path = binding.schema_path
+    root = ET.parse(path).getroot()
+    total = root.find("output/magnetization/total_vec")
+    if total is not None:
+        v = np.asarray(total.text.split(), dtype=np.float64)
+        if np.linalg.norm(v) > 1e-6:
+            return v / np.linalg.norm(v), f"{path} output total_vec"
+    axes = set()
+    species = root.find("input/atomic_species")
+    for sp in (list(species) if species is not None else []):
+        m = sp.findtext("starting_magnetization")
+        if m is None or abs(float(m)) < 1e-12:
+            continue
+        th = float(sp.findtext("spin_teta") or 0.0)
+        ph = float(sp.findtext("spin_phi") or 0.0)
+        v = np.sign(float(m)) * np.array(
+            [np.sin(th) * np.cos(ph), np.sin(th) * np.sin(ph), np.cos(th)])
+        axes.add(tuple(np.round(v, 12)))
+    if len(axes) == 1:
+        return (np.asarray(axes.pop()),
+                f"{path} input starting magnetization direction")
+    return z, (f"default z ({path}: {len(axes)} distinct species "
+               "directions, no output total)")
+
+
 def _atomic_operator_table(row_labels, channels):
     """(n_op, R, R) atomic-row operators and their names.
 
