@@ -281,7 +281,7 @@ def _sigma_subtile_kernel(*, mesh_xy, kgrid, brackets, face_shape, face_band_ext
     from common.fft_helpers import make_kconv_klead_unfold, make_kfft_klead_unfold
     from distrib_la import gemm_plan
     from runtime.tiles import TILE_BYTES
-    from .greens_function_kernel import build_G_tau, has_antiunitary_rows
+    from .greens_function_kernel import build_G_tau, green_right_operand, has_antiunitary_rows
     from .subtile_stream import (band_complete, fold_passes, orbit_cuts, pass_load, pass_rows,
                                  pass_tables, plan_rows, projection_complete)
 
@@ -328,7 +328,9 @@ def _sigma_subtile_kernel(*, mesh_xy, kgrid, brackets, face_shape, face_band_ext
             right_face_shape=(n_parent, nb, n_rmu, ns), face_band_extent=face_band_extent)
         stages.append((whole, gemm, conv, project))
     finish = stages[0][3].finish
-    psi_bytes = 16 * n_parent * ns * (nb + nb_sig) * (local_rows + nu)
+    # ψ rows and columns, the projection faces, and the Green's right operand (one copy of the
+    # columns, formed once per node).
+    psi_bytes = 16 * n_parent * ns * ((nb + nb_sig) * (local_rows + nu) + nb * nu)
     price = dict(d=ns, ns=ns, passes=len(passes), tile=float(TILE_BYTES),
                  new=float(max(xr for _, xr in passes) * row_bytes + psi_bytes))
     from common.gpu_utils import record_stage_price
@@ -344,22 +346,25 @@ def _sigma_subtile_kernel(*, mesh_xy, kgrid, brackets, face_shape, face_band_ext
     partial_spec = NamedSharding(mesh_xy, P(None, ("x", "y")))
     w_spec = P(None, "x", "y")
 
-    def green(psi_p, cols, E, sel, E_min, E_max, ref, t, gemm, band_range):
+    def green(psi_p, g_right, E, sel, E_min, E_max, ref, t, gemm, band_range):
         """The parent Green on the pass's rows: identity masks or signed weights, no clipping.
 
         An antiunitary row reads the conjugate-face partner, built by its own
         local GEMM at every node (``real_weights=False``): no device predicate
         stops the node loop, and the partner is the one the face route's
         single exchange formed.  A static node's weights are real, so its
-        partner is conj(G), read on the mode-7 load.
+        partner is conj(G), read on the mode-7 load.  ``g_right`` is the
+        GEMM's right operand (``green_right_operand`` of the band-complete
+        columns), formed once per node: every row pass and bracket reads it,
+        and the partner is ``conj(A·diag(w*)·B)`` from the same two operands.
         """
         options = dict(e_ref=ref, layout="axis", gemm=gemm, k_unfold_plan=k_unfold_plan,
                        band_range=band_range, trim_zero_bands=True, unfold=False,
-                       real_weights=bool(static))
+                       real_weights=bool(static), right=g_right)
         options["mask" if sel.dtype == jnp.bool_ else "band_weight"] = sel
         if energy_windows:
             options.update(E_min=E_min, E_max=E_max)
-        return build_G_tau(psi_p, cols, E, 1j * t, **options)
+        return build_G_tau(psi_p, None, E, 1j * t, **options)
 
     def _kernel_impl(psi_coh_xn, psi_coh_yr, psi_proj_xr, psi_proj_yn,
                      E_A, mask_A, E_min, E_max, E_ref_A, t_node, W_q, W_pt=None, load=None,
@@ -368,6 +373,8 @@ def _sigma_subtile_kernel(*, mesh_xy, kgrid, brackets, face_shape, face_band_ext
             raise ValueError("Sigma tau: W on the q wedge and the Green door need their device "
                              "load tables (load, g_load = sigma_door_tables)")
         rows_all, cols_all = band_complete(psi_coh_xn, psi_coh_yr, mesh_xy)
+        # conj(ψ) merged centroid-major: once per node, not once per row pass and bracket.
+        g_right = green_right_operand(cols_all)
         left_all, right_all = projection_complete(psi_proj_xr, psi_proj_yn, mesh_xy)
         n_mask = int(mask_A.shape[-1])
         idx = jnp.arange(n_mask)
@@ -392,7 +399,7 @@ def _sigma_subtile_kernel(*, mesh_xy, kgrid, brackets, face_shape, face_band_ext
 
         def step(p, x0, xr, accs, operands):
             whole, gemm, conv, project = stages[p]
-            W, Wt, rows, cols, left, right = operands
+            W, Wt, rows, g_right, left, right = operands
             if not whole:
                 W, Wt = (None if a is None else pass_rows(a, mesh_xy, x0, xr, axis=1, spec=w_spec)
                          for a in (W, Wt))
@@ -409,7 +416,7 @@ def _sigma_subtile_kernel(*, mesh_xy, kgrid, brackets, face_shape, face_band_ext
                     out = list(prev)
 
                 def add(acc, sel=sel, band_range=band_range, w_prep=w_prep, rows=rows):
-                    G = green(rows, cols, E_A, sel, E_min, E_max, E_ref_A, t_node, gemm,
+                    G = green(rows, g_right, E_A, sel, E_min, E_max, E_ref_A, t_node, gemm,
                               band_range)
                     sigma = conv(G.G, G.transpose, w_prep, conj_partner=G.conj_partner,
                                  load=g_pass)
@@ -419,7 +426,7 @@ def _sigma_subtile_kernel(*, mesh_xy, kgrid, brackets, face_shape, face_band_ext
             return tuple(out)
 
         accs = fold_passes(passes, step, (zero,) * len(selectors),
-                           (W_q, W_pt, rows_all, cols_all, left_all, right_all))
+                           (W_q, W_pt, rows_all, g_right, left_all, right_all))
         if brackets is None:
             return finish(accs[0])
         return jax.lax.with_sharding_constraint(
