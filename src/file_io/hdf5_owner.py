@@ -131,7 +131,7 @@ def policy() -> str:
     :data:`POLICY_ENV`: ``tools/env_audit.py`` and
     ``tests/test_env_registry.py`` resolve only literal arguments, so
     this read was invisible to the gate that requires a
-    ``docs/dev/env_vars.md`` row — and the variable duly shipped without
+    ``docs/reference/env_vars.md`` row — and the variable duly shipped without
     one.  The constant stays for the messages and the tests.
     """
     got = str(os.environ.get("LORRAX_HDF5_ONE_OWNER", "measure")).strip().lower()

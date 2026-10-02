@@ -8,8 +8,8 @@ NOTHING renamed.
 
 Each process reads/writes its local shard directly to a hyperslab of the
 shared HDF5 file via MPI-IO — no gather through rank 0.  See
-``docs/building_ffi.md`` for the build and ``docs/installation/ffi-native-libs.md``
-for per-cluster setup.
+``docs/installation/ffi-build.md`` for the build and the per-site
+dependencies.
 
 Section docstrings from the merged modules follow inline.
 """

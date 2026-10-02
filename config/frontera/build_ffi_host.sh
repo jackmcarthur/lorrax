@@ -57,7 +57,7 @@
 # lib64.  KNOWN BUG L-2: SLATE host `heev` SIGSEGVs deterministically (even
 # 1×1, n=64) and is REJECTED at resolve time on CPU meshes.  The distributed
 # CPU eigh is ScaLAPACK `pzheevd` (ScalapackEighHostFfi, workstream V);
-# potrf/trsm/ScaLAPACK getrf are clean.  See docs/dev/linalg_ffi.md.
+# potrf/trsm/ScaLAPACK getrf are clean.  See docs/services/distrib_la/backends.md.
 #
 # ----------------------------------------------------------------------------
 # WHICH LIBRARY SUPPLIES WHAT, AND HOW ITS ABSENCE ANNOUNCES ITSELF

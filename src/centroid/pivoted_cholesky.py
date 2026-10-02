@@ -543,7 +543,7 @@ def _auto_gram_width_from_compiled_peaks(
 #: set with a loud note naming the certified rank and its downstream cost;
 #: ``strict`` restores the 2026-08-07 refusal verbatim.  See
 #: :func:`refuse_unless_select_certified` guard (2b) and
-#: ``docs/dev/rank_truncation_policy.md`` §7 for why the default moved.
+#: ``docs/architecture/rank_truncation_policy.md`` §7 for why the default moved.
 #:
 #: Deliberately NOT ``LORRAX_RANK_POLICY``: that dial governs a truncation's
 #: CONDITIONING against a certified kappa ceiling, and this one governs
@@ -587,7 +587,7 @@ def refuse_unless_select_certified(
     it matters — the refusal blocked the most accurate configuration on
     record while passing one 20-56x worse.  It reports, loudly, with the
     downstream cost named, and ``LORRAX_CENTROID_SELECT=strict`` restores the
-    old refusal.  ``docs/dev/rank_truncation_policy.md`` §7 owns this.
+    old refusal.  ``docs/architecture/rank_truncation_policy.md`` §7 owns this.
 
     It is a free function, and public, for one reason: every one of these
     refusals needs a constructible-FALSE twin, and building one through
@@ -704,7 +704,7 @@ def refuse_unless_select_certified(
     # and ``rank`` still counts only certified directions.  The refusal is
     # kept verbatim behind LORRAX_CENTROID_SELECT=strict.
     #
-    # docs/dev/rank_truncation_policy.md §7 owns this ruling.
+    # docs/architecture/rank_truncation_policy.md §7 owns this ruling.
     if rank_i < int(n_keep):
         mode = (os.environ.get(SELECT_MODE_ENV) or SELECT_MODE_DEFAULT
                 ).strip().lower()

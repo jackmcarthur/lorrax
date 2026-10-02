@@ -9,7 +9,7 @@ RUNNABLE ON THE LOGIN NODE with plain ``python3`` — no jax, no h5py::
 
 Why this file exists
 --------------------
-``docs/dev/env_vars.md`` decayed twice: knobs were added, the page was
+``docs/reference/env_vars.md`` decayed twice: knobs were added, the page was
 not, and the drift went unnoticed because the only check was
 ``tools/env_audit.py`` run BY HAND — which was additionally a silent
 no-op on this login node's python 3.7 (``ast.Str`` vs ``ast.Constant``:
@@ -29,7 +29,7 @@ This gate closes the loop mechanically:
   read-wrappers this tree uses (``log_here`` / ``env_flag``), which is
   what the AST walk cannot see;
 * every ``LORRAX_*`` name found on either side must be covered by a row
-  token in ``docs/dev/env_vars.md`` (exact, ``PREFIX*`` glob, or
+  token in ``docs/reference/env_vars.md`` (exact, ``PREFIX*`` glob, or
   ``PREFIX{A,B}`` brace form).
 
 Every auditor has a NEGATIVE CONTROL beside it, because an auditor that
@@ -47,7 +47,7 @@ import sys
 
 _REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 _SRC = os.path.join(_REPO, "src")
-_REGISTRY = os.path.join(_REPO, "docs", "dev", "env_vars.md")
+_REGISTRY = os.path.join(_REPO, "docs", "reference", "env_vars.md")
 
 # ---------------------------------------------------------------------------
 # Load tools/env_audit.py without a package (tools/ has no __init__)
@@ -265,7 +265,7 @@ def test_every_python_lorrax_read_has_a_registry_row():
             sites = ", ".join("%s:%d" % (f, l) for f, l, _ in hits[name][:3])
             missing.append("%s  (read at %s)" % (name, sites))
     assert not missing, (
-        "LORRAX_* env vars read under src/ with NO docs/dev/env_vars.md "
+        "LORRAX_* env vars read under src/ with NO docs/reference/env_vars.md "
         "row — every new env var needs a registry row (project doctrine):"
         "\n  " + "\n  ".join(missing))
 
@@ -322,7 +322,7 @@ def test_the_real_registry_has_no_universal_glob():
             raw_globs.add(tok[:-1])
     bad = universal_globs(raw_globs)
     assert not bad, (
-        "docs/dev/env_vars.md contains %r, a prefix glob covering the whole "
+        "docs/reference/env_vars.md contains %r, a prefix glob covering the whole "
         "%s namespace.  Every read site would be 'covered' and neither "
         "registry test could ever fail.  Write the family out (e.g. "
         "`LORRAX_SLATE_*`), or say 'every LORRAX variable' in words without "
@@ -372,7 +372,7 @@ def test_python_visitor_sees_helper_reads():
 def test_registry_file_exists_and_is_a_registry():
     text = _registry_text()
     assert "LORRAX environment variables" in text.splitlines()[0], (
-        "docs/dev/env_vars.md no longer starts as the registry; the "
+        "docs/reference/env_vars.md no longer starts as the registry; the "
         "vocabulary scrape below is scraping something else")
     exact, globs = registry_vocabulary(text)
     assert len(exact) > 100, (

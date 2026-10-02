@@ -89,7 +89,7 @@ def env_bool(name: str, default: bool, *, print_fn=print) -> bool:
         Environment variable, e.g. ``"LORRAX_DEBUG_PRINT"``.
     default
         Value when the variable is unset or blank.  This is the knob's
-        DOCUMENTED default, not a guess — ``docs/dev/env_vars.md`` is the
+        DOCUMENTED default, not a guess — ``docs/reference/env_vars.md`` is the
         table it has to agree with.
     print_fn
         Where the announcement goes.  Defaults to ``print`` so a caller

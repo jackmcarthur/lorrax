@@ -643,7 +643,7 @@ def refuse_hl_ppm_without_trs(config, sym) -> None:
             "anti-Hermitian residue the real-axis probe cannot carry.\n"
             "  want: compute_mode = gn_ppm (its ordered fit carries both "
             "halves)\n"
-            "  doc:  docs/dev/notes/DERIVATION_gnppm_nonhermitian.md §6.")
+            "  doc:  docs/theory/gn-ppm-nonhermitian.md §6.")
 
 
 def compute_ppm_sigma_pipeline(
@@ -742,7 +742,7 @@ def compute_ppm_sigma_pipeline(
         # tells the fit to split W(iω_p) into its Hermitian and
         # anti-Hermitian halves.  HL keeps the single-residue fit: a
         # real-axis probe cannot carry the odd residue
-        # (``docs/dev/notes/DERIVATION_gnppm_nonhermitian.md`` §6), so an
+        # (``docs/theory/gn-ppm-nonhermitian.md`` §6), so an
         # ordered store refuses HL at setup (``refuse_hl_ppm_without_trs``).
         from .screening import _trs_verdict
         ordered = bool((not is_hl) and (_trs_verdict(sym) is False))

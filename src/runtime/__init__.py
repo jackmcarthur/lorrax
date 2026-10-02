@@ -1291,7 +1291,7 @@ def tune_glibc_malloc() -> bool:
 # (JAX_CPU_COLLECTIVES_IMPLEMENTATION=mpi -> MPItrampoline -> Intel MPI).  The
 # harness sets that, not this module: MPITRAMPOLINE_LIB names a build artifact
 # outside the repo, so the choice has to stay visible in the launch script
-# (docs/dev/mpi_collectives.md).
+# (docs/environment/transports.md).
 #
 # What this function does is make the resolved choice AUDIBLE and enforce the
 # correctness floor.  jax's own
@@ -1308,7 +1308,7 @@ def announce_cpu_collectives() -> None:
     No-op for single-process runs and for non-CPU platforms (GPU collectives
     are NCCL's).  A multi-process CPU run refuses any non-MPI implementation
     and an unset/nonexistent wrapper because gloo's measured failure is
-    silent data corruption (see docs/dev/mpi_collectives.md).
+    silent data corruption (see docs/environment/transports.md).
     """
     if _resolve_proc_count() <= 1:
         return
@@ -1330,13 +1330,13 @@ def announce_cpu_collectives() -> None:
             "This is refused because gloo reduce-scatter is measured to "
             "return plausible wrong data silently (~5% of executions, rc=0) "
             "and is 14-30x slower on this fabric.  Use the machine CPU-MPI "
-            "launch recipe in docs/dev/mpi_collectives.md.")
+            "launch recipe in docs/environment/transports.md.")
     wrap = os.environ.get("MPITRAMPOLINE_LIB", "")
     if not wrap or not os.path.isfile(wrap):
         raise RuntimeError(
             "JAX_CPU_COLLECTIVES_IMPLEMENTATION=mpi requires "
             "MPITRAMPOLINE_LIB to name an existing adapter; use the machine "
-            "CPU-MPI launch recipe in docs/dev/mpi_collectives.md.  Got "
+            "CPU-MPI launch recipe in docs/environment/transports.md.  Got "
             f"{wrap or '<unset>'!r}.")
     if _resolve_proc_id() == 0:
         print(f"[runtime] CPU collectives: mpi (MPItrampoline -> {wrap}).",
@@ -2801,7 +2801,7 @@ def format_startup_report(f: dict) -> list:
         if not c.get("wrapper"):
             add("  WARNING: MPITRAMPOLINE_LIB is unset, so MPItrampoline has "
                 "no wrapper to load and the MPI transport cannot come up; see "
-                "docs/dev/mpi_collectives.md.")
+                "docs/environment/transports.md.")
         add(f"  The MPI transport knobs resolved to "
             f"LORRAX_MPI_FINALIZE_FIX={c.get('finalize_fix')!r} and "
             f"LORRAX_MPI_FORCE_THREAD_MAIN={c.get('force_thread_main')!r}; "
@@ -2822,7 +2822,7 @@ def format_startup_report(f: dict) -> list:
         add("  This is not merely slower: gloo's reduce_scatter is measured "
             "to return wrong data silently in about 5% of executions, with "
             "plausible values and a zero exit code, so results from this run "
-            "cannot be trusted (docs/dev/mpi_collectives.md).")
+            "cannot be trusted (docs/environment/transports.md).")
 
     # -- allocator, from the client ---------------------------------------
     pool = f.get("pool", {})
@@ -3020,7 +3020,7 @@ def format_startup_report(f: dict) -> list:
             "rank-visible directory to turn it on, or leave it unset and let "
             "the resolution order pick one — LORRAX_RUN_DIR/.lorrax_jax_cache "
             "first, then $SCRATCH/lorrax_jax_cache, then the home cache "
-            "(docs/dev/env_vars.md).")
+            "(docs/reference/env_vars.md).")
     add("  The cache key includes every array shape, so a system size this "
         "machine has not run before misses every entry no matter how warm "
         "the cache looks.")

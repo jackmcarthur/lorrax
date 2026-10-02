@@ -332,7 +332,7 @@ def least_squares_transfer(
             f"{1.0/float(rcond):.3e} the rcond={rcond:g} truncation was "
             f"supposed to enforce (closure slack {_slack:.6f}) — the retained "
             f"set is not the one the criterion selected.")
-    # THE GATE (docs/dev/rank_truncation_policy.md §2).  The cap check above
+    # THE GATE (docs/architecture/rank_truncation_policy.md §2).  The cap check above
     # asks whether the code did what it was told — κ_eff ≤ 1/rcond — and
     # that is NECESSARY AND NOT SUFFICIENT: both registered ζ catastrophes
     # satisfied it exactly.  This asks whether the regime is one anyone has

@@ -201,7 +201,7 @@ RULE_UNSUPPORTED_VERSION = "jax-support.version"
 RULE_PRIVATE_ARITY = "jax-support.private-arity"
 RULE_PRIVATE_MISSING = "jax-support.private-missing"
 
-_DOC = "docs/dev/jax_support.md"
+_DOC = "docs/installation/index.md"
 
 
 class JaxSupportError(RuntimeError):

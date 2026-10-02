@@ -20,7 +20,7 @@ The Python half of the flat-k FFT handlers:
                                   slower at the production tiles and deleted.
 
 Contract: ``docs/architecture/services.md`` (``ffi.fft``); the k-convolution
-router: ``docs/architecture/ffi_layout.md``.
+router: ``docs/architecture/kconv.md``.
 
 WHY the service exists: XLA:CPU's ``fft`` custom-call requires the
 transformed axes minor-most, so every ``dot`` (k-major flat) ↔ ``fft``
@@ -1558,7 +1558,7 @@ def klead_outer_decode_refusal(mesh: Mesh, kgrid, n_c: int, optin: int | None = 
 
 
 def _outer_ksum_fma() -> int:
-    """``LORRAX_BSE_OUTER_KSUM`` (A/B, docs/dev/env_vars.md): ``dmma`` (default) runs the outer load's
+    """``LORRAX_BSE_OUTER_KSUM`` (A/B, docs/reference/env_vars.md): ``dmma`` (default) runs the outer load's
     and the fused decode's K sums on the fp64 tensor cores, ``fma`` on the fp64 FMA pipe (the same
     fragment contract; round-off class), for comparing the two where their rates differ (H100, B200).
     Anything else refuses."""

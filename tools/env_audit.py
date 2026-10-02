@@ -34,7 +34,7 @@ C++ ``getenv()`` reads are NOT covered by the AST walk; find those with
 ``grep -rn 'getenv(' src/ffi`` (``tests/test_env_registry.py`` scans them
 by regex and enforces registry rows for both sides).
 
-Keep ``docs/dev/env_vars.md`` in sync with this tool's output.
+Keep ``docs/reference/env_vars.md`` in sync with this tool's output.
 """
 import ast
 import collections

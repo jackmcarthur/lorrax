@@ -3,7 +3,7 @@
 // open_file: collective MPI_Init_thread + H5Fcreate/H5Fopen with cached
 // property lists.
 //
-// Env tunables (all optional; docs/dev/env_vars.md is the registry).
+// Env tunables (all optional; docs/reference/env_vars.md is the registry).
 // Boolean knobs accept the shared writer grammar — see env_flag below
 // (mirrors Python's runtime.env_flags.env_bool; tests/test_env_grammar.py):
 //   LORRAX_PHDF5_COLLECTIVE_WRITES (1)  collective vs independent writes

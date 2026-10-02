@@ -1737,7 +1737,7 @@ def _host_chunk_bytes() -> int:
 
     THE SAME KNOB AS THE ROUTINE THIS ONE MIRRORS, not a second number.
     ``LORRAX_COLLECTIVE_CHUNK_MB`` is the calibrated per-instruction
-    transport cap (default 128 MB; ``docs/dev/env_vars.md``), and
+    transport cap (default 128 MB; ``docs/reference/env_vars.md``), and
     ``common.collectives._owner_gather_chunk_bytes`` is its one resolver —
     imported here rather than re-derived, so a recalibration reaches this
     path too.  A hard-coded ``1 << 28`` stood here until 2026-08-05, which

@@ -179,7 +179,7 @@ def make_sharded_fftn_3d(
 # "today" number and the 9-k fixture's 0.07%-of-wall does not generalise.
 # Stride descriptors read the dot-layout tile where it lies, so the transposes
 # disappear instead of moving.  Contract: ``docs/architecture/services.md``
-# (``ffi.fft``); the k-convolution router: ``docs/architecture/ffi_layout.md``.
+# (``ffi.fft``); the k-convolution router: ``docs/architecture/kconv.md``.
 #
 # What stays here: the OWNER RULE that these helpers are the single FFT entry
 # point (``make_flat_k_fft`` below is still the only entry point), and the XLA

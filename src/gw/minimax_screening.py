@@ -238,7 +238,7 @@ class LaplaceMinimaxQuadrature:
     #: ``with_odd_kernel=True``; the last ``n_odd_extra`` nodes of ``tau``
     #: then carry ``alpha == 0`` (they exist for the odd part alone, so the
     #: even accumulation is numerically the served even rule).  See
-    #: ``docs/dev/notes/DERIVATION_gnppm_nonhermitian.md`` section 2.
+    #: ``docs/theory/gn-ppm-nonhermitian.md`` section 2.
     alpha_odd: np.ndarray | None = None
     max_error_odd: float = float("nan")
     n_odd_extra: int = 0
@@ -298,7 +298,7 @@ class GNPPMFitResult:
     omega_max_after: float = float("nan")
     tail_anchor_omega: float = float("nan")
     #: The ODD residue ``D = (R_+ - R_-)/2`` of the ordered-orientation fit
-    #: (``docs/dev/notes/DERIVATION_gnppm_nonhermitian.md`` section 3),
+    #: (``docs/theory/gn-ppm-nonhermitian.md`` section 3),
     #: Hermitian elementwise, zero on dead modes.  ``None`` is the incumbent
     #: single-residue model (``R_+ = R_- = B_qmunu``), the only model a
     #: time-reversal-symmetric deck ever sees.
@@ -341,7 +341,7 @@ def fit_gn_ppm_from_wc_pair(
         the odd residue ``D = i*a*(omega_p^2 + Omega^2)/(2*omega_p)`` in
         ``B_odd_qmunu`` so that the conduction branch of Sigma consumes
         ``R_+ = B + D`` and the valence branch ``R_- = B - D``
-        (``docs/dev/notes/DERIVATION_gnppm_nonhermitian.md`` sections 3-4).
+        (``docs/theory/gn-ppm-nonhermitian.md`` sections 3-4).
         Requires a purely imaginary probe: at a real probe ``W^c`` is Hermitian
         for any system and the odd residue is unobservable.  On a Hermitian
         input ``D`` is exactly zero and ``Omega``/``B`` agree with the incumbent
@@ -432,7 +432,7 @@ def fit_gn_ppm_from_wc_pair(
                 "  why:  the odd residue is read from the anti-Hermitian "
                 "part of Wc(i*omega_p), which a real or zero probe cannot "
                 "carry\n"
-                "  doc:  docs/dev/notes/DERIVATION_gnppm_nonhermitian.md")
+                "  doc:  docs/theory/gn-ppm-nonhermitian.md")
 
     # --- q-CHUNKED EVALUATION (movement-only; see the note above the kernel).
     # Leading axis is the q family; the trailing two are (mu, nu).  One q-slice
@@ -1018,7 +1018,7 @@ def _gn_ppm_fit_kernel_ordered(Wc0_qmunu, Wc_probe_qmunu, z_probe, fallback,
     probe.  The elementwise fit is handed the HERMITIAN half of
     ``W^c(i*omega_p)`` -- ``(W + W^H)/2`` over the trailing ``(mu, nu)`` pair
     -- so ``Omega`` stays real symmetric and ``B`` Hermitian whatever the
-    deck (``docs/dev/notes/DERIVATION_gnppm_nonhermitian.md`` section 3).
+    deck (``docs/theory/gn-ppm-nonhermitian.md`` section 3).
     On the ``P(None, 'x', 'y')`` layout the adjoint is an X<->Y tile permute
     (:func:`common.collectives.transpose_xy` on ``xy_mesh``): one tile per
     rank, where a GSPMD ``swapaxes`` all-gathered ~3 global (q, mu, nu)

@@ -482,7 +482,7 @@ def test_defect2_malloc_trim_off_disables_trim():
 def test_defect2_agrees_with_its_documented_sibling():
     """MALLOC_TRIM and MALLOC_TUNE must answer the same for every token.
 
-    They are advertised as a pair in ``docs/dev/env_vars.md:116-117``; the
+    They are advertised as a pair in ``docs/reference/env_vars.md``; the
     defect was that only one of them honoured ``OFF``.
     """
     for tok in FALSE_SPELLINGS + TRUE_SPELLINGS:

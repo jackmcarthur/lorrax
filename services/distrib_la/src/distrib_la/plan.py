@@ -435,8 +435,8 @@ class Plan:
             The reason it is worth a named route: for every matrix that
             fits on one device, the distributed libraries' cost IS their
             fixed per-call charge, which the native replicated eigh does
-            not pay (the per-call rule: § Performance in
-            ``docs/services/distrib_la.md``).
+            not pay (the per-call rule: § "Distributed is a capacity route" in
+            ``docs/services/distrib_la/backends.md``).
             Route (c) serves that whole regime with no distributed-library
             call at all, and it is how small-system linalg happens without
             a second, parallel API.

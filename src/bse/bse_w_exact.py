@@ -594,7 +594,7 @@ def _kramers_canonicalize_trim_block(Psi, R, *, where="a TRIM block"):
             f"outside the band window or a degeneracy grouping tolerance "
             f"that merged two blocks.\n"
             "  doc: bse_w_exact.enforce_trs_pair_gauge, "
-            "docs/dev/rank_truncation_policy.md §3")
+            "docs/architecture/rank_truncation_policy.md §3")
     V = np.stack(cols, axis=1)
     _refuse_unless_rotation_is_unitary(V, where=where, kind="Kramers")
     return np.tensordot(V.T, Psi, axes=(1, 0))

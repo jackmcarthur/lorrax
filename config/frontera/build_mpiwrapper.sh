@@ -43,7 +43,7 @@
 # the AS.4b ~29% class.  It retires only if jaxlib stops requesting
 # MPI_THREAD_FUNNELED -- an upstream change.  That is the remaining exit, and
 # it is the only reason this script still needs to exist.
-# See docs/dev/mpi_collectives.md and wk_REL/jax_threadmain_alternatives.md.
+# See docs/environment/transports.md and wk_REL/jax_threadmain_alternatives.md.
 #
 # ----------------------------------------------------------------------------
 # WHAT THIS IS AND WHY IT EXISTS
@@ -101,8 +101,8 @@
 #       Default OFF: with the variable unset the wrapper's behaviour is
 #       byte-for-byte the certified (1)-only wrapper.
 #
-# See docs/dev/mpi_collectives.md for the full rationale, the evidence, and
-# the launch recipe.  Env-var rows: docs/dev/env_vars.md
+# See docs/environment/transports.md for the full rationale, the evidence, and
+# the launch recipe.  Env-var rows: docs/reference/env_vars.md
 # (LORRAX_MPI_FORCE_THREAD_MAIN, MPITRAMPOLINE_LIB, LORRAX_MPI_FINALIZE_FIX).
 #
 # ----------------------------------------------------------------------------
@@ -299,5 +299,5 @@ Opt-in:     LORRAX_MPI_FORCE_THREAD_MAIN=1  -> MPI_Is_thread_main reports true,
             whose grouped collectives are first issued inside a jitted region.
             Unset  -> byte-for-byte the certified always-on-only behaviour.
 
-Launch recipe: docs/dev/mpi_collectives.md
+Launch recipe: docs/environment/transports.md
 EOF

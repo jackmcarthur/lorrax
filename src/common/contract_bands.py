@@ -795,7 +795,7 @@ def contract_bands_block_reshard(
         own de-promoted chain — the two-channel (S_R, S_I) plan required
         by consumers that weight the channels independently (crossing
         windows; channel algebra: gw.ppm_tau_kernel and
-        docs/dev/notes/DERIVATION_gnppm_nonhermitian.md §5).
+        docs/theory/gn-ppm-nonhermitian.md §5).
         Returns the tuple ``(S_R, S_I)``, both complex.  Incompatible
         with ``extra`` (refused): stack the channel pair yourself as a
         real leading-extra operand if you need both.  Under

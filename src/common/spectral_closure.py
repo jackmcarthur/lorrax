@@ -192,7 +192,7 @@ RELATION TO ``common/rank_criterion``
 -------------------------------------
 The whole policy — this module, ``rank_criterion`` and the band-axis twin
 ``band_degeneracy`` — is written down once in
-``docs/dev/rank_truncation_policy.md``; read that for the site register and
+``docs/architecture/rank_truncation_policy.md``; read that for the site register and
 the certified κ ceiling.
 
 That module decides HOW MANY directions to keep and why (a cap on how much
