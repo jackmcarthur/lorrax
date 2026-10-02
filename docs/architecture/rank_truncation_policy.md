@@ -1,5 +1,11 @@
 # Rank truncation: one criterion, one gate, two dials
 
+This page states when LORRAX may discard directions of a spectrum (the ζ-fit
+Gram, a least-squares transfer, a probe set) and what refuses when it may
+not. It is for anyone reading a truncation receipt in `gwjax.out` or adding a
+new truncation site; read [ISDF ζ and V](../theory/isdf-zeta-vq.md) first
+for the operators being truncated.
+
 A user never chooses a truncation. Conditioning worsens with system size, so
 every rank cut either stays inside a certified regime or refuses, naming the
 number, the site and the fix.

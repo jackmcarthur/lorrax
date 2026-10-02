@@ -1,5 +1,11 @@
 # Large-N_μ operation: running fully distributed
 
+This page explains how to run LORRAX when the ISDF basis is so large that no
+rank can hold a whole `(N_μ·n_spinor)²` tile, and what each stage then costs
+per rank. It is for anyone planning a run at hundreds to thousands of
+low-memory processes. Read [the memory model](../architecture/memory-model.md)
+for the per-stage closed forms this page applies.
+
 LORRAX targets thousands of low-memory processes, where no
 `(N_μ·n_spinor)²` tile fits on one rank. Every dense solve therefore has two
 storage plans:
@@ -13,7 +19,7 @@ storage plans:
   bit-exact.
 
 The deck selects between them with one key, `linalg = local | distributed`;
-the fields it resolves to are tabulated in [linalg_ffi.md](linalg_ffi.md#the-deck-dial).
+the fields it resolves to are tabulated in [the `distrib_la` backends page](../services/distrib_la/backends.md#the-deck-dial).
 An explicit distributed request refuses rather than downgrading.
 
 Conventions: mesh `(P_x, P_y)`, `P = P_x·P_y`, `μ` = padded centroid count,
@@ -39,7 +45,7 @@ buffers complex128 (16 B).
 
 Distributed backends check platform, compiled handler, one process per
 device, mesh geometry and divisibility before any collective
-([distrib_la](../services/distrib_la.md#contract)). The runtime builds only
+([the guard ladder](../services/distrib_la/backends.md#guard-ladder)). The runtime builds only
 square meshes (a nonsquare P refuses; [decisions](../architecture/decisions.md)),
 which satisfies every backend's geometry rule; the matrix extent must still
 divide both axes.
@@ -66,10 +72,10 @@ either layout and says so once in its plan receipt (`ζ back-solve = …`).
 | `LORRAX_ZETA_REPLICATE_CAP_GIB` | 4 | whether the rank-truncating factor may run replicated at all; per q-batch, so μ ≤ `sqrt(cap/16)` |
 | `LORRAX_COLLECTIVE_CHUNK_MB` | 128 | payload of one emitted collective in the distributed W Dyson A-build (host-level q-block loop XLA cannot re-fuse); a single q whose collective exceeds it is sent whole with a warning |
 
-Spellings and grammar: [env_vars.md](env_vars.md). The ScaLAPACK
-workspace and MKL-thread behaviour: [linalg_ffi.md](linalg_ffi.md#inside-the-scalapack-handlers).
+Spellings and grammar: [the registry](../reference/env_vars.md). The ScaLAPACK
+workspace and MKL-thread behaviour: [inside the ScaLAPACK handlers](../services/distrib_la/backends.md#inside-the-scalapack-handlers).
 
-## What does not yet divide by P
+## What does not divide by P
 
 * **`bse/vq_interp`** (on the `exciton_bands` and `bse_k_grid` paths). `Fch`,
   the `(Q, μ, nG)` cleaned long-range form factors, is a host array on every
@@ -86,8 +92,7 @@ workspace and MKL-thread behaviour: [linalg_ffi.md](linalg_ffi.md#inside-the-sca
 ## Launch
 
 The launcher, not the deck, owns the transport. CPU collectives run
-`impl=mpi` ([MPI collectives](mpi_collectives.md),
-[transports](../environment/transports.md)). The `srun --mpi=` flavour must
+`impl=mpi` ([transports](../environment/transports.md)). The `srun --mpi=` flavour must
 match the MPI stack (`pmi2` for Intel MPI on Frontera, `cray_shasta` on
 Perlmutter); a mismatch gives every rank a private `MPI_COMM_WORLD`, and
 [SlabIO](../architecture/slab_io.md) owns that failure and its refusal.
