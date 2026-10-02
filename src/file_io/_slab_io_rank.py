@@ -324,7 +324,7 @@ class StreamedBank:
         self.shapes = tuple((int(r), int(c)) for r, c, _ in segments)
         self.rects = tuple(tuple(tuple(int(v) for v in r) for r in places) for _, _, places in segments)
         self.tile = tuple(int(v) for v in tile)
-        self.dir = Path(root or ".") / "streamed_bank"
+        self.dir, self.label = Path(root or ".") / "streamed_bank", str(label)
         # A store that is read before every record is written (the W bank) reads
         # unwritten records as the zeros the reservation holds (digest 0).
         self.unwritten_zero = bool(unwritten_zero)
@@ -567,7 +567,8 @@ class StreamedBank:
             try:
                 future.result()
             except BaseException as exc:
-                self._read_error = self._read_error or exc
+                self._read_error = self._read_error or OSError(
+                    f"GATE streamed_bank: {self.label} outputs {list(runs)} unread: {exc!r}")
         self.reads["pread"] += time.monotonic() - started
         self.seconds["read"] += time.monotonic() - started
         then = tuple((int(a), int(b)) for a, b in then)
@@ -599,11 +600,12 @@ class StreamedBank:
         try:
             for runs, digest in checks:
                 if not self.unwritten_zero and not all(self.written[a:b].all() for a, b in runs):
-                    raise OSError(f"GATE streamed_bank: runs {runs[:3]}… were not all written")
+                    raise OSError(f"GATE streamed_bank: {self.label} outputs {list(runs)} were not all written")
                 for shard in digest.addressable_shards:
                     expected = np.concatenate([self.digests[shard.device][a:b] for a, b in runs])
                     if not np.array_equal(np.asarray(shard.data)[0, 0], expected):
-                        raise OSError(f"GATE streamed_bank: digest mismatch reading runs {runs[:3]}…")
+                        raise OSError(f"GATE streamed_bank: {self.label} outputs {list(runs)} "
+                                      "do not match their write digests")
         except BaseException as exc:
             error = error or exc
         return error
