@@ -127,8 +127,10 @@ def _round_kernels(mesh, layout="batch"):
         return program(lambda q: tuple(q[:, i] for i in range(count)), (batch,), (batch,) * count)
     apply = program(lambda m, q: mm(m,q), (batch, batch), batch)
     negative_hermitian = program(lambda a: -(a + adjoint(a)) / 2, (batch,), batch)
+    hermitian = program(lambda a: (a + adjoint(a)) / 2, (batch,), batch)
     return SimpleNamespace(
         take=take, column=column, columns=columns, negative_hermitian=negative_hermitian,
+        hermitian=hermitian,
         minus_q_partner=minus_q_partner, act=act, apply=apply,
         stack=program(lambda *a:jnp.stack(a,axis=1),batch,batch),
         dedupe=program(dedupe, (batch, batch), (batch, batch)))
@@ -177,6 +179,22 @@ def leading_response_directions(matrix, width, **kwargs):
     """
     return distrib_la.leading_eigenvectors(
         matrix, width, rcond=matrix.shape[-1] * np.finfo(np.float64).eps, **kwargs)
+
+
+def infinity_directions(kernels, m1, width, **kwargs):
+    """Leading directions of the exact moment M1, read from its Hermitian part.
+
+    M1 is Hermitian (chi(conj z)^H = chi(z)). The Dyson chain that forms it
+    from Hermitian bare moments and Coulomb roots (each anti-Hermitian at
+    <= 4e-16 of its max) leaves an anti-Hermitian rounding part of 2.5e-13 to
+    1.0e-12 of max|M1| at n = 3328 (CrI3 24x24, 61 parents), at the checked
+    eigh's 1e-12 limit. The selection therefore reads Herm M1, as the
+    imaginary supports read -Herm W; the bare moments are checked Hermitian
+    where they are produced (GATE response_moment_hermiticity). The local and
+    batch-reshard eighs symmetrize their input, so their spectra and vectors
+    are unchanged bit for bit; the moment actions keep M1 as stored.
+    """
+    return leading_response_directions(kernels.hermitian(m1), width, **kwargs)
 
 
 def _role_entries(recipe):

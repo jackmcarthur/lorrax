@@ -239,6 +239,46 @@ def _host_spectrum(s):
     return bits.view(values.dtype)[..., ::-1].copy()
 
 
+@lru_cache(maxsize=16)
+def _row_health_kernel(mesh):
+    """Per-row [finite, max|W - W^H|, max|W|] of a square stack, replicated."""
+    @jax.jit(out_shardings=NamedSharding(mesh, P()))
+    def health(w):
+        defect = jnp.max(jnp.abs(w - jnp.conj(jnp.swapaxes(w, -1, -2))), axis=(-2, -1))
+        scale = jnp.max(jnp.abs(w), axis=(-2, -1))
+        finite = jnp.all(jnp.isfinite(w), axis=(-2, -1)).astype(defect.dtype)
+        return jnp.stack([finite, defect, scale], axis=-1)
+    return health
+
+
+def _refuse_nonfinite_spectrum(W, values, *, mesh, what):
+    """Name each row without a finite spectrum and why; a no-op when all are finite.
+
+    ``values`` are replicated, so every rank takes this branch together and
+    runs the one collective diagnostic. A synthetic row is zero and finite.
+    """
+    rows = np.asarray(values)
+    rows = rows.reshape(-1, rows.shape[-1])
+    bad = np.flatnonzero(~np.all(np.isfinite(rows), axis=-1))
+    if not bad.size:
+        return
+    health = np.asarray(_row_health_kernel(mesh)(W)).reshape(-1, 3)
+    causes = []
+    for i in bad[:8]:
+        finite, defect, scale = health[i]
+        ratio = defect / scale if scale > 0 else 0.0
+        if not finite:
+            cause = "input not finite"
+        elif ratio > 1e-12:
+            cause = f"input not Hermitian, max|W-W^H|/max|W| = {ratio:.3e} > 1e-12"
+        else:
+            cause = (f"input finite and Hermitian (max|W-W^H|/max|W| = {ratio:.3e}, "
+                     f"max|W| = {scale:.3e}); the eigensolver returned no spectrum")
+        causes.append(f"row {int(i)}: {cause}")
+    raise ValueError(f"{what} must be finite rank-1 rows; {bad.size} of {rows.shape[0]} "
+                     f"rows are not: " + "; ".join(causes))
+
+
 def _retained_columns(
     Q, values, count, *, mesh, column_extent, layout='face', descending=False,
 ):
@@ -492,6 +532,8 @@ def leading_eigenvectors(W, r, *, eigh_plan, column_extent,
         else:
             s, q = eigh_plan.batched(W)
     values = _host_spectrum(s)
+    _refuse_nonfinite_spectrum(W, values, mesh=eigh_plan.mesh,
+                               what="leading eigenvalue spectra")
     count = _leading_counts(
         values, r, multiplet_tol=multiplet_tol, real_rows=real_rows,
         batched=values.ndim > 1, rcond=rcond)

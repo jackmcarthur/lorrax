@@ -620,7 +620,7 @@ def construct_diagonal_sector_round(samples, moments, meta, config, geometry, *,
     from gw.gw_config import linalg_resolution
     from gw.shared_pole_capacity import ConstructorCapacity,round_padding_output_bytes
     from gw.shared_pole_directions import (_round_kernels,line_panel_states,port_extent,
-                                           select_round_states,leading_response_directions)
+                                           select_round_states,infinity_directions)
     from gw.shared_pole_local import round_tables,reduce_round,grow_round,carrier_history
 
     from gw.shared_pole_execution import is_face, face_reduce_round
@@ -650,10 +650,10 @@ def construct_diagonal_sector_round(samples, moments, meta, config, geometry, *,
                 selection_faces=selection_faces)
     eig=budget.eigenplan(local_meta.n_rmu_padded)
     extent=port_extent(mesh_xy)
-    qi,values=leading_response_directions(moments['M1'],min(n,recipe['infinity_width']),
+    kernels=_round_kernels(mesh_xy,'face' if execution=='face' else 'batch')
+    qi,values=infinity_directions(kernels,moments['M1'],min(n,recipe['infinity_width']),
         eigh_plan=eig,column_extent=extent,multiplet_tol=recipe['multiplet_relative_tolerance'],
         real_rows=None if execution=='face' else geometry['real'])
-    kernels=_round_kernels(mesh_xy,'face' if execution=='face' else 'batch')
     infinity=(qi,*(kernels.apply(moments[name],qi) for name in ('M0','M1','M2','M3')))
     # Synthetic local slots select nothing, as a dense selection's do.
     real=geometry['real']
