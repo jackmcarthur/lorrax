@@ -37,6 +37,7 @@ import shutil
 import subprocess
 import threading
 import time
+import traceback
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from functools import lru_cache
@@ -121,6 +122,11 @@ def _record_run(mesh, shape, rows, padded16):
 
 
 _COMPILED: dict = {}
+#: One dispatch at a time of the programs that land pieces in host memory: XLA
+#: keeps one async-copy event per (executable, copy instruction, device), so two
+#: drain threads dispatching the same program at once fail with "Async copy event
+#: already exists!" (Ni 20³ P64: the W bank's fields drain concurrently).
+_OFFLOAD = threading.Lock()
 
 
 def _compiled_program(builder, mesh, shape, sharding, n_scalars, *static):
@@ -434,10 +440,11 @@ class StreamedBank:
                 store.write(memoryview(source), o * self.S + self.starts[p] + 16 * a)
 
         for program, row, o, a in work:
-            if a is None:
-                stage(program(carry, np.int64(row)), o, 0)
-            else:
-                stage(program(carry, np.int64(row), np.int64(a)), o, a)
+            with _OFFLOAD:
+                host = (program(carry, np.int64(row)) if a is None
+                        else program(carry, np.int64(row), np.int64(a)))
+            stage(host, o, 0 if a is None else a)
+            del host
         del carry, work
         while staged:
             staged.popleft().result()
@@ -454,6 +461,9 @@ class StreamedBank:
         try:
             self.seconds["write"] += self._inflight.popleft().result()
         except BaseException as exc:
+            # The agreed refusal carries the message; this rank's log keeps the stack.
+            print("[slab_io] streamed store drain failed on this rank:\n"
+                  + "".join(traceback.format_exception(exc)), flush=True)
             self._error = self._error or exc
         self.seconds["wait"] += time.monotonic() - started
 
