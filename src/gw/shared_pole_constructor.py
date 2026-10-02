@@ -49,7 +49,8 @@ def constructor_route(meta, config, recipe, *, mesh_xy, ledger, upstream, ordere
         mesh=mesh_xy, ledger=ledger, upstream=upstream, ordered=ordered,
         odd_moments=odd_moments, selection_faces=faces,
         sample_batch=len(recipe["fit_ids"]) - line_panel_count(recipe), parent_count=int(nq),
-        column_extent=column_extent)
+        column_extent=column_extent,
+        ritz_budget=recipe.get("pole_budget") if ordered else None)
     return execution, receipt, column_extent, faces, moment_fields
 
 
