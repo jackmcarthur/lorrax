@@ -128,7 +128,7 @@ def constructor_execution(meta, resolution, recipe, *, mesh, ledger, upstream,
                           ordered, odd_moments, selection_faces, sample_batch,
                           parent_count=1, retained_output_families=1,
                           cross_original_sides=None, cross_retained_side=None,
-                          column_extent=lambda width: width):
+                          column_extent=lambda width: width, ritz_budget=None):
     """Resolve local or whole-mesh execution once, before a constructor read.
 
     ``selection_faces`` counts the selection's resident [n,n] faces
@@ -143,6 +143,8 @@ def constructor_execution(meta, resolution, recipe, *, mesh, ledger, upstream,
     the full mesh, where ``face_batch_width`` sizes the batch. A measured
     pencil is never consulted: a local round could not leave the route once
     its selection is held (CrI3 24x24 at P64, 40 GB: local pencil 64 GB/rank).
+    ``ritz_budget`` is the pole budget of a local paired (ordered scalar)
+    reduction, priced as that program is (``ConstructorCapacity.ritz_budget``).
     """
     from gw.shared_pole_capacity import ConstructorCapacity
 
@@ -159,6 +161,7 @@ def constructor_execution(meta, resolution, recipe, *, mesh, ledger, upstream,
     local = ConstructorCapacity(meta, resolution, mesh_xy=mesh, ledger=ledger,
                                 upstream=upstream, execution='local')
     local.batch_width = int(mesh.size)
+    local.ritz_budget = ritz_budget
     pole_budget = recipe.get('pole_budget')
     if pole_budget is None:
         pole_budget = int(meta.n_rmu)
