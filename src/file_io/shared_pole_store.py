@@ -22,7 +22,7 @@ from jax.sharding import NamedSharding, PartitionSpec as P
 
 from runtime.padding import combined_divisor, padded_axis
 from common import timing
-from common.collectives import (device_put_process_local, process_rank, psum_replicate,
+from common.collectives import (agree_io_error, device_put_process_local, process_rank, psum_replicate,
                                 rank0_transaction)
 from file_io.slab_io import SlabIO, mesh_divisible_shape
 from file_io.commit_state import agree_io_refusal, assert_committed, set_commit_state
@@ -1385,6 +1385,7 @@ class ResidentBankPayload:
         self._logical = {}
         self._stored = {}
         self._pending = set()
+        self._depth, self._read = 0, False
 
     def __str__(self):
         tier = {"device": "device-resident", "host": "host-resident",
@@ -1392,10 +1393,23 @@ class ResidentBankPayload:
         return f"{tier} shared-pole bank ({self.label})"
 
     def __enter__(self):
+        self._depth += 1
         return self
 
     def __exit__(self, *_exc):
+        # Tier reads inside a ``with`` are checked and agreed once, here, before the
+        # caller uses them (one control-store round per constructor round, not per read).
+        self._depth -= 1
+        if not self._depth:
+            self._agree_reads()
         return False
+
+    def _agree_reads(self):
+        if self._read:
+            self._read, error = False, None
+            for store in self._fields.values():
+                error = store.check_reads() or error
+            agree_io_error(error, path=str(self.root), stage="resident_bank.read")
 
     def payload_bytes_per_rank(self):
         return sum(_local_bytes(shape, np.complex128, self.mesh, self._spec(len(shape)))
@@ -1510,8 +1524,15 @@ class ResidentBankPayload:
                 self._pending.discard(name)
             nq, q0, span = stored[0], offset[0], shape[0]
             leads = range(offset[1], offset[1] + shape[1]) if len(shape) == 4 else (0,)
-            runs = list(store.reader([(s * nq + q0, s * nq + q0 + span) for s in leads]))
-            value = _tier_stack(self.mesh, len(shape))(*runs)
+            # One load per call, every lead's run in flight together; the next parent
+            # batch's preads start behind it.
+            nxt = q0 + span if q0 + 2 * span <= nq else None
+            value = _tier_lead(self.mesh, len(shape), len(leads))(store.read_runs(
+                [(s * nq + q0, s * nq + q0 + span) for s in leads],
+                then=() if nxt is None else [(s * nq + nxt, s * nq + nxt + span) for s in leads]))
+            self._read = True
+            if not self._depth:
+                self._agree_reads()
         layout = _bank_layout(None if tuple(partition_spec) == tuple(face) else partition_spec)
         return value if layout == "face" else _bank_face_to_batch(self.mesh, value.ndim)(value)
 
@@ -1525,12 +1546,13 @@ def _tier_tiles(mesh, shape, k):
 
 
 @lru_cache(maxsize=None)
-def _tier_stack(mesh, ndim):
-    """Tier reads ``[q, 1, R, C]`` per lead index → the face span ``[q, (n,), R, C]``."""
+def _tier_lead(mesh, ndim, n):
+    """A tier read ``[n·q, 1, R, C]`` (lead-major runs) → the face span ``[q, (n,), R, C]``."""
     spec = NamedSharding(mesh, P(*((None,) * (ndim - 2)), "x", "y"))
     if ndim == 3:
         return jax.jit(lambda run: run[:, 0], out_shardings=spec)
-    return jax.jit(lambda *runs: jnp.concatenate(runs, axis=1), out_shardings=spec)
+    return jax.jit(lambda run: jnp.swapaxes(run.reshape((n, -1) + run.shape[2:]), 0, 1),
+                   out_shardings=spec)
 
 
 def _resident_zeros(mesh, shape):
