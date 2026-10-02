@@ -207,11 +207,21 @@ def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output, resi
         ranks = mesh_divisor(mesh_xy)
         face_batch = 1
         if execution == 'face':
+            from gw.shared_pole_capacity import constructor_eigenplan, face_eigh_room
             from gw.shared_pole_execution import face_batch_width
             face_batch, execution_receipt['face_batch'] = face_batch_width(
                 meta, resolution, mesh=mesh_xy, ledger=ledger, upstream=upstream,
                 side=conservative_side, sample_batch=len(dense_fit),
                 selection_faces=selection_faces, nq=nq)
+            # The n x n eighs (infinity, direction selection, partner
+            # directions, passivity) take one whole matrix per rank when that
+            # fits beside the admitted selection, instead of a full-mesh call
+            # per matrix (CrI3 24x24, n 3328, P64: 0.88 s per matrix on the
+            # mesh, 0.24 s on one A100).
+            room = face_eigh_room(execution_receipt['face_batch']['selection'],
+                                  execution_receipt['retained_output_upper_bound_bytes_per_rank'])
+            eig = constructor_eigenplan(mesh_xy, n, 'face', room)
+            execution_receipt['face_eigh_room_bytes_per_rank'] = room
         from gw.shared_pole_execution import sector_round_schedule
         rounds = [row[:3] for row in sector_round_schedule(
             bank, header, meta, config, mesh_xy, execution=execution, batch_width=face_batch)]
@@ -412,7 +422,7 @@ def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output, resi
             passive, held_errors, reciprocity, moment_defects = check_round(
                 round_model, round_signed, inverse_sqrt, held, (exact["M1"], exact["M3"]), qi,
                 real=real, nodes=[_sample_point(recipe, i) for i in held_ids], eta_ry=recipe["eta_ev"] / RYD_TO_EV,
-                mesh_xy=mesh_xy, eigh_plan=local_eigh, ordered=ordered)
+                mesh_xy=mesh_xy, eigh_plan=eig if execution == 'face' else local_eigh, ordered=ordered)
             del inverse_sqrt, held, exact
         with phase("gates"):
             for slot, q in enumerate(ids[:real]):
