@@ -326,7 +326,8 @@ def reduce_ordered_shared_pole_pencil(pencil, active_columns, *, eigh, matmul, g
     directions, the largest first, so K <= keep_budget. On a rank-local
     pencil the kept span is solved on its last ``carrier`` columns (default
     ``keep_budget``); a kept count above the carrier (``retained_rank``) is
-    the caller's to rerun wider. The second cut acts on
+    the caller's to rerun wider. A face pencil does the same on a ``carrier``
+    of at least ``keep_budget`` that tiles the mesh. The second cut acts on
     the eigenvalues of S relative to max(top(S), 1), the top of diag(S, I)
     (the kept v directions stay), and Y = L^-H on the kept
     span is P diag(U_S Gamma_S^-1/2, I) with P = [[I, 0], [-B^H, I]], corrected
@@ -384,12 +385,17 @@ def reduce_ordered_shared_pole_pencil(pencil, active_columns, *, eigh, matmul, g
     keep = ((gamma > keep_cut * largest[:, None]) & (largest[:, None] > 0)
             & _within_budget(gamma, keep_budget))
     count = jnp.sum(keep, axis=-1, dtype=jnp.int64)
-    # Budget-excluded columns are exactly zero; omit them from local dense work.
+    # Budget-excluded columns are exactly zero; omit them from the dense work
+    # below. A rank-local pencil keeps ``carrier`` columns (default
+    # ``keep_budget``); a face pencil keeps them only when its caller gives a
+    # carrier that tiles the mesh (``shared_pole_execution.face_ritz_carrier``).
     width = gamma.shape[-1]
-    if matrix_sharding is None and face is None and keep_budget is not None:
+    if (keep_budget is not None and face is None
+            and (matrix_sharding is None or carrier is not None)):
         width = min(width, max(1, int(keep_budget if carrier is None else carrier)))
     kept, values = keep[:, -width:], gamma[:, -width:]
-    z = u[..., -width:] * (kept / jnp.sqrt(jnp.where(kept, values, 1)))[:, None, :]
+    z = _matrix_layout(u[..., -width:] * (kept / jnp.sqrt(jnp.where(kept, values, 1)))[:, None, :],
+                       matrix_sharding)
     del u
     metric = matmul(z, matmul(h_vv, z), transa="C")
     null_identity = diagonal_like(~kept, metric)
