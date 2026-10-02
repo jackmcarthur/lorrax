@@ -35,8 +35,9 @@ srun --jobid=$JOBID -N 1 -n 4 --gpus-per-node=4 src/ffi/cpp/select_gpu.sh \
   .venv/bin/python -m pytest tests/hsuite -q -p no:cacheprovider
 ```
 
-With a module, run the same `srun` line from `$LORRAX_ROOT` with `python` in
-place of `.venv/bin/python`. The fixture chain alone, on one GPU with its
+With a module, run the same `srun` line from `$LORRAX_ROOT`, without the
+`source` line (the module sets those variables) and with `python` in place of
+`.venv/bin/python`. The fixture chain alone, on one GPU with its
 output on a shared filesystem, is
 
 ```bash
@@ -53,10 +54,12 @@ LORRAX starts from a BerkeleyGW-format `WFN.h5`; producing one from a crystal is
 [Inputs from DFT](preprocessing.md).
 
 1. [Select ISDF points](theory/centroid-selection.md) from the requested band-pair feature metric.
-2. Load reciprocal wavefunctions and sample their centroid faces.
-3. [Fit $Z_q$ in G space and solve for $\zeta_q$](architecture/zeta_fit_mubatch.md) in centroid batches.
+2. Load the plane-wave wavefunctions and evaluate them at the centroids
+   $r_\mu$, stored as 2-D sharded faces $\psi_{n\mathbf k}(\mu)$ (centroids on
+   one mesh axis, bands on the other).
+3. [Fit the right-hand side $Z_q$ of the normal equations $C_q\zeta_q = Z_q$ in G space and solve for the interpolation vectors $\zeta_q$](architecture/zeta_fit_mubatch.md) in centroid batches.
 4. [Build $V_q$](theory/isdf-zeta-vq.md) from the interpolation vectors and Coulomb kernel.
-5. Build the Green's function $G$ and (optionally) $\chi_0$ and screened interaction $W$
+5. Build the Green's function $G$ and (optionally) $\chi_0$ and screened interaction $W$.
 6. Form the requested self-energy and project to the band representation $\Sigma_{kij}$.
 
 ## Where each fact lives {#register}
@@ -77,7 +80,7 @@ this table resolves and that every published page is in the site navigation.
 | **how the native FFI pair is built, verified and sealed** | [Building the FFI libraries](installation/ffi-build.md) | the two legs and why they must agree, the dependencies and where each comes from, the per-site build, the verify contract, sealing, how a run selects the pair, the ABI rule and porting. The design is the FFI-layer row. |
 | **how to run a first calculation** | [Quickstart](quickstart.md) | the bundled fixture chain, the minimal deck, the step order from `WFN.h5` to quasiparticle energies, and the next steps (QSGW, bands, BSE). |
 | **how a crystal becomes a `WFN.h5`** | [Inputs from DFT](preprocessing.md) | what `WFN.h5` must contain, the QE and `pw2bgw` namelists, the patched `pw2bgw` for magnetic spinors, and where the tools are on Perlmutter. |
-| **what the production GW calculation is, its options and its error budget** | [Production QSGW](how-to/production-qsgw.md) | the route (full-frequency QSGW with the shared-pole W), the keys it sets, the owner's production requirements, the error budget in its two classes (controllable to about 1 meV; systematic, reported apart) with measured sizes and scope, and which parts are on main and what is open. The ruling itself: [decisions](architecture/decisions.md#production-gw-route). |
+| **what the production GW calculation is, its options and its error budget** | [Production QSGW](how-to/production-qsgw.md) | the route (full-frequency QSGW with the shared-pole W), the keys it sets, the project lead's production requirements, the error budget in its two classes (controllable to about 1 meV; systematic, reported apart) with measured sizes and scope, and which parts are on main and what is open. The ruling itself: [decisions](architecture/decisions.md#production-gw-route). |
 | **how to set up a GW or QSGW run on a metal** | [Metals how-to](how-to/metals.md) | the metal rules (Fermi–Dirac, shared-pole W, the one band support), the choices a request leaves open and their defaults, what the code derives, what refuses, and a worked deck. It links the theory and the SC rules; it does not restate them. |
 | **how self-consistent GW converges and when it refuses** | [Self-consistency](self_consistency.md) | the QSGW map, band treatment, one-evaluation Anderson and its CONVERGED / STALLED / NOT UNIQUE verdicts, the Σ grid and frozen quadrature across maps, metals, seeding and outputs. |
 | **how the BSE is built and solved, and where its screened W comes from** | [BSE](architecture/bse.md) | the inputs and their authentication, the stored or rebuilt static W(0) and its q = 0 head, the Hamiltonian and the trial-stack matvec with its W-term kernel routes, the solvers, the dipoles and absorption, `eigenvectors.h5`, the `w_bse` handoff, the named refusals and the open limits. CLI flags: [drivers](drivers.md#bse-bsebse_jax). |
@@ -117,7 +120,7 @@ this table resolves and that every published page is in the site navigation.
 
 | If you want to know… | The owner is | It is authoritative for |
 |---|---|---|
-| **why the code does something the way it does** | [Design decisions](architecture/decisions.md) | dated, binding owner rulings. Overrides older prose *anywhere* in the tree, including this table's other rows. |
+| **why the code does something the way it does** | [Design decisions](architecture/decisions.md) | dated, binding rulings of the project lead. Overrides older prose *anywhere* in the tree, including this table's other rows. |
 | **where a module may live, and what it may import** | [The three levels](architecture/layers.md) | L1/L2/L3 assignment, the import direction, the sanctioned exceptions, and what deliberately is *not* unified. |
 | **where a source module or service package lives** | [Codebase](codebase.md) | the one-line inventory of every GW, common, centroid, file-I/O, and service source package. |
 | **how LORRAX reaches a vendor library** | [The FFI layer](architecture/ffi_layout.md) | every native target (the kernel catalog), the five layers, the one C++ tree and its two legs, which library serves each engine on each machine (**§3a is the dependency matrix**), which cuSOLVERMp selects which communication path, which FFT engine the host library binds, the C++ phdf5 defaults, the native failure modes and hard invariants, and the Local Fourier plan's CUDA leg. The `LocalFourierPlan` contract is its [service page](dev/fourier_plan.md). |

@@ -52,9 +52,11 @@ installs CPU JAX only. uv downloads its own Python 3.12; the sync takes about
 
 ### 1.2 Build the native pair (once per clone) {#build}
 
-Build both legs on a compute node, in a step with no GPU. With an allocation
-`JOBID` (for example from
-`salloc -N 1 -C gpu -q interactive -t 1:00:00 -A <account>`):
+Build both legs on a compute node. The build needs no GPU (nvcc compiles
+for the listed architectures and the NVRTC kernels compile at run time), so
+the build step asks for none and the node's GPUs stay free for the test step
+below. Take one allocation `JOBID` for both, for example
+`salloc -N 1 -C gpu -G 4 -q interactive -t 1:00:00 -A <account>`:
 
 ```bash
 srun --jobid=$JOBID -N 1 -n 1 -c 64 --gres=none bash -c '
@@ -110,8 +112,7 @@ A module is one venv, one `git archive` source snapshot and one sealed FFI
 bundle under an install prefix, rendered as an Lmod modulefile. It is the
 default runtime on Perlmutter because a sealed bundle is attested at load
 (every library hashed against its manifest) and every user of the module runs
-the same bytes. Project m4598 publishes one as `lorrax_A`; its `lx` launcher
-is m4598 tooling and is not in this repository.
+the same bytes.
 
 ### 2.1 Using a module {#using-the-module}
 

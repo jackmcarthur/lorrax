@@ -63,8 +63,8 @@ a caller's `jit` or `lax.scan`, and checks only operand dtype, rank and extent.
 The split exists because availability is a host fact and operand shape a trace
 fact; one phase could not check both at the right time. Hoist plans out of
 loops: the first FFI call also builds a BLACS or cuSOLVERMp context and
-compiles a module (1.4–2.7 s per plan in the resolver's measurement), paid once
-per plan.
+compiles a module, a cost paid once per plan that a plan built inside a loop
+would pay on every iteration.
 
 **A returned backend is a promise.** When `resolve_backend` returns a name,
 every guard has passed (vocabulary, platform, known-broken combination,

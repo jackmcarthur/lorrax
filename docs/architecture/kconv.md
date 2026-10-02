@@ -2,7 +2,8 @@
 
 Every k-axis convolution and k-axis transform in LORRAX goes through one
 router in `src/ffi/fft.py`: the χ₀ time node, the Σ = G⋆W product, the ζ-fit
-pair Gram, the BSE W term and the route-G plane transform. This page explains
+pair Gram, the BSE W term and the plane transform of the G-space charge ζ fit
+(route G, [μ-batch fit](zeta_fit_mubatch.md)). This page explains
 the operation they share, why it runs as one fused shared-memory pass on
 NVIDIA GPUs, how the router picks a backend, and the twelve kernel modes with
 their launch rules, refusals and caches. It is for anyone who calls, changes
@@ -22,6 +23,9 @@ k-points that modes 7, 8, 9 and 11 read.
 | $a$, $b$, $n_s$ | spin components of the two endpoints; $n_s$ is 1 (scalar), 2 (spinor) or 4 (bispinor) |
 | column | the $N_k$ values of one fixed trailing index, for example $(\mu, a, \nu, b)$; every transform runs along columns |
 | $F_k$, $F_k^{-1}$ | the unnormalized forward ($e^{-2\pi i k\cdot R}$) and inverse ($e^{+2\pi i k\cdot R}$) DFT of a column |
+| $n\vert 1$ | $n$ rounded up to the next odd integer (bitwise OR with 1), the padded length of a shared-memory line |
+| $m_x$, $m_y$ | the rank-local left and right centroid extents ($\mu$ on X, $\nu$ on Y) of an operand |
+| opt-in shared memory | the most dynamic shared memory one thread block may request. An A100 has 164 KiB per SM, of which at most 163 KiB (166 912 B) is opt-in per block |
 
 Operands are complex128 (16 B per element) unless a mode says otherwise.
 
@@ -43,7 +47,16 @@ step between the transforms:
 | χ₀ at one imaginary-time node $\tau$ | $\chi_0(R) \mathrel{+}= \alpha_\tau\sum_{ab}\overline{G^c_{ab}(R)}\,G^v_{ab}(R)$; one forward transform after the τ sum | `gw.w_isdf` |
 | Σ at one τ | $\Sigma(R) = G(R)\cdot W(R)$ per centroid pair | `gw.ppm_tau_kernel`, `gw.cohsex_sigma`, `gw.mpa.sector_sigma` |
 | ζ-fit pair Gram $C_q$ | $\sum_{ab}\phi_l[a]\phi_r[b]\,\overline{P^L_{ab}(R)}\,P^R_{\pi_l a,\pi_r b}(R)$ of band projectors | `isdf.core`, `isdf.zeta_mubatch` |
-| BSE W term | $(F^{-1}T)(R)\cdot W(R)$, $T = \sum_K L\,R$ | `bse.bse_stack_matvec`, `bse.bse_ring_comm` |
+| BSE W term | $(F^{-1}T)(R)\cdot W(R)$, $T = \sum_K \Lambda_K\,\Xi_K$ | `bse.bse_stack_matvec`, `bse.bse_ring_comm` |
+
+Here $\alpha_\tau$ is the quadrature weight of node τ; $G^v$ and $G^c$ are the
+occupied (valence) and empty (conduction) parts of the Green's function at
+that node, in centroid space; $P^L_k(\mu,\nu)$ and $P^R_k(\mu,\nu)$ are the
+band projectors $\sum_n \psi_{nk}(\mu)\overline{\psi_{nk}(\nu)}$ over the left
+and right band windows of a ζ-fit channel; a vertex is a spin permutation
+$\pi$ with a phase $\phi \in \{\pm1, \pm i\}$ per spin component, one per
+side; and the BSE trial stack $T$ is a sum over $K = \min(n_c, n_v)$ products
+of a left transition leg $\Lambda$ and a right leg $\Xi$ ([BSE](bse.md#the-matvec)).
 
 The physics of each row is on its owner's page. This page owns how the
 transform, the R-space step and the transform back are executed.
@@ -60,7 +73,7 @@ wheel, specialized per k grid when NVRTC compiles the kernel at run time.
 
 At large grids a tile no longer fits a block, but the fused route still wins.
 At Ni 20³ ($N_k = 8000$) one $n_s = 2$ pair is four columns, 512 KB, against
-164 KB of shared memory per A100 SM, so the tile streams through HBM either
+the A100's 164 KiB of shared memory per SM, so the tile streams through HBM either
 way. Measured at Ni 20³, P64, one Σ τ row pass: a staged route (an XLA gather
 of the unfolded Green, a vendor batched 3-D FFT, the product, the forward FFT
 and the parent gather) is 1.7–2.1× slower than modes 9 + 7 and holds
@@ -78,9 +91,13 @@ The factory picks the backend from the mesh platform alone
 | cpu | the plan route: the FFTW3-ABI host handlers of `liblorrax_ffi_host.so` (`lorrax_mklfft_flat_k`, `lorrax_mklfft_gw_conv`, [FFI layer §3c](ffi_layout.md#3c-which-fft-engine-the-host-library-binds)) composed with XLA elementwise work |
 | any other | refusal, `GATE kconv-platform` |
 
-No environment variable or deck key selects a route, because a routing choice
-is policy and policy changes only through the deck
-([decisions](decisions.md), 2026-09-24). Both backends return the same
+The backend follows from the platform, so no deck key or environment
+variable selects it; a second route would be an untested path. Two
+environment dials change only the engine inside a route: the A/B test
+`LORRAX_BSE_OUTER_KSUM` ([§11](#bse-outer)) and the cpu test hook
+([§14](#build-and-cache)). See
+[decisions](decisions.md#2026-09-24-nvidia-k-convolutions-run-on-nvidia-mathdx-behind-one-platform-router).
+Both backends return the same
 callable contract, so a consumer never branches on the backend. The cpu leg is
 the reference composition of each mode: the same unfolds and products in XLA,
 with host transforms.
@@ -136,14 +153,17 @@ One handler file serves modes 0–11, each a value of the compile-time
 | 3 `kfft_klead` | `make_kfft_klead`, `make_local_kfft_klead`; `prep` of `make_kconv_klead` | $Y = s\,F^{\pm}_k X$, k leading | `(N_k, rows)` | `lorrax_mklfft_flat_k` |
 | 4 `kconv_kminor` | `make_kconv_kminor`, `make_local_kconv_kminor` | $U = s\,F_k(F^{-1}X\cdot K_R)$, k trailing, $K_R$ made by mode 5 | `X` `(d0, d1, d2, d3, d4, N_k)`, `K_R` `(d1, d2, N_k)` → X's layout (`out_layout=0`) or `(d0, N_k, d3, d1, d4, d2)` (`out_layout=1`) | XLA moves k to the front, host transforms, k moves back |
 | 5 `kfft_kminor` | `make_kfft_kminor`, `make_local_kfft_kminor` | $Y = s\,F^{\pm}_k X$, k trailing | `(rows, N_k)` | the same transpose around one host transform |
-| 6 `kconv_plane` | `make_fused_conv_kplane` | mode 0 read from the route-G D-plane FFT output: Bloch phase `F[k,g,p]` applied and the `2c` axis split into L = slots `[0, c)` and R = slots `[c, 2c)` on the load | `D` `(N_k, g, n_s, 2c, n_s, p)`, `F` `(N_k, g, p)` → `U` `(N_k, c, g·p)` | phase, split and transpose in XLA, then mode 0's composition |
+| 6 `kconv_plane` | `make_fused_conv_kplane` | mode 0 read from route G's plane-transform output (`g` planes of `p` points, `c` centroids per side): the Bloch phase `F[k,g,p]` applied and the `2c` axis split on the load into the left projector (slots `[0, c)`) and the right one (`[c, 2c)`) | `D` `(N_k, g, n_s, 2c, n_s, p)`, `F` `(N_k, g, p)` → `U` `(N_k, c, g·p)` | phase, split and transpose in XLA, then mode 0's composition |
 | 7 `kconv_klead_unfold_xblock` | `make_kconv_klead_unfold` | mode 2 on the typed unfold of the raw-parent Green ([§5](#unfold-on-load)) | `G`, `Gt` `(n_parent, μ, n_s, ν, n_s)`, `V_R` `(N_k, μ, ν)` → `U` `(n_out, n_s, μ or an x block, n_s, ν)` | `symmetry_maps.apply_unfold_load_tables_local` (a full-k copy), mode 2's composition, the row selection |
-| 8 `kconv_klead_lorentz_wparent` | `make_kconv_lorentz_unfold` | the four-current Σ: $U = m\,F_k\sum_{AB}\gamma_A(F^{-1}\hat G)\gamma_B^\dagger\circ\hat W_R[k,x,A,y,B]$, with $\hat G$ and $\hat W$ both unfolded from parents on the load | `G`, `Gt` as mode 7; `W`, `Wt` `(n_{q,parent}, μ, n_A, ν, n_B)`, $n_A, n_B \le 4$ → `U` `(n_out, n_s, μ, n_s, ν)` | both unfolds and the γ block sum in XLA, host transforms |
-| 9 `kfft_klead_unfold` | `make_kfft_klead_unfold` | $Y_k = s\,F^{-1}_k(L_k\hat O_k R_k^\dagger)$: the R-space operand of modes 2 and 7, read from an interaction's q wedge | `W`, `Wt` `(n_wedge, μ·n_l, ν·n_r)` → `Y` `(N_k, μ·n_l, ν·n_r)` | the unfold in XLA, then mode 2's `prep` |
+| 8 `kconv_klead_lorentz_wparent` | `make_kconv_lorentz_unfold` | the four-current Σ: $U = s\,F_k\sum_{A,B}\gamma_A(F^{-1}\hat G)\gamma_B^\dagger\circ\hat W_R[k,\mu,A,\nu,B]$, $A$ ($B$) over the $n_A$ ($n_B$) Lorentz components of the left (right) endpoint (1 for charge, 3 for current), $\gamma_A$ channel $A$'s signed spin permutation, with $\hat G$ and $\hat W$ both unfolded from parents on the load | `G`, `Gt` as mode 7; `W`, `Wt` `(n_{q,parent}, μ, n_A, ν, n_B)`, $n_A, n_B \le 4$ → `U` `(n_out, n_s, μ, n_s, ν)` | both unfolds and the γ block sum in XLA, host transforms |
+| 9 `kfft_klead_unfold` | `make_kfft_klead_unfold` | $Y_k = s\,F^{-1}_k(\mathcal L_k\hat O_k \mathcal R_k^\dagger)$: the R-space operand of modes 2 and 7, read from an interaction's q wedge | `W`, `Wt` `(n_wedge, μ·n_l, ν·n_r)` → `Y` `(N_k, μ·n_l, ν·n_r)` | the unfold in XLA, then mode 2's `prep` |
 | 10 `plane_fft_gather` | `make_plane_fft_gather` (`LocalFourierPlan(in_gather=…)`) | the route-G plane FFT, gathered on load ([§10](#mode-10)) | `F` `(…, n_col)` → `Y` `(…, n_b, n_c)` | the XLA route: a static-run concatenate, then `jnp.fft.fftn` |
 | 11 `kconv_chi_unfold`, `kconv_chi_vertex` | `make_kconv_chi_unfold`, `make_kconv_chi_vertex` | one χ₀ τ node: $acc[o] \mathrel{+}= \alpha_o\sum_{ab}\overline{(F^{-1}\hat G^c)_{ab}}(F^{-1}\hat G^v)_{ab}$ (+ its conjugate when `complete`) | `Gv`, `Gc` and partners `(n_parent, μ, n_s, ν, n_s)`, `α` `(n_out,)` → `acc` `(n_out, N_k, μ, ν)`, in place | the unfold per Green in XLA, host inverse transforms, the trace in XLA |
-| 2 + outer load, `kconv_klead_outer` | `make_local_kconv_klead_outer` | mode 2 with $T = \sum_K L\,R$ formed in shared memory ([§11](#bse-outer)) | `L` `(N_k, a, m_x, K)`, `R` `(N_k, K, b, m_y)`, `V_R` `(m_x, m_y, N_k)` → `U` `(N_k, a, m_x, b, m_y)` | the einsum for T, then mode 2's composition |
+| 2 + outer load, `kconv_klead_outer` | `make_local_kconv_klead_outer` | mode 2 with $T = \sum_K \Lambda_K\Xi_K$ formed in shared memory ([§11](#bse-outer)) | `L` = $\Lambda$ `(N_k, a, m_x, K)`, `R` = $\Xi$ `(N_k, K, b, m_y)`, `V_R` `(m_x, m_y, N_k)` → `U` `(N_k, a, m_x, b, m_y)` | the einsum for T, then mode 2's composition |
 | 2 + outer load + decode, `kconv_klead_outer_decode` | `make_local_kconv_klead_outer_decode` | the same, with $A = \sum_{a,x}\overline{P_c}\,U$ formed in the store | → `A` `(N_k, n_c, b, m_y)` | the outer composition and the decode einsum |
+
+In modes 0 and 6 each `(col, μ)` entry is one row, an independent column
+of the pair operands (`col` is the operand's other non-k index).
 
 Where each mode is used, by owner module:
 
@@ -172,8 +192,9 @@ target, so source trees built against the old ones keep loading
 Every mode except 0, 1, 6 and 10 runs on one stage,
 `src/ffi/cpp/cufft/kbox_stage.cuh`. A mode supplies three pieces:
 
-- **Load**: from HBM into the shared-memory bank. A plain copy (modes 2–5),
-  the typed unfold gather (modes 7, 8, 9, 11), or the outer product (the BSE
+- **Load**: from HBM into the shared-memory bank. A plain copy (modes 2 and
+  3), a strided load of each column's k run (modes 4 and 5), the typed unfold
+  gather (modes 7, 8, 9, 11), or the outer product (the BSE
   load).
 - **Mid**: the R-space step between the transforms: the product with $V_R$,
   the vertex sum, or the spin trace.
@@ -203,8 +224,8 @@ the k grid and the device's opt-in shared memory per block:
 - *split arm*: when fewer than `min_tr` groups fit. Plane passes over
   $(k_y, k_z)$ on tiles of columns, then an x-pencil pass that fuses the
   inverse x transform, the Mid and the forward x transform in registers.
-  `min_tr = 2` protects the 128-byte runs of a copy load; a gathered load
-  (modes 4, 5, 7, 8, 9, 11) has no run to protect and passes `min_tr = 1`.
+  `min_tr = 2` protects the 128-byte runs of a copy load; a strided or
+  gathered load (modes 4, 5, 7, 8, 9, 11) has no run to protect and passes `min_tr = 1`.
 
 Two single-buffered blocks per SM are preferred over one double-buffered
 block because they measured faster for the convolution modes. Each line sees
@@ -215,7 +236,7 @@ so the arms agree bit for bit.
 |---|---|---|
 | 2, 3 | tiles of whole columns | plane and pencil passes through the output, in place |
 | 4, 5 | one column per block at least | none: a column larger than the opt-in memory refuses |
-| 7 | tiles of whole $n_s^2$ groups of two or more columns | chunks of pairs through scratch ([§7](#tiles)): a gather plane pass on tiles of the most whole groups the opt-in memory holds; then, if one padded column fits a block (20³: 134 of 163 KB on A100), one column-resident pass (x pencil, $V_R$, forward transform, store), else an x pencil, a forward plane pass and a pencil-and-store pass |
+| 7 | tiles of whole $n_s^2$ groups of two or more columns | chunks of pairs through scratch ([§7](#tiles)): a gather plane pass on tiles of the most whole groups the opt-in memory holds; then, if one padded column fits a block (20³: 134 of the A100's 163 KiB), one column-resident pass (x pencil, $V_R$, forward transform, store), else an x pencil, a forward plane pass and a pencil-and-store pass |
 | 8 | tiles of whole $n_s^2$ groups plus the pair's $n_A n_B$ W columns | plane and group-pencil passes, chunked over pairs through scratch |
 | 9 | tiles of whole $n_l n_r$ groups | plane tiles of whole groups, then the x pencil in place |
 | 11 | $t_r$ whole pairs ($2n_s^2$ columns each) | plane passes on 16-column tiles, then a warp-shuffle x pencil per pair (it stages nothing), chunked over pairs through scratch |
@@ -302,19 +323,31 @@ serves every one of the $n_A n_B$ Lorentz blocks, and neither a full-q W nor
 a full-grid $W_R$ exists.
 
 **Mode 9** gives the R-space operand that modes 2 and 7 multiply by: W, V or
-a pole field read from its q wedge, with the endpoint actions $L_k$, $R_k$
+a pole field read from its q wedge, with the endpoint actions $\mathcal L_k$, $\mathcal R_k$
 (1 for a scalar interaction, the Lorentz rotation for a current block).
 
-**Mode 11** serves three χ₀ streams of `gw.w_isdf`: the
-identity-vertex step response; the selected-q charge streams of the response
-bank (direct, retarded and KMS static), where each node's correlation is
-transformed once and its rows at $q$ and $-q$ combine per pair mode (retarded
-$-i(r_q - r_{-q})$, KMS static $-(r_q + r_{-q})$); and the four-current
-direct stream through `make_kconv_chi_vertex`, with at most three monomial
-vertices per side and an optional per-k sign `sign_c` for a Dirac-half
-quadrant. Where mode 11 cannot hold the grid (`ffi.fft.chi_unfold_refusal`),
-`gw.w_isdf` keeps the full-k Green route (mode 3 on unfolded Greens, the
-trace in XLA) and announces that once.
+**Mode 11** serves three χ₀ streams of `gw.w_isdf`:
+
+- the identity-vertex step response;
+- the selected-q charge streams of the shared-pole response bank (the χ₀
+  samples the W model is fitted to; [shared-pole model](shared_pole_model.md)):
+  the direct stream, the retarded stream and the static correlation obtained
+  through the Kubo–Martin–Schwinger (KMS) relation. Each node's correlation
+  $r$ is transformed once, and its rows at $q$ and $-q$ are combined by the
+  stream's pair rule: retarded $-i(r_q - r_{-q})$, KMS static
+  $-(r_q + r_{-q})$;
+- the four-current direct stream, through `make_kconv_chi_vertex`, with at
+  most three monomial vertices per side. A four-spinor Green splits into four
+  quadrants by upper and lower Dirac components; `sign_c`, an optional per-k
+  sign, gives one quadrant's sign relative to the shared unfold tables.
+
+`make_kconv_chi_unfold`'s `complete` flag adds the complex-conjugate term,
+which a real-frequency contour needs. Where mode 11 cannot hold the grid
+(`ffi.fft.chi_unfold_refusal`), the scalar streams keep the full-k Green
+route (mode 3 on unfolded Greens, the trace in XLA) and announce it once
+(`gw.w_isdf._chi_kconv_serves`). The four-current stream has no full-k
+fallback on the GPU, because it builds its Greens only on the raw parents: it
+refuses with `GATE response_vertex_grid`.
 
 ## 6. Row passes and the `live` operand {#live-rows}
 
@@ -380,8 +413,11 @@ The pair modes keep three $N_k$-long banks per row (one `(col, μ)` entry):
 $3\cdot16\cdot(N_k|1)$ bytes. A 256-thread block holds
 $r_b = \min(16, \lfloor B/\text{row}\rfloor)$ rows with
 $B = \min(100\ \text{KiB}, \text{opt-in})$; where that is 0, $r_b$ is what the
-opt-in maximum holds. On an A100 (166 912 B opt-in) one row fits up to
-$N_k = 3477$.
+opt-in maximum holds. The budget is a fixed 100 KiB rather than the device's
+opt-in maximum so that every device with at least that much opt-in memory
+gets the same rows per block, and with them the same launch shape; it is
+clamped where the opt-in maximum is smaller (99 KiB on sm_86/89/120). On an
+A100 one row fits the opt-in memory up to $N_k = 3477$.
 
 Above that, the router streams instead of refusing
 (`ffi.fft.pair_resident_refusal` announces the switch once). For each spatial
@@ -403,7 +439,7 @@ $\mathrm{trs}[k] \ne 0$, the load builds
 
 $$
 P_{k,ab}(\mu,\nu) = \overline{\sum_{c,e}\mathrm{coef}[k,\,a n_s+b,\,c n_s+e]\;
-\mathcal T_k\!\left(e^{2\pi i q_p\cdot L_{o,\mu}}\,D_{p,c,e}(m,n)\,e^{-2\pi i q_p\cdot R_{o,\nu}}\right)}
+\mathcal T_k\!\left(e^{2\pi i q_p\cdot \mathbf w^{\rm L}_{o,\mu}}\,D_{p,c,e}(m,n)\,e^{-2\pi i q_p\cdot \mathbf w^{\rm R}_{o,\nu}}\right)}
 $$
 
 from `D_l` with `coef_l` on the left and from `D_r` with `coef_r` on the
@@ -414,7 +450,7 @@ right, then runs mode 0 on $P^L$, $P^R$.
 | `D_l`, `D_r` | `(n_parent, n_s, μ_local, n_s, ν_local)` logical | complex128 |
 | `irr`, `sym` | `(N_k,)` | int32 |
 | `left`, `right` (owner-local source maps) | `(n_ops, μ_local)`, `(n_ops, ν_local)` | int32 |
-| `L`, `R` (lattice wraps) | `(n_ops, μ_local, 3)`, `(n_ops, ν_local, 3)` | float64 |
+| `L`, `R` (lattice wraps $\mathbf w^{\rm L}$, $\mathbf w^{\rm R}$: the lattice vector each centroid image is shifted by) | `(n_ops, μ_local, 3)`, `(n_ops, ν_local, 3)` | float64 |
 | `q` (parent fractional k) | `(n_parent, 3)` | float64 |
 | `trs` (antiunitary mask) | `(N_k,)` | int32 |
 | `coef_l`, `coef_r` (open-spin coefficients) | `(N_k, n_s², n_s²)` | complex128 |
@@ -437,7 +473,7 @@ right, then runs mode 0 on $P^L$, $P^R$.
 
 ## 10. Mode 10: the plane FFT with gather-on-load {#mode-10}
 
-Route G transforms planes whose occupied cells arrive as a compact cylinder
+Route G (the G-space charge ζ fit) transforms planes whose occupied cells arrive as a compact cylinder
 `F (…, n_col)`; `plane_from_col (n_b·n_c,)` names each flat cell's column
 (`n_col` = empty). The call returns
 
@@ -495,18 +531,19 @@ group slice is not copied. A direct handler call past either test refuses
 ## 11. The BSE outer-product load {#bse-outer}
 
 The BSE W term needs $U = s\,F_k(F^{-1}T\cdot W_R)$ with
-$T[k,a,x,b,y] = \sum_K L[k,a,x,K]\,R[k,K,b,y]$. `make_local_kconv_klead_outer`
+$T[k,a,\mu,b,\nu] = \sum_K \Lambda[k,a,\mu,K]\,\Xi[k,K,b,\nu]$ ($a$, $b$ spin
+components; the factory's operands `L` and `R`). `make_local_kconv_klead_outer`
 forms $T$ in the k-box bank on the fp64 tensor cores (`mma.m8n8k4.f64`,
 sm_80 and newer) and never stores it; the transforms, the multiply and the
 store are mode 2's. K is zero-padded to a multiple of 4 (exact), and
-`conj_r` reads $\overline{R}$, which avoids a conjugated copy of the
+`conj_r` reads $\overline{\Xi}$, which avoids a conjugated copy of the
 wavefunction leg. Its K sum reproduces XLA's batched ZGEMM of the same
 contraction bit for bit on A100. It needs a 64-column bank,
 $64\cdot16\cdot\big((n_{kx}n_{ky}(n_{kz}|1))|1\big)$ bytes, within the
 opt-in memory (`ffi.fft.klead_outer_refusal`).
 
 `make_local_kconv_klead_outer_decode` also forms the decode's
-$A[k,c,b,y] = \sum_{a,x}\overline{P_c[k,c,a,x]}\,U[k,a,x,b,y]$ in the store,
+$A[k,c,b,\nu] = \sum_{a,\mu}\overline{\psi_c[k,c,a,\mu]}\,U[k,a,\mu,b,\nu]$ ($\psi_c$ the conduction wavefunctions at the centroids) in the store,
 so $U$ never reaches HBM: one resident block per SM, two 8-warp groups
 alternating on two banks, partial sums added in a fixed phase order
 (deterministic). It needs the two banks within the opt-in memory and the
@@ -544,7 +581,8 @@ host arena of $16\,N_k\,m_x\,m_y$ bytes, invisible to XLA.
 | `GATE mathdx-kconv-axis` | factory; handler | on CUDA, a k-grid axis above 40 (`KCONV_AXIS_MAX`, the fp64 cuFFTDx thread-FFT limit); the cpu leg has no cap | a smaller k grid |
 | `GATE mathdx-kconv-residency` | kernel build | a direct call of mode 0, 1 or 6 whose row exceeds the opt-in memory; the router streams such grids instead ([§8](#resident-rows)) | call through the router |
 | `GATE mathdx-kconv-kbox-residency` | kernel build | the tile, plane or pencil the launch rule picked exceeds the opt-in memory (modes 2, 3, 8, 9); one whole column exceeds it (modes 4 and 5, which have no split arm); a split plane tile of one spin group exceeds it (mode 7: $n_s = 4$ at 26³ and larger on A100) | a smaller k grid |
-| `GATE mathdx-kconv-chi-residency` | kernel build | mode 11 cannot hold the grid | none here: `gw.w_isdf` asks `chi_unfold_refusal` first and keeps the full-k Green route, so this gate means that predicate and the handler's rule disagree, which is a bug |
+| `GATE mathdx-kconv-chi-residency` | kernel build | mode 11 cannot hold the grid | none here: `gw.w_isdf` asks `chi_unfold_refusal` first, so this gate means that predicate and the handler's rule disagree, which is a bug |
+| `GATE response_vertex_grid` | four-current response setup (`gw.w_isdf`) | on CUDA, mode 11 cannot hold the grid at $n_s = 2$ (`chi_unfold_refusal`); the four-current stream has no full-k fallback | a smaller k grid (the scalar streams fall back to the full-k Green route instead) |
 | `GATE mathdx-kconv-unfold-scratch`, `-lorentz-scratch`, `-chi-scratch` | apply | XLA's scratch allocator refuses the split-arm intermediate of mode 7, 8 or 11 ([§7](#tiles)) | for mode 11, a smaller `scratch_bytes` |
 | `GATE mathdx-kconv-outer-tile`, `-outer-decode-tile`, `-outer-arch`, `-outer-rank` | kernel build | the BSE outer load's bank or accumulator does not fit, the device is older than sm_80, or K is not a multiple of 4 | call through the factories, which check `klead_outer_refusal` / `klead_outer_decode_refusal` and pad K |
 | `GATE mathdx-plane-split`, `mathdx-plane-residency` | kernel build | a direct mode-10 call on a plane with no split or too large | call through `make_plane_fft_gather` |

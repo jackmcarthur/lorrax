@@ -44,7 +44,7 @@ None of these are declared in `pyproject.toml` except `nvidia-mathdx`.
 | dependency | minimum | leg |
 |---|---|---|
 | NVIDIA GPU | sm_80 | CUDA |
-| CUDA toolkit | 13.0; the library's CUDA major must match the JAX wheel's | CUDA |
+| CUDA toolkit | 12.x or 13.x, the same major as the JAX wheel (the `cuda12` or `cuda13` extra); Perlmutter uses 13.2 | CUDA |
 | JAX and jaxlib | 0.9.x ([the JAX contract](index.md#jax)); the XLA FFI headers come from the JAX that will load the library | both |
 | cuSOLVERMp | 0.7 (NCCL-native); 0.8 and later need NCCL ≥ 2.27 | CUDA |
 | cuBLASMp | the version staged with cuSOLVERMp | CUDA |

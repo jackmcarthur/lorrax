@@ -40,9 +40,9 @@ jaxlib  >= 0.9.0, < 0.10.0
 
 Patch upgrades inside the series are allowed; any other minor generation of
 either package refuses, and there is no override. The window is narrow
-because `common/jax_compile_cache.py` patches four `jax._src` private
-functions whose arity changes between generations: a mismatched JAX does not
-fail cleanly, it dies at the first compile. Three surfaces enforce the same
+because `common/jax_compile_cache.py` patches five `jax._src` private
+functions whose signatures change between generations: a mismatched JAX does
+not fail cleanly, it dies at the first compile. Three surfaces enforce the same
 window:
 
 1. `pyproject.toml` constrains the base, `cuda12`, `cuda13` and development
@@ -52,7 +52,7 @@ window:
 3. `runtime.jax_support.enforce()`, step 5b of
    `runtime.initialize_communicator_stack` (after the first `jax.devices()`,
    before the first `jit`), checks both live packages and the arity of each
-   patched private. The version string alone is not trusted: a date-stamped
+   arity-checked private. The version string alone is not trusted: a date-stamped
    container build can report an allowed version over a different
    `jax._src`.
 
