@@ -128,7 +128,8 @@ def constructor_execution(meta, resolution, recipe, *, mesh, ledger, upstream,
                           ordered, odd_moments, selection_faces, sample_batch,
                           parent_count=1, retained_output_families=1,
                           cross_original_sides=None, cross_retained_side=None,
-                          column_extent=lambda width: width, ritz_budget=None):
+                          column_extent=lambda width: width, ritz_budget=None,
+                          retain_span=False, carry=0):
     """Resolve local or whole-mesh execution once, before a constructor read.
 
     ``selection_faces`` counts the selection's resident [n,n] faces
@@ -143,8 +144,11 @@ def constructor_execution(meta, resolution, recipe, *, mesh, ledger, upstream,
     the full mesh, where ``face_batch_width`` sizes the batch. A measured
     pencil is never consulted: a local round could not leave the route once
     its selection is held (CrI3 24x24 at P64, 40 GB: local pencil 64 GB/rank).
-    ``ritz_budget`` is the pole budget of a local paired (ordered scalar)
-    reduction, priced as that program is (``ConstructorCapacity.ritz_budget``).
+    ``ritz_budget`` is the pole budget of a local paired (ordered)
+    reduction, priced as that program is (``ConstructorCapacity.ritz_budget``);
+    ``retain_span`` adds a sector round's coefficient map. ``carry`` is a
+    resident per rank the local round runs beside (an earlier sector's held
+    outputs, ``held_sector_bytes``).
     """
     from gw.shared_pole_capacity import ConstructorCapacity
 
@@ -162,6 +166,7 @@ def constructor_execution(meta, resolution, recipe, *, mesh, ledger, upstream,
                                 upstream=upstream, execution='local')
     local.batch_width = int(mesh.size)
     local.ritz_budget = ritz_budget
+    local.retain_span = bool(retain_span)
     pole_budget = recipe.get('pole_budget')
     if pole_budget is None:
         pole_budget = int(meta.n_rmu)
@@ -169,15 +174,17 @@ def constructor_execution(meta, resolution, recipe, *, mesh, ledger, upstream,
     retained_outputs = int(np.ceil(
         16 * int(parent_count) * int(retained_output_families)
         * int(meta.n_rmu_padded) * output_width / int(mesh.size)))
+    carry = int(carry)
     def resident_preview(phase, **kwargs):
         price = local.resident_quote(
             int(cross_retained_side) if phase == 'cross_reduction' else side,
             phase=phase, **kwargs)
         row = ledger.preview(
             resident_bytes_per_rank=(price['resident_bytes_per_rank']
-                                     + retained_outputs),
+                                     + retained_outputs + carry),
             workspace_bytes_per_rank=0, concurrent_with=upstream)
         row['retained_output_upper_bound_bytes_per_rank'] = retained_outputs
+        row['carry_bytes_per_rank'] = carry
         row['native_workspace_query'] = 'NOT_NEEDED_FOR_RESIDENT_LOWER_BOUND'
         return row
     def preview(phase, **kwargs):
@@ -185,9 +192,10 @@ def constructor_execution(meta, resolution, recipe, *, mesh, ledger, upstream,
             int(cross_retained_side) if phase == 'cross_reduction' else side,
             phase=phase,**kwargs)
         row=ledger.preview(
-            resident_bytes_per_rank=price['resident_bytes_per_rank']+retained_outputs,
+            resident_bytes_per_rank=price['resident_bytes_per_rank']+retained_outputs+carry,
             workspace_bytes_per_rank=sum(native.values()),concurrent_with=upstream)
         row['retained_output_upper_bound_bytes_per_rank']=retained_outputs
+        row['carry_bytes_per_rank']=carry
         return row
     selection_args = dict(sample_batch=fit, selection_faces=selection_faces)
     reduction_phase = 'cross_reduction' if cross_original_sides is not None else 'reduction'
