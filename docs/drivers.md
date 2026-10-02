@@ -274,7 +274,7 @@ VBM at 0, returned and fitted windows in the header) and `htransform.out`;
 rank 0 writes. `galerkin_dft.h5` beside the deck caches the basis: reused on an
 exact provenance match, refit in memory otherwise.
 
-Invoke: `python -m bandstructure.htransform -i ht.in [--qp-rotations qp_wfn_rotations.h5 | --eqp-file eqp1.dat]`.
+Invoke: `python -m bandstructure.htransform -i ht.in [--qp-rotations qp_wfn_rotations.h5 | --eqp-file eqp1.dat] [--color spin --color orbital:d] [--moments-grid 40 40 40]`.
 
 | key / flag | default | meaning |
 |---|---|---|
@@ -284,6 +284,32 @@ Invoke: `python -m bandstructure.htransform -i ht.in [--qp-rotations qp_wfn_rota
 | `--a-band` | top band | band whose bandwidth sets $f$'s scale |
 | `linalg` / `--eigh-backend` | `local` | layout of the $f(H)_q$ eigensolve |
 | `get_centroids_fi`, `kgrid_fi`, `wfn_fi_min`/`wfn_fi_max`, `wfn_fi_q_chunk` | off | BSE handoff: fine-grid ψ at the coarse centroids (`bandstructure.bse_setup.compute_wfns_fi`) |
+
+Band character and moments (`bandstructure.orbital`, spinor WFN only):
+
+- `--color spin` colors the path bands by $\langle\sigma\cdot\hat n\rangle$,
+  $\hat n$ the direction of the coarse-grid $\sum_k w_k \sum_n f_{nk}
+  \langle\sigma\rangle_{nn}$; `--color orbital:[EL:]l` (e.g. `orbital:d`,
+  `orbital:Fe:d`) by the character of Löwdin-orthogonalized PP_PSWFC rows
+  (the `*.upf` beside the deck; j-averaged radial functions, as
+  `psp.hubbard_ops`). Repeatable. Writes `bands_<color>.png` ($E - E_F$, $E_F$
+  of the coarse grid) and `band_operators_path.npz` (all path operator
+  matrices: $\sigma_{x,y,z}$, each atom's $L_{x,y,z}$, the characters).
+- `--moments-grid NX NY NZ` interpolates $f(H)$, $\hat n\cdot\sigma$ and each
+  atom's $\hat n\cdot L$ to that uniform grid, re-finds $E_F$ there
+  (Fermi-Dirac at `occ_smearing_width_ry`, $10^{-4}$ Ry if unset, electron
+  count exact) and writes `moments.txt`: $\sum_\mathrm{occ}\langle\sigma\cdot
+  \hat n\rangle$ (QE's sign, $m = n_\uparrow - n_\downarrow$) and the
+  atomic-sphere $\langle L\cdot\hat n\rangle$ per atom. The itinerant
+  (modern-theory) orbital term needs the Berry connection and is not formed.
+
+Every operator is $\langle\psi_{nk}|O|\psi_{mk}\rangle$ on the coarse full BZ,
+carried into the Galerkin basis as $C^T O C^*$ and Fourier-interpolated as
+$f(H)$ is; a QP $U$ is unitary on the fitted window, so with `--qp-rotations`
+only the eigenvectors change. The grid runs one $q_z$ plane per pass (a
+separable phase sum over the coarse $R$, one face→q exchange); $f(H)_R$ and one
+operator image are resident at a time, plus the plane eigenvectors. A $20^3$ →
+$40^3$ run holds about $3\, n_k\, \mathrm{rank}^2 \cdot 16$ B over all ranks.
 
 Refusals: a QRCP search that saturates the ceiling (inspect the projection
 receipts before raising the multiplier); an `f-shoulder` refusal when a

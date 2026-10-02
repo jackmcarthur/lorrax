@@ -256,15 +256,19 @@ def interpolate_band_operator(operator_cart, source_coefficients,
     return jnp.stack(parts, axis=1)
 
 
-def grid_moments(fH_R, f_params, operators_R, kgrid, grid, n_states, mesh):
+def grid_moments(fH_R, f_params, operator_R_builders, kgrid, grid,
+                 n_states, mesh):
     """Energies and band diagonals of the fitted states on a uniform q grid.
 
     Returns ``(E (Nq, n_states) Ry, D (n_op, Nq, n_states), newton
     residual)`` with q in C order over ``grid``.  One pass is one q_z plane:
     a separable phase sum ``z -> y -> x`` over the coarse lattice R (local on
-    the ``(rank, rank)`` face; no dense-grid FFT carrier), one face->q
-    exchange, the fH eigensolve, ``f^-1`` and ``<n|O|n>`` for every
-    operator.  The passes are one ``lax.scan``.
+    the ``(rank, rank)`` face; no dense-grid FFT carrier) and one face->q
+    exchange.  The first ``lax.scan`` solves fH on every plane and keeps the
+    fitted-state eigenvectors; ``fH_R`` is then deleted (consumed) and each
+    operator's lattice image, built by its ``operator_R_builders`` entry
+    only when needed, is read by a second scan.  At most one dense
+    ``(nk, rank, rank)`` image is resident.
     """
     from bandstructure.fh_interp import build_R_grid_np, newton_inv
     a_f, n_f, shift = f_params
@@ -284,7 +288,8 @@ def grid_moments(fH_R, f_params, operators_R, kgrid, grid, n_states, mesh):
                           spec=P(('x', 'y'), None, None), axis=0).carrier
     face = NamedSharding(mesh, P(None, 'x', 'y'))
     exchange = face_to_batch_reshard(mesh)
-    stack = (fH_R,) + tuple(operators_R)
+    plane_q = NamedSharding(mesh, P(None, ('x', 'y'), None))
+    plane_v = NamedSharding(mesh, P(None, ('x', 'y'), None, None))
 
     def plane(pz, X):
         X = X.reshape(nx, ny, nz, rank, rank)
@@ -296,30 +301,43 @@ def grid_moments(fH_R, f_params, operators_R, kgrid, grid, n_states, mesh):
         A = exchange(jax.lax.with_sharding_constraint(A, face))
         return A + jnp.conj(jnp.swapaxes(A, -1, -2))
 
-    @partial(jax.jit, out_shardings=(
-        NamedSharding(mesh, P(None, ('x', 'y'), None)),
-        NamedSharding(mesh, P(None, None, ('x', 'y'), None)),
-        NamedSharding(mesh, P())))
-    def _scan(stack):
+    @partial(jax.jit, out_shardings=(plane_q, plane_v,
+                                     NamedSharding(mesh, P())))
+    def _solve(fH_R):
         def one_pass(_, pz):
-            values, vectors = jax.vmap(jnp.linalg.eigh)(plane(pz, stack[0]))
-            vectors = vectors[:, :, :n_states]
+            values, vectors = jax.vmap(jnp.linalg.eigh)(plane(pz, fH_R))
             energies, residual = newton_inv(
                 a_f, n_f, shift, values[:, :n_states].real)
-            diag = jnp.stack([jnp.einsum(
-                'qan,qab,qbn->qn', jnp.conj(vectors), plane(pz, O), vectors,
-                optimize=True).real for O in stack[1:]])
-            return None, (energies, diag, residual)
+            return None, (energies, vectors[:, :, :n_states], residual)
 
-        _, (E, D, res) = jax.lax.scan(one_pass, None, Pz, unroll=1)
-        return E, D, jnp.max(res)
+        _, (E, V, res) = jax.lax.scan(one_pass, None, Pz, unroll=1)
+        return E, V, jnp.max(res)
 
-    E, D, residual = _scan(stack)
+    @partial(jax.jit, out_shardings=plane_q)
+    def _expect(O_R, V):
+        def one_pass(_, xs):
+            pz, v = xs
+            return None, jnp.einsum('qan,qab,qbn->qn', jnp.conj(v),
+                                    plane(pz, O_R), v, optimize=True).real
+
+        _, D = jax.lax.scan(one_pass, None, (Pz, V), unroll=1)
+        return D
+
+    E, V, residual = _solve(fH_R)
+    jax.block_until_ready(E)
+    fH_R.delete()
+    D = []
+    for build in operator_R_builders:
+        O_R = build()
+        D.append(jax.block_until_ready(_expect(O_R, V)))
+        O_R.delete()
+    del V
+    D = jnp.stack(D)
     # C order over (x, y, z): pass index is z, plane row i*Ny + j.
     E = jnp.transpose(E[:, :n_plane].reshape(Nz, Nx, Ny, n_states),
                       (1, 2, 0, 3))
-    D = jnp.transpose(D[:, :, :n_plane].reshape(Nz, -1, Nx, Ny, n_states),
-                      (1, 2, 3, 0, 4))
+    D = jnp.transpose(D[:, :, :n_plane].reshape(-1, Nz, Nx, Ny, n_states),
+                      (0, 2, 3, 1, 4))
     return (E.reshape(-1, n_states), D.reshape(D.shape[0], -1, n_states),
             residual)
 
