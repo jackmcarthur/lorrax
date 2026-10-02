@@ -1,20 +1,23 @@
 # Environment: the runtime stack
 
-What a LORRAX process runs on, and how the runtime configures JAX, XLA's GPU
-memory pool and the process topology before the first physics `jit`.
+This page describes what a LORRAX process runs on and how the runtime
+configures JAX, XLA's GPU memory pool and the process topology before the
+first physics `jit`, and how to read the startup report that records what
+it resolved. It is for anyone launching runs or diagnosing a startup or
+memory failure; install LORRAX first ([Installation](../installation/index.md)).
 
 | page | owns |
 |---|---|
 | this page | the platform routes, the Frontera CPU layer stack, the startup report, JAX and the GPU memory pool, troubleshooting |
-| [Perlmutter](machines/perlmutter.md) | the GPU lane (`lorrax_A` module, sealed FFI bundle, `lx`), task geometry, CPU-MPI runs |
+| [Perlmutter](machines/perlmutter.md) | GPU task geometry, the network transport, Cray MPICH GPU support, CPU multi-process runs |
 | [Frontera](machines/frontera.md) | machine facts, cold start, build recipes |
-| [Collective transports](transports.md) | gloo vs `impl=mpi` vs NCCL |
+| [Collective transports](transports.md) | gloo vs `impl=mpi` vs NCCL, and the MPI adapter |
 
-Owned elsewhere, linked rather than restated:
-[`docs/dev/env_vars.md`](../dev/env_vars.md) is the registry of every
-environment variable (spelling, default, grammar);
-[`docs/architecture/ffi_layout.md`](../architecture/ffi_layout.md) owns how a
-native library is built and reached.
+Owned elsewhere, linked rather than restated: the
+[environment-variable registry](../reference/env_vars.md) (spelling,
+default, grammar of every variable) and
+[Building the FFI libraries](../installation/ffi-build.md) (how a native
+library is built and selected).
 
 ---
 
@@ -22,8 +25,8 @@ native library is built and reached.
 
 | platform | stack | launched by |
 |---|---|---|
-| Perlmutter GPU (A100 40/80 GB) | bare-host CUDA 13.2, a JAX/JAXLIB 0.9.1 venv, the sealed FFI bundle; all selected by the `lorrax_A` module | `srun` ([Perlmutter §1](machines/perlmutter.md#1-entry-point)) |
-| Perlmutter CPU (Milan) | the same venv, CPU platform, MPI collectives | [Perlmutter §5](machines/perlmutter.md) |
+| Perlmutter GPU (A100 40/80 GB) | bare-host CUDA 13.2, a JAX/JAXLIB 0.9.1 venv and a sealed FFI bundle, selected by a module ([Perlmutter installation](../installation/perlmutter.md#module)) | `srun` ([task geometry](machines/perlmutter.md#required-gpu-task-geometry)) |
+| Perlmutter CPU (Milan) | the same venv, CPU platform, MPI collectives | `srun` ([CPU runs](machines/perlmutter.md#cpu)) |
 | Frontera CPU (CLX) | apptainer image + staged runtime bundle + Intel MPI (layers below) | `config/frontera/templates/gw_dev.sbatch` |
 | another SLURM cluster | `config/<cluster>/` | [`config/README.md`](../../config/README.md) §Porting |
 
@@ -84,12 +87,9 @@ Read, in order:
 
 ## 2. JAX configuration
 
-**One JAX generation.** `pyproject.toml` and `runtime/jax_support.py`
-declare `jax` and `jaxlib` in `[0.9.0, 0.10.0)`; a test fails if the two
-drift, and the runtime refuses any other generation of either package before
-the first physics `jit`, checking the parsed versions and the private API
-shapes the code uses. `tools/require_jax09.py` is the pre-import check for
-launch scripts. There is no escape hatch.
+**One JAX generation.** Only the JAX/JAXLIB 0.9 series runs, enforced at
+install, before import and before the first `jit`
+([the JAX contract](../installation/index.md#jax)).
 
 **64-bit values.** `JAX_ENABLE_X64=1` is runtime-owned: applied even when jax
 was imported first, and a resolved `False` refuses at startup.
@@ -104,7 +104,7 @@ overrides it and refuses anything but `highest` or `float32` (`high` is a
 dtype, is unaffected.
 
 **Compile cache.** One owner, `common.jax_compile_cache`; the directory
-resolution and controls are in [`env_vars.md` §2e](../dev/env_vars.md#2e-compile-cache). The
+resolution and controls are in [`env_vars.md` §2e](../reference/env_vars.md#2e-compile-cache). The
 persistent key includes every array shape, so a new system size misses.
 
 ### 2.1 The GPU memory pool {#gpu-pool}
@@ -146,7 +146,7 @@ $B = 0.9R = 0.801M$ (`common.gpu_utils.get_device_memory_gb`).
 
 **Memory outside the pool.** The CUDA context, NCCL communicators, the
 cuSOLVERMp context and its grow-only `cudaMalloc` workspace live outside
-$R$. Per rank at P=4 on A100-40GB (sandbox claim 2697):
+$R$. Measured per rank at P=4 on A100-40GB:
 
 | cumulative | bytes outside the pool |
 |---|---|
@@ -160,7 +160,7 @@ On 40 GB, $M - R = 0.11 \times 42.4 = 4.66$ GB is less than 4.72 GB, so these
 bytes fit only because the driver releases **idle** reserved memory, on
 demand, to an unrelated allocation in the same process: raw `cudaMalloc`,
 `cuMemCreate`, NCCL communicator init, module loads and launch-time
-local-memory growth all take it (sandbox claim 2700). The driver
+local-memory growth all take it. The driver
 cannot release XLA's live bytes, a block whose stream-ordered free has not
 retired, or idle memory inside a partly used pool chunk (fragmentation). The
 out-of-memory condition is therefore
@@ -203,8 +203,8 @@ SLURM with `SLURM_NTASKS > 1` it calls `jax.distributed.initialize()` with
 `local_device_ids` derived from `CUDA_VISIBLE_DEVICES`; off SLURM set
 `JAX_COORDINATOR_ADDRESS`, `JAX_NUM_PROCESSES` and `JAX_PROCESS_INDEX`. One GPU
 per rank is pinned by `src/ffi/cpp/select_gpu.sh` through
-`CUDA_VISIBLE_DEVICES`, not by `--gpus-per-task=1`, which breaks JAX's
-topology exchange. `jax.distributed` bring-up costs about 1 s, flat to P=64; a
+`CUDA_VISIBLE_DEVICES`, not by `--gpus-per-task=1`
+([why](machines/perlmutter.md#required-gpu-task-geometry)). `jax.distributed` bring-up costs about 1 s, flat to P=64; a
 slow "distributed init" is the CUDA plugin load inside the first
 `jax.devices()`.
 
@@ -235,7 +235,6 @@ dependencies; groups `dev`, `jax`, `build`, `profile`; extras `cuda12`,
 `cuda13`).
 
 **NVIDIA GPUs require `nvidia-mathdx`** (header-only cuFFTDx, pinned in the
-CUDA extras). Every k-axis convolution (ζ fit, Σ, COHSEX, BSE) runs kernels
-that NVRTC compiles at run time from that wheel's headers; a CUDA run without
-it refuses with `GATE mathdx-headers`. Compiled images are cached in
-`$SCRATCH/.cache/lorrax/kconv_mathdx` (else `~/.cache/lorrax/kconv_mathdx`).
+CUDA extras): every k-axis convolution runs kernels NVRTC compiles from its
+headers at run time, and a CUDA run without it refuses with
+`GATE mathdx-headers` ([k-convolution build and cache](../architecture/kconv.md#build-and-cache)).
