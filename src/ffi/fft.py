@@ -1693,12 +1693,14 @@ def x_block_rows(rows) -> np.ndarray:
 #   modes 7/9 on the modes 2/3 split arm where a block cannot hold a group of two or more columns,
 #   P64 tile mode 7 555 -> 237 ms (the 11-row sub-tile pass 22.6 -> 11.6 ms), mode 9 64.9 -> 32.0 ms
 #   (3086): one column per block had re-gathered the pair's group per column (1.3 TB of L2).
-# Paid (B9, 3107): mode 7's split passes as separate entry points (one kernel held every pass at
+# Paid (B9, 3112): mode 7's split passes as separate entry points (one kernel held every pass at
 #   the x-pencil Mid's 240 registers, 8 warps per SM; the gather alone needs 104, so 16 warps),
 #   plane tiles of the most whole groups the opt-in memory holds (16 -> 24 columns at 20^3 ns 2),
 #   and where one column's padded box fits a block (20^3: 134 of 163 KB) the x pencil + Mid, the
 #   forward plane and the pencil + store as one column-resident pass (the intermediate read once,
-#   not three reads and writes): pass shape 11.66 -> 8.23 ms, P64 tile 237 -> 179 ms, bitwise.
+#   not three reads and writes), and the gather's plane tiles in tile-major order (a tile's planes
+#   together, so star members find their parents in L2: DRAM 1.46 -> 1.15 GB, 1.05x): pass shape
+#   11.66 -> 7.9 ms, P64 tile 237 -> 173 ms, bitwise.
 # Did not pay: phase-balanced thread counts 1.014-1.029x (2827); cp.async double buffering -21%
 #   (2799); a staged load reading its tables per cell, 1.63x slower on mode 11, 1.10x on mode 7
 #   (2789); padded shared rows +7% on mode 11, +19% on mode 7 (2845); a per-member vertex Mid
@@ -1713,7 +1715,11 @@ def x_block_rows(rows) -> np.ndarray:
 #   (16-byte runs) left mode 9 at its single-arm wall (3086); mode 7's entries at 512 threads each
 #   (the Mid spills at 128 registers) 0.92x of 512/256/512, two 12-column plane blocks per SM 0.94x
 #   of one 24-column block; B bracket Greens per W load: 2-4 % at most, W_prep is already formed
-#   once per pass for every bracket (not built, 3107).
+#   once per pass for every bracket (not built, 3112).  Left (3112): with G fully L2-resident the
+#   gather is still 2.73 ms (L2 traffic, 16 warps), so the parent regather bounds a gain at ~12 % of
+#   mode 7; tile-major order rereads the per-(k, nu) unfold tables per tile (0.32 -> 0.77 GB), which
+#   only op-indexed tables would avoid; a single-sweep column pass would redo each pair's 2x2 unfold
+#   per spin column (~4x the gather's L2), more than the intermediate round trip it saves (~1.8 ms).
 # Decides it: blocks resident per SM (<= 64 registers, >= 2 blocks) and odd, conflict-free shared
 #   strides, not HBM or FP64 (Fe 8^3 mode 7 at ~50 GB/s and 0.8 TF/s; 2935); after that the
 #   unfold gather's L2 latency (long_scoreboard 49%; 2956).

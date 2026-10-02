@@ -388,15 +388,17 @@ struct PlainK {
 // Plane pass: for each (kx, tile of TP columns) the (ky, kz) plane of every column in padded
 // shared memory (smem: TP * PR elements), the y/z transforms, then st.put.  Load/Store as above;
 // in place is allowed (a block writes only what it staged).  KMINOR: the store runs k fastest
-// (a k-minor Store such as PlainK writes one run per column).  lv: as Live.
-template <int NX, int NY, int NZ, int Arch, cufftdx::fft_direction Dir, int TP, bool KMINOR = false, class C,
-          class Load, class Store>
+// (a k-minor Store such as PlainK writes one run per column).  lv: as Live.  TILEMAJOR: a tile's NX
+// planes run together (consecutive blocks), so a gathered Load's star members, which sit on other
+// planes, find their parent sources in L2 (mode 7's gather at 20^3: DRAM 1.46 -> 1.15 GB, 1.05x).
+template <int NX, int NY, int NZ, int Arch, cufftdx::fft_direction Dir, int TP, bool KMINOR = false,
+          bool TILEMAJOR = false, class C, class Load, class Store>
 __device__ void plane_pass(C* sm, long long ncols, const Load& ld, const Store& st, const Live& lv = Live{}) {
     using G = Geo<NX, NY, NZ>;
     const long long b = lv.b(), e = lv.e(ncols), nct = (e - b + TP - 1) / TP;
     for (long long w = blockIdx.x; w < (long long)NX * nct; w += gridDim.x) {
-        const int kx = int(w / nct);
-        const long long c0 = b + (w % nct) * TP;
+        const int kx = int(TILEMAJOR ? w % NX : w / nct);
+        const long long c0 = b + (TILEMAJOR ? w / NX : w % nct) * TP;
         __syncthreads();
         if constexpr (Load::kDirect) {
             ld.direct(PlaneView<NX, NY, NZ, C>{sm, kx}, kx * NY * NZ, (kx + 1) * NY * NZ, c0, TP, e);

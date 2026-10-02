@@ -1091,10 +1091,10 @@ extern "C" __global__ void __launch_bounds__(LRX_THREADS) lrx_kconv(M7_ARGS) {
     const long long my = t.nl / NR, nc = npairs * SSO;
     const M7Load ld{gp, gt, &t, my, xb.rows * my, pb0};
 #if LRX_ARM == 2
-    lrx_kbox::plane_pass<NX, NY, NZ, LRX_SM, cufftdx::fft_direction::inverse, TRC, true>(
+    lrx_kbox::plane_pass<NX, NY, NZ, LRX_SM, cufftdx::fft_direction::inverse, TRC, true, true>(
         sm, nc, ld, lrx_kbox::PlainK<lrx_c2>{yb, (long long)KG::NK}, M7_LIVE(false));
 #else
-    lrx_kbox::plane_pass<NX, NY, NZ, LRX_SM, cufftdx::fft_direction::inverse, TRC>(
+    lrx_kbox::plane_pass<NX, NY, NZ, LRX_SM, cufftdx::fft_direction::inverse, TRC, false, true>(
         sm, nc, ld, lrx_kbox::Plain<lrx_c2>{yb, nc}, M7_LIVE(false));
 #endif
 }
