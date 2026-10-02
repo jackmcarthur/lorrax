@@ -286,16 +286,12 @@ into multiplets for the label assignment of §5; it is not a convergence knob.
 
 The $q \to 0$ element (head) of $\chi_0$ and $W$ diverges like $1/q^2$ and
 cannot be sampled on a finite k grid; LORRAX completes it from the velocity
-matrix elements $v_{mn} = \langle m | i[H, r] | n \rangle$ and the energies.
-In QSGW the Hamiltonian changes, so its velocity changes. With
-$\Delta H = H - \mathrm{diag}(E^{\rm DFT})$ in the DFT basis and $D_k$ the
-covariant k derivative, $i[\Delta H, r] = D_k \Delta H$ and the QP velocity is
-
-$$
-v^{\rm QP} = U^\dagger \big(v^{\rm DFT} + D_k \Delta H\big)\, U ,
-\qquad v^{\rm DFT} = p + i[V_{\rm NL}, r]\ (+\ \text{SOC}).
-$$
-
+matrix elements and the energies. In QSGW the Hamiltonian changes, so its
+velocity changes: $v^{\rm QP} = U^\dagger(v^{\rm DFT} + D_k\Delta H)\,U$, with
+$D_k\Delta H = i[\Delta H, r]$ the covariant k derivative of the map's
+$\Delta H = H - \mathrm{diag}(E^{\rm DFT})$. The operator, the
+parallel-transport links that form $D_k\Delta H$, their stencil and error,
+and the artifact are owned by [the velocity operator](theory/qp-velocity.md).
 `sc_head_update` chooses how much of this each map uses. One owner,
 `qsgw_head.qp_velocity`, forms the velocity for the head and for
 `dipole_qsgw.h5`:
@@ -317,19 +313,12 @@ and refuses without it, so `off` would gain nothing. Other decks default to `off
 parse time, and holds for the whole run, because a velocity treatment that
 changed between maps would change $F$ under the mixer.
 
-**Links.** `parallel_transport` differentiates on the link shell of
-`common.parallel_transport.link_stencil`: whole Marzari–Vanderbilt shells of
-mesh vectors, closed under the lattice point group. The links span an outer
-band set (`get_dipole_mtxels --parallel-transport-bands`, default
-min(WFN bands, ⌈1.25 × deck bands⌉)); $D_k\Delta H$ is taken there and
-restricted to the head bands. Links that cannot serve the term set
-$D_k\Delta H = 0$ for the whole run, and each map logs the reason: an
-incomplete artifact, a two-point k axis, or a window edge that cuts a
-hybridized manifold (`GATE pt_head_window_hybridized`, judged at the outer
-edge). Complete links always serve the term. Their measured error times
-$\|D_k\Delta H\| / \|v^{\rm DFT}\|$ is logged each map as a bound and gates
-nothing: link error falls with the k grid, so a large value means the grid is
-underconverged. A link artifact whose steps differ from the shell refuses
+**Links on each map.** Complete links serve $D_k\Delta H$ on every map, and
+each map logs their error bound; links that cannot serve the term (an
+incomplete artifact, a two-point k axis, a hybridized window edge) set
+$D_k\Delta H = 0$ for the whole run, with one line naming the reason
+([link error](theory/qp-velocity.md#6-the-link-error-and-what-it-means)). A
+link artifact whose steps differ from the current stencil refuses
 (`GATE pt_link_stencil`); rerun the dipole step. Before the loop, a head
 window whose top edge splits a degenerate multiplet refuses
 (`sc_iteration._refuse_degenerate_window_edge`): an edge inside a multiplet
@@ -344,53 +333,17 @@ the band gap (0 on a metal). Metal routes are in §7.
 
 ### Interband-commutator head {#interband-commutator-head}
 
-`interband_commutator` forms the QSGW velocity without links, on any grid
-(`qsgw_head.interband_commutator_velocity`):
-
-$$
-D_k\Delta H \approx [\Delta H, \mathcal W], \qquad
-\mathcal W_{vc} = \frac{v_{vc}}{E^{\rm DFT}_v - E^{\rm DFT}_c},
-\quad \mathcal W_{cv} = \frac{v_{cv}}{E^{\rm DFT}_c - E^{\rm DFT}_v}
-= -\mathcal W_{vc}^* ,
-$$
-
-for valence $v < n_{\rm occ} \le c$, and $\mathcal W = 0$ inside each
-occupation class. $\mathcal W = i r^{VC}$, with $r^{VC}$ the Hermitian
-cross-gap position operator of the DFT Hamiltonian, so $\mathcal W$ is
-anti-Hermitian and $[H^{\rm DFT}, \mathcal W] = v$ on the
-valence–conduction blocks. Split the covariant derivative by class,
-$D_k\Delta H = -i[A^{VC}, \Delta H] + D^{\rm class}\Delta H$, where
-$A^{VC} = r^{VC}$ is the cross-gap Berry connection: the
-valence–conduction block of $D^{\rm class}\Delta H$ holds only the cross-gap
-block $\Delta H_{VC}$. The head is therefore exact for any $\Delta H$ that
-does not mix valence and conduction (a band-diagonal $\Delta H$ gives
-$v_{vc}(E^{\rm QP}_v - E^{\rm QP}_c)/(E_v - E_c)$), and its error is first
-order in the cross-gap mixing $\theta = \max_k \|U_{VC}\|_F$, which each map
-prints. On MoS2 bispinor at $\theta \approx 0.055$ the head's $S_{zz}$ sits
-1.3 % from the exact position-operator head, about $\theta/4$; there is no
-refusal threshold on θ.
-
-Every same-class pair is excluded, degenerate or not: inside a class
-$\mathcal W$ has no gap in its denominator, near-degenerate pairs make it
-arbitrarily large, and the $\partial_k \Delta H$ that would cancel it has no
-stencil-free form; excluding only exact multiplets gives a Si 6×6×6 SOC head
-8.8 times the link head. Every denominator is therefore at least the direct
-gap.
-
-On a collapsed (one-point) k axis the cell is not periodic, and the
-connection is the stored position operator $Z_a$ of the velocity artifact:
-the reduced component $a$ of $\mathcal W$ is $i Z_a$, and the class rule
-applies to the periodic axes only,
-$\mathcal W_{\rm cart} = B^{-1}[B\,\mathcal W^{VC}$ with row $a$ replaced by
-$i Z_a]$, where $B$ is the reciprocal-lattice matrix that takes Cartesian
-components to reduced ones. `parallel_transport` uses the same operator on such an axis.
-
-A metal refuses (`GATE sc_head_interband_commutator_insulator_only`), and so
-does a cross-gap pair within $10^{-6}$ Ry
-(`GATE sc_head_interband_commutator_gap`). The velocity artifact must stamp
-`vnl_included = 1` (`GATE sc_head_interband_commutator_velocity_operator`),
-because $r_{ml} = -i v_{ml}/(E_m - E_l)$ holds only for the velocity of the
-Hamiltonian whose energies divide it.
+`interband_commutator` replaces $D_k\Delta H$ by $[\Delta H, \mathcal W]$
+with the cross-gap $\mathcal W = i r^{VC}$, so it needs no links and runs on
+any grid (`qsgw_head.interband_commutator_velocity`; definition, accuracy and
+the collapsed-axis form in
+[the velocity operator §7](theory/qp-velocity.md#7-the-heads-that-use-the-velocity)).
+Each map prints the cross-gap mixing $\theta = \max_k \|U_{VC}\|_F$, to which
+its error is first order; no threshold on θ refuses. A metal refuses
+(`GATE sc_head_interband_commutator_insulator_only`), and so do a cross-gap
+pair within $10^{-6}$ Ry (`GATE sc_head_interband_commutator_gap`) and a
+velocity artifact not stamped `vnl_included = 1`
+(`GATE sc_head_interband_commutator_velocity_operator`).
 
 ### QSGW dipoles {#qsgw-dipoles}
 

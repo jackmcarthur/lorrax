@@ -9,7 +9,7 @@ LORRAX has six core drivers in seven modules: GW preprocessing is two modules
 | velocity operator | `psp.get_dipole_mtxels` | `dipole.h5` |
 | one-body Hamiltonian | `gw.kin_ion_io` | `kin_ion.h5` |
 | GW | `gw.gw_jax` | `eqp0.dat`, `eqp1.dat`, `qp_wfn_rotations.h5`, the restart bundle |
-| band interpolation | `bandstructure.htransform` | `bandstructure.dat` |
+| band interpolation | `bandstructure.htransform` | `bandstructure.dat` ([how-to](how-to/htransform-and-exciton-bands.md)) |
 | optical BSE | `bse.bse_jax` | exciton energies, `eigenvectors.h5` |
 | exciton dispersion | `bse.exciton_bands` | `E_S(Q)` table and plot |
 
@@ -78,13 +78,14 @@ conduction window (the old `v_x_vc` default) only warns.
 ## dipole — `psp.get_dipole_mtxels`
 
 Computes the velocity matrix elements
-$\langle mk|\hat v_a|nk\rangle = \langle mk|\hat p_a + s\,i[\hat r_a, V_\mathrm{NL}]|nk\rangle$
-for every full-BZ $k$ and Cartesian $a$, with $\hat p = \sum_G (k+G) c^*c$
-and the nonlocal commutator from the analytic $k$-derivative of the
-projectors. The sign $s$ is `vnl_velocity_sign` (deck key or
-`--vnl-velocity-sign`; unset resolves to `+1`, stamped as
-`prov_vnl_velocity_sign`). Consumed by `gw.head_correction` for the $q\to0$
-head $S(\omega)$ of Σ and by the BSE head term ([theory](theory/physics.md)).
+$\langle mk|\hat v_a|nk\rangle = \langle mk|2(k+G)_a + s\,\partial V_\mathrm{NL}/\partial k_a|nk\rangle$
+(Ry atomic units) for every full-BZ $k$ and Cartesian $a$, with the nonlocal
+term from the analytic $k$-derivative of the projectors. The sign $s$ is
+`vnl_velocity_sign` (deck key or `--vnl-velocity-sign`; unset resolves to
+`+1`, stamped as `prov_vnl_velocity_sign`). Consumed by `gw.head_correction`
+for the $q\to0$ head $S(\omega)$ of Σ and by the BSE. The operator, its sign,
+the links and the artifact are owned by
+[the velocity operator](theory/qp-velocity.md).
 
 Reads the deck (`wfn_file`, `nval`, `ncond`, `nband`, `bispinor`) and the
 `*.upf` files (deck directory, then `../qe/scf`, `../qe/nscf`). Writes
@@ -106,8 +107,9 @@ Invoke: `python3 -m psp.get_dipole_mtxels -i deck.in [--out dipole.h5]`.
 | `--vnl-velocity-sign` | deck, else `+1` | relative sign of $i[r,V_\mathrm{NL}]$ |
 | `--pseudo-dir` | deck directory | where the `*.upf` live |
 | `--with-finite-q` / `--iq-list` | off / all | also write the `finite_q/` group (`rho_cvkq`, symmetrized `v_cvkq`, `kminq_idx`); its conduction axis is sized by the producer's `ncond` |
-| `--parallel-transport-out` | `parallel_transport.h5` beside `--out` | the SlabIO parallel-transport artifact read by `sc_head_update` (links, the DFT velocity and `p` alone); links on the point-group-closed shell of `common.parallel_transport.link_stencil` (schema 4; the full BZ when the shell is not the three axes); dropped on a k grid without a link stencil. `--no-parallel-transport` skips it; `--parallel-transport-velocity-only` writes only the DFT-velocity stage `dft_velocity` needs |
-| `--parallel-transport-bands` | `0`: min(WFN bands, ⌈1.25 × deck bands⌉) | outer band set of the links (and of the velocity written with them). The reconstruction error is measured on the deck's own bands (the head) and stamped; the bands above are a buffer that holds the outer edge's link collapse. The error is a k-convergence measure: the dipole step warns above `--parallel-transport-validation-rtol` (5e-3) and still writes the artifact, and the SC head serves its Σ correction from the links on every map and logs the error's bound on it (`qsgw_head.link_correction_bound`) |
+| `--parallel-transport-out` | `parallel_transport.h5` beside `--out` | the link and velocity artifact read by `sc_head_update` ([its schema](theory/qp-velocity.md#9-the-artifact-parallel_transporth5)). `--no-parallel-transport` skips it; `--parallel-transport-velocity-only` writes only the velocity stage |
+| `--parallel-transport-bands` | `0`: min(WFN bands, ⌈1.25 × deck bands⌉) | outer band set of the links ([why](theory/qp-velocity.md#4-links-and-the-covariant-derivative)) |
+| `--parallel-transport-validation-rtol`, `--parallel-transport-rcond` | 5e-3, 1e-10 | the link-error warning threshold and the polar-factor cutoff ([link error](theory/qp-velocity.md#6-the-link-error-and-what-it-means)) |
 
 ## kin-ion — `gw.kin_ion_io`
 
@@ -158,25 +160,20 @@ G(τ) is never materialized; it exists only as $\psi\psi^*$ phases inside the
 **Inputs.** The deck, `WFN.h5`, `centroids_file`, `kin_ion.h5`, `dipole.h5`
 (for the head); on bispinor runs also `centroids_file_current`.
 
-**Outputs.**
+**Outputs.** Formats, columns, units and band conventions of every file:
+[outputs](how-to/berkeleygw-users.md#outputs).
 
 | file | content |
 |---|---|
-| `eqp0.dat` | BerkeleyGW format. $E_\mathrm{DFT} + \Delta(E_\mathrm{DFT})$, $\Delta = \langle T + V_\mathrm{ion} + V_H + \Sigma_{xc}\rangle - E_\mathrm{DFT}$ |
-| `eqp1.dat` | BerkeleyGW format. Linearized $E + Z\,\Delta(E)$, $Z = (1 - \partial_\omega \mathrm{Re}\,\Sigma_c)^{-1}$, raw for every $Z$ (a BerkeleyGW comparison column). The derivative is a central difference at ±0.5 eV on the sampled ω grid (BerkeleyGW's `finite_difference_spacing` default), one-sided within 0.5 eV of a grid edge. In SC runs `eqp0.dat` and `eqp1.dat` both hold the SC eigenvalues, the accepted map's `eqp0_iterNNNN.dat` body ([self_consistency.md](self_consistency.md)) |
-| `sigma_diag.dat` | Σ diagonals in eV. Dynamic one-shot runs add `Z`, the eqp1 residue at $E_\mathrm{DFT}$. Bispinor runs add `sigCC`, `sigTT`, `sigCT` (= CT + TC); ordered broken-TR GN runs add `sigC_odd`. One-shot runs with band extrapolation add `sigC_raw`, `eqp0_raw`, `eqp1_raw` last: Σ_c and eqp0/eqp1 from the band sum truncated at N with no `spectral_shell` tail, from the same Σ evaluation; compare these to BerkeleyGW at the same `number_bands`. SC runs have no raw columns: their Σ diagonals are in the QP basis, and a diagonal cannot be rotated back |
-| `eqp_g0w0.dat` | PPM one-shot only: Re/Im of $H_0 + \Sigma_{xc}(E_\mathrm{DFT})$ |
-| `qp_wfn_rotations.h5` | the QP eigensystem $U_{mnk}$, $E_\mathrm{QP}$ with the source-WFN fingerprint, read by htransform, BSE and SC seeding |
-| `WFN_qp.h5` | ψ rotated by U with QP energies (`write_wfn_h5`, default true) |
-| `sigma_mnk.h5` | the dynamic Σ cube (PPM/MPA only) |
+| `eqp0.dat`, `eqp1.dat` | BerkeleyGW-format QP energies on the WFN wedge; in SC runs, the converged SC spectrum |
+| `sigma_diag.dat` | the Σ diagonal decomposition per k and band |
+| `eqp_g0w0.dat` | dynamic one-shot runs: $H_0 + \Sigma_{xc}(E_\mathrm{DFT})$ |
+| `sigma_mnk.h5` | dynamic modes: the Σ(ω) band matrices |
+| `qp_wfn_rotations.h5` | the QP eigensystem $U$, $E_\mathrm{QP}$ with the source-WFN fingerprint, read by htransform, BSE and SC seeding |
+| `WFN_qp.h5` | ψ rotated by U with QP energies (`write_wfn_h5`); a one-shot run on a symmetry-reduced WFN writes none |
 | `tmp/zeta_q.h5` | ζ, plus `zeta_q_mu{1,2,3}.h5` on bispinor runs |
-| `tmp/isdf_tensors_<N_mu>.h5` | the restart bundle: `V_qmunu`, `W0_qmunu` (`W0_ready`), `psi_parent_y`, `enk_full`, head scalars, band window; the BSE input |
-| `gwjax.out` | the run report: every resolved pathway |
-
-All energy files are on the irreducible wedge. `eqp0.dat`/`eqp1.dat` carry
-the BerkeleyGW `(3f13.9,i8)` block header, `sigma_diag.dat` and `eqp_g0w0.dat` a
-`# kcrys` line per block. Join blocks to another code's by that coordinate,
-never by block position: the two codes' wedges order k differently.
+| `tmp/isdf_tensors_<N_mu>.h5` | the restart bundle with the static W0; the BSE input |
+| `gwjax.out` | the run report |
 
 `qp_wfn_rotations.h5` converts to a QP WFN through the same writer:
 `python -m postprocess.rotate_wfn_to_qp WFN.h5 qp_wfn_rotations.h5`.
@@ -226,118 +223,22 @@ outputs and the refusals; the `[downfold]` keys are in the
 
 ## htransform — `bandstructure.htransform`
 
-Interpolates band energies to an arbitrary k-path. On the coarse grid it forms
+Interpolates band energies from the coarse grid to the deck's
+`K_POINTS {crystal_b}` path: the window's states are expanded in one
+k-independent Galerkin basis, $f(H)_k = \sum_n f(\varepsilon_{nk})c_{nk}c_{nk}^\dagger$
+is Fourier-interpolated, and $f$ is inverted at each path point. Optional
+routes put QP energies on the path (`--qp-rotations` or `--eqp-file`), color
+the bands by spin or orbital character (`--color`) and sum spin and orbital
+moments on a uniform grid (`--moments-grid`).
 
-$$f(H)_k = \sum_n f(\varepsilon_{nk})\, c_{nk} c_{nk}^\dagger,$$
+Reads the deck, `WFN.h5` (or `--wfn-file WFN_qp.h5`) and `centroids_file`.
+Writes `bandstructure.dat` (eV, VBM at 0), `htransform.out` and the reusable
+basis `galerkin_dft.h5`; rank 0 writes.
 
-where $c_{nk}$ are the states' coefficients in one shared whole-state Galerkin
-basis and $f$ is a smooth monotone map, linear below the window and flat to
-zero at its top. $f(H)_R$ follows by the flat-k inverse FFT; at each path point
-the driver Fourier-interpolates $f(H)_q$, diagonalizes it, and inverts $f$ by
-Newton iteration. States above the window map to exactly zero, so no band
-crosses the window edge: $f(H)_k$ is smooth in k and $f(H)_R$ short-ranged. `isdf.galerkin` selects the basis from stacked full-Bloch
-states by deterministic randomized QRCP and projects every state into that one
-gauge; the WFN transforms stream the G→r work.
+Invoke: `python -m bandstructure.htransform -i ht.in [--qp-rotations qp_wfn_rotations.h5 | --eqp-file eqp1.dat] [--color spin] [--moments-grid 40 40 40]`.
 
-Uniform spin operators use the same physical basis $B=L^{-1}X$, with $X$
-containing only the selected pivot states. Owner-balanced pivot groups use
-the shared WFN row transform, whose measured FFT workspace and live row
-payload bound each real-space slab; the unselected k/band table is not
-transformed for this projection. Consumers that retain band wavefunctions
-continue to stream those bands alongside the basis.
-
-The returned window is $(n_\mathrm{elec} - n_\mathrm{val}, n_\mathrm{elec} + n_\mathrm{cond})$.
-Standalone output requires `nval = nelec`: an omitted lower occupied boundary
-can reproduce the samples and still ring between them. `--guard-bands` extra
-conduction bands are fitted above the window, because the top of the fit window
-sits on $f$'s zero shoulder.
-
-Two QP routes, mutually exclusive, never stacked:
-
-- `--qp-rotations qp_wfn_rotations.h5` is the full QP Hamiltonian: it rotates
-  the compact Galerkin rows by the authenticated $U$, so the builder represents
-  $f(H_\mathrm{QP}) = U f(E_\mathrm{QP}) U^\dagger$. When outer DFT guards
-  remain, the QP block must extend above the returned window; the returned
-  states are selected by their character in the QP projector
-  $P_A(q)$, and a path point without a physical-energy gap between the
-  returned top and the rest refuses. Stale, unstamped or foreign-WFN artifacts
-  refuse before $U$ is applied.
-- `--eqp-file eqp1.dat` is the diagonal approximation: it replaces energies in
-  the DFT band labels and cannot represent QP mixing. The file is LORRAX's own
-  wedge `eqp1.dat`; its block coordinates are checked against the deck's wedge
-  and unfolded through the symmetry service. A missing or unparseable file is
-  fatal.
-
-Consumes the GW deck (with a `K_POINTS {crystal_b}` path), `WFN.h5` (or
-`--wfn-file WFN_qp.h5`) and `centroids_file`. Writes `bandstructure.dat` (eV,
-VBM at 0, returned and fitted windows in the header) and `htransform.out`;
-rank 0 writes. `galerkin_dft.h5` beside the deck caches the basis: reused on an
-exact provenance match, refit in memory otherwise.
-
-Invoke: `python -m bandstructure.htransform -i ht.in [--qp-rotations qp_wfn_rotations.h5 | --eqp-file eqp1.dat] [--color spin --color orbital:d] [--moments-grid 40 40 40]`.
-
-| key / flag | default | meaning |
-|---|---|---|
-| `nval` / `ncond` | 5 / 5 | returned window |
-| `htransform_rank_multiplier` | 20 | QRCP search ceiling $\lceil 20\, N_\mathrm{band}\rceil$; `htransform_qr_eps` (1e-3) selects the delivered rank |
-| `--guard-bands` | 4 | extra fitted conduction bands |
-| `--a-band` | top band | band whose bandwidth sets $f$'s scale |
-| `linalg` / `--eigh-backend` | `local` | layout of the $f(H)_q$ eigensolve |
-| `get_centroids_fi`, `kgrid_fi`, `wfn_fi_min`/`wfn_fi_max`, `wfn_fi_q_chunk` | off | BSE handoff: fine-grid ψ at the coarse centroids (`bandstructure.bse_setup.compute_wfns_fi`) |
-
-Band character and moments (`bandstructure.orbital`, spinor WFN only):
-
-- `--color spin` colors the path bands by $\langle\sigma\cdot\hat n\rangle$,
-  $\hat n$ the magnetization axis of the WFN's QE schema (`output` total
-  magnetization when present, else the input `starting_magnetization`
-  direction); `--color orbital:[EL:]l` (e.g. `orbital:d`, `orbital:Fe:d`) by
-  the character of Löwdin-orthogonalized PP_PSWFC rows (the `*.upf` beside
-  the deck; j-averaged radial functions, as `psp.hubbard_ops`). Repeatable.
-  Writes `bands_<color>.png` ($E - E_F$, $E_F$ of the coarse grid) and
-  `band_operators_path.npz` (all path operator matrices: $\sigma_{x,y,z}$,
-  each atom's $L_{x,y,z}$, the characters).
-- `--moments-grid NX NY NZ` interpolates $f(H)$, $\sigma_{x,y,z}$ and each
-  atom's $L_{x,y,z}$ to that uniform grid, re-finds $E_F$ there
-  (Fermi-Dirac at `occ_smearing_width_ry`, $10^{-4}$ Ry if unset, electron
-  count exact) and writes `moments.txt`: the three components and the
-  projection on $\hat n$ of $m_\mathrm{spin} = \sum_\mathrm{occ}\langle
-  \sigma\rangle$ and of each atom's atomic-sphere $m_\mathrm{orb} =
-  \sum_\mathrm{occ}\langle L\rangle$, beside the same sums taken directly on
-  the coarse grid. Units and sign: $\mu_B$ per cell in QE's convention
-  ($m_\mathrm{spin} = n_\uparrow - n_\downarrow$, QE's "total
-  magnetization"; $m_\mathrm{orb}$ with the same sign flip), so the
-  physical moments are $-\mu_B\langle\sigma\rangle$ and $-\mu_B\langle
-  L\rangle$ and $m_\mathrm{orb}/m_\mathrm{spin} > 0$ means $L \parallel S$.
-  The itinerant (modern-theory) orbital term needs the Berry connection and
-  is not formed.
-
-Every operator is $\langle\psi_{nk}|O|\psi_{mk}\rangle$ on the coarse full BZ,
-carried into the Galerkin basis as $C^T O C^*$ and Fourier-interpolated as
-$f(H)$ is; a QP $U$ is unitary on the fitted window, so with `--qp-rotations`
-only the eigenvectors change. The grid runs one $q_z$ plane per pass (a
-separable phase sum over the coarse $R$, one face→q exchange): one scan solves
-$f(H)$ and keeps the plane eigenvectors, then $f(H)_R$ is freed and each
-operator's image is built for its own scan, so one dense $(n_k, r, r)$ image
-(two while an operator is transformed) is resident.
-
-Refusals: a QRCP search that saturates the ceiling (inspect the projection
-receipts before raising the multiplier); an `f-shoulder` refusal when a
-returned band is absent from $f(H)$ at some coarse k (add guard bands); Newton
-not reaching $\max|f(x)-y| \le 10^{-12}$ Ry in 50 steps. The reproduction of
-coarse-grid energies is reported as a receipt; it is not a locality
-certificate, and the independent fine-grid QE comparison decides acceptance.
-
-`K_POINTS {crystal_b}` format (shared with `bse.exciton_bands`): a count of
-corners, then one line per corner with three crystal coordinates and the number
-of points to the next corner, `#label` optional; the last corner takes 1.
-
-```text
-K_POINTS {crystal_b}
-3
-  0.0000 0.0000 0.0000 2  #G
-  0.5000 0.0000 0.0000 2  #X
-  0.5000 0.5000 0.0000 1  #M
-```
+[Band interpolation and exciton bands](how-to/htransform-and-exciton-bands.md)
+owns the method, every flag and key, the output formats and the refusals.
 
 ## bse — `bse.bse_jax`
 
@@ -371,44 +272,19 @@ Lanczos-only.
 | `head_minibz_average` (deck) | false | read only under `bse_k_grid`: rebuilds the q = 0 exchange tile with the fine grid's mini-BZ head and takes the W head's Γ-cell reference from the analytic sphere ([LT head](theory/lt-exchange-head.md)); must match the GW run |
 
 Forgetting `--bse` gives RPA. Absorption comparisons with BerkeleyGW:
-`src/bse/BGW_COMPARE.md`.
+[BerkeleyGW users](how-to/berkeleygw-users.md#bse).
 
 ## exciton bands — `bse.exciton_bands`
 
-Computes the finite-momentum exciton dispersion $E_S(Q)$ from the TDA
-Hamiltonian $H_Q = D_Q + V_Q - W$ (exchange weighted as in `bse_jax`) in the
-basis $|vk \to c\,k{+}Q\rangle$, along the deck's `K_POINTS {crystal_b}` path.
-The shifted conduction states $\psi_c(k+Q)$, $\varepsilon_c(k+Q)$ are
-eigenpairs of one interpolated htransform $f(H)$ (`compute_wfns_fi` on the
-q-list $\{k+Q\}$). W is the unchanged coarse-grid convolution, because every
-$k - k'$ stays on the grid when all conduction legs shift by the same Q. The
-exchange tile at tile momentum $\mathrm{wrap}(-Q)$ comes from `bse.vq_interp`
-(G = 0 kept at finite Q). The whole path is one jitted `lax.scan` of block
-Lanczos over the stack matvec: one compile for all Q.
-
-Writes `<prefix>.dat` and `<prefix>.png` (rank 0). With `--eqp` both legs, the
-stored energies and the htransform's, are corrected. There is no
-`--qp-rotations` route: a full-QP run needs a restart generated from the same
-stamped `WFN_qp.h5` the deck selects. Why the head is handled as it is:
-[the long-range exchange head](theory/lt-exchange-head.md); the traps and
-sizing rules: `src/bse/EXCITON_BANDS.md`.
+Computes the finite-momentum exciton dispersion $E_S(Q)$ of the TDA
+Hamiltonian $H_Q = D_Q + V_Q - W$ in the basis $|vk \to c\,k{+}Q\rangle$ along
+the deck's `K_POINTS {crystal_b}` path. The shifted conduction states come
+from htransform, W is the coarse-grid convolution of the GW restart, and the
+exchange tile at off-grid $Q$ comes from `bse.vq_interp`. The whole path is
+one compiled `lax.scan`. Writes `<prefix>.dat` and `<prefix>.png` (rank 0).
 
 Invoke: `python -u -m bse.exciton_bands -i cohsex.in --n-val 4 --n-cond 4 --n-eig 6`.
 
-| flag | default | meaning |
-|---|---|---|
-| `--vq-mode` | `interp` | `interp`: interpolated tile, slab decks only (refuses `sys_dim = 3`), needs full-BZ `zeta_q.h5`. `refit`: per-Q ζ refit with the producer's Coulomb kernel, the arbitrary-Q route for bulk. `both`: interp plus refit at `--refit-points` in the same scan. `ongrid`: the stored tile, exact, coarse-grid Q only |
-| `--refit-window` | `zeta` | `zeta` refits on the producer's window, certified by reproducing the stored tiles (needs $N_\mu n_s \ge N_k n_b$); `bse` fits the deck's window and certifies the contracted eigenvalues at on-grid Q |
-| `--cert-grade` | `reference` | tolerance of the `bse`-window certification: `reference` 0.01 meV, `visualization` 1.0 meV; stamped into the outputs |
-| `--q-per-segment` | 16 | floor on the deck's per-segment counts (1 = the deck's counts) |
-| `--n-eig` / `--block-size` / `--max-iter` | 6 / 8 / 40 | per-Q block Lanczos |
-| `--band-degeneracy` | `strict` | as in `bse_jax`, checked on both the loader window and the htransform conduction window |
-| `--w-coarse-grid` / `--w-head-densify` / `--w-head-gamma-cell` | unset / `c1` / `fine` | densify a native fine W from a nested coarse sub-grid; `c1` splits the Γ head off before interpolation and re-attaches it analytically |
-| `nband` / `nval` / `ncond` (deck) | | htransform window; the BSE conduction window must sit interior with guard bands above it |
-
-Refusals: no `K_POINTS crystal_b` block; the Γ gate ("htransform conduction
-cache grossly inconsistent") when the interpolation window is over-packed;
-`interp` on IBZ-only ζ or a bulk deck; `ongrid` at an off-grid Q; a failed
-`--refit-window=bse` certification. A downfolded bundle works here too: the
-driver takes the parent centroid table from the bundle's `downfold_provenance`
-and the transported `zeta_q.h5` for off-grid exchange.
+[Band interpolation and exciton bands](how-to/htransform-and-exciton-bands.md#7-exciton-bands)
+owns the method, the exchange routes (`--vq-mode`) and their certification,
+the flags, the output format and the refusals.

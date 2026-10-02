@@ -6,7 +6,8 @@ the outputs and the refusals. Other owners: CLI flags and invocation,
 [drivers](../drivers.md#bse-bsebse_jax); deck keys,
 [input reference](../input_reference.md); the k-convolution kernels,
 [the FFI layer](ffi_layout.md#kernel-operations); BerkeleyGW conventions,
-`src/bse/BGW_COMPARE.md`; finite-Q exciton bands, `src/bse/EXCITON_BANDS.md`.
+[BerkeleyGW users](../how-to/berkeleygw-users.md#bse); finite-Q exciton
+bands, [exciton bands](../how-to/htransform-and-exciton-bands.md#7-exciton-bands).
 
 ## Inputs
 

@@ -71,6 +71,8 @@ nav:
       - "How-to: metals": how-to/metals.md
       - "How-to: complete-basis WFN": how-to/complete-basis-wfn.md
       - "How-to: large-N_mu operation": how-to/large-nmu-operation.md
+      - "How-to: BerkeleyGW users": how-to/berkeleygw-users.md
+      - "How-to: band and exciton interpolation": how-to/htransform-and-exciton-bands.md
       - Self-consistency: self_consistency.md
       - BSE: architecture/bse.md
       - Downfold driver: downfold.md
@@ -91,6 +93,7 @@ nav:
       - Space-time response (Laplace): theory/response-laplace.md
       - S-tensor convention: theory/s-tensor-convention.md
       - LT splitting and the exchange head: theory/lt-exchange-head.md
+      - The velocity operator: theory/qp-velocity.md
       - HL-GPP derivation: theory/hl-gpp-derivation.md
       - Non-Hermitian GN-PPM: theory/gn-ppm-nonhermitian.md
       - Multipole frequency integration (MPA): theory/THEORY_mpa_implementation.md
