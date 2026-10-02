@@ -2574,6 +2574,7 @@ def produce_sample_bank(wfns, meta, config, *, mesh_xy, sym, sample_plan, bank_i
         for key, value in stream_bank.seconds.items():
             receipt["seconds"]["bank_" + key] = value
         receipt["bank_residence"]["bounced_records"] = stream_bank.bounced
+        receipt["bank_residence"]["rereads"] = stream_bank.rereads
         stream_bank.release()
     if jax.process_index() == 0:
         passes = _direct_passes(wfns, meta, mesh_xy, len(response_rows)) if vertex is None else None
@@ -2589,7 +2590,9 @@ def produce_sample_bank(wfns, meta, config, *, mesh_xy, sym, sample_plan, bank_i
                  + ("" if residence["residence"] == "device" else
                     f"; q spans of {residence.get('q_width')} parents"
                     f"; write {receipt['seconds']['bank_write']:.2f} s, read "
-                    f"{receipt['seconds']['bank_read']:.2f} s, waited {receipt['seconds']['bank_wait']:.2f} s"),
+                    f"{receipt['seconds']['bank_read']:.2f} s, waited {receipt['seconds']['bank_wait']:.2f} s"
+                    + (f"; {residence['rereads']} span(s) re-read after a failed check"
+                       if residence.get("rereads") else "")),
                  flush=True)
         print_fn("Response quadrature: seconds " + " ".join(
             f"{key}={value:.3f}" for key, value in receipt["seconds"].items()), flush=True)
