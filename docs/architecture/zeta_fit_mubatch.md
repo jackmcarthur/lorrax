@@ -101,7 +101,7 @@ C_q) on its load (mathdx mode 6 on CUDA; the XLA composition and the host
 plans on CPU), so no phased, split, vertex-folded or transposed copy of D is
 written. It
 correlates over k by FFTs on the k grid, at O(N_k log N_k) per (μ, r) point.
-Kernel contracts are on [the FFI layer](ffi_layout.md#k-convolution-router-and-the-mathdx-family).
+Kernel contracts (modes 6 and 10) are on [the k-convolution page](kconv.md#modes).
 
 **Cost per batch and rank** (n_b fit bands, n_⊥ = N_r/n_a points per plane,
 n_col × n_s the ψ cylinder):

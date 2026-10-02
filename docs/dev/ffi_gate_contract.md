@@ -114,7 +114,7 @@ tier 1.
 
 ## What stays outside `Gate`
 
-`distrib_la.resolve` ([distrib_la](../services/distrib_la.md)) serves
+`distrib_la.resolve` ([distrib_la backends](../services/distrib_la/backends.md)) serves
 distributed solvers that hold an MPI/BLACS/NCCL communicator. Its selection
 input is a function argument (`plan(op, mesh, backend=, n=)`), it resolves in
 one phase because it receives `n`, and its process-coverage and mesh-geometry

@@ -44,7 +44,7 @@ atoms' spatial Seitz group (improper and nonsymmorphic operations included) and
 pruning admits only whole orbits that fit the budget. Numerical flatness of the
 pool is reported, not refused, because an over-complete interpolation set can
 be accurate; non-PSD input, pool exhaustion and invalid pivots refuse
-([rank policy](dev/rank_truncation_policy.md)).
+([rank policy](architecture/rank_truncation_policy.md)).
 
 Reads `WFN.h5` in the working directory. Writes `centroids_frac_<n>[<suffix>].txt`
 (fractional coordinates, with a provenance header) and `kmeans[<suffix>].out`.
@@ -211,8 +211,8 @@ grid, cutoffs, WFN identity). Mesh and P are excluded: a fit at P=4 is reusable
 at P=80. `LORRAX_FORCE_REFIT=1` forces a refit.
 
 Operating at thousands of centroids (the distributed plan, per-rank scalings):
-[large-μ operation](dev/large_nmu_operation.md). Environment variables:
-[registry](dev/env_vars.md).
+[large-μ operation](how-to/large-nmu-operation.md). Environment variables:
+[registry](reference/env_vars.md).
 
 ## downfold — `gw.downfold_cli`
 

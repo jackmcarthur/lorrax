@@ -11,7 +11,7 @@ how much; `common.gpu_utils.warn_over_budget`; gwjax.out lists it under
 WARNINGS), runs at its smallest size, and OOMs if the device truly lacks the
 room. What still refuses is not a price: a kernel shape limit (a k-grid a
 mathdx mode cannot hold, `GATE response_vertex_grid` and the
-[k-convolution residency gates](ffi_layout.md#k-convolution-router-and-the-mathdx-family)),
+[k-convolution residency gates](kconv.md#refusals)),
 a workspace that cannot be measured (`GATE shared_pole_capacity: … FFT
 workspace unavailable`), and the correctness gates.
 
@@ -46,14 +46,12 @@ No planner reads `bytes_limit`, free memory or the card total.
 k, q, bands, centroids, samples or rows takes the most units whose per-rank
 scaling bytes fit `runtime.tiles.TILE_BYTES` (1 GiB; `tile_units`). The tile
 comes from the loop's shapes alone, so every rank computes it without a
-collective, and no result depends on how much memory a run was given. Two
-sizes still follow the budget, through a ledger: the shared-pole response
-sample group (`response_bank.response_group_size`, the capacity ledger; a
-larger group buys more than 10 % per map) and the Galerkin whole-state
-planner (`isdf.galerkin`, whose capacity also bounds its resident rows).
-A 4 GiB tile was measured and not taken: at the Fe/Ni 20³ P64-local tile it
-cut one χ₀ dispatch by 16 % (four-current) and 9 % (scalar) for four times
-the tile's device memory (claim 3078).
+collective, and no result depends on how much memory a run was given. Some
+planners still size from `memory_per_device_gb` (the same value on every
+rank, so they cannot deadlock); [the fixed-tile ruling](decisions.md#fixed-tile)
+lists them. A 4 GiB tile is not used: at the Fe/Ni 20³ P64-local tile it cut
+one χ₀ dispatch by 16 % (four-current) and 9 % (scalar) for four times the
+tile's device memory.
 
 <a id="streamed-chi-bank"></a>
 **The χ bank streams instead of splitting into sample groups.**
@@ -193,7 +191,7 @@ windows run as one `lax.scan` (`scan_passes`, `stream_passes`). Each slices
 its rows at a traced offset (`window_rows`); its unfold tables are cut from
 the tables placed once per run, on the device (`window_load`, the one
 table-cut owner); and the k-convolutions see only its live rows `[lo, hi)`
-(the `live` operand, [FFI layer](ffi_layout.md#k-convolution-router-and-the-mathdx-family)),
+(the `live` operand, [k-convolution family](kconv.md#live-rows)),
 so a padded window costs only its local Green GEMM rows. One program serves
 every pass, so compile time does not grow with the pass count: the static
 Σ program at 223 passes compiles in 0.8 s instead of 25.7 s; the streamed χ bank compiles one segment program on
@@ -384,8 +382,8 @@ missing, it fails at allocation.
 ### Native handlers
 
 The nvidia-mathdx k-convolution kernels allocate no device workspace beyond
-shared memory, except the split-arm intermediates of modes 8 and 11, which
-XLA's scratch allocator grants ([FFI layer](ffi_layout.md#k-convolution-router-and-the-mathdx-family)).
+shared memory, except the split-arm intermediates of modes 7, 8 and 11, which
+XLA's scratch allocator grants ([k-convolution family](kconv.md#tiles)).
 On CPU the host `gw_conv` handler keeps a reused host arena of
 `16·N_k·m_x·m_y` bytes and per-thread compact chunks, outside XLA.
 

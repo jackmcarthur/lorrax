@@ -39,7 +39,7 @@ out = project.finish(acc)
 
 `project` is safe to jit or trace into a larger kernel. The factory is a
 collective: the legacy and face factories call
-`common.collectives.warm_mesh_cliques` ([MPI collectives](mpi_collectives.md)).
+`common.collectives.warm_mesh_cliques` ([collective transports](../environment/transports.md)).
 Call it synchronously on every rank, outside any trace.
 
 ### Layouts: one projection, three mechanisms

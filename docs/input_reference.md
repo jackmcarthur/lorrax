@@ -6,7 +6,7 @@ read the same deck. `gw_config._DEFAULTS` is the accepted key set. Keys are
 case-insensitive. An unknown key refuses, in one error naming every such key and
 its line; a retired key refuses by name and states its replacement. Energies are
 in Ry unless the key name ends in `_ev`. Environment overrides are listed in
-[env_vars.md](dev/env_vars.md); longer discussions of the load-bearing keys are
+[env_vars.md](reference/env_vars.md); longer discussions of the load-bearing keys are
 in [drivers.md](drivers.md).
 
 An optional `K_POINTS {crystal_b}` block after the section gives the band path
@@ -61,7 +61,7 @@ The material class is inferred from the WFN occupations; no deck key selects it.
 |---|---|---|---|
 | `centroids_file` | str | `centroids_frac.txt` | Charge-channel centroid table written by `centroid.kmeans_cli`. |
 | `centroids_file_current` | str | `""` | Bispinor transverse-channel centroid table, selected from the Dirac-current feature norm. |
-| `zeta_rcond` | float | `1e-8` | Rank-truncation cutoff of the charge CCT, relative to λ_max. A cut that discards directions while the achieved κ_eff exceeds the certified 1e8 refuses ([rank-truncation policy](dev/rank_truncation_policy.md)). |
+| `zeta_rcond` | float | `1e-8` | Rank-truncation cutoff of the charge CCT, relative to λ_max. A cut that discards directions while the achieved κ_eff exceeds the certified 1e8 refuses ([rank-truncation policy](architecture/rank_truncation_policy.md)). |
 | `zeta_ridge` | float | `0.0` | Tikhonov ridge on the charge CCT, as a fraction of the mean diagonal; `0` means no ridge. Only the `cholesky` charge family reads it; the `rank_truncate` factor that both `linalg` layouts resolve does not. |
 | `zeta_cutoff` | float | unset (= ecutwfc) | G-sphere cutoff (Ry) of the per-q ζ_q(G) writes. It must be ≥ `bare_coulomb_cutoff`. |
 | `linalg` | str | `local` | Dense linear-algebra layout. `local`: each task factors ⌈N_q,irr/P⌉ whole N_μ×N_μ matrices (the startup report prints the complex128 GiB per task). `distributed`: 2-D block-distributed matrices through the `distrib_la` providers (cuSOLVERMp/cuBLASMp on CUDA, ScaLAPACK on CPU) for the W Dyson solve, the transverse ζ LU and the eigensolvers; the charge ζ solve stays whole-tile (route G). The value does not invalidate a restart. |

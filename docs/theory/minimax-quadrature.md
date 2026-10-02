@@ -48,7 +48,7 @@ the k grid that pairs k with k − q, done by FFT. Both factors decay for every
 measured broken, the ordered route weights A by −(α_l − iβ_l) e^{−τ_lE_g},
 with β the odd kernel's coefficients on the same times, and completes the
 other orientation as the complex conjugate of that result at −q
-([derivation](../dev/notes/DERIVATION_gnppm_nonhermitian.md)).
+([derivation](gn-ppm-nonhermitian.md)).
 
 ## 2. Cost
 

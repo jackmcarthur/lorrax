@@ -84,8 +84,8 @@ wedge, one run including compiles: Σ_x 1.4 s, χ at 16 MPA samples 35 s, Dyson 
 fit 9.6 s, Σ_c τ sweep (1048 τ nodes) 70 s, peak 6.58 GB per rank (claim 2864). No
 N_k·N_r² object is formed. The per-stage memory laws are
 `MixedBasisPairConvolution.describe()`, which the pipeline prints, and
-`SphereScreening.describe()`, which it writes to the JSON as `screen_law`. The kernels (mode 6 and
-`LocalFourierPlan`) are in [the FFI layer](ffi_layout.md#k-convolution-router-and-the-mathdx-family).
+`SphereScreening.describe()`, which it writes to the JSON as `screen_law`. The kernels are
+[mode 6](kconv.md#modes) and [`LocalFourierPlan`](ffi_layout.md#local-fourier-plan-localfourierplan).
 
 ## The one idea
 

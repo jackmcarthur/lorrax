@@ -129,7 +129,7 @@ extents in hand).
 
 **FFT entry points**: `common/fft_helpers.py`, the flat-k transform and the
 k-convolution router's factories re-exported from `ffi.fft`
-([FFI layer](ffi_layout.md#k-convolution-router-and-the-mathdx-family)), plus
+([k-convolution family](kconv.md#router)), plus
 the `shard_map`-interior `local_*fftn3` aliases.
 
 **jax glue and instrumentation**: `common/{jax_compile_cache, jax_profile,
