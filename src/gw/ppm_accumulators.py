@@ -47,10 +47,23 @@ def _omega_fold(acc, sigma, coeff, omega_axis):
 
 _WINDOW_COMPILED = {}
 
+# The overlapped window (lane LHS 2026-10-01, sandbox runs/DEV/730_lhs_20261001): two τ nodes
+# per loop trip, compiled with XLA's latency-hiding scheduler, so the second node's W(τ)
+# synthesis and its batch-to-face all_to_all run beside the first node's k-convolutions.
+# Ni 20^3 P64-local window, 8 nodes, P64: 0.549 -> 0.492 s per node, compiled temporaries
+# +2.5 GB per rank (the second node's W pair and its synthesis output before the exchange).
+# The scheduler with one node per trip gains nothing (+0.3 %): a node's work waits on its own W.
+# Pairing moves Σ(ω) at round-off (5.8e-16 relative); the scheduler on top of it is bitwise.
+# R82 (remat cloned a counter-indexed read past the counter's in-place increment, which only
+# remat does): every counter read in the window's loops sits behind an optimization barrier,
+# and rematerialization is off for this program, so the hazard cannot arise here.
+WINDOW_OVERLAP = {"xla_gpu_enable_latency_hiding_scheduler": True,
+                  "xla_disable_hlo_passes": "rematerialization"}
+
 
 @lru_cache(maxsize=16)
 def _device_window_runner(tau_kernel, sharding, omega_axis, antihermitian,
-                          reduce=None):
+                          reduce=None, overlap=False):
     """ONE executable for a whole quadrature window: loop the time nodes on device.
 
     ``coeff`` is ``(capacity, n_omega)`` over the COMPLETE output frequency
@@ -64,38 +77,66 @@ def _device_window_runner(tau_kernel, sharding, omega_axis, antihermitian,
     of arrays, before the fold; ``total`` has that structure, so only what is
     folded is stored at every frequency.  A diagonal's dagger is its
     conjugate.
+
+    ``overlap`` (:data:`WINDOW_OVERLAP`): the loop runs two nodes per trip,
+    folded in node order, and an odd last node after it; the program is
+    compiled with the latency-hiding scheduler.
     """
     def pinned(tree):
         return jax.tree.map(
             lambda a: jax.lax.with_sharding_constraint(a, sharding), tree)
 
     def run(total, tau_arguments, t_nodes, coeff, n_active, active_count):
-        def one(i, acc):
-            sigma = tau_kernel(*tau_arguments, t_nodes[i], active_count)
+        def fold(acc, sigma, c):
             if reduce is None:
-                return _omega_fold(acc, sigma, coeff[i], omega_axis)
+                return _omega_fold(acc, sigma, c, omega_axis)
             return jax.tree.map(
-                lambda a, part: _omega_fold(a, part, coeff[i], omega_axis),
+                lambda a, part: _omega_fold(a, part, c, omega_axis),
                 acc, reduce(sigma))
 
+        def one(i, acc):
+            # The node's time and coefficients are read from the counter once,
+            # behind a barrier: remat may otherwise clone a counter-indexed
+            # slice after the counter's in-place increment (the R82 hazard).
+            t, c = jax.lax.optimization_barrier((t_nodes[i], coeff[i]))
+            return fold(acc, tau_kernel(*tau_arguments, t, active_count), c)
+
+        def two(j, acc):
+            # Nodes 2j and 2j+1, read behind one barrier; neither node's Σ(τ)
+            # waits on the other's, so the scheduler runs one's W exchange
+            # beside the other's compute.  Folded in node order.
+            t0, t1, c0, c1 = jax.lax.optimization_barrier(
+                (t_nodes[2 * j], t_nodes[2 * j + 1], coeff[2 * j], coeff[2 * j + 1]))
+            s0 = tau_kernel(*tau_arguments, t0, active_count)
+            s1 = tau_kernel(*tau_arguments, t1, active_count)
+            return fold(fold(acc, s0, c0), s1, c1)
+
+        def nodes(acc):
+            if not overlap:
+                return jax.lax.fori_loop(0, n_active, one, acc)
+            acc = jax.lax.fori_loop(0, n_active // 2, two, acc)
+            return jax.lax.cond(n_active % 2 == 1, lambda a: one(n_active - 1, a),
+                                lambda a: a, acc)
+
         if not antihermitian:
-            out = jax.lax.fori_loop(0, n_active, one, total)
+            out = nodes(total)
             return out if reduce is None else pinned(out)
         if reduce is None:
             Z = jax.lax.with_sharding_constraint(jnp.zeros_like(total), sharding)
-            Z = jax.lax.fori_loop(0, n_active, one, Z)
+            Z = nodes(Z)
             return total + (Z - jnp.conj(jnp.swapaxes(Z, -1, -2))) / 2j
-        matrices, diagonals = jax.lax.fori_loop(
-            0, n_active, one, pinned(jax.tree.map(jnp.zeros_like, total)))
+        matrices, diagonals = nodes(pinned(jax.tree.map(jnp.zeros_like, total)))
         return pinned((
             tuple(a + (z - jnp.conj(jnp.swapaxes(z, -1, -2))) / 2j
                   for a, z in zip(total[0], matrices)),
             tuple(a + (z - jnp.conj(z)) / 2j
                   for a, z in zip(total[1], diagonals))))
 
+    options = WINDOW_OVERLAP if overlap else None
     if reduce is None:
-        return jax.jit(run, donate_argnums=(0,), out_shardings=sharding)
-    return jax.jit(run, donate_argnums=(0,))
+        return jax.jit(run, donate_argnums=(0,), out_shardings=sharding,
+                       compiler_options=options)
+    return jax.jit(run, donate_argnums=(0,), compiler_options=options)
 
 
 class DeviceOmegaAccumulator:
@@ -118,6 +159,7 @@ class DeviceOmegaAccumulator:
         self._sharding = sharding
         self._reduce = reduce
         self._replicated = NamedSharding(sharding.mesh, P())
+        self._gpu = sharding.mesh.devices.flat[0].platform in ("gpu", "cuda")
         self._omega = np.asarray(jax.device_get(omega_vec), np.complex128)
         self._omega_axis = int(omega_axis)
         shapes = ((shape,) if reduce is None else (*shape[0], *shape[1]))
@@ -141,7 +183,7 @@ class DeviceOmegaAccumulator:
                          n_active, active_count, capacity, omega_sign,
                          prefactor, e_ref_sum=0.0, antihermitian=False,
                          omega_indices=None, omega_values=None,
-                         compile_only=False):
+                         overlap=False, compile_only=False):
         """Evaluate ``tau_kernel`` at a window's first ``n_active`` nodes and fold them in.
 
         The window's coefficients (``omega_indices`` places ``omega_values``;
@@ -150,7 +192,8 @@ class DeviceOmegaAccumulator:
         device once; the node loop is one executable
         (:func:`_device_window_runner`).  ``compile_only`` lowers and compiles
         that executable without running it and returns the compiled
-        executable (for a caller that admits its peak).
+        executable (for a caller that admits its peak).  ``overlap``: the
+        overlapped window (:data:`WINDOW_OVERLAP`) on GPU, the plain one elsewhere.
         """
         t = np.asarray(jax.device_get(t), np.complex128)
         alpha = np.asarray(jax.device_get(alpha), np.complex128)
@@ -181,7 +224,7 @@ class DeviceOmegaAccumulator:
             for x in (t_pad, coeff, np.int32(n_active)))
         run = _device_window_runner(
             tau_kernel, self._sharding, self._omega_axis, bool(antihermitian),
-            self._reduce)
+            self._reduce, bool(overlap) and self._gpu)
         arguments = (self._total, tuple(tau_arguments), t_pad, coeff,
                      n_active, active_count)
         if compile_only:

@@ -3,6 +3,18 @@
 User-visible changes, newest first. Binding rulings behind the breaking
 changes live in `docs/architecture/decisions.md`.
 
+## 2026-10-01 — the shared-pole Σ τ window overlaps one node's W exchange with the next node's compute
+
+On GPU, the scalar shared-pole Σ τ window now evaluates two τ nodes per loop
+trip. Only that program is compiled with XLA's latency-hiding scheduler
+(`gw.ppm_accumulators.WINDOW_OVERLAP`); the global flag stays off. One node's
+W(τ) synthesis and all_to_all now run beside the other node's k-convolutions.
+At the Ni 20³ tile on P64, 0.549 → 0.492 s per τ node. The window's compiled
+temporaries grow by about two W(τ) tiles per rank (+2.5 GB at that tile); the
+Σ τ stage prices this. Results move at round-off: Fe 4³ and Na 8³ SC maps 1–2
+stay inside a 4e-16 control, and map 0 is bitwise. On a cold cache the window
+program compiles about twice as long.
+
 ## 2026-10-01 — QP seeds are projected on each k's little group; the four-current χ bank carries no −q rows
 
 An external SC seed (`sc_initial_qp_rotations_file`) is now averaged over each

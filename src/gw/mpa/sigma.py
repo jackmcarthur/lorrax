@@ -578,11 +578,13 @@ def _shared_pole_w_synthesis(io, meta, header, frequencies, schedule, *, mesh_xy
                 selected = jnp.clip(ranges - j*width, 0, width)
 
                 def add(acc):
-                    faces = tuple(jax.lax.dynamic_index_in_dim(f, j, 0, keepdims=False)
-                                  for f in factors)
-                    part = kernel(faces,
-                                  jax.lax.dynamic_index_in_dim(poles2, j, 0, keepdims=False),
-                                  selected, e_ref, t_node)
+                    # Chunk j is read from the counter once, behind a barrier
+                    # (the R82 remat hazard, as the window runner's node reads).
+                    faces, poles_j = jax.lax.optimization_barrier((
+                        tuple(jax.lax.dynamic_index_in_dim(f, j, 0, keepdims=False)
+                              for f in factors),
+                        jax.lax.dynamic_index_in_dim(poles2, j, 0, keepdims=False)))
+                    part = kernel(faces, poles_j, selected, e_ref, t_node)
                     return tuple(a.at[lo:hi].add(v) for a, v in zip(acc, part))
                 # A chunk with no active column in this window adds nothing.
                 return jax.lax.cond(jnp.any(selected[:, 1] > selected[:, 0]),
@@ -620,7 +622,8 @@ def _shared_pole_w_synthesis(io, meta, header, frequencies, schedule, *, mesh_xy
     if weights_fn is not _shared_pole_weights:
         key += (weights_fn.__name__,)
     synthesis = WSynthesis(w_kernel, window_operands, lambda: (panel_factors, panel_poles),
-                           close, native_workspace, key, ordered=ordered)
+                           close, native_workspace, key, ordered=ordered,
+                           tile_bytes=16 * nq * m * m // int(mesh_xy.size))
     synthesis.q_wedge = q_wedge
     return synthesis
 
@@ -1082,11 +1085,13 @@ class WSynthesis:
     stage already charged, ``native`` its GEMM's native workspace, ``close``
     releases them, ``key`` is the static configuration ``w_kernel`` closes
     over, and ``ordered`` says whether the valence branch reads -q (``hole``).
+    ``tile_bytes`` is one W(τ) parent tile's bytes per rank.
     """
 
     def __init__(self, w_kernel, window_operands, resident_operands, close, native, key,
-                 *, ordered):
+                 *, ordered, tile_bytes=0):
         self.key = key
+        self.tile_bytes = int(tile_bytes)
         self.w_kernel = w_kernel
         self.window_operands = window_operands
         self.resident_operands = resident_operands
@@ -1109,12 +1114,14 @@ class SynthesisTau:
     device buffer, so the accumulator's runner cache retains no factors.
     ``door`` (the Σ door's placed load tables, ``ppm_tau_kernel.sigma_door_tables``)
     rides the window arguments too and reaches ``spatial`` as its last
-    argument, so no window program holds table constants.
+    argument, so no window program holds table constants.  ``overlap``: the
+    window runs two nodes per loop trip (``gw.ppm_accumulators.WINDOW_OVERLAP``).
     """
 
     def __init__(self, spatial, synthesis, right_yr, right_proj, native, stage, meta, key, plans,
-                 door=None):
+                 door=None, overlap=False):
         self._spatial, self._synthesis = spatial, synthesis
+        self.overlap = bool(overlap)
         self._right = (right_yr, right_proj)
         self._native, self._stage, self._meta = native, stage, meta
         self._key, self._plans = key, plans
@@ -1172,8 +1179,13 @@ class SynthesisTau:
             got = int(peak.resident_increment) + int(self._native)
             shape = (f"{plan['passes']} row pass(es)" if "passes" in plan
                      else f"d={plan['d']}/{plan['ns']}")
+            # Overlapped: the second node's W pair and its synthesis output
+            # are live beside the first node's passes.
+            second = 3 * self._synthesis.tile_bytes if self.overlap else 0
+            if second:
+                shape += ", two nodes per trip"
             record_stage_price(f"Sigma tau, compiled window {shape}",
-                               counted + max(plan["new"], got), section="sigma.tau_sweep")
+                               counted + max(plan["new"] + second, got), section="sigma.tau_sweep")
 
 
 def _integrate_sigma_batches(
@@ -1283,10 +1295,12 @@ def _integrate_sigma_batches(
                            w_synthesis.q_wedge.wedge_key(),
                            tuple(sorted(face_kwargs.items(), key=lambda kv: kv[0])))
             # The Green door's tables, placed once per run and plan: a window argument.
+            # Two nodes per loop trip (gw.ppm_accumulators.WINDOW_OVERLAP): one
+            # node's W exchange runs beside the other's k-convolutions.
             tau_kernel = SynthesisTau(
                 scalar_spatial, w_synthesis, psi_coh_yr, psi_proj_yn, w_synthesis.native,
                 "sigma.synthesis.window", meta, spatial_key, (k_unfold_plan,),
-                door=sigma_door_tables(mesh_xy, k_unfold_plan))
+                door=sigma_door_tables(mesh_xy, k_unfold_plan), overlap=True)
         else:
             tau_kernel = get_shared_sigma_tau_kernel(
                 mesh_xy=mesh_xy, kgrid=kgrid, brackets=brackets,
@@ -1404,7 +1418,8 @@ def _integrate_sigma_batches(
                 omega_sign=win.omega_sign, prefactor=win.prefactor,
                 e_ref_sum=win.E_ref_A + win.E_ref_B,
                 antihermitian=(win.project_code == 1),
-                omega_indices=row.omega_idx, omega_values=row.omega_abs)
+                omega_indices=row.omega_idx, omega_values=row.omega_abs,
+                overlap=getattr(tau_kernel, "overlap", False))
             if not sweep_started:
                 fence('tau.initial_compile_and_probe', sync_ranks=True)
                 with timing.section('tau.initial_compile_and_probe'):

@@ -626,16 +626,15 @@ def build_shared_w_tau(B_poles, Omega_poles, pole_indices, bounds,
     counts evaluate every selector row.
     """
     def _add(index, W_t):
-        pole = jax.lax.dynamic_index_in_dim(
-            pole_indices, index, axis=0, keepdims=False)
+        # The counter-indexed rows are read once, behind a barrier: remat may
+        # otherwise clone one after the counter's in-place increment (R82).
+        pole, b, use_real = jax.lax.optimization_barrier(tuple(
+            jax.lax.dynamic_index_in_dim(a, index, axis=0, keepdims=False)
+            for a in (pole_indices, bounds, phase_real)))
         omega = jax.lax.dynamic_index_in_dim(
             Omega_poles, pole, axis=0, keepdims=False)
         residue = jax.lax.dynamic_index_in_dim(
             B_poles, pole, axis=0, keepdims=False)
-        b = jax.lax.dynamic_index_in_dim(
-            bounds, index, axis=0, keepdims=False)
-        use_real = jax.lax.dynamic_index_in_dim(
-            phase_real, index, axis=0, keepdims=False)
         a = jnp.real(omega)
         gamma = -jnp.imag(omega)
         selected = ((a > b[0]) & (a <= b[1])
