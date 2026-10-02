@@ -1156,6 +1156,22 @@ class SynthesisTau:
         return (xn, self._right[0], xr, self._right[1], energies, weight, w_operands,
                 e_ref_a, e_ref_b, self._door)
 
+    def fits(self, compiled):
+        """Whether ``compiled`` fits the budget beside the live stages.
+
+        :meth:`admit`'s ledger row, priced by ``CapacityLedger.preview`` and
+        not recorded: shapes and the ledger, so every rank decides alike.
+        """
+        from runtime.aot_memory import aot_kernel_peak_bytes
+        counted = sum(int(x.addressable_shards[0].data.nbytes)
+                      for x in jax.tree.leaves(self._synthesis.resident_operands()))
+        peak = aot_kernel_peak_bytes(compiled)
+        ledger = self._meta.shared_pole_capacity
+        row = ledger.preview(resident_bytes_per_rank=0,
+                             workspace_bytes_per_rank=max(0, peak.total - counted) + self._native,
+                             concurrent_with=ledger.live_stages)
+        return row["device_budget_status"] == "PASS"
+
     def admit(self, compiled, arguments):
         """Reserve the first window executable; the resident factors are the synthesis's stage."""
         if self._admitted:
@@ -1296,7 +1312,8 @@ def _integrate_sigma_batches(
                            tuple(sorted(face_kwargs.items(), key=lambda kv: kv[0])))
             # The Green door's tables, placed once per run and plan: a window argument.
             # Two nodes per loop trip (gw.ppm_accumulators.WINDOW_OVERLAP): one
-            # node's W exchange runs beside the other's k-convolutions.
+            # node's W exchange runs beside the other's k-convolutions, when
+            # the paired window fits (SynthesisTau.fits, at the first compile).
             tau_kernel = SynthesisTau(
                 scalar_spatial, w_synthesis, psi_coh_yr, psi_proj_yn, w_synthesis.native,
                 "sigma.synthesis.window", meta, spatial_key, (k_unfold_plan,),
@@ -1427,6 +1444,15 @@ def _integrate_sigma_batches(
                         row_kernel, tau_arguments, win.nodes.t,
                         win.nodes.alpha, n_active=len(win.nodes.t),
                         compile_only=True, **window_options)
+                    if window_options["overlap"] and not tau_kernel.fits(compiled):
+                        # Two nodes in flight do not fit beside the live
+                        # stages: one node per trip, the default schedule (the
+                        # stage table's window price then names no pairing).
+                        tau_kernel.overlap = window_options["overlap"] = False
+                        compiled = accumulator.integrate_window(
+                            row_kernel, tau_arguments, win.nodes.t,
+                            win.nodes.alpha, n_active=len(win.nodes.t),
+                            compile_only=True, **window_options)
                     if synthesis:
                         tau_kernel.admit(compiled, tau_arguments)
                     print_fn(

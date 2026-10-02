@@ -50,10 +50,15 @@ _WINDOW_COMPILED = {}
 # The overlapped window (lane LHS 2026-10-01, sandbox runs/DEV/730_lhs_20261001): two τ nodes
 # per loop trip, compiled with XLA's latency-hiding scheduler, so the second node's W(τ)
 # synthesis and its batch-to-face all_to_all run beside the first node's k-convolutions.
-# Ni 20^3 P64-local window, 8 nodes, P64: 0.549 -> 0.492 s per node, compiled temporaries
-# +2.5 GB per rank (the second node's W pair and its synthesis output before the exchange).
+# Ni 20^3 SC map 0 at P64 (band extrapolation on, 657 nodes): window executables 351.7 ->
+# 322.3 s (-8.4 %); the compiled window holds a second node's live set, 9.76 -> 16.95 GB per
+# rank (stage peak 21.3 -> 28.5 GB); the first window's cold compile 13 -> 34 s.  Without band
+# brackets (harness, 8 nodes): 0.549 -> 0.492 s per node, +2.5 GB per rank.
 # The scheduler with one node per trip gains nothing (+0.3 %): a node's work waits on its own W.
 # Pairing moves Σ(ω) at round-off (5.8e-16 relative); the scheduler on top of it is bitwise.
+# Memory first: the caller pairs only when the compiled paired window fits the device budget
+# beside the live stages (gw.mpa.sigma.SynthesisTau.fits); otherwise one node per trip and the
+# default schedule, the program before this change.
 # R82 (remat cloned a counter-indexed read past the counter's in-place increment, which only
 # remat does): every counter read in the window's loops sits behind an optimization barrier,
 # and rematerialization is off for this program, so the hazard cannot arise here.
