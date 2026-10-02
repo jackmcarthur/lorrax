@@ -80,13 +80,6 @@ def _digest(flat):
                    dtype=jnp.uint64)
 
 
-def _host_kind(mesh):
-    """Pinned host memory for an accelerator's pieces; a CPU device's own memory is host memory."""
-    device = mesh.devices.flat[0]
-    kinds = {m.kind for m in device.addressable_memories()}
-    return "pinned_host" if device.platform != "cpu" and "pinned_host" in kinds else None
-
-
 @lru_cache(maxsize=None)
 def _record_digests(mesh, shape):
     """Carry ``[n_out, q, rows, cols]`` at ``P(None, None, 'x', 'y')`` → one digest per
@@ -99,26 +92,26 @@ def _record_digests(mesh, shape):
 @lru_cache(maxsize=None)
 def _piece(mesh, shape, length16, padded16):
     """``(carry, o, a)`` → each rank's local record ``o`` elements ``[a, a + length16)``,
-    zero-padded to ``padded16``, as ``(px, py, padded16)`` in host memory."""
+    zero-padded to ``padded16``, as ``(px, py, padded16)`` on the devices."""
     def local(carry, o, a):
         piece = jax.lax.dynamic_slice(carry.reshape(carry.shape[0], -1), (o, a), (1, length16))[0]
         return jnp.pad(piece, (0, padded16 - length16))[None, None]
     body = jax.shard_map(local, mesh=mesh, in_specs=(P(None, None, "x", "y"), P(), P()),
                          out_specs=P("x", "y", None), check_vma=False)
-    return jax.jit(body, out_shardings=NamedSharding(mesh, P("x", "y", None), memory_kind=_host_kind(mesh)))
+    return jax.jit(body, out_shardings=NamedSharding(mesh, P("x", "y", None)))
 
 
 @lru_cache(maxsize=None)
 def _record_run(mesh, shape, rows, padded16):
     """``(carry, r)`` → carry rows ``[r, r + rows)``, each zero-padded to ``padded16``, as one
-    contiguous ``(px, py, rows·padded16)`` run in host memory (consecutive small records)."""
+    contiguous ``(px, py, rows·padded16)`` run on the devices (consecutive small records)."""
     def local(carry, r):
         flat = carry.reshape(carry.shape[0], -1)
         run = jax.lax.dynamic_slice_in_dim(flat, r, rows, axis=0)
         return jnp.pad(run, ((0, 0), (0, padded16 - run.shape[1]))).reshape(-1)[None, None]
     body = jax.shard_map(local, mesh=mesh, in_specs=(P(None, None, "x", "y"), P()),
                          out_specs=P("x", "y", None), check_vma=False)
-    return jax.jit(body, out_shardings=NamedSharding(mesh, P("x", "y", None), memory_kind=_host_kind(mesh)))
+    return jax.jit(body, out_shardings=NamedSharding(mesh, P("x", "y", None)))
 
 
 _COMPILED: dict = {}
@@ -457,12 +450,16 @@ class StreamedBank:
         def land(host, o, a):
             for shard in host.addressable_shards:
                 store = self.stores[shard.device]
+                # One synchronous device-to-host copy (PjRt returns only once the piece is
+                # on the host), never a view of an XLA host-offload output: at P64 such a
+                # view was written before its copy landed (bispinor χ digest mismatches).
                 source = np.asarray(shard.data).reshape(-1).view(np.uint8)
-                if store.direct and source.ctypes.data % self.align:
-                    aligned = _aligned(len(source))       # a sub-allocated host buffer
-                    np.copyto(np.frombuffer(aligned, np.uint8, count=len(source)), source)
-                    source = np.frombuffer(aligned, np.uint8, count=len(source))
-                    self.bounced += 1
+                if store.direct:
+                    staging = getattr(_SCRATCH, "write", None)
+                    if staging is None or len(staging) < len(source):
+                        staging = _SCRATCH.write = _aligned(len(source))
+                    np.copyto(np.frombuffer(staging, np.uint8, count=len(source)), source)
+                    source = np.frombuffer(staging, np.uint8, count=len(source))
                 store.write(memoryview(source), o * self.S + self.starts[p] + 16 * a)
                 # Written bytes are in the quota's used count now: they leave the promise
                 # (else a later store's probe counts them twice, Ni 20³ P64 map 1).
