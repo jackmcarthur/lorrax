@@ -257,6 +257,9 @@ bool build(const Program& p, const std::string& cache_dir, const std::string& ca
     out->ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
     if (cr != CUDA_SUCCESS) { *where = "cuModuleLoadData"; *err = cu_err(cr); return false; }
     cr = api.ModuleGetFunction(&out->fn, module, p.kernel);
+    out->fns.assign(p.entries.size(), nullptr);
+    for (size_t i = 0; i < p.entries.size() && cr == CUDA_SUCCESS; ++i)
+        cr = api.ModuleGetFunction(&out->fns[i], module, p.entries[i]);
     if (cr != CUDA_SUCCESS) { *where = "cuModuleGetFunction"; *err = cu_err(cr); return false; }
     out->from_disk = from_disk;
     out->stored = stored;

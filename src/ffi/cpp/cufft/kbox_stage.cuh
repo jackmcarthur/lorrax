@@ -116,6 +116,17 @@ struct Geo {
     __device__ static constexpr int plane_at(int p) { return (p / NZ) * ZP + p % NZ; }  // p = ky*NZ + kz
 };
 
+// The lanes that meet by shuffles (a ROCm wavefront is 64), and one lane's read of lane `src`'s value
+// within its warp (the port swaps the intrinsic here).
+constexpr int kWarp = 32;
+template <class C>
+__device__ __forceinline__ C lane_read(C v, int src) {
+    C r;
+    r.x = __shfl_sync(0xffffffffu, v.x, src);
+    r.y = __shfl_sync(0xffffffffu, v.y, src);
+    return r;
+}
+
 // cp.async of one element (8 or 16 bytes), global -> shared; commit; wait for all.
 template <int BYTES>
 __device__ __forceinline__ void cp_async(void* smem, const void* gmem) {
@@ -323,11 +334,23 @@ struct Plain {
     __device__ const C* stage(int k, long long col) const { return p + (long long)k * ncols + col; }
     __device__ void put(int k, long long col, C v) const { p[(long long)k * ncols + col] = v; }
 };
+// k-minor access: element (k, col) at col * nk + k, one contiguous run per column (what a
+// column-resident pass stages).
+template <class C>
+struct PlainK {
+    static constexpr bool kDirect = false, kFinish = false;
+    C* p;
+    long long nk;
+    __device__ const C* stage(int k, long long col) const { return p + col * nk + k; }
+    __device__ void put(int k, long long col, C v) const { p[col * nk + k] = v; }
+};
 
 // Plane pass: for each (kx, tile of TP columns) the (ky, kz) plane of every column in padded
 // shared memory (smem: TP * PR elements), the y/z transforms, then st.put.  Load/Store as above;
-// in place is allowed (a block writes only what it staged).
-template <int NX, int NY, int NZ, int Arch, cufftdx::fft_direction Dir, int TP, class C, class Load, class Store>
+// in place is allowed (a block writes only what it staged).  KMINOR: the store runs k fastest
+// (a k-minor Store such as PlainK writes one run per column).
+template <int NX, int NY, int NZ, int Arch, cufftdx::fft_direction Dir, int TP, bool KMINOR = false, class C,
+          class Load, class Store>
 __device__ void plane_pass(C* sm, long long ncols, const Load& ld, const Store& st) {
     using G = Geo<NX, NY, NZ>;
     const long long nct = (ncols + TP - 1) / TP;
@@ -369,9 +392,31 @@ __device__ void plane_pass(C* sm, long long ncols, const Load& ld, const Store& 
         }
         __syncthreads();
         for (int i = threadIdx.x; i < NY * NZ * TP; i += blockDim.x) {
-            const int t = i % TP, p = i / TP;
+            const int t = KMINOR ? i / (NY * NZ) : i % TP, p = KMINOR ? i % (NY * NZ) : i / TP;
             if (c0 + t < ncols) st.put(kx * NY * NZ + p, c0 + t, sm[t * G::PR + G::plane_at(p)]);
         }
+    }
+}
+
+// Column-resident pass, the rest of a convolution after an inverse plane pass when one column's
+// padded box fits a block (bank: RS elements): per column, stage it from the k-minor y, the x
+// lines inverse, then bank = mid(k, col, bank), the forward z, y, x transforms, st.put.  The
+// split's pencil, plane and pencil passes on the same lines in the same axis order: bitwise; the
+// column stays in shared memory, so y is read once instead of three reads and writes.
+template <int NX, int NY, int NZ, int Arch, class C, class Mid, class Store>
+__device__ void column_pass(C* bank, C* y, long long ncols, const Mid& mid, const Store& st) {
+    using G = Geo<NX, NY, NZ>;
+    for (long long col = blockIdx.x; col < ncols; col += gridDim.x) {
+        stage_tile<NX, NY, NZ, 1>(bank, col, ncols, PlainK<C>{y, G::NK});
+        for (int l = threadIdx.x; l < NY * NZ; l += blockDim.x) {
+            C* p = bank + G::plane_at(l);
+            if constexpr (NX > 1) line_fft<NX, Arch, cufftdx::fft_direction::inverse>(p, NY * G::ZP);
+#pragma unroll
+            for (int kx = 0; kx < NX; ++kx) p[kx * NY * G::ZP] = mid(kx * NY * NZ + l, col, p[kx * NY * G::ZP]);
+        }
+        __syncthreads();
+        transform3<NX, NY, NZ, 1, Arch, cufftdx::fft_direction::forward>(bank);
+        store_tile<NX, NY, NZ, 1>(bank, col, ncols, st);
     }
 }
 
@@ -409,7 +454,7 @@ __device__ void pencil_pass(C* y, long long ncols, const Mid& mid) {
 }
 
 // Group pencil pass (a Mid that mixes GROUP columns, e.g. the Lorentz vertex sum over a spin group,
-// or a pair's trace): the group's GROUP columns are consecutive lanes of one warp (GROUP | 32), so
+// or a pair's trace): the group's GROUP columns are consecutive lanes of one warp (GROUP | kWarp), so
 // they meet by warp shuffles and nothing is staged.  Block work item: one (ky, kz) plane point p and
 // the block's NT / GROUP consecutive instances; lane (instance, member) reads its column's x-line
 // (consecutive lanes on consecutive columns of y), inverse-transforms it in registers, and per kx
@@ -419,10 +464,10 @@ __device__ void pencil_pass(C* y, long long ncols, const Mid& mid) {
 // held one block of 2-8 warps per SM on 16^3-20^3 grids (sandbox claims 3077, 3080).
 template <int NX, int NY, int NZ, int Arch, int GROUP, int NT, class C, class Mid>
 __device__ void pencil_group_warp_pass(const C* y, long long ncols, long long n_inst, const Mid& mid) {
-    static_assert(32 % GROUP == 0 && NT % 32 == 0, "a group's columns share one warp");
+    static_assert(kWarp % GROUP == 0 && NT % kWarp == 0, "a group's columns share one warp");
     constexpr int CPB = NT / GROUP;
     constexpr long long PL = (long long)NY * NZ;
-    const int member = (int)(threadIdx.x % GROUP), base = (int)(threadIdx.x & 31) - member;
+    const int member = (int)(threadIdx.x % GROUP), base = (int)(threadIdx.x % kWarp) - member;
     const long long nit = (n_inst + CPB - 1) / CPB;
     for (long long w = blockIdx.x; w < PL * nit; w += gridDim.x) {
         const long long p = w / nit, inst = (w % nit) * CPB + threadIdx.x / GROUP;
@@ -438,12 +483,7 @@ __device__ void pencil_group_warp_pass(const C* y, long long ncols, long long n_
 #pragma unroll
         for (int kx = 0; kx < NX; ++kx) {
             const C own = v[kx];
-            const auto get = [&](int q) {
-                C r;
-                r.x = __shfl_sync(0xffffffffu, own.x, base + q);
-                r.y = __shfl_sync(0xffffffffu, own.y, base + q);
-                return r;
-            };
+            const auto get = [&](int q) { return lane_read(own, base + q); };
             v[kx] = mid.value(int(kx * PL + p), live ? inst : 0, member, get);   // this kx's shuffles are done
         }
         mid.finish(p, inst, member, live, v);

@@ -943,7 +943,7 @@ __device__ __forceinline__ void tt_gather(const lrx_c2* g0, const lrx_c2* g0t, c
 // left = U g (pass 1), then, after a warp barrier, lane a forms row a of left U^dagger (pass 2),
 // so the column-to-row exchange never leaves the warp.  Every lane of a warp runs the same number
 // of rounds (the warp barrier needs the whole warp); k is fastest across the groups of a warp.
-static_assert(32 % NS == 0, "a warp holds whole spin groups");
+static_assert(lrx_kbox::kWarp % NS == 0, "a warp holds whole spin groups");
 __device__ __forceinline__ void tt_finish(const TileTabs& s, int b, int npr, lrx_c2* bank) {
     const lrx_c2* u = s.u();
     const lrx_c2* mp = s.mp(b);
@@ -1069,36 +1069,71 @@ struct M7Mid {                                 // the kernel V[k, x, y] of a pai
 #ifndef LRX_MINB
 #define LRX_MINB 1
 #endif
-// yb, pb0, npairs, phase: the split arm (LRX_ARM 1, a k-box that holds fewer than two spin groups a
-// block), as modes 2/3 through the (nk, npairs * SSO) chunk yb: phase 0 the plane (z, y) pass from
-// the load, 1 the x pencil and the Mid, 2 the plane (z, y) forward, 3 the x pencil forward and the
-// store.  The same lines in the same axis order as the single arm: bitwise.
+// yb, pb0, npairs: the split arms (a k-box that cannot hold a spin group of two or more columns a
+// block) through the chunk yb of npairs * SSO columns, one entry point per pass so each runs at its
+// own register budget (one kernel holds every pass at the largest pass's registers).  lrx_kconv:
+// the plane (z, y) pass from the load.  LRX_ARM 1, as modes 2/3 (yb k-leading): lrx_kconv_mid the
+// x pencil and the Mid, lrx_kconv_pass the plane (z, y) forward (phase 2) and the x pencil forward
+// and the store (phase 3).  LRX_ARM 2, one column's box fits a block (yb k-minor): lrx_kconv_col
+// the rest on the resident column (kbox_stage.cuh column_pass).  The same lines in the same axis
+// order as the single arm: bitwise.
+#define M7_ARGS const lrx_c2* __restrict__ gp, const lrx_c2* __restrict__ gt, \
+    const lrx_c2* __restrict__ kern, lrx_c2* __restrict__ y, UnfoldTab t, double scale, \
+    lrx_c2* yb, long long pb0, long long npairs, int phase
+#if LRX_ARM >= 1
+extern "C" __global__ void __launch_bounds__(LRX_THREADS) lrx_kconv(M7_ARGS) {
+    extern __shared__ lrx_c2 sm[];
+    (void)kern; (void)y; (void)scale; (void)phase;
+    const XBlock xb = lrx_x_block(t);
+    const long long my = t.nl / NR, nc = npairs * SSO;
+    const M7Load ld{gp, gt, &t, my, xb.rows * my, pb0};
+#if LRX_ARM == 2
+    lrx_kbox::plane_pass<NX, NY, NZ, LRX_SM, cufftdx::fft_direction::inverse, TRC, true>(
+        sm, nc, ld, lrx_kbox::PlainK<lrx_c2>{yb, (long long)KG::NK});
+#else
+    lrx_kbox::plane_pass<NX, NY, NZ, LRX_SM, cufftdx::fft_direction::inverse, TRC>(sm, nc, ld, lrx_kbox::Plain<lrx_c2>{yb, nc});
+#endif
+}
+#if LRX_ARM == 2
+extern "C" __global__ void __launch_bounds__(LRX_THREADS2) lrx_kconv_col(M7_ARGS) {
+    extern __shared__ lrx_c2 sm[];
+    (void)gp; (void)gt; (void)phase;
+    const XBlock xb = lrx_x_block(t);
+    const long long my = t.nl / NR;
+    lrx_kbox::column_pass<NX, NY, NZ, LRX_SM>(sm, yb, npairs * SSO, M7Mid{kern, xb, my, pb0},
+                                              M7Store{y, &t, xb.rows, my, scale, pb0 * SSO});
+}
+#else
 struct M7Id {
     __device__ lrx_c2 operator()(int, long long, lrx_c2 v) const { return v; }
 };
-extern "C" __global__ void __launch_bounds__(LRX_THREADS, LRX_MINB) lrx_kconv(
-    const lrx_c2* __restrict__ gp, const lrx_c2* __restrict__ gt,
-    const lrx_c2* __restrict__ kern, lrx_c2* __restrict__ y, UnfoldTab t, double scale,
-    lrx_c2* yb, long long pb0, long long npairs, int phase) {
+extern "C" __global__ void __launch_bounds__(LRX_THREADS2) lrx_kconv_mid(M7_ARGS) {
+    (void)gp; (void)gt; (void)y; (void)scale; (void)phase;
+    const XBlock xb = lrx_x_block(t);
+    lrx_kbox::pencil_pass<NX, NY, NZ, LRX_SM, false, cufftdx::fft_direction::inverse>(
+        yb, npairs * SSO, M7Mid{kern, xb, t.nl / NR, pb0});
+}
+extern "C" __global__ void __launch_bounds__(LRX_THREADS3) lrx_kconv_pass(M7_ARGS) {
     extern __shared__ lrx_c2 sm[];
     using namespace cufftdx;
+    (void)gp; (void)gt; (void)kern;
     const XBlock xb = lrx_x_block(t);
-    const long long my = t.nl / NR, pairs = xb.rows * my, ncols = pairs * SSO;
-#if LRX_ARM == 1
-    const long long nc = npairs * SSO;
+    const long long my = t.nl / NR, nc = npairs * SSO;
     const lrx_kbox::Plain<lrx_c2> yy{yb, nc};
-    if (phase == 0)
-        lrx_kbox::plane_pass<NX, NY, NZ, LRX_SM, fft_direction::inverse, TRC>(sm, nc, M7Load{gp, gt, &t, my, pairs, pb0}, yy);
-    else if (phase == 1)
-        lrx_kbox::pencil_pass<NX, NY, NZ, LRX_SM, false, fft_direction::inverse>(yb, nc, M7Mid{kern, xb, my, pb0});
-    else if (phase == 2)
+    if (phase == 2)
         lrx_kbox::plane_pass<NX, NY, NZ, LRX_SM, fft_direction::forward, TRC>(sm, nc, yy, yy);
     else
         lrx_kbox::pencil_pass<NX, NY, NZ, LRX_SM, false, fft_direction::forward>(
             yb, nc, M7Id{}, M7Store{y, &t, xb.rows, my, scale, pb0 * SSO});
-    (void)ncols;
+}
+#endif
 #else
+extern "C" __global__ void __launch_bounds__(LRX_THREADS, LRX_MINB) lrx_kconv(M7_ARGS) {
+    extern __shared__ lrx_c2 sm[];
+    using namespace cufftdx;
     (void)yb; (void)pb0; (void)npairs; (void)phase;
+    const XBlock xb = lrx_x_block(t);
+    const long long my = t.nl / NR, pairs = xb.rows * my, ncols = pairs * SSO;
     const M7Store st{y, &t, xb.rows, my, scale, 0};
 #if LRX_TT
     const TileTabs s{reinterpret_cast<char*>(sm + TRC * KG::RS)};
@@ -1140,8 +1175,8 @@ extern "C" __global__ void __launch_bounds__(LRX_THREADS, LRX_MINB) lrx_kconv(
         lrx_kbox::store_tile<NX, NY, NZ, TRC>(sm, col0, ncols, st);
     }
 #endif
-#endif
 }
+#endif
 #elif LRX_MODE == 8
 // Mode 8 runs on the k-box stage (kbox_stage.cuh) in two arms, chosen at build by kbox_plan from the
 // grid and the opt-in shared memory (a tile of whole spin groups, ns^2 columns each):
@@ -1981,18 +2016,16 @@ struct Built { CUfunction fn = nullptr; int rb = 1; int smem = 0; double compile
                int arm = 0, tr = 0, ty = 0, threads2 = 0, smem2 = 0, sms = 0;
                // Mode 8 with the interaction read from its parents (variant wa*8 + wb), split arm: the
                // W_R chunk pass (phase 4), tiles of trw columns at threads3 / smem3.
-               int trw = 0, threads3 = 0, smem3 = 0; };
+               int trw = 0, threads3 = 0, smem3 = 0;
+               // Mode 7, split arm: the mid (fn2 at threads2) and pass (fn3 at threads3 / smem3) entries.
+               CUfunction fn2 = nullptr, fn3 = nullptr; };
 // A split arm's plane tile of whole groups of ss columns.  Mode 8: enough groups for a unit of the
-// gathered load per thread (256 per plane) within two blocks per SM.  Modes 7 and 9 store the plane
-// to a k-leading intermediate (or their output): 16 columns as modes 2/3, 256-byte runs per k,
-// halved while the tile exceeds the opt-in memory (one column per plane at 20^3 wrote 16-byte runs
-// and ran mode 9 no faster than its single arm, KCOLRES).
+// gathered load per thread (256 per plane) within two blocks per SM.  Modes 7 and 9 (wide): the
+// most whole groups the opt-in memory holds, one block per SM; the tile's pairs share their per-k
+// unfold tables (20^3 ns 2: 24 columns, the mode-7 gather 3.88 -> 3.65 ms against 16; one column per
+// plane wrote 16-byte runs and ran mode 9 no faster than its single arm, KCOLRES).
 static int split_plane_tile(int nky, int nkz, long long pr, int ss, long long smem_optin, bool wide = false) {
-    if (wide) {
-        int t = std::max(ss, 16);
-        while (t > ss && static_cast<long long>(t) * pr * 16 > smem_optin) t /= 2;
-        return t;
-    }
+    if (wide) return static_cast<int>(std::max<long long>(1, smem_optin / (pr * 16) / ss)) * ss;
     int grp = 1;
     while (static_cast<long long>(nky) * nkz * grp < kThreads && 2LL * ss * (2 * grp) * pr * 16 <= smem_optin)
         grp *= 2;
@@ -2260,14 +2293,16 @@ static ffi::Error build(int mode, int nkx, int nky, int nkz, int ns, bool f32,
     // admits, at most two (Fe 8^3: 2 x 512 threads at <= 64 registers; unbounded, NVCC took 95 and
     // held one block per SM).
     const int blk = (mode == 7 && variant > 0) ? variant : ns;    // mode 7's output spin block
-    int m7_tp = 0, m7_blocks = 0, m7_tr = 0, m7_threads = 0, m7_arm = 0;
-    long long m7_smem = 0;
+    int m7_tp = 0, m7_blocks = 0, m7_tr = 0, m7_threads = 0, m7_arm = 0, m7_mid = 0, m7_pass = 0;
+    long long m7_smem = 0, m7_col_smem = 0;
     if (mode == 7) {
         // Whole spin groups per tile: the single arm when a block holds a group of two or more
-        // columns, else the split arm (as modes 2/3) on plane tiles of whole groups.  One column per
-        // block (the single arm's floor before) re-gathered a pair's group for each column: 20^3
-        // ns 2, 1.3 TB of L2 per P64-tile call at 25% warps; split, 555 -> 237 ms (KCOLRES).  One
-        // group of 4 columns per block (12^3 ns 2) stays single: the split ran it 0.84x.
+        // columns, else a split arm on plane tiles of whole groups: arm 2 when one column's padded
+        // box fits a block (the gather plane pass, then the column pass), else arm 1 (four passes,
+        // as modes 2/3).  One column per block (the single arm's floor before) re-gathered a pair's
+        // group for each column: 20^3 ns 2, 1.3 TB of L2 per P64-tile call at 25% warps; arm 1,
+        // 555 -> 237 ms; arm 2 with separate entries, 237 -> 180 ms (KCOLRES).  One group of 4
+        // columns per block (12^3 ns 2) stays single: the split ran it 0.84x.
         const lrx_kbox::Geometry g{nkx, nky, nkz};
         const int sso = blk * blk;
         const lrx_kbox::Plan kp = lrx_kbox::kbox_plan(nkx, nky, nkz, sso, 1, 16, smem_optin, 2, 1);
@@ -2276,9 +2311,19 @@ static ffi::Error build(int mode, int nkx, int nky, int nkz, int ns, bool f32,
             m7_tr = split_plane_tile(nky, nkz, g.pr(), sso, smem_optin, true);
             const std::string why = split_tile_refusal(7, nkx, nky, nkz, ns, g.pr(), m7_tr, smem_optin);
             if (!why.empty()) return sticky("residency", why, ffi::ErrorCode::kInvalidArgument);
-            m7_threads = kThreads;
+            // Entry threads: 512 for the plane passes and the column pass (<= 128 registers, no
+            // spill); the x pencil with the Mid holds 212 registers and the ns-4 gather (g, U, U_r:
+            // 48 complex) 184-226, so 256.
+            m7_threads = ns <= 2 ? 2 * kThreads : kThreads;
+            m7_mid = kThreads;
+            m7_pass = 2 * kThreads;
             m7_smem = static_cast<long long>(m7_tr) * g.pr() * 16;
             m7_blocks = 1;
+            if (g.rs() * 16 <= smem_optin) {           // one column's box fits a block: arm 2
+                m7_arm = 2;
+                m7_mid = 2 * kThreads;
+                m7_col_smem = g.rs() * 16;
+            }
         } else {
             m7_tr = kp.tr * sso;                       // the plan counts whole spin groups
             m7_threads = tile_tables_pay(ns) ? kThreads : kp.threads;
@@ -2396,6 +2441,8 @@ static ffi::Error build(int mode, int nkx, int nky, int nkz, int ns, bool f32,
         defs.push_back("-DLRX_MINB=" + std::to_string(std::max(1, m7_blocks)));
         defs.push_back("-DLRX_TR=" + std::to_string(m7_tr));
         defs.push_back("-DLRX_THREADS=" + std::to_string(m7_threads));
+        if (m7_arm) defs.push_back("-DLRX_THREADS2=" + std::to_string(m7_mid));
+        if (m7_arm == 1) defs.push_back("-DLRX_THREADS3=" + std::to_string(m7_pass));
     }
     if (kbox_rows || mode == 8) {
         defs.push_back("-DLRX_ARM=" + std::to_string(kb_arm));
@@ -2438,6 +2485,8 @@ static ffi::Error build(int mode, int nkx, int nky, int nkz, int ns, bool f32,
     prog.defs = defs;
     nvrtc::mathdx_toolchain(root, cuda_inc, "cufftdx", &prog);
     prog.kernel = "lrx_kconv";
+    if (mode == 7 && m7_arm == 1) prog.entries = {"lrx_kconv_mid", "lrx_kconv_pass"};
+    if (mode == 7 && m7_arm == 2) prog.entries = {"lrx_kconv_col"};
     std::string missing;
     const std::string key_hex = nvrtc::hex16(nvrtc::key(prog, &missing));
     const std::string dir(missing.empty() ? std::string(cubin_dir) : std::string());
@@ -2501,6 +2550,16 @@ static ffi::Error build(int mode, int nkx, int nky, int nkz, int ns, bool f32,
         b.smem = static_cast<int>(m7_smem);
         b.arm = m7_arm;
         b.sms = sms;
+        if (m7_arm) {                                  // the split arms' later entries
+            b.fn2 = img.fns[0];
+            b.threads2 = m7_mid;
+        }
+        if (m7_arm == 1) {
+            b.fn3 = img.fns[1];
+            b.threads3 = m7_pass;
+            b.smem3 = b.smem;
+        }
+        if (m7_arm == 2) b.smem2 = static_cast<int>(m7_col_smem);
         if (m7_tp) b.grid_cap = static_cast<long long>(sms) * m7_blocks;
     }
     if (mode == 10) {                                  // persistent blocks: the resident count
@@ -2514,6 +2573,10 @@ static ffi::Error build(int mode, int nkx, int nky, int nkz, int ns, bool f32,
     if (b.smem > 49152 || b.smem2 > 49152 || b.smem3 > 49152 || mode == 10) {
         cr = api.FuncSetAttribute(b.fn, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
                                   std::max(b.smem, std::max(b.smem2, b.smem3)));
+        if (cr == CUDA_SUCCESS && b.fn3)
+            cr = api.FuncSetAttribute(b.fn3, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, b.smem3);
+        if (cr == CUDA_SUCCESS && mode == 7 && b.fn2 && b.smem2 > 0)
+            cr = api.FuncSetAttribute(b.fn2, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, b.smem2);
         if (cr != CUDA_SUCCESS && mode == 10) {
             std::ostringstream os;
             os << "GATE mathdx-plane-residency: got plane (" << nkx << "," << nky << "), " << b.smem
@@ -2531,6 +2594,8 @@ static ffi::Error build(int mode, int nkx, int nky, int nkz, int ns, bool f32,
     if ((mode == 11 && chi_minb > 1) || mode == 7) {
         cr = api.FuncSetAttribute(b.fn, CU_FUNC_ATTRIBUTE_PREFERRED_SHARED_MEMORY_CARVEOUT,
                                   mode == 11 && kplan.arm == 1 ? chi_carve : 100);
+        for (CUfunction f : {b.smem2 > 0 ? b.fn2 : nullptr, b.fn3})   // mode 7's shared-memory entries
+            if (cr == CUDA_SUCCESS && f && mode == 7) cr = api.FuncSetAttribute(f, CU_FUNC_ATTRIBUTE_PREFERRED_SHARED_MEMORY_CARVEOUT, 100);
         if (cr != CUDA_SUCCESS) return sticky("cuFuncSetAttribute(carveout)", cu_err(cr));
     }
     if (mklpin::announce_here() || log_enabled()) {
@@ -2859,9 +2924,9 @@ static ffi::Error KleadUnfoldImpl(
     void* args[] = {(void*)&gpp, (void*)&gtp, (void*)&vp, (void*)&up, (void*)&t, (void*)&sc,
                     (void*)&yb, (void*)&p0, (void*)&npairs, (void*)&phase};
     const long long ncols = pairs * d * d;
-    auto launch = [&](long long blocks, int threads, int smem) -> ffi::Error {
+    auto launch = [&](long long blocks, int threads, int smem, CUfunction fn) -> ffi::Error {
         if (blocks > 2147483647LL) return bad("grid.x overflow");
-        CUresult cr = driver_api().LaunchKernel(k->fn, static_cast<unsigned>(blocks), 1, 1, threads, 1, 1,
+        CUresult cr = driver_api().LaunchKernel(fn, static_cast<unsigned>(blocks), 1, 1, threads, 1, 1,
                                                 static_cast<unsigned>(smem), reinterpret_cast<CUstream>(stream),
                                                 args, nullptr);
         return cr == CUDA_SUCCESS ? ffi::Error::Success() : fail("cuLaunchKernel", cu_err(cr));
@@ -2869,7 +2934,7 @@ static ffi::Error KleadUnfoldImpl(
     if (k->arm == 0) {
         long long blocks = (ncols + k->tr - 1) / k->tr;                 // one block per tile
         if (k->grid_cap > 0) blocks = std::min(blocks, k->grid_cap);   // the tile tables' persistent grid
-        return launch(blocks, k->threads, k->smem);
+        return launch(blocks, k->threads, k->smem, k->fn);
     }
     // Split arm: chunks of pairs through a (nk, chunk * d^2) intermediate of at most 1 GiB (the
     // mode-11 and mode-8 bound); a chunk only groups pairs into launches.
@@ -2887,10 +2952,19 @@ static ffi::Error KleadUnfoldImpl(
         npairs = std::min(chunk, pairs - p0);
         const long long nc = npairs * d * d;
         const long long plane = std::min(nkx * ((nc + k->tr - 1) / k->tr), cap);
-        const long long pencil = std::min((nky * nkz * nc + kThreads - 1) / kThreads, cap);
+        auto pencil = [&](int threads) { return std::min((nky * nkz * nc + threads - 1) / threads, cap); };
+        if (k->arm == 2) {                             // the plane pass, then the resident columns
+            if (auto e0 = launch(plane, k->threads, k->smem, k->fn); !e0.success()) return e0;
+            phase = 1;
+            if (auto e1 = launch(std::min(nc, cap), k->threads2, k->smem2, k->fn2); !e1.success()) return e1;
+            continue;
+        }
         for (phase = 0; phase < 4; ++phase) {
-            const bool pl = phase % 2 == 0;
-            if (auto e1 = launch(pl ? plane : pencil, kThreads, pl ? k->smem : 0); !e1.success()) return e1;
+            const ffi::Error e1 = phase == 0 ? launch(plane, k->threads, k->smem, k->fn)
+                                : phase == 1 ? launch(pencil(k->threads2), k->threads2, 0, k->fn2)
+                                : phase == 2 ? launch(plane, k->threads3, k->smem3, k->fn3)
+                                             : launch(pencil(k->threads3), k->threads3, 0, k->fn3);
+            if (!e1.success()) return e1;
         }
     }
     return ffi::Error::Success();
