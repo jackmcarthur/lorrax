@@ -349,6 +349,8 @@ class StreamedBank:
         self.devices = tuple(cells)
         self._cell = {(i[0].start or 0, i[1].start or 0): d for d, i in cells.items()}
         self.seconds, self.bounced = dict(write=0., read=0., wait=0.), 0
+        self.reads = dict(calls=0, runs=0, bytes=0, pread=0., place=0.)
+        self._ahead, self._free, self._checks, self._read_error = {}, [], [], None
         self.digests = {d: np.zeros((self.n_out, len(self.shapes), self.q), np.uint64) for d in self.devices}
         self.written = np.zeros((self.n_out, len(self.shapes)), bool)
         self.stores, self._inflight, self._error = {}, deque(), None
@@ -551,11 +553,105 @@ class StreamedBank:
         flat.block_until_ready()
         return flat, time.monotonic() - started
 
+    def read_runs(self, runs, then=()):
+        """Outputs of every run ``[(o0, o1), ...]`` as one device array ``[Σ(o1-o0), q, ...]``
+        (the W bank's reads: one call per field and parent batch). Every run's preads are in
+        flight together on the I/O threads, then one placement and one unpack. ``then`` names
+        the runs the caller reads next; their preads start now (at most two guesses held).
+        Failures and digest checks wait for :meth:`check_reads`, which the caller agrees
+        across ranks before it uses the value."""
+        runs = tuple((int(a), int(b)) for a, b in runs)
+        started = time.monotonic()
+        local, futures = self._ahead.pop(runs, None) or self._start(runs)
+        for future in futures:
+            try:
+                future.result()
+            except BaseException as exc:
+                self._read_error = self._read_error or exc
+        self.reads["pread"] += time.monotonic() - started
+        self.seconds["read"] += time.monotonic() - started
+        then = tuple((int(a), int(b)) for a, b in then)
+        if then and then not in self._ahead:
+            while len(self._ahead) >= 2:
+                self._settle(self._ahead.pop(next(iter(self._ahead))))
+            self._ahead[then] = self._start(then)
+        mark, n_out = time.monotonic(), sum(b - a for a, b in runs)
+        flat = jax.make_array_from_callback(
+            (int(self.mesh.shape["x"]), int(self.mesh.shape["y"]), n_out * self.S // 16),
+            NamedSharding(self.mesh, P("x", "y", None)),
+            lambda i: self._own(np.frombuffer(local[self._cell[(i[0].start or 0, i[1].start or 0)]],
+                                              np.complex128, n_out * self.S // 16))[None, None])
+        flat.block_until_ready()        # the staging buffer is reused after this
+        self._settle((local, ()))
+        self.reads["place"] += time.monotonic() - mark
+        value, digest = _unpack(self.mesh, n_out, self.q, self.shapes, self.rects, self.tile,
+                                tuple(r // 16 for r in self.records))(flat)
+        self._checks.append((runs, digest))
+        self.reads.update(calls=self.reads["calls"] + 1, runs=self.reads["runs"] + len(runs),
+                          bytes=self.reads["bytes"] + n_out * self.S)
+        return value
+
+    def check_reads(self):
+        """This rank's first failure among the reads since the last call, else ``None``
+        (not agreed: the caller agrees once for every store it read)."""
+        error, self._read_error = self._read_error, None
+        checks, self._checks = self._checks, []
+        try:
+            for runs, digest in checks:
+                if not self.unwritten_zero and not all(self.written[a:b].all() for a, b in runs):
+                    raise OSError(f"GATE streamed_bank: runs {runs[:3]}… were not all written")
+                for shard in digest.addressable_shards:
+                    expected = np.concatenate([self.digests[shard.device][a:b] for a, b in runs])
+                    if not np.array_equal(np.asarray(shard.data)[0, 0], expected):
+                        raise OSError(f"GATE streamed_bank: digest mismatch reading runs {runs[:3]}…")
+        except BaseException as exc:
+            error = error or exc
+        return error
+
+    def _start(self, runs):
+        """Start the preads of ``runs``: ``({device: staging bytes}, futures)``."""
+        n, local, futures = sum(b - a for a, b in runs) * self.S, {}, []
+        try:
+            for d in self.devices:
+                store = self.stores[d]
+                if store.host is not None:
+                    local[d] = np.concatenate([store.view[a * self.S:b * self.S] for a, b in runs])
+                    continue
+                fit = [i for i, buf in enumerate(self._free) if len(buf) >= n]
+                buf = self._free.pop(fit[0]) if fit else _aligned(n)
+                local[d], target, at = buf, memoryview(buf), 0
+                for a, b in runs:
+                    length = (b - a) * self.S
+                    futures += [self._pool.submit(store.read, target[at + k:at + k + min(self.piece, length - k)],
+                                                  a * self.S + k) for k in range(0, length, self.piece)]
+                    at += length
+        except BaseException as exc:
+            self._read_error = self._read_error or exc
+            local = {d: local[d] if d in local else _aligned(n) for d in self.devices}
+        return local, futures
+
+    def _own(self, rows):
+        # A CPU device may alias host memory; the staging buffer is reused.
+        return rows.copy() if self.devices[0].platform == "cpu" else rows
+
+    def _settle(self, entry):
+        """Wait out an entry's preads and keep its staging buffers for reuse."""
+        local, futures = entry
+        for future in futures:
+            try:
+                future.result()
+            except BaseException:
+                pass                    # a guess nobody read
+        self._free += [buf for buf in local.values() if isinstance(buf, mmap.mmap)]
+
     def release(self):
         error = None
         try:
             while self._inflight:
                 self._retire()
+            while self._ahead:
+                self._settle(self._ahead.popitem()[1])
+            self._free = []
             self._pool.shutdown(wait=True)
             self._drain.shutdown(wait=True)
             self._close_stores()
