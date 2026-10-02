@@ -148,6 +148,7 @@ def band_character_and_moments(*, colors, moments_grid, wfn, params, ctilde,
     4. Grid: H and n.sigma, n.L_I interpolated to ``moments_grid``; E_F
        re-found there; m = sum_q w sum_n f <O>.
     """
+    from functools import partial
     import jax.numpy as jnp
     from psp.pseudos import load_pseudopotentials
     from .fh_interp import build_fH_R, require_newton_converged
@@ -240,11 +241,10 @@ def band_character_and_moments(*, colors, moments_grid, wfn, params, ctilde,
             along += [jnp.einsum('a,akmn->kmn', jnp.asarray(axis),
                                  ops[3 + 3 * i:6 + 3 * i])
                       for i in range(n_atom)]
-            operators_R = [_operator_R(o[None], ctilde, kgrid, mesh)
-                           for o in along]
+            builders = [partial(_operator_R, o[None], ctilde, kgrid, mesh)
+                        for o in along]
             E, D, residual = grid_moments(
-                fH_R, f_params, operators_R, kgrid, grid, n_return_bands,
-                mesh)
+                fH_R, f_params, builders, kgrid, grid, n_return_bands, mesh)
         require_newton_converged(float(residual), where="moments grid")
         mu, m, f_top = occupied_sums(
             np.asarray(gather_to_host(E)), np.asarray(gather_to_host(D)),
