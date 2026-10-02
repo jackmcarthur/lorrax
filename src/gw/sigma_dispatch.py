@@ -1454,7 +1454,8 @@ def _compute_mpa_sigma(
 
         sector_result = compute_sector_sigma(
             sector_handle, (wfns, wfns_transverse), mu_bases, meta, mesh_xy,
-            on_shell=on_shell, **body_options)
+            on_shell=on_shell, linalg=linalg_resolution({"linalg": config.backend.linalg}).layout,
+            **body_options)
         if lorentz_output:
             body, (ct_shell, tt_shell) = sector_result
             # The finalizer assigns CC as the exact residual of the total

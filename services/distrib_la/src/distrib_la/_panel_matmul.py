@@ -161,24 +161,34 @@ def _panel_contraction(mesh, active=True):
 
 
 
-def batch_gram(b, weights, bounds, *, mesh, nbatch):
-    """``W[q] = b[q][:, lo:hi]·diag(w[q])·b[q][:, lo:hi]†`` with whole parents per rank, out on the face.
+def batch_gram(b, weights, bounds, *, mesh, nbatch, right=None, partner=False):
+    """``W[q] = b[q][:, lo:hi]·diag(w[q])·c[q][:, lo:hi]†`` with whole parents per rank, out on the face.
 
     ``b`` ``(Bp,m,K)``, ``weights`` ``(Bp,K)`` and int32 ``bounds`` ``(Bp,2)`` are
     in the batch layout (:func:`distrib_la.batch_layout`; ``nbatch`` real rows of
-    ``Bp``).  Each rank contracts its own rows over their intervals with the
-    same local active-range GEMM a :func:`panel_matmul` panel uses, and only
-    ``W`` moves, batch to face (:func:`distrib_la.local_batch`): per call a rank
-    sends its ``W`` rows, never the factor, which stays resident.  Returns
-    ``(nbatch,m,m)`` at ``P(None,'x','y')``.
+    ``Bp``); ``right`` ``c`` ``(Bp,n,K)`` likewise, ``b`` itself when ``None``.
+    Each rank contracts its own rows over their intervals with the same local
+    active-range GEMM a :func:`panel_matmul` panel uses, and only ``W`` moves,
+    batch to face (:func:`distrib_la.local_batch`): per call a rank sends its
+    ``W`` rows, never the factors, which stay resident.  Returns
+    ``(nbatch,m,n)`` at ``P(None,'x','y')``.  ``partner``: also the
+    conjugate-factor product ``conj(b)·diag(w)·c^T`` from the same resident
+    rows (the pair :func:`panel_matmul` returns with ``partner=True``), both
+    moved in the one exchange.
     """
     from ._batch_reshard import local_batch
     contract = _panel_contraction(mesh)
+    bounds = bounds.astype(jnp.int32)
 
-    def one(b, w, limits):
-        return contract(b * w[:, None, :], jnp.swapaxes(jnp.conj(b), -1, -2), limits, None)
-    return local_batch(one, mesh, resident=(0, 1, 2), nbatch=nbatch)(
-        b, weights, bounds.astype(jnp.int32))
+    def gram(b, c, w, limits):
+        value = contract(b * w[:, None, :], jnp.swapaxes(jnp.conj(c), -1, -2), limits, None)
+        if not partner:
+            return value
+        return value, contract(jnp.conj(b) * w[:, None, :], jnp.swapaxes(c, -1, -2), limits, None)
+    if right is None:
+        return local_batch(lambda b, w, limits: gram(b, b, w, limits), mesh, resident=(0, 1, 2),
+                           nbatch=nbatch)(b, weights, bounds)
+    return local_batch(gram, mesh, resident=(0, 1, 2, 3), nbatch=nbatch)(b, right, weights, bounds)
 
 @lru_cache(maxsize=64)
 def _kernel(mesh, q, m, k, n, width, sample_axis):

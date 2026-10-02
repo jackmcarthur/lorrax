@@ -392,6 +392,12 @@ parent panels are a static loop inside the executable, chunks of one static
 width a device loop, one of each when everything fits. A store whose resident
 factors do not fit runs at one parent and one column multiple, with one
 `memory over budget` warning line. The synthesized $W$ always uses both mesh axes.
+The photon sectors (`mpa.sector_sigma.sector_synthesis`) synthesize through the
+same owner (`mpa.sigma.synthesize_shared_pole_parents`) and placement rule, at
+their tile extents $(m n_A, n n_B)$ and in one panel of every parent and pole
+column. On a diagonal sector (CC, TT) the partner is $W^{\mathsf T}$; a mixed
+sector's partner $\bar B_A d B_B^{\mathsf T}$ comes from the same operands (two
+factors in `distrib_la.batch_gram`, the face route's one panel exchange).
 
 **Hole routing.** Conduction windows take $W_+(q)$. An ordered store routes
 valence windows to the particle–hole partner,

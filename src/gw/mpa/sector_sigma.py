@@ -18,7 +18,7 @@ import numpy as np
 from jax.sharding import NamedSharding, PartitionSpec as P
 
 from common.collectives import device_put_process_local
-from runtime.padding import pad_to_axis, padded_axis
+from runtime.padding import pad_to_axis
 from gw.wavefunction_bundle import parent_sigma_operands
 from .sigma import SynthesisTau, WSynthesis, _admit, _static_key
 
@@ -63,7 +63,7 @@ def _zeros(mesh_xy, shape, spec=P(None, 'x', 'y')):
 
 
 #: Test hook: the largest parent-q panel the instantaneous constant is read
-#: and packed in (``None``: the ledger decides).
+#: and packed in (``None``: one tile decides).
 _TEST_CONSTANT_Q_SPAN = None
 
 
@@ -163,51 +163,43 @@ def hole_tables(particle, grid):
         spin=particle.spin[qn], spin_r=None if particle.spin_r is None else particle.spin_r[qn])
 
 
-_W_PARENTS = {}
+_W_PROGRAMS = {}
 
 
-def _w_parents(mesh_xy, plan, m, nc, n, nt, kcarrier, weights_fn, panel_bytes):
+def _w_program(mesh_xy, route, same, m, nc, n, nt, nq, kcarrier, weights_fn):
     """``jit((b_x, b_y, poles, intervals, ref, time) -> (W, partner))`` on the irreducible q.
 
-    The factors enter ``build_G_parents`` as the Green's faces do
-    (``_shared_pole_contract``'s transpose-and-build, on the parent rows):
-    components merged with their own centroid axis, the pole axis as the band
-    axis, ``d(t)`` as the phase row.  The contraction is the face Green's
-    batched SUMMA (``distrib_la.panel_matmul``) with its two live pole panels
-    bounded by ``panel_bytes`` (the ledger's room; one W tile at most).  The
-    partner is ``conj(B_A) d B_B^T`` at the same d: on the face route
-    (``face_green_product(partner=True)``) d scales each gathered panel slice
-    and the partner comes from the same exchange, so no scaled or conjugated
-    copy of a face is formed.  The route bounds its two live panels by one
-    Green tile of ``n_full`` rows; the builder's plan here says ``n_full`` =
-    the rows whose tile is ``panel_bytes`` (both whole faces when they fit:
-    one panel step).
+    The scalar W(τ) owner, :func:`gw.mpa.sigma.synthesize_shared_pole_parents`,
+    with the placement ``route`` its schedule chose (``axis``: replicated pole
+    columns, one local GEMM per rank and no exchange; ``local``: whole parents
+    per rank, ``distrib_la.batch_gram``, only W moves; ``face``: the Green's
+    batched SUMMA, panels bounded by one W tile).  Only each parent's live
+    pole columns are contracted.  The partner ``conj(B_A) d B_B^T`` is the
+    transpose of W on a diagonal sector (``same``) and, on a mixed one, the
+    same contraction on the conjugate factors (the face route's same panel
+    exchange).  Components are merged with their own centroid axis, so W is
+    ``(nq, m, nc, n, nt)`` at ``P(None,'x',None,'y',None)``.  One program per
+    configuration and process.
     """
-    key = (mesh_xy, id(plan), m, nc, n, nt, kcarrier, weights_fn, int(panel_bytes))
-    if key in _W_PARENTS:
-        return _W_PARENTS[key][1]
-    from gw.greens_function_kernel import build_G_parents
-    nq = int(plan.n_parent)
-    px, py = int(mesh_xy.shape['x']), int(mesh_xy.shape['y'])
-    rows = int(max(1, int(panel_bytes) // (16 * (m * nc // px) * (n * nt // py))))
-    gemm = SimpleNamespace(backend='face', mesh=mesh_xy)
-    face_plan = SimpleNamespace(sym_idx=plan.sym_idx, n_sym_spatial=plan.n_sym_spatial,
-                                mesh_xy=mesh_xy, n_full=rows)
-    antiunitary = bool(np.any(np.asarray(plan.sym_idx) >= int(plan.n_sym_spatial)))
+    key = (mesh_xy, route, bool(same), m, nc, n, nt, nq, kcarrier, weights_fn)
+    hit = _W_PROGRAMS.get(key)
+    if hit is not None:
+        return hit
+    from distrib_la import gemm_plan
+    from .sigma import synthesize_shared_pole_parents
+    gemm = None if route == 'local' else gemm_plan(
+        mesh_xy, m=m * nc, k=kcarrier, n=n * nt, nq=nq, dtype=np.complex128, layout=route,
+        enable_active_range=True, warmup=False)
+    shape = (nq, m, nc, n, nt)
+    spec = NamedSharding(mesh_xy, P(None, 'x', None, 'y', None))
 
     @jax.jit
     def kernel(b_x, b_y, poles, intervals, ref, time):
-        d = weights_fn(poles, intervals, ref, time)
-        x = b_x.reshape(nq, m * nc, 1, kcarrier).transpose(0, 2, 1, 3)
-        y = b_y.reshape(nq, n * nt, 1, kcarrier).transpose(0, 3, 2, 1)
-        pg = build_G_parents(x, y, phases=d, layout='face', gemm=gemm, k_unfold_plan=face_plan,
-                             real_weights=False)
-        partner = pg.partner() if antiunitary else build_G_parents(
-            jnp.conj(x), jnp.conj(y), phases=d, layout='face', gemm=gemm,
-            k_unfold_plan=face_plan, real_weights=False).G
-        shape = (nq, m, nc, n, nt)
-        return pg.G.reshape(shape), partner.reshape(shape)
-    _W_PARENTS[key] = (plan, kernel)
+        pair = synthesize_shared_pole_parents(
+            b_x, b_y, poles, jnp.clip(intervals, 0, kcarrier), ref, time, mesh_xy=mesh_xy,
+            gemm=gemm, layout=route, weights_fn=weights_fn, active_range=True, same_factor=same)
+        return tuple(jax.lax.with_sharding_constraint(w.reshape(shape), spec) for w in pair)
+    _W_PROGRAMS[key] = kernel
     return kernel
 
 
@@ -417,25 +409,28 @@ def sector_tau_factory(left, right, keys, meta, mesh_xy):
 
 
 def sector_synthesis(readers, headers, bases, syms, layout, frequencies, meta, mesh_xy,
-                     *, weights_fn=None, stage='sigma'):
+                     *, weights_fn=None, stage='sigma', linalg=None):
     """Keep the endpoint factors on the irreducible q and form W(t) there, per tau.
 
-    The store is read once at setup: both factor faces on the store's own
-    parent rows (``nq_irr``), never unfolded.  Each tau builds
-    ``W = B_A d(t) B_B^dagger`` and its partner on those rows with the Green's
-    builder (``gw.greens_function_kernel.build_G_parents``), and the Sigma
-    door unfolds W on its load through the class's W tables
-    (:func:`_w_tables`).  No full-q W, full-q W factor, unfolded pole table or
-    full-grid W_R is held.  ``syms`` are the endpoint families' symmetry maps
-    (a current endpoint's Cartesian action; a charge endpoint reads none).
-    ``weights_fn`` is d: the causal d(t) by default, the omega = 0
-    coefficient for :func:`sector_static_wc`, whose ledger stages ``stage``
-    prefixes.  The occupied windows read W_-(q) = partner(-q) through the
-    hole tables; d is never conjugated.  ``layout`` is kept for the caller's
-    census (the factors stay on the store's face layout).
+    The store is read once at setup: the factors on the store's own parent
+    rows (``nq_irr``), never unfolded, placed as the scalar model's schedule
+    (:func:`gw.mpa.sigma._shared_pole_memory_schedule`) places its own, with
+    this sector's tile extents: replicated pole columns when they fit, else
+    whole parents per rank on a ``linalg = local`` deck (``linalg``, resolved)
+    when those fit, else both faces.  Each tau builds ``W = B_A d(t) B_B^dagger``
+    and its partner on those rows through the one W(τ) owner
+    (:func:`_w_program`), and the Σ kconv unfolds W on its load through the
+    class's W tables (:func:`_w_tables`).  No full-q W, full-q W factor,
+    unfolded pole table or full-grid W_R is held.  ``syms`` are the endpoint
+    families' symmetry maps (a current endpoint's Cartesian action; a charge
+    endpoint reads none).  ``weights_fn`` is d: the causal d(t) by default,
+    the omega = 0 coefficient for :func:`sector_static_wc`, whose ledger stages
+    ``stage`` prefixes.  The occupied windows read W_-(q) = partner(-q)
+    through the hole tables; d is never conjugated.  ``layout`` is kept for
+    the caller's census.
     """
-    from file_io.shared_pole_store import read_shared_pole_faces
-    from .sigma import _shared_pole_weights
+    from file_io.shared_pole_store import face_width, read_shared_pole_faces
+    from .sigma import _shared_pole_memory_schedule, _shared_pole_weights
     from .sigma_windows import shared_pole_intervals
 
     del layout
@@ -451,48 +446,63 @@ def sector_synthesis(readers, headers, bases, syms, layout, frequencies, meta, m
     tag=f'{left.get("sector")}.{right.get("sector")}'
     w_plan,*w_tables=_w_tables(headers,bases,syms,mesh_xy)
     shape=(nq,m,nc,n,nt)
+    tile=16*nq*m*nc*n*nt//mesh_xy.size
     if not kmax:
         zero=_zeros(mesh_xy,shape,P(None,'x',None,'y',None))
         synthesis=WSynthesis(lambda _ref,_time,hole:ParentW(zero(),zero(),hole),
                           lambda _space,_indices,_bounds:(),lambda:(),lambda _result=None:None,0,
-                          ('zero',mesh_xy,shape),ordered=True)
+                          ('zero',mesh_xy,shape),ordered=True,tile_bytes=tile)
         synthesis.w_tables=tuple(w_tables)
         return synthesis
     # The store reader pads physical Kmax for both endpoint face shardings.
     # Keep that carrier through the GEMM; K and the interval bounds remain
     # physical, so the padded pole columns have identically zero weight.
-    kcarrier=padded_axis(kmax,mesh_xy,name='sector_sigma_K',specs=(
-        (P(None,'x',None,'y'),3),(P(None,'y',None,'x'),3))).carrier
+    kcarrier=face_width(mesh_xy,kmax)
     same=readers[0] is readers[1] and headers[0] is headers[1]
-    faces=16*nq*kcarrier*(m*nc+n*nt)//mesh_xy.size
-    tile=16*nq*m*nc*n*nt//mesh_xy.size
-    native=0
-    # The W pair's two live pole panels hold at most both whole faces (one
-    # step, the fastest), bounded by what the room leaves beside the faces
-    # and the pair; never below one pole column.
-    column=16*nq*(m*nc//int(mesh_xy.shape['x'])+n*nt//int(mesh_xy.shape['y']))
-    panel=max(column,min(faces,capacity.room_bytes_per_rank(ambient)-faces-8*nq*kcarrier-2*tile))
+    schedule=_shared_pole_memory_schedule(meta,left,mesh_xy=mesh_xy,stage=f'{stage}.sector.{tag}',
+        linalg=linalg,extents=(m*nc,n*nt),factors=1 if same else 2)
+    route=schedule['factor_layout']
     setup=f'{stage}.sector.resident.{tag}'
-    # Resident: both parent faces and the parent poles.  The W pair (2 tiles)
-    # is the window executable's, priced there with the Green.
-    capacity.reserve(setup,resident_bytes_per_rank=faces+8*nq*kcarrier,
-        workspace_bytes_per_rank=2*tile+panel,concurrent_with=ambient)
+    # Resident: the placed factors and the parent poles; workspace: the
+    # route's synthesis.  The W pair (2 tiles) is the window executable's,
+    # priced there with the Green.
+    row=schedule['capacity_receipt']
+    capacity.reserve(setup,resident_bytes_per_rank=row['resident_bytes_per_rank'],
+        workspace_bytes_per_rank=row['workspace_bytes_per_rank'],concurrent_with=ambient)
     capacity.live_stages=(*ambient,setup)
+    local=route=='local'
     try:
-        if same:
+        # Whole parents per rank read every factor in the x orientation;
+        # the face and axis routes read the right factor in the y orientation.
+        rhs_axis='x' if local else 'y'
+        if same and not local:
             lhs=read_shared_pole_faces(readers[0],(0,nq),meta=meta,header=left,basis=bases[0])
             b_x,b_y,poles=lhs[0],lhs[1],lhs[2]
         else:
             lhs=read_shared_pole_faces(readers[0],(0,nq),meta=meta,header=left,
                                        basis=bases[0],orientations=('x',))
-            rhs=read_shared_pole_faces(readers[1],(0,nq),meta=meta,header=right,
-                                       basis=bases[1],orientations=('y',))
-            if not bool(jnp.all(lhs[2]==rhs[2])):
-                raise ValueError('GATE shared_pole_sector_census: unequal pole values')
-            b_x,b_y,poles=lhs[0],rhs[1],lhs[2]
-        jax.block_until_ready((b_x,b_y,poles))
+            b_x,b_y,poles=lhs[0],None,lhs[2]
+            if not same:
+                rhs=read_shared_pole_faces(readers[1],(0,nq),meta=meta,header=right,
+                                           basis=bases[1],orientations=(rhs_axis,))
+                if not bool(jnp.all(lhs[2]==rhs[2])):
+                    raise ValueError('GATE shared_pole_sector_census: unequal pole values')
+                b_y=rhs[0] if local else rhs[1]
+                del rhs
         del lhs
-        kernel=_w_parents(mesh_xy,w_plan,m,nc,n,nt,kcarrier,weights_fn or _shared_pole_weights,panel)
+        if local:
+            # Components merged with their centroids, one copy per factor in
+            # distrib_la's batch layout, placed once per Σ call.
+            from distrib_la import batch_layout
+            merge=lambda a:_merge_components(mesh_xy,tuple(a.shape))(a)
+            b_x=batch_layout(merge(b_x),mesh_xy)
+            b_y=None if b_y is None else batch_layout(merge(b_y),mesh_xy)
+            poles=batch_layout(poles,mesh_xy)
+        elif route=='axis':
+            b_x=_placer(mesh_xy,P(None,'x',None,None))(b_x)
+            b_y=_placer(mesh_xy,P(None,'y',None,None))(b_y)
+        jax.block_until_ready((b_x,b_y,poles))
+        kernel=_w_program(mesh_xy,route,same,m,nc,n,nt,nq,kcarrier,weights_fn or _shared_pole_weights)
     except BaseException:
         capacity.live_stages=ambient
         raise
@@ -518,11 +528,20 @@ def sector_synthesis(readers, headers, bases, syms, layout, frequencies, meta, m
             b_x=b_y=poles=None
             capacity.live_stages=ambient
             closed=True
-    synthesis=WSynthesis(w_kernel,window_operands,lambda:(b_x,b_y,poles),close,native,
-                      ('w-parent',mesh_xy,tuple(left['grid']),nq,m,nc,n,nt,kcarrier,id(w_plan)),
-                      ordered=True)
+    synthesis=WSynthesis(w_kernel,window_operands,lambda:(b_x,b_y,poles),
+                      close,0,('w-parent',mesh_xy,tuple(left['grid']),nq,m,nc,n,nt,kcarrier,id(w_plan),
+                               route,same),ordered=True,tile_bytes=tile)
     synthesis.w_tables=tuple(w_tables)
+    synthesis.route=route
     return synthesis
+
+
+@lru_cache(maxsize=None)
+def _merge_components(mesh_xy, shape):
+    """``(nq, m, nc, K)`` at ``P(None,'x',None,'y')`` -> ``(nq, m*nc, K)`` at ``P(None,'x','y')``."""
+    nq, m, nc, k = shape
+    return jax.jit(lambda a: a.reshape(nq, m * nc, k),
+                   out_shardings=NamedSharding(mesh_xy, P(None, 'x', 'y')))
 
 
 @lru_cache(maxsize=None)
@@ -537,7 +556,7 @@ def instantaneous_sector_sigma(handle, families, bases, meta, mesh_xy, *,
     """Exchange-like equal-time contraction of W_infinity-V, exactly once.
 
     The constant is read and packed on its irreducible q (in parent-q panels
-    only when raw + packed do not fit the ledger); each endpoint class is its
+    when raw + packed exceed one tile, ``runtime.tiles``); each endpoint class is its
     parent pair ``(W, conj W)``, read with the occupied Green by the class's
     :func:`sector_node` at τ = 0 on one branch (``gw.photon_sigma.contract_lorentz_blocks``).
     No full-q class operand is formed.
@@ -554,10 +573,11 @@ def instantaneous_sector_sigma(handle, families, bases, meta, mesh_xy, *,
     amount=16*nq*max(raw_layout.packed_extent,layout.packed_extent)**2//mesh_xy.size
     ledger=meta.shared_pole_capacity
     # The raw constant is read and packed in parent-q panels beside the
-    # packed operator when raw + packed (with their workspace, 4x) do not
-    # fit (Fe 20^3/P36: 97.87 GB/rank); a deck that fits reads it once.
-    room=ledger.room_bytes_per_rank(ledger.live_stages)
-    span=nq if 4*amount<=room else max(1,min(nq,(room-amount)*nq//(4*amount)))
+    # packed operator: the most q whose raw + packed (with their workspace,
+    # 4x) fit one tile (runtime.tiles, from the shapes, never the budget;
+    # Fe 20^3/P36: 97.87 GB/rank in all); a deck under one tile reads it once.
+    from runtime.tiles import tile_units
+    span=tile_units(4*amount/nq,nq)
     if _TEST_CONSTANT_Q_SPAN is not None:
         span=min(span,_TEST_CONSTANT_Q_SPAN)
     part=-(-amount*span//nq)
@@ -611,11 +631,13 @@ def instantaneous_sector_sigma(handle, families, bases, meta, mesh_xy, *,
 
 
 def compute_sector_sigma(handle, families, bases, meta, mesh_xy, *,
-                         on_shell=None, **options):
+                         on_shell=None, linalg=None, **options):
     """Integrate CC, TT and both ordered mixed endpoints on their own pole sets.
 
     ``options`` is the common MPA/shared-pole quadrature contract; its live
     occupation state and fixed-rule sessions remain owned by the caller.
+    ``linalg`` (the deck's resolved dense layout) places each sector's W(τ)
+    synthesis as it places the scalar model's (:func:`sector_synthesis`).
     The scalar charge entry is unchanged. No model is kept across SC maps.
     """
     from file_io.shared_pole_store import (ResidentSectorModel, open_shared_pole_model,
@@ -667,7 +689,7 @@ def compute_sector_sigma(handle, families, bases, meta, mesh_xy, *,
                     raise ValueError('GATE shared_pole_sectors: endpoint wavefunction layouts differ')
                 builder=sector_synthesis((reader,other),pair,(bases[a],bases[b]),
                     tuple(f.green_parent.plan.sym for f in (families[a],families[b])),
-                    families[a].layout,freq,meta,mesh_xy)
+                    families[a].layout,freq,meta,mesh_xy,linalg=linalg)
                 bound.append(builder)
                 stack.callback(builder.close)
                 return builder
