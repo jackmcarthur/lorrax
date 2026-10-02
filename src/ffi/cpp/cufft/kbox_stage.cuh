@@ -127,6 +127,33 @@ __device__ __forceinline__ C lane_read(C v, int src) {
     return r;
 }
 
+// The live columns [lo, hi) of a pass padded to a scan's largest pass (a door's live rows times its
+// columns per row, so whole groups): a pass runs over [b, e) = [lo, hi) within [0, ncols) only, as
+// it would over [0, ncols); with zero set (the pass that stores the door's output) zero_dead
+// writes the other columns as zeros.  The default is every column live.
+#ifndef LRX_LIVE
+#define LRX_LIVE 1
+#endif
+struct Live {
+    long long lo = 0, hi = 0x7fffffffffffffffLL;
+    bool zero = false;
+    __device__ long long b() const { return lo > 0 ? lo : 0; }
+    __device__ long long e(long long ncols) const {
+        if (!LRX_LIVE) return ncols;
+        const long long c = hi < ncols ? hi : ncols;
+        return c > b() ? c : b();
+    }
+    // A door's live rows [live[0], live[1]) of per_row columns each, as columns from c0 (null live:
+    // every row).  LRX_LIVE 0 (a program built for calls without live): every column, folded at
+    // compile time, so the plain program keeps no bounds in registers.
+    __device__ static Live rows(const int* live, long long per_row, long long c0, bool zero) {
+        Live lv;
+        lv.zero = zero;
+        if (LRX_LIVE && live) { lv.lo = live[0] * per_row - c0; lv.hi = live[1] * per_row - c0; }
+        return lv;
+    }
+};
+
 // cp.async of one element (8 or 16 bytes), global -> shared; commit; wait for all.
 template <int BYTES>
 __device__ __forceinline__ void cp_async(void* smem, const void* gmem) {
@@ -311,6 +338,19 @@ __device__ void store_tile(const C* bank, long long col0, long long ncols, const
     __syncthreads();
 }
 
+// The output pass's zeros: st.put(k, c, 0) for every column c of [0, ncols) outside lv's [b, e)
+// (nothing without lv.zero), grid-wide; the pass itself writes only [b, e).
+template <int NK, class C, class Store>
+__device__ void zero_dead(long long ncols, const Live& lv, const Store& st) {
+    if (!lv.zero) return;
+    const long long b = lv.b(), n = lv.e(ncols) - b;
+    for (long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x; i < (ncols - n) * NK;
+         i += (long long)gridDim.x * blockDim.x) {
+        const long long d = i / NK;
+        st.put(int(i % NK), d < b ? d : d + n, C{});
+    }
+}
+
 // store_tile with k fastest across threads: a k-MINOR Store (element (col, k) at col*NK + k)
 // writes one contiguous run per column.  The same elements and values as store_tile.
 template <int NX, int NY, int NZ, int TR, class C, class Store>
@@ -348,23 +388,23 @@ struct PlainK {
 // Plane pass: for each (kx, tile of TP columns) the (ky, kz) plane of every column in padded
 // shared memory (smem: TP * PR elements), the y/z transforms, then st.put.  Load/Store as above;
 // in place is allowed (a block writes only what it staged).  KMINOR: the store runs k fastest
-// (a k-minor Store such as PlainK writes one run per column).
+// (a k-minor Store such as PlainK writes one run per column).  lv: as Live.
 template <int NX, int NY, int NZ, int Arch, cufftdx::fft_direction Dir, int TP, bool KMINOR = false, class C,
           class Load, class Store>
-__device__ void plane_pass(C* sm, long long ncols, const Load& ld, const Store& st) {
+__device__ void plane_pass(C* sm, long long ncols, const Load& ld, const Store& st, const Live& lv = Live{}) {
     using G = Geo<NX, NY, NZ>;
-    const long long nct = (ncols + TP - 1) / TP;
+    const long long b = lv.b(), e = lv.e(ncols), nct = (e - b + TP - 1) / TP;
     for (long long w = blockIdx.x; w < (long long)NX * nct; w += gridDim.x) {
         const int kx = int(w / nct);
-        const long long c0 = (w % nct) * TP;
+        const long long c0 = b + (w % nct) * TP;
         __syncthreads();
         if constexpr (Load::kDirect) {
-            ld.direct(PlaneView<NX, NY, NZ, C>{sm, kx}, kx * NY * NZ, (kx + 1) * NY * NZ, c0, TP, ncols);
+            ld.direct(PlaneView<NX, NY, NZ, C>{sm, kx}, kx * NY * NZ, (kx + 1) * NY * NZ, c0, TP, e);
         } else {
             for (int i = threadIdx.x; i < NY * NZ * TP; i += blockDim.x) {
                 const int t = i % TP, p = i / TP, k = kx * NY * NZ + p;
                 C* dst = sm + t * G::PR + G::plane_at(p);
-                if (c0 + t < ncols) cp_async<sizeof(C)>(dst, ld.stage(k, c0 + t));
+                if (c0 + t < e) cp_async<sizeof(C)>(dst, ld.stage(k, c0 + t));
                 else { dst->x = 0; dst->y = 0; }
             }
             cp_async_commit();
@@ -374,9 +414,9 @@ __device__ void plane_pass(C* sm, long long ncols, const Load& ld, const Store& 
         if constexpr (!Load::kDirect && Load::kFinish) {
             for (int i = threadIdx.x; i < NY * NZ * TP; i += blockDim.x) {
                 const int t = i % TP, p = i / TP;
-                if (c0 + t < ncols) {
-                    C* e = sm + t * G::PR + G::plane_at(p);
-                    *e = ld.finish(kx * NY * NZ + p, c0 + t, *e);
+                if (c0 + t < e) {
+                    C* el = sm + t * G::PR + G::plane_at(p);
+                    *el = ld.finish(kx * NY * NZ + p, c0 + t, *el);
                 }
             }
             __syncthreads();
@@ -393,9 +433,10 @@ __device__ void plane_pass(C* sm, long long ncols, const Load& ld, const Store& 
         __syncthreads();
         for (int i = threadIdx.x; i < NY * NZ * TP; i += blockDim.x) {
             const int t = KMINOR ? i / (NY * NZ) : i % TP, p = KMINOR ? i % (NY * NZ) : i / TP;
-            if (c0 + t < ncols) st.put(kx * NY * NZ + p, c0 + t, sm[t * G::PR + G::plane_at(p)]);
+            if (c0 + t < e) st.put(kx * NY * NZ + p, c0 + t, sm[t * G::PR + G::plane_at(p)]);
         }
     }
+    zero_dead<NX * NY * NZ, C>(ncols, lv, st);
 }
 
 // Column-resident pass, the rest of a convolution after an inverse plane pass when one column's
@@ -404,9 +445,10 @@ __device__ void plane_pass(C* sm, long long ncols, const Load& ld, const Store& 
 // split's pencil, plane and pencil passes on the same lines in the same axis order: bitwise; the
 // column stays in shared memory, so y is read once instead of three reads and writes.
 template <int NX, int NY, int NZ, int Arch, class C, class Mid, class Store>
-__device__ void column_pass(C* bank, C* y, long long ncols, const Mid& mid, const Store& st) {
+__device__ void column_pass(C* bank, C* y, long long ncols, const Mid& mid, const Store& st, const Live& lv = Live{}) {
     using G = Geo<NX, NY, NZ>;
-    for (long long col = blockIdx.x; col < ncols; col += gridDim.x) {
+    const long long e = lv.e(ncols);
+    for (long long col = lv.b() + blockIdx.x; col < e; col += gridDim.x) {
         stage_tile<NX, NY, NZ, 1>(bank, col, ncols, PlainK<C>{y, G::NK});
         for (int l = threadIdx.x; l < NY * NZ; l += blockDim.x) {
             C* p = bank + G::plane_at(l);
@@ -418,6 +460,7 @@ __device__ void column_pass(C* bank, C* y, long long ncols, const Mid& mid, cons
         transform3<NX, NY, NZ, 1, Arch, cufftdx::fft_direction::forward>(bank);
         store_tile<NX, NY, NZ, 1>(bank, col, ncols, st);
     }
+    zero_dead<G::NK, C>(ncols, lv, st);
 }
 
 // Pencil pass, columns independent: per (ky, kz, col) the x-line in registers,
@@ -426,11 +469,11 @@ __device__ void column_pass(C* bank, C* y, long long ncols, const Mid& mid, cons
 // a multiplying mid is the first half of a convolution; with a scaling mid, a pass's last axis.
 template <int NX, int NY, int NZ, int Arch, bool CONV, cufftdx::fft_direction Dir, class C, class Mid,
           class Store>
-__device__ void pencil_pass(C* y, long long ncols, const Mid& mid, const Store& st) {
-    const long long total = (long long)NY * NZ * ncols;
+__device__ void pencil_pass(C* y, long long ncols, const Mid& mid, const Store& st, const Live& lv = Live{}) {
+    const long long b = lv.b(), n = lv.e(ncols) - b, total = (long long)NY * NZ * n;
     for (long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x; i < total;
          i += (long long)gridDim.x * blockDim.x) {
-        const long long p = i / ncols, col = i % ncols;
+        const long long p = i / n, col = b + i % n;
         C v[NX];
 #pragma unroll
         for (int kx = 0; kx < NX; ++kx) v[kx] = y[((long long)kx * NY * NZ + p) * ncols + col];
@@ -447,10 +490,11 @@ __device__ void pencil_pass(C* y, long long ncols, const Mid& mid, const Store& 
 #pragma unroll
         for (int kx = 0; kx < NX; ++kx) st.put(int(kx * NY * NZ + p), col, v[kx]);
     }
+    zero_dead<NX * NY * NZ, C>(ncols, lv, st);
 }
 template <int NX, int NY, int NZ, int Arch, bool CONV, cufftdx::fft_direction Dir, class C, class Mid>
-__device__ void pencil_pass(C* y, long long ncols, const Mid& mid) {
-    pencil_pass<NX, NY, NZ, Arch, CONV, Dir>(y, ncols, mid, Plain<C>{y, ncols});
+__device__ void pencil_pass(C* y, long long ncols, const Mid& mid, const Live& lv = Live{}) {
+    pencil_pass<NX, NY, NZ, Arch, CONV, Dir>(y, ncols, mid, Plain<C>{y, ncols}, lv);
 }
 
 // Group pencil pass (a Mid that mixes GROUP columns, e.g. the Lorentz vertex sum over a spin group,
@@ -463,15 +507,19 @@ __device__ void pencil_pass(C* y, long long ncols, const Mid& mid) {
 // mid.finish(p, inst, member, live, v) stores the line.  A block-wide stage of the group's values
 // held one block of 2-8 warps per SM on 16^3-20^3 grids (sandbox claims 3077, 3080).
 template <int NX, int NY, int NZ, int Arch, int GROUP, int NT, class C, class Mid>
-__device__ void pencil_group_warp_pass(const C* y, long long ncols, long long n_inst, const Mid& mid) {
+__device__ void pencil_group_warp_pass(const C* y, long long ncols, long long n_inst, const Mid& mid,
+                                       const Live& lv = Live{}) {   // lv in instances
     static_assert(kWarp % GROUP == 0 && NT % kWarp == 0, "a group's columns share one warp");
     constexpr int CPB = NT / GROUP;
     constexpr long long PL = (long long)NY * NZ;
     const int member = (int)(threadIdx.x % GROUP), base = (int)(threadIdx.x % kWarp) - member;
-    const long long nit = (n_inst + CPB - 1) / CPB;
+    // Work items over the live instances [lo, hi) only (a skip inside the loop spilled the vertex
+    // pencil); which lanes share a warp does not change an instance's arithmetic.
+    const long long lo = lv.b(), hi = lv.e(n_inst);
+    const long long nit = (hi - lo + CPB - 1) / CPB;
     for (long long w = blockIdx.x; w < PL * nit; w += gridDim.x) {
-        const long long p = w / nit, inst = (w % nit) * CPB + threadIdx.x / GROUP;
-        const bool live = inst < n_inst;
+        const long long p = w / nit, inst = lo + (w % nit) * CPB + threadIdx.x / GROUP;
+        const bool live = inst < hi;
         const long long col = inst * GROUP + member;
         C v[NX];
 #pragma unroll

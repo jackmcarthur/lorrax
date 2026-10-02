@@ -683,10 +683,10 @@ The modes of the one handler file. The target column is the string
 | 5 kminor fft | `kfft_kminor` | `Y = s·FFT^±_k X` | `(rows, N_k)` | the k-box stage (single arm) |
 | 6 plane | `kconv_plane` | mode 0 on the identity plan, loaded from the route-G D-plane FFT output: `P^X = conj(F·D^X)` with the Bloch phase `F[k,g,p]`, L = slots `[0, c)` and R = slots `[c, 2c)` of the `2c` axis, split on load | `D` `(N_k, g, ns, 2c, ns, p)`, `F` `(N_k, g, p)` → `U` `(N_k, c, g·p)` | 3 |
 | 7 klead unfold conv | `kconv_klead_unfold_xblock` | mode 2 on the typed unfold of the raw-parent Green, formed on load through `symmetry_maps.unfold_load_tables`: `Ĝ_k = U_k·[(mph_k·G_{row(k)}[lsrc_k, rsrc_k])·nph_k]·U_k†`, reading the partner `Gt` on an antiunitary row, or `conj(G)` when `conj_src = 1` | `G`, `Gt` `(n_parent, μ·ns, ν·ns)`, `V_R` `(N_k, μ, ν)`, `kout` `(N_k,)` → `U` `(n_out, ns, xn·bx, ns, ν)`: full-k row `k` stored at `kout[k]` (−1: transformed, not stored), block row `r` the local left centroid `(r / bx)·xs + x0 + r % bx` (`≥ μ`: a zero padding row; `bx = 0` stores all); a pass reads only its own pairs' sources, so x blocks read `G` and `W` once in all | the k-box stage: `ns²` columns per pair |
-| 8 klead lorentz conv | `kconv_klead_lorentz_conj` | mode 7's load, then the four-current vertex sum in R space: `U = mult·s_f·FFT_k Σ_{A,B} γ_A (s_g·IFFT_k Ĝ) γ_B† ∘ V_R[k, x, A, y, B]`, `γ` signed spin permutations (attributes); one transform of `Ĝ` serves every block | `G`, `Gt` as mode 7, `V_R` `(N_k, μ, n_A, ν, n_B)`, `n_A, n_B ≤ 4` → `U` `(n_out, ns, μ, ns, ν)` through `kout` | the k-box stage: tiles of whole `ns²` spin groups |
+| 8 klead lorentz conv | `kconv_klead_lorentz_wparent` | mode 7's load, then the four-current vertex sum in R space: `U = mult·s_f·FFT_k Σ_{A,B} γ_A (s_g·IFFT_k Ĝ) γ_B† ∘ V_R[k, x, A, y, B]`, `γ` signed spin permutations (attributes); one transform of `Ĝ` serves every block | `G`, `Gt` as mode 7, `V_R` `(N_k, μ, n_A, ν, n_B)`, `n_A, n_B ≤ 4` → `U` `(n_out, ns, μ, ns, ν)` through `kout` | the k-box stage: tiles of whole `ns²` spin groups |
 | 9 klead unfold fft | `kfft_klead_unfold` | `Y_k = s·IFFT_k(L_k·Ô_k·R_k†)`, `Ô_k` the gathered, phased wedge tile of an interaction (partner tile on an antiunitary row, or its conjugate when `conj_trs = 1`), `L`, `R` the endpoint actions: the R-space operand modes 2, 7 and 8 take | `W`, `Wt` `(n_wedge, μ·n_l, ν·n_r)`, `spin_l` `(N_k, n_l, n_l)`, `spin_r` `(N_k, n_r, n_r)`, `n_l, n_r ≤ 4` → `Y` `(N_k, μ·n_l, ν·n_r)` | the k-box stage (single arm): tiles of whole `n_l·n_r` groups, else single columns |
 | 10 plane fft gather | `plane_fft_gather` | the route-G plane transform, gathered on load ([below](#plane-fft-with-gather-on-load-mode-10)) | `F` `(A, S, …, n_col)` → `Y` `(A, n_pg, …, n_b, n_c)` | whole planes |
-| 11 klead chi unfold | `kconv_chi_unfold` | one τ node of χ₀: `acc[o] += α_o Σ_ab conj(s_i·IFFT_k Ĝ^c)_ab · (s_i·IFFT_k Ĝ^v)_ab` (+ its conjugate when `complete`), `Ĝ^{v,c}` mode 7's typed unfold of each Green; the forward transform follows the τ sum | `Gv`, `Gvt`, `Gc`, `Gct` `(n_parent, μ·ns, ν·ns)`, `α` `(n_out,)` → `acc` `(n_out, N_k, μ, ν)`, updated in place | the k-box stage: `2ns²` columns per pair |
+| 11 klead chi unfold | `kconv_chi_unfold`, `kconv_chi_vertex` | one τ node of χ₀: `acc[o] += α_o Σ_ab conj(s_i·IFFT_k Ĝ^c)_ab · (s_i·IFFT_k Ĝ^v)_ab` (+ its conjugate when `complete`), `Ĝ^{v,c}` mode 7's typed unfold of each Green; the forward transform follows the τ sum | `Gv`, `Gvt`, `Gc`, `Gct` `(n_parent, μ·ns, ν·ns)`, `α` `(n_out,)` → `acc` `(n_out, N_k, μ, ν)`, updated in place | the k-box stage: `2ns²` columns per pair |
 
 - **Flat k** is C order, with `kz` fastest.
 - **Dtype.** Modes 2–5 take all-complex128 or all-complex64 operands (the
@@ -709,12 +709,13 @@ The modes of the one handler file. The target column is the string
   and the device's opt-in shared memory; a mode supplies its Load, Mid and
   Store. Modes 2 and 3 stage whole columns in padded shared memory, or, where
   two columns do not fit a block, run plane and pencil passes through the
-  output in place. Modes 4 and 5 (k-minor) and mode 9 run the single arm
-  only, with one-column tiles as the floor (a column above the opt-in memory
-  refuses, `GATE mathdx-kconv-kbox-residency`): modes 4/5 load each column's
-  k run and store k fastest (mode 4's `out_layout=1` rows fastest); mode 9
-  takes tiles of whole `n_l·n_r` groups when one fits (the pair's sources
-  read once, as mode 7's grouped load) and single columns otherwise. Mode 8
+  output in place. Modes 4 and 5 (k-minor) run the single arm only, with
+  one-column tiles as the floor (a column above the opt-in memory refuses,
+  `GATE mathdx-kconv-kbox-residency`), load each column's k run and store k
+  fastest (mode 4's `out_layout=1` rows fastest). Mode 9 takes tiles of whole
+  `n_l·n_r` groups when two columns fit a block (the pair's sources read
+  once, as mode 7's grouped load), else the split arm: the plane pass from
+  the load into `Y`, then the x pencil in place. Mode 8
   takes the single arm when a tile of whole `ns²` spin groups of padded columns fits: the
   unfolded Green as a direct Load, the vertex sum as a group Mid (one thread
   per `(k, pair)`, the resident kernel's; a per-member Mid measured
@@ -731,14 +732,29 @@ The modes of the one handler file. The target column is the string
   group, chunked over pairs through an `(N_k, chunk·2ns²)` intermediate that
   XLA's scratch allocator grants (at most `scratch_bytes`; the door's default
   is the smaller of one parent-Green tile and 1 GiB, with a one-pair
-  minimum; `chi_unfold_scratch_bytes` owns the policy and its pricing). Mode 7, single pass only: `tr` whole pairs (the
+  minimum; `chi_unfold_scratch_bytes` owns the policy and its pricing). Mode 7, single pass: `tr` whole pairs (the
   `d²` columns of a stored spin block) per block, `kbox_plan(group = d²,
   transforms = 2, min_tr = 1)`, gathered on load through the typed unfold,
   inverse transform, `W_R[k, x, y]` in the Mid, forward transform, the scaled
   store through `kout` (Fe 8³ at `ns = 2`: 2 pairs, 512 threads, 73.9 KB, two
   blocks per SM). Where one pair does not fit, the tile counts columns and
-  each column forms its own element; where one padded column does not fit,
-  the build refuses (`GATE mathdx-kconv-kbox-residency`).
+  each column forms its own element. Where a block cannot hold a group of
+  two or more columns, a split arm through `≤ 1 GiB` chunks of pairs: the
+  gather plane pass (tiles of the most whole groups the opt-in memory holds),
+  then, when one padded column fits a block (20³: 134 of 163 KB), the
+  column-resident pass on a k-minor intermediate (x pencil and `W_R`,
+  forward z, y, x, the store), else the x pencil and `W_R`, the forward plane
+  and the x pencil and store (as modes 2/3). Each pass is its own entry point
+  of one program at its own register budget; the same lines in the same axis
+  order: bitwise. A plane tile above the opt-in memory refuses (`GATE
+  mathdx-kconv-kbox-residency`).
+- **Padded passes (modes 7, 8, 9 and 11).** A scan over row passes padded
+  to the largest passes the optional last operand `live` (s32 `[2]`): the
+  call's live left rows `[lo, hi)`. Every pass runs over the live columns only
+  (no gather, no transform outside); the pass that stores the output writes
+  the other rows as zeros (modes 7, 8, 9), and mode 11 adds nothing to them.
+  A call with `live` builds its own program; without it the bounds fold away
+  at compile time. `live = [0, rows)` is bitwise to the call without it.
 - **The tile-table load (modes 7 and 11, sm_80+).** Where the register load
   cannot keep two blocks resident (its live `g`, `U`, `Ur` are `12·ns²`
   registers: 192 at `ns = 4`, 48 at `ns = 2`, which already runs three
