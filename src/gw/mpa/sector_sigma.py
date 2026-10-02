@@ -259,8 +259,8 @@ def sector_node(left, right, keys, meta, mesh_xy, w_tables, band_axis, *, static
     from gw.greens_function_kernel import (build_G_parents, _weighted_tau_phases,
                                            has_antiunitary_rows)
     from symmetry_maps import device_load_tables
-    from gw.subtile_stream import (orbit_cuts, plan_windows, scan_passes, window_load,
-                                   window_rows, window_tables)
+    from gw.subtile_stream import (orbit_cuts, plan_windows, scan_passes, window_green_rows,
+                                   window_load, window_rows, window_tables)
 
     a, b = left.green_parent, right.green_parent
     plans = a.plan, b.plan
@@ -338,13 +338,13 @@ def sector_node(left, right, keys, meta, mesh_xy, w_tables, band_axis, *, static
             return project.accumulate((jnp.conj(left_p), yn), sigma, acc=acc)
         W, Wt = interactions.W, interactions.partner
         if whole:
-            return finish(one_pass(zero, W, Wt, xn, xr, g_load, w_load))
+            return finish(one_pass(zero, W, Wt, window_green_rows(xn, mesh_xy), xr, g_load, w_load))
 
         def step(s, lo, hi, acc):
             # The pass's window: W's and the ψ rows, the projection rows zeroed
             # outside the live rows, and the tables cut there.
             return one_pass(acc, *(window_rows(w, mesh_xy, s, R, axis=1, spec=w_spec) for w in (W, Wt)),
-                            window_rows(xn, mesh_xy, s, R, axis=2),
+                            window_green_rows(xn, mesh_xy, s, R),
                             window_rows(xr, mesh_xy, s, R, axis=3, live=(lo, hi)),
                             window_load(g_load, mesh_xy, s, lo, hi, R, ns),
                             window_load(w_load, mesh_xy, s, lo, hi, R, n_a))
@@ -360,10 +360,13 @@ def sector_node(left, right, keys, meta, mesh_xy, w_tables, band_axis, *, static
 
 @lru_cache(maxsize=None)
 def _place_left(mesh_xy):
-    """``subtile_stream.band_complete``'s rows and ``projection_complete``'s left operand."""
+    """``subtile_stream.green_rows`` (μ-major) and ``projection_complete``'s left operand."""
+    from gw.subtile_stream import green_rows
+
     @jax.jit
     def place(xn, xr):
-        return (jax.lax.with_sharding_constraint(xn, NamedSharding(mesh_xy, P(None, None, 'x', None))),
+        rows = jax.lax.with_sharding_constraint(xn, NamedSharding(mesh_xy, P(None, None, 'x', None)))
+        return (green_rows(rows, mesh_xy),
                 jax.lax.with_sharding_constraint(xr, NamedSharding(mesh_xy, P(None, None, None, 'x'))))
     return place
 
@@ -382,8 +385,8 @@ def _place_right(mesh_xy):
 
 
 def sector_left_operands(family, band_axis, mesh_xy):
-    """A node's left operands ``(xn, xr)``, placed once per Σ call: band-complete ψ rows and
-    the projector's left face, padded to ``band_axis``."""
+    """A node's left operands ``(xn, xr)``, placed once per Σ call: band-complete ψ rows,
+    μ-major (``subtile_stream.green_rows``), and the projector's left face, padded to ``band_axis``."""
     xn, _, xr, _, _, _ = parent_sigma_operands(family)
     return _place_left(mesh_xy)(xn, pad_to_axis(xr, band_axis, axis=1))
 

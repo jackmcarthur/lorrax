@@ -231,17 +231,18 @@ _NO_BRACKETS = None
 def sigma_subtile_operands(psi_coh_xn, psi_coh_yr, psi_proj_xr, psi_proj_yn, *, mesh_xy):
     """The Σ τ operands as the sub-tile kernel reads them, placed once per Σ call.
 
-    The Green faces become band-complete rows (``gw.subtile_stream.band_complete``)
-    and the projection faces the axis projector's operands
-    (``subtile_stream.projection_complete``): one exchange here, none in any τ
-    node.  :func:`_sigma_subtile_kernel` states the same placements, so face
-    operands are also accepted (they are then placed inside the window).
+    The Green faces become band-complete rows, the left ones μ-major
+    (``gw.subtile_stream.green_rows``), and the projection faces the axis
+    projector's operands (``subtile_stream.projection_complete``): one exchange
+    here, none in any τ node.  :func:`_sigma_subtile_kernel` reads its left
+    Green rows in this order.
     """
-    from .subtile_stream import band_complete, projection_complete
+    from .subtile_stream import band_complete, green_rows, projection_complete
 
     @jax.jit
     def place(xn, yr, xr, yn):
-        return (*band_complete(xn, yr, mesh_xy), *projection_complete(xr, yn, mesh_xy))
+        rows, cols = band_complete(xn, yr, mesh_xy)
+        return (green_rows(rows, mesh_xy), cols, *projection_complete(xr, yn, mesh_xy))
     return place(psi_coh_xn, psi_coh_yr, psi_proj_xr, psi_proj_yn)
 
 
@@ -286,8 +287,9 @@ def _sigma_subtile_kernel(*, mesh_xy, kgrid, brackets, face_shape, face_band_ext
     from distrib_la import gemm_plan
     from runtime.tiles import TILE_BYTES
     from .greens_function_kernel import build_G_tau, green_right_operand, has_antiunitary_rows
-    from .subtile_stream import (band_complete, orbit_cuts, plan_windows, projection_complete,
-                                 scan_passes, window_load, window_rows, window_tables)
+    from .subtile_stream import (GREEN_ROWS_SPEC, orbit_cuts, plan_windows, projection_complete,
+                                 scan_passes, window_green_rows, window_load, window_rows,
+                                 window_tables)
 
     kgrid = tuple(int(v) for v in kgrid)
     nk = int(np.prod(kgrid))
@@ -374,7 +376,10 @@ def _sigma_subtile_kernel(*, mesh_xy, kgrid, brackets, face_shape, face_band_ext
         if load is None or g_load is None:
             raise ValueError("Sigma tau: W on the q wedge and the Green door need their device "
                              "load tables (load, g_load = sigma_door_tables)")
-        rows_all, cols_all = band_complete(psi_coh_xn, psi_coh_yr, mesh_xy)
+        # The left Green rows arrive μ-major (sigma_subtile_operands); the columns band-complete.
+        rows_all = jax.lax.with_sharding_constraint(psi_coh_xn, NamedSharding(mesh_xy, GREEN_ROWS_SPEC))
+        cols_all = jax.lax.with_sharding_constraint(
+            psi_coh_yr, NamedSharding(mesh_xy, P(None, None, None, "y")))
         # conj(ψ) merged centroid-major: once per node, not once per row pass and bracket.
         g_right = green_right_operand(cols_all)
         left_all, right_all = projection_complete(psi_proj_xr, psi_proj_yn, mesh_xy)
@@ -424,14 +429,14 @@ def _sigma_subtile_kernel(*, mesh_xy, kgrid, brackets, face_shape, face_band_ext
 
         accs = (zero,) * len(selectors)
         if whole:
-            accs = one_pass(accs, W, Wt, rows, left, load, g_load)
+            accs = one_pass(accs, W, Wt, window_green_rows(rows, mesh_xy), left, load, g_load)
         else:
             def step(s, lo, hi, accs):
                 # The pass's window: W's and the ψ rows, the projection rows
                 # zeroed outside the live rows, and both tables cut there.
                 Wp, Wtp = (None if a is None else window_rows(a, mesh_xy, s, R, axis=1, spec=w_spec)
                            for a in (W, Wt))
-                return one_pass(accs, Wp, Wtp, window_rows(rows, mesh_xy, s, R, axis=2),
+                return one_pass(accs, Wp, Wtp, window_green_rows(rows, mesh_xy, s, R),
                                 window_rows(left, mesh_xy, s, R, axis=3, live=(lo, hi)),
                                 window_load(load, mesh_xy, s, lo, hi, R),
                                 window_load(g_load, mesh_xy, s, lo, hi, R, ns))

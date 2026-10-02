@@ -250,6 +250,31 @@ def window_rows(a, mesh, s, R, axis, spec=None, live=None):
                          check_vma=False)(a, s, lo, hi)
 
 
+#: The placement of :func:`green_rows`: μ on X, every spin and band local.
+GREEN_ROWS_SPEC = P(None, "x", None, None)
+
+
+def green_rows(psi_mun, mesh):
+    """A row-pass Green's band-complete ψ rows, μ-major ``(nk, μ, s, n)`` (placed once per call).
+
+    A window of μ rows is then one contiguous block, sliced in place by a
+    scanned pass (:func:`window_green_rows`).  Spin-major rows ``(nk, s, μ, n)``
+    make XLA lay the scan's loop state out μ-major, a transpose of the whole
+    operand per call (1.38 GB per rank at the Fe/Ni 20³ P64-local Σ tile).
+    """
+    return jax.lax.with_sharding_constraint(jnp.transpose(psi_mun, (0, 2, 1, 3)),
+                                            NamedSharding(mesh, GREEN_ROWS_SPEC))
+
+
+def window_green_rows(rows, mesh, s=None, R=None):
+    """:func:`green_rows`' window ``[s, s + R)`` (every row when ``s`` is None) in the Green
+    build's order ``(nk, s, μ, n)``: the transpose cancels against the build's
+    centroid-major merge (``common.contract_bands.merge_spin_centroid``)."""
+    if s is not None:
+        rows = window_rows(rows, mesh, s, R, axis=1, spec=GREEN_ROWS_SPEC)
+    return jnp.transpose(rows, (0, 2, 1, 3))
+
+
 def scan_passes(windows, step, carry):
     """``carry = step(s, lo, hi, carry)`` over every window (:func:`plan_windows`) in one ``lax.scan``.
 

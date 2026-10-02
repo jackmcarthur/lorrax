@@ -435,7 +435,8 @@ def _make_cohsex_kernels_face(mesh_xy: Mesh, face_shape, _convolve,
         from ffi import _services
         _services.ensure_on_path()
         from symmetry_maps import unfold_file_wedge_band_operator
-        from .ppm_tau_kernel import _get_sigma_kij_kernel, sigma_door_tables
+        from .ppm_tau_kernel import (_get_sigma_kij_kernel, sigma_door_tables,
+                                     sigma_subtile_operands)
         _sym = k_unfold_plan.sym
         _face_shape = tuple(int(v) for v in face_shape)
 
@@ -443,7 +444,9 @@ def _make_cohsex_kernels_face(mesh_xy: Mesh, face_shape, _convolve,
             """Σ on the parent rows (one static node), unfolded to the wedge's band operator."""
             from .wavefunction_bundle import parent_sigma_operands
             g_mun, g_nmu, proj_nmu, proj_mun, _, _ = parent_sigma_operands(wfns)
-            proj_nmu, proj_mun = _windowed(proj_nmu, proj_mun)
+            # The kernel's operands, placed as the Σ τ sweep places them.
+            g_mun, g_nmu, proj_nmu, proj_mun = sigma_subtile_operands(
+                g_mun, g_nmu, *_windowed(proj_nmu, proj_mun), mesh_xy=mesh_xy)
             kernel = _get_sigma_kij_kernel(
                 mesh_xy=mesh_xy, kgrid=kgrid, merged_x=True, layout=layout,
                 face_shape=_face_shape, face_band_extent=band_extent,
