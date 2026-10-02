@@ -310,7 +310,6 @@ _COMPILE_KV_NS = "lorrax/compile_agreement/v2"
 # 57927048.48): rank 0 refused, tore down, and hung in a collective H5Fclose
 # while its peers were still fitting.  A deadline turned skew into a hang.
 _COMPILE_AGREEMENT_TIMEOUT_DEFAULT_S = 0.0
-_AGREEMENT_HEARTBEAT_S = 60.0
 
 
 def _deadline_text(timeout_s: float) -> str:
@@ -334,38 +333,9 @@ def _agreement_deadline_env(name: str, default: float) -> float:
     return value
 
 
-def _is_wait_timeout(exc: BaseException) -> bool:
-    text = str(exc).upper()
-    return (isinstance(exc, TimeoutError) or "DEADLINE" in text
-            or "TIMED OUT" in text or "TIMEOUT" in text)
-
-
-def _wait_for_key(client, key: str, timeout_s: float, *, what: str) -> bytes:
-    """Block on one coordination key; ``timeout_s <= 0`` waits without bound.
-
-    The wait is chunked so that every ``_AGREEMENT_HEARTBEAT_S`` a line names
-    what this rank is still waiting for.  Only the client's own wait timeout
-    is retried; any other failure propagates.
-    """
-    t0 = time.monotonic()
-    while True:
-        waited = time.monotonic() - t0
-        chunk_s = _AGREEMENT_HEARTBEAT_S
-        if timeout_s > 0:
-            chunk_s = min(chunk_s, timeout_s - waited)
-            if chunk_s <= 0:
-                raise TimeoutError(
-                    f"{what}: not within {timeout_s:g} seconds")
-        try:
-            return client.blocking_key_value_get_bytes(
-                key, max(1, int(chunk_s * 1000)))
-        except Exception as exc:                            # noqa: BLE001
-            waited = time.monotonic() - t0
-            if not _is_wait_timeout(exc) or (
-                    timeout_s > 0 and waited >= timeout_s):
-                raise
-            _say(f"compile agreement: still waiting for {what} "
-                 f"({waited:.0f} s elapsed)")
+def _timeout_ms(timeout_s: float) -> int:
+    """A deadline in seconds as the control plane's milliseconds (0 = none)."""
+    return max(1, int(round(timeout_s * 1000))) if timeout_s > 0 else 0
 
 # Parallel page-cache prefetch of the agreed entries (see _prefetch_agreed).
 # ON: at 606 centroids / P=16 the SERIAL reads of 169 entries cost 29 s on one
@@ -1487,18 +1457,22 @@ def _decode_compile_record(payload: bytes, rank: int) -> dict:
 
 def _snapshot_compile_records(client, prefix: str, n_proc: int,
                               local_rank: int, local_record: dict) -> list:
-    """Best-effort all-rank snapshot for a bounded-time refusal message."""
+    """Best-effort all-rank snapshot (one directory get) for a refusal."""
+    from ffi.common.broadcast import rank_records
+
     records: list[dict | None] = [None] * n_proc
-    records[local_rank] = local_record
-    for rank in range(n_proc):
-        if records[rank] is not None:
+    try:
+        payloads = rank_records(client, prefix, n_proc)
+    except Exception:                                      # noqa: BLE001
+        payloads = [None] * n_proc
+    for rank, payload in enumerate(payloads):
+        if payload is None:
             continue
         try:
-            payload = client.blocking_key_value_get_bytes(
-                f"{prefix}/rank/{rank}", 1)
             records[rank] = _decode_compile_record(payload, rank)
         except Exception:                                  # noqa: BLE001
             pass
+    records[local_rank] = local_record
     return records
 
 
@@ -1534,6 +1508,9 @@ def _agree_before_module_compile(module_name: str, key: str, occurrence: int,
                                  proc_idx: int | None = None,
                                  timeout_s: float | None = None) -> None:
     """Exchange one compile fingerprint and refuse divergence or absence."""
+    from ffi.common.broadcast import (
+        collect_rank_records, publish_rank_record, wait_for_key)
+
     s = _STATE
     client = s._compile_client if client is None else client
     n_proc = int(s.n_proc if n_proc is None else n_proc)
@@ -1547,36 +1524,25 @@ def _agree_before_module_compile(module_name: str, key: str, occurrence: int,
         "occurrence": occurrence,
         "key": key,
     }
-    client.key_value_set_bytes(
-        f"{prefix}/rank/{proc_idx}",
-        json.dumps(record, sort_keys=True).encode("utf-8"))
-
     t0 = time.monotonic()
+    publish_rank_record(client, prefix, proc_idx, n_proc,
+                        json.dumps(record, sort_keys=True).encode("utf-8"))
     if proc_idx == 0:
-        records: list[dict | None] = [None] * n_proc
-        records[0] = record
         reason = ""
-        for rank in range(1, n_proc):
-            remaining_s = (timeout_s - (time.monotonic() - t0)
-                           if timeout_s > 0 else 0.0)
-            if timeout_s > 0 and remaining_s <= 0:
-                reason = f"deadline expired after {timeout_s:g} seconds"
-                break
-            try:
-                payload = _wait_for_key(
-                    client, f"{prefix}/rank/{rank}", remaining_s,
-                    what=f"rank {rank} to reach the {module_name} compile")
-                records[rank] = _decode_compile_record(payload, rank)
-            except Exception as exc:                        # noqa: BLE001
-                reason = (
-                    f"rank {rank} did not arrive within {timeout_s:g} "
-                    f"seconds ({type(exc).__name__})")
-                break
-        if any(item is None for item in records):
+        try:
+            payloads = collect_rank_records(
+                client, prefix, n_proc, _timeout_ms(timeout_s),
+                what=f"every rank to reach the {module_name} compile")
+            records = [_decode_compile_record(payload, rank)
+                       for rank, payload in enumerate(payloads)]
+        except Exception as exc:                            # noqa: BLE001
             records = _snapshot_compile_records(
                 client, prefix, n_proc, proc_idx, record)
-            if not reason:
-                reason = f"deadline expired after {timeout_s:g} seconds"
+            missing = [rank for rank, item in enumerate(records)
+                       if item is None]
+            reason = (
+                f"rank(s) {missing} did not arrive within {timeout_s:g} "
+                f"seconds ({type(exc).__name__})")
         keys = {item["key"] for item in records if item is not None}
         modules = {item.get("module") for item in records if item is not None}
         passed = len(records) == n_proc and None not in records \
@@ -1604,8 +1570,8 @@ def _agree_before_module_compile(module_name: str, key: str, occurrence: int,
         handoff_s = min(2.0, max(0.1, timeout_s * 0.1))
         peer_wait_s = 2.0 * timeout_s + handoff_s if timeout_s > 0 else 0.0
         try:
-            payload = _wait_for_key(
-                client, f"{prefix}/verdict", peer_wait_s,
+            payload = wait_for_key(
+                client, f"{prefix}/verdict", _timeout_ms(peer_wait_s),
                 what=f"rank 0's verdict on the {module_name} compile")
             verdict = json.loads(payload.decode("utf-8"))
         except Exception as exc:                            # noqa: BLE001
