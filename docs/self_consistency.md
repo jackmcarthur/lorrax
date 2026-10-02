@@ -1,676 +1,797 @@
 # Self-consistent GW (QSGW)
 
-`qp_solver = self_consistent` finds the quasiparticle self-consistent GW fixed
-point by accelerating the GW map with one-evaluation Anderson mixing. This page
-covers the map, how each band is treated, the acceleration and its stop rules,
-and the Σ grid and quadrature across maps. Other pages own the production
-recipe and its error budget ([production QSGW](how-to/production-qsgw.md)),
-the deck keys and defaults ([input reference](input_reference.md)),
-metallic occupations and heads
-([metallic MPA screening §6–7](theory/metallic-mpa-screening.md)), the Σ(ω)
-rules ([the Σ(ω) quadrature problem](theory/sigma-quadrature-problem.md)) and
-the Hartree rebuild ([direct Hartree field](theory/hartree.md)).
+This page explains how LORRAX solves quasiparticle self-consistent GW (QSGW)
+when a deck sets `qp_solver = self_consistent`. It covers what one iteration
+computes, how each band is treated, how the q → 0 head follows the iteration,
+how the Σ(ω) frequency grid is held, how iterates are mixed and judged
+converged, and what the run writes and how it restarts. It assumes GW and the
+ISDF formulation; read [production QSGW](how-to/production-qsgw.md) first for
+the recipe and its error budget, and the [input reference](input_reference.md)
+for every key named here.
 
-## 1 The map
+Other pages own the neighbouring material: the Σ(ω) quadrature rules
+([the Σ(ω) quadrature problem](theory/sigma-quadrature-problem.md)), the
+shared-pole W ([theory](theory/shared-pole-w-model.md),
+[implementation](architecture/shared_pole_model.md)), the metallic head
+([the metallic q → 0 head](theory/metal-q0-head.md)) and the Hartree rebuild
+([direct Hartree field](theory/hartree.md)).
 
-The carry is the QP Hamiltonian in the fixed DFT basis, $H_k$ of shape
-`(nk, nb, nb)`. It spans the Σ band window `[b0, b3)`, the `nval + ncond`
-bands, on the loop's k-set. One map $F: H \to H'$ does five things:
+**Notation.** $k$ runs over the loop's k-set (§1) and $m, n$ over bands.
+$E^{\rm DFT}_{nk}$ and $\psi^{\rm DFT}_{nk}$ are the DFT eigenpairs read from
+`WFN.h5`. The Σ band window is $[b_0, b_3)$ with $N_b = b_3 - b_0$ bands; the
+loop requires $b_0 = 0$ because its occupations count electrons from band 0.
+$\mu$ is the Fermi level of the current map. Energies are in Ry inside the
+code and in eV in decks and logs.
 
-1. diagonalize $H_k = U_k\,\mathrm{diag}(E_k)\,U_k^\dagger$;
-2. rotate the original DFT orbitals by $U$. There is no cumulative product,
-   so there is no drift;
-3. rebuild $V_H$ from the rotated occupied orbitals (`density_self_consistent`,
-   which is true whenever the key is omitted);
-4. build $\chi_0 \to W \to \Sigma_c(\omega)$ with the configured Σ scheme
-   (`sigma_dispatch.compute_sigma_xc`);
-5. form the static Hermitian QSGW operator (`qsgw_utils.build_qsgw_sigma_xc`)
+## 1 The map {#1-the-map}
+
+QSGW replaces the energy-dependent self-energy $\Sigma(\omega)$ by a static
+Hermitian operator built from it, and looks for the Hamiltonian that
+reproduces itself. LORRAX carries that Hamiltonian in the fixed DFT basis,
 
 $$
-\Sigma^{\rm QSGW}_{ij}(k) = \tfrac12\,\mathrm{herm}\!\left[\Sigma_{ij}(k,E_{ik}) + \Sigma_{ij}(k,E_{jk})\right],
-\qquad \Sigma = \Sigma_x + \Sigma_c ,
+H_{k,mn} = \langle \psi^{\rm DFT}_{mk} | H | \psi^{\rm DFT}_{nk} \rangle ,
+\qquad H:\ (n_k, N_b, N_b)\ \text{complex}.
 $$
 
-   rotate it to the DFT basis, and set
-   $H' = T + V_{\rm ion} + V_H + \Sigma^{\rm QSGW}$ under the band treatment
-   of §2.
+A fixed basis gives every iterate the same coordinates, so differences and
+linear combinations of iterates, which the mixer forms (§5), are meaningful.
+Each state keeps a DFT label: the DFT band it came from, assigned on every map
+by overlap (§5), never by sorted position.
 
-$F$ is a pure function of $H$: re-evaluating the same input returns a
-bitwise-identical output (CLAIMS 2678). Every evaluated pair
-$(H, F(H) - H)$ is therefore valid secant data. Map 0 takes $U = I$ exactly
-instead of calling `eigh` on $\mathrm{diag}(E_{\rm DFT})$, so SC map 0 equals the
-one-shot G0W0 bit for bit. Each
-map costs one full $\chi_0 \to W \to \Sigma$ evaluation. Σ rule planning is
-paid on map 0 (the one-shot plan) and map 1 (the held plan), and after that
-only for a window a state crosses (§4).
+One map $F: H \mapsto H'$ (`sc_iteration.gw_iteration_map`) does six things:
 
-The loop is driven by eqp0, which is Σ at the current energies. No Z-factor
-enters the iteration.
+1. Diagonalize $H_k = U_k\,\mathrm{diag}(E_k)\,U_k^\dagger$, with
+   $U_{k,mn} = \langle \psi^{\rm DFT}_m | \psi^{\rm QP}_n \rangle$.
+2. Rotate the DFT orbitals of $[b_0, b_3)$:
+   $\psi^{\rm QP}_n = \sum_m U_{mn}\,\psi^{\rm DFT}_m$. The rotation always
+   starts from the DFT orbitals, so no product of rotations accumulates
+   round-off.
+3. Solve the occupations of the new spectrum (μ, below) and rebuild the
+   Hartree potential $V_H$ from the rotated occupied orbitals.
+   `density_self_consistent` is on by default under `self_consistent`. An
+   explicit `false` keeps the DFT $V_H$ as an announced comparison mode, and a
+   bispinor deck refuses it, because the Dirac current changes with the
+   orbitals as the charge does.
+4. Build $\chi_0 \to W \to \Sigma_c(\omega)$ and $\Sigma_x$ from the rotated
+   orbitals and energies through the run's screening and Σ route
+   (`sigma_dispatch.compute_sigma_xc`).
+5. Form the QSGW operator in the QP basis
+   (`qsgw_utils.build_qsgw_sigma_xc`):
 
-An SC run's `eqp0.dat` and `eqp1.dat` hold the SC eigenvalues: the accepted
-map's output $\mathrm{eigvalsh}\,F(H_{\rm in})$, with its tail scissor and
-semicore pin, sorted per k. Both files equal the body of that map's
-`eqp0_iterNNNN.dat` bit for bit; the header says so. No fixed-DFT-state
-diagonal and no Z-linearization reach them, and `sigma_mnk.h5` carries no eqp
-receipt: `python -m gw.eqp_bgw` refuses an SC file by name
-(`eqp_bgw_self_consistent_run`). The gap report reads the same array. `WFN_qp.h5`, `qp_wfn_rotations.h5` and `dipole_qsgw.h5` carry the
-accepted map's input QP states, the basis its Σ, W and head were built in;
-they agree with the eqp files to `sc_tol_ev` on the non-scissored states.
+   $$
+   \Sigma^{\rm QSGW}_{ij}(k) = \tfrac12\big[\Sigma_{ij}(k, \tilde E_{ik})
+   + \Sigma_{ij}(k, \tilde E_{jk})\big]^{\rm h},
+   \qquad \Sigma = \Sigma_x + \Sigma_c ,
+   $$
 
-With `sc_on_ibz = true` (the default), $H$, $E$, $U$, every retained k-indexed
-`SigmaResult` table and the density-SC Hartree components carry the star
-wedge. The full BZ exists only inside a map, while the k-grid FFT builds Σ.
-One seam at the map boundary selects the retained result together with its
-defining $U$.
+   where $[\cdot]^{\rm h}$ is the Hermitian part, $\Sigma(\tilde E)$ is read by
+   linear interpolation on the sampled ω grid (§4), and $\tilde E$ is the
+   state's current energy (a pinned semicore state reads at its DFT energy,
+   §2).
+6. Rotate back and set
+   $H' = T + V_{\rm ion} + V_H + U\,\Sigma^{\rm QSGW}U^\dagger$, where
+   $T + V_{\rm ion}$ is the `kin_ion.h5` operator; then apply the frozen-core
+   and semicore blocks of §2.
+
+No Z-factor enters the iteration. Σ is read at the current energies, which at
+the fixed point are the QP energies, so the map's own output solves the QP
+equation there.
+
+**Fermi level.** On an insulator μ is the midgap of the current spectrum by
+band count; with `density_self_consistent` it is the level of the k-weighted
+step occupation (`efermi.fermi_level_step`). On a metal each map solves
+fixed-N Fermi–Dirac occupations of its own input spectrum (§7). μ is a
+function of H and is never mixed.
+
+**Purity.** $F$ reads only $H$ and quantities fixed for the run, so evaluating
+one $H$ twice returns the same $H'$ bit for bit, and every evaluated pair
+$(H, F(H) - H)$ is valid secant data for the mixer.
+
+**Map 0 is the one-shot.** The initial carry is $\mathrm{diag}(E^{\rm DFT})$.
+Map 0 takes $E = E^{\rm DFT}$ and $U = I$ exactly instead of diagonalizing,
+so it reproduces the one-shot calculation (`qp_solver = one_shot_dft`) bit for
+bit, and an SC run computes no separate one-shot. Diagonalizing would return
+the eigenvalues to about one ulp, re-sort them and pick an arbitrary gauge
+inside degenerate multiplets; the GN-PPM fit amplifies ulp noise in the
+energies (MoS2 3×3, +1 ulp on every energy: max $|\Delta\Sigma_c|$ = 1.28 eV).
+
+**k-sets.** With `sc_on_ibz = true` (the default) $H$, $E$, $U$ and the
+carried state live on the star wedge, one k per orbit of the symmetry group.
+Σ is a convolution over the k grid evaluated by FFT, so steps 2–5 run on the
+full grid; one seam at the end of the map
+(`sc_iteration._sc_output_tables_on_loop_kset`) selects the wedge rows of Σ
+together with the $U$ that defines their basis. Every k sum in the loop (the
+mixer's metric, the tail fit, the electron count) weights a wedge row by its
+star size.
+
+**Cost.** Each map costs one full $\chi_0 \to W \to \Sigma$ evaluation. One
+line per map, `SC map N stages (s)`, splits its wall into W response, Σ rule
+refit, Σ rule plan, Σ τ sweep, Σ exchange, Σ Hartree and the rest.
+
+## 2 Band treatment {#2-band-treatment}
+
+**The QP matrix** is $[b_0, b_3)$ with $b_3$ = nelec + `ncond`. Every state in
+it keeps its full Σ row and column and rotates among the others; no band
+above $b_3$ mixes into it. Two exclusive forms request it, and giving both
+refuses (`GATE band_request_forms`):
+
+- `number_bands_protected = N`: every occupied band plus conduction bands up
+  to N bands in total. It is resolved against the WFN to nval = the occupied
+  count and ncond = the rest.
+- `nval` / `ncond`: `ncond` sets $b_3$; `nval` sets the bottom of the ISDF
+  pair-density window and the semicore floor below.
+
+$b_3$ must lie inside the ζ fit's left band range
+(`gw_init.assert_qp_matrix_fitted`, `GATE qp_matrix_zeta_left`): a state
+outside it would carry Σ built on pair densities the fit never saw. $b_3$ is
+a convergence parameter; its measured error is in
+[production QSGW](how-to/production-qsgw.md#error-budget).
+
+Each band belongs to one class:
+
+| class | bands | on every map | reason |
+|---|---|---|---|
+| frozen core (opt-in) | the lowest `sc_frozen_core_bands` (default 0) | block held at $\mathrm{diag}(E^{\rm DFT})$ with no coupling to other bands; stays in every band sum | removes deep bands from the loop at no Σ cost |
+| semicore (coarse) | occupied states below the coarse floor (below) | full Σ row, read on held coarse windows at $\eta_{\rm semi}$ = 5 eV; with `sc_semicore = dft` its own block stays at DFT | keeps semicore mixing without stretching the deck-η grid to semicore depth |
+| protected | every other QP-matrix state | full Σ row, read at its own energy on the near grid at the deck η | the states the calculation is for |
+| scissored tail | $[b_3,$ `number_bands`$)$ | DFT orbitals; energies shifted rigidly by β each map; enter G and χ₀ only, with no Σ and no mixing | completes the band sums without the cost of rotating them |
+
+Production decks do not freeze semicore: a frozen block drops both the
+semicore correction and its mixing with the valence, and both matter on Fe
+3s/3p and the CrI3 I 5s levels. They use the semicore class instead.
+
+### The semicore class
+
+The class changes where a state's $\Sigma_c(\omega)$ is read, not which bands
+are counted. It is built once from the DFT ladder
+(`gw_init.coarse_class_for_deck`, `band_partition.semicore_floor`) and kept on
+`meta.coarse_class`:
+
+- Under `number_bands_protected`: every occupied band below a band gap of at
+  least 4 eV over all k (`band_partition.SEMICORE_GAP_EV`) that lies under the
+  requested bands within μ ± 10 eV; none when no such gap exists. That
+  request protects every occupied band, so the class needs its own boundary;
+  4 eV is 16 deck broadenings at the default η = 0.25 eV, so a coarse window
+  never reads a band the near grid resolves.
+- Under `nval` / `ncond`: every occupied state below the minimum energy of the
+  lowest requested valence band (nelec − nval at each k; `sigma_omega_min_ev`
+  can only lower the floor). The rule is on energy, so a coarse state inside
+  the near grid's lower pad reads the near grid.
+
+Only the MPA and shared-pole Σ, scalar or four-current sector, read coarse
+windows (`qp_support.semicore_patch_route`); a PPM or static Σ has no coarse
+class.
+
+**Coarse windows** (`qp_support.semicore_patches_ev`). The quadrature cost of
+a Σ window grows with bandwidth/η, so a deck-η grid stretched down to the
+semicore would multiply it. The semicore is instead read on windows of its
+own at $\eta_{\rm semi}$ = 5 eV (`qp_support.SEMICORE_ETA_EV`), sampled every
+$\eta_{\rm semi}/2$. There is one automatic window per coarse manifold
+(coarse levels separated by a gap wider than twice the 2 eV pad), padded 2 eV
+around the DFT energies, planned at map 0 and held; a coarse state whose read
+support leaves it extends it, and it never shrinks. `sigma_omega_patches_ev`
+`lo:hi:eta` triples (eV about $E_F$) are user windows: coarse states inside
+one read it at its own η. `GATE sigma_coarse_window` refuses a malformed,
+overlapping or sub-deck-η triple, and any triple in a run without a coarse
+class. The Σ rules certify coarse windows at
+max(`sigma_quadrature_eps`, 3e-3) (`qp_support.SEMICORE_EPS`): the crossing
+node count falls with $\ln(1/\epsilon)$, and the Fe 4³ coarse window takes
+188 nodes at 3e-3 against 253 at 1e-4. Adjacent automatic windows of one η
+share a rule window when that lowers the summed node count
+(`sigma_box_plan._coarse_runs`, decided at map 0 and held).
+
+The broadening is also what makes the semicore converge: at the deck η the Fe
+3s quasiparticle weight $Z$ leaves $(0, 1]$ from map 1 and the loop stalls,
+while at 5 eV every coarse $Z$ stays inside (one `SC semicore Z` line per
+map). Its cost is a systematic error reported apart from the 1 meV budget of
+the controllable errors: converged $E_F \pm 1$ eV std/max 3.6/15.9 meV on
+Fe 4³ (against $\eta_{\rm semi}$ = 1 eV) and 2.9/20.0 meV on MoS2 3×3
+(against the deck η).
+
+**Semicore pin** (`sc_semicore = dft`, the default). The pseudopotentials are
+fitted to DFT, so the semicore levels stay at their DFT energies while their
+mixing with the protected states is kept. With $P_S$ the projector on the
+coarse states' DFT orbitals (labels fixed at map 0), each map sets
+
+$$
+P_S H P_S = \mathrm{diag}(E^{\rm DFT}_s)
+$$
+
+(`sc_iteration._pin_semicore_block_to_dft`) and keeps every
+protected–semicore element. In step 5 of the map a QP state whose DFT label
+(§5) is a coarse label s reads Σ at $\tilde E = E^{\rm DFT}_s$, so its end of
+every $\Sigma^{\rm QSGW}_{ps}$ is $\Sigma_{ps}(E^{\rm DFT}_s)$ and the coarse
+windows, planned on DFT energies, never need to follow it. The semicore QP
+energies still move by the level repulsion of the kept mixing,
+$-\sum_p |H_{ps}|^2/(E_p - E_s)$ to second order. `sc_semicore = qp` lets the
+class move with its own Σ, read at its own QP energy. A run without a coarse
+class logs that there is nothing to pin.
+
+### The scissored tail
+
+Bands $[b_3,$ `number_bands`$)$ keep their DFT orbitals and take one rigid
+shift (`sc_iteration._fit_sum_band_tail`, `scissor.fit_scissor`):
+
+$$
+E_{nk} = E^{\rm DFT}_{nk} + \beta, \qquad
+\beta = \frac{\sum_{kn} w_k u_{nk}\,(E^{\rm QP}_{nk} - E^{\rm DFT}_{nk})}
+{\sum_{kn} w_k u_{nk}}, \qquad
+u_{nk} = \begin{cases} \min(Z_{nk}, Z_{nk}^{-1}) & Z_{nk} > 0 \\ 0 & Z_{nk} \le 0 \end{cases}
+$$
+
+The sum runs over the conduction states of the QP matrix whose Σ was read on
+the sampled grid. $w_k$ is the star weight and
+$Z_{nk} = (1 - \partial_\omega \mathrm{Re}\,\Sigma_{nn}(\omega)|_{E_{nk}})^{-1}$.
+
+- The tail is not in the rotated subspace, so it can only follow the
+  window's correction rigidly. The mean over every trusted conduction state,
+  rather than the lowest multiplet, keeps one localized band from setting it
+  (CrI3: the lowest multiplet moves +7.0 eV, the window mean +3.5 eV).
+- The weight $u$ keeps a state on a satellite or near a pole of Σ, which has
+  small $Z$, from dragging the tail. With
+  $s = \partial_\omega \mathrm{Re}\,\Sigma$, $u = Z$ for $s \le 0$, $1 - s$
+  for $0 < s < 1$ and 0 for $s \ge 1$, so $u$ is continuous in $s$ and the
+  map has no jump where a $Z$ crosses 1.
+- A state off the sampled grid is excluded, because its energy did not come
+  from its own $\Sigma(E)$.
+- $Z$ comes from the previous map and rides the carry (`SCState.tail_z_kn`),
+  because this map's Σ exists only after the tail has fed χ₀ and W. Map 0
+  uses unit weights. With no qualifying state the tail stays at $E^{\rm DFT}$
+  and the log says so.
+- On a metal the bands that cross $E_F$ enter neither the valence nor the
+  conduction class (`scissor.classify_scissor_bands`).
+
+### Degenerate multiplets
+
+$H$ keeps the full operator inside a degenerate multiplet. Averaging only the
+diagonal of a degenerate block would depend on the arbitrary basis inside it
+and break the symmetry of the next map. BerkeleyGW's degeneracy averaging
+(`no_degen_averaging`) applies only to reported diagonals.
+`sc_exact_degeneracy_tol_ev` (at most and by default 1e-4 eV) groups levels
+into multiplets for the label assignment of §5; it is not a convergence knob.
+
+## 3 The head and the velocity on each map
+
+The $q \to 0$ element (head) of $\chi_0$ and $W$ diverges like $1/q^2$ and
+cannot be sampled on a finite k grid; LORRAX completes it from the velocity
+matrix elements $v_{mn} = \langle m | i[H, r] | n \rangle$ and the energies.
+In QSGW the Hamiltonian changes, so its velocity changes. With
+$\Delta H = H - \mathrm{diag}(E^{\rm DFT})$ in the DFT basis and $D_k$ the
+covariant k derivative, $i[\Delta H, r] = D_k \Delta H$ and the QP velocity is
+
+$$
+v^{\rm QP} = U^\dagger \big(v^{\rm DFT} + D_k \Delta H\big)\, U ,
+\qquad v^{\rm DFT} = p + i[V_{\rm NL}, r]\ (+\ \text{SOC}).
+$$
+
+`sc_head_update` chooses how much of this each map uses. One owner,
+`qsgw_head.qp_velocity`, forms the velocity for the head and for
+`dipole_qsgw.h5`:
+
+| `sc_head_update` | velocity on each map | needs |
+|---|---|---|
+| `off` | none: the DFT head, fixed for the run (under `head_correction = full` folded through each map's W) | — |
+| `dft_velocity` | $U^\dagger v^{\rm DFT} U$ | `dipole.h5`, or the velocity stage of `parallel_transport.h5` |
+| `parallel_transport` | $U^\dagger (v^{\rm DFT} + D_k\Delta H) U$, with $D_k$ from finite links | `parallel_transport.h5` with links |
+| `interband_commutator` | $U^\dagger (v^{\rm DFT} + [\Delta H, \mathcal W]) U$, no links; insulators only | the velocity stage of `parallel_transport.h5`, stamped `vnl_included = 1` |
+
+**Default.** An unnamed `sc_head_update` on a shared-pole SC deck (scalar, or
+`bispinor_gw = full_shared_pole`) with the head on takes the best velocity
+the run directory supports: `parallel_transport` when `parallel_transport_file`
+exists (the dipole step writes it by default), else `dft_velocity` from
+`dipole.h5`, else `off`. A `full_shared_pole` deck with neither file takes
+`dft_velocity`. Other decks default to `off`. The choice is made once, at
+parse time, and holds for the whole run, because a velocity treatment that
+changed between maps would change $F$ under the mixer.
+
+**Links.** `parallel_transport` differentiates on the link shell of
+`common.parallel_transport.link_stencil`: whole Marzari–Vanderbilt shells of
+mesh vectors, closed under the lattice point group. The links span an outer
+band set (`get_dipole_mtxels --parallel-transport-bands`, default
+min(WFN bands, ⌈1.25 × deck bands⌉)); $D_k\Delta H$ is taken there and
+restricted to the head bands. Links that cannot serve the term set
+$D_k\Delta H = 0$ for the whole run, and each map logs the reason: an
+incomplete artifact, a two-point k axis, or a window edge that cuts a
+hybridized manifold (`GATE pt_head_window_hybridized`, judged at the outer
+edge). Complete links always serve the term. Their measured error times
+$\|D_k\Delta H\| / \|v^{\rm DFT}\|$ is logged each map as a bound and gates
+nothing: link error falls with the k grid, so a large value means the grid is
+underconverged. A link artifact whose steps differ from the shell refuses
+(`GATE pt_link_stencil`); rerun the dipole step. Before the loop, a head
+window whose top edge splits a degenerate multiplet refuses
+(`sc_iteration._refuse_degenerate_window_edge`): an edge inside a multiplet
+makes the head depend on the arbitrary basis of that multiplet.
+
+**Head block.** Each map writes one block to `gwjax.out`: each term's
+contribution (p, $V_{\rm NL}$, Σ) to $\omega_p^2$ on a metal (eV²) or its
+share of the static head $S_{aa}(0)$ on an insulator (%), the link bound and
+the band gap (0 on a metal). Metal routes are in §7.
 
 ### Interband-commutator head {#interband-commutator-head}
 
-A head update (`sc_head_update`) rebuilds the $q \to 0$ head each map from the
-QP velocity $v^{\rm QP} = U^\dagger (v + D\Delta H)\,U$. Here $v$ is the DFT
-velocity $p + i[V_{\rm NL}, r]$ (plus SOC), $\Delta H = H - \mathrm{diag}(E^{\rm DFT})$,
-and $D$ is the covariant $k$ derivative. `parallel_transport` forms $D\Delta H$
-from finite links and needs a derivative rule on every $k$ axis.
-`interband_commutator` forms it without links, on any grid:
+`interband_commutator` forms the QSGW velocity without links, on any grid
+(`qsgw_head.interband_commutator_velocity`):
 
 $$
-D\Delta H \approx [\Delta H, W], \qquad
-W_{vc} = \frac{v_{vc}}{E_v - E_c}, \quad W_{cv} = W_{vc}^*,
+D_k\Delta H \approx [\Delta H, \mathcal W], \qquad
+\mathcal W_{vc} = \frac{v_{vc}}{E^{\rm DFT}_v - E^{\rm DFT}_c},
+\quad \mathcal W_{cv} = \frac{v_{cv}}{E^{\rm DFT}_c - E^{\rm DFT}_v}
+= -\mathcal W_{vc}^* ,
 $$
 
-with $v < n_{\rm occ} \le c$, and $W = 0$ inside each occupation class.
-$W = i\,r^{VC}$, so $[H^{\rm DFT}, W] = v$ on the valence–conduction blocks.
-Split the covariant derivative by class, $D\Delta H = -i[A^{VC}, \Delta H] + D^{\rm class}\Delta H$.
-The valence–conduction block of $D^{\rm class}\Delta H$ holds only the cross-gap
-block $\Delta H_{VC}$. So the head is exact for any $\Delta H$ that does not mix
-valence and conduction; a band-diagonal $\Delta H$ gives
-$v_{vc}(E^{\rm QP}_v - E^{\rm QP}_c)/(E_v - E_c)$. Its error is first order in the
-cross-gap mixing, and each map prints $\max_k \lVert U_{VC} \rVert_F$.
-$\Delta H$ is the active block plus a diagonal tail inside the head manifold, so
-no sum over states is truncated.
+for valence $v < n_{\rm occ} \le c$, and $\mathcal W = 0$ inside each
+occupation class. $\mathcal W = i r^{VC}$, with $r^{VC}$ the Hermitian
+cross-gap position operator of the DFT Hamiltonian, so $\mathcal W$ is
+anti-Hermitian and $[H^{\rm DFT}, \mathcal W] = v$ on the
+valence–conduction blocks. Split the covariant derivative by class,
+$D_k\Delta H = -i[A^{VC}, \Delta H] + D^{\rm class}\Delta H$: the
+valence–conduction block of $D^{\rm class}\Delta H$ holds only the cross-gap
+block $\Delta H_{VC}$. The head is therefore exact for any $\Delta H$ that
+does not mix valence and conduction (a band-diagonal $\Delta H$ gives
+$v_{vc}(E^{\rm QP}_v - E^{\rm QP}_c)/(E_v - E_c)$), and its error is first
+order in the cross-gap mixing $\theta = \max_k \|U_{VC}\|_F$, which each map
+prints. On MoS2 bispinor at $\theta \approx 0.055$ the head's $S_{zz}$ sits
+1.3 % from the exact position-operator head, about $\theta/4$; there is no
+refusal threshold on θ.
 
-On a collapsed (one-point) $k$ axis the cell is not periodic, and the
-connection is the stored position operator $Z_a$ of the velocity artifact
-(`sc_head_update = parallel_transport` uses the same operator there). There
-the reduced component of $W$ is $i Z_a$, full and exact, and the class rule
-applies to the periodic axes only: $W_{\rm cart} = B^{-1}\,[B\,W^{VC}$ with row
-$a$ replaced by $i Z_a]$.
+Every same-class pair is excluded, degenerate or not: inside a class
+$\mathcal W$ has no gap in its denominator, near-degenerate pairs make it
+arbitrarily large, and the $\partial_k \Delta H$ that would cancel it has no
+stencil-free form. (Excluding only exact multiplets left a Si 6×6×6 SOC head
+8.8 times the link head.) Every denominator is therefore at least the direct
+gap.
 
-**Accuracy.** On MoS2 bispinor at $\theta_{\max} \approx 0.055$ the class rule
-alone put $S_{zz}$ 1.3 % from the exact position-operator head, so the
-periodic-axis error is about $\theta/4$ in $S_{aa}$. A $5\times10^{-3}$ head
-tolerance is out of reach at $\theta \approx 0.05$ without within-class $k$
-information (links). The per-map line prints $\theta$; there is no refusal
-threshold. Measurements: sandbox claim 2815.
+On a collapsed (one-point) k axis the cell is not periodic, and the
+connection is the stored position operator $Z_a$ of the velocity artifact:
+the reduced component $a$ of $\mathcal W$ is $i Z_a$, and the class rule
+applies to the periodic axes only,
+$\mathcal W_{\rm cart} = B^{-1}[B\,\mathcal W^{VC}$ with row $a$ replaced by
+$i Z_a]$. `parallel_transport` uses the same operator on such an axis.
 
-Every same-class pair is excluded, degenerate or not. Inside a class, $W$ has
-no gap in its denominator. Near-degenerate pairs make it arbitrarily large, and
-the $\partial_k \Delta H$ that would cancel it has no stencil-free form.
-Excluding only exact multiplets (BerkeleyGW's $10^{-6}$ Ry) left a Si SOC head
-8.8 times the link head. The class rule has no tolerance, and every
-denominator is at least the direct gap.
+A metal refuses (`GATE sc_head_interband_commutator_insulator_only`), and so
+does a cross-gap pair within $10^{-6}$ Ry
+(`GATE sc_head_interband_commutator_gap`). The velocity artifact must stamp
+`vnl_included = 1` (`GATE sc_head_interband_commutator_velocity_operator`),
+because $r_{ml} = -i v_{ml}/(E_m - E_l)$ holds only for the velocity of the
+Hamiltonian whose energies divide it.
 
-A metal refuses (`GATE sc_head_interband_commutator_insulator_only`), and so does
-a cross-gap pair within $10^{-6}$ Ry (`GATE sc_head_interband_commutator_gap`).
-The velocity artifact must stamp `vnl_included = 1`
-(`GATE sc_head_interband_commutator_velocity_operator`). The kernel is
-`qsgw_head.interband_commutator_velocity`.
+### QSGW dipoles {#qsgw-dipoles}
 
-**QSGW dipoles.** On every velocity head the driver writes the accepted final
-map's $U^\dagger v\,U$, with the QP energies of the same states, to
+Every velocity head the SC driver forms writes the accepted final map's
+$U^\dagger v\,U$, with the QP energies of the same states, to
 `dipole_qsgw.h5` beside the deck (`qsgw_head.write_qsgw_dipole`, the
-`dipole.h5` layout, `basis = "qp"`). $v$ is the head's own velocity from the
-one owner `qsgw_head.qp_velocity`: $v_{\rm DFT} + D_k\Delta H$ on
-`parallel_transport` (only $v_{\rm DFT}$ on a map whose links cannot serve the
-Σ term), $v + [\Delta H, W]$ on this head, $v_{\rm DFT}$ on `dft_velocity`.
-The file's `velocity` attribute names the term. Its states are the ones the
-map's $W$ and the final `WFN_qp.h5` are built from. The absorption consumers
-read it through `load_dipole_h5` and form $d_{cv} = v_{cv}/(E_c - E_v)$. On this
-head that is $(U^\dagger r^{VC} U)_{cv}$ with the collapsed-axis $Z_a$ in place of
-$r^{VC}$: the QSGW term $-i[r^{VC},\Delta H]$ is included; the intraband
-$D^{\rm class}\Delta H$ is not. With a band-diagonal $\Delta H$ the position
-form equals the DFT one, and the whole QSGW change of $|d|^2$ is the mixing
-$U$ (the velocity form scales by the QP-to-DFT transition-energy ratio).
-The file holds velocities between QP states, so it pairs only with a QP WFN:
-a BSE reads it only on a restart built from `WFN_qp.h5`, and refuses it
-beside a DFT WFN (`GATE dipole_basis`,
-[BSE inputs](architecture/bse.md)).
-When the run also writes `WFN_qp.h5`, the file carries the `dipole.h5`
-provenance stamps bound to that WFN (`qsgw_head.stamp_qsgw_dipole_provenance`):
-the WFN_qp fingerprint and this deck's window, V_NL mode and sign,
-representation and DFT+U stamps (`qsgw_head.head_dipole_operator_stamps`, the
-set the head reader checks). A GW run on `WFN_qp.h5` with the same deck,
+`dipole.h5` layout, `basis = "qp"`). $v$ is the head's own velocity from
+`qsgw_head.qp_velocity`, and the file's `velocity` attribute names its Σ term.
+Its states are the ones the final `WFN_qp.h5` holds. (A `full_shared_pole`
+deck on `dft_velocity` writes none: its four-current bank reads `dipole.h5`
+itself, §7.) The absorption consumers
+read it through `load_dipole_h5` and form $d_{cv} = v_{cv}/(E_c - E_v)$.
+
+The file holds velocities between QP states, so it pairs only with a QP WFN: a
+BSE reads it only on a restart built from `WFN_qp.h5` and refuses it beside a
+DFT WFN (`GATE dipole_basis`, [BSE inputs](architecture/bse.md)). When the
+run also writes `WFN_qp.h5`, the file carries the `dipole.h5` provenance
+stamps bound to that WFN (`qsgw_head.stamp_qsgw_dipole_provenance`): the
+`WFN_qp.h5` fingerprint and the deck's window, $V_{\rm NL}$ mode and sign,
+representation and DFT+U stamps. A GW run on `WFN_qp.h5` with the same deck,
 given the file as its `dipole.h5`, builds its head on the SC velocity; any
-other WFN refuses it by fingerprint. A run whose QP window starts above band 0
-logs that the file is not bound.
+other WFN refuses it by fingerprint.
 
-## 2 Band treatment
+## 4 The Σ grid across maps {#sigma-grid-and-quadrature}
 
-| bands | block of $H'$ |
-|---|---|
-| the QP matrix `[b0, b3)`, b3 = nelec + `ncond` as counted on main | full $\Sigma^{\rm QSGW}$, off-diagonals kept within the matrix |
-| its coarse (semicore) states (below) | full rows, read at their own energy on held coarse windows at $\eta_{\rm semi}$ = 5 eV |
-| the lowest `sc_frozen_core_bands` | held at the DFT block $\mathrm{diag}(E_{\rm DFT})$; they stay in the $\Sigma_x$ and $\chi_0$ sums |
-| the scissored tail `[b3, number_bands)` | DFT orbitals with an energy-only rigid shift, refit every map, in G and $\chi_0$ only: the $Z$-weighted mean QP correction of the matrix's conduction states that read their own $\Sigma(E)$ (below) |
+$\Sigma_c(\omega)$ is sampled on a uniform grid of step `sigma_omega_step_ev`,
+measured from the $E_F$ of the Σ frame: `efermi.resolve_sigma_efermi_ry` for
+MPA, and the current spectrum's VBM or midgap for GN/HL-PPM
+(`ppm_sigma.ppm_fermi_frame`). Coverage is judged in that same frame
+(`efermi.sigma_frame_mu_ev`). Each sampled frequency costs quadrature work,
+and a changed grid recompiles every Σ executable, so the loop plans the grid
+once and holds it (`gw/qp_support.py`).
 
-**b3 counts bands** (owner 2026-09-29: "b3 will count bands as on main yes,
-and only bands between b0 and b3 will be rotated amongst each other"). b3 =
-nelec + `ncond` (`number_bands_protected` resolves to the same count); only
-[b0, b3) rotates, and the ζ fit is untouched. b3 is a convergence
-parameter; its measured error is in
-[production QSGW](how-to/production-qsgw.md#error-budget). A `zeta_nband` below b3
-refuses on every route (`GATE qp_matrix_zeta_left`): a state outside the
-fit's left range would carry Σ on unfitted pairs. The classes below change
-only where each QP-matrix state's $\Sigma_c(\omega)$ is read
-(`band_partition.semicore_floor`, `qp_support`).
+**Requested states.** The grid exists to converge the requested set R
+(`qp_support.requested_states`): the QP-matrix states, minus frozen-core and
+semicore states, that the W model treats as active
+($\max_k E^{\rm DFT}_{nk} \ge E_F - 15$ eV,
+`shared_pole_recipe.active_band_mask`, evaluated once on the DFT ladder) and
+that had a quasiparticle at the previous map, $Z \in (0, 1]$. A state with
+$Z \notin (0, 1]$ sits within about η of a pole cluster of its $\Sigma_{nn}$
+and has no quasiparticle. Its energy never moves the grid, and off the grid
+it reads the out-of-grid rule below and is named in an
+`SC window no-quasiparticle` line. This keeps runaway states (Na 8³ band 63
+at $Z \approx -382$, Fe 4³ k 4 band 26 at $Z = 2.82$) from stretching the
+grid.
 
-**The request and the coarse (semicore) class.** Two exclusive forms name the
-QP request; giving both refuses (`GATE band_request_forms`).
+**Plan.** At map 0, and in the one-shot, the grid is the deck's request D
+(`sigma_omega_min_ev` / `sigma_omega_max_ev` or the patch list; an unset edge
+gives the sample next to $E_F$) joined with
+$[\min_R E - P,\ \max_R E + P]$, where $P$ = 2 eV
+(`qp_support.SUPPORT_PAD_EV`) and E is the DFT energy. Because the one-shot
+uses the same rule, SC map 0 has the one-shot's grid, rules and off-grid set.
 
-- `number_bands_protected = N` (the documented form, owner 2026-09-29): every
-  occupied band plus conduction bands up to N in total. The coarse class is
-  every occupied band below a band gap of at least
-  `band_partition.SEMICORE_GAP_EV` = 4 eV (all k) under the requested bands
-  within μ ± 10 eV; none without such a gap.
-- `nval` / `ncond`: the fine window, read at the deck η, runs down to the
-  minimum energy of the lowest requested valence band (`nelec − nval` at each
-  k, the count below μ on a metal; `sigma_omega_min_ev` only lowers it), and
-  every occupied state below that energy is coarse. A deck whose `nval`
-  covers every occupied band has none. The rule is energy-based, so a coarse
-  state inside the fine grid's lower pad reads the fine grid.
+**Hold.** Every later map keeps the grid while each requested state's read
+support $[E - 0.5, E + 0.5]$ eV lies inside it. E is the map's input energy,
+and 0.5 eV is the half-width of the $Z$ stencil
+(`eqp_bgw.Z_FINITE_DIFFERENCE_EV`). When a state is about to leave, only the
+crossed edge grows, to $E \pm P$, which leaves 1.5 eV of motion before it can
+trigger again; one `SC window extension` line names the band, k, $E - \mu$,
+the new edge and the run's extension count. Old samples never move, and an
+interior hole of a patched grid refuses. The grid never leaves D joined with
+the union over maps of $[\min_R E - P,\ \max_R E + P]$
+(`GATE sigma_support_envelope`). Input energies are DFT at map 0 and the
+carried QP eigenvalues afterwards; eqp0, eqp1 and Z never set the grid. A
+grid that reaches far above $E_F$ means the deck requested states there (Na
+8³ with `ncond` = 81 requests every band, up to +96 eV). The grid is not
+re-planned at map 1, because a new grid would recompile every Σ executable
+while the held rules already cover the map-0 grid.
 
-A coarse state stays in the matrix and mixes fully, but its Σ is read at its
-own energy on coarse windows of the grid below the near support. The
-automatic windows are one per coarse manifold (levels separated by a global
-gap wider than twice the 2 eV plan pad), at $\eta_{\rm semi}$ = 5 eV, sampled
-at $\eta_{\rm semi}/2$ (`qp_support.SEMICORE_*`), planned at map 0 over the
-coarse DFT energies and held; a coarse read that leaves them extends them, as
-the near support is extended. `sigma_omega_patches_ev` triples `lo:hi:eta`
-(eV about E_F) are user windows: the coarse states inside one read it at its
-own η instead (`GATE sigma_coarse_window` refuses a malformed, overlapping or
-sub-deck-η triple, or one without a coarse class). In the Σ plan the
-crossing windows that own coarse samples serve them at the window's η and
-max(`sigma_quadrature_eps`, `qp_support.SEMICORE_EPS` = 3e-3) (owner
-2026-09-29; against 1e-4 it moves states within E_F ± 10 eV by ≤ 0.06 meV
-at maps 0–1 and semicore QP by ≤ 4.3 meV at map 0, for 10–12 % fewer map
-pairs on MoS2 and Fe); adjacent automatic windows of one η share a rule
-window when that lowers the summed closed-form node count of the boxes the
-runs are built on (`sigma_box_plan._coarse_runs`, decided at map 0 and
-held); a user window is never grouped; sign-definite windows serve coarse
-samples at the deck η. Broadening flattens $d\Sigma/d\omega$: at the deck η the
-Fe 3s $Z$ leaves $(0, 1]$ from map 1 and the loop stalls; at 5 eV every coarse
-$Z$ stays inside (one `SC semicore Z` receipt per map). The η_semi systematic
-is reported apart from the 1 meV budget of the controllable errors: converged
-E_F ± 1 eV std/max 3.6/15.9 meV (Fe 4³, against η_semi 1 eV) and 2.9/20.0 meV
-(MoS2 3×3, against the deck η), growing about 1.2 and 0.6 meV std per eV
-(claim 2960).
+**Out-of-grid rule** (`sigma_out_of_grid`, `qsgw_utils.sigma_eval_omega`).
+One classification, `qsgw_utils.omega_coverage`, decides which energies are
+on the grid; the Σ build, the grid growth and the tail mask all read it.
 
-**Conduction states** (owner 2026-09-29: "i'd rather default be all cond bands
-have the same broadening"): every protected conduction state is read on the
-near grid at the deck η; there is no far-conduction class. On Fe 4³ prot
-(`number_bands_protected = 26`) the matrix-top band 26 at k 4/11 then sits
-among the scissored tail's levels (+20.6 to +21 eV) with a resonant Σ, and
-the SC map is bistable there (claim 2960). The
-coarse class is built once from the DFT ladder (`gw_init.coarse_class_for_deck`,
-`meta.coarse_class`), above the Σ route: the scalar and the sector (bispinor)
-MPA/shared-pole Σ read the same class and the same coarse windows, because
-the sector Σ calls the one pole executor and window planner once per sector
-pair (`qp_support.semicore_patch_route`). A PPM or static Σ reads no coarse
-windows.
+| policy | an off-grid $\Sigma(E)$ reads | error past the edge, median / p90 (eV) |
+|---|---|---|
+| `cover` (default) | the grid grows over every requested quasiparticle, so none is off grid; W-inactive, frozen-core and no-quasiparticle states read $\Sigma(\omega = 0)$ | 0 for requested states |
+| `clamp` | $\Sigma$ at the nearest edge | Fe 0.3–0.7 / 0.8–4.7; CrI3 0.05–0.12 / 0.5–2.2; MoS2 0.2–0.3 / 0.6–0.8 |
+| `static` | $\Sigma(\omega = 0)$ | Fe 1.6–4.4; CrI3 0.4–0.5; MoS2 0.6–0.8 (median) |
 
-**Pinned semicore** (`sc_semicore = dft`, the default; owner 2026-09-29: the pseudopotentials
-are fitted to DFT, so the semicore stays at its DFT energies while its mixing
-with the protected states is kept). H is carried in the fixed DFT basis, and
-the pin is on the projector $P_S$ onto the coarse labels' DFT orbitals:
+The errors compare against the sampled Σ 2–6 eV beyond a truncated edge.
+`clamp` is continuous at the edge, but an edge on a GN-PPM pole gives errors
+of order $10^3$ eV; `static` has two fixed points near an edge (§5). States
+deeper than the active depth keep $\Sigma(0)$ because the W model carries no
+plasma charge for them: covering Fe 4³'s 3s/3p stretched the grid to −98 eV,
+ran 5× slower and moved those states 16 eV. The active depth is evaluated
+once, so a state never switches between $\Sigma(E)$ and $\Sigma(0)$. No tail
+$C_n/(\omega - \bar\omega_n)$ matched at the edge is offered: Σ at a grid edge
+is far from its $1/\omega$ asymptote (Fe: −5 to −7 eV at +28 eV), so the
+matched pole falls inside the extrapolated range for 10–92 % of the states.
 
-$$P_S H P_S = P_S H^{\rm DFT} P_S = {\rm diag}(E^{\rm DFT}_s),\qquad
-H_{ps} = \tfrac12\big[\Sigma_{ps}(E^{\rm QP}_p) + \Sigma_{ps}(E^{\rm DFT}_s)\big]^{\rm h} - V^{\rm xc}_{ps}.$$
+**Coarse windows** below the near grid follow the same plan-and-hold rule
+(§2).
 
-The semicore–semicore block carries no $\Sigma - V^{\rm xc}$; every other
-element is the QSGW one. The Hermitian average is formed in the current QP
-eigenbasis, where a QP column reads at the $E^{\rm DFT}$ of the coarse label
-`sc_state_identity.assign_qp_identity` gives it (largest $|U|^2$ overlap; a DFT
-multiplet is one capacity block with one energy, so its internal gauge does
-not enter), and the rotation back to the DFT basis carries it. The labels are
-the map-0 coarse class, fixed for the run; the coarse windows are planned on
-their DFT energies and are held (only a drift of μ past their pad would extend
-them). The semicore QP energies still move by the level repulsion of the kept
-mixing, $-\sum_p |H_{ps}|^2/(E_p - E_s)$ to second order. `qp` lets the class
-move with its own Σ. On a run without a coarse class (a PPM or static Σ, or
-a request that covers every occupied band) either value logs that there is
-nothing to pin.
+**Held Σ rules.** The quadrature rules that integrate each product window are
+certified at map 0 over the map-0 grid on padded boxes, reused while each
+window's current box stays inside its certificate, and rebuilt one window at
+a time on an escape, with one `SC fixed quadrature recompute:` line per
+rebuilt window. The padding and the escape rules are owned by
+[Σ quadrature §9](theory/sigma-quadrature-problem.md#9-self-consistent-maps).
 
-Every other matrix band is protected: under the default `sigma_out_of_grid =
-cover` it reads Σ at its own energy, and the grid grows over it; on a route
-without the patch a band deeper than the W model's active depth reads
-$\Sigma(\omega = 0)$ (§4). Map 0, or an authenticated seed, classifies the
-band set once, and the set stays frozen: no band enters or leaves it later.
+**Held W shapes.** From map 1 the shared-pole model keeps one pole-column
+extent per sector (`file_io.shared_pole_store._k_extent`: map 1's largest
+pole count plus 3 %, grown with the same headroom only when a live count
+exceeds it), and the four-current CT round keeps each of CC and TT at its
+largest retained-span width (`shared_pole_sectors.cross_span_widths`, never
+shrunk; the extra columns are exact zeros). Each growth is logged. A drifting
+pole count or rank therefore does not change a compiled shape.
 
-**Tail law.** The rigid shift is
+## 5 Mixing, state identity and convergence
 
-$$
-\beta = \frac{\sum_{kn} w_k u_{nk}\,(E^{\rm QP}_{nk} - E^{\rm DFT}_{nk})}{\sum_{kn} w_k u_{nk}},
-\qquad u_{nk} = \min(Z_{nk}, Z_{nk}^{-1})\ (Z_{nk} > 0),\ 0\ \text{otherwise},
-\qquad Z_{nk} = \bigl(1 - \partial_\omega \mathrm{Re}\,\Sigma_{nn}(\omega)\rvert_{E_{nk}}\bigr)^{-1},
-$$
-
-over the window's conduction states that are on the sampled grid. The weight $u$ is
-continuous in $s = \partial_\omega{\rm Re}\,\Sigma$ ($u = Z$ for $s \le 0$,
-$1 - s$ for $0 < s < 1$, 0 for $s \ge 1$), so the tail law, and with it the SC
-map, has no jump where a state's $Z$ crosses 1. A state on a satellite or near a pole of Σ has small $Z$ and
-cannot drag the tail: a state moved 3 eV onto a satellite with $Z = 0.1$
-shifts β by 21 meV, where the plain mean moves 188 meV (CLAIMS 2710). An
-off-grid state is excluded because its energy did not come from its own
-$\Sigma(E)$; on Fe 4³ three such states moved β by 14.9 meV between two fixed
-points (CLAIMS 2703). The map's Σ exists only after the tail has fed
-$\chi_0$ and $W$, so $Z$ comes from the previous map and rides the carry
-(`SCState.tail_z_kn`); map 0 uses unit weights. No qualifying state leaves
-the tail at $E_{\rm DFT}$.
-
-The masks are indexed by `(k, DFT identity)` because the carry is in the DFT
-basis. On every map, `sc_state_identity.assign_qp_identity` assigns each
-sorted QP column to a DFT identity by projector overlap with the reference
-multiplets. Motion and the criterion use these identities, not sorted
-positions, so a level crossing cannot relabel a state.
-
-In a degenerate subspace the full operator is kept. Averaging only the
-diagonal of a degenerate block would depend on the arbitrary DFT basis within
-it and would break symmetry in the next map. BerkeleyGW degeneracy averaging
-(`no_degen_averaging`) applies only to the reported diagonals.
-`sc_exact_degeneracy_tol_ev` groups identities; it refuses values above
-0.1 meV and is not a convergence knob.
-
-## 3 Acceleration and stop rules
+### Anderson mixing
 
 `mixing.acceleration.anderson_nojit` implements Anderson type II (Pulay) with
 one map evaluation per iteration. The history holds the newest $m + 1$
-evaluated pairs $(x_i, f_i = F(x_i) - x_i)$, where $m$ = `sc_history_depth`
-(default 20). The next and only evaluation is at
+evaluated pairs $(x_i, f_i = F(x_i) - x_i)$, $m$ = `sc_history_depth`
+(default 20), and the next and only evaluation is at
 
 $$
 x_{n+1} = \sum_i \alpha_i\,(x_i + f_i), \qquad
-\alpha = \arg\min \Big\| \sum_i \alpha_i f_i \Big\|_P ,\quad \sum_i \alpha_i = 1 ,
+\alpha = \arg\min_{\sum_i \alpha_i = 1} \Big\| \sum_i \alpha_i f_i \Big\|_P .
 $$
 
-with $\alpha$ real, because Hermitian matrices form a real vector space. The
-metric multiplies each residual by the per-k outer product of the window's
-identity mask and the square root of its star multiplicity; padding is zero.
-Its squared norm is therefore the full uniform k-grid sum, independent of
-the computational wedge. Full-grid rows retain unit weight. Two safeguards
-cost no evaluation and have no tunable constant:
+α is real, because Hermitian matrices form a real vector space. The metric
+$P$ weights each k row by the square root of its star size, so the squared
+norm is the sum over the full uniform k grid whatever wedge the loop runs on.
+Two safeguards cost no evaluation and carry no tunable constant:
 
 - **Conditioning filter.** The oldest differences are dropped until the
   unit-column Gram has condition number at most $10^{12}$.
 - **Nonmonotone fallback.** An evaluation worse than every residual in the
-  window steps next along the two-point secant between the best pair and the
-  rejected one. It never fires twice in a row, and the rejected pair stays in
-  the history.
+  window means the multisecant model failed there; the next point is the
+  two-point secant between the best pair and the rejected one. It never fires
+  twice in a row, and the rejected pair stays in the history.
 
-A discrete map event does not restart the history. Such an event is a Σ rule
-rebuild or a grid extension, logged as `SC map
-event`. Restarting there would reduce the method to Picard steps, which
+A discrete change of the map, a Σ rule rebuild or a grid extension, is logged
+(`SC map event`) and does not restart the history: early maps grow the grid
+on most calls, and restarting there reduces the method to plain steps, which
 diverge on an expansive map.
 
-Plain iteration is refused. On dense band manifolds the QSGW Jacobian has
-cycle-direction eigenvalues of about −3 or below, so a plain fixed point
-2-cycles, and damping only shrinks the cycle. Undamped linear mixing also
-amplifies the input's time-reversal-reality error 6–8× per map (CLAIMS 2391).
-`sc_accelerator` therefore accepts only `anderson`, and any other value
-refuses (`GATE sc_accelerator_anderson_only`).
+Plain iteration is refused (`sc_accelerator` accepts only `anderson`,
+`GATE sc_accelerator_anderson_only`). On dense band manifolds the QSGW
+Jacobian has eigenvalues of about −3 or below along cycle directions, so a
+plain fixed point 2-cycles and damping only shrinks the cycle; undamped
+linear mixing also amplifies the input's time-reversal-reality error 6–8×
+per map.
 
-The solver has no stopping authority of its own. The driver decides on every
-evaluated input:
+**Residency.** The history holds $2(m + 1)$ copies of the carry, stacked on a
+leading axis that is never sharded, with bra bands on mesh axis X, ket bands
+on Y and k replicated (`qsgw_density.band_rotation_spec`). One copy is
+$16\,n_k N_b^2$ bytes: 21 MB on CrI3 8×8 (144 bands), 9.2 GB at $n_k = 144$,
+$N_b = 2000$, where $m = 20$ takes 387 GB in total, 3.9 GB per rank at
+$P = 100$. Each iteration issues one $(m+1)\times(m+1)$ Gram reduction. The
+map needs a replicated carry, so each call gathers one $(n_k, N_b, N_b)$
+matrix.
+
+### State identity
+
+The carry is in the DFT basis, so every per-state table (the tail weights,
+the coarse pin, the convergence test) is indexed by $(k,$ DFT label$)$, not by
+sorted position; a level crossing must not relabel a state.
+`sc_state_identity.assign_qp_identity` assigns, at each k, QP columns to DFT
+labels by maximizing the summed projector overlap $\sum |\langle \psi^{\rm
+DFT}_m | \psi^{\rm QP}_n \rangle|^2$ (a linear assignment). Levels within
+`sc_exact_degeneracy_tol_ev` form multiplets; a multiplet is one capacity
+block scored by its summed overlap, so its internal gauge does not enter, and
+its members report the block-mean energy. A label set that cuts a DFT
+multiplet refuses. The convergence readout matches each map against the
+labels of the map-0 output (`sc_iteration._sc_identity_for_call`).
+
+### Convergence and stop rules
+
+The mixer has no stopping authority; the driver decides on every evaluated
+input:
 
 | verdict | rule |
 |---|---|
-| **CONVERGED** | $\max \lvert E_{\rm out} - E_{\rm in} \rvert$ over the window identities is below `sc_tol_ev`. The loop returns that input, together with its own Σ, W and head. The rule compares output with input, not successive iterates: a mixed iterate can barely move while $F$ still has no fixed point. |
-| **STALLED at floor, not converged** | $r_n = \max_k \lVert P\,(F(H_n) - H_n)\,P \rVert_2$, logged as `SC matrix residual`, has not improved by 10 % over the last 12 maps. $r_n$ is label-free: by Weyl it bounds every sorted-eigenvalue residual, and it also sees eigenvector error. The 10 % and the 12 maps are fixed, not deck keys. |
-| budget | `sc_max_iter` (default 30) accelerated evaluations after map 0. `sc_max_iter = 1` is a one-map diagnostic. |
-| **fixed point NOT UNIQUE** | appended to CONVERGED when states lie within the Σ(E)/Σ(0) jump of a grid edge (§5). It is not a refusal. |
+| **CONVERGED** | $\max \lvert E_{\rm out} - E_{\rm in}\rvert$ over the QP-matrix labels is below `sc_tol_ev` (default 1e-4 eV). $E_{\rm in}$ are the eigenvalues of the input $H$, $E_{\rm out}$ those of $F(H)$, matched by label. The loop returns that input with its own Σ, W and head. |
+| **STALLED at floor, not converged** | the label-free residual $r_n = \max_k \lVert P\,(F(H_n) - H_n)\,P\rVert_2$ (logged as `SC matrix residual`) has not improved by 10 % over the last 12 maps. |
+| budget | `sc_max_iter` (default 30) accelerated evaluations after map 0. `sc_max_iter = 1` runs map 0 alone as a labelled one-map diagnostic. |
+
+The test compares a map's output with its own input, not successive
+iterates: a mixed iterate can barely move while $F$ still has no fixed point.
+It is a maximum, not an RMS, because "every state moved less than the
+tolerance" is a statement about the worst state. $r_n$ bounds every
+sorted-eigenvalue residual (Weyl) and also sees eigenvector error, so
+relabelling a hybridized pair cannot move it; the 10 % and the 12 maps are
+fixed, not deck keys.
 
 A stalled or budget-exhausted run refuses with
-`GATE sc_fixed_point_not_converged`. The per-map `eqp0_iterNNNN.dat` files
-remain, and no terminal QP result is reported. Just before the refusal the
-record prints one block for the last map: the median $\lvert\Delta E\rvert$
-over all states, then the 1-based bands (no k) of the non-scissored set with
-a state moving more than 20 meV, and with a state moving at least `sc_tol_ev`.
+`GATE sc_fixed_point_not_converged` and writes no terminal QP result. Before
+the refusal the record prints one block for the last map: the median
+$\lvert\Delta E\rvert$ over all states, then the 1-based bands (no k) with a
+state moving more than 20 meV, and with a state moving at least `sc_tol_ev`.
+The per-map files remain (§8).
 
-**Cost.** The history is $2(m+1)$ copies of the carry, stacked on a leading,
-never-sharded axis. Bra bands sit on `x` and ket bands on `y`
-(`qsgw_density.band_rotation_spec`), with k replicated. One copy is
-$16\,n_k n_b^2$ bytes: 21 MB on CrI3 8×8 (144 bands), and 9.2 GB at
-$n_k = 144$, $n_b = 2000$, where $m = 20$ takes 387 GB globally, or 3.9 GB per
-rank at $P = 100$. Each iteration issues one $(m+1)\times(m+1)$ Gram
-reduction. The map itself needs a replicated carry, so each call gathers one
-$(n_k, n_b, n_b)$ matrix. Each map output $F(H_n)$ is diagonalised once, on
-device; the identity readout and the warm seed share that eigensystem, and
-$r_n$ is reduced on device, so no $O(n_k n_b^3)$ eigensolve runs on the host.
-For scale, CrI3 8×8 GN-PPM reaches
-$\max\lvert dE\rvert < 0.1$ meV in 13 map calls (CLAIMS 2686).
-
-**Map gain.** From map 2 the log prints
+**Map gain.** From the second map on, the log prints
 `SC map gain: max |dSigma_on-shell| / max |dE_in|` over adjacent maps, and the
 eqp comments carry the same figure. A value above 1 means the sampled map is
-not locally contracting. The gain is a diagnostic and controls nothing. On
-metals it can stay above 1 at Fermi-crossing states, where exchange responds to
-an occupation flip within the smearing width. That is the physics of the map,
-not a failure of the accelerator.
+not locally contracting. It is a diagnostic and controls nothing. On metals
+it can stay above 1 at Fermi-crossing states, where exchange responds to an
+occupation flip within the smearing width; that is the physics of the map,
+not a failure of the mixer.
 
-## 4 Σ grid and quadrature across maps {#sigma-grid-and-quadrature}
-
-The ω grid is measured from $E_F$. The one-shot and every SC map grow the
-requested grid by one rule (`qp_support`, below), so SC map 0
-is the one-shot calculation: the same grid, the same rules and the same
-out-of-grid set (owner, 2026-09-24). Under `cover` the one-shot therefore reads
-$\Sigma(E)$, not $\Sigma(0)$, for an active state outside the requested grid.
-
-- **Out-of-grid policy** (`sigma_out_of_grid`, owner 2026-09-24). One
-  classification, `qsgw_utils.omega_coverage`, decides which energies are
-  on the sampled grid. The Σ build (`qsgw_utils.sigma_eval_omega`), the
-  window plan below and the tail mask all read it.
-
-  | policy | an off-grid $\Sigma(E)$ reads | error past the edge, median / p90 (eV) | risk | cost |
-  |---|---|---|---|---|
-  | `cover` (default) | no requested quasiparticle is off-grid: the grid grows over each (window plan below); deeper identities and states without a quasiparticle read $\Sigma(\omega = 0)$ | 0 for active states | shallow semicore near the active-depth line is covered and stiff: MoS2 S 3s (depth 13.9–15.1 eV) takes 17–18 maps against static's 8 | Fe 4³ with no frozen core: grid to +31 eV (not −98), SC driver 1.33× static on one map |
-  | `clamp` | $\Sigma(\omega_{\rm edge})$ | Fe 0.3–0.7 / 0.8–4.7; CrI3 0.05–0.12 / 0.5–2.2; MoS2 0.2–0.3 / 0.6–0.8 | continuous at the edge, but every clamped state inherits Σ there; an edge on a GN-PPM pole gives errors of order $10^3$ eV | none |
-  | `static` | $\Sigma(\omega = 0)$ | Fe 1.6–4.4; CrI3 0.4–0.5; MoS2 0.6–0.8 (median) | two fixed points for states within the edge jump (§5) | none |
-
-  The numbers are from CLAIMS 2710: truth is the sampled Σ over the 2–6 eV
-  beyond a truncated edge. `clamp` and `static` are there to second-guess a
-  hard system. **Active** is the shared-pole census rule,
-  $\max_k E^{\rm DFT}_{nk} \ge E_F - 15$ eV (`shared_pole_recipe.active_band_mask`),
-  evaluated once on the DFT ladder, so a state never switches between
-  $\Sigma(E)$ and $\Sigma(0)$. Deeper states are the ones the W model carries no
-  plasma charge for; covering Fe 4³'s 3s/3p stretched the grid to −98 eV,
-  ran 5× slower and moved them 16 eV (CLAIMS 2739). An energy-only law for
-  them would sit 11–16 eV from $\Sigma(0)$, which is why they keep it.
-  A tail matched to the edge, $C_n/(\omega - \bar\omega_n)$ with the sum
-  rule $C_n > 0$, is not offered: Σ at a grid edge is far from its $1/\omega$
-  asymptote (Fe: −5 to −7 eV at +28 eV), so the matched pole falls inside
-  the extrapolated range for 10–92 % of the states (CLAIMS 2710).
-- **Window plan** (owner 2026-09-25, 2026-09-27; `gw/qp_support.py`). The
-  sampled grid is chosen to converge only the requested states and never
-  leaves
-  $D \cup [\min_{n\in R} E^{\rm in}_n - P,\ \max_{n\in R} E^{\rm in}_n + P]$,
-  a refusal (`GATE sigma_support_envelope`) if it would. $D$ is the deck's
-  `sigma_omega_min_ev`/`sigma_omega_max_ev` (or patch list), fixed. $R$ is the
-  QP window's identities (`nval`, `ncond`) that the W model treats as active,
-  outside `sc_frozen_core_bands`, and quasiparticles at the previous map,
-  $Z \in (0, 1]$; under `clamp` and `static` only those inside the padded
-  window (`scissor.sc_padded_window_ev`). $E^{\rm in}$ is DFT at map 0 and
-  the carried QP eigenvalue after; eqp0, eqp1 and $Z$ are never an input.
-  The pad is flat, $P$ = 2 eV, and there is one plan: the one-shot and SC
-  map 0 (owner 2026-09-28). Every later map holds the grid while every
-  requested state's read support
-  $[E - 0.5, E + 0.5]$ eV (the $Z$ stencil, `eqp_bgw.Z_FINITE_DIFFERENCE_EV`)
-  lies inside it; when one is about to cross, only that edge grows, to
-  $E \pm P$, the edge the plan would set for that state, and one
-  `SC window extension` line names the band, k, $E - \mu$, the edge and the
-  run's extension count. There is no map-1 re-plan: a changed grid would
-  recompile every Σ executable. A requested state with $Z \notin (0, 1]$ has no
-  quasiparticle: its energy never moves the grid, and off the grid it reads
-  the out-of-grid rule and is named in an `SC window no-quasiparticle`
-  line. A grid that reaches far above $E_F$ therefore means the deck
-  requested states there: the Na 8³ deck with `ncond` = 81 requests every
-  band, up to +96 eV. Old samples do not move on an extension and an interior
-  hole refuses. The Σ rule certificates below pad the band-sum states'
-  outer edge by $\max(2\ \mathrm{eV}, 10\%\,\lvert E - \mu\rvert)$ and
-  a crossing window's inner edge by $2\eta$.
-  Coverage is judged in the frame the Σ build measures from: the current
-  spectrum's VBM or midgap for GN/HL-PPM (`ppm_sigma.ppm_fermi_frame`),
-  `efermi.resolve_sigma_efermi_ry` for MPA. On MoS2 3×3 the PPM frame sat
-  1.4 eV above the DFT midgap, and judging coverage in the wrong one left a
-  "covered" state on $\Sigma(0)$ until a later growth switched it, a 2.8 eV
-  jump of its map output (CLAIMS 2736).
-- **Width.** The crossing-rule node count grows linearly in bandwidth$/\eta$,
-  and Σ far from $E_F$ is not smoother: on Fe the curvature at
-  $\lvert\omega\rvert \ge 15$ eV is 13× that near $E_F$.
-  `sc_frozen_core_bands` holds a band at its DFT block at no Σ cost, but that
-  law fails on Fe 3s/3p and CrI3 I 5s (CLAIMS 2859), so production decks do
-  not freeze semicore.
-  `sigma_regularization_ev` is the literal broadening η of every ansatz and
-  is not a speed knob. The quadrature page owns η and
-  `sigma_quadrature_eps`.
-- **Held rules** (`sigma_box_plan._fit_fixed_sc_rules`). Map 0 is served
-  by the one-shot planner's rules, and the same balanced pass certifies the
-  plan, the only one: one rule per product window on its box over the map-0
-  grid. In the branch's own coordinate ($E - \mu$ on a conduction branch,
-  $\mu - E$ on a valence one) the outer state edge is padded by
-  `scissor.sc_window_pad_ev` = max(2 eV, 10 % of $\lvert E - \mu\rvert$).
-  Near $E_F$ that is the owner's 2 eV; far away the 10 % is the QP stretch
-  (Na 8³: top state +96 → +101 eV at map 1), which a flat pad cannot hold: a
-  flat 1 eV map-1 plan refit Na's 1265- and 1669-node crossing windows in
-  553 s. The inner edge of a crossing window is padded by
-  `scissor.SC_WINDOW_INNER_PAD_ETA` = $2\eta$ and, on a metal, never past
-  $-X$, the occupation floor's reach (`efermi.occupation_floor_reach_ry`:
-  $X = k_BT \ln(1/10^{-5} - 1)$ = 11.5 $k_BT$ for Fermi-Dirac). That edge
-  sets the crossing short side $\lvert\omega\rvert_{\max} + x -
-  \Omega_{\min}$ and so the node count; a 2 eV pad there cost 18–26 nodes
-  per crossing window. The edge is deliberately tight, and only a metal's
-  clip is a bound (no branch state passes $-X$). The old 2 eV slack also
-  absorbed motion that the tight edge now rebuilds: an inward move of the
-  inner state (MoS2 3×3 map 2, the gap edge back 1.5 eV after its map-1
-  overshoot), a grid extension on the crossing half (Fe 4³ map 2) and a
-  near-pole drop past its 10 % pad (Fe 4³ map 1, 0.28 → 0.19 eV) each
-  escape and rebuild (Fe 4³ charge SC-3: 12 windows against 9; claim 2936).
-  A sign-definite window keeps the outer pad on
-  both edges. Both edges stop at the window's own selector interval. Poles are padded by 10 % at the near edges and
-  widths, and 2× at the far edge of an unbounded selector (deep and bulk
-  windows), because the highest shared-pole mode moves 10–30 % per map and a
-  sign-definite relative rule pays about one node for it. From map 1 the
-  rules are held: a map reuses a rule by containment
-  (`rule_source` `hit:sc-fixed`). A window whose box leaves its rule, a new window,
-  or a sign change is an escape: it is rebuilt alone by the same plan rule
-  around its current states (`rebuild:sc-fixed`) and held again; one
-  `SC fixed quadrature recompute:` line in the report names the window and
-  its reason, the state (k, band, $E - \mu$) and the certified edge, the pole
-  extent or the grid edge that crossed, and the receipt counts the maps
-  with an escape (`escape_maps_total`) and the windows rebuilt
-  (`rebuilds_total`) over the run. The zero-side edge of a sign-definite box
-  stops at 5 % of its distance to zero, so the box stays sign-definite. The
-  window executables keep the session's largest node count, so a refit
-  recompiles them only when it raises it. A change of material class
-  re-initializes the plan. Every path accepts a rule only if its certified
-  sup error is at most `sigma_quadrature_eps`; otherwise it refuses, naming
-  the window, box, sup and node count. There is no retry; η and ε are fixed
-  for the session.
-- **Held W carriers.** From map 1 the shared-pole model keeps one
-  pole-column extent per sector (`shared_pole_store._k_extent`: map 1's
-  Kmax + 3 %, grown with headroom only when a live Kmax exceeds it, logged),
-  the bispinor CT round keeps each of CC and TT at its largest retained-span
-  width (`shared_pole_sectors.cross_span_widths`: the extent ladder of the
-  retained rank, grown only when a live width exceeds it, logged, never
-  shrunk; the extra columns are inactive zeros), and the density scan keeps
-  its largest rotated-band count, so a drifting Kmax, retained rank or
-  occupation does not change a compiled shape.
-
-## 5 Where the map is not smooth
+### Where the map is not smooth
 
 **The grid-edge switch** (`sigma_out_of_grid = static` only). $\Sigma(0)$
-makes $F$ discontinuous at each edge $\omega_e$ by
-
-$$
-\Delta_n = \mathrm{Re}\,\Sigma_{c,nn}(0) - \mathrm{Re}\,\Sigma_{c,nn}(\omega_e).
-$$
-
+makes $F$ discontinuous at each grid edge $\omega_e$ by
+$\Delta_n = \mathrm{Re}\,\Sigma_{c,nn}(0) - \mathrm{Re}\,\Sigma_{c,nn}(\omega_e)$.
 In the diagonal model $E = A + \Sigma(E)$, a jump that points outward
-($\Delta_n > 0$ at the top edge, $\Delta_n < 0$ at the bottom) gives every
-state within $\lvert\Delta_n\rvert$ of the edge a self-consistent partner on
-the other side. There are then two fixed points, and the path decides which
-one the loop reaches. An inward jump cannot do this.
-`qsgw_utils.sigma_grid_edge_ambiguity` flags these states every map. It has no
-threshold, because the band is the jump itself. It takes the effective edge as
-the outer of the sampled-grid edge and the padded-window edge, since a state
-inside the padded window grows the grid rather than leaving it. Frozen-core
-bands are excluded. On Fe 4³ bispinor, the H-point states converge at
-$E - \mu = +9.8$ eV (inside) under one trajectory and at $+11.7$ eV (outside)
-under another, around a +10 eV edge with $\Delta = 1.87$ eV (CLAIMS 2688).
-Under `cover` both seeds reach one branch within 2 meV (CLAIMS 2703); `clamp`
-has no jump, so the verdict flags edge states only under `static`.
+($\Delta_n > 0$ at the top edge, $< 0$ at the bottom) gives every state
+within $|\Delta_n|$ of the edge a self-consistent partner on the other side:
+two fixed points, and the path decides which one the loop reaches. An inward
+jump cannot do this. `qsgw_utils.sigma_grid_edge_ambiguity` flags such states
+every map, with no threshold because the band is the jump itself, and the
+verdict appends `fixed point NOT UNIQUE`; it is not a refusal. On Fe 4³
+bispinor the H-point states converge at $E - \mu$ = +9.8 eV (inside) under
+one trajectory and +11.7 eV (outside) under another, around a +10 eV edge
+with Δ = 1.87 eV. Under `cover` both trajectories reach one branch within
+2 meV, and `clamp` has no jump.
 
 **The elementwise MPA pole refit** (`compute_mode = mpa`,
-`sigma_w_model = mpa`). The imaginary-axis samples of $\chi_0$ and $W$ respond
-linearly to a kick. The per-element Loewner/Padé solve from 16 samples is not
-identifiable, though: a $10^{-7}$ change in the samples selects a different,
-equally good pole set, and $\Sigma_c(\omega)$ jumps by 10–20 meV somewhere on
-the real axis (CLAIMS 661). No damping or mixing schedule converges this jump.
-Resolution makes it harmless. At 24 bands and 192 centroids on Si the map gain
-is 14–18 and the loop plateaus; at 80 bands and 504 centroids it is 0.3 and
-the loop contracts.
+`sigma_w_model = mpa`). The per-element pole fit from 16 samples is not
+identifiable: a $10^{-7}$ change in the samples selects a different, equally
+good pole set, and $\Sigma_c(\omega)$ jumps by 10–20 meV somewhere on the real
+axis. No damping schedule converges this jump; resolution makes it harmless.
+On Si at 24 bands and 192 centroids the map gain is 14–18 and the loop
+plateaus; at 80 bands and 504 centroids it is 0.3 and the loop contracts. The
+shared-pole W has no such refit (§6).
 
-**Discrete events.** A rule rebuild or grid growth is a small jump of $F$. It
-is logged, and the history keeps it (§3).
+## 6 Shared-pole W across maps {#shared-pole-w-with-retained-quadrature}
 
-## 6 Shared-pole W with retained quadrature {#shared-pole-w-with-retained-quadrature}
+With `sigma_w_model = shared_pole` every map rebuilds the whole model from its
+rotated wavefunctions, energies and occupations: response samples, moments,
+directions, poles and factors (`shared_pole_screening.screen_shared_poles`).
+An SC map's model belongs to that map; `restart = true` restores only the
+invariant ISDF basis and never skips a map's response or W. What persists
+across maps is sampling geometry, held so that each map is the same function
+of its input:
 
-With `sigma_w_model = shared_pole`, every map rebuilds the whole model from its
-rotated wavefunctions, energies and occupations: the response samples, exact
-moments, directions, Ritz poles and factors. SC W models are local to one map
-and are never published as reusable bundle members. `restart = true` restores
-only the invariant ISDF basis. Three things persist across maps:
+- **Σ rules**: held as in §4. For a four-current sector model the certificate
+  also covers the pole treatment ceiling, twice the χ transition span
+  (`shared_pole_recipe._sector_treatment_ceiling`). The ceiling is held while
+  the current span stays inside it and re-planned at twice the current span
+  otherwise.
+- **Response rules** (`response_bank.response_quadrature`): planned on the
+  transition interval padded by 4 eV (`response_bank.RESPONSE_HOLD_PAD_EV`)
+  and reused while the current interval, decay rate, amplitude, metallicity
+  and sample points stay within the held plan. Otherwise they are rebuilt,
+  with one line `Response rule rebuilt at a held map; failed reuse test: …`
+  naming each failed field.
+- **Support enclosure** (`shared_pole_recipe._support_envelope`). Map 0 uses
+  its own support. From map 1 the loop keeps the running maximum line
+  endpoint and the extreme imaginary endpoints, so the DFT gap's extra
+  imaginary support is never locked in. The enclosure fixes sampling geometry
+  only; it is not an interpolation-error certificate.
+- **Line sites.** The real-axis sample sites are held while the support rule
+  would place every site within
+  max(3 meV, 0.1 × the previous map's max|dE|) of the held one
+  (`shared_pole_recipe.LINE_SITE_HOLD_EV`), and re-placed from the current
+  bands otherwise (`SC W line sites re-planned`). Sites frozen for the whole
+  run move the end point (Fe 4³ bispinor from DFT: 99 meV in the
+  $E_F \pm 10$ eV states), and a hold far below the iterate's own error
+  re-plans on most maps, so each map is a different function and Anderson
+  mixes residuals of different maps (Fe 4³ scalar `parallel_transport`: 10
+  re-plans in 15 maps, stalled).
 
-- **Σ rules.** The frozen set of §4 keeps its nodes and weights. Each map
-  recomputes the masks, pole selectors, reference energies and $W(\tau)$.
-  For a sector (bispinor) model the frozen certificate also covers the pole
-  ceiling $[0, \Omega_{\rm ceil}]$, fixed at map 0 as twice the χ transition
-  span (`shared_pole_recipe._sector_treatment_ceiling`), so a pole that moves
-  within it keeps the same nodes.
-- **Response rules** (`response_bank.response_quadrature`). These are planned
-  on the transition interval padded by 4 eV. They are reused while the
-  current interval, decay and amplitude bounds, metallicity and sample points
-  are contained in the plan, and otherwise rebuilt warm-started from the
-  previous rules.
-- **Support enclosure** (`shared_pole_recipe._support_envelope`). The DFT
-  reference map uses its own support. From the first interacting map on, the
-  loop keeps the running maximum line endpoint and the extreme imaginary
-  endpoints, so the DFT gap's extra imaginary support is never locked in. The
-  enclosure fixes sampling geometry only; it is not an interpolation-error
-  certificate. The line sites inside it are held while the support rule would
-  place every site within max(3 meV, a tenth of the previous map's max|dE|)
-  of the held one for the current bands (`LINE_SITE_HOLD_EV`), and re-placed
-  from the current bands otherwise (one `SC W line sites re-planned` line): held sites
-  frozen at map 2 of a DFT start moved the Fe 4³ bispinor end point 99 meV
-  (REPLAN 2026-09-29), and a 3 meV hold alone re-planned on 10 of 15 maps of
-  the Fe 4³ scalar parallel_transport SC, so Anderson mixed residuals of
-  different maps and stalled (FESTALL 2026-09-30). The bispinor
-  treatment ceiling is held while the current span stays inside it, else
-  re-planned at twice the current span.
+`head_correction = full` folds the head wings through each map's own W
+(`shared_pole_head.build_shared_pole_head`); `sc_head_update = off` keeps the
+DFT direct response. The ordered-store and four-component head refusals are
+in [shared-pole model §8](architecture/shared_pole_model.md).
 
-`head_correction = full` evaluates the current shared-pole Γ body on each map,
-one frequency at a time on both mesh axes, and folds the head wings through
-the total W. The head fit is bound to that map's body digest.
-`sc_head_update = off` keeps the DFT direct response. The ordered-store and
-four-component head refusals are covered in
-[shared-pole model §8](architecture/shared_pole_model.md).
+**Symmetry of the model.** The model is
+$W_c(q, s) = \Pi_{G_q}\big[\sum_j b_j b_j^\dagger/(s - \Lambda_j)\big]$, where
+$\Pi_{G_q}$ averages over the authenticated magnetic little group of $q$
+(recipe `operator_realization = little-group-reynolds-v1`; operations from
+`symmetry_maps.project_little_group_operator` through `gw/qgrid_symmetry.py`).
+Each transformed residue is a unitary or conjugate-unitary congruence of a
+positive residue, so the average keeps residues positive and poles real. At
+complex $s$ an antiunitary operation acts as the same-time transpose of the
+residue endpoints, not as a conjugation of the whole value. The projector
+streams one operation at a time into a fixed accumulator, so no factor gains
+a symmetry axis. The raw-model receipts certify the unprojected model only.
 
-**Physical realization.** The model is
-$W_c(q,s) = \Pi_{G_q}\big[\sum_k b_k b_k^\dagger/(s - \Lambda_k)\big]$, where
-$\Pi_{G_q}$ averages the authenticated magnetic little group of $q$ (recipe
-`operator_realization = little-group-reynolds-v1`, adapter
-`gw/qgrid_symmetry.py`, operations from
-`symmetry_maps.project_little_group_operator`). Each transformed residue is a
-unitary or conjugate-unitary congruence of a positive residue, so the average
-keeps residues positive and poles real. At complex $s$, an antiunitary
-operation acts as the same-time transpose of the residue endpoints, not as a
-conjugation of the whole value. The projector streams one operation at a time
-into a fixed accumulator, so no factor gains a symmetry axis. The raw-model
-receipts certify the unprojected model only.
-
-## 7 Metals
+## 7 Metals {#7-metals}
 
 - Use `compute_mode = mpa` with `sigma_w_model = shared_pole`. GN-PPM refuses
-  metals (`GATE gn_ppm_refuses_metals`).
-- Occupations are Fermi-Dirac only, and `occ_smearing_width_ry` is $k_BT$.
-  Each map solves μ at a fixed electron count from its input spectrum
-  (`_solve_occupation_state`); μ is never mixed.
-- A band is in a Σ or χ branch iff its weight ($f$, or $1-f$) is at least
-  $10^{-5}$ (`gw.efermi.band_in_occupation_window`; $|E-\mu|\le11.5\,k_BT$ for
-  Fermi–Dirac), for the one-shot and every map alike. A state that crosses
-  the cut between maps switches one term by about $10^{-5}$ of its size,
-  0.01 meV (CLAIMS 2793).
-- The energy-only tail above the QP window has exact-zero occupations. It
-  still enters G and the response at its current shifted energies, and the
-  window alone sets μ. A tail state that enters the fractional manifold
-  (`FRACTIONAL_TOL`) refuses.
-- The rate of convergence is set by the largest quasiparticle weight Z in the
-  window. States more than a plasmon energy above μ, where Re Σ(ω) is flat or
-  rising on shell, have $Z \gtrsim 1$ and walk at map gain ≈ 1. End the window
-  (`ncond`) below them, and judge convergence by Fermi-window observables.
+  metals (`GATE gn_ppm_refuses_metals`): its Σ splits bands by a 0/1 step at
+  a derived Fermi level.
+- Occupations are Fermi–Dirac only (`GATE metal_occupations_fermi_dirac`), and
+  `occ_smearing_width_ry` is $k_BT$. At startup the occupations re-solved
+  from the WFN's own energies must reproduce the WFN's stored occupations, so
+  the deck's smearing matches the DFT run. Each map then solves μ at fixed
+  electron count from its input spectrum (`sc_iteration._solve_occupation_state`);
+  χ₀, the head and Σ all read that one state.
+- A band is in a Σ or χ branch iff its weight ($f$ or $1 - f$) is at least
+  $10^{-5}$ (`efermi.OCCUPATION_WEIGHT_FLOOR`; $|E - \mu| \le 11.5\,k_BT$ for
+  Fermi–Dirac), in the one-shot and every map alike. A state that crosses the
+  cut between maps switches one term by about $10^{-5}$ of its size, about
+  0.01 meV.
+- The scissored tail has exact-zero occupations: it enters G and the response
+  at its shifted energies, and the QP matrix alone sets μ. A tail state that
+  enters the fractional manifold refuses (`GATE sc_empty_tail`); enlarge the
+  QP matrix.
+- The local gain of the diagonal map $E \leftarrow A + \Sigma(E)$ is
+  $s = \partial_\omega \mathrm{Re}\,\Sigma = 1 - 1/Z$. States far above μ,
+  where $\mathrm{Re}\,\Sigma$ rises on shell, have $Z > 1$ and $s$ near 1, and
+  converge slowly. Ending the QP matrix below them (`ncond`) and judging
+  convergence by states near $E_F$ shortens the run.
 
 ### Metals: direct Drude head {#metals-direct-drude-head}
 
-One owner forms the SC velocity on every map: `qsgw_head.qp_velocity` returns
-$v = v_{DFT}$ plus this map's Σ term ($D_k\Delta H$ on `parallel_transport`,
-$[\Delta H, W]$ on `interband_commutator`, none on `dft_velocity` or when the
-links are not usable). The head (S, Drude, wings) and `dipole_qsgw.h5` both read $U^\dagger v\,U$
-of that object ([QSGW dipoles](#interband-commutator-head)). The one-shot and
-fixed DFT head (`build_dft_head_response`) reads it at $\Delta H = 0$,
-$U = I$. On `bispinor_gw = full_shared_pole` the four-current bank's direct
-Γ head (`response_bank.compute_photon_bank`) takes this map's object on
-`parallel_transport` through `photon_head_state` and rotates it by $U$; on
-`dft_velocity` it rotates the authenticated `dipole.h5` velocity, which is
-the same object at $\Delta H = 0$.
+On a metal the head adds the intraband (Drude) term, a Fermi-surface integral
+of the velocity computed with tetrahedron weights, and a Thomas–Fermi static
+slot ([the metallic q → 0 head](theory/metal-q0-head.md)). The velocity comes
+from `qsgw_head.qp_velocity` (§3); the one-shot and the fixed DFT head
+(`qsgw_head.build_dft_head_response`) read it at $\Delta H = 0$, $U = I$.
 
-| status on a metal | what | where |
+| `sc_head_update` on a metal | head on each map | admitted on |
 |---|---|---|
-| unnamed with neither `parallel_transport_file` nor `dipole.h5`, or named | `sc_head_update = off`: the fixed DFT response on the DFT fixed-N Fermi-Dirac state, with the tetrahedron Drude term and the Thomas–Fermi static slot | `qsgw_head.build_dft_head_response`, `sc_iteration._fixed_dft_head_occupation_state` |
-| admitted: shared-pole, `head_correction = no_local_fields`, or `full` on a scalar deck | `dft_velocity`: the `dipole.h5` velocity rotated into each map's QP basis, the current fixed-N μ and tetrahedron weights; the dynamic Drude tensor at $\omega \ne 0$, Thomas–Fermi at $\omega = 0$; `full` folds it through intraband wings and the static Γ body | `qsgw_head.qp_velocity`, `qsgw_head.build_iteration_head_response`, `sc_iteration._solve_head_occupations`, `gw_config.uses_metal_direct_drude_head` |
-| admitted: shared-pole scalar deck, `no_local_fields` or `full`; `bispinor_gw = full_shared_pole` (`no_local_fields`), where the four-current bank builds its direct Γ head from the same velocity (`photon_head_state`) | `parallel_transport`: the same head on $U^\dagger(v_{DFT} + D_k\Delta H)U$, where the finite-link covariant derivative of this map's $\Delta H$ is $i[\Delta H, r]$, so the Drude term sees the QP Fermi velocity. The default when `parallel_transport_file` exists and `sc_head_update` is not named (without it: `dft_velocity` from `dipole.h5`, else `off`). The links are taken on the point-group-closed Marzari–Vanderbilt shell of `common.parallel_transport.link_stencil`, the one owner of the stencil (shell per lattice: [input reference](input_reference.md), `parallel_transport_file`). A link artifact from before the shell (schema 3) refuses under `parallel_transport`, and so does one whose steps differ from the shell (`GATE pt_link_stencil`); rerun the dipole step (`dft_velocity` still reads the old file). On Fe 4³ the shell brings the head's symmetry-forbidden off-diagonals to ≤ 1.6e-7 and the link error from 6.5 to 4.6 %; the bcc link stage takes about twice as long. The links run on an outer band set (`get_dipole_mtxels --parallel-transport-bands`, default min(WFN bands, ⌈1.25 × deck bands⌉)); $D_k\Delta H$ is taken there, with the diagonal scissor tail continued past the head, and restricted to the head's bands, so `GATE pt_head_window_hybridized` judges the outer edge (the outer link's top head-count singular values). Only $D_k\Delta H$ goes through the links, so each map logs rel_err(links) × ‖$D_k\Delta H$‖/‖$v_{DFT}$‖ on the elements the head reads (transitions, Fermi-surface diagonal); Fe 4³ 3.9e-3, Si 4³ 6.2e-3 at their fixed points. That bound is information: the link error falls with the k grid, a large value means the grid is underconverged, and it gates nothing. The head stays `parallel_transport` for the whole run and complete links serve $D_k\Delta H$ on every map. Only links that are not usable (incomplete, or the stencil or window-hybridization gate fails, which is a band-window defect and not k convergence) set $D_k\Delta H = 0$ for the run: the head then runs on $U^\dagger v_{DFT} U$ and each map logs one line with the reason; there is no refusal and no other mode, and the run ends with one line saying whether the term was served (`qsgw_head.qp_velocity`). Each map writes one block to the record: each term's (p, V_NL, Σ) contribution to $\omega_p^2$ (metals) or share of $S_{aa}(0)$ (insulators), the total, the link bound and the band gap | `qsgw_head.qp_velocity`, `qsgw_head.build_iteration_head_response`, `qsgw_head.covariant_link_derivative`, `gw_config._apply_input_envelope` |
-| refused (`GATE metal_sc_head_update_disabled`) | `parallel_transport` on a `bare_transverse` bispinor deck; `dft_velocity` with `full` on a bispinor deck | `gw_config.validate_material_inputs` |
-| refused (`GATE shared_pole_head_ordered`) | `full` on an ordered (time-reversal-broken) store, on every route | `shared_pole_head._refuse_head_representation` |
-| refused (`GATE metal_sc_head_update_disabled`) | `occ_broadening > 0` next to a metal width | `gw_config._validate_occupation_smearing` |
+| `off` | the fixed DFT response on the DFT fixed-N Fermi–Dirac state, with its Drude term and Thomas–Fermi slot (`sc_iteration._fixed_dft_head_occupation_state`) | every metal deck |
+| `dft_velocity` | the `dipole.h5` velocity rotated into each map's QP basis, the current μ and tetrahedron weights; the dynamic Drude tensor at $\omega \ne 0$, Thomas–Fermi at $\omega = 0$; `full` folds it through intraband wings and the static Γ body | shared-pole decks with `head_correction = no_local_fields` (scalar, `bare_transverse`, `full_shared_pole`), or `full` on a scalar deck |
+| `parallel_transport` | the same head on $U^\dagger(v^{\rm DFT} + D_k\Delta H)U$, so the Drude term sees the QP Fermi velocity | shared-pole scalar decks with `no_local_fields` or `full`, and `full_shared_pole` |
+| `interband_commutator` | refused (`GATE sc_head_interband_commutator_insulator_only`) | — |
 
-Insulators keep `parallel_transport` and `dft_velocity`.
+Any other metal combination refuses (`GATE metal_sc_head_update_disabled`,
+`gw_config.uses_metal_direct_drude_head`): a folded bispinor metal head has no
+derived completion, and the `bare_transverse` head has no link consumer.
+`full` on an ordered (time-reversal-broken) store refuses on every route
+(`GATE shared_pole_head_ordered`), and so does `occ_broadening > 0` next to a
+metal width (`GATE metal_sc_head_update_disabled`).
 
-## 8 Seeding, restart and outputs
+On `bispinor_gw = full_shared_pole` the four-current bank builds its own
+direct Γ head (`response_bank.compute_photon_bank`) from the same velocity:
+on `parallel_transport` it takes this map's `qp_velocity` through
+`photon_head_state`; on `dft_velocity` it rotates the authenticated
+`dipole.h5` velocity, the same object at $\Delta H = 0$.
 
-- **Warm seed.** After every completed map that does not converge, the loop
-  publishes `sc_seed/qp_wfn_rotations.h5` atomically. It holds that map's
-  output Hamiltonian, the scissored tail energies, the fixed-N occupations and
-  the frozen band policy. It holds no wavefunctions and no accelerator
-  history.
-- **Seeding a new run.** `sc_initial_qp_rotations_file` imports an
-  authenticated eigensystem as $H = U\,\mathrm{diag}(E)\,U^\dagger$ in the
-  original DFT basis. A seed whose band policy is not all-protected, or that
-  carries an active-window scissor (both written only before the 2026-09-22
-  all-protected rule), refuses. Keep the original WFN and
-  reference operators. At import the seed is averaged over each kept k's
-  little group, $H \leftarrow |G_k|^{-1}\sum_L A_L(H)$ with the band
-  representations of the operations from the WFN, so a seed from another run
-  or code version cannot break this run's symmetry; the "SC initial
-  Hamiltonian" line prints the largest change, and a seed whose Σ window cuts
-  a multiplet refuses (`GATE little_group_band_representation`). A charge SC
-  seeds a bispinor SC on the same WFN (the production order,
-  [production QSGW](how-to/production-qsgw.md#the-route)). Occupations and the
-  tail fit are recomputed, and the quadrature and the accelerator history
-  start empty, so this is a new run, not a continuation.
-- **`restart = true`** reuses the ISDF/W tensors of a finished run. It
-  overwrites MPA pole stores in the same directory, so point it at a copy.
-- **Terminal files.** `qp_wfn_rotations.h5` is always written;
-  `WFN_qp.h5` is written when `write_wfn_h5` is set (the default). Both come
-  from the accepted final map. They hold the complete energy ladder (window
-  plus tail), the occupation table, μ, the smearing and the table hash.
-  `WFN_qp.h5` is written collectively: each rank reads, rotates and writes
-  its own G-slab of every k through `file_io.slab_io`, so no rank holds more
-  than $\approx 5\,N_b N_s \lceil N_G^{\max}/P\rceil \cdot 16$ B of ψ. Each
-  file is written to a private sibling, validated through its format owner,
-  and made visible by `os.replace`. The run-completion manifest requires both
-  names. A WFN may store two k of one orbit (k and −k; MoS2 3×3 stores all
-  9). `SymMaps` then builds the full-BZ row of such a stored k from another
-  stored row, so the QP $U$ there is in the gauge of the unfolded parent, not
-  of the stored orbitals. `write_qp_wfn_h5` rotates each such row by
-  $D\cdot U$, $D = \langle\psi_{\rm stored}|\psi_{\rm unfolded}\rangle$ on
-  $[b_0, b_3)$; a non-unitary $D$ (the window cuts a multiplet) refuses
-  (`GATE qp_wfn_orphan_gauge`). Other rows are untouched, so a WFN without
-  such rows (Si) writes the same file as before. A `WFN_qp.h5` written before
-  2026-09-30 from a WFN with such rows breaks time reversal (MoS2 3×3 SOC
-  density residual 3e-2, now 3e-8). Regenerate it from its
-  `qp_wfn_rotations.h5` with `postprocess.rotate_wfn_to_qp` (the same
-  writer), and rerun the BSE and GW runs that read it. That tool reapplies the stored ladder and table;
-  it neither rebuilds the tail nor re-solves occupations.
-- **Per-map files are diagnostics, not restart state.** `eqp0_iterNNNN.dat`
-  holds the map output; at the fixed point it is the root of the QP equation,
-  so no per-map eqp1 is written. `rotation_iterNNNN.npy`
-  (`sc_dump_dir`) is the map's input $U$. With
-  `sigma_lorentz_debug_output = true`, four-current maps write
-  `sigma_lorentz_iterNNNN.h5`: the CC, CT+TC and TT sectors in the map's input
-  QP basis.
+## 8 Seeding, restart and outputs {#8-seeding-restart-and-outputs}
+
+**There is no checkpoint of the loop.** The mixer history is never written,
+so an interrupted run cannot continue where it stopped. A rerun in the same
+directory recomputes from map 0. It reuses a map's shared-pole scratch only
+when that scratch authenticates for the same map identity (WFN fingerprint,
+energies, occupations, centroids, recipe): a committed scalar `model.h5`, a
+four-current `sectors.json` with every model file it names, or a complete
+response bank, which resumes the constructor. Any other partial
+directory is removed and rebuilt, with a WARNING line naming the files
+(`shared_pole_screening.screen_shared_poles`). Only the newest map's scratch
+generation is kept (`shared_pole_screening.retain_iteration_scratch`).
+
+**Warm seed.** After every map that does not converge, the loop writes
+`sc_seed/qp_wfn_rotations.h5` (`sc_iteration._write_sc_seed`): that map's
+output eigensystem, the scissored tail energies and the fixed-N occupations.
+It holds no wavefunctions and no mixer history.
+
+**Seeding a new run.** `sc_initial_qp_rotations_file` imports an
+authenticated eigensystem as $H = U\,\mathrm{diag}(E)\,U^\dagger$ in the
+original DFT basis (`sc_iteration.make_initial_state_from_qp_rotations`). The
+source WFN fingerprint, k table, band range, finite $E$/$U$ and unitarity
+are checked; keep the original WFN and reference operators. At import $H$ is
+averaged over each kept k's little group,
+$H \leftarrow |G_k|^{-1}\sum_L A_L(H)$ with the band representations of the
+operations from the WFN, so a seed from another run or code version cannot
+break this run's symmetry. The `SC initial Hamiltonian` line prints the
+largest change, and a seed whose Σ window cuts a multiplet refuses
+(`GATE little_group_band_representation`). A seed file that records a
+partial band partition or an active-window scissor refuses, because the loop
+keeps every QP-matrix state's full Σ and has nothing to apply such a law to.
+Occupations, the tail fit, the quadrature plan and the mixer history start
+fresh, so a seeded run is a new run, not a continuation. A charge SC seeds a
+bispinor SC on the same WFN
+([production QSGW](how-to/production-qsgw.md#the-route)).
+
+**`restart = true`** reads the ISDF basis and V(q) from a finished run's
+restart store instead of refitting them; every map still rebuilds χ₀, W and
+Σ.
+
+**Terminal files**, written only by a converged run (or a one-map
+diagnostic):
+
+- `eqp0.dat` and `eqp1.dat` hold the SC eigenvalues: the accepted map's output
+  $\mathrm{eigvalsh}\,F(H_{\rm in})$ with its tail scissor and semicore pin,
+  sorted per k, on the WFN file wedge (`sc_iteration._write_sc_result_eqp`).
+  Both equal the body of that map's `eqp0_iterNNNN.dat` bit for bit, and the
+  header says so. No Z linearization enters: at the fixed point the map output
+  solves the QP equation. The gap report reads the same array.
+- `sigma_diag.dat` holds the diagonal of the final Σ on the fixed DFT states,
+  a diagnostic, not the SC spectrum. `sigma_mnk.h5` carries no eqp receipt,
+  and `python -m gw.eqp_bgw` refuses an SC file
+  (`GATE eqp_bgw_self_consistent_run`).
+- `qp_wfn_rotations.h5` (always) and `WFN_qp.h5` (when `write_wfn_h5`, the
+  default) hold the accepted map's input QP states, the basis its Σ, W and
+  head were built in; they agree with the eqp files to `sc_tol_ev` on the
+  QP matrix. Each holds the complete energy ladder (QP matrix plus tail), the
+  occupation table, μ, the smearing and the table hash. `WFN_qp.h5` is
+  written collectively: each rank reads, rotates and writes its own G slab of
+  every k through `file_io.slab_io`. Each file is written to a private
+  sibling, validated through its format owner and made visible by
+  `os.replace`; the run-completion manifest requires both names.
+- `dipole_qsgw.h5` on a velocity head (§3).
+- A converged run on a route that persists W0 writes it once, from the
+  accepted map, so BSE can run on the SC result.
+
+**WFNs that store both k and −k.** A WFN may store two k of one orbit (MoS2
+3×3 stores all 9). `SymMaps` then builds the full-BZ row of such a stored k
+from another stored row, so the QP $U$ there is in the gauge of the unfolded
+parent, not of the stored orbitals. `file_io.qp_wfn.write_qp_wfn_h5` rotates
+each such row by $D\cdot U$,
+$D = \langle\psi_{\rm stored}|\psi_{\rm unfolded}\rangle$ on $[b_0, b_3)$,
+and a non-unitary $D$ (the window cuts a multiplet) refuses
+(`GATE qp_wfn_orphan_gauge`). `postprocess.rotate_wfn_to_qp` rewrites a
+`WFN_qp.h5` from its `qp_wfn_rotations.h5` through the same writer; it
+reapplies the stored ladder and table and neither rebuilds the tail nor
+re-solves occupations.
+
+**Per-map files are diagnostics, not restart state.** `eqp0_iterNNNN.dat`
+holds each map's output energies, with the convergence criterion, the map
+gain, the tail law and the label table in its comments; there is no per-map
+eqp1. With `sc_dump_dir`, `rotation_iterNNNN.npy` is each map's input $U$ and
+`e_history_kn_ev.npy` the output-energy history. With
+`sigma_lorentz_debug_output = true`, four-current maps write
+`sigma_lorentz_iterNNNN.h5`: the CC, CT+TC and TT sectors in the map's input
+QP basis. A new run clears the previous run's managed snapshots.
+
+## 9 Implementation
+
+| concern | owner |
+|---|---|
+| driver entry, final rotation to the DFT basis, terminal writers | `gw.sc_iteration.run_sc_driver` |
+| one map $F$ | `gw.sc_iteration.gw_iteration_map` |
+| Anderson loop, stop rules | `gw.sc_iteration._run_anderson`, `mixing.acceleration.anderson_nojit` |
+| state identity | `gw.sc_state_identity.assign_qp_identity`, `gw.sc_iteration._sc_identity_for_call` |
+| convergence verdict | `gw.sc_iteration.protected_band_convergence` |
+| QSGW operator | `gw.qsgw_utils.build_qsgw_sigma_xc`, `sigma_eval_omega`, `omega_coverage` |
+| semicore class and windows | `gw.band_partition.semicore_floor`, `gw.qp_support` |
+| ω grid plan and hold | `gw.qp_support`, `gw.sc_iteration._sc_sampled_support` |
+| held Σ rules | `gw.sigma_box_plan._fit_fixed_sc_rules`, `_sc_padded_box_spec` |
+| tail scissor | `gw.sc_iteration._fit_sum_band_tail`, `gw.scissor` |
+| velocity and head | `gw.qsgw_head.qp_velocity`, `gw.sc_iteration.load_head_velocity_source` |
+| seeds and QP files | `gw.sc_iteration.make_initial_state_from_qp_rotations`, `dump_qp_wfn_artifacts`, `file_io.qp_wfn` |

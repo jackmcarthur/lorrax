@@ -226,27 +226,64 @@ family, and the (window, τ) pair count is reported, never refused on.
 
 ## 9. Self-consistent maps
 
-A multi-map QSGW run carries a fixed-quadrature session. The first two
-planner calls (maps 0 and 1) use one-shot rules. The third freezes a rule set
-on its own boxes, each padded:
+A multi-map QSGW run plans its rules once and holds them, because a rebuilt
+rule costs planning time and, when it raises the node count, a recompile of
+the window executables. The session lives in
+`sigma_box_plan._fit_fixed_sc_rules`; the ω grid it is planned over is held by
+the rule of [self-consistency §4](../self_consistency.md#sigma-grid-and-quadrature).
 
-- each real edge by the classification pad of the state that sets it,
-  0.5 eV + 0.10 |E − μ|, never across the window's own selector bound;
-- every pole extent by 10%;
-- a sign-definite edge toward zero at most to 5% of its distance from zero;
-- the zero-side edge of a tail window out to the selector's guaranteed gap
-  0.7a, which covers a state that enters the tail on a later map.
+**Map 0** is served by the ordinary one-shot rules, so SC map 0 equals the
+one-shot calculation bit for bit. In the same balanced pass the planner
+certifies one held rule per product window on a padded box over the map-0
+grid (`sigma_box_plan._sc_padded_box_spec`):
 
-Later maps reuse the frozen nodes while the current box is contained. Four
-events change that:
+- **States, outer edge** (farthest from μ in the branch's own coordinate,
+  E − μ on a conduction branch and μ − E on a valence one): padded by
+  max(2 eV, 10 % of |E − μ|) (`scissor.sc_window_pad_ev`). Near E_F the 2 eV
+  covers map-to-map motion; far from it QP corrections stretch the spectrum
+  by about 10 % (Na 8³: top state +96 → +101 eV at map 1), which a flat pad
+  cannot hold. The outer edge sets only a box's long side, so its pad costs
+  almost no nodes.
+- **States, inner edge of a crossing window** (nearest μ): padded by 2η
+  (`scissor.SC_WINDOW_INNER_PAD_ETA`) and, on a metal, never past −X, the
+  occupation floor's reach (X = k_BT ln(1/10⁻⁵ − 1) = 11.5 k_BT,
+  `efermi.occupation_floor_reach_ry`), which no branch state passes. This
+  edge sets the crossing short side |ω|_max + x − Ω_min and so the node
+  count; a 2 eV pad there costs 18–26 nodes per crossing window. A
+  sign-definite window takes the outer pad on both edges. Both edges stop at
+  the window's own selector interval, because a state past it belongs to the
+  neighbouring window, whose certificate covers it.
+- **Poles**: near edges and widths padded by 10 %; the far edge of a window
+  whose selector is unbounded above (deep and bulk windows) by a factor 2,
+  because the highest shared-pole mode moves 10–30 % per map and a
+  sign-definite relative rule pays about one node for the doubled edge. A
+  four-current sector's pole treatment ceiling is included in the box.
+- **Sign topology**: a sign-definite box's zero-side edge stops at 5 % of its
+  distance to zero, so the box stays sign-definite. Where the selectors
+  guarantee a sign gap (tail windows on positive real poles), the zero-side
+  edge is that gap, 0.7 of the state edge, which covers a state that joins
+  the tail on a later map.
 
-- A window that escapes its box, changes currency, or did not exist at the
-  freeze is refit alone.
-- A factored-growth failure refits that window alone.
-- A metal ↔ insulator flip reinitializes the set.
-- A change of η or ε refuses.
+**Later maps** reuse each window's rule while its current box lies inside the
+rule's box (`rule_source` `hit:sc-fixed`). The tight inner edge lets some
+motion escape: an inward move of the inner state, a grid extension on the
+crossing half, or a near-pole drop past its 10 % pad. Four events change a
+rule:
 
-The receipt names every refit window and its reason.
+- a window whose box leaves its rule's box, whose error currency changes
+  (crossing ↔ sign-definite), or that did not exist at map 0 is rebuilt
+  alone, by the same padding around its current states, and held again
+  (`rebuild:sc-fixed`);
+- a factored-growth failure (§8) on reuse rebuilds that window the same way;
+- a metal ↔ insulator flip re-initializes the plan;
+- a change of η or ε within the session refuses.
+
+Each rebuild prints one `SC fixed quadrature recompute:` line naming the
+window, the reason and what crossed (the state's k, band and E − μ, the pole
+extent or the grid edge, against the certified interval); the receipt counts
+the maps with an escape and the windows rebuilt over the run. The window
+executables keep the session's largest node count, so a rebuild recompiles
+them only when it raises it.
 
 ## 10. In-run reuse and parallel planning
 
