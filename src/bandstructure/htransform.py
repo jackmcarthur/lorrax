@@ -235,8 +235,11 @@ def band_character_and_moments(*, colors, moments_grid, wfn, params, ctilde,
         jnp.diagonal(ops, axis1=2, axis2=3)))[:, :, :nb_fit].real
     E_k = np.asarray(gather_to_host(enk_sigma), dtype=np.float64).T
     mu_c, coarse, _ = occupied_sums(E_k, diag[:n_vec], nelec, kT)
-    for line in moment_lines(f"coarse {kgrid[0]}x{kgrid[1]}x{kgrid[2]}",
-                             mu_c, coarse):
+    for line in moment_lines(
+            f"coarse {kgrid[0]}x{kgrid[1]}x{kgrid[2]}"
+            + ("" if energy_source.startswith("DFT") else
+               " (WFN-band diagonals: a check of the DFT route only)"),
+            mu_c, coarse):
         log(line)
 
     files = []
