@@ -53,70 +53,84 @@ markdown_extensions:
       permalink: true
 
 extra_javascript:
-  - https://polyfill.io/v3/polyfill.min.js?features=es6
   - https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js
 
 nav:
   - Home: index.md
-  - Quickstart: quickstart.md
-  - Inputs from DFT: preprocessing.md
-  - Installation:
-      - Overview: installation/index.md
-      - FFI native libraries: installation/ffi-native-libs.md
-      - Building the FFI libraries: building_ffi.md
-      - Perlmutter (NERSC): installation/perlmutter.md
-      - Perlmutter module (maintainers): installation/perlmutter-module.md
-  - Environment:
-      - Overview: environment/overview.md
-      - Collective transports: environment/transports.md
-      - Frontera (TACC): environment/machines/frontera.md
-      - Perlmutter (NERSC): environment/machines/perlmutter.md
-  - User guide:
+  - Use:
+      - Quickstart: quickstart.md
+      - Installation:
+          - Overview: installation/index.md
+          - Perlmutter (NERSC): installation/perlmutter.md
+          - Building the FFI libraries: installation/ffi-build.md
+      - Inputs from DFT: preprocessing.md
       - Drivers: drivers.md
       - Input reference: input_reference.md
-      - Self-consistency: self_consistency.md
+      - Environment variables: reference/env_vars.md
       - "How-to: production QSGW": how-to/production-qsgw.md
       - "How-to: metals": how-to/metals.md
       - "How-to: complete-basis WFN": how-to/complete-basis-wfn.md
+      - "How-to: large-N_mu operation": how-to/large-nmu-operation.md
+      - Self-consistency: self_consistency.md
+      - BSE: architecture/bse.md
       - Downfold driver: downfold.md
+      - Environment:
+          - Overview: environment/overview.md
+          - Collective transports: environment/transports.md
+          - Perlmutter (NERSC): environment/machines/perlmutter.md
+          - Frontera (TACC): environment/machines/frontera.md
   - Theory:
       - Overview: theory/overview.md
       - Physics: theory/physics.md
-      - Direct Hartree field: theory/hartree.md
+      - Centroid selection: theory/centroid-selection.md
       - ISDF / zeta-V(q): theory/isdf-zeta-vq.md
       - ISDF exchange accuracy: theory/isdf-exchange-accuracy.md
+      - Symmetry: theory/symmetry.md
+      - Direct Hartree field: theory/hartree.md
       - Minimax quadrature: theory/minimax-quadrature.md
       - Space-time response (Laplace): theory/response-laplace.md
-      - The Sigma(omega) quadrature problem: theory/sigma-quadrature-problem.md
-      - Sigma_c band extrapolation: theory/band-extrapolation.md
-      - Symmetry: theory/symmetry.md
       - S-tensor convention: theory/s-tensor-convention.md
       - LT splitting and the exchange head: theory/lt-exchange-head.md
-      - Four-current heads and frequency: theory/four-current-head-corrections.md
       - HL-GPP derivation: theory/hl-gpp-derivation.md
-      - "Bispinor (four-current) GW": theory/bispinor-gw.md
-      - Shared-pole screened interaction: theory/shared-pole-w-model.md
+      - Non-Hermitian GN-PPM: theory/gn-ppm-nonhermitian.md
       - Multipole frequency integration (MPA): theory/THEORY_mpa_implementation.md
+      - Shared-pole screened interaction: theory/shared-pole-w-model.md
+      - The Sigma(omega) quadrature problem: theory/sigma-quadrature-problem.md
+      - Sigma_c band extrapolation: theory/band-extrapolation.md
       - Metallic MPA screening: theory/metallic-mpa-screening.md
+      - Finite-occupation screening: theory/finite-occupation-screening.md
       - The metallic q→0 head: theory/metal-q0-head.md
+      - "Bispinor (four-current) GW": theory/bispinor-gw.md
+      - Four-current heads and frequency: theory/four-current-head-corrections.md
   - Architecture:
       - Design decisions: architecture/decisions.md
       - Layers: architecture/layers.md
       - Codebase: codebase.md
-      - Four-current wiring: architecture/four_current_wiring.md
-      - BSE: architecture/bse.md
-      - Substrate services: architecture/services.md
       - The FFI layer: architecture/ffi_layout.md
+      - k-convolution: architecture/kconv.md
       - SlabIO (sharded-slab HDF5): architecture/slab_io.md
+      - Mesh-padded axes: architecture/padding.md
       - Memory model: architecture/memory-model.md
+      - Rank truncation: architecture/rank_truncation_policy.md
       - Symmetry register: architecture/symmetry_register.md
       - Charge zeta fit (route G): architecture/zeta_fit_mubatch.md
       - Face-psi zeta fitting: architecture/zeta_fit_face_psi_cct.md
-      - Mesh-padded axes: architecture/padding.md
       - Fractional chi0 response face: architecture/fractional_chi0_response_face.md
       - Shared-pole W (implementation): architecture/shared_pole_model.md
+      - Four-current sector Sigma consumer: architecture/sector_sigma_consumer.md
+      - Four-current wiring: architecture/four_current_wiring.md
+      - Iterative eigensolvers: architecture/iterative_eigensolvers.md
+      - The NSCF Hamiltonian: architecture/nscf_hamiltonian.md
       - Real-space (ISDF-free) GW: architecture/plane_wave_gw_stages.md
   - Services:
-      - distrib_la (distributed dense linalg): services/distrib_la.md
-      - symmetry_maps (k-grid reduction, stars, unfolds): services/symmetry_maps.md
-  - Contributing: contributing.md
+      - Substrate services: architecture/services.md
+      - "distrib_la: API": services/distrib_la/api.md
+      - "distrib_la: backends": services/distrib_la/backends.md
+      - "distrib_la: active subspace": services/distrib_la/subspace.md
+      - minimax: services/minimax.md
+      - symmetry_maps: services/symmetry_maps.md
+      - vcoul: services/vcoul.md
+      - wfn_loader: services/wfn_loader.md
+      - zeta_loader: services/zeta_loader.md
+  - Developer:
+      - Contributing: contributing.md

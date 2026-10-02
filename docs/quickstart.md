@@ -20,7 +20,7 @@ Then set two shell variables. `LORRAX` is the source tree, which holds the
 fixture. `RUN` is the launch prefix: 4 processes, one GPU each.
 
 With the module stack (the Perlmutter default;
-[using the module](installation/perlmutter-module.md#using-the-module)), where
+[using the module](installation/perlmutter.md#using-the-module)), where
 `<prefix>` is the path the module was published to:
 
 ```bash
@@ -29,16 +29,13 @@ LORRAX=$LORRAX_ROOT
 RUN="srun -N 1 -n 4 --gpus-per-node=4 $LORRAX/src/ffi/cpp/select_gpu.sh python -u -m"
 ```
 
-With a clone ([Perlmutter clone](installation/perlmutter.md), steps 1–2):
+With a clone ([Perlmutter §1](installation/perlmutter.md#clone), steps 1.1–1.2):
 
 ```bash
 LORRAX=/path/to/lorrax
 source $LORRAX/config/perlmutter/gpu_env.sh
 RUN="srun -N 1 -n 4 --gpus-per-node=4 $LORRAX/src/ffi/cpp/select_gpu.sh $LORRAX/.venv/bin/python -u -m"
 ```
-
-With `lx` (project m4598; it needs no `salloc`), `LORRAX` is a checkout and
-`RUN="lx run -N 1 -G 4 -n 4 -- python3 -u -m"`.
 
 On Frontera, build the host leg with `config/frontera/build_ffi_host.sh` and
 launch as [Frontera](environment/machines/frontera.md) describes.
@@ -191,6 +188,6 @@ artifacts a material needs.
 
 - [Preparing inputs from DFT](preprocessing.md): QE → `pw2bgw.x` → `WFN.h5`
 - [Installation](installation/index.md) and
-  [Building the FFI libraries](building_ffi.md)
+  [Building the FFI libraries](installation/ffi-build.md)
 - [Theory overview](theory/overview.md) and [physics](theory/physics.md)
 - [Codebase](codebase.md) and [memory model](architecture/memory-model.md)
