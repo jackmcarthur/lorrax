@@ -22,7 +22,7 @@ import numpy as np
 def shared_pole_byte_terms(meta, *, mesh_xy, resolution, pencil_side,
                            parent_batch, sample_batch, phase="reduction",
                            selection_faces=None, cross_original_sides=None,
-                           padding_output_bytes_per_rank=0, paired=False):
+                           padding_output_bytes_per_rank=0, ritz_budget=None):
     """Price constructor carriers; the map CapacityLedger owns admission.
 
     Selection holds samples, current narrow actions and the n x n direction
@@ -32,8 +32,8 @@ def shared_pole_byte_terms(meta, *, mesh_xy, resolution, pencil_side,
     pencil. Model checks hold factors and bounded samples, with no pencil.
     Native workspace is separately supplied by the service. No threshold
     or independent capacity policy lives in this constructor helper.
-    ``paired`` prices the rank-local paired (ordered) reduction, which holds
-    fewer side-squared temporaries than the even one.
+    ``ritz_budget`` (the pole budget) prices the rank-local paired (ordered)
+    reduction, whose kept span is solved on at most that many columns.
     """
     p = int(mesh_xy.shape["x"]) * int(mesh_xy.shape["y"])
     # Constructor carriers are mu x mu charge operators on every admitted deck.
@@ -75,10 +75,23 @@ def shared_pole_byte_terms(meta, *, mesh_xy, resolution, pencil_side,
     elif phase == "reduction":
         if selection_faces is not None:
             raise ValueError('selection_faces applies only to selection')
-        # Compiled local round programs (P4, one parent per rank), temp + output
-        # per side**2 complex: even 11.7-12.5 (side 5152/10304, n 896/1792);
-        # paired 5.9-7.1 (side 5376/10304, Ritz carrier 2048-3208).
-        dense = (8 if paired else 14) * r*r + 12 * packed * r
+        if ritz_budget is None:
+            # Compiled even local round programs (P4, one parent per rank),
+            # temp + output: 11.7-12.5 side**2 (side 5152/10304, n 896/1792).
+            dense = 14 * r*r + 12 * packed * r
+        else:
+            # Paired: the pencil and its paired members, then the kept-span
+            # algebra on [2c, 2c], 2c = 2 min(side/2, budget), beside the
+            # members. Compiled temp + output per side**2, one parent on one
+            # A100, against this price, at (side, n/side, 2c/side): 18304
+            # 0.18 0.65: 4.64 vs 8.46; 23296 0.14 0.51: 3.76-4.23 vs 7.51;
+            # 10752 0.17 0.48: 3.89 vs 7.68; 10752 0.17 0.80: 6.55 vs 8.92;
+            # 5376 0.17 0.60: 7.86 vs 8.08; 5376 and 10752 0.17 1.0: 9.68 vs
+            # 10.0; 9984 0.33 1.0: 9.30 vs 12.0. Small sides compile with more
+            # side**2 temporaries (no rematerialization), so the side**2 term
+            # is not lowered below 5. At 2c = side this is the old 8 side**2.
+            kept = 2 * min(r // 2, int(ritz_budget))
+            dense = 5 * r*r + 3 * kept*kept + 12 * packed * r
         sample_faces = 0
     elif phase == "model":
         if selection_faces is not None:
@@ -269,7 +282,7 @@ class ConstructorCapacity:
             selection_faces=selection_faces,
             cross_original_sides=cross_original_sides,
             padding_output_bytes_per_rank=padding_output_bytes_per_rank,
-            paired=self.ritz_budget is not None)
+            ritz_budget=self.ritz_budget)
         # Other parents' narrow inputs survive selection and each model's
         # checks; they are additional live storage, never hidden in a limit.
         extra = sum(_shard_bytes(a)
