@@ -1720,6 +1720,17 @@ def x_block_rows(rows) -> np.ndarray:
 #   mode 7; tile-major order rereads the per-(k, nu) unfold tables per tile (0.32 -> 0.77 GB), which
 #   only op-indexed tables would avoid; a single-sweep column pass would redo each pair's 2x2 unfold
 #   per spin column (~4x the gather's L2), more than the intermediate round trip it saves (~1.8 ms).
+# Paid (B10, 3120): mode 8's split passes on two entry points (every pass but W_R's plane at 512
+#   threads, the vertex pencil included at a 112-byte spill: 3.54 -> 2.59 ms a chunk; W_R's plane,
+#   212 registers, at 256), wide plane tiles and tile-major gathers: 20^3 ns 2 Dirac quarter
+#   648.6 -> 554.9 ms, ns 4 366.6 -> 315.4 ms; mode 11's pencil on its own entry (the vertex pencil
+#   kept 256 threads at nkx > 12 for both passes) and a tile-major plane: 20^3 vertex 123.6 -> 113.1
+#   ms, plain 207.0 -> 194.9 ms; all bitwise.
+# Did not pay (B10, 3120): mode 9 at ns 1 as one column-resident sweep (one pair per block: every
+#   (k, pair) reads its own tables, L2-bound) 31.3 -> 58.8 ms at 512 threads; mode 9's gather
+#   tile-major 0.96x; the vertex pencil at two 256-thread blocks per SM (500-byte spill) 0.98x; mode
+#   11's plane tile at 24 columns 0.97x (plain); W_R's plane at two blocks per SM (its tile holds one)
+#   0.93x on that pass.
 # Decides it: blocks resident per SM (<= 64 registers, >= 2 blocks) and odd, conflict-free shared
 #   strides, not HBM or FP64 (Fe 8^3 mode 7 at ~50 GB/s and 0.8 TF/s; 2935); after that the
 #   unfold gather's L2 latency (long_scoreboard 49%; 2956).
