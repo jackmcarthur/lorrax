@@ -266,6 +266,9 @@ def construct_sector_poles(bank, meta, config, *, mesh_xy, output):
                 line_cross=[read_line(io,family,cross=True) for family in (0,1)]
             cross=construct_cross_sector_round(sectors,(ct,tc),cm,meta,config,mesh_xy=mesh_xy,
                 sample_ids=dense_fit,line_cross=line_cross,real=real)
+            import os as _os
+            if _os.environ.get('CTALT_CT_INJECT'):
+                cross=_ctalt_inject(_os.environ['CTALT_CT_INJECT'],cross,ids,real,mesh_xy)
             del line_cross
             with open_shared_pole_bank(bank['path'],mesh_xy=mesh_xy) as io:
                 c1=read_sector_round(io,meta,bank,header,ids,(0,0),fields=('M1',),
@@ -434,6 +437,37 @@ def construct_sector_poles(bank, meta, config, *, mesh_xy, output):
                 execution=execution_rows,model_residence=model_residence)
 
 
+def _ctalt_has_point(recipe,sid):
+    import numpy as np
+    return bool(np.any(np.asarray(recipe['distinct_id'])==sid))
+
+
+def _ctalt_inject(path,cross,ids,real,mesh_xy):
+    """CTALT diag: replace this round's CT signed model by an offline one (ctown_q<id>.npz)."""
+    import os
+    import numpy as np
+    import jax
+    from common.collectives import device_put_process_local
+    from jax.sharding import NamedSharding,PartitionSpec as P
+    from gw.shared_pole_local import _batch_put
+    shapes=[a.shape for a in cross['signed']]
+    b,nc,nt=shapes[0][0],shapes[0][1],shapes[1][1]
+    loaded=[np.load(os.path.join(path,f'ctown_q{int(q):03d}.npz')) for q in ids[:real]]
+    k=max(int(d['mu'].size) for d in loaded)
+    cC=np.zeros((b,nc,k),complex);cT=np.zeros((b,nt,k),complex)
+    mu=np.ones((b,k));act=np.zeros((b,k),bool)
+    for i,d in enumerate(loaded):
+        n=d['mu'].size
+        cC[i,:,:n]=d['cC'];cT[i,:,:n]=d['cT'];mu[i,:n]=d['mu'];act[i,:n]=d['active']
+    signed=tuple(_batch_put(mesh_xy,a) for a in (cC,cT,mu,act))
+    models,zero=positive_cross_models(signed,mesh_xy=mesh_xy)
+    replicated=NamedSharding(mesh_xy,P())
+    zero=jax.tree.map(lambda a:device_put_process_local(a,replicated),zero)
+    print(f"CTALT inject: CT replaced for parents {list(ids[:real])}, K carrier {k}, "
+          f"zero_policy {np.asarray(jax.device_get(zero['zero_policy']))[:real].tolist()}",flush=True)
+    return dict(cross,models=models,signed=signed,zero=zero)
+
+
 def _ctalt_reconstruction(bank,meta,header,ids,real,recipe,signed,*,mesh_xy,output,line_span,
                           dense_fit,execution):
     """CTALT diag: signed-model W vs the bank at every dense sample and line panel.
@@ -499,6 +533,31 @@ def _ctalt_reconstruction(bank,meta,header,ids,real,recipe,signed,*,mesh_xy,outp
                     err,norm=rel(np.matmul(block(1-fam,fam,node),d),cross[:,2*s])
                     rows.append(dict(kind='line',sample=sid,state=s,z=[node.real,node.imag],
                                      block=names[(1-fam,fam)],parents=list(ids[:real]),rel=err,norm=norm))
+    import os
+    dump=os.environ.get('CTALT_DUMP_DIR')
+    if dump:
+        arrays={}
+        with open_shared_pole_bank(bank['path'],mesh_xy=mesh_xy) as io:
+            for sid in [int(i) for i in dense_fit]+sorted(held):
+                for pair,name in names.items():
+                    sample=read_sector_round(io,meta,bank,header,ids,pair,sample_span=(sid,sid+1),
+                                             fields=('Wc','dWc_ds'),execution=execution)
+                    arrays[f'W_{name}_{sid}']=host(sample['Wc'])[:real,0]
+                    arrays[f'dW_{name}_{sid}']=host(sample['dWc_ds'])[:real,0]
+                    del sample
+            for pair,name in names.items():
+                moments=read_sector_round(io,meta,bank,header,ids,pair,fields=('M0','M1','M2','M3'),
+                                          execution=execution)
+                for key,value in moments.items():
+                    arrays[f'{key}_{name}']=host(value)[:real]
+                del moments
+        if jax.process_index()==0:
+            os.makedirs(dump,exist_ok=True)
+            zs={str(sid):complex(_sample_point(recipe,sid)) for sid in range(int(line_span[1])+len(held)+64) if _ctalt_has_point(recipe,sid)}
+            np.savez(os.path.join(dump,f'round_{int(ids[0]):03d}.npz'),ids=np.asarray(ids[:real]),
+                     dense=np.asarray([int(i) for i in dense_fit]),held=np.asarray(sorted(held)),
+                     line=np.asarray(range(*line_span)),z_ids=np.asarray([int(k) for k in zs]),
+                     z=np.asarray(list(zs.values())),**arrays)
     counts={name:np.asarray(m[3]).sum(axis=-1).tolist() for name,m in models.items()}
     if jax.process_index()==0:
         path=Path(output).with_name('ctalt_reconstruction.jsonl')

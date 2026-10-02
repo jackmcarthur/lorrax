@@ -355,6 +355,27 @@ def selection_layout(mesh, execution, nq):
             axis, batch_stack_to_face(mesh, nq))
 
 
+def _ctalt_dump_line(selection, sid, value, slope, kind):
+    """CTALT diag (never lands): the four photon blocks of one line sample, host npz on rank 0."""
+    import os
+    root = os.environ.get("CTALT_DUMP_DIR")
+    if not root:
+        return
+    from common.collectives import gather_to_host
+    out = {}
+    for f, g in ((0, 0), (0, 1), (1, 0), (1, 1)):
+        for name, op in (("W", value), ("dW", slope)):
+            out[f"{name}_{'CT'[f]}{'CT'[g]}"] = np.asarray(gather_to_host(selection.block(op, (f, g))))[:selection.nq, 0]
+    key = (int(sid), kind)
+    part = _CTALT_CALLS[key] = _CTALT_CALLS.get(key, -1) + 1
+    if jax.process_index() == 0:
+        os.makedirs(root, exist_ok=True)
+        np.savez(os.path.join(root, f"line_{int(sid):02d}_{kind}_{part}.npz"), nq=selection.nq, **out)
+
+
+_CTALT_CALLS = {}
+
+
 class LineSelection:
     """The producer's direction selection at the fitted line samples (Re z != 0).
 
@@ -408,6 +429,7 @@ class LineSelection:
     def select(self, sid, value, slope):
         """Directions and the states at z and conj z of every family, from W(z) and dW/ds."""
         lines = {}
+        _ctalt_dump_line(self, sid, value, slope, "value")
         for family in self.families:
             eig = self.plans[family["name"]]
             f = family["index"]
@@ -430,6 +452,7 @@ class LineSelection:
 
     def mirror(self, sid, lines, value, slope):
         """The states at -z and -conj z from the minus-q partner W_q(-conj z) and its dW/ds."""
+        _ctalt_dump_line(self, sid, value, slope, "partner")
         for family in self.families:
             line = lines[family["name"]]
             f = family["index"]
