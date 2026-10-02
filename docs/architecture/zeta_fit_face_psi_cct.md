@@ -73,7 +73,7 @@ plan, plus O(μ²·ns²·N_k log N_k / P) for the correlation. C_q takes
 N_k·μ²·16/P bytes per rank before the q selection.
 
 The GEMM plan is built with `warmup=False`, so C's enclosing JIT runs the
-first GEMM ([`distrib_la`](../services/distrib_la.md#gemm-plans-without-dummy-execution)).
+first GEMM ([`gemm_plan`](../services/distrib_la/api.md#gemm_plan)).
 
 ## Normal equations
 
@@ -113,7 +113,7 @@ B = V_keep Λ_keep^{-1/2}, so B Bᴴ = C⁺. It keeps λ > `zeta_rcond`·λ_max
 (default 1e-8). The cut is moved off any degenerate multiplet it would split.
 A binding cut is certified against κ ≤ 1e8 and against a discarded spectral
 weight of at most 1e-3 (`LORRAX_RANK_POLICY` = refuse | warn | off)
-([rank-truncation policy](../dev/rank_truncation_policy.md)).
+([rank-truncation policy](rank_truncation_policy.md)).
 
 The factor runs replicated, in q batches of at most 4 GiB per rank
 (`factor_c_q_replicated_batched`). On P > 1 with Q·μ³ ≥ 5e9 it runs

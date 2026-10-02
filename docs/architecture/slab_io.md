@@ -10,7 +10,7 @@ and collective-I/O rules, the restart-read path, the per-rank streamed tier
 journal, and SlabIO's refusals. It does not own the rulings behind them
 ([`decisions.md`](decisions.md) 2026-08-04, 2026-08-05), the native layer and
 each knob's effective default ([`ffi_layout.md`](ffi_layout.md) §5–§7), knob
-spellings ([`../dev/env_vars.md`](../dev/env_vars.md)), padded-axis receipts
+spellings ([`../reference/env_vars.md`](../reference/env_vars.md)), padded-axis receipts
 ([`padding.md`](padding.md)), or the restart bundle's contents
 ([`../drivers.md`](../drivers.md)).
 

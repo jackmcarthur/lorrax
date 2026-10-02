@@ -229,7 +229,7 @@ metallic static limit (Thomas–Fermi) and its Schur fold are owned by
 ### 3.5 Time-reversal breaking {#trs-breaking}
 
 The derivation and branch assignment are owned by
-[`DERIVATION_gnppm_nonhermitian.md`](../dev/notes/DERIVATION_gnppm_nonhermitian.md).
+[non-Hermitian GN-PPM](gn-ppm-nonhermitian.md).
 
 * Each response producer takes its ordered form from the measured
   `SymMaps.trs_allowed`: `gw.w_isdf.compute_chi0_imag_ordered` for the GN

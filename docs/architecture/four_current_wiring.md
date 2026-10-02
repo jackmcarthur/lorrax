@@ -30,7 +30,7 @@ refusal names its replacement.
 | **P-bare** | `packed_bare_transverse_route(config)[0]` | zero by declaration; CC from the scalar owner, $W={\rm diag}(W_{00},D_{TT})$ | `gw.photon_sigma` |
 | **B** (incumbent) | `bare_transverse`, none of the others | none; bare TT tiles contracted directly | `gw.sigma_x_bispinor` |
 | **SP-hybrid** | `uses_bare_transverse_shared_pole` | none; CC is a shared-pole bank | `gw.sigma_x_bispinor` |
-| **SP-full** | `uses_full_bispinor_shared_pole` | ordered CC/CT/TC/TT sector bank | `gw.sigma_x_bispinor` for bare exchange; the dynamic sectors by the [sector Σ consumer](../dev/sector_sigma_consumer.md) ([shared-pole model](shared_pole_model.md)) |
+| **SP-full** | `uses_full_bispinor_shared_pole` | ordered CC/CT/TC/TT sector bank | `gw.sigma_x_bispinor` for bare exchange; the dynamic sectors by the [sector Σ consumer](sector_sigma_consumer.md) ([shared-pole model](shared_pole_model.md)) |
 
 "P" rows below apply to both packed modes. `uses_static_photon_response`
 is true on P-screened and P-bare.
@@ -440,7 +440,7 @@ driver entry.
 
 There must always exist a path that materializes no $N_\mu^2$-class object
 on one rank ([decisions](decisions.md); plan table in
-[`large_nmu_operation.md`](../dev/large_nmu_operation.md)). On this layer:
+[large-N_μ operation](../how-to/large-nmu-operation.md)). On this layer:
 
 * **Packed Dyson**, by construction: every operand stays `P(None,'x','y')`.
 * **Packed Σ**, by assertion: `photon_sigma._require_packed_operator`

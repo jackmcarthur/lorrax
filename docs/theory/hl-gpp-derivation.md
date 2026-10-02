@@ -98,7 +98,7 @@ algebra, and the shared one-pole route through
 
 On a time-reversal-broken deck HL runs the single-residue fit: $W_c$ at a real
 frequency outside the spectrum is Hermitian, so one sample cannot separate the
-odd residue ([non-Hermitian GN-PPM](../dev/notes/DERIVATION_gnppm_nonhermitian.md)
+odd residue ([non-Hermitian GN-PPM](gn-ppm-nonhermitian.md)
 §6).
 
 ## References

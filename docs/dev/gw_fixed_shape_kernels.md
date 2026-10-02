@@ -7,7 +7,7 @@ Only the projected Sigma outputs acquire a leading bracket axis. The Green
 and FFT temporaries remain within the loop body; projected output sharding
 is explicitly `P(None, None, 'x', 'y')`.
 
-Both face and axis Green plans enable the shared [active-range GEMM service](active_gemm_ranges.md).
+Both face and axis Green plans enable the shared [active-range GEMM service](../services/distrib_la/api.md#active-ranges).
 After forming the exact phases and selector weights, `build_G_tau` finds
 nonzero support bounds for each parent k. There is no numerical threshold:
 only exact zero columns outside that interval are omitted. Explicit bracket

@@ -72,7 +72,7 @@ axis evaluates for every q at once.
 | factor and solve | \(N_qN_\mu^3+N_qN_\mu^2N_r\) |
 
 The charge solve is rank-truncated under the one
-[rank criterion](../dev/rank_truncation_policy.md); current channels use a
+[rank criterion](../architecture/rank_truncation_policy.md); current channels use a
 ridge-regularized LU. The charge fit forms \(Z_q\) directly in G space by
 [route G](../architecture/zeta_fit_mubatch.md) and applies \(C_q^+\) tile by
 tile over G; the current channels build and solve on orbit-closed real-space
@@ -158,7 +158,7 @@ Two cases change the kernel, not the factorization:
   routes keep both orientations, \(\chi^0_q(z)=F_q(z)+F_{-q}(-z^*)^*\), from
   one contour sweep plus a q-negation gather
   ([MPA §2.1](THEORY_mpa_implementation.md#21-ordered-orientations-when-time-reversal-is-broken);
-  [GN-PPM derivation](../dev/notes/DERIVATION_gnppm_nonhermitian.md)). Time
+  [GN-PPM derivation](gn-ppm-nonhermitian.md)). Time
   reversal is measured from the wavefunctions (`SymMaps.trs_allowed`); no
   deck key can assert it.
 - **Fractional occupations.** Occupation becomes a weight on each branch and
@@ -216,7 +216,7 @@ which \(W\) samples they request and how they turn them into poles:
 |---|---|---|---|
 | `x_only` | \(V\) | bare exchange, \(-G^{\rm occ}\circ V\) | — |
 | `cohsex` | \(W(0)\) | static: \(\Sigma_{SX}=-G^{\rm occ}\circ W(0)\), \(\Sigma_{COH}=\tfrac12 G^{\rm all}\circ W^c(0)\) | — |
-| `gn_ppm` | \(W(0)\), \(W(i\omega_p)\) | one pole per element; with broken time reversal two Hermitian residues \(R_\pm=B\pm D\), \(R_+\) on empty and \(R_-\) on occupied branches | [minimax](minimax-quadrature.md), [derivation](../dev/notes/DERIVATION_gnppm_nonhermitian.md) |
+| `gn_ppm` | \(W(0)\), \(W(i\omega_p)\) | one pole per element; with broken time reversal two Hermitian residues \(R_\pm=B\pm D\), \(R_+\) on empty and \(R_-\) on occupied branches | [minimax](minimax-quadrature.md), [derivation](gn-ppm-nonhermitian.md) |
 | `hl_ppm` | \(W(0)\) | one pole per element fixed by static screening and the f-sum rule | [HL-GPP](hl-gpp-derivation.md) |
 | `mpa`, `sigma_w_model = mpa` | two complex-frequency lines | several complex poles per element, Loewner fit | [MPA](THEORY_mpa_implementation.md) |
 | `mpa`, `sigma_w_model = shared_pole` | a response sample bank | \(W^c_q(z)=\sum_j b_jb_j^\dagger/(z^2-\Omega_j^2)\): one real pole set per q shared by all elements, \(16N_\mu K_q\) bytes per stored q | [shared-pole W](shared-pole-w-model.md) |

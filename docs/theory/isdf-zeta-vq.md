@@ -92,7 +92,7 @@ set is orbit-closed, so a cut between blocks keeps the retained span
 invariant, and \(C_{Sq}=\Pi C_q\Pi^\dagger\) survives truncation. A cut
 through a block would break the k-star identity of \(W\) and \(\Sigma\). The
 criterion and its certification are in the
-[rank-truncation policy](../dev/rank_truncation_policy.md).
+[rank-truncation policy](../architecture/rank_truncation_policy.md).
 
 ## 3. Fit \(Z\) in G space, apply \(C^+\) afterwards
 

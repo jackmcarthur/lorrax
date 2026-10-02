@@ -9,7 +9,8 @@ them.
 
 > **Four-GPU rule.** Every GPU verification leg runs at P = 4; a P = 1-only
 > verification never suffices for landing (unit and CPU cells are exempt).
-> It is #2 and #9 as an operating rule. Procedure: `AGENT_PREAMBLE.md`.
+> It is #2 and #9 as an operating rule. Procedure:
+> [the test suite](../contributing.md#the-test-suite).
 
 ## 1. Silent symmetry: bugs invisible to every invariant you check
 
@@ -117,7 +118,7 @@ pinned every CLI to one process. **Physics- and routing-relevant choices change
 only through declared inputs (the deck); the environment may grant capability
 but never silently selects policy.** A capability whose appearance would change
 behaviour announces that flip.
-[Env-var registry](env_vars.md) · [gate contract](ffi_gate_contract.md).
+[Env-var registry](../reference/env_vars.md) · [gate contract](ffi_gate_contract.md).
 
 ## 9. Claim decay: every performance claim has scope conditions
 

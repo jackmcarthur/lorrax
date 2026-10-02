@@ -226,7 +226,7 @@ $W_{\rm even},W_{\rm odd}$. The fit above runs on $W_{\rm even}$ to fix
 $\Omega_p,B_p$; one fixed-pole least-squares solve then fixes the odd residue
 $D_p$ in $W_{\rm odd}(z)=\sum_p2zD_p/(z^2-\Omega_p^2)$. Conduction branches of
 $\Sigma$ consume $B_p+D_p$, valence branches $B_p-D_p$
-([derivation](../dev/notes/DERIVATION_gnppm_nonhermitian.md) §7–8).
+([derivation](gn-ppm-nonhermitian.md) §7–8).
 
 Pole index is not an energy ordering and all pole fields are independent.
 **More poles are not monotonically better**: a backward-stable fit at higher
