@@ -40,8 +40,8 @@ w, z = eigh.batched(a_stack)
 print(eigh.describe())
 
 # Rank-3 inputs use P(None, 'x', 'y'); rank-2 inputs use P('x', 'y').
-# This provider-free spelling exchanges faces x then y, computes locally,
-# and returns through the literal y-then-x inverse.
+# This provider-free spelling exchanges faces to whole matrices in one
+# all_to_all over (x, y), computes locally, and returns through the inverse.
 d_stack = dla.matmul(a_gemm, b_gemm, mesh=mesh, backend='off',
                      batched_route='batch_reshard')
 ```

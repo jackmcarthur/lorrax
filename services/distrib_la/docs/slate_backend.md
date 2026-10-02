@@ -117,8 +117,9 @@ surfaces do.
 
 This provider path is the default `matmul` route on ROCm; explicit `slate`
 also selects it on CUDA or CPU when the matching handler exists. It is
-distinct from `batched_route='batch_reshard'`, which exchanges faces x then y,
-runs local JAX GEMM, and exchanges D back y then x. A non-`off` SLATE request
+distinct from `batched_route='batch_reshard'`, which exchanges faces to whole
+matrices in one all_to_all over (x, y), runs local JAX GEMM, and exchanges D
+back the same way. A non-`off` SLATE request
 is still capability-probed even with that staged route; use `backend='off'`
 for a provider-free staged call. Leading-batch padding belongs only to the
 staged route. The SLATE provider loops the batch as supplied and requires all
