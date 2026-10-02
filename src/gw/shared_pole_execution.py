@@ -308,9 +308,34 @@ def face_eigh(mesh, n, room=None):
     return plan('eigh',mesh,n=int(n),backend='distributed',budget_bytes=int(room or 0))
 
 
+def face_ritz_carrier(mesh, keep_budget):
+    """Columns of a face pencil's kept span: the pole budget, per-rank tile on the extent ladder.
+
+    The local round solves its kept span on at most ``keep_budget`` columns
+    (``reduce_round``); the face solves it on this carrier, so its Schur and
+    final eigensolves run at the budget's side, not the pencil's. The keep cut
+    retains at most ``keep_budget`` directions, so no kept column is ever cut.
+    The per-rank tile sits on ``runtime.padding.ladder_extent`` (a multiple of
+    a power of two, at most 12.5 % padding): cuSOLVERMp's block edge is the
+    largest divisor of n/p up to 256, and the budget rounded only to the mesh
+    can give a prime n/p (Fe 4^3 on 2x2: 778/2 = 389, block 1, and the face
+    reduction ran 12x slower). CrI3 24x24 on 8x8: 5991 -> 6144, tile 768.
+    """
+    import math
+    from runtime.padding import ladder_extent
+    divisor = math.lcm(int(mesh.shape['x']), int(mesh.shape['y']))
+    return divisor * ladder_extent(-(-int(keep_budget) // divisor))
+
+
 @lru_cache(maxsize=None)
-def face_parent_program(mesh,ordered,odd_moments,keep_budget,retain_span,side,gram_keep=None,room=None):
-    """Retained static-layout executable builder; all state values are operands."""
+def face_parent_program(mesh,ordered,odd_moments,keep_budget,retain_span,side,gram_keep=None,room=None,
+                        carrier=None):
+    """Retained static-layout executable builder; all state values are operands.
+
+    ``room`` is what the pencil's eigh stacks are decided against
+    (``face_eigh``); ``carrier`` (``face_ritz_carrier``) solves an ordered
+    pencil's kept span on that many columns, None keeping the whole H'_vv side.
+    """
     from gw.shared_pole_local import solve_parent_pencil
     from gw.shared_pole_gates import sort_shared_pole_columns
     from gw.shared_pole_recipe import shared_real_pole_gates_ordered_v1, shared_real_pole_gates_v1_r3b
@@ -325,7 +350,7 @@ def face_parent_program(mesh,ordered,odd_moments,keep_budget,retain_span,side,gr
         reduced=solve_parent_pencil(points,pack(qs),pack(os),pack(ds),infinity,active,
             eigh=eigh,matmul=mm,gates=gates,ordered=ordered,odd_moments=odd_moments,
             keep_budget=keep_budget,retain_span=retain_span,gram_keep=gram_keep,
-            matrix_sharding=NamedSharding(mesh,P(None,"x","y")))
+            matrix_sharding=NamedSharding(mesh,P(None,"x","y")),carrier=carrier)
         model,signed,diagnostics=reduced[:3]
         model,permutation=sort_shared_pole_columns(model, matrix_sharding=NamedSharding(mesh,P(None,"x","y")))
         result=model,signed,(*diagnostics,permutation)
@@ -334,17 +359,20 @@ def face_parent_program(mesh,ordered,odd_moments,keep_budget,retain_span,side,gr
 
 
 def face_reduce_round(states,infinity,tables,*,real,mesh,budget,ordered,odd_moments,
-                      keep_budget,retain_span=False,admit=True,gram_keep=None,room=None):
+                      keep_budget,retain_span=False,admit=True,gram_keep=None,room=None,carrier=None):
     """A batch of physical parents with every matrix tiled over all ranks.
 
     ``room`` (``face_eigh_room`` of the reduction admission) is the room the
-    pencil's eigh stacks are decided against (``face_eigh``)."""
+    pencil's eigh stacks are decided against (``face_eigh``); ``carrier`` is
+    the kept-span width of an ordered reduction (``face_ritz_carrier``), None
+    solving the whole H'_vv side."""
     if real != len(tables['own']):
         raise ValueError('distributed constructor batches contain physical parents only')
     side=tables['active'].shape[-1]
     if admit:
         budget.plan(side,phase='reduction')
-    program=face_parent_program(mesh,ordered,odd_moments,keep_budget,retain_span,side,gram_keep,room)
+    program=face_parent_program(mesh,ordered,odd_moments,keep_budget,retain_span,side,gram_keep,room,
+                                None if carrier is None else int(carrier))
     result=program(jnp.asarray(tables['points']),jnp.asarray(tables['order']),
         jnp.asarray(tables['active']),tuple(s[1] for s in states),
         tuple(s[2] for s in states),tuple(s[3] for s in states),tuple(infinity))
