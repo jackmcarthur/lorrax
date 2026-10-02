@@ -349,7 +349,6 @@ class StreamedBank:
         self.devices = tuple(cells)
         self._cell = {(i[0].start or 0, i[1].start or 0): d for d, i in cells.items()}
         self.seconds, self.bounced = dict(write=0., read=0., wait=0.), 0
-        self.reads = dict(calls=0, runs=0, bytes=0, pread=0., place=0.)
         self._ahead, self._free, self._checks, self._read_error = {}, [], [], None
         self.digests = {d: np.zeros((self.n_out, len(self.shapes), self.q), np.uint64) for d in self.devices}
         self.written = np.zeros((self.n_out, len(self.shapes)), bool)
@@ -483,113 +482,56 @@ class StreamedBank:
 
     def reader(self, spans):
         """Each ``(o0, o1)`` or ``(o0, o1, (qa, qb))`` of ``spans`` in turn as one device array
-        ``[o1-o0, q, ...]`` (``q = qb - qa`` for a q span), read one ahead."""
-        return _Reader(self, [(int(s[0]), int(s[1]), None if len(s) < 3 or s[2] is None
-                               else (int(s[2][0]), int(s[2][1]))) for s in spans])
+        ``[o1-o0, q, ...]`` (``q = qb - qa`` for a q span), verified and agreed on every rank
+        (one control-store round per span), the next span's preads started behind it."""
+        spans = [(((int(s[0]), int(s[1])),), None if len(s) < 3 or s[2] is None
+                  else (int(s[2][0]), int(s[2][1]))) for s in spans]
+        for i, (runs, q_span) in enumerate(spans):
+            started = time.monotonic()
+            value = self.read_runs(runs, q_span, then=spans[i + 1] if i + 1 < len(spans) else None)
+            agree_io_error(self.check_reads(), path=self.dir, stage="streamed_bank.read")
+            self.seconds["read"] += time.monotonic() - started
+            yield value
 
-    def _load(self, o0, o1, q_span, staging):
-        """Run ``[o0·S, o1·S)`` of every local store, or rows ``q_span`` of each of its records,
-        as ``(px, py, n/16)`` at ``P('x','y',None)``."""
-        if q_span is not None and q_span != (0, self.q):
-            return self._load_rows(o0, o1, q_span, staging)
-        started = time.monotonic()
-        n, local = (o1 - o0) * self.S, {}
-        for d in self.devices:
-            store = self.stores[d]
-            if store.host is not None:
-                local[d] = store.view[o0 * self.S:o1 * self.S]
-                continue
-            if staging.get(d) is None or len(staging[d]) < n:
-                staging[d] = _aligned(n)
-            target = memoryview(staging[d])[:n]
-            for piece in [self._pool.submit(store.read, target[a:a + self.piece], o0 * self.S + a)
-                          for a in range(0, n, self.piece)]:
-                piece.result()
-            local[d] = np.frombuffer(staging[d], dtype=np.uint8, count=n)
-        flat = jax.make_array_from_callback(
-            (int(self.mesh.shape["x"]), int(self.mesh.shape["y"]), n // 16),
-            NamedSharding(self.mesh, P("x", "y", None)),
-            lambda i: local[self._cell[(i[0].start or 0, i[1].start or 0)]].view(np.complex128)[None, None])
-        flat.block_until_ready()
-        return flat, time.monotonic() - started
-
-    def _load_rows(self, o0, o1, q_span, staging):
-        """Rows ``[qa, qb)`` of every record of outputs ``[o0, o1)``, packed record after record
-        (one aligned run read per record, its rows copied out on the host)."""
-        started = time.monotonic()
-        qa, qb = q_span
-        sub = tuple((qb - qa) * r * c * 16 for r, c in self.shapes)
-        n = (o1 - o0) * sum(sub)
-        local = {}
-        for d in self.devices:
-            store = self.stores[d]
-            if staging.get(d) is None or len(staging[d]) < n:
-                staging[d] = _aligned(n)
-            packed = np.frombuffer(staging[d], dtype=np.uint8, count=n)
-            jobs, at = [], 0
-            for o in range(o0, o1):
-                for s, (r, c) in enumerate(self.shapes):
-                    first = o * self.S + self.starts[s] + qa * r * c * 16
-                    jobs.append((first, sub[s], at))
-                    at += sub[s]
-
-            def copy(job, store=store, packed=packed):
-                first, length, at = job
-                if store.host is not None:
-                    packed[at:at + length] = store.view[first:first + length]
-                    return
-                lo = first // self.align * self.align
-                hi = padded(first + length, self.align)
-                run = _aligned(hi - lo)
-                store.read(memoryview(run)[:hi - lo], lo)
-                packed[at:at + length] = np.frombuffer(run, np.uint8, count=hi - lo)[first - lo:first - lo + length]
-            for piece in [self._pool.submit(copy, job) for job in jobs]:
-                piece.result()
-            local[d] = packed
-        flat = jax.make_array_from_callback(
-            (int(self.mesh.shape["x"]), int(self.mesh.shape["y"]), n // 16),
-            NamedSharding(self.mesh, P("x", "y", None)),
-            lambda i: local[self._cell[(i[0].start or 0, i[1].start or 0)]].view(np.complex128)[None, None])
-        flat.block_until_ready()
-        return flat, time.monotonic() - started
-
-    def read_runs(self, runs, then=()):
-        """Outputs of every run ``[(o0, o1), ...]`` as one device array ``[Σ(o1-o0), q, ...]``
-        (the W bank's reads: one call per field and parent batch). Every run's preads are in
-        flight together on the I/O threads, then one placement and one unpack. ``then`` names
-        the runs the caller reads next; their preads start now (at most two guesses held).
-        Failures and digest checks wait for :meth:`check_reads`, which the caller agrees
-        across ranks before it uses the value."""
+    def read_runs(self, runs, q_span=None, then=None):
+        """Outputs of every run ``[(o0, o1), ...]`` as one device array ``[Σ(o1-o0), q, ...]``,
+        or only rows ``q_span = (qa, qb)`` of each record (``q = qb - qa``). Every run's preads
+        are in flight together on the I/O threads, then one placement and one unpack.
+        ``then = (runs, q_span)`` names the caller's next read; its preads start now (at most
+        two guesses held). Failures and digest checks wait for :meth:`check_reads`, which the
+        caller agrees across ranks before it uses the value."""
         runs = tuple((int(a), int(b)) for a, b in runs)
-        started = time.monotonic()
-        local, futures = self._ahead.pop(runs, None) or self._start(runs)
+        q_span = None if q_span is None or tuple(q_span) == (0, self.q) else tuple(int(v) for v in q_span)
+        key, started = (runs, q_span), time.monotonic()
+        local, futures = self._ahead.pop(key, None) or self._start(*key)
         for future in futures:
             try:
                 future.result()
             except BaseException as exc:
                 self._read_error = self._read_error or OSError(
-                    f"GATE streamed_bank: {self.label} outputs {list(runs)} unread: {exc!r}")
-        self.reads["pread"] += time.monotonic() - started
-        self.seconds["read"] += time.monotonic() - started
-        then = tuple((int(a), int(b)) for a, b in then)
-        if then and then not in self._ahead:
-            while len(self._ahead) >= 2:
-                self._settle(self._ahead.pop(next(iter(self._ahead))))
-            self._ahead[then] = self._start(then)
-        mark, n_out = time.monotonic(), sum(b - a for a, b in runs)
+                    f"GATE streamed_bank: {self.label} outputs {list(runs)} rows {q_span} unread: {exc!r}")
+        self.seconds["wait"] += time.monotonic() - started
+        if then is not None:
+            ahead = (tuple((int(a), int(b)) for a, b in then[0]),
+                     None if then[1] is None or tuple(then[1]) == (0, self.q) else tuple(int(v) for v in then[1]))
+            if ahead not in self._ahead:
+                while len(self._ahead) >= 2:
+                    self._settle(self._ahead.pop(next(iter(self._ahead))))
+                self._ahead[ahead] = self._start(*ahead)
+        qa, qb = (0, self.q) if q_span is None else q_span
+        records16 = tuple((qb - qa) * r * c for r, c in self.shapes)
+        n_out = sum(b - a for a, b in runs)
+        count = n_out * sum(records16) if q_span is not None else n_out * self.S // 16
         flat = jax.make_array_from_callback(
-            (int(self.mesh.shape["x"]), int(self.mesh.shape["y"]), n_out * self.S // 16),
+            (int(self.mesh.shape["x"]), int(self.mesh.shape["y"]), count),
             NamedSharding(self.mesh, P("x", "y", None)),
             lambda i: self._own(np.frombuffer(local[self._cell[(i[0].start or 0, i[1].start or 0)]],
-                                              np.complex128, n_out * self.S // 16))[None, None])
+                                              np.complex128, count))[None, None])
         flat.block_until_ready()        # the staging buffer is reused after this
         self._settle((local, ()))
-        self.reads["place"] += time.monotonic() - mark
-        value, digest = _unpack(self.mesh, n_out, self.q, self.shapes, self.rects, self.tile,
-                                tuple(r // 16 for r in self.records))(flat)
-        self._checks.append((runs, digest))
-        self.reads.update(calls=self.reads["calls"] + 1, runs=self.reads["runs"] + len(runs),
-                          bytes=self.reads["bytes"] + n_out * self.S)
+        value, digest = _unpack(self.mesh, n_out, qb - qa, self.shapes, self.rects, self.tile,
+                                records16 if q_span is not None else tuple(r // 16 for r in self.records))(flat)
+        self._checks.append((runs, (qa, qb), digest))
         return value
 
     def check_reads(self):
@@ -598,11 +540,11 @@ class StreamedBank:
         error, self._read_error = self._read_error, None
         checks, self._checks = self._checks, []
         try:
-            for runs, digest in checks:
+            for runs, (qa, qb), digest in checks:
                 if not self.unwritten_zero and not all(self.written[a:b].all() for a, b in runs):
                     raise OSError(f"GATE streamed_bank: {self.label} outputs {list(runs)} were not all written")
                 for shard in digest.addressable_shards:
-                    expected = np.concatenate([self.digests[shard.device][a:b] for a, b in runs])
+                    expected = np.concatenate([self.digests[shard.device][a:b, :, qa:qb] for a, b in runs])
                     if not np.array_equal(np.asarray(shard.data)[0, 0], expected):
                         raise OSError(f"GATE streamed_bank: {self.label} outputs {list(runs)} "
                                       "do not match their write digests")
@@ -610,27 +552,45 @@ class StreamedBank:
             error = error or exc
         return error
 
-    def _start(self, runs):
-        """Start the preads of ``runs``: ``({device: staging bytes}, futures)``."""
-        n, local, futures = sum(b - a for a, b in runs) * self.S, {}, []
+    def _start(self, runs, q_span=None):
+        """Start the preads of ``runs`` (rows ``q_span`` of each record, else whole records):
+        ``({device: staging bytes}, futures)``."""
+        if q_span is None:
+            jobs = [(o0 * self.S + k, min(self.piece, (o1 - o0) * self.S - k))
+                    for o0, o1 in runs for k in range(0, (o1 - o0) * self.S, self.piece)]
+        else:
+            # One aligned superset read per record segment, its rows copied out on the host.
+            qa, qb = q_span
+            jobs = [(o * self.S + self.starts[s] + qa * r * c * 16, (qb - qa) * r * c * 16)
+                    for o0, o1 in runs for o in range(o0, o1) for s, (r, c) in enumerate(self.shapes)]
+        n, local, futures = sum(length for _, length in jobs), {}, []
         try:
             for d in self.devices:
                 store = self.stores[d]
                 if store.host is not None:
-                    local[d] = np.concatenate([store.view[a * self.S:b * self.S] for a, b in runs])
+                    local[d] = np.concatenate([store.view[first:first + length] for first, length in jobs])
                     continue
                 fit = [i for i, buf in enumerate(self._free) if len(buf) >= n]
                 buf = self._free.pop(fit[0]) if fit else _aligned(n)
                 local[d], target, at = buf, memoryview(buf), 0
-                for a, b in runs:
-                    length = (b - a) * self.S
-                    futures += [self._pool.submit(store.read, target[at + k:at + k + min(self.piece, length - k)],
-                                                  a * self.S + k) for k in range(0, length, self.piece)]
+                for first, length in jobs:
+                    futures.append(self._pool.submit(store.read, target[at:at + length], first)
+                                   if q_span is None else
+                                   self._pool.submit(self._read_rows, store, target[at:at + length], first))
                     at += length
         except BaseException as exc:
             self._read_error = self._read_error or exc
             local = {d: local[d] if d in local else _aligned(n) for d in self.devices}
         return local, futures
+
+    def _read_rows(self, store, target, first):
+        """Bytes ``[first, first + len(target))`` of ``store``, read through the aligned
+        superset (O_DIRECT reads whole aligned blocks)."""
+        lo, hi = first // self.align * self.align, padded(first + len(target), self.align)
+        run = _aligned(hi - lo)
+        store.read(memoryview(run)[:hi - lo], lo)
+        target[:] = memoryview(run)[first - lo:first - lo + len(target)]
+        run.close()
 
     def _own(self, rows):
         # A CPU device may alias host memory; the staging buffer is reused.
@@ -669,50 +629,3 @@ class StreamedBank:
             store.close()
 
 
-class _Reader:
-    """One-ahead reader of a :class:`StreamedBank`'s output runs (two staging slots)."""
-
-    def __init__(self, bank, spans):
-        self.bank, self.spans, self.at, self._staging = bank, spans, 0, ({}, {})
-        self._thread = ThreadPoolExecutor(1, thread_name_prefix="bank-read")
-        self._next = self._submit(0)
-
-    def _submit(self, i):
-        if i < len(self.spans):
-            return self._thread.submit(self.bank._load, *self.spans[i], self._staging[i % 2])
-
-    def __iter__(self):
-        return self
-
-    def __next__(self):
-        bank = self.bank
-        if self.at >= len(self.spans):
-            self._thread.shutdown(wait=True)
-            raise StopIteration
-        (o0, o1, q_span), error, started = self.spans[self.at], None, time.monotonic()
-        qa, qb = (0, bank.q) if q_span is None else q_span
-        try:
-            flat, seconds = self._next.result()
-            bank.seconds["read"] += seconds
-        except BaseException as exc:
-            error, flat = exc, None
-        self.at += 1
-        self._next = self._submit(self.at)
-        bank.seconds["wait"] += time.monotonic() - started
-        agree_io_error(error, path=bank.dir, stage="streamed_bank.read")
-        records16 = (tuple(r // 16 for r in bank.records) if (qa, qb) == (0, bank.q)
-                     else tuple((qb - qa) * r * c for r, c in bank.shapes))
-        value, digest = _unpack(bank.mesh, o1 - o0, qb - qa, bank.shapes, bank.rects, bank.tile,
-                                records16)(flat)
-        try:
-            if not bank.unwritten_zero and not bank.written[o0:o1].all():
-                raise OSError(f"GATE streamed_bank: outputs [{o0}, {o1}) were not all written")
-            for shard in digest.addressable_shards:
-                if not np.array_equal(np.asarray(shard.data)[0, 0],
-                                      bank.digests[shard.device][o0:o1, :, qa:qb]):
-                    raise OSError(f"GATE streamed_bank: digest mismatch reading outputs [{o0}, {o1}) "
-                                  f"rows [{qa}, {qb})")
-        except BaseException as exc:
-            error = exc
-        agree_io_error(error, path=bank.dir, stage="streamed_bank.digest")
-        return value

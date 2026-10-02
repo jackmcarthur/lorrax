@@ -1529,7 +1529,7 @@ class ResidentBankPayload:
             nxt = q0 + span if q0 + 2 * span <= nq else None
             value = _tier_lead(self.mesh, len(shape), len(leads))(store.read_runs(
                 [(s * nq + q0, s * nq + q0 + span) for s in leads],
-                then=() if nxt is None else [(s * nq + nxt, s * nq + nxt + span) for s in leads]))
+                then=None if nxt is None else ([(s * nq + nxt, s * nq + nxt + span) for s in leads], None)))
             self._read = True
             if not self._depth:
                 self._agree_reads()
