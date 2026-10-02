@@ -22,7 +22,7 @@ import numpy as np
 def shared_pole_byte_terms(meta, *, mesh_xy, resolution, pencil_side,
                            parent_batch, sample_batch, phase="reduction",
                            selection_faces=None, cross_original_sides=None,
-                           padding_output_bytes_per_rank=0):
+                           padding_output_bytes_per_rank=0, paired=False):
     """Price constructor carriers; the map CapacityLedger owns admission.
 
     Selection holds samples, current narrow actions and the n x n direction
@@ -32,6 +32,8 @@ def shared_pole_byte_terms(meta, *, mesh_xy, resolution, pencil_side,
     pencil. Model checks hold factors and bounded samples, with no pencil.
     Native workspace is separately supplied by the service. No threshold
     or independent capacity policy lives in this constructor helper.
+    ``paired`` prices the rank-local paired (ordered) reduction, which holds
+    fewer side-squared temporaries than the even one.
     """
     p = int(mesh_xy.shape["x"]) * int(mesh_xy.shape["y"])
     # Constructor carriers are mu x mu charge operators on every admitted deck.
@@ -73,7 +75,10 @@ def shared_pole_byte_terms(meta, *, mesh_xy, resolution, pencil_side,
     elif phase == "reduction":
         if selection_faces is not None:
             raise ValueError('selection_faces applies only to selection')
-        dense = 14 * r*r + 12 * packed * r
+        # Compiled local round programs (P4, one parent per rank), temp + output
+        # per side**2 complex: even 11.7-12.5 (side 5152/10304, n 896/1792);
+        # paired 5.9-7.1 (side 5376/10304, Ritz carrier 2048-3208).
+        dense = (8 if paired else 14) * r*r + 12 * packed * r
         sample_faces = 0
     elif phase == "model":
         if selection_faces is not None:
@@ -169,6 +174,9 @@ class ConstructorCapacity:
         self._phase = "selection"
         self.retained_panels = ()
         self.batch_width = 1
+        # The pole budget of a rank-local paired reduction, else None: its
+        # largest eigh is max(H'_vv, 2 x Ritz width), not the pencil side.
+        self.ritz_budget = None
 
     def eigenplan(self, side):
         """One service plan per configured execution layout and actual side."""
@@ -218,6 +226,8 @@ class ConstructorCapacity:
             side, phase=phase, sample_batch=sample_batch,
             selection_faces=selection_faces, cross_original_sides=cross_original_sides,
             padding_output_bytes_per_rank=padding_output_bytes_per_rank)
+        if eigen_side is None and phase == "reduction" and self.ritz_budget is not None:
+            eigen_side = max(side // 2, 2 * min(side // 2, int(self.ritz_budget)))
         extents = {n} if phase == "selection" else (
             {side if eigen_side is None else int(eigen_side)} if phase in ("reduction", "cross_reduction") else {n})
         # Eigh scratch is transient: replace it at each phase boundary.
@@ -258,7 +268,8 @@ class ConstructorCapacity:
             sample_batch=sample_batch, phase=phase,
             selection_faces=selection_faces,
             cross_original_sides=cross_original_sides,
-            padding_output_bytes_per_rank=padding_output_bytes_per_rank)
+            padding_output_bytes_per_rank=padding_output_bytes_per_rank,
+            paired=self.ritz_budget is not None)
         # Other parents' narrow inputs survive selection and each model's
         # checks; they are additional live storage, never hidden in a limit.
         extra = sum(_shard_bytes(a)

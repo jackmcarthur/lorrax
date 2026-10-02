@@ -184,6 +184,7 @@ def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output, resi
         budget = ConstructorCapacity(meta, resolution, mesh_xy=mesh_xy,
                                      ledger=ledger, upstream=upstream,
                                      execution=execution)
+        budget.ritz_budget = recipe.get("pole_budget") if ordered and execution == 'local' else None
         # A face constructor keeps the Coulomb eigensolve on the same complete
         # mesh even when the deck's default dense policy is local.
         coulomb_config = ({'linalg': 'distributed'}
