@@ -54,6 +54,7 @@ struct Program {
     std::vector<std::string> version_files;                      // toolchain version headers
     std::string extra_key;                                       // hashed last
     const char* kernel = nullptr;                                // entry point
+    std::vector<const char*> entries;                            // further entry points
 };
 
 uint64_t fnv1a(std::string_view data, uint64_t h = 1469598103934665603ULL);
@@ -74,12 +75,14 @@ uint64_t key(const Program& p, std::string* missing);
 
 struct Image {
     CUfunction fn = nullptr;
+    std::vector<CUfunction> fns;                                 // p.entries, in order
     double ms = 0.0;
     bool from_disk = false, stored = false, rebuilt_bad = false;
 };
 
 // Load `cache_path` (framed with `key_hex`) when it is non-empty and valid, else compile (and
-// store it under `cache_dir`); load the module and resolve `p.kernel`.  On failure *where names
+// store it under `cache_dir`); load the module and resolve `p.kernel` and `p.entries` (passes of
+// one program that run at their own register budgets).  On failure *where names
 // the step and *err the reason.
 bool build(const Program& p, const std::string& cache_dir, const std::string& cache_path,
            const std::string& key_hex, Image* out, std::string* where, std::string* err);
