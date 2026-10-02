@@ -1821,16 +1821,33 @@ def _unitary_inversion(plan):
     return rows[0] if rows else None
 
 
+@lru_cache(maxsize=8)
+def _photon_rows_order(families, mesh_xy, to_packed):
+    """The −q mirror's crossing of ``[q, N, N]`` rows between the canonical and packed
+    photon orders (:func:`gw.photon_layout.photon_carry_order`), one cached program
+    each way: to packed, the given fields joined along q; to canonical, the joined
+    rows split back into ``n_fields`` stacks."""
+    from .photon_layout import photon_carry_order
+    face = NamedSharding(mesh_xy, P(None, "x", "y"))
+    if to_packed:
+        return jax.jit(lambda *fields: photon_carry_order(
+            jnp.concatenate(fields)[None], families, mesh_xy, to_packed=True)[0], out_shardings=face)
+    return jax.jit(lambda rows, n_fields: tuple(jnp.split(photon_carry_order(
+        rows[None], families, mesh_xy, to_packed=False)[0], n_fields)),
+        static_argnums=1, out_shardings=face)
+
+
 def _minus_q_mirror_photon(families, meta, mesh_xy):
     """The four-current ``chi_{-q}`` rows from ``chi_q`` rows by a unitary inversion, or ``None``.
 
     As :func:`_minus_q_mirror` on each Lorentz block, with the two families' plans on its endpoints and the inversion's
     Lorentz action (``symmetry_maps.mix_lorentz_blocks``), one source block
     at a time (``w_isdf.photon_blocks_full_q``'s restore), on the families'
-    packed layout (the plans' centroid order).
+    packed layout (the plans' centroid order).  Every field (χ and dχ/ds)
+    given runs as one stack of rows.
     """
     from symmetry_maps import bgw_integer_q_to_fractional, mix_lorentz_blocks, unfold_isdf_operator
-    from .photon_layout import _empty, _insert, photon_block_view, photon_carry_order
+    from .photon_layout import _empty, _insert, photon_block_view
     plans, layout = tuple(families.plans), families.packed_layout
     rows = {_unitary_inversion(plan) for plan in plans}
     if len(rows) != 1 or None in rows:
@@ -1842,12 +1859,13 @@ def _minus_q_mirror_photon(families, meta, mesh_xy):
     classes = tuple(tuple((C, D) for C in ((1, 2, 3) if a else (0,))
                           for D in ((1, 2, 3) if b else (0,))) for a in (0, 1) for b in (0, 1))
 
-    def mirror(rows, q0, q1):
-        n = int(q1) - int(q0)
+    def mirror(fields, q0, q1):
+        n = (int(q1) - int(q0)) * len(fields)
         irr, ops = np.arange(n, dtype=np.int32), np.full(n, inversion, dtype=np.int32)
+        frac = np.tile(q_frac[q0:q1], (len(fields), 1))
         # The plans act on each family's packed centroid order; the bank rows
         # are canonical, so the rows cross to the packed layout and back.
-        rows = photon_carry_order(rows[None], families, mesh_xy, to_packed=True)[0]
+        rows = _photon_rows_order(families, mesh_xy, True)(*fields)
         out = _empty(n, layout, mesh_xy, rows.dtype)
         for keys in classes:
             left, right = plans[int(keys[0][0] != 0)], plans[int(keys[0][1] != 0)]
@@ -1857,7 +1875,7 @@ def _minus_q_mirror_photon(families, meta, mesh_xy):
                     photon_block_view(rows, layout, C, D, mesh_xy), irr_idx=irr, sym_idx=ops,
                     sym_perm=left.sym_perm, L_table=left.L_table,
                     right_sym_perm=right.sym_perm, right_L_table=right.L_table,
-                    q_irr_frac=q_frac[q0:q1], mesh_xy=mesh_xy,
+                    q_irr_frac=frac, mesh_xy=mesh_xy,
                     n_sym_spatial=int(left.n_sym_spatial),
                     axis_local_sym_perm=left.centroid_local_perm,
                     right_axis_local_sym_perm=right.centroid_local_perm)
@@ -1866,7 +1884,8 @@ def _minus_q_mirror_photon(families, meta, mesh_xy):
                 total = mixed if total is None else {k: total[k] + mixed[k] for k in total}
             for (C, D), block in total.items():
                 out = _insert(out, block, layout, C, D, mesh_xy)
-        return photon_carry_order(out[None], families, mesh_xy, to_packed=False)[0]
+        del rows
+        return _photon_rows_order(families, mesh_xy, False)(out, len(fields))
     return mirror
 
 
@@ -1877,7 +1896,8 @@ def _minus_q_mirror(plan, sym, meta, mesh_xy):
     parent row unfolded by that operation (``symmetry_maps.unfold_isdf_operator``
     with the plan's packed centroid tables, as V and W are restored).  Taken
     when the plan holds a unitary (spatial) operation equal to -1 whose centroid
-    map is complete.  Returns ``mirror(rows, q0, q1)`` for the parents ``[q0, q1)``.
+    map is complete.  Returns ``mirror(fields, q0, q1)``: each field's rows of the
+    parents ``[q0, q1)`` mirrored.
     """
     from symmetry_maps import bgw_integer_q_to_fractional, unfold_isdf_operator
     n_spatial = int(plan.n_sym_spatial)
@@ -1887,14 +1907,14 @@ def _minus_q_mirror(plan, sym, meta, mesh_xy):
     kgrid = (int(meta.nkx), int(meta.nky), int(meta.nkz))
     q_frac = np.asarray(bgw_integer_q_to_fractional(sym.q_irr_kgrid_int, kgrid))
 
-    def mirror(rows, q0, q1):
+    def mirror(fields, q0, q1):
         n = int(q1) - int(q0)
-        return unfold_isdf_operator(
+        return tuple(unfold_isdf_operator(
             rows, irr_idx=np.arange(n, dtype=np.int32),
             sym_idx=np.full(n, inversion, dtype=np.int32),
             sym_perm=plan.sym_perm, L_table=plan.L_table, q_irr_frac=q_frac[q0:q1],
             mesh_xy=mesh_xy, n_sym_spatial=n_spatial,
-            axis_local_sym_perm=plan.centroid_local_perm)
+            axis_local_sym_perm=plan.centroid_local_perm) for rows in fields)
     return mirror
 
 
@@ -1948,9 +1968,9 @@ class _MemberRows:
         return self.carry[self.first + int(i), rows]
 
 
-#: Face-sized arrays one parent's partner unfold holds at once (the tile's
-#: gathered rows, their packed copy, the unfolded block, the mixed block and
-#: the output on the four-current route), the bound the partner tile is
+#: Face-sized arrays one parent's partner unfold holds at once per field (the
+#: tile's gathered rows, their packed copy, the unfolded block, the mixed block
+#: and the output on the four-current route), the bound the partner tile is
 #: sized from.
 MIRROR_TILE_STACKS = 5
 
@@ -1966,8 +1986,8 @@ def _dyson_phase(dyson, solve_slope, roots, held_roots, mesh_xy, layout, *, nq, 
     A deck without a pair: ``sample_dyson`` takes ``(H, chi)``; ``sample_slope``
     takes ``(H, Wc, dchi)`` while the value's chi rows are still held (one more
     face stack).  Both at the full parent span ``nq``, the largest a sample solves.  ``mirrored``:
-    a partner's rows are collected from unfolded tiles before they are
-    concatenated (one more stack, plus one tile's unfold).
+    a partner's χ and dχ/ds rows are collected from unfolded tiles before they
+    are concatenated (two more stacks, plus one tile's unfold).
     """
     sharding = getattr(roots, "sharding", None)
     if sharding is None or not hasattr(roots, "shape"):
@@ -1978,7 +1998,7 @@ def _dyson_phase(dyson, solve_slope, roots, held_roots, mesh_xy, layout, *, nq, 
     held = 16 * int(nq) * int(n) * int(n) // int(mesh_xy.size)
     if mirrored:
         from runtime.tiles import TILE_BYTES
-        extra_bytes = held + min(int(TILE_BYTES), MIRROR_TILE_STACKS * held)
+        extra_bytes = 2 * held + min(int(TILE_BYTES), 2 * MIRROR_TILE_STACKS * held)
     else:
         extra_bytes = 0
     phases = []
@@ -2340,16 +2360,18 @@ def produce_sample_bank(wfns, meta, config, *, mesh_xy, sym, sample_plan, bank_i
         selected = (partner_qids if partner and not mirrored else qids)[q0:q1]
         rows = np.asarray([row_index[int(q)] for q in selected])
 
-        def chi_rows(i):
+        def chi_rows(fields):
+            """The rows of each field (0 χ, 1 dχ/ds), every field through one mirror call."""
             if not mirrored:
-                return raw[i, rows]
+                return tuple(raw[i, rows] for i in fields)
             # The partner rows are formed in parent tiles (runtime.tiles): one
-            # tile's unfold transients beside the collected stack.
+            # tile's unfold transients beside the collected stacks.
             from runtime.tiles import tile_units
-            step = tile_units(MIRROR_TILE_STACKS * face_bytes, len(rows))
-            parts = [mirror(raw[i, rows[a:a+step]], q0+a, q0+min(a+step, len(rows)))
-                     for a in range(0, len(rows), step)]
-            return parts[0] if len(parts) == 1 else jnp.concatenate(parts, axis=0)
+            step = tile_units(MIRROR_TILE_STACKS * len(fields) * face_bytes, len(rows))
+            parts = [mirror(tuple(raw[i, rows[a:a+step]] for i in fields), q0+a,
+                            q0+min(a+step, len(rows))) for a in range(0, len(rows), step)]
+            return parts[0] if len(parts) == 1 else tuple(
+                jnp.concatenate(column, axis=0) for column in zip(*parts))
         span = (int(q0), int(q1))
         h = roots[q0:q1]
         constant = 0.
@@ -2368,11 +2390,11 @@ def produce_sample_bank(wfns, meta, config, *, mesh_xy, sym, sample_plan, bank_i
                 return add_direct_gamma_field(packed, coefficient,
                     gamma_vectors=direct_head["gamma_vectors"],
                     layout=bank_io["photon_layout"], mesh=mesh_xy)
-        chi = chi_rows(1)
+        chi, *chi_value = chi_rows((1, 0) if need_value else (1,))
         if partner:
             chi = jnp.conj(chi)
         if need_value:
-            chi_value = chi_rows(0)
+            chi_value, = chi_value
             if partner:
                 chi_value = jnp.conj(chi_value)
         if need_value and dyson.pair(layout) is not None:
