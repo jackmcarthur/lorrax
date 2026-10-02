@@ -571,11 +571,13 @@ its tier ([memory model](memory-model.md#streamed-chi-bank),
 - **Capacity.** One all-gather at creation agrees the alignment, rank 0's
   free bytes and every process's promised bytes. Free bytes are the
   filesystem's free space and, where `lfs` exists, the room under the user's
-  Lustre quota (soft limit, else hard), less what live stores have promised
-  (a file stays sparse, and outside the quota, until it is written). A bank
-  that does not fit is refused on every rank before any compute
-  (`GATE streamed_bank_capacity`, `fits = False`); the caller then takes a
-  smaller bank. A verdict costs 45–64 ms at P4 (claim 3111).
+  Lustre quota (soft limit, else hard), less the bytes live stores have
+  reserved and not yet written (a file stays sparse, and outside the quota,
+  until it is written; written bytes are in the quota's used count, so they
+  leave the promise). A bank that does not fit is refused on every rank
+  before any compute (`GATE streamed_bank_capacity`, `fits = False`); the
+  caller then takes a smaller bank. A verdict costs 45–64 ms at P4 (claim
+  3111).
 - **Lifetime.** A store file is unlinked as soon as it is opened. Its bytes
   live as long as the process's descriptor, so a refusal, a kill or a SIGKILL
   frees them, and an `ls` of `streamed_bank/` shows nothing while a run holds
@@ -594,7 +596,8 @@ its tier ([memory model](memory-model.md#streamed-chi-bank),
 | refusal | cause |
 |---|---|
 | `GATE streamed_bank_capacity` | the disk or quota cannot hold the store, or a reservation failed; the caller falls back |
-| `GATE io_global_commit … streamed_bank.commit` | a drain failed on some rank; the message carries that rank's error |
+| `GATE streamed_bank_capacity: store … was refused at creation and cannot be written` | a `put` to a refused store (every rank alike): a caller wrote without falling back, e.g. a W-bank field store created during the map |
+| `GATE io_global_commit … streamed_bank.commit` | a drain failed on some rank; the message carries that rank's error and its innermost frame |
 | `GATE streamed_bank: … unread` / `short read` | a read of the named outputs and rows failed |
 | `GATE streamed_bank: … do not match their write digests` | the bytes read back differ from the bytes written |
 | `GATE streamed_bank: … were not all written` | a read of a record no `put` wrote (the χ and moment banks) |
