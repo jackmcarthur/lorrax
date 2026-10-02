@@ -199,6 +199,7 @@ def _reserve(fd, nbytes):
 #: sparse (and outside the quota) until it is written, so the free space a new
 #: store sees must leave them out.
 _PROMISED = [0]
+_PROMISE_LOCK = threading.Lock()
 
 
 def _existing(directory):
@@ -387,7 +388,8 @@ class StreamedBank:
         try:
             agree_io_error(error, path=self.dir, stage="streamed_bank.create")
             self.fits = True
-        except RuntimeError:
+        except RuntimeError as exc:
+            self._refused = str(exc)
             self._close_stores()
             self.fits = False
         self.promised = self.nbytes * len(self.stores) if kind == "file" else 0
@@ -401,6 +403,10 @@ class StreamedBank:
     def put(self, p, carry, outputs):
         """Store segment ``p``: carry row ``r`` as output ``o`` for each ``(r, o)``.  Returns at
         once; a failure is held for :meth:`commit`."""
+        if not self.fits:
+            # Agreed on every rank at creation, so every rank refuses here alike.
+            raise RuntimeError(f"GATE streamed_bank_capacity: store {self.label} was refused at "
+                               f"creation and cannot be written: {self._refused}")
         outputs = tuple((int(r), int(o)) for r, o in outputs)
         digest = _record_digests(self.mesh, tuple(carry.shape))(carry)
         # Every program the drain thread will run is compiled here, on the
@@ -456,6 +462,12 @@ class StreamedBank:
                     source = np.frombuffer(aligned, np.uint8, count=len(source))
                     self.bounced += 1
                 store.write(memoryview(source), o * self.S + self.starts[p] + 16 * a)
+                # Written bytes are in the quota's used count now: they leave the promise
+                # (else a later store's probe counts them twice, Ni 20³ P64 map 1).
+                with _PROMISE_LOCK:
+                    done = min(len(source), self.promised)
+                    self.promised -= done
+                    _PROMISED[0] -= done
 
         for program, row, o, a in work:
             with _OFFLOAD:
@@ -479,10 +491,11 @@ class StreamedBank:
         try:
             self.seconds["write"] += self._inflight.popleft().result()
         except BaseException as exc:
-            # The agreed refusal carries the message; this rank's log keeps the stack.
-            print("[slab_io] streamed store drain failed on this rank:\n"
-                  + "".join(traceback.format_exception(exc)), flush=True)
-            self._error = self._error or exc
+            # The agreed refusal carries the message and the innermost frame (stdout
+            # may be routed away on a production rank).
+            frame = traceback.extract_tb(exc.__traceback__)[-1] if exc.__traceback__ else None
+            where = f" [{Path(frame.filename).name}:{frame.lineno} in {frame.name}]" if frame else ""
+            self._error = self._error or RuntimeError(f"{type(exc).__name__}: {exc}{where}")
         self.seconds["wait"] += time.monotonic() - started
 
     def commit(self):
@@ -641,8 +654,9 @@ class StreamedBank:
         agree_io_error(error, path=self.dir, stage="streamed_bank.release")
 
     def _close_stores(self):
-        _PROMISED[0] -= getattr(self, "promised", 0)
-        self.promised = 0
+        with _PROMISE_LOCK:
+            _PROMISED[0] -= getattr(self, "promised", 0)
+            self.promised = 0
         stores, self.stores = self.stores, {}
         for store in stores.values():
             store.close()
