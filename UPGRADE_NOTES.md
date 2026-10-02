@@ -15,6 +15,56 @@ and the capacity-ledger row `door_tables` is now `kconv_tables`. A parser that
 matched the old names must match the new ones. `minimax.door` is now
 `minimax.serving`; `import minimax` is unchanged. No number moves.
 
+## 2026-10-01 — the shared-pole χ and W banks stream through scratch; keep terabytes free
+
+When a shared-pole map's χ bank (the value and slope of every response sample)
+does not fit the devices, the response stream now runs once with every sample
+and writes its carry to SlabIO's per-rank streamed tier, instead of re-running
+every Green pair once per sample group. The W bank goes to the same tier when
+it does not fit the devices. Each bank is held in host memory when it fits half
+the host budget, else in one file per rank under
+`<run dir>/<label>_shared_pole/streamed_bank/`. gwjax.out names the choice, for
+example `Response quadrature: chi bank file, 34.94 GiB/rank; streamed; exceeds
+half the host budget`. Results are bitwise (Fe 4³, Na 8³ and Fe 4³ bispinor
+SC maps 0–2; claims 3082, 3111). The Fe 8³ P4 χ build takes 35 → 19 s per map.
+
+- **Scratch.** A large deck needs the χ bank's bytes free on scratch, and
+  under the quota, during every map: 2.4 TB for Ni 20³ charge and 15.3 TB for
+  Fe 20³ bispinor at 1062 parents
+  ([memory model](docs/architecture/memory-model.md#streamed-chi-bank)). When
+  the disk or quota cannot hold it, the samples run in disk groups (half the
+  samples per try), then in device groups. Each group re-runs every Green
+  pair: the Fe 20³ bispinor χ build is about 420 s per map in one group and
+  1,300–1,400 s in four.
+- **Lifetime.** A file is unlinked as soon as it is opened, so `ls` shows an
+  empty directory while the run holds the bytes, and every exit, SIGKILL
+  included, frees them. Nothing is kept across SC maps, and an interrupted
+  map cannot resume from the tier.
+- **Cleanup.** Code before 2ee02941a left named files after an abnormal exit.
+  The first shared-pole map of a process now removes every `streamed_bank/`
+  directory in its run directory and prints `WARNING shared-pole output:
+  removed streamed stores left by an earlier process`. Delete those
+  directories of finished runs by hand
+  ([SlabIO](docs/architecture/slab_io.md#streamed-tier)).
+
+## 2026-10-01 — row passes run as one scan; compile no longer grows with the pass count
+
+The Σ τ node, the static τ = 0 node (Σ_x, SX, COH), the bispinor sector node
+and the charge and four-current χ streams now run their row passes as equal
+orbit-aligned windows in one `lax.scan`. The unfold tables are cut on the
+device and the k-convolutions skip each window's padded rows
+([memory model](docs/architecture/memory-model.md#the-green-side-stages)), so
+one program serves every pass. Compile: the static Σ program at 223 passes
+25.7 → 0.8 s; the streamed χ bank's segment programs 33 (21.6 s) → 1 (0.7 s)
+on the charge stream and 203 (234.6 s) → 4 (4.9 s) on the four-current
+stream, whose peak falls by 3.6 GB per rank. Walls are within ±1 %. A rank whose rows fit one
+tile runs one pass and is bitwise (Fe 4³ scalar, Na 8³ and Fe 4³ bispinor
+SP-full, maps 0–2). With several Σ passes per rank the sums group
+differently and move at round-off, the size of a 4e-16 control (≤ 1e-7 eV on
+Fe 4³ forced to many passes); the χ streams stay bitwise (claims 3114,
+3122). The k-convolutions' `live` operand needs bundle B9r or later; the
+`lorrax_A` module has it.
+
 ## 2026-10-01 — the photon bank solves a sample's Dyson value and slope in one program
 
 The four-current bank now forms each sample's W − W∞ and its slope in one program, as

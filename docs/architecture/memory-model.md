@@ -9,7 +9,11 @@ No planner refuses on a price (owner 2026-10-01): a stage over its budget
 raises one `RuntimeWarning: memory over budget at <stage>` (needed, budget, by
 how much; `common.gpu_utils.warn_over_budget`; gwjax.out lists it under
 WARNINGS), runs at its smallest size, and OOMs if the device truly lacks the
-room.
+room. What still refuses is not a price: a kernel shape limit (a k-grid a
+mathdx mode cannot hold, `GATE response_vertex_grid` and the
+[k-convolution residency gates](ffi_layout.md#k-convolution-router-and-the-mathdx-family)),
+a workspace that cannot be measured (`GATE shared_pole_capacity: … FFT
+workspace unavailable`), and the correctness gates.
 
 | symbol | meaning |
 |---|---|
@@ -47,20 +51,43 @@ sizes still follow the budget, through a ledger: the shared-pole response
 sample group (`response_bank.response_group_size`, the capacity ledger; a
 larger group buys more than 10 % per map) and the Galerkin whole-state
 planner (`isdf.galerkin`, whose capacity also bounds its resident rows).
+A 4 GiB tile was measured and not taken: at the Fe/Ni 20³ P64-local tile it
+cut one χ₀ dispatch by 16 % (four-current) and 9 % (scalar) for four times
+the tile's device memory (claim 3078).
 
-**The χ bank streams instead of splitting into sample groups.** When every
-sample's χ carry does not fit one group on the devices and the stream runs on
-the row-pass engine (`gw.subtile_stream`; charge and four-current), the
-stream runs once with every sample, one program per segment (a row pass, or
-one family pair's row pass), and each finished segment goes to SlabIO's
-per-rank streamed tier (`file_io.slab_io.StreamedBank`;
-`response_bank.response_bank_residence`, the shared-pole bank's device /
-host / file rule): host memory when it takes at most half the host budget,
-else one O_DIRECT file per rank. The devices hold two segment carries, then
-three sample reads; the host stages at most four 64 MiB pinned pieces per
-rank. Measured on one node at the P64-local volume (75.6 GB per rank,
-4-stripe files): 30 GB/s write, 25 GB/s read per node, every read
-digest-checked.
+<a id="streamed-chi-bank"></a>
+**The χ bank streams instead of splitting into sample groups.**
+The response stream's carry is the bank: the value and slope of every
+response sample on the response rows. When every sample's carry does not fit
+one group on the devices, the stream runs once with every sample, and each
+finished row pass goes to SlabIO's per-rank streamed tier
+([SlabIO](slab_io.md#streamed-tier); `response_bank.response_bank_residence`,
+the shared-pole bank's device / host / file rule): host memory when it takes
+at most half the host budget, else one file per rank. The devices hold two
+pass carries, then three sample reads. Its size per map, over all ranks, is
+
+```text
+χ bank = 2 · N_samples · N_rows · 16 · d²       bytes
+```
+
+with `N_rows` the parent q rows the stream carries (their −q partner rows
+too on an ordered bank without a unitary inversion) and `d` the carrier: `μ`
+on the charge bank, the packed extent `μ + 3μ_T` on the four-current bank.
+Ni 20³ charge (22 samples, 1062 parents, μ 1782): 2.4 TB per map, 34.9 GiB
+per rank at P64. Fe 20³ bispinor (1062 parents, μ 1800, μ_T 900): 15.3 TB
+per map, which needs that much free scratch and quota. The W bank comes on
+top while the samples are solved
+([shared-pole model §10](shared_pole_model.md#10-byte-model)), and both are
+released within the map.
+
+When the disk or quota cannot hold the bank on some rank, the samples
+stream in disk groups, each try half the last, one store reused group
+after group; once a disk group would be no larger than the device group,
+the samples run in groups on the devices. A group re-runs every Green pair,
+so this costs time: the Fe 20³ bispinor χ build at the P64-local shape is
+about 420 s per map in one streamed group, 1,300–1,400 s in four disk
+groups and about 5,700 s in device groups. Without the row-pass engine (the
+full-k Green route) the bank stays in device groups.
 
 A planner fills `target = budget × utilization`. Utilization defaults to
 0.90, 0.85 and 0.78 for `n_s` = 1, 2 and ≥4
@@ -156,6 +183,23 @@ whose bytes fit the fixed tile. ψ is band-complete once per Σ call,
 exists. `sigma_spin_block` (the output spin block `d`, a divisor of `n_s`,
 whose stored x block fits the fixed tile) still sizes the full-zone Σ kernels
 and the static (COHSEX) and PPM spatial kernels.
+
+**Row passes run as one scan.** The passes of the Σ τ node, the static
+τ = 0 node, the sector node and the charge and four-current χ streams are
+equal windows of `R` rows (`subtile_stream.plan_windows`, through
+`plan_passes` on the χ streams): `R` is the orbit-aligned row count nearest
+the fixed tile, and every window ends on an admissible orbit cut. The
+windows run as one `lax.scan` (`scan_passes`, `stream_passes`). Each slices
+its rows at a traced offset (`window_rows`); its unfold tables are cut from
+the tables placed once per run, on the device (`window_load`, the one
+table-cut owner); and the k-convolutions see only its live rows `[lo, hi)`
+(the `live` operand, [FFI layer](ffi_layout.md#k-convolution-router-and-the-mathdx-family)),
+so a padded window costs only its local Green GEMM rows. One program serves
+every pass, so compile time does not grow with the pass count: the static
+Σ program at 223 passes compiles in 0.8 s instead of 25.7 s; the streamed χ bank compiles one segment program on
+the charge stream and at most four on the four-current stream, against one
+per pass before (33 and 203; claims 3114, 3122). A rank whose rows fit one
+tile runs one whole pass.
 `price_chi0_node` only prices the χ₀ node: a band chunk of Gv would still
 be a whole `(μ, ν)` tile. On the packed bispinor route the static photon
 response (`V_packed`, `W_packed`, `2·16·Q·(μ + 3μ_T)²/P`) is deleted after
@@ -172,11 +216,11 @@ the static Σ channels read it, before Hartree and the τ sweep.
 | V_q unfold | `16·N_k·μ²/P`, sharded `P(None,'x','y')` | — | — |
 | shared-pole screening and Σ | response-bank faces, pencils, eigh workspace, then G and W tiles | the capacity ledger ([shared-pole model](shared_pole_model.md), byte model) | warns and admits, when a stage and its named concurrent stages exceed the budget |
 | static / GN-PPM screening | the χ₀ node ([§ Green-side](#the-green-side-stages)); the GN fit's q block (XLA's compiled footprint of one q) | `price_chi0_node` (a price, no choice); `_gn_ppm_fit_q_block`: the fixed tile, at least one q | warns; one q (only under `LORRAX_PPM_FIT_ARENA_GIB`) |
-| Σ(τ) sweep | the resident pole fields, band-complete ψ, then one row pass ([§ Green-side](#the-green-side-stages)) | `subtile_stream.plan_rows`: the rows within the fixed tile | — |
+| Σ(τ) sweep | the resident pole fields, band-complete ψ, then one row pass ([§ Green-side](#the-green-side-stages)) | `subtile_stream.plan_windows`: equal windows within the fixed tile | — |
 | matrix-element sweep (V_H, four-current) | the step's slabs, and FFT boxes `(2 + 2·n_comp)·n_s·N_r·16` per band of a band-layout operator | `mtxel_sweep.plan_sweep`: bands in the fewest chunks whose boxes fit the fixed tile | — |
 | ψ loader off the fit plan (ζ reuse, current faces) | one band tile of G-flat rows, samples and faces | `gflat_memory_model.loader_band_chunk`: the fixed tile, at least the automatic 16 | warns; one scan row |
 | moment bank | `(per_q·w + 16)` faces for a batch of `w` q parents | `response_bank.moment_q_width`: the outputs within the fixed tile | the ledger warns |
-| sector Σ(τ) sweep (bispinor) | band-complete ψ, then one row pass: the four-spinor parent Green and partner, the kconv call's Σ rows, W(t)'s pass rows | `subtile_stream.plan_rows` (`mpa.sector_sigma.sector_tau_factory`): the rows within the fixed tile | — |
+| sector Σ(τ) sweep (bispinor) | band-complete ψ, then one row pass: the four-spinor parent Green and partner, the kconv call's Σ rows, W(t)'s pass rows | `subtile_stream.plan_windows` (`mpa.sector_sigma.sector_tau_factory`): equal windows within the fixed tile | — |
 | direct Γ head (bulk metals) | the compiled per-sample footprint × samples per call, split over every rank | `photon_direct_head.direct_gamma_chunk_plan`: the fixed tile, at least 2¹⁰ samples per rank, at most one 2¹⁷ replicate per call | — |
 | head wings | `n_ends` gathered endpoint blocks `16·N_k·n_s·block·N_b` | `qsgw_head.head_wing_mu_block`: the fixed tile, at least 16 centroids | — |
 | exciton_bands C_q | P_R and its update, one ψ chunk and its Pk | `vq_interp.build_cq_q_chunk`: q rows within the fixed tile | — |

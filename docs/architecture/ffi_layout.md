@@ -100,7 +100,7 @@ its sources, its build and its target strings.
 | local active-range GEMM | `cublas/local_active_gemm_ffi.cc` | CUDA; C++ | `cublas_local_active_range_gemm` (C aliased, beta), `cublas_local_active_range_gemm_out` (no C, beta = 0: writes every row), `cublas_local_prepared_active_range_gemm` |
 | active subspace | `active_subspace/active_{eigh,ops}.cc` | CUDA; C++ (cuBLAS, cuSOLVER, NCCL) | `active_subspace_{store, eigh, project, reconstruct, gram, ortho, distributed_ortho, subtract, subtract_gram}` |
 | parallel HDF5 | `phdf5/` | both; C++ (HDF5, MPI; CUDA-runtime staging on the CUDA leg) | `phdf5_{read, read_kchunk_union, write, write_independent}`; `phdf5_read_kchunk` has no caller |
-| contour accumulator | `response/contour_accumulate{.cu,_ffi.cc}` | CUDA; nvcc | `contour_accumulate` |
+| contour accumulator | `response/contour_accumulate{.cu,_ffi.cc}` | CUDA; nvcc | `contour_accumulate`, `contour_accumulate_block` |
 | spin rotation | `symmetry/spin_rotate{.cu,_ffi.cc}` | CUDA; nvcc | `symmetry_spin_rotate_centroid` |
 | fused W-solve | `cublasmp/batched_w_solve_ffi.cc`, `cublasmp/w_solve_kernels.cu` | CUDA; C++ and nvcc | `cublasmp_batched_w_solve`; no Python caller |
 
@@ -159,7 +159,16 @@ in `_host` (`common/c_abi.h`).
   and the correlation at `P(None, 'x', 'y')`. Each multiply and add is
   rounded separately (`__dmul_rn`, `__dadd_rn`), so the result equals the
   XLA stream it replaces byte for byte. 128 threads, four outputs per thread;
-  more than `4·65535` outputs refuse.
+  more than `4·65535` outputs refuse. The block form
+  (`lorrax_contour_accumulate_block`, `ffi.contour.contour_block_accumulate_local`,
+  inside the caller's `shard_map`) adds `Σ_s p[s,o]·c[s,q,m,n]` into the
+  block of the local tile at row and column offset `(m0, n0)`, touching only
+  the block's non-padding rows and columns, with the terms in order, so terms
+  `(a, b)` give the bytes of two full calls. `m0`, `n0` are attributes, or
+  traced values passed as the optional last operand `origin` (s32 `[2]`): a
+  scanned row pass adds its planes at its own offset. An entry that a traced
+  origin moves outside the accumulator is not touched (the host cannot
+  range-check a device value). On a host mesh the same sum runs in XLA.
 * **Spin rotation.** `G ← U_k G U_k†` on each `(k, μ, ν)` spin block,
   `ns ∈ {2, 4}`, complex128, in place, 128 threads; any other spin width or
   dtype takes the JAX einsums.
@@ -622,6 +631,17 @@ contraction) to the forward transform, so one convolution reads each operand
 from HBM once and writes the result once. The line FFTs are the library's,
 specialised per grid when NVRTC compiles the kernel.
 
+A staged route (an XLA gather of the unfolded Green, the vendor's batched 3-D
+FFT, the product, the forward FFT and the parent gather) was measured against
+modes 9 + 7 at the Ni 20³ P64 Σ τ row pass and is 1.7–2.1× slower (claim
+3106). At 20³ one `ns = 2` pair is 512 KB, above the 164 KB of shared memory
+per SM, so the pass's full-k tile (1.26 GB) goes through HBM either way:
+mode 7 moves about 7.8 tiles per pass, while the staged route needs three
+cuFFT axis kernels each way plus the gather, product and store, 16 GB or
+more, and holds 2.5–3.2 GB live against the fused route's ≤ 1 GiB scratch.
+It wins only on launch-bound 4³ grids (1.19×). The lever left is inside the
+fused kernel: three sweeps instead of four and higher plane-pass occupancy.
+
 | Layer | What |
 |---|---|
 | 1 consumer | ζ fit (`isdf.core`, `isdf.zeta_mubatch`, `isdf.pair_kernels`, `gw.centroid_k_unfold`), Σ and COHSEX (`gw.ppm_tau_kernel`, `gw.cohsex_sigma`, `gw.screening`), χ₀ (`gw.w_isdf`), BSE (`bse.*`), the real-space pair convolution (`gw.mixed_basis_pair_convolution`, mode 6 for χ₀ and for Σ, whose plain product is the conjugated one on W's time-reversed transport; unwired), the flat-k transform (`common.fft_helpers.make_flat_k_fft` and its `make_flat_k_ifftn` / `make_flat_k_fftn` / `make_local_flat_k_fftn` wrappers: `gw.w_isdf`, `gw.qsgw_head`, `gw.wavefunction_bundle`, `bandstructure.htransform`, `bandstructure.orbital`). Every factory name is unique: `git grep -n <factory>` lists its call sites |
@@ -791,8 +811,12 @@ The modes of the one handler file. The target column is the string
   one full tile per full k: the parent tiles are `n_parent/N_k` of the
   full-k footprint, not of the traffic (mode 11 on the 6×6 bispinor reads
   47 GB per τ node against 8.6 GB of parent Greens). The unfold tables (`lsrc`,
-  `rsrc` int32, `mph`, `nph` complex128, each `(N_k, μ·ns)`) are closed-over
-  host constants sliced per rank. Apart from those two intermediates, which
+  `rsrc` int32, `mph`, `nph` complex128, each `(N_k, μ·ns)`) are placed on
+  the devices once per run (`symmetry_maps.device_load_tables`) and passed as
+  the optional `load` operand, or a row pass's cut of them
+  (`gw.subtile_stream.window_load`), so no program holds them as constants;
+  a call without `load` closes over host constants sliced per rank. Apart
+  from those two intermediates, which
   XLA's scratch allocator grants, the kernels allocate no device workspace
   beyond dynamic shared memory.
 - **Host workspace (cpu leg).** `gw_conv` stages `V_R = IFFT_k W` once per

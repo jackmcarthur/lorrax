@@ -5,8 +5,9 @@ HDF5 files, one hyperslab per rank, through collective MPI-IO in the phdf5
 FFI. This page owns the tile contract, the caller-facing API and what a call
 site may and may not assume of it, close-time error agreement and the commit
 receipt, the one-owner-per-file rule, the launcher requirement, the striping
-and collective-I/O rules, the restart-read path, the HDF5 operation journal,
-and SlabIO's refusals. It does not own the rulings behind them
+and collective-I/O rules, the restart-read path, the per-rank streamed tier
+(its files, capacity probe, lifetime and cleanup), the HDF5 operation
+journal, and SlabIO's refusals. It does not own the rulings behind them
 ([`decisions.md`](decisions.md) 2026-08-04, 2026-08-05), the native layer and
 each knob's effective default ([`ffi_layout.md`](ffi_layout.md) §5–§7), knob
 spellings ([`../dev/env_vars.md`](../dev/env_vars.md)), padded-axis receipts
@@ -521,6 +522,82 @@ torn transverse pair, charge and transverse faces with different
 parent-row counts, and a stamped `n_rmu_transverse_logical` that differs
 from the dataset's μ extent. The read is an element selection into the
 band-distributed face specs.
+
+---
+
+## The per-rank streamed tier {#streamed-tier}
+
+`file_io.slab_io.StreamedBank` (`file_io/_slab_io_rank.py`) holds an
+operator that is written once, segment by segment, and read back once by the
+same ranks in the same layout. It is not HDF5 and moves nothing between
+ranks: each device keeps its own `(μ_X, ν_Y)` tile in one private store.
+Create, commit, read and release each end in one error agreement on every
+rank (`common.collectives.agree_io_error`), so every rank calls every method
+in the same order. Its callers are the shared-pole χ bank (label `chi`), the
+moment bank (`moments`) and the W bank (`bank_<field>`); each caller picks
+its tier ([memory model](memory-model.md#streamed-chi-bank),
+[shared-pole model §1](shared_pole_model.md#1-one-map)).
+
+| `kind` | store per device |
+|---|---|
+| `host` | one anonymous, pre-faulted host mapping |
+| `file` | one file, `<run dir>/<label>_shared_pole/streamed_bank/<label>.<device id>` |
+
+- **Layout.** A record is one segment's `[q, rows, cols]` tile of one
+  output, padded to the alignment (the largest page or filesystem block on
+  any rank), at `output·S + segment start`, so a range of outputs is one
+  contiguous run. Every record carries a digest taken on the device at write
+  and checked on the device at read, one per (output, q row), so a q-span
+  read is checked too.
+- **Write.** `put` returns at once. A drain thread moves the finished
+  segment off the device in 64 MiB pieces through pinned host memory, at
+  most four staged per rank, and four I/O threads write them while the
+  devices compute the next segment; two segment carries are alive. The
+  piece programs are compiled on the calling thread in program order (a
+  compile on the drain thread raced the caller's, and ranks published
+  different compile keys at P64), and they dispatch one at a time (XLA keeps
+  one async-copy event per executable, instruction and device). `commit`
+  syncs the files.
+- **Read.** `reader(spans)` yields whole outputs or q spans of them, each
+  verified and agreed, with the next span's reads already in flight. A q-span
+  read goes through one aligned scratch buffer per I/O thread.
+- **Files.** O_DIRECT where the filesystem accepts it; a rejected direct
+  call moves that file to buffered I/O at the same offsets. A 4 × 4 MiB stripe
+  layout where `lfs` exists (a failed `lfs setstripe` is logged; the default
+  layout is used). Every byte is reserved at creation where `fallocate`
+  works; Perlmutter's Lustre has none. Measured on one node at the P64-local
+  volume (75.6 GB per rank, 4-stripe files): 30 GB/s write and 25 GB/s read
+  per node, every read digest-checked.
+- **Capacity.** One all-gather at creation agrees the alignment, rank 0's
+  free bytes and every process's promised bytes. Free bytes are the
+  filesystem's free space and, where `lfs` exists, the room under the user's
+  Lustre quota (soft limit, else hard), less what live stores have promised
+  (a file stays sparse, and outside the quota, until it is written). A bank
+  that does not fit is refused on every rank before any compute
+  (`GATE streamed_bank_capacity`, `fits = False`); the caller then takes a
+  smaller bank. A verdict costs 45–64 ms at P4 (claim 3111).
+- **Lifetime.** A store file is unlinked as soon as it is opened. Its bytes
+  live as long as the process's descriptor, so a refusal, a kill or a SIGKILL
+  frees them, and an `ls` of `streamed_bank/` shows nothing while a run holds
+  terabytes there. `release` closes the stores. The callers release the χ
+  bank when every sample is solved and the W bank when the constructor has
+  committed, so nothing in the tier outlives its SC map, and an interrupted
+  map cannot resume from it.
+- **Freeing space.** Only code before 2026-10-01 (or a process killed between
+  open and unlink) leaves files. The first shared-pole map of a process
+  removes the `streamed_bank/` directories of its run directory and prints one
+  `WARNING shared-pole output: removed streamed stores left by an earlier
+  process` line. By hand: delete `<run dir>/*_shared_pole/streamed_bank/` of
+  runs that are not running. `lfs quota -u $USER $SCRATCH` counts the bytes
+  that running processes hold.
+
+| refusal | cause |
+|---|---|
+| `GATE streamed_bank_capacity` | the disk or quota cannot hold the store, or a reservation failed; the caller falls back |
+| `GATE io_global_commit … streamed_bank.commit` | a drain failed on some rank; the message carries that rank's error |
+| `GATE streamed_bank: … unread` / `short read` | a read of the named outputs and rows failed |
+| `GATE streamed_bank: … do not match their write digests` | the bytes read back differ from the bytes written |
+| `GATE streamed_bank: … were not all written` | a read of a record no `put` wrote (the χ and moment banks) |
 
 ---
 

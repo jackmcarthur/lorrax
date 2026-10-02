@@ -53,17 +53,20 @@ are `P(None,'x','y')` on the square X/Y mesh with `P = Px·Py`.
    → `bank.h5`.
 3. **Residence.** The bank is written frequency-major and read parent-major. It
    stays on the devices when the payload and one read copy fit half the device
-   budget *and* the constructor route is unchanged with it live; otherwise it
-   goes to host memory (one array per local face shard, written and read one
-   span per copy) if it fits half the host budget; otherwise it
-   stays a scratch file. `write_w` and a distributed `linalg` always use the
-   file. A scalar scratch file is unlinked once the constructor has committed
-   `model.h5` (kept for `write_w`; the photon Σ reads its constant), so a run
-   holds at most one bank on disk. Its size is
+   budget *and* the constructor route is unchanged with it live. Otherwise it
+   goes to SlabIO's per-rank streamed tier ([SlabIO](slab_io.md#streamed-tier);
+   q-major tiles, so one sample's q span is one contiguous run, and an
+   unwritten tile reads as zeros): host memory if the payload fits half the
+   host budget, else one file per rank. The tier is released once the
+   constructor has committed. The shared scratch file `bank.h5` is used only
+   for `write_w` (which re-reads the bank), a distributed `linalg`, and a
+   per-rank store the disk or quota refuses; a scalar `bank.h5` is unlinked
+   once the constructor has committed `model.h5` (kept for `write_w`; the
+   photon Σ reads its constant), and the receipt records the bytes and the
+   link count. Either way a run holds at most one bank. Its size is
    $N_q\,(2N_\text{dense}+N_\text{moments})\,N_\mu^2\cdot 16$ B plus the line
-   panels: 1.26e12 B at Fe 20³ (1062 parents, 1796 centroids, 8 dense
-   samples), about 17× the model at $K_\max$ 2400. Only this run's link goes;
-   the receipt records the bytes and the link count.
+   panels (§10): 1.26e12 B at Fe 20³ (1062 parents, 1796 centroids, 8 dense
+   samples), about 17× the model at $K_\max$ 2400.
 4. **Constructor** (§3–§6) → `model.h5`, one parent round at a time. An SC
    map keeps the model on the devices instead (`ResidentSectorModel`, the
    photon sectors' carrier) when the model at its stored column bound and one
@@ -91,6 +94,7 @@ are `P(None,'x','y')` on the square X/Y mesh with `P = Px·Py`.
 
 Every map rebuilds samples, directions, poles and ranks from the current
 state; only quadrature rules and support geometry are retained across SC maps.
+No χ bank, W bank or streamed store survives its map.
 
 ## 2 The response bank
 
@@ -122,7 +126,11 @@ depends on the memory budget: the evaluation runs in groups of at most the group
 size, and each group streams its rule's whole node set for its own members. The
 group size is the largest whose donated carry `[2·members, q, μ_X, ν_Y]` and
 compiled stream temporaries fit the map ledger and the device room (the budget
-less the bytes actually live): every sample in one group on symmetric decks. A
+less the bytes actually live): every sample in one group on symmetric decks.
+When the samples do not fit one group, the stream runs once with every
+sample and its carry streams to SlabIO's per-rank tier
+([memory model](memory-model.md#streamed-chi-bank)); groups remain only
+when the disk refuses the bank and on the full-k Green route. A
 smaller group costs ⌈members/group⌉ passes over the same nodes and gives the same
 eqp. (Rules fitted per group gave eqp up to 14.6 meV off a 100× tighter
 reference on Na 8³ at group 1, against 0.21 meV for the all-sample rule.) The chosen group's executable is
@@ -368,14 +376,15 @@ $[n_{q,\rm irr},\mu,\mu]$; no full-q $W$ is formed (TASTE 97). The Σ kconv call
 unfolds the pair on its transform's load through the store's q-wedge tables
 (`_shared_pole_q_wedge`, pair-transpose rule, mathdx mode 9), as the GN-PPM
 wedge does, one row pass of whole centroid orbits at a time: the pass's rows of
-the pair enter mode 9 with the load tables cut to the pass
-(`subtile_stream.pass_load`), and the pass's parent Green comes from
+the pair enter mode 9 with the load tables cut to the pass on the device
+(`subtile_stream.window_load`), and the pass's parent Green comes from
 band-complete ψ by one local GEMM (`ppm_tau_kernel._sigma_subtile_kernel`).
 Mode 7 reads the Green's unfold tables placed once per run
 (`ppm_tau_kernel.sigma_kconv_tables`, through `symmetry_maps.device_load_tables`)
 and cut to the pass the same way, so no window program holds table
-constants. An endpoint map that crosses a mesh shard refuses
-(`GATE shared_pole_w_parent_local`). The factors are read once per Σ call and stay resident:
+constants. The passes are equal windows run as one `lax.scan`
+([memory model](memory-model.md#the-green-side-stages)). An endpoint map
+that crosses a mesh shard refuses (`GATE shared_pole_w_parent_local`). The factors are read once per Σ call and stay resident:
 $32\,n_{q,\rm irr}\,\mu\,\bar K/P$ bytes per rank face-sharded,
 `P(None,'x',None,'y')`, or $16\,n_{q,\rm irr}\,\mu\,\bar K(1/P_x+1/P_y)$ when the
 panel search admits the replicated pole columns ($\bar K$ the store's pole
@@ -398,6 +407,25 @@ their tile extents $(m n_A, n n_B)$ and in one panel of every parent and pole
 column. On a diagonal sector (CC, TT) the partner is $W^{\mathsf T}$; a mixed
 sector's partner $\bar B_A d B_B^{\mathsf T}$ comes from the same operands (two
 factors in `distrib_la.batch_gram`, the face route's one panel exchange).
+
+**Two τ nodes per loop trip.** On GPU the scalar Σ τ window evaluates two τ
+nodes per trip of its device loop, so one node's W(τ) synthesis and
+exchanges run beside the other node's k-convolutions. Only that program is
+compiled with XLA's latency-hiding scheduler
+(`gw.ppm_accumulators.WINDOW_OVERLAP`, through `jax.jit(compiler_options=)`);
+the process-wide flag stays off. With one node per trip the scheduler gains
+nothing (+0.3 %). The window pairs only when its compiled paired executable
+fits the device budget beside the live stages
+(`gw.mpa.sigma.SynthesisTau.fits`: the executable's peak against the
+capacity ledger, the same on every rank); otherwise it runs one node per
+trip with the default schedule. The paired program holds a second node's
+live set (Ni 20³ P64: 9.76 → 16.95 GB compiled per rank), and its window
+line in gwjax.out's memory table says "two nodes per trip". Every
+counter-indexed read in its loops sits behind an optimization barrier and
+rematerialization is off for it, so the R82 hazard (a rematerialized slice
+read after the loop counter's in-place increment) cannot arise there.
+At the Ni 20³ P64 tile a node takes 0.549 → 0.492 s (claim 3115). The
+photon sectors run one node per trip.
 
 **Hole routing.** Conduction windows take $W_+(q)$. An ordered store routes
 valence windows to the particle–hole partner,
