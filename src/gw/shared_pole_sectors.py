@@ -711,9 +711,12 @@ def construct_diagonal_sector_round(samples, moments, meta, config, geometry, *,
             budget=budget,ordered=True,odd_moments=True,keep_budget=recipe['pole_budget'],retain_span=True,
             gram_keep=gram_keep,admit=False)
     else:
+        # The kept span on the Ritz carrier: the ladder rung of this sector's
+        # largest kept count so far (carrier_history), as the scalar model's.
         reduced=reduce_round(states,infinity,tables,real=geometry['real'],mesh_xy=mesh_xy,
             native_eigh=budget.eigenplan(side).native_fn,ordered=True,odd_moments=True,
-            keep_budget=recipe['pole_budget'],retain_span=True,gram_keep=gram_keep)
+            keep_budget=recipe['pole_budget'],retain_span=True,gram_keep=gram_keep,
+            history=history,key=round_key)
     model,signed,vectors,diagnostics,y=reduced
     reduction,zero,_,_=jax.tree.map(np.asarray,diagnostics)
     for name in ('orientation_paired','gram_diagonal_positive','gram_valid','retained_metric_positive'):

@@ -3,6 +3,13 @@
 User-visible changes, newest first. Binding rulings behind the breaking
 changes live in `docs/architecture/decisions.md`.
 
+## 2026-10-01 — the bispinor sector constructor solves on the Ritz carrier
+
+A bispinor SC map's sector constructor now solves each round's kept span on the
+ladder rung of the largest kept count that sector has had, as the scalar model
+does, and reruns wider when a round keeps more. Map 0 is bitwise; later maps move
+at round-off (Fe 4³ bispinor ≤ 0.09 µeV).
+
 ## 2026-10-01 — the bispinor sector W(τ) runs on the scalar model's synthesis
 
 Each photon sector's W(τ) = B_A d(τ) B_B† is now formed by the scalar shared-pole
