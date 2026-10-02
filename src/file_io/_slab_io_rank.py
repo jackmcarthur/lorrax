@@ -20,9 +20,12 @@ and checked on the device at read.
 
 The service chooses, once per file and with no setting: O_DIRECT where the
 platform and filesystem accept it (aligned pieces; else plain buffered I/O),
-a 4 x 4 MiB stripe layout where ``lfs`` exists, and a reservation of every
-byte where ``fallocate`` exists, so a bank the disk or quota cannot hold is
-refused before any compute (:attr:`StreamedBank.fits`).
+a 4 x 4 MiB stripe layout where ``lfs`` exists, a reservation of every byte
+where ``fallocate`` works, and a capacity check against the filesystem's free
+space and, where ``lfs`` exists, the room under the user's Lustre quota (Lustre
+here has no fallocate), less the bytes live stores have promised; a bank the
+disk or quota cannot hold is refused on every rank before any compute
+(:attr:`StreamedBank.fits`).
 """
 from __future__ import annotations
 
@@ -63,7 +66,7 @@ def _alignment(directory):
     """Direct-I/O alignment here: the larger of the page size and the filesystem block."""
     page = os.sysconf("SC_PAGE_SIZE") if hasattr(os, "sysconf") else 4096
     try:
-        return max(int(page), int(os.statvfs(directory).f_bsize))
+        return max(int(page), int(os.statvfs(_existing(directory)).f_bsize))
     except OSError:
         return int(page)
 
@@ -154,6 +157,44 @@ def _reserve(fd, nbytes):
         if err not in (errno.EOPNOTSUPP, errno.ENOSYS):
             raise OSError(err, f"GATE streamed_bank_capacity: cannot reserve {nbytes} bytes: "
                                f"{os.strerror(err)}")
+
+
+#: Bytes this process's live file stores have promised: a store's file stays
+#: sparse (and outside the quota) until it is written, so the free space a new
+#: store sees must leave them out.
+_PROMISED = [0]
+
+
+def _existing(directory):
+    """``directory`` or its nearest existing parent (a store's directory is made later)."""
+    path = Path(directory)
+    while not path.exists() and path != path.parent:
+        path = path.parent
+    return path
+
+
+def _free_bytes(directory):
+    """Bytes the user may still write under ``directory``: the filesystem's free space
+    and, where ``lfs`` exists, the room under the Lustre user quota (soft limit, else
+    hard); ``-1`` when neither is known. Lustre here has no fallocate, so this is the
+    capacity probe."""
+    free, directory = None, _existing(directory)
+    try:
+        stat = os.statvfs(directory)
+        free = int(stat.f_bavail) * int(stat.f_frsize)
+    except OSError:
+        pass
+    if shutil.which("lfs"):
+        try:
+            fields = subprocess.run(["lfs", "quota", "-q", "-u", str(os.getuid()), str(directory)],
+                                    capture_output=True, text=True, timeout=60).stdout.split()
+            used, soft, hard = (1024 * int(v.rstrip("*")) for v in fields[1:4])
+            if soft or hard:
+                room = (soft or hard) - used
+                free = room if free is None else min(free, room)
+        except (OSError, ValueError, IndexError, subprocess.SubprocessError):
+            pass
+    return -1 if free is None else int(free)
 
 
 class _Store:
@@ -268,8 +309,15 @@ class StreamedBank:
         self.unwritten_zero = bool(unwritten_zero)
         # One alignment on every rank (the largest page or filesystem block), so the
         # record offsets are the same everywhere.
-        local = _alignment(root) if kind == "file" else mmap.PAGESIZE
-        self.align = int(np.max(np.asarray(all_gather_processes(np.asarray(local, np.int64)))))
+        # One all-gather agrees the alignment (the largest on any rank), rank 0's
+        # free bytes and every process's promised bytes, so the capacity verdict
+        # below is the same on every rank.
+        probe = (_alignment(root) if kind == "file" else mmap.PAGESIZE,
+                 _free_bytes(root) if kind == "file" and jax.process_index() == 0 else 0,
+                 _PROMISED[0])
+        agreed = np.asarray(all_gather_processes(np.asarray(probe, np.int64))).reshape(-1, 3)
+        self.align = int(agreed[:, 0].max())
+        free, promised = int(agreed[0, 1]), int(agreed[:, 2].sum())
         self.piece = padded(PIECE, self.align)
         self.records = tuple(padded(16 * self.q * r * c, self.align) for r, c in self.shapes)
         self.starts = tuple(int(s) for s in np.cumsum((0,) + self.records[:-1]))
@@ -287,6 +335,10 @@ class StreamedBank:
         self._drain = ThreadPoolExecutor(1, thread_name_prefix="bank-drain")
         error = None
         try:
+            need = self.nbytes * int(mesh.devices.size)
+            if kind == "file" and free >= 0 and need + promised > free:
+                raise OSError(errno.ENOSPC, f"GATE streamed_bank_capacity: {need} bytes over every "
+                                            f"rank, {free} free less {promised} promised")
             if kind == "file":
                 os.makedirs(self.dir, exist_ok=True)
             for d in self.devices:
@@ -299,6 +351,8 @@ class StreamedBank:
         except RuntimeError:
             self._close_stores()
             self.fits = False
+        self.promised = self.nbytes * len(self.stores) if kind == "file" else 0
+        _PROMISED[0] += self.promised
 
     def receipt(self):
         return dict(tier=self.kind, bytes_per_rank=self.nbytes, outputs=self.n_out,
@@ -426,6 +480,8 @@ class StreamedBank:
         agree_io_error(error, path=self.dir, stage="streamed_bank.release")
 
     def _close_stores(self):
+        _PROMISED[0] -= getattr(self, "promised", 0)
+        self.promised = 0
         stores, self.stores = self.stores, {}
         for store in stores.values():
             store.close()
