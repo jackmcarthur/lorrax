@@ -322,11 +322,17 @@ def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output, resi
                 preview=_preview, admit=_admit)
         with phase("gram_reduction"):
             if execution == 'face':
-                from gw.shared_pole_execution import face_reduce_round
+                from gw.shared_pole_execution import face_reduce_round, face_ritz_carrier
+                # The kept span on the budget's carrier, as the local round
+                # solves it on its Ritz carrier: the Schur and final eigh run
+                # at about 2 x budget instead of the pencil side.
+                keep_budget = recipe.get("pole_budget")
                 round_model, round_signed, vectors, round_diagnostics = face_reduce_round(
                     round_states, infinity, tables, real=real, mesh=mesh_xy,
                     budget=budget, ordered=ordered, odd_moments=odd_moments,
-                    keep_budget=recipe.get("pole_budget"), admit=False, room=reduction_room)
+                    keep_budget=keep_budget, admit=False, room=reduction_room,
+                    carrier=(face_ritz_carrier(mesh_xy, keep_budget)
+                             if ordered and keep_budget is not None else None))
             else:
                 round_model, round_signed, vectors, round_diagnostics = reduce_round(
                     round_states, infinity, tables, real=real, mesh_xy=mesh_xy,
