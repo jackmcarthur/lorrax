@@ -112,66 +112,73 @@ def _require_packed_operator(name, packed, mesh_xy):
             "placed on fewer than all ranks.")
 
 
-def _make_photon_static_class_kernel(
-    mesh_xy, kgrid, nk_tot, wfns_left, wfns_right, keys, *, w_tables, with_head=False,
-):
-    """Share the parent Green, its one transform and the projection across one Lorentz class.
+def _photon_class_kernel(node):
+    """``jit``: one Lorentz class's static Σ, the sector engine's node at τ = 0.
 
-    ``keys`` are the class's blocks, one ``A x B`` product; the interaction
-    is the pair ``(W, Wt)`` on the irreducible q (:func:`_class_parents`), which
-    the door unfolds on its load through ``w_tables`` (:func:`_class_w_tables`).
-    Returns ``(contract_class, loads)``: the k-convolution's unfold tables placed
-    once, which ``contract_class`` takes as an argument (no table constants in its
-    program).
+    ``node`` is the class's :func:`gw.mpa.sector_sigma.sector_node` on its one W
+    branch (:func:`_class_w_tables`); the interaction is the parent pair
+    ``(W, conj W)`` on the irreducible q (:func:`_class_parents`) and the weights
+    the static Green's band weights at every full k (occupations, or the COH
+    band mask).  ``factor`` (-1/2 or 1, an exact power of two) scales the
+    projected class.  One program per node, kept for the run.
+    """
+    hit = _photon_sigma_kernel_cache.get(node.key)
+    if hit is None:
+        from gw.mpa.sector_sigma import ParentW
+        spatial, plan = node.spatial, node.plans[0]
+
+        @jax.jit
+        def contract_class(xn, xr, yr, yn, weights, interaction, factor, loads):
+            weights = plan.parent_rows(weights)
+            zero = jnp.zeros((), jnp.float64)
+            return factor * spatial(xn, yr, xr, yn, jnp.zeros(weights.shape, jnp.float64),
+                                    weights, zero, zero, ParentW(*interaction, hole=False), loads)
+        # The node rides along so its key (ids of plans and tables) cannot be reused.
+        hit = _photon_sigma_kernel_cache[node.key] = (node, contract_class)
+    return hit[1]
+
+
+def _photon_head_class_kernel(mesh_xy, nk_tot, wfns_left, wfns_right):
+    """``jit``: the q -> 0 head diagnostic of one Lorentz class (``sigma_freq_debug_output``).
+
+    The head is a pointwise product on the unfolded full-k Green
+    (``cohsex_sigma.make_lorentz_q0_product``), so this debug path alone builds
+    the class's whole parent Green and projects every band.
     """
     from ffi import ffi_dial_key
     from common.contract_bands import contract_bands_block_reshard
     from distrib_la import gemm_plan
-    from .cohsex_sigma import make_lorentz_convolution, make_lorentz_q0_product
+    from .cohsex_sigma import make_lorentz_q0_product
     from .greens_function_kernel import build_G_parents
     left, right = wfns_left.green_parent, wfns_right.green_parent
     layout = left.layout
     plans = (left.plan, right.plan)
-    keys = tuple((int(A), int(B)) for A, B in keys)
     shapes = tuple((p.n_parent, c.psi_nmu.shape[1], p.n_centroid_packed, p.nspinor)
                    for c, p in zip((left, right), plans))
-    key = (_mesh_key(mesh_xy), tuple(kgrid), tuple(map(id, plans)), shapes, layout, ffi_dial_key(),
-           keys, with_head, id(w_tables))
-    if key in _photon_sigma_kernel_cache:
-        return _photon_sigma_kernel_cache[key]
-    plan_key = ("plans", _mesh_key(mesh_xy), tuple(kgrid), nk_tot, shapes, layout, ffi_dial_key())
-    if plan_key not in _photon_sigma_kernel_cache:
+    key = ("head", _mesh_key(mesh_xy), tuple(map(id, plans)), shapes, layout, ffi_dial_key(),
+           int(nk_tot))
+    hit = _photon_sigma_kernel_cache.get(key)
+    if hit is None:
         project = contract_bands_block_reshard(mesh_xy, layout=layout,
             face_shape=shapes[0], right_face_shape=shapes[1])
         g_plan = gemm_plan(mesh_xy, m=shapes[0][2]*shapes[0][3], k=shapes[0][1],
             n=shapes[1][2]*shapes[1][3], nq=shapes[0][0], dtype=jnp.complex128, layout=layout)
-        _photon_sigma_kernel_cache[plan_key] = project, g_plan
-    project, g_plan = _photon_sigma_kernel_cache[plan_key]
-    convolve = make_lorentz_convolution(mesh_xy, kgrid, nk_tot, keys, plans[0], plans[1],
-                                        w_tables=w_tables)
-    head_product = make_lorentz_q0_product(nk_tot) if with_head else None
-    rows = np.asarray(plans[0].parent_full_rows)
-    @jax.jit
-    def contract_class(left, right, weights, interaction, factor, loads, head_interaction=None,
-                       head_vertices=None):
-        weights = plans[0].parent_rows(weights)
-        green = build_G_parents(left.psi_mun, right.psi_nmu, phases=jnp.real(weights),
-                                layout=layout, gemm=g_plan, k_unfold_plan=plans[0])
-        # The prefactor is -1/2 or 1: an exact power of two, applied after the door.
-        sigma = factor * convolve(green, *interaction, loads)
-        result = project(left.projection_faces()[0], sigma, right.projection_faces()[1])
-        if with_head:
-            # The q -> 0 head is a pointwise product on the unfolded Green.
+        head_product = make_lorentz_q0_product(nk_tot)
+        rows = jnp.asarray(np.asarray(plans[0].parent_full_rows))
+
+        @jax.jit
+        def head_class(left, right, weights, factor, head_interaction, head_vertices):
+            weights = plans[0].parent_rows(weights)
+            green = build_G_parents(left.psi_mun, right.psi_nmu, phases=jnp.real(weights),
+                                    layout=layout, gemm=g_plan, k_unfold_plan=plans[0])
             G = plans[0].unfold_operator(green.G, operator_transpose=green.partner(),
                                          right_plan=plans[1])
             head_sigma = head_product(G, head_interaction, factor, head_vertices)
-            head = project(left.projection_faces()[0], jnp.take(head_sigma, jnp.asarray(rows), axis=0), right.projection_faces()[1])
-            return result, head
-        return result
-    # The entry keeps the W tables alive, so their id in the key cannot be reused.
-    _photon_sigma_kernel_cache[key] = (contract_class, convolve.loads)
-    _photon_sigma_kernel_cache[(key, 'w_tables')] = w_tables
-    return _photon_sigma_kernel_cache[key]
+            return project(left.projection_faces()[0], jnp.take(head_sigma, rows, axis=0),
+                           right.projection_faces()[1])
+        # The entry keeps the plans alive, so their ids in the key cannot be reused.
+        hit = _photon_sigma_kernel_cache[key] = (plans, head_class)
+    return hit[1]
 
 
 def _photon_head_pairs(response, term, mesh_xy):
@@ -272,24 +279,31 @@ def _class_parents(mesh_xy, layout, lefts, rights):
 
 
 def contract_lorentz_blocks(blocks, *, families, term, response, Gij, meta, mesh_xy,
-                            head_diagnostics=False, admit_kernel=None):
-    """Yield one parent-band sum per endpoint class while retaining one resident Green.
+                            head_diagnostics=False, admit_kernel=None, placed=None):
+    """Yield one parent-band sum per endpoint class, each the sector engine's τ = 0 node.
 
-    Each class of the packed operator enters the four-current door as its
-    irreducible-q pair ``(W, conj W)`` (:func:`_class_parents`), unfolded on
-    the door's load (:func:`_class_w_tables`): no full-q class operand.
+    Each class of the packed operator enters as its irreducible-q pair
+    ``(W, conj W)`` (:func:`_class_parents`), unfolded on the k-convolution's
+    load (:func:`_class_w_tables`): no full-q class operand and no whole-tile
+    Green (:func:`gw.mpa.sector_sigma.sector_node`).  The value is
+    ``(n_parent, carrier, carrier)`` on the QP window's band carrier.
+    ``placed``: the families' node operands from :func:`place_photon_families`
+    (placed here when ``None``).
     """
     from .cohsex_sigma import _occ_diag_full
     from .photon_layout import photon_q0_low_rank_block
+    from gw.mpa.sector_sigma import sector_node
     if tuple(f.green_parent.plan for f in families) != response.family_plans:
         raise ValueError("Photon interaction and wavefunctions use different parent plans.")
     if term not in (_TERM_X, _TERM_SX, _TERM_COH):
         raise ValueError(f"Unknown static Sigma term {term}.")
+    band_axis, operands = placed or place_photon_families(families, mesh_xy)
     packed = response.V_packed if term == _TERM_X else response.W_packed
     if term == _TERM_COH:
         packed = packed - response.V_packed
     with_head = head_diagnostics and response.head_completion is not None
     pairs, bare = _photon_head_pairs(response, term, mesh_xy) if with_head else ((), ())
+    factor = -0.5 if term == _TERM_COH else 1.0
     for a, b in ((0, 0), (0, 1), (1, 0), (1, 1)):
         keys = tuple((A, B) for A, B in blocks if bool(A) == bool(a) and bool(B) == bool(b))
         if not keys:
@@ -305,7 +319,14 @@ def contract_lorentz_blocks(blocks, *, families, term, response, Gij, meta, mesh
         tables = _class_w_tables(response.family_plans[a:a + 1] + response.family_plans[b:b + 1],
                                  response.qgrid_policy, lefts, rights, mesh_xy)
         pair = _class_parents(mesh_xy, response.layout, lefts, rights)(packed)
-        head_blocks = vertices = None
+        node = sector_node(left, right, keys, meta, mesh_xy, (tables,), band_axis, static=True)
+        kernel = _photon_class_kernel(node)
+        arguments = (*operands[a][0], *operands[b][1], weights, pair, factor, node.loads)
+        if admit_kernel is not None:
+            admit_kernel(kernel, arguments, keys[0])
+        result = kernel(*arguments)
+        del pair
+        head = None
         if with_head:
             from common.gamma_matrices import gamma_perm_phase
             head_blocks = jnp.stack([photon_q0_low_rank_block(pairs, response.layout, A, B, mesh_xy)
@@ -313,17 +334,23 @@ def contract_lorentz_blocks(blocks, *, families, term, response, Gij, meta, mesh
                 for A, B in keys])
             vertices = jax.tree.map(lambda *v: jnp.stack(v),
                 *((gamma_perm_phase(A), gamma_perm_phase(B)) for A, B in keys))
-        kernel, loads = _make_photon_static_class_kernel(mesh_xy, meta.kgrid, meta.nk_tot,
-                                                         left, right, keys, with_head=with_head,
-                                                         w_tables=tables)
-        arguments = (left.green_parent, right.green_parent, weights, pair,
-                     -0.5 if term == _TERM_COH else 1.0, loads, head_blocks, vertices)
-        if admit_kernel is not None:
-            admit_kernel(kernel, arguments, keys[0])
-        value = kernel(*arguments)
-        del pair
-        result, head = value if with_head else (value, None)
+            head = _photon_head_class_kernel(mesh_xy, meta.nk_tot, left, right)(
+                left.green_parent, right.green_parent, weights, factor, head_blocks, vertices)
         yield keys[0], result, head
+
+
+def place_photon_families(families, mesh_xy):
+    """``(band_axis, operands)``: the QP window's static band carrier and each family's
+    sector-node operands, ``((xn, xr), (yr, yn))`` (placed once per Σ call)."""
+    from .ppm_sigma import sigma_band_axis
+    from gw.mpa.sector_sigma import sector_left_operands, sector_right_operands
+    band_axis = sigma_band_axis(int(families[0].slices.nb_sigma), mesh_xy, ansatz="static")
+    placed = {}
+    for f in families:
+        if id(f) not in placed:
+            placed[id(f)] = (sector_left_operands(f, band_axis, mesh_xy),
+                             sector_right_operands(f, band_axis, mesh_xy))
+    return band_axis, tuple(placed[id(f)] for f in families)
 
 
 def compute_static_photon_sigma(
@@ -348,10 +375,11 @@ def compute_static_photon_sigma(
     sector_values = [[None]*3 for _ in range(3)]
     heads = [[None]*3 for _ in range(3)]
     totals, head_totals = [None]*3, [None]*3
+    placed = place_photon_families(families, mesh_xy)
     for term in range(3):
         for key, value, head in contract_lorentz_blocks(keys, families=families,
                 term=term, response=response, Gij=Gij, meta=meta, mesh_xy=mesh_xy,
-                head_diagnostics=head_diagnostics):
+                head_diagnostics=head_diagnostics, placed=placed):
             sector = _head_sector(*key)
             old = sector_values[term][sector]
             sector_values[term][sector] = value if old is None else old + value
