@@ -105,6 +105,9 @@ def _shared_pole_omega0_weights(poles2, intervals, E_ref_B, t_node):
 #   factor re-gather): Ni 20^3 P64-local tile synthesis 0.427 -> 0.131 s per tau node at P4,
 #   0.81 -> 0.18 s at P16 (3100).  Where the replicated columns fit (Fe 4^3, Na 8^3 P4) they win:
 #   the same local GEMM with no W exchange (whole parents there: +10-13% Sigma tau, 3100).
+#   The photon sectors (sector_sigma.sector_synthesis) synthesize here on the same rule: at the
+#   Fe 20^3 P36-local class tile the synthesis per tau node is CC 0.147 -> 0.064 s, TT 0.263 ->
+#   0.099 s (axis), the node 2-9% faster; Fe 4^3 bispinor Sigma tau -19% per SC map (3116).
 # Did not pay: W^T by a second GEMM, +10% at P4, +2% at P16 (2958), +5.7% on Fe 8^3 (2955); the 2-D
 #   face layout for the Sigma residues, Sigma tau +25% Na 8^3, +160% Fe 4^3 (2955); the local
 #   projector transpose costs Na 8^3 (group order 14.8) +6.4%, accepted (2958); a sync-free tau
@@ -114,9 +117,12 @@ def _shared_pole_omega0_weights(poles2, intervals, E_ref_B, t_node):
 #   transpose, 5.1 vs 1.5 ms per node at P16, ~7% of a node (2958).
 def synthesize_shared_pole_parents(
     b_X, b_Y, poles2, intervals, E_ref_B, t_node, *, mesh_xy, gemm, layout="face",
-    weights_fn=_shared_pole_weights, active_range=False,
+    weights_fn=_shared_pole_weights, active_range=False, same_factor=True,
 ):
     """Synthesize both raw-parent orientations through the configured G service.
+
+    The one W(τ) = b d(τ) b† owner: the scalar model and every photon sector
+    (``gw.mpa.sector_sigma.sector_synthesis``) contract here.
 
     Parameters
     ----------
@@ -126,7 +132,14 @@ def synthesize_shared_pole_parents(
         The component axis is 1 for charge and 3 for current endpoints.
         ``layout='local'``: ``b_X`` is the one factor ``[Bp,mu,column]`` in
         ``distrib_la``'s batch layout (whole parents per rank, Bp the parents
-        padded to the mesh) and ``b_Y`` is ``None`` (:func:`_shared_pole_contract_local`).
+        padded to the mesh) and ``b_Y`` is ``None`` (:func:`_shared_pole_contract_local`),
+        or the right factor ``[Bp,nu,column]`` of a two-factor sector.
+    same_factor : bool
+        Both orientations hold the same physical b (the scalar model, a
+        diagonal sector): the partner is the transpose of W.  ``False`` (a
+        mixed CT/TC sector, ``b_X d b_Y†``): the partner ``conj(b_X) d b_Yᵀ``
+        is contracted from the same operands (the face route's same panel
+        exchange; the local route's same resident rows).
     poles2 : jax.Array
         Replicated float64 ``[parent,column]`` squared frequencies in Ry²
         (``layout='local'``: ``[Bp,column]`` in the batch layout).
@@ -159,7 +172,8 @@ def synthesize_shared_pole_parents(
             NamedSharding(mesh_xy, P(("x", "y"), None)))
         weights = weights_fn(poles2, intervals, E_ref_B, t_node)
         plus = _shared_pole_contract_local(b_X, weights, intervals, mesh_xy=mesh_xy,
-                                           n_parent=n_parent)
+                                           n_parent=n_parent, right=b_Y,
+                                           partner=not same_factor)
     else:
         if b_X.ndim != 4 or b_Y.ndim != 4:
             raise ValueError("shared-pole faces require [parent,mu,spin,column]")
@@ -167,7 +181,10 @@ def synthesize_shared_pole_parents(
             raise ValueError("GATE shared_pole_components: expected charge=1 or current=3")
         weights = weights_fn(poles2, intervals, E_ref_B, t_node)
         plus = _shared_pole_contract(b_X, b_Y, weights, gemm=gemm, layout=layout,
-                                     intervals=intervals if active_range else None)
+                                     intervals=intervals if active_range else None,
+                                     partner=not same_factor)
+    if not same_factor:
+        return plus
     # Both faces store the same physical b. Thus (b d b†)^T = b* d b^T
     # even for complex d: transpose the all-mesh operator, never conjugate
     # its causal phase or contract the same pole columns a second time.
@@ -183,7 +200,8 @@ def _shared_pole_factor_specs(layout):
             (P(None, "x", None, None), P(None, "y", None, None)))
 
 
-def _shared_pole_contract(b_X, b_Y, weights, *, gemm, layout="face", intervals=None):
+def _shared_pole_contract(b_X, b_Y, weights, *, gemm, layout="face", intervals=None,
+                          partner=False):
     """W(τ) = b d b† through G's configured face or axis contraction.
 
     Factors [q,mu,spin,K] use G's face placement under ``layout='face'``;
@@ -197,8 +215,13 @@ def _shared_pole_contract(b_X, b_Y, weights, *, gemm, layout="face", intervals=N
     weight, as G's build does with its band interval (the face route scales
     each gathered panel slice; the axis route a weighted copy of the factor,
     as before); ``gemm`` must then be planned with ``enable_active_range=True``.
+
+    ``partner``: also ``conj(b_X) d b_Yᵀ`` (two factors, where it is not the
+    transpose): on the face route from the same panel exchange
+    (``face_green_product(partner=True)``), on the axis route by the same
+    local GEMM on the conjugate factors.
     """
-    from gw.greens_function_kernel import build_G
+    from gw.greens_function_kernel import _build_G_face, build_G
 
     # Components are operator-port labels, not Green-function spinors.
     # Merge them with their own centroid axis before entering build_G;
@@ -206,14 +229,26 @@ def _shared_pole_contract(b_X, b_Y, weights, *, gemm, layout="face", intervals=N
     b_X = b_X.reshape(b_X.shape[0], b_X.shape[1] * b_X.shape[2], 1, b_X.shape[3])
     b_Y = b_Y.reshape(b_Y.shape[0], b_Y.shape[1] * b_Y.shape[2], 1, b_Y.shape[3])
     band_range = None if intervals is None else (intervals[:, 0], intervals[:, 1])
-    value = build_G(jnp.transpose(b_X, (0, 2, 1, 3)),
-                    jnp.transpose(b_Y, (0, 3, 2, 1)),
-                    phases=weights, layout=layout, gemm=gemm, band_range=band_range)
+
+    def operands(conj):
+        x, y = (jnp.conj(b_X), jnp.conj(b_Y)) if conj else (b_X, b_Y)
+        return jnp.transpose(x, (0, 2, 1, 3)), jnp.transpose(y, (0, 3, 2, 1))
+    if partner and getattr(gemm, "backend", "local") != "local":
+        value, pair = _build_G_face(*operands(False), gemm=gemm, phases=weights,
+                                    band_range=band_range, pair=True)
+        return value[:, :, 0, :, 0], pair[:, :, 0, :, 0]
+    value = build_G(*operands(False), phases=weights, layout=layout, gemm=gemm,
+                    band_range=band_range)
     # build_G is centroid-major (q, mu, s, nu, s'); the unit spin axes are 2, 4.
-    return value[:, :, 0, :, 0]
+    if not partner:
+        return value[:, :, 0, :, 0]
+    pair = build_G(*operands(True), phases=weights, layout=layout, gemm=gemm,
+                   band_range=band_range)
+    return value[:, :, 0, :, 0], pair[:, :, 0, :, 0]
 
 
-def _shared_pole_contract_local(b, weights, intervals, *, mesh_xy, n_parent):
+def _shared_pole_contract_local(b, weights, intervals, *, mesh_xy, n_parent, right=None,
+                                partner=False):
     """W(τ) = b d b† with whole parents per rank: one local GEMM each, one exchange out.
 
     ``b`` ``[Bp,mu,K]``, ``weights`` ``[Bp,K]`` and ``intervals`` ``[Bp,2]`` are
@@ -224,10 +259,12 @@ def _shared_pole_contract_local(b, weights, intervals, *, mesh_xy, n_parent):
     rank sends its W rows, not the K-complete factor panels that a face SUMMA
     re-gathers at every node (2·(μ/p)·K per parent; at Ni 20³ P64, 18.6 GB per
     rank per node across nodes, against 0.85 GB).  The factor is held once,
-    not as two faces.
+    not as two faces.  ``right``: a two-factor sector's right factor ``[Bp,nu,K]``
+    (``b d right†``); ``partner`` adds ``conj(b) d rightᵀ`` from the same rows.
     """
     from distrib_la import batch_gram
-    return batch_gram(b, weights, intervals, mesh=mesh_xy, nbatch=n_parent)
+    return batch_gram(b, weights, intervals, mesh=mesh_xy, nbatch=n_parent, right=right,
+                      partner=partner)
 
 
 def _shared_pole_fixed_q_policy(header):
@@ -731,74 +768,91 @@ def _chunk_major(mesh_xy, spec, n_chunks, width):
     return jax.jit(split, out_shardings=NamedSharding(mesh_xy, P(None, *spec)))
 
 
-def _shared_pole_panel_cost(meta, header, b, c, *, mesh_xy, layout="face"):
+def _w_extents(meta, extents):
+    """``(rows, cols)`` of one W(τ) parent tile, components merged with their centroids:
+    the scalar store's ``(μ, μ)``, or a photon sector's ``(m·n_A, n·n_B)``."""
+    if extents is None:
+        m = int(meta.mu_basis.n_packed)
+        return m, m
+    return tuple(int(e) for e in extents)
+
+
+def _shared_pole_panel_cost(meta, header, b, c, *, mesh_xy, layout="face", extents=None):
     """Price the new buffers of one b-parent x c-column synthesis panel.
 
     Coordinator ruling12 separates unchanged spatial/ψ/Σ peak regression
     from this three-U admission.  W stays on the parent rows (the Σ door
-    unfolds it on its load), so no child W tile is priced.
+    unfolds it on its load), so no child W tile is priced.  ``extents``: a
+    photon sector's ``(rows, cols)`` (:func:`_w_extents`).
     """
     # Factors and W tiles are mu x mu charge operators (factor spin axis 1)
     # on scalar and two-component decks; G alone carries the spinor axes.
-    m, spin = int(meta.mu_basis.n_packed), 1
+    rows, cols = _w_extents(meta, extents)
     nq = int(header["n_q_irr"])
     px, py = int(mesh_xy.shape["x"]), int(mesh_xy.shape["y"])
-    tile = 16 * (spin*m)**2 // (px*py)
+    tile = 16 * rows*cols // (px*py)
     multiple = combined_divisor(px,py)
     c = padded_axis(c,multiple,name="shared_pole_K_chunk").carrier
-    faces = 32 * b * spin*m*c / (px*py)
+    faces = 16 * b * c*(rows+cols) / (px*py)
     # Parent, partner and fixed-size group accumulators coexist. The
     # compiled reservation below measures actual aliases and exchange
     # scratch; this bound also informs the panel-size search.
-    peak = 6*b*tile + 8*b + 80*b*spin*m*c/(px*py) + 64*b*c
+    peak = 6*b*tile + 8*b + 40*b*c*(rows+cols)/(px*py) + 64*b*c
     if layout == "axis":
-        axis_faces = 16*b*spin*m*c*(1/px+1/py)
+        # (The square form is the scalar's own float expression.)
+        axis_faces = (16*b*rows*c*(1/px+1/py) if rows == cols
+                      else 16*b*c*(rows/px + cols/py))
         # Retained axis factors, the reader's face carrier, and weighted
         # GEMM operands coexist.
-        peak += axis_faces + 16*b*spin*m*c*(1/px+1/py)
+        peak += axis_faces + axis_faces
         faces = axis_faces
     return dict(resident_bytes_per_rank=int(np.ceil(faces)),
                 workspace_bytes_per_rank=int(np.ceil(peak-faces)))
 
 
-def _shared_pole_resident_bytes(meta, header, *, mesh_xy, layout):
+def _shared_pole_resident_bytes(meta, header, *, mesh_xy, layout, extents=None):
     """Per-rank bytes of the factors the synthesis holds for a whole Σ call.
 
     All n_q_irr parent faces at the store's whole-K carrier K̄, both
     orientations: 32·n·μ·K̄/P on the face layout, 16·n·μ·K̄·(1/Px+1/Py) with
     the pole columns replicated (axis layout), plus the replicated poles
-    8·n·K̄.
+    8·n·K̄ (a sector: μ·K̄ and ν·K̄ for its two endpoints, ``extents``).
     """
     from file_io.shared_pole_store import face_width
 
-    m, nq = int(meta.mu_basis.n_packed), int(header["n_q_irr"])
+    rows, cols = _w_extents(meta, extents)
+    nq = int(header["n_q_irr"])
     px, py = int(mesh_xy.shape["x"]), int(mesh_xy.shape["y"])
     k = face_width(mesh_xy, int(header["Kmax"]))
-    pair = (32*m*k/(px*py) if layout == "face" else 16*m*k*(1/px + 1/py))
+    pair = (16*(rows+cols)*k/(px*py) if layout == "face" else
+            16*rows*k*(1/px + 1/py) if rows == cols else 16*k*(rows/px + cols/py))
     return int(np.ceil(nq*pair + 8*nq*k))
 
 
-def _shared_pole_local_price(meta, header, *, mesh_xy):
+def _shared_pole_local_price(meta, header, *, mesh_xy, extents=None, factors=1):
     """Per-rank ``(resident, workspace)`` bytes of the synthesis with whole parents per rank.
 
-    Resident: the one factor ``[ceil(nq/P), μ, K̄]`` and its poles.  Workspace:
-    one parent's two GEMM operands, the rank's W rows before the exchange, and
-    the parent pair on the face with its realization temporaries (as
-    :func:`_shared_pole_panel_cost`'s ``6·tile``).
+    Resident: the one factor ``[ceil(nq/P), μ, K̄]`` (a two-factor sector,
+    ``factors=2``: both, ``μ + ν``) and its poles.  Workspace: one parent's two
+    GEMM operands, the rank's W rows (and a two-factor sector's partner rows)
+    before the exchange, and the parent pair on the face with its realization
+    temporaries (as :func:`_shared_pole_panel_cost`'s ``6·tile``).
     """
     from file_io.shared_pole_store import face_width
 
-    m, nq = int(meta.mu_basis.n_packed), int(header["n_q_irr"])
+    m, n = _w_extents(meta, extents)
+    nq = int(header["n_q_irr"])
     ranks = int(mesh_xy.size)
     k = face_width(mesh_xy, int(header["Kmax"]))
     rows = -(-nq // ranks)
-    resident = 16 * rows * m * k + 8 * rows * k
-    workspace = 2 * 16 * m * k + 2 * 16 * rows * m * m + 6 * -(-16 * nq * m * m // ranks)
+    resident = 16 * rows * (m if factors == 1 else m + n) * k + 8 * rows * k
+    workspace = (16 * (m + n) * k + 2 * factors * 16 * rows * m * n
+                 + 6 * -(-16 * nq * m * n // ranks))
     return int(resident), int(workspace)
 
 
 def _shared_pole_memory_schedule(meta, header, *, mesh_xy, layout="face", stage="sigma",
-                                 linalg=None):
+                                 linalg=None, extents=None, factors=1):
     """Price the resident factors, size the τ panels from what is left, admit.
 
     The factors are read once per Σ call and stay resident
@@ -815,6 +869,12 @@ def _shared_pole_memory_schedule(meta, header, *, mesh_xy, layout="face", stage=
     (``shared_pole_execution.whole_parent_execution``, the bank's rule), whole
     parents (``factor_layout='local'``, :func:`_shared_pole_contract_local`:
     only W(τ) moves); else the face SUMMA panels.
+
+    A photon sector (``gw.mpa.sector_sigma.sector_synthesis``) takes the same
+    rule with its tile ``extents`` (rows, cols) and ``factors`` (2: a mixed
+    CT/TC sector's two factors): its synthesis is one panel of every parent
+    and pole column, so only that panel is admissible (the face route always
+    is: its SUMMA panels are bounded by one W tile from the shapes).
     """
     capacity = getattr(meta, "shared_pole_capacity", None)
     if capacity is None:
@@ -830,7 +890,8 @@ def _shared_pole_memory_schedule(meta, header, *, mesh_xy, layout="face", stage=
     # Compare the geometry itself, in integers. The derived unit is
     # 16*Q*(spin*mu)^2 before the mesh divides it; that numerator passes 2**53
     # at the sizes LORRAX targets, where float equality stops being exact.
-    if tuple(int(capacity.geometry[key]) for key in
+    sector = extents is not None
+    if not sector and tuple(int(capacity.geometry[key]) for key in
              ("nq", "nspinor", "nmu", "px", "py")) != (Q, spin, n, px, py):
         raise ValueError("GATE shared_pole_capacity: store/current-map geometry mismatch")
     U = capacity.U_bytes_per_rank
@@ -839,8 +900,10 @@ def _shared_pole_memory_schedule(meta, header, *, mesh_xy, layout="face", stage=
                                    workspace_bytes_per_rank=0, concurrent_with=concurrent)
         return dict(status=receipt["status"],parent_capacity=nq,column_capacity=1,
                     capacity_receipt=receipt,route="empty")
-    tables = _shared_pole_panel_tables(meta, header, (0,nq), mesh_xy=mesh_xy)
-    _require_local_maps(tables["certificates"])
+    if not sector:
+        tables = _shared_pole_panel_tables(meta, header, (0,nq), mesh_xy=mesh_xy)
+        _require_local_maps(tables["certificates"])
+    rows_w, cols_w = _w_extents(meta, extents)
     # The ledger owns the hardware limit (ruling24); 3U is a scaling
     # receipt. A zero-byte planning reservation prices the existing ambient set.
     admission = capacity.reserve(
@@ -852,10 +915,14 @@ def _shared_pole_memory_schedule(meta, header, *, mesh_xy, layout="face", stage=
 
     def workspace(b, c, layout):
         return _shared_pole_panel_cost(meta,header,b,c,mesh_xy=mesh_xy,
-                                       layout=layout)["workspace_bytes_per_rank"]
+                                       layout=layout,extents=extents)["workspace_bytes_per_rank"]
 
     def search(layout):
         best = None
+        if sector:
+            left = budget - _shared_pole_resident_bytes(
+                meta, header, mesh_xy=mesh_xy, layout=layout, extents=extents)
+            return (1, -nq*kmax, nq, kmax) if workspace(nq, kmax, layout) <= left else None
         for b in range(1,nq+1):
             left = budget - _shared_pole_resident_bytes(
                 meta, header, mesh_xy=mesh_xy, layout=layout)
@@ -894,12 +961,14 @@ def _shared_pole_memory_schedule(meta, header, *, mesh_xy, layout="face", stage=
     # Where the replicated columns do not fit, whole parents per rank keep
     # the contraction local and move only W (one tile per node), against the
     # face SUMMA's per-node re-gather of every factor panel.
-    if layout != "axis" and linalg == "local" and int(header.get("factor_components", 1)) == 1:
+    if layout != "axis" and linalg == "local" and (
+            sector or int(header.get("factor_components", 1)) == 1):
         from gw.shared_pole_execution import whole_parent_execution
         execution, whole_resident, whole_workspace = whole_parent_execution(
-            lambda e: (_shared_pole_local_price(meta, header, mesh_xy=mesh_xy) if e == "local"
+            lambda e: (_shared_pole_local_price(meta, header, mesh_xy=mesh_xy, extents=extents,
+                                                factors=factors) if e == "local"
                        else (_shared_pole_resident_bytes(meta, header, mesh_xy=mesh_xy,
-                                                         layout=layout), 0)),
+                                                         layout=layout, extents=extents), 0)),
             ledger=capacity)
         if execution == "local":
             receipt = capacity.reserve(
@@ -914,13 +983,15 @@ def _shared_pole_memory_schedule(meta, header, *, mesh_xy, layout="face", stage=
                         caller_live_bytes_per_rank=caller_bytes, capacity_receipt=receipt,
                         route="local_parent",
                         inherited_sigma_peak_status="NOT_MEASURED",
-                        projection_matrix_bytes_per_rank=int(16*nq*meta.mu_basis.n_packed**2
+                        projection_matrix_bytes_per_rank=int(16*nq*rows_w*cols_w
                                                              / (px*py)))
-    b,c = (1,multiple) if best is None else best[2:]
-    footprint = _shared_pole_panel_cost(meta,header,b,c,mesh_xy=mesh_xy,layout=layout)
-    resident = _shared_pole_resident_bytes(meta, header, mesh_xy=mesh_xy, layout=layout)
-    projection_bytes = 16*b*meta.mu_basis.n_packed**2/(px*py)
-    if projection_bytes > U:
+    b,c = (nq,kmax) if sector else (1,multiple) if best is None else best[2:]
+    footprint = _shared_pole_panel_cost(meta,header,b,c,mesh_xy=mesh_xy,layout=layout,
+                                        extents=extents)
+    resident = _shared_pole_resident_bytes(meta, header, mesh_xy=mesh_xy, layout=layout,
+                                           extents=extents)
+    projection_bytes = 16*b*rows_w*cols_w/(px*py)
+    if not sector and projection_bytes > U:
         from common.gpu_utils import warn_over_budget
         warn_over_budget(f"{stage} parent star (all-P logical bound)", projection_bytes, U)
     receipt = capacity.reserve(

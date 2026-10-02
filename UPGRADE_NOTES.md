@@ -3,6 +3,18 @@
 User-visible changes, newest first. Binding rulings behind the breaking
 changes live in `docs/architecture/decisions.md`.
 
+## 2026-10-01 — the bispinor sector W(τ) runs on the scalar model's synthesis
+
+Each photon sector's W(τ) = B_A d(τ) B_B† is now formed by the scalar shared-pole
+synthesis (`gw.mpa.sigma.synthesize_shared_pole_parents`) and placed by the scalar
+rule: replicated pole columns when they fit, else whole parents per rank on a
+`linalg = local` deck, else the face SUMMA. Only each parent's live pole columns
+are contracted. The SUMMA panels and the W∞ − V constant's q panels are sized from
+the shapes (one tile), no longer from `memory_per_device_gb`. Fe 4³ bispinor SP-full
+Σ τ is 19 % faster per SC map. Bispinor results move at round-off: map 0 is bitwise,
+maps 1–2 move ≤ 0.19 µeV (a ±4e-16 control moves them ≤ 0.11 µeV). Scalar decks
+are bitwise.
+
 ## 2026-10-01 — the shared-pole Σ τ window overlaps one node's W exchange with the next node's compute
 
 On GPU, the scalar shared-pole Σ τ window now evaluates two τ nodes per loop
