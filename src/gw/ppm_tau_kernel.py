@@ -58,7 +58,7 @@ def sigma_door_tables(mesh_xy: Mesh, k_unfold_plan):
     ``symmetry_maps.device_load_tables`` of ``k_unfold_plan.unfold_load_tables()``.
     The q-wedge Σ kernel (:func:`_sigma_subtile_kernel`) reads them as its
     ``g_load`` argument and cuts them to each row pass on the device
-    (``subtile_stream.pass_load``), so no Σ program holds table constants:
+    (``subtile_stream.window_load``), so no Σ program holds table constants:
     baked, every row pass's door carried its own copy of the row/phase tables
     as HLO literals (21 passes at the Fe 20^3 P64-local tile: compile
     24 -> 68.6 s).
@@ -253,23 +253,27 @@ def _sigma_subtile_kernel(*, mesh_xy, kgrid, brackets, face_shape, face_band_ext
 
     is linear in the μ rows, so each rank's ``(μ_X, ν_Y)`` tile runs in row
     passes of whole centroid orbits (cuts admissible for both the Green's and
-    W's unfold tables, :func:`subtile_stream.orbit_cuts`).  Per pass:
+    W's unfold tables, :func:`subtile_stream.orbit_cuts`), every pass one
+    window of ``R`` rows (:func:`subtile_stream.plan_windows`) and the passes
+    one ``lax.scan`` (:func:`subtile_stream.scan_passes`), so the program does
+    not grow with the pass count.  Per pass:
 
-    - W's pass rows on its q parents (a local slice of ``W_q``/``W_pt``)
-      enter mathdx mode 9 with the device load cut to the pass
-      (``subtile_stream.pass_load``): ``W_prep`` exists for the pass's rows only;
-    - the parent Green on the pass's ψ rows: one local GEMM over the active
+    - W's window rows on its q parents (a traced slice of ``W_q``/``W_pt``)
+      enter mathdx mode 9 with the device load cut to the window
+      (``subtile_stream.window_load``): ``W_prep`` exists for the window only;
+    - the parent Green on the window's ψ rows: one local GEMM over the active
       bands of the band-complete ψ (``layout='axis'``), no exchange;
     - mode 7 with the Green's device load ``g_load`` (:func:`sigma_door_tables`)
-      cut to the pass, and the axis band projection of the pass's rows into a
-      rank-local partial;
+      cut to the window, its sources -1 outside the pass's live rows, and the
+      axis band projection of the window's rows (zero outside the live rows)
+      into a rank-local partial;
 
-    and one band-block reduce-scatter per bracket ends the node.  Both doors
-    read their tables as operands, so no pass's program holds table
-    constants.  Pass sizes come from :data:`runtime.tiles.TILE_BYTES` and the
-    shapes (:func:`subtile_stream.plan_rows`).  Brackets run inside each pass,
-    so a pass's ``W_prep`` serves every bracket.  Returns ``(kernel, price)``;
-    the kernel takes ``(..., W_q, W_pt, load, g_load)``.
+    and one band-block reduce-scatter per bracket ends the node.  Both
+    k-convolutions read their tables as operands, so the program holds no
+    table constants.  ``R`` comes from :data:`runtime.tiles.TILE_BYTES`, the
+    shapes and the orbit block.  Brackets run inside each pass, so a pass's
+    ``W_prep`` serves every bracket.  Returns ``(kernel, price)``; the kernel
+    takes ``(..., W_q, W_pt, load, g_load)``.
 
     ``static``: the same node at τ = 0 for a Hermitian static interaction (V,
     W(0), W − V; ``gw.cohsex_sigma``'s Σ_x, SX and COH).  Its antiunitary rows
@@ -282,8 +286,8 @@ def _sigma_subtile_kernel(*, mesh_xy, kgrid, brackets, face_shape, face_band_ext
     from distrib_la import gemm_plan
     from runtime.tiles import TILE_BYTES
     from .greens_function_kernel import build_G_tau, green_right_operand, has_antiunitary_rows
-    from .subtile_stream import (band_complete, fold_passes, orbit_cuts, pass_load, pass_rows,
-                                 pass_tables, plan_rows, projection_complete)
+    from .subtile_stream import (band_complete, orbit_cuts, plan_windows, projection_complete,
+                                 scan_passes, window_load, window_rows, window_tables)
 
     kgrid = tuple(int(v) for v in kgrid)
     nk = int(np.prod(kgrid))
@@ -307,40 +311,38 @@ def _sigma_subtile_kernel(*, mesh_xy, kgrid, brackets, face_shape, face_band_ext
     # rows (Green and projection) and the projector's ν-contracted rows.
     row_bytes = 16 * ((2 + partner) * n_parent * ns * ns * nu + nk * nu
                       + (1 + int(not static)) * n_w * nu + n_parent * ns * (nb + 2 * nb_sig))
-    passes = plan_rows(local_rows, row_bytes, lambda: sorted(
+    R, windows = plan_windows(local_rows, row_bytes, lambda: sorted(
         set(orbit_cuts(g_tables.lsrc, px, ns)) & set(orbit_cuts(w_tables.lsrc, px, 1))))
+    whole = len(windows) == 1
     door9 = make_kfft_klead_unfold(mesh_xy, kgrid, w_tables, norm="ortho")
     mult = -1.0 / np.sqrt(float(nk))
-    stages = []
-    for x0, xr in passes:
-        whole = (x0, xr) == (0, local_rows)
-        # The host tables give the door its shapes; the pass reads g_load's cut.
-        tables = g_tables if whole else pass_tables(g_tables, x0, xr, px, ns)
-        # Not warmed: the plan runs inside the window executable.
-        gemm = gemm_plan(mesh_xy, m=px * xr * ns, k=nb, n=n_rmu * ns, nq=n_parent,
-                         dtype=jnp.complex128, layout="axis", enable_active_range=True,
-                         warmup=False)
-        conv = make_kconv_klead_unfold(mesh_xy, kgrid, tables,
-                                       store_rows=k_unfold_plan.parent_full_rows,
-                                       norm="ortho", mult=mult)
-        project = contract_bands_block_reshard(
-            mesh_xy, channels="none", layout="axis", face_shape=(n_parent, nb, px * xr, ns),
-            right_face_shape=(n_parent, nb, n_rmu, ns), face_band_extent=face_band_extent)
-        stages.append((whole, gemm, conv, project))
-    finish = stages[0][3].finish
+    # One window shape for every pass: the host tables give the k-convolution
+    # its shapes, and each pass reads g_load's cut (subtile_stream.window_load).
+    tables = g_tables if whole else window_tables(g_tables, R, px, ns)
+    # Not warmed: the plan runs inside the window executable.
+    gemm = gemm_plan(mesh_xy, m=px * R * ns, k=nb, n=n_rmu * ns, nq=n_parent,
+                     dtype=jnp.complex128, layout="axis", enable_active_range=True,
+                     warmup=False)
+    conv = make_kconv_klead_unfold(mesh_xy, kgrid, tables,
+                                   store_rows=k_unfold_plan.parent_full_rows,
+                                   norm="ortho", mult=mult)
+    project = contract_bands_block_reshard(
+        mesh_xy, channels="none", layout="axis", face_shape=(n_parent, nb, px * R, ns),
+        right_face_shape=(n_parent, nb, n_rmu, ns), face_band_extent=face_band_extent)
+    finish = project.finish
     # ψ rows and columns, the projection faces, and the Green's right operand (one copy of the
     # columns, formed once per node).
     psi_bytes = 16 * n_parent * ns * ((nb + nb_sig) * (local_rows + nu) + nb * nu)
-    price = dict(d=ns, ns=ns, passes=len(passes), tile=float(TILE_BYTES),
-                 new=float(max(xr for _, xr in passes) * row_bytes + psi_bytes))
+    price = dict(d=ns, ns=ns, passes=len(windows), tile=float(TILE_BYTES),
+                 new=float(R * row_bytes + psi_bytes))
     from common.gpu_utils import record_stage_price
     # A static node is priced in its caller's section (Σ exchange, static COHSEX).
     label = "Sigma static" if static else "Sigma tau"
-    record_stage_price(f"{label}, {len(passes)} row pass(es)", price["new"],
+    record_stage_price(f"{label}, {len(windows)} row pass(es)", price["new"],
                        section=None if static else "sigma.tau_sweep")
     if jax.process_index() == 0:
-        print(f"{label} stream: {len(passes)} row pass(es) of {max(xr for _, xr in passes)} "
-              f"local rows ({local_rows} per rank)", flush=True)
+        print(f"{label} stream: {len(windows)} row pass(es) of {R} local rows "
+              f"({local_rows} per rank)", flush=True)
     selectors = (None,) if brackets is None else tuple(
         (int(lo), None if hi is None else int(hi)) for lo, hi in brackets)
     partial_spec = NamedSharding(mesh_xy, P(None, ("x", "y")))
@@ -397,17 +399,12 @@ def _sigma_subtile_kernel(*, mesh_xy, kgrid, brackets, face_shape, face_band_ext
         zero = jax.lax.with_sharding_constraint(
             jnp.zeros((1, px * py * n_parent, nb_sig, nb_sig), jnp.complex128), partial_spec)
 
-        def step(p, x0, xr, accs, operands):
-            whole, gemm, conv, project = stages[p]
-            W, Wt, rows, g_right, left, right = operands
-            if not whole:
-                W, Wt = (None if a is None else pass_rows(a, mesh_xy, x0, xr, axis=1, spec=w_spec)
-                         for a in (W, Wt))
-                rows = pass_rows(rows, mesh_xy, x0, xr, axis=2)
-                left = pass_rows(left, mesh_xy, x0, xr, axis=3)
-            w_prep = door9(W, Wt, load if whole else pass_load(load, mesh_xy, x0, xr))
-            g_pass = g_load if whole else pass_load(g_load, mesh_xy, x0, xr, ns)
-            faces = (jnp.conj(left), right)
+        W, Wt, rows, left = W_q, W_pt, rows_all, left_all
+        faces_right = right_all
+
+        def one_pass(accs, W, Wt, rows, left, w_load, g_pass):
+            w_prep = door9(W, Wt, w_load)
+            faces = (jnp.conj(left), faces_right)
             out = []
             for b, (sel, band_range) in enumerate(zip(bracket_masks, bracket_ranges)):
                 if b:
@@ -425,8 +422,20 @@ def _sigma_subtile_kernel(*, mesh_xy, kgrid, brackets, face_shape, face_band_ext
                            else jax.lax.cond(live[b], add, lambda a: a, accs[b]))
             return tuple(out)
 
-        accs = fold_passes(passes, step, (zero,) * len(selectors),
-                           (W_q, W_pt, rows_all, g_right, left_all, right_all))
+        accs = (zero,) * len(selectors)
+        if whole:
+            accs = one_pass(accs, W, Wt, rows, left, load, g_load)
+        else:
+            def step(s, lo, hi, accs):
+                # The pass's window: W's and the ψ rows, the projection rows
+                # zeroed outside the live rows, and both tables cut there.
+                Wp, Wtp = (None if a is None else window_rows(a, mesh_xy, s, R, axis=1, spec=w_spec)
+                           for a in (W, Wt))
+                return one_pass(accs, Wp, Wtp, window_rows(rows, mesh_xy, s, R, axis=2),
+                                window_rows(left, mesh_xy, s, R, axis=3, live=(lo, hi)),
+                                window_load(load, mesh_xy, s, lo, hi, R),
+                                window_load(g_load, mesh_xy, s, lo, hi, R, ns))
+            accs = scan_passes(windows, step, accs)
         if brackets is None:
             return finish(accs[0])
         return jax.lax.with_sharding_constraint(
