@@ -1467,43 +1467,66 @@ struct LorWScale {                             // the chunk's W_R scale, as mode
 };
 #endif
 
-extern "C" __global__ void __launch_bounds__(LRX_THREADS) lrx_kconv(LorArgs a, UnfoldTab t, LorentzTab v, int phase,
-                                                                  UnfoldTab tw) {
+// Split arm: two entry points of one program, each at its own thread count (one kernel held every
+// pass at the heaviest pass's 176 registers, one 256-thread block per SM).  lrx_kconv at LRX_THREADS
+// (512, <= 128 registers): 0 the Green's plane from the load, 1 the vertex pencil (a 268-byte
+// spill, but 16 warps: 3.54 -> 2.59 ms a chunk at 20^3), 2 the forward plane, 3 the x pencil and
+// the store, 5 W_R's x pencil; lrx_kconv_heavy at LRX_THREADS2 (256): 4, W_R's plane from its
+// parents (a 4x4 Lorentz block per (k, pair), 212 registers; its 107 KB tile holds one block per
+// SM anyway).  Both gathers walk their tiles tile-major (a parent's star members, on other kx
+// planes, find its sources in L2).
+template <bool HEAVY, int NT>
+__device__ __forceinline__ void lor_split_pass(const LorArgs& a, const UnfoldTab& t, const LorentzTab& v, int phase,
+                                               const UnfoldTab& tw) {
     extern __shared__ lrx_c2 sm[];
     using namespace cufftdx;
     (void)tw;
     const long long ncols = a.npairs * SS;
     const lrx_kbox::Plain<lrx_c2> yy{a.y, ncols};
-#if LRX_WA > 0
-    // phases 4 and 5 (before phase 1 of each chunk): the chunk's W_R into yw (NK, npairs*WS), as phase
-    // 0 does the Green's: a plane (z, y) inverse of the unfolded W on plane tiles of LRX_TRW whole
-    // Lorentz groups (the grouped load reads a pair's tables once per (k, pair)), then the x inverse
-    // with mode 9's scale in place.  Same lines, same axis order: mode 9's single arm bit for bit.
-    if (phase == 4 || phase == 5) {
-        const long long nw = a.npairs * WS;
-        const lrx_kbox::Live lw = lrx_kbox::Live::rows(a.live, a.my * WS, a.p0 * WS, false);
-        if (phase == 4)
-            lrx_kbox::plane_pass<NX, NY, NZ, LRX_SM, fft_direction::inverse, LRX_TRW>(
-                sm, nw, LorWLoad{&a, &tw}, lrx_kbox::Plain<lrx_c2>{a.yw, nw}, lw);
-        else
-            lrx_kbox::pencil_pass<NX, NY, NZ, LRX_SM, false, fft_direction::inverse>(a.yw, nw, LorWScale{a.sw}, lw);
-        return;
-    }
-#endif
     const lrx_kbox::Live lv = lrx_kbox::Live::rows(a.live, a.my * SS, a.p0 * SS, phase == 3);
-    if (phase == 0) {
-        lrx_kbox::plane_pass<NX, NY, NZ, LRX_SM, fft_direction::inverse, TRC>(sm, ncols, LorLoad{&a, &t}, yy, lv);
-    } else if (phase == 1) {
-        const LorWarpMid mid{a.y, a.kern, a.yw, ncols, a.npairs, a.p0, a.mx, a.my, v,
-                             lor_member(v, (int)(threadIdx.x % SS))};
-        lrx_kbox::pencil_group_warp_pass<NX, NY, NZ, LRX_SM, SS, LRX_THREADS>(
-            a.y, ncols, a.npairs, mid, lrx_kbox::Live::rows(a.live, a.my, a.p0, false));
-    } else if (phase == 2) {
-        lrx_kbox::plane_pass<NX, NY, NZ, LRX_SM, fft_direction::forward, TRC>(sm, ncols, LorYLoad{a.y, ncols}, yy, lv);
+#if LRX_WA > 0
+    // W_R into yw (NK, npairs*WS), as phase 0 does the Green's: a plane (z, y) inverse of the unfolded
+    // W on plane tiles of LRX_TRW whole Lorentz groups (the grouped load reads a pair's tables once
+    // per (k, pair)), then the x inverse with mode 9's scale in place.  Same lines, same axis order:
+    // mode 9's single arm bit for bit.
+    const long long nw = a.npairs * WS;
+    const lrx_kbox::Live lw = lrx_kbox::Live::rows(a.live, a.my * WS, a.p0 * WS, false);
+#endif
+    if constexpr (HEAVY) {
+#if LRX_WA > 0
+        lrx_kbox::plane_pass<NX, NY, NZ, LRX_SM, fft_direction::inverse, LRX_TRW, false, true>(
+            sm, nw, LorWLoad{&a, &tw}, lrx_kbox::Plain<lrx_c2>{a.yw, nw}, lw);
+#endif
     } else {
-        lrx_kbox::pencil_pass<NX, NY, NZ, LRX_SM, false, fft_direction::forward>(
-            a.y, ncols, LorFinal{v.s_f, v.mult}, LorStore(a, t), lv);
+#if LRX_WA > 0
+        if (phase == 5) {
+            lrx_kbox::pencil_pass<NX, NY, NZ, LRX_SM, false, fft_direction::inverse>(a.yw, nw, LorWScale{a.sw}, lw);
+            return;
+        }
+#endif
+        if (phase == 0) {
+            lrx_kbox::plane_pass<NX, NY, NZ, LRX_SM, fft_direction::inverse, TRC, false, true>(
+                sm, ncols, LorLoad{&a, &t}, yy, lv);
+        } else if (phase == 1) {
+            const LorWarpMid mid{a.y, a.kern, a.yw, ncols, a.npairs, a.p0, a.mx, a.my, v,
+                                 lor_member(v, (int)(threadIdx.x % SS))};
+            lrx_kbox::pencil_group_warp_pass<NX, NY, NZ, LRX_SM, SS, NT>(
+                a.y, ncols, a.npairs, mid, lrx_kbox::Live::rows(a.live, a.my, a.p0, false));
+        } else if (phase == 2) {
+            lrx_kbox::plane_pass<NX, NY, NZ, LRX_SM, fft_direction::forward, TRC>(sm, ncols, LorYLoad{a.y, ncols}, yy, lv);
+        } else {
+            lrx_kbox::pencil_pass<NX, NY, NZ, LRX_SM, false, fft_direction::forward>(
+                a.y, ncols, LorFinal{v.s_f, v.mult}, LorStore(a, t), lv);
+        }
     }
+}
+extern "C" __global__ void __launch_bounds__(LRX_THREADS) lrx_kconv(LorArgs a, UnfoldTab t, LorentzTab v, int phase,
+                                                                  UnfoldTab tw) {
+    lor_split_pass<false, LRX_THREADS>(a, t, v, phase, tw);
+}
+extern "C" __global__ void __launch_bounds__(LRX_THREADS2) lrx_kconv_heavy(LorArgs a, UnfoldTab t, LorentzTab v,
+                                                                         int phase, UnfoldTab tw) {
+    lor_split_pass<true, LRX_THREADS2>(a, t, v, phase, tw);
 }
 #endif
 #elif LRX_MODE == 9
@@ -1847,17 +1870,25 @@ extern "C" __global__ void __launch_bounds__(LRX_THREADS, LRX_MINB) lrx_kconv(Ch
         lrx_kbox::mid_group_tile<NX, NY, NZ, TRC, GRP>(sm, col0, ce, mid);
     }
 #else
-    if (phase == 0) {
-        lrx_kbox::plane_pass<NX, NY, NZ, LRX_SM, fft_direction::inverse, TRC>(
-            sm, ncols, ld, lrx_kbox::Plain<lrx_c2>{a.y, ncols}, lv);
-    } else {
-        const int ch = a.vch0 + (int)(threadIdx.x % GRP), nch = a.vna * a.vnb;
-        lrx_kbox::pencil_group_warp_pass<NX, NY, NZ, LRX_SM, GRP, LRX_THREADS>(
-            a.y, ncols, a.npairs, ChiWarpMid{&a, ch, ch < nch ? ch : nch - 1},
-            lrx_kbox::Live::rows(a.live, a.my, a.p0, false));
-    }
+    // Split arm, phase 0: the plane pass here, tile-major (a parent's star members, on other kx
+    // planes, find its sources in L2: 20^3 207 -> 194 ms); phase 1, the group pencil, is
+    // lrx_kconv_pencil (its own entry at its own thread count: the vertex pencil needs 256 threads
+    // at nkx > 12, the plane pass runs 512).
+    (void)phase;
+    lrx_kbox::plane_pass<NX, NY, NZ, LRX_SM, fft_direction::inverse, TRC, false, true>(
+        sm, ncols, ld, lrx_kbox::Plain<lrx_c2>{a.y, ncols}, lv);
 #endif
 }
+#if LRX_ARM == 1
+extern "C" __global__ void __launch_bounds__(LRX_THREADS2) lrx_kconv_pencil(ChiArgs a, UnfoldTab t, int phase) {
+    (void)t; (void)phase;
+    const long long ncols = a.npairs * GRP;
+    const int ch = a.vch0 + (int)(threadIdx.x % GRP), nch = a.vna * a.vnb;
+    lrx_kbox::pencil_group_warp_pass<NX, NY, NZ, LRX_SM, GRP, LRX_THREADS2>(
+        a.y, ncols, a.npairs, ChiWarpMid{&a, ch, ch < nch ? ch : nch - 1},
+        lrx_kbox::Live::rows(a.live, a.my, a.p0, false));
+}
+#endif
 #endif
 #endif
 )__lrx__";
@@ -2176,7 +2207,7 @@ static ffi::Error build(int mode, int nkx, int nky, int nkz, int ns, bool f32,
     // the shared memory from the grid and this device's opt-in budget; RB is unused.
     const int chi_grp = 2 * ns * ns;
     lrx_kbox::Plan kplan{};
-    int chi_trc = 0, chi_ty = 0, chi_threads = 0, chi_tt = 0, chi_minb = 1, chi_carve = 100;
+    int chi_trc = 0, chi_ty = 0, chi_threads = 0, chi_threads2 = 0, chi_tt = 0, chi_minb = 1, chi_carve = 100;
     long long chi_smem = 0, chi_smem2 = 0;
     if (mode == 11) {
         kplan = lrx_kbox::kbox_plan(nkx, nky, nkz, ns * ns, 2, 16, smem_optin, 1, 1);  // min_tr 1: a gathered group load
@@ -2218,13 +2249,18 @@ static ffi::Error build(int mode, int nkx, int nky, int nkz, int ns, bool f32,
                            "shared memory per SM");
             LRX_CUDA_CHECK(cudaDeviceGetAttribute(&smem_rsv, cudaDevAttrReservedSharedMemoryPerBlock, dev),
                            "reserved shared memory per block");
+            // Two entry points: the plane pass (lrx_kconv) and the group pencil (lrx_kconv_pencil),
+            // each at its own thread count: the plane pass 512 (or two 256-thread blocks where two
+            // tiles fit), the pencil 512 where its x-line leaves the 128-register bound room, else
+            // 256 (the vertex pencil at nkx > 12; one kernel had held both passes at 256).
             const bool wide = nkx <= ((variant & 2) ? 12 : 20);
             chi_trc = kplan.tr;
             chi_smem = static_cast<long long>(chi_trc) * g.pr() * 16;
             chi_smem2 = 0;
-            const bool two = wide && 2 * (chi_smem + smem_rsv) <= smem_sm;
-            chi_threads = wide && !two ? 2 * kThreads : kThreads;
-            chi_ty = chi_threads / chi_grp;
+            const bool two = 2 * (chi_smem + smem_rsv) <= smem_sm;
+            chi_threads = two ? kThreads : 2 * kThreads;
+            chi_threads2 = wide ? 2 * kThreads : kThreads;
+            chi_ty = chi_threads2 / chi_grp;
             chi_minb = two ? 2 : 1;
             chi_carve = static_cast<int>(std::min<long long>(
                 100, (100LL * chi_minb * (chi_smem + smem_rsv) + smem_sm - 1) / smem_sm));
@@ -2283,20 +2319,20 @@ static ffi::Error build(int mode, int nkx, int nky, int nkz, int ns, bool f32,
         } else {
             const int ss = ns * ns;
             kb_arm = 1;
-            // Plane tiles of whole spin groups: the gathered load runs one thread per (k, group)
-            // of a (ky, kz) plane, so a tile holds enough groups for a unit per thread (256),
-            // within two blocks per SM.
-            kb_tr = split_plane_tile(nky, nkz, g.pr(), ss, smem_optin);
-            // The vertex pencil holds a pair's ss columns on one warp and stages nothing (its block
-            // stage of nkx * ty * (ss + 17) elements refused the two-spinor Dirac-quarter doors at
-            // 16^3-20^3 and held 2-4 warps per SM where it fit).
-            kb_ty = kThreads / ss;                     // pairs per pencil block
-            kb_threads = kThreads;
-            kb_threads2 = kThreads;
+            // Two entry points (lor_split_pass): every pass but W_R's plane at 512 threads (<= 128
+            // registers), W_R's plane (212 registers) at 256.  Plane tiles of the most whole groups
+            // the opt-in memory holds (one block per SM either way).  The vertex pencil holds a pair's
+            // ss columns on one warp and stages nothing (its block stage of nkx * ty * (ss + 17)
+            // elements refused the two-spinor Dirac-quarter doors at 16^3-20^3 and held 2-4 warps
+            // per SM where it fit).
+            kb_tr = split_plane_tile(nky, nkz, g.pr(), ss, smem_optin, true);
+            kb_threads = 2 * kThreads;
+            kb_threads2 = kb_threads;                  // the vertex pencil, on the same entry
+            kb_ty = kb_threads2 / ss;                  // pairs per pencil block
             kb_smem = static_cast<long long>(kb_tr) * g.pr() * 16;
             kb_smem2 = 0;
             if (lor_ws > 0) {                          // the W_R chunk: plane tiles of whole Lorentz groups
-                lor_trw = split_plane_tile(nky, nkz, g.pr(), lor_ws, smem_optin);   // as the Green's tiles
+                lor_trw = split_plane_tile(nky, nkz, g.pr(), lor_ws, smem_optin, true);
                 kb_smem3 = static_cast<long long>(lor_trw) * g.pr() * 16;
                 kb_threads3 = kThreads;
             }
@@ -2481,6 +2517,7 @@ static ffi::Error build(int mode, int nkx, int nky, int nkz, int ns, bool f32,
         defs.push_back("-DLRX_TR=" + std::to_string(kb_tr));
         defs.push_back("-DLRX_TY=" + std::to_string(kb_ty));
         defs.push_back("-DLRX_THREADS=" + std::to_string(kb_threads));
+        if (mode == 8 && kb_arm == 1) defs.push_back("-DLRX_THREADS2=" + std::to_string(kThreads));   // W_R's plane
         if (mode == 8 && lor_ws > 0) {
             defs.push_back("-DLRX_WA=" + std::to_string(lor_wa));
             defs.push_back("-DLRX_WB=" + std::to_string(lor_wb));
@@ -2492,6 +2529,7 @@ static ffi::Error build(int mode, int nkx, int nky, int nkz, int ns, bool f32,
         defs.push_back("-DLRX_TR=" + std::to_string(chi_trc));
         defs.push_back("-DLRX_TY=" + std::to_string(chi_ty));
         defs.push_back("-DLRX_THREADS=" + std::to_string(chi_threads));
+        if (kplan.arm == 1) defs.push_back("-DLRX_THREADS2=" + std::to_string(chi_threads2));
         defs.push_back("-DLRX_COMPLETE=" + std::to_string(variant & 1));
         defs.push_back("-DLRX_VTX=" + std::to_string((variant >> 1) & 1));
         defs.push_back("-DLRX_TT=" + std::to_string(chi_tt ? 1 : 0));
@@ -2519,6 +2557,8 @@ static ffi::Error build(int mode, int nkx, int nky, int nkz, int ns, bool f32,
     prog.kernel = "lrx_kconv";
     if (mode == 7 && m7_arm == 1) prog.entries = {"lrx_kconv_mid", "lrx_kconv_pass"};
     if (mode == 7 && m7_arm == 2) prog.entries = {"lrx_kconv_col"};
+    if (mode == 8 && kb_arm == 1) prog.entries = {"lrx_kconv_heavy"};
+    if (mode == 11 && kplan.arm == 1) prog.entries = {"lrx_kconv_pencil"};
     std::string missing;
     const std::string key_hex = nvrtc::hex16(nvrtc::key(prog, &missing));
     const std::string dir(missing.empty() ? std::string(cubin_dir) : std::string());
@@ -2558,6 +2598,7 @@ static ffi::Error build(int mode, int nkx, int nky, int nkz, int ns, bool f32,
         b.trw = lor_trw;
         b.threads3 = kb_threads3;
         b.smem3 = static_cast<int>(kb_smem3);
+        if (mode == 8 && kb_arm == 1) b.fn2 = img.fns[0];   // W_R's plane (phase 4)
     }
     if (mode == 11) {
         int sms = 0;
@@ -2569,6 +2610,7 @@ static ffi::Error build(int mode, int nkx, int nky, int nkz, int ns, bool f32,
         b.threads = chi_threads;
         b.smem = static_cast<int>(chi_smem);
         b.threads2 = chi_grp * chi_ty;
+        if (kplan.arm == 1) b.fn2 = img.fns[0];         // the group pencil's entry
         b.smem2 = static_cast<int>(chi_smem2);
         b.sms = sms;
         if (chi_tt) b.grid_cap = static_cast<long long>(sms) * chi_minb;   // a persistent grid
@@ -2609,6 +2651,8 @@ static ffi::Error build(int mode, int nkx, int nky, int nkz, int ns, bool f32,
             cr = api.FuncSetAttribute(b.fn3, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, b.smem3);
         if (cr == CUDA_SUCCESS && mode == 7 && b.fn2 && b.smem2 > 0)
             cr = api.FuncSetAttribute(b.fn2, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, b.smem2);
+        if (cr == CUDA_SUCCESS && mode == 8 && b.fn2 && b.smem3 > 0)       // W_R's plane on the heavy entry
+            cr = api.FuncSetAttribute(b.fn2, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, b.smem3);
         if (cr != CUDA_SUCCESS && mode == 10) {
             std::ostringstream os;
             os << "GATE mathdx-plane-residency: got plane (" << nkx << "," << nky << "), " << b.smem
@@ -3185,7 +3229,9 @@ static ffi::Error KleadLorentzImpl(
     auto launch = [&](int phase, long long blocks, int threads, int smem) -> ffi::Error {
         blocks = std::max(1LL, std::min(blocks, 2147483647LL));
         void* args[] = {(void*)&a, (void*)&t, (void*)&v, (void*)&phase, (void*)&tw};
-        CUresult cr = driver_api().LaunchKernel(k->fn, static_cast<unsigned>(blocks), 1, 1, threads, 1, 1,
+        // The split arm's W_R plane on its own entry.
+        CUfunction fn = k->arm == 1 && phase == 4 ? k->fn2 : k->fn;
+        CUresult cr = driver_api().LaunchKernel(fn, static_cast<unsigned>(blocks), 1, 1, threads, 1, 1,
                                                 static_cast<unsigned>(smem),
                                                 reinterpret_cast<CUstream>(stream), args, nullptr);
         if (cr != CUDA_SUCCESS) return fail("cuLaunchKernel", cu_err(cr));
@@ -3218,18 +3264,18 @@ static ffi::Error KleadLorentzImpl(
         const long long ncols = a.npairs * ss;
         const long long plane = nkx * ((ncols + k->tr - 1) / k->tr);
         const long long group = nky * nkz * ((a.npairs + k->ty - 1) / k->ty);
-        const long long pencil = (nky * nkz * ncols + kThreads - 1) / kThreads;
+        const long long pencil = (nky * nkz * ncols + k->threads - 1) / k->threads;
         if (auto e = launch(0, std::min(plane, cap), k->threads, k->smem); !e.success()) return e;
         if (W != nullptr) {
             const long long nw = a.npairs * ws;
             const long long wplane = nkx * ((nw + k->trw - 1) / k->trw);
-            const long long wpencil = (nky * nkz * nw + kThreads - 1) / kThreads;
+            const long long wpencil = (nky * nkz * nw + k->threads - 1) / k->threads;
             if (auto e = launch(4, std::min(wplane, cap), k->threads3, k->smem3); !e.success()) return e;
-            if (auto e = launch(5, std::min(wpencil, cap), kThreads, 0); !e.success()) return e;
+            if (auto e = launch(5, std::min(wpencil, cap), k->threads, 0); !e.success()) return e;
         }
         if (auto e = launch(1, std::min(group, cap), k->threads2, k->smem2); !e.success()) return e;
         if (auto e = launch(2, std::min(plane, cap), k->threads, k->smem); !e.success()) return e;
-        if (auto e = launch(3, std::min(pencil, cap), kThreads, 0); !e.success()) return e;
+        if (auto e = launch(3, std::min(pencil, cap), k->threads, 0); !e.success()) return e;
     }
     return ffi::Error::Success();
 }
@@ -3476,7 +3522,8 @@ static ffi::Error KleadChiUnfoldImpl(
     auto launch = [&](int phase, long long blocks, int threads, int smem) -> ffi::Error {
         blocks = std::max(1LL, std::min(blocks, 2147483647LL));
         void* args[] = {(void*)&a, (void*)&t, (void*)&phase};
-        CUresult cr = driver_api().LaunchKernel(k->fn, static_cast<unsigned>(blocks), 1, 1, threads, 1, 1,
+        CUresult cr = driver_api().LaunchKernel(phase == 1 ? k->fn2 : k->fn, static_cast<unsigned>(blocks), 1, 1,
+                                                threads, 1, 1,
                                                 static_cast<unsigned>(smem),
                                                 reinterpret_cast<CUstream>(stream), args, nullptr);
         if (cr != CUDA_SUCCESS) return fail("cuLaunchKernel", cu_err(cr));

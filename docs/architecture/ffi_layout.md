@@ -722,14 +722,19 @@ The modes of the one handler file. The target column is the string
   0.76–0.94× at the CrI3 6×6 and Fe 4³ `ns = 4` doors), the scaled `kout`
   Store; its load holds a spin group per thread, so it runs 256 threads. Otherwise the
   split arm runs the plane and group-pencil passes chunked over pairs through
-  an `(N_k, chunk·ns²)` intermediate no larger than its output. For mode 11,
+  an `(N_k, chunk·ns²)` intermediate no larger than its output, as two entry
+  points: W_R's plane from its parents (a 4×4 Lorentz block per (k, pair))
+  at 256 threads, every other pass at 512, on plane tiles of the most whole
+  groups the opt-in memory holds; both gathers walk their tiles tile-major.
+  For mode 11,
   single pass: `tr`
   whole pairs per block in a padded bank (odd z-line and row strides),
   gathered on load through mode 7's typed unfold, the three axis passes
   (z, y, x) of cuFFTDx thread FFTs, then the spin trace and its accumulation
   into χ_R in the group Mid, one thread per (k, pair). Split arm, when fewer pairs fit: plane passes over
-  `(k_y, k_z)` on column tiles, then an R-space x-pencil pass for each spin
-  group, chunked over pairs through an `(N_k, chunk·2ns²)` intermediate that
+  `(k_y, k_z)` on column tiles (tile-major), then an R-space x-pencil pass for
+  each spin group (its own entry point: 512 threads, or 256 for the vertex
+  pencil past `nkx = 12`), chunked over pairs through an `(N_k, chunk·2ns²)` intermediate that
   XLA's scratch allocator grants (at most `scratch_bytes`; the door's default
   is the smaller of one parent-Green tile and 1 GiB, with a one-pair
   minimum; `chi_unfold_scratch_bytes` owns the policy and its pricing). Mode 7, single pass: `tr` whole pairs (the
