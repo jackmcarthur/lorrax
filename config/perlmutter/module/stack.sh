@@ -1,7 +1,7 @@
 # shellcheck shell=bash
 # ============================================================================
 # The Perlmutter module stack: pins and prefix layout, sourced by every script
-# in this directory (docs/installation/perlmutter-module.md).
+# in this directory (docs/installation/perlmutter.md, section 2).
 #
 #   export LORRAX_MODULE_PREFIX=/abs/install/prefix     # required, no default
 #

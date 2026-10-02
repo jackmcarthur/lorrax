@@ -19,7 +19,7 @@ from solvers.davidson_fixed import (
 )
 
 # The measured Si clustered-band default; a capacity is still explicit in the
-# composable API. See docs/services/davidson.md for memory/conditioning policy.
+# composable API. See docs/architecture/iterative_eigensolvers.md for memory/conditioning policy.
 DEFAULT_M_MAX_FACTOR = 10
 TRACE_COUNTS: dict = {}
 MATVEC_APPLICATIONS = [0]

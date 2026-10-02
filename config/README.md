@@ -105,7 +105,7 @@ For the complete CPU rank prelude and validated geometry, follow
 
 - `config/perlmutter/site_config.sh` owns Perlmutter paths and vendor stack.
 - `docs/architecture/ffi_layout.md` owns native binding and ABI design.
-- `docs/dev/env_vars.md` owns runtime environment variables.
+- `docs/reference/env_vars.md` owns runtime environment variables.
 - `docs/environment/machines/perlmutter.md` owns launch geometry and current
   machine verification.
 

@@ -12,7 +12,7 @@
 # I_MPI_PMI_LIBRARY that cannot bootstrap --mpi=pmi2).
 #
 # Everything here is either a setdefault (inherited values win) or a
-# deterministic unset/set documented in docs/dev/env_vars.md §5.  Resolved
+# deterministic unset/set documented in docs/reference/env_vars.md §5.  Resolved
 # transport choices are ANNOUNCED on rank 0 (announce-or-refuse doctrine);
 # the I_MPI_DEBUG>=4 "libfabric provider:" banner remains the only
 # trustworthy provider observable (fi_info false-negatives on mlx).

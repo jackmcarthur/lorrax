@@ -757,7 +757,7 @@ static ffi::Future WriteDispatchImpl(
     // per rank, file_io._slab_io_ffi), where independent MPI-IO beats
     // two-phase aggregation; every other layout keeps the ctx's collective
     // default, because an independent write of a strided tile decomposes into
-    // millions of small writes (docs/dev/env_vars.md, COLLECTIVE_WRITES).
+    // millions of small writes (docs/reference/env_vars.md, COLLECTIVE_WRITES).
     const bool collective = !independent && ctx->use_collective_write;
     auto task = [ctx, dset, native_type,
                  offset = std::move(offset),

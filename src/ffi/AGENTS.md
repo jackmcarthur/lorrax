@@ -13,11 +13,10 @@ NVIDIA stack) and `liblorrax_ffi_host.so` (the CUDA-free host leg).
   `gemm.py` (host CBLAS GEMM), `gate.py` (env dials), `common/ffi_loader.py`
   (locate, attest and register the libraries), `cublasmp/` (the fused
   W-solve). Distributed linear algebra lives in `services/distrib_la`.
-- **Build, verify, seal:** [`docs/building_ffi.md`](../../docs/building_ffi.md);
-  dependencies: [`docs/installation/ffi-native-libs.md`](../../docs/installation/ffi-native-libs.md).
-- **Add a target:** a k-convolution mode, "A new mode is added in four
-  steps" in the [router section](../../docs/architecture/ffi_layout.md#k-convolution-router-and-the-mathdx-family);
-  a linear-algebra backend, [`docs/dev/linalg_ffi.md`](../../docs/dev/linalg_ffi.md#adding-a-backend);
+- **Build, verify, seal:** [`docs/installation/ffi-build.md`](../../docs/installation/ffi-build.md);
+  dependencies: [`docs/installation/ffi-build.md`](../../docs/installation/ffi-build.md).
+- **Add a target:** a k-convolution mode, [Adding a mode](../../docs/architecture/kconv.md#adding-a-mode);
+  a linear-algebra backend, [`docs/services/distrib_la/backends.md`](../../docs/services/distrib_la/backends.md#adding-a-backend);
   an env-gated rank-local handler, [`docs/dev/ffi_gate_contract.md`](../../docs/dev/ffi_gate_contract.md#adding-a-dial).
   A changed handler signature bumps `cpp/common/lorrax_ffi_abi.h`
-  ([ABI rule](../../docs/building_ffi.md#the-abi-pairing-rule)).
+  ([ABI rule](../../docs/installation/ffi-build.md#abi)).

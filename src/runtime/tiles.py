@@ -1,19 +1,15 @@
-"""The one fixed tile bound every streamed loop sizes against (owner, 2026-09-30).
+"""The one fixed tile bound every streamed loop sizes against.
 
 A loop that streams over k, q, bands, centroids, samples or rows takes the
 most units whose per-rank scaling bytes fit :data:`TILE_BYTES`. The tile
 comes from the loop's own shapes alone: it never reads free device memory or
 the deck budget, so every rank computes the same tile, and a result never
 depends on how much memory a run was given. 1 GiB per rank saturates the
-kernels that stream (R153's mode-11 scratch bound; DEVROOMA measured no
-site but the response sample group losing > 10 % per map at 256 MiB on
-Fe 4³ and Na 8³).
+kernels that stream (the mode-11 split-arm scratch is bounded by it).
 
-The exceptions size from the deck budget (``memory_per_device_gb``) through
-a ledger: the shared-pole response sample group
-(``gw.response_bank.response_group_size``, the capacity ledger), where a
-larger group buys > 10 % per map, and the Galerkin whole-state planner
-(``isdf.galerkin``), whose capacity also bounds its resident rows.
+Planners that still size from the deck budget (``memory_per_device_gb``) are
+listed under "Not yet conforming" in docs/architecture/decisions.md
+(the fixed-tile ruling); each converts to :func:`tile_units`.
 """
 
 #: Per-rank bytes of one tile's scaling set.

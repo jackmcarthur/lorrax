@@ -1947,8 +1947,8 @@ def _get_w_solve_fn_distributed(mesh_xy: Mesh, nq: int, n_rmu: int,
                      donate_argnums=(0,), out_shardings=nat)
     _zeros_like = jax.jit(jnp.zeros_like, out_shardings=nat)
     # RHS must be a FRESH buffer, never an alias of the caller's V —
-    # the FFI backsolve DONATES both operands (docs/dev/linalg_ffi.md
-    # "Sharp edges") and V is still needed by Σ_SX/Σ_COH/Σ_X and the
+    # the FFI backsolve DONATES both operands (DONATES in
+    # docs/services/distrib_la/api.md) and V is still needed by Σ_SX/Σ_COH/Σ_X and the
     # PPM fit's Wc = W − V.
     @partial(shard_map, mesh=mesh_xy, in_specs=P(None, 'x', 'y'),
              out_specs=P(None, 'x', 'y'), check_vma=False)
@@ -2257,7 +2257,7 @@ def _chi0_imag_ordered_kernel_args(wfns, quad, energy_reference):
             "  want: build_imag_probe_response_rule(..., with_odd_kernel = true)\n"
             "  why:  without odd weights the time-reversal-odd response "
             "channel is zero by construction\n"
-            "  doc:  docs/dev/notes/DERIVATION_gnppm_nonhermitian.md")
+            "  doc:  docs/theory/gn-ppm-nonhermitian.md")
     eref, vmax, cmin = _gap_edges(wfns, energy_reference)
     E_gap = cmin - vmax
     tau = np.asarray(quad.tau, dtype=np.float64)
@@ -2269,7 +2269,7 @@ def _chi0_imag_ordered_kernel_args(wfns, quad, energy_reference):
             f"node axis; got {tau.shape}, {alpha.shape}, {beta.shape}")
     # gamma_l = -(alpha_l - i beta_l) e^{-tau_l E_gap}: the resolvent
     # -1/(x + i omega_p) of the kernel's OWN orientation (the -Delta pole,
-    # DERIVATION_gnppm_nonhermitian.md section 2).  The conjugate partner
+    # docs/theory/gn-ppm-nonhermitian.md section 2).  The conjugate partner
     # receives conj(gamma) through the q-negated conjugate below.
     gamma = -(alpha - 1j * beta) * np.exp(-tau * E_gap)
     return _minimax_chi_operands(wfns, eref, vmax, cmin, tau, gamma)

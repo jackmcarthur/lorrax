@@ -61,7 +61,7 @@ layout='face', enable_active_range=False) -> GemmPlan``
     operand, weighting and accumulation contract but no runtime bounds
     operands. The face layout uses cuBLASMp descriptor views; the axis layout
     uses local cuBLAS pointer views on CUDA and bounded JAX dot panels on CPU.
-    See ``docs/dev/active_gemm_ranges.md``.
+    See ``docs/services/distrib_la/api.md`` § Active ranges.
 ``hermitian_part(a)``, ``hermitian_block(block, off, corner)``, ``join_columns(a, b)``, ``diagonal_like(values, like)``, ``on_face(fn, out, *operands, **static)``
     Block glue for stacked ``[b, R, R]`` operators and ``[b, n, R]`` panels
     that keeps each result on its operand's ``('x','y')`` face. Eager

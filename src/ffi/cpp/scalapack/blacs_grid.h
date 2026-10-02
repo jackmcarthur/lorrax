@@ -222,7 +222,7 @@ inline int blacs_ctxt_for(lorrax_ffi::slate::SlateCtx* ctx) {
 //      NOT in `slate::heev` as L-2 records.  Reproducer:
 //      wk_REL/harness/slalias_l2.sbatch.  That does not make the overlay
 //      safe — reasons 1 and 2 are untouched — but the L-2 sentence in
-//      docs/dev/linalg_ffi.md needs correcting, and the CPU SLATE eigh
+//      docs/services/distrib_la/backends.md needs correcting, and the CPU SLATE eigh
 //      capability may be recoverable.
 //
 //  Hence: DETECT and REFUSE, rather than trust or ignore.  `dlsym` +
@@ -421,7 +421,7 @@ inline std::string scalapack_slate_api_refusal(const char* op,
           "covers a non-converged eigh.  (3) SLATE's heev additionally "
           "requires a SQUARE process grid and refuses a 4x1 outright.  "
           "Fix: drop it from LD_PRELOAD / the link line.  The route to "
-          "making it work is docs/dev/linalg_ffi.md.  To measure it anyway, "
+          "making it work is docs/services/distrib_la/backends.md.  To measure it anyway, "
           "set LORRAX_SCALAPACK_ALLOW_SLATE_API=1.";
 }
 

@@ -9,7 +9,7 @@ Run (one rank per GPU; select_gpu.sh keeps all four GPUs visible for NCCL):
     python -u -m gw.gw_jax -i deck.in
 
 Recipe: config/perlmutter/module/ in the LORRAX repository
-(docs/installation/perlmutter-module.md).
+(docs/installation/perlmutter.md, section 2).
 ]])
 whatis("Name: LORRAX")
 whatis("Version: @REV8@, bundle @BUNDLE12@")

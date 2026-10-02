@@ -56,13 +56,13 @@ export MPITRAMPOLINE_LIB=$WORK/lorrax_mpiwrapper/install/lib64/libmpiwrapper.so
 export LORRAX_MPI_FINALIZE_FIX=skip_atexit
 PYTHONPATH=$WORK/lorrax_env_mpi_overlay/site:$PYTHONPATH
 # LORRAX_MPI_FORCE_THREAD_MAIN: deliberately UNSET — superseded by the
-# in-repo warm_mesh_cliques() (mpi_collectives.md STATUS); setting it would
+# in-repo warm_mesh_cliques() (docs/environment/transports.md, the warm-up); setting it would
 # only mask a missing warm-up call site.
 ```
 
 All three exports plus the overlay `sitecustomize` are load-bearing; omitting
 `LORRAX_MPI_FINALIZE_FIX` makes every successful run exit rc=1. Full
-rationale and the rest of the env block: **`docs/dev/mpi_collectives.md`**.
+rationale and the rest of the env block: **`docs/environment/transports.md`**.
 The whole certified block, executable: `templates/gw_dev.sbatch`.
 
 ## Cold start: the node-local run-time bundle

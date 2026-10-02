@@ -919,7 +919,7 @@ def _owner_gather_chunk_bytes() -> int:
     Reads ``LORRAX_COLLECTIVE_CHUNK_MB`` — the SAME per-instruction
     transport cap the distributed ζ tier and the W Dyson A-build enforce
     (``isdf/core._collective_chunk_bytes``; calibration in
-    ``docs/dev/env_vars.md``).  Re-read here rather than imported because
+    ``docs/reference/env_vars.md``).  Re-read here rather than imported because
     ``common`` must not import ``isdf``.  ``0``/negative = unbounded,
     same escape-hatch semantics as there.
     """
@@ -1432,7 +1432,7 @@ def warm_mesh_cliques(mesh, *, print_fn=print) -> float:
     orders on different ranks is a latent deadlock.  Warming from one thread
     in a program-defined order before any jit runs removes that exposure.
     (The wrapper's OTHER override, the ``MPI_THREAD_MULTIPLE`` upgrade, is
-    still required and is unrelated — see docs/dev/mpi_collectives.md.)
+    still required and is unrelated — see docs/environment/transports.md.)
 
     MUST be called synchronously on every rank: it is a collective.  A no-op
     off the mpi implementation, in single-process runs, and on a mesh already

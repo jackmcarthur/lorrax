@@ -13,9 +13,9 @@
 # Launch from a login shell with no LORRAX module loaded and no LORRAX tree on PYTHONPATH.
 # Passing writes accept/gate10.ok (-n 1) or accept/ok.<rank> (-n 4);
 # publish.sh needs all five.
-# The candidate must be writable from compute nodes: tests/hsuite writes its
-# runs and compile cache inside the source tree, which is why acceptance runs
-# on the candidate and not on a published release under /global/common.
+# The candidate must be writable from compute nodes: the acceptance markers
+# go to <cand>/accept/, which is why acceptance runs on the candidate and not
+# on a published release under /global/common (mounted read-only there).
 # ============================================================================
 set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

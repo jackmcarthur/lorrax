@@ -82,7 +82,7 @@ not a state of anything.  Its default is ``strict`` on the owner's ruling of
 2026-08-10 — a widened window is a DIFFERENT CALCULATION (4v4c became 4v8c,
 1024 dimensions became 2048, and a gate read 0.0906 eV of regression that no
 branch had caused), so it refuses rather than repairing, and its env row in
-``docs/dev/env_vars.md`` (``LORRAX_BAND_DEGENERACY``) carries the standing
+``docs/reference/env_vars.md`` (``LORRAX_BAND_DEGENERACY``) carries the standing
 rule: **never set ``snap`` to make a gate pass.**  That guard is untouched by
 this module and by the ruling above.
 
@@ -193,7 +193,7 @@ RELATION TO ``common/rank_criterion``
 -------------------------------------
 The whole policy — this module, ``rank_criterion`` and the band-axis twin
 ``band_degeneracy`` — is written down once in
-``docs/dev/rank_truncation_policy.md``; read that for the site register and
+``docs/architecture/rank_truncation_policy.md``; read that for the site register and
 the certified κ ceiling.
 
 That module decides HOW MANY directions to keep and why (a cap on how much

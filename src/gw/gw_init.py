@@ -1125,7 +1125,7 @@ def check_zeta_fit_windows(energies, band_range_left, band_range_right,
 #: an ENV knob rather than a deck key because it is an escape hatch for a
 #: deck you are debugging, not a property of the calculation you would want
 #: recorded in the input file.  Never set it to make a gate pass
-#: (``docs/dev/env_vars.md``).
+#: (``docs/reference/env_vars.md``).
 _BAND_DEGENERACY_ENV = "LORRAX_BAND_DEGENERACY"
 
 

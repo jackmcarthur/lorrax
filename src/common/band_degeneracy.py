@@ -3,7 +3,7 @@
 The BAND-axis member of the truncation policy family — its spectral twin is
 ``common/spectral_closure`` and the criterion both serve is
 ``common/rank_criterion``.  A window rounds OUTWARD and a rank cut rounds
-INWARD, deliberately; ``docs/dev/rank_truncation_policy.md`` §5 states the
+INWARD, deliberately; ``docs/architecture/rank_truncation_policy.md`` §5 states the
 discriminator once.
 
 THE PROBLEM.  ``--n-val N`` / ``--n-cond M`` pick a band window by COUNTING:

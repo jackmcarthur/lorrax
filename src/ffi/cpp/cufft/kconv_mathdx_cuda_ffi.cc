@@ -6,13 +6,13 @@
 // writes no DFT, no twiddle table and no radix code here; the per-size
 // specialisation is the library's, made at JIT time.  Ruling:
 // docs/architecture/decisions.md 2026-09-24; layering:
-// docs/architecture/ffi_layout.md "k-convolution router and the mathdx family".
+// docs/architecture/kconv.md.
 //
 // Modes (LRX_MODE of the embedded source; one handler per mode):
 //   0 pair    U[kx,ky,kz,col,mu] = s * FFT_k( sum_ab phase_ab
 //                 conj(IFFT_k A[k,a,col,mu,b]) * IFFT_k B[k,perm_l a,col,mu,perm_r b] )
 //   1 parent  the same contraction with the typed parent load of
-//             docs/architecture/ffi_layout.md "Parent-load ISDF pair
+//             docs/architecture/kconv.md "Mode 1: the parent-load pair
 //             convolution": A/B are raw-parent (p,ns,mu,ns,nu) projectors and
 //             the load applies the umklapp phases, the antiunitary conjugation
 //             and the open-spin coefficients; U is (nk, mu, nu).

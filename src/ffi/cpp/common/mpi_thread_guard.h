@@ -59,7 +59,7 @@ inline void require_thread_multiple(const char* tag, const char* hazard) {
             "measured ~29%% multi-node crash rate (scorecard AS.4b).  Use the "
             "site CPU-MPI launch recipe and verify the live thread grant "
             "before enabling native MPI I/O/linalg "
-            "(docs/dev/mpi_collectives.md).  Aborting the MPI world before "
+            "(docs/environment/transports.md).  Aborting the MPI world before "
             "peer ranks can enter a native collective.\n",
             tag, provided, MPI_THREAD_MULTIPLE, hazard);
         std::fflush(stderr);

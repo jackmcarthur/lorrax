@@ -1091,7 +1091,7 @@ def _write_w_av_stage(
             "q-stream reproducibly segfaults with BFC during the first "
             "collective write. Fix: export "
             "XLA_PYTHON_CLIENT_ALLOCATOR=platform before lx run; see "
-            "docs/dev/env_vars.md.")
+            "docs/reference/env_vars.md.")
     tile_budget_bytes = 0.20 * device_budget_bytes()
     px = int(mesh.shape["x"])
     py = int(mesh.shape["y"])

@@ -578,7 +578,7 @@ def _eigen_rank(G_host: np.ndarray, rcond: float, *, label: str,
 #   budget at all — a window that slices a degenerate manifold makes the run
 #   wrong rather than expensive, so the rule there is closure, not thrift:
 #   ``strict`` is the default and you never set ``snap`` to make a gate pass
-#   (``LORRAX_BAND_DEGENERACY`` in ``docs/dev/env_vars.md``).
+#   (``LORRAX_BAND_DEGENERACY`` in ``docs/reference/env_vars.md``).
 #
 # Do not re-introduce a "these two go opposite ways, on purpose" paragraph
 # here.  There was one, contrasting this floor with a snap-OUTWARD ceiling, and

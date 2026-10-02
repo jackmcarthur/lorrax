@@ -58,7 +58,7 @@ def dispatch_batched_eigh(A, mesh_xy: Mesh, backend: str = "distributed",
     but "no edit here" was only true because this function was a second
     route selector, and a second route selector is the thing the design
     forbids.  A new stacked entry is one ``_IMPL`` row, which is already
-    what ``docs/dev/linalg_ffi.md`` § "Adding a backend" tells you to
+    what ``docs/services/distrib_la/backends.md`` § "Adding a backend" tells you to
     write.  What survives from that argument is
     :func:`distrib_la.plan._eigh_columns` staying RANK-AGNOSTIC: the day
     cuSOLVERMp grows a batched entry, the normaliser starts receiving

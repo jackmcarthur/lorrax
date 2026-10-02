@@ -4,8 +4,8 @@
 #
 # This is the CERTIFIED launch block, vendored (env audit): it reconciles the
 # last certified harness (/scratch2 mos2_4x4_test gw800_merged.sbatch, merged
-# tree @ 9f20cb6) with docs/dev/env_vars.md §5 and the impl=mpi recipe in
-# docs/dev/mpi_collectives.md.  Values are measured, not invented; do not
+# tree @ 9f20cb6) with docs/reference/env_vars.md §5 and the impl=mpi recipe in
+# docs/environment/transports.md.  Values are measured, not invented; do not
 # edit the env block without reading those two docs.
 #
 # What it demonstrates:
@@ -104,14 +104,14 @@ export ISDF_JAX_CACHE_DIR=${ISDF_JAX_CACHE_DIR-$SCRATCH/lorrax_jax_cache}
 # I_MPI_PMI_LIBRARY=$WORK/host_pmi/libpmi2.so.0, I_MPI_DEBUG=4 banner) ------
 . "$LORRAX_ROOT/config/frontera/mpi_transport_env.sh"
 
-# --- CPU collectives: impl=mpi (docs/dev/mpi_collectives.md) ---------------
+# --- CPU collectives: impl=mpi (docs/environment/transports.md) ---------------
 export JAX_CPU_COLLECTIVES_IMPLEMENTATION=mpi
 export MPITRAMPOLINE_LIB="$LORRAX_MPIWRAPPER_SO"
 export LORRAX_MPI_FINALIZE_FIX=skip_atexit   # overlay sitecustomize; without
                                              # it every run exits rc=1 AFTER
                                              # succeeding (double finalize)
 # LORRAX_MPI_FORCE_THREAD_MAIN is deliberately NOT set: superseded by the
-# in-repo warm_mesh_cliques() (mpi_collectives.md STATUS).  Setting it would
+# in-repo warm_mesh_cliques() (docs/environment/transports.md, the warm-up).  Setting it would
 # only mask a missing warm-up call site.
 
 # --- host library search path (host FFI .so deps: SLATE, MKL, phdf5,

@@ -629,7 +629,7 @@ _PERLMUTTER = MachineProfile(
                     "nothing — bug L-2 is CARRIED, not covered: SLATE's "
                     "host heev faults deterministically and a SIGSEGV "
                     "takes the whole pytest process down.  See "
-                    "docs/dev/linalg_ffi.md; the CPU eigh contract is "
+                    "docs/services/distrib_la/backends.md; the CPU eigh contract is "
                     "covered by the ScaLAPACK cells instead"),
     ),
     min_collected=1,

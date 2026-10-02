@@ -564,7 +564,7 @@ def compute_screening(
     # ORDERED ORIENTATIONS on the imaginary-axis probe: exactly when the
     # deck's MEASURED time-reversal verdict is false. Missing symmetry tables
     # refuse in ``_trs_verdict`` rather than selecting a branch. See
-    # ``docs/dev/notes/DERIVATION_gnppm_nonhermitian.md``.
+    # ``docs/theory/gn-ppm-nonhermitian.md``.
     _tr_odd = _trs_verdict(sym) is False
     # Bar/ETA cadence over the W roles; long phases inside also announce via
     # ``timing.section(..., announce=True)`` (see the note at module top).
