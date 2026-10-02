@@ -1,10 +1,16 @@
 # The GN plasmon-pole model from a non-Hermitian $W(i\omega_p)$
 
-The time-reversal-broken (magnetic) GN-PPM and ordered MPA: the Hermitian
-and anti-Hermitian parts of $W(i\omega_p)$ fix two Hermitian residues, and
-each causal Σ branch consumes one of them. Code: `src/gw/w_isdf.py` (χ₀
-kernels), `src/gw/minimax_screening.py` (the fit), `src/gw/ppm_sigma.py`,
-`src/gw/ppm_accumulators.py` and `src/gw/mpa/sigma.py` (the Σ windows).
+On a magnet (time reversal broken) the imaginary-axis screened interaction
+$W(i\omega_p)$ is not Hermitian, and a single-residue plasmon-pole fit would
+break the symmetry the Σ accumulator relies on. This page derives the
+two-residue model LORRAX uses instead, for GN-PPM and for ordered MPA: the
+Hermitian and anti-Hermitian parts of $W(i\omega_p)$ fix two Hermitian
+residues, and each causal Σ branch consumes one of them. Read
+[Core ISDF and GW theory](physics.md) and
+[multipole frequency integration](THEORY_mpa_implementation.md) first. Code:
+`src/gw/w_isdf.py` (χ₀ kernels), `src/gw/minimax_screening.py` (the fit),
+`src/gw/ppm_sigma.py`, `src/gw/ppm_accumulators.py` and
+`src/gw/mpa/sigma.py` (the Σ windows).
 
 ## 1. Exact pole structure without time reversal
 
@@ -98,7 +104,7 @@ Data: $W^c(0)$ (Hermitian) and $W^c(i\omega_p)=h_p+a_p$ split elementwise into
 its Hermitian and anti-Hermitian halves.  The even part is the TRS fit:
 
 $$
-\Omega^2=\omega_p^2\,\frac{h_p}{W^c(0)-h_p}\ (\text{elementwise, Re taken as today}),\qquad
+\Omega^2=\omega_p^2\,\frac{h_p}{W^c(0)-h_p}\ (\text{elementwise, real part}),\qquad
 B\equiv\tfrac12(R_++R_-)=-\tfrac12 W^c(0)\,\Omega .
 $$
 
@@ -130,9 +136,9 @@ $$
 
 ($\odot$ elementwise in $(\mu,\nu)$, then band-projected).  So the
 **conduction branches consume $R_+=B+D$ and the valence branches $R_-=B-D$**;
-with $D=0$ this is the GPP formula.  Verified independently by the
-imaginary-axis contour $\Sigma_c(E)=-\frac1{2\pi}\int d\nu\,G(E-i\nu)W^c(i\nu)$
-at midgap (test cell), whose red twin (residues swapped) fails.  The static
+with $D=0$ this is the GPP formula.  The imaginary-axis contour
+$\Sigma_c(E)=-\frac1{2\pi}\int d\nu\,G(E-i\nu)W^c(i\nu)$ at midgap gives
+the same assignment, and fails with the residues swapped.  The static
 limit picks up $D/\Omega$ beyond COHSEX, the model's image of the odd channel
 that the exact $\Sigma_c$ also carries at $E$ in the gap.
 
@@ -140,7 +146,7 @@ that the exact $\Sigma_c$ also carries at $E$ in the gap.
 
 The Σ accumulator closes a crossing (anti-Hermitian, `project_code = 1`)
 window from a one-sided node sum $Z$ as $(Z-Z^\dagger)/2i$ on the band axes
-(`ppm_accumulators._antiherm_band_fn`). The per-node operand is the Hadamard
+(the `antihermitian` arm of `ppm_accumulators._device_window_runner`). The per-node operand is the Hadamard
 product $\sigma^t_k(\mu,\nu)=\sum_q G^t_{k-q}(\mu,\nu)\,W^t_q(\mu,\nu)$ with
 $W^t_q=m_B\odot R\odot e^{-it(\Omega_q-E^{\rm ref})}$. For a real crossing time
 $t$ neither factor is Hermitian on one slice; what holds is
@@ -172,8 +178,7 @@ and perturb nothing.
 With §3 both branches receive a Hermitian residue ($R_+$ or $R_-$), so the
 closure stays valid on a magnet. Feeding the raw $W^c(i\omega_p)$ of a broken-TR
 system to the single-residue elementwise fit would instead give a non-Hermitian
-$B$ and a non-symmetric $\Omega$ and break the pair-adjoint identity (the red
-twin in the tests).
+$B$ and a non-symmetric $\Omega$ and break the pair-adjoint identity.
 
 ## 6. The charge head, HL, MPA
 
@@ -268,9 +273,11 @@ residues; the delivered-error planner measures the selected residue separately
 for each branch.  The scalar charge head remains the even object of §6 and
 therefore retains the single-residue fit.
 
-For observability, ordered MPA executes that same planned contraction once
-more with $D=0$, exactly as GN-PPM does, and records
-`sigC_odd = Sigma_c[B,D] - Sigma_c[B,0]`.  The debug-off arm therefore emits
-an exactly zero `sigC_odd` column.  This is deliberately not reconstructed
-from a fitted scalar or from an on-shell QP difference: it is the difference
-of the two production Sigma cubes on the same omega grid.
+To make the odd channel observable, ordered MPA executes the same planned
+contraction once more with $D=0$, as GN-PPM does, and writes
+`sigC_odd = Sigma_c[B,D] - Sigma_c[B,0]` to `sigma_diag.dat`
+(`gw.mpa.sigma._attach_ordered_odd_sigma`). Σ is linear in the residues, so
+this difference is the ordered term itself, computed from the two
+production Σ cubes on the same ω grid rather than from a separately
+approximated formula. A run with $D = 0$ therefore writes an exactly zero
+column.
