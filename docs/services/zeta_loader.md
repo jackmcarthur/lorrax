@@ -56,7 +56,7 @@ delegates to the same seal.
 * **Checked at open:**
   - completeness: `isdf_header/zeta_is_done = False` refuses
     (`LORRAX_ALLOW_PARTIAL_ZETA=1` overrides, for debugging; see
-    [`env_vars.md`](../dev/env_vars.md));
+    [`env_vars.md`](../reference/env_vars.md));
   - μ: the ζ dataset's μ extent must be at least the header's `n_rmu` for
     `zeta_q_G` and equal to it for `zeta_q`, else the header and ζ block came
     from different runs;

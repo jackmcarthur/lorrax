@@ -1,112 +1,29 @@
 # distrib_la
 
-`distrib_la` is an independently installable Python package for dense linear
-algebra on a JAX `Mesh` with axes `('x', 'y')`. Its public operations are
-Hermitian eigendecomposition, Cholesky factorization, LU solve, distributed
-GEMM, and opaque factor/solve (including split ScaLAPACK and cuSOLVERMp LU).
-Native JAX kernels are always available;
-optional ScaLAPACK/PBLAS, SLATE, and cuSOLVERMp/cuBLASMp handlers are
-discovered at runtime through a compatible FFI provider shared library.
-
-The package has three runtime dependencies: `jax`, `numpy`, and the sibling
-foundation package `lxkit`. It imports no LORRAX `src/` module or `common`
-helper. From a LORRAX source checkout, install the two distributions with:
+`distrib_la` is LORRAX's dense linear algebra over a JAX `Mesh` with axes
+`('x', 'y')`: Hermitian eigensolves, Cholesky and LU, GEMM, the polar factor
+and the active-subspace algebra of iterative eigensolvers. It is an
+independently installable package whose runtime dependencies are `lxkit`, JAX
+and NumPy; it imports nothing from LORRAX's `src/`. ScaLAPACK, SLATE,
+cuSOLVERMp and cuBLASMp are not Python dependencies: `distrib_la.loader` opens
+them at run time through the LORRAX native FFI pair, and without that pair the
+package still imports, reports its capabilities and runs its pure-JAX routes.
 
 ```bash
 cd services/distrib_la
-python -m pip install -e ../lxkit -e '.[test]'
+python -m pip install -e ../lxkit -e .
 python -c "import distrib_la; print(distrib_la.BATCHED_ROUTE_CHOICES)"
 ```
 
-If `h5py` happens to be installed, the FFI loader imports it in a caught,
-best-effort block before `dlopen` so h5py's HDF5 symbols win the process-wide
-load-order race. `h5py` is not required by `distrib_la`; its absence is
-accepted and it is intentionally not a declared dependency.
+Import top-level names only. The documentation lives in the LORRAX docs:
 
-An installed consumer uses only the top-level API:
+- [The API](../../docs/services/distrib_la/api.md): layouts, plans, factor and
+  solve, GEMM, the polar factor, workspace queries.
+- [Backends](../../docs/services/distrib_la/backends.md): which library serves
+  each operation on each platform, the `linalg` deck dial, the guard ladder,
+  and how to add a backend.
+- [Active subspace](../../docs/services/distrib_la/subspace.md): the
+  fixed-capacity plans of Davidson and Lanczos.
 
-```python
-import jax
-import numpy as np
-from jax.sharding import Mesh
-import distrib_la as dla
-
-devices = np.asarray(jax.devices())
-mesh = Mesh(devices.reshape(1, devices.size), ('x', 'y'))
-
-eigh = dla.plan('eigh', mesh, backend='off', n=a_stack.shape[-1],
-                batched_route='batch_reshard')
-w, z = eigh.batched(a_stack)
-print(eigh.describe())
-
-# Rank-3 inputs use P(None, 'x', 'y'); rank-2 inputs use P('x', 'y').
-# This provider-free spelling exchanges faces to whole matrices in one
-# all_to_all over (x, y), computes locally, and returns through the inverse.
-d_stack = dla.matmul(a_gemm, b_gemm, mesh=mesh, backend='off',
-                     batched_route='batch_reshard')
-```
-
-For `Plan`, `batched_route='auto'` preserves backend-native batching or the
-distributed scan. `batched_route='batch_reshard'` instead exchanges matrix-face shards
-into complete matrices distributed over the batch axis, runs the local JAX
-kernel, and applies the exact inverse exchanges to matrix outputs. This route
-covers `eigh`, `cholesky`, and `solve_lu`, including leading batches not
-divisible by the device count. Use it only when one complete matrix, its
-output, and the native solver workspace fit on one device. It is not a
-replacement for a distributed backend in the single-matrix capacity regime.
-
-Those meanings are service-owned and complete: `batched_route` does not
-choose between `Plan.batched` and the separate `factor()`/`solve()`
-`FactorToken` API, and it does not schedule a caller's multi-channel work.
-For example, LORRAX's coupled transverse-zeta caller applies its own capacity
-policy above this API: automatic local `batch_reshard`, then a distributed
-token, then sequential channels. An explicit `batch_reshard` request never
-silently becomes a token route; partial reuse is sequential. The coupled
-caller shares its Z build but retains three ordered solve calls, not a fused
-three-channel cuSOLVERMp operation.
-
-Top-level `matmul` has deliberately different default routing from `plan`.
-`matmul(..., backend='auto')` selects cuBLASMp on CUDA, XLA's dot on
-gathered faces on CPU (no PBLAS GEMM handler is built), or `slate::multiply`
-on ROCm; `cusolvermp` is an
-accepted alias for its cuBLASMp sibling. Rank-2 inputs and outputs use
-`P('x','y')`, while rank-3 stacks use `P(None,'x','y')`. The explicit staged
-route pads only a ragged leading batch with zero GEMM rows. It refuses matrix
-or output extents that do not tile `Px` by `Py`, and each device must have
-room for complete local A, B, and D matrices, C when `beta != 0`, live input
-faces/exchange buffers, and GEMM workspace. No zero C is allocated or
-exchanged when `beta == 0`. Provider routes require an exact y-minor 2-D
-`('x','y')` process grid; cuBLASMp and SLATE require it to be square, while
-PBLAS also supports rectangular grids.
-
-`gemm_plan(...)` is the fixed-shape, trace-safe surface for hot loops.  With
-`enable_active_range=True`, `plan.active_range(A, B, lo, hi, weights=...)`
-contracts only the exact live interval while retaining the full allocation
-and output sharding.  Optional `weights` has shape `(q, K)` and scales live
-contraction lanes inside the service.  Face operands use cuBLASMp descriptor
-views on CUDA.  Axis operands with replicated `K` use classic cuBLAS pointer
-views on CUDA and exact JAX panels on CPU.  Distributed face execution on CPU
-has no planned active ScaLAPACK kernel yet and refuses.  The interval API,
-restrictions, and validation are documented in
-[`active GEMM ranges`](../../docs/dev/active_gemm_ranges.md).
-
-No shared library is needed to import the package, inspect capabilities, or
-use native routes. To grant an FFI capability, point `LORRAX_FFI_SO` (CUDA)
-or `LORRAX_FFI_HOST_SO` (CPU) at a provider library that exports the handler
-symbols and ABI expected by this package. The current provider is built by
-the LORRAX C++ tree; an explicit missing or incompatible pin is a refusal,
-never a fallback.
-
-The canonical API, sharding contracts, route schedule, refusals, warm-up
-behavior, tests, and backend limitations are documented in
-[`../../docs/services/distrib_la.md`](../../docs/services/distrib_la.md).
-
-
-For iterative algorithms on one CUDA device, `plan_local_subspace(capacity=...,
-n_eig=...)` resolves fixed-capacity active-prefix eigensolves, projections,
-CGS2, reconstruction, and aliased row stores. This route is complex128 and
-process-local; it refuses distributed operands and requires the corresponding
-canonical provider handlers. Its workspaces are available through
-`LocalSubspacePlan.workspace_specs`. Runtime size descriptors synchronize to
-the host inside FFI. The LORRAX consumer contract is documented in
-[`planned local Davidson`](../../docs/services/davidson.md).
+`bench/` holds backend checks and benchmarks that run on a real mesh; they are
+not a pytest suite.
