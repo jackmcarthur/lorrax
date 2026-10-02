@@ -75,6 +75,14 @@ its stop rules in [self-consistency](../self_consistency.md); the W model in
   `WFN_qp.h5` files written before 2026-09-30 from a WFN that stores both k
   and −k have broken rows; regenerate them
   ([self-consistency §8](../self_consistency.md#8-seeding-restart-and-outputs)).
+- **Magnets.** The WFN keeps every symmetry QE found, the operations composed
+  with time reversal included (no `no_t_rev`, no `nosym`), and the NSCF's
+  `data-file-schema.xml` sits beside `WFN.h5`
+  ([inputs from DFT](../preprocessing.md#magnetic)).
+- **Bispinor (four-current) SC.** Converge the charge SC first. Then run the
+  bispinor SC on the same WFN, seeded from the charge run's final
+  Hamiltonian: `sc_initial_qp_rotations_file = <charge run>/qp_wfn_rotations.h5`
+  ([seeding](../self_consistency.md#8-seeding-restart-and-outputs)).
 
 The keys that differ from the defaults:
 
@@ -92,10 +100,14 @@ number_bands = N        # >= 2 n_occ, the one count for chi0 and Sigma
 ## Minimum settings
 
 - At least **20 conduction bands** in the Σ window (`ncond >= 20`).
-- **Centroids ≥ 10 × `number_bands`**, taking the nearest orbit-closed count.
-  About 6 per band is diagnostic only. Select them on the Σ pair set; the
-  exchange error follows N_μ/r of that pair set's rank r
-  ([ISDF exchange accuracy](../theory/isdf-exchange-accuracy.md)).
+- **Centroids N_μ ≈ 0.5 r**, r the rank of the Σ pair set (left: the ζ
+  left window [0, b3); right: `number_bands`), at the nearest orbit-closed
+  count, selected on that pair set (`kmeans_cli --fit-window`). This is the
+  1 meV RMS point of Σ_x. Read r from the kmeans rank probe, or, where the
+  probe does not fit, from the
+  [rank law](../theory/isdf-exchange-accuracy.md#rank-law). Example: Ni 20³
+  with 120 spinor bands and b3 = 30 is L = 15, B = 60 per Kramers pair, so
+  N_μ ≈ 1100; the production deck takes 1200.
 - The ζ fit is built on the Gram of **all bands that enter Σ**
   (`zeta_nband = number_bands`). If the strict rank ceiling refuses, set `zeta_rcond`
   explicitly; do not drop to a smaller basis.
@@ -137,8 +149,10 @@ The W error falls roughly as N^−1.2 over these four counts and does not
 reach 5 meV in the gap at any measured N. Most of it is a rigid shift (+196
 meV at 64, +70 meV at 142), which cancels in a band structure. Si 4³ SOC, one-shot, 1100
 centroids: from N = 100 to 116 the eqp0 gap rises 25 meV with extrapolation
-and 21 meV without (claim 2984). Cost: the G and χ₀ builds are linear in N,
-and the centroid rule (≥ 10 N) grows W and the k-convolution as N_μ²
+and 21 meV without (claim 2984). Cost: the G and χ₀ builds are linear in N;
+N_μ follows the pair-set rank, which grows about as N^0.32
+([rank law](../theory/isdf-exchange-accuracy.md#rank-law)), and W and the
+k-convolution grow as N_μ²
 ([Σ quadrature §3](../theory/sigma-quadrature-problem.md#3-cost)).
 
 **2. Σ's G tail (`use_band_extrapolation`).** Σ's band sum is extrapolated
@@ -150,7 +164,8 @@ N from 64 to 142; at N = 78, 9.0 / 27 / −2.6 meV against 29.2 / 68 / −90 meV
 without extrapolation (Si 4³ scalar, as in 1). Five samples in place of
 three give the same numbers at N = 78. Under W at N the same fit opens the
 gap by 13 to 23 meV, so the production error is smaller than W's alone.
-Cost: Σ τ time +5 to +11 % per SC map (Na 8³).
+Cost: Σ τ time +5 to +11 % per SC map on Na 8³, and +8.5 % at Ni 20³ on 64
+GPUs (claim 3103).
 
 **3. Protected bands (`number_bands_protected` = b3).** Only the QP matrix
 [b0, b3) rotates; the bands [b3, N) keep their DFT orbitals and take one
@@ -204,6 +219,31 @@ The recipe fixes two more sources:
   (Fe 4³, against η_semi = 1 eV) and 2.9 / 20.0 meV (MoS2 3×3, against the
   deck η), both converged SC (claim 2960). `sigma_omega_patches_ev` sets
   user windows at their own η.
+
+## Worked example: one map of Ni 20³ on 64 GPUs {#ni20-example}
+
+Ni fcc ferromagnet, spinor (SOC) WFN at 80 Ry on a 20³ grid (8000 k; this WFN
+was written with `no_t_rev` and stores 1062 k, against 641 with the
+time-reversal-composed operations). Charge SC deck: `number_bands = 180`,
+`number_bands_protected = 30`, 1782 centroids, `sigma_regularization_ev = 0.4`,
+ε 1e-4, band extrapolation on, `memory_per_device_gb = 36`, `linalg = local`.
+16 nodes × 4 A100-40GB (P64), main b530599a4 with bundle B9r. gwjax.out prints
+the stage line `SC map 0 stages (s)`; map 0 (sandbox run
+`runs/DEV/708_ni20_chiinv_p64_20261001/run9`):
+
+| stage | s | parts |
+|---|---|---|
+| W response | 279.0 | constructor 130.1; sample Dyson 26.3 and line selection 37.3; χ build 21.9 (22 samples in one streamed group, 44 Green-pair evaluations); χ bank I/O 12.0; moments 18.6; frequency rule 9.6; head 6.1 |
+| Σ rule plan | 0.5 | |
+| Σ τ sweep | 340.9 | 657 τ nodes, about 0.52 s each |
+| Σ exchange | 10.0 | |
+| other | 37.1 | |
+| **wall** | **667.4** | |
+
+The device peak was 27.0 GB per rank and the host peak 34.8 GB. The χ bank
+did not fit the devices and streamed to per-rank files: 34.9 GiB per rank,
+2.4 TB of scratch for the map
+([memory model](../architecture/memory-model.md#streamed-chi-bank)).
 
 ## On main
 

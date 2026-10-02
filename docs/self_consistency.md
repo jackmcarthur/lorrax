@@ -633,9 +633,16 @@ Insulators keep `parallel_transport` and `dft_velocity`.
   original DFT basis. A seed whose band policy is not all-protected, or that
   carries an active-window scissor (both written only before the 2026-09-22
   all-protected rule), refuses. Keep the original WFN and
-  reference operators. Occupations and the tail fit are recomputed, and the
-  quadrature and the accelerator history start empty, so this is a new run,
-  not a continuation.
+  reference operators. At import the seed is averaged over each kept k's
+  little group, $H \leftarrow |G_k|^{-1}\sum_L A_L(H)$ with the band
+  representations of the operations from the WFN, so a seed from another run
+  or code version cannot break this run's symmetry; the "SC initial
+  Hamiltonian" line prints the largest change, and a seed whose Σ window cuts
+  a multiplet refuses (`GATE little_group_band_representation`). A charge SC
+  seeds a bispinor SC on the same WFN (the production order,
+  [production QSGW](how-to/production-qsgw.md#the-route)). Occupations and the
+  tail fit are recomputed, and the quadrature and the accelerator history
+  start empty, so this is a new run, not a continuation.
 - **`restart = true`** reuses the ISDF/W tensors of a finished run. It
   overwrites MPA pole stores in the same directory, so point it at a copy.
 - **Terminal files.** `qp_wfn_rotations.h5` is always written;

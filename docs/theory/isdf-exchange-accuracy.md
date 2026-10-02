@@ -103,8 +103,24 @@ On this system, with the centroids selected on the Σ pair set (`--fit-window` =
 | Σ_x max ≤ 0.1 meV | ≈ 1.3 r(B) (measured at B = 296, 412; at B ≤ 152 a 0.5–1 meV floor on valence bands 1–8 remains at 1.3 r) |
 
 **Procedure.**
-1. Measure \(r(B)\) before choosing \(N_\mu\): run `kmeans_cli` with a large \(N_c\) and the deck's `--fit-window`, and read "achieved numerical rank" in `kmeans.out`. That costs about 30 s on one node here.
+1. Measure \(r(B)\) before choosing \(N_\mu\): run `kmeans_cli` with a large \(N_c\) and the deck's `--fit-window`, and read "achieved numerical rank" in `kmeans.out`. That costs about 30 s on one node here. Where the probe does not fit the device, estimate \(r\) from the law below.
 2. Take \(N_\mu\) as a fraction of \(r\).
+
+### Estimating r(L, B) without a probe {#rank-law}
+
+On the Si 4³ 25 Ry complete-basis WFNs the rank of the pair set
+left bands 1–L × right bands 1–B follows one law (claim 2870; 102 scalar
+points, log residual 5.6 % RMS, 16 % max):
+
+$$
+r(L,B) \approx \min\big(445\,L^{0.107}B^{0.322},\ 0.97\,N_G(4E_{\rm wfc})\big),
+\qquad N_\mu(\text{RMS }\Sigma_x \le 1\text{ meV}) \approx 0.5\,r(L,B).
+$$
+
+- **Counting.** L and B count orbitals. On a spinor WFN count bands per Kramers pair: half the spinor band indices (a spinor window (2L, 2B) has the rank of the scalar (L, B) within 2 %).
+- **Small windows.** While the window has fewer than about 500 distinct pair functions, r is that count exactly.
+- **No plateau.** r grows until the right window reaches the complete basis, where it is 0.82–0.98 of \(N_G(4E_{\rm wfc})\).
+- **Scope.** One system at one cutoff; the spinor check is at q = 0 only. Whether r at fixed B scales with \(N_G(4E_{\rm wfc})\) is not measured. Prefer the measured rank when the probe fits.
 
 The valence window (bands 1–8) carries the largest error at every \(N_\mu\), because valence–valence pairs have the largest \(|M|^2\) at small \(\mathbf Q\). The high-band windows (153–412) reach 0.1 meV median by \(0.5\,r\).
 

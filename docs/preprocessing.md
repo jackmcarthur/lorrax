@@ -67,7 +67,6 @@ coupling and fully-relativistic ONCV pseudopotentials:
    ecutwfc = 60.0
    noncolin = .true.
    lspinorb = .true.
-   no_t_rev = .true.
    nbnd = 80                     ! NSCF: valence + empties
 /
 ```
@@ -104,6 +103,20 @@ Run `pw2bgw.x` right after the NSCF: each `pw.x` run overwrites `<prefix>.save/`
   symmetries include one combined with time reversal.
 
 ### Magnetic spinor wavefunctions {#magnetic}
+
+- **Keep every symmetry QE finds.** Do not set `no_t_rev` or `nosym`. A
+  magnet's symmetries include operations composed with time reversal; QE
+  reduces the k grid with them (Fe and Ni 20³: 641 stored k instead of 1062,
+  Co 484 instead of 748).
+- **Keep the NSCF's `data-file-schema.xml` beside `WFN.h5`** (the schema
+  bullet above). It must be the NSCF's: LORRAX binds the time-reversal flags
+  only when the schema's operations and k rows are those of the WFN
+  ([`symmetry_maps`](services/symmetry_maps.md)). gwjax.out then prints
+  `Active op rows : 8 unitary; 8 TR-composed` (Fe, Ni).
+- **Effect.** A WFN with the time-reversal-composed operations and one
+  without them, both from the same SCF density, give eqp within 0.07 meV:
+  Fe 4³ scalar and bispinor, one-shot and SC; Ni 4³, Co 4³ and Co 6×6×4
+  scalar SC (claim 3097).
 
 | QE version | `pw2bgw.x` |
 |---|---|
