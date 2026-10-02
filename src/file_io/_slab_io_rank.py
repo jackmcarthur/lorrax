@@ -366,7 +366,7 @@ class StreamedBank:
             (int(mesh.shape["x"]), int(mesh.shape["y"])))
         self.devices = tuple(cells)
         self._cell = {(i[0].start or 0, i[1].start or 0): d for d, i in cells.items()}
-        self.seconds, self.bounced = dict(write=0., read=0., wait=0.), 0
+        self.seconds, self.bounced, self.rereads = dict(write=0., read=0., wait=0.), 0, 0
         self._ahead, self._free, self._checks, self._read_error = {}, [], [], None
         self.digests = {d: np.zeros((self.n_out, len(self.shapes), self.q), np.uint64) for d in self.devices}
         self.written = np.zeros((self.n_out, len(self.shapes)), bool)
@@ -403,6 +403,8 @@ class StreamedBank:
     def put(self, p, carry, outputs):
         """Store segment ``p``: carry row ``r`` as output ``o`` for each ``(r, o)``.  Returns at
         once; a failure is held for :meth:`commit`."""
+        # Writes invalidate anything read ahead.
+        self._drop_ahead()
         if not self.fits:
             # Agreed on every rank at creation, so every rank refuses here alike.
             raise RuntimeError(f"GATE streamed_bank_capacity: store {self.label} was refused at "
@@ -519,7 +521,15 @@ class StreamedBank:
         for i, (runs, q_span) in enumerate(spans):
             started = time.monotonic()
             value = self.read_runs(runs, q_span, then=spans[i + 1] if i + 1 < len(spans) else None)
-            agree_io_error(self.check_reads(), path=self.dir, stage="streamed_bank.read")
+            try:
+                agree_io_error(self.check_reads(), path=self.dir, stage="streamed_bank.read")
+            except RuntimeError:
+                # One agreed re-read, with no read-ahead, before refusing: a stale or
+                # transient read recovers; bytes that never landed refuse again.
+                self.rereads += 1
+                self._drop_ahead()
+                value = self.read_runs(runs, q_span)
+                agree_io_error(self.check_reads(), path=self.dir, stage="streamed_bank.reread")
             self.seconds["read"] += time.monotonic() - started
             yield value
 
@@ -571,13 +581,13 @@ class StreamedBank:
         checks, self._checks = self._checks, []
         try:
             for runs, (qa, qb), digest in checks:
+                where = f"{self.label} outputs {list(runs)} rows [{qa}, {qb})"
                 if not self.unwritten_zero and not all(self.written[a:b].all() for a, b in runs):
-                    raise OSError(f"GATE streamed_bank: {self.label} outputs {list(runs)} were not all written")
+                    raise OSError(f"GATE streamed_bank: {where} were not all written")
                 for shard in digest.addressable_shards:
                     expected = np.concatenate([self.digests[shard.device][a:b, :, qa:qb] for a, b in runs])
                     if not np.array_equal(np.asarray(shard.data)[0, 0], expected):
-                        raise OSError(f"GATE streamed_bank: {self.label} outputs {list(runs)} "
-                                      "do not match their write digests")
+                        raise OSError(f"GATE streamed_bank: {where} do not match their write digests")
         except BaseException as exc:
             error = error or exc
         return error
@@ -628,6 +638,10 @@ class StreamedBank:
         # A CPU device may alias host memory; the staging buffer is reused.
         return rows.copy() if self.devices[0].platform == "cpu" else rows
 
+    def _drop_ahead(self):
+        while self._ahead:
+            self._settle(self._ahead.popitem()[1])
+
     def _settle(self, entry):
         """Wait out an entry's preads and keep its staging buffers for reuse."""
         local, futures = entry
@@ -643,8 +657,7 @@ class StreamedBank:
         try:
             while self._inflight:
                 self._retire()
-            while self._ahead:
-                self._settle(self._ahead.popitem()[1])
+            self._drop_ahead()
             self._free = []
             self._pool.shutdown(wait=True)
             self._drain.shutdown(wait=True)
