@@ -120,7 +120,8 @@ $$
 - **Counting.** L and B count orbitals. On a spinor WFN count bands per Kramers pair: half the spinor band indices (a spinor window (2L, 2B) has the rank of the scalar (L, B) within 2 %).
 - **Small windows.** While the window has fewer than about 500 distinct pair functions, r is that count exactly.
 - **No plateau.** r grows until the right window reaches the complete basis, where it is 0.82–0.98 of \(N_G(4E_{\rm wfc})\).
-- **Scope.** One system at one cutoff; the spinor check is at q = 0 only. Whether r at fixed B scales with \(N_G(4E_{\rm wfc})\) is not measured. Prefer the measured rank when the probe fits.
+- **80 Ry metals.** The kmeans rank probe on the Fe and Ni 20³ spinor WFNs (80 Ry, right window 120 bands, B = 60 pairs) reads Fe r = 1907 at L = 14 and 2006 at L = 17, Ni r = 2085 at L = 15, against 2206, 2252 and 2222 from the law: 0.86–0.94 of it. kmeans reads 0.72–0.99 of the eigen-count the law was fitted to (sandbox runs `runs/Fe/90_prod120_c1200_t600_20261002`, `runs/Ni/09_prod120_c1200_t600_20261002`, `prep/rankprobe*/kmeans.out`).
+- **Scope.** The law was fitted on one system at one cutoff; the spinor check is at q = 0 only. Whether r at fixed B scales with \(N_G(4E_{\rm wfc})\) is not measured. Prefer the measured rank when the probe fits.
 
 The valence window (bands 1–8) carries the largest error at every \(N_\mu\), because valence–valence pairs have the largest \(|M|^2\) at small \(\mathbf Q\). The high-band windows (153–412) reach 0.1 meV median by \(0.5\,r\).
 

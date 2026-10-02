@@ -129,6 +129,44 @@ the inversion (Lorentz blocks mixed by the inversion's action), halving it
 (Fe/Ni 20³: 21.4 → ~10.7 GB per sample per rank); bispinor SC eqp moves by
 ≤ 32 µeV.
 
+## 2026-10-01 — distributed eigh runs block-cyclic
+
+A `linalg = distributed` eigenproblem (cuSOLVERMp, `distrib_la`) now describes
+each rank's tile with a square block, the largest divisor of n/p at most 256,
+so no rank idles as the trailing matrix shrinks; one all_to_all over `x` puts
+the eigenvalue index back in order. At n = 16000: 17.50 → 10.59 s on 16 GPUs
+(1.65×), 20.05 → 15.65 s on 64 (1.28×); neutral at n/p ≤ 1000. LU and
+Cholesky keep one tile per rank (block-cyclic solves measured 2–3× slower).
+Eigenpairs move at round-off (eigenvalues ≤ 1e-15 relative). Fe 4³
+`linalg = distributed` eqp0 at maps 0–2 is bitwise at its natural block and
+moves ≤ 1.8e-4 meV at a forced block of 72, the size of a 4e-16 control
+(1.4e-4 meV; claim 3093).
+
+## 2026-10-01 — the static Σ runs the Σ τ kernel at τ = 0; the map-0 exchange compile is gone
+
+Σ_x (every SC map) and static COHSEX on the parent route now run the Σ τ
+sub-tile kernel at τ = 0 with the static interaction in place of W(τ), its
+unfold tables read as device operands. Before, the Σ_x program baked the
+Green's global unfold tables into its HLO: at Ni 20³ on 64 GPUs (1782
+centroids) that compile took 93 s of the 105–120 s map-0 "Sigma exchange",
+which now takes about 10 s. At the P64-local tile a cold call takes 28.7 →
+6.7 s (compile 25.0 → 2.4 s), a warm call 0.720 → 0.672 s, and the peak
+14.0 → 8.9 GB per rank. Results move at round-off: Σ_x by 4.1e-16 relative
+at most; map 0 is bitwise, and Fe 4³ and Na 8³ SC maps 1–2 move by the size
+of a 4e-16 Σ_x control (claim 3095).
+
+## 2026-10-01 — no `coulomb.h5`; an older bank's constructor resume refuses
+
+Every scalar shared-pole map wrote the bare V to `coulomb.h5` and read it
+back to build the Coulomb roots (54.6 GB and 41 s at Ni 20³ map 0, plus a
+content hash). The roots are now formed from V on the devices, bit for bit
+the file route's, and V is named by a device digest that is the same on
+every rank and at every P. Results are bitwise, and a map directory holds
+no `coulomb.h5`. Resuming a constructor from a bank built before this change
+refuses with `GATE shared_pole_output: the bank at … was built with another
+bare V; use a fresh run directory`: delete that map directory or use a fresh
+run directory. The photon V file is unchanged.
+
 ## 2026-10-01 — the χ bank carries no −q rows on inversion-symmetric magnets
 
 On the ordered (time-reversal-broken) scalar route, every response sample's

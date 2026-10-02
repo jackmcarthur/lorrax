@@ -106,8 +106,9 @@ number_bands = N        # >= 2 n_occ, the one count for chi0 and Sigma
   1 meV RMS point of Σ_x. Read r from the kmeans rank probe, or, where the
   probe does not fit, from the
   [rank law](../theory/isdf-exchange-accuracy.md#rank-law). Example: Ni 20³
-  with 120 spinor bands and b3 = 30 is L = 15, B = 60 per Kramers pair, so
-  N_μ ≈ 1100; the production deck takes 1200.
+  with 120 spinor bands and b3 = 30 is L = 15, B = 60 per Kramers pair; the
+  law gives r ≈ 2220 and the probe 2085, so N_μ ≈ 1050–1100; the production
+  deck takes 1200.
 - The ζ fit is built on the Gram of **all bands that enter Σ**
   (`zeta_nband = number_bands`). If the strict rank ceiling refuses, set `zeta_rcond`
   explicitly; do not drop to a smaller basis.

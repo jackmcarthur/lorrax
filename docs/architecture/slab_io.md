@@ -566,8 +566,8 @@ its tier ([memory model](memory-model.md#streamed-chi-bank),
   layout where `lfs` exists (a failed `lfs setstripe` is logged; the default
   layout is used). Every byte is reserved at creation where `fallocate`
   works; Perlmutter's Lustre has none. Measured on one node at the P64-local
-  volume (75.6 GB per rank, 4-stripe files): 30 GB/s write and 25 GB/s read
-  per node, every read digest-checked.
+  volume (75.6 GB per rank, 4-stripe files): 40 GB/s write and 20 GB/s read
+  per node, every byte digest-checked (claim 3082).
 - **Capacity.** One all-gather at creation agrees the alignment, rank 0's
   free bytes and every process's promised bytes. Free bytes are the
   filesystem's free space and, where `lfs` exists, the room under the user's
