@@ -307,6 +307,9 @@ def band_character_and_moments(*, colors, moments_grid, wfn, params, ctilde,
         if f_top > 1e-6:
             lines.append("  WARNING: the returned window is not empty at "
                          "its top; raise ncond")
+        stats = jax.local_devices()[0].memory_stats() or {}
+        lines.append(f"  device peak (rank 0, whole run so far): "
+                     f"{stats.get('peak_bytes_in_use', 0) / 2**30:.2f} GiB")
         for line in lines:
             log(line)
         txt = os.path.join(input_dir, "moments.txt")
