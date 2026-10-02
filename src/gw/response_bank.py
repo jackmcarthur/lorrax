@@ -417,11 +417,11 @@ _STREAM_KERNELS: dict = {}
 def _response_stream_kernel(mesh_xy, kgrid, n_outputs, shape, *, _ffi_key, **options):
     """Cache programs, never state arrays; window data remain dynamic inputs.
 
-    A map's stream programs are one fixed set (a program per row pass of the
-    streamed χ bank and of the moment stream, about 60 at 20³ P64) met again at
-    every SC map, so every program is kept: a cache smaller than the set rebuilt
-    every factory (0.4 s each at the P64-local shape) and re-lowered every program
-    on every map.  A program binds its plan's placed door tables, which the door
+    A map's stream programs are one fixed set (the streamed χ bank's and the
+    moment stream's segment programs, one per stream or four-current family
+    pair, and the group programs) met again at every SC map, so every program
+    is kept: a cache smaller than the set rebuilt every factory and re-lowered
+    every program on every map.  A program binds its plan's placed door tables, which the door
     caches (``w_isdf._CHARGE_DOORS``, ``_PHOTON_DOORS``) hold and the ledger
     reserves; when a cache evicts a plan, its programs and their executables are
     dropped with it (:func:`_release_evicted_programs`), so no table outlives
@@ -458,7 +458,10 @@ def response_stream(wfns, meta, *, mesh_xy, q_ids, n_outputs,
     ``ordered`` (time reversal measured broken) returns the physical
     orientation ``chi_q = FT_q[chi]`` that Sigma's contraction assumes.
     ``stream_pass`` runs one segment of the direct stream's row-pass engine
-    into that segment's carry (the streamed bank, :func:`stream_segments`).
+    into that segment's carry (the streamed bank, :func:`stream_segments`):
+    the program serves every segment of its stream (the four-current stream:
+    of segment ``stream_pass``'s family pair), the segment index its last
+    argument.
     """
     from ffi import ffi_dial_key
 
@@ -470,6 +473,10 @@ def response_stream(wfns, meta, *, mesh_xy, q_ids, n_outputs,
         n_input = vertex.families.n_parent
         # The direct stream's row passes per family pair come from runtime.tiles
         # and the shapes (w_isdf._photon_pass_plans); its Greens read the active bands.
+        if stream_pass is not None:
+            from .w_isdf import photon_segments
+            stream_pass = photon_segments(
+                _photon_plans(wfns, meta, mesh_xy, vertex.families, len(q_ids)))[int(stream_pass)][0]
         kernel = _response_stream_kernel(
             mesh_xy, (meta.nkx, meta.nky, meta.nkz), n_outputs,
             (n_input, int(wfns.slices.nb_full), vertex.n, 4),
@@ -491,15 +498,9 @@ def response_stream(wfns, meta, *, mesh_xy, q_ids, n_outputs,
         (nk, int(wfns.slices.nb_full), n, int(meta.nspinor)),
         k_unfold_plan=parent, _ffi_key=ffi_dial_key(), layout=wfns.layout, selected_q=tuple(q_ids),
         pair_mode=pair_mode, bank_carry=bank_carry, ordered=ordered, band_ranges=band_ranges,
-        # One segment program for every pass; the caller passes the pass index (stream_pass_index).
+        # One segment program for every pass; the segment index is a runtime argument.
         **({} if stream_pass is None else dict(stream_pass=0)))
     return kernel, (source.psi_mun, source.psi_nmu, source.enk)
-
-
-def stream_pass_index(p, vertex):
-    """The trailing argument of a direct segment program: the charge stream's one program
-    takes its pass index at run time; the four-current stream compiles each segment."""
-    return () if vertex is not None else (jnp.int32(p),)
 
 
 def stream_weights(wfns, weights, mesh_xy):
@@ -1197,7 +1198,7 @@ def streamed_moment_totals(wfns, meta, *, mesh_xy, qids, width, execute, ordered
         kernel, fixed = response_stream(wfns, meta, mesh_xy=mesh_xy, q_ids=tuple(qids),
             n_outputs=n_out, pair_mode="direct", bank_carry=True, ordered=ordered, stream_pass=p)
         carry = _group_zeros(mesh_xy, (n_out, nq, px * rows, py * cols))()
-        carry = execute(kernel, common + tuple(fixed) + tail + (carry,) + stream_pass_index(p, None),
+        carry = execute(kernel, common + tuple(fixed) + tail + (carry, jnp.int32(p)),
                         "moment_correlation", runtime_bytes=scratch)
         bank.put(p, order(carry), outputs)
         del carry
@@ -1679,7 +1680,7 @@ def integrate_response_group(wfns, meta, mesh_xy, rules, group, *, q_ids,
                 n_outputs=weights.shape[1], pair_mode="direct", bank_carry=True, ordered=ordered,
                 vertex=vertex, band_ranges=rules["band_ranges"], stream_pass=p)
             raw = _group_zeros(mesh_xy, (weights.shape[1], len(q_ids), px * rows, py * cols))()
-            raw = execute(kernel, common + tuple(fixed) + tail + (raw,) + stream_pass_index(p, vertex),
+            raw = execute(kernel, common + tuple(fixed) + tail + (raw, jnp.int32(p)),
                           "direct", runtime_bytes=scratch)
             bank.put(p, raw, outputs)
             del raw
@@ -1749,16 +1750,22 @@ def stream_segments(wfns, meta, mesh_xy, q_count, vertex):
         n = int(meta.mu_basis.n_packed)
         segments = tuple(segment_blocks(plan, p, n // py)[1:] for p in range(len(plan.passes)))
         return segments, (n // px, n // py), None
-    import minimax
-    from .w_isdf import _photon_pass_plans, photon_segments
+    from .w_isdf import photon_segments
     families = vertex.families
-    half_plans = tuple(plan.dirac_halves()[0] for plan in families.plans)
-    plans = _photon_pass_plans(mesh_xy, (meta.nkx, meta.nky, meta.nkz), families, half_plans,
-                               n_band=int(wfns.slices.nb_full), q_count=q_count,
-                               n_nodes=minimax.RESPONSE_NODE_CAPACITY)
+    plans = _photon_plans(wfns, meta, mesh_xy, families, q_count)
     segments = tuple(segment_blocks(plans[i], p, 0)[1:] for i, p in photon_segments(plans))
     packed = int(families.packed_layout.packed_extent) // int(families.layout.mesh_side)
     return segments, (packed, packed), _photon_canonical(families, mesh_xy)
+
+
+def _photon_plans(wfns, meta, mesh_xy, families, q_count):
+    """The four-current direct stream's window plans per family pair (``w_isdf._photon_pass_plans``)."""
+    import minimax
+    from .w_isdf import _photon_pass_plans
+    half_plans = tuple(plan.dirac_halves()[0] for plan in families.plans)
+    return _photon_pass_plans(mesh_xy, (meta.nkx, meta.nky, meta.nkz), families, half_plans,
+                              n_band=int(wfns.slices.nb_full), q_count=int(q_count),
+                              n_nodes=minimax.RESPONSE_NODE_CAPACITY)
 
 
 @lru_cache(maxsize=4)
