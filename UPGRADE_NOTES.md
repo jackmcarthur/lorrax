@@ -6,14 +6,19 @@ changes live in `docs/architecture/decisions.md`.
 ## 2026-10-01 — the shared-pole Σ τ window overlaps one node's W exchange with the next node's compute
 
 On GPU, the scalar shared-pole Σ τ window now evaluates two τ nodes per loop
-trip. Only that program is compiled with XLA's latency-hiding scheduler
+trip when the compiled paired window fits the device budget beside the live
+stages. Otherwise it runs one node per trip, as before. When it pairs, the Σ τ
+window line of gwjax.out's memory table says "two nodes per trip". Only
+that program is compiled with XLA's latency-hiding scheduler
 (`gw.ppm_accumulators.WINDOW_OVERLAP`); the global flag stays off. One node's
 W(τ) synthesis and all_to_all now run beside the other node's k-convolutions.
-At the Ni 20³ tile on P64, 0.549 → 0.492 s per τ node. The window's compiled
-temporaries grow by about two W(τ) tiles per rank (+2.5 GB at that tile); the
-Σ τ stage prices this. Results move at round-off: Fe 4³ and Na 8³ SC maps 1–2
-stay inside a 4e-16 control, and map 0 is bitwise. On a cold cache the window
-program compiles about twice as long.
+On the Ni 20³ SC map 0 at P64 (band extrapolation on), the window executables
+take 351.7 → 322.3 s (−8.4 %). The window holds a second node's live set:
+compiled 9.76 → 16.95 GB per rank, and a run peak of 28.5 GB instead of 23.9 GB,
+now set by Σ τ. The Σ τ stage prices this and admission reads it from the
+compiled executable. On a cold cache the first window compiles 13 → 34 s.
+Results move at round-off: Fe 4³ and Na 8³ SC maps 1–2 stay inside a 4e-16
+control, map 0 is bitwise, and the Ni map is bitwise at printed precision.
 
 ## 2026-10-01 — QP seeds are projected on each k's little group; the four-current χ bank carries no −q rows
 
