@@ -46,11 +46,15 @@ def response_algebra(meta, config, *, mesh_xy, n, ordered=False, photon=False):
         ``dyson.value(H, chi_raw)`` returns Wc (Ry); ``slope(H, Wc, dchi_raw)``
         returns its s derivative (Ry^-1), restoring the bare operator internally (photon input is W-V). ``moments(H, A0, A1)`` takes already scaled
         bare-response expansion coefficients and returns M1/M3 (Ry^3/Ry^5).
-        Charge only: ``dyson.pair(layout)(dyson.place(H), chi_raw, dchi_raw)``
-        returns (Wc, dWc/ds) of one sample in one program, the same equations
-        and bits as value then slope; ``place`` lays the roots out once for
-        every sample, and ``layout='batch'`` leaves both outputs in the batch
-        layout (local linalg) for a consumer of whole matrices per rank.
+        ``dyson.pair(layout)(dyson.place(H), chi_raw, dchi_raw)`` returns
+        (Wc, dWc/ds) of one sample in one program, the same equations and bits
+        as value then slope; ``place`` lays the charge roots out once for every
+        sample, and ``layout='batch'`` (charge) leaves both outputs in the batch
+        layout (local linalg) for a consumer of whole matrices per rank.  The
+        photon pair takes ``(V, chi_raw, dchi_raw, contact, W_inf - V)`` on the
+        face and returns (W - W_inf, its slope), the contact and the constant in
+        the split routines' order; V is not held a second time (its batch copy
+        would double the largest resident of the photon bank).
         Neither routine Hermitizes its inputs or outputs.
     """
     from .gw_config import linalg_resolution
@@ -174,12 +178,19 @@ def _response_programs(mesh_xy, n, backend, route, pref, ordered, volume):
             identity = jnp.broadcast_to(jnp.eye(n, dtype=v.dtype), v.shape)
             return solve(identity + mm(v, jnp.broadcast_to(volume * contact, v.shape)), v.copy())
 
-        @program(3)
-        def value(v, chi_raw, contact):
+        def w_minus_v(v, chi_raw, contact):
             chi = pref * chi_raw - volume * contact
             identity = jnp.broadcast_to(jnp.eye(n, dtype=v.dtype), chi.shape)
             return solve(identity - mm(v, chi), v.copy()) - v
-        dyson = SimpleNamespace(value=value, pair=lambda layout: None, place=lambda v: v)
+
+        def photon_pair(v, chi_raw, dchi_raw, contact, constant):
+            # The split routines' order: Wc = (W - V) - (W_inf - V), and the
+            # slope reads W = (Wc + (W_inf - V)) + V.
+            value = w_minus_v(v, chi_raw, contact) - constant
+            return value, derivative((value + constant) + v, dchi_raw)
+        dyson = SimpleNamespace(value=program(3)(w_minus_v),
+                                pair={"face": program(5, 2)(photon_pair)}.get,
+                                place=lambda v: v)
 
         @program(3)
         def slope(v, wc, dchi_raw):
@@ -1930,10 +1941,11 @@ def _dyson_phase(dyson, solve_slope, roots, held_roots, mesh_xy, layout, *, nq, 
 
     Counted as :func:`_bank_execution` admits them: the compiled arguments
     resident, the outputs, temporaries and native solver workspace on top.
-    Charge: one ``sample_dyson`` pair ``(H held, chi, dchi) -> (Wc, dWc/ds)``.
-    Photon: ``sample_dyson`` takes ``(H, chi)``; ``sample_slope`` takes ``(H, Wc, dchi)``
-    while the value's chi rows are still held (one more face stack).  Both at
-    the full parent span ``nq``, the largest a sample solves.  ``mirrored``:
+    One ``sample_dyson`` pair ``(H held, chi, dchi) -> (Wc, dWc/ds)``; the
+    photon pair also takes ``extra`` (the contact) and W_inf - V on the face.
+    A deck without a pair: ``sample_dyson`` takes ``(H, chi)``; ``sample_slope``
+    takes ``(H, Wc, dchi)`` while the value's chi rows are still held (one more
+    face stack).  Both at the full parent span ``nq``, the largest a sample solves.  ``mirrored``:
     a partner's rows are collected from unfolded tiles before they are
     concatenated (one more stack, plus one tile's unfold).
     """
@@ -1952,7 +1964,8 @@ def _dyson_phase(dyson, solve_slope, roots, held_roots, mesh_xy, layout, *, nq, 
     phases = []
     pair = dyson.pair("face")
     stages = (((pair, (jax.ShapeDtypeStruct(held_roots.shape, held_roots.dtype, sharding=held_roots.sharding),
-                       face, face), extra_bytes),) if pair is not None else
+                       face, face) + tuple(extra) + ((face,) if extra else ()), extra_bytes),)
+              if pair is not None else
               ((dyson.value, (h, face) + tuple(extra), extra_bytes),
                (solve_slope, (h, face, face), held + extra_bytes)))
     for kernel, args, kept in stages:
@@ -2343,9 +2356,11 @@ def produce_sample_bank(wfns, meta, config, *, mesh_xy, sym, sample_plan, bank_i
             if partner:
                 chi_value = jnp.conj(chi_value)
         if need_value and dyson.pair(layout) is not None:
-            # Charge: Wc and dWc/ds in one program on the held roots.
+            # Wc and dWc/ds in one program: on the held roots (charge), or
+            # with the contact and W_inf - V (photon).
             value, slope = execute(dyson.pair(layout), (held if span == (0, len(qids))
-                                   else dyson.place(h), chi_value, chi), "sample_dyson")
+                                   else dyson.place(h), chi_value, chi)
+                                   + (() if vertex is None else (contact, constant)), "sample_dyson")
         else:
             if need_value:
                 value = execute(dyson.value, (h,chi_value)+(() if vertex is None else (contact,)),

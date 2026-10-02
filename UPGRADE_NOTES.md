@@ -3,6 +3,14 @@
 User-visible changes, newest first. Binding rulings behind the breaking
 changes live in `docs/architecture/decisions.md`.
 
+## 2026-10-01 — the photon bank solves a sample's Dyson value and slope in one program
+
+The four-current bank now forms each sample's W − W∞ and its slope in one program, as
+the charge bank does; the contact and W∞ − V enter in the old order. Fe 4³ bispinor
+Dyson dispatch per SC map is 18 % faster. Results move at round-off: Wc is bitwise,
+the slope moves at 1.3e-15 relative on the local backend (bitwise on the distributed
+one), and Fe 4³ bispinor SC maps move ≤ 0.08 µeV, inside a 4e-16 control.
+
 ## 2026-10-01 — the bispinor sector constructor solves on the Ritz carrier
 
 A bispinor SC map's sector constructor now solves each round's kept span on the
