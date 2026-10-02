@@ -12,10 +12,10 @@ default), as the scalar shared pole and `bare_transverse` already do. The CC
 class's Green band sum is split into the three brackets and extrapolated by
 the pooled `spectral_shell` fit. TT, CT and TC, which are c⁻² of CC, are
 summed to N as before ([four-current Σ](docs/theory/band-extrapolation.md#four-current)).
-Every SP-full run that does not set `use_band_extrapolation = false` moves
+Every `full_shared_pole` run that does not set `use_band_extrapolation = false` moves
 once. A deck with `number_bands_sigma` < 2·n_occ now refuses at startup:
 raise the band count or set the key to false. Decks that set it to false are
-bitwise. On Fe 4³ bispinor SP-full SC at 36 bands, map 0 eqp0 within E_F ± 10 eV
+bitwise. On Fe 4³ bispinor `full_shared_pole` SC at 36 bands, map 0 eqp0 within E_F ± 10 eV
 moves by a median of 342 meV (at most 891 meV, mean −385 meV). Σ τ costs 13–20 %
 more per map, and the map wall 3–6 % more; device peak is unchanged.
 
@@ -81,11 +81,11 @@ one program serves every pass. Compile: the static Σ program at 223 passes
 on the charge stream and 203 (234.6 s) → 4 (4.9 s) on the four-current
 stream, whose peak falls by 3.6 GB per rank. Walls are within ±1 %. A rank whose rows fit one
 tile runs one pass and is bitwise (Fe 4³ scalar, Na 8³ and Fe 4³ bispinor
-SP-full, maps 0–2). With several Σ passes per rank the sums group
+`full_shared_pole`, maps 0–2). With several Σ passes per rank the sums group
 differently and move at round-off, the size of a 4e-16 control (≤ 1e-7 eV on
 Fe 4³ forced to many passes); the χ streams stay bitwise. The
-k-convolutions' `live` operand needs a native bundle built from this source
-or later.
+k-convolutions' `live` operand needs a native bundle built from 935bcede8 or
+later.
 
 ## 2026-10-01 — the photon bank solves a sample's Dyson value and slope in one program
 
@@ -109,7 +109,7 @@ synthesis (`gw.mpa.sigma.synthesize_shared_pole_parents`) and placed by the scal
 rule: replicated pole columns when they fit, else whole parents per rank on a
 `linalg = local` deck, else the face SUMMA. Only each parent's live pole columns
 are contracted. The SUMMA panels and the W∞ − V constant's q panels are sized from
-the shapes (one tile), no longer from `memory_per_device_gb`. Fe 4³ bispinor SP-full
+the shapes (one tile), no longer from `memory_per_device_gb`. Fe 4³ bispinor `full_shared_pole`
 Σ τ is 19 % faster per SC map. Bispinor results move at round-off: map 0 is bitwise,
 maps 1–2 move ≤ 0.19 µeV (a ±4e-16 control moves them ≤ 0.11 µeV). Scalar decks
 are bitwise.
@@ -295,7 +295,7 @@ instead of 73.1 GB, and the 360-band loop at 90.3 GB instead of 99.5 GB.
 Loops of four or more full panels with no tail were already folded and compile
 the same; P36 runs six. Two-panel loops (P4) keep XLA's GEMM. Results are
 bitwise: with the panel loop forced to six panels, Fe 4³ scalar and bispinor
-SP-full, Na 8³ and MoS2 SC + BSE match the previous code, beside a 4e-16
+`full_shared_pole`, Na 8³ and MoS2 SC + BSE match the previous code, beside a 4e-16
 control that moves.
 
 `distrib_la.panel_matmul_extra_tiles` is deleted, and the photon row-pass count
@@ -344,7 +344,7 @@ Fe 20³ P36-local AOT (M_T 900, 2 row passes per family pair, cold cache, 4 rank
 | node host peak | 175 of 251 GiB | 42 GiB |
 | device args / temp / code | 24.63 / 40.03 GB / 644 MB | 25.44 / 39.80 GB / 0.45 MB |
 
-What moves: nothing. Fe 4³ bispinor SP-full SC is bitwise, and its warm
+What moves: nothing. Fe 4³ bispinor `full_shared_pole` SC is bitwise, and its warm
 per-map W response wall is unchanged. Two concurrent compiles at M_T 1800 no
 longer run the host out of memory on table copies.
 
@@ -517,7 +517,9 @@ deck with a coarse class moves once.
 Under `dft` the coarse (semicore) class keeps its DFT block of H in the DFT
 basis and its end of every protected–semicore element reads Σ at E_DFT on the
 held coarse windows ([self-consistency](docs/self_consistency.md#2-band-treatment)).
-Fe 4³ and MoS2 3×3 prot at η_semi 5 and 8 eV: same maps to converge (14, 8),
+Fe 4³ and MoS2 3×3 decks requested with `number_bands_protected`, with the
+semicore read at η_semi = 5 eV and, in comparison builds with
+`qp_support.SEMICORE_ETA_EV` set to 8 eV, at 8 eV: same maps to converge (14, 8),
 equal or fewer τ pairs (MoS2 333 → 321), semicore QP within 27 meV of DFT
 (qp: 0.1–6 eV deeper), and the protected states' η_semi 8 − 5 spread falls
 3–6× (E_F ± 10 eV std Fe 5.1 → 1.4, MoS2 5.0 → 0.8 meV). The default is a
@@ -650,8 +652,7 @@ The value `band_index_only` refuses by name. Remove the key, or set
 `band_extrapolation_estimator = spectral_shell`, the default and only accepted
 value ([band extrapolation](docs/theory/band-extrapolation.md)). The
 band-index fit S(N) = S_∞ + A/N ignores where the omitted bands lie in
-energy, and it was the least accurate estimator measured against a
-converged band-sum reference. Decks that did not name the value are unchanged.
+energy. Decks that did not name the value are unchanged.
 
 ## 2026-09-24 — FFI handler ABI 6; a native library of another ABI refuses
 
@@ -665,7 +666,8 @@ otherwise fails later with an argument-count error that names neither
 library. A bundle's CUDA and host legs are used together:
 `LORRAX_FFI_SO` and `LORRAX_FFI_HOST_SO` must both be unset or both select
 one bundle, and a partial or mixed override refuses. What to change: on
-Perlmutter load the current `lorrax_A` module; elsewhere rebuild and reseal
+Perlmutter, members of m4598 load the current `lorrax_A` module
+([installation](docs/installation/perlmutter.md#lorrax-a)); elsewhere rebuild and reseal
 both legs from this source tree ([installation](docs/installation/index.md)).
 Do not point either variable at a library built from older source.
 

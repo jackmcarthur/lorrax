@@ -213,7 +213,11 @@ rulings override anything here.
   and takes the minimum over processes (`gpu_utils.minimum_process_budget_gb`),
   so every rank plans the same tile shapes. `chunk_target_utilization = 0` is
   the auto sentinel; a positive `ISDF_CHUNK_TARGET_UTILIZATION` overrides the
-  planner's default after clamping to [0.85, 1.0].
+  planner's default after clamping to [0.85, 1.0]. Its only reader is the
+  ζ μ-batch planner (`gflat_memory_model.plan_zeta_route_g`, called from
+  `gw_init`), one of the budget-sized planners the
+  [fixed-tile ruling](../architecture/decisions.md#fixed-tile) lists as not
+  yet conforming.
 
 ### Band counts
 
@@ -290,10 +294,16 @@ rulings override anything here.
 - **`SCConfig`** holds the loop settings read under
   `qp_solver = self_consistent`. `sc_accelerator` accepts only `anderson`
   (`GATE sc_accelerator_anderson_only`). `eigh` comes from the `linalg` dial
-  (`auto` or `distributed`; `native`, the k-sharded batch, is also accepted).
-  `LORRAX_SC_MAX_ITER`, `LORRAX_SC_TOL_EV`, `LORRAX_SC_MIXING` and
-  `LORRAX_SC_DUMP_DIR` still override their deck keys and print a deprecation
-  note when set. The loop: [self-consistency](../self_consistency.md).
+  (`resolve_linalg`): `local` gives `auto`, `distributed` gives
+  `distributed`; `native` is also accepted. `native` diagonalizes whole
+  (nb, nb) tiles batched over k (`distrib_la`'s `batch_reshard` route);
+  `distributed` spreads each tile over the mesh; `auto` takes `distributed`
+  only on a multi-device mesh where one tile exceeds
+  `qsgw_density.BAND_TILE_BUDGET_FRACTION` of the per-device budget and the
+  distributed backend resolves, else `native`
+  (`sc_iteration._resolve_sc_eigh`). `LORRAX_SC_MAX_ITER`,
+  `LORRAX_SC_TOL_EV`, `LORRAX_SC_MIXING` and `LORRAX_SC_DUMP_DIR` override
+  their deck keys and print a deprecation note when set. The loop: [self-consistency](../self_consistency.md).
 - **`EQP2Config`** configures fixed-Σ eigenvalue self-consistency for the
   opt-in `eqp2.dat` (`write_eqp2`); it never rebuilds G, χ₀, W or Σ.
 - **`BSEConfig`**: `get_centroids_fi` gates the htransform-driven fine-k

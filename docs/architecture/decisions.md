@@ -50,15 +50,24 @@ batch-layout route, one batched cuSolverDn call per local stack).
 (cuSOLVERMp, ScaLAPACK or SLATE on the world communicator), one matrix after
 another. No route splits the mesh into sub-meshes or sub-communicators. The
 deck dial `linalg = local | distributed` (`gw.gw_config.resolve_linalg`)
-selects the plan. Under `local`, a shared-pole parent whose matrices do not
-fit beside the live stages takes the distributed plan
-(`gw.shared_pole_execution.whole_parent_execution`).
+selects the plan.
 
 **Why.** At one q and a large centroid count N_μ the distributed plan is the
 only one that holds a matrix, so it must exist; a sub-mesh plan would be a
 third plan with its own communicator creation (a world-collective
 `MPI_Comm_split`, see the square-mesh ruling below), its own divisibility
 contract and its own failure modes, and it gains nothing at that limit.
+
+**Exception: the shared-pole constructor's parent solves.** Under `local`, a
+shared-pole parent stack whose whole matrices do not fit beside the live
+stages takes the distributed plan instead
+(`gw.shared_pole_execution.whole_parent_execution`). The fit is judged by
+the capacity ledger against `memory_per_device_gb`, so this choice reads the
+budget, unlike the [one-memory-path](#one-memory-path) and
+[fixed-tile](#fixed-tile) rulings. It is kept because the two plans solve the
+same matrices and agree to round-off, and at large N_μ the distributed plan
+is the only one that holds a matrix; the budget picks between two plans that
+both exist, not between layouts of one stage.
 
 **Licenses deleting** the SLATE per-row sub-communicator context
 (`distrib_la._slate._subrow_context_key`, no caller) and the batched SLATE
@@ -213,7 +222,11 @@ velocity operator by design; no k/q-dependent nonlocal current vertex (the
 finite-transfer Ismail-Beigi–Chang–Louie Γ_NL(k, q)) is planned ("there will
 not at any point in the future be a nonlocal k/q dependent current vertex").
 
-**Why.** The owner's ruling.
+**Why.** It keeps one current vertex: the q → 0 velocity $v = i[H, r]$,
+which the dipole step computes and authenticates once, serves the
+four-current response, its heads and the Hall current alike. A
+k/q-dependent nonlocal vertex would need finite-q $V_{\rm NL}$ derivative
+tables at every q and a second vertex owner, for a term no route consumes.
 
 **Deleted.** Every to-do for that vertex, and the unused finite-transfer
 code: `common.mtxel_sweep.FiniteTransferCurrentEndpoint`, the
@@ -228,9 +241,15 @@ stored on disk or across processes ("i really don't want any cached rules for
 quadratures at all"). Reuse is in process only, as the
 [Σ quadrature page §10](../theory/sigma-quadrature-problem.md) describes.
 
-**Why.** The owner's ruling. A cold plan now costs about what a warm plan
-cost with the table, and results are bitwise to a cold run with it
-(claim 2941).
+**Why.** It keeps every run's rules a function of that run's own requests.
+A stored rule is served through a lookup whose admission tests
+(containment, a node-count ceiling, a schema version) must stay correct
+across code versions, and a table written by another code version or
+machine can serve a rule this run would not build. A cold plan costs about
+what a warm plan cost with the table (the widest Na 8³ window builds in
+about 1 s, [§10](../theory/sigma-quadrature-problem.md)), and results are
+bitwise to a run that read the table, so the store saved nothing worth that
+risk.
 
 **Deleted.** The Σ rule table, the run-local rule store, the minimax disk
 cache; the deck key `sigma_quadrature_cache_dir` refuses by name, and
@@ -315,7 +334,7 @@ Perlmutter FFI legs link the one MPI pinned in `config/perlmutter/ffi_mpi.sh`.
 **Why.** Library thread FFTs inside one fused shared-memory pass replace a
 multi-pass transform/transpose/product chain, so each k-convolution is one
 kernel launch; it measured 1.7× (8³) and 4.4× (12×12×1) over the
-direct DFT on A100 (CLAIMS 2651). The wheel ships the headers, so making it
+direct DFT on A100. The wheel ships the headers, so making it
 the only NVIDIA route costs no build complexity.
 
 **Consequence for BSE.** Every TDA solve uses the stack matvec. The scalar

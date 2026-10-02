@@ -128,7 +128,7 @@ and ν = a + x, each branch is partitioned into at most four Cartesian products
 - **The ω cut ν** of the sign-definite branch: there |d| = |ω| + E + Re Ω
   with E ≥ −x, so above ν every denominator clears a and the ω tail is one
   relative box. Below ν only the excursion sliver crosses zero, over a box of
-  size ~ν rather than ω_max + Ω_max (Na 8³ map 0: 1682 → 39 pairs; claim 2821).
+  size ~ν rather than ω_max + Ω_max (Na 8³ map 0: 1682 → 39 pairs).
   A branch with no state within a of zero (an insulator) keeps one bulk window.
 - **One Λ per half**, because the SC cover grows the upper half only; a global
   Λ put 7.9 Ry of poles into the lower half's crossing box on Na.
@@ -233,9 +233,9 @@ the window executables. The session lives in
 the rule of [self-consistency §4](../self_consistency.md#sigma-grid-and-quadrature).
 
 **Map 0** is served by the ordinary one-shot rules, so SC map 0 equals the
-one-shot calculation bit for bit. In the same balanced pass the planner
-certifies one held rule per product window on a padded box over the map-0
-grid (`sigma_box_plan._sc_padded_box_spec`):
+one-shot calculation bit for bit. In the same parallel planning pass (§10)
+the planner certifies one held rule per product window on a padded box over
+the map-0 grid (`sigma_box_plan._sc_padded_box_spec`):
 
 - **States, outer edge** (farthest from μ in the branch's own coordinate,
   E − μ on a conduction branch and μ − E on a valence one): padded by
@@ -248,27 +248,30 @@ grid (`sigma_box_plan._sc_padded_box_spec`):
   (`scissor.SC_WINDOW_INNER_PAD_ETA`) and, on a metal, never past −X, the
   occupation floor's reach (X = k_BT ln(1/10⁻⁵ − 1) = 11.5 k_BT,
   `efermi.occupation_floor_reach_ry`), which no branch state passes. This
-  edge sets the crossing short side |ω|_max + x − Ω_min and so the node
-  count; a 2 eV pad there costs 18–26 nodes per crossing window. A
+  edge sets the crossing short side |ω|_max + x − min Re Ω and so the node
+  count; a 2 eV pad there cost 18–26 nodes per crossing window on the
+  Fe 4³, MoS2 3×3 and Na 8³ SC decks. A
   sign-definite window takes the outer pad on both edges. Both edges stop at
   the window's own selector interval, because a state past it belongs to the
   neighbouring window, whose certificate covers it.
 - **Poles**: near edges and widths padded by 10 %; the far edge of a window
-  whose selector is unbounded above (deep and bulk windows) by a factor 2,
-  because the highest shared-pole mode moves 10–30 % per map and a
-  sign-definite relative rule pays about one node for the doubled edge. A
-  four-current sector's pole treatment ceiling is included in the box.
-- **Sign topology**: a sign-definite box's zero-side edge stops at 5 % of its
-  distance to zero, so the box stays sign-definite. Where the selectors
-  guarantee a sign gap (tail windows on positive real poles), the zero-side
-  edge is that gap, 0.7 of the state edge, which covers a state that joins
-  the tail on a later map.
+  whose pole selector has no upper bound (pole tail, bulk and ω tail, §4) by
+  a factor 2, because the highest shared-pole mode moves 10–30 % per map
+  (Fe 4³ charge SC, map 2: 24.2 → 28.6 Ry) and a sign-definite relative rule
+  pays about one node for the doubled edge. A four-current sector's pole
+  treatment ceiling is included in the box.
+- **Sign topology**: a sign-definite box's zero-side edge may move toward
+  zero until it sits at 5 % of its map-0 distance, so the box stays
+  sign-definite. Where the selectors guarantee a sign gap (the bulk and tail
+  windows on positive real poles), the zero-side edge is that gap, 0.7 a
+  with a the state edge of §4, which covers a state that joins the window
+  on a later map.
 
 **Later maps** reuse each window's rule while its current box lies inside the
 rule's box (`rule_source` `hit:sc-fixed`). The tight inner edge lets some
 motion escape: an inward move of the inner state, a grid extension on the
-crossing half, or a near-pole drop past its 10 % pad. Four events change a
-rule:
+crossing half, or a near-pole drop past its 10 % pad. Four events end a
+rule's hold:
 
 - a window whose box leaves its rule's box, whose error currency changes
   (crossing ↔ sign-definite), or that did not exist at map 0 is rebuilt
@@ -280,8 +283,10 @@ rule:
 
 Each rebuild prints one `SC fixed quadrature recompute:` line naming the
 window, the reason and what crossed (the state's k, band and E − μ, the pole
-extent or the grid edge, against the certified interval); the receipt counts
-the maps with an escape and the windows rebuilt over the run. The window
+extent or the grid edge, against the certified interval). The planner's
+receipt, the per-map record of what it served and rebuilt that the Σ caller
+writes to the run record, counts the maps with an escape and the windows
+rebuilt over the run. The window
 executables keep the session's largest node count, so a rebuild recompiles
 them only when it raises it.
 

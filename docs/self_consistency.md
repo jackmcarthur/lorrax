@@ -16,12 +16,38 @@ shared-pole W ([theory](theory/shared-pole-w-model.md),
 ([the metallic q → 0 head](theory/metal-q0-head.md)) and the Hartree rebuild
 ([direct Hartree field](theory/hartree.md)).
 
-**Notation.** $k$ runs over the loop's k-set (§1) and $m, n$ over bands.
-$E^{\rm DFT}_{nk}$ and $\psi^{\rm DFT}_{nk}$ are the DFT eigenpairs read from
-`WFN.h5`. The Σ band window is $[b_0, b_3)$ with $N_b = b_3 - b_0$ bands; the
-loop requires $b_0 = 0$ because its occupations count electrons from band 0.
-$\mu$ is the Fermi level of the current map. Energies are in Ry inside the
-code and in eV in decks and logs.
+**Notation and terms.**
+
+- $k$ runs over the loop's k-set (§1) and $m, n$ over bands.
+  $E^{\rm DFT}_{nk}$ and $\psi^{\rm DFT}_{nk}$ are the DFT eigenpairs read
+  from `WFN.h5`. $\mu$ is the Fermi level of the current map. Energies are in
+  Ry inside the code and in eV in decks and logs.
+- nelec is the WFN's occupied-band count (`wfn.nelec`, the largest occupied
+  band index over k), so it counts bands, not electrons, and already includes
+  the spin or spinor degeneracy of each band.
+- The Σ band window is $[b_0, b_3)$ with $N_b = b_3 - b_0$ bands; the loop
+  requires $b_0 = 0$ because its occupations count bands from band 0.
+- The **carry** is the state passed from one map to the next
+  (`sc_iteration.SCState`): the Hamiltonian $H$ of §1 plus the small tables
+  that ride with it (the previous map's $Z$ per state, the occupation state).
+- ζ is the ISDF interpolation basis fitted to pair densities, and τ the
+  imaginary-time variable of the Σ(ω) quadrature
+  ([physics](theory/physics.md),
+  [the Σ(ω) quadrature problem](theory/sigma-quadrature-problem.md)).
+- GN-PPM and HL-PPM are the Godby–Needs and Hybertsen–Louie plasmon-pole
+  models of W; MPA is the multipole route (`compute_mode = mpa`), whose
+  production W is the shared-pole model.
+- A bispinor (four-current) deck screens the charge and the Dirac current
+  together; its W has charge–charge (CC), charge–current (CT/TC) and
+  current–current (TT) **sectors** ([bispinor GW](theory/bispinor-gw.md)).
+- An **ordered store** is a W model of a time-reversal-broken system (a
+  magnet), stored with both particle–hole orientations.
+- The **near grid** is the uniform Σ(ω) grid around $E_F$ at the deck
+  broadening η; coarse windows (§2) are separate grids below it.
+- A step **refuses** when it stops the run with an error naming a gate,
+  `GATE name`, the label to search for in the code. An **authenticated** file
+  is one whose provenance stamps (source WFN fingerprint, band and k tables,
+  operator settings) were checked against this run before use.
 
 ## 1 The map {#1-the-map}
 
@@ -78,11 +104,13 @@ No Z-factor enters the iteration. Σ is read at the current energies, which at
 the fixed point are the QP energies, so the map's own output solves the QP
 equation there.
 
-**Fermi level.** On an insulator μ is the midgap of the current spectrum by
-band count; with `density_self_consistent` it is the level of the k-weighted
-step occupation (`efermi.fermi_level_step`). On a metal each map solves
-fixed-N Fermi–Dirac occupations of its own input spectrum (§7). μ is a
-function of H and is never mixed.
+**Fermi level.** On an insulator μ is midway between the highest occupied
+and the lowest empty level. By default (`density_self_consistent`) the
+occupied set comes from a k-weighted step fill (`efermi.fermi_level_step`);
+with it off, the occupied set is the lowest nelec bands at every k. Both give
+the same μ when the fill is gapped. On a metal each map solves fixed-N
+Fermi–Dirac occupations of its own input spectrum (§7). μ is a function of H
+and is never mixed.
 
 **Purity.** $F$ reads only $H$ and quantities fixed for the run, so evaluating
 one $H$ twice returns the same $H'$ bit for bit, and every evaluated pair
@@ -148,9 +176,9 @@ are counted. It is built once from the DFT ladder
 (`gw_init.coarse_class_for_deck`, `band_partition.semicore_floor`) and kept on
 `meta.coarse_class`:
 
-- Under `number_bands_protected`: every occupied band below a band gap of at
-  least 4 eV over all k (`band_partition.SEMICORE_GAP_EV`) that lies under the
-  requested bands within μ ± 10 eV; none when no such gap exists. That
+- Under `number_bands_protected`: the occupied bands below the lowest band
+  gap of at least 4 eV over all k (`band_partition.SEMICORE_GAP_EV`) that lies
+  under every requested band within μ ± 10 eV; none when no such gap exists. That
   request protects every occupied band, so the class needs its own boundary;
   4 eV is 16 deck broadenings at the default η = 0.25 eV, so a coarse window
   never reads a band the near grid resolves.
@@ -186,8 +214,9 @@ The broadening is also what makes the semicore converge: at the deck η the Fe
 while at 5 eV every coarse $Z$ stays inside (one `SC semicore Z` line per
 map). Its cost is a systematic error reported apart from the 1 meV budget of
 the controllable errors: converged $E_F \pm 1$ eV std/max 3.6/15.9 meV on
-Fe 4³ (against $\eta_{\rm semi}$ = 1 eV) and 2.9/20.0 meV on MoS2 3×3
-(against the deck η).
+Fe 4³ (against a comparison build with `qp_support.SEMICORE_ETA_EV` set to
+1 eV) and 2.9/20.0 meV on MoS2 3×3 (against the semicore read at the deck
+η).
 
 **Semicore pin** (`sc_semicore = dft`, the default). The pseudopotentials are
 fitted to DFT, so the semicore levels stay at their DFT energies while their
@@ -205,8 +234,10 @@ every $\Sigma^{\rm QSGW}_{ps}$ is $\Sigma_{ps}(E^{\rm DFT}_s)$ and the coarse
 windows, planned on DFT energies, never need to follow it. The semicore QP
 energies still move by the level repulsion of the kept mixing,
 $-\sum_p |H_{ps}|^2/(E_p - E_s)$ to second order. `sc_semicore = qp` lets the
-class move with its own Σ, read at its own QP energy. A run without a coarse
-class logs that there is nothing to pin.
+class move with its own Σ, read at its own QP energy. On Fe 4³ and MoS2 3×3
+the pinned semicore converges within 27 meV of DFT, while under `qp` it lands
+0.1–6 eV deeper, in the same number of maps (Fe 14, MoS2 8). A run without a
+coarse class logs that there is nothing to pin.
 
 ### The scissored tail
 
@@ -272,7 +303,7 @@ $$
 | `sc_head_update` | velocity on each map | needs |
 |---|---|---|
 | `off` | none: the DFT head, fixed for the run (under `head_correction = full` folded through each map's W) | — |
-| `dft_velocity` | $U^\dagger v^{\rm DFT} U$ | `dipole.h5`, or the velocity stage of `parallel_transport.h5` |
+| `dft_velocity` | $U^\dagger v^{\rm DFT} U$ | the velocity stage of `parallel_transport.h5` when the file exists, else `dipole.h5`; on a metal always `dipole.h5` |
 | `parallel_transport` | $U^\dagger (v^{\rm DFT} + D_k\Delta H) U$, with $D_k$ from finite links | `parallel_transport.h5` with links |
 | `interband_commutator` | $U^\dagger (v^{\rm DFT} + [\Delta H, \mathcal W]) U$, no links; insulators only | the velocity stage of `parallel_transport.h5`, stamped `vnl_included = 1` |
 
@@ -281,7 +312,8 @@ $$
 the run directory supports: `parallel_transport` when `parallel_transport_file`
 exists (the dipole step writes it by default), else `dft_velocity` from
 `dipole.h5`, else `off`. A `full_shared_pole` deck with neither file takes
-`dft_velocity`. Other decks default to `off`. The choice is made once, at
+`dft_velocity`: its four-current bank reads `dipole.h5` on every head route
+and refuses without it, so `off` would gain nothing. Other decks default to `off`. The choice is made once, at
 parse time, and holds for the whole run, because a velocity treatment that
 changed between maps would change $F$ under the mixer.
 
@@ -305,7 +337,9 @@ makes the head depend on the arbitrary basis of that multiplet.
 
 **Head block.** Each map writes one block to `gwjax.out`: each term's
 contribution (p, $V_{\rm NL}$, Σ) to $\omega_p^2$ on a metal (eV²) or its
-share of the static head $S_{aa}(0)$ on an insulator (%), the link bound and
+share of the static head $S_{aa}(0)$ on an insulator (%; $S_{ab}(\omega)$ is
+the $q \to 0$ head tensor of the response, $a, b$ Cartesian), the link
+bound and
 the band gap (0 on a metal). Metal routes are in §7.
 
 ### Interband-commutator head {#interband-commutator-head}
@@ -325,7 +359,8 @@ occupation class. $\mathcal W = i r^{VC}$, with $r^{VC}$ the Hermitian
 cross-gap position operator of the DFT Hamiltonian, so $\mathcal W$ is
 anti-Hermitian and $[H^{\rm DFT}, \mathcal W] = v$ on the
 valence–conduction blocks. Split the covariant derivative by class,
-$D_k\Delta H = -i[A^{VC}, \Delta H] + D^{\rm class}\Delta H$: the
+$D_k\Delta H = -i[A^{VC}, \Delta H] + D^{\rm class}\Delta H$, where
+$A^{VC} = r^{VC}$ is the cross-gap Berry connection: the
 valence–conduction block of $D^{\rm class}\Delta H$ holds only the cross-gap
 block $\Delta H_{VC}$. The head is therefore exact for any $\Delta H$ that
 does not mix valence and conduction (a band-diagonal $\Delta H$ gives
@@ -338,8 +373,8 @@ refusal threshold on θ.
 Every same-class pair is excluded, degenerate or not: inside a class
 $\mathcal W$ has no gap in its denominator, near-degenerate pairs make it
 arbitrarily large, and the $\partial_k \Delta H$ that would cancel it has no
-stencil-free form. (Excluding only exact multiplets left a Si 6×6×6 SOC head
-8.8 times the link head.) Every denominator is therefore at least the direct
+stencil-free form; excluding only exact multiplets gives a Si 6×6×6 SOC head
+8.8 times the link head. Every denominator is therefore at least the direct
 gap.
 
 On a collapsed (one-point) k axis the cell is not periodic, and the
@@ -347,7 +382,8 @@ connection is the stored position operator $Z_a$ of the velocity artifact:
 the reduced component $a$ of $\mathcal W$ is $i Z_a$, and the class rule
 applies to the periodic axes only,
 $\mathcal W_{\rm cart} = B^{-1}[B\,\mathcal W^{VC}$ with row $a$ replaced by
-$i Z_a]$. `parallel_transport` uses the same operator on such an axis.
+$i Z_a]$, where $B$ is the reciprocal-lattice matrix that takes Cartesian
+components to reduced ones. `parallel_transport` uses the same operator on such an axis.
 
 A metal refuses (`GATE sc_head_interband_commutator_insulator_only`), and so
 does a cross-gap pair within $10^{-6}$ Ry
@@ -496,10 +532,11 @@ diverge on an expansive map.
 
 Plain iteration is refused (`sc_accelerator` accepts only `anderson`,
 `GATE sc_accelerator_anderson_only`). On dense band manifolds the QSGW
-Jacobian has eigenvalues of about −3 or below along cycle directions, so a
-plain fixed point 2-cycles and damping only shrinks the cycle; undamped
-linear mixing also amplifies the input's time-reversal-reality error 6–8×
-per map.
+Jacobian has eigenvalues of about −3 or below along cycle directions on
+GN-PPM decks with many bands near the gap, so a plain fixed point 2-cycles
+and damping only shrinks the cycle; undamped linear mixing also amplifies
+the input's time-reversal-reality error 6–8× per map (Si 4×4×4, scalar
+shared pole).
 
 **Residency.** The history holds $2(m + 1)$ copies of the carry, stacked on a
 leading axis that is never sharded, with bra bands on mesh axis X, ket bands
@@ -533,7 +570,7 @@ input:
 |---|---|
 | **CONVERGED** | $\max \lvert E_{\rm out} - E_{\rm in}\rvert$ over the QP-matrix labels is below `sc_tol_ev` (default 1e-4 eV). $E_{\rm in}$ are the eigenvalues of the input $H$, $E_{\rm out}$ those of $F(H)$, matched by label. The loop returns that input with its own Σ, W and head. |
 | **STALLED at floor, not converged** | the label-free residual $r_n = \max_k \lVert P\,(F(H_n) - H_n)\,P\rVert_2$ (logged as `SC matrix residual`) has not improved by 10 % over the last 12 maps. |
-| budget | `sc_max_iter` (default 30) accelerated evaluations after map 0. `sc_max_iter = 1` runs map 0 alone as a labelled one-map diagnostic. |
+| budget | `sc_max_iter = N` (default 30): N ≥ 2 runs map 0 plus N accelerated maps; N = 1 is a special case that runs map 0 only, as a labelled one-map diagnostic. |
 
 The test compares a map's output with its own input, not successive
 iterates: a mixed iterate can barely move while $F$ still has no fixed point.
@@ -590,27 +627,37 @@ With `sigma_w_model = shared_pole` every map rebuilds the whole model from its
 rotated wavefunctions, energies and occupations: response samples, moments,
 directions, poles and factors (`shared_pole_screening.screen_shared_poles`).
 An SC map's model belongs to that map; `restart = true` restores only the
-invariant ISDF basis and never skips a map's response or W. What persists
-across maps is sampling geometry, held so that each map is the same function
-of its input:
+invariant ISDF basis and V(q) and never skips a map's response or W. The
+model is fitted to samples of $W_c$ at fixed **supports**: line sites
+$z = \omega + ih$ on a damped line at height $h$ up to a top line endpoint,
+and an imaginary ladder $z = iu$ on $[u_{\min}, u_{\max}]$
+([shared-pole theory §5.1](theory/shared-pole-w-model.md#51-supports-and-directions)).
+What persists across maps is this sampling geometry and the quadrature
+rules, held so that each map is the same function of its input:
 
 - **Σ rules**: held as in §4. For a four-current sector model the certificate
   also covers the pole treatment ceiling, twice the χ transition span
   (`shared_pole_recipe._sector_treatment_ceiling`). The ceiling is held while
   the current span stays inside it and re-planned at twice the current span
   otherwise.
-- **Response rules** (`response_bank.response_quadrature`): planned on the
-  transition interval padded by 4 eV (`response_bank.RESPONSE_HOLD_PAD_EV`)
-  and reused while the current interval, decay rate, amplitude, metallicity
-  and sample points stay within the held plan. Otherwise they are rebuilt,
+- **Response rules** (`response_bank.response_quadrature`): the shared
+  complex-time rule that evaluates χ₀ at every support from the
+  occupation-weighted transitions. It is planned on the transition-energy
+  interval padded by 4 eV (`response_bank.RESPONSE_HOLD_PAD_EV`) and on the
+  envelope that bounds a metal's occupation products,
+  $|f_n(1 - f_m)| \le A\,\min(1, e^{\beta(E_m - E_n)})$ with amplitude $A$
+  and decay rate $\beta$ (`response_bank.response_occupation_envelope`). It
+  is reused while the current interval, decay rate, amplitude, metallicity
+  and supports stay within the held plan. Otherwise they are rebuilt,
   with one line `Response rule rebuilt at a held map; failed reuse test: …`
   naming each failed field.
 - **Support enclosure** (`shared_pole_recipe._support_envelope`). Map 0 uses
-  its own support. From map 1 the loop keeps the running maximum line
-  endpoint and the extreme imaginary endpoints, so the DFT gap's extra
-  imaginary support is never locked in. The enclosure fixes sampling geometry
+  its own supports. From map 1 the loop keeps the running maximum of the top
+  line endpoint and of $u_{\max}$ and the running minimum of $u_{\min}$, so
+  the smaller DFT gap of map 0, which lowers $u_{\min}$, is never locked in. The enclosure fixes sampling geometry
   only; it is not an interpolation-error certificate.
-- **Line sites.** The real-axis sample sites are held while the support rule
+- **Line sites.** The line sites, placed from the band structure by the
+  support rule of the theory page, are held while the support rule
   would place every site within
   max(3 meV, 0.1 × the previous map's max|dE|) of the held one
   (`shared_pole_recipe.LINE_SITE_HOLD_EV`), and re-placed from the current
@@ -636,7 +683,7 @@ positive residue, so the average keeps residues positive and poles real. At
 complex $s$ an antiunitary operation acts as the same-time transpose of the
 residue endpoints, not as a conjugation of the whole value. The projector
 streams one operation at a time into a fixed accumulator, so no factor gains
-a symmetry axis. The raw-model receipts certify the unprojected model only.
+a symmetry axis.
 
 ## 7 Metals {#7-metals}
 
@@ -661,8 +708,8 @@ a symmetry axis. The raw-model receipts certify the unprojected model only.
 - The local gain of the diagonal map $E \leftarrow A + \Sigma(E)$ is
   $s = \partial_\omega \mathrm{Re}\,\Sigma = 1 - 1/Z$. States far above μ,
   where $\mathrm{Re}\,\Sigma$ rises on shell, have $Z > 1$ and $s$ near 1, and
-  converge slowly. Ending the QP matrix below them (`ncond`) and judging
-  convergence by states near $E_F$ shortens the run.
+  converge slowly. End the QP matrix below them (`ncond`); convergence is
+  judged on every QP-matrix state.
 
 ### Metals: direct Drude head {#metals-direct-drude-head}
 
