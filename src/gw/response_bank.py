@@ -1169,8 +1169,12 @@ def streamed_moment_totals(wfns, meta, *, mesh_xy, qids, width, execute, ordered
     scratch = _stream_scratch(wfns, meta, mesh_xy, None)
     order = _moment_batch_major(mesh_xy, n_out, int(width), n_batch)
     outputs = [(r, r) for r in range(n_batch * n_out)]
-    _reserve(meta, "moment_pass_carry", 0, bank.in_flight * 2 * n_batch * int(width) * n_out
-             * 16 * max(r * c for r, c, _ in segments[0]))
+    # The passes being drained stay live beside every correlation's admission.
+    ledger = meta.shared_pole_capacity
+    live = ledger.live_stages
+    carries, _ = _reserve(meta, "moment_pass_carry", 0, bank.in_flight * 2 * n_batch * int(width) * n_out
+                          * 16 * max(r * c for r, c, _ in segments[0]))
+    ledger.live_stages = live + (carries,)
     for p, (rows, cols) in enumerate(bank.shapes):
         kernel, fixed = response_stream(wfns, meta, mesh_xy=mesh_xy, q_ids=tuple(qids),
             n_outputs=n_out, pair_mode="direct", bank_carry=True, ordered=ordered, stream_pass=p)
@@ -1180,6 +1184,7 @@ def streamed_moment_totals(wfns, meta, *, mesh_xy, qids, width, execute, ordered
         bank.put(p, order(carry), outputs)
         del carry
     bank.commit()
+    ledger.live_stages = live
     receipt["correlation_count"] += n_nodes
     receipt["moment_stream"] = dict(bank.receipt(), passes=len(bank.shapes), nodes=n_nodes,
                                     q_batches=n_batch, width=int(width))
