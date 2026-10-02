@@ -119,6 +119,20 @@ def _record_run(mesh, shape, rows, padded16):
     return jax.jit(body, out_shardings=NamedSharding(mesh, P("x", "y", None), memory_kind=_host_kind(mesh)))
 
 
+_COMPILED: dict = {}
+
+
+def _compiled_program(builder, mesh, shape, sharding, n_scalars, *static):
+    """``builder(mesh, shape, *static)`` lowered and compiled for a carry of ``shape`` at
+    ``sharding`` and ``n_scalars`` int64 scalars, once per process (on the calling thread)."""
+    key = (builder, mesh, shape, sharding, static)
+    if key not in _COMPILED:
+        carry = jax.ShapeDtypeStruct(shape, jnp.complex128, sharding=sharding)
+        scalars = (jax.ShapeDtypeStruct((), jnp.int64),) * n_scalars
+        _COMPILED[key] = builder(mesh, shape, *static).lower(carry, *scalars).compile()
+    return _COMPILED[key]
+
+
 @lru_cache(maxsize=None)
 def _unpack(mesh, n_out, q, shapes, rects, tile, records16):
     """Records ``(px, py, n_out·S/16)`` → the tile ``[n_out, q, px·tile_r, py·tile_c]``
@@ -364,14 +378,43 @@ class StreamedBank:
         once; a failure is held for :meth:`commit`."""
         outputs = tuple((int(r), int(o)) for r, o in outputs)
         digest = _record_digests(self.mesh, tuple(carry.shape))(carry)
+        # Every program the drain thread will run is compiled here, on the
+        # calling thread, in program order: compiling in the drain thread would
+        # interleave with the caller's next compiles in a rank-dependent order
+        # (the runtime's cross-rank compile agreement refuses that).
+        work = self._pieces(p, carry, outputs)
         while len(self._inflight) >= IN_FLIGHT:
             self._retire()
-        self._inflight.append(self._drain.submit(self._drain_segment, p, carry, digest, outputs))
+        self._inflight.append(self._drain.submit(self._drain_segment, p, carry, digest, outputs, work))
 
-    def _drain_segment(self, p, carry, digest, outputs):
-        started = time.monotonic()
+    def _pieces(self, p, carry, outputs):
+        """``[(compiled, row, o, a), ...]``: every piece of segment ``p`` and its program."""
         length16 = self.q * self.shapes[p][0] * self.shapes[p][1]
-        step16, staged = self.piece // 16, deque()
+        step16, record16, work = self.piece // 16, self.records[p] // 16, []
+        shape, sharding = tuple(carry.shape), carry.sharding
+        if len(self.shapes) == 1 and 16 * record16 <= self.piece // 2:
+            # Small records of a one-segment store: consecutive outputs are
+            # consecutive in the file, so runs of them move as one piece.
+            per, i = max(1, self.piece // (16 * record16)), 0
+            while i < len(outputs):
+                j = i + 1
+                while (j < len(outputs) and j - i < per and outputs[j][0] == outputs[j - 1][0] + 1
+                       and outputs[j][1] == outputs[j - 1][1] + 1):
+                    j += 1
+                work.append((_compiled_program(_record_run, self.mesh, shape, sharding, 1,
+                                               j - i, record16), outputs[i][0], outputs[i][1], None))
+                i = j
+            return work
+        for row, o in outputs:
+            for a in range(0, length16, step16):
+                n16 = min(step16, length16 - a)
+                work.append((_compiled_program(_piece, self.mesh, shape, sharding, 2, n16,
+                                               padded(16 * n16, self.align) // 16), row, o, a))
+        return work
+
+    def _drain_segment(self, p, carry, digest, outputs, work):
+        started = time.monotonic()
+        staged = deque()
 
         def stage(host, o, a):
             while len(staged) >= PIECES_IN_FLIGHT:
@@ -389,27 +432,12 @@ class StreamedBank:
                     self.bounced += 1
                 store.write(memoryview(source), o * self.S + self.starts[p] + 16 * a)
 
-        record16 = self.records[p] // 16
-        if len(self.shapes) == 1 and 16 * record16 <= self.piece // 2:
-            # Small records of a one-segment store: consecutive outputs are
-            # consecutive in the file, so runs of them move as one piece.
-            per, runs, i = max(1, self.piece // (16 * record16)), [], 0
-            while i < len(outputs):
-                j = i + 1
-                while (j < len(outputs) and j - i < per and outputs[j][0] == outputs[j - 1][0] + 1
-                       and outputs[j][1] == outputs[j - 1][1] + 1):
-                    j += 1
-                runs.append((outputs[i][0], outputs[i][1], j - i))
-                i = j
-            for row, o, m in runs:
-                stage(_record_run(self.mesh, tuple(carry.shape), m, record16)(carry, np.int64(row)), o, 0)
-        else:
-            for row, o in outputs:
-                for a in range(0, length16, step16):
-                    n16 = min(step16, length16 - a)
-                    program = _piece(self.mesh, tuple(carry.shape), n16, padded(16 * n16, self.align) // 16)
-                    stage(program(carry, np.int64(row), np.int64(a)), o, a)
-        del carry
+        for program, row, o, a in work:
+            if a is None:
+                stage(program(carry, np.int64(row)), o, 0)
+            else:
+                stage(program(carry, np.int64(row), np.int64(a)), o, a)
+        del carry, work
         while staged:
             staged.popleft().result()
         digests = {s.device: np.asarray(s.data)[0, 0] for s in digest.addressable_shards}
