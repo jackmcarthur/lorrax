@@ -1464,6 +1464,13 @@ def _compute_mpa_sigma(
             **body_options)
         if lorentz_output:
             body, (ct_shell, tt_shell) = sector_result
+            # CTALT diag (never lands): the on-shell sector matrices, eV.
+            from common.collectives import gather_to_host as _ctalt_gather
+            _ctalt = [np.asarray(_ctalt_gather(a)) for a in (ct_shell, tt_shell, sigma_lorentz)]
+            if jax.process_index() == 0:
+                np.savez(os.path.join(input_dir, "ctalt_sigma_lorentz.npz"),
+                         ct_tc_ry=_ctalt[0], tt_ry=_ctalt[1], static_ry=_ctalt[2],
+                         e_qp_ev=np.asarray(e_qp_ev), efermi_ry=float(sigma_efermi_ry))
             # The finalizer assigns CC as the exact residual of the total
             # QSGW matrix after the mixed and transverse parts.
             sigma_lorentz = sigma_lorentz.at[1].add(ct_shell).at[2].add(tt_shell)

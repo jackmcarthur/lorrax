@@ -119,6 +119,13 @@ def table_hash(table):
                                      allow_nan=False).encode()).hexdigest()
 
 
+# CTALT diag (never lands): a high-budget reference for the photon sectors.
+import os as _ctalt_os
+_CTALT_WIDTH = float(_ctalt_os.environ.get("CTALT_WIDTH_SCALE", "1"))
+if _CTALT_WIDTH != 1.0:
+    for _f in ("imaginary_width_fraction", "infinity_width_fraction",
+               "line_direction_cap_fraction", "pole_budget_fraction"):
+        shared_real_pole_v1_r3b["production"][_f] *= _CTALT_WIDTH
 RECIPE_HASH = table_hash(shared_real_pole_v1_r3b)
 #: The Sigma quadrature is not W.  A tier's default for an omitted
 #: sigma_quadrature_eps lives outside the hashed table above, whose every field
@@ -138,6 +145,9 @@ shared_real_pole_gates_ordered_v1 = {
 # produces a negative projected pencil despite a positive retained metric.
 shared_real_pole_gates_ordered_v1["normalized_gram_keep"].update(
     threshold=1.0e-7, sector_threshold=1.0e-5)
+if _ctalt_os.environ.get("CTALT_SECTOR_KEEP"):
+    shared_real_pole_gates_ordered_v1["normalized_gram_keep"]["sector_threshold"] = float(
+        _ctalt_os.environ["CTALT_SECTOR_KEEP"])
 for _name, (_predicate, _threshold) in {
     "representation": ("charge operator from N_spinor in (1, 2), authenticated TRS broken, ordered bank: positive poles per parent, hole side from the parent of -q transposed",
                        {"nspinor": (1, 2), "trs_allowed": False, "ordered": True}),

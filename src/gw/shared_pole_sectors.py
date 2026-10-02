@@ -319,6 +319,13 @@ def construct_sector_poles(bank, meta, config, *, mesh_xy, output):
                         held_rows[name].append(dict(sample_id=sample_id,
                             Wc=np.asarray(errors)[:real,0].tolist(),dWc_ds=np.asarray(errors)[:real,1].tolist()))
                         del held
+        with timing.section('spole.sector.ctalt', announce=True):
+            try:
+                _ctalt_reconstruction(bank,meta,header,ids,real,recipe,signed,mesh_xy=mesh_xy,
+                    output=output,line_span=(line_lo,line_hi),dense_fit=dense_fit,
+                    execution=execution)
+            except Exception as exc:  # diag only: never stop the run
+                print(f'CTALT reconstruction failed: {exc!r}',flush=True)
         for key,value in cauchy.items():
             values=np.asarray(value)[:real]
             expected_infinity=(key=='cauchy_schwarz_squared') & np.isposinf(values)
@@ -425,6 +432,78 @@ def construct_sector_poles(bank, meta, config, *, mesh_xy, output):
     return dict(handle=handle,identity=bank['identity'],status='CONSTRUCTED',
                 q_receipts=receipts,capacity=ledger.receipt(),
                 execution=execution_rows,model_residence=model_residence)
+
+
+def _ctalt_reconstruction(bank,meta,header,ids,real,recipe,signed,*,mesh_xy,output,line_span,
+                          dense_fit,execution):
+    """CTALT diag: signed-model W vs the bank at every dense sample and line panel.
+
+    Dense samples (imaginary-axis fitted supports and held supports): relative
+    Frobenius error of each block CC, TT, CT, TC per parent. Line supports:
+    relative error of the model applied to the stored directions at the four
+    ordered nodes (z, conj z, -z, -conj z), own rows and cross rows.
+    """
+    import json
+    import jax
+    import numpy as np
+    from pathlib import Path
+    from common.collectives import gather_to_host
+    from file_io.shared_pole_store import open_shared_pole_bank,read_line_panels
+    from gw.shared_pole_directions import _sample_point
+    from jax.sharding import PartitionSpec as P
+    host=lambda a:np.asarray(gather_to_host(a))
+    models={name:[host(a)[:real] for a in m] for name,m in zip(('CC','TT','CT'),signed)}
+
+    def block(rowfam,colfam,z):
+        if rowfam==colfam:
+            left,right,mu,act=models['CC' if rowfam==0 else 'TT']
+        else:
+            cl,cr,mu,act=models['CT']
+            left,right=(cl,cr) if rowfam==0 else (cr,cl)
+        w=np.where(act,1/(z*mu-1),0)
+        return np.matmul(left*w[:,None,:],np.conj(np.swapaxes(right,-1,-2)))
+
+    def rel(model,exact):
+        num=np.linalg.norm((model-exact).reshape(model.shape[0],-1),axis=-1)
+        den=np.linalg.norm(exact.reshape(exact.shape[0],-1),axis=-1)
+        return (num/np.maximum(den,1e-300)).tolist(),den.tolist()
+    held=set(int(i) for i in recipe['held_ids'])
+    rows=[]
+    names={(0,0):'CC',(1,1):'TT',(0,1):'CT',(1,0):'TC'}
+    with open_shared_pole_bank(bank['path'],mesh_xy=mesh_xy) as io:
+        for sid in [int(i) for i in dense_fit]+sorted(held):
+            z=complex(_sample_point(recipe,sid))
+            for pair,name in names.items():
+                sample=read_sector_round(io,meta,bank,header,ids,pair,sample_span=(sid,sid+1),
+                                         fields=('Wc',),execution=execution)
+                exact=host(sample['Wc'])[:real,0]
+                del sample
+                err,norm=rel(block(*pair,z),exact)
+                rows.append(dict(kind='held' if sid in held else 'dense_fit',sample=sid,
+                                 z=[z.real,z.imag],block=name,parents=list(ids[:real]),rel=err,norm=norm))
+        spec=None if execution=='face' else P(('x','y'))
+        for sid in range(*line_span):
+            z=complex(_sample_point(recipe,sid))
+            nodes=(z,z.conjugate(),-z,-z.conjugate())
+            for fam,fname in ((0,'C'),(1,'T')):
+                own,_=read_line_panels(io,meta=meta,header=header,family=fname,sample=sid,
+                                       q_ids=ids,partition_spec=spec)
+                cross,_=read_line_panels(io,meta=meta,header=header,family=fname,sample=sid,
+                                         cross=True,q_ids=ids,partition_spec=spec)
+                own=host(own)[:real];cross=host(cross)[:real]
+                directions=(own[:,0],own[:,1],own[:,0],own[:,1])
+                for s,(node,d) in enumerate(zip(nodes,directions)):
+                    err,norm=rel(np.matmul(block(fam,fam,node),d),own[:,1+2*s])
+                    rows.append(dict(kind='line',sample=sid,state=s,z=[node.real,node.imag],
+                                     block=names[(fam,fam)],parents=list(ids[:real]),rel=err,norm=norm))
+                    err,norm=rel(np.matmul(block(1-fam,fam,node),d),cross[:,2*s])
+                    rows.append(dict(kind='line',sample=sid,state=s,z=[node.real,node.imag],
+                                     block=names[(1-fam,fam)],parents=list(ids[:real]),rel=err,norm=norm))
+    counts={name:np.asarray(m[3]).sum(axis=-1).tolist() for name,m in models.items()}
+    if jax.process_index()==0:
+        path=Path(output).with_name('ctalt_reconstruction.jsonl')
+        with open(path,'a') as handle:
+            handle.write(json.dumps(dict(parents=list(ids[:real]),active=counts,rows=rows))+'\n')
 
 
 def _sector_model_residence(meta,config,header,mu_bases,execution_rows,*,mesh_xy,root,
