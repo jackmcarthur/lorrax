@@ -134,27 +134,60 @@ def plot_colored_bands(result, values, *, label, path, signed, e_fermi_ry):
     plt.close(fig)
 
 
+def add_band_character_arguments(parser):
+    """The ``--color`` / ``--moments-grid`` flags of band_character_and_moments."""
+    parser.add_argument(
+        "--color", action="append", default=[],
+        metavar="spin|orbital:[EL:]l",
+        help="Color the path bands by <sigma.n> (n: the coarse-grid spin "
+             "moment axis) or by an atomic-orbital character, e.g. "
+             "orbital:d or orbital:Fe:d; repeatable.  Writes "
+             "bands_<color>.png and band_operators_path.npz beside the deck. "
+             "Atomic functions: PP_PSWFC of the *.upf beside the deck.")
+    parser.add_argument(
+        "--moments-grid", type=int, nargs=3, default=None,
+        metavar=("NX", "NY", "NZ"),
+        help="Interpolate H, n.sigma and each atom's n.L to this uniform "
+             "grid and write moments.txt: sum_occ <sigma.n> and the "
+             "atomic-sphere <L.n>, Fermi-Dirac at occ_smearing_width_ry with "
+             "E_F re-found on the grid.")
+    return parser
+
+
+SIGN_CONVENTION = (
+    "mu_B per cell in QE's sign convention: m_spin = sum_occ <sigma> is the "
+    "spin polarization n_up - n_down (QE's 'total magnetization'); m_orb = "
+    "sum_occ <L> (hbar) with the same sign flip, so the physical moments are "
+    "-g/2 mu_B <sigma> and -mu_B <L>, and m_orb/m_spin > 0 means L parallel "
+    "to S")
+
+
 def band_character_and_moments(*, colors, moments_grid, wfn, params, ctilde,
                                enk_sigma, meta, result, mesh, input_dir,
-                               n_return_bands, a_band, energy_source, log):
+                               n_return_bands, a_band, energy_source, report):
     """Spin / orbital-character path coloring and grid moments.
 
     1. ``<psi_kn|O|psi_km>`` on the coarse full BZ: sigma_a, the atomic-
        sphere L_a of each atom, the requested orbital-character projectors.
-    2. Spin axis n = direction of sum_k w_k sum_n f_kn <sigma>_nn on the
-       coarse grid (Fermi-Dirac, input energies).
+    2. Magnetization axis n from the WFN's QE schema
+       (``bandstructure.orbital.magnetization_axis``).
     3. Path: the operators in the fH eigenvectors; color by <sigma.n> or by
        the channel character.
-    4. Grid: H and n.sigma, n.L_I interpolated to ``moments_grid``; E_F
-       re-found there; m = sum_q w sum_n f <O>.
+    4. Grid: H, sigma_a and each atom's L_a interpolated to
+       ``moments_grid``; E_F re-found there; m = sum_q w sum_n f <O>.
     """
+    if not colors and not moments_grid:
+        return []
     from functools import partial
     import jax.numpy as jnp
     from psp.pseudos import load_pseudopotentials
     from .fh_interp import build_fH_R, require_newton_converged
     from .orbital import (band_operators, grid_moments, occupied_sums,
-                          interpolate_band_operator, _operator_R)
+                          interpolate_band_operator, magnetization_axis,
+                          _operator_R)
 
+    report.heading("Band character and moments")
+    log = report.emit
     kgrid = (int(meta.nkx), int(meta.nky), int(meta.nkz))
     nk, nb_fit = int(ctilde.shape[0]), int(ctilde.shape[1])
     band_start = int(result["band_start"])
@@ -178,26 +211,33 @@ def band_character_and_moments(*, colors, moments_grid, wfn, params, ctilde,
         ops, names = band_operators(
             wfn, (band_start, band_start + nb_fit), mesh, pseudos=pseudos,
             channels=channels)
-    n_atom = (len(names) - 3 - len(channels)) // 3
+    n_vec = 3 + 3 * ((len(names) - 3 - len(channels)) // 3)
+    axis, axis_source = magnetization_axis(wfn)
+    log(f"  sign convention: {SIGN_CONVENTION}")
     log(f"  [band operators] {len(names)} on {nk} coarse k x {nb_fit} "
         f"bands: {', '.join(names)}")
+    log(f"  magnetization axis n = ({axis[0]:+.5f}, {axis[1]:+.5f}, "
+        f"{axis[2]:+.5f}) from {axis_source}")
 
-    # Coarse-grid sums: the spin axis, and a direct (uninterpolated) check.
+    def moment_lines(where, mu, m):
+        out = [f"  [{where}] E_F = {mu * RYD_TO_EV:.5f} eV (Fermi-Dirac kT = "
+               f"{kT:.5f} Ry, {kT_note}; N = {nelec:g} electrons)"]
+        for i in range(0, n_vec, 3):
+            v = m[i:i + 3]
+            what = ("spin   sum_occ <sigma>" if i == 0 else
+                    f"orbital <L> {names[i][4:]} (atomic sphere)")
+            out.append(f"  [{where}] {what} = ({v[0]:+.5f}, {v[1]:+.5f}, "
+                       f"{v[2]:+.5f}); along n: {float(axis @ v):+.5f} mu_B")
+        return out
+
+    # Coarse-grid sums: a direct (uninterpolated) check of the grid route.
     diag = np.asarray(gather_to_host(
         jnp.diagonal(ops, axis1=2, axis2=3)))[:, :, :nb_fit].real
     E_k = np.asarray(gather_to_host(enk_sigma), dtype=np.float64).T
-    mu_c, coarse, _ = occupied_sums(E_k, diag, nelec, kT)
-    m_spin = coarse[:3]
-    axis = (m_spin / np.linalg.norm(m_spin) if np.linalg.norm(m_spin) > 1e-6
-            else np.array([0.0, 0.0, 1.0]))
-    log(f"  [moments] coarse {kgrid} grid, Fermi-Dirac kT={kT:.5f} Ry "
-        f"({kT_note}), E_F={mu_c * RYD_TO_EV:.4f} eV: sum_occ <sigma> = "
-        f"({m_spin[0]:+.4f}, {m_spin[1]:+.4f}, {m_spin[2]:+.4f}); "
-        f"spin axis n = ({axis[0]:+.4f}, {axis[1]:+.4f}, {axis[2]:+.4f})")
-    for i in range(n_atom):
-        L = coarse[3 + 3 * i:6 + 3 * i]
-        log(f"  [moments] coarse grid atomic-sphere <L> {names[3 + 3 * i][4:]}"
-            f" = ({L[0]:+.5f}, {L[1]:+.5f}, {L[2]:+.5f})")
+    mu_c, coarse, _ = occupied_sums(E_k, diag[:n_vec], nelec, kT)
+    for line in moment_lines(f"coarse {kgrid[0]}x{kgrid[1]}x{kgrid[2]}",
+                             mu_c, coarse):
+        log(line)
 
     files = []
     if colors:
@@ -229,6 +269,8 @@ def band_character_and_moments(*, colors, moments_grid, wfn, params, ctilde,
                      kpath_frac=np.asarray(kpath_frac),
                      x_path=result["kpath_data"][1],
                      energies_ev=result["energies_sorted"] * RYD_TO_EV,
+                     energy_reference_ev=(result["energy_reference_ry"]
+                                          - mu_c) * RYD_TO_EV,
                      spin_axis=axis, path_operators=path_ops)
         files.append(("path band operators", "written", npz))
 
@@ -237,37 +279,27 @@ def band_character_and_moments(*, colors, moments_grid, wfn, params, ctilde,
         with mesh:
             fH_R, f_params, _, _ = build_fH_R(
                 ctilde, enk_sigma, kgrid, mesh, a_band_index=a_band)
-            along = [jnp.einsum('a,akmn->kmn', jnp.asarray(axis), ops[:3])]
-            along += [jnp.einsum('a,akmn->kmn', jnp.asarray(axis),
-                                 ops[3 + 3 * i:6 + 3 * i])
-                      for i in range(n_atom)]
-            builders = [partial(_operator_R, o[None], ctilde, kgrid, mesh)
-                        for o in along]
+            builders = [partial(_operator_R, ops[i:i + 1], ctilde, kgrid,
+                                mesh) for i in range(n_vec)]
             E, D, residual = grid_moments(
                 fH_R, f_params, builders, kgrid, grid, n_return_bands, mesh)
         require_newton_converged(float(residual), where="moments grid")
         mu, m, f_top = occupied_sums(
             np.asarray(gather_to_host(E)), np.asarray(gather_to_host(D)),
             nelec, kT)
+        where = f"grid {grid[0]}x{grid[1]}x{grid[2]}"
         lines = [
             f"Moments on the {grid[0]}x{grid[1]}x{grid[2]} htransform grid "
-            f"(per cell; sign convention of QE's magnetization, "
-            f"m = n_up - n_down)",
-            f"  energies: {energy_source}; Fermi-Dirac kT = {kT:.5f} Ry ({kT_note}); E_F re-found on "
-            f"the grid = {mu * RYD_TO_EV:.5f} eV for N = {nelec:g} electrons",
-            f"  axis n (coarse-grid spin direction) = "
-            f"({axis[0]:+.5f}, {axis[1]:+.5f}, {axis[2]:+.5f})",
-            f"  spin   sum_occ <sigma.n>  = {m[0]:+.5f} mu_B",
-        ]
-        for i in range(n_atom):
-            lines.append(f"  orbital <L.n> {names[3 + 3 * i][4:]:<8s} = "
-                         f"{m[1 + i]:+.5f} mu_B (atomic sphere)")
-        lines += [
+            f"(energies: {energy_source})",
+            f"  units/sign: {SIGN_CONVENTION}",
+            f"  magnetization axis n = ({axis[0]:+.5f}, {axis[1]:+.5f}, "
+            f"{axis[2]:+.5f}) from {axis_source}",
+        ] + moment_lines(where, mu, m) + [
             f"  max occupation of the top returned band = {f_top:.2e}",
             "  approximation: <L> from Loewdin-orthogonalized PP_PSWFC "
-            "projections (j-averaged radial functions, as QE projwfc's "
-            "atomic sphere); the itinerant modern-theory orbital term needs "
-            "the Berry connection and is not included",
+            "projections (j-averaged radial functions, QE projwfc's atomic "
+            "sphere); the itinerant modern-theory orbital term needs the "
+            "Berry connection and is not included",
         ]
         if f_top > 1e-6:
             lines.append("  WARNING: the returned window is not empty at "
@@ -307,7 +339,8 @@ def write_bands_to_file(output_path: str, energies_on_path, kpath_frac, x_path,
 
 
 def main(argv=None):
-    parser = argparse.ArgumentParser(allow_abbrev=False, description="Hamiltonian interpolation driver")
+    parser = add_band_character_arguments(argparse.ArgumentParser(
+        allow_abbrev=False, description="Hamiltonian interpolation driver"))
     parser.add_argument("-i", "--input", default="cohsex_test.in", help="Input file")
     parser.add_argument("-wfn", "--wfn-file", default=None, help="Override WFN file (e.g. WFN_qp.h5)")
     parser.add_argument("--plot", action="store_true", help="Show interpolated band plot")
@@ -359,21 +392,6 @@ def main(argv=None):
              "driver. auto preserves the backend's robust distributed route; "
              "batch_reshard moves q onto the mesh and runs whole-matrix local "
              "JAX linalg.")
-    parser.add_argument(
-        "--color", action="append", default=[],
-        metavar="spin|orbital:[EL:]l",
-        help="Color the path bands by <sigma.n> (n: the coarse-grid spin "
-             "moment axis) or by an atomic-orbital character, e.g. "
-             "orbital:d or orbital:Fe:d; repeatable.  Writes "
-             "bands_<color>.png and band_operators_path.npz beside the deck. "
-             "Atomic functions: PP_PSWFC of the *.upf beside the deck.")
-    parser.add_argument(
-        "--moments-grid", type=int, nargs=3, default=None,
-        metavar=("NX", "NY", "NZ"),
-        help="Interpolate H, n.sigma and each atom's n.L to this uniform "
-             "grid and write moments.txt: sum_occ <sigma.n> and the "
-             "atomic-sphere <L.n>, Fermi-Dirac at occ_smearing_width_ry with "
-             "E_F re-found on the grid.")
     args = parser.parse_args(argv)
     input_dir = os.path.dirname(os.path.abspath(args.input))
 
@@ -414,18 +432,17 @@ def main(argv=None):
             params["wfn_file"] = args.wfn_file
             log(f"Using WFN file from CLI: {args.wfn_file}")
 
-        _input_dir = os.path.dirname(os.path.abspath(args.input))
         _wfn_path = (params["wfn_file"] if os.path.isabs(params["wfn_file"])
-                     else os.path.join(_input_dir, params["wfn_file"]))
+                     else os.path.join(input_dir, params["wfn_file"]))
         _qp_rotations_path = None
         if args.qp_rotations:
             _qp_rotations_path = (
                 args.qp_rotations if os.path.isabs(args.qp_rotations)
-                else os.path.join(_input_dir, args.qp_rotations))
+                else os.path.join(input_dir, args.qp_rotations))
         _eqp_path = None
         if args.eqp_file:
             _eqp_path = (args.eqp_file if os.path.isabs(args.eqp_file)
-                         else os.path.join(_input_dir, args.eqp_file))
+                         else os.path.join(input_dir, args.eqp_file))
         from file_io.qp_wfn import refuse_conflicting_qp_state_sources
         refuse_conflicting_qp_state_sources(
             wfn_path=_wfn_path, eqp_file=_eqp_path,
@@ -590,15 +607,12 @@ def main(argv=None):
                 f"P{wfns_fi.psi_rmuT_X.sharding.spec}, "
                 f"enk_full={wfns_fi.enk_full.shape}")
 
-        _moment_files = []
-        if args.color or args.moments_grid:
-            report.heading("Band character and moments")
-            _moment_files = band_character_and_moments(
+        _moment_files = band_character_and_moments(
                 colors=args.color, moments_grid=args.moments_grid, wfn=wfn,
                 params=params, ctilde=ctilde, enk_sigma=enk_sigma, meta=meta,
                 result=result, mesh=mesh_xy, input_dir=input_dir,
                 n_return_bands=n_return_bands, a_band=args.a_band,
-                energy_source=_energy_source, log=report.emit)
+                energy_source=_energy_source, report=report)
 
         if args.plot:
             plot_bands(result)
@@ -676,8 +690,7 @@ def main(argv=None):
                          os.path.join(input_dir, args.eqp_file))
             _file_rows.append(("QP energies", "read", _eqp_path))
         _file_rows.append(("interpolated bands", "written", output_path))
-        _file_rows += _moment_files
-        run.complete(files=_file_rows)
+        run.complete(files=_file_rows + _moment_files)
     return 0
 
 

@@ -288,28 +288,37 @@ Invoke: `python -m bandstructure.htransform -i ht.in [--qp-rotations qp_wfn_rota
 Band character and moments (`bandstructure.orbital`, spinor WFN only):
 
 - `--color spin` colors the path bands by $\langle\sigma\cdot\hat n\rangle$,
-  $\hat n$ the direction of the coarse-grid $\sum_k w_k \sum_n f_{nk}
-  \langle\sigma\rangle_{nn}$; `--color orbital:[EL:]l` (e.g. `orbital:d`,
-  `orbital:Fe:d`) by the character of Löwdin-orthogonalized PP_PSWFC rows
-  (the `*.upf` beside the deck; j-averaged radial functions, as
-  `psp.hubbard_ops`). Repeatable. Writes `bands_<color>.png` ($E - E_F$, $E_F$
-  of the coarse grid) and `band_operators_path.npz` (all path operator
-  matrices: $\sigma_{x,y,z}$, each atom's $L_{x,y,z}$, the characters).
-- `--moments-grid NX NY NZ` interpolates $f(H)$, $\hat n\cdot\sigma$ and each
-  atom's $\hat n\cdot L$ to that uniform grid, re-finds $E_F$ there
+  $\hat n$ the magnetization axis of the WFN's QE schema (`output` total
+  magnetization when present, else the input `starting_magnetization`
+  direction); `--color orbital:[EL:]l` (e.g. `orbital:d`, `orbital:Fe:d`) by
+  the character of Löwdin-orthogonalized PP_PSWFC rows (the `*.upf` beside
+  the deck; j-averaged radial functions, as `psp.hubbard_ops`). Repeatable.
+  Writes `bands_<color>.png` ($E - E_F$, $E_F$ of the coarse grid) and
+  `band_operators_path.npz` (all path operator matrices: $\sigma_{x,y,z}$,
+  each atom's $L_{x,y,z}$, the characters).
+- `--moments-grid NX NY NZ` interpolates $f(H)$, $\sigma_{x,y,z}$ and each
+  atom's $L_{x,y,z}$ to that uniform grid, re-finds $E_F$ there
   (Fermi-Dirac at `occ_smearing_width_ry`, $10^{-4}$ Ry if unset, electron
-  count exact) and writes `moments.txt`: $\sum_\mathrm{occ}\langle\sigma\cdot
-  \hat n\rangle$ (QE's sign, $m = n_\uparrow - n_\downarrow$) and the
-  atomic-sphere $\langle L\cdot\hat n\rangle$ per atom. The itinerant
-  (modern-theory) orbital term needs the Berry connection and is not formed.
+  count exact) and writes `moments.txt`: the three components and the
+  projection on $\hat n$ of $m_\mathrm{spin} = \sum_\mathrm{occ}\langle
+  \sigma\rangle$ and of each atom's atomic-sphere $m_\mathrm{orb} =
+  \sum_\mathrm{occ}\langle L\rangle$, beside the same sums taken directly on
+  the coarse grid. Units and sign: $\mu_B$ per cell in QE's convention
+  ($m_\mathrm{spin} = n_\uparrow - n_\downarrow$, QE's "total
+  magnetization"; $m_\mathrm{orb}$ with the same sign flip), so the
+  physical moments are $-\mu_B\langle\sigma\rangle$ and $-\mu_B\langle
+  L\rangle$ and $m_\mathrm{orb}/m_\mathrm{spin} > 0$ means $L \parallel S$.
+  The itinerant (modern-theory) orbital term needs the Berry connection and
+  is not formed.
 
 Every operator is $\langle\psi_{nk}|O|\psi_{mk}\rangle$ on the coarse full BZ,
 carried into the Galerkin basis as $C^T O C^*$ and Fourier-interpolated as
 $f(H)$ is; a QP $U$ is unitary on the fitted window, so with `--qp-rotations`
 only the eigenvectors change. The grid runs one $q_z$ plane per pass (a
-separable phase sum over the coarse $R$, one face→q exchange); $f(H)_R$ and one
-operator image are resident at a time, plus the plane eigenvectors. A $20^3$ →
-$40^3$ run holds about $3\, n_k\, \mathrm{rank}^2 \cdot 16$ B over all ranks.
+separable phase sum over the coarse $R$, one face→q exchange): one scan solves
+$f(H)$ and keeps the plane eigenvectors, then $f(H)_R$ is freed and each
+operator's image is built for its own scan, so one dense $(n_k, r, r)$ image
+(two while an operator is transformed) is resident.
 
 Refusals: a QRCP search that saturates the ceiling (inspect the projection
 receipts before raising the multiplier); an `f-shoulder` refusal when a
