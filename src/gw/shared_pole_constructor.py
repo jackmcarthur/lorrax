@@ -331,7 +331,8 @@ def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output, resi
                 round_model, round_signed, vectors, round_diagnostics = reduce_round(
                     round_states, infinity, tables, real=real, mesh_xy=mesh_xy,
                     native_eigh=local_eigh.native_fn, ordered=ordered,
-                    odd_moments=odd_moments, keep_budget=recipe.get("pole_budget"))
+                    odd_moments=odd_moments, keep_budget=recipe.get("pole_budget"),
+                    history=history, key=round_key)
             qi = infinity[0]
             del round_states, infinity
             round_reduction, round_zero, round_retained, round_permutation = jax.tree.map(np.asarray, round_diagnostics)

@@ -302,7 +302,7 @@ def _restricted_block(ww, wv, vv):
 
 
 def reduce_ordered_shared_pole_pencil(pencil, active_columns, *, eigh, matmul, gates, keep_budget=None,
-                                     retain_span=False, matrix_sharding=None, gram_keep=None):
+                                     retain_span=False, matrix_sharding=None, gram_keep=None, carrier=None):
     """Paired-basis Ritz reduction of the particle-hole pencil.
 
     ``pencil=(G,H,O,z)`` from ``assemble_ordered_shared_pole_pencil`` over paired
@@ -323,7 +323,10 @@ def reduce_ordered_shared_pole_pencil(pencil, active_columns, *, eigh, matmul, g
     times PSD, negative modes belong to the parent of -q (signed model only).
     |mu| <= keep*max|mu| (poles at infinity) is excluded and its output weight
     is reported. ``keep_budget`` caps the H'_vv keep cut at that many
-    directions, the largest first, so K <= keep_budget. The second cut acts on
+    directions, the largest first, so K <= keep_budget. On a rank-local
+    pencil the kept span is solved on its last ``carrier`` columns (default
+    ``keep_budget``); a kept count above the carrier (``retained_rank``) is
+    the caller's to rerun wider. The second cut acts on
     the eigenvalues of S relative to max(top(S), 1), the top of diag(S, I)
     (the kept v directions stay), and Y = L^-H on the kept
     span is P diag(U_S Gamma_S^-1/2, I) with P = [[I, 0], [-B^H, I]], corrected
@@ -381,7 +384,7 @@ def reduce_ordered_shared_pole_pencil(pencil, active_columns, *, eigh, matmul, g
     # Budget-excluded columns are exactly zero; omit them from local dense work.
     width = gamma.shape[-1]
     if matrix_sharding is None and face is None and keep_budget is not None:
-        width = min(width, max(1, int(keep_budget)))
+        width = min(width, max(1, int(keep_budget if carrier is None else carrier)))
     kept, values = keep[:, -width:], gamma[:, -width:]
     z = u[..., -width:] * (kept / jnp.sqrt(jnp.where(kept, values, 1)))[:, None, :]
     del u

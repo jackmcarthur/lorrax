@@ -282,22 +282,42 @@ def _batch_put(mesh_xy, a):
 
 
 def reduce_round(states, infinity, tables, *, real, mesh_xy, native_eigh, ordered, odd_moments, keep_budget,
-                 retain_span=False, gram_keep=None):
-    """Run ``round_program`` on one round: host tables in, round-order results out."""
+                 retain_span=False, gram_keep=None, history=None, key=None):
+    """Run ``round_program`` on one round: host tables in, round-order results out.
+
+    With a model ``history`` (``carrier_history``), an ordered round solves its
+    kept span on the Ritz carrier: the ladder rung (``port_extent``) of the
+    largest kept count this model has had, capped at ``keep_budget``, which is
+    also the first round's carrier. A round whose kept count exceeds its carrier
+    reruns on the wider rung, so only exact-zero columns ever leave the solve.
+    """
     import numpy as np
+    from gw.shared_pole_directions import port_extent
 
     put = lambda a: _batch_put(mesh_xy, np.asarray(a))
-    program = round_program(mesh_xy, native_eigh, bool(ordered), bool(odd_moments),
-                            None if keep_budget is None else int(keep_budget), bool(retain_span), gram_keep)
     live = np.arange(len(tables["own"])) < int(real)
-    return program(put(live), put(tables["points"]), put(tables["order"]), put(tables["active"]),
-                   tuple(st[1] for st in states), tuple(st[2] for st in states),
-                   tuple(st[3] for st in states), tuple(infinity))
+    args = (put(live), put(tables["points"]), put(tables["order"]), put(tables["active"]),
+            tuple(st[1] for st in states), tuple(st[2] for st in states),
+            tuple(st[3] for st in states), tuple(infinity))
+    budget = None if keep_budget is None else int(keep_budget)
+    track = history is not None and bool(ordered) and budget is not None
+    carrier = history.get((key, "ritz"), budget) if track else budget
+    while True:
+        result = round_program(mesh_xy, native_eigh, bool(ordered), bool(odd_moments), budget,
+                               bool(retain_span), gram_keep, carrier)(*args)
+        if not track:
+            return result
+        kept = int(np.max(np.asarray(result[3][0]["retained_rank"])[:int(real)]))
+        rung = min(budget, port_extent(mesh_xy)(kept))
+        history[(key, "ritz")] = max(rung, history.get((key, "ritz"), 0))
+        if kept <= carrier:
+            return result
+        carrier = rung
 
 
 def solve_parent_pencil(points, q, o, d, infinity, active, *, eigh, matmul,
                         gates, ordered, odd_moments, keep_budget, retain_span=False, matrix_sharding=None,
-                        gram_keep=None):
+                        gram_keep=None, carrier=None):
     """One equation owner for local and whole-mesh parent execution.
 
     Inputs carry one or more independent parents. Execution adapters supply
@@ -317,7 +337,7 @@ def solve_parent_pencil(points, q, o, d, infinity, active, *, eigh, matmul,
                                                      matmul=matmul, matrix_sharding=matrix_sharding)
         reduced = reduce_ordered_shared_pole_pencil(
             pencil, active, eigh=eigh, matmul=matmul, gates=gates, keep_budget=keep_budget,
-            retain_span=retain_span, matrix_sharding=matrix_sharding, gram_keep=gram_keep)
+            retain_span=retain_span, matrix_sharding=matrix_sharding, gram_keep=gram_keep, carrier=carrier)
         model, signed, reduction = reduced[:3]
         if retain_span:
             coefficients = reduced[3]
@@ -375,7 +395,7 @@ def zero_row_safe_eigh(eigh):
 
 @lru_cache(maxsize=None)
 def round_program(mesh_xy, native_eigh, ordered, odd_moments, keep_budget, retain_span=False,
-                  gram_keep=None):
+                  gram_keep=None, carrier=None):
     """Pack, assemble, reduce, gate and sort a round of parents, each on its own rank.
 
     One program over batch layout: rank r packs slot r's Q, WQ, dWQ panels by
@@ -409,7 +429,8 @@ def round_program(mesh_xy, native_eigh, ordered, odd_moments, keep_budget, retai
     def solve(points, q, o, d, infinity, active):
         return solve_parent_pencil(points, q, o, d, infinity, active,
             eigh=eigh, matmul=_mm, gates=gates, ordered=ordered,
-            odd_moments=odd_moments, keep_budget=keep_budget, retain_span=retain_span, gram_keep=gram_keep)
+            odd_moments=odd_moments, keep_budget=keep_budget, retain_span=retain_span, gram_keep=gram_keep,
+            carrier=carrier)
 
     def body(live, points, order, active, qs, os, ds, infinity):
         def pack(panels):
