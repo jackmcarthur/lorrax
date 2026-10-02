@@ -88,10 +88,11 @@ def _host_kind(mesh):
 
 @lru_cache(maxsize=None)
 def _record_digests(mesh, shape):
-    """Carry ``[n_out, q, rows, cols]`` at ``P(None, None, 'x', 'y')`` → digests ``(px, py, n_out)``."""
-    return jax.jit(jax.shard_map(lambda c: _digest(c.reshape(c.shape[0], -1))[None, None],
+    """Carry ``[n_out, q, rows, cols]`` at ``P(None, None, 'x', 'y')`` → one digest per
+    (output, q row) ``(px, py, n_out, q)``, so a read of a q span is checked too."""
+    return jax.jit(jax.shard_map(lambda c: _digest(c.reshape(c.shape[0], c.shape[1], -1))[None, None],
                                  mesh=mesh, in_specs=P(None, None, "x", "y"),
-                                 out_specs=P("x", "y", None), check_vma=False))
+                                 out_specs=P("x", "y", None, None), check_vma=False))
 
 
 @lru_cache(maxsize=None)
@@ -136,21 +137,21 @@ def _compiled_program(builder, mesh, shape, sharding, n_scalars, *static):
 @lru_cache(maxsize=None)
 def _unpack(mesh, n_out, q, shapes, rects, tile, records16):
     """Records ``(px, py, n_out·S/16)`` → the tile ``[n_out, q, px·tile_r, py·tile_c]``
-    (zeros outside every rectangle) and the digests ``(px, py, n_out, n_segment)``."""
+    (zeros outside every rectangle) and the digests ``(px, py, n_out, n_segment, q)``."""
     starts = np.concatenate([[0], np.cumsum(records16)[:-1]]).astype(int)
 
     def local(flat):
         flat = flat.reshape(n_out, int(sum(records16)))
         out, digests = jnp.zeros((n_out, q) + tuple(tile), flat.dtype), []
         for start, (rows, cols), places in zip(starts, shapes, rects):
-            record = flat[:, start:start + q * rows * cols]
+            record = flat[:, start:start + q * rows * cols].reshape(n_out, q, rows * cols)
             digests.append(_digest(record))
             record = record.reshape(n_out, q, rows, cols)
             for r0, c0, R0, C0, nr, nc in places:
                 out = out.at[:, :, R0:R0 + nr, C0:C0 + nc].set(record[:, :, r0:r0 + nr, c0:c0 + nc])
-        return out, jnp.stack(digests, axis=-1)[None, None]
+        return out, jnp.stack(digests, axis=1)[None, None]
     return jax.jit(jax.shard_map(local, mesh=mesh, in_specs=P("x", "y", None),
-                                 out_specs=(P(None, None, "x", "y"), P("x", "y", None, None)),
+                                 out_specs=(P(None, None, "x", "y"), P("x", "y", None, None, None)),
                                  check_vma=False))
 
 
@@ -342,7 +343,7 @@ class StreamedBank:
         self.devices = tuple(cells)
         self._cell = {(i[0].start or 0, i[1].start or 0): d for d, i in cells.items()}
         self.seconds, self.bounced = dict(write=0., read=0., wait=0.), 0
-        self.digests = {d: np.zeros((self.n_out, len(self.shapes)), np.uint64) for d in self.devices}
+        self.digests = {d: np.zeros((self.n_out, len(self.shapes), self.q), np.uint64) for d in self.devices}
         self.written = np.zeros((self.n_out, len(self.shapes)), bool)
         self.stores, self._inflight, self._error = {}, deque(), None
         self._pool = ThreadPoolExecutor(IO_THREADS, thread_name_prefix="bank-io")
@@ -469,11 +470,16 @@ class StreamedBank:
         agree_io_error(error, path=self.dir, stage="streamed_bank.commit")
 
     def reader(self, spans):
-        """Each ``(o0, o1)`` of ``spans`` in turn as one device array, read one ahead."""
-        return _Reader(self, [(int(a), int(b)) for a, b in spans])
+        """Each ``(o0, o1)`` or ``(o0, o1, (qa, qb))`` of ``spans`` in turn as one device array
+        ``[o1-o0, q, ...]`` (``q = qb - qa`` for a q span), read one ahead."""
+        return _Reader(self, [(int(s[0]), int(s[1]), None if len(s) < 3 or s[2] is None
+                               else (int(s[2][0]), int(s[2][1]))) for s in spans])
 
-    def _load(self, o0, o1, staging):
-        """Run ``[o0·S, o1·S)`` of every local store as ``(px, py, n/16)`` at ``P('x','y',None)``."""
+    def _load(self, o0, o1, q_span, staging):
+        """Run ``[o0·S, o1·S)`` of every local store, or rows ``q_span`` of each of its records,
+        as ``(px, py, n/16)`` at ``P('x','y',None)``."""
+        if q_span is not None and q_span != (0, self.q):
+            return self._load_rows(o0, o1, q_span, staging)
         started = time.monotonic()
         n, local = (o1 - o0) * self.S, {}
         for d in self.devices:
@@ -488,6 +494,46 @@ class StreamedBank:
                           for a in range(0, n, self.piece)]:
                 piece.result()
             local[d] = np.frombuffer(staging[d], dtype=np.uint8, count=n)
+        flat = jax.make_array_from_callback(
+            (int(self.mesh.shape["x"]), int(self.mesh.shape["y"]), n // 16),
+            NamedSharding(self.mesh, P("x", "y", None)),
+            lambda i: local[self._cell[(i[0].start or 0, i[1].start or 0)]].view(np.complex128)[None, None])
+        flat.block_until_ready()
+        return flat, time.monotonic() - started
+
+    def _load_rows(self, o0, o1, q_span, staging):
+        """Rows ``[qa, qb)`` of every record of outputs ``[o0, o1)``, packed record after record
+        (one aligned run read per record, its rows copied out on the host)."""
+        started = time.monotonic()
+        qa, qb = q_span
+        sub = tuple((qb - qa) * r * c * 16 for r, c in self.shapes)
+        n = (o1 - o0) * sum(sub)
+        local = {}
+        for d in self.devices:
+            store = self.stores[d]
+            if staging.get(d) is None or len(staging[d]) < n:
+                staging[d] = _aligned(n)
+            packed = np.frombuffer(staging[d], dtype=np.uint8, count=n)
+            jobs, at = [], 0
+            for o in range(o0, o1):
+                for s, (r, c) in enumerate(self.shapes):
+                    first = o * self.S + self.starts[s] + qa * r * c * 16
+                    jobs.append((first, sub[s], at))
+                    at += sub[s]
+
+            def copy(job, store=store, packed=packed):
+                first, length, at = job
+                if store.host is not None:
+                    packed[at:at + length] = store.view[first:first + length]
+                    return
+                lo = first // self.align * self.align
+                hi = padded(first + length, self.align)
+                run = _aligned(hi - lo)
+                store.read(memoryview(run)[:hi - lo], lo)
+                packed[at:at + length] = np.frombuffer(run, np.uint8, count=hi - lo)[first - lo:first - lo + length]
+            for piece in [self._pool.submit(copy, job) for job in jobs]:
+                piece.result()
+            local[d] = packed
         flat = jax.make_array_from_callback(
             (int(self.mesh.shape["x"]), int(self.mesh.shape["y"]), n // 16),
             NamedSharding(self.mesh, P("x", "y", None)),
@@ -535,7 +581,8 @@ class _Reader:
         if self.at >= len(self.spans):
             self._thread.shutdown(wait=True)
             raise StopIteration
-        (o0, o1), error, started = self.spans[self.at], None, time.monotonic()
+        (o0, o1, q_span), error, started = self.spans[self.at], None, time.monotonic()
+        qa, qb = (0, bank.q) if q_span is None else q_span
         try:
             flat, seconds = self._next.result()
             bank.seconds["read"] += seconds
@@ -545,14 +592,18 @@ class _Reader:
         self._next = self._submit(self.at)
         bank.seconds["wait"] += time.monotonic() - started
         agree_io_error(error, path=bank.dir, stage="streamed_bank.read")
-        value, digest = _unpack(bank.mesh, o1 - o0, bank.q, bank.shapes, bank.rects, bank.tile,
-                                tuple(r // 16 for r in bank.records))(flat)
+        records16 = (tuple(r // 16 for r in bank.records) if (qa, qb) == (0, bank.q)
+                     else tuple((qb - qa) * r * c for r, c in bank.shapes))
+        value, digest = _unpack(bank.mesh, o1 - o0, qb - qa, bank.shapes, bank.rects, bank.tile,
+                                records16)(flat)
         try:
             if not bank.unwritten_zero and not bank.written[o0:o1].all():
                 raise OSError(f"GATE streamed_bank: outputs [{o0}, {o1}) were not all written")
             for shard in digest.addressable_shards:
-                if not np.array_equal(np.asarray(shard.data)[0, 0], bank.digests[shard.device][o0:o1]):
-                    raise OSError(f"GATE streamed_bank: digest mismatch reading outputs [{o0}, {o1})")
+                if not np.array_equal(np.asarray(shard.data)[0, 0],
+                                      bank.digests[shard.device][o0:o1, :, qa:qb]):
+                    raise OSError(f"GATE streamed_bank: digest mismatch reading outputs [{o0}, {o1}) "
+                                  f"rows [{qa}, {qb})")
         except BaseException as exc:
             error = exc
         agree_io_error(error, path=bank.dir, stage="streamed_bank.digest")

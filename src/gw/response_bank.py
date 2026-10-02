@@ -1865,6 +1865,25 @@ def _minus_q_mirror(plan, sym, meta, mesh_xy):
     return mirror
 
 
+def sample_q_width(face_bytes, nq):
+    """Parents per q span of a streamed sample's read (``runtime.tiles``): the span's value
+    and slope rows, its unpack and the next prefetch fit one tile; ``None`` for one span."""
+    from runtime.tiles import tile_units
+    width = tile_units(3 * 2 * int(face_bytes), int(nq))
+    return None if width >= int(nq) else width
+
+
+class _RowWindow:
+    """``raw[i, rows]`` of a q-span read: absolute response rows mapped to the span's own."""
+
+    def __init__(self, value, first):
+        self.value, self.first = value, int(first)
+
+    def __getitem__(self, key):
+        i, rows = key
+        return self.value[int(i), np.asarray(rows) - self.first]
+
+
 class _MemberRows:
     """``raw[i, rows]`` of one group member, read from the group carry ``[2m, q, μ, ν]``."""
 
@@ -2338,6 +2357,23 @@ def produce_sample_bank(wfns, meta, config, *, mesh_xy, sym, sample_plan, bank_i
                         _tr_odd_census(receipt,dyson.value,h[part],chi_value[part],value[part],z[sample:sample+1],int(qids[iq]))
         return value, slope
 
+    def dense_spans(sample):
+        """``[(q0, q1, need_value, need_slope), ...]`` of a dense sample still to write: a fresh
+        frequency is one q_irr slab; partial restarts keep contiguous rows with identical
+        value/slope masks together."""
+        marked = np.asarray(header["sample_written"], bool)[:, dense_sample_rows(header, (sample,))[0]]
+        edges = np.r_[0, 1+np.flatnonzero(np.any(marked[1:] != marked[:-1], axis=1)), len(qids)]
+        return [(int(q0), int(q1), bool(~marked[q0][0]), bool(~marked[q0][1]))
+                for q0, q1 in zip(edges[:-1], edges[1:]) if not marked[q0].all()]
+
+    # On the streamed tier a sample's value and slope rows come back in q spans
+    # of one tile (the read, its unpack and the next prefetch live at once), so a
+    # sample larger than a card is solved span by span; one span when it fits.
+    q_width = None
+    if stream_bank is not None:
+        q_width = sample_q_width(face_bytes, len(qids))
+        receipt["bank_residence"]["q_width"] = q_width or len(qids)
+
     for group in rules["groups"]:
         members = [int(m) for m in group["members"]]
         if all(committed(m) for m in members):
@@ -2364,7 +2400,13 @@ def produce_sample_bank(wfns, meta, config, *, mesh_xy, sym, sample_plan, bank_i
                 outputs=[(2*row+k, 2*row+k) for row, _ in fresh for k in (0, 1)])
             with timing.section('bank.stream_commit'):
                 stream_bank.commit()
-            raw_group = stream_bank.reader([(2*row, 2*row+2) for row, _ in fresh])
+            # A line sample reads every parent at once; a dense sample larger
+            # than its q width reads one q span per solve (the loop's own order).
+            raw_group = stream_bank.reader([
+                (2*row, 2*row+2, span) for row, sample in fresh
+                for span in ([None] if q_width is None or p0 <= sample < p1 else
+                             [(a, min(q1, a+q_width)) for q0, q1, _, _ in dense_spans(sample)
+                              for a in range(q0, q1, q_width)])])
             take = ((lambda row: next(raw_group)) if finish is None
                     else (lambda row: finish(next(raw_group))))
         io_started = time.monotonic()
@@ -2376,7 +2418,7 @@ def produce_sample_bank(wfns, meta, config, *, mesh_xy, sym, sample_plan, bank_i
                 if committed(sample):
                     progress.step()
                     continue
-                raw = take(row)
+                raw = take(row) if q_width is None or p0 <= sample < p1 else None
                 if p0 <= sample < p1:
                     # Select from W(z) itself, then act with the minus-q partner on
                     # the same directions; only the panels reach the bank.
@@ -2412,24 +2454,21 @@ def produce_sample_bank(wfns, meta, config, *, mesh_xy, sym, sample_plan, bank_i
                     ledger.live_stages = live
                     del panels
                 else:
-                    dense_row = dense_sample_rows(header, (sample,))[0]
-                    marked = np.asarray(header["sample_written"], bool)[:, dense_row]
-                    # A fresh frequency is one q_irr slab. Partial restarts keep
-                    # contiguous rows with identical value/slope masks together.
-                    edges = np.r_[0, 1+np.flatnonzero(np.any(marked[1:] != marked[:-1], axis=1)), len(qids)]
-                    for q0, q1 in zip(edges[:-1], edges[1:]):
-                        need_value, need_slope = ~marked[q0]
-                        if not (need_value or need_slope):
-                            continue
-                        span = (int(q0), int(q1))
-                        value, slope = solve(raw, 0, q0, q1, bank_handle, sample, need_value=need_value)
-                        io_started = time.monotonic()
-                        if need_slope:
-                            write(q_span=span, sample_span=(sample,sample+1), dWc_ds=slope[:,None])
-                        if need_value:
-                            write(q_span=span, sample_span=(sample,sample+1), Wc=value[:,None])
-                        receipt["seconds"]["io"] = receipt["seconds"].get("io",0.)+time.monotonic()-io_started
-                        del value, slope
+                    for q0, q1, need_value, need_slope in dense_spans(sample):
+                        width = q_width or (q1 - q0)
+                        for a in range(q0, q1, width):
+                            span = (int(a), int(min(q1, a + width)))
+                            rows = raw if q_width is None else _RowWindow(take(row), a)
+                            value, slope = solve(rows, 0, *span, bank_handle, sample,
+                                                 need_value=need_value)
+                            del rows
+                            io_started = time.monotonic()
+                            if need_slope:
+                                write(q_span=span, sample_span=(sample,sample+1), dWc_ds=slope[:,None])
+                            if need_value:
+                                write(q_span=span, sample_span=(sample,sample+1), Wc=value[:,None])
+                            receipt["seconds"]["io"] = receipt["seconds"].get("io",0.)+time.monotonic()-io_started
+                            del value, slope
                 receipt["batches"].append(dict(sample=sample, group=members))
                 del raw
                 progress.step()
@@ -2454,6 +2493,7 @@ def produce_sample_bank(wfns, meta, config, *, mesh_xy, sym, sample_plan, bank_i
         print_fn(f"Response quadrature: chi bank {residence['residence']}, "
                  f"{residence['bytes_per_rank'] / 2**30:.2f} GiB/rank; {residence['reason']}"
                  + ("" if residence["residence"] == "device" else
+                    f"; q spans of {residence.get('q_width')} parents"
                     f"; write {receipt['seconds']['bank_write']:.2f} s, read "
                     f"{receipt['seconds']['bank_read']:.2f} s, waited {receipt['seconds']['bank_wait']:.2f} s"),
                  flush=True)
