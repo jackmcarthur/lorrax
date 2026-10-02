@@ -56,7 +56,7 @@ bands. The Na stages run in `run/na/`.
 | sp_export | `gw.gw_jax` | shared-pole one-shot with `write_w`/`write_poles` (the file-model path), restarted; the W bank is compared by value, the pole model by member shapes |
 | kin_ion_bisp | `gw.kin_ion_io` | four-component kinetic-balance kinetic + ionic matrix elements |
 | dipole_bisp | `psp.get_dipole_mtxels` | the four-component dipole the direct head authenticates |
-| bisp_sc | `gw.gw_jax` | `bispinor_gw = full_shared_pole` through the SC driver, 2 maps: fresh charge + transverse ζ (both on the charge centroid set), ordered CC/CT/TC/TT sector poles, direct four-current Γ head, `sc_head_update = dft_velocity`, live four-current density; map 0 is the one-shot |
+| bisp_sc | `gw.gw_jax` | `bispinor_gw = full_shared_pole` through the SC driver, 2 maps: fresh charge + transverse ζ (both on the charge centroid set), ordered CC/CT/TC/TT sector poles, direct four-current Γ head, `sc_head_update = dft_velocity`, live four-current density, the default band extrapolation (on the CC class); map 0 is the one-shot |
 | bse_bisp | `bse.bse_jax` | TDA Davidson after `bisp_sc` on the four-component restart: the final map's W0 = V + W_c,CC(0) (charge sector only) |
 | na_kin_ion | `gw.kin_ion_io` | bcc Na kinetic + ionic matrix elements; the 56 orbit-closed centroids (fitted on the ζ legs, 8 × 13) are stored in `fixture_na/` |
 | na_dipole | `psp.get_dipole_mtxels` | the default dipole: q→0 velocity plus the parallel-transport link artifact |

@@ -228,6 +228,36 @@ def get_sigma_spatial_kernel(
 _NO_BRACKETS = None
 
 
+def bracket_selectors(selector, selectors):
+    """Each band bracket's Green selector, band range and liveness: ``(masks, ranges, live)``.
+
+    ``selectors``: ``(None,)`` (one bracket over every band: the selector
+    itself, no range, no predicate) or ``(lo, hi)`` rows, ``hi`` None for the
+    last band.  ``selector`` is a window's band mask or signed weight with the
+    bands on its last axis; each bracket keeps it on ``[lo, hi)``.  A bracket
+    with no live band builds an identically zero Green, so ``live`` (a
+    replicated predicate) lets the caller skip it.  One owner for the scalar
+    Σ τ kernel and the four-current sector node (``gw.mpa.sector_sigma``).
+    """
+    n_mask = int(selector.shape[-1])
+    idx = jnp.arange(n_mask)
+    masks, ranges, live = [], [], []
+    for bounds in selectors:
+        if bounds is None:
+            masks.append(selector)
+            ranges.append(None)
+            live.append(None)
+            continue
+        lo, hi = bounds[0], n_mask if bounds[1] is None else bounds[1]
+        in_range = (idx >= lo) & (idx < hi)
+        masked = (selector & in_range if selector.dtype == jnp.bool_
+                  else selector * in_range.astype(selector.dtype))
+        masks.append(masked)
+        ranges.append((lo, hi))
+        live.append(jnp.any(masked != 0))
+    return masks, ranges, live
+
+
 def sigma_subtile_operands(psi_coh_xn, psi_coh_yr, psi_proj_xr, psi_proj_yn, *, mesh_xy):
     """The Σ τ operands as the sub-tile kernel reads them, placed once per Σ call.
 
@@ -386,24 +416,7 @@ def _sigma_subtile_kernel(*, mesh_xy, kgrid, brackets, face_shape, face_band_ext
         rows_all = jax.lax.with_sharding_constraint(psi_coh_xn, NamedSharding(mesh_xy, GREEN_ROWS_SPEC))
         g_right = jax.lax.with_sharding_constraint(psi_coh_yr, NamedSharding(mesh_xy, P(None, None, "y")))
         left_all, right_all = projection_complete(psi_proj_xr, psi_proj_yn, mesh_xy)
-        n_mask = int(mask_A.shape[-1])
-        idx = jnp.arange(n_mask)
-        bracket_masks, bracket_ranges, live = [], [], []
-        for bounds in selectors:
-            if bounds is None:
-                bracket_masks.append(mask_A)
-                bracket_ranges.append(None)
-                live.append(None)
-                continue
-            lo, hi = bounds[0], n_mask if bounds[1] is None else bounds[1]
-            in_range = (idx >= lo) & (idx < hi)
-            masked = (mask_A & in_range if mask_A.dtype == jnp.bool_
-                      else mask_A * in_range.astype(mask_A.dtype))
-            bracket_masks.append(masked)
-            bracket_ranges.append((lo, hi))
-            # A bracket with no live band builds an identically zero Green:
-            # it is skipped and adds nothing (replicated predicate).
-            live.append(jnp.any(masked != 0))
+        bracket_masks, bracket_ranges, live = bracket_selectors(mask_A, selectors)
         zero = jax.lax.with_sharding_constraint(
             jnp.zeros((1, px * py * n_parent, nb_sig, nb_sig), jnp.complex128), partial_spec)
 

@@ -2182,12 +2182,14 @@ def mpa_sigma_runs_scalar_executor(config) -> bool:
     (``bispinor_gw = bare_transverse`` with the shared pole): its store is
     the four-component charge operator and ``sigma_dispatch._compute_mpa_sigma``
     hands it to ``compute_sigma_c_mpa_omega_grid`` like a scalar store.  The
-    four-current sector bank (``full_shared_pole``) sums CC/TT/CT on their own
-    pole sets in ``mpa.sector_sigma`` with no bracket plan, and a bispinor
-    MPA fit is unmeasured; both keep the full-band sum.
+    four-current sector bank (``full_shared_pole``) runs that executor once
+    per endpoint class (``mpa.sector_sigma``), and its CC class brackets its
+    Green band sum.  A bispinor MPA fit is unmeasured and keeps the full-band
+    sum.
     """
     return (not bool(getattr(config, "bispinor", False))
-            or uses_bare_transverse_shared_pole(config))
+            or uses_bare_transverse_shared_pole(config)
+            or uses_full_bispinor_shared_pole(config))
 
 
 # ---------------------------------------------------------------------------
@@ -4130,11 +4132,11 @@ class DynamicSigmaConfig:
     #: ``use_band_extrapolation`` (default TRUE) and its deprecated alias
     #: ``sigma_band_extrapolation`` by
     #: :func:`resolve_band_extrapolation`.  Applied by the GN/HL-PPM pipeline
-    #: and the scalar MPA Σ (``gw.ppm_pipeline``'s band-extrapolation seam);
-    #: on a static or bispinor-MPA stage it is turned OFF with a recorded note
-    #: (or refused -- see ``band_extrapolation_explicit``) by
-    #: ``gw.sigma_dispatch``: the static Coulomb hole anti-converges, and the
-    #: four-current sector Σ has no bracket axis.
+    #: and the MPA Σ of scalar and bispinor shared-pole decks
+    #: (``gw.ppm_pipeline``'s band-extrapolation seam); on a static stage or a
+    #: bispinor MPA fit it is turned OFF with a recorded note (or refused --
+    #: see ``band_extrapolation_explicit``) by ``gw.sigma_dispatch``: the
+    #: static Coulomb hole anti-converges, and a bispinor MPA fit is unmeasured.
     band_extrapolation: bool = USE_BAND_EXTRAPOLATION_DEFAULT
     #: Did a deck NAME either spelling?  Selects between auto-disabling and
     #: refusing on a non-PPM mode; see :func:`resolve_band_extrapolation`.

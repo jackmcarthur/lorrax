@@ -18,13 +18,54 @@ converged by raising `number_bands`; its measured size is in
 
 ## Where it runs
 
-The plasmon-pole stages (`gn_ppm`, `hl_ppm`) and the scalar `mpa` stage
-(shared pole or MPA fit) consume it: all three run the same pole-sum Σ
-executor, which splits the Green band sum into brackets. A static stage and a
-bispinor `mpa` stage (a sum of four-current sector bodies, no bracket axis) do
-not: a defaulted-on key disables itself with a log note and a named key
-refuses. On a static Coulomb hole the band limit anti-converges, so that guard
-is a correctness rule ([decisions](../architecture/decisions.md)).
+The plasmon-pole stages (`gn_ppm`, `hl_ppm`), the scalar `mpa` stage
+(shared pole or MPA fit) and both bispinor shared-pole routes
+(`bispinor_gw = bare_transverse` and `full_shared_pole`) consume it: all of
+them run the same pole-sum Σ executor, which splits the Green band sum into
+brackets. A static stage and a bispinor MPA fit do not: a defaulted-on key
+disables itself with a log note and a named key refuses. On a static Coulomb
+hole the band limit anti-converges, so that guard is a correctness rule
+([decisions](../architecture/decisions.md)).
+
+## Four-current Σ {#four-current}
+
+With `bispinor_gw = full_shared_pole`, Σ_c is a sum of four endpoint classes
+(CC, TT, CT, TC), each with its own pole set and its own τ sweep, plus the
+equal-time W∞ − V constant ([bispinor GW](bispinor-gw.md#routes)). Only the
+CC class is extrapolated. Its τ sweep splits the Green band sum into the
+three brackets: W(τ) is formed once per node, and every live bracket builds
+its own Green and runs its own convolution against it
+(`gw.mpa.sector_sigma.sector_node`). TT, CT, TC and the constant are summed
+to N as without extrapolation and added equally to every CC count. The fit's
+differences therefore see CC alone, and the extrapolated Σ carries the other
+classes once.
+
+Why CC alone:
+
+- **The law.** The β = 3 law is derived for a charge vertex ([the model](#the-model)).
+  A current vertex of a high band grows with that band's momentum, so the
+  CT, TC and TT tails fall more slowly and are not this law.
+- **The size.** CT and TC are of order c⁻² of CC and the screened TT of
+  c⁻⁴ ([bispinor GW §3](bispinor-gw.md#counting)). Their tails are smaller by
+  the same factor, far below the 1 meV budget at a tail of a few hundred meV.
+- **`bare_transverse`.** That route extrapolates the same class: its
+  correlation is CC, and its transverse term is the bare exchange Σ^B over
+  occupied states, which has no tail.
+- **The cost.** Each live bracket repeats the class's mode-8 convolution,
+  whose W unfold dominates it. The scalar route shares its W preparation
+  across brackets; mode 8 cannot. On Fe 4³ bispinor SP-full SC at 36 bands,
+  bracketing all four classes raised Σ τ at map 2 by 37 %, and CC alone by 15 %
+  (13/20/15 % at maps 0–2). The map wall rose 3–6 %.
+
+Measured (Fe 4³ bispinor SP-full SC, 36 bands, P4; sandbox SECTEXTRAP, claim 3125): at
+map 0, eqp0 within E_F ± 10 eV moves by a median of 342 meV and at most
+891 meV, mean −385 meV. Bracketing every class instead of CC alone changes
+eqp0 by at most 0.08 meV over maps 0–2. That is the measured size of the
+current classes' tails.
+
+With `sigma_lorentz_debug_output` the CT and TT columns are the classes'
+own sums to N, and the CC column, the residual of the total, carries the
+extrapolation.
 
 ## Three sums from one pass
 

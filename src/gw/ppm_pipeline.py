@@ -336,8 +336,8 @@ def _streamed_combination(cube, live, w):
     shape = (n_omega, int(cube.nk), *members[0].shape[2:])
     sharding = NamedSharding(cube.mesh_xy, P(None, None, "x", "y"))
     out = _zeros_cube_fn(shape, sharding)()
-    run = _combination_slab_fn(cube.unfold, step, cube.term is not None,
-                               sharding)
+    run = _combination_slab_fn(cube.unfold, step,
+                               0 if cube.term is None else cube.term.ndim, sharding)
     for lo in range(0, n_omega, step):
         out = run(out, members, cube.term, w, jnp.asarray(
             min(lo, n_omega - step), dtype=jnp.int32))
@@ -351,13 +351,17 @@ def _zeros_cube_fn(shape, sharding):
 
 
 @lru_cache(maxsize=16)
-def _combination_slab_fn(unfold, step, with_term, sharding):
+def _combination_slab_fn(unfold, step, term_ndim, sharding):
+    """One ω slab of the combination; ``term_ndim`` 0 (no term), 3 (one term
+    for every ω) or 4 (a term per ω, sliced with the slab)."""
     def slab(out, members, term, w, lo):
         parts = []
         for m in members:
             part = unfold(jax.lax.dynamic_slice_in_dim(m, lo, step, axis=0))
-            if with_term:
+            if term_ndim == 3:
                 part = part + term[None, ...]
+            elif term_ndim == 4:
+                part = part + jax.lax.dynamic_slice_in_dim(term, lo, step, axis=0)
             parts.append(part)
         value = _combine_extrapolation(parts[0], tuple(parts[1:]), w)
         return jax.lax.dynamic_update_slice_in_dim(out, value, lo, axis=0)

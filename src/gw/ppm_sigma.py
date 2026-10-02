@@ -182,7 +182,10 @@ class BandCountCube:
     nk: int
     fresh: bool
     mesh_xy: Mesh
-    #: ``(nk, nb, nb)``, added to every point: the PPM static-limit term.
+    #: Added to every point: ``(nk, nb, nb)``, the PPM static-limit term (the
+    #: same at every ω), or ``(n_omega, nk, nb, nb)`` on the full BZ, the
+    #: four-current classes and constant that are not extrapolated
+    #: (``gw.mpa.sector_sigma.compute_sector_sigma``).
     term: jax.Array | None = None
 
     @property
@@ -213,7 +216,7 @@ class BandCountCube:
                  _diagonal_of_cube_fn(self.mesh_xy)(self._matrix(i)))
         slots = self.unfold_rows(slots)
         if self.term is not None:
-            slots = _add_term_slots_fn(self.mesh_xy)(slots, self.term)
+            slots = _add_term_slots_fn(self.mesh_xy, self.term.ndim)(slots, self.term)
         return BandDiagonalSlots(slots, self.mesh_xy)
 
     def block_until_ready(self):
@@ -237,11 +240,13 @@ class BandCountCube:
 
 
 @lru_cache(maxsize=8)
-def _add_term_slots_fn(mesh_xy):
+def _add_term_slots_fn(mesh_xy, ndim=3):
     """Diagonal slots of ``sigma + term`` from those of ``sigma``: the owning
-    slot adds the term's diagonal, the zero slots add zero."""
-    term_slots = band_diagonal_slots(mesh_xy, 3)
-    return jax.jit(lambda slots, term: slots + term_slots(term)[None, ...],
+    slot adds the term's diagonal, the zero slots add zero.  ``ndim``: the
+    term's, 3 (one ω-independent term) or 4 (one per ω)."""
+    term_slots = band_diagonal_slots(mesh_xy, ndim)
+    lead = (None,) * (4 - ndim)
+    return jax.jit(lambda slots, term: slots + term_slots(term)[lead],
                    out_shardings=NamedSharding(mesh_xy, P(None, None, "x", "y")))
 
 
@@ -895,8 +900,10 @@ def _add_static_ppm_term(
 
 @lru_cache(maxsize=8)
 def _add_static_term_fn(sharding, donate):
-    """``sigma + term`` broadcast over omega; ``donate``: in the point's buffer."""
-    return jax.jit(lambda sigma, term: sigma + term[None, ...],
+    """``sigma + term``, an ω-independent term broadcast over omega; ``donate``: in the
+    point's buffer."""
+    return jax.jit(lambda sigma, term: sigma + (term if term.ndim == sigma.ndim
+                                                else term[None, ...]),
                    out_shardings=sharding,
                    donate_argnums=(0,) if donate else ())
 

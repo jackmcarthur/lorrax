@@ -208,7 +208,8 @@ def _w_program(mesh_xy, route, same, m, nc, n, nt, nq, kcarrier, weights_fn):
 _SECTOR_NODES = {}
 
 
-def sector_node(left, right, keys, meta, mesh_xy, w_tables, band_axis, *, static=False):
+def sector_node(left, right, keys, meta, mesh_xy, w_tables, band_axis, *, static=False,
+                brackets=None):
     """One endpoint class's Σ node on the sub-tile engine (``gw.subtile_stream``), row pass by row pass.
 
         Σ_mn(k) = Σ_{μ ∈ passes} Σ_ν ψ*_m(μ) [Σ_AB γ̃_A G γ̃_B† ⋆ W_AB](k)_{μν} ψ_n(ν)
@@ -242,14 +243,23 @@ def sector_node(left, right, keys, meta, mesh_xy, w_tables, band_axis, *, static
     interactions, loads)``: the left operands placed by
     :func:`sector_left_operands`, the right by :func:`sector_right_operands`,
     ``interactions`` a :class:`ParentW` and ``loads`` the node's placed tables.
+
+    ``brackets`` (the band-extrapolation plan's disjoint band brackets,
+    ``gw.ppm_pipeline.plan_sigma_band_brackets``): the Green band sum is split
+    as the scalar Σ τ kernel splits it (``ppm_tau_kernel.bracket_selectors``).
+    Inside each row pass every live bracket builds its own Green over its own
+    bands (the active-range GEMM) and runs its own mode-8 convolution against
+    the same W(t) rows, one bracket's Green at a time; the node returns the
+    brackets on a leading axis.  W(t) is formed once per node.
     """
     from distrib_la import gemm_plan
     from common.contract_bands import contract_bands_block_reshard
     from common.fft_helpers import make_kconv_lorentz_unfold
     from common.gamma_matrices import gamma_perm_phase_host
     from gw.cohsex_sigma import lorentz_class_vertices
-    from gw.greens_function_kernel import (build_G_parents, _weighted_tau_phases,
+    from gw.greens_function_kernel import (build_G_parents, build_G_tau, _weighted_tau_phases,
                                            has_antiunitary_rows)
+    from gw.ppm_tau_kernel import bracket_selectors
     from symmetry_maps import device_load_tables
     from gw.subtile_stream import (orbit_cuts, plan_windows, scan_passes, window_green_rows,
                                    window_load, window_rows, window_tables)
@@ -262,8 +272,10 @@ def sector_node(left, right, keys, meta, mesh_xy, w_tables, band_axis, *, static
     nb_sig = int(band_axis.padded)
     kgrid = tuple(int(v) for v in meta.kgrid)
     w_tables = tuple(w_tables)
+    selectors = None if brackets is None else tuple(
+        (int(lo), None if hi is None else int(hi)) for lo, hi in brackets)
     key = (mesh_xy, id(plans[0]), id(plans[1]), (n_parent, nb, m, n, ns), nb_sig, tuple(keys),
-           kgrid, int(meta.nk_tot), tuple(map(id, w_tables)), bool(static))
+           kgrid, int(meta.nk_tot), tuple(map(id, w_tables)), bool(static), selectors)
     hit = _SECTOR_NODES.get(key)
     if hit is not None:
         return hit[1]
@@ -288,8 +300,10 @@ def sector_node(left, right, keys, meta, mesh_xy, w_tables, band_axis, *, static
     # One window shape for every pass: host tables give the shapes, each pass
     # reads the placed tables' cut (subtile_stream.window_load).
     cut = (lambda t, k: t) if whole else (lambda t, k: window_tables(t, R, px, k))
+    # A bracket's Green contracts only its own bands (the active-range GEMM).
     gemm = gemm_plan(mesh_xy, m=px * R * ns, k=nb, n=n * ns, nq=n_parent,
-                     dtype=jnp.complex128, layout='axis', warmup=False)
+                     dtype=jnp.complex128, layout='axis', warmup=False,
+                     **({} if selectors is None else dict(enable_active_range=True)))
     kconv = tuple(make_kconv_lorentz_unfold(
         mesh_xy, kgrid, cut(g_tables, ns), left_vertices=vertices[0],
         right_vertices=vertices[1], store_rows=plans[0].parent_full_rows,
@@ -316,34 +330,64 @@ def sector_node(left, right, keys, meta, mesh_xy, w_tables, band_axis, *, static
     def spatial(xn, yr, xr, yn, energies, weight, reference, time, interactions, loads):
         # xn, xr: the left band-complete ψ rows and projection rows; yr, yn: the
         # right Green operand and projection operand; ``loads`` the placed tables.
-        phases = _weighted_tau_phases(energies, 1j*time, e_ref=reference, band_weight=weight)
+        if selectors is None:
+            phases = _weighted_tau_phases(energies, 1j*time, e_ref=reference, band_weight=weight)
+        else:
+            bracketed = bracket_selectors(weight, selectors)
         hole = int(interactions.hole)
         g_load, w_load = loads[0], loads[1][hole]
         zero = jax.lax.with_sharding_constraint(
             jnp.zeros((1, px * py * n_parent, nb_sig, nb_sig), jnp.complex128), partial_spec)
 
-        def one_pass(acc, W, Wt, rows, left_p, g_pass, w_pass, rows_live=None):
-            green = build_G_parents(rows, None, phases=phases, layout='axis', gemm=gemm,
-                                    k_unfold_plan=plans[0], real_weights=False, right=yr)
+        def contract(acc, green, W, Wt, left_p, g_pass, w_pass, rows_live):
             # ``rows_live``: a padded window's live rows [lo, hi), skipped outside.
             sigma = kconv[hole](green.G, green.transpose, W, Wt,
                                 conj_partner=green.conj_partner, load=g_pass, w_load=w_pass,
                                 live=rows_live)
             return project.accumulate((jnp.conj(left_p), yn), sigma, acc=acc)
+
+        def one_pass(acc, W, Wt, rows, left_p, g_pass, w_pass, rows_live=None):
+            if selectors is None:
+                green = build_G_parents(rows, None, phases=phases, layout='axis', gemm=gemm,
+                                        k_unfold_plan=plans[0], real_weights=False, right=yr)
+                return contract(acc, green, W, Wt, left_p, g_pass, w_pass, rows_live)
+            out = []
+            for b, (sel, band_range, live) in enumerate(zip(*bracketed)):
+                if b:
+                    # One bracket's Green at a time.
+                    prev, rows = jax.lax.optimization_barrier((tuple(out), rows))
+                    out = list(prev)
+
+                def add(acc, sel=sel, band_range=band_range, rows=rows):
+                    green = build_G_tau(rows, None, energies, 1j*time, e_ref=reference,
+                                        band_weight=sel, layout='axis', gemm=gemm,
+                                        k_unfold_plan=plans[0], band_range=band_range,
+                                        trim_zero_bands=True, unfold=False, real_weights=False,
+                                        right=yr)
+                    return contract(acc, green, W, Wt, left_p, g_pass, w_pass, rows_live)
+                out.append(jax.lax.cond(live, add, lambda a: a, acc[b]))
+            return tuple(out)
+        accs = zero if selectors is None else (zero,) * len(selectors)
         W, Wt = interactions.W, interactions.partner
         if whole:
-            return finish(one_pass(zero, W, Wt, window_green_rows(xn, mesh_xy), xr, g_load, w_load))
-
-        def step(s, lo, hi, acc):
-            # The pass's window: W's and the ψ rows, the projection rows zeroed
-            # outside the live rows, and the tables cut there.
-            return one_pass(acc, *(window_rows(w, mesh_xy, s, R, axis=1, spec=w_spec) for w in (W, Wt)),
-                            window_green_rows(xn, mesh_xy, s, R),
-                            window_rows(xr, mesh_xy, s, R, axis=3, live=(lo, hi)),
-                            window_load(g_load, mesh_xy, s, lo, hi, R, ns),
-                            window_load(w_load, mesh_xy, s, lo, hi, R, n_a),
-                            jnp.stack([lo, hi]).astype(jnp.int32))
-        return finish(scan_passes(windows, step, zero))
+            accs = one_pass(accs, W, Wt, window_green_rows(xn, mesh_xy), xr, g_load, w_load)
+        else:
+            def step(s, lo, hi, acc):
+                # The pass's window: W's and the ψ rows, the projection rows zeroed
+                # outside the live rows, and the tables cut there.
+                return one_pass(acc, *(window_rows(w, mesh_xy, s, R, axis=1, spec=w_spec)
+                                       for w in (W, Wt)),
+                                window_green_rows(xn, mesh_xy, s, R),
+                                window_rows(xr, mesh_xy, s, R, axis=3, live=(lo, hi)),
+                                window_load(g_load, mesh_xy, s, lo, hi, R, ns),
+                                window_load(w_load, mesh_xy, s, lo, hi, R, n_a),
+                                jnp.stack([lo, hi]).astype(jnp.int32))
+            accs = scan_passes(windows, step, accs)
+        if selectors is None:
+            return finish(accs)
+        return jax.lax.with_sharding_constraint(
+            jnp.stack([finish(acc) for acc in accs]),
+            NamedSharding(mesh_xy, P(None, None, 'x', 'y')))
     spatial.price = price
     node = SimpleNamespace(spatial=spatial, loads=loads, key=key + (tuple(windows),), plans=plans)
     while len(_SECTOR_NODES) >= 16:
@@ -393,14 +437,15 @@ def sector_right_operands(family, band_axis, mesh_xy):
     return _place_right(mesh_xy)(yr, pad_to_axis(yn, band_axis, axis=3))
 
 
-def sector_tau_factory(left, right, keys, meta, mesh_xy):
+def sector_tau_factory(left, right, keys, meta, mesh_xy, brackets=None):
     """Bind Gamma_A G_AB(t) Gamma_B to the window executor: the class's :func:`sector_node`
     reading W(t)'s particle and hole branches.  The caller places the left operands
     band-complete once per Σ call (``ppm_tau_kernel.sigma_subtile_operands``); the right
-    ones are placed here."""
+    ones are placed here.  ``brackets``: the Σ call's band brackets (the executor's own)."""
     def factory(synthesis, band_axis):
         w_tables = tuple(synthesis.w_tables)
-        node = sector_node(left, right, keys, meta, mesh_xy, w_tables, band_axis)
+        node = sector_node(left, right, keys, meta, mesh_xy, w_tables, band_axis,
+                           brackets=brackets)
         right_g, right_p = sector_right_operands(right, band_axis, mesh_xy)
         return SynthesisTau(node.spatial, synthesis, right_g, right_p, synthesis.native,
                             f'sigma.sector.tau.{keys[0]}', meta, node.key, (*node.plans, *w_tables),
@@ -639,14 +684,25 @@ def compute_sector_sigma(handle, families, bases, meta, mesh_xy, *,
     ``linalg`` (the deck's resolved dense layout) places each sector's W(τ)
     synthesis as it places the scalar model's (:func:`sector_synthesis`).
     The scalar charge entry is unchanged. No model is kept across SC maps.
+
+    Band brackets (``options['band_brackets']``, the band-extrapolation plan)
+    split the CC class's Green band sum only (:func:`sector_node`): the result
+    is CC's band-count cube (``gw.ppm_sigma.BandCountCube``), and TT, CT, TC
+    and the W∞ − V constant are its ``term``, the same at every count.  The
+    fit's differences then see CC alone and the extrapolated Σ carries the
+    other classes once, at their sum to N.  The β = 3 tail law is the charge
+    vertex's; the current classes are c⁻² of CC and their tails smaller still
+    (docs/theory/band-extrapolation.md#four-current).
     """
     from file_io.shared_pole_store import (ResidentSectorModel, open_shared_pole_model,
                                            validate_shared_pole_sector_manifest)
+    from gw.ppm_sigma import BandCountCube
     from .sigma import compute_sigma_c_mpa_omega_grid
     if handle.get('representation')!='sector-ordered-ph':
         raise ValueError('GATE shared_pole_sectors: missing ordered sector handle')
     if families[1] is None or len(bases)!=2:
         raise ValueError('GATE shared_pole_sectors: both endpoint families are required')
+    brackets=options.get('band_brackets')
     resident={name:sector['path'] for name,sector in handle['sectors'].items()
               if isinstance(sector['path'],ResidentSectorModel)}
     manifest=validate_shared_pole_sector_manifest(handle['path'],
@@ -670,7 +726,7 @@ def compute_sector_sigma(handle, families, bases, meta, mesh_xy, *,
         census.append(tuple(np.asarray(a) for a in jax.device_get((poles,counts))))
     rule_census=([np.concatenate([p[q,:int(c[q])] for p,c in census]) for q in range(len(census[0][1]))],
                  [sum(int(c[q]) for _,c in census) for q in range(len(census[0][1]))])
-    total=None
+    total=counts=None
     currents=[None,None]
     for names,endpoints in ((('CC','CC'),(0,0)),(('TT','TT'),(1,1)),
                             (('CT_C','CT_T'),(0,1)),(('CT_T','CT_C'),(1,0))):
@@ -693,10 +749,16 @@ def compute_sector_sigma(handle, families, bases, meta, mesh_xy, *,
                 bound.append(builder)
                 stack.callback(builder.close)
                 return builder
+            # Only CC's band sum is bracketed (the extrapolated class).
+            charge=names==('CC','CC')
             context=dict(schedule=lambda _header:dict(route='sector-panels'),
                 synthesis=synthesis,rule_census=rule_census,
-                tau_kernel=sector_tau_factory(families[a],families[b],keys,meta,mesh_xy))
+                tau_kernel=sector_tau_factory(families[a],families[b],keys,meta,mesh_xy,
+                                              brackets=brackets if charge else None))
             opts=dict(options)
+            if not charge:
+                opts.pop('band_brackets',None)
+                opts.pop('band_counts',None)
             sessions=opts.pop('fixed_quadrature_session',None)
             if sessions is not None:opts['fixed_quadrature_session']=sessions.setdefault('_'.join(names),{})
             value=compute_sigma_c_mpa_omega_grid(families[a],sectors[names[0]]['path'],meta,mesh_xy,
@@ -708,7 +770,10 @@ def compute_sector_sigma(handle, families, bases, meta, mesh_xy, *,
                 shell=on_shell(value)
                 currents[channel]=(shell if currents[channel] is None
                                    else currents[channel]+shell)
-            total=value if total is None else replace(total,sigma_c_kij=total.sigma_c_kij+value.sigma_c_kij)
+            if isinstance(value.sigma_c_kij,BandCountCube):
+                counts=value
+            else:
+                total=value if total is None else replace(total,sigma_c_kij=total.sigma_c_kij+value.sigma_c_kij)
     # Resident models are read once per map: release them and their stage.
     # An SC map holds CC for the accepted final map's W0 persist
     # (sector_static_wc); the next map's entry or the SC end releases it.
@@ -737,6 +802,9 @@ def compute_sector_sigma(handle, families, bases, meta, mesh_xy, *,
     # the existing semantic band-axis owner before broadcasting in omega.
     constant=pad_to_axis(pad_to_axis(constant,total.band_axis,axis=1),total.band_axis,axis=2)
     result=replace(total,sigma_c_kij=total.sigma_c_kij+constant[None])
+    if counts is not None:
+        # TT, CT, TC and W∞ − V enter every CC count alike.
+        result=replace(counts,sigma_c_kij=replace(counts.sigma_c_kij,term=result.sigma_c_kij))
     return (result, tuple(currents)) if on_shell is not None else result
 
 

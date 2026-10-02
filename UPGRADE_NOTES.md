@@ -3,6 +3,20 @@
 User-visible changes, newest first. Binding rulings behind the breaking
 changes live in `docs/architecture/decisions.md`.
 
+## 2026-10-02 — band extrapolation on the four-current Σ (`full_shared_pole`)
+
+`bispinor_gw = full_shared_pole` now uses `use_band_extrapolation` (on by
+default), as the scalar shared pole and `bare_transverse` already do. The CC
+class's Green band sum is split into the three brackets and extrapolated by
+the pooled `spectral_shell` fit. TT, CT and TC, which are c⁻² of CC, are
+summed to N as before ([four-current Σ](docs/theory/band-extrapolation.md#four-current)).
+Every SP-full run that does not set `use_band_extrapolation = false` moves
+once. A deck with `number_bands_sigma` < 2·n_occ now refuses at startup:
+raise the band count or set the key to false. Decks that set it to false are
+bitwise. On Fe 4³ bispinor SP-full SC at 36 bands, map 0 eqp0 within E_F ± 10 eV
+moves by a median of 342 meV (at most 891 meV, mean −385 meV). Σ τ costs 13–20 %
+more per map, and the map wall 3–6 % more; device peak is unchanged.
+
 ## 2026-10-02 — "door" is gone from the code and the logs
 
 The term "door" is replaced everywhere. A mathdx k-convolution call site and its

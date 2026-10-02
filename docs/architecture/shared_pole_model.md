@@ -453,7 +453,9 @@ unfolds the parent pair only at V's q parents and at their $-q$ rows
 **Band brackets.** With `use_band_extrapolation` (on by default) the scalar
 consumer splits the Green band sum into the three brackets of
 [band extrapolation](../theory/band-extrapolation.md) inside the same window
-executable and applies the pooled fit; a sector (bispinor) consumer does not.
+executable and applies the pooled fit. A sector (bispinor) consumer splits
+the CC class's Green band sum the same way and adds TT, CT and TC to every
+count ([four-current Σ](../theory/band-extrapolation.md#four-current)).
 
 **Γ head** (`gw.shared_pole_head`). `head_correction = full` evaluates the
 current TRS body at Γ one frequency at a time, folds the common head wings

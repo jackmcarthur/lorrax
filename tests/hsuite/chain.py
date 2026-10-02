@@ -197,8 +197,9 @@ write_poles = true
 # rewrites the tmp/ restart the scalar restarted steps read.  SP-full
 # (bispinor_gw = full_shared_pole: ordered CC/CT/TC/TT sector poles, direct
 # four-current Gamma head) through the SC driver for two maps, with its own
-# kinetic-balance kin_ion, the per-map head (dft_velocity) and the live
-# four-current density (density_self_consistent, required).  Map 0 is the
+# kinetic-balance kin_ion, the per-map head (dft_velocity), the live
+# four-current density (density_self_consistent, required) and the default
+# band extrapolation (the CC class's band sum).  Map 0 is the
 # one-shot, so there is no separate one-shot stage (suite wall).  The
 # transverse zeta is fitted on the charge centroid set: one kmeans stage, and
 # any point set is a legal ISDF basis for the current rows.

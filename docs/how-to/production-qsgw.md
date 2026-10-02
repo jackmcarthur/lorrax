@@ -39,7 +39,7 @@ its stop rules in [self-consistency](../self_consistency.md); the W model in
   N for χ₀, which is not extrapolated.
 - **Band extrapolation.** On by default (`use_band_extrapolation`). Σ's G sum
   is extrapolated past N by the pooled `spectral_shell` fit, on the shared-pole
-  Σ as on GN/HL-PPM. The exponent is fixed at β = 3 and only the shell offset
+  Σ (scalar and both bispinor routes) as on GN/HL-PPM. The exponent is fixed at β = 3 and only the shell offset
   Ω is fitted. Ω is bounded below on every map so that every requested state
   keeps a tail ([band extrapolation](../theory/band-extrapolation.md#the-model)).
   With extrapolation on, N ≥ 2·n_occ, or the run refuses at startup.

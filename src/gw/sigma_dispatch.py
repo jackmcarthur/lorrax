@@ -946,8 +946,8 @@ def _validate_sigma_stage(
 
 def validate_band_extrapolation(config, mode, *, print_fn=None):
     """Refuse unsupported explicit requests before screening; report at Sigma."""
-    # AUTO-DISABLED, LOUDLY: a stage with no bracketed pole sum (static, the
-    # four-current sector bank, or a bispinor MPA fit) keeps the full-band sum.
+    # AUTO-DISABLED, LOUDLY: a stage with no bracketed pole sum (static, or a
+    # bispinor MPA fit) keeps the full-band sum.
     scalar_mpa = mpa_sigma_runs_scalar_executor(config)
     if bool(config.sigma.band_extrapolation) and not (
             band_extrapolation_is_consumable((mode,), scalar_mpa=scalar_mpa)):
@@ -975,20 +975,19 @@ def validate_band_extrapolation(config, mode, *, print_fn=None):
                 f"stage refusing here is compute_mode = "
                 f"{getattr(mode, 'value', mode)}.  The band-convergence "
                 f"extrapolation is wired into the bracketed pole-sum Σ_c "
-                f"(gn_ppm / hl_ppm, scalar mpa, and the bispinor charge "
-                f"route bispinor_gw = bare_transverse with the shared "
-                f"pole), and for a static stage "
+                f"(gn_ppm / hl_ppm, scalar mpa, and the bispinor shared-pole "
+                f"routes bispinor_gw = bare_transverse and "
+                f"full_shared_pole), and for a static stage "
                 f"this is a CORRECTNESS "
                 f"guard rather than a wiring gap: the 1/N -> 0 limit point is "
                 f"mode-dependent, and on a static Coulomb hole it overshoots "
                 f"the exact answer by ~340 meV and gets WORSE with more bands "
                 f"(MEASURED against BerkeleyGW's exact static CH: 94.9 meV MAE "
                 f"at nband 60 rising to 288.2 at nband 124, against 171.3 "
-                f"falling to 32.8 for GN-PPM).  The four-current sector bank "
-                f"(bispinor_gw = full_shared_pole) and a bispinor MPA fit are "
+                f"falling to 32.8 for GN-PPM).  A bispinor MPA fit is "
                 f"not extrapolated: unvalidated.  Use "
-                f"compute_mode = gn_ppm, a scalar mpa, or the bispinor "
-                f"charge shared-pole route, add "
+                f"compute_mode = gn_ppm, a scalar mpa, or a bispinor "
+                f"shared-pole route, add "
                 f"a gnppm stage to the sc_stage_N_type ladder, or set "
                 f"use_band_extrapolation = false.  (This deck NAMES the key; "
                 f"had it been left at its default the feature would have "
@@ -1008,14 +1007,12 @@ def validate_band_extrapolation(config, mode, *, print_fn=None):
         if getattr(mode, "is_dynamic", False):
             because = (
                 "MPA is dynamic, so the static Coulomb-hole measurement is "
-                "NOT the reason here.  bispinor_gw = full_shared_pole sums "
-                "CC, TT and both CT endpoints on their own pole sets "
-                "(mpa.sector_sigma) with no bracket plan, and a bispinor MPA "
-                "fit is unmeasured; the 1/N -> 0 limit has never been "
-                "measured on either, so extrapolating would be an "
-                "unvalidated claim, not a correction.  The bispinor charge "
-                "route (bare_transverse + shared pole) runs the scalar "
-                "executor and IS extrapolated")
+                "NOT the reason here.  A bispinor MPA fit is unmeasured; the "
+                "1/N -> 0 limit has never been measured on it, so "
+                "extrapolating would be an unvalidated claim, not a "
+                "correction.  The bispinor shared-pole routes "
+                "(bare_transverse and full_shared_pole) run the scalar "
+                "executor and ARE extrapolated")
         else:
             because = (
                 "The 1/N -> 0 limit is MODE-DEPENDENT and is wrong for a "
@@ -1436,6 +1433,15 @@ def _compute_mpa_sigma(
     import time
     sweep_started = time.monotonic()
     plan = None
+    # Every MPA pole sum brackets its Green band sum exactly as the PPM route
+    # does (one executor, one plan owner, one pooled fit): the scalar body,
+    # and the four-current body's CC class (mpa.sector_sigma).
+    if bool(config.sigma.band_extrapolation) and band_extrapolation_is_consumable(
+            (ComputeMode.MPA,), scalar_mpa=mpa_sigma_runs_scalar_executor(config)):
+        plan = plan_sigma_band_brackets(
+            config, wfns, meta, print_fn=print_fn,
+            where="sigma_dispatch MPA plan seam")
+        body_options.update(band_brackets=plan.bounds, band_counts=plan.counts)
     if sector_handle.get("representation") == "sector-ordered-ph":
         from .mpa.sector_sigma import compute_sector_sigma
         on_shell = None
@@ -1464,14 +1470,6 @@ def _compute_mpa_sigma(
         else:
             body = sector_result
     else:
-        # The scalar pole sum brackets its Green band sum exactly as the PPM
-        # route does (one executor, one plan owner, one pooled fit).
-        if bool(config.sigma.band_extrapolation) and band_extrapolation_is_consumable(
-                (ComputeMode.MPA,), scalar_mpa=mpa_sigma_runs_scalar_executor(config)):
-            plan = plan_sigma_band_brackets(
-                config, wfns, meta, print_fn=print_fn,
-                where="sigma_dispatch MPA plan seam")
-            body_options.update(band_brackets=plan.bounds, band_counts=plan.counts)
         body = compute_sigma_c_mpa_omega_grid(
             wfns, fit_path, meta, mesh_xy, sigma_w_model=sigma_w_model,
             fit_identity=fit_identity, fit_digest=fit_digest,
