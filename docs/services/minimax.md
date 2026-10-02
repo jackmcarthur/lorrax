@@ -74,7 +74,7 @@ sampled gate is missed. It is a sampled fit, not a continuum certificate.
 `gw.minimax_screening` converts units and appends zero even weights on the
 added nodes; `gw.w_isdf.compute_chi0_imag_ordered` consumes even and odd
 weights on one node axis. The derivation is in the
-[non-Hermitian GN-PPM memo](../dev/notes/DERIVATION_gnppm_nonhermitian.md).
+[non-Hermitian GN-PPM memo](../theory/gn-ppm-nonhermitian.md).
 
 ## Response-bank rule sessions
 

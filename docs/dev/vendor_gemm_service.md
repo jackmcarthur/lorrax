@@ -98,7 +98,7 @@ announces and falls back to `auto`. Applied through the shared
 `cpp/common/mkl_thread_pin.h` (a thread-local `mkl_set_num_threads_local`
 resolved by `dlsym`; a no-op on non-MKL BLAS, where `OMP_NUM_THREADS`
 governs). Unlike the ScaLAPACK handlers, which cap their team because they are
-collective ([linalg_ffi](linalg_ffi.md#inside-the-scalapack-handlers)), this
+collective ([distrib_la backends](../services/distrib_la/backends.md#inside-the-scalapack-handlers)), this
 is a rank-local call that wants the full team.
 
 ## Gating a change

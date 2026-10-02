@@ -86,7 +86,7 @@ aliases of `unfold_isdf_operator`, `spinor_rotation_for_sym_row`,
   (a broken or inconclusive verdict refuses); `0`/`off` refuses.
   `LORRAX_TRS_TOL` and `LORRAX_TRS_MAX_K` tune the measurement. The
   environment never grants a symmetry convention;
-  [`docs/dev/env_vars.md`](../dev/env_vars.md) owns the definitions.
+  [`docs/reference/env_vars.md`](../reference/env_vars.md) owns the definitions.
 * **`_star_conj_flags` is the single conjugation predicate:**
   `trs(member) XOR trs(reference_row)`. It is read by `star_broadcast`'s
   `'star_row'` branch, by `star_spread`, and twice by `KStarMap`. Nothing

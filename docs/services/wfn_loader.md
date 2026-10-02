@@ -66,7 +66,7 @@ grid; consumers decide that against authenticated symmetry metadata
   aliasing pad slots onto Γ. Consumers must still carry `ngk_valid`.
 * **Backends are byte-identical** for the same request (`np.array_equal`, no
   tolerance, on hostile geometry and on both platforms). That is why
-  `LORRAX_WFN_BACKEND` (owned by [`env_vars.md`](../dev/env_vars.md)) may
+  `LORRAX_WFN_BACKEND` (owned by [`env_vars.md`](../reference/env_vars.md)) may
   force one.
 * **Refusals.**
   - `backend='phdf5_host'` is deleted and refuses; an unknown backend refuses.
