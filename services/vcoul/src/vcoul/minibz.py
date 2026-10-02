@@ -63,7 +63,7 @@ THE FOURTH COPY OF THE DRAW GEOMETRY IS GONE (verified 2026-08-22).
 ``bse.vq_interp``'s rank-parallel ``fold_in`` draw used to spell the
 frac→Cartesian map, the Voronoi wrap and the mini-BZ affine locally; it
 now calls :func:`minibz_frac_to_cart`, :func:`wrap_points_to_voronoi` and
-:func:`minibz_cell_affine` through the door (``vq_interp.py`` ~:1738).
+:func:`minibz_cell_affine` through the public API (``vq_interp.py`` ~:1738).
 Its own comment records the measurement that licensed the swap —
 bit-identical to the local spellings over 200 random cells, both helpers
 exactly equal in float64 — so the BSE fixtures did not move.  What is

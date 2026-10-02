@@ -18,10 +18,10 @@ family of quadrature rules:
 ===========  ==========================  =============================
 
 Three of those cells have solvers.  Writing the table down as data is what
-lets :func:`~minimax.door.family_for_character` refuse the empty cell BY
+lets :func:`~minimax.serving.family_for_character` refuse the empty cell BY
 NAME (F6) instead of failing somewhere inside a kernel.
 
-:class:`FamilySpec` carries two names: ``name`` is the door's ``family=``
+:class:`FamilySpec` carries two names: ``name`` is :func:`serve`'s ``family=``
 argument (``noncrossing`` / ``crossing`` / ``noncrossing_imag`` /
 ``complex_laplace``), and ``route`` is the mathematical cell from the
 design's R4 table (``exponential_sum`` / ``sine_sum`` /
@@ -48,7 +48,7 @@ class TargetSpec:
 
 @dataclass(frozen=True)
 class FamilySpec:
-    """One cell of R4's 2×2, plus what the door needs to serve it."""
+    """One cell of R4's 2×2, plus what :func:`serve` needs to serve it."""
 
     #: The ``family=`` argument of :func:`minimax.serve`.
     name: str

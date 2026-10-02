@@ -9,7 +9,7 @@ The restart loaders no longer fall back to bare ``V`` for ``W``: a restart
 without a ready ``W0_qmunu`` requests the static response owner through
 ``bse_loading``; ``read_bse_payload`` still refuses a missing screened body.
 ``_inject_q0_head`` still owns the ``w0_ready`` gate in ONE spelling, so a
-screened head can never reach an unscreened tile by any other door.
+screened head can never reach an unscreened tile by any other path.
 
 DEFERRAL IS THE SECOND, SEPARATE QUESTION, and it is deliberately not spelled
 as the first.  When a coarse→fine densification is pending, W's head belongs on

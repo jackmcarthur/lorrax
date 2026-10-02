@@ -1,6 +1,6 @@
 """``distrib_la`` — distributed dense linear algebra over a JAX device mesh.
 
-One door for ``polar_factor``, ``eigh``, ``cholesky``, ``solve_lu`` and
+One public API for ``polar_factor``, ``eigh``, ``cholesky``, ``solve_lu`` and
 ``matmul`` on an ``('x','y')`` device mesh, over four backend families:
 **scalapack/PBLAS** (CPU preferred),
 **slate** (CPU fallback where it is not broken; ROCm always,
@@ -9,7 +9,7 @@ declared-untested), **cusolvermp/cuBLASMp** (CUDA preferred) and **native**
 which library runs is a resolved fact it can read but never has to
 branch on.
 
-THE PACKAGE IS THE DOOR.  There is no separate facade module: everything
+THE PACKAGE IS THE PUBLIC API.  There is no separate facade module: everything
 a consumer needs is a top-level name here, and importing
 ``distrib_la.<submodule>`` from outside is a layering violation the
 monorepo's ``tests/test_layering.py`` fails on.  That is what makes

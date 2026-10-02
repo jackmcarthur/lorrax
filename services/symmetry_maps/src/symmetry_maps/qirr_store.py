@@ -71,9 +71,9 @@ provenance and owes the tables the same validation.  Underscoring them
 would not keep that store out; it would only make it copy them, and a
 copied validator is a second answer to "do these tables describe this
 tensor", differing on the day one of them gains a check.  They are on
-the package door for the same reason ``vcoul`` puts
+the public API for the same reason ``vcoul`` puts
 ``_minibz_kernel_bare`` on its: a consumer reaching
-``symmetry_maps.qirr_store`` for them is a past-the-door edge, and
+``symmetry_maps.qirr_store`` for them is a past-the-API edge, and
 ``tests/test_layering.py`` rule 6 counts those.
 
 THE μ PAD NEVER REACHES DISK (SHARDING_RULES §2).  The producer bakes a

@@ -32,7 +32,7 @@ def _make_ring_rung(mesh_xy: Mesh, kgrid, w_decode):
 
     ``T`` ``(b, μ, ν, t, s, nk)`` (μ on 'x', ν on 'y'), ``W_R``
     ``(μ, ν, kx, ky, kz)`` already in R space.  The convolution is ONE call of
-    the k-convolution router's k-minor door (nvidia-mathdx on CUDA, the plan
+    the k-convolution router's k-minor factory (nvidia-mathdx on CUDA, the plan
     route on cpu) whose store emits the decode's ``(b, k, t, μ, s, ν)`` layout
     (``out_layout=1``); ``w_decode`` is the caller's
     ``contract_bands_block_reshard(mesh, extra="leading")``.

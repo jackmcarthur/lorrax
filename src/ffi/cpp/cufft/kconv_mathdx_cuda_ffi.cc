@@ -829,7 +829,7 @@ __device__ __forceinline__ void lrx_unfold_direct(
 // indices from shared memory, then two shared-memory passes finish the typed unfold: per (k,
 // operand group, column d) the phases (mph * G) * nph and left = U g; per (k, operand group, row
 // a) left U^dagger.  The products and their order are lrx_unfold_pair's and lrx_spin_row's, so
-// the tile is the register load's bit for bit.  The right action is U itself (neither door passes
+// the tile is the register load's bit for bit.  The right action is U itself (neither kconv call passes
 // spin_r) and the whole spin group is loaded (NA == NS).
 #include "kbox_stage.cuh"
 static_assert(NR == NS && NA == NS, "the tile tables load whole Green spin groups");
@@ -1223,7 +1223,7 @@ struct LorArgs {
 // Lorentz components per endpoint) through its own unfold tables tw, on the load of its inverse
 // transform (mode 9's WedgeLoad): no full-q W and no full-grid W_R.  A pair's nA*nB W columns sit
 // beside its NS*NS Green columns in the tile; the vertex Mid reads W_R = sw * IFFT(unfolded W)
-// from the bank, the value mode 9 stores, so the result is the two-door chain's bit for bit.
+// from the bank, the value mode 9 stores, so the result is the two-call chain's bit for bit.
 #ifndef LRX_WA
 #define LRX_WA 0
 #define LRX_WB 0
@@ -2105,7 +2105,7 @@ static std::string split_tile_refusal(int mode, int nkx, int nky, int nkz, int n
 // ctx, mode, nkx, nky, nkz, ns, nsr, f32, variant (mode 11: the static completion; mode 7: its output spin
 // block; mode 8: wa*8 + wb, the interaction's Lorentz widths when it is read from its parents, 0 = V_R)
 using Key = std::tuple<CUcontext, int, int, int, int, int, int, int, int>;
-constexpr int kLiveBit = 1 << 16;                  // build(variant | kLiveBit): the door's live program
+constexpr int kLiveBit = 1 << 16;                  // build(variant | kLiveBit): the kconv call's live program
 static std::mutex g_mu;
 static std::map<Key, Built> g_cache;
 static std::map<Key, std::string> g_fail;
@@ -2165,7 +2165,7 @@ static ffi::Error build(int mode, int nkx, int nky, int nkz, int ns, bool f32,
         if (cr != CUDA_SUCCESS || ctx == nullptr) return fail("cuCtxGetCurrent", cu_err(cr));
     }
     const Key key{ctx, mode, nkx, nky, nkz, ns, nsr, f32 ? 1 : 0, variant};
-    // kLiveBit: a padded pass's program (the door's live operand present), built apart so the plain
+    // kLiveBit: a padded pass's program (the kconv call's live operand present), built apart so the plain
     // program keeps no live bounds in registers (kbox_stage.cuh Live, LRX_LIVE).
     const int live_prog = (variant & kLiveBit) ? 1 : 0;
     variant &= ~kLiveBit;
@@ -2275,11 +2275,11 @@ static ffi::Error build(int mode, int nkx, int nky, int nkz, int ns, bool f32,
     // columns.  Mode 8 takes the single arm when a spin group fits and the split arm otherwise: the
     // group pencil forms each member on its own thread (3766 vs 2156 us at 8^3 in the standalone
     // bench for a per-(k, pair) Mid).  The single arm keeps the resident kernel's per-(k, pair)
-    // group Mid: a member Mid measured 0.76-0.94x at the CrI3 6x6 and Fe 4^3 ns 4 doors (V staged
+    // group Mid: a member Mid measured 0.76-0.94x at the CrI3 6x6 and Fe 4^3 ns 4 kconv calls (V staged
     // or not), since the register load fixes one block per SM either way.  Its load holds a spin
     // group per thread (48 complex values at ns 4), so it runs 256 threads, not the plan's 512 (a
     // 128-register cap would spill it).  Kept 2026-09-25 (FP): mode 3 is 90% of the
-    // FFT-family time of an Fe 8^3 shared-pole SC map, and the stage is 1.14-1.23x at its door
+    // FFT-family time of an Fe 8^3 shared-pole SC map, and the stage is 1.14-1.23x at its kconv call
     // (claim 2779); mode 8's split arm serves 10^3-16^3 at ns 4.
     const bool kbox_rows = (mode >= 2 && mode <= 5) || mode == 9;
     const bool kbox_single_only = mode == 4 || mode == 5;
@@ -2323,7 +2323,7 @@ static ffi::Error build(int mode, int nkx, int nky, int nkz, int ns, bool f32,
             // registers), W_R's plane (212 registers) at 256.  Plane tiles of the most whole groups
             // the opt-in memory holds (one block per SM either way).  The vertex pencil holds a pair's
             // ss columns on one warp and stages nothing (its block stage of nkx * ty * (ss + 17)
-            // elements refused the two-spinor Dirac-quarter doors at 16^3-20^3 and held 2-4 warps
+            // elements refused the two-spinor Dirac-quarter kconv calls at 16^3-20^3 and held 2-4 warps
             // per SM where it fit).
             kb_tr = split_plane_tile(nky, nkz, g.pr(), ss, smem_optin, true);
             kb_threads = 2 * kThreads;
@@ -3671,7 +3671,7 @@ static ffi::Error PlaneFftGather(cudaStream_t stream, ffi::AnyBuffer F, ffi::Any
     if (planes == 0) return ffi::Error::Success();
     const Built* k = nullptr;
     // ns carries (c1, occupied rows): the passes' trip counts and the staging are
-    // compile-time, so every index divisor is a constant.  A door's table is fixed
+    // compile-time, so every index divisor is a constant.  A kconv call's table is fixed
     // for its run, so this is one image per run, as keying on the shape alone was.
     const int64_t row_cap = std::max<int64_t>(1, gd[0]);
     ffi::Error e = build(10, static_cast<int>(nb), static_cast<int>(nc), static_cast<int>(b1),

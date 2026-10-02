@@ -284,7 +284,7 @@ owned by `file_io.commit_state`:
   `rank0_transaction`, clearing the receipt first and setting it last.
   `tagged_arrays` does this for readiness flags and head scalars.
 
-**Read after write.** On a `"w"`/`"a"` handle, a read door that follows
+**Read after write.** On a `"w"`/`"a"` handle, a read method that follows
 writes drains the queue and then calls
 `agree_io_error(stage="SlabIO.read_after_write")` before it touches the file,
 so no rank reads bytes that another rank failed to write. Writes are

@@ -31,7 +31,7 @@ A capability is a service when it has all four of:
 |---|---|---|---|---|
 | **`file_io.slab_io`** | `SlabIO(path, *, mode, mesh)` → `create_dataset` / `write_slab` / `read_slab` / `read_slabs` | the phdf5 handler, its MPI and HDF5, Lustre striping, collective buffering | **no**, by design ([below](#choice)) | [SlabIO](slab_io.md) |
 | **`ffi.io`** | `open_file(path, *, mesh, mode)` → `write_sharded_slab` / `read_sharded_slab` / `read_kchunk_union_sharded` | CUDA or host library, from the mesh's devices | no | [FFI layer §5](ffi_layout.md); SlabIO is its only transport consumer |
-| **`ffi.fft`** (entered through `common.fft_helpers`) | the k-convolution router's doors (`make_fused_conv_kpair`, `make_kconv_klead`, `make_kfft_klead`, …) and `make_flat_k_fft` | nvidia-mathdx on CUDA; FFTW3-ABI plans on cpu | no: the mesh platform decides, and no variable or deck key selects a route | [k-convolution router](ffi_layout.md#k-convolution-router-and-the-mathdx-family) |
+| **`ffi.fft`** (entered through `common.fft_helpers`) | the k-convolution router's factories (`make_fused_conv_kpair`, `make_kconv_klead`, `make_kfft_klead`, …) and `make_flat_k_fft` | nvidia-mathdx on CUDA; FFTW3-ABI plans on cpu | no: the mesh platform decides, and no variable or deck key selects a route | [k-convolution router](ffi_layout.md#k-convolution-router-and-the-mathdx-family) |
 | **`ffi.gemm`** | `gemm_batch(a3, b3)` inside the caller's own `shard_map` | the CBLAS provider, and whether it has a batched entry | no: `LORRAX_BANDS_GEMM_FFI` is on/off, cpu only | `src/ffi/gemm.py` |
 | **`distrib_la`** | `plan(op, mesh_xy, *, backend=…)` → `plan(A_tile)` / `plan.batched(A_stack)`, plus `matmul`, `gemm_plan` | ScaLAPACK, SLATE, cuSOLVERMp, cuBLASMp or native, per op, machine and mesh geometry | **yes**, by design, through deck keys ([below](#choice)) | [`distrib_la`](../services/distrib_la.md) |
 | **`wfn_loader`** | `WfnLoader(path, *, mesh=None, backend='auto')` | `eager` (h5py) or `phdf5` (one collective read through `SlabIO.read_slabs`) | escape hatch only: `LORRAX_WFN_BACKEND` | [`wfn_loader`](../services/wfn_loader.md) |
@@ -44,7 +44,7 @@ A capability is a service when it has all four of:
 
 These packages under `services/` hold one source of truth two or more drivers
 need. Nothing varies underneath them per machine, so they carry no backend
-choice; they are services for property 1 and for the door rule below.
+choice; they are services for property 1 and for the public-API rule below.
 
 | package | owns | contract |
 |---|---|---|
@@ -73,7 +73,7 @@ the report is a defect.
 ### Backends are not services {#ffilinalg}
 
 `distrib_la._scalapack`, `._slate` and `._cusolvermp` are backends of the
-`distrib_la` door. Call sites reach them through `distrib_la.backend_module()`
+`distrib_la` public API. Call sites reach them through `distrib_la.backend_module()`
 or a plan; a `src/` import of one fails `tests/test_layering.py`.
 The distrib_la benches in `services/distrib_la/bench/` import
 `distrib_la._cusolvermp` directly.
@@ -132,10 +132,10 @@ tiles or one large one) belong in the deck.
 `distrib_la` are L3; the single-owner packages take the L1 default), and
 imports run downhill only. Three rules hold at every call site:
 
-* **The package is the door.** A `src/` module imports a service's top-level
+* **The package is the public API.** A `src/` module imports a service's top-level
   package, never a submodule (`tests/test_layering.py` rule 6).
-* **Drivers never name a backend.** The backend is chosen inside a service
-  door, from a deck key or the mesh platform.
+* **Drivers never name a backend.** The backend is chosen inside a service,
+  from a deck key or the mesh platform.
 * **Announce or refuse.** A demotion is announced from the rank it happened
   on; an explicit request that cannot be honoured raises with the reason and
   the fix. Resolve-time checks (platform, geometry, handler probe, grammar)
@@ -155,7 +155,7 @@ cross-rank fingerprint.
 Decide explicitly whether the caller picks the backend, and record why.
 Default to *no*: a dial whose settings are "correct" and "worse in every
 measured respect" is not a choice, and each one costs a router, a vocabulary,
-a deck key and a refusal per door. Add the row to the
+a deck key and a refusal per entry point. Add the row to the
 [inventory](#inventory), the operation and its gate to the
 [kernel operations](ffi_layout.md#kernel-operations) table, and each
 machine's library to [the FFI layer §3a](ffi_layout.md#3a-the-dependency-matrix).

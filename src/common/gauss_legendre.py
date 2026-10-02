@@ -1,4 +1,4 @@
-"""Compatibility door to vcoul's standalone finite-interval rule owner."""
+"""Compatibility re-export of vcoul's standalone finite-interval rule owner."""
 from __future__ import annotations
 
 from ffi import _services

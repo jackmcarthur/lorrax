@@ -590,8 +590,8 @@ def _register_ffi_targets(lib: ctypes.CDLL, platform: str) -> None:
                 raise
 
 
-#: CUDA handlers whose doors are not the k-convolution router, checked at
-#: startup by :func:`require_cuda_handlers`: target -> (symbol, door).  The
+#: CUDA handlers whose Python callers are not the k-convolution router, checked at
+#: startup by :func:`require_cuda_handlers`: target -> (symbol, caller).  The
 #: contour row is registered from ``_CUDA_TARGET_SYMBOLS``; the spin rotation
 #: is registered by its own service, so only its symbol is checked here.
 _CUDA_STARTUP_HANDLERS = {
@@ -608,11 +608,11 @@ def require_cuda_handlers(mesh) -> None:
     if mesh_ffi_platform(mesh) != "CUDA":
         return
     lib = get_lib("CUDA")
-    for target, (symbol, door) in _CUDA_STARTUP_HANDLERS.items():
+    for target, (symbol, caller) in _CUDA_STARTUP_HANDLERS.items():
         if not hasattr(lib, symbol):
             raise RuntimeError(
                 f"GATE ffi-handler: got {loaded_lib_path('CUDA')} without {symbol}; want the "
-                f"handler of {target}, which {door} calls on CUDA; fix: use the sealed bundle, or "
+                f"handler of {target}, which {caller} calls on CUDA; fix: use the sealed bundle, or "
                 "rebuild both legs from this tree and pin them (LORRAX_FFI_SO, LORRAX_FFI_HOST_SO).")
 
 

@@ -1,8 +1,8 @@
 """A node rule evaluated sub-tile by sub-tile: the one loop of the direct χ₀ stream.
 
 The stream integrates ``A[o, q, μ, ν] += Σ_n Σ_s w[s, o, n] P_n^s(q)[μ, ν]``:
-``P_n`` is one rule node's correlation (two parent operands met by a k
-convolution door, its q rows kept), ``s`` its forward and reverse
+``P_n`` is one rule node's correlation (two parent operands met by a
+kconv call, its q rows kept), ``s`` its forward and reverse
 orientation, ``o`` the outputs (value and slope of every sample).  The
 loop is inverted against the tile: for each row pass of the rank's
 ``(μ_X, ν_Y)`` tile, every node is evaluated on that pass only, and its
@@ -13,7 +13,7 @@ rows go straight into the carry.  So
   per node and no exchange inside the node loop;
 - an operand and a correlation exist only as one pass's sub-tile;
 - a pass is a union of whole centroid orbits on every X shard
-  (:func:`orbit_cuts`), so the door's typed unfold reads only the pass's
+  (:func:`orbit_cuts`), so the kconv call's typed unfold reads only the pass's
   own rows;
 - the node-to-output weights act in chunks of nodes through the in-place
   block accumulator (``ffi.contour.contour_block_accumulate_local``); its
@@ -24,9 +24,9 @@ rows go straight into the carry.  So
 
 Sizes come from :data:`runtime.tiles.TILE_BYTES` and the shapes alone
 (:func:`plan_windows`, :func:`plan_passes`); the budget never enters, so no
-result depends on it.  The χ₀ operands and doors are ``gw.w_isdf``'s (the
+result depends on it.  The χ₀ operands and kconv calls are ``gw.w_isdf``'s (the
 response owner), for the charge stream and for the four-current stream
-(Dirac-half quadrant Greens and the mode-11 vertex door per family pair):
+(Dirac-half quadrant Greens and the mode-11 vertex kconv call per family pair):
 nodes in chunks into a carry (:func:`stream_passes`).  The Σ G⋆W convolution
 (``gw.ppm_tau_kernel``, the Σ owner) runs the same passes inside each τ
 node: G(τ) on the pass's ψ rows, W(τ) on the pass's rows of its q parents
@@ -103,7 +103,7 @@ def plan_passes(tables, mesh, *, ns, row_bytes, chunk_bytes, n_nodes, blocks=(Bl
 
     ``chunk_bytes`` are one node's kept rows on the whole local tile, so a
     chunk of nodes fits one tile; ``row_bytes(chunk)`` is one local row's
-    live set at that chunk (the two operands, the door's R-space output and
+    live set at that chunk (the two operands, the kconv call's R-space output and
     its transform, the chunk's kept rows), so a window fits one tile.  The
     passes are equal orbit-aligned windows (:func:`plan_windows`); a rank
     whose rows are one orbit keeps one pass.  ``blocks`` (:class:`Block`)

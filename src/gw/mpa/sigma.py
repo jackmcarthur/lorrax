@@ -304,7 +304,7 @@ def _shared_pole_panel_realizer(meta, header, q_span, *, mesh_xy, tables=None):
     """The physical parent pair of one panel: ``(plus, transposed) -> (W, Wt)`` on its parent rows.
 
     The magnetic little-group realization, then the fixed-q TRS projection,
-    both on the parent tiles.  Nothing is unfolded: the Σ door reads the pair
+    both on the parent tiles.  Nothing is unfolded: the Σ kconv call reads the pair
     through the store's q-wedge load tables (:func:`_shared_pole_q_wedge`),
     ``Wt`` on the antiunitary rows.  Endpoint maps that cross a shard refuse
     (the fused load reads only this rank's parent tile).
@@ -350,7 +350,7 @@ _W_LOADS = {}
 
 
 def _shared_pole_q_wedge(meta, header, *, mesh_xy):
-    """The store's q wedge as the Σ door reads W: ``(wedge, (particle, hole) device loads)``.
+    """The store's q wedge as the Σ kconv call reads W: ``(wedge, (particle, hole) device loads)``.
 
     ``wedge`` is a ``symmetry_maps.QirrOperator`` of tables (no values): the
     store's parent rows ``irr_idx_q`` with the TRS policy's unfold operations,
@@ -466,7 +466,7 @@ def _shared_pole_w_synthesis(io, meta, header, frequencies, schedule, *, mesh_xy
     ``schedule``'s admitted capacity — W_parent = b d(τ) b† and its transpose
     through G's builder, little-group realization, fixed-q projection
     (:func:`_shared_pole_panel_realizer`) — into the parent pair ``(W, Wt)``
-    ``[n_q_irr, m, m]``.  It returns ``(W, Wt, load)``: the Σ door unfolds
+    ``[n_q_irr, m, m]``.  It returns ``(W, Wt, load)``: the Σ kconv call unfolds
     the pair on its load through ``load`` (the particle tables, or on an
     ordered store's valence branch the q-negated ones), so no full-q W is
     formed (TASTE 97).  Parent panels are a static loop, sequenced so that
@@ -781,7 +781,7 @@ def _shared_pole_panel_cost(meta, header, b, c, *, mesh_xy, layout="face", exten
     """Price the new buffers of one b-parent x c-column synthesis panel.
 
     Coordinator ruling12 separates unchanged spatial/ψ/Σ peak regression
-    from this three-U admission.  W stays on the parent rows (the Σ door
+    from this three-U admission.  W stays on the parent rows (the Σ kconv call
     unfolds it on its load), so no child W tile is priced.  ``extents``: a
     photon sector's ``(rows, cols)`` (:func:`_w_extents`).
     """
@@ -1183,20 +1183,20 @@ class SynthesisTau:
     an ordered model; ``window_arguments`` swaps in the right endpoint's
     operands and the synthesis's per-window operands.  Neither closes over a
     device buffer, so the accumulator's runner cache retains no factors.
-    ``door`` (the Σ door's placed load tables, ``ppm_tau_kernel.sigma_door_tables``)
+    ``kconv_tables`` (the Σ kconv call's placed load tables, ``ppm_tau_kernel.sigma_kconv_tables``)
     rides the window arguments too and reaches ``spatial`` as its last
     argument, so no window program holds table constants.  ``overlap``: the
     window runs two nodes per loop trip (``gw.ppm_accumulators.WINDOW_OVERLAP``).
     """
 
     def __init__(self, spatial, synthesis, right_yr, right_proj, native, stage, meta, key, plans,
-                 door=None, overlap=False):
+                 kconv_tables=None, overlap=False):
         self._spatial, self._synthesis = spatial, synthesis
         self.overlap = bool(overlap)
         self._right = (right_yr, right_proj)
         self._native, self._stage, self._meta = native, stage, meta
         self._key, self._plans = key, plans
-        self._door = door
+        self._kconv_tables = kconv_tables
         self._admitted = False
 
     def window_kernel(self, space):
@@ -1212,12 +1212,12 @@ class SynthesisTau:
         if key not in _SYNTHESIS_TAU:
             spatial, w_kernel = self._spatial, self._synthesis.w_kernel
 
-            def tau(xn, yr, xr, yn, energies, weight, w_operands, e_ref_a, e_ref_b, door, t,
+            def tau(xn, yr, xr, yn, energies, weight, w_operands, e_ref_a, e_ref_b, kconv_tables, t,
                     _active):
                 interactions = w_kernel(*w_operands, e_ref_b, t, hole)
-                if door is None:
+                if kconv_tables is None:
                     return spatial(xn, yr, xr, yn, energies, weight, e_ref_a, t, interactions)
-                return spatial(xn, yr, xr, yn, energies, weight, e_ref_a, t, interactions, door)
+                return spatial(xn, yr, xr, yn, energies, weight, e_ref_a, t, interactions, kconv_tables)
             # The plans ride along so the ids in the key cannot be reused.
             _SYNTHESIS_TAU[key] = (self._plans, tau)
         return _SYNTHESIS_TAU[key][1]
@@ -1225,7 +1225,7 @@ class SynthesisTau:
     def window_arguments(self, xn, xr, energies, weight, e_ref_a, e_ref_b, space, indices, bounds):
         w_operands = self._synthesis.window_operands(space, indices, bounds)
         return (xn, self._right[0], xr, self._right[1], energies, weight, w_operands,
-                e_ref_a, e_ref_b, self._door)
+                e_ref_a, e_ref_b, self._kconv_tables)
 
     def fits(self, compiled):
         """Whether ``compiled`` fits the budget beside the live stages.
@@ -1300,7 +1300,7 @@ def _integrate_sigma_batches(
     (:meth:`DeviceOmegaAccumulator.integrate_window`).  A shared-pole model
     (``w_synthesis``, a :class:`WSynthesis`) synthesizes W(τ) inside that
     body through :class:`SynthesisTau`: the scalar route over the shared
-    ``sigma_kij``, a photon sector over its own spatial door
+    ``sigma_kij``, a photon sector over its own spatial kconv call
     (``tau_kernel_factory``).
 
     ``q_wedge``: the slabs are on the q wedge (GN-PPM, owner 2026-09-25);
@@ -1368,7 +1368,7 @@ def _integrate_sigma_batches(
             # The scalar shared-pole route: the shared sigma_kij reads the
             # parent pair its synthesis builds inside the same τ body, and
             # unfolds it on the transform's load (mathdx mode 9, the q wedge).
-            from gw.ppm_tau_kernel import sigma_door_tables, sigma_pass_price
+            from gw.ppm_tau_kernel import sigma_kconv_tables, sigma_pass_price
             sigma_kij = _get_sigma_kij_kernel(
                 mesh_xy=mesh_xy, kgrid=kgrid, merged_x=True, brackets=brackets,
                 q_wedge=w_synthesis.q_wedge, **face_kwargs)
@@ -1381,14 +1381,14 @@ def _integrate_sigma_batches(
             spatial_key = ("scalar-parent", mesh_xy, kgrid, brackets,
                            w_synthesis.q_wedge.wedge_key(),
                            tuple(sorted(face_kwargs.items(), key=lambda kv: kv[0])))
-            # The Green door's tables, placed once per run and plan: a window argument.
+            # The Green kconv call's tables, placed once per run and plan: a window argument.
             # Two nodes per loop trip (gw.ppm_accumulators.WINDOW_OVERLAP): one
             # node's W exchange runs beside the other's k-convolutions, when
             # the paired window fits (SynthesisTau.fits, at the first compile).
             tau_kernel = SynthesisTau(
                 scalar_spatial, w_synthesis, psi_coh_yr, psi_proj_yn, w_synthesis.native,
                 "sigma.synthesis.window", meta, spatial_key, (k_unfold_plan,),
-                door=sigma_door_tables(mesh_xy, k_unfold_plan), overlap=True)
+                kconv_tables=sigma_kconv_tables(mesh_xy, k_unfold_plan), overlap=True)
         else:
             tau_kernel = get_shared_sigma_tau_kernel(
                 mesh_xy=mesh_xy, kgrid=kgrid, brackets=brackets,
@@ -1397,12 +1397,12 @@ def _integrate_sigma_batches(
         # their device load, placed once per run (see ppm_tau_kernel).
         q_pair = (None if q_wedge is None else dataclasses.replace(
             q_wedge, values=None, load=None, trs_rule="pair_transpose").with_load(mesh_xy))
-        # The Green door's tables on the wedge, placed once per run and plan
-        # (ppm_tau_kernel.sigma_door_tables): a τ argument, never a constant.
+        # The Green kconv call's tables on the wedge, placed once per run and plan
+        # (ppm_tau_kernel.sigma_kconv_tables): a τ argument, never a constant.
         g_load = None
         if q_wedge is not None and tau_kernel_factory is None and not synthesis:
-            from gw.ppm_tau_kernel import sigma_door_tables
-            g_load = sigma_door_tables(mesh_xy, k_unfold_plan)
+            from gw.ppm_tau_kernel import sigma_kconv_tables
+            g_load = sigma_kconv_tables(mesh_xy, k_unfold_plan)
         small = NamedSharding(mesh_xy, P())
         # A held SC plan's executables keep one node capacity (the session's
         # largest, never lowered), so a refit recompiles them only if it

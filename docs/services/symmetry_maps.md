@@ -1,6 +1,6 @@
 # symmetry_maps — k-grid reduction, star maps, unfolds, and the 2c TRS check
 
-`services/symmetry_maps/` is the one door for crystal symmetry: the
+`services/symmetry_maps/` is the one entry point for crystal symmetry: the
 IBZ ⇄ full-BZ tables (`SymMaps`), the band-index star map (`KStarMap`,
 `star_*`), the sharded q-axis unfolds, the ψ-unfold antiunitary rule, the
 real-space orbit machinery, the q_irr restart store, and the time-reversal

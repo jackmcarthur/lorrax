@@ -11,7 +11,7 @@ resolved fact it can read off ``loader.backend`` and never has to branch
 on: the two backends are byte-identical for the same request, which is the
 P2 contract and the only reason ``LORRAX_WFN_BACKEND`` is safe to expose.
 
-THE PACKAGE IS THE DOOR.  Everything a consumer needs is a top-level name
+THE PACKAGE IS THE PUBLIC API.  Everything a consumer needs is a top-level name
 here; importing ``wfn_loader.loader`` from outside is a layering violation
 the monorepo's ``tests/test_layering.py`` fails on.
 
@@ -35,19 +35,19 @@ The surface
     The k-spec vocabulary: ``'ibz'``, ``'full_bz'``, or an explicit list
     of full-BZ indices.
 
-THE UNDERSCORED NAMES ARE PART OF THE DOOR, deliberately.  They are the
+THE UNDERSCORED NAMES ARE PART OF THE PUBLIC API, deliberately.  They are the
 module-level kernel / jit-cache factories the in-tree tests pin by name —
 ``_phdf5_unfold_kernel`` is the on-device symmetry unfold, the one piece of
 the collective path that runs without an ``.so`` and therefore the piece a
 single-process cell can pin against the eager backend.  Re-exporting them
 here is what lets the transitional shim ``src/file_io/wfn_loader.py`` keep
-every name the old module bound while still going through the door — the
+every name the old module bound while still going through the public API — the
 alternative is lorrax importing ``wfn_loader.loader``, i.e. trading a
-counted re-export for an uncounted past-the-door reach.
+counted re-export for an uncounted past-the-API reach.
 
 ``_build_phdf5_clamped_counts`` was on this list until 2026-08-07.  It was
 the per-rank hyperslab clip for the collective read, and it is now
-``file_io._slab_io_ffi._derive_window_counts``, behind the slab_io door
+``file_io._slab_io_ffi._derive_window_counts``, behind the slab_io public API
 that performs the read: the service states which windows it wants and how
 much of each is real, and knows nothing about hyperslabs, ranks or FFI
 targets.  Its cells moved with it.

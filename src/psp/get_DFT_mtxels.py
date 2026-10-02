@@ -81,7 +81,7 @@ _services.ensure_on_path()
 # or direct script".  The relative arm never ran: ``from ..io import
 # WFNReader`` on the line above it names a package that does not exist, so
 # the try arm raises on every interpreter and the fallback is the only
-# live code.  The service door is reached by ONE absolute import, and a
+# live code.  The service's public API is reached by ONE absolute import, and a
 # dual spelling of it would be two module objects waiting to happen.
 
 
@@ -144,7 +144,7 @@ def spin_degeneracy_factor(wfn) -> float:
 
     Getting this wrong scales ρ — and therefore ⟨V_H⟩, a ~500 eV
     quantity — by a factor of two.  The WFN-loader occupation summary
-    derives it once; this compatibility door exposes that value to the
+    derives it once; this compatibility function exposes that value to the
     density quadrature, whose result is checked against ``∫ρ d³r`` by
     :func:`build_hartree_potential`.
     """

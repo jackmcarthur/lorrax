@@ -144,7 +144,7 @@ rank beside what is live:
 ```
 
 `S_11` is mode 11's split-arm scratch, at most one `T_p`
-(`greens_function_kernel.chi0_door_scratch`); it is 0 on the single pass.
+(`greens_function_kernel.chi0_kconv_scratch`); it is 0 on the single pass.
 
 The q-wedge Σ(τ) kernel (`ppm_tau_kernel._sigma_subtile_kernel`) runs each
 rank's tile in row passes of whole centroid orbits (`gw.subtile_stream`):
@@ -176,7 +176,7 @@ the static Σ channels read it, before Hartree and the τ sweep.
 | matrix-element sweep (V_H, four-current) | the step's slabs, and FFT boxes `(2 + 2·n_comp)·n_s·N_r·16` per band of a band-layout operator | `mtxel_sweep.plan_sweep`: bands in the fewest chunks whose boxes fit the fixed tile | — |
 | ψ loader off the fit plan (ζ reuse, current faces) | one band tile of G-flat rows, samples and faces | `gflat_memory_model.loader_band_chunk`: the fixed tile, at least the automatic 16 | warns; one scan row |
 | moment bank | `(per_q·w + 16)` faces for a batch of `w` q parents | `response_bank.moment_q_width`: the outputs within the fixed tile | the ledger warns |
-| sector Σ(τ) sweep (bispinor) | band-complete ψ, then one row pass: the four-spinor parent Green and partner, the door's Σ rows, W(t)'s pass rows | `subtile_stream.plan_rows` (`mpa.sector_sigma.sector_tau_factory`): the rows within the fixed tile | — |
+| sector Σ(τ) sweep (bispinor) | band-complete ψ, then one row pass: the four-spinor parent Green and partner, the kconv call's Σ rows, W(t)'s pass rows | `subtile_stream.plan_rows` (`mpa.sector_sigma.sector_tau_factory`): the rows within the fixed tile | — |
 | direct Γ head (bulk metals) | the compiled per-sample footprint × samples per call, split over every rank | `photon_direct_head.direct_gamma_chunk_plan`: the fixed tile, at least 2¹⁰ samples per rank, at most one 2¹⁷ replicate per call | — |
 | head wings | `n_ends` gathered endpoint blocks `16·N_k·n_s·block·N_b` | `qsgw_head.head_wing_mu_block`: the fixed tile, at least 16 centroids | — |
 | exciton_bands C_q | P_R and its update, one ψ chunk and its Pk | `vq_interp.build_cq_q_chunk`: q rows within the fixed tile | — |
@@ -288,7 +288,7 @@ temporaries is compiled once at map 0 and never runs (Fe 8³: 2.3 s cold,
 
 | stage | chunk | compiled figure available | what it misses (priced elsewhere) |
 |---|---|---|---|
-| response direct stream (`gw.response_bank`) | samples per group | yes: temporaries | the donated carry (an argument), mode 11's split-arm scratch (`chi0_door_scratch`) |
+| response direct stream (`gw.response_bank`) | samples per group | yes: temporaries | the donated carry (an argument), mode 11's split-arm scratch (`chi0_kconv_scratch`) |
 | Σ τ window (`gw.mpa.sigma.SynthesisTau.admit`) | row pass | yes: the first window executable | the synthesis GEMM's native workspace (added); the passes are not re-solved |
 | ζ μ batch (`gw.isdf_fitting`, route G) | centroids per owner | yes: the batch executable, which the loop then runs | the lookahead batch's rows (its output, added) |
 

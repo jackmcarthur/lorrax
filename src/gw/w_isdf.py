@@ -119,7 +119,7 @@ def _get_chi_minimax_kernel(mesh_xy: Mesh, kgrid: tuple[int, int, int],
              and right_face_shape is None and k_unfold_plan is not None
              and not isinstance(k_unfold_plan, tuple))
     if fused:
-        fused = _chi_door_serves(mesh_xy, kgrid, int(face_shape[3]))
+        fused = _chi_kconv_serves(mesh_xy, kgrid, int(face_shape[3]))
     cache_key = (_mesh_key(mesh_xy), kgrid, ffi_dial_key(), n_out,
                  complex_contour, layout, face_shape, right_face_shape,
                  vertex_classes, (tuple(id(p) for p in k_unfold_plan)
@@ -149,12 +149,12 @@ def _get_chi_minimax_kernel(mesh_xy: Mesh, kgrid: tuple[int, int, int],
     return kernel
 
 
-#: The charge stream's mode-11 door and its placed load tables per (mesh, grid,
+#: The charge stream's mode-11 kconv call and its placed load tables per (mesh, grid,
 #: plan): every q batch and output count of one run reads the same device tables.
-_CHARGE_DOORS: dict = {}
+_CHARGE_KCONV: dict = {}
 
 
-def _charge_stream_door(mesh_xy, kgrid, plan):
+def _charge_stream_kconv(mesh_xy, kgrid, plan):
     """``ffi.fft.make_kconv_chi_unfold`` on ``plan`` and its tables placed once.
 
     The stream passes the tables to its jit as arguments, so its program holds
@@ -163,31 +163,31 @@ def _charge_stream_door(mesh_xy, kgrid, plan):
     direct, moment and retarded stream of the run.
     """
     key = (mesh_xy, tuple(int(v) for v in kgrid), plan)
-    hit = _CHARGE_DOORS.get(key)
+    hit = _CHARGE_KCONV.get(key)
     if hit is None:
         from common.fft_helpers import make_kconv_chi_unfold
         from symmetry_maps import device_load_tables
         tables = plan.unfold_load_tables()
         hit = (make_kconv_chi_unfold(mesh_xy, kgrid, tables, n_out=1, complete=False, norm="ortho"),
                tuple(device_load_tables(tables, mesh_xy)))
-        while len(_CHARGE_DOORS) >= 2:
-            _CHARGE_DOORS.pop(next(iter(_CHARGE_DOORS)))
-        _CHARGE_DOORS[key] = hit
+        while len(_CHARGE_KCONV) >= 2:
+            _CHARGE_KCONV.pop(next(iter(_CHARGE_KCONV)))
+        _CHARGE_KCONV[key] = hit
     return hit
 
 
-def _charge_window_door(mesh_xy, kgrid, plan, rows):
+def _charge_window_kconv(mesh_xy, kgrid, plan, rows):
     """The direct stream's mode-11 call on its ``rows``-row windows and the plan's placed tables.
 
     One call serves every row pass (``gw.subtile_stream.plan_windows``): its
     host tables give the window's shapes (``subtile_stream.window_tables``;
     the plan's own when one window holds every row), and each pass reads the
     placed tables cut to its window on the device (``subtile_stream.window_load``).
-    Returns ``(door, arrays)``, the arrays a ``symmetry_maps.DeviceLoadTables``'s
+    Returns ``(kconv, arrays)``, the arrays a ``symmetry_maps.DeviceLoadTables``'s
     fields, cached per (mesh, grid, plan, rows).
     """
     key = ("window", mesh_xy, tuple(int(v) for v in kgrid), plan, int(rows))
-    hit = _CHARGE_DOORS.get(key)
+    hit = _CHARGE_KCONV.get(key)
     if hit is None:
         from common.fft_helpers import make_kconv_chi_unfold
         from symmetry_maps import device_load_tables
@@ -198,20 +198,20 @@ def _charge_window_door(mesh_xy, kgrid, plan, rows):
         shape = base if int(rows) == local_rows else window_tables(base, rows, side, ns)
         hit = (make_kconv_chi_unfold(mesh_xy, kgrid, shape, n_out=1, complete=False, norm="ortho"),
                tuple(device_load_tables(base, mesh_xy)))
-        while len(_CHARGE_DOORS) >= 2:
-            _CHARGE_DOORS.pop(next(iter(_CHARGE_DOORS)))
-        _CHARGE_DOORS[key] = hit
+        while len(_CHARGE_KCONV) >= 2:
+            _CHARGE_KCONV.pop(next(iter(_CHARGE_KCONV)))
+        _CHARGE_KCONV[key] = hit
     return hit
 
 
-def charge_door_table_bytes():
-    """Per-rank bytes of every placed charge door table held for reuse (``_CHARGE_DOORS``).
+def charge_kconv_table_bytes():
+    """Per-rank bytes of every placed charge kconv table held for reuse (``_CHARGE_KCONV``).
 
     They stay on the devices between dispatches, outside any executable's
     buffers, so the response bank reserves them as a live stage.
     """
     seen, total = set(), 0
-    for _, arrays in _CHARGE_DOORS.values():
+    for _, arrays in _CHARGE_KCONV.values():
         for a in arrays:
             if id(a) not in seen:
                 seen.add(id(a))
@@ -226,7 +226,7 @@ def _direct_pass_plan(mesh_xy, kgrid, plan, *, n_rmu, ns, n_band, q_count, n_nod
     """The direct stream's row passes and node chunk (``gw.subtile_stream.plan_passes``).
 
     Per local row: the two parent Greens and their antiunitary partners
-    ``16·n_parent·ns·(ν·ns)`` each, the door's R-space output and its
+    ``16·n_parent·ns·(ν·ns)`` each, the kconv call's R-space output and its
     transform ``2·16·nk·ν``, the pass's ψ rows ``16·n_parent·ns·n_band``, and
     the chunk's kept rows ``2·16·chunk·q·ν``; per node on the whole tile,
     ``2·16·q·μ·ν``.  ``ν = n_rmu/p_y``, ``μ = n_rmu/p_x``.
@@ -252,7 +252,7 @@ def _direct_pass_plan(mesh_xy, kgrid, plan, *, n_rmu, ns, n_band, q_count, n_nod
     return _PASS_PLANS[key]
 
 
-def _chi_door_serves(mesh_xy, kgrid, ns) -> bool:
+def _chi_kconv_serves(mesh_xy, kgrid, ns) -> bool:
     """Whether mathdx mode 11 (``ffi.fft.make_kconv_chi_unfold``) holds this grid.
 
     A grid it cannot hold (``ffi.fft.chi_unfold_refusal``) keeps the full-k
@@ -281,11 +281,11 @@ def _photon_pass_plans(mesh_xy, kgrid, families, half_plans, *, n_band, q_count,
                        n_sets=2):
     """Per family pair, the four-current direct stream's row passes, node chunk and blocks.
 
-    ``gw.subtile_stream.plan_passes`` on the pair's own door tables (its
+    ``gw.subtile_stream.plan_passes`` on the pair's own kconv tables (its
     left family's orbit cuts, Dirac-half spin 2), from
     :data:`runtime.tiles.TILE_BYTES` and the shapes.  Per local row of the
     left family: the lower and upper quadrant Greens and their antiunitary
-    partners ``16·n_parent·2·(ν·2)`` each, the door's channel planes in R and
+    partners ``16·n_parent·2·(ν·2)`` each, the kconv call's channel planes in R and
     one plane's transform ``16·(n_ch + 1)·nk·ν``, the pass's ψ rows
     ``16·n_parent·4·n_band``, and the chunk's kept rows
     ``n_sets·16·chunk·q·ν·n_ch`` (``n_sets`` rows per plane and node: two per
@@ -329,8 +329,8 @@ def _photon_pass_plans(mesh_xy, kgrid, families, half_plans, *, n_band, q_count,
     return _PHOTON_PASS_PLANS[key]
 
 
-def _photon_chi_doors(mesh_xy, kgrid, half_plans, parity, rows):
-    """Mode-11 vertex doors of the four-current stream, one per family pair and lower quadrant.
+def _photon_chi_kconvs(mesh_xy, kgrid, half_plans, parity, rows):
+    """Mode-11 vertex kconv calls of the four-current stream, one per family pair and lower quadrant.
 
     ``half_plans`` are the two families' Dirac-half plans and ``parity`` the
     per-full-k-row sign ``p`` of the bispinor action ``diag(U, pU)``
@@ -338,25 +338,25 @@ def _photon_chi_doors(mesh_xy, kgrid, half_plans, parity, rows):
     ``(h, g)`` meets the upper quadrant ``(h', g') = (h, g) ^ flip`` (a current
     vertex exchanges the halves).  Its tables carry the lower quadrant's sign
     ``p^(h+g)`` in the right phases; the upper quadrant's own sign differs
-    by ``p`` when ``h+g`` and ``h'+g'`` differ in parity, and the door applies
+    by ``p`` when ``h+g`` and ``h'+g'`` differ in parity, and the kconv call applies
     that on the upper operand's load.  The vertices are the quadrant-local
     ``(perm, phase)`` of every channel pair of the family pair
-    (``common.gamma_matrices.gamma_perm_phase_host``), so the door forms
+    (``common.gamma_matrices.gamma_perm_phase_host``), so the kconv call forms
     ``sum_ab (J_A G^> J_B^dagger)_ab conj(G^<)_ab``.  ``rows`` (per family
-    pair, its window's rows, :func:`_photon_pass_plans`): the door is built on
+    pair, its window's rows, :func:`_photon_pass_plans`): the kconv call is built on
     the window's shapes (``subtile_stream.window_tables``; the pair's own
     tables when one window holds every row) and every pass reads the pair's
     whole tables cut to its window on the device (``subtile_stream.window_load``).
-    Returns ``{(pair, (h, g)): (door, keys, tables)}`` with the whole tables;
+    Returns ``{(pair, (h, g)): (kconv, keys, tables)}`` with the whole tables;
     quadrants share every table array they have in common
-    (:func:`_place_photon_door_tables` places each once).
+    (:func:`_place_photon_kconv_tables` places each once).
     """
     from common.gamma_matrices import gamma_perm_phase_host
     from ffi.fft import make_kconv_chi_vertex
     from .photon_layout import FAMILY_PAIRS, family_channels
     from .subtile_stream import window_tables
     p = np.asarray(parity, dtype=np.float64)
-    doors = {}
+    kconvs = {}
     side = int(mesh_xy.shape["x"])
     for i_pair, pair in enumerate(FAMILY_PAIRS):
         L, R = pair
@@ -382,24 +382,24 @@ def _photon_chi_doors(mesh_xy, kgrid, half_plans, parity, rows):
                 right = tuple(local(B, 2 * g, gu) for B in family_channels(R))
                 odd = (h + g) % 2 == 1
                 full = base._replace(nph=odd_nph) if odd else base
-                door = make_kconv_chi_vertex(mesh_xy, kgrid,
+                kconv = make_kconv_chi_vertex(mesh_xy, kgrid,
                                              shape._replace(nph=odd_nph) if odd else shape,
                                              left_vertices=left, right_vertices=right,
                                              sign_c=sign_c, norm="ortho")
-                doors[(pair, (h, g))] = (door, keys, full)
-    return doors
+                kconvs[(pair, (h, g))] = (kconv, keys, full)
+    return kconvs
 
 
-def _place_photon_door_tables(doors, mesh_xy):
-    """Every distinct host table array of the doors on the devices, once.
+def _place_photon_kconv_tables(kconvs, mesh_xy):
+    """Every distinct host table array of the kconv calls on the devices, once.
 
     The stream passes them to its jit as arguments, so its program holds no
-    table constants: baked, each door's global tables were HLO literals (6.9
-    GB per rank at the Fe 20^3 P36-local shape, 32 doors), and XLA's copies
+    table constants: baked, each kconv call's global tables were HLO literals (6.9
+    GB per rank at the Fe 20^3 P36-local shape, 32 kconv calls), and XLA's copies
     of them set the compile's host peak.  Each array is one argument, so the
     compiled argument bytes count it once.  Returns ``(index, arrays, specs,
-    bytes_per_rank)``: ``index[door key]`` lists the positions in ``arrays``
-    of that door's ``symmetry_maps.DeviceLoadTables`` fields.
+    bytes_per_rank)``: ``index[kconv key]`` lists the positions in ``arrays``
+    of that kconv call's ``symmetry_maps.DeviceLoadTables`` fields.
     """
     from symmetry_maps import DEVICE_LOAD_SPECS
     slot, arrays, specs, held = {}, [], [], []
@@ -414,7 +414,7 @@ def _place_photon_door_tables(doors, mesh_xy):
         return slot[id(a)]
 
     index = {}
-    for key, (_, _, t) in doors.items():
+    for key, (_, _, t) in kconvs.items():
         host = (t.row, t.trs, t.lsrc, t.rsrc, t.mph, t.nph, t.spin,
                 t.spin if t.spin_r is None else t.spin_r)
         index[key] = tuple(put(a, s) for a, s in zip(host, DEVICE_LOAD_SPECS))
@@ -422,45 +422,45 @@ def _place_photon_door_tables(doors, mesh_xy):
     return index, tuple(arrays), tuple(specs), per_rank
 
 
-#: Placed door tables per (mesh, grid, half plans, passes): every q batch's
+#: Placed kconv tables per (mesh, grid, half plans, passes): every q batch's
 #: program of one run reads the same device tables.  Bounded; plans are
 #: identity-keyed run objects (``CentroidKUnfoldPlan.dirac_halves``).
-_PHOTON_DOORS: dict = {}
+_PHOTON_KCONV: dict = {}
 
 
-def _photon_stream_doors(mesh_xy, kgrid, half_plans, parity, rows):
-    """:func:`_photon_chi_doors` and their placed tables, built once per run and window plan.
+def _photon_stream_kconvs(mesh_xy, kgrid, half_plans, parity, rows):
+    """:func:`_photon_chi_kconvs` and their placed tables, built once per run and window plan.
 
-    Calls whose plans give the same windows share one set of doors and tables.
+    Calls whose plans give the same windows share one set of kconv calls and tables.
     """
     rows = tuple(int(r) for r in rows)
     key = (mesh_xy, tuple(int(v) for v in kgrid), tuple(half_plans), rows)
-    hit = _PHOTON_DOORS.get(key)
+    hit = _PHOTON_KCONV.get(key)
     if hit is None:
         from common import timing
-        with timing.section('response.door_tables', announce=True):
-            doors = _photon_chi_doors(mesh_xy, kgrid, half_plans, parity, rows)
-            placed = _place_photon_door_tables(doors, mesh_xy)
+        with timing.section('response.kconv_tables', announce=True):
+            kconvs = _photon_chi_kconvs(mesh_xy, kgrid, half_plans, parity, rows)
+            placed = _place_photon_kconv_tables(kconvs, mesh_xy)
         if jax.process_index() == 0:
-            print(f"  [response] four-current mode-11 doors: {len(doors)} doors, "
+            print(f"  [response] four-current mode-11 kconv calls: {len(kconvs)} kconv calls, "
                   f"{len(placed[1])} table arrays placed once, {placed[3] / 1e9:.3f} GB/rank",
                   flush=True)
-        while len(_PHOTON_DOORS) >= 2:
-            _PHOTON_DOORS.pop(next(iter(_PHOTON_DOORS)))
-        hit = _PHOTON_DOORS[key] = (doors, placed[:3])
+        while len(_PHOTON_KCONV) >= 2:
+            _PHOTON_KCONV.pop(next(iter(_PHOTON_KCONV)))
+        hit = _PHOTON_KCONV[key] = (kconvs, placed[:3])
     return hit
 
 
-def placed_door_tables_live(tail) -> bool:
-    """Whether every placed door table a bound program reads (``tail``) is still held
-    by its door cache (``_CHARGE_DOORS``, ``_PHOTON_DOORS``); an evicted plan's are not."""
-    held = {id(a) for cache in (_CHARGE_DOORS, _PHOTON_DOORS) for value in cache.values()
+def placed_kconv_tables_live(tail) -> bool:
+    """Whether every placed kconv table a bound program reads (``tail``) is still held
+    by its kconv cache (``_CHARGE_KCONV``, ``_PHOTON_KCONV``); an evicted plan's are not."""
+    held = {id(a) for cache in (_CHARGE_KCONV, _PHOTON_KCONV) for value in cache.values()
             for a in jax.tree.leaves(value) if isinstance(a, jax.Array)}
     return all(id(a) in held for a in jax.tree.leaves(tail) if isinstance(a, jax.Array))
 
 
 class _BoundTail:
-    """A jitted program with trailing operands bound (the placed door tables).
+    """A jitted program with trailing operands bound (the placed kconv tables).
 
     ``lower`` / ``compile`` / the executable's call append them, so callers
     keep the program's public signature; every other attribute passes through.
@@ -823,7 +823,7 @@ def _get_chi_minimax_kernel_fused(mesh_xy, kgrid, nk, n_out, complex_contour,
                     n_band=nb_full, mesh=mesh_xy, partner=anti and not real_t)
     if nk_in != k_unfold_plan.n_parent or k_unfold_plan.n_full != nk:
         raise ValueError("chi parent plan: face k extent or full-k extent disagrees with its plan.")
-    door = make_kconv_chi_unfold(mesh_xy, kgrid, k_unfold_plan.unfold_load_tables(),
+    kconv = make_kconv_chi_unfold(mesh_xy, kgrid, k_unfold_plan.unfold_load_tables(),
                                  n_out=n_out, complete=not complex_contour, norm="ortho")
     chi_fftn = make_flat_k_fftn(mesh_xy, kgrid, _chi_spec, norm='ortho')
     chi_R_shard = NamedSharding(mesh_xy, _chi_R_spec)
@@ -852,7 +852,7 @@ def _get_chi_minimax_kernel_fused(mesh_xy, kgrid, nk, n_out, complex_contour,
             Gc = green(t_c, cmin, mask_c)
             # A Green of real weights reads its partner as conj(G) on the load.
             partners = () if Gv.conj_partner else (Gv.transpose, Gc.transpose)
-            return door(acc, Gv.G, Gc.G, alpha_col.astype(jnp.complex128), *partners), None
+            return kconv(acc, Gv.G, Gc.G, alpha_col.astype(jnp.complex128), *partners), None
 
         acc, _ = jax.lax.scan(node, acc0, (nodes.t, alpha_rows), unroll=1)
         return tuple(chi_fftn(acc[o]) for o in range(n_out))
@@ -936,9 +936,9 @@ def _get_chi_fractional_contour_kernel_face(
     family pair of raw-parent faces.  Each Dirac-half quadrant of a family
     pair's Green is built on the parents only and mathdx mode 11 unfolds it
     on the load with the two families' plans; the Dirac vertices act on its
-    spin indices in the door's Mid,
+    spin indices in the kconv call's Mid,
     ``chi^AB = sum_ab (J_A G^> J_B^dagger)_ab conj(G^<)_ab``
-    (:func:`_photon_chi_doors`).  One quadrant's two Greens are live at a
+    (:func:`_photon_chi_kconvs`).  One quadrant's two Greens are live at a
     time.  Each channel plane is transformed within the node and only its
     selected q and -q rows are kept, in the families' packed photon layout;
     those rows cross into the canonical layout once per call.  The stream
@@ -946,7 +946,7 @@ def _get_chi_fractional_contour_kernel_face(
     direct stream runs on the sub-tile engine (``gw.subtile_stream``): per
     family pair, row passes of the left family's orbit-closed rows, each
     node's quadrant Greens from the band-complete ψ rows by one local GEMM
-    each (``band_ranges``: the active bands), its doors on the pass only.
+    each (``band_ranges``: the active bands), its kconv calls on the pass only.
 
     ``stream_pass`` (direct bank carry on the row-pass engine only) runs one
     segment of that engine (:func:`stream_segments`): the donated carry is
@@ -1086,10 +1086,10 @@ def _get_chi_fractional_contour_kernel_face(
     # Four-current stream on raw-parent plans: each quadrant's parent Green pair
     # goes straight into mathdx mode 11 with the channel vertices (unfold on the
     # load, the traces in its Mid); no full-k Green exists.  A CUDA grid the
-    # door cannot hold refuses (no full-k fallback on the GPU); a non-CUDA
-    # backend takes the door's reference arm.
+    # kconv call cannot hold refuses (no full-k fallback on the GPU); a non-CUDA
+    # backend takes the kconv call's reference arm.
     from symmetry_maps import DeviceLoadTables
-    photon_doors = None
+    photon_kconvs = None
     if photon is not None:
         from ffi import fft as _F
         why = _F.chi_unfold_refusal(grid, 2) if _F.kconv_backend(mesh_xy) == "mathdx" else ""
@@ -1114,7 +1114,7 @@ def _get_chi_fractional_contour_kernel_face(
             mesh_xy, grid, photon, half_plans, n_band=nb_full, q_count=len(selected_q),
             n_nodes=minimax.RESPONSE_NODE_CAPACITY if pair_mode == "direct" else 1,
             n_sets=photon_sets)
-        # Each family pair's passes are windows of plan.rows rows: one door per
+        # Each family pair's passes are windows of plan.rows rows: one kconv call per
         # quadrant and one GEMM plan serve them all.  A segment program
         # (``stream_pass``, the family pair) serves every pass of its pair.
         if stream_pass is not None and not 0 <= int(stream_pass) < len(photon_plans):
@@ -1137,7 +1137,7 @@ def _get_chi_fractional_contour_kernel_face(
                   f"{tuple(plan.rows for plan in photon_plans)} "
                   f"local rows, {tuple(plan.chunk for plan in photon_plans)} node(s) "
                   "per accumulate", flush=True)
-        photon_doors, (door_index, door_arrays, door_specs) = _photon_stream_doors(
+        photon_kconvs, (kconv_index, kconv_arrays, kconv_specs) = _photon_stream_kconvs(
             mesh_xy, grid, half_plans, half_parity, tuple(plan.rows for plan in photon_plans))
     active_gemms = (tuple(g_plan.prepare_active_range(*bounds) for bounds in band_ranges)
                    if band_ranges is not None and layout == "axis" else (None, None))
@@ -1146,19 +1146,19 @@ def _get_chi_fractional_contour_kernel_face(
     # full-k Green, no transform of either Green, no XLA spin trace.  The direct
     # stream runs its rule sub-tile by sub-tile (``gw.subtile_stream``): row
     # passes of orbit-closed rows, each node's parent Greens from the
-    # band-complete ψ rows by one local GEMM, its door on the pass only.
-    chi_door = chi_tables = subtile = None
-    door_serves = (selected_q is not None and photon is None and k_unfold_plan is not None
+    # band-complete ψ rows by one local GEMM, its kconv call on the pass only.
+    chi_kconv = chi_tables = subtile = None
+    kconv_serves = (selected_q is not None and photon is None and k_unfold_plan is not None
                    and pair_mode in ("direct", "retarded", "kms_static")
-                   and _chi_door_serves(mesh_xy, grid, ns))
-    if door_serves and pair_mode == "direct":
+                   and _chi_kconv_serves(mesh_xy, grid, ns))
+    if kconv_serves and pair_mode == "direct":
         import minimax
         px = int(mesh_xy.shape["x"])
         subtile = _direct_pass_plan(mesh_xy, grid, k_unfold_plan, n_rmu=n_rmu, ns=ns,
                                     n_band=nb_full, q_count=len(selected_q),
                                     n_nodes=minimax.RESPONSE_NODE_CAPACITY)
-        # Every pass is one window of subtile.rows rows: one door, one GEMM plan.
-        pass_door, pass_arrays = _charge_window_door(mesh_xy, grid, k_unfold_plan, subtile.rows)
+        # Every pass is one window of subtile.rows rows: one kconv call, one GEMM plan.
+        pass_kconv, pass_arrays = _charge_window_kconv(mesh_xy, grid, k_unfold_plan, subtile.rows)
         pass_gemm = gemm_plan(mesh_xy, m=px * subtile.rows * ns, k=nb_full, n=n_rmu * ns,
                               nq=nk_shape, dtype=jnp.complex128, layout="axis",
                               enable_active_range=band_ranges is not None, warmup=False)
@@ -1168,8 +1168,8 @@ def _get_chi_fractional_contour_kernel_face(
         if jax.process_index() == 0 and not stream_pass:
             print(f"Response direct stream: {len(subtile.passes)} row pass(es) of "
                   f"{subtile.rows} local rows, {subtile.chunk} node(s) per accumulate", flush=True)
-    elif door_serves:
-        chi_door, chi_tables = _charge_stream_door(mesh_xy, grid, k_unfold_plan)
+    elif kconv_serves:
+        chi_kconv, chi_tables = _charge_stream_kconv(mesh_xy, grid, k_unfold_plan)
     if stream_pass is not None and not bank_carry or stream_pass is not None and photon is None and (
             subtile is None or not 0 <= int(stream_pass) < len(subtile.passes)):
         raise ValueError(f"GATE response_stream_pass: pass {stream_pass} needs the direct bank "
@@ -1178,9 +1178,9 @@ def _get_chi_fractional_contour_kernel_face(
     # stream: of its family pair): the segment index is a runtime argument
     # after the carry.
     segment_index = stream_pass is not None
-    # Trailing operands bound to the program (``_BoundTail``): the door tables.
-    tail = (door_arrays if photon_doors is not None else chi_tables)
-    tail_specs = (door_specs if photon_doors is not None else
+    # Trailing operands bound to the program (``_BoundTail``): the kconv tables.
+    tail = (kconv_arrays if photon_kconvs is not None else chi_tables)
+    tail_specs = (kconv_specs if photon_kconvs is not None else
                   None if chi_tables is None else
                   tuple(a.sharding.spec for a in chi_tables))
     def _finish(value):
@@ -1230,11 +1230,11 @@ def _get_chi_fractional_contour_kernel_face(
                    else jax.lax.with_sharding_constraint(
                        jnp.broadcast_to(zero, (n_out,) + zero.shape),
                        selected_shard))
-        # The placed door tables are the last operand (``_BoundTail``).
+        # The placed kconv tables are the last operand (``_BoundTail``).
         chi_load = None
         if tail is not None:
             carry, tables = carry[:-1], carry[-1]
-        if photon_doors is None and chi_tables is not None:
+        if photon_kconvs is None and chi_tables is not None:
             chi_load = tables
         pass_index = None
         if segment_index:
@@ -1281,14 +1281,14 @@ def _get_chi_fractional_contour_kernel_face(
                           upper_time, upper_ref):
             """A family pair's channel planes in R on a window, accumulated in ``acc``.
 
-            ``loads[(h, g)]`` are the quadrant doors' tables cut to the window
+            ``loads[(h, g)]`` are the quadrant kconv calls' tables cut to the window
             and ``live`` its live rows (empty when one window holds every row).
 
             Each lower quadrant ``(h, g)`` meets the upper quadrant
             ``(h, g) ^ flip`` (a current vertex exchanges the halves);
             ``parent(weight, t, ref, halves, current)`` builds one quadrant's
             parent Green.  One quadrant's Green pair is live at a time: both
-            builds wait for the previous quadrant's door.  The door reads
+            builds wait for the previous quadrant's kconv call.  The kconv call reads
             ``G' = ifftn_k`` of the unfolded Greens, so its plane is
             ``v(R) = conj(A(-R))`` and ``FT[A](q) = conj(FT[v](q))``.
             """
@@ -1299,7 +1299,7 @@ def _get_chi_fractional_contour_kernel_face(
                 upper = parent(upper_w, upper_time, upper_ref, (h ^ flip[0], g ^ flip[1]), True)
                 partners = (() if lower.transpose is None and upper.transpose is None
                             else (lower.partner(), upper.partner()))
-                acc = photon_doors[(pair, (h, g))][0](acc, lower.G, upper.G, *partners,
+                acc = photon_kconvs[(pair, (h, g))][0](acc, lower.G, upper.G, *partners,
                                                       load=loads[(h, g)], **live)
             return acc
 
@@ -1313,7 +1313,7 @@ def _get_chi_fractional_contour_kernel_face(
             Per family pair and pass, a node's planes: the pair's quadrant
             Greens on the pass's band-complete ψ rows of the left family and
             the right family's band-complete columns (one local GEMM each over
-            the active bands, plus the antiunitary partners), the doors on
+            the active bands, plus the antiunitary partners), the kconv calls on
             the pass (:func:`photon_planes`), each channel plane's transform
             and its two kept rows.  The engine adds them into their blocks of
             the packed carry.
@@ -1333,13 +1333,13 @@ def _get_chi_fractional_contour_kernel_face(
                 L, R = pair
                 if stream_pass is not None and int(stream_pass) != i_pair:
                     continue
-                keys = photon_doors[(pair, (0, 0))][1]
+                keys = photon_kconvs[(pair, (0, 0))][1]
                 right_extent = photon.packed_layout.carrier_extent(keys[0][1])
                 rows_w = int(plan.rows)
 
                 def prepare(window, pair=pair, L=L, rows_w=rows_w):
                     """A window's left ψ rows, cut quadrant tables and live rows, once per pass."""
-                    loads = {hg: DeviceLoadTables(*(tables[i] for i in door_index[(pair, hg)]))
+                    loads = {hg: DeviceLoadTables(*(tables[i] for i in kconv_index[(pair, hg)]))
                              for hg in QUADRANTS}
                     if window is None:
                         return faces[L][0], loads, {}
@@ -1529,7 +1529,7 @@ def _get_chi_fractional_contour_kernel_face(
                         else (lower.partner(), upper.partner()))
             zero = jax.lax.with_sharding_constraint(
                 jnp.zeros((1, nk, n_mu, n_mu), jnp.complex128), selected_shard)
-            value = chi_fftn(chi_door(zero, lower.G, upper.G,
+            value = chi_fftn(chi_kconv(zero, lower.G, upper.G,
                                       jnp.ones((1,), jnp.complex128), *partners,
                                       load=chi_load)[0])
             ahead, behind = rows(value, gather_q), rows(value, reverse_q)
@@ -1613,7 +1613,7 @@ def _get_chi_fractional_contour_kernel_face(
                 zero = jax.lax.with_sharding_constraint(
                     jnp.zeros((1, nk, px * R, n_mu), jnp.complex128), selected_shard)
                 # A window's rows outside its live rows add nothing (mode 11's live).
-                value = chi_fftn(pass_door(zero, lower.G, upper.G,
+                value = chi_fftn(pass_kconv(zero, lower.G, upper.G,
                                            jnp.ones((1,), jnp.complex128), *partners,
                                            load=load, **live)[0])
                 ahead, behind = rows(value, gather_q), rows(value, reverse_q)
@@ -1642,7 +1642,7 @@ def _get_chi_fractional_contour_kernel_face(
 
         def body(accumulators, node):
             time, projection = node
-            if chi_door is not None:
+            if chi_kconv is not None:
                 if pair_mode == "retarded":
                     tau = -jnp.asarray(1j, jnp.complex128) * time
                     ahead, behind = correlation_rows(occ_f, tau, energy_reference,

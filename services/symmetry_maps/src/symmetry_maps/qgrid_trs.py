@@ -17,7 +17,7 @@ Three charge-channel producers consume it — bare ``V_q``
 ``W_q`` (``gw/screening_bse.py``) — through the one adapter
 ``gw.qgrid_symmetry.qgrid_trs_policy_for``, which supplies rank-0 and the
 once-per-run announcement.  ``tests/test_qgrid_trs_policy.py`` is the
-ratchet that keeps it to one door.
+ratchet that keeps it to one entry point.
 
 WHY IT EXISTS: TRS IS MEASURED, NEVER ASSUMED
 ---------------------------------------------
@@ -301,7 +301,7 @@ def trs_project_self_negative_q_rows(operator, q_full_idx, *, kgrid):
     """Apply the one-element Θ group projector at ``q == −q``.
 
     THE MEASURED-TRS ARM ONLY — see
-    :meth:`QgridTrsPolicy.project_fixed_q`, which is the door and which
+    :meth:`QgridTrsPolicy.project_fixed_q`, which is the entry point and which
     also returns the residual this removes.
 
     Pair-coherent unfold handles every two-element q/−q orbit without

@@ -245,7 +245,7 @@ def bootstrap(*, platform: str = "gpu") -> None:
     runs.  ``platform`` forwards to :func:`set_default_env`.
     """
     # Source/package sealing is stdlib-only and MUST precede every existing
-    # bootstrap step: it puts this checkout's declared service doors ahead of
+    # bootstrap step: it puts this checkout's declared service packages ahead of
     # stale installed copies and refuses a LORRAX_CHECKOUT/runtime mismatch
     # before set_default_env's first possible JAX import.
     _ensure_source_closure(print_fn=rank0_print)

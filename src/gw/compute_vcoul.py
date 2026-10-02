@@ -15,7 +15,7 @@ what the live G-flat V_q path needs:
   head ``<v(K + δq)>_miniBZ`` as a function of the Cartesian ``K = q+G``,
   injected into ``compute_v_q_per_G`` for bulk systems.  It LIVES in
   ``vcoul.minibz`` and is re-exported here (production
-  ``gw.v_q_g_flat`` imports it from the door since the 2026-08-07
+  ``gw.v_q_g_flat`` imports it from the public API since the 2026-08-07
   replumb; this path remains for the head-draw guard and sibling
   branches).
 * :func:`compute_all_V_q` — the thin dispatcher: for a G-flat on-disk ζ
@@ -45,7 +45,7 @@ _services.ensure_on_path()
 #: nmc=2**18 defaults, which the ``si_bse_debug`` frozen reference pins.
 #: ``tests/test_vcoul_minibz_head_draw.py`` imports it from THIS path
 #: (the head-draw guard doubles as shim coverage); ``gw.v_q_g_flat``
-#: imports the door since the 2026-08-07 replumb.
+#: imports the public API since the 2026-08-07 replumb.
 from vcoul import (                                         # noqa: E402,F401
     build_miniBZ_dq_cart,
     build_v_head_miniBZ_fn_3d,
@@ -121,7 +121,7 @@ def compute_v_q_per_G(
     if sys_dim not in (0, 2, 3):
         raise NotImplementedError(
             f"compute_v_q_per_G: sys_dim must be 0 / 2 / 3; got {sys_dim}")
-    # Straight to the door (audit-arm consensus, 2026-08-07): the loose
+    # Straight to the public API (audit-arm consensus, 2026-08-07): the loose
     # arguments here ARE the CoulombGeometry fields, so hopping through
     # the gw.coulomb shim adapter was a redundant double translation —
     # and the only src/ site that reached a shim submodule.

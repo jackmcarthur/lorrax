@@ -212,7 +212,7 @@ class LocalFourierPlan:
             self._gather = make_plane_fft_gather(mesh, plane_from_col, int(n_col), extents)
             self.extents, self.axes, self.sign, self.norm = extents, axes, sign, norm
             self.stages = [(axes, "gather-fft", int(n_col), extents[0] * extents[1])]
-            self.leg = None             # the door chooses mathdx mode 10 or its XLA route
+            self.leg = None             # the factory chooses mathdx mode 10 or its XLA route
             return
         for name, sup in (("in_support", in_support), ("out_support", out_support)):
             if set(sup) - set(axes):

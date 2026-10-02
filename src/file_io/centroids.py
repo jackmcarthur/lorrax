@@ -1,4 +1,4 @@
-"""Centroid-coordinate loading behind one format and symmetry door.
+"""Centroid-coordinate loading behind one format and symmetry entry point.
 
 The text file contains fractional crystal coordinates.  This module owns the
 one conversion from those coordinates to the integer FFT-grid rows consumed by
@@ -220,7 +220,7 @@ def load_centroid_basis(
     n_rmu = int(centroid_indices.shape[0])
     grid = np.asarray(fft_grid, dtype=np.int64).reshape(3)
 
-    # Import through the service door, never through an implementation
+    # Import through the service's public API, never through an implementation
     # submodule.  Measure the grid rows the kernels consume rather than the
     # rounded text spellings, matching ``resolve_qgrid_symmetry`` exactly.
     from symmetry_maps import verify_centroid_orbit_closure

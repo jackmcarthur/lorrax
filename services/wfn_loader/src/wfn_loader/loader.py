@@ -35,7 +35,7 @@ There was a third, ``phdf5_host``, deleted 2026-08-06: a duplicate compute
 path over the eager backend's own POSIX transport, auto-selected by a
 missing ``.so`` — which the 2026-08-01 ruling makes a refusal, not a
 demotion.  Full history: ``docs/services/wfn_loader.md`` (Backends).  The
-two refusal doors below are the tombstone and are load-bearing.
+two refusal entry points below are the tombstone and are load-bearing.
 
 Public surface
 --------------
@@ -60,7 +60,7 @@ P-roadmap — STATUS, not plan (2026-08-07, wave-1 wfn_loader branch)
   service boundary decision), which is why the old ``load_wfns`` helpers
   live THERE rather than being deleted.
 - P4 DONE for every consumer this branch owns: the step-3 replumb moved
-  lorrax onto the door, 45 old-path import edges over 36 files → 3 over
+  lorrax onto the public API, 45 old-path import edges over 36 files → 3 over
   3 (converted delta 42).  The ``SymMaps`` unfold helpers are gone (see
   ``common/symmetry_maps.py``'s head comment for where they went).  The
   three remaining edges ride sibling wave-1 branches by ruling, not by
@@ -68,7 +68,7 @@ P-roadmap — STATUS, not plan (2026-08-07, wave-1 wfn_loader branch)
 - P5 NOT DONE, deliberately.  ``PhdfWfnReader`` is gone, but ``WFNReader``
   is a live ALIAS of this class (the same class object, not a subclass)
   and ``src/file_io/wfn_loader.py`` is a transitional SHIM re-exporting
-  the door's own objects.  Both STAY until the phase-wide cleanup commit
+  the public API's own objects.  Both STAY until the phase-wide cleanup commit
   after all four wave-1 branches land (coordination ruling 2) — the other
   branches are written against the old spellings and have not rebased.
   That cleanup is the gate; nothing here may delete either early.
@@ -645,7 +645,7 @@ class WfnLoader:
             return "eager"
         # GPU first, then CPU: the SAME collective MPI-IO read path, served
         # by whichever platform's FFI library can serve a slab read.  The
-        # question "can this platform read a slab" belongs to the door that
+        # question "can this platform read a slab" belongs to the slab_io entry point that
         # does the reading, so this ladder asks
         # ``slab_io.probe_read_availability`` and nothing here names an FFI
         # target.  That probe wraps ``ffi_loader.probe_target``, which
@@ -690,7 +690,7 @@ class WfnLoader:
         already on a sharded backend keeps its mesh.  A single-process run
         adopts the mesh too, so it holds the same loader state as a driver
         that constructed with ``mesh=`` (gwjax, htransform): the one-k
-        parent-stream doors (``full_k_box_index_one_dev``,
+        parent-stream entry points (``full_k_box_index_one_dev``,
         ``unfold_parent_to_full_k``) need it at every P, and the re-pick
         still resolves ``eager`` there.  The switch is safe mid-life
         because the phdf5 collective context is created lazily on the
@@ -1436,7 +1436,7 @@ class WfnLoader:
         The general :meth:`box_index_dev` API intentionally caches a complete
         requested k set. A strict one-k parent stream must not ask it for
         ``"full_bz"``: that would retain both ``O(nk*ngkmax)`` host G vectors
-        and an ``O(nk*n_r)`` replicated device index. This door instead
+        and an ``O(nk*n_r)`` replicated device index. This entry point instead
         reuses the loader's single parent-G slot and returns only
         ``(1, ngkmax)`` for the requested child.
         """
@@ -1620,7 +1620,7 @@ class WfnLoader:
         probe, the MPI-world check against the LIVE communicator, and the
         read-side stripe-layout announcement — which this loader used to
         hand-copy from ``_FfiBackend.__init__`` because it called
-        ``ffi.io.open_file`` itself.  It no longer does; the door is the
+        ``ffi.io.open_file`` itself.  It no longer does; SlabIO is the
         only phdf5 opener.
 
         ``ffi.io`` caches one ``PhdfCtx`` per PATH, so a loader and a
@@ -1642,7 +1642,7 @@ class WfnLoader:
         nb_padded: int,
         out_sharding: NamedSharding,
     ) -> jax.Array:
-        """Collective read through the slab_io door + on-device unfold.
+        """Collective read through the slab_io public API + on-device unfold.
 
         Output: ``(n_k, nb_padded, nspinor, ngkmax)`` c128 sharded as
         ``out_sharding`` (typically ``P(None, ('x','y'), None, None)``).
@@ -1674,7 +1674,7 @@ class WfnLoader:
 
         # ``load`` refuses ``b_hi > mnband``, so the min() is the
         # file-extent backstop for a direct caller of _phdf5_build.  The
-        # per-rank clip inside the door then handles the padded case: when
+        # per-rank clip inside SlabIO.read_slabs then handles the padded case: when
         # ``b_lo + nb_padded > band_extent`` the tail rank(s) get a band
         # count below bands_per_rank and the rank past the end gets 0,
         # which is how the collective path matches the eager backend's
@@ -1693,7 +1693,7 @@ class WfnLoader:
             k_idxs, unfold)
 
         # One window per IBZ source k, in ascending file order (which is
-        # what _kplan's sort buys — the door requires the windows disjoint
+        # what _kplan's sort buys — SlabIO.read_slabs requires the windows disjoint
         # and ascending).  Dataset layout: (mnband, nspinor, ngktot, 2) f64,
         # so the window axis goes at 2, immediately before the G axis that
         # varies across windows.
@@ -1704,7 +1704,7 @@ class WfnLoader:
         # ...and how much of the padded slab is REAL in each: the band
         # rows up to the logical window end, this k's own ngk on the G
         # axis, everything on the replicated axes.  Stating extents is the
-        # whole request; the clip against them, per rank, is the door's.
+        # whole request; the clip against them, per rank, is SlabIO.read_slabs' job.
         valid_shapes = np.stack([
             [band_extent - b_lo_logical, ns, int(self.ngk[ibz]), 2]
             for ibz in ibz_unique_sorted
@@ -2059,7 +2059,7 @@ class WfnLoader:
         Pad rows of ψ are zero → small components of pad rows are also
         zero (clean propagation, no per-k mask needed).
 
-        ``k`` is resolved once by :meth:`kvecs`, the same public loader door
+        ``k`` is resolved once by :meth:`kvecs`, the same public loader entry point
         whose representatives are paired with :meth:`gvecs`.
         """
         gvecs = np.asarray(self.gvecs(k=k))                  # (n_k, ngkmax, 3) int

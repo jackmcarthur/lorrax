@@ -4,7 +4,7 @@ STAGING LOCATION; the minimax-service design decides the final home.
 ``DESIGN_minimax.md`` R4 point 3 says this object "belongs in the
 service" because it is pure algebra on floats -- no jax, no physics, no
 bands -- and this module honours that: it imports ``numpy``,
-``gw.mpa.sampling`` and the ``minimax`` door (whose declared table the
+``gw.mpa.sampling`` and the ``minimax`` public API (whose declared table the
 character dispatch reads) and nothing else.  It sits under ``gw/mpa``
 only because that is where the rest of the MPA staging lives; moving it
 is a file move.

@@ -46,7 +46,7 @@ K_z(\Delta)
 =-2\int_0^\infty e^{izt}\sin(\Delta t)\,dt .
 $$
 
-The time integral is the common door for every complex-frequency sample: at
+The time integral is the common route for every complex-frequency sample: at
 one time node the transition-pair sum factors into one empty-band and one
 occupied-band Green function,
 

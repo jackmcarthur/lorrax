@@ -1,4 +1,4 @@
-"""What the door hands back: a quadrature that knows where it came from.
+"""What :func:`serve` hands back: a quadrature that knows where it came from.
 
 The return type is a record, not an array pair, and its provenance block is
 mandatory.  :meth:`Provenance.one_line` is what the driver logs, once per

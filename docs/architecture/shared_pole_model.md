@@ -364,7 +364,7 @@ d_j(\tau) = \frac{e^{-i(\Omega_j - E_{\rm ref})\tau}}{2\Omega_j} . \tag{SP 4} $$
 Synthesis uses the Green-function GEMM (`build_G`) at the irreducible parents,
 then the little-group realization and the fixed-q projection, all on the
 parent rows. The result is the parent pair $(W_p, W_p^{\mathsf T})$,
-$[n_{q,\rm irr},\mu,\mu]$; no full-q $W$ is formed (TASTE 97). The Σ door
+$[n_{q,\rm irr},\mu,\mu]$; no full-q $W$ is formed (TASTE 97). The Σ kconv call
 unfolds the pair on its transform's load through the store's q-wedge tables
 (`_shared_pole_q_wedge`, pair-transpose rule, mathdx mode 9), as the GN-PPM
 wedge does, one row pass of whole centroid orbits at a time: the pass's rows of
@@ -372,7 +372,7 @@ the pair enter mode 9 with the load tables cut to the pass
 (`subtile_stream.pass_load`), and the pass's parent Green comes from
 band-complete ψ by one local GEMM (`ppm_tau_kernel._sigma_subtile_kernel`).
 Mode 7 reads the Green's unfold tables placed once per run
-(`ppm_tau_kernel.sigma_door_tables`, through `symmetry_maps.device_load_tables`)
+(`ppm_tau_kernel.sigma_kconv_tables`, through `symmetry_maps.device_load_tables`)
 and cut to the pass the same way, so no window program holds table
 constants. An endpoint map that crosses a mesh shard refuses
 (`GATE shared_pole_w_parent_local`). The factors are read once per Σ call and stay resident:

@@ -3,6 +3,18 @@
 User-visible changes, newest first. Binding rulings behind the breaking
 changes live in `docs/architecture/decisions.md`.
 
+## 2026-10-02 — "door" is gone from the code and the logs
+
+The term "door" is replaced everywhere. A mathdx k-convolution call site and its
+symmetry tables are now a "kconv call" and "kconv tables". A service's top-level
+package is its "public API". A single function that serves one operation is an
+"entry point". The `ffi.fft` router's functions are "factories". Three output
+names change: the stage `response.door_tables` is now `response.kconv_tables`,
+the four-current line reads "four-current mode-11 kconv calls: N kconv calls",
+and the capacity-ledger row `door_tables` is now `kconv_tables`. A parser that
+matched the old names must match the new ones. `minimax.door` is now
+`minimax.serving`; `import minimax` is unchanged. No number moves.
+
 ## 2026-10-01 — the photon bank solves a sample's Dyson value and slope in one program
 
 The four-current bank now forms each sample's W − W∞ and its slope in one program, as
@@ -126,7 +138,7 @@ forced to 5 on Fe 4³ (groups 5,5,5,5,2), eqp0 at maps 0–2 is bitwise to main
 at group 5 and at the default single group, and map 0 compiles two direct
 programs instead of three. Decks whose samples fit one group are unaffected.
 
-## 2026-09-30 — the scalar χ₀ mode-11 door reads its tables as operands
+## 2026-09-30 — the scalar χ₀ mode-11 kconv call reads its tables as operands
 
 The charge response stream on a raw-parent plan (the shared-pole direct
 stream, the moment correlations and the retarded stream) baked its plan's
@@ -141,7 +153,7 @@ the second program). The Fe/Ni 20³ P64 runs compiled this program three times
 at map 0 (34–48 s each), and the Ni run died of host memory during the
 third. At the P64-local shape the stream's temporaries are 13.74 → 13.60 GB
 and its dispatch is unchanged (0.439 s per Green pair). Results are bitwise
-(Fe 4³ scalar and Na 8³ SC, three maps). The Σ τ mode-7 and mode-8 doors
+(Fe 4³ scalar and Na 8³ SC, three maps). The Σ τ mode-7 and mode-8 kconv calls
 still bake their tables.
 
 ## 2026-09-30 — one MPI per process; CPU runs no longer hang in MPI_Init
@@ -192,8 +204,8 @@ The terms are the ones the XLA buffer assignments show:
 - the SUMMA panels;
 - both Dirac halves of the operand faces;
 - the operands that other family pairs keep live (`photon_held_faces`);
-- the placed door tables and mode 11's run-time scratch.
-The ledger door (`memory_per_device_gb`) and `GATE response_photon_passes` are
+- the placed kconv tables and mode 11's run-time scratch.
+The ledger budget (`memory_per_device_gb`) and `GATE response_photon_passes` are
 unchanged. The stage-memory table gets one row, "photon direct stream, row passes
 (…)". Across 20 AOT programs at the Fe 20³ P36-local shape, the count is within
 −3.1 % to +4.9 % of the compiled peak.
@@ -207,9 +219,9 @@ after, and its results are bitwise.
 ## 2026-09-30 — the four-current response compiles without baked symmetry tables
 
 The bispinor four-current χ₀ (mathdx mode 11) now reads its unfold load
-tables as device operands. Each door used to bake its plan's global tables
+tables as device operands. Each kconv call used to bake its plan's global tables
 into the program as constants. Each distinct table array is placed once per
-run (stage `response.door_tables`), and every q batch and SC map reads it.
+run (stage `response.kconv_tables`), and every q batch and SC map reads it.
 No kernel or bundle change.
 
 Fe 20³ P36-local AOT (M_T 900, 2 row passes per family pair, cold cache, 4 ranks per node):

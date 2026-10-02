@@ -32,7 +32,7 @@ from ffi import _services      # noqa: F401  (path bootstrap; dies with the
 
 _services.ensure_on_path()
 
-# The distributed-linalg DOOR: the factor-token type, the q-local batch
+# The distributed-linalg PUBLIC API: the factor-token type, the q-local batch
 # layout, mesh probing and the STABLE mesh cache key.
 #
 # ``mesh_key`` rather than ``id(mesh)`` for the two ANNOUNCEMENT sets below:

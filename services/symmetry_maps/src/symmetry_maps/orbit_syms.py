@@ -596,7 +596,7 @@ A NUMPY SCALAR, AND THE DTYPE IS THE REASON IT IS NOT A PYTHON ``int``.
 This used to be ``jnp.int64(10**12)``, which is a jax Array — and building
 one at module scope MEANS INITIALISING A BACKEND AT IMPORT TIME, because
 ``jnp.int64`` goes through ``asarray`` → ``device_put`` → "which device?".
-So ``import symmetry_maps`` (the door re-exports from
+So ``import symmetry_maps`` (the public API re-exports from
 :mod:`symmetry_maps.qirr_store`, which imports this module) could not
 complete in any process that had no usable backend, whatever it was going
 to do with the package.  That is not hypothetical: it is what took the
@@ -1068,7 +1068,7 @@ def permutation_orbit_labels(permutations) -> np.ndarray:
 
 
 # ─────────────────────────────────────────────────────────────────────────
-# Orbit closure, as a MEASUREMENT you can hold — the public door diagnostic
+# Orbit closure, as a MEASUREMENT you can hold — the public diagnostic
 # ─────────────────────────────────────────────────────────────────────────
 
 #: Closure tolerance, in fractional coordinates, and why this number.
@@ -1291,7 +1291,7 @@ def verify_centroid_orbit_closure(
 
     Reconstructing ``W(Sq)`` from ``W(q)`` in the ISDF basis is a
     permutation of the (μ, ν) indices, and that permutation exists only if
-    every symmetry maps the centroid set into itself.  This is the door
+    every symmetry maps the centroid set into itself.  This is the public
     diagnostic for that prerequisite: it asks, for every op ``s`` and every
     centroid ``x_μ``,
 

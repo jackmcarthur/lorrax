@@ -221,7 +221,7 @@ def mesh_key(mesh_xy) -> tuple:
     Public because LORRAX needs it and there is nowhere else honest to get
     it: ``isdf/core.py`` keys two announcement sets (which do not retain
     their mesh) and used to import ``ffi.linalg._slate._mesh_key`` — a
-    reach past this package's door into a backend-private module, for a
+    reach past this package's public API into a backend-private module, for a
     function that is neither SLATE's nor private in any real sense.  Three
     of this package's four backends had their own copy of it; they all call
     this one now.

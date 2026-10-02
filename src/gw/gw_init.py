@@ -48,11 +48,11 @@ from .gw_config import (
 	uses_direct_bispinor_shared_pole_head,
 )
 
-# ── The ζ file's DOOR ────────────────────────────────────────────────────
+# ── The ζ file's PUBLIC API ──────────────────────────────────────────────
 # ``zeta_q.h5`` (and its bispinor siblings) has exactly one owner, the
 # ``zeta_loader`` service package under ``services/``.  This module reaches
 # it through the TOP-LEVEL package only: ``zeta_loader.format`` /
-# ``zeta_loader.loader`` are past-the-door edges and
+# ``zeta_loader.loader`` are past-the-API edges and
 # ``tests/test_layering.py`` fails on them.
 #
 # ``ffi._services.ensure_on_path()`` is why the import below resolves in a
@@ -75,7 +75,7 @@ _services.ensure_on_path()
 
 from zeta_loader import (probe_zeta_file)
 from file_io.restart_bundle import (open_zeta as ZetaLoader)
-# The vcoul door, for the ONE thing this module needs from it: the
+# The vcoul public API, for the ONE thing this module needs from it: the
 # Cartesian reciprocal rows, taken as a geometry rather than written out as
 # ``blat * bvec`` at the V_q call site below.
 from vcoul import CoulombGeometry                                # noqa: E402
@@ -131,7 +131,7 @@ def _check_zeta_h5_matches_basis(zeta_h5_path, n_rmu, print_fn=print,
 		print_fn(f"  [zeta guard] could not read {zeta_h5_path} "
 		         f"({probe.error}); continuing.")
 		return
-	existing = probe.mu_extent          # μ off the ζ BLOCK (dispatch: door)
+	existing = probe.mu_extent          # μ off the ζ BLOCK (dispatch: public API)
 	zeta_done = probe.zeta_done         # isdf_header/zeta_is_done
 	header_grid = probe.r_mu_fft_idx    # isdf_header/centroids/r_mu_fft_idx
 	if existing is not None and existing != int(n_rmu):
@@ -521,7 +521,7 @@ def _same_wfn_file(old_path, new_path, *, old_bytes=None, new_bytes=None):
 	if new_size is None:
 		# Both spell the same resolved name and neither can be stat'd.
 		# The names agree and the recorded sizes agree, which is every
-		# check this door has; say so rather than refit on absence.
+		# check this entry point has; say so rather than refit on absence.
 		return True, (f"{old_path!r} and {new_path!r} both resolve to "
 		              f"{new_real!r}, which is not present on this node — "
 		              f"the recorded sizes agree, so the spellings are read "
@@ -779,7 +779,7 @@ def _zeta_reuse_ok(zeta_h5_path, provenance_json, centroid_fft_idx,
 		# can pass every check above and still hold a ζ of the wrong
 		# shape — e.g. a run killed after the header write, or a
 		# transverse ζ left over from a different centroids_file_current.
-		# Same door, same never-raising contract as
+		# Same entry point, same never-raising contract as
 		# :func:`_check_zeta_h5_matches_basis` — this site and that one
 		# were the two hand-written copies of the layout dispatch, and the
 		# probe is the one copy now.  ``probe.error`` is the

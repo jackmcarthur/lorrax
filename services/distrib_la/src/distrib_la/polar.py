@@ -38,7 +38,7 @@ _SUPPORTED_DTYPES = (jnp.dtype(jnp.float64), jnp.dtype(jnp.complex128))
 # GEMM avoids a Python/JIT boundary per streamed k-point.
 _KERNEL_CACHE: dict[tuple, Callable] = {}
 
-# The one-shot door also caches plans so a streaming loop cannot accidentally
+# The one-shot entry point also caches plans so a streaming loop cannot accidentally
 # repeat backend probing/dlopen.  Explicit planning remains the preferred
 # spelling when the operation is called from another traced function.
 _PLAN_CACHE: dict[tuple, "PolarPlan"] = {}

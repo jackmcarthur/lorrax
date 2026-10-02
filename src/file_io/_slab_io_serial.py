@@ -9,7 +9,7 @@ every cell of a multi-device mesh.
 
 Why this is not the tier that was deleted (2026-08-06, ``slab_io.py:21``).
 ``H5PY_ALLGATHER`` gathered the whole global array **onto rank 0** — an OOM
-at the design envelope, refused at seven separate doors and deleted for it.
+at the design envelope, refused at seven separate entry points and deleted for it.
 The difference here is checkable rather than rhetorical: at
 ``process_count() == 1`` this process already holds every shard of every
 mesh-sharded array, because all N devices are its own.  So this backend
@@ -47,7 +47,7 @@ process") is therefore not weakened by this module: whatever the emulation
 already forced onto this process is what it moves, plus one shard of
 staging.  The doctrine is spent by the emulation itself, which is also why
 this tier is scoped to ``P == 1`` and can never be selected on a real
-multi-process run — the seven-doors failure mode.
+multi-process run — the seven-entry-points failure mode.
 
 What it refuses.  ``process_count() > 1``, a non-emulated mesh, a
 non-``cpu`` mesh platform and a mode outside ``w``/``a``/``r`` — all at
@@ -55,7 +55,7 @@ construction, all by name.  It is a tier chosen from a predicate, never a
 fallback from a failed transport: nothing in this module or in ``slab_io``
 catches an FFI error and lands here.  The ``p*q != process_count()``
 refusals elsewhere in the tree are untouched and still fire on an emulated
-mesh — that is what makes this a second door rather than a relaxation of
+mesh — that is what makes this a second route rather than a relaxation of
 the first, and ``tests/test_slab_io_emulated_mesh.py`` observes it for the
 phdf5 one.  Where they are, at ``9681eda6``, from
 ``grep -rnE '!= *(int\\()?jax\\.process_count\\(\\)|!= *(int\\()?process_count\\(\\)|!= *world\\b'``
@@ -68,7 +68,7 @@ pattern cannot see refusals spelled positively (``==`` then raise), the C++
 backstop at ``ffi/cpp/phdf5/shard_index.h:298``, ``tools/``, or any ref but
 this one.  The related-but-different mesh-vs-world guard in
 ``common/collectives.py:734`` (``psum_replicate``) is not in that set and
-is not a transport door.
+is not a transport route.
 
 What it is not for.  Production.  An emulated run is device-parallel inside
 each jit and serial across everything a real run parallelises over
@@ -80,7 +80,7 @@ One HDF5 library instance per open file still holds (audit A1;
 ``docs/architecture/slab_io.md#one-owner``).  This backend declares its open
 to :mod:`file_io.hdf5_owner` under ``STACK_H5PY`` — the stack it actually
 uses — so a caller holding its own h5py handle on the same path is refused
-by the same door that refuses it against the FFI.
+by the same entry point that refuses it against the FFI.
 """
 from __future__ import annotations
 
@@ -218,7 +218,7 @@ class _SerialBackend(_DatasetGeometry):
     #: ``h5py``, not ``ffi``: every HDF5 call this tier makes goes through
     #: h5py's bundled libhdf5, and ``file_io.slab_io`` stamps its own
     #: journal lines with this.  Read the note beside ``_FfiBackend.
-    #: journal_stack`` for why the door does not name a library of its own.
+    #: journal_stack`` for why the entry point does not name a library of its own.
     journal_stack = STACK_H5PY
 
     def __init__(self, path: str, mesh: Mesh, *, mode: str) -> None:
@@ -511,7 +511,7 @@ class _SerialBackend(_DatasetGeometry):
             op="write_slab", name=name, valid_shape=valid_shape,
             slab_shape=slab_shape, offset=off, ds_shape=ds_shape)
 
-        # No ``op_scope`` here.  ``SlabIO.write_slab`` — the public door —
+        # No ``op_scope`` here.  ``SlabIO.write_slab`` — the public entry point —
         # already opens one for this op with the same ds/off/cnt/mode, and
         # the journal's stated contract is that "one slab read or write is
         # **one** line" (docs/architecture/slab_io.md#journal).  The FFI
@@ -563,7 +563,7 @@ class _SerialBackend(_DatasetGeometry):
     def read_whole(self, name: str, *, dtype=None):
         """The whole small dataset as a host ``np.ndarray``.
 
-        The scalar door: an H5 rank-0 dataspace has no hyperslab, so
+        The scalar entry point: an H5 rank-0 dataspace has no hyperslab, so
         :meth:`read_slab` cannot express the request on either tier.
         """
         arr = np.asarray(self._h5[name][()])

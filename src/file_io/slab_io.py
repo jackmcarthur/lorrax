@@ -25,9 +25,9 @@ There used to be three, selected by a ``slab_io`` deck key through an
 
 * ``H5PY_ALLGATHER`` gathered the whole global array onto rank 0 and
   wrote it with serial h5py.  It was refused above one process at SEVEN
-  separate doors, each closure landed and reported as complete, and an
-  eighth door kept being found.  A tier that must be refused at seven
-  doors is not a tier; it is dead code wearing a safety label.  DELETED
+  separate entry points, each closure landed and reported as complete, and an
+  eighth entry point kept being found.  A tier that must be refused at seven
+  entry points is not a tier; it is dead code wearing a safety label.  DELETED
   — the module, the enum member, the deck value, and all seven refusals.
   The doctrine it kept violating ("there should always exist a valid path
   that does not materialize N_mu^2 on any proc because it is a guaranteed
@@ -140,7 +140,7 @@ __all__ = ["SlabIO", "StreamedBank", "remove_stale_streamed_banks", "assert_avai
 #: ``h5_journal.rank0.log``).  The journal's whole subject is which HDF5
 #: library instance touched a file — it is read alongside
 #: ``file_io.hdf5_owner``'s verdict, which is keyed on the same names — so
-#: a door that stamps the wrong library defeats the instrument.  Each
+#: an entry point that stamps the wrong library defeats the instrument.  Each
 #: backend now declares its own; see ``_FfiBackend.journal_stack`` and
 #: ``_SerialBackend.journal_stack``.
 
@@ -211,11 +211,11 @@ class SlabIO:
         # runs — never from a transport that failed.  An emulated mesh
         # (P == 1, more mesh cells than processes) has no per-process MPI
         # world to derive a per-rank hyperslab from, so ``ffi.io.open_file``
-        # refuses it and is right to; the serial tier is the second door for
+        # refuses it and is right to; the serial tier is the second route for
         # that one geometry, and it moves only shards this single process
         # already owns.  See ``_slab_io_serial`` for why this is not the tier
         # deleted in 2026-08-06, and ``tests/test_slab_io_emulated_mesh.py``
-        # for the cell proving the FFI door still refuses.
+        # for the cell proving the FFI route still refuses.
         #
         # The class is chosen before it is constructed so the journal's stack
         # name is known even for an open that raises: a failed open is the
@@ -539,7 +539,7 @@ class SlabIO:
     def read_small(self, name: str, *, dtype=None) -> np.ndarray:
         """Read a WHOLE small dataset into a host ``np.ndarray``, every rank.
 
-        THE RANK-0 / SCALAR DOOR, and the reason it is a separate method
+        THE RANK-0 / SCALAR ENTRY POINT, and the reason it is a separate method
         rather than a ``shape=()`` case of :meth:`read_slab`: a scalar
         HDF5 dataspace has NO hyperslab, so the sharded read handler
         cannot express the request at all.  ``read_slab`` refused it with
@@ -618,7 +618,7 @@ class SlabIO:
         packing.  A caller whose windows are not sorted argsorts the tables
         and permutes the window axis back — both cheap.
 
-        WHY THIS IS A DOOR PRIMITIVE and not n :meth:`read_slab` calls
+        WHY THIS IS ONE PUBLIC PRIMITIVE and not n :meth:`read_slab` calls
         (MEASURED 2026-08-07, CPU milan, 2x2 mesh, both arms through the
         same handle; artifacts ``_measure_fold/``).  The fold-down loses on
         every deck measured: warm-min ratios 3.58x / 3.22x / 1.44x against

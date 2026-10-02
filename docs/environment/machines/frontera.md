@@ -34,7 +34,7 @@ All scripts are in `config/frontera/`; the order is the layer table in the
 
 `mpi_transport_env.sh` applies the Intel MPI transport settings
 unconditionally; the launch template sources it. The CPU distributed eigh is
-ScaLAPACK `pzheevd` in the host `.so`, reached through the `distrib_la` door
+ScaLAPACK `pzheevd` in the host `.so`, reached through the `distrib_la` public API
 ([services](../../architecture/services.md#ffilinalg)).
 
 ## 3. Cold start

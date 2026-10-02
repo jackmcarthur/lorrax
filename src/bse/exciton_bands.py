@@ -34,7 +34,7 @@ every Q of a user-supplied high-symmetry path with ONE compiled engine:
       ``--vq-mode=refit``   per-Q ζ refit (compute-don't-interpolate — the
                             off-grid GROUND TRUTH; expensive).  Nothing in
                             it is 2-D: on a ``sys_dim=3`` deck it contracts
-                            with the PRODUCER's own Coulomb door, so it is
+                            with the PRODUCER's own Coulomb entry point, so it is
                             the arbitrary-Q exchange a bulk crystal runs,
                             not merely a checking mode.
       ``--vq-mode=both``    interp on the full path + refit on
@@ -1901,7 +1901,7 @@ def main(argv=None):
                 # NO interpolation model is built at all.  The b26p long-range fit
                 # is the slab-only half of vq_interp; the refit path fits ζ at the
                 # target Q from the htransform ψ and contracts it with the
-                # producer's own Coulomb door.  So this branch loads ζ and stops.
+                # producer's own Coulomb entry point.  So this branch loads ζ and stops.
                 zx = vq_interp.read_vq_payload(restart_file, zeta_path,
                                                 mesh=mesh_xy, log_fn=log, input_file=args.input,
                                                 require_slab=False,
@@ -2158,7 +2158,7 @@ def main(argv=None):
             psi_cQ_Y = psi_cQ_Y[sel]
             eps_cQ = eps_cQ[sel]
 
-        # ── W_R once (the k-convolution router's k-minor door), then the single-compile scan ──
+        # ── W_R once (the k-convolution router's k-minor factory), then the single-compile scan ──
         t0 = time.time()
         sh = make_bse_shardings(mesh_xy)
         _ifftn = make_kfft_kminor(mesh_xy, (nkx, nky, nkz), sh.W.spec,

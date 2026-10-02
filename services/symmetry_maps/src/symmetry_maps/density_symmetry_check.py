@@ -901,7 +901,7 @@ def _enforce_policy(
 
 
 def cached_density_symmetry_check(loader) -> DensitySymmetryReport:
-    """Cached front door used by ``WfnLoader``: process cache, then stamp."""
+    """Cached entry point used by ``WfnLoader``: process cache, then stamp."""
     mode = trs_check_mode()
     tol = _env_float("LORRAX_TRS_TOL", TOL_TRS)
     max_k = _env_int("LORRAX_TRS_MAX_K", MAX_K_DEFAULT)

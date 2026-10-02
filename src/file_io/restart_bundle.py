@@ -2208,7 +2208,7 @@ class _ZetaGTiles:
     make: it is the documented contract of
     :meth:`zeta_loader.ZetaLoader.read_zeta_G_local` — *local by design,
     per-rank independent, do not make this collective* — because the plan
-    it describes moved INTO the door, where the one owner of the file can
+    it describes moved INTO that method, where the one owner of the file can
     hold it to that promise.  What stays here is the consequence: every
     ``__getitem__`` caller in this module is a replicated host diagnostic
     (``recon``, ``run_gates``, ``run_nulls``); those are the mirrors
@@ -3427,7 +3427,7 @@ def read_w_columns_collective(
     geometry identical.  A short final column block is zero-filled to the
     fixed buffer width and ``valid_shape`` prevents those zeros from reading
     bytes belonging to the next block.  This is the surgical single-read
-    door; a scheduled fit must use :class:`WColumnReader` so its epoch does
+    entry point; a scheduled fit must use :class:`WColumnReader` so its epoch does
     not reopen the same source once per column block.
     """
     hdr = read_w_header(src, name) if header is None else header
@@ -3451,7 +3451,7 @@ def read_w_tables(src, name, *, mode="r"):
     to it was an h5py open the ownership registry could not see — the one
     blind spot in this module's one-owner invariant, and not a rare one:
     it runs on EVERY RANK in production (``gw/mpa/fit_driver.py``'s
-    unfold-table read).  The door takes the open and hands the already-open
+    unfold-table read).  The entry point takes the open and hands the already-open
     group on, so the format layer still owns the reading and the registry
     still owns the counting (audit §E.3 item 2).
     """

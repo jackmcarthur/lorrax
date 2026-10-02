@@ -26,7 +26,7 @@ test = ["pytest>=8.0.0", "numpy"]
 # arrays.  The module imports h5py lazily, inside the functions that open
 # the file, and `test_symmetry_maps_import_isolation.py` measures that
 # `import symmetry_maps` leaves h5py out of `sys.modules` even with the
-# store on the door.
+# store on the public API.
 store = ["h5py"]
 
 [tool.setuptools.packages.find]

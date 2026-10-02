@@ -1096,7 +1096,7 @@ static void async_read_kchunk_union_worker(
     //    to the n-th selected memory element, both in row-major order, so
     //    reading packed and then walking the memory selection's own
     //    (offset, length) runs in order puts every element exactly where the
-    //    one-shot union H5Dread put it (the door's windows are disjoint and
+    //    one-shot union H5Dread put it (the caller's windows are disjoint and
     //    ascending, and rows are the outermost dim of both orders).
     //  * A WFN band block (each window whole along the dims after the one
     //    the windows vary in) is read INDEPENDENTLY: its file runs are long,

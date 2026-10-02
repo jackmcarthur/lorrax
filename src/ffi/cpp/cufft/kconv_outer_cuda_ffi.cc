@@ -30,7 +30,7 @@
 //
 // Limits (named refusals; ffi.fft.klead_outer_refusal mirrors them and routes such a shape to
 // the unfused chain): the 64-column bank in opt-in shared memory, every axis <= 40 (the fp64
-// cuFFTDx thread FFT), K a multiple of 4 (the door zero-pads), complex128 only.
+// cuFFTDx thread FFT), K a multiple of 4 (the kconv call zero-pads), complex128 only.
 //
 // The NVRTC build, the disk cache and the version keying are common/nvrtc_build.h's, exactly
 // as the family's (the same mathdx toolchain headers enter the key).
@@ -96,7 +96,7 @@ struct OuterGeo {
 
 constexpr int NX = LRX_NX, NY = LRX_NY, NZ = LRX_NZ, NK = NX * NY * NZ;
 constexpr int KK = LRX_K, XB = 8, YB = 8, TR = XB * YB, NWARP = LRX_THREADS / 32;
-static_assert(KK % 4 == 0, "K is a multiple of the m8n8k4 chunk (the door zero-pads)");
+static_assert(KK % 4 == 0, "K is a multiple of the m8n8k4 chunk (the kconv call zero-pads)");
 using GK = lrx_kbox::Geo<NX, NY, NZ>;
 
 // The family's kernel multiply (kconv_mathdx_cuda_ffi.cc lrx_mul), spelled identically.
@@ -413,7 +413,7 @@ static ffi::Error KleadOuterConvKsum(cudaStream_t stream, ffi::AnyBuffer L, ffi:
 // scaled partial to its own slot; the combo that completes an item (a counter) sums the item's
 // slots in phase order into A (nk, n_c, b, my): deterministic, no atomics on data, no waiting.
 // The handler plans ngrp from the wave count, with the slots capped at 1/16 of U's bytes.
-// Operands arrive in fragment order from the door, so every warp load is 512 contiguous bytes
+// Operands arrive in fragment order from the kconv call, so every warp load is 512 contiguous bytes
 // and needs no predicate:
 //   Lr  (na, nxb, NK, H, 8, 4)      lane (g, t) of chunk h at k:  L[k, a, 8 xb + g, 4h + t]
 //   Rr  (nb, nyb, NK, H, 8, 4)      lane (g, t) of chunk h at k:  R[k, 4h + t, b, 8 yb + g]
@@ -464,7 +464,7 @@ constexpr int KK = LRX_K, H = KK / 4, MB = LRX_MB, TR = 64, NWARP = LRX_THREADS 
 constexpr int GT = LRX_THREADS / 2, GW = NWARP / 2;   // threads and warps of one group
 constexpr int KW = (NK + NWARP - 1) / NWARP;
 constexpr unsigned SLOT = NK * MB * 64;            // one combo's partial, complex elements
-static_assert(KK % 4 == 0, "K is a multiple of the m8n8k4 chunk (the door zero-pads)");
+static_assert(KK % 4 == 0, "K is a multiple of the m8n8k4 chunk (the kconv call zero-pads)");
 static_assert(LRX_THREADS == 512, "two groups of 8 warps");
 using GK = lrx_kbox::Geo<NX, NY, NZ>;
 

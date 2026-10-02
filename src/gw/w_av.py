@@ -97,7 +97,7 @@ def unfold_source_q_scalars(source_values, metadata):
         raise ValueError("W-av target_source_row is outside the source table")
     # A scalar density response is invariant under the spatial/antiunitary
     # q-star action.  Vector wings and centroid bodies use their existing
-    # symmetry-service actions instead of passing through this scalar door.
+    # symmetry-service actions instead of passing through this scalar entry point.
     return values[rows]
 
 

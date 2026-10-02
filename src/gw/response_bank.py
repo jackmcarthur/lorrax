@@ -421,8 +421,8 @@ def _response_stream_kernel(mesh_xy, kgrid, n_outputs, shape, *, _ffi_key, **opt
     moment stream's segment programs, one per stream or four-current family
     pair, and the group programs) met again at every SC map, so every program
     is kept: a cache smaller than the set rebuilt every factory and re-lowered
-    every program on every map.  A program binds its plan's placed door tables, which the door
-    caches (``w_isdf._CHARGE_DOORS``, ``_PHOTON_DOORS``) hold and the ledger
+    every program on every map.  A program binds its plan's placed kconv tables, which the kconv call
+    caches (``w_isdf._CHARGE_KCONV``, ``_PHOTON_KCONV``) hold and the ledger
     reserves; when a cache evicts a plan, its programs and their executables are
     dropped with it (:func:`_release_evicted_programs`), so no table outlives
     its reservation.
@@ -438,10 +438,10 @@ def _response_stream_kernel(mesh_xy, kgrid, n_outputs, shape, *, _ffi_key, **opt
 
 
 def _release_evicted_programs():
-    """Drop the stream programs, and their executables, that bind an evicted plan's door tables."""
-    from .w_isdf import placed_door_tables_live
+    """Drop the stream programs, and their executables, that bind an evicted plan's kconv tables."""
+    from .w_isdf import placed_kconv_tables_live
     for key in [k for k, kernel in _STREAM_KERNELS.items()
-                if not placed_door_tables_live(getattr(kernel, "tail", ()))]:
+                if not placed_kconv_tables_live(getattr(kernel, "tail", ()))]:
         dead = _STREAM_KERNELS.pop(key)
         for entry in [entry for entry in _COMPILED if entry[0] is dead]:
             del _COMPILED[entry]
@@ -1147,7 +1147,7 @@ def streamed_moment_totals(wfns, meta, *, mesh_xy, qids, width, execute, ordered
     ``f E^a`` and ``u E^b``; the node-to-output weights add ``-1j (ahead -
     behind) pref c`` (even) or ``(ahead - behind) pref c`` (odd) to its total,
     the bare correlation :func:`exact_bare_moments` forms one q batch at a
-    time.  Row passes run outer and every parent inner, so each door and
+    time.  Row passes run outer and every parent inner, so each kconv call and
     transform runs once per map instead of once per q batch.  Each finished
     pass goes to a :class:`file_io.slab_io.StreamedBank` whose outputs are the
     totals of one q batch of ``width`` parents, so a batch's totals are read
@@ -1231,7 +1231,7 @@ def compute_moment_bank(wfns, meta, config, *, mesh_xy, sym, bank_io,
     _, _, moments, receipt["algebra"] = response_algebra(meta, config,
         mesh_xy=mesh_xy, n=n, ordered=ordered, photon=vertex is not None)
     # Every parent's totals in one stream (correlations outer would repeat each
-    # door per q batch); a bank partly written by an earlier attempt, the
+    # kconv call per q batch); a bank partly written by an earlier attempt, the
     # four-current bank and a backend without the row-pass engine take the
     # per-batch correlations.  A streamed batch holds its totals and the next
     # batch's (read ahead), H, the Dyson outputs and its temporaries (3 faces
@@ -1721,11 +1721,11 @@ def _stream_executable(wfns, meta, mesh_xy, support, *, q_ids, n_outputs, ordere
 def _direct_passes(wfns, meta, mesh_xy, q_count):
     """The charge direct stream's row passes (``w_isdf._direct_pass_plan``), or ``None``
     when it does not run on mathdx mode 11 from raw parents."""
-    from .w_isdf import _chi_door_serves, _direct_pass_plan
+    from .w_isdf import _chi_kconv_serves, _direct_pass_plan
     import minimax
     parent = wfns.green_parent
     kgrid, ns = (meta.nkx, meta.nky, meta.nkz), int(meta.nspinor)
-    if parent is None or not _chi_door_serves(mesh_xy, kgrid, ns):
+    if parent is None or not _chi_kconv_serves(mesh_xy, kgrid, ns):
         return None
     return _direct_pass_plan(mesh_xy, kgrid, parent.plan, n_rmu=meta.mu_basis.n_packed, ns=ns,
                              n_band=int(wfns.slices.nb_full), q_count=q_count,
@@ -1779,25 +1779,25 @@ def _photon_canonical(families, mesh_xy):
 def _stream_scratch(wfns, meta, mesh_xy, vertex):
     """Run-time scratch of the stream outside its compiled temporaries:
     mathdx mode 11's split arm on a raw-parent plan (w_isdf direct stream); for
-    the four-current stream, the largest family pair's door on its whole tile
+    the four-current stream, the largest family pair's kconv call on its whole tile
     (a bound on every row pass's)."""
-    from .greens_function_kernel import chi0_door_scratch
+    from .greens_function_kernel import chi0_kconv_scratch
     kgrid = (meta.nkx, meta.nky, meta.nkz)
     if vertex is not None:
         from .photon_layout import FAMILY_PAIRS, family_channels
         carrier = vertex.families.packed_layout.carrier_extent
-        return max(int(chi0_door_scratch(
+        return max(int(chi0_kconv_scratch(
             kgrid=kgrid, n_parent=int(vertex.families.n_parent),
             n_rmu=carrier(family_channels(L)[0]), ns=2, mesh=mesh_xy,
             n_right=carrier(family_channels(R)[0]))) for L, R in FAMILY_PAIRS)
     parent = wfns.green_parent
     if parent is None:
         return 0
-    from .w_isdf import _chi_door_serves
+    from .w_isdf import _chi_kconv_serves
     ns = int(meta.nspinor)
-    if not _chi_door_serves(mesh_xy, kgrid, ns):
+    if not _chi_kconv_serves(mesh_xy, kgrid, ns):
         return 0
-    return int(chi0_door_scratch(kgrid=kgrid, n_parent=int(parent.plan.n_parent),
+    return int(chi0_kconv_scratch(kgrid=kgrid, n_parent=int(parent.plan.n_parent),
                                  n_rmu=meta.mu_basis.n_packed, ns=ns, mesh=mesh_xy))
 
 
@@ -2212,13 +2212,13 @@ def produce_sample_bank(wfns, meta, config, *, mesh_xy, sym, sample_plan, bank_i
             extra=() if vertex is None else (contact,), mirrored=mirror is not None)))
         tables_reserved = []
 
-        def reserve_door_tables():
-            """The door tables a stream placed stay on the devices beside every later
+        def reserve_kconv_tables():
+            """The kconv tables a stream placed stay on the devices beside every later
             phase: a live stage, counted once (after the first stream program is built)."""
             nonlocal ambient
             if vertex is None and not tables_reserved:
-                from .w_isdf import charge_door_table_bytes
-                tables, _ = _reserve(meta, "door_tables", charge_door_table_bytes())
+                from .w_isdf import charge_kconv_table_bytes
+                tables, _ = _reserve(meta, "kconv_tables", charge_kconv_table_bytes())
                 tables_reserved.append(tables)
                 ambient += (tables,)
                 ledger.live_stages = ambient
@@ -2234,7 +2234,7 @@ def produce_sample_bank(wfns, meta, config, *, mesh_xy, sym, sample_plan, bank_i
             # temporaries do not grow with the group, only the donated carry does.
             workspace, whole = _stream_workspace(wfns, meta, mesh_xy, support, q_ids=response_rows,
                 n_outputs=2*len(z), ordered=ordered, vertex=vertex)
-            reserve_door_tables()
+            reserve_kconv_tables()
             with timing.section('bank.plan.direct'):
                 size, fixed, room, live = response_group_size(meta, mesh_xy, n_samples=len(z),
                     carry_per_sample=carry_per_sample, stream_workspace=workspace,
@@ -2317,11 +2317,11 @@ def produce_sample_bank(wfns, meta, config, *, mesh_xy, sym, sample_plan, bank_i
             # Slots: the largest rule group's members (empty slots add zeros nobody reads).
             rules["slots"] = max(len(g["members"]) for g in rules["groups"])
             pass_carry = 2*rules["slots"]*len(response_rows)*16*max(r*c for r, c, _ in segments[0])
-            # The first segment's program places the door tables the rest share.
+            # The first segment's program places the kconv tables the rest share.
             response_stream(wfns, meta, mesh_xy=mesh_xy, q_ids=response_rows,
                 n_outputs=2*rules["slots"], pair_mode="direct", bank_carry=True, ordered=ordered,
                 vertex=vertex, band_ranges=rules["band_ranges"], stream_pass=0)
-            reserve_door_tables()
+            reserve_kconv_tables()
             finish = segments[2]
             receipt["bank_residence"].update(stream_bank.receipt(),
                 device_bytes_per_rank=max(stream_bank.in_flight*pass_carry, 3*carry_per_sample))

@@ -32,7 +32,7 @@ and say so in prose (``_slab_io_ffi.close``'s deferred rank-0 reopen,
 ``tagged_arrays``' "SlabIO has released the file and no other writer may
 open it between these two statements", ``mpa_store``'s barrier-separated
 allocate).  That is a convention every new call site has to rediscover.
-This module turns it into an invariant enforced at the door.
+This module turns it into an invariant enforced at the entry point.
 
 WHAT IS ENFORCED, AND WHY EXACTLY THAT
 --------------------------------------
@@ -230,7 +230,7 @@ def _alternation_refusal(path, stack, mode, where, rec) -> str:
 
 
 # ---------------------------------------------------------------------------
-# The door
+# The entry point
 # ---------------------------------------------------------------------------
 
 def _live_verdict_locked(key: str) -> str:

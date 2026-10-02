@@ -48,12 +48,12 @@ _services.ensure_on_path()
 import minimax as _mm                                        # noqa: E402
 from .minimax_config import MinimaxConfig                     # noqa: E402
 
-#: The ``complex_laplace`` family's selection rule, off the DOOR rather
+#: The ``complex_laplace`` family's selection rule, off the PUBLIC API rather
 #: than by `from minimax import beta_selector` -- which is a submodule
 #: reach and which `test_layering` refuses, correctly.  The service
 #: publishes this module as part of its public surface for exactly this
 #: consumer; binding it here keeps the call sites short without spending
-#: the door rule to do it.
+#: the public-API rule to do it.
 
 
 _TINY = 1.0e-12
@@ -135,7 +135,7 @@ def _scalar_to_host_float(a) -> float:
 #  THE SOLVERS LEFT THIS MODULE (2026-08-08); THE CATALOG AND THE DISK CACHE
 #  ARE DELETED (no quadrature rule is stored across runs, 2026-09-28).
 #
-#  They are `services/minimax/` now, reached through the door as `_mm`.  What
+#  They are `services/minimax/` now, reached through the public API as `_mm`.  What
 #  used to sit here was ~190 lines carrying six `except Exception:` handlers
 #  that turned every lookup failure -- a missing catalog, an unreadable
 #  table, a malformed entry, a failed cache write -- into the same silent
@@ -144,7 +144,7 @@ def _scalar_to_host_float(a) -> float:
 #  The service replaces each of those with a value the caller can see, and
 #  every rule it serves now announces where it came from.
 #
-#  WHAT STAYED HERE, and why: the RESCALE.  The door serves tables in the
+#  WHAT STAYED HERE, and why: the RESCALE.  The public API serves tables in the
 #  scaled units the catalog tabulates (`[1, R]` for the Laplace families,
 #  `[0, A]` for the crossing one); the three wrappers below divide by
 #  `x_min` and name windows in Rydberg.  Keeping that split is what makes
@@ -1170,7 +1170,7 @@ def solve_laplace_minimax_imag_interval(
     # `complex_laplace` bundle is the campaign that answers it -- its
     # target's real part IS this function -- and the beta axis is what
     # makes those entries selectable.  So the path is two-branch now: ask
-    # the axis for a certified table, and fall through to the door's
+    # the axis for a certified table, and fall through to the public API's
     # announced escape hatch when it refuses.  A refusal costs an
     # explanation and nothing else; under R1 stage 2 it becomes the error.
     served = _mm.serve(

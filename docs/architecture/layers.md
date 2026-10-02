@@ -27,7 +27,7 @@ name is relative to its source root. `lxkit` and `distrib_la` are L3 packages
 `zeta_loader`, `symmetry_maps`, `vcoul` and `minimax` take the L1 default.
 Levels order modules within one distribution unit. An import of a service's
 top-level package is not ranked; rule 6 governs it instead: lorrax reaches a
-service through its door and nowhere else.
+service through its public API (its top-level package) and nowhere else.
 
 ---
 
@@ -127,8 +127,8 @@ projection and reshard), `common/staged_reshard.py` (its movement-only
 sibling), `common/sharding_fit.py` (a `PartitionSpec` that is legal for the
 extents in hand).
 
-**FFT front doors**: `common/fft_helpers.py`, the flat-k transform and the
-k-convolution router's doors re-exported from `ffi.fft`
+**FFT entry points**: `common/fft_helpers.py`, the flat-k transform and the
+k-convolution router's factories re-exported from `ffi.fft`
 ([FFI layer](ffi_layout.md#k-convolution-router-and-the-mathdx-family)), plus
 the `shard_map`-interior `local_*fftn3` aliases.
 
@@ -156,7 +156,7 @@ readers above it (`epsreader`, `mf_header`, `sigma_output`, `tagged_arrays`,
    order, de-promotion, divisibility refusal, which GEMM backend answered.
 2. **`centroid/kmeans_isdf.py`: L2.** Lloyd's algorithm under a metric tensor
    lifts into any code unchanged. Its orbit canonicalisation comes through the
-   `symmetry_maps` door, which rule 6 governs. The registered fix is to inject
+   `symmetry_maps` public API, which rule 6 governs. The registered fix is to inject
    the orbit map as a parameter, which is a signature change.
 3. **Pivoted Cholesky: split.** `centroid/pivoted_cholesky.py` is L1: it owns
    ψ-based Gram construction, ISDF candidate policy and reporting. The greedy
@@ -189,7 +189,7 @@ readers above it (`epsreader`, `mf_header`, `sigma_output`, `tagged_arrays`,
     vocabulary. Between two levels that both fit, L3 is the tighter
     assignment, since L3 may import nothing above itself.
 11. **Minimax: a service plus two L1 modules.** The physics-free quadrature
-    solver is the `minimax` service (reached through its door).
+    solver is the `minimax` service (reached through its public API).
     `gw/minimax_config.py`, which picks a target error for a screening
     integral, and `gw/minimax_screening.py`, which extracts PPM poles, are L1.
 

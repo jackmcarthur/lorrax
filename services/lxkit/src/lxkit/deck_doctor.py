@@ -1,6 +1,6 @@
 """Login-safe preflight for one LORRAX GW input deck.
 
-The deployed ``lx`` front door runs this module in a one-rank step.  Its
+The deployed ``lx`` launcher runs this module in a one-rank step.  Its
 default step owns no GPU and forces the CPU JAX backend; ``--gpu`` instead
 uses one GPU to add live device and provider evidence.  The requested
 science geometry is inspected, never allocated by the doctor step.

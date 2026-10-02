@@ -1446,7 +1446,7 @@ def _resolve_sc_eigh(nb: int, mesh_xy: Mesh, config, *, print_fn) -> str:
 
 
 def _sc_eigh_bands(H: jax.Array, *, kind: str, mesh_xy: Mesh, config):
-    """One repeated-eigh door for SC-QSGW and fixed-Sigma evSC.
+    """One repeated-eigh entry point for SC-QSGW and fixed-Sigma evSC.
 
     ``distrib_la`` owns both routes.  A large tile uses its explicitly
     distributed backend; a fit-size stack uses its ``batch_reshard`` route,
@@ -1475,7 +1475,7 @@ def qp_eigh(H: jax.Array, *, mesh_xy: Mesh, config, print_fn):
     """``(E, U)`` of a QP Hamiltonian stack through :func:`_sc_eigh_bands`.
 
     The one-shot and fixed-point QP solves diagonalise ``H = kin_ion + Σ``
-    through the same door as every SC map (so SC map 0 and the one-shot share
+    through the same entry point as every SC map (so SC map 0 and the one-shot share
     their eigensolver): ``H`` is hermitised on the band grid, the k batch is
     staged over the mesh (or each tile distributed, per
     :func:`_resolve_sc_eigh`), ``E`` returns replicated and ``U`` is

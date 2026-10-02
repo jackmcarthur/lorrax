@@ -1,4 +1,4 @@
-"""Standalone host Gauss--Legendre rules shared through the vcoul door."""
+"""Standalone host Gauss--Legendre rules shared through the vcoul public API."""
 from __future__ import annotations
 
 import functools

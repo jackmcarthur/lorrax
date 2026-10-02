@@ -7,7 +7,7 @@ surface.  Numbers in, numbers out — no decks, no HDF5, no ``wfn`` loader,
 no ``Meta``.  The deck keys, the head-resolver ladder and the file paths
 stay in ``gw``; this package is what they compute WITH.
 
-THE PACKAGE IS THE DOOR.  Everything a consumer needs is a top-level name
+THE PACKAGE IS THE PUBLIC API.  Everything a consumer needs is a top-level name
 here; importing ``vcoul.<submodule>`` from lorrax is a layering violation
 the monorepo's ``tests/test_layering.py`` fails on.
 
@@ -81,7 +81,7 @@ WHO CALLS WHAT
     of Si's 64 q, so that shape could not express the fix.
 ``build_miniBZ_dq_cart(kgrid, bvec, ...)``
     The centrosymmetric ``{δq} = {−δq}`` mini-BZ draw the head above
-    averages over — on the door because the closure is a correctness
+    averages over — on the public API because the closure is a correctness
     requirement of the injection, not an implementation detail.
 ``bare_coulomb_sphere_indices`` / ``bare_coulomb_sphere_mask``
     "Which G are in q's sphere".  ``common.coulomb_sphere`` pads the
@@ -148,7 +148,7 @@ from vcoul.sphere import (
 #: ``Common/minibzaverage.f90``'s inner expression, not a public formula)
 #: but it has a real cross-package consumer — ``bse.vq_interp`` builds the
 #: 2D slab per-Q exchange head with ``kind="slab_lr"`` — so it is on the
-#: door rather than reached for through a submodule.
+#: public API rather than reached for through a submodule.
 from vcoul.minibz import _minibz_kernel_bare
 
 __all__ = [

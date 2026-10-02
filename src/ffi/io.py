@@ -293,7 +293,7 @@ counts), and the same compiled module handles any offsets/counts
 combination at the same shapes/dtypes.
 
 Preferred public entry point remains :mod:`file_io.slab_io`, whose
-``read_slab`` / ``read_slabs`` are the door onto these two.
+``read_slab`` / ``read_slabs`` are the public entry points onto these two.
 """
 
 _TARGET_READ = "lorrax_phdf5_read"

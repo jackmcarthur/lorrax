@@ -1,6 +1,6 @@
 """Numerical quadrature service for LORRAX frequency kernels.
 
-The package is the public door: consumers import ``minimax`` and never its
+The package is the public API: consumers import ``minimax`` and never its
 submodules. Importing the package loads no JAX or SciPy. Rule constructors
 load optional numerical libraries only when called.
 
@@ -24,7 +24,7 @@ See ``docs/services/minimax.md`` for units, error currencies and certificates.
 
 from __future__ import annotations
 
-from minimax.door import (
+from minimax.serving import (
     family_for_character,
     noncrossing_kappa0,
     reset_announcements,
@@ -51,13 +51,13 @@ from minimax.targets import (
     families_for_character,
 )
 
-#: The solver half, reached lazily: the names the door itself calls.
+#: The solver half, reached lazily: the names the serving module itself calls.
 #: Lazy because :mod:`minimax.solver` is the service's ONLY scipy consumer,
 #: so ``import minimax`` never imports an optimiser.
 _SOLVER_NAMES = (
     # target functions
     "G_hgl", "G_fermi", "tau_max_hgl", "tau_max_fermi",
-    # the two grid drivers the door reaches
+    # the two grid drivers the serving module reaches
     "noncrossing_imag_grids", "crossing_grids",
     # the solvers under them
     "solve_noncrossing_imag", "solve_crossing",
@@ -106,7 +106,7 @@ _MATSUBARA_RULE_NAMES = ("matsubara_response_rule",)
 
 
 def __getattr__(name: str):
-    """PEP 562 lazy door for the solver half.
+    """PEP 562 lazy loader for the solver half.
 
     ``from minimax import crossing_grids`` imports scipy at that
     moment and not before.  ``import minimax`` never does.
@@ -161,7 +161,7 @@ __all__ = [
     "families_for_character", "family_for_character",
     # --- what you get back -------------------------------------------------
     "Quadrature", "Provenance", "runtime_provenance",
-    # --- the door ----------------------------------------------------------
+    # --- serving -----------------------------------------------------------
     "serve", "solve_uncertified", "reset_announcements",
     "noncrossing_kappa0",
     # --- the refusals ------------------------------------------------------

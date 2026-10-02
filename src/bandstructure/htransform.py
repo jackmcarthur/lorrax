@@ -169,7 +169,7 @@ def main(argv=None):
                              "the get_centroids_fi handoff.  auto|off = the "
                              "q-batched native path; distributed|cusolvermp|"
                              "slate|scalapack spread ONE (rank, rank) tile "
-                             "over the mesh through the distrib_la door (wide "
+                             "over the mesh through the distrib_la public API (wide "
                              "band windows).  ``distributed`` is the portable "
                              "spelling and the ONLY one that exists on a host "
                              "mesh, where it means ScaLAPACK pzheevd.  "

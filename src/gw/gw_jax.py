@@ -1062,7 +1062,7 @@ def _diagonalize_qp_hamiltonian(
                "Σ is a defect in the contraction or in what was handed to "
                "it, not a convergence problem.")
     with timing.section("gw_jax.qp_eigh") as _sec_eigh:
-        # The SC loop's eigensolver door: k staged over the mesh, each device
+        # The SC loop's eigensolver entry point: k staged over the mesh, each device
         # solving nk/P matrices, U replicated for the host writers below.
         from gw.sc_iteration import qp_eigh, qp_hamiltonian_sum
         E_full, U_full = qp_eigh(

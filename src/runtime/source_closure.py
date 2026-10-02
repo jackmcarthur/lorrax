@@ -8,14 +8,14 @@ first-party service.  Two deployment forms are supported:
     ``runtime`` was imported from ``<checkout>/src``.  The checkout's
     ``pyproject.toml`` is the authority: uv workspace members name the service
     projects, each project names its source root, and the ``lorrax.services``
-    entry-point group maps distributions to public import doors.  Those source
+    entry-point group maps distributions to public import packages.  Those source
     roots are placed before ambient/site packages and their actual origins are
     verified without importing them.
 
 ``installed``
     ``runtime`` came from an installed LORRAX distribution.  The same entry-
     point group is read from installed metadata and each declared service
-    distribution/import door must exist.  No source path is synthesized.
+    distribution/import package must exist.  No source path is synthesized.
 
 ``LORRAX_CHECKOUT`` is a launcher request, not Python import machinery.  If it
 is present, the already-imported runtime must be the runtime in that exact
@@ -47,7 +47,7 @@ class SourceClosureError(RuntimeError):
 
 @dataclass(frozen=True)
 class ServiceSpec:
-    """One declared service distribution and its public import door."""
+    """One declared service distribution and its public import package."""
 
     distribution: str
     module: str
@@ -170,7 +170,7 @@ def _service_entrypoints(data: Mapping, *, path: Path) -> dict[str, str]:
         module = value.partition(":")[0].strip()
         if not module or any(not part.isidentifier() for part in module.split(".")):
             raise SourceClosureError(
-                f"{path} service {distribution!r} has invalid import door "
+                f"{path} service {distribution!r} has invalid import package "
                 f"{value!r}")
         key = _canonical_distribution(distribution)
         if key in out:
@@ -298,7 +298,7 @@ def source_service_specs(root: Path) -> tuple[ServiceSpec, ...]:
                 candidates.append(source_dir)
         if len(candidates) != 1:
             raise SourceClosureError(
-                f"service {distribution!r} import door {module!r} must resolve "
+                f"service {distribution!r} import package {module!r} must resolve "
                 "under exactly one declared packages.find.where root; "
                 f"found={list(map(str, candidates))}")
         specs.append(ServiceSpec(distribution, module, candidates[0]))
@@ -349,7 +349,7 @@ def _find_origin(module: str, search_path: MutableSequence[str]) -> Path:
     found = machinery.PathFinder.find_spec(module, list(search_path))
     if found is None:
         raise SourceClosureError(
-            f"declared service import door {module!r} cannot be found")
+            f"declared service import package {module!r} cannot be found")
     if found.origin is None:
         locations = tuple(found.submodule_search_locations or ())
         if len(locations) != 1:
@@ -433,7 +433,7 @@ def _installed_service_specs() -> tuple[ServiceSpec, ...]:
                              for part in module.split(".")):
             raise SourceClosureError(
                 f"installed lorrax service {entrypoint.name!r} has invalid "
-                f"import door {entrypoint.value!r}")
+                f"import package {entrypoint.value!r}")
         distribution = _canonical_distribution(entrypoint.name)
         if distribution in seen:
             raise SourceClosureError(
@@ -457,7 +457,7 @@ def _distribution_owns_origin(dist, origin: Path) -> bool:
     """Whether installed distribution metadata binds ``origin`` to ``dist``.
 
     A top-level-name/provider match is insufficient: two distributions can
-    advertise the same import door and path precedence can select the stale
+    advertise the same import package and path precedence can select the stale
     one.  Wheel ``RECORD`` entries are exact ownership evidence.  PEP 610's
     ``direct_url.json`` supplies the equivalent root for an editable install.
     """
@@ -503,12 +503,12 @@ def _seal_installed(
         }
         if named_providers and spec.distribution not in named_providers:
             raise SourceClosureError(
-                f"installed service door {spec.module!r} is provided by "
+                f"installed service package {spec.module!r} is provided by "
                 f"{sorted(named_providers)}, not declared distribution "
                 f"{spec.distribution!r}; actual={origin}")
         if not _distribution_owns_origin(service_dist, origin):
             raise SourceClosureError(
-                f"installed service door {spec.module!r} resolved to "
+                f"installed service package {spec.module!r} resolved to "
                 f"{origin}, but distribution {spec.distribution!r} does not "
                 "own that file according to RECORD/direct_url metadata; "
                 "refusing a duplicate-provider or stale-path launch")

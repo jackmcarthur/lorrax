@@ -8,7 +8,7 @@ conj(ψ_c,k+Q) ψ_v,k with the exchange tile at tile momentum q = wrap(−Q)
 * Γ (Q on an integer point): the production q = 0 tile with its rank-one
   head, ``data["V_q0"]``;
 * ``ongrid``: the stored tile ``V_qmunu[wrap(−Q)]``, exact;
-* ``refit``: a per-Q ζ refit contracted with the producer's Coulomb door
+* ``refit``: a per-Q ζ refit contracted with the producer's Coulomb entry point
   (``bse.vq_interp.refit_vq``);
 * ``interp``: the arbitrary-Q evaluator (``vq_interp.build_vq_evaluator``),
   with the mini-BZ cell-averaged head carried as a rank-three tensor when

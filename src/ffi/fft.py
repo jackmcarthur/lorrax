@@ -65,7 +65,7 @@ carries no copy of its own.  The equivalence pin ``wk_REL/gatecheck.py``
 (cells A2/E/E2) now guards the re-export seam rather than a second copy.
 
 ================================================================================
-THE k-CONVOLUTION ROUTER — one front door per operation, one backend per platform
+THE k-CONVOLUTION ROUTER — one factory per operation, one backend per platform
 ================================================================================
 Every k-axis convolution and k-axis transform the physics needs is asked for
 through a factory here (or its ``common.fft_helpers`` alias), and the factory
@@ -79,7 +79,7 @@ variable (decisions.md 2026-09-24, QUALITY #8):
            convolution, the fused FFTW gw_conv handler).
     other  refusal by name.
 
-    door                      layout         operation
+    factory                   layout         operation
     ------------------------  -------------  ----------------------------------------
     make_fused_conv_kpair     3-D leading    ISDF CCT/ZCT post-pair convolution
     make_fused_conv_kparent   parent tables  the same with the typed parent load
@@ -100,16 +100,16 @@ variable (decisions.md 2026-09-24, QUALITY #8):
     make_kfft_klead / _local  flat leading   one transform
     make_kfft_kminor / _local trailing       one transform
 
-Pick the door whose k position matches the tile you already hold; a caller does
+Pick the factory whose k position matches the tile you already hold; a caller does
 not transpose to reach another.  A k-grid axis above ``KCONV_AXIS_MAX`` (40,
 the fp64 cuFFTDx thread-FFT limit) is refused by name on CUDA. Pair modes0/1/6
 whose three-bank row exceeds shared memory stream spin/spatial tiles through
-this same service's staged native k-axis transform door (no backend switch).
+this same service's staged native k-axis transform factory (no backend switch).
 
 The plain flat-k transform is the same router: ``common.fft_helpers.
 make_flat_k_fft`` calls :func:`make_kfft_klead` (mathdx mode 3 on CUDA,
 measured 1.8-7.4x faster than the cuFFT plan it replaced; the FFTW3-ABI host
-handler on cpu, whose sharded door :func:`make_flat_k_fft_ffi` is cpu-only).
+handler on cpu, whose sharded factory :func:`make_flat_k_fft_ffi` is cpu-only).
 """
 
 from __future__ import annotations
@@ -383,7 +383,7 @@ def make_flat_k_fft_ffi(
 ) -> Callable:
     """FFI-backed flat-k FFT: ``(nk, *trail) -> (nk, *trail)``, same contract
     as ``fft_helpers.make_flat_k_fft`` — one batched strided FFT per rank
-    over the local shard (the FFTW3-ABI host handler; this door is cpu-only),
+    over the local shard (the FFTW3-ABI host handler; this factory is cpu-only),
     k-major layout end to end (never reshaped to the 3-D k-minor form, which
     is the whole point).
 
@@ -743,7 +743,7 @@ def pair_resident_refusal(kgrid, *, optin=None) -> str:
     """Why modes 0/1/6 need the staged route; same three-bank rule as CUDA.
 
     The decision changes execution only. The staged route uses the existing
-    k-axis transform door on each complete-P spatial tile, never a full-spin
+    k-axis transform factory on each complete-P spatial tile, never a full-spin
     unfolded bank. Both routes have O(nk log(nk) mu nu / P) work and O(nk mu nu / P)
     scratch for bounded spin dimension (2/4); no new vendor or driver route.
     """
@@ -756,7 +756,7 @@ def pair_resident_refusal(kgrid, *, optin=None) -> str:
     if why:
         from ffi.gate import announce_once
         announce_once(("kconv", "pair-staged", kg, have),
-                      f"[kconv] pair convolution -> staged spin/spatial tiles through the native k-axis FFT door: {why}; "
+                      f"[kconv] pair convolution -> staged spin/spatial tiles through the native k-axis FFT: {why}; "
                       "scratch columns<=2048, no full-spin unfolded banks", scope="rank0")
     return why
 
@@ -787,7 +787,7 @@ def _stream_pair_components(kgrid, ns, perm_l, phase_l, perm_r, phase_r,
 
 
 def _staged_pair_ffts(mesh, kgrid):
-    """Existing NVIDIA k-box/CPU transform door, with unnormalized transforms."""
+    """Existing NVIDIA k-box/CPU transform factories, with unnormalized transforms."""
     return (make_local_kfft_klead(mesh, kgrid, kind="fftn", norm="backward"),
             make_local_kfft_klead(mesh, kgrid, kind="ifftn", norm="forward"))
 
@@ -980,7 +980,7 @@ def make_fused_conv_kplane(mesh, kgrid, ns, *, perm_l, phase_l, perm_r, phase_r)
     transposed, phased and split copy of ``D`` that its operand layout needs.
     CUDA: nvidia-mathdx mode 6 (the phase and the split are applied on load);
     cpu: the plan route on the same composition.  ``s`` is the forward-norm
-    pair scale of the parent door.
+    pair scale of the parent factory.
     """
     ns = int(ns)
     nkx, nky, nkz = (int(v) for v in kgrid)
@@ -1105,7 +1105,7 @@ def _check_parent_operands(D_l, D_r, ns) -> None:
 # cpp/cufft/kconv_mathdx_cuda_ffi.cc), cpu -> the plan route, anything else ->
 # refusal.  The k axis is either LEADING (the Σ/COHSEX dot layout, flat k first)
 # or MINOR (the BSE ring layout, the three k axes last); a caller asks for the
-# door that matches the tile it holds, and never transposes to reach another.
+# factory that matches the tile it holds, and never transposes to reach another.
 #
 #     make_kconv_klead   Σ, COHSEX   U = mult·fftn(ifftn(T)·ifftn(W)[:,None,:,None,:])
 #     make_kconv_kminor  BSE rung    U = mult·fftn_k(ifftn_k(X)·K_R)   (K_R already R space)
@@ -1206,7 +1206,7 @@ def make_local_kfft_kminor(mesh: Mesh, kgrid, *, kind: str, norm: str | None) ->
 
 def live_row_mask(live, n_rows: int, per_row: int = 1):
     """The mask of a padded pass's live rows: ``live`` (int32 [2]) is ``[lo, hi)`` in rows of
-    ``per_row`` entries; an axis of ``n_rows * per_row`` entries.  The mathdx doors take ``live``
+    ``per_row`` entries; an axis of ``n_rows * per_row`` entries.  The mathdx kconv calls take ``live``
     as an optional last operand, skip the rest and store them as zeros (mode 11: add nothing);
     the cpu compositions zero them with this."""
     r = jnp.arange(n_rows * per_row) // per_row
@@ -1438,7 +1438,7 @@ def make_local_kconv_klead(mesh: Mesh, kgrid, *, norm: str | None = "ortho",
     Σ τ pass of :func:`make_kconv_klead`, in place on T.  cpu: the plan route (as
     :func:`make_local_kconv_kminor`), not the gw_conv host handler, which takes
     k-space W.  The BSE W term holds its T k-leading so that the encode and
-    decode are batched ZGEMMs with no T-sized transpose, and calls this door.
+    decode are batched ZGEMMs with no T-sized transpose, and calls this factory.
     """
     kg = _check_kgrid(kgrid, kconv_backend(mesh))
     nk = kg[0] * kg[1] * kg[2]
@@ -1689,7 +1689,7 @@ def x_block_rows(rows) -> np.ndarray:
 # Residency: mode 8's split vertex pencil staged nkx*ty*(ns^2+17) elements at ty 128/ns^2 and
 #   refused the two-spinor Dirac quarters at >= 16^3; ty now comes from the opt-in budget (3080).
 # Paid (one warp group pencil, kbox_stage.cuh pencil_group_warp_pass): mode 8's vertex pencil on one
-#   warp per pair, 20^3 ns-2 Dirac-quarter door 848 -> 646 ms (pencil 2.3x), ns 4 1.14x (3080);
+#   warp per pair, 20^3 ns-2 Dirac-quarter kconv call 848 -> 646 ms (pencil 2.3x), ns 4 1.14x (3080);
 #   modes 7/9 on the modes 2/3 split arm where a block cannot hold a group of two or more columns,
 #   P64 tile mode 7 555 -> 237 ms (the 11-row sub-tile pass 22.6 -> 11.6 ms), mode 9 64.9 -> 32.0 ms
 #   (3086): one column per block had re-gathered the pair's group per column (1.3 TB of L2).
@@ -1913,7 +1913,7 @@ def make_kconv_lorentz_unfold(mesh: Mesh, kgrid, tables, *, w_tables, left_verti
     the kernel's load.
 
     CUDA: nvidia-mathdx mode 8 with the second (W) load; it rounds as mode 9
-    on ``W`` then the V_R door (bit for bit).  cpu: the service's reference
+    on ``W`` then the V_R kconv call (bit for bit).  cpu: the service's reference
     unfold of both operands and the plan route.  ``load``/``w_load``
     (``symmetry_maps.DeviceLoadTables`` of ``tables``/``w_tables``, or of a
     row pass's cut of them): the tables enter as device operands, so the

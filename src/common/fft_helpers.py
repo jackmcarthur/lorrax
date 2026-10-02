@@ -182,7 +182,7 @@ def make_sharded_fftn_3d(
 # (``ffi.fft``); the k-convolution router: ``docs/architecture/ffi_layout.md``.
 #
 # What stays here: the OWNER RULE that these helpers are the single FFT entry
-# point (``make_flat_k_fft`` below is still the only door), and the XLA
+# point (``make_flat_k_fft`` below is still the only entry point), and the XLA
 # ``make_sharded_*fftn_3d`` / ``local_*fftn3`` layer above — those serve the
 # shard_map-INTERIOR call sites (isdf/core, wfn_transforms, BSE) that have
 # no FFI route, which the ruling explicitly keeps.
@@ -197,7 +197,7 @@ from ffi.fft import (  # noqa: E402  (re-export: see the block above)
 # ============================================================================
 # THE k-CONVOLUTION ROUTER at the factory seam (decisions.md 2026-09-24)
 # ============================================================================
-# The physics front doors for every k-axis convolution and every k-axis
+# The physics entry points for every k-axis convolution and every k-axis
 # transform of a k-MINOR tile.  Each is the ``ffi.fft`` router factory itself,
 # re-exported here so physics code imports its FFTs from one module; the
 # router picks nvidia-mathdx on CUDA and the plan route on cpu from the mesh,
@@ -219,7 +219,7 @@ from ffi.fft import (  # noqa: E402  (re-export: see the block above)
 #
 # The contracts live in ``ffi/fft.py``.
 # ============================================================================
-from ffi.fft import (  # noqa: E402,F401  (re-exported front doors)
+from ffi.fft import (  # noqa: E402,F401  (re-exported entry points)
     KConvStored,
     make_kconv_klead,
     make_kconv_klead_unfold,
