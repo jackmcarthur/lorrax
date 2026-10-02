@@ -360,14 +360,17 @@ def face_reduce_round(states,infinity,tables,*,real,mesh,budget,ordered,odd_mome
 
 
 @lru_cache(maxsize=None)
-def face_round_check_program(mesh, ordered, n):
-    """Whole-mesh adapter for the scalar model's existing gate equations."""
+def face_round_check_program(mesh, ordered, eigh_plan):
+    """Whole-mesh adapter for the scalar model's existing gate equations.
+
+    ``eigh_plan`` is the n x n plan (``constructor_eigenplan``); its route
+    decides whether the passivity eigh runs on the mesh or one per rank.
+    """
     from gw.shared_pole_local import _round_check_equations
     from gw.shared_pole_recipe import (shared_real_pole_gates_ordered_v1,
                                        shared_real_pole_gates_v1_r3b)
     gates = (shared_real_pole_gates_ordered_v1 if ordered else
              shared_real_pole_gates_v1_r3b)
-    eigh_plan = face_eigh(mesh, n)
     return face_program(partial(_round_check_equations, matmul=face_matmul(mesh),
                                 eigh=eigh_plan.batched, gates=gates, ordered=ordered),
                         mesh, outputs='scalars')
