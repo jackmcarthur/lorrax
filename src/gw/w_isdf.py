@@ -177,48 +177,32 @@ def _charge_stream_door(mesh_xy, kgrid, plan):
     return hit
 
 
-def _charge_pass_doors(mesh_xy, kgrid, plan, passes):
-    """Mode-11 doors and placed tables of the direct stream's row passes (``gw.subtile_stream``).
+def _charge_window_door(mesh_xy, kgrid, plan, rows):
+    """The direct stream's mode-11 call on its ``rows``-row windows and the plan's placed tables.
 
-    One pass covering every row reads the plan's own tables; a pass of fewer
-    rows reads them cut to its orbit-closed rows (``subtile_stream.pass_tables``).
-    Only the left tables (``lsrc``, ``mph``) differ between passes: the per-k and
-    right tables are placed once and shared, so the passes together hold one
-    plan's tables.  Returns ``(doors, arrays)``: the doors, one per pass, and
-    the placed arrays ``(row, trs, rsrc, nph, spin, spin_r, lsrc_0, mph_0,
-    lsrc_1, mph_1, ...)`` (:func:`_pass_load`), cached per (mesh, grid, plan,
-    passes).
+    One call serves every row pass (``gw.subtile_stream.plan_windows``): its
+    host tables give the window's shapes (``subtile_stream.window_tables``;
+    the plan's own when one window holds every row), and each pass reads the
+    placed tables cut to its window on the device (``subtile_stream.window_load``).
+    Returns ``(door, arrays)``, the arrays a ``symmetry_maps.DeviceLoadTables``'s
+    fields, cached per (mesh, grid, plan, rows).
     """
-    key = ("passes", mesh_xy, tuple(int(v) for v in kgrid), plan, tuple(passes))
+    key = ("window", mesh_xy, tuple(int(v) for v in kgrid), plan, int(rows))
     hit = _CHARGE_DOORS.get(key)
     if hit is None:
         from common.fft_helpers import make_kconv_chi_unfold
-        from symmetry_maps import DEVICE_LOAD_SPECS
+        from symmetry_maps import device_load_tables
+        from .subtile_stream import window_tables
         base = plan.unfold_load_tables()
         side, ns = int(mesh_xy.shape["x"]), int(np.asarray(base.spin).shape[-1])
         local_rows = int(np.asarray(base.lsrc).shape[1]) // (side * ns)
-        cut = [base if (x0, xr) == (0, local_rows) else pass_tables(base, x0, xr, side, ns)
-               for x0, xr in passes]
-
-        def put(a, field):
-            return device_put_process_local(np.asarray(a), NamedSharding(mesh_xy, DEVICE_LOAD_SPECS[field]))
-        spin_r = base.spin if base.spin_r is None else base.spin_r
-        shared = (put(base.row, 0), put(base.trs, 1), put(base.rsrc, 3), put(base.nph, 5),
-                  put(base.spin, 6), put(spin_r, 7))
-        left = tuple(a for t in cut for a in (put(t.lsrc, 2), put(t.mph, 4)))
-        hit = (tuple(make_kconv_chi_unfold(mesh_xy, kgrid, t, n_out=1, complete=False, norm="ortho")
-                     for t in cut), shared + left)
+        shape = base if int(rows) == local_rows else window_tables(base, rows, side, ns)
+        hit = (make_kconv_chi_unfold(mesh_xy, kgrid, shape, n_out=1, complete=False, norm="ortho"),
+               tuple(device_load_tables(base, mesh_xy)))
         while len(_CHARGE_DOORS) >= 2:
             _CHARGE_DOORS.pop(next(iter(_CHARGE_DOORS)))
         _CHARGE_DOORS[key] = hit
     return hit
-
-
-def _pass_load(arrays, p):
-    """Pass ``p``'s ``symmetry_maps.DeviceLoadTables`` from :func:`_charge_pass_doors`' arrays."""
-    from symmetry_maps import DeviceLoadTables
-    row, trs, rsrc, nph, spin, spin_r = arrays[:6]
-    return DeviceLoadTables(row, trs, arrays[6 + 2 * p], rsrc, arrays[7 + 2 * p], nph, spin, spin_r)
 
 
 def charge_door_table_bytes():
@@ -265,7 +249,8 @@ def _direct_pass_plan(mesh_xy, kgrid, plan, *, n_rmu, ns, n_band, q_count, n_nod
     while len(_PASS_PLANS) >= 4:
         _PASS_PLANS.pop(next(iter(_PASS_PLANS)))
     _PASS_PLANS[key] = plan_passes(plan.unfold_load_tables(), mesh_xy, ns=ns, row_bytes=row_bytes,
-                                   chunk_bytes=2 * 16 * int(q_count) * mu * nu, n_nodes=n_nodes)
+                                   chunk_bytes=2 * 16 * int(q_count) * mu * nu, n_nodes=n_nodes,
+                                   windows=True)
     return _PASS_PLANS[key]
 
 
@@ -1172,27 +1157,26 @@ def _get_chi_fractional_contour_kernel_face(
         subtile = _direct_pass_plan(mesh_xy, grid, k_unfold_plan, n_rmu=n_rmu, ns=ns,
                                     n_band=nb_full, q_count=len(selected_q),
                                     n_nodes=minimax.RESPONSE_NODE_CAPACITY)
-        pass_doors, pass_arrays = _charge_pass_doors(mesh_xy, grid, k_unfold_plan, subtile.passes)
-        # A one-pass program (``stream_pass``) plans only its own pass's GEMMs.
-        pass_gemms = tuple(gemm_plan(mesh_xy, m=px * xr * ns, k=nb_full, n=n_rmu * ns,
-                                     nq=nk_shape, dtype=jnp.complex128, layout="axis",
-                                     enable_active_range=band_ranges is not None, warmup=False)
-                           if stream_pass is None or p == int(stream_pass) else None
-                           for p, (_, xr) in enumerate(subtile.passes))
-        pass_active = tuple((tuple(g.prepare_active_range(*bounds) for bounds in band_ranges)
-                             if band_ranges is not None and g is not None else (None, None))
-                            for g in pass_gemms)
+        # Every pass is one window of subtile.rows rows: one door, one GEMM plan.
+        pass_door, pass_arrays = _charge_window_door(mesh_xy, grid, k_unfold_plan, subtile.rows)
+        pass_gemm = gemm_plan(mesh_xy, m=px * subtile.rows * ns, k=nb_full, n=n_rmu * ns,
+                              nq=nk_shape, dtype=jnp.complex128, layout="axis",
+                              enable_active_range=band_ranges is not None, warmup=False)
+        pass_active = (tuple(pass_gemm.prepare_active_range(*bounds) for bounds in band_ranges)
+                       if band_ranges is not None else (None, None))
         chi_tables = pass_arrays
         if jax.process_index() == 0 and not stream_pass:
             print(f"Response direct stream: {len(subtile.passes)} row pass(es) of "
-                  f"{max(xr for _, xr in subtile.passes)} local rows, {subtile.chunk} node(s) "
-                  "per accumulate", flush=True)
+                  f"{subtile.rows} local rows, {subtile.chunk} node(s) per accumulate", flush=True)
     elif door_serves:
         chi_door, chi_tables = _charge_stream_door(mesh_xy, grid, k_unfold_plan)
     if stream_pass is not None and not bank_carry or stream_pass is not None and photon is None and (
             subtile is None or not 0 <= int(stream_pass) < len(subtile.passes)):
         raise ValueError(f"GATE response_stream_pass: pass {stream_pass} needs the direct bank "
                          "carry on the row-pass engine (mathdx mode 11 from raw parents)")
+    # A segment program of the windowed charge stream serves every pass: the
+    # pass index is a runtime argument after the carry.
+    segment_index = stream_pass is not None and photon_doors is None and subtile is not None
     # Trailing operands bound to the program (``_BoundTail``): the door tables.
     tail = (door_arrays if photon_doors is not None else chi_tables)
     tail_specs = (door_specs if photon_doors is not None else
@@ -1212,7 +1196,7 @@ def _get_chi_fractional_contour_kernel_face(
             rep1, rep0,
             mun_input, nmu_input,
             rep2, rep2, rep2, rep0,
-        ) + ((selected_shard,) if bank_carry else ()) + (
+        ) + ((selected_shard,) if bank_carry else ()) + ((rep0,) if segment_index else ()) + (
             () if tail is None else
             (tuple(NamedSharding(mesh_xy, spec) for spec in tail_specs),)),
         donate_argnums=(8,) if bank_carry else (),
@@ -1252,10 +1236,12 @@ def _get_chi_fractional_contour_kernel_face(
         if photon_doors is not None:
             door_loads = {key: DeviceLoadTables(*(tables[i] for i in slots))
                           for key, slots in door_index.items()}
-        elif subtile is not None:
-            chi_load = tuple(_pass_load(tables, p) for p in range(len(subtile.passes)))
         elif chi_tables is not None:
             chi_load = tables
+        pass_index = None
+        if segment_index:
+            # One program for every segment: the pass is a runtime index.
+            carry, pass_index = carry[:-1], carry[-1]
         if bank_carry:
             initial = carry[0]
 
@@ -1578,41 +1564,51 @@ def _get_chi_fractional_contour_kernel_face(
             :func:`correlation_rows`.
             """
             from .greens_function_kernel import green_right_operand
-            from .subtile_stream import band_complete, pass_rows, stream_passes
+            from .subtile_stream import band_complete, stream_passes, window_load, window_rows
             rows_all, cols_all = band_complete(psi_mun, psi_nmu, mesh_xy)
             # The right operand of every Green build, formed once per dispatch.
             right = green_right_operand(cols_all)
-            px = int(mesh_xy.shape["x"])
+            px, R = int(mesh_xy.shape["x"]), int(subtile.rows)
 
-            def node_rows(p, index):
-                x0, xr = subtile.passes[p]
+            def prepare(window):
+                """A window's ψ rows, cut tables and live rows, formed once per pass."""
+                if window is None:
+                    return rows_all, DeviceLoadTables(*chi_load), {}
+                s, lo, hi = window
+                return (window_rows(rows_all, mesh_xy, s, R, axis=2, spec=P(None, None, "x", None)),
+                        window_load(DeviceLoadTables(*chi_load), mesh_xy, s, lo, hi, R, ns),
+                        dict(live=jnp.stack([lo, hi]).astype(jnp.int32)))
+
+            def node_rows(ops, index):
+                psi_p, load, live = ops
                 time, lower_w, upper_w = jax.lax.optimization_barrier(
                     (time_nodes[index], *node_band_weights(index)))
-                psi_p = pass_rows(rows_all, mesh_xy, x0, xr, axis=2)
 
                 def parent(weight, t, ref, current):
                     weight, t = oriented(weight, t)
                     return build_G_tau(psi_p, None, enk_full, t, e_ref=ref,
-                                       band_weight=weight, layout="axis", gemm=pass_gemms[p],
+                                       band_weight=weight, layout="axis", gemm=pass_gemm,
                                        k_unfold_plan=k_unfold_plan, unfold=False,
-                                       prepared_active_gemm=pass_active[p][int(current)],
+                                       prepared_active_gemm=pass_active[int(current)],
                                        real_weights=False, right=right)
                 lower = parent(lower_w, -time, energy_reference[0], False)
                 upper = parent(upper_w, jnp.conj(time), energy_reference[1], True)
                 partners = (() if lower.conj_partner and upper.conj_partner
                             else (lower.partner(), upper.partner()))
                 zero = jax.lax.with_sharding_constraint(
-                    jnp.zeros((1, nk, px * xr, n_mu), jnp.complex128), selected_shard)
-                value = chi_fftn(pass_doors[p](zero, lower.G, upper.G,
-                                               jnp.ones((1,), jnp.complex128), *partners,
-                                               load=chi_load[p])[0])
+                    jnp.zeros((1, nk, px * R, n_mu), jnp.complex128), selected_shard)
+                # A window's rows outside its live rows add nothing (mode 11's live).
+                value = chi_fftn(pass_door(zero, lower.G, upper.G,
+                                           jnp.ones((1,), jnp.complex128), *partners,
+                                           load=load, **live)[0])
                 ahead, behind = rows(value, gather_q), rows(value, reverse_q)
                 ahead, behind = ((jnp.conj(ahead), behind) if physical
                                  else (ahead, jnp.conj(behind)))
                 return jax.lax.with_sharding_constraint(jnp.stack([ahead, behind])[None],
                                                         plane_shard)
             return stream_passes(accumulators, mesh=mesh_xy, plan=subtile, weights=projection_rows,
-                                 count=live_count(), node_rows=node_rows, only=stream_pass)
+                                 count=live_count(), node_rows=node_rows, prepare=prepare,
+                                 only=pass_index)
 
         def direct_stream(accumulators):
             # The rule is padded to RESPONSE_NODE_CAPACITY slots with zero

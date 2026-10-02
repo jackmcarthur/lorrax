@@ -113,10 +113,18 @@ class Block:
 @dataclass(frozen=True)
 class PassPlan:
     """Row passes ``((x0, xr), ...)`` of every X shard's local rows, nodes per accumulate,
-    and the carry blocks of a node's planes (one whole-tile block by default)."""
+    and the carry blocks of a node's planes (one whole-tile block by default).
+
+    ``windows`` (:func:`plan_windows`): every pass is one window of ``rows``
+    rows, ``((s, lo, hi), ...)`` with ``passes`` their live spans, so one
+    program serves every pass (:func:`stream_passes`).  ``None``: per-pass
+    shapes (the four-current stream, until it reads windows too).
+    """
     passes: tuple
     chunk: int
     blocks: tuple = (Block(),)
+    rows: int = 0
+    windows: tuple | None = None
 
 
 def plan_rows(local_rows, row_bytes, cuts):
@@ -134,7 +142,8 @@ def plan_rows(local_rows, row_bytes, cuts):
     return ((0, local_rows),) if passes is None else passes
 
 
-def plan_passes(tables, mesh, *, ns, row_bytes, chunk_bytes, n_nodes, blocks=(Block(),)):
+def plan_passes(tables, mesh, *, ns, row_bytes, chunk_bytes, n_nodes, blocks=(Block(),),
+                windows=False):
     """Row passes and the node chunk from :data:`runtime.tiles.TILE_BYTES` and shapes.
 
     ``chunk_bytes`` are one node's kept rows on the whole local tile, so a
@@ -143,13 +152,19 @@ def plan_passes(tables, mesh, *, ns, row_bytes, chunk_bytes, n_nodes, blocks=(Bl
     its transform, the chunk's kept rows), so a pass fits one tile.  Passes
     split at the nearest orbit cuts (:func:`row_passes`); a rank whose rows
     are one orbit keeps one pass.  ``blocks`` (:class:`Block`) place a
-    node's planes in the carry.
+    node's planes in the carry.  ``windows``: equal orbit-aligned windows
+    (:func:`plan_windows`) instead.
     """
     from runtime.tiles import tile_units
     side = int(mesh.shape["x"])
     local_rows = int(np.asarray(tables.lsrc).shape[1]) // (side * int(ns))
     chunk = tile_units(chunk_bytes, n_nodes)
-    passes = plan_rows(local_rows, row_bytes(chunk), lambda: orbit_cuts(tables.lsrc, side, ns))
+    cuts = lambda: orbit_cuts(tables.lsrc, side, ns)
+    if windows:
+        R, win = plan_windows(local_rows, row_bytes(chunk), cuts)
+        return PassPlan(passes=tuple((s + lo, hi - lo) for s, lo, hi in win), chunk=int(chunk),
+                        blocks=tuple(blocks), rows=int(R), windows=win)
+    passes = plan_rows(local_rows, row_bytes(chunk), cuts)
     return PassPlan(passes=passes, chunk=int(chunk), blocks=tuple(blocks))
 
 
@@ -342,17 +357,21 @@ def segment_blocks(plan, p, cols):
     at ``[R0:R0+nr, C0:C0+nc]`` of the local tile.
     """
     x0, xr = plan.passes[p]
+    # A windowed plan's segments share one shape: the window's R rows, its
+    # live rows [lo, hi) the ones that go back to the tile.
+    R, lo = (int(plan.rows), int(plan.windows[p][1])) if plan.windows else (xr, 0)
     width = {b.n0: int(cols) if b.extents is None else int(b.extents[3]) for b in plan.blocks}
-    row = {m: i * xr for i, m in enumerate(sorted({b.m0 for b in plan.blocks}))}
+    row = {m: i * R for i, m in enumerate(sorted({b.m0 for b in plan.blocks}))}
     col, c = {}, 0
     for n0 in sorted(width):
         col[n0], c = c, c + width[n0]
     blocks = tuple(Block(m0=row[b.m0], n0=col[b.n0], extents=b.extents) for b in plan.blocks)
-    rects = tuple((row[b.m0], col[b.n0], b.m0 + x0, b.n0, xr, width[b.n0]) for b in plan.blocks)
-    return blocks, len(row) * xr, c, rects
+    rects = tuple((row[b.m0] + lo, col[b.n0], b.m0 + x0, b.n0, xr, width[b.n0])
+                  for b in plan.blocks)
+    return blocks, len(row) * R, c, rects
 
 
-def stream_passes(carry, *, mesh, plan, weights, count, node_rows, only=None):
+def stream_passes(carry, *, mesh, plan, weights, count, node_rows, only=None, prepare=None):
     """``carry[o, q, μ, ν] += Σ_n Σ_s weights[s, o, n] node_rows(p, n)[s]`` over every pass ``p``.
 
     ``carry`` ``[n_out, q, μ, ν]`` at ``P(None, None, 'x', 'y')`` is updated in
@@ -366,6 +385,12 @@ def stream_passes(carry, *, mesh, plan, weights, count, node_rows, only=None):
     segment (:func:`segment_blocks`), its planes at their segment offsets;
     every element gets the same terms in the same order, so its bytes are the
     whole tile's (the streamed bank, ``file_io.slab_io.StreamedBank``).
+
+    A windowed plan (``plan.windows``) runs every pass through one body
+    (:func:`_stream_windows`): ``prepare(window)`` forms a window's operands
+    once, outside the node loop (``window`` is ``(s, lo, hi)``, or ``None``
+    for the one whole-tile window), ``node_rows(operands, n)`` its node rows,
+    and ``only`` is then a traced pass index (one program for every segment).
     """
     from ffi.contour import contour_block_accumulate_local
     chunk = int(plan.chunk)
@@ -374,6 +399,9 @@ def stream_passes(carry, *, mesh, plan, weights, count, node_rows, only=None):
     weights = jnp.pad(weights, ((0, 0), (0, 0), (0, n_chunks_cap * chunk - n_cap)))
     n_chunks = ((count + chunk - 1) // chunk).astype(jnp.int32)
     spec_c = P(None, None, "x", "y")
+    if plan.windows is not None:
+        return _stream_windows(carry, mesh=mesh, plan=plan, weights=weights, n_chunks=n_chunks,
+                               count=count, node_rows=node_rows, prepare=prepare, only=only)
     for p, (x0, xr) in enumerate(plan.passes):
         if only is not None and p != int(only):
             continue
@@ -419,4 +447,83 @@ def stream_passes(carry, *, mesh, plan, weights, count, node_rows, only=None):
 
         _, carry = jax.lax.while_loop(lambda s: s[0] < n_chunks, chunk_body,
                                       (jnp.zeros((), jnp.int32), carry))
+    return carry
+
+
+def _stream_windows(carry, *, mesh, plan, weights, n_chunks, count, node_rows, prepare, only):
+    """:func:`stream_passes` on a windowed plan: one body, every pass a window of ``plan.rows`` rows.
+
+    ``only`` (a traced pass index): the carry is that pass's segment and the
+    body runs once on its window.  Otherwise the carry is the whole tile: one
+    window holding every row runs as is, more run as one ``lax.scan`` over
+    the windows, each window's planes added at its traced row offset (the
+    contour accumulate's runtime origin).  A window's rows outside its live
+    rows carry exact zeros (their sources are -1; the k-convolution also
+    skips them), so adding a whole window adds the pass.
+    """
+    from ffi.contour import contour_block_accumulate_local
+    chunk, R = int(plan.chunk), int(plan.rows)
+    n_sets = int(weights.shape[0])
+    spec_c = P(None, None, "x", "y")
+    prepare = prepare or (lambda window: window)
+    table = jnp.asarray(np.asarray(plan.windows, np.int32))
+
+    def window_body(acc, window, segment):
+        blocks = segment_blocks(plan, 0, 0)[0] if segment else plan.blocks
+        ops = prepare(window)
+        s = 0 if window is None or segment else window[0]
+        shape = jax.eval_shape(lambda n: node_rows(ops, n), jnp.zeros((), jnp.int32))
+
+        def skipped():
+            return jax.lax.with_sharding_constraint(jnp.zeros(shape.shape, shape.dtype),
+                                                    NamedSharding(mesh, P(None, None, None, "x", "y")))
+
+        def block_add(acc, rows, projection, block):
+            def local(a, r, w):
+                if block.extents is None:
+                    valid = jnp.asarray([R, a.shape[3]], jnp.int32)
+                else:
+                    la, wa, lb, wb = block.extents
+                    row0 = 0 if window is None else window[0]
+                    valid = jnp.stack((
+                        jnp.clip(la - jax.lax.axis_index("x") * wa - row0, 0, R),
+                        jnp.clip(lb - jax.lax.axis_index("y") * wb, 0, wb))).astype(jnp.int32)
+                return contour_block_accumulate_local(a, r, w, valid, m0=block.m0 + s,
+                                                      n0=block.n0, mesh=mesh)
+            return jax.shard_map(local, mesh=mesh, in_specs=(spec_c, spec_c, P()),
+                                 out_specs=spec_c, check_vma=False)(acc, rows, projection)
+
+        def chunk_body(state):
+            c, acc = state
+
+            def one(_, j):
+                n = c * chunk + j
+                return None, jax.lax.cond(n < count, lambda: node_rows(ops, n), skipped)
+            _, rows = jax.lax.scan(one, None, jnp.arange(chunk, dtype=jnp.int32), unroll=1)
+            # Read behind a barrier: a counter-indexed slice must not be
+            # rematerialized after the counter's in-place increment.
+            w = jax.lax.optimization_barrier(
+                jax.lax.dynamic_slice_in_dim(weights, c * chunk, chunk, axis=2))
+            projection = jnp.transpose(w, (2, 0, 1)).reshape(n_sets * chunk, -1)
+            for b, block in enumerate(blocks):
+                plane = rows[:, b].reshape((n_sets * chunk,) + rows.shape[3:])
+                acc = block_add(acc, plane, projection, block)
+            return c + 1, acc
+
+        _, acc = jax.lax.while_loop(lambda st: st[0] < n_chunks, chunk_body,
+                                    (jnp.zeros((), jnp.int32), acc))
+        return acc
+
+    if only is not None:
+        if len(plan.windows) == 1:
+            return window_body(carry, None, True)
+        w = jax.lax.optimization_barrier(jax.lax.dynamic_index_in_dim(table, only, keepdims=False))
+        return window_body(carry, (w[0], w[1], w[2]), True)
+    if len(plan.windows) == 1:
+        return window_body(carry, None, False)
+
+    def scan_body(acc, w):
+        s, lo, hi = jax.lax.optimization_barrier((w[0], w[1], w[2]))
+        return window_body(acc, (s, lo, hi), False), None
+    carry, _ = jax.lax.scan(scan_body, carry, table, unroll=1)
     return carry
