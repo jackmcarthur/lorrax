@@ -332,8 +332,8 @@ __device__ void plane_pass(C* sm, long long ncols, const Load& ld, const Store& 
     using G = Geo<NX, NY, NZ>;
     const long long nct = (ncols + TP - 1) / TP;
     for (long long w = blockIdx.x; w < (long long)NX * nct; w += gridDim.x) {
-        const int kx = int(w / nct);
-        const long long c0 = (w % nct) * TP;
+        const int kx = int(w % NX);                     // tile-major: a tile's NX planes run together
+        const long long c0 = (w / NX) * TP;
         __syncthreads();
         if constexpr (Load::kDirect) {
             ld.direct(PlaneView<NX, NY, NZ, C>{sm, kx}, kx * NY * NZ, (kx + 1) * NY * NZ, c0, TP, ncols);
