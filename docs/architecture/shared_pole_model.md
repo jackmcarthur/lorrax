@@ -285,7 +285,13 @@ panels to the round extent (`round_tables`; ordered originals and mirrors as two
 halves of one extent), assembles and reduces its pencil with local dense kernels
 and sorts its poles; synthetic slots are skipped. Otherwise the **face route**
 runs a parent batch on the complete mesh with `distrib_la` GEMM/`eigh`, both
-matrix axes distributed and only spectra and masks replicated. Sectors resolve
+matrix axes distributed and only spectra and masks replicated. An ordered
+face reduction solves its kept span on `face_ritz_carrier` (the pole budget
+tiled to the mesh), as a local round does on its Ritz carrier, and the face
+$n\times n$ eighs (infinity, directions, partners, passivity) run one whole
+matrix per rank through `distrib_la` route (c) when that fits the room beside
+the admitted selection (`face_eigh_room`, `Plan.route_for`), else on the full
+mesh. Sectors resolve
 their own route (`sector_execution`, the CT joint pencil included) against
 the same ledger. The route is fixed before any read and the report line
 `Shared-pole constructor:` names it and its prices; there is no retry or
@@ -523,7 +529,7 @@ with $c_b=\lceil b/P\rceil$ on local rounds ($b/P$ on the face route) and, by
 phase: selection $D=24n^2$, $s_f=2a$ over the $a$ dense fitted samples plus the
 moment faces and the line panels in face units,
 $N_{\rm line}(1+2S)\,n\,r_{\rm cap}/n^2$ (`selection_face_count`);
-reduction $D=14R^2+12nR$, $s_f=0$; model
+reduction $D=14R^2+12nR$, $s_f=0$ (a local paired, ordered scalar round: $D=5R^2+3(2c)^2+12nR$ with $2c=2\min(R/2,K_{\rm budget})$, the kept-span carrier; compiled rounds hold 3.8-9.7 $R^2$ against 7.5-12 here); model
 checks $D=8n^2+4nR$, $s_f=2a$; CT cross reduction
 $D=10\,CT+14R^2+12n(C+T)$. A local round has $b=P$. The native cuSOLVERMp `eigh`
 adds a private $n^2/P$ operand tile beside its workspace, which

@@ -479,7 +479,12 @@ def _mm(a, b, *, transa='N', transb='N'):
 
 def check_round(model, signed, inverse_coulomb_sqrt, held, moments, infinity_directions, *, real, nodes, eta_ry,
                 mesh_xy, eigh_plan, ordered):
-    """Run ``round_checks`` through the plan matching the arrays' layout."""
+    """Run ``round_checks`` through the plan matching the arrays' layout.
+
+    Face arrays take ``eigh_plan`` as the n x n passivity eigh (its route may
+    be the local kernel per rank, ``constructor_eigenplan``); batch arrays
+    take its trace-safe native callable.
+    """
     import jax
     import numpy as np
     from jax.sharding import NamedSharding, PartitionSpec as P
@@ -492,7 +497,9 @@ def check_round(model, signed, inverse_coulomb_sqrt, held, moments, infinity_dir
         from gw.shared_pole_execution import face_round_check_program
         if int(model[0].shape[0]) != int(real):
             raise ValueError('whole-mesh shared-pole checks take physical parents only')
-        program = face_round_check_program(mesh_xy, bool(ordered), model[0].shape[-2])
+        if eigh_plan.n not in (None, int(model[0].shape[-2])):
+            raise ValueError('whole-mesh shared-pole checks need the n x n eigh plan')
+        program = face_round_check_program(mesh_xy, bool(ordered), eigh_plan)
         rows = []
         for slot in range(int(real)):
             pick = partial(_leading_row, slot=slot)

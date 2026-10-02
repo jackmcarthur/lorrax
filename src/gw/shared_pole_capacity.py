@@ -118,14 +118,35 @@ def shared_pole_byte_terms(meta, *, mesh_xy, resolution, pencil_side,
 
 
 @lru_cache(maxsize=None)
-def constructor_eigenplan(mesh_xy, side, execution):
+def constructor_eigenplan(mesh_xy, side, execution, budget_bytes=None):
     """The eigh service plan of a constructor layout: whole parents per rank
-    ('local', the q-local kernel) or the complete mesh ('face')."""
+    ('local', the q-local kernel) or the complete mesh ('face').
+
+    ``budget_bytes`` (face only) is the room beside the live set, the same on
+    every rank. With it a face stack whose whole matrices fit one rank
+    beside that room runs the local kernel on ceil(b/P) matrices per rank
+    (distrib_la route (c), ``Plan.route_for``); otherwise the full mesh.
+    """
     import distrib_la
 
+    face = execution == "face"
     return distrib_la.plan("eigh", mesh_xy, n=int(side),
-        backend="distributed" if execution == "face" else "off",
-        batched_route="auto" if execution == "face" else "batch_reshard")
+        backend="distributed" if face else "off",
+        batched_route="auto" if face else "batch_reshard",
+        budget_bytes=budget_bytes if face else None)
+
+
+def face_eigh_room(selection, retained_outputs):
+    """Room per rank for the face constructor's n x n eighs, or None.
+
+    ``selection`` is the face batch's selection admission row
+    (``face_batch_width``) and ``retained_outputs`` the receipt's upper bound
+    on the factors every parent keeps. Both are shape prices, so every rank
+    agrees on the room and on the route it selects.
+    """
+    room = (int(selection['available_device_bytes_per_rank'])
+            - int(selection['aggregate_bytes_per_rank']) - int(retained_outputs))
+    return room if room > 0 else None
 
 
 def _shard_bytes(array):
