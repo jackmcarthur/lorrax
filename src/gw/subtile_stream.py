@@ -30,9 +30,12 @@ response owner), for the charge stream and for the four-current stream
 nodes in chunks into a carry (:func:`stream_passes`).  The Σ G⋆W convolution
 (``gw.ppm_tau_kernel``, the Σ owner) runs the same passes inside each τ
 node: G(τ) on the pass's ψ rows, W(τ) on the pass's rows of its q parents
-through the mode-9 load (:func:`pass_load`) and mode 7, and the band
-projection, which is linear in the rows, summed over the passes
-(:func:`fold_passes`).  The static Σ (exchange G(0⁻)⋆V, static SX and COH)
+through the mode-9 load and mode 7, and the band projection, which is
+linear in the rows, summed over the passes.  Those passes are equal
+orbit-aligned windows (:func:`plan_windows`) run as one ``lax.scan``
+(:func:`scan_passes`): each pass slices its window by a traced offset
+(:func:`window_rows`), and its tables are cut from the placed ones on the
+device (:func:`window_load`), so the program does not grow with the pass count.  The static Σ (exchange G(0⁻)⋆V, static SX and COH)
 is the same node at τ = 0 with the static interaction in place of W(τ).
 """
 from __future__ import annotations
@@ -150,36 +153,118 @@ def plan_passes(tables, mesh, *, ns, row_bytes, chunk_bytes, n_nodes, blocks=(Bl
     return PassPlan(passes=passes, chunk=int(chunk), blocks=tuple(blocks))
 
 
-def pass_load(load, mesh, x0, xr, ns=1):
-    """Device load tables (``symmetry_maps.DeviceLoadTables``) cut to every X shard's rows ``[x0, x0 + xr)``.
+def plan_windows(local_rows, row_bytes, cuts):
+    """Equal orbit-aligned windows of a scanned pass loop: ``(R, windows)``.
 
-    The device twin of :func:`pass_tables` for a door that reads its tables as
-    operands (mathdx mode 9): the left sources and phases are cut and moved
-    to the pass's own rows.  The caller cuts at an orbit cut of the host
-    tables, so no source leaves the pass.
+    ``g`` is the orbit block, the most common spacing of the admissible cuts
+    (``cuts()``, :func:`orbit_cuts`; called only when one tile does not hold
+    every row), and the window ``R = g·max(1, round(tile_rows / g))`` the
+    orbit-aligned size nearest the tile (:data:`runtime.tiles.TILE_BYTES` over
+    ``row_bytes``).  The passes are consecutive spans of at most ``R`` rows
+    ending on cuts (a longer one where no cut allows less), and ``R`` is the
+    longest span.  Pass ``p`` reads the window ``[s, s + R)`` of every X
+    shard's local rows, ``s = min(x0, local_rows - R)``, and its live rows are
+    ``[lo, hi)`` of the window: ``windows`` is ``((s, lo, hi), ...)``.  One
+    window holding every row: ``(local_rows, ((0, 0, local_rows),))``.
     """
-    c0, c1 = int(x0) * int(ns), (int(x0) + int(xr)) * int(ns)
+    from runtime.tiles import tile_units
+    L = int(local_rows)
+    rows = tile_units(row_bytes, L)
+    whole = (L, ((0, 0, L),))
+    if rows >= L:
+        return whole
+    ends = sorted(set(int(c) for c in cuts()) | {L})
+    if len(ends) == 1:
+        return whole
+    g = int(np.bincount(np.diff([0, *ends])).argmax())
+    target = g * max(1, int(round(rows / g)))
+    spans, start = [], 0
+    while start < L:
+        fit = [c for c in ends if start < c <= start + target]
+        end = max(fit) if fit else min(c for c in ends if c > start)
+        spans.append((start, end - start))
+        start = end
+    if len(spans) == 1:
+        return whole
+    R = max(xr for _, xr in spans)
+    return R, tuple((min(x0, L - R), x0 - min(x0, L - R), x0 - min(x0, L - R) + xr)
+                    for x0, xr in spans)
 
-    def cut(lsrc, mph):
-        rows = lsrc[:, c0:c1]
-        return jnp.where(rows >= 0, rows - c0, -1).astype(lsrc.dtype), mph[:, c0:c1]
+
+def window_tables(tables, R, side, ns):
+    """Host load tables of an ``R``-row window: the shapes a kernel factory reads.
+
+    Every left source is -1 and the left phases are the first window's; the
+    content each pass reads comes from the placed tables cut by
+    :func:`window_load`.
+    """
+    lsrc = np.asarray(tables.lsrc)
+    width = lsrc.shape[1] // int(side)
+    cols = np.concatenate([s * width + np.arange(int(R) * int(ns)) for s in range(int(side))])
+    return tables._replace(lsrc=np.full((lsrc.shape[0], cols.size), -1, np.int32),
+                           mph=np.asarray(tables.mph)[:, cols])
+
+
+def window_load(load, mesh, s, lo, hi, R, ns=1):
+    """Placed load tables (``symmetry_maps.DeviceLoadTables``) cut to every X shard's window ``[s, s + R)``.
+
+    ``s``, ``lo`` and ``hi`` are traced.  The left sources move to the window
+    and are -1 outside its live rows ``[lo, hi)`` (a k-convolution reads them
+    as exact zeros); a pass is a union of whole orbits, so no live source
+    leaves the window.
+    """
+    width = int(R) * int(ns)
+
+    def cut(lsrc, mph, s, lo, hi):
+        rows = jax.lax.dynamic_slice_in_dim(lsrc, s * ns, width, axis=1)
+        live = (jnp.arange(width) // ns >= lo) & (jnp.arange(width) // ns < hi)
+        rows = jnp.where((rows >= 0) & live[None, :], rows - s * ns, -1).astype(lsrc.dtype)
+        return rows, jax.lax.dynamic_slice_in_dim(mph, s * ns, width, axis=1)
     spec = P(None, "x")
-    lsrc, mph = jax.shard_map(cut, mesh=mesh, in_specs=(spec, spec), out_specs=(spec, spec),
-                              check_vma=False)(load.lsrc, load.mph)
+    lsrc, mph = jax.shard_map(cut, mesh=mesh, in_specs=(spec, spec, P(), P(), P()),
+                              out_specs=(spec, spec), check_vma=False)(load.lsrc, load.mph, s, lo, hi)
     return load._replace(lsrc=lsrc, mph=mph)
 
 
-def fold_passes(passes, step, carry, operands):
-    """``carry = step(p, x0, xr, carry, operands)`` over every pass, one pass's temporaries at a time.
+def window_rows(a, mesh, s, R, axis, spec=None, live=None):
+    """Every X shard's local rows ``[s, s + R)`` of ``a`` on ``axis`` (its X-sharded axis), ``s`` traced.
 
-    Each later pass reads ``operands`` (the whole-tile inputs it slices)
-    from behind an optimization barrier with the running carry, so its
-    work cannot be scheduled beside the previous pass's.
+    ``spec`` is ``a``'s placement (default: ``axis`` on X, the rest whole).
+    ``live`` ``(lo, hi)``: rows of the window outside it are zeroed.
     """
-    for p, (x0, xr) in enumerate(passes):
-        if p:
-            carry, operands = jax.lax.optimization_barrier((carry, operands))
-        carry = step(p, x0, xr, carry, operands)
+    if spec is None:
+        spec = [None] * a.ndim
+        spec[axis] = "x"
+        spec = P(*spec)
+
+    def cut(t, s, lo, hi):
+        t = jax.lax.dynamic_slice_in_dim(t, s, int(R), axis=axis)
+        if live is None:
+            return t
+        keep = (jnp.arange(int(R)) >= lo) & (jnp.arange(int(R)) < hi)
+        shape = [1] * t.ndim
+        shape[axis] = int(R)
+        return jnp.where(keep.reshape(shape), t, jnp.zeros((), t.dtype))
+    lo, hi = (jnp.int32(0), jnp.int32(R)) if live is None else live
+    return jax.shard_map(cut, mesh=mesh, in_specs=(spec, P(), P(), P()), out_specs=spec,
+                         check_vma=False)(a, s, lo, hi)
+
+
+def scan_passes(windows, step, carry):
+    """``carry = step(s, lo, hi, carry)`` over every window (:func:`plan_windows`) in one ``lax.scan``.
+
+    The windows' ``(s, lo, hi)`` rows are the scanned operand, so the program
+    is one body whatever the pass count, and one window's temporaries are live
+    at a time.
+    """
+    table = jnp.asarray(np.asarray(windows, np.int32))
+
+    def body(c, w):
+        # Read behind a barrier: a counter-indexed slice must not be
+        # rematerialized after the counter's in-place increment (R82).
+        s, lo, hi = jax.lax.optimization_barrier((w[0], w[1], w[2]))
+        return step(s, lo, hi, c), None
+    carry, _ = jax.lax.scan(body, carry, table, unroll=1)
     return carry
 
 

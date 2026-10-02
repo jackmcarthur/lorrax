@@ -1741,7 +1741,7 @@ def make_kconv_klead_unfold(mesh: Mesh, kgrid, tables, *, store_rows, norm: str 
     spin-major reorder happen on the convolution's load, and every other k
     row is transformed but never stored.  ``load``, when given, is the same
     tables on the devices (``symmetry_maps.device_load_tables``, or a pass's
-    cut of them, ``gw.subtile_stream.pass_load``), read as operands so the
+    cut of them, ``gw.subtile_stream.window_load``), read as operands so the
     consumer's program holds no table constants.  CUDA: nvidia-mathdx mode 7;
     cpu: the service's reference composition, then the plan route and the row
     selection.

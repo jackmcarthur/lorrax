@@ -232,7 +232,7 @@ def sector_node(left, right, keys, meta, mesh_xy, w_tables, band_axis, *, static
     - one ns = 4 mode-8 Lorentz k-convolution (``common.fft_helpers.make_kconv_lorentz_unfold``,
       every vertex of the class in its Mid) reading the pass's rows of W on
       the irreducible q, with the Green's and W's tables placed once on the
-      devices and cut to the pass there (``subtile_stream.pass_load``), so no
+      devices and cut to the pass's window there (``subtile_stream.window_load``), so no
       program holds table constants;
     - the axis band projection of the pass's rows into a rank-local partial;
 
@@ -259,8 +259,8 @@ def sector_node(left, right, keys, meta, mesh_xy, w_tables, band_axis, *, static
     from gw.greens_function_kernel import (build_G_parents, _weighted_tau_phases,
                                            has_antiunitary_rows)
     from symmetry_maps import device_load_tables
-    from gw.subtile_stream import (fold_passes, orbit_cuts, pass_load, pass_rows, pass_tables,
-                                   plan_rows)
+    from gw.subtile_stream import (orbit_cuts, plan_windows, scan_passes, window_load,
+                                   window_rows, window_tables)
 
     a, b = left.green_parent, right.green_parent
     plans = a.plan, b.plan
@@ -289,38 +289,35 @@ def sector_node(left, right, keys, meta, mesh_xy, w_tables, band_axis, *, static
     # ψ rows (Green and projection).
     row_bytes = 16 * ((1 + partner) * n_parent * ns * ns * nu + n_parent * ns * ns * nu
                       + 2 * n_w * n_a * n_b * nu + n_parent * ns * (nb + nb_sig))
-    passes = plan_rows(local_rows, row_bytes, lambda: sorted(
+    R, windows = plan_windows(local_rows, row_bytes, lambda: sorted(
         set(orbit_cuts(g_tables.lsrc, px, ns))
         & set.intersection(*(set(orbit_cuts(t.lsrc, px, n_a)) for t in w_tables))))
-    stages = []
-    for x0, xr in passes:
-        whole = (x0, xr) == (0, local_rows)
-        cut = (lambda t, k: t) if whole else (lambda t, k: pass_tables(t, x0, xr, px, k))
-        gemm = gemm_plan(mesh_xy, m=px * xr * ns, k=nb, n=n * ns, nq=n_parent,
-                         dtype=jnp.complex128, layout='axis', warmup=False)
-        kconv = tuple(make_kconv_lorentz_unfold(
-            mesh_xy, kgrid, cut(g_tables, ns), left_vertices=vertices[0],
-            right_vertices=vertices[1], store_rows=plans[0].parent_full_rows,
-            norm='ortho', mult=mult, w_tables=cut(w, n_a)) for w in w_tables)
-        project = contract_bands_block_reshard(
-            mesh_xy, channels="none", layout="axis", face_shape=(n_parent, nb, px * xr, ns),
-            right_face_shape=(n_parent, nb, n, ns), face_band_extent=nb_sig)
-        stages.append((whole, gemm, kconv, project))
-    finish = stages[0][3].finish
+    whole = len(windows) == 1
+    # One window shape for every pass: host tables give the shapes, each pass
+    # reads the placed tables' cut (subtile_stream.window_load).
+    cut = (lambda t, k: t) if whole else (lambda t, k: window_tables(t, R, px, k))
+    gemm = gemm_plan(mesh_xy, m=px * R * ns, k=nb, n=n * ns, nq=n_parent,
+                     dtype=jnp.complex128, layout='axis', warmup=False)
+    kconv = tuple(make_kconv_lorentz_unfold(
+        mesh_xy, kgrid, cut(g_tables, ns), left_vertices=vertices[0],
+        right_vertices=vertices[1], store_rows=plans[0].parent_full_rows,
+        norm='ortho', mult=mult, w_tables=cut(w, n_a)) for w in w_tables)
+    project = contract_bands_block_reshard(
+        mesh_xy, channels="none", layout="axis", face_shape=(n_parent, nb, px * R, ns),
+        right_face_shape=(n_parent, nb, n, ns), face_band_extent=nb_sig)
+    finish = project.finish
     loads = (device_load_tables(g_tables, mesh_xy),
              tuple(device_load_tables(t, mesh_xy) for t in w_tables))
     psi_bytes = 16 * n_parent * ns * (nb + nb_sig) * (local_rows + nu)
-    price = dict(d=ns, ns=ns, passes=len(passes),
-                 new=float(max(xr for _, xr in passes) * row_bytes + psi_bytes))
+    price = dict(d=ns, ns=ns, passes=len(windows), new=float(R * row_bytes + psi_bytes))
     from common.gpu_utils import record_stage_price
     # A static node is priced in its caller's section (exchange, static COHSEX, W∞ − V).
     label = "Sigma static" if static else "Sigma tau"
-    record_stage_price(f"{label} {keys[0]}, {len(passes)} row pass(es)", price["new"],
+    record_stage_price(f"{label} {keys[0]}, {len(windows)} row pass(es)", price["new"],
                        section=None if static else "sigma.tau_sweep")
     if jax.process_index() == 0:
         print(f"{label} stream {''.join('CT'[f] for f in (int(lefts != (0,)), int(rights != (0,))))}: "
-              f"{len(passes)} row pass(es) of {max(xr for _, xr in passes)} local rows "
-              f"({local_rows} per rank)", flush=True)
+              f"{len(windows)} row pass(es) of {R} local rows ({local_rows} per rank)", flush=True)
     partial_spec = NamedSharding(mesh_xy, P(None, ('x', 'y')))
     w_spec = P(None, 'x', None, 'y', None)
 
@@ -333,25 +330,27 @@ def sector_node(left, right, keys, meta, mesh_xy, w_tables, band_axis, *, static
         zero = jax.lax.with_sharding_constraint(
             jnp.zeros((1, px * py * n_parent, nb_sig, nb_sig), jnp.complex128), partial_spec)
 
-        def step(p, x0, xr_, acc, operands):
-            whole, gemm, kconv, project = stages[p]
-            W, Wt, rows, left_p = operands
-            if not whole:
-                W, Wt = (pass_rows(w, mesh_xy, x0, xr_, axis=1, spec=w_spec) for w in (W, Wt))
-                rows = pass_rows(rows, mesh_xy, x0, xr_, axis=2)
-                left_p = pass_rows(left_p, mesh_xy, x0, xr_, axis=3)
+        def one_pass(acc, W, Wt, rows, left_p, g_pass, w_pass):
             green = build_G_parents(rows, None, phases=phases, layout='axis', gemm=gemm,
                                     k_unfold_plan=plans[0], real_weights=False, right=yr)
             sigma = kconv[hole](green.G, green.transpose, W, Wt,
-                                conj_partner=green.conj_partner,
-                                load=g_load if whole else pass_load(g_load, mesh_xy, x0, xr_, ns),
-                                w_load=(w_load if whole else
-                                        pass_load(w_load, mesh_xy, x0, xr_, n_a)))
+                                conj_partner=green.conj_partner, load=g_pass, w_load=w_pass)
             return project.accumulate((jnp.conj(left_p), yn), sigma, acc=acc)
-        return finish(fold_passes(passes, step, zero,
-                                  (interactions.W, interactions.partner, xn, xr)))
+        W, Wt = interactions.W, interactions.partner
+        if whole:
+            return finish(one_pass(zero, W, Wt, xn, xr, g_load, w_load))
+
+        def step(s, lo, hi, acc):
+            # The pass's window: W's and the ψ rows, the projection rows zeroed
+            # outside the live rows, and the tables cut there.
+            return one_pass(acc, *(window_rows(w, mesh_xy, s, R, axis=1, spec=w_spec) for w in (W, Wt)),
+                            window_rows(xn, mesh_xy, s, R, axis=2),
+                            window_rows(xr, mesh_xy, s, R, axis=3, live=(lo, hi)),
+                            window_load(g_load, mesh_xy, s, lo, hi, R, ns),
+                            window_load(w_load, mesh_xy, s, lo, hi, R, n_a))
+        return finish(scan_passes(windows, step, zero))
     spatial.price = price
-    node = SimpleNamespace(spatial=spatial, loads=loads, key=key + (tuple(passes),), plans=plans)
+    node = SimpleNamespace(spatial=spatial, loads=loads, key=key + (tuple(windows),), plans=plans)
     while len(_SECTOR_NODES) >= 16:
         _SECTOR_NODES.pop(next(iter(_SECTOR_NODES)))
     # The plans and tables ride along so their ids in the key cannot be reused.
