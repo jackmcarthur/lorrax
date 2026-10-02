@@ -235,14 +235,18 @@ def sigma_subtile_operands(psi_coh_xn, psi_coh_yr, psi_proj_xr, psi_proj_yn, *, 
     (``gw.subtile_stream.green_rows``), and the projection faces the axis
     projector's operands (``subtile_stream.projection_complete``): one exchange
     here, none in any τ node.  :func:`_sigma_subtile_kernel` reads its left
-    Green rows in this order.
+    Green rows in this order, and the right ones already as every Green build's
+    right operand (``greens_function_kernel.green_right_operand``: conj ψ
+    merged centroid-major), formed here once per Σ call, not once per τ node.
     """
+    from .greens_function_kernel import green_right_operand
     from .subtile_stream import band_complete, green_rows, projection_complete
 
     @jax.jit
     def place(xn, yr, xr, yn):
         rows, cols = band_complete(xn, yr, mesh_xy)
-        return (green_rows(rows, mesh_xy), cols, *projection_complete(xr, yn, mesh_xy))
+        return (green_rows(rows, mesh_xy), green_right_operand(cols),
+                *projection_complete(xr, yn, mesh_xy))
     return place(psi_coh_xn, psi_coh_yr, psi_proj_xr, psi_proj_yn)
 
 
@@ -286,7 +290,7 @@ def _sigma_subtile_kernel(*, mesh_xy, kgrid, brackets, face_shape, face_band_ext
     from common.fft_helpers import make_kconv_klead_unfold, make_kfft_klead_unfold
     from distrib_la import gemm_plan
     from runtime.tiles import TILE_BYTES
-    from .greens_function_kernel import build_G_tau, green_right_operand, has_antiunitary_rows
+    from .greens_function_kernel import build_G_tau, has_antiunitary_rows
     from .subtile_stream import (GREEN_ROWS_SPEC, orbit_cuts, plan_windows, projection_complete,
                                  scan_passes, window_green_rows, window_load, window_rows,
                                  window_tables)
@@ -359,7 +363,8 @@ def _sigma_subtile_kernel(*, mesh_xy, kgrid, brackets, face_shape, face_band_ext
         single exchange formed.  A static node's weights are real, so its
         partner is conj(G), read on the mode-7 load.  ``g_right`` is the
         GEMM's right operand (``green_right_operand`` of the band-complete
-        columns), formed once per node: every row pass and bracket reads it,
+        columns), formed once per Σ call (:func:`sigma_subtile_operands`): every
+        τ node, row pass and bracket reads it,
         and the partner is ``conj(A·diag(w*)·B)`` from the same two operands.
         """
         options = dict(e_ref=ref, layout="axis", gemm=gemm, k_unfold_plan=k_unfold_plan,
@@ -376,12 +381,10 @@ def _sigma_subtile_kernel(*, mesh_xy, kgrid, brackets, face_shape, face_band_ext
         if load is None or g_load is None:
             raise ValueError("Sigma tau: W on the q wedge and the Green door need their device "
                              "load tables (load, g_load = sigma_door_tables)")
-        # The left Green rows arrive μ-major (sigma_subtile_operands); the columns band-complete.
+        # The left Green rows arrive μ-major and the right ones as the Green's right
+        # operand (sigma_subtile_operands, once per Σ call).
         rows_all = jax.lax.with_sharding_constraint(psi_coh_xn, NamedSharding(mesh_xy, GREEN_ROWS_SPEC))
-        cols_all = jax.lax.with_sharding_constraint(
-            psi_coh_yr, NamedSharding(mesh_xy, P(None, None, None, "y")))
-        # conj(ψ) merged centroid-major: once per node, not once per row pass and bracket.
-        g_right = green_right_operand(cols_all)
+        g_right = jax.lax.with_sharding_constraint(psi_coh_yr, NamedSharding(mesh_xy, P(None, None, "y")))
         left_all, right_all = projection_complete(psi_proj_xr, psi_proj_yn, mesh_xy)
         n_mask = int(mask_A.shape[-1])
         idx = jnp.arange(n_mask)
