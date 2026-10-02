@@ -1,18 +1,20 @@
-"""Staged face ↔ batch movement for :class:`distrib_la.plan.Plan`.
+"""Face ↔ batch movement for :class:`distrib_la.plan.Plan`.
 
 This is the independently-installable service sibling of LORRAX's
 ``common.staged_reshard.face_to_batch_reshard``.  ``distrib_la`` cannot
 import ``common``: the service is installable with only JAX and ``lxkit``.
-The movement contract is nevertheless the same, including its reason for
-being explicit rather than a pair of sharding constraints::
+The movement is explicit rather than a pair of sharding constraints, for the
+same reason::
 
     (B, M, N) P(None, 'x', 'y')
-      -- all_to_all x: split B, join M
-      -- all_to_all y: split B, join N
+      -- one all_to_all over ('x', 'y'): split B, join the (M, N) tiles
     (B, M, N) P(('x','y'), None, None)
 
-The reverse is the literal inverse schedule (``y`` then ``x``).  Both
-directions and the local dense operation live inside ONE ``shard_map``.
+Every byte crosses the network once.  The staged form (``x`` then ``y``)
+moved each tile twice, and at Ni 20^3 P64 the W(τ) exchange of the
+whole-parent synthesis paid for it at every τ node.  The reverse is the
+literal inverse.  Both directions and the local dense operation live inside
+ONE ``shard_map``.
 Consequently GSPMD never sees a direct face→batch or batch→face reshard it
 could lower as replicate-then-partition, and no full matrix crosses the host.
 
@@ -115,25 +117,30 @@ def validate_batch_reshard_operands(
 
 
 def _face_to_batch(a, *, px: int, py: int):
-    """Two volume-preserving exchanges: face tile → whole matrices."""
-    if px > 1:
-        a = jax.lax.all_to_all(
-            a, "x", split_axis=0, concat_axis=1, tiled=True)
-    if py > 1:
-        a = jax.lax.all_to_all(
-            a, "y", split_axis=0, concat_axis=2, tiled=True)
-    return a
+    """One volume-preserving exchange over both axes: face tile -> whole matrices.
+
+    Rank ``r = x*py + y`` receives batch rows ``[r*B/P, (r+1)*B/P)`` of every
+    rank's ``(B, M/px, N/py)`` tile and places tile ``(x', y')`` at rows
+    ``x'*M/px`` and columns ``y'*N/py``.
+    """
+    p = px * py
+    if p == 1:
+        return a
+    b, m, n = a.shape
+    a = jax.lax.all_to_all(a, ("x", "y"), split_axis=0, concat_axis=0, tiled=True)
+    a = a.reshape(px, py, b // p, m, n)
+    return jnp.transpose(a, (2, 0, 3, 1, 4)).reshape(b // p, px * m, py * n)
 
 
 def _batch_to_face(a, *, px: int, py: int):
-    """Literal inverse of :func:`_face_to_batch`: ``y`` then ``x``."""
-    if py > 1:
-        a = jax.lax.all_to_all(
-            a, "y", split_axis=2, concat_axis=0, tiled=True)
-    if px > 1:
-        a = jax.lax.all_to_all(
-            a, "x", split_axis=1, concat_axis=0, tiled=True)
-    return a
+    """Literal inverse of :func:`_face_to_batch`: whole matrices -> face tile, one exchange."""
+    p = px * py
+    if p == 1:
+        return a
+    b, m, n = a.shape
+    a = a.reshape(b, px, m // px, py, n // py)
+    a = jnp.transpose(a, (1, 3, 0, 2, 4)).reshape(p * b, m // px, n // py)
+    return jax.lax.all_to_all(a, ("x", "y"), split_axis=0, concat_axis=0, tiled=True)
 
 
 def _pad_leading(a, amount: int):
@@ -470,7 +477,7 @@ def batch_reshard_call(
     ops: Sequence,
     *, rcond=None,
 ):
-    """Run route (c): staged face→batch, local dense op, staged inverse.
+    """Run route (c): face→batch, local dense op, inverse exchange.
 
     The returned arrays obey the ordinary :meth:`Plan.batched` layout:
     matrix outputs at ``P(None,'x','y')`` and eigh eigenvalues replicated.

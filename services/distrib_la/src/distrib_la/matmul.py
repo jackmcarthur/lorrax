@@ -9,9 +9,9 @@ native JAX floor.  On a CPU mesh that provider is XLA's dot on gathered
 faces (:func:`distrib_la.gemm_plan`'s CPU face plan); no ScaLAPACK GEMM
 handler is built.
 
-The default ``batched_route='batch_reshard'`` route performs x-then-y staged
-face-to-batch exchanges for A, B, and C, runs local ``jnp.matmul``, then
-applies the literal y-then-x inverse exchanges to D.  Use ``backend='off'``
+The default ``batched_route='batch_reshard'`` route moves A, B and C from
+faces to whole matrices in one all_to_all over (x, y) each, runs local
+``jnp.matmul``, then applies the literal inverse exchange to D.  Use ``backend='off'``
 with that route for a provider-free call.  A non-``off`` request is still
 resolved and capability-probed even though the selected route does not call
 the provider.
@@ -494,9 +494,9 @@ def matmul(
         sibling. ``'off'`` is provider-free and requires the staged route.
     batched_route
         ``'batch_reshard'`` (the default) pads a ragged leading batch with
-        zero matrices, exchanges each face x then y into whole per-device
-        matrices, runs local JAX GEMM, and returns D through the inverse y
-        then x exchanges. Explicit ``'auto'`` calls the resolved distributed
+        zero matrices, exchanges each face into whole per-device matrices in
+        one all_to_all over (x, y), runs local JAX GEMM, and returns D
+        through the inverse exchange. Explicit ``'auto'`` calls the resolved distributed
         provider.
     budget_bytes
         Optional per-rank device budget. With ``batched_route='auto'`` the
