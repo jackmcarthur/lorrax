@@ -639,6 +639,10 @@ def construct_diagonal_sector_round(samples, moments, meta, config, geometry, *,
                                execution=execution)
     budget.batch_width=len(geometry['ids'])
     budget.retained_panels=tuple(retained)
+    # Priced as sector_execution's route decision prices the local round.
+    if execution=='local':
+        budget.ritz_budget=recipe['pole_budget']
+        budget.retain_span=True
     # The dense sample and moment fields and the stored line panels are
     # resident during selection. Derive the face count from these exact read
     # dictionaries so admission prices the live panel set.
@@ -1324,9 +1328,13 @@ def sector_execution(meta, config, mu_bases, nq, *, mesh_xy, upstream):
     from gw.shared_pole_execution import constructor_execution, line_panel_count, selection_face_count
     recipe=meta.shared_pole_recipe
     ledger=meta.shared_pole_capacity
+    from gw.shared_pole_capacity import held_sector_bytes
     extent=port_extent(mesh_xy)
     execution_rows=[]
     rows=[(1 if family==0 else 3)*basis.n_packed for family,basis in enumerate(mu_bases)]
+    # TT runs beside CC's held round outputs, CT beside both (rank-local:
+    # one parent per rank), at each sector's conservative side.
+    held=0
     for family,basis in enumerate(mu_bases):
         components=3 if family else 1
         local_meta=copy.copy(meta)
@@ -1342,7 +1350,12 @@ def sector_execution(meta, config, mu_bases, nq, *, mesh_xy, upstream):
             local_meta,linalg_resolution({'linalg':config.backend.linalg}),local_recipe,
             mesh=mesh_xy,ledger=ledger,upstream=upstream,ordered=True,
             odd_moments=True,selection_faces=faces,
-            sample_batch=len(recipe['fit_ids'])-line_panel_count(recipe),column_extent=extent)
+            sample_batch=len(recipe['fit_ids'])-line_panel_count(recipe),column_extent=extent,
+            ritz_budget=local_recipe['pole_budget'],retain_span=True,carry=held)
+        side=route['conservative_pencil_side']
+        budget=local_recipe['pole_budget']
+        held+=held_sector_bytes(local_meta.n_rmu_padded,side,
+                                side if budget is None else 2*min(side//2,int(budget)))
         cap=local_recipe['line_direction_cap']
         execution_rows.append(dict(sector=('CC','TT')[family],mode=mode,
                                    packed_extent=local_meta.n_rmu_padded,
@@ -1370,7 +1383,7 @@ def sector_execution(meta, config, mu_bases, nq, *, mesh_xy, upstream):
         retained_output_families=2,column_extent=extent,
         cross_original_sides=tuple(row['conservative_pencil_side'] for row in execution_rows),
         cross_retained_side=sum(min(row['signed_side_bound'],row['conservative_pencil_side'])
-                                for row in execution_rows))
+                                for row in execution_rows),carry=held)
     resolved_execution=('face' if joint_mode=='face' or
                         any(row['mode']=='face' for row in execution_rows)
                         else 'local')

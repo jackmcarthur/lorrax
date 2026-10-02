@@ -19,10 +19,32 @@ from functools import lru_cache
 import numpy as np
 
 
+def retained_span_columns(side, kept):
+    """Columns of a rank-local paired round's coefficient map Y (``retain_span``).
+
+    The ordered reduction pads Y [R, 2c] to the pencil side R
+    (``reduce_ordered_shared_pole_pencil``), so the map is [R, R]; ``kept`` is
+    2c = 2 min(R/2, budget), the columns it would hold unpadded.
+    """
+    return int(side)
+
+
+def held_sector_bytes(n, side, kept):
+    """Bytes per parent a finished diagonal sector round keeps for the CT round.
+
+    The positive and signed factors b, c [n, R], the coefficient map Y
+    [R, ``retained_span_columns``] and the selected Q, WQ, dWQ and infinity
+    panels (at most 3 n R at the conservative side).
+    """
+    n, side = int(n), int(side)
+    return 16 * (5 * n * side + side * retained_span_columns(side, kept))
+
+
 def shared_pole_byte_terms(meta, *, mesh_xy, resolution, pencil_side,
                            parent_batch, sample_batch, phase="reduction",
                            selection_faces=None, cross_original_sides=None,
-                           padding_output_bytes_per_rank=0, ritz_budget=None):
+                           padding_output_bytes_per_rank=0, ritz_budget=None,
+                           retain_span=False):
     """Price constructor carriers; the map CapacityLedger owns admission.
 
     Selection holds samples, current narrow actions and the n x n direction
@@ -33,7 +55,8 @@ def shared_pole_byte_terms(meta, *, mesh_xy, resolution, pencil_side,
     Native workspace is separately supplied by the service. No threshold
     or independent capacity policy lives in this constructor helper.
     ``ritz_budget`` (the pole budget) prices the rank-local paired (ordered)
-    reduction, whose kept span is solved on at most that many columns.
+    reduction, whose kept span is solved on at most that many columns;
+    ``retain_span`` adds its coefficient map output (a bispinor sector round).
     """
     p = int(mesh_xy.shape["x"]) * int(mesh_xy.shape["y"])
     # Constructor carriers are mu x mu charge operators on every admitted deck.
@@ -63,14 +86,22 @@ def shared_pole_byte_terms(meta, *, mesh_xy, resolution, pencil_side,
         c, t = map(int, cross_original_sides)
         if min(c, t) <= 0:
             raise ValueError('cross reduction original sides must be positive')
-        # The original CT pencils are rectangular C-by-T. They are projected
-        # on the two retained diagonal spans before the joint square is made.
-        # The original assembly's largest rectangular live set has five
-        # finite blocks, three top, three bottom and four corner blocks,
-        # plus at most four whole-rectangle concatenation/output buffers:
-        # at most nine C-by-T equivalents. Allow one more for overlap with
-        # projection, and keep the full fourteen-copy joint-square envelope.
-        dense = 10 * c*t + 14 * r*r + 12 * packed * (c+t)
+        # Local (one parent per rank): the rectangular C-by-T pencil,
+        # projected on the two compacted
+        # retained spans (r = K_C + K_T) into the joint square, its eigh
+        # chain on [r, r] (about 7.3-7.6 r^2 live) and the [n, r] outputs,
+        # plus the compacted span maps Y_C [c, K_C], Y_T [t, K_T] the round
+        # packs for it. Compiled on one A100-80GB, one parent, at CrI3 (c, t,
+        # r) = (23296, 33792, 30720), (18304, 26624, 30720) and its 1/2, 1/4
+        # and Fe-4^3-sized shapes (3584, 4608, 3968), spans on the ladder or
+        # at 2c, XLA rematerialization on and off: temp + output 0.73-0.82 of
+        # this term; with the arguments, 0.80-0.87 of this term plus the
+        # narrow actions.
+        # The face keeps its envelope (ten C-by-T and fourteen joint-square
+        # copies), which also sizes its parent batch.
+        dense = (c*t + 8 * r*r + 4 * packed * r + max(c, t) * r
+                 if resolution.layout == "local" else
+                 10 * c*t + 14 * r*r + 12 * packed * (c+t))
         sample_faces = 0
     elif phase == "reduction":
         if selection_faces is not None:
@@ -92,6 +123,14 @@ def shared_pole_byte_terms(meta, *, mesh_xy, resolution, pencil_side,
             # is not lowered below 5. At 2c = side this is the old 8 side**2.
             kept = 2 * min(r // 2, int(ritz_budget))
             dense = 5 * r*r + 3 * kept*kept + 12 * packed * r
+            if retain_span:
+                # A sector round also returns Y [R, retained_span_columns].
+                # Compiled on one A100-80GB, one parent, CC and TT at CrI3
+                # sides 18304-33792, their 1/2 and 1/4 and Fe-4^3-sized
+                # (3584, 4608), spans R or 2c, XLA rematerialization on and
+                # off: temp + output 0.46-0.96 of this term. The tightest is
+                # TT 33792 (0.89-0.96); CC 23296 compiles at 0.46-0.52.
+                dense += r * retained_span_columns(r, kept)
         sample_faces = 0
     elif phase == "model":
         if selection_faces is not None:
@@ -190,6 +229,8 @@ class ConstructorCapacity:
         # The pole budget of a rank-local paired reduction, else None: its
         # largest eigh is max(H'_vv, 2 x Ritz width), not the pencil side.
         self.ritz_budget = None
+        # A bispinor sector round also returns its coefficient map Y.
+        self.retain_span = False
 
     def eigenplan(self, side):
         """One service plan per configured execution layout and actual side."""
@@ -282,7 +323,7 @@ class ConstructorCapacity:
             selection_faces=selection_faces,
             cross_original_sides=cross_original_sides,
             padding_output_bytes_per_rank=padding_output_bytes_per_rank,
-            ritz_budget=self.ritz_budget)
+            ritz_budget=self.ritz_budget, retain_span=self.retain_span)
         # Other parents' narrow inputs survive selection and each model's
         # checks; they are additional live storage, never hidden in a limit.
         extra = sum(_shard_bytes(a)
