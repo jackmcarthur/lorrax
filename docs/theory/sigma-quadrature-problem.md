@@ -87,7 +87,7 @@ first and its planning time second. Planning is host scalar work on boxes and
 never touches a spatial array. The live set per node is the parent Green (and
 its partner on an antiunitary plan), one full-k convolution output of
 N_k(N_μn_s)² and one W tile of N_k N_μ² complex numbers, over P; the unfolded
-full-k Green is never written ([k-convolution router](../architecture/ffi_layout.md#k-convolution-router-and-the-mathdx-family),
+full-k Green is never written ([unfold on load](../architecture/kconv.md#unfold-on-load),
 mode 7). W never carries a pole axis.
 
 On the resident-pole route (GN/HL one-pole store, elementwise MPA) poles are

@@ -667,7 +667,7 @@ library. A bundle's CUDA and host legs are used together:
 `LORRAX_FFI_SO` and `LORRAX_FFI_HOST_SO` must both be unset or both select
 one bundle, and a partial or mixed override refuses. What to change: on
 Perlmutter, members of m4598 load the current `lorrax_A` module
-([installation](docs/installation/perlmutter.md#lorrax-a)); elsewhere rebuild and reseal
+([installation](docs/installation/perlmutter.md#module)); elsewhere rebuild and reseal
 both legs from this source tree ([installation](docs/installation/index.md)).
 Do not point either variable at a library built from older source.
 

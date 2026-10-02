@@ -98,7 +98,6 @@ nav:
       - The Sigma(omega) quadrature problem: theory/sigma-quadrature-problem.md
       - Sigma_c band extrapolation: theory/band-extrapolation.md
       - Metallic MPA screening: theory/metallic-mpa-screening.md
-      - Finite-occupation screening: theory/finite-occupation-screening.md
       - The metallic q→0 head: theory/metal-q0-head.md
       - "Bispinor (four-current) GW": theory/bispinor-gw.md
       - Four-current heads and frequency: theory/four-current-head-corrections.md

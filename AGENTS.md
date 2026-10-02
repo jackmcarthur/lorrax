@@ -18,12 +18,9 @@ that owns each fact.
 
 ## Key documentation
 
-| Doc | What it covers |
-|-----|---------------|
-| `docs/theory/physics.md` | ISDF factorization, the Coulomb matrix, χ₀, screening, Σ and the QP Hamiltonian shared by every mode |
-| `docs/codebase.md` | Module map: one line per source module |
-| `docs/architecture/memory-model.md` | Per-rank budget, per-stage memory closed forms, the compiled check, the communication model |
-| `docs/theory/minimax-quadrature.md` | Laplace kernels and minimax rules for χ₀, and the Σ denominator-box rules |
+The register at the top of [`docs/index.md`](docs/index.md#register) lists
+every documentation page with the facts it owns, grouped for users, theory,
+architecture, services and developers. Start there.
 
 ## How to run
 
@@ -85,7 +82,7 @@ the task, flag it; do not silently violate it.
 - **FFTs go through their owners.** Never call `jnp.fft.*` directly in a stage kernel.
   The k-axis transforms and convolutions go through the `ffi.fft` router, and sphere↔box
   and plane transforms through `LocalFourierPlan`
-  ([ffi_layout.md](docs/architecture/ffi_layout.md#k-convolution-router-and-the-mathdx-family)).
+  ([k-convolution](docs/architecture/kconv.md#router)).
 - **k and q are flat axes, never folded into the FFT grid.** Store and shard k
   (and q) as an explicit leading axis and transform over the grid axes only, so
   the k axis stays independent of the spatial transform.

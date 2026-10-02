@@ -162,6 +162,7 @@ this table resolves and that every published page is in the site navigation.
 |---|---|---|
 | **how to run the test suite and what a change must pass** | [Contributing](contributing.md) | the suite command, the static gates and the pre-push checklist. |
 | **how to judge whether a claim or a check is any good** | [`docs/dev/QUALITY_PATTERNS.md`](dev/QUALITY_PATTERNS.md) | the ten failure classes and the assessment rubric. Cited by number (`#8`) from other pages. |
+| **what the GW driver and `gw.gw_config` guarantee to their callers** | [GW driver and configuration contracts](dev/gw_config_contracts.md) | the driver invariants of `gw.gw_jax` and the parsing, self-energy, screening, layout, band-count, four-current and head contracts of `gw.gw_config`. Deck keys and their defaults are the input reference. |
 | **how GW fixed-shape kernels avoid unused work** | [`GW kernels`](dev/gw_fixed_shape_kernels.md) | bracket scan, active pole counts and reusable postprocessing. |
 | **developer notes on one mechanism each** | [`device_put` all-gather](dev/device_put_hidden_allgather.md) · [FFI gate contract](dev/ffi_gate_contract.md) · [band-projection primitive](dev/staged_reshard_primitive.md) · [vendor GEMM handler](dev/vendor_gemm_service.md) | each page names its one source file and owns that mechanism's contract; none is a user page. |
 
