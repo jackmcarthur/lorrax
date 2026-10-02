@@ -58,16 +58,19 @@ third plan with its own communicator creation (a world-collective
 `MPI_Comm_split`, see the square-mesh ruling below), its own divisibility
 contract and its own failure modes, and it gains nothing at that limit.
 
-**Exception: the shared-pole constructor's parent solves.** Under `local`, a
-shared-pole parent stack whose whole matrices do not fit beside the live
-stages takes the distributed plan instead
-(`gw.shared_pole_execution.whole_parent_execution`). The fit is judged by
-the capacity ledger against `memory_per_device_gb`, so this choice reads the
-budget, unlike the [one-memory-path](#one-memory-path) and
-[fixed-tile](#fixed-tile) rulings. It is kept because the two plans solve the
-same matrices and agree to round-off, and at large N_μ the distributed plan
-is the only one that holds a matrix; the budget picks between two plans that
-both exist, not between layouts of one stage.
+**Exception: the shared-pole parent solves.** Under `local`, a shared-pole
+parent stack whose whole matrices do not fit beside the live stages takes
+the distributed plan instead (`gw.shared_pole_execution.whole_parent_execution`
+for the bank's line selection, `constructor_execution` for the constructor).
+The fit is judged by the capacity ledger against `memory_per_device_gb`, so
+this choice reads the budget, unlike the [one-memory-path](#one-memory-path)
+and [fixed-tile](#fixed-tile) rulings. It is decided once, before the first
+read, from shape prices only: the constructor prices the conservative recipe
+pencil (`constructor_side_upper_bound`), never a measured pencil or live
+memory, and keeps the route for the whole stage. It is kept because the two
+plans solve the same matrices and agree to round-off, and at large N_μ the
+distributed plan is the only one that holds a matrix; the budget picks
+between two plans that both exist, not between layouts of one stage.
 
 **Licenses deleting** the SLATE per-row sub-communicator context
 (`distrib_la._slate._subrow_context_key`, no caller) and the batched SLATE

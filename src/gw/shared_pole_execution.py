@@ -126,7 +126,7 @@ def line_selection_execution(rows, *, mesh, ledger, nq, carry=0):
 
 def constructor_execution(meta, resolution, recipe, *, mesh, ledger, upstream,
                           ordered, odd_moments, selection_faces, sample_batch,
-                          parent_count=1, retained_output_families=1, defer_reduction=False,
+                          parent_count=1, retained_output_families=1,
                           cross_original_sides=None, cross_retained_side=None,
                           column_extent=lambda width: width):
     """Resolve local or whole-mesh execution once, before a constructor read.
@@ -134,14 +134,15 @@ def constructor_execution(meta, resolution, recipe, *, mesh, ledger, upstream,
     ``selection_faces`` counts the selection's resident [n,n] faces
     (``selection_face_count``) over ``sample_batch`` dense fitted samples.
 
-    Local parents (one whole parent per rank, R4) are the fast path whenever
-    the complete selection stack fits, whatever dense layout the deck names:
-    ``linalg`` prices the per-matrix service calls, it does not force every
-    parent through a whole-mesh eigensolve one at a time. A parent that does
-    not fit runs on the face, where ``face_batch_width`` sizes the batch. A
-    caller that releases samples before reduction may defer that admission to
-    its measured pencil extent; coupled sectors retain the conservative
-    joint-lifetime check.
+    Decided once, up front, from the conservative recipe pencil
+    (``constructor_side_upper_bound``; decisions.md#no-sub-mesh): local
+    parents (one whole parent per rank, R4) when the selection stack and the
+    conservative reduction both fit, whatever dense layout the deck names
+    (``linalg`` prices the per-matrix service calls, it does not force every
+    parent through a whole-mesh eigensolve one at a time); otherwise the face,
+    the full mesh, where ``face_batch_width`` sizes the batch. A measured
+    pencil is never consulted: a local round could not leave the route once
+    its selection is held (CrI3 24x24 at P64, 40 GB: local pencil 64 GB/rank).
     """
     from gw.shared_pole_capacity import ConstructorCapacity
 
@@ -190,7 +191,7 @@ def constructor_execution(meta, resolution, recipe, *, mesh, ledger, upstream,
     reduction_args = (dict(cross_original_sides=cross_original_sides)
                       if cross_original_sides is not None else {})
     resident_selection = resident_preview('selection', **selection_args)
-    resident_reduction = (None if defer_reduction else resident_preview(reduction_phase, **reduction_args))
+    resident_reduction = resident_preview(reduction_phase, **reduction_args)
     if any(row['device_budget_status'] != 'PASS'
            for row in (resident_selection, resident_reduction) if row is not None):
         return 'face', dict(
@@ -201,9 +202,8 @@ def constructor_execution(meta, resolution, recipe, *, mesh, ledger, upstream,
             retained_output_upper_bound_bytes_per_rank=retained_outputs,
             local_selection=resident_selection, local_reduction=resident_reduction)
     selection = preview('selection', **selection_args)
-    reduction = None if defer_reduction else preview(reduction_phase, **reduction_args)
-    admitted = all(row['device_budget_status'] == 'PASS'
-                   for row in (selection, reduction) if row is not None)
+    reduction = preview(reduction_phase, **reduction_args)
+    admitted = all(row['device_budget_status'] == 'PASS' for row in (selection, reduction))
     return ('local' if admitted else 'face'), dict(
         reason=('capacity-admitted local parent' if admitted else
                 'local parent exceeds current device budget'),
@@ -211,8 +211,20 @@ def constructor_execution(meta, resolution, recipe, *, mesh, ledger, upstream,
         conservative_pencil_side=side, selection_face_count=selection_faces,
         retained_output_upper_bound_bytes_per_rank=retained_outputs,
         local_selection=selection, local_reduction=reduction,
-        reduction_admission=('actual selected pencil' if defer_reduction else
-                             'conservative recipe bound'))
+        reduction_admission='conservative recipe bound')
+
+
+def route_summary(mode, receipt):
+    """The constructor route and why, for one report line."""
+    rows = ", ".join(
+        f"{name} {row['aggregate_bytes_per_rank'] / 1e9:.1f}"
+        for name, row in (("selection", receipt.get("local_selection")),
+                          ("reduction", receipt.get("local_reduction"))) if row)
+    budget = next((row['device_budget_bytes_per_rank'] for row in
+                   (receipt.get("local_selection"), receipt.get("local_reduction")) if row), None)
+    price = "" if budget is None else f"; local parent GB/rank: {rows} of {budget / 1e9:.1f}"
+    return (f"{mode} ({receipt['reason']}, conservative pencil side "
+            f"{receipt['conservative_pencil_side']}{price})")
 
 
 def is_face(array):

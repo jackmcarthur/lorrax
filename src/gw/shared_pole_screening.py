@@ -691,6 +691,13 @@ def screen_shared_poles(wfns, V_q, meta, config, *, mesh_xy, sym,
         from .shared_pole_sectors import construct_sector_poles
         result = construct_sector_poles(bank, meta, config,
             mesh_xy=mesh_xy, output=str(root / "model.h5"))
+        from .shared_pole_execution import route_summary
+        rows = result.get("execution") or ()
+        if rows:
+            routes = [(row["sector"], row) for row in rows] + [("CT", rows[0]["joint"])]
+            mode = "face" if any(row["mode"] == "face" for _, row in routes) else "local"
+            print_fn(f"Shared-pole sector constructor: {mode} route; " + "; ".join(
+                f"{name} {route_summary(row['mode'], row)}" for name, row in routes))
     else:
         # An SC map keeps its model on the devices when it fits; an export
         # (write_w, write_poles) reads model.h5 and a one-shot registers it
@@ -708,7 +715,11 @@ def screen_shared_poles(wfns, V_q, meta, config, *, mesh_xy, sym,
                 mesh_xy=mesh_xy, output=str(root / "model.h5"), residence=model_rule)
         walls = dict(result.get("seconds", {}))
         rounds = walls.pop("rounds", 0)
-        print_fn(f"Shared-pole constructor: {rounds} round(s); seconds "
+        from .shared_pole_execution import route_summary
+        route = result.get("execution")
+        print_fn("Shared-pole constructor: "
+                 + ("" if route is None else route_summary(route["mode"], route) + "; ")
+                 + f"{rounds} round(s); seconds "
                  + " ".join(f"{name}={value:.2f}" for name, value in
                             sorted(walls.items(), key=lambda item: -item[1])))
     if resident is not None:

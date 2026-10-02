@@ -278,15 +278,18 @@ untreated fit; accuracy of the treatment is a projected-Σ comparison.
 
 **Route.** `constructor_route` admits one route before the first bank read.
 **Local parent rounds** — one whole parent per rank, batch layout
-`P(('x','y'), ...)` — whenever the complete selection stack fits the device,
-whatever `linalg` names: `gw.shared_pole_local.round_program` packs each parent's
+`P(('x','y'), ...)` — whenever the complete selection stack and the
+conservative reduction pencil (`constructor_side_upper_bound`) fit the
+device, whatever `linalg` names: `gw.shared_pole_local.round_program` packs each parent's
 panels to the round extent (`round_tables`; ordered originals and mirrors as two
 halves of one extent), assembles and reduces its pencil with local dense kernels
 and sorts its poles; synthetic slots are skipped. Otherwise the **face route**
 runs a parent batch on the complete mesh with `distrib_la` GEMM/`eigh`, both
 matrix axes distributed and only spectra and masks replicated. Sectors resolve
-their own route (`sector_execution`) against the same ledger. There is no
-retry or route change inside a stage.
+their own route (`sector_execution`, the CT joint pencil included) against
+the same ledger. The route is fixed before any read and the report line
+`Shared-pole constructor:` names it and its prices; there is no retry or
+route change inside a stage.
 
 **Reindexing.** Matrix selection, factor sorting and unequal CT block assembly
 use `common.staged_reshard`: exchange to slabs split over all ranks, select or
@@ -302,7 +305,16 @@ in canonical order (`canonical_factors`).
 
 **Strong-scaling limit.** Local rounds hold a whole parent's $[R,R]$ pencil
 per rank, so the per-rank peak does not fall with $P$; the face route is the
-path past that point.
+path past that point (CrI3 24×24, $n = 3328$: the local pencil needs 64 GB per
+rank, so 40 GB cards take the face route at any $P$).
+
+**Infinity directions** come from the Hermitian part of the exact $M_1$
+(`shared_pole_directions.infinity_directions`), as the imaginary supports read
+$-\mathrm{Herm}\,W$: the Dyson chain forming $M_1$ from bare moments
+Hermitian to $4\times10^{-16}$ leaves an anti-Hermitian part up to
+$1.0\times10^{-12}$ of $\max|M_1|$ at $n = 3328$, at the checked eigh's
+$10^{-12}$. The bare moments are checked where they are produced
+(`GATE response_moment_hermiticity`).
 
 ## 7 Store schema
 
