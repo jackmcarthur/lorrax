@@ -122,6 +122,16 @@ def _record_run(mesh, shape, rows, padded16):
 
 
 _COMPILED: dict = {}
+def remove_stale_streamed_banks(paths):
+    """Remove streamed-bank directories ``paths`` an earlier process left (a store
+    unlinks its file at creation, so only a release before that, or older code, leaves
+    one).  The caller runs it once, on one rank, before this process creates any store."""
+    removed = []
+    for path in map(Path, paths):
+        if path.name == "streamed_bank" and path.is_dir():
+            shutil.rmtree(path, ignore_errors=True)
+            removed.append(str(path))
+    return removed
 #: One dispatch at a time of the programs that land pieces in host memory: XLA
 #: keeps one async-copy event per (executable, copy instruction, device), so two
 #: drain threads dispatching the same program at once fail with "Async copy event
@@ -246,6 +256,9 @@ class _Store:
             self.direct = True
         except (AttributeError, OSError):
             self.fd = os.open(self.path, flags, 0o600)
+        # The name goes at once: the bytes live exactly as long as this process's
+        # descriptor, so no way the process ends (refusal, kill, SIGKILL) leaves them.
+        os.unlink(self.path)
         try:
             _reserve(self.fd, nbytes)
         except OSError:
@@ -257,7 +270,7 @@ class _Store:
         with self._lock:
             if self.direct and fd == self.fd:
                 os.fsync(self.fd)
-                buffered = os.open(self.path, os.O_RDWR)
+                buffered = os.open(f"/proc/self/fd/{self.fd}", os.O_RDWR)
                 os.close(self.fd)
                 self.fd, self.direct = buffered, False
             return self.fd
@@ -298,7 +311,6 @@ class _Store:
         if self.fd is not None:
             os.close(self.fd)
             self.fd = None
-            os.unlink(self.path)
         if self.host is not None:
             self.view = None
             self.host.close()
