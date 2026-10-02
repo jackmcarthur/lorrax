@@ -122,6 +122,9 @@ def _record_run(mesh, shape, rows, padded16):
 
 
 _COMPILED: dict = {}
+_SCRATCH = threading.local()
+
+
 def remove_stale_streamed_banks(paths):
     """Remove streamed-bank directories ``paths`` an earlier process left (a store
     unlinks its file at creation, so only a release before that, or older code, leaves
@@ -132,6 +135,8 @@ def remove_stale_streamed_banks(paths):
             shutil.rmtree(path, ignore_errors=True)
             removed.append(str(path))
     return removed
+
+
 #: One dispatch at a time of the programs that land pieces in host memory: XLA
 #: keeps one async-copy event per (executable, copy instruction, device), so two
 #: drain threads dispatching the same program at once fail with "Async copy event
@@ -599,10 +604,12 @@ class StreamedBank:
         """Bytes ``[first, first + len(target))`` of ``store``, read through the aligned
         superset (O_DIRECT reads whole aligned blocks)."""
         lo, hi = first // self.align * self.align, padded(first + len(target), self.align)
-        run = _aligned(hi - lo)
+        run = getattr(_SCRATCH, "run", None)
+        if run is None or len(run) < hi - lo:
+            # One aligned scratch per I/O thread, grown, never mapped per read.
+            run = _SCRATCH.run = _aligned(hi - lo)
         store.read(memoryview(run)[:hi - lo], lo)
         target[:] = memoryview(run)[first - lo:first - lo + len(target)]
-        run.close()
 
     def _own(self, rows):
         # A CPU device may alias host memory; the staging buffer is reused.
