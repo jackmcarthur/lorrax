@@ -1837,6 +1837,21 @@ def _photon_rows_order(families, mesh_xy, to_packed):
         static_argnums=1, out_shardings=face)
 
 
+@lru_cache(maxsize=64)
+def _photon_mirror_mix(families, mesh_xy, inversion, n, keys, block, add):
+    """One unfolded source ``block``'s Lorentz mix into its class ``keys``
+    (``symmetry_maps.mix_lorentz_blocks``) as one cached program: the class's
+    first block forms the totals, each later one is added onto them (``add``,
+    donated), in the class's order."""
+    from symmetry_maps import mix_lorentz_blocks
+    sym, ops = families.plans[0].sym, np.full(int(n), int(inversion), dtype=np.int32)
+
+    def mix(source, *total):
+        mixed = mix_lorentz_blocks({block: source}, sym=sym, sym_idx=ops, mesh_xy=mesh_xy, keys=keys)
+        return tuple(t + m for t, m in zip(total, mixed.values())) if add else tuple(mixed.values())
+    return jax.jit(mix, donate_argnums=tuple(range(1, 1 + len(keys))) if add else ())
+
+
 def _minus_q_mirror_photon(families, meta, mesh_xy):
     """The four-current ``chi_{-q}`` rows from ``chi_q`` rows by a unitary inversion, or ``None``.
 
@@ -1846,7 +1861,7 @@ def _minus_q_mirror_photon(families, meta, mesh_xy):
     packed layout (the plans' centroid order).  Every field (χ and dχ/ds)
     given runs as one stack of rows.
     """
-    from symmetry_maps import bgw_integer_q_to_fractional, mix_lorentz_blocks, unfold_isdf_operator
+    from symmetry_maps import bgw_integer_q_to_fractional, unfold_isdf_operator
     from .photon_layout import _empty, _insert, photon_block_view
     plans, layout = tuple(families.plans), families.packed_layout
     rows = {_unitary_inversion(plan) for plan in plans}
@@ -1869,7 +1884,7 @@ def _minus_q_mirror_photon(families, meta, mesh_xy):
         out = _empty(n, layout, mesh_xy, rows.dtype)
         for keys in classes:
             left, right = plans[int(keys[0][0] != 0)], plans[int(keys[0][1] != 0)]
-            total = None
+            total = ()
             for C, D in keys:
                 source = unfold_isdf_operator(
                     photon_block_view(rows, layout, C, D, mesh_xy), irr_idx=irr, sym_idx=ops,
@@ -1879,11 +1894,12 @@ def _minus_q_mirror_photon(families, meta, mesh_xy):
                     n_sym_spatial=int(left.n_sym_spatial),
                     axis_local_sym_perm=left.centroid_local_perm,
                     right_axis_local_sym_perm=right.centroid_local_perm)
-                mixed = mix_lorentz_blocks({(C, D): source}, sym=sym, sym_idx=ops,
-                                           mesh_xy=mesh_xy, keys=keys)
-                total = mixed if total is None else {k: total[k] + mixed[k] for k in total}
-            for (C, D), block in total.items():
+                total = _photon_mirror_mix(families, mesh_xy, inversion, n, keys, (C, D),
+                                           bool(total))(source, *total)
+                del source
+            for (C, D), block in zip(keys, total):
                 out = _insert(out, block, layout, C, D, mesh_xy)
+            del total
         del rows
         return _photon_rows_order(families, mesh_xy, False)(out, len(fields))
     return mirror
@@ -2350,11 +2366,23 @@ def produce_sample_bank(wfns, meta, config, *, mesh_xy, sym, sample_plan, bank_i
     progress = LoopProgress(len(z), print_fn, title="response frequency integration",
                             item_name="frequency", max_updates=len(z)).start()
 
-    def solve(raw, partner, q0, q1, bank_handle, sample, need_value=True, layout="face"):
+    def read_constant(span, bank_handle):
+        """The photon W_inf - V of parents ``span`` (0 for charge), read from the bank."""
+        if vertex is None:
+            return 0.
+        io_started = time.monotonic()
+        constant = read_shared_pole_bank(bank_handle, span, meta=meta, header=header,
+                                         fields=("constant",))["constant"]
+        receipt["seconds"]["io"] = receipt["seconds"].get("io",0.)+time.monotonic()-io_started
+        return constant
+
+    def solve(raw, partner, q0, q1, bank_handle, sample, need_value=True, layout="face",
+              constant=None):
         """W and dW/ds of parents [q0, q1) at one sample, as the bank stores them.
 
         ``layout='batch'`` (a charge line sample beside a q-local selection)
-        returns both in the batch layout.
+        returns both in the batch layout.  ``constant``: the span's W_inf - V
+        when the caller holds it (a line span's two solves), else read here.
         """
         mirrored = partner and mirror is not None
         selected = (partner_qids if partner and not mirrored else qids)[q0:q1]
@@ -2374,12 +2402,8 @@ def produce_sample_bank(wfns, meta, config, *, mesh_xy, sym, sample_plan, bank_i
                 jnp.concatenate(column, axis=0) for column in zip(*parts))
         span = (int(q0), int(q1))
         h = roots[q0:q1]
-        constant = 0.
-        if vertex is not None:
-            io_started = time.monotonic()
-            constant = read_shared_pole_bank(bank_handle, span, meta=meta, header=header,
-                                            fields=("constant",))["constant"]
-            receipt["seconds"]["io"] = receipt["seconds"].get("io",0.)+time.monotonic()-io_started
+        if constant is None:
+            constant = read_constant(span, bank_handle)
         head_update = None
         if direct_head is not None and q0 == 0:
             from .photon_direct_head import add_direct_gamma_field
@@ -2548,15 +2572,20 @@ def produce_sample_bank(wfns, meta, config, *, mesh_xy, sym, sample_plan, bank_i
                     for span in line_spans():
                         sel = line_selections.get(span[1] - span[0], selection)
                         rows = raw if line_width is None else _RowWindow(take(row), span[0])
-                        value, slope = solve(rows, 0, *span, bank_handle, sample, layout=line_layout)
+                        # The span's W_inf - V serves both orientations' solves.
+                        constant = read_constant(span, bank_handle)
+                        value, slope = solve(rows, 0, *span, bank_handle, sample, layout=line_layout,
+                                             constant=constant)
                         with timing.section('bank.line_select'):
                             lines = sel.select(sample, value, slope)
                         del value, slope
                         if ordered:
-                            value, slope = solve(rows, 1, *span, bank_handle, sample, layout=line_layout)
+                            value, slope = solve(rows, 1, *span, bank_handle, sample, layout=line_layout,
+                                                 constant=constant)
                             with timing.section('bank.line_mirror'):
                                 sel.mirror(sample, lines, value, slope)
                             del value, slope
+                        del constant
                         with timing.section('bank.line_panels'):
                             span_panels.append((span, sel.panels(sample, lines)))
                         del lines, rows
