@@ -706,8 +706,8 @@ static ffi::Future WriteDispatchImpl(
     // handler whose input is NOT replicated — a host-memory OOM is per-rank.
     // A rank that hits it never enters the collective H5Dwrite, so the job
     // hangs rather than reporting.  Closing that needs a cross-rank error
-    // rendezvous on a communicator of our own; registered in
-    // KNOWN_LORRAX_ISSUES.md, not attempted here.  The announce is what makes
+    // rendezvous on a communicator of our own, an open limitation not
+    // attempted here.  The announce is what makes
     // it diagnosable in the meantime.  CUDA build only: the host build stages
     // nothing on the write path.
     if (!ensure_pinned(ctx, bytes)) {

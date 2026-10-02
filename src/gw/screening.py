@@ -534,9 +534,8 @@ def compute_screening(
     while a LATER role pays that cost: measured on the production 9x9x1
     deck, the static role's chi0 build/Dyson solve completed and the
     probe role's IDENTICAL build then OOM'd with the static role's W still
-    resident (KNOWN_LORRAX_ISSUES.md, "GN-PPM probe chi0 has no bounded
-    two-role live-set plan at 81 q", 2026-08-20; exact repeated request
-    27,262,284,032 B on two independent jobs).  So every role's W but the
+    resident (repeated request 27,262,284,032 B on two independent
+    jobs).  So every role's W but the
     LAST is spilled to host RAM (:func:`common.collectives.spill_to_host`)
     the moment its own gate passes, and restored
     (:func:`~common.collectives.restore_from_host`) only after every
@@ -641,7 +640,7 @@ def compute_screening(
                     "residue (W^c(z)^H = W^c(conj z) is Hermitian at real "
                     "z), so this HL probe keeps the incumbent even "
                     "orientation completion; the odd channel of χ₀(Ω) is "
-                    "NOT represented here (KNOWN_LORRAX_ISSUES, lane M).")
+                    "NOT represented here.")
         quadrature_log.record_minimax(
             "imag" if on_imag else "real", quad_used,
             omega_ry=abs(req.omega_ry.imag if on_imag else req.omega_ry.real),

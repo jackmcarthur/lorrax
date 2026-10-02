@@ -65,7 +65,8 @@ static inline bool profile_enabled() {
 // ---------------------------------------------------------------------------
 //  Cross-stream join using pooled events on the ctx.  Avoids the +750 ms
 //  per-call stalls that phdf5 hit with `cudaEventDestroy` under
-//  `cuda_malloc_async` (see src/ffi/phdf5/ARCHITECTURE.md §2.2).
+//  `cuda_malloc_async` (see the "cudaEventDestroy" note in
+//  src/ffi/cpp/phdf5/write_ffi.cc).
 // ---------------------------------------------------------------------------
 static ffi::Error cross_stream_wait_pooled(cudaStream_t waiter,
                                            cudaStream_t signaller,

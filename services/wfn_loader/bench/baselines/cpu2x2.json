@@ -16,7 +16,7 @@
     "mb_named": "DERIVED per row as warm_min_s * mbps_warm_min, both of which the artifact records. It is the bytes the REQUEST names (sum over windows of prod(valid_shape) * 8), not the padded slab -- rating a read by its padding would make a raggeder deck look faster. CROSS-CHECK, and the reason it is trustworthy: the union and fold arms read identical bytes, and their independently-recorded (time, rate) pairs agree to 0.54% (gnppm 0-10), 0.06% (gnppm 0-82) and 0.01% (MoS2), and the MoS2 figure lands on the 15.6 GB the design brief states independently.",
     "no_median": "warm_s (median) is deliberately absent. The artifacts record a rep LIST and quote warm-MIN as the headline; inventing a median from 2-3 transcribed reps would add a number nobody measured. Comparing a median against a warm-min is exactly how the draft of docs/services/wfn_loader.md got a row wrong.",
     "pins": "BUILD_NOTES.md, 2026-08-07.",
-    "source": "services/wfn_loader/docs/DESIGN.md DECISION 1 measurement table (jobid 56446562) + the step-1b promotion-gate number (jobid 56456596)."
+    "source": "the 2026-08-07 fold measurement (jobid 56446562: one SlabIO union read of n k windows against n separate read_slab calls, both through the same PhdfCtx, CPU milan 2x2, decks gnppm and MoS2 12x12 400 bands) and the step-1b promotion-gate number (jobid 56456596)."
   },
   "recorded": "2026-08-07",
   "rows": [

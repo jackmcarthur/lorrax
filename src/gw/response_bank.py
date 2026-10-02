@@ -1402,7 +1402,7 @@ def _reciprocity_census(receipt, value, z_batch, q_full, parent, meta):
     fails first when a self-consistent loop amplifies an off-manifold
     reciprocity-violating mode, and nothing else in the construction measures
     it: the shared-pole Gram gate sees it only after the Loewner pencil has
-    amplified it by ~1e2 (KNOWN_LORRAX_ISSUES 2026-09-16 SCGRAM-A/SCGRAM-B).
+    amplified it by ~1e2.
     Every rank evaluates it; no rank-conditional device work (INVARIANTS 21).
     """
     if not _self_negative(int(q_full), meta):

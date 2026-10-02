@@ -344,8 +344,7 @@ def _make_per_q_v_builder_for_tile(
     missing rank-1 head is comparable in Frobenius norm to the WHOLE
     stored q=Γ TT slab (ratio 0.97/1.04/6.0 for the 11/22/33 tiles) and
     the eqp effect is ≈0.2 meV at 4×4, decaying only as ~1/√N_k — the same
-    slow 2D decay that makes the charge head correction mandatory
-    (``KNOWN_LORRAX_ISSUES.md``, bispinor row; claim 41, job 7885325).
+    slow 2D decay that makes the charge head correction mandatory.
 
     When on, the q=Γ, G=0 slot of a TT tile is replaced by the mini-BZ
     Voronoi cell average ``−⟨v(q) P^T_ij(q̂)⟩_mBZ``

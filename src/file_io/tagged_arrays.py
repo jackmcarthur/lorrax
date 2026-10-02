@@ -672,8 +672,8 @@ def write_restart_state_to_h5(
     disk; SlabIO clips the in-memory pad rows against it.  In-memory arrays
     carry the P-dependent padded extent ``meta.n_rmu_padded`` whose pad
     rows are exact zeros, and persisting them verbatim would make the
-    restart file unreadable at a different device count (the
-    ROOT_CAUSE.md defect class, one hop downstream).
+    restart file unreadable at a different device count
+    (docs/architecture/padding.md#pad-extent-invariance).
     ``load_restart_state_from_h5`` re-pads on read.
 
     ``init_W0=True`` pre-allocates an all-zeros W0_qmunu dataset sized

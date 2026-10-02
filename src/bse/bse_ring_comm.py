@@ -1325,7 +1325,7 @@ def build_density_snapshot_operator(
         # outer readout (v(M s), the density-snapshot vertex named in
         # bse_w_exact._build_rpa_resolvent's docstring) and needs the SAME
         # missing weight as apply_V_ring's identically-shaped S_total — see
-        # exchange_spin_weight's docstring (KNOWN_LORRAX_ISSUES.md 2026-08-23).
+        # exchange_spin_weight's docstring.
         S_total = (S_total / sqrt_nk) * exchange_spin_weight(nspinor)
 
         # V_q0 @ S: local N-slice partials, N tiled on y (mu on x from V_q0).

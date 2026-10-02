@@ -63,8 +63,8 @@ struct LorraxCusolverMpCtx {
     // Pooled events for cross-stream joins.  Created once in ctor, destroyed
     // once in dtor.  cudaEventRecord on an already-recorded event just
     // updates the record point.  Avoids the +750 ms stalls that phdf5 hit
-    // with per-call cudaEventDestroy under cuda_malloc_async (see
-    // src/ffi/phdf5/ARCHITECTURE.md §2.2).
+    // with per-call cudaEventDestroy under cuda_malloc_async (see the
+    // "cudaEventDestroy" note in src/ffi/cpp/phdf5/write_ffi.cc).
     cudaEvent_t  ev_xla_in  = nullptr;   // signal on xla_stream → wait on ctx
     cudaEvent_t  ev_ctx_out = nullptr;   // signal on ctx_stream → wait on xla
 

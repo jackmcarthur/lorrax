@@ -41,6 +41,38 @@ Dense solves on a suffix-padded axis run on the logical block
 the larger system changes the round-off with the pad extent. Error messages
 name the axis and both extents.
 
+## Pad-extent invariance {#pad-extent-invariance}
+
+A carrier extent follows the mesh, so anything computed at the carrier extent
+instead of the logical one can change with the device count. Exact-zero pad
+rows are not evidence that a result is invariant: the dependence enters
+through the shape of a solve or a count, not through pad values. Two rules
+close it.
+
+- **Solves run at the logical extent** (`solve_at_logical`; callers in
+  `isdf.core`, `isdf.zeta_mubatch`, `gw.w_isdf`). An identity-padded
+  factorization regroups its partial sums with the pad extent. For a
+  positive-definite Cholesky that stays at round-off; an indefinite,
+  near-singular LU (the transverse current-channel ζ solve) amplifies it
+  O(1) in its near-null modes. With that solve at the carrier extent, one
+  MoS2 3×3 bispinor deck gave a Σ^B tile trace of −0.153 eV on a 668-slot
+  carrier and −117.9 eV on a 672-slot one.
+- **Counts and statistics exclude the pads.** The GN-PPM fit makes every pad
+  mode dead at birth (`gw.minimax_screening.fit_gn_ppm_from_wc_pair` with
+  `n_mu_logical` and the active mask: Ω = 0, so B = 0 and the mode is
+  invalid), and every Ω/B consumer's `Ω > 1e-14` mask then drops pads with no
+  argument of its own. A mode census or window statistic that counted pads
+  would change a discrete choice (an invalid-mode count, a node count) with P.
+
+Bit identity across pad extents is not promised: XLA tiles reductions by the
+carrier extent, so a pad change moves ζ and V at round-off, and an
+ill-conditioned consumer (a near-threshold GN-PPM pole) can amplify that. The
+rule is that a result moving beyond round-off with the pad extent at fixed P
+is a defect. `LORRAX_EXTRA_MU_PAD` (test-only, `runtime.padding.extra_mu_pad`)
+adds pad rows to the canonical centroid carrier at fixed P to expose such a
+dependence without changing the device count; with the orbit-packed
+in-memory order below it moves only the file staging carrier.
+
 ## Orbit-packed runtime centroids
 
 GW's `meta.mu_basis` (`common.centroid_basis.PackedCentroidBasis`) owns the

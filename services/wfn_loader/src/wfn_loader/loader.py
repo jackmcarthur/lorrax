@@ -73,8 +73,8 @@ P-roadmap — STATUS, not plan (2026-08-07, wave-1 wfn_loader branch)
   branches are written against the old spellings and have not rebased.
   That cleanup is the gate; nothing here may delete either early.
 
-Docs: ``docs/services/wfn_loader.md`` (API, contract, backends, measured
-baselines); ``services/wfn_loader/docs/DESIGN.md`` (why).
+Docs: ``docs/services/wfn_loader.md`` (API, contract, backends, and why
+the multi-window union read replaces n single reads).
 """
 from __future__ import annotations
 

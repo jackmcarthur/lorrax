@@ -893,8 +893,7 @@ def _spectral_kernel(mesh: Mesh, kgrid: tuple[int, int, int]) -> Callable:
     before this sweep touched anything -- it also imports
     ``covariant_structured_delta``/``_structured_delta_kernel``, which do
     not exist anywhere in this file and have not since before this
-    session (grep-verified); registered separately in
-    KNOWN_LORRAX_ISSUES.md rather than repaired here, since untangling it
+    session (grep-verified); left unrepaired here, since untangling it
     means editing a P=4 real-distributed-service gate this sweep cannot
     execute to verify.  Left in place rather than deleted out from under
     that reference, per DISCIPLINE's "grep-verified zero callers in src/
@@ -2038,8 +2037,8 @@ def _pad_head_band_manifold_to(v, e, f, surface, *, mesh: Mesh, width: int):
     construction of the two-face carrier, so no further rounding is
     needed here.
 
-    Also applies the fix registered in ``KNOWN_LORRAX_ISSUES.md`` (the
-    v-sharding-commit defect on the legacy path): every returned array goes
+    Also fixes the v-sharding-commit defect of the legacy path: every
+    returned array goes
     through the canonical process-local placement helper onto its declared
     mesh sharding before any kernel sees it, so a foreign
     ``SingleDeviceSharding`` operand never reaches this kernel's
@@ -3016,9 +3015,8 @@ def static_gauge_hall_transaction(
     production consumes its current block.  (The complete sweep,
     ``sweep_uniform_gauge_matrix_elements``, was deleted on 2026-09-02 with
     the rest of the stranded FULL-seam producers; the ``complete`` branch
-    below is therefore unreachable and registered in
-    KNOWN_LORRAX_ISSUES.md rather than removed inside a dead-code commit
-    that must not touch a live producer's contract.)  Exact contact and optional
+    below is therefore unreachable; it was not removed inside a dead-code
+    commit that must not touch a live producer's contract.)  Exact contact and optional
     transfer-q1/q2 fields are validated when present, but they are not
     materialized merely to reduce Hall: on a realistic band manifold that
     would make a three-number reduction retain many unrelated band matrices.
@@ -3508,8 +3506,8 @@ def finalize_iteration_head_samples(
             from .cohsex_sigma import interaction_operator
             W_gamma.append(interaction_operator(W_role).representative_row(0))
         W_gamma = jnp.stack(W_gamma, axis=0)
-        # Hard lifetime boundary (KNOWN_LORRAX_ISSUES.md "the bounded full-
-        # head fold still needs a fresh-fit lifetime boundary"): force this
+        # Hard lifetime boundary (the bounded full-head fold needs a
+        # fresh-fit lifetime boundary): force this
         # tiny (n_omega, mu_X, mu_Y) Gamma extraction eagerly, INSTEAD of
         # letting it stay queued behind whatever the caller does next.  Every
         # other stage this array's inputs pass through (screening.py's

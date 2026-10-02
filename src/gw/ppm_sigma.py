@@ -446,7 +446,7 @@ def _prepare_sigma_state(
     at the fit (``fit_gn_ppm_from_wc_pair(n_mu_logical=...)`` zeroes their
     Ω, hence B = 0 and valid = False), so ``B_mask_raw = Ω > 1e-14``
     excludes them here — and in every other Ω/B consumer — with no mask
-    argument (ROOT_CAUSE.md 2026-07-08; PADDING_AUDIT item 3).
+    argument (docs/architecture/padding.md#pad-extent-invariance).
     """
     # TODO(metal-greens): the finite-occupation Green's-function/Sigma
     # decomposition needs particle/hole weights f and 1-f, not f > 0.5.

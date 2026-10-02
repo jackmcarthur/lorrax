@@ -227,9 +227,8 @@ class Bulk3D:
         ``analytic_sphere=False`` (the default, matching :meth:`q0_average`)
         is a pure-Sobol mean of a ``1/q²``-singular integrand and inherits
         the SAME infinite-variance estimator problem the scalar 3D head has
-        (``KNOWN_LORRAX_ISSUES.md``, the ``minibz.py`` row: measured tail
-        index ``alpha≈1.5 < 2``, so ``sigma/sqrt(N)`` is not a valid error
-        bar).  Pass ``True`` for a 3D bulk production head — it adds the
+        (measured tail index ``alpha≈1.5 < 2``, so ``sigma/sqrt(N)`` is not
+        a valid error bar).  Pass ``True`` for a 3D bulk production head — it adds the
         isotropic Baldereschi-Tosatti sphere term exactly as
         :meth:`q0_average` does for the scalar case.  The 2D slab sibling
         is unaffected (marginal ``alpha=2``); this caveat is 3D-only.

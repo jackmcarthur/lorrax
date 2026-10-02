@@ -576,9 +576,9 @@ def _eigen_rank(G_host: np.ndarray, rcond: float, *, label: str,
 #
 #   BAND WINDOWS keep WHOLE MULTIPLETS.  ``common/band_degeneracy`` is not a
 #   budget at all — a window that slices a degenerate manifold makes the run
-#   wrong rather than expensive, so the rule there is closure, not thrift, and
-#   ``AGENT_PREAMBLE``'s standing ruling is that ``strict`` is the default and
-#   you never set ``snap`` to make a gate pass.
+#   wrong rather than expensive, so the rule there is closure, not thrift:
+#   ``strict`` is the default and you never set ``snap`` to make a gate pass
+#   (``LORRAX_BAND_DEGENERACY`` in ``docs/dev/env_vars.md``).
 #
 # Do not re-introduce a "these two go opposite ways, on purpose" paragraph
 # here.  There was one, contrasting this floor with a snap-OUTWARD ceiling, and
@@ -593,8 +593,8 @@ def _eigen_rank(G_host: np.ndarray, rcond: float, *, label: str,
 # construction, so the ceiling refusal can only ever fire on the number the
 # user typed.
 #
-# ``AGENT_PREAMBLE``'s band-degeneracy ruling ("never set ``snap`` to make a
-# gate pass") is the constraint this must not violate, and it does not: the
+# The band-degeneracy rule ("never set ``snap`` to make a gate pass") is the
+# constraint this must not violate, and it does not: the
 # floor loosens no criterion.  It spends less.
 
 

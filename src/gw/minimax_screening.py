@@ -356,7 +356,8 @@ def fit_gn_ppm_from_wc_pair(
         DEAD here: ``Ω = 0``, ``B = 0``, ``valid = False``.  Handing them the
         live-looking fallback Ω instead used to inflate the mode census and
         the masked-Ω window statistics by a pad-extent- (= device-count-)
-        dependent amount (ROOT_CAUSE.md 2026-07-08).  Zeroing Ω at birth
+        dependent amount (docs/architecture/padding.md#pad-extent-invariance).
+        Zeroing Ω at birth
         makes every present and future ``Omega_q``/``B_q`` consumer
         structurally pad-safe: the ``Ω > 1e-14`` mode mask excludes pads with
         no mask argument anywhere downstream.  Pass the padded extent

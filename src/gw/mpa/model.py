@@ -728,8 +728,7 @@ def _require_metal_time_reversal(material_class, trs_allowed):
             "time-reversal-symmetric metal; why: the metal route fits one "
             "residue with no odd channel, and its physical-orientation "
             "samples (pair kernel and fractional contour, ordered=True) have "
-            "no time-reversal-broken metal gate yet "
-            "(KNOWN_LORRAX_ISSUES 2026-09-15 TRINT; METAL 2026-09-16).")
+            "no time-reversal-broken metal gate yet.")
 
 
 def chi0_orientation_route(material_class: str, *, trs_allowed: bool) -> str:

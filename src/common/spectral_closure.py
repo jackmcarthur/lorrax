@@ -81,9 +81,10 @@ about which physical states enter the calculation and half a multiplet is
 not a state of anything.  Its default is ``strict`` on the owner's ruling of
 2026-08-10 — a widened window is a DIFFERENT CALCULATION (4v4c became 4v8c,
 1024 dimensions became 2048, and a gate read 0.0906 eV of regression that no
-branch had caused), so it refuses rather than repairing, and
-``AGENT_PREAMBLE`` carries the standing rule: **never set ``snap`` to make a
-gate pass.**  That guard is untouched by this module and by the ruling above.
+branch had caused), so it refuses rather than repairing, and its env row in
+``docs/dev/env_vars.md`` (``LORRAX_BAND_DEGENERACY``) carries the standing
+rule: **never set ``snap`` to make a gate pass.**  That guard is untouched by
+this module and by the ruling above.
 
 The one-line discriminator: **a band window says WHICH STATES exist and
 rounds outward; a rank cut says HOW MANY DIRECTIONS are trustworthy and

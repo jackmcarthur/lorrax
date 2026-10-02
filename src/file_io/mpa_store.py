@@ -1693,7 +1693,7 @@ def _pole_field_counts():
     Traced once per shape and sharding: the elementwise tests fuse into
     the two sums, so no field-sized temporary is allocated.  The eager
     form allocated one per ``jnp`` op and died at 6.44 GiB on CrI3 8x8
-    GN-PPM SC (KNOWN_LORRAX_ISSUES, ``mpa_store.py`` row).
+    GN-PPM SC.
     """
     if not _POLE_FIELD_COUNTS:
         import jax

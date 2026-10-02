@@ -173,8 +173,8 @@ struct LORRAX_PHDF_CTX_TYPE {
     // Residual window, CUDA build only: an in-flight async write's D2H
     // (XLA thread) against a queued ``ReadKchunkUnion`` task (writer thread),
     // both on ``pinned_buf``.  Closing it means routing the write staging
-    // through the writer queue — a C++ redesign, deliberately not attempted;
-    // registered in KNOWN_LORRAX_ISSUES.md.  The host build, which is the
+    // through the writer queue — a C++ redesign, deliberately not attempted
+    // here; it is an open limitation.  The host build, which is the
     // platform LORRAX certifies, does not have it.
     void*        pinned_buf          = nullptr;
     std::atomic<size_t> pinned_capacity{0};
@@ -226,8 +226,8 @@ struct LORRAX_PHDF_CTX_TYPE {
     // caution: ad_cray_write_coll.c:669 OOM at >~1 GB/rank on that
     // stack — use the env override there).  Metadata defaults to
     // non-collective so file-level ops (H5Dcreate/extend) bypass the
-    // collective driver — per ARCHITECTURE.md non-collective meta is
-    // ~100 ms faster on OpenMPI small writes too.  dedup_replicas
+    // collective driver; non-collective metadata was also measured
+    // ~100 ms faster on OpenMPI small writes.  dedup_replicas
     // drops all-but-one writer of a replica group's identical
     // hyperslab (mesh axes not consumed by the array's sharding):
     // required for correctness under collective writes (overlapping

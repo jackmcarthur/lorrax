@@ -104,9 +104,7 @@ def _quadrature_tables(wfn, sym):
       Each member keeps its own stored weight; the parents cover only
       ``n_parents / nk_tot`` of it by construction, so the IBZ precondition
       is not merely unnecessary here, it is false for every unfolded NSCF
-      grid.  Requiring it refused every such WFN, including the repo's own
-      ``tests/regression/bispinor_debug/WFN.h5`` (KNOWN_LORRAX_ISSUES.md,
-      2026-09-01).
+      grid.  Requiring it would refuse every such WFN.
 
     The two branches coincide wherever they overlap: a full-BZ file whose
     stars are all singletons hits ``w_parent / 1 == w_member``, so the

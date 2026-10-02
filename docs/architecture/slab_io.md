@@ -177,7 +177,13 @@ a backend, striping, ROMIO hints, or a mesh-divisible extent.
 
 The collective calls must be made by every rank, in the same order, with the
 same dataset name and replicated arguments. A rank that skips one leaves its
-peers blocked in the collective with no traceback.
+peers blocked in the collective with no traceback. The path is one of those
+arguments: a path built from rank-local state (a PID, a `tempfile` name)
+gives each rank a different file, and the collective open hangs. Build it
+from replicated values, or broadcast it from rank 0
+(`ffi.common.broadcast.broadcast_bytes`). Each open and close is itself an
+MPI-IO collective, so a create-and-fill sequence keeps one `mode="w"` handle
+open instead of closing it and reopening in `"a"`.
 
 ### Shapes, padding and offsets
 

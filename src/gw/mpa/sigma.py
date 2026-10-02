@@ -1606,7 +1606,7 @@ def _unfold_sigma_cube(sigma, sym, *, k_axis, sharding):
     without conjugating quadrature coefficients or storing tau tiles.  The
     output sharding is PINNED: unpinned, XLA replicated the full-BZ cube on
     every rank (CrI3 16x16, 3 x 65 x 256 x 184^2 c128 = 27 GB/rank plus a
-    57 GB temp at P64 -- the map-0 OOM; KNOWN_LORRAX_ISSUES 2026-09-23).
+    57 GB temp at P64 -- the map-0 OOM).
     """
     return _unfold_sigma_cube_fn(sym, int(k_axis), sharding)(sigma)
 
@@ -1864,7 +1864,7 @@ def _branches(wfns, omega, efermi_ry, occupation_state=None):
     band whose weight 1−f is at weight 1−f.  Nothing is clipped; the
     Fermi-Dirac weights metals use lie in [0, 1], and an MP overshoot
     (f<0 or f>1) would ride through unchanged
-    (docs/theory/finite-occupation-screening.md).
+    (docs/theory/metallic-mpa-screening.md §5.1).
 
     ``branches_for_omega_grid`` applies the one support predicate
     (``gw.efermi.band_in_occupation_window``).  Applying it here rather

@@ -2352,7 +2352,7 @@ def main(argv=None):
                 kgrid_vq, log=log, grade=args.cert_grade,
                 window_mode=args.refit_window)
             # PROVENANCE.  The run's own rank-0 block is what outranks every page
-            # in the register (AGENT_PREAMBLE), so the grade and the certified
+            # in the register (docs/index.md#register), so the grade and the certified
             # number are stated there before the first byte of output is written,
             # in the same words the .dat and the .png will carry.
             log(f"  [provenance] LORRAX {lorrax_version()}: "

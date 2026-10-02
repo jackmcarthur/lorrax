@@ -667,8 +667,8 @@ def _serve_from_plan(specs, fits, eps):
     scope lookup applies. The result does not depend on rank timing:
     before this, whether a window saw another window's fresh rule depended on
     how far the other rank had got (Si shared-pole ``cond:pole_tail`` took
-    the 9-node own rule or the 7-node ``cond:bulk`` one, eqp1 0.80 ueV apart;
-    KNOWN_LORRAX_ISSUES 2026-09-24).
+    the 9-node own rule or the 7-node ``cond:bulk`` one, eqp1 0.80 ueV
+    apart).
     """
     fresh = sorted((fit for fit in fits if fit["built"]),
                    key=lambda fit: (fit["node_count"], fit["rule_digest"]))

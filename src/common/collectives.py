@@ -573,9 +573,7 @@ def spill_to_host(arr) -> "HostSpill":
     computing several large sharded results in sequence (the motivating
     caller is ``gw.screening.compute_screening``'s per-role W: the
     completed STATIC role's W was staying resident, on Python-dict
-    reference alone, across the PROBE role's own chi0/W build — see
-    KNOWN_LORRAX_ISSUES.md, "GN-PPM probe chi0 has no bounded two-role
-    live-set plan at 81 q", 2026-08-20) can spill every result but the one
+    reference alone, across the PROBE role's own chi0/W build) can spill every result but the one
     about to be consumed, so at most one such result is resident at a
     time, and restore the rest with :func:`restore_from_host` once every
     stage that could contend for headroom has run.  Do NOT touch ``arr``

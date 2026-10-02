@@ -13,7 +13,7 @@ The pad zone is zero-filled BY DEFAULT.  Downstream operators that
 contract along a padded axis (e.g. einsums in V_q tile, V·χ in W solve)
 see no contribution from the pad rows by construction; solves must run at
 the LOGICAL extent (see :func:`solve_at_logical` and
-``reports/device_invariance_2026-07-08/ROOT_CAUSE.md``).
+``docs/architecture/padding.md#pad-extent-invariance``).
 
 A zero pad is inert for operators LINEAR or BILINEAR in the padded axis,
 and is a WRONG NUMBER for a diagonalisation — which is why
@@ -396,7 +396,7 @@ def extra_mu_pad() -> int:
     comparing runs at different P.  This knob forces additional zero
     pad rows on top of the mesh round-up, reproducing e.g. the P=16 pad
     extent in a P=1/P=4 run (see
-    ``reports/device_invariance_2026-07-08/ROOT_CAUSE.md``).  Any
+    ``docs/architecture/padding.md#pad-extent-invariance``).  Any
     result that changes under this knob at fixed P depends on the pad
     extent and is a defect.
 
@@ -450,7 +450,8 @@ def solve_at_logical(solve_fn, n_logical, mats, rhs=None, *, pad_axes=(-2,)):
     zero-embed the solution back at the padded extent.
 
     THE grep-able invariant for "solves run at the logical extent"
-    (ROOT_CAUSE.md 2026-07-08): identity-padded factorizations regroup
+    (docs/architecture/padding.md#pad-extent-invariance): identity-padded
+    factorizations regroup
     partial sums per pad extent — catastrophically for near-singular
     LU — so every dense solve must μ-slice to the logical extent and
     zero-refill.  A solver branch routed through this helper cannot

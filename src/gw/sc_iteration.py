@@ -3204,9 +3204,9 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
         # eigenvalues at ~1 ulp, and the GN-PPM two-point fit amplifies
         # ulp-scale enk noise to O(0.1–1 eV) in Σ_c(ω) via near-threshold
         # pole modes (measured on the MoS2 3×3 fixture: +1 ulp on every
-        # WFN energy → max|ΔΣ_c| = 1.28 eV; same ill-conditioning family
-        # as the Fix-3 on-pole census sensitivity in
-        # reports/device_invariance_2026-07-08/ROOT_CAUSE.md).  The exact
+        # WFN energy → max|ΔΣ_c| = 1.28 eV; the near-threshold-pole
+        # sensitivity of docs/architecture/padding.md#pad-extent-invariance).
+        # The exact
         # eigensystem keeps SC-iteration-1 ≡ one-shot G0W0 bit-exactly
         # (gated by tests/test_invariance_gates.py::
         # test_sc_iteration1_equals_one_shot).
@@ -3944,9 +3944,7 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
         if elementwise_mpa:
             # The fit-sample count comes from the RETURNED plan --
             # ``mpa_z`` is a local inside ``_sc_head_frequency_plan`` and
-            # was never visible here (KNOWN_LORRAX_ISSUES 2026-08-19 row;
-            # every sc_head_update=dft_velocity + compute_mode=mpa
-            # iteration raised NameError at this line before W sampling).
+            # is not visible here.
             # ``plan_z`` excludes the separately appended exact-static
             # G=0 head sample, which is exactly the count meant here.
             from .mpa import sample_plan as _sample_plan
@@ -6405,9 +6403,7 @@ def _maybe_dump_e_history(
 #: Floor below which a retained link's Löwdin-overlap singular value marks
 #: its window edge as cutting a hybridized (non-separable) manifold —
 #: PLAN.md D3(a).  Calibrated against the measured Na 8^3 SOC-48-band
-#: collapse (proposal_1, Sec 1.2 item 2 / KNOWN_LORRAX_ISSUES.md, the
-#: ``file_io/parallel_transport.py:407-415`` register row's sibling
-#: finding): a manifold the transport holonomy independently flagged
+#: collapse: a manifold the transport holonomy independently flagged
 #: (``max|S-1| = 1.9906``) carried retained singular values of ``5.462e-2``
 #: at band 45 and ``4.476e-8`` at band 48, against a healthy link's
 #: near-unitary overlap (near 1.0).  0.5 is a first, round, principled
