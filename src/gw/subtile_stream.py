@@ -209,9 +209,9 @@ def window_load(load, mesh, s, lo, hi, R, ns=1):
     """Placed load tables (``symmetry_maps.DeviceLoadTables``) cut to every X shard's window ``[s, s + R)``.
 
     ``s``, ``lo`` and ``hi`` are traced.  The left sources move to the window
-    and are -1 outside its live rows ``[lo, hi)`` (a k-convolution reads them
-    as exact zeros); a pass is a union of whole orbits, so no live source
-    leaves the window.
+    and are -1 outside its live rows ``[lo, hi)`` (read as exact zeros; the
+    k-convolution also takes ``live = [lo, hi)`` and skips those rows); a pass
+    is a union of whole orbits, so no live source leaves the window.
     """
     width = int(R) * int(ns)
 

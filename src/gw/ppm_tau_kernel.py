@@ -407,8 +407,10 @@ def _sigma_subtile_kernel(*, mesh_xy, kgrid, brackets, face_shape, face_band_ext
         W, Wt, rows, left = W_q, W_pt, rows_all, left_all
         faces_right = right_all
 
-        def one_pass(accs, W, Wt, rows, left, w_load, g_pass):
-            w_prep = door9(W, Wt, w_load)
+        def one_pass(accs, W, Wt, rows, left, w_load, g_pass, rows_live=None):
+            # ``rows_live``: a padded window's live rows [lo, hi); the
+            # k-convolutions skip the rest and return them zero.
+            w_prep = door9(W, Wt, w_load, live=rows_live)
             faces = (jnp.conj(left), faces_right)
             out = []
             for b, (sel, band_range) in enumerate(zip(bracket_masks, bracket_ranges)):
@@ -421,7 +423,7 @@ def _sigma_subtile_kernel(*, mesh_xy, kgrid, brackets, face_shape, face_band_ext
                     G = green(rows, g_right, E_A, sel, E_min, E_max, E_ref_A, t_node, gemm,
                               band_range)
                     sigma = conv(G.G, G.transpose, w_prep, conj_partner=G.conj_partner,
-                                 load=g_pass)
+                                 load=g_pass, live=rows_live)
                     return project.accumulate(faces, sigma, acc=acc)
                 out.append(add(accs[b]) if live[b] is None
                            else jax.lax.cond(live[b], add, lambda a: a, accs[b]))
@@ -439,7 +441,8 @@ def _sigma_subtile_kernel(*, mesh_xy, kgrid, brackets, face_shape, face_band_ext
                 return one_pass(accs, Wp, Wtp, window_green_rows(rows, mesh_xy, s, R),
                                 window_rows(left, mesh_xy, s, R, axis=3, live=(lo, hi)),
                                 window_load(load, mesh_xy, s, lo, hi, R),
-                                window_load(g_load, mesh_xy, s, lo, hi, R, ns))
+                                window_load(g_load, mesh_xy, s, lo, hi, R, ns),
+                                jnp.stack([lo, hi]).astype(jnp.int32))
             accs = scan_passes(windows, step, accs)
         if brackets is None:
             return finish(accs[0])
