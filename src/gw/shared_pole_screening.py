@@ -504,9 +504,10 @@ def screen_shared_poles(wfns, V_q, meta, config, *, mesh_xy, sym,
             # complete bank resumes the constructor, anything else is rebuilt.
             import h5py
             from file_io.slab_io import remove_stale_streamed_banks
-            # Per-rank streamed stores never outlive their process (SlabIO unlinks them
-            # on every exit it sees); a SIGKILL leaves them, so the first map of a
-            # process removes every generation's leftovers before it creates any.
+            # A per-rank streamed store is unlinked as soon as it is opened, so its bytes
+            # die with the process, SIGKILL included; only older code, or a kill between
+            # open and unlink, leaves files, so the first map of a process removes every
+            # generation's leftovers before it creates any.
             stale = remove_stale_streamed_banks(
                 [root / "streamed_bank"] if _SWEPT else
                 [p / "streamed_bank" for p in Path(run_dir).resolve().glob("*_shared_pole")])
