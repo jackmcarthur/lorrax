@@ -27,7 +27,6 @@ from runtime.padding import (
 )
 from .efermi import band_in_occupation_window
 from .minimax_screening import MinimaxNodes
-from .subtile_stream import pass_tables
 
 
 # ============================================================================
@@ -249,8 +248,7 @@ def _direct_pass_plan(mesh_xy, kgrid, plan, *, n_rmu, ns, n_band, q_count, n_nod
     while len(_PASS_PLANS) >= 4:
         _PASS_PLANS.pop(next(iter(_PASS_PLANS)))
     _PASS_PLANS[key] = plan_passes(plan.unfold_load_tables(), mesh_xy, ns=ns, row_bytes=row_bytes,
-                                   chunk_bytes=2 * 16 * int(q_count) * mu * nu, n_nodes=n_nodes,
-                                   windows=True)
+                                   chunk_bytes=2 * 16 * int(q_count) * mu * nu, n_nodes=n_nodes)
     return _PASS_PLANS[key]
 
 
@@ -331,7 +329,7 @@ def _photon_pass_plans(mesh_xy, kgrid, families, half_plans, *, n_band, q_count,
     return _PHOTON_PASS_PLANS[key]
 
 
-def _photon_chi_doors(mesh_xy, kgrid, half_plans, parity, passes):
+def _photon_chi_doors(mesh_xy, kgrid, half_plans, parity, rows):
     """Mode-11 vertex doors of the four-current stream, one per family pair and lower quadrant.
 
     ``half_plans`` are the two families' Dirac-half plans and ``parity`` the
@@ -344,17 +342,19 @@ def _photon_chi_doors(mesh_xy, kgrid, half_plans, parity, passes):
     that on the upper operand's load.  The vertices are the quadrant-local
     ``(perm, phase)`` of every channel pair of the family pair
     (``common.gamma_matrices.gamma_perm_phase_host``), so the door forms
-    ``sum_ab (J_A G^> J_B^dagger)_ab conj(G^<)_ab``.  ``passes`` (per family
-    pair, its row passes ``((x0, xr), ...)`` at orbit cuts,
-    :func:`_photon_pass_plans`): a pass's door
-    reads only its own rows, so its parent Greens are built on those rows only.
-    Returns ``{(pair, (h, g), (x0, xr)): (door, keys, tables)}``; quadrants and
-    passes share every table array they have in common
+    ``sum_ab (J_A G^> J_B^dagger)_ab conj(G^<)_ab``.  ``rows`` (per family
+    pair, its window's rows, :func:`_photon_pass_plans`): the door is built on
+    the window's shapes (``subtile_stream.window_tables``; the pair's own
+    tables when one window holds every row) and every pass reads the pair's
+    whole tables cut to its window on the device (``subtile_stream.window_load``).
+    Returns ``{(pair, (h, g)): (door, keys, tables)}`` with the whole tables;
+    quadrants share every table array they have in common
     (:func:`_place_photon_door_tables` places each once).
     """
     from common.gamma_matrices import gamma_perm_phase_host
     from ffi.fft import make_kconv_chi_vertex
     from .photon_layout import FAMILY_PAIRS, family_channels
+    from .subtile_stream import window_tables
     p = np.asarray(parity, dtype=np.float64)
     doors = {}
     side = int(mesh_xy.shape["x"])
@@ -363,12 +363,11 @@ def _photon_chi_doors(mesh_xy, kgrid, half_plans, parity, passes):
         local_rows = int(half_plans[L].n_centroid_packed) // side
         base = half_plans[L].unfold_load_tables(
             right_plan=None if half_plans[R] is half_plans[L] else half_plans[R])
-        pass_rows = tuple(passes[i_pair])
+        window = int(rows[i_pair])
+        shape = base if window == local_rows else window_tables(base, window, side, 2)
         flip = tuple(int(f == 1) for f in pair)
         keys = tuple((A, B) for A in family_channels(L) for B in family_channels(R))
         odd_nph = np.asarray(base.nph) * p[:, None]
-        cuts = {rows: base if rows == (0, local_rows) else pass_tables(base, *rows, side, 2)
-                for rows in pass_rows}
         for h in (0, 1):
             for g in (0, 1):
                 hu, gu = h ^ flip[0], g ^ flip[1]
@@ -376,16 +375,18 @@ def _photon_chi_doors(mesh_xy, kgrid, half_plans, parity, passes):
 
                 def local(channel, first, other):
                     perm, phase = gamma_perm_phase_host(channel)
-                    rows = [first + i for i in range(2)]
-                    return (tuple(int(perm[a]) - 2 * other for a in rows),
-                            tuple(complex(phase[a]) for a in rows))
+                    rows_ = [first + i for i in range(2)]
+                    return (tuple(int(perm[a]) - 2 * other for a in rows_),
+                            tuple(complex(phase[a]) for a in rows_))
                 left = tuple(local(A, 2 * h, hu) for A in family_channels(L))
                 right = tuple(local(B, 2 * g, gu) for B in family_channels(R))
-                for rows in pass_rows:
-                    cut = cuts[rows] if (h + g) % 2 == 0 else cuts[rows]._replace(nph=odd_nph)
-                    door = make_kconv_chi_vertex(mesh_xy, kgrid, cut, left_vertices=left,
-                                                 right_vertices=right, sign_c=sign_c, norm="ortho")
-                    doors[(pair, (h, g), rows)] = (door, keys, cut)
+                odd = (h + g) % 2 == 1
+                full = base._replace(nph=odd_nph) if odd else base
+                door = make_kconv_chi_vertex(mesh_xy, kgrid,
+                                             shape._replace(nph=odd_nph) if odd else shape,
+                                             left_vertices=left, right_vertices=right,
+                                             sign_c=sign_c, norm="ortho")
+                doors[(pair, (h, g))] = (door, keys, full)
     return doors
 
 
@@ -427,18 +428,18 @@ def _place_photon_door_tables(doors, mesh_xy):
 _PHOTON_DOORS: dict = {}
 
 
-def _photon_stream_doors(mesh_xy, kgrid, half_plans, parity, passes):
-    """:func:`_photon_chi_doors` and their placed tables, built once per run and pass plan.
+def _photon_stream_doors(mesh_xy, kgrid, half_plans, parity, rows):
+    """:func:`_photon_chi_doors` and their placed tables, built once per run and window plan.
 
-    Calls whose plans give the same passes share one set of doors and tables.
+    Calls whose plans give the same windows share one set of doors and tables.
     """
-    passes = tuple(tuple((int(x0), int(xr)) for x0, xr in rows) for rows in passes)
-    key = (mesh_xy, tuple(int(v) for v in kgrid), tuple(half_plans), passes)
+    rows = tuple(int(r) for r in rows)
+    key = (mesh_xy, tuple(int(v) for v in kgrid), tuple(half_plans), rows)
     hit = _PHOTON_DOORS.get(key)
     if hit is None:
         from common import timing
         with timing.section('response.door_tables', announce=True):
-            doors = _photon_chi_doors(mesh_xy, kgrid, half_plans, parity, passes=passes)
+            doors = _photon_chi_doors(mesh_xy, kgrid, half_plans, parity, rows)
             placed = _place_photon_door_tables(doors, mesh_xy)
         if jax.process_index() == 0:
             print(f"  [response] four-current mode-11 doors: {len(doors)} doors, "
@@ -1113,32 +1114,31 @@ def _get_chi_fractional_contour_kernel_face(
             mesh_xy, grid, photon, half_plans, n_band=nb_full, q_count=len(selected_q),
             n_nodes=minimax.RESPONSE_NODE_CAPACITY if pair_mode == "direct" else 1,
             n_sets=photon_sets)
-        # A one-segment program (``stream_pass``) plans only its own pass's GEMMs.
-        segments = photon_segments(photon_plans)
-        if stream_pass is not None and not 0 <= int(stream_pass) < len(segments):
-            raise ValueError(f"GATE response_stream_pass: segment {stream_pass} of "
-                             f"{len(segments)} four-current row passes")
-        wanted = None if stream_pass is None else segments[int(stream_pass)]
+        # Each family pair's passes are windows of plan.rows rows: one door per
+        # quadrant and one GEMM plan serve them all.  A segment program
+        # (``stream_pass``, the family pair) serves every pass of its pair.
+        if stream_pass is not None and not 0 <= int(stream_pass) < len(photon_plans):
+            raise ValueError(f"GATE response_stream_pass: family pair {stream_pass} of "
+                             f"{len(photon_plans)} four-current streams")
         photon_gemms = tuple(
-            tuple(gemm_plan(mesh_xy, m=px * xr * 2, k=nb_full,
-                            n=photon.packed_layout.carrier_extent(family_channels(R)[0]) * 2,
-                            nq=nk_shape, dtype=jnp.complex128, layout="axis",
-                            enable_active_range=band_ranges is not None, warmup=False)
-                  if wanted is None or wanted == (i_pair, p) else None
-                  for p, (_, xr) in enumerate(plan.passes))
+            gemm_plan(mesh_xy, m=px * plan.rows * 2, k=nb_full,
+                      n=photon.packed_layout.carrier_extent(family_channels(R)[0]) * 2,
+                      nq=nk_shape, dtype=jnp.complex128, layout="axis",
+                      enable_active_range=band_ranges is not None, warmup=False)
+            if stream_pass is None or int(stream_pass) == i_pair else None
             for i_pair, ((_, R), plan) in enumerate(zip(FAMILY_PAIRS, photon_plans)))
         photon_active = tuple(
-            tuple((tuple(g.prepare_active_range(*bounds) for bounds in band_ranges)
-                   if band_ranges is not None and g is not None else (None, None)) for g in gemms)
-            for gemms in photon_gemms)
+            (tuple(g.prepare_active_range(*bounds) for bounds in band_ranges)
+             if band_ranges is not None and g is not None else (None, None))
+            for g in photon_gemms)
         if jax.process_index() == 0 and stream_pass is None:
             print(f"Response four-current {pair_mode} stream: row passes (CC, CT, TC, TT) "
                   f"{tuple(len(plan.passes) for plan in photon_plans)} of "
-                  f"{tuple(max(xr for _, xr in plan.passes) for plan in photon_plans)} "
+                  f"{tuple(plan.rows for plan in photon_plans)} "
                   f"local rows, {tuple(plan.chunk for plan in photon_plans)} node(s) "
                   "per accumulate", flush=True)
         photon_doors, (door_index, door_arrays, door_specs) = _photon_stream_doors(
-            mesh_xy, grid, half_plans, half_parity, tuple(plan.passes for plan in photon_plans))
+            mesh_xy, grid, half_plans, half_parity, tuple(plan.rows for plan in photon_plans))
     active_gemms = (tuple(g_plan.prepare_active_range(*bounds) for bounds in band_ranges)
                    if band_ranges is not None and layout == "axis" else (None, None))
     # Selected charge streams on a raw-parent plan form each node's correlation
@@ -1174,9 +1174,10 @@ def _get_chi_fractional_contour_kernel_face(
             subtile is None or not 0 <= int(stream_pass) < len(subtile.passes)):
         raise ValueError(f"GATE response_stream_pass: pass {stream_pass} needs the direct bank "
                          "carry on the row-pass engine (mathdx mode 11 from raw parents)")
-    # A segment program of the windowed charge stream serves every pass: the
-    # pass index is a runtime argument after the carry.
-    segment_index = stream_pass is not None and photon_doors is None and subtile is not None
+    # A segment program serves every pass of its stream (the four-current
+    # stream: of its family pair): the segment index is a runtime argument
+    # after the carry.
+    segment_index = stream_pass is not None
     # Trailing operands bound to the program (``_BoundTail``): the door tables.
     tail = (door_arrays if photon_doors is not None else chi_tables)
     tail_specs = (door_specs if photon_doors is not None else
@@ -1230,13 +1231,10 @@ def _get_chi_fractional_contour_kernel_face(
                        jnp.broadcast_to(zero, (n_out,) + zero.shape),
                        selected_shard))
         # The placed door tables are the last operand (``_BoundTail``).
-        door_loads = chi_load = None
+        chi_load = None
         if tail is not None:
             carry, tables = carry[:-1], carry[-1]
-        if photon_doors is not None:
-            door_loads = {key: DeviceLoadTables(*(tables[i] for i in slots))
-                          for key, slots in door_index.items()}
-        elif chi_tables is not None:
+        if photon_doors is None and chi_tables is not None:
             chi_load = tables
         pass_index = None
         if segment_index:
@@ -1277,9 +1275,14 @@ def _get_chi_fractional_contour_kernel_face(
             return jax.lax.with_sharding_constraint(
                 jnp.einsum("Rmanb,Rmanb->Rmn", gu, gf.conj()), chi_R_shard)
 
-        def photon_planes(acc, pair, rows, parent, lower_w, upper_w, lower_time, lower_ref,
+        QUADRANTS = ((0, 0), (0, 1), (1, 0), (1, 1))
+
+        def photon_planes(acc, pair, loads, live, parent, lower_w, upper_w, lower_time, lower_ref,
                           upper_time, upper_ref):
-            """A family pair's channel planes in R on the row pass ``rows``, accumulated in ``acc``.
+            """A family pair's channel planes in R on a window, accumulated in ``acc``.
+
+            ``loads[(h, g)]`` are the quadrant doors' tables cut to the window
+            and ``live`` its live rows (empty when one window holds every row).
 
             Each lower quadrant ``(h, g)`` meets the upper quadrant
             ``(h, g) ^ flip`` (a current vertex exchanges the halves);
@@ -1290,15 +1293,14 @@ def _get_chi_fractional_contour_kernel_face(
             ``v(R) = conj(A(-R))`` and ``FT[A](q) = conj(FT[v](q))``.
             """
             flip = tuple(int(f == 1) for f in pair)
-            for h, g in ((0, 0), (0, 1), (1, 0), (1, 1)):
+            for h, g in QUADRANTS:
                 acc, lower_w, upper_w = jax.lax.optimization_barrier((acc, lower_w, upper_w))
                 lower = parent(lower_w, lower_time, lower_ref, (h, g), False)
                 upper = parent(upper_w, upper_time, upper_ref, (h ^ flip[0], g ^ flip[1]), True)
                 partners = (() if lower.transpose is None and upper.transpose is None
                             else (lower.partner(), upper.partner()))
-                door_key = (pair, (h, g), rows)
-                acc = photon_doors[door_key][0](acc, lower.G, upper.G, *partners,
-                                                load=door_loads[door_key])
+                acc = photon_doors[(pair, (h, g))][0](acc, lower.G, upper.G, *partners,
+                                                      load=loads[(h, g)], **live)
             return acc
 
         def photon_subtiles(carry, weights, count, orientations):
@@ -1318,28 +1320,39 @@ def _get_chi_fractional_contour_kernel_face(
             """
             from .greens_function_kernel import green_right_operand
             from .photon_layout import FAMILY_PAIRS
-            from .subtile_stream import band_complete, pass_rows, stream_passes
+            from .subtile_stream import band_complete, stream_passes, window_load, window_rows
             faces = tuple(band_complete(psi_mun[f], psi_nmu[f], mesh_xy) for f in (0, 1))
             # Each family's right operands, one per Dirac half, formed once
             # per dispatch: every quadrant Green of every node and pass reads them.
             rights = tuple(tuple(green_right_operand(jax.lax.slice_in_dim(
                 faces[f][1], 2 * g, 2 * g + 2, axis=2)) for g in (0, 1)) for f in (0, 1))
             px = int(mesh_xy.shape["x"])
+            # A segment index counts the passes of every family pair in turn.
+            first = np.cumsum([0] + [len(plan.passes) for plan in photon_plans])
             for i_pair, (pair, plan) in enumerate(zip(FAMILY_PAIRS, photon_plans)):
                 L, R = pair
-                only = None
-                if stream_pass is not None:
-                    only_pair, only = photon_segments(photon_plans)[int(stream_pass)]
-                    if only_pair != i_pair:
-                        continue
-                keys = photon_doors[(pair, (0, 0), plan.passes[0])][1]
+                if stream_pass is not None and int(stream_pass) != i_pair:
+                    continue
+                keys = photon_doors[(pair, (0, 0))][1]
                 right_extent = photon.packed_layout.carrier_extent(keys[0][1])
+                rows_w = int(plan.rows)
 
-                def node_rows(p, index, i_pair=i_pair, pair=pair, plan=plan, keys=keys,
-                              right_extent=right_extent, L=L, R=R):
-                    x0, xr = plan.passes[p]
+                def prepare(window, pair=pair, L=L, rows_w=rows_w):
+                    """A window's left ψ rows, cut quadrant tables and live rows, once per pass."""
+                    loads = {hg: DeviceLoadTables(*(tables[i] for i in door_index[(pair, hg)]))
+                             for hg in QUADRANTS}
+                    if window is None:
+                        return faces[L][0], loads, {}
+                    s, lo, hi = window
+                    return (window_rows(faces[L][0], mesh_xy, s, rows_w, axis=2),
+                            {hg: window_load(load, mesh_xy, s, lo, hi, rows_w, 2)
+                             for hg, load in loads.items()},
+                            dict(live=jnp.stack([lo, hi]).astype(jnp.int32)))
+
+                def node_rows(ops, index, i_pair=i_pair, pair=pair, keys=keys,
+                              right_extent=right_extent, L=L, R=R, rows_w=rows_w):
+                    left_rows, loads, live = ops
                     time = jax.lax.optimization_barrier(time_nodes[index])
-                    left_rows = pass_rows(faces[L][0], mesh_xy, x0, xr, axis=2)
 
                     def parent(weight, t, ref, halves, current):
                         left = jax.lax.slice_in_dim(left_rows, 2 * halves[0], 2 * halves[0] + 2,
@@ -1347,18 +1360,19 @@ def _get_chi_fractional_contour_kernel_face(
                         weight, t = oriented(weight, t)
                         return build_G_tau(left, None, enk_full, t, e_ref=ref,
                                            band_weight=weight, layout="axis",
-                                           gemm=photon_gemms[i_pair][p],
+                                           gemm=photon_gemms[i_pair],
                                            k_unfold_plan=half_plans[L], unfold=False,
-                                           prepared_active_gemm=photon_active[i_pair][p][int(current)],
+                                           prepared_active_gemm=photon_active[i_pair][int(current)],
                                            real_weights=False, right=rights[R][halves[1]])
                     planes = [[] for _ in keys]
                     for lw, lt, lref, uw, ut, uref in orientations(time):
                         # One orientation's planes are live at a time.
                         planes, lw, uw = jax.lax.optimization_barrier((planes, lw, uw))
                         acc = jax.lax.with_sharding_constraint(
-                            jnp.zeros((len(keys), nk, px * xr, right_extent), jnp.complex128),
+                            jnp.zeros((len(keys), nk, px * rows_w, right_extent), jnp.complex128),
                             selected_shard)
-                        acc = photon_planes(acc, pair, (x0, xr), parent, lw, uw, lt, lref, ut, uref)
+                        acc = photon_planes(acc, pair, loads, live, parent, lw, uw, lt, lref,
+                                            ut, uref)
                         for c in range(len(keys)):
                             # One channel plane's transform is live at a time.
                             acc, planes = jax.lax.optimization_barrier((acc, planes))
@@ -1368,7 +1382,8 @@ def _get_chi_fractional_contour_kernel_face(
                     return jax.lax.with_sharding_constraint(
                         jnp.stack([jnp.stack(rows) for rows in planes]), plane_shard)
                 carry = stream_passes(carry, mesh=mesh_xy, plan=plan, weights=weights,
-                                      count=count, node_rows=node_rows, only=only)
+                                      count=count, node_rows=node_rows, prepare=prepare,
+                                      only=None if pass_index is None else pass_index - first[i_pair])
             return carry
 
         def photon_stream(carry):

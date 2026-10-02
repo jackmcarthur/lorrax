@@ -239,7 +239,7 @@ def sector_node(left, right, keys, meta, mesh_xy, w_tables, band_axis, *, static
     and one band-block reduce-scatter ends the node.  No whole-tile
     four-spinor Green exists.  Pass sizes come from
     :data:`runtime.tiles.TILE_BYTES` and the shapes
-    (``subtile_stream.plan_rows``), the rule the scalar Σ τ engine uses.
+    (``subtile_stream.plan_windows``), the rule the scalar Σ τ engine uses.
 
     ``w_tables`` are W's q tables, one per branch ``ParentW.hole`` selects: the
     particle and hole tables of an ordered W(t) (:func:`sector_tau_factory`),
