@@ -335,8 +335,11 @@ def reduce_ordered_shared_pole_pencil(pencil, active_columns, *, eigh, matmul, g
     Returns (b [b,n,R], poles2 [b,R], active [b,R]), the signed model
     (c [b,n,R], mu [b,R], retained [b,R]) and device diagnostics.
     With ``retain_span``, also return the original-pencil coefficient map
-    Y [b,R,R], with O Y = c and Y.H H Y = diag(retained), for the CT
-    joint projection. This map stays inside the parent-local round.
+    Y [b,R,K] on the solve's own K columns (K = R on a face, twice the Ritz
+    carrier on a rank-local pencil), with O Y = c[..., :K] and
+    Y.H H Y = diag(retained[..., :K]), for the CT joint projection. The
+    signed model's columns past K are zero padding, so Y carries none.
+    This map stays inside the parent-local round.
     """
     g, h, output, points = pencil
     side, finite = int(g.shape[-1]), int(points.shape[-1])
@@ -502,5 +505,5 @@ def reduce_ordered_shared_pole_pencil(pencil, active_columns, *, eigh, matmul, g
     mu, positive, retained = (jnp.pad(a, ((0, 0), (0, pad))) for a in (mu, positive, retained))
     result = (b, poles2, positive), (c, mu, retained), diagnostics
     if retain_span:
-        return (*result, jnp.pad(coefficients, ((0, 0), (0, 0), (0, pad))))
+        return (*result, coefficients)
     return result

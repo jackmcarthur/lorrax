@@ -833,7 +833,7 @@ def cross_span_widths(meta, sectors):
     """The CT round's compacted span width of CC and TT: ``(live, held)``.
 
     ``live`` is each sector's largest retained rank in the round on the extent
-    ladder (``runtime.padding.ladder_extent``), at most its signed carrier.
+    ladder (``runtime.padding.ladder_extent``), at most its span's columns.
     Ranks drift across a ladder step between rounds and SC maps (Fe 4^3
     bispinor CC 1152 <-> 1280, TT 1408 <-> 1536), and each step recompiled
     the cross reduction (2 x 11.2 s at map 2). An SC map past map 0 binds
@@ -850,7 +850,7 @@ def cross_span_widths(meta, sectors):
     capacity=getattr(meta,'shared_pole_rank_capacity',None)
     for name,sector in zip(('CC','TT'),sectors):
         active=sector['signed'][2]
-        cap=int(active.shape[-1])
+        cap=int(sector['coefficients'].shape[-1])
         rank=int(jnp.max(jnp.sum(active,axis=-1)))
         width=min(cap,ladder_extent(rank))
         live.append(width)
@@ -906,7 +906,8 @@ def _local_compact_program(mesh,width):
 
 def _compact_sector_equations(y,signed,*,width,matrix_sharding=None):
     c,mu,active=signed
-    order=jnp.argsort(~active,axis=-1,stable=True)[:,:width]
+    # Y holds the solve's columns only; the signed model's columns past them are zero padding.
+    order=jnp.argsort(~active[:,:y.shape[-1]],axis=-1,stable=True)[:,:width]
     return (_matrix_take_columns(y,order,matrix_sharding),
         (_matrix_take_columns(c,order,matrix_sharding),
          jnp.take_along_axis(mu,order,axis=-1),
