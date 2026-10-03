@@ -805,20 +805,22 @@ def _zeta_reuse_ok(zeta_h5_path, provenance_json, centroid_fft_idx,
 
 def _transverse_wfn_data(wfn, sym, meta_T, cent_T_idx, cfg, mesh_xy,
                          band_slices, band_chunk_size, k_chunk_size=None,
-                         faces=None):
+                         faces=None, plan=None):
 	"""Sample the current family's packed basis using the same raw-parent loader as charge.
 
 	``faces`` = ``(psi_y, psi_x)`` from the fit's one ψ(G) read
 	(``common.psi_G_store.load_parent_psi_G``); without them (every current
-	ζ reused) the faces are sampled here.
+	ζ reused) the faces are sampled here.  ``plan`` is the family's typed
+	parent transport when the fit planner already built it.
 	"""
 	from common.wfn_transforms import load_centroids_band_chunked, get_enk_bandrange
 	from .wavefunction_bundle import (parent_faces, wavefunctions_face_from_restart,
 	                                 build_packed_parent_green_carrier)
 	representation = resolve_four_current_representation(cfg.bispinor, cfg.bispinor_gw)
-	plan, _, _ = _prepare_parent_wavefunction_plan(
-		cfg, meta_T, wfn, band_slices, sym=sym,
-		centroid_indices=cent_T_idx, mesh_xy=mesh_xy)
+	if plan is None:
+		plan, _, _ = _prepare_parent_wavefunction_plan(
+			cfg, meta_T, wfn, band_slices, sym=sym,
+			centroid_indices=cent_T_idx, mesh_xy=mesh_xy)
 	if faces is not None:
 		psi_y, psi_x = faces
 	else:
@@ -1689,7 +1691,7 @@ def zeta_sphere_ngkmax(wfn, sym, meta, zeta_cutoff_ry) -> int:
 
 
 def _plan_route_g_for_channel(
-		*, meta, cfg, band_slices, mesh_xy, n_q_selected, n_parent,
+		*, meta, cfg, band_slices, mesh_xy, n_q_selected, k_unfold_plan,
 		print_fn=print, zeta_ngkmax=None, psi_ngkmax=None, psi_cylinder=None,
 		n_vertex=1):
 	"""Plan ONE ζ family (charge, or the current channels together) on route G.
@@ -1699,8 +1701,12 @@ def _plan_route_g_for_channel(
 	runs beside (``16·n_parent·n_s·μ·N_b`` over ``P/2``, the face layout).  Returns the dict ``fit_zeta``
 	reads: ``mubatch`` (the :class:`gw.gflat_memory_model.MuBatchPlan`),
 	its ``band_chunk`` / ``centroid_k_chunk``, and ``memory_estimate``.
+	``k_unfold_plan`` is the family's typed parent transport: its parents and
+	its widest unfold orbit (the smallest whole-orbit owner bin) size the plan.
 	"""
 	from gw.gflat_memory_model import plan_zeta_route_g
+	from gw.centroid_k_unfold import widest_unfold_orbit
+	n_parent = int(k_unfold_plan.n_parent)
 	mem = cfg.memory
 	_zeta_left, _zeta_right = zeta_fit_band_ranges(
 		band_slices,
@@ -1735,7 +1741,8 @@ def _plan_route_g_for_channel(
 			int(meta.n_rtot) // _n_a, math.ceil(1.2 * math.pi * _r * _r)))),
 		n_s=(int(psi_cylinder[1]) if psi_cylinder else int(min(
 			_n_a, math.ceil(2.4 * _r) + 1))),
-		n_vertex=int(n_vertex), n_parent=int(n_parent))
+		n_vertex=int(n_vertex), n_parent=n_parent,
+		orbit_width=widest_unfold_orbit(k_unfold_plan))
 	from common.gpu_utils import record_stage_price
 	record_stage_price("zeta fit, plan_zeta_route_g HWM", mubatch_plan.hwm_bytes,
 	                   section=("gw_jax.zeta_fit_chunked" if int(n_vertex) == 1
@@ -1856,9 +1863,13 @@ def _reuse_zeta_faces(
 
 
 def _plan_transverse_zeta(
-        _reuse_T, band_slices, cfg, mesh_xy, print_fn, sym, zeta_contract,
+        _reuse_T, band_slices, cfg, mesh_xy, print_fn, sym, wfn, zeta_contract,
         zeta_ngkmax=None, psi_ngkmax=None, psi_cylinder=None):
-    """Produce the existing independently sized transverse fit plan."""
+    """Produce the existing independently sized transverse fit plan.
+
+    The current family's typed parent transport is built here, once: it sizes
+    the plan (its widest unfold orbit) and rides in the chunks to the
+    family's parent carrier (``k_unfold_plan``)."""
     _meta_T = zeta_contract.meta_transverse
     _cent_T_idx = zeta_contract.centroids_transverse
     _transverse_identity = zeta_contract.transverse_identity
@@ -1876,12 +1887,16 @@ def _plan_transverse_zeta(
                 int(np.asarray(sym.q_irr_full_idx).shape[0])
                 if _write_ibz_only_transverse else int(_meta_T.nk_tot))
             # The missing current channels share one route-G loop.
+            _plan_T, _, _ = _prepare_parent_wavefunction_plan(
+                cfg, _meta_T, wfn, band_slices, sym=sym,
+                centroid_indices=_cent_T_idx, mesh_xy=mesh_xy)
             _chunks_T = _plan_route_g_for_channel(
                 meta=_meta_T, cfg=cfg, band_slices=band_slices,
                 mesh_xy=mesh_xy, n_q_selected=_n_q_selected_T,
-                n_parent=int(np.asarray(sym.kirr_fullids).size),
+                k_unfold_plan=_plan_T,
                 print_fn=print_fn, zeta_ngkmax=zeta_ngkmax, psi_ngkmax=psi_ngkmax,
                 psi_cylinder=psi_cylinder, n_vertex=sum(not r for r in _reuse_T))
+            _chunks_T['k_unfold_plan'] = _plan_T
     return _meta_T, _cent_T_idx, _chunks_T, _write_ibz_only_transverse
 
 
@@ -2039,7 +2054,8 @@ def _fit_transverse_zeta_channels(
          else zeta_contract.loader_band_chunk),
         k_chunk_size=(_chunks_T['centroid_k_chunk'] if _chunks_T is not None
                       else zeta_contract.loader_k_chunk),
-        faces=faces)
+        faces=faces,
+        plan=(_chunks_T['k_unfold_plan'] if _chunks_T is not None else None))
     del faces
     if not missing:
         return transverse_wfn_data, None
@@ -2127,7 +2143,7 @@ def fit_zeta(wfn, sym, meta, centroid_indices, mesh_xy, cfg, band_slices, tmp_di
 	        band_slices, cfg, mem_est, mesh_xy, print_fn, sym, wfn, zeta_contract, zeta_h5_path)
 	_fit_T = cfg.bispinor and not all(_reuse_T)
 	(_meta_T, _cent_T_idx, _chunks_T, _write_ibz_only_transverse) = _plan_transverse_zeta(
-	    _reuse_T, band_slices, cfg, mesh_xy, print_fn, sym, zeta_contract,
+	    _reuse_T, band_slices, cfg, mesh_xy, print_fn, sym, wfn, zeta_contract,
 	    zeta_ngkmax=(zeta_sphere_ngkmax(
 	        wfn, sym, zeta_contract.meta_transverse, _zeta_cutoff)
 	        if _fit_T else None),
@@ -2629,7 +2645,7 @@ def _prepare_fresh_parent_faces(
     	chunks = _plan_route_g_for_channel(
     		meta=meta, cfg=cfg, band_slices=band_slices, mesh_xy=mesh_xy,
     		n_q_selected=int(np.asarray(sym.q_irr_full_idx).shape[0]),
-    		n_parent=_candidate_plan.n_parent, print_fn=print0,
+    		k_unfold_plan=_candidate_plan, print_fn=print0,
     		zeta_ngkmax=zeta_sphere_ngkmax(
     			wfn, sym, meta, zeta_contract.zeta_cutoff),
     		psi_ngkmax=int(wfn.ngkmax),

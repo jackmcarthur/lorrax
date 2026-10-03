@@ -100,9 +100,13 @@ def best_owner_orbit_batches(plan, mu_pad: int, n_ranks: int, *, c_max: int):
     8x8 P16, p4r_cri3_p16: c = 19 packs 8 batches of 18-slot bins, c = 12
     the same 8 batches of 12).  Each candidate c ≤ ``c_max`` is packed and
     costed ``n_batch·(c + 1)``: a batch pays its per-centroid owner work plus
-    about one centroid's worth of fixed cost (collectives, launches).
-    ponytail: a linear scan over c and a fixed-cost guess of one centroid;
-    move the choice into the planner (with the orbit sizes) if either binds.
+    about one centroid's worth of fixed cost (collectives, launches).  The
+    planner floors ``c_max`` at the widest orbit
+    (``gw.gflat_memory_model.plan_zeta_route_g``, ``MuBatchPlan.min_c``), so
+    every bin fits ``c_max`` and the plan prices the widest batch that runs
+    (CrI3 24x24 P36: 12-member orbits make the batch 432, not the 36 of
+    c_max = 1).
+    ponytail: a linear scan over c and a fixed-cost guess of one centroid.
     """
     best = None
     for c in range(max(1, int(c_max)), 0, -1):

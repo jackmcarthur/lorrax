@@ -565,6 +565,32 @@ def mu_batch_tables(k_unfold_plan, mu) -> tuple[np.ndarray, np.ndarray, np.ndarr
     return left_perm, left_L, rows.astype(np.int32)
 
 
+def unfold_orbits(k_unfold_plan):
+    """The active centroids' orbits under the rows the k unfold applies.
+
+    ``(members, sizes)``: one packed-index array per orbit (packed order
+    inside) and their sizes.  The rows are ``plan.sym_idx``'s, a subset of
+    the operations the centroid layout was packed with, so these orbits can
+    be finer than ``meta.mu_basis``'s groups.  They are what a whole-orbit
+    μ batch must keep together (:func:`orbit_mu_batches`).
+    """
+    plan = k_unfold_plan
+    rows = np.unique(np.asarray(plan.sym_idx, dtype=np.int64))
+    labels = permutation_orbit_labels(np.asarray(plan.sym_perm)[rows])
+    act = np.flatnonzero(np.asarray(plan.layout.axis.active_mask, dtype=bool))
+    lab = labels[act]
+    order = np.argsort(lab, kind="stable")
+    _, start, sizes = np.unique(lab[order], return_index=True,
+                                return_counts=True)
+    return np.split(act[order], start[1:]), sizes
+
+
+def widest_unfold_orbit(k_unfold_plan) -> int:
+    """The widest orbit of :func:`unfold_orbits`: the smallest whole-orbit owner bin."""
+    _, sizes = unfold_orbits(k_unfold_plan)
+    return int(max(sizes, default=1))
+
+
 def orbit_mu_batches(k_unfold_plan, mu_pad: int, n_ranks: int, *,
                      b_target: int) -> MuOrbitBatches:
     """Pack the plan's centroid orbits whole into batches of about ``b_target``.
@@ -584,8 +610,6 @@ def orbit_mu_batches(k_unfold_plan, mu_pad: int, n_ranks: int, *,
     """
     import heapq
 
-    from symmetry_maps import permutation_orbit_labels
-
     plan = k_unfold_plan
     P_ = int(n_ranks)
     if int(mu_pad) != int(plan.n_centroid_packed):
@@ -595,19 +619,12 @@ def orbit_mu_batches(k_unfold_plan, mu_pad: int, n_ranks: int, *,
     if P_ < 1 or int(b_target) < 1:
         raise ValueError(
             f"orbit_mu_batches: need n_ranks, b_target >= 1; got {P_}, {b_target}.")
-    rows = np.unique(np.asarray(plan.sym_idx, dtype=np.int64))
-    labels = permutation_orbit_labels(np.asarray(plan.sym_perm)[rows])
-    act = np.flatnonzero(np.asarray(plan.layout.axis.active_mask, dtype=bool))
-    lab = labels[act]
-    order = np.argsort(lab, kind="stable")
-    _, start, sizes = np.unique(lab[order], return_index=True,
-                                return_counts=True)
-    members = np.split(act[order], start[1:])            # packed order inside
+    members, sizes = unfold_orbits(plan)
     up = lambda v: -(-int(v) // P_) * P_
     b_cap = max(up(int(sizes.max())), (int(b_target) // P_) * P_)
     by_size = sorted(range(len(members)),
                      key=lambda g: (-int(sizes[g]), int(members[g][0])))
-    n_batch = max(1, -(-int(act.size) // b_cap))
+    n_batch = max(1, -(-int(np.sum(sizes)) // b_cap))
     while True:
         heap = [(0, beta) for beta in range(n_batch)]
         owner = np.empty((len(members),), dtype=np.int64)
@@ -648,4 +665,6 @@ __all__ = [
     "build_centroid_k_unfold_plan",
     "mu_batch_tables",
     "orbit_mu_batches",
+    "unfold_orbits",
+    "widest_unfold_orbit",
 ]
