@@ -230,7 +230,7 @@ def _stack_bytes(op: str, mesh: Mesh, nb: int, n: int, dtype: str, rounds: int, 
     from distrib_la.workspace import _vendor_query
     face = NamedSharding(mesh, P(None, "x", "y"))
     program = _reshard_stack_program(op, mesh, (nb, n, n), dtype, rounds, "admission",
-                                     _gathered_fits(mesh, (nb, n, n), dtype, room))
+                                     _gathered_fits(mesh, (nb, n, n), dtype))
     stats = program.lower(jax.ShapeDtypeStruct((nb, n, n), np.dtype(dtype), sharding=face)
                           ).compile().memory_analysis()
     if stats is None:
@@ -246,15 +246,16 @@ def _stack_bytes(op: str, mesh: Mesh, nb: int, n: int, dtype: str, rounds: int, 
     return int(compiled + vendor)
 
 
-def _gathered_fits(mesh: Mesh, shape, dtype, room) -> bool:
-    """Whether an eigh's gathered retry fits every rank within the room
-    (GATHERED_EIGH_BYTES without one): the compiled size of the gathered
-    program (outputs and temporaries) plus cuSOLVER's workspace for each
-    whole matrix, since every rank solves all of them. A whole matrix needs
-    7 n^2 elements this way, against the 3 n^2 of the matrix, its vectors and
-    one copy."""
+def _gathered_fits(mesh: Mesh, shape, dtype) -> bool:
+    """Whether an eigh's gathered retry fits every rank within
+    GATHERED_EIGH_BYTES: the compiled size of the gathered program (outputs
+    and temporaries) plus cuSOLVER's workspace for each whole matrix, since
+    every rank solves all of them (7 n^2 elements per matrix, against the
+    3 n^2 of the matrix, its vectors and one copy). XLA reserves the retry
+    branch's temporaries in every program that holds it, taken or not, so a
+    caller's room does not raise the limit."""
     import numpy as np
-    limit = GATHERED_EIGH_BYTES if room is None else int(room)
+    limit = GATHERED_EIGH_BYTES
     return _agreed_gathered(mesh, tuple(int(v) for v in shape), np.dtype(dtype).name, limit)
 
 
@@ -394,8 +395,8 @@ def _eigh_columns(backend: str, lam, Q):
     return lam, Q
 
 
-#: Per-rank bytes a gathered local eigh retry may take when the plan has no
-#: budget: the matrix, its vectors and the solver's copy (n <= 4730 complex128).
+#: Per-rank bytes a gathered local eigh retry may take, compiled program plus
+#: cuSOLVER workspace (:func:`_gathered_fits`; n <= 3096 complex128).
 GATHERED_EIGH_BYTES = 1 << 30
 
 
@@ -789,7 +790,7 @@ class Plan:
 
     def _checked_eigh(self, call, post):
         from distrib_la._result_check import call_site, checked_eigh, shifted
-        backend, budget = self.backend, self.budget_bytes
+        backend = self.backend
 
         def safe(A, *, mesh, **kwargs):
             def solve(a, **extra):
@@ -806,10 +807,9 @@ class Plan:
                 if block is not None:
                     attempts.append(deflate_zero_rows(partial(solve, block=block)))
                     attempts.append(partial(solve, block=block))
-            # A gathered local solve, where the whole matrix, its vectors and
-            # the solver's copy fit every rank: within the caller's budget, or
-            # GATHERED_EIGH_BYTES without one (a shape rule, the same on every rank).
-            if _gathered_fits(mesh, A.shape, A.dtype, budget or None):
+            # A gathered local solve, where its compiled program and the
+            # solver's workspace fit GATHERED_EIGH_BYTES on every rank (agreed).
+            if _gathered_fits(mesh, A.shape, A.dtype):
                 attempts.append(partial(_gathered_eigh, mesh=mesh))
             return checked_eigh(attempts, A, site=call_site())
         return safe
@@ -936,7 +936,7 @@ class Plan:
         A = ensure_sharding(A, NamedSharding(self.mesh, P(None, "x", "y")))
         shape, site = tuple(int(v) for v in A.shape), call_site()
         out = _reshard_stack_program(op, self.mesh, shape, str(A.dtype), int(rounds), site,
-                                     _gathered_fits(self.mesh, shape, A.dtype, self.budget_bytes or None))(A)
+                                     _gathered_fits(self.mesh, shape, A.dtype))(A)
         if op == "normal_eigh" or isinstance(A, jax.core.Tracer):
             return out
         return refuse_if_poisoned(out, "eigh", shape[-1], site)
