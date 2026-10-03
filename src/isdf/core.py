@@ -1865,8 +1865,9 @@ def _factor_c_q_replicated_qparallel(
 # The hoisted TRANSVERSE factor stage (bispinor mu_L = 1, 2, 3)
 # =============================================================================
 #
-# The transverse CCT is Hermitian INDEFINITE — no Cholesky, no eigh-based
-# rank truncation.  Historically factor_c_q passed the (identity-padded)
+# The transverse CCT is s × a PSD least-squares Gram (s = −1 for Cartesian
+# α², common.gamma_matrices.current_fit_terms) — sign-aware LU, no Cholesky,
+# no eigh-based rank truncation.  Historically factor_c_q passed the (identity-padded)
 # CCT through unfactored and the r-tile solve re-ran the pivoted LU on EVERY
 # r-chunk (on every rank on the local path; on the mesh but still per
 # r-chunk under distributed_lu=scalapack): nq·mu_T³·n_rchunks redundant

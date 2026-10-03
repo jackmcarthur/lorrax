@@ -881,8 +881,9 @@ def _logical_solve(solver_kind: str, n_log: int):
     """ζ_q = C_q⁻¹ Z_q at the logical μ extent, through the channel's conditioning seam.
 
     The charge Gram is PSD: C⁺ = B Bᴴ, the λ > rcond·λ_max eigh cut
-    (:mod:`isdf.cplus`).  A current channel's Gram C^μ is Hermitian
-    INDEFINITE -- that cut would drop its whole negative half -- so the
+    (:mod:`isdf.cplus`).  A current channel's Gram is s × a least-squares
+    Gram (s = −1 for Cartesian α², whose whole spectrum that cut would
+    drop; :func:`common.gamma_matrices.current_fit_terms`), so the
     currents keep their own seam from :mod:`isdf.core`, the same arithmetic
     as every transverse fit: the sign-aware ridged pivoted LU factored once
     per channel (``'lu'``, operand ``(LU, pivots)``, κ_lb certified at

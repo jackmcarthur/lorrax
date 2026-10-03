@@ -168,10 +168,12 @@ def current_fit_terms(channel: int, basis_rows) -> tuple:
 
     ``basis_rows`` is None (Cartesian: channel c fits ψ†α^cψ) or the unitary
     ``B`` of ``symmetry_maps.select_current_basis`` (channel c fits
-    Σ_i B_ci ψ†α^iψ).  The fit kernels are bilinear in the two vertex phase
-    vectors, and every row of ``B`` combines α^i whose phase vectors make the
-    channel's own phase vector real (α^± = (α^1 ± iα^2)/√2 has phases
-    (√2, 0, √2, 0)), so the channel's positive Gram is Σ_ij B_ci B_cj U(α^i, α^j).
+    Σ_i B_ci ψ†α^iψ).  The fit kernels put the vertex Γ = Σ_i B_ci α^i
+    bilinearly on both sides, which equals s × the least-squares
+    (sesquilinear) Gram and Z when the elementwise conjugate is Γ̄ = sΓ:
+    s = +1 for real-entry α^1, α^3, α^± = (α^1 ± iα^2)/√2, s = −1 for
+    Cartesian α^2.  The scalar cancels in ζ = C⁻¹Z.  A row whose nonzero
+    phases differ mod π has no such s and would fit obliquely, so it refuses.
     """
     c = int(channel)
     if c == 0:
@@ -179,6 +181,11 @@ def current_fit_terms(channel: int, basis_rows) -> tuple:
     if basis_rows is None:
         return ((1.0, c, c),)
     u = _np.asarray(basis_rows, dtype=_np.complex128)[c - 1]
+    vertex = sum(u[i] * _gamma_tables[i + 1] for i in range(3))
+    z = vertex[_np.abs(vertex) > 1e-12] ** 2
+    if not _np.allclose(z / _np.abs(z), z[0] / abs(z[0]), atol=1e-10):
+        raise ValueError(f"GATE current_vertex_phase: channel {c} vertex Σ_i B_ci α^i has nonzero "
+                         f"entries of more than one phase mod π (row {u}); its fit would be oblique")
     return tuple((complex(u[i] * u[j]), i + 1, j + 1)
                  for i in range(3) for j in range(3) if abs(u[i] * u[j]) > 0)
 

@@ -54,8 +54,10 @@ training pair products sampled at the centroids, so it is Hermitian positive
 semidefinite.
 
 A current (bispinor) channel inserts its vertex \(\tilde\gamma^i\) on the
-output spinor indices after transport. Its \(C_q\) is then a Hermitian
-indefinite, signed Gram
+output spinor indices after transport. Its \(C_q\) is then \(s\) times the
+least-squares Gram, with \(s=-1\) for Cartesian \(\alpha^2\) (entries
+\(\pm i\)) and \(s=+1\) for the real-entry vertices. It is semidefinite, and
+\(\zeta=C_q^{-1}Z_q\) is the least-squares \(\zeta\)
 ([four-current wiring](../architecture/four_current_wiring.md)).
 
 **Conjugation closure.** The charge windows are asymmetric: \(L\) holds every

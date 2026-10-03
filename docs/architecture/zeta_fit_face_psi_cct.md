@@ -129,10 +129,12 @@ the W Dyson solve, the transverse LU and the eigensolvers, never the ζ
 back-solve. Route G applies the factor tile
 by tile ([finalize](zeta_fit_mubatch.md#finalize-v_q-and-the-head-columns)).
 
-**Current channels.** C_q^i is a Hermitian indefinite, signed Gram. The fit
+**Current channels.** C_q^i is s times a least-squares Gram, so it is
+semidefinite: s = −1 for Cartesian α² and +1 for the real-entry vertices
+([solve seam](zeta_fit_mubatch.md#the-solve-seam)). The fit
 factors C + δI once per channel with pivoted LU, where
 δ = 1e-12·sign(Re tr C)·|tr C|/μ (`_transverse_lu_ridge`). The sign keeps the
-pairing (sC + sδI)⁻¹(sZ) = (C + δI)⁻¹Z. The indefinite solve always runs at
+pairing (sC + sδI)⁻¹(sZ) = (C + δI)⁻¹Z. The current solve always runs at
 the logical extent (`runtime.padding.solve_at_logical`), because pad-extent LU
 round-off is amplified O(1) in the near-null current modes.
 

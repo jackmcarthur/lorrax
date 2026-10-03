@@ -251,7 +251,9 @@ D_{B,k}=\sum_{n\in B}|\Psi_{nk}\rangle\langle\Psi_{nk}|,
 $$
 
 and the charge weight has $1$ for $\alpha^i$. Current fit matrices are
-Hermitian indefinite (ridged pivoted LU); the charge one is semidefinite
+$s$ times a least-squares Gram, semidefinite with $s=-1$ only for Cartesian
+$\alpha^2$, and are solved by ridged pivoted LU; the charge one is positive
+semidefinite
 ([ζ fit by μ-batches](../architecture/zeta_fit_mubatch.md)).
 
 ## 8. The static Hall term {#hall}

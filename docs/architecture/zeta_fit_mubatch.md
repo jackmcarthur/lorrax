@@ -30,8 +30,9 @@ box of ζ, or an accumulator over r. It writes Z_q(μ, G) once and applies the
 solve afterwards. When the charge channel's L and R windows differ, the LR+RL
 completion Z_q ← Z_q + conj Z_{−q} is applied in r space before the q
 selection, as it is for C_q
-([normal equations](zeta_fit_face_psi_cct.md#normal-equations)); the current
-channels train on LR alone.
+([normal equations](zeta_fit_face_psi_cct.md#normal-equations)). The current
+channels take the same LR+RL completion: they apply one vertex to both legs,
+so RL at q is the conjugate of LR at −q for them too.
 
 ## One μ batch
 
@@ -148,10 +149,20 @@ G tile (`zeta_mubatch._logical_solve`):
 - **Charge.** C_q is a PSD Gram. The factor is B = V_keep Λ_keep^{-1/2} with
   B Bᴴ = C⁺, keeping λ > `zeta_rcond`·λ_max (`isdf.cplus`,
   [factor and back-solve](zeta_fit_face_psi_cct.md#factor-and-back-solve)).
-- **Currents.** C^μ_q is Hermitian INDEFINITE: the PSD cut would drop its whole
-  negative half, an O(1) error, not a regularization (the P4 gate's red twin
-  measures 0.23 on a ±-spectrum). Route G therefore keeps the transverse fits'
-  own solve: the sign-aware ridged pivoted LU of C + δI with
+- **Currents.** Channel c fits the pair current ψ†_m Γ ψ_n, with
+  Γ = Σ_i B_ci α^i, and the fit is the exact least-squares fit. Least squares
+  pairs each sampled product with its complex conjugate, so its Gram conjugates
+  the vertex on one side. The kernels instead put the vertex phase on both
+  sides unconjugated. The two differ only by a sign s, because every vertex the
+  code selects has entries of a single phase: s = +1 for the real-entry α¹,
+  α³ and α^±, and s = −1 for Cartesian α², whose entries are ±i. C and Z both
+  carry s, so ζ = C⁻¹Z is the least-squares ζ (CLAIMS 3171). C^μ_q is
+  therefore positive semidefinite, or negative semidefinite for Cartesian α²,
+  never indefinite. The charge's λ > rcond·λ_max cut would drop every mode of
+  the negative α² Gram. A basis row whose entries mixed phases, such as
+  (α¹ + α²)/√2, would have no such s and would fit obliquely;
+  `common.gamma_matrices.current_fit_terms` refuses it
+  (`GATE current_vertex_phase`). Route G keeps the transverse fits' own solve: the sign-aware ridged pivoted LU of C + δI with
   δ = 1e-12·sign(Re tr C)·|tr C|/μ, factored once per channel at the logical
   extent and certified by κ_lb (`isdf.core.factor_c_q`), and applied per tile
   as `(LU, pivots)`. Route G always takes the local whole-tile LU; a
