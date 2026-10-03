@@ -237,9 +237,10 @@ def construct_sector_poles(bank, meta, config, *, mesh_xy, output):
     room = face_room = None
     if resolved_execution == 'face':
         batch_row = batch_admission['reduction']
-        held = model_residence['payload_bytes_per_rank'] if sector_models is not None else 0
+        resident_models = model_residence['payload_bytes_per_rank'] if sector_models is not None else 0
         room = lambda compiled: face_eigh_room(dict(batch_row, aggregate_bytes_per_rank=(
-            batch_row['aggregate_bytes_per_rank'] - batch_admission['compiled_program_bytes_per_rank'] + compiled)), held)
+            batch_row['aggregate_bytes_per_rank'] - batch_admission['compiled_program_bytes_per_rank']
+            + compiled)), resident_models)
         face_room = room(batch_admission['compiled_program_bytes_per_rank'])
     for row in execution_rows if resolved_execution == 'face' else ():
         row['face_eigh_room_bytes_per_rank'] = dict(selection=face_room)
