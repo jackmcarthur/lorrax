@@ -163,9 +163,14 @@ SIGN_CONVENTION = (
 
 
 def band_character_and_moments(*, colors, moments_grid, wfn, params, ctilde,
-                               enk_sigma, meta, result, mesh, input_dir,
-                               n_return_bands, a_band, energy_source, report):
+                               wfn_ctilde, enk_sigma, meta, result, mesh,
+                               input_dir, n_return_bands, a_band,
+                               energy_source, report):
     """Spin / orbital-character path coloring and grid moments.
+
+    ``ctilde`` builds H (QP-rotated under ``--qp-rotations``); the operator
+    images take ``wfn_ctilde``, the unrotated rows of the WFN band basis
+    the operators are computed in.
 
     1. ``<psi_kn|O|psi_km>`` on the coarse full BZ: sigma_a, the atomic-
        sphere L_a of each atom, the requested orbital-character projectors.
@@ -250,7 +255,7 @@ def band_character_and_moments(*, colors, moments_grid, wfn, params, ctilde,
         nq = int(kpath_frac.shape[0])
         with mesh:
             path_ops = gather_to_host(interpolate_band_operator(
-                ops, ctilde, result["coeffs_on_path"],
+                ops, wfn_ctilde, result["coeffs_on_path"],
                 np.asarray(kpath_frac), kgrid, mesh))[:nq]
         expect = np.einsum('qaii->qai', path_ops).real
         for c in colors:
@@ -282,8 +287,8 @@ def band_character_and_moments(*, colors, moments_grid, wfn, params, ctilde,
         with mesh:
             fH_R, f_params, _, _ = build_fH_R(
                 ctilde, enk_sigma, kgrid, mesh, a_band_index=a_band)
-            builders = [partial(_operator_R, ops[i:i + 1], ctilde, kgrid,
-                                mesh) for i in range(n_vec)]
+            builders = [partial(_operator_R, ops[i:i + 1], wfn_ctilde,
+                                kgrid, mesh) for i in range(n_vec)]
             E, D, residual = grid_moments(
                 fH_R, f_params, builders, kgrid, grid, n_return_bands, mesh)
         require_newton_converged(float(residual), where="moments grid")
@@ -523,6 +528,11 @@ def main(argv=None):
                 0.0, 20.0 * RYD_TO_EV, unit="eV", print_fn=log)
 
         ctilde = compact_galerkin_state(ctilde, mesh_xy, log_fn=log)
+        # Band operators come from the WFN states, so their Galerkin image
+        # C^T O C^* takes the unrotated rows; only H takes the QP rotation.
+        wfn_ctilde = (compact_galerkin_state(basis.ctilde, mesh_xy, log_fn=log)
+                      if _qp_rotations_path is not None
+                      and (args.color or args.moments_grid) else ctilde)
         del basis
 
         kpath_data = initialize_kpath(wfn, params)
@@ -615,7 +625,8 @@ def main(argv=None):
 
         _moment_files = band_character_and_moments(
                 colors=args.color, moments_grid=args.moments_grid, wfn=wfn,
-                params=params, ctilde=ctilde, enk_sigma=enk_sigma, meta=meta,
+                params=params, ctilde=ctilde, wfn_ctilde=wfn_ctilde,
+                enk_sigma=enk_sigma, meta=meta,
                 result=result, mesh=mesh_xy, input_dir=input_dir,
                 n_return_bands=n_return_bands, a_band=args.a_band,
                 energy_source=_energy_source, report=report)
