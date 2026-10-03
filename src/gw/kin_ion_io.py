@@ -74,6 +74,7 @@ from wfn_loader import WfnLoader                                    # noqa: E402
 from file_io.kin_ion import write_kin_ion
 from gw.gw_config import (
     BispinorGWMode,
+    LorraxConfig,
     coerce_bispinor_gw_mode,
     read_lorrax_input as read_cohsex_input,
 )
@@ -342,15 +343,22 @@ def main(argv=None):
                 "bispinor=true; the selector does not enable spatial-current "
                 "channels implicitly.")
         # Band window the GW run will actually ask for: ``load_kin_ion_submatrix``
-        # reads [b_id_0, b_id_3) = [0, nelec + ncond).  Sizing the file below
-        # that silently truncates the run's window, so it is a hard floor;
-        # ``nband`` (the polarizability window) is the natural default.
-        nb_window = int(wfn.nelec) + ncond
-        nb_req = int(args.nb) if args.nb is not None else max(int(nband), nb_window)
+        # reads [b_id_0, b_id_3) = [0, nelec + ncond), with ncond resolved as
+        # gw_jax resolves it (``LorraxConfig.with_band_request``:
+        # ``number_bands_protected`` sets ncond = total - nelec).  Sizing the
+        # file below that silently truncates the run's window, so it is a
+        # hard floor, and it is the default: the sweep loads ψ(G) for every
+        # band it writes, and ``nband`` (the polarizability window) is read by
+        # no consumer (CrI3 24x24: 750 bands is 112 GB of ψ(G), 208 are read).
+        nb_window = int(wfn.nelec) + int(LorraxConfig.from_input_file(
+            args.input, print_fn=lambda *_a, **_k: None,
+            resolve_hardware=False).with_band_request(
+                wfn, print_fn=lambda *_a, **_k: None).ncond)
+        nb_req = int(args.nb) if args.nb is not None else nb_window
         if nb_req < nb_window:
             raise SystemExit(
                 f"Requested {nb_req} bands but the deck's sigma window needs "
-                f"nelec+ncond = {int(wfn.nelec)}+{ncond} = {nb_window}."
+                f"nelec+ncond = {int(wfn.nelec)}+{nb_window - int(wfn.nelec)} = {nb_window}."
             )
         nb_eff = max(1, min(int(wfn.nbands), nb_req))
         if nb_eff < nb_window:

@@ -128,7 +128,7 @@ shards through SlabIO; no rank gathers it.
 
 | key / flag | default | meaning |
 |---|---|---|
-| `-n` / `--nb` | max(`nband`, nelec + ncond) | bands written; refuses below nelec + ncond, the window GW reads |
+| `-n` / `--nb` | b3 = nelec + ncond, the window GW reads (`number_bands_protected` resolved as GW resolves it) | bands written (ψ(G) is loaded for each); refuses below b3 |
 | `--sys_dim` | the deck's | may only confirm the deck; a contradiction refuses |
 | `--pseudo_dir` | deck directory, then `../qe/{scf,nscf}` | `*.upf` location |
 | `kin_ion_file` (deck) | `kin_ion.h5` | the file GW reads |
