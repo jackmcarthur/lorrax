@@ -216,7 +216,7 @@ def new_stack_routes() -> list[str]:
 
 
 @lru_cache(maxsize=None)
-def _stack_bytes(op: str, mesh: Mesh, nb: int, n: int, dtype: str, rounds: int) -> int:
+def _stack_bytes(op: str, mesh: Mesh, nb: int, n: int, dtype: str, rounds: int, room: int) -> int:
     """Per-rank device bytes route (c) adds for a face stack of ``nb`` matrices in ``rounds``.
 
     The compiled size of the program that runs (:func:`_reshard_stack_program`:
@@ -229,7 +229,8 @@ def _stack_bytes(op: str, mesh: Mesh, nb: int, n: int, dtype: str, rounds: int) 
     from distrib_la.resolve import mesh_platform
     from distrib_la.workspace import _vendor_query
     face = NamedSharding(mesh, P(None, "x", "y"))
-    program = _reshard_stack_program(op, mesh, (nb, n, n), dtype, rounds, "admission")
+    program = _reshard_stack_program(op, mesh, (nb, n, n), dtype, rounds, "admission",
+                                     _gathered_fits((nb, n, n), dtype, room))
     stats = program.lower(jax.ShapeDtypeStruct((nb, n, n), np.dtype(dtype), sharding=face)
                           ).compile().memory_analysis()
     if stats is None:
@@ -245,21 +246,36 @@ def _stack_bytes(op: str, mesh: Mesh, nb: int, n: int, dtype: str, rounds: int) 
     return int(compiled + vendor)
 
 
+def _gathered_fits(shape, dtype, room) -> bool:
+    """Whether a stack's gathered retry fits every rank: the matrices, their
+    vectors and the solver's copy within the room (GATHERED_EIGH_BYTES
+    without one), the rule of the distributed eigh's retry chain."""
+    import numpy as np
+    limit = GATHERED_EIGH_BYTES if room is None else int(room)
+    return 3 * np.dtype(dtype).itemsize * int(np.prod(shape)) <= limit
+
+
 @lru_cache(maxsize=None)
-def _reshard_stack_program(op: str, mesh: Mesh, shape: tuple, dtype: str, rounds: int, site: str):
+def _reshard_stack_program(op: str, mesh: Mesh, shape: tuple, dtype: str, rounds: int, site: str,
+                           gathered: bool):
     """The jitted route-(c) program for one face stack: ``rounds`` slices
     (:func:`distrib_la._batch_reshard.reshard_rounds_call`), and for an eigh
     the service's probe check on the Hermitian part of the input
-    (:func:`_local_eigh_errors`), refused by name (GATE
-    distrib_la_result_check) when it fails. ``normal_eigh`` (polar's right
-    singular vectors) is not probe-checked here."""
+    (:func:`_local_eigh_errors`). A failed check solves again shifted, then
+    gathered when ``gathered`` (the distributed eigh's retry chain); a result
+    no attempt repairs is NaN-poisoned and named (GATE
+    distrib_la_result_check). ``normal_eigh`` (polar's right singular
+    vectors) is not probe-checked here."""
     from distrib_la._batch_reshard import reshard_rounds_call
-    from distrib_la._result_check import checked
+    from distrib_la._result_check import checked, shifted
     solve = partial(reshard_rounds_call, op, mesh, rounds=int(rounds))
     out = (NamedSharding(mesh, P()), NamedSharding(mesh, P(None, "x", "y")))
     if op == "normal_eigh":
         return jax.jit(solve, out_shardings=out)
-    return jax.jit(lambda a: checked("eigh", (solve,), lambda r: _local_eigh_errors(a, *r),
+    attempts = [solve, shifted(solve)]
+    if gathered:
+        attempts.append(partial(_gathered_eigh, mesh=mesh))
+    return jax.jit(lambda a: checked("eigh", tuple(attempts), lambda r: _local_eigh_errors(a, *r),
                                      (a,), site=site), out_shardings=out)
 
 
@@ -639,7 +655,7 @@ class Plan:
         while per_rank >= 1:
             rounds = -(-(-(-nb // ranks)) // per_rank)
             m = -(-nb // rounds)
-            tried, compiled = -(-m // ranks), _stack_bytes(op, self.mesh, nb, n, dtype, rounds)
+            tried, compiled = -(-m // ranks), _stack_bytes(op, self.mesh, nb, n, dtype, rounds, room)
             if compiled <= room:
                 return StackRoute(ROUTE_BATCH_RESHARD, tried, rounds, compiled, room)
             per_rank = min(per_rank - 1, per_rank * room // compiled)
@@ -863,13 +879,18 @@ class Plan:
         return self._checked_reshard(op, A, self.stack_route(A.shape, A.dtype, op).rounds)
 
     def _checked_reshard(self, op: str, A, rounds: int):
-        """Route (c) in ``rounds`` slices, checked (:func:`_reshard_stack_program`)."""
+        """Route (c) in ``rounds`` slices, checked (:func:`_reshard_stack_program`);
+        an eager call whose checks all failed refuses here by name."""
         from distrib_la._batch_reshard import validate_batch_reshard_operands
-        from distrib_la._result_check import call_site
+        from distrib_la._result_check import call_site, refuse_if_poisoned
         validate_batch_reshard_operands(op if op != "normal_eigh" else "eigh", self.mesh, (A,))
         A = ensure_sharding(A, NamedSharding(self.mesh, P(None, "x", "y")))
-        return _reshard_stack_program(op, self.mesh, tuple(int(v) for v in A.shape), str(A.dtype),
-                                      int(rounds), call_site())(A)
+        shape, site = tuple(int(v) for v in A.shape), call_site()
+        out = _reshard_stack_program(op, self.mesh, shape, str(A.dtype), int(rounds), site,
+                                     _gathered_fits(shape, A.dtype, self.budget_bytes or None))(A)
+        if op == "normal_eigh" or isinstance(A, jax.core.Tracer):
+            return out
+        return refuse_if_poisoned(out, "eigh", shape[-1], site)
 
     @staticmethod
     def _reshard_options(kwargs: dict):
