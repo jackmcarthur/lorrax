@@ -675,12 +675,20 @@ def load_parallel_transport_head(
             "head requires SymMaps.trs_allowed; the supplied symmetry "
             "object has no verdict.")
     trs_measured = bool(sym.trs_allowed)
-    report_trs_velocity_parity(
-        f"{path}: v^DFT", trs_velocity_parity_residual(
-            velocity[..., :expected_nb, :expected_nb],
-            kgrid=tuple(int(n) for n in expected_kgrid),
-            trs_measured=trs_measured),
-        trs_measured=trs_measured)
+    if trs_measured:
+        report_trs_velocity_parity(
+            f"{path}: v^DFT", trs_velocity_parity_residual(
+                velocity[..., :expected_nb, :expected_nb],
+                kgrid=tuple(int(n) for n in expected_kgrid),
+                trs_measured=trs_measured),
+            trs_measured=trs_measured)
+    else:
+        # Broken time reversal: eq. (2) is no identity and the verdict would
+        # be nan, so the O(nk nb^2) mirror of v is not built for a diagnostic
+        # (18.2 GiB per rank at CrI3 24x24, 750 bands, P16).
+        print(f"  sanity[{path}: v^DFT]: the measured spin density says TIME "
+              f"REVERSAL IS BROKEN, so v(-k) = -conj(v(k)) is not an identity "
+              f"here; the parity diagnostic is not computed.")
     return ParallelTransportHeadData(
         forward_links=links,
         forward_neighbors=forward_neighbors,

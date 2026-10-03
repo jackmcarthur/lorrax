@@ -343,10 +343,12 @@ def main(argv=None):
                 "channels implicitly.")
         # Band window the GW run will actually ask for: ``load_kin_ion_submatrix``
         # reads [b_id_0, b_id_3) = [0, nelec + ncond).  Sizing the file below
-        # that silently truncates the run's window, so it is a hard floor;
-        # ``nband`` (the polarizability window) is the natural default.
+        # that silently truncates the run's window, so it is a hard floor, and
+        # it is the default: the sweep loads ψ(G) for every band it writes,
+        # and ``nband`` (the polarizability window) is read by no consumer
+        # (CrI3 24x24: 750 bands is 112 GB of ψ(G), 208 are read).
         nb_window = int(wfn.nelec) + ncond
-        nb_req = int(args.nb) if args.nb is not None else max(int(nband), nb_window)
+        nb_req = int(args.nb) if args.nb is not None else nb_window
         if nb_req < nb_window:
             raise SystemExit(
                 f"Requested {nb_req} bands but the deck's sigma window needs "
