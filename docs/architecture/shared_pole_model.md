@@ -292,8 +292,9 @@ Ritz carrier: the Schur and final eighs run at the carrier and twice it
 (CrI3 24×24 on 4×4: 6144 and 12288 instead of 9152 and 18304). Its eigh stacks
 (infinity, directions, partners, passivity, the Gram reduction, CT and the
 Cauchy check) go to `distrib_la` with the room beside the admitted batch
-(`face_eigh_room` of the selection or reduction admission row, the sector
-batch row for CC/TT/CT); the service runs a stack one or more whole matrices
+(`face_eigh_room` of the selection admission row; a reduction round, CC, TT
+or CT, and a face model check beside its own whole-chain program compiled on
+the arrays it runs, which is also its retry); the service runs a stack one or more whole matrices
 per rank when one slice's compiled program fits that room, else on the whole
 mesh ([eigh stacks](../services/distrib_la/api.md#eigh-stack)). The sectors
 take one route together (`sector_execution`, against the same ledger): CC, TT
@@ -536,9 +537,9 @@ with $c_b=\lceil b/P\rceil$ on local rounds ($b/P$ on the face route) and, by
 phase: selection $D=24n^2$, $s_f=2a$ over the $a$ dense fitted samples plus the
 moment faces and the line panels in face units,
 $N_{\rm line}(1+2S)\,n\,r_{\rm cap}/n^2$ (`selection_face_count`);
-reduction $D=14R^2+12nR$, $s_f=0$ (on the scalar face route $16\,c_b D$ is the compiled size of the round's program at the conservative side, which alone admits a batch: `face_batch_width` starts at one parent per rank and steps down in proportion to the room; a local paired, ordered scalar round: $D=5R^2+3(2c)^2+12nR$ with $2c=2\min(R/2,K_{\rm budget})$, the kept-span carrier; compiled rounds hold 3.8-9.7 $R^2$ against 7.5-12 here); model
-checks $D=8n^2+4nR$, $s_f=2a$; CT cross reduction
-$D=10\,CT+14R^2+12n(C+T)$. A local round has $b=P$. The native cuSOLVERMp `eigh`
+reduction $D=14R^2+12nR$, $s_f=0$ (on the face route $16\,c_b D$ is the compiled size of the round's program at the conservative side, which alone admits a batch: `face_batch_width` starts at one parent per rank and steps down in proportion to the room; the CC/TT/CT batch takes the largest of CC's, TT's and CT's whole-chain programs, `sector_batch_width`; a local paired, ordered scalar round: $D=5R^2+3(2c)^2+12nR$ with $2c=2\min(R/2,K_{\rm budget})$, the kept-span carrier; compiled rounds hold 3.8-9.7 $R^2$ against 7.5-12 here); model
+checks $D=8n^2+4nR$, $s_f=2a$; CT cross reduction (local) $D=CT+8R^2+4nR+\max(C,T)R$,
+on the face its compiled program. A local round has $b=P$. The native cuSOLVERMp `eigh`
 adds a private $n^2/P$ operand tile beside its workspace, which
 `distrib_la.workspace_bytes_per_rank` includes. The ledger
 (`CapacityLedger`) owns admission: when a stage's aggregate with the named
