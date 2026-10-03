@@ -10,15 +10,20 @@ The binding rulings behind breaking changes are in
 The bispinor sector constructor on the face route admits its parent batch by
 the largest compiled size of the round's three whole-chain programs at the
 conservative shapes (CC's and TT's reduction, CT's cross reduction), as the
-scalar face batch already was. Both batches start at every parent, so a deck
-that fits runs one round (Fe 4^3 forced face at P4: 13 parents in 1 round
-again). Each
-CC, TT and CT round, and each face model check of the scalar constructor,
-takes its eigh room beside its own whole-chain program compiled on the arrays
-it runs, so every retry is a sized program. The analytic face prices of the
-sector reduction ($14R^2+12nR$) and of the CT cross reduction
-($10CT+14R^2+12n(C+T)$) are gone. The sector constructor line names each
-sector's compiled program. Decks do not change.
+scalar face batch already was. Each CC, TT and CT round, and each face model
+check of the scalar constructor, takes its eigh room beside its own
+whole-chain program compiled on the arrays it runs, so every retry is a sized
+program. The analytic face prices of the sector reduction ($14R^2+12nR$) and
+of the CT cross reduction ($10CT+14R^2+12n(C+T)$) are gone. Both face batches
+now start at every parent and step down by room, so a deck that fits runs one
+round. The one-parent-per-rank start of the previous entry is withdrawn; it
+split Fe 4^3 at P4 into four rounds whose different sides recompiled every
+program. The sector constructor line names each sector's compiled program.
+Results: Fe 4^3 forced face, SC maps 0-2. Bispinor eqp is bitwise to main.
+The scalar returns to its pre-2026-10-03 batch of 13 and is bitwise to that;
+it differs from current main by 0.071 ueV or less. Bispinor W response is
+280.5 / 122.5 / 14.6 s against 150.2 / 67.2 / 14.6 s on main. The extra
+time is the sizing compiles at maps 0-1; map 2 is equal. Decks do not change.
 
 ## 2026-10-03 — face programs size on their first attempts; the scalar face batch is admitted by its compiled size
 
