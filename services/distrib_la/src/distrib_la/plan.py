@@ -186,13 +186,15 @@ class StackRoute(NamedTuple):
     ``route`` is route (c) or the provider route; on route (c) every rank
     holds ``per_rank`` whole matrices at a time, over ``rounds`` slices of
     the stack, and the program that runs it needs ``program_bytes`` per rank
-    (:func:`_stack_bytes`) against the caller's ``room``.
+    (:func:`_stack_bytes`) against the caller's ``room``. ``sizing_seconds``
+    is the wall of the compiles that decided it.
     """
     route: str
     per_rank: int = 0
     rounds: int = 1
     program_bytes: int | None = None
     room: int | None = None
+    sizing_seconds: float = 0.0
 
 
 #: Decided stack routes, one per (mesh, op, B, n, dtype, room), and the keys
@@ -215,24 +217,45 @@ def new_stack_routes() -> list[str]:
     return lines
 
 
-@lru_cache(maxsize=None)
-def _stack_bytes(op: str, mesh: Mesh, nb: int, n: int, dtype: str, rounds: int, room: int) -> int:
-    """Per-rank device bytes route (c) adds for a face stack of ``nb`` matrices in ``rounds``.
+#: Route-(c) executables compiled to size a stack, by program identity. An
+#: eager call of that stack runs this executable instead of compiling again.
+_EXECUTABLES: dict = {}
 
-    The compiled size of the program that runs (:func:`_reshard_stack_program`:
-    the slices' exchanges, local eighs, inverse exchanges and the result
-    check; outputs and temporaries, the caller's operand excluded) plus the
-    local solver's runtime workspace for one slice, which cuSOLVER reports
-    and the compiler does not count.
+
+def _program_key(op, mesh, shape, dtype, rounds, site):
+    return (op, mesh_key(mesh), tuple(shape), str(dtype), int(rounds), site,
+            _gathered_fits(mesh, shape, dtype))
+
+
+@lru_cache(maxsize=None)
+def _stack_bytes(op: str, mesh: Mesh, nb: int, n: int, dtype: str, rounds: int,
+                 site: str) -> tuple[int, float]:
+    """Per-rank device bytes route (c) adds for a face stack of ``nb`` matrices
+    in ``rounds``, and the seconds the compile took.
+
+    The compiled size of the program that runs (:func:`_reshard_stack_program`
+    for this call ``site``: the slices' exchanges, local eighs, inverse
+    exchanges and the result check with its retries; outputs and temporaries,
+    the caller's operand excluded) plus the local solver's runtime workspace
+    for one slice, which cuSOLVER reports and the compiler does not count.
+    The executable is kept (:data:`_EXECUTABLES`): an eager call of the stack
+    runs it. A call inside a caller's trace inlines the program into the
+    caller's own module, which is compiled with it, so there the sizing
+    compile is of a different program.
     """
+    import time
     import numpy as np
     from distrib_la.resolve import mesh_platform
     from distrib_la.workspace import _vendor_query
     face = NamedSharding(mesh, P(None, "x", "y"))
-    program = _reshard_stack_program(op, mesh, (nb, n, n), dtype, rounds, "admission",
-                                     _gathered_fits(mesh, (nb, n, n), dtype))
-    stats = program.lower(jax.ShapeDtypeStruct((nb, n, n), np.dtype(dtype), sharding=face)
-                          ).compile().memory_analysis()
+    key = _program_key(op, mesh, (nb, n, n), dtype, rounds, site)
+    started = time.perf_counter()
+    program = _reshard_stack_program(op, mesh, (nb, n, n), dtype, rounds, site, key[-1])
+    executable = program.lower(jax.ShapeDtypeStruct((nb, n, n), np.dtype(dtype), sharding=face)
+                               ).compile()
+    seconds = time.perf_counter() - started
+    _EXECUTABLES[key] = executable
+    stats = executable.memory_analysis()
     if stats is None:
         raise RuntimeError("route (c) admission: the compiler returned no memory analysis")
     compiled = stats.output_size_in_bytes + stats.temp_size_in_bytes - stats.alias_size_in_bytes
@@ -243,7 +266,7 @@ def _stack_bytes(op: str, mesh: Mesh, nb: int, n: int, dtype: str, rounds: int, 
         # One cuSOLVER workspace per whole matrix (4 n^2 elements at
         # complex128, the size jaxlib's syevBatched allocates at runtime).
         vendor = per_rank * (_vendor_query(0, "eigh", (n,), np.dtype(dtype).str)[0] + 4)
-    return int(compiled + vendor)
+    return int(compiled + vendor), seconds
 
 
 def _gathered_fits(mesh: Mesh, shape, dtype) -> bool:
@@ -501,14 +524,15 @@ def _native2d_trace_fn(impl: Callable, mesh: Mesh) -> Callable:
 def _describe_stack(route: StackRoute) -> str:
     """One phrase for a decided stack route (log line and :meth:`Plan.describe`)."""
     gb = lambda v: "n/a" if v is None else f"{v / 1e9:.2f} GB"
+    sized = f", sized in {route.sizing_seconds:.1f} s" if route.sizing_seconds else ""
     if route.route == ROUTE_BATCH_RESHARD:
         return (f"{route.route}, {route.per_rank} whole matrix(es) per rank, "
                 f"{route.rounds} round(s), compiled {gb(route.program_bytes)}/rank of room "
-                f"{gb(route.room)}")
+                f"{gb(route.room)}{sized}")
     if route.program_bytes is None:
         return f"{route.route} on the whole mesh (room {gb(route.room)})"
     return (f"{route.route} on the whole mesh ({route.per_rank} whole matrix(es) per rank "
-            f"compile to {gb(route.program_bytes)} against room {gb(route.room)})")
+            f"compile to {gb(route.program_bytes)} against room {gb(route.room)}{sized})")
 
 
 @dataclass(frozen=True)
@@ -670,48 +694,50 @@ class Plan:
         if self.budget_bytes == 0:
             return StackRoute(static, room=0)
         import numpy as np
+        from distrib_la._result_check import call_site
         n, dtype = shape[-1], np.dtype(dtype).name
         key = (mesh_key(self.mesh), op, nb, n, dtype, self.budget_bytes)
         decided = _STACK_ROUTES.get(key)
         if decided is None:
-            decided = _STACK_ROUTES[key] = self._agreed_stack(op, nb, n, dtype)
+            decided = _STACK_ROUTES[key] = self._agreed_stack(op, nb, n, dtype, call_site())
         return decided
 
-    def _agreed_stack(self, op, nb, n, dtype) -> StackRoute:
+    def _agreed_stack(self, op, nb, n, dtype, site) -> StackRoute:
         """:meth:`_decide_stack` agreed over ranks: every rank takes the fewest
         whole matrices per rank any rank chose (0, the whole mesh, wins), so
         the route, the rounds and their collectives are the same everywhere
         (INVARIANTS 21). A compiled figure is read on each rank and may differ."""
         from distrib_la._collectives import agreed_minimum
-        mine = self._decide_stack(op, nb, n, dtype)
+        mine = self._decide_stack(op, nb, n, dtype, site)
         local = mine.per_rank if mine.route == ROUTE_BATCH_RESHARD else 0
         agreed, = agreed_minimum((local,), tag="eigh stack route")
         if agreed == local:
             return mine
         if agreed == 0:
-            return StackRoute(self.batched_route, mine.per_rank, 1, mine.program_bytes, mine.room)
+            return mine._replace(route=self.batched_route, rounds=1)
         ranks = int(self.mesh.shape["x"]) * int(self.mesh.shape["y"])
         rounds = -(-(-(-nb // ranks)) // agreed)
+        program_bytes, seconds = _stack_bytes(op, self.mesh, nb, n, dtype, rounds, site)
         return StackRoute(ROUTE_BATCH_RESHARD, -(-(-(-nb // rounds)) // ranks), rounds,
-                          _stack_bytes(op, self.mesh, nb, n, dtype, rounds, int(self.budget_bytes)),
-                          mine.room)
+                          program_bytes, mine.room, mine.sizing_seconds + seconds)
 
-    def _decide_stack(self, op, nb, n, dtype) -> StackRoute:
+    def _decide_stack(self, op, nb, n, dtype, site) -> StackRoute:
         """Route (c) at the most whole matrices per rank whose program compiles within the room."""
         ranks = int(self.mesh.shape["x"]) * int(self.mesh.shape["y"])
         room, provider = int(self.budget_bytes), self.batched_route
         if n % int(self.mesh.shape["x"]) or n % int(self.mesh.shape["y"]) or room <= 0:
             return StackRoute(provider, room=room)
-        per_rank, tried, compiled = -(-nb // ranks), 0, None
+        per_rank, tried, compiled, wall = -(-nb // ranks), 0, None, 0.0
         while per_rank >= 1:
             rounds = -(-(-(-nb // ranks)) // per_rank)
             m = -(-nb // rounds)
-            tried, compiled = -(-m // ranks), _stack_bytes(op, self.mesh, nb, n, dtype, rounds, room)
+            compiled, seconds = _stack_bytes(op, self.mesh, nb, n, dtype, rounds, site)
+            tried, wall = -(-m // ranks), wall + seconds
             if compiled <= room:
-                return StackRoute(ROUTE_BATCH_RESHARD, tried, rounds, compiled, room)
+                return StackRoute(ROUTE_BATCH_RESHARD, tried, rounds, compiled, room, wall)
             per_rank = min(per_rank - 1, per_rank * room // compiled)
         # The provider route; per_rank names the smallest slice that was compiled.
-        return StackRoute(provider, tried, 1, compiled, room)
+        return StackRoute(provider, tried, 1, compiled, room, wall)
 
     @property
     def native_fn(self) -> Callable:
@@ -935,8 +961,14 @@ class Plan:
         validate_batch_reshard_operands(op if op != "normal_eigh" else "eigh", self.mesh, (A,))
         A = ensure_sharding(A, NamedSharding(self.mesh, P(None, "x", "y")))
         shape, site = tuple(int(v) for v in A.shape), call_site()
-        out = _reshard_stack_program(op, self.mesh, shape, str(A.dtype), int(rounds), site,
-                                     _gathered_fits(self.mesh, shape, A.dtype))(A)
+        key = _program_key(op, self.mesh, shape, A.dtype, rounds, site)
+        executable = None if isinstance(A, jax.core.Tracer) else _EXECUTABLES.get(key)
+        if executable is not None and A.sharding.is_equivalent_to(
+                NamedSharding(self.mesh, P(None, "x", "y")), 3):
+            out = executable(A)          # the sizing compile is the program that runs
+        else:
+            out = _reshard_stack_program(op, self.mesh, shape, str(A.dtype), int(rounds), site,
+                                         key[-1])(A)
         if op == "normal_eigh" or isinstance(A, jax.core.Tracer):
             return out
         return refuse_if_poisoned(out, "eigh", shape[-1], site)
