@@ -214,36 +214,34 @@ def construct_sector_poles(bank, meta, config, *, mesh_xy, output):
     from gw.shared_pole_execution import sector_round_schedule,is_face
     resolved_execution,execution_rows=sector_execution(
         meta,config,bank['mu_bases'],header['n_q_irr'],mesh_xy=mesh_xy,upstream=upstream)
-    batch_width,sizes = int(mesh_xy.size),{}
-    if resolved_execution == 'face':
-        from gw.shared_pole_execution import sector_batch_width
-        batch_width, batch_admission = sector_batch_width(
-            meta,linalg_resolution({'linalg':config.backend.linalg}),recipe,execution_rows,
-            mesh=mesh_xy,ledger=ledger,nq=header['n_q_irr'])
-        sizes = batch_admission['sector_program_bytes_per_rank']
-        for row in (*execution_rows,execution_rows[0]['joint']):
-            row['batch_admission'] = batch_admission
-            row['face_batch'] = dict(parent_batch=batch_width,sizing_seconds=batch_admission['sizing_seconds'],
-                                     compiled_program_bytes_per_rank=sizes[row.get('sector','CT')])
+    # The resident models are reserved first, so the batch is admitted beside them.
     sector_models,model_residence=_sector_model_residence(meta,config,header,bank['mu_bases'],
         execution_rows,mesh_xy=mesh_xy,root=root,upstream=upstream,route=resolved_execution)
     if sector_models is not None:
         upstream=ledger.live_stages=(*upstream,model_residence['stage'])
-    # distrib_la decides the face eigh stacks against the room beside the
-    # admitted sector batch and the resident models reserved after it (whole
-    # matrices per rank where they fit); each round's reduction (CC, TT, CT)
-    # against the batch row with its own compiled program for the batch's.
-    from gw.shared_pole_capacity import face_eigh_room
-    room = face_room = None
+    batch_width,sizes,face_room = int(mesh_xy.size),{},None
+
+    def used_room(row,budget):
+        # The room a sector's reduction ran against, the least over rounds.
+        rooms=row['face_eigh_room_bytes_per_rank']
+        rooms['reduction']=min(rooms.get('reduction',1<<62),budget.face_room or 0)
     if resolved_execution == 'face':
-        batch_row = batch_admission['reduction']
-        resident_models = model_residence['payload_bytes_per_rank'] if sector_models is not None else 0
-        room = lambda compiled: face_eigh_room(dict(batch_row, aggregate_bytes_per_rank=(
-            batch_row['aggregate_bytes_per_rank'] - batch_admission['compiled_program_bytes_per_rank']
-            + compiled)), resident_models)
-        face_room = room(batch_admission['compiled_program_bytes_per_rank'])
-    for row in execution_rows if resolved_execution == 'face' else ():
-        row['face_eigh_room_bytes_per_rank'] = dict(selection=face_room)
+        from gw.shared_pole_capacity import face_eigh_room
+        from gw.shared_pole_execution import sector_batch_width
+        batch_width, batch_admission = sector_batch_width(
+            meta,linalg_resolution({'linalg':config.backend.linalg}),recipe,execution_rows,
+            mesh=mesh_xy,ledger=ledger,nq=header['n_q_irr'])
+        sizes,seconds = (batch_admission[f'sector_program_{key}'] for key in ('bytes_per_rank','seconds'))
+        # distrib_la decides every face eigh stack against the room beside the
+        # admitted batch, whose row holds the largest whole-chain program, so
+        # it bounds every round's retry (whole matrices per rank where they fit).
+        face_room = face_eigh_room(batch_admission['reduction'])
+        for row in (*execution_rows,execution_rows[0]['joint']):
+            row['batch_admission'] = batch_admission
+            name = row.get('sector','CT')
+            row['face_batch'] = dict(parent_batch=batch_width,sizing_seconds=seconds[name],
+                                     compiled_program_bytes_per_rank=sizes[name])
+            row['face_eigh_room_bytes_per_rank'] = dict(selection=face_room)
     for ids,real,slots,execution in sector_round_schedule(
             bank,header,meta,config,mesh_xy,execution=resolved_execution,
             batch_width=batch_width):
@@ -258,11 +256,13 @@ def construct_sector_poles(bank, meta, config, *, mesh_xy, output):
                     line=read_line(io,family)
                 geometry=dict(components=3 if family else 1,basis=bank['mu_bases'][family],
                     ids=ids,real=real,header=sector_headers[family],sample_ids=dense_fit,
-                    sector=name,face_room=face_room,room=room,program_bytes=sizes.get(name))
+                    sector=name,face_room=face_room,program_bytes=sizes.get(name))
                 model=construct_diagonal_sector_round(samples,exact,meta,config,geometry,
                     mesh_xy=mesh_xy,retained=retained,line=line)
                 del samples,exact,line
                 sectors.append(model)
+                if execution=='face':
+                    used_room(execution_rows[family],model['budget'])
 
                 retained.extend(jax.tree.leaves((model['model'],model['signed'],
                     model['coefficients'],model['infinity'],tuple(s[1:] for s in model['states']))))
@@ -284,9 +284,11 @@ def construct_sector_poles(bank, meta, config, *, mesh_xy, output):
                 refuse_nonfinite_moment('CT',cm['M1'],real,mesh_xy=mesh_xy)
                 line_cross=[read_line(io,family,cross=True) for family in (0,1)]
             cross=construct_cross_sector_round(sectors,(ct,tc),cm,meta,config,mesh_xy=mesh_xy,
-                sample_ids=dense_fit,line_cross=line_cross,real=real,room=room,program_bytes=sizes.get('CT'))
+                sample_ids=dense_fit,line_cross=line_cross,real=real,program_bytes=sizes.get('CT'))
             del line_cross
             del ct,tc,cm
+            if execution=='face':
+                used_room(execution_rows[0]['joint'],cross['budget'])
         models=(sectors[0]['model'],sectors[1]['model'],*cross['models'])
         treatment_policy=recipe.get('sector_pole_treatment')
         treatment=None
@@ -716,7 +718,7 @@ def construct_diagonal_sector_round(samples, moments, meta, config, geometry, *,
     if execution == 'face':
         reduced=face_reduce_round(states,infinity,tables,real=geometry['real'],mesh=mesh_xy,
             budget=budget,ordered=True,odd_moments=True,keep_budget=recipe['pole_budget'],retain_span=True,
-            gram_keep=gram_keep,admit=False,room=geometry.get('room'))
+            gram_keep=gram_keep,admit=False,room=budget.face_room)
     else:
         # The kept span on the Ritz carrier: the ladder rung of this sector's
         # largest kept count so far (carrier_history), as the scalar model's.
@@ -744,7 +746,7 @@ def construct_diagonal_sector_round(samples, moments, meta, config, geometry, *,
 
 
 def construct_cross_sector_round(sectors, samples, moments, meta, config, *,
-                                 mesh_xy, sample_ids, line_cross, real, room=None, program_bytes=None):
+                                 mesh_xy, sample_ids, line_cross, real, program_bytes=None):
     """Run CT on the two current-map diagonal spans, keeping both outputs.
 
     ``samples=(CT,TC)`` contains the native rectangular Wc/dWc_ds rounds at
@@ -753,9 +755,7 @@ def construct_cross_sector_round(sectors, samples, moments, meta, config, *,
     moments is the CT M0..M3 round. All operators are parent-sharded. The
     signed physical photon interaction is admitted by the unchanged positive
     retained-H checks, not by the scalar positive-V upper passivity bound.
-    A face round is priced at CT's compiled ``program_bytes`` (``sector_batch_width``)
-    and decides its eighs against ``room(compiled)``, the room beside its
-    whole-chain program compiled on the arrays it runs (also its retry).
+    A face round is priced at CT's compiled ``program_bytes`` (``sector_batch_width``).
     """
     import copy
     import jax
@@ -778,6 +778,7 @@ def construct_cross_sector_round(sectors, samples, moments, meta, config, *,
         mesh_xy=mesh_xy,ledger=meta.shared_pole_capacity,
         upstream=meta.shared_pole_capacity.live_stages,execution=execution)
     budget.batch_width = charge['model'][0].shape[0]
+    budget.face_room = charge['budget'].face_room
     budget.program_bytes = program_bytes
     budget.retained_panels = (*retained,*ct.values(),*tc.values(),*moments.values(),
         *(panels for stored in line_cross for panels,_ in stored.values()))
@@ -821,11 +822,10 @@ def construct_cross_sector_round(sectors, samples, moments, meta, config, *,
         budget.retained_panels=(*base_panels,*jax.tree.leaves((actions,packed)))
     side=sum(s[4].shape[-1] for s in packed)
     budget.plan(side,phase='cross_reduction',cross_original_sides=original_sides)
-    args=(*packed,tuple(actions),tuple(moments[f'M{i}'] for i in range(4)))
-    if execution=='face':
-        from gw.shared_pole_execution import compiled_bytes,cross_parent_program,face_eigh
-        budget.face_room=room(compiled_bytes(cross_parent_program(mesh_xy,face_eigh(mesh_xy,side)),*args))
-    signed,diagnostics=reduce_cross_round(*args,mesh_xy=mesh_xy,eigh_plan=budget.eigenplan(side))
+    cross_eigh=budget.eigenplan(side)
+    signed,diagnostics=reduce_cross_round(*packed,tuple(actions),
+        tuple(moments[f'M{i}'] for i in range(4)),mesh_xy=mesh_xy,
+        eigh_plan=cross_eigh)
     for name in ('gram_valid','retained_metric_positive'):
         if not bool(jnp.all(diagnostics[name][:real])):
             raise ValueError(f'GATE shared_pole_sector_{name}: sector=CT; '

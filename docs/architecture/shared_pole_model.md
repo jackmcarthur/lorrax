@@ -292,9 +292,11 @@ Ritz carrier: the Schur and final eighs run at the carrier and twice it
 (CrI3 24×24 on 4×4: 6144 and 12288 instead of 9152 and 18304). Its eigh stacks
 (infinity, directions, partners, passivity, the Gram reduction, CT and the
 Cauchy check) go to `distrib_la` with the room beside the admitted batch
-(`face_eigh_room` of the selection admission row; a reduction round, CC, TT
-or CT, and a face model check beside its own whole-chain program compiled on
-the arrays it runs, which is also its retry); the service runs a stack one or more whole matrices
+(`face_eigh_room` of the selection admission row; a scalar reduction round
+and a face model check beside its own whole-chain program compiled on the
+arrays it runs, which is also its retry; CC, TT and CT beside the sector batch
+row, which holds the largest of their whole-chain programs and the resident
+sector models); the service runs a stack one or more whole matrices
 per rank when one slice's compiled program fits that room, else on the whole
 mesh ([eigh stacks](../services/distrib_la/api.md#eigh-stack)). The sectors
 take one route together (`sector_execution`, against the same ledger): CC, TT
