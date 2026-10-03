@@ -10,7 +10,8 @@ in the order a user runs them:
            -> exciton bands -> restarted: COHSEX, shared-pole one-shot with
               W and pole exports
            -> bispinor kin_ion, dipole -> four-current shared-pole QSGW
-              (2 maps, fresh zeta; its map 0 is the one-shot)
+              (2 maps, fresh zeta; its map 0 is the one-shot) -> BSE
+           -> the same QSGW with the sector constructor forced to the face
            -> bcc Na (run/na): kin_ion, dipole -> metal shared-pole QSGW
               (2 maps, the production defaults)
 
@@ -31,6 +32,7 @@ references.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import os
 from pathlib import Path
@@ -73,7 +75,7 @@ ATOL = {
 # The SC stages' sigma h5 files, compared at ATOL["sc_sigma_ev"], and the
 # GN-PPM one: its output window holds the deep occupied bands 1-2 of the
 # H2- fixture, where P1 vs P4 reads 0.98 meV.
-SC_SIGMA_H5 = ("bsc_sigma.h5:", "na_sigma.h5:", "gnppm_sigma.h5:")
+SC_SIGMA_H5 = ("bsc_sigma.h5:", "bfc_sigma.h5:", "na_sigma.h5:", "gnppm_sigma.h5:")
 
 # h5 members not compared.  line_charge_* are the W bank's selected
 # direction states: a gauge per direction, and padded to the mesh (P1 6x1,
@@ -230,14 +232,16 @@ sigma_omega_h5_file = {prefix}_sigma.h5
 """)
 
 
-RESTART_DECKS.update({
-    "bisp_sc.in": _bisp_deck("bsc", """restart = false
+_BISP_SC = """restart = false
 qp_solver = self_consistent
 sc_max_iter = 2
 sc_tol_ev = 3.0
 sc_head_update = dft_velocity
 density_self_consistent = true
-"""),
+"""
+RESTART_DECKS.update({
+    "bisp_sc.in": _bisp_deck("bsc", _BISP_SC),
+    "bisp_face.in": _bisp_deck("bfc", _BISP_SC),
 })
 _P = ["--px", _SIDE, "--py", _SIDE]
 
@@ -282,7 +286,15 @@ NA_SC_TOL_EV = "1.5"
 # fresh model in a run directory that already holds the scalar shared-pole
 # models (checked at sp_export), and a fresh run refuses to overwrite a
 # completed model (GATE shared_pole_output).
-_CLEAR_BEFORE = {"bisp_sc": ("tmp/mpa",)}
+_CLEAR_BEFORE = {"bisp_sc": ("tmp/mpa",), "bisp_face": ("tmp/mpa",)}
+
+# bisp_face reruns bisp_sc with the sector constructor (CC/TT/CT) forced to
+# the whole-mesh (face) route, which decks too large for whole parents per
+# rank (CrI3) take for every sector.  Its programs differ from the local ones
+# only in layout and eigensolver adapter, so it is judged against bisp_sc's
+# reference (labels bsc -> bfc).  Test-only, never read by src.
+FORCED_FACE = ("bisp_face",)
+REFERENCE_OF = {"bisp_face": ("bisp_sc", "bsc", "bfc")}
 
 # (name, module, argv, deck name -> template).  The decks are written into
 # the run directory after kmeans, which names the centroid file.
@@ -327,6 +339,8 @@ STAGES = (
       "--band-degeneracy", "off", "--max-lanczos-iter", "40",
       "--n-eig", "2", "--block-size", "1", *_P,
       "--report-file", "bse_bisp.out"]),
+    # After bse_bisp, so that stage reads bisp_sc's W0 restart.
+    ("bisp_face", "gw.gw_jax", ["-i", "bisp_face.in"]),
     # bcc Na in run/na/.  Its centroids are stored in fixture_na/ (kmeans
     # is covered above): 56 orbit-closed points from `centroid.kmeans_cli 64
     # --seed 42 --orbit --oversample 1.5 --fit-window 0:8,0:13` (the zeta legs).
@@ -363,6 +377,10 @@ CHECKS = {
                 "report_floats": ("bsc.out",
                                   r"SC iteration: call=\d+ .*?max\|dE\|=([0-9.e+-]+)")},
     "bse_bisp": {"stdout_floats": r"^\s*S\d+\s+([0-9.+-]+)\s*$"},
+    "bisp_face": {"eqp": ["bfc_eqp0.dat", "bfc_eqp1.dat"],
+                  "h5": ["bfc_sigma.h5"],
+                  "report_floats": ("bfc.out",
+                                    r"SC iteration: call=\d+ .*?max\|dE\|=([0-9.e+-]+)")},
     "na_kin_ion": {"h5": ["kin_ion.h5"]},
     "na_dipole": {"h5": ["dipole.h5"]},
     "na_sc": {"eqp": ["na_eqp0.dat", "na_eqp1.dat"],
@@ -459,6 +477,27 @@ def _injected(name, rank, when):
                          f"{INJECT!r} on rank {rank}; want: unset; why: harness test")
 
 
+@contextlib.contextmanager
+def _sector_route(name):
+    """Force the sector constructor's route to the face for a FORCED_FACE stage."""
+    if name not in FORCED_FACE:
+        yield
+        return
+    import gw.shared_pole_sectors as sectors
+    resolve = sectors.sector_execution
+
+    def face(*args, **kwargs):
+        _, rows = resolve(*args, **kwargs)
+        for row in rows:
+            row["mode"] = "face"
+        return "face", rows
+    sectors.sector_execution = face
+    try:
+        yield
+    finally:
+        sectors.sector_execution = resolve
+
+
 def run_stage(run, name, module, argv, env, timeout):
     """Run one driver's entry point in this process on every rank.
 
@@ -498,7 +537,8 @@ def run_stage(run, name, module, argv, env, timeout):
         main = importlib.import_module(module).main
         try:
             _injected(name, rank, "before")
-            ret = main(argv) if inspect.signature(main).parameters else main()
+            with _sector_route(name):
+                ret = main(argv) if inspect.signature(main).parameters else main()
             rc = int(ret or 0)
             _injected(name, rank, "after")
         except SystemExit as exc:
@@ -745,11 +785,15 @@ def run_chain(out, *, regenerate=False, cache_dir=None, timeout=600,
             got = {"centroids": pts}
         else:
             got = captured(where, name, rule)
-        if regenerate == "all" or (regenerate == "missing" and _load(name) is None):
+        source, old, new = REFERENCE_OF.get(name, (name, "", ""))
+        if source == name and (regenerate == "all" or (
+                regenerate == "missing" and _load(name) is None)):
             REFERENCE.mkdir(exist_ok=True)
             _save(name, got)
             continue
-        ref = _load(name)
+        ref = _load(source)
+        if ref is not None and old:
+            ref = {new + k[len(old):] if k.startswith(old) else k: v for k, v in ref.items()}
         if ref is None:
             problems.append(f"{name}: no stored reference (run --regenerate)")
             continue
