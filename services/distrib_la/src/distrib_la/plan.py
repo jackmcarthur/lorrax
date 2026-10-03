@@ -599,6 +599,8 @@ class Plan:
         if (self.requested_batched_route != "auto" or self.budget_bytes is None
                 or self.is_native or self.op != "eigh"):
             return StackRoute(static)
+        if self.budget_bytes == 0:
+            return StackRoute(static, room=0)
         import numpy as np
         n, dtype = shape[-1], np.dtype(dtype).name
         key = (mesh_key(self.mesh), op, nb, n, dtype, self.budget_bytes)

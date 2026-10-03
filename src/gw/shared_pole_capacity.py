@@ -307,9 +307,12 @@ class ConstructorCapacity:
             eigen_side = max(side // 2, 2 * min(side // 2, int(self.ritz_budget)))
         extents = {n} if phase == "selection" else (
             {side if eigen_side is None else int(eigen_side)} if phase in ("reduction", "cross_reduction") else {n})
-        # Eigh scratch is transient: replace it at each phase boundary.
+        # Eigh scratch is transient: replace it at each phase boundary. It is
+        # priced on the whole-mesh plan: the room distrib_la reads to run a
+        # stack one whole matrix per rank is what this admission leaves over.
         self._native_maxima["eigh"] = max(self.query_workspace(
-            "eigh", ((self.batch_width, extent, extent),), self.eigenplan(extent))
+            "eigh", ((self.batch_width, extent, extent),),
+            constructor_eigenplan(self._mesh_xy, int(extent), self.execution))
             for extent in sorted(extents))
         if self.execution == 'face':
             extent=max(n,side,*extents)
