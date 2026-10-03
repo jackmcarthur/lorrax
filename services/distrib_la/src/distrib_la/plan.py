@@ -230,7 +230,7 @@ def _stack_bytes(op: str, mesh: Mesh, nb: int, n: int, dtype: str, rounds: int, 
     from distrib_la.workspace import _vendor_query
     face = NamedSharding(mesh, P(None, "x", "y"))
     program = _reshard_stack_program(op, mesh, (nb, n, n), dtype, rounds, "admission",
-                                     _gathered_fits((nb, n, n), dtype, room))
+                                     _gathered_fits(mesh, (nb, n, n), dtype, room))
     stats = program.lower(jax.ShapeDtypeStruct((nb, n, n), np.dtype(dtype), sharding=face)
                           ).compile().memory_analysis()
     if stats is None:
@@ -246,13 +246,43 @@ def _stack_bytes(op: str, mesh: Mesh, nb: int, n: int, dtype: str, rounds: int, 
     return int(compiled + vendor)
 
 
-def _gathered_fits(shape, dtype, room) -> bool:
-    """Whether a stack's gathered retry fits every rank: the matrices, their
-    vectors and the solver's copy within the room (GATHERED_EIGH_BYTES
-    without one), the rule of the distributed eigh's retry chain."""
+def _gathered_fits(mesh: Mesh, shape, dtype, room) -> bool:
+    """Whether an eigh's gathered retry fits every rank within the room
+    (GATHERED_EIGH_BYTES without one): the compiled size of the gathered
+    program (outputs and temporaries) plus cuSOLVER's workspace for each
+    whole matrix, since every rank solves all of them. A whole matrix needs
+    7 n^2 elements this way, against the 3 n^2 of the matrix, its vectors and
+    one copy."""
     import numpy as np
     limit = GATHERED_EIGH_BYTES if room is None else int(room)
-    return 3 * np.dtype(dtype).itemsize * int(np.prod(shape)) <= limit
+    return _agreed_gathered(mesh, tuple(int(v) for v in shape), np.dtype(dtype).name, limit)
+
+
+@lru_cache(maxsize=None)
+def _agreed_gathered(mesh: Mesh, shape: tuple, dtype: str, limit: int) -> bool:
+    """:func:`_gathered_fits`, agreed over ranks (any rank's no wins), so every
+    rank builds the same retry chain and its collectives (INVARIANTS 21)."""
+    import numpy as np
+    from distrib_la._collectives import agreed_minimum
+    fits = (3 * np.dtype(dtype).itemsize * int(np.prod(shape)) <= limit
+            and _gathered_bytes(mesh, shape, dtype) <= limit)
+    return bool(agreed_minimum((int(fits),), tag="gathered eigh retry")[0])
+
+
+@lru_cache(maxsize=None)
+def _gathered_bytes(mesh: Mesh, shape: tuple, dtype: str) -> int:
+    """Per-rank device bytes of :func:`_gathered_eigh` on a face operand of ``shape``."""
+    import numpy as np
+    from distrib_la.resolve import mesh_platform
+    from distrib_la.workspace import _vendor_query
+    face = NamedSharding(mesh, P(*([None] * (len(shape) - 2)), "x", "y"))
+    stats = jax.jit(partial(_gathered_eigh, mesh=mesh)).lower(
+        jax.ShapeDtypeStruct(shape, np.dtype(dtype), sharding=face)).compile().memory_analysis()
+    compiled = stats.output_size_in_bytes + stats.temp_size_in_bytes - stats.alias_size_in_bytes
+    if mesh_platform(mesh) != "CUDA":
+        return int(compiled)
+    matrices = int(np.prod(shape[:-2])) if len(shape) > 2 else 1
+    return int(compiled + matrices * (_vendor_query(0, "eigh", (shape[-1],), np.dtype(dtype).str)[0] + 4))
 
 
 @lru_cache(maxsize=None)
@@ -779,8 +809,7 @@ class Plan:
             # A gathered local solve, where the whole matrix, its vectors and
             # the solver's copy fit every rank: within the caller's budget, or
             # GATHERED_EIGH_BYTES without one (a shape rule, the same on every rank).
-            limit = GATHERED_EIGH_BYTES if budget is None else budget
-            if 3 * A.dtype.itemsize * A.size <= limit:
+            if _gathered_fits(mesh, A.shape, A.dtype, budget or None):
                 attempts.append(partial(_gathered_eigh, mesh=mesh))
             return checked_eigh(attempts, A, site=call_site())
         return safe
@@ -907,7 +936,7 @@ class Plan:
         A = ensure_sharding(A, NamedSharding(self.mesh, P(None, "x", "y")))
         shape, site = tuple(int(v) for v in A.shape), call_site()
         out = _reshard_stack_program(op, self.mesh, shape, str(A.dtype), int(rounds), site,
-                                     _gathered_fits(shape, A.dtype, self.budget_bytes or None))(A)
+                                     _gathered_fits(self.mesh, shape, A.dtype, self.budget_bytes or None))(A)
         if op == "normal_eigh" or isinstance(A, jax.core.Tracer):
             return out
         return refuse_if_poisoned(out, "eigh", shape[-1], site)
