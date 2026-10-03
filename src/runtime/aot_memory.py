@@ -566,6 +566,25 @@ def agreed_chunk(chunk: int) -> int:
     return int(np.min(np.asarray(all_gather_processes(np.asarray(int(chunk), dtype=np.int64)))))
 
 
+def step_up(value: int, top: int, *, build, compiled, figure, room: float, stage: str = ""):
+    """Double ``value`` (to at most ``top``) while the compiled figure is over
+    ``room`` and each step lowers it; past that something the value does not
+    touch binds.  ``build(v)`` compiles at ``v``, ``figure(compiled)`` reads
+    its bytes.  Every rank decides on the largest figure, so all ranks step in
+    lockstep (INVARIANTS 21).  Returns ``(value, compiled)`` that run."""
+    agreed_max = lambda ex: -agreed_chunk(-int(figure(ex)))
+    got = agreed_max(compiled)
+    while got > room and value < top:
+        nxt_v = min(2 * int(value), int(top))
+        nxt_c = build(nxt_v)
+        nxt = agreed_max(nxt_c)
+        if nxt >= got:
+            break
+        value, compiled, got = nxt_v, nxt_c, nxt
+        announce_once(f"step-up:{stage}:{value}", f"{stage}: compiled {got / 1e9:.2f} GB at {value}")
+    return value, compiled
+
+
 def check_chunk(chunk: int, *, build, fixed: float, per_unit: float, room: float,
                 extra=lambda c, compiled: 0, minimum: int = 1, compiled=None, stage: str = "",
                 platform: str | None = None) -> ChunkCheck:

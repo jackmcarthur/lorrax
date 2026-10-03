@@ -383,20 +383,19 @@ def _fit_mubatch(
     if agreed not in builds:
         build(agreed)
     mb, c_out, n_blk, kern_args, kernel, batch_executable = builds[agreed]
-    # Over the room, the plane axis steps up in blocks while a step lowers the
-    # compiled batch (past that the source stage binds); every rank decides on
-    # the largest figure, so the slow path stays reachable in lockstep.
-    from runtime.aot_memory import compiled_new_bytes
-    fig = lambda ex: -agreed_chunk(-compiled_new_bytes(
-        ex, extra=int(ex.memory_analysis().output_size_in_bytes)))
-    got, n_grp = fig(batch_executable), -(-int(plan.n_planes) // n_pg_plan)
-    while got > plan.target_bytes - ws0 and n_blk < n_grp:
-        nxt = fig(build(agreed, n_blk=min(2 * n_blk, n_grp)))
-        if nxt >= got:
-            break
-        mb, c_out, n_blk, kern_args, kernel, batch_executable = builds[agreed]
-        got = nxt
-        print_fn(f"  μ-batch executable: compiled {got / 1e9:.2f} GB at {n_blk} plane block(s)")
+    # Over the room, the plane axis steps up in blocks while that lowers the
+    # compiled batch (past that the source stage binds), in lockstep, so the
+    # slow path stays reachable.
+    from runtime.aot_memory import compiled_new_bytes, step_up
+    n_run, batch_executable = step_up(
+        n_blk, -(-int(plan.n_planes) // n_pg_plan), compiled=batch_executable,
+        build=lambda n: build(agreed, n_blk=n), room=plan.target_bytes - ws0,
+        figure=lambda ex: compiled_new_bytes(
+            ex, extra=int(ex.memory_analysis().output_size_in_bytes)),
+        stage="zeta route-G mu batch, plane blocks")
+    if n_run != n_blk:
+        kern_args = dict(kern_args, n_blk=n_run)
+        n_blk, kernel = n_run, zmb.make_route_g_kernel(**kern_args)
     builds.clear()
     b = int(mb.b)
     print_fn(f"  μ-batch executable: new bytes/rank analytic {check.analytic / 1e9:.2f} GB, "
