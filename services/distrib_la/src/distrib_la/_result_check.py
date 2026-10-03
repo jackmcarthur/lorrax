@@ -74,18 +74,70 @@ def deflate_zero_rows(eigh):
     return solve
 
 
+#: Newton-Schulz steps the shifted retry may take. It stops earlier once the
+#: identity defect ||V^H V - I||_F / sqrt(n) is at n * eps, below accept(n).
+ORTHONORMALIZE_STEPS = 12
+
+
+def orthonormalize(vectors):
+    """Newton-Schulz polar iteration V <- V (3I - V^H V) / 2, GEMMs only.
+
+    Returns the vectors and the number of steps taken. A solve whose vectors
+    are eigenvectors but not orthonormal inside a degenerate cluster
+    (cuSOLVERMp at n 18304: residual 2e-15, orthogonality 2e-2) is repaired
+    without leaving the cluster: V^H V couples only near-parallel columns,
+    which share an eigenvalue. The iteration converges quadratically while
+    the columns' singular values lie in (0, sqrt 3); it stops at n * eps or
+    after ORTHONORMALIZE_STEPS, and the result check decides either way
+    (n 18304, 4x4: 6 steps, orthogonality 2e-2 -> 8e-15).
+    """
+    n = vectors.shape[-1]
+    eye = jnp.eye(n, dtype=vectors.dtype)
+    scale = np.sqrt(n)
+    target = n * float(np.finfo(vectors.real.dtype).eps)
+
+    def gram(v):
+        g = jnp.conj(jnp.swapaxes(v, -1, -2)) @ v
+        return g, jnp.max(_norm(g - eye)) / scale
+
+    def unfinished(state):
+        steps, _, _, defect = state
+        return (steps < ORTHONORMALIZE_STEPS) & (defect > target)
+
+    def step(state):
+        steps, v, g, _ = state
+        v = v @ ((3 * eye - g) / 2)
+        g, defect = gram(v)
+        return steps + 1, v, g, defect
+
+    g, defect = gram(vectors)
+    steps, vectors, _, _ = jax.lax.while_loop(unfinished, step, (jnp.int32(0), vectors, g, defect))
+    return vectors, steps
+
+
+def _orthonormalize_notice(n, steps):
+    if jax.process_index() == 0 and int(steps):
+        print(f"distrib_la: eigh n={n}: shifted retry vectors re-orthonormalized in {int(steps)} "
+              f"Newton-Schulz step(s)", file=sys.stderr, flush=True)
+
+
 def shifted(eigh):
-    """Solve A + s I, s = ||A||_F, and return the eigenpairs of A.
+    """Solve A + s I, s = ||A||_F, re-orthonormalize the vectors, and return A's eigenpairs.
 
     The shift moves a large (near-)zero cluster away from the origin.
     cuSOLVERMp's silent failures on rank-deficient PSD responses (n 432, no
-    zero row, every block size) and on the CT metric's zero block (n 2688,
-    block 224) all pass shifted (probe residual <= 1e-15). The eigenvalues
-    come back to within n * eps * (||A|| + s) of A's, the stable bound.
+    zero row, every block size), on the CT metric's zero block (n 2688, block
+    224) and on a sentinel-padded H'_vv (n 9152, 4x4) all pass shifted (probe
+    residual <= 1.3e-15). Where the shifted vectors are still not orthonormal
+    inside a cluster (n 18304, a 3/4-wide near-zero cluster: orthogonality
+    2e-2), ``orthonormalize`` repairs them in 6 steps (8e-15). The
+    eigenvalues come back to within n * eps * (||A|| + s) of A's.
     """
     def solve(a):
         s = jnp.linalg.norm(a, axis=(-2, -1))
         values, vectors = eigh(a + s[..., None, None] * jnp.eye(a.shape[-1], dtype=a.dtype))
+        vectors, steps = orthonormalize(vectors)
+        jax.debug.callback(partial(_orthonormalize_notice, int(a.shape[-1])), steps)
         return values - s[..., None], vectors
     return solve
 

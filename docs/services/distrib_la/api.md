@@ -122,7 +122,8 @@ rank-deficient PSD responses with no zero row (n 432, most block sizes). So:
   rank: ‖(AZ − Z diag(w))X‖/(‖A‖‖X‖) and ‖(ZᴴZ − I)X‖/‖X‖ within
   `roundoff_tol(n)` = 64·n·eps, at O(n²k) beside the O(n³) solve. A failed check is noted on rank 0's
   stderr and solved again: shifted (A + ‖A‖_F I, which moves a large
-  near-zero cluster off the origin), then in cuSOLVERMp's other layout with
+  near-zero cluster off the origin, its vectors then re-orthonormalized by a
+  Newton–Schulz polar iteration, GEMMs only), then in cuSOLVERMp's other layout with
   and without the sentinels, then gathered on every rank when the matrix,
   its vectors and the solver's copy fit the plan's `budget_bytes` (1 GiB
   without one).
