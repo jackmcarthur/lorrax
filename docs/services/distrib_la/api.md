@@ -89,8 +89,10 @@ eigh = dla.plan('eigh', mesh, backend='auto', n=n)   # eager: resolve once
 w, z = eigh.batched(a_stack)                          # trace-safe
 ```
 
-`plan(op, mesh, *, backend='auto', n=None, batched_route='batch_reshard',
+`plan(op, mesh, *, backend='auto', n=None, batched_route=None,
 budget_bytes=None) -> Plan` resolves `op ∈ {eigh, cholesky, solve_lu}`.
+Without `budget_bytes` the route defaults to `'batch_reshard'`; with it and no
+route, the service decides each eigh stack ([the eigh-stack API](#eigh-stack)).
 Passing `n` (independent of any operand, so a caller that will pad can ask
 first) runs the divisibility guard at resolve time.
 
@@ -99,7 +101,7 @@ first) runs the divisibility guard at resolve time.
 | `Plan(A)` | one matrix at `P('x','y')` | `eigh`: `(w, Z)` |
 | `Plan.batched(A_stack, …)` | a stack at `P(None,'x','y')` | the same per matrix |
 | `Plan.native_fn` | — | a pure trace-safe closure, native backends only, for a caller that needs the math inside its own `jit` |
-| `Plan.backend`, `.is_native`, `.batched_route`, `.route_for(shape, dtype)`, `.describe()`, `.donates` | — | the resolved facts, for reports; a caller never branches on them |
+| `Plan.backend`, `.is_native`, `.batched_route`, `.route_for(shape, dtype)`, `.stack_route(shape, dtype)`, `.describe()`, `.donates` | — | the resolved facts, for reports; a caller never branches on them |
 
 **Conventions, identical on every backend.** Eigenvalues return ascending and
 replicated; eigenvectors return as columns, `A Z = Z diag(w)`, in the input's
@@ -126,6 +128,10 @@ rank-deficient PSD responses with no zero row (n 432, most block sizes). So:
   and without the sentinels, then gathered on every rank when the matrix,
   its vectors and the solver's copy fit the plan's `budget_bytes` (1 GiB
   without one).
+- Every route-(c) eigh is checked the same way on its face-layout result; a
+  failed check solves the stack again on the plan's whole-mesh provider
+  (itself checked), and a native plan refuses. Measured cost at P4: 3.0 ms per
+  eigh at n = 3328 (5 % of the solve).
 - Every distributed LU solve (`plan('solve_lu').batched`, `factor`/`solve`)
   is checked on its actual solution through sketches taken before the library
   consumes A and B: ‖Wᴴ(AX − B)‖/(√k (‖A‖‖X‖ + ‖B‖)) within `ACCEPT`. Its
@@ -212,12 +218,24 @@ Nothing crosses the host.
   matrices, their outputs and the local solver workspace. When one matrix
   does not fit one device, use `batched_route='auto'` with a distributed
   backend.
-- **Capacity route.** With `batched_route='auto'` and a `budget_bytes` that
-  every rank shares, `Plan.route_for` picks (c) for a provider eigh stack
-  when `fits_local` admits the per-rank whole matrices plus the local
-  workspace, and the provider route otherwise. The budget must be a value
-  every rank agrees on (a deck value, never a per-rank measurement), because
-  the answer selects collectives.
+- **The eigh-stack API** {#eigh-stack}. A caller that holds a face stack
+  `(B, n, n)` passes its room per rank beside its own live set,
+  `plan('eigh', mesh, n=n, backend='distributed', budget_bytes=room)`, and
+  the service decides each stack (`Plan.stack_route`, a `StackRoute`):
+  - route (c) when the compiled program of one slice of the stack fits the
+    room: the slice's exchanges, local eigh and inverse exchanges (arguments,
+    outputs, temporaries) plus the local solver's vendor-reported workspace per
+    whole matrix. The most whole matrices per rank that fit win, and the stack
+    runs in that many equal slices (rounds, one `lax.scan`);
+  - the whole-mesh provider otherwise, including room 0.
+  The decision is compiled, never a formula, and is the same on every rank
+  (the room is a caller value every rank shares). It is printed once per
+  (op, B, n, dtype, room) on rank 0 and listed by `describe()`. Measured
+  per-matrix compiled sizes at complex128 (one A100, route (c) at one
+  matrix per rank): about 7 n² × 16 B (input, vectors, the zero-row
+  deflation and sort copies, the exchanges and the syevd workspace of 2 n²).
+  There are no sub-meshes or rank groups: whole mesh or whole matrices per
+  rank. `_route=` on `batched` is the test-only override.
 - **Batch-layout input.** An eigh stack already at `P(('x','y'),None,None)`
   is solved rank-locally with no movement.
 - **CPU collectives.** Route (c) calls `warm_mesh_cliques(mesh)` first, so on

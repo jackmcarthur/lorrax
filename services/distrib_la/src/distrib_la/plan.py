@@ -227,6 +227,23 @@ def _round_bytes(op: str, mesh: Mesh, m: int, n: int, dtype: str) -> int:
     return int(compiled + vendor)
 
 
+def _local_eigh_errors(a, values, vectors):
+    """:func:`distrib_la._result_check.eigh_errors` against Herm(a) = (a + a^H)/2,
+    the matrix the local solver diagonalizes (``jnp.linalg.eigh`` symmetrizes
+    its input). a^H V X is read as (X^H V^H a)^H, so the face-tiled stack is
+    never transposed."""
+    from distrib_la._result_check import _norm, probes
+    x = probes(a.shape[-1], vectors.dtype)
+    vx = vectors @ x
+    left = jnp.conj(jnp.swapaxes(jnp.conj(jnp.swapaxes(vx, -1, -2)) @ a, -1, -2))
+    residual = _norm(0.5 * (a @ vx + left) - vectors @ (values[..., :, None] * x)) / (
+        jnp.maximum(_norm(a), jnp.finfo(values.dtype).tiny) * _norm(x))
+    orthogonality = _norm(jnp.conj(jnp.swapaxes(vectors, -1, -2)) @ vx - x) / _norm(x)
+    finite = jnp.all(jnp.isfinite(values))
+    return (jnp.where(finite, jnp.max(residual), jnp.inf),
+            jnp.where(finite, jnp.max(orthogonality), jnp.inf))
+
+
 def ensure_sharding(x, sharding: NamedSharding):
     """Put ``x`` on ``sharding`` — THE one FFI-adjacent reshard helper.
 
@@ -813,13 +830,15 @@ class Plan:
     def _checked_reshard(self, op: str, A, rounds: int):
         """Route (c) in ``rounds`` slices, its eigenpairs checked by the service's probes.
 
-        A failed check solves the stack again on this plan's whole-mesh
-        provider (itself checked), and refuses by name if no attempt passes
-        (GATE distrib_la_result_check). ``normal_eigh`` returns singular values
-        and right singular vectors, whose check is the caller's (open).
+        The check reads the Hermitian part of the input, which the local
+        solver diagonalizes (:func:`_local_eigh_errors`). A failed check
+        solves the stack again on this plan's whole-mesh provider (itself
+        checked), and refuses by name if no attempt passes (GATE
+        distrib_la_result_check). ``normal_eigh`` returns singular values and
+        right singular vectors and is not probe-checked here.
         """
         from distrib_la._batch_reshard import reshard_rounds_call, validate_batch_reshard_operands
-        from distrib_la._result_check import call_site, checked_eigh
+        from distrib_la._result_check import call_site, checked
         validate_batch_reshard_operands(op if op != "normal_eigh" else "eigh", self.mesh, (A,))
         A = ensure_sharding(A, NamedSharding(self.mesh, P(None, "x", "y")))
         site = call_site()
@@ -834,7 +853,8 @@ class Plan:
                 attempts = [solve]
                 if not self.is_native:
                     attempts.append(lambda a: self._scan_over_single((a,), {}))
-                fn = jax.jit(lambda a: checked_eigh(attempts, a, site=site))
+                fn = jax.jit(lambda a: checked("eigh", attempts, lambda r: _local_eigh_errors(a, *r),
+                                               (a,), site=site))
             _SCAN_CACHE[key] = fn
         return fn(A)
 
