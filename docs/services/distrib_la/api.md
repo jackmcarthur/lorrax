@@ -284,8 +284,9 @@ a `StackRoute`):
   part of the caller's module, and the decision line reports the sizing
   compile's wall (`sized in … s`).
 - **A failed sizing rejects.** A rank whose sizing compile fails posts a
-  failure sentinel instead of raising, so every rank reaches the exchange and
-  every rank rejects that candidate.
+  failure sentinel (`distrib_la.SIZING_FAILED`, larger than any room) instead
+  of raising, so every rank reaches the exchange and every rank rejects that
+  candidate. A caller that sizes its own programs posts the same sentinel.
 - **One plan per room.** A plan carries one room; a caller that keys
   programs on the plan (the face constructors floor their rooms to whole
   GiB) compiles again when its room changes.

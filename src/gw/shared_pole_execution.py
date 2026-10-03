@@ -312,7 +312,7 @@ def compiled_bytes(program, *args):
     any rank posts distrib_la's sizing-failure size, so every rank rejects it. Cached.
     """
     import sys
-    from distrib_la.plan import _SIZING_FAILED
+    from distrib_la import SIZING_FAILED
     from runtime.aot_memory import agreed_chunk, compiled_new_bytes
     key = program, jax.tree.structure(args), tuple((a.shape, str(a.dtype)) for a in jax.tree.leaves(args))
     if key in _SIZES:
@@ -322,7 +322,7 @@ def compiled_bytes(program, *args):
     except Exception as exc:        # any failure means "does not fit", on every rank
         print(f"shared-pole face program: sizing failed on process {jax.process_index()} "
               f"({type(exc).__name__}: {exc}); rejected on every rank", file=sys.stderr, flush=True)
-        local = _SIZING_FAILED
+        local = SIZING_FAILED
     _SIZES[key] = -agreed_chunk(-int(local))
     return _SIZES[key]
 
@@ -491,7 +491,7 @@ def face_batch_width(meta, resolution, *, mesh, ledger, upstream, side, sample_b
     constructor still admits every phase at its actual side.
     """
     import time
-    from distrib_la.plan import _SIZING_FAILED
+    from distrib_la import SIZING_FAILED
     from gw.shared_pole_capacity import ConstructorCapacity
 
     budget = ConstructorCapacity(meta, resolution, mesh_xy=mesh, ledger=ledger,
@@ -517,7 +517,7 @@ def face_batch_width(meta, resolution, *, mesh, ledger, upstream, side, sample_b
         if reduction['device_budget_status'] == 'PASS' or width == 1:
             return width, receipt
         room = reduction['available_device_bytes_per_rank'] - reduction['aggregate_bytes_per_rank'] + compiled
-        width = (width - 1 if compiled >= _SIZING_FAILED else
+        width = (width - 1 if compiled >= SIZING_FAILED else
                  max(1, min(width - 1, width * max(room, 0) // compiled)))
 
 
