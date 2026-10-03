@@ -457,9 +457,12 @@ def sector_batch_width(meta, resolution, recipe, routes, *, mesh, ledger, nq):
 @lru_cache(maxsize=None)
 def cross_parent_program(mesh, side):
     from gw.shared_pole_sectors import _cross_reduce_equations
+    from gw.shared_pole_local import zero_row_safe_eigh
     from gw.shared_pole_recipe import shared_real_pole_gates_ordered_v1 as gates
-    eigh_plan = face_eigh(mesh, side)
-    return face_program(partial(_cross_reduce_equations,mm=face_matmul(mesh),eigh=eigh_plan.batched,gates=gates,
+    # The joint CT metric carries exact-zero rows (inactive retained columns,
+    # held span widths); as in face_parent_program and the local CT program.
+    eigh = zero_row_safe_eigh(face_eigh(mesh, side).batched)
+    return face_program(partial(_cross_reduce_equations,mm=face_matmul(mesh),eigh=eigh,gates=gates,
                                 matrix_sharding=NamedSharding(mesh,P(None,"x","y"))),
                         mesh,outputs='cross')
 
