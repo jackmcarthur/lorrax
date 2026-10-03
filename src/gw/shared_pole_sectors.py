@@ -1328,7 +1328,7 @@ def sector_execution(meta, config, mu_bases, nq, *, mesh_xy, upstream):
     from gw.shared_pole_execution import constructor_execution, line_panel_count, selection_face_count
     recipe=meta.shared_pole_recipe
     ledger=meta.shared_pole_capacity
-    from gw.shared_pole_capacity import held_sector_bytes
+    from gw.shared_pole_capacity import held_sector_bytes, retained_span_columns
     extent=port_extent(mesh_xy)
     execution_rows=[]
     rows=[(1 if family==0 else 3)*basis.n_packed for family,basis in enumerate(mu_bases)]
@@ -1354,13 +1354,14 @@ def sector_execution(meta, config, mu_bases, nq, *, mesh_xy, upstream):
             ritz_budget=local_recipe['pole_budget'],retain_span=True,carry=held)
         side=route['conservative_pencil_side']
         budget=local_recipe['pole_budget']
-        held+=held_sector_bytes(local_meta.n_rmu_padded,side,
-                                side if budget is None else 2*min(side//2,int(budget)))
+        kept=side if budget is None else 2*min(side//2,int(budget))
+        held+=held_sector_bytes(local_meta.n_rmu_padded,side,kept)
         cap=local_recipe['line_direction_cap']
         execution_rows.append(dict(sector=('CC','TT')[family],mode=mode,
                                    packed_extent=local_meta.n_rmu_padded,
                                    line_width=extent(max(1,local_meta.n_rmu if cap is None else min(cap,local_meta.n_rmu))),
-                                   signed_side_bound=extent(2*local_recipe['pole_budget']) if local_recipe['pole_budget'] is not None else route['conservative_pencil_side'],**route))
+                                   signed_side_bound=extent(2*local_recipe['pole_budget']) if local_recipe['pole_budget'] is not None else route['conservative_pencil_side'],
+                                   span_columns=retained_span_columns(side,kept),**route))
     # CT retains both diagonal spans and both rectangular sample stacks. The
     # CC/TT admission alone cannot promise that their joint pencil fits one
     # rank. Resolve its conservative route before opening the bank so the
@@ -1382,7 +1383,7 @@ def sector_execution(meta, config, mu_bases, nq, *, mesh_xy, upstream):
         selection_faces=joint_faces,sample_batch=len(recipe['fit_ids'])-lines,parent_count=nq,
         retained_output_families=2,column_extent=extent,
         cross_original_sides=tuple(row['conservative_pencil_side'] for row in execution_rows),
-        cross_retained_side=sum(min(row['signed_side_bound'],row['conservative_pencil_side'])
+        cross_retained_side=sum(min(row['signed_side_bound'],row['span_columns'])
                                 for row in execution_rows),carry=held)
     resolved_execution=('face' if joint_mode=='face' or
                         any(row['mode']=='face' for row in execution_rows)
