@@ -33,7 +33,7 @@ def main():
     from jax.sharding import NamedSharding, PartitionSpec as P
     import distrib_la
     from distrib_la._batch_reshard import reshard_rounds_call
-    from distrib_la._result_check import ACCEPT, eigh_errors
+    from distrib_la._result_check import accept, eigh_errors
 
     mesh = RUNTIME.mesh
     px, py = int(mesh.shape["x"]), int(mesh.shape["y"])
@@ -74,7 +74,7 @@ def main():
         if route.route == "batch_reshard":
             _, wall_raw = timed(jax.jit(lambda x: reshard_rounds_call("eigh", mesh, x, rounds=route.rounds)), a)
             unchecked = f" unchecked={wall_raw:.3f}s check={(wall - wall_raw) / b * 1e3:+.1f}ms/eigh"
-        ok = finite and ascending and max(r, o) <= ACCEPT and gap <= 1e-10
+        ok = finite and ascending and max(r, o) <= accept(n) and gap <= 1e-10
         if not ok:
             failed.append(name)
         if lead:
