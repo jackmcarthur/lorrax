@@ -256,7 +256,8 @@ class GWProductionReport:
         # Every box plan carries a durable policy and accepted-rule receipt,
         # including ordinary shared-pole runs with debug disabled.
         if text.startswith(("Sigma quadrature receipt: ", "Response quadrature: ",
-                            "Sigma checkpoint: ", "Shared-pole constructor: ")):
+                            "Sigma checkpoint: ", "Shared-pole constructor: ",
+                            "Shared-pole sector constructor: ", "  distrib_la eigh stack ")):
             self.progress(text)
             return
         # Fixed-SC quadrature identity is a physics invariant, not backend
