@@ -262,15 +262,17 @@ def _refuse_nonfinite_spectrum(W, values, *, mesh, what):
     bad = np.flatnonzero(~np.all(np.isfinite(rows), axis=-1))
     if not bad.size:
         return
+    from distrib_la.tolerance import roundoff_tol
     health = np.asarray(_row_health_kernel(mesh)(W)).reshape(-1, 3)
+    tol = roundoff_tol(W.shape[-1], dtype=W.dtype)
     causes = []
     for i in bad[:8]:
         finite, defect, scale = health[i]
         ratio = defect / scale if scale > 0 else 0.0
         if not finite:
             cause = "input not finite"
-        elif ratio > 1e-12:
-            cause = f"input not Hermitian, max|W-W^H|/max|W| = {ratio:.3e} > 1e-12"
+        elif ratio > tol:
+            cause = f"input not Hermitian, max|W-W^H|/max|W| = {ratio:.3e} > {tol:.1e}"
         else:
             cause = (f"input finite and Hermitian (max|W-W^H|/max|W| = {ratio:.3e}, "
                      f"max|W| = {scale:.3e}); the eigensolver returned no spectrum")
@@ -522,9 +524,11 @@ def leading_eigenvectors(W, r, *, eigh_plan, column_extent,
     else:
         # A distributed solver never owns complete local rows; checking
         # arbitrary off-diagonal faces still requires peer communication.
+        from distrib_la.tolerance import roundoff_tol
         defect = jnp.max(jnp.abs(W - jnp.conj(jnp.swapaxes(W, -1, -2))), axis=(-2, -1))
         scale = jnp.max(jnp.abs(W), axis=(-2, -1))
-        if not bool(jnp.all(jnp.isfinite(scale) & (defect <= 1e-12 * scale))):
+        tol = roundoff_tol(W.shape[-1], dtype=W.dtype)
+        if not bool(jnp.all(jnp.isfinite(scale) & (defect <= tol * scale))):
             raise ValueError("leading_eigenvectors requires finite Hermitian W")
         if W.ndim == 2:
             s, q = eigh_plan.batched(W[None])
