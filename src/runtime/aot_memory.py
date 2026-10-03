@@ -370,6 +370,63 @@ def _is_cuda_platform(platform: str | None) -> bool:
         return False
 
 
+def buffer_peak_bytes(m) -> int:
+    """``temp + argument + output - alias`` of one ``CompiledMemoryStats``."""
+    return (int(m.temp_size_in_bytes) + int(m.argument_size_in_bytes)
+            + int(m.output_size_in_bytes) - int(m.alias_size_in_bytes))
+
+
+class ModuleDoesNotFit(RuntimeError):
+    """GATE xla_rematerialization: a compiled module is larger than the device."""
+
+
+@functools.lru_cache(maxsize=None)
+def _device_total(ordinal: int) -> int | None:
+    from runtime.xla_memory import cuda_device_total_bytes
+    return cuda_device_total_bytes(ordinal)
+
+
+def refuse_over_device(executable, module_name: str, platform: str) -> None:
+    """Refuse a compiled module whose buffers exceed the device.
+
+    Called once per compiled module, when jax builds its executor for the
+    first execution (``common.jax_compile_cache._install_device_fit_gate``).
+    XLA's rematerialization pass is off
+    (``runtime.disable_xla_rematerialization``), so nothing at compile time
+    shrinks a module that does not fit; it would fail at its first
+    allocation.  This refuses it at once instead.  The limit is the card's
+    total memory (``cuDeviceTotalMem``), a hard device limit: the buffers
+    alone (``temp + arguments + outputs - aliased``, no cuFFT scratch, no
+    NCCL or context) cannot fit above it.  It is not the memory budget;
+    ``memory_per_device_gb`` still only warns.  CUDA only.
+    """
+    if (platform not in ("cuda", "gpu")
+            or not hasattr(executable, "get_compiled_memory_stats")):
+        return
+    stats = executable.get_compiled_memory_stats()
+    peak = buffer_peak_bytes(stats)
+    try:
+        ordinal = int(executable.local_devices()[0].local_hardware_id or 0)
+    except Exception:                                      # noqa: BLE001
+        ordinal = 0
+    total = _device_total(ordinal)
+    if total is None or peak <= total:
+        return
+    raise ModuleDoesNotFit(
+        f"GATE xla_rematerialization: REFUSED module {module_name!r}: its "
+        f"compiled buffers need {peak / 1e9:.2f} GB per device (temp "
+        f"{int(stats.temp_size_in_bytes) / 1e9:.2f} + arguments "
+        f"{int(stats.argument_size_in_bytes) / 1e9:.2f} + outputs "
+        f"{int(stats.output_size_in_bytes) / 1e9:.2f} - aliased "
+        f"{int(stats.alias_size_in_bytes) / 1e9:.2f}), and the device has "
+        f"{total / 1e9:.2f} GB.  XLA's rematerialization pass is off in "
+        f"LORRAX, so this module cannot fit; it was stopped before it ran.  "
+        f"Reduce its peak: more ranks (most peaks fall as 1/P), fewer "
+        f"centroids or bands, or a smaller memory_per_device_gb where the "
+        f"stage's planner sizes from it.  See "
+        f"docs/architecture/memory-model.md#module-does-not-fit.")
+
+
 def aot_kernel_peak_bytes(compiled, *, platform: str | None = None
                           ) -> AotPeakBreakdown:
     """Per-rank peak HBM for ``compiled`` (a ``jax.stages.Compiled``),
@@ -390,10 +447,7 @@ def aot_kernel_peak_bytes(compiled, *, platform: str | None = None
     * CUDA, query fails -> 0 with ``measured = False``, announced once.
     """
     m = compiled.memory_analysis()
-    compiled_peak = (int(m.temp_size_in_bytes)
-                     + int(m.argument_size_in_bytes)
-                     + int(m.output_size_in_bytes)
-                     - int(m.alias_size_in_bytes))
+    compiled_peak = buffer_peak_bytes(m)
     # Some planners query an executable whose arguments are already part of
     # their measured resident floor (a shard-local slice is the motivating
     # case).  ``resident_increment`` is the exact extra buffer-assignment

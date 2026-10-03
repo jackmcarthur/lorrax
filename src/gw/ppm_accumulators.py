@@ -61,9 +61,8 @@ _WINDOW_COMPILED = {}
 # default schedule, the program before this change.
 # R82 (remat cloned a counter-indexed read past the counter's in-place increment, which only
 # remat does): every counter read in the window's loops sits behind an optimization barrier,
-# and rematerialization is off for this program, so the hazard cannot arise here.
-WINDOW_OVERLAP = {"xla_gpu_enable_latency_hiding_scheduler": True,
-                  "xla_disable_hlo_passes": "rematerialization"}
+# and rematerialization is off for every program (runtime.disable_xla_rematerialization).
+WINDOW_OVERLAP = {"xla_gpu_enable_latency_hiding_scheduler": True}
 
 
 @lru_cache(maxsize=16)

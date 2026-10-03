@@ -434,7 +434,7 @@ trip with the default schedule. The paired program holds a second node's
 live set (Ni 20³ P64: 9.76 → 16.95 GB compiled per rank), and its window
 line in gwjax.out's memory table says "two nodes per trip". Every
 counter-indexed read in its loops sits behind an optimization barrier and
-rematerialization is off for it, so the R82 hazard (a rematerialized slice
+rematerialization is off for every program, so the R82 hazard (a rematerialized slice
 read after the loop counter's in-place increment) cannot arise there.
 At the Ni 20³ P64 tile a node takes 0.549 → 0.492 s (claim 3115). The
 photon sectors run one node per trip.
