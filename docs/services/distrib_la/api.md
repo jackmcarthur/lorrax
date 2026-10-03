@@ -128,10 +128,11 @@ rank-deficient PSD responses with no zero row (n 432, most block sizes). So:
   and without the sentinels, then gathered on every rank when the matrix,
   its vectors and the solver's copy fit the plan's `budget_bytes` (1 GiB
   without one).
-- Every route-(c) eigh is checked the same way on its face-layout result; a
-  failed check solves the stack again on the plan's whole-mesh provider
-  (itself checked), and a native plan refuses. Measured cost at P4: 3.0 ms per
-  eigh at n = 3328 (5 % of the solve).
+- Every route-(c) eigh is checked the same way on its face-layout result,
+  against the Hermitian part of the input (the local solver symmetrizes). A
+  failed check solves again shifted, then gathered when it fits (the rule
+  above), and refuses by name. Measured cost at P4: 0.3–4.1 ms per eigh at
+  n = 3328–18304 (at most 0.2 % of the solve).
 - Every distributed LU solve (`plan('solve_lu').batched`, `factor`/`solve`)
   is checked on its actual solution through sketches taken before the library
   consumes A and B: ‖Wᴴ(AX − B)‖/(√k (‖A‖‖X‖ + ‖B‖)) within `ACCEPT`. Its
@@ -222,18 +223,20 @@ Nothing crosses the host.
   `(B, n, n)` passes its room per rank beside its own live set,
   `plan('eigh', mesh, n=n, backend='distributed', budget_bytes=room)`, and
   the service decides each stack (`Plan.stack_route`, a `StackRoute`):
-  - route (c) when the compiled program of one slice of the stack fits the
-    room: the slice's exchanges, local eigh and inverse exchanges (arguments,
-    outputs, temporaries) plus the local solver's vendor-reported workspace per
-    whole matrix. The most whole matrices per rank that fit win, and the stack
-    runs in that many equal slices (rounds, one `lax.scan`);
+  - route (c) when the compiled program that runs the stack fits the room:
+    its slices' exchanges, local eighs, inverse exchanges and result check
+    (outputs and temporaries; the caller's operand is already in its live
+    set) plus cuSOLVER's reported workspace per whole matrix. The most whole
+    matrices per rank that fit win, and the stack runs in that many slices,
+    one `lax.scan` over slice starts writing the face outputs in place;
   - the whole-mesh provider otherwise, including room 0.
   The decision is compiled, never a formula, and is the same on every rank
   (the room is a caller value every rank shares). It is printed once per
-  (op, B, n, dtype, room) on rank 0 and listed by `describe()`. Measured
-  per-matrix compiled sizes at complex128 (one A100, route (c) at one
-  matrix per rank): about 7 n² × 16 B (input, vectors, the zero-row
-  deflation and sort copies, the exchanges and the syevd workspace of 2 n²).
+  (op, B, n, dtype, room) by `new_stack_routes()`, which a driver prints
+  through its reporter, and listed by `describe()`. Per whole matrix at
+  complex128 a rank needs 7 n² × 16 B: 3 n² compiled (input, vectors, one
+  copy) and 4 n² of cuSOLVER syevd workspace (one A100, n = 3328–18304),
+  so n = 9152 needs 9.4 GB and n = 18304 needs 37.6 GB.
   There are no sub-meshes or rank groups: whole mesh or whole matrices per
   rank. `_route=` on `batched` is the test-only override.
 - **Batch-layout input.** An eigh stack already at `P(('x','y'),None,None)`

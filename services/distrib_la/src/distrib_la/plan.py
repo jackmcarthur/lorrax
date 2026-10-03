@@ -216,31 +216,51 @@ def new_stack_routes() -> list[str]:
 
 
 @lru_cache(maxsize=None)
-def _round_bytes(op: str, mesh: Mesh, m: int, n: int, dtype: str) -> int:
-    """Per-rank device bytes of one route-(c) slice of ``m`` matrices.
+def _stack_bytes(op: str, mesh: Mesh, nb: int, n: int, dtype: str, rounds: int) -> int:
+    """Per-rank device bytes route (c) adds for a face stack of ``nb`` matrices in ``rounds``.
 
-    The compiled size of the slice's actual program (the exchanges, the local
-    eigh and the inverse exchanges: arguments, outputs and temporaries), plus
-    the local solver's runtime workspace, which the vendor reports and the
-    compiler does not count, once per whole matrix a rank holds.
+    The compiled size of the program that runs (:func:`_reshard_stack_program`:
+    the slices' exchanges, local eighs, inverse exchanges and the result
+    check; outputs and temporaries, the caller's operand excluded) plus the
+    local solver's runtime workspace for one slice, which cuSOLVER reports
+    and the compiler does not count.
     """
     import numpy as np
-    from distrib_la._batch_reshard import reshard_program
-    from distrib_la.workspace import _vendor_query
     from distrib_la.resolve import mesh_platform
+    from distrib_la.workspace import _vendor_query
     face = NamedSharding(mesh, P(None, "x", "y"))
-    program = reshard_program(op, mesh, (((m, n, n), dtype),))
-    stats = program.lower(jax.ShapeDtypeStruct((m, n, n), np.dtype(dtype), sharding=face)
+    program = _reshard_stack_program(op, mesh, (nb, n, n), dtype, rounds, "admission")
+    stats = program.lower(jax.ShapeDtypeStruct((nb, n, n), np.dtype(dtype), sharding=face)
                           ).compile().memory_analysis()
     if stats is None:
         raise RuntimeError("route (c) admission: the compiler returned no memory analysis")
-    compiled = (stats.argument_size_in_bytes + stats.output_size_in_bytes
-                + stats.temp_size_in_bytes - stats.alias_size_in_bytes)
+    compiled = stats.output_size_in_bytes + stats.temp_size_in_bytes - stats.alias_size_in_bytes
     vendor = 0
     if mesh_platform(mesh) == "CUDA":
-        per_rank = -(-m // (int(mesh.shape["x"]) * int(mesh.shape["y"])))
+        ranks = int(mesh.shape["x"]) * int(mesh.shape["y"])
+        per_rank = -(-(-(-nb // rounds)) // ranks)
+        # One cuSOLVER workspace per whole matrix (4 n^2 elements at
+        # complex128, the size jaxlib's syevBatched allocates at runtime).
         vendor = per_rank * (_vendor_query(0, "eigh", (n,), np.dtype(dtype).str)[0] + 4)
     return int(compiled + vendor)
+
+
+@lru_cache(maxsize=None)
+def _reshard_stack_program(op: str, mesh: Mesh, shape: tuple, dtype: str, rounds: int, site: str):
+    """The jitted route-(c) program for one face stack: ``rounds`` slices
+    (:func:`distrib_la._batch_reshard.reshard_rounds_call`), and for an eigh
+    the service's probe check on the Hermitian part of the input
+    (:func:`_local_eigh_errors`), refused by name (GATE
+    distrib_la_result_check) when it fails. ``normal_eigh`` (polar's right
+    singular vectors) is not probe-checked here."""
+    from distrib_la._batch_reshard import reshard_rounds_call
+    from distrib_la._result_check import checked
+    solve = partial(reshard_rounds_call, op, mesh, rounds=int(rounds))
+    out = (NamedSharding(mesh, P()), NamedSharding(mesh, P(None, "x", "y")))
+    if op == "normal_eigh":
+        return jax.jit(solve, out_shardings=out)
+    return jax.jit(lambda a: checked("eigh", (solve,), lambda r: _local_eigh_errors(a, *r),
+                                     (a,), site=site), out_shardings=out)
 
 
 def _local_eigh_errors(a, values, vectors):
@@ -581,8 +601,8 @@ class Plan:
         an eigh plan built with ``budget_bytes`` (the caller's room per rank,
         beside its own live set) and no explicit route. Then capacity decides:
         the stack runs route (c), one or more whole matrices per rank, when
-        the compiled program of one slice of it fits the room
-        (:func:`_round_bytes`, compiled <= room, never a formula); the stack
+        the compiled program that runs it fits the room (:func:`_stack_bytes`,
+        compiled <= room, never a formula); the stack
         is cut into as many equal slices (rounds) as that needs. When not even
         one whole matrix per rank fits, it runs on the whole mesh. The room is
         a caller value every rank shares and the compiled size is the same on
@@ -610,7 +630,7 @@ class Plan:
         return decided
 
     def _decide_stack(self, op, nb, n, dtype) -> StackRoute:
-        """Route (c) at the most whole matrices per rank whose slice compiles within the room."""
+        """Route (c) at the most whole matrices per rank whose program compiles within the room."""
         ranks = int(self.mesh.shape["x"]) * int(self.mesh.shape["y"])
         room, provider = int(self.budget_bytes), self.batched_route
         if n % int(self.mesh.shape["x"]) or n % int(self.mesh.shape["y"]) or room <= 0:
@@ -619,7 +639,7 @@ class Plan:
         while per_rank >= 1:
             rounds = -(-(-(-nb // ranks)) // per_rank)
             m = -(-nb // rounds)
-            tried, compiled = -(-m // ranks), _round_bytes(op, self.mesh, m, n, dtype)
+            tried, compiled = -(-m // ranks), _stack_bytes(op, self.mesh, nb, n, dtype, rounds)
             if compiled <= room:
                 return StackRoute(ROUTE_BATCH_RESHARD, tried, rounds, compiled, room)
             per_rank = min(per_rank - 1, per_rank * room // compiled)
@@ -843,35 +863,13 @@ class Plan:
         return self._checked_reshard(op, A, self.stack_route(A.shape, A.dtype, op).rounds)
 
     def _checked_reshard(self, op: str, A, rounds: int):
-        """Route (c) in ``rounds`` slices, its eigenpairs checked by the service's probes.
-
-        The check reads the Hermitian part of the input, which the local
-        solver diagonalizes (:func:`_local_eigh_errors`). A failed check
-        solves the stack again on this plan's whole-mesh provider (itself
-        checked), and refuses by name if no attempt passes (GATE
-        distrib_la_result_check). ``normal_eigh`` returns singular values and
-        right singular vectors and is not probe-checked here.
-        """
-        from distrib_la._batch_reshard import reshard_rounds_call, validate_batch_reshard_operands
-        from distrib_la._result_check import call_site, checked
+        """Route (c) in ``rounds`` slices, checked (:func:`_reshard_stack_program`)."""
+        from distrib_la._batch_reshard import validate_batch_reshard_operands
+        from distrib_la._result_check import call_site
         validate_batch_reshard_operands(op if op != "normal_eigh" else "eigh", self.mesh, (A,))
         A = ensure_sharding(A, NamedSharding(self.mesh, P(None, "x", "y")))
-        site = call_site()
-        key = ("reshard", op, mesh_key(self.mesh), self.backend, tuple(A.shape), str(A.dtype),
-               int(rounds), site)
-        fn = _SCAN_CACHE.get(key)
-        if fn is None:
-            solve = partial(reshard_rounds_call, op, self.mesh, rounds=int(rounds))
-            if op == "normal_eigh":
-                fn = jax.jit(solve)
-            else:
-                attempts = [solve]
-                if not self.is_native:
-                    attempts.append(lambda a: self._scan_over_single((a,), {}))
-                fn = jax.jit(lambda a: checked("eigh", attempts, lambda r: _local_eigh_errors(a, *r),
-                                               (a,), site=site))
-            _SCAN_CACHE[key] = fn
-        return fn(A)
+        return _reshard_stack_program(op, self.mesh, tuple(int(v) for v in A.shape), str(A.dtype),
+                                      int(rounds), call_site())(A)
 
     @staticmethod
     def _reshard_options(kwargs: dict):

@@ -13,12 +13,13 @@ batch. The service runs the stack as whole matrices per rank (route (c), the
 local solver) when the compiled program of one slice fits that room, in as
 many slices as it needs, and on the whole mesh otherwise. The n x n eighs
 (directions, infinity, passivity) take route (c) almost always; a side-sized
-Gram eigh takes it only where about 7 n^2 x 16 bytes per matrix fits beside
-the batch (n = 9152: 10 GB; n = 18304: 39 GB). Each decision is printed once
+Gram eigh takes it only where 7 n^2 x 16 bytes per matrix (3 n^2 compiled,
+4 n^2 cuSOLVER workspace) fits beside the batch (n = 9152: 9.4 GB; n = 18304:
+37.6 GB). Each decision is printed once
 after the constructor line, `distrib_la eigh stack B x n^2 complex128:
 ...`, and the constructor line now names the face batch and its eigh rooms.
-Every route-(c) eigh is checked against the service's probes, with the whole
-mesh as its retry. Results move by eigenvector gauge only: Fe 4^3 forced-face
+Every route-(c) eigh is checked against the service's probes and refused by
+name if it fails. Results move by eigenvector gauge only: Fe 4^3 forced-face
 SC maps 0-2, scalar and bispinor, agree with local main to 0.15 ueV. On the
 same deck the face constructor's maps 1-2 drop from about 15 s to 2 s on 4
 A100s. Decks do not change.

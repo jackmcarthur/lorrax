@@ -556,13 +556,15 @@ def reshard_program(op: str, mesh: Mesh, signature, rcond=None):
 
 
 def reshard_rounds_call(op: str, mesh: Mesh, A, *, rounds: int):
-    """Route (c) on a face stack in ``rounds`` equal slices, one ``lax.scan``.
+    """Route (c) on a face stack in ``rounds`` slices of ``m = ceil(B/rounds)`` matrices.
 
-    Each slice of ``ceil(B/rounds)`` matrices runs :func:`batch_reshard_call`
-    (exchange, local eigh, inverse exchange), so a rank holds one slice's
-    whole matrices at a time. The stack is padded with zero matrices to
-    ``rounds`` equal slices and the padding dropped afterwards. ``op`` is
-    ``eigh``, ``checked_eigh`` or ``normal_eigh``; outputs follow
+    One ``lax.scan`` over the slice starts: each slice runs
+    :func:`batch_reshard_call` (exchange, local eigh, inverse exchange) and
+    is written in place into the face outputs, so a rank holds one slice's
+    whole matrices at a time beside the outputs. The last slice starts at
+    ``B - m``; the matrices it shares with the previous slice are solved
+    again and written with the same values. ``op`` is ``eigh``,
+    ``checked_eigh`` or ``normal_eigh``; outputs follow
     :func:`batch_reshard_call`.
     """
     rounds = int(rounds)
@@ -570,19 +572,28 @@ def reshard_rounds_call(op: str, mesh: Mesh, A, *, rounds: int):
         return batch_reshard_call(op, mesh, (A,))
     nb, n = int(A.shape[0]), int(A.shape[-1])
     m = -(-nb // rounds)
-    pad = rounds * m - nb
     validate_batch_reshard_operands(op, mesh, (jax.ShapeDtypeStruct((m, n, n), A.dtype),))
     key = ("rounds", op, mesh_key(mesh), nb, n, str(A.dtype), rounds)
     fn = _JIT_CACHE.get(key)
     if fn is None:
         program = reshard_program(op, mesh, (((m, n, n), str(A.dtype)),))
-        slices = NamedSharding(mesh, P(None, None, "x", "y"))
+        face, replicated = NamedSharding(mesh, P(None, "x", "y")), NamedSharding(mesh, P())
+        starts = jnp.asarray([min(r * m, nb - m) for r in range(rounds)], jnp.int32)
+        real = jnp.zeros((), A.dtype).real.dtype
 
-        @jax.jit
+        @partial(jax.jit, out_shardings=(replicated, face))
         def fn(a):
-            a = jnp.pad(a, ((0, pad), (0, 0), (0, 0))).reshape(rounds, m, n, n)
-            a = jax.lax.with_sharding_constraint(a, slices)
-            _, (w, z) = jax.lax.scan(lambda carry, x: (carry, program(x)), None, a)
-            return w.reshape(rounds * m, -1)[:nb], z.reshape(rounds * m, n, n)[:nb]
+            def body(carry, start):
+                w_all, z_all = carry
+                x = jax.lax.with_sharding_constraint(
+                    jax.lax.dynamic_slice_in_dim(a, start, m, axis=0), face)
+                w, z = program(x)
+                return (jax.lax.dynamic_update_slice_in_dim(w_all, w.astype(w_all.dtype), start, axis=0),
+                        jax.lax.with_sharding_constraint(
+                            jax.lax.dynamic_update_slice_in_dim(z_all, z, start, axis=0), face)), None
+            init = (jnp.zeros((nb, n), real),
+                    jax.lax.with_sharding_constraint(jnp.zeros_like(a), face))
+            (w, z), _ = jax.lax.scan(body, init, starts)
+            return w, z
         _JIT_CACHE[key] = fn
     return fn(A)
