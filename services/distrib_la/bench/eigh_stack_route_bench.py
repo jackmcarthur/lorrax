@@ -60,7 +60,7 @@ def main():
         route = p.stack_route(a.shape, a.dtype)
         if lead:
             for line in distrib_la.new_stack_routes():
-                print("distrib_la eigh " + line, flush=True)
+                print("distrib_la " + line, flush=True)
         (w, v), wall = timed(jax.jit(p.batched), a)
         (ws, vs), wall_scan = timed(jax.jit(lambda x: p.batched(x, _route="scan")), a)
         r, o = (float(x) for x in errors(a, w, v))

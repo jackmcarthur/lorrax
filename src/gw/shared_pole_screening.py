@@ -22,7 +22,7 @@ def _print_eigh_stack_routes(print_fn):
     """The route distrib_la chose for each new eigh stack shape, one line each."""
     import distrib_la
     for line in distrib_la.new_stack_routes():
-        print_fn("  distrib_la eigh " + line)
+        print_fn("  distrib_la " + line)
 
 
 def _json(value):
