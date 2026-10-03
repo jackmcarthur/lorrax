@@ -234,8 +234,7 @@ def route_summary(mode, receipt):
     budget = next((row['device_budget_bytes_per_rank'] for row in
                    (receipt.get("local_selection"), receipt.get("local_reduction")) if row), None)
     price = "" if budget is None else f"; local parent GB/rank: {rows} of {budget / 1e9:.1f}"
-    batch = receipt.get("face_batch") or (
-        {"parent_batch": receipt["parent_batch"]} if "parent_batch" in receipt else None)
+    batch = receipt.get("face_batch")
     if batch is not None:
         gb = lambda v: "none" if v is None else f"{v / 1e9:.1f}"
         rooms = receipt.get("face_eigh_room_bytes_per_rank") or {}
@@ -558,6 +557,7 @@ def sector_batch_width(meta, resolution, recipe, routes, *, mesh, ledger, nq):
     ``cross_parent_program`` (``sector_program_bytes_per_rank``).
     """
     import copy
+    import time
     from gw.shared_pole_recipe import shared_real_pole_gates_ordered_v1 as gates
 
     joint = copy.copy(meta)
@@ -576,21 +576,25 @@ def sector_batch_width(meta, resolution, recipe, routes, *, mesh, ledger, nq):
                          + charge['packed_extent'] * current['line_width'])
     shapes = [dict(rows=row['packed_extent'], side=row['conservative_pencil_side'],
                    infinity_width=row['infinity_width'], ordered=True, odd_moments=True) for row in routes]
-    sizes = {}
+    sizes, seconds = {}, dict(CC=0.0, TT=0.0, CT=0.0)
 
     def program_bytes(width):
-        for name, shape, row in zip(('CC', 'TT'), shapes, routes):
-            sizes[name] = face_reduction_bytes(
-                mesh, width, keep_budget=row['pole_budget'], carrier=None, retain_span=True,
-                gram_keep=gates['normalized_gram_keep']['sector_threshold'], infinity_arrays=5, **shape)
-        sizes['CT'] = face_cross_bytes(mesh, width, shapes, spans)
+        sizers = {name: partial(face_reduction_bytes, mesh, width, keep_budget=row['pole_budget'], carrier=None,
+                                retain_span=True, infinity_arrays=5, **shape,
+                                gram_keep=gates['normalized_gram_keep']['sector_threshold'])
+                  for name, shape, row in zip(('CC', 'TT'), shapes, routes)}
+        sizers['CT'] = partial(face_cross_bytes, mesh, width, shapes, spans)
+        for name, size in sizers.items():
+            started = time.perf_counter()
+            sizes[name] = size()
+            seconds[name] += time.perf_counter() - started
         return max(sizes.values())
     width, receipt = face_batch_width(
         joint, resolution, mesh=mesh, ledger=ledger, upstream=ledger.live_stages, side=side, nq=nq,
         program_bytes=program_bytes, eigen_side=eigen_side,
         extra=lambda width: int(np.ceil(16 * width * ((4 * dense + 8) * joint.n_rmu_padded**2 + cross)
                                         / mesh.size)))
-    return width, dict(receipt, sector_program_bytes_per_rank=sizes)
+    return width, dict(receipt, sector_program_bytes_per_rank=sizes, sector_program_seconds=seconds)
 
 
 @lru_cache(maxsize=None)
