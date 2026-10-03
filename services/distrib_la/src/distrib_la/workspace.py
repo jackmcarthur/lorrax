@@ -77,7 +77,7 @@ def _workspace_details(plan, op, shapes, dtype):
     px, py = int(plan.mesh.shape['x']), int(plan.mesh.shape['y'])
     local = isinstance(plan, Plan) and (plan.is_native or (
         (op != 'eigh' or len(shapes[0]) == 3)
-        and plan.route_for(shapes[0], dtype) == ROUTE_BATCH_RESHARD))
+        and plan.known_route(shapes[0], dtype) == ROUTE_BATCH_RESHARD))
     if op == 'eigh':
         if not isinstance(plan, Plan) or plan.op != 'eigh':
             raise ValueError('eigh query requires an eigh Plan')
@@ -100,7 +100,7 @@ def _workspace_details(plan, op, shapes, dtype):
         # workspace/info per member rather than assume serial reuse.
         batch = int(shapes[0][0]) if local and len(shapes[0]) == 3 else 1
         copies = (-(-batch // (px * py))
-                  if plan.route_for(shapes[0], dtype) == ROUTE_BATCH_RESHARD else batch)
+                  if plan.known_route(shapes[0], dtype) == ROUTE_BATCH_RESHARD else batch)
         scratch = copies*(device + (4 if local else 0))
         checked = 0
         if not local:

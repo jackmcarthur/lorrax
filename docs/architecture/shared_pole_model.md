@@ -285,7 +285,11 @@ panels to the round extent (`round_tables`; ordered originals and mirrors as two
 halves of one extent), assembles and reduces its pencil with local dense kernels
 and sorts its poles; synthetic slots are skipped. Otherwise the **face route**
 runs a parent batch on the complete mesh with `distrib_la` GEMM/`eigh`, both
-matrix axes distributed and only spectra and masks replicated. Its eigh stacks
+matrix axes distributed and only spectra and masks replicated. An ordered
+face reduction solves its kept span on `face_ritz_carrier` (the pole budget
+with its per-rank tile on the extent ladder), as a local round does on its
+Ritz carrier: the Schur and final eighs run at the carrier and twice it
+(CrI3 24×24 on 4×4: 6144 and 12288 instead of 9152 and 18304). Its eigh stacks
 (infinity, directions, partners, passivity, the Gram reduction, CT and the
 Cauchy check) go to `distrib_la` with the room beside the admitted batch
 (`face_eigh_room` of the selection or reduction admission row, the sector

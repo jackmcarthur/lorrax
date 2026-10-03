@@ -301,8 +301,10 @@ def face_eigh(mesh, n, room=None):
 
     ``room`` is the caller's device bytes per rank beside its admitted live
     set (``face_eigh_room``), the same on every rank. distrib_la decides each
-    stack from it: whole matrices per rank where one slice compiles within the
-    room, else the whole mesh. Without a room every stack runs on the mesh.
+    stack from it: whole matrices per rank where the program that runs it
+    compiles within the room, else the whole mesh, and hands back an earlier
+    plan when none of its decisions changes at this room. Without a room
+    every stack runs on the mesh.
     """
     from distrib_la import plan
     return plan('eigh',mesh,n=int(n),backend='distributed',budget_bytes=int(room or 0))
@@ -328,20 +330,22 @@ def face_ritz_carrier(mesh, keep_budget):
 
 
 @lru_cache(maxsize=None)
-def face_parent_program(mesh,ordered,odd_moments,keep_budget,retain_span,side,gram_keep=None,room=None,
+def face_parent_program(mesh,ordered,odd_moments,keep_budget,retain_span,side,gram_keep=None,eigh_plan=None,
                         carrier=None):
     """Retained static-layout executable builder; all state values are operands.
 
-    ``room`` is what the pencil's eigh stacks are decided against
-    (``face_eigh``); ``carrier`` (``face_ritz_carrier``) solves an ordered
-    pencil's kept span on that many columns, None keeping the whole H'_vv side.
+    ``eigh_plan`` (``face_eigh`` at the reduction's room) decides the pencil's
+    eigh stacks; the program is keyed on it, and distrib_la hands back the same
+    plan for a room at which none of its decisions changes. ``carrier``
+    (``face_ritz_carrier``) solves an ordered pencil's kept span on that many
+    columns, None keeping the whole H'_vv side.
     """
     from gw.shared_pole_local import solve_parent_pencil
     from gw.shared_pole_gates import sort_shared_pole_columns
     from gw.shared_pole_recipe import shared_real_pole_gates_ordered_v1, shared_real_pole_gates_v1_r3b
     gates=shared_real_pole_gates_ordered_v1 if ordered else shared_real_pole_gates_v1_r3b
     mm=face_matmul(mesh)
-    eigh=face_eigh(mesh,side,room).batched
+    eigh=(face_eigh(mesh,side) if eigh_plan is None else eigh_plan).batched
     def body(points,order,active,qs,os,ds,infinity):
         def pack(parts):
             panels = jnp.concatenate((*parts, jnp.zeros_like(parts[0][..., :int(mesh.shape["y"])])), axis=-1)
@@ -371,8 +375,8 @@ def face_reduce_round(states,infinity,tables,*,real,mesh,budget,ordered,odd_mome
     side=tables['active'].shape[-1]
     if admit:
         budget.plan(side,phase='reduction')
-    program=face_parent_program(mesh,ordered,odd_moments,keep_budget,retain_span,side,gram_keep,room,
-                                None if carrier is None else int(carrier))
+    program=face_parent_program(mesh,ordered,odd_moments,keep_budget,retain_span,side,gram_keep,
+                                face_eigh(mesh,side,room),None if carrier is None else int(carrier))
     result=program(jnp.asarray(tables['points']),jnp.asarray(tables['order']),
         jnp.asarray(tables['active']),tuple(s[1] for s in states),
         tuple(s[2] for s in states),tuple(s[3] for s in states),tuple(infinity))
@@ -508,12 +512,13 @@ def sector_batch_width(meta, resolution, recipe, routes, *, mesh, ledger, nq):
 
 
 @lru_cache(maxsize=None)
-def cross_parent_program(mesh, side, room=None):
+def cross_parent_program(mesh, eigh_plan):
+    """The CT joint reduction on the whole mesh, keyed on its eigh plan (``face_eigh``)."""
     from gw.shared_pole_sectors import _cross_reduce_equations
     from gw.shared_pole_recipe import shared_real_pole_gates_ordered_v1 as gates
     # The joint CT metric carries exact-zero rows (inactive retained columns,
     # held span widths); the service eigh deflates them and checks its result.
-    eigh = face_eigh(mesh, side, room).batched
+    eigh = eigh_plan.batched
     return face_program(partial(_cross_reduce_equations,mm=face_matmul(mesh),eigh=eigh,gates=gates,
                                 matrix_sharding=NamedSharding(mesh,P(None,"x","y"))),
                         mesh,outputs='cross')

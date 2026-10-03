@@ -514,12 +514,9 @@ def leading_eigenvectors(W, r, *, eigh_plan, column_extent,
     if layout == 'batch':
         from distrib_la._batch_reshard import batch_layout_eigh_call
         s, q = batch_layout_eigh_call("checked_eigh", eigh_plan.mesh, W, real_rows=real_rows)
-    elif eigh_plan.stack_route(W.shape if W.ndim == 3 else (1,) + W.shape, W.dtype,
-                               "checked_eigh", traced=False).route == ROUTE_BATCH_RESHARD:
-        s, q = eigh_plan.reshard_stack("checked_eigh", W if W.ndim == 3 else W[None])
-        if W.ndim == 2:
-            s, q = s[0], q[0]
     else:
+        # Checked once on the faces, before either route: a non-Hermitian W
+        # is the caller's, refused by name, never a solver failure to retry.
         # A distributed solver never owns complete local rows; checking
         # arbitrary off-diagonal faces still requires peer communication.
         from distrib_la.tolerance import roundoff_tol
@@ -528,6 +525,7 @@ def leading_eigenvectors(W, r, *, eigh_plan, column_extent,
         tol = roundoff_tol(W.shape[-1], dtype=W.dtype)
         if not bool(jnp.all(jnp.isfinite(scale) & (defect <= tol * scale))):
             raise ValueError("leading_eigenvectors requires finite Hermitian W")
+        # One decision: Plan.batched runs the stack on the route it decides.
         if W.ndim == 2:
             s, q = eigh_plan.batched(W[None])
             s, q = s[0], q[0]

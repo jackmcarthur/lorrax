@@ -223,16 +223,19 @@ def construct_sector_poles(bank, meta, config, *, mesh_xy, output):
         for row in execution_rows:
             row['batch_admission'] = batch_admission
             row['parent_batch'] = batch_width
-    # distrib_la decides the face eigh stacks against the room beside the
-    # admitted sector batch (whole matrices per rank where they fit).
-    from gw.shared_pole_capacity import face_eigh_room
-    face_room = face_eigh_room(batch_admission) if resolved_execution == 'face' else None
-    for row in execution_rows if resolved_execution == 'face' else ():
-        row['face_eigh_room_bytes_per_rank'] = dict(selection=face_room, reduction=face_room)
     sector_models,model_residence=_sector_model_residence(meta,config,header,bank['mu_bases'],
         execution_rows,mesh_xy=mesh_xy,root=root,upstream=upstream,route=resolved_execution)
     if sector_models is not None:
         upstream=ledger.live_stages=(*upstream,model_residence['stage'])
+    # distrib_la decides the face eigh stacks against the room beside the
+    # admitted sector batch and the resident models reserved after it (whole
+    # matrices per rank where they fit).
+    from gw.shared_pole_capacity import face_eigh_room
+    face_room = (face_eigh_room(batch_admission, model_residence['payload_bytes_per_rank']
+                                if sector_models is not None else 0)
+                 if resolved_execution == 'face' else None)
+    for row in execution_rows if resolved_execution == 'face' else ():
+        row['face_eigh_room_bytes_per_rank'] = dict(selection=face_room, reduction=face_room)
     for ids,real,slots,execution in sector_round_schedule(
             bank,header,meta,config,mesh_xy,execution=resolved_execution,
             batch_width=batch_width):
@@ -1059,8 +1062,10 @@ def reduce_cross_round(charge, transverse, cross, moments, *, mesh_xy, eigh_plan
     """
     from gw.shared_pole_execution import is_face,cross_parent_program
     if is_face(charge[4]):
+        from gw.shared_pole_execution import face_eigh
         side=charge[4].shape[-1]+transverse[4].shape[-1]
-        return cross_parent_program(mesh_xy,side,eigh_plan.budget_bytes)(charge,transverse,cross,moments)
+        return cross_parent_program(mesh_xy,face_eigh(mesh_xy,side,eigh_plan.budget_bytes))(
+            charge,transverse,cross,moments)
     return _local_cross_parent_program(mesh_xy,eigh_plan.native_fn)(charge,transverse,cross,moments)
 
 

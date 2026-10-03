@@ -171,17 +171,17 @@ def constructor_eigenplan(mesh_xy, side, execution, room=None):
                            batched_route="batch_reshard")
 
 
-def face_eigh_room(admission, retained_outputs=0):
+def face_eigh_room(admission, held=0):
     """Room per rank for a face constructor's eigh stacks, or None.
 
     ``admission`` is a face batch admission row (``face_batch_width``,
-    ``sector_batch_width``) and ``retained_outputs`` the receipt's upper bound
-    on the factors every parent keeps, when the row does not hold them. Both
-    are shape prices, so every rank agrees on the room. It is floored to a
-    whole GiB, so SC maps whose admissions differ by less share programs.
+    ``sector_batch_width``) and ``held`` what is live beside it that the row
+    does not hold: the receipt's upper bound on the factors every parent keeps,
+    or the sector models reserved after the admission. Both are shape prices,
+    so every rank agrees on the room. It is floored to a whole GiB.
     """
     room = (int(admission['available_device_bytes_per_rank'])
-            - int(admission['aggregate_bytes_per_rank']) - int(retained_outputs))
+            - int(admission['aggregate_bytes_per_rank']) - int(held))
     return (room >> 30) << 30 if room >= 1 << 30 else None
 
 

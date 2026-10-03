@@ -557,7 +557,7 @@ def reshard_program(op: str, mesh: Mesh, signature, rcond=None):
     return fn
 
 
-def reshard_rounds_call(op: str, mesh: Mesh, A, *, rounds: int):
+def reshard_rounds_call(op: str, mesh: Mesh, A, *, rounds: int, shifted: bool = False):
     """Route (c) on a face stack in ``rounds`` slices of ``m = ceil(B/rounds)`` matrices.
 
     One ``lax.scan`` over the slice starts: each slice runs
@@ -567,18 +567,29 @@ def reshard_rounds_call(op: str, mesh: Mesh, A, *, rounds: int):
     ``B - m``; the matrices it shares with the previous slice are solved
     again and written with the same values. ``op`` is ``eigh``,
     ``checked_eigh`` or ``normal_eigh``; outputs follow
-    :func:`batch_reshard_call`.
+    :func:`batch_reshard_call`. ``shifted`` solves each slice as the checked
+    eigh's shifted retry (:func:`distrib_la._result_check.shifted`), its
+    vectors re-orthonormalized by GEMMs on that slice, so the retry holds no
+    more whole matrices per rank than the first attempt.
     """
     rounds = int(rounds)
-    if rounds == 1:
-        return batch_reshard_call(op, mesh, (A,))
     nb, n = int(A.shape[0]), int(A.shape[-1])
     m = -(-nb // rounds)
     validate_batch_reshard_operands(op, mesh, (jax.ShapeDtypeStruct((m, n, n), A.dtype),))
-    key = ("rounds", op, mesh_key(mesh), nb, n, str(A.dtype), rounds)
+
+    def slice_program():
+        program = reshard_program(op, mesh, (((m, n, n), str(A.dtype)),))
+        if not shifted:
+            return program
+        from distrib_la._result_check import shifted as shift
+        from distrib_la.matmul import matmul
+        return shift(program, matmul=partial(matmul, mesh=mesh))
+    if rounds == 1:
+        return slice_program()(A)
+    key = ("rounds", op, mesh_key(mesh), nb, n, str(A.dtype), rounds, bool(shifted))
     fn = _JIT_CACHE.get(key)
     if fn is None:
-        program = reshard_program(op, mesh, (((m, n, n), str(A.dtype)),))
+        program = slice_program()
         face, replicated = NamedSharding(mesh, P(None, "x", "y")), NamedSharding(mesh, P())
         # Host constants: the program may first be built inside a caller's trace.
         starts = np.asarray([min(r * m, nb - m) for r in range(rounds)], np.int32)

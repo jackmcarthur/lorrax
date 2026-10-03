@@ -10,7 +10,7 @@ The binding rulings behind breaking changes are in
 The whole-mesh (face) shared-pole constructors, scalar and CC/TT/CT, hand
 every eigh stack to `distrib_la` with the room per rank beside their admitted
 batch. The service runs the stack as whole matrices per rank (route (c), the
-local solver) when the compiled program of one slice fits that room, in as
+local solver) when the compiled program that runs it fits that room, in as
 many slices as it needs, and on the whole mesh otherwise. The n x n eighs
 (directions, infinity, passivity) take route (c) almost always; a side-sized
 Gram eigh takes it only where 7 n^2 x 16 bytes per matrix (3 n^2 compiled,
@@ -24,7 +24,15 @@ size of what the program reserves. The choice is agreed over ranks. Results
 move by eigenvector gauge only: Fe 4^3 forced-face
 SC maps 0-2, scalar and bispinor, agree with local main to 0.15 ueV. On the
 same deck the face constructor's maps 1-2 drop from about 15 s to 2 s on 4
-A100s. Decks do not change.
+A100s.
+
+The ordered (time-reversal-broken) face reduction now solves its kept span
+on the pole budget's carrier, as a local round does: its Schur and final
+eighs run at the carrier and twice it instead of at H'_vv's side and the
+pencil side (CrI3 24×24 charge on 4×4: 6144 and 12288 instead of 9152 and
+18304). The dropped columns are exact zeros: CrI3 P16 eqp0 and eqp1 are
+bitwise to the run without it, and its map-0 constructor drops from 1354 s to
+about 1030 s (W response 1470 to 1017 s). Decks do not change.
 
 ## 2026-10-02 — distributed eigh and LU solves are checked before they are returned
 

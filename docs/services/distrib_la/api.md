@@ -140,9 +140,13 @@ sentinel-padded H'_vv (n 9152, 4×4). So:
   `workspace_bytes_per_rank`.
 - Every route-(c) eigh is checked the same way on its face-layout result,
   against the Hermitian part of the input (the local solver symmetrizes),
-  with the same retries after the first attempt: shifted, then gathered
-  when admitted. Measured cost at P4: 0.3–4.1 ms per eigh at
-  n = 3328–18304 (at most 0.2 % of the solve).
+  with the same retries after the first attempt: shifted slice by slice,
+  then gathered when admitted. Measured cost at P4: 0.3–4.1 ms per eigh at
+  n = 3328–18304 (at most 0.2 % of the solve). polar's direction SVD
+  (`normal_eigh`, the eigh of WᴴW) is not probe-checked on route (c); its
+  spectrum is refused when non-finite. A non-Hermitian operand of
+  `leading_eigenvectors` is refused before either route ("requires finite
+  Hermitian W"), never retried as a solver failure.
 - Every distributed LU solve (`plan('solve_lu').batched`) and every
   Cholesky or LU `factor`/`solve` is checked on its actual solution through
   sketches taken before the library consumes A and B:
@@ -237,31 +241,6 @@ Nothing crosses the host.
   matrices, their outputs and the local solver workspace. When one matrix
   does not fit one device, use `batched_route='auto'` with a distributed
   backend.
-- **The eigh-stack API** {#eigh-stack}. A caller that holds a face stack
-  `(B, n, n)` passes its room per rank beside its own live set,
-  `plan('eigh', mesh, n=n, backend='distributed', budget_bytes=room)`, and
-  the service decides each stack (`Plan.stack_route`, a `StackRoute`):
-  - route (c) when the compiled program that runs the stack fits the room:
-    its slices' exchanges, local eighs, inverse exchanges and result check
-    (outputs and temporaries; the caller's operand is already in its live
-    set) plus cuSOLVER's reported workspace per whole matrix. The most whole
-    matrices per rank that fit win, and the stack runs in that many slices,
-    one `lax.scan` over slice starts writing the face outputs in place;
-  - the whole-mesh provider otherwise, including room 0.
-  The decision is compiled, never a formula. The room is a caller value every
-  rank shares, and the choice is agreed over ranks through the runtime's KV
-  store (the fewest whole matrices per rank any rank chose), so every rank
-  runs the same route, rounds and collectives. An eager call runs the
-  executable the decision compiled; inside a caller's trace the program is
-  compiled again as part of the caller's module, and the decision line
-  reports the sizing compile's wall (`sized in … s`). The decision is printed
-  once per (op, B, n, dtype, room) by `new_stack_routes()`, which a driver prints
-  through its reporter, and listed by `describe()`. Per whole matrix at
-  complex128 a rank needs 7 n² × 16 B: 3 n² compiled (input, vectors, one
-  copy) and 4 n² of cuSOLVER syevd workspace (one A100, n = 3328–18304),
-  so n = 9152 needs 9.4 GB and n = 18304 needs 37.6 GB.
-  There are no sub-meshes or rank groups: whole mesh or whole matrices per
-  rank. `_route=` on `batched` is the test-only override.
 - **Batch-layout input.** An eigh stack already at `P(('x','y'),None,None)`
   is solved rank-locally with no movement.
 - **CPU collectives.** Route (c) calls `warm_mesh_cliques(mesh)` first, so on
@@ -273,6 +252,50 @@ Nothing crosses the host.
 `dispatch_batched_eigh(A, mesh, backend='distributed', *,
 batched_route='batch_reshard')` is `plan('eigh', …).batched(A)` for
 `gw.qsgw_density`.
+
+### The eigh-stack API {#eigh-stack}
+
+A caller that holds a face stack `(B, n, n)` passes its room per rank beside
+its own live set, `plan('eigh', mesh, n=n, backend='distributed',
+budget_bytes=room)`, and the service decides each stack (`Plan.stack_route`,
+a `StackRoute`):
+
+- **Route (c)** when the compiled program that runs the stack fits the room:
+  its slices' exchanges, local eighs, inverse exchanges and result check
+  (outputs and temporaries; the caller's operand is already in its live set)
+  plus cuSOLVER's reported workspace per whole matrix. A traced caller's
+  program holds the whole checked chain; an eager call's holds its first
+  attempt, and the retries run as a second program only when that check
+  fails, so each is sized on what it reserves. The most whole matrices per
+  rank that fit win, and the stack runs in that many slices, one `lax.scan`
+  over slice starts writing the face outputs in place.
+- **The whole-mesh provider** otherwise, including room 0.
+- **Only a compiled figure accepts.** A shape bound (one whole matrix and its
+  vectors, 2 n² per rank) may only reject, without a compile.
+- **Lockstep over ranks.** The candidates follow from the shape, the room and
+  agreed sizes only; for each, every rank compiles the same program and the
+  compiled size is agreed (the largest any rank measured, through the
+  runtime's KV store) before the comparison. Every rank runs the same route,
+  rounds and collectives.
+- **One compile per eager call.** An eager call runs the executable its
+  decision compiled. Inside a caller's trace the program is compiled again as
+  part of the caller's module, and the decision line reports the sizing
+  compile's wall (`sized in … s`).
+- **Plans that serve several rooms.** Each decision holds for a range of
+  rooms (`StackRoute.holds_at`). `plan` hands back an earlier plan with a
+  room when every decision it has made holds at the new room, so programs
+  keyed on the plan are not compiled again; that plan decides any new stack
+  against the smallest room it has served.
+- **Reporting.** Each decision is printed once per (op, B, n, dtype, room,
+  eager or traced) by `new_stack_routes()`, which a driver prints through its
+  reporter, and listed by `describe()`. `known_route` is the pure query for
+  pricing: the decided route, or the provider when none was made.
+- **Sizes.** Per whole matrix at complex128 a rank needs 7 n² × 16 B for the
+  first attempt: 3 n² compiled (input, vectors, one copy) and 4 n² of
+  cuSOLVER syevd workspace (one A100, n = 3328–18304), so n = 9152 needs
+  9.4 GB and n = 18304 needs 37.6 GB. The traced chain about doubles it.
+- There are no sub-meshes or rank groups: whole mesh or whole matrices per
+  rank. `_route=` on `batched` is the test-only override.
 
 ### Resident operands: `batch_layout` and `local_batch`
 
