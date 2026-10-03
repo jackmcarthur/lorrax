@@ -22,11 +22,12 @@ import numpy as np
 def retained_span_columns(side, kept):
     """Columns of a rank-local paired round's coefficient map Y (``retain_span``).
 
-    The ordered reduction pads Y [R, 2c] to the pencil side R
-    (``reduce_ordered_shared_pole_pencil``), so the map is [R, R]; ``kept`` is
-    2c = 2 min(R/2, budget), the columns it would hold unpadded.
+    The ordered reduction returns Y [R, 2c] on its solve's own columns
+    (``reduce_ordered_shared_pole_pencil``); ``kept`` = 2 min(R/2, budget)
+    bounds 2c (the Ritz carrier is at most the budget). The CT round's
+    compacted width of a sector is at most these columns.
     """
-    return int(side)
+    return min(int(side), int(kept))
 
 
 def held_sector_bytes(n, side, kept):
