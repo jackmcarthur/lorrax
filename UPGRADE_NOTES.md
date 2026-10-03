@@ -20,7 +20,11 @@ and step down by room, so a deck that fits runs one round. The
 one-parent-per-rank start of the previous entry is withdrawn; it split Fe 4^3
 at P4 into four rounds whose different sides recompiled every program. The
 sector constructor line names each sector's compiled program, its sizing
-wall and the eigh rooms used. RESULTS_PENDING Decks do not change.
+wall and the eigh rooms used. Results: Fe 4^3 forced face, SC maps 0-2.
+Bispinor eqp is bitwise to main, and the W response is 197.3 / 66.7 / 14.6 s
+against 150.2 / 67.2 / 14.6 s. Map 0 adds the one-time batch sizing (46 s).
+The scalar returns to its pre-2026-10-03 batch of 13 and is bitwise to it; it
+differs from current main by 0.071 ueV or less. Decks do not change.
 
 ## 2026-10-03 — face programs size on their first attempts; the scalar face batch is admitted by its compiled size
 
