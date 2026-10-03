@@ -263,10 +263,12 @@ a `StackRoute`):
 - **Route (c)** when the compiled program that runs the stack fits the room:
   its slices' exchanges, local eighs, inverse exchanges and result check
   (outputs and temporaries; the caller's operand is already in its live set)
-  plus cuSOLVER's reported workspace per whole matrix. A traced caller's
-  program holds the whole checked chain; an eager call's holds its first
-  attempt, and the retries run as a second program only when that check
-  fails, so each is sized on what it reserves. The most whole matrices per
+  plus cuSOLVER's reported workspace per whole matrix. An eager call's
+  program, and a traced one inside `checked_program`'s first program, holds
+  its first attempt, and the retries run as a second program only when that
+  check fails (`checked_program` reruns the caller's whole program with every
+  solve's whole chain); any other traced caller holds the whole chain. Each is sized on what it
+  reserves. The most whole matrices per
   rank that fit win, and the stack runs in that many slices, one `lax.scan`
   over slice starts writing the face outputs in place.
 - **The whole-mesh provider** otherwise, including room 0.
@@ -288,7 +290,7 @@ a `StackRoute`):
   programs on the plan (the face constructors floor their rooms to whole
   GiB) compiles again when its room changes.
 - **Reporting.** Each decision is printed once per (op, B, n, dtype, room,
-  eager or traced) by `new_stack_routes()`, which a driver prints through its
+  phase: first attempt, retries or whole chain) by `new_stack_routes()`, which a driver prints through its
   reporter, and listed by `describe()`. `known_route` is the pure query for
   pricing: the decided route, or the provider when none was made.
 - **Sizes.** Per whole matrix at complex128 a rank needs 7 n² × 16 B for the
@@ -297,6 +299,13 @@ a `StackRoute`):
   9.4 GB and n = 18304 needs 37.6 GB. The traced chain about doubles it.
 - There are no sub-meshes or rank groups: whole mesh or whole matrices per
   rank. `_route=` on `batched` is the test-only override.
+- **`checked_program(fn, mesh, out_shardings)`** jits a caller's program
+  over checked solves in two phases: the first holds every solve's first
+  attempt and returns their mesh-reduced failure flag; the second program
+  (every solve on its whole chain: first attempt, then retries where the check
+  fails) is compiled and run only when it is set, and refuses by name if a
+  solve fails them all. `checked_shapes(fn, *args)` is
+  `jax.eval_shape` of the first phase; `call.lower` lowers it, for sizing.
 
 ### Resident operands: `batch_layout` and `local_batch`
 

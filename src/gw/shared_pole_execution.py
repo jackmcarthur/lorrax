@@ -239,6 +239,9 @@ def route_summary(mode, receipt):
     if batch is not None:
         gb = lambda v: "none" if v is None else f"{v / 1e9:.1f}"
         rooms = receipt.get("face_eigh_room_bytes_per_rank") or {}
+        if "compiled_program_bytes_per_rank" in batch:
+            price += (f"; face program {gb(batch['compiled_program_bytes_per_rank'])} GB/rank compiled, "
+                      f"sized in {batch['sizing_seconds']:.1f} s")
         price += (f"; face batch {batch['parent_batch']} parent(s), eigh room GB/rank "
                   f"selection {gb(rooms.get('selection'))}, reduction {gb(rooms.get('reduction'))}")
     return (f"{mode} ({receipt['reason']}, conservative pencil side "
@@ -255,13 +258,19 @@ def face_program(fn, mesh, *, outputs='matrices'):
 
     Matrix-only glue preserves every output's trailing two mesh axes,
     including real matrices. Mixed reducer contracts name their matrix
-    leaves explicitly; diagnostics and spectra alone replicate.
+    leaves explicitly; diagnostics and spectra alone replicate. Its checked
+    eighs hold their first attempts (``distrib_la.checked_program``);
+    ``call.lower(*args)`` lowers it, for sizing.
     """
+    # ponytail: a failed check reruns the whole program with every eigh's
+    # whole chain in-graph (one more round and one cached compile per failing
+    # round; CrI3 saw 1-10 per map). Upgrade path: retry only the failed stack.
+    import distrib_la
     compiled = {}
-    def call(*args):
+    def program(*args):
         signature = jax.tree.structure(args), tuple((a.shape,a.dtype) for a in jax.tree.leaves(args))
         if signature not in compiled:
-            shapes = jax.eval_shape(fn, *args)
+            shapes = distrib_la.checked_shapes(fn, *args)
             rep=NamedSharding(mesh,P())
             def matrix(v):
                 if v.ndim < 3:
@@ -284,8 +293,10 @@ def face_program(fn, mesh, *, outputs='matrices'):
                 out=(matrix(shapes[0]),model(shapes[1]))
             else:
                 raise ValueError('unknown explicit constructor output contract '+outputs)
-            compiled[signature]=jax.jit(fn,out_shardings=out)
-        return compiled[signature](*args)
+            compiled[signature]=distrib_la.checked_program(fn,mesh,out)
+        return compiled[signature]
+    call=lambda *args: program(*args)(*args)
+    call.lower=lambda *args: program(*args).lower(*args)
     return call
 
 
@@ -418,42 +429,79 @@ def sector_round_schedule(bank,header,meta,config,mesh,*,execution=None,batch_wi
             for q in range(0, nq, batch_width)]
 
 
+@lru_cache(maxsize=None)
+def face_reduction_bytes(mesh, width, *, rows, side, infinity_width, infinity_arrays, ordered,
+                         odd_moments, keep_budget, carrier):
+    """Compiled new bytes per rank of ``face_parent_program`` for ``width`` parents, and the wall.
+
+    At a pencil ``side`` whose last ``infinity_width``-wide blocks are the
+    infinity columns, every finite column on one state panel of ``rows``, and
+    its eighs on the whole mesh (the room it leaves is theirs). Every rank
+    compiles the same program and the size is agreed (the largest any rank
+    measured); a rank whose compile fails posts a size no room admits.
+    """
+    import sys
+    import time
+    from runtime.aot_memory import agreed_chunk, compiled_new_bytes
+    blocks = (2 if odd_moments else 0) if ordered else 1
+    finite = int(side) - blocks * int(infinity_width)
+    face, rep = NamedSharding(mesh, P(None, 'x', 'y')), NamedSharding(mesh, P())
+    spec = lambda shape, dtype, sharding=face: jax.ShapeDtypeStruct(shape, dtype, sharding=sharding)
+    panel = (spec((width, rows, finite), jnp.complex128),)
+    started = time.perf_counter()
+    try:
+        program = face_parent_program(mesh, ordered, odd_moments, keep_budget, False, int(side), None,
+                                      face_eigh(mesh, int(side)), carrier)
+        local = compiled_new_bytes(program.lower(
+            spec((width, finite), jnp.complex128, rep), spec((width, finite), jnp.int32, rep),
+            spec((width, int(side)), jnp.bool_, rep), panel, panel, panel,
+            (spec((width, rows, int(infinity_width)), jnp.complex128),) * int(infinity_arrays)).compile())
+    except Exception as exc:        # any failure means "does not fit", on every rank
+        print(f"shared-pole face batch: sizing {width} parent(s) failed on process "
+              f"{jax.process_index()} ({type(exc).__name__}: {exc}); rejected on every rank",
+              file=sys.stderr, flush=True)
+        local = 1 << 62
+    return -agreed_chunk(-int(local)), time.perf_counter() - started
+
+
 def face_batch_width(meta, resolution, *, mesh, ledger, upstream, side, sample_batch,
-                     selection_faces, nq):
+                     selection_faces, nq, program_bytes):
     """Largest whole-mesh parent batch whose selection and reduction fit.
 
     The scalar face route runs a batch of physical parents per round, every
-    matrix tiled over all ranks (``face_reduce_round``), instead of one parent
-    per round. Both phases are priced at the conservative recipe side before
-    any bank read, as ``sector_batch_width`` does for the sector route; the
+    matrix tiled over all ranks (``face_reduce_round``). Before any bank read,
+    at the conservative recipe side, the selection price may reject a width;
+    only the reduction program's compiled size at that width
+    (``program_bytes(width)`` -> (bytes, seconds), agreed over ranks) admits
+    it. Widths start at one parent per rank, so each eigh stack of a round is
+    one route-(c) round, and step down in proportion to the room. The
     constructor still admits every phase at its actual side.
     """
     from gw.shared_pole_capacity import ConstructorCapacity
 
     budget = ConstructorCapacity(meta, resolution, mesh_xy=mesh, ledger=ledger,
                                  upstream=upstream, execution='face')
-    phases = (('selection', dict(sample_batch=sample_batch, selection_faces=selection_faces)),
-              ('reduction', {}))
-    rows = None
-    for width in range(int(nq), 0, -1):
-        budget.batch_width = width
-        rows = [ledger.preview(resident_bytes_per_rank=budget.resident_quote(
-                    side, phase=phase, **kwargs)['resident_bytes_per_rank'],
-                    workspace_bytes_per_rank=0, concurrent_with=upstream)
-                for phase, kwargs in phases]
-        if any(row['device_budget_status'] != 'PASS' for row in rows):
+    width, seconds = min(int(nq), int(mesh.size)), 0.0
+
+    def row(phase, **kwargs):
+        price, native = budget.quote(side, phase=phase, **kwargs)
+        return ledger.preview(resident_bytes_per_rank=price['resident_bytes_per_rank'],
+                              workspace_bytes_per_rank=sum(native.values()), concurrent_with=upstream)
+    while True:
+        budget.batch_width, budget.program_bytes = width, None
+        selection = row('selection', sample_batch=sample_batch, selection_faces=selection_faces)
+        if selection['device_budget_status'] != 'PASS' and width > 1:
+            width -= 1
             continue
-        rows = []
-        for phase, kwargs in phases:
-            price, native = budget.quote(side, phase=phase, **kwargs)
-            rows.append(ledger.preview(
-                resident_bytes_per_rank=price['resident_bytes_per_rank'],
-                workspace_bytes_per_rank=sum(native.values()), concurrent_with=upstream))
-        if all(row['device_budget_status'] == 'PASS' for row in rows):
-            return width, dict(parent_batch=width, selection=rows[0], reduction=rows[1])
-    # One parent per round; its actual-side phase admissions decide.
-    return 1, dict(parent_batch=1, reason='conservative side exceeds the budget at one parent',
-                   selection=rows[0], reduction=rows[1])
+        compiled, wall = program_bytes(width)
+        budget.program_bytes, seconds = compiled, seconds + wall
+        reduction = row('reduction')
+        receipt = dict(parent_batch=width, compiled_program_bytes_per_rank=compiled,
+                       sizing_seconds=seconds, selection=selection, reduction=reduction)
+        if reduction['device_budget_status'] == 'PASS' or width == 1:
+            return width, receipt
+        room = reduction['available_device_bytes_per_rank'] - reduction['aggregate_bytes_per_rank'] + compiled
+        width = max(1, min(width - 1, width * max(room, 0) // compiled))
 
 
 def sector_batch_width(meta, resolution, recipe, routes, *, mesh, ledger, nq):

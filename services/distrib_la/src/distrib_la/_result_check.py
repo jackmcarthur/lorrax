@@ -318,15 +318,78 @@ def checked_eigh(attempts, a, *, site, mesh=None, final=True):
                    constrain=constrain, final=final)
 
 
+#: Inside :func:`checked_program`'s trace: (phase, flags). A traced checked
+#: solve then holds only that phase of its chain and hands its failure flag
+#: here; outside one (None) it holds the whole chain ("all"), as before.
+_TRACED = None
+
+
+def traced_phase():
+    """The phase a traced checked solve compiles: the caller program's, else "all"."""
+    return "all" if _TRACED is None else _TRACED[0]
+
+
+def _in_phase(fn, phase):
+    """``fn`` traced with its checked solves on ``phase``, returning (out, reduced failure flag or ())."""
+    def run(*args):
+        global _TRACED
+        outer, _TRACED = _TRACED, (phase, [])
+        try:
+            out, flags = fn(*args), _TRACED[1]
+        finally:
+            _TRACED = outer
+        return out, (jnp.any(jnp.stack([jnp.any(f) for f in flags])) if flags else ())
+    return run
+
+
+def checked_shapes(fn, *args):
+    """``jax.eval_shape`` of ``fn`` as :func:`checked_program`'s first program traces it."""
+    return jax.eval_shape(_in_phase(fn, "first"), *args)[0]
+
+
+def checked_program(fn, mesh, out_shardings):
+    """A caller's jitted program over checked solves, run as an eager eigh is.
+
+    The first program holds each checked solve's first attempt and check and
+    returns their mesh-reduced failure flag; only when it is set does a
+    second program run, every solve on its whole chain (first attempt, then
+    its retries where the check fails), and refuse by name if one fails them all. A program with no checked solve returns no flag
+    and is never synced on. ``call.lower`` lowers the first program.
+    """
+    rep = NamedSharding(mesh, P())
+    first, retry = (jax.jit(_in_phase(fn, phase), out_shardings=(out_shardings, rep))
+                    for phase in ("first", "all"))
+
+    def call(*args):
+        out, failed = first(*args)
+        if isinstance(failed, tuple) or not _flag(failed):
+            return out
+        del out
+        out, failed = retry(*args)
+        if _flag(failed):
+            raise ValueError(f"GATE distrib_la_result_check: a checked solve in the program at "
+                             f"{call_site()} failed every attempt (named above); result set to NaN")
+        return out
+    call.lower = first.lower
+    return call
+
+
+def _flag(failed):
+    return bool(np.any(np.asarray(jax.device_get(failed.addressable_data(0)))))
+
+
 def raise_if_failed(failed, op, n, dtype, site):
     """An eager call's refusal: raise by name when any matrix of the call failed every attempt.
 
     ``failed`` is one replicated bool (or a stack of them, from a scan), the
     same on every rank, so every rank raises together; only that flag is read.
+    A traced flag goes to the enclosing :func:`checked_program`, if any.
     """
     if isinstance(failed, jax.core.Tracer):
+        if _TRACED is not None:
+            _TRACED[1].append(failed)
         return
-    if bool(np.any(np.asarray(jax.device_get(failed.addressable_data(0))))):
+    if _flag(failed):
         raise ValueError(refusal_message(op, n, dtype, site, "every"))
 
 
