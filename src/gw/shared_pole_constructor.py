@@ -103,7 +103,6 @@ def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output, resi
     with phase("entry"):
         import numpy as np
         from jax.sharding import NamedSharding, PartitionSpec as P
-        import distrib_la
         from runtime.padding import mesh_divisor
         from file_io.shared_pole_store import (
             charge_representation, validate_shared_pole_bank, open_shared_pole_bank,
@@ -286,10 +285,9 @@ def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output, resi
                 side = int(table["active"].shape[-1])
                 padding_bytes = round_padding_output_bytes(
                     round_states, infinity, widths, infinity_width)
-                if execution == 'local' and not distrib_la.fits_local(
-                        budget.eigenplan(side), "eigh", ((1, side, side),) * 8,
-                        np.complex128, ledger.device_budget_bytes_per_rank):
-                    return False
+                # One price per program: the reduction phase's route price
+                # (shared_pole_capacity.shared_pole_byte_terms) and its eigh
+                # workspace, for the local and the face route alike.
                 return budget.preview(side, phase="reduction",
                     padding_output_bytes_per_rank=padding_bytes)["device_budget_status"] == "PASS"
 
@@ -298,20 +296,9 @@ def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output, resi
                 side = int(table["active"].shape[-1])
                 padding_bytes = round_padding_output_bytes(
                     round_states, infinity, widths, infinity_width)
-                # Resolve before either reduction program is traced. Local
-                # mode's native route still has its own workspace guard.
+                # Resolve before either reduction program is traced; the
+                # ledger warns when the route price is over the budget.
                 local_eigh = budget.eigenplan(side)
-                if execution == 'local' and not distrib_la.fits_local(
-                        local_eigh, "eigh", ((1, side, side),) * 8,
-                        np.complex128, ledger.device_budget_bytes_per_rank):
-                    # Every parent reduces on its own rank: eight [side, side]
-                    # complex blocks and the eigh workspace on one device.
-                    from common.gpu_utils import warn_over_budget
-                    warn_over_budget(
-                        "shared-pole local pencil round",
-                        8 * 16 * side * side + budget.query_workspace(
-                            "eigh", ((1, side, side),), local_eigh),
-                        ledger.device_budget_bytes_per_rank)
                 budget.plan(side, phase="reduction",
                     padding_output_bytes_per_rank=padding_bytes)
                 if reuse:
