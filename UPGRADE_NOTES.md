@@ -5,6 +5,19 @@ results move, and what a user must change in decks, environment or files.
 The binding rulings behind breaking changes are in
 `docs/architecture/decisions.md`; older history is in git.
 
+## 2026-10-03 — the CC/TT/CT face batch is admitted by its compiled size
+
+The bispinor sector constructor on the face route admits its parent batch by
+the largest compiled size of the round's three whole-chain programs at the
+conservative shapes (CC's and TT's reduction, CT's cross reduction), as the
+scalar face batch already was; the batch starts at one parent per rank. Each
+CC, TT and CT round, and each face model check of the scalar constructor,
+takes its eigh room beside its own whole-chain program compiled on the arrays
+it runs, so every retry is a sized program. The analytic face prices of the
+sector reduction ($14R^2+12nR$) and of the CT cross reduction
+($10CT+14R^2+12n(C+T)$) are gone. The sector constructor line names each
+sector's compiled program. Decks do not change.
+
 ## 2026-10-03 — face programs size on their first attempts; the scalar face batch is admitted by its compiled size
 
 A whole-mesh (face) shared-pole program now holds only the first attempt and

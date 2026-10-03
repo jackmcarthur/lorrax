@@ -58,8 +58,9 @@ def shared_pole_byte_terms(meta, *, mesh_xy, resolution, pencil_side,
     ``ritz_budget`` (the pole budget) prices the rank-local paired (ordered)
     reduction, whose kept span is solved on at most that many columns;
     ``retain_span`` adds its coefficient map output (a bispinor sector round).
-    ``program_bytes`` is a face reduction's compiled program size per rank
-    (``face_batch_width``), which replaces its dense temporaries.
+    ``program_bytes`` is a face reduction's or CT cross reduction's compiled
+    program size per rank (``face_batch_width``, ``sector_batch_width``),
+    which replaces its dense temporaries.
     """
     p = int(mesh_xy.shape["x"]) * int(mesh_xy.shape["y"])
     # Constructor carriers are mu x mu charge operators on every admitted deck.
@@ -100,11 +101,9 @@ def shared_pole_byte_terms(meta, *, mesh_xy, resolution, pencil_side,
         # at 2c, XLA rematerialization on and off: temp + output 0.73-0.82 of
         # this term; with the arguments, 0.80-0.87 of this term plus the
         # narrow actions.
-        # The face keeps its envelope (ten C-by-T and fourteen joint-square
-        # copies), which also sizes its parent batch.
+        # The face is its compiled CT program (``program_bytes``).
         dense = (c*t + 8 * r*r + 4 * packed * r + max(c, t) * r
-                 if resolution.layout == "local" else
-                 10 * c*t + 14 * r*r + 12 * packed * (c+t))
+                 if resolution.layout == "local" else 0)
         sample_faces = 0
     elif phase == "reduction":
         if selection_faces is not None:
@@ -360,7 +359,7 @@ class ConstructorCapacity:
             cross_original_sides=cross_original_sides,
             padding_output_bytes_per_rank=padding_output_bytes_per_rank,
             ritz_budget=self.ritz_budget, retain_span=self.retain_span,
-            program_bytes=self.program_bytes if phase == "reduction" else None)
+            program_bytes=self.program_bytes if phase in ("reduction", "cross_reduction") else None)
         # Other parents' narrow inputs survive selection and each model's
         # checks; they are additional live storage, never hidden in a limit.
         extra = sum(_shard_bytes(a)

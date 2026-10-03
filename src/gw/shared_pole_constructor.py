@@ -216,8 +216,8 @@ def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output, resi
                                    if ordered and keep_budget is not None else None))
             face_batch, execution_receipt['face_batch'] = face_batch_width(
                 meta, resolution, mesh=mesh_xy, ledger=ledger, upstream=upstream,
-                side=conservative_side, sample_batch=len(dense_fit),
-                selection_faces=selection_faces, nq=nq,
+                side=conservative_side, nq=nq,
+                selection=dict(sample_batch=len(dense_fit), selection_faces=selection_faces),
                 program_bytes=lambda width: face_reduction_bytes(mesh_xy, width, **sizing))
             # Every face round's reduction is priced at this compiled size.
             budget.program_bytes = execution_receipt['face_batch']['compiled_program_bytes_per_rank']
@@ -380,7 +380,7 @@ def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output, resi
             reductions = own_extent_receipts(round_reduction, tables["own"][:real])
         with phase("coulomb"):
             budget.batch_width = ranks if execution == 'local' else real
-            budget.plan(side, phase="model", sample_batch=len(held_ids))
+            model_row = budget.plan(side, phase="model", sample_batch=len(held_ids))
             budget.live((*round_model, *round_signed, qi))
             # V^-1/2 of the round's parents: one owner call per contiguous run of ids, rows in slot order.
             runs = []
@@ -425,7 +425,10 @@ def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output, resi
             passive, held_errors, reciprocity, moment_defects = check_round(
                 round_model, round_signed, inverse_sqrt, held, (exact["M1"], exact["M3"]), qi,
                 real=real, nodes=[_sample_point(recipe, i) for i in held_ids], eta_ry=recipe["eta_ev"] / RYD_TO_EV,
-                mesh_xy=mesh_xy, eigh_plan=eig if execution == 'face' else local_eigh, ordered=ordered)
+                mesh_xy=mesh_xy, eigh_plan=eig if execution == 'face' else local_eigh, ordered=ordered,
+                # A face check decides its eighs beside the model phase and its own program.
+                room=lambda compiled: face_eigh_room(dict(model_row, aggregate_bytes_per_rank=(
+                    model_row['aggregate_bytes_per_rank'] + compiled))))
             del inverse_sqrt, held, exact
         with phase("gates"):
             for slot, q in enumerate(ids[:real]):
