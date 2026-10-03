@@ -849,14 +849,14 @@ def cross_span_widths(meta, sectors):
     ladder (``runtime.padding.ladder_extent``), at most its span's columns.
     Ranks drift across a ladder step between rounds and SC maps (Fe 4^3
     bispinor CC 1152 <-> 1280, TT 1408 <-> 1536), and each step recompiled
-    the cross reduction (2 x 11.2 s at map 2). An SC map past map 0 binds
+    the cross reduction (2 x 11.2 s at map 2). An SC run binds
     ``meta.shared_pole_rank_capacity`` (a dict the quadrature session keeps):
     ``held`` is then the largest live width of any earlier round or map, grown
     only when a live width exceeds it, with the growth noted in
     ``held["_events"]`` for the SC log; it never shrinks. The extra columns
     are inactive retained columns, exact zeros in Y and c: the joint pencil
     gives them zero metric and the zero-row-safe eigensolver keeps them out of
-    the spectrum. No binding (one-shot, map 0): ``held`` is ``live``.
+    the spectrum. No binding (one-shot): ``held`` is ``live``.
     """
     from runtime.padding import ladder_extent
     live=[];held=[]

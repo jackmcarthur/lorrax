@@ -3719,10 +3719,10 @@ def gw_iteration_map(state: SCState, inputs: SCInputs) -> SCState:
         inputs.meta.shared_pole_k_capacity = (
             None if inputs.fixed_quadrature_session is None or int(state.iteration) == 0
             else inputs.fixed_quadrature_session.setdefault("shared_pole_k_capacity", {}))
-        # The same for the CT round's retained CC/TT span widths
-        # (shared_pole_sectors.cross_span_widths).
+        # The CT round's retained CC/TT span widths (shared_pole_sectors.cross_span_widths)
+        # are held from map 0 on, so map 1 neither regrows them nor sizes CT above them.
         inputs.meta.shared_pole_rank_capacity = (
-            None if inputs.fixed_quadrature_session is None or int(state.iteration) == 0
+            None if inputs.fixed_quadrature_session is None
             else inputs.fixed_quadrature_session.setdefault("shared_pole_rank_capacity", {}))
 
     from .gw_config import (uses_bare_transverse_shared_pole,

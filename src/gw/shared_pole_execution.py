@@ -499,7 +499,7 @@ def face_cross_bytes(mesh, width, shapes, spans):
 
 
 def face_batch_width(meta, resolution, *, mesh, ledger, upstream, side, nq, program_bytes,
-                     selection=None, extra=lambda width: 0, eigen_side=None):
+                     selection=None, extra=lambda width: 0, eigen_side=None, reserve=0, floor=1):
     """Largest whole-mesh parent batch whose selection and reduction fit.
 
     A face route runs a batch of physical parents per round, every matrix
@@ -512,7 +512,8 @@ def face_batch_width(meta, resolution, *, mesh, ledger, upstream, side, nq, prog
     each program once per shape (Fe 4^3 bispinor at P4: one round of 13
     instead of four, whose differing sides recompiled every program), and
     step down in proportion to the room. The constructor still admits every
-    phase at its actual side.
+    phase at its actual side. A walk with a ``reserve`` (eigh room kept free)
+    steps by per-parent bytes and stops at ``floor``.
     """
     import time
     from distrib_la import SIZING_FAILED
@@ -538,11 +539,12 @@ def face_batch_width(meta, resolution, *, mesh, ledger, upstream, side, nq, prog
         reduction = row('reduction', extra(width), eigen_side=eigen_side)
         receipt = dict(parent_batch=width, compiled_program_bytes_per_rank=compiled,
                        sizing_seconds=seconds, selection=picked, reduction=reduction)
-        if reduction['device_budget_status'] == 'PASS' or width == 1:
+        left = reduction['available_device_bytes_per_rank'] - reduction['aggregate_bytes_per_rank']
+        if (reduction['device_budget_status'] == 'PASS' and left >= reserve) or width <= floor:
             return width, receipt
-        room = reduction['available_device_bytes_per_rank'] - reduction['aggregate_bytes_per_rank'] + compiled
-        width = (width - 1 if compiled >= SIZING_FAILED else
-                 max(1, min(width - 1, width * max(room, 0) // compiled)))
+        step = (width * max(left + compiled, 0) // compiled if not reserve else width
+                * max(left + reduction['aggregate_bytes_per_rank'] - reserve, 0) // reduction['aggregate_bytes_per_rank'])
+        width = width - 1 if compiled >= SIZING_FAILED else max(floor, min(width - 1, step))
 
 
 def sector_batch_width(meta, resolution, recipe, routes, *, mesh, ledger, nq):
@@ -554,19 +556,33 @@ def sector_batch_width(meta, resolution, recipe, routes, *, mesh, ledger, nq):
     during the cross reduction are priced beside it. A width is admitted by
     the largest compiled size of the round's three whole-chain programs at the
     conservative shapes, CC's and TT's ``face_parent_program`` and CT's
-    ``cross_parent_program`` (``sector_program_bytes_per_rank``).
+    ``cross_parent_program`` (``sector_program_bytes_per_rank``). Once a first
+    map admitted fewer than every parent, later maps size at the held sides and
+    CT widths their rounds run at, never narrower, keeping free the room one
+    whole matrix per rank of the largest eigh needs (7 n^2 x 16 B, distrib_la).
     """
     import copy
     import time
+    from gw.shared_pole_local import carrier_history
     from gw.shared_pole_recipe import shared_real_pole_gates_ordered_v1 as gates
+    history = carrier_history(meta)
+    first = history.get(('sector', 'batch'))
+    held = ({key[0][1]: value[0] for key, value in history.items() if len(key) == 2 and key[1] == 'side'
+             and key[0][0] == 'sector'} if first is not None and first < int(nq) else {})
+    capacity = (getattr(meta, 'shared_pole_rank_capacity', None) or {}) if held else {}
+    sides = [min(row['conservative_pencil_side'], held.get(row['sector'], 1 << 62)) for row in routes]
 
     joint = copy.copy(meta)
     joint.n_rmu_padded = sum(row['packed_extent'] for row in routes)
-    side = sum(row['conservative_pencil_side'] for row in routes)
+    side = sum(sides)
     # CT diagonalizes the retained joint span, never the unreduced
     # rectangular C/T pencil. Diagonal sectors still solve their own side.
-    spans = [min(row['signed_side_bound'], row['conservative_pencil_side']) for row in routes]
-    eigen_side = max(max(row['conservative_pencil_side'] for row in routes), sum(spans))
+    spans = [min(row['signed_side_bound'], s, capacity.get(row['sector'], 1 << 62)) for row, s in zip(routes, sides)]
+    eigen_side = max(max(sides), sum(spans))
+    eighs = [n for row, s in zip(routes, sides)
+             for n in (s // 2, 2 * min(s // 2, face_ritz_carrier(mesh, row['pole_budget'])))] + [sum(spans)]
+    room = ledger.room_bytes_per_rank(ledger.live_stages)
+    reserve = max([(-(-112 * n * n >> 30) + 1) << 30 for n in eighs if 112 * n * n <= room], default=0) if held else 0
     lines = line_panel_count(recipe)
     dense = len(recipe['fit_ids']) - lines
     # Each family's cross panels: 8 [rows of the other family, line width]
@@ -574,8 +590,8 @@ def sector_batch_width(meta, resolution, recipe, routes, *, mesh, ledger, nq):
     charge, current = routes
     cross = lines * 8 * (current['packed_extent'] * charge['line_width']
                          + charge['packed_extent'] * current['line_width'])
-    shapes = [dict(rows=row['packed_extent'], side=row['conservative_pencil_side'],
-                   infinity_width=row['infinity_width'], ordered=True, odd_moments=True) for row in routes]
+    shapes = [dict(rows=row['packed_extent'], side=s,
+                   infinity_width=row['infinity_width'], ordered=True, odd_moments=True) for row, s in zip(routes, sides)]
     sizes, seconds = {}, dict(CC=0.0, TT=0.0, CT=0.0)
 
     def program_bytes(width):
@@ -592,10 +608,12 @@ def sector_batch_width(meta, resolution, recipe, routes, *, mesh, ledger, nq):
         return max(sizes.values())
     width, receipt = face_batch_width(
         joint, resolution, mesh=mesh, ledger=ledger, upstream=ledger.live_stages, side=side, nq=nq,
-        program_bytes=program_bytes, eigen_side=eigen_side,
+        program_bytes=program_bytes, eigen_side=eigen_side, reserve=reserve, floor=first if held else 1,
         extra=lambda width: int(np.ceil(16 * width * ((4 * dense + 8) * joint.n_rmu_padded**2 + cross)
                                         / mesh.size)))
-    return width, dict(receipt, sector_program_bytes_per_rank=sizes, sector_program_seconds=seconds)
+    history.setdefault(('sector', 'batch'), width)
+    return width, dict(receipt, sector_program_bytes_per_rank=sizes, sector_program_seconds=seconds,
+                       eigh_reserve_bytes_per_rank=reserve)
 
 
 @lru_cache(maxsize=None)
