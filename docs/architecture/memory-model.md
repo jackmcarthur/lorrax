@@ -13,7 +13,9 @@ room. What still refuses is not a price: a kernel shape limit (a k-grid a
 mathdx mode cannot hold, `GATE response_vertex_grid` and the
 [k-convolution residency gates](kconv.md#refusals)),
 a workspace that cannot be measured (`GATE shared_pole_capacity: … FFT
-workspace unavailable`), and the correctness gates.
+workspace unavailable`), a compiled module larger than the device
+([`GATE xla_rematerialization`](#module-does-not-fit)), and the correctness
+gates.
 
 | symbol | meaning |
 |---|---|
@@ -340,6 +342,37 @@ does not own the ψ carriers and other residents live when W is built, so leave
 headroom between `memory_per_device_gb` and the card. On a device the stream
 and the line selection are two phases, so a group costs its carry plus the
 larger phase.
+
+### A module larger than the device {#module-does-not-fit}
+
+XLA's HLO rematerialization pass is off for every LORRAX program
+(owner 2026-10-02). `runtime.set_default_env` adds
+`--xla_disable_hlo_passes=rematerialization` to `XLA_FLAGS`, merged into any
+pass list the caller already gives. The pass ran only when a module's peak
+was above XLA's limit; it could take hours of compile and, on the decks that
+printed its give-up line, freed nothing. On a module that fits it changes
+nothing, so results are bitwise.
+
+With the pass off, every compiled module is checked once, when jax builds
+its executor for the module's first execution and before any of its buffers
+exist (`runtime.aot_memory.refuse_over_device`, installed by
+`common.jax_compile_cache`). When the module's buffers,
+`temp + arguments + outputs − aliased`, exceed the card's total memory
+(`cuDeviceTotalMem`), the run stops with
+
+```text
+GATE xla_rematerialization: REFUSED module '<name>': its compiled buffers
+need 137.04 GB per device (temp 125.49 + arguments 11.55 + outputs 0.22
+- aliased 0.22), and the device has 85.09 GB.  …
+```
+
+This is a hard device limit, not the budget: such a module cannot run on
+this card, and before this gate it failed at its first allocation. A module
+between the budget and the card is not refused; the budget only warns. The
+check is CUDA only. It does not run at compile, because planners compile
+larger candidates on purpose to read their figures and then shrink
+([the compiled check](#the-compiled-check), the kmeans Gram width); a
+candidate that never runs is never refused.
 
 ### What compiled statistics miss
 

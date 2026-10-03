@@ -5,6 +5,34 @@ results move, and what a user must change in decks, environment or files.
 The binding rulings behind breaking changes are in
 `docs/architecture/decisions.md`; older history is in git.
 
+## 2026-10-02 — XLA rematerialization is off; a module larger than the device stops by name
+
+LORRAX turns off XLA's HLO rematerialization pass for every program: the
+runtime adds `--xla_disable_hlo_passes=rematerialization` to `XLA_FLAGS`,
+merged into any pass list you already set. The pass ran only on a module
+whose peak was above XLA's memory limit. It could add hours of compile, and on
+the decks that printed `LORRAX GATE xla_rematerialization: a module does not
+fit` it freed nothing. Compile time drops where the pass ran long (on the
+CrI3 8×8 kmeans Gram it gave up in under a second, so nothing changes there).
+Results do not move: Fe 4³ scalar and bispinor SC maps 0–3 and kmeans
+centroids are bitwise.
+
+Every compiled module is now checked against the card before it first runs.
+When its buffers (temp + arguments + outputs − aliased) exceed the device's
+total memory, the run stops with
+`GATE xla_rematerialization: REFUSED module '<name>': its compiled buffers
+need X GB per device (…), and the device has Y GB`, instead of an
+out-of-memory error deep in the allocator. Raise the rank count or lower the
+module's size ([memory model](docs/architecture/memory-model.md#module-does-not-fit)). The
+`memory_per_device_gb` budget still only warns. The old stderr banner is gone.
+
+Expect one cold compile: `XLA_FLAGS` is part of the compile-cache key, so the
+first run of every deck after this change recompiles every program (the P4
+hsuite took 445 s cold), and later runs hit the cache again. If a future jax
+changes the private executor this check hooks, the run prints one
+`jax-compat: … GATE xla_rematerialization is NOT armed` line and continues
+unchecked.
+
 ## 2026-10-02 — band extrapolation on the four-current Σ (`full_shared_pole`)
 
 `bispinor_gw = full_shared_pole` now uses `use_band_extrapolation` (on by

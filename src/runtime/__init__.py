@@ -165,6 +165,7 @@ __all__ = [
     "bootstrap",
     "set_default_env",
     "set_default_xla_gpu_autotune",
+    "disable_xla_rematerialization",
     "announce_cpu_collectives",
     "skip_gpu_plugin_discovery",
     "tune_blas_threading",
@@ -531,6 +532,51 @@ def set_default_xla_gpu_autotune(*, platform: str = "gpu") -> dict:
     return dict(_XLA_GPU_AUTOTUNE)
 
 
+_XLA_DISABLE_PASSES_FLAG = "--xla_disable_hlo_passes"
+_XLA_REMAT_PASS = "rematerialization"
+
+
+def disable_xla_rematerialization() -> str:
+    """Turn XLA's HLO rematerialization pass off for every LORRAX program.
+
+    Owner ruling 2026-10-02: the pass is off, always.  When a module's peak
+    is above XLA's memory limit, the pass searches for recomputations and
+    can take hours of compile; on the decks that printed its give-up line it
+    freed nothing.  With it off, a module that does not fit the device is
+    refused by name before it first runs
+    (``runtime.aot_memory.refuse_over_device``, GATE xla_rematerialization).
+    The pass changes nothing on a module that fits, so results are bitwise.
+
+    Merged into ``XLA_FLAGS``, never overwritten: a caller's
+    ``--xla_disable_hlo_passes=a,b`` becomes ``a,b,rematerialization`` in one
+    token (XLA reads the last occurrence of a repeated flag).  A valueless
+    flag is left for XLA to report.  Returns the resolved ``XLA_FLAGS``.
+    """
+    raw = os.environ.get(_XLA_FLAGS_ENV, "")
+    supplied = _xla_flag_value(raw, _XLA_DISABLE_PASSES_FLAG)
+    if supplied == "<missing>":
+        return raw
+    passes = [p for p in (supplied or "").split(",") if p]
+    if _XLA_REMAT_PASS in passes:
+        return raw
+    tokens = raw.split()
+    kept, i = [], 0
+    while i < len(tokens):
+        tok = tokens[i]
+        if tok.startswith(_XLA_DISABLE_PASSES_FLAG + "="):
+            i += 1
+            continue
+        if tok == _XLA_DISABLE_PASSES_FLAG:
+            i += 2
+            continue
+        kept.append(tok)
+        i += 1
+    kept.append(f"{_XLA_DISABLE_PASSES_FLAG}="
+                + ",".join(passes + [_XLA_REMAT_PASS]))
+    os.environ[_XLA_FLAGS_ENV] = " ".join(kept)
+    return os.environ[_XLA_FLAGS_ENV]
+
+
 def _x64_requested():
     """:data:`_X64_ENV` read through **jax's own** grammar; ``None`` if unset.
 
@@ -700,6 +746,7 @@ def set_default_env(*, platform: str = "gpu") -> None:
     resolved_platforms = os.environ.get("JAX_PLATFORMS", "")
     xla_platform = (
         "cpu" if platform == "cpu" or resolved_platforms == "cpu" else "gpu")
+    disable_xla_rematerialization()
     set_default_xla_gpu_autotune(platform=xla_platform)
     from runtime.network_env import configure_gpu_network
     configure_gpu_network(platform=xla_platform, say=rank0_print)

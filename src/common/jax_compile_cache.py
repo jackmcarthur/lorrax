@@ -1666,6 +1666,82 @@ def install_compile_agreement() -> None:
     """
     _configure_compile_agreement()
     _install_compile_counter()
+    _install_device_fit_gate()
+
+
+def _install_device_fit_gate() -> None:
+    """Refuse a module larger than the device before its first execution.
+
+    GATE xla_rematerialization (``runtime.aot_memory.refuse_over_device``).
+    XLA's rematerialization pass is off (``runtime.disable_xla_rematerialization``),
+    so nothing shrinks a module that does not fit; it would fail at its first
+    allocation.  The check runs when jax builds the module's executor
+    (``pxla.ExecuteReplicated``), which it does lazily on the first call of a
+    compiled module, on every path (jit dispatch and AOT ``Compiled``), before
+    any of the module's buffers exist.  It does not run at compile: planners
+    compile larger candidates on purpose to read their figures and then
+    shrink (``centroid.pivoted_cholesky._auto_gram_width_from_compiled_peaks``,
+    ``runtime.aot_memory.check_chunk``), and a candidate that never runs must
+    not refuse.
+
+    The wrap is signature-checked at install, like the other ``jax._src``
+    patches here: when ``ExecuteReplicated`` is absent or its ``__init__`` does
+    not start ``(self, xla_executable, name, backend)``, the gate is skipped
+    with one stderr notice.  A check that cannot read a module's figures lets
+    it run, with the same notice; only :class:`ModuleDoesNotFit` propagates.
+    """
+    import inspect
+    from jax._src.interpreters import pxla
+    from runtime.aot_memory import ModuleDoesNotFit, refuse_over_device
+
+    if getattr(pxla, "_lorrax_device_fit_gate_installed", False):
+        return
+    cls = getattr(pxla, "ExecuteReplicated", None)
+    head = ("self", "xla_executable", "name", "backend")
+    try:
+        params = tuple(inspect.signature(cls.__init__).parameters)[:4]
+    except Exception:                                      # noqa: BLE001
+        params = None
+    if cls is None or params != head:
+        # Same discipline as the other jax._src patches: a changed private
+        # surface is skipped with one notice, never mis-wrapped.
+        _fit_gate_notice(
+            f"jax {_jax_generation()}: pxla.ExecuteReplicated.__init__ is "
+            f"{'absent' if cls is None else f'{params!r}'}, not {head!r}; "
+            f"GATE xla_rematerialization is NOT armed (a module larger than "
+            f"the device fails at allocation instead).")
+        return
+    _orig_init = cls.__init__
+
+    @functools.wraps(_orig_init)
+    def _gated_init(self, xla_executable, name, backend, *args, **kwargs):
+        try:
+            refuse_over_device(xla_executable, str(name),
+                               str(getattr(backend, "platform", "")))
+        except ModuleDoesNotFit:
+            raise
+        except Exception as exc:                           # noqa: BLE001
+            _fit_gate_notice(
+                f"the device-fit check could not read module {name!r} "
+                f"({type(exc).__name__}: {exc}); it runs unchecked.")
+        _orig_init(self, xla_executable, name, backend, *args, **kwargs)
+
+    cls.__init__ = _gated_init
+    pxla._lorrax_device_fit_gate_installed = True
+
+
+_FIT_GATE_SAID = False
+
+
+def _fit_gate_notice(msg: str) -> None:
+    """One stderr line per process, rank 0 only, when the fit gate stands down."""
+    global _FIT_GATE_SAID
+    if _FIT_GATE_SAID:
+        return
+    _FIT_GATE_SAID = True
+    if _STATE.proc_idx == 0:
+        print(f"  [compile-cache] jax-compat: {msg}", file=sys.stderr,
+              flush=True)
 
 
 def _install_compile_counter() -> None:
