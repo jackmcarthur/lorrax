@@ -125,9 +125,10 @@ rank-deficient PSD responses with no zero row (n 432, most block sizes). So:
   `roundoff_tol(n)` = 64·n·eps, at O(n²k) beside the O(n³) solve. A failed check is noted on rank 0's
   stderr and solved again: shifted (A + ‖A‖_F I, which moves a large
   near-zero cluster off the origin), then in cuSOLVERMp's other layout with
-  and without the sentinels, then gathered on every rank when the matrix,
-  its vectors and the solver's copy fit the plan's `budget_bytes` (1 GiB
-  without one).
+  and without the sentinels, then gathered on every rank when its compiled
+  program and the solver's workspace fit 1 GiB (`GATHERED_EIGH_BYTES`,
+  n ≤ 3096; agreed over ranks). XLA reserves a retry branch's temporaries
+  in every program that holds it, so a caller's room does not raise this.
 - Every route-(c) eigh is checked the same way on its face-layout result,
   against the Hermitian part of the input (the local solver symmetrizes). A
   failed check solves again shifted, then gathered when it fits (the rule
