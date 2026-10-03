@@ -570,7 +570,9 @@ def sector_batch_width(meta, resolution, recipe, routes, *, mesh, ledger, nq):
     held = ({key[0][1]: value[0] for key, value in history.items() if len(key) == 2 and key[1] == 'side'
              and key[0][0] == 'sector'} if first is not None and first < int(nq) else {})
     capacity = (getattr(meta, 'shared_pole_rank_capacity', None) or {}) if held else {}
-    sides = [min(row['conservative_pencil_side'], held.get(row['sector'], 1 << 62)) for row in routes]
+    # A held side sizes at its rung of the per-rank extent ladder, so a small growth keeps the sized shapes.
+    sides = [min(row['conservative_pencil_side'], face_ritz_carrier(mesh, held.get(row['sector'], 1 << 40)))
+             for row in routes]
 
     joint = copy.copy(meta)
     joint.n_rmu_padded = sum(row['packed_extent'] for row in routes)
