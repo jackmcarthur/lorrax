@@ -205,22 +205,28 @@ def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output, resi
         # parents over all ranks (one schedule owner for both constructors).
         ranks = mesh_divisor(mesh_xy)
         face_batch = 1
-        reduction_room = None
         if execution == 'face':
             from gw.shared_pole_capacity import face_eigh_room
-            from gw.shared_pole_execution import face_batch_width
+            from gw.shared_pole_execution import face_batch_width, face_reduction_bytes, face_ritz_carrier
+            keep_budget = recipe.get("pole_budget")
+            sizing = dict(rows=n, side=conservative_side, ordered=ordered, odd_moments=odd_moments,
+                          infinity_width=column_extent(max(1, int(recipe["infinity_width"]))),
+                          infinity_arrays=1 + len(moment_fields), keep_budget=keep_budget,
+                          carrier=(face_ritz_carrier(mesh_xy, keep_budget)
+                                   if ordered and keep_budget is not None else None))
             face_batch, execution_receipt['face_batch'] = face_batch_width(
                 meta, resolution, mesh=mesh_xy, ledger=ledger, upstream=upstream,
                 side=conservative_side, sample_batch=len(dense_fit),
-                selection_faces=selection_faces, nq=nq)
+                selection_faces=selection_faces, nq=nq,
+                program_bytes=lambda width: face_reduction_bytes(mesh_xy, width, **sizing))
+            # Every face round's reduction is priced at this compiled size.
+            budget.program_bytes = execution_receipt['face_batch']['compiled_program_bytes_per_rank']
             # distrib_la decides each eigh stack against the room beside the
             # admitted batch and the retained factors: whole matrices per rank
             # where they fit, else the whole mesh.
             retained_bound = execution_receipt['retained_output_upper_bound_bytes_per_rank']
             budget.face_room = face_eigh_room(execution_receipt['face_batch']['selection'], retained_bound)
-            reduction_room = face_eigh_room(execution_receipt['face_batch']['reduction'], retained_bound)
-            execution_receipt['face_eigh_room_bytes_per_rank'] = dict(
-                selection=budget.face_room, reduction=reduction_room)
+            execution_receipt['face_eigh_room_bytes_per_rank'] = dict(selection=budget.face_room)
             eig = budget.eigenplan(n)
         from gw.shared_pole_execution import sector_round_schedule
         rounds = [row[:3] for row in sector_round_schedule(
@@ -322,17 +328,20 @@ def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output, resi
                 preview=_preview, admit=_admit)
         with phase("gram_reduction"):
             if execution == 'face':
-                from gw.shared_pole_execution import face_reduce_round, face_ritz_carrier
+                from gw.shared_pole_execution import face_reduce_round
                 # The kept span on the budget's carrier, as the local round
                 # solves it on its Ritz carrier: the Schur and final eigh run
                 # at about 2 x budget instead of the pencil side.
-                keep_budget = recipe.get("pole_budget")
+                # The eigh room beside this round's own program: the batch row
+                # with the round's compiled size for the batch's.
+                row = execution_receipt['face_batch']['reduction']
+                room = lambda compiled: face_eigh_room(dict(row, aggregate_bytes_per_rank=(
+                    row['aggregate_bytes_per_rank'] - budget.program_bytes + compiled)), retained_bound)
                 round_model, round_signed, vectors, round_diagnostics = face_reduce_round(
                     round_states, infinity, tables, real=real, mesh=mesh_xy,
                     budget=budget, ordered=ordered, odd_moments=odd_moments,
-                    keep_budget=keep_budget, admit=False, room=reduction_room,
-                    carrier=(face_ritz_carrier(mesh_xy, keep_budget)
-                             if ordered and keep_budget is not None else None))
+                    keep_budget=keep_budget, admit=False, room=room,
+                    carrier=sizing['carrier'])
             else:
                 round_model, round_signed, vectors, round_diagnostics = reduce_round(
                     round_states, infinity, tables, real=real, mesh_xy=mesh_xy,
