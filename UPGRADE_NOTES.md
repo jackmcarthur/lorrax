@@ -5,6 +5,40 @@ results move, and what a user must change in decks, environment or files.
 The binding rulings behind breaking changes are in
 `docs/architecture/decisions.md`; older history is in git.
 
+## 2026-10-02 — planners admit by compiled size; kin_ion writes the window GW reads
+
+No result moves: Fe 4³ scalar and bispinor and Na 8³ SC maps 0–2 are bitwise.
+What changes is which runs warn, the files kin_ion writes, and a few receipts.
+
+- **`gw.kin_ion_io` writes b3 bands by default.** b3 = nelec + ncond, the
+  window GW reads, with `number_bands_protected` resolved as GW resolves it.
+  The old default, max(`number_bands`, nelec + ncond), loaded ψ(G) for bands
+  no consumer reads; CrI3 24×24 went from 750 bands to 208. A `kin_ion.h5`
+  written before still works, and `-n NB` still writes more.
+- **Compiled chunks are admitted only when they fit.** A compiled chunk is
+  admitted only when it fits the room; the analytic price no longer admits it.
+  A chunk at its minimum that does not fit now prints the over-budget warning
+  instead of passing silently. Every rank runs the smallest chunk any rank
+  chose (`runtime.aot_memory.agreed_chunk`).
+- **The ζ μ-batch plan states its real batch.** Route G keeps whole centroid
+  orbits per owner, so the plan floors the batch at P × the widest orbit.
+  Its HWM is that of the batch that runs, and it warns before the compile
+  when that HWM is over the target. CrI3 24×24 bispinor at P36 now plans
+  432 centroids at 70 GB/rank, where it used to print 36. It does not fit
+  40 GB cards at any P ([zeta fit](docs/architecture/zeta_fit_mubatch.md)).
+- **Hermiticity checks scale with n.** Every Hermiticity check compares
+  against `distrib_la.roundoff_tol(n) = 64·n·eps`
+  ([api](docs/services/distrib_la/api.md#roundoff)), not a fixed 1e-12. A
+  large GEMM-built matrix no longer refuses on round-off. A matrix of side
+  n < 71 meets a bar below 1e-12.
+- **Receipt changes.**
+  - `constructor_receipt.json` no longer carries `spectral_moment_cauchy`;
+    the report never passed its support test. A non-finite sector M1 still
+    refuses (`GATE shared_pole_sector_nonfinite`).
+  - On a deck with broken time reversal, the parallel-transport head no
+    longer computes the velocity-parity diagnostic; it prints one line
+    instead.
+
 ## 2026-10-02 — XLA rematerialization is off; a module larger than the device stops by name
 
 LORRAX turns off XLA's HLO rematerialization pass for every program: the
