@@ -450,8 +450,12 @@ def _mm(a, b, *, transa='N', transb='N'):
 
 
 def check_round(model, signed, inverse_coulomb_sqrt, held, moments, infinity_directions, *, real, nodes, eta_ry,
-                mesh_xy, eigh_plan, ordered):
-    """Run ``round_checks`` through the plan matching the arrays' layout."""
+                mesh_xy, eigh_plan, ordered, room=None):
+    """Run ``round_checks`` through the plan matching the arrays' layout.
+
+    A face round given ``room`` decides its eighs against ``room(compiled)``,
+    the room beside the check program's whole-chain size (its retry),
+    compiled on one parent's arrays."""
     import jax
     import numpy as np
     from jax.sharding import NamedSharding, PartitionSpec as P
@@ -461,20 +465,22 @@ def check_round(model, signed, inverse_coulomb_sqrt, held, moments, infinity_dir
         # A face round holds ``real`` physical parents on the leading axis;
         # the gate equations are per parent, so each is checked on its own
         # leading row (no data moves) and the replicated rows are stacked.
-        from gw.shared_pole_execution import face_round_check_program
+        from gw.shared_pole_execution import compiled_bytes, face_eigh, face_round_check_program
         if int(model[0].shape[0]) != int(real):
             raise ValueError('whole-mesh shared-pole checks take physical parents only')
         if eigh_plan.n not in (None, int(model[0].shape[-2])):
             raise ValueError('whole-mesh shared-pole checks need the n x n eigh plan')
-        program = face_round_check_program(mesh_xy, bool(ordered), eigh_plan)
-        rows = []
+        program = lambda plan: face_round_check_program(mesh_xy, bool(ordered), plan)
+        n, rows = int(model[0].shape[-2]), []
         for slot in range(int(real)):
             pick = partial(_leading_row, slot=slot)
-            out = program(jax.tree.map(pick, model), jax.tree.map(pick, signed),
-                          pick(inverse_coulomb_sqrt), *(pick(h) for h in held),
-                          np.asarray(nodes, np.complex128), np.float64(eta_ry),
-                          *(pick(m) for m in moments), pick(infinity_directions))
-            rows.append(jax.tree.map(np.asarray, out))
+            args = (jax.tree.map(pick, model), jax.tree.map(pick, signed),
+                    pick(inverse_coulomb_sqrt), *(pick(h) for h in held),
+                    np.asarray(nodes, np.complex128), np.float64(eta_ry),
+                    *(pick(m) for m in moments), pick(infinity_directions))
+            if callable(room):
+                eigh_plan, room = face_eigh(mesh_xy, n, room(compiled_bytes(program(face_eigh(mesh_xy, n)), *args))), None
+            rows.append(jax.tree.map(np.asarray, program(eigh_plan)(*args)))
         return jax.tree.map(lambda *v: np.concatenate(v, axis=0), *rows)
 
     replicated = NamedSharding(mesh_xy, P())

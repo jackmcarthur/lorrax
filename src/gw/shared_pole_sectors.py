@@ -214,28 +214,36 @@ def construct_sector_poles(bank, meta, config, *, mesh_xy, output):
     from gw.shared_pole_execution import sector_round_schedule,is_face
     resolved_execution,execution_rows=sector_execution(
         meta,config,bank['mu_bases'],header['n_q_irr'],mesh_xy=mesh_xy,upstream=upstream)
-    batch_width = int(mesh_xy.size)
+    batch_width,sizes = int(mesh_xy.size),{}
     if resolved_execution == 'face':
         from gw.shared_pole_execution import sector_batch_width
         batch_width, batch_admission = sector_batch_width(
             meta,linalg_resolution({'linalg':config.backend.linalg}),recipe,execution_rows,
             mesh=mesh_xy,ledger=ledger,nq=header['n_q_irr'])
-        for row in execution_rows:
+        sizes = batch_admission['sector_program_bytes_per_rank']
+        for row in (*execution_rows,execution_rows[0]['joint']):
             row['batch_admission'] = batch_admission
-            row['parent_batch'] = batch_width
+            row['face_batch'] = dict(parent_batch=batch_width,sizing_seconds=batch_admission['sizing_seconds'],
+                                     compiled_program_bytes_per_rank=sizes[row.get('sector','CT')])
     sector_models,model_residence=_sector_model_residence(meta,config,header,bank['mu_bases'],
         execution_rows,mesh_xy=mesh_xy,root=root,upstream=upstream,route=resolved_execution)
     if sector_models is not None:
         upstream=ledger.live_stages=(*upstream,model_residence['stage'])
     # distrib_la decides the face eigh stacks against the room beside the
     # admitted sector batch and the resident models reserved after it (whole
-    # matrices per rank where they fit).
+    # matrices per rank where they fit); each round's reduction (CC, TT, CT)
+    # against the batch row with its own compiled program for the batch's.
     from gw.shared_pole_capacity import face_eigh_room
-    face_room = (face_eigh_room(batch_admission, model_residence['payload_bytes_per_rank']
-                                if sector_models is not None else 0)
-                 if resolved_execution == 'face' else None)
+    room = face_room = None
+    if resolved_execution == 'face':
+        batch_row = batch_admission['reduction']
+        resident_models = model_residence['payload_bytes_per_rank'] if sector_models is not None else 0
+        room = lambda compiled: face_eigh_room(dict(batch_row, aggregate_bytes_per_rank=(
+            batch_row['aggregate_bytes_per_rank'] - batch_admission['compiled_program_bytes_per_rank']
+            + compiled)), resident_models)
+        face_room = room(batch_admission['compiled_program_bytes_per_rank'])
     for row in execution_rows if resolved_execution == 'face' else ():
-        row['face_eigh_room_bytes_per_rank'] = dict(selection=face_room, reduction=face_room)
+        row['face_eigh_room_bytes_per_rank'] = dict(selection=face_room)
     for ids,real,slots,execution in sector_round_schedule(
             bank,header,meta,config,mesh_xy,execution=resolved_execution,
             batch_width=batch_width):
@@ -250,7 +258,7 @@ def construct_sector_poles(bank, meta, config, *, mesh_xy, output):
                     line=read_line(io,family)
                 geometry=dict(components=3 if family else 1,basis=bank['mu_bases'][family],
                     ids=ids,real=real,header=sector_headers[family],sample_ids=dense_fit,
-                    sector=name,face_room=face_room)
+                    sector=name,face_room=face_room,room=room,program_bytes=sizes.get(name))
                 model=construct_diagonal_sector_round(samples,exact,meta,config,geometry,
                     mesh_xy=mesh_xy,retained=retained,line=line)
                 del samples,exact,line
@@ -276,7 +284,7 @@ def construct_sector_poles(bank, meta, config, *, mesh_xy, output):
                 refuse_nonfinite_moment('CT',cm['M1'],real,mesh_xy=mesh_xy)
                 line_cross=[read_line(io,family,cross=True) for family in (0,1)]
             cross=construct_cross_sector_round(sectors,(ct,tc),cm,meta,config,mesh_xy=mesh_xy,
-                sample_ids=dense_fit,line_cross=line_cross,real=real)
+                sample_ids=dense_fit,line_cross=line_cross,real=real,room=room,program_bytes=sizes.get('CT'))
             del line_cross
             del ct,tc,cm
         models=(sectors[0]['model'],sectors[1]['model'],*cross['models'])
@@ -628,6 +636,8 @@ def construct_diagonal_sector_round(samples, moments, meta, config, geometry, *,
     budget.batch_width=len(geometry['ids'])
     budget.retained_panels=tuple(retained)
     budget.face_room=geometry.get('face_room')
+    # Face: the reduction is priced at its sector's compiled program (sector_batch_width).
+    budget.program_bytes=geometry.get('program_bytes')
     # Priced as sector_execution's route decision prices the local round.
     if execution=='local':
         budget.ritz_budget=recipe['pole_budget']
@@ -706,7 +716,7 @@ def construct_diagonal_sector_round(samples, moments, meta, config, geometry, *,
     if execution == 'face':
         reduced=face_reduce_round(states,infinity,tables,real=geometry['real'],mesh=mesh_xy,
             budget=budget,ordered=True,odd_moments=True,keep_budget=recipe['pole_budget'],retain_span=True,
-            gram_keep=gram_keep,admit=False,room=budget.face_room)
+            gram_keep=gram_keep,admit=False,room=geometry.get('room'))
     else:
         # The kept span on the Ritz carrier: the ladder rung of this sector's
         # largest kept count so far (carrier_history), as the scalar model's.
@@ -734,7 +744,7 @@ def construct_diagonal_sector_round(samples, moments, meta, config, geometry, *,
 
 
 def construct_cross_sector_round(sectors, samples, moments, meta, config, *,
-                                 mesh_xy, sample_ids, line_cross, real):
+                                 mesh_xy, sample_ids, line_cross, real, room=None, program_bytes=None):
     """Run CT on the two current-map diagonal spans, keeping both outputs.
 
     ``samples=(CT,TC)`` contains the native rectangular Wc/dWc_ds rounds at
@@ -743,6 +753,9 @@ def construct_cross_sector_round(sectors, samples, moments, meta, config, *,
     moments is the CT M0..M3 round. All operators are parent-sharded. The
     signed physical photon interaction is admitted by the unchanged positive
     retained-H checks, not by the scalar positive-V upper passivity bound.
+    A face round is priced at CT's compiled ``program_bytes`` (``sector_batch_width``)
+    and decides its eighs against ``room(compiled)``, the room beside its
+    whole-chain program compiled on the arrays it runs (also its retry).
     """
     import copy
     import jax
@@ -765,7 +778,7 @@ def construct_cross_sector_round(sectors, samples, moments, meta, config, *,
         mesh_xy=mesh_xy,ledger=meta.shared_pole_capacity,
         upstream=meta.shared_pole_capacity.live_stages,execution=execution)
     budget.batch_width = charge['model'][0].shape[0]
-    budget.face_room = charge['budget'].face_room
+    budget.program_bytes = program_bytes
     budget.retained_panels = (*retained,*ct.values(),*tc.values(),*moments.values(),
         *(panels for stored in line_cross for panels,_ in stored.values()))
     # Cross assembly has rectangular original pencils; only the projected
@@ -808,10 +821,11 @@ def construct_cross_sector_round(sectors, samples, moments, meta, config, *,
         budget.retained_panels=(*base_panels,*jax.tree.leaves((actions,packed)))
     side=sum(s[4].shape[-1] for s in packed)
     budget.plan(side,phase='cross_reduction',cross_original_sides=original_sides)
-    cross_eigh=budget.eigenplan(side)
-    signed,diagnostics=reduce_cross_round(*packed,tuple(actions),
-        tuple(moments[f'M{i}'] for i in range(4)),mesh_xy=mesh_xy,
-        eigh_plan=cross_eigh)
+    args=(*packed,tuple(actions),tuple(moments[f'M{i}'] for i in range(4)))
+    if execution=='face':
+        from gw.shared_pole_execution import compiled_bytes,cross_parent_program,face_eigh
+        budget.face_room=room(compiled_bytes(cross_parent_program(mesh_xy,face_eigh(mesh_xy,side)),*args))
+    signed,diagnostics=reduce_cross_round(*args,mesh_xy=mesh_xy,eigh_plan=budget.eigenplan(side))
     for name in ('gram_valid','retained_metric_positive'):
         if not bool(jnp.all(diagnostics[name][:real])):
             raise ValueError(f'GATE shared_pole_sector_{name}: sector=CT; '
@@ -1320,6 +1334,8 @@ def sector_execution(meta, config, mu_bases, nq, *, mesh_xy, upstream):
                                    packed_extent=local_meta.n_rmu_padded,
                                    line_width=extent(max(1,local_meta.n_rmu if cap is None else min(cap,local_meta.n_rmu))),
                                    signed_side_bound=extent(2*local_recipe['pole_budget']) if local_recipe['pole_budget'] is not None else route['conservative_pencil_side'],
+                                   infinity_width=extent(max(1,int(local_recipe['infinity_width']))),
+                                   pole_budget=local_recipe['pole_budget'],
                                    span_columns=retained_span_columns(side,kept),**route))
     # CT retains both diagonal spans and both rectangular sample stacks. The
     # CC/TT admission alone cannot promise that their joint pencil fits one
