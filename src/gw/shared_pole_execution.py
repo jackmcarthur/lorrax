@@ -579,7 +579,8 @@ def sector_batch_width(meta, resolution, recipe, routes, *, mesh, ledger, nq):
     sizes, seconds = {}, dict(CC=0.0, TT=0.0, CT=0.0)
 
     def program_bytes(width):
-        sizers = {name: partial(face_reduction_bytes, mesh, width, keep_budget=row['pole_budget'], carrier=None,
+        sizers = {name: partial(face_reduction_bytes, mesh, width, keep_budget=row['pole_budget'],
+                                carrier=face_ritz_carrier(mesh, row['pole_budget']),
                                 retain_span=True, infinity_arrays=5, **shape,
                                 gram_keep=gates['normalized_gram_keep']['sector_threshold'])
                   for name, shape, row in zip(('CC', 'TT'), shapes, routes)}

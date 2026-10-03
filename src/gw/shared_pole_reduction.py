@@ -336,8 +336,8 @@ def reduce_ordered_shared_pole_pencil(pencil, active_columns, *, eigh, matmul, g
     Returns (b [b,n,R], poles2 [b,R], active [b,R]), the signed model
     (c [b,n,R], mu [b,R], retained [b,R]) and device diagnostics.
     With ``retain_span``, also return the original-pencil coefficient map
-    Y [b,R,K] on the solve's own K columns (K = R on a face, twice the Ritz
-    carrier on a rank-local pencil), with O Y = c[..., :K] and
+    Y [b,R,K] on the solve's own K columns (K twice the Ritz carrier, R on
+    a face pencil given none), with O Y = c[..., :K] and
     Y.H H Y = diag(retained[..., :K]), for the CT joint projection. The
     signed model's columns past K are zero padding, so Y carries none.
     This map stays inside the parent-local round.

@@ -621,7 +621,7 @@ def construct_diagonal_sector_round(samples, moments, meta, config, geometry, *,
                                            select_round_states,infinity_directions)
     from gw.shared_pole_local import round_tables,reduce_round,grow_round,carrier_history
 
-    from gw.shared_pole_execution import is_face, face_reduce_round
+    from gw.shared_pole_execution import is_face, face_reduce_round, face_ritz_carrier
     execution='face' if is_face(samples['Wc']) else 'local'
     components=int(geometry['components'])
     basis=geometry['basis']
@@ -718,7 +718,8 @@ def construct_diagonal_sector_round(samples, moments, meta, config, geometry, *,
     if execution == 'face':
         reduced=face_reduce_round(states,infinity,tables,real=geometry['real'],mesh=mesh_xy,
             budget=budget,ordered=True,odd_moments=True,keep_budget=recipe['pole_budget'],retain_span=True,
-            gram_keep=gram_keep,admit=False,room=budget.face_room)
+            gram_keep=gram_keep,admit=False,room=budget.face_room,
+            carrier=face_ritz_carrier(mesh_xy,recipe['pole_budget']))
     else:
         # The kept span on the Ritz carrier: the ladder rung of this sector's
         # largest kept count so far (carrier_history), as the scalar model's.
