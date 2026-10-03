@@ -138,6 +138,8 @@ class MuBatchPlan:
     store_bytes: float = 0.0        # Z store per rank
     host_budget_bytes: float = 0.0  # host share per rank at plan time
     n_vertex: int = 1               # channels sharing the loop (1 charge, 3 currents)
+    # b -> X_B band chunks of a batch of b slots (1 when stage 0 fits)
+    x_chunks: object = dataclasses.field(default=None, repr=False, compare=False)
     # (b_src, n_pg, c_out, n_blk) -> the batch's working-set bytes: whole-
     # orbit source rows b_src, owner plane stage c_out rows x n_blk blocks
     # (route_g_plane_chunk)
@@ -265,7 +267,7 @@ def plan_zeta_route_g(*, meta, mesh_xy, n_q_selected: int, ngkmax: int,
         rows = {"Z rows (+1 lookahead)": 2 * n_v * _c128(Q, c, N_G)}
         d_g = 2 * _c128(n_p, ns, b, ns, Gp)                 # D~ L+R, one copy
         return [
-            dict(rows, **{"X_B": 2 * _c128(n_p, nb, ns, b) + _c128(n_p, Gp, b),
+            dict(rows, **{"X_B": 2 * _c128(n_p, -(-nb // x_chunks(b)), ns, b) + _c128(n_p, Gp, b),
                           "pair projectors (GEMM out, all-to-all out)": 2 * d_g}),
             dict(rows, **{"pair projectors (owner)": d_g,
                           "D cylinder (plane block)": _c128(nk, n_ap, ns, 2 * co, ns, n_col)
@@ -277,6 +279,16 @@ def plan_zeta_route_g(*, meta, mesh_xy, n_q_selected: int, ngkmax: int,
                           "k-conv + Z": 9 * _c128(nk, co, r_pl) + 3 * n_v * _c128(Q, co, r_pl),
                           "ζ cylinder accumulator": n_v * _c128(Q, co, n_zc, n_za)}),
         ]
+
+    def x_chunks(b):
+        """X_B (replicated, b·nb wide) in the fewest band chunks whose stage 0
+        fits the target, and never wider than one side of the pair projectors
+        it feeds: 1 whenever stage 0 fits, so X_B stops growing with P."""
+        per_band = 2 * _c128(n_p, 1, ns, b)
+        rest = (base_total + psi_bytes + 2 * n_v * _c128(Q, b // P_, N_G)
+                + _c128(n_p, Gp, b) + 4 * _c128(n_p, ns, b, ns, Gp))
+        room = max(target - rest, _c128(n_p, ns, b, ns, Gp))
+        return -(-nb // max(1, int(room // max(per_band, 1.0))))   # b = 0: the empty baseline
 
     def ws(b, n_pg, c_out=None, n_blk=1):
         return max(stages(b, n_pg, c_out, n_blk), key=lambda d: sum(d.values()))
@@ -323,8 +335,8 @@ def plan_zeta_route_g(*, meta, mesh_xy, n_q_selected: int, ngkmax: int,
             # c = 1, amortized as c/(c+1) (VI3 P16 A100 measurement); the
             # comm-model service prices the two collectives.
             c_ = b // P_
-            t_b = (comm_model.comm_time(_c128(nk, nb, ns, b), P_ - 1)
-                   + comm_model.comm_time(2 * _c128(nk, ns, b, ns, Gp), P_ - 1)
+            t_b = (comm_model.comm_time(_c128(n_p, nb, ns, b), P_ - 1)
+                   + comm_model.comm_time(2 * _c128(n_p, ns, b, ns, Gp), P_ - 1)
                    + 3e-3 * n_grp + 0.65 * (c_ + 1) / 2)
             cands.append((n_b * t_b, n_pg, b))
         if n_pg >= n_a:
@@ -338,7 +350,7 @@ def plan_zeta_route_g(*, meta, mesh_xy, n_q_selected: int, ngkmax: int,
           if len(cands) > 1 else None)
     base["conj ψ(G) slice (resident)"] = psi_bytes
     # The all-to-all floor: every pair projector crosses the network once.
-    t_a2a_floor = mu * 2 * _c128(nk, ns, 1, ns, Gp) / comm_model.BETA_BPS
+    t_a2a_floor = mu * 2 * _c128(n_p, ns, 1, ns, Gp) / comm_model.BETA_BPS
     n_batch = math.ceil(mu / b)
     per_g = 6.0 * _c128(Q_pad, mu, 1, shard=P_)
     g_tile = int(max(P_, (0.25 * target // max(per_g, 1.0)) // P_ * P_))
@@ -359,19 +371,20 @@ def plan_zeta_route_g(*, meta, mesh_xy, n_q_selected: int, ngkmax: int,
     store_total = n_v * Q * mu * N_G * 16.0
     transfer = {
         f"pair-projector all-to-all (floor {t_a2a_floor:.0f} s)":
-            mu * 2 * _c128(nk, ns, 1, ns, Gp),
-        f"X_B psum ({_c128(nk, nb, ns, b) / 1e6:.0f} MB per batch)":
-            mu * _c128(nk, nb, ns, 1),
+            mu * 2 * _c128(n_p, ns, 1, ns, Gp),
+        f"X_B psum ({_c128(n_p, nb, ns, b) / 1e6:.0f} MB per batch, "
+        f"{x_chunks(b)} band chunk(s))":
+            mu * _c128(n_p, nb, ns, 1),
         "Z store write": store_total / P_, "Z store read": store_total / P_,
     }
     return MuBatchPlan(
         green_tile_bytes=float(green), min_config_bytes=float(need_min),
         collectives_per_batch=2, t_model_s=float(t_model), runner_up=ru,
         store_bytes=float(store), host_budget_bytes=float(host_budget),
-        min_call_bytes=float(_c128(nk, nb, ns, b)),
+        min_call_bytes=float(_c128(n_p, -(-nb // x_chunks(b)), ns, b)),
         min_efficient_bytes=comm_model.min_efficient_payload(P_ - 1),
         n_vertex=n_v, route='G', source='resident', band_chunk=int(nb), k_chunk=int(nk),
-        working_set=working_set, min_c=int(c_orb), c_out=int(c_out), n_blk=int(n_blk),
+        working_set=working_set, x_chunks=x_chunks, min_c=int(c_orb), c_out=int(c_out), n_blk=int(n_blk),
         b=int(b), n_batch=int(n_batch), r_sub=int(n_pg), row_chunk=0, n_planes=int(n_a),
         g_tile=int(g_tile), placement=placement,
         hwm_bytes=float(hwm), budget_bytes=float(budget),
@@ -383,22 +396,26 @@ def _plane_stage(working_set, target, *, c_plan: int, c_src: int, n_pg: int,
     """The owner's plane stage ``(c_out, n_blk, fits)`` for bins of ``c_src`` rows.
 
     ``c_out`` is the widest balanced chunk of the ``c_src`` rows, at most
-    ``c_plan``, whose working set fits ``target`` with the whole plane axis
-    in one block; when even one row does not fit, the plane axis is cut into
-    the fewest blocks that do (each block redoes the unfold).  When one plane
-    group per block does not fit, that smallest split is returned with
-    ``fits = False``.
+    ``c_plan``, whose working set fits the cap with the whole plane axis in
+    one block; when even one row does not fit, the plane axis is cut into the
+    fewest blocks that do (each block redoes the unfold).  The cap is
+    ``target``, or the smallest split's working set when that is larger: the
+    source stage (X_B, the pair GEMM, the all-to-all) does not depend on the
+    split, so a split under the bytes it already holds costs nothing (CrI3
+    24x24 bispinor P64: 3 blocks, not 250).  ``fits`` says whether the
+    returned split is within ``target``.
     """
     P_, c_src = int(n_ranks), int(c_src)
     c_plan = max(1, int(c_plan))
-    fits = lambda c_out, n_blk: working_set(P_ * c_src, n_pg, c_out, n_blk) <= target
-    for n_ch in range(-(-c_src // c_plan), c_src + 1):
-        if fits(-(-c_src // n_ch), 1):
-            return -(-c_src // n_ch), 1, True
     n_grp = -(-int(n_planes) // int(n_pg))
+    at = lambda c_out, n_blk: working_set(P_ * c_src, n_pg, c_out, n_blk)
+    cap = max(float(target), at(1, n_grp))
+    for n_ch in range(-(-c_src // c_plan), c_src + 1):
+        if at(-(-c_src // n_ch), 1) <= cap:
+            return -(-c_src // n_ch), 1, at(-(-c_src // n_ch), 1) <= target
     for n_blk in range(2, n_grp + 1):
-        if fits(1, n_blk):
-            return 1, n_blk, True
+        if at(1, n_blk) <= cap:
+            return 1, n_blk, at(1, n_blk) <= target
     return 1, n_grp, False
 
 

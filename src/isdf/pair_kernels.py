@@ -27,9 +27,10 @@ def pair_projectors_lr(x_b, psi_bar_chunk, w_l, w_r):
 
     Parameters
     ----------
-    x_b : (n_bc, n_parent, bc_w, ns, b) complex128
+    x_b : (n_bc, n_parent, bc_w, ns, b) complex128, or callable ``bc -> (n_parent, bc_w, ns, b)``
         ``X_B = ψ_{n k̄ s}(r_μ)`` of the batch centroids per band chunk, raw
-        parent k̄ order.  Pad centroid slots and pad bands are zero.
+        parent k̄ order.  Pad centroid slots and pad bands are zero.  A
+        callable forms each chunk inside the scan (route G's bounded X_B).
     psi_bar_chunk : callable ``bc -> (n_parent, bc_w, ns, cols) complex128``
         ``conj ψ`` of band chunk ``bc`` (a traced int32) on this rank's
         columns, k-leading and contiguous: ``lambda bc: psi_bar[bc]`` for a
@@ -47,16 +48,16 @@ def pair_projectors_lr(x_b, psi_bar_chunk, w_l, w_r):
     def gemm(bc):
         # ponytail: one form for every shape -- a GEMM per side on the stored
         # conj(psi); the stacked L|R GEMM ran no faster and its split pass cost more.
-        x = jnp.transpose(x_b[bc], (0, 2, 3, 1))              # (k, a, m, n): small
+        x = jnp.transpose(x_b(bc) if callable(x_b) else x_b[bc], (0, 2, 3, 1))  # (k, a, m, n)
         y = psi_bar_chunk(bc)
         return (jnp.einsum('kamn,kndr->kamdr', x * w_l[bc], y),
                 jnp.einsum('kamn,kndr->kamdr', x * w_r[bc], y))
 
     acc = gemm(0)
-    if int(x_b.shape[0]) > 1:
+    if int(w_l.shape[0]) > 1:
         # ponytail: plain add of each chunk (no in-place GEMM accumulate); the
         # resident route-G slice is one chunk, so the scan runs only for streamed bands.
         acc, _ = jax.lax.scan(
             lambda a, bc: (jax.tree.map(jnp.add, a, gemm(bc)), None), acc,
-            jnp.arange(1, int(x_b.shape[0]), dtype=jnp.int32), unroll=1)
+            jnp.arange(1, int(w_l.shape[0]), dtype=jnp.int32), unroll=1)
     return acc

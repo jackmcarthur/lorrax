@@ -243,7 +243,7 @@ the factors and the store are priced n_vertex times; everything else once.
 | centroid faces, C factor | the parent faces; ceil(Q/P)·μ²·16 (`local`) or Q·μ²·16 (`replicated`) | whole fit |
 | sphere tables | 12·N_k·N'_G + 4·N_k·n_col·n_s + 8·Q·N_G | whole fit |
 | Z rows, current batch and one lookahead | 2·Q·c·N_G·16 | every stage |
-| X_B and its phase matrix | 2·n_p·n_b·ns·b·16 + n_p·N'_G·b·16 | stage 1 |
+| X_B (one band chunk) and its phase matrix | 2·n_p·⌈n_b/n_x⌉·ns·b·16 + n_p·N'_G·b·16 | stage 1 |
 | pair projectors, GEMM output and all-to-all output | 4·n_p·ns²·b·N'_G·16 | stage 1 |
 | pair projectors on the owner | 2·n_p·ns²·b·N'_G·16 | stage 2 (and 3 when streamed) |
 | D cylinder, one plane block | N_k·(n_a'/n_blk)·ns²·2c_out·n_col·16 | stages 2–3 |
@@ -278,6 +278,11 @@ The planner decides in this order:
    collectives (`gw.comm_model.comm_time`), plus 3 ms per plane group, plus
    0.65 s·(c+1)/2 of owner work, times the batch count. The cheapest wins,
    and the receipt names the runner-up.
+   X_B is replicated and b ≥ P·c_orb, so it grows with P. It is formed in
+   the fewest band chunks n_x whose stage 1 fits the target, inside the pair
+   GEMM's band scan, and never wider than one side of the pair projectors it
+   feeds; n_x = 1 whenever stage 1 fits (CrI3 24×24 bispinor: 1 at P64,
+   2 at P256).
 4. **G tile.** G_tile is the largest multiple of P with
    G_tile·6·ceil(Q/P)·μ·16 ≤ target/4,
    capped at ceil(N_G/P)·P.
@@ -292,9 +297,12 @@ planner's floor keeps every bin within the plan (CrI3 24×24 P36: 12-member
 orbits make the batch 432, which the plan prices, not 36).
 `route_g_plane_chunk` prices the packed batch: the source rows (X_B, pair
 projectors, Z rows, and the owner's D̃ kept live across chunks) at b = P·c,
-the plane stage at the widest balanced c_out ≤ b/P that fits the target with
+the plane stage at the widest balanced c_out ≤ b/P that fits the cap with
 one plane block, down to one row, then at one row with the fewest plane
-blocks that fit, else one row with one plane group per block. The compiled
+blocks that fit, else one row with one plane group per block. The cap is the
+target, or the bytes the source stage already holds when they are more: that
+stage does not depend on the split (CrI3 24×24 bispinor P64: 3 blocks under
+its 69 GB source stage, where the target alone gave 250). The compiled
 check reads that price at the planned chunk, with the widest orbit as its
 minimum chunk: a minimum chunk over the room warns and runs. Every rank runs
 the smallest chunk any rank chose (`runtime.aot_memory.agreed_chunk`).

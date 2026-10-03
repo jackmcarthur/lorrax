@@ -350,7 +350,7 @@ def _fit_mubatch(
             n_col=int(cyl[0].shape[1]), n_s=int(cyl[0].shape[2]),
             plane_from_col=plane_from_col, n_pg=int(plan.r_sub),
             axis=axis, n_src=n_par, vertices=vertices, c_out=c_out, n_blk=n_blk,
-            vertex_terms=vertex_terms)
+            n_xc=int(plan.x_chunks(int(mb.b))), vertex_terms=vertex_terms)
         kernel = zmb.make_route_g_kernel(**kern_args)
         with timing.section("zeta_fit.mubatch.compile"):
             compiled = kernel.lower(*launch_args(0, mb)).compile()
@@ -403,7 +403,8 @@ def _fit_mubatch(
     n_batch = int(mb.n_batch)
     print_fn(f"  μ-batch fit (route G): {n_batch} batches of {b} centroids "
              f"(whole orbits per owner; planned {int(plan.b)}; planes {c_out} "
-             f"of each owner's {int(mb.c)} rows at a time, {n_blk} plane block(s)), "
+             f"of each owner's {int(mb.c)} rows at a time, {n_blk} plane block(s), "
+             f"X_B in {kern_args['n_xc']} band chunk(s)), "
              f"{int(plan.r_sub)} planes per group, "
              f"{n_par} parent k -> {nk}, ψ sphere {ngk_psi} "
              f"slots ({s_ax.carrier // P_}/rank), channels μ_L={list(vertices)}, "

@@ -209,7 +209,7 @@ def _spin_sandwich(U, d):
 def make_route_g_kernel(*, mesh: Mesh, kgrid, fft_grid, ns: int, b: int,
                         q_sel, q_axis, q_neg, qvec_frac, n_col: int, n_s: int,
                         plane_from_col, n_pg: int, axis: int, n_src: int, vertices=(0,),
-                        c_out: int | None = None, n_blk: int = 1,
+                        c_out: int | None = None, n_blk: int = 1, n_xc: int = 1,
                         vertex_terms=None,
                         stop_at: str | None = None):
     """Compile-once executable for one μ batch on route G.
@@ -243,7 +243,10 @@ def make_route_g_kernel(*, mesh: Mesh, kgrid, fft_grid, ns: int, b: int,
     rows from the owner's whole-orbit pair projectors, so no row crosses an
     owner.  The D cylinder is built ``n_blk`` blocks of planes at a time
     (default 1: all planes); each block's axis DFT lands on its own planes,
-    and the unfold and cylinder gather are redone per block.
+    and the unfold and cylinder gather are redone per block.  X_B is formed
+    in ``n_xc`` band chunks inside the pair GEMM's band scan (default 1:
+    whole; the planner's ``x_chunks``), so the replicated X_B stays bounded
+    as ``b`` grows with P.
 
     Operands: ``psi_bar (n_src, nb, ns, ngk_pad)`` = conj ψ(G) of the raw
     parents, G sharded ``P(None, None, None, ('x','y'))``; ``g3 (n_src,
@@ -326,7 +329,7 @@ def make_route_g_kernel(*, mesh: Mesh, kgrid, fft_grid, ns: int, b: int,
            hash(q_sel.tobytes()), q_axis,
            None if q_neg is None else hash(q_neg.tobytes()), hash(qv.tobytes()),
            int(n_col), int(n_s), hash(pfc.tobytes()), int(n_pg), int(axis), int(n_src),
-           vertices, vertex_terms, c_out, n_blk, stop_at)
+           vertices, vertex_terms, c_out, n_blk, int(n_xc), stop_at)
     hit = _kernel_cache.get(key)
     if hit is not None:
         return hit
@@ -346,15 +349,35 @@ def make_route_g_kernel(*, mesh: Mesh, kgrid, fft_grid, ns: int, b: int,
         # 1. X_B = ψ_{nks}(r_μ) = Σ_G c e^{2πi(k+G)·x_μ}/√N, one psum
         kg = kvecs[:, None, :] + g3.astype(jnp.float64)            # (k, Gp, 3)
         ph = jnp.exp(2j * jnp.pi * jnp.einsum('kgd,md->kgm', kg, xmu))
-        X = jnp.einsum('knsg,kgm->knsm', jnp.conj(psi_bar), ph) / np.sqrt(N)
-        X = jax.lax.psum(X, _XY) * live[None, None, None, :]
+
+        def x_of(psi):
+            X = jnp.einsum('knsg,kgm->knsm', jnp.conj(psi), ph) / np.sqrt(N)
+            return jax.lax.psum(X, _XY) * live[None, None, None, :]
+
         n_g = int(zflat.shape[-1])
         chk = lambda a: (jnp.zeros((Q, c, n_g), jnp.complex128) + jnp.sum(jnp.abs(a)),) * n_v
-        if stop_at == 'x':
-            return chk(X)
-        # 2. pair GEMM in G space on this rank's slice (one band chunk)
-        D_l, D_r = pair_projectors_lr(X[None], lambda bc: psi_bar,
-                                      w_l[None], w_r[None])     # (k, s, b, s, Gp)
+        # 2. pair GEMM in G space on this rank's slice, X_B one band chunk at a
+        # time when n_xc > 1 (the last chunk starts early; its repeated bands
+        # carry zero weight)
+        if n_xc == 1:
+            X = x_of(psi_bar)
+            if stop_at == 'x':
+                return chk(X)
+            D_l, D_r = pair_projectors_lr(X[None], lambda bc: psi_bar,
+                                          w_l[None], w_r[None])  # (k, s, b, s, Gp)
+        else:
+            nb_ = int(psi_bar.shape[1])
+            bw = -(-nb_ // n_xc)
+            own = np.arange(n_xc)[:, None] * bw
+            j0 = np.minimum(own, nb_ - bw)
+            jj = j0 + np.arange(bw)[None, :]
+            psi_c = lambda bc: jax.lax.dynamic_slice_in_dim(
+                psi_bar, jnp.asarray(j0[:, 0], jnp.int32)[bc], bw, axis=1)
+            if stop_at == 'x':
+                return chk(x_of(psi_c(0)))
+            keep = jnp.asarray(jj >= own)
+            D_l, D_r = pair_projectors_lr(lambda bc: x_of(psi_c(bc)), psi_c,
+                                          w_l[jj] * keep, w_r[jj] * keep)
         if stop_at == 'gemm':
             return chk(jnp.sum(jnp.abs(D_l)) + jnp.sum(jnp.abs(D_r)))
         # 3. one all-to-all: G split -> μ owners, [L | R] owner-major
@@ -365,6 +388,7 @@ def make_route_g_kernel(*, mesh: Mesh, kgrid, fft_grid, ns: int, b: int,
             return chk(D)
         D = jnp.concatenate([D, jnp.zeros(D.shape[:4] + (1,), D.dtype)], axis=-1)
         ngk1 = int(D.shape[-1])
+        D = D.reshape(n_src, ns, 2, c, ns, ngk1)
 
         # The axis DFT of every k onto the planes, a block at a time: the D
         # cylinder (k, plane, s, μ, s, column), plane axis padded to whole blocks.
@@ -381,9 +405,11 @@ def make_route_g_kernel(*, mesh: Mesh, kgrid, fft_grid, ns: int, b: int,
                 def cyl_k(_, k):
                     # the typed unfold of the parent's pair projectors to child k
                     p, s_ = irr[k], sym[k]
-                    d = D[p].reshape(ns, 2, c, ns, ngk1)
+                    # one gather of the chunk's rows: no whole-bin slab per child
+                    rows = lperm[s_]
+                    d = jnp.moveaxis(D[jnp.full_like(rows, p), :, :, rows], 0, 2)  # (s, 2, c_out, s, G)
                     wl = jnp.exp(2j * jnp.pi * (lL[s_].astype(jnp.float64) @ kvecs[p]))
-                    d = jnp.take(d, lperm[s_], axis=2) * wl[None, None, :, None, None]
+                    d = d * wl[None, None, :, None, None]
                     d = jnp.take(d, pslot[k], axis=-1) * jnp.conj(phase[k])
                     d = jnp.where(anti[k], jnp.conj(d), d)
                     d = _spin_sandwich(U[k], d)
