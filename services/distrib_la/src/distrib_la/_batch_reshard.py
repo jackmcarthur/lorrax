@@ -38,6 +38,7 @@ from functools import partial
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
 from distrib_la._result_check import native_eigh
@@ -578,8 +579,9 @@ def reshard_rounds_call(op: str, mesh: Mesh, A, *, rounds: int):
     if fn is None:
         program = reshard_program(op, mesh, (((m, n, n), str(A.dtype)),))
         face, replicated = NamedSharding(mesh, P(None, "x", "y")), NamedSharding(mesh, P())
-        starts = jnp.asarray([min(r * m, nb - m) for r in range(rounds)], jnp.int32)
-        real = jnp.zeros((), A.dtype).real.dtype
+        # Host constants: the program may first be built inside a caller's trace.
+        starts = np.asarray([min(r * m, nb - m) for r in range(rounds)], np.int32)
+        real = np.empty((), A.dtype).real.dtype
 
         @partial(jax.jit, out_shardings=(replicated, face))
         def fn(a):
