@@ -527,12 +527,14 @@ def main(argv=None):
                 "htransform E_nk bandwidth", np.array([_spread]),
                 0.0, 20.0 * RYD_TO_EV, unit="eV", print_fn=log)
 
-        ctilde = compact_galerkin_state(ctilde, mesh_xy, log_fn=log)
         # Band operators come from the WFN states, so their Galerkin image
         # C^T O C^* takes the unrotated rows; only H takes the QP rotation.
-        wfn_ctilde = (compact_galerkin_state(basis.ctilde, mesh_xy, log_fn=log)
-                      if _qp_rotations_path is not None
-                      and (args.color or args.moments_grid) else ctilde)
+        ctilde, wfn_ctilde = (
+            (compact_galerkin_state(ctilde, mesh_xy, log_fn=log),
+             compact_galerkin_state(basis.ctilde, mesh_xy, log_fn=log))
+            if _qp_rotations_path is not None
+            and (args.color or args.moments_grid) else
+            (compact_galerkin_state(ctilde, mesh_xy, log_fn=log),) * 2)
         del basis
 
         kpath_data = initialize_kpath(wfn, params)
