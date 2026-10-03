@@ -223,6 +223,12 @@ def construct_sector_poles(bank, meta, config, *, mesh_xy, output):
         for row in execution_rows:
             row['batch_admission'] = batch_admission
             row['parent_batch'] = batch_width
+    # distrib_la decides the face eigh stacks against the room beside the
+    # admitted sector batch (whole matrices per rank where they fit).
+    from gw.shared_pole_capacity import face_eigh_room
+    face_room = face_eigh_room(batch_admission) if resolved_execution == 'face' else None
+    for row in execution_rows if resolved_execution == 'face' else ():
+        row['face_eigh_room_bytes_per_rank'] = dict(selection=face_room, reduction=face_room)
     sector_models,model_residence=_sector_model_residence(meta,config,header,bank['mu_bases'],
         execution_rows,mesh_xy=mesh_xy,root=root,upstream=upstream,route=resolved_execution)
     if sector_models is not None:
@@ -241,7 +247,7 @@ def construct_sector_poles(bank, meta, config, *, mesh_xy, output):
                     line=read_line(io,family)
                 geometry=dict(components=3 if family else 1,basis=bank['mu_bases'][family],
                     ids=ids,real=real,header=sector_headers[family],sample_ids=dense_fit,
-                    sector=name)
+                    sector=name,face_room=face_room)
                 model=construct_diagonal_sector_round(samples,exact,meta,config,geometry,
                     mesh_xy=mesh_xy,retained=retained,line=line)
                 del samples,exact,line
@@ -618,6 +624,7 @@ def construct_diagonal_sector_round(samples, moments, meta, config, geometry, *,
                                execution=execution)
     budget.batch_width=len(geometry['ids'])
     budget.retained_panels=tuple(retained)
+    budget.face_room=geometry.get('face_room')
     # Priced as sector_execution's route decision prices the local round.
     if execution=='local':
         budget.ritz_budget=recipe['pole_budget']
@@ -692,7 +699,7 @@ def construct_diagonal_sector_round(samples, moments, meta, config, geometry, *,
     if execution == 'face':
         reduced=face_reduce_round(states,infinity,tables,real=geometry['real'],mesh=mesh_xy,
             budget=budget,ordered=True,odd_moments=True,keep_budget=recipe['pole_budget'],retain_span=True,
-            gram_keep=gram_keep,admit=False)
+            gram_keep=gram_keep,admit=False,room=budget.face_room)
     else:
         # The kept span on the Ritz carrier: the ladder rung of this sector's
         # largest kept count so far (carrier_history), as the scalar model's.
@@ -751,6 +758,7 @@ def construct_cross_sector_round(sectors, samples, moments, meta, config, *,
         mesh_xy=mesh_xy,ledger=meta.shared_pole_capacity,
         upstream=meta.shared_pole_capacity.live_stages,execution=execution)
     budget.batch_width = charge['model'][0].shape[0]
+    budget.face_room = charge['budget'].face_room
     budget.retained_panels = (*retained,*ct.values(),*tc.values(),*moments.values(),
         *(panels for stored in line_cross for panels,_ in stored.values()))
     # Cross assembly has rectangular original pencils; only the projected
@@ -1052,7 +1060,7 @@ def reduce_cross_round(charge, transverse, cross, moments, *, mesh_xy, eigh_plan
     from gw.shared_pole_execution import is_face,cross_parent_program
     if is_face(charge[4]):
         side=charge[4].shape[-1]+transverse[4].shape[-1]
-        return cross_parent_program(mesh_xy,side)(charge,transverse,cross,moments)
+        return cross_parent_program(mesh_xy,side,eigh_plan.budget_bytes)(charge,transverse,cross,moments)
     return _local_cross_parent_program(mesh_xy,eigh_plan.native_fn)(charge,transverse,cross,moments)
 
 

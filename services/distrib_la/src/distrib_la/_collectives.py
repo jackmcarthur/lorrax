@@ -18,14 +18,15 @@ import time
 import numpy as np
 from lxkit import device_put_process_local
 
-__all__ = ["broadcast_bytes", "device_put_process_local",
+__all__ = ["agreed_minimum", "broadcast_bytes", "device_put_process_local",
            "warm_mesh_cliques"]
 
 
 _BOOTSTRAP_HEARTBEAT_MS = 60_000
 
 
-def _wait_for_bootstrap(client, key: str, rank: int) -> str:
+def _wait_for_bootstrap(client, key: str, rank: int,
+                        what: str = "rank 0 to publish NCCL ID") -> str:
     """Wait for rank 0's opaque payload; only retry the KV client's timeout.
 
     Service-local sibling of common.jax_compile_cache's wait: distrib_la is
@@ -43,8 +44,8 @@ def _wait_for_bootstrap(client, key: str, rank: int) -> str:
                     "DEADLINE_EXCEEDED:"):
                 raise
             print(
-                f"[cuSOLVERMp bootstrap] rank={rank} still waiting for rank 0 "
-                f"to publish NCCL ID key={key} "
+                f"[distrib_la] rank={rank} still waiting for {what} "
+                f"key={key} "
                 f"({time.monotonic() - started:.0f} s elapsed)", file=sys.stderr, flush=True)
 
 
@@ -79,6 +80,33 @@ def broadcast_bytes(buf: np.ndarray, *, key: str) -> np.ndarray:
             f"broadcast_bytes: received {len(payload)} bytes, "
             f"expected {buf.size}")
     return np.frombuffer(payload, dtype=np.uint8).copy()
+
+
+_AGREEMENTS = [0]
+
+
+def agreed_minimum(values, *, tag: str) -> tuple:
+    """Every process's integer tuple -> the elementwise minimum, on every process.
+
+    A host exchange through the distributed runtime's KV store, with no
+    device collective, so it may run while a caller's program is being
+    traced. Every process must call it the same number of times in the same
+    order (the agreement number is part of the key). Single-process jobs pass
+    through.
+    """
+    import jax
+    values = tuple(int(v) for v in values)
+    if jax.process_count() == 1:
+        return values
+    from jax._src.distributed import global_state
+    client, me = global_state.client, int(jax.process_index())
+    _AGREEMENTS[0] += 1
+    key = f"distrib_la/agree/{tag}/{_AGREEMENTS[0]}"
+    client.key_value_set(f"{key}/{me}", ",".join(str(v) for v in values))
+    rows = [tuple(int(v) for v in _wait_for_bootstrap(
+                client, f"{key}/{rank}", me, what=f"rank {rank}'s {tag}").split(","))
+            for rank in range(jax.process_count())]
+    return tuple(min(column) for column in zip(*rows))
 
 
 # CPU/MPI creates collective communicators on first use.  jaxlib refuses to

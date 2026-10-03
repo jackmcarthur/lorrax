@@ -379,9 +379,8 @@ def _direction_svd_kernel(eigh_plan, ndim):
     @jax.jit(out_shardings=(NamedSharding(eigh_plan.mesh, P()), tile))
     def extract(w):
         stack = w if w.ndim == 3 else w[None]
-        if eigh_plan.route_for(stack.shape, w.dtype) == ROUTE_BATCH_RESHARD:
-            from distrib_la._batch_reshard import batch_reshard_call
-            s, v = batch_reshard_call("normal_eigh", eigh_plan.mesh, (stack,))
+        if eigh_plan.stack_route(stack.shape, w.dtype, "normal_eigh").route == ROUTE_BATCH_RESHARD:
+            s, v = eigh_plan.reshard_stack("normal_eigh", stack)
         else:
             g = matmul(stack, stack, mesh=eigh_plan.mesh, transa="C",
                        backend=gemm_backend, batched_route="auto")
@@ -515,10 +514,9 @@ def leading_eigenvectors(W, r, *, eigh_plan, column_extent,
     if layout == 'batch':
         from distrib_la._batch_reshard import batch_layout_eigh_call
         s, q = batch_layout_eigh_call("checked_eigh", eigh_plan.mesh, W, real_rows=real_rows)
-    elif eigh_plan.route_for(W.shape if W.ndim == 3 else (1,) + W.shape, W.dtype) == ROUTE_BATCH_RESHARD:
-        from distrib_la._batch_reshard import batch_reshard_call
-        s, q = batch_reshard_call("checked_eigh", eigh_plan.mesh,
-                                  (W if W.ndim == 3 else W[None],))
+    elif eigh_plan.stack_route(W.shape if W.ndim == 3 else (1,) + W.shape, W.dtype,
+                               "checked_eigh").route == ROUTE_BATCH_RESHARD:
+        s, q = eigh_plan.reshard_stack("checked_eigh", W if W.ndim == 3 else W[None])
         if W.ndim == 2:
             s, q = s[0], q[0]
     else:

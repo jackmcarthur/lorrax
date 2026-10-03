@@ -285,7 +285,13 @@ panels to the round extent (`round_tables`; ordered originals and mirrors as two
 halves of one extent), assembles and reduces its pencil with local dense kernels
 and sorts its poles; synthetic slots are skipped. Otherwise the **face route**
 runs a parent batch on the complete mesh with `distrib_la` GEMM/`eigh`, both
-matrix axes distributed and only spectra and masks replicated. Sectors resolve
+matrix axes distributed and only spectra and masks replicated. Its eigh stacks
+(infinity, directions, partners, passivity, the Gram reduction, CT and the
+Cauchy check) go to `distrib_la` with the room beside the admitted batch
+(`face_eigh_room` of the selection or reduction admission row, the sector
+batch row for CC/TT/CT); the service runs a stack one or more whole matrices
+per rank when one slice's compiled program fits that room, else on the whole
+mesh ([eigh stacks](../services/distrib_la/api.md#eigh-stack)). Sectors resolve
 their own route (`sector_execution`, the CT joint pencil included) against
 the same ledger. The route is fixed before any read and the report line
 `Shared-pole constructor:` names it and its prices; there is no retry or

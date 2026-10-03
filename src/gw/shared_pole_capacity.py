@@ -158,14 +158,31 @@ def shared_pole_byte_terms(meta, *, mesh_xy, resolution, pencil_side,
 
 
 @lru_cache(maxsize=None)
-def constructor_eigenplan(mesh_xy, side, execution):
+def constructor_eigenplan(mesh_xy, side, execution, room=None):
     """The eigh service plan of a constructor layout: whole parents per rank
-    ('local', the q-local kernel) or the complete mesh ('face')."""
+    ('local', the q-local kernel) or the complete mesh ('face', ``face_eigh``:
+    distrib_la decides each stack against ``room``)."""
     import distrib_la
 
-    return distrib_la.plan("eigh", mesh_xy, n=int(side),
-        backend="distributed" if execution == "face" else "off",
-        batched_route="auto" if execution == "face" else "batch_reshard")
+    if execution == "face":
+        from gw.shared_pole_execution import face_eigh
+        return face_eigh(mesh_xy, int(side), room)
+    return distrib_la.plan("eigh", mesh_xy, n=int(side), backend="off",
+                           batched_route="batch_reshard")
+
+
+def face_eigh_room(admission, retained_outputs=0):
+    """Room per rank for a face constructor's eigh stacks, or None.
+
+    ``admission`` is a face batch admission row (``face_batch_width``,
+    ``sector_batch_width``) and ``retained_outputs`` the receipt's upper bound
+    on the factors every parent keeps, when the row does not hold them. Both
+    are shape prices, so every rank agrees on the room. It is floored to a
+    whole GiB, so SC maps whose admissions differ by less share programs.
+    """
+    room = (int(admission['available_device_bytes_per_rank'])
+            - int(admission['aggregate_bytes_per_rank']) - int(retained_outputs))
+    return (room >> 30) << 30 if room >= 1 << 30 else None
 
 
 def _shard_bytes(array):
@@ -232,10 +249,15 @@ class ConstructorCapacity:
         self.ritz_budget = None
         # A bispinor sector round also returns its coefficient map Y.
         self.retain_span = False
+        # Face route: room per rank beside the admitted live set, which
+        # distrib_la reads to run an eigh stack one whole matrix per rank.
+        self.face_room = None
 
     def eigenplan(self, side):
-        """One service plan per configured execution layout and actual side."""
-        return constructor_eigenplan(self._mesh_xy, int(side), self.execution)
+        """One service plan per configured execution layout and actual side;
+        a face plan decides its stacks against ``face_room``."""
+        return constructor_eigenplan(self._mesh_xy, int(side), self.execution,
+                                     self.face_room if self.execution == "face" else None)
 
     def query_workspace(self, op, shapes, plan):
         """Native workspace bytes per rank for one op at one shape, cached."""
@@ -285,9 +307,12 @@ class ConstructorCapacity:
             eigen_side = max(side // 2, 2 * min(side // 2, int(self.ritz_budget)))
         extents = {n} if phase == "selection" else (
             {side if eigen_side is None else int(eigen_side)} if phase in ("reduction", "cross_reduction") else {n})
-        # Eigh scratch is transient: replace it at each phase boundary.
+        # Eigh scratch is transient: replace it at each phase boundary. It is
+        # priced on the whole-mesh plan: the room distrib_la reads to run a
+        # stack one whole matrix per rank is what this admission leaves over.
         self._native_maxima["eigh"] = max(self.query_workspace(
-            "eigh", ((self.batch_width, extent, extent),), self.eigenplan(extent))
+            "eigh", ((self.batch_width, extent, extent),),
+            constructor_eigenplan(self._mesh_xy, int(extent), self.execution))
             for extent in sorted(extents))
         if self.execution == 'face':
             extent=max(n,side,*extents)
