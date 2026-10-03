@@ -5,6 +5,26 @@ results move, and what a user must change in decks, environment or files.
 The binding rulings behind breaking changes are in
 `docs/architecture/decisions.md`; older history is in git.
 
+## 2026-10-03 — sector face rounds solve on the Ritz carrier; later maps widen the sector batch
+
+The CC/TT face reduction now solves its kept span on `face_ritz_carrier`
+(the pole budget, per-rank tile on the extent ladder), as the scalar face
+route already did: its Schur and final eighs run at the carrier and twice it
+instead of at H'_vv's side and the pencil side. On CrI3 24×24 bispinor at
+P64 that is TT 9216/18432 instead of 12416/24832 (the 24832 stack ran on the
+whole mesh) and CC 6144/12288 instead of 8736/17472. After a first SC map
+that admitted fewer than every parent, later maps size the CC/TT/CT batch at
+the held sides (on their extent-ladder rung) and CT widths their rounds run at, never narrower than the
+first map, keeping free the room one whole matrix per rank of the round's
+largest eigh needs; the CT span widths are now held from map 0. Results:
+Fe 4^3 forced-face bispinor SC maps 0-2, eqp0 bitwise at map 0 and within
+0.077 µeV at maps 1-2; W response 197.2 / 55.3 / 13.6 s against main's
+196.1 / 66.9 / 14.6 s. Fe 4^3 forced-face scalar is bitwise at every map.
+With the first sector batch capped at 4 of Fe's 13 parents (an instrument),
+map 1 admits all 13 at the held sides in one round, within 0.112 µeV of main
+at the same cap; its held-side sizing costs about 80 s once. Decks do not
+change.
+
 ## 2026-10-03 — the CC/TT/CT face batch is admitted by its compiled size
 
 The bispinor sector constructor on the face route admits its parent batch by
