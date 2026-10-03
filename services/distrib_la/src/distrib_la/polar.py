@@ -515,7 +515,7 @@ def leading_eigenvectors(W, r, *, eigh_plan, column_extent,
         from distrib_la._batch_reshard import batch_layout_eigh_call
         s, q = batch_layout_eigh_call("checked_eigh", eigh_plan.mesh, W, real_rows=real_rows)
     elif eigh_plan.stack_route(W.shape if W.ndim == 3 else (1,) + W.shape, W.dtype,
-                               "checked_eigh").route == ROUTE_BATCH_RESHARD:
+                               "checked_eigh", traced=False).route == ROUTE_BATCH_RESHARD:
         s, q = eigh_plan.reshard_stack("checked_eigh", W if W.ndim == 3 else W[None])
         if W.ndim == 2:
             s, q = s[0], q[0]

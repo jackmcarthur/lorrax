@@ -107,13 +107,11 @@ def _workspace_details(plan, op, shapes, dtype):
             # A distributed eigh is checked and retried inside the program
             # (distrib_la._result_check): its XLA temporaries, and the gathered
             # retry's replicated copies where the plan admits one.
-            from distrib_la.plan import (CHECKED_EIGH_TILES, GATHERED_EIGH_BYTES,
-                                         GATHERED_EIGH_FACTOR)
+            from distrib_la.plan import (CHECKED_EIGH_TILES, GATHERED_EIGH_FACTOR,
+                                         _gathered_admitted)
             checked = CHECKED_EIGH_TILES * (n * n // (px * py)) * dtype.itemsize
-            gathered = GATHERED_EIGH_FACTOR * n * n * dtype.itemsize
-            limit = GATHERED_EIGH_BYTES if plan.budget_bytes is None else plan.budget_bytes
-            if gathered <= limit:
-                checked += gathered
+            if _gathered_admitted((n, n), dtype):
+                checked += GATHERED_EIGH_FACTOR * n * n * dtype.itemsize
         scratch += checked
         return dict(device_bytes=scratch, host_bytes=host,
                     vendor_device_bytes=device if local else None,

@@ -38,7 +38,7 @@ map on Fe 4³ bispinor with the sector route on the face.
 - **Every distributed eigh is checked** with fixed-seed probes (backward
   error within `distrib_la.roundoff_tol(n, dtype)`). A failure is solved
   again: shifted, with the vectors re-orthonormalized; then in the other
-  cuSOLVERMp layout; then gathered when it fits 64 MiB or the plan budget.
+  cuSOLVERMp layout; then gathered when it fits 64 MiB.
   Each retry prints one `distrib_la:` line on rank 0's stderr.
 - **Every distributed LU solve and Cholesky/LU `factor`/`solve`** is checked
   on its solution.

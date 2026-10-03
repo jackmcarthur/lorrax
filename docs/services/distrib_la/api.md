@@ -251,8 +251,11 @@ Nothing crosses the host.
   The decision is compiled, never a formula. The room is a caller value every
   rank shares, and the choice is agreed over ranks through the runtime's KV
   store (the fewest whole matrices per rank any rank chose), so every rank
-  runs the same route, rounds and collectives. It is printed once per
-  (op, B, n, dtype, room) by `new_stack_routes()`, which a driver prints
+  runs the same route, rounds and collectives. An eager call runs the
+  executable the decision compiled; inside a caller's trace the program is
+  compiled again as part of the caller's module, and the decision line
+  reports the sizing compile's wall (`sized in … s`). The decision is printed
+  once per (op, B, n, dtype, room) by `new_stack_routes()`, which a driver prints
   through its reporter, and listed by `describe()`. Per whole matrix at
   complex128 a rank needs 7 n² × 16 B: 3 n² compiled (input, vectors, one
   copy) and 4 n² of cuSOLVER syevd workspace (one A100, n = 3328–18304),
