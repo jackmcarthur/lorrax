@@ -55,9 +55,11 @@ object the loop used to pass.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from functools import lru_cache
 from typing import Any
 
 import jax
+import numpy as np
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
 from distrib_la.plan import (BATCHED_SCAN_UNROLL, cached_scan, ensure_sharding,
@@ -96,6 +98,9 @@ class FactorToken:
     n: int
     nbatch: int
     _factor: Any = field(repr=False)
+    #: (A^H W, ||A||) from before the factorization, which consumes A: every
+    #: solve is checked against it (distrib_la._result_check).
+    _sketch: Any = field(repr=False, default=None)
 
     def __repr__(self) -> str:                      # no factor bytes in logs
         px, py = int(self.mesh.shape["x"]), int(self.mesh.shape["y"])
@@ -143,6 +148,8 @@ def factor(op: str, A, mesh_xy: Mesh, *, backend: str = "auto",
 
     mod = backend_module(resolved)
     A = ensure_sharding(A, NamedSharding(mesh_xy, P(None, "x", "y")))
+    from distrib_la._result_check import matrix_sketch
+    sketch = _jitted(matrix_sketch)(A)
 
     if op == "solve_lu":
         if resolved not in ("scalapack", "cusolvermp"):
@@ -168,7 +175,7 @@ def factor(op: str, A, mesh_xy: Mesh, *, backend: str = "auto",
         held = _slate_potrf_stack(mod, A, mesh_xy)
 
     return FactorToken(op=op, backend=resolved, mesh=mesh_xy,
-                       n=extent, nbatch=nb, _factor=held)
+                       n=extent, nbatch=nb, _factor=held, _sketch=sketch)
 
 
 def _slate_potrf_stack(mod, A, mesh_xy: Mesh) -> tuple:
@@ -230,8 +237,28 @@ def solve(token: FactorToken, B) -> jax.Array:
             f"for the system it factored.")
     mesh = token.mesh
     B = ensure_sharding(B, NamedSharding(mesh, P(None, "x", "y")))
-    mod = backend_module(token.backend)
+    from distrib_la._result_check import (accept, call_site, refusal_message,
+                                          rhs_sketch, solve_errors)
+    # The solve consumes B; its sketch is taken first, and the result is
+    # checked against A's sketch from factor(): one cached program each and
+    # one replicated scalar read back (never returned unchecked).
+    sketch = (*token._sketch, *_jitted(rhs_sketch)(B))
+    X = _solve(token, B, mesh)
+    error = float(np.asarray(_jitted(solve_errors)(sketch, X)[0].addressable_data(0)))
+    if not error <= accept(token.n, X.dtype):
+        raise ValueError(refusal_message(f"{token.op} solve", token.n, X.dtype, call_site(), 1, error))
+    return X
 
+
+@lru_cache(maxsize=None)
+def _jitted(fn):
+    """One cached program per sketch/check function (jax.jit caches per signature)."""
+    return jax.jit(fn)
+
+
+def _solve(token, B, mesh):
+    """The library's back-solve of ``B`` against ``token``'s factor."""
+    mod = backend_module(token.backend)
     if token.op == "solve_lu":
         if token.backend == "scalapack":
             LU, ipiv = token._factor

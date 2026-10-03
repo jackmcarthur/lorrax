@@ -107,6 +107,57 @@ face layout. `ensure_sharding` is the only reshard on entry: a tracer gets a
 sharding constraint, an array already in layout passes untouched, anything
 else is placed process-locally.
 
+**No distributed result is returned unchecked** (`_result_check`). The
+distributed libraries fail silently. cuSOLVERMp 0.9.1's syevd returned wrong
+eigenvectors with status 0 and info 0 (reproduced outside LORRAX) on a
+Hermitian matrix with 680 exact-zero rows (n 2688, block 224, 2×2), on
+rank-deficient PSD responses with no zero row (n 432 to 18304) and on a
+sentinel-padded H'_vv (n 9152, 4×4). So:
+
+- Every eigh route (native, route (c), normal and polar kernels, every
+  distributed attempt) replaces exact-zero rows by distinct diagonal
+  sentinels in [−4b, −2b], b the Gershgorin bound of the rest, and returns
+  them as exact zero eigenvalues with unit vectors, in ascending order
+  (`deflate_zero_rows`; a matrix with no zero row passes through unchanged;
+  the columns are reordered only when a live eigenvalue is negative).
+- Every distributed eigh (cuSOLVERMp, SLATE, ScaLAPACK; single, scanned or
+  stacked) is checked against 8 fixed-seed probe columns X, the same on every
+  rank: ‖(AZ − Z diag(w))X‖/(‖A‖‖X‖) and ‖(ZᴴZ − I)X‖/‖X‖ within
+  `roundoff_tol(n, dtype)` = 64·n·eps, at O(n²k) beside the O(n³) solve. A
+  failed check is noted on rank 0's stderr and solved again: shifted
+  (A + sI, s the Frobenius norm of the rows that are not sentinels, which
+  moves a large near-zero cluster off the origin; its vectors are then
+  re-orthonormalized by a Newton–Schulz polar iteration, GEMMs only, which
+  converges while the singular values of Z lie in (0, √3) and otherwise falls
+  through to the next attempt), then in cuSOLVERMp's other layout, then
+  gathered on every rank when its two n² copies fit the plan's
+  `budget_bytes` (64 MiB without one, n ≤ 1448 complex). XLA reserves every
+  retry inside the program whether or not it runs; the chain's temporaries
+  (7 n²/P per rank, measured) and an admitted gathered retry are priced by
+  `workspace_bytes_per_rank`.
+- Every distributed LU solve (`plan('solve_lu').batched`) and every
+  Cholesky or LU `factor`/`solve` is checked on its actual solution through
+  sketches taken before the library consumes A and B:
+  ‖Wᴴ(AX − B)‖/(√k (‖A‖‖X‖ + ‖B‖)) within `roundoff_tol(n)`. Its operands are
+  gone, so there is no retry.
+- A result that still fails prints `GATE distrib_la_result_check` (op, n, the
+  call site, the errors) on rank 0's stderr and comes back NaN-poisoned on
+  every rank, so a caller's finite-result gate refuses; an eager call raises
+  the GATE itself if any matrix of its stack failed. The verdict is one
+  mesh-reduced scalar, so every rank takes the same branch. (A raise inside
+  the host callback is not used: it is an unordered effect, which each rank
+  meets at a different point.) An eager checked call runs as one cached
+  program per signature, call site and budget.
+
+Scope: the probes catch gross errors and missing, duplicated or
+non-orthogonal eigenpairs. They are a projection, so one eigenvalue wrong by
+δ passes while δ ≲ `roundoff_tol(n)`·√n·‖A‖_F. The bounds are backward
+errors, which a stable solver keeps near n·eps whatever the condition number.
+`services/distrib_la/bench/eigh_zero_block_check.py` and
+`eigh_conformance_check.py` (n/p ∈ {216, 257, 389, 1144, 4576}, P4 and P16)
+are the regression checks. The cuSOLVERMp handlers do not yet read `info`;
+that is a native fix for the next bundle.
+
 **Donation is declared per operation** (`DONATES`), because a caller must know
 whether its buffers survive before it knows which library runs: `eigh` donates
 nothing, `cholesky` operand 0, `solve_lu` operands 0 and 1. A donated operand

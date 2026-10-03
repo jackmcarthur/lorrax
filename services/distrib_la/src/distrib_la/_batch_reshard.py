@@ -40,6 +40,7 @@ import jax
 import jax.numpy as jnp
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
+from distrib_la._result_check import native_eigh
 from distrib_la._shard_map import shard_map
 from distrib_la.resolve import mesh_key
 
@@ -161,8 +162,7 @@ def _checked_eigh(a):
     scale = jnp.max(jnp.abs(a), axis=(-2, -1))
     valid = jnp.all(jnp.isfinite(scale) & (defect <= roundoff_tol(a.shape[-1], dtype=a.dtype) * scale))
     def solve(value):
-        values, vectors = jnp.linalg.eigh(value)
-        return values, vectors
+        return native_eigh(value)
     def refuse(value):
         return (jnp.full(value.shape[:-1], jnp.nan, dtype=value.real.dtype),
                 jnp.zeros_like(value))
@@ -187,11 +187,11 @@ def _local_stack_eigh(op: str, A, *, nbatch: int, py: int):
     real = first + jnp.arange(local_nb) < nbatch
     A = jnp.where(real[:, None, None], A, jnp.zeros((), A.dtype))
     if op == "normal_eigh":
-        w, z = _normal_svd(A, jnp.linalg.eigh)
+        w, z = _normal_svd(A, native_eigh)
     elif op == "checked_eigh":
         w, z = _checked_eigh(A)
     else:
-        w, z = jnp.linalg.eigh(A)
+        w, z = native_eigh(A)
     return (jnp.where(real[:, None], w, jnp.zeros((), w.dtype)),
             jnp.where(real[:, None, None], z, jnp.zeros((), z.dtype)))
 
@@ -512,7 +512,7 @@ def batch_reshard_call(
             if op == "polar":
                 from distrib_la.polar import _polar_from_matrix
                 def kernel(a):
-                    link, s = _polar_from_matrix(a, jnp.linalg.eigh, rcond)
+                    link, s = _polar_from_matrix(a, native_eigh, rcond)
                     return s, link
                 W, Z = (_real_rows(kernel, (A,), nbatch=nbatch, py=py)
                         if batch_pad else kernel(A))

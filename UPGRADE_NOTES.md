@@ -5,6 +5,41 @@ results move, and what a user must change in decks, environment or files.
 The binding rulings behind breaking changes are in
 `docs/architecture/decisions.md`; older history is in git.
 
+## 2026-10-02 — distributed eigh and LU solves are checked before they are returned
+
+cuSOLVERMp 0.9.1's distributed eigh returns wrong eigenvectors with status 0
+and info 0 on valid Hermitian inputs: exact-zero blocks, large near-zero
+clusters of rank-deficient PSD matrices, sentinel-padded pencils. This was
+reproduced outside LORRAX. On main the face (whole-mesh) route used some of
+these silently: 10 eighs per constructor on CrI3 24×24 charge at P16, 2 per
+map on Fe 4³ bispinor with the sector route on the face.
+
+- **Every distributed eigh is checked** with fixed-seed probes (backward
+  error within `distrib_la.roundoff_tol(n, dtype)`). A failure is solved
+  again: shifted, with the vectors re-orthonormalized; then in the other
+  cuSOLVERMp layout; then gathered when it fits 64 MiB or the plan budget.
+  Each retry prints one `distrib_la:` line on rank 0's stderr.
+- **Every distributed LU solve and Cholesky/LU `factor`/`solve`** is checked
+  on its solution.
+- **A result that no retry repairs refuses** with `GATE
+  distrib_la_result_check` (op, n, call site, errors). Inside a program the
+  result is NaN, so the caller's finite-result gate refuses too.
+- **Every eigh route deflates exact-zero rows** with sentinels relative to
+  the matrix. gw's own copies (`zero_row_safe_eigh`) are gone.
+- **Which results move:**
+  - Runs whose face eighs failed silently on main move to the correct
+    decomposition.
+  - Local-route runs move at round-off only: Fe 4³ scalar and bispinor maps
+    0–2 ≤ 0.17 µeV, from the relative sentinels and the deflation of the
+    normal and polar kernels.
+  - Forced-face Fe 4³ bispinor agrees with local to ≤ 1.3 µeV.
+- **Memory:** a checked distributed eigh reserves 7 n²/P elements per rank
+  inside a program, priced by `distrib_la.workspace_bytes_per_rank`. An eager
+  call reserves only its first attempt, about 3 n²/P, and runs any retries
+  as a separate program.
+- **Nothing to change in decks.** The check has no dial. The native
+  cuSOLVERMp handlers do not yet read `info` (next bundle).
+
 ## 2026-10-02 — planners admit by compiled size; kin_ion writes the window GW reads
 
 No result moves: Fe 4³ scalar and bispinor and Na 8³ SC maps 0–2 are bitwise.

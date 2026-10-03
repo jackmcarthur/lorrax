@@ -77,13 +77,15 @@ REPLICATED.  Eigenvectors are COLUMNS.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from functools import lru_cache
+from functools import lru_cache, partial
 from typing import Any, Callable
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
+from distrib_la._result_check import deflate_zero_rows, native_eigh
 from distrib_la.resolve import (NATIVE, NATIVE2D, OPS, backend_module,
                                 mesh_key, resolve_backend)
 
@@ -247,6 +249,27 @@ def _eigh_columns(backend: str, lam, Q):
     return lam, Q
 
 
+#: Per-rank bytes a gathered local eigh retry may take when the plan has no
+#: budget, and the n x n element copies it holds per rank. XLA reserves the
+#: retry inside every program that contains the eigh, executed or not:
+#: 1.75 n^2 per rank measured (memory_analysis, n 3328, P16), so the cap is
+#: small (n <= 1448 complex128) and planners price it (workspace.py).
+GATHERED_EIGH_BYTES = 64 << 20
+GATHERED_EIGH_FACTOR = 2
+#: The checked eigh chain's own XLA temporaries per rank, in units of
+#: n^2 / P elements (deflation, probes, retries; measured 7.0-7.1 at n 3328
+#: and 9152, P16, against 1-2 for a bare deflated eigh).
+CHECKED_EIGH_TILES = 7
+
+
+def _gathered_eigh(A, *, mesh):
+    """Eigh of the whole matrix on every rank: the last retry of a checked distributed eigh."""
+    whole = jax.lax.with_sharding_constraint(A, NamedSharding(mesh, P()))
+    values, vectors = native_eigh(whole)
+    face = NamedSharding(mesh, P(*([None] * (A.ndim - 2)), "x", "y"))
+    return values, jax.lax.with_sharding_constraint(vectors, face)
+
+
 #: (op, backend) → how to call it.
 #:
 #:   one         attribute implementing the SINGLE-tile form, or None
@@ -307,7 +330,7 @@ _IMPL: dict[tuple[str, str], dict[str, Any]] = {
 #: ``cholesky``/``solve_lu`` are not: their native routes are the
 #: replicated dense factor / per-q ridged solve chosen by a channel policy
 #: this module has no business duplicating.
-_NATIVE_CALLABLE = {"eigh": lambda A, *a, **k: jnp.linalg.eigh(A)}
+_NATIVE_CALLABLE = {"eigh": lambda A, *a, **k: native_eigh(A)}
 
 #: Which operands an op DONATES.  Declared per OP, not per backend: the
 #: caller has to know whether its buffers survive the call before it knows
@@ -533,10 +556,109 @@ class Plan:
 
     # ---- calling -------------------------------------------------------
     def _entry(self, key: str):
+        """The backend's ``one`` or ``many`` call and its result normaliser.
+
+        An FFI eigh or LU solve comes back checked (:mod:`distrib_la._result_check`,
+        ``post`` None), because the libraries fail silently: eigh with its zero
+        rows deflated, retried shifted, in another layout and gathered, and
+        refused by name if no attempt passes; an LU solve refused by name (its
+        operands are consumed).
+        """
         spec = _IMPL[(self.op, self.backend)]
         name = spec[key]
-        return (None if name is None
-                else getattr(self.module, name)), spec["post"]
+        call = None if name is None else getattr(self.module, name)
+        if call is None or self.op not in ("eigh", "solve_lu"):
+            return call, spec["post"]
+        if self.op == "solve_lu":
+            return self._checked_solve(call), None
+        return self._checked_eigh(call, spec["post"]), None
+
+    def _is_checked(self):
+        """An FFI eigh or LU solve: its result comes back checked, with a failure flag."""
+        return self.op in ("eigh", "solve_lu") and not self.is_native
+
+    def _finish(self, out, A, site):
+        """Split a checked call's replicated failure flag off; an eager call raises on it."""
+        from distrib_la._result_check import raise_if_failed
+        *result, failed = out
+        raise_if_failed(failed, self.op, int(A.shape[-1]), A.dtype, site)
+        return tuple(result) if len(result) > 1 else result[0]
+
+    def _program(self, fn, ops, kwargs, tag, site):
+        """A checked entry as one cached program for an eager call; a traced caller inlines it.
+
+        Keyed by the call's signature, the plan's budget and the call site
+        (the refusal names it), so a repeated eager call compiles once.
+        """
+        if any(isinstance(o, jax.core.Tracer) for o in ops):
+            return fn(*ops, mesh=self.mesh, _site=site, **kwargs)
+        mesh = self.mesh
+
+        def program(phase, donate):
+            key = scan_signature(self.op, self.backend, mesh, ops, kwargs,
+                                 extra=(tag, phase, self.budget_bytes, site))
+            return cached_scan(key, lambda: jax.jit(
+                lambda *o: fn(*o, mesh=mesh, _site=site, _phase=phase, **kwargs),
+                donate_argnums=donate))
+        if self.op != "eigh":
+            return program("all", self.donates)(*ops)
+        # An eager eigh runs its first attempt and check alone; the retries
+        # are a separate program, compiled and run only on the reduced
+        # failure flag, so their buffers are never reserved beside the first
+        # attempt's (EIGHSTACK: n 18304, P4, 80 GB).
+        out = program("first", ())(*ops)
+        if not bool(np.any(np.asarray(jax.device_get(out[-1].addressable_data(0))))):
+            return out
+        del out
+        return program("retry", ())(*ops)
+
+    def _checked_eigh(self, call, post):
+        from distrib_la._result_check import call_site, checked_eigh, eigh_layout, shifted
+        from distrib_la.matmul import matmul
+        backend, budget = self.backend, self.budget_bytes
+
+        def safe(A, *, mesh, _site=None, _phase="all", **kwargs):
+            def solve(a, **extra):
+                return post(backend, *call(a, mesh=mesh, **kwargs, **extra))
+            # Zero rows leave the solver as distinct sentinels (deflate_zero_rows),
+            # on every attempt. A failed check solves again: shifted (a near-zero
+            # cluster moved off the origin, the vectors re-orthonormalized), then
+            # in the other cuSOLVERMp layout, then gathered.
+            # The provider SUMMA (cuBLASMp): a single matrix never batch-reshards onto one device.
+            gemm = partial(matmul, mesh=mesh, backend="distributed", batched_route="auto")
+            pin = eigh_layout(mesh, A.ndim)
+            deflate = partial(deflate_zero_rows, constrain=pin)
+            attempts = [deflate(solve), deflate(shifted(solve, matmul=gemm))]
+            n = int(A.shape[-1])
+            if backend == "cusolvermp":
+                from distrib_la._cusolvermp import retry_block
+                block = retry_block(n, int(mesh.shape["x"]))
+                if block is not None:
+                    attempts.append(deflate(partial(solve, block=block)))
+            # A gathered local solve, where the whole matrix, its vectors and
+            # the solver's copy fit every rank: within the caller's budget, or
+            # GATHERED_EIGH_BYTES without one (a shape rule, the same on every rank).
+            limit = GATHERED_EIGH_BYTES if budget is None else budget
+            if GATHERED_EIGH_FACTOR * A.dtype.itemsize * A.size <= limit:
+                attempts.append(partial(_gathered_eigh, mesh=mesh))
+            # An eager call's first program holds the first attempt; its retry
+            # program the rest (Plan._program). A traced call holds them all.
+            attempts = {"first": attempts[:1], "retry": attempts[1:], "all": attempts}[_phase]
+            (values, vectors), failed = checked_eigh(attempts, A, site=_site or call_site(), mesh=mesh,
+                                                     final=_phase != "first")
+            return values, vectors, failed
+        return safe
+
+    def _checked_solve(self, call):
+        from distrib_la._result_check import call_site, checked, matrix_sketch, rhs_sketch, solve_errors
+
+        def safe(A, B, *, mesh, _site=None, _phase="all", **kwargs):
+            # The sketch is taken before the call, which may consume A and B.
+            sketch = (*matrix_sketch(A), *rhs_sketch(B))
+            X = call(A, B, mesh=mesh, **kwargs)
+            return checked("solve_lu", (lambda x: x,), lambda x: solve_errors(sketch, x),
+                           (X,), site=_site or call_site(), n=A.shape[-1], dtype=A.dtype)
+        return safe
 
     def __call__(self, A, *args, **kwargs):
         """Run the op on ONE tile (no batch axis).
@@ -566,6 +688,10 @@ class Plan:
                 f"go (one descriptor, one workspace).  Use plan.batched(); "
                 f"a stack of one is a legal stack.")
         ops = [ensure_sharding(x, self.in_sharding) for x in (A, *args)]
+        if self._is_checked():
+            from distrib_la._result_check import call_site
+            site = call_site()
+            return self._finish(self._program(one, ops, kwargs, "one", site), A, site)
         out = one(*ops, mesh=self.mesh, **kwargs)
         return post(self.backend, *out) if post is not None else out
 
@@ -624,9 +750,24 @@ class Plan:
                     f"entry point, so route {ROUTE_BACKEND_BATCHED!r} does "
                     f"not exist for it.  Its batched route is "
                     f"{self.batched_route!r}.")
+            if self._is_checked():
+                from distrib_la._result_check import call_site
+                site = call_site()
+                return self._finish(self._program(many, ops, kwargs, "many", site), A, site)
             out = many(*ops, mesh=self.mesh, **kwargs)
             return post(self.backend, *out) if post is not None else out
         if route == ROUTE_SCAN:
+            if self._is_checked():
+                from distrib_la._result_check import call_site
+                site = call_site()
+                if self.op != "eigh" or isinstance(A, jax.core.Tracer):
+                    return self._finish(self._scan_over_single(ops, kwargs, site=site), A, site)
+                # Eager: the retries run as a second scan only when a matrix failed.
+                out = self._scan_over_single(ops, kwargs, site=site, phase="first")
+                if bool(np.any(np.asarray(jax.device_get(out[-1].addressable_data(0))))):
+                    del out
+                    out = self._scan_over_single(ops, kwargs, site=site, phase="retry")
+                return self._finish(out, A, site)
             return self._scan_over_single(ops, kwargs)
         raise AssertionError(f"unhandled batched route {route!r}")
 
@@ -656,7 +797,7 @@ class Plan:
         ops = tuple(ensure_sharding(x, self.batch_in_sharding) for x in ops)
         return batch_reshard_call(self.op, self.mesh, ops)
 
-    def _scan_over_single(self, ops: tuple, kwargs: dict):
+    def _scan_over_single(self, ops: tuple, kwargs: dict, *, site=None, phase="all"):
         """Route (a): ``lax.scan`` over this plan's own single-matrix call.
 
         The body is exactly what :meth:`__call__` does to one tile —
@@ -691,8 +832,10 @@ class Plan:
 
         def _build():
             def _one_matrix(carry, tiles):
+                # A checked entry returns its failure flag too; the scan stacks it.
+                extra = {} if site is None else {"_site": site, "_phase": phase}
                 out = one(*(ensure_sharding(t, tile) for t in tiles),
-                          mesh=mesh, **kwargs)
+                          mesh=mesh, **extra, **kwargs)
                 return carry, (post(backend, *out) if post is not None
                                else out)
 
@@ -706,7 +849,9 @@ class Plan:
 
             return jax.jit(_scanned)
 
-        key = scan_signature(self.op, self.backend, mesh, ops, kwargs)
+        # The budget sets the retry chain and the site is named by a refusal.
+        key = scan_signature(self.op, self.backend, mesh, ops, kwargs,
+                             extra=(self.budget_bytes, site, phase))
         return cached_scan(key, _build)(*ops)
 
 

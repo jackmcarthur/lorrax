@@ -102,11 +102,25 @@ def _workspace_details(plan, op, shapes, dtype):
         copies = (-(-batch // (px * py))
                   if plan.route_for(shapes[0], dtype) == ROUTE_BATCH_RESHARD else batch)
         scratch = copies*(device + (4 if local else 0))
+        checked = 0
+        if not local:
+            # A distributed eigh is checked and retried inside the program
+            # (distrib_la._result_check): its XLA temporaries, and the gathered
+            # retry's replicated copies where the plan admits one.
+            from distrib_la.plan import (CHECKED_EIGH_TILES, GATHERED_EIGH_BYTES,
+                                         GATHERED_EIGH_FACTOR)
+            checked = CHECKED_EIGH_TILES * (n * n // (px * py)) * dtype.itemsize
+            gathered = GATHERED_EIGH_FACTOR * n * n * dtype.itemsize
+            limit = GATHERED_EIGH_BYTES if plan.budget_bytes is None else plan.budget_bytes
+            if gathered <= limit:
+                checked += gathered
+        scratch += checked
         return dict(device_bytes=scratch, host_bytes=host,
                     vendor_device_bytes=device if local else None,
                     native_device_bytes=device,
                     dynamic_xla_scratch_bytes=scratch,
-                    local=local, formula='copies*(native_device_bytes + local_info(4)); Mp native bytes include aligned vendor workspace and a private operand tile',
+                    local=local, formula='copies*(native_device_bytes + local_info(4)) + checked; Mp native bytes include aligned vendor workspace and a private operand tile; checked = CHECKED_EIGH_TILES n^2/P (+ GATHERED_EIGH_FACTOR n^2 when admitted)',
+                    checked_device_bytes=checked,
                     copies=copies,
                     provider='cusolverDn' if local else 'cusolverMp')
     if op not in ('gemm', 'matmul'):
