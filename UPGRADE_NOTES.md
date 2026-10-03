@@ -10,7 +10,9 @@ The binding rulings behind breaking changes are in
 The bispinor sector constructor on the face route admits its parent batch by
 the largest compiled size of the round's three whole-chain programs at the
 conservative shapes (CC's and TT's reduction, CT's cross reduction), as the
-scalar face batch already was; the batch starts at one parent per rank. Each
+scalar face batch already was. Both batches start at every parent, so a deck
+that fits runs one round (Fe 4^3 forced face at P4: 13 parents in 1 round
+again). Each
 CC, TT and CT round, and each face model check of the scalar constructor,
 takes its eigh room beside its own whole-chain program compiled on the arrays
 it runs, so every retry is a sized program. The analytic face prices of the
