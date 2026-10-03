@@ -318,10 +318,12 @@ stage is priced as `fixed + chunk·per_unit` new bytes per rank beside what is
 live. The executable's figure is `temp + outputs − alias` plus cuFFT plan
 scratch (`compiled_new_bytes`), plus what the stage holds beside it that buffer
 assignment cannot see: a donated carry the caller allocated, a native
-handler's run-time scratch, a lookahead copy of the output. At or below the
-closed form, or within the room, the chunk runs unchanged. Above both, the
-slope is corrected from that one point, `per_unit = (compiled − fixed)/chunk`,
-the chunk solved directly, and compiled once more. There is no bisection; a second figure still over the room warns and runs.
+handler's run-time scratch, a lookahead copy of the output. Only the compiled figure admits a chunk:
+within the room the chunk runs unchanged, whatever the closed form said. Over
+the room, the slope is corrected from that one point,
+`per_unit = max(per_unit, (compiled − fixed)/chunk)`, the chunk solved
+directly, and compiled once more. There is no bisection; a chunk already at
+the stage's minimum, or a second figure still over the room, warns and runs.
 The direct stream's check compiles through the dispatch's own executable cache
 (`gw.response_bank._compiled`), so the checked executable is the one that runs.
 Reading a figure costs 0.01–0.07 s for the direct stream, 0.02–0.12 s for the
@@ -408,7 +410,7 @@ Two reserves follow from this.
   40 GB A100 (42.9 GB) a budget of 36 leaves 6.9 GB. Never set the budget to
   the card size.
 
-When a recompiled chunk is still over its room, `check_chunk` prints one
+When a minimum or recompiled chunk is still over its room, `check_chunk` prints one
 warning line and the stage runs at that chunk; if the room is really
 missing, it fails at allocation.
 

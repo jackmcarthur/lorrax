@@ -2114,12 +2114,6 @@ def response_group_size(meta, mesh_xy, *, n_samples, carry_per_sample, stream_wo
     return size, fixed, device_room, int(device_budget_bytes()) - device_room
 
 
-def _agreed_chunk(chunk):
-    """The smallest of every rank's sample group (one small all-gather)."""
-    from common.collectives import all_gather_processes
-    return int(np.min(np.asarray(all_gather_processes(np.asarray(int(chunk), dtype=np.int64)))))
-
-
 def response_bank_residence(meta, *, segments, n_samples, carry_per_sample, group_size, host_reserved=0):
     """Where this map's χ bank (value and slope of every sample) lives.
 
@@ -2306,7 +2300,7 @@ def produce_sample_bank(wfns, meta, config, *, mesh_xy, sym, sample_plan, bank_i
                 tables_reserved.append(tables)
                 ambient += (tables,)
                 ledger.live_stages = ambient
-        from runtime.aot_memory import check_chunk
+        from runtime.aot_memory import agreed_chunk, check_chunk
         from common.gpu_utils import record_stage_price
         scratch = _stream_scratch(wfns, meta, mesh_xy, vertex)
 
@@ -2333,7 +2327,7 @@ def produce_sample_bank(wfns, meta, config, *, mesh_xy, sym, sample_plan, bank_i
                     extra=lambda g, _: g*carry_per_sample + scratch)
             # The compiled figure is read on each rank; the group (and so the
             # residence below) is the smallest of them, agreed by one all-gather.
-            return check, _agreed_chunk(check.chunk), live, room
+            return check, agreed_chunk(check.chunk), live, room
 
         # One rule, never a refusal (TASTE 96 and the owner's "never refuse"):
         # every sample in one group on the devices when it fits; else one group

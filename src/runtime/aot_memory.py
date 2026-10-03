@@ -24,8 +24,8 @@ callers are the stage memory planners that compile their own kernel
 :func:`check_chunk` is the one compiled check of an analytic chunk: a
 planner's closed form chooses the chunk, the chosen executable is compiled
 anyway, and its figure corrects the per-unit slope, re-solves the chunk and
-recompiles once only when it exceeds both the closed form and the room
-(the response direct stream, the ζ μ batch; the Σ τ window reads
+recompiles once only when it exceeds the room; :func:`agreed_chunk` makes
+the chunk every rank runs the same (the response direct stream, the ζ μ batch; the Σ τ window reads
 :func:`compiled_new_bytes`).  :func:`runtime_reserve_bytes` is the measured
 per-platform, per-P reserve the capacity ledger takes off the budget.
 
@@ -553,6 +553,19 @@ def compiled_new_bytes(compiled, *, extra: int = 0, platform: str | None = None)
     return int(aot_kernel_peak_bytes(compiled, platform=platform).resident_increment) + int(extra)
 
 
+def agreed_chunk(chunk: int) -> int:
+    """The smallest of every rank's chunk (one small all-gather).
+
+    A compiled figure is read on each rank, so :func:`check_chunk` can choose
+    differently per rank (a cuFFT scratch query that came back 0 on one).
+    Every rank runs this chunk, so the programs and their collectives agree
+    (INVARIANTS 21).
+    """
+    import numpy as np
+    from common.collectives import all_gather_processes
+    return int(np.min(np.asarray(all_gather_processes(np.asarray(int(chunk), dtype=np.int64)))))
+
+
 def check_chunk(chunk: int, *, build, fixed: float, per_unit: float, room: float,
                 extra=lambda c, compiled: 0, minimum: int = 1, compiled=None, stage: str = "",
                 platform: str | None = None) -> ChunkCheck:
@@ -564,12 +577,14 @@ def check_chunk(chunk: int, *, build, fixed: float, per_unit: float, room: float
     built for ``chunk``).  Its figure is :func:`compiled_new_bytes` plus
     ``extra(c, compiled)``: what the stage holds beside it (a donated carry
     the caller allocates, a native handler's run-time scratch, a lookahead
-    copy of its output).  At or below the analytic price, or within the room, the
-    chunk runs as planned: nothing is recompiled and results are unchanged.
-    Above both, the slope is corrected from this one point,
-    ``per_unit = (compiled - fixed) / chunk``, the chunk solved directly,
-    ``floor((room - fixed) / per_unit)``, and compiled once more.  No
-    bisection: a second figure still over the room prints one warning line
+    copy of its output).  Within the room the chunk runs as planned: nothing
+    is recompiled and results are unchanged.  The analytic price never admits
+    a chunk; only the compiled figure against the room does.  Over the room,
+    the slope is corrected from this one point,
+    ``per_unit = max(per_unit, (compiled - fixed) / chunk)``, the chunk solved
+    directly, ``floor((room - fixed) / per_unit)``, and compiled once more.
+    No bisection: a chunk already at ``minimum``, or a second figure still
+    over the room, prints one warning line
     (``common.gpu_utils.warn_over_budget``) and the stage runs at that chunk.
     """
     import time
@@ -580,14 +595,17 @@ def check_chunk(chunk: int, *, build, fixed: float, per_unit: float, room: float
     started = time.perf_counter()
     got = compiled_new_bytes(compiled, extra=int(extra(chunk, compiled)), platform=platform)
     seconds = time.perf_counter() - started
-    if got <= analytic or got <= room or chunk <= minimum:
+    from common.gpu_utils import warn_over_budget
+    if got <= room or chunk <= minimum:
+        if got > room:
+            warn_over_budget(f"{stage or 'compiled chunk'} (chunk {chunk}, compiled)", got, room)
         return ChunkCheck(chunk, compiled, analytic, got, max(analytic, got),
                           float(per_unit), False, seconds)
     slope = max(float(per_unit), (got - float(fixed)) / chunk)
     solved = max(int(minimum), min(chunk - 1, int((float(room) - float(fixed)) // slope)))
     announce_once(f"check-chunk:{stage}:{chunk}:{solved}",
-                  f"{stage}: compiled {got / 1e9:.2f} GB over the analytic "
-                  f"{analytic / 1e9:.2f} GB and the room {room / 1e9:.2f} GB at chunk "
+                  f"{stage}: compiled {got / 1e9:.2f} GB (analytic "
+                  f"{analytic / 1e9:.2f} GB) over the room {room / 1e9:.2f} GB at chunk "
                   f"{chunk}; slope {per_unit / 1e6:.1f} -> {slope / 1e6:.1f} MB per unit, "
                   f"chunk {chunk} -> {solved}, recompiled once")
     compiled = build(solved)
@@ -595,6 +613,5 @@ def check_chunk(chunk: int, *, build, fixed: float, per_unit: float, room: float
     again = compiled_new_bytes(compiled, extra=int(extra(solved, compiled)), platform=platform)
     seconds += time.perf_counter() - started
     if again > room:
-        from common.gpu_utils import warn_over_budget
         warn_over_budget(f"{stage or 'compiled chunk'} (chunk {solved}, compiled)", again, room)
     return ChunkCheck(solved, compiled, analytic, got, again, slope, True, seconds)
