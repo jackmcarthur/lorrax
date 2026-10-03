@@ -599,22 +599,24 @@ def _check_bare_hermitian(mesh_xy, q0, receipt, **moments):
 
     The constructor selects its infinity directions from the Hermitian part of
     M1 (``shared_pole_directions.infinity_directions``), so the Hermiticity of
-    what M1 is formed from is checked here, at the checked eigh's 1e-12. GPU
-    streams give <= 4e-16 (CrI3 24x24, n = 3328); the replicated ratios make
-    every rank refuse alike.
+    what M1 is formed from is checked here, at the checked eigh's round-off
+    tolerance ``distrib_la.roundoff_tol(n)``. GPU streams give <= 4e-16 (CrI3
+    24x24, n = 3328); the replicated ratios make every rank refuse alike.
     """
+    from distrib_la import roundoff_tol
     ratios = np.asarray(_anti_hermitian_ratios(mesh_xy)(*moments.values()), dtype=np.float64)
     receipt["bare_anti_hermitian_max"] = max(float(np.nanmax(ratios, initial=0.0)),
                                              receipt.get("bare_anti_hermitian_max", 0.0))
-    bad = ~(ratios <= 1e-12)
+    tol = roundoff_tol(next(iter(moments.values())).shape[-1])
+    bad = ~(ratios <= tol)
     if bad.any():
         f, i = (int(v) for v in np.argwhere(bad)[0])
         raise ValueError(
             f"GATE response_moment_hermiticity: got: bare moment {list(moments)[f]} of q parent "
             f"{q0 + i} has max|A-A^H|/max|A| = {ratios[f, i]:.3e} ({int(bad.sum())} of {bad.size} "
-            "(moment, parent) rows above 1e-12); want: <= 1e-12 (GPU streams give <= 4e-16); "
-            "why: the exact moments are Hermitian and the constructor reads M1's Hermitian part, "
-            "so an anti-Hermitian input would be dropped unseen")
+            f"(moment, parent) rows above {tol:.1e}); want: <= {tol:.1e}, distrib_la.roundoff_tol "
+            "(GPU streams give <= 4e-16); why: the exact moments are Hermitian and the constructor "
+            "reads M1's Hermitian part, so an anti-Hermitian input would be dropped unseen")
 
 
 def _record_odd_moments(q0, M0, M1, M2, M3, receipt):

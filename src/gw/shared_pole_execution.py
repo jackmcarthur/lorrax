@@ -501,16 +501,3 @@ def compact_program(mesh,width):
     from gw.shared_pole_sectors import _compact_sector_equations
     return face_program(partial(_compact_sector_equations,width=width,
         matrix_sharding=NamedSharding(mesh,P(None,"x","y"))),mesh,outputs='compact')
-
-
-@lru_cache(maxsize=None)
-def cauchy_program(mesh, charge_n, current_n):
-    from gw.shared_pole_sectors import sector_cauchy_schwarz
-    from gw.shared_pole_recipe import shared_real_pole_gates_ordered_v1 as gates
-    charge_eigh = face_eigh(mesh, charge_n)
-    current_eigh = face_eigh(mesh, current_n)
-    def body(c,ct,t):
-        return sector_cauchy_schwarz((c,ct,t),eigh_charge=charge_eigh.batched,
-                                    eigh_current=current_eigh.batched,
-                                    matmul=face_matmul(mesh),gates=gates)
-    return face_program(body,mesh,outputs='scalars')

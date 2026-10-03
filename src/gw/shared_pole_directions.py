@@ -187,8 +187,9 @@ def infinity_directions(kernels, m1, width, **kwargs):
     M1 is Hermitian (chi(conj z)^H = chi(z)). The Dyson chain that forms it
     from Hermitian bare moments and Coulomb roots (each anti-Hermitian at
     <= 4e-16 of its max) leaves an anti-Hermitian rounding part of 2.5e-13 to
-    1.0e-12 of max|M1| at n = 3328 (CrI3 24x24, 61 parents), at the checked
-    eigh's 1e-12 limit. The selection therefore reads Herm M1, as the
+    1.0e-12 of max|M1| at n = 3328 (CrI3 24x24, 61 parents), inside the checked
+    eigh's round-off tolerance (``distrib_la.roundoff_tol``, 4.7e-11 there) but
+    not zero. The selection therefore reads Herm M1, as the
     imaginary supports read -Herm W; the bare moments are checked Hermitian
     where they are produced (GATE response_moment_hermiticity). The local and
     batch-reshard eighs symmetrize their input, so their spectra and vectors

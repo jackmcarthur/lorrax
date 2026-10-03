@@ -236,6 +236,7 @@ def construct_sector_poles(bank, meta, config, *, mesh_xy, output):
                 with open_shared_pole_bank(bank['path'],mesh_xy=mesh_xy) as io:
                     exact=read_sector_round(io,meta,bank,header,ids,(family,family),
                         fields=('M0','M1','M2','M3'),retained=retained,execution=execution)
+                    refuse_nonfinite_moment(name,exact['M1'],real,mesh_xy=mesh_xy)
                     samples=read_samples(io,(family,family),(*retained,*exact.values()))
                     line=read_line(io,family)
                 geometry=dict(components=3 if family else 1,basis=bank['mu_bases'][family],
@@ -263,17 +264,11 @@ def construct_sector_poles(bank, meta, config, *, mesh_xy, output):
                 tc=read_samples(io,(1,0),(*retained,*ct.values()))
                 cm=read_sector_round(io,meta,bank,header,ids,(0,1),fields=('M0','M1','M2','M3'),
                                       retained=(*retained,*ct.values(),*tc.values()),execution=execution)
+                refuse_nonfinite_moment('CT',cm['M1'],real,mesh_xy=mesh_xy)
                 line_cross=[read_line(io,family,cross=True) for family in (0,1)]
             cross=construct_cross_sector_round(sectors,(ct,tc),cm,meta,config,mesh_xy=mesh_xy,
                 sample_ids=dense_fit,line_cross=line_cross,real=real)
             del line_cross
-            with open_shared_pole_bank(bank['path'],mesh_xy=mesh_xy) as io:
-                c1=read_sector_round(io,meta,bank,header,ids,(0,0),fields=('M1',),
-                    retained=(*retained,*ct.values(),*tc.values(),*cm.values(),*jax.tree.leaves(cross['models'])),execution=execution)['M1']
-                t1=read_sector_round(io,meta,bank,header,ids,(1,1),fields=('M1',),
-                    retained=(*retained,*ct.values(),*tc.values(),*cm.values(),c1,*jax.tree.leaves(cross['models'])),execution=execution)['M1']
-            cauchy=sector_moment_cauchy((c1,cm['M1'],t1),sectors,mesh_xy=mesh_xy)
-            del c1,t1
             del ct,tc,cm
         models=(sectors[0]['model'],sectors[1]['model'],*cross['models'])
         treatment_policy=recipe.get('sector_pole_treatment')
@@ -319,11 +314,6 @@ def construct_sector_poles(bank, meta, config, *, mesh_xy, output):
                         held_rows[name].append(dict(sample_id=sample_id,
                             Wc=np.asarray(errors)[:real,0].tolist(),dWc_ds=np.asarray(errors)[:real,1].tolist()))
                         del held
-        for key,value in cauchy.items():
-            values=np.asarray(value)[:real]
-            expected_infinity=(key=='cauchy_schwarz_squared') & np.isposinf(values)
-            if not np.all(np.isfinite(values) | expected_infinity):
-                raise ValueError(f'GATE shared_pole_sector_nonfinite: spectral moment {key}')
         treatment_receipt=None
         if treatment is not None:
             treatment_receipt=dict(
@@ -340,8 +330,6 @@ def construct_sector_poles(bank, meta, config, *, mesh_xy, output):
             CT_gram_min_relative=np.asarray(cross['diagnostics']['gram_min_relative'])[:real].tolist(),
             CT_retained_metric_positive=np.asarray(cross['diagnostics']['retained_metric_positive'])[:real].tolist(),
             CT_zero_policy=np.asarray(cross['zero']['zero_policy'])[:real].tolist(),
-            spectral_moment_cauchy={key:[float(v) if np.isfinite(v) else 'OUTSIDE_METRIC_SUPPORT'
-                for v in np.asarray(value)[:real]] for key,value in cauchy.items()},
             scalar_upper_passivity='NOT_APPLICABLE_SIGNED_V',
             stability_scope='retained ordered H; exact full-space stability not established',
             sigma_accuracy='NOT_MEASURED')
@@ -425,6 +413,27 @@ def construct_sector_poles(bank, meta, config, *, mesh_xy, output):
     return dict(handle=handle,identity=bank['identity'],status='CONSTRUCTED',
                 q_receipts=receipts,capacity=ledger.receipt(),
                 execution=execution_rows,model_residence=model_residence)
+
+
+@lru_cache(maxsize=None)
+def _finite_parents_program(mesh):
+    import jax
+    from jax.sharding import NamedSharding,PartitionSpec as P
+    return jax.jit(lambda a: jnp.all(jnp.isfinite(a), axis=tuple(range(1, a.ndim))),
+                   out_shardings=NamedSharding(mesh,P()))
+
+
+def refuse_nonfinite_moment(name, m1, real, *, mesh_xy):
+    """GATE shared_pole_sector_nonfinite: a sector's M1 spectral moment is finite on every real parent.
+
+    One reduction of the moment the round already holds, replicated, so every
+    rank refuses alike.
+    """
+    import numpy as np
+    finite = np.asarray(_finite_parents_program(mesh_xy)(m1))[:int(real)]
+    if not finite.all():
+        raise ValueError(f'GATE shared_pole_sector_nonfinite: spectral moment M1 of sector {name} '
+                         f'is not finite on parent slots {np.flatnonzero(~finite).tolist()}')
 
 
 def _sector_model_residence(meta,config,header,mu_bases,execution_rows,*,mesh_xy,root,
@@ -554,36 +563,6 @@ def _sector_held_equations(left,right,mu,active,w,d,z,*,mm):
         norm=jnp.linalg.norm(exact,axis=(-2,-1))
         result.append(jnp.linalg.norm(value-exact,axis=(-2,-1))/jnp.maximum(norm,jnp.finfo(norm.dtype).tiny))
     return jnp.stack(result,axis=-1)
-
-
-def sector_moment_cauchy(metrics, sectors, *, mesh_xy):
-    """Report the Cauchy–Schwarz diagnostic of the common physical M1 metric."""
-    import jax
-    from common.collectives import device_put_process_local
-    from jax.sharding import NamedSharding,PartitionSpec as P
-    from gw.shared_pole_execution import is_face,cauchy_program
-    if is_face(metrics[0]):
-        return cauchy_program(
-            mesh_xy, metrics[0].shape[-1], metrics[2].shape[-1])(*metrics)
-    plans=[s['budget'].eigenplan(m.shape[-1]).native_fn
-           for s,m in zip(sectors,(metrics[0],metrics[2]))]
-    result=_local_cauchy_program(mesh_xy,*plans)(*metrics)
-    return jax.tree.map(lambda a:device_put_process_local(a,NamedSharding(mesh_xy,P())),result)
-
-
-@lru_cache(maxsize=None)
-def _local_cauchy_program(mesh,charge_eigh,current_eigh):
-    import jax
-    from common.shard_map import shard_map
-    from jax.sharding import PartitionSpec as P
-    from gw.shared_pole_local import _mm
-    from gw.shared_pole_recipe import shared_real_pole_gates_ordered_v1 as gates
-    def body(c,ct,t):
-        return sector_cauchy_schwarz((c,ct,t),eigh_charge=charge_eigh,
-                                     eigh_current=current_eigh,matmul=_mm,gates=gates)
-    spec=P(('x','y'))
-    return jax.jit(shard_map(body,mesh=mesh,in_specs=(spec,)*3,
-                            out_specs=spec,check_vma=False))
 
 
 def sector_recipe(recipe, n):
@@ -1279,40 +1258,6 @@ def reduce_sector_pencil(pencil, *, eigh, matmul, gates, matrix_sharding=None):
             jnp.where(active, values, 1), active), dict(
                 diagnostics, gram_valid=valid, gram_min_relative=ratio,
                 retained_metric_positive=corrected, retained_rank=count)
-
-
-def sector_cauchy_schwarz(metrics, *, eigh_charge, eigh_current, matmul, gates):
-    """Report the squared cross norm in a positive sector metric.
-
-    ``metrics=(C,CT,T)`` consists of [b,n_C,n_C], [b,n_C,n_T], and
-    [b,n_T,n_T] Hermitian diagonal metrics and a rectangular cross block,
-    for example the positive spectral moment. Cauchy--Schwarz is
-    ||C^(-1/2) CT T^(-1/2)||_2² <= 1. This is not an inequality on an
-    arbitrary complex-frequency W tile. No input is repaired or replaced.
-    A cross block outside either metric support is reported as infinity.
-    Service eigenplans and the caller's parent-local GEMM own all algebra.
-    """
-    c, cross, t = metrics
-    cutoff = gates["normalized_gram_keep"]["threshold"]
-
-    def inverse_root(a, eigh):
-        values, vectors = eigh(a)
-        keep = values > cutoff * values[:, -1:]
-        scale = keep / jnp.sqrt(jnp.where(keep, values, 1))
-        return (matmul(vectors * scale[:, None, :], vectors, transb="C"),
-                matmul(vectors * keep[:, None, :], vectors, transb="C"),
-                values[:, 0])
-
-    ic, pc, min_c = inverse_root(c, eigh_charge)
-    it, pt, min_t = inverse_root(t, eigh_current)
-    whitened = matmul(ic, matmul(cross, it))
-    eigenvalues, _ = eigh_charge(matmul(whitened, whitened, transb="C"))
-    norm = jnp.linalg.norm(cross, axis=(-2, -1))
-    outside = jnp.linalg.norm(cross-matmul(pc, matmul(cross, pt)), axis=(-2, -1))
-    defect = outside / jnp.maximum(norm, jnp.finfo(norm.dtype).tiny)
-    supported = defect <= gates["retained_subspace_moments"]["threshold"]
-    return dict(cauchy_schwarz_squared=jnp.where(supported, eigenvalues[:, -1], jnp.inf),
-                support_relative=defect, charge_metric_min=min_c, current_metric_min=min_t)
 
 
 def sector_execution(meta, config, mu_bases, nq, *, mesh_xy, upstream):

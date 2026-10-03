@@ -155,6 +155,7 @@ from distrib_la.resolve import (
 )
 
 from ._batch_reshard import batch_layout, is_batch_layout, local_batch
+from distrib_la.tolerance import ROUNDOFF_MARGIN, roundoff_tol
 
 __all__ = [
     "local_batch", "batch_layout", "is_batch_layout",
@@ -189,4 +190,6 @@ __all__ = [
     "probe_target", "has_target", "dial_key",
     # dispatch
     "dispatch_batched_eigh",
+    # round-off tolerance of every linear-algebra check
+    "roundoff_tol", "ROUNDOFF_MARGIN",
 ]

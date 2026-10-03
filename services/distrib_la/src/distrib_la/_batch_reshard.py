@@ -156,9 +156,10 @@ def _checked_eigh(a):
     exchange. Invalid local batches skip the solver and return a NaN spectrum;
     the existing replicated-spectrum readback refuses them on every rank.
     """
+    from distrib_la.tolerance import roundoff_tol
     defect = jnp.max(jnp.abs(a - jnp.conj(jnp.swapaxes(a, -1, -2))), axis=(-2, -1))
     scale = jnp.max(jnp.abs(a), axis=(-2, -1))
-    valid = jnp.all(jnp.isfinite(scale) & (defect <= 1e-12 * scale))
+    valid = jnp.all(jnp.isfinite(scale) & (defect <= roundoff_tol(a.shape[-1], dtype=a.dtype) * scale))
     def solve(value):
         values, vectors = jnp.linalg.eigh(value)
         return values, vectors

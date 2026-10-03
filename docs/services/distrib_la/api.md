@@ -496,6 +496,19 @@ nothing and accept `float64` or `complex128` only.
 Operand carriers, transpose staging, communication buffers and persistent
 context resources are the caller's to admit.
 
+## Round-off tolerance {#roundoff}
+
+`roundoff_tol(n, dtype=complex128)` is `ROUNDOFF_MARGIN · n · eps(dtype)` with
+`ROUNDOFF_MARGIN = 64`. It is the relative bar of every Hermiticity check: the
+checked local eigh, `leading_eigenvectors` on a distributed solver and its
+spectrum diagnostic, the bare response-moment gate
+(`gw.response_bank._check_bare_hermitian`) and the dense DFT Hamiltonian
+(`psp.run_dense_h`). Each check compares `max|A − A^H| / max|A|` against it, with
+`n` the matrix side when the inner length of the products is not known. A
+fixed `1e-12` is below the round-off of a GEMM-built Hermitian once `n·eps`
+passes it (n ≈ 4500 in complex128). A refusal therefore names a wrong input,
+such as a missing conjugate or an unsymmetrized product, and never round-off.
+
 ## Vocabulary and introspection
 
 | name | purpose |

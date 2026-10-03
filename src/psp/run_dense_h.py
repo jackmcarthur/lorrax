@@ -52,10 +52,6 @@ from psp.pseudos import load_pseudopotentials
 from psp.scf_potential import build_dft_potentials
 from wfn_loader import WfnLoader
 
-#: A Hermitian operator: max|H − H†| relative to max|H| above this refuses.
-HERMITICITY_TOL = 1e-12
-
-
 def solve_k(H_k, gvecs_file, nspinor, eigh, nbands):
     """ε and c for one k: the dense H on its (padded) sphere, one full eigh, source G order."""
     if H_k.nG != gvecs_file.shape[0]:
@@ -66,11 +62,14 @@ def solve_k(H_k, gvecs_file, nspinor, eigh, nbands):
     ngkmax = int(H_k.mask.shape[0])
     H, h_pad = dense_matrix_k(H_k.T_diag, H_k.V_scf, H_k.Gx, H_k.Gy, H_k.Gz,
                               H_k.vnl_Z, H_k.vnl_E, H_k.mask, nspinor=nspinor)
+    # A Hermitian operator: max|H − H†| relative to max|H| above the
+    # round-off bound of its side refuses (distrib_la.roundoff_tol).
     skew = float(jnp.max(jnp.abs(H - jnp.conj(H.T))) / h_pad)
-    if not skew <= HERMITICITY_TOL:
+    tol = distrib_la.roundoff_tol(H.shape[-1], dtype=H.dtype)
+    if not skew <= tol:
         raise RuntimeError(
             f"dense H_k is not Hermitian: max|H - H^H|/||H|| = {skew:.2e} "
-            f"> {HERMITICITY_TOL:.0e}.")
+            f"> {tol:.1e}.")
     energies, vectors = eigh(H)                    # eigenvectors as columns
     psi = np.asarray(vectors[:, :nbands].T).reshape(nbands, nspinor, ngkmax)
     leak = float(np.max(np.abs(psi[:, :, H_k.nG:]), initial=0.0))
