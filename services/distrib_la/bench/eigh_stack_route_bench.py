@@ -58,6 +58,9 @@ def main():
         b, n = int(a.shape[0]), int(a.shape[-1])
         p = distrib_la.plan("eigh", mesh, n=n, backend="distributed", budget_bytes=ROOM)
         route = p.stack_route(a.shape, a.dtype)
+        if lead:
+            for line in distrib_la.new_stack_routes():
+                print("distrib_la eigh " + line, flush=True)
         (w, v), wall = timed(jax.jit(p.batched), a)
         (ws, vs), wall_scan = timed(jax.jit(lambda x: p.batched(x, _route="scan")), a)
         r, o = (float(x) for x in errors(a, w, v))

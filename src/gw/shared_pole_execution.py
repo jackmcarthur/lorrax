@@ -234,6 +234,13 @@ def route_summary(mode, receipt):
     budget = next((row['device_budget_bytes_per_rank'] for row in
                    (receipt.get("local_selection"), receipt.get("local_reduction")) if row), None)
     price = "" if budget is None else f"; local parent GB/rank: {rows} of {budget / 1e9:.1f}"
+    batch = receipt.get("face_batch") or (
+        {"parent_batch": receipt["parent_batch"]} if "parent_batch" in receipt else None)
+    if batch is not None:
+        gb = lambda v: "none" if v is None else f"{v / 1e9:.1f}"
+        rooms = receipt.get("face_eigh_room_bytes_per_rank") or {}
+        price += (f"; face batch {batch['parent_batch']} parent(s), eigh room GB/rank "
+                  f"selection {gb(rooms.get('selection'))}, reduction {gb(rooms.get('reduction'))}")
     return (f"{mode} ({receipt['reason']}, conservative pencil side "
             f"{receipt['conservative_pencil_side']}{price})")
 

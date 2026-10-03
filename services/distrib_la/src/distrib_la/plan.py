@@ -195,8 +195,24 @@ class StackRoute(NamedTuple):
     room: int | None = None
 
 
-#: Decided stack routes, one per (mesh, op, B, n, dtype, room); logged once.
+#: Decided stack routes, one per (mesh, op, B, n, dtype, room), and the keys
+#: :func:`new_stack_routes` has already reported.
 _STACK_ROUTES: dict = {}
+_REPORTED: set = set()
+
+
+def new_stack_routes() -> list[str]:
+    """One line per eigh-stack decision made since the last call, for a driver log.
+
+    The service decides (:meth:`Plan.stack_route`); a driver prints these
+    lines through its own reporter, once per (op, B, n, dtype, room).
+    """
+    lines = []
+    for key, route in _STACK_ROUTES.items():
+        if key not in _REPORTED:
+            _REPORTED.add(key)
+            lines.append(f"{key[1]} stack {key[2]} x {key[3]}^2 {key[4]}: {_describe_stack(route)}")
+    return lines
 
 
 @lru_cache(maxsize=None)
@@ -570,8 +586,9 @@ class Plan:
         is cut into as many equal slices (rounds) as that needs. When not even
         one whole matrix per rank fits, it runs on the whole mesh. The room is
         a caller value every rank shares and the compiled size is the same on
-        every rank, so every rank takes the same route. The decision is
-        printed once per stack shape (:meth:`describe` lists it too).
+        every rank, so every rank takes the same route. Every decision is
+        listed by :meth:`describe`, and :func:`new_stack_routes` hands each to
+        a driver log once.
         """
         static = self.batched_route
         shape = tuple(int(v) for v in shape)
@@ -588,10 +605,6 @@ class Plan:
         decided = _STACK_ROUTES.get(key)
         if decided is None:
             decided = _STACK_ROUTES[key] = self._decide_stack(op, nb, n, dtype)
-            if jax.process_index() == 0:
-                print(f"distrib_la: {op} stack {nb} x {n}^2 {dtype} on the "
-                      f"{self.mesh.shape['x']}x{self.mesh.shape['y']} mesh -> "
-                      f"{_describe_stack(decided)}", flush=True)
         return decided
 
     def _decide_stack(self, op, nb, n, dtype) -> StackRoute:

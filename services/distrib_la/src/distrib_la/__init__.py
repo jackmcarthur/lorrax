@@ -133,7 +133,9 @@ from distrib_la.plan import (
     ROUTE_BATCH_RESHARD,
     ROUTE_SCAN,
     Plan,
+    StackRoute,
     ensure_sharding,
+    new_stack_routes,
     plan,
 )
 from distrib_la.polar import (PolarPlan, plan_polar_factor, polar_factor,
@@ -164,7 +166,7 @@ __all__ = [
     "face_sharding", "on_face", "hermitian_part", "hermitian_block",
     "join_columns", "diagonal_like",
     # plan
-    "Plan", "plan", "ensure_sharding", "DONATES",
+    "Plan", "plan", "StackRoute", "new_stack_routes", "ensure_sharding", "DONATES",
     # native dense workspace queries (no allocation)
     "workspace_bytes_per_rank", "matmul_workspace_bytes_per_rank", "fits_local",
     # polar / SVD

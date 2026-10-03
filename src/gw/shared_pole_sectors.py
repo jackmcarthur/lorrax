@@ -227,6 +227,8 @@ def construct_sector_poles(bank, meta, config, *, mesh_xy, output):
     # admitted sector batch (whole matrices per rank where they fit).
     from gw.shared_pole_capacity import face_eigh_room
     face_room = face_eigh_room(batch_admission) if resolved_execution == 'face' else None
+    for row in execution_rows if resolved_execution == 'face' else ():
+        row['face_eigh_room_bytes_per_rank'] = dict(selection=face_room, reduction=face_room)
     sector_models,model_residence=_sector_model_residence(meta,config,header,bank['mu_bases'],
         execution_rows,mesh_xy=mesh_xy,root=root,upstream=upstream,route=resolved_execution)
     if sector_models is not None:
