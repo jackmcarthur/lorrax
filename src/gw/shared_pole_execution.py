@@ -509,9 +509,11 @@ def face_batch_width(meta, resolution, *, mesh, ledger, upstream, side, nq, prog
     (its ``quote`` arguments) may reject a width; only the reduction
     program's compiled size at that width (``program_bytes(width)``, agreed
     over ranks), beside ``extra(width)`` resident bytes, admits it. Widths
-    start at one parent per rank, so each eigh stack of a round is one
-    route-(c) round, and step down in proportion to the room. The
-    constructor still admits every phase at its actual side.
+    start at every parent, so a deck that fits runs one round and compiles
+    each program once per shape (Fe 4^3 bispinor at P4: one round of 13
+    instead of four, whose differing sides recompiled every program), and
+    step down in proportion to the room. The constructor still admits every
+    phase at its actual side.
     """
     import time
     from distrib_la import SIZING_FAILED
@@ -519,7 +521,7 @@ def face_batch_width(meta, resolution, *, mesh, ledger, upstream, side, nq, prog
 
     budget = ConstructorCapacity(meta, resolution, mesh_xy=mesh, ledger=ledger,
                                  upstream=upstream, execution='face')
-    width, seconds = min(int(nq), int(mesh.size)), 0.0
+    width, seconds = int(nq), 0.0
 
     def row(phase, extra=0, **kwargs):
         price, native = budget.quote(side, phase=phase, **kwargs)
