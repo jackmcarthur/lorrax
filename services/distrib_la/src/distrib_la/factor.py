@@ -96,6 +96,9 @@ class FactorToken:
     n: int
     nbatch: int
     _factor: Any = field(repr=False)
+    #: (A^H W, ||A||) from before the factorization, which consumes A: every
+    #: solve is checked against it (distrib_la._result_check).
+    _sketch: Any = field(repr=False, default=None)
 
     def __repr__(self) -> str:                      # no factor bytes in logs
         px, py = int(self.mesh.shape["x"]), int(self.mesh.shape["y"])
@@ -143,6 +146,8 @@ def factor(op: str, A, mesh_xy: Mesh, *, backend: str = "auto",
 
     mod = backend_module(resolved)
     A = ensure_sharding(A, NamedSharding(mesh_xy, P(None, "x", "y")))
+    from distrib_la._result_check import matrix_sketch
+    sketch = matrix_sketch(A)
 
     if op == "solve_lu":
         if resolved not in ("scalapack", "cusolvermp"):
@@ -168,7 +173,7 @@ def factor(op: str, A, mesh_xy: Mesh, *, backend: str = "auto",
         held = _slate_potrf_stack(mod, A, mesh_xy)
 
     return FactorToken(op=op, backend=resolved, mesh=mesh_xy,
-                       n=extent, nbatch=nb, _factor=held)
+                       n=extent, nbatch=nb, _factor=held, _sketch=sketch)
 
 
 def _slate_potrf_stack(mod, A, mesh_xy: Mesh) -> tuple:
@@ -230,8 +235,20 @@ def solve(token: FactorToken, B) -> jax.Array:
             f"for the system it factored.")
     mesh = token.mesh
     B = ensure_sharding(B, NamedSharding(mesh, P(None, "x", "y")))
-    mod = backend_module(token.backend)
+    from distrib_la._result_check import call_site, checked, refuse_if_poisoned, rhs_sketch, solve_errors
+    # The solve consumes B; its sketch is taken first, and the result is
+    # checked against A's sketch from factor() (never returned unchecked).
+    sketch = (*token._sketch, *rhs_sketch(B))
+    X = _solve(token, B, mesh)
+    site = call_site()
+    X = checked(f"{token.op} solve", (lambda x: x,), lambda x: solve_errors(sketch, x),
+                (X,), site=site, n=token.n)
+    return refuse_if_poisoned(X, f"{token.op} solve", token.n, site)
 
+
+def _solve(token, B, mesh):
+    """The library's back-solve of ``B`` against ``token``'s factor."""
+    mod = backend_module(token.backend)
     if token.op == "solve_lu":
         if token.backend == "scalapack":
             LU, ipiv = token._factor
