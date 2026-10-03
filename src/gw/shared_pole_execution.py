@@ -289,22 +289,27 @@ def face_matmul(mesh):
 
 
 @lru_cache(maxsize=None)
-def face_eigh(mesh, n):
+def face_eigh(mesh, n, room=None):
+    """The whole-mesh constructor's n x n eigh plan.
+
+    ``room`` is the caller's device bytes per rank beside its admitted live
+    set (``face_eigh_room``), the same on every rank. distrib_la decides each
+    stack from it: whole matrices per rank where one slice compiles within the
+    room, else the whole mesh. Without a room every stack runs on the mesh.
+    """
     from distrib_la import plan
-    # Explicit auto selects the whole-mesh provider; no capacity-driven local
-    # reshard or submesh is allowed inside an oversized parent operation.
-    return plan('eigh',mesh,n=int(n),backend='distributed',batched_route='auto')
+    return plan('eigh',mesh,n=int(n),backend='distributed',budget_bytes=int(room or 0))
 
 
 @lru_cache(maxsize=None)
-def face_parent_program(mesh,ordered,odd_moments,keep_budget,retain_span,side,gram_keep=None):
+def face_parent_program(mesh,ordered,odd_moments,keep_budget,retain_span,side,gram_keep=None,room=None):
     """Retained static-layout executable builder; all state values are operands."""
     from gw.shared_pole_local import solve_parent_pencil
     from gw.shared_pole_gates import sort_shared_pole_columns
     from gw.shared_pole_recipe import shared_real_pole_gates_ordered_v1, shared_real_pole_gates_v1_r3b
     gates=shared_real_pole_gates_ordered_v1 if ordered else shared_real_pole_gates_v1_r3b
     mm=face_matmul(mesh)
-    eigh=face_eigh(mesh,side).batched
+    eigh=face_eigh(mesh,side,room).batched
     def body(points,order,active,qs,os,ds,infinity):
         def pack(parts):
             panels = jnp.concatenate((*parts, jnp.zeros_like(parts[0][..., :int(mesh.shape["y"])])), axis=-1)
@@ -322,14 +327,17 @@ def face_parent_program(mesh,ordered,odd_moments,keep_budget,retain_span,side,gr
 
 
 def face_reduce_round(states,infinity,tables,*,real,mesh,budget,ordered,odd_moments,
-                      keep_budget,retain_span=False,admit=True,gram_keep=None):
-    """A batch of physical parents with every matrix tiled over all ranks."""
+                      keep_budget,retain_span=False,admit=True,gram_keep=None,room=None):
+    """A batch of physical parents with every matrix tiled over all ranks.
+
+    ``room`` (``face_eigh_room`` of the reduction admission) is the room the
+    pencil's eigh stacks are decided against (``face_eigh``)."""
     if real != len(tables['own']):
         raise ValueError('distributed constructor batches contain physical parents only')
     side=tables['active'].shape[-1]
     if admit:
         budget.plan(side,phase='reduction')
-    program=face_parent_program(mesh,ordered,odd_moments,keep_budget,retain_span,side,gram_keep)
+    program=face_parent_program(mesh,ordered,odd_moments,keep_budget,retain_span,side,gram_keep,room)
     result=program(jnp.asarray(tables['points']),jnp.asarray(tables['order']),
         jnp.asarray(tables['active']),tuple(s[1] for s in states),
         tuple(s[2] for s in states),tuple(s[3] for s in states),tuple(infinity))
@@ -339,14 +347,17 @@ def face_reduce_round(states,infinity,tables,*,real,mesh,budget,ordered,odd_mome
 
 
 @lru_cache(maxsize=None)
-def face_round_check_program(mesh, ordered, n):
-    """Whole-mesh adapter for the scalar model's existing gate equations."""
+def face_round_check_program(mesh, ordered, eigh_plan):
+    """Whole-mesh adapter for the scalar model's existing gate equations.
+
+    ``eigh_plan`` is the n x n plan (``face_eigh``); distrib_la decides from
+    its room whether the passivity eighs run on the mesh or one per rank.
+    """
     from gw.shared_pole_local import _round_check_equations
     from gw.shared_pole_recipe import (shared_real_pole_gates_ordered_v1,
                                        shared_real_pole_gates_v1_r3b)
     gates = (shared_real_pole_gates_ordered_v1 if ordered else
              shared_real_pole_gates_v1_r3b)
-    eigh_plan = face_eigh(mesh, n)
     return face_program(partial(_round_check_equations, matmul=face_matmul(mesh),
                                 eigh=eigh_plan.batched, gates=gates, ordered=ordered),
                         mesh, outputs='scalars')
@@ -462,12 +473,12 @@ def sector_batch_width(meta, resolution, recipe, routes, *, mesh, ledger, nq):
 
 
 @lru_cache(maxsize=None)
-def cross_parent_program(mesh, side):
+def cross_parent_program(mesh, side, room=None):
     from gw.shared_pole_sectors import _cross_reduce_equations
     from gw.shared_pole_recipe import shared_real_pole_gates_ordered_v1 as gates
     # The joint CT metric carries exact-zero rows (inactive retained columns,
     # held span widths); the service eigh deflates them and checks its result.
-    eigh = face_eigh(mesh, side).batched
+    eigh = face_eigh(mesh, side, room).batched
     return face_program(partial(_cross_reduce_equations,mm=face_matmul(mesh),eigh=eigh,gates=gates,
                                 matrix_sharding=NamedSharding(mesh,P(None,"x","y"))),
                         mesh,outputs='cross')
@@ -502,11 +513,11 @@ def compact_program(mesh,width):
 
 
 @lru_cache(maxsize=None)
-def cauchy_program(mesh, charge_n, current_n):
+def cauchy_program(mesh, charge_n, current_n, room=None):
     from gw.shared_pole_sectors import sector_cauchy_schwarz
     from gw.shared_pole_recipe import shared_real_pole_gates_ordered_v1 as gates
-    charge_eigh = face_eigh(mesh, charge_n)
-    current_eigh = face_eigh(mesh, current_n)
+    charge_eigh = face_eigh(mesh, charge_n, room)
+    current_eigh = face_eigh(mesh, current_n, room)
     def body(c,ct,t):
         return sector_cauchy_schwarz((c,ct,t),eigh_charge=charge_eigh.batched,
                                     eigh_current=current_eigh.batched,

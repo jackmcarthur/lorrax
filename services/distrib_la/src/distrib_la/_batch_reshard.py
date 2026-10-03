@@ -45,7 +45,8 @@ from distrib_la._shard_map import shard_map
 from distrib_la.resolve import mesh_key
 
 __all__ = ["batch_layout", "batch_layout_eigh_call", "batch_reshard_call",
-           "is_batch_layout", "local_batch", "validate_batch_reshard_operands"]
+           "is_batch_layout", "local_batch", "reshard_program", "reshard_rounds_call",
+           "validate_batch_reshard_operands"]
 
 
 _JIT_CACHE: dict = {}
@@ -487,18 +488,22 @@ def batch_reshard_call(
     ``_normal_svd``); the length-n spectrum keeps the ordinary vector gather.
     """
     ops = tuple(ops)
-    nbatch, batch_pad = validate_batch_reshard_operands(op, mesh, ops)
-    px, py = int(mesh.shape["x"]), int(mesh.shape["y"])
+    validate_batch_reshard_operands(op, mesh, ops)
+    return reshard_program(op, mesh, tuple(
+        (tuple(int(s) for s in x.shape), str(x.dtype)) for x in ops), rcond)(*ops)
 
-    key = (
-        op,
-        mesh_key(mesh),
-        tuple((tuple(int(s) for s in x.shape), str(x.dtype)) for x in ops),
-        rcond,
-    )
+
+def reshard_program(op: str, mesh: Mesh, signature, rcond=None):
+    """The jitted route-(c) program of :func:`batch_reshard_call` for operand
+    ``signature`` (``((shape, dtype), ...)``), built once. Its compiled size
+    is what :meth:`distrib_la.plan.Plan.stack_route` admits."""
+    nbatch = int(signature[0][0][0])
+    px, py = int(mesh.shape["x"]), int(mesh.shape["y"])
+    batch_pad = -(-nbatch // (px * py)) * px * py - nbatch
+    key = (op, mesh_key(mesh), tuple(signature), rcond)
     fn = _JIT_CACHE.get(key)
     if fn is None:
-        in_specs = tuple(P(None, "x", "y") for _ in ops)
+        in_specs = tuple(P(None, "x", "y") for _ in signature)
         out_specs = ((P(), P(None, "x", "y")) if op in ("eigh", "checked_eigh", "normal_eigh", "polar")
                      else P(None, "x", "y"))
 
@@ -547,4 +552,37 @@ def batch_reshard_call(
         # (a caller never relies on survival), while this route stays quiet.
         fn = jax.jit(mapped)
         _JIT_CACHE[key] = fn
-    return fn(*ops)
+    return fn
+
+
+def reshard_rounds_call(op: str, mesh: Mesh, A, *, rounds: int):
+    """Route (c) on a face stack in ``rounds`` equal slices, one ``lax.scan``.
+
+    Each slice of ``ceil(B/rounds)`` matrices runs :func:`batch_reshard_call`
+    (exchange, local eigh, inverse exchange), so a rank holds one slice's
+    whole matrices at a time. The stack is padded with zero matrices to
+    ``rounds`` equal slices and the padding dropped afterwards. ``op`` is
+    ``eigh``, ``checked_eigh`` or ``normal_eigh``; outputs follow
+    :func:`batch_reshard_call`.
+    """
+    rounds = int(rounds)
+    if rounds == 1:
+        return batch_reshard_call(op, mesh, (A,))
+    nb, n = int(A.shape[0]), int(A.shape[-1])
+    m = -(-nb // rounds)
+    pad = rounds * m - nb
+    validate_batch_reshard_operands(op, mesh, (jax.ShapeDtypeStruct((m, n, n), A.dtype),))
+    key = ("rounds", op, mesh_key(mesh), nb, n, str(A.dtype), rounds)
+    fn = _JIT_CACHE.get(key)
+    if fn is None:
+        program = reshard_program(op, mesh, (((m, n, n), str(A.dtype)),))
+        slices = NamedSharding(mesh, P(None, None, "x", "y"))
+
+        @jax.jit
+        def fn(a):
+            a = jnp.pad(a, ((0, pad), (0, 0), (0, 0))).reshape(rounds, m, n, n)
+            a = jax.lax.with_sharding_constraint(a, slices)
+            _, (w, z) = jax.lax.scan(lambda carry, x: (carry, program(x)), None, a)
+            return w.reshape(rounds * m, -1)[:nb], z.reshape(rounds * m, n, n)[:nb]
+        _JIT_CACHE[key] = fn
+    return fn(A)

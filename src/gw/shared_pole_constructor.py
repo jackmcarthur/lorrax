@@ -206,12 +206,23 @@ def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output, resi
         # parents over all ranks (one schedule owner for both constructors).
         ranks = mesh_divisor(mesh_xy)
         face_batch = 1
+        reduction_room = None
         if execution == 'face':
+            from gw.shared_pole_capacity import face_eigh_room
             from gw.shared_pole_execution import face_batch_width
             face_batch, execution_receipt['face_batch'] = face_batch_width(
                 meta, resolution, mesh=mesh_xy, ledger=ledger, upstream=upstream,
                 side=conservative_side, sample_batch=len(dense_fit),
                 selection_faces=selection_faces, nq=nq)
+            # distrib_la decides each eigh stack against the room beside the
+            # admitted batch and the retained factors: whole matrices per rank
+            # where they fit, else the whole mesh.
+            retained_bound = execution_receipt['retained_output_upper_bound_bytes_per_rank']
+            budget.face_room = face_eigh_room(execution_receipt['face_batch']['selection'], retained_bound)
+            reduction_room = face_eigh_room(execution_receipt['face_batch']['reduction'], retained_bound)
+            execution_receipt['face_eigh_room_bytes_per_rank'] = dict(
+                selection=budget.face_room, reduction=reduction_room)
+            eig = budget.eigenplan(n)
         from gw.shared_pole_execution import sector_round_schedule
         rounds = [row[:3] for row in sector_round_schedule(
             bank, header, meta, config, mesh_xy, execution=execution, batch_width=face_batch)]
@@ -328,7 +339,7 @@ def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output, resi
                 round_model, round_signed, vectors, round_diagnostics = face_reduce_round(
                     round_states, infinity, tables, real=real, mesh=mesh_xy,
                     budget=budget, ordered=ordered, odd_moments=odd_moments,
-                    keep_budget=recipe.get("pole_budget"), admit=False)
+                    keep_budget=recipe.get("pole_budget"), admit=False, room=reduction_room)
             else:
                 round_model, round_signed, vectors, round_diagnostics = reduce_round(
                     round_states, infinity, tables, real=real, mesh_xy=mesh_xy,
@@ -412,7 +423,7 @@ def construct_shared_poles(bank, moments, meta, config, *, mesh_xy, output, resi
             passive, held_errors, reciprocity, moment_defects = check_round(
                 round_model, round_signed, inverse_sqrt, held, (exact["M1"], exact["M3"]), qi,
                 real=real, nodes=[_sample_point(recipe, i) for i in held_ids], eta_ry=recipe["eta_ev"] / RYD_TO_EV,
-                mesh_xy=mesh_xy, eigh_plan=local_eigh, ordered=ordered)
+                mesh_xy=mesh_xy, eigh_plan=eig if execution == 'face' else local_eigh, ordered=ordered)
             del inverse_sqrt, held, exact
         with phase("gates"):
             for slot, q in enumerate(ids[:real]):

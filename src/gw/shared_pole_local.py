@@ -464,7 +464,9 @@ def check_round(model, signed, inverse_coulomb_sqrt, held, moments, infinity_dir
         from gw.shared_pole_execution import face_round_check_program
         if int(model[0].shape[0]) != int(real):
             raise ValueError('whole-mesh shared-pole checks take physical parents only')
-        program = face_round_check_program(mesh_xy, bool(ordered), model[0].shape[-2])
+        if eigh_plan.n not in (None, int(model[0].shape[-2])):
+            raise ValueError('whole-mesh shared-pole checks need the n x n eigh plan')
+        program = face_round_check_program(mesh_xy, bool(ordered), eigh_plan)
         rows = []
         for slot in range(int(real)):
             pick = partial(_leading_row, slot=slot)

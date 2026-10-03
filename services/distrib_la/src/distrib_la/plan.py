@@ -78,7 +78,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from functools import lru_cache, partial
-from typing import Any, Callable
+from typing import Any, Callable, NamedTuple
 
 import jax
 import jax.numpy as jnp
@@ -88,7 +88,7 @@ from distrib_la._result_check import deflate_zero_rows, native_eigh
 from distrib_la.resolve import (NATIVE, NATIVE2D, OPS, backend_module,
                                 mesh_key, resolve_backend)
 
-__all__ = ["Plan", "plan", "ensure_sharding", "BATCHED_SCAN_UNROLL",
+__all__ = ["Plan", "plan", "StackRoute", "ensure_sharding", "BATCHED_SCAN_UNROLL",
            "BATCHED_ROUTES", "BATCHED_ROUTE_CHOICES",
            "BATCHED_ROUTE_DEFAULT", "ROUTE_SCAN",
            "ROUTE_BACKEND_BATCHED", "ROUTE_BATCH_RESHARD"]
@@ -178,6 +178,53 @@ def cached_scan(key, build):
     if fn is None:
         fn = _SCAN_CACHE[key] = build()
     return fn
+
+
+class StackRoute(NamedTuple):
+    """How :meth:`Plan.batched` runs one eigh stack ``(B, n, n)``.
+
+    ``route`` is route (c) or the provider route; on route (c) every rank
+    holds ``per_rank`` whole matrices at a time, over ``rounds`` slices of
+    the stack, and one slice's compiled program needs ``round_bytes`` per
+    rank against the caller's ``room``.
+    """
+    route: str
+    per_rank: int = 0
+    rounds: int = 1
+    round_bytes: int | None = None
+    room: int | None = None
+
+
+#: Decided stack routes, one per (mesh, op, B, n, dtype, room); logged once.
+_STACK_ROUTES: dict = {}
+
+
+@lru_cache(maxsize=None)
+def _round_bytes(op: str, mesh: Mesh, m: int, n: int, dtype: str) -> int:
+    """Per-rank device bytes of one route-(c) slice of ``m`` matrices.
+
+    The compiled size of the slice's actual program (the exchanges, the local
+    eigh and the inverse exchanges: arguments, outputs and temporaries), plus
+    the local solver's runtime workspace, which the vendor reports and the
+    compiler does not count, once per whole matrix a rank holds.
+    """
+    import numpy as np
+    from distrib_la._batch_reshard import reshard_program
+    from distrib_la.workspace import _vendor_query
+    from distrib_la.resolve import mesh_platform
+    face = NamedSharding(mesh, P(None, "x", "y"))
+    program = reshard_program(op, mesh, (((m, n, n), dtype),))
+    stats = program.lower(jax.ShapeDtypeStruct((m, n, n), np.dtype(dtype), sharding=face)
+                          ).compile().memory_analysis()
+    if stats is None:
+        raise RuntimeError("route (c) admission: the compiler returned no memory analysis")
+    compiled = (stats.argument_size_in_bytes + stats.output_size_in_bytes
+                + stats.temp_size_in_bytes - stats.alias_size_in_bytes)
+    vendor = 0
+    if mesh_platform(mesh) == "CUDA":
+        per_rank = -(-m // (int(mesh.shape["x"]) * int(mesh.shape["y"])))
+        vendor = per_rank * (_vendor_query(0, "eigh", (n,), np.dtype(dtype).str)[0] + 4)
+    return int(compiled + vendor)
 
 
 def ensure_sharding(x, sharding: NamedSharding):
@@ -351,6 +398,19 @@ def _native2d_trace_fn(impl: Callable, mesh: Mesh) -> Callable:
     return lambda A, **kw: impl(A, mesh=mesh, **kw)
 
 
+def _describe_stack(route: StackRoute) -> str:
+    """One phrase for a decided stack route (log line and :meth:`Plan.describe`)."""
+    gb = lambda v: "n/a" if v is None else f"{v / 1e9:.2f} GB"
+    if route.route == ROUTE_BATCH_RESHARD:
+        return (f"{route.route}, {route.per_rank} whole matrix(es) per rank, "
+                f"{route.rounds} round(s), compiled {gb(route.round_bytes)}/rank of room "
+                f"{gb(route.room)}")
+    if route.round_bytes is None:
+        return f"{route.route} on the whole mesh (room {gb(route.room)})"
+    return (f"{route.route} on the whole mesh ({route.per_rank} whole matrix(es) per rank "
+            f"compile to {gb(route.round_bytes)} against room {gb(route.room)})")
+
+
 @dataclass(frozen=True)
 class Plan:
     """A resolved linear-algebra call: backend + layout contract + call.
@@ -478,31 +538,61 @@ class Plan:
         return ROUTE_SCAN
 
     def route_for(self, shape, dtype) -> str:
-        """The route :meth:`batched` takes for one operand stack.
+        """The route :meth:`batched` takes for one operand stack (:meth:`stack_route`)."""
+        return self.stack_route(shape, dtype).route
+
+    def stack_route(self, shape, dtype, op: str = "eigh") -> StackRoute:
+        """How :meth:`batched` runs one operand stack: the service's decision.
 
         :attr:`batched_route` is the answer for every stack except one case:
-        ``'auto'`` requested on a provider eigh plan WITH a ``budget_bytes``. Then
-        capacity decides whatever the deck dial said: when the per-rank whole
-        matrices of the stack (``ceil(nb/P)`` of them, input and output) and
-        the local kernel's workspace fit the budget
-        (:func:`distrib_la.workspace.fits_local`), the stack runs route (c);
-        otherwise the provider route. The budget is a caller value every rank
-        shares, so every rank takes the same route.
+        an eigh plan built with ``budget_bytes`` (the caller's room per rank,
+        beside its own live set) and no explicit route. Then capacity decides:
+        the stack runs route (c), one or more whole matrices per rank, when
+        the compiled program of one slice of it fits the room
+        (:func:`_round_bytes`, compiled <= room, never a formula); the stack
+        is cut into as many equal slices (rounds) as that needs. When not even
+        one whole matrix per rank fits, it runs on the whole mesh. The room is
+        a caller value every rank shares and the compiled size is the same on
+        every rank, so every rank takes the same route. The decision is
+        printed once per stack shape (:meth:`describe` lists it too).
         """
         static = self.batched_route
-        if (self.requested_batched_route != "auto" or self.budget_bytes is None
-                or self.is_native or static == ROUTE_BATCH_RESHARD):
-            return static
-        from distrib_la.workspace import fits_local
         shape = tuple(int(v) for v in shape)
         nb = shape[0] if len(shape) == 3 else 1
         ranks = int(self.mesh.shape["x"]) * int(self.mesh.shape["y"])
-        local = (-(-nb // ranks), shape[-2], shape[-1])
-        live = (local, local) if self.op in ("eigh", "solve_lu") else (local,)
-        if self.op == "eigh" and fits_local(
-                self, "eigh", live, dtype, self.budget_bytes):
-            return ROUTE_BATCH_RESHARD
-        return static
+        if static == ROUTE_BATCH_RESHARD:
+            return StackRoute(static, -(-nb // ranks))
+        if (self.requested_batched_route != "auto" or self.budget_bytes is None
+                or self.is_native or self.op != "eigh"):
+            return StackRoute(static)
+        import numpy as np
+        n, dtype = shape[-1], np.dtype(dtype).name
+        key = (mesh_key(self.mesh), op, nb, n, dtype, self.budget_bytes)
+        decided = _STACK_ROUTES.get(key)
+        if decided is None:
+            decided = _STACK_ROUTES[key] = self._decide_stack(op, nb, n, dtype)
+            if jax.process_index() == 0:
+                print(f"distrib_la: {op} stack {nb} x {n}^2 {dtype} on the "
+                      f"{self.mesh.shape['x']}x{self.mesh.shape['y']} mesh -> "
+                      f"{_describe_stack(decided)}", flush=True)
+        return decided
+
+    def _decide_stack(self, op, nb, n, dtype) -> StackRoute:
+        """Route (c) at the most whole matrices per rank whose slice compiles within the room."""
+        ranks = int(self.mesh.shape["x"]) * int(self.mesh.shape["y"])
+        room, provider = int(self.budget_bytes), self.batched_route
+        if n % int(self.mesh.shape["x"]) or n % int(self.mesh.shape["y"]) or room <= 0:
+            return StackRoute(provider, room=room)
+        per_rank, tried, compiled = -(-nb // ranks), 0, None
+        while per_rank >= 1:
+            rounds = -(-(-(-nb // ranks)) // per_rank)
+            m = -(-nb // rounds)
+            tried, compiled = -(-m // ranks), _round_bytes(op, self.mesh, m, n, dtype)
+            if compiled <= room:
+                return StackRoute(ROUTE_BATCH_RESHARD, tried, rounds, compiled, room)
+            per_rank = min(per_rank - 1, per_rank * room // compiled)
+        # The provider route; per_rank names the smallest slice compiled.
+        return StackRoute(provider, tried, 1, compiled, room)
 
     @property
     def native_fn(self) -> Callable:
@@ -541,9 +631,17 @@ class Plan:
         where = ("native JAX, any layout" if self.is_native else
                  f"ONE tile over the {px}x{py} mesh at P('x','y')")
         n = "" if self.n is None else f", n={self.n}"
-        return (f"{self.op}: {self.requested!r} -> {self.backend} "
+        line = (f"{self.op}: {self.requested!r} -> {self.backend} "
                 f"({where}{n}); batched "
                 f"{self.requested_batched_route!r} -> {self.batched_route}")
+        if self.budget_bytes is None:
+            return line
+        stacks = [f"B={key[2]} n={key[3]}: {_describe_stack(route)}"
+                  for key, route in _STACK_ROUTES.items()
+                  if key[0] == mesh_key(self.mesh) and key[5] == self.budget_bytes
+                  and self.n in (None, key[3])]
+        return line + f"; room {self.budget_bytes / 1e9:.2f} GB/rank" + (
+            "; stacks " + "; ".join(stacks) if stacks else "")
 
     # ---- calling -------------------------------------------------------
     def _entry(self, key: str):
@@ -675,6 +773,10 @@ class Plan:
         # plan resolved an FFI backend.  Its layout contract still starts at
         # the same face sharding, including on an explicit native plan.
         if route == ROUTE_BATCH_RESHARD:
+            if self.op == "eigh":
+                self._reshard_options(kwargs)
+                rounds = 1 if _route is not None else self.stack_route(A.shape, A.dtype).rounds
+                return self._checked_reshard("eigh", A, rounds)
             return self._batch_reshard((A, *args), kwargs)
 
         if self.is_native:
@@ -701,6 +803,51 @@ class Plan:
         if route == ROUTE_SCAN:
             return self._refuse_if_poisoned(self._scan_over_single(ops, kwargs), A)
         raise AssertionError(f"unhandled batched route {route!r}")
+
+    def reshard_stack(self, op: str, A):
+        """Route (c) for a face stack: ``op`` is ``eigh``, ``checked_eigh`` or
+        ``normal_eigh`` (polar's right singular vectors), in this plan's
+        decided rounds (:meth:`stack_route`), checked as :meth:`_checked_reshard`."""
+        return self._checked_reshard(op, A, self.stack_route(A.shape, A.dtype, op).rounds)
+
+    def _checked_reshard(self, op: str, A, rounds: int):
+        """Route (c) in ``rounds`` slices, its eigenpairs checked by the service's probes.
+
+        A failed check solves the stack again on this plan's whole-mesh
+        provider (itself checked), and refuses by name if no attempt passes
+        (GATE distrib_la_result_check). ``normal_eigh`` returns singular values
+        and right singular vectors, whose check is the caller's (open).
+        """
+        from distrib_la._batch_reshard import reshard_rounds_call, validate_batch_reshard_operands
+        from distrib_la._result_check import call_site, checked_eigh
+        validate_batch_reshard_operands(op if op != "normal_eigh" else "eigh", self.mesh, (A,))
+        A = ensure_sharding(A, NamedSharding(self.mesh, P(None, "x", "y")))
+        site = call_site()
+        key = ("reshard", op, mesh_key(self.mesh), self.backend, tuple(A.shape), str(A.dtype),
+               int(rounds), site)
+        fn = _SCAN_CACHE.get(key)
+        if fn is None:
+            solve = partial(reshard_rounds_call, op, self.mesh, rounds=int(rounds))
+            if op == "normal_eigh":
+                fn = jax.jit(solve)
+            else:
+                attempts = [solve]
+                if not self.is_native:
+                    attempts.append(lambda a: self._scan_over_single((a,), {}))
+                fn = jax.jit(lambda a: checked_eigh(attempts, a, site=site))
+            _SCAN_CACHE[key] = fn
+        return fn(A)
+
+    @staticmethod
+    def _reshard_options(kwargs: dict):
+        """Refuse keywords route (c) cannot honour (a block size and the
+        vectors hint are distributed-library options; the eigh contract
+        returns (W, Z) on every route)."""
+        options = {k: v for k, v in kwargs.items() if k not in ("block_size", "compute_evecs")}
+        if options:
+            raise TypeError(
+                f"batch_reshard eigh: keyword(s) {', '.join(sorted(options))} have no "
+                f"native-JAX meaning")
 
     def _batch_reshard(self, ops: tuple, kwargs: dict):
         """Route (c): staged movement, local native op, staged inverse."""
@@ -784,7 +931,7 @@ class Plan:
 
 def plan(op: str, mesh_xy: Mesh, *, backend: str = "auto",
          n: int | None = None,
-         batched_route: str = BATCHED_ROUTE_DEFAULT,
+         batched_route: str | None = None,
          budget_bytes: int | None = None) -> Plan:
     """Resolve ``op`` on ``mesh_xy`` ONCE and return the callable plan.
 
@@ -812,14 +959,16 @@ def plan(op: str, mesh_xy: Mesh, *, backend: str = "auto",
         Matrix extent, when known.  Passing it turns the divisibility rule
         into a resolve-time error instead of a call-time one.
     batched_route
-        ``'batch_reshard'`` (the default) stages the batch over the mesh and
-        runs the device-local native JAX operation. ``'auto'`` explicitly
-        requests the backend-batched/scan choice. See
-        :attr:`Plan.batched_route`.
+        ``'batch_reshard'`` (the default without a budget) stages the batch
+        over the mesh and runs the device-local native JAX operation.
+        ``'auto'`` explicitly requests the backend-batched/scan choice. See
+        :attr:`Plan.batched_route`. Leave it out with ``budget_bytes``.
     budget_bytes
-        Optional per-rank device budget for one batched call. With
-        ``batched_route='auto'`` it makes the route a capacity decision per
-        stack (:meth:`Plan.route_for`); ignored otherwise.
+        The caller's room per rank beside its own live set, the same on every
+        rank (0: no room). Given without a route, the service decides each
+        eigh stack by capacity (:meth:`Plan.stack_route`): whole matrices per
+        rank (route (c), in rounds) when one slice's compiled program fits
+        the room, else the whole-mesh provider.
 
     There is deliberately NO ``batched=`` flag.  The design sketch carried
     one; it would have changed nothing about resolution (both shardings are
@@ -829,6 +978,8 @@ def plan(op: str, mesh_xy: Mesh, *, backend: str = "auto",
     """
     if op not in OPS:
         raise ValueError(f"unknown linalg op {op!r} (known: {'|'.join(OPS)})")
+    if batched_route is None:
+        batched_route = "auto" if budget_bytes is not None else BATCHED_ROUTE_DEFAULT
     batched_route = str(batched_route).strip().lower()
     if batched_route not in BATCHED_ROUTE_CHOICES:
         raise ValueError(
@@ -839,8 +990,8 @@ def plan(op: str, mesh_xy: Mesh, *, backend: str = "auto",
     if budget_bytes is not None:
         import operator
         budget_bytes = operator.index(budget_bytes)
-        if budget_bytes <= 0:
-            raise ValueError(f"budget_bytes must be positive, got {budget_bytes}")
+        if budget_bytes < 0:
+            raise ValueError(f"budget_bytes must be non-negative, got {budget_bytes}")
     face = ffi or batched_route == ROUTE_BATCH_RESHARD
     tile = NamedSharding(mesh_xy, P("x", "y")) if face else None
     stack = NamedSharding(mesh_xy, P(None, "x", "y")) if face else None
