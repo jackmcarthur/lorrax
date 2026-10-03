@@ -157,6 +157,7 @@ from distrib_la.resolve import (
 )
 
 from ._batch_reshard import batch_layout, is_batch_layout, local_batch
+from ._result_check import checked_program, checked_shapes
 from distrib_la.tolerance import ROUNDOFF_MARGIN, roundoff_tol
 
 __all__ = [
@@ -167,7 +168,7 @@ __all__ = [
     "face_sharding", "on_face", "hermitian_part", "hermitian_block",
     "join_columns", "diagonal_like",
     # plan
-    "Plan", "plan", "StackRoute", "new_stack_routes", "ensure_sharding", "DONATES",
+    "Plan", "plan", "StackRoute", "new_stack_routes", "ensure_sharding", "DONATES", "checked_program", "checked_shapes",
     # native dense workspace queries (no allocation)
     "workspace_bytes_per_rank", "matmul_workspace_bytes_per_rank", "fits_local",
     # polar / SVD

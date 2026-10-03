@@ -5,6 +5,31 @@ results move, and what a user must change in decks, environment or files.
 The binding rulings behind breaking changes are in
 `docs/architecture/decisions.md`; older history is in git.
 
+## 2026-10-03 — face programs size on their first attempts; the scalar face batch is admitted by its compiled size
+
+A whole-mesh (face) shared-pole program now holds only the first attempt and
+check of every checked eigh inside it and returns their mesh-reduced failure
+flag (`distrib_la.checked_program`); a failed first attempt returns zeros so
+the program stays finite. Only when the flag is set does the round run again,
+with every eigh's whole chain in-graph and on the whole mesh; a solve that
+fails every attempt refuses by name. Route-(c) stack
+decisions inside these programs are sized on the first attempt, not the
+in-graph retry chain. The scalar face constructor admits its parent batch only
+by the compiled size of its round program at the conservative side
+(`face_batch_width`, starting at one parent per rank), and that figure
+replaces the `14R^2+12nR` price in its reduction rows. Each round is admitted
+by the compiled size of its whole-chain, whole-mesh program on the arrays it
+runs, which is also its retry; its eigh stacks take route (c) in the room
+that leaves. The constructor
+line names the compiled size and its sizing wall. The CC/TT/CT sector batch
+keeps its analytic price. Results move by round-off: Fe 4^3 forced face SC
+maps 0-2 within 0.071 ueV of main (scalar; bispinor bitwise), CrI3 24x24
+charge P16 eqp0 within 0.063 ueV. On CrI3 P16 80 GB the face batch is 8
+parents (was 7), every reduction eigh stack runs one whole matrix per rank,
+and the map-0 constructor drops from 902 s to 644 s. A face batch now holds at
+most one parent per rank: Fe 4^3 forced face at P4 runs 4 rounds instead of 1
+(+0.5 s per later map). Decks do not change.
+
 ## 2026-10-02 — distrib_la decides where a face eigh stack runs
 
 The whole-mesh (face) shared-pole constructors, scalar and CC/TT/CT, hand

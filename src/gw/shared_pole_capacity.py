@@ -45,7 +45,7 @@ def shared_pole_byte_terms(meta, *, mesh_xy, resolution, pencil_side,
                            parent_batch, sample_batch, phase="reduction",
                            selection_faces=None, cross_original_sides=None,
                            padding_output_bytes_per_rank=0, ritz_budget=None,
-                           retain_span=False):
+                           retain_span=False, program_bytes=None):
     """Price constructor carriers; the map CapacityLedger owns admission.
 
     Selection holds samples, current narrow actions and the n x n direction
@@ -58,6 +58,8 @@ def shared_pole_byte_terms(meta, *, mesh_xy, resolution, pencil_side,
     ``ritz_budget`` (the pole budget) prices the rank-local paired (ordered)
     reduction, whose kept span is solved on at most that many columns;
     ``retain_span`` adds its coefficient map output (a bispinor sector round).
+    ``program_bytes`` is a face reduction's compiled program size per rank
+    (``face_batch_width``), which replaces its dense temporaries.
     """
     p = int(mesh_xy.shape["x"]) * int(mesh_xy.shape["y"])
     # Constructor carriers are mu x mu charge operators on every admitted deck.
@@ -107,7 +109,9 @@ def shared_pole_byte_terms(meta, *, mesh_xy, resolution, pencil_side,
     elif phase == "reduction":
         if selection_faces is not None:
             raise ValueError('selection_faces applies only to selection')
-        if ritz_budget is None:
+        if program_bytes is not None:
+            dense = 0
+        elif ritz_budget is None:
             # Compiled even local round programs (P4, one parent per rank),
             # temp + output: 11.7-12.5 side**2 (side 5152/10304, n 896/1792).
             dense = 14 * r*r + 12 * packed * r
@@ -148,7 +152,7 @@ def shared_pole_byte_terms(meta, *, mesh_xy, resolution, pencil_side,
         # reduction envelope covers the old actions, not these new outputs.
         "round_padding_outputs": padding_output_bytes_per_rank,
         "replicated_scalars": 8*b*(12*action_side+4*packed),
-        "phase_dense_temporaries": math.ceil(16*dense_copies*dense),
+        "phase_dense_temporaries": math.ceil(16*dense_copies*dense) + int(program_bytes or 0),
     }
     return {"terms_bytes_per_rank": terms,
             "resident_bytes_per_rank": sum(terms.values()),
@@ -256,6 +260,8 @@ class ConstructorCapacity:
         # Face route: room per rank beside the admitted live set, which
         # distrib_la reads to run an eigh stack one whole matrix per rank.
         self.face_room = None
+        # Face route: the reduction program's compiled size per rank.
+        self.program_bytes = None
 
     def eigenplan(self, side):
         """One service plan per configured execution layout and actual side;
@@ -353,7 +359,8 @@ class ConstructorCapacity:
             selection_faces=selection_faces,
             cross_original_sides=cross_original_sides,
             padding_output_bytes_per_rank=padding_output_bytes_per_rank,
-            ritz_budget=self.ritz_budget, retain_span=self.retain_span)
+            ritz_budget=self.ritz_budget, retain_span=self.retain_span,
+            program_bytes=self.program_bytes if phase == "reduction" else None)
         # Other parents' narrow inputs survive selection and each model's
         # checks; they are additional live storage, never hidden in a limit.
         extra = sum(_shard_bytes(a)

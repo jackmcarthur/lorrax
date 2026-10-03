@@ -85,7 +85,7 @@ import jax.numpy as jnp
 import numpy as np
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
-from distrib_la._result_check import deflate_zero_rows, native_eigh
+from distrib_la._result_check import deflate_zero_rows, in_checked_retry, native_eigh, traced_phase
 from distrib_la.resolve import (NATIVE, NATIVE2D, OPS, backend_module,
                                 mesh_key, resolve_backend)
 
@@ -215,7 +215,7 @@ def new_stack_routes() -> list[str]:
     for key, route in _STACK_ROUTES.items():
         if key not in _REPORTED:
             _REPORTED.add(key)
-            where = "eager" if key[6] == "first" else "in a program"
+            where = "first attempt" if key[6] == "first" else "whole chain"
             lines.append(f"{key[1]} stack {key[2]} x {key[3]}^2 {key[4]} ({where}): "
                          f"{_describe_stack(route)}")
     return lines
@@ -226,11 +226,13 @@ def new_stack_routes() -> list[str]:
 #: the same program again.
 _EXECUTABLES: dict = {}
 
-#: What a route-(c) program reserves, by caller. A traced caller's program
-#: holds the whole checked chain ("all": first attempt, retries, refusal); an
-#: eager call's first program holds the first attempt and its check
-#: ("first"), and the retries run as a separate program ("retry") only when
-#: that check failed (distrib_la._result_check.checked).
+#: What a route-(c) program reserves, by caller. An eager call's first program,
+#: and a traced one inside distrib_la.checked_program's first program, holds
+#: the first attempt and its check ("first"); an eager call's retries run as a
+#: separate program ("retry") only when that check failed. Any other traced
+#: caller's program holds the whole checked chain ("all": first attempt,
+#: retries, refusal); a checked_program's own whole-chain program runs every
+#: stack on the whole mesh (Plan.stack_route).
 PHASES = ("all", "first", "retry")
 
 
@@ -251,9 +253,9 @@ def _stack_bytes(op: str, mesh: Mesh, nb: int, n: int, dtype: str, rounds: int,
     caller's operand excluded) plus the local solver's runtime workspace for
     one slice, which cuSOLVER reports and the compiler does not count. An
     eager ``"first"`` executable is kept (:data:`_EXECUTABLES`) and runs the
-    call. A traced caller inlines the ``"all"`` program into its own module,
+    call. A traced caller inlines its phase's program into its own module,
     which is compiled with it, so there the sizing compile is of a different
-    program.
+    program and is not kept.
     """
     import time
     from distrib_la.resolve import mesh_platform
@@ -264,7 +266,7 @@ def _stack_bytes(op: str, mesh: Mesh, nb: int, n: int, dtype: str, rounds: int,
     executable = program.lower(jax.ShapeDtypeStruct((nb, n, n), np.dtype(dtype), sharding=face)
                                ).compile()
     seconds = time.perf_counter() - started
-    if phase == "first":
+    if phase == "first" and traced_phase() == "all":
         _EXECUTABLES[_program_key(op, mesh, (nb, n, n), dtype, rounds, site, phase)] = executable
     stats = executable.memory_analysis()
     if stats is None:
@@ -694,9 +696,8 @@ class Plan:
         even one whole matrix per rank fits, it runs on the whole mesh. The room
         is a caller value every rank shares and the decision runs in lockstep
         over ranks with agreed sizes (:meth:`_decide_stack`), so every rank
-        takes the same route and rounds. ``traced`` says what the program reserves: a traced caller's
-        holds the whole checked chain, an eager call's first program only the
-        first attempt (:data:`PHASES`). Every decision is listed by
+        takes the same route and rounds. ``traced`` says what the program reserves
+        (:data:`PHASES`). Every decision is listed by
         :meth:`describe`, and :func:`new_stack_routes` hands each to a driver
         log once.
         """
@@ -709,7 +710,8 @@ class Plan:
         if (self.requested_batched_route != "auto" or self.budget_bytes is None
                 or self.is_native or self.op != "eigh"):
             return StackRoute(static)
-        if self.budget_bytes == 0:
+        if self.budget_bytes == 0 or in_checked_retry():
+            # A checked program's retry is the whole-mesh program its caller sized.
             return StackRoute(static, room=0)
         from distrib_la._result_check import call_site
         key = self._stack_key(op, nb, shape[-1], dtype, traced)
@@ -720,7 +722,7 @@ class Plan:
         return decided
 
     def _stack_key(self, op, nb, n, dtype, traced):
-        phase = "all" if traced or op == "normal_eigh" else "first"
+        phase = "all" if op == "normal_eigh" else traced_phase() if traced else "first"
         return (mesh_key(self.mesh), op, int(nb), int(n), np.dtype(dtype).name,
                 self.budget_bytes, phase, self.backend, self.batched_route)
 
@@ -869,7 +871,7 @@ class Plan:
         (the refusal names it), so a repeated eager call compiles once.
         """
         if any(isinstance(o, jax.core.Tracer) for o in ops):
-            return fn(*ops, mesh=self.mesh, _site=site, **kwargs)
+            return fn(*ops, mesh=self.mesh, _site=site, _phase=traced_phase(), **kwargs)
         mesh = self.mesh
 
         def program(phase, donate):
@@ -1046,7 +1048,8 @@ class Plan:
                 from distrib_la._result_check import call_site
                 site = call_site()
                 if self.op != "eigh" or isinstance(A, jax.core.Tracer):
-                    return self._finish(self._scan_over_single(ops, kwargs, site=site), A, site)
+                    phase = traced_phase() if isinstance(A, jax.core.Tracer) else "all"
+                    return self._finish(self._scan_over_single(ops, kwargs, site=site, phase=phase), A, site)
                 # Eager: the retries run as a second scan only when a matrix failed.
                 out = self._scan_over_single(ops, kwargs, site=site, phase="first")
                 if bool(np.any(np.asarray(jax.device_get(out[-1].addressable_data(0))))):
@@ -1066,7 +1069,7 @@ class Plan:
     def _checked_reshard(self, op: str, A, rounds: int):
         """Route (c) in ``rounds`` slices, checked (:func:`_reshard_stack_program`).
 
-        A traced caller inlines the whole checked chain. An eager call runs
+        A traced caller inlines its phase of the chain (:data:`PHASES`). An eager call runs
         its first attempt alone (the executable its sizing compiled, when the
         decision made one) and the retries as a second program only when the
         first check failed; a result no attempt repairs refuses by name.
@@ -1083,7 +1086,8 @@ class Plan:
         if op == "normal_eigh":
             return program("all")(A)
         if isinstance(A, jax.core.Tracer):
-            values_vectors, _ = program("all")(A)
+            values_vectors, failed = program(traced_phase())(A)
+            raise_if_failed(failed, "eigh", shape[-1], A.dtype, site)
             return values_vectors
         executable = _EXECUTABLES.get(_program_key(op, self.mesh, shape, dtype, rounds, site, "first"))
         if executable is None or not A.sharding.is_equivalent_to(face, 3):
