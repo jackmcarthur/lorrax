@@ -18,8 +18,10 @@ Gram eigh takes it only where 7 n^2 x 16 bytes per matrix (3 n^2 compiled,
 37.6 GB). Each decision is printed once
 after the constructor line, `distrib_la eigh stack B x n^2 complex128:
 ...`, and the constructor line now names the face batch and its eigh rooms.
-Every route-(c) eigh is checked against the service's probes and refused by
-name if it fails. Results move by eigenvector gauge only: Fe 4^3 forced-face
+Every route-(c) eigh is checked against the service's probes with the same
+retry chain as a distributed eigh (shifted, then gathered when its compiled
+size fits), and the retry chain is part of the compiled size the route is
+decided on. The choice is agreed over ranks. Results move by eigenvector gauge only: Fe 4^3 forced-face
 SC maps 0-2, scalar and bispinor, agree with local main to 0.15 ueV. On the
 same deck the face constructor's maps 1-2 drop from about 15 s to 2 s on 4
 A100s. Decks do not change.
