@@ -66,8 +66,9 @@ three current channels share it: one X_B, one pair GEMM, one all-to-all and
 one set of plane FFTs per batch, then one k-convolution, one accumulator and
 one Z store per channel. The charge fit is the same kernel with one channel.
 
-Each batch runs two collectives, the X_B psum and the pair-projector
-all-to-all; `LORRAX_DEBUG_PRINT=1` counts them from the compiled HLO. Every
+Each batch runs n_x + 1 collectives, one X_B psum per band chunk (n_x = 1
+unless X_B is chunked) and the pair-projector all-to-all;
+`LORRAX_DEBUG_PRINT=1` counts them from the compiled HLO. Every
 FFT, the typed unfold and the k-convolution run locally on the owner of whole
 μ rows, so no FFT is distributed.
 
@@ -274,15 +275,16 @@ The planner decides in this order:
    The HWM is the working set of that configuration; over the target, the
    planner prints one warning line before anything is compiled, and the plan
    runs.
-3. **Plane-group width.** Each candidate's modelled time per batch is the two
+3. **Plane-group width.** Each candidate's modelled time per batch is its
    collectives (`gw.comm_model.comm_time`), plus 3 ms per plane group, plus
    0.65 s·(c+1)/2 of owner work, times the batch count. The cheapest wins,
    and the receipt names the runner-up.
    X_B is replicated and b ≥ P·c_orb, so it grows with P. It is formed in
-   the fewest band chunks n_x whose stage 1 fits the target, inside the pair
-   GEMM's band scan, and never wider than one side of the pair projectors it
-   feeds; n_x = 1 whenever stage 1 fits (CrI3 24×24 bispinor: 1 at P64,
-   2 at P256).
+   the fewest band chunks n_x that bring stage 1 under its cap (the target,
+   or the smallest plane stage when that is larger), inside the pair GEMM's
+   band scan; a chunk is never smaller than one side of the pair projectors
+   it feeds. n_x = 1 whenever stage 1 fits the cap (CrI3 24×24 bispinor: 1
+   at P64, 2 at P256).
 4. **G tile.** G_tile is the largest multiple of P with
    G_tile·6·ceil(Q/P)·μ·16 ≤ target/4,
    capped at ceil(N_G/P)·P.
@@ -299,12 +301,14 @@ orbits make the batch 432, which the plan prices, not 36).
 projectors, Z rows, and the owner's D̃ kept live across chunks) at b = P·c,
 the plane stage at the widest balanced c_out ≤ b/P that fits the cap with
 one plane block, down to one row, then at one row with the fewest plane
-blocks that fit, else one row with one plane group per block. The cap is the
-target, or the bytes the source stage already holds when they are more: that
+blocks that fit. The cap is the target, or the working set of the smallest
+split (one row, one plane group per block) when that is larger: the source
 stage does not depend on the split (CrI3 24×24 bispinor P64: 3 blocks under
 its 69 GB source stage, where the target alone gave 250). The compiled
 check reads that price at the planned chunk, with the widest orbit as its
-minimum chunk: a minimum chunk over the room warns and runs. Every rank runs
+minimum chunk. Still over the room, it doubles the plane blocks while that
+lowers the compiled figure (every rank on the largest one), up to one plane
+group per block; a split that stays over the room warns and runs. Every rank runs
 the smallest chunk any rank chose (`runtime.aot_memory.agreed_chunk`).
 CrI3 8×8 charge, P4: packed c = 12 streamed at c_out = 3 put the route-G
 module's temp at 8.9 GB, where the unchunked all-plane cylinder alone was

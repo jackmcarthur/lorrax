@@ -357,27 +357,20 @@ def make_route_g_kernel(*, mesh: Mesh, kgrid, fft_grid, ns: int, b: int,
         n_g = int(zflat.shape[-1])
         chk = lambda a: (jnp.zeros((Q, c, n_g), jnp.complex128) + jnp.sum(jnp.abs(a)),) * n_v
         # 2. pair GEMM in G space on this rank's slice, X_B one band chunk at a
-        # time when n_xc > 1 (the last chunk starts early; its repeated bands
-        # carry zero weight)
-        if n_xc == 1:
-            X = x_of(psi_bar)
-            if stop_at == 'x':
-                return chk(X)
-            D_l, D_r = pair_projectors_lr(X[None], lambda bc: psi_bar,
-                                          w_l[None], w_r[None])  # (k, s, b, s, Gp)
-        else:
-            nb_ = int(psi_bar.shape[1])
-            bw = -(-nb_ // n_xc)
-            own = np.arange(n_xc)[:, None] * bw
-            j0 = np.minimum(own, nb_ - bw)
-            jj = j0 + np.arange(bw)[None, :]
-            psi_c = lambda bc: jax.lax.dynamic_slice_in_dim(
-                psi_bar, jnp.asarray(j0[:, 0], jnp.int32)[bc], bw, axis=1)
-            if stop_at == 'x':
-                return chk(x_of(psi_c(0)))
-            keep = jnp.asarray(jj >= own)
-            D_l, D_r = pair_projectors_lr(lambda bc: x_of(psi_c(bc)), psi_c,
-                                          w_l[jj] * keep, w_r[jj] * keep)
+        # time (n_xc = 1: whole); the last chunk starts early, its repeated
+        # bands at zero weight
+        nb_ = int(psi_bar.shape[1])
+        bw = -(-nb_ // n_xc)
+        own = np.arange(n_xc)[:, None] * bw
+        j0 = np.minimum(own, nb_ - bw)
+        jj = j0 + np.arange(bw)[None, :]
+        psi_c = lambda bc: jax.lax.dynamic_slice_in_dim(
+            psi_bar, jnp.asarray(j0[:, 0], jnp.int32)[bc], bw, axis=1)
+        if stop_at == 'x':
+            return chk(x_of(psi_c(0)))
+        keep = jnp.asarray(jj >= own)
+        D_l, D_r = pair_projectors_lr(lambda bc: x_of(psi_c(bc)), psi_c,
+                                      w_l[jj] * keep, w_r[jj] * keep)  # (k, s, b, s, Gp)
         if stop_at == 'gemm':
             return chk(jnp.sum(jnp.abs(D_l)) + jnp.sum(jnp.abs(D_r)))
         # 3. one all-to-all: G split -> μ owners, [L | R] owner-major
@@ -406,8 +399,7 @@ def make_route_g_kernel(*, mesh: Mesh, kgrid, fft_grid, ns: int, b: int,
                     # the typed unfold of the parent's pair projectors to child k
                     p, s_ = irr[k], sym[k]
                     # one gather of the chunk's rows: no whole-bin slab per child
-                    rows = lperm[s_]
-                    d = jnp.moveaxis(D[jnp.full_like(rows, p), :, :, rows], 0, 2)  # (s, 2, c_out, s, G)
+                    d = jnp.moveaxis(D[p, :, :, lperm[s_]], 0, 2)        # (s, 2, c_out, s, G)
                     wl = jnp.exp(2j * jnp.pi * (lL[s_].astype(jnp.float64) @ kvecs[p]))
                     d = d * wl[None, None, :, None, None]
                     d = jnp.take(d, pslot[k], axis=-1) * jnp.conj(phase[k])

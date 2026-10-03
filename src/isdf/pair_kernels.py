@@ -55,8 +55,8 @@ def pair_projectors_lr(x_b, psi_bar_chunk, w_l, w_r):
 
     acc = gemm(0)
     if int(w_l.shape[0]) > 1:
-        # ponytail: plain add of each chunk (no in-place GEMM accumulate); the
-        # resident route-G slice is one chunk, so the scan runs only for streamed bands.
+        # ponytail: plain add of each chunk (no in-place GEMM accumulate); route G
+        # scans only when its X_B is band-chunked (gflat_memory_model x_chunks).
         acc, _ = jax.lax.scan(
             lambda a, bc: (jax.tree.map(jnp.add, a, gemm(bc)), None), acc,
             jnp.arange(1, int(w_l.shape[0]), dtype=jnp.int32), unroll=1)

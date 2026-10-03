@@ -254,7 +254,7 @@ def plan_zeta_route_g(*, meta, mesh_xy, n_q_selected: int, ngkmax: int,
     n_zc = min(ps, math.ceil(1.3 * math.pi * r_zeta * r_zeta))
     n_za = min(n_a, math.ceil(2 * r_zeta) + 1)
 
-    def stages(b, n_pg, c_out=None, n_blk=1):
+    def stages(b, n_pg, c_out=None, n_blk=1, xc=None):
         """The batch's live sets per stage; the working set is their max
         (XLA frees each stage's inputs before the next; measured VI3 P16:
         28.2 GB peak against 53.4 GB for the old sum of all terms).  The
@@ -267,7 +267,8 @@ def plan_zeta_route_g(*, meta, mesh_xy, n_q_selected: int, ngkmax: int,
         rows = {"Z rows (+1 lookahead)": 2 * n_v * _c128(Q, c, N_G)}
         d_g = 2 * _c128(n_p, ns, b, ns, Gp)                 # D~ L+R, one copy
         return [
-            dict(rows, **{"X_B": 2 * _c128(n_p, -(-nb // x_chunks(b)), ns, b) + _c128(n_p, Gp, b),
+            dict(rows, **{"X_B": 2 * _c128(n_p, -(-nb // (xc or x_chunks(b))), ns, b)
+                                 + _c128(n_p, Gp, b),
                           "pair projectors (GEMM out, all-to-all out)": 2 * d_g}),
             dict(rows, **{"pair projectors (owner)": d_g,
                           "D cylinder (plane block)": _c128(nk, n_ap, ns, 2 * co, ns, n_col)
@@ -281,17 +282,21 @@ def plan_zeta_route_g(*, meta, mesh_xy, n_q_selected: int, ngkmax: int,
         ]
 
     def x_chunks(b):
-        """X_B (replicated, b·nb wide) in the fewest band chunks whose stage 0
-        fits the target, and never wider than one side of the pair projectors
-        it feeds: 1 whenever stage 0 fits, so X_B stops growing with P."""
+        """X_B (replicated, b·nb wide) in the fewest band chunks that bring
+        stage 0 under the cap: the target, or the smallest plane stage when
+        that is larger (below it chunking buys nothing).  A chunk is never
+        smaller than one side of the pair projectors it feeds.  1 whenever
+        stage 0 fits the cap, so X_B stops growing with P."""
         per_band = 2 * _c128(n_p, 1, ns, b)
+        plane = max(sum(st.values()) for st in stages(b, 1, 1, n_a, xc=1)[1:])
         rest = (base_total + psi_bytes + 2 * n_v * _c128(Q, b // P_, N_G)
                 + _c128(n_p, Gp, b) + 4 * _c128(n_p, ns, b, ns, Gp))
-        room = max(target - rest, _c128(n_p, ns, b, ns, Gp))
+        room = max(max(target, base_total + psi_bytes + plane) - rest,
+                   _c128(n_p, ns, b, ns, Gp))
         return -(-nb // max(1, int(room // max(per_band, 1.0))))   # b = 0: the empty baseline
 
-    def ws(b, n_pg, c_out=None, n_blk=1):
-        return max(stages(b, n_pg, c_out, n_blk), key=lambda d: sum(d.values()))
+    def ws(b, n_pg, c_out=None, n_blk=1, xc=None):
+        return max(stages(b, n_pg, c_out, n_blk, xc), key=lambda d: sum(d.values()))
 
     # The memory split (owner rule): ψ(G) resident iff what is left after
     # the fixed terms holds it and the smallest batch; then every remaining
@@ -302,8 +307,8 @@ def plan_zeta_route_g(*, meta, mesh_xy, n_q_selected: int, ngkmax: int,
     base_total = sum(base.values())
     M_f = target - base_total
 
-    def batch_bytes(b, n_pg):
-        return sum(ws(b, n_pg).values())
+    def batch_bytes(b, n_pg):                  # unchunked X_B: a positive slope
+        return sum(ws(b, n_pg, xc=1).values())
 
     def working_set(b_src, n_pg_, c_out, n_blk):
         return base_total + psi_bytes + sum(ws(b_src, n_pg_, c_out, n_blk).values())
@@ -325,7 +330,7 @@ def plan_zeta_route_g(*, meta, mesh_xy, n_q_selected: int, ngkmax: int,
             n_b = math.ceil(mu / b)
             b = max(b_min, math.ceil(math.ceil(mu / n_b) / P_) * P_)   # balance
             n_grp = math.ceil(n_a / n_pg)
-            # Per batch: the X_B psum and the pair-projector all-to-all
+            # Per batch: the X_B psums (one per band chunk) and the pair-projector all-to-all
             # (gw.comm_model), n_grp·nk scan steps, and the owner's cylinder
             # gathers.  ponytail: gathers at 1 TB/s and 5 µs per scan step,
             # measured on A100; the per-centroid arithmetic is the same for
@@ -333,9 +338,9 @@ def plan_zeta_route_g(*, meta, mesh_xy, n_q_selected: int, ngkmax: int,
             # ponytail: per plane group 3 ms of launches plus the owner's
             # k-conv and plane FFTs at 0.65 s per centroid-grid per batch of
             # c = 1, amortized as c/(c+1) (VI3 P16 A100 measurement); the
-            # comm-model service prices the two collectives.
-            c_ = b // P_
-            t_b = (comm_model.comm_time(_c128(n_p, nb, ns, b), P_ - 1)
+            # comm-model service prices the collectives.
+            c_, xc_ = b // P_, x_chunks(b)
+            t_b = (xc_ * comm_model.comm_time(_c128(n_p, -(-nb // xc_), ns, b), P_ - 1)
                    + comm_model.comm_time(2 * _c128(n_p, ns, b, ns, Gp), P_ - 1)
                    + 3e-3 * n_grp + 0.65 * (c_ + 1) / 2)
             cands.append((n_b * t_b, n_pg, b))
@@ -367,7 +372,7 @@ def plan_zeta_route_g(*, meta, mesh_xy, n_q_selected: int, ngkmax: int,
     if not fits:
         from common.gpu_utils import warn_over_budget
         warn_over_budget(f"zeta mu-batch ({b // P_} centroids per owner, whole orbits of up "
-                         f"to {c_orb}, one plane per block)", hwm, target)
+                         f"to {c_orb}, {c_out} row(s) x {n_blk} plane block(s))", hwm, target)
     store_total = n_v * Q * mu * N_G * 16.0
     transfer = {
         f"pair-projector all-to-all (floor {t_a2a_floor:.0f} s)":
@@ -379,7 +384,7 @@ def plan_zeta_route_g(*, meta, mesh_xy, n_q_selected: int, ngkmax: int,
     }
     return MuBatchPlan(
         green_tile_bytes=float(green), min_config_bytes=float(need_min),
-        collectives_per_batch=2, t_model_s=float(t_model), runner_up=ru,
+        collectives_per_batch=x_chunks(b) + 1, t_model_s=float(t_model), runner_up=ru,
         store_bytes=float(store), host_budget_bytes=float(host_budget),
         min_call_bytes=float(_c128(n_p, -(-nb // x_chunks(b)), ns, b)),
         min_efficient_bytes=comm_model.min_efficient_payload(P_ - 1),
@@ -413,10 +418,8 @@ def _plane_stage(working_set, target, *, c_plan: int, c_src: int, n_pg: int,
     for n_ch in range(-(-c_src // c_plan), c_src + 1):
         if at(-(-c_src // n_ch), 1) <= cap:
             return -(-c_src // n_ch), 1, at(-(-c_src // n_ch), 1) <= target
-    for n_blk in range(2, n_grp + 1):
-        if at(1, n_blk) <= cap:
-            return 1, n_blk, at(1, n_blk) <= target
-    return 1, n_grp, False
+    n_blk = next((n for n in range(2, n_grp) if at(1, n) <= cap), n_grp)
+    return 1, n_blk, at(1, n_blk) <= target
 
 
 def route_g_plane_chunk(plan: MuBatchPlan, c_src: int, n_ranks: int) -> tuple[int, int]:
@@ -427,8 +430,9 @@ def route_g_plane_chunk(plan: MuBatchPlan, c_src: int, n_ranks: int) -> tuple[in
     the planned ``c = b/P``, which the planner floors at the widest orbit.
     The owner streams its rows through the planes in balanced chunks of
     ``c_out ≤ c`` (:func:`_plane_stage`), so the D cylinder, plane group and
-    k-convolution stay within the plan's target; the source rows (X_B, pair
-    projectors, Z rows) are priced at ``P·c_src``.  A split that does not fit
+    k-convolution stay within its cap (the target, or the bytes the source
+    stage already holds); the source rows (X_B, pair projectors, Z rows) are
+    priced at ``P·c_src``.  A split that does not fit
     was already announced by the planner at its own (wider) batch; a packed
     bin wider than the plan's, which the plan did not price, prints one
     warning line here.

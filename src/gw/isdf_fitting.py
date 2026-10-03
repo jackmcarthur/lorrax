@@ -340,10 +340,11 @@ def _fit_mubatch(
 
     builds = {}
 
-    def build(c_max):
+    def build(c_max, n_blk=None):
         """The batch executable at ``c_max`` rows per owner (runtime.aot_memory.check_chunk)."""
         mb = zmb.best_owner_orbit_batches(k_unfold_plan, mu_pad, P_, c_max=int(c_max))
-        c_out, n_blk = route_g_plane_chunk(plan, int(mb.c), P_)
+        c_out, n_blk_ = route_g_plane_chunk(plan, int(mb.c), P_)
+        n_blk = n_blk_ if n_blk is None else int(n_blk)
         kern_args = dict(
             mesh=mesh_xy, kgrid=kgrid, fft_grid=fft_grid, ns=ns, b=int(mb.b),
             q_sel=q_irr_full_idx, q_axis=q_axis, q_neg=q_neg_idx, qvec_frac=q_frac,
@@ -382,6 +383,20 @@ def _fit_mubatch(
     if agreed not in builds:
         build(agreed)
     mb, c_out, n_blk, kern_args, kernel, batch_executable = builds[agreed]
+    # Over the room, the plane axis steps up in blocks while a step lowers the
+    # compiled batch (past that the source stage binds); every rank decides on
+    # the largest figure, so the slow path stays reachable in lockstep.
+    from runtime.aot_memory import compiled_new_bytes
+    fig = lambda ex: -agreed_chunk(-compiled_new_bytes(
+        ex, extra=int(ex.memory_analysis().output_size_in_bytes)))
+    got, n_grp = fig(batch_executable), -(-int(plan.n_planes) // n_pg_plan)
+    while got > plan.target_bytes - ws0 and n_blk < n_grp:
+        nxt = fig(build(agreed, n_blk=min(2 * n_blk, n_grp)))
+        if nxt >= got:
+            break
+        mb, c_out, n_blk, kern_args, kernel, batch_executable = builds[agreed]
+        got = nxt
+        print_fn(f"  μ-batch executable: compiled {got / 1e9:.2f} GB at {n_blk} plane block(s)")
     builds.clear()
     b = int(mb.b)
     print_fn(f"  μ-batch executable: new bytes/rank analytic {check.analytic / 1e9:.2f} GB, "
