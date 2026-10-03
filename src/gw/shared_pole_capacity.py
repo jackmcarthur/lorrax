@@ -180,6 +180,10 @@ def face_eigh_room(admission, held=0):
     or the sector models reserved after the admission. Both are shape prices,
     so every rank agrees on the room. It is floored to a whole GiB.
     """
+    # ponytail: the face programs are keyed on the plan, and so on this
+    # floored room; a room that crosses a GiB between SC maps recompiles the
+    # face parent program. Upgrade path: key the programs on the decision
+    # tuple (route, matrices per rank, rounds) instead of the room.
     room = (int(admission['available_device_bytes_per_rank'])
             - int(admission['aggregate_bytes_per_rank']) - int(held))
     return (room >> 30) << 30 if room >= 1 << 30 else None

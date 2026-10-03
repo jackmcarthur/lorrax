@@ -281,11 +281,12 @@ a `StackRoute`):
   decision compiled. Inside a caller's trace the program is compiled again as
   part of the caller's module, and the decision line reports the sizing
   compile's wall (`sized in … s`).
-- **Plans that serve several rooms.** Each decision holds for a range of
-  rooms (`StackRoute.holds_at`). `plan` hands back an earlier plan with a
-  room when every decision it has made holds at the new room, so programs
-  keyed on the plan are not compiled again; that plan decides any new stack
-  against the smallest room it has served.
+- **A failed sizing rejects.** A rank whose sizing compile fails posts a
+  failure sentinel instead of raising, so every rank reaches the exchange and
+  every rank rejects that candidate.
+- **One plan per room.** A plan carries one room; a caller that keys
+  programs on the plan (the face constructors floor their rooms to whole
+  GiB) compiles again when its room changes.
 - **Reporting.** Each decision is printed once per (op, B, n, dtype, room,
   eager or traced) by `new_stack_routes()`, which a driver prints through its
   reporter, and listed by `describe()`. `known_route` is the pure query for

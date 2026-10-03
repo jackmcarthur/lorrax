@@ -5,7 +5,8 @@ Each rank is handed a different compiled size for the same candidate
 first candidate, rank 1 does not. The decision must be the same on both
 ranks, both must walk the same candidates in the same order, and neither may
 hang. A second stack exercises the shape-bound rejection (no candidate is
-sized). Run with no arguments; it starts its two ranks itself and exits 1 on
+sized); a third makes rank 1's sizing raise at every candidate, which must
+reject them all on both ranks without a hang. Run with no arguments; it starts its two ranks itself and exits 1 on
 any disagreement or a timeout.
 
     python3 services/distrib_la/bench/stack_route_lockstep_check.py
@@ -35,7 +36,11 @@ def rank_main(rank, port):
     calls = []
 
     def injected(op, mesh_, nb, n, dtype, rounds, site, phase):
-        calls.append(int(rounds))
+        calls.append((int(nb), int(rounds)))
+        if nb == 7 and rank == 1:           # the sizing compile fails on one rank only
+            raise RuntimeError("injected compile failure")
+        if nb == 7:
+            return ROOM // 4, 0.0
         if rounds == 1:                     # two whole matrices per rank
             return (ROOM // 2 if rank == 0 else ROOM + 1), 0.0
         return ROOM // 4, 0.0               # one whole matrix per rank, two rounds
@@ -48,9 +53,12 @@ def rank_main(rank, port):
     decided = p.stack_route((5, 4, 4), np.complex128)
     # Shape bound: 2 n^2 x 16 B per whole matrix exceeds the room, no candidate sized.
     rejected = p.stack_route((5, 32, 32), np.complex128)
+    # One rank's sizing raises at every candidate: both ranks reject them all.
+    failed = p.stack_route((7, 4, 4), np.complex128)
     print("RESULT " + json.dumps(dict(rank=rank, route=decided.route, per_rank=decided.per_rank,
                                       rounds=decided.rounds, bytes=decided.program_bytes, calls=calls,
-                                      rejected=rejected.route, rejected_bytes=rejected.program_bytes)),
+                                      rejected=rejected.route, rejected_bytes=rejected.program_bytes,
+                                      failed=failed.route, failed_bytes=failed.program_bytes)),
           flush=True)
     jax.distributed.shutdown()
 
@@ -79,7 +87,8 @@ def main():
     for row in results:
         print("stack_route_lockstep", json.dumps(row), flush=True)
     if len(results) == 2:
-        keys = ("route", "per_rank", "rounds", "bytes", "calls", "rejected", "rejected_bytes")
+        keys = ("route", "per_rank", "rounds", "bytes", "calls", "rejected", "rejected_bytes",
+                "failed", "failed_bytes")
         if any(results[0][k] != results[1][k] for k in keys):
             failed.append("ranks disagree")
         if results[0]["route"] != "batch_reshard" or results[0]["rounds"] != 2 \
@@ -87,6 +96,8 @@ def main():
             failed.append("wrong decision: want batch_reshard, 1 per rank, 2 rounds at the agreed size")
         if results[0]["rejected"] == "batch_reshard" or results[0]["rejected_bytes"] is not None:
             failed.append("shape bound did not reject without a size")
+        if results[0]["failed"] == "batch_reshard":
+            failed.append("a one-rank sizing failure did not reject on every rank")
     print("stack_route_lockstep " + ("FAILED: " + "; ".join(failed) if failed else "PASS"), flush=True)
     return 1 if failed else 0
 

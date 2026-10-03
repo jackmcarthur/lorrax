@@ -639,8 +639,12 @@ def construct_diagonal_sector_round(samples, moments, meta, config, geometry, *,
     panel_elements=sum(int(np.prod(panels.shape[1:])) for panels,_ in line.values())
     selection_faces=(sum(int(panel.shape[1]) for panel in samples.values())
                      +len(moments)+-(-panel_elements//local_meta.n_rmu_padded**2))
-    budget.plan(0,phase='selection',sample_batch=samples['Wc'].shape[1],
-                selection_faces=selection_faces)
+    selection=budget.plan(0,phase='selection',sample_batch=samples['Wc'].shape[1],
+                          selection_faces=selection_faces)
+    if execution=='face' and budget.face_room is not None:
+        # The selection eighs run beside the selection's own admitted live set.
+        from gw.shared_pole_capacity import face_eigh_room
+        budget.face_room=min(budget.face_room,face_eigh_room(selection) or 0) or None
     eig=budget.eigenplan(local_meta.n_rmu_padded)
     extent=port_extent(mesh_xy)
     kernels=_round_kernels(mesh_xy,'face' if execution=='face' else 'batch')
@@ -1062,10 +1066,7 @@ def reduce_cross_round(charge, transverse, cross, moments, *, mesh_xy, eigh_plan
     """
     from gw.shared_pole_execution import is_face,cross_parent_program
     if is_face(charge[4]):
-        from gw.shared_pole_execution import face_eigh
-        side=charge[4].shape[-1]+transverse[4].shape[-1]
-        return cross_parent_program(mesh_xy,face_eigh(mesh_xy,side,eigh_plan.budget_bytes))(
-            charge,transverse,cross,moments)
+        return cross_parent_program(mesh_xy,eigh_plan)(charge,transverse,cross,moments)
     return _local_cross_parent_program(mesh_xy,eigh_plan.native_fn)(charge,transverse,cross,moments)
 
 

@@ -302,9 +302,8 @@ def face_eigh(mesh, n, room=None):
     ``room`` is the caller's device bytes per rank beside its admitted live
     set (``face_eigh_room``), the same on every rank. distrib_la decides each
     stack from it: whole matrices per rank where the program that runs it
-    compiles within the room, else the whole mesh, and hands back an earlier
-    plan when none of its decisions changes at this room. Without a room
-    every stack runs on the mesh.
+    compiles within the room, else the whole mesh. Without a room every stack
+    runs on the mesh.
     """
     from distrib_la import plan
     return plan('eigh',mesh,n=int(n),backend='distributed',budget_bytes=int(room or 0))
@@ -335,8 +334,7 @@ def face_parent_program(mesh,ordered,odd_moments,keep_budget,retain_span,side,gr
     """Retained static-layout executable builder; all state values are operands.
 
     ``eigh_plan`` (``face_eigh`` at the reduction's room) decides the pencil's
-    eigh stacks; the program is keyed on it, and distrib_la hands back the same
-    plan for a room at which none of its decisions changes. ``carrier``
+    eigh stacks, and the program is keyed on it. ``carrier``
     (``face_ritz_carrier``) solves an ordered pencil's kept span on that many
     columns, None keeping the whole H'_vv side.
     """

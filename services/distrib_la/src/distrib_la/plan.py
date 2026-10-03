@@ -188,10 +188,7 @@ class StackRoute(NamedTuple):
     holds ``per_rank`` whole matrices at a time, over ``rounds`` slices of
     the stack, and the program that runs it needs ``program_bytes`` per rank
     (:func:`_stack_bytes`, agreed over ranks) against the caller's ``room``.
-    ``sizing_seconds`` is the wall of the compiles that decided it. The same
-    decision holds for every room in ``[program_bytes, ceiling)`` (route (c))
-    or ``[0, ceiling)`` (the provider): ``ceiling`` is the smallest size, or
-    lower bound, of the larger candidates it rejected (:meth:`Plan._decide_stack`).
+    ``sizing_seconds`` is the wall of the compiles that decided it.
     """
     route: str
     per_rank: int = 0
@@ -199,12 +196,6 @@ class StackRoute(NamedTuple):
     program_bytes: int | None = None
     room: int | None = None
     sizing_seconds: float = 0.0
-    ceiling: float = float("inf")
-
-    def holds_at(self, room: int) -> bool:
-        """Whether this decision is the one a room of ``room`` bytes would make."""
-        low = self.program_bytes if self.route == ROUTE_BATCH_RESHARD else 0
-        return low <= room < self.ceiling
 
 
 #: Decided stack routes, one per (mesh, op, B, n, dtype, room, phase, backend,
@@ -287,6 +278,23 @@ def _stack_bytes(op: str, mesh: Mesh, nb: int, n: int, dtype: str, rounds: int,
         # complex128, the size jaxlib's syevBatched allocates at runtime).
         vendor = per_rank * (_vendor_query(0, "eigh", (n,), np.dtype(dtype).str)[0] + 4)
     return int(compiled + vendor), seconds
+
+
+#: What a rank posts for a candidate it could not size (a compile error, no
+#: memory analysis): larger than any room, so the agreed size rejects it.
+_SIZING_FAILED = 1 << 62
+
+
+def _sized_or_failed(op, mesh, nb, n, dtype, rounds, site, phase) -> tuple[int, float]:
+    """:func:`_stack_bytes`, or the failure sentinel: never raises before the exchange."""
+    import sys
+    try:
+        return _stack_bytes(op, mesh, nb, n, dtype, rounds, site, phase)
+    except Exception as exc:        # any failure means "does not fit", on every rank
+        print(f"distrib_la: route (c) sizing of {op} {nb} x {n}^2 in {rounds} round(s) failed "
+              f"on process {jax.process_index()} ({type(exc).__name__}: {exc}); the candidate "
+              f"is rejected on every rank", file=sys.stderr, flush=True)
+        return _SIZING_FAILED, 0.0
 
 
 def _gathered_admitted(shape, dtype) -> bool:
@@ -536,8 +544,9 @@ def _describe_stack(route: StackRoute) -> str:
                 f"{route.rounds} round(s), compiled {gb(route.program_bytes)}/rank of room "
                 f"{gb(route.room)}{sized}")
     if route.program_bytes is None:
-        return (f"{route.route} on the whole mesh (room {gb(route.room)}"
-                f"{', below one whole matrix and its vectors' if route.room else ''})")
+        why = ("no compiled candidate fits" if route.sizing_seconds
+               else "below one whole matrix and its vectors" if route.room else "")
+        return f"{route.route} on the whole mesh (room {gb(route.room)}{', ' + why if why else ''})"
     return (f"{route.route} on the whole mesh ({route.per_rank} whole matrix(es) per rank "
             f"compile to {gb(route.program_bytes)} against room {gb(route.room)}{sized})")
 
@@ -740,36 +749,39 @@ class Plan:
         agreed (the largest any rank measured) before the comparison with
         the room. The first candidate whose agreed size fits wins; a
         candidate whose matrices and vectors alone (2 n^2 each) exceed the
-        room is rejected without a compile. Only a compiled figure accepts.
+        room is rejected without a compile. Only a compiled figure accepts. A
+        rank whose sizing fails posts a failure sentinel instead of raising,
+        so every rank still reaches the exchange and rejects the candidate.
         """
         from distrib_la._collectives import agreed_minimum
         ranks = int(self.mesh.shape["x"]) * int(self.mesh.shape["y"])
-        room, provider = int(_SERVED.get(self, self.budget_bytes)), self.batched_route
+        room, provider = int(self.budget_bytes), self.batched_route
         if n % int(self.mesh.shape["x"]) or n % int(self.mesh.shape["y"]):
             return StackRoute(provider, room=room)
         floor = 2 * n * n * np.dtype(dtype).itemsize
         per_rank, tried, compiled, wall = -(-nb // ranks), 0, None, 0.0
-        ceiling = float("inf")
         while per_rank >= 1:
             rounds = -(-(-(-nb // ranks)) // per_rank)
             m = -(-nb // rounds)
             if -(-m // ranks) * floor > room:
-                ceiling = min(ceiling, -(-m // ranks) * floor)
                 per_rank = min(per_rank - 1, room // floor)
                 continue
-            local, seconds = _stack_bytes(op, self.mesh, nb, n, dtype, rounds, site, phase)
+            local, seconds = _sized_or_failed(op, self.mesh, nb, n, dtype, rounds, site, phase)
             agreed, = agreed_minimum((-int(local),), tag="eigh stack size")
             tried, compiled, wall = -(-m // ranks), -agreed, wall + seconds
+            if compiled >= _SIZING_FAILED:
+                compiled = None             # a rank could not size it: doesn't fit anywhere
+                per_rank -= 1
+                continue
             if compiled <= room:
-                return StackRoute(ROUTE_BATCH_RESHARD, tried, rounds, compiled, room, wall, ceiling)
-            ceiling = min(ceiling, compiled)
+                return StackRoute(ROUTE_BATCH_RESHARD, tried, rounds, compiled, room, wall)
             # The size is not proportional to the matrices per rank (fixed
             # exchange and check costs), so one per rank is always compiled
             # before the provider wins.
             per_rank = min(per_rank - 1, max(1, per_rank * room // compiled))
         # The provider route; per_rank names the smallest slice that was compiled
         # (0 with no compile: one whole matrix and its vectors exceed the room).
-        return StackRoute(provider, tried, 1, compiled, room, wall, ceiling)
+        return StackRoute(provider, tried, 1, compiled, room, wall)
 
     @property
     def native_fn(self) -> Callable:
@@ -1240,40 +1252,8 @@ def plan(op: str, mesh_xy: Mesh, *, backend: str = "auto",
         # returned Plan.batched remains trace-safe.
         from distrib_la._collectives import warm_mesh_cliques
         warm_mesh_cliques(mesh_xy)
-    made = Plan(op=op, requested=str(backend), backend=resolved,
+    return Plan(op=op, requested=str(backend), backend=resolved,
                 mesh=mesh_xy, n=None if n is None else int(n),
                 in_sharding=tile, batch_in_sharding=stack,
                 requested_batched_route=batched_route,
                 budget_bytes=budget_bytes)
-    return made if budget_bytes is None else _same_decisions(made)
-
-
-#: Plans with a room, by everything but the room, and the smallest room each
-#: has served (its later decisions are made against that room).
-_ROOMED: dict = {}
-_SERVED: dict = {}
-
-
-def _same_decisions(made: Plan) -> Plan:
-    """An earlier plan whose every stack decision is also this room's, or ``made``.
-
-    A caller keys its programs on the plan, so a room that moves (an SC map's
-    admission crossing a GiB) reuses those programs whenever no decision
-    would change (:meth:`StackRoute.holds_at`). The reused plan decides any
-    new stack against the smallest room it has served, so its decisions hold
-    for every caller that shares it. Only a plan that has decided at least
-    one stack is reused.
-    """
-    family = (made.op, made.requested, made.backend, mesh_key(made.mesh), made.n,
-              made.requested_batched_route)
-    room = int(made.budget_bytes)
-    for earlier in _ROOMED.get(family, ()):
-        decided = [route for key, route in _STACK_ROUTES.items()
-                   if key[0] == family[3] and key[5] == earlier.budget_bytes
-                   and key[7] == earlier.backend and key[8] == earlier.batched_route]
-        if decided and all(route.holds_at(room) for route in decided):
-            _SERVED[earlier] = min(_SERVED[earlier], room)
-            return earlier
-    _ROOMED.setdefault(family, []).append(made)
-    _SERVED[made] = room
-    return made
