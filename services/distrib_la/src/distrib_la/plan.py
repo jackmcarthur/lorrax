@@ -530,7 +530,8 @@ def _describe_stack(route: StackRoute) -> str:
                 f"{route.rounds} round(s), compiled {gb(route.program_bytes)}/rank of room "
                 f"{gb(route.room)}{sized}")
     if route.program_bytes is None:
-        return f"{route.route} on the whole mesh (room {gb(route.room)})"
+        return (f"{route.route} on the whole mesh (room {gb(route.room)}"
+                f"{', below one whole matrix and its vectors' if route.room else ''})")
     return (f"{route.route} on the whole mesh ({route.per_rank} whole matrix(es) per rank "
             f"compile to {gb(route.program_bytes)} against room {gb(route.room)}{sized})")
 
@@ -727,16 +728,25 @@ class Plan:
         room, provider = int(self.budget_bytes), self.batched_route
         if n % int(self.mesh.shape["x"]) or n % int(self.mesh.shape["y"]) or room <= 0:
             return StackRoute(provider, room=room)
+        import numpy as np
+        # A whole matrix and its vectors on one rank: below every route-(c)
+        # program, so a room under it rejects without a compile. Only the
+        # compiled figure ever accepts.
+        floor = 2 * n * n * np.dtype(dtype).itemsize
         per_rank, tried, compiled, wall = -(-nb // ranks), 0, None, 0.0
         while per_rank >= 1:
             rounds = -(-(-(-nb // ranks)) // per_rank)
             m = -(-nb // rounds)
+            if -(-m // ranks) * floor > room:
+                per_rank = min(per_rank - 1, room // floor)
+                continue
             compiled, seconds = _stack_bytes(op, self.mesh, nb, n, dtype, rounds, site)
             tried, wall = -(-m // ranks), wall + seconds
             if compiled <= room:
                 return StackRoute(ROUTE_BATCH_RESHARD, tried, rounds, compiled, room, wall)
             per_rank = min(per_rank - 1, per_rank * room // compiled)
-        # The provider route; per_rank names the smallest slice that was compiled.
+        # The provider route; per_rank names the smallest slice that was compiled
+        # (0 with no compile: one whole matrix and its vectors exceed the room).
         return StackRoute(provider, tried, 1, compiled, room, wall)
 
     @property
