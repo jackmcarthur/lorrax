@@ -80,7 +80,7 @@ def main():
         if lead:
             print(f"eigh_stack P{px * py} {name:22s} B={b:3d} n={n:6d} route={route.route} "
                   f"per_rank={route.per_rank} rounds={route.rounds} "
-                  f"compiled={0 if route.round_bytes is None else route.round_bytes / 1e9:.2f}GB room={ROOM / 1e9:.0f}GB | "
+                  f"compiled={0 if route.program_bytes is None else route.program_bytes / 1e9:.2f}GB room={ROOM / 1e9:.0f}GB | "
                   f"service {wall:.3f}s ({wall / b:.3f}s/eigh){unchecked} | whole-mesh {wall_scan:.3f}s "
                   f"({wall_scan / b:.3f}s/eigh) speedup {wall_scan / wall:.2f}x | residual {r:.1e} orth {o:.1e} "
                   f"(mesh {rs:.1e}/{os_:.1e}) eig_gap {gap:.1e} finite={finite} ascending={ascending} "

@@ -185,13 +185,13 @@ class StackRoute(NamedTuple):
 
     ``route`` is route (c) or the provider route; on route (c) every rank
     holds ``per_rank`` whole matrices at a time, over ``rounds`` slices of
-    the stack, and one slice's compiled program needs ``round_bytes`` per
-    rank against the caller's ``room``.
+    the stack, and the program that runs it needs ``program_bytes`` per rank
+    (:func:`_stack_bytes`) against the caller's ``room``.
     """
     route: str
     per_rank: int = 0
     rounds: int = 1
-    round_bytes: int | None = None
+    program_bytes: int | None = None
     room: int | None = None
 
 
@@ -456,12 +456,12 @@ def _describe_stack(route: StackRoute) -> str:
     gb = lambda v: "n/a" if v is None else f"{v / 1e9:.2f} GB"
     if route.route == ROUTE_BATCH_RESHARD:
         return (f"{route.route}, {route.per_rank} whole matrix(es) per rank, "
-                f"{route.rounds} round(s), compiled {gb(route.round_bytes)}/rank of room "
+                f"{route.rounds} round(s), compiled {gb(route.program_bytes)}/rank of room "
                 f"{gb(route.room)}")
-    if route.round_bytes is None:
+    if route.program_bytes is None:
         return f"{route.route} on the whole mesh (room {gb(route.room)})"
     return (f"{route.route} on the whole mesh ({route.per_rank} whole matrix(es) per rank "
-            f"compile to {gb(route.round_bytes)} against room {gb(route.room)})")
+            f"compile to {gb(route.program_bytes)} against room {gb(route.room)})")
 
 
 @dataclass(frozen=True)
@@ -643,7 +643,7 @@ class Plan:
             if compiled <= room:
                 return StackRoute(ROUTE_BATCH_RESHARD, tried, rounds, compiled, room)
             per_rank = min(per_rank - 1, per_rank * room // compiled)
-        # The provider route; per_rank names the smallest slice compiled.
+        # The provider route; per_rank names the smallest slice that was compiled.
         return StackRoute(provider, tried, 1, compiled, room)
 
     @property
@@ -1000,8 +1000,8 @@ def plan(op: str, mesh_xy: Mesh, *, backend: str = "auto",
         The caller's room per rank beside its own live set, the same on every
         rank (0: no room). Given without a route, the service decides each
         eigh stack by capacity (:meth:`Plan.stack_route`): whole matrices per
-        rank (route (c), in rounds) when one slice's compiled program fits
-        the room, else the whole-mesh provider.
+        rank (route (c), in rounds) when the compiled program that runs it
+        fits the room, else the whole-mesh provider.
 
     There is deliberately NO ``batched=`` flag.  The design sketch carried
     one; it would have changed nothing about resolution (both shardings are
