@@ -18,6 +18,13 @@ import numpy as np
 from common import timing
 
 
+def _print_eigh_stack_routes(print_fn):
+    """The route distrib_la chose for each new eigh stack shape, one line each."""
+    import distrib_la
+    for line in distrib_la.new_stack_routes():
+        print_fn("  distrib_la " + line)
+
+
 def _json(value):
     def encode(x):
         if isinstance(x, np.ndarray):
@@ -698,6 +705,7 @@ def screen_shared_poles(wfns, V_q, meta, config, *, mesh_xy, sym,
             mode = "face" if any(row["mode"] == "face" for _, row in routes) else "local"
             print_fn(f"Shared-pole sector constructor: {mode} route; " + "; ".join(
                 f"{name} {route_summary(row['mode'], row)}" for name, row in routes))
+            _print_eigh_stack_routes(print_fn)
     else:
         # An SC map keeps its model on the devices when it fits; an export
         # (write_w, write_poles) reads model.h5 and a one-shot registers it
@@ -722,6 +730,7 @@ def screen_shared_poles(wfns, V_q, meta, config, *, mesh_xy, sym,
                  + f"{rounds} round(s); seconds "
                  + " ".join(f"{name}={value:.2f}" for name, value in
                             sorted(walls.items(), key=lambda item: -item[1])))
+        _print_eigh_stack_routes(print_fn)
     if resident is not None:
         # The model is committed; the constructor was the bank's last reader.
         resident.release()
