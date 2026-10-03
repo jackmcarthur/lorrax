@@ -143,6 +143,9 @@ class MuBatchPlan:
     # (route_g_plane_chunk)
     working_set: object = dataclasses.field(default=None, repr=False, compare=False)
     n_planes: int = 0               # planes along the fit axis (n_a)
+    min_c: int = 1                  # widest centroid orbit: the smallest owner bin
+    c_out: int = 0                  # owner plane stage of the planned batch:
+    n_blk: int = 1                  # c_out rows at a time, n_blk plane blocks
 
     def format(self) -> str:
         gt = max(self.green_tile_bytes, 1.0)
@@ -150,13 +153,14 @@ class MuBatchPlan:
             "  ISDF μ-batch plan (one budget; docs/architecture/zeta_fit_mubatch.md)",
             f"    fit route     = {self.route} (source {self.source}, "
             f"band chunk {self.band_chunk}, k chunk {self.k_chunk})",
-            f"    μ batch       = {self.b}  ({self.n_batch} batches, "
+            f"    μ batch       = {self.b}  (whole orbits per owner, at least "
+            f"{self.min_c} each; {self.n_batch} batches, "
             f"{self.collectives_per_batch} collectives each, smallest "
             f"{self.min_call_bytes / 1e6:.1f} MB/rank (efficient >= "
             f"{self.min_efficient_bytes / 1e6:.1f}); modelled loop "
             f"{self.t_model_s:.0f} s; runner-up {self.runner_up})",
-            f"    r sub-block   = {self.r_sub} "
-            f"{'points' if self.route == 'cache' else 'planes per group' if self.route == 'G' else 'plane(s)'}",
+            f"    r sub-block   = {self.r_sub} planes per group; owner plane stage "
+            f"{self.c_out} rows at a time, {self.n_blk} plane block(s)",
             f"    ζ back-solve  = whole-tile factor on its q owners, applied on each "
             f"G tile (`linalg` sets the other stages)",
             f"    channels      = {self.n_vertex} (one k-convolution, accumulator and "
@@ -202,16 +206,25 @@ def plan_zeta_route_g(*, meta, mesh_xy, n_q_selected: int, ngkmax: int,
     X_B psum and the per-centroid arithmetic are the same for every
     candidate.  ψ(G), X_B and the pair projectors are priced over the
     ``n_parent`` raw parents the kernel holds (default the full zone).
-    Feasibility: the smallest configuration (``b = P``, one plane per group
-    and per block) must fit; the planned batch keeps the whole plane axis in
-    one block, and :func:`route_g_plane_chunk` streams rows and plane blocks
-    when the packed orbits need it.
+    Every owner holds whole centroid orbits
+    (:func:`isdf.zeta_mubatch.owner_orbit_batches`), so the widest orbit of
+    ``meta.mu_basis`` is the smallest owner bin: ``b ≥ P·c_orb``.  The
+    smallest configuration is ``b = P·c_orb`` with one plane per group and
+    per block; the planned batch keeps the whole plane axis in one block when
+    it fits, else its owner plane stage streams rows and plane blocks
+    (:func:`_plane_stage`, the rule :func:`route_g_plane_chunk` applies in
+    the fit).  The HWM is that configuration's working set; over the target,
+    one warning line is printed here, before anything is compiled, and the
+    plan runs.
     """
     from runtime.padding import mesh_divisor
     P_ = int(mesh_divisor(mesh_xy))
     nk, ns = int(meta.nk_tot), int(meta.nspinor)
     n_p = nk if n_parent is None else int(n_parent)
     mu = int(getattr(meta, "n_rmu_padded", None) or meta.n_rmu)
+    basis = getattr(meta, "mu_basis", None)
+    c_orb = 1 if basis is None else int(max(basis.layout.axis.group_size))
+    b_min = P_ * c_orb
     fft_grid = tuple(int(v) for v in meta.fft_grid)
     n_rtot = int(math.prod(fft_grid))
     n_a = max(fft_grid)
@@ -279,14 +292,14 @@ def plan_zeta_route_g(*, meta, mesh_xy, n_q_selected: int, ngkmax: int,
     def batch_bytes(b, n_pg):
         return sum(ws(b, n_pg).values())
 
+    def working_set(b_src, n_pg_, c_out, n_blk):
+        return base_total + psi_bytes + sum(ws(b_src, n_pg_, c_out, n_blk).values())
+
     green = _c128(nk, ns * ns, mu, mu, shard=P_)
-    floor_ws = sum(ws(P_, 1, 1, n_a).values())
-    need_min = base_total + psi_bytes + floor_ws
-    if M_f - psi_bytes < floor_ws:
-        # The smallest route-G configuration (ψ(G) resident, b = P, one plane
-        # per block) runs; ψ(G) streaming in band-chunk buffers is not implemented.
-        from common.gpu_utils import warn_over_budget
-        warn_over_budget("zeta mu-batch (b = P, one plane per block)", need_min, target)
+    # The smallest route-G configuration: ψ(G) resident (its streaming in
+    # band-chunk buffers is not implemented), one widest orbit per owner, one
+    # plane per block.
+    need_min = working_set(b_min, 1, 1, n_a)
     b_top = math.ceil(mu / P_) * P_
     cands = []
     n_pg = 1
@@ -294,10 +307,10 @@ def plan_zeta_route_g(*, meta, mesh_xy, n_q_selected: int, ngkmax: int,
         c_mu = (batch_bytes(2 * P_, n_pg) - batch_bytes(P_, n_pg)) / P_
         fixed = batch_bytes(P_, n_pg) - c_mu * P_
         room = M_f - psi_bytes - fixed
-        if room >= c_mu * P_:
+        if room >= c_mu * b_min:
             b = min(b_top, int(room // c_mu) // P_ * P_)
             n_b = math.ceil(mu / b)
-            b = math.ceil(math.ceil(mu / n_b) / P_) * P_          # balance
+            b = max(b_min, math.ceil(math.ceil(mu / n_b) / P_) * P_)   # balance
             n_grp = math.ceil(n_a / n_pg)
             # Per batch: the X_B psum and the pair-projector all-to-all
             # (gw.comm_model), n_grp·nk scan steps, and the owner's cylinder
@@ -317,7 +330,7 @@ def plan_zeta_route_g(*, meta, mesh_xy, n_q_selected: int, ngkmax: int,
             break
         n_pg = min(2 * n_pg, n_a)
     if not cands:      # no batch holds the whole plane axis: blocks engage
-        cands.append((float("nan"), 1, P_))
+        cands.append((float("nan"), 1, b_min))
     cands.sort()
     t_model, n_pg, b = cands[0]
     ru = (f"n_pg={cands[1][1]} b={cands[1][2]}: {cands[1][0]:.0f} s"
@@ -333,8 +346,15 @@ def plan_zeta_route_g(*, meta, mesh_xy, n_q_selected: int, ngkmax: int,
     store = n_v * _c128(Q, n_batch * b, n_Gt * g_tile, shard=P_)
     host_budget = _host_bytes_per_rank()
     placement = 'host' if store <= host_budget else 'disk'
+    c_out, n_blk, fits = _plane_stage(working_set, target, c_plan=b // P_, c_src=b // P_,
+                                      n_pg=n_pg, n_planes=n_a, n_ranks=P_)
     br = dict(base)
-    br.update(ws(b, n_pg))
+    br.update(ws(b, n_pg, c_out, n_blk))
+    hwm = sum(br.values())
+    if not fits:
+        from common.gpu_utils import warn_over_budget
+        warn_over_budget(f"zeta mu-batch ({b // P_} centroids per owner, whole orbits of up "
+                         f"to {c_orb}, one plane per block)", hwm, target)
     store_total = n_v * Q * mu * N_G * 16.0
     transfer = {
         f"pair-projector all-to-all (floor {t_a2a_floor:.0f} s)":
@@ -350,45 +370,59 @@ def plan_zeta_route_g(*, meta, mesh_xy, n_q_selected: int, ngkmax: int,
         min_call_bytes=float(_c128(nk, nb, ns, b)),
         min_efficient_bytes=comm_model.min_efficient_payload(P_ - 1),
         n_vertex=n_v, route='G', source='resident', band_chunk=int(nb), k_chunk=int(nk),
-        working_set=lambda b_src, n_pg_, c_out, n_blk: (
-            base_total + psi_bytes + sum(ws(b_src, n_pg_, c_out, n_blk).values())),
+        working_set=working_set, min_c=int(c_orb), c_out=int(c_out), n_blk=int(n_blk),
         b=int(b), n_batch=int(n_batch), r_sub=int(n_pg), row_chunk=0, n_planes=int(n_a),
         g_tile=int(g_tile), placement=placement,
-        hwm_bytes=float(sum(br.values())), budget_bytes=float(budget),
+        hwm_bytes=float(hwm), budget_bytes=float(budget),
         target_bytes=float(target), breakdown=br, transfer=transfer)
 
 
+def _plane_stage(working_set, target, *, c_plan: int, c_src: int, n_pg: int,
+                 n_planes: int, n_ranks: int) -> tuple[int, int, bool]:
+    """The owner's plane stage ``(c_out, n_blk, fits)`` for bins of ``c_src`` rows.
+
+    ``c_out`` is the widest balanced chunk of the ``c_src`` rows, at most
+    ``c_plan``, whose working set fits ``target`` with the whole plane axis
+    in one block; when even one row does not fit, the plane axis is cut into
+    the fewest blocks that do (each block redoes the unfold).  When one plane
+    group per block does not fit, that smallest split is returned with
+    ``fits = False``.
+    """
+    P_, c_src = int(n_ranks), int(c_src)
+    c_plan = max(1, int(c_plan))
+    fits = lambda c_out, n_blk: working_set(P_ * c_src, n_pg, c_out, n_blk) <= target
+    for n_ch in range(-(-c_src // c_plan), c_src + 1):
+        if fits(-(-c_src // n_ch), 1):
+            return -(-c_src // n_ch), 1, True
+    n_grp = -(-int(n_planes) // int(n_pg))
+    for n_blk in range(2, n_grp + 1):
+        if fits(1, n_blk):
+            return 1, n_blk, True
+    return 1, n_grp, False
+
+
 def route_g_plane_chunk(plan: MuBatchPlan, c_src: int, n_ranks: int) -> tuple[int, int]:
-    """The owner's plane stage ``(c_out, n_blk)`` for whole-orbit bins of ``c_src`` rows.
+    """The owner's plane stage ``(c_out, n_blk)`` for the packed whole-orbit bins of ``c_src`` rows.
 
     The fit packs whole centroid orbits per owner
-    (:func:`isdf.zeta_mubatch.best_owner_orbit_batches`), so the executed
-    ``c_src`` is at least the widest orbit and can exceed the planned
-    ``c = b/P``.  The owner streams its rows through the planes in balanced
-    chunks of ``c_out ≤ c``, so the D cylinder, plane group and k-convolution
-    stay at the planned width; the source rows (X_B, pair projectors, Z rows)
-    are re-priced at ``P·c_src``.  ``c_out`` is the widest balanced chunk that
-    fits the plan's target with the whole plane axis in one block; when even
-    one row does not fit, the plane axis is cut into the fewest blocks that
-    do (each block redoes the unfold).  When one plane group per block does
-    not fit, that smallest split runs and one warning line is printed.
+    (:func:`isdf.zeta_mubatch.best_owner_orbit_batches`) into bins of at most
+    the planned ``c = b/P``, which the planner floors at the widest orbit.
+    The owner streams its rows through the planes in balanced chunks of
+    ``c_out ≤ c`` (:func:`_plane_stage`), so the D cylinder, plane group and
+    k-convolution stay within the plan's target; the source rows (X_B, pair
+    projectors, Z rows) are priced at ``P·c_src``.  A split that does not fit
+    was already announced by the planner at its own (wider) batch; a packed
+    bin wider than the plan's, which the plan did not price, prints one
+    warning line here.
     """
     P_ = int(n_ranks)
     c_plan = max(1, int(plan.b) // P_)
-    c_src = int(c_src)
-    n_pg = int(plan.r_sub)
-    fits = lambda c_out, n_blk: plan.working_set(
-        P_ * c_src, n_pg, c_out, n_blk) <= plan.target_bytes
-    for n_ch in range(-(-c_src // c_plan), c_src + 1):
-        if fits(-(-c_src // n_ch), 1):
-            return -(-c_src // n_ch), 1
-    n_grp = -(-int(plan.n_planes) // n_pg)
-    for n_blk in range(2, n_grp + 1):
-        if fits(1, n_blk):
-            return 1, n_blk
-    # Whole-orbit bins of c_src centroids per owner (the widest orbit sets
-    # the floor; the source rows scale with the orbit width, not with P).
-    from common.gpu_utils import warn_over_budget
-    warn_over_budget(f"zeta mu-batch orbit bins ({c_src} centroids per owner)",
-                     plan.working_set(P_ * c_src, n_pg, 1, n_grp), plan.target_bytes)
-    return 1, n_grp
+    c_out, n_blk, fits = _plane_stage(
+        plan.working_set, plan.target_bytes, c_plan=c_plan, c_src=c_src,
+        n_pg=int(plan.r_sub), n_planes=int(plan.n_planes), n_ranks=P_)
+    if not fits and int(c_src) > c_plan:
+        from common.gpu_utils import warn_over_budget
+        warn_over_budget(f"zeta mu-batch orbit bins ({int(c_src)} centroids per owner)",
+                         plan.working_set(P_ * int(c_src), int(plan.r_sub), c_out, n_blk),
+                         plan.target_bytes)
+    return c_out, n_blk

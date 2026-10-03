@@ -252,10 +252,16 @@ The planner decides in this order:
    one plane per group and per block); otherwise that smallest configuration
    runs and one `memory over budget at zeta mu-batch` warning is printed
    ([decisions](decisions.md#warn-not-refuse)).
-2. **Batch width.** For each n_pg = 1, 2, 4, …, n_a, b is the largest
+2. **Batch width.** Every owner holds whole orbits, so the widest centroid
+   orbit c_orb of the run's layout (`meta.mu_basis`) is the smallest owner
+   bin and b ≥ P·c_orb. For each n_pg = 1, 2, 4, …, n_a, b is the largest
    multiple of P whose working set, with the whole plane axis in one block,
    fits M_f − Ψ, capped at ceil(μ/P)·P and balanced across batches; with no
-   such b, b = P and the blocks come from the packing check below.
+   such b, b = P·c_orb and its owner plane stage streams rows and plane
+   blocks (`_plane_stage`, the rule `route_g_plane_chunk` applies below).
+   The HWM is the working set of that configuration; over the target, the
+   planner prints one warning line before anything is compiled, and the plan
+   runs.
 3. **Plane-group width.** Each candidate's modelled time per batch is the two
    collectives (`gw.comm_model.comm_time`), plus 3 ms per plane group, plus
    0.65 s·(c+1)/2 of owner work, times the batch count. The cheapest wins,
@@ -268,15 +274,17 @@ The planner decides in this order:
    against the working set; the loop runs that executable
    ([memory model](memory-model.md#the-compiled-check)).
 
-The fit then packs whole orbits into bins with the least padded work,
-n_batch·(c+1) (`best_owner_orbit_batches`). A bin is at least the widest
-orbit, so the packed c can exceed the planned b/P (CrI3 D3d: 12 members
-against a planned 2 at P64). `route_g_plane_chunk` then re-prices the batch:
-the source rows (X_B, pair projectors, Z rows, and the owner's D̃ kept live
-across chunks) at b = P·c, the plane stage at the widest balanced
-c_out ≤ b/P that fits the target with one plane block, down to one row, then
-at one row with the fewest plane blocks that fit; if none fits, it warns and
-runs one row with one plane group per block.
+The fit then packs whole orbits into bins of at most the planned b/P with
+the least padded work, n_batch·(c+1) (`best_owner_orbit_batches`). The
+planner's floor keeps every bin within the plan (CrI3 24×24 P36: 12-member
+orbits make the batch 432, which the plan prices, not 36).
+`route_g_plane_chunk` prices the packed batch: the source rows (X_B, pair
+projectors, Z rows, and the owner's D̃ kept live across chunks) at b = P·c,
+the plane stage at the widest balanced c_out ≤ b/P that fits the target with
+one plane block, down to one row, then at one row with the fewest plane
+blocks that fit, else one row with one plane group per block. The compiled
+check reads that price at the planned chunk, with the widest orbit as its
+minimum chunk: a minimum chunk over the room warns and runs.
 CrI3 8×8 charge, P4: packed c = 12 streamed at c_out = 3 put the route-G
 module's temp at 8.9 GB, where the unchunked all-plane cylinder alone was
 24.8 GB.
@@ -292,8 +300,8 @@ per rank host Z store.
 
 | refusal | condition | way out |
 |---|---|---|
-| warning, not a refusal: `memory over budget at zeta mu-batch` | ψ(G) plus the smallest batch exceed the device target (ψ(G) streaming is not implemented); the smallest batch runs | more ranks or more memory per device |
-| warning, not a refusal: `memory over budget at zeta mu-batch orbit bins` | the whole-orbit bins' source rows plus one row and one plane group per block exceed the target; that split runs | more memory per device (the bin width is set by the widest orbit, not by P) |
+| warning, not a refusal: `memory over budget at zeta mu-batch (… centroids per owner, whole orbits of up to …)` | the planner's HWM: ψ(G) plus the smallest batch, P·c_orb with one row and one plane group per block, exceed the device target (ψ(G) streaming is not implemented); that split runs | more memory per device (the bin width is set by the widest orbit, not by P) |
+| warning, not a refusal: `memory over budget at zeta route-G mu batch (chunk …, compiled)` | the compiled batch at the widest-orbit chunk exceeds the room | as above |
 | `GATE zeta-mubatch-shell` | a head consumer reads a ζ column that the V_q pass did not keep | name the slot in `_head_shell`'s lists |
 | `_fit_mubatch` | the loader's full-BZ rows are not the C-order k grid | none |
 | `typed_child_G_tables` | a child k is not an image of its parent, or needs a G outside the parent's sphere | none |

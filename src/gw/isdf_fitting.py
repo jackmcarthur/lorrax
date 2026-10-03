@@ -357,18 +357,22 @@ def _fit_mubatch(
         builds[int(c_max)] = (mb, c_out, n_blk, kern_args, kernel)
         return compiled
 
-    # The plan's batch working set is fixed + c·slope per owner row c = b/P
-    # (gflat_memory_model.plan_zeta_route_g); its executable is checked before
-    # the first batch runs.  The lookahead batch keeps one more output live.
+    # The plan's batch working set at c rows per owner, with the owner plane
+    # stage those rows run (gflat_memory_model.route_g_plane_chunk), is the
+    # analytic price; its executable is checked before the first batch runs
+    # (runtime.aot_memory.check_chunk), the widest orbit the smallest chunk.
+    # The lookahead batch keeps one more output live.
     from runtime.aot_memory import check_chunk
     n_pg_plan = int(plan.r_sub)
-    at = lambda c: plan.working_set(P_ * c, n_pg_plan, c, 1)
-    slope = at(2) - at(1)
+    at = lambda c: plan.working_set(P_ * c, n_pg_plan, *route_g_plane_chunk(plan, c, P_))
+    ws0 = plan.working_set(0, n_pg_plan, 0, 1)
+    c_plan = max(int(plan.min_c), int(plan.b) // P_)
+    slope = (at(c_plan) - at(1)) / (c_plan - 1) if c_plan > 1 else at(2) - at(1)
     with timing.section("zeta_fit.mubatch.memcheck"):
         check = check_chunk(
-            max(1, int(plan.b) // P_), build=build, stage="zeta route-G mu batch",
-            fixed=at(1) - slope - plan.working_set(0, n_pg_plan, 0, 1), per_unit=slope,
-            room=plan.target_bytes - plan.working_set(0, n_pg_plan, 0, 1),
+            c_plan, build=build, stage="zeta route-G mu batch", minimum=int(plan.min_c),
+            fixed=at(c_plan) - c_plan * slope - ws0, per_unit=slope,
+            room=plan.target_bytes - ws0,
             extra=lambda c, compiled: int(compiled.memory_analysis().output_size_in_bytes))
     mb, c_out, n_blk, kern_args, kernel = builds[check.chunk]
     batch_executable = check.compiled
