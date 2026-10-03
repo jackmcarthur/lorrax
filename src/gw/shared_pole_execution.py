@@ -299,13 +299,12 @@ def face_eigh(mesh, n):
 @lru_cache(maxsize=None)
 def face_parent_program(mesh,ordered,odd_moments,keep_budget,retain_span,side,gram_keep=None):
     """Retained static-layout executable builder; all state values are operands."""
-    from gw.shared_pole_local import solve_parent_pencil, zero_row_safe_eigh
+    from gw.shared_pole_local import solve_parent_pencil
     from gw.shared_pole_gates import sort_shared_pole_columns
     from gw.shared_pole_recipe import shared_real_pole_gates_ordered_v1, shared_real_pole_gates_v1_r3b
     gates=shared_real_pole_gates_ordered_v1 if ordered else shared_real_pole_gates_v1_r3b
     mm=face_matmul(mesh)
-    eigh_plan=face_eigh(mesh,side)
-    eigh=zero_row_safe_eigh(eigh_plan.batched)
+    eigh=face_eigh(mesh,side).batched
     def body(points,order,active,qs,os,ds,infinity):
         def pack(parts):
             panels = jnp.concatenate((*parts, jnp.zeros_like(parts[0][..., :int(mesh.shape["y"])])), axis=-1)
@@ -465,11 +464,10 @@ def sector_batch_width(meta, resolution, recipe, routes, *, mesh, ledger, nq):
 @lru_cache(maxsize=None)
 def cross_parent_program(mesh, side):
     from gw.shared_pole_sectors import _cross_reduce_equations
-    from gw.shared_pole_local import zero_row_safe_eigh
     from gw.shared_pole_recipe import shared_real_pole_gates_ordered_v1 as gates
     # The joint CT metric carries exact-zero rows (inactive retained columns,
-    # held span widths); as in face_parent_program and the local CT program.
-    eigh = zero_row_safe_eigh(face_eigh(mesh, side).batched)
+    # held span widths); the service eigh deflates them and checks its result.
+    eigh = face_eigh(mesh, side).batched
     return face_program(partial(_cross_reduce_equations,mm=face_matmul(mesh),eigh=eigh,gates=gates,
                                 matrix_sharding=NamedSharding(mesh,P(None,"x","y"))),
                         mesh,outputs='cross')

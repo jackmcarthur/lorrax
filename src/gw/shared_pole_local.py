@@ -364,35 +364,6 @@ def solve_parent_pencil(points, q, o, d, infinity, active, *, eigh, matmul,
     return result
 
 
-def zero_row_safe_eigh(eigh):
-    """Wrap a Hermitian eigensolver so exact zero rows cannot break it.
-
-    Capacity padding and unselected columns reach the eigensolver as exact
-    zero rows/columns; a large zero block made the native eigensolver return
-    nonfinite values (Na P16, 1460 of 2584 rows). Those rows are decoupled, so
-    they are replaced by distinct diagonal sentinels below the Gershgorin
-    bound of the rest, solved, and reported back as exact zero eigenvalues with
-    their unit eigenvectors, in ascending order: the spectrum and vectors of
-    the zero-padded matrix, without a zero block inside the solver.
-    """
-    import jax.numpy as jnp
-
-    def solve(a):
-        n = a.shape[-1]
-        dead = jnp.all(a == 0, axis=-1)
-        # Every live eigenvalue lies in [-bound, bound] (Gershgorin); the
-        # sentinels sit at or below -(2 bound + 1), a relative gap of one bound.
-        bound = jnp.max(jnp.sum(jnp.abs(a), axis=-1), axis=-1)
-        sentinel = -(2 * bound + 1)[..., None] * (1 + jnp.arange(n, dtype=bound.dtype) / n)
-        diagonal = jnp.where(dead, sentinel, 0).astype(a.dtype)
-        values, vectors = eigh(a + diagonal[..., :, None] * jnp.eye(n, dtype=a.dtype))
-        values = jnp.where(values < -(1.5 * bound[..., None] + 0.5), 0, values)
-        order = jnp.argsort(values, axis=-1, stable=True)
-        return (jnp.take_along_axis(values, order, axis=-1),
-                jnp.take_along_axis(vectors, order[..., None, :], axis=-1))
-    return solve
-
-
 @lru_cache(maxsize=None)
 def round_program(mesh_xy, native_eigh, ordered, odd_moments, keep_budget, retain_span=False,
                   gram_keep=None, carrier=None):
@@ -400,7 +371,7 @@ def round_program(mesh_xy, native_eigh, ordered, odd_moments, keep_budget, retai
 
     One program over batch layout: rank r packs slot r's Q, WQ, dWQ panels by
     ``round_tables``, assembles the even or ordered pencil, reduces it with the
-    local eigensolver ``native_eigh`` (made zero-row safe), applies the zero
+    local eigensolver ``native_eigh`` (zero-row safe in the service), applies the zero
     policy, forms the retained (even) or original-infinity (ordered, odd
     moments) moment identity and sorts the poles. Every slot solves at the
     round's laddered extent (``round_tables``); its inert columns are exact
@@ -424,7 +395,8 @@ def round_program(mesh_xy, native_eigh, ordered, odd_moments, keep_budget, retai
 
     gates = shared_real_pole_gates_ordered_v1 if ordered else shared_real_pole_gates_v1_r3b
     batch, replicated = P(BATCH), NamedSharding(mesh_xy, P())
-    eigh = zero_row_safe_eigh(native_eigh)
+    # The service eigh deflates exact-zero rows (distrib_la._eigh_safe).
+    eigh = native_eigh
 
     def solve(points, q, o, d, infinity, active):
         return solve_parent_pencil(points, q, o, d, infinity, active,

@@ -77,13 +77,14 @@ REPLICATED.  Eigenvectors are COLUMNS.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from functools import lru_cache
+from functools import lru_cache, partial
 from typing import Any, Callable
 
 import jax
 import jax.numpy as jnp
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
+from distrib_la._result_check import deflate_zero_rows, native_eigh
 from distrib_la.resolve import (NATIVE, NATIVE2D, OPS, backend_module,
                                 mesh_key, resolve_backend)
 
@@ -247,6 +248,19 @@ def _eigh_columns(backend: str, lam, Q):
     return lam, Q
 
 
+#: Per-rank bytes a gathered local eigh retry may take when the plan has no
+#: budget: the matrix, its vectors and the solver's copy (n <= 4730 complex128).
+GATHERED_EIGH_BYTES = 1 << 30
+
+
+def _gathered_eigh(A, *, mesh):
+    """Eigh of the whole matrix on every rank: the last retry of a checked distributed eigh."""
+    whole = jax.lax.with_sharding_constraint(A, NamedSharding(mesh, P()))
+    values, vectors = native_eigh(whole)
+    face = NamedSharding(mesh, P(*([None] * (A.ndim - 2)), "x", "y"))
+    return values, jax.lax.with_sharding_constraint(vectors, face)
+
+
 #: (op, backend) → how to call it.
 #:
 #:   one         attribute implementing the SINGLE-tile form, or None
@@ -307,7 +321,7 @@ _IMPL: dict[tuple[str, str], dict[str, Any]] = {
 #: ``cholesky``/``solve_lu`` are not: their native routes are the
 #: replicated dense factor / per-q ridged solve chosen by a channel policy
 #: this module has no business duplicating.
-_NATIVE_CALLABLE = {"eigh": lambda A, *a, **k: jnp.linalg.eigh(A)}
+_NATIVE_CALLABLE = {"eigh": lambda A, *a, **k: native_eigh(A)}
 
 #: Which operands an op DONATES.  Declared per OP, not per backend: the
 #: caller has to know whether its buffers survive the call before it knows
@@ -533,10 +547,68 @@ class Plan:
 
     # ---- calling -------------------------------------------------------
     def _entry(self, key: str):
+        """The backend's ``one`` or ``many`` call and its result normaliser.
+
+        An FFI eigh or LU solve comes back checked (:mod:`distrib_la._result_check`,
+        ``post`` None), because the libraries fail silently: eigh with its zero
+        rows deflated, retried shifted, in another layout and gathered, and
+        refused by name if no attempt passes; an LU solve refused by name (its
+        operands are consumed).
+        """
         spec = _IMPL[(self.op, self.backend)]
         name = spec[key]
-        return (None if name is None
-                else getattr(self.module, name)), spec["post"]
+        call = None if name is None else getattr(self.module, name)
+        if call is None or self.op not in ("eigh", "solve_lu"):
+            return call, spec["post"]
+        if self.op == "solve_lu":
+            return self._checked_solve(call), None
+        return self._checked_eigh(call, spec["post"]), None
+
+    def _refuse_if_poisoned(self, out, A):
+        """An eager FFI eigh or LU solve whose checks all failed refuses here, by name."""
+        if self.op not in ("eigh", "solve_lu") or self.is_native or isinstance(A, jax.core.Tracer):
+            return out
+        from distrib_la._result_check import call_site, refuse_if_poisoned
+        return refuse_if_poisoned(out, self.op, int(A.shape[-1]), call_site())
+
+    def _checked_eigh(self, call, post):
+        from distrib_la._result_check import call_site, checked_eigh, shifted
+        backend, budget = self.backend, self.budget_bytes
+
+        def safe(A, *, mesh, **kwargs):
+            def solve(a, **extra):
+                return post(backend, *call(a, mesh=mesh, **kwargs, **extra))
+            # Zero rows leave the solver as distinct sentinels (deflate_zero_rows).
+            # A failed check solves again: shifted (a near-zero cluster moved off
+            # the origin), then in the other cuSOLVERMp layout with and without
+            # the sentinels (themselves a cluster), then gathered.
+            attempts = [deflate_zero_rows(solve), deflate_zero_rows(shifted(solve))]
+            n = int(A.shape[-1])
+            if backend == "cusolvermp":
+                from distrib_la._cusolvermp import retry_block
+                block = retry_block(n, int(mesh.shape["x"]))
+                if block is not None:
+                    attempts.append(deflate_zero_rows(partial(solve, block=block)))
+                    attempts.append(partial(solve, block=block))
+            # A gathered local solve, where the whole matrix, its vectors and
+            # the solver's copy fit every rank: within the caller's budget, or
+            # GATHERED_EIGH_BYTES without one (a shape rule, the same on every rank).
+            limit = GATHERED_EIGH_BYTES if budget is None else budget
+            if 3 * A.dtype.itemsize * A.size <= limit:
+                attempts.append(partial(_gathered_eigh, mesh=mesh))
+            return checked_eigh(attempts, A, site=call_site())
+        return safe
+
+    def _checked_solve(self, call):
+        from distrib_la._result_check import call_site, checked, matrix_sketch, rhs_sketch, solve_errors
+
+        def safe(A, B, *, mesh, **kwargs):
+            # The sketch is taken before the call, which may consume A and B.
+            sketch = (*matrix_sketch(A), *rhs_sketch(B))
+            X = call(A, B, mesh=mesh, **kwargs)
+            return checked("solve_lu", (lambda x: x,), lambda x: solve_errors(sketch, x),
+                           (X,), site=call_site(), n=A.shape[-1])
+        return safe
 
     def __call__(self, A, *args, **kwargs):
         """Run the op on ONE tile (no batch axis).
@@ -567,7 +639,7 @@ class Plan:
                 f"a stack of one is a legal stack.")
         ops = [ensure_sharding(x, self.in_sharding) for x in (A, *args)]
         out = one(*ops, mesh=self.mesh, **kwargs)
-        return post(self.backend, *out) if post is not None else out
+        return self._refuse_if_poisoned(post(self.backend, *out) if post is not None else out, A)
 
     def batched(self, A, *args, _route: str | None = None, **kwargs):
         """Run the op on a STACK ``(nb, n, n)`` — uniform across backends.
@@ -625,9 +697,9 @@ class Plan:
                     f"not exist for it.  Its batched route is "
                     f"{self.batched_route!r}.")
             out = many(*ops, mesh=self.mesh, **kwargs)
-            return post(self.backend, *out) if post is not None else out
+            return self._refuse_if_poisoned(post(self.backend, *out) if post is not None else out, A)
         if route == ROUTE_SCAN:
-            return self._scan_over_single(ops, kwargs)
+            return self._refuse_if_poisoned(self._scan_over_single(ops, kwargs), A)
         raise AssertionError(f"unhandled batched route {route!r}")
 
     def _batch_reshard(self, ops: tuple, kwargs: dict):

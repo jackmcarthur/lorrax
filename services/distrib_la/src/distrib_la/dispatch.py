@@ -10,6 +10,7 @@ from __future__ import annotations
 import jax.numpy as jnp
 from jax.sharding import Mesh
 
+from distrib_la._result_check import native_eigh
 from distrib_la.plan import (BATCHED_ROUTE_DEFAULT, ROUTE_BATCH_RESHARD, ROUTE_SCAN,
                              ensure_sharding, plan as _plan)
 from distrib_la.resolve import EIGH_BACKENDS, NATIVE
@@ -148,7 +149,7 @@ def dispatch_batched_eigh(A, mesh_xy: Mesh, backend: str = "distributed",
     # it needs the face sharding even though the backend resolves native.
     if (str(batched_route).strip().lower() == "auto"
             and backend in ("auto", "off", NATIVE)):
-        return jnp.linalg.eigh(A)
+        return native_eigh(A)
     if A.ndim != 3 or A.shape[1] != A.shape[2]:
         raise ValueError(
             f"dispatch_batched_eigh: expected (Nq, N, N); got {A.shape}")
@@ -156,7 +157,7 @@ def dispatch_batched_eigh(A, mesh_xy: Mesh, backend: str = "distributed",
               batched_route=batched_route)
     if p.is_native and p.batched_route != ROUTE_BATCH_RESHARD:
                                            # (unreachable: resolve has NO
-        return jnp.linalg.eigh(A)          # silent FFI→native fallback for
+        return native_eigh(A)          # silent FFI→native fallback for
                                            # any op — explicit requests
                                            # refuse, and auto/off returned
                                            # above)

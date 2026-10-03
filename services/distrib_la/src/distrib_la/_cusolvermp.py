@@ -254,6 +254,20 @@ def _block_size(n: int, p: int) -> int:
                if local % d == 0)
 
 
+def retry_block(n: int, p: int) -> int | None:
+    """The other layout of an ``n x n`` eigh on a ``p x p`` grid, or None.
+
+    One tile per rank (no block-cyclic relabeling) when the default block is
+    smaller; otherwise the largest divisor of ``n/p`` at most half of it. The
+    checked eigh solves there again when the default layout's result fails
+    its check.
+    """
+    local = n // p
+    if _block_size(n, p) != local:
+        return local
+    return next((d for d in range(local // 2, 1, -1) if local % d == 0), None)
+
+
 def _cyclic_rows_to_block(Q, *, n: int, p: int, mb: int):
     """Inside a shard_map: put rows held block-cyclically over 'x' in order.
 
@@ -300,6 +314,7 @@ def distributed_eigh(
     *,
     mesh: Mesh,
     compute_evecs: bool = True,
+    block: int | None = None,
 ) -> Tuple[jax.Array, jax.Array]:
     """Distributed Hermitian eigendecomposition via cuSOLVERMp.
 
@@ -315,6 +330,10 @@ def distributed_eigh(
     compute_evecs
         Must be True.  ``False`` (jobz='N') is REFUSED — see the guard
         below and ``resolve.resolve_backend`` guard 2c (bug L-3).
+    block
+        The square block edge, a divisor of ``n/p``; default
+        :func:`_block_size`.  ``n/p`` is one tile per rank, the layout the
+        checked eigh retries in (:func:`retry_block`).
 
     The solve runs block-cyclic at :func:`_block_size` on the operand's own
     tiles (the relabeling note above :data:`_BLOCK_MAX`).
@@ -365,7 +384,9 @@ def distributed_eigh(
     loader.get_lib("CUDA")                  # load the .so, register targets
     ctx_key = context_key(mesh)  # NCCL + cal_comm + cusolverMp
 
-    mb = nb = _block_size(n, p)
+    mb = nb = _block_size(n, p) if block is None else int(block)
+    if (n // p) % mb:
+        raise ValueError(f"distributed_eigh: block {mb} does not divide n/p = {n // p}")
 
     # jit(shard_map(...)) with a per-signature cache — the shape EVERY other
     # FFI wrapper in this package has.  This one was the exception: it

@@ -107,6 +107,40 @@ face layout. `ensure_sharding` is the only reshard on entry: a tracer gets a
 sharding constraint, an array already in layout passes untouched, anything
 else is placed process-locally.
 
+**No distributed result is returned unchecked** (`_result_check`). The
+distributed libraries fail silently. cuSOLVERMp 0.9.1's syevd returned wrong
+eigenvectors with status 0 and info 0 (2×2 grid, reproduced outside LORRAX) on
+a Hermitian matrix with 680 exact-zero rows (n 2688, block 224) and on
+rank-deficient PSD responses with no zero row (n 432, most block sizes). So:
+
+- Every eigh route replaces exact-zero rows by distinct diagonal sentinels
+  below the Gershgorin bound and returns them as exact zero eigenpairs, in
+  ascending order (`deflate_zero_rows`; a matrix with no zero row passes
+  through unchanged).
+- Every distributed eigh (cuSOLVERMp, SLATE, ScaLAPACK; single, scanned or
+  stacked) is checked against 8 fixed-seed probe columns X, the same on every
+  rank: ‖(AZ − Z diag(w))X‖/(‖A‖‖X‖) and ‖(ZᴴZ − I)X‖/‖X‖ within `ACCEPT` =
+  1e-8, at O(n²k) beside the O(n³) solve. A failed check is noted on rank 0's
+  stderr and solved again: shifted (A + ‖A‖_F I, which moves a large
+  near-zero cluster off the origin), then in cuSOLVERMp's other layout with
+  and without the sentinels, then gathered on every rank when the matrix,
+  its vectors and the solver's copy fit the plan's `budget_bytes` (1 GiB
+  without one).
+- Every distributed LU solve (`plan('solve_lu').batched`, `factor`/`solve`)
+  is checked on its actual solution through sketches taken before the library
+  consumes A and B: ‖Wᴴ(AX − B)‖/(√k (‖A‖‖X‖ + ‖B‖)) within `ACCEPT`. Its
+  operands are gone, so there is no retry.
+- A result that still fails raises `GATE distrib_la_result_check` (op, n, the
+  call site, the errors) on every rank through a host callback and is
+  NaN-poisoned. The verdict is one replicated scalar, so every rank takes the
+  same branch.
+
+The bounds are backward errors, which a stable solver keeps near n·eps
+whatever the condition number. `services/distrib_la/bench/eigh_zero_block_check.py`
+and `eigh_conformance_check.py` (n/p ∈ {257, 389, 1144, 4576}, P4 and P16) are
+the regression checks. The cuSOLVERMp handlers do not yet read `info`; that
+is a native fix for the next bundle.
+
 **Donation is declared per operation** (`DONATES`), because a caller must know
 whether its buffers survive before it knows which library runs: `eigh` donates
 nothing, `cholesky` operand 0, `solve_lu` operands 0 and 1. A donated operand

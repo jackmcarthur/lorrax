@@ -1083,10 +1083,10 @@ def _local_cross_parent_program(mesh,native_eigh):
     import jax
     from common.shard_map import shard_map
     from jax.sharding import PartitionSpec as P
-    from gw.shared_pole_local import _mm, zero_row_safe_eigh
+    from gw.shared_pole_local import _mm
     from gw.shared_pole_recipe import shared_real_pole_gates_ordered_v1 as gates
     spec=P(('x','y'))
-    body=partial(_cross_reduce_equations,mm=_mm,eigh=zero_row_safe_eigh(native_eigh),gates=gates)
+    body=partial(_cross_reduce_equations,mm=_mm,eigh=native_eigh,gates=gates)
     return jax.jit(shard_map(body,mesh=mesh,in_specs=(spec,)*4,
                             out_specs=(spec,spec),check_vma=False))
 
