@@ -836,8 +836,10 @@ def _cache_key(loader, nocc: int, tol_trs: float, max_k: int) -> tuple:
         stamp = (int(st.st_mtime_ns), int(st.st_size))
     except OSError:
         stamp = (0, 0)
+    # The collective world is in the key: a rank-0-only open (world 1) must
+    # not answer a later all-rank open whose peers enter the all-gather.
     return (path, *stamp, _ALGORITHM_VERSION, int(nocc), float(tol_trs),
-            int(max_k))
+            int(max_k), _evidence_partition(loader)[1])
 
 
 def _enforce_policy(
