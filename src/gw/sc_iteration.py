@@ -292,8 +292,9 @@ def protected_band_convergence(
 ) -> ConvergenceVerdict:
     """Has every NON-SCISSORED band moved by less than ``cutoff_ev``?
 
-    ``e_*_ev`` are ``(nk, nb_active)`` eV, already aligned to map-0
-    QP identities and averaged within exact multiplets by the SC caller.
+    ``e_*_ev`` are ``(nk, nb_active)`` eV indexed by map-0 QP identity: the
+    SC caller puts each identity's input and output at the same sorted
+    columns and averages them within exact multiplets.
     The test set is the current per-k ``protected_mask | in_range_mask``: full
     protected diagonals plus the unprotected in-range diagonals. This is
     exactly the diagonal-retention mask in ``apply_band_partition``.
@@ -2102,8 +2103,8 @@ def _rotate_to_dft_basis(O_qp: jax.Array, U: jax.Array, *,
     the (nk, nb, nb) intermediate is sharded too.
 
     ONLY THE RESULT IS PINNED REPLICATED, and it has to be: the SC carry
-    is ``kin_ion + this``, and ``_run_anderson`` and ``_run_linear_mixing``
-    read the carry back on the host,
+    is ``kin_ion + this``, and ``_run_anderson`` reads the carry back on
+    the host,
     which raises the non-addressable-devices error on a sharded array at
     P>1.  ``O_qp`` arrives replicated from ``compute_sigma_xc`` for the
     same reason.  So this seam still holds two replicated (nk, nb, nb)
@@ -5078,20 +5079,24 @@ def _protected_residual_norms(H_out, H_in, mask_kn, eigvalsh_kshard):
 
 def _sc_identity_for_call(inputs, state_out, e_input_ev, e_output_ev,
                           history, *, cutoff_ev, u_out):
-    """Read a map in frozen QP identities; retain only small host diagnostics.
+    """Read a map's residual per QP state; retain only small host diagnostics.
 
     The reference is the first map OUTPUT. Its labels are the trusted DFT
     bands: at map 0 each trusted DFT band is assigned (by multiplet
     overlap from the DFT basis, including for a reordered warm seed) to the
-    output column that carries it, and later maps are matched to THOSE columns. Sorted
-    position is not identity: on Na (+15 eV top) the scissored Gamma
-    triplet 11-13 lands below the protected doublet at sorted 9-11, so a
-    sorted-band mask cut an exact multiplet and the readout refused
-    (arms N1/N2, 2026-09-05). Every returned table is indexed by DFT
-    band. ``u_out`` is the output's eigenvectors from
-    :func:`_map_output_eigensystem`; the map's retained ``sigma_basis_U``
-    supplies its input eigenvectors. Neither eigenvectors nor assignments
-    replace the Hamiltonian carry.
+    output column that carries it. Each map's INPUT is matched to those
+    labels, and each input column is paired with the output column of the
+    same sorted index, so a label only names a pair. Pairing input and output
+    through the labels separately compared two different states when a
+    hybridized state changed label (CrI3 24x24: 1.3 eV against a 6 meV
+    sorted value); the sorted pair moves by at most max_k ||f_k||_2 (Weyl).
+    Labels still select the trusted set: on Na (+15 eV top) the scissored
+    Gamma triplet 11-13 lands below the protected doublet at sorted 9-11,
+    so a sorted-band mask cut an exact multiplet (arms N1/N2, 2026-09-05).
+    Every returned table is indexed by DFT band. ``u_out`` is the output's
+    eigenvectors from :func:`_map_output_eigensystem`; the map's retained
+    ``sigma_basis_U`` supplies its input eigenvectors. Neither eigenvectors
+    nor assignments replace the Hamiltonian carry.
     """
     from common.collectives import gather_to_host
     from .sc_state_identity import assign_qp_identity
@@ -5151,29 +5156,26 @@ def _sc_identity_for_call(inputs, state_out, e_input_ev, e_output_ev,
         # label-indexed (map-0 output column) -> DFT-band-indexed
         return np.where(found, np.asarray(table)[rows, cols], fill)
 
-    args = (history['u'], history['e'], )
-    out_index, out_e, block_label, weight = assign_qp_identity(
-        *args, u_out, e_output_ev, np.ones(mask.shape, dtype=bool),
-        priority_mask=history['labels'], **kw)
-    in_index, in_e, _, _ = assign_qp_identity(
-        *args, u_in, e_input_ev, np.ones(mask.shape, dtype=bool),
-        priority_mask=history['labels'], **kw)
-    out_index, in_index = by_dft_band(out_index, -1), by_dft_band(in_index, -1)
+    in_index, in_e, block_label, weight = assign_qp_identity(
+        history['u'], history['e'], u_in, e_input_ev,
+        np.ones(mask.shape, dtype=bool), priority_mask=history['labels'], **kw)
+    # The output at the input's columns, averaged over the same label blocks.
+    group = block_label + nb * np.arange(block_label.shape[0])[:, None]
+    out_e = np.bincount(group.ravel(), np.take_along_axis(
+        e_output_ev, in_index, axis=1).ravel(), group.size)
+    out_e = (out_e / np.maximum(np.bincount(group.ravel(), minlength=group.size), 1))[group]
+    out_index = in_index = by_dft_band(in_index, -1)
     out_e, in_e = by_dft_band(out_e, np.nan), by_dft_band(in_e, np.nan)
     weight = by_dft_band(weight, np.nan)
     # block labels in DFT-band terms, from the same reference grouping that
     # produced the block means (so the eqp comments and the body agree)
     first_label = by_dft_band(block_label, 0)
     blocks = np.where(found, dft_of_label[rows, first_label], -1)
-    # Preserve the legacy all-band RMS as a sorted diagnostic. Only trusted
-    # columns enter the criterion and receive the overlap/block-mean readout.
+    # Only trusted columns enter the criterion and receive the block means.
     aligned_in, aligned_out = np.array(e_input_ev), np.array(e_output_ev)
     aligned_in[mask], aligned_out[mask] = in_e[mask], out_e[mask]
     verdict = protected_band_convergence(
         aligned_out, aligned_in, protected, in_range, cutoff_ev)
-    sorted_verdict = protected_band_convergence(
-        e_output_ev, e_input_ev, protected, in_range, cutoff_ev)
-    verdict = replace(verdict, rms_all_ev=sorted_verdict.rms_all_ev)
     previous = history['previous']
     motion = (np.full(out_e.shape, np.nan) if previous is None else out_e - previous)
     history['previous'] = out_e.copy()
@@ -5186,14 +5188,12 @@ def _sc_identity_for_call(inputs, state_out, e_input_ev, e_output_ev,
                 output_ev=np.where(mask, out_e, np.nan),
                 residual_ev=np.where(mask, out_e-in_e, np.nan),
                 motion_ev=np.where(mask, motion, np.nan),
-                weight=np.where(mask, weight, np.nan),
-                sorted_max_ev=sorted_verdict.max_abs_ev)
+                weight=np.where(mask, weight, np.nan))
     state_out = replace(state_out, outputs=replace(state_out.outputs, identity=info))
     _record_sc(inputs,
-        f'SC identity: max |dE| by overlap = {verdict.max_abs_ev:.9e} eV '
-        f'(sorted-index value {sorted_verdict.max_abs_ev:.9e} eV; '
-        f'{int(reassigned[worst_k])} reassignments at k={worst_k}; '
-        f'total={int(reassigned.sum())})')
+        f'SC identity: max |dE| = {verdict.max_abs_ev:.9e} eV, input and '
+        f'output paired by sorted index ({int(reassigned[worst_k])} '
+        f'reassignments at k={worst_k}; total={int(reassigned.sum())})')
     return verdict, state_out
 
 
@@ -5219,17 +5219,8 @@ def _sc_map_gain_for_call(
             "SC map gain: retained E and Sigma tables must already share "
             f"the loop k-set and band window, got E={e_now.shape}, "
             f"Sigma={sigma_now.shape}")
-    identity = getattr(state_out.outputs, 'identity', None)
-    if identity is not None:
-        e_now = e_now.copy()
-        sigma_aligned = sigma_now.copy()
-        for k, block_row in enumerate(identity['blocks']):
-            for block in np.unique(block_row[block_row >= 0]):
-                labels = np.flatnonzero(block_row == block)
-                columns = identity['input_indices'][k, labels]
-                e_now[k, labels] = identity['input_ev'][k, labels]
-                sigma_aligned[k, labels] = sigma_now[k, columns].mean()
-        sigma_now = sigma_aligned
+    # Adjacent inputs pair by sorted index, as the criterion pairs a map's
+    # input and output: a label pairing swaps hybridized states.
     current = (e_now.copy(), sigma_now.copy())
     if previous is None:
         return None, current
@@ -5782,9 +5773,7 @@ def run_self_consistency(
     *,
     max_iter: int = 1,
     tol_ev: float = 1.0e-4,
-    accelerator: str = "anderson",
     history_depth: int = 20,
-    mixing: float = 1.0,
 ) -> tuple[SCState, list[float]]:
     """Iterate ``gw_iteration_map`` until ``max_iter`` or RMS ΔE < ``tol_ev``.
 
@@ -5793,31 +5782,17 @@ def run_self_consistency(
     iteration via the same k-sharded eigvalsh kernel as the main map)
     so the carry never gets out of sync with a separately-tracked E.
 
+    The accelerator is one-evaluation Anderson type II
+    (:func:`mixing.acceleration.anderson_nojit`), the only one: a plain
+    fixed point 2-cycles on dense band manifolds, whose Jacobian has
+    cycle-direction eigenvalues of about -3 or below.
+
     Parameters
     ----------
-    accelerator
-        ``"anderson"`` (default, and the only value a DECK can select —
-        ``gw_config.SCConfig`` refuses every other spelling through GATE
-        ``sc_accelerator_anderson_only``) — one-evaluation Anderson type II
-        (:func:`mixing.acceleration.anderson_nojit`, which replaced the
-        two-evaluation rCROP on 2026-09-24).  Order ``history_depth``.
-        Required for QSGW on dense band manifolds:
-        the Jacobian's cycle-direction eigenvalue is typically ≲ −3 for
-        systems with many bands near the gap (PPM ω-grid stiffness),
-        which means a plain fixed-point hits a 2-cycle and even α=0.5
-        linear damping only shrinks the cycle amplitude rather than
-        killing it.  ``"linear"`` — plain α-mixing with damping
-        ``mixing``.  IN-PROCESS DIAGNOSTIC ONLY: it is kept for direct
-        callers that want the unaccelerated control trajectory, and
-        undamped it amplifies the input's time-reversal-reality error
-        6-8x per map (claim 2391), which is why no deck may ask for it.
     history_depth
-        Anderson history depth (only used when ``accelerator="anderson"``).
-        20 by default: with fewer entries than the map has stiff
-        directions Anderson stalls, and the conditioning filter makes
-        depth cost memory only.
-    mixing
-        Linear damping coefficient when ``accelerator="linear"``.
+        Anderson history depth. 20 by default: with fewer entries than the
+        map has stiff directions Anderson stalls, and the conditioning
+        filter makes depth cost memory only.
 
     Returns
     -------
@@ -5830,7 +5805,7 @@ def run_self_consistency(
     print_fn = inputs.print_fn
     # A continuation keeps the earlier processes' map files.
     resume = (_read_sc_checkpoint(state_init, inputs, history_depth, max_iter)
-              if max_iter > 1 and accelerator == "anderson" else None)
+              if max_iter > 1 else None)
     _, eigvalsh_kshard = _kshard_eigh_kernels(inputs.mesh_xy)
     # E-history dump dir from config.sc (LORRAX_SC_DUMP_DIR env is a
     # deprecated override, applied at config construction).
@@ -5869,175 +5844,15 @@ def run_self_consistency(
         _record_sc_verdict(inputs, verdict)
         return state_new, []
 
-    if accelerator == "anderson":
-        return _run_anderson(
-            state_init, inputs,
-            max_iter=max_iter, tol_ev=tol_ev,
-            history_depth=history_depth,
-            eigvalsh_kshard=eigvalsh_kshard,
-            print_fn=print_fn,
-            dump_dir=_dump_dir,
-            resume=resume,
-        )
-    if accelerator == "linear":
-        return _run_linear_mixing(
-            state_init, inputs,
-            max_iter=max_iter, tol_ev=tol_ev, mixing=mixing,
-            eigvalsh_kshard=eigvalsh_kshard,
-            print_fn=print_fn,
-            dump_dir=_dump_dir,
-        )
-    raise ValueError(
-        f"run_self_consistency: unknown accelerator={accelerator!r} "
-        f"(expected 'anderson' or 'linear').")
-
-
-def _run_linear_mixing(
-    state_init: SCState, inputs: SCInputs, *,
-    max_iter: int, tol_ev: float, mixing: float,
-    eigvalsh_kshard, print_fn, dump_dir,
-) -> tuple[SCState, list[float]]:
-    """Plain α-mixing fixed point.  Diagnostic / accelerator-control path.
-
-    Converges on the SAME criterion as the rCROP path, and for the same
-    reason it is output-vs-input: testing the MIXED iterate against its
-    predecessor is exactly the mixing != 1 trap -- at small alpha the
-    mixed iterate barely moves whatever F does, so the loop would
-    "converge" by damping rather than by solving.
-    """
-    state = state_init
-    rms_history: list[float] = []
-    E_prev_ev = np.asarray(eigvalsh_kshard(state.H_qp_dft)) * RYD_TO_EV
-    _e_history: list[np.ndarray] = [E_prev_ev.copy()]
-    #: Map OUTPUTS (pre-mix candidates), which is what the eqp snapshots
-    #: hold.  Separate from ``_e_history`` (accepted MIXED iterates) because
-    #: under ``mixing != 1`` those are two different sequences and the file
-    #: was stamped from the wrong one.
-    _out_history: list[np.ndarray] = [E_prev_ev.copy()]
-    gain_previous: tuple[np.ndarray, np.ndarray] | None = None
-    identity_history = {}
-    if mixing != 1.0:
-        print_fn(f"  SC mixing α = {mixing:.3f} (linear)")
-
-    last_evaluated: SCState | None = None
-    for it in range(max_iter):
-        # DROP ITERATION i-1's SigmaResult BEFORE BUILDING ITERATION i's.
-        # See the note in ``_run_anderson.residual_fn``; the shape is the
-        # same here — ``state`` is both the loop carry and the argument
-        # to the map, so without this rebind both generations of the
-        # ω-cube are live for the whole of ``gw_iteration_map``.  The
-        # last completed map's payload is retained separately below.
-        state = SCState(
-            H_qp_dft=state.H_qp_dft,
-            iteration=state.iteration,
-            partition=state.partition,
-            occupation_state=state.occupation_state,
-            head_surface_weight_kn=state.head_surface_weight_kn,
-            tail_z_kn=state.tail_z_kn,
-        )
-        map_input = state
-        state_map = gw_iteration_map(map_input, inputs)
-        E_candidate_ev = (
-            np.asarray(eigvalsh_kshard(state_map.H_qp_dft)) * RYD_TO_EV)
-        out_eig = _map_output_eigensystem(inputs, state_map)
-        # Outputs, W and head all describe the MAP INPUT.  Record that exact
-        # evaluated point before constructing an unevaluated mixed candidate.
-        # This is the state returned on convergence or budget exhaustion.
-        last_evaluated = SCState(
-            H_qp_dft=map_input.H_qp_dft,
-            iteration=state_map.iteration,
-            partition=_state_partition(state_map, inputs),
-            occupation_state=state_map.occupation_state,
-            head_surface_weight_kn=state_map.head_surface_weight_kn,
-            outputs=state_map.outputs,
-            tail_z_kn=state_map.tail_z_kn,
-        )
-        if mixing != 1.0:
-            H_next = (
-                mixing * state_map.H_qp_dft
-                + (1.0 - mixing) * map_input.H_qp_dft
-            )
-        else:
-            H_next = state_map.H_qp_dft
-        state_next = SCState(
-            H_qp_dft=H_next,
-            iteration=state_map.iteration,
-            partition=_state_partition(state_map, inputs),
-            occupation_state=state_map.occupation_state,
-            head_surface_weight_kn=state_map.head_surface_weight_kn,
-            tail_z_kn=state_map.tail_z_kn,
-        )
-        E_new_ev = np.asarray(eigvalsh_kshard(state_next.H_qp_dft)) * RYD_TO_EV
-        rms = float(np.sqrt(np.mean((E_new_ev - E_prev_ev) ** 2)))
-        rms_history.append(rms)
-        _e_history.append(E_new_ev.copy())
-        rms2 = (
-            float(np.sqrt(np.mean((E_new_ev - _e_history[-3]) ** 2)))
-            if len(_e_history) >= 3 else float("nan"))
-        print_fn(
-            f"  SC iter {state_map.iteration}: "
-            f"RMS ΔE_{{k,k-1}} = {rms:.6f} eV, "
-            f"ΔE_{{k,k-2}} = {rms2:.6f} eV"
-        )
-        # SAME CRITERION AS rCROP.  ``E_candidate_ev`` is the UNMIXED map
-        # output F(H); ``E_prev_ev`` is that call's input.  This used to
-        # break on ``rms < tol_ev`` -- an RMS over ALL active bands
-        # including the scissored ones, both the looser test and a
-        # different set.
-        verdict, state_map = _sc_identity_for_call(
-            inputs, state_map, E_prev_ev, E_candidate_ev, identity_history,
-            cutoff_ev=tol_ev, u_out=out_eig[1])
-        # THE SNAPSHOT'S STAMPS COME FROM THE MAP-OUTPUT HISTORY, NOT THE
-        # MIXED ONE.  The column written is ``E_candidate_ev`` (pre-mix), so
-        # a stamp computed from ``E_new_ev`` (post-mix) described a
-        # different array than the file holds — wrong exactly when mixing is
-        # on, which is exactly when someone is watching it.  ``_out_history``
-        # holds map OUTPUTS, so ``map_output_RMS_dE_prev_output`` now means
-        # what its name says on both accelerators.
-        cand_rms = float(np.sqrt(np.mean(
-            (E_candidate_ev - _out_history[-1]) ** 2)))
-        _out_history.append(E_candidate_ev.copy())
-        cand_rms2 = (
-            float(np.sqrt(np.mean((E_candidate_ev - _out_history[-3]) ** 2)))
-            if len(_out_history) >= 3 else float("nan"))
-        map_gain, gain_previous = _sc_map_gain_for_call(
-            inputs, state_map, E_prev_ev, gain_previous)
-        _write_sc_eqp_snapshot(
-            inputs, state_map, E_candidate_ev,
-            call_index=it, role="linear",
-            rms_ev=cand_rms, rms2_ev=cand_rms2,
-            prev_output_role=(
-                getattr(inputs, "initial_state_role", "dft_seed")
-                if it == 0 else "linear"),
-            verdict=verdict,
-            map_gain=map_gain,
-            output_eigensystem=out_eig,
-        )
-        out_eig = None
-        _record_sc_verdict(inputs, verdict)
-        last_evaluated = replace(
-            last_evaluated, convergence_verdict=verdict,
-            map_output_ev=E_candidate_ev)
-        if verdict.converged:
-            state = last_evaluated
-            break
-        state = state_next
-        E_prev_ev = E_new_ev
-        if it + 1 < max_iter:
-            # ``state`` carries no outputs, but Python loop locals otherwise
-            # retain the completed map and ``last_evaluated`` while the NEXT
-            # Sigma/W is built.  Drop both large-payload owners now; the final
-            # iteration keeps them for the return below.
-            last_evaluated = None
-            state_map = None
-
-    _maybe_dump_e_history(dump_dir, _e_history, print_fn)
-    if last_evaluated is None:
-        raise RuntimeError("linear self-consistency completed no map calls")
-    # At budget exhaustion ``state`` is the next mixed candidate and has not
-    # been evaluated.  Final artifacts must instead use the last map input and
-    # that input's exact Sigma/W/head payload.
-    return last_evaluated, rms_history
+    return _run_anderson(
+        state_init, inputs,
+        max_iter=max_iter, tol_ev=tol_ev,
+        history_depth=history_depth,
+        eigvalsh_kshard=eigvalsh_kshard,
+        print_fn=print_fn,
+        dump_dir=_dump_dir,
+        resume=resume,
+    )
 
 
 def _run_anderson(
@@ -6363,7 +6178,10 @@ def _run_anderson(
             state_out.H_qp_dft, H, metric_mask, eigvalsh_kshard)
         _record_sc(inputs, f"    SC matrix residual: call={call_index} "
                            f"max_k ||f_k||_2 = {_spec:.6e} meV; ||f||_F = "
-                           f"{_frob:.6e} meV (protected block)")
+                           f"{_frob:.6e} meV (protected block)"
+                           + ("; FLAG: max|dE| exceeds max_k ||f_k||_2, which bounds "
+                              "every sorted pair of the full block (Weyl)"
+                              if _verdict.max_abs_ev * 1e3 > 1.000001 * _spec else ""))
         _iter_idx[0] += 1
         if call_index > 0:
             _floor_history.append(float(_spec))
@@ -7297,15 +7115,12 @@ def run_sc_driver(
         inputs,
         f"  SC: mode={config.compute_mode.value}, max_iter={sc.max_iter}, "
         f"tol={sc.tol_ev:.1e} eV, accel={sc.accelerator}, "
-        f"exact_degeneracy_tol={sc.exact_degeneracy_tol_ev:.1e} eV"
-        + (f", depth={sc.history_depth}" if sc.accelerator == "anderson"
-           else f", α={sc.mixing:.2f}"))
+        f"exact_degeneracy_tol={sc.exact_degeneracy_tol_ev:.1e} eV, "
+        f"depth={sc.history_depth}")
     state_final, rms_history = run_self_consistency(
         state_init, inputs,
         max_iter=sc.max_iter, tol_ev=sc.tol_ev,
-        accelerator=sc.accelerator,
         history_depth=sc.history_depth,
-        mixing=sc.mixing,
     )
     verdict = state_final.convergence_verdict
     if verdict is None:

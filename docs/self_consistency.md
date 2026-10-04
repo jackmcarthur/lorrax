@@ -466,6 +466,15 @@ x_{n+1} = \sum_i \alpha_i\,(x_i + f_i), \qquad
 \alpha = \arg\min_{\sum_i \alpha_i = 1} \Big\| \sum_i \alpha_i f_i \Big\|_P .
 $$
 
+The first step is half a plain step, $x_1 = x_0 + f_0/2$; every later step
+is undamped. On an affine map the later iterates do not depend on the first
+step's size (any nonzero size spans the same affine set), but along a mode
+with plain-step eigenvalue $\lambda$ the map-1 residual is $|1 + \lambda|/2$
+of map 0's instead of $|\lambda|$. On the CrI3 24×24 bispinor mode,
+$\lambda \approx -2.5$, that is 0.75 instead of 2.5. The step index is the
+global map index, so a run resumed from a map-0 checkpoint (§8) takes the same
+half step.
+
 α is real, because Hermitian matrices form a real vector space. The metric
 $P$ weights each k row by the square root of its star size, so the squared
 norm is the sum over the full uniform k grid whatever wedge the loop runs on.
@@ -511,8 +520,16 @@ DFT}_m | \psi^{\rm QP}_n \rangle|^2$ (a linear assignment). Levels within
 `sc_exact_degeneracy_tol_ev` form multiplets; a multiplet is one capacity
 block scored by its summed overlap, so its internal gauge does not enter, and
 its members report the block-mean energy. A label set that cuts a DFT
-multiplet refuses. The convergence readout matches each map against the
-labels of the map-0 output (`sc_iteration._sc_identity_for_call`).
+multiplet refuses. The convergence readout (`sc_iteration._sc_identity_for_call`)
+matches each map's input to the labels of the map-0 output and pairs each
+input column with the output column of the same sorted index, so a label only
+names a pair. Matching the output to the labels separately compared two
+different states whenever a hybridized state changed label between input and
+output: on CrI3 24×24 charge QSGW that read 1.3 eV where the sorted pair moved
+6 meV, and the 1 meV criterion fired one map late. A sorted pair moves by at
+most $\max_k \lVert f_k \rVert_2$ (Weyl), and the `SC matrix residual` line
+carries a `FLAG` if max|dE| ever exceeds it. The map gain pairs adjacent
+inputs by sorted index too.
 
 ### Convergence and stop rules
 
@@ -521,7 +538,7 @@ input:
 
 | verdict | rule |
 |---|---|
-| **CONVERGED** | $\max \lvert E_{\rm out} - E_{\rm in}\rvert$ over the QP-matrix labels is below `sc_tol_ev` (default 1e-4 eV). $E_{\rm in}$ are the eigenvalues of the input $H$, $E_{\rm out}$ those of $F(H)$, matched by label. The loop returns that input with its own Σ, W and head. |
+| **CONVERGED** | $\max \lvert E_{\rm out} - E_{\rm in}\rvert$ over the QP-matrix labels is below `sc_tol_ev` (default 1e-4 eV). $E_{\rm in}$ are the eigenvalues of the input $H$, $E_{\rm out}$ those of $F(H)$, paired by sorted index and named by label. The loop returns that input with its own Σ, W and head. |
 | **STALLED at floor, not converged** | the label-free residual $r_n = \max_k \lVert P\,(F(H_n) - H_n)\,P\rVert_2$ (logged as `SC matrix residual`) has not improved by 10 % over the last 12 maps. |
 | budget | `sc_max_iter = N` (default 30): N ≥ 2 runs map 0 plus N accelerated maps; N = 1 is a special case that runs map 0 only, as a labelled one-map diagnostic. |
 

@@ -374,7 +374,13 @@ def anderson_nojit(
         x_{k+1} = sum_i alpha_i (x_i + f_i),
         alpha = argmin || sum_i alpha_i f_i ||_metric,  sum_i alpha_i = 1,
 
-    with beta = 1 (no damping).  This is CROP with real residuals (Wan &
+    with beta = 1 (no damping), except the first step, x_1 = x_0 + f_0 / 2.
+    On an affine map every later iterate is the same for any first beta != 0
+    (the history spans the same affine set), while along a mode with Picard
+    eigenvalue lambda the map-1 residual is |1 + lambda| / 2 of map 0's
+    instead of |lambda|: 0.75 instead of 2.5 on the CrI3 bispinor mode.
+    The step index is the global map index, so a resume from a map-0
+    state takes the same half step.  This is CROP with real residuals (Wan &
     Miedlar 2024, "CROP-Anderson"); rCROP (:func:`rcrop_nojit`) reaches the
     same iterates on an affine map at two evaluations per iteration, the
     second re-evaluating a residual the linear model already predicts.
@@ -492,7 +498,7 @@ def anderson_nojit(
         filled = min(filled + 1, m)
         Xw = Fw = X_ord = F_ord = None
 
-        x = _entry(x_opt + f_opt)
+        x = _entry(x_opt + (0.5 if it == 0 else 1.0) * f_opt)
         f = _entry(residual_fn(x))
         res = _norm(f)
         res_history.append(res)

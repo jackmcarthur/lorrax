@@ -8,6 +8,9 @@
    so the continuation evaluates that map again). The map is chosen so the
    best pair leaves a depth-2 window and the secant fallback fires, so both
    restore branches run.
+   The first step is half a plain step: on an affine map the second point
+   is the same as after a full first step, and along a Picard eigenvalue
+   of -2.5 the map-1 residual falls instead of growing 2.5x.
 2. ``gw.sigma_box_plan._fit_fixed_sc_rules``: a held Sigma rule that the
    resumed map refuses becomes an escape refit, not a crash.
 3. ``gw.sc_iteration._fit_band_carrier``: a cube read on a non-square mesh
@@ -74,6 +77,42 @@ def test_anderson_resume_is_the_same_trajectory():
     assert len(short) == 5 and len(kept[-1].res) == 4
     resumed, _, _ = _run(seed, 10, resume=lambda: kept[-1])
     assert all(np.array_equal(a, b) for a, b in zip(full[4:], resumed))
+
+
+def test_half_first_step():
+    from mixing.acceleration import AndersonState, anderson_nojit
+    rng = np.random.default_rng(7)
+    q, _ = np.linalg.qr(rng.standard_normal((18, 18)))
+    m = q @ np.diag(np.linspace(-2.5, 0.8, 18)) @ q.T
+    c = rng.standard_normal(18) + 1j * rng.standard_normal(18)
+    jnp = jax.numpy
+
+    def run(resume=None):
+        seen = []
+
+        def residual(x):
+            seen.append(np.asarray(x))
+            return (m @ x.reshape(-1) + c).reshape(x.shape) - x
+        with jax.default_device(CPU):
+            out = anderson_nojit(residual, jnp.zeros((2, 3, 3), complex), m=4,
+                                 maxit=2, tol=0.0, resume=resume)
+        return seen, np.asarray(out.residual_norms)
+
+    half, res = run()
+    assert res[1] <= res[0]                      # a full step: 2.5x res[0]
+    x0 = half[0]
+    f0 = (m @ x0.reshape(-1) + c).reshape(x0.shape) - x0
+    x1 = x0 + f0                                 # the full first step
+    f1 = (m @ x1.reshape(-1) + c).reshape(x1.shape) - x1
+    stack = np.zeros((4,) + x0.shape, complex)
+    stack[0] = x0
+    fstack = np.zeros_like(stack)
+    fstack[0] = f0
+    state = AndersonState(jnp.asarray(stack), jnp.asarray(fstack), 1, 1,
+                          jnp.asarray(x1), jnp.asarray(f1), None,
+                          (float(np.linalg.norm(f0)), float(np.linalg.norm(f1))), False)
+    full, _ = run(resume=lambda: state)
+    assert np.linalg.norm(full[0] - half[2]) <= 1e-10 * np.linalg.norm(half[2])
 
 
 def test_refused_held_rule_is_an_escape(monkeypatch):

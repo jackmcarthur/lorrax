@@ -1364,10 +1364,8 @@ _DEFAULTS = {
     # measurements are claims 2686-2687); the conditioning filter drops dependent columns, so depth costs only
     # memory, 2(m+1) copies of the (nk, nb, nb) carry over the mesh.
     "sc_history_depth": 20,
-    # Linear-mixing α.  Read only by the diagnostic
-    # ``sc_iteration._run_linear_mixing``, which no deck can now select, so
-    # this key changes nothing in a deck; it is retained for that path's
-    # direct callers (tests) rather than removed out from under them.
+    # Retired linear-mixing α: nothing reads it (the linear path was deleted
+    # 2026-10-04); the key stays so decks that carry it still parse.
     "sc_mixing": 1.0,
     "sc_dump_dir": "",           # E/U-history npy dump dir ("" = off)
     # Optional QP rotation seed.  The reader reconstructs U diag(E) U^H in the
