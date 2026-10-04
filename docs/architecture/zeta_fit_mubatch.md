@@ -251,8 +251,8 @@ the factors and the store are priced n_vertex times; everything else once.
 | centroid faces, C factor | the parent faces; ceil(Q/P)·μ²·16 (`local`) or Q·μ²·16 (`replicated`) | whole fit |
 | sphere tables | 12·N_k·N'_G + 4·N_k·n_col·n_s + 8·Q·N_G | whole fit |
 | Z rows, current batch and one lookahead | 2·Q·c·N_G·16 | every stage |
-| X_B and its phase matrix, one parent chunk | 2·n_pc·n_b·ns·b·16 + n_pc·N'_G·b·16 | stage 1 |
-| pair projectors: the owner's D̃, one chunk's all-to-all in and out | 2·n_p·ns²·b·N'_G·16·(1 + min(1, 2n_pc/n_p)) | stage 1 |
+| pair projectors on the owner, D̃ (a separate array from two parent chunks) | 2·n_p·ns²·b·N'_G·16 | stage 1 |
+| one parent chunk in flight: max(X_B ×3, phases, ψ slice and conj, and its D̃; its all-to-all in and out) | max(3·n_pc·n_b·ns·b·16 + n_pc·N'_G·b·16 + 2·n_pc·n_b·ns·N'_G·16 + D̃_c, 2·D̃_c), D̃_c = 2·n_pc·ns²·b·N'_G·16 | stage 1 |
 | pair projectors on the owner | 2·n_p·ns²·b·N'_G·16 | stage 2 (and 3 when streamed) |
 | D cylinder, one plane block | N_k·(n_a'/n_blk)·ns²·2c_out·n_col·16 | stages 2–3 |
 | one plane group | 2·N_k·n_pg·ns²·2c_out·n_⊥·16 | stage 3 |

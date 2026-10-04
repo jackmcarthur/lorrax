@@ -269,14 +269,15 @@ def plan_zeta_route_g(*, meta, mesh_xy, n_q_selected: int, ngkmax: int,
         rows = {"Z rows (+1 lookahead)": 2 * n_v * _c128(Q, c, N_G)}
         d_g = 2 * _c128(n_p, ns, b, ns, Gp)                 # D~ L+R, one copy
         n_pc = p_chunk(b)
+        d_c = d_g * n_pc / max(n_p, 1)                      # one parent chunk's D~
+        # one chunk in flight: at its GEMM, X_B, its psum and the two weighted
+        # copies, the phases, the ψ slice and its conj beside the GEMM output;
+        # at its all-to-all, the input and output.  One chunk is the pad of the
+        # all-to-all output, so the owner's D~ is a separate array only from two.
+        x_c = 3 * _c128(n_pc, nb, ns, b) + _c128(n_pc, Gp, b) + 2 * _c128(n_pc, nb, ns, Gp)
         return [
-            # one parent chunk: X_B, its psum and the two weighted copies, the
-            # phases, the ψ slice and its conj
-            dict(rows, **{"X_B and ψ (one parent chunk)": 3 * _c128(n_pc, nb, ns, b) + _c128(n_pc, Gp, b)
-                                                         + 2 * _c128(n_pc, nb, ns, Gp),
-                          # the owner's D~ and one chunk's all-to-all in and out; one
-                          # chunk is a pad of the all-to-all output, two copies as before
-                          "pair projectors (owner + chunk)": d_g * (1 + min(1.0, 2 * n_pc / n_p))}),
+            dict(rows, **{"pair projectors (owner)": d_g if n_pc < n_p else 0.0,
+                          "parent chunk in flight": max(x_c + d_c, 2 * d_c)}),
             dict(rows, **{"pair projectors (owner)": d_g,
                           "D cylinder (plane block)": _c128(nk, n_ap, ns, 2 * co, ns, n_col)
                           + _c128(ns, 2 * co, ns, n_col, n_s)}),
