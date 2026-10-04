@@ -11,6 +11,10 @@
   inconsistent nonmagnetic WFN, and the SCF magnetization is found by density.
 - `test_orbital_modern_route.py`: htransform's orbital totals and velocity
   refusals on toy inputs (CPU).
+- `test_hl_head_plasma_count.py`: the HL-PPM head ω_p² counts electrons
+  (CPU).
+- `test_minibz_equal_shares.py`: the shared mini-BZ head average gives every
+  rank one share shape (CPU, three simulated ranks).
 - Benchmarks and backend checks for a standalone service live in that service's
   `services/<svc>/bench/`.
 

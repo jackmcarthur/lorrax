@@ -5,6 +5,30 @@ results move, and what a user must change in decks, environment or files.
 The binding rulings behind breaking changes are in
 `docs/architecture/decisions.md`; older history is in git.
 
+## 2026-10-04 — robustness fixes: HL head, mini-BZ shares, SC resume, orbital totals
+
+- `hl_ppm`: the head plasma frequency counts the WFN's electrons
+  ($\omega_p^2 = 16\pi N_e/V$). It counted occupied bands, half of $N_e$ on a
+  scalar WFN (Si: 11.7 eV instead of 16.6 eV), so scalar HL-PPM head Σ moves.
+- The S-tensor q→0 head average splits its draw evenly over ranks. At
+  P = 9, 25, 36, 49, 100 it refused (`GATE cross_rank_compile_agreement`);
+  P = 4, 16, 64 are unchanged.
+- `sc_mixing` other than 1.0 refuses (`GATE sc_mixing_retired`): nothing has
+  read it since the linear path was deleted. `LORRAX_SC_MIXING` is gone.
+- The SC checkpoint's deck digest reads lines as the deck parser does (`=`
+  or `:`, case, `#` comments). A checkpoint written before this change does
+  not match it: the run warns and starts again from the seed.
+- htransform `--velocity` totals: a T = 0 total (no `occ_smearing_width_ry`)
+  with overlapping bands or a fractional count refuses
+  (`GATE orbital_totals_t0_gap`), and the band ceilings start above every
+  band within 10 kT of μ, so the 1/E_ceiling extrapolation moves wherever
+  0.6·nb lay inside the occupied set (CrI3 charge, nb 208). With no width,
+  the coarse and grid E_F use the rounded electron count, and an occupied top
+  returned band refuses (`GATE htransform_moments_window`) instead of
+  warning.
+- `kin_ion` stamps the `nval`/`ncond` GW resolves (`number_bands_protected`);
+  its datasets are unchanged.
+
 ## 2026-10-04 — htransform's orbital moment is the modern-theory one
 
 `--color orbital` colors the path bands by the wavepacket moment
