@@ -5734,7 +5734,7 @@ def _read_sc_checkpoint(state_init, inputs, history_depth, max_iter):
     # The seed only triggers the resume; the trajectory continues from the
     # checkpoint's own map. After a budget's last map or a stall the warm seed
     # is one map newer than the checkpoint, so that map is evaluated again.
-    seed = ("its own map-" f"{n - 1} seed" if state["seed_sha256"] == _seed_sha256(
+    seed = ("its own map-" f"{n - 1} seed" if state.get("seed_sha256") == _seed_sha256(
         inputs.initial_seed_path) else "a seed that is not its map output (unused)")
     _record_sc(inputs, f"  SC resume: continuing the Anderson trajectory at map {n} "
                f"from {path} beside {seed} (window {state['filled'] + 1}; Sigma rules "
