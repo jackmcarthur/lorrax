@@ -5,6 +5,28 @@ results move, and what a user must change in decks, environment or files.
 The binding rulings behind breaking changes are in
 `docs/architecture/decisions.md`; older history is in git.
 
+## 2026-10-03 — route-G stage 0 streams over parent chunks; step_up steps by the compiled figure
+
+Stage 0 of a route-G ζ batch (X_B, the pair GEMM and the all-to-all) runs
+one chunk of raw parents at a time and writes into the owner's D̃, which is
+allocated once with its zero column. The all-to-all no longer holds a second
+copy of D̃ (28.7 GB on CrI3 24×24 bispinor, at every P), and X_B is one
+chunk's instead of growing with P. A chunk is the fewest parents whose X_B
+psum and all-to-all reach the comm model's efficient payload, at most one
+1 GiB tile of X_B, balanced over the parents (CrI3 24×24: 61 chunks of 1;
+small decks: one chunk). The X_B band chunks (`x_chunks`) are removed.
+`runtime.aot_memory.step_up` now steps to the block count the compiled figure
+implies (a secant through the last two figures), rounded up to the next
+count with fewer plane groups per block, instead of doubling; a batch 0.3 %
+over the room at 50 blocks now runs at 63, not 100. Results: Fe 4³ bispinor
+V_q bitwise on the 0.25 GB deck and within rel 1.4e-10 on the roomy deck
+(claim 3177). CrI3 24×24 bispinor at P16 now fits the 56.16 GB target:
+the charge batch compiles to 38.18 GB beside 16.3 GB resident, where main
+modelled 75.6 GB. The plane stage then binds at 16 blocks (charge) and
+50–63 blocks (currents), with t_u = 0.44 s per (block, row). Projected P16 ζ
+fits: charge 18 × 110 s ≈ 33 min, currents ≈ 62 min (91 min measured with the
+old doubling to 100 blocks). Decks do not change.
+
 ## 2026-10-03 — sector face rounds solve on the Ritz carrier; CT span widths are held from map 0
 
 The CC/TT face reduction solves its kept span on `face_ritz_carrier` (the
