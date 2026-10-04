@@ -372,7 +372,7 @@ def make_route_g_kernel(*, mesh: Mesh, kgrid, fft_grid, ns: int, b: int,
             d = jnp.stack([D_l, D_r], axis=2).reshape(n_pc, ns, 2, P_, c, ns, -1)
             d = jnp.moveaxis(d, 3, 2).reshape(n_pc, ns, P_ * 2 * c, ns, -1)
             d = jax.lax.all_to_all(d, _XY, split_axis=2, concat_axis=4, tiled=True)
-            return jax.lax.dynamic_update_slice(D, d, (p0, 0, 0, 0, 0)), None
+            return jax.lax.dynamic_update_slice_in_dim(D, d, p0, axis=0), None
 
         # The owner's D̃, with the empty sphere slot's zero column built in.
         D = jnp.zeros((n_src, ns, 2 * c, ns, P_ * int(psi_bar.shape[-1]) + 1), jnp.complex128)
