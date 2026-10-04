@@ -581,7 +581,9 @@ def step_up(value: int, top: int, *, build, compiled, figure, room: float, stage
     while got > room and value < top:
         a = 0.0 if prev is None else (got * value - prev[1] * prev[0]) / (value - prev[0])
         want = -(-value * (got - a) // (room - a)) if room > a else 2 * int(value)
-        nxt_v = min(snap(max(int(want), int(value) + 1)), int(top))
+        # Clamp before snapping: the caller's snap is defined only up to ``top``
+        # (route G's divides by zero past it).
+        nxt_v = min(snap(min(max(int(want), int(value) + 1), int(top))), int(top))
         nxt_c = build(nxt_v)
         nxt = agreed_max(nxt_c)
         if nxt >= got:
