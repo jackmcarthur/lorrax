@@ -1261,6 +1261,7 @@ def reduce_sector_pencil(pencil, *, eigh, matmul, gates, matrix_sharding=None):
     Existing normalized-Gram thresholds control rank revelation; no
     cross-sector passivity or PSD repair is applied.
     """
+    from distrib_la import hermitian_part
     from gw.shared_pole_reduction import _metric_inverse_root
 
     metric, value, oc, ot = pencil
@@ -1278,7 +1279,11 @@ def reduce_sector_pencil(pencil, *, eigh, matmul, gates, matrix_sharding=None):
         reduced_metric + null, matmul=matmul,
         tolerance=gates["retained_subspace_moments"]["threshold"], matrix_sharding=matrix_sharding)
     y = matmul(y, correction) * keep[:, None, :]
-    reduced = matmul(y, matmul(value, y), transa="C")
+    # Y^H V Y is Hermitian only to round-off amplified by 1/gamma near the keep
+    # cut (3e-11 relative at gamma/top 1e-7, n 1024, above 64 n eps): the
+    # whole-mesh eigh, checked against its operand, refuses it, while the local
+    # eigh symmetrizes. Its Hermitian part is what both routes solve.
+    reduced = _matrix_layout(hermitian_part(matmul(y, matmul(value, y), transa="C")), matrix_sharding)
     sentinel = -(jnp.linalg.norm(reduced, axis=(-2, -1)) + 1)
     values, rotation = eigh(reduced + null * sentinel[:, None, None])
     count = jnp.sum(keep, axis=-1)
