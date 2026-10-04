@@ -1089,15 +1089,16 @@ def _batch_rows(row, batch):
 
 def _admit(compiled, meta, stage, *, native=0, resident=0, counted=0, peak=None):
     """Reserve a compiled executable's peak; ``counted`` argument bytes are charged elsewhere.
-    ``peak`` passes an ``aot_kernel_peak_bytes`` breakdown the caller already read."""
-    from runtime.aot_memory import aot_kernel_peak_bytes
+    ``peak`` passes an ``aot_kernel_peak_bytes`` breakdown the caller already read. The
+    reservation is the largest figure any rank read, so the ledger stays alike on every rank."""
+    from runtime.aot_memory import aot_kernel_peak_bytes, agreed_chunk
     if peak is None:
         peak = aot_kernel_peak_bytes(compiled)
     if not peak.cufft_measured:
         raise ValueError(f"GATE shared_pole_capacity: {stage} FFT workspace unavailable")
     meta.shared_pole_capacity.reserve(
         stage, resident_bytes_per_rank=resident,
-        workspace_bytes_per_rank=max(0, peak.total - counted) + native,
+        workspace_bytes_per_rank=-agreed_chunk(-(max(0, int(peak.total) - counted) + int(native))),
         concurrent_with=meta.shared_pole_capacity.live_stages)
     return compiled
 
@@ -1231,15 +1232,16 @@ class SynthesisTau:
         """Whether ``compiled`` fits the budget beside the live stages.
 
         :meth:`admit`'s ledger row, priced by ``CapacityLedger.preview`` and
-        not recorded: shapes and the ledger, so every rank decides alike.
+        not recorded, on the largest compiled figure any rank read
+        (``runtime.aot_memory.agreed_chunk``), so every rank decides alike.
         """
-        from runtime.aot_memory import aot_kernel_peak_bytes
+        from runtime.aot_memory import aot_kernel_peak_bytes, agreed_chunk
         counted = sum(int(x.addressable_shards[0].data.nbytes)
                       for x in jax.tree.leaves(self._synthesis.resident_operands()))
         peak = aot_kernel_peak_bytes(compiled)
+        workspace = -agreed_chunk(-(max(0, int(peak.total) - counted) + int(self._native)))
         ledger = self._meta.shared_pole_capacity
-        row = ledger.preview(resident_bytes_per_rank=0,
-                             workspace_bytes_per_rank=max(0, peak.total - counted) + self._native,
+        row = ledger.preview(resident_bytes_per_rank=0, workspace_bytes_per_rank=workspace,
                              concurrent_with=ledger.live_stages)
         return row["device_budget_status"] == "PASS"
 
