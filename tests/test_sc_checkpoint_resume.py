@@ -26,9 +26,11 @@ class _Stop(Exception):
 
 
 def _affine(seed):
+    """An expansive affine map: eigenvalues down to -30, -10 or -3 make a new
+    residual exceed the window (fallback) and keep the best pair in the past."""
     rng = np.random.default_rng(seed)
     q, _ = np.linalg.qr(rng.standard_normal((18, 18)))
-    m = q @ np.diag(np.linspace(-2.5, 0.8, 18)) @ q.T
+    m = q @ np.diag(np.linspace((-30.0, -10.0, -3.0)[seed % 3], 0.8, 18)) @ q.T
     c = rng.standard_normal(18) + 1j * rng.standard_normal(18)
     return m, c
 
@@ -58,7 +60,7 @@ def _run(seed, maxit, *, stop_at=None, resume=None):
 
 
 def test_anderson_resume_is_the_same_trajectory():
-    seed = next((s for s in range(64)
+    seed = next((s for s in range(96)
                  if (lambda r: any("fallback" in line for line in r[2])
                      and any(st.best is not None for st in r[1]))(_run(s, 10))), None)
     assert seed is not None, "no toy map exercised the fallback and an out-of-window best"
