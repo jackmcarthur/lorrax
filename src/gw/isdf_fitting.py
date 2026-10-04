@@ -351,7 +351,7 @@ def _fit_mubatch(
             n_col=int(cyl[0].shape[1]), n_s=int(cyl[0].shape[2]),
             plane_from_col=plane_from_col, n_pg=int(plan.r_sub),
             axis=axis, n_src=n_par, vertices=vertices, c_out=c_out, n_blk=n_blk,
-            n_xc=int(plan.x_chunks(int(mb.b))), vertex_terms=vertex_terms)
+            n_pc=int(plan.p_chunk(int(mb.b))), vertex_terms=vertex_terms)
         kernel = zmb.make_route_g_kernel(**kern_args)
         with timing.section("zeta_fit.mubatch.compile"):
             compiled = kernel.lower(*launch_args(0, mb)).compile()
@@ -405,7 +405,7 @@ def _fit_mubatch(
     split_kernels = {}
     if debug_print_enabled():
         # Debug split timers: the same kernel truncated after each stage.
-        for stage in ('x', 'gemm', 'a2a', 'planes', 'kconv'):
+        for stage in ('source', 'planes', 'kconv'):
             split_kernels[stage] = zmb.make_route_g_kernel(**kern_args, stop_at=stage)
     stores = [zmb.ZStore(
         mesh=mesh_xy, q_axis=q_axis, mu_pad=mu_pad, g_axis=g_axis, b=b,
@@ -418,7 +418,7 @@ def _fit_mubatch(
     print_fn(f"  μ-batch fit (route G): {n_batch} batches of {b} centroids "
              f"(whole orbits per owner; planned {int(plan.b)}; planes {c_out} "
              f"of each owner's {int(mb.c)} rows at a time, {n_blk} plane block(s), "
-             f"X_B in {kern_args['n_xc']} band chunk(s)), "
+             f"stage 0 in {-(-n_par // kern_args['n_pc'])} parent chunk(s)), "
              f"{int(plan.r_sub)} planes per group, "
              f"{n_par} parent k -> {nk}, ψ sphere {ngk_psi} "
              f"slots ({s_ax.carrier // P_}/rank), channels μ_L={list(vertices)}, "
@@ -476,7 +476,7 @@ def _fit_mubatch(
                     jax.block_until_ready(kfn(*args))
                     t_stage[stage] = time.perf_counter() - ts
                 if jax.process_index() == 0:
-                    names = ['x', 'gemm', 'a2a', 'planes', 'kconv', 'full']
+                    names = ['source', 'planes', 'kconv', 'full']
                     print_fn(f"[mubatch_dbg] batch {beta + 1} route-G split (s): " + " ".join(
                         f"{n}={t_stage[n] - (t_stage[names[i - 1]] if i else 0.0):.3f}"
                         for i, n in enumerate(names)) + f" total={t_stage['full']:.3f}")

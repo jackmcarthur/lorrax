@@ -44,6 +44,7 @@ slots. Rank p owns slots p·c + [0, c), and each owner's bin holds whole
 centroid orbits.
 
 ```text
+   per chunk of n_pc raw parents, into the owner's D̃ (steps 1-3):
 1  X_B = ψ_{n k̄ s}(r_μ)      partial DFT over the rank's G slots, one psum (replicated)
 2  D̃^X_k̄(a, μ, b, G)         Σ_n w^X_n X_{n k̄ a}(r_μ) conj c_{n k̄ b}(G): one batched GEMM
                                per side on the rank's G slice (isdf.pair_kernels)
@@ -66,9 +67,14 @@ three current channels share it: one X_B, one pair GEMM, one all-to-all and
 one set of plane FFTs per batch, then one k-convolution, one accumulator and
 one Z store per channel. The charge fit is the same kernel with one channel.
 
-Each batch runs n_x + 1 collectives, one X_B psum per band chunk (n_x = 1
-unless X_B is chunked) and the pair-projector all-to-all;
-`LORRAX_DEBUG_PRINT=1` counts them from the compiled HLO. Every
+Each batch runs two collectives per parent chunk, the X_B psum and the
+pair-projector all-to-all; `LORRAX_DEBUG_PRINT=1` counts them from the
+compiled HLO. The chunk is the fewest parents whose psum and all-to-all
+each reach `comm_model.min_efficient_payload` (the planner's `p_chunk`;
+CrI3 24×24 bispinor: 1 parent, 61 chunks). Each chunk's all-to-all output
+is written into the owner's D̃, which is allocated once with the empty
+sphere slot's zero column, so the all-to-all never holds a second copy of
+D̃ and X_B is one chunk's. Every
 FFT, the typed unfold and the k-convolution run locally on the owner of whole
 μ rows, so no FFT is distributed.
 
@@ -244,8 +250,8 @@ the factors and the store are priced n_vertex times; everything else once.
 | centroid faces, C factor | the parent faces; ceil(Q/P)·μ²·16 (`local`) or Q·μ²·16 (`replicated`) | whole fit |
 | sphere tables | 12·N_k·N'_G + 4·N_k·n_col·n_s + 8·Q·N_G | whole fit |
 | Z rows, current batch and one lookahead | 2·Q·c·N_G·16 | every stage |
-| X_B (one band chunk) and its phase matrix | 2·n_p·⌈n_b/n_x⌉·ns·b·16 + n_p·N'_G·b·16 | stage 1 |
-| pair projectors, GEMM output and all-to-all output | 4·n_p·ns²·b·N'_G·16 | stage 1 |
+| X_B and its phase matrix, one parent chunk | 2·n_pc·n_b·ns·b·16 + n_pc·N'_G·b·16 | stage 1 |
+| pair projectors: the owner's D̃, one chunk's all-to-all in and out | 2·n_p·ns²·b·N'_G·16·(1 + 2n_pc/n_p) | stage 1 |
 | pair projectors on the owner | 2·n_p·ns²·b·N'_G·16 | stage 2 (and 3 when streamed) |
 | D cylinder, one plane block | N_k·(n_a'/n_blk)·ns²·2c_out·n_col·16 | stages 2–3 |
 | one plane group | 2·N_k·n_pg·ns²·2c_out·n_⊥·16 | stage 3 |
@@ -279,12 +285,8 @@ The planner decides in this order:
    collectives (`gw.comm_model.comm_time`), plus 3 ms per plane group, plus
    0.65 s·(c+1)/2 of owner work, times the batch count. The cheapest wins,
    and the receipt names the runner-up.
-   X_B is replicated and b ≥ P·c_orb, so it grows with P. It is formed in
-   the fewest band chunks n_x that bring stage 1 under its cap (the target,
-   or the smallest plane stage when that is larger), inside the pair GEMM's
-   band scan; a chunk is never smaller than one side of the pair projectors
-   it feeds. n_x = 1 whenever stage 1 fits the cap (CrI3 24×24 bispinor: 1
-   at P64, 2 at P256).
+   X_B is replicated and b ≥ P·c_orb, so it grows with P; stage 1 holds
+   one parent chunk's.
 4. **G tile.** G_tile is the largest multiple of P with
    G_tile·6·ceil(Q/P)·μ·16 ≤ target/4,
    capped at ceil(N_G/P)·P.
@@ -303,8 +305,8 @@ the plane stage at the widest balanced c_out ≤ b/P that fits the cap with
 one plane block, down to one row, then at one row with the fewest plane
 blocks that fit. The cap is the target, or the working set of the smallest
 split (one row, one plane group per block) when that is larger: the source
-stage does not depend on the split (CrI3 24×24 bispinor P64: 3 blocks under
-its 69 GB source stage, where the target alone gave 250). The compiled
+stage does not depend on the split, so a split under the bytes it already
+holds costs nothing. The compiled
 check reads that price at the planned chunk, with the widest orbit as its
 minimum chunk. Still over the room, it doubles the plane blocks while that
 lowers the compiled figure (every rank on the largest one), up to one plane

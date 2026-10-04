@@ -2,6 +2,7 @@
 
 Per μ batch ``B``, with conj ψ(G) of the full zone sharded over G slots:
 
+    per chunk of raw parents, into the owner's D̃:
     X_B = ψ_{nks}(r_μ)                        one psum of the ranks' partial DFTs
     D̃^X_k(a, μ, b, G) = Σ_n w^X_n X_{nka}(r_μ) conj c_{nkb}(G)   (G-space GEMM, local)
     one all-to-all: G split → μ owner (rank p owns batch slots p·c + [0, c))
@@ -209,7 +210,7 @@ def _spin_sandwich(U, d):
 def make_route_g_kernel(*, mesh: Mesh, kgrid, fft_grid, ns: int, b: int,
                         q_sel, q_axis, q_neg, qvec_frac, n_col: int, n_s: int,
                         plane_from_col, n_pg: int, axis: int, n_src: int, vertices=(0,),
-                        c_out: int | None = None, n_blk: int = 1, n_xc: int = 1,
+                        c_out: int | None = None, n_blk: int = 1, n_pc: int | None = None,
                         vertex_terms=None,
                         stop_at: str | None = None):
     """Compile-once executable for one μ batch on route G.
@@ -221,10 +222,11 @@ def make_route_g_kernel(*, mesh: Mesh, kgrid, fft_grid, ns: int, b: int,
     charge fit, ``(1, 2, 3)`` for the three current channels, which share
     every stage but the k-convolution and the accumulate:
 
-    1. ``X_B = ψ(r_μ)`` by a direct DFT of each rank's ψ G slice, one psum;
-    2. the pair GEMM in G space on the rank's slice
-       (:func:`isdf.pair_kernels.pair_projectors_lr`, stored ``conj c``);
-    3. ONE all-to-all, G split → μ owner (``[L | R]`` rows owner-major);
+    1-3. per chunk of ``n_pc`` raw parents (default all): ``X_B = ψ(r_μ)``
+       by a direct DFT of each rank's ψ G slice, one psum; the pair GEMM in
+       G space on the rank's slice (:func:`isdf.pair_kernels.pair_projectors_lr`,
+       stored ``conj c``); one all-to-all, G split → μ owner (``[L | R]``
+       rows owner-major), written into the owner's D̃;
     4. on the owner, per group of ``n_pg`` planes normal to ``axis``: the
        sphere → cylinder gather, the axis DFT onto the planes, the 2D FFT
        and Bloch phase → ``D(k, μ, r_plane)``; the k-convolution
@@ -243,10 +245,10 @@ def make_route_g_kernel(*, mesh: Mesh, kgrid, fft_grid, ns: int, b: int,
     rows from the owner's whole-orbit pair projectors, so no row crosses an
     owner.  The D cylinder is built ``n_blk`` blocks of planes at a time
     (default 1: all planes); each block's axis DFT lands on its own planes,
-    and the unfold and cylinder gather are redone per block.  X_B is formed
-    in ``n_xc`` band chunks inside the pair GEMM's band scan (default 1:
-    whole; the planner's ``x_chunks``), so the replicated X_B stays bounded
-    as ``b`` grows with P.
+    and the unfold and cylinder gather are redone per block.  Steps 1-3
+    stream the parents in chunks of ``n_pc`` (the planner's ``p_chunk``), so
+    the owner's D̃ is the only whole-batch source array: no second copy at
+    the all-to-all, and X_B is one chunk's.
 
     Operands: ``psi_bar (n_src, nb, ns, ngk_pad)`` = conj ψ(G) of the raw
     parents, G sharded ``P(None, None, None, ('x','y'))``; ``g3 (n_src,
@@ -266,7 +268,7 @@ def make_route_g_kernel(*, mesh: Mesh, kgrid, fft_grid, ns: int, b: int,
     the exact Fourier image of the r-space typed transport C_q and the
     faces use.
 
-    ``stop_at`` (debug split timers only: ``'x'``, ``'gemm'``, ``'a2a'``,
+    ``stop_at`` (debug split timers only: ``'source'`` (steps 1-3),
     ``'planes'``, ``'kconv'``) truncates after that stage with a checksum.
     """
     from isdf.core import _conv_kpair_static_gamma
@@ -282,6 +284,12 @@ def make_route_g_kernel(*, mesh: Mesh, kgrid, fft_grid, ns: int, b: int,
     if not 1 <= c_out <= c:
         raise ValueError(f"make_route_g_kernel: c_out {c_out} must be in [1, c={c}]")
     n_ch = -(-c // c_out)
+    n_src = int(n_src)
+    n_pc = n_src if n_pc is None else min(int(n_pc), n_src)
+    if n_pc < 1:
+        raise ValueError(f"make_route_g_kernel: n_pc {n_pc} must be >= 1")
+    # The last parent chunk starts early; its repeated parents rewrite the same rows.
+    p0s = np.minimum(np.arange(-(-n_src // n_pc)) * n_pc, n_src - n_pc).astype(np.int32)
     nk = int(np.prod(kgrid))
     N = int(np.prod(fft_grid))
     n_a, (n_b, n_c), (b_ax, c_ax) = _plane_geometry(fft_grid, axis)
@@ -329,7 +337,7 @@ def make_route_g_kernel(*, mesh: Mesh, kgrid, fft_grid, ns: int, b: int,
            hash(q_sel.tobytes()), q_axis,
            None if q_neg is None else hash(q_neg.tobytes()), hash(qv.tobytes()),
            int(n_col), int(n_s), hash(pfc.tobytes()), int(n_pg), int(axis), int(n_src),
-           vertices, vertex_terms, c_out, n_blk, int(n_xc), stop_at)
+           vertices, vertex_terms, c_out, n_blk, n_pc, stop_at)
     hit = _kernel_cache.get(key)
     if hit is not None:
         return hit
@@ -346,40 +354,31 @@ def make_route_g_kernel(*, mesh: Mesh, kgrid, fft_grid, ns: int, b: int,
         zc, za, zflat = zt
         irr, sym, anti, U, pslot, phase, kch = unf
         lperm, lL = lt[0][0], lt[1][0]                    # this owner's orbits
-        # 1. X_B = ψ_{nks}(r_μ) = Σ_G c e^{2πi(k+G)·x_μ}/√N, one psum
-        kg = kvecs[:, None, :] + g3.astype(jnp.float64)            # (k, Gp, 3)
-        ph = jnp.exp(2j * jnp.pi * jnp.einsum('kgd,md->kgm', kg, xmu))
-
-        def x_of(psi):
-            X = jnp.einsum('knsg,kgm->knsm', jnp.conj(psi), ph) / np.sqrt(N)
-            return jax.lax.psum(X, _XY) * live[None, None, None, :]
-
         n_g = int(zflat.shape[-1])
         chk = lambda a: (jnp.zeros((Q, c, n_g), jnp.complex128) + jnp.sum(jnp.abs(a)),) * n_v
-        # 2. pair GEMM in G space on this rank's slice, X_B one band chunk at a
-        # time (n_xc = 1: whole); the last chunk starts early, its repeated
-        # bands at zero weight
-        nb_ = int(psi_bar.shape[1])
-        bw = -(-nb_ // n_xc)
-        own = np.arange(n_xc)[:, None] * bw
-        j0 = np.minimum(own, nb_ - bw)
-        jj = j0 + np.arange(bw)[None, :]
-        psi_c = lambda bc: jax.lax.dynamic_slice_in_dim(
-            psi_bar, jnp.asarray(j0[:, 0], jnp.int32)[bc], bw, axis=1)
-        if stop_at == 'x':
-            return chk(x_of(psi_c(0)))
-        keep = jnp.asarray(jj >= own)
-        D_l, D_r = pair_projectors_lr(lambda bc: x_of(psi_c(bc)), psi_c,
-                                      w_l[jj] * keep, w_r[jj] * keep)  # (k, s, b, s, Gp)
-        if stop_at == 'gemm':
-            return chk(jnp.sum(jnp.abs(D_l)) + jnp.sum(jnp.abs(D_r)))
-        # 3. one all-to-all: G split -> μ owners, [L | R] owner-major
-        D = jnp.stack([D_l, D_r], axis=2).reshape(n_src, ns, 2, P_, c, ns, -1)
-        D = jnp.moveaxis(D, 3, 2).reshape(n_src, ns, P_ * 2 * c, ns, -1)
-        D = jax.lax.all_to_all(D, _XY, split_axis=2, concat_axis=4, tiled=True)
-        if stop_at == 'a2a':
+
+        def source(D, p0):
+            """Steps 1-3 for the n_pc parents from p0, written into the owner's D̃."""
+            sl = lambda a: jax.lax.dynamic_slice_in_dim(a, p0, n_pc, axis=0)
+            psi = sl(psi_bar)
+            # 1. X_B = ψ_{nks}(r_μ) = Σ_G c e^{2πi(k+G)·x_μ}/√N, one psum
+            kg = sl(kvecs)[:, None, :] + sl(g3).astype(jnp.float64)     # (k, Gp, 3)
+            ph = jnp.exp(2j * jnp.pi * jnp.einsum('kgd,md->kgm', kg, xmu))
+            X = jnp.einsum('knsg,kgm->knsm', jnp.conj(psi), ph) / np.sqrt(N)
+            X = jax.lax.psum(X, _XY) * live[None, None, None, :]
+            # 2. pair GEMM in G space on this rank's slice
+            D_l, D_r = pair_projectors_lr(X, psi, w_l, w_r)            # (k, s, b, s, Gp)
+            # 3. one all-to-all: G split -> μ owners, [L | R] owner-major
+            d = jnp.stack([D_l, D_r], axis=2).reshape(n_pc, ns, 2, P_, c, ns, -1)
+            d = jnp.moveaxis(d, 3, 2).reshape(n_pc, ns, P_ * 2 * c, ns, -1)
+            d = jax.lax.all_to_all(d, _XY, split_axis=2, concat_axis=4, tiled=True)
+            return jax.lax.dynamic_update_slice(D, d, (p0, 0, 0, 0, 0)), None
+
+        # The owner's D̃, with the empty sphere slot's zero column built in.
+        D = jnp.zeros((n_src, ns, 2 * c, ns, P_ * int(psi_bar.shape[-1]) + 1), jnp.complex128)
+        D, _ = jax.lax.scan(source, D, jnp.asarray(p0s), unroll=1)
+        if stop_at == 'source':
             return chk(D)
-        D = jnp.concatenate([D, jnp.zeros(D.shape[:4] + (1,), D.dtype)], axis=-1)
         ngk1 = int(D.shape[-1])
         D = D.reshape(n_src, ns, 2, c, ns, ngk1)
 
