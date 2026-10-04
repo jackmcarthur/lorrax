@@ -942,8 +942,8 @@ def make_initial_state_from_qp_rotations(
         "  SC initial Hamiltonian: external compact QP seed "
         f"{artifact_path}; authenticated original DFT basis; "
         "seed-only U diag(E) U^H, averaged over each k's little group "
-        f"(max |ΔH| {moved * RYD_TO_EV:.3e} eV). Occupations, DFT tail, reference "
-        "operators, quadrature and Anderson history belong to this new run.")
+        f"(max |ΔH| {moved * RYD_TO_EV:.3e} eV). The quadrature plan and Anderson "
+        "history are this run's unless an SC resume line follows.")
     return SCState(
         H_qp_dft=device_put_process_local(H_loop, rep3),
         iteration=0,
@@ -5620,17 +5620,27 @@ SC_CHECKPOINT = "sc_checkpoint.h5"
 def _held_session(session):
     """The SC session without its fitted rules: what a checkpoint keeps.
 
-    No quadrature rule is stored (TASTE 70): each held Sigma window keeps its
-    name, certificate boxes and counters but not its fit, and the chi response
-    plan is dropped, so a resumed process re-certifies both cold.  The omega
-    grid, windows, supports, line sites and K/rank/carrier capacities stay.
+    No quadrature rule is stored (TASTE 70).  Each held Sigma window keeps its
+    certificate boxes, counters and the box its rule was built on
+    (``held_rule``), from which a resumed process rebuilds that rule cold
+    (``sigma_box_plan._fit_fixed_sc_rules``); the chi response plan is
+    dropped and planned cold.  The omega grid, windows, supports, line sites
+    and K/rank/carrier capacities stay.
     """
+    def held(entry):  # a window absent since a resume still holds its box only
+        fit = entry.get("fit")
+        if fit is None:
+            return dict(entry)
+        return dict({k: v for k, v in entry.items() if k != "fit"}, held_rule=dict(
+            rule_box=tuple(fit["rule_box"]), analytic_line=bool(fit.get("analytic_line")),
+            serve_ceiling_nodes=fit.get("serve_ceiling_nodes"),
+            node_digest=fit["node_digest"]))
+
     def strip(d, parent=None):
         out = {}
         for key, value in d.items():
             if key == "rules" and isinstance(value, dict):
-                out[key] = {name: {k: v for k, v in entry.items() if k != "fit"}
-                            for name, entry in value.items()}
+                out[key] = {name: held(entry) for name, entry in value.items()}
             elif not (parent == "chi" and key == "frequency"):
                 out[key] = strip(value, key) if isinstance(value, dict) else value
         return out
@@ -5640,8 +5650,9 @@ def _held_session(session):
 def _sc_checkpoint_identity(inputs, shape, history_depth):
     """What a checkpoint must share with this run: deck, WFN, carry, depth.
 
-    The deck digest drops comments, blank lines and the two lines a leg
-    rewrites (``restart``, ``sc_initial_qp_rotations_file``).
+    The deck digest drops comments, blank lines, the two lines a leg
+    rewrites (``restart``, ``sc_initial_qp_rotations_file``) and the stop
+    rule (``sc_max_iter``, ``sc_tol_ev``), which a continuation may change.
     """
     import hashlib
     from common.parallel_transport import fingerprint_from_binding, wfn_fingerprint
@@ -5651,7 +5662,8 @@ def _sc_checkpoint_identity(inputs, shape, history_depth):
             for line in (raw.strip() for raw in fh):
                 key = line.split("=", 1)[0].strip()
                 if line and not line.startswith("#") and key not in (
-                        "restart", "sc_initial_qp_rotations_file"):
+                        "restart", "sc_initial_qp_rotations_file",
+                        "sc_max_iter", "sc_tol_ev"):
                     lines.append(line)
     wfn = (wfn_fingerprint(inputs.wfn) if inputs.wfn_fingerprint_binding is None
            else fingerprint_from_binding(inputs.wfn_fingerprint_binding, inputs.wfn))
@@ -5660,28 +5672,37 @@ def _sc_checkpoint_identity(inputs, shape, history_depth):
                 history_depth=int(history_depth))
 
 
-def _read_sc_checkpoint(state_init, inputs, history_depth):
-    """The checkpoint beside the deck's seed, if it continues this run, else None."""
+def _read_sc_checkpoint(state_init, inputs, history_depth, max_iter):
+    """The checkpoint beside the deck's seed, if it continues this run, else None.
+
+    Returns its path, commit and small state; the Anderson cubes are read
+    later by the solver's loader (``_run_anderson``).
+    """
     from file_io.sigma_checkpoint import SC_SCHEMA, read_sigma_checkpoint
     if inputs.initial_seed_path is None:
         return None
     path = os.path.join(os.path.dirname(inputs.initial_seed_path), SC_CHECKPOINT)
     identity = _sc_checkpoint_identity(
         inputs, state_init.H_qp_dft.shape[:2], history_depth)
-    cubes, *rest = read_sigma_checkpoint(
+    found = read_sigma_checkpoint(
         path, identity=identity, mesh=inputs.mesh_xy, print_fn=inputs.print_fn,
-        schema=SC_SCHEMA, discard=False)
-    if cubes is None:
-        if rest[0] != "absent":
+        schema=SC_SCHEMA, discard=False, cubes=False)
+    if found[0] is None:
+        if found[1] != "absent":
             _record_sc(inputs, f"  WARNING SC resume: {path} does not continue this "
-                       f"run ({rest[0]}; this deck digest {identity['deck_sha256'][:16]}); "
-                       "new SC trajectory from the seed")
+                       f"run ({found[1]}; this deck digest {identity['deck_sha256'][:16]}); "
+                       "new SC trajectory from the seed (remove the file to silence this)")
         return None
-    state = rest[1]
-    _record_sc(inputs, f"  SC resume: continuing the Anderson trajectory at map "
-               f"{len(state['res'])} from {path} ({state['pairs']} pairs; Sigma and "
-               "chi rules re-certified cold)")
-    return dict(cubes=cubes, state=state)
+    _, _, state, commit = found
+    n = len(state["res"])
+    if n > max_iter:
+        raise ValueError(
+            f"GATE sc_resume_budget: {path} continues at map {n}, past sc_max_iter = "
+            f"{max_iter}; raise sc_max_iter to continue, or remove the file to start fresh")
+    _record_sc(inputs, f"  SC resume: continuing the Anderson trajectory at map {n} "
+               f"from {path} (window {state['filled'] + 1}; Sigma rules re-fitted on "
+               "their held boxes, chi rule planned cold)")
+    return dict(path=path, commit=commit, state=state)
 
 
 def _clear_sc_eqp_snapshots(input_dir: str, *, print_fn=print) -> None:
@@ -5771,7 +5792,7 @@ def run_self_consistency(
     """
     print_fn = inputs.print_fn
     # A continuation keeps the earlier processes' map files.
-    resume = (_read_sc_checkpoint(state_init, inputs, history_depth)
+    resume = (_read_sc_checkpoint(state_init, inputs, history_depth, max_iter)
               if max_iter > 1 and accelerator == "anderson" else None)
     _, eigvalsh_kshard = _kshard_eigh_kernels(inputs.mesh_xy)
     # E-history dump dir from config.sc (LORRAX_SC_DUMP_DIR env is a
@@ -6395,52 +6416,69 @@ def _run_anderson(
     # the warm seed beside it continues this trajectory.
     checkpoint_identity = _sc_checkpoint_identity(inputs, (nk, nb), history_depth)
 
+    checkpoint_path = os.path.join(inputs.input_dir, "sc_seed", SC_CHECKPOINT)
+
     def _checkpoint(acc):
         import pickle
-        from file_io.sigma_checkpoint import SC_SCHEMA, write_sigma_checkpoint
+        from file_io.sigma_checkpoint import (
+            SC_SCHEMA, discard_sigma_checkpoint, write_sigma_checkpoint)
         n = len(acc.res) - 1
-        path = os.path.join(inputs.input_dir, "sc_seed", SC_CHECKPOINT)
-        cubes = {f"{kind}{i:02d}": value for i, pair in enumerate(acc.pairs)
-                 for kind, value in zip("xf", pair)}
-        cubes.update(x_best=acc.best[0], f_best=acc.best[1])
+        cubes = dict(X=acc.X, F=acc.F, x=acc.x, f=acc.f)
+        if acc.best is not None:  # outside the window: its own pair
+            cubes.update(x_best=acc.best[0], f_best=acc.best[1])
         state = dict(
-            pairs=len(acc.pairs), res=[float(r) for r in acc.res],
-            fallback=bool(acc.fallback), tail_z=_tail_z[0],
-            identity=dict(_identity_history), floor=list(_floor_history),
-            e_tail=list(_e_history[-2:]), rms=list(rms_history),
-            gain=_gain_previous[0],
+            head=int(acc.head), filled=int(acc.filled),
+            res=[float(r) for r in acc.res], fallback=bool(acc.fallback),
+            tail_z=_tail_z[0], identity=dict(_identity_history),
+            floor=list(_floor_history), e_history=list(_e_history),
+            rms=list(rms_history), gain=_gain_previous[0],
             session=_held_session(inputs.fixed_quadrature_session))
         try:
             nbytes, seconds = write_sigma_checkpoint(
-                path, identity=checkpoint_identity, cubes=cubes, host=dict(map=n),
+                checkpoint_path, identity=checkpoint_identity, cubes=cubes,
                 mesh=inputs.mesh_xy, schema=SC_SCHEMA, state=state)
         except (OSError, RuntimeError, TypeError, ValueError, pickle.PickleError) as exc:
+            # The previous map's checkpoint must not outlive this map.
+            discard_sigma_checkpoint(checkpoint_path)
             _record_sc(inputs, f"  WARNING SC checkpoint: map {n} not written "
-                       f"({type(exc).__name__}: {str(exc)[:300]}); a later process "
-                       "starts from the warm seed alone")
+                       f"({type(exc).__name__}: {str(exc)[:300]}); no checkpoint is "
+                       "left, so a later process starts from the warm seed alone")
             return
         _record_sc(inputs, f"  SC checkpoint: map {n} written "
-                   f"({nbytes / 2**20:.1f} MiB in {seconds:.1f} s) to {path}")
+                   f"({nbytes / 2**20:.1f} MiB in {seconds:.1f} s) to {checkpoint_path}")
 
     acc_resume = None
     if resume is not None:
-        st, cubes = resume["state"], resume["cubes"]
-
-        def _pin(a):  # SlabIO reads at the entry spec; another mesh pads differently
-            return a if a.shape == x0.shape else _to_entry(a[:, :nb, :nb])
-        acc_resume = AndersonState(
-            tuple((_pin(cubes[f"x{i:02d}"]), _pin(cubes[f"f{i:02d}"]))
-                  for i in range(st["pairs"])),
-            (_pin(cubes["x_best"]), _pin(cubes["f_best"])),
-            tuple(st["res"]), st["fallback"])
+        st, path, commit = resume["state"], resume["path"], resume["commit"]
+        resume = None
         _iter_idx[0] = len(st["res"])
         _tail_z[0] = st["tail_z"]
         _identity_history.update(st["identity"])
         _floor_history[:] = st["floor"]
-        _e_history[:] = st["e_tail"]
+        _e_history[:] = st["e_history"]
         rms_history[:] = st["rms"]
         _gain_previous[0] = st["gain"]
         inputs.fixed_quadrature_session.update(st["session"])
+        head, filled, res, fallback = st["head"], st["filled"], tuple(st["res"]), st["fallback"]
+        st = None
+
+        def acc_resume():
+            """The solver's window, read when it asks, so no caller keeps it."""
+            from file_io.sigma_checkpoint import read_checkpoint_cubes
+            cubes = read_checkpoint_cubes(path, commit=commit, mesh=mesh)
+
+            def pin(name, sharding):  # another mesh pads the band axes differently
+                a = cubes.pop(name)
+                if a.shape[-1] == nb_pad:
+                    return a
+                pad = [(0, 0)] * (a.ndim - 2) + [(0, nb_pad - nb)] * 2
+                return jax.jit(lambda v: jnp.pad(v[..., :nb, :nb], pad),
+                               out_shardings=sharding)(a)
+            stack_sh = NamedSharding(mesh, P(None, *spec))
+            best = ((pin("x_best", entry_sh), pin("f_best", entry_sh))
+                    if "x_best" in cubes else None)
+            return AndersonState(pin("X", stack_sh), pin("F", stack_sh), head, filled,
+                                 pin("x", entry_sh), pin("f", entry_sh), best, res, fallback)
     try:
         result = anderson_nojit(
             residual_fn,
@@ -6456,6 +6494,9 @@ def _run_anderson(
             on_eval=_checkpoint,
         )
     except _Converged as stop:
+        if stop.verdict.converged:  # a finished run has nothing to continue
+            from file_io.sigma_checkpoint import discard_sigma_checkpoint
+            discard_sigma_checkpoint(checkpoint_path)
         # The criterion (or the stall rule) fired inside the map.  Return the accepted
         # map INPUT that met it, NOT F(input) and not rCROP's stale internal
         # x: only this input was accepted and evaluated with the SCOutputs

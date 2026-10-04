@@ -1370,10 +1370,10 @@ _DEFAULTS = {
     # direct callers (tests) rather than removed out from under them.
     "sc_mixing": 1.0,
     "sc_dump_dir": "",           # E/U-history npy dump dir ("" = off)
-    # Optional seed-only QP rotation artifact for a NEW SC run.  The reader
-    # reconstructs U diag(E) U^H in the selected mean-field WFN's original
-    # DFT basis.  It does not import a rotated WFN, occupations, a protected
-    # partition or accelerator history from the source run.
+    # Optional QP rotation seed.  The reader reconstructs U diag(E) U^H in the
+    # selected mean-field WFN's original DFT basis; an authenticated
+    # sc_checkpoint.h5 beside it continues that run instead
+    # (docs/self_consistency.md section 8).
     "sc_initial_qp_rotations_file": "",
     # Symmetric correction averaging is legal only for accidental/exact
     # degeneracies.  This 0.1 meV owner-set ceiling is deliberately more

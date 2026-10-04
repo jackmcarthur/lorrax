@@ -1182,6 +1182,25 @@ def _fit_fixed_sc_rules(
             initialized=True)
 
     rules = session["rules"]
+    # A resumed SC process holds each window's rule box, never its rule
+    # (TASTE 70; ``gw.sc_iteration._held_session``): the rule is rebuilt cold
+    # on that box and accepted for the window as the plan that held it was.
+    # The builder is deterministic, so this is the held rule; not an escape.
+    resumed = same = 0
+    for spec in rows:
+        held = rules.get(spec["name"], {}).pop("held_rule", None)
+        if held is None:
+            continue
+        spec_eps = _spec_eps(spec, eps)
+        rule = (analytic_line_box_rule(held["rule_box"], spec_eps) if held["analytic_line"]
+                else _BOX_RULE_BUILDER(held["rule_box"], spec_eps,
+                                       mass_cap=_noise_amplification_cap()))
+        rules[spec["name"]]["fit"] = dict(
+            _accept_rule(spec, rule, spec_eps, rule_source="resume:sc-fixed"),
+            built=False, analytic_line=held["analytic_line"],
+            serve_ceiling_nodes=held["serve_ceiling_nodes"])
+        resumed += 1
+        same += rules[spec["name"]]["fit"]["node_digest"] == held["node_digest"]
     # From map 1 the rules are held: the plan's margin absorbs the map-to-map
     # motion (Na 8^3: the top state's +5 eV sits inside its 9.6 eV pad), and a
     # window is rebuilt only when its current box leaves its rule. Re-padding
@@ -1190,12 +1209,8 @@ def _fit_fixed_sc_rules(
     reasons_by_name = {}
     for spec in rows:
         entry = rules.get(spec["name"])
-        if entry is None or "fit" not in entry:
-            # A resumed SC process holds the window names and boxes, never a
-            # rule (``gw.sc_iteration._held_session``): it re-certifies here.
-            reasons_by_name[spec["name"]] = (
-                "escape: absent when the rules froze" if entry is None else
-                "escape: resumed process (rules are never stored)")
+        if entry is None:
+            reasons_by_name[spec["name"]] = "escape: absent when the rules froze"
             continue
         reasons = _box_escape_reasons(entry["fit"]["rule_box"], spec["box"])
         if bool(entry["fit"]["relative"]) != (spec["kind"] != "crossing"):
@@ -1257,8 +1272,11 @@ def _fit_fixed_sc_rules(
         # ``SC fixed quadrature recompute:`` line per window.
         session["rebuild_count"] = int(
             session.get("rebuild_count", 0)) + len(recomputed)
+    event = "extend" if reasons_by_name else "hold"
+    if resumed:
+        event += f", resume: {resumed} rules rebuilt on their held boxes ({same} node-identical)"
     return fits, fit_rows, receipt(
-        "frozen", fits, event=("extend" if reasons_by_name else "hold"),
+        "frozen", fits, event=event,
         rebuilt=(name for name in (spec["name"] for spec in rows) if name in recomputed),
         reasons=recomputed.items(), escaped=len(reasons_by_name))
 

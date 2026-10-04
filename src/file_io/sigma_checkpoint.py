@@ -113,13 +113,20 @@ def checkpointable(cubes):
     return all(cube is None or _spec(cube) is not None for cube in cubes.values())
 
 
+#: The classes a pickle of plain containers and numpy arrays names (numpy 1
+#: and 2 module paths); :class:`_PlainLoader` refuses every other one.
+_PLAIN_CLASSES = frozenset({
+    ("builtins", "complex"), ("numpy", "dtype"), ("numpy", "ndarray"),
+    *((f"numpy.{core}.{mod}", name) for core in ("core", "_core")
+      for mod, name in (("multiarray", "_reconstruct"), ("multiarray", "scalar"),
+                        ("numeric", "_frombuffer")))})
+
+
 class _PlainLoader(pickle.Unpickler):
     """Unpickle plain containers and numpy arrays; refuse every other class."""
 
     def find_class(self, module, name):
-        if ((module.split(".")[0] == "numpy"
-             and name in ("_reconstruct", "ndarray", "dtype", "scalar", "_frombuffer"))
-                or (module == "builtins" and name == "complex")):
+        if (module, name) in _PLAIN_CLASSES:
             return super().find_class(module, name)
         raise pickle.UnpicklingError(
             f"checkpoint state holds {module}.{name}; only plain containers "
@@ -130,50 +137,71 @@ def _plain_loads(data):
     return _PlainLoader(io.BytesIO(data)).load()
 
 
-def write_sigma_checkpoint(path, *, identity, cubes, host, mesh,
+def _cubes_sha256(f, names):
+    """One digest of the stored cube bytes, read slice by slice (mesh-free)."""
+    digest = hashlib.sha256()
+    for name in sorted(names):
+        ds = f[name]
+        digest.update(f"{name}{ds.dtype}{ds.shape}".encode())
+        for i in range(ds.shape[0]):
+            digest.update(np.ascontiguousarray(ds[i]).tobytes())
+    return digest.hexdigest()
+
+
+def write_sigma_checkpoint(path, *, identity, cubes, mesh, host=None,
                            schema=SCHEMA, state=None):
     """Write the cubes, host record and optional ``state`` collectively.
 
-    Returns (bytes, seconds). ``state`` is pickled (plain containers only).
+    Every rank writes its cube shards; rank 0 then adds the record (cube and
+    state digests) and the commit, and the file is published atomically
+    (``collective_atomic_file_transaction``). ``state`` is pickled on rank 0
+    (plain containers only, round-tripped through :func:`_plain_loads`).
+    Returns (bytes, seconds).
     """
-    import os
     import time
     import h5py
-    from common.collectives import rank0_transaction
+    from common.collectives import collective_atomic_file_transaction, process_rank
     from .slab_io import SlabIO
 
-    path = Path(path)
-    partial = path.with_name(path.name + ".partial")
     started = time.monotonic()
-    blob = None
-    if state is not None:
-        blob = pickle.dumps(state, protocol=pickle.HIGHEST_PROTOCOL)
-        _plain_loads(blob)
-    rank0_transaction(partial, stage="checkpoint.clear",
-                      write=lambda: partial.unlink(missing_ok=True))
     present = {name: cube for name, cube in cubes.items() if cube is not None}
-    with SlabIO(str(partial), mode="w", mesh=mesh) as io:
-        for name, cube in present.items():
-            io.create_dataset(name, shape=tuple(cube.shape), dtype=cube.dtype)
-            io.write_slab(name, cube)
-    record = dict(schema=schema, identity=identity,
-                  cubes={name: dict(shape=list(cube.shape), dtype=str(cube.dtype),
-                                    spec=_spec(cube))
-                         for name, cube in present.items()},
-                  host=host,
-                  state_sha256=None if blob is None else hashlib.sha256(blob).hexdigest())
-    text = _json(record)
+    sizes = [0]
 
-    def commit():
-        with h5py.File(partial, "a") as f:
+    def write(staging):
+        with SlabIO(str(staging), mode="w", mesh=mesh) as io:
+            for name, cube in present.items():
+                io.create_dataset(name, shape=tuple(cube.shape), dtype=cube.dtype)
+                io.write_slab(name, cube)
+        if process_rank() != 0:
+            return
+        blob = None
+        if state is not None:
+            blob = pickle.dumps(state, protocol=pickle.HIGHEST_PROTOCOL)
+            _plain_loads(blob)
+            sizes[0] = len(blob)
+        with h5py.File(staging, "a") as f:
+            record = dict(
+                schema=schema, identity=identity,
+                cubes={name: dict(shape=list(cube.shape), dtype=str(cube.dtype),
+                                  spec=_spec(cube)) for name, cube in present.items()},
+                host=host, cubes_sha256=_cubes_sha256(f, present),
+                state_sha256=None if blob is None else hashlib.sha256(blob).hexdigest())
+            text = _json(record)
             if blob is not None:
                 f.create_dataset("state", data=np.frombuffer(blob, np.uint8))
             f.create_dataset("record", data=np.bytes_(text))
             f.attrs["commit"] = hashlib.sha256(text.encode()).hexdigest()
-        os.replace(partial, path)
-    rank0_transaction(path, stage="checkpoint.commit", write=commit)
+
+    def validate(staging):
+        with h5py.File(staging, "r") as f:
+            text = f["record"][()]
+            if hashlib.sha256(bytes(text)).hexdigest() != str(f.attrs["commit"]):
+                raise ValueError("checkpoint record does not match its commit")
+
+    collective_atomic_file_transaction(path, stage="checkpoint.write", write=write,
+                                       validate_file=validate)
     nbytes = sum(int(np.prod(c.shape)) * np.dtype(c.dtype).itemsize for c in present.values())
-    return nbytes + (0 if blob is None else len(blob)), time.monotonic() - started
+    return nbytes + sizes[0], time.monotonic() - started
 
 
 def discard_sigma_checkpoint(path):
@@ -185,36 +213,37 @@ def discard_sigma_checkpoint(path):
 
 
 def read_sigma_checkpoint(path, *, identity, mesh, print_fn=print,
-                          schema=SCHEMA, discard=True):
-    """Return ``(cubes, host, state)`` for an authenticated checkpoint, else
-    ``(None, reason)``.
+                          schema=SCHEMA, discard=True, cubes=True):
+    """Return ``(cubes, host, state, commit)`` for an authenticated
+    checkpoint, else ``(None, reason)``.
 
-    Rank 0 decides. A partial or foreign file is removed (``discard``) so the
-    caller recomputes; with ``discard=False`` it is left in place and the
-    reason names the identity fields that differ.
+    Rank 0 checks the commit, the cube digest and the identity, and returns
+    the commit; every rank then checks that the record it reads carries that
+    commit. A partial or foreign file is removed (``discard``) so the caller
+    recomputes; with ``discard=False`` it is left in place and the reason
+    names the identity fields that differ. ``cubes=False`` defers the cubes
+    to :func:`read_checkpoint_cubes`.
     """
     import h5py
-    from jax.sharding import PartitionSpec as P
     from common.collectives import agree_io_error, rank0_transaction
-    from .slab_io import SlabIO
 
     path = Path(path)
 
     def check():
         if not path.exists():
-            return "absent"
+            return ["absent", None]
         try:
             with h5py.File(path, "r") as f:
-                text = f["record"][()]
-                commit = f.attrs["commit"]
-            text = text.decode() if isinstance(text, bytes) else str(text)
-            commit = commit.decode() if isinstance(commit, bytes) else str(commit)
-            record = json.loads(text)
-            if (hashlib.sha256(text.encode()).hexdigest() != commit
-                    or record.get("schema") != schema):
-                reason = "partial or other schema"
+                text = bytes(f["record"][()])
+                commit = str(f.attrs["commit"])
+                record = json.loads(text)
+                sound = (hashlib.sha256(text).hexdigest() == commit
+                         and record.get("schema") == schema
+                         and record.get("cubes_sha256") == _cubes_sha256(f, record["cubes"]))
+            if not sound:
+                reason = "partial, corrupt or other schema"
             elif record.get("identity") == identity:
-                return "match"
+                return ["match", commit]
             elif isinstance(identity, dict) and isinstance(record.get("identity"), dict):
                 got = record["identity"]
                 reason = "identity differs: " + ", ".join(
@@ -225,10 +254,10 @@ def read_sigma_checkpoint(path, *, identity, mesh, print_fn=print,
             reason = "unreadable or partial"
         if discard:
             path.unlink()
-            return f"removed ({reason})"
-        return reason
-    verdict = rank0_transaction(path, stage="checkpoint.check", write=check,
-                                return_value=True)
+            return [f"removed ({reason})", None]
+        return [reason, None]
+    verdict, commit = rank0_transaction(path, stage="checkpoint.check", write=check,
+                                        return_value=True)
     if verdict.startswith("removed"):
         print_fn(f"WARNING checkpoint: {verdict} {path}; recomputing")
     if verdict != "match":
@@ -236,8 +265,10 @@ def read_sigma_checkpoint(path, *, identity, mesh, print_fn=print,
     record, state, error = None, None, None
     try:
         with h5py.File(path, "r") as f:
-            text = f["record"][()]
-            record = json.loads(text.decode() if isinstance(text, bytes) else str(text))
+            text = bytes(f["record"][()])
+            if hashlib.sha256(text).hexdigest() != commit:
+                raise ValueError("checkpoint changed between rank 0's check and this read")
+            record = json.loads(text)
             if record.get("state_sha256") is not None:
                 blob = f["state"][()].tobytes()
                 if hashlib.sha256(blob).hexdigest() != record["state_sha256"]:
@@ -246,13 +277,38 @@ def read_sigma_checkpoint(path, *, identity, mesh, print_fn=print,
     except (OSError, KeyError, ValueError) as exc:
         error = exc
     agree_io_error(error, path=path, stage="checkpoint.record")
-    cubes = dict.fromkeys(CUBES) if schema == SCHEMA else {}
+    host = _decode(record["host"])
+    if not cubes:
+        return {}, host, state, commit
+    print_fn(f"checkpoint: authenticated {schema} state read from {path}")
+    return read_checkpoint_cubes(path, commit=commit, mesh=mesh), host, state, commit
+
+
+def read_checkpoint_cubes(path, *, commit, mesh):
+    """Every cube of an authenticated checkpoint, at its recorded spec.
+
+    ``shape=None`` lets SlabIO round the stored extent up to this mesh, so a
+    reader on another mesh gets its own padded carrier (zero past the data).
+    """
+    import h5py
+    from jax.sharding import PartitionSpec as P
+    from common.collectives import agree_io_error
+    from .slab_io import SlabIO
+
+    error = None
+    try:
+        with h5py.File(path, "r") as f:
+            text = bytes(f["record"][()])
+        if hashlib.sha256(text).hexdigest() != commit:
+            raise ValueError("checkpoint changed after it was authenticated")
+        record = json.loads(text)
+    except (OSError, KeyError, ValueError) as exc:
+        error = exc
+    agree_io_error(error, path=path, stage="checkpoint.cubes")
+    cubes = dict.fromkeys(CUBES) if record["schema"] == SCHEMA else {}
     with SlabIO(str(path), mode="r", mesh=mesh) as io:
         for name, meta in record["cubes"].items():
             spec = P(*[tuple(a) if isinstance(a, list) else a for a in meta["spec"]])
-            cubes[name] = io.read_slab(name, shape=tuple(meta["shape"]),
-                                       dtype=np.dtype(meta["dtype"]), mesh=mesh,
+            cubes[name] = io.read_slab(name, dtype=np.dtype(meta["dtype"]), mesh=mesh,
                                        partition_spec=spec)
-    host = _decode(record["host"])
-    print_fn(f"checkpoint: authenticated {schema} state read from {path}")
-    return cubes, host, state
+    return cubes

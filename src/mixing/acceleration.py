@@ -49,15 +49,22 @@ class AccelerationResult(NamedTuple):
 class AndersonState(NamedTuple):
     """Everything :func:`anderson_nojit` carries from one evaluation to the next.
 
-    ``pairs`` are the newest m + 1 evaluated ``(x, f)``, oldest first, the
-    last one current; ``best`` is the evaluated pair of least residual;
-    ``res`` every residual norm so far; ``fallback`` whether the next step is
-    the secant fallback.  The next iterate is a function of these alone, so a
-    fresh process handed this state continues the same trajectory.
+    ``X``/``F`` are the history stacks ``(m,) + shape`` in ring order
+    (``head``, ``filled``) and ``(x, f)`` the newest pair; ``best`` is the
+    evaluated pair of least residual, ``None`` when it lies in that window
+    (the first minimum of ``res`` locates it); ``res`` holds every residual
+    norm; ``fallback`` says whether the next step is the secant fallback.  The
+    next iterate is a function of these alone, so a fresh process handed this
+    state continues the same trajectory.
     """
 
-    pairs: tuple
-    best: tuple
+    X: object
+    F: object
+    head: int
+    filled: int
+    x: object
+    f: object
+    best: tuple | None
     res: tuple
     fallback: bool
 
@@ -350,15 +357,16 @@ def anderson_nojit(
     print_fn: Callable = None,
     entry_sharding=None,
     metric=None,
-    resume: AndersonState | None = None,
+    resume: Callable[[], AndersonState] | None = None,
     on_eval: Callable[[AndersonState], None] | None = None,
 ) -> AccelerationResult:
     """Anderson type II (Pulay/DIIS): ONE map evaluation per iteration.
 
-    ``on_eval`` receives the :class:`AndersonState` after every evaluation;
-    ``resume`` restores one and skips the evaluation of ``x0`` (which then
-    fixes only shape and layout), so the run continues at the step that state
-    implies, with ``maxit`` counting from the original first step.
+    ``on_eval`` receives the :class:`AndersonState` after every evaluation
+    but the budget's last; ``resume`` loads one (a callable, so the caller
+    keeps no reference to its buffers) and skips the evaluation of ``x0``,
+    which then fixes only shape and layout: the run continues at the step
+    that state implies, with ``maxit`` counting from the original first step.
 
     Every evaluated pair (x_i, f_i = G(x_i) - x_i) enters a history of the
     newest ``m + 1``; the next and only evaluation is at
@@ -425,36 +433,37 @@ def anderson_nojit(
     def _norm(v):
         return float(jnp.sqrt(jnp.sum(jnp.abs(_weighted(v)) ** 2)))
 
-    Xhist = _zeros_hist()
-    Fhist = _zeros_hist()
-    if resume is None:
+    fresh = resume is None
+    if fresh:
+        Xhist, Fhist, head, filled = _zeros_hist(), _zeros_hist(), 0, 0
         x = _entry(x0)
         f = _entry(residual_fn(x))
-        older, res_history, fallback = (), [_norm(f)], False
-        best = (x, f)
+        res_history, fallback, best = [_norm(f)], False, None
     else:
-        *older, (x, f) = [(_entry(a), _entry(b)) for a, b in resume.pairs]
-        res_history, fallback = list(resume.res), bool(resume.fallback)
-        best = tuple(_entry(v) for v in resume.best)
-    # The ring in chronological order from slot 0, as the loop leaves it
-    # (the window is rolled to that order before every solve).
-    for i, (a, b) in enumerate(older):
-        Xhist, Fhist = Xhist.at[i].set(a), Fhist.at[i].set(b)
-    head, filled = len(older) % m, len(older)
+        Xhist, Fhist, head, filled, x, f, best, res_history, fallback = resume()
+        res_history = list(res_history)
+    resume = None
+
+    def _best_in_window():
+        return int(np.argmin(res_history)) >= len(res_history) - 1 - filled
+
+    if best is None:  # in the window: the first minimum, as the loop keeps it
+        i = int(np.argmin(res_history)) - (len(res_history) - 1 - filled)
+        slot = (head - filled + i) % m
+        best = (x, f) if i == filled else (Xhist[slot], Fhist[slot])
     best_res = min(res_history)
     window_res = res_history[-(m + 1):]
 
     def _state():
-        order = [(head - filled + i) % m for i in range(filled)]
-        return AndersonState(
-            tuple((_entry(Xhist[i]), _entry(Fhist[i])) for i in order) + ((x, f),),
-            best, tuple(res_history), fallback)
+        return AndersonState(Xhist, Fhist, head, filled, x, f,
+                             None if _best_in_window() else best,
+                             tuple(res_history), fallback)
 
-    if resume is None:
+    if fresh:
         if res_history[0] <= tol:
             return AccelerationResult(x=x, residual_norms=jnp.array(res_history),
                                       iterations=0, converged=True)
-        if on_eval is not None:
+        if on_eval is not None and maxit > 0:
             on_eval(_state())
     mask_shape = (m,) + (1,) * len(shape)
 
@@ -494,7 +503,7 @@ def anderson_nojit(
         if res <= tol:
             return AccelerationResult(x=x, residual_norms=jnp.array(res_history),
                                       iterations=it + 1, converged=True)
-        if on_eval is not None:
+        if on_eval is not None and it + 1 < maxit:
             on_eval(_state())
 
     return AccelerationResult(x=x, residual_norms=jnp.array(res_history),
