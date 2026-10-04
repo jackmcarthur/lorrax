@@ -205,6 +205,8 @@ def band_character_and_moments(*, colors, moments_grid, velocity, wfn, sym,
     # Electrons in the window: the count, less one per (spinor) band below.
     nelec = float(wfn.num_electrons) - band_start
     width = params.get("occ_smearing_width_ry")
+    if width is None:   # QE's float count: 1e-5 noise picks the gap edge E_F sits at
+        nelec = float(round(nelec))
     kT, kT_note = ((float(width), "occ_smearing_width_ry") if width is not None
                    else (1.0e-4, "no occ_smearing_width_ry: insulator step at"))
     channels = [c.split(":", 1)[1] for c in colors if c.startswith("orbital:")]
@@ -360,8 +362,10 @@ def band_character_and_moments(*, colors, moments_grid, velocity, wfn, sym,
             f"  max occupation of the top returned band = {f_top:.2e}",
         ]
         if f_top > 1e-6:
-            lines.append("  WARNING: the returned window is not empty at "
-                         "its top; raise ncond")
+            raise ValueError(
+                f"GATE htransform_moments_window: the top returned band holds "
+                f"occupation {f_top:.2e} > 1e-6, so the fixed-N sums are "
+                f"biased; fix: raise ncond")
         stats = jax.local_devices()[0].memory_stats() or {}
         lines.append(f"  device peak (rank 0, whole run so far): "
                      f"{stats.get('peak_bytes_in_use', 0) / 2**30:.2f} GiB")
