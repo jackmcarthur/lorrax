@@ -1882,10 +1882,17 @@ def _stream_workspace(wfns, meta, mesh_xy, support, *, q_ids, n_outputs, ordered
 
 
 def _unitary_inversion(plan):
-    """The plan's spatial row equal to -1 with a complete centroid map, or ``None``."""
+    """The plan's spatial row equal to -1 with a complete centroid map, or ``None``.
+
+    The row must be one the symmetry layer authorizes as unitary
+    (``SymMaps.active_symmetry_rows``, INVARIANTS 16): where QE types inversion
+    with time reversal (a PT-symmetric antiferromagnet) inversion alone is no
+    symmetry, so it supplies no chi_{-q} and the -q rows are streamed.
+    """
     ops, perm = np.asarray(plan.spatial_ops), np.asarray(plan.sym_perm)
-    rows = [r for r in range(int(plan.n_sym_spatial))
-            if np.array_equal(ops[r], -np.eye(3, dtype=ops.dtype)) and np.all(perm[r] >= 0)]
+    permitted = set() if plan.sym is None else set(np.asarray(plan.sym.active_symmetry_rows).tolist())
+    rows = [r for r in range(int(plan.n_sym_spatial)) if r in permitted
+            and np.array_equal(ops[r], -np.eye(3, dtype=ops.dtype)) and np.all(perm[r] >= 0)]
     return rows[0] if rows else None
 
 
