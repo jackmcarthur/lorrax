@@ -363,7 +363,7 @@ def _fit_mubatch(
     # analytic price; its executable is checked before the first batch runs
     # (runtime.aot_memory.check_chunk), the widest orbit the smallest chunk.
     # The lookahead batch keeps one more output live.
-    from runtime.aot_memory import agreed_chunk, check_chunk
+    from runtime.aot_memory import check_chunk
     n_pg_plan = int(plan.r_sub)
     at = lambda c: plan.working_set(P_ * c, n_pg_plan, *route_g_plane_chunk(plan, c, P_))
     ws0 = plan.working_set(0, n_pg_plan, 0, 1)
@@ -378,10 +378,9 @@ def _fit_mubatch(
             fixed=at(c_plan) - c_plan * slope - ws0, per_unit=slope,
             room=plan.target_bytes - ws0,
             extra=lambda c, compiled: int(compiled.memory_analysis().output_size_in_bytes))
-    # Each rank read its own figure: every rank runs the smallest chunk.
-    agreed = agreed_chunk(check.chunk)
-    if agreed not in builds:
-        build(agreed)
+    # check_chunk compares the largest figure any rank read, so every rank
+    # built and returns the same chunk.
+    agreed = check.chunk
     mb, c_out, n_blk, kern_args, kernel, batch_executable = builds[agreed]
     # Over the room, the plane axis steps up in blocks while that lowers the
     # compiled batch (past that the source stage binds), in lockstep, so the

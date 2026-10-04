@@ -554,12 +554,12 @@ def compiled_new_bytes(compiled, *, extra: int = 0, platform: str | None = None)
 
 
 def agreed_chunk(chunk: int) -> int:
-    """The smallest of every rank's chunk (one small all-gather).
+    """The smallest of every rank's value (one small all-gather).
 
-    A compiled figure is read on each rank, so :func:`check_chunk` can choose
-    differently per rank (a cuFFT scratch query that came back 0 on one).
-    Every rank runs this chunk, so the programs and their collectives agree
-    (INVARIANTS 21).
+    A compiled figure is read on each rank and can differ between them (a
+    cuFFT scratch query that came back 0 on one), so :func:`check_chunk` and
+    :func:`step_up` compare the largest figure (``-agreed_chunk(-figure)``)
+    and every rank compiles and runs the same chunk (INVARIANTS 21).
     """
     import numpy as np
     from common.collectives import all_gather_processes
@@ -611,14 +611,18 @@ def check_chunk(chunk: int, *, build, fixed: float, per_unit: float, room: float
     No bisection: a chunk already at ``minimum``, or a second figure still
     over the room, prints one warning line
     (``common.gpu_utils.warn_over_budget``) and the stage runs at that chunk.
+    Every figure is the largest any rank read (:func:`agreed_chunk`) before
+    it is compared, so every rank recompiles, or not, in lockstep (INVARIANTS 21).
     """
     import time
     chunk = int(chunk)
     if compiled is None:
         compiled = build(chunk)
     analytic = int(fixed + chunk * per_unit)
+    figure = lambda c, ex: -agreed_chunk(-compiled_new_bytes(ex, extra=int(extra(c, ex)),
+                                                             platform=platform))
     started = time.perf_counter()
-    got = compiled_new_bytes(compiled, extra=int(extra(chunk, compiled)), platform=platform)
+    got = figure(chunk, compiled)
     seconds = time.perf_counter() - started
     from common.gpu_utils import warn_over_budget
     if got <= room or chunk <= minimum:
@@ -635,7 +639,7 @@ def check_chunk(chunk: int, *, build, fixed: float, per_unit: float, room: float
                   f"chunk {chunk} -> {solved}, recompiled once")
     compiled = build(solved)
     started = time.perf_counter()
-    again = compiled_new_bytes(compiled, extra=int(extra(solved, compiled)), platform=platform)
+    again = figure(solved, compiled)
     seconds += time.perf_counter() - started
     if again > room:
         warn_over_budget(f"{stage or 'compiled chunk'} (chunk {solved}, compiled)", again, room)

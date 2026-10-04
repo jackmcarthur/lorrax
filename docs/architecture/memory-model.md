@@ -324,6 +324,9 @@ the room, the slope is corrected from that one point,
 `per_unit = max(per_unit, (compiled − fixed)/chunk)`, the chunk solved
 directly, and compiled once more. There is no bisection; a chunk already at
 the stage's minimum, or a second figure still over the room, warns and runs.
+Each figure is the largest any rank read, so every rank recompiles, or not,
+together; a figure compared per rank would split the ranks between a compile
+and an all-gather, a silent hang (INVARIANTS 21).
 The direct stream's check compiles through the dispatch's own executable cache
 (`gw.response_bank._compiled`), so the checked executable is the one that runs.
 Reading a figure costs 0.01–0.07 s for the direct stream, 0.02–0.12 s for the

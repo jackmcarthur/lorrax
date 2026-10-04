@@ -314,8 +314,9 @@ the compiled figure implies (bytes a + b/n_blk through the last two figures),
 rounded up to the next count with fewer plane groups per block, while that
 lowers the compiled figure (every rank on the largest one), up to one plane
 group per block (CrI3 24×24 bispinor P16 currents, 0.3 % over at 50 blocks:
-63, where doubling took 100); a split that stays over the room warns and runs. Every rank runs
-the smallest chunk any rank chose (`runtime.aot_memory.agreed_chunk`).
+63, where doubling took 100); a split that stays over the room warns and runs. Every rank
+compares the largest figure any rank read (`runtime.aot_memory.agreed_chunk`), so all
+run one chunk.
 CrI3 8×8 charge, P4: packed c = 12 streamed at c_out = 3 put the route-G
 module's temp at 8.9 GB, where the unchunked all-plane cylinder alone was
 24.8 GB.
