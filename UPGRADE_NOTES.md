@@ -5,11 +5,28 @@ results move, and what a user must change in decks, environment or files.
 The binding rulings behind breaking changes are in
 `docs/architecture/decisions.md`; older history is in git.
 
+## 2026-10-03 — sector face rounds solve on the Ritz carrier; CT span widths are held from map 0
+
+The CC/TT face reduction solves its kept span on `face_ritz_carrier` (the
+pole budget, per-rank tile on the extent ladder), as the scalar face route
+already did, and the sector batch is sized with it: the Schur and final eighs
+run at the carrier and twice it instead of at H'_vv's side and the pencil
+side (CrI3 24×24 bispinor P64: TT 9216/18432 instead of 12416/24832, whose
+24832 stack ran on the whole mesh; CC 6144/12288 instead of 8736/17472). The
+CT round's retained CC/TT span widths are held from SC map 0, so later
+rounds and map 1 no longer recompile the CT reduction as the widths regrow.
+Results: Fe 4^3 forced-face bispinor SC maps 0-2, eqp0 bitwise at map 0 and
+within 0.077 µeV at maps 1-2; W response 197.0 / 62.9 / 13.5 s against
+196.1 / 66.9 / 14.6 s (carrier). The CT binding on top is bitwise at maps
+0-1 and within 0.032 µeV at map 2; map 1's CT stage drops from 20.0 to
+14.2 s (W response 55.7 s against 62.9 s). Decks do not change.
+
 ## 2026-10-03 — the CC/TT/CT face batch is admitted by its compiled size
 
 The bispinor sector constructor on the face route admits its parent batch by
 the largest compiled size of the round's three whole-chain programs at the
-conservative shapes (CC's and TT's reduction, CT's cross reduction), beside
+conservative shapes (CC's and TT's reduction, on the Ritz carrier since the
+entry above, and CT's cross reduction), beside
 the resident sector models, as the scalar face batch already was. Every CC,
 TT and CT eigh stack is decided against the room beside that batch row, which
 bounds every round's retry. Each face model check of the scalar constructor
