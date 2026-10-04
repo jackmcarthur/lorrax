@@ -511,8 +511,9 @@ def resolve_qe_symmetry_binding(
         paths_text = ", ".join(binding.schema_path for binding in bindings)
         raise ValueError(
             "Multiple QE schemas authenticate the WFN but disagree on "
-            f"antiunitary operation typing: {paths_text}. Pass qe_schema=... "
-            "for the WFN-generating NSCF schema.")
+            f"antiunitary operation typing: {paths_text}. Keep only the "
+            "WFN-generating NSCF *.save beside WFN.h5 (its directory and the "
+            "two above it).")
 
     def rank(binding: QESymmetryBinding) -> tuple[int, int, str]:
         path = binding.schema_path

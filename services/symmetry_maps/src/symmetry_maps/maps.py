@@ -2252,8 +2252,8 @@ class SymMaps:
                 "interpretation plus the global DFT-reference TRS verdict. "
                 "RESULTS WILL BE WRONG if time reversal is broken and QE "
                 "used an antiunitary magnetic-space-group operation. "
-                "Co-stage the WFN-generating QE *.save directory or pass "
-                "WfnLoader(..., qe_schema=...).",
+                "Co-stage the WFN-generating QE *.save directory beside "
+                "WFN.h5.",
                 RuntimeWarning)
 
     def _initialize_active_operations(self, wfn):
@@ -2501,10 +2501,12 @@ class SymMaps:
             import warnings as _warnings
             if self.qe_symmetry_binding is None:
                 _warnings.warn(
-                    "SymMaps: the two-component DFT reference says GLOBAL "
-                    "TIME-REVERSAL SYMMETRY IS BROKEN. With no authenticated QE "
-                    "operation typing, only the WFN header's presumed-unitary "
-                    "rows may map the full BZ; an incomplete map refuses.",
+                    "SymMaps: global time reversal is OFF for this WFN (the "
+                    "[2c-TRS] line gives QE's reason, or that no QE schema "
+                    "or SCF was found beside WFN.h5). With no authenticated "
+                    "QE operation typing, only the WFN header's "
+                    "presumed-unitary rows may map the full BZ; an incomplete "
+                    "map refuses.",
                     RuntimeWarning)
             else:
                 _warnings.warn(
@@ -2740,14 +2742,15 @@ class SymMaps:
             raise ValueError(
                 f"SymMaps: {n_bad} of {full_kpts.shape[0]} full-BZ k-points "
                 f"cannot be reached from the IBZ using the SPATIAL symmetry "
-                f"operations alone, and the DFT reference check says "
-                f"time-reversal symmetry is BROKEN for these wavefunctions "
-                f"(occupied-subspace residual above tolerance), so the "
-                f"time-reversal rows must not be used. This WFN's k-mesh was "
-                f"reduced with an assumption its own wavefunctions "
-                f"contradict; regenerate it with `noinv=.true.` (or fix the "
-                f"magnetic ground state). The measured verdict cannot be "
-                f"overridden by an input or environment key."
+                f"operations alone, and global time reversal is OFF for this "
+                f"WFN (the [2c-TRS] line gives QE's reason: a t_rev row, an "
+                f"SCF moment of 1e-4 muB/cell or more, or no QE schema or "
+                f"SCF found), so k <-> -k folding must not be used. Fix: for "
+                f"a nonmagnetic reference, co-stage the WFN-generating NSCF "
+                f"*.save and its SCF *.save beside WFN.h5 (its directory or "
+                f"the two above it); for a magnet, regenerate the k mesh "
+                f"without time-reversal reduction. Doc: "
+                f"docs/preprocessing.md#magnetic."
             )
 
         if self.trs_allowed and not np.all(matched):
