@@ -322,7 +322,11 @@ are excluded: a numerical null direction carries no resolved response and must
 not be amplified by Gram equilibration. Only the actions
 $O_a=W_c(z_a)Q_a$ and $D_a=\partial_sW_c(z_a)Q_a$ reach the pencil. A line
 support's conjugate partner is not a new sample: $W(\bar s)=W(s)^\dagger$ gives
-its action from $O_a$.
+its action from $O_a$. An imaginary support of the even pencil acts with
+$\operatorname{Herm}W_c(iu)$, the even part $\tfrac12[W(iu)+W(-iu)]$ by (W 3).
+Its anti-Hermitian rest $A$ is the odd channel, which the even model does not
+carry; left in $O_a$, (W 18) reads it as $(A_a+A_b)/(s_b-s_a)$, which does not
+cancel and has no sign.
 
 ### 5.2 The Hermite pencil
 
