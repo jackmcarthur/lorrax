@@ -585,9 +585,16 @@ def _odd_moment_ratios(M0, M1, M2, M3):
 
 @lru_cache(maxsize=8)
 def _anti_hermitian_ratios(mesh_xy):
-    """Per-parent max|A - A^H| / max|A| of face-tiled [b, n, n] stacks, replicated."""
+    """Per-parent max|A - A^H| / max|A| of face-tiled [b, n, n] stacks, replicated.
+
+    A^H through the transpose partner (``common.collectives.transpose_xy``):
+    a swapaxes under this replicated output all-gathered every stack (2x2
+    host mesh: 8 all-gathers, 18x one face stack of temp; 0 and 3.5x).
+    """
+    from common.collectives import transpose_xy
+
     def ratio(a):
-        defect = jnp.max(jnp.abs(a - jnp.conj(jnp.swapaxes(a, -1, -2))), axis=(-2, -1))
+        defect = jnp.max(jnp.abs(a - jnp.conj(transpose_xy(a, mesh_xy))), axis=(-2, -1))
         scale = jnp.max(jnp.abs(a), axis=(-2, -1))
         return jnp.where(scale > 0, defect / jnp.where(scale > 0, scale, 1), 0)
     return jax.jit(lambda *stacks: jnp.stack([ratio(a) for a in stacks]),
