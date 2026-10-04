@@ -18,6 +18,7 @@ from typing import Optional
 from common.gpu_utils import bfc_fragmentation_target_utilization
 from gw import comm_model
 from runtime.padding import padded_axis
+from runtime.tiles import tile_units
 
 
 _C128 = 16  # bytes per complex128
@@ -269,9 +270,13 @@ def plan_zeta_route_g(*, meta, mesh_xy, n_q_selected: int, ngkmax: int,
         d_g = 2 * _c128(n_p, ns, b, ns, Gp)                 # D~ L+R, one copy
         n_pc = p_chunk(b)
         return [
-            dict(rows, **{"X_B (one parent chunk)": 2 * _c128(n_pc, nb, ns, b) + _c128(n_pc, Gp, b),
-                          # the owner's D~ and one chunk's all-to-all in and out
-                          "pair projectors (owner + chunk)": d_g * (1 + 2 * n_pc / n_p)}),
+            # one parent chunk: X_B, its psum and the two weighted copies, the
+            # phases, the ψ slice and its conj
+            dict(rows, **{"X_B and ψ (one parent chunk)": 3 * _c128(n_pc, nb, ns, b) + _c128(n_pc, Gp, b)
+                                                         + 2 * _c128(n_pc, nb, ns, Gp),
+                          # the owner's D~ and one chunk's all-to-all in and out; one
+                          # chunk is a pad of the all-to-all output, two copies as before
+                          "pair projectors (owner + chunk)": d_g * (1 + min(1.0, 2 * n_pc / n_p))}),
             dict(rows, **{"pair projectors (owner)": d_g,
                           "D cylinder (plane block)": _c128(nk, n_ap, ns, 2 * co, ns, n_col)
                           + _c128(ns, 2 * co, ns, n_col, n_s)}),
@@ -286,9 +291,12 @@ def plan_zeta_route_g(*, meta, mesh_xy, n_q_selected: int, ngkmax: int,
     def p_chunk(b):
         """Raw parents per stage-0 chunk: the fewest whose X_B psum and
         pair-projector all-to-all each reach the comm model's efficient
-        payload, so the owner's D~ is the only whole-batch source array."""
+        payload, at most one tile of X_B (runtime.tiles), balanced over the
+        parents, so the owner's D~ is the only whole-batch source array."""
         per = min(_c128(1, nb, ns, b), 2 * _c128(1, ns, b, ns, Gp))
-        return min(n_p, math.ceil(comm_model.min_efficient_payload(P_ - 1) / max(per, 1.0)))
+        n = math.ceil(comm_model.min_efficient_payload(P_ - 1) / max(per, 1.0))
+        n = min(n, tile_units(_c128(1, nb, ns, b), n_p))
+        return -(-n_p // -(-n_p // n))              # ceil(n_p / chunks): balanced
 
     def ws(b, n_pg, c_out=None, n_blk=1):
         return max(stages(b, n_pg, c_out, n_blk), key=lambda d: sum(d.values()))

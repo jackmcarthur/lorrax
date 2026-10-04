@@ -63,15 +63,16 @@ centroid orbits.
 ```
 
 Everything through the plane FFT depends only on ψ and the centroids, so the
-three current channels share it: one X_B, one pair GEMM, one all-to-all and
-one set of plane FFTs per batch, then one k-convolution, one accumulator and
-one Z store per channel. The charge fit is the same kernel with one channel.
+three current channels share it: one X_B, pair GEMM and all-to-all per
+parent chunk and one set of plane FFTs per batch, then one k-convolution,
+one accumulator and one Z store per channel. The charge fit is the same kernel with one channel.
 
 Each batch runs two collectives per parent chunk, the X_B psum and the
-pair-projector all-to-all; `LORRAX_DEBUG_PRINT=1` counts them from the
-compiled HLO. The chunk is the fewest parents whose psum and all-to-all
-each reach `comm_model.min_efficient_payload` (the planner's `p_chunk`;
-CrI3 24×24 bispinor: 1 parent, 61 chunks). Each chunk's all-to-all output
+pair-projector all-to-all; `LORRAX_DEBUG_PRINT=1` counts them per chunk
+from the compiled HLO. The chunk is the fewest parents whose psum and
+all-to-all each reach `comm_model.min_efficient_payload`, at most one tile
+of X_B (`runtime.tiles`), balanced over the parents (the planner's
+`p_chunk`; CrI3 24×24 bispinor: 1 parent, 61 chunks). Each chunk's all-to-all output
 is written into the owner's D̃, which is allocated once with the empty
 sphere slot's zero column, so the all-to-all never holds a second copy of
 D̃ and X_B is one chunk's. Every
@@ -251,7 +252,7 @@ the factors and the store are priced n_vertex times; everything else once.
 | sphere tables | 12·N_k·N'_G + 4·N_k·n_col·n_s + 8·Q·N_G | whole fit |
 | Z rows, current batch and one lookahead | 2·Q·c·N_G·16 | every stage |
 | X_B and its phase matrix, one parent chunk | 2·n_pc·n_b·ns·b·16 + n_pc·N'_G·b·16 | stage 1 |
-| pair projectors: the owner's D̃, one chunk's all-to-all in and out | 2·n_p·ns²·b·N'_G·16·(1 + 2n_pc/n_p) | stage 1 |
+| pair projectors: the owner's D̃, one chunk's all-to-all in and out | 2·n_p·ns²·b·N'_G·16·(1 + min(1, 2n_pc/n_p)) | stage 1 |
 | pair projectors on the owner | 2·n_p·ns²·b·N'_G·16 | stage 2 (and 3 when streamed) |
 | D cylinder, one plane block | N_k·(n_a'/n_blk)·ns²·2c_out·n_col·16 | stages 2–3 |
 | one plane group | 2·N_k·n_pg·ns²·2c_out·n_⊥·16 | stage 3 |

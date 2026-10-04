@@ -444,13 +444,15 @@ def _fit_mubatch(
         return batch_executable(*launch_args(beta, mb))
 
     if debug_print_enabled():
-        # The collective count of one batch, read from the compiled HLO.
+        # The collectives of one batch, read from the compiled HLO: the
+        # stage-0 loop body's psum and all-to-all appear once and run per parent chunk.
         hlo = batch_executable.as_text()
         n_coll = {k: hlo.count(k + '(') + hlo.count(k + '-start(')
                   for k in ('all-to-all', 'all-reduce', 'all-gather',
                             'reduce-scatter', 'collective-permute')}
         if jax.process_index() == 0:
-            print_fn(f"[mubatch_dbg] route G collectives per batch (HLO): {n_coll}")
+            print_fn(f"[mubatch_dbg] route G collectives in the batch HLO (stage 0 once, run per "
+                     f"parent chunk): {n_coll}")
     with timing.section("zeta_fit.mubatch.loop"):
         # One batch of lookahead: β+1 is on the device while β is written.
         pending = launch(0)

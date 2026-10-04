@@ -192,8 +192,8 @@ vertex or Σ contraction compensates it.
 
 **ζ fits, by channel.** Every channel takes the μ-batch fit
 ([ζ μ-batch](zeta_fit_mubatch.md)). The three current channels are one fit
-on their own centroids: one ψ(G) read, then per batch one X_B, pair GEMM,
-all-to-all and set of plane FFTs shared by all three, and one k-convolution
+on their own centroids: one ψ(G) read, then one X_B, pair GEMM and
+all-to-all per parent chunk and one set of plane FFTs per batch, shared by all three, and one k-convolution
 (γ̃^{μ_L} on its load), accumulator and Z store per channel. Each channel
 keeps its own C_q^μ, its sign-aware ridged LU
 ([the solve seam](zeta_fit_mubatch.md#the-solve-seam)) and its canonical
