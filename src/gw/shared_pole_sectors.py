@@ -13,16 +13,17 @@ import jax.numpy as jnp
 from gw.shared_pole_pencil import _matrix_layout, _matrix_take_columns, _matrix_concat
 
 
-def _contiguous_q_spans(ids, real, limit=4):
+def _contiguous_q_spans(ids, real):
     """Canonical q spans from a (possibly permuted) constructor round.
 
-    The small limit bounds the extra public factor and store conversion panel;
-    the store still admits each panel against the current map capacity ledger.
+    A round's contiguous parents are one span: one store write per model and
+    round. Its public factor copy is the round's own factor's size, and the
+    store admits it against the current map capacity ledger.
     """
     ordered=sorted(range(real),key=lambda slot:ids[slot])
     spans=[]
     for slot in ordered:
-        if not spans or len(spans[-1])==limit or ids[slot]!=ids[spans[-1][-1]]+1:
+        if not spans or ids[slot]!=ids[spans[-1][-1]]+1:
             spans.append([])
         spans[-1].append(slot)
     return tuple((ids[slots[0]],ids[slots[-1]]+1,tuple(slots)) for slots in spans)
@@ -1361,6 +1362,11 @@ def sector_execution(meta, config, mu_bases, nq, *, mesh_xy, upstream):
         cross_original_sides=tuple(row['conservative_pencil_side'] for row in execution_rows),
         cross_retained_side=sum(min(row['signed_side_bound'],row['span_columns'])
                                 for row in execution_rows),carry=held)
+    if (joint_mode=='face' and int(nq)>=int(mesh_xy.size)
+            and joint_route['local_selection']['device_budget_status']=='PASS'):
+        # Whole q-local models per rank (owner 2026-10-03); the round admits the
+        # joint pencil at its actual spans, not both at twice their pole budgets.
+        joint_mode,joint_route='local',dict(joint_route,reason='parents >= ranks; actual-side joint pencil')
     resolved_execution=('face' if joint_mode=='face' or
                         any(row['mode']=='face' for row in execution_rows)
                         else 'local')

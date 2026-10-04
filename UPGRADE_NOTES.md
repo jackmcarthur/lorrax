@@ -5,6 +5,25 @@ results move, and what a user must change in decks, environment or files.
 The binding rulings behind breaking changes are in
 `docs/architecture/decisions.md`; older history is in git.
 
+## 2026-10-04 — bispinor sectors build whole q-local pole models per rank when parents ≥ ranks
+
+With at least as many irreducible q-parents as ranks, the bispinor CC/TT/CT
+sector constructor now runs local rounds: each rank builds its own parent's
+three models, ceil(nq/P) rounds. Before, the CT joint pencil's conservative
+price (both retained spans at twice their pole budgets) sent all three sectors
+to the face route. There the batch sizing admitted one parent per round, and
+every parent ran on the whole mesh in turn.
+- Ni 20³ bispinor SC, P64 on A100-40GB: the map-0 sector constructor takes
+  643 s in 11 rounds of 64 parents, against about 10,300 s (641 face rounds
+  of 16.1 s). The CT joint side is 3968–4352, against the conservative 10760.
+- Each round admits the CT pencil at its actual spans; a price over the budget
+  warns and runs. With fewer parents than ranks the old rule applies.
+- The models match main's local route bit for bit. Decks that move from face
+  to local change by the face/local difference: on Fe 4³, CT W(z) within
+  9.6e-7 relative at map 0 and eqp within 0.1 µeV.
+- A local round writes each model once (no 4-parent store span cap).
+- Decks do not change.
+
 ## 2026-10-04 — the two-component TRS check pairs k with −k only through QE-unitary rows
 
 The DFT-reference time-reversal check now takes the spatial operation that maps
