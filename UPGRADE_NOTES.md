@@ -5,6 +5,26 @@ results move, and what a user must change in decks, environment or files.
 The binding rulings behind breaking changes are in
 `docs/architecture/decisions.md`; older history is in git.
 
+## 2026-10-04 — the two-component TRS check pairs k with −k only through QE-unitary rows
+
+The DFT-reference time-reversal check now takes the spatial operation that maps
+a stored k to −k only from the rows QE types unitary (t_rev = 0). It used to
+take the first matching row, including the ones QE composes with time reversal.
+On a magnet where such a row maps k to −k before a unitary one does, the test
+compared Θg with g and passed by construction. Monolayer CrSBr (M ∥ b; QE's
+ΘC2z precedes inversion) is the case found: it reported TRS consistent at 6.6e-8
+on a 6 μB/cell ferromagnet. It then ran on the even shared-pole route, with −k
+and (kx, −ky) unfolded through false unitary C2z and C2x. Its q = 0 Gram refused
+(GATE shared_pole_gram_valid, −1.86e-6 at 16×12).
+- Now the check reads 0.29 and reports TRS broken. CrSBr takes the ordered
+  route: all 63 parents construct, and the q = 0 Gram minimum is −6.1e-12.
+- Any deck whose verdict flips moves from the even to the ordered route. No
+  other production deck in the sandbox flips: non-magnetic and schema-less
+  WFNs, CrI3 and the H2⁻ fixture keep their verdicts. Without a QE schema every
+  row is still presumed unitary, and SymMaps warns as before.
+- The cached verdict stamps carry the QE typing, so an old stamp is not reused.
+- Decks do not change.
+
 ## 2026-10-04 — half first Anderson step; the SC criterion pairs by sorted index
 
 The SC Anderson loop's first step is now half a plain step, x1 = x0 + f0/2.

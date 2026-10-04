@@ -33,7 +33,9 @@ loader attaches.
 `active_symmetry_rows` holds all \(2n_t\) rows when global time reversal
 holds. Otherwise it holds the QE-typed row of each operation, or only the
 unitary half when there is no receipt. The table keeps its \(2n_t\) rows
-either way; only the search set shrinks.
+either way; only the search set shrinks. The verdict's spatial k ↔ −k
+partners are only rows QE types unitary: a QE-antiunitary row \(g\) applied as
+unitary tests \(\Theta g\), which passes on any magnet that has it.
 
 Consumers read the typed accessors, never `R_cart` or a determinant:
 
