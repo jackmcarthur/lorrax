@@ -69,10 +69,7 @@ class WavefunctionBasisReceipt:
     bispinor_lift_provenance: str | None
 
     def __post_init__(self) -> None:
-        from common.bispinor_init import (
-            ISOMETRIC_KINETIC_BALANCE_LIFT_PROVENANCE,
-            KINETIC_BALANCE_LIFT_PROVENANCE,
-        )
+        from common.bispinor_init import LIFT_PROVENANCE
         from common.parallel_transport import WFN_FINGERPRINT_SCHEME
         from common.wfn_transforms import FULL_BLOCH_TRANSFORM_SCHEME
 
@@ -128,11 +125,7 @@ class WavefunctionBasisReceipt:
         lift = self.bispinor_lift_provenance
         if lift is not None:
             lift = str(lift)
-        if lift not in (
-            None,
-            KINETIC_BALANCE_LIFT_PROVENANCE,
-            ISOMETRIC_KINETIC_BALANCE_LIFT_PROVENANCE,
-        ):
+        if lift is not None and lift not in LIFT_PROVENANCE.values():
             raise ValueError(
                 "WavefunctionBasisReceipt has an unknown sampled-spinor "
                 f"transform {lift!r}")

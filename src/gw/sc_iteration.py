@@ -2430,8 +2430,8 @@ def rebuild_hartree_dft_basis(inputs, U_qp, occupations_full,
     representation = resolve_four_current_representation(
         bool(inputs.config.bispinor), inputs.config.bispinor_gw)
     include_current = bool(representation.current_bispinor)
-    charge_ns = (int(psi_G.shape[2]) if representation.charge_bispinor
-                 else int(inputs.wfn.nspinor))
+    # The charge is psi_L (docs/theory/bispinor-gw.md#lift).
+    charge_ns = int(inputs.wfn.nspinor)
     # One density-scan shape per SC run: the rotated band count only grows
     # (a metal's occupied count drifts map to map; Fe 4^3 map 2 recompiled).
     from .qsgw_density import density_active_band_count

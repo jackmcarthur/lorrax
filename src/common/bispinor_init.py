@@ -39,6 +39,15 @@ ISOMETRIC_KINETIC_BALANCE_LIFT_PROVENANCE = (
 )
 RAW_KINETIC_BALANCE_LIFT = "raw"
 ISOMETRIC_KINETIC_BALANCE_LIFT = "isometric"
+# The charge carrier (docs/theory/bispinor-gw.md#lift): the Pauli spinor in
+# the large block, zero small block.  The Coulomb kernel's O(c^-2) terms are
+# in the fully relativistic pseudopotential already.
+LARGE_BLOCK_LIFT = "large"
+LIFT_PROVENANCE = {
+    RAW_KINETIC_BALANCE_LIFT: KINETIC_BALANCE_LIFT_PROVENANCE,
+    ISOMETRIC_KINETIC_BALANCE_LIFT: ISOMETRIC_KINETIC_BALANCE_LIFT_PROVENANCE,
+    LARGE_BLOCK_LIFT: "Psi=[psi_L;0]",
+}
 DIRAC_ALPHA_VERTEX_PROVENANCE = (
     "j=c*psi^dagger*alpha*psi; raw_paramagnetic_vertex_no_contact"
 )
@@ -47,14 +56,11 @@ DIRAC_ALPHA_VERTEX_PROVENANCE = (
 def kinetic_balance_lift_provenance(representation: str) -> str:
     """Return the authenticated provenance for one lift selector."""
     mode = str(representation).strip().lower()
-    if mode == RAW_KINETIC_BALANCE_LIFT:
-        return KINETIC_BALANCE_LIFT_PROVENANCE
-    if mode == ISOMETRIC_KINETIC_BALANCE_LIFT:
-        return ISOMETRIC_KINETIC_BALANCE_LIFT_PROVENANCE
-    raise ValueError(
-        f"unknown kinetic-balance representation {representation!r}; "
-        f"expected {RAW_KINETIC_BALANCE_LIFT!r} or "
-        f"{ISOMETRIC_KINETIC_BALANCE_LIFT!r}")
+    if mode not in LIFT_PROVENANCE:
+        raise ValueError(
+            f"unknown kinetic-balance representation {representation!r}; "
+            f"expected one of {sorted(LIFT_PROVENANCE)}")
+    return LIFT_PROVENANCE[mode]
 
 
 def apply_dirac_velocity_to_ket(psi):
@@ -160,6 +166,9 @@ def kinetic_balance_lift_jet(
     # returned string unused is deliberate: this numerical helper does not
     # manufacture an artifact identity.
     kinetic_balance_lift_provenance(mode)
+    if mode == LARGE_BLOCK_LIFT:
+        raise ValueError("kinetic_balance_lift_jet: the large-block charge "
+                         "carrier has no kinetic-balance K jet")
     axes = (None if cartesian_K_derivative_axes is None else tuple(
         int(axis) for axis in cartesian_K_derivative_axes))
     if axes is not None and len(axes) not in (1, 2):
@@ -255,6 +264,7 @@ def lift_to_4spinor(
 
     Appends ``ψ_S = (α/2)(σ·(k+G)) ψ_L`` to the large components.
     The default ``representation='raw'`` is the historical map, unchanged.
+    ``representation='large'`` appends zeros (the charge carrier).
     ``representation='isometric'`` applies the pointwise scalar
 
     ``r(G) = 1/sqrt(1 + [(α/2)|k+G|]^2)``
@@ -286,19 +296,17 @@ def lift_to_4spinor(
     (n_k, nb, 4, ngkmax) complex
         4-spinor ψ: ``[ψ_L ; ψ_S]`` along the spinor axis.
     """
+    mode = str(representation).strip().lower()
+    kinetic_balance_lift_provenance(mode)
+    if mode == LARGE_BLOCK_LIFT:
+        return jnp.concatenate([psi_2, jnp.zeros_like(psi_2)], axis=2)
     # (k + G) in cartesian, per (k, g).
     pkG = gvecs + kvecs[:, None, :]                          # (n_k, ngkmax, 3)
     p_cart = pkG @ bvec_cart_bohr                             # (n_k, ngkmax, 3)
     psi_S = jnp.complex128(HALFALPHA) * sigma_dot_cartesian(
         psi_2, p_cart)
     lifted = jnp.concatenate([psi_2, psi_S], axis=2)
-    mode = str(representation).strip().lower()
     if mode == RAW_KINETIC_BALANCE_LIFT:
         return lifted
-    if mode != ISOMETRIC_KINETIC_BALANCE_LIFT:
-        raise ValueError(
-            f"unknown kinetic-balance representation {representation!r}; "
-            f"expected {RAW_KINETIC_BALANCE_LIFT!r} or "
-            f"{ISOMETRIC_KINETIC_BALANCE_LIFT!r}")
     r = _isometric_kinetic_balance_factor(p_cart)
     return lifted * r[:, None, None, :]

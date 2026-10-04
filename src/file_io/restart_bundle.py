@@ -2522,20 +2522,14 @@ def validate_kin_ion_against_run(
 	representation = resolve_four_current_representation(
 		expected_bispinor, expected_bispinor_gw_mode)
 	if expected_bispinor:
-		for attr, expected in (
-			("charge_representation", representation.charge_representation),
-			("spatial_current_representation",
-			 representation.spatial_current_representation),
-		):
-			stored = attrs.get(attr)
-			if stored is not None and str(stored) != str(expected):
-				raise ValueError(
-					f"kin_ion.h5 {attr}={stored!r}, expected {expected!r}.")
-		# No per-mode ``bispinor_gw_mode`` check: both shipped values ride
-		# the one raw kinetic-balance carrier, so the two representation
-		# attrs above ARE the carrier identity.  A file written by one of
-		# the two retired carrier-comparison modes (2026-09-01) carries a
-		# different ``charge_representation`` and is refused there.
+		# kin_ion is an operator on psi_L, so no charge carrier enters it;
+		# only a pre-2026-09-02 file still carries a current stamp.
+		attr = "spatial_current_representation"
+		expected = representation.spatial_current_representation
+		stored = attrs.get(attr)
+		if stored is not None and str(stored) != str(expected):
+			raise ValueError(
+				f"kin_ion.h5 {attr}={stored!r}, expected {expected!r}.")
 
 	stored_sys_dim = attrs.get("sys_dim")
 	if (sys_dim is not None and stored_sys_dim is not None

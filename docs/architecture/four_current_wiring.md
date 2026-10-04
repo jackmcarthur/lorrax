@@ -89,7 +89,7 @@ flowchart TD
   end
   subgraph INIT["gw_init"]
     C["charge + current centroids"]
-    L["four-spinor parents (raw kinetic-balance lift)"]
+    L["four-spinor parents (charge: large block; current: raw kinetic-balance lift)"]
     Z["zeta_q.h5 + zeta_q_mu{1,2,3}.h5"]
     VQ["v_q_bispinor.h5: 7 unique tiles + photon_g0_vectors"]
   end
@@ -153,8 +153,8 @@ returns a frozen `FourCurrentRepresentation` with the fields
 `charge_bispinor`, `charge_lift`, `current_bispinor`, `current_lift`,
 `scalar_head_bispinor`, `charge_representation` and
 `spatial_current_representation`. It has two outcomes: scalar (all false,
-source-WFN charge) and bispinor (raw kinetic-balance lift for both
-families). `model` is accepted and ignored. The resolver exists because the
+source-WFN charge) and bispinor (charge on the large block $(\psi_L,0)$,
+currents on the raw kinetic-balance lift; [theory](../theory/bispinor-gw.md#lift)). `model` is accepted and ignored. The resolver exists because the
 representation strings are the provenance stamps that the `dipole.h5`,
 `kin_ion.h5` and ζ authenticators compare, and they need one producer. It
 is not stored on the config: consumers call it, so grep for the function
@@ -166,7 +166,7 @@ name.
 |---|---|---|---|---|
 | charge centroids | `file_io.centroids.load_centroid_basis` | `(n_C, 3)` | host | all |
 | current centroids and `meta_transverse` | `gw_init` (refuses without `centroids_file_current`) | `(n_T, 3)` i32; `Meta` with `n_rmu = n_T`, `nspinor = npol = 4`, orbit-packed basis | host | all |
-| four-spinor ψ | `common.bispinor_init.lift_to_4spinor` (via `WfnLoader`) | `(n_k, n_b, 4, n_G)` c128, $[\psi_L;\ (\alpha_{FS}/2)\sigma\cdot(k+G)\psi_L]$ | caller's | all |
+| four-spinor ψ | `common.bispinor_init.lift_to_4spinor` (via `WfnLoader`) | `(n_k, n_b, 4, n_G)` c128; current $[\psi_L;\ (\alpha_{FS}/2)\sigma\cdot(k+G)\psi_L]$, charge $[\psi_L;\ 0]$ | caller's | all |
 | parent faces | `wavefunction_bundle.ParentGreenCarrier`, separate C and T families | `psi_nmu (n_parent, n_b, 4, μ)`, `psi_mun (n_parent, 4, μ, n_b)` | `P(None,'x',None,'y')`, `P(None,None,'x','y')` | all |
 | charge ζ | `isdf_fitting.fit_zeta_to_h5` | `tmp/zeta_q.h5`, G-flat `(n_q, n_C, n_G)` c128 | written through SlabIO | all |
 | three current ζ | the same fit, `vertex_mu_L ∈ {1,2,3}` | `tmp/zeta_q_mu{1,2,3}.h5`, `(n_q, n_T, n_G)` c128 | same | all |

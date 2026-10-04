@@ -16,7 +16,11 @@ J_i(\mathbf r)/c=\sum_{\mathbf k n}w_{\mathbf k}f_{n\mathbf k}
 $$
 
 $f_{n\mathbf k}$ is the physical occupation, fractional on a metal; the
-screening band window does not truncate the density. The signed Dirac
+screening band window does not truncate the density. On bispinor decks
+$\rho$ is built from the large block $\psi_L$ and $J$ from the
+kinetic-balance lift ([carriers](bispinor-gw.md#lift)); both come from one
+scan of the lifted $\psi$, the charge reading its first two components
+(`charge_nspinor`). The signed Dirac
 current $J$ exists only for four-component bispinors. It is a current, not a
 second charge density, and enters only through the transverse projector
 below.

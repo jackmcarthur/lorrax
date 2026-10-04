@@ -423,8 +423,8 @@ def _zeta_fit_provenance(*, wfn, meta, cfg, band_range_left, band_range_right,
 		'wfn_file':             os.path.realpath(wfn_path) if wfn_path else '',
 		'wfn_bytes':            wfn_bytes,
 	}
-	# Additive only for the new normalized carrier.  Historical raw4 and
-	# Pauli-reference stamps remain byte-for-byte reusable.
+	# Additive only for a non-raw carrier (the large-block charge); raw
+	# stamps remain byte-for-byte reusable.
 	if carrier_lift is not None:
 		prov['bispinor_lift'] = str(carrier_lift)
 	# Stamp only the path whose physics changed.  Equal-window charge fits and
@@ -1572,12 +1572,8 @@ def _resolve_zeta_fit_contract(
 
 	representation = resolve_four_current_representation(
 		cfg.bispinor, cfg.bispinor_gw)
-	# One carrier for all shipped bispinor_gw values (the raw kinetic
-	# balance lift), so the zeta provenance names no alternate lift.  The
-	# two comparison carriers that did were retired from the deck grammar
-	# on 2026-09-01 (gw_config._RETIRED_BISPINOR_GW_MODES).
-	_normalized_charge_lift = None
-	_normalized_current_lift = None
+	# The charge zeta names its large-block carrier, so a raw-lift charge
+	# zeta refits; the current zeta stamp (raw lift) stays byte-identical.
 	provenance = _zeta_fit_provenance(
 		wfn=wfn, meta=meta, cfg=cfg,
 		band_range_left=band_range_left,
@@ -1588,7 +1584,7 @@ def _resolve_zeta_fit_contract(
 		write_ibz_only=write_ibz_only_charge,
 		band_norms=band_norms,
 		carrier_bispinor=bool(int(meta.nspinor) == 4),
-		carrier_lift=_normalized_charge_lift,
+		carrier_lift=representation.charge_lift,
 		vertex_mu_L=0, transverse_identity=transverse_identity)
 	provenance_transverse = tuple(
 		_zeta_fit_provenance(
@@ -1600,7 +1596,7 @@ def _resolve_zeta_fit_contract(
 			zeta_vcoul_cutoff=zeta_vcoul_cutoff,
 			write_ibz_only=write_ibz_only_transverse,
 			band_norms=band_norms, carrier_bispinor=True,
-			carrier_lift=_normalized_current_lift,
+			carrier_lift=None,
 			vertex_mu_L=mu_L, transverse_identity=transverse_identity)
 		for mu_L in ((1, 2, 3) if cfg.bispinor else ()))
 	q_irr_identity = bool(sym.q_irr_is_full_identity)

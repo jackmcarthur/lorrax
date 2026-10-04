@@ -15,13 +15,15 @@ Models -- all three of them (the deck grammar added `full_shared_pole` in 2026-0
 the two carrier-comparison spellings were retired, ``gw_config``'s
 ``_RETIRED_BISPINOR_GW_MODES``):
 
-* ``bare_transverse`` (default) and ``full_static_cohsex`` (the packed
-  static photon mode): the raw kinetic-balance lift
-  ``Psi = (Psi_L, (alpha_FS/2) sigma.p Psi_L)`` for both charge and current,
-  and the four-spinor scalar head/dipole artifact
-  (``scalar_head_bispinor = True``).
+* ``bare_transverse`` (default), ``full_static_cohsex`` (the packed
+  static photon mode) and ``full_shared_pole``: the charge on the large
+  block ``(Psi_L, 0)`` (the Coulomb kernel's relativistic terms are in the
+  fully relativistic pseudopotential), the currents on the raw
+  kinetic-balance lift ``(Psi_L, (alpha_FS/2) sigma.p Psi_L)``, and the
+  four-spinor scalar head/dipole artifact (``scalar_head_bispinor = True``).
+  Theory: ``docs/theory/bispinor-gw.md#lift``.
 
-They resolve to the SAME carrier -- ``bispinor_gw`` selects which Lorentz
+They resolve to the SAME carriers -- ``bispinor_gw`` selects which Lorentz
 blocks are screened, never which four-spinor represents them -- so this
 resolver has exactly two outcomes, bispinor and not.  It stays a resolver
 rather than collapsing into ``bool(bispinor)`` because the artifact
@@ -36,8 +38,7 @@ altitude.
 
 from dataclasses import dataclass
 
-RAW_KINETIC_BALANCE_CHARGE_REPRESENTATION = (
-    "raw_kinetic_balance_identity_charge_v1")
+LARGE_BLOCK_CHARGE_REPRESENTATION = "large_block_pauli_charge_v1"
 SOURCE_WFN_CHARGE_REPRESENTATION = "source_wfn_normalized_charge_v1"
 RAW_KINETIC_BALANCE_SPATIAL_CURRENT_REPRESENTATION = (
     "raw_kinetic_balance_alpha_spatial_current_v1")
@@ -69,11 +70,11 @@ def resolve_four_current_representation(
     """Resolve all carrier decisions without importing the GW driver.
 
     ``model`` is accepted and ignored: all shipped ``bispinor_gw`` values
-    ride the raw kinetic-balance carrier.  The parameter stays so the call
+    ride the same carriers.  The parameter stays so the call
     sites keep naming the mode they resolved -- when a phase-3 mode needs a
     different carrier, this is the one function that has to learn about it.
     """
-    from common.bispinor_init import RAW_KINETIC_BALANCE_LIFT
+    from common.bispinor_init import LARGE_BLOCK_LIFT, RAW_KINETIC_BALANCE_LIFT
 
     if not bool(bispinor):
         return FourCurrentRepresentation(
@@ -87,11 +88,11 @@ def resolve_four_current_representation(
         )
     return FourCurrentRepresentation(
         charge_bispinor=True,
-        charge_lift=RAW_KINETIC_BALANCE_LIFT,
+        charge_lift=LARGE_BLOCK_LIFT,
         current_bispinor=True,
         current_lift=RAW_KINETIC_BALANCE_LIFT,
         scalar_head_bispinor=True,
-        charge_representation=RAW_KINETIC_BALANCE_CHARGE_REPRESENTATION,
+        charge_representation=LARGE_BLOCK_CHARGE_REPRESENTATION,
         spatial_current_representation=(
             RAW_KINETIC_BALANCE_SPATIAL_CURRENT_REPRESENTATION),
     )
