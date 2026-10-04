@@ -695,51 +695,57 @@ on `parallel_transport` it takes this map's `qp_velocity` through
 ## 8 Seeding, restart and outputs {#8-seeding-restart-and-outputs}
 
 **Warm seed and checkpoint.** After every map that does not converge, the
-loop writes two files to `sc_seed/`. `qp_wfn_rotations.h5`
-(`sc_iteration._write_sc_seed`) is that map's output eigensystem, the
-scissored tail energies and the fixed-N occupations. `sc_checkpoint.h5`
-(`file_io.sigma_checkpoint`, written by `sc_iteration._run_anderson`, one
-`SC checkpoint: map N written` line) is the state that fixes the next map:
+loop writes `sc_seed/qp_wfn_rotations.h5` (`sc_iteration._write_sc_seed`):
+that map's output eigensystem, the scissored tail energies and the fixed-N
+occupations. Beside it, except after the map that exhausts `sc_max_iter`, it
+writes `sc_checkpoint.h5` (`file_io.sigma_checkpoint`, from
+`sc_iteration._run_anderson`; one `SC checkpoint: map N written` line), the
+state that fixes the next map:
 
-- the Anderson state (`mixing.acceleration.AndersonState`): the newest
-  $m + 1$ evaluated pairs $(x_i, f_i)$, the best pair, every residual norm
-  and the fallback flag. The next input $x_{n+1}$ is a function of these
-  alone, so it is recomputed, not stored;
+- the Anderson state (`mixing.acceleration.AndersonState`): the history
+  stacks of the newest $m$ pairs $(x_i, f_i)$ with their ring position, the
+  newest pair, the best pair when it has left that window, every residual
+  norm and the fallback flag. The next input $x_{n+1}$ is a function of
+  these alone, so it is recomputed, not stored;
 - the loop carry: the previous map's $Z$ (`SCState.tail_z_kn`), the map-0
   identity labels of the convergence readout (§5), the stall history and the
-  diagnostic tails of the eqp comments;
+  diagnostic histories of the eqp comments;
 - the held plan of §4 and §6 without its rules: the ω grid, its envelope and
-  coarse windows, the Σ window names and certificate boxes, the shared-pole
-  supports and line sites, the K, CT-span and constructor carrier extents.
-  No quadrature rule is stored: a continuing process re-certifies every Σ
-  window on its padded box around the current states (one
-  `SC fixed quadrature recompute:` line per window) and plans the χ response
-  rule cold.
+  coarse windows, each Σ window's certificate boxes and the box its rule was
+  built on, the shared-pole supports and line sites, and the K, CT-span and
+  constructor carrier extents. No quadrature rule is stored: a continuing
+  process rebuilds each held Σ rule cold on its box (the builder is
+  deterministic) and plans the χ response rule cold.
 
-The pairs are written from their shards through SlabIO; the rest is one
-record of plain Python and numpy containers. The file is built as a private
-sibling and published by `os.replace`, so a kill mid-write keeps the previous
-map's checkpoint. One entry is $16\,n_k N_b^2$ bytes and the file holds
-$2(m + 2) + 1$ of them: 1.9 GB on CrI3 24×24 (61 wedge k, 208 bands,
+The stacks and pairs are written from their shards through SlabIO; the rest is
+one record of plain Python and numpy containers, pickled on rank 0 and read
+back through a loader that refuses any other class. The commit digest covers
+the record, the state and the cube bytes, and the file is published by
+`common.collectives.collective_atomic_file_transaction`, so a kill mid-write
+keeps the previous map's checkpoint; a failed write removes it. A converged run
+deletes its checkpoint. One entry is $16\,n_k N_b^2$ bytes and the file holds
+at most $2(m + 2)$ of them: 1.8 GB on CrI3 24×24 (61 wedge k, 208 bands,
 $m = 20$).
 
 **Continuing a run.** A deck whose `sc_initial_qp_rotations_file` has an
 `sc_checkpoint.h5` beside it continues that trajectory when the checkpoint
-authenticates: the same deck less comments and the `restart` and
-`sc_initial_qp_rotations_file` lines (SHA-256), the same WFN fingerprint, k
-set, Σ window and `sc_history_depth`. The run logs `SC resume: continuing the
-Anderson trajectory at map n`, keeps the earlier map files, and numbers its
-maps globally: its first map is $n$, writing `eqp0_iter{n}.dat` and
-`tmp/mpa/sc_{n}_shared_pole`, so a continuation never meets a committed store
-of another map. `sc_max_iter` counts maps from the first process. A
-checkpoint that does not authenticate is left in place, and a WARNING names
-the differing fields; the run starts a new trajectory from the seed. A run
-split into one-map processes follows the one-process trajectory up to the
-re-certified Σ rules (the χ rule's share is about 1 µeV). On Fe 4³ bispinor
-from the charge seed, at `sigma_quadrature_eps` = 1e-4, they move a state by
-at most 1.3 meV per map, with a median of 0.1–0.2 meV within $E_F \pm 10$ eV.
-A seed without its checkpoint moves states by up to 485 meV at the second map,
-because every process then takes an unmixed step on a re-planned map.
+authenticates: the same deck (SHA-256 of the deck less comments and the
+`restart`, `sc_initial_qp_rotations_file`, `sc_max_iter` and `sc_tol_ev`
+lines), the same WFN fingerprint, k set, Σ window and `sc_history_depth`. The
+continuation is implicit; to start a new trajectory from the same seed, remove
+the file. The run logs `SC resume: continuing the Anderson trajectory at map
+n`, keeps the earlier map files, and numbers its maps globally: its first map
+is $n$, writing `eqp0_iter{n}.dat` and `tmp/mpa/sc_{n}_shared_pole`, so a
+continuation never meets a committed store of another map. `sc_max_iter` counts
+maps from the first process; a checkpoint past it refuses
+(`GATE sc_resume_budget`). A checkpoint that does not authenticate is left in
+place, and a WARNING names the differing fields; the run starts a new
+trajectory from the seed. A run split into one-map processes follows the
+one-process trajectory to the χ response rule, which is planned cold: on Fe 4³
+bispinor from the charge seed every rebuilt Σ rule is node-identical to the
+held one, and eqp0 agrees within 3 µeV per map. A seed without its checkpoint
+moves states by up to 485 meV at the second map, because every process then
+takes an unmixed step on a re-planned map.
 
 A rerun reuses a map's shared-pole scratch only when that scratch
 authenticates for the same map identity (WFN fingerprint, energies,

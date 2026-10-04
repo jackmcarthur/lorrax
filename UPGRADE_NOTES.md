@@ -7,24 +7,39 @@ The binding rulings behind breaking changes are in
 
 ## 2026-10-04 — an SC run continues across processes from sc_seed/sc_checkpoint.h5
 
-Every unconverged SC map now writes `sc_seed/sc_checkpoint.h5` beside the
-warm seed: the Anderson window, best pair and residual history, the previous
-map's Z, the map-0 identity labels and the held plan (ω grid, windows,
-supports, K/CT/carrier extents) without its fitted rules. A deck whose
-`sc_initial_qp_rotations_file` names a warm seed with an authenticated
-checkpoint beside it (same deck less the `restart` and seed lines, same WFN,
-carry and `sc_history_depth`) continues at the next map, numbering maps
-globally (`eqp0_iterNNNN.dat`, `tmp/mpa/sc_NNNN_shared_pole`), and
-re-certifies the Σ and χ rules cold. Before, every process took one unmixed
-step: on CrI3 24×24 the gap went 4.154 → 4.283 → 4.007 eV over two such steps.
-Results: a one-map-per-process Fe 4³ bispinor SC follows the one-process run
-within 1.3 meV per map (median 0.1–0.2 meV within E_F ± 10 eV; a seed alone
-is off by 485 meV at map 2). The write costs under 1 % of a Fe 4³ scalar map;
-on CrI3 24×24 the file is 1.9 GB. Log lines: `SC checkpoint: map N written`,
-`SC resume: continuing the Anderson trajectory at map n`. A checkpoint that
-does not authenticate is left in place with a WARNING. `file_io.sigma_checkpoint`
-now writes atomically (private sibling, then `os.replace`). Decks do not
-change; a leg chain copies the whole `sc_seed/` directory.
+Every unconverged SC map except the budget's last now writes
+`sc_seed/sc_checkpoint.h5` beside the warm seed. It holds:
+- the Anderson history stacks, newest pair and residual history;
+- the previous map's Z and the map-0 identity labels;
+- the held plan without fitted rules: ω grid, windows, supports, K/CT/carrier
+  extents, and each Σ window's boxes, including the box its rule was built on.
+
+When a deck's `sc_initial_qp_rotations_file` names a warm seed with an
+authenticated checkpoint beside it, the run continues at the next map. It
+authenticates when the deck matches, apart from the `restart`, seed,
+`sc_max_iter` and `sc_tol_ev` lines, and when the WFN, carry and
+`sc_history_depth` match. The continuation:
+- numbers maps globally (`eqp0_iterNNNN.dat`, `tmp/mpa/sc_NNNN_shared_pole`);
+- rebuilds each Σ rule cold on its held box;
+- plans the χ rule cold.
+
+Before, every process took one unmixed step: on CrI3 24×24 the gap went
+4.154 → 4.283 → 4.007 eV over two such steps.
+
+Results:
+- A one-map-per-process Fe 4³ bispinor SC follows the one-process run within
+  3 µeV per map. A seed alone is off by 485 meV at map 2.
+- The write costs 0.1 s per Fe 4³ map. On CrI3 24×24 the file is 1.8 GB.
+- A converged run deletes its checkpoint. One that does not authenticate is
+  left in place with a WARNING. To start fresh from the same seed, remove the
+  file.
+
+Log lines: `SC checkpoint: map N written` and `SC resume: continuing the
+Anderson trajectory at map n`. `file_io.sigma_checkpoint` now publishes through
+`collective_atomic_file_transaction`, with a commit over the cube bytes. A
+one-shot Σ checkpoint written before this change is recomputed once.
+
+Decks do not change. A leg chain copies the whole `sc_seed/` directory.
 
 ## 2026-10-03 — route-G stage 0 streams over parent chunks; step_up steps by the compiled figure
 
