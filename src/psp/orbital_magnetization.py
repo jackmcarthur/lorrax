@@ -346,7 +346,7 @@ def main(argv=None):
     cA, cB = PA.sum(axis=(1, 2)), PB.sum(axis=(1, 2))
     # The physical spin moment -mu_B sum_occ <sigma> fixes the reporting axis.
     m_spin = -spin_moment_ibz(wfn, sym, nocc=nocc)
-    n_hat = m_spin / np.linalg.norm(m_spin)
+    n_hat = m_spin / max(np.linalg.norm(m_spin), 1e-12)    # 0 when nonmagnetic
     PA_band_n = np.einsum("g,gnm->nm", n_hat, PA)
     PB_band_n = np.einsum("g,gnm->nm", n_hat, PB)
 
