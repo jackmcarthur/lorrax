@@ -5,6 +5,24 @@ results move, and what a user must change in decks, environment or files.
 The binding rulings behind breaking changes are in
 `docs/architecture/decisions.md`; older history is in git.
 
+## 2026-10-04 — bispinor charge on the large block
+
+`bispinor = true` builds the charge vertex on $\Psi_C=(\psi_L,0)$: the direct
+Hartree field, the charge ζ, $\Pi_{00}$, $W_C$ and the CC Σ see $\psi_L$ only,
+and the current vertices keep the raw kinetic-balance lift
+(docs/theory/bispinor-gw.md §1). The fully relativistic pseudopotential
+already holds the Coulomb kernel's $O(c^{-2})$ terms; the raw lift had added
+$(\alpha^2/4)\langle p^2\rangle\bar V_H$, a V_H-gauge term that grows with the
+vacuum.
+- Results move. CrI3 6×6 slab one-shot: the direct field drops by 112–310 meV
+  per state, and the Γ gap by about 21 meV. Bispinor − charge is now α·A
+  (≤ 1 meV), the Breit TT term, CT and the Γ head. Fe 4³: the direct field
+  drops by up to 39 meV per state.
+- Files. A raw-lift charge ζ refits. A bispinor restart bundle written before
+  this change refuses with `GATE restart_bispinor_charge_carrier`; set
+  `restart = false` once. kin_ion.h5 and dipole.h5 are reused unchanged.
+- Decks: no change.
+
 ## 2026-10-04 — the response bank's dense stages fill the mesh under `linalg = local`
 
 The sample Dyson, line selection and moment Dyson of the shared-pole bank run
